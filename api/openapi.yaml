@@ -1,0 +1,28 @@
+openapi: 3.1.0
+info:
+  title: hostd API
+  version: 0.1.0
+servers:
+  - url: http://127.0.0.1:7345
+paths:
+  /api/v1/auth/bootstrap/status: {get: {operationId: bootstrapStatus, responses: {'200': {description: Bootstrap state}}}}
+  /api/v1/auth/bootstrap: {post: {operationId: bootstrap, responses: {'201': {description: Session created}}}}
+  /api/v1/auth/sessions: {post: {operationId: login, responses: {'201': {description: Session created}}}}
+  /api/v1/auth/sessions/current: {delete: {operationId: logout, responses: {'204': {description: Logged out}}}}
+  /api/v1/auth/me: {get: {operationId: me, responses: {'200': {description: Current user}}}}
+  /api/v1/system/status: {get: {operationId: systemStatus, responses: {'200': {description: System status}}}}
+  /api/v1/system/doctor: {get: {operationId: doctor, responses: {'200': {description: Diagnostics}}}}
+  /api/v1/apps:
+    get: {operationId: listApplications, responses: {'200': {description: Application list}}}
+    post: {operationId: createApplication, responses: {'201': {description: Application created}}}
+  /api/v1/apps/import/inspect: {post: {operationId: inspectImport, responses: {'200': {description: Inspection}}}}
+  /api/v1/apps/{appId}: {get: {operationId: getApplication, parameters: [{name: appId, in: path, required: true}], responses: {'200': {description: Application}}}}
+  /api/v1/apps/{appId}/services: {get: {operationId: listServices, responses: {'200': {description: Services}}}}
+  /api/v1/apps/{appId}/deployments: {post: {operationId: deployApplication, responses: {'202': {description: Job created}}}}
+  /api/v1/apps/{appId}/start: {post: {operationId: startApplication, responses: {'202': {description: Job created}}}}
+  /api/v1/apps/{appId}/stop: {post: {operationId: stopApplication, responses: {'202': {description: Job created}}}}
+  /api/v1/apps/{appId}/restart: {post: {operationId: restartApplication, responses: {'202': {description: Job created}}}}
+  /api/v1/apps/{appId}/logs/stream: {get: {operationId: streamLogs, responses: {'200': {description: SSE stream}}}}
+  /api/v1/jobs/{jobId}: {get: {operationId: getJob, responses: {'200': {description: Job}}}}
+  /api/v1/jobs/{jobId}/events: {get: {operationId: listJobEvents, responses: {'200': {description: Events}}}}
+  /api/v1/jobs/{jobId}/events/stream: {get: {operationId: streamJobEvents, responses: {'200': {description: SSE stream}}}}

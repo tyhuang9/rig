@@ -1,0 +1,2 @@
+-- Query ownership is intentionally kept in narrow Go repositories during Phase A.
+-- sqlc generation can replace these query definitions without changing HTTP contracts.

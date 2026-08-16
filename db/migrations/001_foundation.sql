@@ -1,0 +1,2 @@
+-- Canonical migration source is embedded from internal/database/migrations/001_foundation.sql.
+-- It is duplicated here for tooling discovery; keep the two files in sync via scripts/check-generation.sh.
