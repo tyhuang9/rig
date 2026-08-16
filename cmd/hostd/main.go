@@ -17,6 +17,7 @@ import (
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
+	"github.com/hostd/hostd/internal/runtime/docker"
 )
 
 func main() {
@@ -51,6 +52,11 @@ func main() {
 		logger.Error("local machine setup failed", "error", err)
 		os.Exit(1)
 	}
+	diagnostic := docker.Check(context.Background(), cfg.CaddyManagement, cfg.DockerEndpoint, cfg.DataRoot)
+	if err := m.UpdateLocalDiagnostics(diagnostic.DockerVersion, diagnostic.ComposeVersion, diagnostic.Resources); err != nil {
+		logger.Error("local diagnostics persistence failed", "error", err)
+		os.Exit(1)
+	}
 	j := jobs.New(db)
 	if err := j.RecoverInterrupted(); err != nil {
 		logger.Error("job recovery failed", "error", err)
@@ -61,7 +67,7 @@ func main() {
 	if cfg.FakeRuntime {
 		go j.RunFakeWorker(ctx)
 	}
-	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: j, Machines: m, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, Logger: logger}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: j, Machines: m, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)

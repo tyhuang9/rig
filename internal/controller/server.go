@@ -26,13 +26,15 @@ import (
 var web embed.FS
 
 type Server struct {
-	Auth        *auth.Service
-	Apps        *apps.Store
-	Jobs        *jobs.Service
-	Machines    *machines.Store
-	Caddy       bool
-	FakeRuntime bool
-	Logger      *slog.Logger
+	Auth           *auth.Service
+	Apps           *apps.Store
+	Jobs           *jobs.Service
+	Machines       *machines.Store
+	Caddy          bool
+	FakeRuntime    bool
+	DockerEndpoint string
+	DataRoot       string
+	Logger         *slog.Logger
 }
 type principalKey struct{}
 type principal struct {
@@ -216,13 +218,18 @@ func (s *Server) rotateCSRF(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"csrfToken": token})
 }
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
-	d := docker.Check(r.Context(), s.Caddy)
+	d := s.runDiagnostics(r.Context())
 	writeJSON(w, 200, map[string]any{"daemon": "running", "diagnostics": d, "capabilities": map[string]bool{"fakeRuntime": s.FakeRuntime}})
 }
 func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
-	d := docker.Check(r.Context(), s.Caddy)
+	d := s.runDiagnostics(r.Context())
 	checks := []map[string]any{{"name": "hostd", "ok": true, "detail": "daemon running"}, {"name": "docker client", "ok": d.ClientAvailable, "detail": d.DockerDetail}, {"name": "docker engine", "ok": d.EngineReady, "detail": d.DockerDetail}, {"name": "compose v2", "ok": d.ComposeAvailable, "detail": d.ComposeDetail}, {"name": "caddy management", "ok": d.CaddyManaged, "detail": "disabled in Phase A"}}
 	writeJSON(w, 200, map[string]any{"checks": checks, "startupLimitation": d.StartupLimitation})
+}
+func (s *Server) runDiagnostics(ctx context.Context) docker.Diagnostics {
+	diagnostic := docker.Check(ctx, s.Caddy, s.DockerEndpoint, s.DataRoot)
+	_ = s.Machines.UpdateLocalDiagnostics(diagnostic.DockerVersion, diagnostic.ComposeVersion, diagnostic.Resources)
+	return diagnostic
 }
 func (s *Server) listApps(w http.ResponseWriter, r *http.Request) {
 	v, err := s.Apps.List()
