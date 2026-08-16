@@ -149,6 +149,7 @@ button:disabled { cursor: wait; opacity: .62; }
 }
 .app-row:hover { border-color: #cfd5de; box-shadow: 0 5px 18px rgba(18, 24, 40, .045); }
 .app-primary, .title-line, .meta { min-width: 0; }
+.app-row > .meta { padding-left: 16px; border-left: 1px solid #e3e6ea; }
 .title-line { display: flex; align-items: center; gap: 10px; }
 .title-line strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
 .muted, .meta small, .meta span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -208,12 +209,16 @@ button:disabled { cursor: wait; opacity: .62; }
 .machine-meta { grid-column: 1 / -1; padding-top: 12px; border-top: 1px solid #e3e6ea; }
 
 .activity-list { overflow: hidden; }
-.activity-row { display: grid; grid-template-columns: 90px minmax(0, 1fr) auto; align-items: center; gap: 12px; min-width: 0; padding: 12px 15px; border-bottom: 1px solid #e3e6ea; }
+.activity-row { display: grid; grid-template-columns: 90px minmax(0, 1fr) auto minmax(100px, auto); align-items: center; gap: 12px; min-width: 0; padding: 12px 15px; border-bottom: 1px solid #e3e6ea; }
 .activity-row:last-child { border-bottom: 0; }
 .activity-row time, .activity-row small { color: #5f6672; font-size: 11px; }
 .activity-row div { min-width: 0; }
 .activity-row strong, .activity-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .activity-row strong { font-size: 13px; text-transform: capitalize; }
+.job-actions { display: grid; justify-items: end; gap: 4px; }
+.activity-feedback { max-width: 180px; font-size: 11px; text-align: right; }
+.activity-feedback.success { color: #195e47; }
+.activity-feedback.error { color: #842a31; }
 
 .auth { display: grid; place-items: center; min-height: 100vh; padding: 24px; background: #f5f6f8; }
 .auth section { width: min(100%, 440px); padding: 30px; border: 1px solid #e3e6ea; border-radius: 12px; background: #fff; box-shadow: 0 12px 36px rgba(18, 24, 40, .08); }
@@ -244,7 +249,9 @@ button:disabled { cursor: wait; opacity: .62; }
   .content { padding: 22px 18px 45px; }
   .page-head { flex-direction: column; }
   .app-row { grid-template-columns: minmax(0, 1fr) auto; }
-  .app-row > :nth-child(2), .app-row > :nth-child(3), .app-row > :nth-child(4) { display: none; }
+  .app-row > .meta { display: grid; grid-column: 1 / -1; grid-template-columns: 72px minmax(0, 1fr); gap: 10px; padding: 9px 0 0; border-top: 1px solid #e3e6ea; border-left: 0; }
+  .app-row > .meta small { margin: 0; }
+  .app-open { grid-column: 2; grid-row: 1; }
   .wizard { grid-template-columns: 1fr; }
   .wizard ol { display: flex; overflow-x: auto; }
   .wizard li { flex: 0 0 auto; }
@@ -272,6 +279,8 @@ button:disabled { cursor: wait; opacity: .62; }
   .app-open { align-self: center; min-width: 64px; }
   .activity-row { grid-template-columns: minmax(0, 1fr) auto; }
   .activity-row time { grid-column: 1 / -1; }
+  .job-actions { grid-column: 1 / -1; justify-items: start; }
+  .activity-feedback { max-width: none; text-align: left; }
   .button { min-height: 44px; }
   .button.small { min-height: 44px; }
   .auth { padding: 14px; }

@@ -9,6 +9,7 @@ import {
   clearCSRF,
   setCSRF,
   type Application,
+  type Job,
   type User,
 } from "./api";
 
@@ -97,6 +98,7 @@ function Login({ setup, onAuthenticated }: { setup: boolean; onAuthenticated: (u
     }
   };
   const invalid = () => window.setTimeout(() => errorSummary.current?.focus(), 0);
+  const tokenError = serverError.startsWith("Enter the one-time") ? serverError : undefined;
   return <main className="auth">
     <section aria-labelledby="auth-title">
       <div className="auth-brand"><b aria-hidden="true">h&gt;</b><span>hostd</span></div>
@@ -104,7 +106,7 @@ function Login({ setup, onAuthenticated }: { setup: boolean; onAuthenticated: (u
       <p>{bootstrapMode ? "Create the first administrator using the one-time token from hostd's protected local console." : "Sign in to your local deployment manager."}</p>
       {(serverError || Object.keys(errors).length > 0) && <div className="error-summary" ref={errorSummary} tabIndex={-1} role="alert">{serverError || "Check the highlighted fields."}</div>}
       <form onSubmit={handleSubmit(submit, invalid)} noValidate>
-        {bootstrapMode && <FormField label="Bootstrap token" id="token" error={serverError.startsWith("Enter the one-time") ? serverError : undefined} required><input id="token" required aria-invalid={Boolean(serverError.startsWith("Enter the one-time"))} aria-describedby={serverError ? "token-error" : undefined} autoComplete="off" {...register("token")}/></FormField>}
+        {bootstrapMode && <FormField label="Bootstrap token" id="token" error={tokenError} required><input id="token" required aria-invalid={Boolean(tokenError)} aria-describedby={tokenError ? "token-error" : undefined} autoComplete="off" {...register("token")}/></FormField>}
         <FormField label="Username" id="username" error={errors.username?.message} required><input id="username" required aria-invalid={Boolean(errors.username)} aria-describedby={errors.username ? "username-error" : undefined} autoComplete="username" {...register("username")}/></FormField>
         <FormField label="Passphrase" id="passphrase" error={errors.passphrase?.message} required><input id="passphrase" required type="password" aria-invalid={Boolean(errors.passphrase)} aria-describedby={errors.passphrase ? "passphrase-error" : undefined} autoComplete={bootstrapMode ? "new-password" : "current-password"} {...register("passphrase")}/></FormField>
         <button className="button primary" disabled={isSubmitting}>{isSubmitting ? "Working…" : bootstrapMode ? "Create administrator" : "Sign in"}</button>
@@ -130,7 +132,7 @@ function ApplicationsPage() {
   const query = useQuery({ queryKey: ["apps"], queryFn: api.apps });
   const items = query.data?.items ?? [];
   return <>
-    <PageHeader title="Applications" subtitle="Deploy and manage apps on your machine." action={<NavLink className="button primary" to="/apps/new">Add application</NavLink>}/>
+    <PageHeader title="Applications" subtitle="Deploy and manage apps on your machines." action={<NavLink className="button primary" to="/apps/new">Add application</NavLink>}/>
     {query.isLoading ? <LoadingState/> : query.isError ? <QueryError message={query.error.message}/> : items.length > 0 ? <div className="app-list">{items.map((app) => <ApplicationRow key={app.id} app={app}/>)}</div> : <section className="empty"><h2>No applications yet</h2><p>Save a local project draft. Runtime execution remains capability-gated.</p><NavLink className="button primary" to="/apps/new">Add application</NavLink></section>}
   </>;
 }
@@ -212,7 +214,28 @@ function MachinesPage() {
 function ActivityPage() {
   const query = useQuery({ queryKey: ["jobs"], queryFn: api.jobs, refetchInterval: 1000 });
   const items = query.data?.items ?? [];
-  return <><PageHeader title="Activity" subtitle="Durable runtime jobs ordered by creation time."/>{query.isLoading ? <LoadingState/> : query.isError ? <QueryError message={query.error.message}/> : items.length === 0 ? <section className="empty"><h2>No activity yet</h2><p>Development deployments will appear here as durable jobs.</p></section> : <div className="activity-list">{items.map((job) => <article className="activity-row" key={job.id}><time dateTime={job.createdAt}>{new Date(job.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><div><strong>{job.type} application</strong><small className="mono">{job.id}</small></div><StatusText value={job.status}/></article>)}</div>}</>;
+  return <><PageHeader title="Activity" subtitle="Durable runtime jobs ordered by creation time."/>{query.isLoading ? <LoadingState/> : query.isError ? <QueryError message={query.error.message}/> : items.length === 0 ? <section className="empty"><h2>No activity yet</h2><p>Development deployments will appear here as durable jobs.</p></section> : <div className="activity-list">{items.map((job) => <ActivityRow job={job} key={job.id}/>)}</div>}</>;
+}
+
+const cancellableStatuses = new Set(["queued", "assigned", "running", "waiting_external", "waiting_user"]);
+
+function ActivityRow({ job }: { job: Job }) {
+  const queryClient = useQueryClient();
+  const cancellation = useMutation({
+    mutationFn: () => api.cancelJob(job.id),
+    onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+  });
+  const current = cancellation.data?.job ?? job;
+  return <article className="activity-row">
+    <time dateTime={current.createdAt}>{new Date(current.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
+    <div><strong>{current.type} application</strong><small className="mono">{current.id}</small></div>
+    <StatusText value={current.status}/>
+    <div className="job-actions">
+      {cancellableStatuses.has(current.status) && <button className="button small" onClick={() => cancellation.mutate()} disabled={cancellation.isPending}>{cancellation.isPending ? "Cancelling…" : "Cancel job"}</button>}
+      {cancellation.isSuccess && <span className="activity-feedback success" role="status">Cancellation recorded</span>}
+      {cancellation.isError && <span className="activity-feedback error" role="alert">{cancellation.error.message}</span>}
+    </div>
+  </article>;
 }
 
 export function App() {
@@ -223,7 +246,13 @@ export function App() {
     api.bootstrapStatus().then(async ({ bootstrapRequired }) => {
       setBootstrapRequired(bootstrapRequired);
       if (!bootstrapRequired) {
-        try { setUser((await api.me()).user); } catch { setUser(null); }
+        try {
+          const restored = await api.me();
+          await api.csrf();
+          setUser(restored.user);
+        } catch {
+          setUser(null);
+        }
       }
     }).catch(() => setBootstrapRequired(false));
   }, []);

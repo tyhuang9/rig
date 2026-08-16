@@ -1,8 +1,13 @@
-.PHONY: bootstrap generate dev-backend dev-web test test-integration test-e2e build
+.PHONY: bootstrap generate check-generated check-embedded dev-backend dev-web test test-integration test-e2e build
 bootstrap:
 	pnpm --dir web install
 generate:
-	pwsh -File scripts/check-generation.ps1
+	go run ./cmd/openapi-gen
+check-generated:
+	go run ./cmd/openapi-gen -check
+	go test ./internal/controller -run '^TestOpenAPIContractMatchesRegisteredRoutes$$' -count=1
+check-embedded:
+	sh scripts/check-embedded.sh
 dev-backend:
 	go run ./cmd/hostd --data-root .hostd-dev --fake-runtime
 dev-web:

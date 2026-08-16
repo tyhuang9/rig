@@ -1,0 +1,2 @@
+# Vite bundles are reproducible opaque artifacts; review their source and verify hashes instead of textual diffs.
+internal/controller/ui/assets/*.js binary

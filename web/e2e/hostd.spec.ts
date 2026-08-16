@@ -64,10 +64,13 @@ test.afterAll(async () => {
   if (dataRoot) await rm(dataRoot, { recursive: true, force: true });
 });
 
-test("bootstraps, logs in, manages Phase A records, and stays responsive", async ({ page }) => {
+test("bootstraps, restores a fresh tab, cancels work, and stays responsive", async ({ page, context }) => {
   const browserErrors: string[] = [];
-  page.on("console", (message) => { if (message.type() === "error") browserErrors.push(message.text()); });
-  page.on("pageerror", (error) => browserErrors.push(error.message));
+  const watchForErrors = (target: typeof page) => {
+    target.on("console", (message) => { if (message.type() === "error") browserErrors.push(message.text()); });
+    target.on("pageerror", (error) => browserErrors.push(error.message));
+  };
+  watchForErrors(page);
 
   await page.goto(`${baseURL}/apps`);
   await expect(page).toHaveTitle("hostd");
@@ -99,33 +102,50 @@ test("bootstraps, logs in, manages Phase A records, and stays responsive", async
   await page.getByLabel("Local source path").fill("C:\\fixtures\\hostd-e2e");
   await page.getByRole("button", { name: "Save application" }).click();
   await expect(page.getByRole("heading", { name: longName })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Deploy with fake runtime" })).toBeVisible();
-  await expect(page.getByText("Development capability")).toBeVisible();
-  await page.getByRole("button", { name: "Deploy with fake runtime" }).click();
-  await expect(page.getByText(/Deployment job queued:/)).toBeVisible();
+  const restoredPage = await context.newPage();
+  watchForErrors(restoredPage);
+  const csrfRestore = restoredPage.waitForResponse((response) => response.url().endsWith("/api/v1/auth/csrf"));
+  await restoredPage.goto(page.url());
+  expect((await csrfRestore).ok()).toBe(true);
+  await expect(restoredPage.getByRole("heading", { name: longName })).toBeVisible();
+  expect(await restoredPage.evaluate(() => window.sessionStorage.getItem("hostd-csrf"))).toBeTruthy();
+  await expect(restoredPage.getByRole("button", { name: "Deploy with fake runtime" })).toBeVisible();
+  await expect(restoredPage.getByText("Development capability")).toBeVisible();
+  await restoredPage.getByRole("button", { name: "Deploy with fake runtime" }).click();
+  await expect(restoredPage.getByText(/Deployment job queued:/)).toBeVisible();
+  expect(await restoredPage.evaluate(() => window.sessionStorage.getItem("hostd-csrf"))).toBeTruthy();
 
-  await page.getByRole("link", { name: "Activity" }).click();
-  await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
-  await expect(page.getByText("deploy application")).toBeVisible();
-  await page.getByRole("link", { name: "Machines" }).click();
-  await expect(page.getByRole("heading", { name: "Machines" })).toBeVisible();
-  await expect(page.getByText(/Local controller/)).toBeVisible();
-  await page.getByRole("link", { name: "Applications" }).click();
-  await expect(page.getByText(longName)).toBeVisible();
+  await restoredPage.getByRole("link", { name: "Activity" }).click();
+  await expect(restoredPage.getByRole("heading", { name: "Activity" })).toBeVisible();
+  const activity = restoredPage.locator(".activity-row").filter({ hasText: "deploy application" }).first();
+  await expect(activity.getByRole("button", { name: "Cancel job" })).toBeVisible();
+  await activity.getByRole("button", { name: "Cancel job" }).click();
+  await expect(activity.locator('[role="status"]').filter({ hasText: "Cancellation recorded" })).toBeVisible();
+  await expect(activity.getByText("cancelled", { exact: true })).toBeVisible();
+  await restoredPage.getByRole("link", { name: "Machines" }).click();
+  await expect(restoredPage.getByRole("heading", { name: "Machines" })).toBeVisible();
+  await expect(restoredPage.getByText(/Local controller/)).toBeVisible();
+  await restoredPage.getByRole("link", { name: "Applications" }).click();
+  await expect(restoredPage.getByText(longName)).toBeVisible();
 
   await mkdir(screenshotDir, { recursive: true });
   for (const [width, height] of [[375, 812], [768, 900], [1024, 900], [1440, 900]] as const) {
-    await page.setViewportSize({ width, height });
-    await expect(page.getByText(longName)).toBeVisible();
-    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    await restoredPage.setViewportSize({ width, height });
+    await expect(restoredPage.getByText(longName)).toBeVisible();
+    const overflow = await restoredPage.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
     expect(overflow, `horizontal overflow at ${width}px`).toBeLessThanOrEqual(0);
-    if (width === 768 || width === 1024) await expect(page.getByText("System ready")).toBeHidden();
+    if (width === 768 || width === 1024) await expect(restoredPage.getByText("System ready")).toBeHidden();
     if (width === 375) {
-      await expect(page.getByRole("link", { name: "Applications" })).toBeVisible();
-      await expect(page.getByRole("link", { name: "Machines" })).toBeVisible();
-      await expect(page.getByRole("link", { name: "Activity" })).toBeVisible();
+      await expect(restoredPage.getByRole("link", { name: "Applications" })).toBeVisible();
+      await expect(restoredPage.getByRole("link", { name: "Machines" })).toBeVisible();
+      await expect(restoredPage.getByRole("link", { name: "Activity" })).toBeVisible();
     }
-    await page.screenshot({ path: path.join(screenshotDir, `apps-${width}.png`), fullPage: true });
+    if (width === 768) {
+      await expect(restoredPage.getByText("Machine", { exact: true })).toBeVisible();
+      await expect(restoredPage.getByText("Release", { exact: true })).toBeVisible();
+      await expect(restoredPage.getByText("Created", { exact: true })).toBeVisible();
+    }
+    await restoredPage.screenshot({ path: path.join(screenshotDir, `apps-${width}.png`), fullPage: true });
   }
   expect(browserErrors).toEqual([]);
 });
