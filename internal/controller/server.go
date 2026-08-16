@@ -41,30 +41,47 @@ type principal struct {
 }
 
 func (s *Server) Handler() http.Handler { return s.requestID(s.logRequests(s.routes())) }
+
+type apiRoute struct {
+	method      string
+	path        string
+	operationID string
+	handler     http.HandlerFunc
+}
+
+func (s *Server) apiRoutes() []apiRoute {
+	return []apiRoute{
+		{http.MethodGet, "/api/v1/auth/bootstrap/status", "bootstrapStatus", s.bootstrapStatus},
+		{http.MethodPost, "/api/v1/auth/bootstrap", "bootstrap", s.bootstrap},
+		{http.MethodPost, "/api/v1/auth/sessions", "login", s.login},
+		{http.MethodDelete, "/api/v1/auth/sessions/current", "logout", s.require(s.logout)},
+		{http.MethodGet, "/api/v1/auth/me", "me", s.require(s.me)},
+		{http.MethodGet, "/api/v1/auth/csrf", "rotateCSRF", s.require(s.rotateCSRF)},
+		{http.MethodGet, "/api/v1/system/status", "systemStatus", s.require(s.status)},
+		{http.MethodGet, "/api/v1/system/doctor", "doctor", s.require(s.doctor)},
+		{http.MethodGet, "/api/v1/apps", "listApplications", s.require(s.listApps)},
+		{http.MethodPost, "/api/v1/apps", "createApplication", s.require(s.createApp)},
+		{http.MethodPost, "/api/v1/apps/import/inspect", "inspectImport", s.require(s.inspectApp)},
+		{http.MethodGet, "/api/v1/apps/{appId}", "getApplication", s.require(s.getApp)},
+		{http.MethodGet, "/api/v1/apps/{appId}/services", "listServices", s.require(s.services)},
+		{http.MethodPost, "/api/v1/apps/{appId}/deployments", "deployApplication", s.require(s.action("deploy"))},
+		{http.MethodPost, "/api/v1/apps/{appId}/start", "startApplication", s.require(s.action("start"))},
+		{http.MethodPost, "/api/v1/apps/{appId}/stop", "stopApplication", s.require(s.action("stop"))},
+		{http.MethodPost, "/api/v1/apps/{appId}/restart", "restartApplication", s.require(s.action("restart"))},
+		{http.MethodGet, "/api/v1/apps/{appId}/logs/stream", "streamLogs", s.require(s.logsStream)},
+		{http.MethodGet, "/api/v1/jobs", "listJobs", s.require(s.listJobs)},
+		{http.MethodGet, "/api/v1/jobs/{jobId}", "getJob", s.require(s.getJob)},
+		{http.MethodGet, "/api/v1/jobs/{jobId}/events", "listJobEvents", s.require(s.events)},
+		{http.MethodGet, "/api/v1/jobs/{jobId}/events/stream", "streamJobEvents", s.require(s.eventsStream)},
+		{http.MethodGet, "/api/v1/machines", "listMachines", s.require(s.listMachines)},
+	}
+}
+
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v1/auth/bootstrap/status", s.bootstrapStatus)
-	mux.HandleFunc("POST /api/v1/auth/bootstrap", s.bootstrap)
-	mux.HandleFunc("POST /api/v1/auth/sessions", s.login)
-	mux.HandleFunc("DELETE /api/v1/auth/sessions/current", s.require(s.logout))
-	mux.HandleFunc("GET /api/v1/auth/me", s.require(s.me))
-	mux.HandleFunc("GET /api/v1/system/status", s.require(s.status))
-	mux.HandleFunc("GET /api/v1/system/doctor", s.require(s.doctor))
-	mux.HandleFunc("GET /api/v1/apps", s.require(s.listApps))
-	mux.HandleFunc("POST /api/v1/apps", s.require(s.createApp))
-	mux.HandleFunc("POST /api/v1/apps/import/inspect", s.require(s.inspectApp))
-	mux.HandleFunc("GET /api/v1/apps/{appId}", s.require(s.getApp))
-	mux.HandleFunc("GET /api/v1/apps/{appId}/services", s.require(s.services))
-	mux.HandleFunc("POST /api/v1/apps/{appId}/deployments", s.require(s.action("deploy")))
-	mux.HandleFunc("POST /api/v1/apps/{appId}/start", s.require(s.action("start")))
-	mux.HandleFunc("POST /api/v1/apps/{appId}/stop", s.require(s.action("stop")))
-	mux.HandleFunc("POST /api/v1/apps/{appId}/restart", s.require(s.action("restart")))
-	mux.HandleFunc("GET /api/v1/apps/{appId}/logs/stream", s.require(s.logsStream))
-	mux.HandleFunc("GET /api/v1/jobs/{jobId}", s.require(s.getJob))
-	mux.HandleFunc("GET /api/v1/jobs", s.require(s.listJobs))
-	mux.HandleFunc("GET /api/v1/jobs/{jobId}/events", s.require(s.events))
-	mux.HandleFunc("GET /api/v1/jobs/{jobId}/events/stream", s.require(s.eventsStream))
-	mux.HandleFunc("GET /api/v1/machines", s.require(s.listMachines))
+	for _, route := range s.apiRoutes() {
+		mux.HandleFunc(route.method+" "+route.path, route.handler)
+	}
 	mux.HandleFunc("/", s.spa)
 	return mux
 }
@@ -184,6 +201,20 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	p := r.Context().Value(principalKey{}).(principal)
 	writeJSON(w, 200, map[string]any{"user": p.user})
 }
+func (s *Server) rotateCSRF(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie(auth.SessionCookie)
+	if err != nil {
+		problem(w, r, http.StatusUnauthorized, "unauthenticated", "Authentication required", nil)
+		return
+	}
+	token, err := s.Auth.RotateCSRF(cookie.Value)
+	if err != nil {
+		problem(w, r, http.StatusUnauthorized, "unauthenticated", "Authentication required", nil)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]string{"csrfToken": token})
+}
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	d := docker.Check(r.Context(), s.Caddy)
 	writeJSON(w, 200, map[string]any{"daemon": "running", "diagnostics": d, "capabilities": map[string]bool{"fakeRuntime": s.FakeRuntime}})
@@ -243,6 +274,10 @@ func (s *Server) getApp(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, v)
 }
 func (s *Server) services(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.Apps.Get(r.PathValue("appId")); err != nil {
+		problem(w, r, http.StatusNotFound, "app_not_found", "Application was not found", nil)
+		return
+	}
 	v, err := s.Apps.Services(r.PathValue("appId"))
 	if err != nil {
 		problem(w, r, 404, "app_not_found", "Application was not found", nil)
@@ -286,6 +321,10 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, v)
 }
 func (s *Server) events(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.Jobs.Get(r.PathValue("jobId")); err != nil {
+		problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
+		return
+	}
 	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
 	v, err := s.Jobs.Events(r.PathValue("jobId"), after)
 	if err != nil {
@@ -295,6 +334,10 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": v})
 }
 func (s *Server) eventsStream(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.Jobs.Get(r.PathValue("jobId")); err != nil {
+		problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
+		return
+	}
 	after, _ := strconv.ParseInt(r.Header.Get("Last-Event-ID"), 10, 64)
 	if after == 0 {
 		after, _ = strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
@@ -330,6 +373,10 @@ func (s *Server) eventsStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (s *Server) logsStream(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.Apps.Get(r.PathValue("appId")); err != nil {
+		problem(w, r, http.StatusNotFound, "app_not_found", "Application was not found", nil)
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	_, _ = fmt.Fprint(w, "event: log\ndata: {\"message\":\"Logs require a real runtime in Milestone 2\"}\n\n")
 }

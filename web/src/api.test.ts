@@ -1,10 +1,26 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { api, setCSRF } from "./api";
+import { api, clearCSRF, setCSRF } from "./api";
 
 describe("API client", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     setCSRF("csrf-token");
+  });
+
+  it("rotates CSRF and retries a restored-session mutation", async () => {
+    clearCSRF();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "csrf_failed", detail: "CSRF validation failed" }), { status: 403 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ csrfToken: "rotated-token" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.logout();
+
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/auth/csrf", expect.objectContaining({ credentials: "same-origin" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/v1/auth/sessions/current", expect.objectContaining({
+      headers: expect.objectContaining({ "X-CSRF-Token": "rotated-token" }),
+    }));
   });
 
   it("sends browser CSRF protection for mutations", async () => {

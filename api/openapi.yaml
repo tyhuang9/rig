@@ -1,29 +1,235 @@
 openapi: 3.1.0
 info:
-  title: hostd API
+  title: hostd Phase A API
   version: 0.1.0
+  description: Authenticated local-only control plane. Runtime actions require the explicit fake-runtime development capability and never execute workloads.
 servers:
   - url: http://127.0.0.1:7345
+security:
+  - sessionCookie: []
+x-job-responses: &jobResponses
+  '200': {description: Existing idempotent job, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
+  '202': {description: Job accepted, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
+  default: {$ref: '#/components/responses/Problem'}
 paths:
-  /api/v1/auth/bootstrap/status: {get: {operationId: bootstrapStatus, responses: {'200': {description: Bootstrap state}}}}
-  /api/v1/auth/bootstrap: {post: {operationId: bootstrap, responses: {'201': {description: Session created}}}}
-  /api/v1/auth/sessions: {post: {operationId: login, responses: {'201': {description: Session created}}}}
-  /api/v1/auth/sessions/current: {delete: {operationId: logout, responses: {'204': {description: Logged out}}}}
-  /api/v1/auth/me: {get: {operationId: me, responses: {'200': {description: Current user}}}}
-  /api/v1/system/status: {get: {operationId: systemStatus, responses: {'200': {description: System status}}}}
-  /api/v1/system/doctor: {get: {operationId: doctor, responses: {'200': {description: Diagnostics}}}}
+  /api/v1/auth/bootstrap/status:
+    get:
+      operationId: bootstrapStatus
+      security: []
+      responses:
+        '200': {description: Bootstrap state, content: {application/json: {schema: {$ref: '#/components/schemas/BootstrapStatus'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/auth/bootstrap:
+    post:
+      operationId: bootstrap
+      security: []
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/BootstrapRequest'}}}}
+      responses:
+        '201': {description: Administrator and session created, headers: {Set-Cookie: {$ref: '#/components/headers/SessionCookie'}}, content: {application/json: {schema: {$ref: '#/components/schemas/SessionResponse'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/auth/sessions:
+    post:
+      operationId: login
+      security: []
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/LoginRequest'}}}}
+      responses:
+        '201': {description: Session created, headers: {Set-Cookie: {$ref: '#/components/headers/SessionCookie'}}, content: {application/json: {schema: {$ref: '#/components/schemas/SessionResponse'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/auth/sessions/current:
+    delete:
+      operationId: logout
+      security: [{sessionCookie: [], csrfHeader: []}]
+      responses:
+        '204': {description: Session revoked and cookie cleared}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/auth/me:
+    get:
+      operationId: me
+      responses:
+        '200': {description: Current user, content: {application/json: {schema: {$ref: '#/components/schemas/MeResponse'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/auth/csrf:
+    get:
+      operationId: rotateCSRF
+      description: Rotates the CSRF secret for an authenticated session-cookie restore. Only the new plaintext value is returned; only its hash is stored.
+      responses:
+        '200': {description: Rotated CSRF token, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/CSRFResponse'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/system/status:
+    get:
+      operationId: systemStatus
+      responses:
+        '200': {description: Controller status and capabilities, content: {application/json: {schema: {$ref: '#/components/schemas/SystemStatus'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/system/doctor:
+    get:
+      operationId: doctor
+      responses:
+        '200': {description: Independent local diagnostics, content: {application/json: {schema: {$ref: '#/components/schemas/DoctorResponse'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/apps:
-    get: {operationId: listApplications, responses: {'200': {description: Application list}}}
-    post: {operationId: createApplication, responses: {'201': {description: Application created}}}
-  /api/v1/apps/import/inspect: {post: {operationId: inspectImport, responses: {'200': {description: Inspection}}}}
-  /api/v1/apps/{appId}: {get: {operationId: getApplication, parameters: [{name: appId, in: path, required: true}], responses: {'200': {description: Application}}}}
-  /api/v1/apps/{appId}/services: {get: {operationId: listServices, responses: {'200': {description: Services}}}}
-  /api/v1/apps/{appId}/deployments: {post: {operationId: deployApplication, responses: {'202': {description: Job created}}}}
-  /api/v1/apps/{appId}/start: {post: {operationId: startApplication, responses: {'202': {description: Job created}}}}
-  /api/v1/apps/{appId}/stop: {post: {operationId: stopApplication, responses: {'202': {description: Job created}}}}
-  /api/v1/apps/{appId}/restart: {post: {operationId: restartApplication, responses: {'202': {description: Job created}}}}
-  /api/v1/apps/{appId}/logs/stream: {get: {operationId: streamLogs, responses: {'200': {description: SSE stream}}}}
-  /api/v1/jobs/{jobId}: {get: {operationId: getJob, responses: {'200': {description: Job}}}}
-  /api/v1/jobs: {get: {operationId: listJobs, responses: {'200': {description: Durable job activity}}}}
-  /api/v1/jobs/{jobId}/events: {get: {operationId: listJobEvents, responses: {'200': {description: Events}}}}
-  /api/v1/jobs/{jobId}/events/stream: {get: {operationId: streamJobEvents, responses: {'200': {description: SSE stream}}}}
+    get:
+      operationId: listApplications
+      responses:
+        '200': {description: Applications, content: {application/json: {schema: {$ref: '#/components/schemas/ApplicationList'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      operationId: createApplication
+      security: [{sessionCookie: [], csrfHeader: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CreateApplicationRequest'}}}}
+      responses:
+        '201': {description: Application created, content: {application/json: {schema: {$ref: '#/components/schemas/Application'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/import/inspect:
+    post:
+      operationId: inspectImport
+      security: [{sessionCookie: [], csrfHeader: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/InspectRequest'}}}}
+      responses:
+        '200': {description: Phase A inspection boundary, content: {application/json: {schema: {$ref: '#/components/schemas/InspectResponse'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    get:
+      operationId: getApplication
+      responses:
+        '200': {description: Application, content: {application/json: {schema: {$ref: '#/components/schemas/Application'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/services:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    get:
+      operationId: listServices
+      responses:
+        '200': {description: Application services, content: {application/json: {schema: {$ref: '#/components/schemas/ServiceList'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/deployments:
+    parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
+    post:
+      operationId: deployApplication
+      security: [{sessionCookie: [], csrfHeader: []}]
+      responses: *jobResponses
+  /api/v1/apps/{appId}/start:
+    parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
+    post:
+      operationId: startApplication
+      security: [{sessionCookie: [], csrfHeader: []}]
+      responses: *jobResponses
+  /api/v1/apps/{appId}/stop:
+    parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
+    post:
+      operationId: stopApplication
+      security: [{sessionCookie: [], csrfHeader: []}]
+      responses: *jobResponses
+  /api/v1/apps/{appId}/restart:
+    parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
+    post:
+      operationId: restartApplication
+      security: [{sessionCookie: [], csrfHeader: []}]
+      responses: *jobResponses
+  /api/v1/apps/{appId}/logs/stream:
+    parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/LastEventId'}]
+    get:
+      operationId: streamLogs
+      responses:
+        '200': {description: SSE log boundary stream, content: {text/event-stream: {schema: {type: string}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/jobs:
+    get:
+      operationId: listJobs
+      responses:
+        '200': {description: Durable jobs, content: {application/json: {schema: {$ref: '#/components/schemas/JobList'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/jobs/{jobId}:
+    parameters: [{$ref: '#/components/parameters/JobId'}]
+    get:
+      operationId: getJob
+      responses:
+        '200': {description: Job, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/jobs/{jobId}/events:
+    parameters: [{$ref: '#/components/parameters/JobId'}, {$ref: '#/components/parameters/AfterEventId'}]
+    get:
+      operationId: listJobEvents
+      responses:
+        '200': {description: Ordered durable job events, content: {application/json: {schema: {$ref: '#/components/schemas/JobEventList'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/jobs/{jobId}/events/stream:
+    parameters: [{$ref: '#/components/parameters/JobId'}, {$ref: '#/components/parameters/AfterEventId'}, {$ref: '#/components/parameters/LastEventId'}]
+    get:
+      operationId: streamJobEvents
+      responses:
+        '200': {description: Replayable SSE job-event stream, content: {text/event-stream: {schema: {type: string}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/machines:
+    get:
+      operationId: listMachines
+      responses:
+        '200': {description: Registered machines, content: {application/json: {schema: {$ref: '#/components/schemas/MachineList'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: hostd_session
+      description: Opaque random session token. Set HttpOnly, Path=/, SameSite=Strict; Secure is enabled when served over TLS. Only a SHA-256 hash is stored.
+    csrfHeader:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: Required with sessionCookie for every non-safe request. Rotated by the authenticated CSRF endpoint; only its hash is stored.
+  headers:
+    SessionCookie:
+      description: HttpOnly hostd_session cookie with Path=/ and SameSite=Strict; Secure when TLS is configured.
+      schema: {type: string}
+  parameters:
+    AppId: {name: appId, in: path, required: true, schema: {type: string, format: uuid}}
+    JobId: {name: jobId, in: path, required: true, schema: {type: string, format: uuid}}
+    IdempotencyKey: {name: Idempotency-Key, in: header, required: false, schema: {type: string, maxLength: 200}}
+    AfterEventId: {name: after, in: query, required: false, schema: {type: integer, format: int64, minimum: 0}}
+    LastEventId: {name: Last-Event-ID, in: header, required: false, schema: {type: integer, format: int64, minimum: 0}}
+  responses:
+    Problem:
+      description: RFC 9457 problem response
+      content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, detail, code, requestId]
+      properties:
+        type: {type: string, format: uri}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        code: {type: string}
+        requestId: {type: string}
+        errors: {type: object, additionalProperties: {type: string}}
+    BootstrapStatus: {type: object, required: [bootstrapRequired], properties: {bootstrapRequired: {type: boolean}}}
+    BootstrapRequest: {type: object, additionalProperties: false, required: [token, username, passphrase], properties: {token: {type: string}, username: {type: string}, passphrase: {type: string, minLength: 12}}}
+    LoginRequest: {type: object, additionalProperties: false, required: [username, passphrase], properties: {username: {type: string}, passphrase: {type: string}}}
+    User: {type: object, required: [id, username, role], properties: {id: {type: string, format: uuid}, username: {type: string}, role: {type: string, const: administrator}}}
+    SessionResponse: {type: object, required: [user, csrfToken], properties: {user: {$ref: '#/components/schemas/User'}, csrfToken: {type: string}}}
+    MeResponse: {type: object, required: [user], properties: {user: {$ref: '#/components/schemas/User'}}}
+    CSRFResponse: {type: object, required: [csrfToken], properties: {csrfToken: {type: string}}}
+    Capabilities: {type: object, required: [fakeRuntime], properties: {fakeRuntime: {type: boolean}}}
+    Diagnostics:
+      type: object
+      required: [daemonRunning, clientAvailable, engineReady, composeAvailable, caddyManaged, os, architecture, dockerDetail, composeDetail, startupLimitation]
+      properties: {daemonRunning: {type: boolean}, clientAvailable: {type: boolean}, engineReady: {type: boolean}, composeAvailable: {type: boolean}, caddyManaged: {type: boolean}, os: {type: string}, architecture: {type: string}, dockerDetail: {type: string}, composeDetail: {type: string}, startupLimitation: {type: string}}
+    SystemStatus: {type: object, required: [daemon, diagnostics, capabilities], properties: {daemon: {type: string, const: running}, diagnostics: {$ref: '#/components/schemas/Diagnostics'}, capabilities: {$ref: '#/components/schemas/Capabilities'}}}
+    DoctorCheck: {type: object, required: [name, ok, detail], properties: {name: {type: string}, ok: {type: boolean}, detail: {type: string}}}
+    DoctorResponse: {type: object, required: [checks, startupLimitation], properties: {checks: {type: array, items: {$ref: '#/components/schemas/DoctorCheck'}}, startupLimitation: {type: string}}}
+    Application: {type: object, required: [id, slug, name, description, status, machineName, createdAt], properties: {id: {type: string, format: uuid}, slug: {type: string}, name: {type: string}, description: {type: string}, status: {type: string}, machineName: {type: string}, createdAt: {type: string, format: date-time}}}
+    ApplicationList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Application'}}}}
+    CreateApplicationRequest: {type: object, additionalProperties: false, required: [name], properties: {name: {type: string}, description: {type: string}, sourcePath: {type: string}, machineId: {type: string, format: uuid}}}
+    InspectRequest: {type: object, additionalProperties: false, required: [sourcePath], properties: {sourcePath: {type: string}}}
+    InspectResponse: {type: object, required: [source, inspection, message], properties: {source: {type: string}, inspection: {type: string}, message: {type: string}}}
+    Service: {type: object, required: [id, name, kind, status], properties: {id: {type: string, format: uuid}, name: {type: string}, kind: {type: string}, status: {type: string}, port: {type: integer}}}
+    ServiceList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Service'}}}}
+    Job: {type: object, required: [id, type, resourceType, resourceId, status, phase, checkpoint, progress, createdAt, updatedAt], properties: {id: {type: string, format: uuid}, type: {type: string}, resourceType: {type: string}, resourceId: {type: string}, status: {type: string}, phase: {type: string}, checkpoint: {type: string}, errorCode: {type: string}, errorDetail: {type: string}, progress: {type: integer}, createdAt: {type: string, format: date-time}, updatedAt: {type: string, format: date-time}}}
+    JobMutationResponse: {type: object, required: [job, created], properties: {job: {$ref: '#/components/schemas/Job'}, created: {type: boolean}}}
+    JobList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Job'}}}}
+    JobEvent: {type: object, required: [id, jobId, sequence, timestamp, level, phase, code, message], properties: {id: {type: integer, format: int64}, jobId: {type: string, format: uuid}, sequence: {type: integer}, timestamp: {type: string, format: date-time}, level: {type: string}, phase: {type: string}, code: {type: string}, message: {type: string}}}
+    JobEventList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/JobEvent'}}}}
+    Machine: {type: object, required: [id, name, status, os, architecture, hostname, dockerVersion, composeVersion, resources], properties: {id: {type: string, format: uuid}, name: {type: string}, status: {type: string}, os: {type: string}, architecture: {type: string}, hostname: {type: string}, dockerVersion: {type: string}, composeVersion: {type: string}, resources: {type: object, additionalProperties: true}}}
+    MachineList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Machine'}}}}

@@ -3,9 +3,9 @@ package config
 import (
 	"errors"
 	"flag"
-	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type Config struct {
@@ -45,10 +45,37 @@ func FromFlags(args []string) (Config, error) {
 	if c.ListenAddress == "" {
 		return Config{}, errors.New("listen address is required")
 	}
-	if !c.FakeRuntime && filepath.Base(c.DataRoot) == ".hostd-dev" {
-		return Config{}, fmt.Errorf("fake runtime must be explicitly enabled for development data root")
+	if c.FakeRuntime && !safeFakeRuntimeRoot(c.DataRoot) {
+		return Config{}, errors.New("fake runtime requires a resolved .hostd-dev root or an isolated hostd-* test root under the system temporary directory")
 	}
 	return c, nil
+}
+
+func safeFakeRuntimeRoot(root string) bool {
+	resolved, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	if evaluated, evalErr := filepath.EvalSymlinks(resolved); evalErr == nil {
+		resolved = evaluated
+	} else if parent, parentErr := filepath.EvalSymlinks(filepath.Dir(resolved)); parentErr == nil {
+		resolved = filepath.Join(parent, filepath.Base(resolved))
+	}
+	if filepath.Base(resolved) == ".hostd-dev" {
+		return true
+	}
+	temp, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		temp, err = filepath.Abs(os.TempDir())
+		if err != nil {
+			return false
+		}
+	}
+	relative, err := filepath.Rel(temp, resolved)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return strings.HasPrefix(filepath.Base(resolved), "hostd-")
 }
 
 func (c Config) EnsureDataRoot() error {

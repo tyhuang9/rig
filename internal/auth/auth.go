@@ -202,6 +202,25 @@ func (s *Service) Authenticate(token string) (User, string, error) {
 func (s *Service) CheckCSRF(expectedHash, supplied string) bool {
 	return supplied != "" && digest(supplied) == expectedHash
 }
+func (s *Service) RotateCSRF(sessionToken string) (string, error) {
+	csrf, err := randomToken()
+	if err != nil {
+		return "", err
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	result, err := s.db.Exec(`UPDATE sessions SET csrf_hash=?,last_seen_at=? WHERE token_hash=? AND revoked_at IS NULL AND expires_at>?`, digest(csrf), now, digest(sessionToken), now)
+	if err != nil {
+		return "", err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if updated != 1 {
+		return "", errors.New("unauthenticated")
+	}
+	return csrf, nil
+}
 func (s *Service) Logout(token string) error {
 	_, err := s.db.Exec(`UPDATE sessions SET revoked_at=? WHERE token_hash=?`, s.now().UTC().Format(time.RFC3339Nano), digest(token))
 	return err

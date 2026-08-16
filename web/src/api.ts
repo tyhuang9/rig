@@ -52,7 +52,18 @@ export function clearCSRF() {
   window.sessionStorage.removeItem("hostd-csrf");
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function rotateCSRF(): Promise<string> {
+  const response = await fetch("/api/v1/auth/csrf", {
+    credentials: "same-origin",
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) throw new Error("Authentication required");
+  const body = (await response.json()) as { csrfToken: string };
+  setCSRF(body.csrfToken);
+  return body.csrfToken;
+}
+
+async function request<T>(path: string, init: RequestInit = {}, retryCSRF = true): Promise<T> {
   const mutating = init.method && !["GET", "HEAD", "OPTIONS"].includes(init.method);
   const response = await fetch(path, {
     ...init,
@@ -65,6 +76,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ detail: "Request failed" }));
+    if (response.status === 403 && body.code === "csrf_failed" && mutating && retryCSRF) {
+      await rotateCSRF();
+      return request<T>(path, init, false);
+    }
     throw new Error(body.detail || "Request failed");
   }
   return response.status === 204 ? (undefined as T) : response.json();
@@ -84,6 +99,7 @@ export const api = {
       body: JSON.stringify(data),
     }),
   me: () => request<{ user: User }>("/api/v1/auth/me"),
+  csrf: rotateCSRF,
   logout: () => request<void>("/api/v1/auth/sessions/current", { method: "DELETE" }),
   status: () => request<SystemStatus>("/api/v1/system/status"),
   apps: () => request<{ items: Application[] }>("/api/v1/apps"),

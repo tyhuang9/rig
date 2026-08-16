@@ -26,6 +26,14 @@ func TestBootstrapLoginAndLogout(t *testing.T) {
 	if _, _, err := s.Authenticate(session.Token); err != nil {
 		t.Fatal(err)
 	}
+	rotated, err := s.RotateCSRF(session.Token)
+	if err != nil || rotated == "" || rotated == session.CSRF {
+		t.Fatalf("RotateCSRF() = %q, %v", rotated, err)
+	}
+	_, csrfHash, err := s.Authenticate(session.Token)
+	if err != nil || !s.CheckCSRF(csrfHash, rotated) || s.CheckCSRF(csrfHash, session.CSRF) {
+		t.Fatal("CSRF rotation did not replace the stored hash")
+	}
 	if err := s.Logout(session.Token); err != nil {
 		t.Fatal(err)
 	}
