@@ -6,7 +6,7 @@
 - [x] Implement durable serialized fake-runtime jobs, events, replay, cancellation, and restart recovery.
 - [x] Implement the embedded React dashboard and CLI.
 - [x] Add fixtures, scripts, unit/API/frontend tests and run static verification.
-- [ ] Capture browser screenshots and complete full production process/e2e verification.
+- [x] Capture browser screenshots and complete full production process/e2e verification.
 
 ## Explicitly deferred
 

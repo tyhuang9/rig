@@ -13,6 +13,8 @@ test:
 test-integration:
 	go test ./...
 test-e2e:
+	pnpm --dir web build
+	powershell -ExecutionPolicy Bypass -File scripts/embed-web.ps1
 	pnpm --dir web e2e
 build:
 	pnpm --dir web build

@@ -76,24 +76,27 @@ function Login({ setup, onAuthenticated }: { setup: boolean; onAuthenticated: (u
   const { register, handleSubmit, formState: { errors, isSubmitting }, reset } = useForm<LoginFields>({
     resolver: zodResolver(loginSchema),
     defaultValues: { token: "", username: "", passphrase: "" },
+    shouldFocusError: false,
   });
   const submit = async (values: LoginFields) => {
     setServerError("");
     if (bootstrapMode && !values.token.trim()) {
       setServerError("Enter the one-time bootstrap token.");
-      queueMicrotask(() => errorSummary.current?.focus());
+      window.setTimeout(() => errorSummary.current?.focus(), 0);
       return;
     }
     try {
-      const response = bootstrapMode ? await api.bootstrap(values) : await api.login(values);
+      const response = bootstrapMode
+        ? await api.bootstrap(values)
+        : await api.login({ username: values.username, passphrase: values.passphrase });
       setCSRF(response.csrfToken);
       onAuthenticated(response.user);
     } catch (error) {
       setServerError(error instanceof Error ? error.message : "Unable to sign in");
-      queueMicrotask(() => errorSummary.current?.focus());
+      window.setTimeout(() => errorSummary.current?.focus(), 0);
     }
   };
-  const invalid = () => queueMicrotask(() => errorSummary.current?.focus());
+  const invalid = () => window.setTimeout(() => errorSummary.current?.focus(), 0);
   return <main className="auth">
     <section aria-labelledby="auth-title">
       <div className="auth-brand"><b aria-hidden="true">h&gt;</b><span>hostd</span></div>
@@ -158,9 +161,9 @@ function AddApplicationPage() {
   const queryClient = useQueryClient();
   const [inspection, setInspection] = useState("");
   const errorSummary = useRef<HTMLDivElement>(null);
-  const { register, handleSubmit, getValues, formState: { errors, isSubmitting } } = useForm<AddFields>({ resolver: zodResolver(addSchema), defaultValues: { name: "", description: "", sourcePath: "" } });
+  const { register, handleSubmit, getValues, formState: { errors, isSubmitting } } = useForm<AddFields>({ resolver: zodResolver(addSchema), defaultValues: { name: "", description: "", sourcePath: "" }, shouldFocusError: false });
   const create = useMutation({ mutationFn: api.createApp, onSuccess: async (app) => { await queryClient.invalidateQueries({ queryKey: ["apps"] }); navigate(`/apps/${app.id}`); } });
-  const invalid = () => queueMicrotask(() => errorSummary.current?.focus());
+  const invalid = () => window.setTimeout(() => errorSummary.current?.focus(), 0);
   return <>
     <PageHeader title="Add application" subtitle="Save a source reference and durable application draft." action={<button className="button" onClick={() => navigate("/apps")}>Cancel</button>}/>
     <div className="wizard">

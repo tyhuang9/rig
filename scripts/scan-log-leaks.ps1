@@ -7,4 +7,4 @@ foreach ($value in $forbidden) {
   $hits = Get-ChildItem -LiteralPath $state -Recurse -File -Exclude '*.png','*.exe' | Select-String -SimpleMatch -Pattern $value
   if ($hits) { throw "Potential secret fixture leaked into repository: $value" }
 }
-Write-Output 'No known fixture auth or secret values found in tracked source.'
+Write-Output 'No known fixture auth or secret values found in local runtime state.'

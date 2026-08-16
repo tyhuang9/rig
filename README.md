@@ -25,6 +25,7 @@ powershell -ExecutionPolicy Bypass -File scripts/scan-log-leaks.ps1
 pnpm --dir web typecheck
 pnpm --dir web test
 go run ./cmd/hostctl doctor
+powershell -ExecutionPolicy Bypass -File scripts/capture-visuals.ps1
 ```
 
 Equivalent shell commands are in `scripts/*.sh`; `make build` runs the production asset embedding workflow.

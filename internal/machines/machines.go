@@ -49,22 +49,20 @@ func (s *Store) Get(id string) (Machine, error) {
 	return m, err
 }
 func (s *Store) List() ([]Machine, error) {
-	rows, err := s.db.Query(`SELECT id FROM machines ORDER BY created_at`)
+	rows, err := s.db.Query(`SELECT id,name,status,os,architecture,hostname,COALESCE(docker_version,''),COALESCE(compose_version,''),resources_json FROM machines ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Machine
+	out := make([]Machine, 0)
 	for rows.Next() {
-		var id string
-		if err = rows.Scan(&id); err != nil {
+		var machine Machine
+		var resources string
+		if err = rows.Scan(&machine.ID, &machine.Name, &machine.Status, &machine.OS, &machine.Architecture, &machine.Hostname, &machine.DockerVersion, &machine.ComposeVersion, &resources); err != nil {
 			return nil, err
 		}
-		m, e := s.Get(id)
-		if e != nil {
-			return nil, e
-		}
-		out = append(out, m)
+		machine.Resources = map[string]any{"reported": resources}
+		out = append(out, machine)
 	}
 	return out, rows.Err()
 }

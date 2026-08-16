@@ -75,6 +75,16 @@ func TestBrowserContractUsesLowerCamelJSON(t *testing.T) {
 	if _, present := jobBody.Job["ID"]; present {
 		t.Fatalf("upper-case job key leaked: %s", deployed.Body.String())
 	}
+
+	withoutFakeRuntime := (&controller.Server{Auth: authService, Apps: apps.New(db), Jobs: jobService, Machines: machineStore, FakeRuntime: false, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).Handler()
+	blocked := httptest.NewRequest(http.MethodPost, "/api/v1/apps/"+appID+"/deployments", strings.NewReader("{}"))
+	blocked.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: session.Token})
+	blocked.Header.Set("X-CSRF-Token", session.CSRF)
+	blockedResponse := httptest.NewRecorder()
+	withoutFakeRuntime.ServeHTTP(blockedResponse, blocked)
+	if blockedResponse.Code != http.StatusConflict || !strings.Contains(blockedResponse.Body.String(), "capability_unavailable") {
+		t.Fatalf("runtime action was not capability-gated: %d %s", blockedResponse.Code, blockedResponse.Body.String())
+	}
 }
 
 func authenticatedRequest(t *testing.T, handler http.Handler, session auth.Session, method, path, body string) *httptest.ResponseRecorder {
