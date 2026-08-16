@@ -10,12 +10,21 @@ import (
 )
 
 func main() {
-	var endpoint string
+	var endpoint, sessionToken string
 	root := &cobra.Command{Use: "hostctl", Short: "hostd local control-plane client"}
 	root.PersistentFlags().StringVar(&endpoint, "endpoint", "http://127.0.0.1:7345", "hostd endpoint")
+	root.PersistentFlags().StringVar(&sessionToken, "session-token", os.Getenv("HOSTD_SESSION_TOKEN"), "hostd browser session token")
 	get := func(path string) func(*cobra.Command, []string) {
 		return func(_ *cobra.Command, _ []string) {
-			r, err := http.Get(endpoint + path)
+			req, err := http.NewRequest(http.MethodGet, endpoint+path, nil)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return
+			}
+			if sessionToken != "" {
+				req.AddCookie(&http.Cookie{Name: "hostd_session", Value: sessionToken})
+			}
+			r, err := http.DefaultClient.Do(req)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				return

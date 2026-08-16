@@ -57,4 +57,10 @@ func TestAuthAndProtectedAPI(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("want 403 got %d", w.Code)
 	}
+	r = httptest.NewRequest(http.MethodGet, "/apps/any/deep/link", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "root") {
+		t.Fatalf("embedded SPA deep link failed: %d", w.Code)
+	}
 }

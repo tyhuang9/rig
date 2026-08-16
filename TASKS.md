@@ -1,11 +1,12 @@
 # Milestone 1 — Foundation with a real local control plane
 
 - [x] Establish repository layout, toolchain metadata, durable architecture and design documentation.
-- [ ] Add SQLite migration and repositories for the Phase A control-plane records.
-- [ ] Implement authenticated API shell, bootstrap, sessions, CSRF, diagnostics, and API contract.
-- [ ] Implement durable serialized fake-runtime jobs, events, replay, cancellation, and restart recovery.
-- [ ] Implement the embedded React dashboard and CLI.
-- [ ] Add fixtures, scripts, unit/API/frontend/e2e tests, then complete verification.
+- [x] Add SQLite migration and repositories for the Phase A control-plane records.
+- [x] Implement authenticated API shell, bootstrap, sessions, CSRF, diagnostics, and API contract.
+- [x] Implement durable serialized fake-runtime jobs, events, replay, cancellation, and restart recovery.
+- [x] Implement the embedded React dashboard and CLI.
+- [x] Add fixtures, scripts, unit/API/frontend tests and run static verification.
+- [ ] Capture browser screenshots and complete full production process/e2e verification.
 
 ## Explicitly deferred
 
