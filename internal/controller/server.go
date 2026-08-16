@@ -138,7 +138,7 @@ func requestID(r *http.Request) string { v, _ := r.Context().Value(requestIDKey{
 func problem(w http.ResponseWriter, r *http.Request, status int, code, detail string, fields map[string]string) {
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"type": "https://hostd.local/problems/" + code, "title": http.StatusText(status), "status": status, "detail": detail, "code": code, "requestId": requestID(r), "errors": fields})
+	_ = json.NewEncoder(w).Encode(apicontract.Problem{Type: "https://hostd.local/problems/" + code, Title: http.StatusText(status), Status: status, Detail: detail, Code: code, RequestID: requestID(r), Errors: fields})
 }
 func readJSON(r *http.Request, dst any) error {
 	defer r.Body.Close()
@@ -157,20 +157,94 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+func contractUser(value auth.User) apicontract.User {
+	return apicontract.User{ID: value.ID, Username: value.Username, Role: value.Role}
+}
+
+func contractApplication(value apps.Application) apicontract.Application {
+	return apicontract.Application{ID: value.ID, Slug: value.Slug, Name: value.Name, Description: value.Description, Status: value.Status, MachineName: value.MachineName, CreatedAt: value.CreatedAt.Format(time.RFC3339Nano)}
+}
+
+func contractApplications(values []apps.Application) []apicontract.Application {
+	result := make([]apicontract.Application, 0, len(values))
+	for _, value := range values {
+		result = append(result, contractApplication(value))
+	}
+	return result
+}
+
+func contractServices(values []apps.Service) []apicontract.Service {
+	result := make([]apicontract.Service, 0, len(values))
+	for _, value := range values {
+		service := apicontract.Service{ID: value.ID, Name: value.Name, Kind: value.Kind, Status: value.Status}
+		if value.Port != nil {
+			service.Port = *value.Port
+		}
+		result = append(result, service)
+	}
+	return result
+}
+
+func contractJob(value jobs.Job) apicontract.Job {
+	return apicontract.Job{ID: value.ID, Type: value.Type, ResourceType: value.ResourceType, ResourceID: value.ResourceID, Status: value.Status, Phase: value.Phase, Checkpoint: value.Checkpoint, ErrorCode: value.ErrorCode, ErrorDetail: value.ErrorDetail, Progress: value.Progress, CreatedAt: value.CreatedAt.Format(time.RFC3339Nano), UpdatedAt: value.UpdatedAt.Format(time.RFC3339Nano)}
+}
+
+func contractJobs(values []jobs.Job) []apicontract.Job {
+	result := make([]apicontract.Job, 0, len(values))
+	for _, value := range values {
+		result = append(result, contractJob(value))
+	}
+	return result
+}
+
+func contractJobEvent(value jobs.Event) apicontract.JobEvent {
+	return apicontract.JobEvent{ID: value.ID, JobID: value.JobID, Sequence: value.Sequence, Timestamp: value.Timestamp.Format(time.RFC3339Nano), Level: value.Level, Phase: value.Phase, Code: value.Code, Message: value.Message}
+}
+
+func contractJobEvents(values []jobs.Event) []apicontract.JobEvent {
+	result := make([]apicontract.JobEvent, 0, len(values))
+	for _, value := range values {
+		result = append(result, contractJobEvent(value))
+	}
+	return result
+}
+
+func contractMachine(value machines.Machine) apicontract.Machine {
+	return apicontract.Machine{ID: value.ID, Name: value.Name, Status: value.Status, OS: value.OS, Architecture: value.Architecture, Hostname: value.Hostname, DockerVersion: value.DockerVersion, ComposeVersion: value.ComposeVersion, Resources: value.Resources}
+}
+
+func contractMachines(values []machines.Machine) []apicontract.Machine {
+	result := make([]apicontract.Machine, 0, len(values))
+	for _, value := range values {
+		result = append(result, contractMachine(value))
+	}
+	return result
+}
+
+func contractDiagnostics(value docker.Diagnostics) apicontract.Diagnostics {
+	return apicontract.Diagnostics{
+		DaemonRunning: value.DaemonRunning, ClientAvailable: value.ClientAvailable, EngineReady: value.EngineReady,
+		ComposeAvailable: value.ComposeAvailable, CaddyManaged: value.CaddyManaged, OS: value.OS,
+		Architecture: value.Architecture, DockerVersion: value.DockerVersion, ComposeVersion: value.ComposeVersion,
+		DockerDetail: value.DockerDetail, ComposeDetail: value.ComposeDetail, StartupLimitation: value.StartupLimitation,
+		Resources: apicontract.HostResources{
+			MemoryTotalBytes: int64(value.Resources.MemoryTotalBytes), MemoryAvailableBytes: int64(value.Resources.MemoryAvailableBytes),
+			DiskTotalBytes: int64(value.Resources.DiskTotalBytes), DiskAvailableBytes: int64(value.Resources.DiskAvailableBytes),
+		},
+	}
+}
+
 func (s *Server) bootstrapStatus(w http.ResponseWriter, r *http.Request) {
 	needed, err := s.Auth.BootstrapStatus()
 	if err != nil {
 		problem(w, r, 500, "internal_error", "Could not inspect bootstrap state", nil)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"bootstrapRequired": needed})
+	writeJSON(w, 200, apicontract.BootstrapStatus{BootstrapRequired: needed})
 }
 func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
-	var b struct {
-		Token      string `json:"token"`
-		Username   string `json:"username"`
-		Passphrase string `json:"passphrase"`
-	}
+	var b apicontract.BootstrapRequest
 	if err := readJSON(r, &b); err != nil {
 		problem(w, r, 400, "invalid_request", "Invalid bootstrap request", nil)
 		return
@@ -181,13 +255,10 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSession(w, session)
-	writeJSON(w, 201, map[string]any{"user": u, "csrfToken": session.CSRF})
+	writeJSON(w, 201, apicontract.SessionResponse{User: contractUser(u), CSRFToken: session.CSRF})
 }
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	var b struct {
-		Username   string `json:"username"`
-		Passphrase string `json:"passphrase"`
-	}
+	var b apicontract.LoginRequest
 	if err := readJSON(r, &b); err != nil {
 		problem(w, r, 400, "invalid_request", "Invalid session request", nil)
 		return
@@ -198,7 +269,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSession(w, session)
-	writeJSON(w, 201, map[string]any{"user": u, "csrfToken": session.CSRF})
+	writeJSON(w, 201, apicontract.SessionResponse{User: contractUser(u), CSRFToken: session.CSRF})
 }
 func (s *Server) setSession(w http.ResponseWriter, v auth.Session) {
 	http.SetCookie(w, &http.Cookie{Name: auth.SessionCookie, Value: v.Token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: v.ExpiresAt, Secure: false})
@@ -211,7 +282,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	p := r.Context().Value(principalKey{}).(principal)
-	writeJSON(w, 200, map[string]any{"user": p.user})
+	writeJSON(w, 200, apicontract.MeResponse{User: contractUser(p.user)})
 }
 func (s *Server) rotateCSRF(w http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie(auth.SessionCookie)
@@ -225,16 +296,16 @@ func (s *Server) rotateCSRF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, map[string]string{"csrfToken": token})
+	writeJSON(w, http.StatusOK, apicontract.CSRFResponse{CSRFToken: token})
 }
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	d := s.runDiagnostics(r.Context())
-	writeJSON(w, 200, map[string]any{"daemon": "running", "diagnostics": d, "capabilities": map[string]bool{"fakeRuntime": s.FakeRuntime}})
+	writeJSON(w, 200, apicontract.SystemStatus{Daemon: "running", Diagnostics: contractDiagnostics(d), Capabilities: apicontract.Capabilities{FakeRuntime: s.FakeRuntime}})
 }
 func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
 	d := s.runDiagnostics(r.Context())
-	checks := []map[string]any{{"name": "hostd", "ok": true, "detail": "daemon running"}, {"name": "docker client", "ok": d.ClientAvailable, "detail": d.DockerDetail}, {"name": "docker engine", "ok": d.EngineReady, "detail": d.DockerDetail}, {"name": "compose v2", "ok": d.ComposeAvailable, "detail": d.ComposeDetail}, {"name": "caddy management", "ok": d.CaddyManaged, "detail": "disabled in Phase A"}}
-	writeJSON(w, 200, map[string]any{"checks": checks, "startupLimitation": d.StartupLimitation})
+	checks := []apicontract.DoctorCheck{{Name: "hostd", OK: true, Detail: "daemon running"}, {Name: "docker client", OK: d.ClientAvailable, Detail: d.DockerDetail}, {Name: "docker engine", OK: d.EngineReady, Detail: d.DockerDetail}, {Name: "compose v2", OK: d.ComposeAvailable, Detail: d.ComposeDetail}, {Name: "caddy management", OK: d.CaddyManaged, Detail: "disabled in Phase A"}}
+	writeJSON(w, 200, apicontract.DoctorResponse{Checks: checks, StartupLimitation: d.StartupLimitation})
 }
 func (s *Server) runDiagnostics(ctx context.Context) docker.Diagnostics {
 	diagnostic := docker.Check(ctx, s.Caddy, s.DockerEndpoint, s.DataRoot)
@@ -247,15 +318,10 @@ func (s *Server) listApps(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 500, "internal_error", "Could not list applications", nil)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"items": v})
+	writeJSON(w, 200, apicontract.ApplicationList{Items: contractApplications(v)})
 }
 func (s *Server) createApp(w http.ResponseWriter, r *http.Request) {
-	var b struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
-		SourcePath  string `json:"sourcePath"`
-		MachineID   string `json:"machineId"`
-	}
+	var b apicontract.CreateApplicationRequest
 	if err := readJSON(r, &b); err != nil {
 		problem(w, r, 400, "invalid_request", "Invalid application", nil)
 		return
@@ -265,12 +331,10 @@ func (s *Server) createApp(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 422, "validation_failed", err.Error(), map[string]string{"name": err.Error()})
 		return
 	}
-	writeJSON(w, 201, v)
+	writeJSON(w, 201, contractApplication(v))
 }
 func (s *Server) inspectApp(w http.ResponseWriter, r *http.Request) {
-	var b struct {
-		SourcePath string `json:"sourcePath"`
-	}
+	var b apicontract.InspectRequest
 	if err := readJSON(r, &b); err != nil {
 		problem(w, r, 400, "invalid_request", "Invalid inspection request", nil)
 		return
@@ -280,7 +344,7 @@ func (s *Server) inspectApp(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 422, "validation_failed", err.Error(), map[string]string{"sourcePath": err.Error()})
 		return
 	}
-	writeJSON(w, 200, v)
+	writeJSON(w, 200, apicontract.InspectResponse{Source: fmt.Sprint(v["source"]), Inspection: fmt.Sprint(v["inspection"]), Message: fmt.Sprint(v["message"])})
 }
 func (s *Server) getApp(w http.ResponseWriter, r *http.Request) {
 	v, err := s.Apps.Get(r.PathValue("appId"))
@@ -288,7 +352,7 @@ func (s *Server) getApp(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 404, "app_not_found", "Application was not found", nil)
 		return
 	}
-	writeJSON(w, 200, v)
+	writeJSON(w, 200, contractApplication(v))
 }
 func (s *Server) services(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.Apps.Get(r.PathValue("appId")); err != nil {
@@ -300,7 +364,7 @@ func (s *Server) services(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 404, "app_not_found", "Application was not found", nil)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"items": v})
+	writeJSON(w, 200, apicontract.ServiceList{Items: contractServices(v)})
 }
 func (s *Server) action(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -318,7 +382,7 @@ func (s *Server) action(kind string) http.HandlerFunc {
 			problem(w, r, 409, "application_busy", err.Error(), nil)
 			return
 		}
-		writeJSON(w, map[bool]int{true: 202, false: 200}[created], map[string]any{"job": job, "created": created})
+		writeJSON(w, map[bool]int{true: 202, false: 200}[created], apicontract.JobMutationResponse{Job: contractJob(job), Created: created})
 	}
 }
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
@@ -327,7 +391,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not list jobs", nil)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": v})
+	writeJSON(w, http.StatusOK, apicontract.JobList{Items: contractJobs(v)})
 }
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	v, err := s.Jobs.Get(r.PathValue("jobId"))
@@ -335,13 +399,13 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 404, "job_not_found", "Job was not found", nil)
 		return
 	}
-	writeJSON(w, 200, v)
+	writeJSON(w, 200, contractJob(v))
 }
 func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	job, err := s.Jobs.Cancel(r.PathValue("jobId"))
 	switch {
 	case err == nil:
-		writeJSON(w, http.StatusOK, map[string]any{"job": job})
+		writeJSON(w, http.StatusOK, apicontract.JobResponse{Job: contractJob(job)})
 	case errors.Is(err, jobs.ErrJobNotFound):
 		problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
 	case errors.Is(err, jobs.ErrJobTerminal):
@@ -361,7 +425,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 500, "internal_error", "Could not list events", nil)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"items": v})
+	writeJSON(w, 200, apicontract.JobEventList{Items: contractJobEvents(v)})
 }
 func (s *Server) eventsStream(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.Jobs.Get(r.PathValue("jobId")); err != nil {
@@ -388,7 +452,7 @@ func (s *Server) eventsStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, e := range events {
-			b, _ := json.Marshal(e)
+			b, _ := json.Marshal(contractJobEvent(e))
 			_, _ = fmt.Fprintf(w, "id: %d\nevent: job-event\ndata: %s\n\n", e.ID, b)
 			after = e.ID
 		}
@@ -416,7 +480,7 @@ func (s *Server) listMachines(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 500, "internal_error", "Could not list machines", nil)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"items": v})
+	writeJSON(w, 200, apicontract.MachineList{Items: contractMachines(v)})
 }
 func (s *Server) spa(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/api/") {

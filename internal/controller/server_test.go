@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hostd/hostd/internal/apicontract"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/controller"
@@ -36,7 +37,7 @@ func TestAuthAndProtectedAPI(t *testing.T) {
 	if _, err := m.EnsureLocal(); err != nil {
 		t.Fatal(err)
 	}
-	h := (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: jobs.New(db), Machines: m, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).Handler()
+	h := (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: jobs.New(db), Machines: m, FakeRuntime: true, DataRoot: t.TempDir(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).Handler()
 	r := httptest.NewRequest(http.MethodGet, "/api/v1/apps", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
@@ -51,6 +52,10 @@ func TestAuthAndProtectedAPI(t *testing.T) {
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("want 201 got %d: %s", w.Code, w.Body.String())
+	}
+	var createdApp apicontract.Application
+	if err := json.Unmarshal(w.Body.Bytes(), &createdApp); err != nil || createdApp.ID == "" || createdApp.Name != "Fixture" {
+		t.Fatalf("application contract response: %s (%v)", w.Body.String(), err)
 	}
 	r = httptest.NewRequest(http.MethodPost, "/api/v1/apps", strings.NewReader(`{"name":"Other"}`))
 	r.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: session.Token})
@@ -67,9 +72,7 @@ func TestAuthAndProtectedAPI(t *testing.T) {
 	if w.Code != http.StatusOK || w.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("fresh-tab CSRF retrieval failed: %d %s", w.Code, w.Body.String())
 	}
-	var csrfBody struct {
-		CSRFToken string `json:"csrfToken"`
-	}
+	var csrfBody apicontract.CSRFResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &csrfBody); err != nil || csrfBody.CSRFToken == "" || csrfBody.CSRFToken == session.CSRF {
 		t.Fatalf("unexpected rotated CSRF response: %s (%v)", w.Body.String(), err)
 	}
@@ -80,6 +83,37 @@ func TestAuthAndProtectedAPI(t *testing.T) {
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("rotated CSRF rejected: %d %s", w.Code, w.Body.String())
+	}
+
+	w = authenticatedRequest(t, h, session, http.MethodGet, "/api/v1/system/status", "")
+	var status apicontract.SystemStatus
+	if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil || status.Daemon != "running" || !status.Capabilities.FakeRuntime {
+		t.Fatalf("system status contract response: %s (%v)", w.Body.String(), err)
+	}
+	w = authenticatedRequest(t, h, session, http.MethodGet, "/api/v1/apps", "")
+	var applicationList apicontract.ApplicationList
+	if err := json.Unmarshal(w.Body.Bytes(), &applicationList); err != nil || len(applicationList.Items) != 2 {
+		t.Fatalf("application list contract response: %s (%v)", w.Body.String(), err)
+	}
+	w = authenticatedRequest(t, h, session, http.MethodGet, "/api/v1/machines", "")
+	var machineList apicontract.MachineList
+	if err := json.Unmarshal(w.Body.Bytes(), &machineList); err != nil || len(machineList.Items) != 1 || machineList.Items[0].ID == "" {
+		t.Fatalf("machine list contract response: %s (%v)", w.Body.String(), err)
+	}
+	r = httptest.NewRequest(http.MethodPost, "/api/v1/apps/"+createdApp.ID+"/deployments", nil)
+	r.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: session.Token})
+	r.Header.Set("X-CSRF-Token", csrfBody.CSRFToken)
+	r.Header.Set("Idempotency-Key", "generated-contract")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	var mutation apicontract.JobMutationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &mutation); err != nil || w.Code != http.StatusAccepted || !mutation.Created || mutation.Job.ID == "" {
+		t.Fatalf("job mutation contract response: %d %s (%v)", w.Code, w.Body.String(), err)
+	}
+	w = authenticatedRequest(t, h, session, http.MethodGet, "/api/v1/jobs", "")
+	var jobList apicontract.JobList
+	if err := json.Unmarshal(w.Body.Bytes(), &jobList); err != nil || len(jobList.Items) != 1 {
+		t.Fatalf("job list contract response: %s (%v)", w.Body.String(), err)
 	}
 	for _, path := range []string{
 		"/api/v1/apps/missing/services",
@@ -147,6 +181,10 @@ func TestCancelAPIAndLastEventIDReplay(t *testing.T) {
 	if !strings.Contains(response.Body.String(), `"status":"cancelled"`) {
 		t.Fatalf("cancel response: %s", response.Body.String())
 	}
+	var cancelled apicontract.JobResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &cancelled); err != nil || cancelled.Job.ID != job.ID || cancelled.Job.Status != string(jobs.Cancelled) {
+		t.Fatalf("cancel contract response: %s (%v)", response.Body.String(), err)
+	}
 	request = httptest.NewRequest(http.MethodPost, path, nil)
 	request.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: session.Token})
 	request.Header.Set("X-CSRF-Token", session.CSRF)
@@ -177,5 +215,27 @@ func TestCancelAPIAndLastEventIDReplay(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), fmt.Sprintf("id: %d", second.ID)) || strings.Contains(response.Body.String(), fmt.Sprintf("id: %d\n", initial[0].ID)) {
 		t.Fatalf("Last-Event-ID replay failed: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestBootstrapResponseUsesGeneratedContract(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.New(db)
+	token, err := authService.EnsureBootstrapToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := (&controller.Server{Auth: authService, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).Handler()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/bootstrap", strings.NewReader(`{"token":"`+token+`","username":"admin","passphrase":"this is a secure passphrase"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	var session apicontract.SessionResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &session); err != nil || response.Code != http.StatusCreated || session.User.ID == "" || session.User.Username != "admin" || session.CSRFToken == "" {
+		t.Fatalf("bootstrap contract response: %d %s (%v)", response.Code, response.Body.String(), err)
 	}
 }

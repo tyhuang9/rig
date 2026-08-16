@@ -1,49 +1,24 @@
-import { operations } from "./generated/api-contract";
+import {
+  operations,
+  type Application,
+  type ApplicationList,
+  type BootstrapRequest,
+  type BootstrapStatus,
+  type CreateApplicationRequest,
+  type CSRFResponse,
+  type InspectRequest,
+  type InspectResponse,
+  type JobList,
+  type JobMutationResponse,
+  type JobResponse,
+  type LoginRequest,
+  type MachineList,
+  type MeResponse,
+  type SessionResponse,
+  type SystemStatus,
+} from "./generated/api-contract";
 
-export type User = {
-  id: string;
-  username: string;
-  role: string;
-};
-
-export type Application = {
-  id: string;
-  slug: string;
-  name: string;
-  description: string;
-  status: string;
-  machineName: string;
-  createdAt: string;
-};
-
-export type Job = {
-  id: string;
-  type: string;
-  resourceType: string;
-  resourceId: string;
-  status: string;
-  phase: string;
-  progress: number;
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type Machine = {
-  id: string;
-  name: string;
-  status: string;
-  os: string;
-  architecture: string;
-  hostname: string;
-  dockerVersion: string;
-  composeVersion: string;
-  resources: Record<string, number>;
-};
-
-export type SystemStatus = {
-  daemon: string;
-  capabilities: { fakeRuntime: boolean };
-};
+export type { Application, Job, Machine, SystemStatus, User } from "./generated/api-contract";
 
 let csrfToken = window.sessionStorage.getItem("hostd-csrf") ?? "";
 
@@ -63,7 +38,7 @@ async function rotateCSRF(): Promise<string> {
     headers: { Accept: "application/json" },
   });
   if (!response.ok) throw new Error("Authentication required");
-  const body = (await response.json()) as { csrfToken: string };
+  const body = (await response.json()) as CSRFResponse;
   setCSRF(body.csrfToken);
   return body.csrfToken;
 }
@@ -91,39 +66,38 @@ async function request<T>(path: string, init: RequestInit = {}, retryCSRF = true
 }
 
 export const api = {
-  bootstrapStatus: () =>
-    request<{ bootstrapRequired: boolean }>(operations.bootstrapStatus.path),
-  bootstrap: (data: { token: string; username: string; passphrase: string }) =>
-    request<{ user: User; csrfToken: string }>(operations.bootstrap.path, {
+  bootstrapStatus: () => request<BootstrapStatus>(operations.bootstrapStatus.path),
+  bootstrap: (data: BootstrapRequest) =>
+    request<SessionResponse>(operations.bootstrap.path, {
       method: "POST",
       body: JSON.stringify(data),
     }),
-  login: (data: { username: string; passphrase: string }) =>
-    request<{ user: User; csrfToken: string }>(operations.login.path, {
+  login: (data: LoginRequest) =>
+    request<SessionResponse>(operations.login.path, {
       method: "POST",
       body: JSON.stringify(data),
     }),
-  me: () => request<{ user: User }>(operations.me.path),
+  me: () => request<MeResponse>(operations.me.path),
   csrf: rotateCSRF,
   logout: () => request<void>(operations.logout.path, { method: "DELETE" }),
   status: () => request<SystemStatus>(operations.systemStatus.path),
-  apps: () => request<{ items: Application[] }>(operations.listApplications.path),
+  apps: () => request<ApplicationList>(operations.listApplications.path),
   app: (id: string) => request<Application>(`/api/v1/apps/${id}`),
-  createApp: (data: { name: string; description: string; sourcePath: string }) =>
+  createApp: (data: CreateApplicationRequest) =>
     request<Application>(operations.createApplication.path, { method: "POST", body: JSON.stringify(data) }),
   inspect: (sourcePath: string) =>
-    request<{ message: string }>(operations.inspectImport.path, {
+    request<InspectResponse>(operations.inspectImport.path, {
       method: "POST",
-      body: JSON.stringify({ sourcePath }),
+      body: JSON.stringify({ sourcePath } satisfies InspectRequest),
     }),
-  machines: () => request<{ items: Machine[] }>(operations.listMachines.path),
-  jobs: () => request<{ items: Job[] }>(operations.listJobs.path),
+  machines: () => request<MachineList>(operations.listMachines.path),
+  jobs: () => request<JobList>(operations.listJobs.path),
   cancelJob: (id: string) =>
-    request<{ job: Job }>(operations.cancelJob.path.replace("{jobId}", encodeURIComponent(id)), {
+    request<JobResponse>(operations.cancelJob.path.replace("{jobId}", encodeURIComponent(id)), {
       method: operations.cancelJob.method,
     }),
   action: (id: string, type: "deploy" | "start" | "stop" | "restart") =>
-    request<{ job: Job }>(`/api/v1/apps/${id}/${type === "deploy" ? "deployments" : type}`, {
+    request<JobMutationResponse>(`/api/v1/apps/${id}/${type === "deploy" ? "deployments" : type}`, {
       method: "POST",
       headers: { "Idempotency-Key": crypto.randomUUID() },
     }),

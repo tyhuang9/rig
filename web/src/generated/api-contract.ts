@@ -31,36 +31,192 @@ export const operations = {
 
 export type OperationID = keyof typeof operations;
 
-export const schemaNames = [
-  "Application",
-  "ApplicationList",
-  "BootstrapRequest",
-  "BootstrapStatus",
-  "CSRFResponse",
-  "Capabilities",
-  "CreateApplicationRequest",
-  "Diagnostics",
-  "DoctorCheck",
-  "DoctorResponse",
-  "HostResources",
-  "InspectRequest",
-  "InspectResponse",
-  "Job",
-  "JobEvent",
-  "JobEventList",
-  "JobList",
-  "JobMutationResponse",
-  "JobResponse",
-  "LoginRequest",
-  "Machine",
-  "MachineList",
-  "MeResponse",
-  "Problem",
-  "Service",
-  "ServiceList",
-  "SessionResponse",
-  "SystemStatus",
-  "User",
-] as const;
+export type Application = {
+  "createdAt": string;
+  "description": string;
+  "id": string;
+  "machineName": string;
+  "name": string;
+  "slug": string;
+  "status": string;
+};
 
-export type SchemaName = (typeof schemaNames)[number];
+export type ApplicationList = {
+  "items": Application[];
+};
+
+export type BootstrapRequest = {
+  "passphrase": string;
+  "token": string;
+  "username": string;
+};
+
+export type BootstrapStatus = {
+  "bootstrapRequired": boolean;
+};
+
+export type CSRFResponse = {
+  "csrfToken": string;
+};
+
+export type Capabilities = {
+  "fakeRuntime": boolean;
+};
+
+export type CreateApplicationRequest = {
+  "description"?: string;
+  "machineId"?: string;
+  "name": string;
+  "sourcePath"?: string;
+};
+
+export type Diagnostics = {
+  "architecture": string;
+  "caddyManaged": boolean;
+  "clientAvailable": boolean;
+  "composeAvailable": boolean;
+  "composeDetail": string;
+  "composeVersion": string;
+  "daemonRunning": boolean;
+  "dockerDetail": string;
+  "dockerVersion": string;
+  "engineReady": boolean;
+  "os": string;
+  "resources": HostResources;
+  "startupLimitation": string;
+};
+
+export type DoctorCheck = {
+  "detail": string;
+  "name": string;
+  "ok": boolean;
+};
+
+export type DoctorResponse = {
+  "checks": DoctorCheck[];
+  "startupLimitation": string;
+};
+
+export type HostResources = {
+  "diskAvailableBytes": number;
+  "diskTotalBytes": number;
+  "memoryAvailableBytes": number;
+  "memoryTotalBytes": number;
+};
+
+export type InspectRequest = {
+  "sourcePath": string;
+};
+
+export type InspectResponse = {
+  "inspection": string;
+  "message": string;
+  "source": string;
+};
+
+export type Job = {
+  "checkpoint": string;
+  "createdAt": string;
+  "errorCode"?: string;
+  "errorDetail"?: string;
+  "id": string;
+  "phase": string;
+  "progress": number;
+  "resourceId": string;
+  "resourceType": string;
+  "status": string;
+  "type": string;
+  "updatedAt": string;
+};
+
+export type JobEvent = {
+  "code": string;
+  "id": number;
+  "jobId": string;
+  "level": string;
+  "message": string;
+  "phase": string;
+  "sequence": number;
+  "timestamp": string;
+};
+
+export type JobEventList = {
+  "items": JobEvent[];
+};
+
+export type JobList = {
+  "items": Job[];
+};
+
+export type JobMutationResponse = {
+  "created": boolean;
+  "job": Job;
+};
+
+export type JobResponse = {
+  "job": Job;
+};
+
+export type LoginRequest = {
+  "passphrase": string;
+  "username": string;
+};
+
+export type Machine = {
+  "architecture": string;
+  "composeVersion": string;
+  "dockerVersion": string;
+  "hostname": string;
+  "id": string;
+  "name": string;
+  "os": string;
+  "resources": Record<string, unknown>;
+  "status": string;
+};
+
+export type MachineList = {
+  "items": Machine[];
+};
+
+export type MeResponse = {
+  "user": User;
+};
+
+export type Problem = {
+  "code": string;
+  "detail": string;
+  "errors"?: Record<string, string>;
+  "requestId": string;
+  "status": number;
+  "title": string;
+  "type": string;
+};
+
+export type Service = {
+  "id": string;
+  "kind": string;
+  "name": string;
+  "port"?: number;
+  "status": string;
+};
+
+export type ServiceList = {
+  "items": Service[];
+};
+
+export type SessionResponse = {
+  "csrfToken": string;
+  "user": User;
+};
+
+export type SystemStatus = {
+  "capabilities": Capabilities;
+  "daemon": string;
+  "diagnostics": Diagnostics;
+};
+
+export type User = {
+  "id": string;
+  "role": string;
+  "username": string;
+};
