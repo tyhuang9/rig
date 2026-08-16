@@ -44,4 +44,19 @@ describe("API client", () => {
     ));
     await expect(api.login({ username: "a", passphrase: "b" })).rejects.toThrow("Invalid credentials");
   });
+
+  it("uses the generated cancellation operation with CSRF", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ job: { id: "job/one", status: "cancelled" } }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await api.cancelJob("job/one");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/jobs/job%2Fone/cancel",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }),
+      }),
+    );
+  });
 });

@@ -1,3 +1,5 @@
+import { operations } from "./generated/api-contract";
+
 export type User = {
   id: string;
   username: string;
@@ -33,6 +35,9 @@ export type Machine = {
   os: string;
   architecture: string;
   hostname: string;
+  dockerVersion: string;
+  composeVersion: string;
+  resources: Record<string, number>;
 };
 
 export type SystemStatus = {
@@ -53,7 +58,7 @@ export function clearCSRF() {
 }
 
 async function rotateCSRF(): Promise<string> {
-  const response = await fetch("/api/v1/auth/csrf", {
+  const response = await fetch(operations.rotateCSRF.path, {
     credentials: "same-origin",
     headers: { Accept: "application/json" },
   });
@@ -87,32 +92,36 @@ async function request<T>(path: string, init: RequestInit = {}, retryCSRF = true
 
 export const api = {
   bootstrapStatus: () =>
-    request<{ bootstrapRequired: boolean }>("/api/v1/auth/bootstrap/status"),
+    request<{ bootstrapRequired: boolean }>(operations.bootstrapStatus.path),
   bootstrap: (data: { token: string; username: string; passphrase: string }) =>
-    request<{ user: User; csrfToken: string }>("/api/v1/auth/bootstrap", {
+    request<{ user: User; csrfToken: string }>(operations.bootstrap.path, {
       method: "POST",
       body: JSON.stringify(data),
     }),
   login: (data: { username: string; passphrase: string }) =>
-    request<{ user: User; csrfToken: string }>("/api/v1/auth/sessions", {
+    request<{ user: User; csrfToken: string }>(operations.login.path, {
       method: "POST",
       body: JSON.stringify(data),
     }),
-  me: () => request<{ user: User }>("/api/v1/auth/me"),
+  me: () => request<{ user: User }>(operations.me.path),
   csrf: rotateCSRF,
-  logout: () => request<void>("/api/v1/auth/sessions/current", { method: "DELETE" }),
-  status: () => request<SystemStatus>("/api/v1/system/status"),
-  apps: () => request<{ items: Application[] }>("/api/v1/apps"),
+  logout: () => request<void>(operations.logout.path, { method: "DELETE" }),
+  status: () => request<SystemStatus>(operations.systemStatus.path),
+  apps: () => request<{ items: Application[] }>(operations.listApplications.path),
   app: (id: string) => request<Application>(`/api/v1/apps/${id}`),
   createApp: (data: { name: string; description: string; sourcePath: string }) =>
-    request<Application>("/api/v1/apps", { method: "POST", body: JSON.stringify(data) }),
+    request<Application>(operations.createApplication.path, { method: "POST", body: JSON.stringify(data) }),
   inspect: (sourcePath: string) =>
-    request<{ message: string }>("/api/v1/apps/import/inspect", {
+    request<{ message: string }>(operations.inspectImport.path, {
       method: "POST",
       body: JSON.stringify({ sourcePath }),
     }),
-  machines: () => request<{ items: Machine[] }>("/api/v1/machines"),
-  jobs: () => request<{ items: Job[] }>("/api/v1/jobs"),
+  machines: () => request<{ items: Machine[] }>(operations.listMachines.path),
+  jobs: () => request<{ items: Job[] }>(operations.listJobs.path),
+  cancelJob: (id: string) =>
+    request<{ job: Job }>(operations.cancelJob.path.replace("{jobId}", encodeURIComponent(id)), {
+      method: operations.cancelJob.method,
+    }),
   action: (id: string, type: "deploy" | "start" | "stop" | "restart") =>
     request<{ job: Job }>(`/api/v1/apps/${id}/${type === "deploy" ? "deployments" : type}`, {
       method: "POST",

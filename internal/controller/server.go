@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hostd/hostd/internal/apicontract"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/jobs"
@@ -53,31 +54,39 @@ type apiRoute struct {
 
 func (s *Server) apiRoutes() []apiRoute {
 	return []apiRoute{
-		{http.MethodGet, "/api/v1/auth/bootstrap/status", "bootstrapStatus", s.bootstrapStatus},
-		{http.MethodPost, "/api/v1/auth/bootstrap", "bootstrap", s.bootstrap},
-		{http.MethodPost, "/api/v1/auth/sessions", "login", s.login},
-		{http.MethodDelete, "/api/v1/auth/sessions/current", "logout", s.require(s.logout)},
-		{http.MethodGet, "/api/v1/auth/me", "me", s.require(s.me)},
-		{http.MethodGet, "/api/v1/auth/csrf", "rotateCSRF", s.require(s.rotateCSRF)},
-		{http.MethodGet, "/api/v1/system/status", "systemStatus", s.require(s.status)},
-		{http.MethodGet, "/api/v1/system/doctor", "doctor", s.require(s.doctor)},
-		{http.MethodGet, "/api/v1/apps", "listApplications", s.require(s.listApps)},
-		{http.MethodPost, "/api/v1/apps", "createApplication", s.require(s.createApp)},
-		{http.MethodPost, "/api/v1/apps/import/inspect", "inspectImport", s.require(s.inspectApp)},
-		{http.MethodGet, "/api/v1/apps/{appId}", "getApplication", s.require(s.getApp)},
-		{http.MethodGet, "/api/v1/apps/{appId}/services", "listServices", s.require(s.services)},
-		{http.MethodPost, "/api/v1/apps/{appId}/deployments", "deployApplication", s.require(s.action("deploy"))},
-		{http.MethodPost, "/api/v1/apps/{appId}/start", "startApplication", s.require(s.action("start"))},
-		{http.MethodPost, "/api/v1/apps/{appId}/stop", "stopApplication", s.require(s.action("stop"))},
-		{http.MethodPost, "/api/v1/apps/{appId}/restart", "restartApplication", s.require(s.action("restart"))},
-		{http.MethodGet, "/api/v1/apps/{appId}/logs/stream", "streamLogs", s.require(s.logsStream)},
-		{http.MethodGet, "/api/v1/jobs", "listJobs", s.require(s.listJobs)},
-		{http.MethodGet, "/api/v1/jobs/{jobId}", "getJob", s.require(s.getJob)},
-		{http.MethodPost, "/api/v1/jobs/{jobId}/cancel", "cancelJob", s.require(s.cancelJob)},
-		{http.MethodGet, "/api/v1/jobs/{jobId}/events", "listJobEvents", s.require(s.events)},
-		{http.MethodGet, "/api/v1/jobs/{jobId}/events/stream", "streamJobEvents", s.require(s.eventsStream)},
-		{http.MethodGet, "/api/v1/machines", "listMachines", s.require(s.listMachines)},
+		contractRoute("bootstrapStatus", s.bootstrapStatus),
+		contractRoute("bootstrap", s.bootstrap),
+		contractRoute("login", s.login),
+		contractRoute("logout", s.require(s.logout)),
+		contractRoute("me", s.require(s.me)),
+		contractRoute("rotateCSRF", s.require(s.rotateCSRF)),
+		contractRoute("systemStatus", s.require(s.status)),
+		contractRoute("doctor", s.require(s.doctor)),
+		contractRoute("listApplications", s.require(s.listApps)),
+		contractRoute("createApplication", s.require(s.createApp)),
+		contractRoute("inspectImport", s.require(s.inspectApp)),
+		contractRoute("getApplication", s.require(s.getApp)),
+		contractRoute("listServices", s.require(s.services)),
+		contractRoute("deployApplication", s.require(s.action("deploy"))),
+		contractRoute("startApplication", s.require(s.action("start"))),
+		contractRoute("stopApplication", s.require(s.action("stop"))),
+		contractRoute("restartApplication", s.require(s.action("restart"))),
+		contractRoute("streamLogs", s.require(s.logsStream)),
+		contractRoute("listJobs", s.require(s.listJobs)),
+		contractRoute("getJob", s.require(s.getJob)),
+		contractRoute("cancelJob", s.require(s.cancelJob)),
+		contractRoute("listJobEvents", s.require(s.events)),
+		contractRoute("streamJobEvents", s.require(s.eventsStream)),
+		contractRoute("listMachines", s.require(s.listMachines)),
 	}
+}
+
+func contractRoute(operationID string, handler http.HandlerFunc) apiRoute {
+	operation, ok := apicontract.Operations[operationID]
+	if !ok {
+		panic("OpenAPI operation artifact missing " + operationID)
+	}
+	return apiRoute{method: operation.Method, path: operation.Path, operationID: operationID, handler: handler}
 }
 
 func (s *Server) routes() http.Handler {
