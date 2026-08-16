@@ -98,3 +98,5 @@ sh scripts/capture-visuals.sh
 ```
 
 PowerShell equivalents are available for generation, embedding, secret scanning, and visual capture under `scripts/`.
+
+The default `make build`, `make check-embedded`, and `make test-e2e` targets use the POSIX scripts. On Windows, use the explicit `build-windows`, `check-embedded-windows`, and `test-e2e-windows` targets when GNU Make is available, or invoke the corresponding `.ps1` scripts directly.

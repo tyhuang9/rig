@@ -1,4 +1,4 @@
-.PHONY: bootstrap generate check-generated check-embedded dev-backend dev-web test test-integration test-e2e build
+.PHONY: bootstrap generate check-generated check-embedded check-embedded-windows dev-backend dev-web test test-integration test-e2e test-e2e-windows build build-windows
 bootstrap:
 	pnpm --dir web install
 generate:
@@ -8,6 +8,8 @@ check-generated:
 	go test ./internal/controller -run '^TestOpenAPIContractMatchesRegisteredRoutes$$' -count=1
 check-embedded:
 	sh scripts/check-embedded.sh
+check-embedded-windows:
+	powershell -ExecutionPolicy Bypass -File scripts/check-embedded.ps1
 dev-backend:
 	go run ./cmd/hostd --data-root .hostd-dev --fake-runtime
 dev-web:
@@ -18,10 +20,14 @@ test:
 test-integration:
 	go test ./...
 test-e2e:
-	pnpm --dir web build
-	powershell -ExecutionPolicy Bypass -File scripts/embed-web.ps1
-	pnpm --dir web e2e
+	sh scripts/capture-visuals.sh
+test-e2e-windows:
+	powershell -ExecutionPolicy Bypass -File scripts/capture-visuals.ps1
 build:
 	pnpm --dir web build
-	pwsh -File scripts/embed-web.ps1
+	sh scripts/embed-web.sh
+	go build ./cmd/hostd ./cmd/hostctl
+build-windows:
+	pnpm --dir web build
+	powershell -ExecutionPolicy Bypass -File scripts/embed-web.ps1
 	go build ./cmd/hostd ./cmd/hostctl
