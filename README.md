@@ -12,7 +12,7 @@ pwsh -File scripts/embed-web.ps1
 go run ./cmd/hostd --data-root .hostd-dev --fake-runtime
 ```
 
-Open `http://127.0.0.1:7345`. The daemon prints a one-time bootstrap token only to its local stderr. Treat that local console output as sensitive; it is intentionally never returned through the API or stored in the database. On a persistent installation, restrict access to daemon logs.
+Open `http://127.0.0.1:7345`. The daemon writes a one-time bootstrap token through a dedicated protected-console path, outside structured/request/audit logging. Treat that console output as sensitive; it is never returned through the API and only its hash is stored in the database. On a persistent installation, restrict access to the daemon console.
 
 ## Verify
 

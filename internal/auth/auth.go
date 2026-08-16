@@ -19,7 +19,11 @@ type Service struct {
 	db  *sql.DB
 	now func() time.Time
 }
-type User struct{ ID, Username, Role string }
+type User struct {
+	ID       string `json:"id"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
+}
 type Session struct {
 	Token, CSRF string
 	ExpiresAt   time.Time

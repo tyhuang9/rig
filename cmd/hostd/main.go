@@ -41,7 +41,10 @@ func main() {
 		logger.Error("bootstrap token setup failed", "error", err)
 		os.Exit(1)
 	} else if token != "" {
-		logger.Warn("one-time bootstrap token generated; store it securely and use it within 15 minutes", "bootstrap_token", token)
+		if err := auth.WriteBootstrapToken(os.Stderr, token); err != nil {
+			logger.Error("bootstrap token console output failed", "error", err)
+			os.Exit(1)
+		}
 	}
 	m := machines.New(db)
 	if _, err := m.EnsureLocal(); err != nil {
@@ -58,7 +61,7 @@ func main() {
 	if cfg.FakeRuntime {
 		go j.RunFakeWorker(ctx)
 	}
-	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: j, Machines: m, Caddy: cfg.CaddyManagement, Logger: logger}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: j, Machines: m, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, Logger: logger}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)

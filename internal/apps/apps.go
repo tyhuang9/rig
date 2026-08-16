@@ -19,8 +19,11 @@ type Application struct {
 	CreatedAt   time.Time `json:"createdAt"`
 }
 type Service struct {
-	ID, Name, Kind, Status string
-	Port                   *int
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Kind   string `json:"kind"`
+	Status string `json:"status"`
+	Port   *int   `json:"port,omitempty"`
 }
 type Store struct {
 	db  *sql.DB

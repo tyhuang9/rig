@@ -26,12 +26,13 @@ import (
 var web embed.FS
 
 type Server struct {
-	Auth     *auth.Service
-	Apps     *apps.Store
-	Jobs     *jobs.Service
-	Machines *machines.Store
-	Caddy    bool
-	Logger   *slog.Logger
+	Auth        *auth.Service
+	Apps        *apps.Store
+	Jobs        *jobs.Service
+	Machines    *machines.Store
+	Caddy       bool
+	FakeRuntime bool
+	Logger      *slog.Logger
 }
 type principalKey struct{}
 type principal struct {
@@ -60,6 +61,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/apps/{appId}/restart", s.require(s.action("restart")))
 	mux.HandleFunc("GET /api/v1/apps/{appId}/logs/stream", s.require(s.logsStream))
 	mux.HandleFunc("GET /api/v1/jobs/{jobId}", s.require(s.getJob))
+	mux.HandleFunc("GET /api/v1/jobs", s.require(s.listJobs))
 	mux.HandleFunc("GET /api/v1/jobs/{jobId}/events", s.require(s.events))
 	mux.HandleFunc("GET /api/v1/jobs/{jobId}/events/stream", s.require(s.eventsStream))
 	mux.HandleFunc("GET /api/v1/machines", s.require(s.listMachines))
@@ -184,7 +186,7 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	d := docker.Check(r.Context(), s.Caddy)
-	writeJSON(w, 200, map[string]any{"daemon": "running", "diagnostics": d})
+	writeJSON(w, 200, map[string]any{"daemon": "running", "diagnostics": d, "capabilities": map[string]bool{"fakeRuntime": s.FakeRuntime}})
 }
 func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
 	d := docker.Check(r.Context(), s.Caddy)
@@ -250,6 +252,10 @@ func (s *Server) services(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) action(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.FakeRuntime {
+			problem(w, r, http.StatusConflict, "capability_unavailable", "Runtime actions are unavailable in this build configuration", nil)
+			return
+		}
 		id := r.PathValue("appId")
 		if _, err := s.Apps.Get(id); err != nil {
 			problem(w, r, 404, "app_not_found", "Application was not found", nil)
@@ -262,6 +268,14 @@ func (s *Server) action(kind string) http.HandlerFunc {
 		}
 		writeJSON(w, map[bool]int{true: 202, false: 200}[created], map[string]any{"job": job, "created": created})
 	}
+}
+func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
+	v, err := s.Jobs.List(100)
+	if err != nil {
+		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not list jobs", nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": v})
 }
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	v, err := s.Jobs.Get(r.PathValue("jobId"))

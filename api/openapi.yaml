@@ -24,5 +24,6 @@ paths:
   /api/v1/apps/{appId}/restart: {post: {operationId: restartApplication, responses: {'202': {description: Job created}}}}
   /api/v1/apps/{appId}/logs/stream: {get: {operationId: streamLogs, responses: {'200': {description: SSE stream}}}}
   /api/v1/jobs/{jobId}: {get: {operationId: getJob, responses: {'200': {description: Job}}}}
+  /api/v1/jobs: {get: {operationId: listJobs, responses: {'200': {description: Durable job activity}}}}
   /api/v1/jobs/{jobId}/events: {get: {operationId: listJobEvents, responses: {'200': {description: Events}}}}
   /api/v1/jobs/{jobId}/events/stream: {get: {operationId: streamJobEvents, responses: {'200': {description: SSE stream}}}}

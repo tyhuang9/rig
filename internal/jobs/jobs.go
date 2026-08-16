@@ -26,9 +26,18 @@ const (
 )
 
 type Job struct {
-	ID, Type, ResourceType, ResourceID, Status, Phase, Checkpoint, ErrorCode, ErrorDetail string
-	Progress                                                                              int
-	CreatedAt, UpdatedAt                                                                  time.Time
+	ID           string    `json:"id"`
+	Type         string    `json:"type"`
+	ResourceType string    `json:"resourceType"`
+	ResourceID   string    `json:"resourceId"`
+	Status       string    `json:"status"`
+	Phase        string    `json:"phase"`
+	Checkpoint   string    `json:"checkpoint"`
+	ErrorCode    string    `json:"errorCode,omitempty"`
+	ErrorDetail  string    `json:"errorDetail,omitempty"`
+	Progress     int       `json:"progress"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
 }
 type Event struct {
 	ID        int64     `json:"id"`
@@ -105,6 +114,29 @@ func (s *Service) byIdempotency(kind, rt, rid, key string) (Job, error) {
 }
 func (s *Service) Get(id string) (Job, error) {
 	return s.scan(s.db.QueryRow(`SELECT id,type,resource_type,resource_id,status,phase,progress_percent,checkpoint_json,COALESCE(error_code,''),COALESCE(error_detail,''),created_at,updated_at FROM jobs WHERE id=?`, id))
+}
+
+func (s *Service) List(limit int) ([]Job, error) {
+	if limit < 1 || limit > 200 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`SELECT id,type,resource_type,resource_id,status,phase,progress_percent,checkpoint_json,COALESCE(error_code,''),COALESCE(error_detail,''),created_at,updated_at FROM jobs ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]Job, 0)
+	for rows.Next() {
+		var job Job
+		var created, updated string
+		if err := rows.Scan(&job.ID, &job.Type, &job.ResourceType, &job.ResourceID, &job.Status, &job.Phase, &job.Progress, &job.Checkpoint, &job.ErrorCode, &job.ErrorDetail, &created, &updated); err != nil {
+			return nil, err
+		}
+		job.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		job.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		result = append(result, job)
+	}
+	return result, rows.Err()
 }
 func (s *Service) scan(row *sql.Row) (Job, error) {
 	var j Job
