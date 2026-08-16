@@ -22,7 +22,7 @@ import (
 	"github.com/hostd/hostd/internal/runtime/docker"
 )
 
-//go:embed ui/*
+//go:embed all:ui
 var web embed.FS
 
 type Server struct {

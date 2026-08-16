@@ -1,0 +1,1 @@
+{"name":"hostd-workspace","private":true,"packageManager":"pnpm@11.22.0","scripts":{"web:build":"pnpm --dir web build","web:test":"pnpm --dir web test"}}
