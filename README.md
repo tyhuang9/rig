@@ -32,6 +32,8 @@ go run ./cmd/hostd --data-root .hostd-dev --fake-runtime
 
 Open `http://127.0.0.1:7345`. The daemon prints a single-use bootstrap token through a dedicated protected-console path outside structured, request, and audit logs. Treat that console as sensitive; only the token hash is stored.
 
+Phase A accepts only an explicit loopback IP literal for `--listen`, such as `127.0.0.1:7345` or `[::1]:7345`. Wildcard addresses, LAN addresses, empty hosts, and hostnames are rejected before the data root is created. This enforced local-only HTTP boundary is why the session cookie is intentionally not marked `Secure` in Phase A.
+
 Fake runtime is fail-closed. It must be explicitly enabled and its resolved data root must either be named `.hostd-dev` or be an isolated `hostd-*` directory under the system temporary directory. It persists job progress but never executes a workload.
 
 ## Use hostctl safely

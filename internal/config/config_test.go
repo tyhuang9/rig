@@ -36,3 +36,30 @@ func TestDevelopmentRootDoesNotImplicitlyEnableFakeRuntime(t *testing.T) {
 		t.Fatal("development data root implicitly enabled fake runtime")
 	}
 }
+
+func TestListenAddressMustBeExplicitLoopback(t *testing.T) {
+	tests := []struct {
+		address string
+		ok      bool
+	}{
+		{address: "127.0.0.1:7345", ok: true},
+		{address: "127.42.0.9:7345", ok: true},
+		{address: "[::1]:7345", ok: true},
+		{address: "0.0.0.0:7345", ok: false},
+		{address: "[::]:7345", ok: false},
+		{address: "192.168.1.10:7345", ok: false},
+		{address: "localhost:7345", ok: false},
+		{address: "hostd.local:7345", ok: false},
+		{address: ":7345", ok: false},
+		{address: "127.0.0.1:http", ok: false},
+		{address: "127.0.0.1", ok: false},
+	}
+	for _, test := range tests {
+		t.Run(test.address, func(t *testing.T) {
+			_, err := FromFlags([]string{"--listen", test.address})
+			if (err == nil) != test.ok {
+				t.Fatalf("FromFlags(--listen %q) error = %v, want success %v", test.address, err, test.ok)
+			}
+		})
+	}
+}

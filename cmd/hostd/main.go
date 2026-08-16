@@ -21,7 +21,7 @@ import (
 )
 
 func main() {
-	cfg, err := config.FromFlags(os.Args[1:])
+	cfg, err := startupConfig(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
@@ -80,6 +80,11 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+func startupConfig(args []string) (config.Config, error) {
+	return config.FromFlags(args)
+}
+
 func parseLevel(v string) slog.Level {
 	switch v {
 	case "debug":

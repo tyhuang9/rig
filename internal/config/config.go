@@ -3,8 +3,10 @@ package config
 import (
 	"errors"
 	"flag"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -45,10 +47,29 @@ func FromFlags(args []string) (Config, error) {
 	if c.ListenAddress == "" {
 		return Config{}, errors.New("listen address is required")
 	}
+	if err := validateLoopbackListenAddress(c.ListenAddress); err != nil {
+		return Config{}, err
+	}
 	if c.FakeRuntime && !safeFakeRuntimeRoot(c.DataRoot) {
 		return Config{}, errors.New("fake runtime requires a resolved .hostd-dev root or an isolated hostd-* test root under the system temporary directory")
 	}
 	return c, nil
+}
+
+func validateLoopbackListenAddress(address string) error {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil || host == "" {
+		return errors.New("listen address must use an explicit loopback host and numeric port")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("listen address must use an explicit loopback host and numeric port")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("listen address must use an explicit loopback host and numeric port")
+	}
+	return nil
 }
 
 func safeFakeRuntimeRoot(root string) bool {
