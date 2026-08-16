@@ -1,7 +1,9 @@
 package controller_test
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -98,5 +100,82 @@ func TestAuthAndProtectedAPI(t *testing.T) {
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "root") {
 		t.Fatalf("embedded SPA deep link failed: %d", w.Code)
+	}
+}
+
+func TestCancelAPIAndLastEventIDReplay(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authService := auth.New(db)
+	token, err := authService.EnsureBootstrapToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, session, err := authService.Bootstrap(token, "admin", "this is a secure passphrase")
+	if err != nil {
+		t.Fatal(err)
+	}
+	machineStore := machines.New(db)
+	if _, err := machineStore.EnsureLocal(); err != nil {
+		t.Fatal(err)
+	}
+	jobService := jobs.New(db)
+	handler := (&controller.Server{Auth: authService, Apps: apps.New(db), Jobs: jobService, Machines: machineStore, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).Handler()
+
+	job, _, err := jobService.Create("deploy", "application", "app-cancel", "cancel-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/v1/jobs/" + job.ID + "/cancel"
+	request := httptest.NewRequest(http.MethodPost, path, nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated cancel = %d", response.Code)
+	}
+	request = httptest.NewRequest(http.MethodPost, path, nil)
+	request.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: session.Token})
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("cancel without CSRF = %d", response.Code)
+	}
+	response = authenticatedRequest(t, handler, session, http.MethodPost, path, "")
+	if !strings.Contains(response.Body.String(), `"status":"cancelled"`) {
+		t.Fatalf("cancel response: %s", response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodPost, path, nil)
+	request.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: session.Token})
+	request.Header.Set("X-CSRF-Token", session.CSRF)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("terminal cancel = %d %s", response.Code, response.Body.String())
+	}
+
+	replayJob, _, err := jobService.Create("deploy", "application", "app-replay", "replay-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := jobService.Events(replayJob.ID, 0)
+	if err != nil || len(initial) != 1 {
+		t.Fatalf("initial events: %#v %v", initial, err)
+	}
+	second, err := jobService.Append(replayJob.ID, "info", "validate", "phase_started", "Validation started")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+replayJob.ID+"/events/stream", nil).WithContext(ctx)
+	request.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: session.Token})
+	request.Header.Set("Last-Event-ID", fmt.Sprint(initial[0].ID))
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), fmt.Sprintf("id: %d", second.ID)) || strings.Contains(response.Body.String(), fmt.Sprintf("id: %d\n", initial[0].ID)) {
+		t.Fatalf("Last-Event-ID replay failed: %d %s", response.Code, response.Body.String())
 	}
 }

@@ -73,6 +73,7 @@ func (s *Server) apiRoutes() []apiRoute {
 		{http.MethodGet, "/api/v1/apps/{appId}/logs/stream", "streamLogs", s.require(s.logsStream)},
 		{http.MethodGet, "/api/v1/jobs", "listJobs", s.require(s.listJobs)},
 		{http.MethodGet, "/api/v1/jobs/{jobId}", "getJob", s.require(s.getJob)},
+		{http.MethodPost, "/api/v1/jobs/{jobId}/cancel", "cancelJob", s.require(s.cancelJob)},
 		{http.MethodGet, "/api/v1/jobs/{jobId}/events", "listJobEvents", s.require(s.events)},
 		{http.MethodGet, "/api/v1/jobs/{jobId}/events/stream", "streamJobEvents", s.require(s.eventsStream)},
 		{http.MethodGet, "/api/v1/machines", "listMachines", s.require(s.listMachines)},
@@ -326,6 +327,19 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, v)
+}
+func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
+	job, err := s.Jobs.Cancel(r.PathValue("jobId"))
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]any{"job": job})
+	case errors.Is(err, jobs.ErrJobNotFound):
+		problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
+	case errors.Is(err, jobs.ErrJobTerminal):
+		problem(w, r, http.StatusConflict, "job_terminal", "Job is already terminal and cannot be cancelled", nil)
+	default:
+		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not cancel job", nil)
+	}
 }
 func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.Jobs.Get(r.PathValue("jobId")); err != nil {
