@@ -256,6 +256,46 @@ func (s *Service) Update(id string, status Status, phase string, progress int, c
 	}
 	return nil
 }
+
+// transition persists a worker state change and its corresponding event as one
+// guarded unit. A concurrent cancellation therefore commits either before this
+// transaction (and makes the guard fail) or after its event has been appended.
+func (s *Service) transition(id string, status Status, phase string, progress int, checkpoint, level, code, message string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := s.now().UTC()
+	formattedNow := now.Format(time.RFC3339Nano)
+	result, err := tx.Exec(`UPDATE jobs SET status=?,phase=?,progress_percent=?,checkpoint_json=?,updated_at=?,started_at=COALESCE(started_at,?),finished_at=CASE WHEN ? IN ('succeeded','failed','cancelled','interrupted','needs_attention') THEN ? ELSE NULL END WHERE id=? AND status IN ('queued','assigned','running','waiting_external','waiting_user')`, status, phase, progress, checkpoint, formattedNow, formattedNow, status, formattedNow, id)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		var exists int
+		if err := tx.QueryRow(`SELECT 1 FROM jobs WHERE id=?`, id).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+			return ErrJobNotFound
+		} else if err != nil {
+			return err
+		}
+		return ErrJobTerminal
+	}
+	if _, err := appendEvent(tx, now, id, level, phase, code, message); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.signal()
+	return nil
+}
+
 func (s *Service) Cancel(id string) (Job, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -323,10 +363,6 @@ func (s *Service) runOne(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	j, err := s.Get(id)
-	if err != nil {
-		return
-	}
 	phases := []struct {
 		n string
 		p int
@@ -337,18 +373,12 @@ func (s *Service) runOne(ctx context.Context) {
 			return
 		default:
 		}
-		current, err := s.Get(j.ID)
-		if err != nil || current.Status == string(Cancelled) {
+		if err := s.transition(id, Running, phase.n, phase.p, `{"phase":"`+phase.n+`"}`, "info", "phase_started", "Fake runtime: "+phase.n); err != nil {
 			return
 		}
-		if err := s.Update(j.ID, Running, phase.n, phase.p, `{"phase":"`+phase.n+`"}`); err != nil {
-			return
-		}
-		_, _ = s.Append(j.ID, "info", phase.n, "phase_started", "Fake runtime: "+phase.n)
 		time.Sleep(120 * time.Millisecond)
 	}
-	if err := s.Update(j.ID, Succeeded, "succeeded", 100, `{"phase":"succeeded"}`); err != nil {
+	if err := s.transition(id, Succeeded, "succeeded", 100, `{"phase":"succeeded"}`, "info", "job_succeeded", "Fake deployment completed"); err != nil {
 		return
 	}
-	_, _ = s.Append(j.ID, "info", "succeeded", "job_succeeded", "Fake deployment completed")
 }
