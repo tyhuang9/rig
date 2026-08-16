@@ -10,8 +10,15 @@ import (
 )
 
 type Machine struct {
-	ID, Name, Status, OS, Architecture, Hostname, DockerVersion, ComposeVersion string         `json:"id,omitempty"`
-	Resources                                                                   map[string]any `json:"resources"`
+	ID             string         `json:"id"`
+	Name           string         `json:"name"`
+	Status         string         `json:"status"`
+	OS             string         `json:"os"`
+	Architecture   string         `json:"architecture"`
+	Hostname       string         `json:"hostname"`
+	DockerVersion  string         `json:"dockerVersion"`
+	ComposeVersion string         `json:"composeVersion"`
+	Resources      map[string]any `json:"resources"`
 }
 type Store struct {
 	db  *sql.DB

@@ -56,9 +56,6 @@ func verifyPassphrase(encoded, passphrase string) bool {
 	var iterations uint32
 	var parallelism uint8
 	var salt, expected []byte
-	if _, err := fmt.Sscanf(encoded, "argon2id$v=19$m=%d,t=%d,p=%d$%s$%s", &memory, &iterations, &parallelism, new(string), new(string)); err == nil {
-		_ = err
-	}
 	parts := split(encoded, '$')
 	if len(parts) != 5 {
 		return false

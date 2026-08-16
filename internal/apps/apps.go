@@ -10,8 +10,13 @@ import (
 )
 
 type Application struct {
-	ID, Slug, Name, Description, Status, MachineName string    `json:"id,omitempty"`
-	CreatedAt                                        time.Time `json:"createdAt"`
+	ID          string    `json:"id"`
+	Slug        string    `json:"slug"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	Status      string    `json:"status"`
+	MachineName string    `json:"machineName"`
+	CreatedAt   time.Time `json:"createdAt"`
 }
 type Service struct {
 	ID, Name, Kind, Status string
@@ -47,6 +52,9 @@ func (s *Store) Create(name, description, sourcePath, machineID string) (Applica
 		return Application{}, errors.New("name must include letters or numbers")
 	}
 	id := uuid.NewString()
+	if machineID == "" {
+		_ = s.db.QueryRow(`SELECT id FROM machines WHERE mode='local' LIMIT 1`).Scan(&machineID)
+	}
 	now := s.now().UTC()
 	_, err := s.db.Exec(`INSERT INTO applications(id,slug,name,description,source_path,active_machine_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?, 'draft',?,?)`, id, slug, name, description, sourcePath, machineID, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 	if err != nil {

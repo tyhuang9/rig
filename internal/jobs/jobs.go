@@ -31,11 +31,14 @@ type Job struct {
 	CreatedAt, UpdatedAt                                                                  time.Time
 }
 type Event struct {
-	ID                          int64     `json:"id"`
-	JobID                       string    `json:"jobId"`
-	Sequence                    int       `json:"sequence"`
-	Timestamp                   time.Time `json:"timestamp"`
-	Level, Phase, Code, Message string    `json:"level","phase","code","message"`
+	ID        int64     `json:"id"`
+	JobID     string    `json:"jobId"`
+	Sequence  int       `json:"sequence"`
+	Timestamp time.Time `json:"timestamp"`
+	Level     string    `json:"level"`
+	Phase     string    `json:"phase"`
+	Code      string    `json:"code"`
+	Message   string    `json:"message"`
 }
 type Service struct {
 	db   *sql.DB

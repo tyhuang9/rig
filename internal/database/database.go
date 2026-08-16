@@ -5,6 +5,7 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -16,6 +17,9 @@ import (
 var migrations embed.FS
 
 func Open(dataRoot string) (*sql.DB, error) {
+	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", filepath.Join(dataRoot, "control.db"))
 	if err != nil {
 		return nil, err

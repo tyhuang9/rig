@@ -8,8 +8,16 @@ import (
 )
 
 type Diagnostics struct {
-	DaemonRunning, ClientAvailable, EngineReady, ComposeAvailable, CaddyManaged bool   `json:"daemonRunning"`
-	OS, Architecture, DockerDetail, ComposeDetail, StartupLimitation            string `json:"os"`
+	DaemonRunning     bool   `json:"daemonRunning"`
+	ClientAvailable   bool   `json:"clientAvailable"`
+	EngineReady       bool   `json:"engineReady"`
+	ComposeAvailable  bool   `json:"composeAvailable"`
+	CaddyManaged      bool   `json:"caddyManaged"`
+	OS                string `json:"os"`
+	Architecture      string `json:"architecture"`
+	DockerDetail      string `json:"dockerDetail"`
+	ComposeDetail     string `json:"composeDetail"`
+	StartupLimitation string `json:"startupLimitation"`
 }
 
 func Check(ctx context.Context, caddy bool) Diagnostics {
