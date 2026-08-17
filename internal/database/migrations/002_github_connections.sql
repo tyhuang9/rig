@@ -17,8 +17,9 @@ CREATE TABLE source_connections (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     CHECK (
-        (status = 'pending' AND pending_expires_at IS NOT NULL AND poll_interval_seconds IS NOT NULL AND next_poll_at IS NOT NULL AND provider_user_id IS NULL AND provider_login IS NULL)
-        OR status <> 'pending'
+        (status = 'pending' AND pending_expires_at IS NOT NULL AND poll_interval_seconds IS NOT NULL AND next_poll_at IS NOT NULL AND provider_user_id IS NULL AND provider_login IS NULL AND credential_generation = 0 AND access_expires_at IS NULL AND refresh_expires_at IS NULL AND connected_at IS NULL)
+        OR (status = 'connected' AND pending_expires_at IS NULL AND poll_interval_seconds IS NULL AND next_poll_at IS NULL AND provider_user_id IS NOT NULL AND provider_login IS NOT NULL AND credential_generation > 0 AND access_expires_at IS NOT NULL AND refresh_expires_at IS NOT NULL AND connected_at IS NOT NULL)
+        OR (status NOT IN ('pending','connected') AND pending_expires_at IS NULL AND poll_interval_seconds IS NULL AND next_poll_at IS NULL)
     ),
     CHECK (provider_user_id IS NULL OR length(provider_user_id) BETWEEN 1 AND 128),
     CHECK (provider_login IS NULL OR length(provider_login) BETWEEN 1 AND 255),

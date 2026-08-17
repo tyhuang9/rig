@@ -88,7 +88,10 @@ func TestGithubConnectionConstraintsAndCascade(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO source_connections(id, owner_user_id, provider, status, created_at, updated_at) VALUES ('bad', 'owner', 'other', 'connected', datetime('now'), datetime('now'))`); err == nil {
 		t.Fatal("unsupported provider was accepted")
 	}
-	if _, err := db.Exec(`INSERT INTO source_connections(id, owner_user_id, provider, status, provider_user_id, created_at, updated_at) VALUES ('two', 'owner', 'github', 'connected', '42', datetime('now'), datetime('now')), ('three', 'owner', 'github', 'connected', '42', datetime('now'), datetime('now'))`); err == nil {
+	if _, err := db.Exec(`INSERT INTO source_connections(id, owner_user_id, provider, status, provider_user_id, provider_login, credential_generation, access_expires_at, refresh_expires_at, connected_at, created_at, updated_at) VALUES ('incomplete', 'owner', 'github', 'connected', '41', 'octo', 0, NULL, NULL, NULL, datetime('now'), datetime('now'))`); err == nil {
+		t.Fatal("connected row without credential metadata was accepted")
+	}
+	if _, err := db.Exec(`INSERT INTO source_connections(id, owner_user_id, provider, status, provider_user_id, provider_login, credential_generation, access_expires_at, refresh_expires_at, connected_at, created_at, updated_at) VALUES ('two', 'owner', 'github', 'connected', '42', 'octo', 1, datetime('now','+1 hour'), datetime('now','+1 day'), datetime('now'), datetime('now'), datetime('now')), ('three', 'owner', 'github', 'connected', '42', 'octo', 1, datetime('now','+1 hour'), datetime('now','+1 day'), datetime('now'), datetime('now'), datetime('now'))`); err == nil {
 		t.Fatal("duplicate active owner identity was accepted")
 	}
 	if _, err := db.Exec(`DELETE FROM source_connections WHERE id = 'one'`); err != nil {
