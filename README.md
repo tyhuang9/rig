@@ -71,7 +71,7 @@ go run ./cmd/hostctl doctor
 go run ./cmd/hostctl jobs cancel JOB_ID
 ```
 
-`hostctl` stores the opaque session and CSRF values in the current user's config directory. Files are written atomically with mode `0600` on POSIX systems; Windows relies on the user-profile directory ACL. Use `--session-file` to choose another protected path or `--session-stdin` to avoid persistent storage. Operational failures return a nonzero exit code.
+`hostctl` stores the opaque session and CSRF values in the current user's config directory. Files are written atomically with mode `0600` on POSIX systems and protected with current-user Windows DPAPI on Windows; Windows never falls back to plaintext session files. Use `--session-file` to choose another protected path or `--session-stdin` to avoid persistent storage. Operational failures return a nonzero exit code.
 
 ## Generate contracts
 

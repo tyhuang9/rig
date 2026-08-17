@@ -23,6 +23,8 @@ type sessionCredentials struct {
 	CSRFToken    string `json:"csrfToken"`
 }
 
+const maxSessionFileBytes = 64 << 10
+
 type commandApp struct {
 	endpoint     string
 	sessionFile  string
@@ -190,7 +192,7 @@ func (app *commandApp) loadSession() (sessionCredentials, error) {
 			return session, fmt.Errorf("read session file: %w", err)
 		}
 		defer file.Close()
-		if err := decodeLimited(file, &session); err != nil {
+		if err := decodeSessionFile(file, &session); err != nil {
 			return session, fmt.Errorf("decode session file: %w", err)
 		}
 	}
@@ -201,7 +203,7 @@ func (app *commandApp) loadSession() (sessionCredentials, error) {
 }
 
 func decodeLimited(reader io.Reader, target any) error {
-	decoder := json.NewDecoder(io.LimitReader(reader, 64<<10))
+	decoder := json.NewDecoder(io.LimitReader(reader, maxSessionFileBytes))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return err
@@ -210,6 +212,32 @@ func decodeLimited(reader io.Reader, target any) error {
 		return errors.New("input must contain one JSON object")
 	}
 	return nil
+}
+
+func encodeSessionFile(session sessionCredentials) ([]byte, error) {
+	var plaintext bytes.Buffer
+	if err := json.NewEncoder(&plaintext).Encode(session); err != nil {
+		return nil, err
+	}
+	data := plaintext.Bytes()
+	defer clear(data)
+	return protectSessionFile(data)
+}
+
+func decodeSessionFile(reader io.Reader, target *sessionCredentials) error {
+	persisted, err := io.ReadAll(io.LimitReader(reader, maxSessionFileBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(persisted) > maxSessionFileBytes {
+		return errors.New("session file is too large")
+	}
+	plaintext, err := unprotectSessionFile(persisted)
+	if err != nil {
+		return err
+	}
+	defer clear(plaintext)
+	return decodeLimited(bytes.NewReader(plaintext), target)
 }
 
 func defaultSessionFile() string {
@@ -221,6 +249,10 @@ func defaultSessionFile() string {
 }
 
 func writeSessionFile(path string, session sessionCredentials) error {
+	payload, err := encodeSessionFile(session)
+	if err != nil {
+		return fmt.Errorf("protect session file: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create session directory: %w", err)
 	}
@@ -239,8 +271,10 @@ func writeSessionFile(path string, session sessionCredentials) error {
 	if err := temporary.Chmod(0o600); err != nil {
 		return err
 	}
-	if err := json.NewEncoder(temporary).Encode(session); err != nil {
+	if written, err := temporary.Write(payload); err != nil {
 		return err
+	} else if written != len(payload) {
+		return io.ErrShortWrite
 	}
 	if err := temporary.Sync(); err != nil {
 		return err
