@@ -502,6 +502,78 @@ func TestCancellationBetweenClaimAndRegistrationFinalizesWithoutExecuting(t *tes
 	}
 }
 
+func TestCancellationAfterAssignmentVerificationFinalizesWithoutExecuting(t *testing.T) {
+	service, closeDB := newTestService(t)
+	defer closeDB()
+	job, _, err := service.Create("deploy", "application", "verified-race", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified := make(chan struct{}, 1)
+	continueExecution := make(chan struct{})
+	service.beforeExecute = func() {
+		verified <- struct{}{}
+		<-continueExecution
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	executed := make(chan struct{}, 1)
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- service.RunWorker(ctx, mustNotExecuteExecutor{executed: executed}) }()
+	select {
+	case <-verified:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not verify assignment")
+	}
+	cancelling, err := service.Cancel(job.ID)
+	if err != nil || cancelling.Status != string(Waiting) || cancelling.Phase != "cancelling" {
+		t.Fatalf("verified-race cancellation = %#v, %v", cancelling, err)
+	}
+	close(continueExecution)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		persisted, getErr := service.Get(job.ID)
+		if getErr == nil && persisted.Status == string(Cancelled) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	persisted, err := service.Get(job.ID)
+	if err != nil || persisted.Status != string(Cancelled) {
+		t.Fatalf("verified-race final state = %#v, %v", persisted, err)
+	}
+	select {
+	case <-executed:
+		t.Fatal("executor ran after cancellation request")
+	default:
+	}
+	events, err := service.Events(job.ID, 0)
+	if err != nil || countEvents(events, "cancellation_requested") != 1 || countEvents(events, "job_cancelled") != 1 {
+		t.Fatalf("verified-race events = %#v, %v", events, err)
+	}
+	stop()
+	select {
+	case err := <-workerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop")
+	}
+	service.beforeExecute = nil
+	replacement, created, err := service.Create("deploy", "application", "verified-race", "replacement")
+	if err != nil || !created {
+		t.Fatalf("replacement create = %#v, %t, %v", replacement, created, err)
+	}
+	if err := service.runOne(context.Background(), &successfulExecutor{}); err != nil {
+		t.Fatalf("replacement execution = %v", err)
+	}
+	replacement, err = service.Get(replacement.ID)
+	if err != nil || replacement.Status != string(Succeeded) {
+		t.Fatalf("replacement final state = %#v, %v", replacement, err)
+	}
+}
+
 type successAfterCancellationExecutor struct {
 	started chan<- struct{}
 	release <-chan struct{}

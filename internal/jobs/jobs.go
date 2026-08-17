@@ -129,6 +129,7 @@ type Service struct {
 	active         map[string]context.CancelFunc
 	beforeClaim    func()
 	beforeRegister func()
+	beforeExecute  func()
 }
 
 func New(db *sql.DB) *Service {
@@ -683,8 +684,18 @@ func (s *Service) runOne(ctx context.Context, executor Executor) error {
 		}
 		return nil
 	}
+	if s.beforeExecute != nil {
+		s.beforeExecute()
+	}
 	if jobCtx.Err() != nil {
 		s.unregister(job.ID, cancel)
+		cancelling, cancellationErr := s.cancellationRequested(job.ID)
+		if cancellationErr != nil {
+			return cancellationErr
+		}
+		if cancelling {
+			return s.finishCancellation(job.ID)
+		}
 		return nil
 	}
 
