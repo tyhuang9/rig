@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -18,7 +19,14 @@ type Config struct {
 	DockerEndpoint  string
 	FakeRuntime     bool
 	CaddyManagement bool
+	GitHubClientID  string
+	GitHubAppSlug   string
 }
+
+var (
+	githubClientIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,255}$`)
+	githubAppSlugPattern  = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?$`)
+)
 
 func Defaults() Config {
 	root, err := os.UserConfigDir()
@@ -38,6 +46,8 @@ func FromFlags(args []string) (Config, error) {
 	fs.StringVar(&c.DockerEndpoint, "docker-endpoint", "", "Docker endpoint override")
 	fs.BoolVar(&c.FakeRuntime, "fake-runtime", false, "enable fake runtime (development/test only)")
 	fs.BoolVar(&c.CaddyManagement, "caddy-management", false, "enable Caddy management")
+	fs.StringVar(&c.GitHubClientID, "github-client-id", "", "public GitHub App client ID")
+	fs.StringVar(&c.GitHubAppSlug, "github-app-slug", "", "public GitHub App slug")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -53,7 +63,17 @@ func FromFlags(args []string) (Config, error) {
 	if c.FakeRuntime && !safeFakeRuntimeRoot(c.DataRoot) {
 		return Config{}, errors.New("fake runtime requires a resolved .hostd-dev root or an isolated hostd-* test root under the system temporary directory")
 	}
+	if (c.GitHubClientID == "") != (c.GitHubAppSlug == "") {
+		return Config{}, errors.New("github-client-id and github-app-slug must be provided together")
+	}
+	if c.GitHubClientID != "" && (!githubClientIDPattern.MatchString(c.GitHubClientID) || !githubAppSlugPattern.MatchString(c.GitHubAppSlug)) {
+		return Config{}, errors.New("GitHub App client ID or slug is invalid")
+	}
 	return c, nil
+}
+
+func (c Config) GitHubConnectionsEnabled() bool {
+	return c.GitHubClientID != "" && c.GitHubAppSlug != ""
 }
 
 func validateLoopbackListenAddress(address string) error {
