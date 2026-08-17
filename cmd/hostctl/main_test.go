@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/hostd/hostd/internal/auth"
+	"github.com/hostd/hostd/internal/secretfile"
 )
 
 func TestLoginSessionFileAndCancelCommand(t *testing.T) {
@@ -83,5 +84,28 @@ func TestSessionStdinAndOperationalFailuresReturnErrors(t *testing.T) {
 	}
 	if err := execute([]string{"--session-token", "must-not-be-supported", "status"}, strings.NewReader(""), &output, server.Client()); err == nil {
 		t.Fatal("session credential argv flag was accepted")
+	}
+}
+
+func TestBootstrapTokenReadsProtectedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bootstrap-token.secret")
+	if err := secretfile.Write(path, "bootstrap-token", []byte("one-time-token")); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := execute([]string{"bootstrap-token", "--file", path}, strings.NewReader(""), &output, http.DefaultClient); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "one-time-token\n" {
+		t.Fatalf("bootstrap token output = %q", output.String())
+	}
+	if err := os.WriteFile(path, []byte("plaintext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := execute([]string{"bootstrap-token", "--file", path}, strings.NewReader(""), &output, http.DefaultClient); err == nil {
+		t.Fatal("plaintext bootstrap token file was accepted")
+	}
+	if err := execute([]string{"bootstrap-token"}, strings.NewReader(""), &output, http.DefaultClient); err == nil {
+		t.Fatal("bootstrap token command accepted a missing file")
 	}
 }

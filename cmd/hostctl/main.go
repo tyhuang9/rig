@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/auth"
+	"github.com/hostd/hostd/internal/secretfile"
 	"github.com/spf13/cobra"
 )
 
@@ -96,6 +97,22 @@ func execute(args []string, input io.Reader, output io.Writer, client *http.Clie
 	}}
 	login.Flags().BoolVar(&credentialsStdin, "credentials-stdin", false, "read username/passphrase JSON from standard input")
 	root.AddCommand(login)
+
+	var bootstrapTokenFile string
+	bootstrapToken := &cobra.Command{Use: "bootstrap-token", Short: "read a protected local bootstrap token", Args: cobra.NoArgs, RunE: func(_ *cobra.Command, _ []string) error {
+		if bootstrapTokenFile == "" {
+			return errors.New("bootstrap-token requires --file")
+		}
+		token, err := secretfile.Read(bootstrapTokenFile, "bootstrap-token")
+		if err != nil {
+			return fmt.Errorf("read bootstrap token: %w", err)
+		}
+		defer clear(token)
+		_, err = fmt.Fprintln(app.output, string(token))
+		return err
+	}}
+	bootstrapToken.Flags().StringVar(&bootstrapTokenFile, "file", "", "protected bootstrap token file printed by hostd")
+	root.AddCommand(bootstrapToken)
 
 	for name, path := range map[string]string{"status": "/api/v1/system/status", "doctor": "/api/v1/system/doctor"} {
 		path := path
