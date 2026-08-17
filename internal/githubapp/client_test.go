@@ -24,6 +24,9 @@ func TestDeviceAndTokenRequestsUseFixedOriginsFormsAndSanitizedErrors(t *testing
 		if request.Header.Get("X-GitHub-Api-Version") != APIVersion || request.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
 			t.Fatalf("headers = %#v", request.Header)
 		}
+		if request.Header.Get("User-Agent") != userAgent {
+			t.Fatalf("User-Agent = %q", request.Header.Get("User-Agent"))
+		}
 		body, _ := io.ReadAll(request.Body)
 		if calls == 1 {
 			if string(body) != "client_id=client-123" {
@@ -67,6 +70,13 @@ func TestTokenRequiresExpiringAccessAndRefreshCredentials(t *testing.T) {
 	})
 	if _, err := client.Refresh(context.Background(), "old-refresh"); !IsCode(err, "invalid_response") {
 		t.Fatalf("missing expiries error = %v", err)
+	}
+
+	client = testClient(t, func(*http.Request) *http.Response {
+		return jsonResponse(200, `{"access_token":"access","refresh_token":"refresh","token_type":"bearer","expires_in":2147483647,"refresh_token_expires_in":2147483647}`)
+	})
+	if _, err := client.Refresh(context.Background(), "old-refresh"); !IsCode(err, "invalid_response") {
+		t.Fatalf("oversized expiries error = %v", err)
 	}
 }
 
@@ -127,7 +137,7 @@ func TestClientRejectsRedirectsOversizedBodiesAndUnknownProviderErrors(t *testin
 
 func TestNewRejectsUnsafeClientIDs(t *testing.T) {
 	for _, value := range []string{"", "with space", "line\nbreak", strings.Repeat("x", 256)} {
-		if _, err := New(value, roundTripFunc(nil)); err == nil {
+		if _, err := New(value); err == nil {
 			t.Errorf("New(%q) succeeded", value)
 		}
 	}
@@ -135,13 +145,32 @@ func TestNewRejectsUnsafeClientIDs(t *testing.T) {
 
 func testClient(t *testing.T, response func(*http.Request) *http.Response) *Client {
 	t.Helper()
-	client, err := New("client-123", roundTripFunc(func(request *http.Request) (*http.Response, error) {
+	client, err := newWithTransport("client-123", roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return response(request), nil
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return client
+}
+
+func TestForbiddenRateLimitClassificationAndRedaction(t *testing.T) {
+	client := testClient(t, func(*http.Request) *http.Response {
+		response := jsonResponse(http.StatusForbidden, `{"message":"secret provider description"}`)
+		response.Header.Set("X-RateLimit-Remaining", "0")
+		return response
+	})
+	if _, err := client.CurrentUser(context.Background(), "ghu_sensitive"); !IsCode(err, "rate_limited") {
+		t.Fatalf("rate-limit error = %v", err)
+	}
+	bundle := TokenBundle{AccessToken: "ghu_sensitive", RefreshToken: "ghr_sensitive"}
+	if rendered := bundle.String() + bundle.GoString(); strings.Contains(rendered, "sensitive") {
+		t.Fatalf("token bundle rendered secrets: %s", rendered)
+	}
+	authorization := DeviceAuthorization{DeviceCode: "device-sensitive", UserCode: "ABCD"}
+	if rendered := authorization.String() + authorization.GoString(); strings.Contains(rendered, "device-sensitive") {
+		t.Fatalf("device authorization rendered secret: %s", rendered)
+	}
 }
 
 func jsonResponse(status int, body string) *http.Response {

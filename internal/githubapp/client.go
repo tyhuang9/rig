@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -15,12 +16,15 @@ import (
 )
 
 const (
-	WebOrigin        = "https://github.com"
-	APIOrigin        = "https://api.github.com"
-	VerificationURI  = WebOrigin + "/login/device"
-	APIVersion       = "2026-03-10"
-	maxResponseBytes = 512 << 10
-	maxCredentialLen = 4096
+	WebOrigin                 = "https://github.com"
+	APIOrigin                 = "https://api.github.com"
+	VerificationURI           = WebOrigin + "/login/device"
+	APIVersion                = "2026-03-10"
+	maxResponseBytes          = 512 << 10
+	maxCredentialLen          = 4096
+	maxAccessLifetimeSeconds  = 7 * 24 * 60 * 60
+	maxRefreshLifetimeSeconds = 2 * 365 * 24 * 60 * 60
+	userAgent                 = "hostd-github-app/1"
 )
 
 type Error struct{ Code string }
@@ -38,7 +42,7 @@ type Client struct {
 }
 
 type DeviceAuthorization struct {
-	DeviceCode      string
+	DeviceCode      string `json:"-"`
 	UserCode        string
 	VerificationURI string
 	ExpiresIn       time.Duration
@@ -46,8 +50,8 @@ type DeviceAuthorization struct {
 }
 
 type TokenBundle struct {
-	AccessToken      string
-	RefreshToken     string
+	AccessToken      string `json:"-"`
+	RefreshToken     string `json:"-"`
 	AccessExpiresIn  time.Duration
 	RefreshExpiresIn time.Duration
 }
@@ -71,12 +75,16 @@ type InstallationPage struct {
 	Installations []Installation
 }
 
-func New(clientID string, transport http.RoundTripper) (*Client, error) {
+func New(clientID string) (*Client, error) {
+	return newWithTransport(clientID, http.DefaultTransport)
+}
+
+func newWithTransport(clientID string, transport http.RoundTripper) (*Client, error) {
 	if !validASCII(clientID, 1, 255) {
 		return nil, errors.New("github client ID must be 1-255 printable ASCII characters")
 	}
 	if transport == nil {
-		transport = http.DefaultTransport
+		return nil, errors.New("github transport is required")
 	}
 	return &Client{
 		clientID: clientID,
@@ -146,7 +154,7 @@ func (c *Client) token(ctx context.Context, values url.Values) (TokenBundle, err
 	if response.Error != "" {
 		return TokenBundle{}, &Error{Code: oauthErrorCode(response.Error)}
 	}
-	if !validSecret(response.AccessToken) || !validSecret(response.RefreshToken) || !strings.EqualFold(response.TokenType, "bearer") || response.ExpiresIn < 1 || response.RefreshTokenExpiresIn < 1 {
+	if !validSecret(response.AccessToken) || !validSecret(response.RefreshToken) || !strings.EqualFold(response.TokenType, "bearer") || response.ExpiresIn < 1 || response.ExpiresIn > maxAccessLifetimeSeconds || response.RefreshTokenExpiresIn < 1 || response.RefreshTokenExpiresIn > maxRefreshLifetimeSeconds {
 		return TokenBundle{}, &Error{Code: "invalid_response"}
 	}
 	return TokenBundle{
@@ -196,7 +204,7 @@ func (c *Client) Installations(ctx context.Context, accessToken string, page, pe
 	if err := c.api(ctx, endpoint, accessToken, &response); err != nil {
 		return InstallationPage{}, err
 	}
-	if response.TotalCount < 0 || len(response.Installations) > perPage {
+	if response.TotalCount < len(response.Installations) || len(response.Installations) > perPage {
 		return InstallationPage{}, &Error{Code: "invalid_response"}
 	}
 	result := InstallationPage{TotalCount: response.TotalCount, Installations: make([]Installation, 0, len(response.Installations))}
@@ -232,6 +240,7 @@ func (c *Client) api(ctx context.Context, endpoint, accessToken string, target a
 
 func (c *Client) execute(request *http.Request, target any) error {
 	request.Header.Set("X-GitHub-Api-Version", APIVersion)
+	request.Header.Set("User-Agent", userAgent)
 	response, err := c.client.Do(request)
 	if err != nil {
 		return &Error{Code: "provider_unavailable"}
@@ -239,7 +248,7 @@ func (c *Client) execute(request *http.Request, target any) error {
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBytes+1))
-		return &Error{Code: statusErrorCode(response.StatusCode)}
+		return &Error{Code: statusErrorCode(response)}
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil {
@@ -275,11 +284,15 @@ func oauthErrorCode(code string) string {
 	}
 }
 
-func statusErrorCode(status int) string {
+func statusErrorCode(response *http.Response) string {
+	status := response.StatusCode
 	switch status {
 	case http.StatusUnauthorized:
 		return "unauthorized"
 	case http.StatusForbidden:
+		if response.Header.Get("Retry-After") != "" || response.Header.Get("X-RateLimit-Remaining") == "0" {
+			return "rate_limited"
+		}
 		return "forbidden"
 	case http.StatusTooManyRequests:
 		return "rate_limited"
@@ -289,6 +302,26 @@ func statusErrorCode(status int) string {
 		}
 		return "provider_rejected"
 	}
+}
+
+func (authorization DeviceAuthorization) String() string {
+	return fmt.Sprintf("GitHub device authorization (user code %q, expires in %s)", authorization.UserCode, authorization.ExpiresIn)
+}
+
+func (authorization DeviceAuthorization) GoString() string { return authorization.String() }
+
+func (authorization DeviceAuthorization) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("user_code", authorization.UserCode), slog.Duration("expires_in", authorization.ExpiresIn))
+}
+
+func (bundle TokenBundle) String() string {
+	return fmt.Sprintf("GitHub token bundle (access expires in %s, refresh expires in %s)", bundle.AccessExpiresIn, bundle.RefreshExpiresIn)
+}
+
+func (bundle TokenBundle) GoString() string { return bundle.String() }
+
+func (bundle TokenBundle) LogValue() slog.Value {
+	return slog.GroupValue(slog.Duration("access_expires_in", bundle.AccessExpiresIn), slog.Duration("refresh_expires_in", bundle.RefreshExpiresIn))
 }
 
 func validSecret(value string) bool {
