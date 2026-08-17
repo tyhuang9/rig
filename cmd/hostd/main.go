@@ -74,8 +74,17 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	workerDone := make(chan struct{})
 	if cfg.FakeRuntime {
-		go j.RunFakeWorker(ctx)
+		go func() {
+			defer close(workerDone)
+			if err := j.RunWorker(ctx, jobs.NewFakeExecutor()); err != nil {
+				logger.Error("job worker stopped", "error", err)
+				stop()
+			}
+		}()
+	} else {
+		close(workerDone)
 	}
 	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: j, Machines: m, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
@@ -85,9 +94,27 @@ func main() {
 		_ = s.Shutdown(shutdown)
 	}()
 	logger.Info("hostd listening", "address", cfg.ListenAddress, "fake_runtime", cfg.FakeRuntime)
-	if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Error("server stopped", "error", err)
+	serveErr := s.ListenAndServe()
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		logger.Error("server stopped", "error", serveErr)
+	}
+	stop()
+	if !waitForWorker(workerDone, 10*time.Second) {
+		logger.Warn("job worker did not stop before shutdown timeout")
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
 		os.Exit(1)
+	}
+}
+
+func waitForWorker(done <-chan struct{}, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
