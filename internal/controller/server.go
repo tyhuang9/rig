@@ -12,9 +12,11 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hostd/hostd/internal/apicontract"
@@ -29,15 +31,16 @@ import (
 var web embed.FS
 
 type Server struct {
-	Auth           authenticationService
-	Apps           *apps.Store
-	Jobs           *jobs.Service
-	Machines       *machines.Store
-	Caddy          bool
-	FakeRuntime    bool
-	DockerEndpoint string
-	DataRoot       string
-	Logger         *slog.Logger
+	Auth               authenticationService
+	Apps               *apps.Store
+	Jobs               *jobs.Service
+	Machines           *machines.Store
+	Caddy              bool
+	FakeRuntime        bool
+	DockerEndpoint     string
+	DataRoot           string
+	Logger             *slog.Logger
+	authenticationWork *authenticationWorkGate
 }
 
 type authenticationService interface {
@@ -170,12 +173,149 @@ const (
 	maxAuthTokenBytes       = 256
 	maxAuthUsernameBytes    = 128
 	maxAuthPassphraseBytes  = 1024
+	authWorkCapacity        = 2
+	authAttemptsPerWindow   = 8
+	authAttemptWindow       = time.Minute
+	maxAuthRateClients      = 1024
 )
 
 var (
 	errAuthContentType  = errors.New("authentication requests require application/json")
 	errAuthBodyTooLarge = errors.New("authentication request body is too large")
 )
+
+var defaultAuthenticationWorkGate = newAuthenticationWorkGate(
+	time.Now,
+	authWorkCapacity,
+	authAttemptsPerWindow,
+	authAttemptWindow,
+	maxAuthRateClients,
+)
+
+type authenticationWorkGate struct {
+	workers chan struct{}
+	rates   *authRateLimiter
+}
+
+type authRateLimiter struct {
+	mu      sync.Mutex
+	now     func() time.Time
+	limit   int
+	window  time.Duration
+	maxKeys int
+	entries map[string]authRateEntry
+}
+
+type authRateEntry struct {
+	started  time.Time
+	seen     time.Time
+	attempts int
+}
+
+func newAuthenticationWorkGate(now func() time.Time, capacity, limit int, window time.Duration, maxKeys int) *authenticationWorkGate {
+	return &authenticationWorkGate{
+		workers: make(chan struct{}, capacity),
+		rates: &authRateLimiter{
+			now: now, limit: limit, window: window, maxKeys: maxKeys, entries: make(map[string]authRateEntry),
+		},
+	}
+}
+
+func (g *authenticationWorkGate) admit(remoteAddr string) (bool, int) {
+	if allowed, retryAfter := g.rates.allow(authClientKey(remoteAddr)); !allowed {
+		return false, retryAfter
+	}
+	select {
+	case g.workers <- struct{}{}:
+		return true, 0
+	default:
+		return false, 1
+	}
+}
+
+func (g *authenticationWorkGate) release() { <-g.workers }
+
+func (l *authRateLimiter) allow(client string) (bool, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := l.now()
+	for key, entry := range l.entries {
+		if !now.Before(entry.seen.Add(l.window)) {
+			delete(l.entries, key)
+		}
+	}
+
+	entry, ok := l.entries[client]
+	if !ok && l.maxKeys > 0 && len(l.entries) >= l.maxKeys {
+		var oldestKey string
+		var oldest time.Time
+		for key, value := range l.entries {
+			if oldestKey == "" || value.seen.Before(oldest) {
+				oldestKey, oldest = key, value.seen
+			}
+		}
+		delete(l.entries, oldestKey)
+	}
+	if !ok || !now.Before(entry.started.Add(l.window)) {
+		entry = authRateEntry{started: now}
+	}
+	if entry.attempts >= l.limit {
+		entry.seen = now
+		l.entries[client] = entry
+		return false, retryAfterSeconds(entry.started.Add(l.window).Sub(now))
+	}
+	entry.attempts++
+	entry.seen = now
+	l.entries[client] = entry
+	return true, 0
+}
+
+func authClientKey(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+	if host == "" {
+		return "unknown"
+	}
+	return host
+}
+
+func retryAfterSeconds(wait time.Duration) int {
+	if wait <= 0 {
+		return 1
+	}
+	seconds := int(wait / time.Second)
+	if wait%time.Second != 0 {
+		seconds++
+	}
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
+}
+
+func (s *Server) authenticationWorkGate() *authenticationWorkGate {
+	if s.authenticationWork != nil {
+		return s.authenticationWork
+	}
+	return defaultAuthenticationWorkGate
+}
+
+func (s *Server) admitAuthenticationWork(w http.ResponseWriter, r *http.Request) bool {
+	allowed, retryAfter := s.authenticationWorkGate().admit(r.RemoteAddr)
+	if allowed {
+		return true
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	problem(w, r, http.StatusTooManyRequests, "auth_rate_limited", "Too many authentication attempts. Try again later.", nil)
+	return false
+}
 
 func readAuthJSON(r *http.Request, dst any) error {
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -323,6 +463,10 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, http.StatusBadRequest, "invalid_request", "Invalid authentication request", nil)
 		return
 	}
+	if !s.admitAuthenticationWork(w, r) {
+		return
+	}
+	defer s.authenticationWorkGate().release()
 	u, session, err := s.Auth.Bootstrap(b.Token, b.Username, b.Passphrase)
 	if err != nil {
 		problem(w, r, 400, "bootstrap_failed", err.Error(), nil)
@@ -341,6 +485,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, http.StatusBadRequest, "invalid_request", "Invalid authentication request", nil)
 		return
 	}
+	if !s.admitAuthenticationWork(w, r) {
+		return
+	}
+	defer s.authenticationWorkGate().release()
 	u, session, err := s.Auth.Login(b.Username, b.Passphrase)
 	if err != nil {
 		problem(w, r, 401, "invalid_credentials", "Invalid username or passphrase", nil)

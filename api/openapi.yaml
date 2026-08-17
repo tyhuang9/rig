@@ -26,6 +26,7 @@ paths:
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/BootstrapRequest'}}}}
       responses:
         '201': {description: Administrator and session created, headers: {Set-Cookie: {$ref: '#/components/headers/SessionCookie'}}, content: {application/json: {schema: {$ref: '#/components/schemas/SessionResponse'}}}}
+        '429': {description: Authentication work is temporarily rate limited, headers: {Retry-After: {description: Seconds until another authentication attempt may be made, schema: {type: integer, minimum: 1}}}, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/auth/sessions:
     post:
@@ -34,6 +35,7 @@ paths:
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/LoginRequest'}}}}
       responses:
         '201': {description: Session created, headers: {Set-Cookie: {$ref: '#/components/headers/SessionCookie'}}, content: {application/json: {schema: {$ref: '#/components/schemas/SessionResponse'}}}}
+        '429': {description: Authentication work is temporarily rate limited, headers: {Retry-After: {description: Seconds until another authentication attempt may be made, schema: {type: integer, minimum: 1}}}, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/auth/sessions/current:
     delete:
