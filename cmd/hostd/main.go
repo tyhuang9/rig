@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -30,7 +31,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(cfg.LogLevel)}))
+	logger := newStructuredLogger(os.Stderr, cfg.LogLevel)
 	db, err := database.Open(cfg.DataRoot)
 	if err != nil {
 		logger.Error("database startup failed", "error", err)
@@ -42,7 +43,7 @@ func main() {
 		logger.Error("bootstrap token setup failed", "error", err)
 		os.Exit(1)
 	} else if token != "" {
-		if err := auth.WriteBootstrapToken(os.Stderr, token); err != nil {
+		if err := writeBootstrapToken(os.Stdout, token); err != nil {
 			logger.Error("bootstrap token console output failed", "error", err)
 			os.Exit(1)
 		}
@@ -83,6 +84,14 @@ func main() {
 
 func startupConfig(args []string) (config.Config, error) {
 	return config.FromFlags(args)
+}
+
+func newStructuredLogger(w io.Writer, logLevel string) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: parseLevel(logLevel)}))
+}
+
+func writeBootstrapToken(w io.Writer, token string) error {
+	return auth.WriteBootstrapToken(w, token)
 }
 
 func parseLevel(v string) slog.Level {

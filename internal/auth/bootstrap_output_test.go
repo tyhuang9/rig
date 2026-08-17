@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestWriteBootstrapTokenUsesDedicatedConsoleFormat(t *testing.T) {
+func TestWriteBootstrapTokenUsesDedicatedUnstructuredConsoleFormat(t *testing.T) {
 	var output bytes.Buffer
 	const token = "one-time-test-token"
 	if err := WriteBootstrapToken(&output, token); err != nil {
