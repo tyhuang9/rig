@@ -1,0 +1,11 @@
+services:
+  web:
+    image: example.invalid/hostd-fixture-web:phase-a
+    ports: ["3000:3000"]
+  api:
+    image: example.invalid/hostd-fixture-api:phase-a
+  postgres:
+    image: postgres:16
+    volumes: [postgres_data:/var/lib/postgresql/data]
+volumes:
+  postgres_data: {}
