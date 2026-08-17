@@ -34,6 +34,13 @@ func TestFileCredentialStorePurposeBindsAndRemovesCredentials(t *testing.T) {
 
 	now := time.Now().UTC()
 	bundle := TokenBundle{Version: 1, Generation: 1, AccessToken: "access-sensitive", RefreshToken: "refresh-sensitive", AccessExpiresAt: now.Add(time.Hour), RefreshExpiresAt: now.Add(24 * time.Hour), ProviderUserID: "42", ProviderLogin: "octo"}
+	exchange := TokenExchange{Version: 1, AccessToken: "exchange-access", RefreshToken: "exchange-refresh", AccessExpiresAt: now.Add(time.Hour), RefreshExpiresAt: now.Add(24 * time.Hour)}
+	if err := store.WriteExchange(id, exchange); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.ReadExchange(id); err != nil || got.AccessToken != exchange.AccessToken {
+		t.Fatalf("ReadExchange = %#v, %v", got, err)
+	}
 	if err := store.WriteBundle(id, bundle); err != nil {
 		t.Fatal(err)
 	}
@@ -48,6 +55,9 @@ func TestFileCredentialStorePurposeBindsAndRemovesCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.RemoveBundle(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveExchange(id); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RemoveBundle(id); err != nil {

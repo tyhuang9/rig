@@ -43,7 +43,7 @@ type Client struct {
 
 type DeviceAuthorization struct {
 	DeviceCode      string `json:"-"`
-	UserCode        string
+	UserCode        string `json:"-"`
 	VerificationURI string
 	ExpiresIn       time.Duration
 	Interval        time.Duration

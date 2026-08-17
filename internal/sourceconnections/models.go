@@ -1,6 +1,10 @@
 package sourceconnections
 
-import "time"
+import (
+	"fmt"
+	"log/slog"
+	"time"
+)
 
 const (
 	StatusPending      = "pending"
@@ -32,7 +36,7 @@ type Connection struct {
 
 type DeviceStart struct {
 	ConnectionID    string
-	UserCode        string
+	UserCode        string `json:"-"`
 	VerificationURI string
 	InstallURL      string
 	ExpiresAt       time.Time
@@ -59,10 +63,34 @@ type InstallationPage struct {
 type TokenBundle struct {
 	Version          int       `json:"version"`
 	Generation       int64     `json:"generation"`
-	AccessToken      string    `json:"accessToken"`
-	RefreshToken     string    `json:"refreshToken"`
+	AccessToken      string    `json:"-"`
+	RefreshToken     string    `json:"-"`
 	AccessExpiresAt  time.Time `json:"accessExpiresAt"`
 	RefreshExpiresAt time.Time `json:"refreshExpiresAt"`
 	ProviderUserID   string    `json:"providerUserId"`
 	ProviderLogin    string    `json:"providerLogin"`
+}
+
+type TokenExchange struct {
+	Version          int       `json:"version"`
+	AccessToken      string    `json:"-"`
+	RefreshToken     string    `json:"-"`
+	AccessExpiresAt  time.Time `json:"accessExpiresAt"`
+	RefreshExpiresAt time.Time `json:"refreshExpiresAt"`
+}
+
+func (start DeviceStart) String() string {
+	return fmt.Sprintf("GitHub device connection %s (expires %s)", start.ConnectionID, start.ExpiresAt.Format(time.RFC3339))
+}
+
+func (start DeviceStart) GoString() string { return start.String() }
+
+func (start DeviceStart) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("connection_id", start.ConnectionID), slog.Time("expires_at", start.ExpiresAt))
+}
+
+func (exchange TokenExchange) String() string   { return "GitHub protected token exchange" }
+func (exchange TokenExchange) GoString() string { return exchange.String() }
+func (exchange TokenExchange) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("state", "protected"))
 }

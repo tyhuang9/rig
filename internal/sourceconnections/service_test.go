@@ -21,6 +21,7 @@ type fakeProvider struct {
 	pollCalls          int
 	user               githubapp.User
 	userError          error
+	userCalls          int
 	refreshTokens      githubapp.TokenBundle
 	refreshError       error
 	refreshCalls       int
@@ -51,6 +52,9 @@ func (provider *fakeProvider) Refresh(context.Context, string) (githubapp.TokenB
 	return provider.refreshTokens, provider.refreshError
 }
 func (provider *fakeProvider) CurrentUser(context.Context, string) (githubapp.User, error) {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	provider.userCalls++
 	return provider.user, provider.userError
 }
 func (provider *fakeProvider) Installations(context.Context, string, int, int) (githubapp.InstallationPage, error) {
@@ -77,8 +81,9 @@ type testClock struct {
 
 type faultCredentialStore struct {
 	CredentialStore
-	failBundleWrite  bool
-	failDeviceRemove int
+	failBundleWrite    bool
+	failDeviceRemove   int
+	failExchangeRemove int
 }
 
 func (store *faultCredentialStore) WriteBundle(id string, bundle TokenBundle) error {
@@ -94,6 +99,14 @@ func (store *faultCredentialStore) RemoveDevice(id string) error {
 		return errors.New("injected device remove failure")
 	}
 	return store.CredentialStore.RemoveDevice(id)
+}
+
+func (store *faultCredentialStore) RemoveExchange(id string) error {
+	if store.failExchangeRemove > 0 {
+		store.failExchangeRemove--
+		return errors.New("injected exchange remove failure")
+	}
+	return store.CredentialStore.RemoveExchange(id)
 }
 
 func (clock *testClock) Time() time.Time {
@@ -359,6 +372,124 @@ func TestInvalidRefreshPurgesCredentialsAndSlowDownStaysWithinPersistenceBound(t
 	pending, err := service.repository.Get(context.Background(), "owner", started.ConnectionID)
 	if err != nil || pending.PollInterval != 300*time.Second {
 		t.Fatalf("clamped interval = %s, %v", pending.PollInterval, err)
+	}
+}
+
+func TestFinalizingExchangeRecoversUserPromotionDatabaseAndCleanupFailures(t *testing.T) {
+	t.Run("current user transient", func(t *testing.T) {
+		service, provider, clock, _, store := testService(t)
+		provider.userError = &githubapp.Error{Code: "provider_unavailable"}
+		started, err := service.Start(context.Background(), "owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(5 * time.Second)
+		if _, err := service.Poll(context.Background(), "owner", started.ConnectionID); !IsCode(err, "provider_unavailable") {
+			t.Fatalf("first poll = %v", err)
+		}
+		if _, err := store.ReadExchange(started.ConnectionID); err != nil {
+			t.Fatalf("durable exchange missing: %v", err)
+		}
+		if _, err := service.Poll(context.Background(), "owner", started.ConnectionID); !IsCode(err, "poll_too_soon") {
+			t.Fatalf("unthrottled finalize retry = %v", err)
+		}
+		provider.userError = nil
+		clock.Advance(5 * time.Second)
+		if got, err := service.Poll(context.Background(), "owner", started.ConnectionID); err != nil || got.Status != StatusConnected {
+			t.Fatalf("recovered = %#v, %v", got, err)
+		}
+		if provider.pollCalls != 1 {
+			t.Fatalf("device exchange repeated %d times", provider.pollCalls)
+		}
+	})
+
+	t.Run("bundle promotion", func(t *testing.T) {
+		service, provider, clock, _, realStore := testService(t)
+		started, err := service.Start(context.Background(), "owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		faults := &faultCredentialStore{CredentialStore: realStore, failBundleWrite: true}
+		service.credentials = faults
+		clock.Advance(5 * time.Second)
+		if _, err := service.Poll(context.Background(), "owner", started.ConnectionID); !IsCode(err, "internal_error") {
+			t.Fatalf("promotion failure = %v", err)
+		}
+		faults.failBundleWrite = false
+		clock.Advance(5 * time.Second)
+		if _, err := service.Poll(context.Background(), "owner", started.ConnectionID); err != nil {
+			t.Fatalf("promotion recovery = %v", err)
+		}
+		if provider.pollCalls != 1 {
+			t.Fatalf("device exchange repeated %d times", provider.pollCalls)
+		}
+	})
+
+	t.Run("database connect", func(t *testing.T) {
+		service, provider, clock, db, _ := testService(t)
+		started, err := service.Start(context.Background(), "owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`CREATE TRIGGER fail_connection_finalize BEFORE UPDATE ON source_connections WHEN NEW.status = 'connected' BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(5 * time.Second)
+		if _, err := service.Poll(context.Background(), "owner", started.ConnectionID); !IsCode(err, "internal_error") {
+			t.Fatalf("database failure = %v", err)
+		}
+		if _, err := db.Exec(`DROP TRIGGER fail_connection_finalize`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.Poll(context.Background(), "owner", started.ConnectionID); err != nil {
+			t.Fatalf("database recovery = %v", err)
+		}
+		if provider.pollCalls != 1 {
+			t.Fatalf("device exchange repeated %d times", provider.pollCalls)
+		}
+	})
+
+	t.Run("exchange cleanup", func(t *testing.T) {
+		service, provider, clock, _, realStore := testService(t)
+		started, err := service.Start(context.Background(), "owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		faults := &faultCredentialStore{CredentialStore: realStore, failExchangeRemove: 1}
+		service.credentials = faults
+		clock.Advance(5 * time.Second)
+		if _, err := service.Poll(context.Background(), "owner", started.ConnectionID); !IsCode(err, "internal_error") {
+			t.Fatalf("cleanup failure = %v", err)
+		}
+		if _, err := service.Poll(context.Background(), "owner", started.ConnectionID); err != nil {
+			t.Fatalf("cleanup recovery = %v", err)
+		}
+		if _, err := realStore.ReadExchange(started.ConnectionID); err == nil {
+			t.Fatal("exchange remains after cleanup retry")
+		}
+		if provider.pollCalls != 1 {
+			t.Fatalf("device exchange repeated %d times", provider.pollCalls)
+		}
+	})
+}
+
+func TestExpiredExchangeAccessRefreshesWithoutUsingDeviceGrantExpiry(t *testing.T) {
+	service, provider, clock, _, store := testService(t)
+	started, err := service.Start(context.Background(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := clock.Time()
+	exchange := TokenExchange{Version: 1, AccessToken: "expired-access", RefreshToken: "valid-refresh", AccessExpiresAt: now.Add(-time.Minute), RefreshExpiresAt: now.Add(time.Hour)}
+	if err := store.WriteExchange(started.ConnectionID, exchange); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(20 * time.Minute)
+	if got, err := service.Poll(context.Background(), "owner", started.ConnectionID); err != nil || got.Status != StatusConnected {
+		t.Fatalf("exchange refresh = %#v, %v", got, err)
+	}
+	if provider.refreshCalls != 1 || provider.pollCalls != 0 {
+		t.Fatalf("refresh calls = %d, device poll calls = %d", provider.refreshCalls, provider.pollCalls)
 	}
 }
 

@@ -46,11 +46,26 @@ func NewService(repository *Repository, provider Provider, credentials Credentia
 	return &Service{repository: repository, provider: provider, credentials: credentials, appSlug: appSlug, now: now}
 }
 
+func (service *Service) ProviderEnabled() bool {
+	return service.provider != nil && service.appSlug != ""
+}
+
 func (service *Service) List(ctx context.Context, owner string) ([]Connection, error) {
 	return service.repository.List(ctx, owner)
 }
 
+func (service *Service) Get(ctx context.Context, owner, id string) (Connection, error) {
+	connection, err := service.repository.Get(ctx, owner, id)
+	if err != nil {
+		return Connection{}, connectionError(err)
+	}
+	return connection, nil
+}
+
 func (service *Service) Start(ctx context.Context, owner string) (DeviceStart, error) {
+	if service.provider == nil || service.appSlug == "" {
+		return DeviceStart{}, &Error{Code: "provider_unavailable"}
+	}
 	authorization, err := service.provider.StartDevice(ctx)
 	if err != nil {
 		return DeviceStart{}, providerError(err)
@@ -98,11 +113,24 @@ func (service *Service) Poll(ctx context.Context, owner, id string) (Connection,
 		return Connection{}, service.loseAccess(ctx, owner, id, "credential_invalid")
 	}
 	now := service.now().UTC()
+	exchange, exchangeErr := service.credentials.ReadExchange(id)
+	if exchangeErr == nil {
+		if connection.NextPollAt != nil && now.Before(*connection.NextPollAt) {
+			return Connection{}, &Error{Code: "poll_too_soon", RetryAfter: connection.NextPollAt.Sub(now)}
+		}
+		return service.finalizeExchange(ctx, owner, connection, exchange)
+	}
+	if !credentialMissing(exchangeErr) {
+		return Connection{}, service.loseAccess(ctx, owner, id, "credential_invalid")
+	}
 	if connection.PendingExpiresAt == nil || !now.Before(*connection.PendingExpiresAt) {
 		return Connection{}, service.purgeAndMark(ctx, owner, id, StatusExpired, "authorization_expired")
 	}
 	if connection.NextPollAt != nil && now.Before(*connection.NextPollAt) {
 		return Connection{}, &Error{Code: "poll_too_soon", RetryAfter: connection.NextPollAt.Sub(now)}
+	}
+	if service.provider == nil {
+		return Connection{}, &Error{Code: "provider_unavailable"}
 	}
 	deviceCode, err := service.credentials.ReadDevice(id)
 	if err != nil {
@@ -114,27 +142,63 @@ func (service *Service) Poll(ctx context.Context, owner, id string) (Connection,
 		return Connection{}, service.handlePollError(ctx, owner, connection, err, service.now().UTC())
 	}
 	postProviderNow := service.now().UTC()
-	if err := service.repository.AdvancePoll(ctx, owner, id, connection.PollInterval, postProviderNow.Add(connection.PollInterval), postProviderNow); err != nil {
-		return Connection{}, internalError()
-	}
-	user, err := service.provider.CurrentUser(ctx, tokens.AccessToken)
-	if err != nil {
-		if githubapp.IsCode(err, "unauthorized") {
-			return Connection{}, service.purgeAndMark(ctx, owner, id, StatusAccessLost, "source_access_lost")
-		}
-		return Connection{}, providerError(err)
-	}
-	bundle := TokenBundle{Version: tokenBundleVersion, Generation: 1, AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken, AccessExpiresAt: postProviderNow.Add(tokens.AccessExpiresIn), RefreshExpiresAt: postProviderNow.Add(tokens.RefreshExpiresIn), ProviderUserID: user.ID, ProviderLogin: user.Login}
-	if err := service.credentials.WriteBundle(id, bundle); err != nil {
+	issuedExchange := TokenExchange{Version: tokenBundleVersion, AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken, AccessExpiresAt: postProviderNow.Add(tokens.AccessExpiresIn), RefreshExpiresAt: postProviderNow.Add(tokens.RefreshExpiresIn)}
+	if err := service.credentials.WriteExchange(id, issuedExchange); err != nil {
 		if terminalErr := service.purgeAndMark(ctx, owner, id, StatusAccessLost, "credential_write_failed"); !IsCode(terminalErr, "source_access_lost") {
 			return Connection{}, terminalErr
 		}
 		return Connection{}, internalError()
 	}
-	if err := service.finishBundle(ctx, owner, id, bundle); err != nil {
+	if err := service.repository.AdvancePoll(ctx, owner, id, connection.PollInterval, postProviderNow.Add(connection.PollInterval), postProviderNow); err != nil {
+		return Connection{}, internalError()
+	}
+	return service.finalizeExchange(ctx, owner, connection, issuedExchange)
+}
+
+func (service *Service) finalizeExchange(ctx context.Context, owner string, connection Connection, exchange TokenExchange) (Connection, error) {
+	if service.provider == nil {
+		return Connection{}, &Error{Code: "provider_unavailable"}
+	}
+	now := service.now().UTC()
+	if !now.Before(exchange.RefreshExpiresAt) {
+		return Connection{}, service.purgeAndMark(ctx, owner, connection.ID, StatusAccessLost, "refresh_expired")
+	}
+	if !now.Before(exchange.AccessExpiresAt) {
+		tokens, err := service.provider.Refresh(ctx, exchange.RefreshToken)
+		if err != nil {
+			if githubapp.IsCode(err, "oauth_failed") || githubapp.IsCode(err, "unauthorized") || githubapp.IsCode(err, "expired_token") || githubapp.IsCode(err, "access_denied") {
+				return Connection{}, service.purgeAndMark(ctx, owner, connection.ID, StatusAccessLost, "refresh_invalid")
+			}
+			return Connection{}, service.finalizationProviderError(ctx, owner, connection, err)
+		}
+		exchange = TokenExchange{Version: tokenBundleVersion, AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken, AccessExpiresAt: now.Add(tokens.AccessExpiresIn), RefreshExpiresAt: now.Add(tokens.RefreshExpiresIn)}
+		if err := service.credentials.WriteExchange(connection.ID, exchange); err != nil {
+			return Connection{}, service.purgeAndMark(ctx, owner, connection.ID, StatusAccessLost, "credential_rotation_failed")
+		}
+	}
+	user, err := service.provider.CurrentUser(ctx, exchange.AccessToken)
+	if err != nil {
+		if githubapp.IsCode(err, "unauthorized") {
+			return Connection{}, service.purgeAndMark(ctx, owner, connection.ID, StatusAccessLost, "source_access_lost")
+		}
+		return Connection{}, service.finalizationProviderError(ctx, owner, connection, err)
+	}
+	bundle := TokenBundle{Version: tokenBundleVersion, Generation: 1, AccessToken: exchange.AccessToken, RefreshToken: exchange.RefreshToken, AccessExpiresAt: exchange.AccessExpiresAt, RefreshExpiresAt: exchange.RefreshExpiresAt, ProviderUserID: user.ID, ProviderLogin: user.Login}
+	if err := service.credentials.WriteBundle(connection.ID, bundle); err != nil {
+		return Connection{}, internalError()
+	}
+	if err := service.finishBundle(ctx, owner, connection.ID, bundle); err != nil {
 		return Connection{}, err
 	}
-	return service.repository.Get(ctx, owner, id)
+	return service.repository.Get(ctx, owner, connection.ID)
+}
+
+func (service *Service) finalizationProviderError(ctx context.Context, owner string, connection Connection, providerErr error) error {
+	now := service.now().UTC()
+	if err := service.repository.AdvancePoll(ctx, owner, connection.ID, connection.PollInterval, now.Add(connection.PollInterval), now); err != nil {
+		return internalError()
+	}
+	return providerError(providerErr)
 }
 
 func (service *Service) Refresh(ctx context.Context, owner, id string) (Connection, error) {
@@ -146,6 +210,9 @@ func (service *Service) Refresh(ctx context.Context, owner, id string) (Connecti
 	}
 	if connection.Status != StatusConnected && connection.Status != StatusAccessLost {
 		return Connection{}, statusError(connection.Status)
+	}
+	if service.provider == nil {
+		return Connection{}, &Error{Code: "provider_unavailable"}
 	}
 	bundle, err := service.loadBundle(ctx, owner, connection)
 	if err != nil {
@@ -166,6 +233,9 @@ func (service *Service) Installations(ctx context.Context, owner, id string, pag
 	}
 	if connection.Status != StatusConnected {
 		return InstallationPage{}, statusError(connection.Status)
+	}
+	if service.provider == nil {
+		return InstallationPage{}, &Error{Code: "provider_unavailable"}
 	}
 	bundle, err := service.loadBundle(ctx, owner, connection)
 	if err != nil {
@@ -262,13 +332,13 @@ func (service *Service) finishBundle(ctx context.Context, owner, id string, bund
 	if err := service.credentials.RemoveDevice(id); err != nil {
 		return internalError()
 	}
+	if err := service.credentials.RemoveExchange(id); err != nil {
+		return internalError()
+	}
 	return nil
 }
 
 func (service *Service) loadBundle(ctx context.Context, owner string, connection Connection) (TokenBundle, error) {
-	if err := service.credentials.RemoveDevice(connection.ID); err != nil {
-		return TokenBundle{}, internalError()
-	}
 	bundle, err := service.credentials.ReadBundle(connection.ID)
 	if err != nil {
 		return TokenBundle{}, service.loseAccess(ctx, owner, connection.ID, "credential_missing")
@@ -280,6 +350,12 @@ func (service *Service) loadBundle(ctx context.Context, owner string, connection
 		if err := service.repository.Connect(ctx, owner, connection.ID, bundle, service.now().UTC()); err != nil {
 			return TokenBundle{}, internalError()
 		}
+	}
+	if err := service.credentials.RemoveDevice(connection.ID); err != nil {
+		return TokenBundle{}, internalError()
+	}
+	if err := service.credentials.RemoveExchange(connection.ID); err != nil {
+		return TokenBundle{}, internalError()
 	}
 	return bundle, nil
 }
@@ -326,8 +402,9 @@ func (service *Service) purgeAndMark(ctx context.Context, owner, id, status, rea
 
 func (service *Service) destroyCredentials(id string) error {
 	deviceErr := service.credentials.RemoveDevice(id)
+	exchangeErr := service.credentials.RemoveExchange(id)
 	bundleErr := service.credentials.RemoveBundle(id)
-	return errors.Join(deviceErr, bundleErr)
+	return errors.Join(deviceErr, exchangeErr, bundleErr)
 }
 
 func providerError(err error) error {
