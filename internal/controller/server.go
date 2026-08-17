@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"embed"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -27,7 +29,7 @@ import (
 var web embed.FS
 
 type Server struct {
-	Auth           *auth.Service
+	Auth           authenticationService
 	Apps           *apps.Store
 	Jobs           *jobs.Service
 	Machines       *machines.Store
@@ -36,6 +38,16 @@ type Server struct {
 	DockerEndpoint string
 	DataRoot       string
 	Logger         *slog.Logger
+}
+
+type authenticationService interface {
+	BootstrapStatus() (bool, error)
+	Bootstrap(string, string, string) (auth.User, auth.Session, error)
+	Login(string, string) (auth.User, auth.Session, error)
+	Authenticate(string) (auth.User, string, error)
+	CheckCSRF(string, string) bool
+	RotateCSRF(string) (string, error)
+	Logout(string) error
 }
 type principalKey struct{}
 type principal struct {
@@ -152,6 +164,64 @@ func readJSON(r *http.Request, dst any) error {
 	}
 	return nil
 }
+
+const (
+	maxAuthRequestBodyBytes = 4 << 10
+	maxAuthTokenBytes       = 256
+	maxAuthUsernameBytes    = 128
+	maxAuthPassphraseBytes  = 1024
+)
+
+var (
+	errAuthContentType  = errors.New("authentication requests require application/json")
+	errAuthBodyTooLarge = errors.New("authentication request body is too large")
+)
+
+func readAuthJSON(r *http.Request, dst any) error {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || !strings.EqualFold(mediaType, "application/json") {
+		return errAuthContentType
+	}
+	defer r.Body.Close()
+	payload, err := io.ReadAll(io.LimitReader(r.Body, maxAuthRequestBodyBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(payload) > maxAuthRequestBodyBytes {
+		return errAuthBodyTooLarge
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("request must contain a single JSON object")
+	}
+	return nil
+}
+
+func authRequestProblem(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, errAuthContentType):
+		problem(w, r, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json", nil)
+	case errors.Is(err, errAuthBodyTooLarge):
+		problem(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "Authentication request is too large", nil)
+	default:
+		problem(w, r, http.StatusBadRequest, "invalid_request", "Invalid authentication request", nil)
+	}
+}
+
+func validBootstrapRequest(value apicontract.BootstrapRequest) bool {
+	return len(value.Token) > 0 && len(value.Token) <= maxAuthTokenBytes &&
+		len(value.Username) > 0 && len(value.Username) <= maxAuthUsernameBytes &&
+		len(value.Passphrase) >= 12 && len(value.Passphrase) <= maxAuthPassphraseBytes
+}
+
+func validLoginRequest(value apicontract.LoginRequest) bool {
+	return len(value.Username) > 0 && len(value.Username) <= maxAuthUsernameBytes &&
+		len(value.Passphrase) > 0 && len(value.Passphrase) <= maxAuthPassphraseBytes
+}
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -245,8 +315,12 @@ func (s *Server) bootstrapStatus(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	var b apicontract.BootstrapRequest
-	if err := readJSON(r, &b); err != nil {
-		problem(w, r, 400, "invalid_request", "Invalid bootstrap request", nil)
+	if err := readAuthJSON(r, &b); err != nil {
+		authRequestProblem(w, r, err)
+		return
+	}
+	if !validBootstrapRequest(b) {
+		problem(w, r, http.StatusBadRequest, "invalid_request", "Invalid authentication request", nil)
 		return
 	}
 	u, session, err := s.Auth.Bootstrap(b.Token, b.Username, b.Passphrase)
@@ -259,8 +333,12 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	var b apicontract.LoginRequest
-	if err := readJSON(r, &b); err != nil {
-		problem(w, r, 400, "invalid_request", "Invalid session request", nil)
+	if err := readAuthJSON(r, &b); err != nil {
+		authRequestProblem(w, r, err)
+		return
+	}
+	if !validLoginRequest(b) {
+		problem(w, r, http.StatusBadRequest, "invalid_request", "Invalid authentication request", nil)
 		return
 	}
 	u, session, err := s.Auth.Login(b.Username, b.Passphrase)

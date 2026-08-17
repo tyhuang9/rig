@@ -213,8 +213,8 @@ components:
         requestId: {type: string}
         errors: {type: object, additionalProperties: {type: string}}
     BootstrapStatus: {type: object, required: [bootstrapRequired], properties: {bootstrapRequired: {type: boolean}}}
-    BootstrapRequest: {type: object, additionalProperties: false, required: [token, username, passphrase], properties: {token: {type: string}, username: {type: string}, passphrase: {type: string, minLength: 12}}}
-    LoginRequest: {type: object, additionalProperties: false, required: [username, passphrase], properties: {username: {type: string}, passphrase: {type: string}}}
+    BootstrapRequest: {type: object, additionalProperties: false, required: [token, username, passphrase], properties: {token: {type: string, minLength: 1, maxLength: 256}, username: {type: string, minLength: 1, maxLength: 128}, passphrase: {type: string, minLength: 12, maxLength: 1024}}}
+    LoginRequest: {type: object, additionalProperties: false, required: [username, passphrase], properties: {username: {type: string, minLength: 1, maxLength: 128}, passphrase: {type: string, minLength: 1, maxLength: 1024}}}
     User: {type: object, required: [id, username, role], properties: {id: {type: string, format: uuid}, username: {type: string}, role: {type: string, const: administrator}}}
     SessionResponse: {type: object, required: [user, csrfToken], properties: {user: {$ref: '#/components/schemas/User'}, csrfToken: {type: string}}}
     MeResponse: {type: object, required: [user], properties: {user: {$ref: '#/components/schemas/User'}}}

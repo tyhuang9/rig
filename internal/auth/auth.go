@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"errors"
@@ -16,8 +17,9 @@ import (
 const SessionCookie = "hostd_session"
 
 type Service struct {
-	db  *sql.DB
-	now func() time.Time
+	db             *sql.DB
+	now            func() time.Time
+	hashPassphrase func(string) (string, error)
 }
 type User struct {
 	ID       string `json:"id"`
@@ -29,7 +31,9 @@ type Session struct {
 	ExpiresAt   time.Time
 }
 
-func New(db *sql.DB) *Service { return &Service{db: db, now: time.Now} }
+func New(db *sql.DB) *Service {
+	return &Service{db: db, now: time.Now, hashPassphrase: hashPassphrase}
+}
 
 func randomToken() (string, error) {
 	b := make([]byte, 32)
@@ -127,7 +131,10 @@ func (s *Service) Bootstrap(token, username, passphrase string) (User, Session, 
 	if username == "" {
 		return User{}, Session{}, errors.New("username is required")
 	}
-	hash, err := hashPassphrase(passphrase)
+	if err := s.validateBootstrapToken(s.db, token); err != nil {
+		return User{}, Session{}, err
+	}
+	hash, err := s.hashPassphrase(passphrase)
 	if err != nil {
 		return User{}, Session{}, err
 	}
@@ -136,20 +143,8 @@ func (s *Service) Bootstrap(token, username, passphrase string) (User, Session, 
 		return User{}, Session{}, err
 	}
 	defer tx.Rollback()
-	var n int
-	if err = tx.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
+	if err = s.validateBootstrapToken(tx, token); err != nil {
 		return User{}, Session{}, err
-	}
-	if n != 0 {
-		return User{}, Session{}, errors.New("bootstrap is no longer available")
-	}
-	var tokenHash string
-	var expires string
-	if err = tx.QueryRow(`SELECT token_hash, expires_at FROM bootstrap_tokens WHERE id=1 AND used_at IS NULL`).Scan(&tokenHash, &expires); err != nil {
-		return User{}, Session{}, errors.New("invalid bootstrap token")
-	}
-	if tokenHash != digest(token) || expires < s.now().UTC().Format(time.RFC3339Nano) {
-		return User{}, Session{}, errors.New("invalid bootstrap token")
 	}
 	u := User{ID: uuid.NewString(), Username: username, Role: "administrator"}
 	now := s.now().UTC().Format(time.RFC3339Nano)
@@ -164,6 +159,30 @@ func (s *Service) Bootstrap(token, username, passphrase string) (User, Session, 
 	}
 	session, err := s.NewSession(u.ID)
 	return u, session, err
+}
+
+type rowQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func (s *Service) validateBootstrapToken(queryer rowQuerier, token string) error {
+	var users int
+	if err := queryer.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&users); err != nil {
+		return err
+	}
+	if users != 0 {
+		return errors.New("bootstrap is no longer available")
+	}
+	var tokenHash string
+	var expires string
+	if err := queryer.QueryRow(`SELECT token_hash, expires_at FROM bootstrap_tokens WHERE id=1 AND used_at IS NULL`).Scan(&tokenHash, &expires); err != nil {
+		return errors.New("invalid bootstrap token")
+	}
+	suppliedHash := digest(token)
+	if subtle.ConstantTimeCompare([]byte(tokenHash), []byte(suppliedHash)) != 1 || expires < s.now().UTC().Format(time.RFC3339Nano) {
+		return errors.New("invalid bootstrap token")
+	}
+	return nil
 }
 func (s *Service) Login(username, passphrase string) (User, Session, error) {
 	var u User
