@@ -30,7 +30,17 @@ sh scripts/embed-web.sh
 go run ./cmd/hostd --data-root .hostd-dev --fake-runtime
 ```
 
-Open `http://127.0.0.1:7345`. The daemon prints a single-use bootstrap token only to stdout through a dedicated protected-console path; structured `slog` output remains on stderr, and neither request nor audit logs receive the token. Treat stdout as sensitive during bootstrap; only the token hash is stored.
+Open `http://127.0.0.1:7345`. The daemon prints only the path to an owner-protected bootstrap file; it never writes the token to process output or logs. Read it explicitly with the printed path, then paste the returned token into the dashboard:
+
+```powershell
+go run ./cmd/hostctl bootstrap-token --file .\.hostd-dev\bootstrap-token.secret
+```
+
+```sh
+go run ./cmd/hostctl bootstrap-token --file ./.hostd-dev/bootstrap-token.secret
+```
+
+The file is atomic and `0600` on POSIX, current-user DPAPI-encrypted on Windows, and removed after successful bootstrap, expiry, or a clean daemon shutdown. Only the token hash is stored in SQLite.
 
 Phase A accepts only an explicit loopback IP literal for `--listen`, such as `127.0.0.1:7345` or `[::1]:7345`. Wildcard addresses, LAN addresses, empty hosts, and hostnames are rejected before the data root is created. This enforced local-only HTTP boundary is why the session cookie is intentionally not marked `Secure` in Phase A.
 

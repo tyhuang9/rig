@@ -89,7 +89,7 @@ func TestSessionStdinAndOperationalFailuresReturnErrors(t *testing.T) {
 
 func TestBootstrapTokenReadsProtectedFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bootstrap-token.secret")
-	if err := secretfile.Write(path, "bootstrap-token", []byte("one-time-token")); err != nil {
+	if err := secretfile.Write(path, auth.BootstrapSecretPurpose, []byte("one-time-token")); err != nil {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
@@ -99,11 +99,14 @@ func TestBootstrapTokenReadsProtectedFile(t *testing.T) {
 	if output.String() != "one-time-token\n" {
 		t.Fatalf("bootstrap token output = %q", output.String())
 	}
+	output.Reset()
 	if err := os.WriteFile(path, []byte("plaintext"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := execute([]string{"bootstrap-token", "--file", path}, strings.NewReader(""), &output, http.DefaultClient); err == nil {
 		t.Fatal("plaintext bootstrap token file was accepted")
+	} else if strings.Contains(err.Error(), "one-time-token") || output.Len() != 0 {
+		t.Fatalf("bootstrap token leaked on retrieval failure: output=%q error=%q", output.String(), err)
 	}
 	if err := execute([]string{"bootstrap-token"}, strings.NewReader(""), &output, http.DefaultClient); err == nil {
 		t.Fatal("bootstrap token command accepted a missing file")

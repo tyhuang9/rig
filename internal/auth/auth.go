@@ -14,7 +14,11 @@ import (
 	"golang.org/x/crypto/argon2"
 )
 
-const SessionCookie = "hostd_session"
+const (
+	SessionCookie          = "hostd_session"
+	BootstrapSecretPurpose = "bootstrap-token"
+	BootstrapTokenLifetime = 15 * time.Minute
+)
 
 type Service struct {
 	db             *sql.DB
@@ -112,19 +116,13 @@ func (s *Service) EnsureBootstrapToken() (string, error) {
 	if err != nil || !needed {
 		return "", err
 	}
-	var existing string
-	err = s.db.QueryRow(`SELECT token_hash FROM bootstrap_tokens WHERE id = 1 AND used_at IS NULL AND expires_at > ?`, s.now().UTC().Format(time.RFC3339Nano)).Scan(&existing)
-	if err == nil {
-		return "", nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return "", err
-	}
+	// Rotate on every pre-bootstrap daemon start so the protected token file
+	// always has recoverable material matching the database hash.
 	token, err := randomToken()
 	if err != nil {
 		return "", err
 	}
-	_, err = s.db.Exec(`INSERT INTO bootstrap_tokens(id,token_hash,expires_at) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash,expires_at=excluded.expires_at,used_at=NULL`, digest(token), s.now().Add(15*time.Minute).UTC().Format(time.RFC3339Nano))
+	_, err = s.db.Exec(`INSERT INTO bootstrap_tokens(id,token_hash,expires_at) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash,expires_at=excluded.expires_at,used_at=NULL`, digest(token), s.now().Add(BootstrapTokenLifetime).UTC().Format(time.RFC3339Nano))
 	return token, err
 }
 func (s *Service) Bootstrap(token, username, passphrase string) (User, Session, error) {

@@ -40,6 +40,7 @@ type Server struct {
 	DockerEndpoint     string
 	DataRoot           string
 	Logger             *slog.Logger
+	BootstrapCompleted func()
 	authenticationWork *authenticationWorkGate
 }
 
@@ -471,6 +472,9 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		problem(w, r, 400, "bootstrap_failed", err.Error(), nil)
 		return
+	}
+	if s.BootstrapCompleted != nil {
+		s.BootstrapCompleted()
 	}
 	s.setSession(w, session)
 	writeJSON(w, 201, apicontract.SessionResponse{User: contractUser(u), CSRFToken: session.CSRF})

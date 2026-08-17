@@ -99,11 +99,11 @@ func execute(args []string, input io.Reader, output io.Writer, client *http.Clie
 	root.AddCommand(login)
 
 	var bootstrapTokenFile string
-	bootstrapToken := &cobra.Command{Use: "bootstrap-token", Short: "read a protected local bootstrap token", Args: cobra.NoArgs, RunE: func(_ *cobra.Command, _ []string) error {
+	bootstrapToken := &cobra.Command{Use: "bootstrap-token", Short: "write a protected local bootstrap token to stdout", Args: cobra.NoArgs, RunE: func(_ *cobra.Command, _ []string) error {
 		if bootstrapTokenFile == "" {
 			return errors.New("bootstrap-token requires --file")
 		}
-		token, err := secretfile.Read(bootstrapTokenFile, "bootstrap-token")
+		token, err := secretfile.Read(bootstrapTokenFile, auth.BootstrapSecretPurpose)
 		if err != nil {
 			return fmt.Errorf("read bootstrap token: %w", err)
 		}

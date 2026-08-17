@@ -229,7 +229,8 @@ func TestBootstrapResponseUsesGeneratedContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := (&controller.Server{Auth: authService, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).Handler()
+	bootstrapCompleted := false
+	handler := (&controller.Server{Auth: authService, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), BootstrapCompleted: func() { bootstrapCompleted = true }}).Handler()
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/bootstrap", strings.NewReader(`{"token":"`+token+`","username":"admin","passphrase":"this is a secure passphrase"}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -237,5 +238,8 @@ func TestBootstrapResponseUsesGeneratedContract(t *testing.T) {
 	var session apicontract.SessionResponse
 	if err := json.Unmarshal(response.Body.Bytes(), &session); err != nil || response.Code != http.StatusCreated || session.User.ID == "" || session.User.Username != "admin" || session.CSRFToken == "" {
 		t.Fatalf("bootstrap contract response: %d %s (%v)", response.Code, response.Body.String(), err)
+	}
+	if !bootstrapCompleted {
+		t.Fatal("successful bootstrap did not trigger protected token cleanup")
 	}
 }

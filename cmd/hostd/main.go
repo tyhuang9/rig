@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,7 +21,10 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/runtime/docker"
+	"github.com/hostd/hostd/internal/secretfile"
 )
+
+const bootstrapSecretFilename = "bootstrap-token.secret"
 
 func main() {
 	cfg, err := startupConfig(os.Args[1:])
@@ -39,15 +44,19 @@ func main() {
 	}
 	defer db.Close()
 	a := auth.New(db)
-	if token, err := a.EnsureBootstrapToken(); err != nil {
+	token, err := a.EnsureBootstrapToken()
+	if err != nil {
 		logger.Error("bootstrap token setup failed", "error", err)
 		os.Exit(1)
-	} else if token != "" {
-		if err := writeBootstrapToken(os.Stdout, token); err != nil {
-			logger.Error("bootstrap token console output failed", "error", err)
-			os.Exit(1)
-		}
 	}
+	bootstrapCompleted, err := prepareBootstrapToken(os.Stdout, cfg.DataRoot, token, auth.BootstrapTokenLifetime, func(err error) {
+		logger.Error("bootstrap token file cleanup failed", "error", err)
+	})
+	if err != nil {
+		logger.Error("bootstrap token file setup failed", "error", err)
+		os.Exit(1)
+	}
+	defer bootstrapCompleted()
 	m := machines.New(db)
 	if _, err := m.EnsureLocal(); err != nil {
 		logger.Error("local machine setup failed", "error", err)
@@ -68,7 +77,7 @@ func main() {
 	if cfg.FakeRuntime {
 		go j.RunFakeWorker(ctx)
 	}
-	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: j, Machines: m, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: j, Machines: m, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -90,8 +99,39 @@ func newStructuredLogger(w io.Writer, logLevel string) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: parseLevel(logLevel)}))
 }
 
-func writeBootstrapToken(w io.Writer, token string) error {
-	return auth.WriteBootstrapToken(w, token)
+func prepareBootstrapToken(output io.Writer, dataRoot, token string, lifetime time.Duration, reportCleanupError func(error)) (func(), error) {
+	path := filepath.Join(dataRoot, bootstrapSecretFilename)
+	if token == "" {
+		if err := secretfile.Remove(path); err != nil {
+			return nil, fmt.Errorf("remove stale bootstrap token: %w", err)
+		}
+		return func() {}, nil
+	}
+	plaintext := []byte(token)
+	defer clear(plaintext)
+	if err := secretfile.Write(path, auth.BootstrapSecretPurpose, plaintext); err != nil {
+		return nil, err
+	}
+	if err := auth.WriteBootstrapTokenPath(output, path); err != nil {
+		if cleanupErr := secretfile.Remove(path); cleanupErr != nil && reportCleanupError != nil {
+			reportCleanupError(fmt.Errorf("remove bootstrap token file after output failure: %w", cleanupErr))
+		}
+		return nil, err
+	}
+	var once sync.Once
+	var timer *time.Timer
+	cleanup := func() {
+		once.Do(func() {
+			if timer != nil {
+				timer.Stop()
+			}
+			if err := secretfile.Remove(path); err != nil && reportCleanupError != nil {
+				reportCleanupError(fmt.Errorf("remove bootstrap token file: %w", err))
+			}
+		})
+	}
+	timer = time.AfterFunc(lifetime, cleanup)
+	return cleanup, nil
 }
 
 func parseLevel(v string) slog.Level {

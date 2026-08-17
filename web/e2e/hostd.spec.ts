@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { access, mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -12,6 +12,7 @@ let daemon: ChildProcessWithoutNullStreams;
 let dataRoot = "";
 let baseURL = "";
 let bootstrapToken = "";
+let bootstrapTokenFile = "";
 
 async function availablePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -28,16 +29,29 @@ async function availablePort(): Promise<number> {
 test.beforeAll(async () => {
   dataRoot = await mkdtemp(path.join(tmpdir(), "hostd-e2e-"));
   const binary = path.join(dataRoot, process.platform === "win32" ? "hostd-e2e.exe" : "hostd-e2e");
+  const hostctl = path.join(dataRoot, process.platform === "win32" ? "hostctl-e2e.exe" : "hostctl-e2e");
   const build = spawnSync("go", ["build", "-o", binary, "./cmd/hostd"], { cwd: repoRoot, encoding: "utf8" });
   if (build.status !== 0) throw new Error(`hostd build failed: ${build.stderr}`);
+  const ctlBuild = spawnSync("go", ["build", "-o", hostctl, "./cmd/hostctl"], { cwd: repoRoot, encoding: "utf8" });
+  if (ctlBuild.status !== 0) throw new Error(`hostctl build failed: ${ctlBuild.stderr}`);
   const port = await availablePort();
   baseURL = `http://127.0.0.1:${port}`;
   daemon = spawn(binary, ["--data-root", dataRoot, "--listen", `127.0.0.1:${port}`, "--fake-runtime"], { cwd: repoRoot, windowsHide: true });
   let stderr = "";
+  let stdout = "";
   daemon.stderr.on("data", (chunk) => {
     stderr += chunk.toString("utf8");
-    const match = stderr.match(/HOSTD BOOTSTRAP TOKEN \(sensitive, one-time, expires in 15 minutes\): ([A-Za-z0-9_-]+)/);
-    if (match) bootstrapToken = match[1];
+  });
+  daemon.stdout.on("data", (chunk) => {
+    stdout += chunk.toString("utf8");
+    const pathLine = stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.endsWith("bootstrap-token.secret"));
+    if (!pathLine || bootstrapToken) return;
+    bootstrapTokenFile = pathLine;
+    const read = spawnSync(hostctl, ["bootstrap-token", "--file", bootstrapTokenFile], { cwd: repoRoot, encoding: "utf8" });
+    if (read.status === 0) bootstrapToken = read.stdout.trim();
   });
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
@@ -49,11 +63,7 @@ test.beforeAll(async () => {
     }
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
-  const redactedStderr = stderr.replace(
-    /HOSTD BOOTSTRAP TOKEN \(sensitive, one-time, expires in 15 minutes\): [A-Za-z0-9_-]+/g,
-    "HOSTD BOOTSTRAP TOKEN: [REDACTED]",
-  );
-  throw new Error(`hostd did not start or expose a bootstrap token. stderr: ${redactedStderr}`);
+  throw new Error(`hostd did not start or expose a protected bootstrap token file. stdout: ${stdout}; stderr: ${stderr}`);
 });
 
 test.afterAll(async () => {
@@ -83,6 +93,14 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
   await page.getByLabel("Passphrase").fill("a safe local browser test passphrase");
   await page.getByRole("button", { name: "Create administrator" }).click();
   await expect(page.getByRole("heading", { name: "Applications", exact: true })).toBeVisible();
+  await expect.poll(async () => {
+    try {
+      await access(bootstrapTokenFile);
+      return true;
+    } catch {
+      return false;
+    }
+  }).toBe(false);
   await expect(page).toHaveTitle("Applications · hostd");
 
   await page.getByRole("button", { name: "Sign out" }).click();
