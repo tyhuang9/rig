@@ -47,3 +47,31 @@ func TestPOSIXSecretFileRejectsBroadPermissions(t *testing.T) {
 		t.Fatal("broad permissions were accepted")
 	}
 }
+
+func TestPOSIXSecretFileReplacesAtomicallyWithoutTemporaryResidue(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "secret.bin")
+	if err := Write(path, "bootstrap", []byte("old-secret")); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(path, "bootstrap", []byte("new-secret")); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Read(path, "bootstrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(loaded)
+	if !bytes.Equal(loaded, []byte("new-secret")) {
+		t.Fatalf("replaced secret = %q", loaded)
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if matched, _ := filepath.Match(".hostd-secret-*", entry.Name()); matched {
+			t.Fatalf("temporary secret file remained after atomic replacement: %s", entry.Name())
+		}
+	}
+}

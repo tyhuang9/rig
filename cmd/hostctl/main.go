@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -25,6 +24,7 @@ type sessionCredentials struct {
 }
 
 const maxSessionFileBytes = 64 << 10
+const sessionFilePurpose = "hostctl-session"
 
 type commandApp struct {
 	endpoint     string
@@ -194,22 +194,12 @@ func (app *commandApp) loadSession() (sessionCredentials, error) {
 			return session, fmt.Errorf("read session from stdin: %w", err)
 		}
 	} else {
-		info, err := os.Stat(app.sessionFile)
+		plaintext, err := secretfile.Read(app.sessionFile, sessionFilePurpose)
 		if err != nil {
 			return session, fmt.Errorf("read session file: %w", err)
 		}
-		if !info.Mode().IsRegular() {
-			return session, errors.New("session file must be a regular file")
-		}
-		if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
-			return session, errors.New("session file permissions are too broad; require 0600")
-		}
-		file, err := os.Open(app.sessionFile)
-		if err != nil {
-			return session, fmt.Errorf("read session file: %w", err)
-		}
-		defer file.Close()
-		if err := decodeSessionFile(file, &session); err != nil {
+		defer clear(plaintext)
+		if err := decodeLimited(bytes.NewReader(plaintext), &session); err != nil {
 			return session, fmt.Errorf("decode session file: %w", err)
 		}
 	}
@@ -236,25 +226,7 @@ func encodeSessionFile(session sessionCredentials) ([]byte, error) {
 	if err := json.NewEncoder(&plaintext).Encode(session); err != nil {
 		return nil, err
 	}
-	data := plaintext.Bytes()
-	defer clear(data)
-	return protectSessionFile(data)
-}
-
-func decodeSessionFile(reader io.Reader, target *sessionCredentials) error {
-	persisted, err := io.ReadAll(io.LimitReader(reader, maxSessionFileBytes+1))
-	if err != nil {
-		return err
-	}
-	if len(persisted) > maxSessionFileBytes {
-		return errors.New("session file is too large")
-	}
-	plaintext, err := unprotectSessionFile(persisted)
-	if err != nil {
-		return err
-	}
-	defer clear(plaintext)
-	return decodeLimited(bytes.NewReader(plaintext), target)
+	return append([]byte(nil), plaintext.Bytes()...), nil
 }
 
 func defaultSessionFile() string {
@@ -268,40 +240,11 @@ func defaultSessionFile() string {
 func writeSessionFile(path string, session sessionCredentials) error {
 	payload, err := encodeSessionFile(session)
 	if err != nil {
+		return fmt.Errorf("encode session file: %w", err)
+	}
+	defer clear(payload)
+	if err := secretfile.Write(path, sessionFilePurpose, payload); err != nil {
 		return fmt.Errorf("protect session file: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create session directory: %w", err)
-	}
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".hostctl-session-*")
-	if err != nil {
-		return fmt.Errorf("create temporary session file: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	keep := false
-	defer func() {
-		_ = temporary.Close()
-		if !keep {
-			_ = os.Remove(temporaryPath)
-		}
-	}()
-	if err := temporary.Chmod(0o600); err != nil {
-		return err
-	}
-	if written, err := temporary.Write(payload); err != nil {
-		return err
-	} else if written != len(payload) {
-		return io.ErrShortWrite
-	}
-	if err := temporary.Sync(); err != nil {
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := replaceFile(temporaryPath, path); err != nil {
-		return fmt.Errorf("replace session file: %w", err)
-	}
-	keep = true
 	return nil
 }
