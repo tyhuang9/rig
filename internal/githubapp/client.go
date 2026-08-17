@@ -305,13 +305,13 @@ func statusErrorCode(response *http.Response) string {
 }
 
 func (authorization DeviceAuthorization) String() string {
-	return fmt.Sprintf("GitHub device authorization (user code %q, expires in %s)", authorization.UserCode, authorization.ExpiresIn)
+	return fmt.Sprintf("GitHub device authorization (expires in %s)", authorization.ExpiresIn)
 }
 
 func (authorization DeviceAuthorization) GoString() string { return authorization.String() }
 
 func (authorization DeviceAuthorization) LogValue() slog.Value {
-	return slog.GroupValue(slog.String("user_code", authorization.UserCode), slog.Duration("expires_in", authorization.ExpiresIn))
+	return slog.GroupValue(slog.Duration("expires_in", authorization.ExpiresIn))
 }
 
 func (bundle TokenBundle) String() string {

@@ -2,6 +2,7 @@ package githubapp
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -168,8 +169,125 @@ func TestForbiddenRateLimitClassificationAndRedaction(t *testing.T) {
 		t.Fatalf("token bundle rendered secrets: %s", rendered)
 	}
 	authorization := DeviceAuthorization{DeviceCode: "device-sensitive", UserCode: "ABCD"}
-	if rendered := authorization.String() + authorization.GoString(); strings.Contains(rendered, "device-sensitive") {
-		t.Fatalf("device authorization rendered secret: %s", rendered)
+	if rendered := authorization.String() + authorization.GoString(); strings.Contains(rendered, "device-sensitive") || strings.Contains(rendered, "ABCD") {
+		t.Fatalf("device authorization rendered one-time material: %s", rendered)
+	}
+	encoded, err := json.Marshal(struct {
+		Device DeviceAuthorization `json:"device"`
+		Tokens TokenBundle         `json:"tokens"`
+	}{authorization, bundle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "sensitive") {
+		t.Fatalf("JSON rendered credentials: %s", encoded)
+	}
+}
+
+func TestOAuthDeviceOutcomesAreAllowlisted(t *testing.T) {
+	for providerCode, want := range map[string]string{
+		"authorization_pending": "authorization_pending",
+		"slow_down":             "slow_down",
+		"expired_token":         "expired_token",
+		"access_denied":         "access_denied",
+	} {
+		t.Run(providerCode, func(t *testing.T) {
+			client := testClient(t, func(*http.Request) *http.Response {
+				return jsonResponse(200, `{"error":"`+providerCode+`","error_description":"raw description"}`)
+			})
+			if _, err := client.PollDevice(context.Background(), "device"); !IsCode(err, want) || strings.Contains(err.Error(), "raw") {
+				t.Fatalf("outcome error = %v", err)
+			}
+		})
+	}
+}
+
+func TestRefreshGrantContainsNoSecretOrQueryCredentials(t *testing.T) {
+	client := testClient(t, func(request *http.Request) *http.Response {
+		if request.URL.RawQuery != "" {
+			t.Fatalf("refresh query = %q", request.URL.RawQuery)
+		}
+		body, _ := io.ReadAll(request.Body)
+		got := string(body)
+		if got != "client_id=client-123&grant_type=refresh_token&refresh_token=refresh-sensitive" || strings.Contains(got, "client_secret") {
+			t.Fatalf("refresh form = %q", got)
+		}
+		return jsonResponse(200, `{"access_token":"access","refresh_token":"refresh","token_type":"bearer","expires_in":3600,"refresh_token_expires_in":7200}`)
+	})
+	if _, err := client.Refresh(context.Background(), "refresh-sensitive"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportCancellationMalformedAndTrailingJSON(t *testing.T) {
+	client, err := newWithTransport("client-123", roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.StartDevice(ctx); !IsCode(err, "provider_unavailable") {
+		t.Fatalf("cancelled request error = %v", err)
+	}
+
+	for name, body := range map[string]string{"malformed": `{`, "trailing": `{} {}`} {
+		t.Run(name, func(t *testing.T) {
+			client := testClient(t, func(*http.Request) *http.Response { return jsonResponse(200, body) })
+			if _, err := client.StartDevice(context.Background()); !IsCode(err, "invalid_response") {
+				t.Fatalf("JSON error = %v", err)
+			}
+		})
+	}
+}
+
+func TestHTTPStatusClassification(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		header http.Header
+		code   string
+	}{
+		{"unauthorized", 401, nil, "unauthorized"},
+		{"forbidden", 403, nil, "forbidden"},
+		{"rate-limited-retry", 403, http.Header{"Retry-After": {"10"}}, "rate_limited"},
+		{"rate-limited-remaining", 403, http.Header{"X-RateLimit-Remaining": {"0"}}, "rate_limited"},
+		{"too-many", 429, nil, "rate_limited"},
+		{"server", 503, nil, "provider_unavailable"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := testClient(t, func(*http.Request) *http.Response {
+				response := jsonResponse(test.status, `{"message":"raw provider body"}`)
+				for key, values := range test.header {
+					for _, value := range values {
+						response.Header.Add(key, value)
+					}
+				}
+				return response
+			})
+			_, err := client.CurrentUser(context.Background(), "access")
+			if !IsCode(err, test.code) || strings.Contains(err.Error(), "raw") {
+				t.Fatalf("status error = %v", err)
+			}
+		})
+	}
+}
+
+func TestInstallationsRejectInvalidProviderPayloads(t *testing.T) {
+	for name, body := range map[string]string{
+		"total":     `{"total_count":0,"installations":[{"id":7,"account":{"login":"acme","type":"Organization"},"target_type":"Organization","repository_selection":"selected"}]}`,
+		"account":   `{"total_count":1,"installations":[{"id":7,"account":{"login":"acme","type":"Unknown"},"target_type":"Organization","repository_selection":"selected"}]}`,
+		"selection": `{"total_count":1,"installations":[{"id":7,"account":{"login":"acme","type":"Organization"},"target_type":"Organization","repository_selection":"private"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := testClient(t, func(*http.Request) *http.Response { return jsonResponse(200, body) })
+			if _, err := client.Installations(context.Background(), "access", 1, 10); !IsCode(err, "invalid_response") {
+				t.Fatalf("invalid payload error = %v", err)
+			}
+		})
 	}
 }
 
