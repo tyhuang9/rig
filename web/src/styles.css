@@ -130,7 +130,7 @@ button:disabled { cursor: wait; opacity: .62; }
 .button.primary { border-color: #315ee8; background: #315ee8; color: #fff; }
 .button.primary:hover { background: #274ec9; }
 .button.small { min-height: 31px; padding: 6px 9px; font-size: 12px; }
-.button:focus-visible, .rail a:focus-visible, .rail-link:focus-visible, input:focus-visible, select:focus-visible, .text-button:focus-visible, .source-choice input:focus-visible {
+.button:focus-visible, .rail a:focus-visible, .rail-link:focus-visible, input:focus-visible, select:focus-visible, .text-button:focus-visible, .source-choice input:focus-visible, .source-panel a:focus-visible {
   outline: 3px solid rgba(49, 94, 232, .42);
   outline-offset: 2px;
 }
@@ -300,6 +300,7 @@ button:disabled { cursor: wait; opacity: .62; }
   .button { min-height: 44px; }
   .button.small { min-height: 44px; }
   .source-choice label { min-height: 44px; }
+  .field input { min-height: 44px; height: 44px; }
   .field select { min-height: 44px; height: 44px; }
   .wizard-pagination { flex-wrap: wrap; min-height: 44px; }
   .auth { padding: 14px; }
@@ -308,6 +309,8 @@ button:disabled { cursor: wait; opacity: .62; }
 
 @media (pointer: coarse) {
   .button, .rail nav a, .rail-link, .text-button { min-height: 44px; }
+  .field input, .field select, .source-choice label { min-height: 44px; }
+  .field input, .field select { height: 44px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
