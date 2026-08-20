@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useBlocker } from "react-router-dom";
 
-const leaveWarning = "Discard unsaved configuration changes and leave this page?";
+const leaveWarning = "Discard unsaved configuration changes and leave this page? Typed secret values cannot be recovered.";
 
 type UnsavedChangesState = {
   dirty: boolean;

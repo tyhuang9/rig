@@ -43,17 +43,19 @@ describe("ApplicationConfigurationPanel", () => {
     expect(replacement.type).toBe("password");
     expect(screen.getByText("Stored on this controller")).not.toBeNull();
     expect(screen.queryByText("sentinel-stored-secret")).toBeNull();
-    expect(screen.queryByRole("button", { name: /replacement value for TOKEN/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reveal typed value for secret TOKEN" })).toBeNull();
 
     fireEvent.change(replacement, { target: { value: "local-secret" } });
-    const show = screen.getByRole("button", { name: "Show replacement value for TOKEN" });
-    fireEvent.click(show);
+    const reveal = screen.getByRole("button", { name: "Reveal typed value for secret TOKEN" });
+    expect(reveal.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(reveal);
+    expect(screen.getByRole("button", { name: "Reveal typed value for secret TOKEN" }).getAttribute("aria-pressed")).toBe("true");
     expect(replacement.type).toBe("text");
     expect(replacement.value).toBe("local-secret");
-    fireEvent.click(screen.getByRole("button", { name: "Hide replacement value for TOKEN" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reveal typed value for secret TOKEN" }));
     expect(replacement.type).toBe("password");
     fireEvent.change(replacement, { target: { value: "" } });
-    expect(screen.queryByRole("button", { name: /replacement value for TOKEN/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reveal typed value for secret TOKEN" })).toBeNull();
 
     fireEvent.change(screen.getByLabelText("Value"), { target: { value: "temporary" } });
     fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
@@ -110,6 +112,35 @@ describe("ApplicationConfigurationPanel", () => {
     expect(document.activeElement).toBe(secondNew);
     fireEvent.click(screen.getByRole("button", { name: "Remove variable SECOND_NEW" }));
     expect(document.activeElement).toBe(screen.getByDisplayValue("EMPTY"));
+  });
+
+  it("focuses the target-specific staged undo after adding and deleting the only active row", async () => {
+    renderPanel();
+    const existing = await screen.findByRole("group", { name: "Variable EMPTY" });
+    fireEvent.click(within(existing).getByRole("button", { name: "Remove variable EMPTY" }));
+    const undo = within(existing).getByRole("button", { name: "Undo removal of variable EMPTY" });
+    fireEvent.click(screen.getByRole("button", { name: "Add variable" }));
+    const newName = screen.getAllByLabelText(/Variable name/).at(-1)!;
+    fireEvent.change(newName, { target: { value: "TEMPORARY" } });
+    fireEvent.click(screen.getByRole("button", { name: "Remove variable TEMPORARY" }));
+    expect(document.activeElement).toBe(undo);
+  });
+
+  it("offers the stable reveal toggle for a nonempty brand-new secret", async () => {
+    renderPanel();
+    await screen.findByRole("group", { name: "Secret TOKEN" });
+    fireEvent.click(screen.getByRole("button", { name: "Add secret" }));
+    const newName = screen.getAllByLabelText(/Secret name/).at(-1)!;
+    const newValue = screen.getByLabelText(/Secret value/) as HTMLInputElement;
+    fireEvent.change(newName, { target: { value: "NEW_TOKEN" } });
+    fireEvent.change(newValue, { target: { value: "typed-new-secret" } });
+    const reveal = screen.getByRole("button", { name: "Reveal typed value for secret NEW_TOKEN" });
+    expect(reveal.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(reveal);
+    expect(newValue.type).toBe("text");
+    expect(screen.getByRole("button", { name: "Reveal typed value for secret NEW_TOKEN" }).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Remove secret NEW_TOKEN" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Add secret" }));
   });
 
   it("validates required portable names and secret values with associated row errors", async () => {

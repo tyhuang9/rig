@@ -29,6 +29,7 @@ describe("UnsavedChangesGuard", () => {
     await screen.findByRole("heading", { name: "Edit application A" });
     fireEvent.click(screen.getByRole("link", { name: "Open application B" }));
     await waitFor(() => expect(confirm).toHaveBeenCalledTimes(1));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Typed secret values cannot be recovered."));
     expect(screen.getByRole("heading", { name: "Edit application A" })).not.toBeNull();
     fireEvent.click(screen.getByRole("link", { name: "Open application B" }));
     expect(await screen.findByRole("heading", { name: "Application B" })).not.toBeNull();
@@ -49,6 +50,7 @@ describe("UnsavedChangesGuard", () => {
 
     await act(async () => { await router.navigate(-1); });
     await waitFor(() => expect(confirm).toHaveBeenCalledTimes(1));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Typed secret values cannot be recovered."));
     expect(screen.getByRole("heading", { name: "Edit application A" })).not.toBeNull();
     await act(async () => { await router.navigate(-1); });
     expect(await screen.findByRole("heading", { name: "Previous page" })).not.toBeNull();
