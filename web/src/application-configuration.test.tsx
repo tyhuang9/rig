@@ -43,19 +43,22 @@ describe("ApplicationConfigurationPanel", () => {
     expect(replacement.type).toBe("password");
     expect(screen.getByText("Stored on this controller")).not.toBeNull();
     expect(screen.queryByText("sentinel-stored-secret")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Reveal typed value for secret TOKEN" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show value for secret TOKEN" })).toBeNull();
 
     fireEvent.change(replacement, { target: { value: "local-secret" } });
-    const reveal = screen.getByRole("button", { name: "Reveal typed value for secret TOKEN" });
-    expect(reveal.getAttribute("aria-pressed")).toBe("false");
-    fireEvent.click(reveal);
-    expect(screen.getByRole("button", { name: "Reveal typed value for secret TOKEN" }).getAttribute("aria-pressed")).toBe("true");
+    const show = screen.getByRole("button", { name: "Show value for secret TOKEN" });
+    expect(show.getAttribute("aria-label")).toContain(show.textContent);
+    expect(show.hasAttribute("aria-pressed")).toBe(false);
+    fireEvent.click(show);
+    const hide = screen.getByRole("button", { name: "Hide value for secret TOKEN" });
+    expect(hide.getAttribute("aria-label")).toContain(hide.textContent);
+    expect(hide.hasAttribute("aria-pressed")).toBe(false);
     expect(replacement.type).toBe("text");
     expect(replacement.value).toBe("local-secret");
-    fireEvent.click(screen.getByRole("button", { name: "Reveal typed value for secret TOKEN" }));
+    fireEvent.click(hide);
     expect(replacement.type).toBe("password");
     fireEvent.change(replacement, { target: { value: "" } });
-    expect(screen.queryByRole("button", { name: "Reveal typed value for secret TOKEN" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show value for secret TOKEN" })).toBeNull();
 
     fireEvent.change(screen.getByLabelText("Value"), { target: { value: "temporary" } });
     fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
@@ -134,11 +137,13 @@ describe("ApplicationConfigurationPanel", () => {
     const newValue = screen.getByLabelText(/Secret value/) as HTMLInputElement;
     fireEvent.change(newName, { target: { value: "NEW_TOKEN" } });
     fireEvent.change(newValue, { target: { value: "typed-new-secret" } });
-    const reveal = screen.getByRole("button", { name: "Reveal typed value for secret NEW_TOKEN" });
-    expect(reveal.getAttribute("aria-pressed")).toBe("false");
-    fireEvent.click(reveal);
+    const show = screen.getByRole("button", { name: "Show value for secret NEW_TOKEN" });
+    expect(show.getAttribute("aria-label")).toContain(show.textContent);
+    fireEvent.click(show);
     expect(newValue.type).toBe("text");
-    expect(screen.getByRole("button", { name: "Reveal typed value for secret NEW_TOKEN" }).getAttribute("aria-pressed")).toBe("true");
+    const hide = screen.getByRole("button", { name: "Hide value for secret NEW_TOKEN" });
+    expect(hide.getAttribute("aria-label")).toContain(hide.textContent);
+    expect(hide.hasAttribute("aria-pressed")).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Remove secret NEW_TOKEN" }));
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Add secret" }));
   });
