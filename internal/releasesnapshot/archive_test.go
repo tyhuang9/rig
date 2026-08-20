@@ -192,6 +192,17 @@ func TestDownloadArchiveClassifiesProviderFailureAndCleansPartial(t *testing.T) 
 	}
 }
 
+func TestArchiveErrorClassifiesLocalExtractionOpenFailureAsInternal(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.tar.gz")
+	err := extractArchive(context.Background(), missing, filepath.Join(t.TempDir(), "workspace"))
+	if err == nil {
+		t.Fatal("missing archive was accepted")
+	}
+	if got := archiveError(err); got != "internal_error" {
+		t.Fatalf("missing archive taxonomy = %q, want internal_error (error: %v)", got, err)
+	}
+}
+
 func TestValidateComposeWorkspaceRejectsDynamicAndEscapingPaths(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "app"), 0o700); err != nil {

@@ -97,7 +97,7 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 func extractArchiveWithLimit(ctx context.Context, archivePath, destination string, tarLimit int64) error {
 	f, err := os.Open(archivePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: open", errLocal)
 	}
 	defer f.Close()
 	buffered := bufio.NewReader(f)
@@ -109,7 +109,7 @@ func extractArchiveWithLimit(ctx context.Context, archivePath, destination strin
 	limited := newTarLimitReader(gz, tarLimit)
 	tr := tar.NewReader(limited)
 	if err := os.MkdirAll(destination, 0o700); err != nil {
-		return err
+		return fmt.Errorf("%w: mkdir", errLocal)
 	}
 	var root string
 	rootHeader := false
@@ -194,7 +194,7 @@ func extractArchiveWithLimit(ctx context.Context, archivePath, destination strin
 		}
 		if h.Typeflag == tar.TypeDir {
 			if err := os.MkdirAll(out, 0o700); err != nil {
-				return err
+				return fmt.Errorf("%w: mkdir", errLocal)
 			}
 			continue
 		}
@@ -203,7 +203,7 @@ func extractArchiveWithLimit(ctx context.Context, archivePath, destination strin
 			return errTooLarge
 		}
 		if err := os.MkdirAll(filepath.Dir(out), 0o700); err != nil {
-			return err
+			return fmt.Errorf("%w: mkdir", errLocal)
 		}
 		mode := os.FileMode(0o600)
 		if h.FileInfo().Mode()&0o111 != 0 {
@@ -211,15 +211,15 @@ func extractArchiveWithLimit(ctx context.Context, archivePath, destination strin
 		}
 		outFile, err := os.OpenFile(out, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: create", errLocal)
 		}
-		written, copyErr := copyContext(ctx, outFile, io.LimitReader(tr, h.Size+1))
+		written, copyErr := copyTarToFile(ctx, outFile, io.LimitReader(tr, h.Size+1))
 		closeErr := outFile.Close()
 		if copyErr != nil {
 			return copyErr
 		}
 		if closeErr != nil {
-			return closeErr
+			return fmt.Errorf("%w: close", errLocal)
 		}
 		if written != h.Size {
 			return errors.New("truncated tar entry")
@@ -244,6 +244,30 @@ func extractArchiveWithLimit(ctx context.Context, archivePath, destination strin
 		return errors.New("trailing archive data")
 	}
 	return nil
+}
+
+func copyTarToFile(ctx context.Context, file *os.File, reader io.Reader) (int64, error) {
+	buffer := make([]byte, 32<<10)
+	var written int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		n, readErr := reader.Read(buffer)
+		if n > 0 {
+			count, writeErr := file.Write(buffer[:n])
+			written += int64(count)
+			if writeErr != nil || count != n {
+				return written, fmt.Errorf("%w: write", errLocal)
+			}
+		}
+		if readErr == io.EOF {
+			return written, nil
+		}
+		if readErr != nil {
+			return written, readErr
+		}
+	}
 }
 
 func hasSparse(h *tar.Header) bool {
