@@ -12,6 +12,11 @@ import {
 
 const pageSize = 30;
 type SourceKind = "local" | "github";
+type ConnectionContext = { generation: number; kind: SourceKind; selectedConnectionId: string };
+
+function sameConnectionContext(left: ConnectionContext, right: ConnectionContext) {
+  return left.generation === right.generation && left.kind === right.kind && left.selectedConnectionId === right.selectedConnectionId;
+}
 
 function safeMessage(error: unknown, fallback: string) {
   return error instanceof APIError || error instanceof Error ? error.message : fallback;
@@ -71,7 +76,9 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const [fieldErrors, setFieldErrors] = useState<{ name?: string; description?: string; localPath?: string }>({});
   const [inspection, setInspection] = useState<InspectResponse | null>(null);
   const [inspectedKey, setInspectedKey] = useState("");
-  const pollInFlight = useRef(false);
+  const connectionContext = useRef<ConnectionContext>({ generation: 0, kind: "local", selectedConnectionId: "" });
+  const inspectionGeneration = useRef(0);
+  const inspectionRequest = useRef<{ generation: number; key: string } | null>(null);
   const priorConnection = useRef<{ id: string; status: string }>({ id: "", status: "" });
   const errorSummary = useRef<HTMLDivElement>(null);
 
@@ -104,10 +111,20 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const exactSourceKey = source?.composePath ? JSON.stringify(source) : "";
   const exactInspection = Boolean(source?.composePath) && inspection !== null && inspectedKey === exactSourceKey && inspection.findings.length === 0;
 
-  const resetInspection = () => {
+  const clearInspection = () => {
     setInspection(null);
     setInspectedKey("");
     setInspectionError("");
+  };
+  const invalidateInspection = () => {
+    inspectionGeneration.current += 1;
+    inspectionRequest.current = null;
+    clearInspection();
+  };
+  const advanceConnectionContext = (nextKind: SourceKind, nextConnectionId: string) => {
+    const next = { generation: connectionContext.current.generation + 1, kind: nextKind, selectedConnectionId: nextConnectionId };
+    connectionContext.current = next;
+    return next;
   };
   const focusErrorSummary = () => window.setTimeout(() => errorSummary.current?.focus(), 0);
   const resetAfterConnection = () => {
@@ -118,7 +135,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     setInstallationPage(1);
     setRepositoryPage(1);
     setBranchPage(1);
-    resetInspection();
+    invalidateInspection();
   };
   const resetAfterInstallation = () => {
     setRepositoryId(null);
@@ -126,17 +143,17 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     setComposePath("");
     setRepositoryPage(1);
     setBranchPage(1);
-    resetInspection();
+    invalidateInspection();
   };
   const resetAfterRepository = () => {
     setBranch("");
     setComposePath("");
     setBranchPage(1);
-    resetInspection();
+    invalidateInspection();
   };
   const resetAfterBranch = () => {
     setComposePath("");
-    resetInspection();
+    invalidateInspection();
   };
   const changeInstallationPage = (page: number) => {
     setInstallationPage(page);
@@ -146,7 +163,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     setComposePath("");
     setRepositoryPage(1);
     setBranchPage(1);
-    resetInspection();
+    invalidateInspection();
   };
   const changeRepositoryPage = (page: number) => {
     setRepositoryPage(page);
@@ -154,20 +171,23 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     setBranch("");
     setComposePath("");
     setBranchPage(1);
-    resetInspection();
+    invalidateInspection();
   };
   const changeBranchPage = (page: number) => {
     setBranchPage(page);
     setBranch("");
     setComposePath("");
-    resetInspection();
+    invalidateInspection();
   };
 
   useEffect(() => {
     const prior = priorConnection.current;
     const knownStatus = selectedConnection !== undefined || pendingStatus !== undefined;
     priorConnection.current = { id: selectedConnectionId, status: selectedStatus };
-    if (kind === "github" && selectedConnectionId && prior.id === selectedConnectionId && prior.status === "connected" && knownStatus && selectedStatus !== "connected") resetAfterConnection();
+    if (kind === "github" && selectedConnectionId && prior.id === selectedConnectionId && prior.status === "connected" && knownStatus && selectedStatus !== "connected") {
+      advanceConnectionContext(kind, selectedConnectionId);
+      resetAfterConnection();
+    }
   }, [kind, pendingStatus, selectedConnection, selectedConnectionId, selectedStatus]);
 
   useEffect(() => {
@@ -175,50 +195,74 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   }, [deviceAuthorization, pendingStatus, selectedConnection]);
 
   const beginConnection = useMutation({
-    mutationFn: api.startGitHubConnection,
-    onSuccess: async (authorization) => {
-      setSourceError("");
-      setDeviceAuthorization(authorization);
-      setPendingStatus("pending");
-      setSelectedConnectionId(authorization.connectionId);
-      resetAfterConnection();
+    mutationFn: (_context: ConnectionContext) => api.startGitHubConnection(),
+    onSuccess: async (authorization, operation) => {
+      if (sameConnectionContext(operation, connectionContext.current)) {
+        advanceConnectionContext("github", authorization.connectionId);
+        setSourceError("");
+        setDeviceAuthorization(authorization);
+        setPendingStatus("pending");
+        setSelectedConnectionId(authorization.connectionId);
+        resetAfterConnection();
+      }
       await queryClient.invalidateQueries({ queryKey: ["source-connections"] });
     },
-    onError: (error) => setSourceError(safeMessage(error, "Could not start GitHub authorization.")),
+    onError: (error, operation) => {
+      if (sameConnectionContext(operation, connectionContext.current)) setSourceError(safeMessage(error, "Could not start GitHub authorization."));
+    },
   });
   const refreshConnection = useMutation({
-    mutationFn: api.refreshSourceConnection,
-    onSuccess: async (connection) => {
-      setPendingStatus(connection.status);
-      setSourceError("");
+    mutationFn: ({ connectionId }: { connectionId: string; context: ConnectionContext }) => api.refreshSourceConnection(connectionId),
+    onSuccess: async (connection, operation) => {
+      if (sameConnectionContext(operation.context, connectionContext.current)) {
+        setPendingStatus(connection.status);
+        setSourceError("");
+      }
       await queryClient.invalidateQueries({ queryKey: ["source-connections"] });
-      setPendingStatus(undefined);
+      if (sameConnectionContext(operation.context, connectionContext.current)) setPendingStatus(undefined);
     },
-    onError: (error) => setSourceError(safeMessage(error, "Could not refresh this connection.")),
+    onError: (error, operation) => {
+      if (sameConnectionContext(operation.context, connectionContext.current)) setSourceError(safeMessage(error, "Could not refresh this connection."));
+    },
   });
   const disconnectConnection = useMutation({
-    mutationFn: api.disconnectSourceConnection,
-    onSuccess: async () => {
-      setDeviceAuthorization(null);
-      setPendingStatus("disconnected");
-      setSelectedConnectionId("");
-      resetAfterConnection();
+    mutationFn: ({ connectionId }: { connectionId: string; context: ConnectionContext }) => api.disconnectSourceConnection(connectionId),
+    onSuccess: async (_, operation) => {
+      if (sameConnectionContext(operation.context, connectionContext.current)) {
+        advanceConnectionContext("github", "");
+        setDeviceAuthorization(null);
+        setPendingStatus("disconnected");
+        setSelectedConnectionId("");
+        resetAfterConnection();
+      }
       await queryClient.invalidateQueries({ queryKey: ["source-connections"] });
     },
-    onError: (error) => setSourceError(safeMessage(error, "Could not disconnect this connection.")),
+    onError: (error, operation) => {
+      if (sameConnectionContext(operation.context, connectionContext.current)) setSourceError(safeMessage(error, "Could not disconnect this connection."));
+    },
   });
   const inspectSource = useMutation({
-    mutationFn: (request: { request: { sourcePath?: string; githubSource?: GitHubSource }; key: string }) => api.inspect(request.request).then((result) => ({ result, key: request.key })),
-    onSuccess: ({ result, key }) => {
+    mutationFn: (operation: { request: { sourcePath?: string; githubSource?: GitHubSource }; key: string; generation: number }) => api.inspect(operation.request).then((result) => ({ result, key: operation.key, generation: operation.generation })),
+    onSuccess: ({ result, key, generation }) => {
+      const currentRequest = inspectionRequest.current;
+      if (!currentRequest || generation !== inspectionGeneration.current || currentRequest.generation !== generation || currentRequest.key !== key) return;
       setInspection(result);
       setInspectedKey(key);
       setInspectionError("");
     },
-    onError: (error) => {
-      resetInspection();
+    onError: (error, operation) => {
+      const currentRequest = inspectionRequest.current;
+      if (!currentRequest || operation.generation !== inspectionGeneration.current || currentRequest.generation !== operation.generation || currentRequest.key !== operation.key) return;
+      clearInspection();
       setInspectionError(safeMessage(error, "Could not inspect this source."));
     },
   });
+  const runInspection = (request: { sourcePath?: string; githubSource?: GitHubSource }, key: string) => {
+    const generation = inspectionGeneration.current + 1;
+    inspectionGeneration.current = generation;
+    inspectionRequest.current = { generation, key };
+    inspectSource.mutate({ request, key, generation });
+  };
   const create = useMutation({
     mutationFn: api.createApp,
     onSuccess: async (application) => {
@@ -233,6 +277,8 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
 
   useEffect(() => {
     if (!deviceAuthorization || selectedConnectionId !== deviceAuthorization.connectionId) return;
+    const authorizationContext = connectionContext.current;
+    if (authorizationContext.kind !== "github" || authorizationContext.selectedConnectionId !== deviceAuthorization.connectionId) return;
     if (isDeviceAuthorizationExpired(deviceAuthorization.expiresAt)) {
       setPendingStatus("expired");
       setDeviceAuthorization(null);
@@ -241,24 +287,26 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
       return;
     }
     let cancelled = false;
+    let pollInFlight = false;
     let timer: number | undefined;
     const schedule = (seconds: number) => {
-      if (!cancelled) timer = window.setTimeout(poll, Math.max(1, seconds) * 1000);
+      if (!cancelled && sameConnectionContext(authorizationContext, connectionContext.current)) timer = window.setTimeout(poll, Math.max(1, seconds) * 1000);
     };
     const poll = async () => {
-      if (cancelled || pollInFlight.current) return;
-      pollInFlight.current = true;
+      if (cancelled || pollInFlight || !sameConnectionContext(authorizationContext, connectionContext.current)) return;
+      pollInFlight = true;
       try {
         const connection = await api.pollGitHubConnection(deviceAuthorization.connectionId);
-        if (cancelled) return;
+        if (cancelled || !sameConnectionContext(authorizationContext, connectionContext.current)) return;
         setPendingStatus(connection.status);
         await queryClient.invalidateQueries({ queryKey: ["source-connections"] });
+        if (cancelled || !sameConnectionContext(authorizationContext, connectionContext.current)) return;
         if (connection.status === "pending") schedule(deviceAuthorization.pollIntervalSeconds);
         else {
           setDeviceAuthorization(null);
         }
       } catch (error) {
-        if (cancelled) return;
+        if (cancelled || !sameConnectionContext(authorizationContext, connectionContext.current)) return;
         if (error instanceof APIError && error.status === 429 && error.retryAfterSeconds) {
           schedule(error.retryAfterSeconds);
         } else if (error instanceof APIError && error.code === "authorization_denied") {
@@ -276,7 +324,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
           setDeviceAuthorization(null);
         }
       } finally {
-        pollInFlight.current = false;
+        pollInFlight = false;
       }
     };
     schedule(deviceAuthorization.pollIntervalSeconds);
@@ -357,18 +405,18 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
 
       <fieldset className="source-choice">
         <legend>Source type</legend>
-        <label><input type="radio" name="source-kind" checked={kind === "local"} onChange={() => { setKind("local"); setFormError(""); setSourceError(""); resetInspection(); }} /> Local folder</label>
-        <label><input type="radio" name="source-kind" checked={kind === "github"} onChange={() => { setKind("github"); setFormError(""); setSourceError(""); setFieldErrors((current) => ({ ...current, localPath: undefined })); resetInspection(); }} /> GitHub repository</label>
+        <label><input type="radio" name="source-kind" checked={kind === "local"} onChange={() => { advanceConnectionContext("local", selectedConnectionId); setKind("local"); setDeviceAuthorization(null); setPendingStatus(undefined); setFormError(""); setSourceError(""); invalidateInspection(); }} /> Local folder</label>
+        <label><input type="radio" name="source-kind" checked={kind === "github"} onChange={() => { advanceConnectionContext("github", selectedConnectionId); setKind("github"); setFormError(""); setSourceError(""); setFieldErrors((current) => ({ ...current, localPath: undefined })); invalidateInspection(); }} /> GitHub repository</label>
       </fieldset>
 
       {kind === "local" ? <section className="source-panel" aria-labelledby="local-source-title">
         <h3 id="local-source-title">Local folder</h3>
         <div className="field">
           <label htmlFor="wizard-source-path">Local source path <span aria-hidden="true">*</span></label>
-          <input id="wizard-source-path" required placeholder="C:\projects\my-app" value={localPath} aria-invalid={Boolean(fieldErrors.localPath)} aria-describedby={fieldErrors.localPath ? "wizard-source-path-error" : undefined} onChange={(event) => { setLocalPath(event.target.value); setFieldErrors((current) => ({ ...current, localPath: undefined })); setFormError(""); resetInspection(); }} />
+          <input id="wizard-source-path" required placeholder="C:\projects\my-app" value={localPath} aria-invalid={Boolean(fieldErrors.localPath)} aria-describedby={fieldErrors.localPath ? "wizard-source-path-error" : undefined} onChange={(event) => { setLocalPath(event.target.value); setFieldErrors((current) => ({ ...current, localPath: undefined })); setFormError(""); invalidateInspection(); }} />
           {fieldErrors.localPath && <p id="wizard-source-path-error" className="form-error">{fieldErrors.localPath}</p>}
         </div>
-        <button type="button" className="button" disabled={!localPath.trim() || inspectSource.isPending} onClick={() => inspectSource.mutate({ request: { sourcePath: localPath.trim() }, key: `local:${localPath.trim()}` })}>{inspectSource.isPending ? "Checking…" : "Check source"}</button>
+        <button type="button" className="button" disabled={!localPath.trim() || inspectSource.isPending} onClick={() => runInspection({ sourcePath: localPath.trim() }, `local:${localPath.trim()}`)}>{inspectSource.isPending ? "Checking…" : "Check source"}</button>
         {inspectionError && <div className="callout danger" role="alert">{inspectionError}</div>}
         <InspectionSummary inspection={inspection} />
       </section> : <section className="source-panel" aria-labelledby="github-source-title">
@@ -376,9 +424,9 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         <span className="sr-only capability-status" role="status" aria-live="polite" aria-atomic="true">{capability.isFetching ? "Checking GitHub connection capability." : capability.isError ? "GitHub connection capability check failed." : githubEnabled ? "GitHub connections are available." : "GitHub connections are unavailable."}</span>
         {capability.isLoading ? <div className="callout info">Checking GitHub connection capability…</div> : capability.isError ? <div className="callout danger"><strong>Could not check GitHub capability</strong><span>{safeMessage(capability.error, "The controller status could not be loaded.")}</span><button type="button" className="button small" onClick={() => void capability.refetch()}>Retry capability check</button></div> : !githubEnabled ? <div className="callout warning"><strong>GitHub connections are unavailable</strong><span>This controller has not enabled the GitHub App client configuration.</span></div> : <>
           <div className="connection-actions">
-            <button type="button" className="button" disabled={sourceIsBusy} onClick={() => beginConnection.mutate()}>{beginConnection.isPending ? "Starting…" : "Connect GitHub"}</button>
-            {selectedConnectionId && selectedStatus === "connected" && <button type="button" className="button" disabled={sourceIsBusy} onClick={() => refreshConnection.mutate(selectedConnectionId)}>{refreshConnection.isPending ? "Refreshing…" : "Refresh connection"}</button>}
-            {selectedConnectionId && <button type="button" className="button" disabled={sourceIsBusy} onClick={() => disconnectConnection.mutate(selectedConnectionId)}>{disconnectConnection.isPending ? "Disconnecting…" : "Disconnect"}</button>}
+            <button type="button" className="button" disabled={sourceIsBusy} onClick={() => beginConnection.mutate(connectionContext.current)}>{beginConnection.isPending ? "Starting…" : "Connect GitHub"}</button>
+            {selectedConnectionId && selectedStatus === "connected" && <button type="button" className="button" disabled={sourceIsBusy} onClick={() => refreshConnection.mutate({ connectionId: selectedConnectionId, context: connectionContext.current })}>{refreshConnection.isPending ? "Refreshing…" : "Refresh connection"}</button>}
+            {selectedConnectionId && <button type="button" className="button" disabled={sourceIsBusy} onClick={() => disconnectConnection.mutate({ connectionId: selectedConnectionId, context: connectionContext.current })}>{disconnectConnection.isPending ? "Disconnecting…" : "Disconnect"}</button>}
           </div>
           <div className={deviceAuthorization ? "callout info device-authorization connection-status" : sourceError ? "callout danger connection-status" : selectedConnectionId && !isConnected ? "callout warning connection-status" : "wizard-status connection-status"} role="status" aria-live="polite" aria-atomic="true">
             {deviceAuthorization ? <>
@@ -394,7 +442,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
           </div>
           <div className="field">
             <label htmlFor="github-connection">GitHub connection</label>
-            <select id="github-connection" value={selectedConnectionId} disabled={connections.isFetching || connections.isError} onChange={(event) => { setSelectedConnectionId(event.target.value); setPendingStatus(undefined); setDeviceAuthorization(null); setSourceError(""); resetAfterConnection(); }}>
+            <select id="github-connection" value={selectedConnectionId} disabled={connections.isFetching || connections.isError} onChange={(event) => { advanceConnectionContext("github", event.target.value); setSelectedConnectionId(event.target.value); setPendingStatus(undefined); setDeviceAuthorization(null); setSourceError(""); resetAfterConnection(); }}>
               <option value="">{connections.isFetching ? "Loading connections…" : connections.isError ? "Connections unavailable" : "Choose a connection"}</option>
               {connections.data?.items.map((connection) => <option key={connection.id} value={connection.id}>{connectionLabel(connection)}</option>)}
             </select>
@@ -409,10 +457,10 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
             {repositoryId !== null && <><SourceSelect label="Tracked branch" collectionLabel="Branches" page={branchPage} id="github-branch" value={branch} onChange={(value) => { setBranch(value); resetAfterBranch(); }} loading={branches.isFetching} error={branches.error} disabled={branches.isFetching} placeholder="Choose a branch" emptyTitle="No branches found" emptyMessage="No branches are available. Push a tracked branch or choose another repository, then retry." onRetry={() => void branches.refetch()} items={branches.data?.items.map((item) => ({ value: item.name, label: item.protected ? `${item.name} (protected)` : item.name })) ?? []} />
             <PaginationControls label="branches" page={branchPage} onPageChange={changeBranchPage} hasNext={(branches.data?.items.length ?? 0) === (branches.data?.perPage ?? pageSize)} loading={branches.isFetching} statusId="github-branch-status" /></>}
           </div>}
-          {source && !composePath && <button type="button" className="button" disabled={inspectSource.isPending} onClick={() => inspectSource.mutate({ request: { githubSource: source }, key: "" })}>{inspectSource.isPending ? "Finding Compose files…" : "Find Compose files"}</button>}
+          {source && !composePath && <button type="button" className="button" disabled={inspectSource.isPending} onClick={() => runInspection({ githubSource: source }, "")}>{inspectSource.isPending ? "Finding Compose files…" : "Find Compose files"}</button>}
           {inspectionError && <div className="callout danger" role="alert">{inspectionError}</div>}
-          {inspection && source && !composePath && inspection.composeCandidates.length > 0 && <div className="field"><label htmlFor="github-compose-path">Compose file</label><select id="github-compose-path" value={composePath} onChange={(event) => { setComposePath(event.target.value); resetInspection(); }}><option value="">Choose a Compose file</option>{inspection.composeCandidates.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}</select></div>}
-          {source?.composePath && <button type="button" className="button" disabled={inspectSource.isPending} onClick={() => inspectSource.mutate({ request: { githubSource: source }, key: JSON.stringify(source) })}>{inspectSource.isPending ? "Inspecting…" : "Inspect selected Compose file"}</button>}
+          {inspection && source && !composePath && inspection.composeCandidates.length > 0 && <div className="field"><label htmlFor="github-compose-path">Compose file</label><select id="github-compose-path" value={composePath} onChange={(event) => { setComposePath(event.target.value); invalidateInspection(); }}><option value="">Choose a Compose file</option>{inspection.composeCandidates.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}</select></div>}
+          {source?.composePath && <button type="button" className="button" disabled={inspectSource.isPending} onClick={() => runInspection({ githubSource: source }, JSON.stringify(source))}>{inspectSource.isPending ? "Inspecting…" : "Inspect selected Compose file"}</button>}
           <InspectionSummary inspection={inspection} discovery={Boolean(source && !composePath)} />
         </>}
       </section>}

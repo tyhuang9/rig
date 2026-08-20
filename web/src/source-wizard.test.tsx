@@ -13,6 +13,11 @@ const connection = {
   createdAt: "2026-01-01T00:00:00Z",
   updatedAt: "2026-01-01T00:00:00Z",
 };
+const otherConnection = {
+  ...connection,
+  id: "fedcba9876543210fedcba9876543210",
+  providerLogin: "rig-backup",
+};
 
 function renderWizard() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -180,6 +185,28 @@ describe("SourceWizard", () => {
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
     fireEvent.click(screen.getByLabelText(/^local folder$/i));
     expect(screen.queryByText(/selected folder could not be inspected/i)).toBeNull();
+  });
+
+  it.each(["success", "error"] as const)("ignores a stale local inspection %s after the path changes", async (outcome) => {
+    const inspectionResult = deferred<Awaited<ReturnType<typeof api.inspect>>>();
+    vi.mocked(api.inspect).mockReturnValueOnce(inspectionResult.promise);
+    renderWizard();
+    const localPath = screen.getByLabelText(/local source path/i);
+    fireEvent.change(localPath, { target: { value: "C:/projects/first" } });
+    fireEvent.click(screen.getByRole("button", { name: /check source/i }));
+    fireEvent.change(localPath, { target: { value: "C:/projects/second" } });
+
+    await act(async () => {
+      if (outcome === "success") {
+        inspectionResult.resolve({ source: { type: "local", path: "C:/projects/first" }, composeCandidates: ["compose.yaml"], services: [{ name: "stale" }], findings: [] });
+      } else {
+        inspectionResult.reject(new APIError({ status: 422, code: "invalid_source", detail: "The stale local path failed." }));
+      }
+    });
+
+    expect(screen.queryByText(/source inspection completed/i)).toBeNull();
+    expect(screen.queryByText(/stale local path failed/i)).toBeNull();
+    expect((localPath as HTMLInputElement).value).toBe("C:/projects/second");
   });
 
   it("shows the capability-disabled state without calling provider endpoints", async () => {
@@ -377,6 +404,105 @@ describe("SourceWizard", () => {
     await waitFor(() => expect((screen.getByRole("button", { name: /connect github/i }) as HTMLButtonElement).disabled).toBe(false));
   });
 
+  it("ignores a refresh completion after selecting another connection", async () => {
+    const refreshResult = deferred<Awaited<ReturnType<typeof api.refreshSourceConnection>>>();
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [connection, otherConnection] });
+    vi.spyOn(api, "refreshSourceConnection").mockReturnValueOnce(refreshResult.promise);
+    renderWizard();
+    await selectConnectedGitHub();
+    fireEvent.click(await screen.findByRole("button", { name: /refresh connection/i }));
+
+    const connectionSelect = screen.getByLabelText(/^github connection$/i) as HTMLSelectElement;
+    fireEvent.change(connectionSelect, { target: { value: otherConnection.id } });
+    await selectInstallation();
+    expect((screen.getByLabelText(/^github app installation$/i) as HTMLSelectElement).value).toBe("10");
+
+    await act(async () => refreshResult.resolve({ ...connection, status: "access_lost" }));
+    await waitFor(() => expect(connectionSelect.value).toBe(otherConnection.id));
+    expect((screen.getByLabelText(/^github app installation$/i) as HTMLSelectElement).value).toBe("10");
+    expect(screen.getByText(/connection status: connected/i)).toBeTruthy();
+  });
+
+  it("ignores a disconnect completion after selecting another connection", async () => {
+    const disconnectResult = deferred<Awaited<ReturnType<typeof api.disconnectSourceConnection>>>();
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [connection, otherConnection] });
+    vi.spyOn(api, "disconnectSourceConnection").mockReturnValueOnce(disconnectResult.promise);
+    renderWizard();
+    await selectConnectedGitHub();
+    fireEvent.click(await screen.findByRole("button", { name: /^disconnect$/i }));
+
+    const connectionSelect = screen.getByLabelText(/^github connection$/i) as HTMLSelectElement;
+    fireEvent.change(connectionSelect, { target: { value: otherConnection.id } });
+    await selectInstallation();
+    await act(async () => disconnectResult.resolve(undefined));
+
+    await waitFor(() => expect(connectionSelect.value).toBe(otherConnection.id));
+    expect((screen.getByLabelText(/^github app installation$/i) as HTMLSelectElement).value).toBe("10");
+    expect(screen.getByText(/connection status: connected/i)).toBeTruthy();
+  });
+
+  it.each(["local source", "another connection"] as const)("does not let a late connection start steal the %s", async (destination) => {
+    const startResult = deferred<Awaited<ReturnType<typeof api.startGitHubConnection>>>();
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [connection, otherConnection] });
+    vi.spyOn(api, "startGitHubConnection").mockReturnValueOnce(startResult.promise);
+    renderWizard();
+    fireEvent.click(screen.getByLabelText(/^github repository$/i));
+    await screen.findByLabelText(/^github connection$/i);
+    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+
+    if (destination === "local source") {
+      fireEvent.click(screen.getByLabelText(/^local folder$/i));
+    } else {
+      await screen.findByRole("option", { name: /@rig-backup/i });
+      fireEvent.change(screen.getByLabelText(/^github connection$/i), { target: { value: otherConnection.id } });
+    }
+    await act(async () => startResult.resolve({ connectionId: "late-connection", userCode: "LATE-CODE", verificationUri: "https://github.com/login/device", installUrl: "https://github.com/apps/rig/installations/new", expiresAt: "2099-01-01T00:00:00Z", pollIntervalSeconds: 5 }));
+
+    expect(screen.queryByText("LATE-CODE")).toBeNull();
+    if (destination === "local source") {
+      expect((screen.getByRole("radio", { name: /^local folder$/i }) as HTMLInputElement).checked).toBe(true);
+    } else {
+      await waitFor(() => expect((screen.getByLabelText(/^github connection$/i) as HTMLSelectElement).value).toBe(otherConnection.id));
+      expect(screen.getByText(/connection status: connected/i)).toBeTruthy();
+    }
+  });
+
+  it("polls a replacement authorization while the previous authorization poll is unresolved", async () => {
+    const firstPoll = deferred<Awaited<ReturnType<typeof api.pollGitHubConnection>>>();
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [{ ...connection, id: "authorization-b" }] });
+    vi.spyOn(api, "startGitHubConnection")
+      .mockResolvedValueOnce({ connectionId: "authorization-a", userCode: "CODE-A", verificationUri: "https://github.com/login/device", installUrl: "https://github.com/apps/rig/installations/new", expiresAt: "2099-01-01T00:00:00Z", pollIntervalSeconds: 1 })
+      .mockResolvedValueOnce({ connectionId: "authorization-b", userCode: "CODE-B", verificationUri: "https://github.com/login/device", installUrl: "https://github.com/apps/rig/installations/new", expiresAt: "2099-01-01T00:00:00Z", pollIntervalSeconds: 1 });
+    vi.spyOn(api, "pollGitHubConnection").mockImplementation((connectionId) => connectionId === "authorization-a"
+      ? firstPoll.promise
+      : Promise.resolve({ ...connection, id: "authorization-b", status: "connected" }));
+    vi.spyOn(api, "disconnectSourceConnection").mockResolvedValue(undefined);
+    renderWizard();
+    fireEvent.click(screen.getByLabelText(/^github repository$/i));
+    await screen.findByLabelText(/^github connection$/i);
+    vi.useFakeTimers();
+
+    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(screen.getByText("CODE-A")).toBeTruthy();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(api.pollGitHubConnection).toHaveBeenCalledWith("authorization-a");
+
+    fireEvent.click(screen.getByRole("button", { name: /^disconnect$/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(screen.getByText("CODE-B")).toBeTruthy();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(api.pollGitHubConnection).toHaveBeenCalledWith("authorization-b");
+
+    await act(async () => firstPoll.resolve({ ...connection, id: "authorization-a", status: "denied" }));
+    await vi.runOnlyPendingTimersAsync();
+    expect((screen.getByLabelText(/^github connection$/i) as HTMLSelectElement).value).toBe("authorization-b");
+    expect(screen.getByText(/connection status: connected/i)).toBeTruthy();
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
+  });
+
   it("treats an invalid device expiration as terminal and never polls", async () => {
     vi.spyOn(api, "startGitHubConnection").mockResolvedValue({ connectionId: "new-connection", userCode: "ABCD-EFGH", verificationUri: "https://github.com/login/device", installUrl: "https://github.com/apps/rig/installations/new", expiresAt: "invalid", pollIntervalSeconds: 5 });
     const poll = vi.spyOn(api, "pollGitHubConnection");
@@ -466,6 +592,55 @@ describe("SourceWizard", () => {
     expect(emptyResult?.textContent).toMatch(/add a compose file to the tracked branch, then inspect again/i);
     expect(screen.queryByText(/source inspection completed/i)).toBeNull();
     expect(screen.queryByLabelText(/^compose file$/i)).toBeNull();
+  });
+
+  it.each(["success", "error"] as const)("ignores a stale GitHub inspection %s after an upstream branch change", async (outcome) => {
+    const inspectionResult = deferred<Awaited<ReturnType<typeof api.inspect>>>();
+    vi.mocked(api.inspect).mockReturnValueOnce(inspectionResult.promise);
+    renderWizard();
+    await selectConnectedGitHub();
+    await selectInstallation();
+    await selectRepository();
+    await selectBranch();
+    fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
+    fireEvent.change(screen.getByLabelText(/^tracked branch$/i), { target: { value: "" } });
+
+    await act(async () => {
+      if (outcome === "success") {
+        inspectionResult.resolve({ source: { type: "github" }, resolvedSha: "stale-sha", composeCandidates: ["compose.yaml"], services: [], findings: [] });
+      } else {
+        inspectionResult.reject(new APIError({ status: 422, code: "invalid_source", detail: "The stale GitHub source failed." }));
+      }
+    });
+
+    expect(screen.queryByLabelText(/^compose file$/i)).toBeNull();
+    expect(screen.queryByText(/source inspection completed/i)).toBeNull();
+    expect(screen.queryByText(/stale github source failed/i)).toBeNull();
+    expect((screen.getByLabelText(/^tracked branch$/i) as HTMLSelectElement).value).toBe("");
+  });
+
+  it("does not let a stale exact inspection satisfy save gating", async () => {
+    const exactInspectionResult = deferred<Awaited<ReturnType<typeof api.inspect>>>();
+    vi.mocked(api.inspect)
+      .mockResolvedValueOnce({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [], findings: [] })
+      .mockReturnValueOnce(exactInspectionResult.promise);
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "GitHub app" } });
+    await selectConnectedGitHub();
+    await selectInstallation();
+    await selectRepository();
+    await selectBranch();
+    fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
+    const composeFile = await screen.findByLabelText(/^compose file$/i);
+    fireEvent.change(composeFile, { target: { value: "compose.yaml" } });
+    fireEvent.click(screen.getByRole("button", { name: /inspect selected compose file/i }));
+    fireEvent.change(screen.getByLabelText(/^tracked branch$/i), { target: { value: "" } });
+
+    await act(async () => exactInspectionResult.resolve({ source: { type: "github", composePath: "compose.yaml" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [{ name: "web" }], findings: [] }));
+
+    expect(screen.queryByText(/source inspection completed/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /save application/i }).hasAttribute("disabled")).toBe(true);
+    expect(api.createApp).not.toHaveBeenCalled();
   });
 
   it("selects a GitHub source, requires an exact clean inspection, and sends only githubSource", async () => {
