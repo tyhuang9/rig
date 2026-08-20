@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -33,6 +34,30 @@ type failingSources struct {
 func (f *failingSources) DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error) {
 	return nil, f.err
 }
+
+type archiveBodySources struct {
+	fakeSources
+	body io.ReadCloser
+}
+
+func (f *archiveBodySources) DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error) {
+	return f.body, nil
+}
+
+type zeroReadCloser struct{ remaining int64 }
+
+func (r *zeroReadCloser) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	clear(p)
+	r.remaining -= int64(len(p))
+	return len(p), nil
+}
+func (*zeroReadCloser) Close() error { return nil }
 
 type coordinatedSources struct {
 	archive []byte
@@ -216,6 +241,132 @@ func TestMaterializePersistsOriginalProviderFailureTaxonomyAfterCleanup(t *testi
 	}
 	if state != WorkspaceStateFailed || code != "provider_unavailable" {
 		t.Fatalf("failure persistence state=%q code=%q", state, code)
+	}
+}
+
+func TestMaterializePersistsSanitizedFailureTaxonomyAfterSuccessfulCleanup(t *testing.T) {
+	app := "11111111-1111-1111-1111-111111111111"
+	tests := []struct {
+		name   string
+		source SourceReader
+		code   string
+	}{
+		{"provider", &failingSources{err: &sourceconnections.Error{Code: "provider_unavailable"}}, "provider_unavailable"},
+		{"access-lost", &failingSources{err: &sourceconnections.Error{Code: "source_access_lost"}}, "source_access_lost"},
+		{"cancel", &failingSources{err: context.Canceled}, "canceled"},
+		{"invalid-archive", &archiveBodySources{body: io.NopCloser(strings.NewReader("not gzip"))}, "invalid_source"},
+		{"compressed-limit", &archiveBodySources{body: &zeroReadCloser{remaining: MaxCompressedBytes + 1}}, "source_too_large"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := snapshotDB(t)
+			m, err := New(db, test.source, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := m.Materialize(context.Background(), "owner", app); !IsCode(err, test.code) {
+				t.Fatalf("materialize code = %v, want %s", err, test.code)
+			}
+			var id, state, code string
+			if err := db.QueryRow(`SELECT id, workspace_state, materialization_error_code FROM releases`).Scan(&id, &state, &code); err != nil {
+				t.Fatal(err)
+			}
+			if state != WorkspaceStateFailed || code != test.code {
+				t.Fatalf("failure persistence state=%q code=%q, want failed/%q", state, code, test.code)
+			}
+			staging, err := m.stagingPath(app, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(staging); !os.IsNotExist(err) {
+				t.Fatalf("staging remains after cleanup: %v", err)
+			}
+		})
+	}
+}
+
+func TestMaterializeCleanupFailureRemainsRecoverableAfterRestart(t *testing.T) {
+	db := snapshotDB(t)
+	root := t.TempDir()
+	m, err := New(db, &failingSources{err: &sourceconnections.Error{Code: "provider_unavailable"}}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := m.fs
+	fs.removeAll = func(string) error { return errors.New("injected cleanup failure") }
+	m.fs = fs
+	app := "11111111-1111-1111-1111-111111111111"
+	if _, err := m.Materialize(context.Background(), "owner", app); !IsCode(err, "internal_error") {
+		t.Fatalf("cleanup failure error = %v", err)
+	}
+	var id, state string
+	if err := db.QueryRow(`SELECT id, workspace_state FROM releases`).Scan(&id, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state != WorkspaceStateMaterializing {
+		t.Fatalf("cleanup failure state = %q", state)
+	}
+	staging, err := m.stagingPath(app, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(staging); err != nil {
+		t.Fatalf("recoverable staging missing: %v", err)
+	}
+	restarted, err := New(db, &fakeSources{}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(staging); !os.IsNotExist(err) {
+		t.Fatalf("restart did not remove staging: %v", err)
+	}
+	if err := db.QueryRow(`SELECT workspace_state FROM releases WHERE id=?`, id).Scan(&state); err != nil || state != WorkspaceStateFailed {
+		t.Fatalf("recovered state=%q err=%v", state, err)
+	}
+}
+
+func TestMaterializeInvalidatesTamperedReadyWorkspaceWithoutPersistingComposeContents(t *testing.T) {
+	db := snapshotDB(t)
+	compose := "services: {}\n# ghp_snapshot_should_never_reach_sqlite\n"
+	source := &fakeSources{archive: composeArchive(t, compose)}
+	m, err := New(db, source, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	first, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(first.WorkspacePath, "compose.yaml"), []byte("invalid: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID || source.calls != 2 {
+		t.Fatalf("tampered release reused: first=%s second=%s calls=%d", first.ID, second.ID, source.calls)
+	}
+	var state, stored string
+	if err := db.QueryRow(`SELECT workspace_state, metadata_json FROM releases WHERE id=?`, first.ID).Scan(&state, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if state != WorkspaceStateFailed {
+		t.Fatalf("tampered ready state=%q", state)
+	}
+	if strings.Contains(stored, "ghp_snapshot_should_never_reach_sqlite") {
+		t.Fatalf("compose content reached sqlite: %q", stored)
+	}
+	var releasePayload string
+	if err := db.QueryRow(`SELECT group_concat(COALESCE(repository_owner,'') || COALESCE(repository_name,'') || COALESCE(resolved_sha,'') || COALESCE(compose_path,'') || COALESCE(archive_sha256,'') || COALESCE(workspace_path,'') || COALESCE(metadata_json,''), '') FROM releases`).Scan(&releasePayload); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(releasePayload, "ghp_snapshot_should_never_reach_sqlite") {
+		t.Fatalf("release row persisted compose content: %q", releasePayload)
 	}
 }
 func snapshotDB(t *testing.T) *sql.DB {

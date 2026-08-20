@@ -203,6 +203,153 @@ func TestArchiveErrorClassifiesLocalExtractionOpenFailureAsInternal(t *testing.T
 	}
 }
 
+func TestArchiveNamesRejectWindowsReservedSuperscriptDevices(t *testing.T) {
+	for _, name := range []string{"repo/COM\u00b9.txt", "repo/COM\u00b2", "repo/COM\u00b3", "repo/LPT\u00b9.txt", "repo/LPT\u00b2", "repo/LPT\u00b3"} {
+		if _, err := validArchiveName(name); err == nil {
+			t.Fatalf("Windows reserved device name accepted: %q", name)
+		}
+	}
+}
+
+func TestArchivePathBoundariesAndUnsafeEntryClasses(t *testing.T) {
+	exactSegment := "repo/" + strings.Repeat("a", MaxSegmentBytes)
+	if _, err := validArchiveName(exactSegment); err != nil {
+		t.Fatalf("exact segment rejected: %v", err)
+	}
+	if _, err := validArchiveName("repo/" + strings.Repeat("a", MaxSegmentBytes+1)); err == nil {
+		t.Fatal("overlong segment accepted")
+	}
+	depth := append([]string{"repo"}, make([]string, MaxPathDepth-1)...)
+	for i := 1; i < len(depth); i++ {
+		depth[i] = "a"
+	}
+	if _, err := validArchiveName(strings.Join(depth, "/")); err != nil {
+		t.Fatalf("exact depth rejected: %v", err)
+	}
+	if _, err := validArchiveName(strings.Join(append(depth, "a"), "/")); err == nil {
+		t.Fatal("over-depth path accepted")
+	}
+	exactPath := "repo/" + strings.Repeat("a", 255) + "/" + strings.Repeat("b", 255) + "/" + strings.Repeat("c", 255) + "/" + strings.Repeat("d", 251)
+	if len(exactPath) != MaxPathBytes {
+		t.Fatalf("fixture path length=%d", len(exactPath))
+	}
+	if _, err := validArchiveName(exactPath); err != nil {
+		t.Fatalf("exact path rejected: %v", err)
+	}
+	if _, err := validArchiveName(exactPath + "x"); err == nil {
+		t.Fatal("overlong path accepted")
+	}
+	for _, entry := range []archiveEntry{
+		{"repo/hard", "", tar.TypeLink},
+		{"repo/device", "", tar.TypeChar},
+		{"repo/fifo", "", tar.TypeFifo},
+		{"repo/absolute", "", tar.TypeReg},
+	} {
+		if entry.name == "repo/absolute" {
+			entry.name = "/absolute"
+		}
+		if err := extractArchive(context.Background(), testArchive(t, archiveEntry{"repo/", "", tar.TypeDir}, entry), filepath.Join(t.TempDir(), "out")); err == nil {
+			t.Fatalf("unsafe entry accepted: %#v", entry)
+		}
+	}
+	if hasSparse(&tar.Header{Format: tar.FormatGNU, PAXRecords: map[string]string{"GNU.sparse.map": "0,1"}}) == false {
+		t.Fatal("GNU sparse entry not detected")
+	}
+}
+
+func TestExtractArchiveClassifiesFilesystemCollisionsAndCancellation(t *testing.T) {
+	archive := testArchive(t, archiveEntry{"repo/", "", tar.TypeDir}, archiveEntry{"repo/file", "contents", tar.TypeReg})
+	destinationFile := filepath.Join(t.TempDir(), "workspace")
+	if err := os.WriteFile(destinationFile, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := archiveError(extractArchive(context.Background(), archive, destinationFile)); got != "internal_error" {
+		t.Fatalf("destination collision taxonomy=%q", got)
+	}
+	destination := filepath.Join(t.TempDir(), "workspace")
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destination, "file"), []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := archiveError(extractArchive(context.Background(), archive, destination)); got != "internal_error" {
+		t.Fatalf("output collision taxonomy=%q", got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := archiveError(extractArchive(ctx, archive, filepath.Join(t.TempDir(), "canceled"))); got != "canceled" {
+		t.Fatalf("cancellation taxonomy=%q", got)
+	}
+}
+
+func TestValidateComposeWorkspaceBoundaryPathsResourcesAndLinks(t *testing.T) {
+	root := t.TempDir()
+	app := filepath.Join(root, "app")
+	for _, directory := range []string{"context", "additional"} {
+		if err := os.MkdirAll(filepath.Join(app, directory), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{"context/Dockerfile", "app.env", "common.yaml", "config.txt", "secret.txt"} {
+		if err := os.WriteFile(filepath.Join(app, file), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	valid := "services:\n  app:\n    build:\n      context: context\n      dockerfile: Dockerfile\n      additional_contexts:\n        one: additional\n        two: additional\n    env_file: [app.env]\n    extends: {file: common.yaml}\nconfigs: {cfg: {file: config.txt}}\nsecrets: {sec: {file: secret.txt}}\n"
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(app, "compose.yaml"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(valid)
+	if err := validateComposeWorkspace(app, "compose.yaml"); err != nil {
+		t.Fatalf("valid compose rejected: %v", err)
+	}
+	for _, path := range []string{"", "../compose.yaml", "./compose.yaml", "dir/../compose.yaml", "C:/compose.yaml", "dir\\compose.yaml"} {
+		if err := validateComposeWorkspace(app, path); err == nil {
+			t.Fatalf("unsafe selected compose path accepted: %q", path)
+		}
+	}
+	exact := "services: {}\n#" + strings.Repeat("x", (1<<20)-len("services: {}\n#"))
+	write(exact)
+	if err := validateComposeWorkspace(app, "compose.yaml"); err != nil {
+		t.Fatalf("exact 1MiB compose rejected: %v", err)
+	}
+	write(exact + "x")
+	if err := validateComposeWorkspace(app, "compose.yaml"); err == nil {
+		t.Fatal("over-1MiB compose accepted")
+	}
+	for _, body := range []string{
+		"services: {app: {build: https://example.test/repo}}\n",
+		"services: {app: {build: {context: context, dockerfile: ../Dockerfile}}}\n",
+		"services: {app: {build: {additional_contexts: [bad]}}}\n",
+		"services: {app: {build: {additional_contexts: {bad: service:other}}}}\n",
+		"services: {app: {env_file: {path: app.env}}}\n",
+		"services: {app: {extends: {file: missing.yaml}}}\n",
+		"configs: {cfg: {file: missing.txt}}\nservices: {}\n",
+		"secrets: {sec: {file: context}}\nservices: {}\n",
+	} {
+		write(body)
+		if err := validateComposeWorkspace(app, "compose.yaml"); err == nil {
+			t.Fatalf("unsafe compose accepted: %s", strings.TrimSpace(body))
+		}
+	}
+	external := filepath.Join(root, "external-compose.yaml")
+	if err := os.WriteFile(external, []byte("services: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(app, "linked.yaml")
+	if err := os.Symlink(external, link); err == nil {
+		if err := validateComposeWorkspace(app, "linked.yaml"); err == nil {
+			t.Fatal("symlinked compose accepted")
+		}
+	} else {
+		t.Logf("symlink fixture unavailable: %v", err)
+	}
+}
+
 func TestValidateComposeWorkspaceRejectsDynamicAndEscapingPaths(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "app"), 0o700); err != nil {
