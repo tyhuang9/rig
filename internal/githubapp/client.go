@@ -3,6 +3,7 @@ package githubapp
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,8 @@ const (
 	VerificationURI           = WebOrigin + "/login/device"
 	APIVersion                = "2026-03-10"
 	maxResponseBytes          = 512 << 10
+	maxTreeResponseBytes      = 4 << 20
+	maxContentResponseBytes   = 2 << 20
 	maxCredentialLen          = 4096
 	maxAccessLifetimeSeconds  = 7 * 24 * 60 * 60
 	maxRefreshLifetimeSeconds = 2 * 365 * 24 * 60 * 60
@@ -98,6 +101,18 @@ type Branch struct {
 
 type BranchPage struct {
 	Branches []Branch
+}
+
+type TreeEntry struct {
+	Path string
+	Type string
+	Size int64
+	SHA  string
+}
+
+type Tree struct {
+	Truncated bool
+	Entries   []TreeEntry
 }
 
 func New(clientID string) (*Client, error) {
@@ -336,6 +351,73 @@ func (c *Client) Branch(ctx context.Context, accessToken string, repositoryID in
 	return Branch{Name: response.Name, SHA: response.Commit.SHA, Protected: response.Protected}, nil
 }
 
+func (c *Client) Tree(ctx context.Context, accessToken string, repositoryID int64, sha string) (Tree, error) {
+	if !validSecret(accessToken) || repositoryID < 1 || !validSHA(sha) {
+		return Tree{}, &Error{Code: "invalid_request"}
+	}
+	endpoint := APIOrigin + "/repositories/" + strconv.FormatInt(repositoryID, 10) + "/git/trees/" + sha + "?recursive=1"
+	var response struct {
+		Truncated bool `json:"truncated"`
+		Tree      []struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+			Size *int64 `json:"size"`
+			SHA  string `json:"sha"`
+		} `json:"tree"`
+	}
+	if err := c.apiLimit(ctx, endpoint, accessToken, maxTreeResponseBytes, &response); err != nil {
+		return Tree{}, err
+	}
+	if len(response.Tree) > 10000 {
+		return Tree{}, &Error{Code: "response_too_large"}
+	}
+	result := Tree{Truncated: response.Truncated, Entries: make([]TreeEntry, 0, len(response.Tree))}
+	for _, item := range response.Tree {
+		if len(item.Path) < 1 || len(item.Path) > 4096 || !oneOf(item.Type, "blob", "tree", "commit") || !validSHA(item.SHA) {
+			return Tree{}, &Error{Code: "invalid_response"}
+		}
+		size := int64(0)
+		if item.Size != nil {
+			size = *item.Size
+			if size < 0 {
+				return Tree{}, &Error{Code: "invalid_response"}
+			}
+		}
+		result.Entries = append(result.Entries, TreeEntry{Path: item.Path, Type: item.Type, Size: size, SHA: item.SHA})
+	}
+	return result, nil
+}
+
+func (c *Client) Content(ctx context.Context, accessToken string, repositoryID int64, path, sha string) ([]byte, error) {
+	if !validSecret(accessToken) || repositoryID < 1 || !validRepositoryPath(path) || !validSHA(sha) {
+		return nil, &Error{Code: "invalid_request"}
+	}
+	segments := strings.Split(path, "/")
+	for index := range segments {
+		segments[index] = url.PathEscape(segments[index])
+	}
+	endpoint := APIOrigin + "/repositories/" + strconv.FormatInt(repositoryID, 10) + "/contents/" + strings.Join(segments, "/") + "?ref=" + url.QueryEscape(sha)
+	var response struct {
+		Type     string `json:"type"`
+		Encoding string `json:"encoding"`
+		Size     int64  `json:"size"`
+		Content  string `json:"content"`
+	}
+	if err := c.apiLimit(ctx, endpoint, accessToken, maxContentResponseBytes, &response); err != nil {
+		return nil, err
+	}
+	if response.Type != "file" || response.Encoding != "base64" || response.Size < 0 || response.Size > 1<<20 || len(response.Content) > 2<<20 {
+		return nil, &Error{Code: "response_too_large"}
+	}
+	encoded := strings.NewReplacer("\n", "", "\r", "").Replace(response.Content)
+	decoded, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding.Strict(), strings.NewReader(encoded)))
+	if err != nil || int64(len(decoded)) != response.Size || len(decoded) > 1<<20 {
+		clear(decoded)
+		return nil, &Error{Code: "invalid_response"}
+	}
+	return decoded, nil
+}
+
 type repositoryResponse struct {
 	ID    int64 `json:"id"`
 	Owner struct {
@@ -375,6 +457,18 @@ func validSHA(value string) bool {
 	return true
 }
 
+func validRepositoryPath(value string) bool {
+	if len(value) < 1 || len(value) > 1024 || strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") || strings.Contains(value, "\\") || strings.Contains(value, ":") {
+		return false
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Client) form(ctx context.Context, endpoint string, values url.Values, target any) error {
 	body := values.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
@@ -387,16 +481,24 @@ func (c *Client) form(ctx context.Context, endpoint string, values url.Values, t
 }
 
 func (c *Client) api(ctx context.Context, endpoint, accessToken string, target any) error {
+	return c.apiLimit(ctx, endpoint, accessToken, maxResponseBytes, target)
+}
+
+func (c *Client) apiLimit(ctx context.Context, endpoint, accessToken string, limit int64, target any) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return &Error{Code: "invalid_request"}
 	}
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("Authorization", "Bearer "+accessToken)
-	return c.execute(request, target)
+	return c.executeLimit(request, limit, target)
 }
 
 func (c *Client) execute(request *http.Request, target any) error {
+	return c.executeLimit(request, maxResponseBytes, target)
+}
+
+func (c *Client) executeLimit(request *http.Request, limit int64, target any) error {
 	request.Header.Set("X-GitHub-Api-Version", APIVersion)
 	request.Header.Set("User-Agent", userAgent)
 	response, err := c.client.Do(request)
@@ -405,15 +507,15 @@ func (c *Client) execute(request *http.Request, target any) error {
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBytes+1))
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, limit+1))
 		return &Error{Code: statusErrorCode(response)}
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	body, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
 	if err != nil {
 		return &Error{Code: "provider_unavailable"}
 	}
 	defer clear(body)
-	if len(body) > maxResponseBytes {
+	if int64(len(body)) > limit {
 		return &Error{Code: "response_too_large"}
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
@@ -454,6 +556,8 @@ func statusErrorCode(response *http.Response) string {
 		return "forbidden"
 	case http.StatusTooManyRequests:
 		return "rate_limited"
+	case http.StatusNotFound:
+		return "not_found"
 	default:
 		if status >= 500 {
 			return "provider_unavailable"

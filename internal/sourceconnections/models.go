@@ -60,6 +60,35 @@ type InstallationPage struct {
 	Installations []Installation
 }
 
+type SourceRepository struct {
+	ID            int64
+	Owner         string
+	Name          string
+	DefaultBranch string
+	Private       bool
+	Archived      bool
+	Disabled      bool
+}
+
+type RepositoryPage struct {
+	Page         int
+	PerPage      int
+	TotalCount   int
+	Repositories []SourceRepository
+}
+
+type Branch struct {
+	Name      string
+	SHA       string
+	Protected bool
+}
+
+type BranchPage struct {
+	Page     int
+	PerPage  int
+	Branches []Branch
+}
+
 type TokenBundle struct {
 	Version          int       `json:"version"`
 	Generation       int64     `json:"generation"`
