@@ -48,7 +48,7 @@ func (s *Server) replaceApplicationConfiguration(w http.ResponseWriter, r *http.
 	}
 	input := appconfig.ReplaceInput{ExpectedRevisionNumber: body.ExpectedRevisionNumber, Remove: body.Remove}
 	input.Variables = configurationInputs(body.Variables)
-	input.Secrets = configurationInputs(body.Secrets)
+	input.Secrets = secretConfigurationInputs(body.Secrets)
 	actor := r.Context().Value(principalKey{}).(principal).user.ID
 	configuration, err := s.Configuration.Replace(r.Context(), r.PathValue("appId"), actor, input)
 	if err != nil {
@@ -56,6 +56,14 @@ func (s *Server) replaceApplicationConfiguration(w http.ResponseWriter, r *http.
 		return
 	}
 	writeJSON(w, http.StatusOK, configurationResponse(configuration))
+}
+
+func secretConfigurationInputs(values []apicontract.SecretConfigurationValueInput) []appconfig.ValueInput {
+	result := make([]appconfig.ValueInput, 0, len(values))
+	for _, value := range values {
+		result = append(result, appconfig.ValueInput{Key: value.Key, Value: value.Value})
+	}
+	return result
 }
 
 func configurationInputs(values []apicontract.ConfigurationValueInput) []appconfig.ValueInput {

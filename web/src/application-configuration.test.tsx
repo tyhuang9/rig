@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { APIError, api } from "./api";
 import { ApplicationConfigurationPanel } from "./application-configuration";
@@ -89,5 +89,82 @@ describe("ApplicationConfigurationPanel", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Reload latest configuration" }));
     expect(await screen.findByText(/could not reload the latest configuration/i)).not.toBeNull();
     expect((value as HTMLInputElement).value).toBe("keep-this-edit");
+  });
+
+  it("resets dirty configuration state when the application route changes", async () => {
+    const configuration = vi.mocked(api.applicationConfiguration);
+    configuration.mockReset();
+    configuration.mockImplementation(async (appId) => appId === "app-a" ? {
+      revisionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      revisionNumber: 3,
+      entries: [
+        { key: "A_VARIABLE", sensitive: false, value: "a-value" },
+        { key: "A_SECRET", sensitive: true },
+      ],
+    } : {
+      revisionId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      revisionNumber: 7,
+      entries: [{ key: "B_VARIABLE", sensitive: false, value: "b-value" }],
+    });
+    const replace = vi.spyOn(api, "replaceApplicationConfiguration").mockResolvedValue({
+      revisionId: "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      revisionNumber: 8,
+      entries: [{ key: "B_VARIABLE", sensitive: false, value: "b-edited" }],
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const view = render(<QueryClientProvider client={client}><ApplicationConfigurationPanel appId="app-a" /></QueryClientProvider>);
+
+    fireEvent.change(await screen.findByDisplayValue("a-value"), { target: { value: "unsaved-a" } });
+    fireEvent.change(screen.getByLabelText("Replacement value"), { target: { value: "a-secret-replacement" } });
+    view.rerender(<QueryClientProvider client={client}><ApplicationConfigurationPanel appId="app-b" /></QueryClientProvider>);
+
+    const bValue = await screen.findByDisplayValue("b-value");
+    expect(screen.queryByDisplayValue("unsaved-a")).toBeNull();
+    expect(screen.queryByDisplayValue("a-secret-replacement")).toBeNull();
+    expect(screen.queryByDisplayValue("A_SECRET")).toBeNull();
+    fireEvent.change(bValue, { target: { value: "b-edited" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("app-b", {
+      expectedRevisionNumber: 7,
+      variables: [{ key: "B_VARIABLE", value: "b-edited" }],
+      secrets: [],
+      remove: [],
+    }));
+    expect(JSON.stringify(replace.mock.calls)).not.toContain("a-secret-replacement");
+  });
+
+  it("serializes saves and locks every edit until the submitted revision is applied", async () => {
+    let resolveSave!: (configuration: typeof initial) => void;
+    const pendingSave = new Promise<typeof initial>((resolve) => { resolveSave = resolve; });
+    const replace = vi.spyOn(api, "replaceApplicationConfiguration").mockReturnValue(pendingSave);
+    renderPanel();
+
+    const value = await screen.findByLabelText("Value");
+    fireEvent.change(value, { target: { value: "submitted-value" } });
+    const save = screen.getByRole("button", { name: "Save configuration" });
+    fireEvent.click(save);
+    fireEvent.click(save);
+
+    await waitFor(() => expect(replace).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Saving/ }).hasAttribute("disabled")).toBe(true));
+    for (const input of screen.getAllByRole("textbox")) expect(input.hasAttribute("disabled")).toBe(true);
+    expect(screen.getByLabelText("Replacement value").hasAttribute("disabled")).toBe(true);
+    for (const button of screen.getAllByRole("button")) expect(button.hasAttribute("disabled")).toBe(true);
+    fireEvent.change(value, { target: { value: "must-not-apply" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add variable" }));
+    expect((value as HTMLInputElement).value).toBe("submitted-value");
+    expect(replace).toHaveBeenCalledTimes(1);
+
+    await act(async () => resolveSave({
+      ...initial,
+      revisionNumber: 2,
+      entries: [
+        { key: "EMPTY", sensitive: false, value: "submitted-value" },
+        { key: "TOKEN", sensitive: true },
+      ],
+    }));
+    expect(await screen.findByText("Configuration revision 2 saved.")).not.toBeNull();
+    expect((screen.getByLabelText("Value") as HTMLInputElement).value).toBe("submitted-value");
+    expect(replace).toHaveBeenCalledTimes(1);
   });
 });

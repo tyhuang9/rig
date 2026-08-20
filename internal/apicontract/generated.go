@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "949cf84e215e54b2d721ff01b136150cdb201cea28aa1d9588470b752f235de9"
+const SourceSHA256 = "40bc5dcb9dd346eab3ec0f3366043da5979a99a350d7d58b6a98114246783fe0"
 
 var Operations = map[string]Operation{
 	"bootstrap":                       {Method: "POST", Path: "/api/v1/auth/bootstrap"},
@@ -301,10 +301,15 @@ type Problem struct {
 }
 
 type ReplaceApplicationConfigurationRequest struct {
-	ExpectedRevisionNumber int64                     `json:"expectedRevisionNumber"`
-	Remove                 []string                  `json:"remove"`
-	Secrets                []ConfigurationValueInput `json:"secrets"`
-	Variables              []ConfigurationValueInput `json:"variables"`
+	ExpectedRevisionNumber int64                           `json:"expectedRevisionNumber"`
+	Remove                 []string                        `json:"remove"`
+	Secrets                []SecretConfigurationValueInput `json:"secrets"`
+	Variables              []ConfigurationValueInput       `json:"variables"`
+}
+
+type SecretConfigurationValueInput struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 type Service struct {

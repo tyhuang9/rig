@@ -78,3 +78,7 @@ BEGIN SELECT RAISE(ABORT, 'invalid release configuration'); END;
 CREATE TRIGGER release_configuration_immutable BEFORE UPDATE OF configuration_revision_id, configuration_revision_number ON releases
 WHEN NOT (NEW.configuration_revision_id IS OLD.configuration_revision_id AND NEW.configuration_revision_number=OLD.configuration_revision_number)
 BEGIN SELECT RAISE(ABORT, 'release configuration is immutable'); END;
+
+CREATE TRIGGER release_application_immutable BEFORE UPDATE OF app_id ON releases
+WHEN NEW.app_id IS NOT OLD.app_id
+BEGIN SELECT RAISE(ABORT, 'release application is immutable'); END;

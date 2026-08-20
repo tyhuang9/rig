@@ -78,11 +78,12 @@ type bundle struct {
 }
 
 type Store struct {
-	db       *sql.DB
-	root     string
-	now      func() time.Time
-	mu       sync.Mutex
-	appLocks map[string]*appLock
+	db                *sql.DB
+	root              string
+	now               func() time.Time
+	mu                sync.Mutex
+	appLocks          map[string]*appLock
+	beforeTransaction func()
 }
 
 type appLock struct {
@@ -197,17 +198,21 @@ func (s *Store) Replace(ctx context.Context, appID, actorID string, input Replac
 			_ = secretfile.Remove(path)
 		}
 	}()
+	if s.beforeTransaction != nil {
+		s.beforeTransaction()
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Configuration{}, err
+		return Configuration{}, s.classifyWriteError(ctx, appID, input.ExpectedRevisionNumber, err)
 	}
 	defer tx.Rollback()
 	now := s.now().UTC().Format(time.RFC3339Nano)
 	variables, secrets := counts(entries)
 	ref := filepath.ToSlash(filepath.Join("apps", appID, "configuration", revisionID+".secret"))
 	if _, err = tx.ExecContext(ctx, `INSERT INTO application_configuration_revisions(id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count) VALUES(?,?,?,?,?,?,?,?)`, revisionID, appID, number, ref, nullable(actorID), now, variables, secrets); err != nil {
-		return Configuration{}, err
+		_ = tx.Rollback()
+		return Configuration{}, s.classifyWriteError(ctx, appID, input.ExpectedRevisionNumber, err)
 	}
 	keys := make([]string, 0, len(entries))
 	for key := range entries {
@@ -216,12 +221,14 @@ func (s *Store) Replace(ctx context.Context, appID, actorID string, input Replac
 	sort.Strings(keys)
 	for _, key := range keys {
 		if _, err = tx.ExecContext(ctx, `INSERT INTO application_configuration_entries(revision_id,key,sensitive) VALUES(?,?,?)`, revisionID, key, entries[key].Sensitive); err != nil {
-			return Configuration{}, err
+			_ = tx.Rollback()
+			return Configuration{}, s.classifyWriteError(ctx, appID, input.ExpectedRevisionNumber, err)
 		}
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE application_configuration_heads SET revision_id=?,revision_number=?,updated_at=? WHERE app_id=? AND revision_number=?`, revisionID, number, now, appID, input.ExpectedRevisionNumber)
 	if err != nil {
-		return Configuration{}, err
+		_ = tx.Rollback()
+		return Configuration{}, s.classifyWriteError(ctx, appID, input.ExpectedRevisionNumber, err)
 	}
 	changed, _ := result.RowsAffected()
 	if changed != 1 {
@@ -229,13 +236,22 @@ func (s *Store) Replace(ctx context.Context, appID, actorID string, input Replac
 	}
 	metadata, _ := json.Marshal(map[string]int{"variables": variables, "secrets": secrets, "removed": len(input.Remove)})
 	if _, err = tx.ExecContext(ctx, `INSERT INTO audit_events(actor_id,action,resource_type,resource_id,metadata_json,created_at) VALUES(?,?,?,?,?,?)`, nullable(actorID), "application.configuration.replace", "application", appID, string(metadata), now); err != nil {
-		return Configuration{}, err
+		_ = tx.Rollback()
+		return Configuration{}, s.classifyWriteError(ctx, appID, input.ExpectedRevisionNumber, err)
 	}
 	if err = tx.Commit(); err != nil {
 		return Configuration{}, err
 	}
 	committed = true
 	return s.Get(ctx, appID)
+}
+
+func (s *Store) classifyWriteError(ctx context.Context, appID string, expected int64, cause error) error {
+	var current int64
+	if err := s.db.QueryRowContext(ctx, `SELECT revision_number FROM application_configuration_heads WHERE app_id=?`, appID).Scan(&current); err == nil && current != expected {
+		return &Error{Code: "configuration_conflict"}
+	}
+	return cause
 }
 
 func (s *Store) loadHeadBundle(ctx context.Context, appID string) (bundle, error) {

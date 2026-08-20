@@ -175,6 +175,51 @@ func TestConcurrentReplaceUsesCompareAndSwap(t *testing.T) {
 	}
 }
 
+func TestIndependentStoresMapUniqueRevisionRaceToConflict(t *testing.T) {
+	first, root := testStore(t)
+	second, err := New(first.db, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	hook := func() { entered <- struct{}{}; <-release }
+	first.beforeTransaction = hook
+	second.beforeTransaction = hook
+	type result struct {
+		configuration Configuration
+		err           error
+	}
+	results := make(chan result, 2)
+	for index, store := range []*Store{first, second} {
+		go func(value string, candidate *Store) {
+			configuration, err := candidate.Replace(context.Background(), configTestApp, "", ReplaceInput{ExpectedRevisionNumber: 0, Variables: []ValueInput{{Key: "VALUE", Value: value}}})
+			results <- result{configuration, err}
+		}(string(rune('a'+index)), store)
+	}
+	<-entered
+	<-entered
+	close(release)
+	successes, conflicts := 0, 0
+	for index := 0; index < 2; index++ {
+		result := <-results
+		if result.err == nil && result.configuration.RevisionNumber == 1 {
+			successes++
+		} else if IsCode(result.err, "configuration_conflict") {
+			conflicts++
+		} else {
+			t.Fatalf("unexpected result: %+v err=%v", result.configuration, result.err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("successes=%d conflicts=%d", successes, conflicts)
+	}
+	var revisions int
+	if err := first.db.QueryRow(`SELECT COUNT(*) FROM application_configuration_revisions WHERE app_id=?`, configTestApp).Scan(&revisions); err != nil || revisions != 1 {
+		t.Fatalf("revisions=%d err=%v", revisions, err)
+	}
+}
+
 func TestDatabaseFailureAfterBundleWriteCleansOnlyNewFile(t *testing.T) {
 	store, root := testStore(t)
 	_, err := store.Replace(context.Background(), configTestApp, "missing-user", ReplaceInput{ExpectedRevisionNumber: 0, Secrets: []ValueInput{{Key: "TOKEN", Value: "secret"}}})

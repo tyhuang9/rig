@@ -166,6 +166,12 @@ func TestApplicationConfigurationMigrationBackfillsAndEnforcesRevisionIntegrity(
 	if _, err := db.Exec(`UPDATE releases SET app_id='future' WHERE id='valid'`); err == nil {
 		t.Fatal("release was allowed to cross application configuration ownership")
 	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at) VALUES('revision-zero','legacy','ready','{}',datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE releases SET app_id='future' WHERE id='revision-zero'`); err == nil {
+		t.Fatal("revision-zero release application was mutable")
+	}
 	if _, err := db.Exec(`UPDATE application_configuration_revisions SET bundle_ref='changed' WHERE id='rev-a'`); err == nil {
 		t.Fatal("configuration revision was mutable")
 	}
