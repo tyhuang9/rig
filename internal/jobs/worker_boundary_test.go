@@ -846,7 +846,7 @@ func TestReporterUsesBoundedSafeEventsAndMonotonicProgress(t *testing.T) {
 			t.Fatalf("executor message leaked: %#v", event)
 		}
 	}
-	for i := 0; i < maxJobEventsPerAttempt-4; i++ {
+	for i := 0; i < maxJobEventsPerAttempt-reservedTerminalEvents-3; i++ {
 		if err := reporter.Report(ProgressUpdate{Status: Running, Phase: "running", Progress: 20, Checkpoint: `{"phase":"running"}`, Code: "phase_started"}); err != nil {
 			t.Fatalf("report %d = %v", i, err)
 		}
