@@ -84,7 +84,11 @@ func main() {
 		}
 	}
 	sources := sourceconnections.NewService(sourceconnections.NewRepository(db), githubProvider, sourceconnections.NewFileCredentialStore(cfg.DataRoot), cfg.GitHubAppSlug, time.Now)
-	snapshots := releasesnapshot.New(db, sources, cfg.DataRoot)
+	snapshots, err := releasesnapshot.New(db, sources, cfg.DataRoot)
+	if err != nil {
+		logger.Error("release snapshot configuration failed", "error", err)
+		os.Exit(1)
+	}
 	if err := snapshots.Recover(); err != nil {
 		logger.Error("release snapshot recovery failed", "error", err)
 		os.Exit(1)

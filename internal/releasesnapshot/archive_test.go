@@ -130,6 +130,8 @@ func TestValidateComposeWorkspaceRejectsDynamicAndEscapingPaths(t *testing.T) {
 		"services:\n  app:\n    env_file: ../outside.env\n",
 		"include: other.yaml\nservices: {}\n",
 		"configs:\n  x:\n    file: https://example.test/x\nservices: {}\n",
+		"services:\n  a: &app\n    build: .\n  b: *app\n",
+		"services:\n  a:\n    build: .\n    build: ../bad\n",
 	} {
 		if err := os.WriteFile(filepath.Join(root, "app", "compose.yaml"), []byte(body), 0o600); err != nil {
 			t.Fatal(err)

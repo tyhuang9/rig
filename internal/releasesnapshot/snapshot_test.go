@@ -37,7 +37,10 @@ func (f *fakeSources) DownloadArchive(context.Context, string, string, int64, st
 func TestMaterializeInstallsImmutableWorkspaceAndReusesReadyRelease(t *testing.T) {
 	db := snapshotDB(t)
 	source := &fakeSources{archive: composeArchive(t, "services: {}\n")}
-	m := New(db, source, t.TempDir())
+	m, err := New(db, source, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	release, err := m.Materialize(context.Background(), "owner", "11111111-1111-1111-1111-111111111111")
 	if err != nil {
 		t.Fatal(err)
@@ -47,6 +50,9 @@ func TestMaterializeInstallsImmutableWorkspaceAndReusesReadyRelease(t *testing.T
 	}
 	if _, err := os.Stat(filepath.Join(release.WorkspacePath, "compose.yaml")); err != nil {
 		t.Fatal(err)
+	}
+	if filepath.Base(release.WorkspacePath) != "workspace" || filepath.Base(filepath.Dir(release.WorkspacePath)) != release.ID {
+		t.Fatalf("workspace layout = %q", release.WorkspacePath)
 	}
 	again, err := m.Materialize(context.Background(), "owner", "11111111-1111-1111-1111-111111111111")
 	if err != nil {
@@ -60,9 +66,28 @@ func TestMaterializeInstallsImmutableWorkspaceAndReusesReadyRelease(t *testing.T
 		t.Fatalf("provenance = %q %q %q %q %v", owner, name, state, storedPath, err)
 	}
 }
+func TestMaterializeRejectsWrongOwnerAndUnsafeRoots(t *testing.T) {
+	db := snapshotDB(t)
+	source := &fakeSources{archive: composeArchive(t, "services: {}\n")}
+	m, err := New(db, source, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Materialize(context.Background(), "other", "11111111-1111-1111-1111-111111111111"); !IsCode(err, "invalid_source") {
+		t.Fatalf("wrong owner = %v", err)
+	}
+	for _, root := range []string{"", "relative", t.TempDir() + string(filepath.Separator) + ".." + string(filepath.Separator) + "x"} {
+		if _, err := New(db, source, root); err == nil {
+			t.Fatalf("unsafe root accepted: %q", root)
+		}
+	}
+}
 func TestRecoverFailsOnlyValidatedMaterializationStaging(t *testing.T) {
 	db := snapshotDB(t)
-	m := New(db, &fakeSources{}, t.TempDir())
+	m, err := New(db, &fakeSources{}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	id := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	app := "11111111-1111-1111-1111-111111111111"
 	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,workspace_state) VALUES(?,?, 'materializing','{}',datetime('now'),'materializing')`, id, app); err != nil {
@@ -107,6 +132,9 @@ func snapshotDB(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO application_sources(application_id,source_type,connection_id,installation_id,repository_id,repository_owner,repository_name,tracked_branch,tracked_ref,compose_path,resolved_sha,created_at,updated_at) VALUES(?, 'github','0123456789abcdef0123456789abcdef',3,7,'old','repo','main','refs/heads/main','compose.yaml',?,datetime('now'),datetime('now'))`, app, snapshotSHA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO application_source_owners(application_id,owner_user_id) VALUES (?,'owner')`, app); err != nil {
 		t.Fatal(err)
 	}
 	return db

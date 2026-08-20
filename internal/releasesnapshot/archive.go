@@ -71,7 +71,7 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 	var root string
 	rootHeader := false
 	seen := map[string]struct{}{}
-	caseFolded := map[string]bool{}
+	caseFolded := map[string]string{}
 	var entries int
 	var total int64
 	for {
@@ -123,17 +123,22 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 		seen[rel] = struct{}{}
 		fold := strings.ToLower(rel)
 		partsFold := strings.Split(fold, "/")
+		partsOriginal := strings.Split(rel, "/")
 		for i := 1; i < len(partsFold); i++ {
 			prefix := strings.Join(partsFold[:i], "/")
-			if isFile, ok := caseFolded[prefix]; ok && isFile {
+			spelling := strings.Join(partsOriginal[:i], "/")
+			if existing, ok := caseFolded[prefix]; ok && existing != spelling {
 				return errors.New("case-folding archive collision")
 			}
-			caseFolded[prefix] = false
+			caseFolded[prefix] = spelling
 		}
-		if _, ok := caseFolded[fold]; ok {
+		if existing, ok := caseFolded[fold]; ok && existing != rel {
 			return errors.New("case-folding archive collision")
 		}
-		caseFolded[fold] = h.Typeflag != tar.TypeDir
+		if _, ok := caseFolded[fold]; ok {
+			return errors.New("duplicate archive entry")
+		}
+		caseFolded[fold] = rel
 		out := filepath.Join(destination, filepath.FromSlash(rel))
 		if !within(destination, out) {
 			return errors.New("workspace escape")
@@ -176,7 +181,7 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 	}
 	// gzip's EOF check validates checksum. A single immutable stream is
 	// required so trailing members and raw bytes cannot be smuggled in.
-	if _, err := io.Copy(io.Discard, gz); err != nil {
+	if extra, err := io.Copy(io.Discard, gz); err != nil || extra != 0 {
 		return errors.New("invalid gzip")
 	}
 	if _, err := buffered.ReadByte(); err != io.EOF {

@@ -55,8 +55,11 @@ type Materializer struct {
 	locks    keyedLocks
 }
 
-func New(db *sql.DB, sources SourceReader, dataRoot string) *Materializer {
-	return &Materializer{db: db, sources: sources, dataRoot: dataRoot, now: time.Now}
+func New(db *sql.DB, sources SourceReader, dataRoot string) (*Materializer, error) {
+	if db == nil || sources == nil || dataRoot == "" || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
+		return nil, errors.New("release snapshot data root must be absolute and clean")
+	}
+	return &Materializer{db: db, sources: sources, dataRoot: dataRoot, now: time.Now}, nil
 }
 
 // Materialize resolves the app's tracked branch exactly once, then installs an
@@ -67,8 +70,11 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 	}
 	unlock := m.locks.lock(appID)
 	defer unlock()
-	source, err := m.appSource(ctx, appID)
+	source, err := m.appSource(ctx, owner, appID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Release{}, &Error{Code: "invalid_source"}
+		}
 		return Release{}, internal(err)
 	}
 	if source.typeName != "github" {
@@ -80,6 +86,9 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 	}
 	if repository.ID != source.repositoryID || branch.Name != source.branch {
 		return Release{}, &Error{Code: "invalid_source"}
+	}
+	if err := m.refreshSource(ctx, appID, repository, branch); err != nil {
+		return Release{}, internal(err)
 	}
 	tree, err := m.sources.ReadTree(ctx, owner, source.connectionID, source.repositoryID, branch.SHA)
 	if err != nil {
@@ -104,11 +113,11 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 	}
 	staging, err := m.stagingPath(appID, release.ID)
 	if err != nil {
-		m.fail(context.Background(), release.ID, "internal_error")
+		m.finalize(ctx, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
 	if err := os.MkdirAll(staging, 0o700); err != nil {
-		m.fail(context.Background(), release.ID, "internal_error")
+		m.finalize(ctx, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
 	defer func() {
@@ -118,38 +127,42 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 	}()
 	body, err := m.sources.DownloadArchive(ctx, owner, source.connectionID, source.repositoryID, branch.SHA)
 	if err != nil {
-		m.fail(context.Background(), release.ID, sourceError(err).(*Error).Code)
+		m.finalize(ctx, release.ID, sourceError(err).(*Error).Code)
 		return Release{}, sourceError(err)
 	}
-	archivePath := filepath.Join(staging, "source.tar.gz")
+	archivePath := filepath.Join(staging, "source.tar.gz.part")
 	hash, err := downloadArchive(ctx, body, archivePath)
 	if err != nil {
 		code := archiveError(err)
-		m.fail(context.Background(), release.ID, code)
+		m.finalize(ctx, release.ID, code)
 		return Release{}, &Error{Code: code}
 	}
 	workspace := filepath.Join(staging, "workspace")
 	if err := extractArchive(ctx, archivePath, workspace); err != nil {
 		code := archiveError(err)
-		m.fail(context.Background(), release.ID, code)
+		m.finalize(ctx, release.ID, code)
 		return Release{}, &Error{Code: code}
 	}
 	if err := validateComposeWorkspace(workspace, source.composePath); err != nil {
 		code := archiveError(err)
-		m.fail(context.Background(), release.ID, code)
+		m.finalize(ctx, release.ID, code)
 		return Release{}, &Error{Code: code}
 	}
 	final, err := m.workspacePath(appID, release.ID)
 	if err != nil {
-		m.fail(context.Background(), release.ID, "internal_error")
+		m.finalize(ctx, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
-		m.fail(context.Background(), release.ID, "internal_error")
+	if err := os.MkdirAll(filepath.Dir(filepath.Dir(final)), 0o700); err != nil {
+		m.finalize(ctx, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	if err := os.Rename(workspace, final); err != nil {
-		m.fail(context.Background(), release.ID, "internal_error")
+	if err := os.Remove(archivePath); err != nil {
+		m.finalize(ctx, release.ID, "internal_error")
+		return Release{}, &Error{Code: "internal_error"}
+	}
+	if err := os.Rename(staging, filepath.Dir(final)); err != nil {
+		m.finalize(ctx, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
 	if err := m.markReady(ctx, release.ID, hash, m.workspaceRelative(appID, release.ID)); err != nil {
@@ -157,7 +170,7 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 		if existing, lookupErr := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath); lookupErr == nil {
 			return existing, nil
 		}
-		m.fail(context.Background(), release.ID, "internal_error")
+		m.finalize(ctx, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
 	release.ArchiveSHA256, release.WorkspacePath, release.WorkspaceState = hash, final, WorkspaceStateReady
@@ -180,14 +193,25 @@ func (m *Materializer) Recover() error {
 		}
 		interrupted = append(interrupted, Release{ID: id, AppID: app})
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
 	for _, release := range interrupted {
 		id, app := release.ID, release.AppID
-		_ = m.removeStaging(app, id)
-		_ = m.removeWorkspace(app, id)
-		if err := m.fail(context.Background(), id, "internal_error"); err != nil {
+		if err := m.removeStaging(app, id); err != nil {
+			return err
+		}
+		if err := m.removeWorkspace(app, id); err != nil {
+			return err
+		}
+		finalize, cancel := finalizeContext(context.Background())
+		err := m.fail(finalize, id, "internal_error")
+		cancel()
+		if err != nil {
 			return err
 		}
 	}
@@ -199,9 +223,9 @@ type appSource struct {
 	installationID, repositoryID                int64
 }
 
-func (m *Materializer) appSource(ctx context.Context, appID string) (appSource, error) {
+func (m *Materializer) appSource(ctx context.Context, owner, appID string) (appSource, error) {
 	var s appSource
-	err := m.db.QueryRowContext(ctx, `SELECT source_type,COALESCE(connection_id,''),COALESCE(installation_id,0),COALESCE(repository_id,0),COALESCE(tracked_branch,''),COALESCE(compose_path,'') FROM application_sources WHERE application_id=?`, appID).Scan(&s.typeName, &s.connectionID, &s.installationID, &s.repositoryID, &s.branch, &s.composePath)
+	err := m.db.QueryRowContext(ctx, `SELECT s.source_type,COALESCE(s.connection_id,''),COALESCE(s.installation_id,0),COALESCE(s.repository_id,0),COALESCE(s.tracked_branch,''),COALESCE(s.compose_path,'') FROM application_sources s JOIN application_source_owners o ON o.application_id=s.application_id WHERE s.application_id=? AND o.owner_user_id=?`, appID, owner).Scan(&s.typeName, &s.connectionID, &s.installationID, &s.repositoryID, &s.branch, &s.composePath)
 	return s, err
 }
 func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, compose string) (Release, error) {
@@ -212,7 +236,18 @@ func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, c
 	}
 	expected, pathErr := m.workspacePath(app, r.ID)
 	if pathErr != nil || r.WorkspacePath != m.workspaceRelative(app, r.ID) || !safeWorkspace(expected, compose) {
-		_, _ = m.db.ExecContext(ctx, `UPDATE releases SET status='failed',workspace_state='failed',materialization_error_code='invalid_source' WHERE id=? AND workspace_state='ready'`, r.ID)
+		if pathErr == nil {
+			if err := m.removeWorkspace(app, r.ID); err != nil {
+				return Release{}, err
+			}
+		}
+		result, updateErr := m.db.ExecContext(ctx, `UPDATE releases SET status='failed',workspace_state='failed',materialization_error_code='invalid_source' WHERE id=? AND workspace_state='ready'`, r.ID)
+		if updateErr != nil {
+			return Release{}, updateErr
+		}
+		if n, _ := result.RowsAffected(); n != 1 {
+			return Release{}, errors.New("ready release changed")
+		}
 		return Release{}, sql.ErrNoRows
 	}
 	r.WorkspacePath = expected
@@ -242,6 +277,10 @@ func (m *Materializer) reserve(ctx context.Context, app string, source appSource
 	}
 	return Release{ID: id, AppID: app, RepositoryID: repository.ID, ResolvedSHA: branch.SHA, ComposePath: source.composePath, WorkspaceState: WorkspaceStateMaterializing}, nil
 }
+func (m *Materializer) refreshSource(ctx context.Context, app string, repository sourceconnections.SourceRepository, branch sourceconnections.Branch) error {
+	_, err := m.db.ExecContext(ctx, `UPDATE application_sources SET repository_owner=?,repository_name=?,resolved_sha=?,updated_at=? WHERE application_id=?`, repository.Owner, repository.Name, branch.SHA, m.now().UTC().Format(time.RFC3339Nano), app)
+	return err
+}
 func (m *Materializer) markReady(ctx context.Context, id, hash, workspace string) error {
 	r, err := m.db.ExecContext(ctx, `UPDATE releases SET status='ready',archive_sha256=?,workspace_path=?,workspace_state='ready',materialized_at=? WHERE id=? AND workspace_state='materializing'`, hash, workspace, m.now().UTC().Format(time.RFC3339Nano), id)
 	if err != nil {
@@ -257,11 +296,20 @@ func (m *Materializer) fail(ctx context.Context, id, code string) error {
 	_, err := m.db.ExecContext(ctx, `UPDATE releases SET status='failed',workspace_state='failed',materialization_error_code=? WHERE id=? AND workspace_state='materializing'`, code, id)
 	return err
 }
+func (m *Materializer) finalize(ctx context.Context, id, code string) {
+	final, cancel := finalizeContext(ctx)
+	defer cancel()
+	_ = m.fail(final, id, code)
+}
 func (m *Materializer) workspacePath(app, id string) (string, error) {
-	return managedPath(m.dataRoot, app, id, "releases")
+	release, err := managedPath(m.dataRoot, app, id, "releases")
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(release, "workspace"), nil
 }
 func (m *Materializer) workspaceRelative(app, id string) string {
-	return filepath.ToSlash(filepath.Join("apps", app, "releases", id))
+	return filepath.ToSlash(filepath.Join("apps", app, "releases", id, "workspace"))
 }
 func (m *Materializer) stagingPath(app, id string) (string, error) {
 	return managedPath(m.dataRoot, app, id, ".staging")
@@ -274,17 +322,21 @@ func (m *Materializer) removeStaging(app, id string) error {
 	return os.RemoveAll(p)
 }
 func (m *Materializer) removeWorkspace(app, id string) error {
-	p, err := m.workspacePath(app, id)
+	p, err := managedPath(m.dataRoot, app, id, "releases")
 	if err != nil {
 		return err
 	}
 	return os.RemoveAll(p)
 }
 func managedPath(root, app, id, kind string) (string, error) {
-	if !validAppID(app) || !validID(id) || (kind != "releases" && kind != ".staging") {
+	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root || !validAppID(app) || !validID(id) || (kind != "releases" && kind != ".staging") {
 		return "", errors.New("invalid managed path")
 	}
-	return filepath.Join(root, "apps", app, kind, id), nil
+	target := filepath.Join(root, "apps", app, kind, id)
+	if !within(root, target) {
+		return "", errors.New("managed path escapes root")
+	}
+	return target, nil
 }
 func randomID() (string, error) {
 	b := make([]byte, 16)
@@ -354,23 +406,39 @@ func safeWorkspace(workspace, compose string) bool {
 	info, err = os.Lstat(filepath.Join(workspace, filepath.FromSlash(compose)))
 	return err == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0
 }
+func finalizeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+}
 
 type keyedLocks struct {
 	mu     sync.Mutex
-	values map[string]*sync.Mutex
+	values map[string]*lockEntry
+}
+type lockEntry struct {
+	mu         sync.Mutex
+	references int
 }
 
 func (k *keyedLocks) lock(id string) func() {
 	k.mu.Lock()
 	if k.values == nil {
-		k.values = map[string]*sync.Mutex{}
+		k.values = map[string]*lockEntry{}
 	}
 	v := k.values[id]
 	if v == nil {
-		v = &sync.Mutex{}
+		v = &lockEntry{}
 		k.values[id] = v
 	}
+	v.references++
 	k.mu.Unlock()
-	v.Lock()
-	return v.Unlock
+	v.mu.Lock()
+	return func() {
+		v.mu.Unlock()
+		k.mu.Lock()
+		v.references--
+		if v.references == 0 {
+			delete(k.values, id)
+		}
+		k.mu.Unlock()
+	}
 }

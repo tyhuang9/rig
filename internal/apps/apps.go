@@ -100,6 +100,16 @@ func (s *Store) CreateWithSource(name, description, machineID string, source Sou
 	if err != nil {
 		return Application{}, err
 	}
+	if source.Type == SourceGitHub {
+		result, err := tx.Exec(`INSERT INTO application_source_owners(application_id,owner_user_id) SELECT ?, owner_user_id FROM source_connections WHERE id=? AND status='connected'`, id, source.ConnectionID)
+		if err != nil {
+			return Application{}, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil || count != 1 {
+			return Application{}, errors.New("GitHub connection is not owned and connected")
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return Application{}, err
 	}

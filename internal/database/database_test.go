@@ -66,7 +66,7 @@ func TestMigrateFreshUpgradePreservesDataAndIsIdempotent(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&versions); err != nil {
 		t.Fatal(err)
 	}
-	if users != 1 || versions != 4 {
+	if users != 1 || versions != 5 {
 		t.Fatalf("preserved users = %d, migration versions = %d", users, versions)
 	}
 }

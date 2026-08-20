@@ -25,6 +25,9 @@ func validateComposeWorkspace(workspace, composePath string) error {
 	if yaml.Unmarshal(contents, &document) != nil {
 		return errors.New("invalid compose")
 	}
+	if !safeYAML(&document) {
+		return errors.New("invalid compose")
+	}
 	root := mappingRoot(&document)
 	if root == nil {
 		return errors.New("invalid compose")
@@ -54,6 +57,30 @@ func validateComposeWorkspace(workspace, composePath string) error {
 	}
 	return nil
 }
+func safeYAML(node *yaml.Node) bool {
+	if node == nil {
+		return false
+	}
+	if node.Anchor != "" || node.Alias != nil {
+		return false
+	}
+	if node.Kind == yaml.MappingNode {
+		seen := map[string]bool{}
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			if key.Value == "<<" || seen[key.Value] {
+				return false
+			}
+			seen[key.Value] = true
+		}
+	}
+	for _, child := range node.Content {
+		if !safeYAML(child) {
+			return false
+		}
+	}
+	return true
+}
 func validateServicePaths(workspace, base string, service *yaml.Node) error {
 	if service == nil || service.Kind != yaml.MappingNode {
 		return errors.New("invalid compose service")
@@ -77,8 +104,10 @@ func validateServicePaths(workspace, base string, service *yaml.Node) error {
 					return err
 				}
 			}
-			if mapValue(build, "additional_contexts") != nil {
-				return errors.New("unsupported additional contexts")
+			if v := mapValue(build, "additional_contexts"); v != nil {
+				if err := validateAdditionalContexts(workspace, base, v); err != nil {
+					return err
+				}
 			}
 		} else {
 			return errors.New("invalid build")
@@ -107,6 +136,39 @@ func validateServicePaths(workspace, base string, service *yaml.Node) error {
 		}
 	}
 	return nil
+}
+func validateAdditionalContexts(workspace, base string, node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.MappingNode:
+		for i := 1; i < len(node.Content); i += 2 {
+			if _, err := resolveAdditionalContext(workspace, base, node.Content[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	case yaml.SequenceNode:
+		for _, item := range node.Content {
+			if item.Kind != yaml.ScalarNode || !strings.Contains(item.Value, "=") {
+				return errors.New("invalid additional context")
+			}
+			value := strings.SplitN(item.Value, "=", 2)[1]
+			copy := *item
+			copy.Value = value
+			if _, err := resolveAdditionalContext(workspace, base, &copy); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return errors.New("invalid additional contexts")
+	}
+}
+func resolveAdditionalContext(workspace, base string, node *yaml.Node) (string, error) {
+	value := strings.TrimSpace(node.Value)
+	if strings.HasPrefix(value, "service:") || strings.HasPrefix(value, "docker-image:") {
+		return "", errors.New("unsupported additional context")
+	}
+	return resolvePathNode(workspace, base, node, true)
 }
 func validatePathNode(workspace, base string, node *yaml.Node, wantDir bool) error {
 	_, err := resolvePathNode(workspace, base, node, wantDir)
