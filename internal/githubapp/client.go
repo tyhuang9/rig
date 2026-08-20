@@ -27,6 +27,7 @@ const (
 	maxContentResponseBytes   = 2 << 20
 	maxCredentialLen          = 4096
 	maxArchiveRedirects       = 3
+	archiveTimeout            = 5 * time.Minute
 	maxAccessLifetimeSeconds  = 7 * 24 * 60 * 60
 	maxRefreshLifetimeSeconds = 2 * 365 * 24 * 60 * 60
 	userAgent                 = "hostd-github-app/1"
@@ -134,12 +135,17 @@ func (c *Client) Archive(ctx context.Context, accessToken string, repositoryID i
 	request.Header.Set("Authorization", "Bearer "+accessToken)
 	request.Header.Set("X-GitHub-Api-Version", APIVersion)
 	request.Header.Set("User-Agent", userAgent)
-	return c.archiveRequest(request, true, sha)
+	archiveClient := *c.client
+	// Archives are intentionally larger than JSON API documents; preserve a
+	// bounded request lifetime without inheriting the metadata client's 15s
+	// whole-body timeout.
+	archiveClient.Timeout = archiveTimeout
+	return c.archiveRequest(&archiveClient, request, true, sha)
 }
 
-func (c *Client) archiveRequest(request *http.Request, initial bool, sha string) (io.ReadCloser, error) {
+func (c *Client) archiveRequest(client *http.Client, request *http.Request, initial bool, sha string) (io.ReadCloser, error) {
 	for redirects := 0; ; redirects++ {
-		response, err := c.client.Do(request)
+		response, err := client.Do(request)
 		if err != nil {
 			return nil, &Error{Code: "provider_unavailable"}
 		}
