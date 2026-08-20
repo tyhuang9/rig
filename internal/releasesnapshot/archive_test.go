@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -113,6 +115,50 @@ func TestExtractArchiveRejectsConcatenatedAndCorruptGzip(t *testing.T) {
 	}
 	if err := extractArchive(context.Background(), corrupt, filepath.Join(t.TempDir(), "out")); err == nil {
 		t.Fatal("corrupt gzip accepted")
+	}
+}
+
+func TestTarLimitReaderUsesBoundedPlusOneOverflowSemantics(t *testing.T) {
+	exact := newTarLimitReader(bytes.NewReader([]byte("1234")), 4)
+	got, err := io.ReadAll(exact)
+	if err != nil || string(got) != "1234" || exact.overflow {
+		t.Fatalf("exact=%q err=%v overflow=%v", got, err, exact.overflow)
+	}
+	over := newTarLimitReader(bytes.NewReader([]byte("12345")), 4)
+	got, err = io.ReadAll(over)
+	if err != nil || string(got) != "12345" || !over.overflow {
+		t.Fatalf("overflow=%q err=%v overflow=%v", got, err, over.overflow)
+	}
+}
+
+func TestExtractArchiveBoundsPostTarDecompression(t *testing.T) {
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "repo/", Typeflag: tar.TypeDir, Mode: 0o700}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "repo/compose.yaml", Typeflag: tar.TypeReg, Mode: 0o600, Size: int64(len("services: {}\n"))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("services: {}\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gz.Write(bytes.Repeat([]byte{0}, 1<<20)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "bomb.tar.gz")
+	if err := os.WriteFile(p, compressed.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := extractArchiveWithLimit(context.Background(), p, filepath.Join(t.TempDir(), "out"), 4096); !errors.Is(err, errTooLarge) {
+		t.Fatalf("post-tar bomb=%v", err)
 	}
 }
 

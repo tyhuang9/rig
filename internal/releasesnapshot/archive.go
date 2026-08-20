@@ -54,6 +54,9 @@ func downloadArchive(ctx context.Context, body io.ReadCloser, destination string
 }
 
 func extractArchive(ctx context.Context, archivePath, destination string) error {
+	return extractArchiveWithLimit(ctx, archivePath, destination, MaxTarBytes)
+}
+func extractArchiveWithLimit(ctx context.Context, archivePath, destination string, tarLimit int64) error {
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return err
@@ -65,7 +68,7 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 		return errors.New("invalid gzip")
 	}
 	gz.Multistream(false)
-	limited := &tarLimitReader{r: gz, remaining: MaxTarBytes}
+	limited := newTarLimitReader(gz, tarLimit)
 	tr := tar.NewReader(limited)
 	if err := os.MkdirAll(destination, 0o700); err != nil {
 		return err
@@ -85,6 +88,9 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 			break
 		}
 		if err != nil {
+			if limited.overflow {
+				return errTooLarge
+			}
 			return errors.New("invalid tar")
 		}
 		entries++
@@ -181,7 +187,7 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 			return errors.New("truncated tar entry")
 		}
 	}
-	if limited.exhausted {
+	if limited.overflow {
 		return errTooLarge
 	}
 	if root == "" || !rootHeader {
@@ -189,8 +195,12 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 	}
 	// gzip's EOF check validates checksum. A single immutable stream is
 	// required so trailing members and raw bytes cannot be smuggled in.
-	if extra, err := io.Copy(io.Discard, gz); err != nil || extra != 0 {
+	if extra, err := io.Copy(io.Discard, limited); err != nil {
 		return errors.New("invalid gzip")
+	} else if limited.overflow {
+		return errTooLarge
+	} else if extra != 0 {
+		return errors.New("invalid tar")
 	}
 	if _, err := buffered.ReadByte(); err != io.EOF {
 		return errors.New("trailing archive data")
@@ -271,12 +281,15 @@ func copyContext(ctx context.Context, w io.Writer, r io.Reader) (int64, error) {
 type tarLimitReader struct {
 	r         io.Reader
 	remaining int64
-	exhausted bool
+	overflow  bool
+}
+
+func newTarLimitReader(reader io.Reader, limit int64) *tarLimitReader {
+	return &tarLimitReader{r: reader, remaining: limit + 1}
 }
 
 func (r *tarLimitReader) Read(p []byte) (int, error) {
 	if r.remaining <= 0 {
-		r.exhausted = true
 		return 0, io.EOF
 	}
 	if int64(len(p)) > r.remaining {
@@ -284,8 +297,8 @@ func (r *tarLimitReader) Read(p []byte) (int, error) {
 	}
 	n, err := r.r.Read(p)
 	r.remaining -= int64(n)
-	if r.remaining == 0 && err == nil {
-		r.exhausted = true
+	if r.remaining == 0 {
+		r.overflow = true
 	}
 	return n, err
 }
