@@ -3,6 +3,7 @@ package apps
 import (
 	"database/sql"
 	"errors"
+	"path"
 	"strings"
 	"time"
 
@@ -148,10 +149,25 @@ func validateSource(source *Source) error {
 		}
 		return nil
 	}
-	if source.Type != SourceGitHub || source.Path != "" || source.ConnectionID == "" || source.InstallationID < 1 || source.RepositoryID < 1 || source.RepositoryOwner == "" || source.RepositoryName == "" || source.TrackedBranch == "" || source.TrackedRef != "refs/heads/"+source.TrackedBranch || source.ComposePath == "" || len(source.ResolvedSHA) != 40 {
+	if source.Type != SourceGitHub || source.Path != "" || !lowerHex(source.ConnectionID, 32) || source.InstallationID < 1 || source.RepositoryID < 1 || source.RepositoryOwner == "" || source.RepositoryName == "" || source.TrackedBranch == "" || source.TrackedRef != "refs/heads/"+source.TrackedBranch || !normalizedRepositoryPath(source.ComposePath) || !lowerHex(source.ResolvedSHA, 40) {
 		return errors.New("invalid GitHub source")
 	}
 	return nil
+}
+
+func lowerHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+func normalizedRepositoryPath(value string) bool {
+	return value != "" && !strings.ContainsAny(value, "\\:") && !strings.HasPrefix(value, "/") && path.Clean(value) == value && value != ".." && !strings.HasPrefix(value, "../")
 }
 
 func nullable(value string) any {

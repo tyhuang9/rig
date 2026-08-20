@@ -366,6 +366,48 @@ func TestRepositoryAndBranchValidationRejectsMismatchesAndUnsafeNames(t *testing
 	}
 }
 
+func TestTreeAndSelectedContentReadsAreBoundedAndCanonical(t *testing.T) {
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	var calls int
+	client := testClient(t, func(request *http.Request) *http.Response {
+		calls++
+		switch calls {
+		case 1:
+			if request.URL.Path != "/repositories/8/git/trees/"+sha || request.URL.Query().Get("recursive") != "1" {
+				t.Fatalf("tree URL=%s", request.URL)
+			}
+			return jsonResponse(200, `{"truncated":false,"tree":[{"path":"deploy/compose.yaml","type":"blob","size":13,"sha":"`+sha+`"}]}`)
+		case 2:
+			if request.URL.Path != "/repositories/8/contents/deploy/compose.yaml" || request.URL.Query().Get("ref") != sha {
+				t.Fatalf("content URL=%s", request.URL)
+			}
+			return jsonResponse(200, `{"type":"file","encoding":"base64","size":13,"content":"c2VydmljZXM6IHt9Cg=="}`)
+		default:
+			t.Fatal("unexpected request")
+			return nil
+		}
+	})
+	tree, err := client.Tree(context.Background(), "access", 8, sha)
+	if err != nil || len(tree.Entries) != 1 {
+		t.Fatalf("tree=%#v err=%v", tree, err)
+	}
+	content, err := client.Content(context.Background(), "access", 8, "deploy/compose.yaml", sha)
+	if err != nil || string(content) != "services: {}\n" {
+		t.Fatalf("content=%q err=%v", content, err)
+	}
+	for _, unsafe := range []string{"../compose.yaml", "/compose.yaml", "C:/compose.yaml", "deploy\\compose.yaml"} {
+		if _, err := client.Content(context.Background(), "access", 8, unsafe, sha); !IsCode(err, "invalid_request") {
+			t.Errorf("path %q error=%v", unsafe, err)
+		}
+	}
+	oversized := testClient(t, func(*http.Request) *http.Response {
+		return jsonResponse(200, `{"type":"file","encoding":"base64","size":1048577,"content":""}`)
+	})
+	if _, err := oversized.Content(context.Background(), "access", 8, "compose.yaml", sha); !IsCode(err, "response_too_large") {
+		t.Fatalf("oversize error=%v", err)
+	}
+}
+
 func jsonResponse(status int, body string) *http.Response {
 	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
 }

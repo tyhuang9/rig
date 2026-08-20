@@ -118,6 +118,78 @@ func (s *Server) listGitHubInstallations(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, apicontract.GitHubInstallationPage{Page: providerPage.Page, PerPage: providerPage.PerPage, TotalCount: providerPage.TotalCount, Items: items})
 }
 
+func (s *Server) listGitHubRepositories(w http.ResponseWriter, r *http.Request) {
+	if !s.requireProviderSources(w, r) {
+		return
+	}
+	installationID, ok := positivePathInteger(r, "installationId")
+	if !ok {
+		problem(w, r, http.StatusBadRequest, "invalid_source", "Invalid GitHub installation", nil)
+		return
+	}
+	page, ok := boundedQueryInteger(r, "page", 1, 1, 10000)
+	if !ok {
+		problem(w, r, http.StatusBadRequest, "invalid_request", "Page must be an integer between 1 and 10000", nil)
+		return
+	}
+	perPage, ok := boundedQueryInteger(r, "perPage", 30, 1, 100)
+	if !ok {
+		problem(w, r, http.StatusBadRequest, "invalid_request", "Per-page count must be an integer between 1 and 100", nil)
+		return
+	}
+	providerPage, err := s.Sources.Repositories(r.Context(), sourceOwner(r), r.PathValue("connectionId"), installationID, page, perPage)
+	if err != nil {
+		sourceProblem(w, r, err)
+		return
+	}
+	items := make([]apicontract.GitHubRepository, 0, len(providerPage.Repositories))
+	for _, repository := range providerPage.Repositories {
+		items = append(items, apicontract.GitHubRepository{ID: repository.ID, Owner: repository.Owner, Name: repository.Name, DefaultBranch: repository.DefaultBranch, Private: repository.Private, Archived: repository.Archived, Disabled: repository.Disabled})
+	}
+	writeJSON(w, http.StatusOK, apicontract.GitHubRepositoryPage{Page: page, PerPage: perPage, TotalCount: providerPage.TotalCount, Items: items})
+}
+
+func (s *Server) listGitHubBranches(w http.ResponseWriter, r *http.Request) {
+	if !s.requireProviderSources(w, r) {
+		return
+	}
+	installationID, ok := positivePathInteger(r, "installationId")
+	if !ok {
+		problem(w, r, http.StatusBadRequest, "invalid_source", "Invalid GitHub installation", nil)
+		return
+	}
+	repositoryID, ok := positivePathInteger(r, "repositoryId")
+	if !ok {
+		problem(w, r, http.StatusBadRequest, "invalid_source", "Invalid GitHub repository", nil)
+		return
+	}
+	page, ok := boundedQueryInteger(r, "page", 1, 1, 10000)
+	if !ok {
+		problem(w, r, http.StatusBadRequest, "invalid_request", "Page must be an integer between 1 and 10000", nil)
+		return
+	}
+	perPage, ok := boundedQueryInteger(r, "perPage", 30, 1, 100)
+	if !ok {
+		problem(w, r, http.StatusBadRequest, "invalid_request", "Per-page count must be an integer between 1 and 100", nil)
+		return
+	}
+	providerPage, err := s.Sources.Branches(r.Context(), sourceOwner(r), r.PathValue("connectionId"), installationID, repositoryID, page, perPage)
+	if err != nil {
+		sourceProblem(w, r, err)
+		return
+	}
+	items := make([]apicontract.GitHubBranch, 0, len(providerPage.Branches))
+	for _, branch := range providerPage.Branches {
+		items = append(items, apicontract.GitHubBranch{Name: branch.Name, Sha: branch.SHA, Protected: branch.Protected})
+	}
+	writeJSON(w, http.StatusOK, apicontract.GitHubBranchPage{Page: page, PerPage: perPage, Items: items})
+}
+
+func positivePathInteger(r *http.Request, name string) (int64, bool) {
+	value, err := strconv.ParseInt(r.PathValue(name), 10, 64)
+	return value, err == nil && value > 0
+}
+
 func (s *Server) requireLocalSources(w http.ResponseWriter, r *http.Request) bool {
 	if s.Sources == nil {
 		problem(w, r, http.StatusInternalServerError, "internal_error", "Source connection storage is unavailable", nil)
@@ -167,6 +239,10 @@ func sourceProblem(w http.ResponseWriter, r *http.Request, err error) {
 		status, detail = http.StatusTooManyRequests, "GitHub temporarily rate limited this operation"
 	case "provider_unavailable":
 		status, detail = http.StatusServiceUnavailable, "GitHub is temporarily unavailable"
+	case "invalid_source":
+		status, detail = http.StatusUnprocessableEntity, "GitHub source is invalid or no longer exists"
+	case "source_too_large":
+		status, detail = http.StatusRequestEntityTooLarge, "GitHub source exceeds inspection limits"
 	case "invalid_connection_state":
 		status, detail = http.StatusConflict, "Source connection is not in the required state"
 	}

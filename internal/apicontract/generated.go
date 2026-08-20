@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "79b1ca9cc84d92779b8f975409e252ddaa1be68e9e07b456b24fb5db7de1bed7"
+const SourceSHA256 = "0d68c2fb660d4c4ee756b31f5658c00356f58fbf358c2a1c9310f1ad74b5fcf5"
 
 var Operations = map[string]Operation{
 	"bootstrap":                   {Method: "POST", Path: "/api/v1/auth/bootstrap"},
@@ -21,7 +21,9 @@ var Operations = map[string]Operation{
 	"getJob":                      {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
 	"inspectImport":               {Method: "POST", Path: "/api/v1/apps/import/inspect"},
 	"listApplications":            {Method: "GET", Path: "/api/v1/apps"},
+	"listGitHubBranches":          {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories/{repositoryId}/branches"},
 	"listGitHubInstallations":     {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations"},
+	"listGitHubRepositories":      {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories"},
 	"listJobEvents":               {Method: "GET", Path: "/api/v1/jobs/{jobId}/events"},
 	"listJobs":                    {Method: "GET", Path: "/api/v1/jobs"},
 	"listMachines":                {Method: "GET", Path: "/api/v1/machines"},
@@ -43,13 +45,14 @@ var Operations = map[string]Operation{
 }
 
 type Application struct {
-	CreatedAt   string `json:"createdAt"`
-	Description string `json:"description"`
-	ID          string `json:"id"`
-	MachineName string `json:"machineName"`
-	Name        string `json:"name"`
-	Slug        string `json:"slug"`
-	Status      string `json:"status"`
+	CreatedAt   string        `json:"createdAt"`
+	Description string        `json:"description"`
+	ID          string        `json:"id"`
+	MachineName string        `json:"machineName"`
+	Name        string        `json:"name"`
+	Slug        string        `json:"slug"`
+	Source      SourceSummary `json:"source"`
+	Status      string        `json:"status"`
 }
 
 type ApplicationList struct {
@@ -76,10 +79,17 @@ type Capabilities struct {
 }
 
 type CreateApplicationRequest struct {
-	Description string `json:"description,omitempty"`
-	MachineID   string `json:"machineId,omitempty"`
-	Name        string `json:"name"`
-	SourcePath  string `json:"sourcePath,omitempty"`
+	Description  string       `json:"description,omitempty"`
+	GithubSource GitHubSource `json:"githubSource,omitempty"`
+	MachineID    string       `json:"machineId,omitempty"`
+	Name         string       `json:"name"`
+	SourcePath   string       `json:"sourcePath,omitempty"`
+}
+
+type DetectedService struct {
+	BuildContext string `json:"buildContext,omitempty"`
+	Image        string `json:"image,omitempty"`
+	Name         string `json:"name"`
 }
 
 type Diagnostics struct {
@@ -109,6 +119,18 @@ type DoctorResponse struct {
 	StartupLimitation string        `json:"startupLimitation"`
 }
 
+type GitHubBranch struct {
+	Name      string `json:"name"`
+	Protected bool   `json:"protected"`
+	Sha       string `json:"sha"`
+}
+
+type GitHubBranchPage struct {
+	Items   []GitHubBranch `json:"items"`
+	Page    int            `json:"page"`
+	PerPage int            `json:"perPage"`
+}
+
 type GitHubDeviceAuthorization struct {
 	ConnectionID        string `json:"connectionId"`
 	ExpiresAt           string `json:"expiresAt"`
@@ -135,6 +157,31 @@ type GitHubInstallationPage struct {
 	TotalCount int                  `json:"totalCount"`
 }
 
+type GitHubRepository struct {
+	Archived      bool   `json:"archived"`
+	DefaultBranch string `json:"defaultBranch"`
+	Disabled      bool   `json:"disabled"`
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	Owner         string `json:"owner"`
+	Private       bool   `json:"private"`
+}
+
+type GitHubRepositoryPage struct {
+	Items      []GitHubRepository `json:"items"`
+	Page       int                `json:"page"`
+	PerPage    int                `json:"perPage"`
+	TotalCount int                `json:"totalCount"`
+}
+
+type GitHubSource struct {
+	Branch         string `json:"branch"`
+	ComposePath    string `json:"composePath,omitempty"`
+	ConnectionID   string `json:"connectionId"`
+	InstallationID int64  `json:"installationId"`
+	RepositoryID   int64  `json:"repositoryId"`
+}
+
 type HostResources struct {
 	DiskAvailableBytes   int64 `json:"diskAvailableBytes"`
 	DiskTotalBytes       int64 `json:"diskTotalBytes"`
@@ -143,13 +190,16 @@ type HostResources struct {
 }
 
 type InspectRequest struct {
-	SourcePath string `json:"sourcePath"`
+	GithubSource GitHubSource `json:"githubSource,omitempty"`
+	SourcePath   string       `json:"sourcePath,omitempty"`
 }
 
 type InspectResponse struct {
-	Inspection string `json:"inspection"`
-	Message    string `json:"message"`
-	Source     string `json:"source"`
+	ComposeCandidates []string          `json:"composeCandidates"`
+	Findings          []SourceFinding   `json:"findings"`
+	ResolvedSha       string            `json:"resolvedSha,omitempty"`
+	Services          []DetectedService `json:"services"`
+	Source            SourceSummary     `json:"source"`
 }
 
 type Job struct {
@@ -267,6 +317,26 @@ type SourceConnection struct {
 
 type SourceConnectionList struct {
 	Items []SourceConnection `json:"items"`
+}
+
+type SourceFinding struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Path    string `json:"path,omitempty"`
+}
+
+type SourceSummary struct {
+	ComposePath     string `json:"composePath,omitempty"`
+	ConnectionID    string `json:"connectionId,omitempty"`
+	InstallationID  int64  `json:"installationId,omitempty"`
+	Path            string `json:"path,omitempty"`
+	RepositoryID    int64  `json:"repositoryId,omitempty"`
+	RepositoryName  string `json:"repositoryName,omitempty"`
+	RepositoryOwner string `json:"repositoryOwner,omitempty"`
+	ResolvedSha     string `json:"resolvedSha,omitempty"`
+	TrackedBranch   string `json:"trackedBranch,omitempty"`
+	TrackedRef      string `json:"trackedRef,omitempty"`
+	Type            string `json:"type"`
 }
 
 type SystemStatus struct {

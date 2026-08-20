@@ -57,6 +57,7 @@ func TestInspectGithubRejectsUnsafeOrOversizedTreeWithoutContentRead(t *testing.
 		"traversal": {githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "../compose.yaml", Type: "blob", SHA: testSHA}}}, "invalid_source"},
 		"absolute":  {githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "/compose.yaml", Type: "blob", SHA: testSHA}}}, "invalid_source"},
 		"drive":     {githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "C:/compose.yaml", Type: "blob", SHA: testSHA}}}, "invalid_source"},
+		"duplicate": {githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "compose.yaml", Type: "blob", SHA: testSHA}, {Path: "compose.yaml", Type: "tree", SHA: testSHA}}}, "invalid_source"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			reader := &fakeReader{repository: sourceconnections.SourceRepository{ID: 9, Owner: "o", Name: "r"}, branch: sourceconnections.Branch{Name: "main", SHA: testSHA}, tree: testCase.tree}
@@ -120,6 +121,21 @@ func TestInspectLocalDiscoversAndParsesCompose(t *testing.T) {
 	}
 	if result.Source.Type != "local" || len(result.Services) != 1 || result.Services[0].Name != "web" {
 		t.Fatalf("result=%#v", result)
+	}
+}
+
+func TestInspectLocalRejectsSourceSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "compose.yaml")
+	if err := os.WriteFile(target, []byte("services:\n  app:\n    image: nginx\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "linked-compose.yaml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, err := InspectLocal(link); !IsCode(err, "invalid_source") {
+		t.Fatalf("error=%v", err)
 	}
 }
 

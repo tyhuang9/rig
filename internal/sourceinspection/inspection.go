@@ -81,11 +81,16 @@ func InspectGitHub(ctx context.Context, reader GitHubReader, owner string, sourc
 	}
 	result := Result{Source: SourceMetadata{Type: "github", ConnectionID: source.ConnectionID, InstallationID: source.InstallationID, RepositoryID: repository.ID, RepositoryOwner: repository.Owner, RepositoryName: repository.Name, TrackedBranch: branch.Name, TrackedRef: "refs/heads/" + branch.Name}, ResolvedSHA: branch.SHA}
 	blobs := make(map[string]githubapp.TreeEntry)
+	seenPaths := make(map[string]struct{}, len(tree.Entries))
 	for _, entry := range tree.Entries {
 		normalized, normalizeErr := normalizePath(entry.Path)
 		if normalizeErr != nil || normalized != entry.Path {
 			return Result{}, &Error{Code: "invalid_source"}
 		}
+		if _, exists := seenPaths[entry.Path]; exists {
+			return Result{}, &Error{Code: "invalid_source"}
+		}
+		seenPaths[entry.Path] = struct{}{}
 		if entry.Type == "commit" {
 			result.Findings = append(result.Findings, Finding{Code: "unsupported_submodule", Message: "Git submodules are not supported", Path: entry.Path})
 		}
@@ -120,6 +125,10 @@ func InspectLocal(sourcePath string) (Result, error) {
 	}
 	absolute, err := filepath.Abs(sourcePath)
 	if err != nil {
+		return Result{}, &Error{Code: "invalid_source"}
+	}
+	linkInfo, err := os.Lstat(absolute)
+	if err != nil || linkInfo.Mode()&os.ModeSymlink != 0 {
 		return Result{}, &Error{Code: "invalid_source"}
 	}
 	info, err := os.Stat(absolute)

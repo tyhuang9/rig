@@ -26,6 +26,7 @@ import (
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/runtime/docker"
 	"github.com/hostd/hostd/internal/sourceconnections"
+	"github.com/hostd/hostd/internal/sourceinspection"
 )
 
 //go:embed all:ui
@@ -102,6 +103,8 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("refreshSourceConnection", s.require(s.refreshSourceConnection)),
 		contractRoute("disconnectSourceConnection", s.require(s.disconnectSourceConnection)),
 		contractRoute("listGitHubInstallations", s.require(s.listGitHubInstallations)),
+		contractRoute("listGitHubRepositories", s.require(s.listGitHubRepositories)),
+		contractRoute("listGitHubBranches", s.require(s.listGitHubBranches)),
 	}
 }
 
@@ -382,7 +385,11 @@ func contractUser(value auth.User) apicontract.User {
 }
 
 func contractApplication(value apps.Application) apicontract.Application {
-	return apicontract.Application{ID: value.ID, Slug: value.Slug, Name: value.Name, Description: value.Description, Status: value.Status, MachineName: value.MachineName, CreatedAt: value.CreatedAt.Format(time.RFC3339Nano)}
+	return apicontract.Application{ID: value.ID, Slug: value.Slug, Name: value.Name, Description: value.Description, Status: value.Status, MachineName: value.MachineName, CreatedAt: value.CreatedAt.Format(time.RFC3339Nano), Source: contractAppSource(value.Source)}
+}
+
+func contractAppSource(value apps.Source) apicontract.SourceSummary {
+	return apicontract.SourceSummary{Type: value.Type, Path: value.Path, ConnectionID: value.ConnectionID, InstallationID: value.InstallationID, RepositoryID: value.RepositoryID, RepositoryOwner: value.RepositoryOwner, RepositoryName: value.RepositoryName, TrackedBranch: value.TrackedBranch, TrackedRef: value.TrackedRef, ComposePath: value.ComposePath, ResolvedSha: value.ResolvedSHA}
 }
 
 func contractApplications(values []apps.Application) []apicontract.Application {
@@ -564,9 +571,33 @@ func (s *Server) createApp(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 400, "invalid_request", "Invalid application", nil)
 		return
 	}
-	v, err := s.Apps.Create(b.Name, b.Description, b.SourcePath, b.MachineID)
+	hasLocal := strings.TrimSpace(b.SourcePath) != ""
+	hasGitHub := githubSourcePresent(b.GithubSource)
+	if hasLocal && hasGitHub {
+		problem(w, r, http.StatusBadRequest, "invalid_source", "Specify either sourcePath or githubSource, not both", nil)
+		return
+	}
+	var v apps.Application
+	var err error
+	if hasGitHub {
+		if !s.requireProviderSources(w, r) {
+			return
+		}
+		inspection, inspectErr := sourceinspection.InspectGitHub(r.Context(), s.Sources, sourceOwner(r), inspectionGitHubSource(b.GithubSource))
+		if inspectErr != nil {
+			inspectionProblem(w, r, inspectErr)
+			return
+		}
+		if len(inspection.Findings) > 0 {
+			problem(w, r, http.StatusUnprocessableEntity, "invalid_source", "GitHub source has unresolved findings", nil)
+			return
+		}
+		v, err = s.Apps.CreateWithSource(b.Name, b.Description, b.MachineID, apps.Source{Type: apps.SourceGitHub, ConnectionID: inspection.Source.ConnectionID, InstallationID: inspection.Source.InstallationID, RepositoryID: inspection.Source.RepositoryID, RepositoryOwner: inspection.Source.RepositoryOwner, RepositoryName: inspection.Source.RepositoryName, TrackedBranch: inspection.Source.TrackedBranch, TrackedRef: inspection.Source.TrackedRef, ComposePath: inspection.Source.ComposePath, ResolvedSHA: inspection.ResolvedSHA})
+	} else {
+		v, err = s.Apps.Create(b.Name, b.Description, b.SourcePath, b.MachineID)
+	}
 	if err != nil {
-		problem(w, r, 422, "validation_failed", err.Error(), map[string]string{"name": err.Error()})
+		problem(w, r, 422, "validation_failed", "Application could not be created", nil)
 		return
 	}
 	writeJSON(w, 201, contractApplication(v))
@@ -577,12 +608,55 @@ func (s *Server) inspectApp(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 400, "invalid_request", "Invalid inspection request", nil)
 		return
 	}
-	v, err := s.Apps.Inspect(b.SourcePath)
-	if err != nil {
-		problem(w, r, 422, "validation_failed", err.Error(), map[string]string{"sourcePath": err.Error()})
+	hasLocal, hasGitHub := strings.TrimSpace(b.SourcePath) != "", githubSourcePresent(b.GithubSource)
+	if hasLocal == hasGitHub {
+		problem(w, r, http.StatusBadRequest, "invalid_source", "Specify exactly one sourcePath or githubSource", nil)
 		return
 	}
-	writeJSON(w, 200, apicontract.InspectResponse{Source: fmt.Sprint(v["source"]), Inspection: fmt.Sprint(v["inspection"]), Message: fmt.Sprint(v["message"])})
+	var result sourceinspection.Result
+	var err error
+	if hasLocal {
+		result, err = sourceinspection.InspectLocal(b.SourcePath)
+	} else {
+		if !s.requireProviderSources(w, r) {
+			return
+		}
+		result, err = sourceinspection.InspectGitHub(r.Context(), s.Sources, sourceOwner(r), inspectionGitHubSource(b.GithubSource))
+	}
+	if err != nil {
+		inspectionProblem(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, contractInspection(result))
+}
+
+func githubSourcePresent(value apicontract.GitHubSource) bool {
+	return value.ConnectionID != "" || value.InstallationID != 0 || value.RepositoryID != 0 || value.Branch != "" || value.ComposePath != ""
+}
+func inspectionGitHubSource(value apicontract.GitHubSource) sourceinspection.GitHubSource {
+	return sourceinspection.GitHubSource{ConnectionID: value.ConnectionID, InstallationID: value.InstallationID, RepositoryID: value.RepositoryID, Branch: value.Branch, ComposePath: value.ComposePath}
+}
+func contractInspection(value sourceinspection.Result) apicontract.InspectResponse {
+	result := apicontract.InspectResponse{ResolvedSha: value.ResolvedSHA, ComposeCandidates: value.ComposeCandidates, Services: make([]apicontract.DetectedService, 0, len(value.Services)), Findings: make([]apicontract.SourceFinding, 0, len(value.Findings)), Source: apicontract.SourceSummary{Type: value.Source.Type, Path: value.Source.Path, ConnectionID: value.Source.ConnectionID, InstallationID: value.Source.InstallationID, RepositoryID: value.Source.RepositoryID, RepositoryOwner: value.Source.RepositoryOwner, RepositoryName: value.Source.RepositoryName, TrackedBranch: value.Source.TrackedBranch, TrackedRef: value.Source.TrackedRef, ComposePath: value.Source.ComposePath, ResolvedSha: value.ResolvedSHA}}
+	for _, service := range value.Services {
+		result.Services = append(result.Services, apicontract.DetectedService{Name: service.Name, Image: service.Image, BuildContext: service.BuildContext})
+	}
+	for _, finding := range value.Findings {
+		result.Findings = append(result.Findings, apicontract.SourceFinding{Code: finding.Code, Message: finding.Message, Path: finding.Path})
+	}
+	return result
+}
+
+func inspectionProblem(w http.ResponseWriter, r *http.Request, err error) {
+	if sourceinspection.IsCode(err, "source_too_large") {
+		problem(w, r, http.StatusRequestEntityTooLarge, "source_too_large", "Source exceeds inspection limits", nil)
+		return
+	}
+	if sourceinspection.IsCode(err, "invalid_source") {
+		problem(w, r, http.StatusUnprocessableEntity, "invalid_source", "Source could not be inspected", nil)
+		return
+	}
+	sourceProblem(w, r, err)
 }
 func (s *Server) getApp(w http.ResponseWriter, r *http.Request) {
 	v, err := s.Apps.Get(r.PathValue("appId"))
