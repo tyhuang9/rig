@@ -31,6 +31,16 @@ function mockCommon(enabled = true) {
   vi.spyOn(api, "createApp").mockResolvedValue({ id: "app-1" } as never);
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
 async function selectConnectedGitHub() {
   fireEvent.click(screen.getByLabelText(/^github repository$/i));
   const connectionSelect = await screen.findByLabelText(/^github connection$/i);
@@ -178,8 +188,31 @@ describe("SourceWizard", () => {
     renderWizard();
     fireEvent.click(screen.getByLabelText(/github repository/i));
 
-    expect(await screen.findByText(/github connections are unavailable/i)).toBeTruthy();
+    expect(await screen.findByText(/^github connections are unavailable$/i, { selector: "strong" })).toBeTruthy();
     expect(api.sourceConnections).not.toHaveBeenCalled();
+  });
+
+  it("announces capability checking and confirmed disabled in one persistent region", async () => {
+    const capabilityResult = deferred<Awaited<ReturnType<typeof api.status>>>();
+    vi.mocked(api.status).mockReturnValueOnce(capabilityResult.promise);
+    renderWizard();
+    fireEvent.click(screen.getByLabelText(/^github repository$/i));
+
+    const capabilityStatus = screen.getByText(/^checking github connection capability\.$/i, { selector: ".capability-status" });
+    expect(capabilityStatus.getAttribute("aria-live")).toBe("polite");
+    await act(async () => capabilityResult.resolve({ capabilities: { githubConnections: false } } as never));
+    expect(await screen.findByText(/^github connections are unavailable\.$/i, { selector: ".capability-status" })).toBe(capabilityStatus);
+  });
+
+  it("announces a capability error after checking", async () => {
+    const capabilityResult = deferred<Awaited<ReturnType<typeof api.status>>>();
+    vi.mocked(api.status).mockReturnValueOnce(capabilityResult.promise);
+    renderWizard();
+    fireEvent.click(screen.getByLabelText(/^github repository$/i));
+
+    const capabilityStatus = screen.getByText(/^checking github connection capability\.$/i, { selector: ".capability-status" });
+    await act(async () => capabilityResult.reject(new APIError({ status: 503, code: "provider_unavailable", detail: "Controller status is temporarily unavailable." })));
+    expect(await screen.findByText(/^github connection capability check failed\.$/i, { selector: ".capability-status" })).toBe(capabilityStatus);
   });
 
   it("focuses a GitHub prerequisite summary when an incomplete form is submitted", async () => {
@@ -218,10 +251,12 @@ describe("SourceWizard", () => {
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
 
     const select = await screen.findByLabelText(/^github connection$/i) as HTMLSelectElement;
+    const connectionStatus = screen.getByText(/^loading github connections\.$/i).closest("[role='status']");
     expect(select.disabled).toBe(true);
     expect(screen.getByRole("option", { name: /loading connections/i })).toBeTruthy();
     resolveConnections?.({ items: [connection] });
     await waitFor(() => expect(select.disabled).toBe(false));
+    expect(screen.getByText(/^github connections loaded\./i).closest("[role='status']")).toBe(connectionStatus);
   });
 
   it("keeps the connection control and retries a failed connection list", async () => {
@@ -254,6 +289,45 @@ describe("SourceWizard", () => {
     expect(select.disabled).toBe(false);
   });
 
+  it("announces installation, repository, and branch loading and results in persistent regions", async () => {
+    const installationsResult = deferred<Awaited<ReturnType<typeof api.githubInstallations>>>();
+    const repositoriesResult = deferred<Awaited<ReturnType<typeof api.githubRepositories>>>();
+    const branchesResult = deferred<Awaited<ReturnType<typeof api.githubBranches>>>();
+    vi.mocked(api.githubInstallations).mockReturnValueOnce(installationsResult.promise);
+    vi.mocked(api.githubRepositories).mockReturnValueOnce(repositoriesResult.promise);
+    vi.mocked(api.githubBranches).mockReturnValueOnce(branchesResult.promise);
+    renderWizard();
+    await selectConnectedGitHub();
+
+    const installationStatus = screen.getByText(/^loading github app installations page 1\.$/i);
+    expect(installationStatus.getAttribute("aria-live")).toBe("polite");
+    expect(screen.getAllByText(/^loading github app installations page 1\.$/i)).toHaveLength(1);
+    await act(async () => installationsResult.resolve({
+      page: 1,
+      perPage: 30,
+      totalCount: 1,
+      items: [{ id: 10, accountLogin: "octo-org", accountType: "Organization", targetType: "Organization", repositorySelection: "selected", cachedAt: "2026-01-01T00:00:00Z" }],
+    }));
+    expect(await screen.findByText(/^github app installations page 1 loaded\. 1 result\.$/i)).toBe(installationStatus);
+
+    await selectInstallation();
+    const repositoryStatus = screen.getByText(/^loading repositories page 1\.$/i);
+    expect(screen.getAllByText(/^loading repositories page 1\.$/i)).toHaveLength(1);
+    await act(async () => repositoriesResult.resolve({
+      page: 1,
+      perPage: 30,
+      totalCount: 1,
+      items: [{ id: 20, owner: "octo-org", name: "web", defaultBranch: "main", private: true, archived: false, disabled: false }],
+    }));
+    expect(await screen.findByText(/^repositories page 1 loaded\. 1 result\.$/i)).toBe(repositoryStatus);
+
+    await selectRepository();
+    const branchStatus = screen.getByText(/^loading branches page 1\.$/i);
+    expect(screen.getAllByText(/^loading branches page 1\.$/i)).toHaveLength(1);
+    await act(async () => branchesResult.resolve({ page: 1, perPage: 30, items: [{ name: "main", sha: "abc123", protected: true }] }));
+    expect(await screen.findByText(/^branches page 1 loaded\. 1 result\.$/i)).toBe(branchStatus);
+  });
+
   it("uses one persistent atomic live region from device instructions through connection", async () => {
     vi.spyOn(api, "startGitHubConnection").mockResolvedValue({ connectionId: "new-connection", userCode: "ABCD-EFGH", verificationUri: "https://github.com/login/device", installUrl: "https://github.com/apps/rig/installations/new", expiresAt: "2099-01-01T00:00:00Z", pollIntervalSeconds: 1 });
     vi.spyOn(api, "pollGitHubConnection").mockResolvedValue({ ...connection, id: "new-connection", status: "connected" });
@@ -268,7 +342,7 @@ describe("SourceWizard", () => {
     const liveRegion = code.closest("[role='status']");
     expect(liveRegion?.getAttribute("aria-live")).toBe("polite");
     expect(liveRegion?.getAttribute("aria-atomic")).toBe("true");
-    expect(screen.getAllByRole("status")).toHaveLength(1);
+    expect(document.querySelectorAll(".connection-status[role='status']")).toHaveLength(1);
     expect(screen.getByRole("link", { name: /open github device authorization \(opens in a new tab\)/i }).getAttribute("rel")).toBe("noreferrer");
     expect(screen.getByRole("link", { name: /install or configure the rig github app \(opens in a new tab\)/i }).getAttribute("target")).toBe("_blank");
 
@@ -278,7 +352,7 @@ describe("SourceWizard", () => {
     const connectedRegion = screen.getByText(/connection status: connected/i).closest("[role='status']");
     expect(connectedRegion).toBe(liveRegion);
     expect(screen.queryByText("ABCD-EFGH")).toBeNull();
-    expect(screen.getAllByRole("status")).toHaveLength(1);
+    expect(document.querySelectorAll(".connection-status[role='status']")).toHaveLength(1);
 
     await act(async () => {
       client.setQueryData(["source-connections"], { items: [{ ...connection, id: "new-connection", status: "access_lost" }] });
@@ -309,7 +383,8 @@ describe("SourceWizard", () => {
     renderWizard();
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
     await screen.findByLabelText(/^github connection$/i);
-    const connectionRegion = screen.getByRole("status");
+    const connectionRegion = document.querySelector(".connection-status[role='status']");
+    if (!connectionRegion) throw new Error("Expected persistent connection status region");
     fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
 
     const expiration = await screen.findByText(/github authorization expired/i);
@@ -476,6 +551,51 @@ describe("SourceWizard", () => {
     expect(screen.getByRole("button", { name: /save application/i }).hasAttribute("disabled")).toBe(true);
   });
 
+  it("keeps the installation pagination and focused control stable while a page is loading", async () => {
+    const secondPage = deferred<Awaited<ReturnType<typeof api.githubInstallations>>>();
+    vi.mocked(api.githubInstallations).mockImplementation((_connectionId, page = 1) => page === 2
+      ? secondPage.promise
+      : Promise.resolve({
+          page: 1,
+          perPage: 30,
+          totalCount: 90,
+          items: [{ id: 10, accountLogin: "octo-org", accountType: "Organization", targetType: "Organization", repositorySelection: "selected" as const, cachedAt: "2026-01-01T00:00:00Z" }],
+        }));
+    renderWizard();
+    await selectConnectedGitHub();
+    await screen.findByRole("option", { name: /octo-org/i });
+
+    const pagination = screen.getByRole("navigation", { name: /github app installations pagination/i });
+    const previous = screen.getByRole("button", { name: /previous github app installations page/i }) as HTMLButtonElement;
+    const next = screen.getByRole("button", { name: /next github app installations page/i }) as HTMLButtonElement;
+    next.focus();
+    expect(document.activeElement).toBe(next);
+    fireEvent.click(next);
+
+    await waitFor(() => expect(api.githubInstallations).toHaveBeenLastCalledWith(connection.id, 2, 30));
+    expect(screen.getByRole("navigation", { name: /github app installations pagination/i })).toBe(pagination);
+    expect(screen.getByRole("button", { name: /previous github app installations page/i })).toBe(previous);
+    expect(screen.getByRole("button", { name: /next github app installations page/i })).toBe(next);
+    await waitFor(() => expect(pagination.getAttribute("aria-busy")).toBe("true"));
+    expect(previous.disabled).toBe(true);
+    expect(next.disabled).toBe(true);
+    expect(document.activeElement).toBe(next);
+    expect(screen.getAllByText(/^loading github app installations page 2\.$/i)).toHaveLength(1);
+
+    await act(async () => secondPage.resolve({
+      page: 2,
+      perPage: 30,
+      totalCount: 90,
+      items: [{ id: 11, accountLogin: "octo-two", accountType: "Organization", targetType: "Organization", repositorySelection: "selected", cachedAt: "2026-01-01T00:00:00Z" }],
+    }));
+    await screen.findByText(/^github app installations page 2 loaded\. 1 result\.$/i);
+    expect(screen.getByRole("navigation", { name: /github app installations pagination/i })).toBe(pagination);
+    expect(screen.getByRole("button", { name: /next github app installations page/i })).toBe(next);
+    expect(pagination.getAttribute("aria-busy")).toBe("false");
+    expect(next.disabled).toBe(false);
+    expect(document.activeElement).toBe(next);
+  });
+
   it("clears repository and all downstream state when the repository page changes", async () => {
     vi.mocked(api.githubRepositories).mockImplementation(async (_connectionId, _installationId, page = 1) => ({ page, perPage: 30, totalCount: 60, items: [{ id: page === 1 ? 20 : 21, owner: "octo-org", name: `web-${page}`, defaultBranch: "main", private: true, archived: false, disabled: false }] }));
     mockCleanInspection();
@@ -508,6 +628,43 @@ describe("SourceWizard", () => {
     expect(screen.queryByLabelText(/^compose file$/i)).toBeNull();
     expect(screen.queryByText(/source inspection completed/i)).toBeNull();
     expect(screen.getByRole("button", { name: /save application/i }).hasAttribute("disabled")).toBe(true);
+  });
+
+  it("retains Previous on an empty second branch page and returns to page one", async () => {
+    const firstPageBranches = Array.from({ length: 30 }, (_, index) => ({
+      name: index === 0 ? "main" : `branch-${index}`,
+      sha: `sha-${index}`,
+      protected: index === 0,
+    }));
+    vi.mocked(api.githubBranches).mockImplementation(async (_connectionId, _installationId, _repositoryId, page = 1) => ({
+      page,
+      perPage: 30,
+      items: page === 1 ? firstPageBranches : [],
+    }));
+    renderWizard();
+    await selectConnectedGitHub();
+    await selectInstallation();
+    await selectRepository();
+    await screen.findByRole("option", { name: /main/i });
+
+    fireEvent.click(screen.getByRole("button", { name: /next branches page/i }));
+    await screen.findByText(/^branches page 2 loaded\. 0 results\.$/i);
+    const pagination = screen.getByRole("navigation", { name: /branches pagination/i });
+    const previous = screen.getByRole("button", { name: /previous branches page/i }) as HTMLButtonElement;
+    const next = screen.getByRole("button", { name: /next branches page/i }) as HTMLButtonElement;
+    expect(pagination.textContent).toMatch(/page 2/i);
+    expect(previous.disabled).toBe(false);
+    expect(next.disabled).toBe(true);
+    expect(screen.getByText(/no branches found/i)).toBeTruthy();
+
+    fireEvent.click(previous);
+    await waitFor(() => expect(api.githubBranches).toHaveBeenLastCalledWith(connection.id, 10, 20, 1, 30));
+    await screen.findByText(/^branches page 1 loaded\. 30 results\.$/i);
+    expect(screen.getByRole("navigation", { name: /branches pagination/i })).toBe(pagination);
+    expect(pagination.textContent).toMatch(/page 1/i);
+    expect(previous.disabled).toBe(true);
+    expect(next.disabled).toBe(false);
+    expect(screen.getByRole("option", { name: /main/i })).toBeTruthy();
   });
 
   it("paginates installation results and honors device polling intervals without overlap", async () => {
