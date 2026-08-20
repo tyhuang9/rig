@@ -60,6 +60,18 @@ describe("API client", () => {
     );
   });
 
+  it("uses the generated configuration path and sends the exact revision request", async () => {
+    const response = { revisionNumber: 2, entries: [] };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(response), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const body = { expectedRevisionNumber: 1, variables: [{ key: "MODE", value: "prod" }], secrets: [], remove: ["OLD_TOKEN"] };
+    await api.replaceApplicationConfiguration("app/one", body);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/apps/app%2Fone/configuration",
+      expect.objectContaining({ method: "PUT", body: JSON.stringify(body), headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }),
+    );
+  });
+
   it("uses exact encoded source-connection paths and pagination queries", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ page: 2, perPage: 30, totalCount: 0, items: [] }), { status: 200 }),

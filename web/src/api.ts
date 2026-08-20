@@ -1,6 +1,7 @@
 import {
   operations,
   type Application,
+  type ApplicationConfiguration,
   type ApplicationList,
   type BootstrapRequest,
   type BootstrapStatus,
@@ -18,6 +19,7 @@ import {
   type LoginRequest,
   type MachineList,
   type MeResponse,
+  type ReplaceApplicationConfigurationRequest,
   type SessionResponse,
   type SourceConnection,
   type SourceConnectionList,
@@ -26,6 +28,7 @@ import {
 
 export type {
   Application,
+  ApplicationConfiguration,
   CreateApplicationRequest,
   GitHubBranch,
   GitHubDeviceAuthorization,
@@ -39,6 +42,7 @@ export type {
   SourceConnection,
   SystemStatus,
   User,
+  ReplaceApplicationConfigurationRequest,
 } from "./generated/api-contract";
 
 export class APIError extends Error {
@@ -141,6 +145,13 @@ export const api = {
   status: () => request<SystemStatus>(operations.systemStatus.path),
   apps: () => request<ApplicationList>(operations.listApplications.path),
   app: (id: string) => request<Application>(`/api/v1/apps/${id}`),
+  applicationConfiguration: (id: string) =>
+    request<ApplicationConfiguration>(operationPath(operations.getApplicationConfiguration.path, { appId: id })),
+  replaceApplicationConfiguration: (id: string, data: ReplaceApplicationConfigurationRequest) =>
+    request<ApplicationConfiguration>(operationPath(operations.replaceApplicationConfiguration.path, { appId: id }), {
+      method: operations.replaceApplicationConfiguration.method,
+      body: JSON.stringify(data),
+    }),
   createApp: (data: CreateApplicationRequest) =>
     request<Application>(operations.createApplication.path, { method: "POST", body: JSON.stringify(data) }),
   inspect: (data: InspectRequest) =>

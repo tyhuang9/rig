@@ -13,6 +13,7 @@ import {
   type User,
 } from "./api";
 import { SourceWizard } from "./source-wizard";
+import { ApplicationConfigurationPanel } from "./application-configuration";
 
 type IconName = "apps" | "machines" | "activity" | "logout";
 
@@ -178,6 +179,7 @@ function ApplicationDetailPage() {
     {fakeRuntime ? <div className="callout warning"><strong>Development capability</strong><span>The fake runtime persists job progress but executes no workload.</span></div> : <div className="callout info"><strong>Runtime actions unavailable</strong><span>Start hostd with the explicit development fake-runtime flag to exercise job orchestration.</span></div>}
     {deploy.data && <div className="callout success" role="status">Deployment job queued: <span className="mono">{deploy.data.job.id}</span></div>}
     {deploy.error && <div className="callout danger" role="alert">{deploy.error.message}</div>}
+    <ApplicationConfigurationPanel appId={id}/>
   </>;
 }
 
