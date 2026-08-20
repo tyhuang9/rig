@@ -25,6 +25,15 @@ type fakeSources struct {
 	calls   int
 }
 
+type failingSources struct {
+	fakeSources
+	err error
+}
+
+func (f *failingSources) DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error) {
+	return nil, f.err
+}
+
 type coordinatedSources struct {
 	archive []byte
 	mu      sync.Mutex
@@ -187,6 +196,26 @@ func TestIndependentMaterializersConvergeAndFinalizeUniqueReadyLoser(t *testing.
 	}
 	if ready != 1 || failed != 1 || materializing != 0 {
 		t.Fatalf("release states ready=%d failed=%d materializing=%d", ready, failed, materializing)
+	}
+}
+
+func TestMaterializePersistsOriginalProviderFailureTaxonomyAfterCleanup(t *testing.T) {
+	db := snapshotDB(t)
+	source := &failingSources{err: &sourceconnections.Error{Code: "provider_unavailable"}}
+	m, err := New(db, source, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Materialize(context.Background(), "owner", "11111111-1111-1111-1111-111111111111")
+	if !IsCode(err, "provider_unavailable") {
+		t.Fatalf("materialize error = %v", err)
+	}
+	var state, code string
+	if err := db.QueryRow(`SELECT workspace_state, materialization_error_code FROM releases`).Scan(&state, &code); err != nil {
+		t.Fatal(err)
+	}
+	if state != WorkspaceStateFailed || code != "provider_unavailable" {
+		t.Fatalf("failure persistence state=%q code=%q", state, code)
 	}
 }
 func snapshotDB(t *testing.T) *sql.DB {
