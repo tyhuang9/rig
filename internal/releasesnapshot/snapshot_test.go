@@ -6,9 +6,11 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/hostd/hostd/internal/database"
@@ -21,6 +23,33 @@ const snapshotSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 type fakeSources struct {
 	archive []byte
 	calls   int
+}
+
+type coordinatedSources struct {
+	archive []byte
+	mu      sync.Mutex
+	calls   int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (f *coordinatedSources) Resolve(context.Context, string, string, int64, int64, string) (sourceconnections.SourceRepository, sourceconnections.Branch, error) {
+	return sourceconnections.SourceRepository{ID: 7, Owner: "renamed", Name: "repo"}, sourceconnections.Branch{Name: "main", SHA: snapshotSHA}, nil
+}
+func (f *coordinatedSources) ReadTree(context.Context, string, string, int64, string) (githubapp.Tree, error) {
+	return githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "compose.yaml", Type: "blob", SHA: snapshotSHA}}}, nil
+}
+func (f *coordinatedSources) DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error) {
+	f.mu.Lock()
+	f.calls++
+	call := f.calls
+	f.mu.Unlock()
+	f.entered <- struct{}{}
+	<-f.release
+	if call > 2 {
+		return nil, errors.New("unexpected download")
+	}
+	return io.NopCloser(bytes.NewReader(f.archive)), nil
 }
 
 func (f *fakeSources) Resolve(context.Context, string, string, int64, int64, string) (sourceconnections.SourceRepository, sourceconnections.Branch, error) {
@@ -112,6 +141,52 @@ func TestRecoverFailsOnlyValidatedMaterializationStaging(t *testing.T) {
 	}
 	if err := m.removeStaging(app, "not-an-id"); err == nil {
 		t.Fatal("unsafe cleanup target accepted")
+	}
+}
+
+func TestIndependentMaterializersConvergeAndFinalizeUniqueReadyLoser(t *testing.T) {
+	db := snapshotDB(t)
+	source := &coordinatedSources{
+		archive: composeArchive(t, "services: {}\n"),
+		entered: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	root := t.TempDir()
+	first, err := New(db, source, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := New(db, source, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		release Release
+		err     error
+	}
+	results := make(chan result, 2)
+	app := "11111111-1111-1111-1111-111111111111"
+	go func() { r, err := first.Materialize(context.Background(), "owner", app); results <- result{r, err} }()
+	go func() { r, err := second.Materialize(context.Background(), "owner", app); results <- result{r, err} }()
+	<-source.entered
+	<-source.entered
+	close(source.release)
+	firstResult, secondResult := <-results, <-results
+	if firstResult.err != nil || secondResult.err != nil || firstResult.release.ID != secondResult.release.ID {
+		t.Fatalf("materializations = %#v %#v", firstResult, secondResult)
+	}
+	var ready, failed, materializing int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM releases WHERE workspace_state='ready'`).Scan(&ready); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM releases WHERE workspace_state='failed'`).Scan(&failed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM releases WHERE workspace_state='materializing'`).Scan(&materializing); err != nil {
+		t.Fatal(err)
+	}
+	if ready != 1 || failed != 1 || materializing != 0 {
+		t.Fatalf("release states ready=%d failed=%d materializing=%d", ready, failed, materializing)
 	}
 }
 func snapshotDB(t *testing.T) *sql.DB {

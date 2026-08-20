@@ -53,13 +53,24 @@ type Materializer struct {
 	dataRoot string
 	now      func() time.Time
 	locks    keyedLocks
+	fs       lifecycleFS
+}
+type lifecycleFS struct {
+	mkdirAll  func(string, os.FileMode) error
+	remove    func(string) error
+	removeAll func(string) error
+	rename    func(string, string) error
+}
+
+func realLifecycleFS() lifecycleFS {
+	return lifecycleFS{os.MkdirAll, os.Remove, os.RemoveAll, os.Rename}
 }
 
 func New(db *sql.DB, sources SourceReader, dataRoot string) (*Materializer, error) {
 	if db == nil || sources == nil || dataRoot == "" || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
 		return nil, errors.New("release snapshot data root must be absolute and clean")
 	}
-	return &Materializer{db: db, sources: sources, dataRoot: dataRoot, now: time.Now}, nil
+	return &Materializer{db: db, sources: sources, dataRoot: dataRoot, now: time.Now, fs: realLifecycleFS()}, nil
 }
 
 // Materialize resolves the app's tracked branch exactly once, then installs an
@@ -116,36 +127,39 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 		m.finalize(ctx, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	if err := os.MkdirAll(staging, 0o700); err != nil {
-		m.finalize(ctx, release.ID, "internal_error")
+	if err := m.fs.mkdirAll(staging, 0o700); err != nil {
+		m.abort(ctx, appID, release.ID)
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	defer func() {
-		if release.WorkspaceState != WorkspaceStateReady {
-			_ = m.removeStaging(appID, release.ID)
-		}
-	}()
 	body, err := m.sources.DownloadArchive(ctx, owner, source.connectionID, source.repositoryID, branch.SHA)
 	if err != nil {
-		m.finalize(ctx, release.ID, sourceError(err).(*Error).Code)
+		if m.abort(ctx, appID, release.ID) != nil {
+			return Release{}, &Error{Code: "internal_error"}
+		}
 		return Release{}, sourceError(err)
 	}
 	archivePath := filepath.Join(staging, "source.tar.gz.part")
 	hash, err := downloadArchive(ctx, body, archivePath)
 	if err != nil {
 		code := archiveError(err)
-		m.finalize(ctx, release.ID, code)
+		if m.abort(ctx, appID, release.ID) != nil {
+			return Release{}, &Error{Code: "internal_error"}
+		}
 		return Release{}, &Error{Code: code}
 	}
 	workspace := filepath.Join(staging, "workspace")
 	if err := extractArchive(ctx, archivePath, workspace); err != nil {
 		code := archiveError(err)
-		m.finalize(ctx, release.ID, code)
+		if m.abort(ctx, appID, release.ID) != nil {
+			return Release{}, &Error{Code: "internal_error"}
+		}
 		return Release{}, &Error{Code: code}
 	}
 	if err := validateComposeWorkspace(workspace, source.composePath); err != nil {
 		code := archiveError(err)
-		m.finalize(ctx, release.ID, code)
+		if m.abort(ctx, appID, release.ID) != nil {
+			return Release{}, &Error{Code: "internal_error"}
+		}
 		return Release{}, &Error{Code: code}
 	}
 	final, err := m.workspacePath(appID, release.ID)
@@ -153,20 +167,22 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 		m.finalize(ctx, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	if err := os.MkdirAll(filepath.Dir(filepath.Dir(final)), 0o700); err != nil {
-		m.finalize(ctx, release.ID, "internal_error")
+	if err := m.fs.mkdirAll(filepath.Dir(filepath.Dir(final)), 0o700); err != nil {
+		m.abort(ctx, appID, release.ID)
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	if err := os.Remove(archivePath); err != nil {
-		m.finalize(ctx, release.ID, "internal_error")
+	if err := m.fs.remove(archivePath); err != nil {
+		m.abort(ctx, appID, release.ID)
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	if err := os.Rename(staging, filepath.Dir(final)); err != nil {
-		m.finalize(ctx, release.ID, "internal_error")
+	if err := m.fs.rename(staging, filepath.Dir(final)); err != nil {
+		m.abort(ctx, appID, release.ID)
 		return Release{}, &Error{Code: "internal_error"}
 	}
 	if err := m.markReady(ctx, release.ID, hash, m.workspaceRelative(appID, release.ID)); err != nil {
-		_ = m.removeWorkspace(appID, release.ID)
+		if m.abort(ctx, appID, release.ID) != nil {
+			return Release{}, &Error{Code: "internal_error"}
+		}
 		if existing, lookupErr := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath); lookupErr == nil {
 			return existing, nil
 		}
@@ -296,6 +312,20 @@ func (m *Materializer) fail(ctx context.Context, id, code string) error {
 	_, err := m.db.ExecContext(ctx, `UPDATE releases SET status='failed',workspace_state='failed',materialization_error_code=? WHERE id=? AND workspace_state='materializing'`, code, id)
 	return err
 }
+
+// abort removes only generated paths before terminalizing. A cleanup or DB
+// failure intentionally leaves the row materializing for startup recovery.
+func (m *Materializer) abort(ctx context.Context, app, id string) error {
+	if err := m.removeStaging(app, id); err != nil {
+		return err
+	}
+	if err := m.removeWorkspace(app, id); err != nil {
+		return err
+	}
+	final, cancel := finalizeContext(ctx)
+	defer cancel()
+	return m.fail(final, id, "internal_error")
+}
 func (m *Materializer) finalize(ctx context.Context, id, code string) {
 	final, cancel := finalizeContext(ctx)
 	defer cancel()
@@ -319,14 +349,14 @@ func (m *Materializer) removeStaging(app, id string) error {
 	if err != nil {
 		return err
 	}
-	return os.RemoveAll(p)
+	return m.fs.removeAll(p)
 }
 func (m *Materializer) removeWorkspace(app, id string) error {
 	p, err := managedPath(m.dataRoot, app, id, "releases")
 	if err != nil {
 		return err
 	}
-	return os.RemoveAll(p)
+	return m.fs.removeAll(p)
 }
 func managedPath(root, app, id, kind string) (string, error) {
 	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root || !validAppID(app) || !validID(id) || (kind != "releases" && kind != ".staging") {
