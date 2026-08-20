@@ -143,6 +143,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
       setPendingStatus(connection.status);
       setSourceError("");
       await queryClient.invalidateQueries({ queryKey: ["source-connections"] });
+      setPendingStatus(undefined);
     },
     onError: (error) => setSourceError(safeMessage(error, "Could not refresh this connection.")),
   });
@@ -191,7 +192,10 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         setPendingStatus(connection.status);
         await queryClient.invalidateQueries({ queryKey: ["source-connections"] });
         if (connection.status === "pending") schedule(deviceAuthorization.pollIntervalSeconds);
-        else setDeviceAuthorization(null);
+        else {
+          setDeviceAuthorization(null);
+          setPendingStatus(undefined);
+        }
       } catch (error) {
         if (cancelled) return;
         if (error instanceof APIError && error.status === 429 && error.retryAfterSeconds) {
@@ -201,11 +205,13 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
           setDeviceAuthorization(null);
           setSourceError(error.detail);
           await queryClient.invalidateQueries({ queryKey: ["source-connections"] });
+          setPendingStatus(undefined);
         } else if (error instanceof APIError && error.code === "authorization_expired") {
           setPendingStatus("expired");
           setDeviceAuthorization(null);
           setSourceError(error.detail);
           await queryClient.invalidateQueries({ queryKey: ["source-connections"] });
+          setPendingStatus(undefined);
         } else {
           setSourceError(safeMessage(error, "Could not check GitHub authorization."));
           setDeviceAuthorization(null);
