@@ -68,12 +68,19 @@ func TestExtractArchiveRequiresOneSafeRootAndTrueEOF(t *testing.T) {
 		{{"repo/link", "", tar.TypeSymlink}},
 		{{"repo/CON.txt", "x", 0}},
 		{{"repo/control\x01", "x", 0}},
+		{{"repo/COM¹.txt", "x", 0}},
+		{{"repo/LPT³.txt", "x", 0}},
+		{{"repo/file", "x", 0}},
 		{{"repo/file", "x", 0}, {"repo/file/child", "x", 0}},
 	} {
 		p := testArchive(t, entries...)
 		if err := extractArchive(context.Background(), p, filepath.Join(t.TempDir(), "out")); err == nil {
 			t.Fatalf("unsafe archive accepted: %#v", entries)
 		}
+	}
+	noRoot := testArchive(t, archiveEntry{"repo/file", "x", 0})
+	if err := extractArchive(context.Background(), noRoot, filepath.Join(t.TempDir(), "out")); err == nil {
+		t.Fatal("file-first archive accepted")
 	}
 	trailing := testArchive(t, archiveEntry{"repo/a", "x", 0})
 	f, err := os.OpenFile(trailing, os.O_APPEND|os.O_WRONLY, 0)

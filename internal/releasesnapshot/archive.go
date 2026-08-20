@@ -19,6 +19,7 @@ import (
 const (
 	MaxCompressedBytes = 64 << 20
 	MaxExtractedBytes  = 256 << 20
+	MaxTarBytes        = MaxExtractedBytes + 64<<20 // payload plus bounded tar metadata/padding
 	MaxFileBytes       = 32 << 20
 	MaxArchiveEntries  = 20000
 	MaxPathDepth       = 64
@@ -64,7 +65,8 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 		return errors.New("invalid gzip")
 	}
 	gz.Multistream(false)
-	tr := tar.NewReader(gz)
+	limited := &tarLimitReader{r: gz, remaining: MaxTarBytes}
+	tr := tar.NewReader(limited)
 	if err := os.MkdirAll(destination, 0o700); err != nil {
 		return err
 	}
@@ -91,6 +93,9 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 		}
 		if h.Typeflag != tar.TypeDir && h.Typeflag != tar.TypeReg && h.Typeflag != tar.TypeRegA {
 			return errors.New("unsupported archive entry")
+		}
+		if h.Typeflag == tar.TypeDir && h.Size != 0 {
+			return errors.New("unsafe archive entry")
 		}
 		if h.Size < 0 || h.Size > MaxFileBytes || hasSparse(h) {
 			return errors.New("unsafe archive entry")
@@ -176,7 +181,10 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 			return errors.New("truncated tar entry")
 		}
 	}
-	if root == "" {
+	if limited.exhausted {
+		return errTooLarge
+	}
+	if root == "" || !rootHeader {
 		return errors.New("rootless archive")
 	}
 	// gzip's EOF check validates checksum. A single immutable stream is
@@ -224,7 +232,7 @@ func safeSegment(value string) bool {
 	}
 	base := strings.ToUpper(strings.Split(value, ".")[0])
 	switch base {
-	case "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+	case "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³":
 		return false
 	}
 	return true
@@ -258,4 +266,26 @@ func copyContext(ctx context.Context, w io.Writer, r io.Reader) (int64, error) {
 			return n, err
 		}
 	}
+}
+
+type tarLimitReader struct {
+	r         io.Reader
+	remaining int64
+	exhausted bool
+}
+
+func (r *tarLimitReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		r.exhausted = true
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:int(r.remaining)]
+	}
+	n, err := r.r.Read(p)
+	r.remaining -= int64(n)
+	if r.remaining == 0 && err == nil {
+		r.exhausted = true
+	}
+	return n, err
 }

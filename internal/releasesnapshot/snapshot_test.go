@@ -134,9 +134,6 @@ func snapshotDB(t *testing.T) *sql.DB {
 	if _, err := db.Exec(`INSERT INTO application_sources(application_id,source_type,connection_id,installation_id,repository_id,repository_owner,repository_name,tracked_branch,tracked_ref,compose_path,resolved_sha,created_at,updated_at) VALUES(?, 'github','0123456789abcdef0123456789abcdef',3,7,'old','repo','main','refs/heads/main','compose.yaml',?,datetime('now'),datetime('now'))`, app, snapshotSHA); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO application_source_owners(application_id,owner_user_id) VALUES (?,'owner')`, app); err != nil {
-		t.Fatal(err)
-	}
 	return db
 }
 func composeArchive(t *testing.T, compose string) []byte {

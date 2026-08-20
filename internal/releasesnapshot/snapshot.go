@@ -225,7 +225,7 @@ type appSource struct {
 
 func (m *Materializer) appSource(ctx context.Context, owner, appID string) (appSource, error) {
 	var s appSource
-	err := m.db.QueryRowContext(ctx, `SELECT s.source_type,COALESCE(s.connection_id,''),COALESCE(s.installation_id,0),COALESCE(s.repository_id,0),COALESCE(s.tracked_branch,''),COALESCE(s.compose_path,'') FROM application_sources s JOIN application_source_owners o ON o.application_id=s.application_id WHERE s.application_id=? AND o.owner_user_id=?`, appID, owner).Scan(&s.typeName, &s.connectionID, &s.installationID, &s.repositoryID, &s.branch, &s.composePath)
+	err := m.db.QueryRowContext(ctx, `SELECT s.source_type,COALESCE(s.connection_id,''),COALESCE(s.installation_id,0),COALESCE(s.repository_id,0),COALESCE(s.tracked_branch,''),COALESCE(s.compose_path,'') FROM application_sources s JOIN source_connections c ON c.id=s.connection_id AND c.owner_user_id=? WHERE s.application_id=?`, owner, appID).Scan(&s.typeName, &s.connectionID, &s.installationID, &s.repositoryID, &s.branch, &s.composePath)
 	return s, err
 }
 func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, compose string) (Release, error) {
@@ -235,7 +235,7 @@ func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, c
 		return r, err
 	}
 	expected, pathErr := m.workspacePath(app, r.ID)
-	if pathErr != nil || r.WorkspacePath != m.workspaceRelative(app, r.ID) || !safeWorkspace(expected, compose) {
+	if pathErr != nil || r.WorkspacePath != m.workspaceRelative(app, r.ID) || !safeWorkspace(expected, compose) || validateComposeWorkspace(expected, compose) != nil {
 		if pathErr == nil {
 			if err := m.removeWorkspace(app, r.ID); err != nil {
 				return Release{}, err
