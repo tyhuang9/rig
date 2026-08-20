@@ -69,8 +69,9 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 		return err
 	}
 	var root string
+	rootHeader := false
 	seen := map[string]struct{}{}
-	caseFolded := map[string]struct{}{}
+	caseFolded := map[string]bool{}
 	var entries int
 	var total int64
 	for {
@@ -109,9 +110,10 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 			return errors.New("multiple archive roots")
 		}
 		if len(parts) == 1 {
-			if h.Typeflag != tar.TypeDir {
+			if h.Typeflag != tar.TypeDir || rootHeader {
 				return errors.New("root is not directory")
 			}
+			rootHeader = true
 			continue
 		}
 		rel := strings.Join(parts[1:], "/")
@@ -120,10 +122,18 @@ func extractArchive(ctx context.Context, archivePath, destination string) error 
 		}
 		seen[rel] = struct{}{}
 		fold := strings.ToLower(rel)
+		partsFold := strings.Split(fold, "/")
+		for i := 1; i < len(partsFold); i++ {
+			prefix := strings.Join(partsFold[:i], "/")
+			if isFile, ok := caseFolded[prefix]; ok && isFile {
+				return errors.New("case-folding archive collision")
+			}
+			caseFolded[prefix] = false
+		}
 		if _, ok := caseFolded[fold]; ok {
 			return errors.New("case-folding archive collision")
 		}
-		caseFolded[fold] = struct{}{}
+		caseFolded[fold] = h.Typeflag != tar.TypeDir
 		out := filepath.Join(destination, filepath.FromSlash(rel))
 		if !within(destination, out) {
 			return errors.New("workspace escape")
@@ -202,7 +212,12 @@ func safeSegment(value string) bool {
 	if value == "" || value == "." || value == ".." || len(value) > MaxSegmentBytes || strings.HasSuffix(value, ".") || strings.HasSuffix(value, " ") || strings.ContainsAny(value, "<>:\"|?*") {
 		return false
 	}
-	base := strings.TrimSuffix(strings.ToUpper(value), ".")
+	for _, r := range value {
+		if r < 0x20 {
+			return false
+		}
+	}
+	base := strings.ToUpper(strings.Split(value, ".")[0])
 	switch base {
 	case "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
 		return false

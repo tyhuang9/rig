@@ -10,7 +10,7 @@ import (
 )
 
 func validateComposeWorkspace(workspace, composePath string) error {
-	if composePath == "" || strings.Contains(composePath, "${") {
+	if composePath == "" || strings.ContainsAny(composePath, "$\\:") || filepath.IsAbs(composePath) || filepath.ToSlash(filepath.Clean(composePath)) != composePath {
 		return errors.New("unsafe compose path")
 	}
 	compose := filepath.Join(workspace, filepath.FromSlash(composePath))
@@ -64,12 +64,21 @@ func validateServicePaths(workspace, base string, service *yaml.Node) error {
 				return err
 			}
 		} else if build.Kind == yaml.MappingNode {
-			for _, key := range []string{"context", "dockerfile"} {
-				if v := mapValue(build, key); v != nil {
-					if err := validatePathNode(workspace, base, v, key == "context"); err != nil {
-						return err
-					}
+			contextPath := base
+			if v := mapValue(build, "context"); v != nil {
+				var err error
+				contextPath, err = resolvePathNode(workspace, base, v, true)
+				if err != nil {
+					return err
 				}
+			}
+			if v := mapValue(build, "dockerfile"); v != nil {
+				if _, err := resolvePathNode(workspace, contextPath, v, false); err != nil {
+					return err
+				}
+			}
+			if mapValue(build, "additional_contexts") != nil {
+				return errors.New("unsupported additional contexts")
 			}
 		} else {
 			return errors.New("invalid build")
@@ -100,28 +109,32 @@ func validateServicePaths(workspace, base string, service *yaml.Node) error {
 	return nil
 }
 func validatePathNode(workspace, base string, node *yaml.Node, wantDir bool) error {
+	_, err := resolvePathNode(workspace, base, node, wantDir)
+	return err
+}
+func resolvePathNode(workspace, base string, node *yaml.Node, wantDir bool) (string, error) {
 	if node == nil || node.Kind != yaml.ScalarNode {
-		return errors.New("invalid compose path")
+		return "", errors.New("invalid compose path")
 	}
 	value := strings.TrimSpace(node.Value)
-	if value == "" || strings.Contains(value, "${") || strings.Contains(value, "}") || strings.Contains(value, "://") || strings.HasPrefix(value, "git@") || filepath.IsAbs(value) || strings.HasPrefix(value, "\\") || (len(value) > 1 && value[1] == ':') {
-		return errors.New("unsafe compose path")
+	if value == "" || strings.ContainsAny(value, "$\\:") || strings.HasPrefix(value, "git@") || filepath.IsAbs(value) || strings.HasPrefix(value, "/") {
+		return "", errors.New("unsafe compose path")
 	}
 	candidate := filepath.Join(base, filepath.FromSlash(strings.ReplaceAll(value, "\\", "/")))
 	if !within(workspace, candidate) {
-		return errors.New("workspace escape")
+		return "", errors.New("workspace escape")
 	}
 	info, err := os.Stat(candidate)
 	if err != nil {
-		return errors.New("compose path not found")
+		return "", errors.New("compose path not found")
 	}
 	if wantDir && !info.IsDir() {
-		return errors.New("compose build context is not directory")
+		return "", errors.New("compose build context is not directory")
 	}
 	if !wantDir && info.IsDir() {
-		return errors.New("compose resource is not file")
+		return "", errors.New("compose resource is not file")
 	}
-	return nil
+	return candidate, nil
 }
 func mappingRoot(document *yaml.Node) *yaml.Node {
 	if document.Kind == yaml.DocumentNode && len(document.Content) == 1 && document.Content[0].Kind == yaml.MappingNode {

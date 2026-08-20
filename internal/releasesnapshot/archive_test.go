@@ -66,6 +66,9 @@ func TestExtractArchiveRequiresOneSafeRootAndTrueEOF(t *testing.T) {
 		{{"repo/a", "x", 0}, {"repo/A", "x", 0}},
 		{{"repo/../escape", "x", 0}},
 		{{"repo/link", "", tar.TypeSymlink}},
+		{{"repo/CON.txt", "x", 0}},
+		{{"repo/control\x01", "x", 0}},
+		{{"repo/file", "x", 0}, {"repo/file/child", "x", 0}},
 	} {
 		p := testArchive(t, entries...)
 		if err := extractArchive(context.Background(), p, filepath.Join(t.TempDir(), "out")); err == nil {
@@ -81,6 +84,28 @@ func TestExtractArchiveRequiresOneSafeRootAndTrueEOF(t *testing.T) {
 	_ = f.Close()
 	if err := extractArchive(context.Background(), trailing, filepath.Join(t.TempDir(), "out")); err == nil {
 		t.Fatal("trailing bytes accepted")
+	}
+}
+
+func TestExtractArchiveRejectsConcatenatedAndCorruptGzip(t *testing.T) {
+	first := testArchive(t, archiveEntry{"repo/a", "x", 0})
+	second := testArchive(t, archiveEntry{"repo/b", "x", 0})
+	a, _ := os.ReadFile(first)
+	b, _ := os.ReadFile(second)
+	if err := os.WriteFile(first, append(a, b...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := extractArchive(context.Background(), first, filepath.Join(t.TempDir(), "out")); err == nil {
+		t.Fatal("concatenated gzip members accepted")
+	}
+	corrupt := testArchive(t, archiveEntry{"repo/a", "x", 0})
+	raw, _ := os.ReadFile(corrupt)
+	raw[len(raw)-1] ^= 0xff
+	if err := os.WriteFile(corrupt, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := extractArchive(context.Background(), corrupt, filepath.Join(t.TempDir(), "out")); err == nil {
+		t.Fatal("corrupt gzip accepted")
 	}
 }
 
@@ -101,6 +126,7 @@ func TestValidateComposeWorkspaceRejectsDynamicAndEscapingPaths(t *testing.T) {
 	}
 	for _, body := range []string{
 		"services:\n  app:\n    build: ${CONTEXT}\n",
+		"services:\n  app:\n    build: $CONTEXT\n",
 		"services:\n  app:\n    env_file: ../outside.env\n",
 		"include: other.yaml\nservices: {}\n",
 		"configs:\n  x:\n    file: https://example.test/x\nservices: {}\n",

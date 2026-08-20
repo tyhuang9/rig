@@ -152,8 +152,11 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 		m.fail(context.Background(), release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	if err := m.markReady(ctx, release.ID, hash, final); err != nil {
-		_ = os.RemoveAll(final)
+	if err := m.markReady(ctx, release.ID, hash, m.workspaceRelative(appID, release.ID)); err != nil {
+		_ = m.removeWorkspace(appID, release.ID)
+		if existing, lookupErr := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath); lookupErr == nil {
+			return existing, nil
+		}
 		m.fail(context.Background(), release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
@@ -166,18 +169,29 @@ func (m *Materializer) Recover() error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	var interrupted []Release
 	for rows.Next() {
 		var id, app string
 		if err := rows.Scan(&id, &app); err != nil {
 			return err
 		}
+		if !validID(id) || !validAppID(app) {
+			return errors.New("invalid materialization row")
+		}
+		interrupted = append(interrupted, Release{ID: id, AppID: app})
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, release := range interrupted {
+		id, app := release.ID, release.AppID
 		_ = m.removeStaging(app, id)
+		_ = m.removeWorkspace(app, id)
 		if err := m.fail(context.Background(), id, "internal_error"); err != nil {
 			return err
 		}
 	}
-	return rows.Err()
+	return nil
 }
 
 type appSource struct {
@@ -193,7 +207,16 @@ func (m *Materializer) appSource(ctx context.Context, appID string) (appSource, 
 func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, compose string) (Release, error) {
 	var r Release
 	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_path,''),workspace_state FROM releases WHERE app_id=? AND repository_id=? AND resolved_sha=? AND compose_path=? AND workspace_state='ready'`, app, repo, sha, compose).Scan(&r.ID, &r.AppID, &r.RepositoryID, &r.ResolvedSHA, &r.ComposePath, &r.ArchiveSHA256, &r.WorkspacePath, &r.WorkspaceState)
-	return r, err
+	if err != nil {
+		return r, err
+	}
+	expected, pathErr := m.workspacePath(app, r.ID)
+	if pathErr != nil || r.WorkspacePath != m.workspaceRelative(app, r.ID) || !safeWorkspace(expected, compose) {
+		_, _ = m.db.ExecContext(ctx, `UPDATE releases SET status='failed',workspace_state='failed',materialization_error_code='invalid_source' WHERE id=? AND workspace_state='ready'`, r.ID)
+		return Release{}, sql.ErrNoRows
+	}
+	r.WorkspacePath = expected
+	return r, nil
 }
 func (m *Materializer) reserve(ctx context.Context, app string, source appSource, repository sourceconnections.SourceRepository, branch sourceconnections.Branch) (Release, error) {
 	id, err := randomID()
@@ -201,12 +224,20 @@ func (m *Materializer) reserve(ctx context.Context, app string, source appSource
 		return Release{}, err
 	}
 	now := m.now().UTC().Format(time.RFC3339Nano)
-	_, err = m.db.ExecContext(ctx, `INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,compose_path,workspace_state) VALUES(?,?,?,?,'materializing','{}',?,'github',?,?,?,?,?,?,?,?)`, id, app, branch.SHA, branch.Name, now, repository.ID, repository.Owner, repository.Name, "refs/heads/"+branch.Name, branch.SHA, source.composePath, WorkspaceStateMaterializing)
+	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Release{}, err
 	}
-	_, err = m.db.ExecContext(ctx, `UPDATE application_sources SET repository_owner=?,repository_name=?,resolved_sha=?,updated_at=? WHERE application_id=?`, repository.Owner, repository.Name, branch.SHA, now, app)
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,compose_path,workspace_state) VALUES(?,?,?,?,'materializing','{}',?,'github',?,?,?,?,?,?,?)`, id, app, branch.SHA, branch.Name, now, repository.ID, repository.Owner, repository.Name, "refs/heads/"+branch.Name, branch.SHA, source.composePath, WorkspaceStateMaterializing)
 	if err != nil {
+		return Release{}, err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE application_sources SET repository_owner=?,repository_name=?,resolved_sha=?,updated_at=? WHERE application_id=?`, repository.Owner, repository.Name, branch.SHA, now, app)
+	if err != nil {
+		return Release{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return Release{}, err
 	}
 	return Release{ID: id, AppID: app, RepositoryID: repository.ID, ResolvedSHA: branch.SHA, ComposePath: source.composePath, WorkspaceState: WorkspaceStateMaterializing}, nil
@@ -229,11 +260,21 @@ func (m *Materializer) fail(ctx context.Context, id, code string) error {
 func (m *Materializer) workspacePath(app, id string) (string, error) {
 	return managedPath(m.dataRoot, app, id, "releases")
 }
+func (m *Materializer) workspaceRelative(app, id string) string {
+	return filepath.ToSlash(filepath.Join("apps", app, "releases", id))
+}
 func (m *Materializer) stagingPath(app, id string) (string, error) {
 	return managedPath(m.dataRoot, app, id, ".staging")
 }
 func (m *Materializer) removeStaging(app, id string) error {
 	p, err := m.stagingPath(app, id)
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(p)
+}
+func (m *Materializer) removeWorkspace(app, id string) error {
+	p, err := m.workspacePath(app, id)
 	if err != nil {
 		return err
 	}
@@ -304,6 +345,14 @@ func archiveError(err error) string {
 		return e.Code
 	}
 	return "invalid_source"
+}
+func safeWorkspace(workspace, compose string) bool {
+	info, err := os.Lstat(workspace)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	info, err = os.Lstat(filepath.Join(workspace, filepath.FromSlash(compose)))
+	return err == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0
 }
 
 type keyedLocks struct {
