@@ -159,8 +159,8 @@ func TestArchiveFollowsOnlyCanonicalCodeloadWithoutAuthorization(t *testing.T) {
 	if got, _ := io.ReadAll(body); string(got) != "archive" || calls != 2 {
 		t.Fatalf("archive = %q calls=%d", got, calls)
 	}
-	for _, location := range []string{"http://codeload.github.com/a", "https://codeload.github.com:443/a", "https://user@codeload.github.com/a", "https://codeload.github.com/a?token=x", "https://evil.example/a", "https://codeload.github.com/a/../b"} {
-		if _, err := validArchiveRedirect(location); err == nil {
+	for _, location := range []string{"http://codeload.github.com/a", "https://codeload.github.com:443/a", "https://user@codeload.github.com/a", "https://codeload.github.com/a?token=x", "https://evil.example/a", "https://codeload.github.com/a/../b", "https://codeload.github.com/octo/repo/tar.gz/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "/relative"} {
+		if _, err := validArchiveRedirect(location, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); err == nil {
 			t.Fatalf("unsafe redirect accepted: %q", location)
 		}
 	}

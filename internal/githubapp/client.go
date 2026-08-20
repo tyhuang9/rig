@@ -134,10 +134,10 @@ func (c *Client) Archive(ctx context.Context, accessToken string, repositoryID i
 	request.Header.Set("Authorization", "Bearer "+accessToken)
 	request.Header.Set("X-GitHub-Api-Version", APIVersion)
 	request.Header.Set("User-Agent", userAgent)
-	return c.archiveRequest(request, true)
+	return c.archiveRequest(request, true, sha)
 }
 
-func (c *Client) archiveRequest(request *http.Request, initial bool) (io.ReadCloser, error) {
+func (c *Client) archiveRequest(request *http.Request, initial bool, sha string) (io.ReadCloser, error) {
 	for redirects := 0; ; redirects++ {
 		response, err := c.client.Do(request)
 		if err != nil {
@@ -149,7 +149,7 @@ func (c *Client) archiveRequest(request *http.Request, initial bool) (io.ReadClo
 			if !initial || redirects >= maxArchiveRedirects {
 				return nil, &Error{Code: "provider_rejected"}
 			}
-			next, err := validArchiveRedirect(location)
+			next, err := validArchiveRedirect(location, sha)
 			if err != nil {
 				return nil, &Error{Code: "provider_rejected"}
 			}
@@ -170,9 +170,9 @@ func (c *Client) archiveRequest(request *http.Request, initial bool) (io.ReadClo
 	}
 }
 
-func validArchiveRedirect(value string) (*url.URL, error) {
+func validArchiveRedirect(value, sha string) (*url.URL, error) {
 	u, err := url.Parse(value)
-	if err != nil || u.Scheme != "https" || u.Host != "codeload.github.com" || u.User != nil || u.Port() != "" || u.RawQuery != "" || u.Fragment != "" || !strings.HasPrefix(u.Path, "/") || path.Clean(u.Path) != u.Path {
+	if err != nil || !validSHA(sha) || u.Scheme != "https" || u.Host != "codeload.github.com" || u.User != nil || u.Port() != "" || u.RawQuery != "" || u.Fragment != "" || !strings.HasPrefix(u.Path, "/") || path.Clean(u.Path) != u.Path || !strings.HasSuffix(u.Path, "/"+sha) {
 		return nil, errors.New("unsafe archive redirect")
 	}
 	return u, nil
