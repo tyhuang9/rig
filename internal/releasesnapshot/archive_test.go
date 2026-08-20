@@ -162,6 +162,36 @@ func TestExtractArchiveBoundsPostTarDecompression(t *testing.T) {
 	}
 }
 
+type failingReadCloser struct{ reads int }
+
+func (f *failingReadCloser) Read(p []byte) (int, error) {
+	if f.reads == 0 {
+		f.reads++
+		copy(p, "abc")
+		return 3, nil
+	}
+	return 0, errors.New("network")
+}
+func (*failingReadCloser) Close() error { return nil }
+func TestDownloadArchiveClassifiesProviderFailureAndCleansPartial(t *testing.T) {
+	destination := filepath.Join(t.TempDir(), "archive.part")
+	_, err := downloadArchive(context.Background(), &failingReadCloser{}, destination)
+	if !errors.Is(err, errProvider) {
+		t.Fatalf("download error=%v", err)
+	}
+	if _, stat := os.Stat(destination); !os.IsNotExist(stat) {
+		t.Fatalf("partial archive remains: %v", stat)
+	}
+	good := io.NopCloser(bytes.NewReader([]byte("exact bytes")))
+	hash, err := downloadArchive(context.Background(), good, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash != "e38e581aade78b64cc86f7ac9f3555ca78c2dcca747942a7f1d9b3275a834f75" {
+		t.Fatalf("hash=%s", hash)
+	}
+}
+
 func TestValidateComposeWorkspaceRejectsDynamicAndEscapingPaths(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "app"), 0o700); err != nil {

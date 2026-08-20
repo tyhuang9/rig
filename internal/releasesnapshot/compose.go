@@ -2,6 +2,7 @@ package releasesnapshot
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,8 +18,8 @@ func validateComposeWorkspace(workspace, composePath string) error {
 	if !within(workspace, compose) {
 		return errors.New("workspace escape")
 	}
-	contents, err := os.ReadFile(compose)
-	if err != nil || len(contents) > 1<<20 {
+	contents, err := readRegularLimited(workspace, compose, 1<<20)
+	if err != nil {
 		return errors.New("compose not found")
 	}
 	var document yaml.Node
@@ -186,7 +187,10 @@ func resolvePathNode(workspace, base string, node *yaml.Node, wantDir bool) (str
 	if !within(workspace, candidate) {
 		return "", errors.New("workspace escape")
 	}
-	info, err := os.Stat(candidate)
+	if !safeNoLink(workspace, candidate) {
+		return "", errors.New("unsafe compose path")
+	}
+	info, err := os.Lstat(candidate)
 	if err != nil {
 		return "", errors.New("compose path not found")
 	}
@@ -197,6 +201,49 @@ func resolvePathNode(workspace, base string, node *yaml.Node, wantDir bool) (str
 		return "", errors.New("compose resource is not file")
 	}
 	return candidate, nil
+}
+func readRegularLimited(workspace, path string, limit int64) ([]byte, error) {
+	if !safeNoLink(workspace, path) {
+		return nil, errors.New("unsafe compose path")
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, errors.New("compose not found")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, errors.New("compose not found")
+	}
+	defer f.Close()
+	body, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil || int64(len(body)) > limit {
+		return nil, errors.New("compose not found")
+	}
+	return body, nil
+}
+func safeNoLink(root, target string) bool {
+	if !within(root, target) {
+		return false
+	}
+	if info, err := os.Lstat(root); err != nil || info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	relative, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	current := root
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return false
+		}
+	}
+	return true
 }
 func mappingRoot(document *yaml.Node) *yaml.Node {
 	if document.Kind == yaml.DocumentNode && len(document.Content) == 1 && document.Content[0].Kind == yaml.MappingNode {

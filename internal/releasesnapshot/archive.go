@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path"
@@ -27,28 +28,65 @@ const (
 	MaxSegmentBytes    = 255
 )
 
-var errTooLarge = errors.New("archive too large")
+var (
+	errTooLarge = errors.New("archive too large")
+	errProvider = errors.New("archive provider stream")
+	errLocal    = errors.New("archive local io")
+)
 
 func downloadArchive(ctx context.Context, body io.ReadCloser, destination string) (string, error) {
 	defer body.Close()
 	f, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: create", errLocal)
 	}
 	h := sha256.New()
-	written, err := copyContext(ctx, io.MultiWriter(f, h), io.LimitReader(body, MaxCompressedBytes+1))
-	closeErr := f.Close()
-	if err != nil {
-		_ = os.Remove(destination)
-		return "", err
+	var written int64
+	buf := make([]byte, 32<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = f.Close()
+			if removeErr := os.Remove(destination); removeErr != nil {
+				return "", fmt.Errorf("%w: cleanup", errLocal)
+			}
+			return "", err
+		}
+		n, readErr := body.Read(buf)
+		if n > 0 {
+			w, writeErr := f.Write(buf[:n])
+			if writeErr != nil || w != n {
+				_ = f.Close()
+				if removeErr := os.Remove(destination); removeErr != nil {
+					return "", fmt.Errorf("%w: cleanup", errLocal)
+				}
+				return "", fmt.Errorf("%w: write", errLocal)
+			}
+			_, _ = h.Write(buf[:n])
+			written += int64(n)
+			if written > MaxCompressedBytes {
+				_ = f.Close()
+				if removeErr := os.Remove(destination); removeErr != nil {
+					return "", fmt.Errorf("%w: cleanup", errLocal)
+				}
+				return "", errTooLarge
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			_ = f.Close()
+			if removeErr := os.Remove(destination); removeErr != nil {
+				return "", fmt.Errorf("%w: cleanup", errLocal)
+			}
+			return "", fmt.Errorf("%w: read", errProvider)
+		}
 	}
-	if closeErr != nil {
-		_ = os.Remove(destination)
-		return "", closeErr
-	}
-	if written > MaxCompressedBytes {
-		_ = os.Remove(destination)
-		return "", errTooLarge
+	if closeErr := f.Close(); closeErr != nil {
+		if removeErr := os.Remove(destination); removeErr != nil {
+			return "", fmt.Errorf("%w: cleanup", errLocal)
+		}
+		return "", fmt.Errorf("%w: close", errLocal)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

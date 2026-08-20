@@ -389,8 +389,17 @@ func sourceError(err error) error {
 	return &Error{Code: "provider_unavailable"}
 }
 func archiveError(err error) string {
+	if errors.Is(err, errTooLarge) {
+		return "source_too_large"
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return "canceled"
+	}
+	if errors.Is(err, errProvider) {
+		return "provider_unavailable"
+	}
+	if errors.Is(err, errLocal) {
+		return "internal_error"
 	}
 	var e *Error
 	if errors.As(err, &e) {
