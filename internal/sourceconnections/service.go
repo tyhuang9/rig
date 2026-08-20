@@ -396,6 +396,9 @@ func (service *Service) DownloadArchive(ctx context.Context, owner, id string, r
 	if err != nil {
 		return nil, sourceOperationError(err, true)
 	}
+	if result == nil {
+		return nil, &Error{Code: "provider_unavailable"}
+	}
 	return result, nil
 }
 

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 type archiveEntry struct {
@@ -84,7 +86,7 @@ func TestExtractArchiveRequiresOneSafeRootAndTrueEOF(t *testing.T) {
 	if err := extractArchive(context.Background(), noRoot, filepath.Join(t.TempDir(), "out")); err == nil {
 		t.Fatal("file-first archive accepted")
 	}
-	trailing := testArchive(t, archiveEntry{"repo/a", "x", 0})
+	trailing := testArchive(t, archiveEntry{"repo/", "", tar.TypeDir}, archiveEntry{"repo/a", "x", 0})
 	f, err := os.OpenFile(trailing, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -97,8 +99,8 @@ func TestExtractArchiveRequiresOneSafeRootAndTrueEOF(t *testing.T) {
 }
 
 func TestExtractArchiveRejectsConcatenatedAndCorruptGzip(t *testing.T) {
-	first := testArchive(t, archiveEntry{"repo/a", "x", 0})
-	second := testArchive(t, archiveEntry{"repo/b", "x", 0})
+	first := testArchive(t, archiveEntry{"repo/", "", tar.TypeDir}, archiveEntry{"repo/a", "x", 0})
+	second := testArchive(t, archiveEntry{"repo/", "", tar.TypeDir}, archiveEntry{"repo/b", "x", 0})
 	a, _ := os.ReadFile(first)
 	b, _ := os.ReadFile(second)
 	if err := os.WriteFile(first, append(a, b...), 0o600); err != nil {
@@ -107,7 +109,7 @@ func TestExtractArchiveRejectsConcatenatedAndCorruptGzip(t *testing.T) {
 	if err := extractArchive(context.Background(), first, filepath.Join(t.TempDir(), "out")); err == nil {
 		t.Fatal("concatenated gzip members accepted")
 	}
-	corrupt := testArchive(t, archiveEntry{"repo/a", "x", 0})
+	corrupt := testArchive(t, archiveEntry{"repo/", "", tar.TypeDir}, archiveEntry{"repo/a", "x", 0})
 	raw, _ := os.ReadFile(corrupt)
 	raw[len(raw)-1] ^= 0xff
 	if err := os.WriteFile(corrupt, raw, 0o600); err != nil {
@@ -380,5 +382,44 @@ func TestValidateComposeWorkspaceRejectsDynamicAndEscapingPaths(t *testing.T) {
 		if err := validateComposeWorkspace(filepath.Join(root, "app"), "compose.yaml"); err == nil {
 			t.Fatalf("unsafe compose accepted: %s", strings.TrimSpace(body))
 		}
+	}
+}
+
+func TestSafeYAMLLimitsExactAndOneOver(t *testing.T) {
+	chain := &yaml.Node{Kind: yaml.ScalarNode, Value: "leaf"}
+	for i := 0; i < 3; i++ {
+		chain = &yaml.Node{Kind: yaml.SequenceNode, Content: []*yaml.Node{chain}}
+	}
+	count := 0
+	if !safeYAMLWithLimits(chain, 0, &count, 3, 4) {
+		t.Fatal("exact depth/node boundary rejected")
+	}
+	chain = &yaml.Node{Kind: yaml.SequenceNode, Content: []*yaml.Node{chain}}
+	count = 0
+	if safeYAMLWithLimits(chain, 0, &count, 3, 5) {
+		t.Fatal("depth overage accepted")
+	}
+	nodes := &yaml.Node{Kind: yaml.SequenceNode}
+	for i := 0; i < 4; i++ {
+		nodes.Content = append(nodes.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: "x"})
+	}
+	count = 0
+	if !safeYAMLWithLimits(nodes, 0, &count, 2, 5) {
+		t.Fatal("exact node boundary rejected")
+	}
+	nodes.Content = append(nodes.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: "x"})
+	count = 0
+	if safeYAMLWithLimits(nodes, 0, &count, 2, 5) {
+		t.Fatal("node overage accepted")
+	}
+}
+func TestValidateComposeWorkspaceRejectsMultipleDocuments(t *testing.T) {
+	root := t.TempDir()
+	body := "services: {}\n---\nservices: {}\n"
+	if err := os.WriteFile(filepath.Join(root, "compose.yaml"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateComposeWorkspace(root, "compose.yaml"); err == nil {
+		t.Fatal("multiple YAML documents accepted")
 	}
 }

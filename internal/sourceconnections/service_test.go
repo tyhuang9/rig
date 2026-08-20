@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -100,6 +101,18 @@ func (provider *fakeProvider) Tree(context.Context, string, int64, string) (gith
 }
 func (provider *fakeProvider) Content(context.Context, string, int64, string, string) ([]byte, error) {
 	return nil, nil
+}
+func (provider *fakeProvider) Archive(context.Context, string, int64, string) (io.ReadCloser, error) {
+	return nil, nil
+}
+
+func TestDownloadArchiveRejectsNilProviderBody(t *testing.T) {
+	service, _, clock, _, _ := testService(t)
+	connection := connectService(t, service, clock)
+	body, err := service.DownloadArchive(context.Background(), "owner", connection.ID, 7, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if body != nil || !IsCode(err, "provider_unavailable") {
+		t.Fatalf("body=%v err=%v", body, err)
+	}
 }
 
 type testClock struct {

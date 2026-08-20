@@ -26,7 +26,6 @@ const (
 	maxTreeResponseBytes      = 4 << 20
 	maxContentResponseBytes   = 2 << 20
 	maxCredentialLen          = 4096
-	maxArchiveRedirects       = 3
 	archiveTimeout            = 5 * time.Minute
 	maxAccessLifetimeSeconds  = 7 * 24 * 60 * 60
 	maxRefreshLifetimeSeconds = 2 * 365 * 24 * 60 * 60
@@ -144,7 +143,7 @@ func (c *Client) Archive(ctx context.Context, accessToken string, repositoryID i
 }
 
 func (c *Client) archiveRequest(client *http.Client, request *http.Request, initial bool, sha string) (io.ReadCloser, error) {
-	for redirects := 0; ; redirects++ {
+	for {
 		response, err := client.Do(request)
 		if err != nil {
 			return nil, &Error{Code: "provider_unavailable"}
@@ -152,7 +151,7 @@ func (c *Client) archiveRequest(client *http.Client, request *http.Request, init
 		if response.StatusCode >= 300 && response.StatusCode < 400 {
 			location := response.Header.Get("Location")
 			response.Body.Close()
-			if !initial || redirects >= maxArchiveRedirects {
+			if !initial {
 				return nil, &Error{Code: "provider_rejected"}
 			}
 			next, err := validArchiveRedirect(location, sha)

@@ -1,6 +1,7 @@
 package releasesnapshot
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"os"
@@ -8,6 +9,11 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+)
+
+const (
+	maxYAMLDepth = 128
+	maxYAMLNodes = 100000
 )
 
 func validateComposeWorkspace(workspace, composePath string) error {
@@ -23,7 +29,12 @@ func validateComposeWorkspace(workspace, composePath string) error {
 		return errors.New("compose not found")
 	}
 	var document yaml.Node
-	if yaml.Unmarshal(contents, &document) != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(contents))
+	if decoder.Decode(&document) != nil {
+		return errors.New("invalid compose")
+	}
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); err != io.EOF {
 		return errors.New("invalid compose")
 	}
 	if !safeYAML(&document) {
@@ -59,7 +70,18 @@ func validateComposeWorkspace(workspace, composePath string) error {
 	return nil
 }
 func safeYAML(node *yaml.Node) bool {
+	count := 0
+	return safeYAMLWithLimits(node, 0, &count, maxYAMLDepth, maxYAMLNodes)
+}
+func safeYAMLWithLimits(node *yaml.Node, depth int, count *int, maxDepth, maxNodes int) bool {
 	if node == nil {
+		return false
+	}
+	if depth > maxDepth {
+		return false
+	}
+	*count++
+	if *count > maxNodes {
 		return false
 	}
 	if node.Anchor != "" || node.Alias != nil {
@@ -76,7 +98,7 @@ func safeYAML(node *yaml.Node) bool {
 		}
 	}
 	for _, child := range node.Content {
-		if !safeYAML(child) {
+		if !safeYAMLWithLimits(child, depth+1, count, maxDepth, maxNodes) {
 			return false
 		}
 	}
