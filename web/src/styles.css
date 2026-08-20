@@ -186,6 +186,7 @@ button:disabled { cursor: wait; opacity: .62; }
 .field input { width: 100%; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #c9ced6; border-radius: 8px; background: #fff; color: #17191d; }
 .field input[aria-invalid="true"] { border-color: #b43d44; }
 .form-error { margin: 0; color: #a42f37; font-size: 12px; }
+.wizard form > .save-help { max-width: 680px; margin: 16px 0 0; color: #4e5561; font-size: 12px; line-height: 1.5; }
 .error-summary { margin: 14px 0; padding: 10px 12px; border: 1px solid #efc3c6; border-radius: 8px; background: #fff0f1; color: #842a31; font-size: 12px; }
 .error-summary:focus { outline: 3px solid rgba(180, 61, 68, .28); }
 .wizard footer { display: flex; justify-content: space-between; gap: 10px; margin-top: 20px; padding-top: 14px; border-top: 1px solid #e3e6ea; }
@@ -199,6 +200,7 @@ button:disabled { cursor: wait; opacity: .62; }
 .field select { width: 100%; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #c9ced6; border-radius: 8px; background: #fff; color: #17191d; }
 .connection-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
 .wizard-status { min-height: 20px; margin: 2px 0 4px; color: #4e5561; font-size: 12px; }
+.connection-status { display: grid; gap: 4px; }
 .source-selects { width: 100%; }
 .wizard-pagination { display: flex; align-items: center; gap: 8px; min-height: 36px; margin: 7px 0 4px; color: #5f6672; font-size: 12px; }
 .wizard-pagination .button { min-width: 80px; }

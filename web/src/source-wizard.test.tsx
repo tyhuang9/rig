@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { APIError, api } from "./api";
 import { isDeviceAuthorizationExpired, SourceWizard } from "./source-wizard";
@@ -18,7 +18,7 @@ function renderWizard() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const onCreated = vi.fn();
   render(<QueryClientProvider client={client}><SourceWizard onCancel={vi.fn()} onCreated={onCreated} /></QueryClientProvider>);
-  return { onCreated };
+  return { client, onCreated };
 }
 
 function mockCommon(enabled = true) {
@@ -129,6 +129,23 @@ describe("SourceWizard", () => {
     expect(document.getElementById("wizard-source-path-error")?.textContent).toMatch(/enter a local source path/i);
   });
 
+  it("links the description length error and clears it when edited", async () => {
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Local app" } });
+    fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/local" } });
+    const description = screen.getByLabelText(/^description$/i);
+    fireEvent.change(description, { target: { value: "x".repeat(301) } });
+    fireEvent.click(screen.getByRole("button", { name: /save application/i }));
+
+    expect(await screen.findByText(/description must be 300 characters or fewer/i)).toBeTruthy();
+    expect(description.getAttribute("aria-invalid")).toBe("true");
+    expect(description.getAttribute("aria-describedby")).toBe("wizard-description-error");
+    fireEvent.change(description, { target: { value: "Short description" } });
+    expect(description.getAttribute("aria-invalid")).toBe("false");
+    expect(description.getAttribute("aria-describedby")).toBeNull();
+    expect(screen.queryByText(/description must be 300 characters or fewer/i)).toBeNull();
+  });
+
   it("focuses the error summary after a create failure", async () => {
     vi.mocked(api.createApp).mockRejectedValueOnce(new APIError({ status: 503, code: "provider_unavailable", detail: "Application storage is temporarily unavailable." }));
     renderWizard();
@@ -170,6 +187,9 @@ describe("SourceWizard", () => {
     fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "GitHub app" } });
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
     await screen.findByLabelText(/^github connection$/i);
+    const saveButton = screen.getByRole("button", { name: /save application/i });
+    expect(saveButton.getAttribute("aria-describedby")).toBe("github-save-help");
+    expect(document.getElementById("github-save-help")?.textContent).toMatch(/choose a connected github account before saving/i);
     const form = screen.getByText("Application source").closest("form");
     if (!form) throw new Error("Expected source wizard form");
     fireEvent.submit(form);
@@ -234,21 +254,53 @@ describe("SourceWizard", () => {
     expect(select.disabled).toBe(false);
   });
 
-  it("announces the complete device authorization action in one atomic live region", async () => {
-    vi.spyOn(api, "startGitHubConnection").mockResolvedValue({ connectionId: "new-connection", userCode: "ABCD-EFGH", verificationUri: "https://github.com/login/device", installUrl: "https://github.com/apps/rig/installations/new", expiresAt: "2099-01-01T00:00:00Z", pollIntervalSeconds: 3600 });
-    vi.spyOn(api, "pollGitHubConnection");
-    renderWizard();
+  it("uses one persistent atomic live region from device instructions through connection", async () => {
+    vi.spyOn(api, "startGitHubConnection").mockResolvedValue({ connectionId: "new-connection", userCode: "ABCD-EFGH", verificationUri: "https://github.com/login/device", installUrl: "https://github.com/apps/rig/installations/new", expiresAt: "2099-01-01T00:00:00Z", pollIntervalSeconds: 1 });
+    vi.spyOn(api, "pollGitHubConnection").mockResolvedValue({ ...connection, id: "new-connection", status: "connected" });
+    const { client } = renderWizard();
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
     await screen.findByLabelText(/^github connection$/i);
+    vi.useFakeTimers();
     fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    await vi.advanceTimersByTimeAsync(0);
 
-    const code = await screen.findByText("ABCD-EFGH");
+    const code = screen.getByText("ABCD-EFGH");
     const liveRegion = code.closest("[role='status']");
     expect(liveRegion?.getAttribute("aria-live")).toBe("polite");
     expect(liveRegion?.getAttribute("aria-atomic")).toBe("true");
     expect(screen.getAllByRole("status")).toHaveLength(1);
     expect(screen.getByRole("link", { name: /open github device authorization \(opens in a new tab\)/i }).getAttribute("rel")).toBe("noreferrer");
     expect(screen.getByRole("link", { name: /install or configure the rig github app \(opens in a new tab\)/i }).getAttribute("target")).toBe("_blank");
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
+    await vi.runOnlyPendingTimersAsync();
+    const connectedRegion = screen.getByText(/connection status: connected/i).closest("[role='status']");
+    expect(connectedRegion).toBe(liveRegion);
+    expect(screen.queryByText("ABCD-EFGH")).toBeNull();
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+
+    await act(async () => {
+      client.setQueryData(["source-connections"], { items: [{ ...connection, id: "new-connection", status: "access_lost" }] });
+      await vi.runOnlyPendingTimersAsync();
+    });
+    const accessLostRegion = screen.getByText(/connection status: access lost/i).closest("[role='status']");
+    expect(accessLostRegion).toBe(liveRegion);
+  });
+
+  it("disables every connection action while one mutation is pending", async () => {
+    let resolveRefresh: ((value: typeof connection) => void) | undefined;
+    vi.spyOn(api, "refreshSourceConnection").mockImplementation(() => new Promise((resolve) => { resolveRefresh = resolve; }));
+    renderWizard();
+    await selectConnectedGitHub();
+    await screen.findByRole("button", { name: /refresh connection/i });
+    fireEvent.click(screen.getByRole("button", { name: /refresh connection/i }));
+
+    await waitFor(() => expect((screen.getByRole("button", { name: /connect github/i }) as HTMLButtonElement).disabled).toBe(true));
+    expect((screen.getByRole("button", { name: /refreshing/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: /disconnect/i }) as HTMLButtonElement).disabled).toBe(true);
+    resolveRefresh?.(connection);
+    await waitFor(() => expect((screen.getByRole("button", { name: /connect github/i }) as HTMLButtonElement).disabled).toBe(false));
   });
 
   it("treats an invalid device expiration as terminal and never polls", async () => {
@@ -257,34 +309,57 @@ describe("SourceWizard", () => {
     renderWizard();
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
     await screen.findByLabelText(/^github connection$/i);
+    const connectionRegion = screen.getByRole("status");
     fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
 
-    expect(await screen.findByText(/github authorization expired/i)).toBeTruthy();
+    const expiration = await screen.findByText(/github authorization expired/i);
+    expect(expiration.closest("[role='status']")).toBe(connectionRegion);
+    expect(connectionRegion.textContent).toMatch(/connection status: expired/i);
     expect(screen.queryByText("ABCD-EFGH")).toBeNull();
     expect(poll).not.toHaveBeenCalled();
   });
 
   it("shows recovery guidance when no installations are available", async () => {
-    vi.mocked(api.githubInstallations).mockResolvedValueOnce({ page: 1, perPage: 30, totalCount: 0, items: [] });
+    vi.mocked(api.githubInstallations)
+      .mockResolvedValueOnce({ page: 1, perPage: 30, totalCount: 0, items: [] })
+      .mockResolvedValueOnce({ page: 1, perPage: 30, totalCount: 1, items: [{ id: 10, accountLogin: "octo-org", accountType: "Organization", targetType: "Organization", repositorySelection: "selected", cachedAt: "2026-01-01T00:00:00Z" }] });
     renderWizard();
     await selectConnectedGitHub();
 
     expect(await screen.findByText(/no github app installations found/i)).toBeTruthy();
     expect(screen.getByText(/install or configure the rig github app, then retry/i)).toBeTruthy();
+    const installation = screen.getByLabelText(/^github app installation$/i) as HTMLSelectElement;
+    expect(installation.disabled).toBe(true);
+    expect(screen.queryByRole("navigation", { name: /github app installations pagination/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /retry github app installation/i }));
+    await screen.findByRole("option", { name: /octo-org/i });
+    expect(installation.disabled).toBe(false);
+    expect(screen.queryByRole("navigation", { name: /github app installations pagination/i })).toBeNull();
   });
 
   it("shows recovery guidance when no repositories are available", async () => {
-    vi.mocked(api.githubRepositories).mockResolvedValueOnce({ page: 1, perPage: 30, totalCount: 0, items: [] });
+    vi.mocked(api.githubRepositories)
+      .mockResolvedValueOnce({ page: 1, perPage: 30, totalCount: 0, items: [] })
+      .mockResolvedValueOnce({ page: 1, perPage: 30, totalCount: 1, items: [{ id: 20, owner: "octo-org", name: "web", defaultBranch: "main", private: true, archived: false, disabled: false }] });
     renderWizard();
     await selectConnectedGitHub();
     await selectInstallation();
 
     expect(await screen.findByText(/no repositories found/i)).toBeTruthy();
     expect(screen.getByText(/update the github app repository access, then retry/i)).toBeTruthy();
+    const repository = screen.getByLabelText(/^repository$/i) as HTMLSelectElement;
+    expect(repository.disabled).toBe(true);
+    expect(screen.queryByRole("navigation", { name: /repositories pagination/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /retry repository/i }));
+    await screen.findByRole("option", { name: /octo-org\/web/i });
+    expect(repository.disabled).toBe(false);
+    expect(screen.queryByRole("navigation", { name: /repositories pagination/i })).toBeNull();
   });
 
   it("shows recovery guidance when no branches are available", async () => {
-    vi.mocked(api.githubBranches).mockResolvedValueOnce({ page: 1, perPage: 30, items: [] });
+    vi.mocked(api.githubBranches)
+      .mockResolvedValueOnce({ page: 1, perPage: 30, items: [] })
+      .mockResolvedValueOnce({ page: 1, perPage: 30, items: [{ name: "main", sha: "abc123", protected: true }] });
     renderWizard();
     await selectConnectedGitHub();
     await selectInstallation();
@@ -292,6 +367,13 @@ describe("SourceWizard", () => {
 
     expect(await screen.findByText(/no branches found/i)).toBeTruthy();
     expect(screen.getByText(/push a tracked branch or choose another repository, then retry/i)).toBeTruthy();
+    const trackedBranch = screen.getByLabelText(/^tracked branch$/i) as HTMLSelectElement;
+    expect(trackedBranch.disabled).toBe(true);
+    expect(screen.queryByRole("navigation", { name: /branches pagination/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /retry tracked branch/i }));
+    await screen.findByRole("option", { name: /main/i });
+    expect(trackedBranch.disabled).toBe(false);
+    expect(screen.queryByRole("navigation", { name: /branches pagination/i })).toBeNull();
   });
 
   it("does not report a clean discovery with no Compose candidates as successful", async () => {
@@ -303,8 +385,10 @@ describe("SourceWizard", () => {
     await selectBranch();
     fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
 
-    expect(await screen.findByText(/no compose files found/i)).toBeTruthy();
-    expect(screen.getByText(/add a compose file to the tracked branch, then inspect again/i)).toBeTruthy();
+    const emptyResult = (await screen.findByText(/no compose files found/i)).closest("[role='status']");
+    expect(emptyResult?.getAttribute("aria-live")).toBe("polite");
+    expect(emptyResult?.getAttribute("aria-atomic")).toBe("true");
+    expect(emptyResult?.textContent).toMatch(/add a compose file to the tracked branch, then inspect again/i);
     expect(screen.queryByText(/source inspection completed/i)).toBeNull();
     expect(screen.queryByLabelText(/^compose file$/i)).toBeNull();
   });
@@ -319,12 +403,17 @@ describe("SourceWizard", () => {
     await selectInstallation();
     await selectRepository();
     await selectBranch();
+    expect(document.getElementById("github-save-help")?.textContent).toMatch(/find and choose a compose file before saving/i);
     fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
     await screen.findByLabelText(/^compose file$/i);
     expect(screen.getByRole("button", { name: /save application/i }).hasAttribute("disabled")).toBe(true);
     fireEvent.change(screen.getByLabelText(/compose file/i), { target: { value: "compose.yaml" } });
+    expect(document.getElementById("github-save-help")?.textContent).toMatch(/inspect the selected compose file before saving/i);
     fireEvent.click(screen.getByRole("button", { name: /inspect selected compose file/i }));
-    await screen.findByText(/source inspection completed/i);
+    const cleanResult = (await screen.findByText(/source inspection completed/i)).closest("[role='status']");
+    expect(cleanResult?.getAttribute("aria-live")).toBe("polite");
+    expect(cleanResult?.getAttribute("aria-atomic")).toBe("true");
+    expect(document.getElementById("github-save-help")?.textContent).toMatch(/ready to save/i);
     fireEvent.click(screen.getByRole("button", { name: /save application/i }));
 
     await waitFor(() => expect(api.createApp).toHaveBeenCalledWith({
@@ -350,8 +439,10 @@ describe("SourceWizard", () => {
     fireEvent.change(composeFile, { target: { value: "compose.yaml" } });
     fireEvent.click(screen.getByRole("button", { name: /inspect selected compose file/i }));
 
-    expect(await screen.findByText(/source requires changes before it can be saved/i)).toBeTruthy();
-    expect(screen.getByText(/referenced file leaves the release workspace/i)).toBeTruthy();
+    const findingsResult = (await screen.findByText(/source requires changes before it can be saved/i)).closest("[role='status']");
+    expect(findingsResult?.getAttribute("aria-live")).toBe("polite");
+    expect(findingsResult?.getAttribute("aria-atomic")).toBe("true");
+    expect(findingsResult?.textContent).toMatch(/referenced file leaves the release workspace/i);
     expect(screen.getByRole("button", { name: /save application/i }).hasAttribute("disabled")).toBe(true);
   });
 
