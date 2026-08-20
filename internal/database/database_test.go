@@ -134,7 +134,10 @@ func TestApplicationConfigurationMigrationBackfillsAndEnforcesRevisionIntegrity(
 	if _, err := db.Exec(`UPDATE application_configuration_heads SET revision_id='missing',revision_number=1,updated_at=datetime('now') WHERE app_id='legacy'`); err == nil {
 		t.Fatal("revision-zero pairing accepted an unknown revision")
 	}
-	if _, err := db.Exec(`INSERT INTO application_configuration_revisions(id,app_id,revision_number,bundle_ref,created_at,variable_count,secret_count) VALUES('rev-a','legacy',1,'legacy/rev-a.bundle',datetime('now'),0,1),('rev-b','future',1,'future/rev-b.bundle',datetime('now'),1,0)`); err != nil {
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES('owner','owner','hash',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO application_configuration_revisions(id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count) VALUES('rev-a','legacy',1,'legacy/rev-a.bundle','owner',datetime('now'),0,1),('rev-b','future',1,'future/rev-b.bundle',NULL,datetime('now'),1,0)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE application_configuration_heads SET revision_id='rev-a',revision_number=1,updated_at=datetime('now') WHERE app_id='legacy'`); err != nil {
@@ -168,6 +171,12 @@ func TestApplicationConfigurationMigrationBackfillsAndEnforcesRevisionIntegrity(
 	}
 	if _, err := db.Exec(`DELETE FROM application_configuration_revisions WHERE id='rev-a'`); err == nil {
 		t.Fatal("referenced configuration revision was deletable")
+	}
+	if _, err := db.Exec(`UPDATE application_configuration_revisions SET created_by='owner' WHERE id='rev-b'`); err == nil {
+		t.Fatal("immutable revision unexpectedly allowed actor reassignment")
+	}
+	if _, err := db.Exec(`DELETE FROM users WHERE id='owner'`); err == nil {
+		t.Fatal("configuration revision creator was deleted")
 	}
 	// Configuration history is intentionally retained. Applications with
 	// revisions must be archived rather than hard-deleted.

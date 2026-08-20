@@ -12,7 +12,7 @@ CREATE TABLE application_configuration_revisions (
     app_id TEXT NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
     revision_number INTEGER NOT NULL CHECK (revision_number > 0),
     bundle_ref TEXT NOT NULL UNIQUE,
-    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    created_by TEXT REFERENCES users(id),
     created_at TEXT NOT NULL,
     variable_count INTEGER NOT NULL CHECK (variable_count >= 0),
     secret_count INTEGER NOT NULL CHECK (secret_count >= 0),

@@ -27,6 +27,7 @@ import (
 const maxBundleBytes = 48 << 10
 
 var envKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var temporarySecretName = regexp.MustCompile(`^\.hostd-secret-[A-Za-z0-9]{8,}$`)
 
 type Error struct {
 	Code   string
@@ -118,6 +119,9 @@ func (s *Store) lock(appID string) func() {
 }
 
 func (s *Store) Get(ctx context.Context, appID string) (Configuration, error) {
+	if !validUUID(appID) {
+		return Configuration{}, &Error{Code: "app_not_found"}
+	}
 	var revisionID sql.NullString
 	var number int64
 	var updated sql.NullString
@@ -149,6 +153,9 @@ func (s *Store) Get(ctx context.Context, appID string) (Configuration, error) {
 }
 
 func (s *Store) Replace(ctx context.Context, appID, actorID string, input ReplaceInput) (Configuration, error) {
+	if !validUUID(appID) {
+		return Configuration{}, &Error{Code: "app_not_found"}
+	}
 	if input.ExpectedRevisionNumber < 0 {
 		return Configuration{}, invalid("expectedRevisionNumber", "Must be zero or greater")
 	}
@@ -175,10 +182,13 @@ func (s *Store) Replace(ctx context.Context, appID, actorID string, input Replac
 	}
 	defer clear(plaintext)
 	path := s.bundlePath(appID, revisionID)
+	if err := s.configurationDirectory(appID, true); err != nil {
+		return Configuration{}, &Error{Code: "configuration_unavailable"}
+	}
 	if err := secretfile.WriteNew(path, purpose(appID, revisionID), plaintext); err != nil {
-		// The randomly generated path is owned by this attempt. WriteNew may have
-		// installed it before a directory-sync error, so cleanup is unconditional.
-		_ = secretfile.Remove(path)
+		if secretfile.WasInstalled(err) {
+			_ = secretfile.Remove(path)
+		}
 		return Configuration{}, &Error{Code: "configuration_unavailable"}
 	}
 	committed := false
@@ -253,6 +263,9 @@ func (s *Store) readBundle(ctx context.Context, appID, revisionID string, number
 	if ref != expected {
 		return bundle{}, errors.New("invalid configuration bundle reference")
 	}
+	if err := s.configurationDirectory(appID, false); err != nil {
+		return bundle{}, err
+	}
 	plaintext, err := secretfile.Read(s.bundlePath(appID, revisionID), purpose(appID, revisionID))
 	if err != nil {
 		return bundle{}, err
@@ -262,6 +275,9 @@ func (s *Store) readBundle(ctx context.Context, appID, revisionID string, number
 		return bundle{}, errors.New("configuration bundle too large")
 	}
 	var b bundle
+	if err := rejectDuplicateJSONKeys(plaintext); err != nil {
+		return bundle{}, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(plaintext))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&b); err != nil {
@@ -303,6 +319,102 @@ func (s *Store) readBundle(ctx context.Context, appID, revisionID string, number
 
 func (s *Store) bundlePath(appID, revisionID string) string {
 	return filepath.Join(s.root, appID, "configuration", revisionID+".secret")
+}
+
+func safeDirectory(path string, create bool) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) && create {
+		if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		info, err = os.Lstat(path)
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("managed configuration path is not a directory")
+	}
+	return nil
+}
+
+func (s *Store) configurationDirectory(appID string, create bool) error {
+	if !validUUID(appID) {
+		return errors.New("invalid application configuration identity")
+	}
+	if err := safeDirectory(s.root, create); err != nil {
+		return err
+	}
+	appRoot := filepath.Join(s.root, appID)
+	if err := safeDirectory(appRoot, create); err != nil {
+		return err
+	}
+	return safeDirectory(filepath.Join(appRoot, "configuration"), create)
+}
+
+func validUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}
+
+func rejectDuplicateJSONKeys(document []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(document))
+	var value func() error
+	value = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, ok := token.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delimiter {
+		case '{':
+			seen := map[string]bool{}
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok || seen[key] {
+					return errors.New("configuration bundle contains duplicate object keys")
+				}
+				seen[key] = true
+				if err := value(); err != nil {
+					return err
+				}
+			}
+			closing, err := decoder.Token()
+			if err != nil || closing != json.Delim('}') {
+				return errors.New("invalid configuration bundle object")
+			}
+		case '[':
+			for decoder.More() {
+				if err := value(); err != nil {
+					return err
+				}
+			}
+			closing, err := decoder.Token()
+			if err != nil || closing != json.Delim(']') {
+				return errors.New("invalid configuration bundle array")
+			}
+		default:
+			return errors.New("invalid configuration bundle delimiter")
+		}
+		return nil
+	}
+	if err := value(); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return errors.New("configuration bundle has trailing content")
+		}
+		return err
+	}
+	return nil
 }
 func purpose(appID, revisionID string) string {
 	return "hostd/application-configuration/v1/" + appID + "/" + revisionID
@@ -412,11 +524,16 @@ func (s *Store) Recover(ctx context.Context) error {
 	}
 	var refs []reference
 	known := map[string]bool{}
+	apps := map[string]bool{}
 	for rows.Next() {
 		var r reference
 		if err := rows.Scan(&r.id, &r.app, &r.number, &r.ref); err != nil {
 			rows.Close()
 			return err
+		}
+		if !validUUID(r.app) || !validUUID(r.id) {
+			rows.Close()
+			return errors.New("invalid configuration bundle identity")
 		}
 		expected := filepath.ToSlash(filepath.Join("apps", r.app, "configuration", r.id+".secret"))
 		if r.ref != expected {
@@ -424,6 +541,7 @@ func (s *Store) Recover(ctx context.Context) error {
 			return errors.New("invalid configuration bundle reference")
 		}
 		known[filepath.Clean(s.bundlePath(r.app, r.id))] = true
+		apps[r.app] = true
 		refs = append(refs, r)
 	}
 	if err := rows.Close(); err != nil {
@@ -434,40 +552,69 @@ func (s *Store) Recover(ctx context.Context) error {
 			return fmt.Errorf("validate configuration bundle: %w", err)
 		}
 	}
-	if err := os.MkdirAll(s.root, 0o700); err != nil {
-		return err
-	}
-	apps, err := os.ReadDir(s.root)
+	headRows, err := s.db.QueryContext(ctx, `SELECT app_id FROM application_configuration_heads`)
 	if err != nil {
 		return err
 	}
-	for _, app := range apps {
-		if !app.IsDir() {
-			continue
+	for headRows.Next() {
+		var app string
+		if err := headRows.Scan(&app); err != nil {
+			headRows.Close()
+			return err
 		}
-		configurationRoot := filepath.Join(s.root, app.Name(), "configuration")
-		if _, err := os.Stat(configurationRoot); errors.Is(err, os.ErrNotExist) {
+		if !validUUID(app) {
+			headRows.Close()
+			return errors.New("invalid application configuration identity")
+		}
+		apps[app] = true
+	}
+	if err := headRows.Close(); err != nil {
+		return err
+	}
+	if err := safeDirectory(s.root, true); err != nil {
+		return err
+	}
+	for app := range apps {
+		configurationRoot := filepath.Join(s.root, app, "configuration")
+		appRoot := filepath.Join(s.root, app)
+		if _, err := os.Lstat(appRoot); errors.Is(err, os.ErrNotExist) {
 			continue
 		} else if err != nil {
 			return err
 		}
-		if err := filepath.WalkDir(configurationRoot, func(path string, entry os.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
+		if err := safeDirectory(appRoot, false); err != nil {
+			return err
+		}
+		if _, err := os.Lstat(configurationRoot); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		if err := safeDirectory(configurationRoot, false); err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(configurationRoot)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			path := filepath.Join(configurationRoot, entry.Name())
 			if entry.IsDir() {
-				return nil
+				return errors.New("unrecognized directory in application configuration directory")
+			}
+			if known[filepath.Clean(path)] {
+				continue
 			}
 			name := entry.Name()
-			if known[filepath.Clean(path)] {
-				return nil
+			orphanRevision := strings.TrimSuffix(name, ".secret")
+			validOrphan := strings.HasSuffix(name, ".secret") && validUUID(orphanRevision)
+			validTemporary := temporarySecretName.MatchString(name)
+			if !validOrphan && !validTemporary {
+				return errors.New("unrecognized file in application configuration directory")
 			}
-			if strings.HasSuffix(name, ".secret") || strings.HasPrefix(name, ".hostd-secret-") {
-				return os.Remove(path)
+			if err := os.Remove(path); err != nil {
+				return err
 			}
-			return errors.New("unrecognized file in application configuration directory")
-		}); err != nil {
-			return err
 		}
 	}
 	return nil

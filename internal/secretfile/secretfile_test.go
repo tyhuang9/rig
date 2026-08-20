@@ -2,6 +2,7 @@ package secretfile
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -36,5 +37,19 @@ func TestWriteNewDoesNotReplaceExistingSecret(t *testing.T) {
 	}
 	if _, err := Read(path, "second-purpose"); err == nil {
 		t.Fatal("wrong purpose was accepted")
+	}
+}
+
+func TestWriteNewReportsInstalledDurabilityFailure(t *testing.T) {
+	original := syncParentDirectory
+	syncParentDirectory = func(string) error { return errors.New("injected directory sync failure") }
+	t.Cleanup(func() { syncParentDirectory = original })
+	path := filepath.Join(t.TempDir(), "installed.secret")
+	err := WriteNew(path, "purpose", []byte("value"))
+	if err == nil || !WasInstalled(err) {
+		t.Fatalf("write error = %v", err)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("installed destination missing: %v", statErr)
 	}
 }

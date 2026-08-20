@@ -1,6 +1,7 @@
 package controller_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -44,7 +45,8 @@ func TestApplicationConfigurationAPIStoresMasksAndConflictsSafely(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := (&controller.Server{Auth: authService, Apps: apps.New(db), Jobs: jobs.New(db), Machines: machinesStore, Configuration: configurationStore, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).Handler()
+	var logs bytes.Buffer
+	handler := (&controller.Server{Auth: authService, Apps: apps.New(db), Jobs: jobs.New(db), Machines: machinesStore, Configuration: configurationStore, Logger: slog.New(slog.NewJSONHandler(&logs, nil))}).Handler()
 
 	initial := authenticatedRequest(t, handler, session, http.MethodGet, "/api/v1/apps/"+app.ID+"/configuration", "")
 	if initial.Header().Get("Cache-Control") != "no-store" || !strings.Contains(initial.Body.String(), `"revisionNumber":0`) {
@@ -89,6 +91,21 @@ func TestApplicationConfigurationAPIStoresMasksAndConflictsSafely(t *testing.T) 
 	handler.ServeHTTP(conflict, conflictRequest)
 	if conflict.Code != http.StatusConflict || !strings.Contains(conflict.Body.String(), `"code":"configuration_conflict"`) || strings.Contains(conflict.Body.String(), "sentinel-api-secret") {
 		t.Fatalf("conflict=%d %s", conflict.Code, conflict.Body.String())
+	}
+	invalidBody := `{"expectedRevisionNumber":1,"variables":[{"key":"BAD-KEY","value":"sentinel-problem-visible"}],"secrets":[{"key":"TOKEN","value":"sentinel-problem-secret"}],"remove":[]}`
+	invalidRequest := httptest.NewRequest(http.MethodPut, "/api/v1/apps/"+app.ID+"/configuration", strings.NewReader(invalidBody))
+	invalidRequest.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: session.Token})
+	invalidRequest.Header.Set("Content-Type", "application/json")
+	invalidRequest.Header.Set("X-CSRF-Token", session.CSRF)
+	invalid := httptest.NewRecorder()
+	handler.ServeHTTP(invalid, invalidRequest)
+	if invalid.Code != http.StatusUnprocessableEntity || strings.Contains(invalid.Body.String(), "sentinel-problem-visible") || strings.Contains(invalid.Body.String(), "sentinel-problem-secret") {
+		t.Fatalf("invalid problem=%d %s", invalid.Code, invalid.Body.String())
+	}
+	for _, sentinel := range []string{"sentinel-api-secret", "sentinel-problem-visible", "sentinel-problem-secret"} {
+		if strings.Contains(logs.String(), sentinel) {
+			t.Fatalf("configuration value found in controller logs: %s", sentinel)
+		}
 	}
 }
 
