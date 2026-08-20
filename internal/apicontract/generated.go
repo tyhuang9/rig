@@ -7,41 +7,43 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "0d68c2fb660d4c4ee756b31f5658c00356f58fbf358c2a1c9310f1ad74b5fcf5"
+const SourceSHA256 = "949cf84e215e54b2d721ff01b136150cdb201cea28aa1d9588470b752f235de9"
 
 var Operations = map[string]Operation{
-	"bootstrap":                   {Method: "POST", Path: "/api/v1/auth/bootstrap"},
-	"bootstrapStatus":             {Method: "GET", Path: "/api/v1/auth/bootstrap/status"},
-	"cancelJob":                   {Method: "POST", Path: "/api/v1/jobs/{jobId}/cancel"},
-	"createApplication":           {Method: "POST", Path: "/api/v1/apps"},
-	"deployApplication":           {Method: "POST", Path: "/api/v1/apps/{appId}/deployments"},
-	"disconnectSourceConnection":  {Method: "DELETE", Path: "/api/v1/source-connections/{connectionId}"},
-	"doctor":                      {Method: "GET", Path: "/api/v1/system/doctor"},
-	"getApplication":              {Method: "GET", Path: "/api/v1/apps/{appId}"},
-	"getJob":                      {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
-	"inspectImport":               {Method: "POST", Path: "/api/v1/apps/import/inspect"},
-	"listApplications":            {Method: "GET", Path: "/api/v1/apps"},
-	"listGitHubBranches":          {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories/{repositoryId}/branches"},
-	"listGitHubInstallations":     {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations"},
-	"listGitHubRepositories":      {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories"},
-	"listJobEvents":               {Method: "GET", Path: "/api/v1/jobs/{jobId}/events"},
-	"listJobs":                    {Method: "GET", Path: "/api/v1/jobs"},
-	"listMachines":                {Method: "GET", Path: "/api/v1/machines"},
-	"listServices":                {Method: "GET", Path: "/api/v1/apps/{appId}/services"},
-	"listSourceConnections":       {Method: "GET", Path: "/api/v1/source-connections"},
-	"login":                       {Method: "POST", Path: "/api/v1/auth/sessions"},
-	"logout":                      {Method: "DELETE", Path: "/api/v1/auth/sessions/current"},
-	"me":                          {Method: "GET", Path: "/api/v1/auth/me"},
-	"pollGitHubDeviceConnection":  {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/poll"},
-	"refreshSourceConnection":     {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/refresh"},
-	"restartApplication":          {Method: "POST", Path: "/api/v1/apps/{appId}/restart"},
-	"rotateCSRF":                  {Method: "GET", Path: "/api/v1/auth/csrf"},
-	"startApplication":            {Method: "POST", Path: "/api/v1/apps/{appId}/start"},
-	"startGitHubDeviceConnection": {Method: "POST", Path: "/api/v1/source-connections/github/device"},
-	"stopApplication":             {Method: "POST", Path: "/api/v1/apps/{appId}/stop"},
-	"streamJobEvents":             {Method: "GET", Path: "/api/v1/jobs/{jobId}/events/stream"},
-	"streamLogs":                  {Method: "GET", Path: "/api/v1/apps/{appId}/logs/stream"},
-	"systemStatus":                {Method: "GET", Path: "/api/v1/system/status"},
+	"bootstrap":                       {Method: "POST", Path: "/api/v1/auth/bootstrap"},
+	"bootstrapStatus":                 {Method: "GET", Path: "/api/v1/auth/bootstrap/status"},
+	"cancelJob":                       {Method: "POST", Path: "/api/v1/jobs/{jobId}/cancel"},
+	"createApplication":               {Method: "POST", Path: "/api/v1/apps"},
+	"deployApplication":               {Method: "POST", Path: "/api/v1/apps/{appId}/deployments"},
+	"disconnectSourceConnection":      {Method: "DELETE", Path: "/api/v1/source-connections/{connectionId}"},
+	"doctor":                          {Method: "GET", Path: "/api/v1/system/doctor"},
+	"getApplication":                  {Method: "GET", Path: "/api/v1/apps/{appId}"},
+	"getApplicationConfiguration":     {Method: "GET", Path: "/api/v1/apps/{appId}/configuration"},
+	"getJob":                          {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
+	"inspectImport":                   {Method: "POST", Path: "/api/v1/apps/import/inspect"},
+	"listApplications":                {Method: "GET", Path: "/api/v1/apps"},
+	"listGitHubBranches":              {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories/{repositoryId}/branches"},
+	"listGitHubInstallations":         {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations"},
+	"listGitHubRepositories":          {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories"},
+	"listJobEvents":                   {Method: "GET", Path: "/api/v1/jobs/{jobId}/events"},
+	"listJobs":                        {Method: "GET", Path: "/api/v1/jobs"},
+	"listMachines":                    {Method: "GET", Path: "/api/v1/machines"},
+	"listServices":                    {Method: "GET", Path: "/api/v1/apps/{appId}/services"},
+	"listSourceConnections":           {Method: "GET", Path: "/api/v1/source-connections"},
+	"login":                           {Method: "POST", Path: "/api/v1/auth/sessions"},
+	"logout":                          {Method: "DELETE", Path: "/api/v1/auth/sessions/current"},
+	"me":                              {Method: "GET", Path: "/api/v1/auth/me"},
+	"pollGitHubDeviceConnection":      {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/poll"},
+	"refreshSourceConnection":         {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/refresh"},
+	"replaceApplicationConfiguration": {Method: "PUT", Path: "/api/v1/apps/{appId}/configuration"},
+	"restartApplication":              {Method: "POST", Path: "/api/v1/apps/{appId}/restart"},
+	"rotateCSRF":                      {Method: "GET", Path: "/api/v1/auth/csrf"},
+	"startApplication":                {Method: "POST", Path: "/api/v1/apps/{appId}/start"},
+	"startGitHubDeviceConnection":     {Method: "POST", Path: "/api/v1/source-connections/github/device"},
+	"stopApplication":                 {Method: "POST", Path: "/api/v1/apps/{appId}/stop"},
+	"streamJobEvents":                 {Method: "GET", Path: "/api/v1/jobs/{jobId}/events/stream"},
+	"streamLogs":                      {Method: "GET", Path: "/api/v1/apps/{appId}/logs/stream"},
+	"systemStatus":                    {Method: "GET", Path: "/api/v1/system/status"},
 }
 
 type Application struct {
@@ -53,6 +55,13 @@ type Application struct {
 	Slug        string        `json:"slug"`
 	Source      SourceSummary `json:"source"`
 	Status      string        `json:"status"`
+}
+
+type ApplicationConfiguration struct {
+	Entries        []ConfigurationEntry `json:"entries"`
+	RevisionID     string               `json:"revisionId,omitempty"`
+	RevisionNumber int64                `json:"revisionNumber"`
+	UpdatedAt      string               `json:"updatedAt,omitempty"`
 }
 
 type ApplicationList struct {
@@ -76,6 +85,17 @@ type CSRFResponse struct {
 type Capabilities struct {
 	FakeRuntime       bool `json:"fakeRuntime"`
 	GithubConnections bool `json:"githubConnections"`
+}
+
+type ConfigurationEntry struct {
+	Key       string `json:"key"`
+	Sensitive bool   `json:"sensitive"`
+	Value     string `json:"value,omitempty"`
+}
+
+type ConfigurationValueInput struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 type CreateApplicationRequest struct {
@@ -278,6 +298,13 @@ type Problem struct {
 	Status    int               `json:"status"`
 	Title     string            `json:"title"`
 	Type      string            `json:"type"`
+}
+
+type ReplaceApplicationConfigurationRequest struct {
+	ExpectedRevisionNumber int64                     `json:"expectedRevisionNumber"`
+	Remove                 []string                  `json:"remove"`
+	Secrets                []ConfigurationValueInput `json:"secrets"`
+	Variables              []ConfigurationValueInput `json:"variables"`
 }
 
 type Service struct {

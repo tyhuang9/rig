@@ -176,6 +176,20 @@ paths:
       responses:
         '200': {description: Registered machines, content: {application/json: {schema: {$ref: '#/components/schemas/MachineList'}}}}
         default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/configuration:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    get:
+      operationId: getApplicationConfiguration
+      responses:
+        '200': {description: Current application configuration metadata and visible variables. Secret values are omitted., headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApplicationConfiguration'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    put:
+      operationId: replaceApplicationConfiguration
+      security: [{sessionCookie: [], csrfHeader: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ReplaceApplicationConfigurationRequest'}}}}
+      responses:
+        '200': {description: New immutable configuration revision, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/ApplicationConfiguration'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/source-connections:
     get:
       operationId: listSourceConnections
@@ -300,6 +314,10 @@ components:
     DoctorResponse: {type: object, required: [checks, startupLimitation], properties: {checks: {type: array, items: {$ref: '#/components/schemas/DoctorCheck'}}, startupLimitation: {type: string}}}
     Application: {type: object, required: [id, slug, name, description, status, machineName, createdAt, source], properties: {id: {type: string, format: uuid}, slug: {type: string}, name: {type: string}, description: {type: string}, status: {type: string}, machineName: {type: string}, createdAt: {type: string, format: date-time}, source: {$ref: '#/components/schemas/SourceSummary'}}}
     ApplicationList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Application'}}}}
+    ConfigurationEntry: {type: object, required: [key, sensitive], properties: {key: {type: string}, sensitive: {type: boolean}, value: {type: string}}}
+    ConfigurationValueInput: {type: object, additionalProperties: false, required: [key, value], properties: {key: {type: string}, value: {type: string}}}
+    ApplicationConfiguration: {type: object, required: [revisionNumber, entries], properties: {revisionId: {type: string, format: uuid}, revisionNumber: {type: integer, format: int64, minimum: 0}, updatedAt: {type: string, format: date-time}, entries: {type: array, items: {$ref: '#/components/schemas/ConfigurationEntry'}}}}
+    ReplaceApplicationConfigurationRequest: {type: object, additionalProperties: false, required: [expectedRevisionNumber, variables, secrets, remove], properties: {expectedRevisionNumber: {type: integer, format: int64, minimum: 0}, variables: {type: array, maxItems: 256, items: {$ref: '#/components/schemas/ConfigurationValueInput'}}, secrets: {type: array, maxItems: 256, items: {$ref: '#/components/schemas/ConfigurationValueInput'}}, remove: {type: array, maxItems: 256, items: {type: string}}}}
     GitHubSource: {type: object, additionalProperties: false, required: [connectionId, installationId, repositoryId, branch], properties: {connectionId: {type: string, pattern: '^[a-f0-9]{32}$'}, installationId: {type: integer, format: int64, minimum: 1}, repositoryId: {type: integer, format: int64, minimum: 1}, branch: {type: string, minLength: 1, maxLength: 255}, composePath: {type: string, minLength: 1, maxLength: 1024}}}
     SourceSummary: {type: object, required: [type], properties: {type: {type: string, enum: [local, github]}, path: {type: string}, connectionId: {type: string}, installationId: {type: integer, format: int64}, repositoryId: {type: integer, format: int64}, repositoryOwner: {type: string}, repositoryName: {type: string}, trackedBranch: {type: string}, trackedRef: {type: string}, composePath: {type: string}, resolvedSha: {type: string}}}
     CreateApplicationRequest: {type: object, additionalProperties: false, required: [name], properties: {name: {type: string}, description: {type: string}, sourcePath: {type: string}, githubSource: {$ref: '#/components/schemas/GitHubSource'}, machineId: {type: string, format: uuid}}}

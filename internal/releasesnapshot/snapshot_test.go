@@ -129,6 +129,49 @@ func TestMaterializeInstallsImmutableWorkspaceAndReusesReadyRelease(t *testing.T
 		t.Fatalf("provenance = %q %q %q %q %v", owner, name, state, storedPath, err)
 	}
 }
+
+func TestMaterializePinsConfigurationRevisionAndDoesNotReuseAfterChange(t *testing.T) {
+	db := snapshotDB(t)
+	source := &fakeSources{archive: composeArchive(t, "services: {}\n")}
+	m, err := New(db, source, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	initial, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.ConfigurationRevisionID != "" || initial.ConfigurationRevisionNumber != 0 {
+		t.Fatalf("initial pin=%+v", initial)
+	}
+	revisionID := "22222222-2222-2222-2222-222222222222"
+	if _, err := db.Exec(`INSERT INTO application_configuration_revisions(id,app_id,revision_number,bundle_ref,created_at,variable_count,secret_count) VALUES(?,?,1,?,datetime('now'),1,0)`, revisionID, app, "apps/"+app+"/configuration/"+revisionID+".secret"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE application_configuration_heads SET revision_id=?,revision_number=1,updated_at=datetime('now') WHERE app_id=?`, revisionID, app); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.ID == initial.ID || changed.ConfigurationRevisionID != revisionID || changed.ConfigurationRevisionNumber != 1 || source.calls != 2 {
+		t.Fatalf("changed=%+v initial=%+v calls=%d", changed, initial, source.calls)
+	}
+	again, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != changed.ID || source.calls != 2 {
+		t.Fatalf("reuse=%+v calls=%d", again, source.calls)
+	}
+	var pinnedID sql.NullString
+	var pinnedNumber int64
+	if err := db.QueryRow(`SELECT configuration_revision_id,configuration_revision_number FROM releases WHERE id=?`, initial.ID).Scan(&pinnedID, &pinnedNumber); err != nil || pinnedID.Valid || pinnedNumber != 0 {
+		t.Fatalf("initial database pin=%v/%d err=%v", pinnedID, pinnedNumber, err)
+	}
+}
 func TestMaterializeRejectsWrongOwnerAndUnsafeRoots(t *testing.T) {
 	db := snapshotDB(t)
 	source := &fakeSources{archive: composeArchive(t, "services: {}\n")}
