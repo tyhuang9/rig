@@ -75,6 +75,31 @@ type InstallationPage struct {
 	Installations []Installation
 }
 
+type Repository struct {
+	ID            int64
+	Owner         string
+	Name          string
+	DefaultBranch string
+	Private       bool
+	Archived      bool
+	Disabled      bool
+}
+
+type RepositoryPage struct {
+	TotalCount   int
+	Repositories []Repository
+}
+
+type Branch struct {
+	Name      string
+	SHA       string
+	Protected bool
+}
+
+type BranchPage struct {
+	Branches []Branch
+}
+
 func New(clientID string) (*Client, error) {
 	return newWithTransport(clientID, http.DefaultTransport)
 }
@@ -215,6 +240,139 @@ func (c *Client) Installations(ctx context.Context, accessToken string, page, pe
 		result.Installations = append(result.Installations, Installation{ID: item.ID, AccountLogin: item.Account.Login, AccountType: item.Account.Type, TargetType: item.TargetType, RepositorySelection: item.RepositorySelection, SuspendedAt: item.SuspendedAt})
 	}
 	return result, nil
+}
+
+func (c *Client) Repositories(ctx context.Context, accessToken string, installationID int64, page, perPage int) (RepositoryPage, error) {
+	if !validSecret(accessToken) || installationID < 1 || !validPage(page, perPage) {
+		return RepositoryPage{}, &Error{Code: "invalid_request"}
+	}
+	endpoint := APIOrigin + "/user/installations/" + strconv.FormatInt(installationID, 10) + "/repositories?page=" + strconv.Itoa(page) + "&per_page=" + strconv.Itoa(perPage)
+	var response struct {
+		TotalCount   int                  `json:"total_count"`
+		Repositories []repositoryResponse `json:"repositories"`
+	}
+	if err := c.api(ctx, endpoint, accessToken, &response); err != nil {
+		return RepositoryPage{}, err
+	}
+	if response.TotalCount < len(response.Repositories) || len(response.Repositories) > perPage {
+		return RepositoryPage{}, &Error{Code: "invalid_response"}
+	}
+	result := RepositoryPage{TotalCount: response.TotalCount, Repositories: make([]Repository, 0, len(response.Repositories))}
+	for _, item := range response.Repositories {
+		repository, err := validateRepository(item)
+		if err != nil {
+			return RepositoryPage{}, err
+		}
+		result.Repositories = append(result.Repositories, repository)
+	}
+	return result, nil
+}
+
+func (c *Client) Repository(ctx context.Context, accessToken string, installationID, repositoryID int64) (Repository, error) {
+	if !validSecret(accessToken) || installationID < 1 || repositoryID < 1 {
+		return Repository{}, &Error{Code: "invalid_request"}
+	}
+	endpoint := APIOrigin + "/user/installations/" + strconv.FormatInt(installationID, 10) + "/repositories/" + strconv.FormatInt(repositoryID, 10)
+	var response repositoryResponse
+	if err := c.api(ctx, endpoint, accessToken, &response); err != nil {
+		return Repository{}, err
+	}
+	repository, err := validateRepository(response)
+	if err != nil {
+		return Repository{}, err
+	}
+	if repository.ID != repositoryID {
+		return Repository{}, &Error{Code: "invalid_response"}
+	}
+	return repository, nil
+}
+
+func (c *Client) Branches(ctx context.Context, accessToken string, repositoryID int64, page, perPage int) (BranchPage, error) {
+	if !validSecret(accessToken) || repositoryID < 1 || !validPage(page, perPage) {
+		return BranchPage{}, &Error{Code: "invalid_request"}
+	}
+	endpoint := APIOrigin + "/repositories/" + strconv.FormatInt(repositoryID, 10) + "/branches?page=" + strconv.Itoa(page) + "&per_page=" + strconv.Itoa(perPage)
+	var response []struct {
+		Name   string `json:"name"`
+		Commit struct {
+			SHA string `json:"sha"`
+		} `json:"commit"`
+		Protected bool `json:"protected"`
+	}
+	if err := c.api(ctx, endpoint, accessToken, &response); err != nil {
+		return BranchPage{}, err
+	}
+	if len(response) > perPage {
+		return BranchPage{}, &Error{Code: "invalid_response"}
+	}
+	result := BranchPage{Branches: make([]Branch, 0, len(response))}
+	for _, item := range response {
+		if !validBranch(item.Name) || !validSHA(item.Commit.SHA) {
+			return BranchPage{}, &Error{Code: "invalid_response"}
+		}
+		result.Branches = append(result.Branches, Branch{Name: item.Name, SHA: item.Commit.SHA, Protected: item.Protected})
+	}
+	return result, nil
+}
+
+func (c *Client) Branch(ctx context.Context, accessToken string, repositoryID int64, branch string) (Branch, error) {
+	if !validSecret(accessToken) || repositoryID < 1 || !validBranch(branch) {
+		return Branch{}, &Error{Code: "invalid_request"}
+	}
+	endpoint := APIOrigin + "/repositories/" + strconv.FormatInt(repositoryID, 10) + "/branches/" + url.PathEscape(branch)
+	var response struct {
+		Name   string `json:"name"`
+		Commit struct {
+			SHA string `json:"sha"`
+		} `json:"commit"`
+		Protected bool `json:"protected"`
+	}
+	if err := c.api(ctx, endpoint, accessToken, &response); err != nil {
+		return Branch{}, err
+	}
+	if response.Name != branch || !validSHA(response.Commit.SHA) {
+		return Branch{}, &Error{Code: "invalid_response"}
+	}
+	return Branch{Name: response.Name, SHA: response.Commit.SHA, Protected: response.Protected}, nil
+}
+
+type repositoryResponse struct {
+	ID    int64 `json:"id"`
+	Owner struct {
+		Login string `json:"login"`
+	} `json:"owner"`
+	Name          string `json:"name"`
+	DefaultBranch string `json:"default_branch"`
+	Private       bool   `json:"private"`
+	Archived      bool   `json:"archived"`
+	Disabled      bool   `json:"disabled"`
+}
+
+func validateRepository(value repositoryResponse) (Repository, error) {
+	if value.ID < 1 || !validASCII(value.Owner.Login, 1, 255) || !validASCII(value.Name, 1, 255) || !validBranch(value.DefaultBranch) {
+		return Repository{}, &Error{Code: "invalid_response"}
+	}
+	return Repository{ID: value.ID, Owner: value.Owner.Login, Name: value.Name, DefaultBranch: value.DefaultBranch, Private: value.Private, Archived: value.Archived, Disabled: value.Disabled}, nil
+}
+
+func validPage(page, perPage int) bool {
+	return page >= 1 && page <= 10000 && perPage >= 1 && perPage <= 100
+}
+
+func validBranch(value string) bool {
+	return validASCII(value, 1, 255) && !strings.HasPrefix(value, "/") && !strings.HasSuffix(value, "/") && !strings.HasSuffix(value, ".lock") && !strings.Contains(value, "..") && !strings.Contains(value, "@{") && !strings.ContainsAny(value, " ~^:?*[\\")
+}
+
+func validSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) form(ctx context.Context, endpoint string, values url.Values, target any) error {

@@ -291,6 +291,81 @@ func TestInstallationsRejectInvalidProviderPayloads(t *testing.T) {
 	}
 }
 
+func TestRepositoriesBranchesAndRenameUseImmutableIDsAndBoundedPagination(t *testing.T) {
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	var calls int
+	client := testClient(t, func(request *http.Request) *http.Response {
+		calls++
+		if request.Header.Get("Authorization") != "Bearer access" {
+			t.Fatalf("authorization = %q", request.Header.Get("Authorization"))
+		}
+		switch calls {
+		case 1:
+			if request.URL.Path != "/user/installations/7/repositories" || request.URL.Query().Get("page") != "2" || request.URL.Query().Get("per_page") != "50" {
+				t.Fatalf("repository page URL = %s", request.URL)
+			}
+			return jsonResponse(200, `{"total_count":1,"repositories":[{"id":41,"owner":{"login":"old-owner"},"name":"repo","default_branch":"main","private":true}]}`)
+		case 2:
+			if request.URL.Path != "/user/installations/7/repositories/41" {
+				t.Fatalf("repository URL = %s", request.URL)
+			}
+			return jsonResponse(200, `{"id":41,"owner":{"login":"new-owner"},"name":"renamed","default_branch":"release/v1","private":true}`)
+		case 3:
+			if request.URL.Path != "/repositories/41/branches" || request.URL.Query().Get("page") != "1" {
+				t.Fatalf("branches URL = %s", request.URL)
+			}
+			return jsonResponse(200, `[{"name":"release/v1","commit":{"sha":"`+sha+`"},"protected":true}]`)
+		case 4:
+			if request.URL.EscapedPath() != "/repositories/41/branches/release%2Fv1" {
+				t.Fatalf("branch URL = %s escaped=%s", request.URL, request.URL.EscapedPath())
+			}
+			return jsonResponse(200, `{"name":"release/v1","commit":{"sha":"`+sha+`"},"protected":true}`)
+		default:
+			t.Fatalf("unexpected call %d", calls)
+			return nil
+		}
+	})
+	page, err := client.Repositories(context.Background(), "access", 7, 2, 50)
+	if err != nil || len(page.Repositories) != 1 || page.Repositories[0].ID != 41 {
+		t.Fatalf("repository page = %#v err=%v", page, err)
+	}
+	repository, err := client.Repository(context.Background(), "access", 7, 41)
+	if err != nil || repository.Owner != "new-owner" || repository.Name != "renamed" {
+		t.Fatalf("repository = %#v err=%v", repository, err)
+	}
+	branches, err := client.Branches(context.Background(), "access", 41, 1, 100)
+	if err != nil || len(branches.Branches) != 1 || branches.Branches[0].Name != "release/v1" {
+		t.Fatalf("branches = %#v err=%v", branches, err)
+	}
+	branch, err := client.Branch(context.Background(), "access", 41, "release/v1")
+	if err != nil || branch.SHA != sha {
+		t.Fatalf("branch = %#v err=%v", branch, err)
+	}
+}
+
+func TestRepositoryAndBranchValidationRejectsMismatchesAndUnsafeNames(t *testing.T) {
+	client := testClient(t, func(*http.Request) *http.Response {
+		return jsonResponse(200, `{"id":9,"owner":{"login":"octo"},"name":"repo","default_branch":"main"}`)
+	})
+	if _, err := client.Repository(context.Background(), "access", 7, 8); !IsCode(err, "invalid_response") {
+		t.Fatalf("provider immutable ID mismatch error = %v", err)
+	}
+	for _, branch := range []string{"../main", "/main", "main.lock", "feature\\bad", "bad name"} {
+		if _, err := client.Branch(context.Background(), "access", 8, branch); !IsCode(err, "invalid_request") {
+			t.Errorf("branch %q error = %v", branch, err)
+		}
+	}
+	if _, err := client.Repositories(context.Background(), "access", 7, 1, 101); !IsCode(err, "invalid_request") {
+		t.Fatalf("pagination error = %v", err)
+	}
+	client = testClient(t, func(*http.Request) *http.Response {
+		return jsonResponse(200, `[{"name":"main","commit":{"sha":"not-a-sha"}}]`)
+	})
+	if _, err := client.Branches(context.Background(), "access", 8, 1, 30); !IsCode(err, "invalid_response") {
+		t.Fatalf("invalid branch payload error = %v", err)
+	}
+}
+
 func jsonResponse(status int, body string) *http.Response {
 	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
 }
