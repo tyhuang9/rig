@@ -26,6 +26,7 @@ import {
 
 export type {
   Application,
+  CreateApplicationRequest,
   GitHubBranch,
   GitHubDeviceAuthorization,
   GitHubInstallation,

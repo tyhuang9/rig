@@ -12,6 +12,7 @@ import {
   type Job,
   type User,
 } from "./api";
+import { SourceWizard } from "./source-wizard";
 
 type IconName = "apps" | "machines" | "activity" | "logout";
 
@@ -151,36 +152,11 @@ function Meta({ label, value, mono = false }: { label: string; value: string; mo
   return <div className="meta"><small>{label}</small><span className={mono ? "mono" : undefined} title={value}>{value}</span></div>;
 }
 
-const addSchema = z.object({
-  name: z.string().trim().min(1, "Enter an application name").max(100, "Use 100 characters or fewer"),
-  description: z.string().max(300, "Use 300 characters or fewer"),
-  sourcePath: z.string().trim().min(1, "Enter a local source path"),
-});
-type AddFields = z.infer<typeof addSchema>;
-
 function AddApplicationPage() {
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
-  const [inspection, setInspection] = useState("");
-  const errorSummary = useRef<HTMLDivElement>(null);
-  const { register, handleSubmit, getValues, formState: { errors, isSubmitting } } = useForm<AddFields>({ resolver: zodResolver(addSchema), defaultValues: { name: "", description: "", sourcePath: "" }, shouldFocusError: false });
-  const create = useMutation({ mutationFn: api.createApp, onSuccess: async (app) => { await queryClient.invalidateQueries({ queryKey: ["apps"] }); navigate(`/apps/${app.id}`); } });
-  const invalid = () => window.setTimeout(() => errorSummary.current?.focus(), 0);
   return <>
     <PageHeader title="Add application" subtitle="Save a source reference and durable application draft." action={<button className="button" onClick={() => navigate("/apps")}>Cancel</button>}/>
-    <div className="wizard">
-      <ol aria-label="Setup progress"><li aria-current="step">Source and review</li><li>Development deployment</li></ol>
-      <form onSubmit={handleSubmit((values) => create.mutate(values), invalid)} noValidate>
-        <h2>Application source</h2><p>Compose parsing starts in the real runtime milestone. Source validation here is truthful about that boundary.</p>
-        {(create.error || Object.keys(errors).length > 0) && <div ref={errorSummary} tabIndex={-1} className="error-summary" role="alert">{create.error?.message || "Check the highlighted fields."}</div>}
-        <FormField label="Application name" id="app-name" error={errors.name?.message} required><input id="app-name" required aria-invalid={Boolean(errors.name)} aria-describedby={errors.name ? "app-name-error" : undefined} {...register("name")}/></FormField>
-        <FormField label="Description" id="description" error={errors.description?.message}><input id="description" aria-invalid={Boolean(errors.description)} aria-describedby={errors.description ? "description-error" : undefined} {...register("description")}/></FormField>
-        <FormField label="Local source path" id="source-path" error={errors.sourcePath?.message} required><input id="source-path" required placeholder="C:\projects\my-app" aria-invalid={Boolean(errors.sourcePath)} aria-describedby={errors.sourcePath ? "source-path-error" : undefined} {...register("sourcePath")}/></FormField>
-        <button type="button" className="button" onClick={() => api.inspect({ sourcePath: getValues("sourcePath") }).then((result) => setInspection(result.findings.length > 0 ? result.findings.map((finding) => finding.message).join(" ") : `Found ${result.services.length} service${result.services.length === 1 ? "" : "s"}.`)).catch((error) => setInspection(error.message))}>Check source</button>
-        {inspection && <p className="callout info" role="status">{inspection}</p>}
-        <footer><button className="button" type="button" onClick={() => navigate("/apps")}>Back</button><button className="button primary" disabled={isSubmitting || create.isPending}>{create.isPending ? "Saving…" : "Save application"}</button></footer>
-      </form>
-    </div>
+    <SourceWizard onCancel={() => navigate("/apps")} onCreated={(id) => navigate(`/apps/${id}`)} />
   </>;
 }
 
