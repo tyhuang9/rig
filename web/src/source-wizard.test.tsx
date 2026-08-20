@@ -577,23 +577,30 @@ describe("SourceWizard", () => {
     expect(screen.getByRole("button", { name: /previous github app installations page/i })).toBe(previous);
     expect(screen.getByRole("button", { name: /next github app installations page/i })).toBe(next);
     await waitFor(() => expect(pagination.getAttribute("aria-busy")).toBe("true"));
-    expect(previous.disabled).toBe(true);
-    expect(next.disabled).toBe(true);
+    expect(previous.disabled).toBe(false);
+    expect(previous.getAttribute("aria-disabled")).toBe("true");
+    expect(next.disabled).toBe(false);
+    expect(next.getAttribute("aria-disabled")).toBe("true");
     expect(document.activeElement).toBe(next);
     expect(screen.getAllByText(/^loading github app installations page 2\.$/i)).toHaveLength(1);
+    fireEvent.click(next);
+    expect(api.githubInstallations).toHaveBeenCalledTimes(2);
 
     await act(async () => secondPage.resolve({
       page: 2,
       perPage: 30,
-      totalCount: 90,
-      items: [{ id: 11, accountLogin: "octo-two", accountType: "Organization", targetType: "Organization", repositorySelection: "selected", cachedAt: "2026-01-01T00:00:00Z" }],
+      totalCount: 30,
+      items: [],
     }));
-    await screen.findByText(/^github app installations page 2 loaded\. 1 result\.$/i);
+    await screen.findByText(/^github app installations page 2 loaded\. 0 results\.$/i);
     expect(screen.getByRole("navigation", { name: /github app installations pagination/i })).toBe(pagination);
     expect(screen.getByRole("button", { name: /next github app installations page/i })).toBe(next);
     expect(pagination.getAttribute("aria-busy")).toBe("false");
-    expect(next.disabled).toBe(false);
+    expect(previous.getAttribute("aria-disabled")).toBe("false");
+    expect(next.getAttribute("aria-disabled")).toBe("true");
     expect(document.activeElement).toBe(next);
+    fireEvent.click(next);
+    expect(api.githubInstallations).toHaveBeenCalledTimes(2);
   });
 
   it("clears repository and all downstream state when the repository page changes", async () => {
@@ -653,8 +660,8 @@ describe("SourceWizard", () => {
     const previous = screen.getByRole("button", { name: /previous branches page/i }) as HTMLButtonElement;
     const next = screen.getByRole("button", { name: /next branches page/i }) as HTMLButtonElement;
     expect(pagination.textContent).toMatch(/page 2/i);
-    expect(previous.disabled).toBe(false);
-    expect(next.disabled).toBe(true);
+    expect(previous.getAttribute("aria-disabled")).toBe("false");
+    expect(next.getAttribute("aria-disabled")).toBe("true");
     expect(screen.getByText(/no branches found/i)).toBeTruthy();
 
     fireEvent.click(previous);
@@ -662,8 +669,8 @@ describe("SourceWizard", () => {
     await screen.findByText(/^branches page 1 loaded\. 30 results\.$/i);
     expect(screen.getByRole("navigation", { name: /branches pagination/i })).toBe(pagination);
     expect(pagination.textContent).toMatch(/page 1/i);
-    expect(previous.disabled).toBe(true);
-    expect(next.disabled).toBe(false);
+    expect(previous.getAttribute("aria-disabled")).toBe("true");
+    expect(next.getAttribute("aria-disabled")).toBe("false");
     expect(screen.getByRole("option", { name: /main/i })).toBeTruthy();
   });
 

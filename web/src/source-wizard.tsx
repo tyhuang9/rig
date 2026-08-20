@@ -32,10 +32,15 @@ export function isDeviceAuthorizationExpired(expiresAt: string, now = Date.now()
 
 function PaginationControls({ label, page, onPageChange, hasNext, loading, statusId }: { label: string; page: number; onPageChange: (page: number) => void; hasNext: boolean; loading: boolean; statusId: string }) {
   if (page === 1 && !hasNext && !loading) return null;
+  const previousUnavailable = loading || page === 1;
+  const nextUnavailable = loading || !hasNext;
+  const changePage = (nextPage: number, unavailable: boolean) => {
+    if (!unavailable) onPageChange(nextPage);
+  };
   return <nav className="wizard-pagination" aria-label={`${label} pagination`} aria-busy={loading} aria-describedby={statusId}>
-    <button type="button" className="button small" aria-label={`Previous ${label} page`} disabled={loading || page === 1} onClick={() => onPageChange(page - 1)}>Previous</button>
+    <button type="button" className="button small" aria-label={`Previous ${label} page`} aria-disabled={previousUnavailable} onClick={() => changePage(page - 1, previousUnavailable)}>Previous</button>
     <span>Page {page}</span>
-    <button type="button" className="button small" aria-label={`Next ${label} page`} disabled={loading || !hasNext} onClick={() => onPageChange(page + 1)}>Next</button>
+    <button type="button" className="button small" aria-label={`Next ${label} page`} aria-disabled={nextUnavailable} onClick={() => changePage(page + 1, nextUnavailable)}>Next</button>
   </nav>;
 }
 

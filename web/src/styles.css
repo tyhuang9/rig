@@ -204,6 +204,9 @@ button:disabled { cursor: wait; opacity: .62; }
 .source-selects { width: 100%; }
 .wizard-pagination { display: flex; align-items: center; gap: 8px; min-height: 36px; margin: 7px 0 4px; color: #5f6672; font-size: 12px; }
 .wizard-pagination .button { min-width: 80px; }
+.wizard-pagination .button[aria-disabled="true"] { cursor: not-allowed; opacity: .62; }
+.wizard-pagination .button[aria-disabled="true"]:hover { background: #fff; }
+.wizard-pagination[aria-busy="true"] .button[aria-disabled="true"] { cursor: wait; }
 .source-panel a { color: #274ec9; font-weight: 650; }
 .source-panel code { padding: 2px 4px; border-radius: 4px; background: #e6ebf6; color: #253e78; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 
