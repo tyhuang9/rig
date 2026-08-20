@@ -68,10 +68,10 @@ func openTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,created_at,updated_at) VALUES ('local','Local','local','ready','windows','amd64','localhost',datetime('now'),datetime('now'))`); err != nil {
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,agent_version,created_at,updated_at) VALUES ('local','Local','local','ready','windows','amd64','localhost','test',datetime('now'),datetime('now'))`); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
 
