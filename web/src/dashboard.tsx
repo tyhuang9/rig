@@ -14,6 +14,7 @@ import {
 } from "./api";
 import { SourceWizard } from "./source-wizard";
 import { ApplicationConfigurationPanel } from "./application-configuration";
+import { UnsavedChangesGuard, useConfirmDiscard } from "./unsaved-changes";
 
 type IconName = "apps" | "machines" | "activity" | "logout";
 
@@ -33,6 +34,7 @@ function StatusText({ value }: { value: string }) {
 
 function Layout({ user, onLogout, children }: { user: User; onLogout: () => void; children: React.ReactNode }) {
   const location = useLocation();
+  const confirmDiscard = useConfirmDiscard();
   const routeName = location.pathname.startsWith("/machines") ? "Machines" : location.pathname.startsWith("/activity") ? "Activity" : location.pathname.startsWith("/apps/new") ? "Add application" : "Applications";
   return <div className="shell">
     <a className="skip" href="#main">Skip to content</a>
@@ -45,7 +47,7 @@ function Layout({ user, onLogout, children }: { user: User; onLogout: () => void
         <NavLink to="/activity" aria-label="Activity"><Icon name="activity"/><span>Activity</span></NavLink>
       </nav>
       <div className="rail-fill"/>
-      <button className="rail-link" aria-label="Sign out" onClick={onLogout}><Icon name="logout"/><span>Sign out</span></button>
+      <button className="rail-link" aria-label="Sign out" onClick={() => { if (confirmDiscard()) onLogout(); }}><Icon name="logout"/><span>Sign out</span></button>
       <div className="account"><b aria-hidden="true">{user.username.slice(0, 1).toUpperCase()}</b><span>{user.username}<small>Administrator</small></span></div>
     </aside>
     <span className="sr-only" role="status" aria-live="polite">{routeName} page</span>
@@ -237,5 +239,5 @@ export function App() {
   if (bootstrapRequired === null) return <main className="auth"><LoadingState/></main>;
   if (!user) return <Login setup={bootstrapRequired} onAuthenticated={(nextUser) => { setUser(nextUser); setBootstrapRequired(false); navigate("/apps"); }}/>;
   const logout = async () => { try { await api.logout(); } finally { clearCSRF(); setUser(null); navigate("/login"); } };
-  return <Layout user={user} onLogout={logout}><Routes><Route path="/" element={<ApplicationsPage/>}/><Route path="/apps" element={<ApplicationsPage/>}/><Route path="/apps/new" element={<AddApplicationPage/>}/><Route path="/apps/:id" element={<ApplicationDetailPage/>}/><Route path="/machines" element={<MachinesPage/>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="*" element={<ApplicationsPage/>}/></Routes></Layout>;
+  return <UnsavedChangesGuard><Layout user={user} onLogout={logout}><Routes><Route path="/" element={<ApplicationsPage/>}/><Route path="/apps" element={<ApplicationsPage/>}/><Route path="/apps/new" element={<AddApplicationPage/>}/><Route path="/apps/:id" element={<ApplicationDetailPage/>}/><Route path="/machines" element={<MachinesPage/>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="*" element={<ApplicationsPage/>}/></Routes></Layout></UnsavedChangesGuard>;
 }

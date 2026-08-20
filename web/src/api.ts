@@ -49,12 +49,14 @@ export class APIError extends Error {
   readonly status: number;
   readonly code: string;
   readonly detail: string;
+  readonly errors: Record<string, string>;
   readonly retryAfterSeconds?: number;
 
-  constructor({ status, code, detail, retryAfterSeconds }: {
+  constructor({ status, code, detail, errors = {}, retryAfterSeconds }: {
     status: number;
     code: string;
     detail: string;
+    errors?: Record<string, string>;
     retryAfterSeconds?: number;
   }) {
     super(detail);
@@ -62,6 +64,7 @@ export class APIError extends Error {
     this.status = status;
     this.code = code;
     this.detail = detail;
+    this.errors = errors;
     this.retryAfterSeconds = retryAfterSeconds;
   }
 }
@@ -112,6 +115,9 @@ async function request<T>(path: string, init: RequestInit = {}, retryCSRF = true
       status: response.status,
       code: typeof body.code === "string" ? body.code : "request_failed",
       detail: typeof body.detail === "string" ? body.detail : "Request failed",
+      errors: body.errors && typeof body.errors === "object"
+        ? Object.fromEntries(Object.entries(body.errors).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
+        : {},
       retryAfterSeconds,
     });
   }

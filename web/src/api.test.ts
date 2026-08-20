@@ -45,6 +45,16 @@ describe("API client", () => {
     await expect(api.login({ username: "a", passphrase: "b" })).rejects.toThrow("Invalid credentials");
   });
 
+  it("preserves safe field errors from problem responses", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ code: "invalid_configuration", detail: "Invalid configuration", errors: { variables: "Use portable names", unsafe: 42 } }), { status: 422 }),
+    ));
+    await expect(api.replaceApplicationConfiguration("app", { expectedRevisionNumber: 0, variables: [], secrets: [], remove: [] })).rejects.toEqual(expect.objectContaining<Partial<APIError>>({
+      code: "invalid_configuration",
+      errors: { variables: "Use portable names" },
+    }));
+  });
+
   it("uses the generated cancellation operation with CSRF", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ job: { id: "job/one", status: "cancelled" } }), { status: 200 }),
