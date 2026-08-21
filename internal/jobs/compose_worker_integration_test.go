@@ -251,7 +251,7 @@ func TestComposeRestartRecoveryCleansExactTempAndDoesNotDuplicateLinkage(t *test
 		t.Fatal(err)
 	}
 	deployment, err = fixture.deployments.Initialize(context.Background(), fixture.app.ID, deployment.ID, "", configuration.RevisionID, configuration.RevisionNumber)
-	clear(configuration.Environment)
+	configuration.Clear()
 	if err != nil {
 		t.Fatal(err)
 	}

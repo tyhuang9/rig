@@ -73,6 +73,9 @@ func TestExportRevisionForExecutionPinsExactRevision(t *testing.T) {
 	if string(exact.Environment) != wantExact {
 		t.Fatalf("exact revision environment=%q want=%q", exact.Environment, wantExact)
 	}
+	if len(exact.SecretOrigins) != 1 || string(exact.SecretOrigins[0].Key) != "TOKEN" || string(exact.SecretOrigins[0].Value) != "secret" || exact.SecretOrigins[0].RevisionID != first.RevisionID || exact.SecretOrigins[0].RevisionNumber != first.RevisionNumber {
+		t.Fatalf("unexpected exact secret origins: %#v", exact.SecretOrigins)
+	}
 	current, err := store.ExportCurrentForExecution(ctx, configTestApp)
 	if err != nil {
 		t.Fatal(err)
@@ -81,9 +84,9 @@ func TestExportRevisionForExecutionPinsExactRevision(t *testing.T) {
 		t.Fatalf("unexpected current revision export: %#v", current)
 	}
 
-	clear(empty.Environment)
-	clear(exact.Environment)
-	clear(current.Environment)
+	empty.Clear()
+	exact.Clear()
+	current.Clear()
 }
 
 func TestExportRevisionForExecutionReturnsIndependentCallerOwnedBytes(t *testing.T) {
@@ -101,9 +104,12 @@ func TestExportRevisionForExecutionReturnsIndependentCallerOwnedBytes(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	clear(first.Environment)
+	first.Clear()
 	if strings.ContainsRune(string(second.Environment), '\x00') || !strings.Contains(string(second.Environment), "TOKEN='secret'") {
 		t.Fatalf("clearing one export changed another: %q", second.Environment)
+	}
+	if len(second.SecretOrigins) != 1 || string(second.SecretOrigins[0].Key) != "TOKEN" || string(second.SecretOrigins[0].Value) != "secret" {
+		t.Fatalf("unexpected independent secret origins: %#v", second.SecretOrigins)
 	}
 	encoded, err := json.Marshal(second)
 	if err != nil {
@@ -112,7 +118,12 @@ func TestExportRevisionForExecutionReturnsIndependentCallerOwnedBytes(t *testing
 	if strings.Contains(string(encoded), "secret") || strings.Contains(string(encoded), "Environment") {
 		t.Fatalf("execution environment was JSON serialized: %s", encoded)
 	}
-	clear(second.Environment)
+	originKey := second.SecretOrigins[0].Key
+	originValue := second.SecretOrigins[0].Value
+	second.Clear()
+	if second.Environment != nil || second.SecretOrigins != nil || !allZero(originKey) || !allZero(originValue) {
+		t.Fatalf("execution configuration did not clear owned buffers")
+	}
 }
 
 func TestExportRevisionForExecutionRejectsMismatchedIdentity(t *testing.T) {
@@ -127,7 +138,7 @@ func TestExportRevisionForExecutionRejectsMismatchedIdentity(t *testing.T) {
 	}{{"", 1}, {"00000000-0000-0000-0000-000000000000", 0}, {"00000000-0000-0000-0000-000000000000", 1}, {revision.RevisionID, revision.RevisionNumber + 1}} {
 		result, err := store.ExportRevisionForExecution(context.Background(), configTestApp, request.id, request.number)
 		if !IsCode(err, "configuration_unavailable") {
-			clear(result.Environment)
+			result.Clear()
 			t.Fatalf("id=%q number=%d error=%v", request.id, request.number, err)
 		}
 	}
@@ -150,10 +161,19 @@ func TestExportRevisionForExecutionFailsClosedOnCorruptBundle(t *testing.T) {
 	}
 	clear(plaintext)
 	result, err := store.ExportRevisionForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber)
-	clear(result.Environment)
+	result.Clear()
 	if !IsCode(err, "configuration_unavailable") {
 		t.Fatalf("corrupt exact revision error = %v", err)
 	}
+}
+
+func allZero(value []byte) bool {
+	for _, item := range value {
+		if item != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func TestRecoverRemovesRecognizedOrphansAndFailsClosedOnCorruption(t *testing.T) {

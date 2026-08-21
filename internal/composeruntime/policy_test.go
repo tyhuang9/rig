@@ -1,6 +1,7 @@
 package composeruntime
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deployments"
 )
@@ -656,6 +658,123 @@ func TestPolicyRecursiveCompositeSchema(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPolicySecretOriginsAreSanitizedAndRejected(t *testing.T) {
+	p := newMatrixPaths(t)
+	secretDirectory := filepath.Join(p.workspace, "SecretPath")
+	if err := os.Mkdir(secretDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	revisionID := uuid.NewString()
+	tests := []struct {
+		name   string
+		secret string
+		model  any
+	}{
+		{
+			name:   "capability uppercase normalization",
+			secret: "net_admin",
+			model:  serviceModel(map[string]any{"cap_add": []any{"NET_ADMIN"}}),
+		},
+		{
+			name:   "canonical managed path",
+			secret: "SecretPath",
+			model: serviceModel(map[string]any{
+				"volumes": []any{map[string]any{
+					"type": "bind", "source": secretDirectory, "target": "/data", "read_only": true,
+				}},
+			}),
+		},
+		{
+			name:   "published port scalar",
+			secret: "8080",
+			model: serviceModel(map[string]any{
+				"ports": []any{map[string]any{"target": 80, "published": 8080}},
+			}),
+		},
+		{
+			name:   "deploy device option",
+			secret: "secret-option",
+			model: serviceModel(map[string]any{
+				"deploy": map[string]any{
+					"resources": map[string]any{
+						"reservations": map[string]any{
+							"devices": []any{map[string]any{
+								"capabilities": []any{"gpu"},
+								"options":      map[string]any{"profile": "secret-option"},
+							}},
+						},
+					},
+				},
+			}),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body, err := json.Marshal(test.model)
+			if err != nil {
+				t.Fatal(err)
+			}
+			origin := appconfig.SecretOrigin{RevisionID: revisionID, RevisionNumber: 7, Key: []byte("TOKEN"), Value: []byte(test.secret)}
+			findings, err := EvaluatePolicy(body, p.workspace, origin)
+			if err != nil || len(findings) == 0 {
+				t.Fatalf("findings=%#v err=%v", findings, err)
+			}
+			encoded, err := json.Marshal(findings)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, variant := range []string{test.secret, strings.ToLower(test.secret), strings.ToUpper(test.secret)} {
+				if bytes.Contains(bytes.ToLower(encoded), bytes.ToLower([]byte(variant))) {
+					t.Fatalf("secret variant persisted in findings: %s", encoded)
+				}
+			}
+			var foundSanitized bool
+			for _, finding := range findings {
+				if strings.Contains(finding.Scope, "secret-origin:") {
+					foundSanitized = true
+					if finding.Disposition != DispositionRejected {
+						t.Fatalf("tainted finding disposition=%s", finding.Disposition)
+					}
+				}
+			}
+			if !foundSanitized {
+				t.Fatalf("no sanitized rejected finding in %#v", findings)
+			}
+		})
+	}
+}
+
+func TestPolicySecretOriginRotationAndUntaintedScopes(t *testing.T) {
+	workspace := t.TempDir()
+	body := []byte(`{"services":{"web":{"privileged":true}}}`)
+	baseline, err := EvaluatePolicy(body, workspace)
+	if err != nil || len(baseline) != 1 {
+		t.Fatalf("baseline=%#v err=%v", baseline, err)
+	}
+	unrelated := appconfig.SecretOrigin{RevisionID: uuid.NewString(), RevisionNumber: 1, Key: []byte("TOKEN"), Value: []byte("does-not-occur")}
+	control, err := EvaluatePolicy(body, workspace, unrelated)
+	if err != nil || len(control) != 1 || control[0] != baseline[0] {
+		t.Fatalf("untainted scope changed: baseline=%#v control=%#v err=%v", baseline, control, err)
+	}
+
+	shortValue := []byte("web")
+	first := appconfig.SecretOrigin{RevisionID: uuid.NewString(), RevisionNumber: 1, Key: []byte("TOKEN"), Value: shortValue}
+	second := appconfig.SecretOrigin{RevisionID: uuid.NewString(), RevisionNumber: 2, Key: []byte("TOKEN"), Value: append([]byte(nil), shortValue...)}
+	a, err := EvaluatePolicy(body, workspace, first)
+	if err != nil || len(a) != 1 || a[0].Disposition != DispositionRejected {
+		t.Fatalf("first taint=%#v err=%v", a, err)
+	}
+	b, err := EvaluatePolicy(body, workspace, second)
+	if err != nil || len(b) != 1 || b[0].Disposition != DispositionRejected {
+		t.Fatalf("second taint=%#v err=%v", b, err)
+	}
+	if a[0].Fingerprint == b[0].Fingerprint || a[0].Scope == b[0].Scope {
+		t.Fatalf("revision rotation reused sanitized identity: %#v %#v", a, b)
+	}
+	// Intentionally conservative: short/common secret values that occur in an
+	// otherwise non-sensitive exact scope fail closed instead of risking reuse.
 }
 
 func newMatrixPaths(t *testing.T) matrixPaths {

@@ -60,7 +60,32 @@ type Configuration struct {
 type ExecutionConfiguration struct {
 	RevisionID     string
 	RevisionNumber int64
-	Environment    []byte `json:"-"`
+	Environment    []byte         `json:"-"`
+	SecretOrigins  []SecretOrigin `json:"-"`
+}
+
+// SecretOrigin is caller-owned metadata used to keep values originating from a
+// protected configuration secret out of durable policy findings. Key and Value
+// are independent buffers and must be cleared with ExecutionConfiguration.Clear.
+type SecretOrigin struct {
+	RevisionID     string
+	RevisionNumber int64
+	Key            []byte `json:"-"`
+	Value          []byte `json:"-"`
+}
+
+// Clear releases and overwrites the decrypted material owned by one execution
+// export. It is safe to call more than once.
+func (c *ExecutionConfiguration) Clear() {
+	clear(c.Environment)
+	c.Environment = nil
+	for index := range c.SecretOrigins {
+		clear(c.SecretOrigins[index].Key)
+		clear(c.SecretOrigins[index].Value)
+		c.SecretOrigins[index] = SecretOrigin{}
+	}
+	clear(c.SecretOrigins)
+	c.SecretOrigins = nil
 }
 
 type ValueInput struct {
@@ -187,13 +212,23 @@ func (s *Store) ExportRevisionForExecution(ctx context.Context, appID, revisionI
 	}
 
 	environment := []byte("# hostd application configuration\n")
+	secretOrigins := make([]SecretOrigin, 0)
 	for _, key := range sortedBundleKeys(entries) {
+		entry := entries[key]
 		environment = append(environment, key...)
 		environment = append(environment, '=')
-		environment = appendDotenvSingleQuoted(environment, entries[key].Value)
+		environment = appendDotenvSingleQuoted(environment, entry.Value)
 		environment = append(environment, '\n')
+		if entry.Sensitive && entry.Value != "" {
+			secretOrigins = append(secretOrigins, SecretOrigin{
+				RevisionID:     revisionID,
+				RevisionNumber: revisionNumber,
+				Key:            append([]byte(nil), key...),
+				Value:          append([]byte(nil), entry.Value...),
+			})
+		}
 	}
-	return ExecutionConfiguration{RevisionID: revisionID, RevisionNumber: revisionNumber, Environment: environment}, nil
+	return ExecutionConfiguration{RevisionID: revisionID, RevisionNumber: revisionNumber, Environment: environment, SecretOrigins: secretOrigins}, nil
 }
 
 // ExportCurrentForExecution resolves the current head once, then delegates to

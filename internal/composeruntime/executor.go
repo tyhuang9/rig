@@ -125,7 +125,7 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 	if err != nil {
 		return jobs.ExecutionResult{}, e.fail(ctx, deployment, executionCode(ctx, err))
 	}
-	defer clear(configuration.Environment)
+	defer configuration.Clear()
 
 	if !deployment.ProvenanceInitialized {
 		deployment, err = e.deployments.Initialize(ctx, job.ResourceID, deployment.ID, source.releaseID, configuration.RevisionID, configuration.RevisionNumber)
@@ -210,7 +210,7 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 	if err := report(reporter, jobs.Running, "evaluate_policy", 60); err != nil {
 		return jobs.ExecutionResult{}, failAfterTemp("internal_error")
 	}
-	findings, err := EvaluatePolicy(configResult.Stdout, source.workspace)
+	findings, err := EvaluatePolicy(configResult.Stdout, source.workspace, configuration.SecretOrigins...)
 	if err != nil {
 		return jobs.ExecutionResult{}, failAfterTemp("compose_invalid")
 	}

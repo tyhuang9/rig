@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/pathsecurity"
 )
 
@@ -112,13 +113,14 @@ type PolicyError struct {
 func (e *PolicyError) Error() string { return "compose policy: " + e.Code }
 
 type evaluator struct {
-	workspace string
-	findings  []PolicyFinding
-	indices   map[string]int
-	overflow  bool
+	workspace     string
+	findings      []PolicyFinding
+	indices       map[string]int
+	overflow      bool
+	secretOrigins []appconfig.SecretOrigin
 }
 
-func EvaluatePolicy(rendered []byte, workspace string) ([]PolicyFinding, error) {
+func EvaluatePolicy(rendered []byte, workspace string, secretOrigins ...appconfig.SecretOrigin) ([]PolicyFinding, error) {
 	if len(rendered) == 0 || len(rendered) > MaxEffectiveJSONBytes {
 		return nil, &PolicyError{Code: "model_too_large"}
 	}
@@ -151,7 +153,7 @@ func EvaluatePolicy(rendered []byte, workspace string) ([]PolicyFinding, error) 
 	if len(services) == 0 || len(services) > 512 {
 		return nil, &PolicyError{Code: "malformed_services"}
 	}
-	e := evaluator{workspace: root, indices: make(map[string]int)}
+	e := evaluator{workspace: root, indices: make(map[string]int), secretOrigins: secretOrigins}
 	for _, field := range sortedKeys(top) {
 		if _, supported := supportedTopLevelFields[field]; !supported && !isExtensionField(field) {
 			e.add("unsupported_top_level_field", map[string]any{"field": field}, DispositionRejected)
@@ -1016,7 +1018,11 @@ func (e *evaluator) workspaceFile(service, capability, value string) {
 }
 
 func (e *evaluator) add(capability string, scope any, disposition string) {
-	encoded, err := json.Marshal(scope)
+	sanitizedScope, tainted := sanitizePolicyScope(scope, e.secretOrigins)
+	if tainted {
+		disposition = DispositionRejected
+	}
+	encoded, err := json.Marshal(sanitizedScope)
 	if err != nil {
 		panic(err)
 	}
@@ -1034,6 +1040,99 @@ func (e *evaluator) add(capability string, scope any, disposition string) {
 	}
 	e.indices[finding.Fingerprint] = len(e.findings)
 	e.findings = append(e.findings, finding)
+}
+
+// sanitizePolicyScope is the last boundary before a finding can be persisted.
+// If a value from the exact protected configuration revision contributed to a
+// policy-bearing scope, the raw scope is discarded and replaced by stable,
+// revision-bound placeholders. The finding is then forced to rejected by add.
+func sanitizePolicyScope(scope any, origins []appconfig.SecretOrigin) (any, bool) {
+	matched := make(map[string]struct{})
+	walkPolicyScope(scope, func(value string) {
+		for _, origin := range origins {
+			if secretOriginMatches(value, origin.Value) {
+				matched[secretOriginPlaceholder(origin)] = struct{}{}
+			}
+		}
+	})
+	if len(matched) == 0 {
+		return scope, false
+	}
+	placeholders := sortedKeys(matched)
+	return map[string]any{"secretOrigins": placeholders}, true
+}
+
+func walkPolicyScope(value any, visit func(string)) {
+	switch typed := value.(type) {
+	case string:
+		visit(typed)
+	case json.Number:
+		visit(typed.String())
+	case float64:
+		visit(strconv.FormatFloat(typed, 'f', -1, 64))
+	case float32:
+		visit(strconv.FormatFloat(float64(typed), 'f', -1, 32))
+	case int:
+		visit(strconv.Itoa(typed))
+	case int64:
+		visit(strconv.FormatInt(typed, 10))
+	case bool:
+		visit(strconv.FormatBool(typed))
+	case map[string]any:
+		for key, item := range typed {
+			visit(key)
+			walkPolicyScope(item, visit)
+		}
+	case []any:
+		for _, item := range typed {
+			walkPolicyScope(item, visit)
+		}
+	case []string:
+		for _, item := range typed {
+			visit(item)
+		}
+	}
+}
+
+func secretOriginMatches(candidate string, value []byte) bool {
+	if len(value) == 0 {
+		return false
+	}
+	secret := string(value)
+	variants := []string{
+		secret,
+		strings.ToLower(secret),
+		strings.ToUpper(secret),
+		filepath.Clean(secret),
+		filepath.ToSlash(secret),
+		strings.ReplaceAll(secret, "/", `\`),
+		strings.ReplaceAll(secret, `\`, "/"),
+	}
+	seen := make(map[string]struct{}, len(variants))
+	for _, variant := range variants {
+		if variant == "" {
+			continue
+		}
+		if _, exists := seen[variant]; exists {
+			continue
+		}
+		seen[variant] = struct{}{}
+		if strings.Contains(candidate, variant) {
+			return true
+		}
+	}
+	return false
+}
+
+func secretOriginPlaceholder(origin appconfig.SecretOrigin) string {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("rig-compose-policy-secret-origin-v1\x00"))
+	_, _ = hash.Write([]byte(origin.RevisionID))
+	_, _ = hash.Write([]byte{'\x00'})
+	_, _ = hash.Write([]byte(strconv.FormatInt(origin.RevisionNumber, 10)))
+	_, _ = hash.Write([]byte{'\x00'})
+	_, _ = hash.Write(origin.Key)
+	return "secret-origin:" + hex.EncodeToString(hash.Sum(nil))
 }
 
 func PolicyFingerprint(policyVersion, capability, scope string) string {

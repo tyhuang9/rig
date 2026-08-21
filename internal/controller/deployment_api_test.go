@@ -1,16 +1,17 @@
 package controller_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,8 +19,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/apicontract"
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
+	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deployments"
@@ -41,11 +44,14 @@ type deploymentAPIFixture struct {
 	handler     http.Handler
 	app         apps.Application
 	otherApp    apps.Application
+	stateRoot   string
+	logs        *bytes.Buffer
 }
 
 func newDeploymentAPIFixture(t *testing.T, composeRuntime, fakeRuntime bool) deploymentAPIFixture {
 	t.Helper()
-	db, err := database.Open(filepath.Join(t.TempDir(), "state"))
+	stateRoot := filepath.Join(t.TempDir(), "state")
+	db, err := database.Open(stateRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,12 +88,13 @@ func newDeploymentAPIFixture(t *testing.T, composeRuntime, fakeRuntime bool) dep
 	}
 	jobService := jobs.New(db)
 	deploymentStore := deployments.New(db)
+	logs := &bytes.Buffer{}
 	handler := (&controller.Server{
 		Auth: authService, Apps: appStore, Jobs: jobService, Machines: machineStore,
 		Deployments: deploymentStore, ComposeRuntime: composeRuntime, FakeRuntime: fakeRuntime,
-		DataRoot: t.TempDir(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DataRoot: t.TempDir(), Logger: slog.New(slog.NewJSONHandler(logs, nil)),
 	}).Handler()
-	return deploymentAPIFixture{db: db, auth: authService, session: session, otherUserID: otherID, apps: appStore, jobs: jobService, deployments: deploymentStore, handler: handler, app: app, otherApp: otherApp}
+	return deploymentAPIFixture{db: db, auth: authService, session: session, otherUserID: otherID, apps: appStore, jobs: jobService, deployments: deploymentStore, handler: handler, app: app, otherApp: otherApp, stateRoot: stateRoot, logs: logs}
 }
 
 func (f deploymentAPIFixture) request(method, path, body string) *httptest.ResponseRecorder {
@@ -391,6 +398,72 @@ func TestDeploymentAndReleaseListsExposeSafeHistory(t *testing.T) {
 	release := releases.Items[0]
 	if release.ID != releaseID || release.SourceProvider != "github" || release.RepositoryID != 17 || release.RepositoryOwner != "owner" || release.RepositoryName != "repository" || release.TrackedRef != "refs/heads/main" || release.ResolvedSha == "" || release.ArchiveSha256 == "" || release.ConfigurationRevisionNumber != 0 {
 		t.Fatalf("release provenance incomplete: %#v", release)
+	}
+}
+
+func TestSecretDerivedPolicyNeverLeaksThroughDurableOrPublicSurfaces(t *testing.T) {
+	f := newDeploymentAPIFixture(t, true, false)
+	const secret = "RigSecretCapabilitySentinel9Z"
+	origin := appconfig.SecretOrigin{
+		RevisionID: uuid.NewString(), RevisionNumber: 9,
+		Key: []byte("TOKEN"), Value: []byte(secret),
+	}
+	model := []byte(`{"services":{"web":{"cap_add":["RIGSECRETCAPABILITYSENTINEL9Z"]}}}`)
+	policyFindings, err := composeruntime.EvaluatePolicy(model, t.TempDir(), origin)
+	if err != nil || len(policyFindings) != 1 || policyFindings[0].Disposition != composeruntime.DispositionRejected {
+		t.Fatalf("policy findings=%#v err=%v", policyFindings, err)
+	}
+
+	job, deployment := f.createDeployment(t, f.app.ID, "current")
+	findings := make([]deployments.Finding, len(policyFindings))
+	for index, finding := range policyFindings {
+		findings[index] = deployments.Finding{
+			PolicyVersion: finding.PolicyVersion, Capability: finding.Capability,
+			Scope: finding.Scope, Fingerprint: finding.Fingerprint, Disposition: finding.Disposition,
+		}
+	}
+	if err := f.deployments.Gate(context.Background(), f.app.ID, deployment.ID, findings); !errors.Is(err, deployments.ErrRejectedCapability) {
+		t.Fatalf("gate error=%v", err)
+	}
+	var adminID string
+	if err := f.db.QueryRow(`SELECT id FROM users WHERE username='admin'`).Scan(&adminID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.deployments.Grant(context.Background(), f.app.ID, adminID, policyFindings[0].Fingerprint); !errors.Is(err, deployments.ErrInvalidDeployment) {
+		t.Fatalf("rejected secret finding became approvable: %v", err)
+	}
+
+	history := f.request(http.MethodGet, "/api/v1/apps/"+f.app.ID+"/deployments", "")
+	events := f.request(http.MethodGet, "/api/v1/jobs/"+job.ID+"/events", "")
+	problem := f.request(http.MethodPost, "/api/v1/apps/"+f.app.ID+"/runtime-approvals", `{"fingerprint":"`+secret+`"}`)
+	for name, payload := range map[string][]byte{
+		"history response": history.Body.Bytes(), "job events": events.Body.Bytes(),
+		"problem response": problem.Body.Bytes(), "logs": f.logs.Bytes(),
+	} {
+		assertSecretAbsent(t, name, payload, secret)
+	}
+
+	if _, err := f.db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := filepath.Glob(filepath.Join(f.stateRoot, "control.db*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertSecretAbsent(t, filepath.Base(path), contents, secret)
+	}
+}
+
+func assertSecretAbsent(t *testing.T, surface string, contents []byte, secret string) {
+	t.Helper()
+	lower := bytes.ToLower(contents)
+	if bytes.Contains(lower, bytes.ToLower([]byte(secret))) {
+		t.Fatalf("secret found in %s", surface)
 	}
 }
 

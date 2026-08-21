@@ -1,6 +1,7 @@
 package composeruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -104,6 +105,11 @@ func (f *fakeConfiguration) ExportRevisionForExecution(_ context.Context, _ stri
 
 func cloneExecutionConfiguration(value appconfig.ExecutionConfiguration) appconfig.ExecutionConfiguration {
 	value.Environment = append([]byte(nil), value.Environment...)
+	value.SecretOrigins = append([]appconfig.SecretOrigin(nil), value.SecretOrigins...)
+	for index := range value.SecretOrigins {
+		value.SecretOrigins[index].Key = append([]byte(nil), value.SecretOrigins[index].Key...)
+		value.SecretOrigins[index].Value = append([]byte(nil), value.SecretOrigins[index].Value...)
+	}
 	return value
 }
 
@@ -238,6 +244,40 @@ func TestExecutorUsesInspectedEffectiveConfigAsSoleMutationInput(t *testing.T) {
 	assertExactExecutorRequests(t, fixture, fixture.runner.requests)
 	assertProgressPhases(t, fixture.reporter.updates, []string{"validate", "prepare_workspace", "materialize_release", "render_compose", "evaluate_policy", "apply_runtime", "wait_for_health", "finalize"})
 	assertCleared(t, configStdout, configStderr, upStdout, upStderr)
+	assertRuntimeTempEmpty(t, fixture.dataRoot)
+}
+
+func TestExecutorRejectsSanitizedSecretDerivedPolicyBeforeMutation(t *testing.T) {
+	fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
+	const secret = "net_admin"
+	fixture.configuration.current.Environment = []byte("TOKEN='" + secret + "'\n")
+	fixture.configuration.current.SecretOrigins = []appconfig.SecretOrigin{{
+		RevisionID: fixture.configuration.current.RevisionID, RevisionNumber: fixture.configuration.current.RevisionNumber,
+		Key: []byte("TOKEN"), Value: []byte(secret),
+	}}
+	fixture.deployments.gateErr = deployments.ErrRejectedCapability
+	configStdout := []byte(`{"services":{"web":{"cap_add":["NET_ADMIN"]}}}`)
+	fixture.runner.run = successfulRunner(runtimeprocess.CommandResult{Stdout: configStdout})
+
+	_, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
+	var executionErr *jobs.ExecutionError
+	if !errors.As(err, &executionErr) || executionErr.Code != "policy_rejected" {
+		t.Fatalf("error=%v", err)
+	}
+	if len(fixture.runner.requests) != 1 {
+		t.Fatalf("secret-derived capability reached mutation: %d runner calls", len(fixture.runner.requests))
+	}
+	if len(fixture.deployments.findings) != 1 || fixture.deployments.findings[0].Disposition != DispositionRejected || !strings.Contains(fixture.deployments.findings[0].Scope, "secret-origin:") {
+		t.Fatalf("gate findings=%#v", fixture.deployments.findings)
+	}
+	encoded, marshalErr := json.Marshal(fixture.deployments.findings)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	if bytes.Contains(bytes.ToLower(encoded), []byte(secret)) {
+		t.Fatalf("secret reached gate findings: %s", encoded)
+	}
+	assertCleared(t, configStdout)
 	assertRuntimeTempEmpty(t, fixture.dataRoot)
 }
 
