@@ -69,17 +69,24 @@ func TestRealDeploymentCompletionAndFailuresAreCentrallySanitized(t *testing.T) 
 		t.Fatalf("completion message=%q err=%v", message, err)
 	}
 	want := map[string]string{
-		"invalid_source":            "Application source is invalid",
-		"source_unavailable":        "Application source is unavailable",
-		"source_access_lost":        "Access to the application source was lost",
-		"provider_unavailable":      "Application source provider is unavailable",
-		"source_too_large":          "Application source exceeds deployment limits",
-		"configuration_unavailable": "Application configuration is unavailable",
-		"compose_invalid":           "Compose configuration is invalid",
-		"policy_rejected":           "Compose configuration requests an unsupported capability",
-		"apply_failed":              "Container runtime failed to apply the deployment",
-		"health_failed":             "Deployment did not become healthy",
-		"internal_error":            "Deployment failed because of an internal error",
+		"invalid_source":                  "Application source is invalid",
+		"source_unavailable":              "Application source is unavailable",
+		"source_access_lost":              "Access to the application source was lost",
+		"provider_unavailable":            "Application source provider is unavailable",
+		"source_too_large":                "Application source exceeds deployment limits",
+		"source_storage_full":             "Application source storage is full",
+		"configuration_unavailable":       "Application configuration is unavailable",
+		"compose_invalid":                 "Compose configuration is invalid",
+		"compose_config_invalid":          "Compose configuration is invalid",
+		"compose_config_timeout":          "Compose configuration check timed out",
+		"compose_config_output_truncated": "Compose configuration output exceeded the allowed limit",
+		"policy_rejected":                 "Compose configuration requests an unsupported capability",
+		"apply_failed":                    "Container runtime failed to apply the deployment",
+		"compose_apply_failed":            "Container runtime failed to apply the deployment",
+		"compose_apply_timeout":           "Container runtime apply timed out",
+		"compose_apply_output_truncated":  "Container runtime apply output exceeded the allowed limit",
+		"health_failed":                   "Deployment did not become healthy",
+		"internal_error":                  "Deployment failed because of an internal error",
 	}
 	for code, message := range want {
 		gotCode, gotMessage := safeExecutionFailure(&ExecutionError{Code: code, Detail: "provider-secret raw stderr"})
@@ -92,9 +99,11 @@ func TestRealDeploymentCompletionAndFailuresAreCentrallySanitized(t *testing.T) 
 func TestWaitingUserResumeStartsANewAttemptAndPausedCancelIsTerminal(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
+	releaseID := uuid.NewString()
+	insertReadyReleaseFixture(t, service, "app", releaseID)
 	job, _, err := service.CreateWithInput(CreateRequest{
 		Type: "deploy", ResourceType: "application", ResourceID: "app",
-		RequestedBy: "owner", Input: DeploymentInput{ReleaseID: uuid.NewString(), ConfigurationMode: ConfigurationOriginal},
+		RequestedBy: "owner", Input: DeploymentInput{ReleaseID: releaseID, ConfigurationMode: ConfigurationOriginal},
 	})
 	if err != nil {
 		t.Fatal(err)

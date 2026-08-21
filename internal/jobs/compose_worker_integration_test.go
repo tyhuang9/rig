@@ -197,8 +197,8 @@ func TestComposeWorkerApplyAndOuterHealthFailuresAreSanitizedWithoutRollback(t *
 		err  error
 		code string
 	}{
-		{name: "nonzero up", err: errors.New("provider-secret exit status 1"), code: "apply_failed"},
-		{name: "outer timeout", err: context.DeadlineExceeded, code: "health_failed"},
+		{name: "nonzero up", err: errors.New("provider-secret exit status 1"), code: "compose_apply_failed"},
+		{name: "outer timeout", err: context.DeadlineExceeded, code: "compose_apply_timeout"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			releaseUp := make(chan struct{})

@@ -198,13 +198,7 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 	defer clear(configResult.Stdout)
 	defer clear(configResult.Stderr)
 	if configErr != nil || configResult.StdoutTruncated || configResult.StderrTruncated || len(configResult.Stdout) == 0 {
-		code := "compose_invalid"
-		if commandUnavailable(configErr) {
-			code = "runtime_unavailable"
-		} else if errors.Is(configErr, context.Canceled) {
-			code = cancellationCode(ctx)
-		}
-		return jobs.ExecutionResult{}, failAfterTemp(code)
+		return jobs.ExecutionResult{}, failAfterTemp(configDiagnosticCode(ctx, configResult, configErr))
 	}
 
 	if err := report(reporter, jobs.Running, "evaluate_policy", 60); err != nil {
@@ -212,7 +206,7 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 	}
 	findings, err := EvaluatePolicy(configResult.Stdout, source.workspace, configuration.SecretOrigins...)
 	if err != nil {
-		return jobs.ExecutionResult{}, failAfterTemp("compose_invalid")
+		return jobs.ExecutionResult{}, failAfterTemp("compose_config_invalid")
 	}
 	if err := files.WriteCompose(configResult.Stdout); err != nil {
 		return jobs.ExecutionResult{}, failAfterTemp("internal_error")
@@ -259,15 +253,7 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 	clear(upResult.Stdout)
 	clear(upResult.Stderr)
 	if upErr != nil || upResult.StdoutTruncated || upResult.StderrTruncated {
-		code := "apply_failed"
-		if commandUnavailable(upErr) {
-			code = "runtime_unavailable"
-		} else if errors.Is(upErr, context.Canceled) {
-			code = cancellationCode(ctx)
-		} else if errors.Is(upErr, context.DeadlineExceeded) {
-			code = "health_failed"
-		}
-		return jobs.ExecutionResult{}, failAfterTemp(code)
+		return jobs.ExecutionResult{}, failAfterTemp(applyDiagnosticCode(ctx, upResult, upErr))
 	}
 	deployment, err = e.deployments.Transition(ctx, job.ResourceID, deployment.ID, deployments.WaitingHealth, "")
 	if err != nil {
@@ -412,7 +398,7 @@ func executionCode(ctx context.Context, err error) string {
 	var releaseErr *releasesnapshot.Error
 	if errors.As(err, &releaseErr) {
 		switch releaseErr.Code {
-		case "invalid_source", "source_access_lost", "source_too_large", "provider_unavailable":
+		case "invalid_source", "source_access_lost", "source_too_large", "source_storage_full", "provider_unavailable":
 			return releaseErr.Code
 		case "release_not_found":
 			return "invalid_source"
@@ -437,6 +423,42 @@ func commandUnavailable(err error) bool {
 	var executableError *exec.Error
 	var pathError *os.PathError
 	return errors.As(err, &executableError) || errors.As(err, &pathError)
+}
+
+// configDiagnosticCode and applyDiagnosticCode deliberately only use command
+// boundary state. Neither output bodies nor an inferred health stage are safe
+// to persist: `compose up --wait` can still be building, pulling, or applying
+// when its outer command timeout expires.
+func configDiagnosticCode(ctx context.Context, result runtimeprocess.CommandResult, err error) string {
+	if commandUnavailable(err) {
+		return "runtime_unavailable"
+	}
+	if errors.Is(err, context.Canceled) {
+		return cancellationCode(ctx)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "compose_config_timeout"
+	}
+	if result.StdoutTruncated || result.StderrTruncated {
+		return "compose_config_output_truncated"
+	}
+	return "compose_config_invalid"
+}
+
+func applyDiagnosticCode(ctx context.Context, result runtimeprocess.CommandResult, err error) string {
+	if commandUnavailable(err) {
+		return "runtime_unavailable"
+	}
+	if errors.Is(err, context.Canceled) {
+		return cancellationCode(ctx)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "compose_apply_timeout"
+	}
+	if result.StdoutTruncated || result.StderrTruncated {
+		return "compose_apply_output_truncated"
+	}
+	return "compose_apply_failed"
 }
 
 func (e *Executor) fail(ctx context.Context, deployment deployments.Deployment, code string) error {

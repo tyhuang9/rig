@@ -251,7 +251,7 @@ func terminal(value Status) bool {
 
 func knownDiagnostic(value string) bool {
 	switch value {
-	case "", "daemon_restarted", "runtime_unavailable", "compose_invalid", "policy_rejected", "approval_required", "apply_failed", "health_failed", "cancelled", "internal_error", "invalid_source", "source_unavailable", "source_access_lost", "source_too_large", "provider_unavailable", "configuration_unavailable":
+	case "", "daemon_restarted", "runtime_unavailable", "compose_invalid", "compose_config_invalid", "compose_config_timeout", "compose_config_output_truncated", "policy_rejected", "approval_required", "apply_failed", "compose_apply_failed", "compose_apply_timeout", "compose_apply_output_truncated", "health_failed", "cancelled", "internal_error", "invalid_source", "source_unavailable", "source_access_lost", "source_too_large", "source_storage_full", "provider_unavailable", "configuration_unavailable":
 		return true
 	default:
 		return false
@@ -264,14 +264,22 @@ func diagnosticSummary(value string) string {
 		return "Deployment interrupted because hostd restarted"
 	case "runtime_unavailable":
 		return "Container runtime is unavailable"
-	case "compose_invalid":
+	case "compose_invalid", "compose_config_invalid":
 		return "Compose configuration is invalid"
+	case "compose_config_timeout":
+		return "Compose configuration check timed out"
+	case "compose_config_output_truncated":
+		return "Compose configuration output exceeded the allowed limit"
 	case "policy_rejected":
 		return "Compose configuration requests an unsupported capability"
 	case "approval_required":
 		return "Deployment requires administrator approval"
-	case "apply_failed":
+	case "apply_failed", "compose_apply_failed":
 		return "Container runtime failed to apply the deployment"
+	case "compose_apply_timeout":
+		return "Container runtime apply timed out"
+	case "compose_apply_output_truncated":
+		return "Container runtime apply output exceeded the allowed limit"
 	case "health_failed":
 		return "Deployment did not become healthy"
 	case "cancelled":
@@ -286,6 +294,8 @@ func diagnosticSummary(value string) string {
 		return "Access to the application source was lost"
 	case "source_too_large":
 		return "Application source exceeds deployment limits"
+	case "source_storage_full":
+		return "Application source storage is full"
 	case "provider_unavailable":
 		return "Application source provider is unavailable"
 	case "configuration_unavailable":

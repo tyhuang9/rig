@@ -226,7 +226,7 @@ func TestGatePersistsRejectedFindingsAndTerminalizes(t *testing.T) {
 }
 
 func TestSourceFailureDiagnosticTaxonomyIsSanitized(t *testing.T) {
-	for _, code := range []string{"invalid_source", "source_unavailable", "source_access_lost", "source_too_large", "provider_unavailable", "configuration_unavailable"} {
+	for _, code := range []string{"invalid_source", "source_unavailable", "source_access_lost", "source_too_large", "source_storage_full", "provider_unavailable", "configuration_unavailable"} {
 		fixture := newRepositoryFixture(t)
 		deployment := fixture.localDeployment(t)
 		failed, err := fixture.repository.Transition(context.Background(), fixture.appA, deployment.ID, Failed, code)

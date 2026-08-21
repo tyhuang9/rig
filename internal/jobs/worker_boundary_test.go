@@ -22,6 +22,17 @@ func newTestService(t *testing.T) (*Service, func()) {
 	return New(db), func() { _ = db.Close() }
 }
 
+func insertReadyReleaseFixture(t *testing.T, service *Service, appID, releaseID string) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := service.db.Exec(`INSERT INTO applications(id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?)`, appID, "fixture-"+appID, "Fixture", now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.db.Exec(`INSERT INTO releases(id,app_id,created_at,workspace_state) VALUES(?,?,?, 'ready')`, releaseID, appID, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func countEvents(events []Event, code string) int {
 	count := 0
 	for _, event := range events {
@@ -87,6 +98,7 @@ func TestIdempotentReplayRequiresIdenticalActorAndSealedInput(t *testing.T) {
 			ConfigurationMode: ConfigurationOriginal,
 		},
 	}
+	insertReadyReleaseFixture(t, service, request.ResourceID, releaseID)
 	created, wasCreated, err := service.CreateWithInput(request)
 	if err != nil || !wasCreated {
 		t.Fatalf("create = %#v, %t, %v", created, wasCreated, err)

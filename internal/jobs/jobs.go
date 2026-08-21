@@ -917,7 +917,10 @@ func (s *Service) pause(id, disposition string) error {
 	return nil
 }
 
-const cancellationWatchInterval = 25 * time.Millisecond
+// SQLite cancellation polling intentionally runs at a bounded 250ms cadence:
+// cancellation remains durable while active workers no longer contend with
+// normal job state transitions forty times per second.
+const cancellationWatchInterval = 250 * time.Millisecond
 
 func (s *Service) startCancellationWatcher(jobCtx context.Context, id string, cancel context.CancelFunc) func() error {
 	watchCtx, stop := context.WithCancel(context.Background())
@@ -1165,14 +1168,24 @@ func safeExecutionFailure(err error) (string, string) {
 			return "provider_unavailable", "Application source provider is unavailable"
 		case "source_too_large":
 			return "source_too_large", "Application source exceeds deployment limits"
+		case "source_storage_full":
+			return "source_storage_full", "Application source storage is full"
 		case "configuration_unavailable":
 			return "configuration_unavailable", "Application configuration is unavailable"
-		case "compose_invalid":
-			return "compose_invalid", "Compose configuration is invalid"
+		case "compose_invalid", "compose_config_invalid":
+			return executionError.Code, "Compose configuration is invalid"
+		case "compose_config_timeout":
+			return "compose_config_timeout", "Compose configuration check timed out"
+		case "compose_config_output_truncated":
+			return "compose_config_output_truncated", "Compose configuration output exceeded the allowed limit"
 		case "policy_rejected":
 			return "policy_rejected", "Compose configuration requests an unsupported capability"
-		case "apply_failed":
-			return "apply_failed", "Container runtime failed to apply the deployment"
+		case "apply_failed", "compose_apply_failed":
+			return executionError.Code, "Container runtime failed to apply the deployment"
+		case "compose_apply_timeout":
+			return "compose_apply_timeout", "Container runtime apply timed out"
+		case "compose_apply_output_truncated":
+			return "compose_apply_output_truncated", "Container runtime apply output exceeded the allowed limit"
 		case "health_failed":
 			return "health_failed", "Deployment did not become healthy"
 		case "internal_error":
