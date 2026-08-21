@@ -21,6 +21,8 @@ The bounded runtime flags and defaults are:
 | Flag | Default | Accepted range |
 | --- | ---: | ---: |
 | `--compose-config-timeout` | `30s` | `1s` to `5m` |
+| `--release-workspace-per-app-bytes` | `1073741824` (1 GiB) | 1 MiB to 1 TiB; must not exceed the global quota |
+| `--release-workspace-global-bytes` | `8589934592` (8 GiB) | 1 MiB to 16 TiB |
 | `--compose-apply-timeout` | `15m` | `1s` to `2h` |
 | `--compose-wait-timeout` | `2m` | `1s` to `1h` |
 

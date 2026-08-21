@@ -63,6 +63,9 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 		return Release{}, &Error{Code: "invalid_source"}
 	}
 	sourceRoot = filepath.Clean(sourceRoot)
+	if err := m.enforceRetention(ctx, appID, 0); err != nil {
+		return Release{}, err
+	}
 
 	release, err := m.reserveLocal(ctx, appID, inspection.Source.ComposePath)
 	if err != nil {
@@ -109,13 +112,28 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 		_ = m.abort(ctx, appID, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
-
-	final, err := m.workspacePath(appID, release.ID)
-	if err != nil || m.fs.mkdirAll(filepath.Dir(filepath.Dir(final)), 0o700) != nil || m.fs.rename(staging, filepath.Dir(final)) != nil {
+	workspaceSize, err := m.stagingWorkspaceSize(appID, release.ID)
+	if err != nil {
 		_ = m.abort(ctx, appID, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	if err := m.markLocalReady(ctx, release.ID, digest, m.workspaceRelative(appID, release.ID)); err != nil {
+
+	final, err := m.workspacePath(appID, release.ID)
+	if err != nil || m.fs.mkdirAll(filepath.Dir(filepath.Dir(final)), 0o700) != nil {
+		_ = m.abort(ctx, appID, release.ID, "internal_error")
+		return Release{}, &Error{Code: "internal_error"}
+	}
+	err = m.admitRetention(ctx, appID, workspaceSize, func() error {
+		if err := m.fs.rename(staging, filepath.Dir(final)); err != nil {
+			return err
+		}
+		return m.markLocalReady(ctx, release.ID, digest, m.workspaceRelative(appID, release.ID), workspaceSize)
+	})
+	if err != nil {
+		if IsCode(err, ErrorCodeSourceStorageFull) {
+			_ = m.abort(ctx, appID, release.ID, ErrorCodeSourceStorageFull)
+			return Release{}, err
+		}
 		if existing, lookupErr := m.ready(ctx, appID, 0, digest, inspection.Source.ComposePath, release.ConfigurationRevisionNumber); lookupErr == nil {
 			_ = m.abort(ctx, appID, release.ID, "superseded")
 			return existing, nil
@@ -129,6 +147,7 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 	release.ArchiveSHA256 = digest
 	release.WorkspacePath = final
 	release.WorkspaceState = WorkspaceStateReady
+	release.WorkspaceSizeBytes = workspaceSize
 	return release, nil
 }
 
@@ -149,8 +168,8 @@ func (m *Materializer) reserveLocal(ctx context.Context, appID, composePath stri
 	return Release{ID: id, AppID: appID, SourceProvider: "local", ComposePath: composePath, WorkspaceState: WorkspaceStateMaterializing, ConfigurationRevisionID: configurationID, ConfigurationRevisionNumber: configurationNumber}, nil
 }
 
-func (m *Materializer) markLocalReady(ctx context.Context, id, digest, workspace string) error {
-	result, err := m.db.ExecContext(ctx, `UPDATE releases SET status='ready',source_commit_sha=?,resolved_sha=?,archive_sha256=?,workspace_path=?,workspace_state='ready',materialized_at=? WHERE id=? AND source_provider='local' AND workspace_state='materializing'`, digest, digest, digest, workspace, m.now().UTC().Format(timeFormat), id)
+func (m *Materializer) markLocalReady(ctx context.Context, id, digest, workspace string, size int64) error {
+	result, err := m.db.ExecContext(ctx, `UPDATE releases SET status='ready',source_commit_sha=?,resolved_sha=?,archive_sha256=?,workspace_path=?,workspace_state='ready',workspace_size_bytes=?,materialized_at=? WHERE id=? AND source_provider='local' AND workspace_state='materializing'`, digest, digest, digest, workspace, size, m.now().UTC().Format(timeFormat), id)
 	if err != nil {
 		return err
 	}

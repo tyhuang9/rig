@@ -13,20 +13,30 @@ import (
 )
 
 type Config struct {
-	Mode                 string
-	ListenAddress        string
-	DataRoot             string
-	LogLevel             string
-	DockerEndpoint       string
-	FakeRuntime          bool
-	ComposeRuntime       bool
-	ComposeConfigTimeout time.Duration
-	ComposeApplyTimeout  time.Duration
-	ComposeWaitTimeout   time.Duration
-	CaddyManagement      bool
-	GitHubClientID       string
-	GitHubAppSlug        string
+	Mode                        string
+	ListenAddress               string
+	DataRoot                    string
+	LogLevel                    string
+	DockerEndpoint              string
+	FakeRuntime                 bool
+	ComposeRuntime              bool
+	ComposeConfigTimeout        time.Duration
+	ComposeApplyTimeout         time.Duration
+	ComposeWaitTimeout          time.Duration
+	ReleaseWorkspacePerAppBytes int64
+	ReleaseWorkspaceGlobalBytes int64
+	CaddyManagement             bool
+	GitHubClientID              string
+	GitHubAppSlug               string
 }
+
+const (
+	defaultReleaseWorkspacePerAppBytes = int64(1 << 30)
+	defaultReleaseWorkspaceGlobalBytes = int64(8 << 30)
+	minReleaseWorkspaceQuotaBytes      = int64(1 << 20)
+	maxReleaseWorkspacePerAppBytes     = int64(1 << 40)
+	maxReleaseWorkspaceGlobalBytes     = int64(16 << 40)
+)
 
 var (
 	githubClientIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,255}$`)
@@ -39,13 +49,15 @@ func Defaults() Config {
 		root = "."
 	}
 	return Config{
-		Mode:                 "controller-agent",
-		ListenAddress:        "127.0.0.1:7345",
-		DataRoot:             filepath.Join(root, "hostd"),
-		LogLevel:             "info",
-		ComposeConfigTimeout: 30 * time.Second,
-		ComposeApplyTimeout:  15 * time.Minute,
-		ComposeWaitTimeout:   2 * time.Minute,
+		Mode:                        "controller-agent",
+		ListenAddress:               "127.0.0.1:7345",
+		DataRoot:                    filepath.Join(root, "hostd"),
+		LogLevel:                    "info",
+		ComposeConfigTimeout:        30 * time.Second,
+		ComposeApplyTimeout:         15 * time.Minute,
+		ComposeWaitTimeout:          2 * time.Minute,
+		ReleaseWorkspacePerAppBytes: defaultReleaseWorkspacePerAppBytes,
+		ReleaseWorkspaceGlobalBytes: defaultReleaseWorkspaceGlobalBytes,
 	}
 }
 
@@ -62,6 +74,8 @@ func FromFlags(args []string) (Config, error) {
 	fs.DurationVar(&c.ComposeConfigTimeout, "compose-config-timeout", c.ComposeConfigTimeout, "Docker Compose configuration timeout")
 	fs.DurationVar(&c.ComposeApplyTimeout, "compose-apply-timeout", c.ComposeApplyTimeout, "Docker Compose apply timeout")
 	fs.DurationVar(&c.ComposeWaitTimeout, "compose-wait-timeout", c.ComposeWaitTimeout, "Docker Compose health wait timeout")
+	fs.Int64Var(&c.ReleaseWorkspacePerAppBytes, "release-workspace-per-app-bytes", c.ReleaseWorkspacePerAppBytes, "maximum retained release workspace bytes per application")
+	fs.Int64Var(&c.ReleaseWorkspaceGlobalBytes, "release-workspace-global-bytes", c.ReleaseWorkspaceGlobalBytes, "maximum retained release workspace bytes across applications")
 	fs.BoolVar(&c.CaddyManagement, "caddy-management", false, "enable Caddy management")
 	fs.StringVar(&c.GitHubClientID, "github-client-id", "", "public GitHub App client ID")
 	fs.StringVar(&c.GitHubAppSlug, "github-app-slug", "", "public GitHub App slug")
@@ -91,6 +105,11 @@ func FromFlags(args []string) (Config, error) {
 		c.ComposeWaitTimeout < time.Second || c.ComposeWaitTimeout > time.Hour ||
 		c.ComposeApplyTimeout <= c.ComposeWaitTimeout {
 		return Config{}, errors.New("compose runtime timeouts are outside supported bounds")
+	}
+	if c.ReleaseWorkspacePerAppBytes < minReleaseWorkspaceQuotaBytes || c.ReleaseWorkspacePerAppBytes > maxReleaseWorkspacePerAppBytes ||
+		c.ReleaseWorkspaceGlobalBytes < minReleaseWorkspaceQuotaBytes || c.ReleaseWorkspaceGlobalBytes > maxReleaseWorkspaceGlobalBytes ||
+		c.ReleaseWorkspacePerAppBytes > c.ReleaseWorkspaceGlobalBytes {
+		return Config{}, errors.New("release workspace quotas are outside supported bounds")
 	}
 	if (c.GitHubClientID == "") != (c.GitHubAppSlug == "") {
 		return Config{}, errors.New("github-client-id and github-app-slug must be provided together")

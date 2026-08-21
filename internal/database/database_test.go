@@ -238,6 +238,16 @@ func TestComposeRuntimeMigrationEnforcesDeploymentAndApprovalIntegrity(t *testin
 	if _, err := db.Exec(`DELETE FROM runtime_approvals WHERE id='approval'`); err == nil {
 		t.Fatal("approval history was deletable")
 	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,workspace_state,workspace_size_bytes,workspace_pruned_at) VALUES('release-unavailable','app-a','ready','{}',datetime('now'),'pruned',0,datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,release_id,status) VALUES('deployment-unavailable','app-a','release-unavailable','preparing')`); err == nil {
+		t.Fatal("deployment linked a pruned release workspace")
+	}
+	input := `{"releaseId":"release-unavailable","configurationMode":"current"}`
+	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,input_json,created_at,updated_at) VALUES('job-unavailable','deploy','application','app-a','queued','queued',?,datetime('now'),datetime('now'))`, input); err == nil {
+		t.Fatal("active job selected a pruned release workspace")
+	}
 }
 
 func TestComposeRuntimeMigrationCapsEventsPerAttempt(t *testing.T) {

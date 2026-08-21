@@ -5,6 +5,12 @@ ALTER TABLE deployments ADD COLUMN actual_configuration_revision_number INTEGER 
 ALTER TABLE deployments ADD COLUMN diagnostic_code TEXT;
 ALTER TABLE deployments ADD COLUMN provenance_initialized INTEGER NOT NULL DEFAULT 0 CHECK (provenance_initialized IN (0,1));
 
+ALTER TABLE releases ADD COLUMN workspace_size_bytes INTEGER CHECK (workspace_size_bytes IS NULL OR workspace_size_bytes >= 0);
+ALTER TABLE releases ADD COLUMN workspace_prune_from_state TEXT CHECK (workspace_prune_from_state IS NULL OR workspace_prune_from_state IN ('ready','failed'));
+ALTER TABLE releases ADD COLUMN workspace_pruned_at TEXT;
+
+CREATE INDEX releases_workspace_retention ON releases(workspace_state, app_id, created_at, id);
+
 CREATE UNIQUE INDEX deployments_job ON deployments(job_id) WHERE job_id IS NOT NULL;
 CREATE INDEX deployments_history ON deployments(app_id, started_at DESC, id DESC);
 
@@ -42,14 +48,14 @@ ALTER TABLE job_events ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX job_events_attempt ON job_events(job_id, attempt, sequence);
 
 CREATE TRIGGER deployment_linkage_valid_insert BEFORE INSERT ON deployments
-WHEN (NEW.release_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM releases r WHERE r.id=NEW.release_id AND r.app_id=NEW.app_id))
+WHEN (NEW.release_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM releases r WHERE r.id=NEW.release_id AND r.app_id=NEW.app_id AND (r.workspace_state='ready' OR r.workspace_state IS NULL)))
   OR (NEW.job_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id=NEW.job_id AND j.type='deploy' AND j.resource_type='application' AND j.resource_id=NEW.app_id))
   OR (NEW.actual_configuration_revision_number=0 AND NEW.actual_configuration_revision_id IS NOT NULL)
   OR (NEW.actual_configuration_revision_number>0 AND NOT EXISTS (SELECT 1 FROM application_configuration_revisions c WHERE c.id=NEW.actual_configuration_revision_id AND c.app_id=NEW.app_id AND c.revision_number=NEW.actual_configuration_revision_number))
 BEGIN SELECT RAISE(ABORT, 'invalid deployment linkage'); END;
 
 CREATE TRIGGER deployment_linkage_valid_update BEFORE UPDATE OF app_id,release_id,job_id,actual_configuration_revision_id,actual_configuration_revision_number ON deployments
-WHEN (NEW.release_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM releases r WHERE r.id=NEW.release_id AND r.app_id=NEW.app_id))
+WHEN (NEW.release_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM releases r WHERE r.id=NEW.release_id AND r.app_id=NEW.app_id AND (r.workspace_state='ready' OR r.workspace_state IS NULL)))
   OR (NEW.job_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id=NEW.job_id AND j.type='deploy' AND j.resource_type='application' AND j.resource_id=NEW.app_id))
   OR (NEW.actual_configuration_revision_number=0 AND NEW.actual_configuration_revision_id IS NOT NULL)
   OR (NEW.actual_configuration_revision_number>0 AND NOT EXISTS (SELECT 1 FROM application_configuration_revisions c WHERE c.id=NEW.actual_configuration_revision_id AND c.app_id=NEW.app_id AND c.revision_number=NEW.actual_configuration_revision_number))
@@ -95,6 +101,30 @@ CREATE TRIGGER job_pause_valid_update BEFORE UPDATE OF status,pause_disposition 
 WHEN (NEW.status='waiting_user' AND NEW.pause_disposition IS NULL)
   OR (NEW.status<>'waiting_user' AND NEW.pause_disposition IS NOT NULL)
 BEGIN SELECT RAISE(ABORT, 'invalid job pause disposition'); END;
+
+CREATE TRIGGER job_release_workspace_available_insert BEFORE INSERT ON jobs
+WHEN NEW.status IN ('queued','assigned','running','waiting_external','waiting_user','needs_attention')
+  AND CASE WHEN json_valid(NEW.input_json) THEN COALESCE(json_type(NEW.input_json,'$.releaseId'),'')='text' ELSE 0 END
+  AND CASE WHEN json_valid(NEW.input_json) THEN COALESCE(json_extract(NEW.input_json,'$.releaseId'),'')<>'' ELSE 0 END
+  AND NOT EXISTS (
+      SELECT 1 FROM releases r
+      WHERE r.id=json_extract(NEW.input_json,'$.releaseId')
+        AND r.app_id=NEW.resource_id
+        AND (r.workspace_state='ready' OR r.workspace_state IS NULL)
+  )
+BEGIN SELECT RAISE(ABORT, 'selected release workspace is unavailable'); END;
+
+CREATE TRIGGER job_release_workspace_available_update BEFORE UPDATE OF status,input_json,resource_id ON jobs
+WHEN NEW.status IN ('queued','assigned','running','waiting_external','waiting_user','needs_attention')
+  AND CASE WHEN json_valid(NEW.input_json) THEN COALESCE(json_type(NEW.input_json,'$.releaseId'),'')='text' ELSE 0 END
+  AND CASE WHEN json_valid(NEW.input_json) THEN COALESCE(json_extract(NEW.input_json,'$.releaseId'),'')<>'' ELSE 0 END
+  AND NOT EXISTS (
+      SELECT 1 FROM releases r
+      WHERE r.id=json_extract(NEW.input_json,'$.releaseId')
+        AND r.app_id=NEW.resource_id
+        AND (r.workspace_state='ready' OR r.workspace_state IS NULL)
+  )
+BEGIN SELECT RAISE(ABORT, 'selected release workspace is unavailable'); END;
 
 CREATE TRIGGER job_event_attempt_valid BEFORE INSERT ON job_events
 WHEN NEW.attempt<>(SELECT attempt FROM jobs WHERE id=NEW.job_id)

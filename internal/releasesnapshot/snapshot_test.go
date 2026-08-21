@@ -210,15 +210,16 @@ func TestReadyReleaseReturnsOnlyAppBoundReadyValidatedWorkspace(t *testing.T) {
 
 func TestReadyReleaseInvalidatesTamperedWorkspaceAndStoredPath(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		tamper func(*testing.T, *sql.DB, *Materializer, Release)
+		name               string
+		workspacePreserved bool
+		tamper             func(*testing.T, *sql.DB, *Materializer, Release)
 	}{
-		{"compose", func(t *testing.T, _ *sql.DB, _ *Materializer, release Release) {
+		{"compose", false, func(t *testing.T, _ *sql.DB, _ *Materializer, release Release) {
 			if err := os.WriteFile(filepath.Join(release.WorkspacePath, "compose.yaml"), []byte("invalid: ["), 0o600); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{"stored-path", func(t *testing.T, db *sql.DB, _ *Materializer, release Release) {
+		{"stored-path", true, func(t *testing.T, db *sql.DB, _ *Materializer, release Release) {
 			if _, err := db.Exec(`UPDATE releases SET workspace_path='../outside' WHERE id=?`, release.ID); err != nil {
 				t.Fatal(err)
 			}
@@ -243,8 +244,12 @@ func TestReadyReleaseInvalidatesTamperedWorkspaceAndStoredPath(t *testing.T) {
 			if err := db.QueryRow(`SELECT workspace_state,materialization_error_code FROM releases WHERE id=?`, release.ID).Scan(&state, &code); err != nil || state != WorkspaceStateFailed || code != "invalid_source" {
 				t.Fatalf("state=%q code=%q err=%v", state, code, err)
 			}
-			if _, err := os.Stat(filepath.Dir(release.WorkspacePath)); !os.IsNotExist(err) {
-				t.Fatalf("managed tampered workspace was not removed: %v", err)
+			_, statErr := os.Stat(release.WorkspacePath)
+			if test.workspacePreserved && statErr != nil {
+				t.Fatalf("unsafe-path workspace was touched: %v", statErr)
+			}
+			if !test.workspacePreserved && !os.IsNotExist(statErr) {
+				t.Fatalf("safely addressable invalid workspace was not removed: %v", statErr)
 			}
 		})
 	}

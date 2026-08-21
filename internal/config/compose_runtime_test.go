@@ -123,3 +123,35 @@ func TestComposeRuntimeTimeoutBounds(t *testing.T) {
 		})
 	}
 }
+
+func TestReleaseWorkspaceQuotaFlagsAndBounds(t *testing.T) {
+	defaults, err := FromFlags(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.ReleaseWorkspacePerAppBytes != defaultReleaseWorkspacePerAppBytes || defaults.ReleaseWorkspaceGlobalBytes != defaultReleaseWorkspaceGlobalBytes {
+		t.Fatalf("retention defaults = (%d,%d)", defaults.ReleaseWorkspacePerAppBytes, defaults.ReleaseWorkspaceGlobalBytes)
+	}
+
+	tests := []struct {
+		name string
+		args []string
+		ok   bool
+	}{
+		{name: "minimum", args: []string{"--release-workspace-per-app-bytes", "1048576", "--release-workspace-global-bytes", "1048576"}, ok: true},
+		{name: "maximum", args: []string{"--release-workspace-per-app-bytes", "1099511627776", "--release-workspace-global-bytes", "17592186044416"}, ok: true},
+		{name: "per-app below minimum", args: []string{"--release-workspace-per-app-bytes", "1048575"}},
+		{name: "global below minimum", args: []string{"--release-workspace-global-bytes", "1048575"}},
+		{name: "per-app above maximum", args: []string{"--release-workspace-per-app-bytes", "1099511627777"}},
+		{name: "global above maximum", args: []string{"--release-workspace-global-bytes", "17592186044417"}},
+		{name: "per-app exceeds global", args: []string{"--release-workspace-per-app-bytes", "2097152", "--release-workspace-global-bytes", "1048576"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := FromFlags(test.args)
+			if (err == nil) != test.ok {
+				t.Fatalf("FromFlags() error = %v, want success %v", err, test.ok)
+			}
+		})
+	}
+}

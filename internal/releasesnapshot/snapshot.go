@@ -24,6 +24,15 @@ const (
 	WorkspaceStateMaterializing = "materializing"
 	WorkspaceStateReady         = "ready"
 	WorkspaceStateFailed        = "failed"
+	WorkspaceStatePruning       = "pruning"
+	WorkspaceStatePruned        = "pruned"
+
+	DefaultPerAppWorkspaceQuota = int64(1 << 30)
+	DefaultGlobalWorkspaceQuota = int64(8 << 30)
+	MaxPerAppWorkspaceQuota     = int64(1 << 40)
+	MaxGlobalWorkspaceQuota     = int64(16 << 40)
+
+	ErrorCodeSourceStorageFull = "source_storage_full"
 )
 
 var errInvalidReadyWorkspace = errors.New("invalid ready release workspace")
@@ -43,8 +52,16 @@ type Release struct {
 	ArchiveSHA256               string
 	WorkspacePath               string
 	WorkspaceState              string
+	WorkspaceSizeBytes          int64
 	ConfigurationRevisionID     string
 	ConfigurationRevisionNumber int64
+}
+
+// RetentionOptions bounds retained release workspaces. Both values are bytes.
+// A zero value selects the conservative defaults.
+type RetentionOptions struct {
+	PerAppBytes int64
+	GlobalBytes int64
 }
 
 type SourceReader interface {
@@ -61,6 +78,7 @@ type Materializer struct {
 	locks          keyedLocks
 	fs             lifecycleFS
 	afterLocalCopy func()
+	retention      RetentionOptions
 }
 type lifecycleFS struct {
 	mkdirAll  func(string, os.FileMode) error
@@ -73,11 +91,23 @@ func realLifecycleFS() lifecycleFS {
 	return lifecycleFS{os.MkdirAll, os.Remove, os.RemoveAll, os.Rename}
 }
 
-func New(db *sql.DB, sources SourceReader, dataRoot string) (*Materializer, error) {
+func New(db *sql.DB, sources SourceReader, dataRoot string, options ...RetentionOptions) (*Materializer, error) {
 	if db == nil || sources == nil || dataRoot == "" || pathsecurity.RejectWindowsNamespace(dataRoot) || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
 		return nil, errors.New("release snapshot data root must be absolute and clean")
 	}
-	return &Materializer{db: db, sources: sources, dataRoot: dataRoot, now: time.Now, fs: realLifecycleFS()}, nil
+	retention := RetentionOptions{PerAppBytes: DefaultPerAppWorkspaceQuota, GlobalBytes: DefaultGlobalWorkspaceQuota}
+	if len(options) > 1 {
+		return nil, errors.New("at most one release retention configuration is allowed")
+	}
+	if len(options) == 1 {
+		if options[0] != (RetentionOptions{}) {
+			retention = options[0]
+		}
+	}
+	if retention.PerAppBytes <= 0 || retention.GlobalBytes <= 0 || retention.PerAppBytes > retention.GlobalBytes || retention.PerAppBytes > MaxPerAppWorkspaceQuota || retention.GlobalBytes > MaxGlobalWorkspaceQuota {
+		return nil, errors.New("release retention quotas must be positive and the per-app quota must not exceed the global quota")
+	}
+	return &Materializer{db: db, sources: sources, dataRoot: dataRoot, now: time.Now, fs: realLifecycleFS(), retention: retention}, nil
 }
 
 // ValidateComposeWorkspace validates the selected Compose file and every local
@@ -137,6 +167,9 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 	if err != nil {
 		return Release{}, internal(err)
 	}
+	if err := m.enforceRetention(ctx, appID, 0); err != nil {
+		return Release{}, err
+	}
 	if ready, err := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath, configurationNumber); err == nil {
 		return ready, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -187,6 +220,13 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 		}
 		return Release{}, &Error{Code: code}
 	}
+	workspaceSize, err := m.stagingWorkspaceSize(appID, release.ID)
+	if err != nil {
+		if m.abort(ctx, appID, release.ID, "internal_error") != nil {
+			return Release{}, &Error{Code: "internal_error"}
+		}
+		return Release{}, &Error{Code: "internal_error"}
+	}
 	final, err := m.workspacePath(appID, release.ID)
 	if err != nil {
 		m.finalize(ctx, release.ID, "internal_error")
@@ -200,13 +240,22 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 		m.abort(ctx, appID, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	if err := m.fs.rename(staging, filepath.Dir(final)); err != nil {
-		m.abort(ctx, appID, release.ID, "internal_error")
-		return Release{}, &Error{Code: "internal_error"}
-	}
-	if err := m.markReady(ctx, release.ID, hash, m.workspaceRelative(appID, release.ID)); err != nil {
-		if m.abort(ctx, appID, release.ID, "internal_error") != nil {
+	err = m.admitRetention(ctx, appID, workspaceSize, func() error {
+		if err := m.fs.rename(staging, filepath.Dir(final)); err != nil {
+			return err
+		}
+		return m.markReady(ctx, release.ID, hash, m.workspaceRelative(appID, release.ID), workspaceSize)
+	})
+	if err != nil {
+		code := "internal_error"
+		if IsCode(err, ErrorCodeSourceStorageFull) {
+			code = ErrorCodeSourceStorageFull
+		}
+		if m.abort(ctx, appID, release.ID, code) != nil {
 			return Release{}, &Error{Code: "internal_error"}
+		}
+		if IsCode(err, ErrorCodeSourceStorageFull) {
+			return Release{}, err
 		}
 		if existing, lookupErr := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath, release.ConfigurationRevisionNumber); lookupErr == nil {
 			return existing, nil
@@ -214,7 +263,7 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 		m.finalize(ctx, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	release.ArchiveSHA256, release.WorkspacePath, release.WorkspaceState = hash, final, WorkspaceStateReady
+	release.ArchiveSHA256, release.WorkspacePath, release.WorkspaceState, release.WorkspaceSizeBytes = hash, final, WorkspaceStateReady, workspaceSize
 	return release, nil
 }
 
@@ -226,7 +275,7 @@ func (m *Materializer) ReadyRelease(ctx context.Context, appID, releaseID string
 		return Release{}, &Error{Code: "release_not_found"}
 	}
 	var release Release
-	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,COALESCE(source_provider,''),repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(configuration_revision_id,''),configuration_revision_number FROM releases WHERE id=? AND app_id=? AND workspace_state='ready'`, releaseID, appID).Scan(&release.ID, &release.AppID, &release.SourceProvider, &release.RepositoryID, &release.ResolvedSHA, &release.ComposePath, &release.ArchiveSHA256, &release.WorkspacePath, &release.WorkspaceState, &release.ConfigurationRevisionID, &release.ConfigurationRevisionNumber)
+	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,COALESCE(source_provider,''),repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(workspace_size_bytes,-1),COALESCE(configuration_revision_id,''),configuration_revision_number FROM releases WHERE id=? AND app_id=? AND workspace_state='ready'`, releaseID, appID).Scan(&release.ID, &release.AppID, &release.SourceProvider, &release.RepositoryID, &release.ResolvedSHA, &release.ComposePath, &release.ArchiveSHA256, &release.WorkspacePath, &release.WorkspaceState, &release.WorkspaceSizeBytes, &release.ConfigurationRevisionID, &release.ConfigurationRevisionNumber)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Release{}, &Error{Code: "release_not_found"}
 	}
@@ -244,6 +293,11 @@ func (m *Materializer) ReadyRelease(ctx context.Context, appID, releaseID string
 }
 
 func (m *Materializer) Recover() error {
+	unlock := retentionLocks.lock(m.dataRoot)
+	defer unlock()
+	if err := m.recoverPruning(context.Background()); err != nil {
+		return err
+	}
 	rows, err := m.db.Query(`SELECT id, app_id FROM releases WHERE workspace_state=?`, WorkspaceStateMaterializing)
 	if err != nil {
 		return err
@@ -281,6 +335,34 @@ func (m *Materializer) Recover() error {
 			return err
 		}
 	}
+	if err := m.backfillWorkspaceSizes(context.Background()); err != nil {
+		return err
+	}
+	rows, err = m.db.Query(`SELECT DISTINCT app_id FROM releases WHERE workspace_state IN ('ready','failed') AND COALESCE(workspace_path,'')<>'' ORDER BY app_id`)
+	if err != nil {
+		return err
+	}
+	var apps []string
+	for rows.Next() {
+		var appID string
+		if err := rows.Scan(&appID); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		apps = append(apps, appID)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, appID := range apps {
+		if err := m.enforceRetentionLocked(context.Background(), appID, 0); err != nil && !IsCode(err, ErrorCodeSourceStorageFull) {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -296,7 +378,7 @@ func (m *Materializer) appSource(ctx context.Context, owner, appID string) (appS
 }
 func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, compose string, configurationNumber int64) (Release, error) {
 	var r Release
-	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,COALESCE(source_provider,''),repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(configuration_revision_id,''),configuration_revision_number FROM releases WHERE app_id=? AND repository_id=? AND resolved_sha=? AND compose_path=? AND configuration_revision_number=? AND workspace_state='ready'`, app, repo, sha, compose, configurationNumber).Scan(&r.ID, &r.AppID, &r.SourceProvider, &r.RepositoryID, &r.ResolvedSHA, &r.ComposePath, &r.ArchiveSHA256, &r.WorkspacePath, &r.WorkspaceState, &r.ConfigurationRevisionID, &r.ConfigurationRevisionNumber)
+	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,COALESCE(source_provider,''),repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(workspace_size_bytes,-1),COALESCE(configuration_revision_id,''),configuration_revision_number FROM releases WHERE app_id=? AND repository_id=? AND resolved_sha=? AND compose_path=? AND configuration_revision_number=? AND workspace_state='ready'`, app, repo, sha, compose, configurationNumber).Scan(&r.ID, &r.AppID, &r.SourceProvider, &r.RepositoryID, &r.ResolvedSHA, &r.ComposePath, &r.ArchiveSHA256, &r.WorkspacePath, &r.WorkspaceState, &r.WorkspaceSizeBytes, &r.ConfigurationRevisionID, &r.ConfigurationRevisionNumber)
 	if err != nil {
 		return r, err
 	}
@@ -309,7 +391,9 @@ func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, c
 
 func (m *Materializer) validateReadyRelease(ctx context.Context, release Release) (Release, error) {
 	expected, pathErr := m.workspacePath(release.AppID, release.ID)
-	valid := pathErr == nil && release.WorkspacePath == m.workspaceRelative(release.AppID, release.ID) && safeWorkspace(expected, release.ComposePath) && validateComposeWorkspace(expected, release.ComposePath) == nil
+	size, sizeErr := m.workspaceLogicalSize(retainedWorkspace{id: release.ID, appID: release.AppID, storedPath: release.WorkspacePath, state: release.WorkspaceState, size: release.WorkspaceSizeBytes})
+	safeForRemoval := pathErr == nil && sizeErr == nil
+	valid := safeForRemoval && release.WorkspaceSizeBytes >= 0 && size == release.WorkspaceSizeBytes && safeWorkspace(expected, release.ComposePath) && validateComposeWorkspace(expected, release.ComposePath) == nil
 	if valid && release.SourceProvider == "local" {
 		digest, digestErr := hashLocalTree(ctx, expected)
 		valid = digestErr == nil && digest == release.ArchiveSHA256 && digest == release.ResolvedSHA
@@ -318,12 +402,12 @@ func (m *Materializer) validateReadyRelease(ctx context.Context, release Release
 		release.WorkspacePath = expected
 		return release, nil
 	}
-	if pathErr == nil {
-		if err := m.removeWorkspace(release.AppID, release.ID); err != nil {
+	if safeForRemoval {
+		if err := m.fs.removeAll(expected); err != nil {
 			return Release{}, err
 		}
 	}
-	result, err := m.db.ExecContext(ctx, `UPDATE releases SET status='failed',workspace_state='failed',materialization_error_code='invalid_source' WHERE id=? AND app_id=? AND workspace_state='ready'`, release.ID, release.AppID)
+	result, err := m.db.ExecContext(ctx, `UPDATE releases SET status='failed',workspace_state='failed',workspace_path=CASE WHEN ? THEN NULL ELSE workspace_path END,workspace_size_bytes=CASE WHEN ? THEN 0 ELSE workspace_size_bytes END,materialization_error_code='invalid_source' WHERE id=? AND app_id=? AND workspace_state='ready'`, safeForRemoval, safeForRemoval, release.ID, release.AppID)
 	if err != nil {
 		return Release{}, err
 	}
@@ -379,8 +463,8 @@ func (m *Materializer) refreshSource(ctx context.Context, app string, repository
 	_, err := m.db.ExecContext(ctx, `UPDATE application_sources SET repository_owner=?,repository_name=?,resolved_sha=?,updated_at=? WHERE application_id=?`, repository.Owner, repository.Name, branch.SHA, m.now().UTC().Format(time.RFC3339Nano), app)
 	return err
 }
-func (m *Materializer) markReady(ctx context.Context, id, hash, workspace string) error {
-	r, err := m.db.ExecContext(ctx, `UPDATE releases SET status='ready',archive_sha256=?,workspace_path=?,workspace_state='ready',materialized_at=? WHERE id=? AND workspace_state='materializing'`, hash, workspace, m.now().UTC().Format(time.RFC3339Nano), id)
+func (m *Materializer) markReady(ctx context.Context, id, hash, workspace string, size int64) error {
+	r, err := m.db.ExecContext(ctx, `UPDATE releases SET status='ready',archive_sha256=?,workspace_path=?,workspace_state='ready',workspace_size_bytes=?,materialized_at=? WHERE id=? AND workspace_state='materializing'`, hash, workspace, size, m.now().UTC().Format(time.RFC3339Nano), id)
 	if err != nil {
 		return err
 	}
