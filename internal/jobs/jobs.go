@@ -36,6 +36,7 @@ var (
 	ErrInvalidProgress = errors.New("invalid job progress")
 	ErrEventBudget     = errors.New("job event budget exhausted")
 	ErrJobNotPaused    = errors.New("job is not waiting for user action")
+	ErrIdempotency     = errors.New("idempotency key conflicts with the original request")
 )
 
 // JobInput is deliberately sealed so new persisted input schemas are reviewed
@@ -223,18 +224,21 @@ func (s *Service) CreateWithInput(request CreateRequest) (Job, bool, error) {
 	if request.Type == "" || request.ResourceType == "" || request.ResourceID == "" {
 		return Job{}, false, fmt.Errorf("%w: type, resource type, and resource id are required", ErrInvalidInput)
 	}
+	input, err := marshalInput(request.Input)
+	if err != nil {
+		return Job{}, false, err
+	}
 	if request.IdempotencyKey != "" {
 		existing, err := s.byIdempotency(request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey)
 		if err == nil {
+			if !sameCreateRequest(existing, request, input) {
+				return Job{}, false, ErrIdempotency
+			}
 			return existing, false, nil
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return Job{}, false, err
 		}
-	}
-	input, err := marshalInput(request.Input)
-	if err != nil {
-		return Job{}, false, err
 	}
 	now := s.now().UTC()
 	job := Job{ID: uuid.NewString(), Type: request.Type, ResourceType: request.ResourceType, ResourceID: request.ResourceID, Status: string(Queued), Phase: "queued", CreatedAt: now, UpdatedAt: now, Input: input}
@@ -249,6 +253,9 @@ func (s *Service) CreateWithInput(request CreateRequest) (Job, bool, error) {
 		if isConstraint(err) && request.IdempotencyKey != "" {
 			_ = tx.Rollback()
 			if existing, lookupErr := s.byIdempotency(request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey); lookupErr == nil {
+				if !sameCreateRequest(existing, request, input) {
+					return Job{}, false, ErrIdempotency
+				}
 				return existing, false, nil
 			}
 		}
@@ -265,6 +272,14 @@ func (s *Service) CreateWithInput(request CreateRequest) (Job, bool, error) {
 	}
 	s.signal()
 	return job, true, nil
+}
+
+func sameCreateRequest(existing Job, request CreateRequest, input json.RawMessage) bool {
+	return existing.Type == request.Type &&
+		existing.ResourceType == request.ResourceType &&
+		existing.ResourceID == request.ResourceID &&
+		existing.RequestedBy == request.RequestedBy &&
+		bytes.Equal(existing.Input, input)
 }
 
 func marshalInput(input JobInput) (json.RawMessage, error) {

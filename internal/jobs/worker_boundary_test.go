@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/database"
 )
 
@@ -51,9 +52,8 @@ func TestCreateWithInputRoundTripsTransactionallyAndDoesNotExposeInternalFields(
 	if err != nil || created || replayed.ID != job.ID || string(replayed.Input) != "{}" {
 		t.Fatalf("idempotent replay = %#v, %t, %v", replayed, created, err)
 	}
-	replayed, created, err = service.CreateWithInput(CreateRequest{Type: request.Type, ResourceType: request.ResourceType, ResourceID: request.ResourceID, IdempotencyKey: request.IdempotencyKey, Input: unrecognizedInput{}})
-	if err != nil || created || replayed.ID != job.ID || string(replayed.Input) != "{}" {
-		t.Fatalf("invalid idempotent replay = %#v, %t, %v", replayed, created, err)
+	if _, _, err = service.CreateWithInput(CreateRequest{Type: request.Type, ResourceType: request.ResourceType, ResourceID: request.ResourceID, IdempotencyKey: request.IdempotencyKey, Input: unrecognizedInput{}}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("invalid idempotent replay error = %v", err)
 	}
 	events, err := service.Events(job.ID, 0)
 	if err != nil || len(events) != 1 || events[0].Code != "job_queued" {
@@ -69,6 +69,47 @@ func TestCreateWithInputRoundTripsTransactionallyAndDoesNotExposeInternalFields(
 	legacy, created, err := service.Create("deploy", "application", "legacy", "")
 	if err != nil || !created || string(legacy.Input) != "{}" {
 		t.Fatalf("legacy input = %#v, %t, %v", legacy, created, err)
+	}
+}
+
+func TestIdempotentReplayRequiresIdenticalActorAndSealedInput(t *testing.T) {
+	service, closeDB := newTestService(t)
+	defer closeDB()
+	releaseID := uuid.NewString()
+	request := CreateRequest{
+		Type:           "deploy",
+		ResourceType:   "application",
+		ResourceID:     "one",
+		IdempotencyKey: "same-key",
+		RequestedBy:    "actor-one",
+		Input: DeploymentInput{
+			ReleaseID:         releaseID,
+			ConfigurationMode: ConfigurationOriginal,
+		},
+	}
+	created, wasCreated, err := service.CreateWithInput(request)
+	if err != nil || !wasCreated {
+		t.Fatalf("create = %#v, %t, %v", created, wasCreated, err)
+	}
+	replayed, wasCreated, err := service.CreateWithInput(request)
+	if err != nil || wasCreated || replayed.ID != created.ID {
+		t.Fatalf("replay = %#v, %t, %v", replayed, wasCreated, err)
+	}
+
+	differentActor := request
+	differentActor.RequestedBy = "actor-two"
+	if _, _, err := service.CreateWithInput(differentActor); !errors.Is(err, ErrIdempotency) {
+		t.Fatalf("actor mismatch error = %v", err)
+	}
+	differentMode := request
+	differentMode.Input = DeploymentInput{ReleaseID: releaseID, ConfigurationMode: ConfigurationCurrent}
+	if _, _, err := service.CreateWithInput(differentMode); !errors.Is(err, ErrIdempotency) {
+		t.Fatalf("input mismatch error = %v", err)
+	}
+	differentRelease := request
+	differentRelease.Input = DeploymentInput{ReleaseID: uuid.NewString(), ConfigurationMode: ConfigurationOriginal}
+	if _, _, err := service.CreateWithInput(differentRelease); !errors.Is(err, ErrIdempotency) {
+		t.Fatalf("release mismatch error = %v", err)
 	}
 }
 
