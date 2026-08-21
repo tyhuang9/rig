@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "40bc5dcb9dd346eab3ec0f3366043da5979a99a350d7d58b6a98114246783fe0"
+const SourceSHA256 = "9a8ed29e1b6ecc5a8f03ee0de0ca317bcbaa1c13649074be3ed9a240a7d34189"
 
 var Operations = map[string]Operation{
 	"bootstrap":                       {Method: "POST", Path: "/api/v1/auth/bootstrap"},
@@ -15,19 +15,24 @@ var Operations = map[string]Operation{
 	"cancelJob":                       {Method: "POST", Path: "/api/v1/jobs/{jobId}/cancel"},
 	"createApplication":               {Method: "POST", Path: "/api/v1/apps"},
 	"deployApplication":               {Method: "POST", Path: "/api/v1/apps/{appId}/deployments"},
+	"deployRelease":                   {Method: "POST", Path: "/api/v1/apps/{appId}/releases/{releaseId}/deployments"},
 	"disconnectSourceConnection":      {Method: "DELETE", Path: "/api/v1/source-connections/{connectionId}"},
 	"doctor":                          {Method: "GET", Path: "/api/v1/system/doctor"},
 	"getApplication":                  {Method: "GET", Path: "/api/v1/apps/{appId}"},
 	"getApplicationConfiguration":     {Method: "GET", Path: "/api/v1/apps/{appId}/configuration"},
 	"getJob":                          {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
+	"grantRuntimeApproval":            {Method: "POST", Path: "/api/v1/apps/{appId}/runtime-approvals"},
 	"inspectImport":                   {Method: "POST", Path: "/api/v1/apps/import/inspect"},
 	"listApplications":                {Method: "GET", Path: "/api/v1/apps"},
+	"listDeployments":                 {Method: "GET", Path: "/api/v1/apps/{appId}/deployments"},
 	"listGitHubBranches":              {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories/{repositoryId}/branches"},
 	"listGitHubInstallations":         {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations"},
 	"listGitHubRepositories":          {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories"},
 	"listJobEvents":                   {Method: "GET", Path: "/api/v1/jobs/{jobId}/events"},
 	"listJobs":                        {Method: "GET", Path: "/api/v1/jobs"},
 	"listMachines":                    {Method: "GET", Path: "/api/v1/machines"},
+	"listReleases":                    {Method: "GET", Path: "/api/v1/apps/{appId}/releases"},
+	"listRuntimeApprovals":            {Method: "GET", Path: "/api/v1/apps/{appId}/runtime-approvals"},
 	"listServices":                    {Method: "GET", Path: "/api/v1/apps/{appId}/services"},
 	"listSourceConnections":           {Method: "GET", Path: "/api/v1/source-connections"},
 	"login":                           {Method: "POST", Path: "/api/v1/auth/sessions"},
@@ -37,6 +42,8 @@ var Operations = map[string]Operation{
 	"refreshSourceConnection":         {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/refresh"},
 	"replaceApplicationConfiguration": {Method: "PUT", Path: "/api/v1/apps/{appId}/configuration"},
 	"restartApplication":              {Method: "POST", Path: "/api/v1/apps/{appId}/restart"},
+	"resumeJob":                       {Method: "POST", Path: "/api/v1/jobs/{jobId}/resume"},
+	"revokeRuntimeApproval":           {Method: "DELETE", Path: "/api/v1/apps/{appId}/runtime-approvals/{approvalId}"},
 	"rotateCSRF":                      {Method: "GET", Path: "/api/v1/auth/csrf"},
 	"startApplication":                {Method: "POST", Path: "/api/v1/apps/{appId}/start"},
 	"startGitHubDeviceConnection":     {Method: "POST", Path: "/api/v1/source-connections/github/device"},
@@ -83,6 +90,7 @@ type CSRFResponse struct {
 }
 
 type Capabilities struct {
+	ComposeRuntime    bool `json:"composeRuntime"`
 	FakeRuntime       bool `json:"fakeRuntime"`
 	GithubConnections bool `json:"githubConnections"`
 }
@@ -104,6 +112,31 @@ type CreateApplicationRequest struct {
 	MachineID    string       `json:"machineId,omitempty"`
 	Name         string       `json:"name"`
 	SourcePath   string       `json:"sourcePath,omitempty"`
+}
+
+type DeployReleaseRequest struct {
+	ConfigurationMode string `json:"configurationMode"`
+}
+
+type Deployment struct {
+	ActualConfigurationRevisionID     string          `json:"actualConfigurationRevisionId,omitempty"`
+	ActualConfigurationRevisionNumber int64           `json:"actualConfigurationRevisionNumber"`
+	AppID                             string          `json:"appId"`
+	ConfigurationMode                 string          `json:"configurationMode"`
+	DiagnosticCode                    string          `json:"diagnosticCode,omitempty"`
+	FailureSummary                    string          `json:"failureSummary,omitempty"`
+	Findings                          []PolicyFinding `json:"findings"`
+	FinishedAt                        string          `json:"finishedAt,omitempty"`
+	ID                                string          `json:"id"`
+	JobID                             string          `json:"jobId,omitempty"`
+	MachineID                         string          `json:"machineId,omitempty"`
+	ReleaseID                         string          `json:"releaseId,omitempty"`
+	StartedAt                         string          `json:"startedAt,omitempty"`
+	Status                            string          `json:"status"`
+}
+
+type DeploymentList struct {
+	Items []Deployment `json:"items"`
 }
 
 type DetectedService struct {
@@ -202,6 +235,10 @@ type GitHubSource struct {
 	RepositoryID   int64  `json:"repositoryId"`
 }
 
+type GrantRuntimeApprovalRequest struct {
+	Fingerprint string `json:"fingerprint"`
+}
+
 type HostResources struct {
 	DiskAvailableBytes   int64 `json:"diskAvailableBytes"`
 	DiskTotalBytes       int64 `json:"diskTotalBytes"`
@@ -223,21 +260,25 @@ type InspectResponse struct {
 }
 
 type Job struct {
-	Checkpoint   string `json:"checkpoint"`
-	CreatedAt    string `json:"createdAt"`
-	ErrorCode    string `json:"errorCode,omitempty"`
-	ErrorDetail  string `json:"errorDetail,omitempty"`
-	ID           string `json:"id"`
-	Phase        string `json:"phase"`
-	Progress     int    `json:"progress"`
-	ResourceID   string `json:"resourceId"`
-	ResourceType string `json:"resourceType"`
-	Status       string `json:"status"`
-	Type         string `json:"type"`
-	UpdatedAt    string `json:"updatedAt"`
+	Attempt          int    `json:"attempt"`
+	Checkpoint       string `json:"checkpoint"`
+	CreatedAt        string `json:"createdAt"`
+	ErrorCode        string `json:"errorCode,omitempty"`
+	ErrorDetail      string `json:"errorDetail,omitempty"`
+	ID               string `json:"id"`
+	PauseDisposition string `json:"pauseDisposition,omitempty"`
+	Phase            string `json:"phase"`
+	Progress         int    `json:"progress"`
+	RequestedBy      string `json:"requestedBy,omitempty"`
+	ResourceID       string `json:"resourceId"`
+	ResourceType     string `json:"resourceType"`
+	Status           string `json:"status"`
+	Type             string `json:"type"`
+	UpdatedAt        string `json:"updatedAt"`
 }
 
 type JobEvent struct {
+	Attempt   int    `json:"attempt"`
 	Code      string `json:"code"`
 	ID        int64  `json:"id"`
 	JobID     string `json:"jobId"`
@@ -290,6 +331,17 @@ type MeResponse struct {
 	User User `json:"user"`
 }
 
+type PolicyFinding struct {
+	Capability    string `json:"capability"`
+	CreatedAt     string `json:"createdAt"`
+	DeploymentID  string `json:"deploymentId"`
+	Disposition   string `json:"disposition"`
+	Fingerprint   string `json:"fingerprint"`
+	ID            string `json:"id"`
+	PolicyVersion string `json:"policyVersion"`
+	Scope         string `json:"scope"`
+}
+
 type Problem struct {
 	Code      string            `json:"code"`
 	Detail    string            `json:"detail"`
@@ -300,11 +352,60 @@ type Problem struct {
 	Type      string            `json:"type"`
 }
 
+type Release struct {
+	AppID                       string `json:"appId"`
+	ArchiveSha256               string `json:"archiveSha256,omitempty"`
+	ComposePath                 string `json:"composePath,omitempty"`
+	ConfigurationRevisionID     string `json:"configurationRevisionId,omitempty"`
+	ConfigurationRevisionNumber int64  `json:"configurationRevisionNumber"`
+	CreatedAt                   string `json:"createdAt"`
+	ID                          string `json:"id"`
+	RepositoryID                int64  `json:"repositoryId,omitempty"`
+	RepositoryName              string `json:"repositoryName,omitempty"`
+	RepositoryOwner             string `json:"repositoryOwner,omitempty"`
+	ResolvedSha                 string `json:"resolvedSha,omitempty"`
+	SourceBranch                string `json:"sourceBranch,omitempty"`
+	SourceCommitSha             string `json:"sourceCommitSha,omitempty"`
+	SourceProvider              string `json:"sourceProvider"`
+	TrackedRef                  string `json:"trackedRef,omitempty"`
+	WorkspaceState              string `json:"workspaceState,omitempty"`
+}
+
+type ReleaseList struct {
+	Items []Release `json:"items"`
+}
+
 type ReplaceApplicationConfigurationRequest struct {
 	ExpectedRevisionNumber int64                           `json:"expectedRevisionNumber"`
 	Remove                 []string                        `json:"remove"`
 	Secrets                []SecretConfigurationValueInput `json:"secrets"`
 	Variables              []ConfigurationValueInput       `json:"variables"`
+}
+
+type RuntimeApproval struct {
+	AppID         string `json:"appId"`
+	Capability    string `json:"capability"`
+	Fingerprint   string `json:"fingerprint"`
+	GrantedAt     string `json:"grantedAt"`
+	GrantedBy     string `json:"grantedBy"`
+	ID            string `json:"id"`
+	PolicyVersion string `json:"policyVersion"`
+	RevokedAt     string `json:"revokedAt,omitempty"`
+	RevokedBy     string `json:"revokedBy,omitempty"`
+	Scope         string `json:"scope"`
+}
+
+type RuntimeApprovalList struct {
+	Items []RuntimeApproval `json:"items"`
+}
+
+type RuntimeApprovalMutationResponse struct {
+	Approval RuntimeApproval `json:"approval"`
+	Created  bool            `json:"created"`
+}
+
+type RuntimeApprovalResponse struct {
+	Approval RuntimeApproval `json:"approval"`
 }
 
 type SecretConfigurationValueInput struct {

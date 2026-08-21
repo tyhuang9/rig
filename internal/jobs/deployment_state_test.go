@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -12,6 +13,21 @@ type pauseExecutor struct{}
 
 func (pauseExecutor) Execute(context.Context, Job, ProgressReporter) (ExecutionResult, error) {
 	return ExecutionResult{Disposition: ExecutionWaitingUser, PauseDisposition: "approval_required"}, nil
+}
+
+func TestCreateRejectsOversizedIdempotencyKeyAtServiceBoundary(t *testing.T) {
+	service, closeDB := newTestService(t)
+	defer closeDB()
+	_, _, err := service.CreateWithInput(CreateRequest{
+		Type:           "deploy",
+		ResourceType:   "application",
+		ResourceID:     "application",
+		IdempotencyKey: strings.Repeat("x", 201),
+		Input:          NoInput{},
+	})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("oversized idempotency key error = %v", err)
+	}
 }
 
 func TestDeploymentInputIsSealedAndRoundTrips(t *testing.T) {

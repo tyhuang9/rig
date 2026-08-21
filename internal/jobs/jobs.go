@@ -37,6 +37,7 @@ var (
 	ErrEventBudget           = errors.New("job event budget exhausted")
 	ErrJobNotPaused          = errors.New("job is not waiting for user action")
 	ErrIdempotency           = errors.New("idempotency key conflicts with the original request")
+	ErrApplicationBusy       = errors.New("application already has an active mutation")
 	ErrCancellationRequested = errors.New("job cancellation requested")
 )
 
@@ -222,7 +223,7 @@ func (s *Service) Create(kind, resourceType, resourceID, idempotency string) (Jo
 }
 
 func (s *Service) CreateWithInput(request CreateRequest) (Job, bool, error) {
-	if request.Type == "" || request.ResourceType == "" || request.ResourceID == "" {
+	if request.Type == "" || request.ResourceType == "" || request.ResourceID == "" || len(request.IdempotencyKey) > 200 {
 		return Job{}, false, fmt.Errorf("%w: type, resource type, and resource id are required", ErrInvalidInput)
 	}
 	input, err := marshalInput(request.Input)
@@ -261,7 +262,7 @@ func (s *Service) CreateWithInput(request CreateRequest) (Job, bool, error) {
 			}
 		}
 		if isConstraint(err) {
-			return Job{}, false, fmt.Errorf("an application mutation is already active: %w", err)
+			return Job{}, false, ErrApplicationBusy
 		}
 		return Job{}, false, err
 	}

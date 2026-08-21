@@ -57,9 +57,15 @@ type Release struct {
 	ID                          string    `json:"id"`
 	AppID                       string    `json:"appId"`
 	SourceProvider              string    `json:"sourceProvider"`
+	RepositoryID                int64     `json:"repositoryId,omitempty"`
+	RepositoryOwner             string    `json:"repositoryOwner,omitempty"`
+	RepositoryName              string    `json:"repositoryName,omitempty"`
+	TrackedRef                  string    `json:"trackedRef,omitempty"`
+	ResolvedSHA                 string    `json:"resolvedSha,omitempty"`
 	SourceCommitSHA             string    `json:"sourceCommitSha,omitempty"`
 	SourceBranch                string    `json:"sourceBranch,omitempty"`
 	ComposePath                 string    `json:"composePath,omitempty"`
+	ArchiveSHA256               string    `json:"archiveSha256,omitempty"`
 	WorkspaceState              string    `json:"workspaceState,omitempty"`
 	ConfigurationRevisionID     string    `json:"configurationRevisionId,omitempty"`
 	ConfigurationRevisionNumber int64     `json:"configurationRevisionNumber"`
@@ -311,7 +317,7 @@ func (r *Repository) List(ctx context.Context, appID string, limit int) ([]Deplo
 	if limit < 1 || limit > 200 {
 		limit = 100
 	}
-	rows, err := r.db.QueryContext(ctx, deploymentSelect+` JOIN jobs j ON j.id=d.job_id WHERE d.app_id=? ORDER BY j.created_at DESC,d.id DESC LIMIT ?`, appID, limit)
+	rows, err := r.db.QueryContext(ctx, deploymentSelect+` LEFT JOIN jobs j ON j.id=d.job_id WHERE d.app_id=? ORDER BY COALESCE(d.started_at,j.created_at,d.finished_at,'') DESC,d.id DESC LIMIT ?`, appID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -356,22 +362,43 @@ func (r *Repository) Releases(ctx context.Context, appID string, limit int) ([]R
 	if limit < 1 || limit > 200 {
 		limit = 100
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT id,app_id,COALESCE(source_provider,''),source_commit_sha,source_branch,COALESCE(compose_path,''),COALESCE(workspace_state,''),COALESCE(configuration_revision_id,''),configuration_revision_number,created_at FROM releases WHERE app_id=? ORDER BY created_at DESC,id DESC LIMIT ?`, appID, limit)
+	rows, err := r.db.QueryContext(ctx, releaseSelect+` WHERE app_id=? ORDER BY created_at DESC,id DESC LIMIT ?`, appID, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	result := []Release{}
 	for rows.Next() {
-		var value Release
-		var created string
-		if err := rows.Scan(&value.ID, &value.AppID, &value.SourceProvider, &value.SourceCommitSHA, &value.SourceBranch, &value.ComposePath, &value.WorkspaceState, &value.ConfigurationRevisionID, &value.ConfigurationRevisionNumber, &created); err != nil {
+		value, err := scanRelease(rows)
+		if err != nil {
 			return nil, err
 		}
-		value.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		result = append(result, value)
 	}
 	return result, rows.Err()
+}
+
+const releaseSelect = `SELECT id,app_id,COALESCE(source_provider,''),COALESCE(repository_id,0),COALESCE(repository_owner,''),COALESCE(repository_name,''),COALESCE(tracked_ref,''),COALESCE(resolved_sha,''),source_commit_sha,source_branch,COALESCE(compose_path,''),COALESCE(archive_sha256,''),COALESCE(workspace_state,''),COALESCE(configuration_revision_id,''),configuration_revision_number,created_at FROM releases`
+
+func scanRelease(row scanner) (Release, error) {
+	var value Release
+	var created string
+	err := row.Scan(&value.ID, &value.AppID, &value.SourceProvider, &value.RepositoryID, &value.RepositoryOwner, &value.RepositoryName, &value.TrackedRef, &value.ResolvedSHA, &value.SourceCommitSHA, &value.SourceBranch, &value.ComposePath, &value.ArchiveSHA256, &value.WorkspaceState, &value.ConfigurationRevisionID, &value.ConfigurationRevisionNumber, &created)
+	value.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	return value, err
+}
+
+// Release returns only an app-bound ready release suitable for a prior-release
+// deployment request. The executor revalidates its managed workspace before use.
+func (r *Repository) Release(ctx context.Context, appID, releaseID string) (Release, error) {
+	if uuid.Validate(appID) != nil || !validReleaseID(releaseID) {
+		return Release{}, ErrNotFound
+	}
+	value, err := scanRelease(r.db.QueryRowContext(ctx, releaseSelect+` WHERE app_id=? AND id=? AND workspace_state='ready'`, appID, releaseID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Release{}, ErrNotFound
+	}
+	return value, err
 }
 
 func (r *Repository) Findings(ctx context.Context, appID, deploymentID string) ([]Finding, error) {

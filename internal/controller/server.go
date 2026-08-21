@@ -23,6 +23,7 @@ import (
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/runtime/docker"
@@ -40,12 +41,14 @@ type Server struct {
 	Machines           *machines.Store
 	Caddy              bool
 	FakeRuntime        bool
+	ComposeRuntime     bool
 	DockerEndpoint     string
 	DataRoot           string
 	Logger             *slog.Logger
 	BootstrapCompleted func()
 	Sources            *sourceconnections.Service
 	Configuration      *appconfig.Store
+	Deployments        *deployments.Repository
 	authenticationWork *authenticationWorkGate
 }
 
@@ -90,7 +93,13 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("getApplicationConfiguration", s.require(s.getApplicationConfiguration)),
 		contractRoute("replaceApplicationConfiguration", s.require(s.replaceApplicationConfiguration)),
 		contractRoute("listServices", s.require(s.services)),
-		contractRoute("deployApplication", s.require(s.action("deploy"))),
+		contractRoute("listDeployments", s.require(s.listDeployments)),
+		contractRoute("deployApplication", s.require(s.deployApplication)),
+		contractRoute("listReleases", s.require(s.listReleases)),
+		contractRoute("deployRelease", s.require(s.deployRelease)),
+		contractRoute("listRuntimeApprovals", s.require(s.listRuntimeApprovals)),
+		contractRoute("grantRuntimeApproval", s.require(s.grantRuntimeApproval)),
+		contractRoute("revokeRuntimeApproval", s.require(s.revokeRuntimeApproval)),
 		contractRoute("startApplication", s.require(s.action("start"))),
 		contractRoute("stopApplication", s.require(s.action("stop"))),
 		contractRoute("restartApplication", s.require(s.action("restart"))),
@@ -98,6 +107,7 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("listJobs", s.require(s.listJobs)),
 		contractRoute("getJob", s.require(s.getJob)),
 		contractRoute("cancelJob", s.require(s.cancelJob)),
+		contractRoute("resumeJob", s.require(s.resumeJob)),
 		contractRoute("listJobEvents", s.require(s.events)),
 		contractRoute("streamJobEvents", s.require(s.eventsStream)),
 		contractRoute("listMachines", s.require(s.listMachines)),
@@ -417,7 +427,7 @@ func contractServices(values []apps.Service) []apicontract.Service {
 }
 
 func contractJob(value jobs.Job) apicontract.Job {
-	return apicontract.Job{ID: value.ID, Type: value.Type, ResourceType: value.ResourceType, ResourceID: value.ResourceID, Status: value.Status, Phase: value.Phase, Checkpoint: value.Checkpoint, ErrorCode: value.ErrorCode, ErrorDetail: value.ErrorDetail, Progress: value.Progress, CreatedAt: value.CreatedAt.Format(time.RFC3339Nano), UpdatedAt: value.UpdatedAt.Format(time.RFC3339Nano)}
+	return apicontract.Job{ID: value.ID, Type: value.Type, ResourceType: value.ResourceType, ResourceID: value.ResourceID, Status: value.Status, Phase: value.Phase, Checkpoint: value.Checkpoint, ErrorCode: value.ErrorCode, ErrorDetail: value.ErrorDetail, RequestedBy: value.RequestedBy, PauseDisposition: value.PauseDisposition, Progress: value.Progress, Attempt: value.Attempt, CreatedAt: value.CreatedAt.Format(time.RFC3339Nano), UpdatedAt: value.UpdatedAt.Format(time.RFC3339Nano)}
 }
 
 func contractJobs(values []jobs.Job) []apicontract.Job {
@@ -429,7 +439,7 @@ func contractJobs(values []jobs.Job) []apicontract.Job {
 }
 
 func contractJobEvent(value jobs.Event) apicontract.JobEvent {
-	return apicontract.JobEvent{ID: value.ID, JobID: value.JobID, Sequence: value.Sequence, Timestamp: value.Timestamp.Format(time.RFC3339Nano), Level: value.Level, Phase: value.Phase, Code: value.Code, Message: value.Message}
+	return apicontract.JobEvent{ID: value.ID, JobID: value.JobID, Sequence: value.Sequence, Attempt: value.Attempt, Timestamp: value.Timestamp.Format(time.RFC3339Nano), Level: value.Level, Phase: value.Phase, Code: value.Code, Message: value.Message}
 }
 
 func contractJobEvents(values []jobs.Event) []apicontract.JobEvent {
@@ -549,7 +559,7 @@ func (s *Server) rotateCSRF(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	d := s.runDiagnostics(r.Context())
-	writeJSON(w, 200, apicontract.SystemStatus{Daemon: "running", Diagnostics: contractDiagnostics(d), Capabilities: apicontract.Capabilities{FakeRuntime: s.FakeRuntime, GithubConnections: s.Sources != nil && s.Sources.ProviderEnabled()}})
+	writeJSON(w, 200, apicontract.SystemStatus{Daemon: "running", Diagnostics: contractDiagnostics(d), Capabilities: apicontract.Capabilities{FakeRuntime: s.FakeRuntime, ComposeRuntime: s.ComposeRuntime, GithubConnections: s.Sources != nil && s.Sources.ProviderEnabled()}})
 }
 func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
 	d := s.runDiagnostics(r.Context())
@@ -684,21 +694,32 @@ func (s *Server) services(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) action(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.FakeRuntime {
-			problem(w, r, http.StatusConflict, "capability_unavailable", "Runtime actions are unavailable in this build configuration", nil)
-			return
-		}
 		id := r.PathValue("appId")
 		if _, err := s.Apps.Get(id); err != nil {
 			problem(w, r, 404, "app_not_found", "Application was not found", nil)
 			return
 		}
-		job, created, err := s.Jobs.Create(kind, "application", id, r.Header.Get("Idempotency-Key"))
-		if err != nil {
-			problem(w, r, 409, "application_busy", err.Error(), nil)
+		if !s.FakeRuntime {
+			problem(w, r, http.StatusConflict, "capability_unavailable", "Runtime actions are unavailable in this build configuration", nil)
 			return
 		}
-		writeJSON(w, map[bool]int{true: 202, false: 200}[created], apicontract.JobMutationResponse{Job: contractJob(job), Created: created})
+		idempotencyKey := r.Header.Get("Idempotency-Key")
+		if len(idempotencyKey) > 200 {
+			problem(w, r, http.StatusUnprocessableEntity, "invalid_idempotency_key", "Idempotency key is invalid", map[string]string{"Idempotency-Key": "Must be at most 200 bytes"})
+			return
+		}
+		actorID := r.Context().Value(principalKey{}).(principal).user.ID
+		job, created, err := s.Jobs.CreateWithInput(jobs.CreateRequest{Type: kind, ResourceType: "application", ResourceID: id, IdempotencyKey: idempotencyKey, RequestedBy: actorID, Input: jobs.NoInput{}})
+		switch {
+		case err == nil:
+			writeJSON(w, map[bool]int{true: 202, false: 200}[created], apicontract.JobMutationResponse{Job: contractJob(job), Created: created})
+		case errors.Is(err, jobs.ErrIdempotency):
+			problem(w, r, http.StatusConflict, "idempotency_conflict", "Idempotency key conflicts with the original request", nil)
+		case errors.Is(err, jobs.ErrApplicationBusy):
+			problem(w, r, http.StatusConflict, "application_busy", "Application already has an active mutation", nil)
+		default:
+			problem(w, r, http.StatusInternalServerError, "internal_error", "Could not create application job", nil)
+		}
 	}
 }
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {

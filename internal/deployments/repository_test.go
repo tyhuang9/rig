@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -284,5 +285,46 @@ func TestTransitionsAndRecoveryUseExplicitAllowlistAndPreserveNeedsAttention(t *
 	}
 	if _, err := fixture.repository.Transition(ctx, fixture.appA, applying.ID, Succeeded, ""); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("terminal transition = %v", err)
+	}
+}
+
+func TestReleaseHistoryPreservesCredentialFreeProvenanceAndLegacyDeployments(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	ctx := context.Background()
+	releaseID := strings.Repeat("a", 32)
+	created := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := fixture.repository.db.Exec(`INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,compose_path,archive_sha256,workspace_state) VALUES(?,?,?,?, 'ready','{}',?,'github',?,?,?,?,?,?,?,'ready')`, releaseID, fixture.appA, strings.Repeat("b", 40), "main", created, 42, "owner", "repository", "refs/heads/main", strings.Repeat("b", 40), "compose.yaml", strings.Repeat("c", 64)); err != nil {
+		t.Fatal(err)
+	}
+	release, err := fixture.repository.Release(ctx, fixture.appA, releaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release.RepositoryID != 42 || release.RepositoryOwner != "owner" || release.RepositoryName != "repository" || release.TrackedRef != "refs/heads/main" || release.ResolvedSHA != strings.Repeat("b", 40) || release.ArchiveSHA256 != strings.Repeat("c", 64) || release.ComposePath != "compose.yaml" {
+		t.Fatalf("release provenance = %#v", release)
+	}
+	if _, err := fixture.repository.Release(ctx, fixture.appB, releaseID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-app release lookup = %v", err)
+	}
+
+	legacyID := uuid.NewString()
+	if _, err := fixture.repository.db.Exec(`INSERT INTO deployments(id,app_id,status,started_at,finished_at) VALUES(?,?,'succeeded',?,?)`, legacyID, fixture.appA, created, created); err != nil {
+		t.Fatal(err)
+	}
+	history, err := fixture.repository.List(ctx, fixture.appA, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, deployment := range history {
+		if deployment.ID == legacyID {
+			found = true
+			if deployment.JobID != "" {
+				t.Fatalf("legacy deployment job ID = %q", deployment.JobID)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("legacy deployment with a null job linkage was omitted from history")
 	}
 }

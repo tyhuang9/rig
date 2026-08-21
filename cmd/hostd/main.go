@@ -141,7 +141,7 @@ func main() {
 		logger.Error("runtime recovery failed", "error", err)
 		os.Exit(1)
 	}
-	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, ComposeRuntime: cfg.ComposeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
