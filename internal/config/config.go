@@ -9,18 +9,23 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
-	Mode            string
-	ListenAddress   string
-	DataRoot        string
-	LogLevel        string
-	DockerEndpoint  string
-	FakeRuntime     bool
-	CaddyManagement bool
-	GitHubClientID  string
-	GitHubAppSlug   string
+	Mode                 string
+	ListenAddress        string
+	DataRoot             string
+	LogLevel             string
+	DockerEndpoint       string
+	FakeRuntime          bool
+	ComposeRuntime       bool
+	ComposeConfigTimeout time.Duration
+	ComposeApplyTimeout  time.Duration
+	ComposeWaitTimeout   time.Duration
+	CaddyManagement      bool
+	GitHubClientID       string
+	GitHubAppSlug        string
 }
 
 var (
@@ -33,7 +38,15 @@ func Defaults() Config {
 	if err != nil {
 		root = "."
 	}
-	return Config{Mode: "controller-agent", ListenAddress: "127.0.0.1:7345", DataRoot: filepath.Join(root, "hostd"), LogLevel: "info"}
+	return Config{
+		Mode:                 "controller-agent",
+		ListenAddress:        "127.0.0.1:7345",
+		DataRoot:             filepath.Join(root, "hostd"),
+		LogLevel:             "info",
+		ComposeConfigTimeout: 30 * time.Second,
+		ComposeApplyTimeout:  15 * time.Minute,
+		ComposeWaitTimeout:   2 * time.Minute,
+	}
 }
 
 func FromFlags(args []string) (Config, error) {
@@ -45,6 +58,10 @@ func FromFlags(args []string) (Config, error) {
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "debug, info, warn, or error")
 	fs.StringVar(&c.DockerEndpoint, "docker-endpoint", "", "Docker endpoint override")
 	fs.BoolVar(&c.FakeRuntime, "fake-runtime", false, "enable fake runtime (development/test only)")
+	fs.BoolVar(&c.ComposeRuntime, "compose-runtime", false, "enable Docker Compose deployments")
+	fs.DurationVar(&c.ComposeConfigTimeout, "compose-config-timeout", c.ComposeConfigTimeout, "Docker Compose configuration timeout")
+	fs.DurationVar(&c.ComposeApplyTimeout, "compose-apply-timeout", c.ComposeApplyTimeout, "Docker Compose apply timeout")
+	fs.DurationVar(&c.ComposeWaitTimeout, "compose-wait-timeout", c.ComposeWaitTimeout, "Docker Compose health wait timeout")
 	fs.BoolVar(&c.CaddyManagement, "caddy-management", false, "enable Caddy management")
 	fs.StringVar(&c.GitHubClientID, "github-client-id", "", "public GitHub App client ID")
 	fs.StringVar(&c.GitHubAppSlug, "github-app-slug", "", "public GitHub App slug")
@@ -60,8 +77,20 @@ func FromFlags(args []string) (Config, error) {
 	if err := validateLoopbackListenAddress(c.ListenAddress); err != nil {
 		return Config{}, err
 	}
+	if c.FakeRuntime && c.ComposeRuntime {
+		return Config{}, errors.New("fake-runtime and compose-runtime are mutually exclusive")
+	}
 	if c.FakeRuntime && !safeFakeRuntimeRoot(c.DataRoot) {
 		return Config{}, errors.New("fake runtime requires a resolved .hostd-dev root or an isolated hostd-* test root under the system temporary directory")
+	}
+	if c.ComposeRuntime && !localDockerEndpoint(c.DockerEndpoint) {
+		return Config{}, errors.New("compose runtime requires a local Docker endpoint")
+	}
+	if c.ComposeConfigTimeout < time.Second || c.ComposeConfigTimeout > 5*time.Minute ||
+		c.ComposeApplyTimeout < time.Second || c.ComposeApplyTimeout > 2*time.Hour ||
+		c.ComposeWaitTimeout < time.Second || c.ComposeWaitTimeout > time.Hour ||
+		c.ComposeApplyTimeout <= c.ComposeWaitTimeout {
+		return Config{}, errors.New("compose runtime timeouts are outside supported bounds")
 	}
 	if (c.GitHubClientID == "") != (c.GitHubAppSlug == "") {
 		return Config{}, errors.New("github-client-id and github-app-slug must be provided together")
@@ -70,6 +99,22 @@ func FromFlags(args []string) (Config, error) {
 		return Config{}, errors.New("GitHub App client ID or slug is invalid")
 	}
 	return c, nil
+}
+
+func localDockerEndpoint(endpoint string) bool {
+	if endpoint == "" {
+		return true
+	}
+	if strings.TrimSpace(endpoint) != endpoint || strings.ContainsAny(endpoint, "?#\x00") {
+		return false
+	}
+	if strings.HasPrefix(endpoint, "unix:///") {
+		return len(strings.TrimPrefix(endpoint, "unix://")) > 1
+	}
+	if strings.HasPrefix(endpoint, "npipe:////./pipe/") {
+		return len(strings.TrimPrefix(endpoint, "npipe:////./pipe/")) > 0
+	}
+	return false
 }
 
 func (c Config) GitHubConnectionsEnabled() bool {
