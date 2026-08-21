@@ -69,6 +69,34 @@ var supportedServiceFields = map[string]struct{}{
 	"uts": {}, "volumes": {}, "volumes_from": {}, "working_dir": {},
 }
 
+var rejectedServiceFields = []string{
+	"blkio_config", "credential_spec", "develop", "external_links", "extends",
+	"include", "isolation", "label_file", "models", "pre_stop", "provider",
+	"runtime", "storage_opt", "sysctls", "volumes_from", "cgroup_parent",
+	"oom_kill_disable", "oom_score_adj",
+}
+
+var supportedBuildFields = map[string]struct{}{
+	"additional_contexts": {}, "args": {}, "context": {}, "dockerfile": {},
+	"entitlements": {}, "labels": {}, "network": {}, "no_cache": {},
+	"platforms": {}, "privileged": {}, "pull": {}, "secrets": {}, "shm_size": {},
+	"ssh": {}, "tags": {}, "target": {},
+}
+
+var allowedVolumeFields = map[string]struct{}{
+	"bind": {}, "consistency": {}, "read_only": {}, "source": {}, "target": {},
+	"tmpfs": {}, "type": {}, "volume": {},
+}
+
+var allowedPortFields = map[string]struct{}{
+	"app_protocol": {}, "host_ip": {}, "mode": {}, "name": {}, "protocol": {},
+	"published": {}, "target": {},
+}
+
+var allowedEnvFileFields = map[string]struct{}{
+	"format": {}, "path": {}, "required": {},
+}
+
 type PolicyFinding struct {
 	PolicyVersion string `json:"policyVersion"`
 	Capability    string `json:"capability"`
@@ -200,10 +228,12 @@ func (e *evaluator) evaluateService(name string, service map[string]json.RawMess
 	e.devices(name, service["devices"])
 	e.gpus(name, service["gpus"])
 	e.build(name, service["build"])
+	e.deploy(name, service["deploy"])
+	e.postStart(name, service["post_start"])
 	e.volumes(name, service["volumes"])
 	e.ports(name, service["ports"])
 	e.envFiles(name, service["env_file"])
-	for _, field := range []string{"extends", "include", "volumes_from", "provider"} {
+	for _, field := range rejectedServiceFields {
 		if raw, ok := service[field]; ok && !isEmptyJSON(raw) {
 			e.add("unsupported_"+field, map[string]any{"service": name, "resource": field}, DispositionRejected)
 		}
@@ -260,8 +290,15 @@ func (e *evaluator) securityOptions(service string, raw json.RawMessage) {
 	}
 	for _, value := range values {
 		lower := strings.ToLower(strings.TrimSpace(value))
-		if strings.Contains(lower, "unconfined") || lower == "label=disable" || lower == "label:disable" {
+		switch {
+		case lower == "no-new-privileges:true" || lower == "no-new-privileges=true":
+			// This tightens the container security boundary and needs no approval.
+		case lower == "seccomp=unconfined" || lower == "seccomp:unconfined" ||
+			lower == "apparmor=unconfined" || lower == "apparmor:unconfined" ||
+			lower == "label=disable" || lower == "label:disable":
 			e.add("unconfined_security_opt", map[string]any{"service": service, "option": lower}, DispositionApprovalRequired)
+		default:
+			e.add("unsupported_security_opt", map[string]any{"service": service}, DispositionRejected)
 		}
 	}
 }
@@ -330,6 +367,32 @@ func (e *evaluator) build(service string, raw json.RawMessage) {
 			e.add("unsupported_build", map[string]any{"service": service}, DispositionRejected)
 			return
 		}
+		for _, field := range sortedKeys(obj) {
+			if _, supported := supportedBuildFields[field]; !supported && !isExtensionField(field) {
+				e.add("unsupported_build_field", map[string]any{"service": service, "field": field}, DispositionRejected)
+			}
+		}
+		e.validateBuildFieldTypes(service, obj)
+		e.boolGate(service, obj, "privileged", "build_privileged")
+		if network, exists := obj["network"]; exists && !isEmptyJSON(network) {
+			value, ok := rawString(network)
+			switch {
+			case !ok:
+				e.add("unsupported_build_network", map[string]any{"service": service}, DispositionRejected)
+			case strings.EqualFold(value, "host"):
+				e.add("build_host_network", map[string]any{"service": service}, DispositionApprovalRequired)
+			case value != "" && !strings.EqualFold(value, "default") && !strings.EqualFold(value, "none"):
+				e.add("unsupported_build_network", map[string]any{"service": service}, DispositionRejected)
+			}
+		}
+		if entitlements, exists := obj["entitlements"]; exists && !isEmptyJSON(entitlements) {
+			e.buildEntitlements(service, entitlements)
+		}
+		for _, field := range []string{"ssh", "secrets"} {
+			if value, exists := obj[field]; exists && !isEmptyJSON(value) {
+				e.add("unsupported_build_"+field, map[string]any{"service": service, "resource": field}, DispositionRejected)
+			}
+		}
 		if contextRaw, exists := obj["context"]; exists && !isEmptyJSON(contextRaw) {
 			var ok bool
 			context, ok = rawString(contextRaw)
@@ -354,6 +417,216 @@ func (e *evaluator) build(service string, raw json.RawMessage) {
 		context = "."
 	}
 	e.pathResource(service, "build_context", context, "", "")
+}
+
+func (e *evaluator) validateBuildFieldTypes(service string, fields map[string]json.RawMessage) {
+	for _, field := range []string{"args", "labels"} {
+		raw, exists := fields[field]
+		if exists && !isEmptyJSON(raw) && !validStringMapOrList(raw) {
+			e.add("unsupported_build_"+field, map[string]any{"service": service}, DispositionRejected)
+		}
+	}
+	for _, field := range []string{"no_cache", "pull"} {
+		raw, exists := fields[field]
+		if exists && !isEmptyJSON(raw) && !validBool(raw) {
+			e.add("unsupported_build_"+field, map[string]any{"service": service}, DispositionRejected)
+		}
+	}
+	for _, field := range []string{"platforms", "tags"} {
+		raw, exists := fields[field]
+		if exists && !isEmptyJSON(raw) && !validStringList(raw) {
+			e.add("unsupported_build_"+field, map[string]any{"service": service}, DispositionRejected)
+		}
+	}
+	for _, field := range []string{"target", "shm_size"} {
+		raw, exists := fields[field]
+		if exists && !isEmptyJSON(raw) && !validStringOrNumber(raw) {
+			e.add("unsupported_build_"+field, map[string]any{"service": service}, DispositionRejected)
+		}
+	}
+}
+
+func (e *evaluator) buildEntitlements(service string, raw json.RawMessage) {
+	var values []string
+	if json.Unmarshal(raw, &values) != nil {
+		e.add("unsupported_build_entitlements", map[string]any{"service": service}, DispositionRejected)
+		return
+	}
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		switch value {
+		case "network.host", "security.insecure":
+			e.add("build_entitlement", map[string]any{"service": service, "entitlement": value}, DispositionApprovalRequired)
+		default:
+			e.add("unsupported_build_entitlement", map[string]any{"service": service}, DispositionRejected)
+		}
+	}
+}
+
+func (e *evaluator) postStart(service string, raw json.RawMessage) {
+	if len(raw) == 0 || isEmptyJSON(raw) {
+		return
+	}
+	var hooks []map[string]json.RawMessage
+	if json.Unmarshal(raw, &hooks) != nil {
+		e.add("unsupported_post_start", map[string]any{"service": service}, DispositionRejected)
+		return
+	}
+	allowed := map[string]struct{}{"command": {}, "environment": {}, "privileged": {}, "user": {}, "working_dir": {}}
+	for index, hook := range hooks {
+		for _, field := range sortedKeys(hook) {
+			if _, ok := allowed[field]; !ok && !isExtensionField(field) {
+				e.add("unsupported_post_start_field", map[string]any{"service": service, "index": index, "field": field}, DispositionRejected)
+			}
+		}
+		if command, exists := hook["command"]; exists && !isEmptyJSON(command) && !validStringOrStringList(command) {
+			e.add("unsupported_post_start_command", map[string]any{"service": service, "index": index}, DispositionRejected)
+		}
+		if environment, exists := hook["environment"]; exists && !isEmptyJSON(environment) && !validStringMapOrList(environment) {
+			e.add("unsupported_post_start_environment", map[string]any{"service": service, "index": index}, DispositionRejected)
+		}
+		for _, field := range []string{"user", "working_dir"} {
+			if value, exists := hook[field]; exists && !isEmptyJSON(value) {
+				if _, ok := rawString(value); !ok {
+					e.add("unsupported_post_start_"+field, map[string]any{"service": service, "index": index}, DispositionRejected)
+				}
+			}
+		}
+		if privileged, exists := hook["privileged"]; exists && !isEmptyJSON(privileged) {
+			var enabled bool
+			if json.Unmarshal(privileged, &enabled) != nil {
+				e.add("unsupported_post_start_privileged", map[string]any{"service": service, "index": index}, DispositionRejected)
+			} else if enabled {
+				e.add("post_start_privileged", map[string]any{"service": service, "index": index}, DispositionApprovalRequired)
+			}
+		}
+		clearRawMap(hook)
+	}
+}
+
+func (e *evaluator) deploy(service string, raw json.RawMessage) {
+	if len(raw) == 0 || isEmptyJSON(raw) {
+		return
+	}
+	var deploy map[string]json.RawMessage
+	if json.Unmarshal(raw, &deploy) != nil || deploy == nil {
+		e.add("unsupported_deploy", map[string]any{"service": service}, DispositionRejected)
+		return
+	}
+	defer clearRawMap(deploy)
+	allowed := map[string]struct{}{
+		"endpoint_mode": {}, "labels": {}, "mode": {}, "placement": {}, "replicas": {},
+		"resources": {}, "restart_policy": {}, "rollback_config": {}, "update_config": {},
+	}
+	for _, field := range sortedKeys(deploy) {
+		if _, ok := allowed[field]; !ok && !isExtensionField(field) {
+			e.add("unsupported_deploy_field", map[string]any{"service": service, "field": field}, DispositionRejected)
+		}
+	}
+	for _, field := range []string{"placement", "restart_policy", "rollback_config", "update_config"} {
+		if value, exists := deploy[field]; exists && !isEmptyJSON(value) {
+			e.add("unsupported_deploy_"+field, map[string]any{"service": service}, DispositionRejected)
+		}
+	}
+	resourcesRaw, exists := deploy["resources"]
+	if !exists || isEmptyJSON(resourcesRaw) {
+		return
+	}
+	var resources map[string]json.RawMessage
+	if json.Unmarshal(resourcesRaw, &resources) != nil || resources == nil {
+		e.add("unsupported_deploy_resources", map[string]any{"service": service}, DispositionRejected)
+		return
+	}
+	defer clearRawMap(resources)
+	for _, field := range sortedKeys(resources) {
+		if field != "limits" && field != "reservations" && !isExtensionField(field) {
+			e.add("unsupported_deploy_resource_field", map[string]any{"service": service, "field": field}, DispositionRejected)
+		}
+	}
+	if limitsRaw, exists := resources["limits"]; exists && !isEmptyJSON(limitsRaw) {
+		e.deployResourceLimit(service, "limits", limitsRaw)
+	}
+	reservationsRaw, exists := resources["reservations"]
+	if !exists || isEmptyJSON(reservationsRaw) {
+		return
+	}
+	var reservations map[string]json.RawMessage
+	if json.Unmarshal(reservationsRaw, &reservations) != nil || reservations == nil {
+		e.add("unsupported_deploy_reservations", map[string]any{"service": service}, DispositionRejected)
+		return
+	}
+	defer clearRawMap(reservations)
+	for _, field := range sortedKeys(reservations) {
+		if field != "cpus" && field != "memory" && field != "pids" && field != "generic_resources" && field != "devices" && !isExtensionField(field) {
+			e.add("unsupported_deploy_reservation_field", map[string]any{"service": service, "field": field}, DispositionRejected)
+		}
+	}
+	for _, field := range []string{"cpus", "memory", "pids"} {
+		if value, exists := reservations[field]; exists && !isEmptyJSON(value) && !validStringOrNumber(value) {
+			e.add("unsupported_deploy_reservation_"+field, map[string]any{"service": service}, DispositionRejected)
+		}
+	}
+	if generic, exists := reservations["generic_resources"]; exists && !isEmptyJSON(generic) {
+		e.add("unsupported_deploy_generic_resources", map[string]any{"service": service}, DispositionRejected)
+	}
+	devicesRaw, exists := reservations["devices"]
+	if !exists || isEmptyJSON(devicesRaw) {
+		return
+	}
+	var devices []json.RawMessage
+	if json.Unmarshal(devicesRaw, &devices) != nil {
+		e.add("unsupported_deploy_reservation_devices", map[string]any{"service": service}, DispositionRejected)
+		return
+	}
+	for index, device := range devices {
+		var object map[string]json.RawMessage
+		if json.Unmarshal(device, &object) != nil || object == nil {
+			e.add("unsupported_deploy_reservation_device", map[string]any{"service": service, "index": index}, DispositionRejected)
+			continue
+		}
+		valid := true
+		for _, field := range sortedKeys(object) {
+			switch field {
+			case "capabilities", "count", "device_ids", "driver", "options":
+			default:
+				if !isExtensionField(field) {
+					valid = false
+					e.add("unsupported_deploy_reservation_device_field", map[string]any{"service": service, "index": index, "field": field}, DispositionRejected)
+				}
+			}
+		}
+		if valid && !validDeployDevice(object) {
+			valid = false
+			e.add("unsupported_deploy_reservation_device", map[string]any{"service": service, "index": index}, DispositionRejected)
+		}
+		if valid {
+			var normalized any
+			if json.Unmarshal(device, &normalized) != nil {
+				e.add("unsupported_deploy_reservation_device", map[string]any{"service": service, "index": index}, DispositionRejected)
+			} else {
+				e.add("deploy_reservation_device", map[string]any{"service": service, "index": index, "device": normalized}, DispositionApprovalRequired)
+			}
+		}
+		clearRawMap(object)
+	}
+}
+
+func (e *evaluator) deployResourceLimit(service, kind string, raw json.RawMessage) {
+	var values map[string]json.RawMessage
+	if json.Unmarshal(raw, &values) != nil || values == nil {
+		e.add("unsupported_deploy_"+kind, map[string]any{"service": service}, DispositionRejected)
+		return
+	}
+	defer clearRawMap(values)
+	for _, field := range sortedKeys(values) {
+		if field != "cpus" && field != "memory" && field != "pids" && !isExtensionField(field) {
+			e.add("unsupported_deploy_"+kind+"_field", map[string]any{"service": service, "field": field}, DispositionRejected)
+			continue
+		}
+		if !isExtensionField(field) && !validStringOrNumber(values[field]) {
+			e.add("unsupported_deploy_"+kind+"_"+field, map[string]any{"service": service}, DispositionRejected)
+		}
+	}
 }
 
 func (e *evaluator) dockerfile(service, contextValue, value string) {
@@ -414,6 +687,29 @@ func (e *evaluator) volumes(service string, raw json.RawMessage) {
 		var volume map[string]json.RawMessage
 		if json.Unmarshal(rawVolume, &volume) != nil || volume == nil {
 			e.add("unsupported_volume", map[string]any{"service": service, "index": i}, DispositionRejected)
+			continue
+		}
+		validSyntax := true
+		for _, field := range sortedKeys(volume) {
+			if _, allowed := allowedVolumeFields[field]; !allowed && !isExtensionField(field) {
+				e.add("unsupported_volume_field", map[string]any{"service": service, "index": i, "field": field}, DispositionRejected)
+				validSyntax = false
+			}
+		}
+		for _, field := range []string{"bind", "tmpfs", "volume"} {
+			if nested, exists := volume[field]; exists && !isEmptyJSON(nested) {
+				e.add("unsupported_volume_"+field+"_options", map[string]any{"service": service, "index": i}, DispositionRejected)
+				validSyntax = false
+			}
+		}
+		if consistency, exists := volume["consistency"]; exists && !isEmptyJSON(consistency) {
+			if _, ok := rawString(consistency); !ok {
+				e.add("unsupported_volume_consistency", map[string]any{"service": service, "index": i}, DispositionRejected)
+				validSyntax = false
+			}
+		}
+		if !validSyntax {
+			clearRawMap(volume)
 			continue
 		}
 		typeName, _ := rawString(volume["type"])
@@ -596,6 +892,25 @@ func (e *evaluator) ports(service string, raw json.RawMessage) {
 			e.add("unsupported_port", map[string]any{"service": service, "index": i}, DispositionRejected)
 			continue
 		}
+		validSyntax := true
+		for _, field := range sortedKeys(port) {
+			if _, allowed := allowedPortFields[field]; !allowed && !isExtensionField(field) {
+				e.add("unsupported_port_field", map[string]any{"service": service, "index": i, "field": field}, DispositionRejected)
+				validSyntax = false
+			}
+		}
+		for _, field := range []string{"app_protocol", "host_ip", "mode", "name", "protocol"} {
+			if value, exists := port[field]; exists && !isEmptyJSON(value) {
+				if _, ok := rawString(value); !ok {
+					e.add("unsupported_port_"+field, map[string]any{"service": service, "index": i}, DispositionRejected)
+					validSyntax = false
+				}
+			}
+		}
+		if !validSyntax {
+			clearRawMap(port)
+			continue
+		}
 		target, okTarget := numberString(port["target"])
 		published, okPublished := numberString(port["published"])
 		if !okTarget {
@@ -652,8 +967,28 @@ func (e *evaluator) envFiles(service string, raw json.RawMessage) {
 				e.add("unsupported_env_file", map[string]any{"service": service, "index": index}, DispositionRejected)
 				continue
 			}
+			validSyntax := true
+			for _, field := range sortedKeys(object) {
+				if _, allowed := allowedEnvFileFields[field]; !allowed && !isExtensionField(field) {
+					e.add("unsupported_env_file_field", map[string]any{"service": service, "index": index, "field": field}, DispositionRejected)
+					validSyntax = false
+				}
+			}
+			if required, exists := object["required"]; exists && !isEmptyJSON(required) && !validBool(required) {
+				e.add("unsupported_env_file_required", map[string]any{"service": service, "index": index}, DispositionRejected)
+				validSyntax = false
+			}
+			if format, exists := object["format"]; exists && !isEmptyJSON(format) {
+				if _, valid := rawString(format); !valid {
+					e.add("unsupported_env_file_format", map[string]any{"service": service, "index": index}, DispositionRejected)
+					validSyntax = false
+				}
+			}
 			path, ok = rawString(object["path"])
 			clearRawMap(object)
+			if !validSyntax {
+				continue
+			}
 		}
 		if !ok {
 			e.add("unsupported_env_file", map[string]any{"service": service, "index": index}, DispositionRejected)
@@ -797,6 +1132,109 @@ func rawString(raw json.RawMessage) (string, bool) {
 func rawBool(raw json.RawMessage) bool {
 	var value bool
 	return json.Unmarshal(raw, &value) == nil && value
+}
+
+func validBool(raw json.RawMessage) bool {
+	var value bool
+	return json.Unmarshal(raw, &value) == nil
+}
+
+func validStringList(raw json.RawMessage) bool {
+	var values []string
+	return json.Unmarshal(raw, &values) == nil
+}
+
+func validStringOrStringList(raw json.RawMessage) bool {
+	if _, ok := rawString(raw); ok {
+		return true
+	}
+	return validStringList(raw)
+}
+
+func validStringOrNumber(raw json.RawMessage) bool {
+	if _, ok := rawString(raw); ok {
+		return true
+	}
+	var value json.Number
+	return json.Unmarshal(raw, &value) == nil
+}
+
+func validStringMapOrList(raw json.RawMessage) bool {
+	if validStringList(raw) {
+		return true
+	}
+	var values map[string]json.RawMessage
+	if json.Unmarshal(raw, &values) != nil || values == nil {
+		return false
+	}
+	defer clearRawMap(values)
+	for _, value := range values {
+		if isEmptyJSON(value) {
+			continue
+		}
+		if _, ok := rawString(value); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func validDeployDevice(fields map[string]json.RawMessage) bool {
+	capabilities, exists := fields["capabilities"]
+	if !exists || !validNonemptyStringList(capabilities) {
+		return false
+	}
+	if count, exists := fields["count"]; exists && !isEmptyJSON(count) {
+		var text string
+		if json.Unmarshal(count, &text) == nil {
+			if !strings.EqualFold(text, "all") {
+				if _, err := strconv.ParseUint(text, 10, 32); err != nil {
+					return false
+				}
+			}
+		} else {
+			var number json.Number
+			if json.Unmarshal(count, &number) != nil {
+				return false
+			}
+			if _, err := strconv.ParseUint(number.String(), 10, 32); err != nil {
+				return false
+			}
+		}
+	}
+	if ids, exists := fields["device_ids"]; exists && !isEmptyJSON(ids) {
+		if !validNonemptyStringList(ids) {
+			return false
+		}
+		if count, hasCount := fields["count"]; hasCount && !isEmptyJSON(count) {
+			return false
+		}
+	}
+	if driver, exists := fields["driver"]; exists && !isEmptyJSON(driver) {
+		value, ok := rawString(driver)
+		if !ok || strings.TrimSpace(value) == "" {
+			return false
+		}
+	}
+	if options, exists := fields["options"]; exists && !isEmptyJSON(options) {
+		if !validStringMapOrList(options) {
+			return false
+		}
+	}
+	return true
+}
+
+func validNonemptyStringList(raw json.RawMessage) bool {
+	var values []string
+	if json.Unmarshal(raw, &values) != nil || len(values) == 0 {
+		return false
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func isEmptyJSON(raw json.RawMessage) bool {

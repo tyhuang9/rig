@@ -502,6 +502,162 @@ func TestPolicyRejectsWindowsNamespacesBeforeFilesystemAccess(t *testing.T) {
 	}
 }
 
+func TestPolicyRecursiveCompositeSchema(t *testing.T) {
+	p := newMatrixPaths(t)
+	cases := []struct {
+		name        string
+		service     map[string]any
+		want        map[string]string
+		wantScope   map[string]string
+		wantNoClass []string
+	}{
+		{
+			name: "lifecycle hook privileged is exact and unknown fields reject",
+			service: map[string]any{
+				"post_start": []any{
+					map[string]any{"command": []any{"echo", "ok"}, "privileged": true},
+					map[string]any{"command": "true", "future_host_access": true},
+				},
+			},
+			want: map[string]string{
+				"post_start_privileged":        DispositionApprovalRequired,
+				"unsupported_post_start_field": DispositionRejected,
+			},
+			wantScope: map[string]string{"post_start_privileged": `{"index":0,"service":"web"}`},
+		},
+		{
+			name:    "pre stop rejected",
+			service: map[string]any{"pre_stop": []any{map[string]any{"command": "true"}}},
+			want:    map[string]string{"unsupported_pre_stop": DispositionRejected},
+		},
+		{
+			name: "build capability fields are recursively classified",
+			service: map[string]any{"build": map[string]any{
+				"context": p.workspace, "privileged": true, "network": "host",
+				"entitlements": []any{"network.host", "security.insecure"},
+				"ssh":          []any{"default"}, "secrets": []any{"build-secret"},
+				"future_host_access": true,
+			}},
+			want: map[string]string{
+				"workspace_build_context":   DispositionAllowed,
+				"build_privileged":          DispositionApprovalRequired,
+				"build_host_network":        DispositionApprovalRequired,
+				"build_entitlement":         DispositionApprovalRequired,
+				"unsupported_build_ssh":     DispositionRejected,
+				"unsupported_build_secrets": DispositionRejected,
+				"unsupported_build_field":   DispositionRejected,
+			},
+		},
+		{
+			name: "deploy device reservation scope binds the entire normalized request",
+			service: map[string]any{"deploy": map[string]any{"resources": map[string]any{"reservations": map[string]any{
+				"devices": []any{map[string]any{
+					"capabilities": []any{"gpu"}, "count": 1, "driver": "nvidia",
+					"options": map[string]any{"virtualization": "false"},
+				}},
+			}}}},
+			want: map[string]string{"deploy_reservation_device": DispositionApprovalRequired},
+			wantScope: map[string]string{
+				"deploy_reservation_device": `{"device":{"capabilities":["gpu"],"count":1,"driver":"nvidia","options":{"virtualization":"false"}},"index":0,"service":"web"}`,
+			},
+		},
+		{
+			name: "uninspected deploy composites and generic resources reject",
+			service: map[string]any{"deploy": map[string]any{
+				"placement":      map[string]any{"constraints": []any{"node.role==manager"}},
+				"restart_policy": map[string]any{"condition": "any"},
+				"resources":      map[string]any{"reservations": map[string]any{"generic_resources": []any{"GPU=1"}}},
+			}},
+			want: map[string]string{
+				"unsupported_deploy_placement":         DispositionRejected,
+				"unsupported_deploy_restart_policy":    DispositionRejected,
+				"unsupported_deploy_generic_resources": DispositionRejected,
+			},
+		},
+		{
+			name: "security options allow only hardened or approval gated values",
+			service: map[string]any{"security_opt": []any{
+				"no-new-privileges:true", "seccomp=unconfined", "apparmor=custom-profile",
+			}},
+			want: map[string]string{
+				"unconfined_security_opt":  DispositionApprovalRequired,
+				"unsupported_security_opt": DispositionRejected,
+			},
+		},
+		{
+			name: "recognized host capability fields reject",
+			service: map[string]any{
+				"credential_spec": map[string]any{"file": "host.json"}, "runtime": "runc",
+				"isolation": "hyperv", "cgroup_parent": "host.slice", "oom_kill_disable": true,
+			},
+			want: map[string]string{
+				"unsupported_credential_spec":  DispositionRejected,
+				"unsupported_runtime":          DispositionRejected,
+				"unsupported_isolation":        DispositionRejected,
+				"unsupported_cgroup_parent":    DispositionRejected,
+				"unsupported_oom_kill_disable": DispositionRejected,
+			},
+		},
+		{
+			name: "unknown long syntax keys fail closed",
+			service: map[string]any{
+				"volumes":  []any{map[string]any{"type": "volume", "source": "data", "target": "/data", "future": true}},
+				"ports":    []any{map[string]any{"target": 80, "future": true}},
+				"env_file": []any{map[string]any{"path": p.env, "future": true}},
+			},
+			want: map[string]string{
+				"unsupported_volume_field":   DispositionRejected,
+				"unsupported_port_field":     DispositionRejected,
+				"unsupported_env_file_field": DispositionRejected,
+			},
+		},
+		{
+			name: "nested field type mismatch fails closed",
+			service: map[string]any{
+				"post_start": []any{map[string]any{"command": true, "environment": true, "user": true}},
+				"build":      map[string]any{"context": p.workspace, "args": true},
+			},
+			want: map[string]string{
+				"unsupported_post_start_command":     DispositionRejected,
+				"unsupported_post_start_environment": DispositionRejected,
+				"unsupported_post_start_user":        DispositionRejected,
+				"unsupported_build_args":             DispositionRejected,
+				"workspace_build_context":            DispositionAllowed,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(serviceModel(tc.service))
+			if err != nil {
+				t.Fatal(err)
+			}
+			findings, err := EvaluatePolicy(body, p.workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			byClass := make(map[string][]PolicyFinding)
+			for _, finding := range findings {
+				byClass[finding.Capability] = append(byClass[finding.Capability], finding)
+			}
+			for capability, disposition := range tc.want {
+				matches := byClass[capability]
+				if len(matches) == 0 {
+					t.Fatalf("missing %s in %#v", capability, findings)
+				}
+				for _, finding := range matches {
+					if finding.Disposition != disposition {
+						t.Fatalf("%s disposition=%s want=%s", capability, finding.Disposition, disposition)
+					}
+				}
+				if scope, ok := tc.wantScope[capability]; ok && len(matches) == 1 && matches[0].Scope != scope {
+					t.Fatalf("%s scope=%s want=%s", capability, matches[0].Scope, scope)
+				}
+			}
+		})
+	}
+}
+
 func newMatrixPaths(t *testing.T) matrixPaths {
 	t.Helper()
 	w := t.TempDir()
