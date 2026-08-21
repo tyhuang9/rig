@@ -188,6 +188,9 @@ func TestRetentionFailsClosedWhenOnlyProtectedOrUnknownBytesRemain(t *testing.T)
 		if _, err := fixture.db.Exec(`INSERT INTO deployments(id,app_id,release_id,status,configuration_mode,provenance_initialized,started_at,finished_at) VALUES(?,?,?,'failed','current',1,datetime('now'),datetime('now'))`, uuid.NewString(), fixture.appA, release.id); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.RemoveAll(filepath.Join(fixture.root, release.storedPath)); err != nil {
+			t.Fatal(err)
+		}
 		if err := fixture.material.enforceRetention(context.Background(), fixture.appA, 1); !IsCode(err, "source_storage_full") {
 			t.Fatalf("error=%v", err)
 		}
@@ -213,6 +216,25 @@ func TestRetentionFailsClosedWhenOnlyProtectedOrUnknownBytesRemain(t *testing.T)
 			t.Fatalf("outside file changed: %q %v", body, err)
 		}
 	})
+}
+
+func TestRetentionAccountsForMissingExactManagedWorkspaceAsPruned(t *testing.T) {
+	fixture := newRetentionFixture(t, 8, 8)
+	release := fixture.addWorkspace(t, fixture.appA, WorkspaceStateReady, 8, time.Now())
+	if err := os.RemoveAll(filepath.Join(fixture.root, release.storedPath)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.material.enforceRetention(context.Background(), fixture.appA, 8); err != nil {
+		t.Fatalf("missing exact workspace blocked quota admission: %v", err)
+	}
+	state, path, size := workspaceState(t, fixture.db, release.id)
+	if state != WorkspaceStatePruned || path.Valid || size != 0 {
+		t.Fatalf("state=%q path=%#v size=%d", state, path, size)
+	}
+	var metadata string
+	if err := fixture.db.QueryRow(`SELECT metadata_json FROM releases WHERE id=?`, release.id).Scan(&metadata); err != nil || metadata != `{"retained":"yes"}` {
+		t.Fatalf("metadata=%q err=%v", metadata, err)
+	}
 }
 
 func TestRetentionPruningRecoveryAndFailureAreDurable(t *testing.T) {

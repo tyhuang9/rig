@@ -61,6 +61,18 @@ func (m *Materializer) enforceRetentionLocked(ctx context.Context, appID string,
 			return &Error{Code: ErrorCodeSourceStorageFull}
 		}
 		if _, err := m.workspaceLogicalSize(candidate); err != nil {
+			if m.exactManagedWorkspaceMissing(candidate) {
+				marked, markErr := m.markPruning(ctx, candidate)
+				if markErr != nil {
+					return internal(markErr)
+				}
+				if marked {
+					if err := m.completePruning(ctx, candidate); err != nil {
+						return internal(err)
+					}
+				}
+				continue
+			}
 			skipped[candidate.id] = true
 			continue
 		}
@@ -382,4 +394,40 @@ func (m *Materializer) managedWorkspaceComponentsSafe(workspace string) bool {
 		}
 	}
 	return true
+}
+
+// exactManagedWorkspaceMissing recognizes a completed external cleanup without
+// following links or touching a path outside the managed release layout. It is
+// deliberately false for malformed identities and unsafe existing ancestors.
+func (m *Materializer) exactManagedWorkspaceMissing(workspace retainedWorkspace) bool {
+	if !validAppID(workspace.appID) || !validID(workspace.id) || workspace.storedPath != m.workspaceRelative(workspace.appID, workspace.id) {
+		return false
+	}
+	expected, err := m.workspacePath(workspace.appID, workspace.id)
+	if err != nil {
+		return false
+	}
+	relative, err := filepath.Rel(m.dataRoot, expected)
+	if err != nil || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return false
+	}
+	current := m.dataRoot
+	parts := append([]string{"."}, strings.Split(relative, string(filepath.Separator))...)
+	for _, part := range parts {
+		if part != "." {
+			current = filepath.Join(current, part)
+		}
+		info, err := os.Lstat(current)
+		if errors.Is(err, fs.ErrNotExist) {
+			return true
+		}
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || localPathIsReparsePoint(current) {
+			return false
+		}
+		resolved, err := filepath.EvalSymlinks(current)
+		if err != nil || !sameFilesystemPath(resolved, current) {
+			return false
+		}
+	}
+	return false
 }
