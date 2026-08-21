@@ -1,6 +1,6 @@
-# hostd - Milestone 1
+# hostd
 
-`hostd` is a local-first deployment manager foundation. Milestone 1 provides a durable, authenticated control plane, an embedded dashboard, independent local diagnostics, and an explicitly enabled fake runtime. It does not execute Docker Compose or configure Caddy.
+`hostd` is a local-first deployment manager with a durable authenticated control plane, independent local diagnostics, an explicitly enabled development fake runtime, and an opt-in controller-local Docker Compose runtime. Runtime execution is disabled by default. Caddy configuration is not implemented.
 
 ## Prerequisites
 
@@ -46,6 +46,8 @@ Phase A accepts only an explicit loopback IP literal for `--listen`, such as `12
 
 Fake runtime is fail-closed. It must be explicitly enabled and its resolved data root must either be named `.hostd-dev` or be an isolated `hostd-*` directory under the system temporary directory. It persists job progress but never executes a workload.
 
+The real Docker Compose runtime requires `--compose-runtime`, is mutually exclusive with the fake runtime, and accepts only a controller-local Docker endpoint. Its administrative surface is the authenticated API; real deployment controls are not yet exposed in the embedded dashboard. See [Docker Compose runtime operations](docs/compose-runtime.md) for security boundaries, timeout flags, approval and resume flows, live verification, crash recovery, and disable/rollback guidance.
+
 ## Use hostctl safely
 
 After creating the administrator in the dashboard, create a CLI session without putting credentials in process arguments. PowerShell can supply a credential object through standard input:
@@ -85,7 +87,7 @@ go run ./cmd/hostctl jobs cancel JOB_ID
 
 ## Generate contracts
 
-`api/openapi.yaml` is the Phase A API source of truth. A pinned repository generator produces the Go operation map consumed by the HTTP router and the TypeScript operation map consumed by the browser client:
+`api/openapi.yaml` is the API source of truth. A pinned repository generator produces the Go operation map consumed by the HTTP router and the TypeScript operation map consumed by the browser client:
 
 ```sh
 go run ./cmd/openapi-gen
