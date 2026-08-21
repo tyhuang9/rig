@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/hostd/hostd/internal/pathsecurity"
 )
 
 const (
@@ -92,7 +94,7 @@ func EvaluatePolicy(rendered []byte, workspace string) ([]PolicyFinding, error) 
 	if len(rendered) == 0 || len(rendered) > MaxEffectiveJSONBytes {
 		return nil, &PolicyError{Code: "model_too_large"}
 	}
-	if workspace == "" || !filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace {
+	if workspace == "" || pathsecurity.RejectWindowsNamespace(workspace) || !filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace {
 		return nil, &PolicyError{Code: "invalid_workspace"}
 	}
 	root, err := canonicalPath(workspace)
@@ -709,6 +711,9 @@ func PolicyFingerprint(policyVersion, capability, scope string) string {
 }
 
 func canonicalPath(path string) (string, error) {
+	if pathsecurity.RejectWindowsNamespace(path) {
+		return "", errors.New("unsafe path namespace")
+	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", err

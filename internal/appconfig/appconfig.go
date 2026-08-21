@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/secretfile"
 )
 
@@ -101,7 +102,7 @@ type appLock struct {
 }
 
 func New(db *sql.DB, dataRoot string) (*Store, error) {
-	if db == nil || dataRoot == "" || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
+	if db == nil || dataRoot == "" || pathsecurity.RejectWindowsNamespace(dataRoot) || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
 		return nil, errors.New("application configuration data root must be absolute and clean")
 	}
 	return &Store{db: db, root: filepath.Join(dataRoot, "apps"), now: time.Now, appLocks: map[string]*appLock{}}, nil
@@ -414,6 +415,9 @@ func (s *Store) bundlePath(appID, revisionID string) string {
 }
 
 func safeDirectory(path string, create bool) error {
+	if pathsecurity.RejectWindowsNamespace(path) {
+		return errors.New("unsafe application configuration path namespace")
+	}
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) && create {
 		if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {

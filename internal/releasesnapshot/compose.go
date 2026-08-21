@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/hostd/hostd/internal/pathsecurity"
 	"gopkg.in/yaml.v3"
 )
 
@@ -17,7 +18,7 @@ const (
 )
 
 func validateComposeWorkspace(workspace, composePath string) error {
-	if composePath == "" || strings.ContainsAny(composePath, "$\\:") || filepath.IsAbs(composePath) || filepath.ToSlash(filepath.Clean(composePath)) != composePath {
+	if composePath == "" || pathsecurity.RejectWindowsNamespace(composePath) || strings.ContainsAny(composePath, "$\\:") || filepath.IsAbs(composePath) || filepath.ToSlash(filepath.Clean(composePath)) != composePath {
 		return errors.New("unsafe compose path")
 	}
 	compose := filepath.Join(workspace, filepath.FromSlash(composePath))
@@ -234,7 +235,7 @@ func resolvePathNode(workspace, base string, node *yaml.Node, wantDir bool) (str
 		return "", errors.New("invalid compose path")
 	}
 	value := strings.TrimSpace(node.Value)
-	if value == "" || strings.ContainsAny(value, "$\\:") || strings.HasPrefix(value, "git@") || filepath.IsAbs(value) || strings.HasPrefix(value, "/") {
+	if value == "" || pathsecurity.RejectWindowsNamespace(value) || strings.ContainsAny(value, "$\\:") || strings.HasPrefix(value, "git@") || filepath.IsAbs(value) || strings.HasPrefix(value, "/") {
 		return "", errors.New("unsafe compose path")
 	}
 	candidate := filepath.Join(base, filepath.FromSlash(strings.ReplaceAll(value, "\\", "/")))
@@ -257,6 +258,9 @@ func resolvePathNode(workspace, base string, node *yaml.Node, wantDir bool) (str
 	return candidate, nil
 }
 func readRegularLimited(workspace, path string, limit int64) ([]byte, error) {
+	if pathsecurity.RejectWindowsNamespace(workspace) || pathsecurity.RejectWindowsNamespace(path) {
+		return nil, errors.New("unsafe compose path")
+	}
 	if !safeNoLink(workspace, path) {
 		return nil, errors.New("unsafe compose path")
 	}
@@ -276,6 +280,9 @@ func readRegularLimited(workspace, path string, limit int64) ([]byte, error) {
 	return body, nil
 }
 func safeNoLink(root, target string) bool {
+	if pathsecurity.RejectWindowsNamespace(root) || pathsecurity.RejectWindowsNamespace(target) {
+		return false
+	}
 	if !within(root, target) {
 		return false
 	}

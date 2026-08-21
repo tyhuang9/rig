@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/pathsecurity"
 )
 
 const (
@@ -30,7 +31,7 @@ type Files struct {
 }
 
 func New(dataRoot string) (*Manager, error) {
-	if dataRoot == "" || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
+	if dataRoot == "" || pathsecurity.RejectWindowsNamespace(dataRoot) || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
 		return nil, errors.New("data root must be an absolute clean path")
 	}
 	if err := rejectPathAncestors(dataRoot); err != nil {
@@ -49,6 +50,9 @@ func New(dataRoot string) (*Manager, error) {
 
 func ensureSecureDirectory(parent, name string) (string, error) {
 	path := filepath.Join(parent, name)
+	if pathsecurity.RejectWindowsNamespace(parent) || pathsecurity.RejectWindowsNamespace(path) {
+		return "", errors.New("unsafe runtime temp path namespace")
+	}
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := secureMkdir(path); err != nil {

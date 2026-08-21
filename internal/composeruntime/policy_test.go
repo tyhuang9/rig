@@ -480,6 +480,18 @@ func TestPolicyRejectsRelativeWorkspace(t *testing.T) {
 	}
 }
 
+func TestPolicyRejectsWindowsNamespacesBeforeFilesystemAccess(t *testing.T) {
+	t.Parallel()
+	model := []byte(`{"services":{"web":{"volumes":[{"type":"bind","source":"\\\\?\\C:\\outside","target":"/data"}]}}}`)
+	findings, err := EvaluatePolicy(model, t.TempDir())
+	if err != nil || len(findings) != 1 || findings[0].Disposition != DispositionRejected {
+		t.Fatalf("namespace finding=%#v err=%v", findings, err)
+	}
+	if _, err := EvaluatePolicy([]byte(`{"services":{"web":{}}}`), `\\server\share`); err == nil {
+		t.Fatal("UNC workspace accepted")
+	}
+}
+
 func newMatrixPaths(t *testing.T) matrixPaths {
 	t.Helper()
 	w := t.TempDir()

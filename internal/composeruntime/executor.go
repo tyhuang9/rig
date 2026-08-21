@@ -17,6 +17,7 @@ import (
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
+	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
@@ -341,6 +342,9 @@ func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.Deploym
 }
 
 func resolveLocalCompose(sourcePath string) (string, string, error) {
+	if pathsecurity.RejectWindowsNamespace(sourcePath) {
+		return "", "", errors.New("unsafe local source namespace")
+	}
 	inspection, err := sourceinspection.InspectLocal(sourcePath)
 	if err != nil {
 		return "", "", err

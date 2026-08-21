@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/githubapp"
+	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
@@ -71,7 +72,7 @@ func realLifecycleFS() lifecycleFS {
 }
 
 func New(db *sql.DB, sources SourceReader, dataRoot string) (*Materializer, error) {
-	if db == nil || sources == nil || dataRoot == "" || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
+	if db == nil || sources == nil || dataRoot == "" || pathsecurity.RejectWindowsNamespace(dataRoot) || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
 		return nil, errors.New("release snapshot data root must be absolute and clean")
 	}
 	return &Materializer{db: db, sources: sources, dataRoot: dataRoot, now: time.Now, fs: realLifecycleFS()}, nil
@@ -434,7 +435,7 @@ func (m *Materializer) removeWorkspace(app, id string) error {
 	return m.fs.removeAll(p)
 }
 func managedPath(root, app, id, kind string) (string, error) {
-	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root || !validAppID(app) || !validID(id) || (kind != "releases" && kind != ".staging") {
+	if root == "" || pathsecurity.RejectWindowsNamespace(root) || !filepath.IsAbs(root) || filepath.Clean(root) != root || !validAppID(app) || !validID(id) || (kind != "releases" && kind != ".staging") {
 		return "", errors.New("invalid managed path")
 	}
 	target := filepath.Join(root, "apps", app, kind, id)
@@ -517,7 +518,7 @@ func safeWorkspace(workspace, compose string) bool {
 }
 
 func safeSelectedCompose(workspace, compose string) bool {
-	if workspace == "" || !filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace {
+	if workspace == "" || pathsecurity.RejectWindowsNamespace(workspace) || pathsecurity.RejectWindowsNamespace(compose) || !filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace {
 		return false
 	}
 	info, err := os.Lstat(workspace)
