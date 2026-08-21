@@ -3,6 +3,7 @@ ALTER TABLE deployments ADD COLUMN configuration_mode TEXT NOT NULL DEFAULT 'ori
 ALTER TABLE deployments ADD COLUMN actual_configuration_revision_id TEXT;
 ALTER TABLE deployments ADD COLUMN actual_configuration_revision_number INTEGER NOT NULL DEFAULT 0 CHECK (actual_configuration_revision_number >= 0);
 ALTER TABLE deployments ADD COLUMN diagnostic_code TEXT;
+ALTER TABLE deployments ADD COLUMN provenance_initialized INTEGER NOT NULL DEFAULT 0 CHECK (provenance_initialized IN (0,1));
 
 CREATE UNIQUE INDEX deployments_job ON deployments(job_id) WHERE job_id IS NOT NULL;
 CREATE INDEX deployments_history ON deployments(app_id, started_at DESC, id DESC);
@@ -54,12 +55,13 @@ WHEN (NEW.release_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM releases r WHERE 
   OR (NEW.actual_configuration_revision_number>0 AND NOT EXISTS (SELECT 1 FROM application_configuration_revisions c WHERE c.id=NEW.actual_configuration_revision_id AND c.app_id=NEW.app_id AND c.revision_number=NEW.actual_configuration_revision_number))
 BEGIN SELECT RAISE(ABORT, 'invalid deployment linkage'); END;
 
-CREATE TRIGGER deployment_identity_immutable BEFORE UPDATE OF app_id,release_id,job_id,configuration_mode,actual_configuration_revision_id,actual_configuration_revision_number ON deployments
+CREATE TRIGGER deployment_identity_immutable BEFORE UPDATE OF app_id,release_id,job_id,configuration_mode,actual_configuration_revision_id,actual_configuration_revision_number,provenance_initialized ON deployments
 WHEN NEW.app_id IS NOT OLD.app_id OR NEW.job_id IS NOT OLD.job_id
   OR NEW.configuration_mode IS NOT OLD.configuration_mode
-  OR (NEW.release_id IS NOT OLD.release_id AND NOT (OLD.status='preparing' AND OLD.release_id IS NULL AND NEW.release_id IS NOT NULL))
+  OR (NEW.release_id IS NOT OLD.release_id AND NOT (OLD.status='preparing' AND OLD.provenance_initialized=0 AND OLD.release_id IS NULL AND NEW.release_id IS NOT NULL))
   OR ((NEW.actual_configuration_revision_id IS NOT OLD.actual_configuration_revision_id OR NEW.actual_configuration_revision_number IS NOT OLD.actual_configuration_revision_number)
-      AND NOT (OLD.status='preparing' AND OLD.actual_configuration_revision_id IS NULL AND OLD.actual_configuration_revision_number=0))
+      AND NOT (OLD.status='preparing' AND OLD.provenance_initialized=0 AND OLD.actual_configuration_revision_id IS NULL AND OLD.actual_configuration_revision_number=0))
+  OR (NEW.provenance_initialized IS NOT OLD.provenance_initialized AND NOT (OLD.status='preparing' AND OLD.provenance_initialized=0 AND NEW.provenance_initialized=1))
 BEGIN SELECT RAISE(ABORT, 'deployment identity is immutable'); END;
 
 CREATE TRIGGER deployment_finding_valid_insert BEFORE INSERT ON deployment_policy_findings
