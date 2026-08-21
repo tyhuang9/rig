@@ -251,7 +251,7 @@ func terminal(value Status) bool {
 
 func knownDiagnostic(value string) bool {
 	switch value {
-	case "", "daemon_restarted", "runtime_unavailable", "compose_invalid", "compose_config_invalid", "compose_config_timeout", "compose_config_output_truncated", "policy_rejected", "approval_required", "apply_failed", "compose_apply_failed", "compose_apply_timeout", "compose_apply_output_truncated", "health_failed", "cancelled", "internal_error", "invalid_source", "source_unavailable", "source_access_lost", "source_too_large", "source_storage_full", "provider_unavailable", "configuration_unavailable":
+	case "", "daemon_restarted", "runtime_unavailable", "process_termination_failed", "compose_invalid", "compose_config_invalid", "compose_config_timeout", "compose_config_output_truncated", "policy_rejected", "approval_required", "apply_failed", "compose_apply_failed", "compose_apply_timeout", "compose_apply_output_truncated", "health_failed", "cancelled", "internal_error", "invalid_source", "source_unavailable", "source_access_lost", "source_too_large", "source_storage_full", "provider_unavailable", "configuration_unavailable":
 		return true
 	default:
 		return false
@@ -264,6 +264,8 @@ func diagnosticSummary(value string) string {
 		return "Deployment interrupted because hostd restarted"
 	case "runtime_unavailable":
 		return "Container runtime is unavailable"
+	case "process_termination_failed":
+		return "Runtime process termination failed"
 	case "compose_invalid", "compose_config_invalid":
 		return "Compose configuration is invalid"
 	case "compose_config_timeout":

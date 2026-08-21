@@ -51,6 +51,10 @@ func killProcessTree(command *exec.Cmd, handle any) error {
 	return nil
 }
 
+// Job Object termination owns the whole tree on Windows. Command wait is the
+// supported completion signal, so no additional Unix-style group probe runs.
+func processTreeAlive(*exec.Cmd, any) (bool, error) { return false, nil }
+
 func closeProcessTree(handle any) {
 	if job, ok := handle.(windows.Handle); ok {
 		_ = windows.CloseHandle(job)

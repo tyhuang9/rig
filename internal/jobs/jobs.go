@@ -1158,6 +1158,8 @@ func safeExecutionFailure(err error) (string, string) {
 			return "validation_failed", "Job validation failed"
 		case "runtime_unavailable":
 			return "runtime_unavailable", "Runtime unavailable"
+		case "process_termination_failed":
+			return "process_termination_failed", "Runtime process termination failed"
 		case "invalid_source":
 			return "invalid_source", "Application source is invalid"
 		case "source_unavailable":

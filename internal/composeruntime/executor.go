@@ -430,6 +430,9 @@ func commandUnavailable(err error) bool {
 // to persist: `compose up --wait` can still be building, pulling, or applying
 // when its outer command timeout expires.
 func configDiagnosticCode(ctx context.Context, result runtimeprocess.CommandResult, err error) string {
+	if errors.Is(err, runtimeprocess.ErrTerminationFailed) {
+		return "process_termination_failed"
+	}
 	if commandUnavailable(err) {
 		return "runtime_unavailable"
 	}
@@ -446,6 +449,9 @@ func configDiagnosticCode(ctx context.Context, result runtimeprocess.CommandResu
 }
 
 func applyDiagnosticCode(ctx context.Context, result runtimeprocess.CommandResult, err error) string {
+	if errors.Is(err, runtimeprocess.ErrTerminationFailed) {
+		return "process_termination_failed"
+	}
 	if commandUnavailable(err) {
 		return "runtime_unavailable"
 	}

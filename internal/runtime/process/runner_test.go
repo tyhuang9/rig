@@ -39,6 +39,8 @@ func TestCommandHelper(t *testing.T) {
 	case "outputsleep":
 		fmt.Fprint(os.Stdout, "collector-secret")
 		time.Sleep(10 * time.Second)
+	case "resistant-tree":
+		runResistantTreeHelper()
 	}
 	os.Exit(0)
 }
@@ -206,6 +208,51 @@ func TestExecRunnerPropagatesParentCancellationAfterTermination(t *testing.T) {
 	_, err := (ExecRunner{}).Run(ctx, sleepingCommandRequest(t, time.Second))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation error = %v", err)
+	}
+}
+
+func TestExecRunnerHardKillsTreeAfterLeaderReaped(t *testing.T) {
+	probes, hardKills := 0, 0
+	runner := ExecRunner{
+		stop: func(command *exec.Cmd, _ any) error { return command.Process.Kill() },
+		hardKill: func(*exec.Cmd, any) error {
+			hardKills++
+			return nil
+		},
+		treeAlive: func(*exec.Cmd, any) (bool, error) {
+			probes++
+			return hardKills == 0, nil
+		},
+		gracePeriod: 100 * time.Millisecond,
+		reapPeriod:  100 * time.Millisecond,
+		treePoll:    time.Millisecond,
+	}
+	_, err := runner.Run(context.Background(), sleepingCommandRequest(t, 20*time.Millisecond))
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrTerminationFailed) {
+		t.Fatalf("termination result = %v", err)
+	}
+	if hardKills != 1 || probes < 2 {
+		t.Fatalf("tree escalation probes=%d hard kills=%d", probes, hardKills)
+	}
+}
+
+func TestExecRunnerFailsWhenTreeCannotBeVerifiedAfterLeaderReaped(t *testing.T) {
+	hardKills := 0
+	runner := ExecRunner{
+		stop: func(command *exec.Cmd, _ any) error { return command.Process.Kill() },
+		hardKill: func(*exec.Cmd, any) error {
+			hardKills++
+			return nil
+		},
+		treeAlive:   func(*exec.Cmd, any) (bool, error) { return true, nil },
+		gracePeriod: 100 * time.Millisecond,
+		reapPeriod:  10 * time.Millisecond,
+		treePoll:    time.Millisecond,
+	}
+	_, err := runner.Run(context.Background(), sleepingCommandRequest(t, 20*time.Millisecond))
+	assertTerminationFailure(t, err, nil, nil, true, context.DeadlineExceeded)
+	if hardKills != 1 {
+		t.Fatalf("hard kills=%d", hardKills)
 	}
 }
 

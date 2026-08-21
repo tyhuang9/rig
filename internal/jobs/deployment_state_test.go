@@ -76,6 +76,7 @@ func TestRealDeploymentCompletionAndFailuresAreCentrallySanitized(t *testing.T) 
 		"source_too_large":                "Application source exceeds deployment limits",
 		"source_storage_full":             "Application source storage is full",
 		"configuration_unavailable":       "Application configuration is unavailable",
+		"process_termination_failed":      "Runtime process termination failed",
 		"compose_invalid":                 "Compose configuration is invalid",
 		"compose_config_invalid":          "Compose configuration is invalid",
 		"compose_config_timeout":          "Compose configuration check timed out",

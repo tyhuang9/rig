@@ -27,4 +27,18 @@ func killProcessTree(command *exec.Cmd, _ any) error {
 	return syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 }
 
+func processTreeAlive(command *exec.Cmd, _ any) (bool, error) {
+	if command.Process == nil {
+		return false, nil
+	}
+	err := syscall.Kill(-command.Process.Pid, 0)
+	if err == nil || err == syscall.EPERM {
+		return true, nil
+	}
+	if err == syscall.ESRCH {
+		return false, nil
+	}
+	return false, err
+}
+
 func closeProcessTree(any) {}
