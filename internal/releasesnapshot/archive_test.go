@@ -298,7 +298,7 @@ func TestValidateComposeWorkspaceBoundaryPathsResourcesAndLinks(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	valid := "services:\n  app:\n    build:\n      context: context\n      dockerfile: Dockerfile\n      additional_contexts:\n        one: additional\n        two: additional\n    env_file: [app.env]\n    extends: {file: common.yaml}\nconfigs: {cfg: {file: config.txt}}\nsecrets: {sec: {file: secret.txt}}\n"
+	valid := "services:\n  app:\n    build:\n      context: context\n      dockerfile: Dockerfile\n      additional_contexts:\n        one: additional\n        two: additional\n    env_file:\n      - app.env\n      - path: app.env\n        required: true\n        format: raw\n    extends: {file: common.yaml}\nconfigs: {cfg: {file: config.txt}}\nsecrets: {sec: {file: secret.txt}}\n"
 	write := func(body string) {
 		t.Helper()
 		if err := os.WriteFile(filepath.Join(app, "compose.yaml"), []byte(body), 0o600); err != nil {
@@ -329,6 +329,9 @@ func TestValidateComposeWorkspaceBoundaryPathsResourcesAndLinks(t *testing.T) {
 		"services: {app: {build: {additional_contexts: [bad]}}}\n",
 		"services: {app: {build: {additional_contexts: {bad: service:other}}}}\n",
 		"services: {app: {env_file: {path: app.env}}}\n",
+		"services: {app: {env_file: [{required: true}]}}\n",
+		"services: {app: {env_file: [{path: app.env, required: yes}]}}\n",
+		"services: {app: {env_file: [{path: app.env, future: true}]}}\n",
 		"services: {app: {extends: {file: missing.yaml}}}\n",
 		"configs: {cfg: {file: missing.txt}}\nservices: {}\n",
 		"secrets: {sec: {file: context}}\nservices: {}\n",
