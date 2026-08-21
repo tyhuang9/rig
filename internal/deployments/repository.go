@@ -245,7 +245,7 @@ func terminal(value Status) bool {
 
 func knownDiagnostic(value string) bool {
 	switch value {
-	case "", "daemon_restarted", "runtime_unavailable", "compose_invalid", "policy_rejected", "approval_required", "apply_failed", "health_failed", "cancelled", "internal_error", "source_unavailable", "source_access_lost", "source_too_large", "configuration_unavailable":
+	case "", "daemon_restarted", "runtime_unavailable", "compose_invalid", "policy_rejected", "approval_required", "apply_failed", "health_failed", "cancelled", "internal_error", "invalid_source", "source_unavailable", "source_access_lost", "source_too_large", "provider_unavailable", "configuration_unavailable":
 		return true
 	default:
 		return false
@@ -272,12 +272,16 @@ func diagnosticSummary(value string) string {
 		return "Deployment was cancelled"
 	case "internal_error":
 		return "Deployment failed because of an internal error"
+	case "invalid_source":
+		return "Application source is invalid"
 	case "source_unavailable":
 		return "Application source is unavailable"
 	case "source_access_lost":
 		return "Access to the application source was lost"
 	case "source_too_large":
 		return "Application source exceeds deployment limits"
+	case "provider_unavailable":
+		return "Application source provider is unavailable"
 	case "configuration_unavailable":
 		return "Application configuration is unavailable"
 	default:

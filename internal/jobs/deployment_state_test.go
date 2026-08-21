@@ -31,6 +31,12 @@ func TestDeploymentInputIsSealedAndRoundTrips(t *testing.T) {
 	if decoded, err := DeploymentInputFor(Job{Type: "deploy", Input: latest}); err != nil || decoded.ReleaseID != "" {
 		t.Fatalf("latest decoded = %#v, %v", decoded, err)
 	}
+	rawReleaseID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if input, err := marshalInput(DeploymentInput{ReleaseID: rawReleaseID, ConfigurationMode: ConfigurationOriginal}); err != nil {
+		t.Fatalf("materialized release ID rejected: %v", err)
+	} else if decoded, err := DeploymentInputFor(Job{Type: "deploy", Input: input}); err != nil || decoded.ReleaseID != rawReleaseID {
+		t.Fatalf("materialized release decoded = %#v, %v", decoded, err)
+	}
 	for _, invalid := range []Job{
 		{Type: "deploy", Input: []byte(`{"releaseId":"` + releaseID + `","configurationMode":"original","path":"/tmp"}`)},
 		{Type: "deploy", Input: []byte(`{"releaseId":"not-a-uuid","configurationMode":"original"}`)},
@@ -38,6 +44,31 @@ func TestDeploymentInputIsSealedAndRoundTrips(t *testing.T) {
 	} {
 		if _, err := DeploymentInputFor(invalid); !errors.Is(err, ErrInvalidInput) {
 			t.Fatalf("invalid input accepted: %s (%v)", invalid.Input, err)
+		}
+	}
+}
+
+func TestRealDeploymentCompletionAndFailuresAreCentrallySanitized(t *testing.T) {
+	if message, err := completionMessage("deployment_completed"); err != nil || message != "Deployment completed" {
+		t.Fatalf("completion message=%q err=%v", message, err)
+	}
+	want := map[string]string{
+		"invalid_source":            "Application source is invalid",
+		"source_unavailable":        "Application source is unavailable",
+		"source_access_lost":        "Access to the application source was lost",
+		"provider_unavailable":      "Application source provider is unavailable",
+		"source_too_large":          "Application source exceeds deployment limits",
+		"configuration_unavailable": "Application configuration is unavailable",
+		"compose_invalid":           "Compose configuration is invalid",
+		"policy_rejected":           "Compose configuration requests an unsupported capability",
+		"apply_failed":              "Container runtime failed to apply the deployment",
+		"health_failed":             "Deployment did not become healthy",
+		"internal_error":            "Deployment failed because of an internal error",
+	}
+	for code, message := range want {
+		gotCode, gotMessage := safeExecutionFailure(&ExecutionError{Code: code, Detail: "provider-secret raw stderr"})
+		if gotCode != code || gotMessage != message || gotMessage == "provider-secret raw stderr" {
+			t.Fatalf("code=%q got=%q/%q", code, gotCode, gotMessage)
 		}
 	}
 }

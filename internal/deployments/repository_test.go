@@ -224,6 +224,20 @@ func TestGatePersistsRejectedFindingsAndTerminalizes(t *testing.T) {
 	}
 }
 
+func TestSourceFailureDiagnosticTaxonomyIsSanitized(t *testing.T) {
+	for _, code := range []string{"invalid_source", "source_unavailable", "source_access_lost", "source_too_large", "provider_unavailable", "configuration_unavailable"} {
+		fixture := newRepositoryFixture(t)
+		deployment := fixture.localDeployment(t)
+		failed, err := fixture.repository.Transition(context.Background(), fixture.appA, deployment.ID, Failed, code)
+		if err != nil {
+			t.Fatalf("code %q: %v", code, err)
+		}
+		if failed.DiagnosticCode != code || failed.FailureSummary == "" {
+			t.Fatalf("code %q persisted %#v", code, failed)
+		}
+	}
+}
+
 func TestTransitionsAndRecoveryUseExplicitAllowlistAndPreserveNeedsAttention(t *testing.T) {
 	fixture := newRepositoryFixture(t)
 	ctx := context.Background()

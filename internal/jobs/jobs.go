@@ -30,13 +30,14 @@ const (
 )
 
 var (
-	ErrJobNotFound     = errors.New("job not found")
-	ErrJobTerminal     = errors.New("job is already terminal")
-	ErrInvalidInput    = errors.New("invalid job input")
-	ErrInvalidProgress = errors.New("invalid job progress")
-	ErrEventBudget     = errors.New("job event budget exhausted")
-	ErrJobNotPaused    = errors.New("job is not waiting for user action")
-	ErrIdempotency     = errors.New("idempotency key conflicts with the original request")
+	ErrJobNotFound           = errors.New("job not found")
+	ErrJobTerminal           = errors.New("job is already terminal")
+	ErrInvalidInput          = errors.New("invalid job input")
+	ErrInvalidProgress       = errors.New("invalid job progress")
+	ErrEventBudget           = errors.New("job event budget exhausted")
+	ErrJobNotPaused          = errors.New("job is not waiting for user action")
+	ErrIdempotency           = errors.New("idempotency key conflicts with the original request")
+	ErrCancellationRequested = errors.New("job cancellation requested")
 )
 
 // JobInput is deliberately sealed so new persisted input schemas are reviewed
@@ -788,21 +789,23 @@ func (s *Service) runOne(ctx context.Context, executor Executor) error {
 	if err != nil || !claimed {
 		return err
 	}
-	jobCtx, cancel := context.WithCancel(ctx)
+	jobCtx, cancelCause := context.WithCancelCause(ctx)
+	cancelRequested := func() { cancelCause(ErrCancellationRequested) }
+	finishExecution := func() { cancelCause(context.Canceled) }
 	if s.beforeRegister != nil {
 		s.beforeRegister()
 	}
 	s.mu.Lock()
-	s.active[job.ID] = cancel
+	s.active[job.ID] = cancelRequested
 	assigned, stateErr := s.isAssigned(job.ID)
 	s.mu.Unlock()
 	if stateErr != nil {
-		s.unregister(job.ID, cancel)
+		s.unregister(job.ID, finishExecution)
 		return stateErr
 	}
 	if !assigned {
 		cancelling, cancellationErr := s.cancellationRequested(job.ID)
-		s.unregister(job.ID, cancel)
+		s.unregister(job.ID, finishExecution)
 		if cancellationErr != nil {
 			return cancellationErr
 		}
@@ -815,7 +818,7 @@ func (s *Service) runOne(ctx context.Context, executor Executor) error {
 		s.beforeExecute()
 	}
 	if jobCtx.Err() != nil {
-		s.unregister(job.ID, cancel)
+		s.unregister(job.ID, finishExecution)
 		cancelling, cancellationErr := s.cancellationRequested(job.ID)
 		if cancellationErr != nil {
 			return cancellationErr
@@ -826,10 +829,10 @@ func (s *Service) runOne(ctx context.Context, executor Executor) error {
 		return nil
 	}
 
-	stopWatching := s.startCancellationWatcher(jobCtx, job.ID, cancel)
+	stopWatching := s.startCancellationWatcher(jobCtx, job.ID, cancelRequested)
 	result, executionErr := invokeExecutor(jobCtx, executor, job, reporter{service: s, jobID: job.ID})
 	watcherErr := stopWatching()
-	s.unregister(job.ID, cancel)
+	s.unregister(job.ID, finishExecution)
 	validPause := executionErr == nil && result.Disposition == ExecutionWaitingUser && result.PauseDisposition == "approval_required" && result.CompletionCode == ""
 	if validPause {
 		pauseErr := s.pause(job.ID, result.PauseDisposition)
@@ -1136,6 +1139,8 @@ func completionMessage(code string) (string, error) {
 		return "Job completed", nil
 	case "fake_deployment_completed":
 		return "Fake deployment completed", nil
+	case "deployment_completed":
+		return "Deployment completed", nil
 	default:
 		return "", ErrInvalidProgress
 	}
@@ -1149,6 +1154,28 @@ func safeExecutionFailure(err error) (string, string) {
 			return "validation_failed", "Job validation failed"
 		case "runtime_unavailable":
 			return "runtime_unavailable", "Runtime unavailable"
+		case "invalid_source":
+			return "invalid_source", "Application source is invalid"
+		case "source_unavailable":
+			return "source_unavailable", "Application source is unavailable"
+		case "source_access_lost":
+			return "source_access_lost", "Access to the application source was lost"
+		case "provider_unavailable":
+			return "provider_unavailable", "Application source provider is unavailable"
+		case "source_too_large":
+			return "source_too_large", "Application source exceeds deployment limits"
+		case "configuration_unavailable":
+			return "configuration_unavailable", "Application configuration is unavailable"
+		case "compose_invalid":
+			return "compose_invalid", "Compose configuration is invalid"
+		case "policy_rejected":
+			return "policy_rejected", "Compose configuration requests an unsupported capability"
+		case "apply_failed":
+			return "apply_failed", "Container runtime failed to apply the deployment"
+		case "health_failed":
+			return "health_failed", "Deployment did not become healthy"
+		case "internal_error":
+			return "internal_error", "Deployment failed because of an internal error"
 		}
 	}
 	return "executor_failed", "Job execution failed"
