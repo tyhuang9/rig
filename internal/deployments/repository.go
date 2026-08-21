@@ -97,6 +97,64 @@ type Repository struct {
 
 func New(db *sql.DB) *Repository { return &Repository{db: db, now: time.Now} }
 
+// GetOrCreateByJob atomically establishes the one-to-one durable linkage
+// between a deployment job and its deployment history row. Replays return the
+// original row only when the app and configuration mode still match.
+func (r *Repository) GetOrCreateByJob(ctx context.Context, appID, jobID, configurationMode string) (Deployment, bool, error) {
+	if r == nil || r.db == nil || uuid.Validate(appID) != nil || uuid.Validate(jobID) != nil || (configurationMode != "current" && configurationMode != "original") {
+		return Deployment{}, false, ErrInvalidDeployment
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Deployment{}, false, err
+	}
+	defer tx.Rollback()
+
+	var existingID, existingAppID, existingMode string
+	lookupErr := tx.QueryRowContext(ctx, `SELECT id,app_id,configuration_mode FROM deployments WHERE job_id=?`, jobID).Scan(&existingID, &existingAppID, &existingMode)
+	if lookupErr == nil {
+		if existingAppID != appID || existingMode != configurationMode {
+			return Deployment{}, false, ErrInvalidDeployment
+		}
+		if err := tx.Commit(); err != nil {
+			return Deployment{}, false, err
+		}
+		deployment, err := r.Get(ctx, appID, existingID)
+		return deployment, false, err
+	}
+	if !errors.Is(lookupErr, sql.ErrNoRows) {
+		return Deployment{}, false, lookupErr
+	}
+
+	id := uuid.NewString()
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO deployments(id,app_id,job_id,machine_id,status,configuration_mode) SELECT ?,?,?,active_machine_id,'preparing',? FROM applications WHERE id=? AND archived_at IS NULL`, id, appID, jobID, configurationMode, appID)
+	if err != nil {
+		return Deployment{}, false, err
+	}
+	createdCount, err := result.RowsAffected()
+	if err != nil {
+		return Deployment{}, false, err
+	}
+	if createdCount != 0 && createdCount != 1 {
+		return Deployment{}, false, ErrInvalidDeployment
+	}
+
+	var persistedID, persistedMode string
+	if err := tx.QueryRowContext(ctx, `SELECT id,configuration_mode FROM deployments WHERE job_id=? AND app_id=?`, jobID, appID).Scan(&persistedID, &persistedMode); errors.Is(err, sql.ErrNoRows) {
+		return Deployment{}, false, ErrInvalidDeployment
+	} else if err != nil {
+		return Deployment{}, false, err
+	}
+	if persistedMode != configurationMode {
+		return Deployment{}, false, ErrInvalidDeployment
+	}
+	if err := tx.Commit(); err != nil {
+		return Deployment{}, false, err
+	}
+	deployment, err := r.Get(ctx, appID, persistedID)
+	return deployment, createdCount == 1, err
+}
+
 func (r *Repository) Create(ctx context.Context, appID, jobID, configurationMode string) (Deployment, error) {
 	if r == nil || r.db == nil || uuid.Validate(appID) != nil || uuid.Validate(jobID) != nil || (configurationMode != "current" && configurationMode != "original") {
 		return Deployment{}, ErrInvalidDeployment

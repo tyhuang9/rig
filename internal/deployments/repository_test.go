@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,65 @@ type repositoryFixture struct {
 	actor      string
 	jobA       string
 	jobB       string
+}
+
+func TestGetOrCreateByJobIsAtomicAndRejectsReplayMismatch(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	ctx := context.Background()
+
+	const callers = 8
+	results := make(chan Deployment, callers)
+	errorsSeen := make(chan error, callers)
+	created := make(chan bool, callers)
+	var start sync.WaitGroup
+	start.Add(1)
+	var workers sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			start.Wait()
+			deployment, wasCreated, err := fixture.repository.GetOrCreateByJob(ctx, fixture.appA, fixture.jobA, "current")
+			results <- deployment
+			created <- wasCreated
+			errorsSeen <- err
+		}()
+	}
+	start.Done()
+	workers.Wait()
+	close(results)
+	close(created)
+	close(errorsSeen)
+
+	var deploymentID string
+	createdCount := 0
+	for err := range errorsSeen {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for value := range created {
+		if value {
+			createdCount++
+		}
+	}
+	for deployment := range results {
+		if deploymentID == "" {
+			deploymentID = deployment.ID
+		}
+		if deployment.ID != deploymentID || deployment.AppID != fixture.appA || deployment.JobID != fixture.jobA {
+			t.Fatalf("inconsistent linkage: %#v", deployment)
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created count = %d, want 1", createdCount)
+	}
+	if _, _, err := fixture.repository.GetOrCreateByJob(ctx, fixture.appA, fixture.jobA, "original"); !errors.Is(err, ErrInvalidDeployment) {
+		t.Fatalf("mode mismatch error = %v", err)
+	}
+	if _, _, err := fixture.repository.GetOrCreateByJob(ctx, fixture.appB, fixture.jobA, "current"); !errors.Is(err, ErrInvalidDeployment) {
+		t.Fatalf("cross-app replay error = %v", err)
+	}
 }
 
 func newRepositoryFixture(t *testing.T) repositoryFixture {
