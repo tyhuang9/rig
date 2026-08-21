@@ -394,6 +394,27 @@ func TestDeploymentAndReleaseListsExposeSafeHistory(t *testing.T) {
 	}
 }
 
+func TestLocalReleaseHistoryNeverExposesAbsoluteSourceOrWorkspacePath(t *testing.T) {
+	f := newDeploymentAPIFixture(t, true, false)
+	releaseID := uuid.NewString()
+	absSource := `C:\users\operator\private-source`
+	_, err := f.db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,source_commit_sha,source_branch,compose_path,archive_sha256,workspace_path,workspace_state,configuration_revision_number) VALUES(?,?, 'ready','{}',?,'local',0,?,?, '', 'compose.yaml',?,?, 'ready',0)`, releaseID, f.app.ID, time.Now().UTC().Format(time.RFC3339Nano), strings.Repeat("a", 64), strings.Repeat("a", 64), strings.Repeat("a", 64), absSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := f.request(http.MethodGet, "/api/v1/apps/"+f.app.ID+"/releases", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("release history: %d %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), absSource) || strings.Contains(response.Body.String(), "private-source") || strings.Contains(response.Body.String(), "workspacePath") {
+		t.Fatalf("absolute local path leaked: %s", response.Body.String())
+	}
+	var releases apicontract.ReleaseList
+	if err := json.Unmarshal(response.Body.Bytes(), &releases); err != nil || len(releases.Items) != 1 || releases.Items[0].SourceProvider != "local" || releases.Items[0].RepositoryID != 0 {
+		t.Fatalf("local release contract=%#v err=%v", releases, err)
+	}
+}
+
 func TestRuntimeApprovalLifecycleOnlyUsesStoredFinding(t *testing.T) {
 	f := newDeploymentAPIFixture(t, true, false)
 	_, deployment := f.createDeployment(t, f.app.ID, "current")

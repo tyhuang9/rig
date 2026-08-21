@@ -17,11 +17,9 @@ import (
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
-	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
-	"github.com/hostd/hostd/internal/sourceinspection"
 )
 
 const (
@@ -36,6 +34,7 @@ type applicationReader interface {
 
 type releaseResolver interface {
 	Materialize(context.Context, string, string) (releasesnapshot.Release, error)
+	MaterializeLocal(context.Context, string, string) (releasesnapshot.Release, error)
 	ReadyRelease(context.Context, string, string) (releasesnapshot.Release, error)
 }
 
@@ -313,6 +312,11 @@ func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.Deploym
 			return resolvedSource{}, appconfig.ExecutionConfiguration{}, err
 		}
 		release, err = e.releases.Materialize(ctx, job.RequestedBy, job.ResourceID)
+	} else if !deployment.ProvenanceInitialized && application.Source.Type == apps.SourceLocal {
+		if err := report(reporter, jobs.Waiting, "materialize_release", 30); err != nil {
+			return resolvedSource{}, appconfig.ExecutionConfiguration{}, err
+		}
+		release, err = e.releases.MaterializeLocal(ctx, job.ResourceID, application.Source.Path)
 	}
 	if err != nil {
 		return resolvedSource{}, appconfig.ExecutionConfiguration{}, err
@@ -320,11 +324,7 @@ func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.Deploym
 	if release.ID != "" {
 		source = resolvedSource{releaseID: release.ID, workspace: release.WorkspacePath, composePath: release.ComposePath}
 	} else {
-		workspace, composePath, localErr := resolveLocalCompose(application.Source.Path)
-		if localErr != nil {
-			return resolvedSource{}, appconfig.ExecutionConfiguration{}, codedError("invalid_source")
-		}
-		source = resolvedSource{workspace: workspace, composePath: composePath}
+		return resolvedSource{}, appconfig.ExecutionConfiguration{}, codedError("invalid_source")
 	}
 
 	var configuration appconfig.ExecutionConfiguration
@@ -339,31 +339,6 @@ func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.Deploym
 		return resolvedSource{}, appconfig.ExecutionConfiguration{}, codedError("configuration_unavailable")
 	}
 	return source, configuration, nil
-}
-
-func resolveLocalCompose(sourcePath string) (string, string, error) {
-	if pathsecurity.RejectWindowsNamespace(sourcePath) {
-		return "", "", errors.New("unsafe local source namespace")
-	}
-	inspection, err := sourceinspection.InspectLocal(sourcePath)
-	if err != nil {
-		return "", "", err
-	}
-	if inspection.Source.ComposePath == "" || len(inspection.Findings) != 0 {
-		return "", "", errors.New("local Compose source is ambiguous or invalid")
-	}
-	selectedPath := inspection.Source.Path
-	workspace := selectedPath
-	if info, statErr := os.Lstat(selectedPath); statErr != nil {
-		return "", "", statErr
-	} else if !info.IsDir() {
-		workspace = filepath.Dir(selectedPath)
-	}
-	workspace, err = canonicalPath(workspace)
-	if err != nil {
-		return "", "", err
-	}
-	return workspace, inspection.Source.ComposePath, nil
 }
 
 func report(reporter jobs.ProgressReporter, status jobs.Status, phase string, progress int) error {

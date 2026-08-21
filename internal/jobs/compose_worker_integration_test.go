@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,10 +18,12 @@ import (
 	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
+	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
 type noReleaseResolver struct{}
@@ -29,8 +32,24 @@ func (noReleaseResolver) Materialize(context.Context, string, string) (releasesn
 	return releasesnapshot.Release{}, errors.New("unexpected release materialization")
 }
 
+func (noReleaseResolver) MaterializeLocal(context.Context, string, string) (releasesnapshot.Release, error) {
+	return releasesnapshot.Release{}, errors.New("unexpected local release materialization")
+}
+
 func (noReleaseResolver) ReadyRelease(context.Context, string, string) (releasesnapshot.Release, error) {
 	return releasesnapshot.Release{}, errors.New("unexpected release lookup")
+}
+
+type unreachableSourceReader struct{}
+
+func (unreachableSourceReader) Resolve(context.Context, string, string, int64, int64, string) (sourceconnections.SourceRepository, sourceconnections.Branch, error) {
+	return sourceconnections.SourceRepository{}, sourceconnections.Branch{}, errors.New("unexpected provider resolution")
+}
+func (unreachableSourceReader) ReadTree(context.Context, string, string, int64, string) (githubapp.Tree, error) {
+	return githubapp.Tree{}, errors.New("unexpected provider tree")
+}
+func (unreachableSourceReader) DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error) {
+	return nil, errors.New("unexpected provider archive")
 }
 
 type blockingComposeRunner struct {
@@ -332,7 +351,11 @@ func newComposeWorkerFixture(t *testing.T, releaseUp chan struct{}) *composeWork
 	jobService := jobs.New(db)
 	deploymentRepository := deployments.New(db)
 	runner := &blockingComposeRunner{upStarted: make(chan struct{}), releaseUp: releaseUp}
-	executor, err := composeruntime.NewExecutor(applicationStore, noReleaseResolver{}, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{
+	releaseMaterializer, err := releasesnapshot.New(db, unreachableSourceReader{}, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := composeruntime.NewExecutor(applicationStore, releaseMaterializer, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{
 		DockerExecutable: "docker-test",
 		ConfigTimeout:    5 * time.Second,
 		ApplyTimeout:     30 * time.Second,

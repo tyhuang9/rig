@@ -36,6 +36,7 @@ func IsCode(err error, code string) bool { var e *Error; return errors.As(err, &
 type Release struct {
 	ID                          string
 	AppID                       string
+	SourceProvider              string
 	RepositoryID                int64
 	ResolvedSHA                 string
 	ComposePath                 string
@@ -53,12 +54,13 @@ type SourceReader interface {
 }
 
 type Materializer struct {
-	db       *sql.DB
-	sources  SourceReader
-	dataRoot string
-	now      func() time.Time
-	locks    keyedLocks
-	fs       lifecycleFS
+	db             *sql.DB
+	sources        SourceReader
+	dataRoot       string
+	now            func() time.Time
+	locks          keyedLocks
+	fs             lifecycleFS
+	afterLocalCopy func()
 }
 type lifecycleFS struct {
 	mkdirAll  func(string, os.FileMode) error
@@ -224,7 +226,7 @@ func (m *Materializer) ReadyRelease(ctx context.Context, appID, releaseID string
 		return Release{}, &Error{Code: "release_not_found"}
 	}
 	var release Release
-	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(configuration_revision_id,''),configuration_revision_number FROM releases WHERE id=? AND app_id=? AND workspace_state='ready'`, releaseID, appID).Scan(&release.ID, &release.AppID, &release.RepositoryID, &release.ResolvedSHA, &release.ComposePath, &release.ArchiveSHA256, &release.WorkspacePath, &release.WorkspaceState, &release.ConfigurationRevisionID, &release.ConfigurationRevisionNumber)
+	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,COALESCE(source_provider,''),repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(configuration_revision_id,''),configuration_revision_number FROM releases WHERE id=? AND app_id=? AND workspace_state='ready'`, releaseID, appID).Scan(&release.ID, &release.AppID, &release.SourceProvider, &release.RepositoryID, &release.ResolvedSHA, &release.ComposePath, &release.ArchiveSHA256, &release.WorkspacePath, &release.WorkspaceState, &release.ConfigurationRevisionID, &release.ConfigurationRevisionNumber)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Release{}, &Error{Code: "release_not_found"}
 	}
@@ -294,7 +296,7 @@ func (m *Materializer) appSource(ctx context.Context, owner, appID string) (appS
 }
 func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, compose string, configurationNumber int64) (Release, error) {
 	var r Release
-	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(configuration_revision_id,''),configuration_revision_number FROM releases WHERE app_id=? AND repository_id=? AND resolved_sha=? AND compose_path=? AND configuration_revision_number=? AND workspace_state='ready'`, app, repo, sha, compose, configurationNumber).Scan(&r.ID, &r.AppID, &r.RepositoryID, &r.ResolvedSHA, &r.ComposePath, &r.ArchiveSHA256, &r.WorkspacePath, &r.WorkspaceState, &r.ConfigurationRevisionID, &r.ConfigurationRevisionNumber)
+	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,COALESCE(source_provider,''),repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(configuration_revision_id,''),configuration_revision_number FROM releases WHERE app_id=? AND repository_id=? AND resolved_sha=? AND compose_path=? AND configuration_revision_number=? AND workspace_state='ready'`, app, repo, sha, compose, configurationNumber).Scan(&r.ID, &r.AppID, &r.SourceProvider, &r.RepositoryID, &r.ResolvedSHA, &r.ComposePath, &r.ArchiveSHA256, &r.WorkspacePath, &r.WorkspaceState, &r.ConfigurationRevisionID, &r.ConfigurationRevisionNumber)
 	if err != nil {
 		return r, err
 	}
@@ -308,6 +310,10 @@ func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, c
 func (m *Materializer) validateReadyRelease(ctx context.Context, release Release) (Release, error) {
 	expected, pathErr := m.workspacePath(release.AppID, release.ID)
 	valid := pathErr == nil && release.WorkspacePath == m.workspaceRelative(release.AppID, release.ID) && safeWorkspace(expected, release.ComposePath) && validateComposeWorkspace(expected, release.ComposePath) == nil
+	if valid && release.SourceProvider == "local" {
+		digest, digestErr := hashLocalTree(ctx, expected)
+		valid = digestErr == nil && digest == release.ArchiveSHA256 && digest == release.ResolvedSHA
+	}
 	if valid {
 		release.WorkspacePath = expected
 		return release, nil

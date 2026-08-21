@@ -494,6 +494,10 @@ func (e *evaluator) pathResource(service, kind, source, target, mode string) {
 		return
 	}
 	if inside {
+		if kind == "bind_mount" && mode != "ro" {
+			e.add("writable_managed_bind", scope, DispositionRejected)
+			return
+		}
 		e.add("workspace_"+kind, scope, DispositionAllowed)
 		return
 	}

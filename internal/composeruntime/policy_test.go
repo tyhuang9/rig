@@ -48,13 +48,23 @@ func TestPolicyAllowGateRejectMatrix(t *testing.T) {
 			count:   1,
 		},
 		{
-			name: "allow workspace bind",
+			name: "allow read-only managed workspace bind",
+			model: func(p matrixPaths) any {
+				return serviceModel(map[string]any{
+					"volumes": []any{map[string]any{"type": "bind", "source": p.workspace, "target": "/app", "read_only": true}},
+				})
+			},
+			classes: map[string]string{"workspace_bind_mount": DispositionAllowed},
+			count:   1,
+		},
+		{
+			name: "reject writable managed workspace bind",
 			model: func(p matrixPaths) any {
 				return serviceModel(map[string]any{
 					"volumes": []any{map[string]any{"type": "bind", "source": p.workspace, "target": "/app"}},
 				})
 			},
-			classes: map[string]string{"workspace_bind_mount": DispositionAllowed},
+			classes: map[string]string{"writable_managed_bind": DispositionRejected},
 			count:   1,
 		},
 		{

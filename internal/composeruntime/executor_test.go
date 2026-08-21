@@ -31,21 +31,31 @@ func (f *fakeApplications) Get(string) (apps.Application, error) {
 }
 
 type fakeReleases struct {
-	release          releasesnapshot.Release
-	err              error
-	materializeErr   error
-	readyErr         error
-	materializeCalls int
-	readyCalls       int
-	materializeOwner string
-	materializeApp   string
-	readyApp         string
-	readyRelease     string
+	release               releasesnapshot.Release
+	err                   error
+	materializeErr        error
+	readyErr              error
+	materializeCalls      int
+	localMaterializeCalls int
+	readyCalls            int
+	materializeOwner      string
+	materializeApp        string
+	readyApp              string
+	readyRelease          string
 }
 
 func (f *fakeReleases) Materialize(_ context.Context, owner, appID string) (releasesnapshot.Release, error) {
 	f.materializeCalls++
 	f.materializeOwner, f.materializeApp = owner, appID
+	if f.materializeErr != nil {
+		return releasesnapshot.Release{}, f.materializeErr
+	}
+	return f.release, f.err
+}
+
+func (f *fakeReleases) MaterializeLocal(_ context.Context, appID, sourcePath string) (releasesnapshot.Release, error) {
+	f.localMaterializeCalls++
+	f.materializeApp = appID
 	if f.materializeErr != nil {
 		return releasesnapshot.Release{}, f.materializeErr
 	}
@@ -219,14 +229,14 @@ func TestExecutorUsesInspectedEffectiveConfigAsSoleMutationInput(t *testing.T) {
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
-	if fixture.deployments.deployment.Status != deployments.Succeeded || fixture.deployments.deployment.ReleaseID != "" || fixture.deployments.deployment.ActualConfigurationRevisionID != fixture.configuration.current.RevisionID {
+	if fixture.deployments.deployment.Status != deployments.Succeeded || fixture.deployments.deployment.ReleaseID != fixture.releases.release.ID || fixture.deployments.deployment.ActualConfigurationRevisionID != fixture.configuration.current.RevisionID {
 		t.Fatalf("deployment=%#v", fixture.deployments.deployment)
 	}
 	if fixture.configuration.currentCalls != 1 || len(fixture.configuration.revisionRequest) != 0 {
 		t.Fatalf("configuration calls current=%d exact=%v", fixture.configuration.currentCalls, fixture.configuration.revisionRequest)
 	}
 	assertExactExecutorRequests(t, fixture, fixture.runner.requests)
-	assertProgressPhases(t, fixture.reporter.updates, []string{"validate", "prepare_workspace", "render_compose", "evaluate_policy", "apply_runtime", "wait_for_health", "finalize"})
+	assertProgressPhases(t, fixture.reporter.updates, []string{"validate", "prepare_workspace", "materialize_release", "render_compose", "evaluate_policy", "apply_runtime", "wait_for_health", "finalize"})
 	assertCleared(t, configStdout, configStderr, upStdout, upStderr)
 	assertRuntimeTempEmpty(t, fixture.dataRoot)
 }
@@ -489,34 +499,6 @@ func githubFailure(err error) func(*executorFixture) {
 	}
 }
 
-func TestResolveLocalComposePreservesInspectionSelection(t *testing.T) {
-	root := t.TempDir()
-	nested := filepath.Join(root, "deploy")
-	if err := os.Mkdir(nested, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	compose := filepath.Join(nested, "compose.yaml")
-	if err := os.WriteFile(compose, []byte("services:\n  web:\n    image: nginx\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	workspace, selected, err := resolveLocalCompose(root)
-	canonicalRoot, canonicalErr := canonicalPath(root)
-	if err != nil || canonicalErr != nil || workspace != canonicalRoot || selected != "deploy/compose.yaml" {
-		t.Fatalf("nested workspace=%q selected=%q err=%v", workspace, selected, err)
-	}
-	workspace, selected, err = resolveLocalCompose(compose)
-	canonicalNested, canonicalErr := canonicalPath(nested)
-	if err != nil || canonicalErr != nil || workspace != canonicalNested || selected != "compose.yaml" {
-		t.Fatalf("direct workspace=%q selected=%q err=%v", workspace, selected, err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "compose.yml"), []byte("services: {}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := resolveLocalCompose(root); err == nil {
-		t.Fatal("ambiguous local Compose selection accepted")
-	}
-}
-
 func TestExecutorLocalDirectoryDirectFileAndAmbiguousSource(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -554,8 +536,26 @@ func TestExecutorLocalDirectoryDirectFileAndAmbiguousSource(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
-			sourcePath, wantWorkspace, wantCompose := test.makePath(t)
+			sourcePath, _, wantCompose := test.makePath(t)
 			fixture.applications.application.Source = apps.Source{Type: apps.SourceLocal, Path: sourcePath}
+			managedWorkspace := t.TempDir()
+			if test.wantError {
+				fixture.releases.materializeErr = &releasesnapshot.Error{Code: "invalid_source"}
+			} else {
+				managedCompose := filepath.Join(managedWorkspace, filepath.FromSlash(wantCompose))
+				if err := os.MkdirAll(filepath.Dir(managedCompose), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(managedCompose, []byte("services:\n  web:\n    image: nginx\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				canonicalManaged, err := canonicalPath(managedWorkspace)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fixture.releases.release.WorkspacePath = canonicalManaged
+				fixture.releases.release.ComposePath = wantCompose
+			}
 			fixture.runner.run = successfulRunner(validModel())
 			_, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
 			if test.wantError {
@@ -568,7 +568,7 @@ func TestExecutorLocalDirectoryDirectFileAndAmbiguousSource(t *testing.T) {
 			if err != nil || len(fixture.runner.requests) != 2 {
 				t.Fatalf("error=%v requests=%v", err, fixture.runner.requests)
 			}
-			canonicalWorkspace, canonicalErr := canonicalPath(wantWorkspace)
+			canonicalWorkspace, canonicalErr := canonicalPath(managedWorkspace)
 			if canonicalErr != nil {
 				t.Fatal(canonicalErr)
 			}
@@ -577,6 +577,46 @@ func TestExecutorLocalDirectoryDirectFileAndAmbiguousSource(t *testing.T) {
 				t.Fatalf("local config request=%#v", config)
 			}
 		})
+	}
+}
+
+func TestExecutorManagedWorkspaceBindIsReadOnlyForGitHubAndLocal(t *testing.T) {
+	for _, sourceType := range []string{apps.SourceGitHub, apps.SourceLocal} {
+		for _, readOnly := range []bool{false, true} {
+			name := sourceType + "/writable"
+			if readOnly {
+				name = sourceType + "/read-only"
+			}
+			t.Run(name, func(t *testing.T) {
+				fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
+				fixture.applications.application.Source.Type = sourceType
+				fixture.releases.release.SourceProvider = sourceType
+				body, err := json.Marshal(serviceModel(map[string]any{
+					"volumes": []any{map[string]any{"type": "bind", "source": fixture.workspace, "target": "/app", "read_only": readOnly}},
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				fixture.runner.run = successfulRunner(runtimeprocess.CommandResult{Stdout: body})
+				if !readOnly {
+					fixture.deployments.gateErr = deployments.ErrRejectedCapability
+				}
+				_, executeErr := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
+				wantCapability, wantDisposition := "workspace_bind_mount", DispositionAllowed
+				if !readOnly {
+					wantCapability, wantDisposition = "writable_managed_bind", DispositionRejected
+					var executionErr *jobs.ExecutionError
+					if !errors.As(executeErr, &executionErr) || executionErr.Code != "policy_rejected" || len(fixture.runner.requests) != 1 {
+						t.Fatalf("execute error=%v requests=%d", executeErr, len(fixture.runner.requests))
+					}
+				} else if executeErr != nil || len(fixture.runner.requests) != 2 {
+					t.Fatalf("execute error=%v requests=%d", executeErr, len(fixture.runner.requests))
+				}
+				if len(fixture.deployments.findings) != 1 || fixture.deployments.findings[0].Capability != wantCapability || fixture.deployments.findings[0].Disposition != wantDisposition {
+					t.Fatalf("findings=%#v", fixture.deployments.findings)
+				}
+			})
+		}
 	}
 }
 
@@ -610,7 +650,7 @@ func newExecutorFixture(t *testing.T, mode jobs.ConfigurationMode, releaseID str
 	}
 	applicationID := uuid.NewString()
 	applications := &fakeApplications{application: apps.Application{ID: applicationID, Source: apps.Source{Type: apps.SourceLocal, Path: workspace}}}
-	releases := &fakeReleases{}
+	releases := &fakeReleases{release: releasesnapshot.Release{ID: strings.Repeat("a", 32), AppID: applicationID, SourceProvider: "local", ResolvedSHA: strings.Repeat("b", 64), ComposePath: "compose.yaml", WorkspacePath: workspace, WorkspaceState: releasesnapshot.WorkspaceStateReady}}
 	configuration := &fakeConfiguration{
 		current: appconfig.ExecutionConfiguration{RevisionID: uuid.NewString(), RevisionNumber: 1, Environment: []byte("TOKEN='runtime-secret'\n")},
 	}
