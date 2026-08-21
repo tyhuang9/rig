@@ -172,6 +172,127 @@ func TestMaterializePinsConfigurationRevisionAndDoesNotReuseAfterChange(t *testi
 		t.Fatalf("initial database pin=%v/%d err=%v", pinnedID, pinnedNumber, err)
 	}
 }
+
+func TestReadyReleaseReturnsOnlyAppBoundReadyValidatedWorkspace(t *testing.T) {
+	db := snapshotDB(t)
+	m, err := New(db, &fakeSources{archive: composeArchive(t, "services: {}\n")}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	release, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := m.ReadyRelease(context.Background(), app, release.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.ID != release.ID || ready.AppID != app || ready.WorkspaceState != WorkspaceStateReady || ready.WorkspacePath != release.WorkspacePath {
+		t.Fatalf("ready release = %#v, materialized = %#v", ready, release)
+	}
+	for _, request := range []struct{ app, release string }{
+		{"22222222-2222-2222-2222-222222222222", release.ID},
+		{app, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		{app, "not-a-release"},
+	} {
+		if _, err := m.ReadyRelease(context.Background(), request.app, request.release); !IsCode(err, "release_not_found") {
+			t.Fatalf("lookup app=%q release=%q error=%v", request.app, request.release, err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE releases SET status='failed',workspace_state='failed',materialization_error_code='invalid_source' WHERE id=?`, release.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ReadyRelease(context.Background(), app, release.ID); !IsCode(err, "release_not_found") {
+		t.Fatalf("non-ready release error = %v", err)
+	}
+}
+
+func TestReadyReleaseInvalidatesTamperedWorkspaceAndStoredPath(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		tamper func(*testing.T, *sql.DB, *Materializer, Release)
+	}{
+		{"compose", func(t *testing.T, _ *sql.DB, _ *Materializer, release Release) {
+			if err := os.WriteFile(filepath.Join(release.WorkspacePath, "compose.yaml"), []byte("invalid: ["), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"stored-path", func(t *testing.T, db *sql.DB, _ *Materializer, release Release) {
+			if _, err := db.Exec(`UPDATE releases SET workspace_path='../outside' WHERE id=?`, release.ID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := snapshotDB(t)
+			m, err := New(db, &fakeSources{archive: composeArchive(t, "services: {}\n")}, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			app := "11111111-1111-1111-1111-111111111111"
+			release, err := m.Materialize(context.Background(), "owner", app)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.tamper(t, db, m, release)
+			if _, err := m.ReadyRelease(context.Background(), app, release.ID); !IsCode(err, "invalid_source") {
+				t.Fatalf("tampered release error = %v", err)
+			}
+			var state, code string
+			if err := db.QueryRow(`SELECT workspace_state,materialization_error_code FROM releases WHERE id=?`, release.ID).Scan(&state, &code); err != nil || state != WorkspaceStateFailed || code != "invalid_source" {
+				t.Fatalf("state=%q code=%q err=%v", state, code, err)
+			}
+			if _, err := os.Stat(filepath.Dir(release.WorkspacePath)); !os.IsNotExist(err) {
+				t.Fatalf("managed tampered workspace was not removed: %v", err)
+			}
+		})
+	}
+}
+
+func TestReadyReleaseRejectsSymlinkedWorkspaceWithoutTouchingTarget(t *testing.T) {
+	db := snapshotDB(t)
+	m, err := New(db, &fakeSources{archive: composeArchive(t, "services: {}\n")}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	release, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(release.WorkspacePath); err != nil {
+		t.Fatal(err)
+	}
+	external := t.TempDir()
+	sentinel := filepath.Join(external, "compose.yaml")
+	if err := os.WriteFile(sentinel, []byte("services: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, release.WorkspacePath); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	if _, err := m.ReadyRelease(context.Background(), app, release.ID); !IsCode(err, "invalid_source") {
+		t.Fatalf("symlinked release error = %v", err)
+	}
+	contents, err := os.ReadFile(sentinel)
+	if err != nil || string(contents) != "services: {}\n" {
+		t.Fatalf("external target changed: %q %v", contents, err)
+	}
+}
+
+func TestValidateComposeWorkspaceIgnoresUnreferencedSymlink(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "compose.yaml"), []byte("services: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(workspace, "node_modules")); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+	if err := ValidateComposeWorkspace(workspace, "compose.yaml"); err != nil {
+		t.Fatalf("unreferenced symlink rejected: %v", err)
+	}
+}
 func TestMaterializeRejectsWrongOwnerAndUnsafeRoots(t *testing.T) {
 	db := snapshotDB(t)
 	source := &fakeSources{archive: composeArchive(t, "services: {}\n")}

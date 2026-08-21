@@ -25,6 +25,8 @@ const (
 	WorkspaceStateFailed        = "failed"
 )
 
+var errInvalidReadyWorkspace = errors.New("invalid ready release workspace")
+
 type Error struct{ Code string }
 
 func (e *Error) Error() string           { return "release snapshot: " + e.Code }
@@ -73,6 +75,19 @@ func New(db *sql.DB, sources SourceReader, dataRoot string) (*Materializer, erro
 		return nil, errors.New("release snapshot data root must be absolute and clean")
 	}
 	return &Materializer{db: db, sources: sources, dataRoot: dataRoot, now: time.Now, fs: realLifecycleFS()}, nil
+}
+
+// ValidateComposeWorkspace validates the selected Compose file and every local
+// path it references. It deliberately does not walk unrelated workspace paths;
+// local repositories commonly contain safe, irrelevant symlinks.
+func ValidateComposeWorkspace(workspace, composePath string) error {
+	if !safeSelectedCompose(workspace, composePath) {
+		return &Error{Code: "invalid_source"}
+	}
+	if err := validateComposeWorkspace(workspace, composePath); err != nil {
+		return &Error{Code: "invalid_source"}
+	}
+	return nil
 }
 
 // Materialize resolves the app's tracked branch exactly once, then installs an
@@ -200,6 +215,31 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 	return release, nil
 }
 
+// ReadyRelease returns one app-bound immutable release after revalidating its
+// managed workspace. Cross-application and non-ready releases are deliberately
+// indistinguishable from missing releases.
+func (m *Materializer) ReadyRelease(ctx context.Context, appID, releaseID string) (Release, error) {
+	if m == nil || m.db == nil || !validAppID(appID) || !validID(releaseID) {
+		return Release{}, &Error{Code: "release_not_found"}
+	}
+	var release Release
+	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(configuration_revision_id,''),configuration_revision_number FROM releases WHERE id=? AND app_id=? AND workspace_state='ready'`, releaseID, appID).Scan(&release.ID, &release.AppID, &release.RepositoryID, &release.ResolvedSHA, &release.ComposePath, &release.ArchiveSHA256, &release.WorkspacePath, &release.WorkspaceState, &release.ConfigurationRevisionID, &release.ConfigurationRevisionNumber)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Release{}, &Error{Code: "release_not_found"}
+	}
+	if err != nil {
+		return Release{}, &Error{Code: "internal_error"}
+	}
+	release, err = m.validateReadyRelease(ctx, release)
+	if errors.Is(err, errInvalidReadyWorkspace) {
+		return Release{}, &Error{Code: "invalid_source"}
+	}
+	if err != nil {
+		return Release{}, &Error{Code: "internal_error"}
+	}
+	return release, nil
+}
+
 func (m *Materializer) Recover() error {
 	rows, err := m.db.Query(`SELECT id, app_id FROM releases WHERE workspace_state=?`, WorkspaceStateMaterializing)
 	if err != nil {
@@ -257,24 +297,33 @@ func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, c
 	if err != nil {
 		return r, err
 	}
-	expected, pathErr := m.workspacePath(app, r.ID)
-	if pathErr != nil || r.WorkspacePath != m.workspaceRelative(app, r.ID) || !safeWorkspace(expected, compose) || validateComposeWorkspace(expected, compose) != nil {
-		if pathErr == nil {
-			if err := m.removeWorkspace(app, r.ID); err != nil {
-				return Release{}, err
-			}
-		}
-		result, updateErr := m.db.ExecContext(ctx, `UPDATE releases SET status='failed',workspace_state='failed',materialization_error_code='invalid_source' WHERE id=? AND workspace_state='ready'`, r.ID)
-		if updateErr != nil {
-			return Release{}, updateErr
-		}
-		if n, _ := result.RowsAffected(); n != 1 {
-			return Release{}, errors.New("ready release changed")
-		}
+	r, err = m.validateReadyRelease(ctx, r)
+	if errors.Is(err, errInvalidReadyWorkspace) {
 		return Release{}, sql.ErrNoRows
 	}
-	r.WorkspacePath = expected
-	return r, nil
+	return r, err
+}
+
+func (m *Materializer) validateReadyRelease(ctx context.Context, release Release) (Release, error) {
+	expected, pathErr := m.workspacePath(release.AppID, release.ID)
+	valid := pathErr == nil && release.WorkspacePath == m.workspaceRelative(release.AppID, release.ID) && safeWorkspace(expected, release.ComposePath) && validateComposeWorkspace(expected, release.ComposePath) == nil
+	if valid {
+		release.WorkspacePath = expected
+		return release, nil
+	}
+	if pathErr == nil {
+		if err := m.removeWorkspace(release.AppID, release.ID); err != nil {
+			return Release{}, err
+		}
+	}
+	result, err := m.db.ExecContext(ctx, `UPDATE releases SET status='failed',workspace_state='failed',materialization_error_code='invalid_source' WHERE id=? AND app_id=? AND workspace_state='ready'`, release.ID, release.AppID)
+	if err != nil {
+		return Release{}, err
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		return Release{}, errors.New("ready release changed")
+	}
+	return Release{}, errInvalidReadyWorkspace
 }
 func (m *Materializer) reserve(ctx context.Context, app string, source appSource, repository sourceconnections.SourceRepository, branch sourceconnections.Branch) (Release, error) {
 	id, err := randomID()
@@ -464,12 +513,44 @@ func archiveError(err error) string {
 	return "invalid_source"
 }
 func safeWorkspace(workspace, compose string) bool {
+	return safeSelectedCompose(workspace, compose) && treeHasExactPaths(workspace)
+}
+
+func safeSelectedCompose(workspace, compose string) bool {
+	if workspace == "" || !filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace {
+		return false
+	}
 	info, err := os.Lstat(workspace)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return false
 	}
-	info, err = os.Lstat(filepath.Join(workspace, filepath.FromSlash(compose)))
+	composeFile := filepath.Join(workspace, filepath.FromSlash(compose))
+	if !within(workspace, composeFile) {
+		return false
+	}
+	info, err = os.Lstat(composeFile)
 	return err == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0
+}
+
+func treeHasExactPaths(root string) bool {
+	return filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.Type()&os.ModeSymlink != 0 {
+			return errInvalidReadyWorkspace
+		}
+		resolved, err := filepath.EvalSymlinks(current)
+		if err != nil || !sameFilesystemPath(resolved, current) {
+			return errInvalidReadyWorkspace
+		}
+		return nil
+	}) == nil
+}
+
+func sameFilesystemPath(first, second string) bool {
+	first, second = filepath.Clean(first), filepath.Clean(second)
+	if filepath.Separator == '\\' {
+		return strings.EqualFold(first, second)
+	}
+	return first == second
 }
 func finalizeContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)

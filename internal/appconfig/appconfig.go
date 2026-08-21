@@ -53,6 +53,15 @@ type Configuration struct {
 	Entries        []Entry   `json:"entries"`
 }
 
+// ExecutionConfiguration is a decrypted, exact configuration revision for a
+// single runtime attempt. Environment is secret-bearing caller-owned memory and
+// must be cleared after it has been written to protected temporary storage.
+type ExecutionConfiguration struct {
+	RevisionID     string
+	RevisionNumber int64
+	Environment    []byte `json:"-"`
+}
+
 type ValueInput struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
@@ -151,6 +160,73 @@ func (s *Store) Get(ctx context.Context, appID string) (Configuration, error) {
 	}
 	sort.Slice(result.Entries, func(i, j int) bool { return result.Entries[i].Key < result.Entries[j].Key })
 	return result, nil
+}
+
+// ExportRevisionForExecution returns one exact historical revision as a
+// Compose-compatible dotenv document. It never silently substitutes the head
+// revision. Revision zero is represented by a nonempty comment-only document.
+func (s *Store) ExportRevisionForExecution(ctx context.Context, appID, revisionID string, revisionNumber int64) (ExecutionConfiguration, error) {
+	if !validUUID(appID) || revisionNumber < 0 || (revisionNumber == 0) != (revisionID == "") {
+		return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+	}
+
+	var entries map[string]bundleEntry
+	if revisionNumber == 0 {
+		var exists int
+		if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM applications WHERE id=? AND archived_at IS NULL`, appID).Scan(&exists); err != nil {
+			return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+		}
+		entries = map[string]bundleEntry{}
+	} else {
+		b, err := s.readBundle(ctx, appID, revisionID, revisionNumber)
+		if err != nil {
+			return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+		}
+		entries = b.Entries
+	}
+
+	environment := []byte("# hostd application configuration\n")
+	for _, key := range sortedBundleKeys(entries) {
+		environment = append(environment, key...)
+		environment = append(environment, '=')
+		environment = appendDotenvSingleQuoted(environment, entries[key].Value)
+		environment = append(environment, '\n')
+	}
+	return ExecutionConfiguration{RevisionID: revisionID, RevisionNumber: revisionNumber, Environment: environment}, nil
+}
+
+// ExportCurrentForExecution resolves the current head once, then delegates to
+// exact-revision export so concurrent configuration changes cannot alter it.
+func (s *Store) ExportCurrentForExecution(ctx context.Context, appID string) (ExecutionConfiguration, error) {
+	if !validUUID(appID) {
+		return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+	}
+	var revisionID sql.NullString
+	var revisionNumber int64
+	if err := s.db.QueryRowContext(ctx, `SELECT h.revision_id,h.revision_number FROM application_configuration_heads h JOIN applications a ON a.id=h.app_id AND a.archived_at IS NULL WHERE h.app_id=?`, appID).Scan(&revisionID, &revisionNumber); err != nil {
+		return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+	}
+	return s.ExportRevisionForExecution(ctx, appID, revisionID.String, revisionNumber)
+}
+
+func sortedBundleKeys(entries map[string]bundleEntry) []string {
+	keys := make([]string, 0, len(entries))
+	for key := range entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func appendDotenvSingleQuoted(destination []byte, value string) []byte {
+	destination = append(destination, '\'')
+	for _, character := range []byte(value) {
+		if character == '\'' {
+			destination = append(destination, '\\')
+		}
+		destination = append(destination, character)
+	}
+	return append(destination, '\'')
 }
 
 func (s *Store) Replace(ctx context.Context, appID, actorID string, input ReplaceInput) (Configuration, error) {

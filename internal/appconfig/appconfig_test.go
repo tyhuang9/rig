@@ -33,6 +33,129 @@ func testStore(t *testing.T) (*Store, string) {
 	return store, root
 }
 
+func TestExportRevisionForExecutionPinsExactRevision(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+
+	empty, err := store.ExportRevisionForExecution(ctx, configTestApp, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.Environment) == 0 || empty.RevisionID != "" || empty.RevisionNumber != 0 {
+		t.Fatalf("unexpected empty revision export: %#v", empty)
+	}
+
+	first, err := store.Replace(ctx, configTestApp, "", ReplaceInput{
+		ExpectedRevisionNumber: 0,
+		Variables: []ValueInput{
+			{Key: "Z_LAST", Value: "hash# equals= double\" slash\\ carriage\rreturn"},
+			{Key: "MODE", Value: "first'$VALUE\nnext"},
+		},
+		Secrets: []ValueInput{{Key: "TOKEN", Value: "secret"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Replace(ctx, configTestApp, "", ReplaceInput{
+		ExpectedRevisionNumber: first.RevisionNumber,
+		Variables:              []ValueInput{{Key: "MODE", Value: "second"}},
+		Remove:                 []string{"TOKEN"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exact, err := store.ExportRevisionForExecution(ctx, configTestApp, first.RevisionID, first.RevisionNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantExact := "# hostd application configuration\nMODE='first\\'$VALUE\nnext'\nTOKEN='secret'\nZ_LAST='hash# equals= double\" slash\\ carriage\rreturn'\n"
+	if string(exact.Environment) != wantExact {
+		t.Fatalf("exact revision environment=%q want=%q", exact.Environment, wantExact)
+	}
+	current, err := store.ExportCurrentForExecution(ctx, configTestApp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.RevisionID != second.RevisionID || current.RevisionNumber != second.RevisionNumber || strings.Contains(string(current.Environment), "secret") || !strings.Contains(string(current.Environment), "MODE='second'") {
+		t.Fatalf("unexpected current revision export: %#v", current)
+	}
+
+	clear(empty.Environment)
+	clear(exact.Environment)
+	clear(current.Environment)
+}
+
+func TestExportRevisionForExecutionReturnsIndependentCallerOwnedBytes(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	revision, err := store.Replace(ctx, configTestApp, "", ReplaceInput{ExpectedRevisionNumber: 0, Secrets: []ValueInput{{Key: "TOKEN", Value: "secret"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.ExportRevisionForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.ExportRevisionForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(first.Environment)
+	if strings.ContainsRune(string(second.Environment), '\x00') || !strings.Contains(string(second.Environment), "TOKEN='secret'") {
+		t.Fatalf("clearing one export changed another: %q", second.Environment)
+	}
+	encoded, err := json.Marshal(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "secret") || strings.Contains(string(encoded), "Environment") {
+		t.Fatalf("execution environment was JSON serialized: %s", encoded)
+	}
+	clear(second.Environment)
+}
+
+func TestExportRevisionForExecutionRejectsMismatchedIdentity(t *testing.T) {
+	store, _ := testStore(t)
+	revision, err := store.Replace(context.Background(), configTestApp, "", ReplaceInput{ExpectedRevisionNumber: 0, Variables: []ValueInput{{Key: "MODE", Value: "prod"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range []struct {
+		id     string
+		number int64
+	}{{"", 1}, {"00000000-0000-0000-0000-000000000000", 0}, {"00000000-0000-0000-0000-000000000000", 1}, {revision.RevisionID, revision.RevisionNumber + 1}} {
+		result, err := store.ExportRevisionForExecution(context.Background(), configTestApp, request.id, request.number)
+		if !IsCode(err, "configuration_unavailable") {
+			clear(result.Environment)
+			t.Fatalf("id=%q number=%d error=%v", request.id, request.number, err)
+		}
+	}
+}
+
+func TestExportRevisionForExecutionFailsClosedOnCorruptBundle(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	revision, err := store.Replace(ctx, configTestApp, "", ReplaceInput{ExpectedRevisionNumber: 0, Secrets: []ValueInput{{Key: "TOKEN", Value: "secret"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := bundle{Version: 1, ApplicationID: configTestApp, RevisionID: revision.RevisionID, RevisionNumber: revision.RevisionNumber, Entries: map[string]bundleEntry{"TOKEN": {Sensitive: false, Value: "secret"}}}
+	plaintext, err := json.Marshal(corrupt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := secretfile.Write(store.bundlePath(configTestApp, revision.RevisionID), purpose(configTestApp, revision.RevisionID), plaintext); err != nil {
+		t.Fatal(err)
+	}
+	clear(plaintext)
+	result, err := store.ExportRevisionForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber)
+	clear(result.Environment)
+	if !IsCode(err, "configuration_unavailable") {
+		t.Fatalf("corrupt exact revision error = %v", err)
+	}
+}
+
 func TestRecoverRemovesRecognizedOrphansAndFailsClosedOnCorruption(t *testing.T) {
 	store, root := testStore(t)
 	ctx := context.Background()
