@@ -88,6 +88,33 @@ func TestRecoveryAttemptMigrationPreservesExistingFailuresAndFencesSelectedAttem
 	}
 }
 
+func TestWSSCommandMigrationIsControllerGlobalTypedAndPayloadFree(t *testing.T) {
+	body, err := migrationFiles.ReadFile("migrations/005_wss_commands.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(body)
+	for _, required := range []string{
+		"PRIMARY KEY (controller_id, message_id)",
+		"command_digest bytea NOT NULL CHECK (octet_length(command_digest) = 32)",
+		"lease_fence bigint NOT NULL CHECK (lease_fence > 0)",
+		"FOREIGN KEY (session_id, controller_id) REFERENCES relay_sessions",
+		"command_type = 'subscriptions.sync' AND result_kind = 'subscriptions_synced'",
+		"result_count BETWEEN 0 AND 1000",
+		"result_kind = 'rotation_challenge'",
+		"result_kind = 'rotation_finalized'",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Errorf("WSS command migration missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"json", "payload", "raw_frame", "signature", "public_key"} {
+		if strings.Contains(strings.ToLower(sql), forbidden) {
+			t.Errorf("WSS command migration contains opaque or sensitive column %q", forbidden)
+		}
+	}
+}
+
 func TestRelaySchemaExcludesForbiddenProductAndSecretData(t *testing.T) {
 	for _, name := range migrationNames(t, migrationFiles, "migrations") {
 		body, err := migrationFiles.ReadFile("migrations/" + name)

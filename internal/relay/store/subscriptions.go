@@ -16,27 +16,51 @@ type Subscription struct {
 }
 
 func (s *Store) SyncSubscriptions(ctx context.Context, controllerID string, generation uint64, subscriptions []Subscription) error {
-	if !validUUID(controllerID) || generation == 0 || generation > math.MaxInt64 || subscriptions == nil || len(subscriptions) > protocol.MaxArrayItems {
-		return ErrInvalid
-	}
-	seen := map[string]Subscription{}
-	for _, sub := range subscriptions {
-		if !validUUID(sub.SubscriptionID) || sub.InstallationID <= 0 || sub.RepositoryID <= 0 || protocol.ValidRef(sub.Ref) != nil {
-			return ErrInvalid
-		}
-		if _, ok := seen[sub.SubscriptionID]; ok {
-			return ErrInvalid
-		}
-		seen[sub.SubscriptionID] = sub
+	seen, err := validateSubscriptions(controllerID, generation, subscriptions)
+	if err != nil {
+		return err
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer rollback(ctx, tx)
-	activeSnapshot, err := activeSubscriptions(ctx, tx, controllerID)
+	locks, err := s.prepareSubscriptionLocks(ctx, tx, controllerID, subscriptions)
 	if err != nil {
 		return err
+	}
+	if err = s.syncSubscriptionsLocked(ctx, tx, controllerID, generation, subscriptions, seen, locks); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+type subscriptionLocks struct {
+	bindings map[int64]struct{}
+	routes   map[int64]struct{}
+}
+
+func validateSubscriptions(controllerID string, generation uint64, subscriptions []Subscription) (map[string]Subscription, error) {
+	if !validUUID(controllerID) || generation == 0 || generation > math.MaxInt64 || subscriptions == nil || len(subscriptions) > protocol.MaxArrayItems {
+		return nil, ErrInvalid
+	}
+	seen := map[string]Subscription{}
+	for _, sub := range subscriptions {
+		if !validUUID(sub.SubscriptionID) || sub.InstallationID <= 0 || sub.RepositoryID <= 0 || protocol.ValidRef(sub.Ref) != nil {
+			return nil, ErrInvalid
+		}
+		if _, ok := seen[sub.SubscriptionID]; ok {
+			return nil, ErrInvalid
+		}
+		seen[sub.SubscriptionID] = sub
+	}
+	return seen, nil
+}
+
+func (s *Store) prepareSubscriptionLocks(ctx context.Context, tx pgx.Tx, controllerID string, subscriptions []Subscription) (subscriptionLocks, error) {
+	activeSnapshot, err := activeSubscriptions(ctx, tx, controllerID)
+	if err != nil {
+		return subscriptionLocks{}, err
 	}
 	bindingLocks := make(map[int64]struct{}, len(activeSnapshot)+len(subscriptions))
 	routeLocks := make(map[int64]struct{}, len(activeSnapshot)+len(subscriptions))
@@ -49,14 +73,18 @@ func (s *Store) SyncSubscriptions(ctx context.Context, controllerID string, gene
 		routeLocks[routeLockKey(sub.InstallationID, sub.RepositoryID, sub.Ref)] = struct{}{}
 	}
 	if err = acquireAdvisoryLocks(ctx, tx, bindingLocks); err != nil {
-		return err
+		return subscriptionLocks{}, err
 	}
 	if err = acquireAdvisoryLocks(ctx, tx, routeLocks); err != nil {
-		return err
+		return subscriptionLocks{}, err
 	}
+	return subscriptionLocks{bindings: bindingLocks, routes: routeLocks}, nil
+}
+
+func (s *Store) syncSubscriptionsLocked(ctx context.Context, tx pgx.Tx, controllerID string, generation uint64, subscriptions []Subscription, seen map[string]Subscription, locks subscriptionLocks) error {
 	now := s.now().UTC()
 	var controllerState string
-	if err = tx.QueryRow(ctx, `SELECT state FROM relay_controllers WHERE controller_id=$1 FOR UPDATE`, controllerID).Scan(&controllerState); isNoRows(err) {
+	if err := tx.QueryRow(ctx, `SELECT state FROM relay_controllers WHERE controller_id=$1 FOR UPDATE`, controllerID).Scan(&controllerState); isNoRows(err) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
@@ -69,10 +97,10 @@ func (s *Store) SyncSubscriptions(ctx context.Context, controllerID string, gene
 		return err
 	}
 	for _, sub := range active {
-		if _, ok := bindingLocks[bindingLockKey(sub.InstallationID)]; !ok {
+		if _, ok := locks.bindings[bindingLockKey(sub.InstallationID)]; !ok {
 			return ErrConflict
 		}
-		if _, ok := routeLocks[routeLockKey(sub.InstallationID, sub.RepositoryID, sub.Ref)]; !ok {
+		if _, ok := locks.routes[routeLockKey(sub.InstallationID, sub.RepositoryID, sub.Ref)]; !ok {
 			return ErrConflict
 		}
 	}
@@ -109,7 +137,7 @@ func (s *Store) SyncSubscriptions(ctx context.Context, controllerID string, gene
 		if matched != len(subscriptions) {
 			return ErrConflict
 		}
-		return tx.Commit(ctx)
+		return nil
 	}
 	if generation != uint64(current+1) {
 		return ErrConflict
@@ -153,7 +181,7 @@ func (s *Store) SyncSubscriptions(ctx context.Context, controllerID string, gene
 	if err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func activeSubscriptions(ctx context.Context, tx interface {

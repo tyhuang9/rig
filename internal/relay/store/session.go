@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -123,6 +124,73 @@ type Lease struct {
 	ExpiresAt    time.Time
 }
 
+// RenewLease extends exactly the caller's fenced lease and rechecks the
+// session, controller, and authenticating key. A superseded lease can never be
+// renewed, even when an old connection wakes after its replacement is ready.
+func (s *Store) RenewLease(ctx context.Context, lease Lease, duration time.Duration) (Lease, error) {
+	if !validLease(lease) || duration < time.Second || duration > 10*time.Minute {
+		return Lease{}, ErrInvalid
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Lease{}, err
+	}
+	defer rollback(ctx, tx)
+	now := s.now().UTC()
+	var leaseExpires, sessionExpires time.Time
+	var sessionRevoked sql.NullTime
+	var controllerState, keyState string
+	err = tx.QueryRow(ctx, `SELECT l.expires_at,s.expires_at,s.revoked_at,c.state,k.state FROM relay_controller_leases l JOIN relay_sessions s ON s.session_id=l.session_id AND s.controller_id=l.controller_id JOIN relay_controllers c ON c.controller_id=s.controller_id JOIN relay_controller_keys k ON k.controller_id=s.controller_id AND k.key_id=s.key_id WHERE l.controller_id=$1 AND l.session_id=$2 AND l.lease_id=$3 AND l.fence=$4 FOR UPDATE OF l,s,c,k`, lease.ControllerID, lease.SessionID, lease.LeaseID, lease.Fence).Scan(&leaseExpires, &sessionExpires, &sessionRevoked, &controllerState, &keyState)
+	if isNoRows(err) {
+		return Lease{}, ErrConflict
+	}
+	if err != nil {
+		return Lease{}, err
+	}
+	if !leaseExpires.After(now) || !sessionExpires.After(now) || sessionRevoked.Valid || controllerState != "active" || keyState != "active" {
+		return Lease{}, ErrConflict
+	}
+	expires := now.Add(duration)
+	if expires.After(sessionExpires) {
+		expires = sessionExpires
+	}
+	tag, err := tx.Exec(ctx, `UPDATE relay_controller_leases SET expires_at=$5,updated_at=$6 WHERE controller_id=$1 AND session_id=$2 AND lease_id=$3 AND fence=$4 AND expires_at=$7`, lease.ControllerID, lease.SessionID, lease.LeaseID, lease.Fence, expires, now, leaseExpires)
+	if err != nil {
+		return Lease{}, err
+	}
+	if tag.RowsAffected() != 1 {
+		return Lease{}, ErrConflict
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return Lease{}, err
+	}
+	lease.ExpiresAt = expires
+	return lease, nil
+}
+
+// ValidateLease is a non-mutating liveness check used by a session supervisor.
+// Every state-changing WSS command performs the same check again under lock.
+func (s *Store) ValidateLease(ctx context.Context, lease Lease) error {
+	if !validLease(lease) {
+		return ErrInvalid
+	}
+	var leaseExpires, sessionExpires time.Time
+	var sessionRevoked sql.NullTime
+	var controllerState, keyState string
+	err := s.pool.QueryRow(ctx, `SELECT l.expires_at,s.expires_at,s.revoked_at,c.state,k.state FROM relay_controller_leases l JOIN relay_sessions s ON s.session_id=l.session_id AND s.controller_id=l.controller_id JOIN relay_controllers c ON c.controller_id=s.controller_id JOIN relay_controller_keys k ON k.controller_id=s.controller_id AND k.key_id=s.key_id WHERE l.controller_id=$1 AND l.session_id=$2 AND l.lease_id=$3 AND l.fence=$4`, lease.ControllerID, lease.SessionID, lease.LeaseID, lease.Fence).Scan(&leaseExpires, &sessionExpires, &sessionRevoked, &controllerState, &keyState)
+	if isNoRows(err) {
+		return ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	now := s.now().UTC()
+	if !leaseExpires.After(now) || !sessionExpires.After(now) || sessionRevoked.Valid || controllerState != "active" || keyState != "active" {
+		return ErrConflict
+	}
+	return nil
+}
+
 func (s *Store) AcquireLease(ctx context.Context, sessionID string, duration time.Duration) (Lease, error) {
 	if !validUUID(sessionID) || duration < time.Second || duration > 10*time.Minute {
 		return Lease{}, ErrInvalid
@@ -217,4 +285,8 @@ func (s *Store) ReleaseLease(ctx context.Context, lease Lease) error {
 		return ErrConflict
 	}
 	return nil
+}
+
+func validLease(lease Lease) bool {
+	return validUUID(lease.ControllerID) && validUUID(lease.SessionID) && validUUID(lease.LeaseID) && lease.Fence > 0
 }
