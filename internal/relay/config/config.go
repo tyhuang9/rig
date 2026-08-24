@@ -345,7 +345,7 @@ func Load(source Source) (Config, error) {
 	}
 	c.MaxEnvelopeBytes, err = optionalInt(source, EnvMaxEnvelopeBytes, c.MaxEnvelopeBytes, 4<<10, 8<<20)
 	if err == nil {
-		c.MaxSubscriptions, err = optionalInt(source, EnvMaxSubscriptions, c.MaxSubscriptions, 1, 100_000)
+		c.MaxSubscriptions, err = optionalInt(source, EnvMaxSubscriptions, c.MaxSubscriptions, 1, 1000)
 	}
 	if err == nil {
 		c.MaxSources, err = optionalInt(source, EnvMaxSourcesPerSubscription, c.MaxSources, 1, 100_000)

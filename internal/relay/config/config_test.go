@@ -280,7 +280,7 @@ func TestDurationAndLimitBounds(t *testing.T) {
 		{"recovery interval too short", EnvRecoveryInterval, "999ms"}, {"recovery order", EnvRecoveryInterval, "24h"},
 		{"minimum session too short", EnvMinSessionDuration, "59s"}, {"maximum session too long", EnvMaxSessionDuration, "721h"},
 		{"envelope too small", EnvMaxEnvelopeBytes, "4095"}, {"envelope too large", EnvMaxEnvelopeBytes, "8388609"},
-		{"subscriptions zero", EnvMaxSubscriptions, "0"}, {"subscriptions huge", EnvMaxSubscriptions, "100001"},
+		{"subscriptions zero", EnvMaxSubscriptions, "0"}, {"subscriptions above protocol cap", EnvMaxSubscriptions, "1001"},
 		{"sources zero", EnvMaxSourcesPerSubscription, "0"}, {"sources huge", EnvMaxSourcesPerSubscription, "100001"},
 	}
 	for _, test := range tests {
