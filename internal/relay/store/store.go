@@ -122,6 +122,10 @@ func bindingLockKey(installationID int64) int64 {
 	digest := sha256.Sum256([]byte(fmt.Sprintf("rig.relay.binding.v1\x00%d", installationID)))
 	return int64(binary.BigEndian.Uint64(digest[:8]))
 }
+func deliveryLockKey(deliveryID string) int64 {
+	digest := sha256.Sum256([]byte("rig.relay.delivery.v1\x00" + deliveryID))
+	return int64(binary.BigEndian.Uint64(digest[:8]))
+}
 func acquireAdvisoryLocks(ctx context.Context, tx pgx.Tx, keys map[int64]struct{}) error {
 	ordered := make([]int64, 0, len(keys))
 	for key := range keys {

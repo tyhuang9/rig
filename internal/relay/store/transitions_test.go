@@ -97,6 +97,7 @@ func TestEmptyFanoutPersistsLedgerThenDeduplicatesWithoutChildren(t *testing.T) 
 	m.ExpectBegin()
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(event.InstallationID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(routeLockKey(event.InstallationID, event.RepositoryID, event.Ref)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(event.DeliveryID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(event.DeliveryID, event.ReceivedAt, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	m.ExpectQuery("SELECT s.controller_id::text,s.subscription_id::text").WithArgs(event.InstallationID, event.RepositoryID, event.Ref).WillReturnRows(pgxmock.NewRows([]string{"controller_id", "subscription_id"}))
 	m.ExpectExec("UPDATE relay_recovery_deliveries").WithArgs(event.DeliveryID, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
@@ -108,7 +109,9 @@ func TestEmptyFanoutPersistsLedgerThenDeduplicatesWithoutChildren(t *testing.T) 
 	m.ExpectBegin()
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(event.InstallationID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(routeLockKey(event.InstallationID, event.RepositoryID, event.Ref)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(event.DeliveryID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(event.DeliveryID, event.ReceivedAt, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
+	m.ExpectQuery("SELECT delivery_kind").WithArgs(event.DeliveryID).WillReturnRows(pgxmock.NewRows([]string{"kind"}).AddRow("source"))
 	m.ExpectExec("UPDATE relay_recovery_deliveries").WithArgs(event.DeliveryID, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	m.ExpectCommit()
 	result, err = s.PushSourceEvent(context.Background(), event, []SourceRoute{{ControllerID: testController, SubscriptionID: testSubscription}})
@@ -127,6 +130,7 @@ func TestBatchFailureRollsBackAndNeverPartiallyCommits(t *testing.T) {
 	m.ExpectBegin()
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(event.InstallationID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(routeLockKey(event.InstallationID, event.RepositoryID, event.Ref)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(event.DeliveryID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(event.DeliveryID, event.ReceivedAt, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	m.ExpectQuery("SELECT s.controller_id::text,s.subscription_id::text").WithArgs(event.InstallationID, event.RepositoryID, event.Ref).WillReturnError(outage)
 	m.ExpectRollback()
@@ -338,6 +342,7 @@ func TestSourceRouteSetMustBeComplete(t *testing.T) {
 	m.ExpectBegin()
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(event.InstallationID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(routeLockKey(event.InstallationID, event.RepositoryID, event.Ref)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(event.DeliveryID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(event.DeliveryID, event.ReceivedAt, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	m.ExpectQuery("SELECT s.controller_id::text,s.subscription_id::text").WithArgs(event.InstallationID, event.RepositoryID, event.Ref).WillReturnRows(pgxmock.NewRows([]string{"controller_id", "subscription_id"}).AddRow(testController, testSubscription))
 	m.ExpectRollback()
@@ -358,6 +363,7 @@ func TestAccessBatchRollbackAndDurablePendingAfterRevocation(t *testing.T) {
 		m.ExpectBegin()
 		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(1)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		m.ExpectQuery("SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(int64(1), int64(0)).WillReturnRows(pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 		m.ExpectQuery("SELECT b.controller_id::text").WithArgs(int64(1), int64(0)).WillReturnRows(pgxmock.NewRows([]string{"controller_id"}).AddRow(testController).AddRow(testController2))
 		m.ExpectExec("INSERT INTO relay_access_events").WithArgs(testEvent, testDelivery, testController, int64(1), nil, event.ChangeCode, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -390,6 +396,7 @@ func TestAccessFanoutRowsErrorRollsBackBeforeChildrenOrRevocation(t *testing.T) 
 	m.ExpectBegin()
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(1)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectQuery("SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(int64(1), int64(2)).WillReturnRows(pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	m.ExpectQuery("SELECT b.controller_id::text").WithArgs(int64(1), int64(2)).WillReturnRows(pgxmock.NewRows([]string{"controller_id"}).AddRow(testController).RowError(0, rowsErr))
 	m.ExpectRollback()
@@ -448,6 +455,196 @@ func TestEnrollmentClaimDoesNotAuthorizeBeforeCompletion(t *testing.T) {
 	if err = m.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestCreateEnrollmentClassifiesOnlyExactSignedRequestReplay(t *testing.T) {
+	input := EnrollmentInput{
+		ControllerID: testController, KeyID: testKey, PublicKey: bytes.Repeat([]byte{2}, 32),
+		InstallationID: 1, RepositoryID: 2, StateHash: bytes.Repeat([]byte{3}, 32),
+		PollHash: bytes.Repeat([]byte{4}, 32), PKCECiphertext: bytes.Repeat([]byte{5}, 29),
+		PKCESealNonce: bytes.Repeat([]byte{6}, 12), RequestNonce: bytes.Repeat([]byte{7}, 32),
+		ExpiresAt: fixedNow.Add(time.Minute),
+	}
+	for _, test := range []struct {
+		name          string
+		databaseError error
+		want          error
+	}{
+		{name: "signed request replay", databaseError: &pgconn.PgError{Code: "23505", ConstraintName: "relay_enrollment_request_replay"}, want: ErrReplay},
+		{name: "unrelated unique violation", databaseError: &pgconn.PgError{Code: "23505", ConstraintName: "relay_enrollments_state_hash_key"}},
+		{name: "database outage", databaseError: errors.New("database unavailable")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, m := mockStore(t)
+			m.ExpectExec("INSERT INTO relay_enrollments").WithArgs(
+				pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+				pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+				pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			).WillReturnError(test.databaseError)
+			_, err := s.CreateEnrollment(context.Background(), input)
+			if test.want != nil {
+				if !errors.Is(err, test.want) {
+					t.Fatalf("error = %v, want %v", err, test.want)
+				}
+			} else if !errors.Is(err, test.databaseError) {
+				t.Fatalf("error = %v, want original %v", err, test.databaseError)
+			}
+			if err := m.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPushAccessEventsPersistsAtomicMultiRepositoryFanout(t *testing.T) {
+	batch := AccessEventBatchInput{
+		DeliveryID: testDelivery, ReceivedAt: fixedNow,
+		Events: []AccessEventBatchItem{
+			{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.removed", ObservedAt: fixedNow, Routes: []AccessRoute{{EventID: testEvent, ControllerID: testController}}},
+			{InstallationID: 1, RepositoryID: 3, ChangeCode: "repository.removed", ObservedAt: fixedNow, Routes: []AccessRoute{{EventID: testEvent2, ControllerID: testController2}}},
+		},
+	}
+	s, m := mockStore(t)
+	m.ExpectBegin()
+	expectSortedAdvisoryLocks(m, bindingLockKey(1))
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	m.ExpectQuery("SELECT b.controller_id::text").WithArgs(int64(1), int64(2)).WillReturnRows(pgxmock.NewRows([]string{"controller_id"}).AddRow(testController))
+	m.ExpectExec("INSERT INTO relay_access_events").WithArgs(testEvent, testDelivery, testController, int64(1), int64(2), "repository.removed", fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	m.ExpectQuery("SELECT b.controller_id::text").WithArgs(int64(1), int64(3)).WillReturnRows(pgxmock.NewRows([]string{"controller_id"}).AddRow(testController2))
+	m.ExpectExec("INSERT INTO relay_access_events").WithArgs(testEvent2, testDelivery, testController2, int64(1), int64(3), "repository.removed", fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	m.ExpectExec("UPDATE relay_recovery_deliveries").WithArgs(testDelivery, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	m.ExpectCommit()
+	if result, err := s.PushAccessEvents(context.Background(), batch); err != nil || result.Deduplicated {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if err := m.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPushAccessEventsRejectsAmbiguousTargetsBeforeDatabaseWork(t *testing.T) {
+	for _, events := range [][]AccessEventBatchItem{
+		{{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.added", ObservedAt: fixedNow}, {InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.removed", ObservedAt: fixedNow}},
+		{{InstallationID: 1, RepositoryID: 0, ChangeCode: "installation.removed", ObservedAt: fixedNow}, {InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.removed", ObservedAt: fixedNow}},
+	} {
+		s, m := mockStore(t)
+		_, err := s.PushAccessEvents(context.Background(), AccessEventBatchInput{DeliveryID: testDelivery, ReceivedAt: fixedNow, Events: events})
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatalf("error=%v", err)
+		}
+		if err := m.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestPushAccessEventsDuplicateDeliveryCannotAppendChildren(t *testing.T) {
+	s, m := mockStore(t)
+	batch := AccessEventBatchInput{DeliveryID: testDelivery, ReceivedAt: fixedNow, Events: []AccessEventBatchItem{{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.added", ObservedAt: fixedNow}}}
+	m.ExpectBegin()
+	expectSortedAdvisoryLocks(m, bindingLockKey(1))
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
+	m.ExpectQuery("SELECT delivery_kind").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"kind"}).AddRow("access"))
+	m.ExpectExec("UPDATE relay_recovery_deliveries").WithArgs(testDelivery, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	m.ExpectCommit()
+	result, err := s.PushAccessEvents(context.Background(), batch)
+	if err != nil || !result.Deduplicated {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if err := m.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeliveryLedgerRejectsCrossKindGUIDReuseAndIgnoredReasonExpansion(t *testing.T) {
+	t.Run("ignored reason is closed enum", func(t *testing.T) {
+		s, m := mockStore(t)
+		if _, err := s.PushIgnoredDelivery(context.Background(), testDelivery, "provider.detail", fixedNow); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("error=%v", err)
+		}
+		if err := m.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("ignored exact replay", func(t *testing.T) {
+		s, m := mockStore(t)
+		m.ExpectBegin()
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
+		m.ExpectQuery("SELECT d.delivery_kind,i.reason_code").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"kind", "reason"}).AddRow("ignored", "push.deleted"))
+		m.ExpectExec("UPDATE relay_recovery_deliveries").WithArgs(testDelivery, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+		m.ExpectCommit()
+		deduplicated, err := s.PushIgnoredDelivery(context.Background(), testDelivery, "push.deleted", fixedNow)
+		if err != nil || !deduplicated {
+			t.Fatalf("deduplicated=%v error=%v", deduplicated, err)
+		}
+		if err := m.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("ignored rejects source GUID", func(t *testing.T) {
+		s, m := mockStore(t)
+		m.ExpectBegin()
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
+		m.ExpectQuery("SELECT d.delivery_kind,i.reason_code").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"kind", "reason"}).AddRow("source", nil))
+		m.ExpectRollback()
+		if _, err := s.PushIgnoredDelivery(context.Background(), testDelivery, "push.deleted", fixedNow); !errors.Is(err, ErrConflict) {
+			t.Fatalf("error=%v", err)
+		}
+		if err := m.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("ignored rejects access GUID", func(t *testing.T) {
+		s, m := mockStore(t)
+		m.ExpectBegin()
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
+		m.ExpectQuery("SELECT d.delivery_kind,i.reason_code").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"kind", "reason"}).AddRow("access", nil))
+		m.ExpectRollback()
+		if _, err := s.PushIgnoredDelivery(context.Background(), testDelivery, "push.deleted", fixedNow); !errors.Is(err, ErrConflict) {
+			t.Fatalf("error=%v", err)
+		}
+		if err := m.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("source rejects ignored GUID", func(t *testing.T) {
+		s, m := mockStore(t)
+		event := SourceEvent{DeliveryID: testDelivery, InstallationID: 1, RepositoryID: 2, Ref: "refs/heads/main", SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ReceivedAt: fixedNow, ObservedAt: fixedNow}
+		m.ExpectBegin()
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(1)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(routeLockKey(1, 2, event.Ref)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
+		m.ExpectQuery("SELECT delivery_kind").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"kind"}).AddRow("ignored"))
+		m.ExpectRollback()
+		if _, err := s.PushSourceEvent(context.Background(), event, nil); !errors.Is(err, ErrConflict) {
+			t.Fatalf("error=%v", err)
+		}
+		if err := m.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("access rejects ignored GUID", func(t *testing.T) {
+		s, m := mockStore(t)
+		batch := AccessEventBatchInput{DeliveryID: testDelivery, ReceivedAt: fixedNow, Events: []AccessEventBatchItem{{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.added", ObservedAt: fixedNow}}}
+		m.ExpectBegin()
+		expectSortedAdvisoryLocks(m, bindingLockKey(1))
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
+		m.ExpectQuery("SELECT delivery_kind").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"kind"}).AddRow("ignored"))
+		m.ExpectRollback()
+		if _, err := s.PushAccessEvents(context.Background(), batch); !errors.Is(err, ErrConflict) {
+			t.Fatalf("error=%v", err)
+		}
+		if err := m.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestEnrollmentOutagesRollbackWithoutCreatingIdentity(t *testing.T) {
@@ -684,15 +881,16 @@ func TestRecoveryFencesRetriesAndCursorTakeover(t *testing.T) {
 	t.Run("claim and stale attempt", func(t *testing.T) {
 		s, m := mockStore(t)
 		m.ExpectBegin()
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(recoveryScanClaimLock).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		m.ExpectQuery("FOR UPDATE SKIP LOCKED").WithArgs(fixedNow, 1).WillReturnRows(pgxmock.NewRows([]string{"number", "id", "occurred", "attempts", "next", "code", "fence"}).AddRow(int64(100), testDelivery, fixedNow.Add(-time.Hour), 0, nil, "", int64(0)))
-		m.ExpectExec("UPDATE relay_recovery_deliveries SET claim_id").WithArgs(int64(100), testLease, uint64(1), fixedNow.Add(time.Minute), int64(0)).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+		m.ExpectExec("UPDATE relay_recovery_deliveries SET claim_id").WithArgs(testDelivery, int64(100), testLease, uint64(1), fixedNow.Add(time.Minute), int64(0)).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 		m.ExpectCommit()
 		claims, err := s.ClaimRecovery(context.Background(), 1, time.Minute)
 		if err != nil || len(claims) != 1 || claims[0].Fence != 1 {
 			t.Fatalf("claims=%#v err=%v", claims, err)
 		}
 		next := fixedNow.Add(time.Minute)
-		m.ExpectExec("UPDATE relay_recovery_deliveries SET attempts").WithArgs(int64(100), testLease, uint64(1), next, "github.unavailable", fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+		m.ExpectExec("UPDATE relay_recovery_deliveries SET attempts").WithArgs(testDelivery, int64(100), testLease, uint64(1), next, "github.unavailable", fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 		if err = s.RecordRecoveryAttempt(context.Background(), claims[0], next, "github.unavailable"); !errors.Is(err, ErrConflict) {
 			t.Fatalf("stale error=%v", err)
 		}
@@ -704,19 +902,20 @@ func TestRecoveryFencesRetriesAndCursorTakeover(t *testing.T) {
 		s, m := mockStore(t)
 		start, end := fixedNow.Add(-time.Hour), fixedNow
 		m.ExpectBegin()
-		m.ExpectQuery("SELECT completed,lease_expires_at").WillReturnRows(pgxmock.NewRows([]string{"complete", "lease"}).AddRow(false, fixedNow.Add(-time.Second)))
-		m.ExpectExec("INSERT INTO relay_recovery_cursor").WithArgs(testLease, start, end, fixedNow.Add(recoveryScanLease), fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(recoveryScanClaimLock).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		m.ExpectQuery("SELECT scan_id::text,fence,window_started_at").WillReturnRows(pgxmock.NewRows([]string{"scan", "fence", "start", "end", "page", "complete", "lease"}).AddRow(testDelivery, int64(7), start, end, "opaque-old", false, fixedNow.Add(-time.Second)))
+		m.ExpectExec(regexp.QuoteMeta("UPDATE relay_recovery_cursor SET fence=fence+1")).WithArgs(testDelivery, uint64(7), fixedNow.Add(recoveryScanLease), fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 		m.ExpectCommit()
 		cursor, err := s.StartRecoveryScan(context.Background(), start, end)
-		if err != nil {
-			t.Fatal(err)
+		if err != nil || cursor.ScanID != testDelivery || cursor.Fence != 8 || cursor.PageCursor != "opaque-old" || !cursor.WindowStartedAt.Equal(start) || !cursor.WindowEndsAt.Equal(end) {
+			t.Fatalf("cursor=%+v err=%v", cursor, err)
 		}
-		m.ExpectExec("UPDATE relay_recovery_cursor SET page_cursor").WithArgs(testLease, uint64(1), nil, "page-2", fixedNow, fixedNow.Add(recoveryScanLease)).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+		m.ExpectExec("UPDATE relay_recovery_cursor SET page_cursor").WithArgs(testDelivery, uint64(8), "opaque-old", "page-2", fixedNow, fixedNow.Add(recoveryScanLease)).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 		next, err := s.AdvanceRecoveryCursor(context.Background(), cursor, "page-2")
-		if err != nil || next.Fence != 2 {
+		if err != nil || next.Fence != 9 {
 			t.Fatalf("next=%#v err=%v", next, err)
 		}
-		m.ExpectExec("UPDATE relay_recovery_cursor SET page_cursor").WithArgs(testLease, uint64(1), nil, "stale", fixedNow, fixedNow.Add(recoveryScanLease)).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+		m.ExpectExec("UPDATE relay_recovery_cursor SET page_cursor").WithArgs(testDelivery, uint64(8), "opaque-old", "stale", fixedNow, fixedNow.Add(recoveryScanLease)).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 		if _, err = s.AdvanceRecoveryCursor(context.Background(), cursor, "stale"); !errors.Is(err, ErrConflict) {
 			t.Fatalf("stale=%v", err)
 		}
@@ -730,8 +929,13 @@ func TestRecoveryFencesRetriesAndCursorTakeover(t *testing.T) {
 	t.Run("mismatched discovery conflict", func(t *testing.T) {
 		s, m := mockStore(t)
 		item := RecoveryDelivery{DeliveryNumber: 100, DeliveryID: testDelivery, OccurredAt: fixedNow}
-		m.ExpectExec("INSERT INTO relay_recovery_deliveries").WithArgs(int64(100), testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
-		m.ExpectQuery("SELECT delivery_number,delivery_id::text").WithArgs(int64(100), testDelivery).WillReturnRows(pgxmock.NewRows([]string{"number", "id"}).AddRow(int64(101), testDelivery))
+		m.ExpectBegin()
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		m.ExpectQuery("SELECT delivery_number,occurred_at,provider_succeeded_at,recovered_at").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"number", "occurred", "succeeded", "recovered"}).AddRow(int64(100), fixedNow, nil, nil))
+		m.ExpectQuery("SELECT EXISTS").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
+		m.ExpectExec("INSERT INTO relay_recovery_delivery_attempts").WithArgs(int64(100), testDelivery, fixedNow, false, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
+		m.ExpectQuery("SELECT delivery_id::text,occurred_at,successful").WithArgs(int64(100)).WillReturnRows(pgxmock.NewRows([]string{"id", "occurred", "successful"}).AddRow(testController, fixedNow, false))
+		m.ExpectRollback()
 		if _, err := s.DiscoverRecoveryDelivery(context.Background(), item); !errors.Is(err, ErrConflict) {
 			t.Fatalf("error=%v", err)
 		}
@@ -742,8 +946,13 @@ func TestRecoveryFencesRetriesAndCursorTakeover(t *testing.T) {
 	t.Run("exact delivery number and GUID is idempotent", func(t *testing.T) {
 		s, m := mockStore(t)
 		item := RecoveryDelivery{DeliveryNumber: 100, DeliveryID: testDelivery, OccurredAt: fixedNow}
-		m.ExpectExec("INSERT INTO relay_recovery_deliveries").WithArgs(int64(100), testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
-		m.ExpectQuery("SELECT delivery_number,delivery_id::text").WithArgs(int64(100), testDelivery).WillReturnRows(pgxmock.NewRows([]string{"number", "id"}).AddRow(int64(100), testDelivery))
+		m.ExpectBegin()
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		m.ExpectQuery("SELECT delivery_number,occurred_at,provider_succeeded_at,recovered_at").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"number", "occurred", "succeeded", "recovered"}).AddRow(int64(100), fixedNow, nil, nil))
+		m.ExpectQuery("SELECT EXISTS").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
+		m.ExpectExec("INSERT INTO relay_recovery_delivery_attempts").WithArgs(int64(100), testDelivery, fixedNow, false, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
+		m.ExpectQuery("SELECT delivery_id::text,occurred_at,successful").WithArgs(int64(100)).WillReturnRows(pgxmock.NewRows([]string{"id", "occurred", "successful"}).AddRow(testDelivery, fixedNow, false))
+		m.ExpectCommit()
 		deduplicated, err := s.DiscoverRecoveryDelivery(context.Background(), item)
 		if err != nil || !deduplicated {
 			t.Fatalf("deduplicated=%t error=%v", deduplicated, err)
@@ -756,6 +965,7 @@ func TestRecoveryFencesRetriesAndCursorTakeover(t *testing.T) {
 		s, m := mockStore(t)
 		rowsErr := errors.New("recovery rows unavailable")
 		m.ExpectBegin()
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(recoveryScanClaimLock).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		m.ExpectQuery("FOR UPDATE SKIP LOCKED").WithArgs(fixedNow, 1).WillReturnRows(pgxmock.NewRows([]string{"number", "id", "occurred", "attempts", "next", "code", "fence"}).AddRow(int64(100), testDelivery, fixedNow.Add(-time.Hour), 0, nil, "", int64(0)).RowError(0, rowsErr))
 		m.ExpectRollback()
 		if _, err := s.ClaimRecovery(context.Background(), 1, time.Minute); !errors.Is(err, rowsErr) {
@@ -769,7 +979,7 @@ func TestRecoveryFencesRetriesAndCursorTakeover(t *testing.T) {
 		s, m := mockStore(t)
 		claim := RecoveryClaim{RecoveryDelivery: RecoveryDelivery{DeliveryNumber: 100, DeliveryID: testDelivery}, ClaimID: testLease, Fence: 7}
 		next := fixedNow.Add(time.Minute)
-		m.ExpectExec("UPDATE relay_recovery_deliveries SET attempts").WithArgs(int64(100), testLease, uint64(7), next, "github.unavailable", fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+		m.ExpectExec("UPDATE relay_recovery_deliveries SET attempts").WithArgs(testDelivery, int64(100), testLease, uint64(7), next, "github.unavailable", fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 		if err := s.RecordRecoveryAttempt(context.Background(), claim, next, "github.unavailable"); err != nil {
 			t.Fatal(err)
 		}
@@ -780,7 +990,7 @@ func TestRecoveryFencesRetriesAndCursorTakeover(t *testing.T) {
 	t.Run("mark recovered requires inbound delivery ledger", func(t *testing.T) {
 		s, m := mockStore(t)
 		claim := RecoveryClaim{RecoveryDelivery: RecoveryDelivery{DeliveryNumber: 100, DeliveryID: testDelivery}, ClaimID: testLease, Fence: 7}
-		m.ExpectExec("UPDATE relay_recovery_deliveries r SET recovered_at").WithArgs(int64(100), testLease, uint64(7), fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+		m.ExpectExec("UPDATE relay_recovery_deliveries r SET recovered_at").WithArgs(testDelivery, int64(100), testLease, uint64(7), fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 		if err := s.MarkRecovered(context.Background(), claim); !errors.Is(err, ErrConflict) {
 			t.Fatalf("error=%v", err)
 		}
@@ -788,6 +998,74 @@ func TestRecoveryFencesRetriesAndCursorTakeover(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestRecoveryAttemptGroupsAdvanceNewestFailureFenceThenSuppressOnSuccess(t *testing.T) {
+	s, m := mockStore(t)
+	failureA := RecoveryDelivery{DeliveryNumber: 100, DeliveryID: testDelivery, OccurredAt: fixedNow.Add(-3 * time.Minute)}
+	failureB := RecoveryDelivery{DeliveryNumber: 101, DeliveryID: testDelivery, OccurredAt: fixedNow.Add(-2 * time.Minute)}
+	successC := RecoveryDelivery{DeliveryNumber: 102, DeliveryID: testDelivery, OccurredAt: fixedNow.Add(-time.Minute), Successful: true}
+
+	m.ExpectBegin()
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	m.ExpectQuery("SELECT delivery_number,occurred_at,provider_succeeded_at,recovered_at").WithArgs(testDelivery).WillReturnError(pgx.ErrNoRows)
+	m.ExpectQuery("SELECT EXISTS").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
+	m.ExpectExec("INSERT INTO relay_recovery_deliveries").WithArgs(int64(100), testDelivery, failureA.OccurredAt, fixedNow, nil, nil).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	m.ExpectExec("INSERT INTO relay_recovery_delivery_attempts").WithArgs(int64(100), testDelivery, failureA.OccurredAt, false, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	m.ExpectCommit()
+	if _, err := s.DiscoverRecoveryDelivery(context.Background(), failureA); err != nil {
+		t.Fatal(err)
+	}
+
+	m.ExpectBegin()
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	m.ExpectQuery("SELECT delivery_number,occurred_at,provider_succeeded_at,recovered_at").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"number", "occurred", "succeeded", "recovered"}).AddRow(int64(100), failureA.OccurredAt, nil, nil))
+	m.ExpectQuery("SELECT EXISTS").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
+	m.ExpectExec("INSERT INTO relay_recovery_delivery_attempts").WithArgs(int64(101), testDelivery, failureB.OccurredAt, false, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	m.ExpectExec("UPDATE relay_recovery_deliveries SET delivery_number").WithArgs(testDelivery, int64(101), failureB.OccurredAt).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	m.ExpectCommit()
+	if _, err := s.DiscoverRecoveryDelivery(context.Background(), failureB); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := RecoveryClaim{RecoveryDelivery: failureA, ClaimID: testLease, Fence: 1}
+	next := fixedNow.Add(time.Minute)
+	m.ExpectExec("UPDATE relay_recovery_deliveries SET attempts").WithArgs(testDelivery, int64(100), testLease, uint64(1), next, "github.unavailable", fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	if err := s.RecordRecoveryAttempt(context.Background(), stale, next, "github.unavailable"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale A claim error=%v", err)
+	}
+
+	m.ExpectBegin()
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	m.ExpectQuery("SELECT delivery_number,occurred_at,provider_succeeded_at,recovered_at").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"number", "occurred", "succeeded", "recovered"}).AddRow(int64(101), failureB.OccurredAt, nil, nil))
+	m.ExpectQuery("SELECT EXISTS").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
+	m.ExpectExec("INSERT INTO relay_recovery_delivery_attempts").WithArgs(int64(102), testDelivery, successC.OccurredAt, true, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	m.ExpectExec("UPDATE relay_recovery_deliveries SET provider_succeeded_at").WithArgs(testDelivery, successC.OccurredAt, false, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	m.ExpectCommit()
+	if _, err := s.DiscoverRecoveryDelivery(context.Background(), successC); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoveryFailureWithInboundLedgerIsImmediatelySuppressed(t *testing.T) {
+	s, m := mockStore(t)
+	item := RecoveryDelivery{DeliveryNumber: 101, DeliveryID: testDelivery, OccurredAt: fixedNow.Add(-time.Minute)}
+	m.ExpectBegin()
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	m.ExpectQuery("SELECT delivery_number,occurred_at,provider_succeeded_at,recovered_at").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"number", "occurred", "succeeded", "recovered"}).AddRow(int64(100), fixedNow.Add(-2*time.Minute), nil, nil))
+	m.ExpectQuery("SELECT EXISTS").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	m.ExpectExec("INSERT INTO relay_recovery_delivery_attempts").WithArgs(int64(101), testDelivery, item.OccurredAt, false, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	m.ExpectExec("UPDATE relay_recovery_deliveries SET recovered_at").WithArgs(testDelivery, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	m.ExpectCommit()
+	if _, err := s.DiscoverRecoveryDelivery(context.Background(), item); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestMigrationApplyRollsBackOnFailure(t *testing.T) {

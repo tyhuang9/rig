@@ -3,11 +3,15 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type EnrollmentInput struct {
+	EnrollmentID   string
 	ControllerID   string
 	KeyID          string
 	PublicKey      []byte
@@ -51,12 +55,22 @@ type EnrollmentStatus struct {
 
 func (s *Store) CreateEnrollment(ctx context.Context, input EnrollmentInput) (string, error) {
 	now := s.now().UTC()
+	if input.EnrollmentID != "" && !validUUID(input.EnrollmentID) {
+		return "", fmt.Errorf("%w: enrollment ID", ErrInvalid)
+	}
 	if !validUUID(input.ControllerID) || !validUUID(input.KeyID) || len(input.PublicKey) != 32 || input.InstallationID <= 0 || input.RepositoryID <= 0 || !validateHash(input.StateHash) || !validateHash(input.PollHash) || len(input.PKCECiphertext) < 29 || len(input.PKCECiphertext) > 4096 || len(input.PKCESealNonce) != 12 || len(input.RequestNonce) != 32 || !input.ExpiresAt.After(now) || input.ExpiresAt.Sub(now) > 30*time.Minute {
 		return "", fmt.Errorf("%w: enrollment", ErrInvalid)
 	}
-	id := s.newUUID().String()
+	id := input.EnrollmentID
+	if id == "" {
+		id = s.newUUID().String()
+	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO relay_enrollments(enrollment_id,controller_id,key_id,public_key,installation_id,repository_id,state_hash,poll_hash,pkce_ciphertext,pkce_seal_nonce,request_nonce,status,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12,$13)`, id, input.ControllerID, input.KeyID, input.PublicKey, input.InstallationID, input.RepositoryID, input.StateHash, input.PollHash, input.PKCECiphertext, input.PKCESealNonce, input.RequestNonce, now, input.ExpiresAt.UTC())
 	if err != nil {
+		var databaseError *pgconn.PgError
+		if errors.As(err, &databaseError) && databaseError.Code == "23505" && databaseError.ConstraintName == "relay_enrollment_request_replay" {
+			return "", ErrReplay
+		}
 		return "", fmt.Errorf("create enrollment: %w", err)
 	}
 	return id, nil
@@ -253,7 +267,7 @@ func (s *Store) PollEnrollment(ctx context.Context, pollHash []byte) (Enrollment
 		if err = tx.Commit(ctx); err != nil {
 			return EnrollmentStatus{}, err
 		}
-		return EnrollmentStatus{}, ErrExpired
+		return out, ErrExpired
 	}
 	if _, err = tx.Exec(ctx, `UPDATE relay_enrollments SET polled_at=$2 WHERE poll_hash=$1`, pollHash, now); err != nil {
 		return EnrollmentStatus{}, err

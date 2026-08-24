@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
@@ -12,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -422,9 +424,9 @@ func TestDestroySecretsAndSerializationSafety(t *testing.T) {
 
 func TestErrorsAndConfigRepresentationsRedactSecrets(t *testing.T) {
 	source := validSource(t)
-	secret := "top-secret-do-not-log"
-	source.env[EnvPostgresDSNFile] = secret
-	source.err[secret] = fmt.Errorf("read %s failed", secret)
+	pathSentinel := "sensitive/path/postgres-dsn"
+	source.env[EnvPostgresDSNFile] = pathSentinel
+	source.err[pathSentinel] = fmt.Errorf("read %s failed", pathSentinel)
 	_, err := Load(source)
 	if err == nil {
 		t.Fatal("expected error")
@@ -433,17 +435,48 @@ func TestErrorsAndConfigRepresentationsRedactSecrets(t *testing.T) {
 	if !errors.As(err, &configErr) {
 		t.Fatalf("error type = %T", err)
 	}
-	for _, representation := range []string{err.Error(), configErr.String(), configErr.LogValue().String()} {
-		if strings.Contains(representation, secret) {
+	errorJSON, jsonErr := json.Marshal(configErr)
+	if jsonErr != nil {
+		t.Fatal(jsonErr)
+	}
+	var errorLog bytes.Buffer
+	slog.New(slog.NewJSONHandler(&errorLog, nil)).Error("configuration", "error", configErr)
+	for _, representation := range []string{err.Error(), configErr.String(), configErr.LogValue().String(), string(errorJSON), errorLog.String()} {
+		if strings.Contains(representation, pathSentinel) {
 			t.Fatalf("secret leaked: %q", representation)
 		}
 	}
+	secret := "top-secret-do-not-log"
 	configuration := Defaults()
-	configuration.PostgresDSN = Secret(secret)
+	configuration.ListenAddress = "198.51.100.77:4321"
+	configuration.PublicBaseURL, _ = url.Parse("https://sensitive-relay.example.test")
+	configuration.GitHubClientID = "sensitive-client-id"
+	configuration.GitHubAppID = 987654321012345
+	configuration.PostgresDSN = Secret("postgres://sensitive-user:sensitive-password@sensitive-database/relay")
+	configuration.GitHubClientSecret = Secret(secret)
+	configuration.GitHubPrivateKey = Secret("sensitive-private-key")
 	configuration.WebhookSecret = Secret(secret)
-	for _, representation := range []string{configuration.String(), fmt.Sprintf("%v", configuration), fmt.Sprintf("%+v", configuration), fmt.Sprintf("%#v", configuration), configuration.LogValue().String(), slog.AnyValue(configuration).String()} {
-		if strings.Contains(representation, secret) {
-			t.Fatalf("config leaked: %q", representation)
+	configuration.EnrollmentKey = Secret("sensitive-enrollment-key")
+	configuration.TLSCertificate = []byte("sensitive-certificate")
+	configuration.TLSPrivateKey = Secret("sensitive-tls-key")
+	configJSON, configJSONErr := json.Marshal(configuration)
+	if configJSONErr == nil {
+		t.Fatal("Config unexpectedly became serializable")
+	}
+	var configLog bytes.Buffer
+	slog.New(slog.NewJSONHandler(&configLog, nil)).Info("configuration", "config", configuration)
+	representations := []string{
+		configuration.String(), fmt.Sprintf("%v", configuration), fmt.Sprintf("%+v", configuration), fmt.Sprintf("%#v", configuration),
+		configuration.LogValue().String(), slog.AnyValue(configuration).String(), string(configJSON), configJSONErr.Error(), configLog.String(),
+	}
+	for _, sentinel := range []string{
+		"198.51.100.77", "4321", "sensitive-relay", "987654321012345", "sensitive-client-id", "sensitive-user", "sensitive-password",
+		"sensitive-database", "top-secret-do-not-log", "sensitive-private-key", "sensitive-enrollment-key", "sensitive-certificate", "sensitive-tls-key",
+	} {
+		for _, representation := range representations {
+			if strings.Contains(representation, sentinel) {
+				t.Fatalf("config leaked %q: %q", sentinel, representation)
+			}
 		}
 	}
 	secretValue := Secret(secret)

@@ -132,26 +132,65 @@ type Config struct {
 }
 
 func (c Config) String() string {
-	base := ""
-	if c.PublicBaseURL != nil {
-		base = c.PublicBaseURL.String()
-	}
-	return fmt.Sprintf("relay config (listen=%s public_base_url=%s github_app_id=%d secrets=[REDACTED])", c.ListenAddress, base, c.GitHubAppID)
+	return fmt.Sprintf("relay config (listen_mode=%s public_url_mode=%s github_client_configured=%t github_app_configured=%t tls_mode=%s)",
+		listenMode(c.ListenAddress), publicURLMode(c.PublicBaseURL), c.GitHubClientID != "", c.GitHubAppID > 0, tlsMode(c.TLSCertificate))
 }
 
 func (c Config) GoString() string               { return c.String() }
 func (c Config) Format(state fmt.State, _ rune) { _, _ = io.WriteString(state, c.String()) }
 func (c Config) LogValue() slog.Value {
-	base := ""
-	if c.PublicBaseURL != nil {
-		base = c.PublicBaseURL.String()
-	}
 	return slog.GroupValue(
-		slog.String("listen_address", c.ListenAddress),
-		slog.String("public_base_url", base),
-		slog.Int64("github_app_id", c.GitHubAppID),
-		slog.String("secrets", "[REDACTED]"),
+		slog.String("listen_mode", listenMode(c.ListenAddress)),
+		slog.String("public_url_mode", publicURLMode(c.PublicBaseURL)),
+		slog.Bool("loopback_development", c.LoopbackDevelopment),
+		slog.Bool("github_client_configured", c.GitHubClientID != ""),
+		slog.Bool("github_app_configured", c.GitHubAppID > 0),
+		slog.String("tls_mode", tlsMode(c.TLSCertificate)),
+		slog.Duration("read_timeout", c.ReadTimeout),
+		slog.Duration("write_timeout", c.WriteTimeout),
+		slog.Duration("idle_timeout", c.IdleTimeout),
+		slog.Duration("recovery_interval", c.RecoveryInterval),
+		slog.Duration("recovery_window", c.RecoveryWindow),
+		slog.Duration("min_session_duration", c.MinSessionDuration),
+		slog.Duration("max_session_duration", c.MaxSessionDuration),
+		slog.Int("max_envelope_bytes", c.MaxEnvelopeBytes),
+		slog.Int("max_subscriptions", c.MaxSubscriptions),
+		slog.Int("max_sources", c.MaxSources),
 	)
+}
+
+func listenMode(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		if address == "" {
+			return "unset"
+		}
+		return "invalid"
+	}
+	if loopbackHost(host) {
+		return "loopback"
+	}
+	return "network"
+}
+
+func publicURLMode(value *url.URL) string {
+	if value == nil {
+		return "unset"
+	}
+	if value.Scheme == "https" {
+		return "https"
+	}
+	if value.Scheme == "http" && loopbackHost(value.Hostname()) {
+		return "loopback_http"
+	}
+	return "invalid"
+}
+
+func tlsMode(certificate []byte) string {
+	if len(certificate) == 0 {
+		return "disabled"
+	}
+	return "enabled"
 }
 
 func (c *Config) DestroySecrets() {

@@ -57,15 +57,48 @@ func TestRelaySchemaContainsRequiredDurabilityInvariants(t *testing.T) {
 	}
 }
 
-func TestRelaySchemaExcludesForbiddenProductAndSecretData(t *testing.T) {
-	body, err := migrationFiles.ReadFile("migrations/001_relay_state.sql")
+func TestEnrollmentReplayMigrationUsesCanonicalSignedNonceTuple(t *testing.T) {
+	body, err := migrationFiles.ReadFile("migrations/002_enrollment_replay.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	lower := strings.ToLower(string(body))
-	for _, forbidden := range []string{"app_name", "application_name", "source_body", "archive_body", "compose", "configuration", "variable", "secret", "raw_webhook", "webhook_body", "user_token", "access_token", "refresh_token", "oauth_token"} {
-		if strings.Contains(lower, forbidden) {
-			t.Errorf("schema contains forbidden material %q", forbidden)
+	if !strings.Contains(string(body), "UNIQUE (controller_id, key_id, request_nonce)") {
+		t.Fatal("enrollment replay constraint does not bind the signed request tuple")
+	}
+}
+
+func TestRecoveryAttemptMigrationPreservesExistingFailuresAndFencesSelectedAttempt(t *testing.T) {
+	body, err := migrationFiles.ReadFile("migrations/003_recovery_attempt_groups.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(body)
+	for _, required := range []string{
+		"ADD PRIMARY KEY (delivery_id)",
+		"CREATE TABLE relay_recovery_delivery_attempts",
+		"SELECT delivery_number,delivery_id,occurred_at,false,discovered_at",
+		"FOREIGN KEY (delivery_number,delivery_id)",
+		"DEFERRABLE INITIALLY DEFERRED",
+		"CHECK ((delivery_number IS NULL) = (occurred_at IS NULL))",
+		"provider_succeeded_at IS NULL",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Errorf("recovery attempt migration missing %q", required)
+		}
+	}
+}
+
+func TestRelaySchemaExcludesForbiddenProductAndSecretData(t *testing.T) {
+	for _, name := range migrationNames(t, migrationFiles, "migrations") {
+		body, err := migrationFiles.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lower := strings.ToLower(string(body))
+		for _, forbidden := range []string{"app_name", "application_name", "source_body", "archive_body", "compose", "configuration", "variable", "secret", "raw_webhook", "webhook_body", "user_token", "access_token", "refresh_token", "oauth_token"} {
+			if strings.Contains(lower, forbidden) {
+				t.Errorf("schema migration %s contains forbidden material %q", name, forbidden)
+			}
 		}
 	}
 }

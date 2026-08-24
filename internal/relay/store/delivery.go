@@ -36,6 +36,61 @@ type SourcePushResult struct {
 	Desired      []DesiredState
 }
 
+func (s *Store) PushIgnoredDelivery(ctx context.Context, deliveryID, reasonCode string, receivedAt time.Time) (bool, error) {
+	if !validUUID(deliveryID) || !validIgnoredReason(reasonCode) || !validTime(receivedAt) {
+		return false, ErrInvalid
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer rollback(ctx, tx)
+	now := s.now().UTC()
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, deliveryLockKey(deliveryID)); err != nil {
+		return false, err
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO relay_github_deliveries(delivery_id,delivery_kind,received_at,persisted_at) VALUES($1,'ignored',$2,$3) ON CONFLICT(delivery_id) DO NOTHING`, deliveryID, receivedAt.UTC(), now)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		var kind string
+		var storedReason sql.NullString
+		if err = tx.QueryRow(ctx, `SELECT d.delivery_kind,i.reason_code FROM relay_github_deliveries d LEFT JOIN relay_ignored_deliveries i ON i.delivery_id=d.delivery_id WHERE d.delivery_id=$1`, deliveryID).Scan(&kind, &storedReason); err != nil {
+			return false, err
+		}
+		if kind != "ignored" || !storedReason.Valid || storedReason.String != reasonCode {
+			return false, ErrConflict
+		}
+		if _, err = tx.Exec(ctx, `UPDATE relay_recovery_deliveries SET recovered_at=$2,next_attempt_at=NULL,last_error_code=NULL,claim_id=NULL,claim_expires_at=NULL WHERE delivery_id=$1 AND recovered_at IS NULL`, deliveryID, now); err != nil {
+			return false, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO relay_ignored_deliveries(delivery_id,reason_code,persisted_at) VALUES($1,$2,$3)`, deliveryID, reasonCode, now); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE relay_recovery_deliveries SET recovered_at=$2,next_attempt_at=NULL,last_error_code=NULL,claim_id=NULL,claim_expires_at=NULL WHERE delivery_id=$1 AND recovered_at IS NULL`, deliveryID, now); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func validIgnoredReason(reason string) bool {
+	switch reason {
+	case "push.deleted", "push.untracked_ref", "installation.unsupported_action", "installation_repositories.unsupported_action":
+		return true
+	default:
+		return false
+	}
+}
+
 // PushSourceEvent persists a complete fan-out in one transaction. A repeated
 // GitHub GUID is a no-op; it can never append or alter child targets.
 func (s *Store) PushSourceEvent(ctx context.Context, event SourceEvent, routes []SourceRoute) (SourcePushResult, error) {
@@ -61,11 +116,23 @@ func (s *Store) PushSourceEvent(ctx context.Context, event SourceEvent, routes [
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, routeLockKey(event.InstallationID, event.RepositoryID, event.Ref)); err != nil {
 		return SourcePushResult{}, err
 	}
+	// Global order is binding -> route -> delivery -> rows. Recovery takes only
+	// the delivery lock, closing the new-GUID inbound/discovery lost-update race.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, deliveryLockKey(event.DeliveryID)); err != nil {
+		return SourcePushResult{}, err
+	}
 	tag, err := tx.Exec(ctx, `INSERT INTO relay_github_deliveries(delivery_id,delivery_kind,received_at,persisted_at) VALUES($1,'source',$2,$3) ON CONFLICT(delivery_id) DO NOTHING`, event.DeliveryID, event.ReceivedAt.UTC(), now)
 	if err != nil {
 		return SourcePushResult{}, err
 	}
 	if tag.RowsAffected() == 0 {
+		var kind string
+		if err = tx.QueryRow(ctx, `SELECT delivery_kind FROM relay_github_deliveries WHERE delivery_id=$1`, event.DeliveryID).Scan(&kind); err != nil {
+			return SourcePushResult{}, err
+		}
+		if kind != "source" {
+			return SourcePushResult{}, ErrConflict
+		}
 		if _, err = tx.Exec(ctx, `UPDATE relay_recovery_deliveries SET recovered_at=$2,next_attempt_at=NULL,last_error_code=NULL,claim_id=NULL,claim_expires_at=NULL WHERE delivery_id=$1 AND recovered_at IS NULL`, event.DeliveryID, now); err != nil {
 			return SourcePushResult{}, err
 		}
@@ -161,44 +228,127 @@ type AccessRoute struct {
 }
 type AccessPushResult struct{ Deduplicated bool }
 
+type AccessEventBatchItem struct {
+	InstallationID int64
+	RepositoryID   int64
+	ChangeCode     string
+	ObservedAt     time.Time
+	RemoveAccess   bool
+	Routes         []AccessRoute
+}
+
+type AccessEventBatchInput struct {
+	DeliveryID string
+	ReceivedAt time.Time
+	Events     []AccessEventBatchItem
+}
+
 func (s *Store) PushAccessEvent(ctx context.Context, event AccessEventInput, routes []AccessRoute) (AccessPushResult, error) {
-	if !validUUID(event.DeliveryID) || event.InstallationID <= 0 || event.RepositoryID < 0 || !validCode(event.ChangeCode) || !validTime(event.ReceivedAt) || !validTime(event.ObservedAt) || len(routes) > 1000 {
+	return s.PushAccessEvents(ctx, AccessEventBatchInput{
+		DeliveryID: event.DeliveryID,
+		ReceivedAt: event.ReceivedAt,
+		Events:     []AccessEventBatchItem{{InstallationID: event.InstallationID, RepositoryID: event.RepositoryID, ChangeCode: event.ChangeCode, ObservedAt: event.ObservedAt, RemoveAccess: event.RemoveAccess, Routes: routes}},
+	})
+}
+
+func (s *Store) PushAccessEvents(ctx context.Context, batch AccessEventBatchInput) (AccessPushResult, error) {
+	if !validUUID(batch.DeliveryID) || !validTime(batch.ReceivedAt) || len(batch.Events) == 0 || len(batch.Events) > 1000 {
 		return AccessPushResult{}, ErrInvalid
 	}
-	controllerSet := map[string]struct{}{}
-	for _, route := range routes {
-		if !validUUID(route.EventID) || !validUUID(route.ControllerID) {
+	events := append([]AccessEventBatchItem(nil), batch.Events...)
+	targets := make(map[[2]int64]struct{}, len(events))
+	installationWide := make(map[int64]bool)
+	repositorySpecific := make(map[int64]bool)
+	eventIDs := make(map[string]struct{})
+	totalRoutes := 0
+	for i := range events {
+		events[i].Routes = append([]AccessRoute(nil), events[i].Routes...)
+		item := &events[i]
+		if item.InstallationID <= 0 || item.RepositoryID < 0 || !validCode(item.ChangeCode) || !validTime(item.ObservedAt) {
 			return AccessPushResult{}, ErrInvalid
 		}
-		if _, ok := controllerSet[route.ControllerID]; ok {
+		target := [2]int64{item.InstallationID, item.RepositoryID}
+		if _, exists := targets[target]; exists {
 			return AccessPushResult{}, ErrInvalid
 		}
-		controllerSet[route.ControllerID] = struct{}{}
+		targets[target] = struct{}{}
+		if item.RepositoryID == 0 {
+			installationWide[item.InstallationID] = true
+		} else {
+			repositorySpecific[item.InstallationID] = true
+		}
+		if installationWide[item.InstallationID] && repositorySpecific[item.InstallationID] {
+			return AccessPushResult{}, ErrInvalid
+		}
+		controllerSet := map[string]struct{}{}
+		for _, route := range item.Routes {
+			if !validUUID(route.EventID) || !validUUID(route.ControllerID) {
+				return AccessPushResult{}, ErrInvalid
+			}
+			if _, exists := controllerSet[route.ControllerID]; exists {
+				return AccessPushResult{}, ErrInvalid
+			}
+			if _, exists := eventIDs[route.EventID]; exists {
+				return AccessPushResult{}, ErrInvalid
+			}
+			controllerSet[route.ControllerID] = struct{}{}
+			eventIDs[route.EventID] = struct{}{}
+			totalRoutes++
+			if totalRoutes > 1000 {
+				return AccessPushResult{}, ErrInvalid
+			}
+		}
 	}
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].InstallationID != events[j].InstallationID {
+			return events[i].InstallationID < events[j].InstallationID
+		}
+		return events[i].RepositoryID < events[j].RepositoryID
+	})
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return AccessPushResult{}, err
 	}
 	defer rollback(ctx, tx)
 	now := s.now().UTC()
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, bindingLockKey(event.InstallationID)); err != nil {
+	bindingLocks := make(map[int64]struct{})
+	for _, item := range events {
+		bindingLocks[bindingLockKey(item.InstallationID)] = struct{}{}
+	}
+	if err = acquireAdvisoryLocks(ctx, tx, bindingLocks); err != nil {
 		return AccessPushResult{}, err
 	}
-	if event.RemoveAccess {
-		routeLocks, routeErr := queryRouteLockKeys(ctx, tx, `SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions WHERE installation_id=$1 AND ($2::bigint=0 OR repository_id=$2) AND retired_generation IS NULL`, event.InstallationID, event.RepositoryID)
-		if routeErr != nil {
-			return AccessPushResult{}, routeErr
-		}
-		if err = acquireAdvisoryLocks(ctx, tx, routeLocks); err != nil {
-			return AccessPushResult{}, err
+	routeLocks := make(map[int64]struct{})
+	for _, item := range events {
+		if item.RemoveAccess {
+			keys, routeErr := queryRouteLockKeys(ctx, tx, `SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions WHERE installation_id=$1 AND ($2::bigint=0 OR repository_id=$2) AND retired_generation IS NULL`, item.InstallationID, item.RepositoryID)
+			if routeErr != nil {
+				return AccessPushResult{}, routeErr
+			}
+			for key := range keys {
+				routeLocks[key] = struct{}{}
+			}
 		}
 	}
-	tag, err := tx.Exec(ctx, `INSERT INTO relay_github_deliveries(delivery_id,delivery_kind,received_at,persisted_at) VALUES($1,'access',$2,$3) ON CONFLICT(delivery_id) DO NOTHING`, event.DeliveryID, event.ReceivedAt.UTC(), now)
+	if err = acquireAdvisoryLocks(ctx, tx, routeLocks); err != nil {
+		return AccessPushResult{}, err
+	}
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, deliveryLockKey(batch.DeliveryID)); err != nil {
+		return AccessPushResult{}, err
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO relay_github_deliveries(delivery_id,delivery_kind,received_at,persisted_at) VALUES($1,'access',$2,$3) ON CONFLICT(delivery_id) DO NOTHING`, batch.DeliveryID, batch.ReceivedAt.UTC(), now)
 	if err != nil {
 		return AccessPushResult{}, err
 	}
 	if tag.RowsAffected() == 0 {
-		if _, err = tx.Exec(ctx, `UPDATE relay_recovery_deliveries SET recovered_at=$2,next_attempt_at=NULL,last_error_code=NULL,claim_id=NULL,claim_expires_at=NULL WHERE delivery_id=$1 AND recovered_at IS NULL`, event.DeliveryID, now); err != nil {
+		var kind string
+		if err = tx.QueryRow(ctx, `SELECT delivery_kind FROM relay_github_deliveries WHERE delivery_id=$1`, batch.DeliveryID).Scan(&kind); err != nil {
+			return AccessPushResult{}, err
+		}
+		if kind != "access" {
+			return AccessPushResult{}, ErrConflict
+		}
+		if _, err = tx.Exec(ctx, `UPDATE relay_recovery_deliveries SET recovered_at=$2,next_attempt_at=NULL,last_error_code=NULL,claim_id=NULL,claim_expires_at=NULL WHERE delivery_id=$1 AND recovered_at IS NULL`, batch.DeliveryID, now); err != nil {
 			return AccessPushResult{}, err
 		}
 		if err = tx.Commit(ctx); err != nil {
@@ -206,51 +356,53 @@ func (s *Store) PushAccessEvent(ctx context.Context, event AccessEventInput, rou
 		}
 		return AccessPushResult{Deduplicated: true}, nil
 	}
-	rows, err := tx.Query(ctx, `SELECT b.controller_id::text FROM relay_bindings b JOIN relay_controllers c ON c.controller_id=b.controller_id WHERE b.installation_id=$1 AND ($2::bigint=0 OR b.repository_id=$2) AND b.revoked_at IS NULL AND c.state='active' ORDER BY b.controller_id,b.repository_id FOR UPDATE OF b`, event.InstallationID, event.RepositoryID)
-	if err != nil {
-		return AccessPushResult{}, err
-	}
-	expected := map[string]struct{}{}
-	for rows.Next() {
-		var id string
-		if err = rows.Scan(&id); err != nil {
-			rows.Close()
-			return AccessPushResult{}, err
+	for _, item := range events {
+		rows, queryErr := tx.Query(ctx, `SELECT b.controller_id::text FROM relay_bindings b JOIN relay_controllers c ON c.controller_id=b.controller_id WHERE b.installation_id=$1 AND ($2::bigint=0 OR b.repository_id=$2) AND b.revoked_at IS NULL AND c.state='active' ORDER BY b.controller_id,b.repository_id FOR UPDATE OF b`, item.InstallationID, item.RepositoryID)
+		if queryErr != nil {
+			return AccessPushResult{}, queryErr
 		}
-		expected[id] = struct{}{}
-	}
-	rows.Close()
-	if rows.Err() != nil {
-		return AccessPushResult{}, rows.Err()
-	}
-	if len(expected) != len(controllerSet) {
-		return AccessPushResult{}, ErrConflict
-	}
-	for id := range expected {
-		if _, ok := controllerSet[id]; !ok {
+		expected := map[string]struct{}{}
+		for rows.Next() {
+			var id string
+			if err = rows.Scan(&id); err != nil {
+				rows.Close()
+				return AccessPushResult{}, err
+			}
+			expected[id] = struct{}{}
+		}
+		rows.Close()
+		if rows.Err() != nil {
+			return AccessPushResult{}, rows.Err()
+		}
+		if len(expected) != len(item.Routes) {
 			return AccessPushResult{}, ErrConflict
 		}
-	}
-	var repository any
-	if event.RepositoryID > 0 {
-		repository = event.RepositoryID
-	}
-	for _, route := range routes {
-		if _, err = tx.Exec(ctx, `INSERT INTO relay_access_events(event_id,delivery_id,controller_id,installation_id,repository_id,change_code,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, route.EventID, event.DeliveryID, route.ControllerID, event.InstallationID, repository, event.ChangeCode, event.ObservedAt.UTC()); err != nil {
-			return AccessPushResult{}, err
+		for _, route := range item.Routes {
+			if _, ok := expected[route.ControllerID]; !ok {
+				return AccessPushResult{}, ErrConflict
+			}
+		}
+		var repository any
+		if item.RepositoryID > 0 {
+			repository = item.RepositoryID
+		}
+		for _, route := range item.Routes {
+			if _, err = tx.Exec(ctx, `INSERT INTO relay_access_events(event_id,delivery_id,controller_id,installation_id,repository_id,change_code,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, route.EventID, batch.DeliveryID, route.ControllerID, item.InstallationID, repository, item.ChangeCode, item.ObservedAt.UTC()); err != nil {
+				return AccessPushResult{}, err
+			}
+		}
+		if item.RemoveAccess {
+			if item.RepositoryID > 0 {
+				_, err = tx.Exec(ctx, `UPDATE relay_bindings SET revoked_at=$3 WHERE installation_id=$1 AND repository_id=$2 AND revoked_at IS NULL`, item.InstallationID, item.RepositoryID, now)
+			} else {
+				_, err = tx.Exec(ctx, `UPDATE relay_bindings SET revoked_at=$2 WHERE installation_id=$1 AND revoked_at IS NULL`, item.InstallationID, now)
+			}
+			if err != nil {
+				return AccessPushResult{}, err
+			}
 		}
 	}
-	if event.RemoveAccess {
-		if event.RepositoryID > 0 {
-			_, err = tx.Exec(ctx, `UPDATE relay_bindings SET revoked_at=$3 WHERE installation_id=$1 AND repository_id=$2 AND revoked_at IS NULL`, event.InstallationID, event.RepositoryID, now)
-		} else {
-			_, err = tx.Exec(ctx, `UPDATE relay_bindings SET revoked_at=$2 WHERE installation_id=$1 AND revoked_at IS NULL`, event.InstallationID, now)
-		}
-		if err != nil {
-			return AccessPushResult{}, err
-		}
-	}
-	if _, err = tx.Exec(ctx, `UPDATE relay_recovery_deliveries SET recovered_at=$2,next_attempt_at=NULL,last_error_code=NULL,claim_id=NULL,claim_expires_at=NULL WHERE delivery_id=$1 AND recovered_at IS NULL`, event.DeliveryID, now); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE relay_recovery_deliveries SET recovered_at=$2,next_attempt_at=NULL,last_error_code=NULL,claim_id=NULL,claim_expires_at=NULL WHERE delivery_id=$1 AND recovered_at IS NULL`, batch.DeliveryID, now); err != nil {
 		return AccessPushResult{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
