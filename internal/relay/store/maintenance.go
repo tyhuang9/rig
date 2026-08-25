@@ -12,6 +12,8 @@ const (
 	MinimumSubscriptionSetRetention = time.Hour
 	MinimumDeliveryHistoryRetention = 24 * time.Hour
 	MaximumMaintenanceBatch         = 1000
+	MaximumActiveEnrollments        = 256
+	EnrollmentTerminalRetention     = 7 * 24 * time.Hour
 )
 
 // DurableRetentionPolicy defines the minimum durable replay and diagnostic
@@ -54,10 +56,11 @@ type DurablePruneResult struct {
 	RotationReferences    int64
 	ExpiredSessions       int64
 	ExpiredChallenges     int64
+	TerminalEnrollments   int64
 }
 
 func (r DurablePruneResult) Total() int64 {
-	return r.SubscriptionSetItems + r.SourceDeliveryTargets + r.RetiredDesiredStates + r.RetiredSubscriptions + r.TerminalAccessEvents + r.IgnoredDeliveries + r.RecoveryAttempts + r.RecoveryDeliveries + r.OrphanDeliveries + r.ExpiredLeases + r.SessionCommands + r.SessionMessages + r.RotationReferences + r.ExpiredSessions + r.ExpiredChallenges
+	return r.SubscriptionSetItems + r.SourceDeliveryTargets + r.RetiredDesiredStates + r.RetiredSubscriptions + r.TerminalAccessEvents + r.IgnoredDeliveries + r.RecoveryAttempts + r.RecoveryDeliveries + r.OrphanDeliveries + r.ExpiredLeases + r.SessionCommands + r.SessionMessages + r.RotationReferences + r.ExpiredSessions + r.ExpiredChallenges + r.TerminalEnrollments
 }
 
 // PruneDurableState removes only bounded, unreachable history. It preserves
@@ -75,6 +78,7 @@ func (s *Store) PruneDurableState(ctx context.Context, policy DurableRetentionPo
 	sessionBefore := now.Add(-policy.ExpiredSessionRetention)
 	setBefore := now.Add(-policy.SubscriptionSetRetention)
 	historyBefore := now.Add(-policy.DeliveryHistoryRetention)
+	enrollmentBefore := now.Add(-EnrollmentTerminalRetention)
 	var result DurablePruneResult
 
 	queries := []struct {
@@ -82,6 +86,15 @@ func (s *Store) PruneDurableState(ctx context.Context, policy DurableRetentionPo
 		query       string
 		args        []any
 	}{
+		{
+			&result.TerminalEnrollments,
+			// Enrollment polling is guaranteed for its live lifetime. Terminal
+			// records are retained for at least seven additional days and are
+			// deleted in bounded 1000-row maintenance batches only after both
+			// expires_at and completed_at are safely in the past.
+			`WITH candidates AS (SELECT e.enrollment_id FROM relay_enrollments e WHERE e.status IN ('authorized','failed','expired') AND e.expires_at<$1 AND e.completed_at<$2 ORDER BY e.completed_at,e.enrollment_id LIMIT $3 FOR UPDATE OF e SKIP LOCKED) DELETE FROM relay_enrollments e USING candidates c WHERE e.enrollment_id=c.enrollment_id`,
+			[]any{now, enrollmentBefore, MaximumMaintenanceBatch},
+		},
 		{
 			&result.SourceDeliveryTargets,
 			`WITH candidates AS (SELECT t.delivery_id,t.subscription_id FROM relay_source_delivery_targets t JOIN relay_subscriptions s ON s.subscription_id=t.subscription_id WHERE t.persisted_at<$1 AND ((s.retired_generation IS NOT NULL AND s.retired_at<$1) OR NOT EXISTS(SELECT 1 FROM relay_desired_states d WHERE d.subscription_id=t.subscription_id AND d.generation=t.generation AND d.decision IS NULL)) ORDER BY t.persisted_at,t.delivery_id,t.subscription_id LIMIT $2 FOR UPDATE OF t SKIP LOCKED) DELETE FROM relay_source_delivery_targets t USING candidates c WHERE t.delivery_id=c.delivery_id AND t.subscription_id=c.subscription_id`,

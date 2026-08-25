@@ -78,6 +78,7 @@ type Service struct {
 	webhookSecret      []byte
 	enrollmentKey      []byte
 	recoveryWindow     time.Duration
+	enrollmentLimiter  *enrollmentLimiter
 }
 
 func New(options Options) (*Service, error) {
@@ -95,6 +96,12 @@ func New(options Options) (*Service, error) {
 	if options.ProviderTimeout < time.Second || options.ProviderTimeout > time.Minute {
 		return nil, ErrInvalidOptions
 	}
+	limiterKey := make([]byte, 32)
+	if _, err := io.ReadFull(options.Random, limiterKey); err != nil {
+		clear(limiterKey)
+		return nil, ErrInvalidOptions
+	}
+	defer clear(limiterKey)
 	base := *options.PublicBaseURL
 	return &Service{
 		http: &http.Client{
@@ -113,6 +120,7 @@ func New(options Options) (*Service, error) {
 		webhookSecret:      append([]byte(nil), options.WebhookSecret...),
 		enrollmentKey:      append([]byte(nil), options.EnrollmentKey...),
 		recoveryWindow:     options.RecoveryWindow,
+		enrollmentLimiter:  newEnrollmentLimiter(limiterKey, options.Now().UTC()),
 	}, nil
 }
 
@@ -149,5 +157,8 @@ func (s *Service) Close() {
 	clear(s.githubClientSecret)
 	clear(s.webhookSecret)
 	clear(s.enrollmentKey)
+	if s.enrollmentLimiter != nil {
+		s.enrollmentLimiter.Close()
+	}
 	s.http.CloseIdleConnections()
 }

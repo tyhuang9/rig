@@ -62,6 +62,14 @@ func (s *Service) handleStartEnrollment(w http.ResponseWriter, request *http.Req
 		writeProblem(w, http.StatusMethodNotAllowed, "request.method")
 		return
 	}
+	// Rate limiting intentionally derives identity only from the peer address.
+	// Forwarded and X-Forwarded-* headers are always untrusted. Production
+	// transport is TLS and loopback development uses the direct peer address.
+	if s.enrollmentLimiter == nil || !s.enrollmentLimiter.Allow(request.RemoteAddr, s.now().UTC()) {
+		w.Header().Set("Retry-After", "30")
+		writeProblem(w, http.StatusTooManyRequests, "enrollment.rate_limited")
+		return
+	}
 	var input startEnrollmentRequest
 	if err := decodeStrictRequest(request, maxEnrollmentBody, &input); err != nil {
 		writeProblem(w, http.StatusBadRequest, "request.invalid")
@@ -147,6 +155,9 @@ func (s *Service) handleStartEnrollment(w http.ResponseWriter, request *http.Req
 		status := http.StatusServiceUnavailable
 		if errors.Is(err, store.ErrReplay) {
 			code, status = "proof.replay", http.StatusConflict
+		} else if errors.Is(err, store.ErrCapacity) {
+			w.Header().Set("Retry-After", "30")
+			code, status = "enrollment.rate_limited", http.StatusTooManyRequests
 		}
 		writeProblem(w, status, code)
 		return

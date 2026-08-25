@@ -65,12 +65,43 @@ func (s *Store) CreateEnrollment(ctx context.Context, input EnrollmentInput) (st
 	if id == "" {
 		id = s.newUUID().String()
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO relay_enrollments(enrollment_id,controller_id,key_id,public_key,installation_id,repository_id,state_hash,poll_hash,pkce_ciphertext,pkce_seal_nonce,request_nonce,status,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12,$13)`, id, input.ControllerID, input.KeyID, input.PublicKey, input.InstallationID, input.RepositoryID, input.StateHash, input.PollHash, input.PKCECiphertext, input.PKCESealNonce, input.RequestNonce, now, input.ExpiresAt.UTC())
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("create enrollment: %w", err)
+	}
+	defer rollback(ctx, tx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, enrollmentCapacityLock); err != nil {
+		return "", fmt.Errorf("create enrollment: %w", err)
+	}
+	// Expiration, replay classification, capacity check, and insertion share
+	// one authoritative transaction. Replay deliberately precedes capacity so
+	// load cannot change the externally stable classification of a signed replay.
+	if _, err = tx.Exec(ctx, `UPDATE relay_enrollments SET status='expired',completed_at=$1,pkce_ciphertext=NULL,pkce_seal_nonce=NULL WHERE status IN ('pending','state_claimed') AND expires_at<=$1`, now); err != nil {
+		return "", fmt.Errorf("create enrollment: %w", err)
+	}
+	var replay bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM relay_enrollments WHERE controller_id=$1 AND key_id=$2 AND request_nonce=$3)`, input.ControllerID, input.KeyID, input.RequestNonce).Scan(&replay); err != nil {
+		return "", fmt.Errorf("create enrollment: %w", err)
+	}
+	if replay {
+		return "", ErrReplay
+	}
+	var active int
+	if err = tx.QueryRow(ctx, `SELECT count(*) FROM relay_enrollments WHERE status IN ('pending','state_claimed') AND expires_at>$1`, now).Scan(&active); err != nil {
+		return "", fmt.Errorf("create enrollment: %w", err)
+	}
+	if active >= MaximumActiveEnrollments {
+		return "", ErrCapacity
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO relay_enrollments(enrollment_id,controller_id,key_id,public_key,installation_id,repository_id,state_hash,poll_hash,pkce_ciphertext,pkce_seal_nonce,request_nonce,status,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12,$13)`, id, input.ControllerID, input.KeyID, input.PublicKey, input.InstallationID, input.RepositoryID, input.StateHash, input.PollHash, input.PKCECiphertext, input.PKCESealNonce, input.RequestNonce, now, input.ExpiresAt.UTC())
 	if err != nil {
 		var databaseError *pgconn.PgError
 		if errors.As(err, &databaseError) && databaseError.Code == "23505" && databaseError.ConstraintName == "relay_enrollment_request_replay" {
 			return "", ErrReplay
 		}
+		return "", fmt.Errorf("create enrollment: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
 		return "", fmt.Errorf("create enrollment: %w", err)
 	}
 	return id, nil

@@ -350,18 +350,27 @@ func TestCreateEnrollmentClassifiesOnlyExactSignedRequestReplay(t *testing.T) {
 		name          string
 		databaseError error
 		want          error
+		replay        bool
 	}{
-		{name: "signed request replay", databaseError: &pgconn.PgError{Code: "23505", ConstraintName: "relay_enrollment_request_replay"}, want: ErrReplay},
+		{name: "signed request replay", want: ErrReplay, replay: true},
 		{name: "unrelated unique violation", databaseError: &pgconn.PgError{Code: "23505", ConstraintName: "relay_enrollments_state_hash_key"}},
 		{name: "database outage", databaseError: errors.New("database unavailable")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			s, m := mockStore(t)
-			m.ExpectExec("INSERT INTO relay_enrollments").WithArgs(
-				pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-				pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-				pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-			).WillReturnError(test.databaseError)
+			m.ExpectBegin()
+			m.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(enrollmentCapacityLock).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+			m.ExpectExec("UPDATE relay_enrollments SET status='expired'").WithArgs(fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+			m.ExpectQuery("SELECT EXISTS").WithArgs(input.ControllerID, input.KeyID, input.RequestNonce).WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(test.replay))
+			if !test.replay {
+				m.ExpectQuery("SELECT count").WithArgs(fixedNow).WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(0))
+				m.ExpectExec("INSERT INTO relay_enrollments").WithArgs(
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+				).WillReturnError(test.databaseError)
+			}
+			m.ExpectRollback()
 			_, err := s.CreateEnrollment(context.Background(), input)
 			if test.want != nil {
 				if !errors.Is(err, test.want) {

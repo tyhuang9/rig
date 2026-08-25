@@ -25,8 +25,11 @@ var (
 	ErrConflict = errors.New("relay store conflict")
 	ErrExpired  = errors.New("relay store record expired")
 	ErrReplay   = errors.New("relay store replay detected")
+	ErrCapacity = errors.New("relay store capacity reached")
 	codePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 )
+
+const enrollmentCapacityLock int64 = 0x524947454e524f4c
 
 type Options struct {
 	Now         func() time.Time

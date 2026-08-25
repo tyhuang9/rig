@@ -19,11 +19,13 @@ func TestPruneDurableStateUsesBoundedForeignKeySafeOrder(t *testing.T) {
 	historyBefore := fixedNow.Add(-policy.DeliveryHistoryRetention)
 	sessionBefore := fixedNow.Add(-policy.ExpiredSessionRetention)
 	commandBefore := fixedNow.Add(-policy.CommandReplayRetention)
+	enrollmentBefore := fixedNow.Add(-EnrollmentTerminalRetention)
 	expectOperation := func(pattern string, count int64, args ...any) {
 		m.ExpectBegin()
 		m.ExpectExec(pattern).WithArgs(args...).WillReturnResult(pgxmock.NewResult("DELETE", count))
 		m.ExpectCommit()
 	}
+	expectOperation("WITH candidates AS \\(SELECT e.enrollment_id", 16, fixedNow, enrollmentBefore, MaximumMaintenanceBatch)
 	expectOperation("WITH candidates AS \\(SELECT t.delivery_id,t.subscription_id", 1, historyBefore, policy.BatchSize)
 	expectOperation("WITH candidates AS \\(SELECT d.subscription_id", 2, historyBefore, policy.BatchSize)
 	expectOperation("WITH candidates AS \\(SELECT i.controller_id", 3, setBefore, policy.BatchSize)
@@ -54,7 +56,7 @@ func TestPruneDurableStateUsesBoundedForeignKeySafeOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.SourceDeliveryTargets != 1 || result.RetiredDesiredStates != 2 || result.SubscriptionSetItems != 3 || result.RetiredSubscriptions != 4 || result.TerminalAccessEvents != 5 || result.IgnoredDeliveries != 6 || result.RecoveryAttempts != 7 || result.RecoveryDeliveries != 8 || result.OrphanDeliveries != 9 || result.ExpiredLeases != 10 || result.SessionCommands != 11 || result.SessionMessages != 12 || result.RotationReferences != 13 || result.ExpiredSessions != 14 || result.ExpiredChallenges != 15 || result.Total() != 120 {
+	if result.TerminalEnrollments != 16 || result.SourceDeliveryTargets != 1 || result.RetiredDesiredStates != 2 || result.SubscriptionSetItems != 3 || result.RetiredSubscriptions != 4 || result.TerminalAccessEvents != 5 || result.IgnoredDeliveries != 6 || result.RecoveryAttempts != 7 || result.RecoveryDeliveries != 8 || result.OrphanDeliveries != 9 || result.ExpiredLeases != 10 || result.SessionCommands != 11 || result.SessionMessages != 12 || result.RotationReferences != 13 || result.ExpiredSessions != 14 || result.ExpiredChallenges != 15 || result.Total() != 136 {
 		t.Fatalf("result=%+v total=%d", result, result.Total())
 	}
 	if err = m.ExpectationsWereMet(); err != nil {
@@ -67,13 +69,16 @@ func TestPruneDurableStateReturnsCommittedPartialProgressOnFailure(t *testing.T)
 	policy := DefaultDurableRetentionPolicy()
 	outage := errors.New("maintenance unavailable")
 	m.ExpectBegin()
+	m.ExpectExec("WITH candidates AS \\(SELECT e.enrollment_id").WithArgs(fixedNow, fixedNow.Add(-EnrollmentTerminalRetention), MaximumMaintenanceBatch).WillReturnResult(pgxmock.NewResult("DELETE", 2))
+	m.ExpectCommit()
+	m.ExpectBegin()
 	m.ExpectExec("WITH candidates AS \\(SELECT t.delivery_id,t.subscription_id").WithArgs(fixedNow.Add(-policy.DeliveryHistoryRetention), policy.BatchSize).WillReturnResult(pgxmock.NewResult("DELETE", 4))
 	m.ExpectCommit()
 	m.ExpectBegin()
 	m.ExpectExec("WITH candidates AS \\(SELECT d.subscription_id").WithArgs(fixedNow.Add(-policy.DeliveryHistoryRetention), policy.BatchSize).WillReturnError(outage)
 	m.ExpectRollback()
 	result, err := s.PruneDurableState(context.Background(), policy)
-	if !errors.Is(err, outage) || result.SourceDeliveryTargets != 4 || result.Total() != 4 {
+	if !errors.Is(err, outage) || result.TerminalEnrollments != 2 || result.SourceDeliveryTargets != 4 || result.Total() != 6 {
 		t.Fatalf("result=%+v error=%v", result, err)
 	}
 	if err = m.ExpectationsWereMet(); err != nil {

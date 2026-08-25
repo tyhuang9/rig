@@ -243,7 +243,7 @@ func TestTopologyShardCollisionUsesOneGlobalFirstLockAcrossEveryPath(t *testing.
 }
 
 func TestTopologyAdvisoryLockInventoryIsConstant(t *testing.T) {
-	allowed := []string{"deliveryLockKey(", "sessionCommandLockKey(", "controllerSessionLockKey(", "recoveryScanClaimLock", "migrationAdvisoryLock"}
+	allowed := []string{"deliveryLockKey(", "sessionCommandLockKey(", "controllerSessionLockKey(", "recoveryScanClaimLock", "migrationAdvisoryLock", "enrollmentCapacityLock"}
 	err := filepath.Walk(".", func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
