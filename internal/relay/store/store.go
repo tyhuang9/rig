@@ -109,52 +109,136 @@ func validUUID(value string) bool {
 func validCode(value string) bool    { return codePattern.MatchString(value) }
 func validTime(value time.Time) bool { return !value.IsZero() }
 func validateHash(value []byte) bool { return len(value) == 32 }
-func subscriptionLockKey(id string) int64 {
-	parsed := uuid.MustParse(id)
-	b := parsed[:]
-	return int64(uint64(b[0])<<56 | uint64(b[1])<<48 | uint64(b[2])<<40 | uint64(b[3])<<32 | uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7]))
-}
-func routeLockKey(installationID, repositoryID int64, ref string) int64 {
-	digest := sha256.Sum256([]byte(fmt.Sprintf("rig.relay.route.v1\x00%d\x00%d\x00%s", installationID, repositoryID, ref)))
-	return int64(binary.BigEndian.Uint64(digest[:8]))
-}
-func bindingLockKey(installationID int64) int64 {
-	digest := sha256.Sum256([]byte(fmt.Sprintf("rig.relay.binding.v1\x00%d", installationID)))
-	return int64(binary.BigEndian.Uint64(digest[:8]))
-}
 func deliveryLockKey(deliveryID string) int64 {
 	digest := sha256.Sum256([]byte("rig.relay.delivery.v1\x00" + deliveryID))
 	return int64(binary.BigEndian.Uint64(digest[:8]))
 }
-func acquireAdvisoryLocks(ctx context.Context, tx pgx.Tx, keys map[int64]struct{}) error {
-	ordered := make([]int64, 0, len(keys))
-	for key := range keys {
-		ordered = append(ordered, key)
+
+const topologyShardCount = 64
+
+type routeTopologyKey struct {
+	installationID int64
+	repositoryID   int64
+	ref            string
+}
+
+type topologyLockSet struct {
+	bindings      map[int64]struct{}
+	routes        map[routeTopologyKey]struct{}
+	subscriptions map[string]struct{}
+}
+
+func newTopologyLockSet() topologyLockSet {
+	return topologyLockSet{bindings: make(map[int64]struct{}), routes: make(map[routeTopologyKey]struct{}), subscriptions: make(map[string]struct{})}
+}
+
+func (locks *topologyLockSet) addBinding(installationID int64) {
+	locks.bindings[installationID] = struct{}{}
+}
+
+func (locks *topologyLockSet) addRoute(installationID, repositoryID int64, ref string) {
+	locks.routes[routeTopologyKey{installationID: installationID, repositoryID: repositoryID, ref: ref}] = struct{}{}
+}
+
+func (locks *topologyLockSet) addRoutes(routes map[routeTopologyKey]struct{}) {
+	for route := range routes {
+		locks.routes[route] = struct{}{}
+	}
+}
+
+func (locks *topologyLockSet) addSubscription(subscriptionID string) {
+	locks.subscriptions[subscriptionID] = struct{}{}
+}
+
+func bindingTopologyShard(installationID int64) int16 {
+	digest := sha256.Sum256([]byte(fmt.Sprintf("rig.relay.topology.binding.v1\x00%d", installationID)))
+	return int16(binary.BigEndian.Uint64(digest[:8]) % topologyShardCount)
+}
+
+func routeTopologyShard(installationID, repositoryID int64, ref string) int16 {
+	digest := sha256.Sum256([]byte(fmt.Sprintf("rig.relay.topology.route.v1\x00%d\x00%d\x00%s", installationID, repositoryID, ref)))
+	return int16(binary.BigEndian.Uint64(digest[:8]) % topologyShardCount)
+}
+
+func subscriptionTopologyShard(subscriptionID string) int16 {
+	digest := sha256.Sum256([]byte("rig.relay.topology.subscription.v1\x00" + subscriptionID))
+	return int16(binary.BigEndian.Uint64(digest[:8]) % topologyShardCount)
+}
+
+func (locks topologyLockSet) shardIDs() []int16 {
+	shards := make(map[int16]struct{}, len(locks.bindings)+len(locks.routes)+len(locks.subscriptions))
+	for installationID := range locks.bindings {
+		shards[bindingTopologyShard(installationID)] = struct{}{}
+	}
+	for route := range locks.routes {
+		shards[routeTopologyShard(route.installationID, route.repositoryID, route.ref)] = struct{}{}
+	}
+	for subscriptionID := range locks.subscriptions {
+		shards[subscriptionTopologyShard(subscriptionID)] = struct{}{}
+	}
+	ordered := make([]int16, 0, len(shards))
+	for shard := range shards {
+		ordered = append(ordered, shard)
 	}
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
-	for _, key := range ordered {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, key); err != nil {
+	return ordered
+}
+
+func acquireTopologyLocks(ctx context.Context, tx pgx.Tx, locks topologyLockSet) error {
+	shards := locks.shardIDs()
+	if len(shards) == 0 {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `SELECT shard_id FROM relay_topology_lock_shards WHERE shard_id=ANY($1::smallint[]) ORDER BY shard_id FOR UPDATE`, shards)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	matched := 0
+	for rows.Next() {
+		var shard int16
+		if err = rows.Scan(&shard); err != nil {
 			return err
 		}
+		if matched >= len(shards) || shard != shards[matched] {
+			return ErrConflict
+		}
+		matched++
+	}
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	if matched != len(shards) {
+		return ErrConflict
 	}
 	return nil
 }
-func queryRouteLockKeys(ctx context.Context, tx pgx.Tx, query string, args ...any) (map[int64]struct{}, error) {
+
+func queryRouteTopologyKeys(ctx context.Context, tx pgx.Tx, query string, args ...any) (map[routeTopologyKey]struct{}, error) {
 	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	keys := make(map[int64]struct{})
+	keys := make(map[routeTopologyKey]struct{})
 	for rows.Next() {
 		var installationID, repositoryID int64
 		var ref string
 		if err = rows.Scan(&installationID, &repositoryID, &ref); err != nil {
 			return nil, err
 		}
-		keys[routeLockKey(installationID, repositoryID, ref)] = struct{}{}
+		keys[routeTopologyKey{installationID: installationID, repositoryID: repositoryID, ref: ref}] = struct{}{}
 	}
 	return keys, rows.Err()
+}
+
+func topologyRoutesCovered(locked topologyLockSet, current map[routeTopologyKey]struct{}) bool {
+	for route := range current {
+		if _, ok := locked.routes[route]; !ok {
+			return false
+		}
+	}
+	return true
 }
 func validateRefSHA(ref, sha string) error {
 	if err := protocol.ValidRef(ref); err != nil {

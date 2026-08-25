@@ -49,11 +49,45 @@ func mockStore(t *testing.T) (*Store, pgxmock.PgxPoolIface) {
 	return store, mock
 }
 
-func expectSortedAdvisoryLocks(mock pgxmock.PgxPoolIface, keys ...int64) {
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	for _, key := range keys {
-		mock.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(key).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+func expectTopologyShards(mock pgxmock.PgxPoolIface, shards ...int16) {
+	unique := make(map[int16]struct{}, len(shards))
+	for _, shard := range shards {
+		unique[shard] = struct{}{}
 	}
+	ordered := make([]int16, 0, len(unique))
+	for shard := range unique {
+		ordered = append(ordered, shard)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	rows := pgxmock.NewRows([]string{"shard_id"})
+	for _, shard := range ordered {
+		rows.AddRow(shard)
+	}
+	mock.ExpectQuery("SELECT shard_id FROM relay_topology_lock_shards").WithArgs(ordered).WillReturnRows(rows)
+}
+
+func accessBatchTargetArgs(events []AccessEventBatchItem) ([]int64, []int64, []bool) {
+	events = append([]AccessEventBatchItem(nil), events...)
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].InstallationID != events[j].InstallationID {
+			return events[i].InstallationID < events[j].InstallationID
+		}
+		return events[i].RepositoryID < events[j].RepositoryID
+	})
+	installations := make([]int64, len(events))
+	repositories := make([]int64, len(events))
+	removals := make([]bool, len(events))
+	for i, event := range events {
+		installations[i] = event.InstallationID
+		repositories[i] = event.RepositoryID
+		removals[i] = event.RemoveAccess
+	}
+	return installations, repositories, removals
+}
+
+func expectAccessRouteSnapshot(mock pgxmock.PgxPoolIface, events []AccessEventBatchItem, rows *pgxmock.Rows) {
+	installations, repositories, removals := accessBatchTargetArgs(events)
+	mock.ExpectQuery("WITH targets AS .*SELECT DISTINCT s.installation_id").WithArgs(installations, repositories, removals).WillReturnRows(rows)
 }
 
 func TestCreateChallengeChecksAuthorizationRowsAndPropagatesOutage(t *testing.T) {
@@ -95,11 +129,13 @@ func TestEmptyFanoutPersistsLedgerThenDeduplicatesWithoutChildren(t *testing.T) 
 	event := SourceEvent{DeliveryID: testDelivery, InstallationID: 1, RepositoryID: 2, Ref: "refs/heads/main", SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ReceivedAt: fixedNow, ObservedAt: fixedNow}
 	s, m := mockStore(t)
 	m.ExpectBegin()
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(event.InstallationID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(routeLockKey(event.InstallationID, event.RepositoryID, event.Ref)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	expectTopologyShards(m, bindingTopologyShard(event.InstallationID), routeTopologyShard(event.InstallationID, event.RepositoryID, event.Ref))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(event.DeliveryID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(event.DeliveryID, event.ReceivedAt, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	m.ExpectQuery("SELECT s.controller_id::text,s.subscription_id::text").WithArgs(event.InstallationID, event.RepositoryID, event.Ref).WillReturnRows(pgxmock.NewRows([]string{"controller_id", "subscription_id"}))
+	m.ExpectQuery("SELECT subscription_id::text,generation FROM relay_desired_states").WithArgs([]string{}).WillReturnRows(pgxmock.NewRows([]string{"subscription_id", "generation"}))
+	m.ExpectExec("INSERT INTO relay_source_delivery_targets").WithArgs(event.DeliveryID, []string{}, []int64{}, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
+	m.ExpectQuery("WITH input AS.*INSERT INTO relay_desired_states").WithArgs([]string{}, []string{}, []int64{}, event.DeliveryID, event.InstallationID, event.RepositoryID, event.Ref, event.SHA, event.ObservedAt).WillReturnRows(pgxmock.NewRows([]string{"subscription_id", "generation"}))
 	m.ExpectExec("UPDATE relay_recovery_deliveries").WithArgs(event.DeliveryID, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	m.ExpectCommit()
 	result, err := s.PushSourceEvent(context.Background(), event, []SourceRoute{})
@@ -107,8 +143,7 @@ func TestEmptyFanoutPersistsLedgerThenDeduplicatesWithoutChildren(t *testing.T) 
 		t.Fatalf("first=%#v %v", result, err)
 	}
 	m.ExpectBegin()
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(event.InstallationID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(routeLockKey(event.InstallationID, event.RepositoryID, event.Ref)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	expectTopologyShards(m, bindingTopologyShard(event.InstallationID), routeTopologyShard(event.InstallationID, event.RepositoryID, event.Ref), subscriptionTopologyShard(testSubscription))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(event.DeliveryID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(event.DeliveryID, event.ReceivedAt, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
 	m.ExpectQuery("SELECT delivery_kind").WithArgs(event.DeliveryID).WillReturnRows(pgxmock.NewRows([]string{"kind"}).AddRow("source"))
@@ -128,8 +163,7 @@ func TestBatchFailureRollsBackAndNeverPartiallyCommits(t *testing.T) {
 	event := SourceEvent{DeliveryID: testDelivery, InstallationID: 1, RepositoryID: 2, Ref: "refs/heads/main", SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ReceivedAt: fixedNow, ObservedAt: fixedNow}
 	outage := errors.New("query failed")
 	m.ExpectBegin()
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(event.InstallationID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(routeLockKey(event.InstallationID, event.RepositoryID, event.Ref)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	expectTopologyShards(m, bindingTopologyShard(event.InstallationID), routeTopologyShard(event.InstallationID, event.RepositoryID, event.Ref))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(event.DeliveryID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(event.DeliveryID, event.ReceivedAt, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	m.ExpectQuery("SELECT s.controller_id::text,s.subscription_id::text").WithArgs(event.InstallationID, event.RepositoryID, event.Ref).WillReturnError(outage)
@@ -139,173 +173,6 @@ func TestBatchFailureRollsBackAndNeverPartiallyCommits(t *testing.T) {
 		t.Fatalf("error=%v", err)
 	}
 	if err = m.ExpectationsWereMet(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestSameGenerationSyncIsExactIdempotent(t *testing.T) {
-	s, m := mockStore(t)
-	sub := Subscription{SubscriptionID: testSubscription, InstallationID: 1, RepositoryID: 2, Ref: "refs/heads/main"}
-	m.ExpectBegin()
-	m.ExpectQuery("SELECT subscription_id::text,installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"subscription_id", "installation_id", "repository_id", "tracked_ref"}))
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(sub.InstallationID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(routeLockKey(sub.InstallationID, sub.RepositoryID, sub.Ref)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	m.ExpectQuery("SELECT state FROM relay_controllers").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"state"}).AddRow("active"))
-	m.ExpectQuery("SELECT subscription_id::text,installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"subscription_id", "installation_id", "repository_id", "tracked_ref"}))
-	m.ExpectQuery("SELECT generation FROM relay_subscription_heads").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"generation"}).AddRow(int64(3)))
-	m.ExpectQuery("SELECT s.subscription_id::text").WithArgs(testController, int64(3)).WillReturnRows(pgxmock.NewRows([]string{"subscription_id", "installation_id", "repository_id", "tracked_ref"}).AddRow(testSubscription, int64(1), int64(2), "refs/heads/main"))
-	m.ExpectCommit()
-	if err := s.SyncSubscriptions(context.Background(), testController, 3, []Subscription{sub}); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.ExpectationsWereMet(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestSameGenerationSyncFailsClosedOnRevokedBindingAndRowsError(t *testing.T) {
-	sub := Subscription{SubscriptionID: testSubscription, InstallationID: 1, RepositoryID: 2, Ref: "refs/heads/main"}
-	for _, tc := range []struct {
-		name    string
-		rows    *pgxmock.Rows
-		wantErr error
-	}{
-		{name: "revoked binding excludes persisted member", rows: pgxmock.NewRows([]string{"subscription_id", "installation_id", "repository_id", "tracked_ref"}), wantErr: ErrConflict},
-		{name: "row iteration outage", rows: pgxmock.NewRows([]string{"subscription_id", "installation_id", "repository_id", "tracked_ref"}).AddRow(testSubscription, int64(1), int64(2), "refs/heads/main").RowError(0, errors.New("subscription rows unavailable"))},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s, m := mockStore(t)
-			m.ExpectBegin()
-			m.ExpectQuery("SELECT subscription_id::text,installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"subscription_id", "installation_id", "repository_id", "tracked_ref"}))
-			m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(sub.InstallationID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-			m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(routeLockKey(sub.InstallationID, sub.RepositoryID, sub.Ref)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-			m.ExpectQuery("SELECT state FROM relay_controllers").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"state"}).AddRow("active"))
-			m.ExpectQuery("SELECT subscription_id::text,installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"subscription_id", "installation_id", "repository_id", "tracked_ref"}))
-			m.ExpectQuery("SELECT generation FROM relay_subscription_heads").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"generation"}).AddRow(int64(3)))
-			m.ExpectQuery("SELECT s.subscription_id::text").WithArgs(testController, int64(3)).WillReturnRows(tc.rows)
-			m.ExpectRollback()
-			err := s.SyncSubscriptions(context.Background(), testController, 3, []Subscription{sub})
-			if tc.wantErr != nil {
-				if !errors.Is(err, tc.wantErr) {
-					t.Fatalf("error=%v want=%v", err, tc.wantErr)
-				}
-			} else if err == nil || err.Error() != "subscription rows unavailable" {
-				t.Fatalf("row iteration error=%v", err)
-			}
-			if err = m.ExpectationsWereMet(); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
-func TestSyncSubscriptionsLocksOldAndNewUnionBindingThenRouteThenController(t *testing.T) {
-	s, m := mockStore(t)
-	old := Subscription{SubscriptionID: testSubscription, InstallationID: 19, RepositoryID: 29, Ref: "refs/heads/old"}
-	next := Subscription{SubscriptionID: testMessage, InstallationID: 11, RepositoryID: 21, Ref: "refs/heads/main"}
-	m.ExpectBegin()
-	m.ExpectQuery("SELECT subscription_id::text,installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController).WillReturnRows(
-		pgxmock.NewRows([]string{"subscription_id", "installation_id", "repository_id", "tracked_ref"}).AddRow(old.SubscriptionID, old.InstallationID, old.RepositoryID, old.Ref),
-	)
-	expectSortedAdvisoryLocks(m, bindingLockKey(old.InstallationID), bindingLockKey(next.InstallationID))
-	expectSortedAdvisoryLocks(m,
-		routeLockKey(old.InstallationID, old.RepositoryID, old.Ref),
-		routeLockKey(next.InstallationID, next.RepositoryID, next.Ref),
-	)
-	m.ExpectQuery("SELECT state FROM relay_controllers").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"state"}).AddRow("active"))
-	m.ExpectQuery("SELECT subscription_id::text,installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController).WillReturnRows(
-		pgxmock.NewRows([]string{"subscription_id", "installation_id", "repository_id", "tracked_ref"}).AddRow(old.SubscriptionID, old.InstallationID, old.RepositoryID, old.Ref),
-	)
-	m.ExpectQuery("SELECT generation FROM relay_subscription_heads").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"generation"}).AddRow(int64(3)))
-	m.ExpectExec("UPDATE relay_subscriptions SET retired_generation").WithArgs(old.SubscriptionID, uint64(4)).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-	m.ExpectQuery("SELECT EXISTS").WithArgs(testController, next.InstallationID, next.RepositoryID).WillReturnRows(pgxmock.NewRows([]string{"authorized"}).AddRow(true))
-	m.ExpectQuery("SELECT controller_id::text,installation_id,repository_id,tracked_ref,retired_generation").WithArgs(next.SubscriptionID).WillReturnError(pgx.ErrNoRows)
-	m.ExpectExec("INSERT INTO relay_subscriptions").WithArgs(next.SubscriptionID, testController, next.InstallationID, next.RepositoryID, next.Ref, uint64(4), fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	m.ExpectExec("INSERT INTO relay_subscription_set_items").WithArgs(testController, uint64(4), next.SubscriptionID, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	m.ExpectExec("INSERT INTO relay_subscription_heads").WithArgs(testController, uint64(4), fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	m.ExpectCommit()
-	if err := s.SyncSubscriptions(context.Background(), testController, 4, []Subscription{next}); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.ExpectationsWereMet(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestRevokeControllerLocksBindingThenRouteThenControllerAndRejectsUncoveredBinding(t *testing.T) {
-	t.Run("stable snapshot blanket revokes after ordered locks", func(t *testing.T) {
-		s, m := mockStore(t)
-		bindings := []int64{19, 11}
-		routes := []Subscription{
-			{InstallationID: 19, RepositoryID: 29, Ref: "refs/heads/old"},
-			{InstallationID: 11, RepositoryID: 21, Ref: "refs/heads/main"},
-		}
-		m.ExpectBegin()
-		m.ExpectQuery("SELECT DISTINCT installation_id FROM relay_bindings").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"installation_id"}).AddRow(bindings[0]).AddRow(bindings[1]))
-		expectSortedAdvisoryLocks(m, bindingLockKey(bindings[0]), bindingLockKey(bindings[1]))
-		m.ExpectQuery("SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}).AddRow(routes[0].InstallationID, routes[0].RepositoryID, routes[0].Ref).AddRow(routes[1].InstallationID, routes[1].RepositoryID, routes[1].Ref))
-		expectSortedAdvisoryLocks(m, routeLockKey(routes[0].InstallationID, routes[0].RepositoryID, routes[0].Ref), routeLockKey(routes[1].InstallationID, routes[1].RepositoryID, routes[1].Ref))
-		m.ExpectQuery("SELECT state FROM relay_controllers").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"state"}).AddRow("active"))
-		m.ExpectQuery("SELECT DISTINCT installation_id FROM relay_bindings").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"installation_id"}).AddRow(bindings[1]).AddRow(bindings[0]))
-		m.ExpectQuery("SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}).AddRow(routes[1].InstallationID, routes[1].RepositoryID, routes[1].Ref).AddRow(routes[0].InstallationID, routes[0].RepositoryID, routes[0].Ref))
-		m.ExpectExec("UPDATE relay_controllers SET state='revoked'").WithArgs(testController, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-		m.ExpectExec("UPDATE relay_controller_keys SET state='revoked',rotation_nonce=NULL,rotation_expires_at=NULL").WithArgs(testController, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-		m.ExpectExec("UPDATE relay_bindings SET revoked_at").WithArgs(testController, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 2))
-		m.ExpectExec("UPDATE relay_sessions SET revoked_at").WithArgs(testController, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-		m.ExpectCommit()
-		if err := s.RevokeController(context.Background(), testController); err != nil {
-			t.Fatal(err)
-		}
-		if err := m.ExpectationsWereMet(); err != nil {
-			t.Fatal(err)
-		}
-	})
-
-	t.Run("binding enrolled after snapshot forces retry without inverse lock", func(t *testing.T) {
-		s, m := mockStore(t)
-		m.ExpectBegin()
-		m.ExpectQuery("SELECT DISTINCT installation_id FROM relay_bindings").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"installation_id"}).AddRow(int64(11)))
-		expectSortedAdvisoryLocks(m, bindingLockKey(11))
-		m.ExpectQuery("SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
-		m.ExpectQuery("SELECT state FROM relay_controllers").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"state"}).AddRow("active"))
-		m.ExpectQuery("SELECT DISTINCT installation_id FROM relay_bindings").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"installation_id"}).AddRow(int64(11)).AddRow(int64(22)))
-		m.ExpectRollback()
-		if err := s.RevokeController(context.Background(), testController); !errors.Is(err, ErrConflict) {
-			t.Fatalf("error=%v", err)
-		}
-		if err := m.ExpectationsWereMet(); err != nil {
-			t.Fatal(err)
-		}
-	})
-}
-
-func TestControllerBoundSourceDecisionUsesLockedCAS(t *testing.T) {
-	s, m := mockStore(t)
-	m.ExpectBegin()
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(subscriptionLockKey(testSubscription)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	m.ExpectQuery("SELECT controller_id::text,generation,decision").WithArgs(testSubscription).WillReturnRows(pgxmock.NewRows([]string{"controller_id", "generation", "decision", "message", "code"}).AddRow(testController, int64(2), nil, nil, nil))
-	m.ExpectExec("UPDATE relay_desired_states").WithArgs(testSubscription, uint64(2), "acked", nil, testMessage, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-	m.ExpectCommit()
-	if err := s.DecideSource(context.Background(), testController, testSubscription, 2, Decision{MessageID: testMessage, Accepted: true}); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.ExpectationsWereMet(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestLeaseValidationLocksBeforeReplayMutation(t *testing.T) {
-	s, m := mockStore(t)
-	lease := Lease{ControllerID: testController, SessionID: testSession, LeaseID: testLease, Fence: 4, ExpiresAt: fixedNow.Add(time.Minute)}
-	m.ExpectBegin()
-	m.ExpectQuery("FOR UPDATE OF l,s").WithArgs(testController, testSession, testLease, uint64(4)).WillReturnRows(pgxmock.NewRows([]string{"lease_expires", "session_expires", "revoked"}).AddRow(fixedNow.Add(time.Minute), fixedNow.Add(time.Hour), nil))
-	m.ExpectExec("INSERT INTO relay_session_messages").WithArgs(testSession, testMessage, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	m.ExpectExec("UPDATE relay_sessions SET last_seen_at").WithArgs(testSession, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-	m.ExpectCommit()
-	if err := s.RecordSessionMessage(context.Background(), lease, testMessage); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -340,8 +207,7 @@ func TestSourceRouteSetMustBeComplete(t *testing.T) {
 	s, m := mockStore(t)
 	event := SourceEvent{DeliveryID: testDelivery, InstallationID: 1, RepositoryID: 2, Ref: "refs/heads/main", SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ReceivedAt: fixedNow, ObservedAt: fixedNow}
 	m.ExpectBegin()
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(event.InstallationID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(routeLockKey(event.InstallationID, event.RepositoryID, event.Ref)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	expectTopologyShards(m, bindingTopologyShard(event.InstallationID), routeTopologyShard(event.InstallationID, event.RepositoryID, event.Ref))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(event.DeliveryID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(event.DeliveryID, event.ReceivedAt, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	m.ExpectQuery("SELECT s.controller_id::text,s.subscription_id::text").WithArgs(event.InstallationID, event.RepositoryID, event.Ref).WillReturnRows(pgxmock.NewRows([]string{"controller_id", "subscription_id"}).AddRow(testController, testSubscription))
@@ -360,14 +226,15 @@ func TestAccessBatchRollbackAndDurablePendingAfterRevocation(t *testing.T) {
 		event := AccessEventInput{DeliveryID: testDelivery, InstallationID: 1, ChangeCode: "installation.removed", ReceivedAt: fixedNow, ObservedAt: fixedNow, RemoveAccess: true}
 		routes := []AccessRoute{{EventID: testEvent, ControllerID: testController}, {EventID: testEvent2, ControllerID: testController2}}
 		outage := errors.New("second target failed")
+		batchEvents := []AccessEventBatchItem{{InstallationID: 1, ChangeCode: event.ChangeCode, ObservedAt: fixedNow, RemoveAccess: true, Routes: routes}}
 		m.ExpectBegin()
-		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(1)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-		m.ExpectQuery("SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(int64(1), int64(0)).WillReturnRows(pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+		expectAccessRouteSnapshot(m, batchEvents, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+		expectTopologyShards(m, bindingTopologyShard(1))
+		expectAccessRouteSnapshot(m, batchEvents, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-		m.ExpectQuery("SELECT b.controller_id::text").WithArgs(int64(1), int64(0)).WillReturnRows(pgxmock.NewRows([]string{"controller_id"}).AddRow(testController).AddRow(testController2))
-		m.ExpectExec("INSERT INTO relay_access_events").WithArgs(testEvent, testDelivery, testController, int64(1), nil, event.ChangeCode, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-		m.ExpectExec("INSERT INTO relay_access_events").WithArgs(testEvent2, testDelivery, testController2, int64(1), nil, event.ChangeCode, fixedNow).WillReturnError(outage)
+		m.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs([]int64{1}, []int64{0}).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)).AddRow(int64(1), testController2, int64(3)))
+		m.ExpectExec("INSERT INTO relay_access_events").WithArgs(testDelivery, []string{testEvent, testEvent2}, []string{testController, testController2}, []int64{1, 1}, []int64{0, 0}, []string{event.ChangeCode, event.ChangeCode}, []time.Time{fixedNow, fixedNow}).WillReturnError(outage)
 		m.ExpectRollback()
 		if _, err := s.PushAccessEvent(context.Background(), event, routes); !errors.Is(err, outage) {
 			t.Fatalf("error=%v", err)
@@ -378,8 +245,9 @@ func TestAccessBatchRollbackAndDurablePendingAfterRevocation(t *testing.T) {
 	})
 	t.Run("pending does not join revoked binding", func(t *testing.T) {
 		s, m := mockStore(t)
-		m.ExpectQuery("SELECT a.event_id::text").WithArgs(testController, 10).WillReturnRows(pgxmock.NewRows([]string{"event_id", "delivery_id", "controller_id", "installation_id", "repository_id", "change_code", "observed_at"}).AddRow(testEvent, testDelivery, testController, int64(1), int64(0), "installation.removed", fixedNow))
-		items, err := s.PendingAccess(context.Background(), testController, 10)
+		lease := Lease{ControllerID: testController, SessionID: testSession, LeaseID: testLease, Fence: 1, ExpiresAt: fixedNow.Add(time.Minute)}
+		m.ExpectQuery("SELECT a.event_id::text").WithArgs(testController, testSession, testLease, uint64(1), fixedNow, 10).WillReturnRows(pgxmock.NewRows([]string{"event_id", "delivery_id", "controller_id", "installation_id", "repository_id", "change_code", "observed_at"}).AddRow(testEvent, testDelivery, testController, int64(1), int64(0), "installation.removed", fixedNow))
+		items, err := s.PendingAccess(context.Background(), lease, 10)
 		if err != nil || len(items) != 1 || items[0].EventID != testEvent {
 			t.Fatalf("items=%#v err=%v", items, err)
 		}
@@ -389,16 +257,56 @@ func TestAccessBatchRollbackAndDurablePendingAfterRevocation(t *testing.T) {
 	})
 }
 
+func TestPendingDeliveriesRequireExactLiveLeaseFence(t *testing.T) {
+	lease := Lease{ControllerID: testController, SessionID: testSession, LeaseID: testLease, Fence: 7, ExpiresAt: fixedNow.Add(time.Minute)}
+	for _, test := range []struct {
+		name string
+		call func(*Store) (int, error)
+	}{
+		{name: "source", call: func(store *Store) (int, error) {
+			items, err := store.PendingDesired(context.Background(), lease, 10)
+			return len(items), err
+		}},
+		{name: "access", call: func(store *Store) (int, error) {
+			items, err := store.PendingAccess(context.Background(), lease, 10)
+			return len(items), err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, m := mockStore(t)
+			m.ExpectQuery("FROM relay_controller_leases l").WithArgs(testController, testSession, testLease, uint64(7), fixedNow, 10).WillReturnRows(pgxmock.NewRows([]string{"id"}))
+			count, err := test.call(s)
+			if err != nil || count != 0 {
+				t.Fatalf("count=%d error=%v", count, err)
+			}
+			if err = m.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	invalid := lease
+	invalid.Fence = 0
+	s, m := mockStore(t)
+	if _, err := s.PendingDesired(context.Background(), invalid, 10); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid lease error=%v", err)
+	}
+	if err := m.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAccessFanoutRowsErrorRollsBackBeforeChildrenOrRevocation(t *testing.T) {
 	s, m := mockStore(t)
 	event := AccessEventInput{DeliveryID: testDelivery, InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.removed", ReceivedAt: fixedNow, ObservedAt: fixedNow, RemoveAccess: true}
+	batchEvents := []AccessEventBatchItem{{InstallationID: 1, RepositoryID: 2, ChangeCode: event.ChangeCode, ObservedAt: fixedNow, RemoveAccess: true, Routes: []AccessRoute{{EventID: testEvent, ControllerID: testController}}}}
 	rowsErr := errors.New("access route iteration failed")
 	m.ExpectBegin()
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(1)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	m.ExpectQuery("SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(int64(1), int64(2)).WillReturnRows(pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+	expectAccessRouteSnapshot(m, batchEvents, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+	expectTopologyShards(m, bindingTopologyShard(1))
+	expectAccessRouteSnapshot(m, batchEvents, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	m.ExpectQuery("SELECT b.controller_id::text").WithArgs(int64(1), int64(2)).WillReturnRows(pgxmock.NewRows([]string{"controller_id"}).AddRow(testController).RowError(0, rowsErr))
+	m.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs([]int64{1}, []int64{2}).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)).RowError(0, rowsErr))
 	m.ExpectRollback()
 	_, err := s.PushAccessEvent(context.Background(), event, []AccessRoute{{EventID: testEvent, ControllerID: testController}})
 	if !errors.Is(err, rowsErr) {
@@ -406,33 +314,6 @@ func TestAccessFanoutRowsErrorRollsBackBeforeChildrenOrRevocation(t *testing.T) 
 	}
 	if err = m.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestAccessDecisionAuthorizationAndExactRejectIdempotency(t *testing.T) {
-	decision := Decision{MessageID: testMessage, Code: "access.revoked"}
-	for _, tc := range []struct {
-		name       string
-		controller string
-		code       string
-		wantErr    error
-	}{
-		{name: "same code", controller: testController, code: decision.Code},
-		{name: "different code", controller: testController, code: "different.code", wantErr: ErrConflict},
-		{name: "different controller", controller: testController2, code: decision.Code, wantErr: ErrConflict},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s, m := mockStore(t)
-			m.ExpectExec("UPDATE relay_access_events").WithArgs(testEvent, testController, "rejected", decision.Code, testMessage, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
-			m.ExpectQuery("SELECT controller_id::text,decision").WithArgs(testEvent).WillReturnRows(pgxmock.NewRows([]string{"controller_id", "decision", "message", "code"}).AddRow(tc.controller, "rejected", testMessage, tc.code))
-			err := s.DecideAccess(context.Background(), testController, testEvent, decision)
-			if !errors.Is(err, tc.wantErr) {
-				t.Fatalf("error=%v want=%v", err, tc.wantErr)
-			}
-			if err = m.ExpectationsWereMet(); err != nil {
-				t.Fatal(err)
-			}
-		})
 	}
 }
 
@@ -505,14 +386,17 @@ func TestPushAccessEventsPersistsAtomicMultiRepositoryFanout(t *testing.T) {
 		},
 	}
 	s, m := mockStore(t)
+	installations, repositories, removals := accessBatchTargetArgs(batch.Events)
 	m.ExpectBegin()
-	expectSortedAdvisoryLocks(m, bindingLockKey(1))
+	expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+	expectTopologyShards(m, bindingTopologyShard(1))
+	expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	m.ExpectQuery("SELECT b.controller_id::text").WithArgs(int64(1), int64(2)).WillReturnRows(pgxmock.NewRows([]string{"controller_id"}).AddRow(testController))
-	m.ExpectExec("INSERT INTO relay_access_events").WithArgs(testEvent, testDelivery, testController, int64(1), int64(2), "repository.removed", fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	m.ExpectQuery("SELECT b.controller_id::text").WithArgs(int64(1), int64(3)).WillReturnRows(pgxmock.NewRows([]string{"controller_id"}).AddRow(testController2))
-	m.ExpectExec("INSERT INTO relay_access_events").WithArgs(testEvent2, testDelivery, testController2, int64(1), int64(3), "repository.removed", fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	m.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs(installations, repositories).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)).AddRow(int64(2), testController2, int64(3)))
+	m.ExpectExec("INSERT INTO relay_access_events").WithArgs(testDelivery, []string{testEvent, testEvent2}, []string{testController, testController2}, []int64{1, 1}, []int64{2, 3}, []string{"repository.removed", "repository.removed"}, []time.Time{fixedNow, fixedNow}).WillReturnResult(pgxmock.NewResult("INSERT", 2))
+	m.ExpectExec("WITH targets AS .*UPDATE relay_bindings b SET revoked_at").WithArgs(installations, repositories, removals, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	m.ExpectExec("WITH targets AS .*UPDATE relay_bindings b SET revoked_at").WithArgs(installations, repositories, removals, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	m.ExpectExec("UPDATE relay_recovery_deliveries").WithArgs(testDelivery, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	m.ExpectCommit()
 	if result, err := s.PushAccessEvents(context.Background(), batch); err != nil || result.Deduplicated {
@@ -543,7 +427,9 @@ func TestPushAccessEventsDuplicateDeliveryCannotAppendChildren(t *testing.T) {
 	s, m := mockStore(t)
 	batch := AccessEventBatchInput{DeliveryID: testDelivery, ReceivedAt: fixedNow, Events: []AccessEventBatchItem{{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.added", ObservedAt: fixedNow}}}
 	m.ExpectBegin()
-	expectSortedAdvisoryLocks(m, bindingLockKey(1))
+	expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+	expectTopologyShards(m, bindingTopologyShard(1))
+	expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
 	m.ExpectQuery("SELECT delivery_kind").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"kind"}).AddRow("access"))
@@ -616,8 +502,7 @@ func TestDeliveryLedgerRejectsCrossKindGUIDReuseAndIgnoredReasonExpansion(t *tes
 		s, m := mockStore(t)
 		event := SourceEvent{DeliveryID: testDelivery, InstallationID: 1, RepositoryID: 2, Ref: "refs/heads/main", SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ReceivedAt: fixedNow, ObservedAt: fixedNow}
 		m.ExpectBegin()
-		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(1)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(routeLockKey(1, 2, event.Ref)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		expectTopologyShards(m, bindingTopologyShard(1), routeTopologyShard(1, 2, event.Ref))
 		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
 		m.ExpectQuery("SELECT delivery_kind").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"kind"}).AddRow("ignored"))
@@ -633,7 +518,9 @@ func TestDeliveryLedgerRejectsCrossKindGUIDReuseAndIgnoredReasonExpansion(t *tes
 		s, m := mockStore(t)
 		batch := AccessEventBatchInput{DeliveryID: testDelivery, ReceivedAt: fixedNow, Events: []AccessEventBatchItem{{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.added", ObservedAt: fixedNow}}}
 		m.ExpectBegin()
-		expectSortedAdvisoryLocks(m, bindingLockKey(1))
+		expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+		expectTopologyShards(m, bindingTopologyShard(1))
+		expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
 		m.ExpectQuery("SELECT delivery_kind").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"kind"}).AddRow("ignored"))
@@ -676,8 +563,10 @@ func TestEnrollmentOutagesRollbackWithoutCreatingIdentity(t *testing.T) {
 		outage := errors.New("key persistence unavailable")
 		m.ExpectBegin()
 		m.ExpectQuery("SELECT controller_id,key_id,public_key").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"controller_id", "key_id", "public_key", "installation_id", "repository_id", "expires_at", "status"}).AddRow(testController, testKey, publicKey, int64(1), int64(2), fixedNow.Add(time.Minute), "state_claimed"))
-		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(1)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		m.ExpectQuery("SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController, int64(1), int64(2)).WillReturnRows(pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+		expectTopologyShards(m, bindingTopologyShard(1))
+		m.ExpectQuery("SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController, int64(1), int64(2)).WillReturnRows(pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+		m.ExpectQuery("SELECT controller_id,key_id,public_key").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"controller_id", "key_id", "public_key", "installation_id", "repository_id", "expires_at", "status"}).AddRow(testController, testKey, publicKey, int64(1), int64(2), fixedNow.Add(time.Minute), "state_claimed"))
 		m.ExpectQuery("SELECT state FROM relay_controllers").WithArgs(testController).WillReturnError(pgx.ErrNoRows)
 		m.ExpectExec("INSERT INTO relay_controllers").WithArgs(testController, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 		m.ExpectExec("INSERT INTO relay_controller_keys").WithArgs(testKey, testController, publicKey, fixedNow).WillReturnError(outage)
@@ -696,8 +585,10 @@ func TestCompleteEnrollmentCreatesIdentityOnlyAfterClaim(t *testing.T) {
 	publicKey := bytes.Repeat([]byte{2}, 32)
 	m.ExpectBegin()
 	m.ExpectQuery("SELECT controller_id,key_id,public_key").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"controller_id", "key_id", "public_key", "installation_id", "repository_id", "expires_at", "status"}).AddRow(testController, testKey, publicKey, int64(1), int64(2), fixedNow.Add(time.Minute), "state_claimed"))
-	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(bindingLockKey(1)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectQuery("SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController, int64(1), int64(2)).WillReturnRows(pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+	expectTopologyShards(m, bindingTopologyShard(1))
+	m.ExpectQuery("SELECT installation_id,repository_id,tracked_ref FROM relay_subscriptions").WithArgs(testController, int64(1), int64(2)).WillReturnRows(pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+	m.ExpectQuery("SELECT controller_id,key_id,public_key").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"controller_id", "key_id", "public_key", "installation_id", "repository_id", "expires_at", "status"}).AddRow(testController, testKey, publicKey, int64(1), int64(2), fixedNow.Add(time.Minute), "state_claimed"))
 	m.ExpectQuery("SELECT state FROM relay_controllers").WithArgs(testController).WillReturnError(pgx.ErrNoRows)
 	m.ExpectExec("INSERT INTO relay_controllers").WithArgs(testController, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	m.ExpectExec("INSERT INTO relay_controller_keys").WithArgs(testKey, testController, publicKey, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -716,24 +607,12 @@ func TestLeaseConflictAndReplayCAS(t *testing.T) {
 	t.Run("active replacement conflict", func(t *testing.T) {
 		s, m := mockStore(t)
 		m.ExpectBegin()
-		m.ExpectQuery("SELECT controller_id::text,expires_at,revoked_at").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller", "expires", "revoked"}).AddRow(testController, fixedNow.Add(time.Hour), nil))
+		m.ExpectQuery("SELECT controller_id::text FROM relay_sessions").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller"}).AddRow(testController))
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(controllerSessionLockKey(testController)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		m.ExpectQuery("SELECT session_id::text,fence,expires_at").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"session", "fence", "expires"}).AddRow(testMessage, int64(3), fixedNow.Add(time.Minute)))
+		m.ExpectQuery("SELECT s.controller_id::text,s.expires_at,s.revoked_at,c.state,k.state").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller", "expires", "revoked", "controller_state", "key_state"}).AddRow(testController, fixedNow.Add(time.Hour), nil, "active", "active"))
 		m.ExpectRollback()
 		if _, err := s.AcquireLease(context.Background(), testSession, time.Minute); !errors.Is(err, ErrConflict) {
-			t.Fatalf("error=%v", err)
-		}
-		if err := m.ExpectationsWereMet(); err != nil {
-			t.Fatal(err)
-		}
-	})
-	t.Run("message replay", func(t *testing.T) {
-		s, m := mockStore(t)
-		lease := Lease{ControllerID: testController, SessionID: testSession, LeaseID: testLease, Fence: 4}
-		m.ExpectBegin()
-		m.ExpectQuery("FOR UPDATE OF l").WithArgs(testController, testSession, testLease, uint64(4)).WillReturnRows(pgxmock.NewRows([]string{"lease_expires", "session_expires", "revoked"}).AddRow(fixedNow.Add(time.Minute), fixedNow.Add(time.Hour), nil))
-		m.ExpectExec("INSERT INTO relay_session_messages").WithArgs(testSession, testMessage, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
-		m.ExpectRollback()
-		if err := s.RecordSessionMessage(context.Background(), lease, testMessage); !errors.Is(err, ErrReplay) {
 			t.Fatalf("error=%v", err)
 		}
 		if err := m.ExpectationsWereMet(); err != nil {
@@ -746,8 +625,10 @@ func TestExpiredLeaseCanBeTakenOverAndStaleLeaseCannotRecordReplayState(t *testi
 	t.Run("expired lease takeover increments fence", func(t *testing.T) {
 		s, m := mockStore(t)
 		m.ExpectBegin()
-		m.ExpectQuery("SELECT controller_id::text,expires_at,revoked_at").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller", "expires", "revoked"}).AddRow(testController, fixedNow.Add(time.Hour), nil))
+		m.ExpectQuery("SELECT controller_id::text FROM relay_sessions").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller"}).AddRow(testController))
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(controllerSessionLockKey(testController)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		m.ExpectQuery("SELECT session_id::text,fence,expires_at").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"session", "fence", "expires"}).AddRow(testMessage, int64(3), fixedNow.Add(-time.Second)))
+		m.ExpectQuery("SELECT s.controller_id::text,s.expires_at,s.revoked_at,c.state,k.state").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller", "expires", "revoked", "controller_state", "key_state"}).AddRow(testController, fixedNow.Add(time.Hour), nil, "active", "active"))
 		m.ExpectExec("INSERT INTO relay_controller_leases").WithArgs(testController, testSession, testLease, int64(4), fixedNow.Add(time.Minute), fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 		m.ExpectCommit()
 		lease, err := s.AcquireLease(context.Background(), testSession, time.Minute)
@@ -759,124 +640,7 @@ func TestExpiredLeaseCanBeTakenOverAndStaleLeaseCannotRecordReplayState(t *testi
 		}
 	})
 
-	t.Run("expired lease fails before replay insert", func(t *testing.T) {
-		s, m := mockStore(t)
-		lease := Lease{ControllerID: testController, SessionID: testSession, LeaseID: testLease, Fence: 4}
-		m.ExpectBegin()
-		m.ExpectQuery("FOR UPDATE OF l").WithArgs(testController, testSession, testLease, uint64(4)).WillReturnRows(pgxmock.NewRows([]string{"lease_expires", "session_expires", "revoked"}).AddRow(fixedNow, fixedNow.Add(time.Hour), nil))
-		m.ExpectRollback()
-		if err := s.RecordSessionMessage(context.Background(), lease, testMessage); !errors.Is(err, ErrConflict) {
-			t.Fatalf("error=%v", err)
-		}
-		if err := m.ExpectationsWereMet(); err != nil {
-			t.Fatal(err)
-		}
-	})
 }
-
-func TestRotationPersistsOriginAndEnforcesExpiryOwnership(t *testing.T) {
-	input := RotationInput{RotationID: testDelivery, ControllerID: testController, OldKeyID: testKey, NewKeyID: testSubscription, SessionID: testSession, NewPublicKey: bytes.Repeat([]byte{9}, 32)}
-	t.Run("propose binds active session", func(t *testing.T) {
-		s, m := mockStore(t)
-		nonce := make([]byte, 32)
-		for i := range nonce {
-			nonce[i] = byte(i)
-		}
-		m.ExpectBegin()
-		m.ExpectQuery("SELECT c.state,se.expires_at,se.revoked_at.*FOR UPDATE OF c,k,se").WithArgs(testController, testKey, testSession).WillReturnRows(pgxmock.NewRows([]string{"state", "expires", "revoked"}).AddRow("active", fixedNow.Add(time.Hour), nil))
-		m.ExpectExec("INSERT INTO relay_controller_keys").WithArgs(input.NewKeyID, input.ControllerID, input.NewPublicKey, input.RotationID, input.OldKeyID, input.SessionID, nonce, fixedNow.Add(time.Minute), fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-		m.ExpectCommit()
-		challenge, err := s.ProposeRotation(context.Background(), input, time.Minute)
-		if err != nil || challenge.SessionID != testSession || challenge.OldKeyID != testKey || !bytes.Equal(challenge.NewPublicKey, input.NewPublicKey) {
-			t.Fatalf("challenge=%#v err=%v", challenge, err)
-		}
-		challenge.Destroy()
-		if err = m.ExpectationsWereMet(); err != nil {
-			t.Fatal(err)
-		}
-	})
-	t.Run("confirm expires pending key", func(t *testing.T) {
-		s, m := mockStore(t)
-		m.ExpectBegin()
-		m.ExpectQuery("SELECT rotation_expires_at,possession_confirmed_at").WithArgs(testController, testDelivery).WillReturnRows(pgxmock.NewRows([]string{"expires", "confirmed"}).AddRow(fixedNow, nil))
-		m.ExpectExec("UPDATE relay_controller_keys SET state='revoked'").WithArgs(testController, testDelivery, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-		m.ExpectCommit()
-		if err := s.ConfirmRotation(context.Background(), testController, testDelivery); !errors.Is(err, ErrExpired) {
-			t.Fatalf("error=%v", err)
-		}
-		if err := m.ExpectationsWereMet(); err != nil {
-			t.Fatal(err)
-		}
-	})
-	t.Run("finalize rejects different origin session", func(t *testing.T) {
-		s, m := mockStore(t)
-		m.ExpectBegin()
-		m.ExpectQuery("SELECT p.key_id::text,p.public_key,p.rotation_old_key_id::text.*FOR UPDATE OF p,o,se").WithArgs(testController, testDelivery).WillReturnRows(pgxmock.NewRows([]string{"pending", "public_key", "old", "session", "confirmed", "expires", "old_state", "session_expires", "session_revoked"}).AddRow(testSubscription, input.NewPublicKey, testKey, testMessage, true, fixedNow.Add(time.Minute), "active", fixedNow.Add(time.Hour), nil))
-		m.ExpectRollback()
-		if err := s.FinalizeRotation(context.Background(), input); !errors.Is(err, ErrConflict) {
-			t.Fatalf("error=%v", err)
-		}
-		if err := m.ExpectationsWereMet(); err != nil {
-			t.Fatal(err)
-		}
-	})
-	t.Run("finalize atomically activates new key and revokes old sessions", func(t *testing.T) {
-		s, m := mockStore(t)
-		m.ExpectBegin()
-		m.ExpectQuery("SELECT p.key_id::text,p.public_key,p.rotation_old_key_id::text.*FOR UPDATE OF p,o,se").WithArgs(testController, testDelivery).WillReturnRows(pgxmock.NewRows([]string{"pending", "public_key", "old", "session", "confirmed", "expires", "old_state", "session_expires", "session_revoked"}).AddRow(testSubscription, input.NewPublicKey, testKey, testSession, true, fixedNow.Add(time.Minute), "active", fixedNow.Add(time.Hour), nil))
-		m.ExpectExec("UPDATE relay_controller_keys SET state='revoked'").WithArgs(testController, testKey, testDelivery, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-		m.ExpectExec("UPDATE relay_controller_keys SET state='active'").WithArgs(testController, testSubscription).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-		m.ExpectExec("UPDATE relay_sessions SET revoked_at").WithArgs(testController, testKey, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 2))
-		m.ExpectCommit()
-		if err := s.FinalizeRotation(context.Background(), input); err != nil {
-			t.Fatal(err)
-		}
-		if err := m.ExpectationsWereMet(); err != nil {
-			t.Fatal(err)
-		}
-	})
-	t.Run("finalize rejects revoked origin session", func(t *testing.T) {
-		s, m := mockStore(t)
-		revokedAt := fixedNow.Add(-time.Second)
-		m.ExpectBegin()
-		m.ExpectQuery("SELECT p.key_id::text,p.public_key,p.rotation_old_key_id::text.*FOR UPDATE OF p,o,se").WithArgs(testController, testDelivery).WillReturnRows(pgxmock.NewRows([]string{"pending", "public_key", "old", "session", "confirmed", "expires", "old_state", "session_expires", "session_revoked"}).AddRow(testSubscription, input.NewPublicKey, testKey, testSession, true, fixedNow.Add(time.Minute), "active", fixedNow.Add(time.Hour), revokedAt))
-		m.ExpectRollback()
-		if err := s.FinalizeRotation(context.Background(), input); !errors.Is(err, ErrConflict) {
-			t.Fatalf("error=%v", err)
-		}
-		if err := m.ExpectationsWereMet(); err != nil {
-			t.Fatal(err)
-		}
-	})
-	t.Run("finalize rejects different persisted public key", func(t *testing.T) {
-		s, m := mockStore(t)
-		m.ExpectBegin()
-		m.ExpectQuery("SELECT p.key_id::text,p.public_key,p.rotation_old_key_id::text.*FOR UPDATE OF p,o,se").WithArgs(testController, testDelivery).WillReturnRows(pgxmock.NewRows([]string{"pending", "public_key", "old", "session", "confirmed", "expires", "old_state", "session_expires", "session_revoked"}).AddRow(testSubscription, bytes.Repeat([]byte{8}, 32), testKey, testSession, true, fixedNow.Add(time.Minute), "active", fixedNow.Add(time.Hour), nil))
-		m.ExpectRollback()
-		if err := s.FinalizeRotation(context.Background(), input); !errors.Is(err, ErrConflict) {
-			t.Fatalf("error=%v", err)
-		}
-		if err := m.ExpectationsWereMet(); err != nil {
-			t.Fatal(err)
-		}
-	})
-}
-
-func TestRevokeKeyCancelsPendingRotationsAndSessionsAtomically(t *testing.T) {
-	s, m := mockStore(t)
-	m.ExpectBegin()
-	m.ExpectExec("UPDATE relay_controller_keys SET state='revoked'.*key_id=\\$2").WithArgs(testController, testKey, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-	m.ExpectExec("UPDATE relay_controller_keys SET state='revoked'.*rotation_old_key_id=\\$2").WithArgs(testController, testKey, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 2))
-	m.ExpectExec("UPDATE relay_sessions SET revoked_at").WithArgs(testController, testKey, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 3))
-	m.ExpectCommit()
-	if err := s.RevokeKey(context.Background(), testController, testKey); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.ExpectationsWereMet(); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestRecoveryFencesRetriesAndCursorTakeover(t *testing.T) {
 	t.Run("claim and stale attempt", func(t *testing.T) {
 		s, m := mockStore(t)

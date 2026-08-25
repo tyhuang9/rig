@@ -131,7 +131,7 @@ func TestRelaySchemaExcludesForbiddenProductAndSecretData(t *testing.T) {
 }
 
 func TestStoreQueriesContainLockingAndAuthorizationPredicates(t *testing.T) {
-	files := []string{"delivery.go", "session.go", "subscriptions.go", "recovery.go", "migrate.go"}
+	files := []string{"delivery.go", "session.go", "session_commands.go", "subscriptions.go", "recovery.go", "migrate.go"}
 	var source strings.Builder
 	for _, name := range files {
 		body, err := os.ReadFile(name)
@@ -140,7 +140,7 @@ func TestStoreQueriesContainLockingAndAuthorizationPredicates(t *testing.T) {
 		}
 		source.Write(body)
 	}
-	for _, required := range []string{"pg_advisory_xact_lock", "FOR UPDATE SKIP LOCKED", "FOR UPDATE OF l", "controller_id=$1", "b.revoked_at IS NULL", "pg_advisory_lock", "checksum mismatch"} {
+	for _, required := range []string{"pg_advisory_xact_lock", "FOR UPDATE SKIP LOCKED", "SELECT expires_at FROM relay_controller_leases", "FOR UPDATE OF s,c,k", "controller_id=$1", "b.revoked_at IS NULL", "pg_advisory_lock", "checksum mismatch"} {
 		if !strings.Contains(source.String(), required) {
 			t.Errorf("store queries missing %q", required)
 		}

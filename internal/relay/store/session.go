@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -137,10 +138,21 @@ func (s *Store) RenewLease(ctx context.Context, lease Lease, duration time.Durat
 	}
 	defer rollback(ctx, tx)
 	now := s.now().UTC()
-	var leaseExpires, sessionExpires time.Time
+	if err = acquireControllerSessionLock(ctx, tx, lease.ControllerID); err != nil {
+		return Lease{}, err
+	}
+	var leaseExpires time.Time
+	err = tx.QueryRow(ctx, `SELECT expires_at FROM relay_controller_leases WHERE controller_id=$1 AND session_id=$2 AND lease_id=$3 AND fence=$4 FOR UPDATE`, lease.ControllerID, lease.SessionID, lease.LeaseID, lease.Fence).Scan(&leaseExpires)
+	if isNoRows(err) {
+		return Lease{}, ErrConflict
+	}
+	if err != nil {
+		return Lease{}, err
+	}
+	var sessionExpires time.Time
 	var sessionRevoked sql.NullTime
 	var controllerState, keyState string
-	err = tx.QueryRow(ctx, `SELECT l.expires_at,s.expires_at,s.revoked_at,c.state,k.state FROM relay_controller_leases l JOIN relay_sessions s ON s.session_id=l.session_id AND s.controller_id=l.controller_id JOIN relay_controllers c ON c.controller_id=s.controller_id JOIN relay_controller_keys k ON k.controller_id=s.controller_id AND k.key_id=s.key_id WHERE l.controller_id=$1 AND l.session_id=$2 AND l.lease_id=$3 AND l.fence=$4 FOR UPDATE OF l,s,c,k`, lease.ControllerID, lease.SessionID, lease.LeaseID, lease.Fence).Scan(&leaseExpires, &sessionExpires, &sessionRevoked, &controllerState, &keyState)
+	err = tx.QueryRow(ctx, `SELECT s.expires_at,s.revoked_at,c.state,k.state FROM relay_sessions s JOIN relay_controllers c ON c.controller_id=s.controller_id JOIN relay_controller_keys k ON k.controller_id=s.controller_id AND k.key_id=s.key_id WHERE s.controller_id=$1 AND s.session_id=$2 FOR UPDATE OF s,c,k`, lease.ControllerID, lease.SessionID).Scan(&sessionExpires, &sessionRevoked, &controllerState, &keyState)
 	if isNoRows(err) {
 		return Lease{}, ErrConflict
 	}
@@ -202,31 +214,48 @@ func (s *Store) AcquireLease(ctx context.Context, sessionID string, duration tim
 	defer rollback(ctx, tx)
 	now := s.now().UTC()
 	var controllerID string
-	var sessionExpires time.Time
-	var revoked *time.Time
-	err = tx.QueryRow(ctx, `SELECT controller_id::text,expires_at,revoked_at FROM relay_sessions WHERE session_id=$1 FOR UPDATE`, sessionID).Scan(&controllerID, &sessionExpires, &revoked)
+	err = tx.QueryRow(ctx, `SELECT controller_id::text FROM relay_sessions WHERE session_id=$1`, sessionID).Scan(&controllerID)
 	if isNoRows(err) {
 		return Lease{}, ErrNotFound
 	}
 	if err != nil {
 		return Lease{}, err
 	}
-	if revoked != nil || !sessionExpires.After(now) {
-		return Lease{}, ErrExpired
-	}
-	expires := now.Add(duration)
-	if expires.After(sessionExpires) {
-		expires = sessionExpires
+	if err = acquireControllerSessionLock(ctx, tx, controllerID); err != nil {
+		return Lease{}, err
 	}
 	var oldSession string
 	var oldFence int64
 	var oldExpiry time.Time
 	err = tx.QueryRow(ctx, `SELECT session_id::text,fence,expires_at FROM relay_controller_leases WHERE controller_id=$1 FOR UPDATE`, controllerID).Scan(&oldSession, &oldFence, &oldExpiry)
-	if err == nil && oldExpiry.After(now) && oldSession != sessionID {
-		return Lease{}, ErrConflict
-	}
 	if err != nil && !isNoRows(err) {
 		return Lease{}, err
+	}
+	var lockedControllerID, controllerState, keyState string
+	var sessionExpires time.Time
+	var sessionRevoked sql.NullTime
+	err = tx.QueryRow(ctx, `SELECT s.controller_id::text,s.expires_at,s.revoked_at,c.state,k.state FROM relay_sessions s JOIN relay_controllers c ON c.controller_id=s.controller_id JOIN relay_controller_keys k ON k.controller_id=s.controller_id AND k.key_id=s.key_id WHERE s.session_id=$1 FOR UPDATE OF s,c,k`, sessionID).Scan(&lockedControllerID, &sessionExpires, &sessionRevoked, &controllerState, &keyState)
+	if isNoRows(err) {
+		return Lease{}, ErrNotFound
+	}
+	if err != nil {
+		return Lease{}, err
+	}
+	if lockedControllerID != controllerID {
+		return Lease{}, ErrConflict
+	}
+	if sessionRevoked.Valid || !sessionExpires.After(now) || controllerState != "active" || keyState != "active" {
+		return Lease{}, ErrExpired
+	}
+	if oldExpiry.After(now) && oldSession != sessionID {
+		return Lease{}, ErrConflict
+	}
+	if oldFence < 0 || oldFence == math.MaxInt64 {
+		return Lease{}, ErrConflict
+	}
+	expires := now.Add(duration)
+	if expires.After(sessionExpires) {
+		expires = sessionExpires
 	}
 	fence := oldFence + 1
 	leaseID := s.newUUID().String()
@@ -238,40 +267,6 @@ func (s *Store) AcquireLease(ctx context.Context, sessionID string, duration tim
 		return Lease{}, err
 	}
 	return Lease{ControllerID: controllerID, SessionID: sessionID, LeaseID: leaseID, Fence: uint64(fence), ExpiresAt: expires}, nil
-}
-func (s *Store) RecordSessionMessage(ctx context.Context, lease Lease, messageID string) error {
-	if !validUUID(lease.ControllerID) || !validUUID(lease.SessionID) || !validUUID(lease.LeaseID) || lease.Fence == 0 || !validUUID(messageID) {
-		return ErrInvalid
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer rollback(ctx, tx)
-	now := s.now().UTC()
-	var expiresAt, sessionExpiresAt time.Time
-	var revokedAt *time.Time
-	err = tx.QueryRow(ctx, `SELECT l.expires_at,s.expires_at,s.revoked_at FROM relay_controller_leases l JOIN relay_sessions s ON s.session_id=l.session_id AND s.controller_id=l.controller_id WHERE l.controller_id=$1 AND l.session_id=$2 AND l.lease_id=$3 AND l.fence=$4 FOR UPDATE OF l,s`, lease.ControllerID, lease.SessionID, lease.LeaseID, lease.Fence).Scan(&expiresAt, &sessionExpiresAt, &revokedAt)
-	if isNoRows(err) {
-		return ErrConflict
-	}
-	if err != nil {
-		return err
-	}
-	if !expiresAt.After(now) || !sessionExpiresAt.After(now) || revokedAt != nil {
-		return ErrConflict
-	}
-	tag, err := tx.Exec(ctx, `INSERT INTO relay_session_messages(session_id,message_id,seen_at) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, lease.SessionID, messageID, now)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() != 1 {
-		return ErrReplay
-	}
-	if _, err = tx.Exec(ctx, `UPDATE relay_sessions SET last_seen_at=$2 WHERE session_id=$1`, lease.SessionID, now); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
 }
 func (s *Store) ReleaseLease(ctx context.Context, lease Lease) error {
 	if !validUUID(lease.ControllerID) || !validUUID(lease.LeaseID) || lease.Fence == 0 {

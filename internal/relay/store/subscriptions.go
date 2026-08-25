@@ -15,29 +15,9 @@ type Subscription struct {
 	Ref            string
 }
 
-func (s *Store) SyncSubscriptions(ctx context.Context, controllerID string, generation uint64, subscriptions []Subscription) error {
-	seen, err := validateSubscriptions(controllerID, generation, subscriptions)
-	if err != nil {
-		return err
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer rollback(ctx, tx)
-	locks, err := s.prepareSubscriptionLocks(ctx, tx, controllerID, subscriptions)
-	if err != nil {
-		return err
-	}
-	if err = s.syncSubscriptionsLocked(ctx, tx, controllerID, generation, subscriptions, seen, locks); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
-}
-
 type subscriptionLocks struct {
-	bindings map[int64]struct{}
-	routes   map[int64]struct{}
+	topologyLockSet
+	active []Subscription
 }
 
 func validateSubscriptions(controllerID string, generation uint64, subscriptions []Subscription) (map[string]Subscription, error) {
@@ -62,29 +42,38 @@ func (s *Store) prepareSubscriptionLocks(ctx context.Context, tx pgx.Tx, control
 	if err != nil {
 		return subscriptionLocks{}, err
 	}
-	bindingLocks := make(map[int64]struct{}, len(activeSnapshot)+len(subscriptions))
-	routeLocks := make(map[int64]struct{}, len(activeSnapshot)+len(subscriptions))
+	locks := newTopologyLockSet()
 	for _, sub := range activeSnapshot {
-		bindingLocks[bindingLockKey(sub.InstallationID)] = struct{}{}
-		routeLocks[routeLockKey(sub.InstallationID, sub.RepositoryID, sub.Ref)] = struct{}{}
+		locks.addBinding(sub.InstallationID)
+		locks.addRoute(sub.InstallationID, sub.RepositoryID, sub.Ref)
 	}
 	for _, sub := range subscriptions {
-		bindingLocks[bindingLockKey(sub.InstallationID)] = struct{}{}
-		routeLocks[routeLockKey(sub.InstallationID, sub.RepositoryID, sub.Ref)] = struct{}{}
+		locks.addBinding(sub.InstallationID)
+		locks.addRoute(sub.InstallationID, sub.RepositoryID, sub.Ref)
 	}
-	if err = acquireAdvisoryLocks(ctx, tx, bindingLocks); err != nil {
+	if err = acquireTopologyLocks(ctx, tx, locks); err != nil {
 		return subscriptionLocks{}, err
 	}
-	if err = acquireAdvisoryLocks(ctx, tx, routeLocks); err != nil {
+	current, err := activeSubscriptions(ctx, tx, controllerID)
+	if err != nil {
 		return subscriptionLocks{}, err
 	}
-	return subscriptionLocks{bindings: bindingLocks, routes: routeLocks}, nil
+	for _, sub := range current {
+		if _, ok := locks.bindings[sub.InstallationID]; !ok {
+			return subscriptionLocks{}, ErrConflict
+		}
+		if _, ok := locks.routes[routeTopologyKey{installationID: sub.InstallationID, repositoryID: sub.RepositoryID, ref: sub.Ref}]; !ok {
+			return subscriptionLocks{}, ErrConflict
+		}
+	}
+	return subscriptionLocks{topologyLockSet: locks, active: current}, nil
 }
 
 func (s *Store) syncSubscriptionsLocked(ctx context.Context, tx pgx.Tx, controllerID string, generation uint64, subscriptions []Subscription, seen map[string]Subscription, locks subscriptionLocks) error {
 	now := s.now().UTC()
+	var err error
 	var controllerState string
-	if err := tx.QueryRow(ctx, `SELECT state FROM relay_controllers WHERE controller_id=$1 FOR UPDATE`, controllerID).Scan(&controllerState); isNoRows(err) {
+	if err = tx.QueryRow(ctx, `SELECT state FROM relay_controllers WHERE controller_id=$1 FOR UPDATE`, controllerID).Scan(&controllerState); isNoRows(err) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
@@ -92,18 +81,7 @@ func (s *Store) syncSubscriptionsLocked(ctx context.Context, tx pgx.Tx, controll
 	if controllerState != "active" {
 		return ErrConflict
 	}
-	active, err := activeSubscriptions(ctx, tx, controllerID)
-	if err != nil {
-		return err
-	}
-	for _, sub := range active {
-		if _, ok := locks.bindings[bindingLockKey(sub.InstallationID)]; !ok {
-			return ErrConflict
-		}
-		if _, ok := locks.routes[routeLockKey(sub.InstallationID, sub.RepositoryID, sub.Ref)]; !ok {
-			return ErrConflict
-		}
-	}
+	active := locks.active
 	var current int64
 	err = tx.QueryRow(ctx, `SELECT generation FROM relay_subscription_heads WHERE controller_id=$1`, controllerID).Scan(&current)
 	if isNoRows(err) {
@@ -142,38 +120,67 @@ func (s *Store) syncSubscriptionsLocked(ctx context.Context, tx pgx.Tx, controll
 	if generation != uint64(current+1) {
 		return ErrConflict
 	}
-	for _, existing := range active {
-		if _, ok := seen[existing.SubscriptionID]; !ok {
-			if _, err = tx.Exec(ctx, `UPDATE relay_subscriptions SET retired_generation=$2 WHERE subscription_id=$1 AND retired_generation IS NULL`, existing.SubscriptionID, generation); err != nil {
-				return err
-			}
-		}
-	}
-	for _, sub := range subscriptions {
+	ids, installations, repositories, _ := subscriptionArrays(subscriptions)
+	if len(subscriptions) > 0 {
 		var authorized bool
-		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM relay_bindings WHERE controller_id=$1 AND installation_id=$2 AND repository_id=$3 AND revoked_at IS NULL)`, controllerID, sub.InstallationID, sub.RepositoryID).Scan(&authorized); err != nil {
+		if err = tx.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM (SELECT DISTINCT installation_id,repository_id FROM unnest($2::bigint[],$3::bigint[]) AS requested(installation_id,repository_id)) requested WHERE NOT EXISTS(SELECT 1 FROM relay_bindings b WHERE b.controller_id=$1 AND b.installation_id=requested.installation_id AND b.repository_id=requested.repository_id AND b.revoked_at IS NULL))`, controllerID, installations, repositories).Scan(&authorized); err != nil {
 			return err
 		}
 		if !authorized {
 			return ErrConflict
 		}
-		var existingController string
-		var installationID, repositoryID int64
-		var ref string
-		var retired *int64
-		err = tx.QueryRow(ctx, `SELECT controller_id::text,installation_id,repository_id,tracked_ref,retired_generation FROM relay_subscriptions WHERE subscription_id=$1`, sub.SubscriptionID).Scan(&existingController, &installationID, &repositoryID, &ref, &retired)
-		if err == nil {
-			if existingController != controllerID || installationID != sub.InstallationID || repositoryID != sub.RepositoryID || ref != sub.Ref || retired != nil {
-				return ErrConflict
-			}
-		} else if isNoRows(err) {
-			if _, err = tx.Exec(ctx, `INSERT INTO relay_subscriptions(subscription_id,controller_id,installation_id,repository_id,tracked_ref,activated_generation,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, sub.SubscriptionID, controllerID, sub.InstallationID, sub.RepositoryID, sub.Ref, generation, now); err != nil {
+	}
+
+	existingByID := make(map[string]Subscription, len(subscriptions))
+	if len(ids) > 0 {
+		rows, queryErr := tx.Query(ctx, `SELECT s.subscription_id::text,s.controller_id::text,s.installation_id,s.repository_id,s.tracked_ref,s.retired_generation FROM unnest($1::text[]) requested(subscription_id) JOIN relay_subscriptions s ON s.subscription_id=requested.subscription_id::uuid FOR UPDATE OF s`, ids)
+		if queryErr != nil {
+			return queryErr
+		}
+		for rows.Next() {
+			var subscriptionID, existingController, ref string
+			var installationID, repositoryID int64
+			var retired *int64
+			if err = rows.Scan(&subscriptionID, &existingController, &installationID, &repositoryID, &ref, &retired); err != nil {
+				rows.Close()
 				return err
 			}
-		} else {
+			if existingController != controllerID || retired != nil {
+				rows.Close()
+				return ErrConflict
+			}
+			existingByID[subscriptionID] = Subscription{SubscriptionID: subscriptionID, InstallationID: installationID, RepositoryID: repositoryID, Ref: ref}
+		}
+		rows.Close()
+		if rows.Err() != nil {
+			return rows.Err()
+		}
+		for subscriptionID, existing := range existingByID {
+			if seen[subscriptionID] != existing {
+				return ErrConflict
+			}
+		}
+	}
+
+	if len(active) > 0 {
+		if _, err = tx.Exec(ctx, `UPDATE relay_subscriptions s SET retired_generation=$2,retired_at=$4 WHERE s.controller_id=$1 AND s.retired_generation IS NULL AND NOT EXISTS(SELECT 1 FROM unnest($3::text[]) requested(subscription_id) WHERE requested.subscription_id::uuid=s.subscription_id)`, controllerID, generation, ids, now); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO relay_subscription_set_items(controller_id,set_generation,subscription_id,created_at) VALUES($1,$2,$3,$4)`, controllerID, generation, sub.SubscriptionID, now); err != nil {
+	}
+	newSubscriptions := make([]Subscription, 0, len(subscriptions)-len(existingByID))
+	for _, sub := range subscriptions {
+		if _, exists := existingByID[sub.SubscriptionID]; !exists {
+			newSubscriptions = append(newSubscriptions, sub)
+		}
+	}
+	if len(newSubscriptions) > 0 {
+		newIDs, newInstallations, newRepositories, newRefs := subscriptionArrays(newSubscriptions)
+		if _, err = tx.Exec(ctx, `INSERT INTO relay_subscriptions(subscription_id,controller_id,installation_id,repository_id,tracked_ref,activated_generation,created_at) SELECT subscription_id::uuid,$1,installation_id,repository_id,tracked_ref,$2,$7 FROM unnest($3::text[],$4::bigint[],$5::bigint[],$6::text[]) input(subscription_id,installation_id,repository_id,tracked_ref)`, controllerID, generation, newIDs, newInstallations, newRepositories, newRefs, now); err != nil {
+			return err
+		}
+	}
+	if len(ids) > 0 {
+		if _, err = tx.Exec(ctx, `INSERT INTO relay_subscription_set_items(controller_id,set_generation,subscription_id,created_at) SELECT $1,$2,subscription_id::uuid,$4 FROM unnest($3::text[]) input(subscription_id)`, controllerID, generation, ids, now); err != nil {
 			return err
 		}
 	}
@@ -182,6 +189,20 @@ func (s *Store) syncSubscriptionsLocked(ctx context.Context, tx pgx.Tx, controll
 		return err
 	}
 	return nil
+}
+
+func subscriptionArrays(subscriptions []Subscription) ([]string, []int64, []int64, []string) {
+	ids := make([]string, len(subscriptions))
+	installations := make([]int64, len(subscriptions))
+	repositories := make([]int64, len(subscriptions))
+	refs := make([]string, len(subscriptions))
+	for index, sub := range subscriptions {
+		ids[index] = sub.SubscriptionID
+		installations[index] = sub.InstallationID
+		repositories[index] = sub.RepositoryID
+		refs[index] = sub.Ref
+	}
+	return ids, installations, repositories, refs
 }
 
 func activeSubscriptions(ctx context.Context, tx interface {

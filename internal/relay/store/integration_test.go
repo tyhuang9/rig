@@ -3,8 +3,11 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -12,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/relay/protocol"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -116,6 +120,135 @@ func TestPostgreSQLRelayMigrationUpgradeFrom001(t *testing.T) {
 	}
 }
 
+func TestPostgreSQLAcquireLeaseSerializesWithTerminalSessionMutations(t *testing.T) {
+	dsn := os.Getenv("RIG_RELAY_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skipf("RIG_RELAY_TEST_DATABASE_URL is unset; AcquireLease terminal-mutation concurrency regression not run")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := "relay_lease_race_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	quoted := pgx.Identifier{schema}.Sanitize()
+	if _, err = admin.Exec(ctx, "CREATE SCHEMA "+quoted); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = admin.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+quoted+" CASCADE") })
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err = Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+
+	for index, operation := range []string{"controller revoke", "self key revoke", "rotation finalize"} {
+		t.Run(operation, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			controllerID, keyID := uuid.NewString(), uuid.NewString()
+			activeSessionID, candidateSessionID := uuid.NewString(), uuid.NewString()
+			leaseID := uuid.NewString()
+			store, err := New(pool, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO relay_controllers(controller_id,state,created_at) VALUES($1,'active',$2)`, controllerID, now); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO relay_controller_keys(key_id,controller_id,public_key,state,created_at) VALUES($1,$2,$3,'active',$4)`, keyID, controllerID, bytes.Repeat([]byte{byte(20 + index)}, protocol.PublicKeyBytes), now); err != nil {
+				t.Fatal(err)
+			}
+			for sessionIndex, sessionID := range []string{activeSessionID, candidateSessionID} {
+				challengeByte := byte(80 + index*8 + sessionIndex)
+				challenge := ChallengeInput{
+					SessionID: sessionID, ControllerID: controllerID, KeyID: keyID,
+					ClientNonce: bytes.Repeat([]byte{challengeByte}, protocol.NonceBytes),
+					ServerNonce: bytes.Repeat([]byte{challengeByte + 2}, protocol.NonceBytes),
+					ACKDigest:   bytes.Repeat([]byte{challengeByte + 4}, sha256.Size),
+					ExpiresAt:   now.Add(time.Minute),
+				}
+				if err := store.CreateChallenge(ctx, challenge); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.ConsumeChallenge(ctx, sessionID, now.Add(time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO relay_controller_leases(controller_id,session_id,lease_id,fence,expires_at,updated_at) VALUES($1,$2,$3,1,$4,$5)`, controllerID, activeSessionID, leaseID, now.Add(time.Minute), now); err != nil {
+				t.Fatal(err)
+			}
+			lease := Lease{ControllerID: controllerID, SessionID: activeSessionID, LeaseID: leaseID, Fence: 1, ExpiresAt: now.Add(time.Minute)}
+			commandType := CommandControllerRevoke
+			terminal := func(runCtx context.Context, command SessionCommand) error {
+				_, applyErr := store.ApplyControllerRevocation(runCtx, lease, command, controllerID)
+				return applyErr
+			}
+			switch operation {
+			case "self key revoke":
+				commandType = CommandKeyRevoke
+				terminal = func(runCtx context.Context, command SessionCommand) error {
+					_, applyErr := store.ApplyKeyRevocation(runCtx, lease, command, controllerID, keyID)
+					return applyErr
+				}
+			case "rotation finalize":
+				commandType = CommandRotationFinalize
+				rotationID, newKeyID := uuid.NewString(), uuid.NewString()
+				if _, err := pool.Exec(ctx, `INSERT INTO relay_controller_keys(key_id,controller_id,public_key,state,rotation_id,rotation_old_key_id,rotation_session_id,rotation_nonce,rotation_expires_at,created_at,possession_confirmed_at) VALUES($1,$2,$3,'pending',$4,$5,$6,$7,$8,$9,$9)`, newKeyID, controllerID, bytes.Repeat([]byte{byte(40 + index)}, protocol.PublicKeyBytes), rotationID, keyID, activeSessionID, bytes.Repeat([]byte{byte(60 + index)}, protocol.NonceBytes), now.Add(time.Minute), now); err != nil {
+					t.Fatal(err)
+				}
+				terminal = func(runCtx context.Context, command SessionCommand) error {
+					_, applyErr := store.ApplyRotationFinalization(runCtx, lease, command, rotationID)
+					return applyErr
+				}
+			}
+			messageID := uuid.NewString()
+			command := SessionCommand{MessageID: messageID, Type: commandType, Digest: sha256.Sum256([]byte(messageID))}
+			runCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			start := make(chan struct{})
+			type outcome struct {
+				name string
+				err  error
+			}
+			results := make(chan outcome, 2)
+			go func() {
+				<-start
+				_, acquireErr := store.AcquireLease(runCtx, candidateSessionID, time.Minute)
+				results <- outcome{name: "acquire", err: acquireErr}
+			}()
+			go func() {
+				<-start
+				results <- outcome{name: "terminal", err: terminal(runCtx, command)}
+			}()
+			close(start)
+			seen := make(map[string]error, 2)
+			for len(seen) < 2 {
+				select {
+				case result := <-results:
+					seen[result.name] = result.err
+				case <-runCtx.Done():
+					t.Fatalf("possible deadlock: %v", runCtx.Err())
+				}
+			}
+			if seen["terminal"] != nil {
+				t.Fatalf("terminal mutation: %v", seen["terminal"])
+			}
+			if !errors.Is(seen["acquire"], ErrConflict) && !errors.Is(seen["acquire"], ErrExpired) {
+				t.Fatalf("AcquireLease error=%v, want conflict or expired", seen["acquire"])
+			}
+		})
+	}
+}
+
 func TestPostgreSQLRelayStateIntegration(t *testing.T) {
 	dsn := os.Getenv("RIG_RELAY_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -155,7 +288,8 @@ func TestPostgreSQLRelayStateIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	controllerID, keyID, subscriptionID := uuid.NewString(), uuid.NewString(), uuid.NewString()
-	publicKey := bytes.Repeat([]byte{3}, 32)
+	oldPrivateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{3}, ed25519.SeedSize))
+	publicKey := oldPrivateKey.Public().(ed25519.PublicKey)
 	stateHash, pollHash := bytes.Repeat([]byte{4}, 32), bytes.Repeat([]byte{5}, 32)
 	enrollmentID, err := s.CreateEnrollment(ctx, EnrollmentInput{ControllerID: controllerID, KeyID: keyID, PublicKey: publicKey, InstallationID: 10, RepositoryID: 20, StateHash: stateHash, PollHash: pollHash, PKCECiphertext: bytes.Repeat([]byte{6}, 29), PKCESealNonce: bytes.Repeat([]byte{7}, 12), RequestNonce: bytes.Repeat([]byte{8}, 32), ExpiresAt: now.Add(10 * time.Minute)})
 	if err != nil {
@@ -180,6 +314,29 @@ func TestPostgreSQLRelayStateIntegration(t *testing.T) {
 	if err != nil || status.Status != "authorized" {
 		t.Fatalf("idempotent poll=%#v %v", status, err)
 	}
+	newCommand := func(commandType SessionCommandType) SessionCommand {
+		messageID := uuid.NewString()
+		return SessionCommand{MessageID: messageID, Type: commandType, Digest: sha256.Sum256([]byte(messageID))}
+	}
+	sessionID := uuid.NewString()
+	if err = s.CreateChallenge(ctx, ChallengeInput{SessionID: sessionID, ControllerID: controllerID, KeyID: keyID, ClientNonce: bytes.Repeat([]byte{1}, 32), ServerNonce: bytes.Repeat([]byte{2}, 32), ACKDigest: bytes.Repeat([]byte{3}, 32), ExpiresAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	authChallenge, err := s.LoadChallengeForAuthentication(ctx, sessionID)
+	if err != nil || !bytes.Equal(authChallenge.PublicKey, publicKey) || authChallenge.ControllerID != controllerID || authChallenge.KeyID != keyID {
+		t.Fatalf("auth challenge=%#v %v", authChallenge, err)
+	}
+	authChallenge.Destroy()
+	if err = s.ConsumeChallenge(ctx, sessionID, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ConsumeChallenge(ctx, sessionID, now.Add(time.Hour)); !errors.Is(err, ErrReplay) {
+		t.Fatalf("challenge replay=%v", err)
+	}
+	lease, err := s.AcquireLease(ctx, sessionID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Existing controller/key can authorize a second exact repository and can
 	// reauthorize a binding without replacing its original creation audit.
 	secondState, secondPoll := bytes.Repeat([]byte{9}, 32), bytes.Repeat([]byte{10}, 32)
@@ -193,8 +350,8 @@ func TestPostgreSQLRelayStateIntegration(t *testing.T) {
 	if err = s.CompleteEnrollment(ctx, secondID); err != nil {
 		t.Fatal(err)
 	}
-	if err = s.RevokeBinding(ctx, controllerID, 10, 21); err != nil {
-		t.Fatal(err)
+	if result, applyErr := s.ApplyBindingRemoval(ctx, lease, newCommand(CommandBindingRemove), 10, 21); applyErr != nil || result.Kind != ResultBindingRemoved {
+		t.Fatalf("binding removal=%#v %v", result, applyErr)
 	}
 	reauthState, reauthPoll := bytes.Repeat([]byte{15}, 32), bytes.Repeat([]byte{16}, 32)
 	reauthID, err := s.CreateEnrollment(ctx, EnrollmentInput{ControllerID: controllerID, KeyID: keyID, PublicKey: publicKey, InstallationID: 10, RepositoryID: 21, StateHash: reauthState, PollHash: reauthPoll, PKCECiphertext: bytes.Repeat([]byte{17}, 29), PKCESealNonce: bytes.Repeat([]byte{18}, 12), RequestNonce: bytes.Repeat([]byte{19}, 32), ExpiresAt: now.Add(10 * time.Minute)})
@@ -218,14 +375,16 @@ func TestPostgreSQLRelayStateIntegration(t *testing.T) {
 	if err = s.CompleteEnrollment(ctx, mismatchID); !errors.Is(err, ErrConflict) {
 		t.Fatalf("mismatched key enrollment=%v", err)
 	}
-	if err = s.SyncSubscriptions(ctx, controllerID, 1, []Subscription{{SubscriptionID: subscriptionID, InstallationID: 10, RepositoryID: 20, Ref: "refs/heads/main"}}); err != nil {
-		t.Fatal(err)
+	subscriptions := []Subscription{{SubscriptionID: subscriptionID, InstallationID: 10, RepositoryID: 20, Ref: "refs/heads/main"}}
+	syncCommand := newCommand(CommandSubscriptionsSync)
+	if result, applyErr := s.ApplySubscriptionsSync(ctx, lease, syncCommand, 1, subscriptions); applyErr != nil || result.Kind != ResultSubscriptionsSynced {
+		t.Fatalf("subscriptions sync=%#v %v", result, applyErr)
 	}
-	if err = s.SyncSubscriptions(ctx, controllerID, 1, []Subscription{{SubscriptionID: subscriptionID, InstallationID: 10, RepositoryID: 20, Ref: "refs/heads/main"}}); err != nil {
-		t.Fatalf("same generation retransmit: %v", err)
+	if result, applyErr := s.ApplySubscriptionsSync(ctx, lease, syncCommand, 1, subscriptions); applyErr != nil || result.Kind != ResultSubscriptionsSynced {
+		t.Fatalf("same generation retransmit=%#v %v", result, applyErr)
 	}
-	if err = s.SyncSubscriptions(ctx, controllerID, 3, []Subscription{}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("skipped generation=%v", err)
+	if _, applyErr := s.ApplySubscriptionsSync(ctx, lease, newCommand(CommandSubscriptionsSync), 3, []Subscription{}); !errors.Is(applyErr, ErrConflict) {
+		t.Fatalf("skipped generation=%v", applyErr)
 	}
 	event := SourceEvent{DeliveryID: uuid.NewString(), InstallationID: 10, RepositoryID: 20, Ref: "refs/heads/main", SHA: strings.Repeat("a", 40), ReceivedAt: now, ObservedAt: now}
 	route := SourceRoute{ControllerID: controllerID, SubscriptionID: subscriptionID}
@@ -242,11 +401,15 @@ func TestPostgreSQLRelayStateIntegration(t *testing.T) {
 	second := event
 	second.DeliveryID = uuid.NewString()
 	second.SHA = strings.Repeat("b", 40)
-	decision := Decision{MessageID: uuid.NewString(), Accepted: true}
+	decisionCommand := newCommand(CommandAckSource)
+	targetMessageID := uuid.NewString()
 	var wg sync.WaitGroup
 	var ackErr, pushErr error
 	wg.Add(2)
-	go func() { defer wg.Done(); ackErr = s.DecideSource(ctx, controllerID, subscriptionID, 1, decision) }()
+	go func() {
+		defer wg.Done()
+		_, ackErr = s.ApplySourceDecision(ctx, lease, decisionCommand, subscriptionID, 1, targetMessageID, true, "")
+	}()
 	go func() { defer wg.Done(); _, pushErr = s.PushSourceEvent(ctx, second, []SourceRoute{route}) }()
 	wg.Wait()
 	if pushErr != nil {
@@ -255,49 +418,41 @@ func TestPostgreSQLRelayStateIntegration(t *testing.T) {
 	if ackErr != nil && !errors.Is(ackErr, ErrConflict) {
 		t.Fatal(ackErr)
 	}
-	pending, err := s.PendingDesired(ctx, controllerID, 10)
+	pending, err := s.PendingDesired(ctx, lease, 10)
 	if err != nil || len(pending) != 1 || pending[0].Generation != 2 {
 		t.Fatalf("pending=%#v %v", pending, err)
 	}
-	sessionID := uuid.NewString()
-	if err = s.CreateChallenge(ctx, ChallengeInput{SessionID: sessionID, ControllerID: controllerID, KeyID: keyID, ClientNonce: bytes.Repeat([]byte{1}, 32), ServerNonce: bytes.Repeat([]byte{2}, 32), ACKDigest: bytes.Repeat([]byte{3}, 32), ExpiresAt: now.Add(time.Minute)}); err != nil {
-		t.Fatal(err)
+	newPrivateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{14}, ed25519.SeedSize))
+	newPublicKey := newPrivateKey.Public().(ed25519.PublicKey)
+	rotation := RotationInput{RotationID: uuid.NewString(), ControllerID: controllerID, OldKeyID: keyID, NewKeyID: uuid.NewString(), SessionID: sessionID, NewPublicKey: newPublicKey}
+	rotationChallenge, err := s.ApplyRotationProposal(ctx, lease, newCommand(CommandRotationPropose), rotation, time.Minute)
+	if err != nil || rotationChallenge.Kind != ResultRotationChallenge {
+		t.Fatalf("rotation proposal=%#v %v", rotationChallenge, err)
 	}
-	authChallenge, err := s.LoadChallengeForAuthentication(ctx, sessionID)
-	if err != nil || !bytes.Equal(authChallenge.PublicKey, publicKey) || authChallenge.ControllerID != controllerID || authChallenge.KeyID != keyID {
-		t.Fatalf("auth challenge=%#v %v", authChallenge, err)
-	}
-	authChallenge.Destroy()
-	if err = s.ConsumeChallenge(ctx, sessionID, now.Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	if err = s.ConsumeChallenge(ctx, sessionID, now.Add(time.Hour)); !errors.Is(err, ErrReplay) {
-		t.Fatalf("challenge replay=%v", err)
-	}
-	lease, err := s.AcquireLease(ctx, sessionID, time.Minute)
+	transcript, err := protocol.KeyRotationTranscript(protocol.RotationProof{RotationID: rotation.RotationID, ControllerID: controllerID, OldKeyID: keyID, NewKeyID: rotation.NewKeyID, NewPublicKey: base64.RawURLEncoding.EncodeToString(newPublicKey), SessionID: sessionID, ServerNonce: base64.RawURLEncoding.EncodeToString(rotationChallenge.Nonce), ExpiresAt: rotationChallenge.ExpiresAt})
 	if err != nil {
 		t.Fatal(err)
 	}
-	messageID := uuid.NewString()
-	if err = s.RecordSessionMessage(ctx, lease, messageID); err != nil {
-		t.Fatal(err)
-	}
-	if err = s.RecordSessionMessage(ctx, lease, messageID); !errors.Is(err, ErrReplay) {
-		t.Fatalf("message replay=%v", err)
-	}
-	rotation := RotationInput{RotationID: uuid.NewString(), ControllerID: controllerID, OldKeyID: keyID, NewKeyID: uuid.NewString(), SessionID: sessionID, NewPublicKey: bytes.Repeat([]byte{14}, 32)}
-	rotationChallenge, err := s.ProposeRotation(ctx, rotation, time.Minute)
+	signature, err := protocol.Sign(newPrivateKey, transcript)
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := s.LoadRotationChallenge(ctx, controllerID, rotation.RotationID)
-	if err != nil || !bytes.Equal(loaded.Nonce, rotationChallenge.Nonce) {
-		t.Fatalf("rotation load=%#v %v", loaded, err)
+	if result, applyErr := s.ApplyRotationConfirmation(ctx, lease, newCommand(CommandRotationConfirm), rotation.RotationID, signature); applyErr != nil || result.Kind != ResultRotationConfirmed {
+		t.Fatalf("rotation confirmation=%#v %v", result, applyErr)
 	}
-	if err = s.ConfirmRotation(ctx, controllerID, rotation.RotationID); err != nil {
+	if result, applyErr := s.ApplyRotationFinalization(ctx, lease, newCommand(CommandRotationFinalize), rotation.RotationID); applyErr != nil || result.Kind != ResultRotationFinalized || result.RetiredKeyID != keyID {
+		t.Fatalf("rotation finalization=%#v %v", result, applyErr)
+	}
+	rotationChallenge.Destroy()
+	newSessionID := uuid.NewString()
+	if err = s.CreateChallenge(ctx, ChallengeInput{SessionID: newSessionID, ControllerID: controllerID, KeyID: rotation.NewKeyID, ClientNonce: bytes.Repeat([]byte{31}, 32), ServerNonce: bytes.Repeat([]byte{32}, 32), ACKDigest: bytes.Repeat([]byte{33}, 32), ExpiresAt: now.Add(time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
-	if err = s.FinalizeRotation(ctx, rotation); err != nil {
+	if err = s.ConsumeChallenge(ctx, newSessionID, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	lease, err = s.AcquireLease(ctx, newSessionID, time.Minute)
+	if err != nil {
 		t.Fatal(err)
 	}
 	revokedState := bytes.Repeat([]byte{26}, 32)
@@ -383,7 +538,7 @@ func TestPostgreSQLRelayStateIntegration(t *testing.T) {
 	if err != nil || len(accessRoutes) != 1 || accessRoutes[0] != controllerID {
 		t.Fatalf("fresh re-enrollment routes=%v err=%v", accessRoutes, err)
 	}
-	accessPending, err := s.PendingAccess(ctx, controllerID, 10)
+	accessPending, err := s.PendingAccess(ctx, lease, 10)
 	if err != nil || len(accessPending) != 1 {
 		t.Fatalf("pending access=%#v %v", accessPending, err)
 	}
@@ -457,5 +612,45 @@ func TestPostgreSQLRelayStateIntegration(t *testing.T) {
 	claims, err = s.ClaimRecovery(ctx, 100, time.Minute)
 	if err != nil || len(claims) != 1 || claims[0].DeliveryID != unresolvedID {
 		t.Fatalf("post-scan unresolved claim=%#v %v", claims, err)
+	}
+
+	// Repeatedly replace the full subscription set without acknowledging its
+	// desired state. Retirement is terminal after the configured history
+	// horizon, while the current generation and its pending target remain.
+	churnIDs := []string{uuid.NewString(), uuid.NewString(), uuid.NewString()}
+	for index, churnID := range churnIDs {
+		generation := uint64(index + 2)
+		churnSubscription := Subscription{SubscriptionID: churnID, InstallationID: 10, RepositoryID: 20, Ref: "refs/heads/main"}
+		if result, applyErr := s.ApplySubscriptionsSync(ctx, lease, newCommand(CommandSubscriptionsSync), generation, []Subscription{churnSubscription}); applyErr != nil || result.Kind != ResultSubscriptionsSynced {
+			t.Fatalf("churn sync generation %d=%#v %v", generation, result, applyErr)
+		}
+		churnEvent := SourceEvent{DeliveryID: uuid.NewString(), InstallationID: 10, RepositoryID: 20, Ref: "refs/heads/main", SHA: strings.Repeat(fmt.Sprintf("%x", index+1), 40), ReceivedAt: now, ObservedAt: now}
+		if _, pushErr := s.PushSourceEvent(ctx, churnEvent, []SourceRoute{{ControllerID: controllerID, SubscriptionID: churnID}}); pushErr != nil {
+			t.Fatalf("churn push generation %d: %v", generation, pushErr)
+		}
+	}
+	now = now.Add(8 * 24 * time.Hour)
+	pruned, err := s.PruneDurableState(ctx, DefaultDurableRetentionPolicy())
+	if err != nil {
+		t.Fatalf("prune churn: %v", err)
+	}
+	if pruned.RetiredSubscriptions < 3 || pruned.RetiredDesiredStates < 2 || pruned.SourceDeliveryTargets < 2 {
+		t.Fatalf("retired churn was not bounded: %+v", pruned)
+	}
+	var retiredCount, currentCount, pendingCurrent, currentTarget int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM relay_subscriptions WHERE subscription_id IN ($1,$2,$3)`, subscriptionID, churnIDs[0], churnIDs[1]).Scan(&retiredCount); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM relay_subscriptions WHERE subscription_id=$1 AND retired_generation IS NULL`, churnIDs[2]).Scan(&currentCount); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM relay_desired_states WHERE subscription_id=$1 AND decision IS NULL`, churnIDs[2]).Scan(&pendingCurrent); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM relay_source_delivery_targets WHERE subscription_id=$1`, churnIDs[2]).Scan(&currentTarget); err != nil {
+		t.Fatal(err)
+	}
+	if retiredCount != 0 || currentCount != 1 || pendingCurrent != 1 || currentTarget != 1 {
+		t.Fatalf("retired=%d current=%d pending=%d target=%d", retiredCount, currentCount, pendingCurrent, currentTarget)
 	}
 }
