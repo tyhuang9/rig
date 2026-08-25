@@ -6,8 +6,10 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -199,6 +201,26 @@ func TestHandlerRejectsMethodOriginPresenceAndMissingSubprotocol(t *testing.T) {
 	}
 }
 
+func TestStopAdmissionsIsStableAndWaitSafe(t *testing.T) {
+	handler, err := NewHandler(&fakeStateStore{}, DefaultConfig(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.StopAdmissions()
+	request := httptest.NewRequest(http.MethodGet, "http://relay.test/ws", nil)
+	request.Header.Set("Sec-WebSocket-Protocol", protocol.Subprotocol)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("Retry-After") != "1" {
+		t.Fatalf("status=%d headers=%v body=%q", response.Code, response.Header(), response.Body.String())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := handler.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHandlerForcesTeardownWhenAcceptedSubprotocolDoesNotMatch(t *testing.T) {
 	handler, err := NewHandler(&fakeStateStore{}, DefaultConfig(), Options{})
 	if err != nil {
@@ -245,6 +267,9 @@ func TestHandlerAdmissionCapacityAndReleasePaths(t *testing.T) {
 	if response.Code != http.StatusServiceUnavailable || called {
 		t.Fatalf("status=%d accept called=%v", response.Code, called)
 	}
+	if stats := handler.Stats(); stats.Active != 0 || stats.Capacity != 1 || stats.CapacityRejections != 1 {
+		t.Fatalf("capacity rejection stats=%+v", stats)
+	}
 	<-handler.admissions
 
 	handler.accept = func(http.ResponseWriter, *http.Request, *websocket.AcceptOptions) (socket, error) {
@@ -262,6 +287,71 @@ func TestHandlerAdmissionCapacityAndReleasePaths(t *testing.T) {
 	handler.ServeHTTP(httptest.NewRecorder(), request())
 	if len(handler.admissions) != 0 {
 		t.Fatal("admission leaked after session exit")
+	}
+}
+
+func TestHandlerUpgradeFailureLogContainsOnlyFixedOperationalFields(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, nil))
+	handler, err := NewHandler(&fakeStateStore{}, DefaultConfig(), Options{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.accept = func(http.ResponseWriter, *http.Request, *websocket.AcceptOptions) (socket, error) {
+		return nil, errors.New("secret-upgrade-token")
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://relay.test/v1/controllers/connect?token=secret-query", nil)
+	request.Header.Set("Sec-WebSocket-Protocol", protocol.Subprotocol)
+	request.Header.Set("Authorization", "Bearer secret-header")
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+	logged := output.String()
+	if !strings.Contains(logged, `"msg":"relay WSS admission failed"`) || !strings.Contains(logged, `"code":"upgrade_failed"`) {
+		t.Fatalf("missing fixed WSS log fields: %q", logged)
+	}
+	for _, forbidden := range []string{"secret-upgrade-token", "secret-query", "secret-header", "Authorization", request.URL.String()} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("WSS log leaked %q: %q", forbidden, logged)
+		}
+	}
+}
+
+func TestHandlerStatsIncludeHandshakeAndWaitForEveryExit(t *testing.T) {
+	config := DefaultConfig()
+	config.MaxConnections = 2
+	handler, err := NewHandler(&fakeStateStore{}, config, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	handler.accept = func(http.ResponseWriter, *http.Request, *websocket.AcceptOptions) (socket, error) {
+		entered <- struct{}{}
+		<-release
+		return nil, errors.New("upgrade stopped")
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://relay.test/v1/controllers/connect", nil)
+	request.Header.Set("Sec-WebSocket-Protocol", protocol.Subprotocol)
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(httptest.NewRecorder(), request)
+		close(done)
+	}()
+	<-entered
+	if stats := handler.Stats(); stats.Active != 1 || stats.Capacity != 2 || stats.CapacityRejections != 0 {
+		t.Fatalf("handshake stats=%+v", stats)
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	if err := handler.Wait(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Wait while active=%v", err)
+	}
+	close(release)
+	<-done
+	if err := handler.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if stats := handler.Stats(); stats.Active != 0 || stats.Capacity != 2 || stats.CapacityRejections != 0 {
+		t.Fatalf("exit stats=%+v", stats)
 	}
 }
 
@@ -626,5 +716,41 @@ func TestAuthenticatedFullSyncUsesActiveFrameBound(t *testing.T) {
 	}
 	if _, err = canonicalSessionCommand(decoded, config.MaxEnvelopeBytes); err != nil {
 		t.Fatalf("canonical full sync: %v", err)
+	}
+}
+
+func TestStatsExposeOnlyClosedAggregateDimensionsConcurrently(t *testing.T) {
+	handler, err := NewHandler(&fakeStateStore{}, DefaultConfig(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.observeLifecycle("ghp_secret_dynamic")
+	handler.observeDelivery("https://repository.example")
+	handler.observeDecision("raw_error")
+	done := make(chan struct{}, 6)
+	for i := 0; i < 6; i++ {
+		go func() {
+			for j := 0; j < 100; j++ {
+				handler.observeLifecycle("handshake")
+				handler.observeDelivery("desired")
+				handler.observeDecision("ack")
+				_ = handler.Stats()
+			}
+			done <- struct{}{}
+		}()
+	}
+	for i := 0; i < 6; i++ {
+		<-done
+	}
+	stats := handler.Stats()
+	if stats.LifecycleOutcomes[0] != 600 || stats.Deliveries[0] != 600 || stats.Decisions[0] != 600 {
+		t.Fatalf("stats=%+v", stats)
+	}
+	for _, values := range [][]uint64{stats.LifecycleOutcomes[:], stats.Deliveries[:], stats.Decisions[:]} {
+		for index := 1; index < len(values); index++ {
+			if values[index] != 0 {
+				t.Fatalf("unexpected dynamic dimension accepted: %+v", stats)
+			}
+		}
 	}
 }

@@ -50,18 +50,28 @@ func validSource(t *testing.T) *memorySource {
 		t.Fatal(err)
 	}
 	privatePEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	now := time.Now()
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "relay.example.test"}, DNSNames: []string{"relay.example.test"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment}
+	certificateDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
 	env := map[string]string{
 		EnvPublicBaseURL:   "https://relay.example.test",
 		EnvPostgresDSNFile: "dsn", EnvGitHubClientID: "Iv1.test_client", EnvGitHubAppID: "42",
 		EnvGitHubClientSecretFile: "client-secret", EnvGitHubPrivateKeyFile: "app-key",
 		EnvWebhookSecretFile: "webhook-secret", EnvEnrollmentKeyFile: "enrollment-key",
+		EnvTLSCertificateFile: "tls-certificate", EnvTLSPrivateKeyFile: "tls-private-key",
 	}
 	files := map[string]File{
-		"dsn":            {Data: []byte("postgres://relay:password@database/relay?sslmode=require"), Mode: 0o600, Regular: true},
-		"client-secret":  {Data: []byte("0123456789abcdef-client"), Mode: 0o600, Regular: true},
-		"app-key":        {Data: privatePEM, Mode: 0o600, Regular: true},
-		"webhook-secret": {Data: []byte("0123456789abcdef-webhook"), Mode: 0o600, Regular: true},
-		"enrollment-key": {Data: make([]byte, 32), Mode: 0o600, Regular: true},
+		"dsn":             {Data: []byte("postgres://relay:password@database/relay?sslmode=require"), Mode: 0o600, Regular: true},
+		"client-secret":   {Data: []byte("0123456789abcdef-client"), Mode: 0o600, Regular: true},
+		"app-key":         {Data: privatePEM, Mode: 0o600, Regular: true},
+		"webhook-secret":  {Data: []byte("0123456789abcdef-webhook"), Mode: 0o600, Regular: true},
+		"enrollment-key":  {Data: make([]byte, 32), Mode: 0o600, Regular: true},
+		"tls-certificate": {Data: certificatePEM, Mode: 0o644, Regular: true},
+		"tls-private-key": {Data: append([]byte(nil), privatePEM...), Mode: 0o600, Regular: true},
 	}
 	for i := range files["enrollment-key"].Data {
 		files["enrollment-key"].Data[i] = byte(i)
@@ -160,6 +170,12 @@ func TestPublicURLAndListenValidation(t *testing.T) {
 			if test.development != "" {
 				source.env[EnvLoopbackDevelopment] = test.development
 			}
+			if test.name == "loopback development" {
+				delete(source.env, EnvTLSCertificateFile)
+				delete(source.env, EnvTLSPrivateKeyFile)
+				delete(source.files, "tls-certificate")
+				delete(source.files, "tls-private-key")
+			}
 			configuration, err := Load(source)
 			if (err == nil) != test.ok {
 				t.Fatalf("Load() error = %v, want success %v", err, test.ok)
@@ -236,8 +252,8 @@ func TestTLSCertificatePairValidation(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
 		source := validSource(t)
 		source.env[EnvTLSCertificateFile], source.env[EnvTLSPrivateKeyFile] = "cert", "tls-key"
-		source.files["cert"] = File{Data: cert, Mode: 0o644, Regular: true}
-		source.files["tls-key"] = File{Data: key, Mode: 0o600, Regular: true}
+		source.files["cert"] = File{Data: append([]byte(nil), cert...), Mode: 0o644, Regular: true}
+		source.files["tls-key"] = File{Data: append([]byte(nil), key...), Mode: 0o600, Regular: true}
 		configuration, err := Load(source)
 		if err != nil {
 			t.Fatal(err)
@@ -248,7 +264,7 @@ func TestTLSCertificatePairValidation(t *testing.T) {
 		_, otherKey := testCertificatePair(t)
 		source := validSource(t)
 		source.env[EnvTLSCertificateFile], source.env[EnvTLSPrivateKeyFile] = "cert", "tls-key"
-		source.files["cert"] = File{Data: cert, Mode: 0o644, Regular: true}
+		source.files["cert"] = File{Data: append([]byte(nil), cert...), Mode: 0o644, Regular: true}
 		source.files["tls-key"] = File{Data: otherKey, Mode: 0o600, Regular: true}
 		_, err := Load(source)
 		assertConfigCode(t, err, CodeInvalid)
@@ -263,9 +279,31 @@ func TestTLSCertificatePairValidation(t *testing.T) {
 	t.Run("pair required", func(t *testing.T) {
 		source := validSource(t)
 		source.env[EnvTLSCertificateFile] = "cert"
-		source.files["cert"] = File{Data: cert, Mode: 0o644, Regular: true}
+		delete(source.env, EnvTLSPrivateKeyFile)
+		source.files["cert"] = File{Data: append([]byte(nil), cert...), Mode: 0o644, Regular: true}
 		_, err := Load(source)
 		assertConfigCode(t, err, CodeInvalid)
+	})
+	t.Run("production pair required", func(t *testing.T) {
+		source := validSource(t)
+		secretViews := [][]byte{
+			source.files["dsn"].Data,
+			source.files["client-secret"].Data,
+			source.files["app-key"].Data,
+			source.files["webhook-secret"].Data,
+			source.files["enrollment-key"].Data,
+		}
+		delete(source.env, EnvTLSCertificateFile)
+		delete(source.env, EnvTLSPrivateKeyFile)
+		_, err := Load(source)
+		assertConfigCode(t, err, CodeInvalid)
+		for _, view := range secretViews {
+			for _, value := range view {
+				if value != 0 {
+					t.Fatal("production TLS rejection retained secret input")
+				}
+			}
+		}
 	})
 }
 
@@ -278,12 +316,11 @@ func TestRecoveryWindowIsCappedAtGitHubRedeliveryHorizon(t *testing.T) {
 
 func TestDurationAndLimitBounds(t *testing.T) {
 	tests := []struct{ name, env, value string }{
-		{"read too short", EnvReadTimeout, "999ms"}, {"write too long", EnvWriteTimeout, "61s"}, {"idle too short", EnvIdleTimeout, "9s"},
+		{"read too short", EnvReadTimeout, "999ms"}, {"write too long", EnvWriteTimeout, "30s1ns"}, {"idle too short", EnvIdleTimeout, "9s"},
 		{"recovery interval too short", EnvRecoveryInterval, "999ms"}, {"recovery order", EnvRecoveryInterval, "24h"},
-		{"minimum session too short", EnvMinSessionDuration, "59s"}, {"maximum session too long", EnvMaxSessionDuration, "721h"},
-		{"envelope too small", EnvMaxEnvelopeBytes, "4095"}, {"envelope too large", EnvMaxEnvelopeBytes, "8388609"},
+		{"maximum session too long", EnvMaxSessionDuration, "24h1ns"},
+		{"envelope too small", EnvMaxEnvelopeBytes, "4095"}, {"envelope too large", EnvMaxEnvelopeBytes, "1048577"},
 		{"subscriptions zero", EnvMaxSubscriptions, "0"}, {"subscriptions above protocol cap", EnvMaxSubscriptions, "1001"},
-		{"sources zero", EnvMaxSourcesPerSubscription, "0"}, {"sources huge", EnvMaxSourcesPerSubscription, "100001"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -293,6 +330,22 @@ func TestDurationAndLimitBounds(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected error")
 			}
+		})
+	}
+
+	for _, boundary := range []struct{ env, value string }{
+		{EnvWriteTimeout, "30s"},
+		{EnvMaxSessionDuration, "24h"},
+		{EnvMaxEnvelopeBytes, "1048576"},
+	} {
+		t.Run("accept boundary "+boundary.env, func(t *testing.T) {
+			source := validSource(t)
+			source.env[boundary.env] = boundary.value
+			configuration, err := Load(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			configuration.DestroySecrets()
 		})
 	}
 }
@@ -362,6 +415,57 @@ func TestPKCS8RSAPrivateKeyIsAccepted(t *testing.T) {
 		t.Fatal(err)
 	}
 	configuration.DestroySecrets()
+}
+
+func TestParseRSAPrivateKeyReturnsOnlySafeSentinel(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkcs1 := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rsaKey)})
+	pkcs8DER, err := x509.MarshalPKCS8PrivateKey(rsaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkcs8 := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8DER})
+	for _, valid := range [][]byte{pkcs1, pkcs8} {
+		parsed, parseErr := ParseRSAPrivateKey(valid)
+		if parseErr != nil || parsed.N.Cmp(rsaKey.N) != 0 {
+			t.Fatalf("valid key rejected: parsed=%v err=%v", parsed != nil, parseErr)
+		}
+	}
+
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edDER, err := x509.MarshalPKCS8PrivateKey(edKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	weak, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := [][]byte{
+		nil,
+		[]byte("not pem: secret-parser-detail"),
+		pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: []byte("secret-parser-detail")}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: edDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(weak)}),
+		append(append([]byte(nil), pkcs1...), pkcs1...),
+		append(append([]byte(nil), pkcs1...), '\n'),
+		pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Headers: map[string]string{"X-Test": "secret-parser-detail"}, Bytes: x509.MarshalPKCS1PrivateKey(rsaKey)}),
+	}
+	for index, value := range invalid {
+		parsed, parseErr := ParseRSAPrivateKey(value)
+		if parsed != nil || parseErr != ErrInvalidRSAPrivateKey {
+			t.Fatalf("invalid[%d]: parsed=%v err=%v", index, parsed != nil, parseErr)
+		}
+		if strings.Contains(parseErr.Error(), "secret-parser-detail") {
+			t.Fatalf("invalid[%d] leaked parser input: %v", index, parseErr)
+		}
+	}
 }
 
 func TestOSSourceRejectsNonRegularAndSymlink(t *testing.T) {

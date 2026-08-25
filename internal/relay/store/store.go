@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,21 +21,28 @@ import (
 )
 
 var (
-	ErrInvalid  = errors.New("relay store invalid input")
-	ErrNotFound = errors.New("relay store record not found")
-	ErrConflict = errors.New("relay store conflict")
-	ErrExpired  = errors.New("relay store record expired")
-	ErrReplay   = errors.New("relay store replay detected")
-	ErrCapacity = errors.New("relay store capacity reached")
-	codePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+	ErrInvalid     = errors.New("relay store invalid input")
+	ErrNotFound    = errors.New("relay store record not found")
+	ErrConflict    = errors.New("relay store conflict")
+	ErrExpired     = errors.New("relay store record expired")
+	ErrReplay      = errors.New("relay store replay detected")
+	ErrCapacity    = errors.New("relay store capacity reached")
+	ErrUnavailable = errors.New("relay store unavailable")
+	codePattern    = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 )
 
 const enrollmentCapacityLock int64 = 0x524947454e524f4c
 
 type Options struct {
-	Now         func() time.Time
-	NewUUID     func() uuid.UUID
-	RandomBytes func([]byte) error
+	Now               func() time.Time
+	NewUUID           func() uuid.UUID
+	RandomBytes       func([]byte) error
+	ReadinessObserver ReadinessObserver
+}
+
+// ReadinessObserver receives only closed result and cache-state codes.
+type ReadinessObserver interface {
+	ObserveReadiness(result, cacheState string)
 }
 type database interface {
 	Begin(context.Context) (pgx.Tx, error)
@@ -43,11 +51,19 @@ type database interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 type Store struct {
-	pool        database
-	close       func()
-	now         func() time.Time
-	newUUID     func() uuid.UUID
-	randomBytes func([]byte) error
+	pool          database
+	close         func()
+	now           func() time.Time
+	newUUID       func() uuid.UUID
+	randomBytes   func([]byte) error
+	readyMu       sync.Mutex
+	readyResult   error
+	readyAt       time.Time
+	readyProbe    chan struct{}
+	readyContext  context.Context
+	readyCancel   context.CancelFunc
+	readyObserver ReadinessObserver
+	closeOnce     sync.Once
 }
 
 func Open(ctx context.Context, dsn string, options Options) (*Store, error) {
@@ -82,11 +98,112 @@ func New(pool *pgxpool.Pool, options Options) (*Store, error) {
 	if options.RandomBytes == nil {
 		options.RandomBytes = func(dst []byte) error { _, err := rand.Read(dst); return err }
 	}
-	return &Store{pool: pool, close: pool.Close, now: options.Now, newUUID: options.NewUUID, randomBytes: options.RandomBytes}, nil
+	readyContext, readyCancel := context.WithCancel(context.Background())
+	return &Store{pool: pool, close: pool.Close, now: options.Now, newUUID: options.NewUUID, randomBytes: options.RandomBytes, readyContext: readyContext, readyCancel: readyCancel, readyObserver: options.ReadinessObserver}, nil
+}
+
+func (s *Store) observeReadiness(result, state string) {
+	if s != nil && s.readyObserver != nil {
+		s.readyObserver.ObserveReadiness(result, state)
+	}
 }
 func (s *Store) Close() {
-	if s != nil && s.close != nil {
-		s.close()
+	if s != nil {
+		s.closeOnce.Do(func() {
+			if s.readyCancel != nil {
+				s.readyCancel()
+			}
+			if s.close != nil {
+				s.close()
+			}
+		})
+	}
+}
+
+// Ready performs a bounded, read-only connectivity check. Database failures
+// collapse to a fixed sentinel so operational endpoints cannot expose them.
+func (s *Store) Ready(ctx context.Context) error {
+	if s == nil || s.pool == nil {
+		return ErrUnavailable
+	}
+	now := s.now().UTC()
+	s.readyMu.Lock()
+	if s.readyContext == nil || s.readyContext.Err() != nil {
+		s.readyMu.Unlock()
+		s.observeReadiness("failure", "wait_canceled")
+		return ErrUnavailable
+	}
+	if !s.readyAt.IsZero() {
+		cacheFor := time.Second
+		if s.readyResult != nil {
+			cacheFor = 250 * time.Millisecond
+		}
+		if !now.Before(s.readyAt) && now.Sub(s.readyAt) < cacheFor {
+			result := s.readyResult
+			s.readyMu.Unlock()
+			if result == nil {
+				s.observeReadiness("success", "cached_success")
+			} else {
+				s.observeReadiness("failure", "cached_failure")
+			}
+			return result
+		}
+	}
+	if s.readyProbe != nil {
+		probe := s.readyProbe
+		// A known-success result may be served stale for at most five seconds,
+		// and only while a single refresh is actually in flight.
+		if s.readyResult == nil && !s.readyAt.IsZero() && !now.Before(s.readyAt) && now.Sub(s.readyAt) <= 5*time.Second {
+			s.readyMu.Unlock()
+			s.observeReadiness("success", "stale_success")
+			return nil
+		}
+		s.readyMu.Unlock()
+		select {
+		case <-probe:
+			return s.Ready(ctx)
+		case <-ctx.Done():
+			s.observeReadiness("failure", "wait_canceled")
+			return ErrUnavailable
+		}
+	}
+	probe := make(chan struct{})
+	s.readyProbe = probe
+	probeContext := s.readyContext
+	s.readyMu.Unlock()
+	go s.runReadyProbe(probeContext, probe)
+	select {
+	case <-probe:
+		s.readyMu.Lock()
+		result := s.readyResult
+		s.readyMu.Unlock()
+		return result
+	case <-ctx.Done():
+		s.observeReadiness("failure", "wait_canceled")
+		return ErrUnavailable
+	}
+}
+
+func (s *Store) runReadyProbe(parent context.Context, probe chan struct{}) {
+	checkCtx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	var value int
+	result := error(nil)
+	if err := s.pool.QueryRow(checkCtx, `SELECT 1`).Scan(&value); err != nil || value != 1 {
+		result = ErrUnavailable
+	}
+	s.readyMu.Lock()
+	// Publish the failure before waking waiters; this prevents stale success
+	// from being returned after a known failed refresh.
+	s.readyResult = result
+	s.readyAt = s.now().UTC()
+	s.readyProbe = nil
+	close(probe)
+	s.readyMu.Unlock()
+	if result == nil {
+		s.observeReadiness("success", "probe_success")
+	} else {
+		s.observeReadiness("failure", "probe_failure")
 	}
 }
 func newWithDatabase(db database, options Options) (*Store, error) {
@@ -102,7 +219,8 @@ func newWithDatabase(db database, options Options) (*Store, error) {
 	if options.RandomBytes == nil {
 		options.RandomBytes = func(dst []byte) error { _, err := rand.Read(dst); return err }
 	}
-	return &Store{pool: db, now: options.Now, newUUID: options.NewUUID, randomBytes: options.RandomBytes}, nil
+	readyContext, readyCancel := context.WithCancel(context.Background())
+	return &Store{pool: db, now: options.Now, newUUID: options.NewUUID, randomBytes: options.RandomBytes, readyContext: readyContext, readyCancel: readyCancel, readyObserver: options.ReadinessObserver}, nil
 }
 func isNoRows(err error) bool { return errors.Is(err, pgx.ErrNoRows) }
 func validUUID(value string) bool {

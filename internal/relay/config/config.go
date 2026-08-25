@@ -27,32 +27,35 @@ const (
 	GitHubWebOrigin = "https://github.com"
 	GitHubAPIOrigin = "https://api.github.com"
 
-	EnvListenAddress             = "HOSTD_RELAY_LISTEN_ADDRESS"
-	EnvPublicBaseURL             = "HOSTD_RELAY_PUBLIC_BASE_URL"
-	EnvLoopbackDevelopment       = "HOSTD_RELAY_LOOPBACK_DEVELOPMENT"
-	EnvPostgresDSNFile           = "HOSTD_RELAY_POSTGRES_DSN_FILE"
-	EnvGitHubClientID            = "HOSTD_RELAY_GITHUB_CLIENT_ID"
-	EnvGitHubAppID               = "HOSTD_RELAY_GITHUB_APP_ID"
-	EnvGitHubClientSecretFile    = "HOSTD_RELAY_GITHUB_CLIENT_SECRET_FILE"
-	EnvGitHubPrivateKeyFile      = "HOSTD_RELAY_GITHUB_PRIVATE_KEY_FILE"
-	EnvWebhookSecretFile         = "HOSTD_RELAY_WEBHOOK_SECRET_FILE"
-	EnvEnrollmentKeyFile         = "HOSTD_RELAY_ENROLLMENT_KEY_FILE"
-	EnvTLSCertificateFile        = "HOSTD_RELAY_TLS_CERTIFICATE_FILE"
-	EnvTLSPrivateKeyFile         = "HOSTD_RELAY_TLS_PRIVATE_KEY_FILE"
-	EnvReadTimeout               = "HOSTD_RELAY_READ_TIMEOUT"
-	EnvWriteTimeout              = "HOSTD_RELAY_WRITE_TIMEOUT"
-	EnvIdleTimeout               = "HOSTD_RELAY_IDLE_TIMEOUT"
-	EnvRecoveryInterval          = "HOSTD_RELAY_RECOVERY_INTERVAL"
-	EnvRecoveryWindow            = "HOSTD_RELAY_RECOVERY_WINDOW"
-	EnvMinSessionDuration        = "HOSTD_RELAY_MIN_SESSION_DURATION"
-	EnvMaxSessionDuration        = "HOSTD_RELAY_MAX_SESSION_DURATION"
-	EnvMaxEnvelopeBytes          = "HOSTD_RELAY_MAX_ENVELOPE_BYTES"
-	EnvMaxSubscriptions          = "HOSTD_RELAY_MAX_SUBSCRIPTIONS"
-	EnvMaxSourcesPerSubscription = "HOSTD_RELAY_MAX_SOURCES_PER_SUBSCRIPTION"
+	EnvListenAddress          = "HOSTD_RELAY_LISTEN_ADDRESS"
+	EnvPublicBaseURL          = "HOSTD_RELAY_PUBLIC_BASE_URL"
+	EnvLoopbackDevelopment    = "HOSTD_RELAY_LOOPBACK_DEVELOPMENT"
+	EnvPostgresDSNFile        = "HOSTD_RELAY_POSTGRES_DSN_FILE"
+	EnvGitHubClientID         = "HOSTD_RELAY_GITHUB_CLIENT_ID"
+	EnvGitHubAppID            = "HOSTD_RELAY_GITHUB_APP_ID"
+	EnvGitHubClientSecretFile = "HOSTD_RELAY_GITHUB_CLIENT_SECRET_FILE"
+	EnvGitHubPrivateKeyFile   = "HOSTD_RELAY_GITHUB_PRIVATE_KEY_FILE"
+	EnvWebhookSecretFile      = "HOSTD_RELAY_WEBHOOK_SECRET_FILE"
+	EnvEnrollmentKeyFile      = "HOSTD_RELAY_ENROLLMENT_KEY_FILE"
+	EnvTLSCertificateFile     = "HOSTD_RELAY_TLS_CERTIFICATE_FILE"
+	EnvTLSPrivateKeyFile      = "HOSTD_RELAY_TLS_PRIVATE_KEY_FILE"
+	EnvReadTimeout            = "HOSTD_RELAY_READ_TIMEOUT"
+	EnvWriteTimeout           = "HOSTD_RELAY_WRITE_TIMEOUT"
+	EnvIdleTimeout            = "HOSTD_RELAY_IDLE_TIMEOUT"
+	EnvRecoveryInterval       = "HOSTD_RELAY_RECOVERY_INTERVAL"
+	EnvRecoveryWindow         = "HOSTD_RELAY_RECOVERY_WINDOW"
+	EnvMaxSessionDuration     = "HOSTD_RELAY_MAX_SESSION_DURATION"
+	EnvMaxEnvelopeBytes       = "HOSTD_RELAY_MAX_ENVELOPE_BYTES"
+	EnvMaxSubscriptions       = "HOSTD_RELAY_MAX_SUBSCRIPTIONS"
 
 	maxSecretFileBytes = 1 << 20
 	maxTLSFileBytes    = 4 << 20
 )
+
+// ErrInvalidRSAPrivateKey is deliberately the only error returned by
+// ParseRSAPrivateKey. It is safe to log or compare without exposing parser
+// details or key material.
+var ErrInvalidRSAPrivateKey = errors.New("invalid relay RSA private key")
 
 type ErrorCode string
 
@@ -124,11 +127,9 @@ type Config struct {
 	IdleTimeout        time.Duration
 	RecoveryInterval   time.Duration
 	RecoveryWindow     time.Duration
-	MinSessionDuration time.Duration
 	MaxSessionDuration time.Duration
 	MaxEnvelopeBytes   int
 	MaxSubscriptions   int
-	MaxSources         int
 }
 
 func (c Config) String() string {
@@ -151,11 +152,9 @@ func (c Config) LogValue() slog.Value {
 		slog.Duration("idle_timeout", c.IdleTimeout),
 		slog.Duration("recovery_interval", c.RecoveryInterval),
 		slog.Duration("recovery_window", c.RecoveryWindow),
-		slog.Duration("min_session_duration", c.MinSessionDuration),
 		slog.Duration("max_session_duration", c.MaxSessionDuration),
 		slog.Int("max_envelope_bytes", c.MaxEnvelopeBytes),
 		slog.Int("max_subscriptions", c.MaxSubscriptions),
-		slog.Int("max_sources", c.MaxSources),
 	)
 }
 
@@ -254,11 +253,9 @@ func Defaults() Config {
 		IdleTimeout:        75 * time.Second,
 		RecoveryInterval:   30 * time.Second,
 		RecoveryWindow:     24 * time.Hour,
-		MinSessionDuration: 5 * time.Minute,
 		MaxSessionDuration: 24 * time.Hour,
 		MaxEnvelopeBytes:   1 << 20,
 		MaxSubscriptions:   1000,
-		MaxSources:         1000,
 	}
 }
 
@@ -325,7 +322,7 @@ func Load(source Source) (Config, error) {
 	if len(c.GitHubClientSecret) < 16 || len(c.GitHubClientSecret) > 4<<10 || bytes.IndexByte(c.GitHubClientSecret, 0) >= 0 {
 		return destroyAndError(&c, EnvGitHubClientSecretFile)
 	}
-	if _, err := parseRSAPrivateKey(c.GitHubPrivateKey); err != nil {
+	if _, err := ParseRSAPrivateKey(c.GitHubPrivateKey); err != nil {
 		return destroyAndError(&c, EnvGitHubPrivateKeyFile)
 	}
 	if len(c.WebhookSecret) < 16 || len(c.WebhookSecret) > 64<<10 || bytes.IndexByte(c.WebhookSecret, 0) >= 0 {
@@ -338,6 +335,9 @@ func Load(source Source) (Config, error) {
 	certPath, certSet := source.LookupEnv(EnvTLSCertificateFile)
 	keyPath, keySet := source.LookupEnv(EnvTLSPrivateKeyFile)
 	if certSet != keySet || (certSet && (certPath == "" || keyPath == "")) {
+		return destroyAndError(&c, EnvTLSCertificateFile)
+	}
+	if !c.LoopbackDevelopment && !certSet {
 		return destroyAndError(&c, EnvTLSCertificateFile)
 	}
 	if certSet {
@@ -365,12 +365,11 @@ func Load(source Source) (Config, error) {
 		maximum time.Duration
 	}{
 		{EnvReadTimeout, &c.ReadTimeout, time.Second, time.Minute},
-		{EnvWriteTimeout, &c.WriteTimeout, time.Second, time.Minute},
+		{EnvWriteTimeout, &c.WriteTimeout, time.Second, 30 * time.Second},
 		{EnvIdleTimeout, &c.IdleTimeout, 10 * time.Second, 10 * time.Minute},
 		{EnvRecoveryInterval, &c.RecoveryInterval, time.Second, time.Hour},
 		{EnvRecoveryWindow, &c.RecoveryWindow, time.Minute, 72 * time.Hour},
-		{EnvMinSessionDuration, &c.MinSessionDuration, time.Minute, 24 * time.Hour},
-		{EnvMaxSessionDuration, &c.MaxSessionDuration, time.Minute, 30 * 24 * time.Hour},
+		{EnvMaxSessionDuration, &c.MaxSessionDuration, time.Minute, 24 * time.Hour},
 	}
 	for _, item := range durations {
 		*item.dst, err = optionalDuration(source, item.env, *item.dst, item.minimum, item.maximum)
@@ -379,15 +378,12 @@ func Load(source Source) (Config, error) {
 			return Config{}, err
 		}
 	}
-	if c.RecoveryInterval >= c.RecoveryWindow || c.MinSessionDuration > c.MaxSessionDuration || c.IdleTimeout >= c.MaxSessionDuration {
+	if c.RecoveryInterval >= c.RecoveryWindow || c.IdleTimeout >= c.MaxSessionDuration {
 		return destroyAndError(&c, "duration_bounds")
 	}
-	c.MaxEnvelopeBytes, err = optionalInt(source, EnvMaxEnvelopeBytes, c.MaxEnvelopeBytes, 4<<10, 8<<20)
+	c.MaxEnvelopeBytes, err = optionalInt(source, EnvMaxEnvelopeBytes, c.MaxEnvelopeBytes, 4<<10, 1<<20)
 	if err == nil {
 		c.MaxSubscriptions, err = optionalInt(source, EnvMaxSubscriptions, c.MaxSubscriptions, 1, 1000)
-	}
-	if err == nil {
-		c.MaxSources, err = optionalInt(source, EnvMaxSourcesPerSubscription, c.MaxSources, 1, 100_000)
 	}
 	if err != nil {
 		c.DestroySecrets()
@@ -554,10 +550,13 @@ func validPostgresDSN(value []byte) bool {
 	return true
 }
 
-func parseRSAPrivateKey(data []byte) (*rsa.PrivateKey, error) {
+// ParseRSAPrivateKey accepts one PEM-encoded PKCS#1 or RSA PKCS#8 private key.
+// Weak, non-RSA, malformed, concatenated, and trailing input all return the
+// same fixed sentinel.
+func ParseRSAPrivateKey(data []byte) (*rsa.PrivateKey, error) {
 	block, rest := pem.Decode(data)
-	if block == nil || len(bytes.TrimSpace(rest)) != 0 {
-		return nil, errors.New("invalid PEM")
+	if block == nil || len(rest) != 0 || len(block.Headers) != 0 {
+		return nil, ErrInvalidRSAPrivateKey
 	}
 	var key any
 	var err error
@@ -567,14 +566,14 @@ func parseRSAPrivateKey(data []byte) (*rsa.PrivateKey, error) {
 	case "PRIVATE KEY":
 		key, err = x509.ParsePKCS8PrivateKey(block.Bytes)
 	default:
-		return nil, errors.New("unsupported private key")
+		return nil, ErrInvalidRSAPrivateKey
 	}
 	if err != nil {
-		return nil, err
+		return nil, ErrInvalidRSAPrivateKey
 	}
 	rsaKey, ok := key.(*rsa.PrivateKey)
 	if !ok || rsaKey.N.BitLen() < 2048 || rsaKey.Validate() != nil {
-		return nil, errors.New("invalid RSA private key")
+		return nil, ErrInvalidRSAPrivateKey
 	}
 	return rsaKey, nil
 }

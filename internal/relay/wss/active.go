@@ -130,7 +130,7 @@ func (s *session) active(ctx context.Context) *sessionFailure {
 		select {
 		case event := <-s.reads:
 			if event.err != nil {
-				return failure("connection_closed", websocket.StatusNormalClosure, false)
+				return categorizedFailure("connection_closed", websocket.StatusNormalClosure, false, event.category)
 			}
 			if deadlineFailure := ensureDeadlines(); deadlineFailure != nil {
 				clear(event.data)
@@ -263,7 +263,7 @@ func (s *session) handleSubscriptionSync(ctx context.Context, state *activeState
 		result, applyErr = s.handler.store.ApplySubscriptionsSync(storeCtx, s.lease, command, message.Generation, subscriptions)
 		return applyErr
 	}); err != nil || result.Kind != store.ResultSubscriptionsSynced {
-		return failure("subscriptions_sync_failed", websocket.StatusPolicyViolation, true)
+		return categorizedFailure("subscriptions_sync_failed", websocket.StatusPolicyViolation, true, failureCategoryStore)
 	}
 	for subscriptionID, messageID := range state.sourceCurrent {
 		if _, exists := next[subscriptionID]; !exists {
@@ -322,18 +322,24 @@ func (s *session) handleDecision(ctx context.Context, state *activeState, frame 
 		})
 	}
 	if err != nil {
-		return failure("decision_failed", websocket.StatusInternalError, true)
+		return categorizedFailure("decision_failed", websocket.StatusInternalError, true, failureCategoryStore)
 	}
 	if result.Kind == store.ResultProtocolError {
 		if result.ErrorCode == "unknown_target" {
 			s.markTerminal(state, target)
 		}
+		s.handler.observeDecision("protocol")
 		return s.nonfatalProtocolError(ctx, frameMessageID(frame), result.ErrorCode)
 	}
 	if result.Kind != store.ResultDecisionApplied {
-		return failure("decision_failed", websocket.StatusInternalError, true)
+		return categorizedFailure("decision_failed", websocket.StatusInternalError, true, failureCategoryStore)
 	}
 	s.markTerminal(state, target)
+	if accepted {
+		s.handler.observeDecision("ack")
+	} else {
+		s.handler.observeDecision("reject")
+	}
 	return nil
 }
 
@@ -348,15 +354,26 @@ func (s *session) handleDecisionProtocolError(ctx context.Context, messageID str
 		return failure("replay_mismatch", websocket.StatusPolicyViolation, true)
 	}
 	if err != nil {
-		return failure("decision_failed", websocket.StatusInternalError, true)
+		return categorizedFailure("decision_failed", websocket.StatusInternalError, true, failureCategoryStore)
 	}
 	switch result.Kind {
 	case store.ResultDecisionApplied:
+		decision := ""
+		switch command.Type {
+		case store.CommandAckSource, store.CommandAckAccess:
+			decision = "ack"
+		case store.CommandRejectSource, store.CommandRejectAccess:
+			decision = "reject"
+		}
+		if decision != "" {
+			s.handler.observeDecision(decision)
+		}
 		return nil
 	case store.ResultProtocolError:
+		s.handler.observeDecision("protocol")
 		return s.nonfatalProtocolError(ctx, messageID, result.ErrorCode)
 	default:
-		return failure("decision_failed", websocket.StatusInternalError, true)
+		return categorizedFailure("decision_failed", websocket.StatusInternalError, true, failureCategoryStore)
 	}
 }
 
@@ -411,6 +428,7 @@ func (s *session) pollDeliveries(ctx context.Context, state *activeState) *sessi
 		if err = s.sendFrame(pollCtx, frame); err != nil {
 			return false, failure("write_failed", websocket.StatusInternalError, false)
 		}
+		s.handler.observeDelivery("access")
 		target := &deliveryTarget{kind: targetAccess, state: targetCurrent, messageID: frame.MessageID, eventID: item.EventID}
 		state.remember(target, s.handler.config.MaxOutstanding)
 		state.accessCurrent[item.EventID] = frame.MessageID
@@ -467,6 +485,7 @@ func (s *session) pollDeliveries(ctx context.Context, state *activeState) *sessi
 		if err = s.sendFrame(pollCtx, frame); err != nil {
 			return failure("write_failed", websocket.StatusInternalError, false)
 		}
+		s.handler.observeDelivery("desired")
 		target := &deliveryTarget{kind: targetSource, state: targetCurrent, messageID: frame.MessageID, subscriptionID: item.SubscriptionID, generation: item.Generation}
 		state.remember(target, s.handler.config.MaxOutstanding)
 		state.sourceCurrent[item.SubscriptionID] = frame.MessageID

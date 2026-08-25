@@ -53,11 +53,13 @@ type normalizedAccess struct {
 
 func (s *Service) handleWebhook(w http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
+		s.observeWebhook("invalid")
 		writeProblem(w, http.StatusMethodNotAllowed, "webhook.method")
 		return
 	}
 	mediaType, parameters, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" || len(parameters) != 0 || !singleHeader(request.Header, "Content-Type") {
+		s.observeWebhook("invalid")
 		writeProblem(w, http.StatusUnsupportedMediaType, "webhook.content_type")
 		return
 	}
@@ -66,36 +68,43 @@ func (s *Service) handleWebhook(w http.ResponseWriter, request *http.Request) {
 	signature := request.Header.Get("X-Hub-Signature-256")
 	if !singleHeader(request.Header, "X-GitHub-Delivery") || !singleHeader(request.Header, "X-GitHub-Event") || !singleHeader(request.Header, "X-Hub-Signature-256") ||
 		!canonicalUUID(delivery) || !validWebhookEvent(event) {
+		s.observeWebhook("invalid")
 		writeProblem(w, http.StatusBadRequest, "webhook.headers")
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(request.Body, maxWebhookBody+1))
 	if err != nil || len(body) == 0 || len(body) > maxWebhookBody {
 		clear(body)
+		s.observeWebhook("invalid")
 		writeProblem(w, http.StatusRequestEntityTooLarge, "webhook.body")
 		return
 	}
 	defer clear(body)
 	if !verifyWebhookSignature(s.webhookSecret, body, signature) {
+		s.observeWebhook("auth_invalid")
 		writeProblem(w, http.StatusUnauthorized, "webhook.signature")
 		return
 	}
 	if err := rejectDuplicateKeys(body); err != nil {
+		s.observeWebhook("invalid")
 		writeProblem(w, http.StatusBadRequest, "webhook.json")
 		return
 	}
 	var payload webhookEnvelope
 	if err := json.Unmarshal(body, &payload); err != nil {
+		s.observeWebhook("invalid")
 		writeProblem(w, http.StatusBadRequest, "webhook.json")
 		return
 	}
 	receivedAt := s.now().UTC()
 	switch event {
 	case "ping":
+		s.observeWebhook("ignored")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	case "push":
 		if payload.Installation.ID <= 0 || payload.Repository.ID <= 0 || payload.Deleted == nil || !validGitRef(payload.Ref) || protocol.ValidSHA(payload.After) != nil || *payload.Deleted != (payload.After == strings.Repeat("0", 40)) {
+			s.observeWebhook("invalid")
 			writeProblem(w, http.StatusUnprocessableEntity, "webhook.event")
 			return
 		}
@@ -106,62 +115,94 @@ func (s *Service) handleWebhook(w http.ResponseWriter, request *http.Request) {
 			ignoredReason = "push.deleted"
 		}
 		if ignoredReason != "" {
-			if _, err := s.store.PushIgnoredDelivery(request.Context(), delivery, ignoredReason, receivedAt); err != nil {
+			deduplicated, err := s.store.PushIgnoredDelivery(request.Context(), delivery, ignoredReason, receivedAt)
+			if err != nil {
+				s.observeWebhook("store_failure")
 				writeProblem(w, http.StatusServiceUnavailable, "webhook.persist")
 				return
+			}
+			if deduplicated {
+				s.observeWebhook("duplicate")
+			} else {
+				s.observeWebhook("ignored")
 			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if err := s.persistPush(request.Context(), delivery, receivedAt, payload); err != nil {
+		deduplicated, err := s.persistPush(request.Context(), delivery, receivedAt, payload)
+		if err != nil {
 			if errors.Is(err, store.ErrInvalid) {
+				s.observeWebhook("invalid")
 				writeProblem(w, http.StatusUnprocessableEntity, "webhook.event")
 				return
 			}
+			s.observeWebhook("store_failure")
 			writeProblem(w, http.StatusServiceUnavailable, "webhook.persist")
 			return
+		}
+		if deduplicated {
+			s.observeWebhook("duplicate")
+		} else {
+			s.observeWebhook("persisted")
 		}
 	case "installation", "installation_repositories":
 		changes, ignoredReason, err := normalizeAccess(event, payload)
 		if err != nil {
+			s.observeWebhook("invalid")
 			writeProblem(w, http.StatusUnprocessableEntity, "webhook.event")
 			return
 		}
 		if ignoredReason != "" {
-			if _, err := s.store.PushIgnoredDelivery(request.Context(), delivery, ignoredReason, receivedAt); err != nil {
+			deduplicated, err := s.store.PushIgnoredDelivery(request.Context(), delivery, ignoredReason, receivedAt)
+			if err != nil {
+				s.observeWebhook("store_failure")
 				writeProblem(w, http.StatusServiceUnavailable, "webhook.persist")
 				return
+			}
+			if deduplicated {
+				s.observeWebhook("duplicate")
+			} else {
+				s.observeWebhook("ignored")
 			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if err := s.persistAccess(request.Context(), delivery, receivedAt, changes); err != nil {
+		deduplicated, err := s.persistAccess(request.Context(), delivery, receivedAt, changes)
+		if err != nil {
 			if errors.Is(err, store.ErrInvalid) {
+				s.observeWebhook("invalid")
 				writeProblem(w, http.StatusUnprocessableEntity, "webhook.event")
 				return
 			}
+			s.observeWebhook("store_failure")
 			writeProblem(w, http.StatusServiceUnavailable, "webhook.persist")
 			return
+		}
+		if deduplicated {
+			s.observeWebhook("duplicate")
+		} else {
+			s.observeWebhook("persisted")
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Service) persistPush(ctx context.Context, delivery string, receivedAt time.Time, payload webhookEnvelope) error {
+func (s *Service) persistPush(ctx context.Context, delivery string, receivedAt time.Time, payload webhookEnvelope) (bool, error) {
 	if payload.Installation.ID <= 0 || payload.Repository.ID <= 0 || protocol.ValidRef(payload.Ref) != nil || protocol.ValidSHA(payload.After) != nil {
-		return store.ErrInvalid
+		return false, store.ErrInvalid
 	}
 	event := store.SourceEvent{DeliveryID: delivery, InstallationID: payload.Installation.ID, RepositoryID: payload.Repository.ID, Ref: payload.Ref, SHA: payload.After, ReceivedAt: receivedAt, ObservedAt: receivedAt}
 	for attempt := 0; attempt < maxRoutePushRetries; attempt++ {
 		routes, err := s.store.SourceRoutes(ctx, event.InstallationID, event.RepositoryID, event.Ref)
 		if err != nil {
-			return err
+			return false, err
 		}
-		if _, err = s.store.PushSourceEvent(ctx, event, routes); !errors.Is(err, store.ErrConflict) {
-			return err
+		result, pushErr := s.store.PushSourceEvent(ctx, event, routes)
+		if !errors.Is(pushErr, store.ErrConflict) {
+			return result.Deduplicated, pushErr
 		}
 	}
-	return store.ErrConflict
+	return false, store.ErrConflict
 }
 
 func normalizeAccess(event string, payload webhookEnvelope) ([]normalizedAccess, string, error) {
@@ -244,29 +285,30 @@ func validGitRef(ref string) bool {
 	return true
 }
 
-func (s *Service) persistAccess(ctx context.Context, delivery string, receivedAt time.Time, changes []normalizedAccess) error {
+func (s *Service) persistAccess(ctx context.Context, delivery string, receivedAt time.Time, changes []normalizedAccess) (bool, error) {
 	for attempt := 0; attempt < maxRoutePushRetries; attempt++ {
 		batch := store.AccessEventBatchInput{DeliveryID: delivery, ReceivedAt: receivedAt, Events: make([]store.AccessEventBatchItem, 0, len(changes))}
 		for _, change := range changes {
 			controllerIDs, err := s.store.AccessRoutes(ctx, change.installationID, change.repositoryID)
 			if err != nil {
-				return err
+				return false, err
 			}
 			routes := make([]store.AccessRoute, 0, len(controllerIDs))
 			for _, controllerID := range controllerIDs {
 				eventID, err := newRandomUUID(s.random)
 				if err != nil {
-					return err
+					return false, err
 				}
 				routes = append(routes, store.AccessRoute{EventID: eventID, ControllerID: controllerID})
 			}
 			batch.Events = append(batch.Events, store.AccessEventBatchItem{InstallationID: change.installationID, RepositoryID: change.repositoryID, ChangeCode: change.changeCode, ObservedAt: receivedAt, RemoveAccess: change.removeAccess, Routes: routes})
 		}
-		if _, err := s.store.PushAccessEvents(ctx, batch); !errors.Is(err, store.ErrConflict) {
-			return err
+		result, pushErr := s.store.PushAccessEvents(ctx, batch)
+		if !errors.Is(pushErr, store.ErrConflict) {
+			return result.Deduplicated, pushErr
 		}
 	}
-	return store.ErrConflict
+	return false, store.ErrConflict
 }
 
 func verifyWebhookSignature(secret, body []byte, header string) bool {

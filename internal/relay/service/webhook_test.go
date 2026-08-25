@@ -18,17 +18,20 @@ import (
 
 type webhookStore struct {
 	fakeStore
-	batch         store.AccessEventBatchInput
-	pushError     error
-	ignoredReason string
-	ignoredError  error
-	storeCalls    int
+	batch               store.AccessEventBatchInput
+	pushError           error
+	ignoredReason       string
+	ignoredError        error
+	ignoredDeduplicated bool
+	sourceResult        store.SourcePushResult
+	accessResult        store.AccessPushResult
+	storeCalls          int
 }
 
 func (f *webhookStore) PushIgnoredDelivery(_ context.Context, _ string, reason string, _ time.Time) (bool, error) {
 	f.storeCalls++
 	f.ignoredReason = reason
-	return false, f.ignoredError
+	return f.ignoredDeduplicated, f.ignoredError
 }
 
 func (f *webhookStore) AccessRoutes(_ context.Context, _ int64, repositoryID int64) ([]string, error) {
@@ -42,7 +45,7 @@ func (f *webhookStore) AccessRoutes(_ context.Context, _ int64, repositoryID int
 func (f *webhookStore) PushAccessEvents(_ context.Context, batch store.AccessEventBatchInput) (store.AccessPushResult, error) {
 	f.storeCalls++
 	f.batch = batch
-	return store.AccessPushResult{}, f.pushError
+	return f.accessResult, f.pushError
 }
 
 func (f *webhookStore) SourceRoutes(context.Context, int64, int64, string) ([]store.SourceRoute, error) {
@@ -52,7 +55,64 @@ func (f *webhookStore) SourceRoutes(context.Context, int64, int64, string) ([]st
 
 func (f *webhookStore) PushSourceEvent(context.Context, store.SourceEvent, []store.SourceRoute) (store.SourcePushResult, error) {
 	f.storeCalls++
-	return store.SourcePushResult{}, nil
+	return f.sourceResult, f.pushError
+}
+
+type webhookObserver struct{ outcomes []string }
+
+func (o *webhookObserver) ObserveWebhook(outcome string) { o.outcomes = append(o.outcomes, outcome) }
+
+func TestWebhookObserverUsesOnlyClosedAuthoritativeOutcomes(t *testing.T) {
+	validPush := []byte(`{"installation":{"id":1},"repository":{"id":2},"ref":"refs/heads/main","after":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","deleted":false}`)
+	tests := []struct {
+		name, want string
+		store      *webhookStore
+		perform    func(*testing.T, *Service) *httptest.ResponseRecorder
+	}{
+		{name: "auth invalid", want: "auth_invalid", store: &webhookStore{}, perform: func(t *testing.T, s *Service) *httptest.ResponseRecorder {
+			request := httptest.NewRequest(http.MethodPost, "/v1/github/webhook", bytes.NewReader([]byte(`{"zen":"sentinel"}`)))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("X-GitHub-Delivery", "66666666-6666-4666-8666-666666666666")
+			request.Header.Set("X-GitHub-Event", "ping")
+			request.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+			recorder := httptest.NewRecorder()
+			s.Handler().ServeHTTP(recorder, request)
+			return recorder
+		}},
+		{name: "invalid", want: "invalid", store: &webhookStore{}, perform: func(t *testing.T, s *Service) *httptest.ResponseRecorder {
+			recorder := httptest.NewRecorder()
+			s.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/github/webhook", nil))
+			return recorder
+		}},
+		{name: "ignored", want: "ignored", store: &webhookStore{}, perform: func(t *testing.T, s *Service) *httptest.ResponseRecorder {
+			return performWebhook(t, s, "ping", []byte(`{"zen":"ok"}`))
+		}},
+		{name: "duplicate", want: "duplicate", store: &webhookStore{sourceResult: store.SourcePushResult{Deduplicated: true}}, perform: func(t *testing.T, s *Service) *httptest.ResponseRecorder {
+			return performWebhook(t, s, "push", validPush)
+		}},
+		{name: "persisted", want: "persisted", store: &webhookStore{}, perform: func(t *testing.T, s *Service) *httptest.ResponseRecorder {
+			return performWebhook(t, s, "push", validPush)
+		}},
+		{name: "store failure", want: "store_failure", store: &webhookStore{pushError: errors.New("ghp_secret_store_error")}, perform: func(t *testing.T, s *Service) *httptest.ResponseRecorder {
+			return performWebhook(t, s, "push", validPush)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := newEnrollmentTestService(t, test.store, fakeHTTP(func(*http.Request) (*http.Response, error) { return nil, nil }), time.Now().UTC())
+			observer := new(webhookObserver)
+			s.observer = observer
+			_ = test.perform(t, s)
+			if len(observer.outcomes) != 1 || observer.outcomes[0] != test.want {
+				t.Fatalf("outcomes=%v want=%q", observer.outcomes, test.want)
+			}
+			for _, outcome := range observer.outcomes {
+				if strings.Contains(outcome, "secret") || strings.Contains(outcome, "ghp_") {
+					t.Fatalf("dynamic outcome=%q", outcome)
+				}
+			}
+		})
+	}
 }
 
 func TestWebhookAcceptsDocumentedExtraFieldsAndPersistsMultiRepositoryRemovalAtomically(t *testing.T) {

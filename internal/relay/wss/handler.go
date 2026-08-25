@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -103,16 +105,47 @@ type socket interface {
 type acceptSocket func(http.ResponseWriter, *http.Request, *websocket.AcceptOptions) (socket, error)
 
 type Handler struct {
-	store      StateStore
-	config     Config
-	now        func() time.Time
-	entropy    io.Reader
-	logger     *slog.Logger
-	accept     acceptSocket
-	lifecycle  context.Context
-	timers     TimerSource
-	admissions chan struct{}
+	store             StateStore
+	config            Config
+	now               func() time.Time
+	entropy           io.Reader
+	logger            *slog.Logger
+	accept            acceptSocket
+	lifecycle         context.Context
+	timers            TimerSource
+	admissions        chan struct{}
+	active            atomic.Int64
+	authenticated     atomic.Int64
+	leasesActive      atomic.Int64
+	rejected          atomic.Uint64
+	lifecycleOutcomes [8]atomic.Uint64
+	deliveries        [2]atomic.Uint64
+	decisions         [3]atomic.Uint64
+	admitMu           sync.Mutex
+	stopped           bool
+	sessions          sync.WaitGroup
 }
+
+// Stats is a fixed-cardinality snapshot of WebSocket admission state.
+type Stats struct {
+	Active             int64
+	Authenticated      int64
+	LeasesActive       int64
+	OutboundCapacity   int64
+	Capacity           int64
+	CapacityRejections uint64
+	LifecycleOutcomes  [8]uint64
+	Deliveries         [2]uint64
+	Decisions          [3]uint64
+}
+
+var lifecycleOutcomeNames = [...]string{"handshake", "authenticated", "closed", "protocol_reject", "auth_reject", "store_failure", "read_failure", "write_failure"}
+var deliveryKindNames = [...]string{"desired", "access"}
+var decisionNames = [...]string{"ack", "reject", "protocol"}
+
+func LifecycleOutcomeNames() [8]string { return lifecycleOutcomeNames }
+func DeliveryKindNames() [2]string     { return deliveryKindNames }
+func DecisionNames() [3]string         { return decisionNames }
 
 type Options struct {
 	Now       func() time.Time
@@ -153,6 +186,82 @@ func NewHandler(state StateStore, config Config, options Options) (*Handler, err
 			return websocket.Accept(w, r, options)
 		},
 	}, nil
+}
+
+// Stats returns a concurrency-safe snapshot. Active includes connections that
+// have been admitted but have not yet completed their WebSocket handshake.
+func (h *Handler) Stats() Stats {
+	if h == nil {
+		return Stats{}
+	}
+	stats := Stats{Active: h.active.Load(), Authenticated: h.authenticated.Load(), LeasesActive: h.leasesActive.Load(), OutboundCapacity: int64(h.config.OutboundQueue), Capacity: int64(cap(h.admissions)), CapacityRejections: h.rejected.Load()}
+	for i := range stats.LifecycleOutcomes {
+		stats.LifecycleOutcomes[i] = h.lifecycleOutcomes[i].Load()
+	}
+	for i := range stats.Deliveries {
+		stats.Deliveries[i] = h.deliveries[i].Load()
+	}
+	for i := range stats.Decisions {
+		stats.Decisions[i] = h.decisions[i].Load()
+	}
+	return stats
+}
+
+func (h *Handler) observeLifecycle(name string) {
+	for i, candidate := range lifecycleOutcomeNames {
+		if name == candidate {
+			h.lifecycleOutcomes[i].Add(1)
+			return
+		}
+	}
+}
+
+func (h *Handler) observeDelivery(name string) {
+	for i, candidate := range deliveryKindNames {
+		if name == candidate {
+			h.deliveries[i].Add(1)
+			return
+		}
+	}
+}
+
+func (h *Handler) observeDecision(name string) {
+	for i, candidate := range decisionNames {
+		if name == candidate {
+			h.decisions[i].Add(1)
+			return
+		}
+	}
+}
+
+// StopAdmissions makes the shutdown transition atomic with respect to session
+// WaitGroup additions. Calls after the transition receive a stable response.
+func (h *Handler) StopAdmissions() {
+	if h == nil {
+		return
+	}
+	h.admitMu.Lock()
+	h.stopped = true
+	h.admitMu.Unlock()
+}
+
+// Wait waits for every admitted handshake/session to exit. Callers must call
+// StopAdmissions first.
+func (h *Handler) Wait(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		h.sessions.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 type Timer interface {
@@ -209,11 +318,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "required websocket subprotocol not offered", http.StatusBadRequest)
 		return
 	}
+	h.admitMu.Lock()
+	if h.stopped {
+		h.admitMu.Unlock()
+		writeUnavailable(w, "relay websocket unavailable")
+		return
+	}
 	select {
 	case h.admissions <- struct{}{}:
-		defer func() { <-h.admissions }()
+		h.sessions.Add(1)
+		h.active.Add(1)
+		h.admitMu.Unlock()
+		defer func() {
+			<-h.admissions
+			h.active.Add(-1)
+			h.sessions.Done()
+		}()
 	default:
-		http.Error(w, "relay websocket capacity reached", http.StatusServiceUnavailable)
+		h.admitMu.Unlock()
+		h.rejected.Add(1)
+		writeUnavailable(w, "relay websocket capacity reached")
 		return
 	}
 	conn, err := h.accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{protocol.Subprotocol}, CompressionMode: websocket.CompressionDisabled})
@@ -221,6 +345,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logger.Warn("relay WSS admission failed", "code", "upgrade_failed")
 		return
 	}
+	h.observeLifecycle("handshake")
 	conn.SetReadLimit(int64(h.config.HandshakeMaxBytes))
 	if conn.Subprotocol() != protocol.Subprotocol {
 		_ = conn.CloseNow()
@@ -228,6 +353,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	s := newSession(h, conn)
 	s.run(h.lifecycle)
+}
+
+func writeUnavailable(w http.ResponseWriter, message string) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, message, http.StatusServiceUnavailable)
 }
 
 func offeredSubprotocol(values []string, required string) bool {

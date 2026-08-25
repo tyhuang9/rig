@@ -1083,6 +1083,94 @@ func TestLocalDecisionProtocolErrorsSurviveTombstoneEvictionAndRestart(t *testin
 	}
 }
 
+func TestDurableDecisionReplayKeepsAckOrRejectMetricAfterTombstoneAndRestart(t *testing.T) {
+	tests := []struct {
+		name       string
+		access     bool
+		accepted   bool
+		wantMetric string
+	}{
+		{name: "source ack", accepted: true, wantMetric: "ack"},
+		{name: "source reject", wantMetric: "reject"},
+		{name: "access ack", access: true, accepted: true, wantMetric: "ack"},
+		{name: "access reject", access: true, wantMetric: "reject"},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			storeState := newActiveStore()
+			harness := newActiveHarness(t, storeState, 2)
+			state := newActiveState()
+			targetMessageID := activeUUID(2300 + index*10)
+			messageID := activeUUID(2301 + index*10)
+			var frame protocol.Frame
+			decisionCode := ""
+			if test.access {
+				eventID := activeUUID(2302 + index*10)
+				state.targets[targetMessageID] = &deliveryTarget{kind: targetAccess, state: targetCurrent, messageID: targetMessageID, eventID: eventID}
+				state.accessCurrent[eventID] = targetMessageID
+				if test.accepted {
+					frame = &protocol.Ack{Envelope: protocol.NewEnvelope(protocol.TypeAck, messageID, commandTime), TargetMessageID: targetMessageID, Access: &protocol.AccessTarget{EventID: eventID}}
+				} else {
+					decisionCode = "access.denied"
+					frame = &protocol.Reject{Envelope: protocol.NewEnvelope(protocol.TypeReject, messageID, commandTime), TargetMessageID: targetMessageID, Access: &protocol.AccessTarget{EventID: eventID}, Code: decisionCode}
+				}
+			} else {
+				subscriptionID := activeUUID(2302 + index*10)
+				state.targets[targetMessageID] = &deliveryTarget{kind: targetSource, state: targetCurrent, messageID: targetMessageID, subscriptionID: subscriptionID, generation: 3}
+				state.sourceCurrent[subscriptionID] = targetMessageID
+				if test.accepted {
+					frame = &protocol.Ack{Envelope: protocol.NewEnvelope(protocol.TypeAck, messageID, commandTime), TargetMessageID: targetMessageID, Source: &protocol.SourceTarget{SubscriptionID: subscriptionID, Generation: 3}}
+				} else {
+					decisionCode = "source.rejected"
+					frame = &protocol.Reject{Envelope: protocol.NewEnvelope(protocol.TypeReject, messageID, commandTime), TargetMessageID: targetMessageID, Source: &protocol.SourceTarget{SubscriptionID: subscriptionID, Generation: 3}, Code: decisionCode}
+				}
+			}
+
+			if failure := harness.session.handleDecision(context.Background(), state, frame, test.accepted, decisionCode); failure != nil {
+				t.Fatal(failure)
+			}
+			// A fresh process-local state has neither the target nor its tombstone.
+			// The durable command ledger still replays the original applied result.
+			if failure := harness.session.handleDecision(context.Background(), newActiveState(), frame, test.accepted, decisionCode); failure != nil {
+				t.Fatal(failure)
+			}
+			stats := harness.session.handler.Stats()
+			for metricIndex, name := range DecisionNames() {
+				want := uint64(0)
+				if name == test.wantMetric {
+					want = 2
+				}
+				if stats.Decisions[metricIndex] != want {
+					t.Fatalf("decision %s=%d want=%d", name, stats.Decisions[metricIndex], want)
+				}
+			}
+		})
+	}
+}
+
+func TestDecisionProtocolMetricIsReservedForDurableProtocolError(t *testing.T) {
+	storeState := newActiveStore()
+	harness := newActiveHarness(t, storeState, 2)
+	ack := &protocol.Ack{
+		Envelope:        protocol.NewEnvelope(protocol.TypeAck, activeUUID(2390), commandTime),
+		TargetMessageID: activeUUID(2391),
+		Source:          &protocol.SourceTarget{SubscriptionID: activeUUID(2392), Generation: 1},
+	}
+	if failure := harness.session.handleDecision(context.Background(), newActiveState(), ack, true, ""); failure != nil {
+		t.Fatal(failure)
+	}
+	stats := harness.session.handler.Stats()
+	for index, name := range DecisionNames() {
+		want := uint64(0)
+		if name == "protocol" {
+			want = 1
+		}
+		if stats.Decisions[index] != want {
+			t.Fatalf("decision %s=%d want=%d", name, stats.Decisions[index], want)
+		}
+	}
+}
+
 func TestAuthoritativeUnsubscribeMakesLateACKAndRejectDurablyStale(t *testing.T) {
 	for index, accepted := range []bool{true, false} {
 		name := "reject"

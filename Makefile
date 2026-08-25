@@ -26,8 +26,8 @@ test-e2e-windows:
 build:
 	pnpm --dir web build
 	sh scripts/embed-web.sh
-	go build ./cmd/hostd ./cmd/hostctl
+	go build ./cmd/hostd ./cmd/hostctl ./cmd/rig-relay
 build-windows:
 	pnpm --dir web build
 	powershell -ExecutionPolicy Bypass -File scripts/embed-web.ps1
-	go build ./cmd/hostd ./cmd/hostctl
+	go build ./cmd/hostd ./cmd/hostctl ./cmd/rig-relay

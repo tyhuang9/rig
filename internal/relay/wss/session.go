@@ -19,6 +19,7 @@ type readEvent struct {
 	messageType websocket.MessageType
 	data        []byte
 	err         error
+	category    sessionFailureCategory
 }
 
 type writeRequest struct {
@@ -44,14 +45,16 @@ type session struct {
 	readerDone   chan struct{}
 	writerDone   chan struct{}
 
-	controllerID  string
-	keyID         string
-	sessionID     string
-	lease         store.Lease
-	leaseHeld     bool
-	sessionUntil  time.Time
-	subscriptions map[string]struct{}
-	syncComplete  bool
+	controllerID         string
+	keyID                string
+	sessionID            string
+	lease                store.Lease
+	leaseHeld            bool
+	leaseCounted         bool
+	authenticatedCounted bool
+	sessionUntil         time.Time
+	subscriptions        map[string]struct{}
+	syncComplete         bool
 }
 
 func newSession(handler *Handler, conn socket) *session {
@@ -71,6 +74,14 @@ func newSession(handler *Handler, conn socket) *session {
 }
 
 func (s *session) run(parent context.Context) {
+	defer func() {
+		s.releaseLeaseCount()
+		if s.authenticatedCounted {
+			s.handler.authenticated.Add(-1)
+			s.authenticatedCounted = false
+		}
+		s.handler.observeLifecycle("closed")
+	}()
 	ctx, cancel := context.WithCancel(parent)
 	go func() {
 		defer close(s.readerDone)
@@ -83,11 +94,13 @@ func (s *session) run(parent context.Context) {
 
 	status, reason := websocket.StatusNormalClosure, "session complete"
 	if sessionErr := s.handshake(ctx); sessionErr != nil {
+		s.observeTerminalFailure(sessionErr)
 		status, reason = sessionErr.status, sessionErr.code
 		if sessionErr.send {
 			_ = s.sendProtocolError(ctx, "", sessionErr.code, true)
 		}
 	} else if sessionErr := s.active(ctx); sessionErr != nil {
+		s.observeTerminalFailure(sessionErr)
 		status, reason = sessionErr.status, sessionErr.code
 		if sessionErr.send {
 			_ = s.sendProtocolError(ctx, "", sessionErr.code, true)
@@ -96,24 +109,76 @@ func (s *session) run(parent context.Context) {
 
 	if s.leaseHeld {
 		releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), s.handler.config.StoreTimeout)
-		_ = s.handler.store.ReleaseLease(releaseCtx, s.lease)
+		if err := s.handler.store.ReleaseLease(releaseCtx, s.lease); err != nil {
+			s.handler.observeLifecycle("store_failure")
+		}
 		releaseCancel()
+		s.leaseHeld = false
+		s.releaseLeaseCount()
 	}
 	s.requestClose(status, reason)
 	cancel()
 	s.joinWorkers()
 }
 
+func (s *session) observeTerminalFailure(sessionErr *sessionFailure) {
+	if sessionErr == nil || sessionErr.category == failureCategoryNone {
+		return
+	}
+	s.handler.observeLifecycle(string(sessionErr.category))
+}
+
+type sessionFailureCategory string
+
+const (
+	failureCategoryNone           sessionFailureCategory = ""
+	failureCategoryProtocolReject sessionFailureCategory = "protocol_reject"
+	failureCategoryAuthReject     sessionFailureCategory = "auth_reject"
+	failureCategoryStore          sessionFailureCategory = "store_failure"
+	failureCategoryRead           sessionFailureCategory = "read_failure"
+	failureCategoryWrite          sessionFailureCategory = "write_failure"
+)
+
 type sessionFailure struct {
-	code   string
-	status websocket.StatusCode
-	send   bool
+	code     string
+	status   websocket.StatusCode
+	send     bool
+	category sessionFailureCategory
 }
 
 func (e *sessionFailure) Error() string { return e.code }
 
 func failure(code string, status websocket.StatusCode, send bool) *sessionFailure {
-	return &sessionFailure{code: code, status: status, send: send}
+	return categorizedFailure(code, status, send, stableFailureCategory(code))
+}
+
+func categorizedFailure(code string, status websocket.StatusCode, send bool, category sessionFailureCategory) *sessionFailure {
+	return &sessionFailure{code: code, status: status, send: send, category: category}
+}
+
+func stableFailureCategory(code string) sessionFailureCategory {
+	switch code {
+	case "expected_hello", "invalid_frame", "expected_subscriptions_sync", "binary_not_supported", "invalid_direction", "handshake_timeout", "inbound_rate_limited", "idle_timeout", "heartbeat_replay", "unexpected_frame", "replay_mismatch", "identity_mismatch", "subscriptions_sync_failed":
+		return failureCategoryProtocolReject
+	case "authentication_failed", "authentication_timeout":
+		return failureCategoryAuthReject
+	case "lease_unavailable", "decision_failed", "delivery_unavailable", "lease_lost", "binding_remove_failed", "key_revoke_failed", "controller_revoke_failed", "rotation_proposal_failed", "rotation_confirmation_failed", "rotation_finalization_failed":
+		return failureCategoryStore
+	case "write_failed":
+		return failureCategoryWrite
+	case "connection_closed", "internal_error", "server_shutdown", "terminal_command", "session_expired":
+		return failureCategoryNone
+	default:
+		panic("unclassified relay WSS failure code")
+	}
+}
+
+func (s *session) releaseLeaseCount() {
+	if !s.leaseCounted {
+		return
+	}
+	s.leaseCounted = false
+	s.handler.leasesActive.Add(-1)
 }
 
 func (s *session) handshake(ctx context.Context) *sessionFailure {
@@ -150,7 +215,7 @@ func (s *session) handshake(ctx context.Context) *sessionFailure {
 	challengeInput := store.ChallengeInput{SessionID: challenge.SessionID, ControllerID: hello.ControllerID, KeyID: hello.KeyID, ClientNonce: clientNonce, ServerNonce: serverNonce, ACKDigest: ackDigest, ExpiresAt: challenge.ExpiresAt}
 	storeErr := s.withStore(ctx, func(storeCtx context.Context) error { return s.handler.store.CreateChallenge(storeCtx, challengeInput) })
 	if storeErr != nil {
-		return failure("authentication_failed", websocket.StatusPolicyViolation, true)
+		return categorizedFailure("authentication_failed", websocket.StatusPolicyViolation, true, failureCategoryStore)
 	}
 	if sendErr := s.sendFrame(ctx, challenge); sendErr != nil {
 		return failure("write_failed", websocket.StatusInternalError, false)
@@ -160,6 +225,7 @@ func (s *session) handshake(ctx context.Context) *sessionFailure {
 	if authFailure != nil {
 		if authFailure.code == "handshake_timeout" {
 			authFailure.code = "authentication_timeout"
+			authFailure.category = failureCategoryAuthReject
 		}
 		return authFailure
 	}
@@ -174,7 +240,7 @@ func (s *session) handshake(ctx context.Context) *sessionFailure {
 		return loadErr
 	})
 	if storeErr != nil {
-		return failure("authentication_failed", websocket.StatusPolicyViolation, true)
+		return categorizedFailure("authentication_failed", websocket.StatusPolicyViolation, true, failureCategoryStore)
 	}
 	defer durable.Destroy()
 	if durable.ControllerID != hello.ControllerID || durable.KeyID != hello.KeyID || durable.SessionID != challenge.SessionID || !bytes.Equal(durable.ClientNonce, challengeInput.ClientNonce) || !bytes.Equal(durable.ServerNonce, challengeInput.ServerNonce) || !bytes.Equal(durable.ACKDigest, challengeInput.ACKDigest) || !durable.ExpiresAt.Equal(challenge.ExpiresAt) || len(durable.PublicKey) != ed25519.PublicKeySize {
@@ -197,7 +263,7 @@ func (s *session) handshake(ctx context.Context) *sessionFailure {
 		return s.handler.store.ConsumeChallenge(storeCtx, challenge.SessionID, sessionUntil)
 	})
 	if storeErr != nil {
-		return failure("authentication_failed", websocket.StatusPolicyViolation, true)
+		return categorizedFailure("authentication_failed", websocket.StatusPolicyViolation, true, failureCategoryStore)
 	}
 	var lease store.Lease
 	storeErr = s.withStore(ctx, func(storeCtx context.Context) error {
@@ -210,6 +276,11 @@ func (s *session) handshake(ctx context.Context) *sessionFailure {
 	}
 	s.controllerID, s.keyID, s.sessionID, s.sessionUntil = hello.ControllerID, hello.KeyID, challenge.SessionID, sessionUntil
 	s.lease, s.leaseHeld = lease, true
+	s.leaseCounted = true
+	s.handler.leasesActive.Add(1)
+	s.authenticatedCounted = true
+	s.handler.authenticated.Add(1)
+	s.handler.observeLifecycle("authenticated")
 	// Reads are supervisor-permitted one at a time. Authentication and the
 	// fenced lease are durable before the larger allowance is installed and
 	// the mandatory full subscription sync receives its permit.
@@ -242,7 +313,7 @@ func (s *session) handshake(ctx context.Context) *sessionFailure {
 		return applyErr
 	})
 	if storeErr != nil || result.Kind != store.ResultSubscriptionsSynced {
-		return failure("subscriptions_sync_failed", websocket.StatusPolicyViolation, true)
+		return categorizedFailure("subscriptions_sync_failed", websocket.StatusPolicyViolation, true, failureCategoryStore)
 	}
 	for _, subscription := range syncMessage.Subscriptions {
 		s.subscriptions[subscription.SubscriptionID] = struct{}{}
@@ -264,7 +335,7 @@ func (s *session) nextControllerFrame(ctx context.Context, timeout time.Duration
 	select {
 	case event := <-s.reads:
 		if event.err != nil {
-			return nil, failure("connection_closed", websocket.StatusNormalClosure, false)
+			return nil, categorizedFailure("connection_closed", websocket.StatusNormalClosure, false, event.category)
 		}
 		if event.messageType != websocket.MessageText {
 			return nil, failure("binary_not_supported", websocket.StatusUnsupportedData, true)
@@ -417,7 +488,11 @@ func (s *session) readLoop(ctx context.Context) {
 			return
 		}
 		messageType, data, err := s.conn.Read(ctx)
-		event := readEvent{messageType: messageType, data: data, err: err}
+		category := failureCategoryNone
+		if err != nil && ctx.Err() == nil {
+			category = failureCategoryRead
+		}
+		event := readEvent{messageType: messageType, data: data, err: err, category: category}
 		select {
 		case s.reads <- event:
 		case <-ctx.Done():
@@ -439,7 +514,7 @@ func (s *session) writeLoop(ctx context.Context) {
 			cancel()
 			clear(request.data)
 			request.done <- err
-			if err != nil {
+			if err != nil && ctx.Err() == nil {
 				select {
 				case s.writerFailed <- err:
 				default:

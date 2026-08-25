@@ -63,6 +63,13 @@ type Options struct {
 	RecoveryWindow      time.Duration
 	ProviderTimeout     time.Duration
 	LoopbackDevelopment bool
+	Observer            Observer
+}
+
+// Observer receives only closed, aggregate outcome codes. Implementations
+// must not attach request, provider, repository, or network identifiers.
+type Observer interface {
+	ObserveWebhook(outcome string)
 }
 
 type Service struct {
@@ -79,6 +86,7 @@ type Service struct {
 	enrollmentKey      []byte
 	recoveryWindow     time.Duration
 	enrollmentLimiter  *enrollmentLimiter
+	observer           Observer
 }
 
 func New(options Options) (*Service, error) {
@@ -121,7 +129,14 @@ func New(options Options) (*Service, error) {
 		enrollmentKey:      append([]byte(nil), options.EnrollmentKey...),
 		recoveryWindow:     options.RecoveryWindow,
 		enrollmentLimiter:  newEnrollmentLimiter(limiterKey, options.Now().UTC()),
+		observer:           options.Observer,
 	}, nil
+}
+
+func (s *Service) observeWebhook(outcome string) {
+	if s != nil && s.observer != nil {
+		s.observer.ObserveWebhook(outcome)
+	}
 }
 
 func validPublicBaseURL(value *url.URL, development bool) bool {
