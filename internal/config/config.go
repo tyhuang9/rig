@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hostd/hostd/internal/controllerrelay"
 )
 
 type Config struct {
@@ -28,6 +30,8 @@ type Config struct {
 	CaddyManagement             bool
 	GitHubClientID              string
 	GitHubAppSlug               string
+	ControllerRelay             bool
+	RelayOrigin                 string
 }
 
 const (
@@ -79,11 +83,24 @@ func FromFlags(args []string) (Config, error) {
 	fs.BoolVar(&c.CaddyManagement, "caddy-management", false, "enable Caddy management")
 	fs.StringVar(&c.GitHubClientID, "github-client-id", "", "public GitHub App client ID")
 	fs.StringVar(&c.GitHubAppSlug, "github-app-slug", "", "public GitHub App slug")
+	fs.BoolVar(&c.ControllerRelay, "controller-relay", false, "enable controller relay lifecycle")
+	fs.StringVar(&c.RelayOrigin, "relay-origin", "", "canonical HTTPS controller relay origin")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
 	if c.Mode != "controller-agent" && c.Mode != "agent" {
 		return Config{}, errors.New("mode must be controller-agent or agent")
+	}
+	if c.ControllerRelay != (c.RelayOrigin != "") {
+		return Config{}, errors.New("controller-relay and relay-origin must be provided together")
+	}
+	if c.ControllerRelay {
+		if c.Mode != "controller-agent" {
+			return Config{}, errors.New("controller relay requires controller-agent mode")
+		}
+		if _, err := controllerrelay.ParseCanonicalHTTPSOrigin(c.RelayOrigin); err != nil {
+			return Config{}, errors.New("relay origin is invalid")
+		}
 	}
 	if c.ListenAddress == "" {
 		return Config{}, errors.New("listen address is required")
