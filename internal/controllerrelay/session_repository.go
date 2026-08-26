@@ -43,6 +43,71 @@ func (r *Repository) AdvanceSessionStatus(ctx context.Context, expectedEpoch, ex
 	return nil
 }
 
+// BeginSessionEpoch establishes the durable lifecycle fence before recovery.
+// It discovers the active singleton in the same transaction, so callers never
+// invent a controller ID merely to record a local recovery failure.
+func (r *Repository) BeginSessionEpoch(ctx context.Context, at time.Time) (SessionStatus, error) {
+	if ctx == nil || at.IsZero() {
+		return SessionStatus{}, ErrInvalid
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SessionStatus{}, err
+	}
+	defer tx.Rollback()
+	var controllerID string
+	if err = tx.QueryRowContext(ctx, `SELECT controller_id FROM relay_controllers WHERE singleton=1 AND state='active'`).Scan(&controllerID); errors.Is(err, sql.ErrNoRows) {
+		return SessionStatus{}, ErrNotFound
+	} else if err != nil {
+		return SessionStatus{}, err
+	}
+
+	var current SessionStatus
+	var epoch, fence int64
+	var changed, updated string
+	var nextAttempt, lastReady, lastSeen sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT controller_id,epoch,fence,state,COALESCE(key_id,''),COALESCE(last_error_code,''),attempt,next_attempt_at,last_ready_at,last_seen_at,state_changed_at,updated_at FROM relay_controller_session_state WHERE controller_id=?`, controllerID).Scan(&current.ControllerID, &epoch, &fence, &current.State, &current.KeyID, &current.ErrorCode, &current.Attempt, &nextAttempt, &lastReady, &lastSeen, &changed, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		result := SessionStatus{ControllerID: controllerID, Epoch: 1, Fence: 1, State: SessionDisconnected, StateChangedAt: at.UTC(), UpdatedAt: at.UTC()}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO relay_controller_session_state(controller_id,epoch,fence,state,key_id,last_error_code,attempt,next_attempt_at,last_ready_at,last_seen_at,state_changed_at,updated_at) VALUES(?,?,?,'disconnected',NULL,NULL,0,NULL,NULL,NULL,?,?)`, controllerID, result.Epoch, result.Fence, timestamp(result.StateChangedAt), timestamp(result.UpdatedAt)); err != nil {
+			return SessionStatus{}, classifyConstraint(err)
+		}
+		if err = tx.Commit(); err != nil {
+			return SessionStatus{}, err
+		}
+		return result, nil
+	}
+	if err != nil {
+		return SessionStatus{}, err
+	}
+	if current.LastReadyAt, err = parseNullableTimestamp(lastReady); err != nil {
+		return SessionStatus{}, err
+	}
+	if current.LastSeenAt, err = parseNullableTimestamp(lastSeen); err != nil {
+		return SessionStatus{}, err
+	}
+	nextEpoch := uint64(epoch) + 1
+	if nextEpoch == 0 || nextEpoch > math.MaxInt64 {
+		return SessionStatus{}, ErrState
+	}
+	result := SessionStatus{ControllerID: controllerID, Epoch: nextEpoch, Fence: 1, State: SessionDisconnected, LastReadyAt: current.LastReadyAt, LastSeenAt: current.LastSeenAt, StateChangedAt: at.UTC(), UpdatedAt: at.UTC()}
+	update, err := tx.ExecContext(ctx, `UPDATE relay_controller_session_state SET epoch=?,fence=1,state='disconnected',key_id=NULL,last_error_code=NULL,attempt=0,next_attempt_at=NULL,last_ready_at=?,last_seen_at=?,state_changed_at=?,updated_at=? WHERE controller_id=? AND epoch=? AND fence=?`, result.Epoch, nullableTime(result.LastReadyAt), nullableTime(result.LastSeenAt), timestamp(result.StateChangedAt), timestamp(result.UpdatedAt), controllerID, epoch, fence)
+	if err != nil {
+		return SessionStatus{}, classifyConstraint(err)
+	}
+	count, err := update.RowsAffected()
+	if err != nil {
+		return SessionStatus{}, err
+	}
+	if count != 1 {
+		return SessionStatus{}, ErrState
+	}
+	if err = tx.Commit(); err != nil {
+		return SessionStatus{}, err
+	}
+	return result, nil
+}
+
 func (r *Repository) SessionStatus(ctx context.Context, controllerID string) (SessionStatus, error) {
 	if !canonicalUUID(controllerID) {
 		return SessionStatus{}, ErrInvalid
@@ -73,6 +138,33 @@ func (r *Repository) SessionStatus(ctx context.Context, controllerID string) (Se
 	}
 	value.LastSeenAt, err = parseNullableTimestamp(lastSeen)
 	return value, err
+}
+
+// SessionLifecycleDiagnostics returns bounded aggregate operational state for
+// lifecycle observations. It intentionally omits command bodies and all
+// credential or session material.
+func (r *Repository) SessionLifecycleDiagnostics(ctx context.Context, controllerID string, at time.Time) (SessionLifecycleDiagnostics, error) {
+	if !canonicalUUID(controllerID) || at.IsZero() {
+		return SessionLifecycleDiagnostics{}, ErrInvalid
+	}
+	var value SessionLifecycleDiagnostics
+	var oldest sql.NullString
+	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*),MIN(sent_at) FROM relay_outbound_commands WHERE controller_id=? AND state='prepared'`, controllerID).Scan(&value.PendingCommands, &oldest); err != nil {
+		return SessionLifecycleDiagnostics{}, err
+	}
+	if oldest.Valid {
+		oldestAt, err := parseTimestamp(oldest.String)
+		if err != nil {
+			return SessionLifecycleDiagnostics{}, err
+		}
+		if at.After(oldestAt) {
+			value.OldestPendingAge = at.Sub(oldestAt)
+		}
+	}
+	if err := r.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN lease_expires_at>? THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN lease_expires_at<=? THEN 1 ELSE 0 END),0) FROM relay_controller_key_io_leases WHERE controller_id=?`, timestamp(at), timestamp(at), controllerID).Scan(&value.ActiveLeases, &value.ExpiredLeases); err != nil {
+		return SessionLifecycleDiagnostics{}, err
+	}
+	return value, nil
 }
 
 func (r *Repository) CreateSubscription(ctx context.Context, value RelaySubscription) error {
@@ -374,6 +466,17 @@ func (r *Repository) DurableACKState(ctx context.Context, controllerID string) (
 }
 
 func (r *Repository) CommitSourceDesired(ctx context.Context, controllerID string, source protocol.SourceDesired, receivedAt time.Time) (InboxDecision, error) {
+	return r.commitSourceDesired(ctx, controllerID, 0, 0, source, receivedAt)
+}
+
+func (r *Repository) CommitSourceDesiredFenced(ctx context.Context, controllerID string, epoch, fence uint64, source protocol.SourceDesired, receivedAt time.Time) (InboxDecision, error) {
+	if epoch == 0 || fence == 0 {
+		return InboxDecision{}, ErrInvalid
+	}
+	return r.commitSourceDesired(ctx, controllerID, epoch, fence, source, receivedAt)
+}
+
+func (r *Repository) commitSourceDesired(ctx context.Context, controllerID string, epoch, fence uint64, source protocol.SourceDesired, receivedAt time.Time) (InboxDecision, error) {
 	if !canonicalUUID(controllerID) || receivedAt.IsZero() || source.Generation > math.MaxInt64 || protocol.Validate(&source) != nil {
 		return InboxDecision{}, ErrInvalid
 	}
@@ -384,6 +487,9 @@ func (r *Repository) CommitSourceDesired(ctx context.Context, controllerID strin
 	defer tx.Rollback()
 	if err = requireActiveController(ctx, tx, controllerID); err != nil {
 		return InboxDecision{}, err
+	}
+	if epoch != 0 && requireFencedReadySession(ctx, tx, controllerID, epoch, fence) != nil {
+		return InboxDecision{}, ErrState
 	}
 	decision, found, err := existingSourceDecision(ctx, tx, controllerID, source)
 	if err != nil {
@@ -429,6 +535,17 @@ func (r *Repository) CommitSourceDesired(ctx context.Context, controllerID strin
 }
 
 func (r *Repository) CommitAccessChange(ctx context.Context, controllerID string, change protocol.AccessChange, receivedAt time.Time) (InboxDecision, error) {
+	return r.commitAccessChange(ctx, controllerID, 0, 0, change, receivedAt)
+}
+
+func (r *Repository) CommitAccessChangeFenced(ctx context.Context, controllerID string, epoch, fence uint64, change protocol.AccessChange, receivedAt time.Time) (InboxDecision, error) {
+	if epoch == 0 || fence == 0 {
+		return InboxDecision{}, ErrInvalid
+	}
+	return r.commitAccessChange(ctx, controllerID, epoch, fence, change, receivedAt)
+}
+
+func (r *Repository) commitAccessChange(ctx context.Context, controllerID string, epoch, fence uint64, change protocol.AccessChange, receivedAt time.Time) (InboxDecision, error) {
 	if !canonicalUUID(controllerID) || receivedAt.IsZero() || protocol.Validate(&change) != nil || !validAccessCode(change.ChangeCode) || !validAccessScope(change.ChangeCode, change.RepositoryID) {
 		return InboxDecision{}, ErrInvalid
 	}
@@ -439,6 +556,9 @@ func (r *Repository) CommitAccessChange(ctx context.Context, controllerID string
 	defer tx.Rollback()
 	if err = requireActiveController(ctx, tx, controllerID); err != nil {
 		return InboxDecision{}, err
+	}
+	if epoch != 0 && requireFencedReadySession(ctx, tx, controllerID, epoch, fence) != nil {
+		return InboxDecision{}, ErrState
 	}
 	var installationID, repositoryID int64
 	var code, observed string
@@ -598,6 +718,19 @@ func (r *Repository) PrepareBindingRemoval(ctx context.Context, owner, bindingID
 // CompleteBindingRemoval validates the exact relay response and commits both
 // the command ledger and binding terminal state in the same transaction.
 func (r *Repository) CompleteBindingRemoval(ctx context.Context, controllerID string, response protocol.BindingRemoved, at time.Time) error {
+	return r.completeBindingRemoval(ctx, controllerID, 0, 0, response, at)
+}
+
+// CompleteBindingRemovalFenced records an inbound response only while the
+// exact Ready session owner remains current in the same transaction.
+func (r *Repository) CompleteBindingRemovalFenced(ctx context.Context, controllerID string, epoch, fence uint64, response protocol.BindingRemoved, at time.Time) error {
+	if epoch == 0 || fence == 0 {
+		return ErrInvalid
+	}
+	return r.completeBindingRemoval(ctx, controllerID, epoch, fence, response, at)
+}
+
+func (r *Repository) completeBindingRemoval(ctx context.Context, controllerID string, epoch, fence uint64, response protocol.BindingRemoved, at time.Time) error {
 	if !canonicalUUID(controllerID) || protocol.Validate(&response) != nil || at.IsZero() {
 		return ErrInvalid
 	}
@@ -606,6 +739,11 @@ func (r *Repository) CompleteBindingRemoval(ctx context.Context, controllerID st
 		return err
 	}
 	defer tx.Rollback()
+	if epoch != 0 {
+		if err = requireFencedReadySession(ctx, tx, controllerID, epoch, fence); err != nil {
+			return err
+		}
+	}
 	command, err := scanOutboundCommand(tx.QueryRowContext(ctx, `SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND message_id=?`, controllerID, response.TargetMessageID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
@@ -773,14 +911,23 @@ func (r *Repository) CompleteControlCommand(ctx context.Context, controllerID, m
 }
 
 func (r *Repository) PrepareRotationProposal(ctx context.Context, candidate OutboundCommand, at time.Time) (KeyRotation, OutboundCommand, error) {
-	return r.prepareRotationStage(ctx, candidate, RotationPrepare, RotationPropose, "", at)
+	return r.prepareRotationStage(ctx, candidate, RotationPrepare, RotationPropose, "", at, 0, 0)
 }
 
 func (r *Repository) PrepareRotationConfirmation(ctx context.Context, targetMessageID string, candidate OutboundCommand, at time.Time) (KeyRotation, OutboundCommand, error) {
-	return r.prepareRotationStage(ctx, candidate, RotationPropose, RotationConfirm, targetMessageID, at)
+	return r.prepareRotationStage(ctx, candidate, RotationPropose, RotationConfirm, targetMessageID, at, 0, 0)
 }
 
-func (r *Repository) prepareRotationStage(ctx context.Context, candidate OutboundCommand, expectedState, nextState, targetMessageID string, at time.Time) (KeyRotation, OutboundCommand, error) {
+// PrepareRotationConfirmationFenced records an inbound challenge response only
+// while its exact Ready session owner remains current in the transaction.
+func (r *Repository) PrepareRotationConfirmationFenced(ctx context.Context, targetMessageID string, epoch, fence uint64, candidate OutboundCommand, at time.Time) (KeyRotation, OutboundCommand, error) {
+	if epoch == 0 || fence == 0 {
+		return KeyRotation{}, OutboundCommand{}, ErrInvalid
+	}
+	return r.prepareRotationStage(ctx, candidate, RotationPropose, RotationConfirm, targetMessageID, at, epoch, fence)
+}
+
+func (r *Repository) prepareRotationStage(ctx context.Context, candidate OutboundCommand, expectedState, nextState, targetMessageID string, at time.Time, epoch, fence uint64) (KeyRotation, OutboundCommand, error) {
 	if !validOutboundCommand(candidate) || candidate.State != CommandPrepared || candidate.RotationID == "" || at.IsZero() ||
 		(nextState == RotationPropose && candidate.CommandType != CommandRotationPropose) ||
 		(nextState == RotationConfirm && (candidate.CommandType != CommandRotationConfirm || !canonicalUUID(targetMessageID))) {
@@ -791,6 +938,11 @@ func (r *Repository) prepareRotationStage(ctx context.Context, candidate Outboun
 		return KeyRotation{}, OutboundCommand{}, err
 	}
 	defer tx.Rollback()
+	if epoch != 0 {
+		if err = requireFencedReadySession(ctx, tx, candidate.ControllerID, epoch, fence); err != nil {
+			return KeyRotation{}, OutboundCommand{}, err
+		}
+	}
 	rotation, err := scanRotation(tx.QueryRowContext(ctx, rotationSelect+` WHERE controller_id=? AND rotation_id=?`, candidate.ControllerID, candidate.RotationID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return KeyRotation{}, OutboundCommand{}, ErrNotFound
@@ -857,6 +1009,19 @@ func (r *Repository) prepareRotationStage(ctx context.Context, candidate Outboun
 // advances through the local recovery-armed state, and prepares Finalize in a
 // single transaction. Finalize is still sent on the old-key session.
 func (r *Repository) ConfirmRotationAndPrepareFinalize(ctx context.Context, targetMessageID, rotationID, sessionKeyID string, candidate OutboundCommand, at time.Time) (KeyRotation, OutboundCommand, error) {
+	return r.confirmRotationAndPrepareFinalize(ctx, targetMessageID, rotationID, sessionKeyID, candidate, at, 0, 0)
+}
+
+// ConfirmRotationAndPrepareFinalizeFenced records an inbound confirmation only
+// while its exact Ready session owner remains current in the transaction.
+func (r *Repository) ConfirmRotationAndPrepareFinalizeFenced(ctx context.Context, targetMessageID, rotationID, sessionKeyID string, epoch, fence uint64, candidate OutboundCommand, at time.Time) (KeyRotation, OutboundCommand, error) {
+	if epoch == 0 || fence == 0 {
+		return KeyRotation{}, OutboundCommand{}, ErrInvalid
+	}
+	return r.confirmRotationAndPrepareFinalize(ctx, targetMessageID, rotationID, sessionKeyID, candidate, at, epoch, fence)
+}
+
+func (r *Repository) confirmRotationAndPrepareFinalize(ctx context.Context, targetMessageID, rotationID, sessionKeyID string, candidate OutboundCommand, at time.Time, epoch, fence uint64) (KeyRotation, OutboundCommand, error) {
 	if !canonicalUUID(targetMessageID) || !canonicalUUID(rotationID) || !canonicalUUID(sessionKeyID) || at.IsZero() || !validOutboundCommand(candidate) || candidate.CommandType != CommandRotationFinalize || candidate.RotationID != rotationID || candidate.State != CommandPrepared {
 		return KeyRotation{}, OutboundCommand{}, ErrInvalid
 	}
@@ -865,6 +1030,11 @@ func (r *Repository) ConfirmRotationAndPrepareFinalize(ctx context.Context, targ
 		return KeyRotation{}, OutboundCommand{}, err
 	}
 	defer tx.Rollback()
+	if epoch != 0 {
+		if err = requireFencedReadySession(ctx, tx, candidate.ControllerID, epoch, fence); err != nil {
+			return KeyRotation{}, OutboundCommand{}, err
+		}
+	}
 	rotation, err := scanRotation(tx.QueryRowContext(ctx, rotationSelect+` WHERE controller_id=? AND rotation_id=?`, candidate.ControllerID, rotationID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return KeyRotation{}, OutboundCommand{}, ErrNotFound
@@ -1066,6 +1236,19 @@ func parseRevokedKeyCleanupCursor(cursor string) (string, string, error) {
 // CompleteRotationFinalized records only the relay-side terminal response. The
 // local key swap remains gated by a separately durable fenced Ready.
 func (r *Repository) CompleteRotationFinalized(ctx context.Context, controllerID string, response protocol.KeyRotationFinalized, at time.Time) error {
+	return r.completeRotationFinalized(ctx, controllerID, 0, 0, response, at)
+}
+
+// CompleteRotationFinalizedFenced records an inbound terminal response only
+// while its exact Ready session owner remains current in the transaction.
+func (r *Repository) CompleteRotationFinalizedFenced(ctx context.Context, controllerID string, epoch, fence uint64, response protocol.KeyRotationFinalized, at time.Time) error {
+	if epoch == 0 || fence == 0 {
+		return ErrInvalid
+	}
+	return r.completeRotationFinalized(ctx, controllerID, epoch, fence, response, at)
+}
+
+func (r *Repository) completeRotationFinalized(ctx context.Context, controllerID string, epoch, fence uint64, response protocol.KeyRotationFinalized, at time.Time) error {
 	if !canonicalUUID(controllerID) || protocol.Validate(&response) != nil || at.IsZero() {
 		return ErrInvalid
 	}
@@ -1074,6 +1257,11 @@ func (r *Repository) CompleteRotationFinalized(ctx context.Context, controllerID
 		return err
 	}
 	defer tx.Rollback()
+	if epoch != 0 {
+		if err = requireFencedReadySession(ctx, tx, controllerID, epoch, fence); err != nil {
+			return err
+		}
+	}
 	command, err := scanOutboundCommand(tx.QueryRowContext(ctx, `SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND message_id=?`, controllerID, response.TargetMessageID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
@@ -1104,6 +1292,19 @@ func (r *Repository) CompleteRotationFinalized(ctx context.Context, controllerID
 // under the old active key. Finalize is intentionally excluded because relay
 // activation may already be externally committed at that stage.
 func (r *Repository) FailExpiredRotation(ctx context.Context, controllerID, rotationID string, at time.Time) error {
+	return r.failExpiredRotation(ctx, controllerID, rotationID, at, 0, 0)
+}
+
+// FailExpiredRotationFenced fails an inbound expired rotation only while the
+// exact Ready session owner remains current in the same transaction.
+func (r *Repository) FailExpiredRotationFenced(ctx context.Context, controllerID, rotationID string, epoch, fence uint64, at time.Time) error {
+	if epoch == 0 || fence == 0 {
+		return ErrInvalid
+	}
+	return r.failExpiredRotation(ctx, controllerID, rotationID, at, epoch, fence)
+}
+
+func (r *Repository) failExpiredRotation(ctx context.Context, controllerID, rotationID string, at time.Time, epoch, fence uint64) error {
 	if !canonicalUUID(controllerID) || !canonicalUUID(rotationID) || at.IsZero() {
 		return ErrInvalid
 	}
@@ -1112,6 +1313,11 @@ func (r *Repository) FailExpiredRotation(ctx context.Context, controllerID, rota
 		return err
 	}
 	defer tx.Rollback()
+	if epoch != 0 {
+		if err = requireFencedReadySession(ctx, tx, controllerID, epoch, fence); err != nil {
+			return err
+		}
+	}
 	rotation, err := scanRotation(tx.QueryRowContext(ctx, rotationSelect+` WHERE controller_id=? AND rotation_id=?`, controllerID, rotationID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
@@ -1416,6 +1622,20 @@ func requireActiveController(ctx context.Context, tx *sql.Tx, controllerID strin
 		return err
 	}
 	if state != ControllerActive {
+		return ErrState
+	}
+	return nil
+}
+
+func requireFencedReadySession(ctx context.Context, tx *sql.Tx, controllerID string, epoch, fence uint64) error {
+	if epoch == 0 || fence == 0 {
+		return ErrInvalid
+	}
+	var found int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM relay_controller_session_state WHERE controller_id=? AND epoch=? AND fence=? AND state='ready'`, controllerID, epoch, fence).Scan(&found); err != nil {
+		return err
+	}
+	if found != 1 {
 		return ErrState
 	}
 	return nil

@@ -68,7 +68,7 @@ func TestBindingRemovalIsOwnerScopedAtomicReplayableAndConcurrent(t *testing.T) 
 	}
 
 	wrong := protocol.BindingRemoved{Envelope: protocol.NewEnvelope(protocol.TypeBindingRemoved, uuid.NewString(), now), TargetMessageID: first.MessageID, InstallationID: first.InstallationID, RepositoryID: first.RepositoryID + 1}
-	if _, err = service.Handle(context.Background(), testControlSession(now, repositoryTestKeyID), &wrong); err == nil {
+	if _, err = service.Handle(context.Background(), testReadyControlSession(t, repository, now, repositoryTestKeyID), &wrong); err == nil {
 		t.Fatal("wrong-scope binding response succeeded")
 	}
 	stillPending, _ := repository.Binding(context.Background(), binding.OwnerUserID, binding.BindingID)
@@ -79,12 +79,12 @@ func TestBindingRemovalIsOwnerScopedAtomicReplayableAndConcurrent(t *testing.T) 
 	removed := wrong
 	removed.MessageID = uuid.NewString()
 	removed.RepositoryID = first.RepositoryID
-	result, err := service.Handle(context.Background(), testControlSession(now, repositoryTestKeyID), &removed)
+	result, err := service.Handle(context.Background(), testReadyControlSession(t, repository, now, repositoryTestKeyID), &removed)
 	if err != nil || result.Action != ControlContinue || result.Response != nil {
 		t.Fatalf("binding completion = %#v err=%v", result, err)
 	}
 	removed.MessageID = uuid.NewString()
-	if _, err = service.Handle(context.Background(), testControlSession(now, repositoryTestKeyID), &removed); err != nil {
+	if _, err = service.Handle(context.Background(), testReadyControlSession(t, repository, now, repositoryTestKeyID), &removed); err != nil {
 		t.Fatalf("duplicate binding response = %v", err)
 	}
 	terminal, _ := repository.Binding(context.Background(), binding.OwnerUserID, binding.BindingID)
@@ -144,7 +144,7 @@ func TestKeyRotationReplaysExactCommandsAndCompletesOnlyAfterFencedReady(t *test
 		t.Fatalf("pre-finalized authentication key = %#v %#v err=%v", oldIdentity, oldKey, err)
 	}
 
-	session := testControlSession(now, repositoryTestKeyID)
+	session := testReadyControlSession(t, repository, now, repositoryTestKeyID)
 	nonce := bytes.Repeat([]byte{0x6a}, protocol.NonceBytes)
 	challenge := &protocol.KeyRotationChallenge{Envelope: protocol.NewEnvelope(protocol.TypeKeyRotationChallenge, uuid.NewString(), now.Add(time.Minute)), TargetMessageID: propose.MessageID, RotationID: propose.RotationID, ServerNonce: base64.RawURLEncoding.EncodeToString(nonce), ExpiresAt: now.Add(4 * time.Minute)}
 	result, err := service.Handle(context.Background(), session, challenge)
@@ -257,19 +257,19 @@ func TestKeyRotationReplaysExactCommandsAndCompletesOnlyAfterFencedReady(t *test
 	}
 
 	readyAt := now.Add(5 * time.Minute)
-	ready := SessionStatus{ControllerID: repositoryTestControllerID, Epoch: 1, Fence: 1, State: SessionReady, KeyID: propose.NewKeyID, LastReadyAt: &readyAt, LastSeenAt: &readyAt, StateChangedAt: readyAt, UpdatedAt: readyAt}
-	if err = repository.AdvanceSessionStatus(context.Background(), 0, 0, ready); err != nil {
+	ready := SessionStatus{ControllerID: repositoryTestControllerID, Epoch: 1, Fence: 2, State: SessionReady, KeyID: propose.NewKeyID, LastReadyAt: &readyAt, LastSeenAt: &readyAt, StateChangedAt: readyAt, UpdatedAt: readyAt}
+	if err = repository.AdvanceSessionStatus(context.Background(), 1, 1, ready); err != nil {
 		t.Fatal(err)
 	}
 	service.config.Now = func() time.Time { return readyAt.Add(time.Second) }
-	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, propose.NewKeyID, 1, 2); err == nil {
+	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, propose.NewKeyID, 1, 3); err == nil {
 		t.Fatal("wrong Ready fence completed rotation")
 	}
 	if _, err = repository.db.Exec(fmt.Sprintf(`CREATE TRIGGER test_abort_control_new_key_activation BEFORE UPDATE OF state ON relay_controller_keys WHEN OLD.key_id='%s' AND NEW.state='active' BEGIN SELECT RAISE(ABORT,'forced rotation rollback'); END`, propose.NewKeyID)); err != nil {
 		t.Fatal(err)
 	}
 	removalsBeforeRollback := credentials.removeCalls
-	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, propose.NewKeyID, 1, 1); err == nil {
+	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, propose.NewKeyID, 1, 2); err == nil {
 		t.Fatal("forced Ready completion rollback succeeded")
 	}
 	if credentials.removeCalls != removalsBeforeRollback || !credentials.has(ProtectedKeyRef(repositoryTestControllerID, repositoryTestKeyID)) {
@@ -279,7 +279,7 @@ func TestKeyRotationReplaysExactCommandsAndCompletesOnlyAfterFencedReady(t *test
 		t.Fatal(err)
 	}
 	credentials.failNextRemoval(ProtectedKeyRef(repositoryTestControllerID, repositoryTestKeyID))
-	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, propose.NewKeyID, 1, 1); err == nil || !strings.Contains(err.Error(), controlErrorCredential) {
+	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, propose.NewKeyID, 1, 2); err == nil || !strings.Contains(err.Error(), controlErrorCredential) {
 		t.Fatalf("cleanup failure = %v", err)
 	}
 	completedAfterCleanupFailure, _ := repository.Rotation(context.Background(), repositoryTestControllerID, rotation.RotationID)
@@ -293,7 +293,7 @@ func TestKeyRotationReplaysExactCommandsAndCompletesOnlyAfterFencedReady(t *test
 	if _, err = repository.db.Exec(`CREATE TRIGGER test_abort_completed_key_clear BEFORE UPDATE OF protected_key_cleared_at ON relay_controller_keys BEGIN SELECT RAISE(ABORT,'forced completed key clear failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, propose.NewKeyID, 1, 1); err == nil || !strings.Contains(err.Error(), controlErrorPersistence) {
+	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, propose.NewKeyID, 1, 2); err == nil || !strings.Contains(err.Error(), controlErrorPersistence) {
 		t.Fatalf("completed cleanup mark failure = %v", err)
 	}
 	if credentials.has(ProtectedKeyRef(repositoryTestControllerID, repositoryTestKeyID)) {
@@ -310,10 +310,10 @@ func TestKeyRotationReplaysExactCommandsAndCompletesOnlyAfterFencedReady(t *test
 	if recoverErr != nil || recovered.Cleaned != 0 {
 		t.Fatalf("completed cleanup mark recovery=%#v err=%v", recovered, recoverErr)
 	}
-	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, propose.NewKeyID, 1, 1); err != nil {
+	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, propose.NewKeyID, 1, 2); err != nil {
 		t.Fatalf("completed cleanup mark retry = %v", err)
 	}
-	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, propose.NewKeyID, 1, 1); err != nil {
+	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, propose.NewKeyID, 1, 2); err != nil {
 		t.Fatalf("absent old key cleanup = %v", err)
 	}
 	if err = repository.db.QueryRow(`SELECT protected_key_cleared_at FROM relay_controller_keys WHERE key_id=?`, repositoryTestKeyID).Scan(&oldKeyCleared); err != nil || oldKeyCleared == nil {
@@ -366,7 +366,7 @@ func TestExactFinalizedLostResponseCompletesAfterExpiryWithoutWeakeningCorrelati
 	wrongResponses[2].RetiredKeyID = rotation.NewKeyID
 	for index := range wrongResponses {
 		wrongResponses[index].MessageID = uuid.NewString()
-		if _, err := service.Handle(context.Background(), testControlSession(now, repositoryTestKeyID), &wrongResponses[index]); err == nil {
+		if _, err := service.Handle(context.Background(), testReadyControlSession(t, repository, now, repositoryTestKeyID), &wrongResponses[index]); err == nil {
 			t.Fatalf("wrong finalized response %d succeeded", index)
 		}
 		stored, loadErr := repository.LoadControlCommand(context.Background(), repositoryTestControllerID, command.MessageID)
@@ -375,7 +375,7 @@ func TestExactFinalizedLostResponseCompletesAfterExpiryWithoutWeakeningCorrelati
 		}
 	}
 
-	result, err := service.Handle(context.Background(), testControlSession(now, repositoryTestKeyID), &exact)
+	result, err := service.Handle(context.Background(), testReadyControlSession(t, repository, now, repositoryTestKeyID), &exact)
 	if err != nil || result.Action != ControlReconnect {
 		t.Fatalf("delayed exact finalized = %#v err=%v", result, err)
 	}
@@ -384,17 +384,17 @@ func TestExactFinalizedLostResponseCompletesAfterExpiryWithoutWeakeningCorrelati
 		t.Fatalf("delayed finalized command=%#v err=%v", stored, err)
 	}
 	exact.MessageID = uuid.NewString()
-	if _, err = service.Handle(context.Background(), testControlSession(now, repositoryTestKeyID), &exact); err != nil {
+	if _, err = service.Handle(context.Background(), testReadyControlSession(t, repository, now, repositoryTestKeyID), &exact); err != nil {
 		t.Fatalf("delayed exact finalized replay = %v", err)
 	}
 
 	readyAt := now.Add(11 * time.Minute)
-	ready := SessionStatus{ControllerID: repositoryTestControllerID, Epoch: 1, Fence: 1, State: SessionReady, KeyID: pending.KeyID, LastReadyAt: &readyAt, LastSeenAt: &readyAt, StateChangedAt: readyAt, UpdatedAt: readyAt}
-	if err = repository.AdvanceSessionStatus(context.Background(), 0, 0, ready); err != nil {
+	ready := SessionStatus{ControllerID: repositoryTestControllerID, Epoch: 1, Fence: 2, State: SessionReady, KeyID: pending.KeyID, LastReadyAt: &readyAt, LastSeenAt: &readyAt, StateChangedAt: readyAt, UpdatedAt: readyAt}
+	if err = repository.AdvanceSessionStatus(context.Background(), 1, 1, ready); err != nil {
 		t.Fatal(err)
 	}
 	service.config.Now = func() time.Time { return now.Add(12 * time.Minute) }
-	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, pending.KeyID, 1, 1); err != nil {
+	if err = service.CompleteRotationAfterFencedReady(context.Background(), repositoryTestControllerID, pending.KeyID, 1, 2); err != nil {
 		t.Fatalf("post-expiry fenced completion = %v", err)
 	}
 	var cleared any
@@ -1355,6 +1355,24 @@ func newTestControlService(t *testing.T, repository *Repository, credentials ses
 
 func testControlSession(now time.Time, keyID string) SessionControlContext {
 	return SessionControlContext{ControllerID: repositoryTestControllerID, KeyID: keyID, SessionID: "77777777-7777-4777-8777-777777777777", ExpiresAt: now.Add(time.Hour)}
+}
+
+func testReadyControlSession(t *testing.T, repository *Repository, now time.Time, keyID string) SessionControlContext {
+	t.Helper()
+	status, err := repository.SessionStatus(context.Background(), repositoryTestControllerID)
+	if errors.Is(err, ErrNotFound) {
+		readyAt := now.UTC()
+		status = SessionStatus{ControllerID: repositoryTestControllerID, Epoch: 1, Fence: 1, State: SessionReady, KeyID: repositoryTestKeyID, LastReadyAt: &readyAt, LastSeenAt: &readyAt, StateChangedAt: readyAt, UpdatedAt: readyAt}
+		if err = repository.AdvanceSessionStatus(context.Background(), 0, 0, status); err != nil {
+			t.Fatal(err)
+		}
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	value := testControlSession(now, keyID)
+	value.Epoch = status.Epoch
+	value.Fence = status.Fence
+	return value
 }
 
 type memoryControlCredentials struct {

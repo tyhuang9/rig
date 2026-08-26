@@ -7,10 +7,12 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -36,6 +38,23 @@ var errSessionExpired = errors.New("controller relay session expired")
 type SessionTransportError struct {
 	Code  string
 	Fatal bool
+}
+
+// SessionTransportErrorInfo is the safe, typed classification of a transport
+// failure. It deliberately contains no network, protocol, or credential data.
+type SessionTransportErrorInfo struct {
+	Code  string
+	Fatal bool
+}
+
+// ClassifySessionTransportError extracts a safe transport classification
+// without parsing an error string.
+func ClassifySessionTransportError(err error) (SessionTransportErrorInfo, bool) {
+	var transportErr *SessionTransportError
+	if !errors.As(err, &transportErr) || transportErr == nil {
+		return SessionTransportErrorInfo{}, false
+	}
+	return SessionTransportErrorInfo{Code: safeSessionErrorCode(transportErr.Code), Fatal: transportErr.Fatal}, true
 }
 
 func (err *SessionTransportError) Error() string {
@@ -91,6 +110,91 @@ type SessionTimerSource interface {
 	NewTimer(time.Duration) SessionTimer
 }
 
+const (
+	SessionTransportConnecting     = "connecting"
+	SessionTransportAuthenticating = "authenticating"
+	SessionTransportReady          = "ready"
+)
+
+// SessionTransportReconnect contains only validated aggregate reconnect
+// limits. It intentionally excludes session identity and relay payloads.
+type SessionTransportReconnect struct {
+	InitialDelay time.Duration
+	MaximumDelay time.Duration
+	Multiplier   uint32
+	Jitter       uint32
+}
+
+// SessionTransportEvent is safe to expose to optional transport observers. It
+// never contains controller/key/session identifiers, frames, credentials, or
+// source/application data.
+type SessionTransportEvent struct {
+	Stage            string
+	Fallback         bool
+	Pending          bool
+	ExpiresAt        time.Time
+	MaxEnvelopeBytes int
+	MaxOutstanding   int
+	MaxSubscriptions int
+	Reconnect        SessionTransportReconnect
+}
+
+type sessionTransportLifecycleEvent struct {
+	SessionTransportEvent
+	ControllerID string
+	KeyID        string
+	readyOwner   sessionReadyOwner
+}
+
+func (SessionTransportEvent) String() string         { return "controller relay transport event" }
+func (value SessionTransportEvent) GoString() string { return value.String() }
+func (value SessionTransportEvent) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("stage", safeSessionTransportStage(value.Stage)),
+		slog.Bool("fallback", value.Fallback),
+		slog.Int("max_envelope_bytes", value.MaxEnvelopeBytes),
+		slog.Int("max_outstanding", value.MaxOutstanding),
+		slog.Int("max_subscriptions", value.MaxSubscriptions),
+	)
+}
+
+func (value SessionTransportEvent) MarshalJSON() ([]byte, error) {
+	type safeEvent struct {
+		Stage            string                    `json:"stage"`
+		Fallback         bool                      `json:"fallback"`
+		Pending          bool                      `json:"pending"`
+		ExpiresAt        time.Time                 `json:"expires_at"`
+		MaxEnvelopeBytes int                       `json:"max_envelope_bytes"`
+		MaxOutstanding   int                       `json:"max_outstanding"`
+		MaxSubscriptions int                       `json:"max_subscriptions"`
+		Reconnect        SessionTransportReconnect `json:"reconnect"`
+	}
+	return json.Marshal(safeEvent{
+		Stage:            safeSessionTransportStage(value.Stage),
+		Fallback:         value.Fallback,
+		Pending:          value.Pending,
+		ExpiresAt:        value.ExpiresAt,
+		MaxEnvelopeBytes: value.MaxEnvelopeBytes,
+		MaxOutstanding:   value.MaxOutstanding,
+		MaxSubscriptions: value.MaxSubscriptions,
+		Reconnect:        value.Reconnect,
+	})
+}
+
+func safeSessionTransportStage(stage string) string {
+	switch stage {
+	case SessionTransportConnecting, SessionTransportAuthenticating, SessionTransportReady:
+		return stage
+	default:
+		return SessionTransportConnecting
+	}
+}
+
+// SessionTransportObserver observes safe handshake milestones. Returning an
+// error fails closed with a sanitized persistence transport error.
+type SessionTransportObserver func(context.Context, SessionTransportEvent) error
+type sessionTransportLifecycleObserver func(context.Context, *sessionTransportLifecycleEvent) error
+
 type sessionTransportStore interface {
 	SessionAuthenticationCandidates(context.Context) (ControllerIdentity, []ControllerKey, error)
 	DurableACKState(context.Context, string) ([]protocol.ACKState, error)
@@ -100,10 +204,20 @@ type sessionTransportStore interface {
 	CommitAccessChange(context.Context, string, protocol.AccessChange, time.Time) (InboxDecision, error)
 }
 
+type fencedSessionTransportStore interface {
+	CommitSourceDesiredFenced(context.Context, string, uint64, uint64, protocol.SourceDesired, time.Time) (InboxDecision, error)
+	CommitAccessChangeFenced(context.Context, string, uint64, uint64, protocol.AccessChange, time.Time) (InboxDecision, error)
+}
+
 type SessionControlHandler interface {
 	Pending(context.Context, SessionControlContext, int) ([]protocol.Frame, error)
 	Handle(context.Context, SessionControlContext, protocol.Frame) (SessionControlResult, error)
 }
+
+// sessionFenceRequiredControlHandler reports whether a production control
+// handler's backing repository fences inbound persistence to the active Ready
+// owner. A supervisor refuses a handler that cannot make that guarantee.
+type sessionFenceRequiredControlHandler interface{ requiresSessionFence() bool }
 
 type sessionTransportCredentials interface {
 	ReadControllerKey(controllerID, keyID string, expectedPublicKey []byte) (ControllerKeyBundle, error)
@@ -123,6 +237,7 @@ type SessionTransportConfig struct {
 	Entropy              io.Reader
 	Timers               SessionTimerSource
 	ControlHandler       SessionControlHandler
+	Observer             SessionTransportObserver
 }
 
 func DefaultSessionTransportConfig() SessionTransportConfig {
@@ -150,6 +265,34 @@ type SessionTransport struct {
 	sessionURL  string
 	config      SessionTransportConfig
 	issuer      protocol.Issuer
+	observer    SessionTransportObserver
+	// lifecycleMu protects lifecycle ownership and run activation as one state
+	// machine. A direct run can therefore never pass eligibility before a
+	// supervisor claim and become active afterward.
+	lifecycleMu          sync.Mutex
+	lifecycle            sessionTransportLifecycleObserver
+	runToken             *sessionTransportRunToken
+	runActive            bool
+	beforeRunActivate    func()
+	beforeLifecycleClaim func()
+	observerMu           sync.Mutex
+	observerBusy         bool
+}
+
+type sessionReadyOwner struct {
+	Epoch uint64
+	Fence uint64
+}
+
+type sessionTransportRunToken struct{}
+
+type sessionTransportRunner struct {
+	transport *SessionTransport
+	token     *sessionTransportRunToken
+}
+
+func (runner sessionTransportRunner) RunOnce(ctx context.Context) error {
+	return runner.transport.runOnceClaimed(ctx, runner.token)
 }
 
 func NewSessionTransport(rawOrigin string, store sessionTransportStore, credentials sessionTransportCredentials, transport http.RoundTripper, dial SessionDialFunc, config SessionTransportConfig) (*SessionTransport, error) {
@@ -172,6 +315,7 @@ func NewSessionTransport(rawOrigin string, store sessionTransportStore, credenti
 		sessionURL:  sessionURL,
 		config:      config,
 		issuer:      protocol.Issuer{Entropy: config.Entropy, Now: config.Now},
+		observer:    config.Observer,
 	}, nil
 }
 
@@ -179,6 +323,42 @@ func (transport *SessionTransport) RunOnce(ctx context.Context) error {
 	if transport == nil || ctx == nil {
 		return sessionFailure(sessionErrorIdentity, true)
 	}
+	if !transport.activateRun(nil) {
+		return sessionFailure(sessionErrorIdentity, true)
+	}
+	return transport.runActiveSession(ctx)
+}
+
+func (transport *SessionTransport) runOnceClaimed(ctx context.Context, token *sessionTransportRunToken) error {
+	if transport == nil || ctx == nil || token == nil {
+		return sessionFailure(sessionErrorIdentity, true)
+	}
+	if !transport.activateRun(token) {
+		return sessionFailure(sessionErrorIdentity, true)
+	}
+	return transport.runActiveSession(ctx)
+}
+
+func (transport *SessionTransport) activateRun(token *sessionTransportRunToken) bool {
+	transport.lifecycleMu.Lock()
+	defer transport.lifecycleMu.Unlock()
+	if transport.runActive || token == nil && transport.runToken != nil || token != nil && transport.runToken != token {
+		return false
+	}
+	if transport.beforeRunActivate != nil {
+		transport.beforeRunActivate()
+	}
+	// The hooks are private deterministic test seams. Production activation is
+	// one uninterrupted eligibility-and-ownership transition under lifecycleMu.
+	if transport.runActive || token == nil && transport.runToken != nil || token != nil && transport.runToken != token {
+		return false
+	}
+	transport.runActive = true
+	return true
+}
+
+func (transport *SessionTransport) runActiveSession(ctx context.Context) error {
+	defer transport.deactivateRun()
 	active, err := transport.connect(ctx)
 	if err != nil {
 		return err
@@ -187,11 +367,19 @@ func (transport *SessionTransport) RunOnce(ctx context.Context) error {
 	return active.run(ctx)
 }
 
+func (transport *SessionTransport) deactivateRun() {
+	transport.lifecycleMu.Lock()
+	transport.runActive = false
+	transport.lifecycleMu.Unlock()
+}
+
 type activeControllerSession struct {
 	transport         *SessionTransport
 	conn              SessionSocket
 	controllerID      string
 	keyID             string
+	epoch             uint64
+	fence             uint64
 	sessionID         string
 	maxEnvelopeBytes  int
 	maxOutstanding    int
@@ -217,7 +405,12 @@ func (transport *SessionTransport) connect(ctx context.Context) (_ *activeContro
 		if (key.State != KeyActive && key.State != KeyPending) || identity.ControllerID != key.ControllerID || index > 0 && key.State != KeyPending {
 			return nil, sessionFailure(sessionErrorIdentity, true)
 		}
-		active, attemptErr := transport.connectCandidate(handshakeCtx, identity, key, ackState)
+		fallback := index > 0
+		connectingEvent := sessionTransportLifecycleEvent{SessionTransportEvent: SessionTransportEvent{Stage: SessionTransportConnecting, Fallback: fallback, Pending: key.State == KeyPending}, ControllerID: identity.ControllerID, KeyID: key.KeyID}
+		if err = transport.observeLifecycle(handshakeCtx, &connectingEvent); err != nil {
+			return nil, err
+		}
+		active, attemptErr := transport.connectCandidate(handshakeCtx, identity, key, ackState, fallback)
 		if attemptErr == nil {
 			return active, nil
 		}
@@ -229,7 +422,7 @@ func (transport *SessionTransport) connect(ctx context.Context) (_ *activeContro
 	return nil, resultErr
 }
 
-func (transport *SessionTransport) connectCandidate(handshakeCtx context.Context, identity ControllerIdentity, key ControllerKey, ackState []protocol.ACKState) (_ *activeControllerSession, resultErr error) {
+func (transport *SessionTransport) connectCandidate(handshakeCtx context.Context, identity ControllerIdentity, key ControllerKey, ackState []protocol.ACKState, fallback bool) (_ *activeControllerSession, resultErr error) {
 	hello, err := transport.issuer.NewHello(identity.ControllerID, key.KeyID, ackState)
 	if err != nil {
 		return nil, sessionFailure(sessionErrorIdentity, true)
@@ -263,6 +456,10 @@ func (transport *SessionTransport) connectCandidate(handshakeCtx context.Context
 	challenge, ok := frame.(*protocol.Challenge)
 	if !ok || !transport.validChallenge(challenge, hello, ackState) {
 		return nil, sessionFailure(sessionErrorProtocol, true)
+	}
+	authenticatingEvent := sessionTransportLifecycleEvent{SessionTransportEvent: SessionTransportEvent{Stage: SessionTransportAuthenticating, Fallback: fallback, Pending: key.State == KeyPending}, ControllerID: identity.ControllerID, KeyID: key.KeyID}
+	if err = transport.observeLifecycle(handshakeCtx, &authenticatingEvent); err != nil {
+		return nil, err
 	}
 
 	bundle, err := transport.credentials.ReadControllerKey(identity.ControllerID, key.KeyID, key.PublicKey)
@@ -346,13 +543,35 @@ func (transport *SessionTransport) connectCandidate(handshakeCtx context.Context
 	if err = transport.store.AcknowledgeSubscriptionSync(handshakeCtx, identity.ControllerID, synced.TargetMessageID, synced.Generation, synced.AcceptedCount, transport.now()); err != nil {
 		return nil, sessionFailure(sessionErrorPersistence, true)
 	}
+	readyEvent := sessionTransportLifecycleEvent{
+		SessionTransportEvent: SessionTransportEvent{Stage: SessionTransportReady, Fallback: fallback, Pending: key.State == KeyPending, ExpiresAt: ready.SessionExpiresAt.UTC(), MaxEnvelopeBytes: maxEnvelope, MaxOutstanding: minInt(transport.config.MaxOutstanding, int(ready.MaxOutstanding)), MaxSubscriptions: minInt(transport.config.MaxSubscriptions, int(ready.MaxSubscriptions)), Reconnect: SessionTransportReconnect{
+			InitialDelay: time.Duration(ready.Reconnect.InitialDelayMillis) * time.Millisecond,
+			MaximumDelay: time.Duration(ready.Reconnect.MaximumDelayMillis) * time.Millisecond,
+			Multiplier:   uint32(ready.Reconnect.Multiplier),
+			Jitter:       uint32(ready.Reconnect.JitterPercent),
+		}}, ControllerID: identity.ControllerID, KeyID: key.KeyID,
+	}
+	if err = transport.observeLifecycle(handshakeCtx, &readyEvent); err != nil {
+		return nil, err
+	}
 
+	owner := readyEvent.readyOwner
+	_, fencedStore := transport.store.(fencedSessionTransportStore)
+	fencedControls := false
+	if handler, ok := transport.config.ControlHandler.(sessionFenceRequiredControlHandler); ok {
+		fencedControls = handler.requiresSessionFence()
+	}
+	if (transport.hasLifecycle() || fencedStore || fencedControls) && (owner.Epoch == 0 || owner.Fence == 0) {
+		return nil, sessionFailure(sessionErrorPersistence, true)
+	}
 	succeeded = true
 	return &activeControllerSession{
 		transport:         transport,
 		conn:              conn,
 		controllerID:      identity.ControllerID,
 		keyID:             key.KeyID,
+		epoch:             owner.Epoch,
+		fence:             owner.Fence,
 		sessionID:         ready.SessionID,
 		maxEnvelopeBytes:  maxEnvelope,
 		maxOutstanding:    minInt(transport.config.MaxOutstanding, int(ready.MaxOutstanding)),
@@ -430,6 +649,12 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 			}
 			return finish(err)
 		case event := <-reads:
+			// Closing the socket to join the reader races with its terminal read
+			// result. Preserve expiry as the authoritative safe outcome when the
+			// session deadline canceled the run before observing that read error.
+			if errors.Is(context.Cause(runCtx), errSessionExpired) {
+				return finish(sessionFailure(sessionErrorExpired, false))
+			}
 			if event.err != nil {
 				return finish(sessionFailure(sessionErrorConnectionClosed, false))
 			}
@@ -500,7 +725,7 @@ func (session *activeControllerSession) handleInboundWithAction(ctx context.Cont
 		if !session.expiresAt.After(session.transport.now()) {
 			return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorExpired, false)
 		}
-		decision, err := session.transport.store.CommitSourceDesired(ctx, session.controllerID, *value, session.transport.now())
+		decision, err := session.commitSourceDesired(ctx, *value)
 		if err != nil {
 			return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorPersistence, true)
 		}
@@ -513,7 +738,7 @@ func (session *activeControllerSession) handleInboundWithAction(ctx context.Cont
 		if !session.expiresAt.After(session.transport.now()) {
 			return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorExpired, false)
 		}
-		decision, err := session.transport.store.CommitAccessChange(ctx, session.controllerID, *value, session.transport.now())
+		decision, err := session.commitAccessChange(ctx, *value)
 		if err != nil {
 			return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorPersistence, true)
 		}
@@ -542,7 +767,27 @@ func (session *activeControllerSession) handleInboundWithAction(ctx context.Cont
 }
 
 func (session *activeControllerSession) controlContext() SessionControlContext {
-	return SessionControlContext{ControllerID: session.controllerID, KeyID: session.keyID, SessionID: session.sessionID, ExpiresAt: session.expiresAt}
+	return SessionControlContext{ControllerID: session.controllerID, KeyID: session.keyID, Epoch: session.epoch, Fence: session.fence, SessionID: session.sessionID, ExpiresAt: session.expiresAt}
+}
+
+func (session *activeControllerSession) commitSourceDesired(ctx context.Context, source protocol.SourceDesired) (InboxDecision, error) {
+	if store, ok := session.transport.store.(fencedSessionTransportStore); ok {
+		if session.epoch == 0 || session.fence == 0 {
+			return InboxDecision{}, ErrState
+		}
+		return store.CommitSourceDesiredFenced(ctx, session.controllerID, session.epoch, session.fence, source, session.transport.now())
+	}
+	return session.transport.store.CommitSourceDesired(ctx, session.controllerID, source, session.transport.now())
+}
+
+func (session *activeControllerSession) commitAccessChange(ctx context.Context, change protocol.AccessChange) (InboxDecision, error) {
+	if store, ok := session.transport.store.(fencedSessionTransportStore); ok {
+		if session.epoch == 0 || session.fence == 0 {
+			return InboxDecision{}, ErrState
+		}
+		return store.CommitAccessChangeFenced(ctx, session.controllerID, session.epoch, session.fence, change, session.transport.now())
+	}
+	return session.transport.store.CommitAccessChange(ctx, session.controllerID, change, session.transport.now())
 }
 
 func (session *activeControllerSession) sourceDecision(source *protocol.SourceDesired, decision InboxDecision) (protocol.Frame, error) {
@@ -732,6 +977,80 @@ func (transport *SessionTransport) messageID() (string, error) {
 }
 
 func (transport *SessionTransport) now() time.Time { return transport.config.Now().UTC() }
+
+func (transport *SessionTransport) observeLifecycle(ctx context.Context, event *sessionTransportLifecycleEvent) error {
+	if event == nil {
+		return sessionFailure(sessionErrorPersistence, true)
+	}
+	if lifecycle := transport.lifecycleObserver(); lifecycle != nil {
+		if err := lifecycle(ctx, event); err != nil {
+			return sessionFailure(sessionErrorPersistence, true)
+		}
+	}
+	if transport.observer != nil {
+		if err := transport.observeExternal(ctx, event.SessionTransportEvent); err != nil {
+			return sessionFailure(sessionErrorPersistence, true)
+		}
+	}
+	return nil
+}
+
+func (transport *SessionTransport) lifecycleObserver() sessionTransportLifecycleObserver {
+	if transport == nil {
+		return nil
+	}
+	transport.lifecycleMu.Lock()
+	defer transport.lifecycleMu.Unlock()
+	return transport.lifecycle
+}
+
+func (transport *SessionTransport) hasLifecycle() bool {
+	return transport.lifecycleObserver() != nil
+}
+
+func (transport *SessionTransport) claimLifecycle(observer sessionTransportLifecycleObserver) (*sessionTransportRunToken, bool) {
+	if transport == nil || observer == nil {
+		return nil, false
+	}
+	transport.lifecycleMu.Lock()
+	defer transport.lifecycleMu.Unlock()
+	if transport.lifecycle != nil || transport.runActive {
+		return nil, false
+	}
+	if transport.beforeLifecycleClaim != nil {
+		transport.beforeLifecycleClaim()
+	}
+	if transport.lifecycle != nil || transport.runActive {
+		return nil, false
+	}
+	transport.lifecycle = observer
+	transport.runToken = &sessionTransportRunToken{}
+	return transport.runToken, true
+}
+
+func (transport *SessionTransport) observeExternal(ctx context.Context, event SessionTransportEvent) error {
+	transport.observerMu.Lock()
+	if transport.observerBusy {
+		transport.observerMu.Unlock()
+		return sessionFailure(sessionErrorPersistence, true)
+	}
+	transport.observerBusy = true
+	transport.observerMu.Unlock()
+	done := make(chan error, 1)
+	go func() {
+		err := transport.observer(ctx, event)
+		transport.observerMu.Lock()
+		transport.observerBusy = false
+		transport.observerMu.Unlock()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 func (session *activeControllerSession) closeNow() {
 	if session != nil && session.conn != nil {

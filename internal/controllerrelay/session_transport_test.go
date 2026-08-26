@@ -126,6 +126,85 @@ func TestSessionTransportHandshakeBindsIdentityAndSynchronizesBeforeReady(t *tes
 	}
 }
 
+func TestSessionTransportDirectRunActivationWinsOverConcurrentLifecycleClaim(t *testing.T) {
+	now := time.Date(2026, 8, 26, 4, 0, 0, 0, time.UTC)
+	transport, _, _ := newSessionHandshakeFixture(t, now, nil, nil)
+	activationEntered := make(chan struct{})
+	releaseActivation := make(chan struct{})
+	dialEntered := make(chan struct{})
+	transport.beforeRunActivate = func() {
+		close(activationEntered)
+		<-releaseActivation
+	}
+	transport.dial = func(ctx context.Context, _ string, _ *websocket.DialOptions) (SessionSocket, *http.Response, error) {
+		close(dialEntered)
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	directDone := make(chan error, 1)
+	go func() { directDone <- transport.RunOnce(ctx) }()
+	<-activationEntered
+	claimStarted := make(chan struct{})
+	claimDone := make(chan bool, 1)
+	go func() {
+		close(claimStarted)
+		_, claimed := transport.claimLifecycle(func(context.Context, *sessionTransportLifecycleEvent) error { return nil })
+		claimDone <- claimed
+	}()
+	<-claimStarted
+	select {
+	case claimed := <-claimDone:
+		t.Fatalf("claim completed before direct activation: %t", claimed)
+	default:
+	}
+	close(releaseActivation)
+	<-dialEntered
+	if claimed := <-claimDone; claimed {
+		t.Fatal("lifecycle claim won after an eligible direct run became active")
+	}
+	cancel()
+	select {
+	case <-directDone:
+	case <-time.After(time.Second):
+		t.Fatal("direct run did not stop after cancellation")
+	}
+	if transport.hasLifecycle() {
+		t.Fatal("failed lifecycle claim installed an observer")
+	}
+}
+
+func TestSessionTransportLifecycleClaimWinsOverConcurrentDirectActivation(t *testing.T) {
+	transport := &SessionTransport{}
+	claimEntered := make(chan struct{})
+	releaseClaim := make(chan struct{})
+	transport.beforeLifecycleClaim = func() {
+		close(claimEntered)
+		<-releaseClaim
+	}
+	claimDone := make(chan bool, 1)
+	go func() {
+		_, claimed := transport.claimLifecycle(func(context.Context, *sessionTransportLifecycleEvent) error { return nil })
+		claimDone <- claimed
+	}()
+	<-claimEntered
+	directDone := make(chan error, 1)
+	go func() { directDone <- transport.RunOnce(context.Background()) }()
+	close(releaseClaim)
+	if claimed := <-claimDone; !claimed {
+		t.Fatal("lifecycle claim lost without an active direct run")
+	}
+	select {
+	case err := <-directDone:
+		if !sessionErrorCode(err, sessionErrorIdentity) {
+			t.Fatalf("direct run bypassed completed lifecycle claim: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("direct run did not resolve after lifecycle claim")
+	}
+}
+
 func TestSessionTransportInteroperatesWithTLSWebSocketRelay(t *testing.T) {
 	now := time.Date(2026, 8, 26, 4, 0, 0, 0, time.UTC)
 	privateKey := deterministicSessionPrivateKey(7)

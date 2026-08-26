@@ -35,6 +35,8 @@ type SessionControlAction uint8
 type SessionControlContext struct {
 	ControllerID string
 	KeyID        string
+	Epoch        uint64
+	Fence        uint64
 	SessionID    string
 	ExpiresAt    time.Time
 }
@@ -75,11 +77,15 @@ type ControllerKeyRecoveryCursor struct {
 }
 
 type ControllerKeyRecoveryPage struct {
-	Cleaned        int
-	Scanned        int
-	NeedsAttention []ControllerKeyCredentialIssue
-	NextCursor     ControllerKeyRecoveryCursor
-	Complete       bool
+	Cleaned           int
+	Scanned           int
+	LeaseScanned      int
+	RevokedScanned    int
+	CredentialScanned int
+	TemporaryScanned  int
+	NeedsAttention    []ControllerKeyCredentialIssue
+	NextCursor        ControllerKeyRecoveryCursor
+	Complete          bool
 }
 
 func (SessionControlResult) String() string         { return "controller relay control result" }
@@ -147,6 +153,17 @@ type sessionControlRepository interface {
 	MarkRevokedControllerKeyCleared(context.Context, RevokedKeyCleanupCandidate, time.Time) error
 }
 
+// fencedSessionControlRepository is implemented by the durable repository.
+// Test-only repositories may omit it, but a production inbound control frame
+// can never mutate durable state without its active Ready epoch and fence.
+type fencedSessionControlRepository interface {
+	CompleteBindingRemovalFenced(context.Context, string, uint64, uint64, protocol.BindingRemoved, time.Time) error
+	PrepareRotationConfirmationFenced(context.Context, string, uint64, uint64, OutboundCommand, time.Time) (KeyRotation, OutboundCommand, error)
+	ConfirmRotationAndPrepareFinalizeFenced(context.Context, string, string, string, uint64, uint64, OutboundCommand, time.Time) (KeyRotation, OutboundCommand, error)
+	CompleteRotationFinalizedFenced(context.Context, string, uint64, uint64, protocol.KeyRotationFinalized, time.Time) error
+	FailExpiredRotationFenced(context.Context, string, string, uint64, uint64, time.Time) error
+}
+
 type sessionControlCredentials interface {
 	WriteControllerKey(ControllerKeyBundle) (string, error)
 	ReadControllerKey(controllerID, keyID string, expectedPublicKey []byte) (ControllerKeyBundle, error)
@@ -194,6 +211,14 @@ type SessionControlService struct {
 	entropyMu   sync.Mutex
 	recoveryMu  sync.Mutex
 	recovery    ControllerKeyRecoveryCursor
+}
+
+func (service *SessionControlService) requiresSessionFence() bool {
+	if service == nil {
+		return false
+	}
+	_, ok := service.repository.(fencedSessionControlRepository)
+	return ok
 }
 
 func NewSessionControlService(repository sessionControlRepository, credentials sessionControlCredentials, config SessionControlConfig) (*SessionControlService, error) {
@@ -349,7 +374,7 @@ func (service *SessionControlService) Handle(ctx context.Context, session Sessio
 	}
 	switch value := frame.(type) {
 	case *protocol.BindingRemoved:
-		if err := service.repository.CompleteBindingRemoval(ctx, session.ControllerID, *value, service.now()); err != nil {
+		if err := service.completeBindingRemoval(ctx, session, *value); err != nil {
 			return SessionControlResult{}, service.repositoryFailure(err)
 		}
 		return SessionControlResult{Action: ControlContinue}, nil
@@ -366,7 +391,7 @@ func (service *SessionControlService) Handle(ctx context.Context, session Sessio
 		}
 		return SessionControlResult{Response: response, Action: ControlContinue}, nil
 	case *protocol.KeyRotationFinalized:
-		if err := service.repository.CompleteRotationFinalized(ctx, session.ControllerID, *value, service.now()); err != nil {
+		if err := service.completeRotationFinalized(ctx, session, *value); err != nil {
 			return SessionControlResult{}, service.repositoryFailure(err)
 		}
 		return SessionControlResult{Action: ControlReconnect}, nil
@@ -383,6 +408,26 @@ func (service *SessionControlService) Handle(ctx context.Context, session Sessio
 	default:
 		return SessionControlResult{}, controlFailure(controlErrorInvalid)
 	}
+}
+
+func (service *SessionControlService) completeBindingRemoval(ctx context.Context, session SessionControlContext, response protocol.BindingRemoved) error {
+	if repository, ok := service.repository.(fencedSessionControlRepository); ok {
+		if session.Epoch == 0 || session.Fence == 0 {
+			return ErrState
+		}
+		return repository.CompleteBindingRemovalFenced(ctx, session.ControllerID, session.Epoch, session.Fence, response, service.now())
+	}
+	return service.repository.CompleteBindingRemoval(ctx, session.ControllerID, response, service.now())
+}
+
+func (service *SessionControlService) completeRotationFinalized(ctx context.Context, session SessionControlContext, response protocol.KeyRotationFinalized) error {
+	if repository, ok := service.repository.(fencedSessionControlRepository); ok {
+		if session.Epoch == 0 || session.Fence == 0 {
+			return ErrState
+		}
+		return repository.CompleteRotationFinalizedFenced(ctx, session.ControllerID, session.Epoch, session.Fence, response, service.now())
+	}
+	return service.repository.CompleteRotationFinalized(ctx, session.ControllerID, response, service.now())
 }
 
 func destroyInboundSessionControlFrame(frame protocol.Frame) {
@@ -487,6 +532,7 @@ func (service *SessionControlService) RecoverControllerKeysPage(ctx context.Cont
 		leasing, err := service.recoverExpiredControllerKeyIOLeases(ctx, cursor.LeaseCursor, limit)
 		leaseErr = err
 		result.Scanned += len(leasing.Leases)
+		result.LeaseScanned += len(leasing.Leases)
 		result.Cleaned += leasing.Cleaned
 		if leasing.Complete {
 			result.NextCursor.LeasesComplete = true
@@ -500,6 +546,7 @@ func (service *SessionControlService) RecoverControllerKeysPage(ctx context.Cont
 		revoked, err := service.RecoverRevokedControllerKeys(ctx, cursor.RevokedCursor, limit)
 		cleanupErr = err
 		result.Scanned += len(revoked.Candidates)
+		result.RevokedScanned += len(revoked.Candidates)
 		result.Cleaned += revoked.Cleaned
 		if revoked.Complete {
 			result.NextCursor.RevokedComplete = true
@@ -521,6 +568,7 @@ func (service *SessionControlService) RecoverControllerKeysPage(ctx context.Cont
 				result.NextCursor.CredentialCursor = inventory.NextCursor
 			}
 			result.Scanned += len(inventory.Credentials) + len(inventory.Issues)
+			result.CredentialScanned += len(inventory.Credentials) + len(inventory.Issues)
 			result.NeedsAttention = append(result.NeedsAttention, inventory.Issues...)
 			for index := range inventory.Credentials {
 				metadata := &inventory.Credentials[index]
@@ -605,6 +653,7 @@ func (service *SessionControlService) RecoverControllerKeysPage(ctx context.Cont
 				result.NextCursor.TemporaryCursor = temporary.NextCursor
 			}
 			result.Scanned += len(temporary.Artifacts)
+			result.TemporaryScanned += len(temporary.Artifacts)
 			for _, artifact := range temporary.Artifacts {
 				lease, newErr := service.newCleanupLease(artifact.ControllerID, ControllerKeyIOTempCleanup, "", artifact.Name)
 				if newErr != nil {
@@ -894,7 +943,7 @@ func (service *SessionControlService) handleRotationChallenge(ctx context.Contex
 	now := service.now()
 	if rotation.OldKeyID != session.KeyID || (rotation.State != RotationPropose && rotation.State != RotationConfirm) || !challenge.ExpiresAt.After(now) || challenge.ExpiresAt.After(rotation.ExpiresAt) || challenge.ExpiresAt.Sub(now) > service.config.MaxChallengeLifetime {
 		if !rotation.ExpiresAt.After(now) && rotation.State != RotationFinalize {
-			if failErr := service.failExpiredRotation(ctx, rotation, now); failErr != nil {
+			if failErr := service.failExpiredRotationFenced(ctx, session, rotation, now); failErr != nil {
 				return nil, failErr
 			}
 		}
@@ -934,7 +983,15 @@ func (service *SessionControlService) handleRotationChallenge(ctx context.Contex
 		signature = ""
 		return nil, err
 	}
-	_, persisted, err := service.repository.PrepareRotationConfirmation(ctx, challenge.TargetMessageID, command, now)
+	var persisted OutboundCommand
+	if repository, ok := service.repository.(fencedSessionControlRepository); ok {
+		if session.Epoch == 0 || session.Fence == 0 {
+			return nil, controlFailure(controlErrorState)
+		}
+		_, persisted, err = repository.PrepareRotationConfirmationFenced(ctx, challenge.TargetMessageID, session.Epoch, session.Fence, command, now)
+	} else {
+		_, persisted, err = service.repository.PrepareRotationConfirmation(ctx, challenge.TargetMessageID, command, now)
+	}
 	if err != nil {
 		candidate.Signature = ""
 		signature = ""
@@ -962,6 +1019,22 @@ func (service *SessionControlService) failExpiredRotation(ctx context.Context, r
 	return err
 }
 
+func (service *SessionControlService) failExpiredRotationFenced(ctx context.Context, session SessionControlContext, rotation KeyRotation, at time.Time) error {
+	if repository, ok := service.repository.(fencedSessionControlRepository); ok {
+		if session.Epoch == 0 || session.Fence == 0 {
+			return controlFailure(controlErrorState)
+		}
+		if err := repository.FailExpiredRotationFenced(ctx, rotation.ControllerID, rotation.RotationID, session.Epoch, session.Fence, at); err != nil {
+			return service.repositoryFailure(err)
+		}
+	} else if err := service.repository.FailExpiredRotation(ctx, rotation.ControllerID, rotation.RotationID, at); err != nil {
+		return service.repositoryFailure(err)
+	}
+	candidate := RevokedKeyCleanupCandidate{ControllerID: rotation.ControllerID, KeyID: rotation.NewKeyID, ProtectedKeyRef: ProtectedKeyRef(rotation.ControllerID, rotation.NewKeyID)}
+	_, err := service.cleanupRevokedControllerKey(ctx, candidate)
+	return err
+}
+
 func (service *SessionControlService) handleRotationConfirmed(ctx context.Context, session SessionControlContext, confirmed *protocol.KeyRotationConfirmed) (*protocol.KeyRotationFinalize, error) {
 	confirm, err := service.repository.LoadControlCommand(ctx, session.ControllerID, confirmed.TargetMessageID)
 	if err != nil {
@@ -979,7 +1052,15 @@ func (service *SessionControlService) handleRotationConfirmed(ctx context.Contex
 	if err != nil {
 		return nil, err
 	}
-	_, persisted, err := service.repository.ConfirmRotationAndPrepareFinalize(ctx, confirmed.TargetMessageID, confirmed.RotationID, session.KeyID, command, service.now())
+	var persisted OutboundCommand
+	if repository, ok := service.repository.(fencedSessionControlRepository); ok {
+		if session.Epoch == 0 || session.Fence == 0 {
+			return nil, controlFailure(controlErrorState)
+		}
+		_, persisted, err = repository.ConfirmRotationAndPrepareFinalizeFenced(ctx, confirmed.TargetMessageID, confirmed.RotationID, session.KeyID, session.Epoch, session.Fence, command, service.now())
+	} else {
+		_, persisted, err = service.repository.ConfirmRotationAndPrepareFinalize(ctx, confirmed.TargetMessageID, confirmed.RotationID, session.KeyID, command, service.now())
+	}
 	if err != nil {
 		return nil, service.repositoryFailure(err)
 	}

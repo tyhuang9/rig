@@ -75,6 +75,13 @@ func parseCanonicalHTTPSOrigin(raw string) (*url.URL, error) {
 	return parsed, nil
 }
 
+// ParseCanonicalHTTPSOrigin validates a relay origin without normalizing it.
+// Callers that persist or dial a relay endpoint must use this exact seam so an
+// accepted value is always the same canonical HTTPS origin the transport uses.
+func ParseCanonicalHTTPSOrigin(raw string) (*url.URL, error) {
+	return parseCanonicalHTTPSOrigin(raw)
+}
+
 func relayControllerSessionURL(origin *url.URL) (string, error) {
 	if origin == nil {
 		return "", errors.New("relay HTTPS origin is required")
