@@ -295,6 +295,190 @@ func TestEnrollmentPollCredentialInventoryPagesDeterministicallyAndRejectsInvali
 	}
 }
 
+func TestControllerKeyCredentialInventoryPagesPublicMetadataAndRejectsForgedPath(t *testing.T) {
+	store := newTestCredentialStore(t)
+	ids := []string{
+		"f0000000-0000-4000-8000-000000000003",
+		"10000000-0000-4000-8000-000000000001",
+		"90000000-0000-4000-8000-000000000002",
+	}
+	wantPublic := make(map[string][]byte)
+	for index, keyID := range ids {
+		privateKey := testPrivateKey(byte(index + 1))
+		publicKey := append([]byte(nil), privateKey.Public().(ed25519.PublicKey)...)
+		wantPublic[keyID] = publicKey
+		if _, err := store.WriteControllerKey(ControllerKeyBundle{Version: credentialVersion, ControllerID: credentialTestControllerID, KeyID: keyID, PrivateKey: privateKey, PublicKey: publicKey}); err != nil {
+			t.Fatal(err)
+		}
+		clear(privateKey)
+	}
+	var got []string
+	cursor := ""
+	for pageNumber := 0; pageNumber < 4; pageNumber++ {
+		page, err := store.ControllerKeyCredentials(cursor, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Credentials) > 1 {
+			t.Fatalf("page exceeded bound: %#v", page)
+		}
+		for _, metadata := range page.Credentials {
+			got = append(got, metadata.KeyID)
+			if metadata.ProtectedRef != ProtectedKeyRef(metadata.ControllerID, metadata.KeyID) || !bytes.Equal(metadata.PublicKey, wantPublic[metadata.KeyID]) {
+				t.Fatalf("inventoried metadata = %#v", metadata)
+			}
+			clear(metadata.PublicKey)
+		}
+		if page.Complete {
+			break
+		}
+		if page.NextCursor == "" || page.NextCursor == cursor {
+			t.Fatalf("inventory cursor did not advance: %#v", page)
+		}
+		cursor = page.NextCursor
+	}
+	if want := []string{ids[1], ids[2], ids[0]}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("deterministic page order=%v want=%v", got, want)
+	}
+	for _, invalid := range []string{"v1:", "../key", "v1:A1111111-1111-4111-8111-111111111111:" + credentialTestKeyID} {
+		if _, err := store.ControllerKeyCredentials(invalid, 1); err == nil {
+			t.Fatalf("invalid cursor accepted: %q", invalid)
+		}
+	}
+
+	forgedStore := newTestCredentialStore(t)
+	privateKey := testPrivateKey(9)
+	if _, err := forgedStore.WriteControllerKey(ControllerKeyBundle{Version: credentialVersion, ControllerID: credentialTestControllerID, KeyID: credentialTestKeyID, PrivateKey: privateKey}); err != nil {
+		t.Fatal(err)
+	}
+	clear(privateKey)
+	original, _, _ := forgedStore.controllerKeyLocation(credentialTestControllerID, credentialTestKeyID)
+	forgedID := "44444444-4444-4444-8444-444444444444"
+	forged, _, _ := forgedStore.controllerKeyLocation(credentialTestControllerID, forgedID)
+	if err := os.Rename(original, forged); err != nil {
+		t.Fatal(err)
+	}
+	forgedPage, err := forgedStore.ControllerKeyCredentials("", 1)
+	if err != nil || len(forgedPage.Credentials) != 0 || len(forgedPage.Issues) != 1 || forgedPage.Issues[0].ControllerID != credentialTestControllerID || forgedPage.Issues[0].KeyID != forgedID || forgedPage.Issues[0].Code != controllerKeyCredentialUnreadable || forgedPage.NextCursor == "" {
+		t.Fatalf("purpose-mismatched inventory page = %#v err=%v", forgedPage, err)
+	}
+	continued, err := forgedStore.ControllerKeyCredentials(forgedPage.NextCursor, 1)
+	if err != nil || !continued.Complete || len(continued.Credentials) != 0 || len(continued.Issues) != 0 {
+		t.Fatalf("purpose-mismatched inventory did not advance: %#v err=%v", continued, err)
+	}
+}
+
+func TestControllerKeyCredentialInventoryFailsClosedOnMalformedTopology(t *testing.T) {
+	t.Run("malformed key path", func(t *testing.T) {
+		store := newTestCredentialStore(t)
+		privateKey := testPrivateKey(4)
+		if _, err := store.WriteControllerKey(ControllerKeyBundle{Version: credentialVersion, ControllerID: credentialTestControllerID, KeyID: credentialTestKeyID, PrivateKey: privateKey}); err != nil {
+			t.Fatal(err)
+		}
+		clear(privateKey)
+		path, _, _ := store.controllerKeyLocation(credentialTestControllerID, credentialTestKeyID)
+		if err := os.WriteFile(filepath.Join(filepath.Dir(path), "malformed.key"), []byte("not a credential"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		page, err := store.ControllerKeyCredentials("", 10)
+		if err != nil || !page.Complete || len(page.Issues) != 1 || page.Issues[0].Code != controllerKeyCredentialUnexpected || len(page.Credentials) != 1 {
+			t.Fatalf("malformed key path was not isolated: page=%#v err=%v", page, err)
+		}
+	})
+
+	t.Run("unsafe controllers root", func(t *testing.T) {
+		store := newTestCredentialStore(t)
+		relayRoot := filepath.Join(store.dataRoot, "secrets", "relay")
+		if err := os.MkdirAll(relayRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(relayRoot, "controllers"), []byte("not a directory"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ControllerKeyCredentials("", 10); err == nil {
+			t.Fatal("unsafe controllers root was not globally rejected")
+		}
+	})
+}
+
+func TestControllerKeyCredentialInventoryAdvancesPastUnexpectedUnsafeAndTemporaryEntries(t *testing.T) {
+	store := newTestCredentialStore(t)
+	validID := "f0000000-0000-4000-8000-000000000001"
+	corruptID := "20000000-0000-4000-8000-000000000001"
+	validPrivate := testPrivateKey(0x41)
+	corruptPrivate := testPrivateKey(0x42)
+	if _, err := store.WriteControllerKey(ControllerKeyBundle{Version: credentialVersion, ControllerID: credentialTestControllerID, KeyID: validID, PrivateKey: validPrivate}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.WriteControllerKey(ControllerKeyBundle{Version: credentialVersion, ControllerID: credentialTestControllerID, KeyID: corruptID, PrivateKey: corruptPrivate}); err != nil {
+		t.Fatal(err)
+	}
+	clear(validPrivate)
+	clear(corruptPrivate)
+	corruptPath, _, _ := store.controllerKeyLocation(credentialTestControllerID, corruptID)
+	keysPath := filepath.Dir(corruptPath)
+	if err := os.WriteFile(corruptPath, []byte("corrupt purpose-bound key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(keysPath, "000-unknown"), []byte("unexpected"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(keysPath, "10000000-0000-4000-8000-000000000001.key"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tempName := ".hostd-secret-000000001"
+	if err := os.WriteFile(filepath.Join(keysPath, tempName), []byte("crash staging"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controllersRoot := filepath.Dir(filepath.Dir(keysPath))
+	if err := os.WriteFile(filepath.Join(controllersRoot, "000-invalid-controller"), []byte("unexpected"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	symlinkCreated := false
+	external := filepath.Join(t.TempDir(), "external")
+	if err := os.WriteFile(external, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symlinkName := "15000000-0000-4000-8000-000000000001.key"
+	if err := os.Symlink(external, filepath.Join(keysPath, symlinkName)); err == nil {
+		symlinkCreated = true
+	}
+
+	var credentials []ControllerKeyCredentialMetadata
+	var issues []ControllerKeyCredentialIssue
+	cursor := ""
+	for pageNumber := 0; pageNumber < 16; pageNumber++ {
+		page, err := store.ControllerKeyCredentials(cursor, 1)
+		if err != nil {
+			t.Fatalf("page %d failed: %v", pageNumber, err)
+		}
+		credentials = append(credentials, page.Credentials...)
+		issues = append(issues, page.Issues...)
+		if page.Complete {
+			break
+		}
+		if page.NextCursor == "" || page.NextCursor == cursor {
+			t.Fatalf("page %d cursor did not advance: %#v", pageNumber, page)
+		}
+		cursor = page.NextCursor
+	}
+	wantIssues := 4
+	if symlinkCreated {
+		wantIssues++
+	}
+	if len(credentials) != 1 || credentials[0].KeyID != validID || len(issues) != wantIssues {
+		t.Fatalf("fair inventory credentials=%#v issues=%#v wantIssues=%d", credentials, issues, wantIssues)
+	}
+	temporary, err := store.ControllerKeyTemporaryArtifacts("", 1)
+	if err != nil || len(temporary.Artifacts) != 1 || temporary.Artifacts[0].Name != tempName {
+		t.Fatalf("temporary inventory=%#v err=%v", temporary, err)
+	}
+	if value, err := os.ReadFile(external); err != nil || string(value) != "outside" {
+		t.Fatalf("unsafe symlink target changed value=%q err=%v", value, err)
+	}
+}
+
 func TestCredentialDirectoryReadIsSortedAndFailsAtExplicitCapacity(t *testing.T) {
 	directory := t.TempDir()
 	for _, name := range []string{"c", "a", "b"} {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/hostd/hostd/internal/relay/protocol"
@@ -131,6 +132,77 @@ func (r *Repository) AuthorizedBindings(ctx context.Context, limit int) ([]Insta
 		return nil, err
 	}
 	return values, nil
+}
+
+// SessionAuthenticationCandidates returns at most two ordered keys. While
+// Finalize is ambiguous the old active key is tried first and the pending key
+// second; an exact completed Finalized response selects only the pending key.
+func (r *Repository) SessionAuthenticationCandidates(ctx context.Context) (ControllerIdentity, []ControllerKey, error) {
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return ControllerIdentity{}, nil, err
+	}
+	defer tx.Rollback()
+	identity, err := scanIdentity(tx.QueryRowContext(ctx, identitySelect+` WHERE singleton=1 AND state='active'`))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ControllerIdentity{}, nil, ErrNotFound
+	}
+	if err != nil {
+		return ControllerIdentity{}, nil, err
+	}
+	var oldKeyID, newKeyID, commandState string
+	err = tx.QueryRowContext(ctx, `SELECT r.old_key_id,r.new_key_id,c.state FROM relay_key_rotations r JOIN relay_outbound_commands c ON c.controller_id=r.controller_id AND c.rotation_id=r.rotation_id AND c.command_type='key.rotation.finalize' AND c.stage='finalize' WHERE r.controller_id=? AND r.state='finalize'`, identity.ControllerID).Scan(&oldKeyID, &newKeyID, &commandState)
+	if errors.Is(err, sql.ErrNoRows) {
+		active, keyErr := scanKey(tx.QueryRowContext(ctx, keySelect+` WHERE controller_id=? AND state='active'`, identity.ControllerID))
+		if keyErr != nil {
+			return ControllerIdentity{}, nil, keyErr
+		}
+		if err = tx.Commit(); err != nil {
+			return ControllerIdentity{}, nil, err
+		}
+		return identity, []ControllerKey{active}, nil
+	}
+	if err != nil {
+		return ControllerIdentity{}, nil, err
+	}
+	oldKey, err := scanKey(tx.QueryRowContext(ctx, keySelect+` WHERE controller_id=? AND key_id=?`, identity.ControllerID, oldKeyID))
+	if err != nil {
+		return ControllerIdentity{}, nil, err
+	}
+	newKey, err := scanKey(tx.QueryRowContext(ctx, keySelect+` WHERE controller_id=? AND key_id=?`, identity.ControllerID, newKeyID))
+	if err != nil {
+		return ControllerIdentity{}, nil, err
+	}
+	var candidates []ControllerKey
+	switch commandState {
+	case CommandPrepared:
+		if oldKey.State != KeyActive || newKey.State != KeyPending {
+			return ControllerIdentity{}, nil, ErrState
+		}
+		candidates = []ControllerKey{oldKey, newKey}
+	case CommandCompleted:
+		if newKey.State != KeyPending {
+			return ControllerIdentity{}, nil, ErrState
+		}
+		candidates = []ControllerKey{newKey}
+	default:
+		return ControllerIdentity{}, nil, ErrState
+	}
+	if err = tx.Commit(); err != nil {
+		return ControllerIdentity{}, nil, err
+	}
+	return identity, candidates, nil
+}
+
+func (r *Repository) SessionAuthenticationIdentity(ctx context.Context) (ControllerIdentity, ControllerKey, error) {
+	identity, candidates, err := r.SessionAuthenticationCandidates(ctx)
+	if err != nil {
+		return ControllerIdentity{}, ControllerKey{}, err
+	}
+	if len(candidates) == 0 {
+		return ControllerIdentity{}, ControllerKey{}, ErrNotFound
+	}
+	return identity, candidates[0], nil
 }
 
 func (r *Repository) PrepareSubscriptionSync(ctx context.Context, controllerID, messageID string, sentAt time.Time) (SyncSnapshot, error) {
@@ -454,6 +526,190 @@ func (r *Repository) PrepareControlCommand(ctx context.Context, value OutboundCo
 	return OutboundCommand{}, ErrConflict
 }
 
+// PrepareBindingRemoval atomically fences the owner-scoped binding and creates
+// (or returns) its single immutable removal command.
+func (r *Repository) PrepareBindingRemoval(ctx context.Context, owner, bindingID string, candidate OutboundCommand, at time.Time) (InstallationBinding, OutboundCommand, error) {
+	if !validOpaqueID(owner) || !canonicalUUID(bindingID) || at.IsZero() || !validOutboundCommand(candidate) || candidate.CommandType != CommandBindingRemove || candidate.BindingID != bindingID || candidate.State != CommandPrepared {
+		return InstallationBinding{}, OutboundCommand{}, ErrInvalid
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return InstallationBinding{}, OutboundCommand{}, err
+	}
+	defer tx.Rollback()
+	binding, err := scanBinding(tx.QueryRowContext(ctx, bindingSelect+` WHERE owner_user_id=? AND binding_id=?`, owner, bindingID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return InstallationBinding{}, OutboundCommand{}, ErrNotFound
+	}
+	if err != nil {
+		return InstallationBinding{}, OutboundCommand{}, err
+	}
+	if candidate.ControllerID != binding.ControllerID {
+		return InstallationBinding{}, OutboundCommand{}, ErrInvalid
+	}
+
+	existing, existingErr := loadControlCommandTx(ctx, tx, candidate.ControllerID, bindingID, "", "remove")
+	if existingErr == nil {
+		if existing.CommandType != CommandBindingRemove || existing.BindingID != bindingID {
+			return InstallationBinding{}, OutboundCommand{}, ErrConflict
+		}
+		if binding.State != BindingRemovalPending && !(binding.State == BindingRemoved && existing.State == CommandCompleted) {
+			return InstallationBinding{}, OutboundCommand{}, ErrState
+		}
+		if err = tx.Commit(); err != nil {
+			return InstallationBinding{}, OutboundCommand{}, err
+		}
+		return binding, existing, nil
+	}
+	if !errors.Is(existingErr, ErrNotFound) {
+		return InstallationBinding{}, OutboundCommand{}, existingErr
+	}
+	if binding.State != BindingAuthorized && binding.State != BindingAccessLost && binding.State != BindingRemovalPending {
+		return InstallationBinding{}, OutboundCommand{}, ErrState
+	}
+	if binding.State != BindingRemovalPending {
+		result, updateErr := tx.ExecContext(ctx, `UPDATE relay_installation_bindings SET state='removal_pending',state_changed_at=?,updated_at=?,last_error_code=NULL WHERE owner_user_id=? AND binding_id=? AND state IN ('authorized','access_lost')`, timestamp(at), timestamp(at), owner, bindingID)
+		if updateErr != nil {
+			return InstallationBinding{}, OutboundCommand{}, classifyConstraint(updateErr)
+		}
+		if count, rowsErr := result.RowsAffected(); rowsErr != nil || count != 1 {
+			if rowsErr != nil {
+				return InstallationBinding{}, OutboundCommand{}, rowsErr
+			}
+			return InstallationBinding{}, OutboundCommand{}, ErrState
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE relay_controller_subscriptions SET state='retired',retired_at=? WHERE controller_id=? AND binding_id=? AND state='active'`, timestamp(at), binding.ControllerID, bindingID); err != nil {
+			return InstallationBinding{}, OutboundCommand{}, classifyConstraint(err)
+		}
+		binding.State = BindingRemovalPending
+		binding.StateChangedAt = at.UTC()
+		binding.UpdatedAt = at.UTC()
+		binding.LastErrorCode = ""
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO relay_outbound_commands(controller_id,message_id,command_type,binding_id,rotation_id,stage,sent_at,canonical_digest,state,completed_at) VALUES(?,?,?,?,NULL,'remove',?,?,'prepared',NULL)`, candidate.ControllerID, candidate.MessageID, candidate.CommandType, bindingID, timestamp(candidate.SentAt), candidate.Digest[:]); err != nil {
+		return InstallationBinding{}, OutboundCommand{}, classifyConstraint(err)
+	}
+	if err = tx.Commit(); err != nil {
+		return InstallationBinding{}, OutboundCommand{}, err
+	}
+	return binding, candidate, nil
+}
+
+// CompleteBindingRemoval validates the exact relay response and commits both
+// the command ledger and binding terminal state in the same transaction.
+func (r *Repository) CompleteBindingRemoval(ctx context.Context, controllerID string, response protocol.BindingRemoved, at time.Time) error {
+	if !canonicalUUID(controllerID) || protocol.Validate(&response) != nil || at.IsZero() {
+		return ErrInvalid
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	command, err := scanOutboundCommand(tx.QueryRowContext(ctx, `SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND message_id=?`, controllerID, response.TargetMessageID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if command.CommandType != CommandBindingRemove || command.Stage != "remove" || !canonicalUUID(command.BindingID) {
+		return ErrState
+	}
+	binding, err := scanBinding(tx.QueryRowContext(ctx, bindingSelect+` WHERE controller_id=? AND binding_id=?`, controllerID, command.BindingID))
+	if err != nil {
+		return err
+	}
+	if binding.InstallationID != response.InstallationID || binding.RepositoryID != response.RepositoryID {
+		return ErrConflict
+	}
+	if command.State == CommandCompleted && binding.State == BindingRemoved {
+		return tx.Commit()
+	}
+	if command.State != CommandPrepared || binding.State != BindingRemovalPending {
+		return ErrState
+	}
+	if err = completeControlCommandTx(ctx, tx, controllerID, response.TargetMessageID, at); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE relay_installation_bindings SET state='removed',state_changed_at=?,updated_at=?,completed_at=?,last_error_code=NULL WHERE controller_id=? AND binding_id=? AND state='removal_pending'`, timestamp(at), timestamp(at), timestamp(at), controllerID, binding.BindingID)
+	if err != nil {
+		return classifyConstraint(err)
+	}
+	if count, rowsErr := result.RowsAffected(); rowsErr != nil || count != 1 {
+		if rowsErr != nil {
+			return rowsErr
+		}
+		return ErrState
+	}
+	return tx.Commit()
+}
+
+// PendingControlCommands returns a deterministic bounded replay set. Callers
+// reconstruct protocol frames from public aggregate metadata; no raw frame or
+// sensitive protocol material is persisted here.
+func (r *Repository) PendingControlCommands(ctx context.Context, controllerID string, limit int) ([]OutboundCommand, error) {
+	if !canonicalUUID(controllerID) || limit < 1 || limit > protocol.MaxArrayItems {
+		return nil, ErrInvalid
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND state='prepared' AND command_type<>'key.rotation.confirm' ORDER BY sent_at,message_id LIMIT ?`, controllerID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	commands := make([]OutboundCommand, 0)
+	for rows.Next() {
+		command, scanErr := scanOutboundCommand(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		commands = append(commands, command)
+	}
+	return commands, rows.Err()
+}
+
+func (r *Repository) BindingForController(ctx context.Context, controllerID, bindingID string) (InstallationBinding, error) {
+	if !canonicalUUID(controllerID) || !canonicalUUID(bindingID) {
+		return InstallationBinding{}, ErrInvalid
+	}
+	value, err := scanBinding(r.db.QueryRowContext(ctx, bindingSelect+` WHERE controller_id=? AND binding_id=?`, controllerID, bindingID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return InstallationBinding{}, ErrNotFound
+	}
+	return value, err
+}
+
+func (r *Repository) RotationByNewKey(ctx context.Context, controllerID, keyID string) (KeyRotation, error) {
+	if !canonicalUUID(controllerID) || !canonicalUUID(keyID) {
+		return KeyRotation{}, ErrInvalid
+	}
+	value, err := scanRotation(r.db.QueryRowContext(ctx, rotationSelect+` WHERE controller_id=? AND new_key_id=? ORDER BY created_at DESC LIMIT 1`, controllerID, keyID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return KeyRotation{}, ErrNotFound
+	}
+	return value, err
+}
+
+func (r *Repository) ControlCommandForAggregate(ctx context.Context, controllerID, bindingID, rotationID, stage string) (OutboundCommand, error) {
+	if !canonicalUUID(controllerID) || (bindingID == "") == (rotationID == "") || bindingID != "" && !canonicalUUID(bindingID) || rotationID != "" && !canonicalUUID(rotationID) {
+		return OutboundCommand{}, ErrInvalid
+	}
+	if stage != "remove" && stage != "propose" && stage != "confirm" && stage != "finalize" {
+		return OutboundCommand{}, ErrInvalid
+	}
+	query := `SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND binding_id=? AND stage=?`
+	aggregateID := bindingID
+	if aggregateID == "" {
+		query = `SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND rotation_id=? AND stage=?`
+		aggregateID = rotationID
+	}
+	value, err := scanOutboundCommand(r.db.QueryRowContext(ctx, query, controllerID, aggregateID, stage))
+	if errors.Is(err, sql.ErrNoRows) {
+		return OutboundCommand{}, ErrNotFound
+	}
+	return value, err
+}
+
 func (r *Repository) loadControlCommandForAggregate(ctx context.Context, value OutboundCommand) (OutboundCommand, error) {
 	query := `SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND binding_id=? AND stage=?`
 	aggregateID := value.BindingID
@@ -514,6 +770,415 @@ func (r *Repository) CompleteControlCommand(ctx context.Context, controllerID, m
 		return nil
 	}
 	return ErrState
+}
+
+func (r *Repository) PrepareRotationProposal(ctx context.Context, candidate OutboundCommand, at time.Time) (KeyRotation, OutboundCommand, error) {
+	return r.prepareRotationStage(ctx, candidate, RotationPrepare, RotationPropose, "", at)
+}
+
+func (r *Repository) PrepareRotationConfirmation(ctx context.Context, targetMessageID string, candidate OutboundCommand, at time.Time) (KeyRotation, OutboundCommand, error) {
+	return r.prepareRotationStage(ctx, candidate, RotationPropose, RotationConfirm, targetMessageID, at)
+}
+
+func (r *Repository) prepareRotationStage(ctx context.Context, candidate OutboundCommand, expectedState, nextState, targetMessageID string, at time.Time) (KeyRotation, OutboundCommand, error) {
+	if !validOutboundCommand(candidate) || candidate.State != CommandPrepared || candidate.RotationID == "" || at.IsZero() ||
+		(nextState == RotationPropose && candidate.CommandType != CommandRotationPropose) ||
+		(nextState == RotationConfirm && (candidate.CommandType != CommandRotationConfirm || !canonicalUUID(targetMessageID))) {
+		return KeyRotation{}, OutboundCommand{}, ErrInvalid
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return KeyRotation{}, OutboundCommand{}, err
+	}
+	defer tx.Rollback()
+	rotation, err := scanRotation(tx.QueryRowContext(ctx, rotationSelect+` WHERE controller_id=? AND rotation_id=?`, candidate.ControllerID, candidate.RotationID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return KeyRotation{}, OutboundCommand{}, ErrNotFound
+	}
+	if err != nil {
+		return KeyRotation{}, OutboundCommand{}, err
+	}
+	if !rotation.ExpiresAt.After(at) {
+		return KeyRotation{}, OutboundCommand{}, ErrState
+	}
+	if targetMessageID != "" {
+		target, targetErr := scanOutboundCommand(tx.QueryRowContext(ctx, `SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND message_id=?`, candidate.ControllerID, targetMessageID))
+		if errors.Is(targetErr, sql.ErrNoRows) {
+			return KeyRotation{}, OutboundCommand{}, ErrNotFound
+		}
+		if targetErr != nil {
+			return KeyRotation{}, OutboundCommand{}, targetErr
+		}
+		if target.CommandType != CommandRotationPropose || target.RotationID != candidate.RotationID || target.Stage != "propose" || target.State != CommandPrepared {
+			return KeyRotation{}, OutboundCommand{}, ErrState
+		}
+	}
+	existing, existingErr := loadControlCommandTx(ctx, tx, candidate.ControllerID, "", candidate.RotationID, candidate.Stage)
+	if existingErr == nil {
+		if existing.CommandType != candidate.CommandType {
+			return KeyRotation{}, OutboundCommand{}, ErrConflict
+		}
+		if err = tx.Commit(); err != nil {
+			return KeyRotation{}, OutboundCommand{}, err
+		}
+		return rotation, existing, nil
+	}
+	if !errors.Is(existingErr, ErrNotFound) {
+		return KeyRotation{}, OutboundCommand{}, existingErr
+	}
+	if rotation.State != expectedState && rotation.State != nextState {
+		return KeyRotation{}, OutboundCommand{}, ErrState
+	}
+	if rotation.State == expectedState {
+		result, updateErr := tx.ExecContext(ctx, `UPDATE relay_key_rotations SET state=?,state_changed_at=?,updated_at=? WHERE controller_id=? AND rotation_id=? AND state=?`, nextState, timestamp(at), timestamp(at), candidate.ControllerID, candidate.RotationID, expectedState)
+		if updateErr != nil {
+			return KeyRotation{}, OutboundCommand{}, classifyConstraint(updateErr)
+		}
+		if count, rowsErr := result.RowsAffected(); rowsErr != nil || count != 1 {
+			if rowsErr != nil {
+				return KeyRotation{}, OutboundCommand{}, rowsErr
+			}
+			return KeyRotation{}, OutboundCommand{}, ErrState
+		}
+		rotation.State = nextState
+		rotation.StateChangedAt = at.UTC()
+		rotation.UpdatedAt = at.UTC()
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO relay_outbound_commands(controller_id,message_id,command_type,binding_id,rotation_id,stage,sent_at,canonical_digest,state,completed_at) VALUES(?,?,?,NULL,?,?,?,?, 'prepared',NULL)`, candidate.ControllerID, candidate.MessageID, candidate.CommandType, candidate.RotationID, candidate.Stage, timestamp(candidate.SentAt), candidate.Digest[:]); err != nil {
+		return KeyRotation{}, OutboundCommand{}, classifyConstraint(err)
+	}
+	if err = tx.Commit(); err != nil {
+		return KeyRotation{}, OutboundCommand{}, err
+	}
+	return rotation, candidate, nil
+}
+
+// ConfirmRotationAndPrepareFinalize records the exact confirmation response,
+// advances through the local recovery-armed state, and prepares Finalize in a
+// single transaction. Finalize is still sent on the old-key session.
+func (r *Repository) ConfirmRotationAndPrepareFinalize(ctx context.Context, targetMessageID, rotationID, sessionKeyID string, candidate OutboundCommand, at time.Time) (KeyRotation, OutboundCommand, error) {
+	if !canonicalUUID(targetMessageID) || !canonicalUUID(rotationID) || !canonicalUUID(sessionKeyID) || at.IsZero() || !validOutboundCommand(candidate) || candidate.CommandType != CommandRotationFinalize || candidate.RotationID != rotationID || candidate.State != CommandPrepared {
+		return KeyRotation{}, OutboundCommand{}, ErrInvalid
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return KeyRotation{}, OutboundCommand{}, err
+	}
+	defer tx.Rollback()
+	rotation, err := scanRotation(tx.QueryRowContext(ctx, rotationSelect+` WHERE controller_id=? AND rotation_id=?`, candidate.ControllerID, rotationID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return KeyRotation{}, OutboundCommand{}, ErrNotFound
+	}
+	if err != nil {
+		return KeyRotation{}, OutboundCommand{}, err
+	}
+	if rotation.OldKeyID != sessionKeyID {
+		return KeyRotation{}, OutboundCommand{}, ErrState
+	}
+	confirm, err := scanOutboundCommand(tx.QueryRowContext(ctx, `SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND message_id=?`, candidate.ControllerID, targetMessageID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return KeyRotation{}, OutboundCommand{}, ErrNotFound
+	}
+	if err != nil {
+		return KeyRotation{}, OutboundCommand{}, err
+	}
+	if confirm.CommandType != CommandRotationConfirm || confirm.Stage != "confirm" || confirm.RotationID != rotationID {
+		return KeyRotation{}, OutboundCommand{}, ErrConflict
+	}
+	existing, existingErr := loadControlCommandTx(ctx, tx, candidate.ControllerID, "", rotationID, "finalize")
+	if existingErr == nil {
+		if rotation.State != RotationFinalize || confirm.State != CommandCompleted || existing.CommandType != CommandRotationFinalize {
+			return KeyRotation{}, OutboundCommand{}, ErrState
+		}
+		if err = tx.Commit(); err != nil {
+			return KeyRotation{}, OutboundCommand{}, err
+		}
+		return rotation, existing, nil
+	}
+	if !errors.Is(existingErr, ErrNotFound) {
+		return KeyRotation{}, OutboundCommand{}, existingErr
+	}
+	if rotation.State != RotationConfirm || confirm.State != CommandPrepared || !rotation.ExpiresAt.After(at) {
+		return KeyRotation{}, OutboundCommand{}, ErrState
+	}
+	completedCommands, err := tx.ExecContext(ctx, `UPDATE relay_outbound_commands SET state='completed',completed_at=? WHERE controller_id=? AND rotation_id=? AND stage IN ('propose','confirm') AND state='prepared'`, timestamp(at), candidate.ControllerID, rotationID)
+	if err != nil {
+		return KeyRotation{}, OutboundCommand{}, classifyConstraint(err)
+	}
+	if count, rowsErr := completedCommands.RowsAffected(); rowsErr != nil || count != 2 {
+		if rowsErr != nil {
+			return KeyRotation{}, OutboundCommand{}, rowsErr
+		}
+		return KeyRotation{}, OutboundCommand{}, ErrState
+	}
+	for _, transition := range [][2]string{{RotationConfirm, RotationNewKeyAuth}, {RotationNewKeyAuth, RotationFinalize}} {
+		result, updateErr := tx.ExecContext(ctx, `UPDATE relay_key_rotations SET state=?,state_changed_at=?,updated_at=? WHERE controller_id=? AND rotation_id=? AND state=?`, transition[1], timestamp(at), timestamp(at), candidate.ControllerID, rotationID, transition[0])
+		if updateErr != nil {
+			return KeyRotation{}, OutboundCommand{}, classifyConstraint(updateErr)
+		}
+		if count, rowsErr := result.RowsAffected(); rowsErr != nil || count != 1 {
+			if rowsErr != nil {
+				return KeyRotation{}, OutboundCommand{}, rowsErr
+			}
+			return KeyRotation{}, OutboundCommand{}, ErrState
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO relay_outbound_commands(controller_id,message_id,command_type,binding_id,rotation_id,stage,sent_at,canonical_digest,state,completed_at) VALUES(?,?,?,NULL,?,?,?,?, 'prepared',NULL)`, candidate.ControllerID, candidate.MessageID, candidate.CommandType, rotationID, candidate.Stage, timestamp(candidate.SentAt), candidate.Digest[:]); err != nil {
+		return KeyRotation{}, OutboundCommand{}, classifyConstraint(err)
+	}
+	rotation.State = RotationFinalize
+	rotation.StateChangedAt = at.UTC()
+	rotation.UpdatedAt = at.UTC()
+	if err = tx.Commit(); err != nil {
+		return KeyRotation{}, OutboundCommand{}, err
+	}
+	return rotation, candidate, nil
+}
+
+const revokedRotationKeyCleanupEligibility = `k.state='revoked'
+		AND k.protected_key_cleared_at IS NULL
+		AND (EXISTS (SELECT 1 FROM relay_key_rotations completed WHERE completed.controller_id=k.controller_id AND completed.old_key_id=k.key_id AND completed.state='completed')
+			OR EXISTS (SELECT 1 FROM relay_key_rotations failed WHERE failed.controller_id=k.controller_id AND failed.new_key_id=k.key_id AND failed.state='failed')
+			OR (k.activated_at IS NULL AND k.possession_confirmed_at IS NULL AND NOT EXISTS (SELECT 1 FROM relay_key_rotations referenced WHERE referenced.controller_id=k.controller_id AND (referenced.old_key_id=k.key_id OR referenced.new_key_id=k.key_id))))
+		AND NOT EXISTS (SELECT 1 FROM relay_key_rotations live WHERE live.controller_id=k.controller_id AND live.state IN ('prepare','propose','confirm','new_key_auth','finalize') AND (live.old_key_id=k.key_id OR live.new_key_id=k.key_id))
+		AND NOT EXISTS (SELECT 1 FROM relay_controller_session_state session WHERE session.controller_id=k.controller_id AND session.key_id=k.key_id)`
+
+const revokedRotationKeyCleanupSelect = `SELECT k.controller_id,k.key_id,k.protected_key_ref FROM relay_controller_keys k WHERE ` + revokedRotationKeyCleanupEligibility
+
+// RevokedRotationKeyCleanupCandidate revalidates one exact deletion target.
+// Callers hold the per-controller cleanup lease while using this result.
+func (r *Repository) RevokedRotationKeyCleanupCandidate(ctx context.Context, candidate RevokedKeyCleanupCandidate) (RevokedKeyCleanupCandidate, error) {
+	if !canonicalUUID(candidate.ControllerID) || !canonicalUUID(candidate.KeyID) || candidate.ProtectedKeyRef != ProtectedKeyRef(candidate.ControllerID, candidate.KeyID) {
+		return RevokedKeyCleanupCandidate{}, ErrInvalid
+	}
+	var value RevokedKeyCleanupCandidate
+	err := r.db.QueryRowContext(ctx, revokedRotationKeyCleanupSelect+` AND k.controller_id=? AND k.key_id=? AND k.protected_key_ref=?`, candidate.ControllerID, candidate.KeyID, candidate.ProtectedKeyRef).Scan(&value.ControllerID, &value.KeyID, &value.ProtectedKeyRef)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RevokedKeyCleanupCandidate{}, ErrNotFound
+	}
+	if err != nil {
+		return RevokedKeyCleanupCandidate{}, err
+	}
+	if value != candidate {
+		return RevokedKeyCleanupCandidate{}, ErrConflict
+	}
+	return value, nil
+}
+
+// RevokedRotationKeyCleanupCandidates pages over only keys whose completed or
+// failed rotation makes their protected private material obsolete. The cursor
+// is caller-owned so failures cannot permanently starve later keys.
+func (r *Repository) RevokedRotationKeyCleanupCandidates(ctx context.Context, cursor string, limit int) (RevokedKeyCleanupPage, error) {
+	if limit < 1 || limit > protocol.MaxArrayItems {
+		return RevokedKeyCleanupPage{}, ErrInvalid
+	}
+	cursorControllerID, cursorKeyID, err := parseRevokedKeyCleanupCursor(cursor)
+	if err != nil {
+		return RevokedKeyCleanupPage{}, ErrInvalid
+	}
+	rows, err := r.db.QueryContext(ctx, revokedRotationKeyCleanupSelect+`
+		AND (?='' OR k.controller_id>? OR (k.controller_id=? AND k.key_id>?))
+		ORDER BY k.controller_id,k.key_id LIMIT ?`, cursorControllerID, cursorControllerID, cursorControllerID, cursorKeyID, limit)
+	if err != nil {
+		return RevokedKeyCleanupPage{}, err
+	}
+	defer rows.Close()
+	page := RevokedKeyCleanupPage{Candidates: make([]RevokedKeyCleanupCandidate, 0, limit)}
+	for rows.Next() {
+		var candidate RevokedKeyCleanupCandidate
+		if err = rows.Scan(&candidate.ControllerID, &candidate.KeyID, &candidate.ProtectedKeyRef); err != nil {
+			return RevokedKeyCleanupPage{}, err
+		}
+		if candidate.ProtectedKeyRef != ProtectedKeyRef(candidate.ControllerID, candidate.KeyID) {
+			return RevokedKeyCleanupPage{}, ErrConflict
+		}
+		page.Candidates = append(page.Candidates, candidate)
+	}
+	if err = rows.Err(); err != nil {
+		return RevokedKeyCleanupPage{}, err
+	}
+	if len(page.Candidates) < limit {
+		page.Complete = true
+	} else {
+		last := page.Candidates[len(page.Candidates)-1]
+		page.NextCursor = revokedKeyCleanupCursor(last.ControllerID, last.KeyID)
+	}
+	return page, nil
+}
+
+// MarkRevokedControllerKeyCleared records the absence of one exact protected
+// file only after the credential store has reported successful deletion.
+func (r *Repository) MarkRevokedControllerKeyCleared(ctx context.Context, candidate RevokedKeyCleanupCandidate, at time.Time) error {
+	if !canonicalUUID(candidate.ControllerID) || !canonicalUUID(candidate.KeyID) || candidate.ProtectedKeyRef != ProtectedKeyRef(candidate.ControllerID, candidate.KeyID) || at.IsZero() {
+		return ErrInvalid
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE relay_controller_keys AS k SET protected_key_cleared_at=?
+		WHERE k.controller_id=? AND k.key_id=? AND k.protected_key_ref=? AND k.state='revoked' AND k.protected_key_cleared_at IS NULL
+		AND (EXISTS (SELECT 1 FROM relay_key_rotations completed WHERE completed.controller_id=k.controller_id AND completed.old_key_id=k.key_id AND completed.state='completed')
+			OR EXISTS (SELECT 1 FROM relay_key_rotations failed WHERE failed.controller_id=k.controller_id AND failed.new_key_id=k.key_id AND failed.state='failed')
+			OR (k.activated_at IS NULL AND k.possession_confirmed_at IS NULL AND NOT EXISTS (SELECT 1 FROM relay_key_rotations referenced WHERE referenced.controller_id=k.controller_id AND (referenced.old_key_id=k.key_id OR referenced.new_key_id=k.key_id))))
+		AND NOT EXISTS (SELECT 1 FROM relay_key_rotations live WHERE live.controller_id=k.controller_id AND live.state IN ('prepare','propose','confirm','new_key_auth','finalize') AND (live.old_key_id=k.key_id OR live.new_key_id=k.key_id))
+		AND NOT EXISTS (SELECT 1 FROM relay_controller_session_state session WHERE session.controller_id=k.controller_id AND session.key_id=k.key_id)`, timestamp(at), candidate.ControllerID, candidate.KeyID, candidate.ProtectedKeyRef)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 1 {
+		return nil
+	}
+	var state, protectedRef string
+	var cleared sql.NullString
+	err = r.db.QueryRowContext(ctx, `SELECT state,protected_key_ref,protected_key_cleared_at FROM relay_controller_keys WHERE controller_id=? AND key_id=?`, candidate.ControllerID, candidate.KeyID).Scan(&state, &protectedRef, &cleared)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if state == KeyRevoked && protectedRef == candidate.ProtectedKeyRef && cleared.Valid {
+		return nil
+	}
+	return ErrState
+}
+
+func revokedKeyCleanupCursor(controllerID, keyID string) string {
+	return "v1:" + controllerID + ":" + keyID
+}
+
+func parseRevokedKeyCleanupCursor(cursor string) (string, string, error) {
+	if cursor == "" {
+		return "", "", nil
+	}
+	const cursorLength = len("v1:") + 36 + 1 + 36
+	if len(cursor) != cursorLength || !strings.HasPrefix(cursor, "v1:") || cursor[39] != ':' {
+		return "", "", ErrInvalid
+	}
+	controllerID, keyID := cursor[3:39], cursor[40:]
+	if !canonicalUUID(controllerID) || !canonicalUUID(keyID) || cursor != revokedKeyCleanupCursor(controllerID, keyID) {
+		return "", "", ErrInvalid
+	}
+	return controllerID, keyID, nil
+}
+
+// CompleteRotationFinalized records only the relay-side terminal response. The
+// local key swap remains gated by a separately durable fenced Ready.
+func (r *Repository) CompleteRotationFinalized(ctx context.Context, controllerID string, response protocol.KeyRotationFinalized, at time.Time) error {
+	if !canonicalUUID(controllerID) || protocol.Validate(&response) != nil || at.IsZero() {
+		return ErrInvalid
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	command, err := scanOutboundCommand(tx.QueryRowContext(ctx, `SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND message_id=?`, controllerID, response.TargetMessageID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if command.CommandType != CommandRotationFinalize || command.Stage != "finalize" || command.RotationID != response.RotationID {
+		return ErrConflict
+	}
+	rotation, err := scanRotation(tx.QueryRowContext(ctx, rotationSelect+` WHERE controller_id=? AND rotation_id=?`, controllerID, response.RotationID))
+	if err != nil {
+		return err
+	}
+	if rotation.State != RotationFinalize || rotation.OldKeyID != response.RetiredKeyID {
+		return ErrConflict
+	}
+	if command.State == CommandCompleted {
+		return tx.Commit()
+	}
+	if err = completeControlCommandTx(ctx, tx, controllerID, response.TargetMessageID, at); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// FailExpiredRotation releases a rotation that is still safely recoverable
+// under the old active key. Finalize is intentionally excluded because relay
+// activation may already be externally committed at that stage.
+func (r *Repository) FailExpiredRotation(ctx context.Context, controllerID, rotationID string, at time.Time) error {
+	if !canonicalUUID(controllerID) || !canonicalUUID(rotationID) || at.IsZero() {
+		return ErrInvalid
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rotation, err := scanRotation(tx.QueryRowContext(ctx, rotationSelect+` WHERE controller_id=? AND rotation_id=?`, controllerID, rotationID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if rotation.State == RotationFailed {
+		return tx.Commit()
+	}
+	if rotation.ExpiresAt.After(at) || (rotation.State != RotationPrepare && rotation.State != RotationPropose && rotation.State != RotationConfirm && rotation.State != RotationNewKeyAuth) {
+		return ErrState
+	}
+	stamp := timestamp(at)
+	result, err := tx.ExecContext(ctx, `UPDATE relay_key_rotations SET state='failed',state_changed_at=?,updated_at=?,completed_at=?,last_error_code='rotation_failed' WHERE controller_id=? AND rotation_id=? AND state IN ('prepare','propose','confirm','new_key_auth')`, stamp, stamp, stamp, controllerID, rotationID)
+	if err != nil {
+		return classifyConstraint(err)
+	}
+	if count, rowsErr := result.RowsAffected(); rowsErr != nil || count != 1 {
+		if rowsErr != nil {
+			return rowsErr
+		}
+		return ErrState
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE relay_outbound_commands SET state='completed',completed_at=? WHERE controller_id=? AND rotation_id=? AND state='prepared'`, stamp, controllerID, rotationID); err != nil {
+		return classifyConstraint(err)
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE relay_controller_keys SET state='revoked',updated_at=?,revoked_at=? WHERE controller_id=? AND key_id=? AND state='pending'`, stamp, stamp, controllerID, rotation.NewKeyID)
+	if err != nil {
+		return classifyConstraint(err)
+	}
+	if count, rowsErr := result.RowsAffected(); rowsErr != nil || count != 1 {
+		if rowsErr != nil {
+			return rowsErr
+		}
+		return ErrState
+	}
+	return tx.Commit()
+}
+
+func loadControlCommandTx(ctx context.Context, tx *sql.Tx, controllerID, bindingID, rotationID, stage string) (OutboundCommand, error) {
+	query := `SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND binding_id=? AND stage=?`
+	aggregateID := bindingID
+	if aggregateID == "" {
+		query = `SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND rotation_id=? AND stage=?`
+		aggregateID = rotationID
+	}
+	value, err := scanOutboundCommand(tx.QueryRowContext(ctx, query, controllerID, aggregateID, stage))
+	if errors.Is(err, sql.ErrNoRows) {
+		return OutboundCommand{}, ErrNotFound
+	}
+	return value, err
+}
+
+func completeControlCommandTx(ctx context.Context, tx *sql.Tx, controllerID, messageID string, at time.Time) error {
+	result, err := tx.ExecContext(ctx, `UPDATE relay_outbound_commands SET state='completed',completed_at=? WHERE controller_id=? AND message_id=? AND state='prepared'`, timestamp(at), controllerID, messageID)
+	if err != nil {
+		return classifyConstraint(err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return ErrState
+	}
+	return nil
 }
 
 // CompleteRotationAfterReady performs the local half of two-phase rotation.

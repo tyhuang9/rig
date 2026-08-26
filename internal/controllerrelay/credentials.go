@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,10 +19,14 @@ import (
 )
 
 const (
-	credentialVersion            = 1
-	pollTokenBytes               = 32
-	maxCredentialBytes           = 4 << 10
-	maxInventoryDirectoryEntries = 10_000
+	credentialVersion                 = 1
+	pollTokenBytes                    = 32
+	maxCredentialBytes                = 4 << 10
+	maxInventoryDirectoryEntries      = 10_000
+	controllerKeyCredentialUnreadable = "credential_unreadable"
+	controllerKeyCredentialUnexpected = "unexpected_artifact"
+	controllerKeyCredentialUnsafe     = "unsafe_artifact"
+	controllerKeyTemporaryPrefix      = ".hostd-secret-"
 )
 
 // ControllerKeyBundle is decrypted controller signing material. Callers must
@@ -32,6 +37,38 @@ type ControllerKeyBundle struct {
 	KeyID        string
 	PrivateKey   ed25519.PrivateKey
 	PublicKey    ed25519.PublicKey
+}
+
+type ControllerKeyCredentialMetadata struct {
+	ControllerID string
+	KeyID        string
+	PublicKey    []byte
+	ProtectedRef string
+}
+
+type ControllerKeyCredentialPage struct {
+	Credentials []ControllerKeyCredentialMetadata
+	Issues      []ControllerKeyCredentialIssue
+	NextCursor  string
+	Complete    bool
+}
+
+type ControllerKeyCredentialIssue struct {
+	ControllerID string
+	KeyID        string
+	ProtectedRef string
+	Code         string
+}
+
+type ControllerKeyTemporaryArtifact struct {
+	ControllerID string
+	Name         string
+}
+
+type ControllerKeyTemporaryArtifactPage struct {
+	Artifacts  []ControllerKeyTemporaryArtifact
+	NextCursor string
+	Complete   bool
 }
 
 func (bundle ControllerKeyBundle) String() string   { return "protected relay controller key" }
@@ -168,61 +205,336 @@ func (store *FileCredentialStore) ReadControllerKey(controllerID, keyID string, 
 	if store == nil || !validCanonicalUUID(controllerID) || !validCanonicalUUID(keyID) || len(expectedPublicKey) != ed25519.PublicKeySize {
 		return ControllerKeyBundle{}, errors.New("invalid relay controller key metadata")
 	}
-	path, _, err := store.controllerKeyLocation(controllerID, keyID)
+	privateKey, publicKey, err := store.loadControllerKey(controllerID, keyID)
 	if err != nil {
 		return ControllerKeyBundle{}, err
 	}
+	if subtle.ConstantTimeCompare(publicKey, expectedPublicKey) != 1 {
+		clear(privateKey)
+		clear(publicKey)
+		return ControllerKeyBundle{}, errors.New("relay controller public key metadata does not match protected key")
+	}
+	return ControllerKeyBundle{Version: credentialVersion, ControllerID: controllerID, KeyID: keyID, PrivateKey: privateKey, PublicKey: publicKey}, nil
+}
+
+func (store *FileCredentialStore) loadControllerKey(controllerID, keyID string) (ed25519.PrivateKey, ed25519.PublicKey, error) {
+	path, _, err := store.controllerKeyLocation(controllerID, keyID)
+	if err != nil {
+		return nil, nil, err
+	}
 	if err = store.validateExistingPath(path); err != nil {
-		return ControllerKeyBundle{}, err
+		return nil, nil, err
 	}
 	plaintext, err := secretfile.Read(path, controllerKeyPurpose(controllerID, keyID))
 	if err != nil {
-		return ControllerKeyBundle{}, errors.New("load relay controller key")
+		return nil, nil, errors.New("load relay controller key")
 	}
 	defer clear(plaintext)
 	var persisted persistedControllerKey
 	if err = decodeStrictJSON(plaintext, &persisted); err != nil {
 		clear(persisted.PrivateKey)
-		return ControllerKeyBundle{}, errors.New("invalid relay controller key")
+		return nil, nil, errors.New("invalid relay controller key")
 	}
 	defer clear(persisted.PrivateKey)
 	if persisted.Version != credentialVersion || persisted.ControllerID != controllerID || persisted.KeyID != keyID || len(persisted.PrivateKey) != ed25519.PrivateKeySize {
-		return ControllerKeyBundle{}, errors.New("invalid relay controller key")
+		return nil, nil, errors.New("invalid relay controller key")
 	}
 	privateKey := append(ed25519.PrivateKey(nil), persisted.PrivateKey...)
 	publicKey, ok := privateKey.Public().(ed25519.PublicKey)
 	if !ok || len(publicKey) != ed25519.PublicKeySize {
 		clear(privateKey)
-		return ControllerKeyBundle{}, errors.New("invalid relay controller key")
+		return nil, nil, errors.New("invalid relay controller key")
 	}
-	if subtle.ConstantTimeCompare(publicKey, expectedPublicKey) != 1 {
-		clear(privateKey)
-		return ControllerKeyBundle{}, errors.New("relay controller public key metadata does not match protected key")
-	}
-	return ControllerKeyBundle{Version: credentialVersion, ControllerID: controllerID, KeyID: keyID, PrivateKey: privateKey, PublicKey: append(ed25519.PublicKey(nil), publicKey...)}, nil
+	return privateKey, append(ed25519.PublicKey(nil), publicKey...), nil
 }
 
 func (store *FileCredentialStore) RemoveControllerKey(controllerID, keyID string) error {
+	_, err := store.RemoveControllerKeyWithResult(controllerID, keyID)
+	return err
+}
+
+// RemoveControllerKeyWithResult reports whether the exact protected file was
+// present and removed. Callers use this to distinguish cleanup work from an
+// idempotent already-absent result.
+func (store *FileCredentialStore) RemoveControllerKeyWithResult(controllerID, keyID string) (bool, error) {
 	if store == nil || !validCanonicalUUID(controllerID) || !validCanonicalUUID(keyID) {
-		return errors.New("invalid relay controller key identity")
+		return false, errors.New("invalid relay controller key identity")
 	}
 	path, _, err := store.controllerKeyLocation(controllerID, keyID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err = os.Lstat(path); errors.Is(err, os.ErrNotExist) {
-		return nil
+		return false, nil
 	} else if err != nil {
-		return errors.New("inspect relay credential")
+		return false, errors.New("inspect relay credential")
 	}
 	if err = store.validateDirectoryChain(filepath.Dir(path)); err != nil {
-		return err
+		return false, err
 	}
 	if err = removeExactSecret(path); err != nil {
-		return err
+		return false, err
 	}
 	removeEmptyCredentialDirectory(filepath.Dir(path))
-	return nil
+	return true, nil
+}
+
+// ControllerKeyCredentials returns a bounded metadata-only inventory for
+// crash recovery. Each file is decrypted with its exact purpose and private
+// material is cleared before the public identity is returned.
+func (store *FileCredentialStore) ControllerKeyCredentials(cursor string, limit int) (ControllerKeyCredentialPage, error) {
+	if store == nil || limit < 1 || limit > 1000 {
+		return ControllerKeyCredentialPage{}, errors.New("invalid relay controller key inventory limit")
+	}
+	cursorControllerName, cursorEntryName, err := parseControllerKeyInventoryCursor(cursor)
+	if err != nil {
+		return ControllerKeyCredentialPage{}, err
+	}
+	controllersRoot := filepath.Join(store.dataRoot, "secrets", "relay", "controllers")
+	info, err := os.Lstat(controllersRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return ControllerKeyCredentialPage{Complete: true}, nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return ControllerKeyCredentialPage{}, errors.New("relay controller credential directory is unsafe")
+	}
+	controllerEntries, err := readBoundedSortedDirectory(controllersRoot, maxInventoryDirectoryEntries)
+	if err != nil {
+		return ControllerKeyCredentialPage{}, errors.New("list relay controller credentials")
+	}
+	result := make([]ControllerKeyCredentialMetadata, 0, limit)
+	issues := make([]ControllerKeyCredentialIssue, 0)
+	processed := 0
+	for _, controllerEntry := range controllerEntries {
+		controllerName := controllerEntry.Name()
+		if cursorControllerName != "" && controllerName < cursorControllerName {
+			continue
+		}
+		if !validCanonicalUUID(controllerName) {
+			if cursorControllerName == "" || controllerName > cursorControllerName {
+				issues = append(issues, ControllerKeyCredentialIssue{Code: controllerKeyCredentialUnexpected})
+				processed++
+				if processed == limit {
+					return ControllerKeyCredentialPage{Credentials: result, Issues: issues, NextCursor: controllerKeyInventoryCursor(controllerName, "")}, nil
+				}
+			}
+			continue
+		}
+		controllerID := controllerName
+		controllerPath := filepath.Join(controllersRoot, controllerID)
+		controllerInfo, inspectErr := os.Lstat(controllerPath)
+		if inspectErr != nil || !controllerInfo.IsDir() || controllerInfo.Mode()&os.ModeSymlink != 0 {
+			if cursorControllerName == "" || controllerID > cursorControllerName {
+				issues = append(issues, ControllerKeyCredentialIssue{ControllerID: controllerID, Code: controllerKeyCredentialUnsafe})
+				processed++
+				if processed == limit {
+					return ControllerKeyCredentialPage{Credentials: result, Issues: issues, NextCursor: controllerKeyInventoryCursor(controllerID, "")}, nil
+				}
+			}
+			continue
+		}
+		keysPath := filepath.Join(controllerPath, "keys")
+		keysInfo, inspectErr := os.Lstat(keysPath)
+		if errors.Is(inspectErr, os.ErrNotExist) {
+			continue
+		}
+		if inspectErr != nil || !keysInfo.IsDir() || keysInfo.Mode()&os.ModeSymlink != 0 {
+			if cursorControllerName == "" || controllerID > cursorControllerName {
+				issues = append(issues, ControllerKeyCredentialIssue{ControllerID: controllerID, Code: controllerKeyCredentialUnsafe})
+				processed++
+				if processed == limit {
+					return ControllerKeyCredentialPage{Credentials: result, Issues: issues, NextCursor: controllerKeyInventoryCursor(controllerID, "")}, nil
+				}
+			}
+			continue
+		}
+		keyEntries, readErr := readBoundedSortedDirectory(keysPath, maxInventoryDirectoryEntries)
+		if readErr != nil {
+			return ControllerKeyCredentialPage{}, errors.New("list relay controller keys")
+		}
+		for _, keyEntry := range keyEntries {
+			name := keyEntry.Name()
+			if cursorControllerName != "" && (controllerID < cursorControllerName || controllerID == cursorControllerName && name <= cursorEntryName) {
+				continue
+			}
+			keyPath := filepath.Join(keysPath, name)
+			keyInfo, inspectErr := os.Lstat(keyPath)
+			if validControllerKeyTemporaryArtifactName(name) {
+				if inspectErr != nil || !keyInfo.Mode().IsRegular() {
+					issues = append(issues, ControllerKeyCredentialIssue{ControllerID: controllerID, Code: controllerKeyCredentialUnsafe})
+				}
+				processed++
+				if processed == limit {
+					return ControllerKeyCredentialPage{Credentials: result, Issues: issues, NextCursor: controllerKeyInventoryCursor(controllerID, name)}, nil
+				}
+				continue
+			}
+			keyID := strings.TrimSuffix(name, ".key")
+			if !strings.HasSuffix(name, ".key") || !validCanonicalUUID(keyID) {
+				issues = append(issues, ControllerKeyCredentialIssue{ControllerID: controllerID, Code: controllerKeyCredentialUnexpected})
+				processed++
+				if processed == limit {
+					return ControllerKeyCredentialPage{Credentials: result, Issues: issues, NextCursor: controllerKeyInventoryCursor(controllerID, name)}, nil
+				}
+				continue
+			}
+			if inspectErr != nil || !keyInfo.Mode().IsRegular() {
+				issues = append(issues, ControllerKeyCredentialIssue{ControllerID: controllerID, KeyID: keyID, ProtectedRef: ProtectedKeyRef(controllerID, keyID), Code: controllerKeyCredentialUnsafe})
+				processed++
+				if processed == limit {
+					return ControllerKeyCredentialPage{Credentials: result, Issues: issues, NextCursor: controllerKeyInventoryCursor(controllerID, name)}, nil
+				}
+				continue
+			}
+			privateKey, publicKey, loadErr := store.loadControllerKey(controllerID, keyID)
+			if loadErr != nil {
+				issues = append(issues, ControllerKeyCredentialIssue{ControllerID: controllerID, KeyID: keyID, ProtectedRef: ProtectedKeyRef(controllerID, keyID), Code: controllerKeyCredentialUnreadable})
+				processed++
+				if processed == limit {
+					return ControllerKeyCredentialPage{Credentials: result, Issues: issues, NextCursor: controllerKeyInventoryCursor(controllerID, name)}, nil
+				}
+				continue
+			}
+			clear(privateKey)
+			result = append(result, ControllerKeyCredentialMetadata{ControllerID: controllerID, KeyID: keyID, PublicKey: publicKey, ProtectedRef: ProtectedKeyRef(controllerID, keyID)})
+			processed++
+			if processed == limit {
+				return ControllerKeyCredentialPage{Credentials: result, Issues: issues, NextCursor: controllerKeyInventoryCursor(controllerID, name)}, nil
+			}
+		}
+	}
+	return ControllerKeyCredentialPage{Credentials: result, Issues: issues, Complete: true}, nil
+}
+
+func controllerKeyCredentialCursor(controllerID, keyID string) string {
+	return controllerKeyInventoryCursor(controllerID, keyID+".key")
+}
+
+func parseControllerKeyCredentialCursor(cursor string) (string, string, error) {
+	controllerID, entryName, err := parseControllerKeyInventoryCursor(cursor)
+	if err != nil {
+		return "", "", err
+	}
+	if controllerID == "" {
+		return "", "", nil
+	}
+	keyID := strings.TrimSuffix(entryName, ".key")
+	if !validCanonicalUUID(controllerID) || !strings.HasSuffix(entryName, ".key") || !validCanonicalUUID(keyID) || cursor != controllerKeyCredentialCursor(controllerID, keyID) {
+		return "", "", errors.New("invalid relay controller key inventory cursor")
+	}
+	return controllerID, keyID, nil
+}
+
+func controllerKeyInventoryCursor(controllerName, entryName string) string {
+	return "v2:" + base64.RawURLEncoding.EncodeToString([]byte(controllerName)) + ":" + base64.RawURLEncoding.EncodeToString([]byte(entryName))
+}
+
+func parseControllerKeyInventoryCursor(cursor string) (string, string, error) {
+	if cursor == "" {
+		return "", "", nil
+	}
+	if !strings.HasPrefix(cursor, "v2:") {
+		return "", "", errors.New("invalid relay controller key inventory cursor")
+	}
+	parts := strings.Split(cursor[3:], ":")
+	if len(parts) != 2 {
+		return "", "", errors.New("invalid relay controller key inventory cursor")
+	}
+	controller, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil || len(controller) == 0 || len(controller) > 255 || strings.IndexByte(string(controller), 0) >= 0 {
+		return "", "", errors.New("invalid relay controller key inventory cursor")
+	}
+	entry, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil || len(entry) > 255 || strings.IndexByte(string(entry), 0) >= 0 || cursor != controllerKeyInventoryCursor(string(controller), string(entry)) {
+		return "", "", errors.New("invalid relay controller key inventory cursor")
+	}
+	return string(controller), string(entry), nil
+}
+
+// ControllerKeyTemporaryArtifacts inventories only safe regular generic
+// secretfile staging artifacts. Unsafe entries are surfaced by the credential
+// inventory and are never returned as deletion candidates.
+func (store *FileCredentialStore) ControllerKeyTemporaryArtifacts(cursor string, limit int) (ControllerKeyTemporaryArtifactPage, error) {
+	if store == nil || limit < 1 || limit > 1000 {
+		return ControllerKeyTemporaryArtifactPage{}, errors.New("invalid relay controller key temporary inventory limit")
+	}
+	cursorController, cursorEntry, err := parseControllerKeyInventoryCursor(cursor)
+	if err != nil {
+		return ControllerKeyTemporaryArtifactPage{}, err
+	}
+	controllersRoot := filepath.Join(store.dataRoot, "secrets", "relay", "controllers")
+	entries, err := readBoundedSortedDirectoryIfPresent(controllersRoot, maxInventoryDirectoryEntries)
+	if err != nil {
+		return ControllerKeyTemporaryArtifactPage{}, errors.New("list relay controller credentials")
+	}
+	page := ControllerKeyTemporaryArtifactPage{Artifacts: make([]ControllerKeyTemporaryArtifact, 0, limit)}
+	for _, controllerEntry := range entries {
+		controllerID := controllerEntry.Name()
+		if !validCanonicalUUID(controllerID) || controllerID < cursorController {
+			continue
+		}
+		controllerPath := filepath.Join(controllersRoot, controllerID)
+		controllerInfo, inspectErr := os.Lstat(controllerPath)
+		if inspectErr != nil || !controllerInfo.IsDir() || controllerInfo.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		keysPath := filepath.Join(controllerPath, "keys")
+		keyEntries, readErr := readBoundedSortedDirectoryIfPresent(keysPath, maxInventoryDirectoryEntries)
+		if readErr != nil {
+			continue
+		}
+		for _, keyEntry := range keyEntries {
+			name := keyEntry.Name()
+			if (controllerID == cursorController && name <= cursorEntry) || !validControllerKeyTemporaryArtifactName(name) {
+				continue
+			}
+			info, inspectErr := os.Lstat(filepath.Join(keysPath, name))
+			if inspectErr != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			page.Artifacts = append(page.Artifacts, ControllerKeyTemporaryArtifact{ControllerID: controllerID, Name: name})
+			if len(page.Artifacts) == limit {
+				page.NextCursor = controllerKeyInventoryCursor(controllerID, name)
+				return page, nil
+			}
+		}
+	}
+	page.Complete = true
+	return page, nil
+}
+
+func (store *FileCredentialStore) RemoveControllerKeyTemporaryArtifact(controllerID, name string) (bool, error) {
+	if store == nil || !validCanonicalUUID(controllerID) || !validControllerKeyTemporaryArtifactName(name) {
+		return false, errors.New("invalid relay controller key temporary artifact")
+	}
+	keysPath := filepath.Join(store.dataRoot, "secrets", "relay", "controllers", controllerID, "keys")
+	if err := store.validateDirectoryChain(keysPath); err != nil {
+		return false, err
+	}
+	path := filepath.Join(keysPath, name)
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || !info.Mode().IsRegular() {
+		return false, errors.New("relay controller key temporary artifact is unsafe")
+	}
+	if err = secretfile.Remove(path); err != nil {
+		return false, errors.New("remove relay controller key temporary artifact")
+	}
+	return true, nil
+}
+
+func validControllerKeyTemporaryArtifactName(name string) bool {
+	if len(name) < len(controllerKeyTemporaryPrefix)+1 || len(name) > 128 || !strings.HasPrefix(name, controllerKeyTemporaryPrefix) {
+		return false
+	}
+	for _, character := range name[len(controllerKeyTemporaryPrefix):] {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (store *FileCredentialStore) WriteEnrollmentPollToken(token EnrollmentPollToken) (string, error) {
@@ -566,6 +878,17 @@ func readBoundedSortedDirectory(path string, maximum int) ([]os.DirEntry, error)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	return entries, nil
+}
+
+func readBoundedSortedDirectoryIfPresent(path string, maximum int) ([]os.DirEntry, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("relay credential directory is unsafe")
+	}
+	return readBoundedSortedDirectory(path, maximum)
 }
 
 func controllerKeyPurpose(controllerID, keyID string) string {

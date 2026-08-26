@@ -92,12 +92,17 @@ type SessionTimerSource interface {
 }
 
 type sessionTransportStore interface {
-	ActiveIdentity(context.Context) (ControllerIdentity, ControllerKey, error)
+	SessionAuthenticationCandidates(context.Context) (ControllerIdentity, []ControllerKey, error)
 	DurableACKState(context.Context, string) ([]protocol.ACKState, error)
 	PrepareSubscriptionSync(context.Context, string, string, time.Time) (SyncSnapshot, error)
 	AcknowledgeSubscriptionSync(context.Context, string, string, uint64, uint32, time.Time) error
 	CommitSourceDesired(context.Context, string, protocol.SourceDesired, time.Time) (InboxDecision, error)
 	CommitAccessChange(context.Context, string, protocol.AccessChange, time.Time) (InboxDecision, error)
+}
+
+type SessionControlHandler interface {
+	Pending(context.Context, SessionControlContext, int) ([]protocol.Frame, error)
+	Handle(context.Context, SessionControlContext, protocol.Frame) (SessionControlResult, error)
 }
 
 type sessionTransportCredentials interface {
@@ -117,6 +122,7 @@ type SessionTransportConfig struct {
 	Now                  func() time.Time
 	Entropy              io.Reader
 	Timers               SessionTimerSource
+	ControlHandler       SessionControlHandler
 }
 
 func DefaultSessionTransportConfig() SessionTransportConfig {
@@ -196,17 +202,34 @@ type activeControllerSession struct {
 func (transport *SessionTransport) connect(ctx context.Context) (_ *activeControllerSession, resultErr error) {
 	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, transport.config.HandshakeTimeout)
 	defer cancelHandshake()
-	identity, key, err := transport.store.ActiveIdentity(handshakeCtx)
+	identity, candidates, err := transport.store.SessionAuthenticationCandidates(handshakeCtx)
 	if err != nil {
 		return nil, sessionFailure(sessionErrorIdentity, true)
 	}
-	if identity.State != ControllerActive || key.State != KeyActive || identity.ControllerID != key.ControllerID {
+	if identity.State != ControllerActive || len(candidates) < 1 || len(candidates) > 2 {
 		return nil, sessionFailure(sessionErrorIdentity, true)
 	}
 	ackState, err := transport.store.DurableACKState(handshakeCtx, identity.ControllerID)
 	if err != nil || protocol.ValidateACKState(ackState) != nil {
 		return nil, sessionFailure(sessionErrorPersistence, true)
 	}
+	for index, key := range candidates {
+		if (key.State != KeyActive && key.State != KeyPending) || identity.ControllerID != key.ControllerID || index > 0 && key.State != KeyPending {
+			return nil, sessionFailure(sessionErrorIdentity, true)
+		}
+		active, attemptErr := transport.connectCandidate(handshakeCtx, identity, key, ackState)
+		if attemptErr == nil {
+			return active, nil
+		}
+		resultErr = attemptErr
+		if index+1 == len(candidates) || !retryAuthenticationCandidate(attemptErr) || handshakeCtx.Err() != nil {
+			return nil, attemptErr
+		}
+	}
+	return nil, resultErr
+}
+
+func (transport *SessionTransport) connectCandidate(handshakeCtx context.Context, identity ControllerIdentity, key ControllerKey, ackState []protocol.ACKState) (_ *activeControllerSession, resultErr error) {
 	hello, err := transport.issuer.NewHello(identity.ControllerID, key.KeyID, ackState)
 	if err != nil {
 		return nil, sessionFailure(sessionErrorIdentity, true)
@@ -366,12 +389,6 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 	writeErrors := make(chan error, 1)
 	writerDone := make(chan struct{})
 	go session.writeLoop(runCtx, writes, writeErrors, writerDone)
-
-	heartbeat := session.transport.config.Timers.NewTicker(session.heartbeatInterval)
-	defer heartbeat.Stop()
-	lastSeen := session.transport.now()
-	var inboundHeartbeat, outboundHeartbeat uint64
-
 	finish := func(err error) error {
 		cancel(context.Canceled)
 		_ = session.conn.CloseNow()
@@ -380,6 +397,26 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 		<-expiryDone
 		return err
 	}
+	if session.transport.config.ControlHandler != nil {
+		pendingCtx, cancelPending := context.WithTimeout(runCtx, session.transport.config.PersistenceTimeout)
+		pending, err := session.transport.config.ControlHandler.Pending(pendingCtx, session.controlContext(), minInt(session.maxOutstanding, session.transport.config.MaxOutstanding))
+		cancelPending()
+		if err != nil {
+			destroySessionControlFrames(pending)
+			return finish(controlSessionFailure(err))
+		}
+		for index, frame := range pending {
+			if !enqueueSessionFrame(writes, frame) {
+				destroySessionControlFrames(pending[index:])
+				return finish(sessionFailure(sessionErrorQueueSaturated, false))
+			}
+		}
+	}
+
+	heartbeat := session.transport.config.Timers.NewTicker(session.heartbeatInterval)
+	defer heartbeat.Stop()
+	lastSeen := session.transport.now()
+	var inboundHeartbeat, outboundHeartbeat uint64
 	for {
 		select {
 		case <-runCtx.Done():
@@ -406,7 +443,7 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 				persistenceTimeout = remaining
 			}
 			inboundCtx, cancelInbound := context.WithTimeout(runCtx, persistenceTimeout)
-			response, nextHeartbeat, err := session.handleInbound(inboundCtx, event.frame, inboundHeartbeat)
+			response, nextHeartbeat, action, err := session.handleInboundWithAction(inboundCtx, event.frame, inboundHeartbeat)
 			cancelInbound()
 			if errors.Is(context.Cause(runCtx), errSessionExpired) || !session.expiresAt.After(session.transport.now()) {
 				return finish(sessionFailure(sessionErrorExpired, false))
@@ -419,7 +456,17 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 			}
 			inboundHeartbeat = nextHeartbeat
 			if response != nil && !enqueueSessionFrame(writes, response) {
+				destroySessionControlFrame(response)
 				return finish(sessionFailure(sessionErrorQueueSaturated, false))
+			}
+			switch action {
+			case ControlContinue:
+			case ControlReconnect:
+				return finish(sessionFailure(sessionErrorConnectionClosed, false))
+			case ControlStop:
+				return finish(sessionFailure(sessionErrorIdentity, true))
+			default:
+				return finish(sessionFailure(sessionErrorProtocol, true))
 			}
 		case <-heartbeat.C():
 			now := session.transport.now()
@@ -443,43 +490,59 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 }
 
 func (session *activeControllerSession) handleInbound(ctx context.Context, frame protocol.Frame, heartbeat uint64) (protocol.Frame, uint64, error) {
+	response, nextHeartbeat, _, err := session.handleInboundWithAction(ctx, frame, heartbeat)
+	return response, nextHeartbeat, err
+}
+
+func (session *activeControllerSession) handleInboundWithAction(ctx context.Context, frame protocol.Frame, heartbeat uint64) (protocol.Frame, uint64, SessionControlAction, error) {
 	switch value := frame.(type) {
 	case *protocol.SourceDesired:
 		if !session.expiresAt.After(session.transport.now()) {
-			return nil, heartbeat, sessionFailure(sessionErrorExpired, false)
+			return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorExpired, false)
 		}
 		decision, err := session.transport.store.CommitSourceDesired(ctx, session.controllerID, *value, session.transport.now())
 		if err != nil {
-			return nil, heartbeat, sessionFailure(sessionErrorPersistence, true)
+			return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorPersistence, true)
 		}
 		if !session.expiresAt.After(session.transport.now()) {
-			return nil, heartbeat, sessionFailure(sessionErrorExpired, false)
+			return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorExpired, false)
 		}
 		response, err := session.sourceDecision(value, decision)
-		return response, heartbeat, err
+		return response, heartbeat, ControlContinue, err
 	case *protocol.AccessChange:
 		if !session.expiresAt.After(session.transport.now()) {
-			return nil, heartbeat, sessionFailure(sessionErrorExpired, false)
+			return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorExpired, false)
 		}
 		decision, err := session.transport.store.CommitAccessChange(ctx, session.controllerID, *value, session.transport.now())
 		if err != nil {
-			return nil, heartbeat, sessionFailure(sessionErrorPersistence, true)
+			return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorPersistence, true)
 		}
 		if !session.expiresAt.After(session.transport.now()) {
-			return nil, heartbeat, sessionFailure(sessionErrorExpired, false)
+			return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorExpired, false)
 		}
 		response, err := session.accessDecision(value, decision)
-		return response, heartbeat, err
+		return response, heartbeat, ControlContinue, err
 	case *protocol.Heartbeat:
 		if value.Sequence <= heartbeat {
-			return nil, heartbeat, sessionFailure(sessionErrorProtocol, true)
+			return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorProtocol, true)
 		}
-		return nil, value.Sequence, nil
+		return nil, value.Sequence, ControlContinue, nil
 	case *protocol.ProtocolError:
-		return nil, heartbeat, sessionFailure(sessionErrorProtocol, value.Fatal)
+		return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorProtocol, value.Fatal)
 	default:
-		return nil, heartbeat, sessionFailure(sessionErrorProtocol, true)
+		if session.transport.config.ControlHandler == nil {
+			return nil, heartbeat, ControlContinue, sessionFailure(sessionErrorProtocol, true)
+		}
+		result, err := session.transport.config.ControlHandler.Handle(ctx, session.controlContext(), frame)
+		if err != nil {
+			return nil, heartbeat, result.Action, controlSessionFailure(err)
+		}
+		return result.Response, heartbeat, result.Action, nil
 	}
+}
+
+func (session *activeControllerSession) controlContext() SessionControlContext {
+	return SessionControlContext{ControllerID: session.controllerID, KeyID: session.keyID, SessionID: session.sessionID, ExpiresAt: session.expiresAt}
 }
 
 func (session *activeControllerSession) sourceDecision(source *protocol.SourceDesired, decision InboxDecision) (protocol.Frame, error) {
@@ -537,7 +600,10 @@ func (session *activeControllerSession) readLoop(ctx context.Context, output cha
 }
 
 func (session *activeControllerSession) writeLoop(ctx context.Context, input <-chan protocol.Frame, failures chan<- error, done chan<- struct{}) {
-	defer close(done)
+	defer func() {
+		drainSessionControlFrames(input)
+		close(done)
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -547,12 +613,29 @@ func (session *activeControllerSession) writeLoop(ctx context.Context, input <-c
 				return
 			}
 			if err := session.transport.writeFrame(ctx, session.conn, frame, session.maxEnvelopeBytes); err != nil {
+				destroySessionControlFrame(frame)
 				select {
 				case failures <- err:
 				default:
 				}
+				<-ctx.Done()
 				return
 			}
+			destroySessionControlFrame(frame)
+		}
+	}
+}
+
+func drainSessionControlFrames(input <-chan protocol.Frame) {
+	for {
+		select {
+		case frame, ok := <-input:
+			if !ok {
+				return
+			}
+			destroySessionControlFrame(frame)
+		default:
+			return
 		}
 	}
 }
@@ -700,6 +783,38 @@ func defaultSessionDial(ctx context.Context, target string, options *websocket.D
 
 func sessionFailure(code string, fatal bool) error {
 	return &SessionTransportError{Code: code, Fatal: fatal}
+}
+
+func controlSessionFailure(err error) error {
+	var controlErr *SessionControlError
+	if !errors.As(err, &controlErr) {
+		return sessionFailure(sessionErrorProtocol, true)
+	}
+	switch controlErr.Code {
+	case controlErrorPersistence:
+		return sessionFailure(sessionErrorPersistence, true)
+	case controlErrorCredential:
+		return sessionFailure(sessionErrorCredential, true)
+	case controlErrorExpired:
+		return sessionFailure(sessionErrorExpired, false)
+	case controlErrorRevoked:
+		return sessionFailure(sessionErrorIdentity, true)
+	default:
+		return sessionFailure(sessionErrorProtocol, true)
+	}
+}
+
+func retryAuthenticationCandidate(err error) bool {
+	var transportErr *SessionTransportError
+	if !errors.As(err, &transportErr) || transportErr.Fatal && transportErr.Code != sessionErrorProtocol {
+		return false
+	}
+	switch transportErr.Code {
+	case sessionErrorRelayUnavailable, sessionErrorConnectionClosed, sessionErrorProtocol, sessionErrorExpired:
+		return true
+	default:
+		return false
+	}
 }
 
 type realSessionTimerSource struct{}

@@ -226,13 +226,13 @@ func TestEnrollmentServiceFailurePathsPersistThroughRealRepositoryAndCleanupAfte
 				t.Fatal(err)
 			}
 			activated := now
-			if err = repository.CreateIdentity(context.Background(), ControllerIdentity{ControllerID: controllerID, State: ControllerActive, CreatedAt: now, UpdatedAt: now}, ControllerKey{
+			identity := ControllerIdentity{ControllerID: controllerID, State: ControllerActive, CreatedAt: now, UpdatedAt: now}
+			key := ControllerKey{
 				KeyID: keyID, ControllerID: controllerID, PublicKey: publicKey, Algorithm: KeyAlgorithmEd25519,
 				State: KeyActive, ProtectedKeyRef: protectedKeyRef, CreatedAt: now, UpdatedAt: now,
 				ActivatedAt: &activated, PossessionConfirmedAt: &activated,
-			}); err != nil {
-				t.Fatal(err)
 			}
+			persistTestIdentity(t, repository, identity, key, now)
 			pollToken := bytes.Repeat([]byte{byte(0x61 + index)}, pollTokenBytes)
 			protectedPollRef := ProtectedEnrollmentPollRef(controllerID, enrollmentID)
 			if test.writePoll {
@@ -660,6 +660,9 @@ type fakeEnrollmentRepository struct {
 	mutex                         sync.Mutex
 	identity                      ControllerIdentity
 	key                           ControllerKey
+	identityLease                 ControllerKeyIOLease
+	createIdentityCommitThenErr   bool
+	createIdentityErr             error
 	enrollments                   map[string]Enrollment
 	createEnrollmentErr           error
 	createEnrollmentCommitThenErr bool
@@ -668,6 +671,8 @@ type fakeEnrollmentRepository struct {
 }
 
 func (repository *fakeEnrollmentRepository) ActiveIdentity(context.Context) (ControllerIdentity, ControllerKey, error) {
+	repository.mutex.Lock()
+	defer repository.mutex.Unlock()
 	if repository.identity.ControllerID == "" {
 		return ControllerIdentity{}, ControllerKey{}, ErrNotFound
 	}
@@ -676,11 +681,36 @@ func (repository *fakeEnrollmentRepository) ActiveIdentity(context.Context) (Con
 	return repository.identity, key, nil
 }
 
-func (repository *fakeEnrollmentRepository) CreateIdentity(_ context.Context, identity ControllerIdentity, key ControllerKey) error {
+func (repository *fakeEnrollmentRepository) BeginControllerIdentityWrite(_ context.Context, lease ControllerKeyIOLease) error {
+	repository.mutex.Lock()
+	defer repository.mutex.Unlock()
 	if repository.identity.ControllerID != "" {
+		return ErrState
+	}
+	if repository.identityLease.LeaseID != "" {
 		return ErrConflict
 	}
+	repository.identityLease = lease
+	repository.identityLease.PublicKey = append([]byte(nil), lease.PublicKey...)
+	return nil
+}
+
+func (repository *fakeEnrollmentRepository) CreateIdentity(_ context.Context, lease ControllerKeyIOLease, identity ControllerIdentity, key ControllerKey, at time.Time) error {
+	repository.mutex.Lock()
+	defer repository.mutex.Unlock()
+	if repository.createIdentityErr != nil {
+		return repository.createIdentityErr
+	}
+	if repository.identity.ControllerID != "" || !sameControllerKeyIOLeaseIdentity(repository.identityLease, lease) || !repository.identityLease.LeaseExpiresAt.After(at) {
+		return ErrState
+	}
 	repository.identity, repository.key = identity, key
+	repository.key.PublicKey = append([]byte(nil), key.PublicKey...)
+	clear(repository.identityLease.PublicKey)
+	repository.identityLease = ControllerKeyIOLease{}
+	if repository.createIdentityCommitThenErr {
+		return errors.New("lost identity commit response")
+	}
 	return nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -512,6 +513,109 @@ func TestOutboundCommandReplayAndAtomicRotationCompletion(t *testing.T) {
 	_, active, err := repository.ActiveIdentity(ctx)
 	if err != nil || active.KeyID != repositoryTestNewKeyID {
 		t.Fatalf("active rotated key = %#v %v", active, err)
+	}
+}
+
+func TestPendingControlCommandsUsesPendingReplayIndexWithoutSort(t *testing.T) {
+	repository, _, now := newRepositoryHarness(t)
+	binding := createSessionBinding(t, repository, now)
+	ctx := context.Background()
+
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	bindingStatement, err := tx.PrepareContext(ctx, `INSERT INTO relay_installation_bindings(binding_id,owner_user_id,connection_id,controller_id,installation_id,repository_id,state,state_changed_at,created_at,updated_at) VALUES(?,'owner','connection-a',?,?,?,'removal_pending',?,?,?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandStatement, err := tx.PrepareContext(ctx, `INSERT INTO relay_outbound_commands(controller_id,message_id,command_type,binding_id,rotation_id,stage,sent_at,canonical_digest,state,completed_at) VALUES(?,?,'binding.remove',?,NULL,'remove',?,?,'completed',?)`)
+	if err != nil {
+		_ = bindingStatement.Close()
+		t.Fatal(err)
+	}
+	for index := 0; index < 512; index++ {
+		bindingID := uuid.NewString()
+		messageID := uuid.NewString()
+		sentAt := now.Add(-time.Duration(512-index) * time.Minute)
+		digest := sha256.Sum256([]byte(fmt.Sprintf("completed replay history %d", index)))
+		if _, err := bindingStatement.ExecContext(ctx, bindingID, binding.ControllerID, 10_000+index, 20_000+index, timestamp(sentAt), timestamp(sentAt), timestamp(sentAt)); err != nil {
+			t.Fatalf("insert completed history binding %d: %v", index, err)
+		}
+		if _, err := commandStatement.ExecContext(ctx, binding.ControllerID, messageID, bindingID, timestamp(sentAt), digest[:], timestamp(sentAt.Add(time.Second))); err != nil {
+			t.Fatalf("insert completed history command %d: %v", index, err)
+		}
+	}
+	if err := bindingStatement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := commandStatement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared := []OutboundCommand{
+		{ControllerID: binding.ControllerID, MessageID: "70000000-0000-4000-8000-000000000002", CommandType: CommandBindingRemove, BindingID: "80000000-0000-4000-8000-000000000002", Stage: "remove", SentAt: now.Add(2 * time.Minute), Digest: sha256.Sum256([]byte("pending replay second")), State: CommandPrepared},
+		{ControllerID: binding.ControllerID, MessageID: "70000000-0000-4000-8000-000000000001", CommandType: CommandBindingRemove, BindingID: "80000000-0000-4000-8000-000000000001", Stage: "remove", SentAt: now.Add(time.Minute), Digest: sha256.Sum256([]byte("pending replay first")), State: CommandPrepared},
+		{ControllerID: binding.ControllerID, MessageID: "70000000-0000-4000-8000-000000000003", CommandType: CommandBindingRemove, BindingID: "80000000-0000-4000-8000-000000000003", Stage: "remove", SentAt: now.Add(2 * time.Minute), Digest: sha256.Sum256([]byte("pending replay tie")), State: CommandPrepared},
+	}
+	for index, command := range prepared {
+		if _, err := repository.db.ExecContext(ctx, `INSERT INTO relay_installation_bindings(binding_id,owner_user_id,connection_id,controller_id,installation_id,repository_id,state,state_changed_at,created_at,updated_at) VALUES(?,'owner','connection-a',?,?,?,'removal_pending',?,?,?)`, command.BindingID, command.ControllerID, 20_000+index, 30_000+index, timestamp(command.SentAt), timestamp(command.SentAt), timestamp(command.SentAt)); err != nil {
+			t.Fatalf("insert prepared binding %d: %v", index, err)
+		}
+		if got, err := repository.PrepareControlCommand(ctx, command); err != nil || got != command {
+			t.Fatalf("prepare pending command %d = %#v %v", index, got, err)
+		}
+	}
+
+	rows, err := repository.db.QueryContext(ctx, `EXPLAIN QUERY PLAN SELECT controller_id,message_id,command_type,COALESCE(binding_id,''),COALESCE(rotation_id,''),stage,sent_at,canonical_digest,state,completed_at FROM relay_outbound_commands WHERE controller_id=? AND state='prepared' AND command_type<>'key.rotation.confirm' ORDER BY sent_at,message_id LIMIT ?`, binding.ControllerID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan []string
+	for rows.Next() {
+		var id, parent, ignored int
+		var detail string
+		if err := rows.Scan(&id, &parent, &ignored, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	joinedPlan := strings.ToLower(strings.Join(plan, "\n"))
+	if !strings.Contains(joinedPlan, "using index relay_outbound_pending_replay") {
+		t.Fatalf("pending replay plan did not select partial index: %s", joinedPlan)
+	}
+	if strings.Contains(joinedPlan, "temp b-tree") {
+		t.Fatalf("pending replay plan requires temporary sort: %s", joinedPlan)
+	}
+
+	got, err := repository.PendingControlCommands(ctx, binding.ControllerID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].MessageID != prepared[1].MessageID || got[1].MessageID != prepared[0].MessageID {
+		t.Fatalf("bounded pending replay = %#v", got)
+	}
+	for _, command := range got {
+		if command.State != CommandPrepared {
+			t.Fatalf("replayed non-pending command = %#v", command)
+		}
+	}
+	all, err := repository.PendingControlCommands(ctx, binding.ControllerID, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 || all[0].MessageID != prepared[1].MessageID || all[1].MessageID != prepared[0].MessageID || all[2].MessageID != prepared[2].MessageID {
+		t.Fatalf("ordered pending replay = %#v", all)
 	}
 }
 

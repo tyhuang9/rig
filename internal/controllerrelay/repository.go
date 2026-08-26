@@ -1,6 +1,7 @@
 package controllerrelay
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"database/sql"
@@ -24,8 +25,13 @@ type Repository struct{ db *sql.DB }
 
 func NewRepository(db *sql.DB) *Repository { return &Repository{db: db} }
 
-func (r *Repository) CreateIdentity(ctx context.Context, identity ControllerIdentity, key ControllerKey) error {
-	if !validIdentityForCreate(identity) || !validKeyForCreate(key) || identity.ControllerID != key.ControllerID || key.State != KeyActive {
+// CreateIdentity consumes the exact, unexpired singleton identity-write lease
+// in the same transaction that makes the controller and public key metadata
+// authoritative. Callers must never materialize a protected key before this
+// durable intent exists.
+func (r *Repository) CreateIdentity(ctx context.Context, lease ControllerKeyIOLease, identity ControllerIdentity, key ControllerKey, at time.Time) error {
+	if !validControllerKeyIOLease(lease) || lease.Operation != ControllerKeyIOIdentityWrite || lease.Phase != ControllerKeyIOActive || at.IsZero() || !validIdentityForCreate(identity) || !validKeyForCreate(key) || identity.ControllerID != key.ControllerID || key.State != KeyActive ||
+		identity.ControllerID != lease.ControllerID || key.KeyID != lease.KeyID || key.ProtectedKeyRef != lease.ProtectedKeyRef || !bytes.Equal(key.PublicKey, lease.PublicKey) {
 		return ErrInvalid
 	}
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -33,12 +39,33 @@ func (r *Repository) CreateIdentity(ctx context.Context, identity ControllerIden
 		return err
 	}
 	defer tx.Rollback()
+	persisted, err := scanControllerKeyIOLease(tx.QueryRowContext(ctx, controllerKeyIOLeaseSelect+` WHERE scope_key=?`, controllerIdentityIOScope))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	defer clear(persisted.PublicKey)
+	if !sameControllerKeyIOLeaseIdentity(persisted, lease) || persisted.Operation != ControllerKeyIOIdentityWrite || persisted.Phase != ControllerKeyIOActive || !persisted.LeaseExpiresAt.After(at) {
+		return ErrState
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO relay_controllers(singleton,controller_id,state,last_error_code,created_at,updated_at,revoked_at) VALUES(1,?,?,?,?,?,?)`, identity.ControllerID, identity.State, nullable(identity.LastErrorCode), timestamp(identity.CreatedAt), timestamp(identity.UpdatedAt), nullableTime(identity.RevokedAt))
 	if err != nil {
 		return classifyConstraint(err)
 	}
 	if err = insertKey(ctx, tx, key); err != nil {
 		return err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM relay_controller_key_io_leases WHERE scope_key=? AND lease_id=? AND fence=? AND operation='identity_write' AND phase='active'`, lease.ScopeKey, lease.LeaseID, lease.Fence)
+	if err != nil {
+		return err
+	}
+	if count, rowsErr := result.RowsAffected(); rowsErr != nil || count != 1 {
+		if rowsErr != nil {
+			return rowsErr
+		}
+		return ErrState
 	}
 	return tx.Commit()
 }
@@ -154,6 +181,14 @@ func (r *Repository) CreateRotation(ctx context.Context, rotation KeyRotation) e
 	}
 	_, err := r.db.ExecContext(ctx, `INSERT INTO relay_key_rotations(rotation_id,controller_id,old_key_id,new_key_id,state,expires_at,state_changed_at,last_error_code,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, rotation.RotationID, rotation.ControllerID, rotation.OldKeyID, rotation.NewKeyID, rotation.State, timestamp(rotation.ExpiresAt), timestamp(rotation.StateChangedAt), nil, timestamp(rotation.CreatedAt), timestamp(rotation.UpdatedAt), nil)
 	return classifyConstraint(err)
+}
+
+func liveRotationTx(ctx context.Context, tx *sql.Tx, controllerID string) (KeyRotation, error) {
+	value, err := scanRotation(tx.QueryRowContext(ctx, rotationSelect+` WHERE controller_id=? AND state IN ('prepare','propose','confirm','new_key_auth','finalize')`, controllerID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return KeyRotation{}, ErrNotFound
+	}
+	return value, err
 }
 
 func (r *Repository) Rotation(ctx context.Context, controllerID, rotationID string) (KeyRotation, error) {
