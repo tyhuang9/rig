@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -12,7 +11,6 @@ import (
 	"io"
 	"log/slog"
 	"mime"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -116,33 +114,9 @@ func NewRelayHTTPSClient(rawOrigin string, transport http.RoundTripper) (*RelayH
 	if err != nil {
 		return nil, err
 	}
-	if transport == nil {
-		dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-		transport = &http.Transport{
-			Proxy:                  nil,
-			DialContext:            dialer.DialContext,
-			ForceAttemptHTTP2:      true,
-			MaxIdleConns:           16,
-			MaxIdleConnsPerHost:    4,
-			IdleConnTimeout:        30 * time.Second,
-			TLSHandshakeTimeout:    5 * time.Second,
-			ResponseHeaderTimeout:  10 * time.Second,
-			ExpectContinueTimeout:  time.Second,
-			MaxResponseHeaderBytes: 16 << 10,
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-			},
-		}
-	}
 	return &RelayHTTPSClient{
 		origin: origin,
-		client: &http.Client{
-			Transport: transport,
-			Timeout:   relayRequestTimeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
+		client: newRelayHTTPClient(transport, relayRequestTimeout),
 	}, nil
 }
 
@@ -255,45 +229,6 @@ func (client *RelayHTTPSClient) postJSON(ctx context.Context, path string, value
 		return nil, &ClientError{Code: "invalid_response"}
 	}
 	return responseBody, nil
-}
-
-func parseCanonicalHTTPSOrigin(raw string) (*url.URL, error) {
-	if raw == "" || len(raw) > 2048 || strings.IndexByte(raw, 0) >= 0 {
-		return nil, errors.New("relay HTTPS origin is required")
-	}
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme != "https" || parsed.Opaque != "" || parsed.User != nil || parsed.Host == "" || parsed.Path != "" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
-		return nil, errors.New("relay origin must be an exact HTTPS origin")
-	}
-	if parsed.String() != raw || parsed.Host != strings.ToLower(parsed.Host) || strings.Contains(parsed.Host, "%") {
-		return nil, errors.New("relay HTTPS origin is not canonical")
-	}
-	hostname := parsed.Hostname()
-	if hostname == "" || strings.HasSuffix(hostname, ".") || strings.IndexFunc(hostname, func(r rune) bool { return r <= 0x20 || r >= 0x7f }) >= 0 {
-		return nil, errors.New("relay HTTPS origin host is invalid")
-	}
-	port := parsed.Port()
-	if port == "443" {
-		return nil, errors.New("relay HTTPS origin contains a default port")
-	}
-	if port != "" {
-		value, parseErr := strconv.ParseUint(port, 10, 16)
-		if parseErr != nil || value == 0 || strconv.FormatUint(value, 10) != port {
-			return nil, errors.New("relay HTTPS origin port is invalid")
-		}
-	}
-	if strings.Contains(hostname, ":") {
-		ip := net.ParseIP(hostname)
-		if ip == nil || "["+ip.String()+"]"+(func() string {
-			if port == "" {
-				return ""
-			}
-			return ":" + port
-		})() != parsed.Host {
-			return nil, errors.New("relay HTTPS origin IPv6 host is not canonical")
-		}
-	}
-	return parsed, nil
 }
 
 func validRelayEnrollmentRequest(input RelayEnrollmentRequest) bool {
