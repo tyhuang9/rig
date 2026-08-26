@@ -144,8 +144,11 @@ func main() {
 		logger.Error("runtime recovery failed", "error", err)
 		os.Exit(1)
 	}
+	autoDeployDone, autoDeployWake, autoDeployReconcile := startAutoDeploy(ctx, cfg, logger, func() (autoDeployRunner, error) {
+		return newAutoDeployRunner(cfg, db, sources, j, logger)
+	})
 	relayDone := startControllerRelay(ctx, cfg, logger, func() (controllerRelayRunner, error) {
-		return newControllerRelayRunner(cfg, db, logger)
+		return newControllerRelayRunner(cfg, db, logger, autoDeployWake, autoDeployReconcile)
 	})
 	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, ComposeRuntime: cfg.ComposeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
@@ -164,6 +167,7 @@ func main() {
 		logger.Warn("job worker did not stop before shutdown timeout")
 	}
 	_ = waitForControllerRelay(relayDone, controllerRelayShutdownTimeout, logger)
+	_ = waitForAutoDeploy(autoDeployDone, autoDeployShutdownTimeout, logger)
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		os.Exit(1)
 	}

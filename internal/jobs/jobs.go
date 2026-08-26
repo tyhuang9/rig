@@ -78,6 +78,12 @@ type CreateRequest struct {
 	Input          JobInput
 }
 
+// CreateFinalizer is a trusted internal transaction hook. It runs after an
+// exact idempotent job has been found or a new queued job and event have been
+// inserted, but before commit. Returning an error rolls the entire operation
+// back. Finalizers must not retain tx or perform external I/O.
+type CreateFinalizer func(*sql.Tx, Job) error
+
 type Job struct {
 	ID               string          `json:"id"`
 	Type             string          `json:"type"`
@@ -223,6 +229,13 @@ func (s *Service) Create(kind, resourceType, resourceID, idempotency string) (Jo
 }
 
 func (s *Service) CreateWithInput(request CreateRequest) (Job, bool, error) {
+	return s.CreateWithInputFinalized(request, nil)
+}
+
+// CreateWithInputFinalized atomically creates (or finds) an exact idempotent
+// job and commits caller-owned trusted linkage in the same SQLite transaction.
+// The worker is signaled only after that combined transaction commits.
+func (s *Service) CreateWithInputFinalized(request CreateRequest, finalize CreateFinalizer) (Job, bool, error) {
 	if request.Type == "" || request.ResourceType == "" || request.ResourceID == "" || len(request.IdempotencyKey) > 200 {
 		return Job{}, false, fmt.Errorf("%w: type, resource type, and resource id are required", ErrInvalidInput)
 	}
@@ -230,37 +243,39 @@ func (s *Service) CreateWithInput(request CreateRequest) (Job, bool, error) {
 	if err != nil {
 		return Job{}, false, err
 	}
-	if request.IdempotencyKey != "" {
-		existing, err := s.byIdempotency(request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey)
-		if err == nil {
-			if !sameCreateRequest(existing, request, input) {
-				return Job{}, false, ErrIdempotency
-			}
-			return existing, false, nil
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return Job{}, false, err
-		}
-	}
 	now := s.now().UTC()
-	job := Job{ID: uuid.NewString(), Type: request.Type, ResourceType: request.ResourceType, ResourceID: request.ResourceID, Status: string(Queued), Phase: "queued", CreatedAt: now, UpdatedAt: now, Input: input}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Job{}, false, err
 	}
 	defer tx.Rollback()
+	if request.IdempotencyKey != "" {
+		existing, lookupErr := byIdempotencyTx(tx, request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey)
+		if lookupErr == nil {
+			if !sameCreateRequest(existing, request, input) {
+				return Job{}, false, ErrIdempotency
+			}
+			if finalize != nil {
+				if err = finalize(tx, existing); err != nil {
+					return Job{}, false, err
+				}
+			}
+			if err = tx.Commit(); err != nil {
+				return Job{}, false, err
+			}
+			if existing.Status == string(Queued) {
+				s.signal()
+			}
+			return existing, false, nil
+		}
+		if !errors.Is(lookupErr, sql.ErrNoRows) {
+			return Job{}, false, lookupErr
+		}
+	}
+	job := Job{ID: uuid.NewString(), Type: request.Type, ResourceType: request.ResourceType, ResourceID: request.ResourceID, Status: string(Queued), Phase: "queued", CreatedAt: now, UpdatedAt: now, Input: input}
 	job.RequestedBy = request.RequestedBy
 	_, err = tx.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,idempotency_key,requested_by,input_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, job.ID, job.Type, job.ResourceType, job.ResourceID, job.Status, job.Phase, nullIfBlank(request.IdempotencyKey), nullIfBlank(request.RequestedBy), string(input), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 	if err != nil {
-		if isConstraint(err) && request.IdempotencyKey != "" {
-			_ = tx.Rollback()
-			if existing, lookupErr := s.byIdempotency(request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey); lookupErr == nil {
-				if !sameCreateRequest(existing, request, input) {
-					return Job{}, false, ErrIdempotency
-				}
-				return existing, false, nil
-			}
-		}
 		if isConstraint(err) {
 			return Job{}, false, ErrApplicationBusy
 		}
@@ -268,6 +283,11 @@ func (s *Service) CreateWithInput(request CreateRequest) (Job, bool, error) {
 	}
 	if _, err := appendEvent(tx, now, job.ID, "info", "queued", "job_queued", "Job queued"); err != nil {
 		return Job{}, false, err
+	}
+	if finalize != nil {
+		if err = finalize(tx, job); err != nil {
+			return Job{}, false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Job{}, false, err
@@ -368,8 +388,8 @@ func contains(s, sub string) bool {
 
 const jobSelectColumns = `id,type,resource_type,resource_id,status,phase,progress_percent,checkpoint_json,COALESCE(error_code,''),COALESCE(error_detail,''),COALESCE(requested_by,''),COALESCE(pause_disposition,''),input_json,attempt,created_at,updated_at`
 
-func (s *Service) byIdempotency(kind, rt, rid, key string) (Job, error) {
-	return s.scan(s.db.QueryRow(`SELECT `+jobSelectColumns+` FROM jobs WHERE type=? AND resource_type=? AND resource_id=? AND idempotency_key=?`, kind, rt, rid, key))
+func byIdempotencyTx(tx *sql.Tx, kind, resourceType, resourceID, key string) (Job, error) {
+	return scanJob(tx.QueryRow(`SELECT `+jobSelectColumns+` FROM jobs WHERE type=? AND resource_type=? AND resource_id=? AND idempotency_key=?`, kind, resourceType, resourceID, key))
 }
 func (s *Service) Get(id string) (Job, error) {
 	return s.scan(s.db.QueryRow(`SELECT `+jobSelectColumns+` FROM jobs WHERE id=?`, id))

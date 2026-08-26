@@ -24,12 +24,13 @@ const (
 )
 
 var (
-	ErrNotFound        = errors.New("auto-deploy configuration not found")
-	ErrInvalid         = errors.New("invalid auto-deploy request")
-	ErrConflict        = errors.New("auto-deploy revision conflict")
-	ErrState           = errors.New("invalid auto-deploy state transition")
-	ErrUnauthorized    = errors.New("auto-deploy actor is not authorized")
-	ErrApplicationBusy = errors.New("application has an active auto-deploy job")
+	ErrNotFound         = errors.New("auto-deploy configuration not found")
+	ErrInvalid          = errors.New("invalid auto-deploy request")
+	ErrConflict         = errors.New("auto-deploy revision conflict")
+	ErrState            = errors.New("invalid auto-deploy state transition")
+	ErrUnauthorized     = errors.New("auto-deploy actor is not authorized")
+	ErrApplicationBusy  = errors.New("application has an active auto-deploy job")
+	ErrSourceAccessLost = errors.New("auto-deploy source access lost")
 )
 
 type ConfigureRequest struct {
@@ -48,6 +49,12 @@ type Status struct {
 	ControllerID               string
 	BindingID                  string
 	SubscriptionID             string
+	SourceConnectionID         string
+	InstallationID             int64
+	RepositoryID               int64
+	TrackedBranch              string
+	TrackedRef                 string
+	SourceScopeActive          bool
 	State                      string
 	LastConsumedGeneration     uint64
 	LatestResolvedGeneration   uint64

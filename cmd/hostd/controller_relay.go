@@ -9,6 +9,7 @@ import (
 
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controllerrelay"
+	"github.com/hostd/hostd/internal/relay/protocol"
 )
 
 const controllerRelayShutdownTimeout = 10 * time.Second
@@ -60,11 +61,20 @@ func waitForControllerRelay(done <-chan struct{}, timeout time.Duration, logger 
 	return false
 }
 
-func newControllerRelayRunner(cfg config.Config, db *sql.DB, logger *slog.Logger) (controllerRelayRunner, error) {
+func newControllerRelayRunner(cfg config.Config, db *sql.DB, logger *slog.Logger, wake ...func()) (controllerRelayRunner, error) {
 	if !cfg.ControllerRelay || db == nil || logger == nil {
 		return nil, errors.New("controller relay is unavailable")
 	}
 	repository := controllerrelay.NewRepository(db)
+	var wakeCoordinator func()
+	if len(wake) > 0 {
+		wakeCoordinator = wake[0]
+	}
+	reconcileCoordinator := wakeCoordinator
+	if len(wake) > 1 {
+		reconcileCoordinator = wake[1]
+	}
+	store := &controllerRelayWakeStore{repository: repository, wake: wakeCoordinator}
 	credentials, err := controllerrelay.NewFileCredentialStore(cfg.DataRoot)
 	if err != nil {
 		return nil, err
@@ -75,11 +85,12 @@ func newControllerRelayRunner(cfg config.Config, db *sql.DB, logger *slog.Logger
 	}
 	transportConfig := controllerrelay.DefaultSessionTransportConfig()
 	transportConfig.ControlHandler = controls
-	transport, err := controllerrelay.NewSessionTransport(cfg.RelayOrigin, repository, credentials, nil, nil, transportConfig)
+	transport, err := controllerrelay.NewSessionTransport(cfg.RelayOrigin, store, credentials, nil, nil, transportConfig)
 	if err != nil {
 		return nil, err
 	}
 	supervisorConfig := controllerrelay.DefaultSupervisorConfig()
+	supervisorConfig.OnReady = reconcileCoordinator
 	var supervisor *controllerrelay.Supervisor
 	supervisorConfig.Observer = func(_ context.Context, event controllerrelay.SupervisorEvent) error {
 		snapshot := controllerrelay.SupervisorSnapshot{}
@@ -94,6 +105,67 @@ func newControllerRelayRunner(cfg config.Config, db *sql.DB, logger *slog.Logger
 		return nil, err
 	}
 	return supervisor, nil
+}
+
+// controllerRelayWakeStore preserves the complete durable/fenced session-store
+// contract. A wake is emitted only after a durable source ACK decision returns;
+// it is never emitted before the repository transaction commits.
+type controllerRelayWakeStore struct {
+	repository controllerRelaySessionStore
+	wake       func()
+}
+
+type controllerRelaySessionStore interface {
+	SessionAuthenticationCandidates(context.Context) (controllerrelay.ControllerIdentity, []controllerrelay.ControllerKey, error)
+	DurableACKState(context.Context, string) ([]protocol.ACKState, error)
+	PrepareSubscriptionSync(context.Context, string, string, time.Time) (controllerrelay.SyncSnapshot, error)
+	AcknowledgeSubscriptionSync(context.Context, string, string, uint64, uint32, time.Time) error
+	CommitSourceDesired(context.Context, string, protocol.SourceDesired, time.Time) (controllerrelay.InboxDecision, error)
+	CommitAccessChange(context.Context, string, protocol.AccessChange, time.Time) (controllerrelay.InboxDecision, error)
+	CommitSourceDesiredFenced(context.Context, string, uint64, uint64, protocol.SourceDesired, time.Time) (controllerrelay.InboxDecision, error)
+	CommitAccessChangeFenced(context.Context, string, uint64, uint64, protocol.AccessChange, time.Time) (controllerrelay.InboxDecision, error)
+}
+
+func (store *controllerRelayWakeStore) SessionAuthenticationCandidates(ctx context.Context) (controllerrelay.ControllerIdentity, []controllerrelay.ControllerKey, error) {
+	return store.repository.SessionAuthenticationCandidates(ctx)
+}
+
+func (store *controllerRelayWakeStore) DurableACKState(ctx context.Context, controllerID string) ([]protocol.ACKState, error) {
+	return store.repository.DurableACKState(ctx, controllerID)
+}
+
+func (store *controllerRelayWakeStore) PrepareSubscriptionSync(ctx context.Context, controllerID, messageID string, at time.Time) (controllerrelay.SyncSnapshot, error) {
+	return store.repository.PrepareSubscriptionSync(ctx, controllerID, messageID, at)
+}
+
+func (store *controllerRelayWakeStore) AcknowledgeSubscriptionSync(ctx context.Context, controllerID, messageID string, generation uint64, count uint32, at time.Time) error {
+	return store.repository.AcknowledgeSubscriptionSync(ctx, controllerID, messageID, generation, count, at)
+}
+
+func (store *controllerRelayWakeStore) CommitSourceDesired(ctx context.Context, controllerID string, source protocol.SourceDesired, at time.Time) (controllerrelay.InboxDecision, error) {
+	decision, err := store.repository.CommitSourceDesired(ctx, controllerID, source, at)
+	store.wakeAfterACK(decision, err)
+	return decision, err
+}
+
+func (store *controllerRelayWakeStore) CommitAccessChange(ctx context.Context, controllerID string, change protocol.AccessChange, at time.Time) (controllerrelay.InboxDecision, error) {
+	return store.repository.CommitAccessChange(ctx, controllerID, change, at)
+}
+
+func (store *controllerRelayWakeStore) CommitSourceDesiredFenced(ctx context.Context, controllerID string, epoch, fence uint64, source protocol.SourceDesired, at time.Time) (controllerrelay.InboxDecision, error) {
+	decision, err := store.repository.CommitSourceDesiredFenced(ctx, controllerID, epoch, fence, source, at)
+	store.wakeAfterACK(decision, err)
+	return decision, err
+}
+
+func (store *controllerRelayWakeStore) CommitAccessChangeFenced(ctx context.Context, controllerID string, epoch, fence uint64, change protocol.AccessChange, at time.Time) (controllerrelay.InboxDecision, error) {
+	return store.repository.CommitAccessChangeFenced(ctx, controllerID, epoch, fence, change, at)
+}
+
+func (store *controllerRelayWakeStore) wakeAfterACK(decision controllerrelay.InboxDecision, err error) {
+	if err == nil && decision.Kind == controllerrelay.DecisionAck && store.wake != nil {
+		store.wake()
+	}
 }
 
 func logControllerRelayEvent(logger *slog.Logger, event controllerrelay.SupervisorEvent, snapshot controllerrelay.SupervisorSnapshot) {

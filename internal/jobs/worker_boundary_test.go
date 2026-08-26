@@ -2,10 +2,12 @@ package jobs
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,6 +124,109 @@ func TestIdempotentReplayRequiresIdenticalActorAndSealedInput(t *testing.T) {
 	differentRelease.Input = DeploymentInput{ReleaseID: uuid.NewString(), ConfigurationMode: ConfigurationOriginal}
 	if _, _, err := service.CreateWithInput(differentRelease); !errors.Is(err, ErrIdempotency) {
 		t.Fatalf("release mismatch error = %v", err)
+	}
+}
+
+func TestCreateWithInputFinalizedRollsBackJobEventAndWakeTogether(t *testing.T) {
+	service, closeDB := newTestService(t)
+	defer closeDB()
+	request := CreateRequest{Type: "deploy", ResourceType: "application", ResourceID: "one", IdempotencyKey: "atomic-finalize", RequestedBy: "owner", Input: DeploymentInput{ConfigurationMode: ConfigurationCurrent}}
+	finalizeErr := errors.New("link failed")
+	var rolledBackID string
+	_, _, err := service.CreateWithInputFinalized(request, func(tx *sql.Tx, job Job) error {
+		rolledBackID = job.ID
+		var count int
+		if queryErr := tx.QueryRow(`SELECT COUNT(*) FROM job_events WHERE job_id=? AND code='job_queued'`, job.ID).Scan(&count); queryErr != nil || count != 1 {
+			t.Fatalf("queued event was not visible in finalize tx count=%d err=%v", count, queryErr)
+		}
+		return finalizeErr
+	})
+	if !errors.Is(err, finalizeErr) {
+		t.Fatalf("finalize error=%v", err)
+	}
+	if _, err = service.Get(rolledBackID); !errors.Is(err, sql.ErrNoRows) && !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("rolled-back job remains: %v", err)
+	}
+	var jobsCount, eventsCount int
+	if err = service.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE idempotency_key=?`, request.IdempotencyKey).Scan(&jobsCount); err != nil {
+		t.Fatal(err)
+	}
+	if err = service.db.QueryRow(`SELECT COUNT(*) FROM job_events WHERE job_id=?`, rolledBackID).Scan(&eventsCount); err != nil {
+		t.Fatal(err)
+	}
+	if jobsCount != 0 || eventsCount != 0 || len(service.wake) != 0 {
+		t.Fatalf("partial finalize jobs=%d events=%d wake=%d", jobsCount, eventsCount, len(service.wake))
+	}
+
+	finalizeCalls := 0
+	created, wasCreated, err := service.CreateWithInputFinalized(request, func(_ *sql.Tx, job Job) error {
+		finalizeCalls++
+		if job.RequestedBy != request.RequestedBy {
+			t.Fatalf("finalize actor=%q", job.RequestedBy)
+		}
+		return nil
+	})
+	if err != nil || !wasCreated || len(service.wake) != 1 {
+		t.Fatalf("committed create=%#v created=%t err=%v wake=%d", created, wasCreated, err, len(service.wake))
+	}
+	<-service.wake
+	replayed, wasCreated, err := service.CreateWithInputFinalized(request, func(_ *sql.Tx, job Job) error {
+		finalizeCalls++
+		if job.ID != created.ID {
+			t.Fatalf("replay finalizer job=%q want=%q", job.ID, created.ID)
+		}
+		return nil
+	})
+	if err != nil || wasCreated || replayed.ID != created.ID || finalizeCalls != 2 || len(service.wake) != 1 {
+		t.Fatalf("replay=%#v created=%t calls=%d wake=%d err=%v", replayed, wasCreated, finalizeCalls, len(service.wake), err)
+	}
+	events, err := service.Events(created.ID, 0)
+	if err != nil || countEvents(events, "job_queued") != 1 {
+		t.Fatalf("replay queued events=%#v err=%v", events, err)
+	}
+}
+
+func TestCreateWithInputFinalizedConcurrentReplayFinalizesOneJob(t *testing.T) {
+	service, closeDB := newTestService(t)
+	defer closeDB()
+	request := CreateRequest{Type: "deploy", ResourceType: "application", ResourceID: "one", IdempotencyKey: "atomic-race", RequestedBy: "owner", Input: DeploymentInput{ConfigurationMode: ConfigurationCurrent}}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	finalize := func(_ *sql.Tx, _ Job) error {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	type result struct {
+		job     Job
+		created bool
+		err     error
+	}
+	results := make(chan result, 2)
+	go func() {
+		job, created, err := service.CreateWithInputFinalized(request, finalize)
+		results <- result{job: job, created: created, err: err}
+	}()
+	<-entered
+	go func() {
+		job, created, err := service.CreateWithInputFinalized(request, finalize)
+		results <- result{job: job, created: created, err: err}
+	}()
+	close(release)
+	first, second := <-results, <-results
+	if first.err != nil || second.err != nil || first.job.ID == "" || first.job.ID != second.job.ID || first.created == second.created || calls.Load() != 2 {
+		t.Fatalf("concurrent results first=%#v second=%#v calls=%d", first, second, calls.Load())
+	}
+	var count int
+	if err := service.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE idempotency_key=?`, request.IdempotencyKey).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("job count=%d err=%v", count, err)
+	}
+	events, err := service.Events(first.job.ID, 0)
+	if err != nil || countEvents(events, "job_queued") != 1 {
+		t.Fatalf("events=%#v err=%v", events, err)
 	}
 }
 

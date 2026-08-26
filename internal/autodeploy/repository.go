@@ -204,6 +204,8 @@ const claimDueACKCandidateSQL = `SELECT application_id,due_at FROM (
 	  AND s.controller_id=h.controller_id AND s.subscription_id=h.subscription_id AND s.state='active'
 	  AND a.controller_id=h.controller_id AND a.subscription_id=h.subscription_id
 	  AND a.generation>h.last_consumed_generation
+	  AND NOT (h.state='paused' AND h.pause_code='source_access_lost')
+	  AND (h.last_reconciled_at IS NULL OR h.last_reconciled_at<=?2)
 	  AND (h.lease_token IS NULL OR h.lease_expires_at<=?1)
 	ORDER BY a.received_at,h.application_id LIMIT 1
 )`
@@ -233,6 +235,8 @@ const claimDueCandidateSQL = `WITH due_candidates(application_id,due_at) AS (
 		FROM github_auto_deploy_heads AS h INDEXED BY github_auto_deploy_unresolved_due
 		JOIN github_auto_deploy_configs AS c ON c.application_id=h.application_id AND c.revision=h.config_revision AND c.enabled=1
 		WHERE h.latest_resolved_generation<h.last_consumed_generation
+		  AND NOT (h.state='paused' AND h.pause_code='source_access_lost')
+		  AND (h.last_reconciled_at IS NULL OR h.last_reconciled_at<=?2)
 		  AND (h.lease_token IS NULL OR h.lease_expires_at<=?1)
 		ORDER BY h.updated_at,h.application_id LIMIT 1
 	)
@@ -242,6 +246,7 @@ const claimDueCandidateSQL = `WITH due_candidates(application_id,due_at) AS (
 		FROM github_auto_deploy_heads AS h INDEXED BY github_auto_deploy_reconcile_due
 		JOIN github_auto_deploy_configs AS c ON c.application_id=h.application_id AND c.revision=h.config_revision AND c.enabled=1
 		WHERE h.next_reconcile_at IS NOT NULL AND h.next_reconcile_at<=?1
+		  AND (h.last_reconciled_at IS NULL OR h.last_reconciled_at<=?2)
 		  AND (h.lease_token IS NULL OR h.lease_expires_at<=?1)
 		ORDER BY h.next_reconcile_at,h.application_id LIMIT 1
 	)
@@ -251,6 +256,7 @@ const claimDueCandidateSQL = `WITH due_candidates(application_id,due_at) AS (
 		FROM github_auto_deploy_heads AS h INDEXED BY github_auto_deploy_retry_due
 		JOIN github_auto_deploy_configs AS c ON c.application_id=h.application_id AND c.revision=h.config_revision AND c.enabled=1
 		WHERE h.state='retry_wait' AND h.next_retry_at<=?1
+		  AND (h.last_reconciled_at IS NULL OR h.last_reconciled_at<=?2)
 		  AND (h.lease_token IS NULL OR h.lease_expires_at<=?1)
 		ORDER BY h.next_retry_at,h.application_id LIMIT 1
 	)
@@ -261,7 +267,20 @@ JOIN github_auto_deploy_heads AS h ON h.application_id=d.application_id
 ORDER BY d.due_at,d.application_id LIMIT 1`
 
 func (r *Repository) ClaimDue(ctx context.Context, token string, now time.Time, ttl time.Duration) (Status, WorkLease, error) {
-	if ctx == nil || !canonicalUUID(token) || now.IsZero() || ttl < time.Second || ttl > maxLeaseTTL {
+	return r.claimDue(ctx, token, now, ttl, now)
+}
+
+// ClaimDueWithResolveCutoff leaves newer ACK generations unconsumed until the
+// persisted authoritative-resolution cooldown is eligible.
+func (r *Repository) ClaimDueWithResolveCutoff(ctx context.Context, token string, now time.Time, ttl time.Duration, resolveCutoff time.Time) (Status, WorkLease, error) {
+	if resolveCutoff.IsZero() || resolveCutoff.After(now) || now.Sub(resolveCutoff) > 24*time.Hour {
+		return Status{}, WorkLease{}, ErrInvalid
+	}
+	return r.claimDue(ctx, token, now, ttl, resolveCutoff)
+}
+
+func (r *Repository) claimDue(ctx context.Context, token string, now time.Time, ttl time.Duration, resolveCutoff time.Time) (Status, WorkLease, error) {
+	if ctx == nil || !canonicalUUID(token) || now.IsZero() || resolveCutoff.IsZero() || ttl < time.Second || ttl > maxLeaseTTL {
 		return Status{}, WorkLease{}, ErrInvalid
 	}
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -272,7 +291,7 @@ func (r *Repository) ClaimDue(ctx context.Context, token string, now time.Time, 
 	stamp, expires := timestamp(now), timestamp(now.Add(ttl))
 	var applicationID string
 	var revision, fence int64
-	err = tx.QueryRowContext(ctx, claimDueCandidateSQL, stamp).Scan(&applicationID, &revision, &fence)
+	err = tx.QueryRowContext(ctx, claimDueCandidateSQL, stamp, timestamp(resolveCutoff)).Scan(&applicationID, &revision, &fence)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Status{}, WorkLease{}, ErrNotFound
 	}
@@ -367,7 +386,102 @@ func (r *Repository) RecoverExpiredLeases(ctx context.Context, now time.Time, li
 	return recovered, nil
 }
 
-func (r *Repository) ObserveNewestACK(ctx context.Context, lease WorkLease, at time.Time) (SourceACKHead, error) {
+// ForceReconcile makes a bounded set of enabled configurations immediately
+// eligible for authoritative source reconciliation. It deliberately preserves
+// coordinator state, including pauses, and does not disturb live leases.
+func (r *Repository) ForceReconcile(ctx context.Context, now time.Time, limit int) (int, error) {
+	return r.ForceReconcileEligible(ctx, now, now, limit, true)
+}
+
+// ForceReconcileEligible rearms only idle, unlinked work. Ready signals obey
+// the persisted resolution cooldown; startup may rearm a crash-recovery row
+// even while its prior lease remains live, without modifying that lease.
+func (r *Repository) ForceReconcileEligible(ctx context.Context, now, resolveCutoff time.Time, limit int, startup bool) (int, error) {
+	if ctx == nil || now.IsZero() || resolveCutoff.IsZero() || resolveCutoff.After(now) || now.Sub(resolveCutoff) > 24*time.Hour || limit < 1 || limit > maxListLimit {
+		return 0, ErrInvalid
+	}
+	stamp := timestamp(now)
+	result, err := r.db.ExecContext(ctx, `UPDATE github_auto_deploy_heads
+		SET next_reconcile_at=?,updated_at=?
+		WHERE application_id IN (
+			SELECT h.application_id
+			FROM github_auto_deploy_heads h
+			JOIN github_auto_deploy_configs c ON c.application_id=h.application_id AND c.revision=h.config_revision
+			WHERE c.enabled=1 AND h.state='idle' AND h.active_job_id IS NULL
+			  AND (h.next_reconcile_at IS NULL OR h.next_reconcile_at>?)
+			  AND (? OR h.last_reconciled_at IS NULL OR h.last_reconciled_at<=?)
+			ORDER BY h.application_id LIMIT ?
+		)`, stamp, stamp, stamp, startup, timestamp(resolveCutoff), limit)
+	if err != nil {
+		return 0, classifyConstraint(err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(changed), nil
+}
+
+// DeferReconcile records a bounded future reconciliation time without changing
+// deployment or pause state. It prevents provider/access failures from turning
+// a durable pause into a hot loop.
+func (r *Repository) DeferReconcile(ctx context.Context, lease WorkLease, nextReconcileAt, at time.Time) error {
+	if !validLease(lease) || at.IsZero() || !nextReconcileAt.After(at) || nextReconcileAt.Sub(at) > 24*time.Hour {
+		return ErrInvalid
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := requireLease(ctx, tx, lease, at); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET resolving_generation=NULL,resolving_lease_fence=NULL,next_reconcile_at=?,updated_at=?
+		WHERE application_id=? AND config_revision=? AND lease_fence=? AND lease_token=? AND state<>'disabled'`, timestamp(nextReconcileAt), timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token)
+	if err = mutationResult(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CountRecentProviderFailures returns only a bounded aggregate. It does not
+// expose job input, source identity, or provider diagnostics to the coordinator.
+func (r *Repository) CountRecentProviderFailures(ctx context.Context, lease WorkLease, since, at time.Time) (uint32, error) {
+	if !validLease(lease) || since.IsZero() || at.IsZero() || since.After(at) || at.Sub(since) > 24*time.Hour {
+		return 0, ErrInvalid
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if err = requireLease(ctx, tx, lease, at); err != nil {
+		return 0, err
+	}
+	var count int64
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM (
+		SELECT 1 FROM jobs j JOIN github_auto_deploy_configs c ON c.application_id=j.resource_id
+		WHERE j.resource_type='application' AND j.resource_id=? AND j.type='deploy' AND j.requested_by=c.source_owner_user_id
+		  AND j.status IN ('failed','cancelled','interrupted','needs_attention') AND j.error_code='provider_unavailable'
+		  AND j.updated_at>=? AND j.updated_at<=? LIMIT 500
+	)`, lease.ApplicationID, timestamp(since), timestamp(at)).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	if count < 0 || count > math.MaxUint32 {
+		return 0, ErrState
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return uint32(count), nil
+}
+
+// PeekNewestACK returns the newest durable ACK without consuming it. It lets
+// the coordinator decide whether a provider call is needed before reserving
+// the durable cooldown.
+func (r *Repository) PeekNewestACK(ctx context.Context, lease WorkLease, at time.Time) (SourceACKHead, error) {
 	if !validLease(lease) || at.IsZero() {
 		return SourceACKHead{}, ErrInvalid
 	}
@@ -379,12 +493,23 @@ func (r *Repository) ObserveNewestACK(ctx context.Context, lease WorkLease, at t
 	if err = requireLease(ctx, tx, lease, at); err != nil {
 		return SourceACKHead{}, err
 	}
+	head, err := loadNewestACKTx(ctx, tx, lease.ApplicationID)
+	if err != nil {
+		return SourceACKHead{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return SourceACKHead{}, err
+	}
+	return head, nil
+}
+
+func loadNewestACKTx(ctx context.Context, tx *sql.Tx, applicationID string) (SourceACKHead, error) {
 	var head SourceACKHead
 	var generation int64
 	var observed, received string
-	err = tx.QueryRowContext(ctx, `SELECT a.controller_id,a.subscription_id,a.delivery_id,a.generation,a.installation_id,a.repository_id,a.tracked_ref,a.observed_sha,a.observed_at,a.received_at
+	err := tx.QueryRowContext(ctx, `SELECT a.controller_id,a.subscription_id,a.delivery_id,a.generation,a.installation_id,a.repository_id,a.tracked_ref,a.observed_sha,a.observed_at,a.received_at
 		FROM github_auto_deploy_heads h JOIN relay_source_ack_heads a ON a.controller_id=h.controller_id AND a.subscription_id=h.subscription_id
-		WHERE h.application_id=?`, lease.ApplicationID).Scan(&head.ControllerID, &head.SubscriptionID, &head.DeliveryID, &generation, &head.InstallationID, &head.RepositoryID, &head.Ref, &head.ObservedSHA, &observed, &received)
+		WHERE h.application_id=?`, applicationID).Scan(&head.ControllerID, &head.SubscriptionID, &head.DeliveryID, &generation, &head.InstallationID, &head.RepositoryID, &head.Ref, &head.ObservedSHA, &observed, &received)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SourceACKHead{}, ErrNotFound
 	}
@@ -398,21 +523,49 @@ func (r *Repository) ObserveNewestACK(ctx context.Context, lease WorkLease, at t
 	if head.ReceivedAt, err = parseTimestamp(received); err != nil {
 		return SourceACKHead{}, err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET last_consumed_generation=?,updated_at=?
-		WHERE application_id=? AND config_revision=? AND lease_fence=? AND lease_token=? AND last_consumed_generation<?`, generation, timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token, generation)
-	if err != nil {
-		return SourceACKHead{}, classifyConstraint(err)
-	}
-	if _, err = result.RowsAffected(); err != nil {
-		return SourceACKHead{}, err
-	}
-	if err = tx.Commit(); err != nil {
-		return SourceACKHead{}, err
-	}
 	return head, nil
 }
 
-func (r *Repository) RecordResolvedHead(ctx context.Context, lease WorkLease, generation uint64, sha string, nextReconcileAt, at time.Time) error {
+// ReserveResolve durably binds one authoritative provider call to the current
+// configuration and lease without consuming any source generation.
+func (r *Repository) ReserveResolve(ctx context.Context, lease WorkLease, generation uint64, at time.Time) error {
+	if !validLease(lease) || generation > math.MaxInt64 || at.IsZero() {
+		return ErrInvalid
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = requireLease(ctx, tx, lease, at); err != nil {
+		return err
+	}
+	if err = requireResolveScope(ctx, tx, lease, generation); err != nil {
+		if !errors.Is(err, ErrSourceAccessLost) {
+			return err
+		}
+		if err = pauseSourceAccessLostTx(ctx, tx, lease, at); err != nil {
+			return err
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+		return ErrSourceAccessLost
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
+		SET resolving_generation=?,resolving_lease_fence=?,last_reconciled_at=?,updated_at=?
+		WHERE application_id=? AND config_revision=? AND lease_fence=? AND lease_token=?
+		  AND last_consumed_generation<=? AND latest_resolved_generation<=?`, generation, lease.Fence, timestamp(at), timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token, generation, generation)
+	if err = mutationResult(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// FinalizeResolvedHead consumes only the generation reserved before provider
+// I/O. Scope and compact-head checks are repeated in the same transaction;
+// newer generations remain pending and raw inbox retention is irrelevant.
+func (r *Repository) FinalizeResolvedHead(ctx context.Context, lease WorkLease, generation uint64, sha string, nextReconcileAt, at time.Time) error {
 	if !validLease(lease) || generation > math.MaxInt64 || !validSHA(sha) || nextReconcileAt.IsZero() || nextReconcileAt.Before(at) || at.IsZero() {
 		return ErrInvalid
 	}
@@ -424,36 +577,94 @@ func (r *Repository) RecordResolvedHead(ctx context.Context, lease WorkLease, ge
 	if err = requireLease(ctx, tx, lease, at); err != nil {
 		return err
 	}
+	if err = requireResolveScope(ctx, tx, lease, generation); err != nil {
+		if !errors.Is(err, ErrSourceAccessLost) {
+			return err
+		}
+		if err = pauseSourceAccessLostTx(ctx, tx, lease, at); err != nil {
+			return err
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+		return ErrSourceAccessLost
+	}
 	var consumed, currentGeneration int64
-	if err = tx.QueryRowContext(ctx, `SELECT last_consumed_generation,latest_resolved_generation FROM github_auto_deploy_heads WHERE application_id=?`, lease.ApplicationID).Scan(&consumed, &currentGeneration); err != nil {
-		return err
-	}
-	if generation != uint64(consumed) || generation < uint64(currentGeneration) {
-		return ErrState
-	}
+	var reservedGeneration, reservedFence sql.NullInt64
 	var state, pausedSHA string
 	var activeJob sql.NullString
-	if err = tx.QueryRowContext(ctx, `SELECT state,COALESCE(paused_sha,''),active_job_id FROM github_auto_deploy_heads WHERE application_id=?`, lease.ApplicationID).Scan(&state, &pausedSHA, &activeJob); err != nil {
+	err = tx.QueryRowContext(ctx, `SELECT last_consumed_generation,latest_resolved_generation,resolving_generation,resolving_lease_fence,state,COALESCE(paused_sha,''),active_job_id
+		FROM github_auto_deploy_heads WHERE application_id=?`, lease.ApplicationID).Scan(&consumed, &currentGeneration, &reservedGeneration, &reservedFence, &state, &pausedSHA, &activeJob)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrState
+	}
+	if err != nil {
 		return err
+	}
+	if !reservedGeneration.Valid || !reservedFence.Valid || uint64(reservedGeneration.Int64) != generation || uint64(reservedFence.Int64) != lease.Fence || generation < uint64(consumed) || generation < uint64(currentGeneration) {
+		return ErrState
 	}
 	resumeNewHead := state == StatePaused && !activeJob.Valid && sha != pausedSHA
 	result, err := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
-		SET latest_resolved_generation=?,latest_resolved_sha=?,last_reconciled_at=?,next_reconcile_at=?,
-			state=CASE WHEN ? THEN 'idle' ELSE state END,
-			pause_code=CASE WHEN ? THEN NULL ELSE pause_code END,
-			paused_sha=CASE WHEN ? THEN NULL ELSE paused_sha END,
-			updated_at=?
-		WHERE application_id=? AND config_revision=? AND lease_fence=? AND lease_token=?`, generation, sha, timestamp(at), timestamp(nextReconcileAt), resumeNewHead, resumeNewHead, resumeNewHead, timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token)
-	if err != nil {
-		return classifyConstraint(err)
-	}
-	if changed, rowsErr := result.RowsAffected(); rowsErr != nil || changed != 1 {
-		if rowsErr != nil {
-			return rowsErr
-		}
-		return ErrState
+		SET last_consumed_generation=?,latest_resolved_generation=?,latest_resolved_sha=?,resolving_generation=NULL,resolving_lease_fence=NULL,
+			last_reconciled_at=?,next_reconcile_at=?,state=CASE WHEN ? THEN 'idle' ELSE state END,
+			pause_code=CASE WHEN ? THEN NULL ELSE pause_code END,paused_sha=CASE WHEN ? THEN NULL ELSE paused_sha END,updated_at=?
+		WHERE application_id=? AND config_revision=? AND lease_fence=? AND lease_token=?
+		  AND resolving_generation=? AND resolving_lease_fence=? AND last_consumed_generation=?`, generation, generation, sha, timestamp(at), timestamp(nextReconcileAt), resumeNewHead, resumeNewHead, resumeNewHead, timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token, generation, lease.Fence, consumed)
+	if err = mutationResult(result, err); err != nil {
+		return err
 	}
 	return tx.Commit()
+}
+
+func requireResolveScope(ctx context.Context, tx *sql.Tx, lease WorkLease, generation uint64) error {
+	return requireCurrentSourceScope(ctx, tx, lease.ApplicationID, lease.ConfigRevision, generation)
+}
+
+func requireCurrentSourceScope(ctx context.Context, tx *sql.Tx, applicationID string, configRevision, generation uint64) error {
+	var compactGeneration sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT ack.generation
+		FROM github_auto_deploy_heads h
+		JOIN github_auto_deploy_configs c ON c.application_id=h.application_id AND c.revision=h.config_revision AND c.enabled=1
+		JOIN applications a ON a.id=c.application_id AND a.archived_at IS NULL
+		JOIN application_sources src ON src.application_id=c.application_id AND src.source_type='github'
+		JOIN source_connections sc ON sc.id=src.connection_id AND sc.owner_user_id=c.source_owner_user_id AND sc.status='connected'
+		JOIN relay_installation_bindings b ON b.binding_id=c.binding_id AND b.owner_user_id=c.source_owner_user_id
+			AND b.connection_id=src.connection_id AND b.controller_id=c.controller_id
+			AND b.installation_id=src.installation_id AND b.repository_id=src.repository_id AND b.state='authorized'
+		JOIN relay_controllers rc ON rc.controller_id=c.controller_id AND rc.state='active'
+		JOIN relay_controller_subscriptions sub ON sub.subscription_id=c.subscription_id AND sub.controller_id=c.controller_id
+			AND sub.owner_user_id=c.source_owner_user_id AND sub.binding_id=c.binding_id
+			AND sub.installation_id=src.installation_id AND sub.repository_id=src.repository_id
+			AND sub.tracked_ref=src.tracked_ref AND sub.state='active'
+		LEFT JOIN relay_source_ack_heads ack ON ack.controller_id=c.controller_id AND ack.subscription_id=c.subscription_id
+		WHERE h.application_id=? AND h.config_revision=? AND h.controller_id=c.controller_id AND h.subscription_id=c.subscription_id`, applicationID, configRevision).Scan(&compactGeneration)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrSourceAccessLost
+	}
+	if err != nil {
+		return err
+	}
+	if generation > 0 && (!compactGeneration.Valid || uint64(compactGeneration.Int64) < generation) {
+		return ErrState
+	}
+	return nil
+}
+
+func pauseSourceAccessLostTx(ctx context.Context, tx *sql.Tx, lease WorkLease, at time.Time) error {
+	result, err := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
+		SET state='paused',pause_code='source_access_lost',paused_sha=COALESCE(active_sha,prepared_dispatch_sha,latest_resolved_sha,
+			(SELECT resolved_sha FROM application_sources WHERE application_id=github_auto_deploy_heads.application_id AND source_type='github')),
+			prepared_dispatch_sequence=NULL,prepared_dispatch_generation=NULL,prepared_dispatch_sha=NULL,
+			resolving_generation=NULL,resolving_lease_fence=NULL,retry_attempt=0,next_retry_at=NULL,next_reconcile_at=NULL,
+			next_job_poll_at=CASE WHEN active_job_id IS NOT NULL THEN ? ELSE NULL END,
+			lease_fence=lease_fence+1,lease_token=NULL,lease_expires_at=NULL,updated_at=?
+		WHERE application_id=? AND config_revision=? AND lease_fence=? AND lease_token=? AND lease_expires_at=?
+		  AND lease_fence<? AND state<>'disabled'
+		  AND COALESCE(active_sha,prepared_dispatch_sha,latest_resolved_sha,
+			(SELECT resolved_sha FROM application_sources WHERE application_id=github_auto_deploy_heads.application_id AND source_type='github')) IS NOT NULL`,
+		timestamp(at), timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token, timestamp(lease.ExpiresAt), int64(math.MaxInt64))
+	return mutationResult(result, err)
 }
 
 func (r *Repository) PrepareDispatch(ctx context.Context, lease WorkLease, at time.Time) (PreparedDispatch, error) {
@@ -516,8 +727,8 @@ func (r *Repository) PrepareDispatch(ctx context.Context, lease WorkLease, at ti
 	return PreparedDispatch{ApplicationID: lease.ApplicationID, Sequence: uint64(sequence), Generation: uint64(resolvedGeneration), SHA: resolvedSHA.String}, nil
 }
 
-func (r *Repository) LinkDispatchJob(ctx context.Context, lease WorkLease, sequence uint64, jobID string, at time.Time) error {
-	if !validLease(lease) || sequence == 0 || sequence > math.MaxInt64 || !validOpaqueID(jobID) || at.IsZero() {
+func (r *Repository) LinkDispatchJob(ctx context.Context, lease WorkLease, sequence, generation uint64, jobID string, at time.Time) error {
+	if !validLease(lease) || sequence == 0 || sequence > math.MaxInt64 || generation > math.MaxInt64 || !validOpaqueID(jobID) || at.IsZero() {
 		return ErrInvalid
 	}
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -525,7 +736,23 @@ func (r *Repository) LinkDispatchJob(ctx context.Context, lease WorkLease, seque
 		return err
 	}
 	defer tx.Rollback()
-	if err = requireLease(ctx, tx, lease, at); err != nil {
+	if err = r.LinkDispatchJobTx(ctx, tx, lease, sequence, generation, jobID, at); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// LinkDispatchJobTx validates and links an exact coordinator job using the
+// caller's transaction. Existing linkage is idempotent only while the exact
+// same job and dispatch remain actively deploying.
+func (r *Repository) LinkDispatchJobTx(ctx context.Context, tx *sql.Tx, lease WorkLease, sequence, generation uint64, jobID string, at time.Time) error {
+	if ctx == nil || tx == nil || !validLease(lease) || sequence == 0 || sequence > math.MaxInt64 || generation > math.MaxInt64 || !validOpaqueID(jobID) || at.IsZero() {
+		return ErrInvalid
+	}
+	if err := requireLease(ctx, tx, lease, at); err != nil {
+		return err
+	}
+	if err := requireCurrentSourceScope(ctx, tx, lease.ApplicationID, lease.ConfigRevision, 0); err != nil {
 		return err
 	}
 	job, err := loadCoordinatorJobTx(ctx, tx, lease.ApplicationID, lease.ConfigRevision, sequence, jobID)
@@ -535,11 +762,24 @@ func (r *Repository) LinkDispatchJob(ctx context.Context, lease WorkLease, seque
 	if err != nil {
 		return err
 	}
+	var state, activeJob, activeSHA, preparedSHA string
+	var activeSequence, activeGeneration, preparedSequence, preparedGeneration sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT state,COALESCE(active_job_id,''),active_dispatch_sequence,active_generation,COALESCE(active_sha,''),prepared_dispatch_sequence,prepared_dispatch_generation,COALESCE(prepared_dispatch_sha,'')
+		FROM github_auto_deploy_heads WHERE application_id=?`, lease.ApplicationID).Scan(&state, &activeJob, &activeSequence, &activeGeneration, &activeSHA, &preparedSequence, &preparedGeneration, &preparedSHA)
+	if err != nil {
+		return err
+	}
+	if state == StateDeploying && activeJob == jobID && activeSequence.Valid && activeGeneration.Valid && activeSequence.Int64 == int64(sequence) && activeGeneration.Int64 == int64(generation) {
+		return nil
+	}
+	if state != StateDispatching || activeJob != "" || activeSHA != "" || !preparedSequence.Valid || !preparedGeneration.Valid || preparedSequence.Int64 != int64(sequence) || preparedGeneration.Int64 != int64(generation) || preparedSHA == "" {
+		return ErrState
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
 		SET state='deploying',pause_code=NULL,paused_sha=NULL,
 			active_job_id=?,active_dispatch_sequence=prepared_dispatch_sequence,active_generation=prepared_dispatch_generation,active_sha=prepared_dispatch_sha,
 			prepared_dispatch_sequence=NULL,prepared_dispatch_generation=NULL,prepared_dispatch_sha=NULL,next_job_poll_at=?,updated_at=?
-		WHERE application_id=? AND config_revision=? AND lease_fence=? AND lease_token=? AND state='dispatching' AND prepared_dispatch_sequence=?`, jobID, timestamp(at), timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token, sequence)
+		WHERE application_id=? AND config_revision=? AND lease_fence=? AND lease_token=? AND state='dispatching' AND prepared_dispatch_sequence=? AND prepared_dispatch_generation=?`, jobID, timestamp(at), timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token, sequence, generation)
 	if err != nil {
 		return classifyConstraint(err)
 	}
@@ -552,7 +792,7 @@ func (r *Repository) LinkDispatchJob(ctx context.Context, lease WorkLease, seque
 	if err = applyJobStateTx(ctx, tx, lease.ApplicationID, job, at); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 // RefreshActiveJob derives coordinator state from jobs without mutating the
@@ -609,10 +849,13 @@ func (r *Repository) Pause(ctx context.Context, lease WorkLease, code string, at
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
-		SET state='paused',pause_code=?,paused_sha=COALESCE(active_sha,prepared_dispatch_sha,latest_resolved_sha),
-			prepared_dispatch_sequence=NULL,prepared_dispatch_generation=NULL,prepared_dispatch_sha=NULL,retry_attempt=0,next_retry_at=NULL,updated_at=?
+		SET state='paused',pause_code=?,paused_sha=COALESCE(active_sha,prepared_dispatch_sha,latest_resolved_sha,
+			(SELECT resolved_sha FROM application_sources WHERE application_id=github_auto_deploy_heads.application_id AND source_type='github')),
+			prepared_dispatch_sequence=NULL,prepared_dispatch_generation=NULL,prepared_dispatch_sha=NULL,resolving_generation=NULL,resolving_lease_fence=NULL,
+			retry_attempt=0,next_retry_at=NULL,updated_at=?
 		WHERE application_id=? AND config_revision=? AND lease_fence=? AND lease_token=? AND state IN ('idle','dispatching','deploying','retry_wait')
-		  AND COALESCE(active_sha,prepared_dispatch_sha,latest_resolved_sha) IS NOT NULL`, code, timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token)
+		  AND COALESCE(active_sha,prepared_dispatch_sha,latest_resolved_sha,
+			(SELECT resolved_sha FROM application_sources WHERE application_id=github_auto_deploy_heads.application_id AND source_type='github')) IS NOT NULL`, code, timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token)
 	if err = mutationResult(result, err); err != nil {
 		return err
 	}
@@ -633,8 +876,11 @@ func (r *Repository) ScheduleRetry(ctx context.Context, lease WorkLease, nextRet
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
 		SET state='retry_wait',prepared_dispatch_sequence=NULL,prepared_dispatch_generation=NULL,prepared_dispatch_sha=NULL,
-			retry_attempt=retry_attempt+1,next_retry_at=?,pause_code=NULL,paused_sha=NULL,updated_at=?
-		WHERE application_id=? AND config_revision=? AND lease_fence=? AND lease_token=? AND state IN ('idle','dispatching','retry_wait') AND active_job_id IS NULL AND retry_attempt<1000`, timestamp(nextRetryAt), timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token)
+			resolving_generation=NULL,resolving_lease_fence=NULL,retry_attempt=retry_attempt+1,next_retry_at=?,pause_code=NULL,paused_sha=NULL,
+			next_reconcile_at=CASE WHEN next_reconcile_at IS NULL OR next_reconcile_at<? THEN ? ELSE next_reconcile_at END,updated_at=?
+		WHERE application_id=? AND config_revision=? AND lease_fence=? AND lease_token=?
+		  AND (state IN ('idle','dispatching','retry_wait') OR (state='paused' AND pause_code='provider_unavailable'))
+		  AND active_job_id IS NULL AND retry_attempt<1000`, timestamp(nextRetryAt), timestamp(nextRetryAt), timestamp(nextRetryAt), timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token)
 	if err = mutationResult(result, err); err != nil {
 		return err
 	}
@@ -655,11 +901,11 @@ func (r *Repository) Resume(ctx context.Context, applicationID, actorUserID stri
 	}
 	var revision int64
 	var owner, configuredBy string
-	var state string
+	var state, pauseCode string
 	var activeJob sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT c.revision,c.source_owner_user_id,c.configured_by_user_id,h.state,h.active_job_id
+	err = tx.QueryRowContext(ctx, `SELECT c.revision,c.source_owner_user_id,c.configured_by_user_id,h.state,COALESCE(h.pause_code,''),h.active_job_id
 		FROM github_auto_deploy_configs c JOIN github_auto_deploy_heads h ON h.application_id=c.application_id
-		WHERE c.application_id=? AND c.enabled=1`, applicationID).Scan(&revision, &owner, &configuredBy, &state, &activeJob)
+		WHERE c.application_id=? AND c.enabled=1`, applicationID).Scan(&revision, &owner, &configuredBy, &state, &pauseCode, &activeJob)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Status{}, ErrNotFound
 	}
@@ -675,6 +921,11 @@ func (r *Repository) Resume(ctx context.Context, applicationID, actorUserID stri
 	if state != StatePaused {
 		return Status{}, ErrState
 	}
+	if pauseCode == PauseSourceAccessLost {
+		if err = requireCurrentSourceScope(ctx, tx, applicationID, uint64(revision), 0); err != nil {
+			return Status{}, err
+		}
+	}
 	nextState := StateIdle
 	if activeJob.Valid {
 		var jobState string
@@ -689,9 +940,11 @@ func (r *Repository) Resume(ctx context.Context, applicationID, actorUserID stri
 		}
 		nextState = StateDeploying
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET state=?,pause_code=NULL,paused_sha=NULL,
+	reconcileNow := pauseCode == PauseSourceAccessLost && !activeJob.Valid
+	result, err := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET state=?,pause_code=NULL,paused_sha=NULL,resolving_generation=NULL,resolving_lease_fence=NULL,
 		next_job_poll_at=CASE WHEN active_job_id IS NOT NULL THEN ? ELSE NULL END,
-		lease_token=NULL,lease_expires_at=NULL,updated_at=? WHERE application_id=? AND config_revision=? AND state='paused'`, nextState, timestamp(at), timestamp(at), applicationID, revision)
+		next_reconcile_at=CASE WHEN ? THEN ? ELSE next_reconcile_at END,
+		lease_token=NULL,lease_expires_at=NULL,updated_at=? WHERE application_id=? AND config_revision=? AND state='paused'`, nextState, timestamp(at), reconcileNow, timestamp(at), timestamp(at), applicationID, revision)
 	if err != nil {
 		return Status{}, classifyConstraint(err)
 	}
@@ -714,12 +967,20 @@ func (r *Repository) Resume(ctx context.Context, applicationID, actorUserID stri
 const statusSelect = `SELECT
 	c.application_id,c.revision,c.enabled,COALESCE(c.source_owner_user_id,''),COALESCE(c.configured_by_user_id,''),
 	COALESCE(c.controller_id,''),COALESCE(c.binding_id,''),COALESCE(c.subscription_id,''),
+	COALESCE(s.connection_id,''),COALESCE(s.installation_id,0),COALESCE(s.repository_id,0),COALESCE(s.tracked_branch,''),COALESCE(s.tracked_ref,''),
+	CASE WHEN EXISTS (
+		SELECT 1 FROM relay_controller_subscriptions rs
+		JOIN relay_installation_bindings rb ON rb.binding_id=c.binding_id AND rb.controller_id=c.controller_id
+		WHERE rs.subscription_id=c.subscription_id AND rs.controller_id=c.controller_id AND rs.state='active' AND rb.state='authorized'
+	) THEN 1 ELSE 0 END,
 	h.state,h.last_consumed_generation,h.latest_resolved_generation,COALESCE(h.latest_resolved_sha,''),h.dispatch_sequence,
 	h.prepared_dispatch_sequence,h.prepared_dispatch_generation,COALESCE(h.prepared_dispatch_sha,''),
 	COALESCE(h.active_job_id,''),h.active_dispatch_sequence,h.active_generation,COALESCE(h.active_sha,''),
 	COALESCE(h.last_successful_deployed_sha,''),COALESCE(h.pause_code,''),COALESCE(h.paused_sha,''),h.retry_attempt,
 	h.next_retry_at,h.next_job_poll_at,h.last_reconciled_at,h.next_reconcile_at,h.lease_fence,h.lease_expires_at,h.created_at,h.updated_at
-	FROM github_auto_deploy_configs c JOIN github_auto_deploy_heads h ON h.application_id=c.application_id AND h.config_revision=c.revision`
+	FROM github_auto_deploy_configs c
+	JOIN github_auto_deploy_heads h ON h.application_id=c.application_id AND h.config_revision=c.revision
+	JOIN application_sources s ON s.application_id=c.application_id`
 
 type scanner interface{ Scan(...any) error }
 
@@ -727,13 +988,14 @@ func scanStatus(row scanner) (Status, error) {
 	var value Status
 	var revision, consumed, resolved, dispatch, leaseFence int64
 	var preparedSequence, preparedGeneration, activeSequence, activeGeneration sql.NullInt64
-	var enabled int
+	var enabled, sourceScopeActive int
 	var retryAttempt int64
 	var nextRetry, nextJobPoll, lastReconciled, nextReconcile, leaseExpires sql.NullString
 	var created, updated string
 	err := row.Scan(
 		&value.ApplicationID, &revision, &enabled, &value.SourceOwnerUserID, &value.ConfiguredByUserID,
 		&value.ControllerID, &value.BindingID, &value.SubscriptionID,
+		&value.SourceConnectionID, &value.InstallationID, &value.RepositoryID, &value.TrackedBranch, &value.TrackedRef, &sourceScopeActive,
 		&value.State, &consumed, &resolved, &value.LatestResolvedSHA, &dispatch,
 		&preparedSequence, &preparedGeneration, &value.PreparedDispatchSHA,
 		&value.ActiveJobID, &activeSequence, &activeGeneration, &value.ActiveSHA,
@@ -748,6 +1010,7 @@ func scanStatus(row scanner) (Status, error) {
 	}
 	value.Revision = uint64(revision)
 	value.Enabled = enabled == 1
+	value.SourceScopeActive = sourceScopeActive == 1
 	value.LastConsumedGeneration = uint64(consumed)
 	value.LatestResolvedGeneration = uint64(resolved)
 	value.DispatchSequence = uint64(dispatch)
@@ -837,14 +1100,14 @@ type coordinatorJob struct {
 
 func loadCoordinatorJobTx(ctx context.Context, tx *sql.Tx, applicationID string, configRevision, sequence uint64, jobID string) (coordinatorJob, error) {
 	var value coordinatorJob
-	var requestedBy, configuredBy, sourceOwner, input, idempotency string
-	err := tx.QueryRowContext(ctx, `SELECT j.id,j.status,COALESCE(j.error_code,''),COALESCE(j.pause_disposition,''),COALESCE(j.requested_by,''),j.input_json,COALESCE(j.idempotency_key,''),c.configured_by_user_id,c.source_owner_user_id
+	var requestedBy, sourceOwner, input, idempotency string
+	err := tx.QueryRowContext(ctx, `SELECT j.id,j.status,COALESCE(j.error_code,''),COALESCE(j.pause_disposition,''),COALESCE(j.requested_by,''),j.input_json,COALESCE(j.idempotency_key,''),c.source_owner_user_id
 		FROM jobs j JOIN github_auto_deploy_configs c ON c.application_id=j.resource_id
-		WHERE j.id=? AND j.type='deploy' AND j.resource_type='application' AND j.resource_id=?`, jobID, applicationID).Scan(&value.ID, &value.Status, &value.ErrorCode, &value.PauseDisposition, &requestedBy, &input, &idempotency, &configuredBy, &sourceOwner)
+		WHERE j.id=? AND j.type='deploy' AND j.resource_type='application' AND j.resource_id=?`, jobID, applicationID).Scan(&value.ID, &value.Status, &value.ErrorCode, &value.PauseDisposition, &requestedBy, &input, &idempotency, &sourceOwner)
 	if err != nil {
 		return coordinatorJob{}, err
 	}
-	if requestedBy == "" || requestedBy != sourceOwner || requestedBy != configuredBy || idempotency != DispatchIdempotencyKey(configRevision, sequence) {
+	if requestedBy == "" || requestedBy != sourceOwner || idempotency != DispatchIdempotencyKey(configRevision, sequence) {
 		return coordinatorJob{}, ErrUnauthorized
 	}
 	if input != `{"releaseId":"","configurationMode":"current"}` {
@@ -860,11 +1123,25 @@ func applyJobStateTx(ctx context.Context, tx *sql.Tx, applicationID string, job 
 	stamp := timestamp(at)
 	var result sql.Result
 	var err error
+	var currentState, currentPause, currentPausedSHA, activeSHA, latestSHA string
+	if err = tx.QueryRowContext(ctx, `SELECT state,COALESCE(pause_code,''),COALESCE(paused_sha,''),COALESCE(active_sha,''),COALESCE(latest_resolved_sha,'')
+		FROM github_auto_deploy_heads WHERE application_id=? AND active_job_id=?`, applicationID, job.ID).Scan(&currentState, &currentPause, &currentPausedSHA, &activeSHA, &latestSHA); err != nil {
+		return err
+	}
+	sourceAccessOverlay := currentState == StatePaused && currentPause == PauseSourceAccessLost && validSHA(currentPausedSHA)
 	switch job.Status {
 	case "queued", "assigned", "running", "waiting_external":
-		result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET state='deploying',pause_code=NULL,paused_sha=NULL,next_job_poll_at=?,updated_at=? WHERE application_id=? AND active_job_id=?`, timestamp(at.Add(activeJobPollInterval)), stamp, applicationID, job.ID)
+		if sourceAccessOverlay {
+			result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET next_job_poll_at=?,updated_at=? WHERE application_id=? AND active_job_id=? AND state='paused' AND pause_code='source_access_lost'`, timestamp(at.Add(activeJobPollInterval)), stamp, applicationID, job.ID)
+		} else {
+			result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET state='deploying',pause_code=NULL,paused_sha=NULL,next_job_poll_at=?,updated_at=? WHERE application_id=? AND active_job_id=?`, timestamp(at.Add(activeJobPollInterval)), stamp, applicationID, job.ID)
+		}
 	case "waiting_user":
-		result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET state='paused',pause_code='approval_required',paused_sha=active_sha,retry_attempt=0,next_retry_at=NULL,next_job_poll_at=?,updated_at=? WHERE application_id=? AND active_job_id=?`, timestamp(at.Add(waitingJobPollInterval)), stamp, applicationID, job.ID)
+		if sourceAccessOverlay {
+			result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET next_job_poll_at=?,updated_at=? WHERE application_id=? AND active_job_id=? AND state='paused' AND pause_code='source_access_lost'`, timestamp(at.Add(waitingJobPollInterval)), stamp, applicationID, job.ID)
+		} else {
+			result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET state='paused',pause_code='approval_required',paused_sha=active_sha,retry_attempt=0,next_retry_at=NULL,next_job_poll_at=?,updated_at=? WHERE application_id=? AND active_job_id=?`, timestamp(at.Add(waitingJobPollInterval)), stamp, applicationID, job.ID)
+		}
 	case "succeeded":
 		var actualSHA string
 		err = tx.QueryRowContext(ctx, `SELECT r.resolved_sha
@@ -874,24 +1151,52 @@ func applyJobStateTx(ctx context.Context, tx *sql.Tx, applicationID string, job 
 			WHERE d.job_id=? AND d.app_id=? AND d.status='succeeded'
 			  AND r.source_provider='github' AND r.repository_id=s.repository_id AND r.tracked_ref=s.tracked_ref`, job.ID, applicationID).Scan(&actualSHA)
 		if errors.Is(err, sql.ErrNoRows) || (err == nil && !validSHA(actualSHA)) {
-			result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
-				SET state='paused',paused_sha=active_sha,pause_code='invalid_source',active_job_id=NULL,active_dispatch_sequence=NULL,active_generation=NULL,active_sha=NULL,
-					retry_attempt=0,next_retry_at=NULL,next_job_poll_at=NULL,updated_at=? WHERE application_id=? AND active_job_id=?`, stamp, applicationID, job.ID)
+			if sourceAccessOverlay {
+				result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
+					SET active_job_id=NULL,active_dispatch_sequence=NULL,active_generation=NULL,active_sha=NULL,next_job_poll_at=NULL,updated_at=?
+					WHERE application_id=? AND active_job_id=? AND state='paused' AND pause_code='source_access_lost'`, stamp, applicationID, job.ID)
+			} else {
+				result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
+					SET state='paused',paused_sha=active_sha,pause_code='invalid_source',active_job_id=NULL,active_dispatch_sequence=NULL,active_generation=NULL,active_sha=NULL,
+						retry_attempt=0,next_retry_at=NULL,next_job_poll_at=NULL,updated_at=? WHERE application_id=? AND active_job_id=?`, stamp, applicationID, job.ID)
+			}
 			break
 		}
 		if err != nil {
 			return err
 		}
-		result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
-			SET state='idle',active_job_id=NULL,active_dispatch_sequence=NULL,active_generation=NULL,active_sha=NULL,
-				last_successful_deployed_sha=?,pause_code=NULL,paused_sha=NULL,retry_attempt=0,next_retry_at=NULL,
-				next_job_poll_at=NULL,next_reconcile_at=CASE WHEN latest_resolved_sha<>? THEN ? ELSE next_reconcile_at END,updated_at=?
-			WHERE application_id=? AND active_job_id=?`, actualSHA, actualSHA, stamp, stamp, applicationID, job.ID)
+		if sourceAccessOverlay {
+			result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
+				SET active_job_id=NULL,active_dispatch_sequence=NULL,active_generation=NULL,active_sha=NULL,last_successful_deployed_sha=?,next_job_poll_at=NULL,updated_at=?
+				WHERE application_id=? AND active_job_id=? AND state='paused' AND pause_code='source_access_lost'`, actualSHA, stamp, applicationID, job.ID)
+		} else {
+			result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
+				SET state='idle',active_job_id=NULL,active_dispatch_sequence=NULL,active_generation=NULL,active_sha=NULL,
+					last_successful_deployed_sha=?,pause_code=NULL,paused_sha=NULL,retry_attempt=0,next_retry_at=NULL,
+					next_job_poll_at=NULL,next_reconcile_at=CASE WHEN latest_resolved_sha<>? THEN ? ELSE next_reconcile_at END,updated_at=?
+				WHERE application_id=? AND active_job_id=?`, actualSHA, actualSHA, stamp, stamp, applicationID, job.ID)
+		}
 	case "failed", "cancelled", "interrupted", "needs_attention":
-		pauseCode := pauseCodeForJobError(job.ErrorCode)
-		result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
-			SET state='paused',paused_sha=active_sha,pause_code=?,active_job_id=NULL,active_dispatch_sequence=NULL,active_generation=NULL,active_sha=NULL,
-				retry_attempt=0,next_retry_at=NULL,next_job_poll_at=NULL,updated_at=? WHERE application_id=? AND active_job_id=?`, pauseCode, stamp, applicationID, job.ID)
+		if sourceAccessOverlay {
+			result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
+				SET active_job_id=NULL,active_dispatch_sequence=NULL,active_generation=NULL,active_sha=NULL,next_job_poll_at=NULL,updated_at=?
+				WHERE application_id=? AND active_job_id=? AND state='paused' AND pause_code='source_access_lost'`, stamp, applicationID, job.ID)
+		} else {
+			var actualSHA sql.NullString
+			if queryErr := tx.QueryRowContext(ctx, `SELECT r.resolved_sha FROM deployments d
+				JOIN releases r ON r.id=d.release_id AND r.app_id=d.app_id
+				JOIN application_sources s ON s.application_id=d.app_id AND s.source_type='github'
+				WHERE d.job_id=? AND d.app_id=? AND r.source_provider='github' AND r.repository_id=s.repository_id AND r.tracked_ref=s.tracked_ref
+				ORDER BY d.started_at DESC LIMIT 1`, job.ID, applicationID).Scan(&actualSHA); queryErr != nil && !errors.Is(queryErr, sql.ErrNoRows) {
+				return queryErr
+			}
+			newerKnown := latestSHA != activeSHA || (actualSHA.Valid && validSHA(actualSHA.String) && latestSHA != actualSHA.String)
+			pauseCode := pauseCodeForJobError(job.ErrorCode)
+			result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
+				SET state='paused',paused_sha=active_sha,pause_code=?,active_job_id=NULL,active_dispatch_sequence=NULL,active_generation=NULL,active_sha=NULL,
+					retry_attempt=0,next_retry_at=NULL,next_job_poll_at=NULL,next_reconcile_at=CASE WHEN ? THEN ? ELSE next_reconcile_at END,updated_at=?
+				WHERE application_id=? AND active_job_id=?`, pauseCode, newerKnown, stamp, stamp, applicationID, job.ID)
+		}
 	default:
 		return ErrState
 	}
@@ -914,6 +1219,8 @@ func pauseCodeForJobError(code string) string {
 		return PauseMissingConfig
 	case "source_access_lost":
 		return PauseSourceAccessLost
+	case "provider_unavailable":
+		return PauseProviderUnavailable
 	case "invalid_source":
 		return PauseInvalidSource
 	case "approval_required":

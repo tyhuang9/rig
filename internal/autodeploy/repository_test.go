@@ -205,7 +205,7 @@ func TestConfigureRejectsDisableWhileAutoDeployJobIsNonterminal(t *testing.T) {
 			fixture := newRepositoryFixture(t)
 			status, lease, dispatch := prepareCoordinatorDispatch(t, fixture)
 			jobID := insertCoordinatorJob(t, fixture, status, dispatch, jobStatus, "")
-			if err := fixture.repository.LinkDispatchJob(context.Background(), lease, dispatch.Sequence, jobID, fixture.now.Add(time.Second)); err != nil {
+			if err := fixture.repository.LinkDispatchJob(context.Background(), lease, dispatch.Sequence, dispatch.Generation, jobID, fixture.now.Add(time.Second)); err != nil {
 				t.Fatal(err)
 			}
 			before, err := fixture.repository.Get(context.Background(), testApp)
@@ -226,7 +226,7 @@ func TestConfigureRejectsDisableWhileAutoDeployJobIsNonterminal(t *testing.T) {
 		fixture := newRepositoryFixture(t)
 		status, lease, dispatch := prepareCoordinatorDispatch(t, fixture)
 		jobID := insertCoordinatorJob(t, fixture, status, dispatch, "failed", "invalid_source")
-		if err := fixture.repository.LinkDispatchJob(context.Background(), lease, dispatch.Sequence, jobID, fixture.now.Add(time.Second)); err != nil {
+		if err := fixture.repository.LinkDispatchJob(context.Background(), lease, dispatch.Sequence, dispatch.Generation, jobID, fixture.now.Add(time.Second)); err != nil {
 			t.Fatal(err)
 		}
 		disabled, err := fixture.repository.Configure(context.Background(), ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, ExpectedRevision: 1, Enabled: false}, fixture.now.Add(2*time.Second))
@@ -304,7 +304,7 @@ func TestLeaseExpiryUsesFixedNanosecondBoundariesAndFencesReclaims(t *testing.T)
 	if err = fixture.repository.Pause(ctx, first, PauseDeploymentFailed, first.ExpiresAt.Add(time.Nanosecond)); !errors.Is(err, ErrState) {
 		t.Fatalf("old lease paused after reclaim=%v", err)
 	}
-	if err = fixture.repository.RecordResolvedHead(ctx, second, 0, testSHA, first.ExpiresAt.Add(6*time.Hour), first.ExpiresAt); err != nil {
+	if err = reserveAndFinalize(ctx, fixture.repository, second, 0, testSHA, first.ExpiresAt.Add(6*time.Hour), first.ExpiresAt); err != nil {
 		t.Fatal(err)
 	}
 	if err = fixture.repository.ScheduleRetry(ctx, second, first.ExpiresAt.Add(2*time.Second), first.ExpiresAt.Add(time.Second)); err != nil {
@@ -337,7 +337,7 @@ func TestPrepareDispatchEnforcesRetryDeadline(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err = fixture.repository.RecordResolvedHead(ctx, lease, 0, testSHA, now.Add(6*time.Hour), now); err != nil {
+			if err = reserveAndFinalize(ctx, fixture.repository, lease, 0, testSHA, now.Add(6*time.Hour), now); err != nil {
 				t.Fatal(err)
 			}
 			due := now.Add(5 * time.Second)
@@ -376,7 +376,7 @@ func TestClaimDueDoesNotBusyPollActiveJobAheadOfOtherApps(t *testing.T) {
 	firstStatus, firstLease, dispatch := prepareCoordinatorDispatch(t, fixture)
 	jobID := insertCoordinatorJob(t, fixture, firstStatus, dispatch, "running", "")
 	linkedAt := fixture.now.Add(time.Second)
-	if err := fixture.repository.LinkDispatchJob(ctx, firstLease, dispatch.Sequence, jobID, linkedAt); err != nil {
+	if err := fixture.repository.LinkDispatchJob(ctx, firstLease, dispatch.Sequence, dispatch.Generation, jobID, linkedAt); err != nil {
 		t.Fatal(err)
 	}
 	if err := fixture.repository.ReleaseLease(ctx, firstLease, linkedAt.Add(time.Nanosecond)); err != nil {
@@ -392,7 +392,7 @@ func TestClaimDueDoesNotBusyPollActiveJobAheadOfOtherApps(t *testing.T) {
 	if err != nil || claimed.ApplicationID != secondApp {
 		t.Fatalf("fair claim status=%#v err=%v", claimed, err)
 	}
-	if err = fixture.repository.RecordResolvedHead(ctx, secondLease, 0, testSHA, linkedAt.Add(6*time.Hour), linkedAt.Add(2*time.Second)); err != nil {
+	if err = reserveAndFinalize(ctx, fixture.repository, secondLease, 0, testSHA, linkedAt.Add(6*time.Hour), linkedAt.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if err = fixture.repository.ReleaseLease(ctx, secondLease, linkedAt.Add(2*time.Second)); err != nil {
@@ -416,7 +416,7 @@ func TestClaimDueUsesEarliestCurrentlyDueReason(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err = fixture.repository.RecordResolvedHead(ctx, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
+		if err = reserveAndFinalize(ctx, fixture.repository, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
 			t.Fatal(err)
 		}
 		if err = fixture.repository.ScheduleRetry(ctx, lease, fixture.now.Add(time.Hour), fixture.now.Add(time.Nanosecond)); err != nil {
@@ -443,7 +443,7 @@ func TestClaimDueUsesEarliestCurrentlyDueReason(t *testing.T) {
 		ctx := context.Background()
 		first, lease, dispatch := prepareCoordinatorDispatch(t, fixture)
 		jobID := insertCoordinatorJob(t, fixture, first, dispatch, "running", "")
-		if err := fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, jobID, fixture.now); err != nil {
+		if err := fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, dispatch.Generation, jobID, fixture.now); err != nil {
 			t.Fatal(err)
 		}
 		if err := fixture.repository.ReleaseLease(ctx, lease, fixture.now.Add(time.Nanosecond)); err != nil {
@@ -474,7 +474,7 @@ func TestClaimDueOrdersExactSecondACKBeforeFractionalDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = fixture.repository.RecordResolvedHead(ctx, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
+	if err = reserveAndFinalize(ctx, fixture.repository, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
 		t.Fatal(err)
 	}
 	if err = fixture.repository.ReleaseLease(ctx, lease, fixture.now.Add(time.Nanosecond)); err != nil {
@@ -503,7 +503,7 @@ func TestClaimDueOrdersExactSecondACKBeforeFractionalDeadline(t *testing.T) {
 
 func TestClaimDueCandidateDiscoveryUsesReasonSpecificIndexes(t *testing.T) {
 	fixture := newRepositoryFixture(t)
-	rows, err := fixture.db.Query(`EXPLAIN QUERY PLAN `+claimDueCandidateSQL, timestamp(fixture.now))
+	rows, err := fixture.db.Query(`EXPLAIN QUERY PLAN `+claimDueCandidateSQL, timestamp(fixture.now), timestamp(fixture.now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -554,7 +554,7 @@ func TestClaimDueACKCandidateIsDrivenByLiveHeads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = fixture.repository.RecordResolvedHead(ctx, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
+	if err = reserveAndFinalize(ctx, fixture.repository, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
 		t.Fatal(err)
 	}
 	if err = fixture.repository.ReleaseLease(ctx, lease, fixture.now.Add(time.Nanosecond)); err != nil {
@@ -565,7 +565,7 @@ func TestClaimDueACKCandidateIsDrivenByLiveHeads(t *testing.T) {
 		t.Fatalf("retired ACK history became eligible work: %v", err)
 	}
 
-	rows, err := fixture.db.Query(`EXPLAIN QUERY PLAN `+claimDueACKCandidateSQL, timestamp(fixture.now.Add(time.Second)))
+	rows, err := fixture.db.Query(`EXPLAIN QUERY PLAN `+claimDueACKCandidateSQL, timestamp(fixture.now.Add(time.Second)), timestamp(fixture.now.Add(time.Second)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,7 +605,7 @@ func TestPausedHeadCrashRecoveryDispatchReplayAndSuccessFollowup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = fixture.repository.RecordResolvedHead(ctx, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
+	if err = reserveAndFinalize(ctx, fixture.repository, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
 		t.Fatal(err)
 	}
 	if err = fixture.repository.Pause(ctx, lease, PauseMissingConfig, fixture.now.Add(time.Second)); err != nil {
@@ -620,11 +620,14 @@ func TestPausedHeadCrashRecoveryDispatchReplayAndSuccessFollowup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim paused new generation: %v", err)
 	}
-	head, err := fixture.repository.ObserveNewestACK(ctx, lease, fixture.now.Add(3*time.Second))
+	head, err := fixture.repository.PeekNewestACK(ctx, lease, fixture.now.Add(3*time.Second))
 	if err != nil || head.Generation != 1 {
-		t.Fatalf("observe generation=%#v err=%v", head, err)
+		t.Fatalf("peek generation=%#v err=%v", head, err)
 	}
-	if err = fixture.repository.RecordResolvedHead(ctx, lease, 1, testSHA, fixture.now.Add(6*time.Hour), fixture.now.Add(3*time.Second)); err != nil {
+	if err = fixture.repository.ReserveResolve(ctx, lease, head.Generation, fixture.now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.FinalizeResolvedHead(ctx, lease, 1, testSHA, fixture.now.Add(6*time.Hour), fixture.now.Add(3*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	stillPaused, err := fixture.repository.Get(ctx, testApp)
@@ -641,7 +644,7 @@ func TestPausedHeadCrashRecoveryDispatchReplayAndSuccessFollowup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("paused periodic reconciliation: %v", err)
 	}
-	if err = fixture.repository.RecordResolvedHead(ctx, lease, 1, secondSHA, fixture.now.Add(12*time.Hour), fixture.now.Add(6*time.Hour)); err != nil {
+	if err = reserveAndFinalize(ctx, fixture.repository, lease, 1, secondSHA, fixture.now.Add(12*time.Hour), fixture.now.Add(6*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	periodic, err := fixture.repository.Get(ctx, testApp)
@@ -658,7 +661,7 @@ func TestPausedHeadCrashRecoveryDispatchReplayAndSuccessFollowup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = fixture.repository.ObserveNewestACK(ctx, lease, fixture.now.Add(6*time.Hour+2*time.Second)); err != nil {
+	if err = fixture.repository.ReserveResolve(ctx, lease, 2, fixture.now.Add(6*time.Hour+2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if err = fixture.repository.ReleaseLease(ctx, lease, fixture.now.Add(6*time.Hour+3*time.Second)); err != nil {
@@ -668,7 +671,10 @@ func TestPausedHeadCrashRecoveryDispatchReplayAndSuccessFollowup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim after crash between consume and resolve: %v", err)
 	}
-	if err = fixture.repository.RecordResolvedHead(ctx, lease, 2, thirdSHA, fixture.now.Add(12*time.Hour), fixture.now.Add(6*time.Hour+4*time.Second)); err != nil {
+	if err = fixture.repository.ReserveResolve(ctx, lease, 2, fixture.now.Add(6*time.Hour+4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.FinalizeResolvedHead(ctx, lease, 2, thirdSHA, fixture.now.Add(12*time.Hour), fixture.now.Add(6*time.Hour+4*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	resumed, err := fixture.repository.Get(ctx, testApp)
@@ -684,15 +690,15 @@ func TestPausedHeadCrashRecoveryDispatchReplayAndSuccessFollowup(t *testing.T) {
 		t.Fatalf("dispatch replay=%#v err=%v", replayed, err)
 	}
 	jobID := insertCoordinatorJob(t, fixture, resumed, dispatch, "queued", "")
-	if err = fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, jobID, fixture.now.Add(6*time.Hour+7*time.Second)); err != nil {
+	if err = fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, dispatch.Generation, jobID, fixture.now.Add(6*time.Hour+7*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	fourthSHA := "dddddddddddddddddddddddddddddddddddddddd"
 	commitDesired(t, fixture, status, 3, fourthSHA, fixture.now.Add(6*time.Hour+8*time.Second))
-	if _, err = fixture.repository.ObserveNewestACK(ctx, lease, fixture.now.Add(6*time.Hour+8*time.Second)); err != nil {
+	if err = fixture.repository.ReserveResolve(ctx, lease, 3, fixture.now.Add(6*time.Hour+8*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err = fixture.repository.RecordResolvedHead(ctx, lease, 3, fourthSHA, fixture.now.Add(12*time.Hour), fixture.now.Add(6*time.Hour+8*time.Second)); err != nil {
+	if err = fixture.repository.FinalizeResolvedHead(ctx, lease, 3, fourthSHA, fixture.now.Add(12*time.Hour), fixture.now.Add(6*time.Hour+8*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = fixture.db.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded',progress_percent=100,finished_at=?,updated_at=? WHERE id=?`, timestamp(fixture.now.Add(6*time.Hour+9*time.Second)), timestamp(fixture.now.Add(6*time.Hour+9*time.Second)), jobID); err != nil {
@@ -715,6 +721,103 @@ func TestPausedHeadCrashRecoveryDispatchReplayAndSuccessFollowup(t *testing.T) {
 	}
 }
 
+func TestReserveResolveRejectsGenerationBeyondCompactHead(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	ctx := context.Background()
+	status, err := fixture.repository.Configure(ctx, ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, Enabled: true}, fixture.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitDesired(t, fixture, status, 1, testSHA, fixture.now)
+	_, lease, err := fixture.repository.ClaimDue(ctx, uuid.NewString(), fixture.now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.ReserveResolve(ctx, lease, 2, fixture.now); !errors.Is(err, ErrState) {
+		t.Fatalf("future generation reservation=%v", err)
+	}
+	unchanged, err := fixture.repository.Get(ctx, testApp)
+	if err != nil || unchanged.LastConsumedGeneration != 0 || unchanged.LatestResolvedSHA != "" {
+		t.Fatalf("future generation mutated state=%#v err=%v", unchanged, err)
+	}
+	if err = reserveAndFinalize(ctx, fixture.repository, lease, 1, secondSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
+		t.Fatal(err)
+	}
+	recorded, err := fixture.repository.Get(ctx, testApp)
+	if err != nil || recorded.LastConsumedGeneration != 1 || recorded.LatestResolvedGeneration != 1 || recorded.LatestResolvedSHA != secondSHA {
+		t.Fatalf("exact checkpoint state=%#v err=%v", recorded, err)
+	}
+}
+
+func TestResolveReservationIsFencedAndClearedOnAccessLoss(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	ctx := context.Background()
+	status, err := fixture.repository.Configure(ctx, ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, Enabled: true}, fixture.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitDesired(t, fixture, status, 1, testSHA, fixture.now)
+	_, lease, err := fixture.repository.ClaimDue(ctx, uuid.NewString(), fixture.now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.ReserveResolve(ctx, lease, 1, fixture.now); err != nil {
+		t.Fatal(err)
+	}
+	removedAt := fixture.now.Add(time.Second)
+	decision, err := controllerrelay.NewRepository(fixture.db).CommitAccessChange(ctx, testController, protocol.AccessChange{
+		Envelope: protocol.NewEnvelope(protocol.TypeAccessChange, uuid.NewString(), removedAt), EventID: uuid.NewString(),
+		InstallationID: testInstallation, RepositoryID: testRepository, ChangeCode: "repository.removed", ObservedAt: removedAt, AckRequired: true,
+	}, removedAt)
+	if err != nil || decision.Kind != controllerrelay.DecisionAck {
+		t.Fatalf("access removal=%#v err=%v", decision, err)
+	}
+	if err = fixture.repository.FinalizeResolvedHead(ctx, lease, 1, secondSHA, fixture.now.Add(6*time.Hour), removedAt); !errors.Is(err, ErrState) {
+		t.Fatalf("fenced finalization=%v", err)
+	}
+	paused, err := fixture.repository.Get(ctx, testApp)
+	if err != nil || paused.State != StatePaused || paused.PauseCode != PauseSourceAccessLost {
+		t.Fatalf("access-loss state=%#v err=%v", paused, err)
+	}
+	var generation, fence sql.NullInt64
+	if err = fixture.db.QueryRow(`SELECT resolving_generation,resolving_lease_fence FROM github_auto_deploy_heads WHERE application_id=?`, testApp).Scan(&generation, &fence); err != nil {
+		t.Fatal(err)
+	}
+	if generation.Valid || fence.Valid {
+		t.Fatalf("access loss retained reservation generation=%#v fence=%#v", generation, fence)
+	}
+}
+
+func TestFinalizeResolveDynamicAccessLossRetainsActiveJob(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	ctx := context.Background()
+	status, lease, dispatch := prepareCoordinatorDispatch(t, fixture)
+	jobID := insertCoordinatorJob(t, fixture, status, dispatch, "running", "")
+	if err := fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, dispatch.Generation, jobID, fixture.now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.repository.ReleaseLease(ctx, lease, fixture.now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	commitDesired(t, fixture, status, 1, testSHA, fixture.now.Add(2*time.Second))
+	_, resolveLease, err := fixture.repository.ClaimDue(ctx, uuid.NewString(), fixture.now.Add(2*time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.ReserveResolve(ctx, resolveLease, 1, fixture.now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	setSourceConnectionStatus(t, fixture, "disconnected", fixture.now.Add(3*time.Second))
+	if err = fixture.repository.FinalizeResolvedHead(ctx, resolveLease, 1, secondSHA, fixture.now.Add(6*time.Hour), fixture.now.Add(3*time.Second)); !errors.Is(err, ErrSourceAccessLost) {
+		t.Fatalf("dynamic access-loss finalization=%v", err)
+	}
+	paused, err := fixture.repository.Get(ctx, testApp)
+	if err != nil || paused.State != StatePaused || paused.PauseCode != PauseSourceAccessLost || paused.ActiveJobID != jobID || paused.ActiveSHA != testSHA || paused.NextJobPollAt == nil || paused.LeaseExpiresAt != nil || paused.LastConsumedGeneration != 0 {
+		t.Fatalf("active job was not retained across dynamic access loss status=%#v err=%v", paused, err)
+	}
+	assertNoResolveReservation(t, fixture.db, testApp)
+}
+
 func TestLinkDerivesWaitingAndTerminalJobStateWithoutMutatingJobs(t *testing.T) {
 	fixture := newRepositoryFixture(t)
 	ctx := context.Background()
@@ -726,7 +829,7 @@ func TestLinkDerivesWaitingAndTerminalJobStateWithoutMutatingJobs(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = fixture.repository.RecordResolvedHead(ctx, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
+	if err = reserveAndFinalize(ctx, fixture.repository, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
 		t.Fatal(err)
 	}
 	dispatch, err := fixture.repository.PrepareDispatch(ctx, lease, fixture.now)
@@ -734,7 +837,7 @@ func TestLinkDerivesWaitingAndTerminalJobStateWithoutMutatingJobs(t *testing.T) 
 		t.Fatal(err)
 	}
 	jobID := insertCoordinatorJob(t, fixture, status, dispatch, "waiting_user", "")
-	if err = fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, jobID, fixture.now.Add(time.Second)); err != nil {
+	if err = fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, dispatch.Generation, jobID, fixture.now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	paused, err := fixture.repository.Get(ctx, testApp)
@@ -778,7 +881,7 @@ func TestLinkAcceptsExactTerminalRaceAndRejectsUnrelatedJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = fixture.repository.RecordResolvedHead(ctx, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
+	if err = reserveAndFinalize(ctx, fixture.repository, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
 		t.Fatal(err)
 	}
 	dispatch, err := fixture.repository.PrepareDispatch(ctx, lease, fixture.now)
@@ -786,7 +889,10 @@ func TestLinkAcceptsExactTerminalRaceAndRejectsUnrelatedJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobID := insertCoordinatorJob(t, fixture, status, dispatch, "needs_attention", "invalid_source")
-	if err = fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, jobID, fixture.now.Add(time.Second)); err != nil {
+	if err = fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, dispatch.Generation+1, jobID, fixture.now.Add(time.Second)); !errors.Is(err, ErrState) {
+		t.Fatalf("mismatched dispatch generation linked: %v", err)
+	}
+	if err = fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, dispatch.Generation, jobID, fixture.now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	got, err := fixture.repository.Get(ctx, testApp)
@@ -800,7 +906,7 @@ func TestSuccessfulCurrentSourceJobRecordsActualForwardRelease(t *testing.T) {
 	ctx := context.Background()
 	status, lease, dispatch := prepareCoordinatorDispatch(t, fixture)
 	jobID := insertCoordinatorJob(t, fixture, status, dispatch, "running", "")
-	if err := fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, jobID, fixture.now.Add(time.Second)); err != nil {
+	if err := fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, dispatch.Generation, jobID, fixture.now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := fixture.db.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded',progress_percent=100,finished_at=?,updated_at=? WHERE id=?`, timestamp(fixture.now.Add(2*time.Second)), timestamp(fixture.now.Add(2*time.Second)), jobID); err != nil {
@@ -837,7 +943,7 @@ func TestSuccessfulJobRejectsMismatchedReleaseProvenance(t *testing.T) {
 			ctx := context.Background()
 			status, lease, dispatch := prepareCoordinatorDispatch(t, fixture)
 			jobID := insertCoordinatorJob(t, fixture, status, dispatch, "running", "")
-			if err := fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, jobID, fixture.now.Add(time.Second)); err != nil {
+			if err := fixture.repository.LinkDispatchJob(ctx, lease, dispatch.Sequence, dispatch.Generation, jobID, fixture.now.Add(time.Second)); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := fixture.db.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded',progress_percent=100,finished_at=?,updated_at=? WHERE id=?`, timestamp(fixture.now.Add(2*time.Second)), timestamp(fixture.now.Add(2*time.Second)), jobID); err != nil {
@@ -856,6 +962,87 @@ func TestSuccessfulJobRejectsMismatchedReleaseProvenance(t *testing.T) {
 			completed, err := fixture.repository.RefreshActiveJob(ctx, lease, fixture.now.Add(3*time.Second))
 			if err != nil || completed.State != StatePaused || completed.PauseCode != PauseInvalidSource || completed.ActiveJobID != "" || completed.LastSuccessfulDeployedSHA != "" {
 				t.Fatalf("mismatched %s completion=%#v err=%v", test.name, completed, err)
+			}
+		})
+	}
+}
+
+func TestRefreshActiveJobPreservesSourceAccessLostOverlay(t *testing.T) {
+	for _, jobStatus := range []string{"running", "waiting_user", "succeeded", "failed"} {
+		t.Run(jobStatus, func(t *testing.T) {
+			fixture := newRepositoryFixture(t)
+			ctx := context.Background()
+			status, err := fixture.repository.Configure(ctx, ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, Enabled: true}, fixture.now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, firstLease, err := fixture.repository.ClaimDue(ctx, uuid.NewString(), fixture.now, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = reserveAndFinalize(ctx, fixture.repository, firstLease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
+				t.Fatal(err)
+			}
+			dispatch, err := fixture.repository.PrepareDispatch(ctx, firstLease, fixture.now.Add(time.Second))
+			if err != nil {
+				t.Fatal(err)
+			}
+			jobID := insertCoordinatorJob(t, fixture, status, dispatch, "queued", "")
+			if err = fixture.repository.LinkDispatchJob(ctx, firstLease, dispatch.Sequence, dispatch.Generation, jobID, fixture.now.Add(2*time.Second)); err != nil {
+				t.Fatal(err)
+			}
+
+			removedAt := fixture.now.Add(3 * time.Second)
+			change := protocol.AccessChange{
+				Envelope:       protocol.NewEnvelope(protocol.TypeAccessChange, uuid.NewString(), removedAt),
+				EventID:        uuid.NewString(),
+				InstallationID: testInstallation,
+				RepositoryID:   testRepository,
+				ChangeCode:     "repository.removed",
+				ObservedAt:     removedAt,
+				AckRequired:    true,
+			}
+			decision, err := controllerrelay.NewRepository(fixture.db).CommitAccessChange(ctx, testController, change, removedAt)
+			if err != nil || decision.Kind != controllerrelay.DecisionAck {
+				t.Fatalf("access removal decision=%#v err=%v", decision, err)
+			}
+
+			updateAt := fixture.now.Add(4 * time.Second)
+			switch jobStatus {
+			case "waiting_user":
+				_, err = fixture.db.Exec(`UPDATE jobs SET status='waiting_user',phase='approval_required',pause_disposition='approval_required',updated_at=? WHERE id=?`, timestamp(updateAt), jobID)
+			case "succeeded":
+				releaseID := insertActualRelease(t, fixture, testSHA, dispatch.Sequence)
+				insertSucceededDeployment(t, fixture, testApp, releaseID, jobID)
+				_, err = fixture.db.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded',updated_at=?,finished_at=? WHERE id=?`, timestamp(updateAt), timestamp(updateAt), jobID)
+			case "failed":
+				_, err = fixture.db.Exec(`UPDATE jobs SET status='failed',phase='failed',error_code='provider_unavailable',updated_at=?,finished_at=? WHERE id=?`, timestamp(updateAt), timestamp(updateAt), jobID)
+			default:
+				_, err = fixture.db.Exec(`UPDATE jobs SET status='running',phase='deploying',updated_at=? WHERE id=?`, timestamp(updateAt), jobID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, lease, err := fixture.repository.ClaimDue(ctx, uuid.NewString(), updateAt, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			refreshed, err := fixture.repository.RefreshActiveJob(ctx, lease, updateAt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if refreshed.State != StatePaused || refreshed.PauseCode != PauseSourceAccessLost || refreshed.PausedSHA != testSHA {
+				t.Fatalf("overlay lost status=%#v", refreshed)
+			}
+			terminal := jobStatus == "succeeded" || jobStatus == "failed"
+			if terminal && refreshed.ActiveJobID != "" {
+				t.Fatalf("terminal overlay retained active job=%#v", refreshed)
+			}
+			if !terminal && refreshed.ActiveJobID != jobID {
+				t.Fatalf("nonterminal overlay lost active job=%#v", refreshed)
+			}
+			if jobStatus == "succeeded" && refreshed.LastSuccessfulDeployedSHA != testSHA {
+				t.Fatalf("successful overlay lost provenance=%#v", refreshed)
 			}
 		})
 	}
@@ -880,6 +1067,21 @@ func commitDesired(t *testing.T, fixture *repositoryFixture, status Status, gene
 	}
 }
 
+func setSourceConnectionStatus(t *testing.T, fixture *repositoryFixture, status string, at time.Time) {
+	t.Helper()
+	result, err := fixture.db.Exec(`UPDATE source_connections SET status=?,updated_at=? WHERE id=?`, status, timestamp(at), testConnection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, rowsErr := result.RowsAffected(); rowsErr != nil || changed != 1 {
+		t.Fatalf("source connection status rows=%d err=%v", changed, rowsErr)
+	}
+	var persisted string
+	if err = fixture.db.QueryRow(`SELECT status FROM source_connections WHERE id=?`, testConnection).Scan(&persisted); err != nil || persisted != status {
+		t.Fatalf("source connection status=%q want=%q err=%v", persisted, status, err)
+	}
+}
+
 func insertCoordinatorJob(t *testing.T, fixture *repositoryFixture, status Status, dispatch PreparedDispatch, jobStatus, errorCode string) string {
 	t.Helper()
 	jobID := uuid.NewString()
@@ -891,7 +1093,7 @@ func insertCoordinatorJob(t *testing.T, fixture *repositoryFixture, status Statu
 		pauseDisposition = PauseApprovalRequired
 		phase = PauseApprovalRequired
 	}
-	if _, err := fixture.db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,idempotency_key,requested_by,input_json,pause_disposition,error_code,created_at,updated_at) VALUES(?,'deploy','application',?,?,?,?,?,?,?, ?,?,?)`, jobID, status.ApplicationID, jobStatus, phase, DispatchIdempotencyKey(status.Revision, dispatch.Sequence), testOwner, input, pauseDisposition, nullString(errorCode), stamp, stamp); err != nil {
+	if _, err := fixture.db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,idempotency_key,requested_by,input_json,pause_disposition,error_code,created_at,updated_at) VALUES(?,'deploy','application',?,?,?,?,?,?,?, ?,?,?)`, jobID, status.ApplicationID, jobStatus, phase, DispatchIdempotencyKey(status.Revision, dispatch.Sequence), status.SourceOwnerUserID, input, pauseDisposition, nullString(errorCode), stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
 	return jobID
@@ -929,7 +1131,7 @@ func prepareCoordinatorDispatch(t *testing.T, fixture *repositoryFixture) (Statu
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = fixture.repository.RecordResolvedHead(ctx, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
+	if err = reserveAndFinalize(ctx, fixture.repository, lease, 0, testSHA, fixture.now.Add(6*time.Hour), fixture.now); err != nil {
 		t.Fatal(err)
 	}
 	dispatch, err := fixture.repository.PrepareDispatch(ctx, lease, fixture.now)
@@ -937,6 +1139,13 @@ func prepareCoordinatorDispatch(t *testing.T, fixture *repositoryFixture) (Statu
 		t.Fatal(err)
 	}
 	return status, lease, dispatch
+}
+
+func reserveAndFinalize(ctx context.Context, repository *Repository, lease WorkLease, generation uint64, sha string, nextReconcileAt, at time.Time) error {
+	if err := repository.ReserveResolve(ctx, lease, generation, at); err != nil {
+		return err
+	}
+	return repository.FinalizeResolvedHead(ctx, lease, generation, sha, nextReconcileAt, at)
 }
 
 func insertGitHubApplication(t *testing.T, fixture *repositoryFixture, applicationID, name string) {
