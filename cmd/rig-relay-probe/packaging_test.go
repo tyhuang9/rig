@@ -31,13 +31,23 @@ func TestRelayPackagingContract(t *testing.T) {
 		if err != nil {
 			t.Fatalf("required packaging file unavailable: %s", name)
 		}
-		files[name] = string(data)
+		files[name] = normalizePackagingText(string(data))
 	}
 
 	errors := portablePackagingErrors(files)
 	if len(errors) != 0 {
 		t.Fatalf("packaging contract failed: %s", strings.Join(errors, ", "))
 	}
+
+	t.Run("accept_crlf", func(t *testing.T) {
+		crlf := clonePackagingFiles(files)
+		for name, content := range crlf {
+			crlf[name] = strings.ReplaceAll(content, "\n", "\r\n")
+		}
+		if errors := portablePackagingErrors(crlf); len(errors) != 0 {
+			t.Fatalf("CRLF packaging contract failed: %s", strings.Join(errors, ", "))
+		}
+	})
 
 	mutations := []struct {
 		name, file, old, replacement, want string
@@ -113,7 +123,17 @@ func containsPackagingError(errors []string, want string) bool {
 	return false
 }
 
+func normalizePackagingText(content string) string {
+	return strings.ReplaceAll(content, "\r\n", "\n")
+}
+
 func portablePackagingErrors(files map[string]string) []string {
+	normalized := make(map[string]string, len(files))
+	for name, content := range files {
+		normalized[name] = normalizePackagingText(content)
+	}
+	files = normalized
+
 	set := map[string]struct{}{}
 	add := func(code string) { set[code] = struct{}{} }
 	dockerfile := files["deploy/relay/Dockerfile"]
