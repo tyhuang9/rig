@@ -33,7 +33,17 @@ const (
 	maximumSessionTransportQueueSize = 1000
 )
 
-var errSessionExpired = errors.New("controller relay session expired")
+var (
+	errSessionExpired              = errors.New("controller relay session expired")
+	errSessionCancellationObserved = sessionCancellationObservedError{}
+)
+
+type sessionCancellationObservedError struct{}
+
+func (sessionCancellationObservedError) Error() string {
+	return "controller relay session cancellation observed"
+}
+func (sessionCancellationObservedError) Unwrap() error { return context.Canceled }
 
 type SessionTransportError struct {
 	Code  string
@@ -269,14 +279,17 @@ type SessionTransport struct {
 	// lifecycleMu protects lifecycle ownership and run activation as one state
 	// machine. A direct run can therefore never pass eligibility before a
 	// supervisor claim and become active afterward.
-	lifecycleMu          sync.Mutex
-	lifecycle            sessionTransportLifecycleObserver
-	runToken             *sessionTransportRunToken
-	runActive            bool
-	beforeRunActivate    func()
-	beforeLifecycleClaim func()
-	observerMu           sync.Mutex
-	observerBusy         bool
+	lifecycleMu                 sync.Mutex
+	lifecycle                   sessionTransportLifecycleObserver
+	runToken                    *sessionTransportRunToken
+	runActive                   bool
+	beforeRunActivate           func()
+	beforeLifecycleClaim        func()
+	observerMu                  sync.Mutex
+	observerBusy                bool
+	observerDone                chan struct{}
+	observerReconciling         bool
+	beforeObserverReconcileLock func()
 }
 
 type sessionReadyOwner struct {
@@ -326,7 +339,11 @@ func (transport *SessionTransport) RunOnce(ctx context.Context) error {
 	if !transport.activateRun(nil) {
 		return sessionFailure(sessionErrorIdentity, true)
 	}
-	return transport.runActiveSession(ctx)
+	err := transport.runActiveSession(ctx)
+	if errors.Is(err, errSessionCancellationObserved) {
+		return nil
+	}
+	return err
 }
 
 func (transport *SessionTransport) runOnceClaimed(ctx context.Context, token *sessionTransportRunToken) error {
@@ -392,13 +409,16 @@ func (transport *SessionTransport) connect(ctx context.Context) (_ *activeContro
 	defer cancelHandshake()
 	identity, candidates, err := transport.store.SessionAuthenticationCandidates(handshakeCtx)
 	if err != nil {
-		return nil, sessionFailure(sessionErrorIdentity, true)
+		return nil, sessionStoreFailure(handshakeCtx, err, sessionErrorIdentity)
 	}
 	if identity.State != ControllerActive || len(candidates) < 1 || len(candidates) > 2 {
 		return nil, sessionFailure(sessionErrorIdentity, true)
 	}
 	ackState, err := transport.store.DurableACKState(handshakeCtx, identity.ControllerID)
-	if err != nil || protocol.ValidateACKState(ackState) != nil {
+	if err != nil {
+		return nil, sessionStoreFailure(handshakeCtx, err, sessionErrorPersistence)
+	}
+	if protocol.ValidateACKState(ackState) != nil {
 		return nil, sessionFailure(sessionErrorPersistence, true)
 	}
 	for index, key := range candidates {
@@ -519,7 +539,7 @@ func (transport *SessionTransport) connectCandidate(handshakeCtx context.Context
 	}
 	snapshot, err := transport.store.PrepareSubscriptionSync(handshakeCtx, identity.ControllerID, syncMessageID, transport.now())
 	if err != nil {
-		return nil, sessionFailure(sessionErrorPersistence, true)
+		return nil, sessionStoreFailure(handshakeCtx, err, sessionErrorPersistence)
 	}
 	if len(snapshot.Items) > transport.config.MaxSubscriptions || len(snapshot.Items) > int(ready.MaxSubscriptions) || snapshot.State != SyncInflight || snapshot.ControllerID != identity.ControllerID {
 		return nil, sessionFailure(sessionErrorProtocol, true)
@@ -541,7 +561,7 @@ func (transport *SessionTransport) connectCandidate(handshakeCtx context.Context
 		return nil, sessionFailure(sessionErrorProtocol, true)
 	}
 	if err = transport.store.AcknowledgeSubscriptionSync(handshakeCtx, identity.ControllerID, synced.TargetMessageID, synced.Generation, synced.AcceptedCount, transport.now()); err != nil {
-		return nil, sessionFailure(sessionErrorPersistence, true)
+		return nil, sessionStoreFailure(handshakeCtx, err, sessionErrorPersistence)
 	}
 	readyEvent := sessionTransportLifecycleEvent{
 		SessionTransportEvent: SessionTransportEvent{Stage: SessionTransportReady, Fallback: fallback, Pending: key.State == KeyPending, ExpiresAt: ready.SessionExpiresAt.UTC(), MaxEnvelopeBytes: maxEnvelope, MaxOutstanding: minInt(transport.config.MaxOutstanding, int(ready.MaxOutstanding)), MaxSubscriptions: minInt(transport.config.MaxSubscriptions, int(ready.MaxSubscriptions)), Reconnect: SessionTransportReconnect{
@@ -622,6 +642,14 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 		cancelPending()
 		if err != nil {
 			destroySessionControlFrames(pending)
+			if controlFailureWasCanceled(err) {
+				if errors.Is(context.Cause(runCtx), errSessionExpired) {
+					return finish(sessionFailure(sessionErrorExpired, false))
+				}
+				if ctx.Err() != nil {
+					return finish(errSessionCancellationObserved)
+				}
+			}
 			return finish(controlSessionFailure(err))
 		}
 		for index, frame := range pending {
@@ -642,7 +670,7 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 			if errors.Is(context.Cause(runCtx), errSessionExpired) {
 				return finish(sessionFailure(sessionErrorExpired, false))
 			}
-			return finish(nil)
+			return finish(errSessionCancellationObserved)
 		case err := <-writeErrors:
 			if err == nil {
 				err = sessionFailure(sessionErrorConnectionClosed, false)
@@ -984,11 +1012,14 @@ func (transport *SessionTransport) observeLifecycle(ctx context.Context, event *
 	}
 	if lifecycle := transport.lifecycleObserver(); lifecycle != nil {
 		if err := lifecycle(ctx, event); err != nil {
-			return sessionFailure(sessionErrorPersistence, true)
+			return sessionStoreFailure(ctx, err, sessionErrorPersistence)
 		}
 	}
 	if transport.observer != nil {
 		if err := transport.observeExternal(ctx, event.SessionTransportEvent); err != nil {
+			if errors.Is(err, errSessionCancellationObserved) {
+				return errSessionCancellationObserved
+			}
 			return sessionFailure(sessionErrorPersistence, true)
 		}
 	}
@@ -1029,26 +1060,79 @@ func (transport *SessionTransport) claimLifecycle(observer sessionTransportLifec
 }
 
 func (transport *SessionTransport) observeExternal(ctx context.Context, event SessionTransportEvent) error {
-	transport.observerMu.Lock()
-	if transport.observerBusy {
-		transport.observerMu.Unlock()
-		return sessionFailure(sessionErrorPersistence, true)
-	}
-	transport.observerBusy = true
-	transport.observerMu.Unlock()
-	done := make(chan error, 1)
-	go func() {
-		err := transport.observer(ctx, event)
+	for {
 		transport.observerMu.Lock()
-		transport.observerBusy = false
+		if transport.observerBusy {
+			if !transport.observerReconciling || transport.observerDone == nil {
+				transport.observerMu.Unlock()
+				return sessionFailure(sessionErrorPersistence, true)
+			}
+			done := transport.observerDone
+			transport.observerMu.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				if errors.Is(context.Cause(ctx), errSupervisorReconcile) {
+					return errSessionCancellationObserved
+				}
+				return ctx.Err()
+			}
+		}
+		transport.observerBusy = true
+		transport.observerReconciling = false
+		transport.observerDone = make(chan struct{})
+		done := transport.observerDone
 		transport.observerMu.Unlock()
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
+
+		result := make(chan error, 1)
+		go func() {
+			err := transport.observer(ctx, event)
+			transport.observerMu.Lock()
+			// Publish the result while holding observerMu so the caller cannot
+			// begin the next lifecycle callback before busy state is cleared.
+			result <- err
+			if transport.observerDone == done {
+				transport.observerBusy = false
+				transport.observerReconciling = false
+				transport.observerDone = nil
+				close(done)
+			}
+			transport.observerMu.Unlock()
+		}()
+		select {
+		case err := <-result:
+			return err
+		case <-ctx.Done():
+			// If the observer already completed, its result wins even when the
+			// context became ready at the same select boundary.
+			select {
+			case err := <-result:
+				return err
+			default:
+			}
+			if errors.Is(context.Cause(ctx), errSupervisorReconcile) {
+				if transport.beforeObserverReconcileLock != nil {
+					transport.beforeObserverReconcileLock()
+				}
+				transport.observerMu.Lock()
+				// Linearize cancellation attribution with result publication. A
+				// callback result published before this lock was acquired wins,
+				// even if the initial optimistic result check was empty.
+				select {
+				case err := <-result:
+					transport.observerMu.Unlock()
+					return err
+				default:
+				}
+				if transport.observerBusy && transport.observerDone == done {
+					transport.observerReconciling = true
+				}
+				transport.observerMu.Unlock()
+				return errSessionCancellationObserved
+			}
+			return ctx.Err()
+		}
 	}
 }
 
@@ -1102,6 +1186,16 @@ func defaultSessionDial(ctx context.Context, target string, options *websocket.D
 
 func sessionFailure(code string, fatal bool) error {
 	return &SessionTransportError{Code: code, Fatal: fatal}
+}
+
+func sessionStoreFailure(ctx context.Context, err error, code string) error {
+	if errors.Is(err, context.Canceled) {
+		if ctx != nil && errors.Is(context.Cause(ctx), errSupervisorReconcile) {
+			return errSessionCancellationObserved
+		}
+		return context.Canceled
+	}
+	return sessionFailure(code, true)
 }
 
 func controlSessionFailure(err error) error {

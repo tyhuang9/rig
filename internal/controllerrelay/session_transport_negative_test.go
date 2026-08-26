@@ -278,12 +278,12 @@ func TestActiveSessionRejectsHeartbeatReplay(t *testing.T) {
 
 func TestActiveSessionCancellationAndExpiryCloseAndJoin(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		trigger    func(context.CancelFunc, *manualSessionTimerSource)
-		wantCode   string
-		wantNilErr bool
+		name         string
+		trigger      func(context.CancelFunc, *manualSessionTimerSource)
+		wantCode     string
+		wantCanceled bool
 	}{
-		{name: "cancel", trigger: func(cancel context.CancelFunc, _ *manualSessionTimerSource) { cancel() }, wantNilErr: true},
+		{name: "cancel", trigger: func(cancel context.CancelFunc, _ *manualSessionTimerSource) { cancel() }, wantCanceled: true},
 		{name: "expiry", trigger: func(_ context.CancelFunc, timers *manualSessionTimerSource) { timers.timer <- time.Now() }, wantCode: sessionErrorExpired},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -304,10 +304,10 @@ func TestActiveSessionCancellationAndExpiryCloseAndJoin(t *testing.T) {
 			test.trigger(cancel, timers)
 			select {
 			case err := <-result:
-				if test.wantNilErr && err != nil {
-					t.Fatalf("cancel = %v", err)
+				if test.wantCanceled && !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancel = %v, want observed cancellation", err)
 				}
-				if !test.wantNilErr && !sessionErrorCode(err, test.wantCode) {
+				if !test.wantCanceled && !sessionErrorCode(err, test.wantCode) {
 					t.Fatalf("session result = %v, want %s", err, test.wantCode)
 				}
 			case <-time.After(2 * time.Second):

@@ -94,7 +94,10 @@ func (value SessionControlResult) LogValue() slog.Value {
 	return slog.GroupValue(slog.Uint64("action", uint64(value.Action)))
 }
 
-type SessionControlError struct{ Code string }
+type SessionControlError struct {
+	Code  string
+	cause error
+}
 
 func (err *SessionControlError) Error() string {
 	if err == nil {
@@ -121,6 +124,15 @@ func safeControlErrorCode(code string) string {
 }
 
 func controlFailure(code string) error { return &SessionControlError{Code: safeControlErrorCode(code)} }
+
+func canceledControlFailure(code string) error {
+	return &SessionControlError{Code: safeControlErrorCode(code), cause: context.Canceled}
+}
+
+func controlFailureWasCanceled(err error) bool {
+	var controlErr *SessionControlError
+	return errors.As(err, &controlErr) && errors.Is(controlErr.cause, context.Canceled)
+}
 
 type sessionControlRepository interface {
 	ActiveIdentity(context.Context) (ControllerIdentity, ControllerKey, error)
@@ -1220,6 +1232,11 @@ func (service *SessionControlService) repositoryFailure(err error) error {
 		return controlFailure(controlErrorState)
 	}
 	switch {
+	case errors.Is(err, context.Canceled):
+		// Retain only the standard cancellation sentinel, never the repository
+		// error. The transport uses it to distinguish its own session cancel
+		// from a genuine persistence failure without exposing provider detail.
+		return canceledControlFailure(controlErrorPersistence)
 	case errors.Is(err, ErrInvalid):
 		return controlFailure(controlErrorInvalid)
 	case errors.Is(err, ErrState), errors.Is(err, ErrConflict), errors.Is(err, ErrNotFound):

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -123,6 +124,134 @@ func TestSessionTransportHandshakeBindsIdentityAndSynchronizesBeforeReady(t *tes
 		if value != 0 {
 			t.Fatal("decrypted controller private key was not destroyed immediately after signing")
 		}
+	}
+}
+
+func TestSessionTransportStoreBoundaryFailuresPreserveCancellationAndFatalCodes(t *testing.T) {
+	type boundary struct {
+		name      string
+		fatalCode string
+		setError  func(*fakeSessionTransportStore, error)
+	}
+	boundaries := []boundary{
+		{
+			name:      "identity",
+			fatalCode: sessionErrorIdentity,
+			setError:  func(store *fakeSessionTransportStore, err error) { store.authenticationErr = err },
+		},
+		{
+			name:      "durable ack",
+			fatalCode: sessionErrorPersistence,
+			setError:  func(store *fakeSessionTransportStore, err error) { store.durableACKErr = err },
+		},
+		{
+			name:      "subscription prepare",
+			fatalCode: sessionErrorPersistence,
+			setError:  func(store *fakeSessionTransportStore, err error) { store.prepareErr = err },
+		},
+		{
+			name:      "subscription acknowledge",
+			fatalCode: sessionErrorPersistence,
+			setError:  func(store *fakeSessionTransportStore, err error) { store.acknowledgeErr = err },
+		},
+	}
+
+	for _, boundary := range boundaries {
+		boundary := boundary
+		t.Run(boundary.name+" cancellation", func(t *testing.T) {
+			transport, _, _ := newSessionHandshakeFixture(t, time.Date(2026, 8, 26, 4, 0, 0, 0, time.UTC), nil, nil)
+			store := transport.store.(*fakeSessionTransportStore)
+			boundary.setError(store, context.Canceled)
+
+			_, err := transport.connect(context.Background())
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("connect error = %v, want preserved context cancellation", err)
+			}
+			if errors.Is(err, errSessionCancellationObserved) {
+				t.Fatalf("independent store cancellation gained supervisor attribution: %v", err)
+			}
+		})
+
+		t.Run(boundary.name+" ordinary context cancellation", func(t *testing.T) {
+			transport, _, _ := newSessionHandshakeFixture(t, time.Date(2026, 8, 26, 4, 0, 0, 0, time.UTC), nil, nil)
+			store := transport.store.(*fakeSessionTransportStore)
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(context.Canceled)
+			store.failureHook = func() { cancel(context.Canceled) }
+			boundary.setError(store, context.Canceled)
+
+			_, err := transport.connect(ctx)
+			if !errors.Is(err, context.Canceled) || errors.Is(err, errSessionCancellationObserved) {
+				t.Fatalf("connect error = %v, want ordinary context cancellation without supervisor attribution", err)
+			}
+		})
+
+		t.Run(boundary.name+" supervisor cancellation", func(t *testing.T) {
+			transport, _, _ := newSessionHandshakeFixture(t, time.Date(2026, 8, 26, 4, 0, 0, 0, time.UTC), nil, nil)
+			store := transport.store.(*fakeSessionTransportStore)
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(context.Canceled)
+			store.failureHook = func() { cancel(errSupervisorReconcile) }
+			boundary.setError(store, context.Canceled)
+
+			_, err := transport.connect(ctx)
+			if !errors.Is(err, errSessionCancellationObserved) || !errors.Is(err, context.Canceled) {
+				t.Fatalf("connect error = %v, want supervisor-owned cancellation marker", err)
+			}
+		})
+
+		t.Run(boundary.name+" independent failure", func(t *testing.T) {
+			transport, _, _ := newSessionHandshakeFixture(t, time.Date(2026, 8, 26, 4, 0, 0, 0, time.UTC), nil, nil)
+			store := transport.store.(*fakeSessionTransportStore)
+			rawErr := errors.New("raw store boundary failure")
+			boundary.setError(store, rawErr)
+
+			_, err := transport.connect(context.Background())
+			if !sessionErrorCode(err, boundary.fatalCode) {
+				t.Fatalf("connect error = %v, want fatal code %q", err, boundary.fatalCode)
+			}
+			info, ok := ClassifySessionTransportError(err)
+			if !ok || !info.Fatal {
+				t.Fatalf("classified error = %#v, %t, want fatal transport error", info, ok)
+			}
+			if strings.Contains(err.Error(), rawErr.Error()) {
+				t.Fatalf("connect error leaked repository failure: %v", err)
+			}
+		})
+	}
+}
+
+func TestSessionTransportDirectCancellationAndDeadlineAreNotSupervisorAttributed(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		context func() (context.Context, context.CancelFunc)
+	}{
+		{
+			name: "ordinary cancellation",
+			context: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, cancel
+			},
+		},
+		{
+			name: "expired deadline",
+			context: func() (context.Context, context.CancelFunc) {
+				return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			transport, _, _ := newSessionHandshakeFixture(t, time.Date(2026, 8, 26, 4, 0, 0, 0, time.UTC), nil, nil)
+			transport.store.(*fakeSessionTransportStore).authenticationErr = context.Canceled
+			ctx, cancel := test.context()
+			defer cancel()
+
+			err := transport.RunOnce(ctx)
+			if err == nil || !errors.Is(err, context.Canceled) || errors.Is(err, errSessionCancellationObserved) {
+				t.Fatalf("RunOnce error = %v, want public ordinary cancellation", err)
+			}
+		})
 	}
 }
 
@@ -525,8 +654,8 @@ func TestActiveSessionReplaysPendingControlsThroughSoleWriterAndClearsScratch(t 
 		t.Fatal("pending control was not written")
 	}
 	cancel()
-	if err := <-result; err != nil {
-		t.Fatalf("cancelled session = %v", err)
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled session = %v, want observed cancellation", err)
 	}
 	if handler.pendingCalls != 1 || handler.handleCalls != 0 {
 		t.Fatalf("handler calls pending=%d handle=%d", handler.pendingCalls, handler.handleCalls)
@@ -660,10 +789,15 @@ func (*failingWriteControlSocket) SetReadLimit(int64)                       {}
 func (*failingWriteControlSocket) Subprotocol() string                      { return protocol.Subprotocol }
 
 type fakeSessionTransportStore struct {
-	identity   ControllerIdentity
-	key        ControllerKey
-	candidates []ControllerKey
-	ack        []protocol.ACKState
+	identity          ControllerIdentity
+	key               ControllerKey
+	candidates        []ControllerKey
+	ack               []protocol.ACKState
+	authenticationErr error
+	durableACKErr     error
+	prepareErr        error
+	acknowledgeErr    error
+	failureHook       func()
 	// A non-nil slice overrides the default single test subscription, including
 	// with a valid empty full set.
 	subscriptions []protocol.Subscription
@@ -684,17 +818,35 @@ type fakeSessionTransportStore struct {
 }
 
 func (store *fakeSessionTransportStore) SessionAuthenticationCandidates(context.Context) (ControllerIdentity, []ControllerKey, error) {
+	if store.authenticationErr != nil {
+		if store.failureHook != nil {
+			store.failureHook()
+		}
+		return ControllerIdentity{}, nil, store.authenticationErr
+	}
 	if store.candidates != nil {
 		return store.identity, append([]ControllerKey(nil), store.candidates...), nil
 	}
 	return store.identity, []ControllerKey{store.key}, nil
 }
 func (store *fakeSessionTransportStore) DurableACKState(context.Context, string) ([]protocol.ACKState, error) {
+	if store.durableACKErr != nil {
+		if store.failureHook != nil {
+			store.failureHook()
+		}
+		return nil, store.durableACKErr
+	}
 	result := make([]protocol.ACKState, len(store.ack))
 	copy(result, store.ack)
 	return result, nil
 }
 func (store *fakeSessionTransportStore) PrepareSubscriptionSync(_ context.Context, controllerID, messageID string, sentAt time.Time) (SyncSnapshot, error) {
+	if store.prepareErr != nil {
+		if store.failureHook != nil {
+			store.failureHook()
+		}
+		return SyncSnapshot{}, store.prepareErr
+	}
 	store.prepareMessageID = messageID
 	items := []protocol.Subscription{{SubscriptionID: sessionTestSubscriptionID, InstallationID: 7, RepositoryID: 8, Ref: "refs/heads/main"}}
 	if store.subscriptions != nil {
@@ -704,6 +856,12 @@ func (store *fakeSessionTransportStore) PrepareSubscriptionSync(_ context.Contex
 	return SyncSnapshot{ControllerID: controllerID, Generation: 1, MessageID: messageID, SentAt: sentAt, Digest: digest, State: SyncInflight, Items: items}, nil
 }
 func (store *fakeSessionTransportStore) AcknowledgeSubscriptionSync(_ context.Context, _ string, target string, generation uint64, _ uint32, _ time.Time) error {
+	if store.acknowledgeErr != nil {
+		if store.failureHook != nil {
+			store.failureHook()
+		}
+		return store.acknowledgeErr
+	}
 	store.ackTarget = target
 	store.acknowledged = generation
 	return nil

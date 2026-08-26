@@ -25,8 +25,10 @@ const (
 )
 
 var (
-	ErrSupervisorNotPaused   = errors.New("controller relay supervisor is not paused")
-	ErrSupervisorRateLimited = errors.New("controller relay supervisor resume is rate limited")
+	ErrSupervisorNotPaused                   = errors.New("controller relay supervisor is not paused")
+	ErrSupervisorRateLimited                 = errors.New("controller relay supervisor resume is rate limited")
+	errSupervisorReconcile                   = errors.New("controller relay supervisor reconcile requested")
+	errSupervisorBackoffCancellationObserved = errors.New("controller relay supervisor backoff cancellation observed")
 )
 
 // SupervisorEvent is the safe, aggregate event surface for a session
@@ -217,6 +219,15 @@ type Supervisor struct {
 	runGeneration      uint64
 	pauseGeneration    uint64
 	pauseRunGeneration uint64
+	reconcileRequested uint64
+	reconcileApplied   uint64
+	reconcileTarget    uint64
+	reconcileIssued    bool
+	reconcileCancel    context.CancelCauseFunc
+	reconcileObserved  bool
+	readyTransition    bool
+	afterRunOnce       func()
+	afterBackoffSleep  func()
 	observerMu         sync.Mutex
 	observerBusy       bool
 	observerNext       *supervisorObserverDelivery
@@ -288,6 +299,45 @@ func (supervisor *Supervisor) Resume() error {
 	return nil
 }
 
+// Reconcile coalesces durable management changes into one immediate session
+// refresh. It never starts a connection and never resumes a paused or
+// previously stopped supervisor. A request made before the first Run is
+// retained for that Run's initial fenced handshake.
+func (supervisor *Supervisor) Reconcile() {
+	if supervisor == nil {
+		return
+	}
+	supervisor.mu.Lock()
+	if !supervisor.running {
+		if supervisor.runGeneration == 0 && supervisor.reconcileRequested == 0 {
+			supervisor.reconcileRequested = 1
+		}
+		supervisor.mu.Unlock()
+		return
+	}
+	if supervisor.snapshot.Paused {
+		supervisor.mu.Unlock()
+		return
+	}
+	// A request newer than this attempt's captured target is already queued.
+	// Coalesce callers until a new RunOnce captures that generation.
+	if supervisor.reconcileRequested > supervisor.reconcileTarget {
+		supervisor.mu.Unlock()
+		return
+	}
+	supervisor.reconcileRequested++
+	if supervisor.reconcileRequested == 0 {
+		// A Run generation cannot realistically exhaust uint64 values. Fail
+		// closed by retaining a pending maximum generation if it ever does.
+		supervisor.reconcileRequested--
+	}
+	if supervisor.reconcileCancel != nil && !supervisor.reconcileIssued && !supervisor.readyTransition {
+		supervisor.reconcileIssued = true
+		supervisor.reconcileCancel(errSupervisorReconcile)
+	}
+	supervisor.mu.Unlock()
+}
+
 func (supervisor *Supervisor) Run(ctx context.Context) error {
 	if supervisor == nil || ctx == nil {
 		return sessionFailure(sessionErrorIdentity, true)
@@ -297,17 +347,24 @@ func (supervisor *Supervisor) Run(ctx context.Context) error {
 		supervisor.mu.Unlock()
 		return sessionFailure(sessionErrorIdentity, true)
 	}
+	firstRun := supervisor.runGeneration == 0
 	supervisor.running = true
 	supervisor.runGeneration++
 	if supervisor.runGeneration == 0 {
 		supervisor.runGeneration = 1
 	}
 	supervisor.clearResumeLocked()
+	if firstRun {
+		supervisor.prepareFirstRunReconcileLocked()
+	} else {
+		supervisor.clearReconcileLocked()
+	}
 	supervisor.mu.Unlock()
 	defer func() {
 		supervisor.mu.Lock()
 		supervisor.running = false
 		supervisor.clearResumeLocked()
+		supervisor.clearReconcileLocked()
 		supervisor.mu.Unlock()
 	}()
 
@@ -329,10 +386,29 @@ func (supervisor *Supervisor) Run(ctx context.Context) error {
 			needsRecovery = false
 		}
 
-		err := supervisor.runner.RunOnce(ctx)
+		runOnceCtx, cancelRunOnce := context.WithCancelCause(ctx)
+		supervisor.mu.Lock()
+		supervisor.reconcileCancel = cancelRunOnce
+		supervisor.reconcileTarget = supervisor.reconcileRequested
+		supervisor.reconcileIssued = false
+		supervisor.reconcileObserved = false
+		supervisor.mu.Unlock()
+		err := supervisor.runner.RunOnce(runOnceCtx)
+		if supervisor.afterRunOnce != nil {
+			supervisor.afterRunOnce()
+		}
+		cause := context.Cause(runOnceCtx)
+		supervisor.mu.Lock()
+		supervisor.reconcileCancel = nil
+		reconcileObserved := supervisor.reconcileObserved
+		supervisor.mu.Unlock()
+		cancelRunOnce(context.Canceled)
 		if ctx.Err() != nil {
 			supervisor.stop(ctx)
 			return nil
+		}
+		if reconcileCancellation(cause, err, reconcileObserved) {
+			continue
 		}
 		if err == nil {
 			err = sessionFailure(sessionErrorConnectionClosed, false)
@@ -362,7 +438,31 @@ func (supervisor *Supervisor) Run(ctx context.Context) error {
 			needsRecovery = true
 			continue
 		}
-		if err = supervisor.config.Sleep(ctx, delay); err != nil || ctx.Err() != nil {
+		backoffCtx, cancelBackoff := context.WithCancelCause(ctx)
+		supervisor.mu.Lock()
+		supervisor.reconcileCancel = cancelBackoff
+		supervisor.reconcileIssued = false
+		if supervisor.reconcileRequested > supervisor.reconcileTarget {
+			supervisor.reconcileIssued = true
+			cancelBackoff(errSupervisorReconcile)
+		}
+		supervisor.mu.Unlock()
+		err = supervisor.config.Sleep(backoffCtx, delay)
+		if supervisor.afterBackoffSleep != nil {
+			supervisor.afterBackoffSleep()
+		}
+		supervisor.mu.Lock()
+		supervisor.reconcileCancel = nil
+		supervisor.mu.Unlock()
+		cancelBackoff(context.Canceled)
+		if ctx.Err() != nil {
+			supervisor.stop(ctx)
+			return nil
+		}
+		if errors.Is(err, errSupervisorBackoffCancellationObserved) {
+			continue
+		}
+		if err != nil {
 			supervisor.stop(ctx)
 			return nil
 		}
@@ -434,6 +534,7 @@ func (supervisor *Supervisor) observeTransport(ctx context.Context, event *sessi
 	case SessionTransportConnecting:
 		status, err := supervisor.nextCandidate(ctx, event)
 		if err != nil {
+			supervisor.markObservedReconcileCancellation(ctx, err)
 			return err
 		}
 		supervisor.setStatus(status, "")
@@ -454,11 +555,22 @@ func (supervisor *Supervisor) observeTransport(ctx context.Context, event *sessi
 			return current
 		})
 		if err != nil {
+			supervisor.markObservedReconcileCancellation(ctx, err)
 			return err
 		}
 		supervisor.setStatus(status, "")
 		supervisor.emit(ctx, SupervisorEvent{Kind: SupervisorHandshake, Stage: SessionTransportAuthenticating, Fallback: event.Fallback, Attempt: status.Attempt})
 	case SessionTransportReady:
+		supervisor.mu.Lock()
+		if supervisor.reconcileIssued && supervisor.reconcileRequested > supervisor.reconcileTarget {
+			supervisor.reconcileObserved = true
+			supervisor.mu.Unlock()
+			return errSupervisorReconcile
+		}
+		supervisor.readyTransition = true
+		supervisor.mu.Unlock()
+		readySucceeded := false
+		defer func() { supervisor.finishReadyTransition(readySucceeded) }()
 		readyAt := supervisor.now()
 		status, err := supervisor.advance(ctx, event.ControllerID, func(current SessionStatus) SessionStatus {
 			current.Fence++
@@ -491,6 +603,7 @@ func (supervisor *Supervisor) observeTransport(ctx context.Context, event *sessi
 		}
 		supervisor.sampleDiagnostics(ctx)
 		supervisor.emit(ctx, SupervisorEvent{Kind: SupervisorReady, Stage: SessionTransportReady, Fallback: event.Fallback})
+		readySucceeded = true
 	default:
 		return sessionFailure(sessionErrorProtocol, true)
 	}
@@ -564,6 +677,7 @@ func (supervisor *Supervisor) pause(ctx context.Context, outcome string) {
 		}
 	}
 	supervisor.mu.Lock()
+	supervisor.clearReconcileLocked()
 	supervisor.pauseGeneration++
 	if supervisor.pauseGeneration == 0 {
 		supervisor.pauseGeneration = 1
@@ -601,6 +715,7 @@ func (supervisor *Supervisor) stop(ctx context.Context) {
 	}
 	supervisor.mu.Lock()
 	supervisor.clearResumeLocked()
+	supervisor.clearReconcileLocked()
 	if outcome == "" {
 		supervisor.snapshot.Outcome = ""
 	} else {
@@ -754,6 +869,47 @@ func (supervisor *Supervisor) drainResumeLocked() {
 	}
 }
 
+func (supervisor *Supervisor) clearReconcileLocked() {
+	supervisor.reconcileRequested = 0
+	supervisor.reconcileApplied = 0
+	supervisor.reconcileTarget = 0
+	supervisor.reconcileIssued = false
+	supervisor.reconcileCancel = nil
+	supervisor.reconcileObserved = false
+	supervisor.readyTransition = false
+}
+
+func (supervisor *Supervisor) prepareFirstRunReconcileLocked() {
+	requested := supervisor.reconcileRequested
+	supervisor.clearReconcileLocked()
+	supervisor.reconcileRequested = requested
+}
+
+func (supervisor *Supervisor) markObservedReconcileCancellation(ctx context.Context, err error) {
+	if !errors.Is(context.Cause(ctx), errSupervisorReconcile) || !errors.Is(err, context.Canceled) {
+		return
+	}
+	supervisor.mu.Lock()
+	supervisor.reconcileObserved = true
+	supervisor.mu.Unlock()
+}
+
+func (supervisor *Supervisor) finishReadyTransition(succeeded bool) {
+	supervisor.mu.Lock()
+	defer supervisor.mu.Unlock()
+	supervisor.readyTransition = false
+	if !succeeded {
+		return
+	}
+	if supervisor.reconcileTarget > supervisor.reconcileApplied {
+		supervisor.reconcileApplied = supervisor.reconcileTarget
+	}
+	if supervisor.reconcileRequested > supervisor.reconcileApplied && supervisor.reconcileCancel != nil && !supervisor.reconcileIssued {
+		supervisor.reconcileIssued = true
+		supervisor.reconcileCancel(errSupervisorReconcile)
+	}
+}
+
 func (supervisor *Supervisor) ownedStatus() SessionStatus {
 	supervisor.mu.RLock()
 	defer supervisor.mu.RUnlock()
@@ -879,11 +1035,21 @@ func recoveryFailureOutcome(err error) string {
 	}
 }
 
+func reconcileCancellation(cause, runErr error, observed bool) bool {
+	if !errors.Is(cause, errSupervisorReconcile) {
+		return false
+	}
+	return observed || errors.Is(runErr, errSessionCancellationObserved)
+}
+
 func supervisorSleep(ctx context.Context, delay time.Duration) error {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
+		if errors.Is(context.Cause(ctx), errSupervisorReconcile) {
+			return errSupervisorBackoffCancellationObserved
+		}
 		return ctx.Err()
 	case <-timer.C:
 		return nil
