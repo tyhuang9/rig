@@ -1,0 +1,6 @@
+# Optional direct-TLS overlay. The default remains loopback-only. Changing the
+# publish address is an explicit infrastructure approval and firewall decision.
+services:
+  relay:
+    ports:
+      - "${HOSTD_RELAY_PUBLISH_ADDRESS:-127.0.0.1}:${HOSTD_RELAY_PUBLISH_PORT:-7346}:7346"
