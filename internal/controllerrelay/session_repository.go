@@ -437,7 +437,7 @@ func (r *Repository) DurableACKState(ctx context.Context, controllerID string) (
 	if !canonicalUUID(controllerID) {
 		return nil, ErrInvalid
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT i.subscription_id,MAX(i.generation) FROM relay_source_event_inbox i JOIN relay_controller_subscriptions s ON s.subscription_id=i.subscription_id AND s.controller_id=i.controller_id WHERE i.controller_id=? AND s.state='active' GROUP BY i.subscription_id ORDER BY i.subscription_id`, controllerID)
+	rows, err := r.db.QueryContext(ctx, `SELECT h.subscription_id,h.generation FROM relay_source_ack_heads h JOIN relay_controller_subscriptions s ON s.subscription_id=h.subscription_id AND s.controller_id=h.controller_id WHERE h.controller_id=? AND s.state='active' ORDER BY h.subscription_id`, controllerID)
 	if err != nil {
 		return nil, err
 	}
@@ -514,17 +514,41 @@ func (r *Repository) commitSourceDesired(ctx context.Context, controllerID strin
 		return RejectDecision(RejectScopeMismatch), tx.Commit()
 	}
 
-	var durableMax sql.NullInt64
-	if err = tx.QueryRowContext(ctx, `SELECT MAX(generation) FROM relay_source_event_inbox WHERE controller_id=? AND subscription_id=?`, controllerID, source.SubscriptionID).Scan(&durableMax); err != nil {
+	var durableGeneration sql.NullInt64
+	if err = tx.QueryRowContext(ctx, `SELECT generation FROM relay_source_ack_heads WHERE controller_id=? AND subscription_id=?`, controllerID, source.SubscriptionID).Scan(&durableGeneration); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return InboxDecision{}, err
 	}
-	if durableMax.Valid && source.Generation <= uint64(durableMax.Int64) {
+	if durableGeneration.Valid && source.Generation <= uint64(durableGeneration.Int64) {
 		if err = tx.Commit(); err != nil {
 			return InboxDecision{}, err
 		}
 		return RejectDecision(RejectGenerationConflict), nil
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO relay_source_event_inbox(controller_id,delivery_id,subscription_id,generation,installation_id,repository_id,tracked_ref,observed_sha,observed_at,received_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, controllerID, source.DeliveryID, source.SubscriptionID, source.Generation, source.InstallationID, source.RepositoryID, source.Ref, source.ObservedSHA, timestamp(source.ObservedAt), timestamp(receivedAt))
+	if err != nil {
+		return InboxDecision{}, classifyConstraint(err)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO relay_source_ack_heads(controller_id,subscription_id,delivery_id,generation,installation_id,repository_id,tracked_ref,observed_sha,observed_at,received_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(controller_id,subscription_id) DO UPDATE SET
+			delivery_id=excluded.delivery_id,
+			generation=excluded.generation,
+			installation_id=excluded.installation_id,
+			repository_id=excluded.repository_id,
+			tracked_ref=excluded.tracked_ref,
+			observed_sha=excluded.observed_sha,
+			observed_at=excluded.observed_at,
+			received_at=excluded.received_at`, controllerID, source.SubscriptionID, source.DeliveryID, source.Generation, source.InstallationID, source.RepositoryID, source.Ref, source.ObservedSHA, timestamp(source.ObservedAt), coordinationTimestamp(receivedAt))
+	if err != nil {
+		return InboxDecision{}, classifyConstraint(err)
+	}
+	_, err = tx.ExecContext(ctx, `DELETE FROM relay_source_event_inbox
+		WHERE rowid IN (
+			SELECT rowid FROM relay_source_event_inbox
+			WHERE controller_id=? AND subscription_id=?
+			ORDER BY generation DESC
+			LIMIT -1 OFFSET 32
+		)`, controllerID, source.SubscriptionID)
 	if err != nil {
 		return InboxDecision{}, classifyConstraint(err)
 	}
@@ -603,6 +627,42 @@ func (r *Repository) commitAccessChange(ctx context.Context, controllerID string
 		}
 		if _, err = tx.ExecContext(ctx, query, args...); err != nil {
 			return InboxDecision{}, classifyConstraint(err)
+		}
+		headScope := `
+			FROM github_auto_deploy_configs c
+			JOIN github_auto_deploy_heads h ON h.application_id=c.application_id AND h.config_revision=c.revision
+			JOIN relay_controller_subscriptions s ON s.subscription_id=c.subscription_id AND s.controller_id=c.controller_id
+			WHERE c.enabled=1 AND s.state='active' AND s.controller_id=? AND s.installation_id=?`
+		headArgs := []any{controllerID, change.InstallationID}
+		if change.RepositoryID > 0 {
+			headScope += ` AND s.repository_id=?`
+			headArgs = append(headArgs, change.RepositoryID)
+		}
+		var affectedHeads int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) `+headScope, headArgs...).Scan(&affectedHeads); err != nil {
+			return InboxDecision{}, err
+		}
+		if affectedHeads > 0 {
+			pauseArgs := []any{coordinationTimestamp(receivedAt), coordinationTimestamp(receivedAt)}
+			pauseArgs = append(pauseArgs, headArgs...)
+			result, updateErr := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
+				SET state='paused',pause_code='source_access_lost',
+					paused_sha=COALESCE(active_sha,prepared_dispatch_sha,latest_resolved_sha,(SELECT resolved_sha FROM application_sources WHERE application_id=github_auto_deploy_heads.application_id)),
+					prepared_dispatch_sequence=NULL,prepared_dispatch_generation=NULL,prepared_dispatch_sha=NULL,
+					retry_attempt=0,next_retry_at=NULL,
+					next_job_poll_at=CASE WHEN active_job_id IS NOT NULL THEN ? ELSE NULL END,
+					lease_fence=lease_fence+1,lease_token=NULL,lease_expires_at=NULL,updated_at=?
+				WHERE lease_fence<9223372036854775807 AND application_id IN (SELECT c.application_id `+headScope+`)`, pauseArgs...)
+			if updateErr != nil {
+				return InboxDecision{}, classifyConstraint(updateErr)
+			}
+			changed, rowsErr := result.RowsAffected()
+			if rowsErr != nil {
+				return InboxDecision{}, rowsErr
+			}
+			if changed != int64(affectedHeads) {
+				return InboxDecision{}, ErrState
+			}
 		}
 		retireQuery := `UPDATE relay_controller_subscriptions SET state='retired',retired_at=? WHERE controller_id=? AND installation_id=? AND state='active'`
 		retireArgs := []any{timestamp(receivedAt), controllerID, change.InstallationID}
@@ -1611,6 +1671,22 @@ func existingSourceDecision(ctx context.Context, tx *sql.Tx, controllerID string
 		}
 		return RejectDecision(RejectGenerationConflict), true, nil
 	}
+	var delivery, ref, sha, observed string
+	var generation uint64
+	var installation, repository int64
+	err := tx.QueryRowContext(ctx, `SELECT delivery_id,generation,installation_id,repository_id,tracked_ref,observed_sha,observed_at FROM relay_source_ack_heads WHERE controller_id=? AND subscription_id=?`, controllerID, source.SubscriptionID).Scan(&delivery, &generation, &installation, &repository, &ref, &sha, &observed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return InboxDecision{}, false, nil
+	}
+	if err != nil {
+		return InboxDecision{}, false, err
+	}
+	if delivery == source.DeliveryID && generation == source.Generation && installation == source.InstallationID && repository == source.RepositoryID && ref == source.Ref && sha == source.ObservedSHA && observed == timestamp(source.ObservedAt) {
+		return AckDecision(), true, nil
+	}
+	if source.Generation <= generation || source.DeliveryID == delivery {
+		return RejectDecision(RejectGenerationConflict), true, nil
+	}
 	return InboxDecision{}, false, nil
 }
 
@@ -1659,6 +1735,10 @@ func validAccessScope(code string, repositoryID int64) bool {
 		return repositoryID == 0
 	}
 	return repositoryID > 0
+}
+
+func coordinationTimestamp(value time.Time) string {
+	return value.UTC().Format("2006-01-02T15:04:05.000000000Z")
 }
 
 func validOutboundCommand(value OutboundCommand) bool {
