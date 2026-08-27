@@ -666,7 +666,26 @@ func TestPolicySecretOriginsAreSanitizedAndRejected(t *testing.T) {
 	if err := os.Mkdir(secretDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	revisionID := uuid.NewString()
+	const (
+		revisionID          = "f3dfa55c-2e77-432c-8dec-a7a23c88f552"
+		expectedPlaceholder = "secret-origin:570006fde010dc47210bd8fe3299874b861bb48080ba4bd94ee0e37eb98ac7c8"
+	)
+	origin := appconfig.SecretOrigin{RevisionID: revisionID, RevisionNumber: 7, Key: []byte("TOKEN"), Value: []byte("first-value")}
+	if got := secretOriginPlaceholder(origin); got != expectedPlaceholder {
+		t.Fatalf("placeholder=%q want=%q", got, expectedPlaceholder)
+	}
+	origin.Value = []byte("second-value")
+	if got := secretOriginPlaceholder(origin); got != expectedPlaceholder {
+		t.Fatalf("placeholder changed with secret value: got=%q want=%q", got, expectedPlaceholder)
+	}
+	if !strings.Contains(expectedPlaceholder, "8080") {
+		t.Fatalf("collision fixture no longer contains published-port secret: %q", expectedPlaceholder)
+	}
+	expectedScopeBytes, err := json.Marshal(map[string]any{"secretOrigins": []string{expectedPlaceholder}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedScope := string(expectedScopeBytes)
 	tests := []struct {
 		name   string
 		secret string
@@ -718,29 +737,30 @@ func TestPolicySecretOriginsAreSanitizedAndRejected(t *testing.T) {
 			}
 			origin := appconfig.SecretOrigin{RevisionID: revisionID, RevisionNumber: 7, Key: []byte("TOKEN"), Value: []byte(test.secret)}
 			findings, err := EvaluatePolicy(body, p.workspace, origin)
-			if err != nil || len(findings) == 0 {
+			if err != nil || len(findings) != 1 {
 				t.Fatalf("findings=%#v err=%v", findings, err)
 			}
-			encoded, err := json.Marshal(findings)
+			finding := findings[0]
+			if finding.Scope != expectedScope {
+				t.Fatalf("scope=%s want=%s", finding.Scope, expectedScope)
+			}
+			if finding.Disposition != DispositionRejected {
+				t.Fatalf("tainted finding disposition=%s", finding.Disposition)
+			}
+			wantFingerprint := PolicyFingerprint(PolicyVersion, finding.Capability, expectedScope)
+			if finding.Fingerprint != wantFingerprint {
+				t.Fatalf("fingerprint=%s want=%s", finding.Fingerprint, wantFingerprint)
+			}
+
+			normalized := finding
+			normalized.Scope = `{"secretOrigins":["<validated-opaque-placeholder>"]}`
+			normalized.Fingerprint = "<validated-opaque-fingerprint>"
+			encoded, err := json.Marshal(normalized)
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, variant := range []string{test.secret, strings.ToLower(test.secret), strings.ToUpper(test.secret)} {
-				if bytes.Contains(bytes.ToLower(encoded), bytes.ToLower([]byte(variant))) {
-					t.Fatalf("secret variant persisted in findings: %s", encoded)
-				}
-			}
-			var foundSanitized bool
-			for _, finding := range findings {
-				if strings.Contains(finding.Scope, "secret-origin:") {
-					foundSanitized = true
-					if finding.Disposition != DispositionRejected {
-						t.Fatalf("tainted finding disposition=%s", finding.Disposition)
-					}
-				}
-			}
-			if !foundSanitized {
-				t.Fatalf("no sanitized rejected finding in %#v", findings)
+			if bytes.Contains(bytes.ToLower(encoded), bytes.ToLower([]byte(test.secret))) {
+				t.Fatalf("secret persisted outside validated opaque fields: %s", encoded)
 			}
 		})
 	}
