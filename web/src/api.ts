@@ -1,6 +1,7 @@
 import {
   operations,
   type Application,
+  type ApplicationAutoDeployStatus,
   type ApplicationConfiguration,
   type ApplicationList,
   type BootstrapRequest,
@@ -22,6 +23,8 @@ import {
   type MachineList,
   type MeResponse,
   type ReplaceApplicationConfigurationRequest,
+  type RelayStatus,
+  type ResumeApplicationAutoDeployRequest,
   type ReleaseList,
   type RuntimeApprovalList,
   type RuntimeApprovalMutationResponse,
@@ -31,10 +34,12 @@ import {
   type SourceConnection,
   type SourceConnectionList,
   type SystemStatus,
+  type UpdateApplicationAutoDeployRequest,
 } from "./generated/api-contract";
 
 export type {
   Application,
+  ApplicationAutoDeployStatus,
   ApplicationConfiguration,
   CreateApplicationRequest,
   GitHubBranch,
@@ -53,6 +58,9 @@ export type {
   Deployment,
   Release,
   RuntimeApproval,
+  RelayStatus,
+  ResumeApplicationAutoDeployRequest,
+  UpdateApplicationAutoDeployRequest,
 } from "./generated/api-contract";
 
 export class APIError extends Error {
@@ -161,6 +169,19 @@ export const api = {
   status: () => request<SystemStatus>(operations.systemStatus.path),
   apps: () => request<ApplicationList>(operations.listApplications.path),
   app: (id: string) => request<Application>(operationPath(operations.getApplication.path, { appId: id })),
+  getApplicationAutoDeploy: (id: string) =>
+    request<ApplicationAutoDeployStatus>(operationPath(operations.getApplicationAutoDeploy.path, { appId: id })),
+  updateApplicationAutoDeploy: (id: string, data: UpdateApplicationAutoDeployRequest) =>
+    request<ApplicationAutoDeployStatus>(operationPath(operations.updateApplicationAutoDeploy.path, { appId: id }), {
+      method: operations.updateApplicationAutoDeploy.method,
+      body: JSON.stringify(data),
+    }),
+  resumeApplicationAutoDeploy: (id: string, data: ResumeApplicationAutoDeployRequest) =>
+    request<ApplicationAutoDeployStatus>(operationPath(operations.resumeApplicationAutoDeploy.path, { appId: id }), {
+      method: operations.resumeApplicationAutoDeploy.method,
+      body: JSON.stringify(data),
+    }),
+  relayStatus: () => request<RelayStatus>(operations.getRelayStatus.path),
   applicationConfiguration: (id: string) =>
     request<ApplicationConfiguration>(operationPath(operations.getApplicationConfiguration.path, { appId: id })),
   replaceApplicationConfiguration: (id: string, data: ReplaceApplicationConfigurationRequest) =>
