@@ -658,7 +658,7 @@ func TestLeaseConflictAndReplayCAS(t *testing.T) {
 		m.ExpectBegin()
 		m.ExpectQuery("SELECT controller_id::text FROM relay_sessions").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller"}).AddRow(testController))
 		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(controllerSessionLockKey(testController)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-		m.ExpectQuery("SELECT session_id::text,fence,expires_at").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"session", "fence", "expires"}).AddRow(testMessage, int64(3), fixedNow.Add(time.Minute)))
+		m.ExpectQuery("SELECT l.session_id::text,l.fence,l.expires_at,s.expires_at,s.revoked_at").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"session", "fence", "lease_expires", "session_expires", "session_revoked"}).AddRow(testMessage, int64(3), fixedNow.Add(time.Minute), fixedNow.Add(time.Hour), nil))
 		m.ExpectQuery("SELECT s.controller_id::text,s.expires_at,s.revoked_at,c.state,k.state").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller", "expires", "revoked", "controller_state", "key_state"}).AddRow(testController, fixedNow.Add(time.Hour), nil, "active", "active"))
 		m.ExpectRollback()
 		if _, err := s.AcquireLease(context.Background(), testSession, time.Minute); !errors.Is(err, ErrConflict) {
@@ -676,7 +676,41 @@ func TestExpiredLeaseCanBeTakenOverAndStaleLeaseCannotRecordReplayState(t *testi
 		m.ExpectBegin()
 		m.ExpectQuery("SELECT controller_id::text FROM relay_sessions").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller"}).AddRow(testController))
 		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(controllerSessionLockKey(testController)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-		m.ExpectQuery("SELECT session_id::text,fence,expires_at").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"session", "fence", "expires"}).AddRow(testMessage, int64(3), fixedNow.Add(-time.Second)))
+		m.ExpectQuery("SELECT l.session_id::text,l.fence,l.expires_at,s.expires_at,s.revoked_at").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"session", "fence", "lease_expires", "session_expires", "session_revoked"}).AddRow(testMessage, int64(3), fixedNow.Add(-time.Second), fixedNow.Add(time.Hour), nil))
+		m.ExpectQuery("SELECT s.controller_id::text,s.expires_at,s.revoked_at,c.state,k.state").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller", "expires", "revoked", "controller_state", "key_state"}).AddRow(testController, fixedNow.Add(time.Hour), nil, "active", "active"))
+		m.ExpectExec("INSERT INTO relay_controller_leases").WithArgs(testController, testSession, testLease, int64(4), fixedNow.Add(time.Minute), fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+		m.ExpectCommit()
+		lease, err := s.AcquireLease(context.Background(), testSession, time.Minute)
+		if err != nil || lease.Fence != 4 || lease.LeaseID != testLease || lease.SessionID != testSession {
+			t.Fatalf("lease=%#v err=%v", lease, err)
+		}
+		if err = m.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("revoked prior session permits unexpired lease takeover", func(t *testing.T) {
+		s, m := mockStore(t)
+		m.ExpectBegin()
+		m.ExpectQuery("SELECT controller_id::text FROM relay_sessions").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller"}).AddRow(testController))
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(controllerSessionLockKey(testController)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		m.ExpectQuery("SELECT l.session_id::text,l.fence,l.expires_at,s.expires_at,s.revoked_at").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"session", "fence", "lease_expires", "session_expires", "session_revoked"}).AddRow(testMessage, int64(3), fixedNow.Add(time.Minute), fixedNow.Add(time.Hour), fixedNow.Add(-time.Second)))
+		m.ExpectQuery("SELECT s.controller_id::text,s.expires_at,s.revoked_at,c.state,k.state").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller", "expires", "revoked", "controller_state", "key_state"}).AddRow(testController, fixedNow.Add(time.Hour), nil, "active", "active"))
+		m.ExpectExec("INSERT INTO relay_controller_leases").WithArgs(testController, testSession, testLease, int64(4), fixedNow.Add(time.Minute), fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+		m.ExpectCommit()
+		lease, err := s.AcquireLease(context.Background(), testSession, time.Minute)
+		if err != nil || lease.Fence != 4 || lease.LeaseID != testLease || lease.SessionID != testSession {
+			t.Fatalf("lease=%#v err=%v", lease, err)
+		}
+		if err = m.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("expired prior session permits unexpired lease takeover", func(t *testing.T) {
+		s, m := mockStore(t)
+		m.ExpectBegin()
+		m.ExpectQuery("SELECT controller_id::text FROM relay_sessions").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller"}).AddRow(testController))
+		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(controllerSessionLockKey(testController)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+		m.ExpectQuery("SELECT l.session_id::text,l.fence,l.expires_at,s.expires_at,s.revoked_at").WithArgs(testController).WillReturnRows(pgxmock.NewRows([]string{"session", "fence", "lease_expires", "session_expires", "session_revoked"}).AddRow(testMessage, int64(3), fixedNow.Add(time.Minute), fixedNow.Add(-time.Second), nil))
 		m.ExpectQuery("SELECT s.controller_id::text,s.expires_at,s.revoked_at,c.state,k.state").WithArgs(testSession).WillReturnRows(pgxmock.NewRows([]string{"controller", "expires", "revoked", "controller_state", "key_state"}).AddRow(testController, fixedNow.Add(time.Hour), nil, "active", "active"))
 		m.ExpectExec("INSERT INTO relay_controller_leases").WithArgs(testController, testSession, testLease, int64(4), fixedNow.Add(time.Minute), fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 		m.ExpectCommit()

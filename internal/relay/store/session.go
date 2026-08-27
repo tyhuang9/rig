@@ -228,7 +228,9 @@ func (s *Store) AcquireLease(ctx context.Context, sessionID string, duration tim
 	var oldSession string
 	var oldFence int64
 	var oldExpiry time.Time
-	err = tx.QueryRow(ctx, `SELECT session_id::text,fence,expires_at FROM relay_controller_leases WHERE controller_id=$1 FOR UPDATE`, controllerID).Scan(&oldSession, &oldFence, &oldExpiry)
+	var oldSessionExpiry time.Time
+	var oldSessionRevoked sql.NullTime
+	err = tx.QueryRow(ctx, `SELECT l.session_id::text,l.fence,l.expires_at,s.expires_at,s.revoked_at FROM relay_controller_leases l JOIN relay_sessions s ON s.controller_id=l.controller_id AND s.session_id=l.session_id WHERE l.controller_id=$1 FOR UPDATE OF l,s`, controllerID).Scan(&oldSession, &oldFence, &oldExpiry, &oldSessionExpiry, &oldSessionRevoked)
 	if err != nil && !isNoRows(err) {
 		return Lease{}, err
 	}
@@ -248,7 +250,7 @@ func (s *Store) AcquireLease(ctx context.Context, sessionID string, duration tim
 	if sessionRevoked.Valid || !sessionExpires.After(now) || controllerState != "active" || keyState != "active" {
 		return Lease{}, ErrExpired
 	}
-	if oldExpiry.After(now) && oldSession != sessionID {
+	if oldSession != sessionID && oldExpiry.After(now) && oldSessionExpiry.After(now) && !oldSessionRevoked.Valid {
 		return Lease{}, ErrConflict
 	}
 	if oldFence < 0 || oldFence == math.MaxInt64 {

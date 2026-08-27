@@ -114,7 +114,7 @@ func TestControllerSessionAdvisoryLockIsDomainSeparatedAndOrdered(t *testing.T) 
 		m.ExpectBegin()
 		m.ExpectQuery("SELECT controller_id::text FROM relay_sessions").WithArgs(lease.SessionID).WillReturnRows(pgxmock.NewRows([]string{"controller_id"}).AddRow(lease.ControllerID))
 		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(guard).WillReturnResult(pgxmock.NewResult("SELECT", 1))
-		m.ExpectQuery("SELECT session_id::text,fence,expires_at FROM relay_controller_leases").WithArgs(lease.ControllerID).WillReturnError(stop)
+		m.ExpectQuery("SELECT l.session_id::text,l.fence,l.expires_at,s.expires_at,s.revoked_at FROM relay_controller_leases").WithArgs(lease.ControllerID).WillReturnError(stop)
 		m.ExpectRollback()
 		if _, err := s.AcquireLease(context.Background(), lease.SessionID, time.Minute); !errors.Is(err, stop) {
 			t.Fatalf("error=%v", err)
