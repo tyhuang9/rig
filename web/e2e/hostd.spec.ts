@@ -130,7 +130,7 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
   await expect(restoredPage.getByRole("button", { name: "Deploy latest" })).toBeVisible();
   await expect(restoredPage.getByText("Development capability")).toBeVisible();
   await restoredPage.getByRole("button", { name: "Deploy latest" }).click();
-  await expect(restoredPage.getByText(/Deployment job queued:/)).toBeVisible();
+  await expect(restoredPage.getByText(/Deployment job .+ queued\./)).toBeVisible();
   expect(await restoredPage.evaluate(() => window.sessionStorage.getItem("hostd-csrf"))).toBeTruthy();
 
   await restoredPage.getByRole("link", { name: "Activity" }).click();
