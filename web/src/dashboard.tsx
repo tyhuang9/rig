@@ -239,21 +239,30 @@ function ActivityPage() {
 }
 
 const cancellableStatuses = new Set(["queued", "assigned", "running", "waiting_external", "waiting_user"]);
+const terminalJobStatuses = new Set(["succeeded", "failed", "cancelled", "interrupted", "needs_attention"]);
+const terminalCancellationMessages = new Map([
+  ["cancelled", "Cancellation recorded. Job cancelled."],
+  ["succeeded", "Cancellation recorded. Job succeeded."],
+  ["failed", "Cancellation recorded. Job failed."],
+  ["interrupted", "Cancellation recorded. Job interrupted."],
+  ["needs_attention", "Cancellation recorded. Job needs attention."],
+]);
 
-function ActivityRow({ job }: { job: Job }) {
+export function ActivityRow({ job }: { job: Job }) {
   const queryClient = useQueryClient();
   const cancellation = useMutation({
     mutationFn: () => api.cancelJob(job.id),
-    onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+    onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ["jobs"] }); },
   });
-  const current = cancellation.data?.job ?? job;
+  const current = terminalJobStatuses.has(job.status) ? job : cancellation.data?.job ?? job;
+  const cancellationFeedback = terminalCancellationMessages.get(current.status) ?? "Cancellation recorded.";
   return <article className="activity-row">
     <time dateTime={current.createdAt}>{new Date(current.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
     <div><strong>{current.type} application</strong><small className="mono">{current.id}</small></div>
     <StatusText value={current.status}/>
     <div className="job-actions">
-      {cancellableStatuses.has(current.status) && <button className="button small" onClick={() => cancellation.mutate()} disabled={cancellation.isPending}>{cancellation.isPending ? "Cancelling…" : "Cancel job"}</button>}
-      {cancellation.isSuccess && <span className="activity-feedback success" role="status">Cancellation recorded</span>}
+      {cancellableStatuses.has(current.status) && <button className="button small" onClick={() => cancellation.mutate()} disabled={cancellation.isPending || cancellation.isSuccess}>{cancellation.isPending ? "Cancelling…" : cancellation.isSuccess ? "Cancellation requested" : "Cancel job"}</button>}
+      {cancellation.isSuccess && <span className="activity-feedback" role="status" aria-live="polite" aria-atomic="true">{cancellationFeedback}</span>}
       {cancellation.isError && <span className="activity-feedback error" role="alert">{cancellation.error.message}</span>}
     </div>
   </article>;
