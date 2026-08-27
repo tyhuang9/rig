@@ -46,9 +46,11 @@ Phase A accepts only an explicit loopback IP literal for `--listen`, such as `12
 
 Fake runtime is fail-closed. It must be explicitly enabled and its resolved data root must either be named `.hostd-dev` or be an isolated `hostd-*` directory under the system temporary directory. It persists job progress but never executes a workload.
 
-The real Docker Compose runtime requires `--compose-runtime`, is mutually exclusive with the fake runtime, and accepts only a controller-local Docker endpoint. Its administrative surface is the authenticated API; real deployment controls are not yet exposed in the embedded dashboard. See [Docker Compose runtime operations](docs/compose-runtime.md) for security boundaries, timeout flags, approval and resume flows, live verification, crash recovery, and disable/rollback guidance.
+The real Docker Compose runtime requires `--compose-runtime`, is mutually exclusive with the fake runtime, and accepts only a controller-local Docker endpoint. The authenticated API and embedded dashboard expose deployment history, releases, exact runtime approvals, waiting-job resume, and explicit prior-release recovery. See [Docker Compose runtime operations](docs/compose-runtime.md) for security boundaries, timeout flags, dashboard and API verification, crash recovery, and disable/rollback guidance.
 
-The separately deployable GitHub webhook relay has an immutable, non-root OCI build, PostgreSQL Compose examples, a strict HTTPS health probe, and production operations guidance. See [Official webhook relay operations](docs/relay-operations.md) for TLS/proxy modes, protected configuration, backup/recovery, monitoring, rollback, and staging verification.
+Applications can continue to use a local source path or connect to a selected GitHub.com repository without a user-managed checkout or installed Git CLI. GitHub credentials remain in controller-protected files, releases are immutable commit snapshots, and automatic deployment is disabled per application by default. See [GitHub-connected deployments](docs/github-connected-deployments.md) for the controller workflow, supported source model, relay enrollment, failure behavior, and acceptance checklist.
+
+The separately deployable GitHub webhook relay has an immutable, non-root OCI build, PostgreSQL Compose examples, a strict HTTPS health probe, and production operations guidance. The dashboard exposes controller enrollment, binding removal, key rotation, and relay recovery; cloud account, DNS, region, and live provisioning remain operations work. See [Official webhook relay operations](docs/relay-operations.md) for TLS/proxy modes, protected configuration, backup/recovery, monitoring, rollback, and staging verification.
 
 ## Use hostctl safely
 
