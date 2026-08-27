@@ -305,6 +305,9 @@ func (s *Store) PushAccessEvents(ctx context.Context, batch AccessEventBatchInpu
 		if item.InstallationID <= 0 || item.RepositoryID < 0 || !validCode(item.ChangeCode) || !validTime(item.ObservedAt) {
 			return AccessPushResult{}, ErrInvalid
 		}
+		if !item.RemoveAccess && len(item.Routes) != 0 {
+			return AccessPushResult{}, ErrInvalid
+		}
 		target := [2]int64{item.InstallationID, item.RepositoryID}
 		if _, exists := targets[target]; exists {
 			return AccessPushResult{}, ErrInvalid
@@ -353,26 +356,32 @@ func (s *Store) PushAccessEvents(ctx context.Context, batch AccessEventBatchInpu
 	repositoryIDs := make([]int64, len(events))
 	removeAccess := make([]bool, len(events))
 	topologyLocks := newTopologyLockSet()
+	hasRemovals := false
 	for i, item := range events {
 		installationIDs[i] = item.InstallationID
 		repositoryIDs[i] = item.RepositoryID
 		removeAccess[i] = item.RemoveAccess
-		topologyLocks.addBinding(item.InstallationID)
+		if item.RemoveAccess {
+			hasRemovals = true
+			topologyLocks.addBinding(item.InstallationID)
+		}
 	}
-	keys, routeErr := queryRouteTopologyKeys(ctx, tx, `WITH targets AS (SELECT installation_id,repository_id,remove_access FROM unnest($1::bigint[],$2::bigint[],$3::boolean[]) AS input(installation_id,repository_id,remove_access)) SELECT DISTINCT s.installation_id,s.repository_id,s.tracked_ref FROM targets t JOIN relay_subscriptions s ON s.installation_id=t.installation_id AND (t.repository_id=0 OR s.repository_id=t.repository_id) WHERE t.remove_access AND s.retired_generation IS NULL ORDER BY s.installation_id,s.repository_id,s.tracked_ref`, installationIDs, repositoryIDs, removeAccess)
-	if routeErr != nil {
-		return AccessPushResult{}, routeErr
-	}
-	topologyLocks.addRoutes(keys)
-	if err = acquireTopologyLocks(ctx, tx, topologyLocks); err != nil {
-		return AccessPushResult{}, err
-	}
-	currentRoutes, routeErr := queryRouteTopologyKeys(ctx, tx, `WITH targets AS (SELECT installation_id,repository_id,remove_access FROM unnest($1::bigint[],$2::bigint[],$3::boolean[]) AS input(installation_id,repository_id,remove_access)) SELECT DISTINCT s.installation_id,s.repository_id,s.tracked_ref FROM targets t JOIN relay_subscriptions s ON s.installation_id=t.installation_id AND (t.repository_id=0 OR s.repository_id=t.repository_id) WHERE t.remove_access AND s.retired_generation IS NULL ORDER BY s.installation_id,s.repository_id,s.tracked_ref`, installationIDs, repositoryIDs, removeAccess)
-	if routeErr != nil {
-		return AccessPushResult{}, routeErr
-	}
-	if !topologyRoutesCovered(topologyLocks, currentRoutes) {
-		return AccessPushResult{}, ErrConflict
+	if hasRemovals {
+		keys, routeErr := queryRouteTopologyKeys(ctx, tx, `WITH targets AS (SELECT installation_id,repository_id,remove_access FROM unnest($1::bigint[],$2::bigint[],$3::boolean[]) AS input(installation_id,repository_id,remove_access)) SELECT DISTINCT s.installation_id,s.repository_id,s.tracked_ref FROM targets t JOIN relay_subscriptions s ON s.installation_id=t.installation_id AND (t.repository_id=0 OR s.repository_id=t.repository_id) WHERE t.remove_access AND s.retired_generation IS NULL ORDER BY s.installation_id,s.repository_id,s.tracked_ref`, installationIDs, repositoryIDs, removeAccess)
+		if routeErr != nil {
+			return AccessPushResult{}, routeErr
+		}
+		topologyLocks.addRoutes(keys)
+		if err = acquireTopologyLocks(ctx, tx, topologyLocks); err != nil {
+			return AccessPushResult{}, err
+		}
+		currentRoutes, routeErr := queryRouteTopologyKeys(ctx, tx, `WITH targets AS (SELECT installation_id,repository_id,remove_access FROM unnest($1::bigint[],$2::bigint[],$3::boolean[]) AS input(installation_id,repository_id,remove_access)) SELECT DISTINCT s.installation_id,s.repository_id,s.tracked_ref FROM targets t JOIN relay_subscriptions s ON s.installation_id=t.installation_id AND (t.repository_id=0 OR s.repository_id=t.repository_id) WHERE t.remove_access AND s.retired_generation IS NULL ORDER BY s.installation_id,s.repository_id,s.tracked_ref`, installationIDs, repositoryIDs, removeAccess)
+		if routeErr != nil {
+			return AccessPushResult{}, routeErr
+		}
+		if !topologyRoutesCovered(topologyLocks, currentRoutes) {
+			return AccessPushResult{}, ErrConflict
+		}
 	}
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, deliveryLockKey(batch.DeliveryID)); err != nil {
 		return AccessPushResult{}, err
@@ -397,7 +406,16 @@ func (s *Store) PushAccessEvents(ctx context.Context, batch AccessEventBatchInpu
 		}
 		return AccessPushResult{Deduplicated: true}, nil
 	}
-	rows, queryErr := tx.Query(ctx, `WITH targets AS (SELECT ordinality::bigint AS target_index,installation_id,repository_id FROM unnest($1::bigint[],$2::bigint[]) WITH ORDINALITY AS input(installation_id,repository_id,ordinality)) SELECT t.target_index,b.controller_id::text,b.repository_id FROM targets t JOIN relay_bindings b ON b.installation_id=t.installation_id AND (t.repository_id=0 OR b.repository_id=t.repository_id) JOIN relay_controllers c ON c.controller_id=b.controller_id WHERE b.revoked_at IS NULL AND c.state='active' ORDER BY t.target_index,b.controller_id,b.repository_id FOR UPDATE OF b`, installationIDs, repositoryIDs)
+	if !hasRemovals {
+		if _, err = tx.Exec(ctx, `UPDATE relay_recovery_deliveries SET recovered_at=$2,next_attempt_at=NULL,last_error_code=NULL,claim_id=NULL,claim_expires_at=NULL WHERE delivery_id=$1 AND recovered_at IS NULL`, batch.DeliveryID, now); err != nil {
+			return AccessPushResult{}, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return AccessPushResult{}, err
+		}
+		return AccessPushResult{}, nil
+	}
+	rows, queryErr := tx.Query(ctx, `WITH targets AS (SELECT ordinality::bigint AS target_index,installation_id,repository_id,remove_access FROM unnest($1::bigint[],$2::bigint[],$3::boolean[]) WITH ORDINALITY AS input(installation_id,repository_id,remove_access,ordinality)) SELECT t.target_index,b.controller_id::text,b.repository_id FROM targets t JOIN relay_bindings b ON b.installation_id=t.installation_id AND (t.repository_id=0 OR b.repository_id=t.repository_id) JOIN relay_controllers c ON c.controller_id=b.controller_id WHERE t.remove_access AND b.revoked_at IS NULL AND c.state='active' ORDER BY t.target_index,b.controller_id,b.repository_id FOR UPDATE OF b`, installationIDs, repositoryIDs, removeAccess)
 	if queryErr != nil {
 		return AccessPushResult{}, queryErr
 	}

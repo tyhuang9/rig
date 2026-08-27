@@ -121,7 +121,7 @@ func TestPushAccessEventsMaxFanoutUsesTwelveRoundTripsAndBatchedWrites(t *testin
 	expectAccessRouteSnapshot(mock, batch.Events, routeRowsAfter)
 	mock.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(batch.DeliveryID)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(batch.DeliveryID, batch.ReceivedAt, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	mock.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs(installationIDs, repositoryIDs).WillReturnRows(authorized)
+	mock.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs(installationIDs, repositoryIDs, removals).WillReturnRows(authorized)
 	mock.ExpectExec("INSERT INTO relay_access_events").WithArgs(batch.DeliveryID, accessEventIDs, controllerIDs, installationIDs, repositoryIDs, changeCodes, observedAt).WillReturnResult(pgxmock.NewResult("INSERT", 1000))
 	mock.ExpectExec("WITH targets AS .*UPDATE relay_bindings b SET revoked_at").WithArgs(installationIDs, repositoryIDs, removals, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1000))
 	mock.ExpectExec("WITH targets AS .*UPDATE relay_bindings b SET revoked_at").WithArgs(installationIDs, repositoryIDs, removals, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
@@ -211,7 +211,7 @@ func TestAccessBatchAuthorizationDedupeAndBulkFailures(t *testing.T) {
 		expectAccessRouteSnapshot(mock, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 		mock.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		mock.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-		mock.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs(installations, repositories).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)).AddRow(int64(1), testController, int64(3)))
+		mock.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs(installations, repositories, removals).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)).AddRow(int64(1), testController, int64(3)))
 		mock.ExpectExec("INSERT INTO relay_access_events").WithArgs(testDelivery, []string{testEvent}, []string{testController}, []int64{1}, []int64{0}, []string{"installation.removed"}, []time.Time{fixedNow}).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 		mock.ExpectExec("WITH targets AS .*UPDATE relay_bindings b SET revoked_at").WithArgs(installations, repositories, removals, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 		mock.ExpectExec("WITH targets AS .*UPDATE relay_bindings b SET revoked_at").WithArgs(installations, repositories, removals, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 2))
@@ -226,8 +226,8 @@ func TestAccessBatchAuthorizationDedupeAndBulkFailures(t *testing.T) {
 	})
 
 	t.Run("unauthorized route", func(t *testing.T) {
-		batch := AccessEventBatchInput{DeliveryID: testDelivery, ReceivedAt: fixedNow, Events: []AccessEventBatchItem{{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.removed", ObservedAt: fixedNow, Routes: []AccessRoute{{EventID: testEvent, ControllerID: testController}}}}}
-		installations, repositories, _ := accessBatchTargetArgs(batch.Events)
+		batch := AccessEventBatchInput{DeliveryID: testDelivery, ReceivedAt: fixedNow, Events: []AccessEventBatchItem{{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.removed", ObservedAt: fixedNow, RemoveAccess: true, Routes: []AccessRoute{{EventID: testEvent, ControllerID: testController}}}}}
+		installations, repositories, removals := accessBatchTargetArgs(batch.Events)
 		s, mock := mockStore(t)
 		mock.ExpectBegin()
 		expectAccessRouteSnapshot(mock, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
@@ -235,7 +235,7 @@ func TestAccessBatchAuthorizationDedupeAndBulkFailures(t *testing.T) {
 		expectAccessRouteSnapshot(mock, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 		mock.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		mock.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-		mock.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs(installations, repositories).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController2, int64(2)))
+		mock.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs(installations, repositories, removals).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController2, int64(2)))
 		mock.ExpectRollback()
 		if _, err := s.PushAccessEvents(context.Background(), batch); !errors.Is(err, ErrConflict) {
 			t.Fatalf("error=%v", err)
@@ -268,7 +268,7 @@ func TestAccessBatchAuthorizationDedupeAndBulkFailures(t *testing.T) {
 			expectAccessRouteSnapshot(mock, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 			mock.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 			mock.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-			mock.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs(installations, repositories).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)))
+			mock.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs(installations, repositories, removals).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)))
 			insert := mock.ExpectExec("INSERT INTO relay_access_events").WithArgs(testDelivery, []string{testEvent}, []string{testController}, []int64{1}, []int64{2}, []string{"repository.removed"}, []time.Time{fixedNow})
 			if test.insertErr != nil {
 				insert.WillReturnError(test.insertErr)

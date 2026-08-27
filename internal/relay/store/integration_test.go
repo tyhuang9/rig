@@ -507,6 +507,13 @@ func TestPostgreSQLRelayStateIntegration(t *testing.T) {
 	if _, err = s.PushAccessEvent(ctx, restored, nil); err != nil {
 		t.Fatalf("persist informational restore event: %v", err)
 	}
+	var restoredDeliveryCount, restoredAccessEventCount int
+	if err = s.pool.QueryRow(ctx, `SELECT count(*) FROM relay_github_deliveries WHERE delivery_id=$1`, restored.DeliveryID).Scan(&restoredDeliveryCount); err != nil || restoredDeliveryCount != 1 {
+		t.Fatalf("informational restore delivery count=%d err=%v", restoredDeliveryCount, err)
+	}
+	if err = s.pool.QueryRow(ctx, `SELECT count(*) FROM relay_access_events WHERE delivery_id=$1`, restored.DeliveryID).Scan(&restoredAccessEventCount); err != nil || restoredAccessEventCount != 0 {
+		t.Fatalf("informational restore access events=%d err=%v", restoredAccessEventCount, err)
+	}
 	accessRoutes, err = s.AccessRoutes(ctx, 10, 20)
 	if err != nil || len(accessRoutes) != 0 {
 		t.Fatalf("informational restore resurrected binding routes=%v err=%v", accessRoutes, err)
