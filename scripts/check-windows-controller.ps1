@@ -40,6 +40,11 @@ $checks = @(
     Package = './internal/runtime/process'
     Pattern = '^TestExecRunnerCancelsDescendantProcessTree$'
     Tests = @('TestExecRunnerCancelsDescendantProcessTree')
+  },
+  @{
+    Package = './internal/releasesnapshot'
+    Pattern = '^TestManagedWorkspaceAcceptsWindowsShortNameWithoutFollowingReparsePoints$'
+    Tests = @('TestManagedWorkspaceAcceptsWindowsShortNameWithoutFollowingReparsePoints')
   }
 )
 
@@ -73,4 +78,4 @@ try {
   Pop-Location
 }
 
-Write-Output 'Windows DPAPI, session, secure temporary storage, and process-tree tests executed successfully.'
+Write-Output 'Windows DPAPI, session, secure temporary storage, process-tree, and short-path release tests executed successfully.'
