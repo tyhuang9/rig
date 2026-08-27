@@ -20,6 +20,11 @@ import (
 	"github.com/hostd/hostd/internal/deployments"
 )
 
+const (
+	policyTestApplicationID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	policyTestProject       = "rig-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+)
+
 type matrixPaths struct {
 	workspace  string
 	outside    string
@@ -375,7 +380,7 @@ func TestPolicyAllowGateRejectMatrix(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			body, _ := json.Marshal(tc.model(p))
-			findings, err := EvaluatePolicy(body, p.workspace)
+			findings, err := evaluatePolicyTest(body, p.workspace)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -418,14 +423,14 @@ func TestPolicyMalformedBoundsDedupeAndDeterminism(t *testing.T) {
 	}{"service count", tooManyServicesBody, "malformed_services"})
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := EvaluatePolicy(tc.body, workspace)
+			_, err := evaluatePolicyTest(tc.body, workspace)
 			var pe *PolicyError
 			if !errors.As(err, &pe) || pe.Code != tc.code {
 				t.Fatalf("error=%v want=%s", err, tc.code)
 			}
 		})
 	}
-	findings, err := EvaluatePolicy([]byte(`{"services":{"web":{"cap_add":["NET_ADMIN","net_admin"]}}}`), workspace)
+	findings, err := evaluatePolicyTest([]byte(`{"services":{"web":{"cap_add":["NET_ADMIN","net_admin"]}}}`), workspace)
 	if err != nil || len(findings) != 1 {
 		t.Fatalf("dedupe=%#v err=%v", findings, err)
 	}
@@ -434,13 +439,13 @@ func TestPolicyMalformedBoundsDedupeAndDeterminism(t *testing.T) {
 		values[i] = "CAP_" + strings.Repeat("A", i/26) + string(rune('A'+i%26))
 	}
 	body, _ := json.Marshal(serviceModel(map[string]any{"cap_add": values}))
-	_, err = EvaluatePolicy(body, workspace)
+	_, err = evaluatePolicyTest(body, workspace)
 	var pe *PolicyError
 	if !errors.As(err, &pe) || pe.Code != "too_many_findings" {
 		t.Fatalf("bound=%v", err)
 	}
-	a, ea := EvaluatePolicy([]byte(`{"services":{"b":{"privileged":true},"a":{"cap_add":["NET_ADMIN"]}}}`), workspace)
-	b, eb := EvaluatePolicy([]byte(`{"services":{"a":{"cap_add":["NET_ADMIN"]},"b":{"privileged":true}}}`), workspace)
+	a, ea := evaluatePolicyTest([]byte(`{"services":{"b":{"privileged":true},"a":{"cap_add":["NET_ADMIN"]}}}`), workspace)
+	b, eb := evaluatePolicyTest([]byte(`{"services":{"a":{"cap_add":["NET_ADMIN"]},"b":{"privileged":true}}}`), workspace)
 	ja, _ := json.Marshal(a)
 	jb, _ := json.Marshal(b)
 	if ea != nil || eb != nil || string(ja) != string(jb) {
@@ -451,7 +456,7 @@ func TestPolicyMalformedBoundsDedupeAndDeterminism(t *testing.T) {
 func TestPolicyCanonicalScopeFingerprintAndRepositoryParity(t *testing.T) {
 	p := newMatrixPaths(t)
 	body, _ := json.Marshal(serviceModel(map[string]any{"volumes": []any{map[string]any{"type": "bind", "source": p.outside, "target": "/data", "read_only": true}}}))
-	findings, err := EvaluatePolicy(body, p.workspace)
+	findings, err := evaluatePolicyTest(body, p.workspace)
 	if err != nil || len(findings) != 1 {
 		t.Fatalf("findings=%#v err=%v", findings, err)
 	}
@@ -473,6 +478,147 @@ func TestPolicyCanonicalScopeFingerprintAndRepositoryParity(t *testing.T) {
 	assertRepositoryParity(t, f)
 }
 
+func TestPolicyProjectResourceNamesPreserveIsolationAndExactApprovals(t *testing.T) {
+	p := newMatrixPaths(t)
+	const applicationID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	project := "rig-" + strings.Repeat("b", 32)
+	model := func(volumeName, networkName any) []byte {
+		body, err := json.Marshal(map[string]any{
+			"services": map[string]any{"web": map[string]any{
+				"image":    "nginx",
+				"volumes":  []any{map[string]any{"type": "volume", "source": "data", "target": "/data"}},
+				"networks": map[string]any{"private": nil},
+			}},
+			"volumes":  map[string]any{"data": map[string]any{"name": volumeName}},
+			"networks": map[string]any{"private": map[string]any{"name": networkName}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+
+	canonical, err := EvaluatePolicy(model(project+"_data", project+"_private"), p.workspace, applicationID, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMatrix(t, canonical, map[string]string{"named_volume": DispositionAllowed}, 1)
+
+	custom, err := EvaluatePolicy(model("shared-data", "shared-network"), p.workspace, applicationID, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMatrix(t, custom, map[string]string{
+		"named_volume":        DispositionAllowed,
+		"custom_volume_name":  DispositionApprovalRequired,
+		"custom_network_name": DispositionApprovalRequired,
+	}, 3)
+	volume := findingByCapability(t, custom, "custom_volume_name")
+	network := findingByCapability(t, custom, "custom_network_name")
+	if volume.Scope != `{"applicationId":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","name":"shared-data","resource":"data"}` || network.Scope != `{"applicationId":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","name":"shared-network","resource":"private"}` {
+		t.Fatalf("custom scopes volume=%s network=%s", volume.Scope, network.Scope)
+	}
+	changed, err := EvaluatePolicy(model("shared-data-v2", "shared-network"), p.workspace, applicationID, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next := findingByCapability(t, changed, "custom_volume_name"); next.Fingerprint == volume.Fingerprint || next.Scope == volume.Scope {
+		t.Fatalf("changed custom name reused approval: before=%#v after=%#v", volume, next)
+	}
+	const otherApplicationID = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+	otherProject := "rig-" + strings.Repeat("e", 32)
+	otherApp, err := EvaluatePolicy(model("shared-data", "shared-network"), p.workspace, otherApplicationID, otherProject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other := findingByCapability(t, otherApp, "custom_volume_name"); other.Fingerprint == volume.Fingerprint || other.Scope == volume.Scope {
+		t.Fatalf("different application reused approval: first=%#v other=%#v", volume, other)
+	}
+	assertRepositoryParity(t, volume)
+}
+
+func TestPolicyProjectResourceNamesFailClosedAndPreserveRejectPrecedence(t *testing.T) {
+	workspace := t.TempDir()
+	const applicationID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	project := "rig-" + strings.Repeat("c", 32)
+	tests := []struct {
+		name       string
+		body       string
+		capability string
+	}{
+		{name: "null volume", body: `{"services":{"web":{"image":"nginx"}},"volumes":{"data":null}}`, capability: "unsupported_volumes"},
+		{name: "empty network", body: `{"services":{"web":{"image":"nginx"}},"networks":{"private":{}}}`, capability: "unsupported_networks"},
+		{name: "missing volume name", body: `{"services":{"web":{"image":"nginx"}},"volumes":{"data":{"driver":"local"}}}`, capability: "unsupported_volumes"},
+		{name: "non-string network name", body: `{"services":{"web":{"image":"nginx"}},"networks":{"private":{"name":7}}}`, capability: "unsupported_networks"},
+		{name: "empty volume name", body: `{"services":{"web":{"image":"nginx"}},"volumes":{"data":{"name":""}}}`, capability: "unsupported_volumes"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			findings, err := EvaluatePolicy([]byte(test.body), workspace, applicationID, project)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertMatrix(t, findings, map[string]string{test.capability: DispositionRejected}, 1)
+		})
+	}
+
+	precedence := []byte(`{"services":{"web":{"image":"nginx","volumes":[{"type":"volume","source":"data","target":"/data"}]}},"volumes":{"data":{"external":true,"name":"shared-data"}},"networks":{"private":{"driver":"overlay","driver_opts":{"x":"y"},"name":"shared-network"}}}`)
+	findings, err := EvaluatePolicy(precedence, workspace, applicationID, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMatrix(t, findings, map[string]string{
+		"named_volume":           DispositionAllowed,
+		"external_volume":        DispositionRejected,
+		"remote_network_driver":  DispositionRejected,
+		"remote_network_options": DispositionRejected,
+	}, 4)
+	for _, finding := range findings {
+		if finding.Capability == "custom_volume_name" || finding.Capability == "custom_network_name" {
+			t.Fatalf("unsafe resource was reduced to approval: %#v", findings)
+		}
+	}
+
+	for _, invalid := range []struct {
+		applicationID string
+		project       string
+	}{
+		{applicationID: applicationID, project: ""},
+		{applicationID: applicationID, project: "project"},
+		{applicationID: applicationID, project: "rig-" + strings.Repeat("A", 32)},
+		{applicationID: applicationID, project: "rig-" + strings.Repeat("c", 31)},
+		{applicationID: applicationID, project: policyTestProject},
+		{applicationID: "not-an-application-id", project: project},
+	} {
+		_, policyErr := EvaluatePolicy([]byte(`{"services":{"web":{"image":"nginx"}}}`), workspace, invalid.applicationID, invalid.project)
+		var typed *PolicyError
+		if !errors.As(policyErr, &typed) || typed.Code != "invalid_project" {
+			t.Fatalf("application=%q project=%q error=%v", invalid.applicationID, invalid.project, policyErr)
+		}
+	}
+}
+
+func TestPolicySecretDerivedCustomResourceNameIsRedactedAndRejected(t *testing.T) {
+	workspace := t.TempDir()
+	const applicationID = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+	project := "rig-" + strings.Repeat("d", 32)
+	const secret = "shared-sensitive-volume"
+	origin := appconfig.SecretOrigin{RevisionID: uuid.NewString(), RevisionNumber: 7, Key: []byte("VOLUME_NAME"), Value: []byte(secret)}
+	body := []byte(`{"services":{"web":{"image":"nginx","volumes":[{"type":"volume","source":"data","target":"/data"}]}},"volumes":{"data":{"name":"` + secret + `"}}}`)
+	findings, err := EvaluatePolicy(body, workspace, applicationID, project, origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finding := findingByCapability(t, findings, "custom_volume_name")
+	if finding.Disposition != DispositionRejected || strings.Contains(finding.Scope, secret) || !strings.Contains(finding.Scope, "secret-origin:") {
+		t.Fatalf("secret-derived finding=%#v", finding)
+	}
+	encoded, marshalErr := json.Marshal(findings)
+	if marshalErr != nil || bytes.Contains(encoded, []byte(secret)) {
+		t.Fatalf("secret leaked through findings: %s err=%v", encoded, marshalErr)
+	}
+}
+
 func TestPolicyRejectsSymlinkAncestor(t *testing.T) {
 	workspace, outside := t.TempDir(), t.TempDir()
 	link := filepath.Join(workspace, "escape")
@@ -480,14 +626,14 @@ func TestPolicyRejectsSymlinkAncestor(t *testing.T) {
 		t.Skipf("symlink unavailable: %v", err)
 	}
 	body, _ := json.Marshal(serviceModel(map[string]any{"volumes": []any{map[string]any{"type": "bind", "source": link, "target": "/data"}}}))
-	findings, err := EvaluatePolicy(body, workspace)
+	findings, err := evaluatePolicyTest(body, workspace)
 	if err != nil || len(findings) != 1 || findings[0].Disposition != DispositionRejected {
 		t.Fatalf("findings=%#v err=%v", findings, err)
 	}
 }
 
 func TestPolicyRejectsRelativeWorkspace(t *testing.T) {
-	if _, err := EvaluatePolicy([]byte(`{"services":{"web":{}}}`), "relative"); err == nil {
+	if _, err := evaluatePolicyTest([]byte(`{"services":{"web":{}}}`), "relative"); err == nil {
 		t.Fatal("relative workspace accepted")
 	}
 }
@@ -495,11 +641,11 @@ func TestPolicyRejectsRelativeWorkspace(t *testing.T) {
 func TestPolicyRejectsWindowsNamespacesBeforeFilesystemAccess(t *testing.T) {
 	t.Parallel()
 	model := []byte(`{"services":{"web":{"volumes":[{"type":"bind","source":"\\\\?\\C:\\outside","target":"/data"}]}}}`)
-	findings, err := EvaluatePolicy(model, t.TempDir())
+	findings, err := evaluatePolicyTest(model, t.TempDir())
 	if err != nil || len(findings) != 1 || findings[0].Disposition != DispositionRejected {
 		t.Fatalf("namespace finding=%#v err=%v", findings, err)
 	}
-	if _, err := EvaluatePolicy([]byte(`{"services":{"web":{}}}`), `\\server\share`); err == nil {
+	if _, err := evaluatePolicyTest([]byte(`{"services":{"web":{}}}`), `\\server\share`); err == nil {
 		t.Fatal("UNC workspace accepted")
 	}
 }
@@ -634,7 +780,7 @@ func TestPolicyRecursiveCompositeSchema(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			findings, err := EvaluatePolicy(body, p.workspace)
+			findings, err := evaluatePolicyTest(body, p.workspace)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -736,7 +882,7 @@ func TestPolicySecretOriginsAreSanitizedAndRejected(t *testing.T) {
 				t.Fatal(err)
 			}
 			origin := appconfig.SecretOrigin{RevisionID: revisionID, RevisionNumber: 7, Key: []byte("TOKEN"), Value: []byte(test.secret)}
-			findings, err := EvaluatePolicy(body, p.workspace, origin)
+			findings, err := evaluatePolicyTest(body, p.workspace, origin)
 			if err != nil || len(findings) != 1 {
 				t.Fatalf("findings=%#v err=%v", findings, err)
 			}
@@ -769,12 +915,12 @@ func TestPolicySecretOriginsAreSanitizedAndRejected(t *testing.T) {
 func TestPolicySecretOriginRotationAndUntaintedScopes(t *testing.T) {
 	workspace := t.TempDir()
 	body := []byte(`{"services":{"web":{"privileged":true}}}`)
-	baseline, err := EvaluatePolicy(body, workspace)
+	baseline, err := evaluatePolicyTest(body, workspace)
 	if err != nil || len(baseline) != 1 {
 		t.Fatalf("baseline=%#v err=%v", baseline, err)
 	}
 	unrelated := appconfig.SecretOrigin{RevisionID: uuid.NewString(), RevisionNumber: 1, Key: []byte("TOKEN"), Value: []byte("does-not-occur")}
-	control, err := EvaluatePolicy(body, workspace, unrelated)
+	control, err := evaluatePolicyTest(body, workspace, unrelated)
 	if err != nil || len(control) != 1 || control[0] != baseline[0] {
 		t.Fatalf("untainted scope changed: baseline=%#v control=%#v err=%v", baseline, control, err)
 	}
@@ -782,11 +928,11 @@ func TestPolicySecretOriginRotationAndUntaintedScopes(t *testing.T) {
 	shortValue := []byte("web")
 	first := appconfig.SecretOrigin{RevisionID: uuid.NewString(), RevisionNumber: 1, Key: []byte("TOKEN"), Value: shortValue}
 	second := appconfig.SecretOrigin{RevisionID: uuid.NewString(), RevisionNumber: 2, Key: []byte("TOKEN"), Value: append([]byte(nil), shortValue...)}
-	a, err := EvaluatePolicy(body, workspace, first)
+	a, err := evaluatePolicyTest(body, workspace, first)
 	if err != nil || len(a) != 1 || a[0].Disposition != DispositionRejected {
 		t.Fatalf("first taint=%#v err=%v", a, err)
 	}
-	b, err := EvaluatePolicy(body, workspace, second)
+	b, err := evaluatePolicyTest(body, workspace, second)
 	if err != nil || len(b) != 1 || b[0].Disposition != DispositionRejected {
 		t.Fatalf("second taint=%#v err=%v", b, err)
 	}
@@ -838,6 +984,21 @@ func assertMatrix(t *testing.T, findings []PolicyFinding, want map[string]string
 			t.Fatalf("%s=%s want=%s", c, got[c], d)
 		}
 	}
+}
+
+func evaluatePolicyTest(rendered []byte, workspace string, origins ...appconfig.SecretOrigin) ([]PolicyFinding, error) {
+	return EvaluatePolicy(rendered, workspace, policyTestApplicationID, policyTestProject, origins...)
+}
+
+func findingByCapability(t *testing.T, findings []PolicyFinding, capability string) PolicyFinding {
+	t.Helper()
+	for _, finding := range findings {
+		if finding.Capability == capability {
+			return finding
+		}
+	}
+	t.Fatalf("missing %s in %#v", capability, findings)
+	return PolicyFinding{}
 }
 
 func assertRepositoryParity(t *testing.T, f PolicyFinding) {

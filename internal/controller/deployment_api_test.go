@@ -409,7 +409,8 @@ func TestSecretDerivedPolicyNeverLeaksThroughDurableOrPublicSurfaces(t *testing.
 		Key: []byte("TOKEN"), Value: []byte(secret),
 	}
 	model := []byte(`{"services":{"web":{"cap_add":["RIGSECRETCAPABILITYSENTINEL9Z"]}}}`)
-	policyFindings, err := composeruntime.EvaluatePolicy(model, t.TempDir(), origin)
+	project := "rig-" + strings.ReplaceAll(f.app.ID, "-", "")
+	policyFindings, err := composeruntime.EvaluatePolicy(model, t.TempDir(), f.app.ID, project, origin)
 	if err != nil || len(policyFindings) != 1 || policyFindings[0].Disposition != composeruntime.DispositionRejected {
 		t.Fatalf("policy findings=%#v err=%v", policyFindings, err)
 	}

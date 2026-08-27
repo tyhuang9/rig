@@ -204,7 +204,7 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 	if err := report(reporter, jobs.Running, "evaluate_policy", 60); err != nil {
 		return jobs.ExecutionResult{}, failAfterTemp("internal_error")
 	}
-	findings, err := EvaluatePolicy(configResult.Stdout, source.workspace, configuration.SecretOrigins...)
+	findings, err := EvaluatePolicy(configResult.Stdout, source.workspace, job.ResourceID, project, configuration.SecretOrigins...)
 	if err != nil {
 		return jobs.ExecutionResult{}, failAfterTemp("compose_config_invalid")
 	}

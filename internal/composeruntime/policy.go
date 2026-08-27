@@ -114,13 +114,23 @@ func (e *PolicyError) Error() string { return "compose policy: " + e.Code }
 
 type evaluator struct {
 	workspace     string
+	applicationID string
+	project       string
 	findings      []PolicyFinding
 	indices       map[string]int
 	overflow      bool
 	secretOrigins []appconfig.SecretOrigin
 }
 
-func EvaluatePolicy(rendered []byte, workspace string, secretOrigins ...appconfig.SecretOrigin) ([]PolicyFinding, error) {
+// EvaluatePolicy verifies the effective Compose model against the exact
+// application and project namespace that will be used for mutation. Compose
+// renders default resource names as <project>_<resource>; a different name is
+// a shared host resource capability and must pass the deployment approval gate.
+func EvaluatePolicy(rendered []byte, workspace, applicationID, project string, secretOrigins ...appconfig.SecretOrigin) ([]PolicyFinding, error) {
+	expectedProject, err := projectName(applicationID)
+	if err != nil || project != expectedProject {
+		return nil, &PolicyError{Code: "invalid_project"}
+	}
 	if len(rendered) == 0 || len(rendered) > MaxEffectiveJSONBytes {
 		return nil, &PolicyError{Code: "model_too_large"}
 	}
@@ -153,7 +163,7 @@ func EvaluatePolicy(rendered []byte, workspace string, secretOrigins ...appconfi
 	if len(services) == 0 || len(services) > 512 {
 		return nil, &PolicyError{Code: "malformed_services"}
 	}
-	e := evaluator{workspace: root, indices: make(map[string]int), secretOrigins: secretOrigins}
+	e := evaluator{workspace: root, applicationID: applicationID, project: project, indices: make(map[string]int), secretOrigins: secretOrigins}
 	for _, field := range sortedKeys(top) {
 		if _, supported := supportedTopLevelFields[field]; !supported && !isExtensionField(field) {
 			e.add("unsupported_top_level_field", map[string]any{"field": field}, DispositionRejected)
@@ -820,6 +830,9 @@ func (e *evaluator) externalResources(top map[string]json.RawMessage) {
 		for _, name := range sortedKeys(resources) {
 			definition := resources[name]
 			if isEmptyJSON(definition) {
+				if group.field == "volumes" || group.field == "networks" {
+					e.add("unsupported_"+group.field, map[string]any{"resource": name}, DispositionRejected)
+				}
 				continue
 			}
 			var object map[string]json.RawMessage
@@ -832,8 +845,10 @@ func (e *evaluator) externalResources(top map[string]json.RawMessage) {
 				e.add("unsupported_"+group.field, map[string]any{"resource": name}, DispositionRejected)
 				continue
 			}
+			rejected := false
 			if external {
 				e.add(group.capability, map[string]any{"resource": name}, DispositionRejected)
+				rejected = true
 			}
 			if (group.field == "configs" || group.field == "secrets") && !external {
 				if file, exists := object["file"]; exists && !isEmptyJSON(file) {
@@ -851,16 +866,33 @@ func (e *evaluator) externalResources(top map[string]json.RawMessage) {
 					allowed := group.field == "volumes" && value == "local" || group.field == "networks" && value == "bridge"
 					if !ok || !allowed {
 						e.add("remote_"+strings.TrimSuffix(group.field, "s")+"_driver", map[string]any{"resource": name}, DispositionRejected)
+						rejected = true
 					}
 				}
 				if options, exists := object["driver_opts"]; exists && !isEmptyJSON(options) {
 					e.add("remote_"+strings.TrimSuffix(group.field, "s")+"_options", map[string]any{"resource": name}, DispositionRejected)
+					rejected = true
+				}
+				if !rejected {
+					e.projectResourceName(group.field, name, object["name"])
 				}
 			}
 			clearRawMap(object)
 		}
 		clearRawMap(resources)
 	}
+}
+
+func (e *evaluator) projectResourceName(group, resource string, raw json.RawMessage) {
+	name, valid := rawString(raw)
+	if resource == "" || !valid || name == "" {
+		e.add("unsupported_"+group, map[string]any{"resource": resource}, DispositionRejected)
+		return
+	}
+	if name == e.project+"_"+resource {
+		return
+	}
+	e.add("custom_"+strings.TrimSuffix(group, "s")+"_name", map[string]any{"applicationId": e.applicationID, "resource": resource, "name": name}, DispositionApprovalRequired)
 }
 
 func externalResourceFlag(raw json.RawMessage) (bool, bool) {
