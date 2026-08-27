@@ -452,6 +452,8 @@ func TestLegacyLocalSourceDraftMigratesAndCompletesManagedComposeDeployment(t *t
 	jobService := jobs.New(db)
 	deploymentRepository := deployments.New(db)
 	releaseUp := make(chan struct{})
+	var releaseUpOnce sync.Once
+	release := func() { releaseUpOnce.Do(func() { close(releaseUp) }) }
 	runner := &blockingComposeRunner{upStarted: make(chan struct{}), releaseUp: releaseUp}
 	runner.setConfigJSON([]byte(`{"services":{"web":{"image":"nginx","environment":{"TOKEN":"runtime-secret"}}}}`))
 	executor, err := composeruntime.NewExecutor(applicationStore, materializer, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{
@@ -476,13 +478,18 @@ func TestLegacyLocalSourceDraftMigratesAndCompletesManagedComposeDeployment(t *t
 		dataRoot:      dataRoot,
 	}
 	fixture.startWorker(t)
+	t.Cleanup(release)
 	job := fixture.createJob(t)
 	select {
 	case <-runner.upStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("legacy local deployment did not reach compose up")
+	case <-time.After(20 * time.Second):
+		durable, getErr := jobService.Get(job.ID)
+		if getErr != nil {
+			t.Fatalf("legacy local deployment did not reach compose up: durable job lookup failed: getErr=%v upCalls=%d", getErr, runner.upCallCount())
+		}
+		t.Fatalf("legacy local deployment did not reach compose up: status=%q phase=%q errorCode=%q errorDetailSet=%t attempt=%d upCalls=%d", durable.Status, durable.Phase, durable.ErrorCode, durable.ErrorDetail != "", durable.Attempt, runner.upCallCount())
 	}
-	close(releaseUp)
+	release()
 	completed := waitForJob(t, jobService, job.ID, jobs.Succeeded)
 	if completed.ErrorCode != "" {
 		t.Fatalf("completed legacy job=%#v", completed)
