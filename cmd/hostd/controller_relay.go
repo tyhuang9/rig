@@ -24,6 +24,19 @@ type controllerRelayRunner interface {
 
 type controllerRelayFactory func() (controllerRelayRunner, error)
 
+type controllerRelayManagement interface {
+	Status() controllerrelay.ManagementStatus
+	StartEnrollment(context.Context, string, controllerrelay.ManagementEnrollmentInput) (controllerrelay.ManagementEnrollmentStart, error)
+	PollEnrollment(context.Context, string, string) (controllerrelay.ManagementEnrollmentStatus, error)
+	RemoveBinding(context.Context, string, string) (controllerrelay.ManagementBindingStatus, error)
+	RotateKey(context.Context) (controllerrelay.ManagementKeyRotationStatus, error)
+}
+
+type controllerRelayManagedRunner interface {
+	controllerRelayRunner
+	controllerRelayManagementService() controllerRelayManagement
+}
+
 // controllerRelayRuntime retains the single dependency graph shared by relay
 // lifecycle and management operations. These references are immutable after
 // construction; the management target controls concurrent publication.
@@ -34,6 +47,7 @@ type controllerRelayRuntime struct {
 	enrollment  *controllerrelay.EnrollmentService
 	controls    *controllerrelay.SessionControlService
 	supervisor  *controllerrelay.Supervisor
+	management  *controllerrelay.ManagementService
 }
 
 func (runtime *controllerRelayRuntime) Run(ctx context.Context) error {
@@ -53,6 +67,13 @@ func (runtime *controllerRelayRuntime) Reconcile() {
 	}
 }
 
+func (runtime *controllerRelayRuntime) controllerRelayManagementService() controllerRelayManagement {
+	if runtime == nil {
+		return nil
+	}
+	return runtime.management
+}
+
 // controllerRelayManagementTarget is the host-owned publication point used by
 // lifecycle startup and, later, controller APIs. Reconcile calls made while
 // asynchronous construction is pending are collapsed into one replay.
@@ -60,8 +81,13 @@ type controllerRelayManagementTarget struct {
 	mu          sync.RWMutex
 	runner      controllerRelayRunner
 	runtime     *controllerRelayRuntime
+	management  controllerRelayManagement
 	pending     bool
 	unavailable bool
+
+	managementInFlight int
+	managementDraining bool
+	managementDrained  chan struct{}
 }
 
 func newControllerRelayManagementTarget() *controllerRelayManagementTarget {
@@ -98,6 +124,9 @@ func (target *controllerRelayManagementTarget) install(runner controllerRelayRun
 	}
 	target.runner = runner
 	target.runtime, _ = runner.(*controllerRelayRuntime)
+	if managed, ok := runner.(controllerRelayManagedRunner); ok {
+		target.management = managed.controllerRelayManagementService()
+	}
 	pending := target.pending
 	target.pending = false
 	target.mu.Unlock()
@@ -119,6 +148,40 @@ func (target *controllerRelayManagementTarget) markUnavailable() {
 	target.mu.Unlock()
 }
 
+// markUnexpectedExit permanently unpublishes an installed relay graph. A
+// stopped runner cannot safely serve management mutations, and this terminal
+// state prevents a late runtime from replacing the failed graph.
+func (target *controllerRelayManagementTarget) markUnexpectedExit() {
+	if target == nil {
+		return
+	}
+	target.mu.Lock()
+	if target.runner == nil || target.unavailable {
+		target.mu.Unlock()
+		return
+	}
+	target.managementDraining = true
+	if target.managementInFlight > 0 {
+		if target.managementDrained == nil {
+			target.managementDrained = make(chan struct{})
+		}
+		drained := target.managementDrained
+		target.mu.Unlock()
+		<-drained
+		target.mu.Lock()
+	}
+	if target.runner != nil && target.managementDraining {
+		target.runner = nil
+		target.runtime = nil
+		target.management = nil
+		target.pending = false
+		target.unavailable = true
+	}
+	target.managementDraining = false
+	target.managementDrained = nil
+	target.mu.Unlock()
+}
+
 func (target *controllerRelayManagementTarget) current() (*controllerRelayRuntime, bool) {
 	if target == nil {
 		return nil, false
@@ -126,6 +189,92 @@ func (target *controllerRelayManagementTarget) current() (*controllerRelayRuntim
 	target.mu.RLock()
 	defer target.mu.RUnlock()
 	return target.runtime, target.runtime != nil && !target.unavailable
+}
+
+func (target *controllerRelayManagementTarget) Status() controllerrelay.ManagementStatus {
+	if target == nil {
+		return controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementUnavailable, DiagnosticsUnavailable: true}
+	}
+	target.mu.RLock()
+	management := target.management
+	unavailable := target.unavailable
+	draining := target.managementDraining
+	target.mu.RUnlock()
+	if unavailable || draining {
+		return controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementUnavailable, DiagnosticsUnavailable: true}
+	}
+	if management == nil {
+		return controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementInitializing, DiagnosticsUnavailable: true}
+	}
+	return management.Status()
+}
+
+func (target *controllerRelayManagementTarget) StartEnrollment(ctx context.Context, owner string, input controllerrelay.ManagementEnrollmentInput) (controllerrelay.ManagementEnrollmentStart, error) {
+	management, done := target.beginManagementCall()
+	if management == nil {
+		return controllerrelay.ManagementEnrollmentStart{}, controllerRelayManagementUnavailable()
+	}
+	defer done()
+	return management.StartEnrollment(ctx, owner, input)
+}
+
+func (target *controllerRelayManagementTarget) PollEnrollment(ctx context.Context, owner, enrollmentID string) (controllerrelay.ManagementEnrollmentStatus, error) {
+	management, done := target.beginManagementCall()
+	if management == nil {
+		return controllerrelay.ManagementEnrollmentStatus{}, controllerRelayManagementUnavailable()
+	}
+	defer done()
+	return management.PollEnrollment(ctx, owner, enrollmentID)
+}
+
+func (target *controllerRelayManagementTarget) RemoveBinding(ctx context.Context, owner, bindingID string) (controllerrelay.ManagementBindingStatus, error) {
+	management, done := target.beginManagementCall()
+	if management == nil {
+		return controllerrelay.ManagementBindingStatus{}, controllerRelayManagementUnavailable()
+	}
+	defer done()
+	return management.RemoveBinding(ctx, owner, bindingID)
+}
+
+func (target *controllerRelayManagementTarget) RotateKey(ctx context.Context) (controllerrelay.ManagementKeyRotationStatus, error) {
+	management, done := target.beginManagementCall()
+	if management == nil {
+		return controllerrelay.ManagementKeyRotationStatus{}, controllerRelayManagementUnavailable()
+	}
+	defer done()
+	return management.RotateKey(ctx)
+}
+
+func (target *controllerRelayManagementTarget) beginManagementCall() (controllerRelayManagement, func()) {
+	if target == nil {
+		return nil, nil
+	}
+	target.mu.Lock()
+	if target.unavailable || target.managementDraining || target.management == nil {
+		target.mu.Unlock()
+		return nil, nil
+	}
+	management := target.management
+	target.managementInFlight++
+	target.mu.Unlock()
+
+	var once sync.Once
+	return management, func() {
+		once.Do(func() {
+			target.mu.Lock()
+			target.managementInFlight--
+			if target.managementDraining && target.managementInFlight == 0 && target.managementDrained != nil {
+				drained := target.managementDrained
+				target.managementDrained = nil
+				close(drained)
+			}
+			target.mu.Unlock()
+		})
+	}
+}
+
+func controllerRelayManagementUnavailable() error {
+	return &controllerrelay.ManagementError{Code: controllerrelay.ManagementErrorUnavailable}
 }
 
 // startControllerRelay is deliberately a no-op before invoking its factory
@@ -158,7 +307,11 @@ func startControllerRelay(ctx context.Context, cfg config.Config, logger *slog.L
 			logger.Warn("controller relay unavailable", "outcome", "persistence_unavailable")
 			return
 		}
-		if runner.Run(ctx) != nil {
+		runErr := runner.Run(ctx)
+		if ctx.Err() == nil {
+			target.markUnexpectedExit()
+		}
+		if runErr != nil {
 			// Relay lifecycle outcomes are isolated from host lifetime and are
 			// intentionally fixed-safe here; detailed observability comes only
 			// from the safe Supervisor observer below.
@@ -227,9 +380,13 @@ func newControllerRelayRuntime(cfg config.Config, db *sql.DB, sources *sourcecon
 	if err != nil {
 		return nil, err
 	}
+	management, err := controllerrelay.NewManagementService(repository, enrollment, controls, supervisor)
+	if err != nil {
+		return nil, err
+	}
 	return &controllerRelayRuntime{
 		repository: repository, credentials: credentials, client: client,
-		enrollment: enrollment, controls: controls, supervisor: supervisor,
+		enrollment: enrollment, controls: controls, supervisor: supervisor, management: management,
 	}, nil
 }
 

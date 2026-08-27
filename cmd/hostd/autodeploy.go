@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"log/slog"
 	"sync"
@@ -107,15 +106,15 @@ func waitForAutoDeploy(done <-chan struct{}, timeout time.Duration, logger *slog
 	return false
 }
 
-func newAutoDeployRunner(cfg config.Config, db *sql.DB, sources *sourceconnections.Service, jobService *jobs.Service, logger *slog.Logger) (autoDeployRunner, error) {
-	if !cfg.ComposeRuntime || !cfg.GitHubConnectionsEnabled() || db == nil || sources == nil || !sources.ProviderEnabled() || jobService == nil || logger == nil {
+func newAutoDeployRunner(cfg config.Config, repository *autodeploy.Repository, sources *sourceconnections.Service, jobService *jobs.Service, logger *slog.Logger) (autoDeployRunner, error) {
+	if !cfg.ComposeRuntime || !cfg.GitHubConnectionsEnabled() || repository == nil || sources == nil || !sources.ProviderEnabled() || jobService == nil || logger == nil {
 		return nil, errors.New("github auto-deploy is unavailable")
 	}
 	coordinatorConfig := autodeploy.DefaultCoordinatorConfig()
 	coordinatorConfig.Observer = func(_ context.Context, event autodeploy.CoordinatorEvent) {
 		observeAutoDeployLifecycle(logger, event)
 	}
-	return autodeploy.NewCoordinator(autodeploy.NewRepository(db), sourceHeadResolver{service: sources}, jobService, coordinatorConfig)
+	return autodeploy.NewCoordinator(repository, sourceHeadResolver{service: sources}, jobService, coordinatorConfig)
 }
 
 func observeAutoDeployLifecycle(logger *slog.Logger, event autodeploy.CoordinatorEvent) {

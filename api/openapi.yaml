@@ -305,6 +305,68 @@ paths:
       responses:
         '200': {description: Live repository branches, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubBranchPage'}}}}
         default: {$ref: '#/components/responses/Problem'}
+  /api/v1/relay/status:
+    get:
+      operationId: getRelayStatus
+      responses:
+        '200': {description: Relay availability and safe operator diagnostics, content: {application/json: {schema: {$ref: '#/components/schemas/RelayStatus'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/relay/enrollments:
+    post:
+      operationId: startRelayEnrollment
+      security: [{sessionCookie: [], csrfHeader: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/StartRelayEnrollmentRequest'}}}}
+      responses:
+        '201': {description: Relay enrollment started, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/RelayEnrollmentStart'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/relay/enrollments/{enrollmentId}/poll:
+    parameters: [{$ref: '#/components/parameters/EnrollmentId'}]
+    post:
+      operationId: pollRelayEnrollment
+      security: [{sessionCookie: [], csrfHeader: []}]
+      responses:
+        '200': {description: Relay enrollment reached a terminal state, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/RelayEnrollmentStatus'}}}}
+        '202': {description: Relay enrollment remains pending, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/RelayEnrollmentStatus'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/relay/bindings/{bindingId}:
+    parameters: [{$ref: '#/components/parameters/BindingId'}]
+    delete:
+      operationId: removeRelayBinding
+      security: [{sessionCookie: [], csrfHeader: []}]
+      responses:
+        '200': {description: Relay binding removed, content: {application/json: {schema: {$ref: '#/components/schemas/RelayBindingStatus'}}}}
+        '202': {description: Relay binding removal is pending, content: {application/json: {schema: {$ref: '#/components/schemas/RelayBindingStatus'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/relay/key-rotations:
+    post:
+      operationId: startRelayKeyRotation
+      security: [{sessionCookie: [], csrfHeader: []}]
+      responses:
+        '202': {description: Relay key rotation started, content: {application/json: {schema: {$ref: '#/components/schemas/RelayKeyRotationStatus'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/auto-deploy:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    get:
+      operationId: getApplicationAutoDeploy
+      responses:
+        '200': {description: Application auto-deploy status, content: {application/json: {schema: {$ref: '#/components/schemas/ApplicationAutoDeployStatus'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    put:
+      operationId: updateApplicationAutoDeploy
+      security: [{sessionCookie: [], csrfHeader: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/UpdateApplicationAutoDeployRequest'}}}}
+      responses:
+        '200': {description: Application auto-deploy status updated, content: {application/json: {schema: {$ref: '#/components/schemas/ApplicationAutoDeployStatus'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/auto-deploy/resume:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    post:
+      operationId: resumeApplicationAutoDeploy
+      security: [{sessionCookie: [], csrfHeader: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ResumeApplicationAutoDeployRequest'}}}}
+      responses:
+        '200': {description: Application auto-deploy resumed, content: {application/json: {schema: {$ref: '#/components/schemas/ApplicationAutoDeployStatus'}}}}
+        default: {$ref: '#/components/responses/Problem'}
 components:
   securitySchemes:
     sessionCookie:
@@ -332,6 +394,8 @@ components:
     ConnectionId: {name: connectionId, in: path, required: true, schema: {type: string, pattern: '^[a-f0-9]{32}$'}}
     InstallationId: {name: installationId, in: path, required: true, schema: {type: integer, format: int64, minimum: 1}}
     RepositoryId: {name: repositoryId, in: path, required: true, schema: {type: integer, format: int64, minimum: 1}}
+    EnrollmentId: {name: enrollmentId, in: path, required: true, schema: {type: string, format: uuid}}
+    BindingId: {name: bindingId, in: path, required: true, schema: {type: string, format: uuid}}
     Page: {name: page, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 10000, default: 1}}
     PerPage: {name: perPage, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 100, default: 30}}
   responses:
@@ -410,3 +474,96 @@ components:
     GitHubRepositoryPage: {type: object, required: [page, perPage, totalCount, items], properties: {page: {type: integer}, perPage: {type: integer}, totalCount: {type: integer}, items: {type: array, items: {$ref: '#/components/schemas/GitHubRepository'}}}}
     GitHubBranch: {type: object, required: [name, sha, protected], properties: {name: {type: string}, sha: {type: string}, protected: {type: boolean}}}
     GitHubBranchPage: {type: object, required: [page, perPage, items], properties: {page: {type: integer}, perPage: {type: integer}, items: {type: array, items: {$ref: '#/components/schemas/GitHubBranch'}}}}
+    RelayStatus:
+      type: object
+      additionalProperties: false
+      required: [availability, state, paused, outcome, diagnosticsUnavailable, pendingCommands, activeLeases, expiredLeases, oldestPendingAgeSeconds, observerDropped]
+      properties:
+        availability: {type: string, enum: [initializing, available, unavailable]}
+        state: {type: string, maxLength: 64}
+        paused: {type: boolean}
+        outcome: {type: string, maxLength: 64}
+        diagnosticsUnavailable: {type: boolean}
+        pendingCommands: {type: integer, minimum: 0}
+        activeLeases: {type: integer, minimum: 0}
+        expiredLeases: {type: integer, minimum: 0}
+        oldestPendingAgeSeconds: {type: integer, minimum: 0}
+        observerDropped: {type: integer, format: int64, minimum: 0}
+    StartRelayEnrollmentRequest:
+      type: object
+      additionalProperties: false
+      required: [connectionId, installationId, repositoryId]
+      properties:
+        connectionId: {type: string, pattern: '^[a-f0-9]{32}$'}
+        installationId: {type: integer, format: int64, minimum: 1}
+        repositoryId: {type: integer, format: int64, minimum: 1}
+    RelayEnrollmentStart:
+      type: object
+      additionalProperties: false
+      required: [enrollmentId, authorizationUrl, status, expiresAt]
+      properties:
+        enrollmentId: {type: string, format: uuid}
+        authorizationUrl: {type: string, format: uri}
+        status: {type: string, const: pending}
+        expiresAt: {type: string, format: date-time}
+    RelayEnrollmentStatus:
+      type: object
+      additionalProperties: false
+      required: [enrollmentId, status, createdAt, expiresAt, updatedAt]
+      properties:
+        enrollmentId: {type: string, format: uuid}
+        bindingId: {type: string, format: uuid}
+        status: {type: string, enum: [pending, authorized, denied, expired, failed]}
+        createdAt: {type: string, format: date-time}
+        expiresAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
+        completedAt: {type: string, format: date-time}
+    RelayBindingStatus:
+      type: object
+      additionalProperties: false
+      required: [bindingId, state, updatedAt]
+      properties:
+        bindingId: {type: string, format: uuid}
+        state: {type: string, enum: [pending, authorized, denied, expired, removal_pending, removed, access_lost, failed]}
+        updatedAt: {type: string, format: date-time}
+    RelayKeyRotationStatus:
+      type: object
+      additionalProperties: false
+      required: [rotationId, state, expiresAt]
+      properties:
+        rotationId: {type: string, format: uuid}
+        state: {type: string, enum: [prepare, propose, confirm, new_key_auth, finalize, completed, failed]}
+        expiresAt: {type: string, format: date-time}
+    ApplicationAutoDeployStatus:
+      type: object
+      additionalProperties: false
+      required: [applicationId, revision, enabled, state, source, sourceScopeActive, latestResolvedSha, activeSha, lastSuccessfulDeployedSha, pausedSha, retryAttempt, updatedAt]
+      properties:
+        applicationId: {type: string, format: uuid}
+        revision: {type: integer, format: int64, minimum: 0}
+        enabled: {type: boolean}
+        state: {type: string, enum: [disabled, idle, dispatching, deploying, paused, retry_wait]}
+        source: {$ref: '#/components/schemas/SourceSummary'}
+        sourceScopeActive: {type: boolean}
+        pauseCode: {type: string, maxLength: 64}
+        activeJobId: {type: string, format: uuid}
+        latestResolvedSha: {type: string, maxLength: 128}
+        activeSha: {type: string, maxLength: 128}
+        lastSuccessfulDeployedSha: {type: string, maxLength: 128}
+        pausedSha: {type: string, maxLength: 128}
+        nextRetryAt: {type: string, format: date-time}
+        retryAttempt: {type: integer, minimum: 0}
+        updatedAt: {type: string, format: date-time}
+    UpdateApplicationAutoDeployRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedRevision, enabled]
+      properties:
+        expectedRevision: {type: integer, format: int64, minimum: 0}
+        enabled: {type: boolean}
+    ResumeApplicationAutoDeployRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedRevision]
+      properties:
+        expectedRevision: {type: integer, format: int64, minimum: 0}

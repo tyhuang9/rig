@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "9a8ed29e1b6ecc5a8f03ee0de0ca317bcbaa1c13649074be3ed9a240a7d34189"
+const SourceSHA256 = "763baf2d2344b6404dc313143c93063468b3604052c0d9cb206eddccf604d76c"
 
 var Operations = map[string]Operation{
 	"bootstrap":                       {Method: "POST", Path: "/api/v1/auth/bootstrap"},
@@ -19,8 +19,10 @@ var Operations = map[string]Operation{
 	"disconnectSourceConnection":      {Method: "DELETE", Path: "/api/v1/source-connections/{connectionId}"},
 	"doctor":                          {Method: "GET", Path: "/api/v1/system/doctor"},
 	"getApplication":                  {Method: "GET", Path: "/api/v1/apps/{appId}"},
+	"getApplicationAutoDeploy":        {Method: "GET", Path: "/api/v1/apps/{appId}/auto-deploy"},
 	"getApplicationConfiguration":     {Method: "GET", Path: "/api/v1/apps/{appId}/configuration"},
 	"getJob":                          {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
+	"getRelayStatus":                  {Method: "GET", Path: "/api/v1/relay/status"},
 	"grantRuntimeApproval":            {Method: "POST", Path: "/api/v1/apps/{appId}/runtime-approvals"},
 	"inspectImport":                   {Method: "POST", Path: "/api/v1/apps/import/inspect"},
 	"listApplications":                {Method: "GET", Path: "/api/v1/apps"},
@@ -39,18 +41,24 @@ var Operations = map[string]Operation{
 	"logout":                          {Method: "DELETE", Path: "/api/v1/auth/sessions/current"},
 	"me":                              {Method: "GET", Path: "/api/v1/auth/me"},
 	"pollGitHubDeviceConnection":      {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/poll"},
+	"pollRelayEnrollment":             {Method: "POST", Path: "/api/v1/relay/enrollments/{enrollmentId}/poll"},
 	"refreshSourceConnection":         {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/refresh"},
+	"removeRelayBinding":              {Method: "DELETE", Path: "/api/v1/relay/bindings/{bindingId}"},
 	"replaceApplicationConfiguration": {Method: "PUT", Path: "/api/v1/apps/{appId}/configuration"},
 	"restartApplication":              {Method: "POST", Path: "/api/v1/apps/{appId}/restart"},
+	"resumeApplicationAutoDeploy":     {Method: "POST", Path: "/api/v1/apps/{appId}/auto-deploy/resume"},
 	"resumeJob":                       {Method: "POST", Path: "/api/v1/jobs/{jobId}/resume"},
 	"revokeRuntimeApproval":           {Method: "DELETE", Path: "/api/v1/apps/{appId}/runtime-approvals/{approvalId}"},
 	"rotateCSRF":                      {Method: "GET", Path: "/api/v1/auth/csrf"},
 	"startApplication":                {Method: "POST", Path: "/api/v1/apps/{appId}/start"},
 	"startGitHubDeviceConnection":     {Method: "POST", Path: "/api/v1/source-connections/github/device"},
+	"startRelayEnrollment":            {Method: "POST", Path: "/api/v1/relay/enrollments"},
+	"startRelayKeyRotation":           {Method: "POST", Path: "/api/v1/relay/key-rotations"},
 	"stopApplication":                 {Method: "POST", Path: "/api/v1/apps/{appId}/stop"},
 	"streamJobEvents":                 {Method: "GET", Path: "/api/v1/jobs/{jobId}/events/stream"},
 	"streamLogs":                      {Method: "GET", Path: "/api/v1/apps/{appId}/logs/stream"},
 	"systemStatus":                    {Method: "GET", Path: "/api/v1/system/status"},
+	"updateApplicationAutoDeploy":     {Method: "PUT", Path: "/api/v1/apps/{appId}/auto-deploy"},
 }
 
 type Application struct {
@@ -62,6 +70,24 @@ type Application struct {
 	Slug        string        `json:"slug"`
 	Source      SourceSummary `json:"source"`
 	Status      string        `json:"status"`
+}
+
+type ApplicationAutoDeployStatus struct {
+	ActiveJobID               string        `json:"activeJobId,omitempty"`
+	ActiveSha                 string        `json:"activeSha"`
+	ApplicationID             string        `json:"applicationId"`
+	Enabled                   bool          `json:"enabled"`
+	LastSuccessfulDeployedSha string        `json:"lastSuccessfulDeployedSha"`
+	LatestResolvedSha         string        `json:"latestResolvedSha"`
+	NextRetryAt               string        `json:"nextRetryAt,omitempty"`
+	PauseCode                 string        `json:"pauseCode,omitempty"`
+	PausedSha                 string        `json:"pausedSha"`
+	RetryAttempt              int           `json:"retryAttempt"`
+	Revision                  int64         `json:"revision"`
+	Source                    SourceSummary `json:"source"`
+	SourceScopeActive         bool          `json:"sourceScopeActive"`
+	State                     string        `json:"state"`
+	UpdatedAt                 string        `json:"updatedAt"`
 }
 
 type ApplicationConfiguration struct {
@@ -352,6 +378,48 @@ type Problem struct {
 	Type      string            `json:"type"`
 }
 
+type RelayBindingStatus struct {
+	BindingID string `json:"bindingId"`
+	State     string `json:"state"`
+	UpdatedAt string `json:"updatedAt"`
+}
+
+type RelayEnrollmentStart struct {
+	AuthorizationUrl string `json:"authorizationUrl"`
+	EnrollmentID     string `json:"enrollmentId"`
+	ExpiresAt        string `json:"expiresAt"`
+	Status           string `json:"status"`
+}
+
+type RelayEnrollmentStatus struct {
+	BindingID    string `json:"bindingId,omitempty"`
+	CompletedAt  string `json:"completedAt,omitempty"`
+	CreatedAt    string `json:"createdAt"`
+	EnrollmentID string `json:"enrollmentId"`
+	ExpiresAt    string `json:"expiresAt"`
+	Status       string `json:"status"`
+	UpdatedAt    string `json:"updatedAt"`
+}
+
+type RelayKeyRotationStatus struct {
+	ExpiresAt  string `json:"expiresAt"`
+	RotationID string `json:"rotationId"`
+	State      string `json:"state"`
+}
+
+type RelayStatus struct {
+	ActiveLeases            int    `json:"activeLeases"`
+	Availability            string `json:"availability"`
+	DiagnosticsUnavailable  bool   `json:"diagnosticsUnavailable"`
+	ExpiredLeases           int    `json:"expiredLeases"`
+	ObserverDropped         int64  `json:"observerDropped"`
+	OldestPendingAgeSeconds int    `json:"oldestPendingAgeSeconds"`
+	Outcome                 string `json:"outcome"`
+	Paused                  bool   `json:"paused"`
+	PendingCommands         int    `json:"pendingCommands"`
+	State                   string `json:"state"`
+}
+
 type Release struct {
 	AppID                       string `json:"appId"`
 	ArchiveSha256               string `json:"archiveSha256,omitempty"`
@@ -380,6 +448,10 @@ type ReplaceApplicationConfigurationRequest struct {
 	Remove                 []string                        `json:"remove"`
 	Secrets                []SecretConfigurationValueInput `json:"secrets"`
 	Variables              []ConfigurationValueInput       `json:"variables"`
+}
+
+type ResumeApplicationAutoDeployRequest struct {
+	ExpectedRevision int64 `json:"expectedRevision"`
 }
 
 type RuntimeApproval struct {
@@ -472,10 +544,21 @@ type SourceSummary struct {
 	Type            string `json:"type"`
 }
 
+type StartRelayEnrollmentRequest struct {
+	ConnectionID   string `json:"connectionId"`
+	InstallationID int64  `json:"installationId"`
+	RepositoryID   int64  `json:"repositoryId"`
+}
+
 type SystemStatus struct {
 	Capabilities Capabilities `json:"capabilities"`
 	Daemon       string       `json:"daemon"`
 	Diagnostics  Diagnostics  `json:"diagnostics"`
+}
+
+type UpdateApplicationAutoDeployRequest struct {
+	Enabled          bool  `json:"enabled"`
+	ExpectedRevision int64 `json:"expectedRevision"`
 }
 
 type User struct {
