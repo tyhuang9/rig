@@ -41,7 +41,7 @@ func (s *Store) AccessRoutes(ctx context.Context, installationID, repositoryID i
 	if installationID <= 0 || repositoryID < 0 {
 		return nil, ErrInvalid
 	}
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT b.controller_id::text FROM relay_bindings b JOIN relay_controllers c ON c.controller_id=b.controller_id WHERE b.installation_id=$1 AND ($2::bigint=0 OR b.repository_id=$2) AND b.revoked_at IS NULL AND c.state='active' ORDER BY b.controller_id LIMIT 1001`, installationID, repositoryID)
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT b.controller_id::text FROM relay_bindings b JOIN relay_controllers c ON c.controller_id=b.controller_id WHERE b.installation_id=$1 AND ($2::bigint=0 OR b.repository_id=$2) AND b.revoked_at IS NULL AND c.state='active' ORDER BY b.controller_id::text LIMIT 1001`, installationID, repositoryID)
 	if err != nil {
 		return nil, err
 	}
