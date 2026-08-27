@@ -57,11 +57,12 @@ func (s *Store) LoadChallengeForAuthentication(ctx context.Context, sessionID st
 	}
 	var out AuthenticationChallenge
 	out.SessionID = sessionID
-	err := s.pool.QueryRow(ctx, `SELECT ch.controller_id::text,ch.key_id::text,ch.client_nonce,ch.server_nonce,ch.ack_digest,ch.created_at,ch.expires_at,k.public_key FROM relay_wss_challenges ch JOIN relay_controllers c ON c.controller_id=ch.controller_id JOIN relay_controller_keys k ON k.controller_id=ch.controller_id AND k.key_id=ch.key_id WHERE ch.session_id=$1 AND ch.consumed_at IS NULL AND c.state='active' AND k.state='active'`).Scan(&out.ControllerID, &out.KeyID, &out.ClientNonce, &out.ServerNonce, &out.ACKDigest, &out.CreatedAt, &out.ExpiresAt, &out.PublicKey)
+	err := s.pool.QueryRow(ctx, `SELECT ch.controller_id::text,ch.key_id::text,ch.client_nonce,ch.server_nonce,ch.ack_digest,ch.created_at,ch.expires_at,k.public_key FROM relay_wss_challenges ch JOIN relay_controllers c ON c.controller_id=ch.controller_id JOIN relay_controller_keys k ON k.controller_id=ch.controller_id AND k.key_id=ch.key_id WHERE ch.session_id=$1 AND ch.consumed_at IS NULL AND c.state='active' AND k.state='active'`, sessionID).Scan(&out.ControllerID, &out.KeyID, &out.ClientNonce, &out.ServerNonce, &out.ACKDigest, &out.CreatedAt, &out.ExpiresAt, &out.PublicKey)
 	if isNoRows(err) {
 		return AuthenticationChallenge{}, ErrNotFound
 	}
 	if err != nil {
+		out.Destroy()
 		return AuthenticationChallenge{}, err
 	}
 	if !out.ExpiresAt.After(s.now().UTC()) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"reflect"
 	"regexp"
 	"sort"
 	"testing"
@@ -113,6 +114,45 @@ func TestCreateChallengeChecksAuthorizationRowsAndPropagatesOutage(t *testing.T)
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestLoadChallengeForAuthenticationBindsSessionAndReturnsChallenge(t *testing.T) {
+	s, m := mockStore(t)
+	clientNonce := bytes.Repeat([]byte{1}, 32)
+	serverNonce := bytes.Repeat([]byte{2}, 32)
+	ackDigest := bytes.Repeat([]byte{3}, 32)
+	publicKey := bytes.Repeat([]byte{4}, 32)
+	createdAt := fixedNow.Add(-time.Minute)
+	expiresAt := fixedNow.Add(time.Minute)
+
+	m.ExpectQuery("SELECT ch.controller_id::text").WithArgs(testSession).WillReturnRows(
+		pgxmock.NewRows([]string{"controller_id", "key_id", "client_nonce", "server_nonce", "ack_digest", "created_at", "expires_at", "public_key"}).
+			AddRow(testController, testKey, clientNonce, serverNonce, ackDigest, createdAt, expiresAt, publicKey),
+	)
+
+	got, err := s.LoadChallengeForAuthentication(context.Background(), testSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := AuthenticationChallenge{
+		ChallengeInput: ChallengeInput{
+			SessionID:    testSession,
+			ControllerID: testController,
+			KeyID:        testKey,
+			ClientNonce:  clientNonce,
+			ServerNonce:  serverNonce,
+			ACKDigest:    ackDigest,
+			ExpiresAt:    expiresAt,
+		},
+		PublicKey: publicKey,
+		CreatedAt: createdAt,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("challenge=%#v, want %#v", got, want)
+	}
+	if err := m.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestConstraintClassificationDoesNotHideOutages(t *testing.T) {
