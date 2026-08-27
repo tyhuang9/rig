@@ -11,9 +11,16 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+)
+
+const (
+	testRelayOrigin    = "https://relay.example"
+	testGitHubClientID = "client"
 )
 
 func TestNewRelayHTTPSClientRequiresCanonicalHTTPSOrigin(t *testing.T) {
@@ -24,19 +31,24 @@ func TestNewRelayHTTPSClientRequiresCanonicalHTTPSOrigin(t *testing.T) {
 		"https://relay.example/path", "https://relay.example:0001",
 	}
 	for _, origin := range invalid {
-		if _, err := NewRelayHTTPSClient(origin, roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, nil })); err == nil {
+		if _, err := NewRelayHTTPSClient(origin, testGitHubClientID, roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, nil })); err == nil {
 			t.Errorf("accepted noncanonical origin %q", origin)
 		}
 	}
 	for _, origin := range []string{"https://relay.example", "https://relay.example:8443", "https://127.0.0.1:8443", "https://[::1]:8443"} {
-		if _, err := NewRelayHTTPSClient(origin, roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, nil })); err != nil {
+		if _, err := NewRelayHTTPSClient(origin, testGitHubClientID, roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, nil })); err != nil {
 			t.Errorf("rejected canonical origin %q: %v", origin, err)
+		}
+	}
+	for _, clientID := range []string{"", "client id", strings.Repeat("x", 256), "client?"} {
+		if _, err := NewRelayHTTPSClient(testRelayOrigin, clientID, roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, nil })); err == nil {
+			t.Errorf("accepted invalid GitHub client ID %q", clientID)
 		}
 	}
 }
 
 func TestRelayHTTPSClientDefaultTransportIsBoundedAndProxyFree(t *testing.T) {
-	client, err := NewRelayHTTPSClient("https://relay.example", nil)
+	client, err := NewRelayHTTPSClient(testRelayOrigin, testGitHubClientID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,10 +89,10 @@ func TestRelayHTTPSClientStartUsesExactWireContract(t *testing.T) {
 				t.Fatalf("missing wire field %q in %s", key, body)
 			}
 		}
-		response := `{"authorizationUrl":"https://github.com/login/oauth/authorize?client_id=abc","pollToken":"` + base64.RawURLEncoding.EncodeToString(poll) + `"}`
+		response := `{"authorizationUrl":"` + validClientAuthorizationURL(8) + `","pollToken":"` + base64.RawURLEncoding.EncodeToString(poll) + `"}`
 		return jsonResponse(http.StatusCreated, response), nil
 	})
-	client, err := NewRelayHTTPSClient("https://relay.example", transport)
+	client, err := NewRelayHTTPSClient(testRelayOrigin, testGitHubClientID, transport)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,6 +103,75 @@ func TestRelayHTTPSClientStartUsesExactWireContract(t *testing.T) {
 	defer started.Destroy()
 	if !bytes.Equal(started.PollToken, poll) || !strings.HasPrefix(started.AuthorizationURL, "https://github.com/") {
 		t.Fatalf("unexpected start result %#v", started)
+	}
+}
+
+func TestValidAuthorizationURLRequiresExactCanonicalGitHubOAuthEndpoint(t *testing.T) {
+	const redirectURI = testRelayOrigin + "/v1/github/callback"
+	valid := validClientAuthorizationURL(8)
+	if !validAuthorizationURL(valid, testGitHubClientID, redirectURI, 8) {
+		t.Fatalf("rejected producer-shaped GitHub authorization URL %q", valid)
+	}
+
+	invalid := []string{
+		"",
+		"https://github.com/login/oauth/authorize",
+		"http://github.com/login/oauth/authorize",
+		"https://attacker.example/login/oauth/authorize",
+		"https://github.com.attacker.example/login/oauth/authorize",
+		"https://api.github.com/login/oauth/authorize",
+		"https://github.com.:443/login/oauth/authorize",
+		"https://github.com:443/login/oauth/authorize",
+		"https://user:pass@github.com/login/oauth/authorize",
+		"https://github.com/login/oauth/authorize#fragment",
+		"https://github.com/login/oauth/access_token",
+		"https://github.com/login/oauth/authorize/",
+		"https://github.com/login/oauth/%61uthorize",
+		"https://github.com/login/oauth/authorize?",
+		mutatedClientAuthorizationURL(8, func(query url.Values) { query.Set("client_id", "different") }),
+		mutatedClientAuthorizationURL(8, func(query url.Values) { query.Set("redirect_uri", "https://other-relay.example/v1/github/callback") }),
+		validClientAuthorizationURL(9),
+		mutatedClientAuthorizationURL(8, func(query url.Values) { query.Set("scope", "repo") }),
+		mutatedClientAuthorizationURL(8, func(query url.Values) { query["client_id"] = append(query["client_id"], testGitHubClientID) }),
+		mutatedClientAuthorizationURL(8, func(query url.Values) { query.Set("extra", "value") }),
+		mutatedClientAuthorizationURL(8, func(query url.Values) { query.Set("code_challenge_method", "plain") }),
+		mutatedClientAuthorizationURL(8, func(query url.Values) { query.Set("state", "short") }),
+		mutatedClientAuthorizationURL(8, func(query url.Values) { query.Set("code_challenge", strings.Repeat("A", 42)+"B") }),
+		strings.Replace(valid, "client_id=client&", "", 1),
+		strings.Replace(valid, "client_id=client&", "state="+base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))+"&client_id=client&", 1),
+		"https://github.com/login/oauth/authorize?client_id=abc;state=safe",
+		"HTTPS://github.com/login/oauth/authorize",
+		"https://GITHUB.com/login/oauth/authorize",
+		"https://github.com//login/oauth/authorize",
+		"https://github.com/login/oauth/authorize\x00?state=safe",
+		"https://github.com/login/oauth/authorize?state=" + strings.Repeat("a", 4096),
+	}
+	for _, raw := range invalid {
+		if validAuthorizationURL(raw, testGitHubClientID, redirectURI, 8) {
+			t.Errorf("accepted non-GitHub or noncanonical authorization URL %q", raw)
+		}
+	}
+}
+
+func TestRelayHTTPSClientStartRejectsForeignAuthorizationURLWithoutLeakingResponse(t *testing.T) {
+	poll := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, pollTokenBytes))
+	const attackerURL = "https://attacker.example/login/oauth/authorize?providerToken=ghu_private_marker"
+	client, err := NewRelayHTTPSClient(testRelayOrigin, testGitHubClientID, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return jsonResponse(http.StatusCreated, `{"authorizationUrl":"`+attackerURL+`","pollToken":"`+poll+`"}`), nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := client.Start(context.Background(), validClientEnrollmentRequest())
+	if !IsClientCode(err, "invalid_response") {
+		t.Fatalf("expected invalid_response, got %#v", err)
+	}
+	if started.AuthorizationURL != "" || started.PollToken != nil {
+		t.Fatalf("unsafe response material returned: %#v", started)
+	}
+	errorText := fmt.Sprintf("%v %#v", err, err)
+	if strings.Contains(errorText, "attacker.example") || strings.Contains(errorText, "ghu_private_marker") {
+		t.Fatalf("relay response leaked through error: %s", errorText)
 	}
 }
 
@@ -106,7 +187,7 @@ func TestRelayHTTPSClientRejectsRedirectWithoutFollowing(t *testing.T) {
 		http.Redirect(w, &http.Request{}, destination.URL, http.StatusTemporaryRedirect)
 	}))
 	defer redirector.Close()
-	client, err := NewRelayHTTPSClient(redirector.URL, redirector.Client().Transport)
+	client, err := NewRelayHTTPSClient(redirector.URL, testGitHubClientID, redirector.Client().Transport)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +212,7 @@ func TestRelayHTTPSClientRejectsOversizeDuplicateUnknownAndNonJSONResponses(t *t
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			client, err := NewRelayHTTPSClient("https://relay.example", roundTripFunc(func(*http.Request) (*http.Response, error) {
+			client, err := NewRelayHTTPSClient(testRelayOrigin, testGitHubClientID, roundTripFunc(func(*http.Request) (*http.Response, error) {
 				response := &http.Response{StatusCode: http.StatusCreated, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(test.body))}
 				response.Header.Set("Content-Type", test.contentType)
 				return response, nil
@@ -165,7 +246,7 @@ func TestRelayHTTPSClientPollStatusAndSecretFreeErrorMapping(t *testing.T) {
 	}
 	for index, response := range responses {
 		t.Run(fmt.Sprintf("case_%d", index), func(t *testing.T) {
-			client, err := NewRelayHTTPSClient("https://relay.example", roundTripFunc(func(*http.Request) (*http.Response, error) {
+			client, err := NewRelayHTTPSClient(testRelayOrigin, testGitHubClientID, roundTripFunc(func(*http.Request) (*http.Response, error) {
 				result := jsonResponse(response.status, response.body)
 				result.Header.Set("Retry-After", "999999")
 				return result, nil
@@ -204,7 +285,7 @@ func TestRelayHTTPSClientRejectsInvalidPollShapes(t *testing.T) {
 		`{"status":"unknown"}`,
 		`{"status":"pending","status":"authorized"}`,
 	} {
-		client, err := NewRelayHTTPSClient("https://relay.example", roundTripFunc(func(*http.Request) (*http.Response, error) {
+		client, err := NewRelayHTTPSClient(testRelayOrigin, testGitHubClientID, roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return jsonResponse(http.StatusOK, body), nil
 		}))
 		if err != nil {
@@ -214,6 +295,25 @@ func TestRelayHTTPSClientRejectsInvalidPollShapes(t *testing.T) {
 			t.Fatalf("invalid poll shape accepted %s: %v", body, err)
 		}
 	}
+}
+
+func validClientAuthorizationURL(repositoryID int64) string {
+	return mutatedClientAuthorizationURL(repositoryID, nil)
+}
+
+func mutatedClientAuthorizationURL(repositoryID int64, mutate func(url.Values)) string {
+	query := url.Values{
+		"client_id":             {testGitHubClientID},
+		"redirect_uri":          {testRelayOrigin + "/v1/github/callback"},
+		"repository_id":         {strconv.FormatInt(repositoryID, 10)},
+		"code_challenge_method": {"S256"},
+		"state":                 {base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))},
+		"code_challenge":        {base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x22}, 32))},
+	}
+	if mutate != nil {
+		mutate(query)
+	}
+	return "https://github.com/login/oauth/authorize?" + query.Encode()
 }
 
 func validClientEnrollmentRequest() RelayEnrollmentRequest {

@@ -636,6 +636,7 @@ func TestNewControllerRelayRuntimeRetainsOneSharedManagementGraph(t *testing.T) 
 	cfg.DataRoot = t.TempDir()
 	cfg.ControllerRelay = true
 	cfg.RelayOrigin = "https://relay.example"
+	cfg.GitHubClientID = "client"
 	if err := cfg.EnsureDataRoot(); err != nil {
 		t.Fatal(err)
 	}

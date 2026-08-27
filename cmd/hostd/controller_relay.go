@@ -357,7 +357,7 @@ func newControllerRelayRuntime(cfg config.Config, db *sql.DB, sources *sourcecon
 	if err != nil {
 		return nil, err
 	}
-	client, err := controllerrelay.NewRelayHTTPSClient(cfg.RelayOrigin, nil)
+	client, err := controllerrelay.NewRelayHTTPSClient(cfg.RelayOrigin, cfg.GitHubClientID, nil)
 	if err != nil {
 		return nil, err
 	}
