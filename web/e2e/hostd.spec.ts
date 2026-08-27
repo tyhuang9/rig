@@ -127,9 +127,9 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
   expect((await csrfRestore).ok()).toBe(true);
   await expect(restoredPage.getByRole("heading", { name: longName })).toBeVisible();
   expect(await restoredPage.evaluate(() => window.sessionStorage.getItem("hostd-csrf"))).toBeTruthy();
-  await expect(restoredPage.getByRole("button", { name: "Deploy with fake runtime" })).toBeVisible();
+  await expect(restoredPage.getByRole("button", { name: "Deploy latest" })).toBeVisible();
   await expect(restoredPage.getByText("Development capability")).toBeVisible();
-  await restoredPage.getByRole("button", { name: "Deploy with fake runtime" }).click();
+  await restoredPage.getByRole("button", { name: "Deploy latest" }).click();
   await expect(restoredPage.getByText(/Deployment job queued:/)).toBeVisible();
   expect(await restoredPage.evaluate(() => window.sessionStorage.getItem("hostd-csrf"))).toBeTruthy();
 
