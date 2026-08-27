@@ -2,7 +2,7 @@
 
 This runbook covers the independently deployable Rig GitHub webhook relay and its authoritative PostgreSQL state. The supplied production Compose contract always uses TLS at the relay listener, including when a reverse proxy is in front of it. Plain HTTP is permitted only for explicit loopback development outside these production Compose files.
 
-Cloud account, DNS, region, and live provisioning are outside this repository delivery. Controller enrollment UI, subscription synchronization, the local source-event inbox, and automatic deployment are Unit 9 work and are also out of scope here.
+Cloud account, DNS, region, and live provisioning are outside this repository delivery. The controller and dashboard implement enrollment, subscription synchronization, the durable local source-event inbox, latest-head automatic deployment, binding removal, and key rotation; their end-to-end workflow is documented in [GitHub-connected deployments](github-connected-deployments.md).
 
 ## Security and data boundaries
 
@@ -256,7 +256,7 @@ Follow PostgreSQL's [SQL dump](https://www.postgresql.org/docs/current/backup-du
 
 ## Key and secret rotation
 
-- **Controller Ed25519 keys:** use the versioned WSS two-phase rotation: propose the new key, sign the relay challenge with the new private key, confirm, and finalize only after the controller has durably stored the new key and proven reconnection. Keep the old private key until finalization. If either side cannot confirm, abandon/expire the proposal rather than deleting the only working key. Unit 9 owns the controller-side operator experience.
+- **Controller Ed25519 keys:** use the versioned WSS two-phase rotation: propose the new key, sign the relay challenge with the new private key, confirm, and finalize only after the controller has durably stored the new key and proven reconnection. Keep the old private key until finalization. If either side cannot confirm, abandon/expire the proposal rather than deleting the only working key. The dashboard Relay management panel exposes the administrator action and recovery state.
 - **GitHub App private key:** create a second App private key in GitHub, place it in the protected file, recreate the relay, verify GitHub API/recovery success, then delete the old App key in GitHub. Never delete the old key first.
 - **GitHub client secret:** stage the replacement in GitHub and the protected file, recreate the relay, verify enrollment in staging, then revoke the previous secret if GitHub permits overlap. Otherwise use a planned enrollment maintenance window.
 - **Webhook secret:** GitHub uses the configured current secret for new deliveries. Coordinate GitHub and file replacement in a short maintenance window, recreate the relay, validate a test delivery, and recover any missed delivery afterward.
