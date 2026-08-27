@@ -1413,13 +1413,15 @@ func TestActiveLeaseRenewalUpdatesFenceAndFailureTerminates(t *testing.T) {
 			}
 			deadline.Stop()
 			if test.renewErr == nil {
-				if harness.session.lease.ExpiresAt != storeState.renewResult.ExpiresAt || harness.session.lease.Fence != original.Fence {
-					t.Fatalf("renewed lease=%+v", harness.session.lease)
-				}
 				cancel()
 			}
 			if failure := <-result; failure == nil || failure.code != test.wantCode {
 				t.Fatalf("failure=%#v", failure)
+			}
+			if test.renewErr == nil {
+				if harness.session.lease.ExpiresAt != storeState.renewResult.ExpiresAt || harness.session.lease.Fence != original.Fence {
+					t.Fatalf("renewed lease=%+v", harness.session.lease)
+				}
 			}
 			cancel()
 		})
