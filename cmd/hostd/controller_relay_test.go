@@ -45,15 +45,19 @@ type firstRunAwareRelayRunner struct {
 type controllerRelayManagementFake struct {
 	mu      sync.Mutex
 	status  controllerrelay.ManagementStatus
-	calls   [4]int
-	entered [4]chan<- struct{}
-	blocked [4]<-chan struct{}
+	calls   [5]int
+	entered [5]chan<- struct{}
+	blocked [5]<-chan struct{}
 }
 
 func (management *controllerRelayManagementFake) Status() controllerrelay.ManagementStatus {
 	management.mu.Lock()
 	defer management.mu.Unlock()
 	return management.status
+}
+func (management *controllerRelayManagementFake) ReadModel(context.Context, string) (controllerrelay.ManagementReadModel, error) {
+	management.recordCall(4)
+	return controllerrelay.ManagementReadModel{RemovableBindings: make([]controllerrelay.ManagementBindingSummary, 0)}, nil
 }
 func (management *controllerRelayManagementFake) StartEnrollment(context.Context, string, controllerrelay.ManagementEnrollmentInput) (controllerrelay.ManagementEnrollmentStart, error) {
 	management.recordCall(0)
@@ -87,7 +91,7 @@ func (management *controllerRelayManagementFake) recordCall(index int) {
 		<-blocked
 	}
 }
-func (management *controllerRelayManagementFake) callCounts() [4]int {
+func (management *controllerRelayManagementFake) callCounts() [5]int {
 	management.mu.Lock()
 	defer management.mu.Unlock()
 	return management.calls
@@ -388,7 +392,12 @@ func TestControllerRelayManagementTargetLifecycleStatusAndUnavailableMethods(t *
 			t.Fatalf("management error=%v", err)
 		}
 	}
-	_, err := target.StartEnrollment(ctx, "owner", controllerrelay.ManagementEnrollmentInput{})
+	readModel, err := target.ReadModel(ctx, "owner")
+	assertUnavailable(err)
+	if readModel.RemovableBindings == nil || len(readModel.RemovableBindings) != 0 {
+		t.Fatalf("initializing read model=%#v", readModel)
+	}
+	_, err = target.StartEnrollment(ctx, "owner", controllerrelay.ManagementEnrollmentInput{})
 	assertUnavailable(err)
 	_, err = target.PollEnrollment(ctx, "owner", "enrollment")
 	assertUnavailable(err)
@@ -403,6 +412,11 @@ func TestControllerRelayManagementTargetLifecycleStatusAndUnavailableMethods(t *
 	}
 	_, err = target.RotateKey(ctx)
 	assertUnavailable(err)
+	readModel, err = target.ReadModel(ctx, "owner")
+	assertUnavailable(err)
+	if readModel.RemovableBindings == nil || len(readModel.RemovableBindings) != 0 {
+		t.Fatalf("unavailable read model=%#v", readModel)
+	}
 }
 
 func TestControllerRelayManagementTargetUnexpectedExitIsTerminalButCancellationIsClean(t *testing.T) {
@@ -442,7 +456,7 @@ func TestControllerRelayManagementTargetUnexpectedExitIsTerminalButCancellationI
 			assertUnavailable(err)
 			_, err = target.RotateKey(context.Background())
 			assertUnavailable(err)
-			if calls := management.callCounts(); calls != [4]int{} {
+			if calls := management.callCounts(); calls != [5]int{} {
 				t.Fatalf("post-exit mutation reached management: %v", calls)
 			}
 			if target.install(&controllerRelayManagedRunnerFake{managedRelayRunnerFake: &managedRelayRunnerFake{}, management: management}) {
@@ -486,6 +500,10 @@ func TestControllerRelayManagementTargetDrainsAdmittedMutationsBeforeTerminalBou
 		index  int
 		invoke func(*controllerRelayManagementTarget) error
 	}{
+		{name: "read_model", index: 4, invoke: func(target *controllerRelayManagementTarget) error {
+			_, err := target.ReadModel(context.Background(), "owner")
+			return err
+		}},
 		{name: "start_enrollment", index: 0, invoke: func(target *controllerRelayManagementTarget) error {
 			_, err := target.StartEnrollment(context.Background(), "owner", controllerrelay.ManagementEnrollmentInput{})
 			return err
@@ -605,7 +623,7 @@ func TestControllerRelayManagementTargetConcurrentPublicationAndMutations(t *tes
 	if status := target.Status(); status.Availability != controllerrelay.ManagementAvailable || status.State != controllerrelay.SessionReady {
 		t.Fatalf("published status=%#v", status)
 	}
-	if got := management.callCounts(); got != [4]int{callers / 4, callers / 4, callers / 4, callers / 4} {
+	if got := management.callCounts(); got != [5]int{callers / 4, callers / 4, callers / 4, callers / 4, 0} {
 		t.Fatalf("management calls=%v", got)
 	}
 	if runtime, available := target.current(); available || runtime != nil {

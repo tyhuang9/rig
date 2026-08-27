@@ -427,6 +427,97 @@ func (r *Repository) Bindings(ctx context.Context, owner string) ([]Installation
 	return values, rows.Err()
 }
 
+const maxRelayReadModelBindings = 1000
+
+const relayReadModelBindingsQuery = `SELECT binding_id,connection_id,installation_id,repository_id,state,updated_at
+	FROM relay_installation_bindings
+	WHERE owner_user_id=? AND state IN ('authorized','access_lost','removal_pending')
+	ORDER BY updated_at DESC,binding_id DESC
+	LIMIT 1001`
+
+// ReadModel loads only the durable fields required by the controller relay
+// status API. Both projections share one read-only transaction so callers do
+// not observe a binding set and rotation state from different snapshots.
+func (r *Repository) ReadModel(ctx context.Context, owner string) (RelayReadModel, error) {
+	result := RelayReadModel{RemovableBindings: make([]RelayBindingReadModel, 0)}
+	if r == nil || r.db == nil || ctx == nil || !validOpaqueID(owner) {
+		return result, ErrInvalid
+	}
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return result, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, relayReadModelBindingsQuery, owner)
+	if err != nil {
+		return result, err
+	}
+	for rows.Next() {
+		var binding RelayBindingReadModel
+		var updated string
+		if err = rows.Scan(&binding.BindingID, &binding.ConnectionID, &binding.InstallationID, &binding.RepositoryID, &binding.State, &updated); err != nil {
+			rows.Close()
+			return result, err
+		}
+		if binding.UpdatedAt, err = parseTimestamp(updated); err != nil {
+			rows.Close()
+			return result, err
+		}
+		result.RemovableBindings = append(result.RemovableBindings, binding)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return result, err
+	}
+	if err = rows.Close(); err != nil {
+		return result, err
+	}
+	if len(result.RemovableBindings) > maxRelayReadModelBindings {
+		return result, ErrState
+	}
+
+	rotationRows, err := tx.QueryContext(ctx, `SELECT r.state,r.expires_at,r.updated_at
+		FROM relay_key_rotations r
+		JOIN relay_controllers c ON c.controller_id=r.controller_id
+		WHERE c.singleton=1 AND c.state='active'
+			AND r.state IN ('prepare','propose','confirm','new_key_auth','finalize')
+		ORDER BY r.updated_at DESC
+		LIMIT 2`)
+	if err != nil {
+		return result, err
+	}
+	defer rotationRows.Close()
+	rotationCount := 0
+	for rotationRows.Next() {
+		rotationCount++
+		if rotationCount > 1 {
+			return result, ErrState
+		}
+		var expires, updated string
+		if err = rotationRows.Scan(&result.KeyRotation.State, &expires, &updated); err != nil {
+			return result, err
+		}
+		if result.KeyRotation.ExpiresAt, err = parseTimestamp(expires); err != nil {
+			return result, err
+		}
+		if result.KeyRotation.UpdatedAt, err = parseTimestamp(updated); err != nil {
+			return result, err
+		}
+		result.KeyRotation.InProgress = true
+	}
+	if err = rotationRows.Err(); err != nil {
+		return result, err
+	}
+	if err = rotationRows.Close(); err != nil {
+		return result, err
+	}
+	if err = tx.Commit(); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
 func (r *Repository) MarkBindingRemovalPending(ctx context.Context, owner, bindingID string, changedAt time.Time) error {
 	return r.transitionBinding(ctx, owner, bindingID, []string{BindingAuthorized, BindingAccessLost}, BindingRemovalPending, "", changedAt)
 }

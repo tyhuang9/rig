@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "763baf2d2344b6404dc313143c93063468b3604052c0d9cb206eddccf604d76c"
+const SourceSHA256 = "34f3a400735bd02a4a72e683631ac253e4684225ca0338597f85fbd81e627b01"
 
 var Operations = map[string]Operation{
 	"bootstrap":                       {Method: "POST", Path: "/api/v1/auth/bootstrap"},
@@ -384,6 +384,15 @@ type RelayBindingStatus struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
+type RelayBindingSummary struct {
+	BindingID      string `json:"bindingId"`
+	ConnectionID   string `json:"connectionId"`
+	InstallationID int64  `json:"installationId"`
+	RepositoryID   int64  `json:"repositoryId"`
+	State          string `json:"state"`
+	UpdatedAt      string `json:"updatedAt"`
+}
+
 type RelayEnrollmentStart struct {
 	AuthorizationUrl string `json:"authorizationUrl"`
 	EnrollmentID     string `json:"enrollmentId"`
@@ -407,17 +416,27 @@ type RelayKeyRotationStatus struct {
 	State      string `json:"state"`
 }
 
+type RelayKeyRotationSummary struct {
+	ExpiresAt  string `json:"expiresAt,omitempty"`
+	InProgress bool   `json:"inProgress"`
+	State      string `json:"state,omitempty"`
+	UpdatedAt  string `json:"updatedAt,omitempty"`
+}
+
 type RelayStatus struct {
-	ActiveLeases            int    `json:"activeLeases"`
-	Availability            string `json:"availability"`
-	DiagnosticsUnavailable  bool   `json:"diagnosticsUnavailable"`
-	ExpiredLeases           int    `json:"expiredLeases"`
-	ObserverDropped         int64  `json:"observerDropped"`
-	OldestPendingAgeSeconds int    `json:"oldestPendingAgeSeconds"`
-	Outcome                 string `json:"outcome"`
-	Paused                  bool   `json:"paused"`
-	PendingCommands         int    `json:"pendingCommands"`
-	State                   string `json:"state"`
+	ActiveLeases            int                     `json:"activeLeases"`
+	Availability            string                  `json:"availability"`
+	DiagnosticsUnavailable  bool                    `json:"diagnosticsUnavailable"`
+	ExpiredLeases           int                     `json:"expiredLeases"`
+	KeyRotation             RelayKeyRotationSummary `json:"keyRotation"`
+	ObserverDropped         int64                   `json:"observerDropped"`
+	OldestPendingAgeSeconds int                     `json:"oldestPendingAgeSeconds"`
+	Outcome                 string                  `json:"outcome"`
+	Paused                  bool                    `json:"paused"`
+	PendingCommands         int                     `json:"pendingCommands"`
+	ReadModelAvailable      bool                    `json:"readModelAvailable"`
+	RemovableBindings       []RelayBindingSummary   `json:"removableBindings"`
+	State                   string                  `json:"state"`
 }
 
 type Release struct {

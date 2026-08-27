@@ -44,6 +44,10 @@ type relayManagementFake struct {
 	removeErr     error
 	rotation      controllerrelay.ManagementKeyRotationStatus
 	rotationErr   error
+	readModel     controllerrelay.ManagementReadModel
+	readModelErr  error
+	readOwner     string
+	readCalls     int
 	startOwner    string
 	pollOwner     string
 	removeOwner   string
@@ -54,6 +58,11 @@ type relayManagementFake struct {
 }
 
 func (fake *relayManagementFake) Status() controllerrelay.ManagementStatus { return fake.status }
+func (fake *relayManagementFake) ReadModel(_ context.Context, owner string) (controllerrelay.ManagementReadModel, error) {
+	fake.readOwner = owner
+	fake.readCalls++
+	return fake.readModel, fake.readModelErr
+}
 func (fake *relayManagementFake) StartEnrollment(_ context.Context, owner string, input controllerrelay.ManagementEnrollmentInput) (controllerrelay.ManagementEnrollmentStart, error) {
 	fake.startOwner, fake.startInput = owner, input
 	return fake.start, fake.startErr
@@ -156,6 +165,85 @@ func TestRelayManagementRoutesValidateScopeAndProjectContracts(t *testing.T) {
 	rotation := relayAuthenticatedRequest(handler, http.MethodPost, "/api/v1/relay/key-rotations", "")
 	if rotation.Code != http.StatusAccepted || fake.rotationCalls != 1 {
 		t.Fatalf("rotation=%d %s calls=%d", rotation.Code, rotation.Body.String(), fake.rotationCalls)
+	}
+}
+
+func TestRelayStatusReadModelIsOwnerScopedNoStoreAndPure(t *testing.T) {
+	owner := uuid.NewString()
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	fake := &relayManagementFake{
+		status: controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementAvailable, State: "ready"},
+		readModel: controllerrelay.ManagementReadModel{
+			RemovableBindings: []controllerrelay.ManagementBindingSummary{{
+				BindingID: "11111111-1111-4111-8111-111111111111", ConnectionID: "0123456789abcdef0123456789abcdef",
+				InstallationID: 101, RepositoryID: 202, State: controllerrelay.BindingAccessLost, UpdatedAt: now,
+			}},
+			KeyRotation: controllerrelay.ManagementKeyRotationSummary{
+				InProgress: true, State: controllerrelay.RotationConfirm, ExpiresAt: now.Add(time.Hour), UpdatedAt: now.Add(time.Minute),
+			},
+		},
+	}
+	handler := (&Server{Auth: controllerAuthFake{user: auth.User{ID: owner, Role: "administrator"}}, RelayManagement: fake, Logger: relayTestLogger()}).Handler()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/relay/status", nil)
+	request.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: "session"})
+	// GET intentionally has no CSRF header.
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" || fake.readOwner != owner || fake.readCalls != 1 {
+		t.Fatalf("status=%d cache=%q owner=%q calls=%d body=%s", response.Code, response.Header().Get("Cache-Control"), fake.readOwner, fake.readCalls, body)
+	}
+	for _, expected := range []string{`"readModelAvailable":true`, `"removableBindings":[{`, `"connectionId":"0123456789abcdef0123456789abcdef"`, `"state":"access_lost"`, `"keyRotation":{`, `"inProgress":true`, `"state":"confirm"`} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("status body missing %q: %s", expected, body)
+		}
+	}
+	for _, forbidden := range []string{`"removableBindings":null`, `"rotationId"`, `"controllerId"`, `"keyId"`, `"provider"`, `"credential"`, `"frame"`, "ghu_", "github_pat_"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("status body contains %q: %s", forbidden, body)
+		}
+	}
+	if fake.startOwner != "" || fake.pollOwner != "" || fake.removeOwner != "" || fake.rotationCalls != 0 {
+		t.Fatalf("GET caused mutation calls: %#v", fake)
+	}
+}
+
+func TestRelayStatusLifecycleAndFailuresDoNotReadOrLeak(t *testing.T) {
+	owner := uuid.NewString()
+	for _, lifecycle := range []string{controllerrelay.ManagementInitializing, controllerrelay.ManagementUnavailable} {
+		t.Run(lifecycle, func(t *testing.T) {
+			fake := &relayManagementFake{status: controllerrelay.ManagementStatus{Availability: lifecycle, DiagnosticsUnavailable: true}}
+			handler := (&Server{Auth: controllerAuthFake{user: auth.User{ID: owner, Role: "administrator"}}, RelayManagement: fake, Logger: relayTestLogger()}).Handler()
+			response := relayAuthenticatedRequest(handler, http.MethodGet, "/api/v1/relay/status", "")
+			body := response.Body.String()
+			if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" || fake.readCalls != 0 {
+				t.Fatalf("lifecycle=%s status=%d cache=%q reads=%d body=%s", lifecycle, response.Code, response.Header().Get("Cache-Control"), fake.readCalls, body)
+			}
+			if !strings.Contains(body, `"readModelAvailable":false`) || !strings.Contains(body, `"removableBindings":[]`) || !strings.Contains(body, `"keyRotation":{"inProgress":false}`) || strings.Contains(body, `"removableBindings":null`) {
+				t.Fatalf("unsafe lifecycle defaults=%s", body)
+			}
+		})
+	}
+
+	const raw = "ghu_secret provider-private-body controller-id=private key-id=private frame=private internal/path"
+	fake := &relayManagementFake{
+		status:       controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementAvailable},
+		readModelErr: errors.New(raw),
+	}
+	handler := (&Server{Auth: controllerAuthFake{user: auth.User{ID: owner, Role: "administrator"}}, RelayManagement: fake, Logger: relayTestLogger()}).Handler()
+	failed := relayAuthenticatedRequest(handler, http.MethodGet, "/api/v1/relay/status", "")
+	if failed.Code != http.StatusServiceUnavailable || failed.Header().Get("Cache-Control") != "no-store" || failed.Header().Get("Content-Type") != "application/problem+json" || !strings.Contains(failed.Body.String(), `"code":"relay_unavailable"`) || !strings.Contains(failed.Body.String(), `"status":503`) {
+		t.Fatalf("read failure=%d headers=%v body=%s", failed.Code, failed.Header(), failed.Body.String())
+	}
+	if strings.Contains(failed.Body.String(), raw) || strings.Contains(failed.Body.String(), "ghu_") || strings.Contains(failed.Body.String(), "provider-private") || strings.Contains(failed.Body.String(), "internal/path") {
+		t.Fatalf("read failure leaked raw error: %s", failed.Body.String())
+	}
+
+	unauthenticated := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/relay/status", nil)
+	handler.ServeHTTP(unauthenticated, request)
+	if unauthenticated.Code != http.StatusUnauthorized || unauthenticated.Header().Get("Cache-Control") != "no-store" || fake.readCalls != 1 || !strings.Contains(unauthenticated.Body.String(), `"code":"unauthenticated"`) {
+		t.Fatalf("unauthenticated=%d cache=%q reads=%d body=%s", unauthenticated.Code, unauthenticated.Header().Get("Cache-Control"), fake.readCalls, unauthenticated.Body.String())
 	}
 }
 

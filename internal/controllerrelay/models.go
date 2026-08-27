@@ -100,6 +100,32 @@ type InstallationBinding struct {
 	CompletedAt    *time.Time
 }
 
+// RelayBindingReadModel is the narrow durable projection exposed to relay
+// management. It intentionally excludes controller, provider, error, and
+// protocol fields.
+type RelayBindingReadModel struct {
+	BindingID      string
+	ConnectionID   string
+	InstallationID int64
+	RepositoryID   int64
+	State          string
+	UpdatedAt      time.Time
+}
+
+// RelayKeyRotationReadModel is the narrow durable projection for the one live
+// singleton-controller rotation. A zero value means no rotation is active.
+type RelayKeyRotationReadModel struct {
+	InProgress bool
+	State      string
+	ExpiresAt  time.Time
+	UpdatedAt  time.Time
+}
+
+type RelayReadModel struct {
+	RemovableBindings []RelayBindingReadModel
+	KeyRotation       RelayKeyRotationReadModel
+}
+
 type Enrollment struct {
 	EnrollmentID     string
 	OwnerUserID      string
