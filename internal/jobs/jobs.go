@@ -249,37 +249,38 @@ func (s *Service) CreateWithInputFinalized(request CreateRequest, finalize Creat
 		return Job{}, false, err
 	}
 	defer tx.Rollback()
-	if request.IdempotencyKey != "" {
-		existing, lookupErr := byIdempotencyTx(tx, request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey)
-		if lookupErr == nil {
-			if !sameCreateRequest(existing, request, input) {
-				return Job{}, false, ErrIdempotency
-			}
-			if finalize != nil {
-				if err = finalize(tx, existing); err != nil {
-					return Job{}, false, err
-				}
-			}
-			if err = tx.Commit(); err != nil {
-				return Job{}, false, err
-			}
-			if existing.Status == string(Queued) {
-				s.signal()
-			}
-			return existing, false, nil
-		}
-		if !errors.Is(lookupErr, sql.ErrNoRows) {
-			return Job{}, false, lookupErr
-		}
-	}
 	job := Job{ID: uuid.NewString(), Type: request.Type, ResourceType: request.ResourceType, ResourceID: request.ResourceID, Status: string(Queued), Phase: "queued", CreatedAt: now, UpdatedAt: now, Input: input}
 	job.RequestedBy = request.RequestedBy
 	_, err = tx.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,idempotency_key,requested_by,input_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, job.ID, job.Type, job.ResourceType, job.ResourceID, job.Status, job.Phase, nullIfBlank(request.IdempotencyKey), nullIfBlank(request.RequestedBy), string(input), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 	if err != nil {
-		if isConstraint(err) {
+		if !isConstraint(err) {
+			return Job{}, false, err
+		}
+		if request.IdempotencyKey == "" {
 			return Job{}, false, ErrApplicationBusy
 		}
-		return Job{}, false, err
+		existing, lookupErr := byIdempotencyTx(tx, request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey)
+		if errors.Is(lookupErr, sql.ErrNoRows) {
+			return Job{}, false, ErrApplicationBusy
+		}
+		if lookupErr != nil {
+			return Job{}, false, lookupErr
+		}
+		if !sameCreateRequest(existing, request, input) {
+			return Job{}, false, ErrIdempotency
+		}
+		if finalize != nil {
+			if err = finalize(tx, existing); err != nil {
+				return Job{}, false, err
+			}
+		}
+		if err = tx.Commit(); err != nil {
+			return Job{}, false, err
+		}
+		if existing.Status == string(Queued) {
+			s.signal()
+		}
+		return existing, false, nil
 	}
 	if _, err := appendEvent(tx, now, job.ID, "info", "queued", "job_queued", "Job queued"); err != nil {
 		return Job{}, false, err
