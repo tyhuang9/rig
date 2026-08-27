@@ -313,7 +313,7 @@ function Test-DocumentationText {
         'Windows Docker Desktop deployment with these file-backed secrets is unsupported',
         'Those fakes do not prove Linux `lstat`',
         'stat -c ''%u:%g %a %F %n''',
-        'Unit 9',
+        'GitHub-connected deployments',
         'Cloud account, DNS, region, and live provisioning are outside this repository delivery.'
     ) $errors 'docs_required_operations'
     return $errors.ToArray()
