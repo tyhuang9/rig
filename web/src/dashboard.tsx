@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
 import { NavLink, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
@@ -17,6 +17,44 @@ import { ApplicationConfigurationPanel } from "./application-configuration";
 import { AutoDeployPanel } from "./auto-deploy";
 import { DeploymentHistoryPanel } from "./deployment-history";
 import { UnsavedChangesGuard, useConfirmDiscard } from "./unsaved-changes";
+
+type RelayPanelProps = { role: string };
+type RelayPanelLoader = () => Promise<{ default: ComponentType<RelayPanelProps> }>;
+
+const defaultRelayPanelLoader: RelayPanelLoader = async () => {
+  const relayManagement = await import("./relay-management");
+  return { default: relayManagement.RelayManagementPanel };
+};
+
+class RelayPanelErrorBoundary extends Component<{ children: ReactNode; fallback: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
+
+function RelayPanelLoading() {
+  return <section className="relay-panel" aria-label="GitHub deployment relay"><div className="relay-loading" role="status" aria-live="polite" aria-busy="true"><span className="sr-only">Loading relay management</span><i/><i/></div></section>;
+}
+
+function RelayPanelSlot({ role, loader }: RelayPanelProps & { loader: RelayPanelLoader }) {
+  const [attempt, setAttempt] = useState(0);
+  const retryInFlight = useRef(false);
+  const LazyRelayManagementPanel = useMemo(() => lazy(loader), [attempt, loader]);
+  useEffect(() => { retryInFlight.current = false; }, [attempt]);
+  const retry = () => {
+    if (retryInFlight.current) return;
+    retryInFlight.current = true;
+    setAttempt((current) => current + 1);
+  };
+  const errorFallback = <section className="relay-panel" aria-label="GitHub deployment relay"><div className="callout danger relay-chunk-error" role="alert"><strong>Relay management unavailable</strong><span>Relay management controls could not be loaded. Machine information remains available.</span><button className="button small" type="button" onClick={retry}>Retry relay management</button></div></section>;
+  return <RelayPanelErrorBoundary key={attempt} fallback={errorFallback}><Suspense fallback={<RelayPanelLoading/>}><LazyRelayManagementPanel role={role}/></Suspense></RelayPanelErrorBoundary>;
+}
 
 type IconName = "apps" | "machines" | "activity" | "logout";
 
@@ -188,10 +226,10 @@ function ApplicationDetailPage() {
   </>;
 }
 
-function MachinesPage() {
+export function MachinesPage({ role, relayPanelLoader = defaultRelayPanelLoader }: { role: string; relayPanelLoader?: RelayPanelLoader }) {
   const query = useQuery({ queryKey: ["machines"], queryFn: api.machines });
   const items = query.data?.items ?? [];
-  return <><PageHeader title="Machines" subtitle="Hosts registered with this local controller."/>{query.isLoading ? <LoadingState/> : query.isError ? <QueryError message={query.error.message}/> : <div className="machine-list">{items.map((machine) => <article className="machine" key={machine.id}><div><h2>{machine.name}</h2><p>{machine.os} · {machine.architecture} · {machine.hostname}</p></div><StatusText value={machine.status}/><div className="machine-meta">Local controller · independent runtime diagnostics</div></article>)}</div>}</>;
+  return <><PageHeader title="Machines" subtitle="Hosts registered with this local controller."/>{query.isLoading ? <LoadingState/> : query.isError ? <QueryError message={query.error.message}/> : <div className="machine-list">{items.map((machine) => <article className="machine" key={machine.id}><div><h2>{machine.name}</h2><p>{machine.os} · {machine.architecture} · {machine.hostname}</p></div><StatusText value={machine.status}/><div className="machine-meta">Local controller · independent runtime diagnostics</div></article>)}</div>}<RelayPanelSlot role={role} loader={relayPanelLoader}/></>;
 }
 
 function ActivityPage() {
@@ -242,5 +280,5 @@ export function App() {
   if (bootstrapRequired === null) return <main className="auth"><LoadingState/></main>;
   if (!user) return <Login setup={bootstrapRequired} onAuthenticated={(nextUser) => { setUser(nextUser); setBootstrapRequired(false); navigate("/apps"); }}/>;
   const logout = async () => { try { await api.logout(); } finally { clearCSRF(); setUser(null); navigate("/login"); } };
-  return <UnsavedChangesGuard><Layout user={user} onLogout={logout}><Routes><Route path="/" element={<ApplicationsPage/>}/><Route path="/apps" element={<ApplicationsPage/>}/><Route path="/apps/new" element={<AddApplicationPage/>}/><Route path="/apps/:id" element={<ApplicationDetailPage/>}/><Route path="/machines" element={<MachinesPage/>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="*" element={<ApplicationsPage/>}/></Routes></Layout></UnsavedChangesGuard>;
+  return <UnsavedChangesGuard><Layout user={user} onLogout={logout}><Routes><Route path="/" element={<ApplicationsPage/>}/><Route path="/apps" element={<ApplicationsPage/>}/><Route path="/apps/new" element={<AddApplicationPage/>}/><Route path="/apps/:id" element={<ApplicationDetailPage/>}/><Route path="/machines" element={<MachinesPage role={user.role}/>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="*" element={<ApplicationsPage/>}/></Routes></Layout></UnsavedChangesGuard>;
 }
