@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/config"
@@ -75,6 +76,15 @@ func main() {
 		logger.Error("job recovery failed", "error", err)
 		os.Exit(1)
 	}
+	applicationConfiguration, err := appconfig.New(db, cfg.DataRoot)
+	if err != nil {
+		logger.Error("application configuration setup failed", "error", err)
+		os.Exit(1)
+	}
+	if err := applicationConfiguration.Recover(context.Background()); err != nil {
+		logger.Error("application configuration recovery failed", "error", err)
+		os.Exit(1)
+	}
 	var githubProvider sourceconnections.Provider
 	if cfg.GitHubConnectionsEnabled() {
 		githubProvider, err = githubapp.New(cfg.GitHubClientID)
@@ -107,7 +117,7 @@ func main() {
 	} else {
 		close(workerDone)
 	}
-	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: j, Machines: m, Sources: sources, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)

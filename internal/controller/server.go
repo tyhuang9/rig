@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/apicontract"
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/jobs"
@@ -44,6 +45,7 @@ type Server struct {
 	Logger             *slog.Logger
 	BootstrapCompleted func()
 	Sources            *sourceconnections.Service
+	Configuration      *appconfig.Store
 	authenticationWork *authenticationWorkGate
 }
 
@@ -85,6 +87,8 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("createApplication", s.require(s.createApp)),
 		contractRoute("inspectImport", s.require(s.inspectApp)),
 		contractRoute("getApplication", s.require(s.getApp)),
+		contractRoute("getApplicationConfiguration", s.require(s.getApplicationConfiguration)),
+		contractRoute("replaceApplicationConfiguration", s.require(s.replaceApplicationConfiguration)),
 		contractRoute("listServices", s.require(s.services)),
 		contractRoute("deployApplication", s.require(s.action("deploy"))),
 		contractRoute("startApplication", s.require(s.action("start"))),

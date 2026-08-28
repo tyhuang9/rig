@@ -66,7 +66,7 @@ func TestMigrateFreshUpgradePreservesDataAndIsIdempotent(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&versions); err != nil {
 		t.Fatal(err)
 	}
-	if users != 1 || versions != 4 {
+	if users != 1 || versions != 5 {
 		t.Fatalf("preserved users = %d, migration versions = %d", users, versions)
 	}
 }
@@ -94,6 +94,100 @@ func TestReleaseSnapshotMigrationPreservesLegacyReleasesAndPreventsReadyDuplicat
 	var state sql.NullString
 	if err := db.QueryRow(`SELECT workspace_state FROM releases WHERE id='legacy'`).Scan(&state); err != nil || state.Valid {
 		t.Fatalf("legacy workspace state = %#v, %v", state, err)
+	}
+}
+
+func TestApplicationConfigurationMigrationBackfillsAndEnforcesRevisionIntegrity(t *testing.T) {
+	db := openMemoryDatabase(t)
+	for _, name := range []string{"001_foundation.sql", "002_github_connections.sql", "003_application_sources.sql", "004_release_snapshots.sql"} {
+		body, err := migrations.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(string(body)); err != nil {
+			t.Fatalf("apply %s: %v", name, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES('legacy','legacy','Legacy','draft',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	body, err := migrations.ReadFile("migrations/005_application_configuration.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(body)); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, app := range []string{"legacy", "future"} {
+		if app == "future" {
+			if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES('future','future','Future','draft',datetime('now'),datetime('now'))`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var number int64
+		var id sql.NullString
+		if err := db.QueryRow(`SELECT revision_id,revision_number FROM application_configuration_heads WHERE app_id=?`, app).Scan(&id, &number); err != nil || id.Valid || number != 0 {
+			t.Fatalf("%s head id=%v number=%d err=%v", app, id, number, err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE application_configuration_heads SET revision_id='missing',revision_number=1,updated_at=datetime('now') WHERE app_id='legacy'`); err == nil {
+		t.Fatal("revision-zero pairing accepted an unknown revision")
+	}
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES('owner','owner','hash',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO application_configuration_revisions(id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count) VALUES('rev-a','legacy',1,'legacy/rev-a.bundle','owner',datetime('now'),0,1),('rev-b','future',1,'future/rev-b.bundle',NULL,datetime('now'),1,0)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE application_configuration_heads SET revision_id='rev-a',revision_number=1,updated_at=datetime('now') WHERE app_id='legacy'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE application_configuration_heads SET revision_id='rev-b',revision_number=1,updated_at=datetime('now') WHERE app_id='legacy'`); err == nil {
+		t.Fatal("cross-app head revision accepted")
+	}
+
+	invalidReleaseStatements := []string{
+		`INSERT INTO releases(id,app_id,status,metadata_json,created_at,configuration_revision_id,configuration_revision_number) VALUES('cross','legacy','ready','{}',datetime('now'),'rev-b',1)`,
+		`INSERT INTO releases(id,app_id,status,metadata_json,created_at,configuration_revision_id,configuration_revision_number) VALUES('wrong-number','legacy','ready','{}',datetime('now'),'rev-a',2)`,
+		`INSERT INTO releases(id,app_id,status,metadata_json,created_at,configuration_revision_number) VALUES('negative','legacy','ready','{}',datetime('now'),-1)`,
+	}
+	for _, statement := range invalidReleaseStatements {
+		if _, err := db.Exec(statement); err == nil {
+			t.Fatalf("invalid release accepted: %s", statement)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,configuration_revision_id,configuration_revision_number) VALUES('valid','legacy','ready','{}',datetime('now'),'rev-a',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE releases SET configuration_revision_id=NULL,configuration_revision_number=0 WHERE id='valid'`); err == nil {
+		t.Fatal("release configuration was mutable")
+	}
+	if _, err := db.Exec(`UPDATE releases SET app_id='future' WHERE id='valid'`); err == nil {
+		t.Fatal("release was allowed to cross application configuration ownership")
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at) VALUES('revision-zero','legacy','ready','{}',datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE releases SET app_id='future' WHERE id='revision-zero'`); err == nil {
+		t.Fatal("revision-zero release application was mutable")
+	}
+	if _, err := db.Exec(`UPDATE application_configuration_revisions SET bundle_ref='changed' WHERE id='rev-a'`); err == nil {
+		t.Fatal("configuration revision was mutable")
+	}
+	if _, err := db.Exec(`DELETE FROM application_configuration_revisions WHERE id='rev-a'`); err == nil {
+		t.Fatal("referenced configuration revision was deletable")
+	}
+	if _, err := db.Exec(`UPDATE application_configuration_revisions SET created_by='owner' WHERE id='rev-b'`); err == nil {
+		t.Fatal("immutable revision unexpectedly allowed actor reassignment")
+	}
+	if _, err := db.Exec(`DELETE FROM users WHERE id='owner'`); err == nil {
+		t.Fatal("configuration revision creator was deleted")
+	}
+	// Configuration history is intentionally retained. Applications with
+	// revisions must be archived rather than hard-deleted.
+	if _, err := db.Exec(`DELETE FROM applications WHERE id='legacy'`); err == nil {
+		t.Fatal("application configuration history was cascade-deleted")
 	}
 }
 

@@ -31,14 +31,16 @@ func (e *Error) Error() string           { return "release snapshot: " + e.Code 
 func IsCode(err error, code string) bool { var e *Error; return errors.As(err, &e) && e.Code == code }
 
 type Release struct {
-	ID             string
-	AppID          string
-	RepositoryID   int64
-	ResolvedSHA    string
-	ComposePath    string
-	ArchiveSHA256  string
-	WorkspacePath  string
-	WorkspaceState string
+	ID                          string
+	AppID                       string
+	RepositoryID                int64
+	ResolvedSHA                 string
+	ComposePath                 string
+	ArchiveSHA256               string
+	WorkspacePath               string
+	WorkspaceState              string
+	ConfigurationRevisionID     string
+	ConfigurationRevisionNumber int64
 }
 
 type SourceReader interface {
@@ -113,7 +115,11 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 			return Release{}, &Error{Code: "invalid_source"}
 		}
 	}
-	if ready, err := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath); err == nil {
+	_, configurationNumber, err := m.currentConfiguration(ctx, appID)
+	if err != nil {
+		return Release{}, internal(err)
+	}
+	if ready, err := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath, configurationNumber); err == nil {
 		return ready, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return Release{}, internal(err)
@@ -184,7 +190,7 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 		if m.abort(ctx, appID, release.ID, "internal_error") != nil {
 			return Release{}, &Error{Code: "internal_error"}
 		}
-		if existing, lookupErr := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath); lookupErr == nil {
+		if existing, lookupErr := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath, release.ConfigurationRevisionNumber); lookupErr == nil {
 			return existing, nil
 		}
 		m.finalize(ctx, release.ID, "internal_error")
@@ -245,9 +251,9 @@ func (m *Materializer) appSource(ctx context.Context, owner, appID string) (appS
 	err := m.db.QueryRowContext(ctx, `SELECT s.source_type,COALESCE(s.connection_id,''),COALESCE(s.installation_id,0),COALESCE(s.repository_id,0),COALESCE(s.tracked_branch,''),COALESCE(s.compose_path,'') FROM application_sources s JOIN source_connections c ON c.id=s.connection_id AND c.owner_user_id=? WHERE s.application_id=?`, owner, appID).Scan(&s.typeName, &s.connectionID, &s.installationID, &s.repositoryID, &s.branch, &s.composePath)
 	return s, err
 }
-func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, compose string) (Release, error) {
+func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, compose string, configurationNumber int64) (Release, error) {
 	var r Release
-	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_path,''),workspace_state FROM releases WHERE app_id=? AND repository_id=? AND resolved_sha=? AND compose_path=? AND workspace_state='ready'`, app, repo, sha, compose).Scan(&r.ID, &r.AppID, &r.RepositoryID, &r.ResolvedSHA, &r.ComposePath, &r.ArchiveSHA256, &r.WorkspacePath, &r.WorkspaceState)
+	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(configuration_revision_id,''),configuration_revision_number FROM releases WHERE app_id=? AND repository_id=? AND resolved_sha=? AND compose_path=? AND configuration_revision_number=? AND workspace_state='ready'`, app, repo, sha, compose, configurationNumber).Scan(&r.ID, &r.AppID, &r.RepositoryID, &r.ResolvedSHA, &r.ComposePath, &r.ArchiveSHA256, &r.WorkspacePath, &r.WorkspaceState, &r.ConfigurationRevisionID, &r.ConfigurationRevisionNumber)
 	if err != nil {
 		return r, err
 	}
@@ -281,7 +287,12 @@ func (m *Materializer) reserve(ctx context.Context, app string, source appSource
 		return Release{}, err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,compose_path,workspace_state) VALUES(?,?,?,?,'materializing','{}',?,'github',?,?,?,?,?,?,?)`, id, app, branch.SHA, branch.Name, now, repository.ID, repository.Owner, repository.Name, "refs/heads/"+branch.Name, branch.SHA, source.composePath, WorkspaceStateMaterializing)
+	var configurationID sql.NullString
+	var configurationNumber int64
+	if err = tx.QueryRowContext(ctx, `SELECT revision_id,revision_number FROM application_configuration_heads WHERE app_id=?`, app).Scan(&configurationID, &configurationNumber); err != nil {
+		return Release{}, err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,compose_path,workspace_state,configuration_revision_id,configuration_revision_number) VALUES(?,?,?,?,'materializing','{}',?,'github',?,?,?,?,?,?,?,?,?)`, id, app, branch.SHA, branch.Name, now, repository.ID, repository.Owner, repository.Name, "refs/heads/"+branch.Name, branch.SHA, source.composePath, WorkspaceStateMaterializing, nullableString(configurationID), configurationNumber)
 	if err != nil {
 		return Release{}, err
 	}
@@ -292,7 +303,21 @@ func (m *Materializer) reserve(ctx context.Context, app string, source appSource
 	if err := tx.Commit(); err != nil {
 		return Release{}, err
 	}
-	return Release{ID: id, AppID: app, RepositoryID: repository.ID, ResolvedSHA: branch.SHA, ComposePath: source.composePath, WorkspaceState: WorkspaceStateMaterializing}, nil
+	return Release{ID: id, AppID: app, RepositoryID: repository.ID, ResolvedSHA: branch.SHA, ComposePath: source.composePath, WorkspaceState: WorkspaceStateMaterializing, ConfigurationRevisionID: configurationID.String, ConfigurationRevisionNumber: configurationNumber}, nil
+}
+
+func (m *Materializer) currentConfiguration(ctx context.Context, app string) (string, int64, error) {
+	var id sql.NullString
+	var number int64
+	err := m.db.QueryRowContext(ctx, `SELECT revision_id,revision_number FROM application_configuration_heads WHERE app_id=?`, app).Scan(&id, &number)
+	return id.String, number, err
+}
+
+func nullableString(value sql.NullString) any {
+	if value.Valid {
+		return value.String
+	}
+	return nil
 }
 func (m *Materializer) refreshSource(ctx context.Context, app string, repository sourceconnections.SourceRepository, branch sourceconnections.Branch) error {
 	_, err := m.db.ExecContext(ctx, `UPDATE application_sources SET repository_owner=?,repository_name=?,resolved_sha=?,updated_at=? WHERE application_id=?`, repository.Owner, repository.Name, branch.SHA, m.now().UTC().Format(time.RFC3339Nano), app)

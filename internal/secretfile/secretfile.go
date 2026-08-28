@@ -10,9 +10,34 @@ import (
 
 const maxSecretFileBytes = 64 << 10
 
+var syncParentDirectory = syncDirectory
+
+type installedError struct{ err error }
+
+func (e *installedError) Error() string { return e.err.Error() }
+func (e *installedError) Unwrap() error { return e.err }
+
+// WasInstalled reports that a write reached its destination but the final
+// directory durability sync failed. Callers that own a create-only path may
+// safely remove that path before reporting failure.
+func WasInstalled(err error) bool {
+	var target *installedError
+	return errors.As(err, &target)
+}
+
 // Write atomically persists a purpose-bound secret using the platform's
 // current-user protection and restrictive filesystem permissions.
 func Write(path, purpose string, plaintext []byte) error {
+	return write(path, purpose, plaintext, false)
+}
+
+// WriteNew durably creates an immutable purpose-bound secret. It fails if the
+// destination already exists and never replaces an existing secret.
+func WriteNew(path, purpose string, plaintext []byte) error {
+	return write(path, purpose, plaintext, true)
+}
+
+func write(path, purpose string, plaintext []byte, createOnly bool) error {
 	if path == "" || purpose == "" || len(plaintext) == 0 {
 		return errors.New("secret path, purpose, and value are required")
 	}
@@ -53,10 +78,17 @@ func Write(path, purpose string, plaintext []byte) error {
 	if err := temporary.Close(); err != nil {
 		return fmt.Errorf("close secret file: %w", err)
 	}
-	if err := replaceFile(temporaryPath, path); err != nil {
+	if createOnly {
+		if err := installNewFile(temporaryPath, path); err != nil {
+			return fmt.Errorf("install secret file: %w", err)
+		}
+	} else if err := replaceFile(temporaryPath, path); err != nil {
 		return fmt.Errorf("replace secret file: %w", err)
 	}
 	keep = true
+	if err := syncParentDirectory(directory); err != nil {
+		return &installedError{err: fmt.Errorf("sync secret directory: %w", err)}
+	}
 	return nil
 }
 

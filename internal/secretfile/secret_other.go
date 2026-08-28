@@ -32,6 +32,22 @@ func unprotect(purpose string, persisted []byte) ([]byte, error) {
 
 func replaceFile(source, destination string) error { return os.Rename(source, destination) }
 
+func installNewFile(source, destination string) error {
+	if err := os.Link(source, destination); err != nil {
+		return err
+	}
+	return os.Remove(source)
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
+}
+
 func restrictDirectory(path string) error {
 	if err := os.Chmod(path, 0o700); err != nil {
 		return err

@@ -1,6 +1,7 @@
 import {
   operations,
   type Application,
+  type ApplicationConfiguration,
   type ApplicationList,
   type BootstrapRequest,
   type BootstrapStatus,
@@ -18,6 +19,7 @@ import {
   type LoginRequest,
   type MachineList,
   type MeResponse,
+  type ReplaceApplicationConfigurationRequest,
   type SessionResponse,
   type SourceConnection,
   type SourceConnectionList,
@@ -26,6 +28,7 @@ import {
 
 export type {
   Application,
+  ApplicationConfiguration,
   CreateApplicationRequest,
   GitHubBranch,
   GitHubDeviceAuthorization,
@@ -39,18 +42,21 @@ export type {
   SourceConnection,
   SystemStatus,
   User,
+  ReplaceApplicationConfigurationRequest,
 } from "./generated/api-contract";
 
 export class APIError extends Error {
   readonly status: number;
   readonly code: string;
   readonly detail: string;
+  readonly errors: Record<string, string>;
   readonly retryAfterSeconds?: number;
 
-  constructor({ status, code, detail, retryAfterSeconds }: {
+  constructor({ status, code, detail, errors = {}, retryAfterSeconds }: {
     status: number;
     code: string;
     detail: string;
+    errors?: Record<string, string>;
     retryAfterSeconds?: number;
   }) {
     super(detail);
@@ -58,6 +64,7 @@ export class APIError extends Error {
     this.status = status;
     this.code = code;
     this.detail = detail;
+    this.errors = errors;
     this.retryAfterSeconds = retryAfterSeconds;
   }
 }
@@ -108,6 +115,9 @@ async function request<T>(path: string, init: RequestInit = {}, retryCSRF = true
       status: response.status,
       code: typeof body.code === "string" ? body.code : "request_failed",
       detail: typeof body.detail === "string" ? body.detail : "Request failed",
+      errors: body.errors && typeof body.errors === "object"
+        ? Object.fromEntries(Object.entries(body.errors).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
+        : {},
       retryAfterSeconds,
     });
   }
@@ -141,6 +151,13 @@ export const api = {
   status: () => request<SystemStatus>(operations.systemStatus.path),
   apps: () => request<ApplicationList>(operations.listApplications.path),
   app: (id: string) => request<Application>(`/api/v1/apps/${id}`),
+  applicationConfiguration: (id: string) =>
+    request<ApplicationConfiguration>(operationPath(operations.getApplicationConfiguration.path, { appId: id })),
+  replaceApplicationConfiguration: (id: string, data: ReplaceApplicationConfigurationRequest) =>
+    request<ApplicationConfiguration>(operationPath(operations.replaceApplicationConfiguration.path, { appId: id }), {
+      method: operations.replaceApplicationConfiguration.method,
+      body: JSON.stringify(data),
+    }),
   createApp: (data: CreateApplicationRequest) =>
     request<Application>(operations.createApplication.path, { method: "POST", body: JSON.stringify(data) }),
   inspect: (data: InspectRequest) =>

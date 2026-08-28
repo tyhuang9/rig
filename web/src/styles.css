@@ -222,6 +222,27 @@ button:disabled { cursor: wait; opacity: .62; }
 .summary small, .summary > article > span { display: block; color: #616975; font-size: 11px; }
 .summary strong { display: block; min-width: 0; margin: 8px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; }
 
+.configuration-panel { margin-top: 28px; padding: 20px; border: 1px solid #e3e6ea; border-radius: 10px; background: #fff; }
+.configuration-heading, .configuration-group-heading, .configuration-footer { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.configuration-heading h2, .configuration-group h3 { margin: 0; font-size: 16px; }
+.configuration-heading p, .configuration-group-heading p, .configuration-empty { margin: 5px 0 0; color: #5f6672; font-size: 12px; line-height: 1.5; }
+.configuration-revision { flex: 0 0 auto; padding: 4px 8px; border-radius: 999px; background: #eef1f5; color: #4e5561; font-size: 11px; }
+.configuration-group { margin-top: 20px; padding-top: 18px; border-top: 1px solid #e3e6ea; }
+.configuration-rows { display: grid; gap: 10px; margin-top: 12px; }
+.configuration-row { min-width: 0; margin: 0; padding: 8px 12px 12px; border: 1px solid #e3e6ea; border-radius: 9px; background: #fbfcfd; }
+.configuration-row.removed { border-color: #e6b9bd; background: #fff5f5; }
+.configuration-row-title { padding: 0 4px; color: #4e5561; font-size: 12px; font-weight: 700; }
+.configuration-row-fields { display: grid; grid-template-columns: minmax(150px, .8fr) minmax(220px, 1.2fr) auto; align-items: end; gap: 10px; min-width: 0; }
+.configuration-row .field { max-width: none; min-width: 0; margin: 0; }
+.configuration-row .field input { height: 40px; }
+.configuration-row .field input:disabled { color: #5f6672; background: #f1f3f5; }
+.configuration-remove { min-width: 84px; }
+.configuration-row-actions { display: grid; gap: 8px; }
+.stored-secret { color: #4f6b5f; font-size: 11px; font-weight: 650; }
+.configuration-footer { align-items: center; min-height: 44px; margin-top: 20px; padding-top: 16px; border-top: 1px solid #e3e6ea; }
+.configuration-footer [role="status"] { color: #195e47; font-size: 12px; }
+.configuration-panel .error-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+
 .machine-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .machine { display: grid; grid-template-columns: minmax(0, 1fr) auto; min-width: 0; gap: 12px; padding: 15px 16px; }
 .machine h2 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
@@ -277,6 +298,9 @@ button:disabled { cursor: wait; opacity: .62; }
   .wizard li { flex: 0 0 auto; }
   .source-panel { width: 100%; }
   .summary, .machine-list { grid-template-columns: 1fr; }
+  .configuration-row-fields { grid-template-columns: 1fr 1fr; }
+  .configuration-remove { grid-column: 1 / -1; justify-self: start; }
+  .configuration-row-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; }
 }
 
 @media (max-width: 560px) {
@@ -307,6 +331,14 @@ button:disabled { cursor: wait; opacity: .62; }
   .source-choice label { min-height: 44px; }
   .field input { min-height: 44px; height: 44px; }
   .field select { min-height: 44px; height: 44px; }
+  .configuration-panel { padding: 16px 14px; overflow: hidden; }
+  .configuration-heading, .configuration-group-heading, .configuration-footer { align-items: stretch; flex-direction: column; }
+  .configuration-row { width: 100%; }
+  .configuration-row-fields { grid-template-columns: minmax(0, 1fr); }
+  .configuration-remove { grid-column: auto; width: 100%; }
+  .configuration-row-actions { grid-column: auto; display: grid; }
+  .configuration-group-heading .button, .configuration-footer .button, .configuration-panel .error-summary .button { width: 100%; }
+  .configuration-panel .error-summary { align-items: stretch; flex-direction: column; }
   .wizard-pagination { flex-wrap: wrap; min-height: 44px; }
   .auth { padding: 14px; }
   .auth section { padding: 24px 20px; }
@@ -315,6 +347,8 @@ button:disabled { cursor: wait; opacity: .62; }
 @media (pointer: coarse) {
   .button, .rail nav a, .rail-link, .text-button { min-height: 44px; }
   .field input, .field select, .source-choice label { min-height: 44px; }
+  .configuration-row .field input, .configuration-panel .button { min-height: 44px; }
+  .configuration-row { gap: 10px; }
   .field input, .field select { height: 44px; }
 }
 

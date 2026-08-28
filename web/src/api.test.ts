@@ -45,6 +45,16 @@ describe("API client", () => {
     await expect(api.login({ username: "a", passphrase: "b" })).rejects.toThrow("Invalid credentials");
   });
 
+  it("preserves safe field errors from problem responses", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ code: "invalid_configuration", detail: "Invalid configuration", errors: { variables: "Use portable names", unsafe: 42 } }), { status: 422 }),
+    ));
+    await expect(api.replaceApplicationConfiguration("app", { expectedRevisionNumber: 0, variables: [], secrets: [], remove: [] })).rejects.toEqual(expect.objectContaining<Partial<APIError>>({
+      code: "invalid_configuration",
+      errors: { variables: "Use portable names" },
+    }));
+  });
+
   it("uses the generated cancellation operation with CSRF", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ job: { id: "job/one", status: "cancelled" } }), { status: 200 }),
@@ -57,6 +67,18 @@ describe("API client", () => {
         method: "POST",
         headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }),
       }),
+    );
+  });
+
+  it("uses the generated configuration path and sends the exact revision request", async () => {
+    const response = { revisionNumber: 2, entries: [] };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(response), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const body = { expectedRevisionNumber: 1, variables: [{ key: "MODE", value: "prod" }], secrets: [], remove: ["OLD_TOKEN"] };
+    await api.replaceApplicationConfiguration("app/one", body);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/apps/app%2Fone/configuration",
+      expect.objectContaining({ method: "PUT", body: JSON.stringify(body), headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }),
     );
   });
 
