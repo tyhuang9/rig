@@ -1,4 +1,4 @@
-package jobs_test
+package jobs
 
 import (
 	"context"
@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/database"
-	"github.com/hostd/hostd/internal/jobs"
 )
 
 func TestIdempotencyEventsAndRecovery(t *testing.T) {
@@ -18,7 +17,7 @@ func TestIdempotencyEventsAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	s := jobs.New(db)
+	s := New(db)
 	j, created, err := s.Create("deploy", "application", "app-one", "same-request")
 	if err != nil || !created {
 		t.Fatal(err)
@@ -30,14 +29,17 @@ func TestIdempotencyEventsAndRecovery(t *testing.T) {
 	if _, _, err := s.Create("restart", "application", "app-one", "other-request"); err == nil {
 		t.Fatal("concurrent mutation accepted")
 	}
-	if err := s.Update(j.ID, jobs.Running, "apply", 40, "{}"); err != nil {
+	if _, ok, err := s.claimNext(context.Background()); err != nil || !ok {
+		t.Fatalf("claim = %t, %v", ok, err)
+	}
+	if err := s.Update(j.ID, Running, "running", 40, `{"secret":"ignored"}`); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.RecoverInterrupted(); err != nil {
 		t.Fatal(err)
 	}
 	recovered, err := s.Get(j.ID)
-	if err != nil || recovered.Status != string(jobs.Interrupted) {
+	if err != nil || recovered.Status != string(Interrupted) {
 		t.Fatalf("recovery: %#v %v", recovered, err)
 	}
 	events, err := s.Events(j.ID, 0)
@@ -61,7 +63,7 @@ func TestIdempotencyEventsAndRecovery(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		v, _ := s.Get(next.ID)
-		if v.Status == string(jobs.Succeeded) {
+		if v.Status == string(Succeeded) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -75,7 +77,7 @@ func TestCancellationIsAtomicAndEmitsOneTerminalEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	service := jobs.New(db)
+	service := New(db)
 	job, _, err := service.Create("deploy", "application", "app-cancel", "cancel-request")
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +101,7 @@ func TestCancellationIsAtomicAndEmitsOneTerminalEvent(t *testing.T) {
 		switch {
 		case err == nil:
 			succeeded++
-		case errors.Is(err, jobs.ErrJobTerminal):
+		case errors.Is(err, ErrJobTerminal):
 			conflicted++
 		default:
 			t.Fatalf("unexpected cancellation error: %v", err)
@@ -109,7 +111,7 @@ func TestCancellationIsAtomicAndEmitsOneTerminalEvent(t *testing.T) {
 		t.Fatalf("cancellation results: %d succeeded, %d conflicted", succeeded, conflicted)
 	}
 	cancelled, err := service.Get(job.ID)
-	if err != nil || cancelled.Status != string(jobs.Cancelled) {
+	if err != nil || cancelled.Status != string(Cancelled) {
 		t.Fatalf("job was not cancelled: %#v %v", cancelled, err)
 	}
 	events, err := service.Events(job.ID, 0)
@@ -125,7 +127,7 @@ func TestCancellationIsAtomicAndEmitsOneTerminalEvent(t *testing.T) {
 	if terminalEvents != 1 {
 		t.Fatalf("cancel terminal event count = %d: %#v", terminalEvents, events)
 	}
-	if _, err := service.Cancel("missing"); !errors.Is(err, jobs.ErrJobNotFound) {
+	if _, err := service.Cancel("missing"); !errors.Is(err, ErrJobNotFound) {
 		t.Fatalf("missing cancellation error = %v", err)
 	}
 }

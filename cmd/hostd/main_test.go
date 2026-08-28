@@ -123,3 +123,17 @@ func TestBootstrapTokenProtectionFailureDoesNotExposeToken(t *testing.T) {
 		t.Fatalf("bootstrap token leaked on protection failure: output=%q error=%q", output.String(), err)
 	}
 }
+
+func TestWaitForWorkerDrainsOrTimesOut(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		time.Sleep(time.Millisecond)
+		close(done)
+	}()
+	if !waitForWorker(done, time.Second) {
+		t.Fatal("worker drain was not observed")
+	}
+	if waitForWorker(make(chan struct{}), time.Millisecond) {
+		t.Fatal("worker timeout was reported as drained")
+	}
+}

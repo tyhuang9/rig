@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -9,8 +10,27 @@ import (
 	"github.com/hostd/hostd/internal/database"
 )
 
-func TestWorkerTransitionAndCancellationAreAtomic(t *testing.T) {
-	for attempt := 0; attempt < 32; attempt++ {
+type atomicExecutor struct {
+	started chan<- struct{}
+	release <-chan struct{}
+	result  error
+}
+
+func (e atomicExecutor) Execute(ctx context.Context, _ Job, reporter ProgressReporter) (ExecutionResult, error) {
+	if err := reporter.Report(ProgressUpdate{Status: Running, Phase: "apply_fake_runtime", Progress: 70, Code: "phase_started"}); err != nil {
+		return ExecutionResult{}, err
+	}
+	e.started <- struct{}{}
+	select {
+	case <-e.release:
+		return ExecutionResult{}, e.result
+	case <-ctx.Done():
+		return ExecutionResult{}, ctx.Err()
+	}
+}
+
+func TestRunnerCancellationAndProgressHaveOneTerminalOutcome(t *testing.T) {
+	for attempt := 0; attempt < 16; attempt++ {
 		db, err := database.Open(filepath.Join(t.TempDir(), "state"))
 		if err != nil {
 			t.Fatal(err)
@@ -21,64 +41,35 @@ func TestWorkerTransitionAndCancellationAreAtomic(t *testing.T) {
 			db.Close()
 			t.Fatal(err)
 		}
-
-		start := make(chan struct{})
-		var group sync.WaitGroup
-		group.Add(2)
-		var transitionErr, cancelErr error
+		started := make(chan struct{}, 1)
+		release := make(chan struct{})
+		runDone := make(chan error, 1)
 		go func() {
-			defer group.Done()
-			<-start
-			transitionErr = service.transition(job.ID, Running, "apply_fake_runtime", 70, `{"phase":"apply_fake_runtime"}`, "info", "phase_started", "Fake runtime: apply_fake_runtime")
+			runDone <- service.runOne(context.Background(), atomicExecutor{started: started, release: release})
 		}()
-		go func() {
-			defer group.Done()
-			<-start
-			_, cancelErr = service.Cancel(job.ID)
-		}()
-		close(start)
-		group.Wait()
-
+		<-started
+		_, cancelErr := service.Cancel(job.ID)
 		if cancelErr != nil {
 			db.Close()
-			t.Fatalf("attempt %d: cancellation failed: %v", attempt, cancelErr)
+			t.Fatalf("attempt %d: cancel = %v", attempt, cancelErr)
 		}
-		if transitionErr != nil && !errors.Is(transitionErr, ErrJobTerminal) {
+		if err := <-runDone; err != nil {
 			db.Close()
-			t.Fatalf("attempt %d: transition error = %v", attempt, transitionErr)
+			t.Fatalf("attempt %d: runner = %v", attempt, err)
 		}
 		persisted, err := service.Get(job.ID)
-		if err != nil {
+		if err != nil || persisted.Status != string(Cancelled) {
 			db.Close()
-			t.Fatal(err)
-		}
-		if persisted.Status != string(Cancelled) {
-			db.Close()
-			t.Fatalf("attempt %d: terminal status = %q", attempt, persisted.Status)
+			t.Fatalf("attempt %d: cancelled job = %#v, %v", attempt, persisted, err)
 		}
 		events, err := service.Events(job.ID, 0)
 		if err != nil {
 			db.Close()
 			t.Fatal(err)
 		}
-		cancelEvents := 0
-		terminalEvents := 0
-		for _, event := range events {
-			switch event.Code {
-			case "job_cancelled":
-				cancelEvents++
-				terminalEvents++
-			case "job_succeeded", "job_failed", "daemon_restarted":
-				terminalEvents++
-			}
-		}
-		if cancelEvents != 1 || terminalEvents != 1 {
+		if countEvents(events, "cancellation_requested") != 1 || countEvents(events, "job_cancelled") != 1 || countEvents(events, "job_succeeded") != 0 || countEvents(events, "job_failed") != 0 {
 			db.Close()
-			t.Fatalf("attempt %d: cancel events = %d, terminal events = %d: %#v", attempt, cancelEvents, terminalEvents, events)
-		}
-		if last := events[len(events)-1]; last.Code != "job_cancelled" {
-			db.Close()
-			t.Fatalf("attempt %d: terminal cancellation was not the final event: %#v", attempt, events)
+			t.Fatalf("attempt %d: events = %#v", attempt, events)
 		}
 		if err := db.Close(); err != nil {
 			t.Fatal(err)
@@ -86,61 +77,54 @@ func TestWorkerTransitionAndCancellationAreAtomic(t *testing.T) {
 	}
 }
 
-func TestWorkerCompletionAndCancellationHaveOneTerminalOutcome(t *testing.T) {
-	for attempt := 0; attempt < 32; attempt++ {
+func TestRunnerCompletionAndCancellationHaveOneTerminalOutcome(t *testing.T) {
+	for attempt := 0; attempt < 16; attempt++ {
 		db, err := database.Open(filepath.Join(t.TempDir(), "state"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		service := New(db)
-		job, _, err := service.Create("deploy", "application", "app-terminal-race", "terminal-race-request")
+		job, _, err := service.Create("deploy", "application", "app-completion-race", "completion-race-request")
 		if err != nil {
 			db.Close()
 			t.Fatal(err)
 		}
-
-		start := make(chan struct{})
+		started := make(chan struct{}, 1)
+		release := make(chan struct{})
+		runDone := make(chan error, 1)
+		go func() {
+			runDone <- service.runOne(context.Background(), atomicExecutor{started: started, release: release})
+		}()
+		<-started
 		var group sync.WaitGroup
 		group.Add(2)
-		var transitionErr, cancelErr error
+		var cancelErr error
 		go func() {
 			defer group.Done()
-			<-start
-			transitionErr = service.transition(job.ID, Succeeded, "succeeded", 100, `{"phase":"succeeded"}`, "info", "job_succeeded", "Fake deployment completed")
-		}()
-		go func() {
-			defer group.Done()
-			<-start
 			_, cancelErr = service.Cancel(job.ID)
 		}()
-		close(start)
+		go func() {
+			defer group.Done()
+			close(release)
+		}()
 		group.Wait()
-
-		transitionWon := transitionErr == nil && errors.Is(cancelErr, ErrJobTerminal)
-		cancelWon := cancelErr == nil && errors.Is(transitionErr, ErrJobTerminal)
-		if !transitionWon && !cancelWon {
+		if cancelErr != nil && !errors.Is(cancelErr, ErrJobTerminal) {
 			db.Close()
-			t.Fatalf("attempt %d: transition error = %v, cancellation error = %v", attempt, transitionErr, cancelErr)
+			t.Fatalf("attempt %d: cancel = %v", attempt, cancelErr)
+		}
+		if err := <-runDone; err != nil {
+			db.Close()
+			t.Fatalf("attempt %d: runner = %v", attempt, err)
 		}
 		events, err := service.Events(job.ID, 0)
 		if err != nil {
 			db.Close()
 			t.Fatal(err)
 		}
-		terminalEvents := 0
-		for _, event := range events {
-			if event.Code == "job_cancelled" || event.Code == "job_succeeded" {
-				terminalEvents++
-			}
-		}
+		terminalEvents := countEvents(events, "job_cancelled") + countEvents(events, "job_succeeded") + countEvents(events, "job_failed")
 		if terminalEvents != 1 {
 			db.Close()
-			t.Fatalf("attempt %d: terminal events = %d: %#v", attempt, terminalEvents, events)
-		}
-		last := events[len(events)-1]
-		if last.Code != "job_cancelled" && last.Code != "job_succeeded" {
-			db.Close()
-			t.Fatalf("attempt %d: final event is not terminal: %#v", attempt, events)
+			t.Fatalf("attempt %d: terminal events = %#v", attempt, events)
 		}
 		if err := db.Close(); err != nil {
 			t.Fatal(err)

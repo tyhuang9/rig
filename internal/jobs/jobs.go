@@ -1,8 +1,10 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -26,24 +28,49 @@ const (
 )
 
 var (
-	ErrJobNotFound = errors.New("job not found")
-	ErrJobTerminal = errors.New("job is already terminal")
+	ErrJobNotFound     = errors.New("job not found")
+	ErrJobTerminal     = errors.New("job is already terminal")
+	ErrInvalidInput    = errors.New("invalid job input")
+	ErrInvalidProgress = errors.New("invalid job progress")
+	ErrEventBudget     = errors.New("job event budget exhausted")
 )
 
-type Job struct {
-	ID           string    `json:"id"`
-	Type         string    `json:"type"`
-	ResourceType string    `json:"resourceType"`
-	ResourceID   string    `json:"resourceId"`
-	Status       string    `json:"status"`
-	Phase        string    `json:"phase"`
-	Checkpoint   string    `json:"checkpoint"`
-	ErrorCode    string    `json:"errorCode,omitempty"`
-	ErrorDetail  string    `json:"errorDetail,omitempty"`
-	Progress     int       `json:"progress"`
-	CreatedAt    time.Time `json:"createdAt"`
-	UpdatedAt    time.Time `json:"updatedAt"`
+// JobInput is deliberately sealed so new persisted input schemas are reviewed
+// in this package before external callers can create them.
+type JobInput interface{ jobInput() }
+
+// NoInput preserves the legacy {} payload for resource actions without adding
+// caller-controlled fields to the durable schema.
+type NoInput struct{}
+
+func (NoInput) jobInput() {}
+
+// CreateRequest is the controlled boundary for durable job creation.
+type CreateRequest struct {
+	Type           string
+	ResourceType   string
+	ResourceID     string
+	IdempotencyKey string
+	Input          JobInput
 }
+
+type Job struct {
+	ID           string          `json:"id"`
+	Type         string          `json:"type"`
+	ResourceType string          `json:"resourceType"`
+	ResourceID   string          `json:"resourceId"`
+	Status       string          `json:"status"`
+	Phase        string          `json:"phase"`
+	Checkpoint   string          `json:"checkpoint"`
+	ErrorCode    string          `json:"errorCode,omitempty"`
+	ErrorDetail  string          `json:"errorDetail,omitempty"`
+	Progress     int             `json:"progress"`
+	CreatedAt    time.Time       `json:"createdAt"`
+	UpdatedAt    time.Time       `json:"updatedAt"`
+	Input        json.RawMessage `json:"-"`
+	Attempt      int             `json:"-"`
+}
+
 type Event struct {
 	ID        int64     `json:"id"`
 	JobID     string    `json:"jobId"`
@@ -54,20 +81,68 @@ type Event struct {
 	Code      string    `json:"code"`
 	Message   string    `json:"message"`
 }
-type Service struct {
-	db   *sql.DB
-	now  func() time.Time
-	wake chan struct{}
-	mu   sync.Mutex
+
+// ProgressUpdate is an executor-owned nonterminal state update.
+type ProgressUpdate struct {
+	Status     Status
+	Phase      string
+	Progress   int
+	Checkpoint string
+	Level      string
+	Code       string
+	// Message is ignored. Persisted messages are centrally generated from Code.
+	Message string
 }
 
-func New(db *sql.DB) *Service { return &Service{db: db, now: time.Now, wake: make(chan struct{}, 1)} }
+// ProgressReporter durably records executor progress. The runner owns terminal state.
+type ProgressReporter interface{ Report(ProgressUpdate) error }
+
+type ExecutionResult struct {
+	// CompletionCode selects a centrally-owned completion message. Empty uses
+	// the generic completion message.
+	CompletionCode string
+}
+
+// ExecutionError identifies a known executor failure. Detail is retained for
+// executor diagnostics only and is never persisted or returned to clients.
+type ExecutionError struct {
+	Code   string
+	Detail string
+}
+
+func (e *ExecutionError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Code
+}
+
+type Executor interface {
+	Execute(context.Context, Job, ProgressReporter) (ExecutionResult, error)
+}
+
+type Service struct {
+	db             *sql.DB
+	now            func() time.Time
+	wake           chan struct{}
+	mu             sync.Mutex
+	active         map[string]context.CancelFunc
+	beforeClaim    func()
+	beforeRegister func()
+	beforeExecute  func()
+}
+
+func New(db *sql.DB) *Service {
+	return &Service{db: db, now: time.Now, wake: make(chan struct{}, 1), active: make(map[string]context.CancelFunc)}
+}
+
 func (s *Service) signal() {
 	select {
 	case s.wake <- struct{}{}:
 	default:
 	}
 }
+
 func (s *Service) RecoverInterrupted() error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -105,9 +180,18 @@ func (s *Service) RecoverInterrupted() error {
 	}
 	return tx.Commit()
 }
+
+// Create preserves the legacy no-input API.
 func (s *Service) Create(kind, resourceType, resourceID, idempotency string) (Job, bool, error) {
-	if idempotency != "" {
-		existing, err := s.byIdempotency(kind, resourceType, resourceID, idempotency)
+	return s.CreateWithInput(CreateRequest{Type: kind, ResourceType: resourceType, ResourceID: resourceID, IdempotencyKey: idempotency, Input: NoInput{}})
+}
+
+func (s *Service) CreateWithInput(request CreateRequest) (Job, bool, error) {
+	if request.Type == "" || request.ResourceType == "" || request.ResourceID == "" {
+		return Job{}, false, fmt.Errorf("%w: type, resource type, and resource id are required", ErrInvalidInput)
+	}
+	if request.IdempotencyKey != "" {
+		existing, err := s.byIdempotency(request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey)
 		if err == nil {
 			return existing, false, nil
 		}
@@ -115,27 +199,77 @@ func (s *Service) Create(kind, resourceType, resourceID, idempotency string) (Jo
 			return Job{}, false, err
 		}
 	}
-	now := s.now().UTC()
-	job := Job{ID: uuid.NewString(), Type: kind, ResourceType: resourceType, ResourceID: resourceID, Status: string(Queued), Phase: "queued", CreatedAt: now, UpdatedAt: now}
-	_, err := s.db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, job.ID, job.Type, job.ResourceType, job.ResourceID, job.Status, job.Phase, nullIfBlank(idempotency), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	input, err := marshalInput(request.Input)
 	if err != nil {
+		return Job{}, false, err
+	}
+	now := s.now().UTC()
+	job := Job{ID: uuid.NewString(), Type: request.Type, ResourceType: request.ResourceType, ResourceID: request.ResourceID, Status: string(Queued), Phase: "queued", CreatedAt: now, UpdatedAt: now, Input: input}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Job{}, false, err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,idempotency_key,input_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, job.ID, job.Type, job.ResourceType, job.ResourceID, job.Status, job.Phase, nullIfBlank(request.IdempotencyKey), string(input), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	if err != nil {
+		if isConstraint(err) && request.IdempotencyKey != "" {
+			_ = tx.Rollback()
+			if existing, lookupErr := s.byIdempotency(request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey); lookupErr == nil {
+				return existing, false, nil
+			}
+		}
 		if isConstraint(err) {
 			return Job{}, false, fmt.Errorf("an application mutation is already active: %w", err)
 		}
 		return Job{}, false, err
 	}
-	if _, err = s.Append(job.ID, "info", "queued", "job_queued", "Job queued"); err != nil {
+	if _, err := appendEvent(tx, now, job.ID, "info", "queued", "job_queued", "Job queued"); err != nil {
+		return Job{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
 		return Job{}, false, err
 	}
 	s.signal()
 	return job, true, nil
 }
+
+func marshalInput(input JobInput) (json.RawMessage, error) {
+	if input == nil {
+		return json.RawMessage(`{}`), nil
+	}
+	switch input.(type) {
+	case NoInput:
+		return json.RawMessage(`{}`), nil
+	default:
+		return nil, ErrInvalidInput
+	}
+}
+
+func normalizeInput(input json.RawMessage) (json.RawMessage, error) {
+	if len(input) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	if len(input) > 64<<10 || !json.Valid(input) {
+		return nil, ErrInvalidInput
+	}
+	trimmed := bytes.TrimSpace(input)
+	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+		return nil, fmt.Errorf("%w: input must be a JSON object", ErrInvalidInput)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &object); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+	}
+	return append(json.RawMessage(nil), trimmed...), nil
+}
+
 func nullIfBlank(v string) any {
 	if v == "" {
 		return nil
 	}
 	return v
 }
+
 func isConstraint(err error) bool {
 	return err != nil && (contains(err.Error(), "UNIQUE") || contains(err.Error(), "constraint"))
 }
@@ -147,54 +281,76 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+const jobSelectColumns = `id,type,resource_type,resource_id,status,phase,progress_percent,checkpoint_json,COALESCE(error_code,''),COALESCE(error_detail,''),input_json,attempt,created_at,updated_at`
+
 func (s *Service) byIdempotency(kind, rt, rid, key string) (Job, error) {
-	return s.scan(s.db.QueryRow(`SELECT id,type,resource_type,resource_id,status,phase,progress_percent,checkpoint_json,COALESCE(error_code,''),COALESCE(error_detail,''),created_at,updated_at FROM jobs WHERE type=? AND resource_type=? AND resource_id=? AND idempotency_key=?`, kind, rt, rid, key))
+	return s.scan(s.db.QueryRow(`SELECT `+jobSelectColumns+` FROM jobs WHERE type=? AND resource_type=? AND resource_id=? AND idempotency_key=?`, kind, rt, rid, key))
 }
 func (s *Service) Get(id string) (Job, error) {
-	return s.scan(s.db.QueryRow(`SELECT id,type,resource_type,resource_id,status,phase,progress_percent,checkpoint_json,COALESCE(error_code,''),COALESCE(error_detail,''),created_at,updated_at FROM jobs WHERE id=?`, id))
+	return s.scan(s.db.QueryRow(`SELECT `+jobSelectColumns+` FROM jobs WHERE id=?`, id))
 }
 
 func (s *Service) List(limit int) ([]Job, error) {
 	if limit < 1 || limit > 200 {
 		limit = 100
 	}
-	rows, err := s.db.Query(`SELECT id,type,resource_type,resource_id,status,phase,progress_percent,checkpoint_json,COALESCE(error_code,''),COALESCE(error_detail,''),created_at,updated_at FROM jobs ORDER BY created_at DESC LIMIT ?`, limit)
+	rows, err := s.db.Query(`SELECT `+jobSelectColumns+` FROM jobs ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	result := make([]Job, 0)
 	for rows.Next() {
-		var job Job
-		var created, updated string
-		if err := rows.Scan(&job.ID, &job.Type, &job.ResourceType, &job.ResourceID, &job.Status, &job.Phase, &job.Progress, &job.Checkpoint, &job.ErrorCode, &job.ErrorDetail, &created, &updated); err != nil {
+		job, err := scanJob(rows)
+		if err != nil {
 			return nil, err
 		}
-		job.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
-		job.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 		result = append(result, job)
 	}
 	return result, rows.Err()
 }
-func (s *Service) scan(row *sql.Row) (Job, error) {
+
+type rowScanner interface{ Scan(...any) error }
+
+func (s *Service) scan(row *sql.Row) (Job, error) { return scanJob(row) }
+func scanJob(row rowScanner) (Job, error) {
 	var j Job
-	var c, u string
-	err := row.Scan(&j.ID, &j.Type, &j.ResourceType, &j.ResourceID, &j.Status, &j.Phase, &j.Progress, &j.Checkpoint, &j.ErrorCode, &j.ErrorDetail, &c, &u)
-	if err != nil {
+	var input, created, updated string
+	if err := row.Scan(&j.ID, &j.Type, &j.ResourceType, &j.ResourceID, &j.Status, &j.Phase, &j.Progress, &j.Checkpoint, &j.ErrorCode, &j.ErrorDetail, &input, &j.Attempt, &created, &updated); err != nil {
 		return j, err
 	}
-	j.CreatedAt, _ = time.Parse(time.RFC3339Nano, c)
-	j.UpdatedAt, _ = time.Parse(time.RFC3339Nano, u)
+	j.Input = json.RawMessage(input)
+	j.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	j.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return j, nil
 }
+
 func (s *Service) Append(jobID, level, phase, code, message string) (Event, error) {
+	_ = message
+	if level != "info" || code != "phase_started" || !knownPhase(phase) {
+		return Event{}, ErrInvalidProgress
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Event{}, err
 	}
 	defer tx.Rollback()
+	var status, statusPhase string
+	var eventCount int
+	if err := tx.QueryRow(`SELECT status,phase,(SELECT COUNT(*) FROM job_events WHERE job_id=jobs.id) FROM jobs WHERE id=?`, jobID).Scan(&status, &statusPhase, &eventCount); errors.Is(err, sql.ErrNoRows) {
+		return Event{}, ErrJobNotFound
+	} else if err != nil {
+		return Event{}, err
+	}
+	if terminal(status) || (status == string(Waiting) && statusPhase == "cancelling") {
+		return Event{}, ErrJobTerminal
+	}
+	if eventCount >= maxJobEventsPerAttempt {
+		return Event{}, ErrEventBudget
+	}
 	now := s.now().UTC()
-	event, err := appendEvent(tx, now, jobID, level, phase, code, message)
+	event, err := appendEvent(tx, now, jobID, "info", phase, "phase_started", "Job phase started")
 	if err != nil {
 		return Event{}, err
 	}
@@ -220,6 +376,7 @@ func appendEvent(tx *sql.Tx, now time.Time, jobID, level, phase, code, message s
 	}
 	return Event{ID: id, JobID: jobID, Sequence: sequence, Timestamp: now, Level: level, Phase: phase, Code: code, Message: message}, nil
 }
+
 func (s *Service) Events(jobID string, after int64) ([]Event, error) {
 	rows, err := s.db.Query(`SELECT id,job_id,sequence,timestamp,level,phase,code,message FROM job_events WHERE job_id=? AND id>? ORDER BY id`, jobID, after)
 	if err != nil {
@@ -238,9 +395,165 @@ func (s *Service) Events(jobID string, after int64) ([]Event, error) {
 	}
 	return out, rows.Err()
 }
+
 func (s *Service) Update(id string, status Status, phase string, progress int, checkpoint string) error {
-	now := s.now().UTC().Format(time.RFC3339Nano)
-	result, err := s.db.Exec(`UPDATE jobs SET status=?,phase=?,progress_percent=?,checkpoint_json=?,updated_at=?,started_at=COALESCE(started_at,?),finished_at=CASE WHEN ? IN ('succeeded','failed','cancelled','interrupted','needs_attention') THEN ? ELSE NULL END WHERE id=? AND status IN ('queued','assigned','running','waiting_external','waiting_user')`, status, phase, progress, checkpoint, now, now, status, now, id)
+	_ = checkpoint
+	return s.report(id, ProgressUpdate{Status: status, Phase: phase, Progress: progress, Code: "phase_started"})
+}
+
+func (s *Service) Cancel(id string) (Job, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Job{}, err
+	}
+	defer tx.Rollback()
+	var status, phase string
+	if err := tx.QueryRow(`SELECT status,phase FROM jobs WHERE id=?`, id).Scan(&status, &phase); errors.Is(err, sql.ErrNoRows) {
+		return Job{}, ErrJobNotFound
+	} else if err != nil {
+		return Job{}, err
+	}
+	if terminal(status) {
+		return Job{}, ErrJobTerminal
+	}
+	if status == string(Waiting) && phase == "cancelling" {
+		if err := tx.Commit(); err != nil {
+			return Job{}, err
+		}
+		s.mu.Lock()
+		cancel := s.active[id]
+		s.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		s.signal()
+		return s.Get(id)
+	}
+	now := s.now().UTC()
+	if status == string(Queued) {
+		result, err := tx.Exec(`UPDATE jobs SET status='cancelled',phase='cancelled',updated_at=?,finished_at=? WHERE id=? AND status='queued'`, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id)
+		if err != nil {
+			return Job{}, err
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return Job{}, err
+		}
+		if updated != 1 {
+			return Job{}, ErrJobTerminal
+		}
+		if _, err := appendEvent(tx, now, id, "warn", "cancelled", "job_cancelled", "Job cancelled"); err != nil {
+			return Job{}, err
+		}
+	} else {
+		result, err := tx.Exec(`UPDATE jobs SET status='waiting_external',phase='cancelling',updated_at=? WHERE id=? AND status IN ('assigned','running','waiting_external','waiting_user') AND NOT (status='waiting_external' AND phase='cancelling')`, now.Format(time.RFC3339Nano), id)
+		if err != nil {
+			return Job{}, err
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return Job{}, err
+		}
+		if updated != 1 {
+			return Job{}, ErrJobTerminal
+		}
+		if _, err := appendEvent(tx, now, id, "warn", "cancelling", "cancellation_requested", "Cancellation requested"); err != nil {
+			return Job{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Job{}, err
+	}
+	s.mu.Lock()
+	cancel := s.active[id]
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	s.signal()
+	return s.Get(id)
+}
+
+func terminal(status string) bool {
+	switch Status(status) {
+	case Succeeded, Failed, Cancelled, Interrupted, NeedsAttention:
+		return true
+	default:
+		return false
+	}
+}
+
+// claimNext atomically reserves the oldest queued job and records its assignment.
+func (s *Service) claimNext(ctx context.Context) (Job, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Job{}, false, err
+	}
+	defer tx.Rollback()
+	now := s.now().UTC()
+	row := tx.QueryRowContext(ctx, `WITH next AS (SELECT id FROM jobs WHERE status='queued' ORDER BY created_at,id LIMIT 1)
+		UPDATE jobs SET status='assigned',phase='assigned',attempt=attempt+1,updated_at=?
+		WHERE id=(SELECT id FROM next) AND status='queued'
+		RETURNING `+jobSelectColumns, now.Format(time.RFC3339Nano))
+	job, err := scanJob(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Job{}, false, nil
+	}
+	if err != nil {
+		return Job{}, false, err
+	}
+	if _, err := appendEvent(tx, now, job.ID, "info", "assigned", "job_assigned", "Job assigned"); err != nil {
+		return Job{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Job{}, false, err
+	}
+	s.signal()
+	return job, true, nil
+}
+
+type reporter struct {
+	service *Service
+	jobID   string
+}
+
+func (r reporter) Report(update ProgressUpdate) error { return r.service.report(r.jobID, update) }
+
+const (
+	maxCheckpointBytes     = 4 << 10
+	maxJobEventsPerAttempt = 32
+)
+
+func (s *Service) report(id string, update ProgressUpdate) error {
+	code, message, err := progressEvent(update)
+	if err != nil {
+		return err
+	}
+	checkpoint := checkpointForPhase(update.Phase)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var status, phase string
+	var progress, eventCount int
+	if err := tx.QueryRow(`SELECT status,phase,progress_percent,(SELECT COUNT(*) FROM job_events WHERE job_id=jobs.id) FROM jobs WHERE id=?`, id).Scan(&status, &phase, &progress, &eventCount); errors.Is(err, sql.ErrNoRows) {
+		return ErrJobNotFound
+	} else if err != nil {
+		return err
+	}
+	if (status != string(Assigned) && status != string(Running) && status != string(Waiting)) || (status == string(Waiting) && phase == "cancelling") {
+		return ErrJobTerminal
+	}
+	if update.Progress < progress {
+		return ErrInvalidProgress
+	}
+	if eventCount >= maxJobEventsPerAttempt {
+		return ErrEventBudget
+	}
+	now := s.now().UTC()
+	formattedNow := now.Format(time.RFC3339Nano)
+	result, err := tx.Exec(`UPDATE jobs SET status=?,phase=?,progress_percent=?,checkpoint_json=?,updated_at=?,started_at=COALESCE(started_at,?) WHERE id=? AND status IN ('assigned','running','waiting_external') AND NOT (status='waiting_external' AND phase='cancelling') AND progress_percent<=?`, update.Status, update.Phase, update.Progress, checkpoint, formattedNow, formattedNow, id, update.Progress)
 	if err != nil {
 		return err
 	}
@@ -249,27 +562,304 @@ func (s *Service) Update(id string, status Status, phase string, progress int, c
 		return err
 	}
 	if updated != 1 {
-		if _, err := s.Get(id); errors.Is(err, sql.ErrNoRows) {
-			return ErrJobNotFound
-		}
 		return ErrJobTerminal
+	}
+	if _, err := appendEvent(tx, now, id, "info", update.Phase, code, message); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.signal()
+	return nil
+}
+
+func progressEvent(update ProgressUpdate) (string, string, error) {
+	if (update.Status != Running && update.Status != Waiting) || update.Progress < 0 || update.Progress > 100 || !knownPhase(update.Phase) || (update.Level != "" && update.Level != "info") {
+		return "", "", ErrInvalidProgress
+	}
+	switch update.Code {
+	case "fake_phase_started":
+		if !fakePhase(update.Phase) {
+			return "", "", ErrInvalidProgress
+		}
+		return "phase_started", "Fake runtime: " + update.Phase, nil
+	case "phase_started":
+		return "phase_started", "Job phase started", nil
+	case "waiting_external":
+		if update.Status != Waiting {
+			return "", "", ErrInvalidProgress
+		}
+		return "waiting_external", "Job waiting for external work", nil
+	default:
+		return "", "", ErrInvalidProgress
+	}
+}
+
+func fakePhase(phase string) bool {
+	switch phase {
+	case "validate", "prepare_workspace", "apply_fake_runtime", "wait_for_health", "finalize":
+		return true
+	default:
+		return false
+	}
+}
+
+func knownPhase(phase string) bool {
+	switch phase {
+	case "validate", "prepare_workspace", "apply_fake_runtime", "wait_for_health", "finalize", "running", "waiting_external":
+		return true
+	default:
+		return false
+	}
+}
+
+func checkpointForPhase(phase string) string { return `{"phase":"` + phase + `"}` }
+
+func normalizeCheckpoint(checkpoint string) (string, error) {
+	if len(checkpoint) > maxCheckpointBytes {
+		return "", ErrInvalidProgress
+	}
+	normalized, err := normalizeInput(json.RawMessage(checkpoint))
+	if err != nil {
+		return "", ErrInvalidProgress
+	}
+	return string(normalized), nil
+}
+
+// RunWorker returns only infrastructure failures; executor failures are persisted.
+func (s *Service) RunWorker(ctx context.Context, executor Executor) error {
+	if executor == nil {
+		return errors.New("job executor is required")
+	}
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-s.wake:
+		case <-ticker.C:
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		if s.beforeClaim != nil {
+			s.beforeClaim()
+		}
+		if err := s.runOne(ctx, executor); err != nil {
+			if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func (s *Service) runOne(ctx context.Context, executor Executor) error {
+	job, claimed, err := s.claimNext(ctx)
+	if err != nil || !claimed {
+		return err
+	}
+	jobCtx, cancel := context.WithCancel(ctx)
+	if s.beforeRegister != nil {
+		s.beforeRegister()
+	}
+	s.mu.Lock()
+	s.active[job.ID] = cancel
+	assigned, stateErr := s.isAssigned(job.ID)
+	s.mu.Unlock()
+	if stateErr != nil {
+		s.unregister(job.ID, cancel)
+		return stateErr
+	}
+	if !assigned {
+		cancelling, cancellationErr := s.cancellationRequested(job.ID)
+		s.unregister(job.ID, cancel)
+		if cancellationErr != nil {
+			return cancellationErr
+		}
+		if cancelling {
+			return s.finishCancellation(job.ID)
+		}
+		return nil
+	}
+	if s.beforeExecute != nil {
+		s.beforeExecute()
+	}
+	if jobCtx.Err() != nil {
+		s.unregister(job.ID, cancel)
+		cancelling, cancellationErr := s.cancellationRequested(job.ID)
+		if cancellationErr != nil {
+			return cancellationErr
+		}
+		if cancelling {
+			return s.finishCancellation(job.ID)
+		}
+		return nil
+	}
+
+	stopWatching := s.startCancellationWatcher(jobCtx, job.ID, cancel)
+	result, executionErr := invokeExecutor(jobCtx, executor, job, reporter{service: s, jobID: job.ID})
+	watcherErr := stopWatching()
+	s.unregister(job.ID, cancel)
+	validSuccess := executionErr == nil && validateResult(result) == nil
+	if validSuccess {
+		successErr := s.succeed(job.ID, result.CompletionCode)
+		if watcherErr != nil {
+			return watcherErr
+		}
+		if errors.Is(successErr, ErrJobTerminal) || errors.Is(successErr, ErrJobNotFound) {
+			return nil
+		}
+		return successErr
+	}
+	cancelling, err := s.cancellationRequested(job.ID)
+	if err != nil {
+		if watcherErr != nil {
+			return watcherErr
+		}
+		return err
+	}
+	if cancelling {
+		finishErr := s.finishCancellation(job.ID)
+		if watcherErr != nil {
+			return watcherErr
+		}
+		return finishErr
+	}
+	if watcherErr != nil {
+		return watcherErr
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+	if executionErr != nil {
+		code, detail := safeExecutionFailure(executionErr)
+		progress, checkpoint := s.failureState(job.ID)
+		return s.resolveTerminalConflict(job.ID, s.fail(job.ID, progress, checkpoint, code, detail))
+	}
+	progress, checkpoint := s.failureState(job.ID)
+	return s.resolveTerminalConflict(job.ID, s.fail(job.ID, progress, checkpoint, "executor_invalid_result", "Job execution failed"))
+}
+
+const cancellationWatchInterval = 25 * time.Millisecond
+
+func (s *Service) startCancellationWatcher(jobCtx context.Context, id string, cancel context.CancelFunc) func() error {
+	watchCtx, stop := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- s.watchCancellation(watchCtx, jobCtx, id, cancel)
+	}()
+	return func() error {
+		stop()
+		return <-done
+	}
+}
+
+func (s *Service) watchCancellation(watchCtx, jobCtx context.Context, id string, cancel context.CancelFunc) error {
+	ticker := time.NewTicker(cancellationWatchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-watchCtx.Done():
+			return nil
+		case <-jobCtx.Done():
+			return nil
+		case <-ticker.C:
+			cancelling, err := s.cancellationRequestedContext(watchCtx, id)
+			if err != nil {
+				if watchCtx.Err() != nil {
+					return nil
+				}
+				cancel()
+				return err
+			}
+			if cancelling {
+				cancel()
+				return nil
+			}
+		}
+	}
+}
+
+var errExecutorPanic = errors.New("executor panicked")
+
+func invokeExecutor(ctx context.Context, executor Executor, job Job, reporter ProgressReporter) (result ExecutionResult, err error) {
+	defer func() {
+		if recover() != nil {
+			result = ExecutionResult{}
+			err = errExecutorPanic
+		}
+	}()
+	return executor.Execute(ctx, job, reporter)
+}
+
+func (s *Service) isAssigned(id string) (bool, error) {
+	var status string
+	err := s.db.QueryRow(`SELECT status FROM jobs WHERE id=?`, id).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return status == string(Assigned), err
+}
+
+func (s *Service) unregister(id string, cancel context.CancelFunc) {
+	s.mu.Lock()
+	delete(s.active, id)
+	s.mu.Unlock()
+	cancel()
+}
+
+func (s *Service) failureState(id string) (int, string) {
+	job, err := s.Get(id)
+	if err != nil || job.Progress < 0 || job.Progress > 100 {
+		return 0, `{"phase":"failed"}`
+	}
+	return job.Progress, checkpointOrDefault(job.Checkpoint, "failed")
+}
+
+func (s *Service) cancellationRequested(id string) (bool, error) {
+	return s.cancellationRequestedContext(context.Background(), id)
+}
+
+func (s *Service) cancellationRequestedContext(ctx context.Context, id string) (bool, error) {
+	var status, phase string
+	if err := s.db.QueryRowContext(ctx, `SELECT status,phase FROM jobs WHERE id=?`, id).Scan(&status, &phase); err != nil {
+		return false, err
+	}
+	return status == string(Waiting) && phase == "cancelling", nil
+}
+
+func (s *Service) resolveTerminalConflict(id string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, ErrJobTerminal) && !errors.Is(err, ErrJobNotFound) {
+		return err
+	}
+	cancelling, checkErr := s.cancellationRequested(id)
+	if checkErr != nil {
+		if errors.Is(checkErr, sql.ErrNoRows) {
+			return nil
+		}
+		return checkErr
+	}
+	if cancelling {
+		return s.finishCancellation(id)
 	}
 	return nil
 }
 
-// transition persists a worker state change and its corresponding event as one
-// guarded unit. A concurrent cancellation therefore commits either before this
-// transaction (and makes the guard fail) or after its event has been appended.
-func (s *Service) transition(id string, status Status, phase string, progress int, checkpoint, level, code, message string) error {
+func (s *Service) finishCancellation(id string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-
 	now := s.now().UTC()
 	formattedNow := now.Format(time.RFC3339Nano)
-	result, err := tx.Exec(`UPDATE jobs SET status=?,phase=?,progress_percent=?,checkpoint_json=?,updated_at=?,started_at=COALESCE(started_at,?),finished_at=CASE WHEN ? IN ('succeeded','failed','cancelled','interrupted','needs_attention') THEN ? ELSE NULL END WHERE id=? AND status IN ('queued','assigned','running','waiting_external','waiting_user')`, status, phase, progress, checkpoint, formattedNow, formattedNow, status, formattedNow, id)
+	result, err := tx.Exec(`UPDATE jobs SET status='cancelled',phase='cancelled',updated_at=?,finished_at=? WHERE id=? AND status='waiting_external' AND phase='cancelling'`, formattedNow, formattedNow, id)
 	if err != nil {
 		return err
 	}
@@ -286,7 +876,7 @@ func (s *Service) transition(id string, status Status, phase string, progress in
 		}
 		return ErrJobTerminal
 	}
-	if _, err := appendEvent(tx, now, id, level, phase, code, message); err != nil {
+	if _, err := appendEvent(tx, now, id, "warn", "cancelled", "job_cancelled", "Job cancelled"); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -296,89 +886,142 @@ func (s *Service) transition(id string, status Status, phase string, progress in
 	return nil
 }
 
-func (s *Service) Cancel(id string) (Job, error) {
+func (s *Service) fail(id string, progress int, checkpoint, code, detail string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return Job{}, err
+		return err
 	}
 	defer tx.Rollback()
-	var status string
-	if err := tx.QueryRow(`SELECT status FROM jobs WHERE id=?`, id).Scan(&status); errors.Is(err, sql.ErrNoRows) {
-		return Job{}, ErrJobNotFound
-	} else if err != nil {
-		return Job{}, err
-	}
-	if terminal(status) {
-		return Job{}, ErrJobTerminal
-	}
 	now := s.now().UTC()
-	result, err := tx.Exec(`UPDATE jobs SET status='cancelled',phase='cancelled',updated_at=?,finished_at=? WHERE id=? AND status IN ('queued','assigned','running','waiting_external','waiting_user')`, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id)
+	formattedNow := now.Format(time.RFC3339Nano)
+	result, err := tx.Exec(`UPDATE jobs SET status='failed',phase='failed',progress_percent=?,checkpoint_json=?,error_code=?,error_detail=?,updated_at=?,started_at=COALESCE(started_at,?),finished_at=? WHERE id=? AND status IN ('assigned','running','waiting_external') AND NOT (status='waiting_external' AND phase='cancelling')`, progress, checkpoint, code, detail, formattedNow, formattedNow, formattedNow, id)
 	if err != nil {
-		return Job{}, err
+		return err
 	}
 	updated, err := result.RowsAffected()
 	if err != nil {
-		return Job{}, err
+		return err
 	}
 	if updated != 1 {
-		return Job{}, ErrJobTerminal
+		var exists int
+		if err := tx.QueryRow(`SELECT 1 FROM jobs WHERE id=?`, id).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+			return ErrJobNotFound
+		} else if err != nil {
+			return err
+		}
+		return ErrJobTerminal
 	}
-	if _, err := appendEvent(tx, now, id, "warn", "cancelled", "job_cancelled", "Job cancelled"); err != nil {
-		return Job{}, err
+	if _, err := appendEvent(tx, now, id, "error", "failed", "job_failed", detail); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
-		return Job{}, err
+		return err
 	}
 	s.signal()
-	return s.Get(id)
+	return nil
 }
 
-func terminal(status string) bool {
-	switch Status(status) {
-	case Succeeded, Failed, Cancelled, Interrupted, NeedsAttention:
-		return true
+func (s *Service) succeed(id, completionCode string) error {
+	message, err := completionMessage(completionCode)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := s.now().UTC()
+	formattedNow := now.Format(time.RFC3339Nano)
+	result, err := tx.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded',progress_percent=100,checkpoint_json='{"phase":"succeeded"}',error_code=NULL,error_detail=NULL,updated_at=?,started_at=COALESCE(started_at,?),finished_at=? WHERE id=? AND status IN ('assigned','running','waiting_external')`, formattedNow, formattedNow, formattedNow, id)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		var exists int
+		if err := tx.QueryRow(`SELECT 1 FROM jobs WHERE id=?`, id).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+			return ErrJobNotFound
+		} else if err != nil {
+			return err
+		}
+		return ErrJobTerminal
+	}
+	if _, err := appendEvent(tx, now, id, "info", "succeeded", "job_succeeded", message); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.signal()
+	return nil
+}
+
+func completionMessage(code string) (string, error) {
+	switch code {
+	case "":
+		return "Job completed", nil
+	case "fake_deployment_completed":
+		return "Fake deployment completed", nil
 	default:
-		return false
+		return "", ErrInvalidProgress
 	}
 }
 
-// RunFakeWorker is intentionally the only Phase A runtime executor. It persists every phase before progressing.
-func (s *Service) RunFakeWorker(ctx context.Context) {
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-s.wake:
-			s.runOne(ctx)
-		case <-ticker.C:
-			s.runOne(ctx)
+func safeExecutionFailure(err error) (string, string) {
+	var executionError *ExecutionError
+	if errors.As(err, &executionError) {
+		switch executionError.Code {
+		case "validation_failed":
+			return "validation_failed", "Job validation failed"
+		case "runtime_unavailable":
+			return "runtime_unavailable", "Runtime unavailable"
 		}
 	}
+	return "executor_failed", "Job execution failed"
 }
-func (s *Service) runOne(ctx context.Context) {
-	var id string
-	err := s.db.QueryRow(`SELECT id FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1`).Scan(&id)
-	if err != nil {
-		return
+
+func checkpointOrDefault(checkpoint, phase string) string {
+	if normalized, err := normalizeCheckpoint(checkpoint); err == nil {
+		return normalized
 	}
+	return `{"phase":"` + phase + `"}`
+}
+
+func validateResult(result ExecutionResult) error {
+	_, err := completionMessage(result.CompletionCode)
+	return err
+}
+
+// FakeExecutor preserves the existing Phase A runtime sequence.
+type FakeExecutor struct{ phaseDelay time.Duration }
+
+func NewFakeExecutor() *FakeExecutor { return &FakeExecutor{phaseDelay: 120 * time.Millisecond} }
+
+func (e *FakeExecutor) Execute(ctx context.Context, _ Job, reporter ProgressReporter) (ExecutionResult, error) {
 	phases := []struct {
-		n string
-		p int
+		name     string
+		progress int
 	}{{"validate", 15}, {"prepare_workspace", 35}, {"apply_fake_runtime", 70}, {"wait_for_health", 90}, {"finalize", 100}}
 	for _, phase := range phases {
+		if err := reporter.Report(ProgressUpdate{Status: Running, Phase: phase.name, Progress: phase.progress, Checkpoint: `{"phase":"` + phase.name + `"}`, Level: "info", Code: "fake_phase_started"}); err != nil {
+			return ExecutionResult{}, err
+		}
+		timer := time.NewTimer(e.phaseDelay)
 		select {
 		case <-ctx.Done():
-			return
-		default:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ExecutionResult{}, ctx.Err()
+		case <-timer.C:
 		}
-		if err := s.transition(id, Running, phase.n, phase.p, `{"phase":"`+phase.n+`"}`, "info", "phase_started", "Fake runtime: "+phase.n); err != nil {
-			return
-		}
-		time.Sleep(120 * time.Millisecond)
 	}
-	if err := s.transition(id, Succeeded, "succeeded", 100, `{"phase":"succeeded"}`, "info", "job_succeeded", "Fake deployment completed"); err != nil {
-		return
-	}
+	return ExecutionResult{CompletionCode: "fake_deployment_completed"}, nil
 }
+
+// RunFakeWorker is retained for existing callers.
+func (s *Service) RunFakeWorker(ctx context.Context) { _ = s.RunWorker(ctx, NewFakeExecutor()) }
