@@ -194,6 +194,7 @@ func (s *session) handshake(ctx context.Context) *sessionFailure {
 	if issueErr != nil {
 		return failure("internal_error", websocket.StatusInternalError, true)
 	}
+	challenge.ExpiresAt = challenge.ExpiresAt.UTC().Truncate(time.Microsecond)
 	clientNonce, decodeErr := base64.RawURLEncoding.DecodeString(hello.ClientNonce)
 	if decodeErr != nil {
 		return failure("invalid_frame", websocket.StatusPolicyViolation, true)

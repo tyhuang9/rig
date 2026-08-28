@@ -22,7 +22,9 @@ import (
 type fakeStateStore struct {
 	publicKey       ed25519.PublicKey
 	challenge       store.ChallengeInput
+	loadedExpiry    time.Time
 	challengeStored bool
+	truncateExpiry  bool
 	consumed        bool
 	leaseAcquired   bool
 	syncApplied     bool
@@ -45,7 +47,12 @@ func (f *fakeStateStore) LoadChallengeForAuthentication(context.Context, string)
 	if !f.challengeStored {
 		return store.AuthenticationChallenge{}, store.ErrNotFound
 	}
-	return store.AuthenticationChallenge{ChallengeInput: store.ChallengeInput{SessionID: f.challenge.SessionID, ControllerID: f.challenge.ControllerID, KeyID: f.challenge.KeyID, ClientNonce: append([]byte(nil), f.challenge.ClientNonce...), ServerNonce: append([]byte(nil), f.challenge.ServerNonce...), ACKDigest: append([]byte(nil), f.challenge.ACKDigest...), ExpiresAt: f.challenge.ExpiresAt}, PublicKey: append([]byte(nil), f.publicKey...), CreatedAt: commandTime}, nil
+	expiresAt := f.challenge.ExpiresAt
+	if f.truncateExpiry {
+		expiresAt = expiresAt.Truncate(time.Microsecond)
+	}
+	f.loadedExpiry = expiresAt
+	return store.AuthenticationChallenge{ChallengeInput: store.ChallengeInput{SessionID: f.challenge.SessionID, ControllerID: f.challenge.ControllerID, KeyID: f.challenge.KeyID, ClientNonce: append([]byte(nil), f.challenge.ClientNonce...), ServerNonce: append([]byte(nil), f.challenge.ServerNonce...), ACKDigest: append([]byte(nil), f.challenge.ACKDigest...), ExpiresAt: expiresAt}, PublicKey: append([]byte(nil), f.publicKey...), CreatedAt: commandTime}, nil
 }
 func (f *fakeStateStore) ConsumeChallenge(context.Context, string, time.Time) error {
 	f.mu.Lock()
@@ -356,10 +363,13 @@ func TestHandlerStatsIncludeHandshakeAndWaitForEveryExit(t *testing.T) {
 }
 
 func TestHandshakePersistsBeforeChallengeAuthenticatesAndRequiresFullSync(t *testing.T) {
-	now := commandTime
+	now := time.Date(2030, time.February, 3, 4, 5, 6, 123, time.FixedZone("challenge-test", -7*60*60))
+	if now.Nanosecond()%int(time.Microsecond) == 0 {
+		t.Fatal("test clock has microsecond precision")
+	}
 	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{8}, ed25519.SeedSize))
 	publicKey := privateKey.Public().(ed25519.PublicKey)
-	state := &fakeStateStore{publicKey: publicKey}
+	state := &fakeStateStore{publicKey: publicKey, truncateExpiry: true}
 	lifecycle, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	config := DefaultConfig()
@@ -375,6 +385,7 @@ func TestHandshakePersistsBeforeChallengeAuthenticatesAndRequiresFullSync(t *tes
 	syncFrame := &protocol.SubscriptionsSync{Envelope: protocol.NewEnvelope(protocol.TypeSubscriptionsSync, commandMessage2, now), Generation: 1, Subscriptions: []protocol.Subscription{{SubscriptionID: commandID4, InstallationID: 10, RepositoryID: 20, Ref: "refs/heads/main"}}}
 	challengeReady := make(chan *protocol.Challenge, 1)
 	readyWritten := make(chan struct{}, 1)
+	var wireChallengeExpiry time.Time
 	fakeConn := &fakeSocket{subprotocol: protocol.Subprotocol}
 	fakeConn.read = func(ctx context.Context, index int) (websocket.MessageType, []byte, error) {
 		switch index {
@@ -427,6 +438,9 @@ func TestHandshakePersistsBeforeChallengeAuthenticatesAndRequiresFullSync(t *tes
 	fakeConn.onWrite = func(frame protocol.Frame) {
 		switch value := frame.(type) {
 		case *protocol.Challenge:
+			state.mu.Lock()
+			wireChallengeExpiry = value.ExpiresAt
+			state.mu.Unlock()
 			challengeReady <- value
 		case *protocol.Ready:
 			readyWritten <- struct{}{}
@@ -452,6 +466,10 @@ func TestHandshakePersistsBeforeChallengeAuthenticatesAndRequiresFullSync(t *tes
 	defer state.mu.Unlock()
 	if !state.challengeStored || !state.consumed || !state.leaseAcquired || !state.syncApplied || !state.released {
 		t.Fatalf("state=%+v", state)
+	}
+	wantChallengeExpiry := now.UTC().Add(config.ChallengeLifetime).Truncate(time.Microsecond)
+	if state.challenge.ExpiresAt.Location() != time.UTC || state.loadedExpiry.Location() != time.UTC || wireChallengeExpiry.Location() != time.UTC || !state.challenge.ExpiresAt.Equal(wantChallengeExpiry) || !state.loadedExpiry.Equal(wantChallengeExpiry) || !wireChallengeExpiry.Equal(wantChallengeExpiry) || !wireChallengeExpiry.Equal(state.loadedExpiry) {
+		t.Fatalf("challenge expiry stored=%s loaded=%s wire=%s want=%s", state.challenge.ExpiresAt, state.loadedExpiry, wireChallengeExpiry, wantChallengeExpiry)
 	}
 	if len(fakeConn.readLimits) != 2 || fakeConn.readLimits[0] != int64(config.HandshakeMaxBytes) || fakeConn.readLimits[1] != int64(config.MaxEnvelopeBytes) {
 		t.Fatalf("read limit transitions=%v", fakeConn.readLimits)
