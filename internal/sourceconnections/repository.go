@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/hostd/hostd/internal/autodeploystate"
 )
 
 var (
@@ -68,8 +70,35 @@ func (repository *Repository) MarkTerminal(ctx context.Context, owner, id, statu
 	if status != StatusDenied && status != StatusExpired && status != StatusAccessLost {
 		return errors.New("invalid terminal connection status")
 	}
+	if status == StatusAccessLost {
+		return repository.markAccessLost(ctx, owner, id, code, now)
+	}
 	result, err := repository.db.ExecContext(ctx, `UPDATE source_connections SET status = ?, pending_expires_at = NULL, poll_interval_seconds = NULL, next_poll_at = NULL, last_error_code = ?, updated_at = ? WHERE owner_user_id = ? AND id = ?`, status, nullable(code), timestamp(now), owner, id)
 	return mutationResult(result, err)
+}
+
+func (repository *Repository) markAccessLost(ctx context.Context, owner, id, code string, now time.Time) error {
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current string
+	if err = tx.QueryRowContext(ctx, `SELECT status FROM source_connections WHERE owner_user_id=? AND id=?`, owner, id).Scan(&current); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if current != StatusAccessLost {
+		if _, err = autodeploystate.PauseConnectionSourceAccessLostTx(ctx, tx, owner, id, now); err != nil {
+			return err
+		}
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE source_connections SET status='access_lost',pending_expires_at=NULL,poll_interval_seconds=NULL,next_poll_at=NULL,last_error_code=?,updated_at=? WHERE owner_user_id=? AND id=?`, nullable(code), timestamp(now), owner, id)
+	if err = mutationResult(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (repository *Repository) Connect(ctx context.Context, owner, id string, bundle TokenBundle, now time.Time) error {
@@ -99,8 +128,19 @@ func (repository *Repository) Disconnect(ctx context.Context, owner, id string, 
 		return err
 	}
 	defer tx.Rollback()
+	var current string
+	if err = tx.QueryRowContext(ctx, `SELECT status FROM source_connections WHERE owner_user_id=? AND id=?`, owner, id).Scan(&current); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM github_installations WHERE connection_id IN (SELECT id FROM source_connections WHERE owner_user_id = ? AND id = ?)`, owner, id); err != nil {
 		return err
+	}
+	if current != StatusDisconnected {
+		if _, err = autodeploystate.PauseConnectionSourceAccessLostTx(ctx, tx, owner, id, now); err != nil {
+			return err
+		}
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE source_connections SET status = 'disconnected', pending_expires_at = NULL, poll_interval_seconds = NULL, next_poll_at = NULL, provider_user_id = NULL, provider_login = NULL, credential_generation = 0, access_expires_at = NULL, refresh_expires_at = NULL, last_error_code = NULL, disconnected_at = COALESCE(disconnected_at, ?), updated_at = ? WHERE owner_user_id = ? AND id = ?`, timestamp(now), timestamp(now), owner, id)
 	if err != nil {

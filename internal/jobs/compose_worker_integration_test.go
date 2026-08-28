@@ -1,6 +1,9 @@
 package jobs_test
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"errors"
@@ -15,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
+	"github.com/hostd/hostd/internal/autodeploy"
 	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deployments"
@@ -61,6 +65,220 @@ type blockingComposeRunner struct {
 	upStartedOnce sync.Once
 	upResult      runtimeprocess.CommandResult
 	upError       error
+}
+
+type ownerScopedGitHubSources struct {
+	owner, connection    string
+	installation, repo   int64
+	branch, sha          string
+	archive              []byte
+	mu                   sync.Mutex
+	resolveCalls         int
+	materializationCalls int
+}
+
+func (source *ownerScopedGitHubSources) Resolve(_ context.Context, owner, connection string, installation, repository int64, branch string) (sourceconnections.SourceRepository, sourceconnections.Branch, error) {
+	if owner != source.owner || connection != source.connection || installation != source.installation || repository != source.repo || branch != source.branch {
+		return sourceconnections.SourceRepository{}, sourceconnections.Branch{}, errors.New("unexpected source scope")
+	}
+	source.mu.Lock()
+	source.resolveCalls++
+	source.mu.Unlock()
+	return sourceconnections.SourceRepository{ID: source.repo, Owner: "octo", Name: "app"}, sourceconnections.Branch{Name: source.branch, SHA: source.sha}, nil
+}
+
+func (source *ownerScopedGitHubSources) ResolveHead(ctx context.Context, scope autodeploy.SourceScope) (string, error) {
+	_, branch, err := source.Resolve(ctx, scope.OwnerUserID, scope.ConnectionID, scope.InstallationID, scope.RepositoryID, scope.Branch)
+	if err != nil || scope.Ref != "refs/heads/"+scope.Branch {
+		return "", errors.New("unexpected coordinator source scope")
+	}
+	return branch.SHA, nil
+}
+
+func (source *ownerScopedGitHubSources) ReadTree(_ context.Context, owner, connection string, repository int64, sha string) (githubapp.Tree, error) {
+	if owner != source.owner || connection != source.connection || repository != source.repo || sha != source.sha {
+		return githubapp.Tree{}, errors.New("unexpected tree scope")
+	}
+	return githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "compose.yaml", Type: "blob", SHA: source.sha}}}, nil
+}
+
+func (source *ownerScopedGitHubSources) DownloadArchive(_ context.Context, owner, connection string, repository int64, sha string) (io.ReadCloser, error) {
+	if owner != source.owner || connection != source.connection || repository != source.repo || sha != source.sha {
+		return nil, errors.New("unexpected archive scope")
+	}
+	source.mu.Lock()
+	source.materializationCalls++
+	source.mu.Unlock()
+	return io.NopCloser(bytes.NewReader(source.archive)), nil
+}
+
+type successfulComposeRunner struct {
+	mu       sync.Mutex
+	requests []runtimeprocess.CommandRequest
+}
+
+func (runner *successfulComposeRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	runner.mu.Lock()
+	runner.requests = append(runner.requests, request)
+	runner.mu.Unlock()
+	if hasArgument(request.Args, "config") {
+		return runtimeprocess.CommandResult{Stdout: []byte(`{"services":{"web":{"image":"nginx"}}}`)}, nil
+	}
+	if hasArgument(request.Args, "up") {
+		return runtimeprocess.CommandResult{}, nil
+	}
+	return runtimeprocess.CommandResult{}, errors.New("unexpected compose command")
+}
+
+func (source *ownerScopedGitHubSources) counts() (int, int) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	return source.resolveCalls, source.materializationCalls
+}
+
+func TestCoordinatorJobRunsOwnerScopedGitHubComposeMaterialization(t *testing.T) {
+	dataRoot := t.TempDir()
+	db, err := database.Open(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	now := time.Now().UTC()
+	stamp := now.Format(time.RFC3339Nano)
+	owner, machineID := uuid.NewString(), uuid.NewString()
+	controllerID, bindingID := uuid.NewString(), uuid.NewString()
+	connectionID := "0123456789abcdef0123456789abcdef"
+	const installationID, repositoryID = int64(3), int64(7)
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if _, err = db.Exec(`INSERT INTO users(id,username,passphrase_hash,role,created_at,updated_at) VALUES(?,'owner','hash','administrator',?,?)`, owner, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,agent_version,created_at,updated_at) VALUES(?,'local','local','ready','test','test','test','test',?,?)`, machineID, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO source_connections(id,owner_user_id,provider,status,provider_user_id,provider_login,credential_generation,access_expires_at,refresh_expires_at,connected_at,created_at,updated_at) VALUES(?,?,'github','connected','1','owner',1,?,?,?,?,?)`, connectionID, owner, stamp, stamp, stamp, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	applications := apps.New(db)
+	application, err := applications.CreateWithSource("GitHub Runtime App", "", machineID, apps.Source{Type: apps.SourceGitHub, ConnectionID: connectionID, InstallationID: installationID, RepositoryID: repositoryID, RepositoryOwner: "octo", RepositoryName: "app", TrackedBranch: "main", TrackedRef: "refs/heads/main", ComposePath: "compose.yaml", ResolvedSHA: sha})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO relay_controllers(singleton,controller_id,state,created_at,updated_at) VALUES(1,?,'active',?,?)`, controllerID, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO relay_installation_bindings(binding_id,owner_user_id,connection_id,controller_id,installation_id,repository_id,state,state_changed_at,created_at,updated_at) VALUES(?,?,?,?,?,?,'authorized',?,?,?)`, bindingID, owner, connectionID, controllerID, installationID, repositoryID, stamp, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := appconfig.New(db, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = configuration.Replace(context.Background(), application.ID, owner, appconfig.ReplaceInput{ExpectedRevisionNumber: 0}); err != nil {
+		t.Fatal(err)
+	}
+	sources := &ownerScopedGitHubSources{owner: owner, connection: connectionID, installation: installationID, repo: repositoryID, branch: "main", sha: sha, archive: githubComposeArchive(t)}
+	materializer, err := releasesnapshot.New(db, sources, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary, err := securetemp.New(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &successfulComposeRunner{}
+	deploymentRepository := deployments.New(db)
+	executor, err := composeruntime.NewExecutor(applications, materializer, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{DockerExecutable: "docker-test", ConfigTimeout: 5 * time.Second, ApplyTimeout: 30 * time.Second, WaitTimeout: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobService := jobs.New(db)
+	autoRepository := autodeploy.NewRepository(db)
+	if _, err = autoRepository.Configure(context.Background(), autodeploy.ConfigureRequest{ApplicationID: application.ID, ActorUserID: owner, Enabled: true}, now); err != nil {
+		t.Fatal(err)
+	}
+	coordinatorConfig := autodeploy.DefaultCoordinatorConfig()
+	coordinatorConfig.PollInterval = 10 * time.Millisecond
+	coordinatorConfig.MinResolveInterval = time.Nanosecond
+	coordinatorConfig.LeaseTTL = 5 * time.Second
+	coordinator, err := autodeploy.NewCoordinator(autoRepository, sources, jobService, coordinatorConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	workerDone, coordinatorDone := make(chan error, 1), make(chan error, 1)
+	go func() { workerDone <- jobService.RunWorker(ctx, executor) }()
+	go func() { coordinatorDone <- coordinator.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		for name, done := range map[string]<-chan error{"worker": workerDone, "coordinator": coordinatorDone} {
+			select {
+			case runErr := <-done:
+				if runErr != nil {
+					t.Errorf("%s stopped: %v", name, runErr)
+				}
+			case <-time.After(5 * time.Second):
+				t.Errorf("%s did not stop", name)
+			}
+		}
+	})
+
+	var jobID string
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if queryErr := db.QueryRow(`SELECT id FROM jobs WHERE resource_id=?`, application.ID).Scan(&jobID); queryErr == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if jobID == "" {
+		t.Fatal("coordinator did not create a job")
+	}
+	completed := waitForJob(t, jobService, jobID, jobs.Succeeded)
+	if completed.RequestedBy != owner || string(completed.Input) != `{"releaseId":"","configurationMode":"current"}` {
+		t.Fatalf("coordinator job actor/input=%q/%q", completed.RequestedBy, completed.Input)
+	}
+	resolveCalls, materializationCalls := sources.counts()
+	if resolveCalls != 2 || materializationCalls != 1 {
+		t.Fatalf("source calls resolve=%d materialize=%d", resolveCalls, materializationCalls)
+	}
+	var releaseSHA, provider string
+	if err = db.QueryRow(`SELECT r.resolved_sha,r.source_provider FROM deployments d JOIN releases r ON r.id=d.release_id WHERE d.job_id=? AND d.status='succeeded'`, jobID).Scan(&releaseSHA, &provider); err != nil || releaseSHA != sha || provider != "github" {
+		t.Fatalf("deployment provenance sha=%q provider=%q err=%v", releaseSHA, provider, err)
+	}
+	var persistedInput string
+	if err = db.QueryRow(`SELECT input_json FROM jobs WHERE id=?`, jobID).Scan(&persistedInput); err != nil || strings.Contains(persistedInput, "token") || strings.Contains(persistedInput, "octo") || strings.Contains(persistedInput, sha) {
+		t.Fatalf("job input contamination=%q err=%v", persistedInput, err)
+	}
+}
+
+func githubComposeArchive(t *testing.T) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	gzipWriter := gzip.NewWriter(&buffer)
+	tarWriter := tar.NewWriter(gzipWriter)
+	for _, entry := range []struct {
+		name, body string
+		typeFlag   byte
+	}{{name: "repo/", typeFlag: tar.TypeDir}, {name: "repo/compose.yaml", body: "services:\n  web:\n    image: nginx\n", typeFlag: tar.TypeReg}} {
+		header := &tar.Header{Name: entry.name, Typeflag: entry.typeFlag, Mode: 0o600, Size: int64(len(entry.body))}
+		if entry.typeFlag == tar.TypeDir {
+			header.Size = 0
+		}
+		if err := tarWriter.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tarWriter.Write([]byte(entry.body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tarWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
 }
 
 func (r *blockingComposeRunner) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {

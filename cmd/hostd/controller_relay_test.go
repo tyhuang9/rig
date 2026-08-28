@@ -10,6 +10,7 @@ import (
 
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controllerrelay"
+	"github.com/hostd/hostd/internal/relay/protocol"
 )
 
 type relayRunnerFake struct {
@@ -185,5 +186,73 @@ func TestControllerRelayObserverLogIsAggregateAndSafe(t *testing.T) {
 	output := logs.String()
 	if strings.Contains(output, secret) || strings.Contains(output, "relay.example") || !strings.Contains(output, "queue_saturated") || !strings.Contains(output, "observer_dropped") || !strings.Contains(output, "recovery_lease_scanned") || !strings.Contains(output, "pending_commands") {
 		t.Fatalf("unsafe/incomplete relay observer log=%q", output)
+	}
+}
+
+type relayWakeStoreFake struct {
+	committed bool
+	decision  controllerrelay.InboxDecision
+	err       error
+}
+
+func (*relayWakeStoreFake) SessionAuthenticationCandidates(context.Context) (controllerrelay.ControllerIdentity, []controllerrelay.ControllerKey, error) {
+	return controllerrelay.ControllerIdentity{}, nil, nil
+}
+func (*relayWakeStoreFake) DurableACKState(context.Context, string) ([]protocol.ACKState, error) {
+	return nil, nil
+}
+func (*relayWakeStoreFake) PrepareSubscriptionSync(context.Context, string, string, time.Time) (controllerrelay.SyncSnapshot, error) {
+	return controllerrelay.SyncSnapshot{}, nil
+}
+func (*relayWakeStoreFake) AcknowledgeSubscriptionSync(context.Context, string, string, uint64, uint32, time.Time) error {
+	return nil
+}
+func (store *relayWakeStoreFake) CommitSourceDesired(context.Context, string, protocol.SourceDesired, time.Time) (controllerrelay.InboxDecision, error) {
+	store.committed = store.err == nil
+	return store.decision, store.err
+}
+func (*relayWakeStoreFake) CommitAccessChange(context.Context, string, protocol.AccessChange, time.Time) (controllerrelay.InboxDecision, error) {
+	return controllerrelay.InboxDecision{}, nil
+}
+func (store *relayWakeStoreFake) CommitSourceDesiredFenced(context.Context, string, uint64, uint64, protocol.SourceDesired, time.Time) (controllerrelay.InboxDecision, error) {
+	store.committed = store.err == nil
+	return store.decision, store.err
+}
+func (*relayWakeStoreFake) CommitAccessChangeFenced(context.Context, string, uint64, uint64, protocol.AccessChange, time.Time) (controllerrelay.InboxDecision, error) {
+	return controllerrelay.InboxDecision{}, nil
+}
+
+func TestControllerRelayWakeStoreSignalsOnlyAfterDurableACK(t *testing.T) {
+	for _, fenced := range []bool{false, true} {
+		store := &relayWakeStoreFake{decision: controllerrelay.AckDecision()}
+		wakes := 0
+		wrapper := &controllerRelayWakeStore{repository: store, wake: func() {
+			if !store.committed {
+				t.Fatal("wake preceded durable commit return")
+			}
+			wakes++
+		}}
+		if fenced {
+			if _, err := wrapper.CommitSourceDesiredFenced(context.Background(), "controller", 1, 1, protocol.SourceDesired{}, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		} else if _, err := wrapper.CommitSourceDesired(context.Background(), "controller", protocol.SourceDesired{}, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if wakes != 1 {
+			t.Fatalf("fenced=%v wakes=%d", fenced, wakes)
+		}
+	}
+
+	for _, store := range []*relayWakeStoreFake{
+		{decision: controllerrelay.RejectDecision(controllerrelay.RejectInvalidEvent)},
+		{decision: controllerrelay.AckDecision(), err: errors.New("persistence failed")},
+	} {
+		wakes := 0
+		wrapper := &controllerRelayWakeStore{repository: store, wake: func() { wakes++ }}
+		_, _ = wrapper.CommitSourceDesired(context.Background(), "controller", protocol.SourceDesired{}, time.Now())
+		if wakes != 0 {
+			t.Fatalf("non-durable/non-ACK source wakes=%d", wakes)
+		}
 	}
 }

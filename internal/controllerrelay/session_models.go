@@ -86,6 +86,22 @@ type InboxDecision struct {
 	Code string
 }
 
+// SourceACKHead is the compact, authoritative identity of the newest durable
+// source.desired envelope for one subscription. Raw inbox rows are bounded
+// audit history and are not used to determine acknowledgement state.
+type SourceACKHead struct {
+	ControllerID   string
+	SubscriptionID string
+	DeliveryID     string
+	Generation     uint64
+	InstallationID int64
+	RepositoryID   int64
+	Ref            string
+	ObservedSHA    string
+	ObservedAt     time.Time
+	ReceivedAt     time.Time
+}
+
 func AckDecision() InboxDecision { return InboxDecision{Kind: DecisionAck} }
 
 func RejectDecision(code string) InboxDecision {

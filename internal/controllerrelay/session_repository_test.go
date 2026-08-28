@@ -288,6 +288,87 @@ func TestSourceInboxDeduplicatesAfterDurabilityAndSortsACKState(t *testing.T) {
 	}
 }
 
+func TestSourceInboxHardBoundsHistoryAndPreservesCompactACKReplay(t *testing.T) {
+	repository, _, now := newRepositoryHarness(t)
+	binding := createSessionBinding(t, repository, now)
+	subscription := RelaySubscription{SubscriptionID: uuid.NewString(), OwnerUserID: binding.OwnerUserID, BindingID: binding.BindingID, ControllerID: binding.ControllerID, InstallationID: binding.InstallationID, RepositoryID: binding.RepositoryID, Ref: "refs/heads/main", State: SubscriptionActive, CreatedAt: now}
+	if err := repository.CreateSubscription(context.Background(), subscription); err != nil {
+		t.Fatal(err)
+	}
+	var current protocol.SourceDesired
+	for generation := uint64(1); generation <= 600; generation++ {
+		current = testSourceDesired(subscription, uuid.NewString(), generation, now.Add(time.Duration(generation)*time.Second))
+		current.ObservedSHA = fmt.Sprintf("%040x", generation)
+		decision, err := repository.CommitSourceDesired(context.Background(), binding.ControllerID, current, now.Add(time.Duration(generation)*time.Second))
+		if err != nil || decision.Kind != DecisionAck {
+			t.Fatalf("generation %d decision=%#v err=%v", generation, decision, err)
+		}
+	}
+	var rows, headGeneration int
+	var headDelivery, headSHA string
+	if err := repository.db.QueryRow(`SELECT COUNT(*) FROM relay_source_event_inbox WHERE controller_id=? AND subscription_id=?`, binding.ControllerID, subscription.SubscriptionID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 32 {
+		t.Fatalf("bounded source history rows=%d", rows)
+	}
+	if err := repository.db.QueryRow(`SELECT delivery_id,generation,observed_sha FROM relay_source_ack_heads WHERE controller_id=? AND subscription_id=?`, binding.ControllerID, subscription.SubscriptionID).Scan(&headDelivery, &headGeneration, &headSHA); err != nil {
+		t.Fatal(err)
+	}
+	if headGeneration != 600 || headDelivery != current.DeliveryID || headSHA != current.ObservedSHA {
+		t.Fatalf("ACK head delivery=%q generation=%d sha=%q", headDelivery, headGeneration, headSHA)
+	}
+	current.MessageID = uuid.NewString()
+	if decision, err := repository.CommitSourceDesired(context.Background(), binding.ControllerID, current, now.Add(601*time.Second)); err != nil || decision.Kind != DecisionAck {
+		t.Fatalf("exact head replay=%#v err=%v", decision, err)
+	}
+	stale := testSourceDesired(subscription, uuid.NewString(), 1, now.Add(time.Second))
+	stale.ObservedSHA = fmt.Sprintf("%040x", 1)
+	if decision, err := repository.CommitSourceDesired(context.Background(), binding.ControllerID, stale, now.Add(602*time.Second)); err != nil || decision != RejectDecision(RejectGenerationConflict) {
+		t.Fatalf("pruned stale generation=%#v err=%v", decision, err)
+	}
+	conflict := current
+	conflict.MessageID = uuid.NewString()
+	conflict.DeliveryID = uuid.NewString()
+	conflict.ObservedSHA = "ffffffffffffffffffffffffffffffffffffffff"
+	if decision, err := repository.CommitSourceDesired(context.Background(), binding.ControllerID, conflict, now.Add(603*time.Second)); err != nil || decision != RejectDecision(RejectGenerationConflict) {
+		t.Fatalf("current conflict=%#v err=%v", decision, err)
+	}
+	state, err := repository.DurableACKState(context.Background(), binding.ControllerID)
+	if err != nil || len(state) != 1 || state[0].SubscriptionID != subscription.SubscriptionID || state[0].Generation != 600 {
+		t.Fatalf("durable ACK state=%#v err=%v", state, err)
+	}
+}
+
+func TestDurableACKStateQueryUsesCompactHeadWithoutTempGrouping(t *testing.T) {
+	repository, _, now := newRepositoryHarness(t)
+	binding := createSessionBinding(t, repository, now)
+	subscription := RelaySubscription{SubscriptionID: uuid.NewString(), OwnerUserID: binding.OwnerUserID, BindingID: binding.BindingID, ControllerID: binding.ControllerID, InstallationID: binding.InstallationID, RepositoryID: binding.RepositoryID, Ref: "refs/heads/main", State: SubscriptionActive, CreatedAt: now}
+	if err := repository.CreateSubscription(context.Background(), subscription); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := repository.db.QueryContext(context.Background(), `EXPLAIN QUERY PLAN SELECT h.subscription_id,h.generation FROM relay_source_ack_heads h JOIN relay_controller_subscriptions s ON s.subscription_id=h.subscription_id AND s.controller_id=h.controller_id WHERE h.controller_id=? AND s.state='active' ORDER BY h.subscription_id`, binding.ControllerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		details = append(details, detail)
+		if strings.Contains(strings.ToUpper(detail), "TEMP B-TREE") || strings.Contains(strings.ToUpper(detail), "SCAN RELAY_SOURCE_EVENT_INBOX") {
+			t.Fatalf("unbounded ACK query plan: %s", strings.Join(details, "; "))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAccessRemovalIsAtomicAndRestorationIsAdvisory(t *testing.T) {
 	repository, _, now := newRepositoryHarness(t)
 	binding := createSessionBinding(t, repository, now)
@@ -331,6 +412,64 @@ func TestAccessRemovalIsAtomicAndRestorationIsAdvisory(t *testing.T) {
 	}
 }
 
+func TestAccessRemovalPausesAndFencesEnabledAutoDeployBeforeRetirement(t *testing.T) {
+	for _, changeCode := range []string{"repository.removed", "installation.removed"} {
+		t.Run(changeCode, func(t *testing.T) {
+			repository, _, now := newRepositoryHarness(t)
+			binding := createSessionBinding(t, repository, now)
+			subscription := RelaySubscription{SubscriptionID: uuid.NewString(), OwnerUserID: binding.OwnerUserID, BindingID: binding.BindingID, ControllerID: binding.ControllerID, InstallationID: binding.InstallationID, RepositoryID: binding.RepositoryID, Ref: "refs/heads/main", State: SubscriptionActive, CreatedAt: now}
+			if err := repository.CreateSubscription(context.Background(), subscription); err != nil {
+				t.Fatal(err)
+			}
+			applicationID, jobID, leaseToken := seedEnabledAutoDeployHead(t, repository, binding, subscription, now)
+			change := protocol.AccessChange{
+				Envelope:       protocol.NewEnvelope(protocol.TypeAccessChange, uuid.NewString(), now),
+				EventID:        uuid.NewString(),
+				InstallationID: binding.InstallationID,
+				ChangeCode:     changeCode,
+				ObservedAt:     now,
+				AckRequired:    true,
+			}
+			if changeCode == "repository.removed" {
+				change.RepositoryID = binding.RepositoryID
+			}
+			decision, err := repository.CommitAccessChange(context.Background(), binding.ControllerID, change, now.Add(time.Minute))
+			if err != nil || decision.Kind != DecisionAck {
+				t.Fatalf("access removal decision=%#v err=%v", decision, err)
+			}
+			var enabled, revision, fence int
+			var configuredSubscription, state, pauseCode, activeJob string
+			var persistedToken, expires any
+			if err = repository.db.QueryRow(`SELECT c.enabled,c.revision,c.subscription_id,h.state,h.pause_code,h.active_job_id,h.lease_fence,h.lease_token,h.lease_expires_at
+				FROM github_auto_deploy_configs c JOIN github_auto_deploy_heads h ON h.application_id=c.application_id WHERE c.application_id=?`, applicationID).
+				Scan(&enabled, &revision, &configuredSubscription, &state, &pauseCode, &activeJob, &fence, &persistedToken, &expires); err != nil {
+				t.Fatal(err)
+			}
+			if enabled != 1 || revision != 1 || configuredSubscription != subscription.SubscriptionID || state != "paused" || pauseCode != "source_access_lost" || activeJob != jobID || fence != 2 || persistedToken != nil || expires != nil {
+				t.Fatalf("paused head enabled=%d revision=%d subscription=%q state=%q pause=%q job=%q fence=%d token=%v expires=%v previousToken=%q", enabled, revision, configuredSubscription, state, pauseCode, activeJob, fence, persistedToken, expires, leaseToken)
+			}
+			var bindingState, subscriptionState string
+			var eventRows int
+			if err = repository.db.QueryRow(`SELECT state FROM relay_installation_bindings WHERE binding_id=?`, binding.BindingID).Scan(&bindingState); err != nil {
+				t.Fatal(err)
+			}
+			if err = repository.db.QueryRow(`SELECT state FROM relay_controller_subscriptions WHERE subscription_id=?`, subscription.SubscriptionID).Scan(&subscriptionState); err != nil {
+				t.Fatal(err)
+			}
+			if err = repository.db.QueryRow(`SELECT COUNT(*) FROM relay_access_event_inbox WHERE controller_id=? AND event_id=?`, binding.ControllerID, change.EventID).Scan(&eventRows); err != nil {
+				t.Fatal(err)
+			}
+			if bindingState != BindingAccessLost || subscriptionState != SubscriptionRetired || eventRows != 1 {
+				t.Fatalf("atomic access state binding=%q subscription=%q events=%d", bindingState, subscriptionState, eventRows)
+			}
+			newDesired := testSourceDesired(subscription, uuid.NewString(), 1, now.Add(2*time.Minute))
+			if rejected, err := repository.CommitSourceDesired(context.Background(), binding.ControllerID, newDesired, now.Add(2*time.Minute)); err != nil || rejected != RejectDecision(RejectUnknownSubscription) {
+				t.Fatalf("source after retirement decision=%#v err=%v", rejected, err)
+			}
+		})
+	}
+}
+
 func TestAccessRemovalRollsBackInboxAndBindingTogether(t *testing.T) {
 	repository, _, now := newRepositoryHarness(t)
 	binding := createSessionBinding(t, repository, now)
@@ -338,6 +477,7 @@ func TestAccessRemovalRollsBackInboxAndBindingTogether(t *testing.T) {
 	if err := repository.CreateSubscription(context.Background(), sub); err != nil {
 		t.Fatal(err)
 	}
+	applicationID, _, leaseToken := seedEnabledAutoDeployHead(t, repository, binding, sub, now)
 	if _, err := repository.db.Exec(`CREATE TRIGGER test_abort_subscription_retire BEFORE UPDATE OF state ON relay_controller_subscriptions WHEN OLD.state='active' BEGIN SELECT RAISE(ABORT,'forced rollback'); END`); err != nil {
 		t.Fatal(err)
 	}
@@ -352,6 +492,18 @@ func TestAccessRemovalRollsBackInboxAndBindingTogether(t *testing.T) {
 	var events int
 	if err := repository.db.QueryRow(`SELECT COUNT(*) FROM relay_access_event_inbox WHERE event_id=?`, removed.EventID).Scan(&events); err != nil || events != 0 {
 		t.Fatalf("access inbox escaped rollback = %d %v", events, err)
+	}
+	var enabled, revision, fence int
+	var state, token string
+	if err := repository.db.QueryRow(`SELECT c.enabled,c.revision,h.state,h.lease_fence,h.lease_token FROM github_auto_deploy_configs c JOIN github_auto_deploy_heads h ON h.application_id=c.application_id WHERE c.application_id=?`, applicationID).Scan(&enabled, &revision, &state, &fence, &token); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 1 || revision != 1 || state != "deploying" || fence != 1 || token != leaseToken {
+		t.Fatalf("head escaped rollback enabled=%d revision=%d state=%q fence=%d token=%q", enabled, revision, state, fence, token)
+	}
+	var subscriptionState string
+	if err := repository.db.QueryRow(`SELECT state FROM relay_controller_subscriptions WHERE subscription_id=?`, sub.SubscriptionID).Scan(&subscriptionState); err != nil || subscriptionState != SubscriptionActive {
+		t.Fatalf("subscription escaped rollback state=%q err=%v", subscriptionState, err)
 	}
 }
 
@@ -692,6 +844,26 @@ func createSessionBinding(t *testing.T, repository *Repository, now time.Time) I
 
 func testSourceDesired(sub RelaySubscription, deliveryID string, generation uint64, at time.Time) protocol.SourceDesired {
 	return protocol.SourceDesired{Envelope: protocol.NewEnvelope(protocol.TypeSourceDesired, uuid.NewString(), at), DeliveryID: deliveryID, SubscriptionID: sub.SubscriptionID, Generation: generation, InstallationID: sub.InstallationID, RepositoryID: sub.RepositoryID, Ref: sub.Ref, ObservedSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ObservedAt: at}
+}
+
+func seedEnabledAutoDeployHead(t *testing.T, repository *Repository, binding InstallationBinding, subscription RelaySubscription, now time.Time) (string, string, string) {
+	t.Helper()
+	applicationID := uuid.NewString()
+	jobID := uuid.NewString()
+	leaseToken := uuid.NewString()
+	stamp := coordinationTimestamp(now)
+	mustExec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := repository.db.Exec(query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustExec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,'Auto Deploy','draft',?,?)`, applicationID, applicationID, timestamp(now), timestamp(now))
+	mustExec(`INSERT INTO application_sources(application_id,source_type,connection_id,installation_id,repository_id,repository_owner,repository_name,tracked_branch,tracked_ref,compose_path,resolved_sha,created_at,updated_at) VALUES(?,'github',?,?,?,'octo','app','main',?,'compose.yaml','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?,?)`, applicationID, binding.ConnectionID, binding.InstallationID, binding.RepositoryID, subscription.Ref, timestamp(now), timestamp(now))
+	mustExec(`UPDATE github_auto_deploy_configs SET revision=1,enabled=1,source_owner_user_id=?,configured_by_user_id=?,controller_id=?,binding_id=?,subscription_id=?,updated_at=? WHERE application_id=?`, binding.OwnerUserID, binding.OwnerUserID, binding.ControllerID, binding.BindingID, subscription.SubscriptionID, stamp, applicationID)
+	mustExec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,idempotency_key,requested_by,input_json,created_at,updated_at) VALUES(?,'deploy','application',?,'running','running','auto-deploy:1:1',?,'{"releaseId":"","configurationMode":"current"}',?,?)`, jobID, applicationID, binding.OwnerUserID, timestamp(now), timestamp(now))
+	mustExec(`UPDATE github_auto_deploy_heads SET state='deploying',latest_resolved_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',dispatch_sequence=1,active_job_id=?,active_dispatch_sequence=1,active_generation=0,active_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',next_job_poll_at=?,lease_fence=1,lease_token=?,lease_expires_at=?,updated_at=? WHERE application_id=?`, jobID, coordinationTimestamp(now.Add(time.Second)), leaseToken, coordinationTimestamp(now.Add(time.Hour)), stamp, applicationID)
+	return applicationID, jobID, leaseToken
 }
 
 func TestSyncDigestIsCanonicalForOrderedItems(t *testing.T) {

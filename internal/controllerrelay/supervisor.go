@@ -175,7 +175,10 @@ type SupervisorConfig struct {
 	Now               func() time.Time
 	Sleep             func(context.Context, time.Duration) error
 	Jitter            func(time.Duration, uint32) time.Duration
-	Observer          SupervisorObserver
+	// OnReady is a dedicated durable-lifecycle hook. Implementations must be
+	// nonblocking and coalescing; unlike Observer, delivery is not lossy.
+	OnReady  func()
+	Observer SupervisorObserver
 }
 
 func DefaultSupervisorConfig() SupervisorConfig {
@@ -478,6 +481,9 @@ func (supervisor *Supervisor) observeTransport(ctx context.Context, event *sessi
 		supervisor.mu.Unlock()
 		supervisor.setStatus(status, "")
 		event.readyOwner = sessionReadyOwner{Epoch: status.Epoch, Fence: status.Fence}
+		if supervisor.config.OnReady != nil {
+			supervisor.config.OnReady()
+		}
 		if event.Pending && supervisor.completer != nil {
 			if err = supervisor.completer.CompleteRotationAfterFencedReady(ctx, event.ControllerID, event.KeyID, status.Epoch, status.Fence); err != nil {
 				return err

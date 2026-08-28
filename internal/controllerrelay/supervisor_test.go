@@ -307,6 +307,23 @@ func TestSupervisorRunsRealTransportHandshakeWithOwnedReady(t *testing.T) {
 	store := &supervisorStoreFake{}
 	config := DefaultSupervisorConfig()
 	config.Now = func() time.Time { return now }
+	observerStarted := make(chan struct{}, 1)
+	releaseObserver := make(chan struct{})
+	config.Observer = func(context.Context, SupervisorEvent) error {
+		select {
+		case observerStarted <- struct{}{}:
+		default:
+		}
+		<-releaseObserver
+		return nil
+	}
+	ready := make(chan struct{}, 1)
+	config.OnReady = func() {
+		select {
+		case ready <- struct{}{}:
+		default:
+		}
+	}
 	supervisor, err := NewSupervisor(transport, store, &supervisorRecoveryFake{}, supervisorCompleterFake{}, config)
 	if err != nil {
 		t.Fatal(err)
@@ -320,6 +337,16 @@ func TestSupervisorRunsRealTransportHandshakeWithOwnedReady(t *testing.T) {
 	if err = supervisor.runner.RunOnce(context.Background()); !sessionErrorCode(err, sessionErrorConnectionClosed) {
 		t.Fatalf("supervised handshake run=%v", err)
 	}
+	select {
+	case <-ready:
+	default:
+		t.Fatal("durable Ready hook was lost behind blocked observer")
+	}
+	select {
+	case <-observerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("observer was not scheduled")
+	}
 	status, _ := store.snapshot()
 	if status.State != SessionReady || status.Epoch != 2 || status.Fence != 3 || status.KeyID != sessionTestKeyID {
 		t.Fatalf("real handshake did not retain owned ready status: %#v", status)
@@ -330,6 +357,7 @@ func TestSupervisorRunsRealTransportHandshakeWithOwnedReady(t *testing.T) {
 	if !socket.closed {
 		t.Fatal("real handshake session was not closed after disconnect")
 	}
+	close(releaseObserver)
 }
 
 func TestSupervisorBackoffClampsJitterAndMapsSafeOutcomes(t *testing.T) {
@@ -1002,6 +1030,8 @@ func TestSupervisorPendingReadyCompleterUsesExactFenceAndFailsClosed(t *testing.
 			completer := &supervisorCompleterCapture{err: test.complete}
 			config := DefaultSupervisorConfig()
 			config.Now = func() time.Time { return now }
+			readyCalls := 0
+			config.OnReady = func() { readyCalls++ }
 			transport := &SessionTransport{}
 			supervisor, err := NewSupervisor(transport, store, &supervisorRecoveryFake{}, completer, config)
 			if err != nil {
@@ -1029,6 +1059,9 @@ func TestSupervisorPendingReadyCompleterUsesExactFenceAndFailsClosed(t *testing.
 			completer.mu.Unlock()
 			if len(calls) != 1 || calls[0].Epoch != 2 || calls[0].Fence != 3 {
 				t.Fatalf("completion calls=%#v", calls)
+			}
+			if readyCalls != 1 {
+				t.Fatalf("durable Ready hook calls=%d", readyCalls)
 			}
 		})
 	}
