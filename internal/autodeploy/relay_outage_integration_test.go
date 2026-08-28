@@ -61,17 +61,11 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	}
 
 	handler, server := relayOutageServer(t, relay)
-	firstRun, stopFirst := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, nil)
-	relayOutageWait(t, ctx, "initial authenticated subscription sync", func(queryCtx context.Context) (bool, error) {
-		var count int
-		err := pool.QueryRow(queryCtx, `SELECT COUNT(*) FROM relay_subscriptions WHERE controller_id=$1 AND subscription_id=$2`, controllerID, status.SubscriptionID).Scan(&count)
-		return count == 1, err
-	})
-	stopFirst()
-	server.Close()
-	handler.StopAdmissions()
-	relayOutageWaitRun(t, firstRun)
-	relayOutageWaitHandler(t, handler)
+	firstRun, stopFirst, firstSupervisor := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, nil)
+	firstFixture := relayOutageFirstRunFixture{stopSupervisor: stopFirst, server: server, handler: handler, done: firstRun}
+	t.Cleanup(func() { firstFixture.Stop(t) })
+	relayOutageWaitInitialSubscriptionSync(t, ctx, db, pool, controllerID, status.SubscriptionID, firstSupervisor)
+	firstFixture.Stop(t)
 
 	for generation, sha := range []string{testSHA, secondSHA, coordinatorThirdSHA} {
 		result, pushErr := relay.PushSourceEvent(ctx, store.SourceEvent{
@@ -120,7 +114,7 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	handler, server = relayOutageServer(t, relay)
 	dial := &relayOutageDropACKDial{dropped: make(chan struct{}), release: make(chan struct{})}
 	defer dial.Release()
-	secondRun, stopSecond := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, dial.Dial)
+	secondRun, stopSecond, _ := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, dial.Dial)
 	select {
 	case <-dial.dropped:
 	case <-time.After(5 * time.Second):
@@ -136,7 +130,7 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	relayOutageAssertDurableSource(t, ctx, db, controllerID, status.SubscriptionID)
 	dial.Release()
 	relayOutageWaitRun(t, secondRun)
-	thirdRun, stopThird := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, nil)
+	thirdRun, stopThird, _ := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, nil)
 	defer func() {
 		stopThird()
 		server.Close()
@@ -304,7 +298,7 @@ func relayOutageServer(t *testing.T, relay *store.Store) (*wss.Handler, *httptes
 	return handler, server
 }
 
-func relayOutageSupervisor(t *testing.T, url string, server *httptest.Server, repository *controllerrelay.Repository, controllerID, keyID string, privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey, dial controllerrelay.SessionDialFunc) (<-chan error, func()) {
+func relayOutageSupervisor(t *testing.T, url string, server *httptest.Server, repository *controllerrelay.Repository, controllerID, keyID string, privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey, dial controllerrelay.SessionDialFunc) (<-chan error, func(), *controllerrelay.Supervisor) {
 	t.Helper()
 	transportConfig := controllerrelay.DefaultSessionTransportConfig()
 	transportConfig.HandshakeTimeout = time.Second
@@ -326,7 +320,7 @@ func relayOutageSupervisor(t *testing.T, url string, server *httptest.Server, re
 	t.Cleanup(cancel)
 	done := make(chan error, 1)
 	go func() { done <- supervisor.Run(ctx) }()
-	return done, cancel
+	return done, cancel, supervisor
 }
 
 func relayOutageEnrollRelay(t *testing.T, ctx context.Context, relay *store.Store, at time.Time, controllerID, keyID string, publicKey ed25519.PublicKey) {
@@ -445,6 +439,146 @@ func relayOutageWait(t *testing.T, parent context.Context, label string, ready f
 			t.Fatalf("timed out waiting for %s", label)
 		case <-ticker.C:
 		}
+	}
+}
+
+const (
+	relayOutageInitialSyncTimeout     = 5 * time.Second
+	relayOutageDiagnosticQueryTimeout = 100 * time.Millisecond
+	relayOutageDiagnosticCountLimit   = 1000
+	relayOutageDiagnosticUnavailable  = -1
+)
+
+type relayOutageFirstRunFixture struct {
+	stopOnce       sync.Once
+	stopSupervisor func()
+	server         *httptest.Server
+	handler        *wss.Handler
+	done           <-chan error
+}
+
+func (fixture *relayOutageFirstRunFixture) Stop(t *testing.T) {
+	if fixture == nil {
+		return
+	}
+	fixture.stopOnce.Do(func() {
+		fixture.stopSupervisor()
+		fixture.server.Close()
+		fixture.handler.StopAdmissions()
+		select {
+		case err := <-fixture.done:
+			if err != nil {
+				t.Fatal("initial relay fixture supervisor failed")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("initial relay fixture supervisor did not stop")
+		}
+		waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if fixture.handler.Wait(waitCtx) != nil {
+			t.Fatal("initial relay fixture handler did not stop")
+		}
+	})
+}
+
+func relayOutageWaitInitialSubscriptionSync(t *testing.T, parent context.Context, db *sql.DB, pool *pgxpool.Pool, controllerID, subscriptionID string, supervisor *controllerrelay.Supervisor) {
+	t.Helper()
+	deadline := time.NewTimer(relayOutageInitialSyncTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if relayOutagePostgresDiagnosticCount(parent, pool, `SELECT COUNT(*) FROM relay_subscriptions WHERE controller_id=$1 AND subscription_id=$2`, controllerID, subscriptionID) == 1 {
+			return
+		}
+		select {
+		case <-parent.Done():
+			relayOutageFatalInitialSubscriptionSync(t, db, pool, controllerID, supervisor)
+		case <-deadline.C:
+			relayOutageFatalInitialSubscriptionSync(t, db, pool, controllerID, supervisor)
+		case <-ticker.C:
+		}
+	}
+}
+
+func relayOutageFatalInitialSubscriptionSync(t *testing.T, db *sql.DB, pool *pgxpool.Pool, controllerID string, supervisor *controllerrelay.Supervisor) {
+	t.Helper()
+	snapshot := relayOutageSafeSupervisorSnapshot(supervisor)
+	t.Fatalf("timed out waiting for initial authenticated subscription sync: sqlite_active_controller_subscriptions=%d sqlite_subscription_sync_heads=%d sqlite_inflight_sync_sets=%d postgres_relay_sessions=%d postgres_controller_leases=%d postgres_subscriptions_sync_commands=%d postgres_current_relay_subscriptions=%d supervisor_state=%s supervisor_outcome=%s supervisor_paused=%t",
+		relayOutageSQLiteDiagnosticCount(context.Background(), db, `SELECT COUNT(*) FROM relay_controller_subscriptions WHERE controller_id=? AND state='active'`, controllerID),
+		relayOutageSQLiteDiagnosticCount(context.Background(), db, `SELECT COUNT(*) FROM relay_subscription_sync_heads WHERE controller_id=?`, controllerID),
+		relayOutageSQLiteDiagnosticCount(context.Background(), db, `SELECT COUNT(*) FROM relay_subscription_sync_sets WHERE controller_id=? AND state='inflight'`, controllerID),
+		relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_sessions WHERE controller_id=$1 AND revoked_at IS NULL`, controllerID),
+		relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_controller_leases WHERE controller_id=$1`, controllerID),
+		relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_session_commands WHERE controller_id=$1 AND command_type='subscriptions.sync'`, controllerID),
+		relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_subscriptions WHERE controller_id=$1 AND retired_generation IS NULL`, controllerID),
+		snapshot.state, snapshot.outcome, snapshot.paused)
+}
+
+func relayOutageSQLiteDiagnosticCount(parent context.Context, db *sql.DB, query string, args ...any) int {
+	if db == nil {
+		return relayOutageDiagnosticUnavailable
+	}
+	return relayOutageDiagnosticCount(parent, func(queryCtx context.Context) (int, error) {
+		var count int
+		err := db.QueryRowContext(queryCtx, query, args...).Scan(&count)
+		return count, err
+	})
+}
+
+func relayOutagePostgresDiagnosticCount(parent context.Context, pool *pgxpool.Pool, query string, args ...any) int {
+	if pool == nil {
+		return relayOutageDiagnosticUnavailable
+	}
+	return relayOutageDiagnosticCount(parent, func(queryCtx context.Context) (int, error) {
+		var count int
+		err := pool.QueryRow(queryCtx, query, args...).Scan(&count)
+		return count, err
+	})
+}
+
+func relayOutageDiagnosticCount(parent context.Context, load func(context.Context) (int, error)) int {
+	queryCtx, cancel := context.WithTimeout(parent, relayOutageDiagnosticQueryTimeout)
+	defer cancel()
+	count, err := load(queryCtx)
+	if err != nil || count < 0 {
+		return relayOutageDiagnosticUnavailable
+	}
+	if count > relayOutageDiagnosticCountLimit {
+		return relayOutageDiagnosticCountLimit
+	}
+	return count
+}
+
+type relayOutageSafeSnapshot struct {
+	state   string
+	outcome string
+	paused  bool
+}
+
+func relayOutageSafeSupervisorSnapshot(supervisor *controllerrelay.Supervisor) relayOutageSafeSnapshot {
+	if supervisor == nil {
+		return relayOutageSafeSnapshot{state: "unavailable", outcome: "unavailable"}
+	}
+	snapshot := supervisor.Snapshot()
+	return relayOutageSafeSnapshot{state: relayOutageSafeSupervisorState(snapshot.State), outcome: relayOutageSafeSupervisorOutcome(snapshot.Outcome), paused: snapshot.Paused}
+}
+
+func relayOutageSafeSupervisorState(state string) string {
+	switch state {
+	case "", controllerrelay.SessionDisconnected, controllerrelay.SessionConnecting, controllerrelay.SessionAuthenticating, controllerrelay.SessionReady, controllerrelay.SessionBackoff, controllerrelay.SessionNeedsAttention, controllerrelay.SessionStopped:
+		return state
+	default:
+		return "unavailable"
+	}
+}
+
+func relayOutageSafeSupervisorOutcome(outcome string) string {
+	switch outcome {
+	case "", "relay_unavailable", "connection_closed", "protocol_error", "persistence_unavailable", "credential_unavailable", "identity_unavailable", "queue_saturated", "session_expired":
+		return outcome
+	default:
+		return "unavailable"
 	}
 }
 func relayOutageWaitRun(t *testing.T, done <-chan error) {
