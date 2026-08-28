@@ -108,6 +108,9 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 			return Release{}, &Error{Code: "internal_error"}
 		}
 		return existing, nil
+	} else if errors.Is(lookupErr, context.Canceled) || errors.Is(lookupErr, context.DeadlineExceeded) {
+		_ = m.abort(ctx, appID, release.ID, "canceled")
+		return Release{}, sourceError(lookupErr)
 	} else if !errors.Is(lookupErr, sql.ErrNoRows) {
 		_ = m.abort(ctx, appID, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
@@ -145,6 +148,7 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 	release.RepositoryID = 0
 	release.ResolvedSHA = digest
 	release.ArchiveSHA256 = digest
+	release.WorkspaceTreeSHA256 = digest
 	release.WorkspacePath = final
 	release.WorkspaceState = WorkspaceStateReady
 	release.WorkspaceSizeBytes = workspaceSize
@@ -169,7 +173,7 @@ func (m *Materializer) reserveLocal(ctx context.Context, appID, composePath stri
 }
 
 func (m *Materializer) markLocalReady(ctx context.Context, id, digest, workspace string, size int64) error {
-	result, err := m.db.ExecContext(ctx, `UPDATE releases SET status='ready',source_commit_sha=?,resolved_sha=?,archive_sha256=?,workspace_path=?,workspace_state='ready',workspace_size_bytes=?,materialized_at=? WHERE id=? AND source_provider='local' AND workspace_state='materializing'`, digest, digest, digest, workspace, size, m.now().UTC().Format(timeFormat), id)
+	result, err := m.db.ExecContext(ctx, `UPDATE releases SET status='ready',source_commit_sha=?,resolved_sha=?,archive_sha256=?,workspace_tree_sha256=?,workspace_path=?,workspace_state='ready',workspace_size_bytes=?,materialized_at=? WHERE id=? AND source_provider='local' AND workspace_state='materializing'`, digest, digest, digest, digest, workspace, size, m.now().UTC().Format(timeFormat), id)
 	if err != nil {
 		return err
 	}

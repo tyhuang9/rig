@@ -1107,7 +1107,7 @@ func insertReleaseWithProvenance(t *testing.T, fixture *repositoryFixture, appli
 	t.Helper()
 	releaseID := uuid.NewString()
 	stamp := timestamp(fixture.now)
-	if _, err := fixture.db.Exec(`INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,compose_path,archive_sha256,workspace_path,workspace_state,materialized_at) VALUES(?,?,?,'main','ready','{}',?,?,?,'octo','app',?,?,'compose.yaml',?,?,'ready',?)`, releaseID, applicationID, sha, stamp, provider, repositoryID, ref, sha, fmt.Sprintf("%064x", sequence), "releases/"+releaseID, stamp); err != nil {
+	if _, err := fixture.db.Exec(`INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,compose_path,archive_sha256,workspace_tree_sha256,workspace_path,workspace_state,materialized_at) VALUES(?,?,?,'main','ready','{}',?,?,?,'octo','app',?,?,'compose.yaml',?,?,?,'ready',?)`, releaseID, applicationID, sha, stamp, provider, repositoryID, ref, sha, fmt.Sprintf("%064x", sequence), fmt.Sprintf("%064x", sequence), "releases/"+releaseID, stamp); err != nil {
 		t.Fatal(err)
 	}
 	return releaseID
