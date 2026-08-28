@@ -252,19 +252,18 @@ func prepareBootstrapToken(output io.Writer, dataRoot, token string, lifetime ti
 		return nil, err
 	}
 	var once sync.Once
-	var timer *time.Timer
-	cleanup := func() {
+	remove := func() {
 		once.Do(func() {
-			if timer != nil {
-				timer.Stop()
-			}
 			if err := secretfile.Remove(path); err != nil && reportCleanupError != nil {
 				reportCleanupError(fmt.Errorf("remove bootstrap token file: %w", err))
 			}
 		})
 	}
-	timer = time.AfterFunc(lifetime, cleanup)
-	return cleanup, nil
+	timer := time.AfterFunc(lifetime, remove)
+	return func() {
+		timer.Stop()
+		remove()
+	}, nil
 }
 
 func parseLevel(v string) slog.Level {
