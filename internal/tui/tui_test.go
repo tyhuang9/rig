@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -35,6 +36,113 @@ type fakeClient struct {
 	applicationID   string
 	overviewStarted chan<- string
 	overviewRelease <-chan struct{}
+}
+
+type delayedHistoryCall struct {
+	kind   historyOperationKind
+	values []string
+}
+
+// delayedHistoryStore makes the ordering of persistence completions explicit
+// in tests. Each storage call waits for the test to release it.
+type delayedHistoryStore struct {
+	mu      sync.Mutex
+	values  []string
+	started chan delayedHistoryCall
+	release chan error
+}
+
+func newDelayedHistoryStore(values []string) *delayedHistoryStore {
+	return &delayedHistoryStore{
+		values:  append([]string(nil), values...),
+		started: make(chan delayedHistoryCall),
+		release: make(chan error),
+	}
+}
+
+func (s *delayedHistoryStore) Load(context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.values...), nil
+}
+
+func (s *delayedHistoryStore) Save(ctx context.Context, values []string) error {
+	call := delayedHistoryCall{kind: historySaveOperation, values: append([]string(nil), values...)}
+	select {
+	case s.started <- call:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-s.release:
+		if err == nil {
+			s.mu.Lock()
+			s.values = append([]string(nil), call.values...)
+			s.mu.Unlock()
+		}
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *delayedHistoryStore) Clear(ctx context.Context) error {
+	select {
+	case s.started <- delayedHistoryCall{kind: historyClearOperation}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-s.release:
+		if err == nil {
+			s.mu.Lock()
+			s.values = nil
+			s.mu.Unlock()
+		}
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *delayedHistoryStore) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.values...)
+}
+
+func startHistoryCommand(t *testing.T, cmd tea.Cmd) <-chan tea.Msg {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("expected history command")
+	}
+	result := make(chan tea.Msg, 1)
+	go func() { result <- cmd() }()
+	return result
+}
+
+func waitHistoryCall(t *testing.T, store *delayedHistoryStore) delayedHistoryCall {
+	t.Helper()
+	select {
+	case call := <-store.started:
+		return call
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for history storage call")
+		return delayedHistoryCall{}
+	}
+}
+
+func finishHistoryCommand(t *testing.T, m *Model, store *delayedHistoryStore, result <-chan tea.Msg, err error) tea.Cmd {
+	t.Helper()
+	store.release <- err
+	select {
+	case msg := <-result:
+		_, next := m.Update(msg)
+		return next
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for history storage result")
+		return nil
+	}
 }
 
 func (f *fakeClient) waitOverview(ctx context.Context, operation string) error {
@@ -589,17 +697,122 @@ func TestAsyncCommandSnapshotsSelectedAndTargetState(t *testing.T) {
 	}
 }
 
-func TestLogoutSnapshotsHistoryBeforeAsyncWork(t *testing.T) {
+func TestHistorySaveSnapshotsBeforeAsyncWork(t *testing.T) {
 	history := &memoryHistoryStore{}
 	m := NewModel(context.Background(), &fakeClient{}, history, "endpoint")
-	m.screen = screenConsole
 	m.historyValues = []string{"/status"}
-	run := m.execute(command{Name: "/logout"})
+	run := m.enqueueHistorySave(m.historyValues)
 	m.historyValues = []string{"/stop"}
 	_ = run()
 	values, err := history.Load(context.Background())
 	if err != nil || len(values) != 1 || values[0] != "/status" {
 		t.Fatalf("saved history=%v err=%v", values, err)
+	}
+}
+
+func TestHistoryPersistenceSerializesOlderSnapshotsBeforeNewerRequests(t *testing.T) {
+	store := newDelayedHistoryStore(nil)
+	m := NewModel(context.Background(), &fakeClient{}, store, "endpoint")
+	first := startHistoryCommand(t, m.enqueueHistorySave([]string{"/status"}))
+	if call := waitHistoryCall(t, store); call.kind != historySaveOperation || !reflect.DeepEqual(call.values, []string{"/status"}) {
+		t.Fatalf("first call = %#v", call)
+	}
+	if cmd := m.enqueueHistorySave([]string{"/jobs"}); cmd != nil {
+		t.Fatal("newer history request started before older save completed")
+	}
+	if cmd := m.enqueueHistorySave([]string{"/apps"}); cmd != nil {
+		t.Fatal("latest history request started before older save completed")
+	}
+	next := finishHistoryCommand(t, m, store, first, nil)
+	second := startHistoryCommand(t, next)
+	if call := waitHistoryCall(t, store); call.kind != historySaveOperation || !reflect.DeepEqual(call.values, []string{"/apps"}) {
+		t.Fatalf("second call = %#v", call)
+	}
+	if next := finishHistoryCommand(t, m, store, second, nil); next != nil {
+		t.Fatal("unexpected extra history operation")
+	}
+	if got := store.snapshot(); !reflect.DeepEqual(got, []string{"/apps"}) {
+		t.Fatalf("persisted history = %v", got)
+	}
+}
+
+func TestHistoryClearWaitsForPendingSaveAndCannotBeResurrected(t *testing.T) {
+	store := newDelayedHistoryStore([]string{"/old"})
+	m := NewModel(context.Background(), &fakeClient{}, store, "endpoint")
+	first := startHistoryCommand(t, m.enqueueHistorySave([]string{"/status"}))
+	_ = waitHistoryCall(t, store)
+	if cmd := m.enqueueHistoryClear(); cmd != nil {
+		t.Fatal("clear started before pending save completed")
+	}
+	next := finishHistoryCommand(t, m, store, first, nil)
+	clear := startHistoryCommand(t, next)
+	if call := waitHistoryCall(t, store); call.kind != historyClearOperation {
+		t.Fatalf("clear call = %#v", call)
+	}
+	if next := finishHistoryCommand(t, m, store, clear, nil); next != nil {
+		t.Fatal("unexpected history operation after clear")
+	}
+	if got := store.snapshot(); len(got) != 0 {
+		t.Fatalf("clear was resurrected by stale save: %v", got)
+	}
+}
+
+func TestHistoryClearThenLaterCommandPersistsOnlyPostClearHistory(t *testing.T) {
+	store := newDelayedHistoryStore([]string{"/old"})
+	m := NewModel(context.Background(), &fakeClient{}, store, "endpoint")
+	clear := startHistoryCommand(t, m.enqueueHistoryClear())
+	if call := waitHistoryCall(t, store); call.kind != historyClearOperation {
+		t.Fatalf("clear call = %#v", call)
+	}
+	if cmd := m.enqueueHistorySave([]string{"/status"}); cmd != nil {
+		t.Fatal("post-clear save started before clear completed")
+	}
+	next := finishHistoryCommand(t, m, store, clear, nil)
+	save := startHistoryCommand(t, next)
+	if call := waitHistoryCall(t, store); call.kind != historySaveOperation || !reflect.DeepEqual(call.values, []string{"/status"}) {
+		t.Fatalf("post-clear call = %#v", call)
+	}
+	if next := finishHistoryCommand(t, m, store, save, nil); next != nil {
+		t.Fatal("unexpected extra history operation")
+	}
+	if got := store.snapshot(); !reflect.DeepEqual(got, []string{"/status"}) {
+		t.Fatalf("persisted post-clear history = %v", got)
+	}
+}
+
+func TestLateHistoryLoadCannotReplaceCommandsAcceptedAfterStartup(t *testing.T) {
+	m := NewModel(context.Background(), &fakeClient{}, &memoryHistoryStore{}, "endpoint")
+	m.historyValues = []string{"/status"}
+	_ = m.enqueueHistorySave(m.historyValues)
+	_, bootstrap := m.Update(historyLoadedMsg{values: []string{"/old", "/jobs"}})
+	if !reflect.DeepEqual(m.historyValues, []string{"/status"}) {
+		t.Fatalf("late startup load overwrote accepted history: %v", m.historyValues)
+	}
+	if bootstrap == nil {
+		t.Fatal("history load did not continue startup")
+	}
+}
+
+func TestHistoryPersistenceReportsErrorsAndContinuesQueue(t *testing.T) {
+	store := newDelayedHistoryStore(nil)
+	m := consoleModel(&fakeClient{})
+	m.history = store
+	first := startHistoryCommand(t, m.enqueueHistorySave([]string{"/status"}))
+	_ = waitHistoryCall(t, store)
+	if cmd := m.enqueueHistorySave([]string{"/jobs"}); cmd != nil {
+		t.Fatal("second save started before first completed")
+	}
+	next := finishHistoryCommand(t, m, store, first, errors.New("disk unavailable"))
+	if len(m.entries) == 0 || m.entries[len(m.entries)-1].Title != "history" {
+		t.Fatalf("save error was not visible: %#v", m.entries)
+	}
+	second := startHistoryCommand(t, next)
+	_ = waitHistoryCall(t, store)
+	if next := finishHistoryCommand(t, m, store, second, nil); next != nil {
+		t.Fatal("unexpected extra history operation")
+	}
+	if got := store.snapshot(); !reflect.DeepEqual(got, []string{"/jobs"}) {
+		t.Fatalf("queue did not continue after error: %v", got)
 	}
 }
 

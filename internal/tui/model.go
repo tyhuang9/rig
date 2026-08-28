@@ -103,6 +103,9 @@ type Model struct {
 	suggestion           int
 	historyValues        []string
 	historyIndex         int
+	historyGeneration    uint64
+	historyActive        *historyOperation
+	historyPending       []historyOperation
 	draft                string
 	confirm              *confirmation
 	bootstrapConfirm     bool
@@ -151,12 +154,36 @@ func NewModel(ctx context.Context, client Client, history HistoryStore, endpoint
 }
 
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(m.loadHistory(), m.checkBootstrap())
+	// Loading the small protected history first avoids a late disk response
+	// replacing commands the operator has already entered. Bootstrap checking
+	// starts from historyLoadedMsg once that ordering point has completed.
+	return m.loadHistory()
 }
 
 type historyLoadedMsg struct {
 	values []string
 	err    error
+}
+type historyOperationKind uint8
+
+const (
+	historySaveOperation historyOperationKind = iota
+	historyClearOperation
+)
+
+// historyOperation is deliberately a snapshot. The model serializes these
+// operations rather than letting Bubble Tea run each write independently:
+// history files must reflect command acceptance order, even when storage is
+// slow or a clear races an earlier save.
+type historyOperation struct {
+	generation uint64
+	kind       historyOperationKind
+	values     []string
+}
+
+type historyOperationMsg struct {
+	generation uint64
+	err        error
 }
 type bootstrapStatusMsg struct {
 	status apicontract.BootstrapStatus
@@ -204,7 +231,6 @@ type followEventMsg struct {
 	err        error
 	done       bool
 }
-type historySavedMsg struct{ err error }
 type sessionClearedMsg struct{}
 
 func (m *Model) loadHistory() tea.Cmd {
@@ -212,6 +238,62 @@ func (m *Model) loadHistory() tea.Cmd {
 	return func() tea.Msg {
 		values, err := history.Load(ctx)
 		return historyLoadedMsg{values: values, err: err}
+	}
+}
+
+// enqueueHistorySave captures the normalized command list at acceptance time.
+// The returned command starts the FIFO only when no operation is already
+// running; all later requests remain in order behind it.
+func (m *Model) enqueueHistorySave(values []string) tea.Cmd {
+	m.historyGeneration++
+	operation := historyOperation{
+		generation: m.historyGeneration,
+		kind:       historySaveOperation,
+		values:     append([]string(nil), normalizeHistory(values)...),
+	}
+	// Pending saves on the same side of a clear barrier have no observable
+	// intermediate state, so retain only the newest snapshot. This bounds a
+	// slow disk's queue while keeping clears and post-clear history distinct.
+	if last := len(m.historyPending) - 1; last >= 0 && m.historyPending[last].kind == historySaveOperation {
+		m.historyPending[last] = operation
+		return nil
+	}
+	return m.enqueueHistoryOperation(operation)
+}
+
+// enqueueHistoryClear is a FIFO barrier. A save that was already in flight is
+// allowed to complete, then the clear runs before any later save, so an older
+// snapshot can never recreate the cleared history.
+func (m *Model) enqueueHistoryClear() tea.Cmd {
+	m.historyGeneration++
+	return m.enqueueHistoryOperation(historyOperation{
+		generation: m.historyGeneration,
+		kind:       historyClearOperation,
+	})
+}
+
+func (m *Model) enqueueHistoryOperation(operation historyOperation) tea.Cmd {
+	m.historyPending = append(m.historyPending, operation)
+	return m.startNextHistoryOperation()
+}
+
+func (m *Model) startNextHistoryOperation() tea.Cmd {
+	if m.historyActive != nil || len(m.historyPending) == 0 {
+		return nil
+	}
+	operation := m.historyPending[0]
+	m.historyPending = m.historyPending[1:]
+	m.historyActive = &operation
+	store, ctx := m.history, m.ctx
+	return func() tea.Msg {
+		var err error
+		switch operation.kind {
+		case historyClearOperation:
+			err = store.Clear(ctx)
+		default:
+			err = store.Save(ctx, operation.values)
+		}
+		return historyOperationMsg{generation: operation.generation, err: err}
 	}
 }
 
@@ -291,11 +373,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resize()
 		return m, nil
 	case historyLoadedMsg:
-		if msg.err == nil {
+		if msg.err == nil && m.historyGeneration == 0 {
 			m.historyValues = normalizeHistory(msg.values)
 			m.historyIndex = len(m.historyValues)
 		}
-		return m, nil
+		return m, m.checkBootstrap()
 	case bootstrapStatusMsg:
 		if msg.err != nil {
 			m.goOffline(msg.err)
@@ -412,11 +494,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.startOverview()
 		}
 		return m, m.waitForFollow()
-	case historySavedMsg:
+	case historyOperationMsg:
+		if m.historyActive == nil || msg.generation != m.historyActive.generation {
+			return m, nil
+		}
+		m.historyActive = nil
 		if msg.err != nil {
 			m.appendEntry(entryError, "history", "Could not persist command history: "+msg.err.Error())
 		}
-		return m, nil
+		return m, m.startNextHistoryOperation()
 	case sessionClearedMsg:
 		return m, nil
 	case tea.MouseMsg:
@@ -574,8 +660,7 @@ func (m *Model) submitCommand() (tea.Model, tea.Cmd) {
 	if parsed.Name != "/history clear" {
 		m.historyValues = normalizeHistory(append(m.historyValues, parsed.Raw))
 		m.historyIndex = len(m.historyValues)
-		values := append([]string(nil), m.historyValues...)
-		persist = func() tea.Msg { return historySavedMsg{err: m.history.Save(m.ctx, values)} }
+		persist = m.enqueueHistorySave(m.historyValues)
 	}
 	spec := commandSpecs[parsed.Name]
 	if spec.Confirm {
@@ -620,20 +705,16 @@ func (m *Model) execute(cmd command) tea.Cmd {
 	case "/history clear":
 		m.historyValues = nil
 		m.historyIndex = 0
-		return func() tea.Msg { return historySavedMsg{err: m.history.Clear(m.ctx)} }
+		return m.enqueueHistoryClear()
 	case "/quit":
 		m.stopFollowing(false)
 		return tea.Quit
 	case "/logout":
 		m.busy = true
 		m.commandInput.Blur()
-		history := append([]string(nil), m.historyValues...)
-		client, store, ctx := m.client, m.history, m.ctx
+		client, ctx := m.client, m.ctx
 		return func() tea.Msg {
 			err := client.Logout(ctx)
-			if err == nil {
-				_ = store.Save(ctx, history)
-			}
 			return commandResultMsg{cmd: cmd, body: "Session ended.", err: err}
 		}
 	case "/use":
