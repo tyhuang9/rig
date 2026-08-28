@@ -26,10 +26,18 @@ REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIRECTORY}/.." && pwd -P)"
 readonly REPOSITORY_ROOT
 readonly COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/relay/compose.yaml"
 readonly MIGRATION_DIRECTORY="${REPOSITORY_ROOT}/internal/relay/store/migrations"
+CURRENT_PHASE="initialization"
 
 fail() {
   printf 'relay Compose lifecycle check failed: %s\n' "$1" >&2
   exit 1
+}
+
+on_error() {
+  local status=$?
+  trap - ERR
+  printf 'relay Compose lifecycle command failed: phase=%s status=%d\n' "${CURRENT_PHASE}" "${status}" >&2
+  return "${status}"
 }
 
 valid_scope() {
@@ -165,7 +173,7 @@ cleanup() {
   local recorded_anchor_identity=""
   local scope_present=0
 
-  trap - EXIT INT TERM HUP
+  trap - EXIT INT TERM HUP ERR
   set +e
 
   if [[ -e "${STATE_DIRECTORY}" || -L "${STATE_DIRECTORY}" || -e "${DEPLOYMENT_ANCHOR}" || -L "${DEPLOYMENT_ANCHOR}" ]]; then
@@ -639,19 +647,27 @@ run_lifecycle() {
   [[ "${CI:-}" == "true" && "${GITHUB_ACTIONS:-}" == "true" ]] || fail "hosted CI guard unavailable"
   require_commands
   trap on_exit EXIT
+  trap on_error ERR
   trap 'exit 130' INT
   trap 'exit 143' TERM HUP
+  CURRENT_PHASE="runtime-scope"
   assert_runtime_scope_empty
+  CURRENT_PHASE="protected-fixture"
   create_fixture
+  CURRENT_PHASE="isolated-registry"
   create_registry
 
+  CURRENT_PHASE="edge-network"
   docker network create "${EDGE_NETWORK}" >"${STATE_DIRECTORY}/edge-network-id"
   [[ "$(docker network inspect --format '{{.Id}}' "${EDGE_NETWORK}")" == "$(<"${STATE_DIRECTORY}/edge-network-id")" ]] ||
     fail "edge network identity unavailable"
 
+  CURRENT_PHASE="relay-image"
   relay_image="$(build_relay_image)"
+  CURRENT_PHASE="deployment-environment"
   write_environment "${relay_image}"
 
+  CURRENT_PHASE="packaging-preflight"
   prepare_required_log "${STATE_DIRECTORY}/packaging-preflight.log"
   pwsh -NoProfile -File "${REPOSITORY_ROOT}/scripts/check-relay-packaging.ps1" \
     -TrustedDeploymentAnchor "${DEPLOYMENT_ANCHOR}" \
@@ -661,14 +677,18 @@ run_lifecycle() {
   chmod 0600 "${STATE_DIRECTORY}/packaging-preflight.log"
   scan_captured_logs
 
+  CURRENT_PHASE="compose-start-one"
   : >"${STATE_DIRECTORY}/compose-attempted"
   chmod 0600 "${STATE_DIRECTORY}/compose-attempted"
   prepare_required_log "${STATE_DIRECTORY}/compose-up-one.log"
   compose up --detach --wait --wait-timeout 180 >"${STATE_DIRECTORY}/compose-up-one.log" 2>&1
   chmod 0600 "${STATE_DIRECTORY}/compose-up-one.log"
+  CURRENT_PHASE="health-one"
   assert_healthy
+  CURRENT_PHASE="probe-one"
   probe_relay before
 
+  CURRENT_PHASE="state-one"
   postgres_before="$(compose ps --quiet postgres)"
   relay_before="$(compose ps --quiet relay)"
   volume_before="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Name}}{{end}}{{end}}' "${postgres_before}")"
@@ -676,20 +696,27 @@ run_lifecycle() {
   docker volume inspect "${volume_before}" >/dev/null
   system_before="$(query_system_identity before)"
 
+  CURRENT_PHASE="migrations-one"
   query_migrations "${STATE_DIRECTORY}/migrations-before"
   assert_exact_migrations
   sha256sum "${STATE_DIRECTORY}/migrations-before" | cut -d ' ' -f 1 >"${STATE_DIRECTORY}/migrations-before.sha256"
+  CURRENT_PHASE="persistence-marker"
   create_persistence_marker
+  CURRENT_PHASE="logs-one"
   capture_logs "${STATE_DIRECTORY}/generation-one.log"
   scan_captured_logs
 
+  CURRENT_PHASE="compose-start-two"
   prepare_required_log "${STATE_DIRECTORY}/compose-up-two.log"
   compose up --detach --wait --wait-timeout 180 --no-deps --force-recreate relay \
     >"${STATE_DIRECTORY}/compose-up-two.log" 2>&1
   chmod 0600 "${STATE_DIRECTORY}/compose-up-two.log"
+  CURRENT_PHASE="health-two"
   assert_healthy
+  CURRENT_PHASE="probe-two"
   probe_relay after
 
+  CURRENT_PHASE="state-two"
   postgres_after="$(compose ps --quiet postgres)"
   relay_after="$(compose ps --quiet relay)"
   volume_after="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Name}}{{end}}{{end}}' "${postgres_after}")"
@@ -701,14 +728,17 @@ run_lifecycle() {
   [[ "${system_after}" == "${system_before}" ]] || fail "PostgreSQL system identity changed"
   assert_persistence_marker after
 
+  CURRENT_PHASE="migrations-two"
   query_migrations "${STATE_DIRECTORY}/migrations-after"
   cmp --silent "${STATE_DIRECTORY}/migrations-before" "${STATE_DIRECTORY}/migrations-after" ||
     fail "migration ledger changed during relay recreation"
   sha256sum "${STATE_DIRECTORY}/migrations-after" | cut -d ' ' -f 1 >"${STATE_DIRECTORY}/migrations-after.sha256"
   cmp --silent "${STATE_DIRECTORY}/migrations-before.sha256" "${STATE_DIRECTORY}/migrations-after.sha256" ||
     fail "migration ledger hash changed during relay recreation"
+  CURRENT_PHASE="logs-two"
   capture_logs "${STATE_DIRECTORY}/generation-two.log"
   scan_captured_logs
+  CURRENT_PHASE="complete"
   printf 'relay Compose lifecycle check passed\n'
 }
 
