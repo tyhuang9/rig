@@ -180,9 +180,113 @@ func TestCreateWithInputFinalizedRollsBackJobEventAndWakeTogether(t *testing.T) 
 	if err != nil || wasCreated || replayed.ID != created.ID || finalizeCalls != 2 || len(service.wake) != 1 {
 		t.Fatalf("replay=%#v created=%t calls=%d wake=%d err=%v", replayed, wasCreated, finalizeCalls, len(service.wake), err)
 	}
+	mismatch := request
+	mismatch.RequestedBy = "different-owner"
+	mismatchFinalizeCalls := 0
+	if _, _, err := service.CreateWithInputFinalized(mismatch, func(_ *sql.Tx, _ Job) error {
+		mismatchFinalizeCalls++
+		return nil
+	}); !errors.Is(err, ErrIdempotency) || mismatchFinalizeCalls != 0 || len(service.wake) != 1 {
+		t.Fatalf("mismatch error=%v finalizeCalls=%d wake=%d", err, mismatchFinalizeCalls, len(service.wake))
+	}
 	events, err := service.Events(created.ID, 0)
 	if err != nil || countEvents(events, "job_queued") != 1 {
 		t.Fatalf("replay queued events=%#v err=%v", events, err)
+	}
+}
+
+func TestCreateWithInputFinalizedSerializesWritersAcrossDatabaseHandles(t *testing.T) {
+	dataRoot := filepath.Join(t.TempDir(), "state")
+	firstDB, err := database.Open(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = firstDB.Close() })
+	secondDB, err := database.Open(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = secondDB.Close() })
+	firstService, secondService := New(firstDB), New(secondDB)
+
+	type createResult struct {
+		job     Job
+		created bool
+		err     error
+	}
+	writerEntered := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseWriter) }) }
+	t.Cleanup(release)
+	var firstFinalizers, secondFinalizers atomic.Int32
+	firstResult := make(chan createResult, 1)
+	go func() {
+		job, created, createErr := firstService.CreateWithInputFinalized(CreateRequest{Type: "deploy", ResourceType: "application", ResourceID: "writer-one", IdempotencyKey: "writer-one", Input: NoInput{}}, func(tx *sql.Tx, job Job) error {
+			firstFinalizers.Add(1)
+			var queuedEvents int
+			if queryErr := tx.QueryRow(`SELECT COUNT(*) FROM job_events WHERE job_id=? AND code='job_queued'`, job.ID).Scan(&queuedEvents); queryErr != nil {
+				return queryErr
+			}
+			if queuedEvents != 1 {
+				return errors.New("writer finalizer did not observe one queued event")
+			}
+			close(writerEntered)
+			<-releaseWriter
+			return nil
+		})
+		firstResult <- createResult{job: job, created: created, err: createErr}
+	}()
+	select {
+	case <-writerEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first service did not enter its finalizer")
+	}
+
+	secondCalling := make(chan struct{})
+	secondResult := make(chan createResult, 1)
+	go func() {
+		close(secondCalling)
+		job, created, createErr := secondService.CreateWithInputFinalized(CreateRequest{Type: "deploy", ResourceType: "application", ResourceID: "writer-two", IdempotencyKey: "writer-two", Input: NoInput{}}, func(_ *sql.Tx, _ Job) error {
+			secondFinalizers.Add(1)
+			return nil
+		})
+		secondResult <- createResult{job: job, created: created, err: createErr}
+	}()
+	<-secondCalling
+	select {
+	case result := <-secondResult:
+		t.Fatalf("second create returned while first writer was held: %#v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	var first, second createResult
+	select {
+	case first = <-firstResult:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first create did not finish after writer release")
+	}
+	select {
+	case second = <-secondResult:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second create did not finish after writer release")
+	}
+	if first.err != nil || !first.created || second.err != nil || !second.created || first.job.ID == "" || second.job.ID == "" || first.job.ID == second.job.ID {
+		t.Fatalf("serialized creates first=%#v second=%#v", first, second)
+	}
+	if firstFinalizers.Load() != 1 || secondFinalizers.Load() != 1 || len(firstService.wake) != 1 || len(secondService.wake) != 1 {
+		t.Fatalf("serialized finalizers first=%d second=%d wakes=%d/%d", firstFinalizers.Load(), secondFinalizers.Load(), len(firstService.wake), len(secondService.wake))
+	}
+	var secondJobs, secondEvents int
+	if err := secondDB.QueryRow(`SELECT COUNT(*) FROM jobs WHERE resource_type='application' AND resource_id='writer-two'`).Scan(&secondJobs); err != nil {
+		t.Fatal(err)
+	}
+	if err := secondDB.QueryRow(`SELECT COUNT(*) FROM job_events WHERE job_id=? AND code='job_queued'`, second.job.ID).Scan(&secondEvents); err != nil {
+		t.Fatal(err)
+	}
+	if secondJobs != 1 || secondEvents != 1 {
+		t.Fatalf("second serialized create jobs=%d queuedEvents=%d", secondJobs, secondEvents)
 	}
 }
 
@@ -559,8 +663,11 @@ func TestActiveCancellationHoldsApplicationUntilExecutorCleanupAcrossServices(t 
 	if err != nil || countEvents(events, "cancellation_requested") != 1 || countEvents(events, "job_cancelled") != 0 {
 		t.Fatalf("cancellation events before cleanup = %#v, %v", events, err)
 	}
-	if _, _, err := peer.Create("deploy", "application", "same-app", "request-two"); err == nil {
-		t.Fatal("replacement application work was accepted while cleanup ran")
+	if _, _, err := peer.Create("deploy", "application", "same-app", "request-two"); !errors.Is(err, ErrApplicationBusy) {
+		t.Fatalf("replacement during cleanup error=%v, want %v", err, ErrApplicationBusy)
+	}
+	if _, _, err := peer.Create("deploy", "application", "same-app", ""); !errors.Is(err, ErrApplicationBusy) {
+		t.Fatalf("non-idempotent replacement during cleanup error=%v, want %v", err, ErrApplicationBusy)
 	}
 	close(release)
 	deadline := time.Now().Add(2 * time.Second)
