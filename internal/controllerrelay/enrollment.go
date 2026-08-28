@@ -17,11 +17,17 @@ import (
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
-const enrollmentAttemptLifetime = 10 * time.Minute
+const (
+	enrollmentAttemptLifetime    = 10 * time.Minute
+	controllerIdentityWriteLease = 5 * time.Minute
+	controllerIdentityWriteWait  = 2 * time.Second
+	controllerIdentityWritePoll  = 5 * time.Millisecond
+)
 
 type enrollmentRepository interface {
 	ActiveIdentity(context.Context) (ControllerIdentity, ControllerKey, error)
-	CreateIdentity(context.Context, ControllerIdentity, ControllerKey) error
+	BeginControllerIdentityWrite(context.Context, ControllerKeyIOLease) error
+	CreateIdentity(context.Context, ControllerKeyIOLease, ControllerIdentity, ControllerKey, time.Time) error
 	CreateEnrollment(context.Context, Enrollment) error
 	Enrollment(context.Context, string, string) (Enrollment, error)
 	MarkEnrollmentPolled(context.Context, string, string, time.Time) error
@@ -40,7 +46,6 @@ type sourceAccess interface {
 type enrollmentCredentials interface {
 	WriteControllerKey(ControllerKeyBundle) (string, error)
 	ReadControllerKey(string, string, []byte) (ControllerKeyBundle, error)
-	RemoveControllerKey(string, string) error
 	WriteEnrollmentPollToken(EnrollmentPollToken) (string, error)
 	ReadEnrollmentPollToken(string, string) (EnrollmentPollToken, error)
 	RemoveEnrollmentPollToken(string, string) error
@@ -421,12 +426,45 @@ func (service *EnrollmentService) activeIdentity(ctx context.Context) (Controlle
 		return ControllerIdentity{}, ControllerKey{}, ControllerKeyBundle{}, enrollmentFailure("entropy_unavailable")
 	}
 	bundle := ControllerKeyBundle{Version: credentialVersion, ControllerID: controllerID, KeyID: keyID, PrivateKey: privateKey, PublicKey: publicKey}
+	now := service.now().UTC()
+	if now.IsZero() {
+		bundle.Destroy()
+		return ControllerIdentity{}, ControllerKey{}, ControllerKeyBundle{}, enrollmentFailure("internal_error")
+	}
+	leaseID, err := randomUUID(service.entropy)
+	if err != nil {
+		bundle.Destroy()
+		return ControllerIdentity{}, ControllerKey{}, ControllerKeyBundle{}, enrollmentFailure("entropy_unavailable")
+	}
+	lease := ControllerKeyIOLease{
+		ScopeKey: controllerIdentityIOScope, ControllerID: controllerID, LeaseID: leaseID, Operation: ControllerKeyIOIdentityWrite,
+		Phase: ControllerKeyIOActive, Fence: 1, LeaseExpiresAt: now.Add(controllerIdentityWriteLease), KeyID: keyID,
+		PublicKey: append([]byte(nil), publicKey...), ProtectedKeyRef: ProtectedKeyRef(controllerID, keyID), CreatedAt: now, UpdatedAt: now,
+	}
+	defer clear(lease.PublicKey)
+	if err = service.repository.BeginControllerIdentityWrite(ctx, lease); err != nil {
+		bundle.Destroy()
+		if errors.Is(err, ErrConflict) {
+			return service.waitForActiveIdentity(ctx)
+		}
+		if errors.Is(err, ErrState) {
+			identity, key, readErr := service.repository.ActiveIdentity(ctx)
+			if readErr == nil {
+				storedBundle, validateErr := service.validateActiveIdentity(identity, key)
+				return identity, key, storedBundle, validateErr
+			}
+		}
+		return ControllerIdentity{}, ControllerKey{}, ControllerKeyBundle{}, enrollmentFailure("persistence_unavailable")
+	}
 	protectedRef, err := service.credentials.WriteControllerKey(bundle)
 	if err != nil {
 		bundle.Destroy()
 		return ControllerIdentity{}, ControllerKey{}, ControllerKeyBundle{}, enrollmentFailure("credential_unavailable")
 	}
-	now := service.now().UTC()
+	if protectedRef != lease.ProtectedKeyRef {
+		bundle.Destroy()
+		return ControllerIdentity{}, ControllerKey{}, ControllerKeyBundle{}, enrollmentFailure("credential_unavailable")
+	}
 	identity = ControllerIdentity{ControllerID: controllerID, State: ControllerActive, CreatedAt: now, UpdatedAt: now}
 	activated := now
 	key = ControllerKey{
@@ -434,20 +472,43 @@ func (service *EnrollmentService) activeIdentity(ctx context.Context) (Controlle
 		State: KeyActive, ProtectedKeyRef: protectedRef, CreatedAt: now, UpdatedAt: now,
 		ActivatedAt: &activated, PossessionConfirmedAt: &activated,
 	}
-	if err = service.repository.CreateIdentity(ctx, identity, key); err == nil {
+	if err = service.repository.CreateIdentity(ctx, lease, identity, key, service.now().UTC()); err == nil {
 		return identity, key, bundle, nil
 	}
 	storedIdentity, storedKey, readErr := service.repository.ActiveIdentity(ctx)
 	if readErr == nil && storedIdentity.ControllerID == controllerID && storedKey.KeyID == keyID {
 		return identity, key, bundle, nil
 	}
-	_ = service.credentials.RemoveControllerKey(controllerID, keyID)
 	bundle.Destroy()
 	if readErr == nil {
 		storedBundle, validateErr := service.validateActiveIdentity(storedIdentity, storedKey)
 		return storedIdentity, storedKey, storedBundle, validateErr
 	}
 	return ControllerIdentity{}, ControllerKey{}, ControllerKeyBundle{}, enrollmentFailure("persistence_unavailable")
+}
+
+func (service *EnrollmentService) waitForActiveIdentity(ctx context.Context) (ControllerIdentity, ControllerKey, ControllerKeyBundle, error) {
+	timer := time.NewTimer(controllerIdentityWriteWait)
+	defer timer.Stop()
+	ticker := time.NewTicker(controllerIdentityWritePoll)
+	defer ticker.Stop()
+	for {
+		identity, key, err := service.repository.ActiveIdentity(ctx)
+		if err == nil {
+			bundle, validateErr := service.validateActiveIdentity(identity, key)
+			return identity, key, bundle, validateErr
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return ControllerIdentity{}, ControllerKey{}, ControllerKeyBundle{}, enrollmentFailure("persistence_unavailable")
+		}
+		select {
+		case <-ctx.Done():
+			return ControllerIdentity{}, ControllerKey{}, ControllerKeyBundle{}, enrollmentFailure("persistence_unavailable")
+		case <-timer.C:
+			return ControllerIdentity{}, ControllerKey{}, ControllerKeyBundle{}, enrollmentFailure("persistence_unavailable")
+		case <-ticker.C:
+		}
+	}
 }
 
 func (service *EnrollmentService) validateActiveIdentity(identity ControllerIdentity, key ControllerKey) (ControllerKeyBundle, error) {

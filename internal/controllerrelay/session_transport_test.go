@@ -290,6 +290,82 @@ func TestSessionTransportRejectsChallengeACKDigestMismatchBeforeCredentialRead(t
 	}
 }
 
+func TestSessionTransportBoundsAmbiguousFinalizeAuthenticationFallback(t *testing.T) {
+	now := time.Date(2026, 8, 26, 4, 0, 0, 0, time.UTC)
+	pendingKeyID := "99999999-9999-4999-8999-999999999999"
+	privateKey := deterministicSessionPrivateKey(12)
+	publicKey := append(ed25519.PublicKey(nil), privateKey.Public().(ed25519.PublicKey)...)
+	store := &fakeSessionTransportStore{
+		identity: ControllerIdentity{ControllerID: sessionTestControllerID, State: ControllerActive},
+		candidates: []ControllerKey{
+			{ControllerID: sessionTestControllerID, KeyID: sessionTestKeyID, State: KeyActive, PublicKey: bytes.Repeat([]byte{0x11}, ed25519.PublicKeySize)},
+			{ControllerID: sessionTestControllerID, KeyID: pendingKeyID, State: KeyPending, PublicKey: publicKey},
+		},
+		ack:           []protocol.ACKState{},
+		subscriptions: []protocol.Subscription{},
+	}
+	credentials := &fakeSessionTransportCredentials{bundle: ControllerKeyBundle{Version: credentialVersion, ControllerID: sessionTestControllerID, KeyID: pendingKeyID, PrivateKey: append(ed25519.PrivateKey(nil), privateKey...), PublicKey: append(ed25519.PublicKey(nil), publicKey...)}}
+	socket := &scriptedSessionSocket{subprotocol: protocol.Subprotocol}
+	var hello *protocol.Hello
+	socket.onWrite = func(frame protocol.Frame) error {
+		switch value := frame.(type) {
+		case *protocol.Hello:
+			hello = value
+			if value.KeyID != pendingKeyID {
+				return errors.New("fallback did not use pending key")
+			}
+			digest, err := protocol.CanonicalACKDigest(value.ACKState)
+			if err != nil {
+				return err
+			}
+			socket.enqueue(&protocol.Challenge{Envelope: protocol.NewEnvelope(protocol.TypeChallenge, sessionTestChallengeID, now), SessionID: sessionTestSessionID, ServerNonce: base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x22}, protocol.NonceBytes)), ACKDigest: base64.RawURLEncoding.EncodeToString(digest[:]), ExpiresAt: now.Add(time.Minute)})
+		case *protocol.Authenticate:
+			if hello == nil {
+				return errors.New("authenticate before hello")
+			}
+			socket.enqueue(&protocol.Ready{Envelope: protocol.NewEnvelope(protocol.TypeReady, sessionTestReadyID, now), SessionID: sessionTestSessionID, HeartbeatIntervalSeconds: 15, MaxEnvelopeBytes: protocol.DefaultMaxEnvelopeBytes, MaxSubscriptions: protocol.MaxArrayItems, MaxOutstanding: 32, SessionExpiresAt: now.Add(time.Hour), Reconnect: protocol.ReconnectPolicy{InitialDelayMillis: 500, MaximumDelayMillis: 30000, Multiplier: 2, JitterPercent: 20}})
+		case *protocol.SubscriptionsSync:
+			socket.enqueue(&protocol.SubscriptionsSynced{Envelope: protocol.NewEnvelope(protocol.TypeSubscriptionsSynced, sessionTestSyncedID, now), TargetMessageID: value.MessageID, Generation: value.Generation, AcceptedCount: uint32(len(value.Subscriptions))})
+		default:
+			return errors.New("unexpected fallback controller frame")
+		}
+		return nil
+	}
+	var dialCount int
+	dial := func(context.Context, string, *websocket.DialOptions) (SessionSocket, *http.Response, error) {
+		dialCount++
+		if dialCount == 1 {
+			return nil, nil, errors.New("old key rejected after relay finalization")
+		}
+		if dialCount == 2 {
+			return socket, nil, nil
+		}
+		return nil, nil, errors.New("unbounded authentication attempt")
+	}
+	config := DefaultSessionTransportConfig()
+	config.Now = func() time.Time { return now }
+	config.Entropy = bytes.NewReader(bytes.Repeat([]byte{0xd1}, 256))
+	transport, err := NewSessionTransport("https://relay.example", store, credentials, roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, nil }), dial, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := transport.connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.closeNow()
+	if dialCount != 2 || active.keyID != pendingKeyID || credentials.reads != 1 {
+		t.Fatalf("fallback dialCount=%d activeKey=%q credentialReads=%d", dialCount, active.keyID, credentials.reads)
+	}
+
+	tooMany := &fakeSessionTransportStore{identity: store.identity, candidates: append(append([]ControllerKey(nil), store.candidates...), ControllerKey{ControllerID: sessionTestControllerID, KeyID: sessionTestReadyID, State: KeyPending, PublicKey: publicKey}), ack: []protocol.ACKState{}, subscriptions: []protocol.Subscription{}}
+	transport.store = tooMany
+	dialCount = 0
+	if _, err = transport.connect(context.Background()); !sessionErrorCode(err, sessionErrorIdentity) || dialCount != 0 {
+		t.Fatalf("unbounded candidate set err=%v dials=%d", err, dialCount)
+	}
+}
+
 func TestActiveSessionCommitsBeforeACKAndSuppressesACKOnStoreFailure(t *testing.T) {
 	now := time.Date(2026, 8, 26, 4, 0, 0, 0, time.UTC)
 	store := &fakeSessionTransportStore{commitSourceErr: errors.New("database unavailable")}
@@ -327,10 +403,188 @@ func TestActiveSessionCommitsBeforeACKAndSuppressesACKOnStoreFailure(t *testing.
 	}
 }
 
+func TestActiveSessionRoutesControlsOnlyAfterHandlerPersistence(t *testing.T) {
+	now := time.Date(2026, 8, 26, 4, 0, 0, 0, time.UTC)
+	response := &protocol.KeyRotationFinalize{Envelope: protocol.NewEnvelope(protocol.TypeKeyRotationFinalize, sessionTestSyncedID, now), RotationID: sessionTestSubscriptionID, RetireOldKey: true}
+	handler := &fakeSessionControlHandler{handleResult: SessionControlResult{Response: response, Action: ControlContinue}}
+	transport := &SessionTransport{config: DefaultSessionTransportConfig()}
+	transport.config.Now = func() time.Time { return now }
+	transport.config.ControlHandler = handler
+	session := &activeControllerSession{transport: transport, controllerID: sessionTestControllerID, keyID: sessionTestKeyID, sessionID: sessionTestSessionID, expiresAt: now.Add(time.Hour)}
+	inbound := &protocol.KeyRotationConfirmed{Envelope: protocol.NewEnvelope(protocol.TypeKeyRotationConfirmed, sessionTestChallengeID, now), TargetMessageID: sessionTestReadyID, RotationID: sessionTestSubscriptionID}
+	got, heartbeat, action, err := session.handleInboundWithAction(context.Background(), inbound, 7)
+	if err != nil || got != response || heartbeat != 7 || action != ControlContinue || handler.handleCalls != 1 || !handler.persisted {
+		t.Fatalf("control route got=%#v heartbeat=%d action=%d err=%v handler=%#v", got, heartbeat, action, err, handler)
+	}
+
+	handler.handleErr = controlFailure(controlErrorPersistence)
+	handler.persisted = false
+	got, _, _, err = session.handleInboundWithAction(context.Background(), inbound, 7)
+	if got != nil || !sessionErrorCode(err, sessionErrorPersistence) || handler.persisted {
+		t.Fatalf("failed persistence emitted response=%#v err=%v", got, err)
+	}
+}
+
+func TestActiveSessionReplaysPendingControlsThroughSoleWriterAndClearsScratch(t *testing.T) {
+	now := time.Date(2026, 8, 26, 4, 0, 0, 0, time.UTC)
+	confirm := &protocol.KeyRotationConfirm{Envelope: protocol.NewEnvelope(protocol.TypeKeyRotationConfirm, sessionTestChallengeID, now), RotationID: sessionTestSubscriptionID, Signature: base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x5c}, protocol.SignatureBytes))}
+	handler := &fakeSessionControlHandler{pending: []protocol.Frame{confirm}}
+	socket := &blockingControlSocket{written: make(chan protocol.Frame, 1)}
+	transport := &SessionTransport{config: DefaultSessionTransportConfig()}
+	transport.config.Now = func() time.Time { return now }
+	transport.config.ControlHandler = handler
+	session := &activeControllerSession{transport: transport, conn: socket, controllerID: sessionTestControllerID, keyID: sessionTestKeyID, sessionID: sessionTestSessionID, maxEnvelopeBytes: protocol.DefaultMaxEnvelopeBytes, maxOutstanding: 4, heartbeatInterval: time.Minute, expiresAt: now.Add(time.Hour)}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- session.run(ctx) }()
+	select {
+	case written := <-socket.written:
+		if _, ok := written.(*protocol.KeyRotationConfirm); !ok {
+			t.Fatalf("pending writer frame=%T", written)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending control was not written")
+	}
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("cancelled session = %v", err)
+	}
+	if handler.pendingCalls != 1 || handler.handleCalls != 0 {
+		t.Fatalf("handler calls pending=%d handle=%d", handler.pendingCalls, handler.handleCalls)
+	}
+	if confirm.Signature != "" {
+		t.Fatal("confirmation signature scratch survived writer")
+	}
+}
+
+func TestSessionWriterClearsQueuedControlScratchOnCancelAndWriteFailure(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		socket SessionSocket
+	}{
+		{name: "cancel", socket: &blockingWriteControlSocket{started: make(chan struct{})}},
+		{name: "write_failure", socket: &failingWriteControlSocket{}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			now := time.Date(2026, 8, 26, 4, 0, 0, 0, time.UTC)
+			first := &protocol.KeyRotationConfirm{Envelope: protocol.NewEnvelope(protocol.TypeKeyRotationConfirm, sessionTestChallengeID, now), RotationID: sessionTestSubscriptionID, Signature: base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x31}, protocol.SignatureBytes))}
+			second := &protocol.KeyRotationConfirm{Envelope: protocol.NewEnvelope(protocol.TypeKeyRotationConfirm, sessionTestReadyID, now), RotationID: sessionTestSubscriptionID, Signature: base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x32}, protocol.SignatureBytes))}
+			input := make(chan protocol.Frame, 2)
+			input <- first
+			input <- second
+			failures := make(chan error, 1)
+			done := make(chan struct{})
+			ctx, cancel := context.WithCancel(context.Background())
+			transport := &SessionTransport{config: DefaultSessionTransportConfig()}
+			session := &activeControllerSession{transport: transport, conn: testCase.socket, maxEnvelopeBytes: protocol.DefaultMaxEnvelopeBytes}
+			go session.writeLoop(ctx, input, failures, done)
+			if blocking, ok := testCase.socket.(*blockingWriteControlSocket); ok {
+				select {
+				case <-blocking.started:
+				case <-time.After(2 * time.Second):
+					t.Fatal("writer did not start blocked write")
+				}
+				cancel()
+			} else {
+				select {
+				case <-failures:
+					cancel()
+				case <-time.After(2 * time.Second):
+					t.Fatal("writer did not report failure")
+				}
+			}
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("writer did not stop")
+			}
+			if first.Signature != "" || second.Signature != "" {
+				t.Fatalf("queued signature scratch survived: first=%t second=%t", first.Signature != "", second.Signature != "")
+			}
+		})
+	}
+}
+
+type fakeSessionControlHandler struct {
+	pending      []protocol.Frame
+	pendingCalls int
+	handleCalls  int
+	handleResult SessionControlResult
+	handleErr    error
+	persisted    bool
+}
+
+func (handler *fakeSessionControlHandler) Pending(_ context.Context, _ SessionControlContext, _ int) ([]protocol.Frame, error) {
+	handler.pendingCalls++
+	return append([]protocol.Frame(nil), handler.pending...), nil
+}
+
+func (handler *fakeSessionControlHandler) Handle(_ context.Context, _ SessionControlContext, _ protocol.Frame) (SessionControlResult, error) {
+	handler.handleCalls++
+	if handler.handleErr != nil {
+		return SessionControlResult{}, handler.handleErr
+	}
+	handler.persisted = true
+	return handler.handleResult, nil
+}
+
+type blockingControlSocket struct {
+	written chan protocol.Frame
+}
+
+func (socket *blockingControlSocket) Read(ctx context.Context) (websocket.MessageType, []byte, error) {
+	<-ctx.Done()
+	return 0, nil, ctx.Err()
+}
+func (socket *blockingControlSocket) Write(_ context.Context, messageType websocket.MessageType, data []byte) error {
+	if messageType != websocket.MessageText {
+		return errors.New("unexpected binary control frame")
+	}
+	frame, err := protocol.Decode(data, protocol.DefaultMaxEnvelopeBytes)
+	if err != nil {
+		return err
+	}
+	socket.written <- frame
+	return nil
+}
+func (*blockingControlSocket) Close(websocket.StatusCode, string) error { return nil }
+func (*blockingControlSocket) CloseNow() error                          { return nil }
+func (*blockingControlSocket) SetReadLimit(int64)                       {}
+func (*blockingControlSocket) Subprotocol() string                      { return protocol.Subprotocol }
+
+type blockingWriteControlSocket struct{ started chan struct{} }
+
+func (*blockingWriteControlSocket) Read(context.Context) (websocket.MessageType, []byte, error) {
+	return 0, nil, errors.New("unused")
+}
+func (socket *blockingWriteControlSocket) Write(ctx context.Context, _ websocket.MessageType, _ []byte) error {
+	close(socket.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (*blockingWriteControlSocket) Close(websocket.StatusCode, string) error { return nil }
+func (*blockingWriteControlSocket) CloseNow() error                          { return nil }
+func (*blockingWriteControlSocket) SetReadLimit(int64)                       {}
+func (*blockingWriteControlSocket) Subprotocol() string                      { return protocol.Subprotocol }
+
+type failingWriteControlSocket struct{}
+
+func (*failingWriteControlSocket) Read(context.Context) (websocket.MessageType, []byte, error) {
+	return 0, nil, errors.New("unused")
+}
+func (*failingWriteControlSocket) Write(context.Context, websocket.MessageType, []byte) error {
+	return errors.New("forced write failure")
+}
+func (*failingWriteControlSocket) Close(websocket.StatusCode, string) error { return nil }
+func (*failingWriteControlSocket) CloseNow() error                          { return nil }
+func (*failingWriteControlSocket) SetReadLimit(int64)                       {}
+func (*failingWriteControlSocket) Subprotocol() string                      { return protocol.Subprotocol }
+
 type fakeSessionTransportStore struct {
-	identity ControllerIdentity
-	key      ControllerKey
-	ack      []protocol.ACKState
+	identity   ControllerIdentity
+	key        ControllerKey
+	candidates []ControllerKey
+	ack        []protocol.ACKState
 	// A non-nil slice overrides the default single test subscription, including
 	// with a valid empty full set.
 	subscriptions []protocol.Subscription
@@ -350,8 +604,11 @@ type fakeSessionTransportStore struct {
 	sourceStartOnce  sync.Once
 }
 
-func (store *fakeSessionTransportStore) ActiveIdentity(context.Context) (ControllerIdentity, ControllerKey, error) {
-	return store.identity, store.key, nil
+func (store *fakeSessionTransportStore) SessionAuthenticationCandidates(context.Context) (ControllerIdentity, []ControllerKey, error) {
+	if store.candidates != nil {
+		return store.identity, append([]ControllerKey(nil), store.candidates...), nil
+	}
+	return store.identity, []ControllerKey{store.key}, nil
 }
 func (store *fakeSessionTransportStore) DurableACKState(context.Context, string) ([]protocol.ACKState, error) {
 	result := make([]protocol.ACKState, len(store.ack))

@@ -25,9 +25,7 @@ const (
 func TestIdentityAndKeyRepositoryEnforcesCanonicalCASState(t *testing.T) {
 	repository, _, now := newRepositoryHarness(t)
 	identity, key := testIdentity(now)
-	if err := repository.CreateIdentity(context.Background(), identity, key); err != nil {
-		t.Fatal(err)
-	}
+	persistTestIdentity(t, repository, identity, key, now)
 	gotIdentity, gotKey, err := repository.ActiveIdentity(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -258,7 +256,21 @@ func testPendingKey(now time.Time) ControllerKey {
 func createTestIdentity(t *testing.T, repository *Repository, now time.Time) {
 	t.Helper()
 	identity, key := testIdentity(now)
-	if err := repository.CreateIdentity(context.Background(), identity, key); err != nil {
+	persistTestIdentity(t, repository, identity, key, now)
+}
+
+func persistTestIdentity(t *testing.T, repository *Repository, identity ControllerIdentity, key ControllerKey, now time.Time) {
+	t.Helper()
+	lease := ControllerKeyIOLease{
+		ScopeKey: controllerIdentityIOScope, ControllerID: identity.ControllerID, LeaseID: "77000000-0000-4000-8000-000000000000",
+		Operation: ControllerKeyIOIdentityWrite, Phase: ControllerKeyIOActive, Fence: 1, LeaseExpiresAt: now.Add(5 * time.Minute),
+		KeyID: key.KeyID, PublicKey: append([]byte(nil), key.PublicKey...), ProtectedKeyRef: key.ProtectedKeyRef, CreatedAt: now, UpdatedAt: now,
+	}
+	defer clear(lease.PublicKey)
+	if err := repository.BeginControllerIdentityWrite(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CreateIdentity(context.Background(), lease, identity, key, now); err != nil {
 		t.Fatal(err)
 	}
 }
