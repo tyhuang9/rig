@@ -1,6 +1,6 @@
 # Docker Compose runtime operations
 
-The Docker Compose runtime is an opt-in, controller-local execution capability. It is disabled by default. The authenticated API is the Unit 7 administrative surface; the embedded dashboard does not expose real deployment, release, or approval controls yet.
+The Docker Compose runtime is an opt-in, controller-local execution capability. It is disabled by default. Both the authenticated API and embedded dashboard expose real deployment, release, exact-approval, waiting-job resume, and prior-release recovery controls. The API examples below remain useful for automation and diagnostics.
 
 ## Enable the runtime
 
@@ -27,6 +27,18 @@ The bounded runtime flags and defaults are:
 | `--compose-wait-timeout` | `2m` | `1s` to `1h` |
 
 The apply timeout must be greater than the health-wait timeout.
+
+## Dashboard verification
+
+After administrator bootstrap, open an application in the embedded dashboard:
+
+1. Use **Configuration** to create a revision. Secret values are accepted for replacement but are never displayed again.
+2. Use **Deploy latest** to materialize the local source or current GitHub branch head and queue a Compose deployment.
+3. Inspect **Deployment history** and **Releases** for the resolved source provenance, actual configuration revision, findings, health state, and sanitized failure code.
+4. When a deployment requires approval, inspect the exact capability and scope, grant the persisted fingerprint, and explicitly resume the waiting job. Revoke the approval after no matching deployment is applying or waiting for health.
+5. To recover, select a prior ready release and explicitly choose current or original configuration. Rig does not roll back automatically.
+
+The dashboard is not an alternative policy path: every mutation uses the same authenticated, CSRF-protected controller APIs and the same durable approval/revalidation rules as the examples below.
 
 ## Security and failure model
 

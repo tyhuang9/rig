@@ -218,7 +218,7 @@ func portablePackagingErrors(files map[string]string) []string {
 
 	docs := files["docs/relay-operations.md"]
 	for _, required := range []string{
-		"30 days", "7 days", "GitHub does not automatically redeliver failed webhook deliveries", "Unit 9",
+		"30 days", "7 days", "GitHub does not automatically redeliver failed webhook deliveries", "GitHub-connected deployments",
 		"docker buildx build --file deploy/relay/Dockerfile", "scripts/check-relay-packaging.ps1 -SelfTest",
 		"scripts/check-relay-packaging.ps1 -BehaviorTest", "HOSTD_RELAY_RUN_LINUX_PREFLIGHT_TESTS=1", "-LinuxIntegrationTest",
 		"-TrustedDeploymentAnchor /etc/rig-relay", "-SecretDirectory /etc/rig-relay/secrets", "-DeploymentMode baseline", "-DeploymentMode direct-tls",
