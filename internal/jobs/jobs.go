@@ -824,12 +824,20 @@ func (s *Service) RunWorker(ctx context.Context, executor Executor) error {
 			s.beforeClaim()
 		}
 		if err := s.runOne(ctx, executor); err != nil {
-			if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-				return nil
-			}
-			return err
+			return normalizeWorkerError(ctx, err)
 		}
 	}
+}
+
+// normalizeWorkerError makes owner shutdown authoritative over infrastructure
+// errors returned after the parent worker context has ended. SQLite, for
+// example, may return an opaque interruption error instead of wrapping the
+// context cancellation that caused it.
+func normalizeWorkerError(ctx context.Context, err error) error {
+	if err != nil && ctx.Err() != nil {
+		return nil
+	}
+	return err
 }
 
 func (s *Service) runOne(ctx context.Context, executor Executor) error {

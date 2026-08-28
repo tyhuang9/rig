@@ -565,6 +565,31 @@ func TestWorkerCancellationBetweenWakeAndClaimIsCleanShutdown(t *testing.T) {
 	}
 }
 
+func TestNormalizeWorkerError(t *testing.T) {
+	sentinel := errors.New("sqlite interrupted")
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	expiredCtx, stop := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer stop()
+	<-expiredCtx.Done()
+
+	for _, test := range []struct {
+		name string
+		ctx  context.Context
+		want error
+	}{
+		{name: "canceled context suppresses opaque error", ctx: canceledCtx, want: nil},
+		{name: "deadline context suppresses opaque error", ctx: expiredCtx, want: nil},
+		{name: "active context preserves exact error", ctx: context.Background(), want: sentinel},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := normalizeWorkerError(test.ctx, sentinel); got != test.want {
+				t.Fatalf("normalizeWorkerError() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 type blockingExecutor struct{ started chan<- struct{} }
 
 func (e blockingExecutor) Execute(ctx context.Context, _ Job, reporter ProgressReporter) (ExecutionResult, error) {
