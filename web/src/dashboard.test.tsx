@@ -1,9 +1,9 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api } from "./api";
-import { MachinesPage } from "./dashboard";
+import { api, type Job } from "./api";
+import { ActivityRow, MachinesPage } from "./dashboard";
 import { DASHBOARD_CAUGHT_ERROR_MESSAGE, handleDashboardCaughtError } from "./root-errors";
 
 const unavailableRelayStatus = {
@@ -35,6 +35,104 @@ function renderPage(role: string, relayPanelLoader?: RelayPanelLoader) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(<QueryClientProvider client={client}><MachinesPage role={role} relayPanelLoader={relayPanelLoader}/></QueryClientProvider>, { onCaughtError: handleDashboardCaughtError });
 }
+
+const activeJob: Job = {
+  attempt: 1,
+  checkpoint: "{}",
+  createdAt: "2026-08-27T12:00:00Z",
+  id: "job-1",
+  phase: "running",
+  progress: 50,
+  resourceId: "app-1",
+  resourceType: "application",
+  status: "running",
+  type: "deploy",
+  updatedAt: "2026-08-27T12:00:00Z",
+};
+
+function QueryBackedActivityRow({ initialJob }: { initialJob: Job }) {
+  const jobs = useQuery({ queryKey: ["jobs"], queryFn: api.jobs, initialData: { items: [initialJob] } });
+  return <ActivityRow job={jobs.data.items.find(({ id }) => id === initialJob.id) ?? initialJob}/>;
+}
+
+describe("ActivityRow cancellation convergence", () => {
+  beforeEach(() => vi.restoreAllMocks());
+  afterEach(cleanup);
+
+  it.each([
+    ["cancelled", "Cancellation recorded. Job cancelled."],
+    ["succeeded", "Cancellation recorded. Job succeeded."],
+    ["failed", "Cancellation recorded. Job failed."],
+    ["interrupted", "Cancellation recorded. Job interrupted."],
+    ["needs_attention", "Cancellation recorded. Job needs attention."],
+  ])("lets a refreshed terminal %s job replace the cancellation response", async (terminalStatus, terminalMessage) => {
+    const cancellationJob = { ...activeJob, status: "waiting_external", phase: "cancelling", updatedAt: "2026-08-27T12:01:00Z" };
+    vi.spyOn(api, "cancelJob").mockResolvedValue({ job: cancellationJob });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const row = (job: Job) => <QueryClientProvider client={client}><ActivityRow job={job}/></QueryClientProvider>;
+    const view = render(row(activeJob));
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel job" }));
+    const feedback = await screen.findByRole("status");
+    expect(feedback.textContent).toBe("Cancellation recorded.");
+    expect(feedback.getAttribute("aria-live")).toBe("polite");
+    expect(feedback.getAttribute("aria-atomic")).toBe("true");
+    expect(view.container.querySelector(".status")?.textContent).toBe("waiting_external");
+    const recorded = screen.getByRole("button", { name: "Cancellation requested" }) as HTMLButtonElement;
+    expect(recorded.disabled).toBe(true);
+    fireEvent.click(recorded);
+    expect(api.cancelJob).toHaveBeenCalledTimes(1);
+
+    view.rerender(row({ ...activeJob, status: terminalStatus, phase: terminalStatus, progress: terminalStatus === "succeeded" ? 100 : 50 }));
+    expect(view.container.querySelector(".status")?.textContent).toBe(terminalStatus);
+    expect(screen.getByRole("status")).toBe(feedback);
+    expect(feedback.textContent).toBe(terminalMessage);
+    expect(screen.queryByRole("button", { name: "Cancellation requested" })).toBeNull();
+    expect(api.cancelJob).toHaveBeenCalledTimes(1);
+    expect(api.cancelJob).toHaveBeenCalledWith(activeJob.id);
+  });
+
+  it("shows an immediately terminal cancellation response", async () => {
+    vi.spyOn(api, "cancelJob").mockResolvedValue({ job: { ...activeJob, status: "cancelled", phase: "cancelled" } });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const view = render(<QueryClientProvider client={client}><ActivityRow job={activeJob}/></QueryClientProvider>);
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel job" }));
+
+    expect((await screen.findByRole("status")).textContent).toBe("Cancellation recorded. Job cancelled.");
+    expect(view.container.querySelector(".status")?.textContent).toBe("cancelled");
+    expect(screen.queryByRole("button", { name: /Cancel|Cancellation/ })).toBeNull();
+    expect(api.cancelJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("announces before a slow jobs refetch and then renders its terminal result", async () => {
+    const cancellation = deferred<Awaited<ReturnType<typeof api.cancelJob>>>();
+    const jobsRefetch = deferred<Awaited<ReturnType<typeof api.jobs>>>();
+    vi.spyOn(api, "cancelJob").mockReturnValue(cancellation.promise);
+    vi.spyOn(api, "jobs")
+      .mockResolvedValueOnce({ items: [activeJob] })
+      .mockReturnValueOnce(jobsRefetch.promise);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const view = render(<QueryClientProvider client={client}><QueryBackedActivityRow initialJob={activeJob}/></QueryClientProvider>);
+    await waitFor(() => expect(api.jobs).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel job" }));
+    const pending = await screen.findByRole("button", { name: "Cancelling…" }) as HTMLButtonElement;
+    expect(pending.disabled).toBe(true);
+    expect(screen.queryByRole("status")).toBeNull();
+
+    await act(async () => cancellation.resolve({ job: { ...activeJob, status: "waiting_external", phase: "cancelling" } }));
+    expect((await screen.findByRole("status")).textContent).toBe("Cancellation recorded.");
+    await waitFor(() => expect(api.jobs).toHaveBeenCalledTimes(2));
+    expect((screen.getByRole("button", { name: "Cancellation requested" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(view.container.querySelector(".status")?.textContent).toBe("waiting_external");
+
+    await act(async () => jobsRefetch.resolve({ items: [{ ...activeJob, status: "cancelled", phase: "cancelled" }] }));
+    await waitFor(() => expect(view.container.querySelector(".status")?.textContent).toBe("cancelled"));
+    expect(screen.getByRole("status").textContent).toBe("Cancellation recorded. Job cancelled.");
+    expect(screen.queryByRole("button", { name: /Cancel|Cancellation/ })).toBeNull();
+  });
+});
 
 describe("MachinesPage relay integration", () => {
   beforeEach(() => {
