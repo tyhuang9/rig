@@ -71,7 +71,7 @@ jobs:
   postgres-race:
     name: PostgreSQL and Linux race verification
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     services:
       postgres:
         image: docker.io/library/postgres:18.6-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af
@@ -103,6 +103,31 @@ jobs:
         env:
           RIG_RELAY_TEST_DATABASE_URL: "postgresql://rig_relay:rig-relay-ci-only@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/rig_relay?sslmode=disable"
         run: go test -race -v -count=1 -timeout=20m ./internal/relay/store -run '^TestPostgreSQL'
+
+      - name: Prove PostgreSQL relay outage convergence with race detection
+        shell: bash
+        env:
+          RIG_RELAY_TEST_DATABASE_URL: "postgresql://rig_relay:rig-relay-ci-only@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/rig_relay?sslmode=disable"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          test_name='TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart'
+          package_name='github.com/hostd/hostd/internal/autodeploy'
+          set +e
+          go test -race -json -v -count=1 -timeout=5m ./internal/autodeploy -run "^${test_name}$" | tee "$output" > /dev/null
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          go_status="${pipeline_status[0]:-1}"
+          tee_status="${pipeline_status[1]:-1}"
+          if (( go_status != 0 || tee_status != 0 )); then
+            jq -c --arg package_name "$package_name" 'select(.Action == "fail" and .Package == $package_name) | {Action, Package, Test, Elapsed}' "$output" >&2 || true
+            if (( go_status != 0 )); then
+              exit "$go_status"
+            fi
+            exit "$tee_status"
+          fi
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
 
       - name: Run repository tests with race detection
         run: go test -race -count=1 -timeout=30m ./...
