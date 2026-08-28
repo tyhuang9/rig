@@ -222,6 +222,10 @@ There is no production plaintext-behind-proxy mode. `HOSTD_RELAY_LOOPBACK_DEVELO
 
 PostgreSQL 18 persists its versioned data directory below the named `/var/lib/postgresql` volume. No host database port is published. On startup, the relay waits for the PostgreSQL health check, acquires its migration lock, and applies embedded ordered migrations before it accepts traffic. Migration failure leaves readiness down and exits startup; do not bypass it.
 
+Pull requests run a hosted Linux lifecycle check against the unmodified baseline `compose.yaml`. The check builds the relay image, deploys it by the immutable digest returned from an isolated local registry, uses protected synthetic credentials and an in-container validated TLS certificate, waits for PostgreSQL and relay readiness, and verifies the complete embedded migration ledger. It then force-recreates only the relay and proves that the PostgreSQL container, named volume, database system identity, migration checksums/timestamps, and a CI-only marker remain unchanged. Captured logs are checked for the synthetic secrets before the fixtures and volume are removed.
+
+This automated check proves the baseline topology on a GitHub-hosted Ubuntu runner; it does not publish a host port. The direct-TLS overlay remains covered by effective-Compose and static contract checks. Public exposure, reverse-proxy behavior, firewall and denial-of-service controls, live GitHub integration, backup/restore, load characteristics, and multi-architecture image promotion remain separate staging or operations gates.
+
 Inspect only closed process codes and lifecycle phases in logs:
 
 ```sh
@@ -323,6 +327,6 @@ Prerequisites: a private test repository, a staging-only GitHub App installation
 
 Cleanup: revoke staging App keys/client secrets and controller keys, remove staging webhook/install access, securely delete local secret/backup files, and remove staging containers, networks, and volumes only after confirming their exact names and that no evidence must be retained.
 
-## Verification not available in this checkout
+## Verification boundaries
 
-The repository checks can validate Go behavior and static packaging policy, but this Windows checkout has no Docker daemon, `psql`, live PostgreSQL, Linux namespace inspection, or CGO race toolchain. Therefore Docker build/Compose rendering, multi-architecture execution, live migrations and backup/restore, non-root/read-only enforcement, reverse-proxy CA/SNI behavior, served-chain expiry monitoring, and end-to-end GitHub/controller staging remain mandatory external gates. Do not promote solely from static checks.
+This Windows checkout has no Docker daemon, `psql`, live PostgreSQL, Linux namespace inspection, or CGO race toolchain, so those checks cannot be reproduced locally here. Pull-request CI separately builds the native Linux relay and exercises the baseline Compose topology, TLS probes, live embedded migrations, relay recreation, and PostgreSQL persistence as described above. Multi-architecture execution, backup/restore, reverse-proxy CA/SNI behavior, served-chain expiry monitoring, public exposure controls, load behavior, and end-to-end live GitHub/controller staging remain mandatory external gates. Do not promote solely from the local Windows or single-runner hosted checks.
