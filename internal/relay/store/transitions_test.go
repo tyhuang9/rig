@@ -273,7 +273,7 @@ func TestAccessBatchRollbackAndDurablePendingAfterRevocation(t *testing.T) {
 		expectAccessRouteSnapshot(m, batchEvents, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-		m.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs([]int64{1}, []int64{0}).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)).AddRow(int64(1), testController2, int64(3)))
+		m.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs([]int64{1}, []int64{0}, []bool{true}).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)).AddRow(int64(1), testController2, int64(3)))
 		m.ExpectExec("INSERT INTO relay_access_events").WithArgs(testDelivery, []string{testEvent, testEvent2}, []string{testController, testController2}, []int64{1, 1}, []int64{0, 0}, []string{event.ChangeCode, event.ChangeCode}, []time.Time{fixedNow, fixedNow}).WillReturnError(outage)
 		m.ExpectRollback()
 		if _, err := s.PushAccessEvent(context.Background(), event, routes); !errors.Is(err, outage) {
@@ -346,7 +346,7 @@ func TestAccessFanoutRowsErrorRollsBackBeforeChildrenOrRevocation(t *testing.T) 
 	expectAccessRouteSnapshot(m, batchEvents, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	m.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs([]int64{1}, []int64{2}).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)).RowError(0, rowsErr))
+	m.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs([]int64{1}, []int64{2}, []bool{true}).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)).RowError(0, rowsErr))
 	m.ExpectRollback()
 	_, err := s.PushAccessEvent(context.Background(), event, []AccessRoute{{EventID: testEvent, ControllerID: testController}})
 	if !errors.Is(err, rowsErr) {
@@ -430,8 +430,8 @@ func TestPushAccessEventsPersistsAtomicMultiRepositoryFanout(t *testing.T) {
 	batch := AccessEventBatchInput{
 		DeliveryID: testDelivery, ReceivedAt: fixedNow,
 		Events: []AccessEventBatchItem{
-			{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.removed", ObservedAt: fixedNow, Routes: []AccessRoute{{EventID: testEvent, ControllerID: testController}}},
-			{InstallationID: 1, RepositoryID: 3, ChangeCode: "repository.removed", ObservedAt: fixedNow, Routes: []AccessRoute{{EventID: testEvent2, ControllerID: testController2}}},
+			{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.removed", ObservedAt: fixedNow, RemoveAccess: true, Routes: []AccessRoute{{EventID: testEvent, ControllerID: testController}}},
+			{InstallationID: 1, RepositoryID: 3, ChangeCode: "repository.removed", ObservedAt: fixedNow, RemoveAccess: true, Routes: []AccessRoute{{EventID: testEvent2, ControllerID: testController2}}},
 		},
 	}
 	s, m := mockStore(t)
@@ -442,7 +442,7 @@ func TestPushAccessEventsPersistsAtomicMultiRepositoryFanout(t *testing.T) {
 	expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	m.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs(installations, repositories).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)).AddRow(int64(2), testController2, int64(3)))
+	m.ExpectQuery("WITH targets AS .*SELECT t.target_index").WithArgs(installations, repositories, removals).WillReturnRows(pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(1), testController, int64(2)).AddRow(int64(2), testController2, int64(3)))
 	m.ExpectExec("INSERT INTO relay_access_events").WithArgs(testDelivery, []string{testEvent, testEvent2}, []string{testController, testController2}, []int64{1, 1}, []int64{2, 3}, []string{"repository.removed", "repository.removed"}, []time.Time{fixedNow, fixedNow}).WillReturnResult(pgxmock.NewResult("INSERT", 2))
 	m.ExpectExec("WITH targets AS .*UPDATE relay_bindings b SET revoked_at").WithArgs(installations, repositories, removals, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	m.ExpectExec("WITH targets AS .*UPDATE relay_bindings b SET revoked_at").WithArgs(installations, repositories, removals, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
@@ -456,10 +456,94 @@ func TestPushAccessEventsPersistsAtomicMultiRepositoryFanout(t *testing.T) {
 	}
 }
 
+func TestPushAccessEventsPersistsInformationalDeliveryWithoutFanout(t *testing.T) {
+	batch := AccessEventBatchInput{
+		DeliveryID: testDelivery,
+		ReceivedAt: fixedNow,
+		Events: []AccessEventBatchItem{{
+			InstallationID: 1,
+			RepositoryID:   2,
+			ChangeCode:     "repository.added",
+			ObservedAt:     fixedNow,
+		}},
+	}
+	s, m := mockStore(t)
+	m.ExpectBegin()
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	m.ExpectExec("UPDATE relay_recovery_deliveries").WithArgs(testDelivery, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	m.ExpectCommit()
+
+	result, err := s.PushAccessEvents(context.Background(), batch)
+	if err != nil || result.Deduplicated {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if err := m.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPushAccessEventsFiltersInformationalTargetsFromRemovalFanout(t *testing.T) {
+	batch := AccessEventBatchInput{
+		DeliveryID: testDelivery,
+		ReceivedAt: fixedNow,
+		Events: []AccessEventBatchItem{
+			{InstallationID: 3, RepositoryID: 4, ChangeCode: "repository.removed", ObservedAt: fixedNow, RemoveAccess: true, Routes: []AccessRoute{{EventID: testEvent, ControllerID: testController}}},
+			{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.added", ObservedAt: fixedNow},
+		},
+	}
+	installations := []int64{1, 3}
+	repositories := []int64{2, 4}
+	removals := []bool{false, true}
+	s, m := mockStore(t)
+	m.ExpectBegin()
+	expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+	expectTopologyShards(m, bindingTopologyShard(3))
+	expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
+	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	m.ExpectQuery("WITH targets AS .*remove_access.*WHERE t.remove_access AND b.revoked_at").WithArgs(installations, repositories, removals).WillReturnRows(
+		pgxmock.NewRows([]string{"target_index", "controller_id", "repository_id"}).AddRow(int64(2), testController, int64(4)),
+	)
+	m.ExpectExec("INSERT INTO relay_access_events").WithArgs(testDelivery, []string{testEvent}, []string{testController}, []int64{3}, []int64{4}, []string{"repository.removed"}, []time.Time{fixedNow}).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	m.ExpectExec("WITH targets AS .*WHERE t.remove_access AND t.repository_id>0").WithArgs(installations, repositories, removals, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	m.ExpectExec("WITH targets AS .*WHERE t.remove_access AND t.repository_id=0").WithArgs(installations, repositories, removals, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	m.ExpectExec("UPDATE relay_recovery_deliveries").WithArgs(testDelivery, fixedNow).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	m.ExpectCommit()
+
+	result, err := s.PushAccessEvents(context.Background(), batch)
+	if err != nil || result.Deduplicated {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if err := m.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPushAccessEventsRejectsRoutesForInformationalEvent(t *testing.T) {
+	s, m := mockStore(t)
+	_, err := s.PushAccessEvents(context.Background(), AccessEventBatchInput{
+		DeliveryID: testDelivery,
+		ReceivedAt: fixedNow,
+		Events: []AccessEventBatchItem{{
+			InstallationID: 1,
+			ChangeCode:     "installation.restored",
+			ObservedAt:     fixedNow,
+			Routes:         []AccessRoute{{EventID: testEvent, ControllerID: testController}},
+		}},
+	})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("error=%v", err)
+	}
+	if err := m.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPushAccessEventsRejectsAmbiguousTargetsBeforeDatabaseWork(t *testing.T) {
 	for _, events := range [][]AccessEventBatchItem{
-		{{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.added", ObservedAt: fixedNow}, {InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.removed", ObservedAt: fixedNow}},
-		{{InstallationID: 1, RepositoryID: 0, ChangeCode: "installation.removed", ObservedAt: fixedNow}, {InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.removed", ObservedAt: fixedNow}},
+		{{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.added", ObservedAt: fixedNow}, {InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.removed", ObservedAt: fixedNow, RemoveAccess: true}},
+		{{InstallationID: 1, RepositoryID: 0, ChangeCode: "installation.removed", ObservedAt: fixedNow, RemoveAccess: true}, {InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.removed", ObservedAt: fixedNow, RemoveAccess: true}},
 	} {
 		s, m := mockStore(t)
 		_, err := s.PushAccessEvents(context.Background(), AccessEventBatchInput{DeliveryID: testDelivery, ReceivedAt: fixedNow, Events: events})
@@ -476,9 +560,6 @@ func TestPushAccessEventsDuplicateDeliveryCannotAppendChildren(t *testing.T) {
 	s, m := mockStore(t)
 	batch := AccessEventBatchInput{DeliveryID: testDelivery, ReceivedAt: fixedNow, Events: []AccessEventBatchItem{{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.added", ObservedAt: fixedNow}}}
 	m.ExpectBegin()
-	expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
-	expectTopologyShards(m, bindingTopologyShard(1))
-	expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 	m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
 	m.ExpectQuery("SELECT delivery_kind").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"kind"}).AddRow("access"))
@@ -567,9 +648,6 @@ func TestDeliveryLedgerRejectsCrossKindGUIDReuseAndIgnoredReasonExpansion(t *tes
 		s, m := mockStore(t)
 		batch := AccessEventBatchInput{DeliveryID: testDelivery, ReceivedAt: fixedNow, Events: []AccessEventBatchItem{{InstallationID: 1, RepositoryID: 2, ChangeCode: "repository.added", ObservedAt: fixedNow}}}
 		m.ExpectBegin()
-		expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
-		expectTopologyShards(m, bindingTopologyShard(1))
-		expectAccessRouteSnapshot(m, batch.Events, pgxmock.NewRows([]string{"installation_id", "repository_id", "tracked_ref"}))
 		m.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(deliveryLockKey(testDelivery)).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		m.ExpectExec("INSERT INTO relay_github_deliveries").WithArgs(testDelivery, fixedNow, fixedNow).WillReturnResult(pgxmock.NewResult("INSERT", 0))
 		m.ExpectQuery("SELECT delivery_kind").WithArgs(testDelivery).WillReturnRows(pgxmock.NewRows([]string{"kind"}).AddRow("ignored"))

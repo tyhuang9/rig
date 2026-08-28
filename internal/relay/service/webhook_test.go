@@ -26,6 +26,7 @@ type webhookStore struct {
 	sourceResult        store.SourcePushResult
 	accessResult        store.AccessPushResult
 	storeCalls          int
+	accessRouteCalls    int
 }
 
 func (f *webhookStore) PushIgnoredDelivery(_ context.Context, _ string, reason string, _ time.Time) (bool, error) {
@@ -36,6 +37,7 @@ func (f *webhookStore) PushIgnoredDelivery(_ context.Context, _ string, reason s
 
 func (f *webhookStore) AccessRoutes(_ context.Context, _ int64, repositoryID int64) ([]string, error) {
 	f.storeCalls++
+	f.accessRouteCalls++
 	if repositoryID == 2 {
 		return []string{"11111111-1111-4111-8111-111111111111"}, nil
 	}
@@ -129,6 +131,41 @@ func TestWebhookAcceptsDocumentedExtraFieldsAndPersistsMultiRepositoryRemovalAto
 	for _, event := range persistence.batch.Events {
 		if !event.RemoveAccess || event.ChangeCode != "repository.removed" || len(event.Routes) != 1 {
 			t.Fatalf("event=%+v", event)
+		}
+	}
+	if persistence.accessRouteCalls != 2 {
+		t.Fatalf("AccessRoutes calls=%d want 2", persistence.accessRouteCalls)
+	}
+}
+
+func TestPersistAccessDoesNotResolveRoutesForInformationalChanges(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	changes := []normalizedAccess{
+		{installationID: 1, changeCode: "installation.created"},
+		{installationID: 2, changeCode: "installation.restored"},
+		{installationID: 3, changeCode: "installation.permissions_updated"},
+		{installationID: 4, changeCode: "installation.repositories_reconciled"},
+		{installationID: 5, repositoryID: 6, changeCode: "repository.added"},
+	}
+	persistence := &webhookStore{}
+	s := newEnrollmentTestService(t, persistence, fakeHTTP(func(*http.Request) (*http.Response, error) {
+		t.Fatal("unexpected provider call")
+		return nil, nil
+	}), now)
+
+	deduplicated, err := s.persistAccess(context.Background(), "66666666-6666-4666-8666-666666666666", now, changes)
+	if err != nil || deduplicated {
+		t.Fatalf("deduplicated=%v error=%v", deduplicated, err)
+	}
+	if persistence.accessRouteCalls != 0 {
+		t.Fatalf("AccessRoutes calls=%d want 0", persistence.accessRouteCalls)
+	}
+	if len(persistence.batch.Events) != len(changes) {
+		t.Fatalf("events=%d want %d", len(persistence.batch.Events), len(changes))
+	}
+	for _, event := range persistence.batch.Events {
+		if event.RemoveAccess || len(event.Routes) != 0 {
+			t.Fatalf("informational event=%+v", event)
 		}
 	}
 }

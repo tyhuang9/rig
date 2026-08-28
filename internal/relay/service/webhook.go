@@ -289,17 +289,20 @@ func (s *Service) persistAccess(ctx context.Context, delivery string, receivedAt
 	for attempt := 0; attempt < maxRoutePushRetries; attempt++ {
 		batch := store.AccessEventBatchInput{DeliveryID: delivery, ReceivedAt: receivedAt, Events: make([]store.AccessEventBatchItem, 0, len(changes))}
 		for _, change := range changes {
-			controllerIDs, err := s.store.AccessRoutes(ctx, change.installationID, change.repositoryID)
-			if err != nil {
-				return false, err
-			}
-			routes := make([]store.AccessRoute, 0, len(controllerIDs))
-			for _, controllerID := range controllerIDs {
-				eventID, err := newRandomUUID(s.random)
+			var routes []store.AccessRoute
+			if change.removeAccess {
+				controllerIDs, err := s.store.AccessRoutes(ctx, change.installationID, change.repositoryID)
 				if err != nil {
 					return false, err
 				}
-				routes = append(routes, store.AccessRoute{EventID: eventID, ControllerID: controllerID})
+				routes = make([]store.AccessRoute, 0, len(controllerIDs))
+				for _, controllerID := range controllerIDs {
+					eventID, err := newRandomUUID(s.random)
+					if err != nil {
+						return false, err
+					}
+					routes = append(routes, store.AccessRoute{EventID: eventID, ControllerID: controllerID})
+				}
 			}
 			batch.Events = append(batch.Events, store.AccessEventBatchItem{InstallationID: change.installationID, RepositoryID: change.repositoryID, ChangeCode: change.changeCode, ObservedAt: receivedAt, RemoveAccess: change.removeAccess, Routes: routes})
 		}
