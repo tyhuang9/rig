@@ -17,7 +17,11 @@ func currentUserSecurityAttributes() (*windows.SecurityAttributes, error) {
 	if err != nil {
 		return nil, err
 	}
-	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + user.User.Sid.String() + ")")
+	if user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
+		return nil, errors.New("current user SID is unavailable")
+	}
+	sid := user.User.Sid.String()
+	descriptor, err := windows.SecurityDescriptorFromString("O:" + sid + "D:P(A;;FA;;;" + sid + ")")
 	if err != nil {
 		return nil, err
 	}

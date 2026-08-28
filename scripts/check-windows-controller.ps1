@@ -37,6 +37,11 @@ $checks = @(
     )
   },
   @{
+    Package = './internal/runtime/securetemp'
+    Pattern = '^TestWindowsProtectedFilesUseCurrentUserOnlyDACL$'
+    Tests = @('TestWindowsProtectedFilesUseCurrentUserOnlyDACL')
+  },
+  @{
     Package = './internal/runtime/process'
     Pattern = '^TestExecRunnerCancelsDescendantProcessTree$'
     Tests = @('TestExecRunnerCancelsDescendantProcessTree')
