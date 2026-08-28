@@ -983,10 +983,23 @@ func TestTerminalResponseWriteFailureDoesNotRetryMutation(t *testing.T) {
 			}
 			session.reads <- readEvent{messageType: websocket.MessageText, data: first}
 			ctx, cancel := context.WithCancel(context.Background())
+			writerStopped := false
 			go func() {
 				defer close(session.writerDone)
 				session.writeLoop(ctx)
 			}()
+			t.Cleanup(func() {
+				cancel()
+				_ = conn.CloseNow()
+				if writerStopped {
+					return
+				}
+				select {
+				case <-session.writerDone:
+				case <-time.After(time.Second):
+					t.Error("writer teardown did not complete during cleanup")
+				}
+			})
 			failure := session.active(ctx)
 			if failure == nil || failure.code != "write_failed" {
 				t.Fatalf("failure=%#v", failure)
@@ -996,9 +1009,9 @@ func TestTerminalResponseWriteFailureDoesNotRetryMutation(t *testing.T) {
 				t.Fatal(err)
 			}
 			session.reads <- readEvent{messageType: websocket.MessageText, data: second}
-			cancel()
 			select {
 			case <-session.writerDone:
+				writerStopped = true
 			case <-time.After(time.Second):
 				t.Fatal("writer teardown did not complete")
 			}
