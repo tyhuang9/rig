@@ -36,63 +36,63 @@ import (
 
 const bootstrapSecretFilename = "bootstrap-token.secret"
 
-func main() {
-	cfg, err := startupConfig(os.Args[1:])
+func runServer(args []string) int {
+	cfg, err := startupConfig(args)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
+		return 2
 	}
 	if err = cfg.EnsureDataRoot(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 1
 	}
 	logger := newStructuredLogger(os.Stderr, cfg.LogLevel)
 	db, err := database.Open(cfg.DataRoot)
 	if err != nil {
 		logger.Error("database startup failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer db.Close()
 	a := auth.New(db)
 	token, err := a.EnsureBootstrapToken()
 	if err != nil {
 		logger.Error("bootstrap token setup failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	bootstrapCompleted, err := prepareBootstrapToken(os.Stdout, cfg.DataRoot, token, auth.BootstrapTokenLifetime, func(err error) {
 		logger.Error("bootstrap token file cleanup failed", "error", err)
 	})
 	if err != nil {
 		logger.Error("bootstrap token file setup failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer bootstrapCompleted()
 	m := machines.New(db)
 	if _, err := m.EnsureLocal(); err != nil {
 		logger.Error("local machine setup failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	diagnostic := docker.Check(context.Background(), cfg.CaddyManagement, cfg.DockerEndpoint, cfg.DataRoot)
 	if err := m.UpdateLocalDiagnostics(diagnostic.DockerVersion, diagnostic.ComposeVersion, diagnostic.Resources); err != nil {
 		logger.Error("local diagnostics persistence failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	j := jobs.New(db)
 	applicationConfiguration, err := appconfig.New(db, cfg.DataRoot)
 	if err != nil {
 		logger.Error("application configuration setup failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	if err := applicationConfiguration.Recover(context.Background()); err != nil {
 		logger.Error("application configuration recovery failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	var githubProvider sourceconnections.Provider
 	if cfg.GitHubConnectionsEnabled() {
 		githubProvider, err = githubapp.New(cfg.GitHubClientID)
 		if err != nil {
 			logger.Error("GitHub App configuration failed", "error", err)
-			os.Exit(1)
+			return 1
 		}
 	}
 	sources := sourceconnections.NewService(sourceconnections.NewRepository(db), githubProvider, sourceconnections.NewFileCredentialStore(cfg.DataRoot), cfg.GitHubAppSlug, time.Now)
@@ -102,18 +102,18 @@ func main() {
 	})
 	if err != nil {
 		logger.Error("release snapshot configuration failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	if err := snapshots.Recover(); err != nil {
 		logger.Error("release snapshot recovery failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	applications := apps.New(db)
 	deploymentRepository := deployments.New(db)
 	temporary, err := securetemp.New(cfg.DataRoot)
 	if err != nil {
 		logger.Error("compose runtime temporary storage setup failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	var executor jobs.Executor
 	if cfg.FakeRuntime {
@@ -128,7 +128,7 @@ func main() {
 		})
 		if err != nil {
 			logger.Error("compose runtime setup failed", "error", err)
-			os.Exit(1)
+			return 1
 		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -143,7 +143,7 @@ func main() {
 	})
 	if err != nil {
 		logger.Error("runtime recovery failed", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	autoDeployRepository := autodeploy.NewRepository(db)
 	autoDeployDone, autoDeployWake, autoDeployReconcile := startAutoDeploy(ctx, cfg, logger, func() (autoDeployRunner, error) {
@@ -173,8 +173,9 @@ func main() {
 	_ = waitForControllerRelay(relayDone, controllerRelayShutdownTimeout, logger)
 	_ = waitForAutoDeploy(autoDeployDone, autoDeployShutdownTimeout, logger)
 	if serveErr != nil && serveErr != http.ErrServerClosed {
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 type runtimeRecovery struct {
