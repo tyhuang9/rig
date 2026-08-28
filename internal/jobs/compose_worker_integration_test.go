@@ -45,15 +45,41 @@ func (noReleaseResolver) ReadyRelease(context.Context, string, string) (releases
 	return releasesnapshot.Release{}, errors.New("unexpected release lookup")
 }
 
-type unreachableSourceReader struct{}
+type providerCallCounter struct {
+	mu    sync.Mutex
+	calls int
+}
 
-func (unreachableSourceReader) Resolve(context.Context, string, string, int64, int64, string) (sourceconnections.SourceRepository, sourceconnections.Branch, error) {
+func (counter *providerCallCounter) record() {
+	if counter == nil {
+		return
+	}
+	counter.mu.Lock()
+	counter.calls++
+	counter.mu.Unlock()
+}
+
+func (counter *providerCallCounter) count() int {
+	if counter == nil {
+		return 0
+	}
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+	return counter.calls
+}
+
+type unreachableSourceReader struct{ calls *providerCallCounter }
+
+func (reader unreachableSourceReader) Resolve(context.Context, string, string, int64, int64, string) (sourceconnections.SourceRepository, sourceconnections.Branch, error) {
+	reader.calls.record()
 	return sourceconnections.SourceRepository{}, sourceconnections.Branch{}, errors.New("unexpected provider resolution")
 }
-func (unreachableSourceReader) ReadTree(context.Context, string, string, int64, string) (githubapp.Tree, error) {
+func (reader unreachableSourceReader) ReadTree(context.Context, string, string, int64, string) (githubapp.Tree, error) {
+	reader.calls.record()
 	return githubapp.Tree{}, errors.New("unexpected provider tree")
 }
-func (unreachableSourceReader) DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error) {
+func (reader unreachableSourceReader) DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error) {
+	reader.calls.record()
 	return nil, errors.New("unexpected provider archive")
 }
 
@@ -342,6 +368,18 @@ func (r *blockingComposeRunner) upCallCount() int {
 	return count
 }
 
+func (r *blockingComposeRunner) requestsSnapshot() []runtimeprocess.CommandRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	requests := make([]runtimeprocess.CommandRequest, len(r.requests))
+	for index, request := range r.requests {
+		requests[index] = request
+		requests[index].Args = append([]string(nil), request.Args...)
+		requests[index].Env = append([]string(nil), request.Env...)
+	}
+	return requests
+}
+
 func customVolumeModel(project, volumeName string) []byte {
 	model, err := json.Marshal(map[string]any{
 		"services": map[string]any{"web": map[string]any{
@@ -356,6 +394,224 @@ func customVolumeModel(project, volumeName string) []byte {
 		panic(err)
 	}
 	return model
+}
+
+func TestLegacyLocalSourceDraftMigratesAndCompletesManagedComposeDeployment(t *testing.T) {
+	sourceRoot := t.TempDir()
+	composeBody := []byte("services:\n  web:\n    image: nginx\n")
+	markerBody := []byte("legacy-source-must-not-change\n")
+	if err := os.WriteFile(filepath.Join(sourceRoot, "compose.yaml"), composeBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRoot, "source-marker.txt"), markerBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	dataRoot := t.TempDir()
+	db, actorID, appID := openLegacyFoundationDatabase(t, dataRoot, sourceRoot)
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+
+	applicationStore := apps.New(db)
+	application, err := applicationStore.Get(appID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if application.Status != "draft" || application.Source.Type != apps.SourceLocal || application.Source.Path != sourceRoot {
+		t.Fatalf("migrated legacy application=%#v", application)
+	}
+	if application.Source.ConnectionID != "" || application.Source.InstallationID != 0 || application.Source.RepositoryID != 0 || application.Source.RepositoryOwner != "" || application.Source.RepositoryName != "" || application.Source.TrackedBranch != "" || application.Source.TrackedRef != "" || application.Source.ComposePath != "" || application.Source.ResolvedSHA != "" {
+		t.Fatalf("local source retained provider metadata: %#v", application.Source)
+	}
+	var sourceRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM application_sources WHERE application_id=? AND source_type='local'`, appID).Scan(&sourceRows); err != nil || sourceRows != 1 {
+		t.Fatalf("backfilled local source rows=%d err=%v", sourceRows, err)
+	}
+
+	configuration, err := appconfig.New(db, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := configuration.Replace(context.Background(), appID, actorID, appconfig.ReplaceInput{
+		ExpectedRevisionNumber: 0,
+		Secrets:                []appconfig.ValueInput{{Key: "TOKEN", Value: "runtime-secret"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary, err := securetemp.New(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerCalls := &providerCallCounter{}
+	materializer, err := releasesnapshot.New(db, unreachableSourceReader{calls: providerCalls}, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobService := jobs.New(db)
+	deploymentRepository := deployments.New(db)
+	releaseUp := make(chan struct{})
+	var releaseUpOnce sync.Once
+	release := func() { releaseUpOnce.Do(func() { close(releaseUp) }) }
+	runner := &blockingComposeRunner{upStarted: make(chan struct{}), releaseUp: releaseUp}
+	runner.setConfigJSON([]byte(`{"services":{"web":{"image":"nginx","environment":{"TOKEN":"runtime-secret"}}}}`))
+	executor, err := composeruntime.NewExecutor(applicationStore, materializer, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{
+		DockerExecutable: "docker-test",
+		ConfigTimeout:    5 * time.Second,
+		ApplyTimeout:     30 * time.Second,
+		WaitTimeout:      10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &composeWorkerFixture{
+		db:            db,
+		jobs:          jobService,
+		deployments:   deploymentRepository,
+		configuration: configuration,
+		temporary:     temporary,
+		runner:        runner,
+		executor:      executor,
+		app:           application,
+		actorID:       actorID,
+		dataRoot:      dataRoot,
+	}
+	fixture.startWorker(t)
+	t.Cleanup(release)
+	job := fixture.createJob(t)
+	select {
+	case <-runner.upStarted:
+	case <-time.After(20 * time.Second):
+		durable, getErr := jobService.Get(job.ID)
+		if getErr != nil {
+			t.Fatalf("legacy local deployment did not reach compose up: durable job lookup failed: getErr=%v upCalls=%d", getErr, runner.upCallCount())
+		}
+		t.Fatalf("legacy local deployment did not reach compose up: status=%q phase=%q errorCode=%q errorDetailSet=%t attempt=%d upCalls=%d", durable.Status, durable.Phase, durable.ErrorCode, durable.ErrorDetail != "", durable.Attempt, runner.upCallCount())
+	}
+	release()
+	completed := waitForJob(t, jobService, job.ID, jobs.Succeeded)
+	if completed.ErrorCode != "" {
+		t.Fatalf("completed legacy job=%#v", completed)
+	}
+	if providerCalls.count() != 0 {
+		t.Fatalf("local deployment made %d provider calls", providerCalls.count())
+	}
+
+	application, err = applicationStore.Get(appID)
+	if err != nil || application.Status != "draft" || application.Source.Type != apps.SourceLocal || application.Source.Path != sourceRoot {
+		t.Fatalf("legacy draft changed after deployment: %#v err=%v", application, err)
+	}
+	history, err := deploymentRepository.List(context.Background(), appID, 10)
+	if err != nil || len(history) != 1 || history[0].Status != deployments.Succeeded || history[0].ReleaseID == "" || history[0].ActualConfigurationRevisionID != revision.RevisionID || history[0].ActualConfigurationRevisionNumber != revision.RevisionNumber {
+		t.Fatalf("legacy deployment history=%#v err=%v", history, err)
+	}
+
+	var provider, resolvedSHA, archiveSHA, composePath, workspaceRef, workspaceState, releaseStatus, configurationID string
+	var workspaceSize, configurationNumber int64
+	if err := db.QueryRow(`SELECT source_provider,resolved_sha,archive_sha256,compose_path,workspace_path,workspace_state,status,workspace_size_bytes,configuration_revision_id,configuration_revision_number FROM releases WHERE id=?`, history[0].ReleaseID).Scan(
+		&provider, &resolvedSHA, &archiveSHA, &composePath, &workspaceRef, &workspaceState, &releaseStatus, &workspaceSize, &configurationID, &configurationNumber,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if provider != apps.SourceLocal || len(resolvedSHA) != 64 || archiveSHA != resolvedSHA || composePath != "compose.yaml" || filepath.IsAbs(workspaceRef) || workspaceState != releasesnapshot.WorkspaceStateReady || releaseStatus != "ready" || workspaceSize <= 0 || configurationID != revision.RevisionID || configurationNumber != revision.RevisionNumber {
+		t.Fatalf("legacy release provenance provider=%q resolved=%q archive=%q compose=%q workspace=%q state=%q status=%q size=%d configuration=%q/%d", provider, resolvedSHA, archiveSHA, composePath, workspaceRef, workspaceState, releaseStatus, workspaceSize, configurationID, configurationNumber)
+	}
+	managedWorkspace := filepath.Clean(filepath.Join(dataRoot, filepath.FromSlash(workspaceRef)))
+	expectedWorkspace := filepath.Clean(filepath.Join(dataRoot, "apps", appID, "releases", history[0].ReleaseID, "workspace"))
+	if managedWorkspace != expectedWorkspace {
+		t.Fatalf("managed workspace=%q want exact release namespace=%q", managedWorkspace, expectedWorkspace)
+	}
+	if !withinTestRoot(dataRoot, managedWorkspace) || withinTestRoot(sourceRoot, managedWorkspace) || managedWorkspace == sourceRoot {
+		t.Fatalf("managed workspace=%q dataRoot=%q sourceRoot=%q", managedWorkspace, dataRoot, sourceRoot)
+	}
+	if got, err := os.ReadFile(filepath.Join(managedWorkspace, "compose.yaml")); err != nil || !bytes.Equal(got, composeBody) {
+		t.Fatalf("managed compose=%q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(managedWorkspace, "source-marker.txt")); err != nil || !bytes.Equal(got, markerBody) {
+		t.Fatalf("managed marker=%q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(sourceRoot, "compose.yaml")); err != nil || !bytes.Equal(got, composeBody) {
+		t.Fatalf("original compose changed=%q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(sourceRoot, "source-marker.txt")); err != nil || !bytes.Equal(got, markerBody) {
+		t.Fatalf("original marker changed=%q err=%v", got, err)
+	}
+
+	requests := runner.requestsSnapshot()
+	if len(requests) != 2 {
+		t.Fatalf("compose requests=%#v", requests)
+	}
+	for _, request := range requests {
+		if request.Directory != managedWorkspace || argumentAfter(request.Args, "--project-directory") != managedWorkspace || withinTestRoot(sourceRoot, request.Directory) {
+			t.Fatalf("compose request did not use managed workspace: %#v", request)
+		}
+		if strings.Contains(strings.Join(request.Args, "\x00"), sourceRoot) {
+			t.Fatalf("compose request referenced mutable source: %#v", request.Args)
+		}
+	}
+	if got := argumentAfter(requests[0].Args, "-f"); got != filepath.Join(managedWorkspace, "compose.yaml") || !hasArgument(requests[0].Args, "config") {
+		t.Fatalf("compose config source=%q args=%v", got, requests[0].Args)
+	}
+	if got := argumentAfter(requests[1].Args, "-f"); !hasArgument(requests[1].Args, "up") || !withinTestRoot(filepath.Join(dataRoot, "runtime", "compose"), got) {
+		t.Fatalf("compose up source=%q args=%v", got, requests[1].Args)
+	}
+	assertNoRollbackAndSecretsCleared(t, runner)
+	assertComposeRuntimeTempEmpty(t, dataRoot)
+}
+
+func openLegacyFoundationDatabase(t *testing.T, dataRoot, sourceRoot string) (*sql.DB, string, string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(dataRoot, "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	for _, pragma := range []string{"PRAGMA foreign_keys = ON", "PRAGMA busy_timeout = 5000"} {
+		if _, err := db.Exec(pragma); err != nil {
+			t.Fatal(err)
+		}
+	}
+	foundation, err := os.ReadFile(filepath.Join("..", "database", "migrations", "001_foundation.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(foundation)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO schema_migrations(version,applied_at) VALUES('001_foundation.sql',datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	actorID, machineID, appID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,'legacy-owner','hash',?,?)`, actorID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,agent_version,created_at,updated_at) VALUES(?,'legacy-local','local','ready','test','test','test','test',?,?)`, machineID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,description,source_path,active_machine_id,status,created_at,updated_at) VALUES(?,'legacy-local-draft','Legacy Local Draft','created before typed sources',?,?,'draft',?,?)`, appID, sourceRoot, machineID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	return db, actorID, appID
+}
+
+func withinTestRoot(root, target string) bool {
+	relative, err := filepath.Rel(root, target)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
+}
+
+func argumentAfter(arguments []string, name string) string {
+	for index := 0; index+1 < len(arguments); index++ {
+		if arguments[index] == name {
+			return arguments[index+1]
+		}
+	}
+	return ""
 }
 
 func TestComposeWorkerCustomResourceNameRequiresExactApprovalBeforeMutation(t *testing.T) {
