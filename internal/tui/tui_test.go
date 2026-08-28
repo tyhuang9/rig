@@ -195,6 +195,78 @@ func TestOrdinaryInputDoesNotRebuildTranscript(t *testing.T) {
 	}
 }
 
+func TestOverviewCompletionCannotReleaseCommandBusyState(t *testing.T) {
+	started := make(chan string, 3)
+	release := make(chan struct{})
+	client := &fakeClient{overviewStarted: started, overviewRelease: release}
+	m := consoleModel(client)
+	m.overviewLoaded = false
+	overview := m.startOverview()
+	result := make(chan tea.Msg, 1)
+	go func() { result <- overview() }()
+	for i := 0; i < 3; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("overview did not begin all controller requests")
+		}
+	}
+	mutation := m.execute(command{Name: "/start", Raw: "/start"})
+	if mutation == nil || !m.busy {
+		t.Fatal("mutation did not acquire the command busy guard")
+	}
+	close(release)
+	select {
+	case raw := <-result:
+		m.Update(raw)
+	case <-time.After(time.Second):
+		t.Fatal("slow overview did not finish")
+	}
+	if !m.busy {
+		t.Fatal("overview completion released an in-flight mutation busy guard")
+	}
+	m.commandInput.SetValue("/start")
+	_, second := m.handleConsoleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if second != nil || client.lifecycleCalls != 0 {
+		t.Fatalf("busy state accepted a second mutation: calls=%d cmd=%v", client.lifecycleCalls, second)
+	}
+
+	oldGeneration := m.overviewGen
+	m.overviewGen++
+	m.overviewLoading = true
+	m.status.Daemon = "fresh"
+	m.Update(overviewMsg{generation: oldGeneration, status: apicontract.SystemStatus{Daemon: "stale"}})
+	if m.status.Daemon != "fresh" || !m.overviewLoading || !m.busy {
+		t.Fatalf("stale overview changed active state: daemon=%q loading=%t busy=%t", m.status.Daemon, m.overviewLoading, m.busy)
+	}
+	m.overviewGen++
+	m.overviewLoading = true
+	m.Update(overviewMsg{generation: m.overviewGen, err: errors.New("temporary overview failure")})
+	if !m.busy || m.screen != screenConsole {
+		t.Fatalf("overview failure interrupted the active command: busy=%t screen=%d", m.busy, m.screen)
+	}
+}
+
+func TestOrdinaryInputAndViewReuseTranscriptCaches(t *testing.T) {
+	for _, accessible := range []bool{false, true} {
+		t.Run(fmt.Sprintf("accessible=%t", accessible), func(t *testing.T) {
+			m := consoleModel(&fakeClient{})
+			m.accessible = accessible
+			for i := 0; i < transcriptLimit; i++ {
+				m.appendEntry(entryEvent, "event", strings.Repeat("detail ", 200))
+			}
+			_ = m.View() // Populate the mode-specific cache before measuring input.
+			m.transcriptBuilds = 0
+			m.accessibleBuilds = 0
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+			_ = m.View()
+			if m.transcriptBuilds != 0 || m.accessibleBuilds != 0 {
+				t.Fatalf("ordinary input rebuilt transcript: normal=%d accessible=%d", m.transcriptBuilds, m.accessibleBuilds)
+			}
+		})
+	}
+}
+
 func TestTranscriptHasUnicodeSafeByteBudget(t *testing.T) {
 	m := consoleModel(&fakeClient{})
 	body := strings.Repeat("界", maxAPITextBytes)
@@ -236,6 +308,29 @@ func BenchmarkOrdinaryInputWithLargeTranscript(b *testing.B) {
 	b.StopTimer()
 	if m.transcriptBuilds != 0 {
 		b.Fatalf("ordinary input rebuilt transcript %d times", m.transcriptBuilds)
+	}
+}
+
+func BenchmarkOrdinaryInputAndViewWithLargeTranscript(b *testing.B) {
+	for _, accessible := range []bool{false, true} {
+		b.Run(fmt.Sprintf("accessible=%t", accessible), func(b *testing.B) {
+			m := consoleModel(&fakeClient{})
+			m.accessible = accessible
+			for i := 0; i < transcriptLimit; i++ {
+				m.appendEntry(entryEvent, "event", strings.Repeat("detail ", 200))
+			}
+			_ = m.View()
+			m.transcriptBuilds, m.accessibleBuilds = 0, 0
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+				_ = m.View()
+			}
+			b.StopTimer()
+			if m.transcriptBuilds != 0 || m.accessibleBuilds != 0 {
+				b.Fatalf("ordinary input rebuilt transcript: normal=%d accessible=%d", m.transcriptBuilds, m.accessibleBuilds)
+			}
+		})
 	}
 }
 
@@ -710,6 +805,37 @@ func TestAccessibleViewIsLinearMonochromeAndChronological(t *testing.T) {
 	}
 }
 
+func TestAccessibleTranscriptPagingAndAuthMinimumSize(t *testing.T) {
+	m := consoleModel(&fakeClient{})
+	m.accessible = true
+	m.width, m.height = 80, 12
+	m.entries = nil
+	for i := 0; i < 4; i++ {
+		m.appendEntry(entryEvent, fmt.Sprintf("event-%d", i), fmt.Sprintf("body-%d", i))
+	}
+	latest := m.View()
+	if !strings.Contains(latest, "event-3") || strings.Contains(latest, "event-0") {
+		t.Fatalf("latest accessible page was not bounded to newest entries:\n%s", latest)
+	}
+	m.handleConsoleKey(tea.KeyMsg{Type: tea.KeyPgUp})
+	older := m.View()
+	if !strings.Contains(older, "event-0") || !strings.Contains(older, "Transcript page 2 of") {
+		t.Fatalf("PgUp did not expose an older accessible page:\n%s", older)
+	}
+	m.handleConsoleKey(tea.KeyMsg{Type: tea.KeyPgDown})
+	if current := m.View(); !strings.Contains(current, "event-3") {
+		t.Fatalf("PgDn did not return to the newest accessible page:\n%s", current)
+	}
+
+	login := NewModel(context.Background(), &fakeClient{}, &memoryHistoryStore{}, "http://controller")
+	login.showLogin("")
+	login.width, login.height = 31, 7
+	login.resize()
+	if view := ansi.Strip(login.View()); !strings.Contains(view, "Terminal too small") {
+		t.Fatalf("auth view bypassed minimum-size guard: %q", view)
+	}
+}
+
 func TestNoColorAndANSISafeTruncation(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	m := consoleModel(&fakeClient{})
@@ -752,6 +878,53 @@ func TestAuthLabelsFocusFirstInvalidAndFocusRestores(t *testing.T) {
 	console.Update(commandResultMsg{cmd: command{Name: "/status"}, body: "daemon: running"})
 	if !console.commandInput.Focused() {
 		t.Fatal("command input did not regain focus after result")
+	}
+
+	console = consoleModel(&fakeClient{})
+	console.commandInput.SetValue("/stop")
+	console.handleConsoleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	console.resize()
+	console.handleMouse(tea.MouseMsg(tea.MouseEvent{X: console.cancelRect.x, Y: console.cancelRect.y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
+	if !console.commandInput.Focused() {
+		t.Fatal("command input did not regain focus after mouse cancellation")
+	}
+
+	console.commandInput.Blur()
+	console.busy = true
+	_, follow := console.Update(commandResultMsg{cmd: command{Name: "/start"}, followID: "job-1"})
+	if follow == nil || !console.commandInput.Focused() {
+		t.Fatal("command input did not regain focus when lifecycle follow began")
+	}
+	console.commandInput.Blur()
+	console.stopFollowing(false)
+	if !console.commandInput.Focused() {
+		t.Fatal("command input did not regain focus when follow ended")
+	}
+	console.startFollowing("job-2", 0)
+	console.commandInput.Blur()
+	console.handleConsoleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if !console.commandInput.Focused() {
+		t.Fatal("command input did not regain focus when Escape stopped follow")
+	}
+	console.startFollowing("job-3", 0)
+	console.commandInput.Blur()
+	console.Update(followEventMsg{generation: console.followGeneration, event: apicontract.JobEvent{Code: "job_succeeded"}})
+	if !console.commandInput.Focused() {
+		t.Fatal("command input did not regain focus when terminal follow event arrived")
+	}
+	console.startFollowing("job-4", 0)
+	console.commandInput.Blur()
+	console.Update(followEventMsg{generation: console.followGeneration, err: errors.New("stream disconnected")})
+	if !console.commandInput.Focused() {
+		t.Fatal("command input did not regain focus when follow failed")
+	}
+
+	bootstrap := NewModel(context.Background(), &fakeClient{}, &memoryHistoryStore{}, "http://controller")
+	bootstrap.showBootstrap()
+	bootstrap.focusAuth(2)
+	bootstrap.Update(authMsg{err: errors.New("bootstrap rejected")})
+	if bootstrap.authIndex != 0 || !bootstrap.authInputs[0].Focused() {
+		t.Fatal("failed bootstrap did not refocus the bootstrap token field")
 	}
 }
 

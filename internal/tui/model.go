@@ -69,23 +69,31 @@ type Model struct {
 	endpoint string
 	newKey   func() string
 
-	screen         screen
-	width          int
-	height         int
-	layout         layout
-	accessible     bool
-	overviewLoaded bool
-	busy           bool
-	err            string
-	user           apicontract.User
-	status         apicontract.SystemStatus
-	apps           []apicontract.Application
-	jobs           []apicontract.Job
+	screen          screen
+	width           int
+	height          int
+	layout          layout
+	accessible      bool
+	overviewLoaded  bool
+	overviewLoading bool
+	overviewGen     uint64
+	busy            bool
+	err             string
+	user            apicontract.User
+	status          apicontract.SystemStatus
+	apps            []apicontract.Application
+	jobs            []apicontract.Job
 
 	selectedAppID    string
 	entries          []transcriptEntry
 	transcriptBytes  int
 	transcriptBuilds int
+	transcriptGen    uint64
+	accessibleLines  []string
+	accessibleGen    uint64
+	accessibleWidth  int
+	accessibleBuilds int
+	accessiblePage   int
 	viewport         viewport.Model
 	commandInput     textinput.Model
 	authInputs       []textinput.Model
@@ -163,10 +171,11 @@ type authMsg struct {
 	err     error
 }
 type overviewMsg struct {
-	status apicontract.SystemStatus
-	apps   apicontract.ApplicationList
-	jobs   apicontract.JobList
-	err    error
+	generation uint64
+	status     apicontract.SystemStatus
+	apps       apicontract.ApplicationList
+	jobs       apicontract.JobList
+	err        error
 }
 type commandResultMsg struct {
 	cmd      command
@@ -222,7 +231,17 @@ func (m *Model) checkMe() tea.Cmd {
 	}
 }
 
+// startOverview keeps refresh bookkeeping independent from command work. An
+// overview is advisory data; its completion must never release a command's
+// busy guard.
+func (m *Model) startOverview() tea.Cmd {
+	m.overviewGen++
+	m.overviewLoading = true
+	return m.loadOverview()
+}
+
 func (m *Model) loadOverview() tea.Cmd {
+	generation := m.overviewGen
 	client, ctx := m.client, m.ctx
 	return func() tea.Msg {
 		requestCtx, cancel := context.WithCancel(ctx)
@@ -258,9 +277,9 @@ func (m *Model) loadOverview() tea.Cmd {
 		wg.Wait()
 		select {
 		case err := <-errors:
-			return overviewMsg{err: err}
+			return overviewMsg{generation: generation, err: err}
 		default:
-			return overviewMsg{status: status, apps: apps, jobs: jobs}
+			return overviewMsg{generation: generation, status: status, apps: apps, jobs: jobs}
 		}
 	}
 }
@@ -299,18 +318,28 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.enterConsole(msg.me.User)
-		return m, m.loadOverview()
+		return m, m.startOverview()
 	case authMsg:
 		m.busy = false
 		if msg.err != nil {
 			m.err = sanitizeAPIText(msg.err.Error())
+			if m.screen == screenBootstrap && len(m.authInputs) > 0 {
+				m.focusAuth(0)
+			}
 			return m, nil
 		}
 		m.enterConsole(msg.session.User)
-		return m, m.loadOverview()
+		return m, m.startOverview()
 	case overviewMsg:
-		m.busy = false
+		if msg.generation != m.overviewGen {
+			return m, nil
+		}
+		m.overviewLoading = false
 		if msg.err != nil {
+			if m.busy && m.screen == screenConsole {
+				m.appendEntry(entryError, "overview", "Overview refresh failed: "+msg.err.Error())
+				return m, nil
+			}
 			return m, m.handleControllerError(msg.err)
 		}
 		m.status = msg.status
@@ -377,7 +406,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendEntry(entryEvent, fmt.Sprintf("%s · %s · %d%%", msg.event.Phase, msg.event.Level, eventProgress(msg.event, m.jobs)), msg.event.Message)
 		if jobEventTerminal(msg.event) {
 			m.stopFollowing(false)
-			return m, m.loadOverview()
+			return m, m.startOverview()
 		}
 		return m, m.waitForFollow()
 	case historySavedMsg:
@@ -509,9 +538,17 @@ func (m *Model) handleConsoleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.nextHistory()
 		return m, nil
 	case "pgup":
+		if m.accessible {
+			m.accessiblePageUp()
+			return m, nil
+		}
 		m.viewport.PageUp()
 		return m, nil
 	case "pgdown":
+		if m.accessible {
+			m.accessiblePageDown()
+			return m, nil
+		}
 		m.viewport.PageDown()
 		return m, nil
 	}
@@ -574,6 +611,7 @@ func (m *Model) execute(cmd command) tea.Cmd {
 	case "/clear":
 		m.entries = nil
 		m.transcriptBytes = 0
+		m.invalidateAccessibleTranscript()
 		m.refreshTranscript()
 		return nil
 	case "/history clear":
@@ -702,6 +740,7 @@ func (m *Model) startFollowing(jobID string, after int64) tea.Cmd {
 	m.followCancel = cancel
 	m.followContext = ctx
 	m.followCursor = after
+	m.restoreCommandFocus()
 	return func() tea.Msg {
 		events, errs := client.FollowJob(ctx, jobID, after)
 		return followOpenedMsg{generation: generation, jobID: jobID, events: events, errors: errs}
@@ -753,6 +792,7 @@ func (m *Model) stopFollowing(notify bool) {
 	}
 	m.followCancel, m.followContext, m.followEvents, m.followErrors = nil, nil, nil, nil
 	m.followJobID = ""
+	m.restoreCommandFocus()
 }
 
 func (m *Model) submitAuth() (tea.Model, tea.Cmd) {
@@ -852,7 +892,7 @@ func (m *Model) mutationKey() (string, error) {
 }
 
 func (m *Model) enterConsole(user apicontract.User) {
-	m.screen, m.busy, m.err, m.user, m.overviewLoaded = screenConsole, false, "", user, false
+	m.screen, m.busy, m.err, m.user, m.overviewLoaded, m.overviewLoading = screenConsole, false, "", user, false, false
 	m.commandInput.Focus()
 	m.appendEntry(entrySystem, "connected", "Authenticated as "+sanitizeAPIText(user.Username)+". Type /help for commands.")
 }
@@ -917,7 +957,13 @@ func (m *Model) appendEntry(kind entryKind, title, body string) {
 	if trimmed > 0 {
 		m.entries = append([]transcriptEntry(nil), m.entries[trimmed:]...)
 	}
+	m.invalidateAccessibleTranscript()
 	m.refreshTranscript()
+}
+
+func (m *Model) invalidateAccessibleTranscript() {
+	m.transcriptGen++
+	m.accessiblePage = 0
 }
 
 func transcriptEntryBytes(entry transcriptEntry) int {
@@ -1015,6 +1061,9 @@ func (m *Model) resize() {
 	m.viewport.Width, m.viewport.Height = w, h
 	m.commandInput.Width = max(1, m.layout.command.w-4)
 	m.rebuildHitTargets()
+	if m.accessibleWidth != m.width {
+		m.accessiblePage = 0
+	}
 	if previousTranscriptWidth != w {
 		m.refreshTranscript()
 	}

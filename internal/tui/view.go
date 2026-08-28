@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -31,6 +32,9 @@ var (
 func (m *Model) View() string {
 	if m.width <= 0 || m.height <= 0 {
 		return "hostd operator console\n"
+	}
+	if m.width < 32 || m.height < 8 {
+		return m.finishView(m.centered("hostd operator console\n\nTerminal too small\nResize to at least 32×8\nCtrl+C quits"))
 	}
 	if m.accessible {
 		return m.finishView(m.accessibleView())
@@ -136,9 +140,9 @@ func (m *Model) tinyConsoleView() string {
 }
 
 func (m *Model) renderHeader() string {
-	connection := goodStyle.Render("● connected")
+	connection := "[connected]"
 	if m.busy {
-		connection = mutedStyle.Render("● working")
+		connection = "[working]"
 	}
 	left := titleStyle.Render("hostd operator console") + "  " + connection
 	right := fmt.Sprintf("%s · %s", endpointLabel(m.endpoint), sanitizeAPIText(m.user.Username))
@@ -160,7 +164,11 @@ func (m *Model) renderOverview() string {
 	b.WriteString(titleStyle.Render("Overview"))
 	b.WriteString("\n")
 	if !m.overviewLoaded {
-		b.WriteString(mutedStyle.Render("Loading controller overview…"))
+		message := "Overview unavailable; run /status to retry."
+		if m.overviewLoading {
+			message = "Loading controller overview…"
+		}
+		b.WriteString(mutedStyle.Render(message))
 		return panelStyle.Width(max(1, m.layout.overview.w-4)).Height(max(1, m.layout.overview.h-2)).Render(b.String())
 	}
 	daemon := sanitizeAPIText(m.status.Daemon)
@@ -289,6 +297,7 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if m.cancelRect.contains(event.X, event.Y) {
 			m.confirm = nil
 			m.appendEntry(entrySystem, "cancelled", "No changes were made.")
+			m.restoreCommandFocus()
 		}
 		return m, nil
 	}
@@ -343,9 +352,9 @@ func overviewJobs(jobs []apicontract.Job, limit int) []apicontract.Job {
 
 func boolWord(value bool) string {
 	if value {
-		return goodStyle.Render("ready")
+		return "ready"
 	}
-	return errorStyle.Render("not ready")
+	return "not ready"
 }
 
 func cropWidth(value string, width int) string {
@@ -416,8 +425,12 @@ func (m *Model) accessibleView() string {
 		if !m.overviewLoaded {
 			b.WriteString("Overview: loading\n")
 		}
-		for _, entry := range m.entries {
-			b.WriteString(entryKindLabel(entry.Kind) + " " + entry.Title + "\n" + entry.Body + "\n")
+		lines, page, pages := m.accessibleTranscriptPage()
+		if pages > 0 {
+			fmt.Fprintf(&b, "Transcript page %d of %d (PgUp older, PgDn newer)\n", page+1, pages)
+			for _, line := range lines {
+				b.WriteString(line + "\n")
+			}
 		}
 		if m.confirm != nil {
 			b.WriteString("Confirmation required: " + m.confirm.Text + ". Press Enter to run or Escape to cancel.\n")
@@ -425,6 +438,99 @@ func (m *Model) accessibleView() string {
 		b.WriteString("Command: " + m.commandInput.View() + "\nShortcuts: Enter run; Tab complete; Escape cancel; Ctrl+C quit.\n")
 	}
 	return b.String()
+}
+
+// accessibleTranscriptPage keeps ordinary keystrokes cheap: sanitization and
+// line splitting happen only when transcript content or terminal width changes.
+// The retained transcript itself can be 1 MiB, so the cache builds from a
+// bounded tail before it starts splitting lines for the current terminal.
+func (m *Model) accessibleTranscriptPage() ([]string, int, int) {
+	m.refreshAccessibleTranscript()
+	pageSize := m.accessiblePageSize()
+	pages := max(1, (len(m.accessibleLines)+pageSize-1)/pageSize)
+	if m.accessiblePage >= pages {
+		m.accessiblePage = pages - 1
+	}
+	end := len(m.accessibleLines) - m.accessiblePage*pageSize
+	if end < 0 {
+		end = 0
+	}
+	start := max(0, end-pageSize)
+	return m.accessibleLines[start:end], m.accessiblePage, pages
+}
+
+func (m *Model) accessiblePageSize() int {
+	// Header, connection summary, paging label, command bar, and shortcuts use
+	// at most eight lines. Keep at least one transcript line available.
+	return max(1, m.height-8)
+}
+
+func (m *Model) accessiblePageUp() {
+	m.refreshAccessibleTranscript()
+	pages := max(1, (len(m.accessibleLines)+m.accessiblePageSize()-1)/m.accessiblePageSize())
+	if m.accessiblePage < pages-1 {
+		m.accessiblePage++
+	}
+}
+
+func (m *Model) accessiblePageDown() {
+	if m.accessiblePage > 0 {
+		m.accessiblePage--
+	}
+}
+
+func (m *Model) refreshAccessibleTranscript() {
+	if m.accessibleGen == m.transcriptGen && m.accessibleWidth == m.width {
+		return
+	}
+	budget := accessibleTranscriptBudget(m.width)
+	start := len(m.entries)
+	used := 0
+	for start > 0 {
+		size := transcriptEntryBytes(m.entries[start-1])
+		if start < len(m.entries) && used+size > budget {
+			break
+		}
+		start--
+		used += size
+		if used >= budget {
+			break
+		}
+	}
+	lines := make([]string, 0, min(len(m.entries)-start, max(1, m.height*4)))
+	for _, entry := range m.entries[start:] {
+		lines = append(lines, cropWidth(entryKindLabel(entry.Kind)+" "+entry.Title, m.width))
+		// The last selected entry can still be close to the byte budget. Bound it
+		// before Split so a single API message cannot make a redraw expensive.
+		body := tailUTF8(entry.Body, budget)
+		for _, line := range strings.Split(body, "\n") {
+			lines = append(lines, cropWidth(line, m.width))
+		}
+	}
+	m.accessibleLines = lines
+	m.accessibleGen = m.transcriptGen
+	m.accessibleWidth = m.width
+	m.accessibleBuilds++
+}
+
+func accessibleTranscriptBudget(width int) int {
+	// Height changes only alter the selected page. Width changes alter wrapping,
+	// so it is the only terminal dimension that invalidates this cache.
+	return min(128<<10, max(8<<10, max(1, width)*256))
+}
+
+func tailUTF8(value string, limit int) string {
+	if limit <= 0 || value == "" {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	start := len(value) - limit
+	for start < len(value) && !utf8.RuneStart(value[start]) {
+		start++
+	}
+	return "…" + value[start:]
 }
 
 func (m *Model) linearAuthFields() string {
