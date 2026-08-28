@@ -538,6 +538,314 @@ func TestMaterializeInvalidatesTamperedReadyWorkspaceWithoutPersistingComposeCon
 		t.Fatalf("release row persisted compose content: %q", releasePayload)
 	}
 }
+
+func TestMaterializeInvalidatesSameSizeDockerfileMutationAndRematerializes(t *testing.T) {
+	db := snapshotDB(t)
+	source := &fakeSources{archive: composeAndDockerfileArchive(t, "services:\n  web:\n    build:\n      context: .\n      dockerfile: Dockerfile\n", "FROM scratch\n# one\n")}
+	m, err := New(db, source, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	first, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(first.WorkspacePath, "Dockerfile"), []byte("FROM scratch\n# two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID || source.calls != 2 {
+		t.Fatalf("same-size Dockerfile mutation reused=%+v first=%+v calls=%d", second, first, source.calls)
+	}
+	if contents, err := os.ReadFile(filepath.Join(second.WorkspacePath, "Dockerfile")); err != nil || string(contents) != "FROM scratch\n# one\n" {
+		t.Fatalf("rematerialized Dockerfile=%q err=%v", contents, err)
+	}
+	var state string
+	if err := db.QueryRow(`SELECT workspace_state FROM releases WHERE id=?`, first.ID).Scan(&state); err != nil || state != WorkspaceStateFailed {
+		t.Fatalf("tampered state=%q err=%v", state, err)
+	}
+}
+
+func TestMaterializeFailsClosedAndRematerializesLegacyGitHubReadyWithoutTreeDigest(t *testing.T) {
+	db := snapshotDB(t)
+	source := &fakeSources{archive: composeArchive(t, "services: {}\n")}
+	m, err := New(db, source, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	first, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TRIGGER releases_ready_insert_requires_workspace_tree_digest`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM releases WHERE id=?`, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,compose_path,archive_sha256,workspace_path,workspace_state,workspace_size_bytes,configuration_revision_number)
+		VALUES(?,?, 'ready','{}',datetime('now'),'github',7,?,'compose.yaml',?,?, 'ready',?,0)`, first.ID, app, snapshotSHA, first.ArchiveSHA256, m.workspaceRelative(app, first.ID), first.WorkspaceSizeBytes); err != nil {
+		t.Fatal(err)
+	}
+	second, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID || source.calls != 2 {
+		t.Fatalf("legacy digest-less workspace reused=%+v first=%+v calls=%d", second, first, source.calls)
+	}
+	var state string
+	if err := db.QueryRow(`SELECT workspace_state FROM releases WHERE id=?`, first.ID).Scan(&state); err != nil || state != WorkspaceStateFailed {
+		t.Fatalf("legacy state=%q err=%v", state, err)
+	}
+	if _, err := os.Stat(first.WorkspacePath); !os.IsNotExist(err) {
+		t.Fatalf("legacy managed workspace retained: %v", err)
+	}
+}
+
+func TestReadyReleaseCancellationPreservesGitHubWorkspaceAndReuse(t *testing.T) {
+	db := snapshotDB(t)
+	source := &fakeSources{archive: composeArchive(t, "services: {}\n")}
+	m, err := New(db, source, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	release, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnchanged := func(phase string) {
+		t.Helper()
+		var state string
+		if err := db.QueryRow(`SELECT workspace_state FROM releases WHERE id=?`, release.ID).Scan(&state); err != nil || state != WorkspaceStateReady {
+			t.Fatalf("%s state=%q err=%v", phase, state, err)
+		}
+		if _, err := os.Stat(release.WorkspacePath); err != nil {
+			t.Fatalf("%s removed workspace: %v", phase, err)
+		}
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := m.ReadyRelease(canceled, app, release.ID); !IsCode(err, "canceled") {
+		t.Fatalf("pre-canceled ready lookup error=%v", err)
+	}
+	assertUnchanged("pre-canceled lookup")
+
+	canonicalHash := m.hashTree
+	hashCalls := 0
+	m.hashTree = func(context.Context, string) (string, error) {
+		hashCalls++
+		return "", context.Canceled
+	}
+	if _, err := m.ReadyRelease(context.Background(), app, release.ID); !IsCode(err, "canceled") || hashCalls != 1 {
+		t.Fatalf("hash-canceled ready lookup error=%v calls=%d", err, hashCalls)
+	}
+	assertUnchanged("hash-canceled lookup")
+
+	boundary, cancelBoundary := context.WithCancel(context.Background())
+	m.hashTree = func(ctx context.Context, root string) (string, error) {
+		digest, err := canonicalHash(ctx, root)
+		cancelBoundary()
+		return digest, err
+	}
+	if _, err := m.ReadyRelease(boundary, app, release.ID); !IsCode(err, "canceled") {
+		t.Fatalf("post-hash canceled ready lookup error=%v", err)
+	}
+	assertUnchanged("post-hash canceled lookup")
+	m.hashTree = canonicalHash
+
+	if ready, err := m.ReadyRelease(context.Background(), app, release.ID); err != nil || ready.ID != release.ID {
+		t.Fatalf("uncanceled ready lookup=%+v err=%v", ready, err)
+	}
+	if reused, err := m.Materialize(context.Background(), "owner", app); err != nil || reused.ID != release.ID || source.calls != 1 {
+		t.Fatalf("uncanceled reuse=%+v err=%v archive calls=%d", reused, err, source.calls)
+	}
+}
+
+func TestReadyReleaseTerminalizesAfterWorkspaceRemovalCancelsCaller(t *testing.T) {
+	db := snapshotDB(t)
+	source := &fakeSources{archive: composeAndDockerfileArchive(t, "services:\n  web:\n    build:\n      context: .\n      dockerfile: Dockerfile\n", "FROM scratch\n# one\n")}
+	m, err := New(db, source, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	release, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(release.WorkspacePath, "Dockerfile"), []byte("FROM scratch\n# two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	caller, cancel := context.WithCancel(context.Background())
+	removeAll := m.fs.removeAll
+	m.fs.removeAll = func(path string) error {
+		err := removeAll(path)
+		cancel()
+		return err
+	}
+	if _, err := m.ReadyRelease(caller, app, release.ID); !IsCode(err, "invalid_source") {
+		t.Fatalf("post-removal cancellation error=%v", err)
+	}
+	var state string
+	var workspace sql.NullString
+	if err := db.QueryRow(`SELECT workspace_state,workspace_path FROM releases WHERE id=?`, release.ID).Scan(&state, &workspace); err != nil || state != WorkspaceStateFailed || workspace.Valid {
+		t.Fatalf("post-removal state=%q workspace=%#v err=%v", state, workspace, err)
+	}
+	if _, err := os.Stat(release.WorkspacePath); !os.IsNotExist(err) {
+		t.Fatalf("post-removal workspace still exists: %v", err)
+	}
+}
+
+func TestReadyReleaseRemovalFailureLeavesFailedWorkspaceForRetention(t *testing.T) {
+	db := snapshotDB(t)
+	source := &fakeSources{archive: composeAndDockerfileArchive(t, "services:\n  web:\n    build:\n      context: .\n      dockerfile: Dockerfile\n", "FROM scratch\n# one\n")}
+	m, err := New(db, source, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	release, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dockerfile := filepath.Join(release.WorkspacePath, "Dockerfile")
+	if err := os.WriteFile(dockerfile, []byte("FROM scratch\n# two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalRemoveAll := m.fs.removeAll
+	removeCalls := 0
+	removedPath := ""
+	m.fs.removeAll = func(path string) error {
+		removeCalls++
+		removedPath = path
+		return errors.New("injected workspace removal failure")
+	}
+	if _, err := m.ReadyRelease(context.Background(), app, release.ID); !IsCode(err, "internal_error") {
+		t.Fatalf("removal failure error=%v", err)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("remove calls=%d want=1", removeCalls)
+	}
+	if removedPath != release.WorkspacePath {
+		t.Fatalf("removed path=%q want=%q", removedPath, release.WorkspacePath)
+	}
+	var status, state, code, digest string
+	var storedPath sql.NullString
+	var size int64
+	if err := db.QueryRow(`SELECT status,workspace_state,COALESCE(materialization_error_code,''),workspace_path,workspace_size_bytes,workspace_tree_sha256 FROM releases WHERE id=?`, release.ID).Scan(&status, &state, &code, &storedPath, &size, &digest); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || state != WorkspaceStateFailed || code != "invalid_source" || !storedPath.Valid || storedPath.String != m.workspaceRelative(app, release.ID) || size != release.WorkspaceSizeBytes || digest != release.WorkspaceTreeSHA256 {
+		t.Fatalf("removal failure row status=%q state=%q code=%q path=%#v size=%d digest=%q", status, state, code, storedPath, size, digest)
+	}
+	if body, err := os.ReadFile(dockerfile); err != nil || string(body) != "FROM scratch\n# two\n" {
+		t.Fatalf("workspace changed after failed removal: %q %v", body, err)
+	}
+	if source.calls != 1 {
+		t.Fatalf("removal failure refetched archive calls=%d", source.calls)
+	}
+	m.fs.removeAll = originalRemoveAll
+	m.retention = RetentionOptions{PerAppBytes: release.WorkspaceSizeBytes, GlobalBytes: release.WorkspaceSizeBytes}
+	if err := m.enforceRetention(context.Background(), app, 1); err != nil {
+		t.Fatalf("retention cleanup: %v", err)
+	}
+	if err := db.QueryRow(`SELECT status,workspace_state,workspace_path,workspace_size_bytes FROM releases WHERE id=?`, release.ID).Scan(&status, &state, &storedPath, &size); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || state != WorkspaceStatePruned || storedPath.Valid || size != 0 {
+		t.Fatalf("retention cleanup row status=%q state=%q path=%#v size=%d", status, state, storedPath, size)
+	}
+	if _, err := os.Stat(release.WorkspacePath); !os.IsNotExist(err) {
+		t.Fatalf("retention cleanup workspace still exists: %v", err)
+	}
+	if source.calls != 1 {
+		t.Fatalf("retention cleanup refetched archive calls=%d", source.calls)
+	}
+}
+
+func TestReadyReleaseChangedRowDoesNotRemoveWorkspace(t *testing.T) {
+	db := snapshotDB(t)
+	m, err := New(db, &fakeSources{archive: composeArchive(t, "services: {}\n")}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	release, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalHash := m.hashTree
+	invalidDigest := "a" + release.WorkspaceTreeSHA256[1:]
+	if invalidDigest == release.WorkspaceTreeSHA256 {
+		invalidDigest = "b" + release.WorkspaceTreeSHA256[1:]
+	}
+	m.hashTree = func(ctx context.Context, root string) (string, error) {
+		if _, err := db.Exec(`UPDATE releases SET workspace_path='changed' WHERE id=?`, release.ID); err != nil {
+			t.Fatal(err)
+		}
+		return invalidDigest, nil
+	}
+	if _, err := m.ReadyRelease(context.Background(), app, release.ID); !IsCode(err, "internal_error") {
+		t.Fatalf("changed ready row error=%v", err)
+	}
+	m.hashTree = originalHash
+	var state string
+	if err := db.QueryRow(`SELECT workspace_state FROM releases WHERE id=?`, release.ID).Scan(&state); err != nil || state != WorkspaceStateReady {
+		t.Fatalf("changed row state=%q err=%v", state, err)
+	}
+	if _, err := os.Stat(release.WorkspacePath); err != nil {
+		t.Fatalf("changed row workspace removed: %v", err)
+	}
+}
+
+func TestReadyReleaseCleanupFailureLeavesRecoverableFailedWorkspace(t *testing.T) {
+	db := snapshotDB(t)
+	m, err := New(db, &fakeSources{archive: composeAndDockerfileArchive(t, "services:\n  web:\n    build:\n      context: .\n      dockerfile: Dockerfile\n", "FROM scratch\n# one\n")}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	release, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(release.WorkspacePath, "Dockerfile"), []byte("FROM scratch\n# two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER block_release_workspace_cleanup BEFORE UPDATE OF workspace_path ON releases
+		WHEN NEW.workspace_path IS NULL BEGIN SELECT RAISE(ABORT, 'cleanup blocked'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ReadyRelease(context.Background(), app, release.ID); !IsCode(err, "internal_error") {
+		t.Fatalf("cleanup failure error=%v", err)
+	}
+	var state string
+	var storedPath sql.NullString
+	var size int64
+	if err := db.QueryRow(`SELECT workspace_state,workspace_path,workspace_size_bytes FROM releases WHERE id=?`, release.ID).Scan(&state, &storedPath, &size); err != nil || state != WorkspaceStateFailed || !storedPath.Valid || size <= 0 {
+		t.Fatalf("cleanup failure state=%q path=%#v size=%d err=%v", state, storedPath, size, err)
+	}
+	if _, err := os.Stat(release.WorkspacePath); !os.IsNotExist(err) {
+		t.Fatalf("cleanup failure workspace still exists: %v", err)
+	}
+	if _, err := db.Exec(`DROP TRIGGER block_release_workspace_cleanup`); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Recover(); err != nil {
+		t.Fatalf("recover failed cleanup: %v", err)
+	}
+	if err := db.QueryRow(`SELECT workspace_state,workspace_path,workspace_size_bytes FROM releases WHERE id=?`, release.ID).Scan(&state, &storedPath, &size); err != nil || state != WorkspaceStateFailed || storedPath.Valid || size != 0 {
+		t.Fatalf("recovered cleanup state=%q path=%#v size=%d err=%v", state, storedPath, size, err)
+	}
+}
+
 func snapshotDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := database.Open(t.TempDir())
@@ -561,14 +869,25 @@ func snapshotDB(t *testing.T) *sql.DB {
 	return db
 }
 func composeArchive(t *testing.T, compose string) []byte {
+	return composeAndDockerfileArchive(t, compose, "")
+}
+
+func composeAndDockerfileArchive(t *testing.T, compose, dockerfile string) []byte {
 	t.Helper()
 	var b bytes.Buffer
 	gz := gzip.NewWriter(&b)
 	tw := tar.NewWriter(gz)
-	for _, e := range []struct {
+	entries := []struct {
 		name, body string
 		typ        byte
-	}{{"repo/", "", tar.TypeDir}, {"repo/compose.yaml", compose, tar.TypeReg}} {
+	}{{"repo/", "", tar.TypeDir}, {"repo/compose.yaml", compose, tar.TypeReg}}
+	if dockerfile != "" {
+		entries = append(entries, struct {
+			name, body string
+			typ        byte
+		}{"repo/Dockerfile", dockerfile, tar.TypeReg})
+	}
+	for _, e := range entries {
 		h := &tar.Header{Name: e.name, Typeflag: e.typ, Mode: 0o600, Size: int64(len(e.body))}
 		if e.typ == tar.TypeDir {
 			h.Size = 0
