@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,65 @@ type supervisorStoreFake struct {
 	advanceCalls   int
 	diagnostics    SessionLifecycleDiagnostics
 	diagnosticsErr error
+}
+
+type cancelAwareSupervisorStore struct{ *supervisorStoreFake }
+
+func (store cancelAwareSupervisorStore) AdvanceSessionStatus(ctx context.Context, epoch, fence uint64, next SessionStatus) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return store.supervisorStoreFake.AdvanceSessionStatus(ctx, epoch, fence, next)
+}
+
+type blockingReadyFailureStore struct {
+	*supervisorStoreFake
+	mu      sync.Mutex
+	entered chan struct{}
+	release <-chan struct{}
+	failed  bool
+}
+
+type blockingLifecycleFailureStore struct {
+	*supervisorStoreFake
+	mu       sync.Mutex
+	state    string
+	entered  chan struct{}
+	release  <-chan struct{}
+	canceled bool
+	blocked  bool
+}
+
+func (store *blockingLifecycleFailureStore) AdvanceSessionStatus(ctx context.Context, epoch, fence uint64, next SessionStatus) error {
+	store.mu.Lock()
+	block := next.State == store.state && !store.blocked
+	if block {
+		store.blocked = true
+		close(store.entered)
+	}
+	store.mu.Unlock()
+	if block {
+		if store.canceled {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		<-store.release
+		return errors.New("genuine lifecycle persistence failure")
+	}
+	return store.supervisorStoreFake.AdvanceSessionStatus(ctx, epoch, fence, next)
+}
+
+func (store *blockingReadyFailureStore) AdvanceSessionStatus(ctx context.Context, epoch, fence uint64, next SessionStatus) error {
+	store.mu.Lock()
+	if next.State == SessionReady && !store.failed {
+		store.failed = true
+		close(store.entered)
+		store.mu.Unlock()
+		<-store.release
+		return errors.New("ready persistence failed")
+	}
+	store.mu.Unlock()
+	return store.supervisorStoreFake.AdvanceSessionStatus(ctx, epoch, fence, next)
 }
 
 func (store *supervisorStoreFake) BeginSessionEpoch(_ context.Context, at time.Time) (SessionStatus, error) {
@@ -104,6 +164,50 @@ type supervisorCompleterCapture struct {
 	err   error
 }
 
+type supervisorBlockingCompleter struct {
+	entered chan context.Context
+	release <-chan struct{}
+}
+
+func (completer supervisorBlockingCompleter) CompleteRotationAfterFencedReady(ctx context.Context, _ string, _ string, _ uint64, _ uint64) error {
+	completer.entered <- ctx
+	<-completer.release
+	return ctx.Err()
+}
+
+type supervisorFailingBlockingCompleter struct {
+	entered chan struct{}
+	release <-chan struct{}
+	err     error
+}
+
+type blockingPendingControlHandler struct {
+	entered  chan struct{}
+	release  <-chan struct{}
+	canceled bool
+	once     sync.Once
+}
+
+func (*blockingPendingControlHandler) requiresSessionFence() bool { return true }
+func (handler *blockingPendingControlHandler) Pending(ctx context.Context, _ SessionControlContext, _ int) ([]protocol.Frame, error) {
+	handler.once.Do(func() { close(handler.entered) })
+	if handler.canceled {
+		<-ctx.Done()
+		return nil, canceledControlFailure(controlErrorPersistence)
+	}
+	<-handler.release
+	return nil, controlFailure(controlErrorPersistence)
+}
+func (*blockingPendingControlHandler) Handle(context.Context, SessionControlContext, protocol.Frame) (SessionControlResult, error) {
+	return SessionControlResult{Action: ControlContinue}, nil
+}
+
+func (completer supervisorFailingBlockingCompleter) CompleteRotationAfterFencedReady(context.Context, string, string, uint64, uint64) error {
+	close(completer.entered)
+	<-completer.release
+	return completer.err
+}
+
 // legacyOnlySessionControlRepository intentionally exposes the historical
 // control repository surface while hiding the fenced extension. It verifies
 // that supervised production construction cannot silently downgrade fencing.
@@ -181,6 +285,13 @@ func (runner *supervisorRunnerFake) callCount() int {
 	return runner.calls
 }
 
+func observedSupervisorRunnerCancellation(ctx context.Context) error {
+	if errors.Is(context.Cause(ctx), errSupervisorReconcile) {
+		return errSessionCancellationObserved
+	}
+	return ctx.Err()
+}
+
 func waitSupervisorState(t *testing.T, supervisor *Supervisor, paused bool) {
 	t.Helper()
 	deadline := time.After(time.Second)
@@ -209,6 +320,19 @@ func waitRunnerCalls(t *testing.T, runner *supervisorRunnerFake, want int) {
 		case <-time.After(time.Millisecond):
 		}
 	}
+}
+
+func observeSupervisorReadyAttempt(ctx context.Context, transport *SessionTransport, pending bool) error {
+	for _, event := range []sessionTransportLifecycleEvent{
+		testLifecycleEvent(SessionTransportConnecting, sessionTestKeyID, false),
+		testLifecycleEvent(SessionTransportAuthenticating, sessionTestKeyID, false),
+		{SessionTransportEvent: SessionTransportEvent{Stage: SessionTransportReady, Pending: pending}, ControllerID: sessionTestControllerID, KeyID: sessionTestKeyID},
+	} {
+		if err := observeTestLifecycle(ctx, transport, event); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func TestSupervisorFencesTransportStagesAndFallbackFromOwnedStatus(t *testing.T) {
@@ -441,6 +565,825 @@ func TestSupervisorRunRecoversBeforeDialRetriesWithoutRecoveryAndResumesWithReco
 	}
 	if store.status.State != SessionStopped {
 		t.Fatalf("canceled run did not persist stopped: %#v", store.status)
+	}
+}
+
+func TestSupervisorReconcileReadySessionIsImmediateAndConcurrentBurstCoalesces(t *testing.T) {
+	transport := &SessionTransport{}
+	config := DefaultSupervisorConfig()
+	var sleepMu sync.Mutex
+	var sleeps int
+	config.Sleep = func(context.Context, time.Duration) error {
+		sleepMu.Lock()
+		sleeps++
+		sleepMu.Unlock()
+		return nil
+	}
+	supervisor, err := NewSupervisor(transport, &supervisorStoreFake{}, &supervisorRecoveryFake{}, supervisorCompleterFake{}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan int, 2)
+	releaseFirst := make(chan struct{})
+	runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+		if err := observeSupervisorReadyAttempt(ctx, transport, false); err != nil {
+			return err
+		}
+		ready <- call
+		<-ctx.Done()
+		if call == 1 {
+			<-releaseFirst
+		}
+		return observedSupervisorRunnerCancellation(ctx)
+	}}
+	supervisor.runner = runner
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- supervisor.Run(ctx) }()
+	if call := <-ready; call != 1 {
+		t.Fatalf("first ready call=%d", call)
+	}
+
+	const callers = 1000
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for index := 0; index < callers; index++ {
+		go func() {
+			defer wait.Done()
+			supervisor.Reconcile()
+		}()
+	}
+	wait.Wait()
+	close(releaseFirst)
+	if call := <-ready; call != 2 {
+		t.Fatalf("replacement ready call=%d", call)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if calls := runner.callCount(); calls != 2 {
+		t.Fatalf("reconcile burst RunOnce calls=%d want 2", calls)
+	}
+	sleepMu.Lock()
+	gotSleeps := sleeps
+	sleepMu.Unlock()
+	if gotSleeps != 0 {
+		t.Fatalf("reconcile used ordinary backoff sleeps=%d", gotSleeps)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupervisorReconcileDuringReplacementHandshakeIsNotLost(t *testing.T) {
+	transport := &SessionTransport{}
+	store := cancelAwareSupervisorStore{supervisorStoreFake: &supervisorStoreFake{}}
+	supervisor, err := NewSupervisor(transport, store, &supervisorRecoveryFake{}, supervisorCompleterFake{}, DefaultSupervisorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReady := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	replacementPrepared := make(chan struct{})
+	releaseReplacementReady := make(chan struct{})
+	thirdReady := make(chan struct{})
+	runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+		switch call {
+		case 1:
+			if err := observeSupervisorReadyAttempt(ctx, transport, false); err != nil {
+				return err
+			}
+			close(firstReady)
+			<-ctx.Done()
+			<-releaseFirst
+			return observedSupervisorRunnerCancellation(ctx)
+		case 2:
+			for _, event := range []sessionTransportLifecycleEvent{testLifecycleEvent(SessionTransportConnecting, sessionTestKeyID, false), testLifecycleEvent(SessionTransportAuthenticating, sessionTestKeyID, false)} {
+				if err := observeTestLifecycle(ctx, transport, event); err != nil {
+					return err
+				}
+			}
+			close(replacementPrepared)
+			<-releaseReplacementReady
+			ready := sessionTransportLifecycleEvent{SessionTransportEvent: SessionTransportEvent{Stage: SessionTransportReady}, ControllerID: sessionTestControllerID, KeyID: sessionTestKeyID}
+			if err := observeTestLifecycle(ctx, transport, ready); err != nil {
+				return err
+			}
+			return observedSupervisorRunnerCancellation(ctx)
+		default:
+			if err := observeSupervisorReadyAttempt(ctx, transport, false); err != nil {
+				return err
+			}
+			close(thirdReady)
+			<-ctx.Done()
+			return observedSupervisorRunnerCancellation(ctx)
+		}
+	}}
+	supervisor.runner = runner
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- supervisor.Run(ctx) }()
+	<-firstReady
+	supervisor.Reconcile()
+	close(releaseFirst)
+	<-replacementPrepared
+	supervisor.Reconcile()
+	close(releaseReplacementReady)
+	select {
+	case <-thirdReady:
+	case <-time.After(time.Second):
+		t.Fatalf("newer replacement-handshake mutation was lost; calls=%d", runner.callCount())
+	}
+	if calls := runner.callCount(); calls != 3 {
+		t.Fatalf("replacement-handshake RunOnce calls=%d want 3", calls)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupervisorReconcileCancellationDuringLifecyclePersistenceRefreshes(t *testing.T) {
+	for _, state := range []string{SessionConnecting, SessionAuthenticating} {
+		t.Run(state, func(t *testing.T) {
+			transport := &SessionTransport{}
+			store := &blockingLifecycleFailureStore{supervisorStoreFake: &supervisorStoreFake{}, state: state, entered: make(chan struct{}), canceled: true}
+			supervisor, err := NewSupervisor(transport, store, &supervisorRecoveryFake{}, supervisorCompleterFake{}, DefaultSupervisorConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondStarted := make(chan struct{})
+			runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+				if call == 1 {
+					if err := observeTestLifecycle(ctx, transport, testLifecycleEvent(SessionTransportConnecting, sessionTestKeyID, false)); err != nil {
+						return err
+					}
+					return observeTestLifecycle(ctx, transport, testLifecycleEvent(SessionTransportAuthenticating, sessionTestKeyID, false))
+				}
+				close(secondStarted)
+				<-ctx.Done()
+				return ctx.Err()
+			}}
+			supervisor.runner = runner
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- supervisor.Run(ctx) }()
+			<-store.entered
+			supervisor.Reconcile()
+			select {
+			case <-secondStarted:
+			case <-time.After(time.Second):
+				t.Fatalf("reconcile cancellation during %s persistence paused supervisor", state)
+			}
+			if supervisor.Snapshot().Paused {
+				t.Fatalf("reconcile cancellation during %s entered needs_attention", state)
+			}
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSupervisorGenuineLifecycleFailureRacingReconcileRequiresResume(t *testing.T) {
+	transport := &SessionTransport{}
+	release := make(chan struct{})
+	store := &blockingLifecycleFailureStore{supervisorStoreFake: &supervisorStoreFake{}, state: SessionConnecting, entered: make(chan struct{}), release: release}
+	supervisor, err := NewSupervisor(transport, store, &supervisorRecoveryFake{}, supervisorCompleterFake{}, DefaultSupervisorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStarted := make(chan struct{})
+	runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+		if call == 1 {
+			return observeTestLifecycle(ctx, transport, testLifecycleEvent(SessionTransportConnecting, sessionTestKeyID, false))
+		}
+		close(secondStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	supervisor.runner = runner
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- supervisor.Run(ctx) }()
+	<-store.entered
+	supervisor.Reconcile()
+	close(release)
+	waitSupervisorState(t, supervisor, true)
+	select {
+	case <-secondStarted:
+		t.Fatal("genuine lifecycle failure was masked by reconcile")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := supervisor.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("explicit Resume did not restart after genuine lifecycle failure")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupervisorReconcileCancellationDuringInitialPendingControlsRefreshes(t *testing.T) {
+	transport := &SessionTransport{config: DefaultSessionTransportConfig()}
+	handler := &blockingPendingControlHandler{entered: make(chan struct{}), canceled: true}
+	transport.config.ControlHandler = handler
+	supervisor, err := NewSupervisor(transport, &supervisorStoreFake{}, &supervisorRecoveryFake{}, supervisorCompleterFake{}, DefaultSupervisorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStarted := make(chan struct{})
+	runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+		if call == 1 {
+			if err := observeSupervisorReadyAttempt(ctx, transport, false); err != nil {
+				return err
+			}
+			now := time.Now().UTC()
+			session := &activeControllerSession{transport: transport, conn: newBlockingSessionSocket(), controllerID: sessionTestControllerID, keyID: sessionTestKeyID, sessionID: sessionTestSessionID, maxEnvelopeBytes: protocol.DefaultMaxEnvelopeBytes, maxOutstanding: 4, heartbeatInterval: time.Minute, expiresAt: now.Add(time.Hour)}
+			return session.run(ctx)
+		}
+		close(secondStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	supervisor.runner = runner
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- supervisor.Run(ctx) }()
+	<-handler.entered
+	supervisor.Reconcile()
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile cancellation during initial Pending paused supervisor")
+	}
+	if supervisor.Snapshot().Paused {
+		t.Fatal("reconcile cancellation during initial Pending entered needs_attention")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupervisorGenuinePendingControlFailureRacingReconcileRequiresResume(t *testing.T) {
+	transport := &SessionTransport{config: DefaultSessionTransportConfig()}
+	release := make(chan struct{})
+	handler := &blockingPendingControlHandler{entered: make(chan struct{}), release: release}
+	transport.config.ControlHandler = handler
+	supervisor, err := NewSupervisor(transport, &supervisorStoreFake{}, &supervisorRecoveryFake{}, supervisorCompleterFake{}, DefaultSupervisorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStarted := make(chan struct{})
+	runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+		if call == 1 {
+			if err := observeSupervisorReadyAttempt(ctx, transport, false); err != nil {
+				return err
+			}
+			now := time.Now().UTC()
+			session := &activeControllerSession{transport: transport, conn: newBlockingSessionSocket(), controllerID: sessionTestControllerID, keyID: sessionTestKeyID, sessionID: sessionTestSessionID, maxEnvelopeBytes: protocol.DefaultMaxEnvelopeBytes, maxOutstanding: 4, heartbeatInterval: time.Minute, expiresAt: now.Add(time.Hour)}
+			return session.run(ctx)
+		}
+		close(secondStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	supervisor.runner = runner
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- supervisor.Run(ctx) }()
+	<-handler.entered
+	supervisor.Reconcile()
+	close(release)
+	waitSupervisorState(t, supervisor, true)
+	select {
+	case <-secondStarted:
+		t.Fatal("genuine Pending control failure was masked by reconcile")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := supervisor.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("explicit Resume did not restart after genuine Pending control failure")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupervisorReconcileDuringPendingReadyCompletionWaitsThenRefreshes(t *testing.T) {
+	transport := &SessionTransport{}
+	completionEntered := make(chan context.Context, 1)
+	releaseCompletion := make(chan struct{})
+	completer := supervisorBlockingCompleter{entered: completionEntered, release: releaseCompletion}
+	supervisor, err := NewSupervisor(transport, &supervisorStoreFake{}, &supervisorRecoveryFake{}, completer, DefaultSupervisorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReady := make(chan struct{})
+	thirdReady := make(chan struct{})
+	runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+		if err := observeSupervisorReadyAttempt(ctx, transport, call == 2); err != nil {
+			return err
+		}
+		switch call {
+		case 1:
+			close(firstReady)
+		case 3:
+			close(thirdReady)
+		}
+		<-ctx.Done()
+		return observedSupervisorRunnerCancellation(ctx)
+	}}
+	supervisor.runner = runner
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- supervisor.Run(ctx) }()
+	<-firstReady
+	supervisor.Reconcile()
+	completionCtx := <-completionEntered
+	supervisor.Reconcile()
+	select {
+	case <-completionCtx.Done():
+		t.Fatal("reconcile canceled fenced pending completion before it committed")
+	default:
+	}
+	close(releaseCompletion)
+	select {
+	case <-thirdReady:
+	case <-time.After(time.Second):
+		t.Fatalf("mutation racing pending Ready completion was lost; calls=%d", runner.callCount())
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupervisorReadyPersistenceFailureRacingReconcileRequiresResume(t *testing.T) {
+	transport := &SessionTransport{}
+	releaseReady := make(chan struct{})
+	store := &blockingReadyFailureStore{supervisorStoreFake: &supervisorStoreFake{}, entered: make(chan struct{}), release: releaseReady}
+	supervisor, err := NewSupervisor(transport, store, &supervisorRecoveryFake{}, supervisorCompleterFake{}, DefaultSupervisorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStarted := make(chan struct{})
+	runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+		if call == 1 {
+			return observeSupervisorReadyAttempt(ctx, transport, false)
+		}
+		close(secondStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	supervisor.runner = runner
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- supervisor.Run(ctx) }()
+	<-store.entered
+	supervisor.Reconcile()
+	close(releaseReady)
+	waitSupervisorState(t, supervisor, true)
+	select {
+	case <-secondStarted:
+		t.Fatal("Ready persistence failure was masked by reconcile")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := supervisor.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("explicit Resume did not restart after Ready persistence failure")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupervisorPendingCompletionFailureRacingReconcileRequiresResume(t *testing.T) {
+	transport := &SessionTransport{}
+	releaseCompletion := make(chan struct{})
+	completer := supervisorFailingBlockingCompleter{entered: make(chan struct{}), release: releaseCompletion, err: controlFailure(controlErrorPersistence)}
+	supervisor, err := NewSupervisor(transport, &supervisorStoreFake{}, &supervisorRecoveryFake{}, completer, DefaultSupervisorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStarted := make(chan struct{})
+	runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+		if call == 1 {
+			return observeSupervisorReadyAttempt(ctx, transport, true)
+		}
+		close(secondStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	supervisor.runner = runner
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- supervisor.Run(ctx) }()
+	<-completer.entered
+	supervisor.Reconcile()
+	close(releaseCompletion)
+	waitSupervisorState(t, supervisor, true)
+	select {
+	case <-secondStarted:
+		t.Fatal("pending completion failure was masked by reconcile")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := supervisor.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("explicit Resume did not restart after pending completion failure")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupervisorReconcileAfterFatalRunOnceReturnDoesNotMaskFailure(t *testing.T) {
+	supervisor, err := NewSupervisor(&SessionTransport{}, &supervisorStoreFake{}, &supervisorRecoveryFake{}, supervisorCompleterFake{}, DefaultSupervisorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStarted := make(chan struct{})
+	runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+		if call == 1 {
+			return sessionFailure(sessionErrorProtocol, true)
+		}
+		close(secondStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	supervisor.runner = runner
+	returned := make(chan struct{})
+	releaseReturn := make(chan struct{})
+	supervisor.afterRunOnce = func() {
+		close(returned)
+		<-releaseReturn
+		supervisor.afterRunOnce = nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- supervisor.Run(ctx) }()
+	<-returned
+	supervisor.Reconcile()
+	close(releaseReturn)
+	waitSupervisorState(t, supervisor, true)
+	select {
+	case <-secondStarted:
+		t.Fatal("post-return reconcile masked a genuine fatal result")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := supervisor.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("explicit Resume did not restart after genuine fatal result")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupervisorLateReconcileAfterCompletedRunOncePreservesDisconnectAndBackoff(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		result error
+	}{
+		{name: "nonfatal", result: sessionFailure(sessionErrorRelayUnavailable, false)},
+		{name: "nil maps connection closed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &supervisorStoreFake{}
+			backoff := make(chan SupervisorSnapshot, 1)
+			config := DefaultSupervisorConfig()
+			var supervisor *Supervisor
+			config.Sleep = func(ctx context.Context, _ time.Duration) error {
+				backoff <- supervisor.Snapshot()
+				<-ctx.Done()
+				if errors.Is(context.Cause(ctx), errSupervisorReconcile) {
+					return errSupervisorBackoffCancellationObserved
+				}
+				return ctx.Err()
+			}
+			var err error
+			supervisor, err = NewSupervisor(&SessionTransport{}, store, &supervisorRecoveryFake{}, supervisorCompleterFake{}, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondStarted := make(chan struct{})
+			runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+				if call == 1 {
+					return test.result
+				}
+				close(secondStarted)
+				<-ctx.Done()
+				return observedSupervisorRunnerCancellation(ctx)
+			}}
+			supervisor.runner = runner
+			returned := make(chan struct{})
+			releaseReturn := make(chan struct{})
+			supervisor.afterRunOnce = func() {
+				supervisor.afterRunOnce = nil
+				close(returned)
+				<-releaseReturn
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- supervisor.Run(ctx) }()
+			<-returned
+			supervisor.Reconcile()
+			close(releaseReturn)
+
+			select {
+			case snapshot := <-backoff:
+				if snapshot.State != SessionBackoff {
+					t.Fatalf("snapshot state=%q want %q", snapshot.State, SessionBackoff)
+				}
+				store.mu.Lock()
+				status := store.status
+				store.mu.Unlock()
+				if status.ErrorCode != ErrorRelayUnavailable || status.Attempt != 1 {
+					t.Fatalf("backoff status=%#v", status)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("completed RunOnce result was mislabeled as reconcile cancellation")
+			}
+			select {
+			case <-secondStarted:
+			case <-time.After(time.Second):
+				t.Fatal("queued reconcile did not cancel the installed backoff")
+			}
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSupervisorLateReconcileAfterBackoffSleepReturnDoesNotRelabelResult(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		sleepError error
+		wantSecond bool
+	}{
+		{name: "completed sleep", wantSecond: true},
+		{name: "independent sleep failure", sleepError: errors.New("independent sleep failure")},
+		{name: "independent canceled sleep", sleepError: context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &supervisorStoreFake{}
+			config := DefaultSupervisorConfig()
+			config.Sleep = func(context.Context, time.Duration) error { return test.sleepError }
+			supervisor, err := NewSupervisor(&SessionTransport{}, store, &supervisorRecoveryFake{}, supervisorCompleterFake{}, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondStarted := make(chan struct{})
+			runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+				if call == 1 {
+					return sessionFailure(sessionErrorRelayUnavailable, false)
+				}
+				close(secondStarted)
+				<-ctx.Done()
+				return observedSupervisorRunnerCancellation(ctx)
+			}}
+			supervisor.runner = runner
+			sleepReturned := make(chan struct{})
+			releaseSleep := make(chan struct{})
+			supervisor.afterBackoffSleep = func() {
+				supervisor.afterBackoffSleep = nil
+				close(sleepReturned)
+				<-releaseSleep
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- supervisor.Run(ctx) }()
+			<-sleepReturned
+			supervisor.Reconcile()
+			close(releaseSleep)
+
+			if test.wantSecond {
+				select {
+				case <-secondStarted:
+				case <-time.After(time.Second):
+					t.Fatal("completed backoff did not enter the next attempt")
+				}
+				cancel()
+			} else {
+				select {
+				case <-secondStarted:
+					t.Fatal("late reconcile masked an independent backoff failure")
+				case err := <-done:
+					if err != nil {
+						t.Fatal(err)
+					}
+					if store.status.State != SessionStopped {
+						t.Fatalf("sleep failure state=%q want %q", store.status.State, SessionStopped)
+					}
+					return
+				case <-time.After(time.Second):
+					t.Fatal("supervisor did not stop after independent backoff failure")
+				}
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSupervisorSleepCancellationAttributionRequiresExactCause(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		context    func() context.Context
+		wantMarker bool
+		wantError  error
+	}{
+		{
+			name: "supervisor reconcile",
+			context: func() context.Context {
+				ctx, cancel := context.WithCancelCause(context.Background())
+				cancel(errSupervisorReconcile)
+				return ctx
+			},
+			wantMarker: true,
+		},
+		{
+			name: "ordinary cancellation",
+			context: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			wantError: context.Canceled,
+		},
+		{
+			name: "deadline",
+			context: func() context.Context {
+				ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				defer cancel()
+				return ctx
+			},
+			wantError: context.DeadlineExceeded,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := supervisorSleep(test.context(), time.Hour)
+			if test.wantMarker {
+				if !errors.Is(err, errSupervisorBackoffCancellationObserved) {
+					t.Fatalf("sleep error = %v, want observed reconcile marker", err)
+				}
+				return
+			}
+			if !errors.Is(err, test.wantError) || errors.Is(err, errSupervisorBackoffCancellationObserved) {
+				t.Fatalf("sleep error = %v, want %v without reconcile marker", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestSupervisorReconcileBeforeFirstRunIsAppliedByInitialReady(t *testing.T) {
+	transport := &SessionTransport{}
+	supervisor, err := NewSupervisor(transport, &supervisorStoreFake{}, &supervisorRecoveryFake{}, supervisorCompleterFake{}, DefaultSupervisorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 1000; index++ {
+		supervisor.Reconcile()
+	}
+	ready := make(chan int, 2)
+	runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+		if err := observeSupervisorReadyAttempt(ctx, transport, false); err != nil {
+			return err
+		}
+		ready <- call
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	supervisor.runner = runner
+	firstCtx, firstCancel := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- supervisor.Run(firstCtx) }()
+	if call := <-ready; call != 1 {
+		t.Fatalf("initial Ready call=%d", call)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if calls := runner.callCount(); calls != 1 {
+		t.Fatalf("pre-first-Run reconcile caused extra refresh calls=%d", calls)
+	}
+	supervisor.mu.RLock()
+	requested, applied, target := supervisor.reconcileRequested, supervisor.reconcileApplied, supervisor.reconcileTarget
+	supervisor.mu.RUnlock()
+	if requested != 1 || applied != 1 || target != 1 {
+		t.Fatalf("initial reconcile generations requested=%d applied=%d target=%d", requested, applied, target)
+	}
+	firstCancel()
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+
+	// A call after a completed Run must not cross into a later generation.
+	supervisor.Reconcile()
+	secondCtx, secondCancel := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- supervisor.Run(secondCtx) }()
+	if call := <-ready; call != 2 {
+		t.Fatalf("second generation Ready call=%d", call)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if calls := runner.callCount(); calls != 2 {
+		t.Fatalf("stopped reconcile crossed Run generation calls=%d", calls)
+	}
+	secondCancel()
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupervisorReconcileDoesNotResumeFatalPause(t *testing.T) {
+	supervisor, err := NewSupervisor(&SessionTransport{}, &supervisorStoreFake{}, &supervisorRecoveryFake{}, supervisorCompleterFake{}, DefaultSupervisorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &supervisorRunnerFake{run: func(context.Context, int) error { return sessionFailure(sessionErrorProtocol, true) }}
+	supervisor.runner = runner
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- supervisor.Run(ctx) }()
+	waitSupervisorState(t, supervisor, true)
+	for index := 0; index < 1000; index++ {
+		supervisor.Reconcile()
+	}
+	time.Sleep(20 * time.Millisecond)
+	if calls := runner.callCount(); calls != 1 {
+		t.Fatalf("reconcile resumed fatal pause calls=%d", calls)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupervisorShutdownWinsAndReconcileDoesNotCrossRunGeneration(t *testing.T) {
+	started := make(chan int, 2)
+	supervisor, err := NewSupervisor(&SessionTransport{}, &supervisorStoreFake{}, &supervisorRecoveryFake{}, supervisorCompleterFake{}, DefaultSupervisorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+		started <- call
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	supervisor.runner = runner
+	firstCtx, firstCancel := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- supervisor.Run(firstCtx) }()
+	<-started
+	firstCancel()
+	supervisor.Reconcile()
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	supervisor.Reconcile()
+
+	secondCtx, secondCancel := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- supervisor.Run(secondCtx) }()
+	if call := <-started; call != 2 {
+		t.Fatalf("second generation first call=%d", call)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if calls := runner.callCount(); calls != 2 {
+		t.Fatalf("stale reconcile crossed Run generations calls=%d", calls)
+	}
+	secondCancel()
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1013,6 +1956,149 @@ func TestBlockingTransportObserverIsBoundedAndFailsClosed(t *testing.T) {
 		t.Fatalf("second observer while blocked error=%v", err)
 	}
 	close(release)
+}
+
+func TestSupervisorReconcileDuringExternalObserverDrainsBeforeReplacement(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var observerCalls atomic.Int32
+	transport := &SessionTransport{observer: func(context.Context, SessionTransportEvent) error {
+		if observerCalls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return nil
+	}}
+	supervisor, err := NewSupervisor(transport, &supervisorStoreFake{}, &supervisorRecoveryFake{}, supervisorCompleterFake{}, DefaultSupervisorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStarted := make(chan struct{})
+	runner := &supervisorRunnerFake{run: func(ctx context.Context, call int) error {
+		if err := observeTestLifecycle(ctx, transport, testLifecycleEvent(SessionTransportConnecting, sessionTestKeyID, false)); err != nil {
+			return err
+		}
+		if call == 2 {
+			close(secondStarted)
+		}
+		<-ctx.Done()
+		return observedSupervisorRunnerCancellation(ctx)
+	}}
+	supervisor.runner = runner
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- supervisor.Run(ctx) }()
+	<-started
+	supervisor.Reconcile()
+	waitRunnerCalls(t, runner, 2)
+	select {
+	case <-secondStarted:
+		t.Fatal("replacement passed the still-running canceled observer")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if supervisor.Snapshot().Paused {
+		t.Fatal("supervisor paused while a reconcile-canceled observer drained")
+	}
+	close(release)
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not resume after canceled observer drained")
+	}
+	if got := observerCalls.Load(); got != 2 {
+		t.Fatalf("observer calls=%d want 2", got)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportObserverFailuresRemainFatalWithoutCancellationAttribution(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "independent error", err: errors.New("independent observer failure")},
+		{name: "observer returned cancellation", err: context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			transport := &SessionTransport{observer: func(context.Context, SessionTransportEvent) error { return test.err }}
+			event := testLifecycleEvent(SessionTransportConnecting, sessionTestKeyID, false)
+			err := transport.observeLifecycle(context.Background(), &event)
+			info, ok := ClassifySessionTransportError(err)
+			if !ok || info.Code != sessionErrorPersistence || !info.Fatal {
+				t.Fatalf("observer error classified as %#v, %t", info, ok)
+			}
+			if strings.Contains(err.Error(), test.err.Error()) {
+				t.Fatalf("observer error leaked callback detail: %v", err)
+			}
+		})
+	}
+}
+
+func TestTransportObserverPublishedFailureWinsReconcileCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "genuine error", err: errors.New("published observer failure")},
+		{name: "independent cancellation", err: context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			observerStarted := make(chan struct{})
+			releaseObserver := make(chan struct{})
+			beforeReconcileLock := make(chan struct{})
+			releaseReconcileLock := make(chan struct{})
+			transport := &SessionTransport{observer: func(context.Context, SessionTransportEvent) error {
+				close(observerStarted)
+				<-releaseObserver
+				return test.err
+			}}
+			transport.beforeObserverReconcileLock = func() {
+				close(beforeReconcileLock)
+				<-releaseReconcileLock
+			}
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(context.Canceled)
+			result := make(chan error, 1)
+			go func() {
+				event := testLifecycleEvent(SessionTransportConnecting, sessionTestKeyID, false)
+				result <- transport.observeLifecycle(ctx, &event)
+			}()
+			<-observerStarted
+			cancel(errSupervisorReconcile)
+			<-beforeReconcileLock
+			close(releaseObserver)
+
+			deadline := time.Now().Add(time.Second)
+			for {
+				transport.observerMu.Lock()
+				busy := transport.observerBusy
+				transport.observerMu.Unlock()
+				if !busy {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("observer result was not published before reconcile linearization")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			close(releaseReconcileLock)
+
+			err := <-result
+			info, ok := ClassifySessionTransportError(err)
+			if !ok || info.Code != sessionErrorPersistence || !info.Fatal {
+				t.Fatalf("published observer failure classified as %#v, %t", info, ok)
+			}
+			if errors.Is(err, errSessionCancellationObserved) {
+				t.Fatalf("published observer failure was replaced by reconcile marker: %v", err)
+			}
+			if strings.Contains(err.Error(), test.err.Error()) {
+				t.Fatalf("observer failure leaked callback detail: %v", err)
+			}
+		})
+	}
 }
 
 func TestSupervisorPendingReadyCompleterUsesExactFenceAndFailsClosed(t *testing.T) {

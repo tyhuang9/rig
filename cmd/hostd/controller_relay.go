@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controllerrelay"
 	"github.com/hostd/hostd/internal/relay/protocol"
+	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
 const controllerRelayShutdownTimeout = 10 * time.Second
@@ -17,21 +19,128 @@ const controllerRelayShutdownTimeout = 10 * time.Second
 type controllerRelayRunner interface {
 	Run(context.Context) error
 	Snapshot() controllerrelay.SupervisorSnapshot
+	Reconcile()
 }
 
 type controllerRelayFactory func() (controllerRelayRunner, error)
 
+// controllerRelayRuntime retains the single dependency graph shared by relay
+// lifecycle and management operations. These references are immutable after
+// construction; the management target controls concurrent publication.
+type controllerRelayRuntime struct {
+	repository  *controllerrelay.Repository
+	credentials *controllerrelay.FileCredentialStore
+	client      *controllerrelay.RelayHTTPSClient
+	enrollment  *controllerrelay.EnrollmentService
+	controls    *controllerrelay.SessionControlService
+	supervisor  *controllerrelay.Supervisor
+}
+
+func (runtime *controllerRelayRuntime) Run(ctx context.Context) error {
+	return runtime.supervisor.Run(ctx)
+}
+
+func (runtime *controllerRelayRuntime) Snapshot() controllerrelay.SupervisorSnapshot {
+	if runtime == nil || runtime.supervisor == nil {
+		return controllerrelay.SupervisorSnapshot{}
+	}
+	return runtime.supervisor.Snapshot()
+}
+
+func (runtime *controllerRelayRuntime) Reconcile() {
+	if runtime != nil && runtime.supervisor != nil {
+		runtime.supervisor.Reconcile()
+	}
+}
+
+// controllerRelayManagementTarget is the host-owned publication point used by
+// lifecycle startup and, later, controller APIs. Reconcile calls made while
+// asynchronous construction is pending are collapsed into one replay.
+type controllerRelayManagementTarget struct {
+	mu          sync.RWMutex
+	runner      controllerRelayRunner
+	runtime     *controllerRelayRuntime
+	pending     bool
+	unavailable bool
+}
+
+func newControllerRelayManagementTarget() *controllerRelayManagementTarget {
+	return &controllerRelayManagementTarget{}
+}
+
+func (target *controllerRelayManagementTarget) Reconcile() {
+	if target == nil {
+		return
+	}
+	target.mu.Lock()
+	if target.unavailable {
+		target.mu.Unlock()
+		return
+	}
+	runner := target.runner
+	if runner == nil {
+		target.pending = true
+		target.mu.Unlock()
+		return
+	}
+	target.mu.Unlock()
+	runner.Reconcile()
+}
+
+func (target *controllerRelayManagementTarget) install(runner controllerRelayRunner) bool {
+	if target == nil || runner == nil {
+		return false
+	}
+	target.mu.Lock()
+	if target.runner != nil || target.unavailable {
+		target.mu.Unlock()
+		return false
+	}
+	target.runner = runner
+	target.runtime, _ = runner.(*controllerRelayRuntime)
+	pending := target.pending
+	target.pending = false
+	target.mu.Unlock()
+	if pending {
+		runner.Reconcile()
+	}
+	return true
+}
+
+func (target *controllerRelayManagementTarget) markUnavailable() {
+	if target == nil {
+		return
+	}
+	target.mu.Lock()
+	if target.runner == nil {
+		target.pending = false
+		target.unavailable = true
+	}
+	target.mu.Unlock()
+}
+
+func (target *controllerRelayManagementTarget) current() (*controllerRelayRuntime, bool) {
+	if target == nil {
+		return nil, false
+	}
+	target.mu.RLock()
+	defer target.mu.RUnlock()
+	return target.runtime, target.runtime != nil && !target.unavailable
+}
+
 // startControllerRelay is deliberately a no-op before invoking its factory
 // unless the paired controller relay configuration enabled it.
-func startControllerRelay(ctx context.Context, cfg config.Config, logger *slog.Logger, factory controllerRelayFactory) <-chan struct{} {
+func startControllerRelay(ctx context.Context, cfg config.Config, logger *slog.Logger, target *controllerRelayManagementTarget, factory controllerRelayFactory) <-chan struct{} {
 	done := make(chan struct{})
 	if !cfg.ControllerRelay {
+		target.markUnavailable()
 		close(done)
 		return done
 	}
 	go func() {
 		defer close(done)
 		if factory == nil {
+			target.markUnavailable()
 			logger.Warn("controller relay unavailable", "outcome", "persistence_unavailable")
 			return
 		}
@@ -40,6 +149,12 @@ func startControllerRelay(ctx context.Context, cfg config.Config, logger *slog.L
 			// Construction must not make the primary host or manual deployments
 			// unavailable. Never attach an arbitrary construction error because it
 			// may include credential-provider or endpoint detail.
+			target.markUnavailable()
+			logger.Warn("controller relay unavailable", "outcome", "persistence_unavailable")
+			return
+		}
+		if !target.install(runner) {
+			target.markUnavailable()
 			logger.Warn("controller relay unavailable", "outcome", "persistence_unavailable")
 			return
 		}
@@ -61,8 +176,8 @@ func waitForControllerRelay(done <-chan struct{}, timeout time.Duration, logger 
 	return false
 }
 
-func newControllerRelayRunner(cfg config.Config, db *sql.DB, logger *slog.Logger, wake ...func()) (controllerRelayRunner, error) {
-	if !cfg.ControllerRelay || db == nil || logger == nil {
+func newControllerRelayRuntime(cfg config.Config, db *sql.DB, sources *sourceconnections.Service, logger *slog.Logger, wake ...func()) (*controllerRelayRuntime, error) {
+	if !cfg.ControllerRelay || db == nil || sources == nil || logger == nil {
 		return nil, errors.New("controller relay is unavailable")
 	}
 	repository := controllerrelay.NewRepository(db)
@@ -76,6 +191,14 @@ func newControllerRelayRunner(cfg config.Config, db *sql.DB, logger *slog.Logger
 	}
 	store := &controllerRelayWakeStore{repository: repository, wake: wakeCoordinator}
 	credentials, err := controllerrelay.NewFileCredentialStore(cfg.DataRoot)
+	if err != nil {
+		return nil, err
+	}
+	client, err := controllerrelay.NewRelayHTTPSClient(cfg.RelayOrigin, nil)
+	if err != nil {
+		return nil, err
+	}
+	enrollment, err := controllerrelay.NewEnrollmentService(repository, sources, credentials, client, time.Now, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +227,10 @@ func newControllerRelayRunner(cfg config.Config, db *sql.DB, logger *slog.Logger
 	if err != nil {
 		return nil, err
 	}
-	return supervisor, nil
+	return &controllerRelayRuntime{
+		repository: repository, credentials: credentials, client: client,
+		enrollment: enrollment, controls: controls, supervisor: supervisor,
+	}, nil
 }
 
 // controllerRelayWakeStore preserves the complete durable/fenced session-store
