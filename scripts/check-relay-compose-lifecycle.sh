@@ -610,12 +610,21 @@ assert_persistence_marker() {
   local phase="$1"
   local count
   local error_log="${STATE_DIRECTORY}/persistence-marker-${phase}.stderr.log"
-  prepare_required_log "${error_log}"
-  count="$(compose exec -T postgres \
+  if ! prepare_required_log "${error_log}" 2>/dev/null; then
+    fail "PostgreSQL persistence marker log preparation failed"
+  fi
+  if ! count="$(compose exec -T postgres \
     psql --no-psqlrc --username=rig_relay --dbname=rig_relay --tuples-only --no-align \
     --set ON_ERROR_STOP=1 --set marker="${RUN_TOKEN}" \
-    --command="SELECT count(*) FROM rig_ci_lifecycle_marker WHERE marker = :'marker'" 2>"${error_log}")"
-  chmod 0600 "${error_log}"
+    2>"${error_log}" <<'SQL'
+SELECT count(*) FROM rig_ci_lifecycle_marker WHERE marker = :'marker';
+SQL
+  )"; then
+    fail "PostgreSQL persistence marker query failed"
+  fi
+  if ! chmod 0600 "${error_log}" 2>/dev/null; then
+    fail "PostgreSQL persistence marker log protection failed"
+  fi
   [[ "${count}" == "1" ]] || fail "PostgreSQL persistence marker changed"
 }
 
@@ -623,11 +632,17 @@ query_system_identity() {
   local phase="$1"
   local error_log="${STATE_DIRECTORY}/postgres-system-${phase}.stderr.log"
   local identity
-  prepare_required_log "${error_log}"
-  identity="$(compose exec -T postgres \
+  if ! prepare_required_log "${error_log}" 2>/dev/null; then
+    fail "PostgreSQL system identity log preparation failed"
+  fi
+  if ! identity="$(compose exec -T postgres \
     psql --no-psqlrc --username=rig_relay --dbname=rig_relay --tuples-only --no-align \
-    --set ON_ERROR_STOP=1 --command='SELECT system_identifier FROM pg_control_system()' 2>"${error_log}")"
-  chmod 0600 "${error_log}"
+    --set ON_ERROR_STOP=1 --command='SELECT system_identifier FROM pg_control_system()' 2>"${error_log}")"; then
+    fail "PostgreSQL system identity query failed"
+  fi
+  if ! chmod 0600 "${error_log}" 2>/dev/null; then
+    fail "PostgreSQL system identity log protection failed"
+  fi
   [[ "${identity}" =~ ^[0-9]+$ ]] || fail "PostgreSQL system identity unavailable"
   printf '%s' "${identity}"
 }
@@ -794,16 +809,36 @@ run_lifecycle() {
   CURRENT_PHASE="probe-two"
   probe_relay after
 
-  CURRENT_PHASE="state-two"
-  postgres_after="$(compose ps --quiet postgres)"
-  relay_after="$(compose ps --quiet relay)"
-  volume_after="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Name}}{{end}}{{end}}' "${postgres_after}")"
+  CURRENT_PHASE="state-two-postgres-container-query"
+  if ! postgres_after="$(compose ps --quiet postgres 2>/dev/null)"; then
+    fail "state-two PostgreSQL container query failed"
+  fi
+  if [[ -z "${postgres_after}" || "${postgres_after}" == *$'\n'* || "${postgres_after}" == *$'\r'* ]]; then
+    fail "state-two PostgreSQL container query returned invalid output"
+  fi
+  CURRENT_PHASE="state-two-relay-container-query"
+  if ! relay_after="$(compose ps --quiet relay 2>/dev/null)"; then
+    fail "state-two relay container query failed"
+  fi
+  if [[ -z "${relay_after}" || "${relay_after}" == *$'\n'* || "${relay_after}" == *$'\r'* ]]; then
+    fail "state-two relay container query returned invalid output"
+  fi
+  CURRENT_PHASE="state-two-postgres-volume-query"
+  if ! volume_after="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Name}}{{end}}{{end}}' "${postgres_after}" 2>/dev/null)"; then
+    fail "state-two PostgreSQL volume query failed"
+  fi
+  CURRENT_PHASE="state-two-system-identity-query"
   system_after="$(query_system_identity after)"
 
+  CURRENT_PHASE="state-two-relay-recreation-check"
   [[ "${relay_after}" != "${relay_before}" ]] || fail "relay container was not recreated"
+  CURRENT_PHASE="state-two-postgres-container-check"
   [[ "${postgres_after}" == "${postgres_before}" ]] || fail "PostgreSQL container changed"
+  CURRENT_PHASE="state-two-postgres-volume-check"
   [[ "${volume_after}" == "${volume_before}" ]] || fail "PostgreSQL volume changed"
+  CURRENT_PHASE="state-two-system-identity-check"
   [[ "${system_after}" == "${system_before}" ]] || fail "PostgreSQL system identity changed"
+  CURRENT_PHASE="state-two-persistence-marker-check"
   assert_persistence_marker after
 
   CURRENT_PHASE="migrations-two"
