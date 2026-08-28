@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -16,6 +18,8 @@ import (
 )
 
 const transcriptLimit = 500
+const transcriptByteLimit = 1 << 20
+const transcriptEntryOverhead = 8
 
 type screen uint8
 
@@ -78,12 +82,14 @@ type Model struct {
 	apps           []apicontract.Application
 	jobs           []apicontract.Job
 
-	selectedAppID string
-	entries       []transcriptEntry
-	viewport      viewport.Model
-	commandInput  textinput.Model
-	authInputs    []textinput.Model
-	authIndex     int
+	selectedAppID    string
+	entries          []transcriptEntry
+	transcriptBytes  int
+	transcriptBuilds int
+	viewport         viewport.Model
+	commandInput     textinput.Model
+	authInputs       []textinput.Model
+	authIndex        int
 
 	suggestions          []string
 	suggestion           int
@@ -219,16 +225,43 @@ func (m *Model) checkMe() tea.Cmd {
 func (m *Model) loadOverview() tea.Cmd {
 	client, ctx := m.client, m.ctx
 	return func() tea.Msg {
-		status, err := client.Status(ctx)
-		if err != nil {
-			return overviewMsg{err: err}
+		requestCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		var status apicontract.SystemStatus
+		var apps apicontract.ApplicationList
+		var jobs apicontract.JobList
+		var wg sync.WaitGroup
+		errors := make(chan error, 3)
+		run := func(fetch func(context.Context) error) {
+			defer wg.Done()
+			if err := fetch(requestCtx); err != nil {
+				select {
+				case errors <- err:
+				default:
+				}
+				cancel()
+			}
 		}
-		apps, err := client.Applications(ctx)
-		if err != nil {
+		wg.Add(3)
+		go run(func(callCtx context.Context) (err error) {
+			status, err = client.Status(callCtx)
+			return err
+		})
+		go run(func(callCtx context.Context) (err error) {
+			apps, err = client.Applications(callCtx)
+			return err
+		})
+		go run(func(callCtx context.Context) (err error) {
+			jobs, err = client.Jobs(callCtx)
+			return err
+		})
+		wg.Wait()
+		select {
+		case err := <-errors:
 			return overviewMsg{err: err}
+		default:
+			return overviewMsg{status: status, apps: apps, jobs: jobs}
 		}
-		jobs, err := client.Jobs(ctx)
-		return overviewMsg{status: status, apps: apps, jobs: jobs, err: err}
 	}
 }
 
@@ -540,6 +573,7 @@ func (m *Model) execute(cmd command) tea.Cmd {
 		return nil
 	case "/clear":
 		m.entries = nil
+		m.transcriptBytes = 0
 		m.refreshTranscript()
 		return nil
 	case "/history clear":
@@ -871,14 +905,51 @@ func (m *Model) handleControllerError(err error) tea.Cmd {
 }
 
 func (m *Model) appendEntry(kind entryKind, title, body string) {
-	m.entries = append(m.entries, transcriptEntry{Kind: kind, Title: sanitizeAPIText(title), Body: sanitizeAPIText(body)})
-	if len(m.entries) > transcriptLimit {
-		m.entries = append([]transcriptEntry(nil), m.entries[len(m.entries)-transcriptLimit:]...)
+	entry := transcriptEntry{Kind: kind, Title: sanitizeAPIText(title), Body: sanitizeAPIText(body)}
+	entry = boundTranscriptEntry(entry, transcriptByteLimit)
+	m.entries = append(m.entries, entry)
+	m.transcriptBytes += transcriptEntryBytes(entry)
+	trimmed := 0
+	for len(m.entries)-trimmed > transcriptLimit || m.transcriptBytes > transcriptByteLimit {
+		m.transcriptBytes -= transcriptEntryBytes(m.entries[trimmed])
+		trimmed++
+	}
+	if trimmed > 0 {
+		m.entries = append([]transcriptEntry(nil), m.entries[trimmed:]...)
 	}
 	m.refreshTranscript()
 }
 
+func transcriptEntryBytes(entry transcriptEntry) int {
+	return len(entry.Title) + len(entry.Body) + transcriptEntryOverhead
+}
+
+func boundTranscriptEntry(entry transcriptEntry, limit int) transcriptEntry {
+	limit -= transcriptEntryOverhead
+	if limit <= 0 {
+		return transcriptEntry{Kind: entry.Kind}
+	}
+	entry.Title = truncateUTF8Bytes(entry.Title, limit)
+	entry.Body = truncateUTF8Bytes(entry.Body, limit-len(entry.Title))
+	return entry
+}
+
+func truncateUTF8Bytes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut]
+}
+
 func (m *Model) refreshTranscript() {
+	m.transcriptBuilds++
 	wasBottom := m.viewport.AtBottom()
 	var b strings.Builder
 	for _, entry := range m.entries {
@@ -937,13 +1008,16 @@ func (m *Model) nextHistory() {
 }
 
 func (m *Model) resize() {
+	previousTranscriptWidth := m.viewport.Width
 	m.layout = calculateLayout(m.width, m.height, len(m.suggestions), m.confirm != nil)
 	w := max(1, m.layout.transcript.w-2)
 	h := max(1, m.layout.transcript.h-2)
 	m.viewport.Width, m.viewport.Height = w, h
 	m.commandInput.Width = max(1, m.layout.command.w-4)
 	m.rebuildHitTargets()
-	m.refreshTranscript()
+	if previousTranscriptWidth != w {
+		m.refreshTranscript()
+	}
 }
 
 func (m *Model) selectedAppName() string {

@@ -28,17 +28,21 @@ type Session struct {
 }
 
 // Options configures a Client. A nil HTTPClient gets a safe default timeout.
+// StreamConnectionTimeout bounds one SSE request, including headers and idle body time.
 type Options struct {
-	Endpoint   string
-	HTTPClient *http.Client
-	Timeout    time.Duration
+	Endpoint                string
+	HTTPClient              *http.Client
+	Timeout                 time.Duration
+	StreamConnectionTimeout time.Duration
 }
 
 // Client is safe for concurrent read requests. Concurrent mutations of the same Session should be serialized.
 type Client struct {
-	endpoint   *url.URL
-	origin     string
-	httpClient *http.Client
+	endpoint                *url.URL
+	origin                  string
+	httpClient              *http.Client
+	streamClient            *http.Client
+	streamConnectionTimeout time.Duration
 }
 
 // ProblemError is returned for non-success controller responses.
@@ -74,7 +78,17 @@ func New(options Options) (*Client, error) {
 		}
 		c = &http.Client{Timeout: timeout}
 	}
-	return &Client{endpoint: u, origin: canonicalControllerOrigin(u), httpClient: c}, nil
+	streamConnectionTimeout := options.StreamConnectionTimeout
+	if streamConnectionTimeout <= 0 {
+		streamConnectionTimeout = defaultSSEConnectionTimeout
+	}
+	return &Client{
+		endpoint:                u,
+		origin:                  canonicalControllerOrigin(u),
+		httpClient:              c,
+		streamClient:            newSSEHTTPClient(c, streamConnectionTimeout),
+		streamConnectionTimeout: streamConnectionTimeout,
+	}, nil
 }
 
 func canonicalControllerOrigin(u *url.URL) string {

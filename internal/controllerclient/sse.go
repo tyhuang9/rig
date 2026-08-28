@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hostd/hostd/internal/apicontract"
@@ -19,6 +22,10 @@ const maxSSEEventBytes = 64 << 10
 const maxSSEEventsPerConnection = 1000
 const minSSEReconnectBackoff = 250 * time.Millisecond
 const maxSSEReconnectBackoff = 5 * time.Second
+const defaultSSEConnectionTimeout = 35 * time.Second
+const healthySSEConnectionDuration = 5 * time.Second
+
+var sseStreamSequence atomic.Uint64
 
 // JobEventStream replays events after After and reconnects until its context is cancelled.
 // Errors reports terminal response, decode, and limit failures. It closes when
@@ -33,6 +40,7 @@ type JobEventStream struct {
 func (c *Client) StreamJobEvents(ctx context.Context, session Session, jobID string, after int64) *JobEventStream {
 	events := make(chan apicontract.JobEvent)
 	failures := make(chan error, 1)
+	reconnectSeed := jobID + ":" + strconv.FormatUint(sseStreamSequence.Add(1), 10)
 	go func() {
 		defer close(failures)
 		defer close(events)
@@ -41,7 +49,9 @@ func (c *Client) StreamJobEvents(ctx context.Context, session Session, jobID str
 			if ctx.Err() != nil {
 				return
 			}
+			started := time.Now()
 			next, terminal, err := c.streamConnection(ctx, session, jobID, last, events)
+			connectionDuration := time.Since(started)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -54,22 +64,78 @@ func (c *Client) StreamJobEvents(ctx context.Context, session Session, jobID str
 					return
 				}
 			}
-			progressed := next > last
-			if progressed {
+			if next > last {
 				last = next
-				attempts = 0
 			}
+			attempts = nextSSEReconnectAttempt(attempts, connectionDuration)
+			timer := time.NewTimer(sseReconnectDelay(attempts, reconnectSeed))
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
-			case <-time.After(sseReconnectBackoff(attempts)):
-			}
-			if !progressed {
-				attempts++
+			case <-timer.C:
 			}
 		}
 	}()
 	return &JobEventStream{Events: events, Errors: failures}
+}
+
+func nextSSEReconnectAttempt(attempt int, connectionDuration time.Duration) int {
+	if connectionDuration >= healthySSEConnectionDuration {
+		return 0
+	}
+	if attempt < 0 {
+		return 1
+	}
+	return attempt + 1
+}
+
+// sseReconnectDelay applies deterministic per-job jitter so multiple followers
+// do not reconnect in lockstep while keeping tests and operational behavior
+// reproducible.
+func sseReconnectDelay(attempt int, jobID string) time.Duration {
+	base := sseReconnectBackoff(attempt)
+	var hash uint32 = 2166136261
+	for _, b := range []byte(jobID + ":" + strconv.Itoa(attempt)) {
+		hash ^= uint32(b)
+		hash *= 16777619
+	}
+	// A 0.8x-1.2x window avoids herds without weakening the minimum materially.
+	factor := 800 + int(hash%401)
+	return time.Duration(int64(base) * int64(factor) / 1000)
+}
+
+func newSSEHTTPClient(base *http.Client, connectionTimeout time.Duration) *http.Client {
+	streamClient := *base
+	streamClient.Timeout = 0
+	transport := base.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	if typed, ok := transport.(*http.Transport); ok {
+		clone := typed.Clone()
+		if clone.DialContext == nil {
+			clone.DialContext = (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+		}
+		if clone.TLSHandshakeTimeout <= 0 || clone.TLSHandshakeTimeout > 5*time.Second {
+			clone.TLSHandshakeTimeout = 5 * time.Second
+		}
+		headerTimeout := 10 * time.Second
+		if connectionTimeout < headerTimeout {
+			headerTimeout = connectionTimeout
+		}
+		if clone.ResponseHeaderTimeout <= 0 || clone.ResponseHeaderTimeout > headerTimeout {
+			clone.ResponseHeaderTimeout = headerTimeout
+		}
+		if clone.MaxConnsPerHost <= 0 || clone.MaxConnsPerHost > 4 {
+			clone.MaxConnsPerHost = 4
+		}
+		if clone.MaxIdleConnsPerHost <= 0 || clone.MaxIdleConnsPerHost > 2 {
+			clone.MaxIdleConnsPerHost = 2
+		}
+		streamClient.Transport = clone
+	}
+	return &streamClient
 }
 
 func sseReconnectBackoff(attempt int) time.Duration {
@@ -89,9 +155,9 @@ func sseReconnectBackoff(attempt int) time.Duration {
 
 func (c *Client) streamConnection(ctx context.Context, session Session, jobID string, after int64, output chan<- apicontract.JobEvent) (int64, bool, error) {
 	q := url.Values{"after": []string{strconv.FormatInt(after, 10)}}
-	streamClient := *c.httpClient
-	streamClient.Timeout = 0 // An SSE body is intentionally long-lived.
-	response, err := c.requestWithClient(ctx, &streamClient, "streamJobEvents", &session, nil, false, "", q, jobID)
+	connectionCtx, cancel := context.WithTimeout(ctx, c.streamConnectionTimeout)
+	defer cancel()
+	response, err := c.requestWithClient(connectionCtx, c.streamClient, "streamJobEvents", &session, nil, false, "", q, jobID)
 	if err != nil {
 		return after, false, err
 	}
@@ -129,8 +195,8 @@ func (c *Client) streamConnection(ctx context.Context, session Session, jobID st
 		}
 		select {
 		case output <- event:
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-connectionCtx.Done():
+			return connectionCtx.Err()
 		}
 		lastDelivered = event.ID
 		data.Reset()

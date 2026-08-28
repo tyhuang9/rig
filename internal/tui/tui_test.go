@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -31,6 +32,26 @@ type fakeClient struct {
 	followCtx       context.Context
 	lifecycleAppID  string
 	applicationID   string
+	overviewStarted chan<- string
+	overviewRelease <-chan struct{}
+}
+
+func (f *fakeClient) waitOverview(ctx context.Context, operation string) error {
+	if f.overviewStarted != nil {
+		select {
+		case f.overviewStarted <- operation:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if f.overviewRelease != nil {
+		select {
+		case <-f.overviewRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 func (f *fakeClient) BootstrapStatus(context.Context) (apicontract.BootstrapStatus, error) {
@@ -45,13 +66,19 @@ func (f *fakeClient) Login(_ context.Context, request apicontract.LoginRequest) 
 }
 func (f *fakeClient) Logout(context.Context) error                       { f.logoutCalls++; return nil }
 func (f *fakeClient) Me(context.Context) (apicontract.MeResponse, error) { return f.me, f.meErr }
-func (f *fakeClient) Status(context.Context) (apicontract.SystemStatus, error) {
+func (f *fakeClient) Status(ctx context.Context) (apicontract.SystemStatus, error) {
+	if err := f.waitOverview(ctx, "status"); err != nil {
+		return apicontract.SystemStatus{}, err
+	}
 	return apicontract.SystemStatus{Daemon: "running", Diagnostics: apicontract.Diagnostics{EngineReady: true}}, nil
 }
 func (f *fakeClient) Doctor(context.Context) (apicontract.DoctorResponse, error) {
 	return apicontract.DoctorResponse{Checks: []apicontract.DoctorCheck{{Name: "engine", OK: true}}}, nil
 }
-func (f *fakeClient) Applications(context.Context) (apicontract.ApplicationList, error) {
+func (f *fakeClient) Applications(ctx context.Context) (apicontract.ApplicationList, error) {
+	if err := f.waitOverview(ctx, "apps"); err != nil {
+		return apicontract.ApplicationList{}, err
+	}
 	return apicontract.ApplicationList{Items: []apicontract.Application{{ID: "app-1", Slug: "one", Name: "One"}, {ID: "app-2", Slug: "two", Name: "Two"}}}, nil
 }
 func (f *fakeClient) Application(_ context.Context, id string) (apicontract.Application, error) {
@@ -69,7 +96,10 @@ func (f *fakeClient) Lifecycle(_ context.Context, appID, _ string, _ string) (ap
 	f.lifecycleAppID = appID
 	return apicontract.JobMutationResponse{Created: true, Job: apicontract.Job{ID: "job-life", Status: "queued"}}, nil
 }
-func (f *fakeClient) Jobs(context.Context) (apicontract.JobList, error) {
+func (f *fakeClient) Jobs(ctx context.Context) (apicontract.JobList, error) {
+	if err := f.waitOverview(ctx, "jobs"); err != nil {
+		return apicontract.JobList{}, err
+	}
 	return apicontract.JobList{Items: []apicontract.Job{{ID: "job-1", Status: "running"}}}, nil
 }
 func (f *fakeClient) Job(_ context.Context, id string) (apicontract.Job, error) {
@@ -118,6 +148,94 @@ func TestParseAndCompleteCommands(t *testing.T) {
 	suggestions := commandSuggestions("/st")
 	if strings.Join(suggestions, ",") != "/start,/status,/stop" {
 		t.Fatalf("suggestions = %v", suggestions)
+	}
+}
+
+func TestOverviewRequestsRunConcurrently(t *testing.T) {
+	started := make(chan string, 3)
+	release := make(chan struct{})
+	client := &fakeClient{overviewStarted: started, overviewRelease: release}
+	m := NewModel(context.Background(), client, &memoryHistoryStore{}, "http://controller")
+	result := make(chan tea.Msg, 1)
+	go func() { result <- m.loadOverview()() }()
+	seen := map[string]bool{}
+	for len(seen) < 3 {
+		select {
+		case operation := <-started:
+			seen[operation] = true
+		case <-time.After(250 * time.Millisecond):
+			t.Fatalf("overview requests did not overlap; started=%v", seen)
+		}
+	}
+	close(release)
+	select {
+	case raw := <-result:
+		msg, ok := raw.(overviewMsg)
+		if !ok || msg.err != nil || len(msg.apps.Items) != 2 || len(msg.jobs.Items) != 1 {
+			t.Fatalf("overview result=%#v", raw)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("concurrent overview did not finish")
+	}
+}
+
+func TestOrdinaryInputDoesNotRebuildTranscript(t *testing.T) {
+	m := consoleModel(&fakeClient{})
+	m.appendEntry(entrySuccess, "/status", "daemon: running")
+	m.transcriptBuilds = 0
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m.refreshSuggestions()
+	m.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+	if m.transcriptBuilds != 0 {
+		t.Fatalf("ordinary input rebuilt transcript %d times", m.transcriptBuilds)
+	}
+	m.Update(tea.WindowSizeMsg{Width: m.width - 10, Height: m.height})
+	if m.transcriptBuilds != 1 {
+		t.Fatalf("width change rebuilt transcript %d times", m.transcriptBuilds)
+	}
+}
+
+func TestTranscriptHasUnicodeSafeByteBudget(t *testing.T) {
+	m := consoleModel(&fakeClient{})
+	body := strings.Repeat("界", maxAPITextBytes)
+	for i := 0; i < 100; i++ {
+		entry := boundTranscriptEntry(transcriptEntry{Kind: entryEvent, Title: fmt.Sprintf("event-%d", i), Body: sanitizeAPIText(body)}, transcriptByteLimit)
+		m.entries = append(m.entries, entry)
+		m.transcriptBytes += transcriptEntryBytes(entry)
+	}
+	m.appendEntry(entryEvent, "latest", body)
+	if m.transcriptBytes > transcriptByteLimit {
+		t.Fatalf("transcript retained %d bytes, limit %d", m.transcriptBytes, transcriptByteLimit)
+	}
+	measured := 0
+	for _, entry := range m.entries {
+		measured += transcriptEntryBytes(entry)
+		if !utf8.ValidString(entry.Title) || !utf8.ValidString(entry.Body) {
+			t.Fatal("transcript trimming split a UTF-8 rune")
+		}
+	}
+	if measured != m.transcriptBytes {
+		t.Fatalf("tracked transcript bytes=%d measured=%d", m.transcriptBytes, measured)
+	}
+	m.execute(command{Name: "/clear"})
+	if m.transcriptBytes != 0 || len(m.entries) != 0 {
+		t.Fatalf("clear retained %d bytes across %d entries", m.transcriptBytes, len(m.entries))
+	}
+}
+
+func BenchmarkOrdinaryInputWithLargeTranscript(b *testing.B) {
+	m := consoleModel(&fakeClient{})
+	for i := 0; i < transcriptLimit; i++ {
+		m.appendEntry(entryEvent, "event", strings.Repeat("detail ", 200))
+	}
+	m.transcriptBuilds = 0
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	}
+	b.StopTimer()
+	if m.transcriptBuilds != 0 {
+		b.Fatalf("ordinary input rebuilt transcript %d times", m.transcriptBuilds)
 	}
 }
 

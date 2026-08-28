@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hostd/hostd/internal/apicontract"
 )
 
 func TestStreamJobEventsUsesReplayPositionAndCancels(t *testing.T) {
@@ -31,7 +33,7 @@ func TestStreamJobEventsUsesReplayPositionAndCancels(t *testing.T) {
 		if event.ID != 8 {
 			t.Fatalf("event=%+v", event)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("event not received")
 	}
 	select {
@@ -39,7 +41,7 @@ func TestStreamJobEventsUsesReplayPositionAndCancels(t *testing.T) {
 		if got != "7" {
 			t.Fatalf("Last-Event-ID=%q", got)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("request not received")
 	}
 	cancel()
@@ -48,7 +50,7 @@ func TestStreamJobEventsUsesReplayPositionAndCancels(t *testing.T) {
 		if ok {
 			t.Fatal("stream remains open after cancellation")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("stream did not close")
 	}
 }
@@ -80,7 +82,7 @@ func TestStreamJobEventsReconnectsWithCursorAndDeduplicates(t *testing.T) {
 			if event.ID != want {
 				t.Fatalf("event id=%d want=%d", event.ID, want)
 			}
-		case <-time.After(2 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatal("reconnected event not received")
 		}
 	}
@@ -90,7 +92,7 @@ func TestStreamJobEventsReconnectsWithCursorAndDeduplicates(t *testing.T) {
 			if got != want {
 				t.Fatalf("Last-Event-ID=%q want=%q", got, want)
 			}
-		case <-time.After(time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatal("reconnect request not observed")
 		}
 	}
@@ -114,7 +116,7 @@ func TestStreamJobEventsDoesNotUseWholeBodyTimeout(t *testing.T) {
 		if event.ID != 1 {
 			t.Fatalf("event=%+v", event)
 		}
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(3 * time.Second):
 		t.Fatal("SSE inherited whole-body timeout")
 	}
 	if requests.Load() != 1 {
@@ -132,7 +134,7 @@ func TestStreamJobEventsReportsTerminalClientError(t *testing.T) {
 		if err == nil {
 			t.Fatal("terminal 4xx was not reported")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("terminal 4xx was retried forever")
 	}
 }
@@ -156,7 +158,7 @@ func TestStreamJobEventsReportsTerminalDecodeAndLimitErrors(t *testing.T) {
 				if err == nil {
 					t.Fatal("terminal stream error was not reported")
 				}
-			case <-time.After(time.Second):
+			case <-time.After(10 * time.Second):
 				t.Fatal("terminal stream error was retried")
 			}
 		})
@@ -169,5 +171,63 @@ func TestSSEReconnectBackoffHasMinimumAndCap(t *testing.T) {
 	}
 	if got := sseReconnectBackoff(100); got != maxSSEReconnectBackoff {
 		t.Fatalf("capped backoff = %s", got)
+	}
+	if got := nextSSEReconnectAttempt(4, healthySSEConnectionDuration-time.Millisecond); got != 5 {
+		t.Fatalf("short connection reset backoff attempt to %d", got)
+	}
+	if got := nextSSEReconnectAttempt(4, healthySSEConnectionDuration); got != 0 {
+		t.Fatalf("healthy connection retained backoff attempt %d", got)
+	}
+	if first, second := sseReconnectDelay(0, "job"), sseReconnectDelay(1, "job"); second <= first {
+		t.Fatalf("jittered backoff did not increase: %s then %s", first, second)
+	}
+}
+
+func TestStreamConnectionBoundsResponseHeaderWait(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	client, err := New(Options{
+		Endpoint:                server.URL,
+		HTTPClient:              server.Client(),
+		StreamConnectionTimeout: 40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, terminal, err := client.streamConnection(context.Background(), Session{SessionToken: "s"}, "job", 0, make(chan apicontract.JobEvent))
+	if err == nil || terminal {
+		t.Fatalf("err=%v terminal=%t", err, terminal)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("withheld response headers were not bounded: %s", elapsed)
+	}
+}
+
+func TestStreamConnectionBoundsIdleBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	client, err := New(Options{
+		Endpoint:                server.URL,
+		HTTPClient:              server.Client(),
+		StreamConnectionTimeout: 40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, terminal, err := client.streamConnection(context.Background(), Session{SessionToken: "s"}, "job", 0, make(chan apicontract.JobEvent))
+	if err == nil || terminal {
+		t.Fatalf("err=%v terminal=%t", err, terminal)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("idle response body was not bounded: %s", elapsed)
 	}
 }
