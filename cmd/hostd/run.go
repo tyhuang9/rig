@@ -14,7 +14,10 @@ import (
 	"github.com/hostd/hostd/internal/tui"
 )
 
-type tuiLaunchOptions struct{ endpoint, sessionFile, historyFile string }
+type tuiLaunchOptions struct {
+	endpoint, sessionFile, historyFile string
+	accessible                         bool
+}
 type hostdRunners struct {
 	interactive func() bool
 	runUI       func(tuiLaunchOptions) error
@@ -70,6 +73,7 @@ func parseTUIOptions(args []string) (tuiLaunchOptions, string, error) {
 	flags.SetOutput(&help)
 	flags.StringVar(&options.endpoint, "endpoint", options.endpoint, "controller endpoint")
 	flags.StringVar(&options.sessionFile, "session-file", options.sessionFile, "protected controller session file")
+	flags.BoolVar(&options.accessible, "accessible", false, "use a linear, screen-reader-oriented terminal view")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return options, help.String(), nil
@@ -109,5 +113,6 @@ func runTUI(options tuiLaunchOptions) error {
 			return newTUIControllerClient(options.endpoint, store)
 		},
 		HistoryPath: options.historyFile,
+		Accessible:  options.accessible,
 	})
 }

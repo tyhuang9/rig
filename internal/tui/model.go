@@ -65,16 +65,18 @@ type Model struct {
 	endpoint string
 	newKey   func() string
 
-	screen screen
-	width  int
-	height int
-	layout layout
-	busy   bool
-	err    string
-	user   apicontract.User
-	status apicontract.SystemStatus
-	apps   []apicontract.Application
-	jobs   []apicontract.Job
+	screen         screen
+	width          int
+	height         int
+	layout         layout
+	accessible     bool
+	overviewLoaded bool
+	busy           bool
+	err            string
+	user           apicontract.User
+	status         apicontract.SystemStatus
+	apps           []apicontract.Application
+	jobs           []apicontract.Job
 
 	selectedAppID string
 	entries       []transcriptEntry
@@ -281,22 +283,28 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = msg.status
 		m.apps = append([]apicontract.Application(nil), msg.apps.Items...)
 		m.jobs = append([]apicontract.Job(nil), msg.jobs.Items...)
-		if m.selectedAppID == "" && len(m.apps) > 0 {
-			m.selectedAppID = m.apps[0].ID
-		}
+		m.overviewLoaded = true
+		m.reconcileSelectedApp()
 		m.rebuildHitTargets()
 		return m, nil
 	case commandResultMsg:
 		m.busy = false
 		if msg.err != nil {
-			return m, m.handleControllerError(msg.err)
+			cmd := m.handleControllerError(msg.err)
+			m.restoreCommandFocus()
+			return m, cmd
 		}
 		if msg.apps != nil {
 			m.apps = append([]apicontract.Application(nil), msg.apps...)
+			m.reconcileSelectedApp()
 			m.rebuildHitTargets()
 		}
 		if msg.jobs != nil {
 			m.jobs = append([]apicontract.Job(nil), msg.jobs...)
+			m.rebuildHitTargets()
+		}
+		if msg.job != nil {
+			m.mergeJob(*msg.job)
 			m.rebuildHitTargets()
 		}
 		m.appendEntry(entrySuccess, msg.cmd.Name, msg.body)
@@ -307,6 +315,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.followID != "" {
 			return m, m.startFollowing(msg.followID, 0)
 		}
+		m.restoreCommandFocus()
 		return m, nil
 	case followOpenedMsg:
 		if msg.generation != m.followGeneration {
@@ -426,6 +435,7 @@ func (m *Model) handleConsoleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.appendEntry(entrySystem, "cancelled", "No changes were made.")
 			m.confirm = nil
+			m.restoreCommandFocus()
 		}
 		return m, nil
 	}
@@ -501,6 +511,7 @@ func (m *Model) submitCommand() (tea.Model, tea.Cmd) {
 			return m, persist
 		}
 		m.confirm = &confirmation{Command: parsed, Text: confirmationText(parsed, m.targetAppName(parsed))}
+		m.commandInput.Blur()
 		m.resize()
 		return m, persist
 	}
@@ -540,6 +551,7 @@ func (m *Model) execute(cmd command) tea.Cmd {
 		return tea.Quit
 	case "/logout":
 		m.busy = true
+		m.commandInput.Blur()
 		history := append([]string(nil), m.historyValues...)
 		client, store, ctx := m.client, m.history, m.ctx
 		return func() tea.Msg {
@@ -567,6 +579,7 @@ func (m *Model) execute(cmd command) tea.Cmd {
 		return func() tea.Msg { return commandResultMsg{cmd: cmd, err: err} }
 	}
 	m.busy = true
+	m.commandInput.Blur()
 	ctx, client := m.ctx, m.client
 	return func() tea.Msg { return runAPICommand(ctx, client, request) }
 }
@@ -709,9 +722,13 @@ func (m *Model) stopFollowing(notify bool) {
 }
 
 func (m *Model) submitAuth() (tea.Model, tea.Cmd) {
-	for _, input := range m.authInputs {
+	if m.busy {
+		return m, nil
+	}
+	for index, input := range m.authInputs {
 		if strings.TrimSpace(input.Value()) == "" {
-			m.err = "All fields are required."
+			m.err = authFieldLabel(m.screen, index) + " is required."
+			m.focusAuth(index)
 			return m, nil
 		}
 	}
@@ -734,13 +751,18 @@ func (m *Model) showBootstrap() {
 }
 
 func (m *Model) beginBootstrapConfirmation() tea.Cmd {
-	for _, input := range m.authInputs {
+	for index, input := range m.authInputs {
 		if strings.TrimSpace(input.Value()) == "" {
-			m.err = "All fields are required."
+			m.err = authFieldLabel(m.screen, index) + " is required."
+			m.focusAuth(index)
 			return nil
 		}
 	}
 	m.bootstrapConfirm = true
+	m.commandInput.Blur()
+	for i := range m.authInputs {
+		m.authInputs[i].Blur()
+	}
 	m.bootstrapUsername = sanitizeAPIText(m.authInputs[1].Value())
 	m.err = ""
 	return nil
@@ -796,7 +818,7 @@ func (m *Model) mutationKey() (string, error) {
 }
 
 func (m *Model) enterConsole(user apicontract.User) {
-	m.screen, m.busy, m.err, m.user = screenConsole, false, "", user
+	m.screen, m.busy, m.err, m.user, m.overviewLoaded = screenConsole, false, "", user, false
 	m.commandInput.Focus()
 	m.appendEntry(entrySystem, "connected", "Authenticated as "+sanitizeAPIText(user.Username)+". Type /help for commands.")
 }
@@ -804,6 +826,34 @@ func (m *Model) enterConsole(user apicontract.User) {
 func (m *Model) goOffline(err error) {
 	m.stopFollowing(false)
 	m.screen, m.busy, m.err = screenOffline, false, sanitizeAPIText(err.Error())
+}
+
+func (m *Model) restoreCommandFocus() {
+	if m.screen == screenConsole && m.confirm == nil && !m.busy {
+		m.commandInput.Focus()
+	}
+}
+
+func (m *Model) reconcileSelectedApp() {
+	for _, app := range m.apps {
+		if app.ID == m.selectedAppID {
+			return
+		}
+	}
+	m.selectedAppID = ""
+	if len(m.apps) > 0 {
+		m.selectedAppID = m.apps[0].ID
+	}
+}
+
+func (m *Model) mergeJob(job apicontract.Job) {
+	for i := range m.jobs {
+		if m.jobs[i].ID == job.ID {
+			m.jobs[i] = job
+			return
+		}
+	}
+	m.jobs = append([]apicontract.Job{job}, m.jobs...)
 }
 
 func (m *Model) handleControllerError(err error) tea.Cmd {
@@ -905,7 +955,7 @@ func (m *Model) selectedAppName() string {
 			return sanitizeAPIText(app.Name)
 		}
 	}
-	return "selected application"
+	return "none"
 }
 
 func (m *Model) targetApp(cmd command) (apicontract.Application, bool) {

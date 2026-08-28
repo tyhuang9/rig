@@ -21,7 +21,7 @@ func TestRunHostdDispatchesModesAndGuidesNonInteractiveUse(t *testing.T) {
 		{name: "no args starts UI interactively", interactive: true, wantUI: true},
 		{name: "no args guides pipe users", want: 2, wantText: "interactive terminal"},
 		{name: "explicit UI guides pipe users", args: []string{"ui"}, want: 2, wantText: "interactive terminal"},
-		{name: "explicit UI parses options", args: []string{"ui", "--endpoint", "http://controller", "--session-file", "custom/session"}, interactive: true, wantUI: true},
+		{name: "explicit UI parses options", args: []string{"ui", "--endpoint", "http://controller", "--session-file", "custom/session", "--accessible"}, interactive: true, wantUI: true},
 		{name: "serve starts daemon", args: []string{"serve", "--fake-runtime"}, wantServer: []string{"--fake-runtime"}},
 		{name: "legacy flags warn", args: []string{"--fake-runtime"}, wantServer: []string{"--fake-runtime"}, wantText: "deprecated"},
 		{name: "unknown command errors", args: []string{"deploy"}, want: 2, wantText: "unknown hostd command"},
@@ -48,6 +48,9 @@ func TestRunHostdDispatchesModesAndGuidesNonInteractiveUse(t *testing.T) {
 			}
 			if calledUI && len(tt.args) > 0 && ui.historyFile == "" {
 				t.Fatal("TUI history file was not derived")
+			}
+			if tt.name == "explicit UI parses options" && !ui.accessible {
+				t.Fatal("accessible option was not propagated")
 			}
 		})
 	}

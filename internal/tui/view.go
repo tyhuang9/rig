@@ -2,10 +2,13 @@ package tui
 
 import (
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hostd/hostd/internal/apicontract"
 )
 
@@ -29,23 +32,27 @@ func (m *Model) View() string {
 	if m.width <= 0 || m.height <= 0 {
 		return "hostd operator console\n"
 	}
+	if m.accessible {
+		return m.finishView(m.accessibleView())
+	}
+	var view string
 	switch m.screen {
 	case screenLoading:
-		return m.centered("hostd operator console\n\nConnecting to " + sanitizeAPIText(m.endpoint) + "…")
+		view = m.centered("hostd operator console\n\nConnecting to " + endpointLabel(m.endpoint) + "…")
 	case screenOffline:
-		return m.centered(titleStyle.Render("Controller unavailable") + "\n\n" + errorStyle.Render(sanitizeAPIText(m.err)) + "\n\nPress Enter or r to retry · Ctrl+C to quit")
+		view = m.centered(titleStyle.Render("Controller unavailable") + "\n\nEndpoint: " + endpointLabel(m.endpoint) + "\n" + errorStyle.Render(sanitizeAPIText(m.err)) + "\n\nStart the controller with: hostd serve\nThen press Enter or r to retry. Ctrl+C quits.")
 	case screenBootstrap:
 		if m.bootstrapConfirm {
-			return m.bootstrapConfirmationView()
+			view = m.bootstrapConfirmationView()
+		} else {
+			view = m.authView("Create the first administrator", "Enter the one-time bootstrap token and new administrator credentials.")
 		}
-		return m.authView("Create the first administrator", "Enter the one-time bootstrap token and new administrator credentials.")
 	case screenLogin:
-		return m.authView("Sign in to hostd", "Credentials stay in memory only and are never written to command history.")
+		view = m.authView("Sign in to hostd", "Credentials stay in memory only and are never written to command history.")
 	case screenConsole:
-		return m.consoleView()
-	default:
-		return ""
+		view = m.consoleView()
 	}
+	return m.finishView(view)
 }
 
 func (m *Model) centered(content string) string {
@@ -59,6 +66,7 @@ func (m *Model) authView(title, subtitle string) string {
 	b.WriteString(mutedStyle.Render(subtitle))
 	b.WriteString("\n\n")
 	for i := range m.authInputs {
+		b.WriteString(authFieldLabel(m.screen, i) + ":\n")
 		b.WriteString(m.authInputs[i].View())
 		b.WriteString("\n")
 	}
@@ -70,7 +78,7 @@ func (m *Model) authView(title, subtitle string) string {
 		b.WriteString("\nAuthenticating…")
 	}
 	b.WriteString("\n\nTab/Shift+Tab change field · Enter continues · Ctrl+C quits")
-	boxWidth := min(max(38, m.width-8), 72)
+	boxWidth := min(max(1, m.width-4), 68)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panelStyle.Width(boxWidth).Render(b.String()))
 }
 
@@ -83,7 +91,7 @@ func (m *Model) bootstrapConfirmationView() string {
 		buttonStyle.Render("Confirm [Enter]") + " " + cancelStyle.Render("Cancel [Esc]"),
 		mutedStyle.Render("Enter confirms · Escape cancels"),
 	}, "\n")
-	boxWidth := min(max(38, m.width-8), 72)
+	boxWidth := min(max(1, m.width-4), 68)
 	box := panelStyle.Width(boxWidth).Render(content)
 	x := max(0, (m.width-lipgloss.Width(box))/2)
 	y := max(0, (m.height-lipgloss.Height(box))/2)
@@ -101,14 +109,14 @@ func (m *Model) consoleView() string {
 	}
 	header := m.renderHeader()
 	overview := m.renderOverview()
-	transcript := panelStyle.Width(max(1, m.layout.transcript.w-2)).Height(max(1, m.layout.transcript.h-2)).Render(m.viewport.View())
+	transcript := panelStyle.Width(max(1, m.layout.transcript.w-4)).Height(max(1, m.layout.transcript.h-2)).Render(m.viewport.View())
 	body := overview + "\n" + transcript
 	if m.layout.wide {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, overview, " ", transcript)
 	}
 	lower := m.renderLower()
 	footer := mutedStyle.Render(m.renderFooter())
-	return cropHeight(strings.Join([]string{header, body, lower, footer}, "\n"), m.height)
+	return strings.Join([]string{header, body, lower, footer}, "\n")
 }
 
 func (m *Model) tinyConsoleView() string {
@@ -117,12 +125,12 @@ func (m *Model) tinyConsoleView() string {
 	if m.confirm != nil {
 		prompt := cropWidth(errorStyle.Render("CONFIRM: "+m.confirm.Text), m.width)
 		actions := cropWidth(buttonStyle.Render("Confirm [Enter]")+" "+cancelStyle.Render("Cancel [Esc]"), m.width)
-		command := m.commandInput.View()
+		command := "Command: " + m.commandInput.View()
 		footer := mutedStyle.Render("Enter confirms · Esc cancels · Ctrl+C quits")
 		return cropHeight(strings.Join([]string{header, prompt, actions, command, footer}, "\n"), m.height)
 	}
 	transcript := cropHeight(m.viewport.View(), max(1, m.layout.transcript.h))
-	command := m.commandInput.View()
+	command := "Command: " + m.commandInput.View()
 	footer := mutedStyle.Render("Enter run · Esc stop follow · Ctrl+C quit")
 	return cropHeight(strings.Join([]string{header, transcript, command, footer}, "\n"), m.height)
 }
@@ -133,7 +141,7 @@ func (m *Model) renderHeader() string {
 		connection = mutedStyle.Render("● working")
 	}
 	left := titleStyle.Render("hostd operator console") + "  " + connection
-	right := fmt.Sprintf("%s · %s", sanitizeAPIText(m.endpoint), sanitizeAPIText(m.user.Username))
+	right := fmt.Sprintf("%s · %s", endpointLabel(m.endpoint), sanitizeAPIText(m.user.Username))
 	line := left
 	space := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if space > 1 {
@@ -151,6 +159,10 @@ func (m *Model) renderOverview() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Overview"))
 	b.WriteString("\n")
+	if !m.overviewLoaded {
+		b.WriteString(mutedStyle.Render("Loading controller overview…"))
+		return panelStyle.Width(max(1, m.layout.overview.w-4)).Height(max(1, m.layout.overview.h-2)).Render(b.String())
+	}
 	daemon := sanitizeAPIText(m.status.Daemon)
 	if daemon == "" {
 		daemon = "loading"
@@ -176,14 +188,14 @@ func (m *Model) renderOverview() string {
 	if len(m.overviewJobRows) == 0 {
 		b.WriteString(mutedStyle.Render("No active or failed jobs") + "\n")
 	}
-	return panelStyle.Width(max(1, m.layout.overview.w-2)).Height(max(1, m.layout.overview.h-2)).Render(strings.TrimSuffix(b.String(), "\n"))
+	return panelStyle.Width(max(1, m.layout.overview.w-4)).Height(max(1, m.layout.overview.h-2)).Render(strings.TrimSuffix(b.String(), "\n"))
 }
 
 func (m *Model) renderLower() string {
 	if m.confirm != nil {
-		prompt := cropWidth(errorStyle.Render("Confirm: "+m.confirm.Text), max(1, m.width-29))
+		prompt := cropWidth(errorStyle.Render("CONFIRMATION REQUIRED: "+m.confirm.Text), max(1, m.width-29))
 		prompt += strings.Repeat(" ", max(1, m.width-29-lipgloss.Width(prompt)))
-		return cropHeight(prompt+buttonStyle.Render("Run [Enter]")+" "+cancelStyle.Render("Cancel [Esc]"), max(1, m.layout.confirmation.h)) + "\n" + panelStyle.Width(max(1, m.layout.command.w-2)).Render(m.commandInput.View())
+		return cropHeight(prompt+buttonStyle.Render("Run [Enter]")+" "+cancelStyle.Render("Cancel [Esc]"), max(1, m.layout.confirmation.h)) + "\n" + panelStyle.Width(max(1, m.layout.command.w-4)).Render("Command: "+m.commandInput.View())
 	}
 	var lines []string
 	for i, suggestion := range m.suggestions {
@@ -194,7 +206,7 @@ func (m *Model) renderLower() string {
 		lines = append(lines, cropWidth(line, m.width))
 	}
 	suggestions := cropHeight(strings.Join(lines, "\n"), m.layout.suggestions.h)
-	command := panelStyle.Width(max(1, m.layout.command.w-2)).Render(m.commandInput.View())
+	command := panelStyle.Width(max(1, m.layout.command.w-4)).Render("Command: " + m.commandInput.View())
 	if suggestions == "" {
 		return command
 	}
@@ -202,7 +214,11 @@ func (m *Model) renderLower() string {
 }
 
 func (m *Model) renderFooter() string {
-	return cropWidth("Tab complete · ↑↓ history/suggestions · PgUp/PgDn or wheel scroll · Esc cancel/stop follow · Ctrl+C quit", m.width)
+	state := "connected"
+	if m.busy {
+		state = "working"
+	}
+	return cropWidth(fmt.Sprintf("Endpoint: %s | App: %s | State: %s | Tab complete | ↑↓ history | PgUp/PgDn scroll | Esc cancel | Ctrl+C quit", endpointLabel(m.endpoint), m.selectedAppName(), state), m.width)
 }
 
 func (m *Model) rebuildHitTargets() {
@@ -235,6 +251,9 @@ func (m *Model) rebuildHitTargets() {
 }
 
 func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.accessible || m.busy {
+		return m, nil
+	}
 	event := tea.MouseEvent(msg)
 	if event.Button == tea.MouseButtonWheelUp || event.Button == tea.MouseButtonWheelDown {
 		if m.layout.transcript.contains(event.X, event.Y) {
@@ -330,10 +349,13 @@ func boolWord(value bool) string {
 }
 
 func cropWidth(value string, width int) string {
-	if width <= 0 || lipgloss.Width(value) <= width {
+	if width <= 0 {
+		return ""
+	}
+	if ansi.StringWidth(value) <= width {
 		return value
 	}
-	return truncate(value, width)
+	return ansi.Truncate(value, width, "…")
 }
 
 func cropHeight(value string, height int) string {
@@ -348,15 +370,94 @@ func cropHeight(value string, height int) string {
 }
 
 func truncate(value string, width int) string {
-	if width <= 0 {
-		return ""
+	return cropWidth(value, width)
+}
+
+func (m *Model) finishView(value string) string {
+	if m.accessible || noColor() {
+		value = ansi.Strip(value)
 	}
-	runes := []rune(value)
-	if len(runes) <= width {
-		return value
+	lines := strings.Split(value, "\n")
+	for i := range lines {
+		lines[i] = cropWidth(lines[i], m.width)
 	}
-	if width == 1 {
-		return "…"
+	if len(lines) > m.height {
+		// The command prompt and current result are at the end of a console
+		// frame, so retain the tail rather than obscuring the active control.
+		lines = lines[len(lines)-m.height:]
 	}
-	return string(runes[:width-1]) + "…"
+	return strings.Join(lines, "\n")
+}
+
+func (m *Model) accessibleView() string {
+	var b strings.Builder
+	b.WriteString("hostd operator console\n")
+	b.WriteString("Endpoint: " + endpointLabel(m.endpoint) + "\n")
+	switch m.screen {
+	case screenLoading:
+		b.WriteString("Connection state: connecting\n")
+	case screenOffline:
+		b.WriteString("Connection state: unavailable\nError: " + sanitizeAPIText(m.err) + "\nRecovery: start hostd serve, then press Enter or r to retry.\n")
+	case screenBootstrap:
+		b.WriteString("Authentication: bootstrap required\n")
+		if m.bootstrapConfirm {
+			b.WriteString("Confirmation required: create administrator " + sanitizeAPIText(m.bootstrapUsername) + ". Press Enter to confirm or Escape to cancel.\n")
+		} else {
+			b.WriteString(m.linearAuthFields())
+		}
+	case screenLogin:
+		b.WriteString("Authentication: sign in\n" + m.linearAuthFields())
+	case screenConsole:
+		state := "connected"
+		if m.busy {
+			state = "working"
+		}
+		b.WriteString("Connection state: " + state + "\nSelected application: " + m.selectedAppName() + "\n")
+		if !m.overviewLoaded {
+			b.WriteString("Overview: loading\n")
+		}
+		for _, entry := range m.entries {
+			b.WriteString(entryKindLabel(entry.Kind) + " " + entry.Title + "\n" + entry.Body + "\n")
+		}
+		if m.confirm != nil {
+			b.WriteString("Confirmation required: " + m.confirm.Text + ". Press Enter to run or Escape to cancel.\n")
+		}
+		b.WriteString("Command: " + m.commandInput.View() + "\nShortcuts: Enter run; Tab complete; Escape cancel; Ctrl+C quit.\n")
+	}
+	return b.String()
+}
+
+func (m *Model) linearAuthFields() string {
+	var b strings.Builder
+	for i := range m.authInputs {
+		b.WriteString(authFieldLabel(m.screen, i) + ": " + m.authInputs[i].View() + "\n")
+	}
+	if m.err != "" {
+		b.WriteString("Error: " + sanitizeAPIText(m.err) + "\n")
+	}
+	return b.String()
+}
+
+func authFieldLabel(current screen, index int) string {
+	if current == screenBootstrap {
+		return []string{"Bootstrap token", "Administrator username", "Passphrase"}[index]
+	}
+	return []string{"Username", "Passphrase"}[index]
+}
+
+func entryKindLabel(kind entryKind) string {
+	return []string{"SYSTEM", "COMMAND", "RESULT", "ERROR", "EVENT"}[kind]
+}
+
+func endpointLabel(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		return sanitizeAPIText(parsed.Scheme + "://" + parsed.Host)
+	}
+	return sanitizeAPIText(endpoint)
+}
+
+func noColor() bool {
+	_, set := os.LookupEnv("NO_COLOR")
+	return set
 }

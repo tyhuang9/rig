@@ -23,13 +23,18 @@ type Config struct {
 	HistoryStoreFactory HistoryStoreFactory
 	HistoryPath         string
 	ProgramRunner       ProgramRunner
+	// Accessible uses the primary terminal buffer and a stable, linear view.
+	// It deliberately does not enable mouse reporting or the alternate screen.
+	Accessible bool
 }
 
-// Run starts a full-screen alternate-buffer operator console.
+// Run starts the operator console. Accessible mode uses the primary buffer.
 func Run(ctx context.Context, cfg Config) error {
 	if ctx == nil {
 		return errors.New("tui context is required")
 	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	client := cfg.Client
 	if client == nil {
 		if cfg.ClientFactory == nil || cfg.SessionStoreFactory == nil {
@@ -52,14 +57,19 @@ func Run(ctx context.Context, cfg Config) error {
 	if endpoint == "" {
 		endpoint = "http://127.0.0.1:7345"
 	}
-	model := NewModel(ctx, client, history, endpoint)
+	model := NewModel(runCtx, client, history, endpoint)
+	model.accessible = cfg.Accessible
 	runner := cfg.ProgramRunner
 	if runner == nil {
 		runner = func(model tea.Model, options ...tea.ProgramOption) (tea.Model, error) {
 			return tea.NewProgram(model, options...).Run()
 		}
 	}
-	_, err = runner(model, tea.WithContext(ctx), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	options := []tea.ProgramOption{tea.WithContext(runCtx)}
+	if !cfg.Accessible {
+		options = append(options, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	}
+	_, err = runner(model, options...)
 	return err
 }
 

@@ -13,6 +13,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hostd/hostd/internal/apicontract"
 	"github.com/hostd/hostd/internal/secretfile"
 )
@@ -97,6 +98,7 @@ func consoleModel(client *fakeClient) *Model {
 	m.user = apicontract.User{Username: "operator"}
 	m.apps = []apicontract.Application{{ID: "app-1", Slug: "one"}, {ID: "app-2", Slug: "two"}}
 	m.selectedAppID = "app-1"
+	m.overviewLoaded = true
 	m.width, m.height = 120, 30
 	m.resize()
 	return m
@@ -517,5 +519,176 @@ func TestRunUsesInjectedFactoriesAndRunner(t *testing.T) {
 	})
 	if err != nil || !run {
 		t.Fatalf("Run = %v, called=%t", err, run)
+	}
+}
+
+func TestAccessibleRunUsesPrimaryBufferOnly(t *testing.T) {
+	for _, accessible := range []bool{false, true} {
+		t.Run(fmt.Sprintf("accessible=%t", accessible), func(t *testing.T) {
+			var optionCount int
+			err := Run(context.Background(), Config{
+				Client:              &fakeClient{},
+				Accessible:          accessible,
+				HistoryStoreFactory: func() (HistoryStore, error) { return &memoryHistoryStore{}, nil },
+				ProgramRunner: func(_ tea.Model, options ...tea.ProgramOption) (tea.Model, error) {
+					optionCount = len(options)
+					return nil, nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 3
+			if accessible {
+				want = 1
+			}
+			if optionCount != want {
+				t.Fatalf("program options = %d, want %d", optionCount, want)
+			}
+		})
+	}
+}
+
+func TestRenderedFramesFitTerminalAndKeepCommandVisible(t *testing.T) {
+	for _, size := range [][2]int{{32, 8}, {40, 10}, {50, 12}, {80, 24}, {80, 30}, {99, 30}, {100, 30}} {
+		t.Run(fmt.Sprintf("%dx%d", size[0], size[1]), func(t *testing.T) {
+			m := consoleModel(&fakeClient{})
+			m.width, m.height = size[0], size[1]
+			m.commandInput.SetValue("/status")
+			m.resize()
+			view := m.View()
+			lines := strings.Split(view, "\n")
+			if len(lines) > size[1] {
+				t.Fatalf("height=%d exceeds %d:\n%s", len(lines), size[1], view)
+			}
+			for _, line := range lines {
+				if width := ansi.StringWidth(line); width > size[0] {
+					t.Fatalf("line width=%d exceeds %d: %q", width, size[0], line)
+				}
+			}
+			if !strings.Contains(ansi.Strip(view), "/status") {
+				t.Fatalf("command prompt was clipped:\n%s", view)
+			}
+		})
+	}
+}
+
+func TestAccessibleViewIsLinearMonochromeAndChronological(t *testing.T) {
+	m := consoleModel(&fakeClient{})
+	m.accessible = true
+	m.width, m.height = 120, 30
+	m.entries = nil
+	m.appendEntry(entryCommand, "you", "/status")
+	m.appendEntry(entrySuccess, "/status", "daemon: running")
+	m.appendEntry(entryEvent, "running", "halfway")
+	view := m.View()
+	for _, text := range []string{"Endpoint:", "Connection state: connected", "COMMAND you", "RESULT /status", "EVENT running", "Command:"} {
+		if !strings.Contains(view, text) {
+			t.Fatalf("accessible view missing %q:\n%s", text, view)
+		}
+	}
+	if strings.Contains(view, "\x1b[") || strings.Contains(view, "●") || strings.Contains(view, "✓") {
+		t.Fatalf("accessible view contains presentation-only output: %q", view)
+	}
+}
+
+func TestNoColorAndANSISafeTruncation(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	m := consoleModel(&fakeClient{})
+	if view := m.View(); strings.Contains(view, "\x1b[") {
+		t.Fatalf("NO_COLOR view contains ANSI styling: %q", view)
+	}
+	styled := "\x1b[31m界界界\x1b[0m"
+	got := cropWidth(styled, 5)
+	if ansi.StringWidth(got) > 5 || ansi.Strip(got) != "界界…" {
+		t.Fatalf("ANSI-aware truncation = %q (%q, width=%d)", got, ansi.Strip(got), ansi.StringWidth(got))
+	}
+}
+
+func TestAuthLabelsFocusFirstInvalidAndFocusRestores(t *testing.T) {
+	m := NewModel(context.Background(), &fakeClient{}, &memoryHistoryStore{}, "http://controller")
+	m.showLogin("")
+	m.width, m.height = 80, 24
+	m.resize()
+	if view := m.View(); !strings.Contains(view, "Username:") || !strings.Contains(view, "Passphrase:") {
+		t.Fatalf("auth labels missing: %q", view)
+	}
+	m.authInputs[1].SetValue("present")
+	_, cmd := m.submitAuth()
+	if cmd != nil || m.authIndex != 0 || !m.authInputs[0].Focused() || m.err != "Username is required." {
+		t.Fatalf("invalid auth did not focus username: index=%d focused=%t error=%q", m.authIndex, m.authInputs[0].Focused(), m.err)
+	}
+
+	console := consoleModel(&fakeClient{})
+	console.commandInput.SetValue("/stop")
+	console.handleConsoleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if console.commandInput.Focused() {
+		t.Fatal("command input remained focused behind confirmation")
+	}
+	console.handleConsoleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if !console.commandInput.Focused() {
+		t.Fatal("command input did not regain focus after cancel")
+	}
+	console.commandInput.Blur()
+	console.busy = true
+	console.Update(commandResultMsg{cmd: command{Name: "/status"}, body: "daemon: running"})
+	if !console.commandInput.Focused() {
+		t.Fatal("command input did not regain focus after result")
+	}
+}
+
+func TestOfflineLoadingMergeSelectionAndFooterStates(t *testing.T) {
+	m := consoleModel(&fakeClient{})
+	m.overviewLoaded = false
+	if view := ansi.Strip(m.View()); !strings.Contains(view, "Overview") || strings.Contains(view, "not ready") {
+		t.Fatalf("initial overview implied failure: %q", view)
+	}
+	m.goOffline(errors.New("dial refused"))
+	if view := ansi.Strip(m.View()); !strings.Contains(view, "Endpoint: http://controller") || !strings.Contains(view, "hostd serve") {
+		t.Fatalf("offline recovery text missing: %q", view)
+	}
+	m = consoleModel(&fakeClient{})
+	m.Update(commandResultMsg{cmd: command{Name: "/stop"}, job: &apicontract.Job{ID: "new", Progress: 42, Status: "running"}})
+	if eventProgress(apicontract.JobEvent{JobID: "new"}, m.jobs) != 42 {
+		t.Fatalf("mutation job was not merged: %#v", m.jobs)
+	}
+	m.selectedAppID = "gone"
+	m.Update(overviewMsg{apps: apicontract.ApplicationList{Items: []apicontract.Application{{ID: "remaining", Slug: "kept"}}}})
+	if m.selectedAppID != "remaining" || m.selectedAppName() != "kept" {
+		t.Fatalf("selected app was not reconciled: %q / %q", m.selectedAppID, m.selectedAppName())
+	}
+	if footer := ansi.Strip(m.renderFooter()); !strings.Contains(footer, "Endpoint:") || !strings.Contains(footer, "App:") || !strings.Contains(footer, "State:") {
+		t.Fatalf("footer summary incomplete: %q", footer)
+	}
+}
+
+func TestRunCancelsModelWorkOnProgramExitAndRejectsBusyInput(t *testing.T) {
+	var model *Model
+	err := Run(context.Background(), Config{
+		Client:              &fakeClient{},
+		HistoryStoreFactory: func() (HistoryStore, error) { return &memoryHistoryStore{}, nil },
+		ProgramRunner: func(value tea.Model, _ ...tea.ProgramOption) (tea.Model, error) {
+			model = value.(*Model)
+			model.startFollowing("job", 0)
+			return value, nil
+		},
+	})
+	if err != nil || model == nil || model.followContext == nil || model.followContext.Err() == nil {
+		t.Fatalf("Run did not cancel model follow context: err=%v model=%#v", err, model)
+	}
+
+	console := consoleModel(&fakeClient{})
+	console.busy = true
+	console.confirm = &confirmation{Command: command{Name: "/stop"}, Text: "stop"}
+	console.resize()
+	console.handleMouse(tea.MouseMsg(tea.MouseEvent{X: console.confirmRect.x, Y: console.confirmRect.y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
+	if console.confirm == nil {
+		t.Fatal("busy mouse interaction accepted a confirmation")
+	}
+	login := NewModel(context.Background(), &fakeClient{}, &memoryHistoryStore{}, "endpoint")
+	login.showLogin("")
+	login.busy = true
+	if _, cmd := login.submitAuth(); cmd != nil {
+		t.Fatal("busy authentication submission started a second request")
 	}
 }
