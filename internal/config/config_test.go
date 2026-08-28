@@ -93,3 +93,33 @@ func TestGitHubAppPublicConfigurationIsPairwiseAndBounded(t *testing.T) {
 		})
 	}
 }
+
+func TestControllerRelayFlagsArePairedCanonicalAndControllerOnly(t *testing.T) {
+	if defaults := Defaults(); defaults.ControllerRelay || defaults.RelayOrigin != "" {
+		t.Fatalf("controller relay defaults = %#v", defaults)
+	}
+	for _, test := range []struct {
+		name string
+		args []string
+		ok   bool
+	}{
+		{name: "disabled", ok: true}, {name: "flag alone", args: []string{"--controller-relay"}}, {name: "origin alone", args: []string{"--relay-origin", "https://relay.example"}},
+		{name: "canonical controller", args: []string{"--controller-relay", "--relay-origin", "https://relay.example"}, ok: true},
+		{name: "canonical non-default port", args: []string{"--controller-relay", "--relay-origin", "https://relay.example:8443"}, ok: true},
+		{name: "agent", args: []string{"--mode", "agent", "--controller-relay", "--relay-origin", "https://relay.example"}},
+		{name: "http", args: []string{"--controller-relay", "--relay-origin", "http://relay.example"}}, {name: "whitespace", args: []string{"--controller-relay", "--relay-origin", " https://relay.example"}},
+		{name: "path", args: []string{"--controller-relay", "--relay-origin", "https://relay.example/path"}}, {name: "query", args: []string{"--controller-relay", "--relay-origin", "https://relay.example?q=1"}},
+		{name: "fragment", args: []string{"--controller-relay", "--relay-origin", "https://relay.example#x"}}, {name: "userinfo", args: []string{"--controller-relay", "--relay-origin", "https://a@relay.example"}},
+		{name: "default port", args: []string{"--controller-relay", "--relay-origin", "https://relay.example:443"}}, {name: "noncanonical host", args: []string{"--controller-relay", "--relay-origin", "https://RELAY.example"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, err := FromFlags(test.args)
+			if (err == nil) != test.ok {
+				t.Fatalf("FromFlags() error=%v want success=%t", err, test.ok)
+			}
+			if err == nil && test.name == "canonical controller" && (!c.ControllerRelay || c.RelayOrigin != "https://relay.example") {
+				t.Fatalf("relay config=%#v", c)
+			}
+		})
+	}
+}
