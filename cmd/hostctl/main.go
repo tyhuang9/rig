@@ -130,8 +130,12 @@ func execute(args []string, input io.Reader, output io.Writer, client *http.Clie
 		if err != nil {
 			return err
 		}
+		before := session
 		value, err := client.Cancel(context.Background(), &session, args[0])
 		if err != nil {
+			return err
+		}
+		if err := app.persistSessionIfChanged(before, session); err != nil {
 			return err
 		}
 		return app.printJSON(value)
@@ -167,6 +171,16 @@ func (app *commandApp) loadSession() (sessionCredentials, error) {
 		session = loaded
 	}
 	return session, nil
+}
+
+func (app *commandApp) persistSessionIfChanged(before, after sessionCredentials) error {
+	if app.sessionStdin || before == after {
+		return nil
+	}
+	if err := writeSessionFile(app.sessionFile, after); err != nil {
+		return fmt.Errorf("persist refreshed session: %w", err)
+	}
+	return nil
 }
 
 func decodeLimited(reader io.Reader, target any) error {
