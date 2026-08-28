@@ -26,6 +26,7 @@ type controllerRelayFactory func() (controllerRelayRunner, error)
 
 type controllerRelayManagement interface {
 	Status() controllerrelay.ManagementStatus
+	ReadModel(context.Context, string) (controllerrelay.ManagementReadModel, error)
 	StartEnrollment(context.Context, string, controllerrelay.ManagementEnrollmentInput) (controllerrelay.ManagementEnrollmentStart, error)
 	PollEnrollment(context.Context, string, string) (controllerrelay.ManagementEnrollmentStatus, error)
 	RemoveBinding(context.Context, string, string) (controllerrelay.ManagementBindingStatus, error)
@@ -207,6 +208,15 @@ func (target *controllerRelayManagementTarget) Status() controllerrelay.Manageme
 		return controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementInitializing, DiagnosticsUnavailable: true}
 	}
 	return management.Status()
+}
+
+func (target *controllerRelayManagementTarget) ReadModel(ctx context.Context, owner string) (controllerrelay.ManagementReadModel, error) {
+	management, done := target.beginManagementCall()
+	if management == nil {
+		return controllerrelay.ManagementReadModel{RemovableBindings: make([]controllerrelay.ManagementBindingSummary, 0)}, controllerRelayManagementUnavailable()
+	}
+	defer done()
+	return management.ReadModel(ctx, owner)
 }
 
 func (target *controllerRelayManagementTarget) StartEnrollment(ctx context.Context, owner string, input controllerrelay.ManagementEnrollmentInput) (controllerrelay.ManagementEnrollmentStart, error) {

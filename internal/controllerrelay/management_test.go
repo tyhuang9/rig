@@ -2,6 +2,7 @@ package controllerrelay
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -32,9 +33,12 @@ type managementRepositoryFake struct {
 	enrollErr   error
 	rotation    KeyRotation
 	rotationErr error
+	readModel   RelayReadModel
+	readErr     error
 
 	bindingOwners    []string
 	enrollmentOwners []string
+	readOwners       []string
 	rotationIDs      []string
 }
 
@@ -56,6 +60,13 @@ func (repository *managementRepositoryFake) Enrollment(_ context.Context, owner,
 	defer repository.mu.Unlock()
 	repository.enrollmentOwners = append(repository.enrollmentOwners, owner)
 	return repository.enrollment, repository.enrollErr
+}
+
+func (repository *managementRepositoryFake) ReadModel(_ context.Context, owner string) (RelayReadModel, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	repository.readOwners = append(repository.readOwners, owner)
+	return repository.readModel, repository.readErr
 }
 
 func (repository *managementRepositoryFake) Rotation(_ context.Context, controllerID, rotationID string) (KeyRotation, error) {
@@ -173,6 +184,92 @@ func TestManagementStatusIsSanitizedAndStructured(t *testing.T) {
 	supervisor.snapshot.Outcome = "credential-and-endpoint-secret"
 	if got := service.Status().Outcome; got != ErrorProtocol {
 		t.Fatalf("unsafe outcome mapped to %q", got)
+	}
+}
+
+func TestManagementReadModelIsOwnerScopedSanitizedAndSideEffectFree(t *testing.T) {
+	service, repository, enrollment, controls, supervisor := newManagementFixture(t)
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	repository.readModel = RelayReadModel{
+		RemovableBindings: []RelayBindingReadModel{{
+			BindingID: managementTestBinding, ConnectionID: "0123456789abcdef0123456789abcdef",
+			InstallationID: 101, RepositoryID: 202, State: BindingAccessLost, UpdatedAt: now,
+		}},
+		KeyRotation: RelayKeyRotationReadModel{
+			InProgress: true, State: RotationNewKeyAuth, ExpiresAt: now.Add(time.Hour), UpdatedAt: now.Add(time.Minute),
+		},
+	}
+	got, err := service.ReadModel(context.Background(), "owner-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.RemovableBindings) != 1 || got.RemovableBindings[0].State != BindingAccessLost || !got.KeyRotation.InProgress || got.KeyRotation.State != RotationNewKeyAuth {
+		t.Fatalf("read model=%#v", got)
+	}
+	if !reflect.DeepEqual(repository.readOwners, []string{"owner-user"}) {
+		t.Fatalf("read owners=%#v", repository.readOwners)
+	}
+	if controls.removeCalls != 0 || controls.rotationCalls != 0 || enrollment.startInput != (StartEnrollmentInput{}) || enrollment.pollOwner != "" || supervisor.reconcileCount() != 0 {
+		t.Fatalf("read caused side effects: controls=%d/%d enrollment=%#v/%q reconciles=%d", controls.removeCalls, controls.rotationCalls, enrollment.startInput, enrollment.pollOwner, supervisor.reconcileCount())
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"controllerId", "keyId", "rotationId", "protected", "provider", "credential", "frame", managementTestController, managementTestKey, managementTestRotation} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("management read model leaked %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestManagementReadModelMalformedDurableStateFailsClosed(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	validBinding := RelayBindingReadModel{
+		BindingID: managementTestBinding, ConnectionID: "0123456789abcdef0123456789abcdef",
+		InstallationID: 1, RepositoryID: 2, State: BindingAuthorized, UpdatedAt: now,
+	}
+	valid := RelayReadModel{RemovableBindings: []RelayBindingReadModel{validBinding}}
+	tests := []struct {
+		name  string
+		model RelayReadModel
+		err   error
+	}{
+		{name: "repository error", model: valid, err: errors.New("ghu_secret provider-private-body internal/path")},
+		{name: "nil bindings", model: RelayReadModel{}},
+		{name: "too many bindings", model: RelayReadModel{RemovableBindings: make([]RelayBindingReadModel, maxRelayReadModelBindings+1)}},
+		{name: "invalid binding id", model: RelayReadModel{RemovableBindings: []RelayBindingReadModel{func() RelayBindingReadModel { value := validBinding; value.BindingID = "not-a-uuid"; return value }()}}},
+		{name: "invalid connection id", model: RelayReadModel{RemovableBindings: []RelayBindingReadModel{func() RelayBindingReadModel {
+			value := validBinding
+			value.ConnectionID = "ABCDEF0123456789ABCDEF0123456789"
+			return value
+		}()}}},
+		{name: "invalid scope", model: RelayReadModel{RemovableBindings: []RelayBindingReadModel{func() RelayBindingReadModel { value := validBinding; value.RepositoryID = 0; return value }()}}},
+		{name: "terminal binding", model: RelayReadModel{RemovableBindings: []RelayBindingReadModel{func() RelayBindingReadModel { value := validBinding; value.State = BindingRemoved; return value }()}}},
+		{name: "zero binding time", model: RelayReadModel{RemovableBindings: []RelayBindingReadModel{func() RelayBindingReadModel { value := validBinding; value.UpdatedAt = time.Time{}; return value }()}}},
+		{name: "false rotation with fields", model: RelayReadModel{RemovableBindings: []RelayBindingReadModel{}, KeyRotation: RelayKeyRotationReadModel{State: RotationPrepare}}},
+		{name: "terminal live rotation", model: RelayReadModel{RemovableBindings: []RelayBindingReadModel{}, KeyRotation: RelayKeyRotationReadModel{InProgress: true, State: RotationCompleted, ExpiresAt: now, UpdatedAt: now}}},
+		{name: "live rotation missing time", model: RelayReadModel{RemovableBindings: []RelayBindingReadModel{}, KeyRotation: RelayKeyRotationReadModel{InProgress: true, State: RotationPrepare, ExpiresAt: now}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, repository, _, controls, supervisor := newManagementFixture(t)
+			repository.readModel, repository.readErr = test.model, test.err
+			got, err := service.ReadModel(context.Background(), "owner-user")
+			if !IsManagementCode(err, "persistence_unavailable") {
+				t.Fatalf("error=%v model=%#v", err, got)
+			}
+			if strings.Contains(err.Error(), "ghu_secret") || strings.Contains(err.Error(), "provider-private") || strings.Contains(err.Error(), "internal/path") {
+				t.Fatalf("unsafe error=%v", err)
+			}
+			if got.RemovableBindings == nil || len(got.RemovableBindings) != 0 || controls.removeCalls != 0 || controls.rotationCalls != 0 || supervisor.reconcileCount() != 0 {
+				t.Fatalf("failed read returned data or side effects: %#v", got)
+			}
+		})
+	}
+	service, repository, _, _, _ := newManagementFixture(t)
+	if _, err := service.ReadModel(context.Background(), ""); !IsManagementCode(err, ManagementErrorInvalidRequest) || len(repository.readOwners) != 0 {
+		t.Fatalf("invalid owner read=%v owners=%#v", err, repository.readOwners)
 	}
 }
 

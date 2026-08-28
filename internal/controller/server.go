@@ -63,6 +63,7 @@ type Server struct {
 // Implementations must return only the curated management DTOs.
 type RelayManagementService interface {
 	Status() controllerrelay.ManagementStatus
+	ReadModel(context.Context, string) (controllerrelay.ManagementReadModel, error)
 	StartEnrollment(context.Context, string, controllerrelay.ManagementEnrollmentInput) (controllerrelay.ManagementEnrollmentStart, error)
 	PollEnrollment(context.Context, string, string) (controllerrelay.ManagementEnrollmentStatus, error)
 	RemoveBinding(context.Context, string, string) (controllerrelay.ManagementBindingStatus, error)
@@ -143,7 +144,7 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("listGitHubInstallations", s.require(s.listGitHubInstallations)),
 		contractRoute("listGitHubRepositories", s.require(s.listGitHubRepositories)),
 		contractRoute("listGitHubBranches", s.require(s.listGitHubBranches)),
-		contractRoute(operationGetRelayStatus, s.requireOperation(operationGetRelayStatus, s.getRelayStatus)),
+		contractRoute(operationGetRelayStatus, noStore(s.requireOperation(operationGetRelayStatus, s.getRelayStatus))),
 		contractRoute(operationStartRelayEnrollment, s.requireOperation(operationStartRelayEnrollment, s.startRelayEnrollment)),
 		contractRoute(operationPollRelayEnrollment, s.requireOperation(operationPollRelayEnrollment, s.pollRelayEnrollment)),
 		contractRoute(operationRemoveRelayBinding, s.requireOperation(operationRemoveRelayBinding, s.removeRelayBinding)),
@@ -151,6 +152,13 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute(operationGetApplicationAutoDeploy, s.requireOperation(operationGetApplicationAutoDeploy, s.getApplicationAutoDeploy)),
 		contractRoute(operationUpdateApplicationAutoDeploy, s.requireOperation(operationUpdateApplicationAutoDeploy, s.updateApplicationAutoDeploy)),
 		contractRoute(operationResumeApplicationAutoDeploy, s.requireOperation(operationResumeApplicationAutoDeploy, s.resumeApplicationAutoDeploy)),
+	}
+}
+
+func noStore(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next(w, r)
 	}
 }
 

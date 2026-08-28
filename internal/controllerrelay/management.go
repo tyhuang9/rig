@@ -41,6 +41,27 @@ type ManagementStatus struct {
 	ObserverDropped         uint64 `json:"observerDropped"`
 }
 
+type ManagementBindingSummary struct {
+	BindingID      string    `json:"bindingId"`
+	ConnectionID   string    `json:"connectionId"`
+	InstallationID int64     `json:"installationId"`
+	RepositoryID   int64     `json:"repositoryId"`
+	State          string    `json:"state"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
+type ManagementKeyRotationSummary struct {
+	InProgress bool      `json:"inProgress"`
+	State      string    `json:"state,omitempty"`
+	ExpiresAt  time.Time `json:"expiresAt,omitempty"`
+	UpdatedAt  time.Time `json:"updatedAt,omitempty"`
+}
+
+type ManagementReadModel struct {
+	RemovableBindings []ManagementBindingSummary   `json:"removableBindings"`
+	KeyRotation       ManagementKeyRotationSummary `json:"keyRotation"`
+}
+
 type ManagementEnrollmentInput struct {
 	ConnectionID   string `json:"connectionId"`
 	InstallationID int64  `json:"installationId"`
@@ -107,6 +128,7 @@ type managementRepository interface {
 	ActiveIdentity(context.Context) (ControllerIdentity, ControllerKey, error)
 	Binding(context.Context, string, string) (InstallationBinding, error)
 	Enrollment(context.Context, string, string) (Enrollment, error)
+	ReadModel(context.Context, string) (RelayReadModel, error)
 	Rotation(context.Context, string, string) (KeyRotation, error)
 }
 
@@ -170,6 +192,72 @@ func (service *ManagementService) Status() ManagementStatus {
 		OldestPendingAgeSeconds: managementAgeSeconds(snapshot.Diagnostics.OldestPendingAge),
 		ObserverDropped:         snapshot.ObserverDropped,
 	}
+}
+
+func (service *ManagementService) ReadModel(ctx context.Context, owner string) (ManagementReadModel, error) {
+	result := ManagementReadModel{RemovableBindings: make([]ManagementBindingSummary, 0)}
+	if service == nil || service.repository == nil {
+		return result, managementFailure(ManagementErrorUnavailable, 0)
+	}
+	if ctx == nil || !validOpaqueID(owner) {
+		return result, managementFailure(ManagementErrorInvalidRequest, 0)
+	}
+	stored, err := service.repository.ReadModel(ctx, owner)
+	if err != nil {
+		return result, managementFailure("persistence_unavailable", 0)
+	}
+	if stored.RemovableBindings == nil || len(stored.RemovableBindings) > maxRelayReadModelBindings {
+		return result, managementFailure("persistence_unavailable", 0)
+	}
+	for _, binding := range stored.RemovableBindings {
+		if !validCanonicalUUID(binding.BindingID) || !validLowerHexID(binding.ConnectionID, 32) || binding.InstallationID < 1 || binding.RepositoryID < 1 || binding.UpdatedAt.IsZero() || !removableBindingState(binding.State) {
+			return ManagementReadModel{RemovableBindings: make([]ManagementBindingSummary, 0)}, managementFailure("persistence_unavailable", 0)
+		}
+		result.RemovableBindings = append(result.RemovableBindings, ManagementBindingSummary{
+			BindingID: binding.BindingID, ConnectionID: binding.ConnectionID,
+			InstallationID: binding.InstallationID, RepositoryID: binding.RepositoryID,
+			State: binding.State, UpdatedAt: binding.UpdatedAt,
+		})
+	}
+	rotation := stored.KeyRotation
+	if !rotation.InProgress {
+		if rotation.State != "" || !rotation.ExpiresAt.IsZero() || !rotation.UpdatedAt.IsZero() {
+			return ManagementReadModel{RemovableBindings: make([]ManagementBindingSummary, 0)}, managementFailure("persistence_unavailable", 0)
+		}
+		return result, nil
+	}
+	if !liveRotationState(rotation.State) || rotation.ExpiresAt.IsZero() || rotation.UpdatedAt.IsZero() {
+		return ManagementReadModel{RemovableBindings: make([]ManagementBindingSummary, 0)}, managementFailure("persistence_unavailable", 0)
+	}
+	result.KeyRotation = ManagementKeyRotationSummary{
+		InProgress: true, State: rotation.State, ExpiresAt: rotation.ExpiresAt, UpdatedAt: rotation.UpdatedAt,
+	}
+	return result, nil
+}
+
+func removableBindingState(value string) bool {
+	return value == BindingAuthorized || value == BindingAccessLost || value == BindingRemovalPending
+}
+
+func liveRotationState(value string) bool {
+	switch value {
+	case RotationPrepare, RotationPropose, RotationConfirm, RotationNewKeyAuth, RotationFinalize:
+		return true
+	default:
+		return false
+	}
+}
+
+func validLowerHexID(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (service *ManagementService) StartEnrollment(ctx context.Context, owner string, input ManagementEnrollmentInput) (ManagementEnrollmentStart, error) {

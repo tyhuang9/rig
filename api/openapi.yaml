@@ -309,7 +309,7 @@ paths:
     get:
       operationId: getRelayStatus
       responses:
-        '200': {description: Relay availability and safe operator diagnostics, content: {application/json: {schema: {$ref: '#/components/schemas/RelayStatus'}}}}
+        '200': {description: Relay availability, safe operator diagnostics, and owner-scoped durable management state, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/RelayStatus'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/relay/enrollments:
     post:
@@ -477,7 +477,7 @@ components:
     RelayStatus:
       type: object
       additionalProperties: false
-      required: [availability, state, paused, outcome, diagnosticsUnavailable, pendingCommands, activeLeases, expiredLeases, oldestPendingAgeSeconds, observerDropped]
+      required: [availability, state, paused, outcome, diagnosticsUnavailable, pendingCommands, activeLeases, expiredLeases, oldestPendingAgeSeconds, observerDropped, readModelAvailable, removableBindings, keyRotation]
       properties:
         availability: {type: string, enum: [initializing, available, unavailable]}
         state: {type: string, maxLength: 64}
@@ -489,6 +489,29 @@ components:
         expiredLeases: {type: integer, minimum: 0}
         oldestPendingAgeSeconds: {type: integer, minimum: 0}
         observerDropped: {type: integer, format: int64, minimum: 0}
+        readModelAvailable: {type: boolean}
+        removableBindings: {type: array, maxItems: 1000, items: {$ref: '#/components/schemas/RelayBindingSummary'}}
+        keyRotation: {$ref: '#/components/schemas/RelayKeyRotationSummary'}
+    RelayBindingSummary:
+      type: object
+      additionalProperties: false
+      required: [bindingId, connectionId, installationId, repositoryId, state, updatedAt]
+      properties:
+        bindingId: {type: string, format: uuid}
+        connectionId: {type: string, pattern: '^[a-f0-9]{32}$'}
+        installationId: {type: integer, format: int64, minimum: 1}
+        repositoryId: {type: integer, format: int64, minimum: 1}
+        state: {type: string, enum: [authorized, access_lost, removal_pending]}
+        updatedAt: {type: string, format: date-time}
+    RelayKeyRotationSummary:
+      type: object
+      additionalProperties: false
+      required: [inProgress]
+      properties:
+        inProgress: {type: boolean}
+        state: {type: string, enum: [prepare, propose, confirm, new_key_auth, finalize]}
+        expiresAt: {type: string, format: date-time}
+        updatedAt: {type: string, format: date-time}
     StartRelayEnrollmentRequest:
       type: object
       additionalProperties: false

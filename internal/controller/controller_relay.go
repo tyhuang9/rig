@@ -25,12 +25,25 @@ const (
 	operationResumeApplicationAutoDeploy = "resumeApplicationAutoDeploy"
 )
 
-func (s *Server) getRelayStatus(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) getRelayStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	status := controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementUnavailable, DiagnosticsUnavailable: true}
 	if s.RelayManagement != nil {
 		status = s.RelayManagement.Status()
 	}
-	writeJSON(w, http.StatusOK, contractRelayStatus(status))
+	readModel := controllerrelay.ManagementReadModel{RemovableBindings: make([]controllerrelay.ManagementBindingSummary, 0)}
+	readModelAvailable := false
+	if status.Availability == controllerrelay.ManagementAvailable {
+		owner := r.Context().Value(principalKey{}).(principal).user.ID
+		var err error
+		readModel, err = s.RelayManagement.ReadModel(r.Context(), owner)
+		if err != nil {
+			s.relayUnavailableProblem(w, r, operationGetRelayStatus, 0)
+			return
+		}
+		readModelAvailable = true
+	}
+	writeJSON(w, http.StatusOK, contractRelayStatus(status, readModel, readModelAvailable))
 }
 
 func (s *Server) startRelayEnrollment(w http.ResponseWriter, r *http.Request) {
@@ -132,17 +145,35 @@ func (s *Server) startRelayKeyRotation(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func contractRelayStatus(value controllerrelay.ManagementStatus) apicontract.RelayStatus {
+func contractRelayStatus(value controllerrelay.ManagementStatus, readModel controllerrelay.ManagementReadModel, readModelAvailable bool) apicontract.RelayStatus {
 	availability := value.Availability
 	if availability != controllerrelay.ManagementInitializing && availability != controllerrelay.ManagementAvailable && availability != controllerrelay.ManagementUnavailable {
 		availability = controllerrelay.ManagementUnavailable
+	}
+	bindings := make([]apicontract.RelayBindingSummary, 0, len(readModel.RemovableBindings))
+	if readModelAvailable {
+		for _, binding := range readModel.RemovableBindings {
+			bindings = append(bindings, apicontract.RelayBindingSummary{
+				BindingID: binding.BindingID, ConnectionID: binding.ConnectionID,
+				InstallationID: binding.InstallationID, RepositoryID: binding.RepositoryID,
+				State: binding.State, UpdatedAt: contractTime(binding.UpdatedAt),
+			})
+		}
+	}
+	rotation := apicontract.RelayKeyRotationSummary{}
+	if readModelAvailable && readModel.KeyRotation.InProgress {
+		rotation = apicontract.RelayKeyRotationSummary{
+			InProgress: true, State: readModel.KeyRotation.State,
+			ExpiresAt: contractTime(readModel.KeyRotation.ExpiresAt), UpdatedAt: contractTime(readModel.KeyRotation.UpdatedAt),
+		}
 	}
 	return apicontract.RelayStatus{
 		Availability: availability, State: safeRelayDiagnostic(value.State), Paused: value.Paused,
 		Outcome: safeRelayDiagnostic(value.Outcome), DiagnosticsUnavailable: value.DiagnosticsUnavailable,
 		PendingCommands: nonnegativeInt(value.PendingCommands), ActiveLeases: nonnegativeInt(value.ActiveLeases),
 		ExpiredLeases: nonnegativeInt(value.ExpiredLeases), OldestPendingAgeSeconds: boundedInt64ToInt(value.OldestPendingAgeSeconds),
-		ObserverDropped: boundedUint64ToInt64(value.ObserverDropped),
+		ObserverDropped:    boundedUint64ToInt64(value.ObserverDropped),
+		ReadModelAvailable: readModelAvailable, RemovableBindings: bindings, KeyRotation: rotation,
 	}
 }
 
