@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -60,6 +61,7 @@ type blockingComposeRunner struct {
 	mu            sync.Mutex
 	requests      []runtimeprocess.CommandRequest
 	secretBuffers [][]byte
+	configJSON    []byte
 	upStarted     chan struct{}
 	releaseUp     chan struct{}
 	upStartedOnce sync.Once
@@ -286,7 +288,12 @@ func (r *blockingComposeRunner) Run(ctx context.Context, request runtimeprocess.
 	r.requests = append(r.requests, request)
 	r.mu.Unlock()
 	if hasArgument(request.Args, "config") {
-		stdout := []byte(`{"services":{"web":{"image":"nginx","privileged":true,"environment":{"TOKEN":"provider-secret"}}}}`)
+		r.mu.Lock()
+		stdout := append([]byte(nil), r.configJSON...)
+		r.mu.Unlock()
+		if len(stdout) == 0 {
+			stdout = []byte(`{"services":{"web":{"image":"nginx","privileged":true,"environment":{"TOKEN":"provider-secret"}}}}`)
+		}
 		stderr := []byte("provider config diagnostics")
 		r.mu.Lock()
 		r.secretBuffers = append(r.secretBuffers, stdout, stderr)
@@ -315,6 +322,97 @@ func (r *blockingComposeRunner) Run(ctx context.Context, request runtimeprocess.
 		return runtimeprocess.CommandResult{}, ctx.Err()
 	}
 	return runtimeprocess.CommandResult{}, errors.New("unexpected Docker command")
+}
+
+func (r *blockingComposeRunner) setConfigJSON(model []byte) {
+	r.mu.Lock()
+	r.configJSON = append(r.configJSON[:0], model...)
+	r.mu.Unlock()
+}
+
+func (r *blockingComposeRunner) upCallCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := 0
+	for _, request := range r.requests {
+		if hasArgument(request.Args, "up") {
+			count++
+		}
+	}
+	return count
+}
+
+func customVolumeModel(project, volumeName string) []byte {
+	model, err := json.Marshal(map[string]any{
+		"services": map[string]any{"web": map[string]any{
+			"image":    "nginx",
+			"volumes":  []any{map[string]any{"type": "volume", "source": "data", "target": "/data"}},
+			"networks": map[string]any{"private": nil},
+		}},
+		"volumes":  map[string]any{"data": map[string]any{"name": volumeName}},
+		"networks": map[string]any{"private": map[string]any{"name": project + "_private"}},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return model
+}
+
+func TestComposeWorkerCustomResourceNameRequiresExactApprovalBeforeMutation(t *testing.T) {
+	releaseUp := make(chan struct{})
+	fixture := newComposeWorkerFixture(t, releaseUp)
+	project := "rig-" + strings.ReplaceAll(fixture.app.ID, "-", "")
+	fixture.runner.setConfigJSON(customVolumeModel(project, "shared-data"))
+	fixture.startWorker(t)
+
+	job := fixture.createJob(t)
+	paused := waitForJob(t, fixture.jobs, job.ID, jobs.WaitingUser)
+	if paused.PauseDisposition != "approval_required" || fixture.runner.upCallCount() != 0 {
+		t.Fatalf("custom name mutated before approval: job=%#v upCalls=%d", paused, fixture.runner.upCallCount())
+	}
+	history, err := fixture.deployments.List(context.Background(), fixture.app.ID, 10)
+	if err != nil || len(history) != 1 || history[0].Status != deployments.NeedsAttention {
+		t.Fatalf("paused history=%#v err=%v", history, err)
+	}
+	finding := deploymentFindingByCapability(t, history[0].Findings, "custom_volume_name")
+	wantScope := `{"applicationId":"` + fixture.app.ID + `","name":"shared-data","resource":"data"}`
+	if finding.Disposition != composeruntime.DispositionApprovalRequired || finding.Scope != wantScope || strings.Contains(finding.Scope, "runtime-secret") {
+		t.Fatalf("custom finding=%#v wantScope=%s", finding, wantScope)
+	}
+	if _, created, grantErr := fixture.deployments.Grant(context.Background(), fixture.app.ID, fixture.actorID, finding.Fingerprint); grantErr != nil || !created {
+		t.Fatalf("grant created=%t err=%v", created, grantErr)
+	}
+	if _, err := fixture.jobs.Resume(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fixture.runner.upStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("approved custom name did not start up")
+	}
+	close(releaseUp)
+	waitForJob(t, fixture.jobs, job.ID, jobs.Succeeded)
+	if fixture.runner.upCallCount() != 1 {
+		t.Fatalf("approved up calls=%d", fixture.runner.upCallCount())
+	}
+
+	fixture.runner.setConfigJSON(customVolumeModel(project, "shared-data-v2"))
+	changedJob := fixture.createJob(t)
+	waitForJob(t, fixture.jobs, changedJob.ID, jobs.WaitingUser)
+	changedHistory, err := fixture.deployments.List(context.Background(), fixture.app.ID, 10)
+	if err != nil || len(changedHistory) != 2 {
+		t.Fatalf("changed history=%#v err=%v", changedHistory, err)
+	}
+	changed := deploymentFindingByCapability(t, changedHistory[0].Findings, "custom_volume_name")
+	if changed.Fingerprint == finding.Fingerprint || changed.Scope == finding.Scope || fixture.runner.upCallCount() != 1 {
+		t.Fatalf("changed name reused approval or mutated: original=%#v changed=%#v upCalls=%d", finding, changed, fixture.runner.upCallCount())
+	}
+	if _, err := fixture.jobs.Cancel(changedJob.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitForJob(t, fixture.jobs, changedJob.ID, jobs.Cancelled)
+	assertNoRollbackAndSecretsCleared(t, fixture.runner)
+	assertComposeRuntimeTempEmpty(t, fixture.dataRoot)
 }
 
 func TestComposeWorkerApprovalResumeRevocationRaceAndSingleDeployment(t *testing.T) {
@@ -645,6 +743,17 @@ func approvalFingerprint(t *testing.T, findings []deployments.Finding) string {
 	}
 	t.Fatal("approval-required finding not found")
 	return ""
+}
+
+func deploymentFindingByCapability(t *testing.T, findings []deployments.Finding, capability string) deployments.Finding {
+	t.Helper()
+	for _, finding := range findings {
+		if finding.Capability == capability {
+			return finding
+		}
+	}
+	t.Fatalf("%s finding not found in %#v", capability, findings)
+	return deployments.Finding{}
 }
 
 func assertNoRollbackAndSecretsCleared(t *testing.T, runner *blockingComposeRunner) {
