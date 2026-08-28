@@ -625,7 +625,7 @@ func safeSelectedCompose(workspace, compose string) bool {
 
 func treeHasExactPaths(root string) bool {
 	return filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil || entry.Type()&os.ModeSymlink != 0 {
+		if walkErr != nil || entry.Type()&os.ModeSymlink != 0 || localPathIsReparsePoint(current) {
 			return errInvalidReadyWorkspace
 		}
 		resolved, err := filepath.EvalSymlinks(current)
@@ -636,13 +636,6 @@ func treeHasExactPaths(root string) bool {
 	}) == nil
 }
 
-func sameFilesystemPath(first, second string) bool {
-	first, second = filepath.Clean(first), filepath.Clean(second)
-	if filepath.Separator == '\\' {
-		return strings.EqualFold(first, second)
-	}
-	return first == second
-}
 func finalizeContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 }
