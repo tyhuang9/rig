@@ -713,8 +713,11 @@ function Test-StrictJSONSyntax {
     }
 }
 
-function Get-JSONIPAMPropertyTokens {
-    param([string]$Json)
+function Get-JSONPropertyTokens {
+    param(
+        [string]$Json,
+        [string]$PropertyName
+    )
     $tokens = [System.Collections.Generic.List[object]]::new()
     for ($index = 0; $index -lt $Json.Length; $index++) {
         if ($Json[$index] -cne '"') {
@@ -743,14 +746,23 @@ function Get-JSONIPAMPropertyTokens {
         if ($cursor -ge $Json.Length -or $Json[$cursor] -cne ':') {
             continue
         }
+        $valueCursor = $cursor + 1
+        while ($valueCursor -lt $Json.Length -and $Json[$valueCursor] -in @(' ', "`t", "`r", "`n")) {
+            $valueCursor++
+        }
+        $isNullValue = $false
+        if ($valueCursor + 4 -le $Json.Length -and $Json.Substring($valueCursor, 4) -ceq 'null') {
+            $valueEnd = $valueCursor + 4
+            $isNullValue = $valueEnd -eq $Json.Length -or $Json[$valueEnd] -in @(' ', "`t", "`r", "`n", ',', '}')
+        }
         try {
             $name = ConvertFrom-Json -InputObject $literal
         }
         catch {
             continue
         }
-        if ($name -is [string] -and [StringComparer]::OrdinalIgnoreCase.Equals($name, 'ipam')) {
-            $tokens.Add([pscustomobject]@{ Literal = $literal; Name = $name })
+        if ($name -is [string] -and [StringComparer]::OrdinalIgnoreCase.Equals($name, $PropertyName)) {
+            $tokens.Add([pscustomobject]@{ Literal = $literal; Name = $name; IsNullValue = $isNullValue })
         }
     }
     return $tokens.ToArray()
@@ -768,7 +780,12 @@ function Test-EffectiveComposeJson {
         Add-CheckError $errors 'compose_effective_json_invalid'
         return $errors.ToArray()
     }
-    $rawIPAMTokens = @(Get-JSONIPAMPropertyTokens $Json)
+    $rawIPAMTokens = @(Get-JSONPropertyTokens -Json $Json -PropertyName 'ipam')
+    $rawServiceNullTokens = @{
+        command = @(Get-JSONPropertyTokens -Json $Json -PropertyName 'command')
+        entrypoint = @(Get-JSONPropertyTokens -Json $Json -PropertyName 'entrypoint')
+    }
+    $acceptedServiceNullFields = @{ command = 0; entrypoint = 0 }
     try {
         $model = ConvertTo-HashtableModel (ConvertFrom-Json -InputObject $Json)
     }
@@ -792,10 +809,10 @@ function Test-EffectiveComposeJson {
             continue
         }
         $expectedServiceKeys = if ($serviceName -eq 'postgres') {
-            @('cap_drop', 'cpus', 'environment', 'healthcheck', 'image', 'init', 'logging', 'mem_limit', 'networks', 'pids_limit', 'read_only', 'restart', 'secrets', 'security_opt', 'shm_size', 'stop_grace_period', 'tmpfs', 'user', 'volumes')
+            @('cap_drop', 'command', 'cpus', 'entrypoint', 'environment', 'healthcheck', 'image', 'init', 'logging', 'mem_limit', 'networks', 'pids_limit', 'read_only', 'restart', 'secrets', 'security_opt', 'shm_size', 'stop_grace_period', 'tmpfs', 'user', 'volumes')
         }
         else {
-            $keys = @('cap_drop', 'cpus', 'depends_on', 'environment', 'healthcheck', 'image', 'init', 'logging', 'mem_limit', 'networks', 'pids_limit', 'read_only', 'restart', 'secrets', 'security_opt', 'stop_grace_period', 'user')
+            $keys = @('cap_drop', 'command', 'cpus', 'depends_on', 'entrypoint', 'environment', 'healthcheck', 'image', 'init', 'logging', 'mem_limit', 'networks', 'pids_limit', 'read_only', 'restart', 'secrets', 'security_opt', 'stop_grace_period', 'user')
             if ($DirectTLS) {
                 $keys += 'ports'
             }
@@ -804,6 +821,15 @@ function Test-EffectiveComposeJson {
         if (-not (Test-ExactMapKeys -Map $service -Expected $expectedServiceKeys)) {
             Add-CheckError $errors 'compose_effective_service_keys'
             continue
+        }
+        foreach ($nullField in @('command', 'entrypoint')) {
+            $exactFieldKeys = @($service.Keys | Where-Object { [string]$_ -ceq $nullField })
+            if ($exactFieldKeys.Count -ne 1 -or $null -ne $service[$exactFieldKeys[0]]) {
+                Add-CheckError $errors 'compose_effective_service_keys'
+            }
+            else {
+                $acceptedServiceNullFields[$nullField]++
+            }
         }
         $expectedUser = if ($serviceName -eq 'postgres') { '999:999' } else { '65532:65532' }
         if ([string]$service['user'] -cne $expectedUser -or $service['read_only'] -ne $true -or $service['init'] -ne $true) {
@@ -857,6 +883,15 @@ function Test-EffectiveComposeJson {
                     Add-CheckError $errors 'compose_effective_ports'
                 }
             }
+        }
+    }
+
+    foreach ($nullField in @('command', 'entrypoint')) {
+        $rawTokens = @($rawServiceNullTokens[$nullField])
+        $exactTokens = @($rawTokens | Where-Object { [string]$_.Literal -ceq ('"' + $nullField + '"') })
+        $exactNullTokens = @($exactTokens | Where-Object { $_.IsNullValue })
+        if ($rawTokens.Count -ne 2 -or $exactTokens.Count -ne 2 -or $exactNullTokens.Count -ne 2 -or $rawTokens.Count -ne $acceptedServiceNullFields[$nullField]) {
+            Add-CheckError $errors 'compose_effective_service_keys'
         }
     }
 
@@ -1197,6 +1232,8 @@ function New-EffectiveComposeModel {
     $relayLogging = [ordered]@{ driver = 'local'; options = [ordered]@{ compress = 'true'; 'max-file' = '5'; 'max-size' = '10m' } }
     $postgres = [ordered]@{
         cap_drop = @('ALL')
+        command = $null
+        entrypoint = $null
         cpus = 1.5
         environment = [ordered]@{
             POSTGRES_DB = 'rig_relay'; POSTGRES_USER = 'rig_relay'; POSTGRES_PASSWORD_FILE = '/run/secrets/postgres_password'
@@ -1223,6 +1260,8 @@ function New-EffectiveComposeModel {
     $relaySecrets = @($relaySecretNames | ForEach-Object { [ordered]@{ source = $_; target = $_ } })
     $relay = [ordered]@{
         cap_drop = @('ALL')
+        command = $null
+        entrypoint = $null
         cpus = 1.0
         depends_on = [ordered]@{ postgres = [ordered]@{ condition = 'service_healthy'; required = $true; restart = $true } }
         environment = [ordered]@{
@@ -1381,6 +1420,23 @@ function Assert-BehaviorOnlyError {
     }
 }
 
+function Replace-UniqueJSONFragment {
+    param(
+        [string]$Name,
+        [string]$Json,
+        [string]$Source,
+        [string]$Destination
+    )
+    if ([regex]::Matches($Json, [regex]::Escape($Source)).Count -ne 1) {
+        throw "behavior test failed: $Name source fragment was not unique"
+    }
+    $result = $Json.Replace($Source, $Destination)
+    if ($result -ceq $Json -or [regex]::Matches($result, [regex]::Escape($Destination)).Count -ne 1) {
+        throw "behavior test failed: $Name mutation was not exact"
+    }
+    return $result
+}
+
 function Invoke-PackagingBehaviorTests {
     $context = New-FakePreflightContext
     $errors = @(Invoke-EffectiveComposePreflight 'baseline' $context.Anchor $context.EnvironmentPath $context.SecretsPath 'compose.yaml' 'compose.direct-tls.yaml' $context.Adapter $context.Anchor)
@@ -1409,6 +1465,61 @@ function Invoke-PackagingBehaviorTests {
     }
     $errors = @(Invoke-EffectiveComposePreflight 'baseline' $testContext.Anchor $testContext.EnvironmentPath $testContext.SecretsPath 'compose.yaml' 'compose.direct-tls.yaml' $testContext.Adapter $testContext.Anchor)
     Assert-BehaviorSuccess 'valid baseline preflight with normalized empty IPAM' $errors
+
+    foreach ($serviceName in @('postgres', 'relay')) {
+        foreach ($nullField in @('command', 'entrypoint')) {
+            $fieldPrefix = '"' + $serviceName + '":{"cap_drop":["ALL"],'
+            if ($nullField -eq 'entrypoint') {
+                $fieldPrefix += '"command":null,'
+            }
+            $fieldSource = $fieldPrefix + '"' + $nullField + '":null'
+
+            $testContext = New-FakePreflightContext
+            $testContext.State.ComposeJSON = Replace-UniqueJSONFragment "remove $serviceName $nullField" $testContext.State.ComposeJSON "$fieldSource," $fieldPrefix
+            $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+            Assert-BehaviorOnlyError "reject missing $serviceName $nullField" $errors 'compose_effective_service_keys'
+
+            foreach ($mutation in @(
+                @{ Name = 'scalar'; JSON = '"unsafe"' },
+                @{ Name = 'empty array'; JSON = '[]' },
+                @{ Name = 'object'; JSON = '{}' },
+                @{ Name = 'list'; JSON = '["unsafe"]' }
+            )) {
+                $testContext = New-FakePreflightContext
+                $testContext.State.ComposeJSON = Replace-UniqueJSONFragment "set $serviceName $nullField $($mutation.Name)" $testContext.State.ComposeJSON $fieldSource "$fieldPrefix`"$nullField`":$($mutation.JSON)"
+                $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+                Assert-BehaviorOnlyError "reject $serviceName $nullField $($mutation.Name)" $errors 'compose_effective_service_keys'
+            }
+
+            $caseVariant = $nullField.Substring(0, 1).ToUpperInvariant() + $nullField.Substring(1)
+            $testContext = New-FakePreflightContext
+            $testContext.State.ComposeJSON = Replace-UniqueJSONFragment "case-variant $serviceName $nullField" $testContext.State.ComposeJSON $fieldSource "$fieldPrefix`"$caseVariant`":null"
+            $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+            Assert-BehaviorOnlyError "reject $serviceName case-variant $nullField" $errors 'compose_effective_service_keys'
+
+            $escapedField = if ($nullField -eq 'command') { '\u0063ommand' } else { '\u0065ntrypoint' }
+            $testContext = New-FakePreflightContext
+            $testContext.State.ComposeJSON = Replace-UniqueJSONFragment "escaped $serviceName $nullField" $testContext.State.ComposeJSON $fieldSource "$fieldPrefix`"$escapedField`":null"
+            $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+            Assert-BehaviorOnlyError "reject $serviceName escaped $nullField" $errors 'compose_effective_service_keys'
+
+            foreach ($duplicateMembers in @(
+                "`"$nullField`":`"unsafe`",`"$nullField`":null",
+                "`"$nullField`":null,`"$nullField`":`"unsafe`""
+            )) {
+                $testContext = New-FakePreflightContext
+                $testContext.State.ComposeJSON = Replace-UniqueJSONFragment "duplicate $serviceName $nullField $duplicateMembers" $testContext.State.ComposeJSON $fieldSource "$fieldPrefix$duplicateMembers"
+                $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+                Assert-BehaviorOnlyError "reject $serviceName duplicate $nullField $duplicateMembers" $errors 'compose_effective_service_keys'
+            }
+        }
+
+        $servicePrefix = '"' + $serviceName + '":{"cap_drop":["ALL"],'
+        $testContext = New-FakePreflightContext
+        $testContext.State.ComposeJSON = Replace-UniqueJSONFragment "remove both $serviceName null service keys" $testContext.State.ComposeJSON ($servicePrefix + '"command":null,"entrypoint":null,') $servicePrefix
+        $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+        Assert-BehaviorOnlyError "reject missing both $serviceName null service keys" $errors 'compose_effective_service_keys'
+    }
 
     foreach ($serviceName in @('postgres', 'relay')) {
         foreach ($key in @('extra_hosts', 'dns', 'dns_search', 'links', 'external_links', 'hostname', 'domainname', 'network_mode', 'pid', 'ipc', 'cgroup', 'runtime', 'devices', 'device_cgroup_rules', 'privileged', 'cap_add', 'build', 'pull_policy', 'configs', 'env_file', 'credential_spec', 'extends', 'profiles', 'unknown_effective_key')) {
