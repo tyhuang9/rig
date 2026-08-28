@@ -338,8 +338,9 @@ func BenchmarkOrdinaryInputAndViewWithLargeTranscript(b *testing.B) {
 func TestProtectedHistoryLimitClearAndNoPlaintext(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "history")
 	store := NewProtectedHistoryStore(path)
-	values := make([]string, 0, 105)
-	for i := 0; i < 105; i++ {
+	inputCount := historyLimit + 5
+	values := make([]string, 0, inputCount)
+	for i := 0; i < inputCount; i++ {
 		values = append(values, fmt.Sprintf("/job sensitive-marker-%03d", i))
 	}
 	values = append(values, "bad\ncommand", "")
@@ -350,7 +351,9 @@ func TestProtectedHistoryLimitClearAndNoPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded) != historyLimit || !strings.Contains(loaded[0], "005") || !strings.Contains(loaded[99], "104") {
+	firstRetained := inputCount - historyLimit
+	lastRetained := inputCount - 1
+	if len(loaded) != historyLimit || !strings.Contains(loaded[0], fmt.Sprintf("%03d", firstRetained)) || !strings.Contains(loaded[historyLimit-1], fmt.Sprintf("%03d", lastRetained)) {
 		t.Fatalf("bounded history = %#v", loaded)
 	}
 	raw, err := os.ReadFile(path)
