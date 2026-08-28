@@ -101,22 +101,31 @@ func IsClientCode(err error, code string) bool {
 }
 
 type RelayHTTPSClient struct {
-	origin *url.URL
-	client *http.Client
+	origin            *url.URL
+	githubClientID    string
+	githubRedirectURI string
+	client            *http.Client
 }
 
 // NewRelayHTTPSClient accepts an exact HTTPS origin. A nil transport creates a
 // hardened production transport that never consults ambient proxy settings.
 // Tests may inject a RoundTripper; redirect policy and total timeout remain
 // owned by this client in either case.
-func NewRelayHTTPSClient(rawOrigin string, transport http.RoundTripper) (*RelayHTTPSClient, error) {
+func NewRelayHTTPSClient(rawOrigin, githubClientID string, transport http.RoundTripper) (*RelayHTTPSClient, error) {
 	origin, err := parseCanonicalHTTPSOrigin(rawOrigin)
 	if err != nil {
 		return nil, err
 	}
+	if !validConfiguredGitHubClientID(githubClientID) {
+		return nil, errors.New("GitHub client ID is invalid")
+	}
+	callback := *origin
+	callback.Path = "/v1/github/callback"
 	return &RelayHTTPSClient{
-		origin: origin,
-		client: newRelayHTTPClient(transport, relayRequestTimeout),
+		origin:            origin,
+		githubClientID:    githubClientID,
+		githubRedirectURI: callback.String(),
+		client:            newRelayHTTPClient(transport, relayRequestTimeout),
 	}, nil
 }
 
@@ -148,7 +157,7 @@ func (client *RelayHTTPSClient) Start(ctx context.Context, input RelayEnrollment
 		AuthorizationURL string `json:"authorizationUrl"`
 		PollToken        string `json:"pollToken"`
 	}
-	if err = decodeStrictJSON(responseBody, &response); err != nil || !validAuthorizationURL(response.AuthorizationURL) {
+	if err = decodeStrictJSON(responseBody, &response); err != nil || !validAuthorizationURL(response.AuthorizationURL, client.githubClientID, client.githubRedirectURI, input.RepositoryID) {
 		return RelayEnrollmentStart{}, &ClientError{Code: "invalid_response"}
 	}
 	pollToken, err := decodeCanonicalBase64URL(response.PollToken, pollTokenBytes)
@@ -256,12 +265,53 @@ func decodeCanonicalBase64URL(value string, expectedBytes int) ([]byte, error) {
 	return decoded, nil
 }
 
-func validAuthorizationURL(raw string) bool {
+func validAuthorizationURL(raw, expectedClientID, expectedRedirectURI string, expectedRepositoryID int64) bool {
 	if raw == "" || len(raw) > 4096 || strings.IndexByte(raw, 0) >= 0 {
 		return false
 	}
 	parsed, err := url.Parse(raw)
-	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && parsed.Fragment == "" && parsed.String() == raw
+	if err != nil || parsed.Scheme != "https" || parsed.Host != "github.com" || parsed.User != nil || parsed.Opaque != "" || parsed.Path != "/login/oauth/authorize" || parsed.RawPath != "" || parsed.Fragment != "" || parsed.RawFragment != "" || parsed.ForceQuery || parsed.String() != raw {
+		return false
+	}
+	query, err := url.ParseQuery(parsed.RawQuery)
+	if err != nil || len(query) != 6 || query.Encode() != parsed.RawQuery || raw != "https://github.com/login/oauth/authorize?"+parsed.RawQuery {
+		return false
+	}
+	clientID, clientOK := singleQueryValue(query, "client_id")
+	redirectURI, redirectOK := singleQueryValue(query, "redirect_uri")
+	repositoryID, repositoryOK := singleQueryValue(query, "repository_id")
+	method, methodOK := singleQueryValue(query, "code_challenge_method")
+	stateValue, stateOK := singleQueryValue(query, "state")
+	challengeValue, challengeOK := singleQueryValue(query, "code_challenge")
+	if !clientOK || !redirectOK || !repositoryOK || !methodOK || !stateOK || !challengeOK || clientID != expectedClientID || redirectURI != expectedRedirectURI || repositoryID != strconv.FormatInt(expectedRepositoryID, 10) || method != "S256" {
+		return false
+	}
+	state, stateErr := decodeCanonicalBase64URL(stateValue, protocol.NonceBytes)
+	clear(state)
+	challenge, challengeErr := decodeCanonicalBase64URL(challengeValue, 32)
+	clear(challenge)
+	return stateErr == nil && challengeErr == nil
+}
+
+func singleQueryValue(query url.Values, key string) (string, bool) {
+	values, ok := query[key]
+	if !ok || len(values) != 1 || values[0] == "" {
+		return "", false
+	}
+	return values[0], true
+}
+
+func validConfiguredGitHubClientID(value string) bool {
+	if value == "" || len(value) > 255 {
+		return false
+	}
+	for index := range len(value) {
+		character := value[index]
+		if (character < 'A' || character > 'Z') && (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '.' && character != '_' && character != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func validRelayStatus(status, failureCode string, completedAt *time.Time) bool {

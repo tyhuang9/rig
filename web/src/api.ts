@@ -24,6 +24,10 @@ import {
   type MeResponse,
   type ReplaceApplicationConfigurationRequest,
   type RelayStatus,
+  type RelayBindingStatus,
+  type RelayEnrollmentStart,
+  type RelayEnrollmentStatus,
+  type RelayKeyRotationStatus,
   type ResumeApplicationAutoDeployRequest,
   type ReleaseList,
   type RuntimeApprovalList,
@@ -34,6 +38,7 @@ import {
   type SourceConnection,
   type SourceConnectionList,
   type SystemStatus,
+  type StartRelayEnrollmentRequest,
   type UpdateApplicationAutoDeployRequest,
 } from "./generated/api-contract";
 
@@ -59,8 +64,13 @@ export type {
   Release,
   RuntimeApproval,
   RelayStatus,
+  RelayBindingStatus,
+  RelayEnrollmentStart,
+  RelayEnrollmentStatus,
+  RelayKeyRotationStatus,
   ResumeApplicationAutoDeployRequest,
   UpdateApplicationAutoDeployRequest,
+  StartRelayEnrollmentRequest,
 } from "./generated/api-contract";
 
 export class APIError extends Error {
@@ -182,6 +192,23 @@ export const api = {
       body: JSON.stringify(data),
     }),
   relayStatus: () => request<RelayStatus>(operations.getRelayStatus.path),
+  startRelayEnrollment: (data: StartRelayEnrollmentRequest) =>
+    request<RelayEnrollmentStart>(operations.startRelayEnrollment.path, {
+      method: operations.startRelayEnrollment.method,
+      body: JSON.stringify(data),
+    }),
+  pollRelayEnrollment: (enrollmentId: string) =>
+    request<RelayEnrollmentStatus>(operationPath(operations.pollRelayEnrollment.path, { enrollmentId }), {
+      method: operations.pollRelayEnrollment.method,
+    }),
+  removeRelayBinding: (bindingId: string) =>
+    request<RelayBindingStatus>(operationPath(operations.removeRelayBinding.path, { bindingId }), {
+      method: operations.removeRelayBinding.method,
+    }),
+  startRelayKeyRotation: () =>
+    request<RelayKeyRotationStatus>(operations.startRelayKeyRotation.path, {
+      method: operations.startRelayKeyRotation.method,
+    }),
   applicationConfiguration: (id: string) =>
     request<ApplicationConfiguration>(operationPath(operations.getApplicationConfiguration.path, { appId: id })),
   replaceApplicationConfiguration: (id: string, data: ReplaceApplicationConfigurationRequest) =>

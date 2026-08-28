@@ -130,7 +130,7 @@ button:disabled { cursor: wait; opacity: .62; }
 .button.primary { border-color: #315ee8; background: #315ee8; color: #fff; }
 .button.primary:hover { background: #274ec9; }
 .button.small { min-height: 31px; padding: 6px 9px; font-size: 12px; }
-.button:focus-visible, .rail a:focus-visible, .rail-link:focus-visible, input:focus-visible, select:focus-visible, .text-button:focus-visible, .source-choice input:focus-visible, .source-panel a:focus-visible {
+.button:focus-visible, .rail a:focus-visible, .rail-link:focus-visible, input:focus-visible, select:focus-visible, .text-button:focus-visible, .source-choice input:focus-visible, .source-panel a:focus-visible, .relay-enrollment-status a:focus-visible {
   outline: 3px solid #274ec9;
   outline-offset: 2px;
 }
@@ -298,7 +298,7 @@ button:disabled { cursor: wait; opacity: .62; }
 .release-actions { display: flex !important; flex: 0 0 auto; align-items: center; gap: 8px; }
 .approval-state { color: #195e47; font-size: 12px; font-weight: 650; }
 .deployment-dialog-backdrop { position: fixed; z-index: 50; inset: 0; display: grid; place-items: center; padding: 18px; background: rgba(18, 24, 40, .46); }
-.deployment-dialog { width: min(100%, 520px); padding: 20px; border: 1px solid #d5d9df; border-radius: 10px; background: #fff; box-shadow: 0 16px 48px rgba(18, 24, 40, .22); }
+.deployment-dialog { width: min(100%, 520px); max-height: min(90vh, 720px); overflow-y: auto; padding: 20px; border: 1px solid #d5d9df; border-radius: 10px; background: #fff; box-shadow: 0 16px 48px rgba(18, 24, 40, .22); }
 .deployment-dialog h2 { margin: 0; font-size: 16px; }.deployment-dialog p { color: #4e5561; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
 .deployment-mode { display: grid; gap: 10px; margin: 16px 0; padding: 12px; border: 1px solid #d5d9df; border-radius: 8px; }.deployment-mode label { display: flex; min-height: 44px; gap: 8px; align-items: center; font-size: 13px; }
 .deployment-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }.danger-button { border-color: #b43d44; background: #b43d44; color: #fff; }
@@ -308,6 +308,44 @@ button:disabled { cursor: wait; opacity: .62; }
 .machine h2 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
 .machine p, .machine-meta { margin: 6px 0 0; color: #5f6672; font-size: 11px; overflow-wrap: anywhere; }
 .machine-meta { grid-column: 1 / -1; padding-top: 12px; border-top: 1px solid #e3e6ea; }
+
+.relay-panel { margin-top: 28px; padding: 20px; border: 1px solid #e3e6ea; border-radius: 10px; background: #fff; }
+.relay-heading, .relay-section-heading, .relay-binding-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.relay-heading h2, .relay-section-heading h3 { margin: 0; font-size: 16px; }
+.relay-heading p, .relay-section-heading p, .relay-muted, .relay-empty { margin: 5px 0 0; color: #5f6672; font-size: 12px; line-height: 1.5; }
+.relay-loading { display: grid; gap: 10px; min-height: 94px; margin-top: 18px; }
+.relay-loading i { display: block; height: 34px; border-radius: 8px; background: linear-gradient(90deg, #e9ebee 25%, #f7f8fa 38%, #e9ebee 63%); background-size: 400% 100%; animation: shimmer 1.1s infinite; }
+.relay-loading i:last-child { width: 72%; }
+.relay-status-error .button, .relay-enrollment-status .button { justify-self: start; }
+.relay-chunk-error .button { min-height: 44px; justify-self: start; }
+.relay-overview, .relay-binding dl, .relay-rotation, .relay-confirmation, .relay-enrollment-target { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px 14px; margin: 16px 0 0; }
+.relay-overview > div, .relay-binding dl > div, .relay-rotation > div, .relay-confirmation > div, .relay-enrollment-target > div { display: grid; min-width: 0; gap: 4px; }
+.relay-overview dt, .relay-binding dt, .relay-rotation dt, .relay-confirmation dt, .relay-enrollment-target dt { color: #616975; font-size: 10px; }
+.relay-overview dd, .relay-binding dd, .relay-rotation dd, .relay-confirmation dd, .relay-enrollment-target dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 12px; }
+.relay-section { margin-top: 22px; padding-top: 20px; border-top: 1px solid #e3e6ea; }
+.relay-section-heading > span { flex: 0 0 auto; padding: 4px 8px; border-radius: 999px; background: #eef1f5; color: #4e5561; font-size: 11px; font-weight: 650; text-transform: capitalize; }
+.relay-source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; gap: 10px 14px; margin-top: 14px; }
+.relay-source-grid > .field { max-width: none; margin: 0; }
+.relay-source-grid > .callout, .relay-enrollment-actions { grid-column: 1 / -1; }
+.relay-pagination { display: flex; align-items: center; gap: 8px; min-height: 38px; color: #5f6672; font-size: 12px; }
+.relay-enrollment-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-top: 4px; }
+.relay-enrollment-actions > span { color: #5f6672; font-size: 11px; overflow-wrap: anywhere; }
+.relay-enrollment-status a { color: #274ec9; font-weight: 650; }
+.relay-bindings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+.relay-binding { display: grid; align-content: start; gap: 12px; min-width: 0; padding: 14px; border: 1px solid #e3e6ea; border-radius: 9px; background: #fbfcfd; }
+.relay-binding-heading h4 { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
+.relay-binding dl { grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0; padding-top: 10px; border-top: 1px solid #e3e6ea; }
+.relay-binding > .button { justify-self: start; }
+.relay-state { flex: 0 0 auto; padding: 4px 8px; border-radius: 999px; background: #eef1f5; color: #4e5561; font-size: 11px; font-weight: 650; text-transform: capitalize; }
+.relay-state.authorized { background: #eaf7f1; color: #195e47; }
+.relay-state.access_lost, .relay-state.removal_pending { background: #fff6e7; color: #6d4c19; }
+.relay-rotation { margin-bottom: 14px; }
+.relay-confirmation { margin: 16px 0; padding: 12px; border: 1px solid #e3e6ea; border-radius: 8px; background: #fbfcfd; }
+.deployment-dialog:focus-visible, .callout[tabindex="-1"]:focus-visible { outline: 3px solid #274ec9; outline-offset: 2px; }
+
+@media (pointer: coarse), (max-width: 560px) {
+  .relay-enrollment-status a { display: inline-flex; align-items: center; min-height: 44px; }
+}
 
 .activity-list { overflow: hidden; }
 .activity-row { display: grid; grid-template-columns: 90px minmax(0, 1fr) auto minmax(100px, auto); align-items: center; gap: 12px; min-width: 0; padding: 12px 15px; border-bottom: 1px solid #e3e6ea; }
@@ -357,7 +395,7 @@ button:disabled { cursor: wait; opacity: .62; }
   .wizard ol { display: flex; overflow-x: auto; }
   .wizard li { flex: 0 0 auto; }
   .source-panel { width: 100%; }
-  .summary, .machine-list { grid-template-columns: 1fr; }
+  .summary, .machine-list, .relay-bindings { grid-template-columns: 1fr; }
   .configuration-row-fields { grid-template-columns: 1fr 1fr; }
   .configuration-remove { grid-column: 1 / -1; justify-self: start; }
   .configuration-row-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; }
@@ -415,6 +453,13 @@ button:disabled { cursor: wait; opacity: .62; }
   .deployment-result { grid-column: auto; }
   .release-actions { flex-wrap: wrap; justify-content: space-between; }
   .deployment-dialog-actions { flex-direction: column; }
+  .relay-panel { padding: 16px 14px; overflow: hidden; }
+  .relay-heading, .relay-section-heading, .relay-binding-heading { align-items: stretch; flex-direction: column; }
+  .relay-heading .button, .relay-binding > .button, .relay-section > .button, .relay-enrollment-actions .button { width: 100%; }
+  .relay-source-grid { grid-template-columns: minmax(0, 1fr); }
+  .relay-source-grid > .callout, .relay-enrollment-actions { grid-column: auto; }
+  .relay-pagination { flex-wrap: wrap; }
+  .relay-overview, .relay-binding dl, .relay-rotation, .relay-confirmation, .relay-enrollment-target { grid-template-columns: minmax(0, 1fr); }
   .wizard-pagination { flex-wrap: wrap; min-height: 44px; }
   .auth { padding: 14px; }
   .auth section { padding: 24px 20px; }
@@ -425,6 +470,7 @@ button:disabled { cursor: wait; opacity: .62; }
   .field input, .field select, .source-choice label { min-height: 44px; }
   .configuration-row .field input, .configuration-panel .button { min-height: 44px; }
   .auto-deploy-panel .button { min-height: 44px; }
+  .relay-panel .button, .relay-panel select, .deployment-dialog .button { min-height: 44px; }
   .configuration-row { gap: 10px; }
   .field input, .field select { height: 44px; }
 }

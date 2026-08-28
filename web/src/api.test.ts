@@ -185,4 +185,24 @@ describe("API client", () => {
     await expect(api.relayStatus()).rejects.toEqual(expect.objectContaining<Partial<APIError>>({ code: "relay_unavailable", detail: "Relay is unavailable" }));
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/relay/status", expect.objectContaining({ credentials: "same-origin" }));
   });
+
+  it("uses generated relay mutation paths, exact bodies, encoding, and CSRF", async () => {
+    const enrollment = { connectionId: "a".repeat(32), installationId: 2, repositoryId: 3 };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ enrollmentId: "enrollment", authorizationUrl: "https://github.com/login/oauth/authorize", status: "pending", expiresAt: "2026-08-27T12:00:00Z" }), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ enrollmentId: "enrollment", status: "pending", createdAt: "2026-08-27T11:00:00Z", expiresAt: "2026-08-27T12:00:00Z", updatedAt: "2026-08-27T11:00:00Z" }), { status: 202 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ bindingId: "binding", state: "removal_pending", updatedAt: "2026-08-27T11:00:00Z" }), { status: 202 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ rotationId: "rotation", state: "prepare", expiresAt: "2026-08-27T12:00:00Z" }), { status: 202 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.startRelayEnrollment(enrollment);
+    await api.pollRelayEnrollment("enrollment/one");
+    await api.removeRelayBinding("binding/one");
+    await api.startRelayKeyRotation();
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/relay/enrollments", expect.objectContaining({ method: "POST", body: JSON.stringify(enrollment), headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/relay/enrollments/enrollment%2Fone/poll", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/v1/relay/bindings/binding%2Fone", expect.objectContaining({ method: "DELETE", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/v1/relay/key-rotations", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+  });
 });
