@@ -301,7 +301,7 @@ require_commands() {
   local command
   local compose_version
   for command in docker openssl pwsh stat id curl awk grep find base64 od sha256sum \
-    install sed sort head tail seq tr cut cmp diff date ss uname sleep chmod chown cat; do
+    install sed sort head tail seq tr cut cmp diff date ss uname sleep chmod chown cat jq; do
     command -v "${command}" >/dev/null 2>&1 || fail "required command unavailable"
   done
   docker info >/dev/null 2>&1 || fail "Docker daemon unavailable"
@@ -643,6 +643,7 @@ run_lifecycle() {
   local system_before
   local system_after
   local sanitized_error
+  local network_summary
 
   [[ "$(uname -s)" == "Linux" ]] || fail "hosted Linux is required"
   [[ "${CI:-}" == "true" && "${GITHUB_ACTIONS:-}" == "true" ]] || fail "hosted CI guard unavailable"
@@ -679,6 +680,16 @@ run_lifecycle() {
       "${STATE_DIRECTORY}/packaging-preflight.log" | tail -n 1 || true)"
     if [[ -n "${sanitized_error}" ]]; then
       printf '%s\n' "${sanitized_error}" >&2
+    fi
+    if [[ "${sanitized_error}" == *"compose_effective_networks"* ]]; then
+      network_summary="$(docker compose --env-file "${ENVIRONMENT_FILE}" --file "${COMPOSE_FILE}" \
+        config --format json 2>/dev/null | jq --compact-output \
+        '.networks | to_entries | map({key: .key, fields: (.value | keys | sort), internal: (.value.internal // false), external: (.value.external // false), name: .value.name})')"
+      if [[ -n "${network_summary}" && "${network_summary}" != *$'\n'* ]] &&
+         (( ${#network_summary} <= 2048 )); then
+        printf 'relay Compose lifecycle network summary: compose=%s model=%s\n' \
+          "$(docker compose version --short)" "${network_summary}" >&2
+      fi
     fi
     fail "packaging preflight rejected the isolated fixture"
   fi
