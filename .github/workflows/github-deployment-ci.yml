@@ -122,6 +122,7 @@ jobs:
           tee_status="${pipeline_status[1]:-1}"
           if (( go_status != 0 || tee_status != 0 )); then
             jq -c --arg package_name "$package_name" 'select(.Action == "fail" and .Package == $package_name) | {Action, Package, Test, Elapsed}' "$output" >&2 || true
+            jq -c --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "output" and .Package == $package_name and .Test == $test_name) | (.Output | capture("(?<Location>relay_outage_integration_test\\.go:[0-9]+:)")) | {Location}' "$output" >&2 || true
             if (( go_status != 0 )); then
               exit "$go_status"
             fi
