@@ -19,15 +19,16 @@
 - [x] Add the separately deployable PostgreSQL-backed relay and versioned authenticated WSS protocol.
 - [x] Add latest-head automatic deployment, reconciliation, coalescing, and pause/resume behavior.
 - [x] Add deployment, approval, auto-deploy, and relay-management dashboard experiences.
+- [x] Add hosted deterministic Chromium execution for the embedded hostd and GitHub source-wizard flows.
 - [x] Publish the implementation as a strictly ordered stack of narrow pull requests without merging them.
 
 ## External promotion gates
 
 - [ ] Exercise the private-repository, live GitHub App, deployed relay, and offline latest-head acceptance flow in staging.
 - [ ] Exercise live Docker Compose mutation, health failure, approval/resume, cancellation, crash recovery, and prior-release recovery on disposable Linux and Windows hosts.
-- [ ] Exercise live PostgreSQL migration/restore, TLS/SNI proxying, relay recovery/redelivery, reconnect/load behavior, and alert routing.
-- [ ] Run Linux race, file-owner/mode/no-follow, container hardening, multi-architecture image, SBOM, signature, and provenance checks.
-- [ ] Run real-browser, screen-reader, and physical-device coverage beyond the automated Chromium checks.
+- [ ] Exercise live PostgreSQL restore, TLS/SNI proxying, relay recovery/redelivery, reconnect/load behavior, and alert routing beyond hosted PostgreSQL integration tests.
+- [ ] Run container hardening, multi-architecture image, SBOM, signature, and provenance checks beyond hosted Linux race, real-filesystem permission/no-follow, and native linux/amd64 image evidence.
+- [ ] Run additional real-browser, screen-reader, and physical-device coverage beyond the hosted Chromium workflow.
 
 ## Explicitly deferred
 

@@ -4,6 +4,7 @@ import { createServer } from "node:net";
 import { access, mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { JobMutationResponse } from "../src/generated/api-contract";
 
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 const screenshotDir = process.env.HOSTD_SCREENSHOT_DIR ?? path.join(repoRoot, "artifacts", "screenshots");
@@ -127,10 +128,14 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
   expect((await csrfRestore).ok()).toBe(true);
   await expect(restoredPage.getByRole("heading", { name: longName })).toBeVisible();
   expect(await restoredPage.evaluate(() => window.sessionStorage.getItem("hostd-csrf"))).toBeTruthy();
-  await expect(restoredPage.getByRole("button", { name: "Deploy with fake runtime" })).toBeVisible();
+  await expect(restoredPage.getByRole("button", { name: "Deploy latest" })).toBeVisible();
   await expect(restoredPage.getByText("Development capability")).toBeVisible();
-  await restoredPage.getByRole("button", { name: "Deploy with fake runtime" }).click();
-  await expect(restoredPage.getByText(/Deployment job queued:/)).toBeVisible();
+  const deployResponse = restoredPage.waitForResponse((response) =>
+    response.request().method() === "POST" && new URL(response.url()).pathname.endsWith("/deployments"),
+  );
+  await restoredPage.getByRole("button", { name: "Deploy latest" }).click();
+  const deployment = await (await deployResponse).json() as JobMutationResponse;
+  await expect(restoredPage.getByText(`Deployment job ${deployment.job.id} queued.`, { exact: true })).toBeVisible();
   expect(await restoredPage.evaluate(() => window.sessionStorage.getItem("hostd-csrf"))).toBeTruthy();
 
   await restoredPage.getByRole("link", { name: "Activity" }).click();
@@ -138,11 +143,15 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
   const activity = restoredPage.locator(".activity-row").filter({ hasText: "deploy application" }).first();
   await expect(activity.getByRole("button", { name: "Cancel job" })).toBeVisible();
   await activity.getByRole("button", { name: "Cancel job" }).click();
-  await expect(activity.locator('[role="status"]').filter({ hasText: "Cancellation recorded" })).toBeVisible();
+  const cancellationStatus = activity.getByRole("status");
+  await expect(cancellationStatus).toHaveText("Cancellation recorded. Job cancelled.");
+  await expect(cancellationStatus).toHaveAttribute("aria-live", "polite");
+  await expect(cancellationStatus).toHaveAttribute("aria-atomic", "true");
   await expect(activity.getByText("cancelled", { exact: true })).toBeVisible();
+  await expect(activity.locator("button")).toHaveCount(0);
   await restoredPage.getByRole("link", { name: "Machines" }).click();
   await expect(restoredPage.getByRole("heading", { name: "Machines" })).toBeVisible();
-  await expect(restoredPage.getByText(/Local controller/)).toBeVisible();
+  await expect(restoredPage.getByText("Local controller · independent runtime diagnostics", { exact: true })).toBeVisible();
   await restoredPage.getByRole("link", { name: "Applications" }).click();
   await expect(restoredPage.getByText(longName)).toBeVisible();
 
