@@ -146,8 +146,19 @@ func TestIssuerUsesInjectedEntropyAndClock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hello.SentAt.Equal(now) || hello.MessageID == "" || hello.ClientNonce == "" {
+	if !hello.SentAt.Equal(now) || hello.MessageID == "" || hello.ClientNonce == "" || hello.ACKState == nil {
 		t.Fatalf("unexpected hello: %#v", hello)
+	}
+	encodedHello, err := Encode(hello, DefaultMaxEnvelopeBytes)
+	if err != nil {
+		t.Fatalf("encode hello with empty ACK state: %v", err)
+	}
+	decodedHello, err := Decode(encodedHello, DefaultMaxEnvelopeBytes)
+	if err != nil {
+		t.Fatalf("decode hello with empty ACK state: %v", err)
+	}
+	if decodedHello.(*Hello).ACKState == nil {
+		t.Fatal("empty ACK state was not preserved as a JSON array")
 	}
 	issuer = Issuer{Entropy: bytes.NewReader(entropyBytes), Now: func() time.Time { return now }}
 	hello2, err := issuer.NewHello(idController, idKey, []ACKState{})
@@ -156,6 +167,12 @@ func TestIssuerUsesInjectedEntropyAndClock(t *testing.T) {
 	}
 	if !reflect.DeepEqual(hello, hello2) {
 		t.Fatal("injected issuer is not deterministic")
+	}
+	if sorted := SortACKState([]ACKState{}); sorted == nil {
+		t.Fatal("sorting an empty ACK state returned nil")
+	}
+	if sorted := SortACKState(nil); sorted != nil {
+		t.Fatal("sorting nil ACK state changed its validation semantics")
 	}
 	issuer = Issuer{Entropy: bytes.NewReader(entropyBytes), Now: func() time.Time { return now }}
 	challenge, err := issuer.NewChallenge(time.Minute, []ACKState{})

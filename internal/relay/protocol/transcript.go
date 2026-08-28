@@ -117,7 +117,10 @@ func ValidateACKState(state []ACKState) error {
 }
 
 func SortACKState(state []ACKState) []ACKState {
-	canonical := append([]ACKState(nil), state...)
+	if state == nil {
+		return nil
+	}
+	canonical := append([]ACKState{}, state...)
 	sort.Slice(canonical, func(i, j int) bool { return canonical[i].SubscriptionID < canonical[j].SubscriptionID })
 	return canonical
 }
@@ -140,7 +143,7 @@ func (i Issuer) NewHello(controllerID, keyID string, state []ACKState) (*Hello, 
 	if err != nil {
 		return nil, err
 	}
-	return &Hello{Envelope: envelope, ControllerID: controllerID, KeyID: keyID, ClientNonce: nonce, ACKState: append([]ACKState(nil), state...)}, nil
+	return &Hello{Envelope: envelope, ControllerID: controllerID, KeyID: keyID, ClientNonce: nonce, ACKState: append([]ACKState{}, state...)}, nil
 }
 
 func (i Issuer) NewChallenge(lifetime time.Duration, state []ACKState) (*Challenge, error) {
