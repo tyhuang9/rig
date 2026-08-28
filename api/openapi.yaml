@@ -7,6 +7,15 @@ servers:
   - url: http://127.0.0.1:7345
 security:
   - sessionCookie: []
+x-rig-problem-codes:
+  authentication_required: {description: GitHub authorization does not permit the requested operation, statuses: [403]}
+  source_access_lost: {description: Access to the selected GitHub source must be restored, statuses: [409]}
+  provider_unavailable: {description: GitHub or its configured integration is temporarily unavailable, statuses: [503]}
+  invalid_source: {description: The selected GitHub source is invalid or cannot be used, statuses: [400, 422]}
+  approval_required: {description: Deployment requires an administrator approval before it can continue, statuses: [409]}
+  application_busy: {description: The application already has an active conflicting operation, statuses: [409]}
+  source_too_large: {description: The source exceeds the supported inspection limits, statuses: [413]}
+  relay_unavailable: {description: The configured controller relay is unavailable, statuses: [503]}
 x-job-responses: &jobResponses
   '200': {description: Existing idempotent job, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
   '202': {description: Job accepted, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
@@ -77,6 +86,7 @@ paths:
         default: {$ref: '#/components/responses/Problem'}
     post:
       operationId: createApplication
+      x-rig-problem-codes: [authentication_required, source_access_lost, provider_unavailable, invalid_source, source_too_large]
       security: [{sessionCookie: [], csrfHeader: []}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CreateApplicationRequest'}}}}
       responses:
@@ -85,6 +95,7 @@ paths:
   /api/v1/apps/import/inspect:
     post:
       operationId: inspectImport
+      x-rig-problem-codes: [authentication_required, source_access_lost, provider_unavailable, invalid_source, source_too_large]
       security: [{sessionCookie: [], csrfHeader: []}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/InspectRequest'}}}}
       responses:
@@ -113,6 +124,7 @@ paths:
         default: {$ref: '#/components/responses/Problem'}
     post:
       operationId: deployApplication
+      x-rig-problem-codes: [application_busy]
       security: [{sessionCookie: [], csrfHeader: []}]
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
       responses: *jobResponses
@@ -127,6 +139,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/ReleaseId'}]
     post:
       operationId: deployRelease
+      x-rig-problem-codes: [application_busy]
       security: [{sessionCookie: [], csrfHeader: []}]
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/DeployReleaseRequest'}}}}
@@ -158,18 +171,21 @@ paths:
     parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
     post:
       operationId: startApplication
+      x-rig-problem-codes: [application_busy]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses: *jobResponses
   /api/v1/apps/{appId}/stop:
     parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
     post:
       operationId: stopApplication
+      x-rig-problem-codes: [application_busy]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses: *jobResponses
   /api/v1/apps/{appId}/restart:
     parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
     post:
       operationId: restartApplication
+      x-rig-problem-codes: [application_busy]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses: *jobResponses
   /api/v1/apps/{appId}/logs/stream:
@@ -211,6 +227,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/JobId'}]
     post:
       operationId: resumeJob
+      x-rig-problem-codes: [approval_required]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
         '200': {description: Paused job atomically requeued, content: {application/json: {schema: {$ref: '#/components/schemas/JobResponse'}}}}
@@ -251,6 +268,7 @@ paths:
   /api/v1/source-connections/github/device:
     post:
       operationId: startGitHubDeviceConnection
+      x-rig-problem-codes: [authentication_required, provider_unavailable]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
         '201': {description: GitHub device authorization started, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubDeviceAuthorization'}}}}
@@ -267,6 +285,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/ConnectionId'}]
     post:
       operationId: pollGitHubDeviceConnection
+      x-rig-problem-codes: [authentication_required, source_access_lost, provider_unavailable]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
         '200': {description: GitHub connection established, content: {application/json: {schema: {$ref: '#/components/schemas/SourceConnection'}}}}
@@ -277,6 +296,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/ConnectionId'}]
     post:
       operationId: refreshSourceConnection
+      x-rig-problem-codes: [authentication_required, source_access_lost, provider_unavailable]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
         '200': {description: Source credentials refreshed, content: {application/json: {schema: {$ref: '#/components/schemas/SourceConnection'}}}}
@@ -285,6 +305,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/ConnectionId'}, {$ref: '#/components/parameters/Page'}, {$ref: '#/components/parameters/PerPage'}]
     get:
       operationId: listGitHubInstallations
+      x-rig-problem-codes: [authentication_required, source_access_lost, provider_unavailable]
       description: Fetches a live provider page and updates only that page's display cache. Cached rows never authorize source access.
       responses:
         '200': {description: Live GitHub App installations, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubInstallationPage'}}}}
@@ -293,6 +314,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/ConnectionId'}, {$ref: '#/components/parameters/InstallationId'}, {$ref: '#/components/parameters/Page'}, {$ref: '#/components/parameters/PerPage'}]
     get:
       operationId: listGitHubRepositories
+      x-rig-problem-codes: [source_access_lost, provider_unavailable, invalid_source, source_too_large]
       description: Lists repositories currently accessible through the authenticated user's selected GitHub App installation.
       responses:
         '200': {description: Live accessible repositories, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubRepositoryPage'}}}}
@@ -301,6 +323,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/ConnectionId'}, {$ref: '#/components/parameters/InstallationId'}, {$ref: '#/components/parameters/RepositoryId'}, {$ref: '#/components/parameters/Page'}, {$ref: '#/components/parameters/PerPage'}]
     get:
       operationId: listGitHubBranches
+      x-rig-problem-codes: [source_access_lost, provider_unavailable, invalid_source, source_too_large]
       description: Revalidates the immutable repository ID within the selected installation before listing branches.
       responses:
         '200': {description: Live repository branches, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubBranchPage'}}}}
@@ -308,12 +331,14 @@ paths:
   /api/v1/relay/status:
     get:
       operationId: getRelayStatus
+      x-rig-problem-codes: [relay_unavailable]
       responses:
         '200': {description: Relay availability, safe operator diagnostics, and owner-scoped durable management state, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/RelayStatus'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/relay/enrollments:
     post:
       operationId: startRelayEnrollment
+      x-rig-problem-codes: [authentication_required, source_access_lost, provider_unavailable, invalid_source, relay_unavailable]
       security: [{sessionCookie: [], csrfHeader: []}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/StartRelayEnrollmentRequest'}}}}
       responses:
@@ -323,6 +348,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/EnrollmentId'}]
     post:
       operationId: pollRelayEnrollment
+      x-rig-problem-codes: [relay_unavailable]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
         '200': {description: Relay enrollment reached a terminal state, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/RelayEnrollmentStatus'}}}}
@@ -332,6 +358,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/BindingId'}]
     delete:
       operationId: removeRelayBinding
+      x-rig-problem-codes: [relay_unavailable]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
         '200': {description: Relay binding removed, content: {application/json: {schema: {$ref: '#/components/schemas/RelayBindingStatus'}}}}
@@ -340,6 +367,7 @@ paths:
   /api/v1/relay/key-rotations:
     post:
       operationId: startRelayKeyRotation
+      x-rig-problem-codes: [relay_unavailable]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
         '202': {description: Relay key rotation started, content: {application/json: {schema: {$ref: '#/components/schemas/RelayKeyRotationStatus'}}}}
@@ -353,6 +381,7 @@ paths:
         default: {$ref: '#/components/responses/Problem'}
     put:
       operationId: updateApplicationAutoDeploy
+      x-rig-problem-codes: [source_access_lost, application_busy]
       security: [{sessionCookie: [], csrfHeader: []}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/UpdateApplicationAutoDeployRequest'}}}}
       responses:
@@ -362,6 +391,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/AppId'}]
     post:
       operationId: resumeApplicationAutoDeploy
+      x-rig-problem-codes: [source_access_lost]
       security: [{sessionCookie: [], csrfHeader: []}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ResumeApplicationAutoDeployRequest'}}}}
       responses:

@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "34f3a400735bd02a4a72e683631ac253e4684225ca0338597f85fbd81e627b01"
+const SourceSHA256 = "1c8ec9ebe9b0973b5daf64ceeb0aecb42abb0a7b4c011175facb9731ff525477"
 
 var Operations = map[string]Operation{
 	"bootstrap":                       {Method: "POST", Path: "/api/v1/auth/bootstrap"},
