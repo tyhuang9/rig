@@ -66,8 +66,47 @@ func TestMigrateFreshUpgradePreservesDataAndIsIdempotent(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&versions); err != nil {
 		t.Fatal(err)
 	}
-	if users != 1 || versions != 3 {
+	if users != 1 || versions != 4 {
 		t.Fatalf("preserved users = %d, migration versions = %d", users, versions)
+	}
+}
+
+func TestReleaseSnapshotMigrationPreservesLegacyReleasesAndPreventsReadyDuplicates(t *testing.T) {
+	db := openMemoryDatabase(t)
+	if err := Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES ('app','app','App','draft',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at) VALUES ('legacy','app','ready','{}',datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,compose_path,workspace_state) VALUES ('ready','app','ready','{}',datetime('now'),'github',7,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','compose.yaml','ready')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,compose_path,workspace_state) VALUES ('duplicate','app','ready','{}',datetime('now'),'github',7,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','compose.yaml','ready')`); err == nil {
+		t.Fatal("duplicate ready snapshot was accepted")
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,compose_path,workspace_state) VALUES ('failed','app','failed','{}',datetime('now'),'github',7,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','compose.yaml','failed')`); err != nil {
+		t.Fatalf("failed retry was rejected: %v", err)
+	}
+	var state sql.NullString
+	if err := db.QueryRow(`SELECT workspace_state FROM releases WHERE id='legacy'`).Scan(&state); err != nil || state.Valid {
+		t.Fatalf("legacy workspace state = %#v, %v", state, err)
+	}
+}
+
+func TestReleaseSnapshotMigrationContainsNoSensitiveMaterial(t *testing.T) {
+	body, err := migrations.ReadFile("migrations/004_release_snapshots.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lower := strings.ToLower(string(body))
+	for _, forbidden := range []string{"access_token", "refresh_token", "archive_body", "compose_document", "secret", "variable"} {
+		if strings.Contains(lower, forbidden) {
+			t.Errorf("migration contains forbidden material %q", forbidden)
+		}
 	}
 }
 

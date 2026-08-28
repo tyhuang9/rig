@@ -1,0 +1,366 @@
+package releasesnapshot
+
+import (
+	"archive/tar"
+	"bufio"
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+	"unicode/utf8"
+)
+
+const (
+	MaxCompressedBytes = 64 << 20
+	MaxExtractedBytes  = 256 << 20
+	MaxTarBytes        = MaxExtractedBytes + 64<<20 // payload plus bounded tar metadata/padding
+	MaxFileBytes       = 32 << 20
+	MaxArchiveEntries  = 20000
+	MaxPathDepth       = 64
+	MaxPathBytes       = 1024
+	MaxSegmentBytes    = 255
+)
+
+var (
+	errTooLarge = errors.New("archive too large")
+	errProvider = errors.New("archive provider stream")
+	errLocal    = errors.New("archive local io")
+)
+
+func downloadArchive(ctx context.Context, body io.ReadCloser, destination string) (string, error) {
+	defer body.Close()
+	f, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("%w: create", errLocal)
+	}
+	h := sha256.New()
+	var written int64
+	buf := make([]byte, 32<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = f.Close()
+			if removeErr := os.Remove(destination); removeErr != nil {
+				return "", fmt.Errorf("%w: cleanup", errLocal)
+			}
+			return "", err
+		}
+		n, readErr := body.Read(buf)
+		if n > 0 {
+			w, writeErr := f.Write(buf[:n])
+			if writeErr != nil || w != n {
+				_ = f.Close()
+				if removeErr := os.Remove(destination); removeErr != nil {
+					return "", fmt.Errorf("%w: cleanup", errLocal)
+				}
+				return "", fmt.Errorf("%w: write", errLocal)
+			}
+			_, _ = h.Write(buf[:n])
+			written += int64(n)
+			if written > MaxCompressedBytes {
+				_ = f.Close()
+				if removeErr := os.Remove(destination); removeErr != nil {
+					return "", fmt.Errorf("%w: cleanup", errLocal)
+				}
+				return "", errTooLarge
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			_ = f.Close()
+			if removeErr := os.Remove(destination); removeErr != nil {
+				return "", fmt.Errorf("%w: cleanup", errLocal)
+			}
+			return "", fmt.Errorf("%w: read", errProvider)
+		}
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		if removeErr := os.Remove(destination); removeErr != nil {
+			return "", fmt.Errorf("%w: cleanup", errLocal)
+		}
+		return "", fmt.Errorf("%w: close", errLocal)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func extractArchive(ctx context.Context, archivePath, destination string) error {
+	return extractArchiveWithLimit(ctx, archivePath, destination, MaxTarBytes)
+}
+func extractArchiveWithLimit(ctx context.Context, archivePath, destination string, tarLimit int64) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return fmt.Errorf("%w: open", errLocal)
+	}
+	defer f.Close()
+	buffered := bufio.NewReader(f)
+	gz, err := gzip.NewReader(buffered)
+	if err != nil {
+		return errors.New("invalid gzip")
+	}
+	gz.Multistream(false)
+	limited := newTarLimitReader(gz, tarLimit)
+	tr := tar.NewReader(limited)
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		return fmt.Errorf("%w: mkdir", errLocal)
+	}
+	var root string
+	rootHeader := false
+	seen := map[string]struct{}{}
+	caseFolded := map[string]string{}
+	var entries int
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			if limited.overflow {
+				return errTooLarge
+			}
+			return errors.New("invalid tar")
+		}
+		entries++
+		if entries > MaxArchiveEntries {
+			return errTooLarge
+		}
+		if h.Typeflag != tar.TypeDir && h.Typeflag != tar.TypeReg && h.Typeflag != tar.TypeRegA {
+			return errors.New("unsupported archive entry")
+		}
+		if h.Typeflag == tar.TypeDir && h.Size != 0 {
+			return errors.New("unsafe archive entry")
+		}
+		if h.Size < 0 || h.Size > MaxFileBytes || hasSparse(h) {
+			return errors.New("unsafe archive entry")
+		}
+		name := h.Name
+		if h.Typeflag == tar.TypeDir {
+			name = strings.TrimSuffix(name, "/")
+		}
+		archiveName, err := validArchiveName(name)
+		if err != nil {
+			return err
+		}
+		parts := strings.Split(archiveName, "/")
+		if root == "" {
+			root = parts[0]
+		} else if parts[0] != root {
+			return errors.New("multiple archive roots")
+		}
+		if len(parts) == 1 {
+			if h.Typeflag != tar.TypeDir || rootHeader {
+				return errors.New("root is not directory")
+			}
+			rootHeader = true
+			continue
+		}
+		rel := strings.Join(parts[1:], "/")
+		if _, ok := seen[rel]; ok {
+			return errors.New("duplicate archive entry")
+		}
+		seen[rel] = struct{}{}
+		fold := strings.ToLower(rel)
+		partsFold := strings.Split(fold, "/")
+		partsOriginal := strings.Split(rel, "/")
+		for i := 1; i < len(partsFold); i++ {
+			prefix := strings.Join(partsFold[:i], "/")
+			spelling := strings.Join(partsOriginal[:i], "/")
+			if existing, ok := caseFolded[prefix]; ok && existing != spelling {
+				return errors.New("case-folding archive collision")
+			}
+			caseFolded[prefix] = spelling
+		}
+		if existing, ok := caseFolded[fold]; ok && existing != rel {
+			return errors.New("case-folding archive collision")
+		}
+		if _, ok := caseFolded[fold]; ok {
+			return errors.New("duplicate archive entry")
+		}
+		caseFolded[fold] = rel
+		out := filepath.Join(destination, filepath.FromSlash(rel))
+		if !within(destination, out) {
+			return errors.New("workspace escape")
+		}
+		if h.Typeflag == tar.TypeDir {
+			if err := os.MkdirAll(out, 0o700); err != nil {
+				return fmt.Errorf("%w: mkdir", errLocal)
+			}
+			continue
+		}
+		total += h.Size
+		if total > MaxExtractedBytes {
+			return errTooLarge
+		}
+		if err := os.MkdirAll(filepath.Dir(out), 0o700); err != nil {
+			return fmt.Errorf("%w: mkdir", errLocal)
+		}
+		mode := os.FileMode(0o600)
+		if h.FileInfo().Mode()&0o111 != 0 {
+			mode = 0o700
+		}
+		outFile, err := os.OpenFile(out, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+		if err != nil {
+			return fmt.Errorf("%w: create", errLocal)
+		}
+		written, copyErr := copyTarToFile(ctx, outFile, io.LimitReader(tr, h.Size+1))
+		closeErr := outFile.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return fmt.Errorf("%w: close", errLocal)
+		}
+		if written != h.Size {
+			return errors.New("truncated tar entry")
+		}
+	}
+	if limited.overflow {
+		return errTooLarge
+	}
+	if root == "" || !rootHeader {
+		return errors.New("rootless archive")
+	}
+	// gzip's EOF check validates checksum. A single immutable stream is
+	// required so trailing members and raw bytes cannot be smuggled in.
+	if extra, err := io.Copy(io.Discard, limited); err != nil {
+		return errors.New("invalid gzip")
+	} else if limited.overflow {
+		return errTooLarge
+	} else if extra != 0 {
+		return errors.New("invalid tar")
+	}
+	if _, err := buffered.ReadByte(); err != io.EOF {
+		return errors.New("trailing archive data")
+	}
+	return nil
+}
+
+func copyTarToFile(ctx context.Context, file *os.File, reader io.Reader) (int64, error) {
+	buffer := make([]byte, 32<<10)
+	var written int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		n, readErr := reader.Read(buffer)
+		if n > 0 {
+			count, writeErr := file.Write(buffer[:n])
+			written += int64(count)
+			if writeErr != nil || count != n {
+				return written, fmt.Errorf("%w: write", errLocal)
+			}
+		}
+		if readErr == io.EOF {
+			return written, nil
+		}
+		if readErr != nil {
+			return written, readErr
+		}
+	}
+}
+
+func hasSparse(h *tar.Header) bool {
+	for key := range h.PAXRecords {
+		if strings.HasPrefix(strings.ToLower(key), "gnu.sparse") {
+			return true
+		}
+	}
+	return h.Format == tar.FormatGNU && (h.PAXRecords["GNU.sparse.map"] != "")
+}
+func validArchiveName(name string) (string, error) {
+	if !utf8.ValidString(name) || name == "" || strings.ContainsAny(name, "\\\x00") || strings.HasPrefix(name, "/") || len(name) > MaxPathBytes || path.Clean(name) != name {
+		return "", errors.New("unsafe archive path")
+	}
+	parts := strings.Split(name, "/")
+	if len(parts) > MaxPathDepth {
+		return "", errors.New("unsafe archive path")
+	}
+	for _, part := range parts {
+		if !safeSegment(part) {
+			return "", errors.New("unsafe archive path")
+		}
+	}
+	return name, nil
+}
+func safeSegment(value string) bool {
+	if value == "" || value == "." || value == ".." || len(value) > MaxSegmentBytes || strings.HasSuffix(value, ".") || strings.HasSuffix(value, " ") || strings.ContainsAny(value, "<>:\"|?*") {
+		return false
+	}
+	for _, r := range value {
+		if r < 0x20 {
+			return false
+		}
+	}
+	base := strings.ToUpper(strings.Split(value, ".")[0])
+	switch base {
+	case "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³":
+		return false
+	}
+	return true
+}
+func within(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+func copyContext(ctx context.Context, w io.Writer, r io.Reader) (int64, error) {
+	buf := make([]byte, 32<<10)
+	var n int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return n, err
+		}
+		read, err := r.Read(buf)
+		if read > 0 {
+			written, writeErr := w.Write(buf[:read])
+			n += int64(written)
+			if writeErr != nil {
+				return n, writeErr
+			}
+			if written != read {
+				return n, io.ErrShortWrite
+			}
+		}
+		if err == io.EOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
+	}
+}
+
+type tarLimitReader struct {
+	r         io.Reader
+	remaining int64
+	overflow  bool
+}
+
+func newTarLimitReader(reader io.Reader, limit int64) *tarLimitReader {
+	return &tarLimitReader{r: reader, remaining: limit + 1}
+}
+
+func (r *tarLimitReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:int(r.remaining)]
+	}
+	n, err := r.r.Read(p)
+	r.remaining -= int64(n)
+	if r.remaining == 0 {
+		r.overflow = true
+	}
+	return n, err
+}

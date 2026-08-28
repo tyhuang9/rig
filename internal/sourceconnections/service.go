@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -25,6 +26,10 @@ type repositoryProvider interface {
 	Branch(context.Context, string, int64, string) (githubapp.Branch, error)
 	Tree(context.Context, string, int64, string) (githubapp.Tree, error)
 	Content(context.Context, string, int64, string, string) ([]byte, error)
+}
+
+type archiveProvider interface {
+	Archive(context.Context, string, int64, string) (io.ReadCloser, error)
 }
 
 type Error struct {
@@ -370,6 +375,29 @@ func (service *Service) ReadContent(ctx context.Context, owner, id string, repos
 	})
 	if err != nil {
 		return nil, sourceOperationError(err, false)
+	}
+	return result, nil
+}
+
+// DownloadArchive opens a short-lived, authenticated archive stream for an
+// immutable commit. Callers must close the result promptly and never retain
+// the access token or provider response metadata.
+func (service *Service) DownloadArchive(ctx context.Context, owner, id string, repositoryID int64, sha string) (io.ReadCloser, error) {
+	provider, ok := service.provider.(archiveProvider)
+	if !ok {
+		return nil, &Error{Code: "provider_unavailable"}
+	}
+	var result io.ReadCloser
+	err := service.withAccess(ctx, owner, id, func(_ repositoryProvider, token string) error {
+		var providerErr error
+		result, providerErr = provider.Archive(ctx, token, repositoryID, sha)
+		return providerErr
+	})
+	if err != nil {
+		return nil, sourceOperationError(err, true)
+	}
+	if result == nil {
+		return nil, &Error{Code: "provider_unavailable"}
 	}
 	return result, nil
 }

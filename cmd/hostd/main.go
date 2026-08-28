@@ -21,6 +21,7 @@ import (
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
+	"github.com/hostd/hostd/internal/releasesnapshot"
 	"github.com/hostd/hostd/internal/runtime/docker"
 	"github.com/hostd/hostd/internal/secretfile"
 	"github.com/hostd/hostd/internal/sourceconnections"
@@ -83,6 +84,15 @@ func main() {
 		}
 	}
 	sources := sourceconnections.NewService(sourceconnections.NewRepository(db), githubProvider, sourceconnections.NewFileCredentialStore(cfg.DataRoot), cfg.GitHubAppSlug, time.Now)
+	snapshots, err := releasesnapshot.New(db, sources, cfg.DataRoot)
+	if err != nil {
+		logger.Error("release snapshot configuration failed", "error", err)
+		os.Exit(1)
+	}
+	if err := snapshots.Recover(); err != nil {
+		logger.Error("release snapshot recovery failed", "error", err)
+		os.Exit(1)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	workerDone := make(chan struct{})

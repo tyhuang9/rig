@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ const (
 	maxTreeResponseBytes      = 4 << 20
 	maxContentResponseBytes   = 2 << 20
 	maxCredentialLen          = 4096
+	archiveTimeout            = 5 * time.Minute
 	maxAccessLifetimeSeconds  = 7 * 24 * 60 * 60
 	maxRefreshLifetimeSeconds = 2 * 365 * 24 * 60 * 60
 	userAgent                 = "hostd-github-app/1"
@@ -113,6 +115,72 @@ type TreeEntry struct {
 type Tree struct {
 	Truncated bool
 	Entries   []TreeEntry
+}
+
+// Archive opens the immutable GitHub-generated tarball for a commit. The
+// caller owns and must close the returned body. Authentication is deliberately
+// limited to the initial API request: redirects are followed only to the
+// canonical codeload host without forwarding the bearer token.
+func (c *Client) Archive(ctx context.Context, accessToken string, repositoryID int64, sha string) (io.ReadCloser, error) {
+	if !validSecret(accessToken) || repositoryID < 1 || !validSHA(sha) {
+		return nil, &Error{Code: "invalid_request"}
+	}
+	endpoint := APIOrigin + "/repositories/" + strconv.FormatInt(repositoryID, 10) + "/tarball/" + sha
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, &Error{Code: "invalid_request"}
+	}
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	request.Header.Set("X-GitHub-Api-Version", APIVersion)
+	request.Header.Set("User-Agent", userAgent)
+	archiveClient := *c.client
+	// Archives are intentionally larger than JSON API documents; preserve a
+	// bounded request lifetime without inheriting the metadata client's 15s
+	// whole-body timeout.
+	archiveClient.Timeout = archiveTimeout
+	return c.archiveRequest(&archiveClient, request, true, sha)
+}
+
+func (c *Client) archiveRequest(client *http.Client, request *http.Request, initial bool, sha string) (io.ReadCloser, error) {
+	for {
+		response, err := client.Do(request)
+		if err != nil {
+			return nil, &Error{Code: "provider_unavailable"}
+		}
+		if response.StatusCode >= 300 && response.StatusCode < 400 {
+			location := response.Header.Get("Location")
+			response.Body.Close()
+			if !initial {
+				return nil, &Error{Code: "provider_rejected"}
+			}
+			next, err := validArchiveRedirect(location, sha)
+			if err != nil {
+				return nil, &Error{Code: "provider_rejected"}
+			}
+			request, err = http.NewRequestWithContext(request.Context(), http.MethodGet, next.String(), nil)
+			if err != nil {
+				return nil, &Error{Code: "provider_rejected"}
+			}
+			request.Header.Set("Accept", "application/octet-stream")
+			request.Header.Set("User-Agent", userAgent)
+			initial = false
+			continue
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			_ = response.Body.Close()
+			return nil, &Error{Code: statusErrorCode(response)}
+		}
+		return response.Body, nil
+	}
+}
+
+func validArchiveRedirect(value, sha string) (*url.URL, error) {
+	u, err := url.Parse(value)
+	if err != nil || !validSHA(sha) || u.Scheme != "https" || u.Host != "codeload.github.com" || u.User != nil || u.Port() != "" || u.RawQuery != "" || u.Fragment != "" || !strings.HasPrefix(u.Path, "/") || path.Clean(u.Path) != u.Path || !strings.HasSuffix(u.Path, "/"+sha) {
+		return nil, errors.New("unsafe archive redirect")
+	}
+	return u, nil
 }
 
 func New(clientID string) (*Client, error) {

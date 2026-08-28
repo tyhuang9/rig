@@ -136,6 +136,36 @@ func TestClientRejectsRedirectsOversizedBodiesAndUnknownProviderErrors(t *testin
 	}
 }
 
+func TestArchiveFollowsOnlyCanonicalCodeloadWithoutAuthorization(t *testing.T) {
+	calls := 0
+	client := testClient(t, func(request *http.Request) *http.Response {
+		calls++
+		if calls == 1 {
+			if request.URL.String() != "https://api.github.com/repositories/7/tarball/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || request.Header.Get("Authorization") != "Bearer access" {
+				t.Fatalf("initial archive request = %s %#v", request.URL, request.Header)
+			}
+			return &http.Response{StatusCode: http.StatusFound, Header: http.Header{"Location": {"https://codeload.github.com/octo/repo/tar.gz/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}, Body: io.NopCloser(strings.NewReader(""))}
+		}
+		if request.URL.Host != "codeload.github.com" || request.Header.Get("Authorization") != "" {
+			t.Fatalf("redirect leaked authorization: %s %#v", request.URL, request.Header)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("archive"))}
+	})
+	body, err := client.Archive(context.Background(), "access", 7, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if got, _ := io.ReadAll(body); string(got) != "archive" || calls != 2 {
+		t.Fatalf("archive = %q calls=%d", got, calls)
+	}
+	for _, location := range []string{"http://codeload.github.com/a", "https://codeload.github.com:443/a", "https://user@codeload.github.com/a", "https://codeload.github.com/a?token=x", "https://evil.example/a", "https://codeload.github.com/a/../b", "https://codeload.github.com/octo/repo/tar.gz/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "/relative"} {
+		if _, err := validArchiveRedirect(location, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); err == nil {
+			t.Fatalf("unsafe redirect accepted: %q", location)
+		}
+	}
+}
+
 func TestNewRejectsUnsafeClientIDs(t *testing.T) {
 	for _, value := range []string{"", "with space", "line\nbreak", strings.Repeat("x", 256)} {
 		if _, err := New(value); err == nil {
