@@ -19,6 +19,7 @@ func TestRunHostdDispatchesModesAndGuidesNonInteractiveUse(t *testing.T) {
 	}{
 		{name: "no args starts UI interactively", interactive: true, wantUI: true},
 		{name: "no args guides pipe users", want: 2, wantText: "interactive terminal"},
+		{name: "explicit UI guides pipe users", args: []string{"ui"}, want: 2, wantText: "interactive terminal"},
 		{name: "explicit UI parses options", args: []string{"ui", "--endpoint", "http://controller", "--session-file", "custom/session"}, interactive: true, wantUI: true},
 		{name: "serve starts daemon", args: []string{"serve", "--fake-runtime"}, wantServer: []string{"--fake-runtime"}},
 		{name: "legacy flags warn", args: []string{"--fake-runtime"}, wantServer: []string{"--fake-runtime"}, wantText: "deprecated"},
@@ -61,7 +62,7 @@ func TestRunHostdReportsUIFailure(t *testing.T) {
 func TestRunHostdUIHelpReturnsSuccess(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	called := false
-	code := runHostd([]string{"ui", "--help"}, hostdRunners{interactive: func() bool { return true }, stdout: &stdout, stderr: &stderr, runUI: func(tuiLaunchOptions) error { called = true; return nil }, runServer: func([]string) int { return 0 }})
+	code := runHostd([]string{"ui", "--help"}, hostdRunners{interactive: func() bool { return false }, stdout: &stdout, stderr: &stderr, runUI: func(tuiLaunchOptions) error { called = true; return nil }, runServer: func([]string) int { return 0 }})
 	if code != 0 || called || !bytes.Contains(stdout.Bytes(), []byte("-endpoint")) || stderr.Len() != 0 {
 		t.Fatalf("code=%d called=%v stdout=%q stderr=%q", code, called, stdout.String(), stderr.String())
 	}

@@ -26,7 +26,7 @@ V1 does not expand submodules or Git LFS, fetch Git history, deploy pull-request
 For a GitHub-connected controller that can execute manual deployments, use the public GitHub pair with the execution flag:
 
 ```powershell
-hostd --data-root <absolute-data-root> --github-client-id <public-client-id> --github-app-slug <github-app-slug> --compose-runtime
+hostd serve --data-root <absolute-data-root> --github-client-id <public-client-id> --github-app-slug <github-app-slug> --compose-runtime
 ```
 
 The client ID and slug are public identifiers; do not place any secret in this command.
@@ -53,7 +53,7 @@ Relay-driven event delivery and controller pairing require both `--controller-re
 To enable relay-driven event delivery and controller pairing, add the relay pair to the same controller invocation:
 
 ```powershell
-hostd --data-root <absolute-data-root> --github-client-id <public-client-id> --github-app-slug <github-app-slug> --compose-runtime --controller-relay --relay-origin https://relay.example.invalid
+hostd serve --data-root <absolute-data-root> --github-client-id <public-client-id> --github-app-slug <github-app-slug> --compose-runtime --controller-relay --relay-origin https://relay.example.invalid
 ```
 
 In the dashboard **Relay management** panel:

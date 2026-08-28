@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"strconv"
 	"sync"
 
 	"github.com/hostd/hostd/internal/apicontract"
@@ -47,6 +50,7 @@ func (s *protectedSessionStore) Clear(context.Context) error {
 type tuiControllerClient struct {
 	client  *controllerclient.Client
 	store   tui.SessionStore
+	origin  string
 	mu      sync.Mutex
 	session controllerclient.Session
 	loaded  bool
@@ -56,11 +60,31 @@ func newTUIControllerClient(endpoint string, store tui.SessionStore) (tui.Client
 	if store == nil {
 		return nil, errors.New("TUI session store is required")
 	}
-	client, err := controllerclient.New(controllerclient.Options{Endpoint: endpoint})
+	origin, err := tuiControllerOrigin(endpoint)
 	if err != nil {
 		return nil, err
 	}
-	return &tuiControllerClient{client: client, store: store}, nil
+	client, err := controllerclient.New(controllerclient.Options{Endpoint: origin})
+	if err != nil {
+		return nil, err
+	}
+	return &tuiControllerClient{client: client, store: store, origin: origin}, nil
+}
+
+func tuiControllerOrigin(endpoint string) (string, error) {
+	u, err := url.ParseRequestURI(endpoint)
+	if err != nil || !u.IsAbs() || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("TUI controller endpoint must be an absolute loopback HTTP(S) IP origin with an explicit port")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("TUI controller endpoint must use HTTP or HTTPS")
+	}
+	ip := net.ParseIP(u.Hostname())
+	port, portErr := strconv.Atoi(u.Port())
+	if ip == nil || !ip.IsLoopback() || portErr != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("TUI controller endpoint must be a loopback IP origin with an explicit port")
+	}
+	return u.Scheme + "://" + net.JoinHostPort(ip.String(), strconv.Itoa(port)), nil
 }
 
 func (c *tuiControllerClient) BootstrapStatus(ctx context.Context) (apicontract.BootstrapStatus, error) {
@@ -86,9 +110,7 @@ func (c *tuiControllerClient) Logout(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := c.client.Logout(ctx, &session); err != nil {
-		return mapTUIError(err)
-	}
+	remoteErr := c.client.Logout(ctx, &session)
 	c.mu.Lock()
 	c.session = controllerclient.Session{}
 	c.loaded = true
@@ -96,7 +118,7 @@ func (c *tuiControllerClient) Logout(ctx context.Context) error {
 	if err := c.store.Clear(ctx); err != nil {
 		return fmt.Errorf("clear controller session: %w", err)
 	}
-	return nil
+	return mapTUIError(remoteErr)
 }
 func (c *tuiControllerClient) Me(ctx context.Context) (apicontract.MeResponse, error) {
 	session, err := c.current(ctx)
@@ -234,7 +256,7 @@ func (c *tuiControllerClient) current(ctx context.Context) (controllerclient.Ses
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.loaded {
-		return c.session, nil
+		return c.session, c.validateSessionOrigin(c.session)
 	}
 	value, err := c.store.Load(ctx)
 	if err != nil {
@@ -247,9 +269,10 @@ func (c *tuiControllerClient) current(ctx context.Context) (controllerclient.Ses
 	if err := json.Unmarshal(value, &c.session); err != nil {
 		return c.session, fmt.Errorf("decode controller session: %w", err)
 	}
-	return c.session, nil
+	return c.session, c.validateSessionOrigin(c.session)
 }
 func (c *tuiControllerClient) save(ctx context.Context, session controllerclient.Session) error {
+	session.ControllerOrigin = c.origin
 	value, err := json.Marshal(session)
 	if err != nil {
 		return err
@@ -261,6 +284,13 @@ func (c *tuiControllerClient) save(ctx context.Context, session controllerclient
 	c.session = session
 	c.loaded = true
 	c.mu.Unlock()
+	return nil
+}
+
+func (c *tuiControllerClient) validateSessionOrigin(session controllerclient.Session) error {
+	if session.ControllerOrigin != "" && session.ControllerOrigin != c.origin {
+		return errors.New("protected controller session belongs to a different endpoint")
+	}
 	return nil
 }
 func mapTUIError(err error) error {

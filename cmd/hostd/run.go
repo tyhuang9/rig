@@ -43,10 +43,6 @@ func runHostd(args []string, runners hostdRunners) int {
 		}
 		return runners.runServer(invocation.args)
 	}
-	if len(args) == 0 && !runners.interactive() {
-		fmt.Fprintln(runners.stderr, "hostd requires an interactive terminal for the operator console; use hostd serve to run the daemon")
-		return 2
-	}
 	options, help, err := parseTUIOptions(invocation.args)
 	if err != nil {
 		fmt.Fprintln(runners.stderr, err)
@@ -55,6 +51,10 @@ func runHostd(args []string, runners hostdRunners) int {
 	if help != "" {
 		fmt.Fprint(runners.stdout, help)
 		return 0
+	}
+	if !runners.interactive() {
+		fmt.Fprintln(runners.stderr, "hostd requires an interactive terminal for the operator console; use hostd serve to run the daemon")
+		return 2
 	}
 	if err := runners.runUI(options); err != nil {
 		fmt.Fprintln(runners.stderr, err)
