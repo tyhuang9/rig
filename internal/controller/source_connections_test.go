@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +30,12 @@ type controllerProvider struct {
 	pollCalls         int
 	installationCalls int
 	pollError         error
+	repository        githubapp.Repository
+	repositoryPage    githubapp.RepositoryPage
+	branch            githubapp.Branch
+	branchPage        githubapp.BranchPage
+	tree              githubapp.Tree
+	content           []byte
 }
 
 func (provider *controllerProvider) StartDevice(context.Context) (githubapp.DeviceAuthorization, error) {
@@ -50,6 +58,24 @@ func (provider *controllerProvider) CurrentUser(context.Context, string) (github
 func (provider *controllerProvider) Installations(context.Context, string, int, int) (githubapp.InstallationPage, error) {
 	provider.installationCalls++
 	return githubapp.InstallationPage{}, nil
+}
+func (provider *controllerProvider) Repositories(context.Context, string, int64, int, int) (githubapp.RepositoryPage, error) {
+	return provider.repositoryPage, nil
+}
+func (provider *controllerProvider) Repository(context.Context, string, int64, int64) (githubapp.Repository, error) {
+	return provider.repository, nil
+}
+func (provider *controllerProvider) Branches(context.Context, string, int64, int, int) (githubapp.BranchPage, error) {
+	return provider.branchPage, nil
+}
+func (provider *controllerProvider) Branch(context.Context, string, int64, string) (githubapp.Branch, error) {
+	return provider.branch, nil
+}
+func (provider *controllerProvider) Tree(context.Context, string, int64, string) (githubapp.Tree, error) {
+	return provider.tree, nil
+}
+func (provider *controllerProvider) Content(context.Context, string, int64, string, string) ([]byte, error) {
+	return provider.content, nil
 }
 
 type controllerClock struct{ now time.Time }
@@ -120,6 +146,64 @@ func TestSourceConnectionAPIAuthenticationCSRFAndDisabledCleanup(t *testing.T) {
 		if withoutCSRF.Code != http.StatusForbidden || !strings.Contains(withoutCSRF.Body.String(), "csrf_failed") {
 			t.Errorf("%s %s without CSRF = %d %s", endpoint.method, endpoint.path, withoutCSRF.Code, withoutCSRF.Body.String())
 		}
+	}
+}
+
+func TestGitHubRepositoryBranchInspectionAndApplicationCreationAPI(t *testing.T) {
+	harness := newSourceHarness(t, true)
+	owner := harness.sessionUserID(t, harness.session)
+	started, err := harness.service.Start(context.Background(), owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.clock.now = harness.clock.now.Add(5 * time.Second)
+	connection, err := harness.service.Poll(context.Background(), owner, started.ConnectionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	harness.provider.repository = githubapp.Repository{ID: 77, Owner: "new-owner", Name: "renamed", DefaultBranch: "feature/slash", Private: true}
+	harness.provider.repositoryPage = githubapp.RepositoryPage{TotalCount: 1, Repositories: []githubapp.Repository{harness.provider.repository}}
+	harness.provider.branch = githubapp.Branch{Name: "feature/slash", SHA: sha, Protected: true}
+	harness.provider.branchPage = githubapp.BranchPage{Branches: []githubapp.Branch{harness.provider.branch}}
+	harness.provider.tree = githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "deploy/compose.yaml", Type: "blob", SHA: sha}}}
+	harness.provider.content = []byte("services:\n  api:\n    image: example/api\n")
+	base := "/api/v1/source-connections/" + connection.ID + "/github/installations/9/repositories"
+	repositories := sourceRequest(harness.handler, harness.session, http.MethodGet, base+"?page=1&perPage=30", "", true)
+	if repositories.Code != http.StatusOK || !strings.Contains(repositories.Body.String(), `"owner":"new-owner"`) {
+		t.Fatalf("repositories=%d %s", repositories.Code, repositories.Body.String())
+	}
+	branches := sourceRequest(harness.handler, harness.session, http.MethodGet, base+"/77/branches", "", true)
+	if branches.Code != http.StatusOK || !strings.Contains(branches.Body.String(), `"name":"feature/slash"`) {
+		t.Fatalf("branches=%d %s", branches.Code, branches.Body.String())
+	}
+	githubJSON := `{"connectionId":"` + connection.ID + `","installationId":9,"repositoryId":77,"branch":"feature/slash","composePath":"deploy/compose.yaml"}`
+	inspected := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps/import/inspect", `{"githubSource":`+githubJSON+`}`, true)
+	if inspected.Code != http.StatusOK || !strings.Contains(inspected.Body.String(), `"resolvedSha":"`+sha+`"`) || !strings.Contains(inspected.Body.String(), `"name":"api"`) {
+		t.Fatalf("inspect=%d %s", inspected.Code, inspected.Body.String())
+	}
+	created := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps", `{"name":"GitHub App","githubSource":`+githubJSON+`}`, true)
+	if created.Code != http.StatusCreated || !strings.Contains(created.Body.String(), `"repositoryName":"renamed"`) {
+		t.Fatalf("create=%d %s", created.Code, created.Body.String())
+	}
+	assertAbsent(t, repositories.Body.String()+branches.Body.String()+inspected.Body.String()+created.Body.String()+harness.logs.String(), "ghu_api_sentinel", "ghr_api_sentinel", "device-code-sentinel")
+}
+
+func TestInspectRequiresExactlyOneSourceAndLocalInspectionRemainsUseful(t *testing.T) {
+	harness := newSourceHarness(t, true)
+	for _, body := range []string{`{}`, `{"sourcePath":"C:/local","githubSource":{"connectionId":"x","installationId":1,"repositoryId":1,"branch":"main"}}`} {
+		response := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps/import/inspect", body, true)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "invalid_source") {
+			t.Fatalf("exact-one=%d %s", response.Code, response.Body.String())
+		}
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "compose.yaml"), []byte("services:\n  local:\n    image: nginx\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	response := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps/import/inspect", `{"sourcePath":`+strconv.Quote(root)+`}`, true)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"name":"local"`) {
+		t.Fatalf("local=%d %s", response.Code, response.Body.String())
 	}
 }
 

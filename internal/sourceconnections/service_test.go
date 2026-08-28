@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +30,13 @@ type fakeProvider struct {
 	installationErrors []error
 	installationCalls  int
 	installationGate   chan struct{}
+	repositoryPage     githubapp.RepositoryPage
+	repository         githubapp.Repository
+	branchPage         githubapp.BranchPage
+	branch             githubapp.Branch
+	repositoryError    error
+	branchError        error
+	repositoryCalls    int
 }
 
 func (provider *fakeProvider) StartDevice(context.Context) (githubapp.DeviceAuthorization, error) {
@@ -72,6 +80,26 @@ func (provider *fakeProvider) Installations(context.Context, string, int, int) (
 		}
 	}
 	return provider.installationPage, nil
+}
+func (provider *fakeProvider) Repositories(context.Context, string, int64, int, int) (githubapp.RepositoryPage, error) {
+	provider.repositoryCalls++
+	return provider.repositoryPage, provider.repositoryError
+}
+func (provider *fakeProvider) Repository(context.Context, string, int64, int64) (githubapp.Repository, error) {
+	provider.repositoryCalls++
+	return provider.repository, provider.repositoryError
+}
+func (provider *fakeProvider) Branches(context.Context, string, int64, int, int) (githubapp.BranchPage, error) {
+	return provider.branchPage, provider.branchError
+}
+func (provider *fakeProvider) Branch(context.Context, string, int64, string) (githubapp.Branch, error) {
+	return provider.branch, provider.branchError
+}
+func (provider *fakeProvider) Tree(context.Context, string, int64, string) (githubapp.Tree, error) {
+	return githubapp.Tree{}, nil
+}
+func (provider *fakeProvider) Content(context.Context, string, int64, string, string) ([]byte, error) {
+	return nil, nil
 }
 
 type testClock struct {
@@ -191,6 +219,43 @@ func TestMissingCredentialsFailClosedAndDisconnectIsOwnerScopedIdempotent(t *tes
 	}
 	if err := service.Disconnect(context.Background(), "owner", connection.ID); err != nil {
 		t.Fatalf("idempotent disconnect: %v", err)
+	}
+}
+
+func TestRepositoryBrowsingIsOwnerScopedAndResolvesRenamedRepositoryBranch(t *testing.T) {
+	service, provider, clock, _, _ := testService(t)
+	connection := connectService(t, service, clock)
+	provider.repositoryPage = githubapp.RepositoryPage{TotalCount: 1, Repositories: []githubapp.Repository{{ID: 77, Owner: "new-owner", Name: "renamed", DefaultBranch: "main"}}}
+	provider.repository = provider.repositoryPage.Repositories[0]
+	provider.branchPage = githubapp.BranchPage{Branches: []githubapp.Branch{{Name: "feature/slash", SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
+	provider.branch = provider.branchPage.Branches[0]
+	if _, err := service.Repositories(context.Background(), "other", connection.ID, 9, 1, 30); !IsCode(err, "connection_not_found") {
+		t.Fatalf("other owner error = %v", err)
+	}
+	page, err := service.Repositories(context.Background(), "owner", connection.ID, 9, 1, 30)
+	if err != nil || page.Repositories[0].Owner != "new-owner" {
+		t.Fatalf("repositories = %#v err=%v", page, err)
+	}
+	branches, err := service.Branches(context.Background(), "owner", connection.ID, 9, 77, 1, 30)
+	if err != nil || branches.Branches[0].Name != "feature/slash" {
+		t.Fatalf("branches = %#v err=%v", branches, err)
+	}
+	repository, branch, err := service.Resolve(context.Background(), "owner", connection.ID, 9, 77, "feature/slash")
+	if err != nil || repository.Name != "renamed" || branch.SHA == "" {
+		t.Fatalf("resolve = %#v %#v err=%v", repository, branch, err)
+	}
+}
+
+func TestRepositoryAccessLossAndProviderFailuresAreSanitized(t *testing.T) {
+	service, provider, clock, _, _ := testService(t)
+	connection := connectService(t, service, clock)
+	provider.repositoryError = &githubapp.Error{Code: "not_found"}
+	if _, err := service.Repositories(context.Background(), "owner", connection.ID, 9, 1, 30); !IsCode(err, "source_access_lost") {
+		t.Fatalf("access loss = %v", err)
+	}
+	provider.repositoryError = errors.New("raw provider body secret")
+	if _, err := service.Repositories(context.Background(), "owner", connection.ID, 9, 1, 30); !IsCode(err, "provider_unavailable") || strings.Contains(err.Error(), "raw") {
+		t.Fatalf("provider error = %v", err)
 	}
 }
 

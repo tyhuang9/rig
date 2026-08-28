@@ -3,6 +3,7 @@ package apps
 import (
 	"database/sql"
 	"errors"
+	"path"
 	"strings"
 	"time"
 
@@ -17,6 +18,26 @@ type Application struct {
 	Status      string    `json:"status"`
 	MachineName string    `json:"machineName"`
 	CreatedAt   time.Time `json:"createdAt"`
+	Source      Source    `json:"source"`
+}
+
+const (
+	SourceLocal  = "local"
+	SourceGitHub = "github"
+)
+
+type Source struct {
+	Type            string
+	Path            string
+	ConnectionID    string
+	InstallationID  int64
+	RepositoryID    int64
+	RepositoryOwner string
+	RepositoryName  string
+	TrackedBranch   string
+	TrackedRef      string
+	ComposePath     string
+	ResolvedSHA     string
 }
 type Service struct {
 	ID     string `json:"id"`
@@ -46,6 +67,10 @@ func slugify(name string) string {
 	return strings.Trim(b.String(), "-")
 }
 func (s *Store) Create(name, description, sourcePath, machineID string) (Application, error) {
+	return s.CreateWithSource(name, description, machineID, Source{Type: SourceLocal, Path: sourcePath})
+}
+
+func (s *Store) CreateWithSource(name, description, machineID string, source Source) (Application, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return Application{}, errors.New("name is required")
@@ -54,19 +79,34 @@ func (s *Store) Create(name, description, sourcePath, machineID string) (Applica
 	if slug == "" {
 		return Application{}, errors.New("name must include letters or numbers")
 	}
+	if err := validateSource(&source); err != nil {
+		return Application{}, err
+	}
 	id := uuid.NewString()
 	if machineID == "" {
 		_ = s.db.QueryRow(`SELECT id FROM machines WHERE mode='local' LIMIT 1`).Scan(&machineID)
 	}
 	now := s.now().UTC()
-	_, err := s.db.Exec(`INSERT INTO applications(id,slug,name,description,source_path,active_machine_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?, 'draft',?,?)`, id, slug, name, description, sourcePath, machineID, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	tx, err := s.db.Begin()
 	if err != nil {
+		return Application{}, err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`INSERT INTO applications(id,slug,name,description,source_path,active_machine_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?, 'draft',?,?)`, id, slug, name, description, source.Path, machineID, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	if err != nil {
+		return Application{}, err
+	}
+	_, err = tx.Exec(`INSERT INTO application_sources(application_id,source_type,connection_id,installation_id,repository_id,repository_owner,repository_name,tracked_branch,tracked_ref,compose_path,resolved_sha,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, source.Type, nullable(source.ConnectionID), nullableInt64(source.InstallationID), nullableInt64(source.RepositoryID), nullable(source.RepositoryOwner), nullable(source.RepositoryName), nullable(source.TrackedBranch), nullable(source.TrackedRef), nullable(source.ComposePath), nullable(source.ResolvedSHA), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	if err != nil {
+		return Application{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return Application{}, err
 	}
 	return s.Get(id)
 }
 func (s *Store) List() ([]Application, error) {
-	rows, err := s.db.Query(`SELECT a.id,a.slug,a.name,a.description,a.status,COALESCE(m.name,''),a.created_at FROM applications a LEFT JOIN machines m ON m.id=a.active_machine_id WHERE a.archived_at IS NULL ORDER BY a.created_at DESC`)
+	rows, err := s.db.Query(applicationSelect + ` WHERE a.archived_at IS NULL ORDER BY a.created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -82,17 +122,66 @@ func (s *Store) List() ([]Application, error) {
 	return out, rows.Err()
 }
 func (s *Store) Get(id string) (Application, error) {
-	return scan(s.db.QueryRow(`SELECT a.id,a.slug,a.name,a.description,a.status,COALESCE(m.name,''),a.created_at FROM applications a LEFT JOIN machines m ON m.id=a.active_machine_id WHERE a.id=? AND a.archived_at IS NULL`, id))
+	return scan(s.db.QueryRow(applicationSelect+` WHERE a.id=? AND a.archived_at IS NULL`, id))
 }
+
+const applicationSelect = `SELECT a.id,a.slug,a.name,a.description,a.status,COALESCE(m.name,''),a.created_at,s.source_type,a.source_path,COALESCE(s.connection_id,''),COALESCE(s.installation_id,0),COALESCE(s.repository_id,0),COALESCE(s.repository_owner,''),COALESCE(s.repository_name,''),COALESCE(s.tracked_branch,''),COALESCE(s.tracked_ref,''),COALESCE(s.compose_path,''),COALESCE(s.resolved_sha,'') FROM applications a LEFT JOIN machines m ON m.id=a.active_machine_id JOIN application_sources s ON s.application_id=a.id`
 
 type scanner interface{ Scan(...any) error }
 
 func scan(row scanner) (Application, error) {
 	var a Application
 	var created string
-	err := row.Scan(&a.ID, &a.Slug, &a.Name, &a.Description, &a.Status, &a.MachineName, &created)
+	err := row.Scan(&a.ID, &a.Slug, &a.Name, &a.Description, &a.Status, &a.MachineName, &created, &a.Source.Type, &a.Source.Path, &a.Source.ConnectionID, &a.Source.InstallationID, &a.Source.RepositoryID, &a.Source.RepositoryOwner, &a.Source.RepositoryName, &a.Source.TrackedBranch, &a.Source.TrackedRef, &a.Source.ComposePath, &a.Source.ResolvedSHA)
 	a.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	return a, err
+}
+
+func validateSource(source *Source) error {
+	source.Type = strings.TrimSpace(source.Type)
+	if source.Type == "" {
+		source.Type = SourceLocal
+	}
+	source.Path = strings.TrimSpace(source.Path)
+	if source.Type == SourceLocal {
+		if source.ConnectionID != "" || source.InstallationID != 0 || source.RepositoryID != 0 || source.RepositoryOwner != "" || source.RepositoryName != "" || source.TrackedBranch != "" || source.TrackedRef != "" || source.ComposePath != "" || source.ResolvedSHA != "" {
+			return errors.New("local source contains GitHub metadata")
+		}
+		return nil
+	}
+	if source.Type != SourceGitHub || source.Path != "" || !lowerHex(source.ConnectionID, 32) || source.InstallationID < 1 || source.RepositoryID < 1 || source.RepositoryOwner == "" || source.RepositoryName == "" || source.TrackedBranch == "" || source.TrackedRef != "refs/heads/"+source.TrackedBranch || !normalizedRepositoryPath(source.ComposePath) || !lowerHex(source.ResolvedSHA, 40) {
+		return errors.New("invalid GitHub source")
+	}
+	return nil
+}
+
+func lowerHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+func normalizedRepositoryPath(value string) bool {
+	return value != "" && !strings.ContainsAny(value, "\\:") && !strings.HasPrefix(value, "/") && path.Clean(value) == value && value != ".." && !strings.HasPrefix(value, "../")
+}
+
+func nullable(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func nullableInt64(value int64) any {
+	if value == 0 {
+		return nil
+	}
+	return value
 }
 func (s *Store) Services(appID string) ([]Service, error) {
 	rows, err := s.db.Query(`SELECT id,name,kind,'Unknown',internal_port FROM services WHERE app_id=? ORDER BY name`, appID)

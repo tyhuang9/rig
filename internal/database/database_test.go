@@ -66,8 +66,54 @@ func TestMigrateFreshUpgradePreservesDataAndIsIdempotent(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&versions); err != nil {
 		t.Fatal(err)
 	}
-	if users != 1 || versions != 2 {
+	if users != 1 || versions != 3 {
 		t.Fatalf("preserved users = %d, migration versions = %d", users, versions)
+	}
+}
+
+func TestApplicationSourceBackfillConstraintsAndCascade(t *testing.T) {
+	db := openMemoryDatabase(t)
+	first, err := migrations.ReadFile("migrations/001_foundation.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(first)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO schema_migrations VALUES ('001_foundation.sql', datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,source_path,status,created_at,updated_at) VALUES ('app','app','App','C:/apps/app','draft',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	var sourceType string
+	if err := db.QueryRow(`SELECT source_type FROM application_sources WHERE application_id='app'`).Scan(&sourceType); err != nil {
+		t.Fatal(err)
+	}
+	if sourceType != "local" {
+		t.Fatalf("backfilled source type = %q", sourceType)
+	}
+	if _, err := db.Exec(`INSERT INTO application_sources(application_id,source_type,created_at,updated_at) VALUES ('app','local',datetime('now'),datetime('now'))`); err == nil {
+		t.Fatal("second source row was accepted")
+	}
+	if _, err := db.Exec(`UPDATE application_sources SET source_type='github', connection_id='missing', installation_id=1, repository_id=2, repository_owner='o', repository_name='r', tracked_branch='main', tracked_ref='refs/heads/main', compose_path='../compose.yaml', resolved_sha='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE application_id='app'`); err == nil {
+		t.Fatal("invalid GitHub source was accepted")
+	}
+	if _, err := db.Exec(`DELETE FROM applications WHERE id='app'`); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM application_sources WHERE application_id='app'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("cascaded sources = %d", count)
 	}
 }
 

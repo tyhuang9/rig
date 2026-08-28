@@ -18,6 +18,15 @@ type Provider interface {
 	Installations(context.Context, string, int, int) (githubapp.InstallationPage, error)
 }
 
+type repositoryProvider interface {
+	Repositories(context.Context, string, int64, int, int) (githubapp.RepositoryPage, error)
+	Repository(context.Context, string, int64, int64) (githubapp.Repository, error)
+	Branches(context.Context, string, int64, int, int) (githubapp.BranchPage, error)
+	Branch(context.Context, string, int64, string) (githubapp.Branch, error)
+	Tree(context.Context, string, int64, string) (githubapp.Tree, error)
+	Content(context.Context, string, int64, string, string) ([]byte, error)
+}
+
 type Error struct {
 	Code       string
 	RetryAfter time.Duration
@@ -270,6 +279,151 @@ func (service *Service) Installations(ctx context.Context, owner, id string, pag
 		return InstallationPage{}, connectionError(err)
 	}
 	return InstallationPage{Page: page, PerPage: perPage, TotalCount: providerPage.TotalCount, Installations: installations}, nil
+}
+
+func (service *Service) Repositories(ctx context.Context, owner, id string, installationID int64, page, perPage int) (RepositoryPage, error) {
+	var providerPage githubapp.RepositoryPage
+	err := service.withAccess(ctx, owner, id, func(provider repositoryProvider, token string) error {
+		var err error
+		providerPage, err = provider.Repositories(ctx, token, installationID, page, perPage)
+		return err
+	})
+	if err != nil {
+		return RepositoryPage{}, sourceOperationError(err, true)
+	}
+	result := RepositoryPage{Page: page, PerPage: perPage, TotalCount: providerPage.TotalCount, Repositories: make([]SourceRepository, 0, len(providerPage.Repositories))}
+	for _, item := range providerPage.Repositories {
+		result.Repositories = append(result.Repositories, SourceRepository{ID: item.ID, Owner: item.Owner, Name: item.Name, DefaultBranch: item.DefaultBranch, Private: item.Private, Archived: item.Archived, Disabled: item.Disabled})
+	}
+	return result, nil
+}
+
+func (service *Service) Repository(ctx context.Context, owner, id string, installationID, repositoryID int64) (SourceRepository, error) {
+	var item githubapp.Repository
+	err := service.withAccess(ctx, owner, id, func(provider repositoryProvider, token string) error {
+		var err error
+		item, err = provider.Repository(ctx, token, installationID, repositoryID)
+		return err
+	})
+	if err != nil {
+		return SourceRepository{}, sourceOperationError(err, true)
+	}
+	return SourceRepository{ID: item.ID, Owner: item.Owner, Name: item.Name, DefaultBranch: item.DefaultBranch, Private: item.Private, Archived: item.Archived, Disabled: item.Disabled}, nil
+}
+
+func (service *Service) Branches(ctx context.Context, owner, id string, installationID, repositoryID int64, page, perPage int) (BranchPage, error) {
+	if _, err := service.Repository(ctx, owner, id, installationID, repositoryID); err != nil {
+		return BranchPage{}, err
+	}
+	var providerPage githubapp.BranchPage
+	err := service.withAccess(ctx, owner, id, func(provider repositoryProvider, token string) error {
+		var err error
+		providerPage, err = provider.Branches(ctx, token, repositoryID, page, perPage)
+		return err
+	})
+	if err != nil {
+		return BranchPage{}, sourceOperationError(err, false)
+	}
+	result := BranchPage{Page: page, PerPage: perPage, Branches: make([]Branch, 0, len(providerPage.Branches))}
+	for _, item := range providerPage.Branches {
+		result.Branches = append(result.Branches, Branch{Name: item.Name, SHA: item.SHA, Protected: item.Protected})
+	}
+	return result, nil
+}
+
+func (service *Service) Resolve(ctx context.Context, owner, id string, installationID, repositoryID int64, branch string) (SourceRepository, Branch, error) {
+	repository, err := service.Repository(ctx, owner, id, installationID, repositoryID)
+	if err != nil {
+		return SourceRepository{}, Branch{}, err
+	}
+	var resolved githubapp.Branch
+	err = service.withAccess(ctx, owner, id, func(provider repositoryProvider, token string) error {
+		var providerErr error
+		resolved, providerErr = provider.Branch(ctx, token, repositoryID, branch)
+		return providerErr
+	})
+	if err != nil {
+		return SourceRepository{}, Branch{}, sourceOperationError(err, false)
+	}
+	return repository, Branch{Name: resolved.Name, SHA: resolved.SHA, Protected: resolved.Protected}, nil
+}
+
+func (service *Service) ReadTree(ctx context.Context, owner, id string, repositoryID int64, sha string) (githubapp.Tree, error) {
+	var result githubapp.Tree
+	err := service.withAccess(ctx, owner, id, func(provider repositoryProvider, token string) error {
+		var err error
+		result, err = provider.Tree(ctx, token, repositoryID, sha)
+		return err
+	})
+	if err != nil {
+		return githubapp.Tree{}, sourceOperationError(err, false)
+	}
+	return result, nil
+}
+
+func (service *Service) ReadContent(ctx context.Context, owner, id string, repositoryID int64, path, sha string) ([]byte, error) {
+	var result []byte
+	err := service.withAccess(ctx, owner, id, func(provider repositoryProvider, token string) error {
+		var err error
+		result, err = provider.Content(ctx, token, repositoryID, path, sha)
+		return err
+	})
+	if err != nil {
+		return nil, sourceOperationError(err, false)
+	}
+	return result, nil
+}
+
+func (service *Service) withAccess(ctx context.Context, owner, id string, operation func(repositoryProvider, string) error) error {
+	provider, ok := service.provider.(repositoryProvider)
+	if !ok {
+		return &Error{Code: "provider_unavailable"}
+	}
+	unlock := service.locks.lock(id)
+	defer unlock()
+	connection, err := service.repository.Get(ctx, owner, id)
+	if err != nil {
+		return connectionError(err)
+	}
+	if connection.Status != StatusConnected {
+		return statusError(connection.Status)
+	}
+	bundle, err := service.loadBundle(ctx, owner, connection)
+	if err != nil {
+		return err
+	}
+	err = operation(provider, bundle.AccessToken)
+	if githubapp.IsCode(err, "unauthorized") {
+		bundle, err = service.refreshLocked(ctx, owner, connection, bundle)
+		if err != nil {
+			return err
+		}
+		err = operation(provider, bundle.AccessToken)
+		if githubapp.IsCode(err, "unauthorized") {
+			return service.loseAccess(ctx, owner, id, "repeated_unauthorized")
+		}
+	}
+	return err
+}
+
+func sourceOperationError(err error, accessLoss bool) error {
+	var serviceErr *Error
+	if errors.As(err, &serviceErr) {
+		return err
+	}
+	if githubapp.IsCode(err, "not_found") || githubapp.IsCode(err, "forbidden") {
+		if accessLoss {
+			return &Error{Code: "source_access_lost"}
+		}
+		return &Error{Code: "invalid_source"}
+	}
+	if githubapp.IsCode(err, "response_too_large") {
+		return &Error{Code: "source_too_large"}
+	}
+	if githubapp.IsCode(err, "invalid_request") || githubapp.IsCode(err, "invalid_response") || githubapp.IsCode(err, "provider_rejected") {
+		return &Error{Code: "invalid_source"}
+	}
+	return providerError(err)
 }
 
 func (service *Service) Disconnect(ctx context.Context, owner, id string) error {
