@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +12,9 @@ import (
 
 	"github.com/hostd/hostd/internal/autodeploy"
 	"github.com/hostd/hostd/internal/config"
+	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/githubapp"
+	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
@@ -136,6 +140,50 @@ func TestAutoDeployConstructionAndRunFailuresAreSanitized(t *testing.T) {
 		if strings.Contains(output, secret) || strings.Contains(output, "private") || strings.Contains(output, "aaaaaaaa") || !strings.Contains(output, autodeploy.OutcomePersistenceUnavailable) {
 			t.Fatalf("unsafe coordinator log=%q", output)
 		}
+	}
+}
+
+type autoDeployProviderStub struct{}
+
+func (autoDeployProviderStub) StartDevice(context.Context) (githubapp.DeviceAuthorization, error) {
+	return githubapp.DeviceAuthorization{}, nil
+}
+func (autoDeployProviderStub) PollDevice(context.Context, string) (githubapp.TokenBundle, error) {
+	return githubapp.TokenBundle{}, nil
+}
+func (autoDeployProviderStub) Refresh(context.Context, string) (githubapp.TokenBundle, error) {
+	return githubapp.TokenBundle{}, nil
+}
+func (autoDeployProviderStub) CurrentUser(context.Context, string) (githubapp.User, error) {
+	return githubapp.User{}, nil
+}
+func (autoDeployProviderStub) Installations(context.Context, string, int, int) (githubapp.InstallationPage, error) {
+	return githubapp.InstallationPage{}, nil
+}
+
+func TestNewAutoDeployRunnerRetainsInjectedRepository(t *testing.T) {
+	cfg := enabledAutoDeployConfig()
+	if runner, err := newAutoDeployRunner(cfg, nil, nil, nil, newStructuredLogger(&bytes.Buffer{}, "info")); err == nil || runner != nil {
+		t.Fatal("nil repository was accepted")
+	}
+	db, err := database.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := autodeploy.NewRepository(db)
+	sources := sourceconnections.NewService(nil, autoDeployProviderStub{}, nil, "app", time.Now)
+	runner, err := newAutoDeployRunner(cfg, repository, sources, jobs.New(db), newStructuredLogger(&bytes.Buffer{}, "info"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, ok := runner.(*autodeploy.Coordinator)
+	if !ok {
+		t.Fatalf("runner type=%T", runner)
+	}
+	retained := reflect.ValueOf(coordinator).Elem().FieldByName("repository")
+	if !retained.IsValid() || retained.IsNil() || retained.Elem().Pointer() != reflect.ValueOf(repository).Pointer() {
+		t.Fatal("coordinator did not retain the injected auto-deploy repository")
 	}
 }
 

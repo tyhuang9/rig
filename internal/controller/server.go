@@ -23,6 +23,8 @@ import (
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
+	"github.com/hostd/hostd/internal/autodeploy"
+	"github.com/hostd/hostd/internal/controllerrelay"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
@@ -35,21 +37,43 @@ import (
 var web embed.FS
 
 type Server struct {
-	Auth               authenticationService
-	Apps               *apps.Store
-	Jobs               *jobs.Service
-	Machines           *machines.Store
-	Caddy              bool
-	FakeRuntime        bool
-	ComposeRuntime     bool
-	DockerEndpoint     string
-	DataRoot           string
-	Logger             *slog.Logger
-	BootstrapCompleted func()
-	Sources            *sourceconnections.Service
-	Configuration      *appconfig.Store
-	Deployments        *deployments.Repository
-	authenticationWork *authenticationWorkGate
+	Auth                authenticationService
+	Apps                *apps.Store
+	Jobs                *jobs.Service
+	Machines            *machines.Store
+	Caddy               bool
+	FakeRuntime         bool
+	ComposeRuntime      bool
+	DockerEndpoint      string
+	DataRoot            string
+	Logger              *slog.Logger
+	BootstrapCompleted  func()
+	Sources             *sourceconnections.Service
+	Configuration       *appconfig.Store
+	Deployments         *deployments.Repository
+	RelayManagement     RelayManagementService
+	AutoDeploy          AutoDeployService
+	AutoDeployAvailable bool
+	RelayReconcile      func()
+	AutoDeployReconcile func()
+	authenticationWork  *authenticationWorkGate
+}
+
+// RelayManagementService is the controller-safe relay management boundary.
+// Implementations must return only the curated management DTOs.
+type RelayManagementService interface {
+	Status() controllerrelay.ManagementStatus
+	StartEnrollment(context.Context, string, controllerrelay.ManagementEnrollmentInput) (controllerrelay.ManagementEnrollmentStart, error)
+	PollEnrollment(context.Context, string, string) (controllerrelay.ManagementEnrollmentStatus, error)
+	RemoveBinding(context.Context, string, string) (controllerrelay.ManagementBindingStatus, error)
+	RotateKey(context.Context) (controllerrelay.ManagementKeyRotationStatus, error)
+}
+
+// AutoDeployService is the narrow repository surface required by the API.
+type AutoDeployService interface {
+	Get(context.Context, string) (autodeploy.Status, error)
+	Configure(context.Context, autodeploy.ConfigureRequest, time.Time) (autodeploy.Status, error)
+	Resume(context.Context, string, string, uint64, time.Time) (autodeploy.Status, error)
 }
 
 type authenticationService interface {
@@ -119,6 +143,14 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("listGitHubInstallations", s.require(s.listGitHubInstallations)),
 		contractRoute("listGitHubRepositories", s.require(s.listGitHubRepositories)),
 		contractRoute("listGitHubBranches", s.require(s.listGitHubBranches)),
+		contractRoute(operationGetRelayStatus, s.requireOperation(operationGetRelayStatus, s.getRelayStatus)),
+		contractRoute(operationStartRelayEnrollment, s.requireOperation(operationStartRelayEnrollment, s.startRelayEnrollment)),
+		contractRoute(operationPollRelayEnrollment, s.requireOperation(operationPollRelayEnrollment, s.pollRelayEnrollment)),
+		contractRoute(operationRemoveRelayBinding, s.requireOperation(operationRemoveRelayBinding, s.removeRelayBinding)),
+		contractRoute(operationStartRelayKeyRotation, s.requireOperation(operationStartRelayKeyRotation, s.startRelayKeyRotation)),
+		contractRoute(operationGetApplicationAutoDeploy, s.requireOperation(operationGetApplicationAutoDeploy, s.getApplicationAutoDeploy)),
+		contractRoute(operationUpdateApplicationAutoDeploy, s.requireOperation(operationUpdateApplicationAutoDeploy, s.updateApplicationAutoDeploy)),
+		contractRoute(operationResumeApplicationAutoDeploy, s.requireOperation(operationResumeApplicationAutoDeploy, s.resumeApplicationAutoDeploy)),
 	}
 }
 
@@ -152,28 +184,38 @@ type requestIDKey struct{}
 
 func (s *Server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.Logger.Info("request", "request_id", r.Context().Value(requestIDKey{}), "method", r.Method, "path", r.URL.Path)
 		next.ServeHTTP(w, r)
+		s.Logger.Info("request", "request_id", r.Context().Value(requestIDKey{}), "method", r.Method, "route", r.Pattern)
 	})
 }
 func (s *Server) require(next http.HandlerFunc) http.HandlerFunc {
+	return s.requireOperation("", next)
+}
+func (s *Server) requireOperation(operation string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(auth.SessionCookie)
 		if err != nil {
-			problem(w, r, http.StatusUnauthorized, "unauthenticated", "Authentication required", nil)
+			s.authenticationProblem(w, r, operation, http.StatusUnauthorized, "unauthenticated", "Authentication required")
 			return
 		}
 		u, csrf, err := s.Auth.Authenticate(c.Value)
 		if err != nil {
-			problem(w, r, http.StatusUnauthorized, "unauthenticated", "Authentication required", nil)
+			s.authenticationProblem(w, r, operation, http.StatusUnauthorized, "unauthenticated", "Authentication required")
 			return
 		}
 		if r.Method != "GET" && r.Method != "HEAD" && r.Method != "OPTIONS" && !s.Auth.CheckCSRF(csrf, r.Header.Get("X-CSRF-Token")) {
-			problem(w, r, http.StatusForbidden, "csrf_failed", "CSRF validation failed", nil)
+			s.authenticationProblem(w, r, operation, http.StatusForbidden, "csrf_failed", "CSRF validation failed")
 			return
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, principal{u, csrf})))
 	}
+}
+func (s *Server) authenticationProblem(w http.ResponseWriter, r *http.Request, operation string, status int, code, detail string) {
+	if operation == "" {
+		problem(w, r, status, code, detail, nil)
+		return
+	}
+	s.handlerProblem(w, r, operation, status, code, detail, 0)
 }
 func requestID(r *http.Request) string { v, _ := r.Context().Value(requestIDKey{}).(string); return v }
 func problem(w http.ResponseWriter, r *http.Request, status int, code, detail string, fields map[string]string) {

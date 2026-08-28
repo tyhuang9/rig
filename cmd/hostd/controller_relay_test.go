@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +40,91 @@ type firstRunAwareRelayRunner struct {
 	reconcileCalls  int
 	firstRunApplied int
 	lateReconciles  int
+}
+
+type controllerRelayManagementFake struct {
+	mu      sync.Mutex
+	status  controllerrelay.ManagementStatus
+	calls   [4]int
+	entered [4]chan<- struct{}
+	blocked [4]<-chan struct{}
+}
+
+func (management *controllerRelayManagementFake) Status() controllerrelay.ManagementStatus {
+	management.mu.Lock()
+	defer management.mu.Unlock()
+	return management.status
+}
+func (management *controllerRelayManagementFake) StartEnrollment(context.Context, string, controllerrelay.ManagementEnrollmentInput) (controllerrelay.ManagementEnrollmentStart, error) {
+	management.recordCall(0)
+	return controllerrelay.ManagementEnrollmentStart{}, nil
+}
+func (management *controllerRelayManagementFake) PollEnrollment(context.Context, string, string) (controllerrelay.ManagementEnrollmentStatus, error) {
+	management.recordCall(1)
+	return controllerrelay.ManagementEnrollmentStatus{}, nil
+}
+func (management *controllerRelayManagementFake) RemoveBinding(context.Context, string, string) (controllerrelay.ManagementBindingStatus, error) {
+	management.recordCall(2)
+	return controllerrelay.ManagementBindingStatus{}, nil
+}
+func (management *controllerRelayManagementFake) RotateKey(context.Context) (controllerrelay.ManagementKeyRotationStatus, error) {
+	management.recordCall(3)
+	return controllerrelay.ManagementKeyRotationStatus{}, nil
+}
+func (management *controllerRelayManagementFake) recordCall(index int) {
+	management.mu.Lock()
+	management.calls[index]++
+	entered := management.entered[index]
+	blocked := management.blocked[index]
+	management.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if blocked != nil {
+		<-blocked
+	}
+}
+func (management *controllerRelayManagementFake) callCounts() [4]int {
+	management.mu.Lock()
+	defer management.mu.Unlock()
+	return management.calls
+}
+
+type controllerRelayManagedRunnerFake struct {
+	*managedRelayRunnerFake
+	management controllerRelayManagement
+}
+
+type terminatingManagedRelayRunnerFake struct {
+	management controllerRelayManagement
+	started    chan struct{}
+	release    <-chan struct{}
+	exitErr    error
+	cancelErr  error
+}
+
+func (runner *terminatingManagedRelayRunnerFake) Run(ctx context.Context) error {
+	close(runner.started)
+	select {
+	case <-runner.release:
+		return runner.exitErr
+	case <-ctx.Done():
+		return runner.cancelErr
+	}
+}
+func (*terminatingManagedRelayRunnerFake) Snapshot() controllerrelay.SupervisorSnapshot {
+	return controllerrelay.SupervisorSnapshot{}
+}
+func (*terminatingManagedRelayRunnerFake) Reconcile() {}
+func (runner *terminatingManagedRelayRunnerFake) controllerRelayManagementService() controllerRelayManagement {
+	return runner.management
+}
+
+func (runner *controllerRelayManagedRunnerFake) controllerRelayManagementService() controllerRelayManagement {
+	return runner.management
 }
 
 func (runner *firstRunAwareRelayRunner) Run(context.Context) error {
@@ -114,12 +200,16 @@ func (relayRunnerFake) Reconcile() {}
 
 func TestControllerRelayDisabledDoesNotConstructOrRun(t *testing.T) {
 	var calls int
-	done := startControllerRelay(context.Background(), config.Defaults(), newStructuredLogger(&bytes.Buffer{}, "info"), newControllerRelayManagementTarget(), func() (controllerRelayRunner, error) { calls++; return nil, nil })
+	target := newControllerRelayManagementTarget()
+	done := startControllerRelay(context.Background(), config.Defaults(), newStructuredLogger(&bytes.Buffer{}, "info"), target, func() (controllerRelayRunner, error) { calls++; return nil, nil })
 	if calls != 0 {
 		t.Fatalf("disabled relay factory calls=%d", calls)
 	}
 	if !waitForWorker(done, time.Second) {
 		t.Fatal("disabled relay did not finish")
+	}
+	if status := target.Status(); status.Availability != controllerrelay.ManagementUnavailable || !status.DiagnosticsUnavailable {
+		t.Fatalf("disabled relay status=%#v", status)
 	}
 }
 
@@ -197,7 +287,8 @@ func TestControllerRelayConstructionFailureIsSafeAndNonfatal(t *testing.T) {
 	cfg.ControllerRelay = true
 	cfg.RelayOrigin = "https://relay.example"
 	var logs bytes.Buffer
-	done := startControllerRelay(context.Background(), cfg, newStructuredLogger(&logs, "info"), newControllerRelayManagementTarget(), func() (controllerRelayRunner, error) {
+	target := newControllerRelayManagementTarget()
+	done := startControllerRelay(context.Background(), cfg, newStructuredLogger(&logs, "info"), target, func() (controllerRelayRunner, error) {
 		return nil, errors.New("https://relay.example secret-session-id")
 	})
 	if !waitForWorker(done, time.Second) {
@@ -205,6 +296,9 @@ func TestControllerRelayConstructionFailureIsSafeAndNonfatal(t *testing.T) {
 	}
 	if output := logs.String(); strings.Contains(output, "relay.example") || strings.Contains(output, "secret-session-id") || !strings.Contains(output, "persistence_unavailable") {
 		t.Fatalf("unsafe construction log=%q", output)
+	}
+	if status := target.Status(); status.Availability != controllerrelay.ManagementUnavailable || !status.DiagnosticsUnavailable {
+		t.Fatalf("construction failure status=%#v", status)
 	}
 }
 
@@ -282,6 +376,243 @@ func TestControllerRelayManagementTargetRemainsUnavailableAfterConstructionFailu
 	}
 }
 
+func TestControllerRelayManagementTargetLifecycleStatusAndUnavailableMethods(t *testing.T) {
+	target := newControllerRelayManagementTarget()
+	if status := target.Status(); status.Availability != controllerrelay.ManagementInitializing || !status.DiagnosticsUnavailable {
+		t.Fatalf("initial status=%#v", status)
+	}
+	ctx := context.Background()
+	assertUnavailable := func(err error) {
+		t.Helper()
+		if !controllerrelay.IsManagementCode(err, controllerrelay.ManagementErrorUnavailable) {
+			t.Fatalf("management error=%v", err)
+		}
+	}
+	_, err := target.StartEnrollment(ctx, "owner", controllerrelay.ManagementEnrollmentInput{})
+	assertUnavailable(err)
+	_, err = target.PollEnrollment(ctx, "owner", "enrollment")
+	assertUnavailable(err)
+	_, err = target.RemoveBinding(ctx, "owner", "binding")
+	assertUnavailable(err)
+	_, err = target.RotateKey(ctx)
+	assertUnavailable(err)
+
+	target.markUnavailable()
+	if status := target.Status(); status.Availability != controllerrelay.ManagementUnavailable || !status.DiagnosticsUnavailable {
+		t.Fatalf("unavailable status=%#v", status)
+	}
+	_, err = target.RotateKey(ctx)
+	assertUnavailable(err)
+}
+
+func TestControllerRelayManagementTargetUnexpectedExitIsTerminalButCancellationIsClean(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.ControllerRelay = true
+	cfg.RelayOrigin = "https://relay.example"
+
+	for name, exitErr := range map[string]error{"return": nil, "error": errors.New("secret runtime failure")} {
+		t.Run("unexpected_"+name, func(t *testing.T) {
+			target := newControllerRelayManagementTarget()
+			management := &controllerRelayManagementFake{status: controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementAvailable, State: controllerrelay.SessionReady}}
+			started, release := make(chan struct{}), make(chan struct{})
+			runner := &terminatingManagedRelayRunnerFake{management: management, started: started, release: release, exitErr: exitErr}
+			done := startControllerRelay(context.Background(), cfg, newStructuredLogger(&bytes.Buffer{}, "info"), target, func() (controllerRelayRunner, error) { return runner, nil })
+			<-started
+			if status := target.Status(); status.Availability != controllerrelay.ManagementAvailable || status.DiagnosticsUnavailable {
+				t.Fatalf("installed status=%#v", status)
+			}
+			close(release)
+			if !waitForWorker(done, time.Second) {
+				t.Fatal("unexpected relay exit did not drain")
+			}
+			if status := target.Status(); status.Availability != controllerrelay.ManagementUnavailable || !status.DiagnosticsUnavailable {
+				t.Fatalf("unexpected exit status=%#v", status)
+			}
+			assertUnavailable := func(err error) {
+				t.Helper()
+				if !controllerrelay.IsManagementCode(err, controllerrelay.ManagementErrorUnavailable) {
+					t.Fatalf("post-exit management error=%v", err)
+				}
+			}
+			_, err := target.StartEnrollment(context.Background(), "owner", controllerrelay.ManagementEnrollmentInput{})
+			assertUnavailable(err)
+			_, err = target.PollEnrollment(context.Background(), "owner", "enrollment")
+			assertUnavailable(err)
+			_, err = target.RemoveBinding(context.Background(), "owner", "binding")
+			assertUnavailable(err)
+			_, err = target.RotateKey(context.Background())
+			assertUnavailable(err)
+			if calls := management.callCounts(); calls != [4]int{} {
+				t.Fatalf("post-exit mutation reached management: %v", calls)
+			}
+			if target.install(&controllerRelayManagedRunnerFake{managedRelayRunnerFake: &managedRelayRunnerFake{}, management: management}) {
+				t.Fatal("terminal target accepted a replacement runtime")
+			}
+		})
+	}
+
+	for name, cancelErr := range map[string]error{"nil_return": nil, "canceled_error": context.Canceled} {
+		t.Run("clean_"+name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			target := newControllerRelayManagementTarget()
+			management := &controllerRelayManagementFake{status: controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementAvailable, State: controllerrelay.SessionStopped}}
+			started, release := make(chan struct{}), make(chan struct{})
+			runner := &terminatingManagedRelayRunnerFake{management: management, started: started, release: release, cancelErr: cancelErr}
+			done := startControllerRelay(ctx, cfg, newStructuredLogger(&bytes.Buffer{}, "info"), target, func() (controllerRelayRunner, error) { return runner, nil })
+			<-started
+			cancel()
+			if !waitForWorker(done, time.Second) {
+				t.Fatal("clean relay shutdown did not drain")
+			}
+			if status := target.Status(); status.Availability != controllerrelay.ManagementAvailable || status.DiagnosticsUnavailable {
+				t.Fatalf("clean shutdown status=%#v", status)
+			}
+			if _, err := target.RotateKey(context.Background()); err != nil {
+				t.Fatalf("clean shutdown discarded supervisor-owned management: %v", err)
+			}
+			if calls := management.callCounts(); calls[3] != 1 {
+				t.Fatalf("clean shutdown management calls=%v", calls)
+			}
+		})
+	}
+}
+
+func TestControllerRelayManagementTargetDrainsAdmittedMutationsBeforeTerminalBoundary(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.ControllerRelay = true
+	cfg.RelayOrigin = "https://relay.example"
+	tests := []struct {
+		name   string
+		index  int
+		invoke func(*controllerRelayManagementTarget) error
+	}{
+		{name: "start_enrollment", index: 0, invoke: func(target *controllerRelayManagementTarget) error {
+			_, err := target.StartEnrollment(context.Background(), "owner", controllerrelay.ManagementEnrollmentInput{})
+			return err
+		}},
+		{name: "poll_enrollment", index: 1, invoke: func(target *controllerRelayManagementTarget) error {
+			_, err := target.PollEnrollment(context.Background(), "owner", "enrollment")
+			return err
+		}},
+		{name: "remove_binding", index: 2, invoke: func(target *controllerRelayManagementTarget) error {
+			_, err := target.RemoveBinding(context.Background(), "owner", "binding")
+			return err
+		}},
+		{name: "rotate_key", index: 3, invoke: func(target *controllerRelayManagementTarget) error {
+			_, err := target.RotateKey(context.Background())
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target := newControllerRelayManagementTarget()
+			entered := make(chan struct{}, 1)
+			unblock := make(chan struct{})
+			management := &controllerRelayManagementFake{status: controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementAvailable}}
+			management.entered[test.index] = entered
+			management.blocked[test.index] = unblock
+			runnerStarted, runnerExit := make(chan struct{}), make(chan struct{})
+			runner := &terminatingManagedRelayRunnerFake{management: management, started: runnerStarted, release: runnerExit}
+			done := startControllerRelay(context.Background(), cfg, newStructuredLogger(&bytes.Buffer{}, "info"), target, func() (controllerRelayRunner, error) { return runner, nil })
+			<-runnerStarted
+
+			callDone := make(chan error, 1)
+			go func() { callDone <- test.invoke(target) }()
+			<-entered
+			close(runnerExit)
+			if !waitForManagementDrain(target, time.Second) {
+				t.Fatal("unexpected exit did not begin management drain")
+			}
+			if status := target.Status(); status.Availability != controllerrelay.ManagementUnavailable || !status.DiagnosticsUnavailable {
+				t.Fatalf("draining status=%#v", status)
+			}
+			select {
+			case <-done:
+				t.Fatal("terminal boundary crossed before admitted mutation drained")
+			default:
+			}
+			if err := test.invoke(target); !controllerrelay.IsManagementCode(err, controllerrelay.ManagementErrorUnavailable) {
+				t.Fatalf("mutation admitted during drain: %v", err)
+			}
+			if calls := management.callCounts(); calls[test.index] != 1 {
+				t.Fatalf("management calls during drain=%v", calls)
+			}
+
+			close(unblock)
+			if err := <-callDone; err != nil {
+				t.Fatalf("pre-boundary admitted mutation failed: %v", err)
+			}
+			if !waitForWorker(done, time.Second) {
+				t.Fatal("unexpected exit did not finish after management drain")
+			}
+			if status := target.Status(); status.Availability != controllerrelay.ManagementUnavailable || !status.DiagnosticsUnavailable {
+				t.Fatalf("terminal status=%#v", status)
+			}
+			if err := test.invoke(target); !controllerrelay.IsManagementCode(err, controllerrelay.ManagementErrorUnavailable) {
+				t.Fatalf("post-boundary mutation result=%v", err)
+			}
+		})
+	}
+}
+
+func waitForManagementDrain(target *controllerRelayManagementTarget, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		target.mu.RLock()
+		draining := target.managementDraining
+		target.mu.RUnlock()
+		if draining {
+			return true
+		}
+		runtime.Gosched()
+	}
+	return false
+}
+
+func TestControllerRelayManagementTargetConcurrentPublicationAndMutations(t *testing.T) {
+	target := newControllerRelayManagementTarget()
+	management := &controllerRelayManagementFake{status: controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementAvailable, State: controllerrelay.SessionReady}}
+	runner := &controllerRelayManagedRunnerFake{managedRelayRunnerFake: &managedRelayRunnerFake{}, management: management}
+	const callers = 400
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for index := 0; index < callers; index++ {
+		index := index
+		go func() {
+			defer wait.Done()
+			<-start
+			for target.Status().Availability != controllerrelay.ManagementAvailable {
+				runtime.Gosched()
+			}
+			switch index % 4 {
+			case 0:
+				_, _ = target.StartEnrollment(context.Background(), "owner", controllerrelay.ManagementEnrollmentInput{})
+			case 1:
+				_, _ = target.PollEnrollment(context.Background(), "owner", "enrollment")
+			case 2:
+				_, _ = target.RemoveBinding(context.Background(), "owner", "binding")
+			case 3:
+				_, _ = target.RotateKey(context.Background())
+			}
+		}()
+	}
+	close(start)
+	if !target.install(runner) {
+		t.Fatal("concurrent target publication failed")
+	}
+	wait.Wait()
+	if status := target.Status(); status.Availability != controllerrelay.ManagementAvailable || status.State != controllerrelay.SessionReady {
+		t.Fatalf("published status=%#v", status)
+	}
+	if got := management.callCounts(); got != [4]int{callers / 4, callers / 4, callers / 4, callers / 4} {
+		t.Fatalf("management calls=%v", got)
+	}
+	if runtime, available := target.current(); available || runtime != nil {
+		t.Fatalf("fake runner exposed runtime=%p available=%t", runtime, available)
+	}
+}
+
 func TestNewControllerRelayRuntimeRetainsOneSharedManagementGraph(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.DataRoot = t.TempDir()
@@ -300,7 +631,7 @@ func TestNewControllerRelayRuntimeRetainsOneSharedManagementGraph(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runtime.repository == nil || runtime.credentials == nil || runtime.client == nil || runtime.enrollment == nil || runtime.controls == nil || runtime.supervisor == nil {
+	if runtime.repository == nil || runtime.credentials == nil || runtime.client == nil || runtime.enrollment == nil || runtime.controls == nil || runtime.supervisor == nil || runtime.management == nil {
 		t.Fatalf("incomplete retained runtime: %#v", runtime)
 	}
 	target := newControllerRelayManagementTarget()
@@ -310,6 +641,9 @@ func TestNewControllerRelayRuntimeRetainsOneSharedManagementGraph(t *testing.T) 
 	got, available := target.current()
 	if !available || got != runtime {
 		t.Fatalf("published runtime=%p available=%t want %p", got, available, runtime)
+	}
+	if status := target.Status(); status.Availability != controllerrelay.ManagementAvailable {
+		t.Fatalf("published management status=%#v", status)
 	}
 }
 
