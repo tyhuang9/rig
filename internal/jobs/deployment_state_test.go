@@ -3,10 +3,13 @@ package jobs
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/database"
 )
 
 type pauseExecutor struct{}
@@ -133,6 +136,108 @@ func TestWaitingUserResumeStartsANewAttemptAndPausedCancelIsTerminal(t *testing.
 	}
 	if _, err := service.Resume(job.ID); !errors.Is(err, ErrJobNotPaused) {
 		t.Fatalf("resume cancelled = %v", err)
+	}
+}
+
+func TestResumeWaitsForConcurrentApprovalRevocationAndFailsClosed(t *testing.T) {
+	dataRoot := filepath.Join(t.TempDir(), "state")
+	db, err := database.Open(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	peerDB, err := database.Open(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = peerDB.Close() })
+	service := New(db)
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	appID, actorID := uuid.NewString(), uuid.NewString()
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,'resume-owner','hash',?,?)`, actorID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,created_at,updated_at) VALUES(?,'resume-race','Resume race',?,?)`, appID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := service.CreateWithInput(CreateRequest{
+		Type: "deploy", ResourceType: "application", ResourceID: appID,
+		RequestedBy: actorID, Input: DeploymentInput{ConfigurationMode: ConfigurationCurrent},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentID, findingID, approvalID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	const fingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,job_id,status,configuration_mode,provenance_initialized) VALUES(?,?,?,'needs_attention','current',1)`, deploymentID, appID, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO deployment_policy_findings(id,deployment_id,policy_version,capability,scope,fingerprint,disposition,created_at) VALUES(?,?, 'compose-runtime-v1','privileged','service:web',?,'approval_required',?)`, findingID, deploymentID, fingerprint, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO runtime_approvals(id,app_id,policy_version,capability,scope,fingerprint,granted_by,granted_at) VALUES(?,?, 'compose-runtime-v1','privileged','service:web',?,?,?)`, approvalID, appID, fingerprint, actorID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE jobs SET status='waiting_user',phase='approval_required',pause_disposition='approval_required',attempt=2 WHERE id=?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-service.wake:
+	default:
+	}
+
+	revocation, err := peerDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	revocationOpen := true
+	t.Cleanup(func() {
+		if revocationOpen {
+			_ = revocation.Rollback()
+		}
+	})
+	if _, err := revocation.Exec(`UPDATE runtime_approvals SET revoked_by=?,revoked_at=? WHERE id=? AND revoked_at IS NULL`, actorID, time.Now().UTC().Format(time.RFC3339Nano), approvalID); err != nil {
+		t.Fatal(err)
+	}
+
+	resumeCalling := make(chan struct{})
+	resumeResult := make(chan error, 1)
+	go func() {
+		close(resumeCalling)
+		_, resumeErr := service.Resume(job.ID)
+		resumeResult <- resumeErr
+	}()
+	<-resumeCalling
+	select {
+	case resumeErr := <-resumeResult:
+		t.Fatalf("resume returned before the revocation writer committed: %v", resumeErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := revocation.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	revocationOpen = false
+	select {
+	case resumeErr := <-resumeResult:
+		if !errors.Is(resumeErr, ErrApprovalRequired) {
+			t.Fatalf("resume after revocation = %v, want %v", resumeErr, ErrApprovalRequired)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("resume did not finish after revocation committed")
+	}
+	persisted, err := service.Get(job.ID)
+	if err != nil || persisted.Status != string(WaitingUser) || persisted.Phase != "approval_required" || persisted.PauseDisposition != "approval_required" || persisted.Attempt != 2 {
+		t.Fatalf("resume after revocation changed job = %#v, %v", persisted, err)
+	}
+	events, err := service.Events(job.ID, 0)
+	if err != nil || countEvents(events, "job_resumed") != 0 {
+		t.Fatalf("resume after revocation events = %#v, %v", events, err)
+	}
+	select {
+	case <-service.wake:
+		t.Fatal("resume after revocation woke a worker")
+	default:
 	}
 }
 

@@ -651,6 +651,106 @@ func TestResumeOnlyRequeuesOwnWaitingDeploymentOnComposeRuntime(t *testing.T) {
 	assertProblemCode(t, crossApp, http.StatusNotFound, "job_not_found")
 }
 
+func TestResumeRequiresEveryExactActiveRuntimeApproval(t *testing.T) {
+	f := newDeploymentAPIFixture(t, true, false)
+	job, deployment := f.createDeployment(t, f.app.ID, "current")
+	findings := []deployments.Finding{
+		{
+			PolicyVersion: "compose-runtime-v1", Capability: "privileged", Scope: "service:web",
+			Fingerprint: policyFindingFingerprint("compose-runtime-v1", "privileged", "service:web"), Disposition: "approval_required",
+		},
+		{
+			PolicyVersion: "compose-runtime-v1", Capability: "host-network", Scope: "service:worker",
+			Fingerprint: policyFindingFingerprint("compose-runtime-v1", "host-network", "service:worker"), Disposition: "approval_required",
+		},
+	}
+	if err := f.deployments.Gate(context.Background(), f.app.ID, deployment.ID, findings); !errors.Is(err, deployments.ErrApprovalRequired) {
+		t.Fatalf("initial approval gate = %v", err)
+	}
+	if _, err := f.db.Exec(`UPDATE jobs SET status='waiting_user',phase='approval_required',pause_disposition='approval_required',attempt=3 WHERE id=?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	actorID := f.userID(t)
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	wrongIdentityID, wrongAppID := uuid.NewString(), uuid.NewString()
+	if _, err := f.db.Exec(`INSERT INTO runtime_approvals(id,app_id,policy_version,capability,scope,fingerprint,granted_by,granted_at) VALUES(?,?,?,?,?,?,?,?)`, wrongIdentityID, f.app.ID, "compose-runtime-v0", "different-capability", "service:different", findings[0].Fingerprint, actorID, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Exec(`INSERT INTO runtime_approvals(id,app_id,policy_version,capability,scope,fingerprint,granted_by,granted_at) VALUES(?,?,?,?,?,?,?,?)`, wrongAppID, f.otherApp.ID, findings[1].PolicyVersion, findings[1].Capability, findings[1].Scope, findings[1].Fingerprint, actorID, stamp); err != nil {
+		t.Fatal(err)
+	}
+
+	resumePath := "/api/v1/jobs/" + job.ID + "/resume"
+	assertResumeApprovalRequired := func(label string) {
+		t.Helper()
+		response := f.request(http.MethodPost, resumePath, "")
+		assertProblemCode(t, response, http.StatusConflict, "approval_required")
+		assertNoSensitiveDetail(t, response.Body.String())
+		if strings.Contains(response.Body.String(), findings[0].Fingerprint) || strings.Contains(response.Body.String(), findings[1].Scope) {
+			t.Fatalf("%s response exposed policy identity: %s", label, response.Body.String())
+		}
+		persisted, err := f.jobs.Get(job.ID)
+		if err != nil || persisted.Status != string(jobs.WaitingUser) || persisted.Phase != "approval_required" || persisted.PauseDisposition != "approval_required" || persisted.Attempt != 3 {
+			t.Fatalf("%s changed waiting job: %#v, %v", label, persisted, err)
+		}
+		events, err := f.jobs.Events(job.ID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range events {
+			if event.Code == "job_resumed" {
+				t.Fatalf("%s appended a resume event: %#v", label, events)
+			}
+		}
+	}
+
+	assertResumeApprovalRequired("mismatched approvals")
+	if _, err := f.deployments.Revoke(context.Background(), f.app.ID, wrongIdentityID, actorID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.deployments.Revoke(context.Background(), f.otherApp.ID, wrongAppID, actorID); err != nil {
+		t.Fatal(err)
+	}
+	firstApproval, _, err := f.deployments.Grant(context.Background(), f.app.ID, actorID, findings[0].Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertResumeApprovalRequired("one of two approvals")
+	if _, _, err := f.deployments.Grant(context.Background(), f.app.ID, actorID, findings[1].Fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.deployments.Revoke(context.Background(), f.app.ID, firstApproval.ID, actorID); err != nil {
+		t.Fatal(err)
+	}
+	assertResumeApprovalRequired("revoked approval")
+	if _, _, err := f.deployments.Grant(context.Background(), f.app.ID, actorID, findings[0].Fingerprint); err != nil {
+		t.Fatal(err)
+	}
+
+	resumed := f.request(http.MethodPost, resumePath, "")
+	if resumed.Code != http.StatusOK {
+		t.Fatalf("approved resume: %d %s", resumed.Code, resumed.Body.String())
+	}
+	persisted, err := f.jobs.Get(job.ID)
+	if err != nil || persisted.Status != string(jobs.Queued) || persisted.Phase != "queued" || persisted.PauseDisposition != "" || persisted.Attempt != 3 {
+		t.Fatalf("approved resume = %#v, %v", persisted, err)
+	}
+	events, err := f.jobs.Events(job.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumedEvents := 0
+	for _, event := range events {
+		if event.Code == "job_resumed" {
+			resumedEvents++
+		}
+	}
+	if resumedEvents != 1 {
+		t.Fatalf("approved resume events = %#v", events)
+	}
+}
+
 func (f deploymentAPIFixture) requestWithKey(method, path, body, key string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: f.session.Token})
