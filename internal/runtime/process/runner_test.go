@@ -24,9 +24,26 @@ func TestCommandHelper(t *testing.T) {
 		fmt.Fprint(os.Stderr, strings.Repeat("e", 128))
 	case "tree":
 		if os.Getenv("HOSTD_PROCESS_CHILD") == "1" {
-			time.Sleep(1500 * time.Millisecond)
-			_ = os.WriteFile(os.Getenv("HOSTD_PROCESS_MARKER"), []byte("survived"), 0o600)
-			os.Exit(0)
+			if err := createProcessSignal(os.Getenv("HOSTD_PROCESS_READY")); err != nil {
+				os.Exit(4)
+			}
+			expires := time.Now().Add(15 * time.Second)
+			for {
+				if time.Now().After(expires) {
+					os.Exit(7)
+				}
+				_, err := os.Stat(os.Getenv("HOSTD_PROCESS_RELEASE"))
+				if err == nil {
+					if err := os.WriteFile(os.Getenv("HOSTD_PROCESS_MARKER"), []byte("survived"), 0o600); err != nil {
+						os.Exit(6)
+					}
+					os.Exit(0)
+				}
+				if !errors.Is(err, os.ErrNotExist) {
+					os.Exit(5)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
 		}
 		command := exec.Command(os.Args[0], "-test.run=TestCommandHelper")
 		command.Env = append(os.Environ(), "HOSTD_PROCESS_CHILD=1")
@@ -66,22 +83,121 @@ func TestExecRunnerUsesExactEnvAndBoundsOutput(t *testing.T) {
 }
 
 func TestExecRunnerCancelsDescendantProcessTree(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), "descendant-survived")
-	_, err := (ExecRunner{}).Run(context.Background(), CommandRequest{
-		Executable: os.Args[0], Args: []string{"-test.run=TestCommandHelper"}, Directory: t.TempDir(),
-		Env:     []string{"HOSTD_PROCESS_HELPER=1", "HOSTD_PROCESS_MODE=tree", "HOSTD_PROCESS_MARKER=" + marker},
-		Timeout: 150 * time.Millisecond,
+	signals := t.TempDir()
+	ready := filepath.Join(signals, "descendant-ready")
+	release := filepath.Join(signals, "descendant-release")
+	marker := filepath.Join(signals, "descendant-survived")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		if err := createProcessSignal(release); err != nil && !errors.Is(err, os.ErrExist) {
+			t.Errorf("release descendant during cleanup: %v", err)
+		}
 	})
-	if !errors.Is(err, context.DeadlineExceeded) {
+	commandDirectory := t.TempDir()
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := (ExecRunner{}).Run(ctx, CommandRequest{
+			Executable: os.Args[0], Args: []string{"-test.run=TestCommandHelper"}, Directory: commandDirectory,
+			Env: []string{
+				"HOSTD_PROCESS_HELPER=1", "HOSTD_PROCESS_MODE=tree", "HOSTD_PROCESS_READY=" + ready,
+				"HOSTD_PROCESS_RELEASE=" + release, "HOSTD_PROCESS_MARKER=" + marker,
+			},
+			Timeout: 10 * time.Second,
+		})
+		runDone <- err
+	}()
+
+	readinessDeadline := time.NewTimer(5 * time.Second)
+	readinessPoll := time.NewTicker(10 * time.Millisecond)
+	readyObserved := false
+	for !readyObserved {
+		select {
+		case err := <-runDone:
+			readinessDeadline.Stop()
+			readinessPoll.Stop()
+			t.Fatalf("runner returned before descendant readiness: %v", err)
+		case <-readinessDeadline.C:
+			readinessPoll.Stop()
+			cancel()
+			select {
+			case err := <-runDone:
+				t.Fatalf("timed out waiting for descendant readiness; cancellation result: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for descendant readiness and runner cancellation")
+			}
+		case <-readinessPoll.C:
+			_, err := os.Stat(ready)
+			if err == nil {
+				readyObserved = true
+				readinessDeadline.Stop()
+				readinessPoll.Stop()
+				continue
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				readinessDeadline.Stop()
+				readinessPoll.Stop()
+				cancel()
+				select {
+				case runErr := <-runDone:
+					t.Fatalf("inspect descendant readiness: %v; cancellation result: %v", err, runErr)
+				case <-time.After(5 * time.Second):
+					t.Fatalf("inspect descendant readiness: %v; runner did not stop", err)
+				}
+			}
+		}
+	}
+
+	cancel()
+	var err error
+	select {
+	case err = <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runner did not return after external cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancel error = %v", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("external cancellation was reported as a timeout: %v", err)
 	}
 	if errors.Is(err, ErrTerminationFailed) {
 		t.Fatalf("successful descendant termination reported failure: %v", err)
 	}
-	time.Sleep(1800 * time.Millisecond)
-	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("descendant escaped process-tree cancellation: %v", err)
+	if err := createProcessSignal(release); err != nil {
+		t.Fatalf("release surviving descendant: %v", err)
 	}
+
+	survivorDeadline := time.NewTimer(3 * time.Second)
+	defer survivorDeadline.Stop()
+	survivorPoll := time.NewTicker(10 * time.Millisecond)
+	defer survivorPoll.Stop()
+	for {
+		_, err := os.Stat(marker)
+		if err == nil {
+			t.Fatal("descendant escaped process-tree cancellation")
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("inspect descendant survivor marker: %v", err)
+		}
+		select {
+		case <-survivorDeadline.C:
+			return
+		case <-survivorPoll.C:
+		}
+	}
+}
+
+func createProcessSignal(path string) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
 }
 
 func TestExecRunnerPreservesGracefulTerminationFailure(t *testing.T) {
