@@ -48,6 +48,8 @@ Fake runtime is fail-closed. It must be explicitly enabled and its resolved data
 
 The real Docker Compose runtime requires `--compose-runtime`, is mutually exclusive with the fake runtime, and accepts only a controller-local Docker endpoint. Its administrative surface is the authenticated API; real deployment controls are not yet exposed in the embedded dashboard. See [Docker Compose runtime operations](docs/compose-runtime.md) for security boundaries, timeout flags, approval and resume flows, live verification, crash recovery, and disable/rollback guidance.
 
+The separately deployable GitHub webhook relay has an immutable, non-root OCI build, PostgreSQL Compose examples, a strict HTTPS health probe, and production operations guidance. See [Official webhook relay operations](docs/relay-operations.md) for TLS/proxy modes, protected configuration, backup/recovery, monitoring, rollback, and staging verification.
+
 ## Use hostctl safely
 
 After creating the administrator in the dashboard, create a CLI session without putting credentials in process arguments. PowerShell can supply a credential object through standard input:

@@ -1,4 +1,4 @@
-.PHONY: bootstrap generate check-generated check-embedded check-embedded-windows dev-backend dev-web test test-integration test-e2e test-e2e-windows build build-windows
+.PHONY: bootstrap generate check-generated check-embedded check-embedded-windows dev-backend dev-web test test-integration test-e2e test-e2e-windows build build-windows test-relay-probe check-relay-package check-relay-package-windows
 bootstrap:
 	pnpm --dir web install
 generate:
@@ -26,8 +26,14 @@ test-e2e-windows:
 build:
 	pnpm --dir web build
 	sh scripts/embed-web.sh
-	go build ./cmd/hostd ./cmd/hostctl
+	go build ./cmd/hostd ./cmd/hostctl ./cmd/rig-relay ./cmd/rig-relay-probe
 build-windows:
 	pnpm --dir web build
 	powershell -ExecutionPolicy Bypass -File scripts/embed-web.ps1
-	go build ./cmd/hostd ./cmd/hostctl
+	go build ./cmd/hostd ./cmd/hostctl ./cmd/rig-relay ./cmd/rig-relay-probe
+test-relay-probe:
+	go test ./cmd/rig-relay-probe -count=1
+check-relay-package:
+	go test ./cmd/rig-relay-probe -run '^TestRelayPackagingContract$$' -count=1
+check-relay-package-windows:
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-relay-packaging.ps1 -SelfTest

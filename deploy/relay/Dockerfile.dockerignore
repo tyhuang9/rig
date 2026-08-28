@@ -1,0 +1,12 @@
+# Fail closed: only the Go module contract and relay source enter the build context.
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/rig-relay/
+!cmd/rig-relay/**
+!cmd/rig-relay-probe/
+!cmd/rig-relay-probe/**
+!internal/
+!internal/relay/
+!internal/relay/**

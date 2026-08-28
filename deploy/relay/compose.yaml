@@ -1,0 +1,137 @@
+name: rig-relay
+
+services:
+  postgres:
+    image: docker.io/library/postgres:18.6-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af
+    user: "999:999"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    environment:
+      POSTGRES_DB: rig_relay
+      POSTGRES_USER: rig_relay
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --data-checksums
+    secrets:
+      - postgres_password
+    volumes:
+      - relay-postgres-data:/var/lib/postgresql
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777,uid=999,gid=999
+      - /var/run/postgresql:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=999,gid=999
+    shm_size: 128m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -U rig_relay -d rig_relay"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - relay-database
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.5
+    stop_grace_period: 30s
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "5"
+        compress: "true"
+
+  relay:
+    image: "${HOSTD_RELAY_IMAGE:?set HOSTD_RELAY_IMAGE to a verified registry/repository@sha256 digest}"
+    user: "65532:65532"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    environment:
+      HOSTD_RELAY_LISTEN_ADDRESS: 0.0.0.0:7346
+      HOSTD_RELAY_PUBLIC_BASE_URL: "${HOSTD_RELAY_PUBLIC_BASE_URL:?set the public HTTPS origin}"
+      HOSTD_RELAY_LOOPBACK_DEVELOPMENT: "false"
+      HOSTD_RELAY_GITHUB_CLIENT_ID: "${HOSTD_RELAY_GITHUB_CLIENT_ID:?set the GitHub App client ID}"
+      HOSTD_RELAY_GITHUB_APP_ID: "${HOSTD_RELAY_GITHUB_APP_ID:?set the GitHub App ID}"
+      HOSTD_RELAY_POSTGRES_DSN_FILE: /run/secrets/relay_postgres_dsn
+      HOSTD_RELAY_GITHUB_CLIENT_SECRET_FILE: /run/secrets/github_client_secret
+      HOSTD_RELAY_GITHUB_PRIVATE_KEY_FILE: /run/secrets/github_app_private_key
+      HOSTD_RELAY_WEBHOOK_SECRET_FILE: /run/secrets/github_webhook_secret
+      HOSTD_RELAY_ENROLLMENT_KEY_FILE: /run/secrets/enrollment_key
+      HOSTD_RELAY_TLS_CERTIFICATE_FILE: /run/secrets/relay_tls_certificate
+      HOSTD_RELAY_TLS_PRIVATE_KEY_FILE: /run/secrets/relay_tls_private_key
+    secrets:
+      - relay_postgres_dsn
+      - github_client_secret
+      - github_app_private_key
+      - github_webhook_secret
+      - enrollment_key
+      - relay_tls_certificate
+      - relay_tls_private_key
+      - relay_tls_ca
+    depends_on:
+      postgres:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/rig-relay-probe
+        - --base-url=https://127.0.0.1:7346
+        - "--server-name=${HOSTD_RELAY_TLS_SERVER_NAME:?set the certificate DNS name used for SNI}"
+        - --ca-file=/run/secrets/relay_tls_ca
+        - --endpoint=ready
+        - --timeout=5s
+      interval: 15s
+      timeout: 7s
+      retries: 4
+      start_period: 45s
+    networks:
+      - relay-database
+      - relay-edge
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    stop_grace_period: 30s
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "5"
+        compress: "true"
+
+secrets:
+  postgres_password:
+    file: ${HOSTD_RELAY_SECRET_DIRECTORY:?set the absolute protected secret directory}/postgres-password.txt
+  relay_postgres_dsn:
+    file: ${HOSTD_RELAY_SECRET_DIRECTORY:?set the absolute protected secret directory}/relay-postgres-dsn.txt
+  github_client_secret:
+    file: ${HOSTD_RELAY_SECRET_DIRECTORY:?set the absolute protected secret directory}/github-client-secret.txt
+  github_app_private_key:
+    file: ${HOSTD_RELAY_SECRET_DIRECTORY:?set the absolute protected secret directory}/github-app-private-key.pem
+  github_webhook_secret:
+    file: ${HOSTD_RELAY_SECRET_DIRECTORY:?set the absolute protected secret directory}/github-webhook-secret.txt
+  enrollment_key:
+    file: ${HOSTD_RELAY_SECRET_DIRECTORY:?set the absolute protected secret directory}/enrollment-key.bin
+  relay_tls_certificate:
+    file: ${HOSTD_RELAY_SECRET_DIRECTORY:?set the absolute protected secret directory}/relay-tls-certificate.pem
+  relay_tls_private_key:
+    file: ${HOSTD_RELAY_SECRET_DIRECTORY:?set the absolute protected secret directory}/relay-tls-private-key.pem
+  relay_tls_ca:
+    file: ${HOSTD_RELAY_SECRET_DIRECTORY:?set the absolute protected secret directory}/relay-tls-ca.pem
+
+volumes:
+  relay-postgres-data:
+
+networks:
+  relay-database:
+    internal: true
+  relay-edge:
+    external: true
+    name: "${HOSTD_RELAY_EDGE_NETWORK:-rig-relay-edge}"
