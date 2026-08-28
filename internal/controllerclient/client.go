@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,8 +22,9 @@ const maxResponseBytes int64 = 1 << 20
 
 // Session holds the cookie and CSRF credentials for one controller session.
 type Session struct {
-	SessionToken string `json:"sessionToken"`
-	CSRFToken    string `json:"csrfToken"`
+	SessionToken     string `json:"sessionToken"`
+	CSRFToken        string `json:"csrfToken"`
+	ControllerOrigin string `json:"controllerOrigin,omitempty"`
 }
 
 // Options configures a Client. A nil HTTPClient gets a safe default timeout.
@@ -35,6 +37,7 @@ type Options struct {
 // Client is safe for concurrent read requests. Concurrent mutations of the same Session should be serialized.
 type Client struct {
 	endpoint   *url.URL
+	origin     string
 	httpClient *http.Client
 }
 
@@ -61,6 +64,7 @@ func New(options Options) (*Client, error) {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("invalid controller endpoint: %q", options.Endpoint)
 	}
+	u.Scheme = strings.ToLower(u.Scheme)
 	u.Path = strings.TrimRight(u.Path, "/")
 	c := options.HTTPClient
 	if c == nil {
@@ -70,7 +74,19 @@ func New(options Options) (*Client, error) {
 		}
 		c = &http.Client{Timeout: timeout}
 	}
-	return &Client{endpoint: u, httpClient: c}, nil
+	return &Client{endpoint: u, origin: canonicalControllerOrigin(u), httpClient: c}, nil
+}
+
+func canonicalControllerOrigin(u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+	port := u.Port()
+	if port != "" && !((u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443")) {
+		host = net.JoinHostPort(host, port)
+	}
+	return strings.ToLower(u.Scheme) + "://" + host
 }
 
 func (c *Client) BootstrapStatus(ctx context.Context) (apicontract.BootstrapStatus, error) {
@@ -106,6 +122,7 @@ func (c *Client) login(ctx context.Context, operation string, payload any) (apic
 	if session.SessionToken == "" || session.CSRFToken == "" {
 		return response, session, errors.New("hostd login response omitted session credentials")
 	}
+	session.ControllerOrigin = c.origin
 	return response, session, nil
 }
 func (c *Client) Logout(ctx context.Context, session *Session) error {
@@ -217,6 +234,13 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, op string, s *Session, i
 	return decodeJSON(response.Body, out)
 }
 func (c *Client) request(ctx context.Context, op string, s *Session, in any, mutation bool, idempotency string, q url.Values, args ...string) (*http.Response, error) {
+	return c.requestWithClient(ctx, c.httpClient, op, s, in, mutation, idempotency, q, args...)
+}
+
+func (c *Client) requestWithClient(ctx context.Context, httpClient *http.Client, op string, s *Session, in any, mutation bool, idempotency string, q url.Values, args ...string) (*http.Response, error) {
+	if s != nil && s.ControllerOrigin != "" && s.ControllerOrigin != c.origin {
+		return nil, errors.New("controller session belongs to a different endpoint")
+	}
 	operation, ok := apicontract.Operations[op]
 	if !ok {
 		return nil, fmt.Errorf("unknown controller operation %q", op)
@@ -273,7 +297,7 @@ func (c *Client) request(ctx context.Context, op string, s *Session, in any, mut
 	if mutation && s != nil && s.CSRFToken != "" {
 		req.Header.Set("X-CSRF-Token", s.CSRFToken)
 	}
-	response, err := c.httpClient.Do(req)
+	response, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("hostd request failed: %w", err)
 	}

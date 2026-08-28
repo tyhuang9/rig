@@ -17,9 +17,12 @@ import (
 
 const maxSSEEventBytes = 64 << 10
 const maxSSEEventsPerConnection = 1000
+const minSSEReconnectBackoff = 250 * time.Millisecond
+const maxSSEReconnectBackoff = 5 * time.Second
 
 // JobEventStream replays events after After and reconnects until its context is cancelled.
-// Errors is closed after Events. A nil error is never sent.
+// Errors reports terminal response, decode, and limit failures. It closes when
+// Events closes; a nil error is never sent.
 type JobEventStream struct {
 	Events <-chan apicontract.JobEvent
 	Errors <-chan error
@@ -33,52 +36,77 @@ func (c *Client) StreamJobEvents(ctx context.Context, session Session, jobID str
 	go func() {
 		defer close(events)
 		defer close(failures)
-		last := after
+		last, attempts := after, 0
 		for {
 			if ctx.Err() != nil {
 				return
 			}
-			next, err := c.streamConnection(ctx, session, jobID, last, events)
+			next, terminal, err := c.streamConnection(ctx, session, jobID, last, events)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
 				}
-				select {
-				case failures <- err:
-				case <-ctx.Done():
+				if terminal {
+					select {
+					case failures <- err:
+					case <-ctx.Done():
+					}
+					return
 				}
-				return
 			}
-			if next > last {
+			progressed := next > last
+			if progressed {
 				last = next
+				attempts = 0
 			}
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(sseReconnectBackoff(attempts)):
+			}
+			if !progressed {
+				attempts++
 			}
 		}
 	}()
 	return &JobEventStream{Events: events, Errors: failures}
 }
 
-func (c *Client) streamConnection(ctx context.Context, session Session, jobID string, after int64, output chan<- apicontract.JobEvent) (int64, error) {
+func sseReconnectBackoff(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	delay := minSSEReconnectBackoff
+	for attempt > 0 && delay < maxSSEReconnectBackoff {
+		delay *= 2
+		attempt--
+	}
+	if delay > maxSSEReconnectBackoff {
+		return maxSSEReconnectBackoff
+	}
+	return delay
+}
+
+func (c *Client) streamConnection(ctx context.Context, session Session, jobID string, after int64, output chan<- apicontract.JobEvent) (int64, bool, error) {
 	q := url.Values{"after": []string{strconv.FormatInt(after, 10)}}
-	response, err := c.request(ctx, "streamJobEvents", &session, nil, false, "", q, jobID)
+	streamClient := *c.httpClient
+	streamClient.Timeout = 0 // An SSE body is intentionally long-lived.
+	response, err := c.requestWithClient(ctx, &streamClient, "streamJobEvents", &session, nil, false, "", q, jobID)
 	if err != nil {
-		return after, err
+		return after, false, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return after, decodeProblem(response)
+		return after, response.StatusCode >= 400 && response.StatusCode < 500, decodeProblem(response)
 	}
 	if !strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
-		return after, errors.New("hostd job event stream has invalid content type")
+		return after, true, errors.New("hostd job event stream has invalid content type")
 	}
-	scanner := bufio.NewScanner(io.LimitReader(response.Body, int64(maxSSEEventBytes*maxSSEEventsPerConnection)+1))
+	limited := &io.LimitedReader{R: response.Body, N: int64(maxSSEEventBytes*maxSSEEventsPerConnection) + 1}
+	scanner := bufio.NewScanner(limited)
 	scanner.Buffer(make([]byte, 4096), maxSSEEventBytes)
 	var data strings.Builder
-	var id int64 = after
+	lastDelivered := after
 	count := 0
 	emit := func() error {
 		if data.Len() == 0 {
@@ -94,14 +122,17 @@ func (c *Client) streamConnection(ctx context.Context, session Session, jobID st
 		if err := json.Unmarshal([]byte(data.String()), &event); err != nil {
 			return fmt.Errorf("decode hostd job event: %w", err)
 		}
-		if event.ID > id {
-			id = event.ID
+		if event.ID <= lastDelivered {
+			data.Reset()
+			count++
+			return nil
 		}
 		select {
 		case output <- event:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+		lastDelivered = event.ID
 		data.Reset()
 		count++
 		return nil
@@ -110,14 +141,11 @@ func (c *Client) streamConnection(ctx context.Context, session Session, jobID st
 		line := scanner.Text()
 		if line == "" {
 			if err := emit(); err != nil {
-				return id, err
+				return lastDelivered, true, err
 			}
 			continue
 		}
 		if strings.HasPrefix(line, "id:") {
-			if parsed, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(line, "id:")), 10, 64); err == nil && parsed > id {
-				id = parsed
-			}
 			continue
 		}
 		if strings.HasPrefix(line, "data:") {
@@ -130,15 +158,21 @@ func (c *Client) streamConnection(ctx context.Context, session Session, jobID st
 			}
 			data.WriteString(part)
 			if data.Len() > maxSSEEventBytes {
-				return id, errors.New("hostd job event stream exceeded event size limit")
+				return lastDelivered, true, errors.New("hostd job event stream exceeded event size limit")
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return id, fmt.Errorf("read hostd job event stream: %w", err)
+		if strings.Contains(err.Error(), "token too long") {
+			return lastDelivered, true, errors.New("hostd job event stream exceeded event size limit")
+		}
+		return lastDelivered, false, fmt.Errorf("read hostd job event stream: %w", err)
+	}
+	if limited.N == 0 {
+		return lastDelivered, true, errors.New("hostd job event stream exceeded connection limit")
 	}
 	if err := emit(); err != nil {
-		return id, err
+		return lastDelivered, true, err
 	}
-	return id, nil
+	return lastDelivered, false, nil
 }

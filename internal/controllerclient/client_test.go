@@ -74,3 +74,36 @@ func TestProblemResponseIsBoundedAndTyped(t *testing.T) {
 		t.Fatalf("error=%T %v", err, err)
 	}
 }
+
+func TestSessionOriginBindingPreventsCredentialForwarding(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
+	defer server.Close()
+	client, err := New(Options{Endpoint: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Status(context.Background(), Session{SessionToken: "session", CSRFToken: "csrf", ControllerOrigin: "http://127.0.0.1:7345"})
+	if err == nil || !strings.Contains(err.Error(), "different endpoint") {
+		t.Fatalf("origin mismatch error = %v", err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("origin mismatch made %d request(s)", requests.Load())
+	}
+}
+
+func TestLoginBindsSessionToControllerOrigin(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: auth.SessionCookie, Value: "session"})
+		_, _ = w.Write([]byte(`{"csrfToken":"csrf"}`))
+	}))
+	defer server.Close()
+	client, err := New(Options{Endpoint: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, session, err := client.Login(context.Background(), apicontract.LoginRequest{Username: "u", Passphrase: "p"})
+	if err != nil || session.ControllerOrigin == "" {
+		t.Fatalf("session=%+v err=%v", session, err)
+	}
+}
