@@ -7,33 +7,39 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "71ba4e0cdb23cdfac8c57c539f14d71523e1149a7a024e36e04b68293f4b9ecd"
+const SourceSHA256 = "79b1ca9cc84d92779b8f975409e252ddaa1be68e9e07b456b24fb5db7de1bed7"
 
 var Operations = map[string]Operation{
-	"bootstrap":          {Method: "POST", Path: "/api/v1/auth/bootstrap"},
-	"bootstrapStatus":    {Method: "GET", Path: "/api/v1/auth/bootstrap/status"},
-	"cancelJob":          {Method: "POST", Path: "/api/v1/jobs/{jobId}/cancel"},
-	"createApplication":  {Method: "POST", Path: "/api/v1/apps"},
-	"deployApplication":  {Method: "POST", Path: "/api/v1/apps/{appId}/deployments"},
-	"doctor":             {Method: "GET", Path: "/api/v1/system/doctor"},
-	"getApplication":     {Method: "GET", Path: "/api/v1/apps/{appId}"},
-	"getJob":             {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
-	"inspectImport":      {Method: "POST", Path: "/api/v1/apps/import/inspect"},
-	"listApplications":   {Method: "GET", Path: "/api/v1/apps"},
-	"listJobEvents":      {Method: "GET", Path: "/api/v1/jobs/{jobId}/events"},
-	"listJobs":           {Method: "GET", Path: "/api/v1/jobs"},
-	"listMachines":       {Method: "GET", Path: "/api/v1/machines"},
-	"listServices":       {Method: "GET", Path: "/api/v1/apps/{appId}/services"},
-	"login":              {Method: "POST", Path: "/api/v1/auth/sessions"},
-	"logout":             {Method: "DELETE", Path: "/api/v1/auth/sessions/current"},
-	"me":                 {Method: "GET", Path: "/api/v1/auth/me"},
-	"restartApplication": {Method: "POST", Path: "/api/v1/apps/{appId}/restart"},
-	"rotateCSRF":         {Method: "GET", Path: "/api/v1/auth/csrf"},
-	"startApplication":   {Method: "POST", Path: "/api/v1/apps/{appId}/start"},
-	"stopApplication":    {Method: "POST", Path: "/api/v1/apps/{appId}/stop"},
-	"streamJobEvents":    {Method: "GET", Path: "/api/v1/jobs/{jobId}/events/stream"},
-	"streamLogs":         {Method: "GET", Path: "/api/v1/apps/{appId}/logs/stream"},
-	"systemStatus":       {Method: "GET", Path: "/api/v1/system/status"},
+	"bootstrap":                   {Method: "POST", Path: "/api/v1/auth/bootstrap"},
+	"bootstrapStatus":             {Method: "GET", Path: "/api/v1/auth/bootstrap/status"},
+	"cancelJob":                   {Method: "POST", Path: "/api/v1/jobs/{jobId}/cancel"},
+	"createApplication":           {Method: "POST", Path: "/api/v1/apps"},
+	"deployApplication":           {Method: "POST", Path: "/api/v1/apps/{appId}/deployments"},
+	"disconnectSourceConnection":  {Method: "DELETE", Path: "/api/v1/source-connections/{connectionId}"},
+	"doctor":                      {Method: "GET", Path: "/api/v1/system/doctor"},
+	"getApplication":              {Method: "GET", Path: "/api/v1/apps/{appId}"},
+	"getJob":                      {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
+	"inspectImport":               {Method: "POST", Path: "/api/v1/apps/import/inspect"},
+	"listApplications":            {Method: "GET", Path: "/api/v1/apps"},
+	"listGitHubInstallations":     {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations"},
+	"listJobEvents":               {Method: "GET", Path: "/api/v1/jobs/{jobId}/events"},
+	"listJobs":                    {Method: "GET", Path: "/api/v1/jobs"},
+	"listMachines":                {Method: "GET", Path: "/api/v1/machines"},
+	"listServices":                {Method: "GET", Path: "/api/v1/apps/{appId}/services"},
+	"listSourceConnections":       {Method: "GET", Path: "/api/v1/source-connections"},
+	"login":                       {Method: "POST", Path: "/api/v1/auth/sessions"},
+	"logout":                      {Method: "DELETE", Path: "/api/v1/auth/sessions/current"},
+	"me":                          {Method: "GET", Path: "/api/v1/auth/me"},
+	"pollGitHubDeviceConnection":  {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/poll"},
+	"refreshSourceConnection":     {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/refresh"},
+	"restartApplication":          {Method: "POST", Path: "/api/v1/apps/{appId}/restart"},
+	"rotateCSRF":                  {Method: "GET", Path: "/api/v1/auth/csrf"},
+	"startApplication":            {Method: "POST", Path: "/api/v1/apps/{appId}/start"},
+	"startGitHubDeviceConnection": {Method: "POST", Path: "/api/v1/source-connections/github/device"},
+	"stopApplication":             {Method: "POST", Path: "/api/v1/apps/{appId}/stop"},
+	"streamJobEvents":             {Method: "GET", Path: "/api/v1/jobs/{jobId}/events/stream"},
+	"streamLogs":                  {Method: "GET", Path: "/api/v1/apps/{appId}/logs/stream"},
+	"systemStatus":                {Method: "GET", Path: "/api/v1/system/status"},
 }
 
 type Application struct {
@@ -65,7 +71,8 @@ type CSRFResponse struct {
 }
 
 type Capabilities struct {
-	FakeRuntime bool `json:"fakeRuntime"`
+	FakeRuntime       bool `json:"fakeRuntime"`
+	GithubConnections bool `json:"githubConnections"`
 }
 
 type CreateApplicationRequest struct {
@@ -100,6 +107,32 @@ type DoctorCheck struct {
 type DoctorResponse struct {
 	Checks            []DoctorCheck `json:"checks"`
 	StartupLimitation string        `json:"startupLimitation"`
+}
+
+type GitHubDeviceAuthorization struct {
+	ConnectionID        string `json:"connectionId"`
+	ExpiresAt           string `json:"expiresAt"`
+	InstallUrl          string `json:"installUrl"`
+	PollIntervalSeconds int    `json:"pollIntervalSeconds"`
+	UserCode            string `json:"userCode"`
+	VerificationUri     string `json:"verificationUri"`
+}
+
+type GitHubInstallation struct {
+	AccountLogin        string `json:"accountLogin"`
+	AccountType         string `json:"accountType"`
+	CachedAt            string `json:"cachedAt"`
+	ID                  int64  `json:"id"`
+	RepositorySelection string `json:"repositorySelection"`
+	SuspendedAt         string `json:"suspendedAt,omitempty"`
+	TargetType          string `json:"targetType"`
+}
+
+type GitHubInstallationPage struct {
+	Items      []GitHubInstallation `json:"items"`
+	Page       int                  `json:"page"`
+	PerPage    int                  `json:"perPage"`
+	TotalCount int                  `json:"totalCount"`
 }
 
 type HostResources struct {
@@ -212,6 +245,28 @@ type ServiceList struct {
 type SessionResponse struct {
 	CSRFToken string `json:"csrfToken"`
 	User      User   `json:"user"`
+}
+
+type SourceConnection struct {
+	AccessExpiresAt      string `json:"accessExpiresAt,omitempty"`
+	ConnectedAt          string `json:"connectedAt,omitempty"`
+	CreatedAt            string `json:"createdAt"`
+	CredentialGeneration int64  `json:"credentialGeneration"`
+	DisconnectedAt       string `json:"disconnectedAt,omitempty"`
+	ID                   string `json:"id"`
+	LastErrorCode        string `json:"lastErrorCode,omitempty"`
+	NextPollAt           string `json:"nextPollAt,omitempty"`
+	PendingExpiresAt     string `json:"pendingExpiresAt,omitempty"`
+	Provider             string `json:"provider"`
+	ProviderLogin        string `json:"providerLogin,omitempty"`
+	ProviderUserID       string `json:"providerUserId,omitempty"`
+	RefreshExpiresAt     string `json:"refreshExpiresAt,omitempty"`
+	Status               string `json:"status"`
+	UpdatedAt            string `json:"updatedAt"`
+}
+
+type SourceConnectionList struct {
+	Items []SourceConnection `json:"items"`
 }
 
 type SystemStatus struct {

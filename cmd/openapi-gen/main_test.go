@@ -1,11 +1,36 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 )
+
+func TestNormalizeLineEndingsMakesParsingAndDigestPlatformIndependent(t *testing.T) {
+	lf := []byte("openapi: 3.1.0\npaths: {}\n")
+	crlf := bytes.ReplaceAll(lf, []byte("\n"), []byte("\r\n"))
+	cr := bytes.ReplaceAll(lf, []byte("\n"), []byte("\r"))
+
+	want := sha256.Sum256(lf)
+	for name, source := range map[string][]byte{"lf": lf, "crlf": crlf, "cr": cr} {
+		t.Run(name, func(t *testing.T) {
+			normalized := normalizeLineEndings(source)
+			if !bytes.Equal(normalized, lf) {
+				t.Fatalf("normalized source = %q, want %q", normalized, lf)
+			}
+			if got := sha256.Sum256(normalized); got != want {
+				t.Fatalf("digest = %x, want %x", got, want)
+			}
+			var spec document
+			if err := yaml.Unmarshal(normalized, &spec); err != nil {
+				t.Fatalf("parse normalized source: %v", err)
+			}
+		})
+	}
+}
 
 func TestConcreteModelsPreserveFieldsTypesReferencesAndRequiredness(t *testing.T) {
 	var spec document

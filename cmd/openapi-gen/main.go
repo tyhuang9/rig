@@ -50,6 +50,7 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	source = normalizeLineEndings(source)
 	var spec document
 	if err := yaml.Unmarshal(source, &spec); err != nil {
 		fatal(fmt.Errorf("parse OpenAPI: %w", err))
@@ -82,6 +83,14 @@ func main() {
 			fatal(err)
 		}
 	}
+}
+
+func normalizeLineEndings(source []byte) []byte {
+	if !bytes.Contains(source, []byte{'\r'}) {
+		return source
+	}
+	source = bytes.ReplaceAll(source, []byte("\r\n"), []byte("\n"))
+	return bytes.ReplaceAll(source, []byte("\r"), []byte("\n"))
 }
 
 func collectOperations(paths map[string]map[string]yaml.Node) ([]operation, error) {

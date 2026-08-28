@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -59,6 +60,35 @@ func TestListenAddressMustBeExplicitLoopback(t *testing.T) {
 			_, err := FromFlags([]string{"--listen", test.address})
 			if (err == nil) != test.ok {
 				t.Fatalf("FromFlags(--listen %q) error = %v, want success %v", test.address, err, test.ok)
+			}
+		})
+	}
+}
+
+func TestGitHubAppPublicConfigurationIsPairwiseAndBounded(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		ok   bool
+	}{
+		{name: "disabled", ok: true},
+		{name: "enabled", args: []string{"--github-client-id", "Iv1.abc_123", "--github-app-slug", "hostd-app"}, ok: true},
+		{name: "client only", args: []string{"--github-client-id", "Iv1_abc"}},
+		{name: "slug only", args: []string{"--github-app-slug", "hostd-app"}},
+		{name: "client whitespace", args: []string{"--github-client-id", "client id", "--github-app-slug", "hostd-app"}},
+		{name: "slug URL", args: []string{"--github-client-id", "client", "--github-app-slug", "https://evil.example/app"}},
+		{name: "slug traversal", args: []string{"--github-client-id", "client", "--github-app-slug", "../app"}},
+		{name: "slug uppercase", args: []string{"--github-client-id", "client", "--github-app-slug", "Hostd-App"}},
+		{name: "oversized client", args: []string{"--github-client-id", strings.Repeat("a", 256), "--github-app-slug", "hostd-app"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configuration, err := FromFlags(test.args)
+			if (err == nil) != test.ok {
+				t.Fatalf("FromFlags() error = %v, want success %v", err, test.ok)
+			}
+			if err == nil && configuration.GitHubConnectionsEnabled() != (test.name == "enabled") {
+				t.Fatalf("GitHubConnectionsEnabled = %v", configuration.GitHubConnectionsEnabled())
 			}
 		})
 	}

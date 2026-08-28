@@ -18,10 +18,12 @@ import (
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/runtime/docker"
 	"github.com/hostd/hostd/internal/secretfile"
+	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
 const bootstrapSecretFilename = "bootstrap-token.secret"
@@ -72,6 +74,15 @@ func main() {
 		logger.Error("job recovery failed", "error", err)
 		os.Exit(1)
 	}
+	var githubProvider sourceconnections.Provider
+	if cfg.GitHubConnectionsEnabled() {
+		githubProvider, err = githubapp.New(cfg.GitHubClientID)
+		if err != nil {
+			logger.Error("GitHub App configuration failed", "error", err)
+			os.Exit(1)
+		}
+	}
+	sources := sourceconnections.NewService(sourceconnections.NewRepository(db), githubProvider, sourceconnections.NewFileCredentialStore(cfg.DataRoot), cfg.GitHubAppSlug, time.Now)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	workerDone := make(chan struct{})
@@ -86,7 +97,7 @@ func main() {
 	} else {
 		close(workerDone)
 	}
-	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: j, Machines: m, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: j, Machines: m, Sources: sources, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)

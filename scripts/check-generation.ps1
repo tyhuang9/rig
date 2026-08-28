@@ -1,8 +1,15 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$canonical = Join-Path $root 'internal/database/migrations/001_foundation.sql'
-$mirror = Join-Path $root 'db/migrations/001_foundation.sql'
-if ((Get-FileHash $canonical).Hash -ne (Get-FileHash $mirror).Hash) { throw 'Migration mirror drift: copy internal/database/migrations/001_foundation.sql to db/migrations/001_foundation.sql.' }
+$canonicalDirectory = Join-Path $root 'internal/database/migrations'
+$mirrorDirectory = Join-Path $root 'db/migrations'
+$canonicalNames = @(Get-ChildItem $canonicalDirectory -Filter '*.sql' -File | Sort-Object Name | ForEach-Object Name)
+$mirrorNames = @(Get-ChildItem $mirrorDirectory -Filter '*.sql' -File | Sort-Object Name | ForEach-Object Name)
+if (($canonicalNames -join "`n") -ne ($mirrorNames -join "`n")) { throw 'Migration mirror drift: embedded and public migration file lists differ.' }
+foreach ($name in $canonicalNames) {
+  $canonical = Join-Path $canonicalDirectory $name
+  $mirror = Join-Path $mirrorDirectory $name
+  if ((Get-FileHash $canonical).Hash -ne (Get-FileHash $mirror).Hash) { throw "Migration mirror drift: $name differs." }
+}
 Push-Location $root
 try {
   & go run ./cmd/openapi-gen -check

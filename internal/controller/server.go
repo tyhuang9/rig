@@ -25,6 +25,7 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/runtime/docker"
+	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
 //go:embed all:ui
@@ -41,6 +42,7 @@ type Server struct {
 	DataRoot           string
 	Logger             *slog.Logger
 	BootstrapCompleted func()
+	Sources            *sourceconnections.Service
 	authenticationWork *authenticationWorkGate
 }
 
@@ -94,6 +96,12 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("listJobEvents", s.require(s.events)),
 		contractRoute("streamJobEvents", s.require(s.eventsStream)),
 		contractRoute("listMachines", s.require(s.listMachines)),
+		contractRoute("listSourceConnections", s.require(s.listSourceConnections)),
+		contractRoute("startGitHubDeviceConnection", s.require(s.startGitHubDeviceConnection)),
+		contractRoute("pollGitHubDeviceConnection", s.require(s.pollGitHubDeviceConnection)),
+		contractRoute("refreshSourceConnection", s.require(s.refreshSourceConnection)),
+		contractRoute("disconnectSourceConnection", s.require(s.disconnectSourceConnection)),
+		contractRoute("listGitHubInstallations", s.require(s.listGitHubInstallations)),
 	}
 }
 
@@ -530,7 +538,7 @@ func (s *Server) rotateCSRF(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	d := s.runDiagnostics(r.Context())
-	writeJSON(w, 200, apicontract.SystemStatus{Daemon: "running", Diagnostics: contractDiagnostics(d), Capabilities: apicontract.Capabilities{FakeRuntime: s.FakeRuntime}})
+	writeJSON(w, 200, apicontract.SystemStatus{Daemon: "running", Diagnostics: contractDiagnostics(d), Capabilities: apicontract.Capabilities{FakeRuntime: s.FakeRuntime, GithubConnections: s.Sources != nil && s.Sources.ProviderEnabled()}})
 }
 func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
 	d := s.runDiagnostics(r.Context())
