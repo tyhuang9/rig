@@ -644,6 +644,9 @@ run_lifecycle() {
   local system_after
   local sanitized_error
   local network_summary
+  local service_summary
+  local compose_version
+  local diagnostic_line
 
   [[ "$(uname -s)" == "Linux" ]] || fail "hosted Linux is required"
   [[ "${CI:-}" == "true" && "${GITHUB_ACTIONS:-}" == "true" ]] || fail "hosted CI guard unavailable"
@@ -682,13 +685,33 @@ run_lifecycle() {
       printf '%s\n' "${sanitized_error}" >&2
     fi
     if [[ "${sanitized_error}" == *"compose_effective_networks"* ]]; then
-      network_summary="$(docker compose --env-file "${ENVIRONMENT_FILE}" --file "${COMPOSE_FILE}" \
+      if network_summary="$(docker compose --env-file "${ENVIRONMENT_FILE}" --file "${COMPOSE_FILE}" \
         config --format json 2>/dev/null | jq --compact-output \
-        '.networks | to_entries | map({key: .key, fields: (.value | keys | sort), internal: (.value.internal // false), external: (.value.external // false), name: .value.name})')"
-      if [[ -n "${network_summary}" && "${network_summary}" != *$'\n'* ]] &&
-         (( ${#network_summary} <= 2048 )); then
-        printf 'relay Compose lifecycle network summary: compose=%s model=%s\n' \
-          "$(docker compose version --short)" "${network_summary}" >&2
+        '.networks | to_entries | map({key: .key, fields: (.value | keys | sort), internal: (.value.internal // false), external: (.value.external // false), name: .value.name})')"; then
+        if [[ -n "${network_summary}" && "${network_summary}" != *$'\n'* ]] &&
+           (( ${#network_summary} <= 2048 )) &&
+           compose_version="$(docker compose version --short 2>/dev/null)" &&
+           [[ -n "${compose_version}" && "${compose_version}" != *$'\n'* ]]; then
+          diagnostic_line="relay Compose lifecycle network summary: compose=${compose_version} model=${network_summary}"
+          if [[ "${diagnostic_line}" != *$'\n'* ]] && (( ${#diagnostic_line} <= 2048 )); then
+            printf '%s\n' "${diagnostic_line}" >&2
+          fi
+        fi
+      fi
+    fi
+    if [[ "${sanitized_error}" == *"compose_effective_service_keys"* ]]; then
+      if service_summary="$(docker compose --env-file "${ENVIRONMENT_FILE}" --file "${COMPOSE_FILE}" \
+        config --format json 2>/dev/null | jq --compact-output \
+        '{postgres: (.services.postgres | keys | sort), relay: (.services.relay | keys | sort)}')"; then
+        if [[ -n "${service_summary}" && "${service_summary}" != *$'\n'* ]] &&
+           (( ${#service_summary} <= 2048 )) &&
+           compose_version="$(docker compose version --short 2>/dev/null)" &&
+           [[ -n "${compose_version}" && "${compose_version}" != *$'\n'* ]]; then
+          diagnostic_line="relay Compose lifecycle service-key summary: compose=${compose_version} model=${service_summary}"
+          if [[ "${diagnostic_line}" != *$'\n'* ]] && (( ${#diagnostic_line} <= 2048 )); then
+            printf '%s\n' "${diagnostic_line}" >&2
+          fi
+        fi
       fi
     fi
     fail "packaging preflight rejected the isolated fixture"
