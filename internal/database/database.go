@@ -39,10 +39,14 @@ func Open(dataRoot string) (*sql.DB, error) {
 }
 
 func Migrate(db *sql.DB) error {
+	return migrateFS(db, migrations)
+}
+
+func migrateFS(db *sql.DB, migrationFS fs.FS) error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
 		return err
 	}
-	entries, err := fs.ReadDir(migrations, "migrations")
+	entries, err := fs.ReadDir(migrationFS, "migrations")
 	if err != nil {
 		return err
 	}
@@ -58,7 +62,7 @@ func Migrate(db *sql.DB) error {
 		if exists > 0 {
 			continue
 		}
-		body, err := migrations.ReadFile("migrations/" + entry.Name())
+		body, err := fs.ReadFile(migrationFS, "migrations/"+entry.Name())
 		if err != nil {
 			return err
 		}
