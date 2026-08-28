@@ -135,6 +135,57 @@ func TestReadyLocalReleaseRejectsRetainedWorkspaceTamper(t *testing.T) {
 	}
 }
 
+func TestReadyLocalReleaseCancellationPreservesWorkspace(t *testing.T) {
+	materializer, db, _, appID, _, source := localMaterializerFixture(t, false)
+	release, err := materializer.MaterializeLocal(context.Background(), appID, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnchanged := func(phase string) {
+		t.Helper()
+		var state string
+		if err := db.QueryRow(`SELECT workspace_state FROM releases WHERE id=?`, release.ID).Scan(&state); err != nil || state != WorkspaceStateReady {
+			t.Fatalf("%s state=%q err=%v", phase, state, err)
+		}
+		if _, err := os.Stat(release.WorkspacePath); err != nil {
+			t.Fatalf("%s removed workspace: %v", phase, err)
+		}
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := materializer.ReadyRelease(canceled, appID, release.ID); !IsCode(err, "canceled") {
+		t.Fatalf("pre-canceled ready lookup error=%v", err)
+	}
+	assertUnchanged("pre-canceled lookup")
+
+	canonicalHash := materializer.hashTree
+	hashCalls := 0
+	materializer.hashTree = func(context.Context, string) (string, error) {
+		hashCalls++
+		return "", context.Canceled
+	}
+	if _, err := materializer.ReadyRelease(context.Background(), appID, release.ID); !IsCode(err, "canceled") || hashCalls != 1 {
+		t.Fatalf("hash-canceled ready lookup error=%v calls=%d", err, hashCalls)
+	}
+	assertUnchanged("hash-canceled lookup")
+
+	boundary, cancelBoundary := context.WithCancel(context.Background())
+	materializer.hashTree = func(ctx context.Context, root string) (string, error) {
+		digest, err := canonicalHash(ctx, root)
+		cancelBoundary()
+		return digest, err
+	}
+	if _, err := materializer.ReadyRelease(boundary, appID, release.ID); !IsCode(err, "canceled") {
+		t.Fatalf("post-hash canceled ready lookup error=%v", err)
+	}
+	assertUnchanged("post-hash canceled lookup")
+	materializer.hashTree = canonicalHash
+
+	if ready, err := materializer.ReadyRelease(context.Background(), appID, release.ID); err != nil || ready.ID != release.ID {
+		t.Fatalf("uncanceled ready lookup=%+v err=%v", ready, err)
+	}
+}
+
 func localMaterializerFixture(t *testing.T, direct bool) (*Materializer, *sql.DB, string, string, string, string) {
 	t.Helper()
 	dataRoot := t.TempDir()
@@ -196,14 +247,14 @@ func localMaterializerFixture(t *testing.T, direct bool) (*Materializer, *sql.DB
 
 func assertReadyLocalRelease(t *testing.T, db *sql.DB, dataRoot, source string, release Release) {
 	t.Helper()
-	if release.ID == "" || release.SourceProvider != "local" || release.RepositoryID != 0 || len(release.ResolvedSHA) != 64 || release.ResolvedSHA != release.ArchiveSHA256 || release.WorkspaceState != WorkspaceStateReady || !strings.HasPrefix(release.WorkspacePath, dataRoot) || strings.HasPrefix(release.WorkspacePath, source) {
+	if release.ID == "" || release.SourceProvider != "local" || release.RepositoryID != 0 || len(release.ResolvedSHA) != 64 || release.ResolvedSHA != release.ArchiveSHA256 || release.ResolvedSHA != release.WorkspaceTreeSHA256 || release.WorkspaceState != WorkspaceStateReady || !strings.HasPrefix(release.WorkspacePath, dataRoot) || strings.HasPrefix(release.WorkspacePath, source) {
 		t.Fatalf("release=%#v", release)
 	}
-	var provider, resolved, archive, workspace string
-	if err := db.QueryRow(`SELECT source_provider,resolved_sha,archive_sha256,workspace_path FROM releases WHERE id=?`, release.ID).Scan(&provider, &resolved, &archive, &workspace); err != nil {
+	var provider, resolved, archive, tree, workspace string
+	if err := db.QueryRow(`SELECT source_provider,resolved_sha,archive_sha256,workspace_tree_sha256,workspace_path FROM releases WHERE id=?`, release.ID).Scan(&provider, &resolved, &archive, &tree, &workspace); err != nil {
 		t.Fatal(err)
 	}
-	if provider != "local" || resolved != release.ResolvedSHA || archive != release.ArchiveSHA256 || filepath.IsAbs(workspace) || strings.Contains(provider+resolved+archive+workspace, source) {
-		t.Fatalf("stored provider=%q resolved=%q archive=%q workspace=%q", provider, resolved, archive, workspace)
+	if provider != "local" || resolved != release.ResolvedSHA || archive != release.ArchiveSHA256 || tree != release.WorkspaceTreeSHA256 || filepath.IsAbs(workspace) || strings.Contains(provider+resolved+archive+tree+workspace, source) {
+		t.Fatalf("stored provider=%q resolved=%q archive=%q tree=%q workspace=%q", provider, resolved, archive, tree, workspace)
 	}
 }

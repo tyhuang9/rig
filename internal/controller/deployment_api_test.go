@@ -472,7 +472,7 @@ func TestLocalReleaseHistoryNeverExposesAbsoluteSourceOrWorkspacePath(t *testing
 	f := newDeploymentAPIFixture(t, true, false)
 	releaseID := uuid.NewString()
 	absSource := `C:\users\operator\private-source`
-	_, err := f.db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,source_commit_sha,source_branch,compose_path,archive_sha256,workspace_path,workspace_state,configuration_revision_number) VALUES(?,?, 'ready','{}',?,'local',0,?,?, '', 'compose.yaml',?,?, 'ready',0)`, releaseID, f.app.ID, time.Now().UTC().Format(time.RFC3339Nano), strings.Repeat("a", 64), strings.Repeat("a", 64), strings.Repeat("a", 64), absSource)
+	_, err := f.db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,source_commit_sha,source_branch,compose_path,archive_sha256,workspace_tree_sha256,workspace_path,workspace_state,configuration_revision_number) VALUES(?,?, 'ready','{}',?,'local',0,?,?, '', 'compose.yaml',?,?,?, 'ready',0)`, releaseID, f.app.ID, time.Now().UTC().Format(time.RFC3339Nano), strings.Repeat("a", 64), strings.Repeat("a", 64), strings.Repeat("a", 64), strings.Repeat("a", 64), absSource)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -783,7 +783,7 @@ func policyFindingFingerprint(version, capability, scope string) string {
 func (f deploymentAPIFixture) insertRelease(t *testing.T, appID, state string) string {
 	t.Helper()
 	id := uuid.NewString()
-	_, err := f.db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,source_commit_sha,source_branch,compose_path,archive_sha256,workspace_state,configuration_revision_number) VALUES(?,?,?,'{}',?,'github',17,'owner','repository','refs/heads/main','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','main','compose.yaml','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',?,0)`, id, appID, state, time.Now().UTC().Format(time.RFC3339Nano), state)
+	_, err := f.db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,source_commit_sha,source_branch,compose_path,archive_sha256,workspace_tree_sha256,workspace_state,configuration_revision_number) VALUES(?,?,?,'{}',?,'github',17,'owner','repository','refs/heads/main','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','main','compose.yaml','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',?,0)`, id, appID, state, time.Now().UTC().Format(time.RFC3339Nano), state)
 	if err != nil {
 		t.Fatal(err)
 	}

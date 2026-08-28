@@ -25,6 +25,8 @@ type retentionFixture struct {
 	material *Materializer
 }
 
+const retentionWorkspaceTreeSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 func newRetentionFixture(t *testing.T, perApp, global int64) retentionFixture {
 	t.Helper()
 	root := t.TempDir()
@@ -71,7 +73,7 @@ func (f retentionFixture) addWorkspace(t *testing.T, appID, state string, size i
 	if state == WorkspaceStateFailed {
 		status = "failed"
 	}
-	if _, err := f.db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,workspace_path,workspace_state,workspace_size_bytes) VALUES(?,?,?,?,?,'local',?,?,?)`, id, appID, status, `{"retained":"yes"}`, created.UTC().Format(time.RFC3339Nano), stored, state, size); err != nil {
+	if _, err := f.db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,workspace_path,workspace_state,workspace_size_bytes,workspace_tree_sha256) VALUES(?,?,?,?,?,'local',?,?,?,?)`, id, appID, status, `{"retained":"yes"}`, created.UTC().Format(time.RFC3339Nano), stored, state, size, retentionWorkspaceTreeSHA256); err != nil {
 		t.Fatal(err)
 	}
 	return retainedWorkspace{id: id, appID: appID, storedPath: stored, state: state, size: int64(size), createdAt: created.UTC().Format(time.RFC3339Nano)}

@@ -181,10 +181,10 @@ func TestReleaseSnapshotMigrationPreservesLegacyReleasesAndPreventsReadyDuplicat
 	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at) VALUES ('legacy','app','ready','{}',datetime('now'))`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,compose_path,workspace_state) VALUES ('ready','app','ready','{}',datetime('now'),'github',7,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','compose.yaml','ready')`); err != nil {
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,compose_path,workspace_state,workspace_tree_sha256) VALUES ('ready','app','ready','{}',datetime('now'),'github',7,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','compose.yaml','ready','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,compose_path,workspace_state) VALUES ('duplicate','app','ready','{}',datetime('now'),'github',7,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','compose.yaml','ready')`); err == nil {
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,compose_path,workspace_state,workspace_tree_sha256) VALUES ('duplicate','app','ready','{}',datetime('now'),'github',7,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','compose.yaml','ready','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')`); err == nil {
 		t.Fatal("duplicate ready snapshot was accepted")
 	}
 	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,compose_path,workspace_state) VALUES ('failed','app','failed','{}',datetime('now'),'github',7,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','compose.yaml','failed')`); err != nil {

@@ -30,7 +30,7 @@ func insertReadyReleaseFixture(t *testing.T, service *Service, appID, releaseID 
 	if _, err := service.db.Exec(`INSERT INTO applications(id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?)`, appID, "fixture-"+appID, "Fixture", now, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.db.Exec(`INSERT INTO releases(id,app_id,created_at,workspace_state) VALUES(?,?,?, 'ready')`, releaseID, appID, now); err != nil {
+	if _, err := service.db.Exec(`INSERT INTO releases(id,app_id,created_at,workspace_state,workspace_tree_sha256) VALUES(?,?,?, 'ready','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')`, releaseID, appID, now); err != nil {
 		t.Fatal(err)
 	}
 }

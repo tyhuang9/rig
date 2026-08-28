@@ -293,7 +293,7 @@ func TestReleaseHistoryPreservesCredentialFreeProvenanceAndLegacyDeployments(t *
 	ctx := context.Background()
 	releaseID := strings.Repeat("a", 32)
 	created := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := fixture.repository.db.Exec(`INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,compose_path,archive_sha256,workspace_state) VALUES(?,?,?,?, 'ready','{}',?,'github',?,?,?,?,?,?,?,'ready')`, releaseID, fixture.appA, strings.Repeat("b", 40), "main", created, 42, "owner", "repository", "refs/heads/main", strings.Repeat("b", 40), "compose.yaml", strings.Repeat("c", 64)); err != nil {
+	if _, err := fixture.repository.db.Exec(`INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,compose_path,archive_sha256,workspace_tree_sha256,workspace_state) VALUES(?,?,?,?, 'ready','{}',?,'github',?,?,?,?,?,?,?,?,'ready')`, releaseID, fixture.appA, strings.Repeat("b", 40), "main", created, 42, "owner", "repository", "refs/heads/main", strings.Repeat("b", 40), "compose.yaml", strings.Repeat("c", 64), strings.Repeat("c", 64)); err != nil {
 		t.Fatal(err)
 	}
 	release, err := fixture.repository.Release(ctx, fixture.appA, releaseID)
