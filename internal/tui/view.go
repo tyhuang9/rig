@@ -14,19 +14,19 @@ import (
 )
 
 var (
-	colorAccent = lipgloss.Color("39")
-	colorMuted  = lipgloss.Color("245")
-	colorGood   = lipgloss.Color("42")
-	colorBad    = lipgloss.Color("196")
+	colorAccent = lipgloss.AdaptiveColor{Light: "#005FAF", Dark: "#7DD3FC"}
+	colorMuted  = lipgloss.AdaptiveColor{Light: "#52606D", Dark: "#A0AEC0"}
+	colorBad    = lipgloss.AdaptiveColor{Light: "#B42318", Dark: "#FDA4AF"}
+	colorPanel  = lipgloss.AdaptiveColor{Light: "#94A3B8", Dark: "#475569"}
+	colorSelect = lipgloss.AdaptiveColor{Light: "#DCEEFF", Dark: "#163A5F"}
 
 	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
 	mutedStyle    = lipgloss.NewStyle().Foreground(colorMuted)
-	goodStyle     = lipgloss.NewStyle().Foreground(colorGood)
-	errorStyle    = lipgloss.NewStyle().Foreground(colorBad)
-	panelStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("238")).Padding(0, 1)
-	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("24"))
-	buttonStyle   = lipgloss.NewStyle().Bold(true).Padding(0, 1).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("24"))
-	cancelStyle   = lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("252")).Background(lipgloss.Color("238"))
+	errorStyle    = lipgloss.NewStyle().Bold(true).Foreground(colorBad)
+	panelStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorPanel).Padding(0, 1)
+	selectedStyle = lipgloss.NewStyle().Bold(true).Background(colorSelect)
+	buttonStyle   = lipgloss.NewStyle().Bold(true).Underline(true).Padding(0, 1)
+	cancelStyle   = lipgloss.NewStyle().Underline(true).Padding(0, 1)
 )
 
 func (m *Model) View() string {
@@ -64,6 +64,10 @@ func (m *Model) centered(content string) string {
 }
 
 func (m *Model) authView(title, subtitle string) string {
+	m.resizeAuthInputs()
+	if m.compactAuthLayout() {
+		return m.compactAuthView(title)
+	}
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(title))
 	b.WriteString("\n")
@@ -86,7 +90,37 @@ func (m *Model) authView(title, subtitle string) string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panelStyle.Width(boxWidth).Render(b.String()))
 }
 
+// Compact auth keeps every field on screen at supported terminal sizes. It is
+// intentionally linear rather than allowing a centered panel to crop fields
+// below the bottom edge of a small terminal.
+func (m *Model) compactAuthView(title string) string {
+	lines := []string{titleStyle.Render(title)}
+	for i := range m.authInputs {
+		line := authFieldLabel(m.screen, i) + ": " + m.authInputs[i].View()
+		lines = append(lines, cropWidth(line, m.width))
+	}
+	if m.err != "" {
+		lines = append(lines, cropWidth(errorStyle.Render(sanitizeAPIText(m.err)), m.width))
+	}
+	if m.busy {
+		lines = append(lines, "Authenticating…")
+	}
+	lines = append(lines, mutedStyle.Render("Tab fields · Enter continues · Ctrl+C quits"))
+	return cropHeight(strings.Join(lines, "\n"), m.height)
+}
+
 func (m *Model) bootstrapConfirmationView() string {
+	if m.compactAuthLayout() {
+		lines := []string{
+			titleStyle.Render("Confirm administrator creation"),
+			cropWidth("Create administrator "+sanitizeAPIText(m.bootstrapUsername)+"?", m.width),
+			buttonStyle.Render("Confirm [Enter]") + " " + cancelStyle.Render("Cancel [Esc]"),
+			mutedStyle.Render("Enter confirms · Escape cancels"),
+		}
+		m.bootstrapConfirmRect = rect{0, 2, max(1, m.width/2), 1}
+		m.bootstrapCancelRect = rect{max(1, m.width/2), 2, max(1, m.width-m.width/2), 1}
+		return cropHeight(strings.Join(lines, "\n"), m.height)
+	}
 	content := strings.Join([]string{
 		titleStyle.Render("Confirm administrator creation"),
 		"",

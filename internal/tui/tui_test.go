@@ -22,6 +22,7 @@ import (
 type fakeClient struct {
 	bootstrapStatus apicontract.BootstrapStatus
 	bootstrapErr    error
+	loginErr        error
 	me              apicontract.MeResponse
 	meErr           error
 	lifecycleCalls  int
@@ -62,7 +63,7 @@ func (f *fakeClient) Bootstrap(_ context.Context, request apicontract.BootstrapR
 	return apicontract.SessionResponse{User: apicontract.User{Username: request.Username, Role: "admin"}}, nil
 }
 func (f *fakeClient) Login(_ context.Context, request apicontract.LoginRequest) (apicontract.SessionResponse, error) {
-	return apicontract.SessionResponse{User: apicontract.User{Username: request.Username, Role: "admin"}}, nil
+	return apicontract.SessionResponse{User: apicontract.User{Username: request.Username, Role: "admin"}}, f.loginErr
 }
 func (f *fakeClient) Logout(context.Context) error                       { f.logoutCalls++; return nil }
 func (f *fakeClient) Me(context.Context) (apicontract.MeResponse, error) { return f.me, f.meErr }
@@ -415,6 +416,77 @@ func TestAuthInputNeverEntersHistoryAndIsMasked(t *testing.T) {
 	m.Update(msg)
 	if m.screen != screenConsole || len(m.historyValues) != 0 {
 		t.Fatalf("screen/history after auth = %v/%v", m.screen, m.historyValues)
+	}
+}
+
+func TestAuthInputsResizeAndCompactLayoutsKeepAllFieldsVisible(t *testing.T) {
+	types := []struct {
+		name            string
+		setup           func(*Model)
+		labels          []string
+		wideVisibleText string
+	}{
+		{
+			name: "login",
+			setup: func(m *Model) {
+				m.showLogin("")
+				m.authInputs[0].SetValue("operator-name")
+				m.authInputs[1].SetValue("sensitive-passphrase")
+			},
+			labels:          []string{"Username:", "Passphrase:"},
+			wideVisibleText: "operator",
+		},
+		{
+			name: "bootstrap",
+			setup: func(m *Model) {
+				m.showBootstrap()
+				m.authInputs[0].SetValue("bootstrap-token")
+				m.authInputs[1].SetValue("administrator-name")
+				m.authInputs[2].SetValue("sensitive-passphrase")
+			},
+			labels:          []string{"Bootstrap token:", "Administrator username:", "Passphrase:"},
+			wideVisibleText: "administrator",
+		},
+	}
+	for _, auth := range types {
+		for _, size := range [][2]int{{80, 24}, {32, 8}, {40, 10}, {50, 12}} {
+			t.Run(fmt.Sprintf("%s-%dx%d", auth.name, size[0], size[1]), func(t *testing.T) {
+				m := NewModel(context.Background(), &fakeClient{}, &memoryHistoryStore{}, "http://controller")
+				auth.setup(m)
+				m.width, m.height = size[0], size[1]
+				m.resize()
+				view := ansi.Strip(m.View())
+				for _, label := range auth.labels {
+					if !strings.Contains(view, label) {
+						t.Fatalf("auth field %q was cropped from %dx%d:\n%s", label, size[0], size[1], view)
+					}
+				}
+				for i, input := range m.authInputs {
+					if input.Width < 6 || ansi.StringWidth(ansi.Strip(input.View())) < 2 {
+						t.Fatalf("auth input %d has unusable width=%d view=%q", i, input.Width, input.View())
+					}
+				}
+				if size == [2]int{80, 24} && !strings.Contains(view, auth.wideVisibleText) {
+					t.Fatalf("wide auth value was not visibly multi-character:\n%s", view)
+				}
+			})
+		}
+	}
+}
+
+func TestFailedLoginClearsCredentialsAndRefocusesUsername(t *testing.T) {
+	client := &fakeClient{loginErr: errors.New("invalid credentials")}
+	m := NewModel(context.Background(), client, &memoryHistoryStore{}, "http://controller")
+	m.showLogin("")
+	m.authInputs[0].SetValue("operator")
+	m.authInputs[1].SetValue("bad-passphrase")
+	_, cmd := m.submitAuth()
+	if cmd == nil {
+		t.Fatal("login did not start")
+	}
+	m.Update(cmd())
+	if m.authIndex != 0 || !m.authInputs[0].Focused() || m.authInputs[0].Value() != "" || m.authInputs[1].Value() != "" {
+		t.Fatalf("failed login did not clear and refocus username: index=%d username=%q passphrase=%q", m.authIndex, m.authInputs[0].Value(), m.authInputs[1].Value())
 	}
 }
 

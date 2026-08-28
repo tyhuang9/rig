@@ -325,6 +325,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = sanitizeAPIText(msg.err.Error())
 			if m.screen == screenBootstrap && len(m.authInputs) > 0 {
 				m.focusAuth(0)
+			} else if m.screen == screenLogin && len(m.authInputs) > 0 {
+				m.clearAuthValues()
+				m.focusAuth(0)
 			}
 			return m, nil
 		}
@@ -821,6 +824,7 @@ func (m *Model) submitAuth() (tea.Model, tea.Cmd) {
 func (m *Model) showBootstrap() {
 	m.screen, m.busy, m.err, m.bootstrapConfirm, m.bootstrapUsername = screenBootstrap, false, "", false, ""
 	m.authInputs = []textinput.Model{authInput("bootstrap token", true), authInput("admin username", false), authInput("passphrase", true)}
+	m.resizeAuthInputs()
 	m.focusAuth(0)
 }
 
@@ -852,11 +856,13 @@ func (m *Model) showLogin(message string) {
 	m.stopFollowing(false)
 	m.screen, m.busy, m.err = screenLogin, false, sanitizeAPIText(message)
 	m.authInputs = []textinput.Model{authInput("username", false), authInput("passphrase", true)}
+	m.resizeAuthInputs()
 	m.focusAuth(0)
 }
 
 func authInput(placeholder string, secret bool) textinput.Model {
 	input := textinput.New()
+	input.Prompt = ""
 	input.Placeholder = placeholder
 	input.CharLimit = 512
 	if secret {
@@ -864,6 +870,31 @@ func authInput(placeholder string, secret bool) textinput.Model {
 		input.EchoCharacter = '•'
 	}
 	return input
+}
+
+func (m *Model) compactAuthLayout() bool {
+	return m.width < 60 || m.height < 18
+}
+
+func (m *Model) resizeAuthInputs() {
+	if len(m.authInputs) == 0 {
+		return
+	}
+	width := m.width
+	if width <= 0 {
+		width = 68
+	}
+	if m.compactAuthLayout() {
+		for i := range m.authInputs {
+			labelWidth := len(authFieldLabel(m.screen, i)) + 2 // ": "
+			m.authInputs[i].Width = max(6, width-labelWidth-1)
+		}
+		return
+	}
+	panelWidth := min(max(1, width-4), 68)
+	for i := range m.authInputs {
+		m.authInputs[i].Width = max(12, panelWidth-4)
+	}
 }
 
 func (m *Model) focusAuth(index int) {
@@ -1060,6 +1091,7 @@ func (m *Model) resize() {
 	h := max(1, m.layout.transcript.h-2)
 	m.viewport.Width, m.viewport.Height = w, h
 	m.commandInput.Width = max(1, m.layout.command.w-4)
+	m.resizeAuthInputs()
 	m.rebuildHitTargets()
 	if m.accessibleWidth != m.width {
 		m.accessiblePage = 0
