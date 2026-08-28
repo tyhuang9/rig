@@ -6,6 +6,10 @@ import {
   type BootstrapStatus,
   type CreateApplicationRequest,
   type CSRFResponse,
+  type GitHubBranchPage,
+  type GitHubDeviceAuthorization,
+  type GitHubInstallationPage,
+  type GitHubRepositoryPage,
   type InspectRequest,
   type InspectResponse,
   type JobList,
@@ -15,10 +19,48 @@ import {
   type MachineList,
   type MeResponse,
   type SessionResponse,
+  type SourceConnection,
+  type SourceConnectionList,
   type SystemStatus,
 } from "./generated/api-contract";
 
-export type { Application, Job, Machine, SystemStatus, User } from "./generated/api-contract";
+export type {
+  Application,
+  CreateApplicationRequest,
+  GitHubBranch,
+  GitHubDeviceAuthorization,
+  GitHubInstallation,
+  GitHubRepository,
+  GitHubSource,
+  InspectRequest,
+  InspectResponse,
+  Job,
+  Machine,
+  SourceConnection,
+  SystemStatus,
+  User,
+} from "./generated/api-contract";
+
+export class APIError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly detail: string;
+  readonly retryAfterSeconds?: number;
+
+  constructor({ status, code, detail, retryAfterSeconds }: {
+    status: number;
+    code: string;
+    detail: string;
+    retryAfterSeconds?: number;
+  }) {
+    super(detail);
+    this.name = "APIError";
+    this.status = status;
+    this.code = code;
+    this.detail = detail;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
 
 let csrfToken = window.sessionStorage.getItem("hostd-csrf") ?? "";
 
@@ -55,14 +97,30 @@ async function request<T>(path: string, init: RequestInit = {}, retryCSRF = true
     },
   });
   if (!response.ok) {
-    const body = await response.json().catch(() => ({ detail: "Request failed" }));
+    const body = await response.json().catch(() => ({ code: "request_failed", detail: "Request failed" }));
     if (response.status === 403 && body.code === "csrf_failed" && mutating && retryCSRF) {
       await rotateCSRF();
       return request<T>(path, init, false);
     }
-    throw new Error(body.detail || "Request failed");
+    const retryAfter = response.headers.get("Retry-After");
+    const retryAfterSeconds = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) : undefined;
+    throw new APIError({
+      status: response.status,
+      code: typeof body.code === "string" ? body.code : "request_failed",
+      detail: typeof body.detail === "string" ? body.detail : "Request failed",
+      retryAfterSeconds,
+    });
   }
   return response.status === 204 ? (undefined as T) : response.json();
+}
+
+function operationPath(path: string, values: Record<string, string | number>) {
+  return path.replace(/\{([^}]+)\}/g, (_, key: string) => encodeURIComponent(String(values[key])));
+}
+
+function pagedPath(path: string, values: Record<string, string | number>, page: number, perPage: number) {
+  const query = new URLSearchParams({ page: String(page), perPage: String(perPage) });
+  return `${operationPath(path, values)}?${query.toString()}`;
 }
 
 export const api = {
@@ -85,11 +143,34 @@ export const api = {
   app: (id: string) => request<Application>(`/api/v1/apps/${id}`),
   createApp: (data: CreateApplicationRequest) =>
     request<Application>(operations.createApplication.path, { method: "POST", body: JSON.stringify(data) }),
-  inspect: (sourcePath: string) =>
+  inspect: (data: InspectRequest) =>
     request<InspectResponse>(operations.inspectImport.path, {
       method: "POST",
-      body: JSON.stringify({ sourcePath } satisfies InspectRequest),
+      body: JSON.stringify(data),
     }),
+  sourceConnections: () => request<SourceConnectionList>(operations.listSourceConnections.path),
+  startGitHubConnection: () =>
+    request<GitHubDeviceAuthorization>(operations.startGitHubDeviceConnection.path, {
+      method: operations.startGitHubDeviceConnection.method,
+    }),
+  pollGitHubConnection: (connectionId: string) =>
+    request<SourceConnection>(operationPath(operations.pollGitHubDeviceConnection.path, { connectionId }), {
+      method: operations.pollGitHubDeviceConnection.method,
+    }),
+  refreshSourceConnection: (connectionId: string) =>
+    request<SourceConnection>(operationPath(operations.refreshSourceConnection.path, { connectionId }), {
+      method: operations.refreshSourceConnection.method,
+    }),
+  disconnectSourceConnection: (connectionId: string) =>
+    request<void>(operationPath(operations.disconnectSourceConnection.path, { connectionId }), {
+      method: operations.disconnectSourceConnection.method,
+    }),
+  githubInstallations: (connectionId: string, page = 1, perPage = 30) =>
+    request<GitHubInstallationPage>(pagedPath(operations.listGitHubInstallations.path, { connectionId }, page, perPage)),
+  githubRepositories: (connectionId: string, installationId: number, page = 1, perPage = 30) =>
+    request<GitHubRepositoryPage>(pagedPath(operations.listGitHubRepositories.path, { connectionId, installationId }, page, perPage)),
+  githubBranches: (connectionId: string, installationId: number, repositoryId: number, page = 1, perPage = 30) =>
+    request<GitHubBranchPage>(pagedPath(operations.listGitHubBranches.path, { connectionId, installationId, repositoryId }, page, perPage)),
   machines: () => request<MachineList>(operations.listMachines.path),
   jobs: () => request<JobList>(operations.listJobs.path),
   cancelJob: (id: string) =>
