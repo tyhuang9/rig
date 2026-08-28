@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -27,6 +29,7 @@ type fakeClient struct {
 	followErrors    chan error
 	followCtx       context.Context
 	lifecycleAppID  string
+	applicationID   string
 }
 
 func (f *fakeClient) BootstrapStatus(context.Context) (apicontract.BootstrapStatus, error) {
@@ -51,6 +54,7 @@ func (f *fakeClient) Applications(context.Context) (apicontract.ApplicationList,
 	return apicontract.ApplicationList{Items: []apicontract.Application{{ID: "app-1", Slug: "one", Name: "One"}, {ID: "app-2", Slug: "two", Name: "Two"}}}, nil
 }
 func (f *fakeClient) Application(_ context.Context, id string) (apicontract.Application, error) {
+	f.applicationID = id
 	return apicontract.Application{ID: id, Slug: "one", Name: "One"}, nil
 }
 func (f *fakeClient) Machines(context.Context) (apicontract.MachineList, error) {
@@ -235,6 +239,13 @@ func TestSanitizeAPITextStripsTerminalControls(t *testing.T) {
 	}
 }
 
+func TestSanitizeAPITextAdvancesByRuneForUnicodeControls(t *testing.T) {
+	got := sanitizeAPIText("before\u0085after")
+	if got != "beforeafter" || !utf8.ValidString(got) {
+		t.Fatalf("sanitize unicode control = %q", got)
+	}
+}
+
 func TestLayoutResponsiveAndTiny(t *testing.T) {
 	tiny := calculateLayout(40, 10, 4, false)
 	if !tiny.tiny || tiny.unsupported || tiny.overview.h != 0 || tiny.transcript.h < 1 {
@@ -267,6 +278,55 @@ func TestLifecycleAcceptsExplicitApplicationTarget(t *testing.T) {
 	}
 	if client.lifecycleAppID != "app-2" {
 		t.Fatalf("explicit target = %q", client.lifecycleAppID)
+	}
+}
+
+func TestAsyncCommandSnapshotsSelectedAndTargetState(t *testing.T) {
+	client := &fakeClient{}
+	m := consoleModel(client)
+	run := m.execute(command{Name: "/stop", Args: []string{"one"}, Raw: "/stop one"})
+	m.selectedAppID = "app-2"
+	m.apps[0].ID = "changed"
+	result := run().(commandResultMsg)
+	if result.err != nil || client.lifecycleAppID != "app-1" {
+		t.Fatalf("result=%#v lifecycle app=%q", result, client.lifecycleAppID)
+	}
+	run = m.execute(command{Name: "/app", Raw: "/app"})
+	m.selectedAppID = "app-1"
+	result = run().(commandResultMsg)
+	if result.err != nil || client.applicationID != "app-2" {
+		t.Fatalf("result=%#v application id=%q", result, client.applicationID)
+	}
+}
+
+func TestLogoutSnapshotsHistoryBeforeAsyncWork(t *testing.T) {
+	history := &memoryHistoryStore{}
+	m := NewModel(context.Background(), &fakeClient{}, history, "endpoint")
+	m.screen = screenConsole
+	m.historyValues = []string{"/status"}
+	run := m.execute(command{Name: "/logout"})
+	m.historyValues = []string{"/stop"}
+	_ = run()
+	values, err := history.Load(context.Background())
+	if err != nil || len(values) != 1 || values[0] != "/status" {
+		t.Fatalf("saved history=%v err=%v", values, err)
+	}
+}
+
+func TestRenderSanitizesStoredErrorAndUsesSameJobRowsAsHitTargets(t *testing.T) {
+	m := consoleModel(&fakeClient{})
+	m.screen = screenOffline
+	m.err = "bad\x1b[31merror"
+	if got := m.View(); strings.Contains(got, "\x1b[31m") {
+		t.Fatalf("offline view rendered raw escape: %q", got)
+	}
+	m.screen = screenConsole
+	m.jobs = []apicontract.Job{{ID: "active", Status: "running"}, {ID: "failed", Status: "failed"}}
+	m.resize()
+	rows := append([]apicontract.Job(nil), m.overviewJobRows...)
+	_ = m.View()
+	if !reflect.DeepEqual(rows, m.overviewJobRows) || len(m.jobRects) != len(rows) {
+		t.Fatalf("rows=%v rendered=%v hit targets=%d", rows, m.overviewJobRows, len(m.jobRects))
 	}
 }
 

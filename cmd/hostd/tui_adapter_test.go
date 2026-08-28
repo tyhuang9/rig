@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -18,12 +19,16 @@ import (
 type memorySessionStore struct {
 	value   []byte
 	cleared bool
+	saveErr error
 }
 
 func (s *memorySessionStore) Load(context.Context) ([]byte, error) {
 	return append([]byte(nil), s.value...), nil
 }
 func (s *memorySessionStore) Save(_ context.Context, value []byte) error {
+	if s.saveErr != nil {
+		return s.saveErr
+	}
 	s.value = append([]byte(nil), value...)
 	return nil
 }
@@ -70,6 +75,34 @@ func TestMapTUIErrorPreservesHTTPProblem(t *testing.T) {
 	var output *tui.HTTPError
 	if !errors.As(err, &output) || output.Status != 401 || output.Code != "unauthenticated" || output.Detail != "Authentication required" {
 		t.Fatalf("mapped error = %#v", err)
+	}
+}
+
+func TestCancelAndResumePropagateSessionSaveFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"job":{"id":"job","status":"queued"}}`))
+	}))
+	defer server.Close()
+	stored, err := json.Marshal(controllerclient.Session{SessionToken: "session", CSRFToken: "csrf"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"cancel", "resume"} {
+		t.Run(operation, func(t *testing.T) {
+			client, err := newTUIControllerClient(server.URL, &memorySessionStore{value: stored, saveErr: errors.New("disk full")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var callErr error
+			if operation == "cancel" {
+				_, callErr = client.CancelJob(context.Background(), "job", "key")
+			} else {
+				_, callErr = client.ResumeJob(context.Background(), "job", "key")
+			}
+			if callErr == nil || !strings.Contains(callErr.Error(), "disk full") {
+				t.Fatalf("save error = %v", callErr)
+			}
+		})
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -65,5 +66,14 @@ func TestRunHostdUIHelpReturnsSuccess(t *testing.T) {
 	code := runHostd([]string{"ui", "--help"}, hostdRunners{interactive: func() bool { return false }, stdout: &stdout, stderr: &stderr, runUI: func(tuiLaunchOptions) error { called = true; return nil }, runServer: func([]string) int { return 0 }})
 	if code != 0 || called || !bytes.Contains(stdout.Bytes(), []byte("-endpoint")) || stderr.Len() != 0 {
 		t.Fatalf("code=%d called=%v stdout=%q stderr=%q", code, called, stdout.String(), stderr.String())
+	}
+}
+
+func TestHistoryFileForSessionPreservesSafeDefaultAndExplicitDirectory(t *testing.T) {
+	if got := historyFileForSession(filepath.Join("custom", "session.json")); got != filepath.Join("custom", "hostd-tui-history.json") {
+		t.Fatalf("explicit directory history=%q", got)
+	}
+	if got := historyFileForSession("session.json"); filepath.Dir(got) == "." {
+		t.Fatalf("relative session history escaped protected config path: %q", got)
 	}
 }

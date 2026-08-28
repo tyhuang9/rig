@@ -223,7 +223,9 @@ func (c *tuiControllerClient) CancelJob(ctx context.Context, id, _ string) (apic
 	}
 	value, err := c.client.Cancel(ctx, &session, id)
 	if err == nil {
-		_ = c.save(ctx, session)
+		if saveErr := c.save(ctx, session); saveErr != nil {
+			return value, saveErr
+		}
 	}
 	return value, mapTUIError(err)
 }
@@ -234,7 +236,9 @@ func (c *tuiControllerClient) ResumeJob(ctx context.Context, id, _ string) (apic
 	}
 	value, err := c.client.Resume(ctx, &session, id)
 	if err == nil {
-		_ = c.save(ctx, session)
+		if saveErr := c.save(ctx, session); saveErr != nil {
+			return value, saveErr
+		}
 	}
 	return value, mapTUIError(err)
 }

@@ -33,7 +33,7 @@ func (m *Model) View() string {
 	case screenLoading:
 		return m.centered("hostd operator console\n\nConnecting to " + sanitizeAPIText(m.endpoint) + "…")
 	case screenOffline:
-		return m.centered(titleStyle.Render("Controller unavailable") + "\n\n" + errorStyle.Render(m.err) + "\n\nPress Enter or r to retry · Ctrl+C to quit")
+		return m.centered(titleStyle.Render("Controller unavailable") + "\n\n" + errorStyle.Render(sanitizeAPIText(m.err)) + "\n\nPress Enter or r to retry · Ctrl+C to quit")
 	case screenBootstrap:
 		if m.bootstrapConfirm {
 			return m.bootstrapConfirmationView()
@@ -64,7 +64,7 @@ func (m *Model) authView(title, subtitle string) string {
 	}
 	if m.err != "" {
 		b.WriteString("\n")
-		b.WriteString(errorStyle.Render(m.err))
+		b.WriteString(errorStyle.Render(sanitizeAPIText(m.err)))
 	}
 	if m.busy {
 		b.WriteString("\nAuthenticating…")
@@ -170,7 +170,6 @@ func (m *Model) renderOverview() string {
 		b.WriteString(mutedStyle.Render("No applications") + "\n")
 	}
 	b.WriteString("\n" + titleStyle.Render("Active / failures") + "\n")
-	m.overviewJobRows = overviewJobs(m.jobs, 4)
 	for _, job := range m.overviewJobRows {
 		b.WriteString(fmt.Sprintf("%-10s %s\n", truncate(sanitizeAPIText(job.Status), 10), truncate(sanitizeAPIText(job.ID), max(8, m.layout.overview.w-15))))
 	}

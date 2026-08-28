@@ -79,8 +79,20 @@ func parseTUIOptions(args []string) (tuiLaunchOptions, string, error) {
 	if flags.NArg() != 0 {
 		return options, "", errors.New("hostd ui does not accept positional arguments")
 	}
-	options.historyFile = filepath.Join(filepath.Dir(options.sessionFile), "hostd-tui-history.json")
+	options.historyFile = historyFileForSession(options.sessionFile)
 	return options, "", nil
+}
+
+func historyFileForSession(sessionFile string) string {
+	directory := filepath.Dir(sessionFile)
+	if directory != "." {
+		return filepath.Join(directory, "hostd-tui-history.json")
+	}
+	root, err := os.UserConfigDir()
+	if err != nil {
+		return filepath.Join("hostd", "tui-history.json")
+	}
+	return filepath.Join(root, "hostd", "tui-history.json")
 }
 func interactiveTerminal() bool {
 	stdin, inputErr := os.Stdin.Stat()

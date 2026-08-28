@@ -93,13 +93,23 @@ func normalizeHistory(values []string) []string {
 
 type memoryHistoryStore struct {
 	values []string
+	mu     sync.Mutex
 }
 
 func (s *memoryHistoryStore) Load(context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return append([]string(nil), s.values...), nil
 }
 func (s *memoryHistoryStore) Save(_ context.Context, values []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.values = append([]string(nil), normalizeHistory(values)...)
 	return nil
 }
-func (s *memoryHistoryStore) Clear(context.Context) error { s.values = nil; return nil }
+func (s *memoryHistoryStore) Clear(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.values = nil
+	return nil
+}

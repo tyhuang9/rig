@@ -68,15 +68,15 @@ func sanitizeAPIText(value string) string {
 			continue
 		}
 		if unicode.IsControl(r) {
-			switch c {
+			switch r {
 			case '\n', '\t':
-				out.WriteByte(c)
+				out.WriteRune(r)
 			case '\r':
 				if i+1 >= len(value) || value[i+1] != '\n' {
 					out.WriteByte('\n')
 				}
 			}
-			i++
+			i += size
 			continue
 		}
 		out.WriteString(value[i : i+size])

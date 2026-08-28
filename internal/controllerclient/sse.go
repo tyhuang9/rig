@@ -34,8 +34,8 @@ func (c *Client) StreamJobEvents(ctx context.Context, session Session, jobID str
 	events := make(chan apicontract.JobEvent)
 	failures := make(chan error, 1)
 	go func() {
-		defer close(events)
 		defer close(failures)
+		defer close(events)
 		last, attempts := after, 0
 		for {
 			if ctx.Err() != nil {

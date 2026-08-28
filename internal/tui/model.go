@@ -169,6 +169,12 @@ type commandResultMsg struct {
 	followID string
 	err      error
 }
+type apiCommandRequest struct {
+	cmd            command
+	selectedAppID  string
+	targetAppID    string
+	idempotencyKey string
+}
 type followOpenedMsg struct {
 	generation uint64
 	jobID      string
@@ -185,37 +191,41 @@ type historySavedMsg struct{ err error }
 type sessionClearedMsg struct{}
 
 func (m *Model) loadHistory() tea.Cmd {
+	history, ctx := m.history, m.ctx
 	return func() tea.Msg {
-		values, err := m.history.Load(m.ctx)
+		values, err := history.Load(ctx)
 		return historyLoadedMsg{values: values, err: err}
 	}
 }
 
 func (m *Model) checkBootstrap() tea.Cmd {
+	client, ctx := m.client, m.ctx
 	return func() tea.Msg {
-		status, err := m.client.BootstrapStatus(m.ctx)
+		status, err := client.BootstrapStatus(ctx)
 		return bootstrapStatusMsg{status: status, err: err}
 	}
 }
 
 func (m *Model) checkMe() tea.Cmd {
+	client, ctx := m.client, m.ctx
 	return func() tea.Msg {
-		me, err := m.client.Me(m.ctx)
+		me, err := client.Me(ctx)
 		return meMsg{me: me, err: err}
 	}
 }
 
 func (m *Model) loadOverview() tea.Cmd {
+	client, ctx := m.client, m.ctx
 	return func() tea.Msg {
-		status, err := m.client.Status(m.ctx)
+		status, err := client.Status(ctx)
 		if err != nil {
 			return overviewMsg{err: err}
 		}
-		apps, err := m.client.Applications(m.ctx)
+		apps, err := client.Applications(ctx)
 		if err != nil {
 			return overviewMsg{err: err}
 		}
-		jobs, err := m.client.Jobs(m.ctx)
+		jobs, err := client.Jobs(ctx)
 		return overviewMsg{status: status, apps: apps, jobs: jobs, err: err}
 	}
 }
@@ -530,10 +540,12 @@ func (m *Model) execute(cmd command) tea.Cmd {
 		return tea.Quit
 	case "/logout":
 		m.busy = true
+		history := append([]string(nil), m.historyValues...)
+		client, store, ctx := m.client, m.history, m.ctx
 		return func() tea.Msg {
-			err := m.client.Logout(m.ctx)
+			err := client.Logout(ctx)
 			if err == nil {
-				_ = m.history.Save(m.ctx, m.historyValues)
+				_ = store.Save(ctx, history)
 			}
 			return commandResultMsg{cmd: cmd, body: "Session ended.", err: err}
 		}
@@ -550,77 +562,84 @@ func (m *Model) execute(cmd command) tea.Cmd {
 	case "/follow":
 		return m.startFollowing(cmd.Args[0], 0)
 	}
+	request, err := m.snapshotAPICommand(cmd)
+	if err != nil {
+		return func() tea.Msg { return commandResultMsg{cmd: cmd, err: err} }
+	}
 	m.busy = true
-	return func() tea.Msg { return m.runAPICommand(cmd) }
+	ctx, client := m.ctx, m.client
+	return func() tea.Msg { return runAPICommand(ctx, client, request) }
 }
 
-func (m *Model) runAPICommand(cmd command) commandResultMsg {
+func (m *Model) snapshotAPICommand(cmd command) (apiCommandRequest, error) {
+	request := apiCommandRequest{cmd: command{Name: cmd.Name, Args: append([]string(nil), cmd.Args...), Raw: cmd.Raw}, selectedAppID: m.selectedAppID}
+	switch cmd.Name {
+	case "/deploy", "/start", "/stop", "/restart":
+		target, ok := m.targetApp(cmd)
+		if !ok {
+			return request, errors.New("application not found; run /apps or /use <slug-or-id>")
+		}
+		key, err := m.mutationKey()
+		if err != nil {
+			return request, err
+		}
+		request.targetAppID, request.idempotencyKey = target.ID, key
+	case "/cancel", "/resume":
+		key, err := m.mutationKey()
+		if err != nil {
+			return request, err
+		}
+		request.idempotencyKey = key
+	}
+	return request, nil
+}
+
+func runAPICommand(ctx context.Context, client Client, request apiCommandRequest) commandResultMsg {
+	cmd := request.cmd
 	result := commandResultMsg{cmd: cmd}
 	switch cmd.Name {
 	case "/status":
-		v, err := m.client.Status(m.ctx)
+		v, err := client.Status(ctx)
 		result.err = err
 		result.body = formatStatus(v)
 	case "/doctor":
-		v, err := m.client.Doctor(m.ctx)
+		v, err := client.Doctor(ctx)
 		result.err = err
 		result.body = formatDoctor(v)
 	case "/apps":
-		v, err := m.client.Applications(m.ctx)
+		v, err := client.Applications(ctx)
 		result.err, result.apps = err, v.Items
 		result.body = formatApps(v.Items)
 	case "/app":
-		v, err := m.client.Application(m.ctx, m.selectedAppID)
+		v, err := client.Application(ctx, request.selectedAppID)
 		result.err = err
 		result.body = formatApp(v)
 	case "/machines":
-		v, err := m.client.Machines(m.ctx)
+		v, err := client.Machines(ctx)
 		result.err = err
 		result.body = formatMachines(v.Items)
 	case "/jobs":
-		v, err := m.client.Jobs(m.ctx)
+		v, err := client.Jobs(ctx)
 		result.err, result.jobs = err, v.Items
 		result.body = formatJobs(v.Items)
 	case "/job":
-		v, err := m.client.Job(m.ctx, cmd.Args[0])
+		v, err := client.Job(ctx, cmd.Args[0])
 		result.err, result.job = err, &v
 		result.body = formatJob(v)
 	case "/deploy":
-		target, _ := m.targetApp(cmd)
-		key, err := m.mutationKey()
-		if err != nil {
-			result.err = err
-			return result
-		}
-		v, err := m.client.Deploy(m.ctx, target.ID, key)
+		v, err := client.Deploy(ctx, request.targetAppID, request.idempotencyKey)
 		result.err, result.job, result.followID = err, &v.Job, v.Job.ID
 		result.body = mutationBody(v)
 	case "/start", "/stop", "/restart":
-		target, _ := m.targetApp(cmd)
-		key, err := m.mutationKey()
-		if err != nil {
-			result.err = err
-			return result
-		}
-		v, err := m.client.Lifecycle(m.ctx, target.ID, strings.TrimPrefix(cmd.Name, "/"), key)
+		v, err := client.Lifecycle(ctx, request.targetAppID, strings.TrimPrefix(cmd.Name, "/"), request.idempotencyKey)
 		result.err, result.job, result.followID = err, &v.Job, v.Job.ID
 		result.body = mutationBody(v)
 	case "/cancel":
-		key, err := m.mutationKey()
-		if err != nil {
-			result.err = err
-			return result
-		}
-		v, err := m.client.CancelJob(m.ctx, cmd.Args[0], key)
+		v, err := client.CancelJob(ctx, cmd.Args[0], request.idempotencyKey)
 		result.err, result.job = err, &v.Job
 		result.body = formatJob(v.Job)
 	case "/resume":
-		key, err := m.mutationKey()
-		if err != nil {
-			result.err = err
-			return result
-		}
-		v, err := m.client.ResumeJob(m.ctx, cmd.Args[0], key)
+		v, err := client.ResumeJob(ctx, cmd.Args[0], request.idempotencyKey)
 		result.err, result.job, result.followID = err, &v.Job, v.Job.ID
 		result.body = formatJob(v.Job)
 	}
@@ -632,11 +651,12 @@ func (m *Model) startFollowing(jobID string, after int64) tea.Cmd {
 	m.followGeneration++
 	generation := m.followGeneration
 	ctx, cancel := context.WithCancel(m.ctx)
+	client := m.client
 	m.followCancel = cancel
 	m.followContext = ctx
 	m.followCursor = after
 	return func() tea.Msg {
-		events, errs := m.client.FollowJob(ctx, jobID, after)
+		events, errs := client.FollowJob(ctx, jobID, after)
 		return followOpenedMsg{generation: generation, jobID: jobID, events: events, errors: errs}
 	}
 }
@@ -655,7 +675,7 @@ func (m *Model) waitForFollow() tea.Cmd {
 		case event, ok := <-events:
 			if !ok {
 				if errs == nil {
-					return followEventMsg{done: true}
+					return followEventMsg{generation: generation, done: true}
 				}
 				select {
 				case err, ok := <-errs:
@@ -696,14 +716,15 @@ func (m *Model) submitAuth() (tea.Model, tea.Cmd) {
 		}
 	}
 	m.busy, m.err, m.bootstrapConfirm, m.bootstrapUsername = true, "", false, ""
+	client, ctx := m.client, m.ctx
 	if m.screen == screenLogin {
 		request := apicontract.LoginRequest{Username: m.authInputs[0].Value(), Passphrase: m.authInputs[1].Value()}
 		m.clearAuthValues()
-		return m, func() tea.Msg { v, err := m.client.Login(m.ctx, request); return authMsg{session: v, err: err} }
+		return m, func() tea.Msg { v, err := client.Login(ctx, request); return authMsg{session: v, err: err} }
 	}
 	request := apicontract.BootstrapRequest{Token: m.authInputs[0].Value(), Username: m.authInputs[1].Value(), Passphrase: m.authInputs[2].Value()}
 	m.clearAuthValues()
-	return m, func() tea.Msg { v, err := m.client.Bootstrap(m.ctx, request); return authMsg{session: v, err: err} }
+	return m, func() tea.Msg { v, err := client.Bootstrap(ctx, request); return authMsg{session: v, err: err} }
 }
 
 func (m *Model) showBootstrap() {
