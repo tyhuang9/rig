@@ -303,6 +303,9 @@ func (coordinator *Coordinator) processOne(ctx context.Context) (bool, Coordinat
 		return false, CoordinatorEvent{Outcome: OutcomeIdle}
 	}
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+			return false, CoordinatorEvent{}
+		}
 		return false, CoordinatorEvent{Outcome: OutcomePersistenceUnavailable}
 	}
 	event := CoordinatorEvent{Outcome: OutcomeIdle, Claimed: 1}

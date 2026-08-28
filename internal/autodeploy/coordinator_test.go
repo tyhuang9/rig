@@ -158,6 +158,24 @@ type reserveBarrierRepository struct {
 	release <-chan struct{}
 }
 
+type claimBarrierRepository struct {
+	*Repository
+	once    sync.Once
+	reached chan struct{}
+	release <-chan struct{}
+	err     error
+}
+
+func (repository *claimBarrierRepository) ClaimDueWithResolveCutoff(ctx context.Context, _ string, _ time.Time, _ time.Duration, _ time.Time) (Status, WorkLease, error) {
+	repository.once.Do(func() { close(repository.reached) })
+	select {
+	case <-ctx.Done():
+		return Status{}, WorkLease{}, ctx.Err()
+	case <-repository.release:
+		return Status{}, WorkLease{}, repository.err
+	}
+}
+
 func (repository *reserveBarrierRepository) ReserveResolve(ctx context.Context, lease WorkLease, generation uint64, at time.Time) error {
 	blocked := false
 	repository.once.Do(func() {
@@ -1502,6 +1520,73 @@ func TestCoordinatorWakeCoalescesAndRunCancels(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("coordinator did not stop after cancellation")
+	}
+}
+
+func TestCoordinatorCanceledClaimDoesNotObservePersistenceFailure(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	repository := &claimBarrierRepository{Repository: fixture.repository, reached: make(chan struct{})}
+	recorder := &coordinatorEventRecorder{}
+	config := DefaultCoordinatorConfig()
+	config.PollInterval = time.Hour
+	config.Observer = recorder.Observe
+	coordinator, err := NewCoordinator(repository, &coordinatorTestResolver{sha: testSHA}, jobs.New(fixture.db), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+
+	select {
+	case <-repository.reached:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("coordinator did not reach claim barrier")
+	}
+	cancel()
+	select {
+	case runErr := <-done:
+		if runErr != nil {
+			t.Fatalf("cancel run=%v", runErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("coordinator did not stop after canceled claim")
+	}
+	if events := recorder.Events(); len(events) != 0 {
+		t.Fatalf("canceled claim produced observations=%#v", events)
+	}
+}
+
+func TestCoordinatorLiveClaimErrorRemainsPersistenceFailure(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	release := make(chan struct{})
+	repository := &claimBarrierRepository{
+		Repository: fixture.repository,
+		reached:    make(chan struct{}),
+		release:    release,
+		err:        context.Canceled,
+	}
+	coordinator := newCoordinatorForTest(t, repository, &coordinatorTestResolver{sha: testSHA}, jobs.New(fixture.db), &coordinatorTestClock{now: fixture.now})
+	result := make(chan CoordinatorEvent, 1)
+	go func() {
+		_, event := coordinator.processOne(context.Background())
+		result <- event
+	}()
+
+	select {
+	case <-repository.reached:
+	case <-time.After(time.Second):
+		t.Fatal("coordinator did not reach claim barrier")
+	}
+	close(release)
+	select {
+	case event := <-result:
+		if event.Outcome != OutcomePersistenceUnavailable {
+			t.Fatalf("live claim error event=%#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("coordinator did not return live claim error")
 	}
 }
 
