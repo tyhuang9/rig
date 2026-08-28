@@ -66,7 +66,7 @@ func TestMigrateFreshUpgradePreservesDataAndIsIdempotent(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&versions); err != nil {
 		t.Fatal(err)
 	}
-	if users != 1 || versions != 5 {
+	if users != 1 || versions != 6 {
 		t.Fatalf("preserved users = %d, migration versions = %d", users, versions)
 	}
 }
@@ -188,6 +188,89 @@ func TestApplicationConfigurationMigrationBackfillsAndEnforcesRevisionIntegrity(
 	// revisions must be archived rather than hard-deleted.
 	if _, err := db.Exec(`DELETE FROM applications WHERE id='legacy'`); err == nil {
 		t.Fatal("application configuration history was cascade-deleted")
+	}
+}
+
+func TestComposeRuntimeMigrationEnforcesDeploymentAndApprovalIntegrity(t *testing.T) {
+	db := openMemoryDatabase(t)
+	if err := Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES('owner','owner','hash',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	for _, app := range []string{"app-a", "app-b"} {
+		if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'draft',datetime('now'),datetime('now'))`, app, app, app); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at) VALUES('release-a','app-a','ready','{}',datetime('now')),('release-b','app-b','ready','{}',datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,created_at,updated_at) VALUES('job-a','deploy','application','app-a','queued','queued','owner',datetime('now'),datetime('now')),('job-b','deploy','application','app-b','queued','queued','owner',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,release_id,job_id,status) VALUES('bad','app-a','release-b','job-a','preparing')`); err == nil {
+		t.Fatal("cross-application release linkage was accepted")
+	}
+	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,release_id,job_id,status) VALUES('deployment-a','app-a','release-a','job-a','preparing')`); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := strings.Repeat("a", 64)
+	if _, err := db.Exec(`INSERT INTO deployment_policy_findings(id,deployment_id,policy_version,capability,scope,fingerprint,disposition,created_at) VALUES('finding','deployment-a','compose-v1','host_bind','/srv/data',?,'approval_required',datetime('now'))`, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO runtime_approvals(id,app_id,policy_version,capability,scope,fingerprint,granted_by,granted_at) VALUES('approval','app-a','compose-v1','host_bind','/srv/data',?,'owner',datetime('now'))`, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE deployments SET status='applying' WHERE id='deployment-a'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE runtime_approvals SET revoked_by='owner',revoked_at=datetime('now') WHERE id='approval'`); err == nil {
+		t.Fatal("approval used by an applying deployment was revoked")
+	}
+	if _, err := db.Exec(`UPDATE deployments SET status='failed' WHERE id='deployment-a'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE runtime_approvals SET revoked_by='owner',revoked_at=datetime('now') WHERE id='approval'`); err != nil {
+		t.Fatalf("inactive approval could not be revoked: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM runtime_approvals WHERE id='approval'`); err == nil {
+		t.Fatal("approval history was deletable")
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,workspace_state,workspace_size_bytes,workspace_pruned_at) VALUES('release-unavailable','app-a','ready','{}',datetime('now'),'pruned',0,datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,release_id,status) VALUES('deployment-unavailable','app-a','release-unavailable','preparing')`); err == nil {
+		t.Fatal("deployment linked a pruned release workspace")
+	}
+	input := `{"releaseId":"release-unavailable","configurationMode":"current"}`
+	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,input_json,created_at,updated_at) VALUES('job-unavailable','deploy','application','app-a','queued','queued',?,datetime('now'),datetime('now'))`, input); err == nil {
+		t.Fatal("active job selected a pruned release workspace")
+	}
+}
+
+func TestComposeRuntimeMigrationCapsEventsPerAttempt(t *testing.T) {
+	db := openMemoryDatabase(t)
+	if err := Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,attempt,created_at,updated_at) VALUES('job','test','machine','machine','running','running',1,datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	for sequence := 1; sequence <= 32; sequence++ {
+		if _, err := db.Exec(`INSERT INTO job_events(job_id,sequence,attempt,timestamp,level,phase,code,message) VALUES('job',?,1,datetime('now'),'info','running','phase_started','safe')`, sequence); err != nil {
+			t.Fatalf("event %d: %v", sequence, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO job_events(job_id,sequence,attempt,timestamp,level,phase,code,message) VALUES('job',33,1,datetime('now'),'info','running','phase_started','safe')`); err == nil {
+		t.Fatal("33rd event in an attempt was accepted")
+	}
+	if _, err := db.Exec(`UPDATE jobs SET attempt=2 WHERE id='job'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO job_events(job_id,sequence,attempt,timestamp,level,phase,code,message) VALUES('job',33,2,datetime('now'),'info','running','phase_started','safe')`); err != nil {
+		t.Fatalf("first event in next attempt: %v", err)
 	}
 }
 

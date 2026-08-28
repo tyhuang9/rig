@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,14 +17,18 @@ import (
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
+	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	"github.com/hostd/hostd/internal/runtime/docker"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/runtime/securetemp"
 	"github.com/hostd/hostd/internal/secretfile"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
@@ -72,10 +77,6 @@ func main() {
 		os.Exit(1)
 	}
 	j := jobs.New(db)
-	if err := j.RecoverInterrupted(); err != nil {
-		logger.Error("job recovery failed", "error", err)
-		os.Exit(1)
-	}
 	applicationConfiguration, err := appconfig.New(db, cfg.DataRoot)
 	if err != nil {
 		logger.Error("application configuration setup failed", "error", err)
@@ -94,7 +95,10 @@ func main() {
 		}
 	}
 	sources := sourceconnections.NewService(sourceconnections.NewRepository(db), githubProvider, sourceconnections.NewFileCredentialStore(cfg.DataRoot), cfg.GitHubAppSlug, time.Now)
-	snapshots, err := releasesnapshot.New(db, sources, cfg.DataRoot)
+	snapshots, err := releasesnapshot.New(db, sources, cfg.DataRoot, releasesnapshot.RetentionOptions{
+		PerAppBytes: cfg.ReleaseWorkspacePerAppBytes,
+		GlobalBytes: cfg.ReleaseWorkspaceGlobalBytes,
+	})
 	if err != nil {
 		logger.Error("release snapshot configuration failed", "error", err)
 		os.Exit(1)
@@ -103,28 +107,51 @@ func main() {
 		logger.Error("release snapshot recovery failed", "error", err)
 		os.Exit(1)
 	}
+	applications := apps.New(db)
+	deploymentRepository := deployments.New(db)
+	temporary, err := securetemp.New(cfg.DataRoot)
+	if err != nil {
+		logger.Error("compose runtime temporary storage setup failed", "error", err)
+		os.Exit(1)
+	}
+	var executor jobs.Executor
+	if cfg.FakeRuntime {
+		executor = jobs.NewFakeExecutor()
+	}
+	if cfg.ComposeRuntime {
+		executor, err = composeruntime.NewExecutor(applications, snapshots, applicationConfiguration, deploymentRepository, temporary, runtimeprocess.ExecRunner{}, composeruntime.ExecutorOptions{
+			DockerEndpoint: cfg.DockerEndpoint,
+			ConfigTimeout:  cfg.ComposeConfigTimeout,
+			ApplyTimeout:   cfg.ComposeApplyTimeout,
+			WaitTimeout:    cfg.ComposeWaitTimeout,
+		})
+		if err != nil {
+			logger.Error("compose runtime setup failed", "error", err)
+			os.Exit(1)
+		}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	workerDone := make(chan struct{})
-	if cfg.FakeRuntime {
-		go func() {
-			defer close(workerDone)
-			if err := j.RunWorker(ctx, jobs.NewFakeExecutor()); err != nil {
-				logger.Error("job worker stopped", "error", err)
-				stop()
-			}
-		}()
-	} else {
-		close(workerDone)
+	workerDone, err := prepareRuntimeWorker(ctx, runtimeRecovery{
+		temporary:   temporary.Recover,
+		deployments: deploymentRepository.Recover,
+		jobs:        j.RecoverInterrupted,
+	}, executor, j.RunWorker, func(err error) {
+		logger.Error("job worker stopped", "error", err)
+		stop()
+	})
+	if err != nil {
+		logger.Error("runtime recovery failed", "error", err)
+		os.Exit(1)
 	}
-	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, ComposeRuntime: cfg.ComposeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = s.Shutdown(shutdown)
 	}()
-	logger.Info("hostd listening", "address", cfg.ListenAddress, "fake_runtime", cfg.FakeRuntime)
+	logger.Info("hostd listening", "address", cfg.ListenAddress, "fake_runtime", cfg.FakeRuntime, "compose_runtime", cfg.ComposeRuntime)
 	serveErr := s.ListenAndServe()
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		logger.Error("server stopped", "error", serveErr)
@@ -136,6 +163,42 @@ func main() {
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		os.Exit(1)
 	}
+}
+
+type runtimeRecovery struct {
+	temporary   func() error
+	deployments func(context.Context) error
+	jobs        func() error
+}
+
+func prepareRuntimeWorker(ctx context.Context, recovery runtimeRecovery, executor jobs.Executor, run func(context.Context, jobs.Executor) error, reportFailure func(error)) (<-chan struct{}, error) {
+	if recovery.temporary == nil || recovery.deployments == nil || recovery.jobs == nil {
+		return nil, errors.New("runtime recovery dependencies are required")
+	}
+	if err := recovery.temporary(); err != nil {
+		return nil, fmt.Errorf("clean compose runtime temporary files: %w", err)
+	}
+	if err := recovery.deployments(context.WithoutCancel(ctx)); err != nil {
+		return nil, fmt.Errorf("recover deployments: %w", err)
+	}
+	if err := recovery.jobs(); err != nil {
+		return nil, fmt.Errorf("recover jobs: %w", err)
+	}
+	done := make(chan struct{})
+	if executor == nil {
+		close(done)
+		return done, nil
+	}
+	if run == nil {
+		return nil, errors.New("runtime worker is required")
+	}
+	go func() {
+		defer close(done)
+		if err := run(ctx, executor); err != nil && reportFailure != nil {
+			reportFailure(err)
+		}
+	}()
+	return done, nil
 }
 
 func waitForWorker(done <-chan struct{}, timeout time.Duration) bool {

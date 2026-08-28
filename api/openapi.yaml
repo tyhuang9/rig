@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: hostd Phase A API
   version: 0.1.0
-  description: Authenticated local-only control plane. Runtime actions require the explicit fake-runtime development capability and never execute workloads.
+  description: Authenticated local-only control plane. Workload execution is disabled by default and requires an explicit runtime capability.
 servers:
   - url: http://127.0.0.1:7345
 security:
@@ -105,11 +105,55 @@ paths:
         '200': {description: Application services, content: {application/json: {schema: {$ref: '#/components/schemas/ServiceList'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/apps/{appId}/deployments:
-    parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    get:
+      operationId: listDeployments
+      responses:
+        '200': {description: Deployment history, content: {application/json: {schema: {$ref: '#/components/schemas/DeploymentList'}}}}
+        default: {$ref: '#/components/responses/Problem'}
     post:
       operationId: deployApplication
       security: [{sessionCookie: [], csrfHeader: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
       responses: *jobResponses
+  /api/v1/apps/{appId}/releases:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    get:
+      operationId: listReleases
+      responses:
+        '200': {description: Release history, content: {application/json: {schema: {$ref: '#/components/schemas/ReleaseList'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/releases/{releaseId}/deployments:
+    parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/ReleaseId'}]
+    post:
+      operationId: deployRelease
+      security: [{sessionCookie: [], csrfHeader: []}]
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/DeployReleaseRequest'}}}}
+      responses: *jobResponses
+  /api/v1/apps/{appId}/runtime-approvals:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    get:
+      operationId: listRuntimeApprovals
+      responses:
+        '200': {description: Runtime approval history, content: {application/json: {schema: {$ref: '#/components/schemas/RuntimeApprovalList'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      operationId: grantRuntimeApproval
+      security: [{sessionCookie: [], csrfHeader: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/GrantRuntimeApprovalRequest'}}}}
+      responses:
+        '200': {description: Existing active approval, content: {application/json: {schema: {$ref: '#/components/schemas/RuntimeApprovalMutationResponse'}}}}
+        '201': {description: Runtime approval granted, content: {application/json: {schema: {$ref: '#/components/schemas/RuntimeApprovalMutationResponse'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/runtime-approvals/{approvalId}:
+    parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/ApprovalId'}]
+    delete:
+      operationId: revokeRuntimeApproval
+      security: [{sessionCookie: [], csrfHeader: []}]
+      responses:
+        '200': {description: Runtime approval revoked, content: {application/json: {schema: {$ref: '#/components/schemas/RuntimeApprovalResponse'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/apps/{appId}/start:
     parameters: [{$ref: '#/components/parameters/AppId'}, {$ref: '#/components/parameters/IdempotencyKey'}]
     post:
@@ -162,6 +206,14 @@ paths:
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
         '200': {description: Job cancelled, content: {application/json: {schema: {$ref: '#/components/schemas/JobResponse'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/jobs/{jobId}/resume:
+    parameters: [{$ref: '#/components/parameters/JobId'}]
+    post:
+      operationId: resumeJob
+      security: [{sessionCookie: [], csrfHeader: []}]
+      responses:
+        '200': {description: Paused job atomically requeued, content: {application/json: {schema: {$ref: '#/components/schemas/JobResponse'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/jobs/{jobId}/events/stream:
     parameters: [{$ref: '#/components/parameters/JobId'}, {$ref: '#/components/parameters/AfterEventId'}, {$ref: '#/components/parameters/LastEventId'}]
@@ -272,6 +324,8 @@ components:
   parameters:
     AppId: {name: appId, in: path, required: true, schema: {type: string, format: uuid}}
     JobId: {name: jobId, in: path, required: true, schema: {type: string, format: uuid}}
+    ReleaseId: {name: releaseId, in: path, required: true, schema: {type: string, pattern: '^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$'}}
+    ApprovalId: {name: approvalId, in: path, required: true, schema: {type: string, format: uuid}}
     IdempotencyKey: {name: Idempotency-Key, in: header, required: false, schema: {type: string, maxLength: 200}}
     AfterEventId: {name: after, in: query, required: false, schema: {type: integer, format: int64, minimum: 0}}
     LastEventId: {name: Last-Event-ID, in: header, required: false, schema: {type: integer, format: int64, minimum: 0}}
@@ -303,7 +357,7 @@ components:
     SessionResponse: {type: object, required: [user, csrfToken], properties: {user: {$ref: '#/components/schemas/User'}, csrfToken: {type: string}}}
     MeResponse: {type: object, required: [user], properties: {user: {$ref: '#/components/schemas/User'}}}
     CSRFResponse: {type: object, required: [csrfToken], properties: {csrfToken: {type: string}}}
-    Capabilities: {type: object, required: [fakeRuntime, githubConnections], properties: {fakeRuntime: {type: boolean}, githubConnections: {type: boolean}}}
+    Capabilities: {type: object, required: [fakeRuntime, composeRuntime, githubConnections], properties: {fakeRuntime: {type: boolean}, composeRuntime: {type: boolean}, githubConnections: {type: boolean}}}
     Diagnostics:
       type: object
       required: [daemonRunning, clientAvailable, engineReady, composeAvailable, caddyManaged, os, architecture, dockerVersion, composeVersion, dockerDetail, composeDetail, startupLimitation, resources]
@@ -314,6 +368,17 @@ components:
     DoctorResponse: {type: object, required: [checks, startupLimitation], properties: {checks: {type: array, items: {$ref: '#/components/schemas/DoctorCheck'}}, startupLimitation: {type: string}}}
     Application: {type: object, required: [id, slug, name, description, status, machineName, createdAt, source], properties: {id: {type: string, format: uuid}, slug: {type: string}, name: {type: string}, description: {type: string}, status: {type: string}, machineName: {type: string}, createdAt: {type: string, format: date-time}, source: {$ref: '#/components/schemas/SourceSummary'}}}
     ApplicationList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Application'}}}}
+    PolicyFinding: {type: object, required: [id, deploymentId, policyVersion, capability, scope, fingerprint, disposition, createdAt], properties: {id: {type: string, format: uuid}, deploymentId: {type: string, format: uuid}, policyVersion: {type: string}, capability: {type: string}, scope: {type: string}, fingerprint: {type: string, pattern: '^[a-f0-9]{64}$'}, disposition: {type: string, enum: [allowed, approval_required, rejected]}, createdAt: {type: string, format: date-time}}}
+    Deployment: {type: object, required: [id, appId, status, configurationMode, actualConfigurationRevisionNumber, findings], properties: {id: {type: string, format: uuid}, appId: {type: string, format: uuid}, releaseId: {type: string}, jobId: {type: string, format: uuid}, machineId: {type: string, format: uuid}, status: {type: string, enum: [preparing, applying, waiting_health, succeeded, failed, cancelled, needs_attention]}, configurationMode: {type: string, enum: [current, original]}, actualConfigurationRevisionId: {type: string, format: uuid}, actualConfigurationRevisionNumber: {type: integer, format: int64, minimum: 0}, startedAt: {type: string, format: date-time}, finishedAt: {type: string, format: date-time}, diagnosticCode: {type: string}, failureSummary: {type: string}, findings: {type: array, items: {$ref: '#/components/schemas/PolicyFinding'}}}}
+    DeploymentList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Deployment'}}}}
+    Release: {type: object, required: [id, appId, sourceProvider, configurationRevisionNumber, createdAt], properties: {id: {type: string}, appId: {type: string, format: uuid}, sourceProvider: {type: string}, repositoryId: {type: integer, format: int64}, repositoryOwner: {type: string}, repositoryName: {type: string}, trackedRef: {type: string}, resolvedSha: {type: string}, sourceCommitSha: {type: string}, sourceBranch: {type: string}, composePath: {type: string}, archiveSha256: {type: string, pattern: '^[a-f0-9]{64}$'}, workspaceState: {type: string}, configurationRevisionId: {type: string, format: uuid}, configurationRevisionNumber: {type: integer, format: int64, minimum: 0}, createdAt: {type: string, format: date-time}}}
+    ReleaseList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Release'}}}}
+    DeployReleaseRequest: {type: object, additionalProperties: false, required: [configurationMode], properties: {configurationMode: {type: string, enum: [current, original]}}}
+    RuntimeApproval: {type: object, required: [id, appId, policyVersion, capability, scope, fingerprint, grantedBy, grantedAt], properties: {id: {type: string, format: uuid}, appId: {type: string, format: uuid}, policyVersion: {type: string}, capability: {type: string}, scope: {type: string}, fingerprint: {type: string, pattern: '^[a-f0-9]{64}$'}, grantedBy: {type: string, format: uuid}, grantedAt: {type: string, format: date-time}, revokedBy: {type: string, format: uuid}, revokedAt: {type: string, format: date-time}}}
+    RuntimeApprovalList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/RuntimeApproval'}}}}
+    GrantRuntimeApprovalRequest: {type: object, additionalProperties: false, required: [fingerprint], properties: {fingerprint: {type: string, pattern: '^[a-f0-9]{64}$'}}}
+    RuntimeApprovalMutationResponse: {type: object, required: [approval, created], properties: {approval: {$ref: '#/components/schemas/RuntimeApproval'}, created: {type: boolean}}}
+    RuntimeApprovalResponse: {type: object, required: [approval], properties: {approval: {$ref: '#/components/schemas/RuntimeApproval'}}}
     ConfigurationEntry: {type: object, required: [key, sensitive], properties: {key: {type: string}, sensitive: {type: boolean}, value: {type: string}}}
     ConfigurationValueInput: {type: object, additionalProperties: false, required: [key, value], properties: {key: {type: string, pattern: '^[A-Za-z_][A-Za-z0-9_]*$', maxLength: 128}, value: {type: string, maxLength: 8192}}}
     SecretConfigurationValueInput: {type: object, additionalProperties: false, required: [key, value], properties: {key: {type: string, pattern: '^[A-Za-z_][A-Za-z0-9_]*$', maxLength: 128}, value: {type: string, minLength: 1, maxLength: 8192}}}
@@ -328,11 +393,11 @@ components:
     InspectResponse: {type: object, required: [source, composeCandidates, services, findings], properties: {source: {$ref: '#/components/schemas/SourceSummary'}, resolvedSha: {type: string}, composeCandidates: {type: array, items: {type: string}}, services: {type: array, items: {$ref: '#/components/schemas/DetectedService'}}, findings: {type: array, items: {$ref: '#/components/schemas/SourceFinding'}}}}
     Service: {type: object, required: [id, name, kind, status], properties: {id: {type: string, format: uuid}, name: {type: string}, kind: {type: string}, status: {type: string}, port: {type: integer}}}
     ServiceList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Service'}}}}
-    Job: {type: object, required: [id, type, resourceType, resourceId, status, phase, checkpoint, progress, createdAt, updatedAt], properties: {id: {type: string, format: uuid}, type: {type: string}, resourceType: {type: string}, resourceId: {type: string}, status: {type: string}, phase: {type: string}, checkpoint: {type: string}, errorCode: {type: string}, errorDetail: {type: string}, progress: {type: integer}, createdAt: {type: string, format: date-time}, updatedAt: {type: string, format: date-time}}}
+    Job: {type: object, required: [id, type, resourceType, resourceId, status, phase, checkpoint, progress, attempt, createdAt, updatedAt], properties: {id: {type: string, format: uuid}, type: {type: string}, resourceType: {type: string}, resourceId: {type: string}, status: {type: string}, phase: {type: string}, checkpoint: {type: string}, errorCode: {type: string}, errorDetail: {type: string}, requestedBy: {type: string, format: uuid}, pauseDisposition: {type: string}, progress: {type: integer}, attempt: {type: integer, minimum: 0}, createdAt: {type: string, format: date-time}, updatedAt: {type: string, format: date-time}}}
     JobMutationResponse: {type: object, required: [job, created], properties: {job: {$ref: '#/components/schemas/Job'}, created: {type: boolean}}}
     JobResponse: {type: object, required: [job], properties: {job: {$ref: '#/components/schemas/Job'}}}
     JobList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Job'}}}}
-    JobEvent: {type: object, required: [id, jobId, sequence, timestamp, level, phase, code, message], properties: {id: {type: integer, format: int64}, jobId: {type: string, format: uuid}, sequence: {type: integer}, timestamp: {type: string, format: date-time}, level: {type: string}, phase: {type: string}, code: {type: string}, message: {type: string}}}
+    JobEvent: {type: object, required: [id, jobId, sequence, attempt, timestamp, level, phase, code, message], properties: {id: {type: integer, format: int64}, jobId: {type: string, format: uuid}, sequence: {type: integer}, attempt: {type: integer, minimum: 0}, timestamp: {type: string, format: date-time}, level: {type: string}, phase: {type: string}, code: {type: string}, message: {type: string}}}
     JobEventList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/JobEvent'}}}}
     Machine: {type: object, required: [id, name, status, os, architecture, hostname, dockerVersion, composeVersion, resources], properties: {id: {type: string, format: uuid}, name: {type: string}, status: {type: string}, os: {type: string}, architecture: {type: string}, hostname: {type: string}, dockerVersion: {type: string}, composeVersion: {type: string}, resources: {type: object, additionalProperties: true}}}
     MachineList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Machine'}}}}

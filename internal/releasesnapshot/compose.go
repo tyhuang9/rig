@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/hostd/hostd/internal/pathsecurity"
 	"gopkg.in/yaml.v3"
 )
 
@@ -17,7 +18,7 @@ const (
 )
 
 func validateComposeWorkspace(workspace, composePath string) error {
-	if composePath == "" || strings.ContainsAny(composePath, "$\\:") || filepath.IsAbs(composePath) || filepath.ToSlash(filepath.Clean(composePath)) != composePath {
+	if composePath == "" || pathsecurity.RejectWindowsNamespace(composePath) || strings.ContainsAny(composePath, "$\\:") || filepath.IsAbs(composePath) || filepath.ToSlash(filepath.Clean(composePath)) != composePath {
 		return errors.New("unsafe compose path")
 	}
 	compose := filepath.Join(workspace, filepath.FromSlash(composePath))
@@ -138,12 +139,12 @@ func validateServicePaths(workspace, base string, service *yaml.Node) error {
 	}
 	if env := mapValue(service, "env_file"); env != nil {
 		if env.Kind == yaml.ScalarNode {
-			if err := validatePathNode(workspace, base, env, false); err != nil {
+			if err := validateEnvFileNode(workspace, base, env); err != nil {
 				return err
 			}
 		} else if env.Kind == yaml.SequenceNode {
 			for _, v := range env.Content {
-				if err := validatePathNode(workspace, base, v, false); err != nil {
+				if err := validateEnvFileNode(workspace, base, v); err != nil {
 					return err
 				}
 			}
@@ -160,6 +161,38 @@ func validateServicePaths(workspace, base string, service *yaml.Node) error {
 	}
 	return nil
 }
+
+func validateEnvFileNode(workspace, base string, node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		return validatePathNode(workspace, base, node, false)
+	}
+	if node.Kind != yaml.MappingNode {
+		return errors.New("invalid env_file")
+	}
+	pathNode := mapValue(node, "path")
+	if pathNode == nil {
+		return errors.New("invalid env_file")
+	}
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		key := node.Content[index].Value
+		value := node.Content[index+1]
+		switch key {
+		case "path":
+		case "required":
+			if value.Kind != yaml.ScalarNode || value.Tag != "!!bool" {
+				return errors.New("invalid env_file")
+			}
+		case "format":
+			if value.Kind != yaml.ScalarNode || strings.TrimSpace(value.Value) == "" {
+				return errors.New("invalid env_file")
+			}
+		default:
+			return errors.New("invalid env_file")
+		}
+	}
+	return validatePathNode(workspace, base, pathNode, false)
+}
+
 func validateAdditionalContexts(workspace, base string, node *yaml.Node) error {
 	switch node.Kind {
 	case yaml.MappingNode:
@@ -202,7 +235,7 @@ func resolvePathNode(workspace, base string, node *yaml.Node, wantDir bool) (str
 		return "", errors.New("invalid compose path")
 	}
 	value := strings.TrimSpace(node.Value)
-	if value == "" || strings.ContainsAny(value, "$\\:") || strings.HasPrefix(value, "git@") || filepath.IsAbs(value) || strings.HasPrefix(value, "/") {
+	if value == "" || pathsecurity.RejectWindowsNamespace(value) || strings.ContainsAny(value, "$\\:") || strings.HasPrefix(value, "git@") || filepath.IsAbs(value) || strings.HasPrefix(value, "/") {
 		return "", errors.New("unsafe compose path")
 	}
 	candidate := filepath.Join(base, filepath.FromSlash(strings.ReplaceAll(value, "\\", "/")))
@@ -225,6 +258,9 @@ func resolvePathNode(workspace, base string, node *yaml.Node, wantDir bool) (str
 	return candidate, nil
 }
 func readRegularLimited(workspace, path string, limit int64) ([]byte, error) {
+	if pathsecurity.RejectWindowsNamespace(workspace) || pathsecurity.RejectWindowsNamespace(path) {
+		return nil, errors.New("unsafe compose path")
+	}
 	if !safeNoLink(workspace, path) {
 		return nil, errors.New("unsafe compose path")
 	}
@@ -244,6 +280,9 @@ func readRegularLimited(workspace, path string, limit int64) ([]byte, error) {
 	return body, nil
 }
 func safeNoLink(root, target string) bool {
+	if pathsecurity.RejectWindowsNamespace(root) || pathsecurity.RejectWindowsNamespace(target) {
+		return false
+	}
 	if !within(root, target) {
 		return false
 	}

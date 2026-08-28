@@ -33,6 +33,149 @@ func testStore(t *testing.T) (*Store, string) {
 	return store, root
 }
 
+func TestExportRevisionForExecutionPinsExactRevision(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+
+	empty, err := store.ExportRevisionForExecution(ctx, configTestApp, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.Environment) == 0 || empty.RevisionID != "" || empty.RevisionNumber != 0 {
+		t.Fatalf("unexpected empty revision export: %#v", empty)
+	}
+
+	first, err := store.Replace(ctx, configTestApp, "", ReplaceInput{
+		ExpectedRevisionNumber: 0,
+		Variables: []ValueInput{
+			{Key: "Z_LAST", Value: "hash# equals= double\" slash\\ carriage\rreturn"},
+			{Key: "MODE", Value: "first'$VALUE\nnext"},
+		},
+		Secrets: []ValueInput{{Key: "TOKEN", Value: "secret"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Replace(ctx, configTestApp, "", ReplaceInput{
+		ExpectedRevisionNumber: first.RevisionNumber,
+		Variables:              []ValueInput{{Key: "MODE", Value: "second"}},
+		Remove:                 []string{"TOKEN"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exact, err := store.ExportRevisionForExecution(ctx, configTestApp, first.RevisionID, first.RevisionNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantExact := "# hostd application configuration\nMODE='first\\'$VALUE\nnext'\nTOKEN='secret'\nZ_LAST='hash# equals= double\" slash\\ carriage\rreturn'\n"
+	if string(exact.Environment) != wantExact {
+		t.Fatalf("exact revision environment=%q want=%q", exact.Environment, wantExact)
+	}
+	if len(exact.SecretOrigins) != 1 || string(exact.SecretOrigins[0].Key) != "TOKEN" || string(exact.SecretOrigins[0].Value) != "secret" || exact.SecretOrigins[0].RevisionID != first.RevisionID || exact.SecretOrigins[0].RevisionNumber != first.RevisionNumber {
+		t.Fatalf("unexpected exact secret origins: %#v", exact.SecretOrigins)
+	}
+	current, err := store.ExportCurrentForExecution(ctx, configTestApp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.RevisionID != second.RevisionID || current.RevisionNumber != second.RevisionNumber || strings.Contains(string(current.Environment), "secret") || !strings.Contains(string(current.Environment), "MODE='second'") {
+		t.Fatalf("unexpected current revision export: %#v", current)
+	}
+
+	empty.Clear()
+	exact.Clear()
+	current.Clear()
+}
+
+func TestExportRevisionForExecutionReturnsIndependentCallerOwnedBytes(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	revision, err := store.Replace(ctx, configTestApp, "", ReplaceInput{ExpectedRevisionNumber: 0, Secrets: []ValueInput{{Key: "TOKEN", Value: "secret"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.ExportRevisionForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.ExportRevisionForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Clear()
+	if strings.ContainsRune(string(second.Environment), '\x00') || !strings.Contains(string(second.Environment), "TOKEN='secret'") {
+		t.Fatalf("clearing one export changed another: %q", second.Environment)
+	}
+	if len(second.SecretOrigins) != 1 || string(second.SecretOrigins[0].Key) != "TOKEN" || string(second.SecretOrigins[0].Value) != "secret" {
+		t.Fatalf("unexpected independent secret origins: %#v", second.SecretOrigins)
+	}
+	encoded, err := json.Marshal(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "secret") || strings.Contains(string(encoded), "Environment") {
+		t.Fatalf("execution environment was JSON serialized: %s", encoded)
+	}
+	originKey := second.SecretOrigins[0].Key
+	originValue := second.SecretOrigins[0].Value
+	second.Clear()
+	if second.Environment != nil || second.SecretOrigins != nil || !allZero(originKey) || !allZero(originValue) {
+		t.Fatalf("execution configuration did not clear owned buffers")
+	}
+}
+
+func TestExportRevisionForExecutionRejectsMismatchedIdentity(t *testing.T) {
+	store, _ := testStore(t)
+	revision, err := store.Replace(context.Background(), configTestApp, "", ReplaceInput{ExpectedRevisionNumber: 0, Variables: []ValueInput{{Key: "MODE", Value: "prod"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range []struct {
+		id     string
+		number int64
+	}{{"", 1}, {"00000000-0000-0000-0000-000000000000", 0}, {"00000000-0000-0000-0000-000000000000", 1}, {revision.RevisionID, revision.RevisionNumber + 1}} {
+		result, err := store.ExportRevisionForExecution(context.Background(), configTestApp, request.id, request.number)
+		if !IsCode(err, "configuration_unavailable") {
+			result.Clear()
+			t.Fatalf("id=%q number=%d error=%v", request.id, request.number, err)
+		}
+	}
+}
+
+func TestExportRevisionForExecutionFailsClosedOnCorruptBundle(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	revision, err := store.Replace(ctx, configTestApp, "", ReplaceInput{ExpectedRevisionNumber: 0, Secrets: []ValueInput{{Key: "TOKEN", Value: "secret"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := bundle{Version: 1, ApplicationID: configTestApp, RevisionID: revision.RevisionID, RevisionNumber: revision.RevisionNumber, Entries: map[string]bundleEntry{"TOKEN": {Sensitive: false, Value: "secret"}}}
+	plaintext, err := json.Marshal(corrupt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := secretfile.Write(store.bundlePath(configTestApp, revision.RevisionID), purpose(configTestApp, revision.RevisionID), plaintext); err != nil {
+		t.Fatal(err)
+	}
+	clear(plaintext)
+	result, err := store.ExportRevisionForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber)
+	result.Clear()
+	if !IsCode(err, "configuration_unavailable") {
+		t.Fatalf("corrupt exact revision error = %v", err)
+	}
+}
+
+func allZero(value []byte) bool {
+	for _, item := range value {
+		if item != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func TestRecoverRemovesRecognizedOrphansAndFailsClosedOnCorruption(t *testing.T) {
 	store, root := testStore(t)
 	ctx := context.Background()

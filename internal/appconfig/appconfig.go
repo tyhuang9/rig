@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/secretfile"
 )
 
@@ -51,6 +52,40 @@ type Configuration struct {
 	RevisionNumber int64     `json:"revisionNumber"`
 	UpdatedAt      time.Time `json:"updatedAt,omitempty"`
 	Entries        []Entry   `json:"entries"`
+}
+
+// ExecutionConfiguration is a decrypted, exact configuration revision for a
+// single runtime attempt. Environment is secret-bearing caller-owned memory and
+// must be cleared after it has been written to protected temporary storage.
+type ExecutionConfiguration struct {
+	RevisionID     string
+	RevisionNumber int64
+	Environment    []byte         `json:"-"`
+	SecretOrigins  []SecretOrigin `json:"-"`
+}
+
+// SecretOrigin is caller-owned metadata used to keep values originating from a
+// protected configuration secret out of durable policy findings. Key and Value
+// are independent buffers and must be cleared with ExecutionConfiguration.Clear.
+type SecretOrigin struct {
+	RevisionID     string
+	RevisionNumber int64
+	Key            []byte `json:"-"`
+	Value          []byte `json:"-"`
+}
+
+// Clear releases and overwrites the decrypted material owned by one execution
+// export. It is safe to call more than once.
+func (c *ExecutionConfiguration) Clear() {
+	clear(c.Environment)
+	c.Environment = nil
+	for index := range c.SecretOrigins {
+		clear(c.SecretOrigins[index].Key)
+		clear(c.SecretOrigins[index].Value)
+		c.SecretOrigins[index] = SecretOrigin{}
+	}
+	clear(c.SecretOrigins)
+	c.SecretOrigins = nil
 }
 
 type ValueInput struct {
@@ -92,7 +127,7 @@ type appLock struct {
 }
 
 func New(db *sql.DB, dataRoot string) (*Store, error) {
-	if db == nil || dataRoot == "" || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
+	if db == nil || dataRoot == "" || pathsecurity.RejectWindowsNamespace(dataRoot) || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
 		return nil, errors.New("application configuration data root must be absolute and clean")
 	}
 	return &Store{db: db, root: filepath.Join(dataRoot, "apps"), now: time.Now, appLocks: map[string]*appLock{}}, nil
@@ -151,6 +186,83 @@ func (s *Store) Get(ctx context.Context, appID string) (Configuration, error) {
 	}
 	sort.Slice(result.Entries, func(i, j int) bool { return result.Entries[i].Key < result.Entries[j].Key })
 	return result, nil
+}
+
+// ExportRevisionForExecution returns one exact historical revision as a
+// Compose-compatible dotenv document. It never silently substitutes the head
+// revision. Revision zero is represented by a nonempty comment-only document.
+func (s *Store) ExportRevisionForExecution(ctx context.Context, appID, revisionID string, revisionNumber int64) (ExecutionConfiguration, error) {
+	if !validUUID(appID) || revisionNumber < 0 || (revisionNumber == 0) != (revisionID == "") {
+		return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+	}
+
+	var entries map[string]bundleEntry
+	if revisionNumber == 0 {
+		var exists int
+		if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM applications WHERE id=? AND archived_at IS NULL`, appID).Scan(&exists); err != nil {
+			return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+		}
+		entries = map[string]bundleEntry{}
+	} else {
+		b, err := s.readBundle(ctx, appID, revisionID, revisionNumber)
+		if err != nil {
+			return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+		}
+		entries = b.Entries
+	}
+
+	environment := []byte("# hostd application configuration\n")
+	secretOrigins := make([]SecretOrigin, 0)
+	for _, key := range sortedBundleKeys(entries) {
+		entry := entries[key]
+		environment = append(environment, key...)
+		environment = append(environment, '=')
+		environment = appendDotenvSingleQuoted(environment, entry.Value)
+		environment = append(environment, '\n')
+		if entry.Sensitive && entry.Value != "" {
+			secretOrigins = append(secretOrigins, SecretOrigin{
+				RevisionID:     revisionID,
+				RevisionNumber: revisionNumber,
+				Key:            append([]byte(nil), key...),
+				Value:          append([]byte(nil), entry.Value...),
+			})
+		}
+	}
+	return ExecutionConfiguration{RevisionID: revisionID, RevisionNumber: revisionNumber, Environment: environment, SecretOrigins: secretOrigins}, nil
+}
+
+// ExportCurrentForExecution resolves the current head once, then delegates to
+// exact-revision export so concurrent configuration changes cannot alter it.
+func (s *Store) ExportCurrentForExecution(ctx context.Context, appID string) (ExecutionConfiguration, error) {
+	if !validUUID(appID) {
+		return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+	}
+	var revisionID sql.NullString
+	var revisionNumber int64
+	if err := s.db.QueryRowContext(ctx, `SELECT h.revision_id,h.revision_number FROM application_configuration_heads h JOIN applications a ON a.id=h.app_id AND a.archived_at IS NULL WHERE h.app_id=?`, appID).Scan(&revisionID, &revisionNumber); err != nil {
+		return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+	}
+	return s.ExportRevisionForExecution(ctx, appID, revisionID.String, revisionNumber)
+}
+
+func sortedBundleKeys(entries map[string]bundleEntry) []string {
+	keys := make([]string, 0, len(entries))
+	for key := range entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func appendDotenvSingleQuoted(destination []byte, value string) []byte {
+	destination = append(destination, '\'')
+	for _, character := range []byte(value) {
+		if character == '\'' {
+			destination = append(destination, '\\')
+		}
+		destination = append(destination, character)
+	}
+	return append(destination, '\'')
 }
 
 func (s *Store) Replace(ctx context.Context, appID, actorID string, input ReplaceInput) (Configuration, error) {
@@ -338,6 +450,9 @@ func (s *Store) bundlePath(appID, revisionID string) string {
 }
 
 func safeDirectory(path string, create bool) error {
+	if pathsecurity.RejectWindowsNamespace(path) {
+		return errors.New("unsafe application configuration path namespace")
+	}
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) && create {
 		if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {

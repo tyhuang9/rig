@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/hostd/hostd/internal/githubapp"
+	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/sourceconnections"
 	"gopkg.in/yaml.v3"
 )
@@ -120,7 +121,7 @@ func InspectGitHub(ctx context.Context, reader GitHubReader, owner string, sourc
 
 func InspectLocal(sourcePath string) (Result, error) {
 	sourcePath = strings.TrimSpace(sourcePath)
-	if sourcePath == "" {
+	if sourcePath == "" || pathsecurity.RejectWindowsNamespace(sourcePath) {
 		return Result{}, &Error{Code: "invalid_source"}
 	}
 	absolute, err := filepath.Abs(sourcePath)
