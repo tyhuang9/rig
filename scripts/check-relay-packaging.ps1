@@ -620,6 +620,29 @@ function Test-ExactMapKeys {
     return $true
 }
 
+function Test-ExactEffectiveNetworkKeys {
+    param(
+        [object]$Map,
+        [string[]]$Expected
+    )
+    if ($Map -isnot [System.Collections.IDictionary]) {
+        return $false
+    }
+    $expectedKeys = @($Expected)
+    $ipamKeys = @($Map.Keys | Where-Object { [string]$_ -ieq 'ipam' })
+    if ($ipamKeys.Count -gt 0) {
+        if ($ipamKeys.Count -ne 1 -or [string]$ipamKeys[0] -cne 'ipam') {
+            return $false
+        }
+        $ipam = $Map[$ipamKeys[0]]
+        if ($ipam -isnot [System.Collections.IDictionary] -or $ipam.Count -ne 0) {
+            return $false
+        }
+        $expectedKeys += 'ipam'
+    }
+    return Test-ExactMapKeys -Map $Map -Expected $expectedKeys
+}
+
 function Test-ExactStringArray {
     param(
         [object]$Value,
@@ -670,6 +693,69 @@ function ConvertTo-HashtableModel {
     return $Value
 }
 
+function Test-StrictJSONSyntax {
+    param([string]$Json)
+    $options = [System.Text.Json.JsonDocumentOptions]::new()
+    $options.AllowTrailingCommas = $false
+    $options.CommentHandling = [System.Text.Json.JsonCommentHandling]::Disallow
+    $document = $null
+    try {
+        $document = [System.Text.Json.JsonDocument]::Parse($Json, $options)
+        return $true
+    }
+    catch [System.Text.Json.JsonException] {
+        return $false
+    }
+    finally {
+        if ($null -ne $document) {
+            $document.Dispose()
+        }
+    }
+}
+
+function Get-JSONIPAMPropertyTokens {
+    param([string]$Json)
+    $tokens = [System.Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $Json.Length; $index++) {
+        if ($Json[$index] -cne '"') {
+            continue
+        }
+        $start = $index
+        $index++
+        while ($index -lt $Json.Length) {
+            if ($Json[$index] -ceq '\') {
+                $index += 2
+                continue
+            }
+            if ($Json[$index] -ceq '"') {
+                break
+            }
+            $index++
+        }
+        if ($index -ge $Json.Length) {
+            break
+        }
+        $literal = $Json.Substring($start, $index - $start + 1)
+        $cursor = $index + 1
+        while ($cursor -lt $Json.Length -and $Json[$cursor] -in @(' ', "`t", "`r", "`n")) {
+            $cursor++
+        }
+        if ($cursor -ge $Json.Length -or $Json[$cursor] -cne ':') {
+            continue
+        }
+        try {
+            $name = ConvertFrom-Json -InputObject $literal
+        }
+        catch {
+            continue
+        }
+        if ($name -is [string] -and [StringComparer]::OrdinalIgnoreCase.Equals($name, 'ipam')) {
+            $tokens.Add([pscustomobject]@{ Literal = $literal; Name = $name })
+        }
+    }
+    return $tokens.ToArray()
+}
+
 function Test-EffectiveComposeJson {
     param(
         [string]$Json,
@@ -678,6 +764,11 @@ function Test-EffectiveComposeJson {
         [System.Collections.IDictionary]$ExpectedEnvironment
     )
     $errors = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-StrictJSONSyntax $Json)) {
+        Add-CheckError $errors 'compose_effective_json_invalid'
+        return $errors.ToArray()
+    }
+    $rawIPAMTokens = @(Get-JSONIPAMPropertyTokens $Json)
     try {
         $model = ConvertTo-HashtableModel (ConvertFrom-Json -InputObject $Json)
     }
@@ -866,11 +957,29 @@ function Test-EffectiveComposeJson {
         Add-CheckError $errors 'compose_effective_named_volumes'
     }
     if ($model['networks'] -isnot [System.Collections.IDictionary] -or -not (Test-ExactMapKeys -Map $model['networks'] -Expected @('relay-database', 'relay-edge')) -or
-        $model['networks']['relay-database'] -isnot [System.Collections.IDictionary] -or -not (Test-ExactMapKeys -Map $model['networks']['relay-database'] -Expected @('internal', 'name')) -or
-        $model['networks']['relay-edge'] -isnot [System.Collections.IDictionary] -or -not (Test-ExactMapKeys -Map $model['networks']['relay-edge'] -Expected @('external', 'name')) -or
+        -not (Test-ExactEffectiveNetworkKeys -Map $model['networks']['relay-database'] -Expected @('internal', 'name')) -or
+        -not (Test-ExactEffectiveNetworkKeys -Map $model['networks']['relay-edge'] -Expected @('external', 'name')) -or
         $model['networks']['relay-database']['internal'] -ne $true -or [string]$model['networks']['relay-database']['name'] -cne 'rig-relay_relay-database' -or
         $model['networks']['relay-edge']['external'] -ne $true -or
         [string]$model['networks']['relay-edge']['name'] -cne [string]$ExpectedEnvironment['HOSTD_RELAY_EDGE_NETWORK']) {
+        Add-CheckError $errors 'compose_effective_networks'
+    }
+    $acceptedTopLevelIPAMCount = 0
+    if ($model['networks'] -is [System.Collections.IDictionary]) {
+        foreach ($networkName in @('relay-database', 'relay-edge')) {
+            $definition = $model['networks'][$networkName]
+            if ($definition -isnot [System.Collections.IDictionary]) {
+                continue
+            }
+            $exactIPAMKeys = @($definition.Keys | Where-Object { [string]$_ -ceq 'ipam' })
+            if ($exactIPAMKeys.Count -eq 1 -and $definition[$exactIPAMKeys[0]] -is [System.Collections.IDictionary] -and
+                $definition[$exactIPAMKeys[0]].Count -eq 0) {
+                $acceptedTopLevelIPAMCount++
+            }
+        }
+    }
+    $rawIPAMTokensAreExact = @($rawIPAMTokens | Where-Object { [string]$_.Literal -cne '"ipam"' }).Count -eq 0
+    if (-not $rawIPAMTokensAreExact -or $rawIPAMTokens.Count -ne $acceptedTopLevelIPAMCount -or $acceptedTopLevelIPAMCount -gt 2) {
         Add-CheckError $errors 'compose_effective_networks'
     }
     $depends = $relay['depends_on']
@@ -1261,6 +1370,17 @@ function Assert-BehaviorSuccess {
     }
 }
 
+function Assert-BehaviorOnlyError {
+    param(
+        [string]$Name,
+        [string[]]$Errors,
+        [string]$Expected
+    )
+    if ($Errors.Count -ne 1 -or $Errors[0] -cne $Expected) {
+        throw "behavior test failed: $Name (expected only $Expected; got $($Errors -join ','))"
+    }
+}
+
 function Invoke-PackagingBehaviorTests {
     $context = New-FakePreflightContext
     $errors = @(Invoke-EffectiveComposePreflight 'baseline' $context.Anchor $context.EnvironmentPath $context.SecretsPath 'compose.yaml' 'compose.direct-tls.yaml' $context.Adapter $context.Anchor)
@@ -1269,6 +1389,26 @@ function Invoke-PackagingBehaviorTests {
     $directContext = New-FakePreflightContext -DirectTLS
     $errors = @(Invoke-EffectiveComposePreflight 'direct-tls' $directContext.Anchor $directContext.EnvironmentPath $directContext.SecretsPath 'compose.yaml' 'compose.direct-tls.yaml' $directContext.Adapter $directContext.Anchor)
     Assert-BehaviorSuccess 'valid direct TLS preflight' $errors
+
+    $testContext = New-FakePreflightContext
+    $originalJSON = $testContext.State.ComposeJSON
+    $databaseSource = '"internal":true,"name":"rig-relay_relay-database"'
+    $databaseDestination = '"internal":true,"name":"rig-relay_relay-database","ipam":{}'
+    $edgeSource = '"external":true,"name":"rig-relay-edge"'
+    $edgeDestination = '"external":true,"name":"rig-relay-edge","ipam":{}'
+    if ([regex]::Matches($originalJSON, [regex]::Escape($databaseSource)).Count -ne 1 -or
+        [regex]::Matches($originalJSON, [regex]::Escape($edgeSource)).Count -ne 1) {
+        throw 'behavior test failed: normalized empty IPAM fixture source fragments were not unique'
+    }
+    $testContext.State.ComposeJSON = $originalJSON.Replace($databaseSource, $databaseDestination).Replace($edgeSource, $edgeDestination)
+    if ($testContext.State.ComposeJSON -ceq $originalJSON -or
+        [regex]::Matches($testContext.State.ComposeJSON, [regex]::Escape($databaseDestination)).Count -ne 1 -or
+        [regex]::Matches($testContext.State.ComposeJSON, [regex]::Escape($edgeDestination)).Count -ne 1 -or
+        [regex]::Matches($testContext.State.ComposeJSON, [regex]::Escape('"ipam":{}')).Count -ne 2) {
+        throw 'behavior test failed: normalized empty IPAM fixture mutation was not exact'
+    }
+    $errors = @(Invoke-EffectiveComposePreflight 'baseline' $testContext.Anchor $testContext.EnvironmentPath $testContext.SecretsPath 'compose.yaml' 'compose.direct-tls.yaml' $testContext.Adapter $testContext.Anchor)
+    Assert-BehaviorSuccess 'valid baseline preflight with normalized empty IPAM' $errors
 
     foreach ($serviceName in @('postgres', 'relay')) {
         foreach ($key in @('extra_hosts', 'dns', 'dns_search', 'links', 'external_links', 'hostname', 'domainname', 'network_mode', 'pid', 'ipc', 'cgroup', 'runtime', 'devices', 'device_cgroup_rules', 'privileged', 'cap_add', 'build', 'pull_policy', 'configs', 'env_file', 'credential_spec', 'extends', 'profiles', 'unknown_effective_key')) {
@@ -1292,6 +1432,116 @@ function Invoke-PackagingBehaviorTests {
     $model['services']['relay']['networks']['relay-edge'] = @{ aliases = @('api.github.com') }
     $errors = @(Test-EffectiveComposeJson (ConvertTo-JSONText $model) -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
     Assert-BehaviorErrors 'reject network alias rebind' $errors 'compose_effective_networks'
+
+    $testContext = New-FakePreflightContext
+    $testContext.State.ComposeJSON = $testContext.State.ComposeJSON.Replace('"relay-edge":{}', '"relay-edge":{"ipam":{}}')
+    $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+    Assert-BehaviorOnlyError 'reject service network attachment IPAM' $errors 'compose_effective_networks'
+
+    foreach ($networkName in @('relay-database', 'relay-edge')) {
+        foreach ($mutation in @(
+            @{ Name = 'configured IPAM'; Value = @{ config = @(@{ subnet = '198.51.100.0/24' }) } },
+            @{ Name = 'IPAM driver'; Value = @{ driver = 'default' } },
+            @{ Name = 'unknown IPAM field'; Value = @{ unreviewed = @{} } },
+            @{ Name = 'scalar IPAM'; Value = 'default' },
+            @{ Name = 'array IPAM'; Value = @() },
+            @{ Name = 'null IPAM'; Value = $null }
+        )) {
+            $testContext = New-FakePreflightContext
+            $networkDefinition = if ($networkName -eq 'relay-database') {
+                '"internal":true,"name":"rig-relay_relay-database"'
+            }
+            else {
+                '"external":true,"name":"rig-relay-edge"'
+            }
+            $ipamJson = if ($null -eq $mutation.Value) { 'null' } else { ConvertTo-JSONText $mutation.Value }
+            $testContext.State.ComposeJSON = $testContext.State.ComposeJSON.Replace($networkDefinition, "$networkDefinition,`"ipam`":$ipamJson")
+            $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+            Assert-BehaviorOnlyError "reject $networkName $($mutation.Name)" $errors 'compose_effective_networks'
+        }
+
+        foreach ($ipamKey in @('IPAM', 'Ipam')) {
+            $testContext = New-FakePreflightContext
+            $networkDefinition = if ($networkName -eq 'relay-database') {
+                '"internal":true,"name":"rig-relay_relay-database"'
+            }
+            else {
+                '"external":true,"name":"rig-relay-edge"'
+            }
+            $testContext.State.ComposeJSON = $testContext.State.ComposeJSON.Replace($networkDefinition, "$networkDefinition,`"$ipamKey`":{}")
+            $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+            Assert-BehaviorOnlyError "reject $networkName case-variant $ipamKey" $errors 'compose_effective_networks'
+        }
+
+        $testContext = New-FakePreflightContext
+        $networkDefinition = if ($networkName -eq 'relay-database') {
+            '"internal":true,"name":"rig-relay_relay-database"'
+        }
+        else {
+            '"external":true,"name":"rig-relay-edge"'
+        }
+        $testContext.State.ComposeJSON = $testContext.State.ComposeJSON.Replace($networkDefinition, "$networkDefinition,`"ip\u0061m`":{}")
+        $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+        Assert-BehaviorOnlyError "reject $networkName escaped IPAM key" $errors 'compose_effective_networks'
+
+        foreach ($duplicateMembers in @(
+            '"ipam":{},"ipam":{"driver":"default"}',
+            '"ipam":{"driver":"default"},"ipam":{}'
+        )) {
+            $testContext = New-FakePreflightContext
+            $networkDefinition = if ($networkName -eq 'relay-database') {
+                '"internal":true,"name":"rig-relay_relay-database"'
+            }
+            else {
+                '"external":true,"name":"rig-relay-edge"'
+            }
+            $testContext.State.ComposeJSON = $testContext.State.ComposeJSON.Replace($networkDefinition, "$networkDefinition,$duplicateMembers")
+            $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+            Assert-BehaviorOnlyError "reject $networkName duplicate IPAM members $duplicateMembers" $errors 'compose_effective_networks'
+        }
+
+        foreach ($mutation in @(
+            @{ Name = 'single-quoted IPAM property'; Members = '''ipam'':{}' },
+            @{ Name = 'unquoted IPAM property'; Members = 'ipam:{}' }
+        )) {
+            $testContext = New-FakePreflightContext
+            $networkDefinition = if ($networkName -eq 'relay-database') {
+                '"internal":true,"name":"rig-relay_relay-database"'
+            }
+            else {
+                '"external":true,"name":"rig-relay-edge"'
+            }
+            $testContext.State.ComposeJSON = $testContext.State.ComposeJSON.Replace($networkDefinition, "$networkDefinition,$($mutation.Members)")
+            $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+            Assert-BehaviorOnlyError "reject $networkName $($mutation.Name)" $errors 'compose_effective_json_invalid'
+        }
+
+        $testContext = New-FakePreflightContext
+        $networkDefinition = if ($networkName -eq 'relay-database') {
+            '"internal":true,"name":"rig-relay_relay-database"'
+        }
+        else {
+            '"external":true,"name":"rig-relay-edge"'
+        }
+        $testContext.State.ComposeJSON = $testContext.State.ComposeJSON.Replace($networkDefinition, "$networkDefinition,`"attachable`":true")
+        $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+        Assert-BehaviorOnlyError "reject $networkName extra network key" $errors 'compose_effective_networks'
+
+        $testContext = New-FakePreflightContext
+        $testContext.State.ComposeJSON = $testContext.State.ComposeJSON.Replace($networkDefinition, "$networkDefinition,`"ipam`":{},`"attachable`":true")
+        $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+        Assert-BehaviorOnlyError "reject $networkName empty IPAM with extra network key" $errors 'compose_effective_networks'
+    }
+
+    $testContext = New-FakePreflightContext
+    $testContext.State.ComposeJSON = "/* comment */$($testContext.State.ComposeJSON)"
+    $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+    Assert-BehaviorOnlyError 'reject JSON comment' $errors 'compose_effective_json_invalid'
+
+    $testContext = New-FakePreflightContext
+    $testContext.State.ComposeJSON = $testContext.State.ComposeJSON.Substring(0, $testContext.State.ComposeJSON.Length - 1) + ',}'
+    $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+    Assert-BehaviorOnlyError 'reject trailing JSON comma' $errors 'compose_effective_json_invalid'
 
     foreach ($serviceName in @('postgres', 'relay')) {
         $testContext = New-FakePreflightContext
