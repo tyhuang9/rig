@@ -785,6 +785,10 @@ function Test-EffectiveComposeJson {
         command = @(Get-JSONPropertyTokens -Json $Json -PropertyName 'command')
         entrypoint = @(Get-JSONPropertyTokens -Json $Json -PropertyName 'entrypoint')
     }
+    $rawSourceTargetTokens = @{
+        source = @(Get-JSONPropertyTokens -Json $Json -PropertyName 'source')
+        target = @(Get-JSONPropertyTokens -Json $Json -PropertyName 'target')
+    }
     $acceptedServiceNullFields = @{ command = 0; entrypoint = 0 }
     try {
         $model = ConvertTo-HashtableModel (ConvertFrom-Json -InputObject $Json)
@@ -895,6 +899,15 @@ function Test-EffectiveComposeJson {
         }
     }
 
+    $expectedRawSourceTargetCounts = @{ source = 10; target = if ($DirectTLS) { 11 } else { 10 } }
+    foreach ($field in @('source', 'target')) {
+        $rawTokens = @($rawSourceTargetTokens[$field])
+        $exactTokens = @($rawTokens | Where-Object { [string]$_.Literal -ceq ('"' + $field + '"') })
+        if ($rawTokens.Count -ne $expectedRawSourceTargetCounts[$field] -or $exactTokens.Count -ne $expectedRawSourceTargetCounts[$field]) {
+            Add-CheckError $errors 'compose_effective_service_secrets'
+        }
+    }
+
     $postgres = $services['postgres']
     $relay = $services['relay']
     if ([string]$postgres['image'] -cne $postgresReference -or [string]$relay['image'] -cne [string]$ExpectedEnvironment['HOSTD_RELAY_IMAGE']) {
@@ -964,7 +977,8 @@ function Test-EffectiveComposeJson {
             $item = $actual[$index]
             $expected = $expectedServiceSecrets[$serviceName][$index]
             if ($item -isnot [System.Collections.IDictionary] -or -not (Test-ExactMapKeys -Map $item -Expected @('source', 'target')) -or
-                [string]$item['source'] -cne $expected -or [string]$item['target'] -cne $expected) {
+                $item['source'] -isnot [string] -or $item['target'] -isnot [string] -or
+                [string]$item['source'] -cne $expected -or [string]$item['target'] -cne "/run/secrets/$expected") {
                 Add-CheckError $errors 'compose_effective_service_secrets'
             }
         }
@@ -1248,7 +1262,7 @@ function New-EffectiveComposeModel {
         pids_limit = 256
         read_only = $true
         restart = 'unless-stopped'
-        secrets = @([ordered]@{ source = 'postgres_password'; target = 'postgres_password' })
+        secrets = @([ordered]@{ source = 'postgres_password'; target = '/run/secrets/postgres_password' })
         security_opt = @('no-new-privileges:true')
         shm_size = 134217728
         stop_grace_period = '30s'
@@ -1257,7 +1271,7 @@ function New-EffectiveComposeModel {
         volumes = @([ordered]@{ source = 'relay-postgres-data'; target = '/var/lib/postgresql'; type = 'volume'; volume = @{} })
     }
     $relaySecretNames = @('relay_postgres_dsn', 'github_client_secret', 'github_app_private_key', 'github_webhook_secret', 'enrollment_key', 'relay_tls_certificate', 'relay_tls_private_key', 'relay_tls_ca')
-    $relaySecrets = @($relaySecretNames | ForEach-Object { [ordered]@{ source = $_; target = $_ } })
+    $relaySecrets = @($relaySecretNames | ForEach-Object { [ordered]@{ source = $_; target = "/run/secrets/$_" } })
     $relay = [ordered]@{
         cap_drop = @('ALL')
         command = $null
@@ -1445,6 +1459,46 @@ function Invoke-PackagingBehaviorTests {
     $directContext = New-FakePreflightContext -DirectTLS
     $errors = @(Invoke-EffectiveComposePreflight 'direct-tls' $directContext.Anchor $directContext.EnvironmentPath $directContext.SecretsPath 'compose.yaml' 'compose.direct-tls.yaml' $directContext.Adapter $directContext.Anchor)
     Assert-BehaviorSuccess 'valid direct TLS preflight' $errors
+
+    $postgresSecret = '{"source":"postgres_password","target":"/run/secrets/postgres_password"}'
+    $relaySecret = '{"source":"relay_postgres_dsn","target":"/run/secrets/relay_postgres_dsn"}'
+    foreach ($mutation in @(
+        @{ Name = 'old bare secret target'; Source = $postgresSecret; Destination = '{"source":"postgres_password","target":"postgres_password"}' },
+        @{ Name = 'mismatched secret target'; Source = $postgresSecret; Destination = '{"source":"postgres_password","target":"/run/secrets/github_client_secret"}' },
+        @{ Name = 'outside secret target'; Source = $postgresSecret; Destination = '{"source":"postgres_password","target":"/etc/passwd"}' },
+        @{ Name = 'traversal secret target'; Source = $postgresSecret; Destination = '{"source":"postgres_password","target":"/run/secrets/../postgres_password"}' },
+        @{ Name = 'null secret target'; Source = $postgresSecret; Destination = '{"source":"postgres_password","target":null}' },
+        @{ Name = 'scalar secret target'; Source = $postgresSecret; Destination = '{"source":"postgres_password","target":true}' },
+        @{ Name = 'list secret target'; Source = $postgresSecret; Destination = '{"source":"postgres_password","target":[]}' },
+        @{ Name = 'singleton-list secret target'; Source = $postgresSecret; Destination = '{"source":"postgres_password","target":["/run/secrets/postgres_password"]}' },
+        @{ Name = 'wrong secret source'; Source = $postgresSecret; Destination = '{"source":"relay_postgres_dsn","target":"/run/secrets/postgres_password"}' },
+        @{ Name = 'null secret source'; Source = $postgresSecret; Destination = '{"source":null,"target":"/run/secrets/postgres_password"}' },
+        @{ Name = 'boolean secret source'; Source = $postgresSecret; Destination = '{"source":true,"target":"/run/secrets/postgres_password"}' },
+        @{ Name = 'object secret source'; Source = $postgresSecret; Destination = '{"source":{},"target":"/run/secrets/postgres_password"}' },
+        @{ Name = 'singleton-list secret source'; Source = $postgresSecret; Destination = '{"source":["postgres_password"],"target":"/run/secrets/postgres_password"}' },
+        @{ Name = 'secret attachment extra key'; Source = $postgresSecret; Destination = '{"source":"postgres_password","target":"/run/secrets/postgres_password","mode":292}' },
+        @{ Name = 'secret attachment missing source'; Source = $postgresSecret; Destination = '{"target":"/run/secrets/postgres_password"}' },
+        @{ Name = 'secret attachment missing target'; Source = $postgresSecret; Destination = '{"source":"postgres_password"}' },
+        @{ Name = 'case-variant secret source property'; Source = $postgresSecret; Destination = '{"Source":"postgres_password","target":"/run/secrets/postgres_password"}' },
+        @{ Name = 'escaped secret source property'; Source = $postgresSecret; Destination = '{"\u0073ource":"postgres_password","target":"/run/secrets/postgres_password"}' },
+        @{ Name = 'case-variant secret target property'; Source = $postgresSecret; Destination = '{"source":"postgres_password","Target":"/run/secrets/postgres_password"}' },
+        @{ Name = 'escaped secret target property'; Source = $postgresSecret; Destination = '{"source":"postgres_password","\u0074arget":"/run/secrets/postgres_password"}' },
+        @{ Name = 'duplicate secret source with valid final value'; Source = $postgresSecret; Destination = '{"source":"untrusted","source":"postgres_password","target":"/run/secrets/postgres_password"}' },
+        @{ Name = 'duplicate secret source with untrusted final value'; Source = $postgresSecret; Destination = '{"source":"postgres_password","source":"untrusted","target":"/run/secrets/postgres_password"}' },
+        @{ Name = 'duplicate secret target with valid final value'; Source = $postgresSecret; Destination = '{"source":"postgres_password","target":"/run/secrets/untrusted","target":"/run/secrets/postgres_password"}' },
+        @{ Name = 'duplicate secret target with untrusted final value'; Source = $postgresSecret; Destination = '{"source":"postgres_password","target":"/run/secrets/postgres_password","target":"/run/secrets/untrusted"}' }
+    )) {
+        $testContext = New-FakePreflightContext
+        $testContext.State.ComposeJSON = Replace-UniqueJSONFragment $mutation.Name $testContext.State.ComposeJSON $mutation.Source $mutation.Destination
+        $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+        Assert-BehaviorOnlyError "reject $($mutation.Name)" $errors 'compose_effective_service_secrets'
+    }
+
+    $testContext = New-FakePreflightContext
+    $testContext.State.ComposeJSON = Replace-UniqueJSONFragment 'balance duplicate secret target' $testContext.State.ComposeJSON $postgresSecret '{"source":"postgres_password","target":"/run/secrets/untrusted","target":"/run/secrets/postgres_password"}'
+    $testContext.State.ComposeJSON = Replace-UniqueJSONFragment 'balance missing relay secret target' $testContext.State.ComposeJSON $relaySecret '{"source":"relay_postgres_dsn"}'
+    $errors = @(Test-EffectiveComposeJson $testContext.State.ComposeJSON -ExpectedSecretDirectory $testContext.SecretsPath -ExpectedEnvironment $testContext.Environment)
+    Assert-BehaviorOnlyError 'reject balanced secret target count manipulation' $errors 'compose_effective_service_secrets'
 
     $testContext = New-FakePreflightContext
     $originalJSON = $testContext.State.ComposeJSON
