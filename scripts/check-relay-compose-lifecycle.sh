@@ -645,6 +645,7 @@ run_lifecycle() {
   local sanitized_error
   local network_summary
   local service_summary
+  local service_secret_summary
   local compose_version
   local diagnostic_line
 
@@ -709,6 +710,41 @@ run_lifecycle() {
            [[ -n "${compose_version}" && "${compose_version}" != *$'\n'* ]]; then
           diagnostic_line="relay Compose lifecycle service-key summary: compose=${compose_version} model=${service_summary}"
           if [[ "${diagnostic_line}" != *$'\n'* ]] && (( ${#diagnostic_line} <= 2048 )); then
+            printf '%s\n' "${diagnostic_line}" >&2
+          fi
+        fi
+      fi
+    fi
+    if [[ "${sanitized_error}" == *"compose_effective_service_secrets"* ]]; then
+      if service_secret_summary="$(docker compose --env-file "${ENVIRONMENT_FILE}" --file "${COMPOSE_FILE}" \
+        config --format json 2>/dev/null | jq --compact-output '
+          def safe_field_keys:
+            [keys_unsorted[]
+             | if . == "source" or . == "target" or . == "uid" or . == "gid" or . == "mode"
+               then .
+               else "other"
+               end]
+            | unique | sort;
+          def service_secrets($service):
+            (.services[$service].secrets? // []) as $raw
+            | ($raw | if type == "array" then . else [] end) as $attachments
+            | {
+                attachment_count: ($attachments | length),
+                field_key_sets: ([$attachments[] | select(type == "object") | safe_field_keys] | unique | sort),
+                string_source_count: ([$attachments[] | select(type == "object") | select((.source? | type) == "string")] | length),
+                string_target_count: ([$attachments[] | select(type == "object") | select((.target? | type) == "string")] | length),
+                exact_run_secrets_target_count: ([$attachments[] | select(type == "object") | select((.source? | type) == "string" and (.target? | type) == "string") | select(.target == ("/run/secrets/" + .source))] | length),
+                absolute_run_secrets_target_count: ([$attachments[] | select(type == "object") | select((.target? | type) == "string") | select(.target | startswith("/run/secrets/"))] | length)
+              };
+          {postgres: service_secrets("postgres"), relay: service_secrets("relay")}
+        ')"; then
+        if [[ -n "${service_secret_summary}" && "${service_secret_summary}" != *$'\n'* ]] &&
+           (( ${#service_secret_summary} <= 1900 )) &&
+           compose_version="$(docker compose version --short 2>/dev/null)" &&
+           [[ -n "${compose_version}" && "${compose_version}" != *$'\n'* && "${compose_version}" =~ ^v?[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}([.-][0-9A-Za-z.-]{1,32})?$ ]] &&
+           (( ${#compose_version} <= 64 )); then
+          diagnostic_line="relay Compose lifecycle service-secret shape: compose=${compose_version} model=${service_secret_summary}"
+          if [[ -n "${diagnostic_line}" && "${diagnostic_line}" != *$'\n'* ]] && (( ${#diagnostic_line} <= 2048 )); then
             printf '%s\n' "${diagnostic_line}" >&2
           fi
         fi
