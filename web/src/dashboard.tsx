@@ -14,6 +14,7 @@ import {
 } from "./api";
 import { SourceWizard } from "./source-wizard";
 import { ApplicationConfigurationPanel } from "./application-configuration";
+import { DeploymentHistoryPanel } from "./deployment-history";
 import { UnsavedChangesGuard, useConfirmDiscard } from "./unsaved-changes";
 
 type IconName = "apps" | "machines" | "activity" | "logout";
@@ -145,7 +146,7 @@ function ApplicationRow({ app }: { app: Application }) {
   return <article className="app-row">
     <div className="app-primary"><div className="title-line"><strong title={app.name}>{app.name}</strong><StatusText value={app.status}/></div><span className="muted" title={app.description}>{app.description || "No description"}</span></div>
     <Meta label="Machine" value={app.machineName || "Local machine"}/>
-    <Meta label="Release" value="Not deployed" mono/>
+    <Meta label="Release" value="View details" mono/>
     <Meta label="Created" value={new Date(app.createdAt).toLocaleDateString()}/>
     <NavLink className="button small app-open" aria-label={`Open ${app.name}`} to={`/apps/${app.id}`}>Open</NavLink>
   </article>;
@@ -167,20 +168,20 @@ function ApplicationDetailPage() {
   const { id = "" } = useParams();
   const appQuery = useQuery({ queryKey: ["app", id], queryFn: () => api.app(id) });
   const statusQuery = useQuery({ queryKey: ["system-status"], queryFn: api.status });
-  const deploy = useMutation({ mutationFn: () => api.action(id, "deploy") });
+  const deploymentQuery = useQuery({ queryKey: ["deployments", id], queryFn: () => api.deployments(id) });
   if (appQuery.isLoading || statusQuery.isLoading) return <LoadingState/>;
   if (appQuery.isError) return <QueryError message={appQuery.error.message}/>;
   if (statusQuery.isError) return <QueryError message={statusQuery.error.message}/>;
   if (!appQuery.data || !statusQuery.data) return <QueryError message="The API returned an incomplete response."/>;
   const app = appQuery.data;
   const fakeRuntime = statusQuery.data.capabilities.fakeRuntime;
+  const currentDeployment = deploymentQuery.data?.items[0];
   return <>
-    <PageHeader title={app.name} subtitle={`${app.machineName || "Local machine"} · ${app.status}`} action={fakeRuntime ? <button className="button primary" onClick={() => deploy.mutate()} disabled={deploy.isPending}>{deploy.isPending ? "Queuing…" : "Deploy with fake runtime"}</button> : undefined}/>
+    <PageHeader title={app.name} subtitle={`${app.machineName || "Local machine"} · ${app.status}`}/>
     <p className="section-kicker">Overview</p>
-    <div className="summary"><article><small>Current state</small><strong><StatusText value={app.status}/></strong><span>Durable control record</span></article><article><small>Source</small><strong className="mono">{app.slug}</strong><span>Runtime is not inferred</span></article><article><small>Health</small><strong>Not verified</strong><span>No real workload has run</span></article></div>
-    {fakeRuntime ? <div className="callout warning"><strong>Development capability</strong><span>The fake runtime persists job progress but executes no workload.</span></div> : <div className="callout info"><strong>Runtime actions unavailable</strong><span>Start hostd with the explicit development fake-runtime flag to exercise job orchestration.</span></div>}
-    {deploy.data && <div className="callout success" role="status">Deployment job queued: <span className="mono">{deploy.data.job.id}</span></div>}
-    {deploy.error && <div className="callout danger" role="alert">{deploy.error.message}</div>}
+    <div className="summary"><article><small>Current deployment</small><strong>{currentDeployment ? <StatusText value={currentDeployment.status}/> : deploymentQuery.isLoading ? "Loading..." : "Not deployed"}</strong><span>{currentDeployment ? `Configuration ${currentDeployment.configurationMode}` : deploymentQuery.isError ? "History unavailable" : "No deployment record"}</span></article><article><small>Source</small><strong className="mono">{app.slug}</strong><span>Runtime is not inferred</span></article><article><small>Health</small><strong>Not verified</strong><span>Health reporting is not available</span></article></div>
+    {fakeRuntime ? <div className="callout warning"><strong>Development capability</strong><span>The fake runtime persists job progress but executes no workload.</span></div> : !statusQuery.data.capabilities.composeRuntime && <div className="callout info"><strong>Runtime actions unavailable</strong><span>Configure a runtime to deploy this application.</span></div>}
+    <DeploymentHistoryPanel appId={id} composeRuntime={statusQuery.data.capabilities.composeRuntime} fakeRuntime={fakeRuntime}/>
     <ApplicationConfigurationPanel appId={id}/>
   </>;
 }

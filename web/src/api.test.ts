@@ -136,4 +136,26 @@ describe("API client", () => {
       expect.objectContaining({ body: JSON.stringify({ githubSource: { connectionId: "a", installationId: 1, repositoryId: 2, branch: "main", composePath: "compose.yaml" } }) }),
     );
   });
+
+  it("uses generated deployment and approval operation paths with CSRF and deploy idempotency", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ created: true, job: { id: "job-1" } }), { status: 202 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ created: true, job: { id: "job-2" } }), { status: 202 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ created: true, approval: { id: "approval-1" } }), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ approval: { id: "approval-1" } }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ job: { id: "job-1" } }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.deployments("app/one"); await api.releases("app/one"); await api.runtimeApprovals("app/one");
+    await api.deployApplication("app/one"); await api.deployRelease("app/one", "release/one", { configurationMode: "original" });
+    await api.grantRuntimeApproval("app/one", { fingerprint: "a".repeat(64) }); await api.revokeRuntimeApproval("app/one", "approval/one"); await api.resumeJob("job/one");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/v1/apps/app%2Fone/deployments", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token", "Idempotency-Key": expect.any(String) }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(5, "/api/v1/apps/app%2Fone/releases/release%2Fone/deployments", expect.objectContaining({ method: "POST", body: JSON.stringify({ configurationMode: "original" }), headers: expect.objectContaining({ "Idempotency-Key": expect.any(String) }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(6, "/api/v1/apps/app%2Fone/runtime-approvals", expect.objectContaining({ method: "POST", headers: expect.not.objectContaining({ "Idempotency-Key": expect.any(String) }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(8, "/api/v1/jobs/job%2Fone/resume", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+  });
 });

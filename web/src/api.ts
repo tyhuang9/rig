@@ -7,6 +7,8 @@ import {
   type BootstrapStatus,
   type CreateApplicationRequest,
   type CSRFResponse,
+  type DeploymentList,
+  type DeployReleaseRequest,
   type GitHubBranchPage,
   type GitHubDeviceAuthorization,
   type GitHubInstallationPage,
@@ -20,6 +22,11 @@ import {
   type MachineList,
   type MeResponse,
   type ReplaceApplicationConfigurationRequest,
+  type ReleaseList,
+  type RuntimeApprovalList,
+  type RuntimeApprovalMutationResponse,
+  type RuntimeApprovalResponse,
+  type GrantRuntimeApprovalRequest,
   type SessionResponse,
   type SourceConnection,
   type SourceConnectionList,
@@ -43,6 +50,9 @@ export type {
   SystemStatus,
   User,
   ReplaceApplicationConfigurationRequest,
+  Deployment,
+  Release,
+  RuntimeApproval,
 } from "./generated/api-contract";
 
 export class APIError extends Error {
@@ -150,7 +160,7 @@ export const api = {
   logout: () => request<void>(operations.logout.path, { method: "DELETE" }),
   status: () => request<SystemStatus>(operations.systemStatus.path),
   apps: () => request<ApplicationList>(operations.listApplications.path),
-  app: (id: string) => request<Application>(`/api/v1/apps/${id}`),
+  app: (id: string) => request<Application>(operationPath(operations.getApplication.path, { appId: id })),
   applicationConfiguration: (id: string) =>
     request<ApplicationConfiguration>(operationPath(operations.getApplicationConfiguration.path, { appId: id })),
   replaceApplicationConfiguration: (id: string, data: ReplaceApplicationConfigurationRequest) =>
@@ -191,8 +201,38 @@ export const api = {
   machines: () => request<MachineList>(operations.listMachines.path),
   jobs: () => request<JobList>(operations.listJobs.path),
   cancelJob: (id: string) =>
-    request<JobResponse>(operations.cancelJob.path.replace("{jobId}", encodeURIComponent(id)), {
+    request<JobResponse>(operationPath(operations.cancelJob.path, { jobId: id }), {
       method: operations.cancelJob.method,
+    }),
+  deployments: (appId: string) =>
+    request<DeploymentList>(operationPath(operations.listDeployments.path, { appId })),
+  releases: (appId: string) =>
+    request<ReleaseList>(operationPath(operations.listReleases.path, { appId })),
+  runtimeApprovals: (appId: string) =>
+    request<RuntimeApprovalList>(operationPath(operations.listRuntimeApprovals.path, { appId })),
+  deployApplication: (appId: string) =>
+    request<JobMutationResponse>(operationPath(operations.deployApplication.path, { appId }), {
+      method: operations.deployApplication.method,
+      headers: { "Idempotency-Key": crypto.randomUUID() },
+    }),
+  deployRelease: (appId: string, releaseId: string, data: DeployReleaseRequest) =>
+    request<JobMutationResponse>(operationPath(operations.deployRelease.path, { appId, releaseId }), {
+      method: operations.deployRelease.method,
+      body: JSON.stringify(data),
+      headers: { "Idempotency-Key": crypto.randomUUID() },
+    }),
+  grantRuntimeApproval: (appId: string, data: GrantRuntimeApprovalRequest) =>
+    request<RuntimeApprovalMutationResponse>(operationPath(operations.grantRuntimeApproval.path, { appId }), {
+      method: operations.grantRuntimeApproval.method,
+      body: JSON.stringify(data),
+    }),
+  revokeRuntimeApproval: (appId: string, approvalId: string) =>
+    request<RuntimeApprovalResponse>(operationPath(operations.revokeRuntimeApproval.path, { appId, approvalId }), {
+      method: operations.revokeRuntimeApproval.method,
+    }),
+  resumeJob: (jobId: string) =>
+    request<JobResponse>(operationPath(operations.resumeJob.path, { jobId }), {
+      method: operations.resumeJob.method,
     }),
   action: (id: string, type: "deploy" | "start" | "stop" | "restart") =>
     request<JobMutationResponse>(`/api/v1/apps/${id}/${type === "deploy" ? "deployments" : type}`, {
