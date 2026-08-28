@@ -7,8 +7,8 @@ Rig can deploy a selected GitHub.com repository without a user-managed checkout 
 - GitHub.com is the only provider/host in v1.
 - A GitHub App device connection and its rotating user credential stay on the controller in purpose-bound protected files. SQLite contains safe identity, status, and expiry metadata only.
 - Sources are either `local` or `github`. A GitHub source binds a connection, installation ID, immutable repository ID, display owner/name, tracked branch, and normalized repository-relative Compose path.
-- Automatic deployment is disabled per application by default. Manual deployment remains available when the relay is unavailable.
-- Docker Compose execution is disabled unless `hostd` starts with `--compose-runtime`; `--fake-runtime` remains isolated development behavior.
+- Automatic deployment is disabled per application by default. The relay is optional: a relay outage leaves GitHub-connected manual deployment operable.
+- Docker Compose execution is disabled unless `hostd` starts with `--compose-runtime`; `--fake-runtime` remains isolated development behavior. This flag enables execution only; it does not configure GitHub or the relay.
 - Elevated Compose capabilities and LAN/public port bindings require an exact administrator approval. Workspace escapes and unsupported remote resources are rejected.
 - A failed deployment preserves diagnostics and release state. Rig never rolls back automatically.
 
@@ -17,10 +17,19 @@ V1 does not expand submodules or Git LFS, fetch Git history, deploy pull-request
 ## Controller setup
 
 1. Register/configure the official GitHub App with device flow, repository Contents read/metadata access, and the `push`, `installation`, and `installation_repositories` events described in [the relay runbook](relay-operations.md#github-app-prerequisites).
-2. Start `hostd` with an absolute data root. Add `--compose-runtime` only on a controller whose local Docker endpoint and administrator trust boundary are ready.
-3. Bootstrap and sign in as the local administrator.
-4. In **Add application**, choose **GitHub**, start device authorization, complete the GitHub page, then select an accessible installation, repository, branch, and discovered Compose file.
-5. Create the application, add visible/secret configuration as needed, and use **Deploy latest**. The resulting release records the resolved commit SHA, archive hash, Compose path, managed workspace state, and configuration revision without credentials.
+2. Start `hostd` with an absolute data root. GitHub connection and optional manual GitHub deployment require the public pair `--github-client-id` and `--github-app-slug`. They must be supplied together; supplying either one alone, or an invalid client ID or slug, fails startup before the controller begins serving.
+3. Add `--compose-runtime` only when this controller is authorized to execute its selected application's Docker Compose workload through its local Docker endpoint. It is required to execute a manual deployment, but it neither enables GitHub connection nor automatic deployment.
+4. Bootstrap and sign in as the local administrator.
+5. In **Add application**, choose **GitHub**, start device authorization, complete the GitHub page, then select an accessible installation, repository, branch, and discovered Compose file.
+6. Create the application, add visible/secret configuration as needed, and use **Deploy latest**. The resulting release records the resolved commit SHA, archive hash, Compose path, managed workspace state, and configuration revision without credentials.
+
+For a GitHub-connected controller that can execute manual deployments, use the public GitHub pair with the execution flag:
+
+```powershell
+hostd --data-root <absolute-data-root> --github-client-id <public-client-id> --github-app-slug <github-app-slug> --compose-runtime
+```
+
+The client ID and slug are public identifiers; do not place any secret in this command.
 
 If authorization expires or repository access is removed, reconnect before inspection/deployment. Rig returns a stable local problem code and never forwards the provider response body.
 
@@ -38,6 +47,14 @@ Neither choice removes or rolls back the failed workload automatically. See [Doc
 ## Relay enrollment and automatic deployment
 
 Deploy the official relay from [the relay operations runbook](relay-operations.md). The relay uses PostgreSQL-authoritative state; cloud account, DNS, region, certificates, backups, and live provisioning are operator responsibilities.
+
+Relay-driven event delivery and controller pairing require both `--controller-relay` and `--relay-origin`. The pair is all-or-nothing: either flag alone fails startup. `--relay-origin` must be a canonical absolute HTTPS origin (host only, with no user information, path, query, fragment, noncanonical host representation, or explicit default port); an invalid origin also fails startup. Omitting both relay flags disables relay connectivity and relay event delivery, but is not a kill switch for already enabled durable auto-deploy or reconciliation; use the per-application auto-deploy control to turn off future automatic deployments, and handle any already active deployment job separately. These relay flags do not replace the GitHub pair or `--compose-runtime`: GitHub source access still needs `--github-client-id` with `--github-app-slug`, and workload execution still needs `--compose-runtime`.
+
+To enable relay-driven event delivery and controller pairing, add the relay pair to the same controller invocation:
+
+```powershell
+hostd --data-root <absolute-data-root> --github-client-id <public-client-id> --github-app-slug <github-app-slug> --compose-runtime --controller-relay --relay-origin https://relay.example.invalid
+```
 
 In the dashboard **Relay management** panel:
 
@@ -63,4 +80,4 @@ Run these checks in a disposable staging environment with synthetic credentials 
 6. Open and deploy an existing local-source application to verify backfill compatibility.
 7. Scan controller/relay databases, protected-file metadata, jobs, events, audits, logs, metrics, problem responses, image layers, and PostgreSQL backups for synthetic GitHub token prefixes and submitted secrets. Relay storage must also exclude source archives, Compose/configuration documents, application names, and raw webhook bodies.
 
-Repository and hosted workflows provide deterministic validation, persistence, protocol, UI, and failure-path evidence. Hosted coverage includes Chromium execution of the embedded-hostd and GitHub source-wizard flows, Linux race tests, real-filesystem permission/no-follow tests, a native linux/amd64 relay image, and PostgreSQL integration tests; the result of each hosted run remains visible in CI. Live GitHub and Docker acceptance, PostgreSQL restore, TLS/proxy, relay recovery/load, container hardening, multi-architecture images, SBOM/signature/provenance, additional browsers and physical devices, and assistive-technology checks remain promotion gates listed in [TASKS.md](../TASKS.md#external-promotion-gates).
+Repository and hosted workflows provide deterministic validation, persistence, protocol, UI, and failure-path evidence. Hosted coverage includes Chromium execution of the embedded-hostd and GitHub source-wizard flows, Windows controller coverage, a real Linux relay Docker Compose lifecycle, Linux race tests, real-filesystem permission/no-follow tests, a native linux/amd64 relay image, and PostgreSQL integration tests; the result of each hosted run remains visible in CI. Live controller-application Docker Compose execution and live GitHub remain external promotion gates, alongside PostgreSQL restore, TLS/proxy, relay recovery/load, container hardening, multi-architecture images, SBOM/signature/provenance, additional browsers and physical devices, and assistive-technology checks listed in [TASKS.md](../TASKS.md#external-promotion-gates).

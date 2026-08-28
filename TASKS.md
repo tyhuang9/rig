@@ -25,7 +25,7 @@
 ## External promotion gates
 
 - [ ] Exercise the private-repository, live GitHub App, deployed relay, and offline latest-head acceptance flow in staging.
-- [ ] Exercise live Docker Compose mutation, health failure, approval/resume, cancellation, crash recovery, and prior-release recovery on disposable Linux and Windows hosts.
+- [ ] Exercise live controller-application Docker Compose mutation, health failure, approval/resume, cancellation, crash recovery, and prior-release recovery on disposable Linux and Windows hosts.
 - [ ] Exercise live PostgreSQL restore, TLS/SNI proxying, relay recovery/redelivery, reconnect/load behavior, and alert routing beyond hosted PostgreSQL integration tests.
 - [ ] Run container hardening, multi-architecture image, SBOM, signature, and provenance checks beyond hosted Linux race, real-filesystem permission/no-follow, and native linux/amd64 image evidence.
 - [ ] Run additional real-browser, screen-reader, and physical-device coverage beyond the hosted Chromium workflow.
