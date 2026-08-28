@@ -224,7 +224,7 @@ PostgreSQL 18 persists its versioned data directory below the named `/var/lib/po
 
 Pull requests run a hosted Linux lifecycle check against the unmodified baseline `compose.yaml`. The check builds the relay image, deploys it by the immutable digest returned from an isolated local registry, uses protected synthetic credentials and an in-container validated TLS certificate, waits for PostgreSQL and relay readiness, and verifies the complete embedded migration ledger. It then force-recreates only the relay and proves that the PostgreSQL container, named volume, database system identity, migration checksums/timestamps, and a CI-only marker remain unchanged. Captured logs are checked for the synthetic secrets before the fixtures and volume are removed.
 
-This automated check proves the baseline topology on a GitHub-hosted Ubuntu runner; it does not publish a host port. The direct-TLS overlay remains covered by effective-Compose and static contract checks. Public exposure, reverse-proxy behavior, firewall and denial-of-service controls, live GitHub integration, backup/restore, load characteristics, and multi-architecture image promotion remain separate staging or operations gates.
+This automated check is the hosted relay lifecycle evidence for Unit 9 and proves the baseline topology on a GitHub-hosted Ubuntu runner; it does not publish a host port. The direct-TLS overlay remains covered by effective-Compose and static contract checks. Public exposure, reverse-proxy behavior, firewall and denial-of-service controls, live GitHub integration, backup/restore, load characteristics, and multi-architecture image promotion remain separate staging or operations gates.
 
 Inspect only closed process codes and lifecycle phases in logs:
 
