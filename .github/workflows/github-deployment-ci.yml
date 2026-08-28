@@ -1,0 +1,175 @@
+name: GitHub deployment CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+  GOFLAGS: -mod=readonly
+  GOTOOLCHAIN: local
+
+jobs:
+  fast-verification:
+    name: Fast verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+
+      - name: Install frontend dependencies
+        run: pnpm --dir web install --frozen-lockfile
+
+      - name: Run Go tests
+        run: go test -count=1 -timeout=15m ./...
+
+      - name: Run Go vet
+        run: go vet ./...
+
+      - name: Build commands
+        run: go build -trimpath ./cmd/hostd ./cmd/hostctl ./cmd/rig-relay ./cmd/rig-relay-probe
+
+      - name: Type-check frontend
+        run: pnpm --dir web typecheck
+
+      - name: Test frontend
+        run: pnpm --dir web test
+
+      - name: Check generated contracts and migrations
+        run: sh scripts/check-generation.sh
+
+      - name: Check embedded dashboard assets
+        run: sh scripts/check-embedded.sh
+
+  postgres-race:
+    name: PostgreSQL and Linux race verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: docker.io/library/postgres:18.6-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af
+        env:
+          POSTGRES_DB: rig_relay
+          POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --data-checksums
+          POSTGRES_PASSWORD: rig-relay-ci-only
+          POSTGRES_USER: rig_relay
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -q -U rig_relay -d rig_relay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Run PostgreSQL integration tests with race detection
+        env:
+          RIG_RELAY_TEST_DATABASE_URL: "postgresql://rig_relay:rig-relay-ci-only@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/rig_relay?sslmode=disable"
+        run: go test -race -v -count=1 -timeout=20m ./internal/relay/store -run '^TestPostgreSQL'
+
+      - name: Prove PostgreSQL relay outage convergence with race detection
+        shell: bash
+        env:
+          RIG_RELAY_TEST_DATABASE_URL: "postgresql://rig_relay:rig-relay-ci-only@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/rig_relay?sslmode=disable"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          test_name='TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart'
+          package_name='github.com/hostd/hostd/internal/autodeploy'
+          set +e
+          go test -race -json -v -count=1 -timeout=5m ./internal/autodeploy -run "^${test_name}$" | tee "$output" > /dev/null
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          go_status="${pipeline_status[0]:-1}"
+          tee_status="${pipeline_status[1]:-1}"
+          if (( go_status != 0 || tee_status != 0 )); then
+            jq -c --arg package_name "$package_name" 'select(.Action == "fail" and .Package == $package_name) | {Action, Package, Test, Elapsed}' "$output" >&2 || true
+            jq -c --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "output" and .Package == $package_name and .Test == $test_name) | (.Output | capture("(?<Location>relay_outage_integration_test\\.go:[0-9]+:)")) | {Location}' "$output" >&2 || true
+            jq -c --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "output" and .Package == $package_name and .Test == $test_name) | .Output | capture("^[[:space:]]*relay_outage_integration_test\\.go:[0-9]+: timed out waiting for initial authenticated subscription sync: sqlite_active_controller_subscriptions=(?<sqlite_active_controller_subscriptions>-1|0|[1-9][0-9]{0,2}|1000) sqlite_subscription_sync_heads=(?<sqlite_subscription_sync_heads>-1|0|[1-9][0-9]{0,2}|1000) sqlite_inflight_sync_sets=(?<sqlite_inflight_sync_sets>-1|0|[1-9][0-9]{0,2}|1000) postgres_relay_sessions=(?<postgres_relay_sessions>-1|0|[1-9][0-9]{0,2}|1000) postgres_controller_leases=(?<postgres_controller_leases>-1|0|[1-9][0-9]{0,2}|1000) postgres_subscriptions_sync_commands=(?<postgres_subscriptions_sync_commands>-1|0|[1-9][0-9]{0,2}|1000) postgres_current_relay_subscriptions=(?<postgres_current_relay_subscriptions>-1|0|[1-9][0-9]{0,2}|1000) supervisor_state=(?<supervisor_state>(?:disconnected|connecting|authenticating|ready|backoff|needs_attention|stopped|unavailable)?) supervisor_outcome=(?<supervisor_outcome>(?:relay_unavailable|connection_closed|protocol_error|persistence_unavailable|credential_unavailable|identity_unavailable|queue_saturated|session_expired|unavailable)?) supervisor_paused=(?<supervisor_paused>true|false)(?:\\n)?\\z") | {sqlite_active_controller_subscriptions: (.sqlite_active_controller_subscriptions | tonumber), sqlite_subscription_sync_heads: (.sqlite_subscription_sync_heads | tonumber), sqlite_inflight_sync_sets: (.sqlite_inflight_sync_sets | tonumber), postgres_relay_sessions: (.postgres_relay_sessions | tonumber), postgres_controller_leases: (.postgres_controller_leases | tonumber), postgres_subscriptions_sync_commands: (.postgres_subscriptions_sync_commands | tonumber), postgres_current_relay_subscriptions: (.postgres_current_relay_subscriptions | tonumber), supervisor_state: (if .supervisor_state == "" then "empty" else .supervisor_state end), supervisor_outcome: (if .supervisor_outcome == "" then "empty" else .supervisor_outcome end), supervisor_paused: (.supervisor_paused == "true")}' "$output" >&2 || true
+            if (( go_status != 0 )); then
+              exit "$go_status"
+            fi
+            exit "$tee_status"
+          fi
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
+
+      - name: Run repository tests with race detection
+        run: go test -race -count=1 -timeout=30m ./...
+
+  relay-packaging:
+    name: Relay packaging verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Check relay packaging contracts
+        run: pwsh -NoProfile -File scripts/check-relay-packaging.ps1 -SelfTest -BehaviorTest
+
+      - name: Check Linux filesystem protections
+        run: sudo /usr/bin/env HOSTD_RELAY_RUN_LINUX_PREFLIGHT_TESTS=1 /usr/bin/pwsh -NoProfile -File scripts/check-relay-packaging.ps1 -LinuxIntegrationTest
+
+      - name: Build native Linux relay image
+        run: >-
+          docker buildx build
+          --file deploy/relay/Dockerfile
+          --platform linux/amd64
+          --pull
+          --load
+          --provenance=false
+          --sbom=false
+          --tag "rig-relay-ci:${GITHUB_SHA}"
+          .
+
+      - name: Verify relay image metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="rig-relay-ci:${GITHUB_SHA}"
+          actual="$(docker image inspect --format '{{.Os}}/{{.Architecture}}|{{.Config.User}}|{{json .Config.Entrypoint}}' "$image")"
+          expected='linux/amd64|65532:65532|["/usr/local/bin/rig-relay"]'
+          if [[ "$actual" != "$expected" ]]; then
+            printf 'unexpected relay image metadata: %s\n' "$actual" >&2
+            exit 1
+          fi
