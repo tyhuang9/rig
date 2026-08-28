@@ -36,6 +36,7 @@ var (
 	ErrInvalidProgress       = errors.New("invalid job progress")
 	ErrEventBudget           = errors.New("job event budget exhausted")
 	ErrJobNotPaused          = errors.New("job is not waiting for user action")
+	ErrApprovalRequired      = errors.New("job still requires runtime approval")
 	ErrIdempotency           = errors.New("idempotency key conflicts with the original request")
 	ErrApplicationBusy       = errors.New("application already has an active mutation")
 	ErrCancellationRequested = errors.New("job cancellation requested")
@@ -591,18 +592,20 @@ func (s *Service) Resume(id string) (Job, error) {
 		return Job{}, err
 	}
 	defer tx.Rollback()
-	var status string
-	if err := tx.QueryRow(`SELECT status FROM jobs WHERE id=?`, id).Scan(&status); errors.Is(err, sql.ErrNoRows) {
-		return Job{}, ErrJobNotFound
-	} else if err != nil {
-		return Job{}, err
-	}
-	if status != string(WaitingUser) {
-		return Job{}, ErrJobNotPaused
-	}
 	now := s.now().UTC()
 	formattedNow := now.Format(time.RFC3339Nano)
-	result, err := tx.Exec(`UPDATE jobs SET status='queued',phase='queued',progress_percent=0,checkpoint_json='{}',pause_disposition=NULL,error_code=NULL,error_detail=NULL,started_at=NULL,finished_at=NULL,updated_at=? WHERE id=? AND status='waiting_user'`, formattedNow, id)
+	// Make the approval check and requeue one serialized write. A controller-side
+	// preflight would allow an approval revocation to race the state mutation.
+	result, err := tx.Exec(`UPDATE jobs SET status='queued',phase='queued',progress_percent=0,checkpoint_json='{}',pause_disposition=NULL,error_code=NULL,error_detail=NULL,started_at=NULL,finished_at=NULL,updated_at=?
+		WHERE id=? AND status='waiting_user' AND NOT EXISTS (
+			SELECT 1 FROM deployments d
+			JOIN deployment_policy_findings f ON f.deployment_id=d.id AND f.disposition='approval_required'
+			WHERE d.job_id=jobs.id AND d.app_id=jobs.resource_id AND NOT EXISTS (
+				SELECT 1 FROM runtime_approvals a
+				WHERE a.app_id=d.app_id AND a.policy_version=f.policy_version AND a.capability=f.capability
+					AND a.scope=f.scope AND a.fingerprint=f.fingerprint AND a.revoked_at IS NULL
+			)
+		)`, formattedNow, id)
 	if err != nil {
 		return Job{}, err
 	}
@@ -611,6 +614,29 @@ func (s *Service) Resume(id string) (Job, error) {
 		return Job{}, err
 	}
 	if updated != 1 {
+		var status string
+		var missingApproval bool
+		err := tx.QueryRow(`SELECT j.status,EXISTS (
+			SELECT 1 FROM deployments d
+			JOIN deployment_policy_findings f ON f.deployment_id=d.id AND f.disposition='approval_required'
+			WHERE d.job_id=j.id AND d.app_id=j.resource_id AND NOT EXISTS (
+				SELECT 1 FROM runtime_approvals a
+				WHERE a.app_id=d.app_id AND a.policy_version=f.policy_version AND a.capability=f.capability
+					AND a.scope=f.scope AND a.fingerprint=f.fingerprint AND a.revoked_at IS NULL
+			)
+		) FROM jobs j WHERE j.id=?`, id).Scan(&status, &missingApproval)
+		if errors.Is(err, sql.ErrNoRows) {
+			return Job{}, ErrJobNotFound
+		}
+		if err != nil {
+			return Job{}, err
+		}
+		if status != string(WaitingUser) {
+			return Job{}, ErrJobNotPaused
+		}
+		if missingApproval {
+			return Job{}, ErrApprovalRequired
+		}
 		return Job{}, ErrJobNotPaused
 	}
 	if _, err := appendEvent(tx, now, id, "info", "queued", "job_resumed", "Job resumed"); err != nil {
