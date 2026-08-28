@@ -642,6 +642,7 @@ run_lifecycle() {
   local volume_after
   local system_before
   local system_after
+  local sanitized_error
 
   [[ "$(uname -s)" == "Linux" ]] || fail "hosted Linux is required"
   [[ "${CI:-}" == "true" && "${GITHUB_ACTIONS:-}" == "true" ]] || fail "hosted CI guard unavailable"
@@ -669,11 +670,18 @@ run_lifecycle() {
 
   CURRENT_PHASE="packaging-preflight"
   prepare_required_log "${STATE_DIRECTORY}/packaging-preflight.log"
-  pwsh -NoProfile -File "${REPOSITORY_ROOT}/scripts/check-relay-packaging.ps1" \
+  if ! pwsh -NoProfile -File "${REPOSITORY_ROOT}/scripts/check-relay-packaging.ps1" \
     -TrustedDeploymentAnchor "${DEPLOYMENT_ANCHOR}" \
     -EnvironmentFile "${ENVIRONMENT_FILE}" \
     -SecretDirectory "${SECRET_DIRECTORY}" \
-    -DeploymentMode baseline >"${STATE_DIRECTORY}/packaging-preflight.log" 2>&1
+    -DeploymentMode baseline >"${STATE_DIRECTORY}/packaging-preflight.log" 2>&1; then
+    sanitized_error="$(grep --only-matching --extended-regexp 'relay packaging check failed: [a-z0-9_, ]+' \
+      "${STATE_DIRECTORY}/packaging-preflight.log" | tail -n 1 || true)"
+    if [[ -n "${sanitized_error}" ]]; then
+      printf '%s\n' "${sanitized_error}" >&2
+    fi
+    fail "packaging preflight rejected the isolated fixture"
+  fi
   chmod 0600 "${STATE_DIRECTORY}/packaging-preflight.log"
   scan_captured_logs
 
