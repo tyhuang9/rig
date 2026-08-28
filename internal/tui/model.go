@@ -83,24 +83,29 @@ type Model struct {
 	authInputs    []textinput.Model
 	authIndex     int
 
-	suggestions     []string
-	suggestion      int
-	historyValues   []string
-	historyIndex    int
-	draft           string
-	confirm         *confirmation
-	followJobID     string
-	followCursor    int64
-	followCancel    context.CancelFunc
-	followContext   context.Context
-	followEvents    <-chan apicontract.JobEvent
-	followErrors    <-chan error
-	suggestionRects []rect
-	appRects        []rect
-	jobRects        []rect
-	overviewJobRows []apicontract.Job
-	confirmRect     rect
-	cancelRect      rect
+	suggestions          []string
+	suggestion           int
+	historyValues        []string
+	historyIndex         int
+	draft                string
+	confirm              *confirmation
+	bootstrapConfirm     bool
+	bootstrapUsername    string
+	followJobID          string
+	followCursor         int64
+	followGeneration     uint64
+	followCancel         context.CancelFunc
+	followContext        context.Context
+	followEvents         <-chan apicontract.JobEvent
+	followErrors         <-chan error
+	suggestionRects      []rect
+	appRects             []rect
+	jobRects             []rect
+	overviewJobRows      []apicontract.Job
+	confirmRect          rect
+	cancelRect           rect
+	bootstrapConfirmRect rect
+	bootstrapCancelRect  rect
 }
 
 func NewModel(ctx context.Context, client Client, history HistoryStore, endpoint string) *Model {
@@ -165,14 +170,16 @@ type commandResultMsg struct {
 	err      error
 }
 type followOpenedMsg struct {
-	jobID  string
-	events <-chan apicontract.JobEvent
-	errors <-chan error
+	generation uint64
+	jobID      string
+	events     <-chan apicontract.JobEvent
+	errors     <-chan error
 }
 type followEventMsg struct {
-	event apicontract.JobEvent
-	err   error
-	done  bool
+	generation uint64
+	event      apicontract.JobEvent
+	err        error
+	done       bool
 }
 type historySavedMsg struct{ err error }
 type sessionClearedMsg struct{}
@@ -292,11 +299,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case followOpenedMsg:
+		if msg.generation != m.followGeneration {
+			return m, nil
+		}
 		m.followJobID = msg.jobID
 		m.followEvents, m.followErrors = msg.events, msg.errors
 		m.appendEntry(entrySystem, "follow", "Following job "+sanitizeAPIText(msg.jobID)+"; Escape stops local follow.")
 		return m, m.waitForFollow()
 	case followEventMsg:
+		if msg.generation != m.followGeneration {
+			return m, nil
+		}
 		if msg.done {
 			m.stopFollowing(false)
 			return m, nil
@@ -362,6 +375,15 @@ func (m *Model) handleAuthKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.busy {
 		return m, nil
 	}
+	if m.screen == screenBootstrap && m.bootstrapConfirm {
+		switch key.String() {
+		case "enter":
+			return m.submitAuth()
+		case "esc":
+			m.cancelBootstrapConfirmation()
+		}
+		return m, nil
+	}
 	switch key.String() {
 	case "tab", "down":
 		m.focusAuth((m.authIndex + 1) % len(m.authInputs))
@@ -373,6 +395,9 @@ func (m *Model) handleAuthKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.authIndex < len(m.authInputs)-1 {
 			m.focusAuth(m.authIndex + 1)
 			return m, nil
+		}
+		if m.screen == screenBootstrap {
+			return m, m.beginBootstrapConfirmation()
 		}
 		return m.submitAuth()
 	}
@@ -562,20 +587,40 @@ func (m *Model) runAPICommand(cmd command) commandResultMsg {
 		result.body = formatJob(v)
 	case "/deploy":
 		target, _ := m.targetApp(cmd)
-		v, err := m.client.Deploy(m.ctx, target.ID, m.newKey())
+		key, err := m.mutationKey()
+		if err != nil {
+			result.err = err
+			return result
+		}
+		v, err := m.client.Deploy(m.ctx, target.ID, key)
 		result.err, result.job, result.followID = err, &v.Job, v.Job.ID
 		result.body = mutationBody(v)
 	case "/start", "/stop", "/restart":
 		target, _ := m.targetApp(cmd)
-		v, err := m.client.Lifecycle(m.ctx, target.ID, strings.TrimPrefix(cmd.Name, "/"), m.newKey())
+		key, err := m.mutationKey()
+		if err != nil {
+			result.err = err
+			return result
+		}
+		v, err := m.client.Lifecycle(m.ctx, target.ID, strings.TrimPrefix(cmd.Name, "/"), key)
 		result.err, result.job, result.followID = err, &v.Job, v.Job.ID
 		result.body = mutationBody(v)
 	case "/cancel":
-		v, err := m.client.CancelJob(m.ctx, cmd.Args[0], m.newKey())
+		key, err := m.mutationKey()
+		if err != nil {
+			result.err = err
+			return result
+		}
+		v, err := m.client.CancelJob(m.ctx, cmd.Args[0], key)
 		result.err, result.job = err, &v.Job
 		result.body = formatJob(v.Job)
 	case "/resume":
-		v, err := m.client.ResumeJob(m.ctx, cmd.Args[0], m.newKey())
+		key, err := m.mutationKey()
+		if err != nil {
+			result.err = err
+			return result
+		}
+		v, err := m.client.ResumeJob(m.ctx, cmd.Args[0], key)
 		result.err, result.job, result.followID = err, &v.Job, v.Job.ID
 		result.body = formatJob(v.Job)
 	}
@@ -584,13 +629,15 @@ func (m *Model) runAPICommand(cmd command) commandResultMsg {
 
 func (m *Model) startFollowing(jobID string, after int64) tea.Cmd {
 	m.stopFollowing(false)
+	m.followGeneration++
+	generation := m.followGeneration
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.followCancel = cancel
 	m.followContext = ctx
 	m.followCursor = after
 	return func() tea.Msg {
 		events, errs := m.client.FollowJob(ctx, jobID, after)
-		return followOpenedMsg{jobID: jobID, events: events, errors: errs}
+		return followOpenedMsg{generation: generation, jobID: jobID, events: events, errors: errs}
 	}
 }
 
@@ -600,10 +647,11 @@ func (m *Model) waitForFollow() tea.Cmd {
 	if ctx == nil {
 		ctx = m.ctx
 	}
+	generation := m.followGeneration
 	return func() tea.Msg {
 		select {
 		case <-ctx.Done():
-			return followEventMsg{done: true}
+			return followEventMsg{generation: generation, done: true}
 		case event, ok := <-events:
 			if !ok {
 				if errs == nil {
@@ -612,23 +660,24 @@ func (m *Model) waitForFollow() tea.Cmd {
 				select {
 				case err, ok := <-errs:
 					if ok && err != nil {
-						return followEventMsg{err: err}
+						return followEventMsg{generation: generation, err: err}
 					}
 				default:
 				}
-				return followEventMsg{done: true}
+				return followEventMsg{generation: generation, done: true}
 			}
-			return followEventMsg{event: event}
+			return followEventMsg{generation: generation, event: event}
 		case err, ok := <-errs:
 			if ok && err != nil {
-				return followEventMsg{err: err}
+				return followEventMsg{generation: generation, err: err}
 			}
-			return followEventMsg{done: true}
+			return followEventMsg{generation: generation, done: true}
 		}
 	}
 }
 
 func (m *Model) stopFollowing(notify bool) {
+	m.followGeneration++
 	if m.followCancel != nil {
 		m.followCancel()
 		if notify {
@@ -646,7 +695,7 @@ func (m *Model) submitAuth() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
-	m.busy, m.err = true, ""
+	m.busy, m.err, m.bootstrapConfirm, m.bootstrapUsername = true, "", false, ""
 	if m.screen == screenLogin {
 		request := apicontract.LoginRequest{Username: m.authInputs[0].Value(), Passphrase: m.authInputs[1].Value()}
 		m.clearAuthValues()
@@ -658,8 +707,27 @@ func (m *Model) submitAuth() (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) showBootstrap() {
-	m.screen, m.busy, m.err = screenBootstrap, false, ""
+	m.screen, m.busy, m.err, m.bootstrapConfirm, m.bootstrapUsername = screenBootstrap, false, "", false, ""
 	m.authInputs = []textinput.Model{authInput("bootstrap token", true), authInput("admin username", false), authInput("passphrase", true)}
+	m.focusAuth(0)
+}
+
+func (m *Model) beginBootstrapConfirmation() tea.Cmd {
+	for _, input := range m.authInputs {
+		if strings.TrimSpace(input.Value()) == "" {
+			m.err = "All fields are required."
+			return nil
+		}
+	}
+	m.bootstrapConfirm = true
+	m.bootstrapUsername = sanitizeAPIText(m.authInputs[1].Value())
+	m.err = ""
+	return nil
+}
+
+func (m *Model) cancelBootstrapConfirmation() {
+	m.bootstrapConfirm, m.bootstrapUsername = false, ""
+	m.clearAuthValues()
 	m.focusAuth(0)
 }
 
@@ -696,6 +764,14 @@ func (m *Model) clearAuthValues() {
 	for i := range m.authInputs {
 		m.authInputs[i].SetValue("")
 	}
+}
+
+func (m *Model) mutationKey() (string, error) {
+	key := m.newKey()
+	if key == "" {
+		return "", errors.New("could not generate a secure idempotency key; no change was made")
+	}
+	return key, nil
 }
 
 func (m *Model) enterConsole(user apicontract.User) {
@@ -837,7 +913,7 @@ func (m *Model) targetAppName(cmd command) string {
 func randomIdempotencyKey() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return "tui-operation"
+		return ""
 	}
 	return "tui-" + hex.EncodeToString(b)
 }

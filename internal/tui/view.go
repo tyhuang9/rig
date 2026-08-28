@@ -35,6 +35,9 @@ func (m *Model) View() string {
 	case screenOffline:
 		return m.centered(titleStyle.Render("Controller unavailable") + "\n\n" + errorStyle.Render(m.err) + "\n\nPress Enter or r to retry · Ctrl+C to quit")
 	case screenBootstrap:
+		if m.bootstrapConfirm {
+			return m.bootstrapConfirmationView()
+		}
 		return m.authView("Create the first administrator", "Enter the one-time bootstrap token and new administrator credentials.")
 	case screenLogin:
 		return m.authView("Sign in to hostd", "Credentials stay in memory only and are never written to command history.")
@@ -71,6 +74,24 @@ func (m *Model) authView(title, subtitle string) string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panelStyle.Width(boxWidth).Render(b.String()))
 }
 
+func (m *Model) bootstrapConfirmationView() string {
+	content := strings.Join([]string{
+		titleStyle.Render("Confirm administrator creation"),
+		"",
+		"Create administrator " + sanitizeAPIText(m.bootstrapUsername) + "?",
+		"",
+		buttonStyle.Render("Confirm [Enter]") + " " + cancelStyle.Render("Cancel [Esc]"),
+		mutedStyle.Render("Enter confirms · Escape cancels"),
+	}, "\n")
+	boxWidth := min(max(38, m.width-8), 72)
+	box := panelStyle.Width(boxWidth).Render(content)
+	x := max(0, (m.width-lipgloss.Width(box))/2)
+	y := max(0, (m.height-lipgloss.Height(box))/2)
+	m.bootstrapConfirmRect = rect{x + 1, y + 5, 18, 1}
+	m.bootstrapCancelRect = rect{x + 20, y + 5, 16, 1}
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
 func (m *Model) consoleView() string {
 	if m.layout.unsupported {
 		return m.centered(titleStyle.Render("Terminal too small") + "\nResize to at least 32×8\nCtrl+C quits")
@@ -93,6 +114,13 @@ func (m *Model) consoleView() string {
 func (m *Model) tinyConsoleView() string {
 	selected := m.selectedAppName()
 	header := titleStyle.Render("hostd") + " " + mutedStyle.Render(selected)
+	if m.confirm != nil {
+		prompt := cropWidth(errorStyle.Render("CONFIRM: "+m.confirm.Text), m.width)
+		actions := cropWidth(buttonStyle.Render("Confirm [Enter]")+" "+cancelStyle.Render("Cancel [Esc]"), m.width)
+		command := m.commandInput.View()
+		footer := mutedStyle.Render("Enter confirms · Esc cancels · Ctrl+C quits")
+		return cropHeight(strings.Join([]string{header, prompt, actions, command, footer}, "\n"), m.height)
+	}
 	transcript := cropHeight(m.viewport.View(), max(1, m.layout.transcript.h))
 	command := m.commandInput.View()
 	footer := mutedStyle.Render("Enter run · Esc stop follow · Ctrl+C quit")
@@ -195,9 +223,15 @@ func (m *Model) rebuildHitTargets() {
 		m.jobRects = append(m.jobRects, rect{m.layout.overview.x + 1, jobStartY + i, max(1, m.layout.overview.w-2), 1})
 	}
 	if m.confirm != nil {
-		y := m.layout.confirmation.y
-		m.confirmRect = rect{max(0, m.width-29), y, 14, 1}
-		m.cancelRect = rect{max(0, m.width-14), y, 14, 1}
+		if m.layout.tiny {
+			y := m.layout.confirmation.y + 1
+			m.confirmRect = rect{0, y, max(1, m.width/2), 1}
+			m.cancelRect = rect{max(1, m.width/2), y, max(1, m.width-m.width/2), 1}
+		} else {
+			y := m.layout.confirmation.y
+			m.confirmRect = rect{max(0, m.width-29), y, 14, 1}
+			m.cancelRect = rect{max(0, m.width-14), y, 14, 1}
+		}
 	}
 }
 
@@ -213,7 +247,19 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
-	if event.Action != tea.MouseActionPress || event.Button != tea.MouseButtonLeft || m.screen != screenConsole {
+	if event.Action != tea.MouseActionPress || event.Button != tea.MouseButtonLeft {
+		return m, nil
+	}
+	if m.screen == screenBootstrap && m.bootstrapConfirm {
+		if m.bootstrapConfirmRect.contains(event.X, event.Y) {
+			return m.submitAuth()
+		}
+		if m.bootstrapCancelRect.contains(event.X, event.Y) {
+			m.cancelBootstrapConfirmation()
+		}
+		return m, nil
+	}
+	if m.screen != screenConsole {
 		return m, nil
 	}
 	if m.confirm != nil {

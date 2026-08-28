@@ -12,8 +12,10 @@ import (
 )
 
 const (
-	historyLimit   = 100
-	historyPurpose = "hostd-tui-command-history-v1"
+	historyLimit           = 100
+	historyPurpose         = "hostd-tui-command-history-v1"
+	maxHistoryPayloadBytes = 16 << 10
+	maxHistoryEntryBytes   = 512
 )
 
 type HistoryStore interface {
@@ -44,6 +46,9 @@ func (s *protectedHistoryStore) Load(context.Context) ([]string, error) {
 		return nil, err
 	}
 	defer clear(b)
+	if len(b) > maxHistoryPayloadBytes {
+		return nil, errors.New("protected command history payload is too large")
+	}
 	var values []string
 	if err := json.Unmarshal(b, &values); err != nil {
 		return nil, err
@@ -59,6 +64,9 @@ func (s *protectedHistoryStore) Save(_ context.Context, values []string) error {
 		return err
 	}
 	defer clear(b)
+	if len(b) > maxHistoryPayloadBytes {
+		return errors.New("protected command history payload is too large")
+	}
 	return secretfile.Write(s.path, historyPurpose, b)
 }
 
@@ -72,7 +80,7 @@ func normalizeHistory(values []string) []string {
 	out := make([]string, 0, len(values))
 	for _, value := range values {
 		value = strings.TrimSpace(value)
-		if value == "" || strings.ContainsAny(value, "\r\n\x00") {
+		if value == "" || len(value) > maxHistoryEntryBytes || strings.ContainsAny(value, "\r\n\x00") {
 			continue
 		}
 		out = append(out, value)

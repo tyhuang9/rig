@@ -38,7 +38,12 @@ func calculateLayout(width, height, suggestionCount int, confirming bool) layout
 	l := layout{width: width, height: height, tiny: width < tinyWidth || height < tinyHeight, unsupported: width < 32 || height < 8}
 	if l.tiny {
 		l.header = rect{0, 0, width, 1}
-		l.transcript = rect{0, 1, width, max(1, height-4)}
+		transcriptTop := 1
+		if confirming {
+			l.confirmation = rect{0, 1, width, 2}
+			transcriptTop = 3
+		}
+		l.transcript = rect{0, transcriptTop, width, max(1, height-transcriptTop-3)}
 		l.command = rect{0, max(1, height-3), width, 2}
 		l.footer = rect{0, height - 1, width, 1}
 		return l

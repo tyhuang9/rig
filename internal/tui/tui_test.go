@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/hostd/hostd/internal/apicontract"
+	"github.com/hostd/hostd/internal/secretfile"
 )
 
 type fakeClient struct {
@@ -20,6 +21,7 @@ type fakeClient struct {
 	me              apicontract.MeResponse
 	meErr           error
 	lifecycleCalls  int
+	bootstrapCalls  int
 	logoutCalls     int
 	followEvents    chan apicontract.JobEvent
 	followErrors    chan error
@@ -31,6 +33,7 @@ func (f *fakeClient) BootstrapStatus(context.Context) (apicontract.BootstrapStat
 	return f.bootstrapStatus, f.bootstrapErr
 }
 func (f *fakeClient) Bootstrap(_ context.Context, request apicontract.BootstrapRequest) (apicontract.SessionResponse, error) {
+	f.bootstrapCalls++
 	return apicontract.SessionResponse{User: apicontract.User{Username: request.Username, Role: "admin"}}, nil
 }
 func (f *fakeClient) Login(_ context.Context, request apicontract.LoginRequest) (apicontract.SessionResponse, error) {
@@ -146,6 +149,24 @@ func TestProtectedHistoryLimitClearAndNoPlaintext(t *testing.T) {
 	}
 }
 
+func TestProtectedHistoryRejectsOversizedDecryptedPayloadAndEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history")
+	store := NewProtectedHistoryStore(path)
+	if err := secretfile.Write(path, historyPurpose, []byte(`["`+strings.Repeat("x", maxHistoryPayloadBytes)+`"]`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(context.Background()); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("oversized history error = %v", err)
+	}
+	if err := store.Save(context.Background(), []string{"/status", "/job " + strings.Repeat("x", maxHistoryEntryBytes+1)}); err != nil {
+		t.Fatal(err)
+	}
+	values, err := store.Load(context.Background())
+	if err != nil || len(values) != 1 || values[0] != "/status" {
+		t.Fatalf("bounded history = %#v, %v", values, err)
+	}
+}
+
 func TestAuthInputNeverEntersHistoryAndIsMasked(t *testing.T) {
 	m := NewModel(context.Background(), &fakeClient{}, &memoryHistoryStore{}, "endpoint")
 	m.showBootstrap()
@@ -157,9 +178,15 @@ func TestAuthInputNeverEntersHistoryAndIsMasked(t *testing.T) {
 	m.authInputs[2].SetValue("passphrase-secret")
 	m.authIndex = 2
 	_, cmd := m.handleAuthKey(tea.KeyMsg{Type: tea.KeyEnter})
-	if cmd == nil || len(m.historyValues) != 0 {
-		t.Fatal("authentication did not submit safely")
+	if cmd != nil || !m.bootstrapConfirm || m.client.(*fakeClient).bootstrapCalls != 0 || len(m.historyValues) != 0 {
+		t.Fatal("bootstrap did not wait for explicit confirmation")
 	}
+	m.width, m.height = 80, 20
+	view := m.View()
+	if !strings.Contains(view, "admin") || strings.Contains(view, "bootstrap-secret") || strings.Contains(view, "passphrase-secret") {
+		t.Fatalf("confirmation rendered secrets or omitted username: %q", view)
+	}
+	_, cmd = m.handleAuthKey(tea.KeyMsg{Type: tea.KeyEnter})
 	for _, input := range m.authInputs {
 		if input.Value() != "" {
 			t.Fatal("credential remained in input after submission")
@@ -169,6 +196,31 @@ func TestAuthInputNeverEntersHistoryAndIsMasked(t *testing.T) {
 	m.Update(msg)
 	if m.screen != screenConsole || len(m.historyValues) != 0 {
 		t.Fatalf("screen/history after auth = %v/%v", m.screen, m.historyValues)
+	}
+}
+
+func TestBootstrapConfirmationCancelsWithEscapeAndMouse(t *testing.T) {
+	m := NewModel(context.Background(), &fakeClient{}, &memoryHistoryStore{}, "endpoint")
+	m.showBootstrap()
+	for i, value := range []string{"token", "operator", "passphrase"} {
+		m.authInputs[i].SetValue(value)
+	}
+	m.authIndex = 2
+	m.handleAuthKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m.handleAuthKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.bootstrapConfirm || m.authInputs[0].Value() != "" || m.authInputs[2].Value() != "" {
+		t.Fatal("Escape retained bootstrap credentials")
+	}
+	for i, value := range []string{"token", "operator", "passphrase"} {
+		m.authInputs[i].SetValue(value)
+	}
+	m.authIndex = 2
+	m.handleAuthKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m.width, m.height = 80, 20
+	m.View()
+	m.handleMouse(tea.MouseMsg(tea.MouseEvent{X: m.bootstrapCancelRect.x, Y: m.bootstrapCancelRect.y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}))
+	if m.bootstrapConfirm || m.authInputs[0].Value() != "" || m.authInputs[2].Value() != "" {
+		t.Fatal("mouse cancel retained bootstrap credentials")
 	}
 }
 
@@ -242,6 +294,33 @@ func TestMutationRequiresKeyboardConfirmationAndAutoFollows(t *testing.T) {
 	m.Update(follow())
 	if m.followJobID != "job-life" {
 		t.Fatalf("following %q", m.followJobID)
+	}
+}
+
+func TestTinyLayoutRendersConfirmationBeforeMutation(t *testing.T) {
+	client := &fakeClient{}
+	m := consoleModel(client)
+	m.width, m.height = 40, 10
+	m.resize()
+	m.commandInput.SetValue("/stop")
+	m.handleConsoleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.confirm == nil || client.lifecycleCalls != 0 || !strings.Contains(m.View(), "CONFIRM") {
+		t.Fatalf("tiny confirmation/calls/view = %#v/%d/%q", m.confirm, client.lifecycleCalls, m.View())
+	}
+	_, run := m.handleConsoleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	_ = run()
+	if client.lifecycleCalls != 1 {
+		t.Fatal("tiny confirmation did not gate mutation")
+	}
+}
+
+func TestMutationRefusesWhenSecureIdempotencyKeyFails(t *testing.T) {
+	client := &fakeClient{}
+	m := consoleModel(client)
+	m.newKey = func() string { return "" }
+	result := m.execute(command{Name: "/stop"})().(commandResultMsg)
+	if result.err == nil || client.lifecycleCalls != 0 {
+		t.Fatalf("result=%#v calls=%d", result, client.lifecycleCalls)
 	}
 }
 
@@ -321,6 +400,25 @@ func TestFollowEscapeCancelsOnlyLocalStream(t *testing.T) {
 	}
 	if client.followCtx == nil || client.followCtx.Err() == nil {
 		t.Fatal("follow context was not cancelled")
+	}
+}
+
+func TestStaleFollowMessagesCannotReplaceOrStopCurrentFollow(t *testing.T) {
+	m := consoleModel(&fakeClient{})
+	oldOpen := m.startFollowing("old-job", 0)().(followOpenedMsg)
+	newOpen := m.startFollowing("new-job", 0)().(followOpenedMsg)
+	m.Update(newOpen)
+	m.Update(oldOpen)
+	if m.followJobID != "new-job" {
+		t.Fatalf("stale open replaced follow: %q", m.followJobID)
+	}
+	m.Update(followEventMsg{generation: oldOpen.generation, done: true})
+	if m.followJobID != "new-job" {
+		t.Fatal("stale done stopped current follow")
+	}
+	m.Update(followEventMsg{generation: oldOpen.generation, err: errors.New("stale")})
+	if m.followJobID != "new-job" || strings.Contains(m.View(), "stale") {
+		t.Fatal("stale error affected current follow")
 	}
 }
 
