@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	_ "modernc.org/sqlite"
 )
@@ -33,6 +34,104 @@ func TestEveryEmbeddedMigrationMirrorsPublicMigration(t *testing.T) {
 			t.Errorf("migration %s is not byte-mirrored", name)
 		}
 	}
+}
+
+func TestMigrateRollsBackBodyWhenLedgerInsertFailsAndRetriesSameVersion(t *testing.T) {
+	db := openMemoryDatabase(t)
+	migrationFS := fstest.MapFS{
+		"migrations/001_foundation.sql": &fstest.MapFile{Data: []byte(`
+CREATE TABLE durable_migration_rows (name TEXT PRIMARY KEY);
+INSERT INTO durable_migration_rows(name) VALUES ('from-001');
+CREATE TRIGGER reject_migration_two_ledger
+BEFORE INSERT ON schema_migrations
+WHEN NEW.version = '002_feature.sql'
+BEGIN
+    SELECT RAISE(ABORT, 'migration ledger rejected');
+END;
+`)},
+		"migrations/002_feature.sql": &fstest.MapFile{Data: []byte(`
+CREATE TABLE migration_two_rows (name TEXT PRIMARY KEY);
+INSERT INTO migration_two_rows(name) VALUES ('from-002');
+INSERT INTO durable_migration_rows(name) VALUES ('from-002');
+`)},
+	}
+
+	err := migrateFS(db, migrationFS)
+	if err == nil {
+		t.Fatal("migration with rejected ledger insert succeeded")
+	}
+	// Keep this assertion independent of driver-specific constraint wording.
+	if !strings.Contains(err.Error(), "002_feature.sql") {
+		t.Fatalf("migration error does not identify the failing file: %v", err)
+	}
+
+	count := func(query string, args ...any) int {
+		t.Helper()
+		var value int
+		if err := db.QueryRow(query, args...).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	if got := count(`SELECT COUNT(*) FROM schema_migrations WHERE version='001_foundation.sql'`); got != 1 {
+		t.Fatalf("001 ledger rows after failure = %d", got)
+	}
+	if got := count(`SELECT COUNT(*) FROM durable_migration_rows WHERE name='from-001'`); got != 1 {
+		t.Fatalf("001 durable rows after failure = %d", got)
+	}
+	if got := count(`SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name='reject_migration_two_ledger'`); got != 1 {
+		t.Fatalf("001 trigger rows after failure = %d", got)
+	}
+	if got := count(`SELECT COUNT(*) FROM schema_migrations WHERE version='002_feature.sql'`); got != 0 {
+		t.Fatalf("002 ledger rows after failure = %d", got)
+	}
+	if got := count(`SELECT COUNT(*) FROM durable_migration_rows WHERE name='from-002'`); got != 0 {
+		t.Fatalf("002 durable rows after failure = %d", got)
+	}
+	if got := count(`SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='migration_two_rows'`); got != 0 {
+		t.Fatalf("002 schema rows after failure = %d", got)
+	}
+
+	migrationFS["migrations/002_feature.sql"] = &fstest.MapFile{Data: []byte(`
+DROP TRIGGER reject_migration_two_ledger;
+CREATE TABLE migration_two_rows (name TEXT PRIMARY KEY);
+INSERT INTO migration_two_rows(name) VALUES ('from-002');
+INSERT INTO durable_migration_rows(name) VALUES ('from-002');
+`)}
+	if err := migrateFS(db, migrationFS); err != nil {
+		t.Fatalf("corrected migration: %v", err)
+	}
+
+	assertCorrectedState := func(stage string) {
+		t.Helper()
+		if got := count(`SELECT COUNT(*) FROM schema_migrations`); got != 2 {
+			t.Fatalf("%s ledger rows = %d", stage, got)
+		}
+		if got := count(`SELECT COUNT(*) FROM schema_migrations WHERE version='001_foundation.sql'`); got != 1 {
+			t.Fatalf("%s 001 ledger rows = %d", stage, got)
+		}
+		if got := count(`SELECT COUNT(*) FROM schema_migrations WHERE version='002_feature.sql'`); got != 1 {
+			t.Fatalf("%s 002 ledger rows = %d", stage, got)
+		}
+		if got := count(`SELECT COUNT(*) FROM durable_migration_rows WHERE name='from-001'`); got != 1 {
+			t.Fatalf("%s 001 durable rows = %d", stage, got)
+		}
+		if got := count(`SELECT COUNT(*) FROM durable_migration_rows WHERE name='from-002'`); got != 1 {
+			t.Fatalf("%s 002 durable rows = %d", stage, got)
+		}
+		if got := count(`SELECT COUNT(*) FROM migration_two_rows WHERE name='from-002'`); got != 1 {
+			t.Fatalf("%s 002 table rows = %d", stage, got)
+		}
+		if got := count(`SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name='reject_migration_two_ledger'`); got != 0 {
+			t.Fatalf("%s trigger rows = %d", stage, got)
+		}
+	}
+	assertCorrectedState("corrected retry")
+
+	if err := migrateFS(db, migrationFS); err != nil {
+		t.Fatalf("idempotent rerun: %v", err)
+	}
+	assertCorrectedState("idempotent rerun")
 }
 
 func TestMigrateFreshUpgradePreservesDataAndIsIdempotent(t *testing.T) {
