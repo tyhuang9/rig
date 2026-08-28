@@ -158,4 +158,31 @@ describe("API client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(6, "/api/v1/apps/app%2Fone/runtime-approvals", expect.objectContaining({ method: "POST", headers: expect.not.objectContaining({ "Idempotency-Key": expect.any(String) }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(8, "/api/v1/jobs/job%2Fone/resume", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
   });
+
+  it("uses generated auto-deploy paths with exact CAS request bodies and CSRF", async () => {
+    const status = { applicationId: "app/one", revision: 4, enabled: false, state: "disabled", source: { type: "github" }, sourceScopeActive: false, latestResolvedSha: "", activeSha: "", lastSuccessfulDeployedSha: "", pausedSha: "", retryAttempt: 0, updatedAt: "2026-08-26T00:00:00Z" };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(status), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...status, enabled: true, revision: 5 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...status, enabled: true, state: "idle", revision: 6 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getApplicationAutoDeploy("app/one");
+    await api.updateApplicationAutoDeploy("app/one", { expectedRevision: 4, enabled: true });
+    await api.resumeApplicationAutoDeploy("app/one", { expectedRevision: 5 });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/apps/app%2Fone/auto-deploy", expect.objectContaining({ credentials: "same-origin" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/apps/app%2Fone/auto-deploy", expect.objectContaining({ method: "PUT", body: JSON.stringify({ expectedRevision: 4, enabled: true }), headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/v1/apps/app%2Fone/auto-deploy/resume", expect.objectContaining({ method: "POST", body: JSON.stringify({ expectedRevision: 5 }), headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+  });
+
+  it("gets relay status and preserves safe relay errors", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ availability: "available", state: "ready", paused: false, outcome: "ready", diagnosticsUnavailable: false, pendingCommands: 0, activeLeases: 0, expiredLeases: 0, oldestPendingAgeSeconds: 0, observerDropped: 0 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "relay_unavailable", detail: "Relay is unavailable" }), { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.relayStatus()).resolves.toMatchObject({ availability: "available" });
+    await expect(api.relayStatus()).rejects.toEqual(expect.objectContaining<Partial<APIError>>({ code: "relay_unavailable", detail: "Relay is unavailable" }));
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/relay/status", expect.objectContaining({ credentials: "same-origin" }));
+  });
 });

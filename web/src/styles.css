@@ -247,6 +247,30 @@ button:disabled { cursor: wait; opacity: .62; }
 .configuration-footer [role="status"] { color: #195e47; font-size: 12px; }
 .configuration-panel .error-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 
+.auto-deploy-panel { margin-top: 28px; padding: 20px; border: 1px solid #e3e6ea; border-radius: 10px; background: #fff; }
+.auto-deploy-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.auto-deploy-heading h2 { margin: 0; font-size: 16px; }
+.auto-deploy-heading p, .auto-deploy-description, .auto-deploy-loading { margin: 5px 0 0; color: #5f6672; font-size: 12px; line-height: 1.5; }
+.auto-deploy-enable-note { max-width: 720px; margin: 12px 0 0; color: #4e5561; font-size: 11px; line-height: 1.5; }
+.auto-deploy-loading { min-height: 156px; }
+.auto-deploy-loading-skeleton { display: grid; gap: 10px; margin-top: 20px; }
+.auto-deploy-loading-skeleton span { display: block; height: 14px; border-radius: 4px; background: #eef1f5; }
+.auto-deploy-loading-skeleton span:nth-child(1) { width: min(68%, 460px); }
+.auto-deploy-loading-skeleton span:nth-child(2) { width: min(92%, 680px); }
+.auto-deploy-loading-skeleton span:nth-child(3) { width: min(54%, 360px); }
+.auto-deploy-state { flex: 0 0 auto; padding: 4px 8px; border-radius: 999px; background: #eef1f5; color: #4e5561; font-size: 11px; font-weight: 650; }
+.auto-deploy-state.idle { background: #eaf7f1; color: #195e47; }.auto-deploy-state.dispatching, .auto-deploy-state.deploying, .auto-deploy-state.retry_wait { background: #f1f4fb; color: #284fc5; }.auto-deploy-state.paused { background: #fff6e7; color: #6d4c19; }
+.auto-deploy-live { min-height: 18px; margin: 12px 0 0; color: #195e47; font-size: 12px; }
+.auto-deploy-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 16px; }
+.auto-deploy-disabled-reason { flex: 1 1 260px; color: #5f6672; font-size: 11px; line-height: 1.45; }
+.auto-deploy-prerequisite, .auto-deploy-mutation-error, .auto-deploy-query-error { align-items: start; }
+.auto-deploy-prerequisite .button, .auto-deploy-mutation-error .button, .auto-deploy-query-error .button { justify-self: start; }
+.auto-deploy-mutation-error:focus { outline: 3px solid rgba(180, 61, 68, .28); }
+.auto-deploy-diagnostics { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 10px 14px; margin: 18px 0 0; padding: 16px 0 0; border-top: 1px solid #e3e6ea; }
+.auto-deploy-diagnostics > div { display: grid; min-width: 0; gap: 3px; }
+.auto-deploy-diagnostics dt { color: #616975; font-size: 10px; }
+.auto-deploy-diagnostics dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 12px; }
+
 .deployment-panel { margin-top: 28px; padding: 20px; border: 1px solid #e3e6ea; border-radius: 10px; background: #fff; }
 .deployment-heading, .deployment-section-heading, .release-row, .approval-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .deployment-heading h2, .deployment-section-heading h3 { margin: 0; font-size: 16px; }
@@ -377,6 +401,11 @@ button:disabled { cursor: wait; opacity: .62; }
   .configuration-row-actions { grid-column: auto; display: grid; }
   .configuration-group-heading .button, .configuration-footer .button, .configuration-panel .error-summary .button { width: 100%; }
   .configuration-panel .error-summary { align-items: stretch; flex-direction: column; }
+  .auto-deploy-panel { padding: 16px 14px; overflow: hidden; }
+  .auto-deploy-heading { flex-direction: column; align-items: stretch; }
+  .auto-deploy-actions { align-items: stretch; flex-direction: column; }
+  .auto-deploy-actions .button { width: 100%; }
+  .auto-deploy-diagnostics { grid-template-columns: minmax(0, 1fr); }
   .deployment-panel { padding: 16px 14px; overflow: hidden; }
   .deployment-heading, .deployment-section-heading, .release-row, .approval-row { flex-direction: column; align-items: stretch; }
   .deployment-heading .button, .release-actions .button, .approval-row .button, .deployment-dialog-actions .button { width: 100%; }
@@ -395,6 +424,7 @@ button:disabled { cursor: wait; opacity: .62; }
   .button, .rail nav a, .rail-link, .text-button { min-height: 44px; }
   .field input, .field select, .source-choice label { min-height: 44px; }
   .configuration-row .field input, .configuration-panel .button { min-height: 44px; }
+  .auto-deploy-panel .button { min-height: 44px; }
   .configuration-row { gap: 10px; }
   .field input, .field select { height: 44px; }
 }
