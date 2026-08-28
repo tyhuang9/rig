@@ -22,12 +22,12 @@ Embed the production dashboard with the script for your shell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/embed-web.ps1
-go run ./cmd/hostd --data-root .hostd-dev --fake-runtime
+go run ./cmd/hostd serve --data-root .hostd-dev --fake-runtime
 ```
 
 ```sh
 sh scripts/embed-web.sh
-go run ./cmd/hostd --data-root .hostd-dev --fake-runtime
+go run ./cmd/hostd serve --data-root .hostd-dev --fake-runtime
 ```
 
 Open `http://127.0.0.1:7345`. The daemon prints only the path to an owner-protected bootstrap file; it never writes the token to process output or logs. Read it explicitly with the printed path, then paste the returned token into the dashboard:
@@ -51,6 +51,18 @@ The real Docker Compose runtime requires `--compose-runtime`, is mutually exclus
 Applications can continue to use a local source path or connect to a selected GitHub.com repository without a user-managed checkout or installed Git CLI. GitHub credentials remain in controller-protected files, releases are immutable commit snapshots, and automatic deployment is disabled per application by default. See [GitHub-connected deployments](docs/github-connected-deployments.md) for the controller workflow, supported source model, relay enrollment, failure behavior, and acceptance checklist.
 
 The separately deployable GitHub webhook relay has an immutable, non-root OCI build, PostgreSQL Compose examples, a strict HTTPS health probe, and production operations guidance. The dashboard exposes controller enrollment, binding removal, key rotation, and relay recovery; cloud account, DNS, region, and live provisioning remain operations work. See [Official webhook relay operations](docs/relay-operations.md) for TLS/proxy modes, protected configuration, backup/recovery, monitoring, rollback, and staging verification.
+
+## Use the operator terminal
+
+With the daemon running, start the interactive terminal application in another terminal:
+
+```sh
+go run ./cmd/hostd
+```
+
+Use `hostd ui --endpoint URL --session-file PATH` to override the controller or protected session file. A non-interactive no-argument invocation exits with guidance instead of waiting for input. `hostd serve` is the daemon command; flag-led invocations remain compatible for one release and print a deprecation warning.
+
+The terminal application handles first-administrator bootstrap and login with masked fields. Its command bar accepts `/help`, `/status`, `/doctor`, application selection and lifecycle commands, machine and job inspection, job following, cancellation, and resume. Mutations require an inline confirmation. Escape cancels a confirmation or stops following locally without cancelling the server job. Tab completes commands; arrow keys recall protected command history; Page Up/Page Down and the mouse wheel scroll the bounded transcript. Only the latest 100 accepted command strings are persisted in the current user's protected config storage—credentials, confirmation input, and transcript output are never saved.
 
 ## Use hostctl safely
 
