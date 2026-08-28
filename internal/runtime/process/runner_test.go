@@ -167,33 +167,38 @@ func TestExecRunnerClearsOutputAfterReapedTerminationFailure(t *testing.T) {
 }
 
 func TestExecRunnerClearsOutputAfterLateReap(t *testing.T) {
+	stdout := newBoundedBuffer(DefaultOutputLimit)
+	if _, err := stdout.Write([]byte("collector-secret")); err != nil {
+		t.Fatal(err)
+	}
+	stderr := newBoundedBuffer(DefaultOutputLimit)
 	releaseWait := make(chan struct{})
-	cleared := make(chan struct{})
+	waiting := make(chan struct{})
+	done := make(chan error, 1)
 	var captured, backing []byte
-	runner := ExecRunner{
-		stop: func(*exec.Cmd, any) error { return nil },
-		hardKill: func(command *exec.Cmd, handle any) error {
-			return killProcessTree(command, handle)
-		},
-		wait: func(command *exec.Cmd) error {
-			<-releaseWait
-			return command.Wait()
-		},
+	outputs := outputOwnership{
+		stdout: stdout,
+		stderr: stderr,
 		beforeClear: func(stdout, _ *boundedBuffer) {
 			captured = append([]byte(nil), stdout.buffer.Bytes()...)
 			backing = stdout.buffer.Bytes()
-			close(cleared)
 		},
-		gracePeriod: 10 * time.Millisecond,
-		reapPeriod:  10 * time.Millisecond,
 	}
-	_, err := runner.Run(context.Background(), outputSleepingCommandRequest(t, 150*time.Millisecond))
-	assertTerminationFailure(t, err, nil, nil, true, context.DeadlineExceeded)
+	wait := func(*exec.Cmd) error {
+		close(waiting)
+		<-releaseWait
+		return nil
+	}
+
+	go waitForCommand(done, &exec.Cmd{}, wait, &outputs)
+	<-waiting
+	outputs.discard()
+	if !bytes.Contains(stdout.buffer.Bytes(), []byte("collector-secret")) {
+		t.Fatal("discard cleared output before the command waiter completed")
+	}
 	close(releaseWait)
-	select {
-	case <-cleared:
-	case <-time.After(time.Second):
-		t.Fatal("late waiter did not clear captured output")
+	if err := <-done; err != nil {
+		t.Fatalf("wait error = %v", err)
 	}
 	assertClearedSentinelOutput(t, captured, backing)
 }
