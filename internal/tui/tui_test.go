@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -464,12 +465,25 @@ func TestProtectedHistoryLimitClearAndNoPlaintext(t *testing.T) {
 	if len(loaded) != historyLimit || !strings.Contains(loaded[0], fmt.Sprintf("%03d", firstRetained)) || !strings.Contains(loaded[historyLimit-1], fmt.Sprintf("%03d", lastRetained)) {
 		t.Fatalf("bounded history = %#v", loaded)
 	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), "sensitive-marker") {
-		t.Fatal("history file contains plaintext command")
+	if runtime.GOOS == "windows" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "sensitive-marker") {
+			t.Fatal("history file contains plaintext command")
+		}
+	} else {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.Mode().IsRegular() {
+			t.Fatalf("history file mode = %v, want a regular file", info.Mode())
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Fatalf("history file permissions = %04o, want 0600", info.Mode().Perm())
+		}
 	}
 	if err := store.Clear(context.Background()); err != nil {
 		t.Fatal(err)
