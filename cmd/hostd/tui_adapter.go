@@ -266,14 +266,20 @@ func (c *tuiControllerClient) current(ctx context.Context) (controllerclient.Ses
 	if err != nil {
 		return c.session, fmt.Errorf("load controller session: %w", err)
 	}
-	c.loaded = true
 	if len(value) == 0 {
+		c.loaded = true
 		return c.session, nil
 	}
-	if err := json.Unmarshal(value, &c.session); err != nil {
+	var session controllerclient.Session
+	if err := json.Unmarshal(value, &session); err != nil {
 		return c.session, fmt.Errorf("decode controller session: %w", err)
 	}
-	return c.session, c.validateSessionOrigin(c.session)
+	if err := c.validateSessionOrigin(session); err != nil {
+		return c.session, err
+	}
+	c.session = session
+	c.loaded = true
+	return c.session, nil
 }
 func (c *tuiControllerClient) save(ctx context.Context, session controllerclient.Session) error {
 	session.ControllerOrigin = c.origin

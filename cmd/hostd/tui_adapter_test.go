@@ -150,6 +150,49 @@ func TestTUIRefusesSessionBoundToDifferentOriginBeforeRequest(t *testing.T) {
 	}
 }
 
+func TestTUIInvalidPersistedSessionDoesNotPoisonCachedState(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+
+	valid, err := json.Marshal(controllerclient.Session{
+		SessionToken:     "correct-session",
+		CSRFToken:        "correct-csrf",
+		ControllerOrigin: server.URL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name    string
+		invalid []byte
+	}{
+		{name: "malformed", invalid: []byte(`{"sessionToken":`)},
+		{name: "different origin", invalid: []byte(`{"sessionToken":"stale","csrfToken":"stale","controllerOrigin":"http://127.0.0.1:7345"}`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &memorySessionStore{value: test.invalid}
+			client, err := newTUIControllerClient(server.URL, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter := client.(*tuiControllerClient)
+			if _, err := adapter.current(context.Background()); err == nil {
+				t.Fatal("invalid persisted session was accepted")
+			}
+
+			store.value = append([]byte(nil), valid...)
+			got, err := adapter.current(context.Background())
+			if err != nil {
+				t.Fatalf("corrected persisted session failed to load: %v", err)
+			}
+			if got.SessionToken != "correct-session" || got.CSRFToken != "correct-csrf" {
+				t.Fatalf("session = %#v, want corrected persisted session", got)
+			}
+		})
+	}
+}
+
 func TestTUILogoutClearsExpiredProtectedSessionLocally(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
