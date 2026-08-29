@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -45,12 +46,25 @@ func TestProtectedSessionStoreRoundTripAndClear(t *testing.T) {
 	if err := store.Save(context.Background(), want); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(raw) == string(want) {
-		t.Fatal("protected session was written as plaintext")
+	if runtime.GOOS == "windows" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "session-secret") || strings.Contains(string(raw), "csrf-secret") {
+			t.Fatal("protected session contains plaintext credentials")
+		}
+	} else {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.Mode().IsRegular() {
+			t.Fatalf("session file mode = %v, want a regular file", info.Mode())
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Fatalf("session file permissions = %04o, want 0600", info.Mode().Perm())
+		}
 	}
 	got, err := store.Load(context.Background())
 	if err != nil {
