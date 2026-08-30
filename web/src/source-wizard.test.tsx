@@ -357,13 +357,17 @@ describe("SourceWizard", () => {
   });
 
   it("uses one persistent atomic live region from device instructions through connection", async () => {
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [{ ...connection, id: "new-connection" }] });
     vi.spyOn(api, "startGitHubConnection").mockResolvedValue({ connectionId: "new-connection", userCode: "ABCD-EFGH", verificationUri: "https://github.com/login/device", installUrl: "https://github.com/apps/rig/installations/new", expiresAt: "2099-01-01T00:00:00Z", pollIntervalSeconds: 1 });
     vi.spyOn(api, "pollGitHubConnection").mockResolvedValue({ ...connection, id: "new-connection", status: "connected" });
-    const { client } = renderWizard();
+    vi.mocked(api.githubInstallations)
+      .mockResolvedValueOnce({ page: 1, perPage: 30, totalCount: 0, items: [] })
+      .mockResolvedValueOnce({ page: 1, perPage: 30, totalCount: 1, items: [{ id: 10, accountLogin: "octo-org", accountType: "Organization", targetType: "Organization", repositorySelection: "selected", cachedAt: "2026-01-01T00:00:00Z" }] });
+    renderWizard();
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
     await screen.findByLabelText(/^github connection$/i);
     vi.useFakeTimers();
-    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sign in to github/i }));
     await vi.advanceTimersByTimeAsync(0);
 
     const code = screen.getByText("ABCD-EFGH");
@@ -371,23 +375,30 @@ describe("SourceWizard", () => {
     expect(liveRegion?.getAttribute("aria-live")).toBe("polite");
     expect(liveRegion?.getAttribute("aria-atomic")).toBe("true");
     expect(document.querySelectorAll(".connection-status[role='status']")).toHaveLength(1);
-    expect(screen.getByRole("link", { name: /open github device authorization \(opens in a new tab\)/i }).getAttribute("rel")).toBe("noreferrer");
-    expect(screen.getByRole("link", { name: /install or configure the rig github app \(opens in a new tab\)/i }).getAttribute("target")).toBe("_blank");
+    const signIn = screen.getByRole("link", { name: /sign in to github \(opens in a new tab\)/i });
+    expect(signIn.getAttribute("href")).toBe("https://github.com/login/device");
+    expect(signIn.getAttribute("rel")).toBe("noreferrer");
+    expect(screen.queryByRole("link", { name: /install or configure repository access/i })).toBeNull();
 
     await vi.advanceTimersByTimeAsync(1000);
     expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
     await vi.runOnlyPendingTimersAsync();
-    const connectedRegion = screen.getByText(/connection status: connected/i).closest("[role='status']");
+    vi.useRealTimers();
+    const connectedRegion = await screen.findByText(/step 1 complete: signed in to github/i).then((element) => element.closest("[role='status']"));
     expect(connectedRegion).toBe(liveRegion);
     expect(screen.queryByText("ABCD-EFGH")).toBeNull();
+    const install = screen.getByRole("link", { name: /install or configure repository access \(opens in a new tab\)/i });
+    expect(install.getAttribute("href")).toBe("https://github.com/apps/rig/installations/new");
+    expect(install.getAttribute("target")).toBe("_blank");
+    expect(screen.getByText(/choose the personal account or organization that owns the repository/i)).toBeTruthy();
+    expect(document.getElementById("github-save-help")?.textContent).toMatch(/install or configure repository access, then choose the github app installation/i);
     expect(document.querySelectorAll(".connection-status[role='status']")).toHaveLength(1);
 
-    await act(async () => {
-      client.setQueryData(["source-connections"], { items: [{ ...connection, id: "new-connection", status: "access_lost" }] });
-      await vi.runOnlyPendingTimersAsync();
-    });
-    const accessLostRegion = screen.getByText(/connection status: access lost/i).closest("[role='status']");
-    expect(accessLostRegion).toBe(liveRegion);
+    fireEvent.click(screen.getByRole("button", { name: /retry github app installation/i }));
+    await screen.findByRole("option", { name: /octo-org/i });
+    await waitFor(() => expect(screen.queryByRole("link", { name: /install or configure repository access/i })).toBeNull());
+    expect(screen.getByText(/connection status: connected/i).closest("[role='status']")).toBe(liveRegion);
+
   });
 
   it("disables every connection action while one mutation is pending", async () => {
@@ -398,11 +409,11 @@ describe("SourceWizard", () => {
     await screen.findByRole("button", { name: /refresh connection/i });
     fireEvent.click(screen.getByRole("button", { name: /refresh connection/i }));
 
-    await waitFor(() => expect((screen.getByRole("button", { name: /connect github/i }) as HTMLButtonElement).disabled).toBe(true));
+    await waitFor(() => expect((screen.getByRole("button", { name: /sign in to github/i }) as HTMLButtonElement).disabled).toBe(true));
     expect((screen.getByRole("button", { name: /refreshing/i }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: /disconnect/i }) as HTMLButtonElement).disabled).toBe(true);
     resolveRefresh?.(connection);
-    await waitFor(() => expect((screen.getByRole("button", { name: /connect github/i }) as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole("button", { name: /sign in to github/i }) as HTMLButtonElement).disabled).toBe(false));
   });
 
   it("ignores a refresh completion after selecting another connection", async () => {
@@ -449,7 +460,7 @@ describe("SourceWizard", () => {
     renderWizard();
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
     await screen.findByLabelText(/^github connection$/i);
-    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sign in to github/i }));
 
     if (destination === "local source") {
       fireEvent.click(screen.getByLabelText(/^local folder$/i));
@@ -483,7 +494,7 @@ describe("SourceWizard", () => {
     await screen.findByLabelText(/^github connection$/i);
     vi.useFakeTimers();
 
-    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sign in to github/i }));
     await vi.advanceTimersByTimeAsync(0);
     expect(screen.getByText("CODE-A")).toBeTruthy();
     await vi.advanceTimersByTimeAsync(1000);
@@ -491,7 +502,7 @@ describe("SourceWizard", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /^disconnect$/i }));
     await vi.advanceTimersByTimeAsync(0);
-    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sign in to github/i }));
     await vi.advanceTimersByTimeAsync(0);
     expect(screen.getByText("CODE-B")).toBeTruthy();
     await vi.advanceTimersByTimeAsync(1000);
@@ -512,7 +523,7 @@ describe("SourceWizard", () => {
     await screen.findByLabelText(/^github connection$/i);
     const connectionRegion = document.querySelector(".connection-status[role='status']");
     if (!connectionRegion) throw new Error("Expected persistent connection status region");
-    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sign in to github/i }));
 
     const expiration = await screen.findByText(/github authorization expired/i);
     expect(expiration.closest("[role='status']")).toBe(connectionRegion);
@@ -529,7 +540,7 @@ describe("SourceWizard", () => {
     await selectConnectedGitHub();
 
     expect(await screen.findByText(/no github app installations found/i)).toBeTruthy();
-    expect(screen.getByText(/install or configure the rig github app, then retry/i)).toBeTruthy();
+    expect(screen.getByText(/sign in to github again to install or configure repository access, then retry/i)).toBeTruthy();
     const installation = screen.getByLabelText(/^github app installation$/i) as HTMLSelectElement;
     expect(installation.disabled).toBe(true);
     expect(screen.queryByRole("navigation", { name: /github app installations pagination/i })).toBeNull();
@@ -865,7 +876,7 @@ describe("SourceWizard", () => {
     await waitFor(() => expect(api.githubInstallations).toHaveBeenLastCalledWith(connection.id, 2, 30));
 
     vi.useFakeTimers();
-    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sign in to github/i }));
     await vi.advanceTimersByTimeAsync(0);
     expect(screen.getByText(/ABCD-EFGH/)).toBeTruthy();
     await vi.advanceTimersByTimeAsync(5000);

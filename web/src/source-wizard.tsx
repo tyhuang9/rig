@@ -13,6 +13,7 @@ import {
 const pageSize = 30;
 type SourceKind = "local" | "github";
 type ConnectionContext = { generation: number; kind: SourceKind; selectedConnectionId: string };
+type InstallationAction = { connectionId: string; url: string };
 
 function sameConnectionContext(left: ConnectionContext, right: ConnectionContext) {
   return left.generation === right.generation && left.kind === right.kind && left.selectedConnectionId === right.selectedConnectionId;
@@ -69,6 +70,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const [repositoryPage, setRepositoryPage] = useState(1);
   const [branchPage, setBranchPage] = useState(1);
   const [deviceAuthorization, setDeviceAuthorization] = useState<GitHubDeviceAuthorization | null>(null);
+  const [installationAction, setInstallationAction] = useState<InstallationAction | null>(null);
   const [pendingStatus, setPendingStatus] = useState<SourceConnection["status"] | undefined>();
   const [sourceError, setSourceError] = useState("");
   const [inspectionError, setInspectionError] = useState("");
@@ -124,6 +126,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const advanceConnectionContext = (nextKind: SourceKind, nextConnectionId: string) => {
     const next = { generation: connectionContext.current.generation + 1, kind: nextKind, selectedConnectionId: nextConnectionId };
     connectionContext.current = next;
+    setInstallationAction(null);
     return next;
   };
   const focusErrorSummary = () => window.setTimeout(() => errorSummary.current?.focus(), 0);
@@ -194,6 +197,11 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     if (!deviceAuthorization && pendingStatus && selectedConnection && selectedConnection.status !== "pending") setPendingStatus(undefined);
   }, [deviceAuthorization, pendingStatus, selectedConnection]);
 
+  useEffect(() => {
+    if (!installations.data?.items.length) return;
+    setInstallationAction((current) => current?.connectionId === selectedConnectionId ? null : current);
+  }, [installations.data, selectedConnectionId]);
+
   const beginConnection = useMutation({
     mutationFn: (_context: ConnectionContext) => api.startGitHubConnection(),
     onSuccess: async (authorization, operation) => {
@@ -201,6 +209,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         advanceConnectionContext("github", authorization.connectionId);
         setSourceError("");
         setDeviceAuthorization(authorization);
+        setInstallationAction({ connectionId: authorization.connectionId, url: authorization.installUrl });
         setPendingStatus("pending");
         setSelectedConnectionId(authorization.connectionId);
         resetAfterConnection();
@@ -363,12 +372,15 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
 
   const githubEnabled = capability.data?.capabilities.githubConnections === true;
   const sourceIsBusy = beginConnection.isPending || refreshConnection.isPending || disconnectConnection.isPending;
+  const installUrl = installationAction?.connectionId === selectedConnectionId ? installationAction.url : "";
   const githubSaveHelp = !githubEnabled
     ? "GitHub connections must be enabled before this application can be saved."
     : deviceAuthorization
       ? "Finish GitHub device authorization before choosing the application source."
       : !isConnected
         ? "Choose a connected GitHub account before saving."
+        : installUrl
+          ? "Install or configure repository access, then choose the GitHub App installation before saving."
         : installationId === null
           ? "Choose a GitHub App installation before saving."
           : repositoryId === null
@@ -424,14 +436,21 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         <span className="sr-only capability-status" role="status" aria-live="polite" aria-atomic="true">{capability.isFetching ? "Checking GitHub connection capability." : capability.isError ? "GitHub connection capability check failed." : githubEnabled ? "GitHub connections are available." : "GitHub connections are disabled."}</span>
         {capability.isLoading ? <div className="callout info">Checking GitHub connection capability…</div> : capability.isError ? <div className="callout danger"><strong>Could not check GitHub capability</strong><span>{safeMessage(capability.error, "The controller status could not be loaded.")}</span><button type="button" className="button small" onClick={() => void capability.refetch()}>Retry capability check</button></div> : !githubEnabled ? <div className="callout warning"><strong>GitHub connections are disabled</strong><span>The administrator disabled GitHub connections on this controller.</span></div> : <>
           <div className="connection-actions">
-            <button type="button" className="button" disabled={sourceIsBusy} onClick={() => beginConnection.mutate(connectionContext.current)}>{beginConnection.isPending ? "Starting…" : "Connect GitHub"}</button>
+            <button type="button" className="button" disabled={sourceIsBusy} onClick={() => beginConnection.mutate(connectionContext.current)}>{beginConnection.isPending ? "Starting…" : "Sign in to GitHub"}</button>
             {selectedConnectionId && selectedStatus === "connected" && <button type="button" className="button" disabled={sourceIsBusy} onClick={() => refreshConnection.mutate({ connectionId: selectedConnectionId, context: connectionContext.current })}>{refreshConnection.isPending ? "Refreshing…" : "Refresh connection"}</button>}
             {selectedConnectionId && <button type="button" className="button" disabled={sourceIsBusy} onClick={() => disconnectConnection.mutate({ connectionId: selectedConnectionId, context: connectionContext.current })}>{disconnectConnection.isPending ? "Disconnecting…" : "Disconnect"}</button>}
           </div>
           <div className={deviceAuthorization ? "callout info device-authorization connection-status" : sourceError ? "callout danger connection-status" : selectedConnectionId && !isConnected ? "callout warning connection-status" : "wizard-status connection-status"} role="status" aria-live="polite" aria-atomic="true">
             {deviceAuthorization ? <>
-              <strong>Authorize this controller</strong><span>Enter code <code>{deviceAuthorization.userCode}</code> at GitHub, then install the app for the repository you want to deploy.</span>
-              <span><a href={deviceAuthorization.verificationUri} target="_blank" rel="noreferrer">Open GitHub device authorization (opens in a new tab)</a> · <a href={deviceAuthorization.installUrl} target="_blank" rel="noreferrer">Install or configure the Rig GitHub App (opens in a new tab)</a></span>
+              <strong>Step 1 of 2: Sign in to GitHub</strong>
+              <span>Enter code <code>{deviceAuthorization.userCode}</code> at GitHub to sign in and authorize Rig.</span>
+              <span>Use an account that can manage GitHub App access for the personal account or organization that owns the repository.</span>
+              <span><a className="button primary" href={deviceAuthorization.verificationUri} target="_blank" rel="noreferrer">Sign in to GitHub (opens in a new tab)</a></span>
+            </> : isConnected && installUrl ? <>
+              <strong>Step 1 complete: Signed in to GitHub</strong>
+              <span>Step 2 of 2: Install or configure repository access.</span>
+              <span>Choose the personal account or organization that owns the repository, then grant Rig access to the repositories you want to deploy.</span>
+              <span><a className="button primary" href={installUrl} target="_blank" rel="noreferrer">Install or configure repository access (opens in a new tab)</a></span>
             </> : selectedConnectionId ? <>
               <strong>{isConnected ? "GitHub connection ready" : "GitHub connection needs attention"}</strong>
               <span>{`Connection status: ${selectedStatus.replaceAll("_", " ")}.`}</span>
@@ -448,9 +467,9 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
             </select>
           </div>
           {connections.isError && <div className="callout danger"><strong>Could not load GitHub connections</strong><span>{safeMessage(connections.error, "The connection list could not be loaded.")}</span><button type="button" className="button small" onClick={() => void connections.refetch()}>Retry connections</button></div>}
-          {!connections.isFetching && !connections.isError && connections.data?.items.length === 0 && <div className="callout info"><strong>No GitHub connections yet</strong><span>Start a GitHub connection to authorize this controller.</span></div>}
+          {!connections.isFetching && !connections.isError && connections.data?.items.length === 0 && <div className="callout info"><strong>No GitHub accounts connected</strong><span>Select Sign in to GitHub to authorize Rig.</span></div>}
           {isConnected && <div className="source-selects">
-            <SourceSelect label="GitHub App installation" collectionLabel="GitHub App installations" page={installationPage} id="github-installation" value={installationId?.toString() ?? ""} onChange={(value) => { setInstallationId(value ? Number(value) : null); resetAfterInstallation(); }} loading={installations.isFetching} error={installations.error} disabled={installations.isFetching} placeholder="Choose an installation" emptyTitle="No GitHub App installations found" emptyMessage="No GitHub App installations are available. Install or configure the Rig GitHub App, then retry." onRetry={() => void installations.refetch()} items={installations.data?.items.map((item) => ({ value: String(item.id), label: `${item.accountLogin} (${item.repositorySelection} repositories)` })) ?? []} />
+            <SourceSelect label="GitHub App installation" collectionLabel="GitHub App installations" page={installationPage} id="github-installation" value={installationId?.toString() ?? ""} onChange={(value) => { setInstallationId(value ? Number(value) : null); resetAfterInstallation(); }} loading={installations.isFetching} error={installations.error} disabled={installations.isFetching} placeholder="Choose an installation" emptyTitle="No GitHub App installations found" emptyMessage="No GitHub App installations are available. Sign in to GitHub again to install or configure repository access, then retry." onRetry={() => void installations.refetch()} items={installations.data?.items.map((item) => ({ value: String(item.id), label: `${item.accountLogin} (${item.repositorySelection} repositories)` })) ?? []} />
             <PaginationControls label="GitHub App installations" page={installationPage} onPageChange={changeInstallationPage} hasNext={(installations.data?.page ?? 0) * (installations.data?.perPage ?? pageSize) < (installations.data?.totalCount ?? 0)} loading={installations.isFetching} statusId="github-installation-status" />
             {installationId !== null && <><SourceSelect label="Repository" collectionLabel="Repositories" page={repositoryPage} id="github-repository" value={repositoryId?.toString() ?? ""} onChange={(value) => { setRepositoryId(value ? Number(value) : null); resetAfterRepository(); }} loading={repositories.isFetching} error={repositories.error} disabled={repositories.isFetching} placeholder="Choose a repository" emptyTitle="No repositories found" emptyMessage="No accessible repositories are available. Update the GitHub App repository access, then retry." onRetry={() => void repositories.refetch()} items={repositories.data?.items.filter((item) => !item.archived && !item.disabled).map((item) => ({ value: String(item.id), label: `${item.owner}/${item.name}${item.private ? " (private)" : ""}` })) ?? []} />
             <PaginationControls label="repositories" page={repositoryPage} onPageChange={changeRepositoryPage} hasNext={(repositories.data?.page ?? 0) * (repositories.data?.perPage ?? pageSize) < (repositories.data?.totalCount ?? 0)} loading={repositories.isFetching} statusId="github-repository-status" /></>}

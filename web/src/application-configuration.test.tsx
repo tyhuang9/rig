@@ -77,6 +77,9 @@ describe("ApplicationConfigurationPanel", () => {
     prompt.focus();
     expect(document.activeElement).toBe(prompt);
     expect(screen.getByText(/This creates a new GitHub-source app and does not change this app’s source here/)).not.toBeNull();
+    expect(screen.getByText(/GitHub connections are enabled by default\. Administrators can opt out for a controller/i)).not.toBeNull();
+    expect(screen.getByText(/install or configure repository access for the personal account or organization/i)).not.toBeNull();
+    expect(screen.queryByText(/--github-client-id|--github-app-slug/)).toBeNull();
     expect(screen.getByText(/External-provider access is governed by Codex or Claude/)).not.toBeNull();
 
     const save = screen.getByRole("button", { name: "Save configuration" });
