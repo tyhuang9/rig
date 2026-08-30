@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/hostd/hostd/internal/controllerclient"
@@ -15,8 +14,8 @@ import (
 )
 
 type tuiLaunchOptions struct {
-	endpoint, sessionFile, historyFile string
-	accessible                         bool
+	endpoint, sessionFile string
+	accessible            bool
 }
 type hostdRunners struct {
 	interactive func() bool
@@ -83,20 +82,7 @@ func parseTUIOptions(args []string) (tuiLaunchOptions, string, error) {
 	if flags.NArg() != 0 {
 		return options, "", errors.New("hostd ui does not accept positional arguments")
 	}
-	options.historyFile = historyFileForSession(options.sessionFile)
 	return options, "", nil
-}
-
-func historyFileForSession(sessionFile string) string {
-	directory := filepath.Dir(sessionFile)
-	if directory != "." {
-		return filepath.Join(directory, "hostd-tui-history.json")
-	}
-	root, err := os.UserConfigDir()
-	if err != nil {
-		return filepath.Join("hostd", "tui-history.json")
-	}
-	return filepath.Join(root, "hostd", "tui-history.json")
 }
 func interactiveTerminal() bool {
 	stdin, inputErr := os.Stdin.Stat()
@@ -112,7 +98,7 @@ func runTUI(options tuiLaunchOptions) error {
 		ClientFactory: func(store tui.SessionStore) (tui.Client, error) {
 			return newTUIControllerClient(options.endpoint, store)
 		},
-		HistoryPath: options.historyFile,
-		Accessible:  options.accessible,
+		OpenURL:    openDashboard,
+		Accessible: options.accessible,
 	})
 }

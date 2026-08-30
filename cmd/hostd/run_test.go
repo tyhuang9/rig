@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"errors"
-	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -46,9 +45,6 @@ func TestRunHostdDispatchesModesAndGuidesNonInteractiveUse(t *testing.T) {
 			if tt.wantText != "" && !bytes.Contains(output.Bytes(), []byte(tt.wantText)) {
 				t.Fatalf("output=%q missing %q", output.String(), tt.wantText)
 			}
-			if calledUI && len(tt.args) > 0 && ui.historyFile == "" {
-				t.Fatal("TUI history file was not derived")
-			}
 			if tt.name == "explicit UI parses options" && !ui.accessible {
 				t.Fatal("accessible option was not propagated")
 			}
@@ -72,11 +68,9 @@ func TestRunHostdUIHelpReturnsSuccess(t *testing.T) {
 	}
 }
 
-func TestHistoryFileForSessionPreservesSafeDefaultAndExplicitDirectory(t *testing.T) {
-	if got := historyFileForSession(filepath.Join("custom", "session.json")); got != filepath.Join("custom", "hostd-tui-history.json") {
-		t.Fatalf("explicit directory history=%q", got)
-	}
-	if got := historyFileForSession("session.json"); filepath.Dir(got) == "." {
-		t.Fatalf("relative session history escaped protected config path: %q", got)
+func TestRemovedHistoryFlagIsRejected(t *testing.T) {
+	_, _, err := parseTUIOptions([]string{"--history-file", "old"})
+	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("flag provided but not defined")) {
+		t.Fatalf("history flag error=%v", err)
 	}
 }
