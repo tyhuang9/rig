@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestOpenDashboardUsesDirectPlatformCommands(t *testing.T) {
@@ -19,7 +22,11 @@ func TestOpenDashboardUsesDirectPlatformCommands(t *testing.T) {
 		t.Run(tt.goos, func(t *testing.T) {
 			var name string
 			var args []string
-			err := openDashboardWith(context.Background(), "http://127.0.0.1:7345", tt.goos, func(_ context.Context, got string, values ...string) error {
+			err := openDashboardWith(context.Background(), "http://127.0.0.1:7345", tt.goos, func(ctx context.Context, got string, values ...string) error {
+				deadline, ok := ctx.Deadline()
+				if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > dashboardCommandTimeout {
+					t.Fatalf("runner context is not usefully bounded: deadline=%v ok=%v", deadline, ok)
+				}
 				name, args = got, append([]string(nil), values...)
 				return nil
 			})
@@ -27,6 +34,33 @@ func TestOpenDashboardUsesDirectPlatformCommands(t *testing.T) {
 				t.Fatalf("command=%s %v err=%v", name, args, err)
 			}
 		})
+	}
+}
+
+func TestRunDashboardCommandWaitsForRepeatedRunnerCompletion(t *testing.T) {
+	for i := 0; i < 3; i++ {
+		completion := filepath.Join(t.TempDir(), "completed")
+		t.Setenv("HOSTD_DASHBOARD_HELPER_COMPLETION", completion)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := runDashboardCommand(ctx, os.Args[0], "-test.run=^TestDashboardCommandHelperProcess$")
+		cancel()
+		if err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		if _, err := os.Stat(completion); err != nil {
+			t.Fatalf("run %d returned before helper completion: %v", i, err)
+		}
+	}
+}
+
+func TestDashboardCommandHelperProcess(t *testing.T) {
+	completion := os.Getenv("HOSTD_DASHBOARD_HELPER_COMPLETION")
+	if completion == "" {
+		return
+	}
+	time.Sleep(25 * time.Millisecond)
+	if err := os.WriteFile(completion, []byte("complete"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

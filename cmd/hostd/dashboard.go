@@ -9,14 +9,19 @@ import (
 	"os/exec"
 	"runtime"
 	"strconv"
+	"time"
 )
 
 type dashboardCommandRunner func(context.Context, string, ...string) error
 
+const dashboardCommandTimeout = 10 * time.Second
+
 func openDashboard(ctx context.Context, target string) error {
-	return openDashboardWith(ctx, target, runtime.GOOS, func(ctx context.Context, name string, args ...string) error {
-		return exec.CommandContext(ctx, name, args...).Start()
-	})
+	return openDashboardWith(ctx, target, runtime.GOOS, runDashboardCommand)
+}
+
+func runDashboardCommand(ctx context.Context, name string, args ...string) error {
+	return exec.CommandContext(ctx, name, args...).Run()
 }
 
 func openDashboardWith(ctx context.Context, target, goos string, run dashboardCommandRunner) error {
@@ -33,13 +38,15 @@ func openDashboardWith(ctx context.Context, target, goos string, run dashboardCo
 		return errors.New("dashboard URL must be a loopback origin with an explicit port")
 	}
 	origin := u.Scheme + "://" + net.JoinHostPort(ip.String(), strconv.Itoa(port))
+	commandCtx, cancel := context.WithTimeout(ctx, dashboardCommandTimeout)
+	defer cancel()
 	switch goos {
 	case "windows":
-		return run(ctx, "rundll32", "url.dll,FileProtocolHandler", origin)
+		return run(commandCtx, "rundll32", "url.dll,FileProtocolHandler", origin)
 	case "darwin":
-		return run(ctx, "open", origin)
+		return run(commandCtx, "open", origin)
 	case "linux":
-		return run(ctx, "xdg-open", origin)
+		return run(commandCtx, "xdg-open", origin)
 	default:
 		return fmt.Errorf("opening the dashboard is unsupported on %s", goos)
 	}

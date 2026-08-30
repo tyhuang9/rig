@@ -36,6 +36,8 @@ type resultState struct{ AppID, JobID, Title, Detail string }
 
 const dashboardOpenCooldown = 1500 * time.Millisecond
 
+const followSnapshotEveryEvents = 8
+
 type bannerTone uint8
 
 const (
@@ -83,16 +85,22 @@ type Model struct {
 	openURLNext                time.Time
 	now                        func() time.Time
 
-	followedJobID    string
-	followedJob      apicontract.Job
-	followCursor     int64
-	followGeneration uint64
-	followCancel     context.CancelFunc
-	followContext    context.Context
-	followEvents     <-chan apicontract.JobEvent
-	followErrors     <-chan error
-	recentEvents     []apicontract.JobEvent
-	phases           []phaseState
+	followedJobID             string
+	followedJob               apicontract.Job
+	followCursor              int64
+	followGeneration          uint64
+	followCancel              context.CancelFunc
+	followContext             context.Context
+	followEvents              <-chan apicontract.JobEvent
+	followErrors              <-chan error
+	recentEvents              []apicontract.JobEvent
+	phases                    []phaseState
+	followSnapshotPending     bool
+	followSnapshotStarted     bool
+	followSnapshotUrgent      bool
+	followStreamDone          bool
+	followEventsSinceSnapshot int
+	followWaitPending         bool
 
 	authInputs        []textinput.Model
 	authIndex         int
@@ -381,11 +389,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.followedJobID, m.followEvents, m.followErrors = msg.jobID, msg.events, msg.errors
-		return m, m.waitForFollow()
+		m.followWaitPending = false
+		return m, m.startFollowWait()
 	case followEventMsg:
 		if msg.generation != m.followGeneration {
 			return m, nil
 		}
+		m.followWaitPending = false
 		if msg.err != nil {
 			if isUnauthenticated(msg.err) {
 				m.showLogin("Session expired. Sign in again.")
@@ -396,28 +406,46 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.done {
-			return m, m.fetchFollowedJob(msg.generation, true)
+			m.followStreamDone = true
+			if m.followSnapshotPending {
+				m.followSnapshotUrgent = true
+				return m, nil
+			}
+			return m, m.startFollowSnapshot(msg.generation, true)
 		}
 		if msg.event.ID > m.followCursor {
 			m.followCursor = msg.event.ID
 		}
 		m.recentEvents = appendBoundedEvent(m.recentEvents, msg.event)
 		m.phases = updatePhases(m.phases, msg.event.Phase)
-		return m, m.fetchFollowedJob(msg.generation, false)
+		m.followEventsSinceSnapshot++
+		shouldSnapshot := !m.followSnapshotStarted || isSnapshotUrgentEvent(msg.event) || m.followEventsSinceSnapshot >= followSnapshotEveryEvents
+		if shouldSnapshot {
+			if m.followSnapshotPending {
+				m.followSnapshotUrgent = true
+				return m, m.startFollowWait()
+			}
+			return m, m.startFollowSnapshot(msg.generation, false)
+		}
+		return m, m.startFollowWait()
 	case jobSnapshotMsg:
 		if msg.generation != m.followGeneration {
 			return m, nil
 		}
+		m.followSnapshotPending = false
+		streamDone := msg.streamDone || m.followStreamDone
 		if msg.err != nil {
 			if isUnauthenticated(msg.err) {
 				m.showLogin("Session expired. Sign in again.")
 				return m, m.clearExpiredSession(msg.err)
 			}
 			m.setBanner("Could not refresh operation: "+sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerError)
-			if msg.streamDone {
+			if streamDone {
 				m.stopFollowing()
+				return m, nil
 			}
-			return m, nil
+			m.followSnapshotUrgent = false
+			return m, m.startFollowWait()
 		}
 		m.followedJob = msg.job
 		m.mergeJob(msg.job)
@@ -430,12 +458,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.overviewLoading = false
 			return m, m.startOverview()
 		}
-		if msg.streamDone {
+		if m.followSnapshotUrgent {
+			m.followSnapshotUrgent = false
+			return m, m.startFollowSnapshot(msg.generation, streamDone)
+		}
+		if streamDone {
 			m.stopFollowing()
 			m.setBanner("Live updates stopped. Reopen the operation to retry.", bannerWarning)
 			return m, nil
 		}
-		return m, m.waitForFollow()
+		return m, m.startFollowWait()
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -761,6 +793,10 @@ func (m *Model) startFollowing(jobID string, after int64, reset bool) tea.Cmd {
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.followCancel, m.followContext = cancel, ctx
 	m.followedJobID, m.followCursor = jobID, after
+	m.followSnapshotPending, m.followSnapshotStarted = false, false
+	m.followSnapshotUrgent, m.followStreamDone = false, false
+	m.followEventsSinceSnapshot = 0
+	m.followWaitPending = false
 	if reset {
 		m.recentEvents, m.phases = nil, nil
 	}
@@ -792,18 +828,40 @@ func (m *Model) waitForFollow() tea.Cmd {
 		}
 	}
 }
+func (m *Model) startFollowWait() tea.Cmd {
+	if m.followWaitPending {
+		return nil
+	}
+	wait := m.waitForFollow()
+	if wait != nil {
+		m.followWaitPending = true
+	}
+	return wait
+}
 func (m *Model) fetchFollowedJob(generation uint64, streamDone bool) tea.Cmd {
-	client, ctx, jobID := m.client, m.ctx, m.followedJobID
+	client, ctx, jobID := m.client, m.followContext, m.followedJobID
 	return func() tea.Msg {
 		job, err := client.Job(ctx, jobID)
 		return jobSnapshotMsg{generation: generation, job: job, streamDone: streamDone, err: err}
 	}
+}
+func (m *Model) startFollowSnapshot(generation uint64, streamDone bool) tea.Cmd {
+	m.followSnapshotPending, m.followSnapshotStarted = true, true
+	m.followEventsSinceSnapshot = 0
+	fetch := m.fetchFollowedJob(generation, streamDone)
+	if streamDone {
+		return fetch
+	}
+	return tea.Batch(m.startFollowWait(), fetch)
 }
 func (m *Model) stopFollowing() {
 	if m.followCancel != nil {
 		m.followCancel()
 	}
 	m.followCancel, m.followContext, m.followEvents, m.followErrors = nil, nil, nil, nil
+	m.followSnapshotPending, m.followSnapshotUrgent, m.followStreamDone = false, false, false
+	m.followEventsSinceSnapshot = 0
+	m.followWaitPending = false
 	m.followGeneration++
 }
 

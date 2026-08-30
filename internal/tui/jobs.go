@@ -128,6 +128,19 @@ func jobSummaryAt(job apicontract.Job, now time.Time) string {
 	}
 	return summary
 }
+
+func isSnapshotUrgentEvent(event apicontract.JobEvent) bool {
+	switch strings.ToLower(sanitizeIdentity(event.Code, 128)) {
+	case "job_succeeded", "job_failed", "job_cancelled", "job_interrupted", "approval_required", "needs_attention", "cancellation_requested":
+		return true
+	}
+	switch strings.ToLower(sanitizeIdentity(event.Phase, 128)) {
+	case "succeeded", "failed", "cancelled", "interrupted", "approval_required", "needs_attention", "cancelling":
+		return true
+	default:
+		return false
+	}
+}
 func percent(value int) string {
 	if value < 0 {
 		value = 0
