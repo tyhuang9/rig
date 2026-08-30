@@ -5,21 +5,17 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hostd/hostd/internal/apicontract"
 )
-
-const transcriptLimit = 500
-const transcriptByteLimit = 1 << 20
-const transcriptEntryOverhead = 8
 
 type screen uint8
 
@@ -28,163 +24,98 @@ const (
 	screenOffline
 	screenBootstrap
 	screenLogin
-	screenConsole
+	screenSwitchboard
+	screenActions
+	screenConfirmation
+	screenJobProgress
+	screenResult
+	screenHelp
 )
 
-type entryKind uint8
+type resultState struct{ AppID, JobID, Title, Detail string }
+
+const dashboardOpenCooldown = 1500 * time.Millisecond
+
+const followSnapshotEveryEvents = 8
+
+type bannerTone uint8
 
 const (
-	entrySystem entryKind = iota
-	entryCommand
-	entrySuccess
-	entryError
-	entryEvent
+	bannerError bannerTone = iota
+	bannerInfo
+	bannerWarning
+	bannerSuccess
 )
 
-type transcriptEntry struct {
-	Kind  entryKind
-	Title string
-	Body  string
-}
-
-type confirmation struct {
-	Command command
-	Text    string
-}
-
-type dependencies struct {
-	ctx      context.Context
-	client   Client
-	history  HistoryStore
-	endpoint string
-	newKey   func() string
-}
-
-// Model is exported so integrations can embed or test the console without
-// starting a terminal program. NewModel returns it in its loading state.
+// Model is an explicit application-first state machine. Overview refresh,
+// mutation submission, and the one active server-job follow have independent
+// state so an advisory refresh cannot release a mutation guard.
 type Model struct {
 	ctx      context.Context
 	client   Client
-	history  HistoryStore
 	endpoint string
+	openURL  URLOpener
 	newKey   func() string
 
-	screen          screen
-	width           int
-	height          int
-	layout          layout
-	accessible      bool
-	overviewLoaded  bool
-	overviewLoading bool
-	overviewGen     uint64
-	busy            bool
-	err             string
-	user            apicontract.User
-	status          apicontract.SystemStatus
-	apps            []apicontract.Application
-	jobs            []apicontract.Job
+	screen, returnScreen screen
+	width, height        int
+	layout               layout
+	accessible           bool
+	err                  string
+	bannerTone           bannerTone
+	user                 apicontract.User
 
-	selectedAppID    string
-	entries          []transcriptEntry
-	transcriptBytes  int
-	transcriptBuilds int
-	transcriptGen    uint64
-	accessibleLines  []string
-	accessibleGen    uint64
-	accessibleWidth  int
-	accessibleBuilds int
-	accessiblePage   int
-	viewport         viewport.Model
-	commandInput     textinput.Model
-	authInputs       []textinput.Model
-	authIndex        int
+	status                          apicontract.SystemStatus
+	apps                            []apicontract.Application
+	jobs                            []apicontract.Job
+	overviewLoaded, overviewLoading bool
+	overviewGen                     uint64
 
-	suggestions          []string
-	suggestion           int
-	historyValues        []string
-	historyIndex         int
-	historyGeneration    uint64
-	historyActive        *historyOperation
-	historyPending       []historyOperation
-	draft                string
-	confirm              *confirmation
-	bootstrapConfirm     bool
-	bootstrapUsername    string
-	followJobID          string
-	followCursor         int64
-	followGeneration     uint64
-	followCancel         context.CancelFunc
-	followContext        context.Context
-	followEvents         <-chan apicontract.JobEvent
-	followErrors         <-chan error
-	suggestionRects      []rect
-	appRects             []rect
-	jobRects             []rect
-	overviewJobRows      []apicontract.Job
-	confirmRect          rect
-	cancelRect           rect
-	bootstrapConfirmRect rect
-	bootstrapCancelRect  rect
+	selectedAppID              string
+	listOffset, selectedAction int
+	actionOffset               int
+	confirmation               *confirmation
+	result                     *resultState
+	mutationBusy               bool
+	authEpoch, requestSerial   uint64
+	activeRequestID            uint64
+	openURLBusy                bool
+	openURLSerial              uint64
+	openURLRequest             uint64
+	openURLNext                time.Time
+	now                        func() time.Time
+
+	followedJobID             string
+	followedJob               apicontract.Job
+	followCursor              int64
+	followGeneration          uint64
+	followCancel              context.CancelFunc
+	followContext             context.Context
+	followEvents              <-chan apicontract.JobEvent
+	followErrors              <-chan error
+	recentEvents              []apicontract.JobEvent
+	phases                    []phaseState
+	followSnapshotPending     bool
+	followSnapshotStarted     bool
+	followSnapshotUrgent      bool
+	followStreamDone          bool
+	followEventsSinceSnapshot int
+	followWaitPending         bool
+
+	authInputs        []textinput.Model
+	authIndex         int
+	bootstrapConfirm  bool
+	bootstrapUsername string
 }
 
-func NewModel(ctx context.Context, client Client, history HistoryStore, endpoint string) *Model {
+func NewModel(ctx context.Context, client Client, endpoint string) *Model {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if history == nil {
-		history = &memoryHistoryStore{}
-	}
-	input := textinput.New()
-	input.Prompt = "> "
-	input.Placeholder = "/help"
-	input.CharLimit = 512
-	input.Focus()
-	m := &Model{
-		ctx:          ctx,
-		client:       client,
-		history:      history,
-		endpoint:     endpoint,
-		newKey:       randomIdempotencyKey,
-		screen:       screenLoading,
-		viewport:     viewport.New(1, 1),
-		commandInput: input,
-	}
-	m.suggestions = commandSuggestions("")
-	return m
+	return &Model{ctx: ctx, client: client, endpoint: endpoint, newKey: randomIdempotencyKey, now: time.Now, screen: screenLoading, layout: calculateLayout(1, 1)}
 }
+func (m *Model) Init() tea.Cmd { return m.checkBootstrap() }
 
-func (m *Model) Init() tea.Cmd {
-	// Loading the small protected history first avoids a late disk response
-	// replacing commands the operator has already entered. Bootstrap checking
-	// starts from historyLoadedMsg once that ordering point has completed.
-	return m.loadHistory()
-}
-
-type historyLoadedMsg struct {
-	values []string
-	err    error
-}
-type historyOperationKind uint8
-
-const (
-	historySaveOperation historyOperationKind = iota
-	historyClearOperation
-)
-
-// historyOperation is deliberately a snapshot. The model serializes these
-// operations rather than letting Bubble Tea run each write independently:
-// history files must reflect command acceptance order, even when storage is
-// slow or a clear races an earlier save.
-type historyOperation struct {
-	generation uint64
-	kind       historyOperationKind
-	values     []string
-}
-
-type historyOperationMsg struct {
-	generation uint64
-	err        error
-}
 type bootstrapStatusMsg struct {
 	status apicontract.BootstrapStatus
 	err    error
@@ -194,8 +125,10 @@ type meMsg struct {
 	err error
 }
 type authMsg struct {
-	session apicontract.SessionResponse
-	err     error
+	session   apicontract.SessionResponse
+	epoch     uint64
+	requestID uint64
+	err       error
 }
 type overviewMsg struct {
 	generation uint64
@@ -204,20 +137,27 @@ type overviewMsg struct {
 	jobs       apicontract.JobList
 	err        error
 }
-type commandResultMsg struct {
-	cmd      command
-	body     string
-	apps     []apicontract.Application
-	jobs     []apicontract.Job
-	job      *apicontract.Job
-	followID string
+type mutationMsg struct {
+	request  mutationRequest
+	response apicontract.JobMutationResponse
 	err      error
 }
-type apiCommandRequest struct {
-	cmd            command
-	selectedAppID  string
-	targetAppID    string
-	idempotencyKey string
+type cancelMsg struct {
+	request  mutationRequest
+	response apicontract.JobResponse
+	err      error
+}
+type logoutMsg struct {
+	epoch, requestID uint64
+	err              error
+}
+type openURLMsg struct {
+	requestID uint64
+	err       error
+}
+type sessionClearedMsg struct {
+	epoch uint64
+	err   error
 }
 type followOpenedMsg struct {
 	generation uint64
@@ -231,100 +171,28 @@ type followEventMsg struct {
 	err        error
 	done       bool
 }
-type sessionClearedMsg struct{}
-
-func (m *Model) loadHistory() tea.Cmd {
-	history, ctx := m.history, m.ctx
-	return func() tea.Msg {
-		values, err := history.Load(ctx)
-		return historyLoadedMsg{values: values, err: err}
-	}
-}
-
-// enqueueHistorySave captures the normalized command list at acceptance time.
-// The returned command starts the FIFO only when no operation is already
-// running; all later requests remain in order behind it.
-func (m *Model) enqueueHistorySave(values []string) tea.Cmd {
-	m.historyGeneration++
-	operation := historyOperation{
-		generation: m.historyGeneration,
-		kind:       historySaveOperation,
-		values:     append([]string(nil), normalizeHistory(values)...),
-	}
-	// Pending saves on the same side of a clear barrier have no observable
-	// intermediate state, so retain only the newest snapshot. This bounds a
-	// slow disk's queue while keeping clears and post-clear history distinct.
-	if last := len(m.historyPending) - 1; last >= 0 && m.historyPending[last].kind == historySaveOperation {
-		m.historyPending[last] = operation
-		return nil
-	}
-	return m.enqueueHistoryOperation(operation)
-}
-
-// enqueueHistoryClear is a FIFO barrier. A save that was already in flight is
-// allowed to complete, then the clear runs before any later save, so an older
-// snapshot can never recreate the cleared history.
-func (m *Model) enqueueHistoryClear() tea.Cmd {
-	m.historyGeneration++
-	return m.enqueueHistoryOperation(historyOperation{
-		generation: m.historyGeneration,
-		kind:       historyClearOperation,
-	})
-}
-
-func (m *Model) enqueueHistoryOperation(operation historyOperation) tea.Cmd {
-	m.historyPending = append(m.historyPending, operation)
-	return m.startNextHistoryOperation()
-}
-
-func (m *Model) startNextHistoryOperation() tea.Cmd {
-	if m.historyActive != nil || len(m.historyPending) == 0 {
-		return nil
-	}
-	operation := m.historyPending[0]
-	m.historyPending = m.historyPending[1:]
-	m.historyActive = &operation
-	store, ctx := m.history, m.ctx
-	return func() tea.Msg {
-		var err error
-		switch operation.kind {
-		case historyClearOperation:
-			err = store.Clear(ctx)
-		default:
-			err = store.Save(ctx, operation.values)
-		}
-		return historyOperationMsg{generation: operation.generation, err: err}
-	}
+type jobSnapshotMsg struct {
+	generation uint64
+	job        apicontract.Job
+	streamDone bool
+	err        error
 }
 
 func (m *Model) checkBootstrap() tea.Cmd {
 	client, ctx := m.client, m.ctx
-	return func() tea.Msg {
-		status, err := client.BootstrapStatus(ctx)
-		return bootstrapStatusMsg{status: status, err: err}
-	}
+	return func() tea.Msg { value, err := client.BootstrapStatus(ctx); return bootstrapStatusMsg{value, err} }
 }
-
 func (m *Model) checkMe() tea.Cmd {
 	client, ctx := m.client, m.ctx
-	return func() tea.Msg {
-		me, err := client.Me(ctx)
-		return meMsg{me: me, err: err}
-	}
+	return func() tea.Msg { value, err := client.Me(ctx); return meMsg{value, err} }
 }
-
-// startOverview keeps refresh bookkeeping independent from command work. An
-// overview is advisory data; its completion must never release a command's
-// busy guard.
 func (m *Model) startOverview() tea.Cmd {
+	if m.overviewLoading {
+		return nil
+	}
 	m.overviewGen++
 	m.overviewLoading = true
-	return m.loadOverview()
-}
-
-func (m *Model) loadOverview() tea.Cmd {
-	generation := m.overviewGen
-	client, ctx := m.client, m.ctx
+	generation, client, ctx := m.overviewGen, m.client, m.ctx
 	return func() tea.Msg {
 		requestCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -332,33 +200,24 @@ func (m *Model) loadOverview() tea.Cmd {
 		var apps apicontract.ApplicationList
 		var jobs apicontract.JobList
 		var wg sync.WaitGroup
-		errors := make(chan error, 3)
-		run := func(fetch func(context.Context) error) {
+		errCh := make(chan error, 3)
+		run := func(fn func(context.Context) error) {
 			defer wg.Done()
-			if err := fetch(requestCtx); err != nil {
+			if err := fn(requestCtx); err != nil {
 				select {
-				case errors <- err:
+				case errCh <- err:
 				default:
 				}
 				cancel()
 			}
 		}
 		wg.Add(3)
-		go run(func(callCtx context.Context) (err error) {
-			status, err = client.Status(callCtx)
-			return err
-		})
-		go run(func(callCtx context.Context) (err error) {
-			apps, err = client.Applications(callCtx)
-			return err
-		})
-		go run(func(callCtx context.Context) (err error) {
-			jobs, err = client.Jobs(callCtx)
-			return err
-		})
+		go run(func(c context.Context) (err error) { status, err = client.Status(c); return err })
+		go run(func(c context.Context) (err error) { apps, err = client.Applications(c); return err })
+		go run(func(c context.Context) (err error) { jobs, err = client.Jobs(c); return err })
 		wg.Wait()
 		select {
-		case err := <-errors:
+		case err := <-errCh:
 			return overviewMsg{generation: generation, err: err}
 		default:
 			return overviewMsg{generation: generation, status: status, apps: apps, jobs: jobs}
@@ -370,14 +229,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.resize()
-		return m, nil
-	case historyLoadedMsg:
-		if msg.err == nil && m.historyGeneration == 0 {
-			m.historyValues = normalizeHistory(msg.values)
-			m.historyIndex = len(m.historyValues)
+		m.layout = calculateLayout(m.width, m.height)
+		m.resizeAuthInputs()
+		m.reconcileOffset()
+		if m.screen == screenActions {
+			_, actions, ok := m.currentActions()
+			if ok {
+				m.reconcileActionSelection(len(actions))
+			}
 		}
-		return m, m.checkBootstrap()
+		return m, nil
 	case bootstrapStatusMsg:
 		if msg.err != nil {
 			m.goOffline(msg.err)
@@ -387,33 +248,36 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showBootstrap()
 			return m, nil
 		}
-		m.busy = true
 		return m, m.checkMe()
 	case meMsg:
-		m.busy = false
 		if msg.err != nil {
 			if isUnauthenticated(msg.err) {
 				m.showLogin("")
+				return m, m.clearExpiredSession(msg.err)
 			} else {
 				m.goOffline(msg.err)
 			}
 			return m, nil
 		}
-		m.enterConsole(msg.me.User)
+		m.enterSwitchboard(msg.me.User)
 		return m, m.startOverview()
 	case authMsg:
-		m.busy = false
+		if !m.requestCurrent(msg.epoch, msg.requestID) {
+			return m, nil
+		}
+		m.activeRequestID = 0
+		m.mutationBusy = false
 		if msg.err != nil {
-			m.err = sanitizeAPIText(msg.err.Error())
-			if m.screen == screenBootstrap && len(m.authInputs) > 0 {
-				m.focusAuth(0)
-			} else if m.screen == screenLogin && len(m.authInputs) > 0 {
+			m.setBanner(sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerError)
+			if m.screen == screenLogin {
 				m.clearAuthValues()
+			}
+			if len(m.authInputs) > 0 {
 				m.focusAuth(0)
 			}
 			return m, nil
 		}
-		m.enterConsole(msg.session.User)
+		m.enterSwitchboard(msg.session.User)
 		return m, m.startOverview()
 	case overviewMsg:
 		if msg.generation != m.overviewGen {
@@ -421,140 +285,265 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.overviewLoading = false
 		if msg.err != nil {
-			if m.busy && m.screen == screenConsole {
-				m.appendEntry(entryError, "overview", "Overview refresh failed: "+msg.err.Error())
+			if isUnauthenticated(msg.err) {
+				m.showLogin("Session expired. Sign in again.")
+				return m, m.clearExpiredSession(msg.err)
+			}
+			if m.overviewLoaded {
+				m.setBanner("Refresh failed: "+sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerWarning)
 				return m, nil
 			}
-			return m, m.handleControllerError(msg.err)
-		}
-		m.status = msg.status
-		m.apps = append([]apicontract.Application(nil), msg.apps.Items...)
-		m.jobs = append([]apicontract.Job(nil), msg.jobs.Items...)
-		m.overviewLoaded = true
-		m.reconcileSelectedApp()
-		m.rebuildHitTargets()
-		return m, nil
-	case commandResultMsg:
-		m.busy = false
-		if msg.err != nil {
-			cmd := m.handleControllerError(msg.err)
-			m.restoreCommandFocus()
-			return m, cmd
-		}
-		if msg.apps != nil {
-			m.apps = append([]apicontract.Application(nil), msg.apps...)
-			m.reconcileSelectedApp()
-			m.rebuildHitTargets()
-		}
-		if msg.jobs != nil {
-			m.jobs = append([]apicontract.Job(nil), msg.jobs...)
-			m.rebuildHitTargets()
-		}
-		if msg.job != nil {
-			m.mergeJob(*msg.job)
-			m.rebuildHitTargets()
-		}
-		m.appendEntry(entrySuccess, msg.cmd.Name, msg.body)
-		if msg.cmd.Name == "/logout" {
-			m.showLogin("Signed out.")
+			m.goOffline(msg.err)
 			return m, nil
 		}
-		if msg.followID != "" {
-			return m, m.startFollowing(msg.followID, 0)
+		oldIndex := m.selectedIndex()
+		m.status = msg.status
+		m.apps = sortedApps(msg.apps.Items)
+		m.jobs = append([]apicontract.Job(nil), msg.jobs.Items...)
+		m.overviewLoaded = true
+		m.clearBanner()
+		m.reconcileSelection(oldIndex)
+		m.syncFollowSnapshot()
+		if m.screen == screenActions {
+			_, actions, ok := m.currentActions()
+			if ok {
+				m.reconcileActionSelection(len(actions))
+			}
 		}
-		m.restoreCommandFocus()
+		return m, nil
+	case mutationMsg:
+		if !m.requestCurrent(msg.request.Epoch, msg.request.RequestID) {
+			return m, nil
+		}
+		m.activeRequestID = 0
+		m.mutationBusy = false
+		if msg.err != nil {
+			return m, m.operationError(msg.err, screenActions)
+		}
+		if err := validateMutationResponse(msg.request, msg.response.Job); err != nil {
+			return m, m.operationError(err, screenActions)
+		}
+		m.mergeJob(msg.response.Job)
+		m.followedJob = msg.response.Job
+		m.followedJobID = msg.response.Job.ID
+		m.screen = screenJobProgress
+		m.confirmation = nil
+		m.clearBanner()
+		return m, m.startFollowing(msg.response.Job.ID, 0, true)
+	case cancelMsg:
+		if !m.requestCurrent(msg.request.Epoch, msg.request.RequestID) {
+			return m, nil
+		}
+		m.activeRequestID = 0
+		m.mutationBusy = false
+		m.confirmation = nil
+		if msg.err != nil {
+			return m, m.operationError(msg.err, screenJobProgress)
+		}
+		if err := validateCancelResponse(msg.request, msg.response.Job); err != nil {
+			return m, m.operationError(err, screenJobProgress)
+		}
+		m.mergeJob(msg.response.Job)
+		m.followedJob = msg.response.Job
+		m.followedJobID = msg.response.Job.ID
+		m.screen = screenJobProgress
+		m.setBanner("Cancellation requested; waiting for the controller job to finish.", bannerWarning)
+		if m.followCancel == nil && !isFollowTerminal(msg.response.Job) {
+			return m, m.startFollowing(msg.response.Job.ID, m.followCursor, false)
+		}
+		return m, nil
+	case logoutMsg:
+		if !m.requestCurrent(msg.epoch, msg.requestID) {
+			return m, nil
+		}
+		m.activeRequestID = 0
+		m.mutationBusy = false
+		m.confirmation = nil
+		m.showLogin("Signed out.")
+		m.bannerTone = bannerInfo
+		if msg.err != nil {
+			m.setBanner(sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerError)
+		}
+		return m, nil
+	case openURLMsg:
+		if msg.requestID == 0 || msg.requestID != m.openURLRequest {
+			return m, nil
+		}
+		m.openURLBusy, m.openURLRequest = false, 0
+		if msg.err != nil {
+			m.setBanner("Could not open dashboard: "+sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerError)
+		} else {
+			m.setBanner("Dashboard opened in your browser.", bannerSuccess)
+		}
+		return m, nil
+	case sessionClearedMsg:
+		if msg.epoch != m.authEpoch {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.setBanner("Could not clear expired session: "+sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerError)
+		}
 		return m, nil
 	case followOpenedMsg:
 		if msg.generation != m.followGeneration {
 			return m, nil
 		}
-		m.followJobID = msg.jobID
-		m.followEvents, m.followErrors = msg.events, msg.errors
-		m.appendEntry(entrySystem, "follow", "Following job "+sanitizeAPIText(msg.jobID)+"; Escape stops local follow.")
-		return m, m.waitForFollow()
+		m.followedJobID, m.followEvents, m.followErrors = msg.jobID, msg.events, msg.errors
+		m.followWaitPending = false
+		return m, m.startFollowWait()
 	case followEventMsg:
 		if msg.generation != m.followGeneration {
 			return m, nil
 		}
-		if msg.done {
-			m.stopFollowing(false)
+		m.followWaitPending = false
+		if msg.err != nil {
+			if isUnauthenticated(msg.err) {
+				m.showLogin("Session expired. Sign in again.")
+				return m, m.clearExpiredSession(msg.err)
+			}
+			m.setBanner("Live updates stopped: "+sanitizeIdentity(msg.err.Error(), maxAPITextBytes)+". Reopen the operation to retry.", bannerWarning)
+			m.stopFollowing()
 			return m, nil
 		}
-		if msg.err != nil {
-			m.appendEntry(entryError, "follow", msg.err.Error())
-			m.stopFollowing(false)
-			return m, nil
+		if msg.done {
+			m.followStreamDone = true
+			if m.followSnapshotPending {
+				m.followSnapshotUrgent = true
+				return m, nil
+			}
+			return m, m.startFollowSnapshot(msg.generation, true)
 		}
 		if msg.event.ID > m.followCursor {
 			m.followCursor = msg.event.ID
 		}
-		m.appendEntry(entryEvent, fmt.Sprintf("%s · %s · %d%%", msg.event.Phase, msg.event.Level, eventProgress(msg.event, m.jobs)), msg.event.Message)
-		if jobEventTerminal(msg.event) {
-			m.stopFollowing(false)
-			return m, m.startOverview()
+		m.recentEvents = appendBoundedEvent(m.recentEvents, msg.event)
+		m.phases = updatePhases(m.phases, msg.event.Phase)
+		m.followEventsSinceSnapshot++
+		shouldSnapshot := !m.followSnapshotStarted || isSnapshotUrgentEvent(msg.event) || m.followEventsSinceSnapshot >= followSnapshotEveryEvents
+		if shouldSnapshot {
+			if m.followSnapshotPending {
+				m.followSnapshotUrgent = true
+				return m, m.startFollowWait()
+			}
+			return m, m.startFollowSnapshot(msg.generation, false)
 		}
-		return m, m.waitForFollow()
-	case historyOperationMsg:
-		if m.historyActive == nil || msg.generation != m.historyActive.generation {
+		return m, m.startFollowWait()
+	case jobSnapshotMsg:
+		if msg.generation != m.followGeneration {
 			return m, nil
 		}
-		m.historyActive = nil
+		m.followSnapshotPending = false
+		streamDone := msg.streamDone || m.followStreamDone
 		if msg.err != nil {
-			m.appendEntry(entryError, "history", "Could not persist command history: "+msg.err.Error())
+			if isUnauthenticated(msg.err) {
+				m.showLogin("Session expired. Sign in again.")
+				return m, m.clearExpiredSession(msg.err)
+			}
+			m.setBanner("Could not refresh operation: "+sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerError)
+			if streamDone {
+				m.stopFollowing()
+				return m, nil
+			}
+			m.followSnapshotUrgent = false
+			return m, m.startFollowWait()
 		}
-		return m, m.startNextHistoryOperation()
-	case sessionClearedMsg:
-		return m, nil
-	case tea.MouseMsg:
-		return m.handleMouse(msg)
+		m.followedJob = msg.job
+		m.mergeJob(msg.job)
+		if isFollowTerminal(msg.job) {
+			m.stopFollowing()
+			m.result = resultFor(msg.job, m.appByID(msg.job.ResourceID))
+			m.screen = screenResult
+			// A terminal snapshot must supersede any advisory refresh already
+			// in flight so its result cannot remain stale.
+			m.overviewLoading = false
+			return m, m.startOverview()
+		}
+		if m.followSnapshotUrgent {
+			m.followSnapshotUrgent = false
+			return m, m.startFollowSnapshot(msg.generation, streamDone)
+		}
+		if streamDone {
+			m.stopFollowing()
+			m.setBanner("Live updates stopped. Reopen the operation to retry.", bannerWarning)
+			return m, nil
+		}
+		return m, m.startFollowWait()
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
-
-	if m.screen == screenConsole && m.confirm == nil {
+	if (m.screen == screenBootstrap || m.screen == screenLogin) && !m.bootstrapConfirm && !m.mutationBusy && len(m.authInputs) > 0 {
 		var cmd tea.Cmd
-		m.commandInput, cmd = m.commandInput.Update(msg)
-		m.refreshSuggestions()
+		m.authInputs[m.authIndex], cmd = m.authInputs[m.authIndex].Update(msg)
 		return m, cmd
 	}
 	return m, nil
 }
 
 func (m *Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if key.String() == "ctrl+c" {
-		m.stopFollowing(false)
+	k := key.String()
+	if k == "ctrl+c" {
+		m.stopFollowing()
 		return m, tea.Quit
+	}
+	if m.layout.unsupported {
+		return m, nil
 	}
 	switch m.screen {
 	case screenOffline:
-		if key.String() == "enter" || strings.EqualFold(key.String(), "r") {
-			m.screen, m.err, m.busy = screenLoading, "", true
+		if k == "enter" || k == "r" {
+			m.screen = screenLoading
+			m.clearBanner()
 			return m, m.checkBootstrap()
 		}
-		return m, nil
+		if k == "q" {
+			m.confirmation = &confirmation{Action: actionQuit, ReturnScreen: screenOffline}
+			m.screen = screenConfirmation
+		}
 	case screenBootstrap, screenLogin:
 		return m.handleAuthKey(key)
-	case screenConsole:
-		return m.handleConsoleKey(key)
-	default:
-		return m, nil
+	case screenSwitchboard:
+		return m.handleSwitchboardKey(k)
+	case screenActions:
+		return m.handleActionsKey(k)
+	case screenConfirmation:
+		return m.handleConfirmationKey(k)
+	case screenJobProgress:
+		return m.handleProgressKey(k)
+	case screenResult:
+		if k == "enter" || k == "esc" {
+			m.screen, m.result = screenSwitchboard, nil
+			m.clearBanner()
+			return m, nil
+		}
+		return m.handleCommonKey(k, screenResult)
+	case screenHelp:
+		if k == "esc" || k == "?" || k == "enter" {
+			m.screen = m.returnScreen
+			return m, nil
+		}
+		return m.handleCommonKey(k, screenHelp)
 	}
+	return m, nil
 }
 
 func (m *Model) handleAuthKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.busy {
+	if m.mutationBusy {
 		return m, nil
 	}
+	k := key.String()
 	if m.screen == screenBootstrap && m.bootstrapConfirm {
-		switch key.String() {
-		case "enter":
+		if k == "enter" {
 			return m.submitAuth()
-		case "esc":
+		}
+		if k == "esc" {
 			m.cancelBootstrapConfirmation()
 		}
 		return m, nil
 	}
-	switch key.String() {
+	if len(m.authInputs) == 0 {
+		return m, nil
+	}
+	switch k {
 	case "tab", "down":
 		m.focusAuth((m.authIndex + 1) % len(m.authInputs))
 		return m, nil
@@ -567,7 +556,8 @@ func (m *Model) handleAuthKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.screen == screenBootstrap {
-			return m, m.beginBootstrapConfirmation()
+			m.beginBootstrapConfirmation()
+			return m, nil
 		}
 		return m.submitAuth()
 	}
@@ -576,284 +566,257 @@ func (m *Model) handleAuthKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *Model) handleConsoleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.confirm != nil {
-		switch key.String() {
-		case "enter":
-			cmd := m.confirm.Command
-			m.confirm = nil
-			return m, m.execute(cmd)
-		case "esc":
-			m.appendEntry(entrySystem, "cancelled", "No changes were made.")
-			m.confirm = nil
-			m.restoreCommandFocus()
-		}
-		return m, nil
-	}
-	if key.String() == "esc" {
-		if m.followCancel != nil {
-			m.stopFollowing(true)
-			return m, nil
-		}
-		m.commandInput.SetValue("")
-		m.refreshSuggestions()
-		return m, nil
-	}
-	if m.busy {
-		return m, nil
-	}
-	switch key.String() {
-	case "enter":
-		return m.submitCommand()
-	case "tab":
-		if len(m.suggestions) > 0 {
-			m.commandInput.SetValue(m.suggestions[m.suggestion])
-			m.commandInput.CursorEnd()
-			m.refreshSuggestions()
-		}
-		return m, nil
-	case "up":
-		if len(m.suggestions) > 1 && strings.TrimSpace(m.commandInput.Value()) != "" {
-			m.suggestion = (m.suggestion - 1 + len(m.suggestions)) % len(m.suggestions)
-			return m, nil
-		}
-		m.previousHistory()
-		return m, nil
-	case "down":
-		if len(m.suggestions) > 1 && strings.TrimSpace(m.commandInput.Value()) != "" {
-			m.suggestion = (m.suggestion + 1) % len(m.suggestions)
-			return m, nil
-		}
-		m.nextHistory()
-		return m, nil
+func (m *Model) handleSwitchboardKey(k string) (tea.Model, tea.Cmd) {
+	switch k {
+	case "up", "k":
+		m.moveSelection(-1)
+	case "down", "j":
+		m.moveSelection(1)
 	case "pgup":
-		if m.accessible {
-			m.accessiblePageUp()
-			return m, nil
-		}
-		m.viewport.PageUp()
-		return m, nil
+		m.moveSelection(-max(1, m.layout.listRows))
 	case "pgdown":
-		if m.accessible {
-			m.accessiblePageDown()
+		m.moveSelection(max(1, m.layout.listRows))
+	case "home":
+		m.selectIndex(0)
+	case "end":
+		m.selectIndex(len(m.apps) - 1)
+	case "enter":
+		if _, ok := m.selectedApp(); ok {
+			m.selectedAction = 0
+			m.actionOffset = 0
+			m.screen = screenActions
+		}
+	case "r":
+		return m, m.startOverview()
+	default:
+		return m.handleCommonKey(k, screenSwitchboard)
+	}
+	return m, nil
+}
+
+func (m *Model) handleActionsKey(k string) (tea.Model, tea.Cmd) {
+	app, actions, ok := m.currentActions()
+	if !ok {
+		m.screen = screenSwitchboard
+		return m, nil
+	}
+	m.reconcileActionSelection(len(actions))
+	switch k {
+	case "esc":
+		m.screen = screenSwitchboard
+	case "up", "k":
+		m.selectedAction = wrapIndex(m.selectedAction-1, len(actions))
+		m.reconcileActionSelection(len(actions))
+	case "down", "j":
+		m.selectedAction = wrapIndex(m.selectedAction+1, len(actions))
+		m.reconcileActionSelection(len(actions))
+	case "home":
+		m.selectedAction = 0
+		m.reconcileActionSelection(len(actions))
+	case "end":
+		m.selectedAction = max(0, len(actions)-1)
+		m.reconcileActionSelection(len(actions))
+	case "enter":
+		if len(actions) == 0 {
 			return m, nil
 		}
-		m.viewport.PageDown()
-		return m, nil
+		item := actions[m.selectedAction]
+		if !item.Enabled {
+			m.setBanner(item.DisabledBy, bannerWarning)
+			return m, nil
+		}
+		return m.chooseAction(item, app)
+	default:
+		return m.handleCommonKey(k, screenActions)
 	}
-	var cmd tea.Cmd
-	m.commandInput, cmd = m.commandInput.Update(key)
-	m.refreshSuggestions()
-	return m, cmd
+	return m, nil
 }
 
-func (m *Model) submitCommand() (tea.Model, tea.Cmd) {
-	parsed, err := parseCommand(m.commandInput.Value())
-	if err != nil {
-		m.appendEntry(entryError, "command", err.Error())
-		return m, nil
-	}
-	m.commandInput.SetValue("")
-	m.refreshSuggestions()
-	m.appendEntry(entryCommand, "you", parsed.Raw)
-	var persist tea.Cmd
-	if parsed.Name != "/history clear" {
-		m.historyValues = normalizeHistory(append(m.historyValues, parsed.Raw))
-		m.historyIndex = len(m.historyValues)
-		persist = m.enqueueHistorySave(m.historyValues)
-	}
-	spec := commandSpecs[parsed.Name]
-	if spec.Confirm {
-		if err := m.validateCommand(parsed); err != nil {
-			m.appendEntry(entryError, parsed.Name, err.Error())
-			return m, persist
+func (m *Model) chooseAction(item actionItem, app apicontract.Application) (tea.Model, tea.Cmd) {
+	switch item.Kind {
+	case actionBack:
+		m.screen = screenSwitchboard
+	case actionOpenDashboard:
+		return m, m.openDashboard()
+	case actionViewCurrent, actionViewLast:
+		job := relevantJob(app.ID, m.jobs)
+		if job == nil {
+			return m, nil
 		}
-		m.confirm = &confirmation{Command: parsed, Text: confirmationText(parsed, m.targetAppName(parsed))}
-		m.commandInput.Blur()
-		m.resize()
-		return m, persist
-	}
-	return m, tea.Batch(persist, m.execute(parsed))
-}
-
-func (m *Model) validateCommand(cmd command) error {
-	switch cmd.Name {
-	case "/deploy", "/start", "/stop", "/restart", "/app":
-		if _, ok := m.targetApp(cmd); !ok {
-			return errors.New("application not found; run /apps or /use <slug-or-id>")
+		if isFollowTerminal(*job) {
+			m.result = resultFor(*job, app)
+			m.screen = screenResult
+			return m, nil
 		}
-	}
-	return nil
-}
-
-func (m *Model) execute(cmd command) tea.Cmd {
-	if err := m.validateCommand(cmd); err != nil {
-		return func() tea.Msg {
-			return commandResultMsg{cmd: cmd, err: &HTTPError{Status: 400, Code: "invalid_command", Detail: err.Error()}}
+		alreadyFollowing := m.followCancel != nil && m.followedJobID == job.ID
+		m.followedJob, m.followedJobID = *job, job.ID
+		m.screen = screenJobProgress
+		if !alreadyFollowing {
+			return m, m.startFollowing(job.ID, 0, true)
 		}
-	}
-	switch cmd.Name {
-	case "/help":
-		m.appendEntry(entrySystem, "commands", helpText())
-		return nil
-	case "/clear":
-		m.entries = nil
-		m.transcriptBytes = 0
-		m.invalidateAccessibleTranscript()
-		m.refreshTranscript()
-		return nil
-	case "/history clear":
-		m.historyValues = nil
-		m.historyIndex = 0
-		return m.enqueueHistoryClear()
-	case "/quit":
-		m.stopFollowing(false)
-		return tea.Quit
-	case "/logout":
-		m.busy = true
-		m.commandInput.Blur()
-		client, ctx := m.client, m.ctx
-		return func() tea.Msg {
-			err := client.Logout(ctx)
-			return commandResultMsg{cmd: cmd, body: "Session ended.", err: err}
-		}
-	case "/use":
-		for _, app := range m.apps {
-			if strings.EqualFold(app.ID, cmd.Args[0]) || strings.EqualFold(app.Slug, cmd.Args[0]) {
-				m.selectedAppID = app.ID
-				m.appendEntry(entrySuccess, "/use", fmt.Sprintf("Selected %s (%s).", sanitizeAPIText(app.Name), sanitizeAPIText(app.ID)))
-				return nil
+	default:
+		confirmation := &confirmation{Action: item.Kind, App: app, ReturnScreen: screenActions}
+		if item.Kind == actionCancelJob {
+			if job := relevantJob(app.ID, m.jobs); job != nil {
+				confirmation.Job = *job
 			}
 		}
-		m.appendEntry(entryError, "/use", "Application not found in the current list; run /apps to refresh.")
-		return nil
-	case "/follow":
-		return m.startFollowing(cmd.Args[0], 0)
+		m.confirmation = confirmation
+		m.screen = screenConfirmation
 	}
-	request, err := m.snapshotAPICommand(cmd)
+	return m, nil
+}
+
+func (m *Model) handleConfirmationKey(k string) (tea.Model, tea.Cmd) {
+	if m.confirmation == nil {
+		m.screen = screenSwitchboard
+		return m, nil
+	}
+	if m.mutationBusy {
+		return m, nil
+	}
+	if k == "esc" {
+		m.screen = m.confirmation.ReturnScreen
+		m.confirmation = nil
+		m.clearBanner()
+		return m, nil
+	}
+	if k != "enter" {
+		return m, nil
+	}
+	c := *m.confirmation
+	if c.Action == actionQuit {
+		m.stopFollowing()
+		return m, tea.Quit
+	}
+	if c.Action == actionLogout {
+		m.mutationBusy = true
+		epoch, requestID := m.nextRequest()
+		client, ctx := m.client, m.ctx
+		return m, func() tea.Msg { return logoutMsg{epoch: epoch, requestID: requestID, err: client.Logout(ctx)} }
+	}
+	key, err := m.mutationKey()
 	if err != nil {
-		return func() tea.Msg { return commandResultMsg{cmd: cmd, err: err} }
+		m.setBanner(err.Error(), bannerError)
+		return m, nil
 	}
-	m.busy = true
-	m.commandInput.Blur()
-	ctx, client := m.ctx, m.client
-	return func() tea.Msg { return runAPICommand(ctx, client, request) }
+	epoch, requestID := m.nextRequest()
+	request := mutationRequest{Action: c.Action, AppID: c.App.ID, JobID: c.Job.ID, IdempotencyKey: key, Epoch: epoch, RequestID: requestID}
+	m.mutationBusy = true
+	if c.Action == actionCancelJob {
+		return m, m.cancelJob(request)
+	}
+	return m, m.runMutation(request)
 }
 
-func (m *Model) snapshotAPICommand(cmd command) (apiCommandRequest, error) {
-	request := apiCommandRequest{cmd: command{Name: cmd.Name, Args: append([]string(nil), cmd.Args...), Raw: cmd.Raw}, selectedAppID: m.selectedAppID}
-	switch cmd.Name {
-	case "/deploy", "/start", "/stop", "/restart":
-		target, ok := m.targetApp(cmd)
-		if !ok {
-			return request, errors.New("application not found; run /apps or /use <slug-or-id>")
+func (m *Model) handleProgressKey(k string) (tea.Model, tea.Cmd) {
+	switch k {
+	case "esc":
+		m.screen = screenSwitchboard
+		m.setBanner("Operation continues; live updates remain active.", bannerInfo)
+	case "c":
+		if m.followedJobID != "" && isActiveJob(m.followedJob) && !isCancellationPending(m.followedJob) {
+			m.confirmation = &confirmation{Action: actionCancelJob, App: m.appByID(m.followedJob.ResourceID), Job: m.followedJob, ReturnScreen: screenJobProgress}
+			m.screen = screenConfirmation
 		}
-		key, err := m.mutationKey()
-		if err != nil {
-			return request, err
-		}
-		request.targetAppID, request.idempotencyKey = target.ID, key
-	case "/cancel", "/resume":
-		key, err := m.mutationKey()
-		if err != nil {
-			return request, err
-		}
-		request.idempotencyKey = key
+	default:
+		return m.handleCommonKey(k, screenJobProgress)
 	}
-	return request, nil
+	return m, nil
+}
+func (m *Model) handleCommonKey(k string, from screen) (tea.Model, tea.Cmd) {
+	switch k {
+	case "?":
+		m.returnScreen, m.screen = from, screenHelp
+	case "o":
+		return m, m.openDashboard()
+	case "l":
+		m.confirmation = &confirmation{Action: actionLogout, ReturnScreen: from}
+		m.screen = screenConfirmation
+	case "q":
+		m.confirmation = &confirmation{Action: actionQuit, ReturnScreen: from}
+		m.screen = screenConfirmation
+	case "r":
+		return m, m.startOverview()
+	}
+	return m, nil
 }
 
-func runAPICommand(ctx context.Context, client Client, request apiCommandRequest) commandResultMsg {
-	cmd := request.cmd
-	result := commandResultMsg{cmd: cmd}
-	switch cmd.Name {
-	case "/status":
-		v, err := client.Status(ctx)
-		result.err = err
-		result.body = formatStatus(v)
-	case "/doctor":
-		v, err := client.Doctor(ctx)
-		result.err = err
-		result.body = formatDoctor(v)
-	case "/apps":
-		v, err := client.Applications(ctx)
-		result.err, result.apps = err, v.Items
-		result.body = formatApps(v.Items)
-	case "/app":
-		v, err := client.Application(ctx, request.selectedAppID)
-		result.err = err
-		result.body = formatApp(v)
-	case "/machines":
-		v, err := client.Machines(ctx)
-		result.err = err
-		result.body = formatMachines(v.Items)
-	case "/jobs":
-		v, err := client.Jobs(ctx)
-		result.err, result.jobs = err, v.Items
-		result.body = formatJobs(v.Items)
-	case "/job":
-		v, err := client.Job(ctx, cmd.Args[0])
-		result.err, result.job = err, &v
-		result.body = formatJob(v)
-	case "/deploy":
-		v, err := client.Deploy(ctx, request.targetAppID, request.idempotencyKey)
-		result.err, result.job, result.followID = err, &v.Job, v.Job.ID
-		result.body = mutationBody(v)
-	case "/start", "/stop", "/restart":
-		v, err := client.Lifecycle(ctx, request.targetAppID, strings.TrimPrefix(cmd.Name, "/"), request.idempotencyKey)
-		result.err, result.job, result.followID = err, &v.Job, v.Job.ID
-		result.body = mutationBody(v)
-	case "/cancel":
-		v, err := client.CancelJob(ctx, cmd.Args[0], request.idempotencyKey)
-		result.err, result.job = err, &v.Job
-		result.body = formatJob(v.Job)
-	case "/resume":
-		v, err := client.ResumeJob(ctx, cmd.Args[0], request.idempotencyKey)
-		result.err, result.job, result.followID = err, &v.Job, v.Job.ID
-		result.body = formatJob(v.Job)
+func (m *Model) runMutation(request mutationRequest) tea.Cmd {
+	client, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		var response apicontract.JobMutationResponse
+		var err error
+		if request.Action == actionDeploy {
+			response, err = client.Deploy(ctx, request.AppID, request.IdempotencyKey)
+		} else {
+			response, err = client.Lifecycle(ctx, request.AppID, strings.ToLower(actionVerb(request.Action)), request.IdempotencyKey)
+		}
+		return mutationMsg{request: request, response: response, err: err}
 	}
-	return result
+}
+func (m *Model) cancelJob(request mutationRequest) tea.Cmd {
+	client, ctx := m.client, m.ctx
+	return func() tea.Msg {
+		response, err := client.CancelJob(ctx, request.JobID, request.IdempotencyKey)
+		return cancelMsg{request: request, response: response, err: err}
+	}
+}
+func (m *Model) openDashboard() tea.Cmd {
+	if m.openURLBusy {
+		m.setBanner("Dashboard open request is already in progress.", bannerInfo)
+		return nil
+	}
+	now := m.now()
+	if now.Before(m.openURLNext) {
+		m.setBanner("Dashboard open request was already sent.", bannerInfo)
+		return nil
+	}
+	if m.openURL == nil {
+		m.setBanner("Dashboard opener is unavailable.", bannerError)
+		return nil
+	}
+	m.openURLSerial++
+	requestID := m.openURLSerial
+	m.openURLRequest, m.openURLBusy = requestID, true
+	m.openURLNext = now.Add(dashboardOpenCooldown)
+	opener, ctx, endpoint := m.openURL, m.ctx, m.endpoint
+	return func() tea.Msg { return openURLMsg{requestID: requestID, err: opener(ctx, endpoint)} }
 }
 
-func (m *Model) startFollowing(jobID string, after int64) tea.Cmd {
-	m.stopFollowing(false)
+func (m *Model) startFollowing(jobID string, after int64, reset bool) tea.Cmd {
+	if m.followCancel != nil {
+		m.followCancel()
+	}
 	m.followGeneration++
 	generation := m.followGeneration
 	ctx, cancel := context.WithCancel(m.ctx)
+	m.followCancel, m.followContext = cancel, ctx
+	m.followedJobID, m.followCursor = jobID, after
+	m.followSnapshotPending, m.followSnapshotStarted = false, false
+	m.followSnapshotUrgent, m.followStreamDone = false, false
+	m.followEventsSinceSnapshot = 0
+	m.followWaitPending = false
+	if reset {
+		m.recentEvents, m.phases = nil, nil
+	}
 	client := m.client
-	m.followCancel = cancel
-	m.followContext = ctx
-	m.followCursor = after
-	m.restoreCommandFocus()
 	return func() tea.Msg {
 		events, errs := client.FollowJob(ctx, jobID, after)
 		return followOpenedMsg{generation: generation, jobID: jobID, events: events, errors: errs}
 	}
 }
-
 func (m *Model) waitForFollow() tea.Cmd {
-	events, errs := m.followEvents, m.followErrors
-	ctx := m.followContext
+	events, errs, ctx, generation := m.followEvents, m.followErrors, m.followContext, m.followGeneration
 	if ctx == nil {
-		ctx = m.ctx
+		return nil
 	}
-	generation := m.followGeneration
 	return func() tea.Msg {
 		select {
 		case <-ctx.Done():
 			return followEventMsg{generation: generation, done: true}
 		case event, ok := <-events:
 			if !ok {
-				if errs == nil {
-					return followEventMsg{generation: generation, done: true}
-				}
-				select {
-				case err, ok := <-errs:
-					if ok && err != nil {
-						return followEventMsg{generation: generation, err: err}
-					}
-				default:
-				}
 				return followEventMsg{generation: generation, done: true}
 			}
 			return followEventMsg{generation: generation, event: event}
@@ -865,82 +828,112 @@ func (m *Model) waitForFollow() tea.Cmd {
 		}
 	}
 }
-
-func (m *Model) stopFollowing(notify bool) {
-	m.followGeneration++
+func (m *Model) startFollowWait() tea.Cmd {
+	if m.followWaitPending {
+		return nil
+	}
+	wait := m.waitForFollow()
+	if wait != nil {
+		m.followWaitPending = true
+	}
+	return wait
+}
+func (m *Model) fetchFollowedJob(generation uint64, streamDone bool) tea.Cmd {
+	client, ctx, jobID := m.client, m.followContext, m.followedJobID
+	return func() tea.Msg {
+		job, err := client.Job(ctx, jobID)
+		return jobSnapshotMsg{generation: generation, job: job, streamDone: streamDone, err: err}
+	}
+}
+func (m *Model) startFollowSnapshot(generation uint64, streamDone bool) tea.Cmd {
+	m.followSnapshotPending, m.followSnapshotStarted = true, true
+	m.followEventsSinceSnapshot = 0
+	fetch := m.fetchFollowedJob(generation, streamDone)
+	if streamDone {
+		return fetch
+	}
+	return tea.Batch(m.startFollowWait(), fetch)
+}
+func (m *Model) stopFollowing() {
 	if m.followCancel != nil {
 		m.followCancel()
-		if notify {
-			m.appendEntry(entrySystem, "follow", "Stopped local follow; the server job is still running.")
-		}
 	}
 	m.followCancel, m.followContext, m.followEvents, m.followErrors = nil, nil, nil, nil
-	m.followJobID = ""
-	m.restoreCommandFocus()
+	m.followSnapshotPending, m.followSnapshotUrgent, m.followStreamDone = false, false, false
+	m.followEventsSinceSnapshot = 0
+	m.followWaitPending = false
+	m.followGeneration++
 }
 
 func (m *Model) submitAuth() (tea.Model, tea.Cmd) {
-	if m.busy {
+	if m.mutationBusy {
 		return m, nil
 	}
-	for index, input := range m.authInputs {
+	for i, input := range m.authInputs {
 		if strings.TrimSpace(input.Value()) == "" {
-			m.err = authFieldLabel(m.screen, index) + " is required."
-			m.focusAuth(index)
+			m.setBanner(authFieldLabel(m.screen, i)+" is required.", bannerError)
+			m.focusAuth(i)
 			return m, nil
 		}
 	}
-	m.busy, m.err, m.bootstrapConfirm, m.bootstrapUsername = true, "", false, ""
+	m.mutationBusy, m.bootstrapConfirm, m.bootstrapUsername = true, false, ""
+	m.clearBanner()
+	epoch, requestID := m.nextRequest()
 	client, ctx := m.client, m.ctx
 	if m.screen == screenLogin {
 		request := apicontract.LoginRequest{Username: m.authInputs[0].Value(), Passphrase: m.authInputs[1].Value()}
 		m.clearAuthValues()
-		return m, func() tea.Msg { v, err := client.Login(ctx, request); return authMsg{session: v, err: err} }
+		return m, func() tea.Msg {
+			v, err := client.Login(ctx, request)
+			return authMsg{session: v, epoch: epoch, requestID: requestID, err: err}
+		}
 	}
 	request := apicontract.BootstrapRequest{Token: m.authInputs[0].Value(), Username: m.authInputs[1].Value(), Passphrase: m.authInputs[2].Value()}
 	m.clearAuthValues()
-	return m, func() tea.Msg { v, err := client.Bootstrap(ctx, request); return authMsg{session: v, err: err} }
+	return m, func() tea.Msg {
+		v, err := client.Bootstrap(ctx, request)
+		return authMsg{session: v, epoch: epoch, requestID: requestID, err: err}
+	}
 }
-
 func (m *Model) showBootstrap() {
-	m.screen, m.busy, m.err, m.bootstrapConfirm, m.bootstrapUsername = screenBootstrap, false, "", false, ""
+	m.resetAuthenticatedState()
+	m.screen, m.mutationBusy, m.err, m.bootstrapConfirm = screenBootstrap, false, "", false
+	m.bannerTone = bannerError
 	m.authInputs = []textinput.Model{authInput("bootstrap token", true), authInput("admin username", false), authInput("passphrase", true)}
 	m.resizeAuthInputs()
 	m.focusAuth(0)
 }
-
-func (m *Model) beginBootstrapConfirmation() tea.Cmd {
-	for index, input := range m.authInputs {
+func (m *Model) beginBootstrapConfirmation() {
+	for i, input := range m.authInputs {
 		if strings.TrimSpace(input.Value()) == "" {
-			m.err = authFieldLabel(m.screen, index) + " is required."
-			m.focusAuth(index)
-			return nil
+			m.setBanner(authFieldLabel(m.screen, i)+" is required.", bannerError)
+			m.focusAuth(i)
+			return
 		}
 	}
-	m.bootstrapConfirm = true
-	m.commandInput.Blur()
+	m.bootstrapConfirm, m.bootstrapUsername = true, sanitizeIdentity(m.authInputs[1].Value(), 512)
+	m.clearBanner()
 	for i := range m.authInputs {
 		m.authInputs[i].Blur()
 	}
-	m.bootstrapUsername = sanitizeAPIText(m.authInputs[1].Value())
-	m.err = ""
-	return nil
 }
-
 func (m *Model) cancelBootstrapConfirmation() {
 	m.bootstrapConfirm, m.bootstrapUsername = false, ""
 	m.clearAuthValues()
 	m.focusAuth(0)
 }
-
 func (m *Model) showLogin(message string) {
-	m.stopFollowing(false)
-	m.screen, m.busy, m.err = screenLogin, false, sanitizeAPIText(message)
+	m.resetAuthenticatedState()
+	m.screen, m.mutationBusy, m.err = screenLogin, false, sanitizeIdentity(message, maxAPITextBytes)
+	if m.err != "" {
+		m.bannerTone = bannerWarning
+	} else {
+		m.bannerTone = bannerError
+	}
 	m.authInputs = []textinput.Model{authInput("username", false), authInput("passphrase", true)}
 	m.resizeAuthInputs()
 	m.focusAuth(0)
 }
-
 func authInput(placeholder string, secret bool) textinput.Model {
 	input := textinput.New()
 	input.Prompt = ""
@@ -952,11 +945,7 @@ func authInput(placeholder string, secret bool) textinput.Model {
 	}
 	return input
 }
-
-func (m *Model) compactAuthLayout() bool {
-	return m.width < 60 || m.height < 18
-}
-
+func (m *Model) compactAuthLayout() bool { return m.width < 60 || m.height < 18 }
 func (m *Model) resizeAuthInputs() {
 	if len(m.authInputs) == 0 {
 		return
@@ -965,19 +954,15 @@ func (m *Model) resizeAuthInputs() {
 	if width <= 0 {
 		width = 68
 	}
-	if m.compactAuthLayout() {
-		for i := range m.authInputs {
-			labelWidth := len(authFieldLabel(m.screen, i)) + 2 // ": "
-			m.authInputs[i].Width = max(6, width-labelWidth-1)
-		}
-		return
-	}
-	panelWidth := min(max(1, width-4), 68)
 	for i := range m.authInputs {
-		m.authInputs[i].Width = max(12, panelWidth-4)
+		if m.compactAuthLayout() {
+			prefixWidth := ansi.StringWidth("  " + authDisplayLabel(m.screen, i) + ": ")
+			m.authInputs[i].Width = max(1, width-prefixWidth)
+		} else {
+			m.authInputs[i].Width = max(12, min(width-8, 64))
+		}
 	}
 }
-
 func (m *Model) focusAuth(index int) {
 	m.authIndex = index
 	for i := range m.authInputs {
@@ -988,13 +973,21 @@ func (m *Model) focusAuth(index int) {
 		}
 	}
 }
-
 func (m *Model) clearAuthValues() {
 	for i := range m.authInputs {
 		m.authInputs[i].SetValue("")
 	}
 }
 
+func (m *Model) setBanner(value string, tone bannerTone) {
+	m.err = value
+	m.bannerTone = tone
+}
+
+func (m *Model) clearBanner() {
+	m.err = ""
+	m.bannerTone = bannerError
+}
 func (m *Model) mutationKey() (string, error) {
 	key := m.newKey()
 	if key == "" {
@@ -1003,35 +996,245 @@ func (m *Model) mutationKey() (string, error) {
 	return key, nil
 }
 
-func (m *Model) enterConsole(user apicontract.User) {
-	m.screen, m.busy, m.err, m.user, m.overviewLoaded, m.overviewLoading = screenConsole, false, "", user, false, false
-	m.commandInput.Focus()
-	m.appendEntry(entrySystem, "connected", "Authenticated as "+sanitizeAPIText(user.Username)+". Type /help for commands.")
+func (m *Model) enterSwitchboard(user apicontract.User) {
+	m.resetAuthenticatedState()
+	m.screen, m.user, m.err, m.mutationBusy, m.overviewLoaded, m.overviewLoading = screenSwitchboard, user, "", false, false, false
+	m.bannerTone = bannerError
+	m.confirmation, m.result = nil, nil
 }
-
 func (m *Model) goOffline(err error) {
-	m.stopFollowing(false)
-	m.screen, m.busy, m.err = screenOffline, false, sanitizeAPIText(err.Error())
+	m.resetAuthenticatedState()
+	m.screen, m.mutationBusy, m.err = screenOffline, false, sanitizeIdentity(err.Error(), maxAPITextBytes)
+	m.bannerTone = bannerError
+}
+func (m *Model) clearExpiredSession(authErr error) tea.Cmd {
+	client, ctx := m.client, m.ctx
+	epoch := m.authEpoch
+	generation := failedSessionGeneration(authErr)
+	return func() tea.Msg {
+		return sessionClearedMsg{epoch: epoch, err: client.ClearSession(ctx, generation)}
+	}
+}
+func (m *Model) operationError(err error, fallback screen) tea.Cmd {
+	if isUnauthenticated(err) {
+		m.showLogin("Session expired. Sign in again.")
+		return m.clearExpiredSession(err)
+	}
+	m.setBanner(sanitizeIdentity(err.Error(), maxAPITextBytes), bannerError)
+	m.screen, m.confirmation = fallback, nil
+	return nil
 }
 
-func (m *Model) restoreCommandFocus() {
-	if m.screen == screenConsole && m.confirm == nil && !m.busy {
-		m.commandInput.Focus()
+func (m *Model) nextRequest() (uint64, uint64) {
+	m.requestSerial++
+	m.activeRequestID = m.requestSerial
+	return m.authEpoch, m.requestSerial
+}
+
+func (m *Model) requestCurrent(epoch, requestID uint64) bool {
+	return requestID != 0 && epoch == m.authEpoch && requestID == m.activeRequestID
+}
+
+func (m *Model) resetAuthenticatedState() {
+	m.authEpoch++
+	m.overviewGen++
+	m.stopFollowing()
+	m.user = apicontract.User{}
+	m.status = apicontract.SystemStatus{}
+	m.apps = nil
+	m.jobs = nil
+	m.selectedAppID = ""
+	m.listOffset, m.selectedAction, m.actionOffset = 0, 0, 0
+	m.confirmation, m.result = nil, nil
+	m.overviewLoaded, m.overviewLoading = false, false
+	m.mutationBusy, m.activeRequestID = false, 0
+	m.followedJobID = ""
+	m.followedJob = apicontract.Job{}
+	m.followCursor = 0
+	m.recentEvents, m.phases = nil, nil
+}
+
+func validateMutationResponse(request mutationRequest, job apicontract.Job) error {
+	if job.ID == "" || job.ResourceType != "application" || job.ResourceID != request.AppID {
+		return errors.New("controller returned an operation for an unexpected application; live updates were not started")
+	}
+	expected, ok := expectedMutationJobType(request.Action)
+	if !ok || strings.ToLower(strings.TrimSpace(job.Type)) != expected {
+		return errors.New("controller returned an unexpected operation type; live updates were not started")
+	}
+	return nil
+}
+
+func expectedMutationJobType(action actionKind) (string, bool) {
+	switch action {
+	case actionDeploy:
+		return "deploy", true
+	case actionStart:
+		return "start", true
+	case actionStop:
+		return "stop", true
+	case actionRestart:
+		return "restart", true
+	default:
+		return "", false
 	}
 }
 
-func (m *Model) reconcileSelectedApp() {
-	for _, app := range m.apps {
-		if app.ID == m.selectedAppID {
-			return
+func validateCancelResponse(request mutationRequest, job apicontract.Job) error {
+	if job.ID == "" || job.ID != request.JobID {
+		return errors.New("controller returned an unexpected cancellation job; live updates were not changed")
+	}
+	if request.AppID != "" && (job.ResourceType != "application" || job.ResourceID != request.AppID) {
+		return errors.New("controller returned a cancellation job for an unexpected application; live updates were not changed")
+	}
+	return nil
+}
+
+func sortedApps(items []apicontract.Application) []apicontract.Application {
+	out := append([]apicontract.Application(nil), items...)
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := strings.ToLower(sanitizeIdentity(out[i].Name, 512)), strings.ToLower(sanitizeIdentity(out[j].Name, 512))
+		if a != b {
+			return a < b
+		}
+		a, b = strings.ToLower(sanitizeIdentity(out[i].Slug, 512)), strings.ToLower(sanitizeIdentity(out[j].Slug, 512))
+		if a != b {
+			return a < b
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+func (m *Model) selectedIndex() int {
+	for i := range m.apps {
+		if m.apps[i].ID == m.selectedAppID {
+			return i
 		}
 	}
-	m.selectedAppID = ""
-	if len(m.apps) > 0 {
-		m.selectedAppID = m.apps[0].ID
+	return -1
+}
+func (m *Model) reconcileSelection(fallback int) {
+	if i := m.selectedIndex(); i >= 0 {
+		m.reconcileOffset()
+		return
+	}
+	if len(m.apps) == 0 {
+		m.selectedAppID = ""
+		m.listOffset = 0
+		return
+	}
+	if fallback < 0 {
+		fallback = 0
+	}
+	if fallback >= len(m.apps) {
+		fallback = len(m.apps) - 1
+	}
+	m.selectedAppID = m.apps[fallback].ID
+	m.reconcileOffset()
+}
+func (m *Model) reconcileOffset() {
+	index := m.selectedIndex()
+	if index < 0 {
+		m.listOffset = 0
+		return
+	}
+	capacity := max(1, m.layout.listRows)
+	if index < m.listOffset {
+		m.listOffset = index
+	}
+	if index >= m.listOffset+capacity {
+		m.listOffset = index - capacity + 1
+	}
+	maxOffset := max(0, len(m.apps)-capacity)
+	if m.listOffset > maxOffset {
+		m.listOffset = maxOffset
+	}
+	if m.listOffset < 0 {
+		m.listOffset = 0
 	}
 }
+func (m *Model) moveSelection(delta int) {
+	if len(m.apps) == 0 {
+		return
+	}
+	index := m.selectedIndex()
+	if index < 0 {
+		index = 0
+	}
+	m.selectIndex(index + delta)
+}
+func (m *Model) selectIndex(index int) {
+	if len(m.apps) == 0 {
+		return
+	}
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(m.apps) {
+		index = len(m.apps) - 1
+	}
+	m.selectedAppID = m.apps[index].ID
+	m.reconcileOffset()
+}
+func (m *Model) selectedApp() (apicontract.Application, bool) {
+	for _, app := range m.apps {
+		if app.ID == m.selectedAppID {
+			return app, true
+		}
+	}
+	return apicontract.Application{}, false
+}
 
+func (m *Model) currentActions() (apicontract.Application, []actionItem, bool) {
+	app, ok := m.selectedApp()
+	if !ok {
+		return apicontract.Application{}, nil, false
+	}
+	return app, actionsFor(app, relevantJob(app.ID, m.jobs), m.status), true
+}
+
+func (m *Model) actionCapacity() int {
+	reserved := 2 // title and footer
+	if m.err != "" {
+		reserved++
+	}
+	return max(1, m.height-reserved)
+}
+
+func (m *Model) reconcileActionSelection(length int) {
+	if length <= 0 {
+		m.selectedAction, m.actionOffset = 0, 0
+		return
+	}
+	if m.selectedAction < 0 {
+		m.selectedAction = 0
+	}
+	if m.selectedAction >= length {
+		m.selectedAction = length - 1
+	}
+	capacity := m.actionCapacity()
+	if m.selectedAction < m.actionOffset {
+		m.actionOffset = m.selectedAction
+	}
+	if m.selectedAction >= m.actionOffset+capacity {
+		m.actionOffset = m.selectedAction - capacity + 1
+	}
+	maxOffset := max(0, length-capacity)
+	if m.actionOffset > maxOffset {
+		m.actionOffset = maxOffset
+	}
+	if m.actionOffset < 0 {
+		m.actionOffset = 0
+	}
+}
+func (m *Model) appByID(id string) apicontract.Application {
+	for _, app := range m.apps {
+		if app.ID == id {
+			return app
+		}
+	}
+	return apicontract.Application{ID: id, Name: "Application"}
+}
 func (m *Model) mergeJob(job apicontract.Job) {
 	for i := range m.jobs {
 		if m.jobs[i].ID == job.ID {
@@ -1041,57 +1244,61 @@ func (m *Model) mergeJob(job apicontract.Job) {
 	}
 	m.jobs = append([]apicontract.Job{job}, m.jobs...)
 }
-
-func (m *Model) handleControllerError(err error) tea.Cmd {
-	if isUnauthenticated(err) {
-		m.showLogin("Session expired. Sign in again.")
-		return func() tea.Msg { _ = m.client.Logout(m.ctx); return sessionClearedMsg{} }
+func (m *Model) syncFollowSnapshot() {
+	if m.followedJobID == "" {
+		return
 	}
-	var httpErr *HTTPError
-	if !errors.As(err, &httpErr) {
-		m.goOffline(err)
-		return nil
+	for _, job := range m.jobs {
+		if job.ID == m.followedJobID {
+			m.followedJob = job
+			return
+		}
 	}
-	m.appendEntry(entryError, "controller", err.Error())
-	return nil
+}
+func wrapIndex(index, length int) int {
+	if length <= 0 {
+		return 0
+	}
+	for index < 0 {
+		index += length
+	}
+	return index % length
 }
 
-func (m *Model) appendEntry(kind entryKind, title, body string) {
-	entry := transcriptEntry{Kind: kind, Title: sanitizeAPIText(title), Body: sanitizeAPIText(body)}
-	entry = boundTranscriptEntry(entry, transcriptByteLimit)
-	m.entries = append(m.entries, entry)
-	m.transcriptBytes += transcriptEntryBytes(entry)
-	trimmed := 0
-	for len(m.entries)-trimmed > transcriptLimit || m.transcriptBytes > transcriptByteLimit {
-		m.transcriptBytes -= transcriptEntryBytes(m.entries[trimmed])
-		trimmed++
+func resultFor(job apicontract.Job, app apicontract.Application) *resultState {
+	name := displayAppName(app)
+	op := titleWord(job.Type)
+	title := op + " completed"
+	detail := name + " completed successfully."
+	switch strings.ToLower(job.Status) {
+	case "failed", "interrupted":
+		title = op + " failed"
+		detail = sanitizeIdentity(job.ErrorDetail, maxAPITextBytes)
+		if detail == "" {
+			detail = "The operation did not complete. Open the dashboard for full details."
+		}
+	case "cancelled":
+		title = op + " cancelled"
+		detail = "The controller job was cancelled."
+	case "waiting_user":
+		title = op + " needs approval"
+		detail = "Approval review is available in the web dashboard."
+	case "needs_attention":
+		title = op + " needs attention"
+		detail = sanitizeIdentity(job.ErrorDetail, maxAPITextBytes)
+		if detail == "" {
+			detail = "Continue in the web dashboard."
+		}
 	}
-	if trimmed > 0 {
-		m.entries = append([]transcriptEntry(nil), m.entries[trimmed:]...)
+	return &resultState{AppID: app.ID, JobID: job.ID, Title: title, Detail: detail}
+}
+func randomIdempotencyKey() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return ""
 	}
-	m.invalidateAccessibleTranscript()
-	m.refreshTranscript()
+	return "tui-" + hex.EncodeToString(b)
 }
-
-func (m *Model) invalidateAccessibleTranscript() {
-	m.transcriptGen++
-	m.accessiblePage = 0
-}
-
-func transcriptEntryBytes(entry transcriptEntry) int {
-	return len(entry.Title) + len(entry.Body) + transcriptEntryOverhead
-}
-
-func boundTranscriptEntry(entry transcriptEntry, limit int) transcriptEntry {
-	limit -= transcriptEntryOverhead
-	if limit <= 0 {
-		return transcriptEntry{Kind: entry.Kind}
-	}
-	entry.Title = truncateUTF8Bytes(entry.Title, limit)
-	entry.Body = truncateUTF8Bytes(entry.Body, limit-len(entry.Title))
-	return entry
-}
-
 func truncateUTF8Bytes(value string, limit int) string {
 	if limit <= 0 {
 		return ""
@@ -1105,213 +1312,3 @@ func truncateUTF8Bytes(value string, limit int) string {
 	}
 	return value[:cut]
 }
-
-func (m *Model) refreshTranscript() {
-	m.transcriptBuilds++
-	wasBottom := m.viewport.AtBottom()
-	var b strings.Builder
-	for _, entry := range m.entries {
-		prefix := "·"
-		switch entry.Kind {
-		case entryCommand:
-			prefix = ">"
-		case entrySuccess:
-			prefix = "✓"
-		case entryError:
-			prefix = "!"
-		case entryEvent:
-			prefix = "↳"
-		}
-		fmt.Fprintf(&b, "%s %s\n%s\n\n", prefix, entry.Title, entry.Body)
-	}
-	m.viewport.SetContent(strings.TrimSuffix(b.String(), "\n"))
-	if wasBottom || len(m.entries) <= 1 {
-		m.viewport.GotoBottom()
-	}
-}
-
-func (m *Model) refreshSuggestions() {
-	m.suggestions = commandSuggestions(m.commandInput.Value())
-	if m.suggestion >= len(m.suggestions) {
-		m.suggestion = 0
-	}
-	m.resize()
-}
-
-func (m *Model) previousHistory() {
-	if len(m.historyValues) == 0 {
-		return
-	}
-	if m.historyIndex == len(m.historyValues) {
-		m.draft = m.commandInput.Value()
-	}
-	if m.historyIndex > 0 {
-		m.historyIndex--
-	}
-	m.commandInput.SetValue(m.historyValues[m.historyIndex])
-	m.commandInput.CursorEnd()
-	m.refreshSuggestions()
-}
-
-func (m *Model) nextHistory() {
-	if m.historyIndex < len(m.historyValues)-1 {
-		m.historyIndex++
-		m.commandInput.SetValue(m.historyValues[m.historyIndex])
-	} else {
-		m.historyIndex = len(m.historyValues)
-		m.commandInput.SetValue(m.draft)
-	}
-	m.commandInput.CursorEnd()
-	m.refreshSuggestions()
-}
-
-func (m *Model) resize() {
-	previousTranscriptWidth := m.viewport.Width
-	m.layout = calculateLayout(m.width, m.height, len(m.suggestions), m.confirm != nil)
-	w := max(1, m.layout.transcript.w-2)
-	h := max(1, m.layout.transcript.h-2)
-	m.viewport.Width, m.viewport.Height = w, h
-	m.commandInput.Width = max(1, m.layout.command.w-4)
-	m.resizeAuthInputs()
-	m.rebuildHitTargets()
-	if m.accessibleWidth != m.width {
-		m.accessiblePage = 0
-	}
-	if previousTranscriptWidth != w {
-		m.refreshTranscript()
-	}
-}
-
-func (m *Model) selectedAppName() string {
-	for _, app := range m.apps {
-		if app.ID == m.selectedAppID {
-			if app.Slug != "" {
-				return sanitizeAPIText(app.Slug)
-			}
-			return sanitizeAPIText(app.Name)
-		}
-	}
-	return "none"
-}
-
-func (m *Model) targetApp(cmd command) (apicontract.Application, bool) {
-	target := m.selectedAppID
-	if (cmd.Name == "/deploy" || cmd.Name == "/start" || cmd.Name == "/stop" || cmd.Name == "/restart") && len(cmd.Args) == 1 {
-		target = cmd.Args[0]
-	}
-	for _, app := range m.apps {
-		if strings.EqualFold(app.ID, target) || strings.EqualFold(app.Slug, target) {
-			return app, true
-		}
-	}
-	return apicontract.Application{}, false
-}
-
-func (m *Model) targetAppName(cmd command) string {
-	if app, ok := m.targetApp(cmd); ok {
-		if app.Slug != "" {
-			return sanitizeAPIText(app.Slug)
-		}
-		return sanitizeAPIText(app.Name)
-	}
-	return m.selectedAppName()
-}
-
-func randomIdempotencyKey() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return ""
-	}
-	return "tui-" + hex.EncodeToString(b)
-}
-
-func jobEventTerminal(event apicontract.JobEvent) bool {
-	code := strings.ToLower(event.Code)
-	phase := strings.ToLower(event.Phase)
-	return code == "job_succeeded" || code == "job_failed" || code == "job_cancelled" || code == "daemon_restarted" || code == "needs_attention" || phase == "succeeded" || phase == "failed" || phase == "cancelled" || phase == "interrupted" || phase == "needs_attention"
-}
-
-func eventProgress(event apicontract.JobEvent, jobs []apicontract.Job) int {
-	for _, job := range jobs {
-		if job.ID == event.JobID {
-			return job.Progress
-		}
-	}
-	return 0
-}
-
-func formatStatus(v apicontract.SystemStatus) string {
-	return fmt.Sprintf("daemon: %s\nengine ready: %t\ndocker: %s\ncompose: %s", sanitizeAPIText(v.Daemon), v.Diagnostics.EngineReady, sanitizeAPIText(v.Diagnostics.DockerVersion), sanitizeAPIText(v.Diagnostics.ComposeVersion))
-}
-
-func formatDoctor(v apicontract.DoctorResponse) string {
-	lines := make([]string, 0, len(v.Checks)+1)
-	for _, check := range v.Checks {
-		mark := "FAIL"
-		if check.OK {
-			mark = "OK"
-		}
-		lines = append(lines, fmt.Sprintf("%-4s %-18s %s", mark, sanitizeAPIText(check.Name), sanitizeAPIText(check.Detail)))
-	}
-	if v.StartupLimitation != "" {
-		lines = append(lines, "limitation: "+sanitizeAPIText(v.StartupLimitation))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func formatApps(apps []apicontract.Application) string {
-	if len(apps) == 0 {
-		return "No applications."
-	}
-	items := append([]apicontract.Application(nil), apps...)
-	sort.SliceStable(items, func(i, j int) bool { return items[i].Slug < items[j].Slug })
-	lines := make([]string, 0, len(items))
-	for _, app := range items {
-		lines = append(lines, fmt.Sprintf("%-20s %-12s %s", sanitizeAPIText(app.Slug), sanitizeAPIText(app.Status), sanitizeAPIText(app.ID)))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func formatApp(app apicontract.Application) string {
-	return fmt.Sprintf("%s (%s)\nstatus: %s\nmachine: %s\nsource: %s\n%s", sanitizeAPIText(app.Name), sanitizeAPIText(app.Slug), sanitizeAPIText(app.Status), sanitizeAPIText(app.MachineName), sanitizeAPIText(app.Source.Type), sanitizeAPIText(app.Description))
-}
-
-func formatMachines(items []apicontract.Machine) string {
-	if len(items) == 0 {
-		return "No machines."
-	}
-	lines := make([]string, 0, len(items))
-	for _, machine := range items {
-		lines = append(lines, fmt.Sprintf("%-18s %-12s %s/%s", sanitizeAPIText(machine.Name), sanitizeAPIText(machine.Status), sanitizeAPIText(machine.OS), sanitizeAPIText(machine.Architecture)))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func formatJobs(items []apicontract.Job) string {
-	if len(items) == 0 {
-		return "No jobs."
-	}
-	lines := make([]string, 0, len(items))
-	for _, job := range items {
-		lines = append(lines, fmt.Sprintf("%-24s %-10s %3d%% %s", sanitizeAPIText(job.ID), sanitizeAPIText(job.Status), job.Progress, sanitizeAPIText(job.Type)))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func formatJob(job apicontract.Job) string {
-	line := fmt.Sprintf("%s\nstatus: %s\nphase: %s\nprogress: %d%%\nresource: %s", sanitizeAPIText(job.ID), sanitizeAPIText(job.Status), sanitizeAPIText(job.Phase), job.Progress, sanitizeAPIText(job.ResourceID))
-	if job.ErrorDetail != "" {
-		line += "\nerror: " + sanitizeAPIText(job.ErrorDetail)
-	}
-	return line
-}
-
-func mutationBody(v apicontract.JobMutationResponse) string {
-	verb := "Accepted"
-	if !v.Created {
-		verb = "Reused"
-	}
-	return fmt.Sprintf("%s job %s (%s).", verb, sanitizeAPIText(v.Job.ID), sanitizeAPIText(v.Job.Status))
-}
-
-var _ tea.Model = (*Model)(nil)

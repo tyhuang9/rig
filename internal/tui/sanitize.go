@@ -84,3 +84,37 @@ func sanitizeAPIText(value string) string {
 	}
 	return out.String()
 }
+
+// sanitizeIdentity is the strict boundary for API-controlled values rendered
+// inside rows, labels, and confirmations. Unlike longer diagnostic text it is
+// always one line, removes Unicode formatting/bidi/zero-width controls, folds
+// whitespace, and is byte bounded without splitting UTF-8.
+func sanitizeIdentity(value string, limit int) string {
+	value = sanitizeAPIText(value)
+	var out strings.Builder
+	space := false
+	for _, r := range value {
+		if forbiddenIdentityRune(r) || unicode.IsControl(r) {
+			if unicode.IsSpace(r) {
+				space = out.Len() > 0
+			}
+			continue
+		}
+		if unicode.IsSpace(r) {
+			space = out.Len() > 0
+			continue
+		}
+		if space {
+			out.WriteByte(' ')
+			space = false
+		}
+		out.WriteRune(r)
+	}
+	return truncateUTF8Bytes(strings.TrimSpace(out.String()), limit)
+}
+
+func forbiddenIdentityRune(r rune) bool {
+	return unicode.Is(unicode.Cf, r) || r == '\u034f' ||
+		(r >= '\ufe00' && r <= '\ufe0f') ||
+		(r >= '\U000e0100' && r <= '\U000e01ef')
+}
