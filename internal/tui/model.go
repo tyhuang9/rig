@@ -35,6 +35,15 @@ type resultState struct{ AppID, JobID, Title, Detail string }
 
 const dashboardOpenCooldown = 1500 * time.Millisecond
 
+type bannerTone uint8
+
+const (
+	bannerError bannerTone = iota
+	bannerInfo
+	bannerWarning
+	bannerSuccess
+)
+
 // Model is an explicit application-first state machine. Overview refresh,
 // mutation submission, and the one active server-job follow have independent
 // state so an advisory refresh cannot release a mutation guard.
@@ -50,6 +59,7 @@ type Model struct {
 	layout               layout
 	accessible           bool
 	err                  string
+	bannerTone           bannerTone
 	user                 apicontract.User
 
 	status                          apicontract.SystemStatus
@@ -249,7 +259,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.activeRequestID = 0
 		m.mutationBusy = false
 		if msg.err != nil {
-			m.err = sanitizeIdentity(msg.err.Error(), maxAPITextBytes)
+			m.setBanner(sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerError)
 			if m.screen == screenLogin {
 				m.clearAuthValues()
 			}
@@ -271,7 +281,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.clearExpiredSession(msg.err)
 			}
 			if m.overviewLoaded {
-				m.err = "Refresh failed: " + sanitizeIdentity(msg.err.Error(), maxAPITextBytes)
+				m.setBanner("Refresh failed: "+sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerWarning)
 				return m, nil
 			}
 			m.goOffline(msg.err)
@@ -282,7 +292,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.apps = sortedApps(msg.apps.Items)
 		m.jobs = append([]apicontract.Job(nil), msg.jobs.Items...)
 		m.overviewLoaded = true
-		m.err = ""
+		m.clearBanner()
 		m.reconcileSelection(oldIndex)
 		m.syncFollowSnapshot()
 		if m.screen == screenActions {
@@ -309,7 +319,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.followedJobID = msg.response.Job.ID
 		m.screen = screenJobProgress
 		m.confirmation = nil
-		m.err = ""
+		m.clearBanner()
 		return m, m.startFollowing(msg.response.Job.ID, 0, true)
 	case cancelMsg:
 		if !m.requestCurrent(msg.request.Epoch, msg.request.RequestID) {
@@ -328,7 +338,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.followedJob = msg.response.Job
 		m.followedJobID = msg.response.Job.ID
 		m.screen = screenJobProgress
-		m.err = "Cancellation requested; waiting for the controller job to finish."
+		m.setBanner("Cancellation requested; waiting for the controller job to finish.", bannerWarning)
 		if m.followCancel == nil && !isFollowTerminal(msg.response.Job) {
 			return m, m.startFollowing(msg.response.Job.ID, m.followCursor, false)
 		}
@@ -341,8 +351,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mutationBusy = false
 		m.confirmation = nil
 		m.showLogin("Signed out.")
+		m.bannerTone = bannerInfo
 		if msg.err != nil {
-			m.err = sanitizeIdentity(msg.err.Error(), maxAPITextBytes)
+			m.setBanner(sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerError)
 		}
 		return m, nil
 	case openURLMsg:
@@ -351,9 +362,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.openURLBusy, m.openURLRequest = false, 0
 		if msg.err != nil {
-			m.err = "Could not open dashboard: " + sanitizeIdentity(msg.err.Error(), maxAPITextBytes)
+			m.setBanner("Could not open dashboard: "+sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerError)
 		} else {
-			m.err = "Dashboard opened in your browser."
+			m.setBanner("Dashboard opened in your browser.", bannerSuccess)
 		}
 		return m, nil
 	case sessionClearedMsg:
@@ -361,7 +372,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.err != nil {
-			m.err = "Could not clear expired session: " + sanitizeIdentity(msg.err.Error(), maxAPITextBytes)
+			m.setBanner("Could not clear expired session: "+sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerError)
 		}
 		return m, nil
 	case followOpenedMsg:
@@ -379,7 +390,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showLogin("Session expired. Sign in again.")
 				return m, m.clearExpiredSession(msg.err)
 			}
-			m.err = "Live updates stopped: " + sanitizeIdentity(msg.err.Error(), maxAPITextBytes) + ". Reopen the operation to retry."
+			m.setBanner("Live updates stopped: "+sanitizeIdentity(msg.err.Error(), maxAPITextBytes)+". Reopen the operation to retry.", bannerWarning)
 			m.stopFollowing()
 			return m, nil
 		}
@@ -401,7 +412,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showLogin("Session expired. Sign in again.")
 				return m, m.clearExpiredSession(msg.err)
 			}
-			m.err = "Could not refresh operation: " + sanitizeIdentity(msg.err.Error(), maxAPITextBytes)
+			m.setBanner("Could not refresh operation: "+sanitizeIdentity(msg.err.Error(), maxAPITextBytes), bannerError)
 			if msg.streamDone {
 				m.stopFollowing()
 			}
@@ -420,7 +431,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.streamDone {
 			m.stopFollowing()
-			m.err = "Live updates stopped. Reopen the operation to retry."
+			m.setBanner("Live updates stopped. Reopen the operation to retry.", bannerWarning)
 			return m, nil
 		}
 		return m, m.waitForFollow()
@@ -441,10 +452,14 @@ func (m *Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.stopFollowing()
 		return m, tea.Quit
 	}
+	if m.layout.unsupported {
+		return m, nil
+	}
 	switch m.screen {
 	case screenOffline:
 		if k == "enter" || k == "r" {
-			m.screen, m.err = screenLoading, ""
+			m.screen = screenLoading
+			m.clearBanner()
 			return m, m.checkBootstrap()
 		}
 		if k == "q" {
@@ -463,7 +478,8 @@ func (m *Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleProgressKey(k)
 	case screenResult:
 		if k == "enter" || k == "esc" {
-			m.screen, m.result, m.err = screenSwitchboard, nil, ""
+			m.screen, m.result = screenSwitchboard, nil
+			m.clearBanner()
 			return m, nil
 		}
 		return m.handleCommonKey(k, screenResult)
@@ -472,6 +488,7 @@ func (m *Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.screen = m.returnScreen
 			return m, nil
 		}
+		return m.handleCommonKey(k, screenHelp)
 	}
 	return m, nil
 }
@@ -572,7 +589,7 @@ func (m *Model) handleActionsKey(k string) (tea.Model, tea.Cmd) {
 		}
 		item := actions[m.selectedAction]
 		if !item.Enabled {
-			m.err = item.DisabledBy
+			m.setBanner(item.DisabledBy, bannerWarning)
 			return m, nil
 		}
 		return m.chooseAction(item, app)
@@ -628,7 +645,7 @@ func (m *Model) handleConfirmationKey(k string) (tea.Model, tea.Cmd) {
 	if k == "esc" {
 		m.screen = m.confirmation.ReturnScreen
 		m.confirmation = nil
-		m.err = ""
+		m.clearBanner()
 		return m, nil
 	}
 	if k != "enter" {
@@ -647,7 +664,7 @@ func (m *Model) handleConfirmationKey(k string) (tea.Model, tea.Cmd) {
 	}
 	key, err := m.mutationKey()
 	if err != nil {
-		m.err = err.Error()
+		m.setBanner(err.Error(), bannerError)
 		return m, nil
 	}
 	epoch, requestID := m.nextRequest()
@@ -663,7 +680,7 @@ func (m *Model) handleProgressKey(k string) (tea.Model, tea.Cmd) {
 	switch k {
 	case "esc":
 		m.screen = screenSwitchboard
-		m.err = "Operation continues; live updates remain active."
+		m.setBanner("Operation continues; live updates remain active.", bannerInfo)
 	case "c":
 		if m.followedJobID != "" && isActiveJob(m.followedJob) && !isCancellationPending(m.followedJob) {
 			m.confirmation = &confirmation{Action: actionCancelJob, App: m.appByID(m.followedJob.ResourceID), Job: m.followedJob, ReturnScreen: screenJobProgress}
@@ -686,6 +703,8 @@ func (m *Model) handleCommonKey(k string, from screen) (tea.Model, tea.Cmd) {
 	case "q":
 		m.confirmation = &confirmation{Action: actionQuit, ReturnScreen: from}
 		m.screen = screenConfirmation
+	case "r":
+		return m, m.startOverview()
 	}
 	return m, nil
 }
@@ -712,16 +731,16 @@ func (m *Model) cancelJob(request mutationRequest) tea.Cmd {
 }
 func (m *Model) openDashboard() tea.Cmd {
 	if m.openURLBusy {
-		m.err = "Dashboard open request is already in progress."
+		m.setBanner("Dashboard open request is already in progress.", bannerInfo)
 		return nil
 	}
 	now := m.now()
 	if now.Before(m.openURLNext) {
-		m.err = "Dashboard open request was already sent."
+		m.setBanner("Dashboard open request was already sent.", bannerInfo)
 		return nil
 	}
 	if m.openURL == nil {
-		m.err = "Dashboard opener is unavailable."
+		m.setBanner("Dashboard opener is unavailable.", bannerError)
 		return nil
 	}
 	m.openURLSerial++
@@ -793,12 +812,13 @@ func (m *Model) submitAuth() (tea.Model, tea.Cmd) {
 	}
 	for i, input := range m.authInputs {
 		if strings.TrimSpace(input.Value()) == "" {
-			m.err = authFieldLabel(m.screen, i) + " is required."
+			m.setBanner(authFieldLabel(m.screen, i)+" is required.", bannerError)
 			m.focusAuth(i)
 			return m, nil
 		}
 	}
-	m.mutationBusy, m.err, m.bootstrapConfirm, m.bootstrapUsername = true, "", false, ""
+	m.mutationBusy, m.bootstrapConfirm, m.bootstrapUsername = true, false, ""
+	m.clearBanner()
 	epoch, requestID := m.nextRequest()
 	client, ctx := m.client, m.ctx
 	if m.screen == screenLogin {
@@ -819,6 +839,7 @@ func (m *Model) submitAuth() (tea.Model, tea.Cmd) {
 func (m *Model) showBootstrap() {
 	m.resetAuthenticatedState()
 	m.screen, m.mutationBusy, m.err, m.bootstrapConfirm = screenBootstrap, false, "", false
+	m.bannerTone = bannerError
 	m.authInputs = []textinput.Model{authInput("bootstrap token", true), authInput("admin username", false), authInput("passphrase", true)}
 	m.resizeAuthInputs()
 	m.focusAuth(0)
@@ -826,12 +847,13 @@ func (m *Model) showBootstrap() {
 func (m *Model) beginBootstrapConfirmation() {
 	for i, input := range m.authInputs {
 		if strings.TrimSpace(input.Value()) == "" {
-			m.err = authFieldLabel(m.screen, i) + " is required."
+			m.setBanner(authFieldLabel(m.screen, i)+" is required.", bannerError)
 			m.focusAuth(i)
 			return
 		}
 	}
-	m.bootstrapConfirm, m.bootstrapUsername, m.err = true, sanitizeIdentity(m.authInputs[1].Value(), 512), ""
+	m.bootstrapConfirm, m.bootstrapUsername = true, sanitizeIdentity(m.authInputs[1].Value(), 512)
+	m.clearBanner()
 	for i := range m.authInputs {
 		m.authInputs[i].Blur()
 	}
@@ -844,6 +866,11 @@ func (m *Model) cancelBootstrapConfirmation() {
 func (m *Model) showLogin(message string) {
 	m.resetAuthenticatedState()
 	m.screen, m.mutationBusy, m.err = screenLogin, false, sanitizeIdentity(message, maxAPITextBytes)
+	if m.err != "" {
+		m.bannerTone = bannerWarning
+	} else {
+		m.bannerTone = bannerError
+	}
 	m.authInputs = []textinput.Model{authInput("username", false), authInput("passphrase", true)}
 	m.resizeAuthInputs()
 	m.focusAuth(0)
@@ -891,6 +918,16 @@ func (m *Model) clearAuthValues() {
 		m.authInputs[i].SetValue("")
 	}
 }
+
+func (m *Model) setBanner(value string, tone bannerTone) {
+	m.err = value
+	m.bannerTone = tone
+}
+
+func (m *Model) clearBanner() {
+	m.err = ""
+	m.bannerTone = bannerError
+}
 func (m *Model) mutationKey() (string, error) {
 	key := m.newKey()
 	if key == "" {
@@ -902,11 +939,13 @@ func (m *Model) mutationKey() (string, error) {
 func (m *Model) enterSwitchboard(user apicontract.User) {
 	m.resetAuthenticatedState()
 	m.screen, m.user, m.err, m.mutationBusy, m.overviewLoaded, m.overviewLoading = screenSwitchboard, user, "", false, false, false
+	m.bannerTone = bannerError
 	m.confirmation, m.result = nil, nil
 }
 func (m *Model) goOffline(err error) {
 	m.resetAuthenticatedState()
 	m.screen, m.mutationBusy, m.err = screenOffline, false, sanitizeIdentity(err.Error(), maxAPITextBytes)
+	m.bannerTone = bannerError
 }
 func (m *Model) clearExpiredSession(authErr error) tea.Cmd {
 	client, ctx := m.client, m.ctx
@@ -921,7 +960,7 @@ func (m *Model) operationError(err error, fallback screen) tea.Cmd {
 		m.showLogin("Session expired. Sign in again.")
 		return m.clearExpiredSession(err)
 	}
-	m.err = sanitizeIdentity(err.Error(), maxAPITextBytes)
+	m.setBanner(sanitizeIdentity(err.Error(), maxAPITextBytes), bannerError)
 	m.screen, m.confirmation = fallback, nil
 	return nil
 }

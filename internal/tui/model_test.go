@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hostd/hostd/internal/apicontract"
 )
 
@@ -240,7 +241,7 @@ func TestActionPolicyIsCapabilityAuthoritative(t *testing.T) {
 	}{
 		{"fake running", readyStatus(), "running", nil, true, false, true, true},
 		{"fake stopped", readyStatus(), "stopped", nil, true, true, false, false},
-		{"compose running", apicontract.SystemStatus{Capabilities: apicontract.Capabilities{ComposeRuntime: true}}, "running", nil, true, false, false, false},
+		{"compose running", apicontract.SystemStatus{Capabilities: apicontract.Capabilities{ComposeRuntime: true}, Diagnostics: apicontract.Diagnostics{EngineReady: true, ComposeAvailable: true}}, "running", nil, true, false, false, false},
 		{"none", apicontract.SystemStatus{}, "running", nil, false, false, false, false},
 		{"active", readyStatus(), "running", func() *apicontract.Job { j := activeJob("j", "a", "deploy"); return &j }(), false, false, false, false},
 	}
@@ -590,7 +591,7 @@ func TestAccessibleModeLabelsSelectionAndProgress(t *testing.T) {
 	m := switchboardModel(&fakeClient{})
 	m.accessible = true
 	view := m.View()
-	if !strings.Contains(view, "> Alpha") || !strings.Contains(view, "Running") {
+	if !strings.Contains(view, "Current: Alpha") || !strings.Contains(view, "Status: Running") {
 		t.Fatalf("accessible view=%q", view)
 	}
 	m.followedJob = activeJob("j", "app-a", "deploy")
@@ -663,7 +664,7 @@ func TestActionViewWindowsSelectionAndFooterAtCompactSizes(t *testing.T) {
 			if len(strings.Split(view, "\n")) > size[1] {
 				t.Fatalf("height overflow:\n%s", view)
 			}
-			if !strings.Contains(view, "> Back") || !strings.Contains(view, "Esc Back") || !strings.Contains(view, "action unavailable") {
+			if !strings.Contains(view, "Current: Back") || !strings.Contains(view, "Esc Back") || !strings.Contains(view, "action unavailable") {
 				t.Fatalf("selection, error, or footer hidden:\n%s", view)
 			}
 		})
@@ -856,5 +857,276 @@ func TestDashboardOpenerBusyGuardStartsExactlyOnce(t *testing.T) {
 	m.Update(second())
 	if calls != 2 {
 		t.Fatalf("opener calls=%d want=2", calls)
+	}
+}
+
+func TestMajorScreensReserveEssentialControlsAtSupportedSizes(t *testing.T) {
+	type screenCase struct {
+		name  string
+		setup func(*Model)
+		want  []string
+	}
+	cases := []screenCase{
+		{name: "loading", setup: func(m *Model) { m.screen = screenLoading }, want: []string{"Ctrl+C", "Quit"}},
+		{name: "offline", setup: func(m *Model) { m.goOffline(errors.New("controller unavailable")) }, want: []string{"Retry", "q Quit"}},
+		{name: "login", setup: func(m *Model) { m.showLogin("Session expired") }, want: []string{"Enter", "Ctrl+C Quit"}},
+		{name: "bootstrap", setup: func(m *Model) { m.showBootstrap(); m.err = "Check token" }, want: []string{"Enter", "Ctrl+C Quit"}},
+		{name: "bootstrap confirmation", setup: func(m *Model) { m.showBootstrap(); m.bootstrapConfirm = true; m.bootstrapUsername = "admin" }, want: []string{"Enter", "Esc Cancel"}},
+		{name: "switchboard", setup: func(m *Model) { m.screen = screenSwitchboard }, want: []string{"Enter", "r Refresh", "q Quit"}},
+		{name: "actions", setup: func(m *Model) { m.screen = screenActions }, want: []string{"Enter", "Esc Back", "q Quit"}},
+		{name: "deploy confirmation", setup: func(m *Model) {
+			m.screen = screenConfirmation
+			m.confirmation = &confirmation{Action: actionDeploy, App: m.apps[0], ReturnScreen: screenActions}
+			m.err = "Review target"
+		}, want: []string{"Enter", "Esc Cancel"}},
+		{name: "cancel confirmation", setup: func(m *Model) {
+			job := activeJob("job-a", "app-a", "deploy")
+			m.screen = screenConfirmation
+			m.confirmation = &confirmation{Action: actionCancelJob, App: m.apps[0], Job: job, ReturnScreen: screenJobProgress}
+			m.err = "Review cancellation"
+		}, want: []string{"Enter", "Esc Cancel"}},
+		{name: "progress", setup: func(m *Model) {
+			job := activeJob("job-a", "app-a", "deploy")
+			job.Checkpoint = "container-created"
+			m.screen, m.followedJob, m.followedJobID = screenJobProgress, job, job.ID
+			for i := 0; i < maxPhases; i++ {
+				m.phases = append(m.phases, phaseState{Name: fmt.Sprintf("phase-%02d", i), Completed: i < maxPhases-1})
+			}
+			for i := 0; i < maxRecentEvents; i++ {
+				m.recentEvents = append(m.recentEvents, apicontract.JobEvent{ID: int64(i + 1), Message: fmt.Sprintf("event-%02d", i)})
+			}
+			m.setBanner("Network is slow", bannerWarning)
+		}, want: []string{"Esc Back", "c Cancel", "q Quit"}},
+		{name: "result", setup: func(m *Model) {
+			m.screen = screenResult
+			m.result = &resultState{Title: "Deploy completed", Detail: "Alpha is running"}
+		}, want: []string{"Enter Back", "q Quit", "r Refresh"}},
+		{name: "help", setup: func(m *Model) { m.screen = screenHelp; m.returnScreen = screenSwitchboard }, want: []string{"Esc Back", "r Refresh", "q Quit"}},
+	}
+	for _, size := range [][2]int{{32, 8}, {40, 10}, {50, 12}} {
+		for _, test := range cases {
+			t.Run(fmt.Sprintf("%s/%dx%d", test.name, size[0], size[1]), func(t *testing.T) {
+				m := switchboardModel(&fakeClient{})
+				m.accessible = true
+				test.setup(m)
+				m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+				view := m.View()
+				lines := strings.Split(view, "\n")
+				if len(lines) != size[1] {
+					t.Fatalf("line count=%d want=%d\n%s", len(lines), size[1], view)
+				}
+				footer := lines[len(lines)-1]
+				for _, want := range test.want {
+					if !strings.Contains(footer, want) {
+						t.Fatalf("footer missing %q: %q\n%s", want, footer, view)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestUnsupportedTerminalIgnoresOrdinaryKeysOnEveryInteractiveScreen(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*Model)
+		key   tea.KeyMsg
+		check func(*testing.T, *Model, *fakeClient, tea.Cmd)
+	}{
+		{name: "auth", setup: func(m *Model) { m.showLogin("") }, key: key("r"), check: func(t *testing.T, m *Model, _ *fakeClient, cmd tea.Cmd) {
+			if cmd != nil || m.screen != screenLogin || m.authInputs[0].Value() != "" || m.overviewLoading {
+				t.Fatal("hidden auth accepted input")
+			}
+		}},
+		{name: "actions", setup: func(m *Model) { m.screen = screenActions }, key: key("enter"), check: func(t *testing.T, m *Model, _ *fakeClient, cmd tea.Cmd) {
+			if cmd != nil || m.screen != screenActions || m.confirmation != nil {
+				t.Fatal("hidden action executed")
+			}
+		}},
+		{name: "confirmation", setup: func(m *Model) {
+			m.screen = screenConfirmation
+			m.confirmation = &confirmation{Action: actionDeploy, App: m.apps[0]}
+		}, key: key("enter"), check: func(t *testing.T, m *Model, f *fakeClient, cmd tea.Cmd) {
+			if cmd != nil || m.screen != screenConfirmation || f.deployCalls != 0 || m.mutationBusy {
+				t.Fatal("hidden confirmation executed")
+			}
+		}},
+		{name: "progress", setup: func(m *Model) {
+			job := activeJob("job-a", "app-a", "deploy")
+			m.screen, m.followedJob, m.followedJobID = screenJobProgress, job, job.ID
+		}, key: key("c"), check: func(t *testing.T, m *Model, f *fakeClient, cmd tea.Cmd) {
+			if cmd != nil || m.screen != screenJobProgress || m.confirmation != nil || f.cancelCalls != 0 {
+				t.Fatal("hidden progress action executed")
+			}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := &fakeClient{}
+			m := switchboardModel(f)
+			test.setup(m)
+			m.Update(tea.WindowSizeMsg{Width: 31, Height: 8})
+			_, cmd := m.Update(test.key)
+			test.check(t, m, f, cmd)
+		})
+	}
+}
+
+func TestRuntimeReadinessIsCentralizedAcrossHeaderAndActions(t *testing.T) {
+	tests := []struct {
+		name              string
+		status            apicontract.SystemStatus
+		label             string
+		deploy, lifecycle bool
+	}{
+		{name: "test runtime", status: readyStatus(), label: "Ready", deploy: true, lifecycle: true},
+		{name: "compose ready", status: apicontract.SystemStatus{Capabilities: apicontract.Capabilities{ComposeRuntime: true}, Diagnostics: apicontract.Diagnostics{EngineReady: true, ComposeAvailable: true}}, label: "Ready", deploy: true},
+		{name: "compose engine unavailable", status: apicontract.SystemStatus{Capabilities: apicontract.Capabilities{ComposeRuntime: true}, Diagnostics: apicontract.Diagnostics{ComposeAvailable: true}}, label: "Unavailable"},
+		{name: "compose unavailable", status: apicontract.SystemStatus{Capabilities: apicontract.Capabilities{ComposeRuntime: true}, Diagnostics: apicontract.Diagnostics{EngineReady: true}}, label: "Unavailable"},
+		{name: "not configured", status: apicontract.SystemStatus{}, label: "Not configured"},
+	}
+	app := runningApp("app-a", "Alpha")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := runtimeState(test.status)
+			if state.Label != test.label || state.DeployReady != test.deploy || state.LifecycleReady != test.lifecycle {
+				t.Fatalf("runtime state=%+v", state)
+			}
+			items := actionsFor(app, nil, test.status)
+			enabled := map[actionKind]bool{}
+			for _, item := range items {
+				enabled[item.Kind] = item.Enabled
+				if item.Kind == actionDeploy && item.Enabled != state.DeployReady {
+					t.Fatalf("deploy policy=%+v runtime=%+v", item, state)
+				}
+			}
+			if enabled[actionStop] != state.LifecycleReady || enabled[actionRestart] != state.LifecycleReady {
+				t.Fatalf("lifecycle policy=%v runtime=%+v", enabled, state)
+			}
+			m := switchboardModel(&fakeClient{})
+			m.status = test.status
+			if header := ansi.Strip(m.header()); !strings.Contains(header, "Runtime: "+state.Label) {
+				t.Fatalf("header=%q runtime=%+v", header, state)
+			}
+		})
+	}
+}
+
+func TestAccessibleRenderingIsASCIIAndNamesCurrentControls(t *testing.T) {
+	m := switchboardModel(&fakeClient{})
+	m.accessible = true
+	m.showLogin("")
+	login := m.View()
+	if !strings.Contains(login, "Current field: Username") {
+		t.Fatalf("auth focus missing:\n%s", login)
+	}
+	m = switchboardModel(&fakeClient{})
+	m.accessible = true
+	switchboard := m.View()
+	for _, want := range []string{"Current: Alpha", "Status: Running"} {
+		if !strings.Contains(switchboard, want) {
+			t.Fatalf("switchboard missing %q:\n%s", want, switchboard)
+		}
+	}
+	m.screen = screenActions
+	actions := m.View()
+	if !strings.Contains(actions, "Current: Deploy latest") {
+		t.Fatalf("actions selection missing:\n%s", actions)
+	}
+	m = switchboardModel(&fakeClient{})
+	m.accessible = true
+	job := activeJob("job-a", "app-a", "deploy")
+	m.followedJob, m.followedJobID, m.screen = job, job.ID, screenJobProgress
+	m.phases = []phaseState{{Name: "prepare", Completed: true}, {Name: "apply"}}
+	view := m.View()
+	for _, unsafe := range []string{"●", "○", "×", "✓", "…", "—", "·", "█", "░", "╭", "│", "•"} {
+		if strings.Contains(view, unsafe) {
+			t.Fatalf("accessible view contains %q:\n%s", unsafe, view)
+		}
+	}
+	for _, want := range []string{"[", "#", "done prepare", "current apply", "Status: Running"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("accessible view missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestRefreshIsGlobalOnlyOnSafeMainScreens(t *testing.T) {
+	for _, current := range []screen{screenSwitchboard, screenActions, screenJobProgress, screenResult, screenHelp} {
+		t.Run(fmt.Sprint(current), func(t *testing.T) {
+			m := switchboardModel(&fakeClient{})
+			m.screen = current
+			if current == screenResult {
+				m.result = &resultState{Title: "Done"}
+			}
+			if current == screenJobProgress {
+				m.followedJob = activeJob("job", "app-a", "deploy")
+			}
+			_, cmd := m.Update(key("r"))
+			if cmd == nil || !m.overviewLoading || m.screen != current {
+				t.Fatalf("screen=%v cmd=%v loading=%v current=%v", current, cmd, m.overviewLoading, m.screen)
+			}
+		})
+	}
+	for _, current := range []screen{screenLogin, screenConfirmation} {
+		m := switchboardModel(&fakeClient{})
+		if current == screenLogin {
+			m.showLogin("")
+		} else {
+			m.screen = current
+			m.confirmation = &confirmation{Action: actionDeploy, App: m.apps[0]}
+		}
+		_, _ = m.Update(key("r"))
+		if m.overviewLoading {
+			t.Fatalf("unsafe screen %v refreshed", current)
+		}
+	}
+}
+
+func TestProgressShowsGerundRelativeUpdateAndCheckpoint(t *testing.T) {
+	m := switchboardModel(&fakeClient{})
+	now := time.Date(2026, 8, 30, 14, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return now }
+	job := activeJob("job-a", "app-a", "stop")
+	job.UpdatedAt = now.Add(-90 * time.Minute).Format(time.RFC3339Nano)
+	job.Checkpoint = "drained\ncontainers"
+	m.followedJob, m.followedJobID, m.screen = job, job.ID, screenJobProgress
+	view := m.View()
+	for _, want := range []string{"Stopping Alpha", "updated 1h ago", "Checkpoint: drained containers"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("progress missing %q:\n%s", want, view)
+		}
+	}
+	for raw, want := range map[string]string{"deploy": "Deploying", "start": "Starting", "stop": "Stopping", "restart": "Restarting"} {
+		if got := operationGerund(raw); got != want {
+			t.Fatalf("gerund %q=%q want=%q", raw, got, want)
+		}
+	}
+}
+
+func TestBannerIntentAndCtrlCRemainSemanticallyDistinct(t *testing.T) {
+	m := switchboardModel(&fakeClient{})
+	m.setBanner("opened", bannerSuccess)
+	if m.bannerTone != bannerSuccess {
+		t.Fatal("success banner lost intent")
+	}
+	m.setBanner("continues", bannerInfo)
+	if m.bannerTone != bannerInfo {
+		t.Fatal("info banner lost intent")
+	}
+	m.setBanner("retry", bannerWarning)
+	if m.bannerTone != bannerWarning {
+		t.Fatal("warning banner lost intent")
+	}
+	f := &fakeClient{}
+	m = switchboardModel(f)
+	stopped := 0
+	m.followCancel = func() { stopped++ }
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd == nil || stopped != 1 || f.cancelCalls != 0 {
+		t.Fatalf("Ctrl+C cmd=%v local stops=%d server cancels=%d", cmd, stopped, f.cancelCalls)
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatal("Ctrl+C did not return Bubble Tea quit message")
 	}
 }

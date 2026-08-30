@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
@@ -16,11 +17,13 @@ var (
 	colorAccent   = lipgloss.AdaptiveColor{Light: "#005FAF", Dark: "#7DD3FC"}
 	colorMuted    = lipgloss.AdaptiveColor{Light: "#52606D", Dark: "#A0AEC0"}
 	colorBad      = lipgloss.AdaptiveColor{Light: "#B42318", Dark: "#FDA4AF"}
+	colorWarning  = lipgloss.AdaptiveColor{Light: "#8A4B00", Dark: "#FCD34D"}
 	colorGood     = lipgloss.AdaptiveColor{Light: "#137333", Dark: "#86EFAC"}
 	colorPanel    = lipgloss.AdaptiveColor{Light: "#94A3B8", Dark: "#475569"}
 	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
 	mutedStyle    = lipgloss.NewStyle().Foreground(colorMuted)
 	errorStyle    = lipgloss.NewStyle().Bold(true).Foreground(colorBad)
+	warningStyle  = lipgloss.NewStyle().Foreground(colorWarning)
 	goodStyle     = lipgloss.NewStyle().Foreground(colorGood)
 	selectedStyle = lipgloss.NewStyle().Bold(true)
 	panelStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorPanel).Padding(0, 1)
@@ -31,12 +34,12 @@ func (m *Model) View() string {
 		return "Rig application switchboard\n"
 	}
 	if m.layout.unsupported {
-		return m.finishView(m.centered("Rig\n\nTerminal too small\nResize to at least 32×8\n\nCtrl+C quits"))
+		return m.finishView(m.centered("Rig\n\nTerminal too small\nResize to at least 32x8\n\nCtrl+C quits"))
 	}
 	var view string
 	switch m.screen {
 	case screenLoading:
-		view = m.centered("Rig application switchboard\n\nConnecting to " + endpointLabel(m.endpoint) + "…")
+		view = m.centeredScreen([]string{"Rig application switchboard", "Connecting to " + endpointLabel(m.endpoint) + "..."}, "Ctrl+C Quit")
 	case screenOffline:
 		view = m.offlineView()
 	case screenBootstrap:
@@ -67,48 +70,40 @@ func (m *Model) centered(content string) string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
 }
 func (m *Model) offlineView() string {
-	return m.centered(strings.Join([]string{titleStyle.Render("Controller unavailable"), "", "Rig could not reach " + endpointLabel(m.endpoint) + ".", errorStyle.Render(cropWidth(sanitizeIdentity(m.err, maxAPITextBytes), max(1, m.width-4))), "", "Start the controller with: hostd serve", "", "Enter Retry   q Quit   Ctrl+C Exit"}, "\n"))
+	body := []string{titleStyle.Render("Controller unavailable"), "Rig could not reach " + endpointLabel(m.endpoint) + ".", m.bannerLine(max(1, m.width-4)), "Start the controller with: hostd serve"}
+	return m.centeredScreen(nonEmptyLines(body), "Enter Retry | q Quit | Ctrl+C Exit")
 }
 
 func (m *Model) authView(title, subtitle string) string {
 	m.resizeAuthInputs()
-	if m.compactAuthLayout() {
-		lines := []string{titleStyle.Render(title)}
-		for i := range m.authInputs {
-			lines = append(lines, cropWidth(authFieldLabel(m.screen, i)+": "+m.authInputs[i].View(), m.width))
-		}
-		if m.err != "" {
-			lines = append(lines, errorStyle.Render(cropWidth(m.err, m.width)))
-		}
-		if m.mutationBusy {
-			lines = append(lines, "Authenticating…")
-		}
-		lines = append(lines, mutedStyle.Render("Tab fields · Enter continues · Ctrl+C quits"))
-		return strings.Join(lines, "\n")
+	lines := []string{titleStyle.Render(title)}
+	if !m.layout.compact {
+		lines = append(lines, mutedStyle.Render(subtitle))
 	}
-	var b strings.Builder
-	b.WriteString(titleStyle.Render(title) + "\n" + mutedStyle.Render(subtitle) + "\n\n")
 	for i := range m.authInputs {
-		b.WriteString(authFieldLabel(m.screen, i) + ":\n" + m.authInputs[i].View() + "\n")
+		marker := "  "
+		if i == m.authIndex {
+			marker = "> "
+			if m.accessible {
+				marker = "Current field: "
+			}
+		}
+		lines = append(lines, cropWidth(marker+authFieldLabel(m.screen, i)+": "+m.authInputs[i].View(), m.width))
 	}
 	if m.err != "" {
-		b.WriteString("\n" + errorStyle.Render(m.err))
+		lines = append(lines, m.bannerLine(m.width))
 	}
 	if m.mutationBusy {
-		b.WriteString("\nAuthenticating…")
+		lines = append(lines, "Authenticating...")
 	}
-	b.WriteString("\n\nTab/Shift+Tab change field · Enter continues · Ctrl+C quits")
-	return m.centered(panelStyle.Width(min(max(1, m.width-6), 68)).Render(b.String()))
+	return m.screenLines(lines, "Tab Fields | Enter | Ctrl+C Quit")
 }
 func (m *Model) bootstrapConfirmationView() string {
-	return m.centered(strings.Join([]string{titleStyle.Render("Confirm administrator creation"), "", "Create administrator " + sanitizeIdentity(m.bootstrapUsername, 512) + "?", "", "Enter Create administrator   Esc Cancel"}, "\n"))
+	return m.centeredScreen([]string{titleStyle.Render("Confirm administrator creation"), "Create administrator " + sanitizeIdentity(m.bootstrapUsername, 512) + "?"}, "Enter Confirm | Esc Cancel")
 }
 
 func (m *Model) header() string {
-	runtime := "Not ready"
-	if m.status.Capabilities.FakeRuntime || m.status.Capabilities.ComposeRuntime {
-		runtime = "Ready"
-	}
+	runtime := runtimeState(m.status).Label
 	refresh := ""
 	if m.overviewLoading {
 		refresh = " · Refreshing"
@@ -118,21 +113,21 @@ func (m *Model) header() string {
 
 func (m *Model) switchboardView() string {
 	if !m.overviewLoaded {
-		return strings.Join([]string{m.header(), "", "Loading applications…", m.footer("r Refresh   ? Help   q Quit")}, "\n")
+		return m.screenLines([]string{m.header(), "Loading applications..."}, "r Refresh | ? Help | q Quit")
 	}
 	if len(m.apps) == 0 {
-		lines := []string{m.header(), "", titleStyle.Render("No applications yet"), "", "Create or import an application in the Rig web dashboard,", "then return here and refresh.", "", "o Open Web   r Refresh   ? Help   l Logout   q Quit"}
+		lines := []string{m.header(), titleStyle.Render("No applications yet"), "Create or import an application in the web dashboard,", "then return here and refresh."}
 		if m.err != "" {
-			lines = append(lines, errorStyle.Render(m.err))
+			lines = append(lines, m.bannerLine(m.width))
 		}
-		return strings.Join(lines, "\n")
+		return m.screenLines(lines, m.switchboardFooter())
 	}
 	if m.layout.wide {
 		return m.wideSwitchboardView()
 	}
 	lines := []string{m.header()}
 	if m.err != "" {
-		lines = append(lines, errorStyle.Render(cropWidth(m.err, m.width)))
+		lines = append(lines, m.bannerLine(m.width))
 	} else {
 		lines = append(lines, "")
 	}
@@ -148,8 +143,7 @@ func (m *Model) switchboardView() string {
 			lines = append(lines, m.appDetails(app)...)
 		}
 	}
-	lines = append(lines, m.footer(m.switchboardFooter()))
-	return strings.Join(lines, "\n")
+	return m.screenLines(lines, m.switchboardFooter())
 }
 func (m *Model) wideSwitchboardView() string {
 	leftLines := append([]string{titleStyle.Render("Applications")}, m.applicationRows(max(1, m.layout.leftWidth-4), m.layout.listRows)...)
@@ -163,12 +157,12 @@ func (m *Model) wideSwitchboardView() string {
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
 	lines := []string{m.header()}
 	if m.err != "" {
-		lines = append(lines, errorStyle.Render(cropWidth(m.err, m.width)))
+		lines = append(lines, m.bannerLine(m.width))
 	} else {
 		lines = append(lines, "")
 	}
-	lines = append(lines, body, m.footer(m.switchboardFooter()))
-	return strings.Join(lines, "\n")
+	lines = append(lines, body)
+	return m.screenLines(lines, m.switchboardFooter())
 }
 func (m *Model) applicationRows(width, capacity int) []string {
 	end := min(len(m.apps), m.listOffset+max(1, capacity))
@@ -179,6 +173,9 @@ func (m *Model) applicationRows(width, capacity int) []string {
 		marker := "  "
 		if selected {
 			marker = "> "
+			if m.accessible {
+				marker = "Current: "
+			}
 		}
 		state := appStateLabel(app.Status, m.accessible)
 		job := relevantJob(app.ID, m.jobs)
@@ -232,20 +229,20 @@ func (m *Model) appDetails(app apicontract.Application) []string {
 }
 func (m *Model) switchboardFooter() string {
 	if m.layout.compact {
-		return "Enter Actions · r Refresh · ? Help · q Quit"
+		return "Enter | r Refresh | q Quit"
 	}
-	return "Enter Actions   r Refresh   o Open Web   ? Help   l Logout   q Quit"
+	return "Enter Actions | r Refresh | o Open Web | ? Help | l Logout | q Quit"
 }
 
 func (m *Model) actionsView() string {
 	app, items, ok := m.currentActions()
 	if !ok {
-		return "No application selected\n\nEsc Back"
+		return m.screenLines([]string{"No application selected"}, "Esc Back | q Quit")
 	}
 	m.reconcileActionSelection(len(items))
 	lines := []string{cropWidth(titleStyle.Render("Actions — "+displayAppName(app))+"  "+appStateLabel(app.Status, m.accessible), m.width)}
 	if m.err != "" {
-		lines = append(lines, errorStyle.Render(cropWidth(sanitizeIdentity(m.err, maxAPITextBytes), m.width)))
+		lines = append(lines, m.bannerLine(m.width))
 	}
 	end := min(len(items), m.actionOffset+m.actionCapacity())
 	for i := m.actionOffset; i < end; i++ {
@@ -253,6 +250,9 @@ func (m *Model) actionsView() string {
 		marker := "  "
 		if i == m.selectedAction {
 			marker = "> "
+			if m.accessible {
+				marker = "Current: "
+			}
 		}
 		detail := item.Detail
 		if !item.Enabled {
@@ -267,17 +267,16 @@ func (m *Model) actionsView() string {
 		}
 		lines = append(lines, cropWidth(line, m.width))
 	}
-	footer := "↑↓ Select   Enter Choose   Esc Back"
+	footer := "Up/Down Select | Enter | Esc Back | q Quit"
 	if m.width < 45 {
-		footer = "↑↓ Select · Enter · Esc Back"
+		footer = "Enter | Esc Back | q Quit"
 	}
-	lines = append(lines, m.footer(footer))
-	return strings.Join(lines, "\n")
+	return m.screenLines(lines, footer)
 }
 
 func (m *Model) confirmationView() string {
 	if m.confirmation == nil {
-		return "Confirmation unavailable\n\nEsc Back"
+		return m.screenLines([]string{"Confirmation unavailable"}, "Esc Back | q Quit")
 	}
 	c := m.confirmation
 	title := actionVerb(c.Action) + "?"
@@ -290,7 +289,7 @@ func (m *Model) confirmationView() string {
 	} else {
 		title = actionVerb(c.Action) + " " + displayAppName(c.App) + "?"
 	}
-	lines := []string{titleStyle.Render(title), ""}
+	lines := []string{titleStyle.Render(title)}
 	if c.App.ID != "" {
 		lines = append(lines, "Application  "+displayAppName(c.App), "Current      "+statusWord(c.App.Status))
 	}
@@ -306,78 +305,196 @@ func (m *Model) confirmationView() string {
 		}
 	}
 	if c.Action == actionCancelJob {
-		lines = append(lines, "Job ID       "+sanitizeIdentity(c.Job.ID, 256), "", "The running server job will be asked to stop.", "Returning with Escape does not cancel it.")
+		lines = append(lines, "Job ID       "+sanitizeIdentity(c.Job.ID, 256), "Requests the server job to stop.", "Esc keeps the server job running.")
 	}
 	if m.err != "" {
-		lines = append(lines, "", errorStyle.Render(cropWidth(m.err, m.width)))
+		lines = append(lines, m.bannerLine(m.width))
 	}
 	label := actionVerb(c.Action)
+	footer := "Enter " + label + " | Esc Cancel"
 	if m.mutationBusy {
-		label = "Working…"
+		footer = "Working... | Ctrl+C Exit"
 	}
-	lines = append(lines, "", "Enter "+label+"   Esc Cancel")
-	return m.centered(strings.Join(lines, "\n"))
+	return m.centeredScreen(lines, footer)
 }
 
 func (m *Model) progressView() string {
 	job := m.followedJob
 	app := m.appByID(job.ResourceID)
-	title := titleWord(job.Type) + "ing " + displayAppName(app)
-	if strings.EqualFold(job.Type, "deploy") {
-		title = "Deploying " + displayAppName(app)
-	}
+	title := operationGerund(job.Type) + " " + displayAppName(app)
 	jobStatus := statusWord(job.Status)
 	if isCancellationPending(job) {
 		jobStatus = "Cancelling"
 	}
-	lines := []string{titleStyle.Render(title) + "  " + percent(job.Progress), "", progressBar(job.Progress, max(10, min(50, m.width-2))), "", "Status: " + jobStatus + " · " + strconv.Itoa(job.Progress) + " percent"}
-	for _, phase := range m.phases {
-		mark := "●"
-		if phase.Completed {
-			mark = "✓"
-		}
-		if m.accessible {
-			if phase.Completed {
-				mark = "completed"
-			} else {
-				mark = "current"
-			}
-		}
-		lines = append(lines, mark+" "+sanitizeIdentity(phase.Name, 256))
+	statusLine := "Status: " + jobStatus + " | " + strconv.Itoa(job.Progress) + " percent"
+	if updated := relativeUpdatedAt(job.UpdatedAt, m.now()); updated != "" {
+		statusLine += " | " + updated
 	}
-	if len(m.phases) == 0 && job.Phase != "" {
-		lines = append(lines, "Current phase: "+sanitizeIdentity(job.Phase, 256))
+	lines := []string{titleStyle.Render(title) + "  " + percent(job.Progress), statusLine, progressBarForMode(job.Progress, max(10, min(50, m.width-2)), m.accessible)}
+	if job.Checkpoint != "" {
+		lines = append(lines, "Checkpoint: "+sanitizeIdentity(job.Checkpoint, 512))
 	}
+	reserve := 0
 	if len(m.recentEvents) > 0 {
-		event := m.recentEvents[len(m.recentEvents)-1]
-		lines = append(lines, "", cropWidth(sanitizeIdentity(event.Message, maxAPITextBytes), m.width))
+		reserve++
 	}
 	if m.err != "" {
-		lines = append(lines, errorStyle.Render(cropWidth(m.err, m.width)))
+		reserve++
 	}
-	footer := "c Cancel job   Esc Back — operation continues   o Open Web"
+	phaseCapacity := max(0, (m.height-1)-len(lines)-reserve)
+	phaseLines := m.progressPhaseLines(job)
+	if len(phaseLines) > phaseCapacity {
+		phaseLines = phaseLines[len(phaseLines)-phaseCapacity:]
+	}
+	lines = append(lines, phaseLines...)
+	if len(m.recentEvents) > 0 {
+		event := m.recentEvents[len(m.recentEvents)-1]
+		lines = append(lines, "Latest: "+cropWidth(sanitizeIdentity(event.Message, maxAPITextBytes), max(1, m.width-8)))
+	}
+	if m.err != "" {
+		lines = append(lines, m.bannerLine(m.width))
+	}
+	footer := "Esc Back | c Cancel | q Quit"
 	if isCancellationPending(job) {
-		footer = "Cancellation pending   Esc Back — operation continues   o Open Web"
+		footer = "Esc Back | q Quit | Cancelling"
+	} else if !isActiveJob(job) {
+		footer = "Esc Back | q Quit | r Refresh"
 	}
-	lines = append(lines, "", m.footer(footer))
-	return strings.Join(lines, "\n")
+	if m.width >= 50 {
+		if isCancellationPending(job) {
+			footer = "Esc Back | Cancellation pending | q Quit"
+		}
+		footer += " | o Web | r Refresh"
+	}
+	return m.screenLines(lines, footer)
 }
 func (m *Model) resultView() string {
 	if m.result == nil {
-		return "Operation result unavailable\n\nEnter Return to Applications"
+		return m.centeredScreen([]string{"Operation result unavailable"}, "Enter Back | q Quit | r Refresh")
 	}
-	lines := []string{titleStyle.Render(sanitizeIdentity(m.result.Title, 512)), "", cropWidth(sanitizeIdentity(m.result.Detail, maxAPITextBytes), m.width), ""}
+	lines := []string{titleStyle.Render(sanitizeIdentity(m.result.Title, 512)), cropWidth(sanitizeIdentity(m.result.Detail, maxAPITextBytes), m.width)}
 	if m.err != "" {
-		lines = append(lines, errorStyle.Render(cropWidth(m.err, m.width)), "")
+		lines = append(lines, m.bannerLine(m.width))
 	}
-	lines = append(lines, "Enter Return to Applications   o Open Web   q Quit")
-	return m.centered(strings.Join(lines, "\n"))
+	footer := "Enter Back | q Quit | r Refresh"
+	if m.width >= 50 {
+		footer += " | o Web"
+	}
+	return m.centeredScreen(lines, footer)
 }
 func (m *Model) helpView() string {
-	return strings.Join([]string{titleStyle.Render("Rig Switchboard Help"), "", "↑↓ / j k     Select an application or action", "PgUp/PgDn    Move one application page", "Home / End   First or last application", "Enter        Open, choose, or confirm", "Esc          Go back; never cancels a server job", "r            Refresh applications", "o            Open web dashboard", "c            Cancel job (progress screen, with confirmation)", "l            Logout", "q            Quit", "Ctrl+C       Exit locally", "", "Configuration, approvals, logs, releases, and relay management remain in the web dashboard.", "", "Esc Back"}, "\n")
+	lines := []string{titleStyle.Render("Rig Switchboard Help"), "Up/Down, j/k  Select", "PgUp/PgDn    Move one page", "Home/End     First or last", "Enter        Open or confirm", "Esc          Back; never cancels jobs", "r            Refresh", "o            Open web dashboard", "c            Confirm job cancellation", "l            Logout", "q            Quit", "Ctrl+C       Exit locally"}
+	return m.screenLines(lines, "Esc Back | r Refresh | q Quit")
 }
 
 func (m *Model) footer(value string) string { return cropWidth(value, m.width) }
+
+func (m *Model) screenLines(body []string, footer string) string {
+	capacity := max(0, m.height-1)
+	lines := make([]string, 0, capacity+1)
+	for _, line := range body {
+		lines = append(lines, strings.Split(line, "\n")...)
+	}
+	if len(lines) > capacity {
+		lines = lines[:capacity]
+	}
+	for len(lines) < capacity {
+		lines = append(lines, "")
+	}
+	return strings.Join(append(lines, m.footer(footer)), "\n")
+}
+
+func (m *Model) centeredScreen(body []string, footer string) string {
+	capacity := max(0, m.height-1)
+	content := strings.Join(body, "\n")
+	placed := lipgloss.Place(m.width, capacity, lipgloss.Center, lipgloss.Center, content)
+	return placed + "\n" + m.footer(footer)
+}
+
+func nonEmptyLines(lines []string) []string {
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func (m *Model) bannerLine(width int) string {
+	value := cropWidth(sanitizeIdentity(m.err, maxAPITextBytes), width)
+	switch m.bannerTone {
+	case bannerInfo:
+		return mutedStyle.Render(value)
+	case bannerWarning:
+		return warningStyle.Render(value)
+	case bannerSuccess:
+		return goodStyle.Render(value)
+	default:
+		return errorStyle.Render(value)
+	}
+}
+
+func (m *Model) progressPhaseLines(job apicontract.Job) []string {
+	lines := make([]string, 0, len(m.phases)+1)
+	for _, phase := range m.phases {
+		mark := "*"
+		if phase.Completed {
+			mark = "done"
+		} else if m.accessible {
+			mark = "current"
+		}
+		lines = append(lines, mark+" "+sanitizeIdentity(phase.Name, 256))
+	}
+	if len(lines) == 0 && job.Phase != "" {
+		lines = append(lines, "Current phase: "+sanitizeIdentity(job.Phase, 256))
+	}
+	return lines
+}
+
+func relativeUpdatedAt(value string, now time.Time) string {
+	updated, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || now.IsZero() {
+		return ""
+	}
+	age := now.Sub(updated)
+	if age < time.Minute {
+		return "updated just now"
+	}
+	if age < time.Hour {
+		return "updated " + strconv.Itoa(int(age/time.Minute)) + "m ago"
+	}
+	if age < 24*time.Hour {
+		return "updated " + strconv.Itoa(int(age/time.Hour)) + "h ago"
+	}
+	return "updated " + strconv.Itoa(int(age/(24*time.Hour))) + "d ago"
+}
+
+func operationGerund(value string) string {
+	switch strings.ToLower(sanitizeIdentity(value, 128)) {
+	case "deploy":
+		return "Deploying"
+	case "start":
+		return "Starting"
+	case "stop":
+		return "Stopping"
+	case "restart":
+		return "Restarting"
+	default:
+		return "Working"
+	}
+}
+
+func progressBarForMode(value, width int, accessible bool) string {
+	if !accessible {
+		return progressBar(value, width)
+	}
+	if width < 2 {
+		return ""
+	}
+	filled := max(0, min(width-2, value*(width-2)/100))
+	return "[" + strings.Repeat("#", filled) + strings.Repeat("-", width-2-filled) + "]"
+}
 func progressBar(value, width int) string {
 	if width < 1 {
 		return ""
@@ -403,7 +520,7 @@ func displayAppName(app apicontract.Application) string {
 func appStateLabel(raw string, accessible bool) string {
 	word := statusWord(raw)
 	if accessible {
-		return word
+		return "Status: " + word
 	}
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "running":
@@ -512,6 +629,9 @@ func (m *Model) finishView(value string) string {
 	if m.accessible || noColor() {
 		value = ansi.Strip(value)
 	}
+	if m.accessible {
+		value = asciiSafe(value)
+	}
 	lines := strings.Split(value, "\n")
 	for i := range lines {
 		lines[i] = cropWidth(lines[i], m.width)
@@ -520,4 +640,14 @@ func (m *Model) finishView(value string) string {
 		lines = lines[:m.height]
 	}
 	return strings.Join(lines, "\n")
+}
+
+func asciiSafe(value string) string {
+	replacer := strings.NewReplacer(
+		"…", "...", "—", "-", "–", "-", "·", " | ",
+		"●", "*", "○", "o", "×", "x", "✓", "done", "◐", "~",
+		"█", "#", "░", "-", "↑", "Up", "↓", "Down", "•", "*",
+		"╭", "+", "╮", "+", "╰", "+", "╯", "+", "─", "-", "│", "|",
+	)
+	return replacer.Replace(value)
 }

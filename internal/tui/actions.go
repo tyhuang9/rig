@@ -46,6 +46,39 @@ type mutationRequest struct {
 	RequestID      uint64
 }
 
+type runtimePresentation struct {
+	DeployReady          bool
+	LifecycleReady       bool
+	Label                string
+	DeployUnavailable    string
+	LifecycleUnavailable string
+}
+
+func runtimeState(status apicontract.SystemStatus) runtimePresentation {
+	if status.Capabilities.FakeRuntime {
+		return runtimePresentation{DeployReady: true, LifecycleReady: true, Label: "Ready"}
+	}
+	if status.Capabilities.ComposeRuntime {
+		if status.Diagnostics.EngineReady && status.Diagnostics.ComposeAvailable {
+			return runtimePresentation{
+				DeployReady:          true,
+				Label:                "Ready",
+				LifecycleUnavailable: "lifecycle controls are unavailable for the configured runtime",
+			}
+		}
+		return runtimePresentation{
+			Label:                "Unavailable",
+			DeployUnavailable:    "configured runtime is unavailable",
+			LifecycleUnavailable: "configured runtime is unavailable",
+		}
+	}
+	return runtimePresentation{
+		Label:                "Not configured",
+		DeployUnavailable:    "runtime is not configured",
+		LifecycleUnavailable: "runtime is not configured",
+	}
+}
+
 // actionsFor is capability-authoritative: deploy is supported by either
 // configured runtime, while start/stop/restart are controller-supported only
 // by the fake runtime today.
@@ -67,11 +100,10 @@ func actionsFor(app apicontract.Application, job *apicontract.Job, status apicon
 		}
 		items = append(items, actionItem{Kind: kind, Label: label, Detail: jobSummary(*job), Enabled: true})
 	}
-	deployReady := status.Capabilities.FakeRuntime || status.Capabilities.ComposeRuntime
-	lifecycleReady := status.Capabilities.FakeRuntime
+	runtime := runtimeState(status)
 	reason := ""
-	if !deployReady {
-		reason = "runtime not configured"
+	if !runtime.DeployReady {
+		reason = runtime.DeployUnavailable
 	}
 	items = append(items, actionItem{Kind: actionDeploy, Label: "Deploy latest", Detail: deployDetail(app), Enabled: reason == "", DisabledBy: reason})
 
@@ -87,8 +119,8 @@ func actionsFor(app apicontract.Application, job *apicontract.Job, status apicon
 	} {
 		reason = ""
 		switch {
-		case !lifecycleReady:
-			reason = "requires fake runtime"
+		case !runtime.LifecycleReady:
+			reason = runtime.LifecycleUnavailable
 		case !candidate.allowed:
 			reason = "unavailable while " + statusWord(app.Status)
 		}
