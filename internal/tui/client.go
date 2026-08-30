@@ -16,6 +16,9 @@ type Client interface {
 	Bootstrap(context.Context, apicontract.BootstrapRequest) (apicontract.SessionResponse, error)
 	Login(context.Context, apicontract.LoginRequest) (apicontract.SessionResponse, error)
 	Logout(context.Context) error
+	// ClearSession removes an expired local session only if generation still
+	// identifies the session that produced the authentication failure.
+	ClearSession(context.Context, uint64) error
 	Me(context.Context) (apicontract.MeResponse, error)
 	Status(context.Context) (apicontract.SystemStatus, error)
 	Applications(context.Context) (apicontract.ApplicationList, error)
@@ -44,9 +47,10 @@ type SessionStoreFactory func() (SessionStore, error)
 // HTTPError lets an injected client distinguish an expired session from an
 // unavailable controller without coupling the UI to an HTTP implementation.
 type HTTPError struct {
-	Status int
-	Code   string
-	Detail string
+	Status            int
+	Code              string
+	Detail            string
+	SessionGeneration uint64
 }
 
 func (e *HTTPError) Error() string {
@@ -62,4 +66,12 @@ func (e *HTTPError) Error() string {
 func isUnauthenticated(err error) bool {
 	var target *HTTPError
 	return errors.As(err, &target) && target.Status == 401
+}
+
+func failedSessionGeneration(err error) uint64 {
+	var target *HTTPError
+	if errors.As(err, &target) {
+		return target.SessionGeneration
+	}
+	return 0
 }

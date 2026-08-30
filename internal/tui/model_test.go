@@ -15,25 +15,26 @@ import (
 )
 
 type fakeClient struct {
-	mu                                                              sync.Mutex
-	bootstrapStatus                                                 apicontract.BootstrapStatus
-	bootstrapStatusErr                                              error
-	me                                                              apicontract.MeResponse
-	meErr                                                           error
-	status                                                          apicontract.SystemStatus
-	apps                                                            apicontract.ApplicationList
-	jobs                                                            apicontract.JobList
-	overviewErr                                                     error
-	job                                                             apicontract.Job
-	jobsByID                                                        map[string]apicontract.Job
-	jobErr                                                          error
-	mutationJob                                                     apicontract.Job
-	cancelJobResponse                                               apicontract.Job
-	deployCalls, lifecycleCalls, cancelCalls, logoutCalls, jobCalls int
-	lastApp, lastAction, lastKey, lastJob                           string
-	followCtx                                                       context.Context
-	followEvents                                                    chan apicontract.JobEvent
-	followErrors                                                    chan error
+	mu                                                                          sync.Mutex
+	bootstrapStatus                                                             apicontract.BootstrapStatus
+	bootstrapStatusErr                                                          error
+	me                                                                          apicontract.MeResponse
+	meErr                                                                       error
+	status                                                                      apicontract.SystemStatus
+	apps                                                                        apicontract.ApplicationList
+	jobs                                                                        apicontract.JobList
+	overviewErr                                                                 error
+	job                                                                         apicontract.Job
+	jobsByID                                                                    map[string]apicontract.Job
+	jobErr                                                                      error
+	mutationJob                                                                 apicontract.Job
+	cancelJobResponse                                                           apicontract.Job
+	deployCalls, lifecycleCalls, cancelCalls, logoutCalls, clearCalls, jobCalls int
+	lastApp, lastAction, lastKey, lastJob                                       string
+	lastClearGeneration                                                         uint64
+	followCtx                                                                   context.Context
+	followEvents                                                                chan apicontract.JobEvent
+	followErrors                                                                chan error
 }
 
 func (f *fakeClient) BootstrapStatus(context.Context) (apicontract.BootstrapStatus, error) {
@@ -49,6 +50,13 @@ func (f *fakeClient) Logout(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.logoutCalls++
+	return nil
+}
+func (f *fakeClient) ClearSession(_ context.Context, generation uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clearCalls++
+	f.lastClearGeneration = generation
 	return nil
 }
 func (f *fakeClient) Me(context.Context) (apicontract.MeResponse, error) { return f.me, f.meErr }
@@ -443,6 +451,25 @@ func TestStaleFollowAndSessionExpiryCannotMutateCurrentJob(t *testing.T) {
 	}
 }
 
+func TestFollowUnauthorizedReturnsToLoginAndClearsExpiredSession(t *testing.T) {
+	f := &fakeClient{}
+	m := switchboardModel(f)
+	job := activeJob("job-a", "app-a", "deploy")
+	m.user = apicontract.User{Username: "admin"}
+	m.followedJob, m.followedJobID = job, job.ID
+	m.followGeneration = 9
+	m.followCancel = func() {}
+	_, cmd := m.Update(followEventMsg{generation: 9, err: &HTTPError{Status: 401, Detail: "expired", SessionGeneration: 27}})
+	if cmd == nil || m.screen != screenLogin || m.followedJobID != "" || len(m.apps) != 0 || m.overviewLoaded || m.user.Username != "" {
+		t.Fatalf("expiry state not cleared: screen=%v follow=%q apps=%d loaded=%v user=%q", m.screen, m.followedJobID, len(m.apps), m.overviewLoaded, m.user.Username)
+	}
+	msg := cmd().(sessionClearedMsg)
+	m.Update(msg)
+	if f.clearCalls != 1 || f.lastClearGeneration != 27 {
+		t.Fatalf("local clear calls=%d generation=%d", f.clearCalls, f.lastClearGeneration)
+	}
+}
+
 func TestEmptyRuntimeUnknownFailureAndHelpViews(t *testing.T) {
 	m := switchboardModel(&fakeClient{})
 	m.apps = nil
@@ -504,6 +531,8 @@ func TestLogoutAndQuitRequireConfirmation(t *testing.T) {
 func TestDashboardOpenerSuccessFailureAndSanitization(t *testing.T) {
 	f := &fakeClient{}
 	m := switchboardModel(f)
+	now := time.Unix(100, 0)
+	m.now = func() time.Time { return now }
 	calls := 0
 	m.openURL = func(_ context.Context, target string) error {
 		calls++
@@ -517,6 +546,7 @@ func TestDashboardOpenerSuccessFailureAndSanitization(t *testing.T) {
 	if calls != 1 || !strings.Contains(m.err, "opened") {
 		t.Fatalf("calls=%d err=%q", calls, m.err)
 	}
+	now = now.Add(dashboardOpenCooldown)
 	m.openURL = func(context.Context, string) error { return errors.New("failed\x1b]0;bad\a") }
 	m.Update(m.openDashboard()())
 	if strings.Contains(m.err, "\x1b") || !strings.Contains(m.err, "failed") {
@@ -715,6 +745,31 @@ func TestStaleAndMismatchedMutationResponsesAreIgnored(t *testing.T) {
 	}
 }
 
+func TestMutationResponseTypeMustMatchConfirmedAction(t *testing.T) {
+	for _, test := range []struct {
+		action actionKind
+		got    string
+	}{
+		{actionDeploy, "restart"},
+		{actionStart, "stop"},
+		{actionStop, "deploy"},
+		{actionRestart, "start"},
+	} {
+		t.Run(actionVerb(test.action), func(t *testing.T) {
+			request := mutationRequest{Action: test.action, AppID: "app-a"}
+			job := activeJob("job", "app-a", test.got)
+			if err := validateMutationResponse(request, job); err == nil || !strings.Contains(err.Error(), "operation type") {
+				t.Fatalf("mismatch %q accepted: %v", test.got, err)
+			}
+			expected, _ := expectedMutationJobType(test.action)
+			job.Type = strings.ToUpper(expected)
+			if err := validateMutationResponse(request, job); err != nil {
+				t.Fatalf("normalized matching type rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestMismatchedCancelResponseDoesNotRetargetFollow(t *testing.T) {
 	job := activeJob("job-a", "app-a", "deploy")
 	f := &fakeClient{cancelJobResponse: activeJob("job-b", "app-a", "deploy")}
@@ -777,6 +832,8 @@ func TestStrictIdentitySanitization(t *testing.T) {
 
 func TestDashboardOpenerBusyGuardStartsExactlyOnce(t *testing.T) {
 	m := switchboardModel(&fakeClient{})
+	now := time.Unix(100, 0)
+	m.now = func() time.Time { return now }
 	calls := 0
 	m.openURL = func(context.Context, string) error { calls++; return nil }
 	first := m.openDashboard()
@@ -788,9 +845,13 @@ func TestDashboardOpenerBusyGuardStartsExactlyOnce(t *testing.T) {
 		t.Fatalf("opener calls=%d busy=%v", calls, m.openURLBusy)
 	}
 	m.Update(msg)
+	if m.openDashboard() != nil || !strings.Contains(m.err, "already sent") {
+		t.Fatalf("cooldown allowed rapid reopen: err=%q", m.err)
+	}
+	now = now.Add(dashboardOpenCooldown)
 	second := m.openDashboard()
 	if second == nil {
-		t.Fatal("opener remained busy after completion")
+		t.Fatal("opener remained guarded after cooldown")
 	}
 	m.Update(second())
 	if calls != 2 {

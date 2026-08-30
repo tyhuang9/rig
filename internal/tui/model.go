@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -31,6 +32,8 @@ const (
 )
 
 type resultState struct{ AppID, JobID, Title, Detail string }
+
+const dashboardOpenCooldown = 1500 * time.Millisecond
 
 // Model is an explicit application-first state machine. Overview refresh,
 // mutation submission, and the one active server-job follow have independent
@@ -66,6 +69,8 @@ type Model struct {
 	openURLBusy                bool
 	openURLSerial              uint64
 	openURLRequest             uint64
+	openURLNext                time.Time
+	now                        func() time.Time
 
 	followedJobID    string
 	followedJob      apicontract.Job
@@ -88,7 +93,7 @@ func NewModel(ctx context.Context, client Client, endpoint string) *Model {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return &Model{ctx: ctx, client: client, endpoint: endpoint, newKey: randomIdempotencyKey, screen: screenLoading, layout: calculateLayout(1, 1)}
+	return &Model{ctx: ctx, client: client, endpoint: endpoint, newKey: randomIdempotencyKey, now: time.Now, screen: screenLoading, layout: calculateLayout(1, 1)}
 }
 func (m *Model) Init() tea.Cmd { return m.checkBootstrap() }
 
@@ -130,6 +135,10 @@ type logoutMsg struct {
 type openURLMsg struct {
 	requestID uint64
 	err       error
+}
+type sessionClearedMsg struct {
+	epoch uint64
+	err   error
 }
 type followOpenedMsg struct {
 	generation uint64
@@ -225,6 +234,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			if isUnauthenticated(msg.err) {
 				m.showLogin("")
+				return m, m.clearExpiredSession(msg.err)
 			} else {
 				m.goOffline(msg.err)
 			}
@@ -258,7 +268,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			if isUnauthenticated(msg.err) {
 				m.showLogin("Session expired. Sign in again.")
-				return m, m.clearRemoteSession()
+				return m, m.clearExpiredSession(msg.err)
 			}
 			if m.overviewLoaded {
 				m.err = "Refresh failed: " + sanitizeIdentity(msg.err.Error(), maxAPITextBytes)
@@ -346,6 +356,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = "Dashboard opened in your browser."
 		}
 		return m, nil
+	case sessionClearedMsg:
+		if msg.epoch != m.authEpoch {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.err = "Could not clear expired session: " + sanitizeIdentity(msg.err.Error(), maxAPITextBytes)
+		}
+		return m, nil
 	case followOpenedMsg:
 		if msg.generation != m.followGeneration {
 			return m, nil
@@ -357,6 +375,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.err != nil {
+			if isUnauthenticated(msg.err) {
+				m.showLogin("Session expired. Sign in again.")
+				return m, m.clearExpiredSession(msg.err)
+			}
 			m.err = "Live updates stopped: " + sanitizeIdentity(msg.err.Error(), maxAPITextBytes) + ". Reopen the operation to retry."
 			m.stopFollowing()
 			return m, nil
@@ -377,7 +399,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			if isUnauthenticated(msg.err) {
 				m.showLogin("Session expired. Sign in again.")
-				return m, m.clearRemoteSession()
+				return m, m.clearExpiredSession(msg.err)
 			}
 			m.err = "Could not refresh operation: " + sanitizeIdentity(msg.err.Error(), maxAPITextBytes)
 			if msg.streamDone {
@@ -690,6 +712,12 @@ func (m *Model) cancelJob(request mutationRequest) tea.Cmd {
 }
 func (m *Model) openDashboard() tea.Cmd {
 	if m.openURLBusy {
+		m.err = "Dashboard open request is already in progress."
+		return nil
+	}
+	now := m.now()
+	if now.Before(m.openURLNext) {
+		m.err = "Dashboard open request was already sent."
 		return nil
 	}
 	if m.openURL == nil {
@@ -699,6 +727,7 @@ func (m *Model) openDashboard() tea.Cmd {
 	m.openURLSerial++
 	requestID := m.openURLSerial
 	m.openURLRequest, m.openURLBusy = requestID, true
+	m.openURLNext = now.Add(dashboardOpenCooldown)
 	opener, ctx, endpoint := m.openURL, m.ctx, m.endpoint
 	return func() tea.Msg { return openURLMsg{requestID: requestID, err: opener(ctx, endpoint)} }
 }
@@ -879,14 +908,18 @@ func (m *Model) goOffline(err error) {
 	m.resetAuthenticatedState()
 	m.screen, m.mutationBusy, m.err = screenOffline, false, sanitizeIdentity(err.Error(), maxAPITextBytes)
 }
-func (m *Model) clearRemoteSession() tea.Cmd {
+func (m *Model) clearExpiredSession(authErr error) tea.Cmd {
 	client, ctx := m.client, m.ctx
-	return func() tea.Msg { _ = client.Logout(ctx); return nil }
+	epoch := m.authEpoch
+	generation := failedSessionGeneration(authErr)
+	return func() tea.Msg {
+		return sessionClearedMsg{epoch: epoch, err: client.ClearSession(ctx, generation)}
+	}
 }
 func (m *Model) operationError(err error, fallback screen) tea.Cmd {
 	if isUnauthenticated(err) {
 		m.showLogin("Session expired. Sign in again.")
-		return m.clearRemoteSession()
+		return m.clearExpiredSession(err)
 	}
 	m.err = sanitizeIdentity(err.Error(), maxAPITextBytes)
 	m.screen, m.confirmation = fallback, nil
@@ -926,7 +959,26 @@ func validateMutationResponse(request mutationRequest, job apicontract.Job) erro
 	if job.ID == "" || job.ResourceType != "application" || job.ResourceID != request.AppID {
 		return errors.New("controller returned an operation for an unexpected application; live updates were not started")
 	}
+	expected, ok := expectedMutationJobType(request.Action)
+	if !ok || strings.ToLower(strings.TrimSpace(job.Type)) != expected {
+		return errors.New("controller returned an unexpected operation type; live updates were not started")
+	}
 	return nil
+}
+
+func expectedMutationJobType(action actionKind) (string, bool) {
+	switch action {
+	case actionDeploy:
+		return "deploy", true
+	case actionStart:
+		return "start", true
+	case actionStop:
+		return "stop", true
+	case actionRestart:
+		return "restart", true
+	default:
+		return "", false
+	}
 }
 
 func validateCancelResponse(request mutationRequest, job apicontract.Job) error {

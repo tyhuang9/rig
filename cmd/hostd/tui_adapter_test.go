@@ -12,15 +12,20 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/hostd/hostd/internal/apicontract"
+	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/controllerclient"
 	"github.com/hostd/hostd/internal/tui"
 )
 
 type memorySessionStore struct {
-	value   []byte
-	cleared bool
-	saveErr error
+	value        []byte
+	cleared      bool
+	saveErr      error
+	clearStarted chan struct{}
+	releaseClear <-chan struct{}
 }
 
 func (s *memorySessionStore) Load(context.Context) ([]byte, error) {
@@ -31,9 +36,16 @@ func (s *memorySessionStore) Save(_ context.Context, value []byte) error {
 		return s.saveErr
 	}
 	s.value = append([]byte(nil), value...)
+	s.cleared = false
 	return nil
 }
 func (s *memorySessionStore) Clear(context.Context) error {
+	if s.clearStarted != nil {
+		close(s.clearStarted)
+	}
+	if s.releaseClear != nil {
+		<-s.releaseClear
+	}
 	s.value = nil
 	s.cleared = true
 	return nil
@@ -227,5 +239,176 @@ func TestTUILogoutClearsExpiredProtectedSessionLocally(t *testing.T) {
 	}
 	if !store.cleared || len(store.value) != 0 {
 		t.Fatal("expired session remained in protected storage")
+	}
+}
+
+func TestTUIFollowMapsUnauthorizedAndConditionallyClearsSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":"unauthenticated","detail":"expired"}`))
+	}))
+	defer server.Close()
+	stored, err := json.Marshal(controllerclient.Session{SessionToken: "session-a", CSRFToken: "csrf-a", ControllerOrigin: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &memorySessionStore{value: stored}
+	client, err := newTUIControllerClient(server.URL, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	events, failures := client.FollowJob(ctx, "job-a", 0)
+	var streamErr error
+	select {
+	case streamErr = <-failures:
+	case _, ok := <-events:
+		t.Fatalf("event channel closed before mapped authentication failure (open=%v)", ok)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for stream failure")
+	}
+	var httpErr *tui.HTTPError
+	if !errors.As(streamErr, &httpErr) || httpErr.Status != http.StatusUnauthorized || httpErr.SessionGeneration == 0 {
+		t.Fatalf("stream error = %#v", streamErr)
+	}
+	if err := client.ClearSession(context.Background(), httpErr.SessionGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if !store.cleared || len(store.value) != 0 {
+		t.Fatal("expired stream session remained in protected storage")
+	}
+}
+
+func TestDelayedLogoutAndExpiryCleanupCannotEraseNewLogin(t *testing.T) {
+	logoutStarted := make(chan struct{})
+	releaseLogout := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/auth/sessions/current":
+			close(logoutStarted)
+			<-releaseLogout
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/auth/sessions":
+			http.SetCookie(w, &http.Cookie{Name: auth.SessionCookie, Value: "session-b"})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"csrfToken":"csrf-b","user":{"id":"user-b","username":"new-admin"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	stored, err := json.Marshal(controllerclient.Session{SessionToken: "session-a", CSRFToken: "csrf-a", ControllerOrigin: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &memorySessionStore{value: stored}
+	client, err := newTUIControllerClient(server.URL, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := client.(*tuiControllerClient)
+	old, err := adapter.currentSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	logoutDone := make(chan error, 1)
+	go func() { logoutDone <- client.Logout(context.Background()) }()
+	select {
+	case <-logoutStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("logout did not start")
+	}
+	if _, err := client.Login(context.Background(), apicontract.LoginRequest{Username: "new-admin", Passphrase: "new-passphrase"}); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseLogout)
+	if err := <-logoutDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ClearSession(context.Background(), old.generation); err != nil {
+		t.Fatal(err)
+	}
+	stale := old.session
+	stale.CSRFToken = "stale-refreshed-csrf"
+	if err := adapter.saveIfCurrent(context.Background(), old.generation, stale); err != nil {
+		t.Fatal(err)
+	}
+	current, err := adapter.current(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.SessionToken != "session-b" || current.CSRFToken != "csrf-b" || store.cleared {
+		t.Fatalf("new session was erased: session=%#v cleared=%v", current, store.cleared)
+	}
+	var persisted controllerclient.Session
+	if err := json.Unmarshal(store.value, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.SessionToken != "session-b" || persisted.CSRFToken != "csrf-b" {
+		t.Fatalf("persisted session = %#v", persisted)
+	}
+}
+
+func TestDelayedExpiryClearSerializesWithNewLogin(t *testing.T) {
+	loginStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/auth/sessions" {
+			http.NotFound(w, r)
+			return
+		}
+		close(loginStarted)
+		http.SetCookie(w, &http.Cookie{Name: auth.SessionCookie, Value: "session-b"})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"csrfToken":"csrf-b","user":{"id":"user-b","username":"new-admin"}}`))
+	}))
+	defer server.Close()
+	stored, err := json.Marshal(controllerclient.Session{SessionToken: "session-a", CSRFToken: "csrf-a", ControllerOrigin: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearStarted := make(chan struct{})
+	releaseClear := make(chan struct{})
+	store := &memorySessionStore{value: stored, clearStarted: clearStarted, releaseClear: releaseClear}
+	client, err := newTUIControllerClient(server.URL, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := client.(*tuiControllerClient)
+	old, err := adapter.currentSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearDone := make(chan error, 1)
+	go func() { clearDone <- client.ClearSession(context.Background(), old.generation) }()
+	select {
+	case <-clearStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("local session clear did not start")
+	}
+	loginDone := make(chan error, 1)
+	go func() {
+		_, loginErr := client.Login(context.Background(), apicontract.LoginRequest{Username: "new-admin", Passphrase: "new-passphrase"})
+		loginDone <- loginErr
+	}()
+	select {
+	case <-loginStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("new login did not start while clear was delayed")
+	}
+	close(releaseClear)
+	if err := <-clearDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-loginDone; err != nil {
+		t.Fatal(err)
+	}
+	current, err := adapter.current(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.SessionToken != "session-b" || current.CSRFToken != "csrf-b" || store.cleared {
+		t.Fatalf("new login did not replace cleared session: session=%#v cleared=%v", current, store.cleared)
 	}
 }
