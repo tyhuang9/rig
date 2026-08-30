@@ -1,40 +1,38 @@
-// Package tui implements hostd's interactive, non-AI operator console.
+// Package tui implements hostd's interactive, non-AI application switchboard.
 package tui
 
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 type ProgramRunner func(tea.Model, ...tea.ProgramOption) (tea.Model, error)
+type URLOpener func(context.Context, string) error
 
-// Config wires the terminal model to a controller client and protected stores.
-// Client can be supplied directly for tests; production integrations normally
-// provide both SessionStoreFactory and ClientFactory.
+// Config wires the terminal model to a controller client and protected session
+// store. OpenURL receives only the validated controller origin.
 type Config struct {
 	Endpoint            string
 	Client              Client
 	ClientFactory       ClientFactory
 	SessionStoreFactory SessionStoreFactory
-	HistoryStoreFactory HistoryStoreFactory
-	HistoryPath         string
 	ProgramRunner       ProgramRunner
-	// Accessible uses the primary terminal buffer and a stable, linear view.
-	// It deliberately does not enable mouse reporting or the alternate screen.
-	Accessible bool
+	OpenURL             URLOpener
+	Accessible          bool
 }
 
-// Run starts the operator console. Accessible mode uses the primary buffer.
+// Run starts the operator switchboard. Accessible mode remains in the primary
+// terminal buffer; normal mode uses the alternate buffer. Neither reports mouse
+// events.
 func Run(ctx context.Context, cfg Config) error {
 	if ctx == nil {
 		return errors.New("tui context is required")
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
 	client := cfg.Client
 	if client == nil {
 		if cfg.ClientFactory == nil || cfg.SessionStoreFactory == nil {
@@ -49,16 +47,14 @@ func Run(ctx context.Context, cfg Config) error {
 			return err
 		}
 	}
-	history, err := buildHistoryStore(cfg)
-	if err != nil {
-		return err
-	}
 	endpoint := cfg.Endpoint
 	if endpoint == "" {
 		endpoint = "http://127.0.0.1:7345"
 	}
-	model := NewModel(runCtx, client, history, endpoint)
+	model := NewModel(runCtx, client, endpoint)
 	model.accessible = cfg.Accessible
+	model.openURL = cfg.OpenURL
+
 	runner := cfg.ProgramRunner
 	if runner == nil {
 		runner = func(model tea.Model, options ...tea.ProgramOption) (tea.Model, error) {
@@ -67,23 +63,8 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	options := []tea.ProgramOption{tea.WithContext(runCtx)}
 	if !cfg.Accessible {
-		options = append(options, tea.WithAltScreen(), tea.WithMouseCellMotion())
+		options = append(options, tea.WithAltScreen())
 	}
-	_, err = runner(model, options...)
+	_, err := runner(model, options...)
 	return err
-}
-
-func buildHistoryStore(cfg Config) (HistoryStore, error) {
-	if cfg.HistoryStoreFactory != nil {
-		return cfg.HistoryStoreFactory()
-	}
-	path := cfg.HistoryPath
-	if path == "" {
-		root, err := os.UserConfigDir()
-		if err != nil {
-			return nil, err
-		}
-		path = filepath.Join(root, "hostd", "tui-history.json")
-	}
-	return NewProtectedHistoryStore(path), nil
 }

@@ -1,60 +1,63 @@
 package tui
 
 import (
-	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
-	"unicode/utf8"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/hostd/hostd/internal/apicontract"
 )
 
 var (
-	colorAccent = lipgloss.AdaptiveColor{Light: "#005FAF", Dark: "#7DD3FC"}
-	colorMuted  = lipgloss.AdaptiveColor{Light: "#52606D", Dark: "#A0AEC0"}
-	colorBad    = lipgloss.AdaptiveColor{Light: "#B42318", Dark: "#FDA4AF"}
-	colorPanel  = lipgloss.AdaptiveColor{Light: "#94A3B8", Dark: "#475569"}
-	colorSelect = lipgloss.AdaptiveColor{Light: "#DCEEFF", Dark: "#163A5F"}
-
+	colorAccent   = lipgloss.AdaptiveColor{Light: "#005FAF", Dark: "#7DD3FC"}
+	colorMuted    = lipgloss.AdaptiveColor{Light: "#52606D", Dark: "#A0AEC0"}
+	colorBad      = lipgloss.AdaptiveColor{Light: "#B42318", Dark: "#FDA4AF"}
+	colorGood     = lipgloss.AdaptiveColor{Light: "#137333", Dark: "#86EFAC"}
+	colorPanel    = lipgloss.AdaptiveColor{Light: "#94A3B8", Dark: "#475569"}
 	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
 	mutedStyle    = lipgloss.NewStyle().Foreground(colorMuted)
 	errorStyle    = lipgloss.NewStyle().Bold(true).Foreground(colorBad)
+	goodStyle     = lipgloss.NewStyle().Foreground(colorGood)
+	selectedStyle = lipgloss.NewStyle().Bold(true)
 	panelStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorPanel).Padding(0, 1)
-	selectedStyle = lipgloss.NewStyle().Bold(true).Background(colorSelect)
-	buttonStyle   = lipgloss.NewStyle().Bold(true).Underline(true).Padding(0, 1)
-	cancelStyle   = lipgloss.NewStyle().Underline(true).Padding(0, 1)
 )
 
 func (m *Model) View() string {
 	if m.width <= 0 || m.height <= 0 {
-		return "hostd operator console\n"
+		return "Rig application switchboard\n"
 	}
-	if m.width < 32 || m.height < 8 {
-		return m.finishView(m.centered("hostd operator console\n\nTerminal too small\nResize to at least 32×8\nCtrl+C quits"))
-	}
-	if m.accessible {
-		return m.finishView(m.accessibleView())
+	if m.layout.unsupported {
+		return m.finishView(m.centered("Rig\n\nTerminal too small\nResize to at least 32×8\n\nCtrl+C quits"))
 	}
 	var view string
 	switch m.screen {
 	case screenLoading:
-		view = m.centered("hostd operator console\n\nConnecting to " + endpointLabel(m.endpoint) + "…")
+		view = m.centered("Rig application switchboard\n\nConnecting to " + endpointLabel(m.endpoint) + "…")
 	case screenOffline:
-		view = m.centered(titleStyle.Render("Controller unavailable") + "\n\nEndpoint: " + endpointLabel(m.endpoint) + "\n" + errorStyle.Render(sanitizeAPIText(m.err)) + "\n\nStart the controller with: hostd serve\nThen press Enter or r to retry. Ctrl+C quits.")
+		view = m.offlineView()
 	case screenBootstrap:
 		if m.bootstrapConfirm {
 			view = m.bootstrapConfirmationView()
 		} else {
-			view = m.authView("Create the first administrator", "Enter the one-time bootstrap token and new administrator credentials.")
+			view = m.authView("Create the first administrator", "Use the protected one-time bootstrap token.")
 		}
 	case screenLogin:
-		view = m.authView("Sign in to hostd", "Credentials stay in memory only and are never written to command history.")
-	case screenConsole:
-		view = m.consoleView()
+		view = m.authView("Sign in to Rig", "Credentials stay in memory only.")
+	case screenSwitchboard:
+		view = m.switchboardView()
+	case screenActions:
+		view = m.actionsView()
+	case screenConfirmation:
+		view = m.confirmationView()
+	case screenJobProgress:
+		view = m.progressView()
+	case screenResult:
+		view = m.resultView()
+	case screenHelp:
+		view = m.helpView()
 	}
 	return m.finishView(view)
 }
@@ -62,335 +65,421 @@ func (m *Model) View() string {
 func (m *Model) centered(content string) string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
 }
+func (m *Model) offlineView() string {
+	return m.centered(strings.Join([]string{titleStyle.Render("Controller unavailable"), "", "Rig could not reach " + endpointLabel(m.endpoint) + ".", errorStyle.Render(cropWidth(sanitizeAPIText(m.err), max(1, m.width-4))), "", "Start the controller with: hostd serve", "", "Enter Retry   q Quit   Ctrl+C Exit"}, "\n"))
+}
 
 func (m *Model) authView(title, subtitle string) string {
 	m.resizeAuthInputs()
 	if m.compactAuthLayout() {
-		return m.compactAuthView(title)
+		lines := []string{titleStyle.Render(title)}
+		for i := range m.authInputs {
+			lines = append(lines, cropWidth(authFieldLabel(m.screen, i)+": "+m.authInputs[i].View(), m.width))
+		}
+		if m.err != "" {
+			lines = append(lines, errorStyle.Render(cropWidth(m.err, m.width)))
+		}
+		if m.mutationBusy {
+			lines = append(lines, "Authenticating…")
+		}
+		lines = append(lines, mutedStyle.Render("Tab fields · Enter continues · Ctrl+C quits"))
+		return strings.Join(lines, "\n")
 	}
 	var b strings.Builder
-	b.WriteString(titleStyle.Render(title))
-	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render(subtitle))
-	b.WriteString("\n\n")
+	b.WriteString(titleStyle.Render(title) + "\n" + mutedStyle.Render(subtitle) + "\n\n")
 	for i := range m.authInputs {
-		b.WriteString(authFieldLabel(m.screen, i) + ":\n")
-		b.WriteString(m.authInputs[i].View())
-		b.WriteString("\n")
+		b.WriteString(authFieldLabel(m.screen, i) + ":\n" + m.authInputs[i].View() + "\n")
 	}
 	if m.err != "" {
-		b.WriteString("\n")
-		b.WriteString(errorStyle.Render(sanitizeAPIText(m.err)))
+		b.WriteString("\n" + errorStyle.Render(m.err))
 	}
-	if m.busy {
+	if m.mutationBusy {
 		b.WriteString("\nAuthenticating…")
 	}
 	b.WriteString("\n\nTab/Shift+Tab change field · Enter continues · Ctrl+C quits")
-	boxWidth := min(max(1, m.width-4), 68)
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panelStyle.Width(boxWidth).Render(b.String()))
+	return m.centered(panelStyle.Width(min(max(1, m.width-6), 68)).Render(b.String()))
 }
-
-// Compact auth keeps every field on screen at supported terminal sizes. It is
-// intentionally linear rather than allowing a centered panel to crop fields
-// below the bottom edge of a small terminal.
-func (m *Model) compactAuthView(title string) string {
-	lines := []string{titleStyle.Render(title)}
-	for i := range m.authInputs {
-		line := authFieldLabel(m.screen, i) + ": " + m.authInputs[i].View()
-		lines = append(lines, cropWidth(line, m.width))
-	}
-	if m.err != "" {
-		lines = append(lines, cropWidth(errorStyle.Render(sanitizeAPIText(m.err)), m.width))
-	}
-	if m.busy {
-		lines = append(lines, "Authenticating…")
-	}
-	lines = append(lines, mutedStyle.Render("Tab fields · Enter continues · Ctrl+C quits"))
-	return cropHeight(strings.Join(lines, "\n"), m.height)
-}
-
 func (m *Model) bootstrapConfirmationView() string {
-	if m.compactAuthLayout() {
-		lines := []string{
-			titleStyle.Render("Confirm administrator creation"),
-			cropWidth("Create administrator "+sanitizeAPIText(m.bootstrapUsername)+"?", m.width),
-			buttonStyle.Render("Confirm [Enter]") + " " + cancelStyle.Render("Cancel [Esc]"),
-			mutedStyle.Render("Enter confirms · Escape cancels"),
-		}
-		m.bootstrapConfirmRect = rect{0, 2, max(1, m.width/2), 1}
-		m.bootstrapCancelRect = rect{max(1, m.width/2), 2, max(1, m.width-m.width/2), 1}
-		return cropHeight(strings.Join(lines, "\n"), m.height)
-	}
-	content := strings.Join([]string{
-		titleStyle.Render("Confirm administrator creation"),
-		"",
-		"Create administrator " + sanitizeAPIText(m.bootstrapUsername) + "?",
-		"",
-		buttonStyle.Render("Confirm [Enter]") + " " + cancelStyle.Render("Cancel [Esc]"),
-		mutedStyle.Render("Enter confirms · Escape cancels"),
-	}, "\n")
-	boxWidth := min(max(1, m.width-4), 68)
-	box := panelStyle.Width(boxWidth).Render(content)
-	x := max(0, (m.width-lipgloss.Width(box))/2)
-	y := max(0, (m.height-lipgloss.Height(box))/2)
-	m.bootstrapConfirmRect = rect{x + 1, y + 5, 18, 1}
-	m.bootstrapCancelRect = rect{x + 20, y + 5, 16, 1}
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	return m.centered(strings.Join([]string{titleStyle.Render("Confirm administrator creation"), "", "Create administrator " + sanitizeAPIText(m.bootstrapUsername) + "?", "", "Enter Create administrator   Esc Cancel"}, "\n"))
 }
 
-func (m *Model) consoleView() string {
-	if m.layout.unsupported {
-		return m.centered(titleStyle.Render("Terminal too small") + "\nResize to at least 32×8\nCtrl+C quits")
+func (m *Model) header() string {
+	runtime := "Not ready"
+	if m.status.Capabilities.FakeRuntime || m.status.Capabilities.ComposeRuntime {
+		runtime = "Ready"
 	}
-	if m.layout.tiny {
-		return m.tinyConsoleView()
+	refresh := ""
+	if m.overviewLoading {
+		refresh = " · Refreshing"
 	}
-	header := m.renderHeader()
-	overview := m.renderOverview()
-	transcript := panelStyle.Width(max(1, m.layout.transcript.w-4)).Height(max(1, m.layout.transcript.h-2)).Render(m.viewport.View())
-	body := overview + "\n" + transcript
-	if m.layout.wide {
-		body = lipgloss.JoinHorizontal(lipgloss.Top, overview, " ", transcript)
-	}
-	lower := m.renderLower()
-	footer := mutedStyle.Render(m.renderFooter())
-	return strings.Join([]string{header, body, lower, footer}, "\n")
+	return cropWidth(titleStyle.Render("Rig")+"  "+goodStyle.Render("● Connected")+refresh+"  "+mutedStyle.Render("Runtime: "+runtime), m.width)
 }
 
-func (m *Model) tinyConsoleView() string {
-	selected := m.selectedAppName()
-	header := titleStyle.Render("hostd") + " " + mutedStyle.Render(selected)
-	if m.confirm != nil {
-		prompt := cropWidth(errorStyle.Render("CONFIRM: "+m.confirm.Text), m.width)
-		actions := cropWidth(buttonStyle.Render("Confirm [Enter]")+" "+cancelStyle.Render("Cancel [Esc]"), m.width)
-		command := "Command: " + m.commandInput.View()
-		footer := mutedStyle.Render("Enter confirms · Esc cancels · Ctrl+C quits")
-		return cropHeight(strings.Join([]string{header, prompt, actions, command, footer}, "\n"), m.height)
-	}
-	transcript := cropHeight(m.viewport.View(), max(1, m.layout.transcript.h))
-	command := "Command: " + m.commandInput.View()
-	footer := mutedStyle.Render("Enter run · Esc stop follow · Ctrl+C quit")
-	return cropHeight(strings.Join([]string{header, transcript, command, footer}, "\n"), m.height)
-}
-
-func (m *Model) renderHeader() string {
-	connection := "[connected]"
-	if m.busy {
-		connection = "[working]"
-	}
-	left := titleStyle.Render("hostd operator console") + "  " + connection
-	right := fmt.Sprintf("%s · %s", endpointLabel(m.endpoint), sanitizeAPIText(m.user.Username))
-	line := left
-	space := m.width - lipgloss.Width(left) - lipgloss.Width(right)
-	if space > 1 {
-		line += strings.Repeat(" ", space) + mutedStyle.Render(right)
-	}
-	selected := "application: " + m.selectedAppName()
-	follow := ""
-	if m.followJobID != "" {
-		follow = "  following: " + sanitizeAPIText(m.followJobID)
-	}
-	return cropWidth(line, m.width) + "\n" + cropWidth(mutedStyle.Render(selected+follow), m.width) + "\n" + strings.Repeat("─", m.width)
-}
-
-func (m *Model) renderOverview() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("Overview"))
-	b.WriteString("\n")
+func (m *Model) switchboardView() string {
 	if !m.overviewLoaded {
-		message := "Overview unavailable; run /status to retry."
-		if m.overviewLoading {
-			message = "Loading controller overview…"
-		}
-		b.WriteString(mutedStyle.Render(message))
-		return panelStyle.Width(max(1, m.layout.overview.w-4)).Height(max(1, m.layout.overview.h-2)).Render(b.String())
-	}
-	daemon := sanitizeAPIText(m.status.Daemon)
-	if daemon == "" {
-		daemon = "loading"
-	}
-	fmt.Fprintf(&b, "daemon  %s\nengine  %s\n", daemon, boolWord(m.status.Diagnostics.EngineReady))
-	b.WriteString("\n" + titleStyle.Render("Applications") + "\n")
-	visible := min(len(m.apps), max(0, min(3, m.layout.overview.h-12)))
-	for i := 0; i < visible; i++ {
-		app := m.apps[i]
-		line := fmt.Sprintf("%-14s %s", truncate(sanitizeAPIText(app.Slug), 14), truncate(sanitizeAPIText(app.Status), 9))
-		if app.ID == m.selectedAppID {
-			line = selectedStyle.Width(max(1, m.layout.overview.w-4)).Render(line)
-		}
-		b.WriteString(line + "\n")
+		return strings.Join([]string{m.header(), "", "Loading applications…", m.footer("r Refresh   ? Help   q Quit")}, "\n")
 	}
 	if len(m.apps) == 0 {
-		b.WriteString(mutedStyle.Render("No applications") + "\n")
-	}
-	b.WriteString("\n" + titleStyle.Render("Active / failures") + "\n")
-	for _, job := range m.overviewJobRows {
-		b.WriteString(fmt.Sprintf("%-10s %s\n", truncate(sanitizeAPIText(job.Status), 10), truncate(sanitizeAPIText(job.ID), max(8, m.layout.overview.w-15))))
-	}
-	if len(m.overviewJobRows) == 0 {
-		b.WriteString(mutedStyle.Render("No active or failed jobs") + "\n")
-	}
-	return panelStyle.Width(max(1, m.layout.overview.w-4)).Height(max(1, m.layout.overview.h-2)).Render(strings.TrimSuffix(b.String(), "\n"))
-}
-
-func (m *Model) renderLower() string {
-	if m.confirm != nil {
-		prompt := cropWidth(errorStyle.Render("CONFIRMATION REQUIRED: "+m.confirm.Text), max(1, m.width-29))
-		prompt += strings.Repeat(" ", max(1, m.width-29-lipgloss.Width(prompt)))
-		return cropHeight(prompt+buttonStyle.Render("Run [Enter]")+" "+cancelStyle.Render("Cancel [Esc]"), max(1, m.layout.confirmation.h)) + "\n" + panelStyle.Width(max(1, m.layout.command.w-4)).Render("Command: "+m.commandInput.View())
-	}
-	var lines []string
-	for i, suggestion := range m.suggestions {
-		line := "  " + suggestion
-		if i == m.suggestion {
-			line = selectedStyle.Render("› " + suggestion)
+		lines := []string{m.header(), "", titleStyle.Render("No applications yet"), "", "Create or import an application in the Rig web dashboard,", "then return here and refresh.", "", "o Open Web   r Refresh   ? Help   l Logout   q Quit"}
+		if m.err != "" {
+			lines = append(lines, errorStyle.Render(m.err))
 		}
-		lines = append(lines, cropWidth(line, m.width))
+		return strings.Join(lines, "\n")
 	}
-	suggestions := cropHeight(strings.Join(lines, "\n"), m.layout.suggestions.h)
-	command := panelStyle.Width(max(1, m.layout.command.w-4)).Render("Command: " + m.commandInput.View())
-	if suggestions == "" {
-		return command
+	if m.layout.wide {
+		return m.wideSwitchboardView()
 	}
-	return suggestions + "\n" + command
-}
-
-func (m *Model) renderFooter() string {
-	state := "connected"
-	if m.busy {
-		state = "working"
+	lines := []string{m.header()}
+	if m.err != "" {
+		lines = append(lines, errorStyle.Render(cropWidth(m.err, m.width)))
+	} else {
+		lines = append(lines, "")
 	}
-	return cropWidth(fmt.Sprintf("Endpoint: %s | App: %s | State: %s | Tab complete | ↑↓ history | PgUp/PgDn scroll | Esc cancel | Ctrl+C quit", endpointLabel(m.endpoint), m.selectedAppName(), state), m.width)
-}
-
-func (m *Model) rebuildHitTargets() {
-	m.suggestionRects = m.suggestionRects[:0]
-	for i := 0; i < min(len(m.suggestions), m.layout.suggestions.h); i++ {
-		m.suggestionRects = append(m.suggestionRects, rect{0, m.layout.suggestions.y + i, m.width, 1})
+	if !m.layout.compact {
+		lines = append(lines, titleStyle.Render("Applications"))
 	}
-	m.appRects = m.appRects[:0]
-	visible := min(len(m.apps), max(0, min(3, m.layout.overview.h-12)))
-	for i := 0; i < visible; i++ {
-		m.appRects = append(m.appRects, rect{m.layout.overview.x + 1, m.layout.overview.y + 6 + i, max(1, m.layout.overview.w-2), 1})
-	}
-	m.overviewJobRows = overviewJobs(m.jobs, max(0, m.layout.overview.h-10-visible))
-	m.jobRects = m.jobRects[:0]
-	jobStartY := m.layout.overview.y + 8 + visible
-	for i := range m.overviewJobRows {
-		m.jobRects = append(m.jobRects, rect{m.layout.overview.x + 1, jobStartY + i, max(1, m.layout.overview.w-2), 1})
-	}
-	if m.confirm != nil {
-		if m.layout.tiny {
-			y := m.layout.confirmation.y + 1
-			m.confirmRect = rect{0, y, max(1, m.width/2), 1}
-			m.cancelRect = rect{max(1, m.width/2), y, max(1, m.width-m.width/2), 1}
+	lines = append(lines, m.applicationRows(m.width, m.layout.listRows)...)
+	if app, ok := m.selectedApp(); ok {
+		if m.layout.compact {
+			lines = append(lines, m.compactAppSummary(app))
 		} else {
-			y := m.layout.confirmation.y
-			m.confirmRect = rect{max(0, m.width-29), y, 14, 1}
-			m.cancelRect = rect{max(0, m.width-14), y, 14, 1}
+			lines = append(lines, "")
+			lines = append(lines, m.appDetails(app)...)
 		}
 	}
+	lines = append(lines, m.footer(m.switchboardFooter()))
+	return strings.Join(lines, "\n")
 }
-
-func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	if m.accessible || m.busy {
-		return m, nil
+func (m *Model) wideSwitchboardView() string {
+	leftLines := append([]string{titleStyle.Render("Applications")}, m.applicationRows(max(1, m.layout.leftWidth-4), m.layout.listRows)...)
+	rightLines := []string{"No application selected"}
+	if app, ok := m.selectedApp(); ok {
+		rightLines = append([]string{titleStyle.Render(displayAppName(app))}, m.appDetails(app)...)
 	}
-	event := tea.MouseEvent(msg)
-	if event.Button == tea.MouseButtonWheelUp || event.Button == tea.MouseButtonWheelDown {
-		if m.layout.transcript.contains(event.X, event.Y) {
-			if event.Button == tea.MouseButtonWheelUp {
-				m.viewport.ScrollUp(3)
-			} else {
-				m.viewport.ScrollDown(3)
-			}
-		}
-		return m, nil
+	panelHeight := max(3, m.height-5)
+	left := panelStyle.Width(max(1, m.layout.leftWidth-4)).Height(panelHeight - 2).Render(strings.Join(leftLines, "\n"))
+	right := panelStyle.Width(max(1, m.layout.rightWidth-4)).Height(panelHeight - 2).Render(strings.Join(rightLines, "\n"))
+	body := lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
+	lines := []string{m.header()}
+	if m.err != "" {
+		lines = append(lines, errorStyle.Render(cropWidth(m.err, m.width)))
+	} else {
+		lines = append(lines, "")
 	}
-	if event.Action != tea.MouseActionPress || event.Button != tea.MouseButtonLeft {
-		return m, nil
-	}
-	if m.screen == screenBootstrap && m.bootstrapConfirm {
-		if m.bootstrapConfirmRect.contains(event.X, event.Y) {
-			return m.submitAuth()
-		}
-		if m.bootstrapCancelRect.contains(event.X, event.Y) {
-			m.cancelBootstrapConfirmation()
-		}
-		return m, nil
-	}
-	if m.screen != screenConsole {
-		return m, nil
-	}
-	if m.confirm != nil {
-		if m.confirmRect.contains(event.X, event.Y) {
-			cmd := m.confirm.Command
-			m.confirm = nil
-			return m, m.execute(cmd)
-		}
-		if m.cancelRect.contains(event.X, event.Y) {
-			m.confirm = nil
-			m.appendEntry(entrySystem, "cancelled", "No changes were made.")
-			m.restoreCommandFocus()
-		}
-		return m, nil
-	}
-	for i, target := range m.suggestionRects {
-		if target.contains(event.X, event.Y) && i < len(m.suggestions) {
-			m.commandInput.SetValue(m.suggestions[i])
-			m.commandInput.CursorEnd()
-			m.refreshSuggestions()
-			return m, nil
-		}
-	}
-	for i, target := range m.appRects {
-		if target.contains(event.X, event.Y) && i < len(m.apps) {
-			m.selectedAppID = m.apps[i].ID
-			return m, nil
-		}
-	}
-	for i, target := range m.jobRects {
-		if target.contains(event.X, event.Y) && i < len(m.overviewJobRows) {
-			jobID := m.overviewJobRows[i].ID
-			return m, m.execute(command{Name: "/job", Args: []string{jobID}, Raw: "/job " + jobID})
-		}
-	}
-	return m, nil
+	lines = append(lines, body, m.footer(m.switchboardFooter()))
+	return strings.Join(lines, "\n")
 }
-
-func overviewJobs(jobs []apicontract.Job, limit int) []apicontract.Job {
-	if limit <= 0 {
-		return nil
-	}
-	rows := make([]apicontract.Job, 0, limit)
-	for _, job := range jobs {
-		status := strings.ToLower(job.Status)
-		if status != "succeeded" && status != "failed" && status != "cancelled" && status != "interrupted" && status != "needs_attention" {
-			rows = append(rows, job)
+func (m *Model) applicationRows(width, capacity int) []string {
+	end := min(len(m.apps), m.listOffset+max(1, capacity))
+	rows := make([]string, 0, end-m.listOffset)
+	for i := m.listOffset; i < end; i++ {
+		app := m.apps[i]
+		selected := app.ID == m.selectedAppID
+		marker := "  "
+		if selected {
+			marker = "> "
 		}
-		if len(rows) == limit {
-			return rows
+		state := appStateLabel(app.Status, m.accessible)
+		job := relevantJob(app.ID, m.jobs)
+		suffix := ""
+		if job != nil {
+			suffix = "  " + jobSummary(*job)
 		}
-	}
-	for _, job := range jobs {
-		status := strings.ToLower(job.Status)
-		if status == "failed" || status == "interrupted" || status == "needs_attention" {
-			rows = append(rows, job)
+		available := max(4, width-ansi.StringWidth(marker)-ansi.StringWidth(state)-ansi.StringWidth(suffix)-2)
+		name := cropWidth(displayAppName(app), available)
+		gap := max(1, width-ansi.StringWidth(marker+name+state+suffix))
+		line := marker + name + strings.Repeat(" ", gap) + state + suffix
+		if selected {
+			line = selectedStyle.Render(line)
 		}
-		if len(rows) == limit {
-			break
-		}
+		rows = append(rows, cropWidth(line, width))
 	}
 	return rows
 }
-
-func boolWord(value bool) string {
-	if value {
-		return "ready"
+func (m *Model) compactAppSummary(app apicontract.Application) string {
+	source := sourceSummary(app.Source)
+	summary := displayAppName(app)
+	if source != "" {
+		summary += " · " + source
 	}
-	return "not ready"
+	if job := relevantJob(app.ID, m.jobs); job != nil {
+		summary += " · " + jobSummary(*job)
+	}
+	return cropWidth(summary, m.width)
+}
+func (m *Model) appDetails(app apicontract.Application) []string {
+	lines := []string{displayAppName(app) + " · " + appStateLabel(app.Status, m.accessible)}
+	if source := sourceSummary(app.Source); source != "" {
+		lines = append(lines, "Source     "+source)
+	}
+	if app.Source.TrackedBranch != "" {
+		lines = append(lines, "Branch     "+sanitizeAPIText(app.Source.TrackedBranch))
+	}
+	if app.Source.ResolvedSha != "" {
+		lines = append(lines, "Revision   "+shortRevision(app.Source.ResolvedSha))
+	}
+	if app.MachineName != "" {
+		lines = append(lines, "Machine    "+sanitizeAPIText(app.MachineName))
+	}
+	if job := relevantJob(app.ID, m.jobs); job != nil {
+		lines = append(lines, "Operation  "+jobSummary(*job))
+		if job.ErrorDetail != "" {
+			lines = append(lines, "Error      "+cropWidth(sanitizeAPIText(job.ErrorDetail), max(8, m.width-11)))
+		}
+	}
+	return lines
+}
+func (m *Model) switchboardFooter() string {
+	if m.layout.compact {
+		return "Enter Actions · r Refresh · ? Help · q Quit"
+	}
+	return "Enter Actions   r Refresh   o Open Web   ? Help   l Logout   q Quit"
 }
 
+func (m *Model) actionsView() string {
+	app, ok := m.selectedApp()
+	if !ok {
+		return "No application selected\n\nEsc Back"
+	}
+	job := relevantJob(app.ID, m.jobs)
+	items := actionsFor(app, job, m.status)
+	lines := []string{titleStyle.Render("Actions — "+displayAppName(app)) + "  " + appStateLabel(app.Status, m.accessible), ""}
+	for i, item := range items {
+		marker := "  "
+		if i == m.selectedAction {
+			marker = "> "
+		}
+		detail := item.Detail
+		if !item.Enabled {
+			detail = item.DisabledBy
+		}
+		line := marker + item.Label
+		if detail != "" {
+			line += "  " + mutedStyle.Render(detail)
+		}
+		if i == m.selectedAction {
+			line = selectedStyle.Render(line)
+		}
+		lines = append(lines, cropWidth(line, m.width))
+	}
+	if m.err != "" {
+		lines = append(lines, "", errorStyle.Render(cropWidth(m.err, m.width)))
+	}
+	lines = append(lines, "", "↑↓ Select   Enter Choose   Esc Back")
+	return strings.Join(lines, "\n")
+}
+
+func (m *Model) confirmationView() string {
+	if m.confirmation == nil {
+		return "Confirmation unavailable\n\nEsc Back"
+	}
+	c := m.confirmation
+	title := actionVerb(c.Action) + "?"
+	if c.Action == actionQuit {
+		title = "Quit Rig?"
+	} else if c.Action == actionLogout {
+		title = "Sign out of Rig?"
+	} else if c.Action == actionCancelJob {
+		title = "Cancel " + sanitizeAPIText(c.Job.Type) + " for " + displayAppName(c.App) + "?"
+	} else {
+		title = actionVerb(c.Action) + " " + displayAppName(c.App) + "?"
+	}
+	lines := []string{titleStyle.Render(title), ""}
+	if c.App.ID != "" {
+		lines = append(lines, "Application  "+displayAppName(c.App), "Current      "+statusWord(c.App.Status))
+	}
+	if c.Action == actionDeploy {
+		if source := sourceSummary(c.App.Source); source != "" {
+			lines = append(lines, "Source       "+source)
+		}
+		if c.App.Source.TrackedBranch != "" {
+			lines = append(lines, "Branch       "+sanitizeAPIText(c.App.Source.TrackedBranch))
+		}
+		if c.App.Source.ResolvedSha != "" {
+			lines = append(lines, "Revision     "+shortRevision(c.App.Source.ResolvedSha))
+		}
+	}
+	if c.Action == actionCancelJob {
+		lines = append(lines, "", "The running server job will be asked to stop.", "Returning with Escape does not cancel it.")
+	}
+	if m.err != "" {
+		lines = append(lines, "", errorStyle.Render(cropWidth(m.err, m.width)))
+	}
+	label := actionVerb(c.Action)
+	if m.mutationBusy {
+		label = "Working…"
+	}
+	lines = append(lines, "", "Enter "+label+"   Esc Cancel")
+	return m.centered(strings.Join(lines, "\n"))
+}
+
+func (m *Model) progressView() string {
+	job := m.followedJob
+	app := m.appByID(job.ResourceID)
+	title := titleWord(job.Type) + "ing " + displayAppName(app)
+	if strings.EqualFold(job.Type, "deploy") {
+		title = "Deploying " + displayAppName(app)
+	}
+	lines := []string{titleStyle.Render(title) + "  " + percent(job.Progress), "", progressBar(job.Progress, max(10, min(50, m.width-2))), "", "Status: " + statusWord(job.Status) + " · " + strconv.Itoa(job.Progress) + " percent"}
+	for _, phase := range m.phases {
+		mark := "●"
+		if phase.Completed {
+			mark = "✓"
+		}
+		if m.accessible {
+			if phase.Completed {
+				mark = "completed"
+			} else {
+				mark = "current"
+			}
+		}
+		lines = append(lines, mark+" "+sanitizeAPIText(phase.Name))
+	}
+	if len(m.phases) == 0 && job.Phase != "" {
+		lines = append(lines, "Current phase: "+sanitizeAPIText(job.Phase))
+	}
+	if len(m.recentEvents) > 0 {
+		event := m.recentEvents[len(m.recentEvents)-1]
+		lines = append(lines, "", cropWidth(sanitizeAPIText(event.Message), m.width))
+	}
+	if m.err != "" {
+		lines = append(lines, errorStyle.Render(cropWidth(m.err, m.width)))
+	}
+	lines = append(lines, "", m.footer("c Cancel job   Esc Back — operation continues   o Open Web"))
+	return strings.Join(lines, "\n")
+}
+func (m *Model) resultView() string {
+	if m.result == nil {
+		return "Operation result unavailable\n\nEnter Return to Applications"
+	}
+	lines := []string{titleStyle.Render(m.result.Title), "", cropWidth(sanitizeAPIText(m.result.Detail), m.width), ""}
+	if m.err != "" {
+		lines = append(lines, errorStyle.Render(cropWidth(m.err, m.width)), "")
+	}
+	lines = append(lines, "Enter Return to Applications   o Open Web   q Quit")
+	return m.centered(strings.Join(lines, "\n"))
+}
+func (m *Model) helpView() string {
+	return strings.Join([]string{titleStyle.Render("Rig Switchboard Help"), "", "↑↓ / j k     Select an application or action", "PgUp/PgDn    Move one application page", "Home / End   First or last application", "Enter        Open, choose, or confirm", "Esc          Go back; never cancels a server job", "r            Refresh applications", "o            Open web dashboard", "c            Cancel job (progress screen, with confirmation)", "l            Logout", "q            Quit", "Ctrl+C       Exit locally", "", "Configuration, approvals, logs, releases, and relay management remain in the web dashboard.", "", "Esc Back"}, "\n")
+}
+
+func (m *Model) footer(value string) string { return cropWidth(value, m.width) }
+func progressBar(value, width int) string {
+	if width < 1 {
+		return ""
+	}
+	if value < 0 {
+		value = 0
+	}
+	if value > 100 {
+		value = 100
+	}
+	filled := value * width / 100
+	return strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+}
+func displayAppName(app apicontract.Application) string {
+	if strings.TrimSpace(app.Name) != "" {
+		return sanitizeAPIText(app.Name)
+	}
+	if strings.TrimSpace(app.Slug) != "" {
+		return sanitizeAPIText(app.Slug)
+	}
+	return sanitizeAPIText(app.ID)
+}
+func appStateLabel(raw string, accessible bool) string {
+	word := statusWord(raw)
+	if accessible {
+		return word
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "running":
+		return "● " + word
+	case "stopped", "draft":
+		return "○ " + word
+	case "failed":
+		return "× " + word
+	default:
+		return "? " + word
+	}
+}
+func statusWord(raw string) string {
+	value := strings.ToLower(strings.TrimSpace(sanitizeAPIText(raw)))
+	switch value {
+	case "running":
+		return "Running"
+	case "stopped":
+		return "Stopped"
+	case "draft":
+		return "Draft"
+	case "failed":
+		return "Failed"
+	case "queued":
+		return "Queued"
+	case "assigned":
+		return "Assigned"
+	case "waiting_external":
+		return "Waiting"
+	case "waiting_user":
+		return "Needs approval"
+	case "succeeded":
+		return "Succeeded"
+	case "cancelled":
+		return "Cancelled"
+	case "interrupted":
+		return "Interrupted"
+	case "needs_attention":
+		return "Needs attention"
+	case "":
+		return "Unknown"
+	default:
+		return "Unknown (" + value + ")"
+	}
+}
+func sourceSummary(source apicontract.SourceSummary) string {
+	switch strings.ToLower(source.Type) {
+	case "github":
+		repo := strings.Trim(strings.TrimSpace(source.RepositoryOwner)+"/"+strings.TrimSpace(source.RepositoryName), "/")
+		if repo == "" {
+			repo = "GitHub"
+		}
+		return sanitizeAPIText(repo)
+	case "local":
+		if source.Path != "" {
+			return sanitizeAPIText(source.Path)
+		}
+		return "Local source"
+	default:
+		return sanitizeAPIText(source.Type)
+	}
+}
+func shortRevision(value string) string {
+	value = sanitizeAPIText(value)
+	if len(value) > 12 {
+		return value[:12]
+	}
+	return value
+}
+func titleWord(value string) string {
+	value = strings.TrimSpace(sanitizeAPIText(value))
+	if value == "" {
+		return "Operation"
+	}
+	return strings.ToUpper(value[:1]) + value[1:]
+}
+func authFieldLabel(current screen, index int) string {
+	if current == screenBootstrap {
+		return []string{"Bootstrap token", "Administrator username", "Passphrase"}[index]
+	}
+	return []string{"Username", "Passphrase"}[index]
+}
+func endpointLabel(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		return sanitizeAPIText(parsed.Scheme + "://" + parsed.Host)
+	}
+	return sanitizeAPIText(endpoint)
+}
+func noColor() bool { _, set := os.LookupEnv("NO_COLOR"); return set }
 func cropWidth(value string, width int) string {
 	if width <= 0 {
 		return ""
@@ -400,22 +489,6 @@ func cropWidth(value string, width int) string {
 	}
 	return ansi.Truncate(value, width, "…")
 }
-
-func cropHeight(value string, height int) string {
-	if height <= 0 {
-		return ""
-	}
-	lines := strings.Split(value, "\n")
-	if len(lines) > height {
-		lines = lines[:height]
-	}
-	return strings.Join(lines, "\n")
-}
-
-func truncate(value string, width int) string {
-	return cropWidth(value, width)
-}
-
 func (m *Model) finishView(value string) string {
 	if m.accessible || noColor() {
 		value = ansi.Strip(value)
@@ -425,179 +498,7 @@ func (m *Model) finishView(value string) string {
 		lines[i] = cropWidth(lines[i], m.width)
 	}
 	if len(lines) > m.height {
-		// The command prompt and current result are at the end of a console
-		// frame, so retain the tail rather than obscuring the active control.
-		lines = lines[len(lines)-m.height:]
+		lines = lines[:m.height]
 	}
 	return strings.Join(lines, "\n")
-}
-
-func (m *Model) accessibleView() string {
-	var b strings.Builder
-	b.WriteString("hostd operator console\n")
-	b.WriteString("Endpoint: " + endpointLabel(m.endpoint) + "\n")
-	switch m.screen {
-	case screenLoading:
-		b.WriteString("Connection state: connecting\n")
-	case screenOffline:
-		b.WriteString("Connection state: unavailable\nError: " + sanitizeAPIText(m.err) + "\nRecovery: start hostd serve, then press Enter or r to retry.\n")
-	case screenBootstrap:
-		b.WriteString("Authentication: bootstrap required\n")
-		if m.bootstrapConfirm {
-			b.WriteString("Confirmation required: create administrator " + sanitizeAPIText(m.bootstrapUsername) + ". Press Enter to confirm or Escape to cancel.\n")
-		} else {
-			b.WriteString(m.linearAuthFields())
-		}
-	case screenLogin:
-		b.WriteString("Authentication: sign in\n" + m.linearAuthFields())
-	case screenConsole:
-		state := "connected"
-		if m.busy {
-			state = "working"
-		}
-		b.WriteString("Connection state: " + state + "\nSelected application: " + m.selectedAppName() + "\n")
-		if !m.overviewLoaded {
-			b.WriteString("Overview: loading\n")
-		}
-		lines, page, pages := m.accessibleTranscriptPage()
-		if pages > 0 {
-			fmt.Fprintf(&b, "Transcript page %d of %d (PgUp older, PgDn newer)\n", page+1, pages)
-			for _, line := range lines {
-				b.WriteString(line + "\n")
-			}
-		}
-		if m.confirm != nil {
-			b.WriteString("Confirmation required: " + m.confirm.Text + ". Press Enter to run or Escape to cancel.\n")
-		}
-		b.WriteString("Command: " + m.commandInput.View() + "\nShortcuts: Enter run; Tab complete; Escape cancel; Ctrl+C quit.\n")
-	}
-	return b.String()
-}
-
-// accessibleTranscriptPage keeps ordinary keystrokes cheap: sanitization and
-// line splitting happen only when transcript content or terminal width changes.
-// The retained transcript itself can be 1 MiB, so the cache builds from a
-// bounded tail before it starts splitting lines for the current terminal.
-func (m *Model) accessibleTranscriptPage() ([]string, int, int) {
-	m.refreshAccessibleTranscript()
-	pageSize := m.accessiblePageSize()
-	pages := max(1, (len(m.accessibleLines)+pageSize-1)/pageSize)
-	if m.accessiblePage >= pages {
-		m.accessiblePage = pages - 1
-	}
-	end := len(m.accessibleLines) - m.accessiblePage*pageSize
-	if end < 0 {
-		end = 0
-	}
-	start := max(0, end-pageSize)
-	return m.accessibleLines[start:end], m.accessiblePage, pages
-}
-
-func (m *Model) accessiblePageSize() int {
-	// Header, connection summary, paging label, command bar, and shortcuts use
-	// at most eight lines. Keep at least one transcript line available.
-	return max(1, m.height-8)
-}
-
-func (m *Model) accessiblePageUp() {
-	m.refreshAccessibleTranscript()
-	pages := max(1, (len(m.accessibleLines)+m.accessiblePageSize()-1)/m.accessiblePageSize())
-	if m.accessiblePage < pages-1 {
-		m.accessiblePage++
-	}
-}
-
-func (m *Model) accessiblePageDown() {
-	if m.accessiblePage > 0 {
-		m.accessiblePage--
-	}
-}
-
-func (m *Model) refreshAccessibleTranscript() {
-	if m.accessibleGen == m.transcriptGen && m.accessibleWidth == m.width {
-		return
-	}
-	budget := accessibleTranscriptBudget(m.width)
-	start := len(m.entries)
-	used := 0
-	for start > 0 {
-		size := transcriptEntryBytes(m.entries[start-1])
-		if start < len(m.entries) && used+size > budget {
-			break
-		}
-		start--
-		used += size
-		if used >= budget {
-			break
-		}
-	}
-	lines := make([]string, 0, min(len(m.entries)-start, max(1, m.height*4)))
-	for _, entry := range m.entries[start:] {
-		lines = append(lines, cropWidth(entryKindLabel(entry.Kind)+" "+entry.Title, m.width))
-		// The last selected entry can still be close to the byte budget. Bound it
-		// before Split so a single API message cannot make a redraw expensive.
-		body := tailUTF8(entry.Body, budget)
-		for _, line := range strings.Split(body, "\n") {
-			lines = append(lines, cropWidth(line, m.width))
-		}
-	}
-	m.accessibleLines = lines
-	m.accessibleGen = m.transcriptGen
-	m.accessibleWidth = m.width
-	m.accessibleBuilds++
-}
-
-func accessibleTranscriptBudget(width int) int {
-	// Height changes only alter the selected page. Width changes alter wrapping,
-	// so it is the only terminal dimension that invalidates this cache.
-	return min(128<<10, max(8<<10, max(1, width)*256))
-}
-
-func tailUTF8(value string, limit int) string {
-	if limit <= 0 || value == "" {
-		return ""
-	}
-	if len(value) <= limit {
-		return value
-	}
-	start := len(value) - limit
-	for start < len(value) && !utf8.RuneStart(value[start]) {
-		start++
-	}
-	return "…" + value[start:]
-}
-
-func (m *Model) linearAuthFields() string {
-	var b strings.Builder
-	for i := range m.authInputs {
-		b.WriteString(authFieldLabel(m.screen, i) + ": " + m.authInputs[i].View() + "\n")
-	}
-	if m.err != "" {
-		b.WriteString("Error: " + sanitizeAPIText(m.err) + "\n")
-	}
-	return b.String()
-}
-
-func authFieldLabel(current screen, index int) string {
-	if current == screenBootstrap {
-		return []string{"Bootstrap token", "Administrator username", "Passphrase"}[index]
-	}
-	return []string{"Username", "Passphrase"}[index]
-}
-
-func entryKindLabel(kind entryKind) string {
-	return []string{"SYSTEM", "COMMAND", "RESULT", "ERROR", "EVENT"}[kind]
-}
-
-func endpointLabel(endpoint string) string {
-	parsed, err := url.Parse(endpoint)
-	if err == nil && parsed.Scheme != "" && parsed.Host != "" {
-		return sanitizeAPIText(parsed.Scheme + "://" + parsed.Host)
-	}
-	return sanitizeAPIText(endpoint)
-}
-
-func noColor() bool {
-	_, set := os.LookupEnv("NO_COLOR")
-	return set
 }

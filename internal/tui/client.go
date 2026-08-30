@@ -18,16 +18,15 @@ type Client interface {
 	Logout(context.Context) error
 	Me(context.Context) (apicontract.MeResponse, error)
 	Status(context.Context) (apicontract.SystemStatus, error)
-	Doctor(context.Context) (apicontract.DoctorResponse, error)
 	Applications(context.Context) (apicontract.ApplicationList, error)
-	Application(context.Context, string) (apicontract.Application, error)
-	Machines(context.Context) (apicontract.MachineList, error)
 	Deploy(context.Context, string, string) (apicontract.JobMutationResponse, error)
 	Lifecycle(context.Context, string, string, string) (apicontract.JobMutationResponse, error)
 	Jobs(context.Context) (apicontract.JobList, error)
 	Job(context.Context, string) (apicontract.Job, error)
 	FollowJob(context.Context, string, int64) (<-chan apicontract.JobEvent, <-chan error)
 	CancelJob(context.Context, string, string) (apicontract.JobResponse, error)
+	// ResumeJob remains on the adapter contract for hostctl/session regression
+	// coverage. The Switchboard intentionally exposes no Resume action.
 	ResumeJob(context.Context, string, string) (apicontract.JobResponse, error)
 }
 
