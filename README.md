@@ -1,38 +1,45 @@
-# hostd
+# Rig
 
-`hostd` is a local-first deployment manager with a durable authenticated control plane, independent local diagnostics, an explicitly enabled development fake runtime, and an opt-in controller-local Docker Compose runtime. Runtime execution is disabled by default. Caddy configuration is not implemented.
+Rig is a local-first deployment manager for Docker Compose applications. It gives one administrator a browser dashboard, an operator terminal, and a scriptable CLI while keeping the controller and its credentials on the machine that runs the workloads.
 
-## Prerequisites
+Rig is being built to make small, self-hosted deployments understandable and recoverable:
 
-- Go 1.26.x
-- Node.js 24 LTS
-- pnpm 11.x
-- Chromium installed for Playwright (`pnpm --dir web exec playwright install chromium`)
+- register an application from a local folder or a GitHub.com repository;
+- keep visible configuration and write-only secrets in versioned revisions;
+- inspect Compose capabilities before execution and require exact approval for elevated behavior;
+- retain immutable releases and deployment history;
+- explicitly redeploy a prior release with its original or current configuration; and
+- optionally receive GitHub push events through the separately deployed relay.
 
-The commands below assume these tools are already on `PATH`; no machine-specific toolchain locations are required.
+## Current boundaries
 
-## Run locally
+Rig is not a general-purpose cloud platform. The controller accepts local loopback connections only, and real workload execution is disabled unless it is explicitly started with `--compose-runtime`. Docker access is a high-trust boundary: a Docker administrator can inspect or alter managed workloads.
 
-```sh
-pnpm --dir web install --frozen-lockfile
-pnpm --dir web build
-```
+The included `--fake-runtime` is for development and testing. It records realistic job progress but never runs a workload. Rig does not currently configure Caddy, target remote agents, support GitHub Enterprise Server, expand Git submodules or Git LFS, or automatically roll back a failed deployment. Live GitHub authorization and production Compose execution still require verification in your own environment.
 
-Embed the production dashboard with the script for your shell:
+## Quick start
+
+Prerequisites: Go 1.26.x, Node.js 24 LTS, and pnpm 11.x.
+
+Build the dashboard, embed it in the controller, and start a development-only controller:
 
 ```powershell
+pnpm --dir web install --frozen-lockfile
+pnpm --dir web build
 powershell -ExecutionPolicy Bypass -File scripts/embed-web.ps1
 $dataRoot = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) ".hostd-dev"))
 go run ./cmd/hostd serve --data-root $dataRoot --fake-runtime
 ```
 
 ```sh
+pnpm --dir web install --frozen-lockfile
+pnpm --dir web build
 sh scripts/embed-web.sh
 data_root="$PWD/.hostd-dev"
 go run ./cmd/hostd serve --data-root "$data_root" --fake-runtime
 ```
 
-Open `http://127.0.0.1:7345`. The daemon prints only the path to an owner-protected bootstrap file; it never writes the token to process output or logs. Read it explicitly with the printed path, then paste the returned token into the dashboard:
+Open `http://127.0.0.1:7345`. The controller prints the path to a protected bootstrap file, not the token itself. Read the token explicitly and paste it into the dashboard:
 
 ```powershell
 go run ./cmd/hostctl bootstrap-token --file (Join-Path $dataRoot "bootstrap-token.secret")
@@ -42,97 +49,56 @@ go run ./cmd/hostctl bootstrap-token --file (Join-Path $dataRoot "bootstrap-toke
 go run ./cmd/hostctl bootstrap-token --file "$data_root/bootstrap-token.secret"
 ```
 
-The file is atomic and `0600` on POSIX, current-user DPAPI-encrypted on Windows, and removed after successful bootstrap, expiry, or a clean daemon shutdown. Only the token hash is stored in SQLite.
+The fake runtime requires an isolated development data root and cannot execute the application. Follow the [Docker Compose runtime guide](docs/compose-runtime.md) before enabling real execution.
 
-Phase A accepts only an explicit loopback IP literal for `--listen`, such as `127.0.0.1:7345` or `[::1]:7345`. Wildcard addresses, LAN addresses, empty hosts, and hostnames are rejected before the data root is created. This enforced local-only HTTP boundary is why the session cookie is intentionally not marked `Secure` in Phase A.
+## Choose an application source
 
-Fake runtime is fail-closed. It must be explicitly enabled and its resolved data root must either be named `.hostd-dev` or be an isolated `hostd-*` directory under the system temporary directory. It persists job progress but never executes a workload.
+### Local folder
 
-The real Docker Compose runtime requires `--compose-runtime`, is mutually exclusive with the fake runtime, and accepts only a controller-local Docker endpoint. The authenticated API and embedded dashboard expose deployment history, releases, exact runtime approvals, waiting-job resume, and explicit prior-release recovery. See [Docker Compose runtime operations](docs/compose-runtime.md) for security boundaries, timeout flags, dashboard and API verification, crash recovery, and disable/rollback guidance.
+In **Add application**, keep **Local folder** selected, enter an absolute path on the controller machine, and run the source check. Rig snapshots local source into its managed workspace before a deployment so later edits cannot change an existing release.
 
-Applications can continue to use a local source path or connect to a selected GitHub.com repository without a user-managed checkout or installed Git CLI. GitHub credentials remain in controller-protected files, releases are immutable commit snapshots, and automatic deployment is disabled per application by default. See [GitHub-connected deployments](docs/github-connected-deployments.md) for the controller workflow, supported source model, relay enrollment, failure behavior, and acceptance checklist.
+### GitHub repository
 
-The separately deployable GitHub webhook relay has an immutable, non-root OCI build, PostgreSQL Compose examples, a strict HTTPS health probe, and production operations guidance. The dashboard exposes controller enrollment, binding removal, key rotation, and relay recovery; cloud account, DNS, region, and live provisioning remain operations work. See [Official webhook relay operations](docs/relay-operations.md) for TLS/proxy modes, protected configuration, backup/recovery, monitoring, rollback, and staging verification.
+GitHub sources use GitHub's device authorization flow and do not require an installed Git CLI or a user-managed checkout. The controller must first be configured with a GitHub App's public client ID and app slug. Then choose **GitHub repository**, select **Connect GitHub**, complete authorization and app installation on GitHub, and choose an installation, repository, branch, and Compose file.
 
-## Use the operator terminal
+GitHub credentials stay in purpose-bound protected files on the controller. Do not put a client secret, private key, access token, or webhook secret in command-line flags or in the repository. See [Connect GitHub](docs/connect-github.md) for the user flow and [GitHub-connected deployments](docs/github-connected-deployments.md) for administrator setup and operational behavior.
 
-With the daemon running, start the interactive terminal application in another terminal:
+## Safety model
+
+- The controller serves only an explicit loopback IP address.
+- Bootstrap tokens, sessions, GitHub credentials, and configuration secrets are stored through platform-specific protected-file handling; plaintext secret values are not returned after submission.
+- Compose input is normalized and inspected before execution. Elevated capabilities require an exact, persisted approval; unsafe or unverifiable shapes are rejected.
+- Deployment failure does not trigger an automatic `docker compose down` or rollback. Inspect the retained diagnostics before taking recovery action.
+- GitHub automatic deployment is off per application by default and requires the optional relay.
+
+## Documentation
+
+- [Getting started](docs/getting-started.md)
+- [Connect GitHub](docs/connect-github.md)
+- [Docker Compose runtime operations](docs/compose-runtime.md)
+- [GitHub-connected deployments](docs/github-connected-deployments.md)
+- [Official webhook relay operations](docs/relay-operations.md)
+
+## Operator and contributor commands
+
+Run the keyboard-driven operator terminal against a started controller:
 
 ```sh
 go run ./cmd/hostd
 ```
 
-Use `hostd ui --endpoint URL --session-file PATH` to override the controller or protected session file. A non-interactive no-argument invocation exits with guidance instead of waiting for input. `hostd serve` is the daemon command; flag-led invocations remain compatible for one release and print a deprecation warning.
+Use `hostd ui --accessible` for the monochrome primary-buffer view. Use `hostctl` for line-oriented diagnostics and automation; credentials can be supplied through standard input, and operational failures return a nonzero exit code.
 
-After masked first-administrator bootstrap or login, the terminal opens the application-first Switchboard. Use Up/Down or `j`/`k` to select an application, Enter to open its contextual actions, and Escape to go back. Page Up/Page Down and Home/End navigate longer application lists. Deploy, Start, Stop, Restart, server-job cancellation, logout, and quit are explicit typed flows with visible confirmation; there is no command prompt, transcript, mouse interaction, or command-history file.
-
-Rig follows the single job created by a confirmed mutation and shows its controller-reported status, numeric progress, observed phases, and latest bounded event. Escape returns to the Switchboard while the operation and local live follow continue. Press `c` only on the progress screen to open a separate server-job cancellation confirmation. Approval-required and needs-attention jobs hand off to the web dashboard rather than exposing a context-free Resume action. Press `o` to open the validated local controller origin directly in the system browser.
-
-Add `--accessible` for a monochrome, keyboard-only primary-buffer view with persistent authentication labels, textual selection and state, and numeric progress. It remains an interactive terminal program, so screen-reader behavior depends on the terminal emulator. Use `hostctl` for line-oriented scripting and JSON-oriented controller operations; it is not a complete interactive substitute for every Switchboard screen.
-
-## Use hostctl safely
-
-After creating the administrator in the dashboard, create a CLI session without putting credentials in process arguments. PowerShell can supply a credential object through standard input:
-
-```powershell
-$credential = Get-Credential
-@{ username = $credential.UserName; passphrase = $credential.GetNetworkCredential().Password } |
-  ConvertTo-Json -Compress |
-  go run ./cmd/hostctl login --credentials-stdin
-Remove-Variable credential
-
-go run ./cmd/hostctl status
-go run ./cmd/hostctl doctor
-go run ./cmd/hostctl jobs cancel JOB_ID
-```
-
-In a POSIX shell, keep the passphrase out of shell history and pipe the JSON from shell built-ins:
-
-```sh
-printf 'Username: '
-read -r username
-printf 'Passphrase: '
-stty -echo
-read -r passphrase
-stty echo
-printf '\n'
-printf '{"username":"%s","passphrase":"%s"}\n' "$username" "$passphrase" |
-  go run ./cmd/hostctl login --credentials-stdin
-unset passphrase
-
-go run ./cmd/hostctl status
-go run ./cmd/hostctl doctor
-go run ./cmd/hostctl jobs cancel JOB_ID
-```
-
-`hostctl` stores the opaque session and CSRF values in the current user's config directory. Files are written atomically with mode `0600` on POSIX systems and protected with current-user Windows DPAPI on Windows; Windows never falls back to plaintext session files. Use `--session-file` to choose another protected path or `--session-stdin` to avoid persistent storage. Operational failures return a nonzero exit code.
-
-## Generate contracts
-
-`api/openapi.yaml` is the API source of truth. A pinned repository generator produces the Go operation map consumed by the HTTP router and the TypeScript operation map consumed by the browser client:
-
-```sh
-go run ./cmd/openapi-gen
-go run ./cmd/openapi-gen -check
-```
-
-Generated files are `internal/apicontract/generated.go` and `web/src/generated/api-contract.ts`. `scripts/check-generation.*` also checks route, schema, migration-mirror, and generated-artifact drift.
-
-## Verify
+Run the main verification set before submitting a change:
 
 ```sh
 go test ./...
 go vet ./...
-go build -o artifacts/hostd ./cmd/hostd
-go build -o artifacts/hostctl ./cmd/hostctl
+go build ./cmd/hostd ./cmd/hostctl
 pnpm --dir web typecheck
 pnpm --dir web test
 sh scripts/check-generation.sh
 sh scripts/check-embedded.sh
-sh scripts/scan-log-leaks.sh
-sh scripts/capture-visuals.sh
 ```
 
-PowerShell equivalents are available for generation, embedding, secret scanning, and visual capture under `scripts/`.
-
-The default `make build`, `make check-embedded`, and `make test-e2e` targets use the POSIX scripts. On Windows, use the explicit `build-windows`, `check-embedded-windows`, and `test-e2e-windows` targets when GNU Make is available, or invoke the corresponding `.ps1` scripts directly.
+PowerShell equivalents for repository scripts are available under `scripts/`.
