@@ -2,26 +2,23 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
+	"github.com/hostd/hostd/internal/apicontract"
 	"github.com/hostd/hostd/internal/auth"
+	"github.com/hostd/hostd/internal/controllerclient"
 	"github.com/hostd/hostd/internal/secretfile"
 	"github.com/spf13/cobra"
 )
 
-type sessionCredentials struct {
-	SessionToken string `json:"sessionToken"`
-	CSRFToken    string `json:"csrfToken"`
-}
+type sessionCredentials = controllerclient.Session
 
 const maxSessionFileBytes = 64 << 10
 const sessionFilePurpose = "hostctl-session"
@@ -65,31 +62,15 @@ func execute(args []string, input io.Reader, output io.Writer, client *http.Clie
 		if credentials.Username == "" || credentials.Passphrase == "" {
 			return errors.New("stdin credentials require username and passphrase")
 		}
-		body, err := json.Marshal(credentials)
+		client, err := app.controllerClient()
 		if err != nil {
 			return err
 		}
-		response, err := app.request(http.MethodPost, "/api/v1/auth/sessions", body, sessionCredentials{})
+		_, session, err := client.Login(context.Background(), apicontract.LoginRequest{Username: credentials.Username, Passphrase: credentials.Passphrase})
 		if err != nil {
 			return err
 		}
-		defer response.Body.Close()
-		var payload struct {
-			CSRFToken string `json:"csrfToken"`
-		}
-		if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
-			return fmt.Errorf("decode login response: %w", err)
-		}
-		var sessionToken string
-		for _, cookie := range response.Cookies() {
-			if cookie.Name == auth.SessionCookie {
-				sessionToken = cookie.Value
-			}
-		}
-		if sessionToken == "" || payload.CSRFToken == "" {
-			return errors.New("hostd login response omitted session credentials")
-		}
-		if err := writeSessionFile(app.sessionFile, sessionCredentials{SessionToken: sessionToken, CSRFToken: payload.CSRFToken}); err != nil {
+		if err := writeSessionFile(app.sessionFile, session); err != nil {
 			return err
 		}
 		_, err = fmt.Fprintf(app.output, "Session saved to %s\n", app.sessionFile)
@@ -114,14 +95,29 @@ func execute(args []string, input io.Reader, output io.Writer, client *http.Clie
 	bootstrapToken.Flags().StringVar(&bootstrapTokenFile, "file", "", "protected bootstrap token file printed by hostd")
 	root.AddCommand(bootstrapToken)
 
-	for name, path := range map[string]string{"status": "/api/v1/system/status", "doctor": "/api/v1/system/doctor"} {
-		path := path
+	for name := range map[string]struct{}{"status": {}, "doctor": {}} {
+		name := name
 		root.AddCommand(&cobra.Command{Use: name, Args: cobra.NoArgs, RunE: func(_ *cobra.Command, _ []string) error {
 			session, err := app.loadSession()
 			if err != nil {
 				return err
 			}
-			return app.printResponse(http.MethodGet, path, nil, session)
+			client, err := app.controllerClient()
+			if err != nil {
+				return err
+			}
+			if name == "status" {
+				value, err := client.Status(context.Background(), session)
+				if err != nil {
+					return err
+				}
+				return app.printJSON(value)
+			}
+			value, err := client.Doctor(context.Background(), session)
+			if err != nil {
+				return err
+			}
+			return app.printJSON(value)
 		}})
 	}
 	jobsCommand := &cobra.Command{Use: "jobs", Short: "manage durable jobs"}
@@ -130,22 +126,25 @@ func execute(args []string, input io.Reader, output io.Writer, client *http.Clie
 		if err != nil {
 			return err
 		}
-		return app.printResponse(http.MethodPost, "/api/v1/jobs/"+url.PathEscape(args[0])+"/cancel", nil, session)
+		client, err := app.controllerClient()
+		if err != nil {
+			return err
+		}
+		before := session
+		value, err := client.Cancel(context.Background(), &session, args[0])
+		if err != nil {
+			return err
+		}
+		if err := app.persistSessionIfChanged(before, session); err != nil {
+			return err
+		}
+		return app.printJSON(value)
 	}})
 	root.AddCommand(jobsCommand)
 	return root.Execute()
 }
 
-func (app *commandApp) printResponse(method, path string, body []byte, session sessionCredentials) error {
-	response, err := app.request(method, path, body, session)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	var payload any
-	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
-		return fmt.Errorf("decode hostd response: %w", err)
-	}
+func (app *commandApp) printJSON(payload any) error {
 	encoded, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return err
@@ -154,37 +153,8 @@ func (app *commandApp) printResponse(method, path string, body []byte, session s
 	return err
 }
 
-func (app *commandApp) request(method, path string, body []byte, session sessionCredentials) (*http.Response, error) {
-	request, err := http.NewRequest(method, strings.TrimRight(app.endpoint, "/")+path, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Set("Accept", "application/json")
-	if body != nil {
-		request.Header.Set("Content-Type", "application/json")
-	}
-	if session.SessionToken != "" {
-		request.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: session.SessionToken})
-	}
-	if method != http.MethodGet && method != http.MethodHead && session.CSRFToken != "" {
-		request.Header.Set("X-CSRF-Token", session.CSRFToken)
-	}
-	response, err := app.httpClient.Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("hostd request failed: %w", err)
-	}
-	if response.StatusCode >= 200 && response.StatusCode < 300 {
-		return response, nil
-	}
-	defer response.Body.Close()
-	var problem struct {
-		Detail string `json:"detail"`
-	}
-	_ = json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&problem)
-	if problem.Detail == "" {
-		problem.Detail = http.StatusText(response.StatusCode)
-	}
-	return nil, fmt.Errorf("hostd returned %s: %s", response.Status, problem.Detail)
+func (app *commandApp) controllerClient() (*controllerclient.Client, error) {
+	return controllerclient.New(controllerclient.Options{Endpoint: app.endpoint, HTTPClient: app.httpClient})
 }
 
 func (app *commandApp) loadSession() (sessionCredentials, error) {
@@ -194,19 +164,23 @@ func (app *commandApp) loadSession() (sessionCredentials, error) {
 			return session, fmt.Errorf("read session from stdin: %w", err)
 		}
 	} else {
-		plaintext, err := secretfile.Read(app.sessionFile, sessionFilePurpose)
+		loaded, err := controllerclient.ReadSessionFile(app.sessionFile)
 		if err != nil {
-			return session, fmt.Errorf("read session file: %w", err)
+			return session, err
 		}
-		defer clear(plaintext)
-		if err := decodeLimited(bytes.NewReader(plaintext), &session); err != nil {
-			return session, fmt.Errorf("decode session file: %w", err)
-		}
-	}
-	if session.SessionToken == "" || session.CSRFToken == "" {
-		return session, errors.New("session credentials are incomplete")
+		session = loaded
 	}
 	return session, nil
+}
+
+func (app *commandApp) persistSessionIfChanged(before, after sessionCredentials) error {
+	if app.sessionStdin || before == after {
+		return nil
+	}
+	if err := writeSessionFile(app.sessionFile, after); err != nil {
+		return fmt.Errorf("persist refreshed session: %w", err)
+	}
+	return nil
 }
 
 func decodeLimited(reader io.Reader, target any) error {
@@ -230,21 +204,9 @@ func encodeSessionFile(session sessionCredentials) ([]byte, error) {
 }
 
 func defaultSessionFile() string {
-	root, err := os.UserConfigDir()
-	if err != nil {
-		root = "."
-	}
-	return filepath.Join(root, "hostd", "hostctl-session.json")
+	return controllerclient.DefaultSessionFile()
 }
 
 func writeSessionFile(path string, session sessionCredentials) error {
-	payload, err := encodeSessionFile(session)
-	if err != nil {
-		return fmt.Errorf("encode session file: %w", err)
-	}
-	defer clear(payload)
-	if err := secretfile.Write(path, sessionFilePurpose, payload); err != nil {
-		return fmt.Errorf("protect session file: %w", err)
-	}
-	return nil
+	return controllerclient.WriteSessionFile(path, session)
 }

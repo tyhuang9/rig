@@ -9,9 +9,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/hostd/hostd/internal/auth"
+	"github.com/hostd/hostd/internal/controllerclient"
 	"github.com/hostd/hostd/internal/secretfile"
 )
 
@@ -84,6 +86,89 @@ func TestSessionStdinAndOperationalFailuresReturnErrors(t *testing.T) {
 	}
 	if err := execute([]string{"--session-token", "must-not-be-supported", "status"}, strings.NewReader(""), &output, server.Client()); err == nil {
 		t.Fatal("session credential argv flag was accepted")
+	}
+}
+
+func TestCancelPersistsRotatedCSRFOnlyAfterSuccess(t *testing.T) {
+	const sessionToken = "session-secret-value"
+	var cancelCalls int
+	var failMutation atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/v1/auth/sessions":
+			http.SetCookie(w, &http.Cookie{Name: auth.SessionCookie, Value: sessionToken, HttpOnly: true})
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"csrfToken":"old-csrf"}`))
+		case "/api/v1/jobs/job-one/cancel":
+			cancelCalls++
+			if failMutation.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"type":"about:blank","title":"failure","status":500,"detail":"failed"}`))
+				return
+			}
+			if request.Header.Get("X-CSRF-Token") == "old-csrf" {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"type":"https://hostd.dev/problems/csrf","title":"Forbidden","status":403,"code":"csrf_failed","detail":"expired"}`))
+				return
+			}
+			if request.Header.Get("X-CSRF-Token") != "new-csrf" {
+				t.Fatalf("retry csrf = %q", request.Header.Get("X-CSRF-Token"))
+			}
+			_, _ = w.Write([]byte(`{"job":{"id":"job-one","status":"cancelled"}}`))
+		case "/api/v1/auth/csrf":
+			_, _ = w.Write([]byte(`{"csrfToken":"new-csrf"}`))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	sessionFile := filepath.Join(t.TempDir(), "session.json")
+	var output bytes.Buffer
+	if err := execute([]string{"--endpoint", server.URL, "--session-file", sessionFile, "login", "--credentials-stdin"}, strings.NewReader(`{"username":"admin","passphrase":"safe"}`), &output, server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(sessionFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := execute([]string{"--endpoint", server.URL, "--session-file", sessionFile, "jobs", "cancel", "job-one"}, strings.NewReader(""), &output, server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	if cancelCalls != 2 {
+		t.Fatalf("cancel calls = %d, want CSRF retry", cancelCalls)
+	}
+	updated, err := controllerclient.ReadSessionFile(sessionFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.CSRFToken != "new-csrf" {
+		t.Fatalf("persisted csrf = %q, want new-csrf", updated.CSRFToken)
+	}
+
+	rotated, err := os.ReadFile(sessionFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(original, rotated) {
+		t.Fatal("successful CSRF rotation did not update protected session")
+	}
+
+	failedBefore, err := os.ReadFile(sessionFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failMutation.Store(true)
+	if err := execute([]string{"--endpoint", server.URL, "--session-file", sessionFile, "jobs", "cancel", "job-one"}, strings.NewReader(""), &output, server.Client()); err == nil {
+		t.Fatal("failed mutation returned success")
+	}
+	failedAfter, err := os.ReadFile(sessionFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(failedBefore, failedAfter) {
+		t.Fatal("failed mutation rewrote protected session")
 	}
 }
 

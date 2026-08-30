@@ -7,11 +7,11 @@ The Docker Compose runtime is an opt-in, controller-local execution capability. 
 Start `hostd` with an absolute data root and the explicit flag:
 
 ```powershell
-go run ./cmd/hostd --data-root C:\hostd\state --compose-runtime
+go run ./cmd/hostd serve --data-root C:\hostd\state --compose-runtime
 ```
 
 ```sh
-go run ./cmd/hostd --data-root /var/lib/hostd --compose-runtime
+go run ./cmd/hostd serve --data-root /var/lib/hostd --compose-runtime
 ```
 
 `--compose-runtime` and `--fake-runtime` are mutually exclusive. Omitting both starts no job worker. The real runtime accepts only the local Docker default, a local `unix:///...` socket, or a local `npipe:////./pipe/...` endpoint. TCP, HTTP(S), SSH, and `fd://` endpoints are rejected.
