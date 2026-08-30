@@ -64,6 +64,13 @@ func (service *Service) ProviderEnabled() bool {
 	return service.provider != nil && service.appSlug != ""
 }
 
+func (service *Service) InstallURL() string {
+	if !service.ProviderEnabled() {
+		return ""
+	}
+	return githubapp.WebOrigin + "/apps/" + service.appSlug + "/installations/new"
+}
+
 func (service *Service) List(ctx context.Context, owner string) ([]Connection, error) {
 	return service.repository.List(ctx, owner)
 }
@@ -98,7 +105,7 @@ func (service *Service) Start(ctx context.Context, owner string) (DeviceStart, e
 	}
 	return DeviceStart{
 		ConnectionID: connection.ID, UserCode: authorization.UserCode, VerificationURI: githubapp.VerificationURI,
-		InstallURL: githubapp.WebOrigin + "/apps/" + service.appSlug + "/installations/new", ExpiresAt: expiresAt, PollInterval: authorization.Interval,
+		InstallURL: service.InstallURL(), ExpiresAt: expiresAt, PollInterval: authorization.Interval,
 	}, nil
 }
 

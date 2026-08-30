@@ -224,6 +224,11 @@ func TestSourceConnectionAPIUsesNoStoreOwnerScopeAndFixedSafeProblems(t *testing
 		t.Fatalf("start body = %s", started.Body.String())
 	}
 	assertAbsent(t, started.Body.String()+harness.logs.String(), "device-code-sentinel", "ghu_api_sentinel", "ghr_api_sentinel", "raw provider description")
+	listed := sourceRequest(harness.handler, harness.session, http.MethodGet, "/api/v1/source-connections", "", true)
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"installUrl":"https://github.com/apps/hostd-app/installations/new"`) || !strings.Contains(listed.Body.String(), `"pendingExpiresAt"`) || !strings.Contains(listed.Body.String(), `"nextPollAt"`) {
+		t.Fatalf("pending connection metadata = %d %s", listed.Code, listed.Body.String())
+	}
+	assertAbsent(t, listed.Body.String()+harness.logs.String(), "USER-CODE", "userCode", "verificationUri", "device-code-sentinel", "ghu_api_sentinel", "ghr_api_sentinel")
 	enabledStatus := sourceRequest(harness.handler, harness.session, http.MethodGet, "/api/v1/system/status", "", true)
 	if !strings.Contains(enabledStatus.Body.String(), `"githubConnections":true`) {
 		t.Fatalf("enabled capability = %s", enabledStatus.Body.String())
@@ -236,6 +241,10 @@ func TestSourceConnectionAPIUsesNoStoreOwnerScopeAndFixedSafeProblems(t *testing
 	otherDelete := sourceRequest(harness.handler, harness.otherSession, http.MethodDelete, "/api/v1/source-connections/"+body.ConnectionID, "", true)
 	if otherDelete.Code != http.StatusNotFound {
 		t.Fatalf("other owner delete = %d %s", otherDelete.Code, otherDelete.Body.String())
+	}
+	otherPoll := sourceRequest(harness.handler, harness.otherSession, http.MethodPost, "/api/v1/source-connections/"+body.ConnectionID+"/device/poll", "", true)
+	if otherPoll.Code != http.StatusNotFound || harness.provider.pollCalls != 0 {
+		t.Fatalf("other owner poll = %d calls=%d body=%s", otherPoll.Code, harness.provider.pollCalls, otherPoll.Body.String())
 	}
 
 	invalidPage := sourceRequest(harness.handler, harness.session, http.MethodGet, "/api/v1/source-connections/"+body.ConnectionID+"/github/installations?perPage=101", "", true)
@@ -253,7 +262,10 @@ func TestSourceConnectionAPIUsesNoStoreOwnerScopeAndFixedSafeProblems(t *testing
 	if pending.Code != http.StatusAccepted || pending.Header().Get("Retry-After") == "" || !strings.Contains(pending.Body.String(), `"status":"pending"`) {
 		t.Fatalf("pending poll = %d retry=%q body=%s", pending.Code, pending.Header().Get("Retry-After"), pending.Body.String())
 	}
-	assertAbsent(t, pending.Body.String()+harness.logs.String(), "device-code-sentinel", "ghu_api_sentinel", "ghr_api_sentinel", "raw provider description")
+	if !strings.Contains(pending.Body.String(), `"installUrl":"https://github.com/apps/hostd-app/installations/new"`) {
+		t.Fatalf("pending poll install URL = %s", pending.Body.String())
+	}
+	assertAbsent(t, pending.Body.String()+harness.logs.String(), "USER-CODE", "userCode", "verificationUri", "device-code-sentinel", "ghu_api_sentinel", "ghr_api_sentinel", "raw provider description")
 
 	harness.clock.now = harness.clock.now.Add(5 * time.Second)
 	harness.provider.pollError = errors.New("raw provider description")
