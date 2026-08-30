@@ -50,18 +50,24 @@ assert([...home.matchAll(/<main\b/g)].length === 1, "the home page needs exactly
 assert(home.includes('href="#VPContent"'), "the home page skip link must remain available");
 assert(home.includes('id="VPContent"'), "the skip-link target must remain available");
 
-const colors = Object.fromEntries(
-  [...theme.matchAll(/--vp-button-brand-(bg|hover-bg|active-bg):\s*(#[0-9a-f]{6})/gi)].map(
-    ([, state, color]) => [state, color],
-  ),
-);
-
-for (const state of ["bg", "hover-bg", "active-bg"]) {
-  assert(colors[state], `missing light-theme brand button ${state} color`);
-  assert(
-    contrast(colors[state], "#ffffff") >= 4.5,
-    `light-theme brand button ${state} contrast must be at least 4.5:1`,
+function themeColors(selector, label) {
+  const block = theme.match(new RegExp(`${selector}\\s*\\{([^}]*)\\}`, "s"))?.[1] ?? "";
+  const colors = Object.fromEntries(
+    [...block.matchAll(/--vp-button-brand-(bg|hover-bg|active-bg):\s*(#[0-9a-f]{6})/gi)].map(
+      ([, state, color]) => [state, color],
+    ),
   );
+
+  for (const state of ["bg", "hover-bg", "active-bg"]) {
+    assert(colors[state], `missing ${label}-theme brand button ${state} color`);
+    assert(
+      contrast(colors[state], "#ffffff") >= 4.5,
+      `${label}-theme brand button ${state} contrast must be at least 4.5:1`,
+    );
+  }
 }
+
+themeColors(":root:not\\(.dark\\)", "light");
+themeColors(":root\\.dark", "dark");
 
 console.log(`Documentation accessibility contract passed for ${docsRoot}`);
