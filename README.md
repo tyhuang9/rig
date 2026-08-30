@@ -22,22 +22,24 @@ Embed the production dashboard with the script for your shell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/embed-web.ps1
-go run ./cmd/hostd serve --data-root .hostd-dev --fake-runtime
+$dataRoot = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) ".hostd-dev"))
+go run ./cmd/hostd serve --data-root $dataRoot --fake-runtime
 ```
 
 ```sh
 sh scripts/embed-web.sh
-go run ./cmd/hostd serve --data-root .hostd-dev --fake-runtime
+data_root="$PWD/.hostd-dev"
+go run ./cmd/hostd serve --data-root "$data_root" --fake-runtime
 ```
 
 Open `http://127.0.0.1:7345`. The daemon prints only the path to an owner-protected bootstrap file; it never writes the token to process output or logs. Read it explicitly with the printed path, then paste the returned token into the dashboard:
 
 ```powershell
-go run ./cmd/hostctl bootstrap-token --file .\.hostd-dev\bootstrap-token.secret
+go run ./cmd/hostctl bootstrap-token --file (Join-Path $dataRoot "bootstrap-token.secret")
 ```
 
 ```sh
-go run ./cmd/hostctl bootstrap-token --file ./.hostd-dev/bootstrap-token.secret
+go run ./cmd/hostctl bootstrap-token --file "$data_root/bootstrap-token.secret"
 ```
 
 The file is atomic and `0600` on POSIX, current-user DPAPI-encrypted on Windows, and removed after successful bootstrap, expiry, or a clean daemon shutdown. Only the token hash is stored in SQLite.
