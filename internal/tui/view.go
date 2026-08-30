@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -66,7 +67,7 @@ func (m *Model) centered(content string) string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
 }
 func (m *Model) offlineView() string {
-	return m.centered(strings.Join([]string{titleStyle.Render("Controller unavailable"), "", "Rig could not reach " + endpointLabel(m.endpoint) + ".", errorStyle.Render(cropWidth(sanitizeAPIText(m.err), max(1, m.width-4))), "", "Start the controller with: hostd serve", "", "Enter Retry   q Quit   Ctrl+C Exit"}, "\n"))
+	return m.centered(strings.Join([]string{titleStyle.Render("Controller unavailable"), "", "Rig could not reach " + endpointLabel(m.endpoint) + ".", errorStyle.Render(cropWidth(sanitizeIdentity(m.err, maxAPITextBytes), max(1, m.width-4))), "", "Start the controller with: hostd serve", "", "Enter Retry   q Quit   Ctrl+C Exit"}, "\n"))
 }
 
 func (m *Model) authView(title, subtitle string) string {
@@ -100,7 +101,7 @@ func (m *Model) authView(title, subtitle string) string {
 	return m.centered(panelStyle.Width(min(max(1, m.width-6), 68)).Render(b.String()))
 }
 func (m *Model) bootstrapConfirmationView() string {
-	return m.centered(strings.Join([]string{titleStyle.Render("Confirm administrator creation"), "", "Create administrator " + sanitizeAPIText(m.bootstrapUsername) + "?", "", "Enter Create administrator   Esc Cancel"}, "\n"))
+	return m.centered(strings.Join([]string{titleStyle.Render("Confirm administrator creation"), "", "Create administrator " + sanitizeIdentity(m.bootstrapUsername, 512) + "?", "", "Enter Create administrator   Esc Cancel"}, "\n"))
 }
 
 func (m *Model) header() string {
@@ -213,18 +214,18 @@ func (m *Model) appDetails(app apicontract.Application) []string {
 		lines = append(lines, "Source     "+source)
 	}
 	if app.Source.TrackedBranch != "" {
-		lines = append(lines, "Branch     "+sanitizeAPIText(app.Source.TrackedBranch))
+		lines = append(lines, "Branch     "+sanitizeIdentity(app.Source.TrackedBranch, 256))
 	}
 	if app.Source.ResolvedSha != "" {
 		lines = append(lines, "Revision   "+shortRevision(app.Source.ResolvedSha))
 	}
 	if app.MachineName != "" {
-		lines = append(lines, "Machine    "+sanitizeAPIText(app.MachineName))
+		lines = append(lines, "Machine    "+sanitizeIdentity(app.MachineName, 256))
 	}
 	if job := relevantJob(app.ID, m.jobs); job != nil {
 		lines = append(lines, "Operation  "+jobSummary(*job))
 		if job.ErrorDetail != "" {
-			lines = append(lines, "Error      "+cropWidth(sanitizeAPIText(job.ErrorDetail), max(8, m.width-11)))
+			lines = append(lines, "Error      "+cropWidth(sanitizeIdentity(job.ErrorDetail, maxAPITextBytes), max(8, m.width-11)))
 		}
 	}
 	return lines
@@ -237,14 +238,18 @@ func (m *Model) switchboardFooter() string {
 }
 
 func (m *Model) actionsView() string {
-	app, ok := m.selectedApp()
+	app, items, ok := m.currentActions()
 	if !ok {
 		return "No application selected\n\nEsc Back"
 	}
-	job := relevantJob(app.ID, m.jobs)
-	items := actionsFor(app, job, m.status)
-	lines := []string{titleStyle.Render("Actions — "+displayAppName(app)) + "  " + appStateLabel(app.Status, m.accessible), ""}
-	for i, item := range items {
+	m.reconcileActionSelection(len(items))
+	lines := []string{cropWidth(titleStyle.Render("Actions — "+displayAppName(app))+"  "+appStateLabel(app.Status, m.accessible), m.width)}
+	if m.err != "" {
+		lines = append(lines, errorStyle.Render(cropWidth(sanitizeIdentity(m.err, maxAPITextBytes), m.width)))
+	}
+	end := min(len(items), m.actionOffset+m.actionCapacity())
+	for i := m.actionOffset; i < end; i++ {
+		item := items[i]
 		marker := "  "
 		if i == m.selectedAction {
 			marker = "> "
@@ -262,10 +267,11 @@ func (m *Model) actionsView() string {
 		}
 		lines = append(lines, cropWidth(line, m.width))
 	}
-	if m.err != "" {
-		lines = append(lines, "", errorStyle.Render(cropWidth(m.err, m.width)))
+	footer := "↑↓ Select   Enter Choose   Esc Back"
+	if m.width < 45 {
+		footer = "↑↓ Select · Enter · Esc Back"
 	}
-	lines = append(lines, "", "↑↓ Select   Enter Choose   Esc Back")
+	lines = append(lines, m.footer(footer))
 	return strings.Join(lines, "\n")
 }
 
@@ -280,7 +286,7 @@ func (m *Model) confirmationView() string {
 	} else if c.Action == actionLogout {
 		title = "Sign out of Rig?"
 	} else if c.Action == actionCancelJob {
-		title = "Cancel " + sanitizeAPIText(c.Job.Type) + " for " + displayAppName(c.App) + "?"
+		title = "Cancel " + sanitizeIdentity(c.Job.Type, 128) + " for " + displayAppName(c.App) + "?"
 	} else {
 		title = actionVerb(c.Action) + " " + displayAppName(c.App) + "?"
 	}
@@ -293,14 +299,14 @@ func (m *Model) confirmationView() string {
 			lines = append(lines, "Source       "+source)
 		}
 		if c.App.Source.TrackedBranch != "" {
-			lines = append(lines, "Branch       "+sanitizeAPIText(c.App.Source.TrackedBranch))
+			lines = append(lines, "Branch       "+sanitizeIdentity(c.App.Source.TrackedBranch, 256))
 		}
 		if c.App.Source.ResolvedSha != "" {
 			lines = append(lines, "Revision     "+shortRevision(c.App.Source.ResolvedSha))
 		}
 	}
 	if c.Action == actionCancelJob {
-		lines = append(lines, "", "The running server job will be asked to stop.", "Returning with Escape does not cancel it.")
+		lines = append(lines, "Job ID       "+sanitizeIdentity(c.Job.ID, 256), "", "The running server job will be asked to stop.", "Returning with Escape does not cancel it.")
 	}
 	if m.err != "" {
 		lines = append(lines, "", errorStyle.Render(cropWidth(m.err, m.width)))
@@ -320,7 +326,11 @@ func (m *Model) progressView() string {
 	if strings.EqualFold(job.Type, "deploy") {
 		title = "Deploying " + displayAppName(app)
 	}
-	lines := []string{titleStyle.Render(title) + "  " + percent(job.Progress), "", progressBar(job.Progress, max(10, min(50, m.width-2))), "", "Status: " + statusWord(job.Status) + " · " + strconv.Itoa(job.Progress) + " percent"}
+	jobStatus := statusWord(job.Status)
+	if isCancellationPending(job) {
+		jobStatus = "Cancelling"
+	}
+	lines := []string{titleStyle.Render(title) + "  " + percent(job.Progress), "", progressBar(job.Progress, max(10, min(50, m.width-2))), "", "Status: " + jobStatus + " · " + strconv.Itoa(job.Progress) + " percent"}
 	for _, phase := range m.phases {
 		mark := "●"
 		if phase.Completed {
@@ -333,26 +343,30 @@ func (m *Model) progressView() string {
 				mark = "current"
 			}
 		}
-		lines = append(lines, mark+" "+sanitizeAPIText(phase.Name))
+		lines = append(lines, mark+" "+sanitizeIdentity(phase.Name, 256))
 	}
 	if len(m.phases) == 0 && job.Phase != "" {
-		lines = append(lines, "Current phase: "+sanitizeAPIText(job.Phase))
+		lines = append(lines, "Current phase: "+sanitizeIdentity(job.Phase, 256))
 	}
 	if len(m.recentEvents) > 0 {
 		event := m.recentEvents[len(m.recentEvents)-1]
-		lines = append(lines, "", cropWidth(sanitizeAPIText(event.Message), m.width))
+		lines = append(lines, "", cropWidth(sanitizeIdentity(event.Message, maxAPITextBytes), m.width))
 	}
 	if m.err != "" {
 		lines = append(lines, errorStyle.Render(cropWidth(m.err, m.width)))
 	}
-	lines = append(lines, "", m.footer("c Cancel job   Esc Back — operation continues   o Open Web"))
+	footer := "c Cancel job   Esc Back — operation continues   o Open Web"
+	if isCancellationPending(job) {
+		footer = "Cancellation pending   Esc Back — operation continues   o Open Web"
+	}
+	lines = append(lines, "", m.footer(footer))
 	return strings.Join(lines, "\n")
 }
 func (m *Model) resultView() string {
 	if m.result == nil {
 		return "Operation result unavailable\n\nEnter Return to Applications"
 	}
-	lines := []string{titleStyle.Render(m.result.Title), "", cropWidth(sanitizeAPIText(m.result.Detail), m.width), ""}
+	lines := []string{titleStyle.Render(sanitizeIdentity(m.result.Title, 512)), "", cropWidth(sanitizeIdentity(m.result.Detail, maxAPITextBytes), m.width), ""}
 	if m.err != "" {
 		lines = append(lines, errorStyle.Render(cropWidth(m.err, m.width)), "")
 	}
@@ -379,12 +393,12 @@ func progressBar(value, width int) string {
 }
 func displayAppName(app apicontract.Application) string {
 	if strings.TrimSpace(app.Name) != "" {
-		return sanitizeAPIText(app.Name)
+		return sanitizeIdentity(app.Name, 512)
 	}
 	if strings.TrimSpace(app.Slug) != "" {
-		return sanitizeAPIText(app.Slug)
+		return sanitizeIdentity(app.Slug, 512)
 	}
-	return sanitizeAPIText(app.ID)
+	return sanitizeIdentity(app.ID, 512)
 }
 func appStateLabel(raw string, accessible bool) string {
 	word := statusWord(raw)
@@ -403,7 +417,7 @@ func appStateLabel(raw string, accessible bool) string {
 	}
 }
 func statusWord(raw string) string {
-	value := strings.ToLower(strings.TrimSpace(sanitizeAPIText(raw)))
+	value := strings.ToLower(sanitizeIdentity(raw, 128))
 	switch value {
 	case "running":
 		return "Running"
@@ -425,6 +439,8 @@ func statusWord(raw string) string {
 		return "Succeeded"
 	case "cancelled":
 		return "Cancelled"
+	case "cancelling":
+		return "Cancelling"
 	case "interrupted":
 		return "Interrupted"
 	case "needs_attention":
@@ -436,35 +452,38 @@ func statusWord(raw string) string {
 	}
 }
 func sourceSummary(source apicontract.SourceSummary) string {
-	switch strings.ToLower(source.Type) {
+	switch strings.ToLower(sanitizeIdentity(source.Type, 128)) {
 	case "github":
-		repo := strings.Trim(strings.TrimSpace(source.RepositoryOwner)+"/"+strings.TrimSpace(source.RepositoryName), "/")
+		owner := sanitizeIdentity(source.RepositoryOwner, 256)
+		name := sanitizeIdentity(source.RepositoryName, 256)
+		repo := strings.Trim(owner+"/"+name, "/")
 		if repo == "" {
 			repo = "GitHub"
 		}
-		return sanitizeAPIText(repo)
+		return sanitizeIdentity(repo, 512)
 	case "local":
 		if source.Path != "" {
-			return sanitizeAPIText(source.Path)
+			return sanitizeIdentity(source.Path, 512)
 		}
 		return "Local source"
 	default:
-		return sanitizeAPIText(source.Type)
+		return sanitizeIdentity(source.Type, 128)
 	}
 }
 func shortRevision(value string) string {
-	value = sanitizeAPIText(value)
+	value = sanitizeIdentity(value, 256)
 	if len(value) > 12 {
-		return value[:12]
+		return truncateUTF8Bytes(value, 12)
 	}
 	return value
 }
 func titleWord(value string) string {
-	value = strings.TrimSpace(sanitizeAPIText(value))
+	value = sanitizeIdentity(value, 128)
 	if value == "" {
 		return "Operation"
 	}
-	return strings.ToUpper(value[:1]) + value[1:]
+	_, size := utf8.DecodeRuneInString(value)
+	return strings.ToUpper(value[:size]) + value[size:]
 }
 func authFieldLabel(current screen, index int) string {
 	if current == screenBootstrap {
@@ -475,9 +494,9 @@ func authFieldLabel(current screen, index int) string {
 func endpointLabel(endpoint string) string {
 	parsed, err := url.Parse(endpoint)
 	if err == nil && parsed.Scheme != "" && parsed.Host != "" {
-		return sanitizeAPIText(parsed.Scheme + "://" + parsed.Host)
+		return sanitizeIdentity(parsed.Scheme+"://"+parsed.Host, 512)
 	}
-	return sanitizeAPIText(endpoint)
+	return sanitizeIdentity(endpoint, 512)
 }
 func noColor() bool { _, set := os.LookupEnv("NO_COLOR"); return set }
 func cropWidth(value string, width int) string {

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/hostd/hostd/internal/apicontract"
@@ -24,7 +25,10 @@ type fakeClient struct {
 	jobs                                                            apicontract.JobList
 	overviewErr                                                     error
 	job                                                             apicontract.Job
+	jobsByID                                                        map[string]apicontract.Job
 	jobErr                                                          error
+	mutationJob                                                     apicontract.Job
+	cancelJobResponse                                               apicontract.Job
 	deployCalls, lifecycleCalls, cancelCalls, logoutCalls, jobCalls int
 	lastApp, lastAction, lastKey, lastJob                           string
 	followCtx                                                       context.Context
@@ -59,7 +63,11 @@ func (f *fakeClient) Deploy(_ context.Context, app, key string) (apicontract.Job
 	defer f.mu.Unlock()
 	f.deployCalls++
 	f.lastApp, f.lastKey = app, key
-	return apicontract.JobMutationResponse{Job: activeJob("deploy-job", app, "deploy")}, nil
+	job := f.mutationJob
+	if job.ID == "" {
+		job = activeJob("deploy-job", app, "deploy")
+	}
+	return apicontract.JobMutationResponse{Job: job}, nil
 }
 func (f *fakeClient) Lifecycle(_ context.Context, app, action, key string) (apicontract.JobMutationResponse, error) {
 	f.mu.Lock()
@@ -69,10 +77,14 @@ func (f *fakeClient) Lifecycle(_ context.Context, app, action, key string) (apic
 	return apicontract.JobMutationResponse{Job: activeJob(action+"-job", app, action)}, nil
 }
 func (f *fakeClient) Jobs(context.Context) (apicontract.JobList, error) { return f.jobs, f.overviewErr }
-func (f *fakeClient) Job(context.Context, string) (apicontract.Job, error) {
+func (f *fakeClient) Job(_ context.Context, id string) (apicontract.Job, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.jobCalls++
+	f.lastJob = id
+	if job, ok := f.jobsByID[id]; ok {
+		return job, f.jobErr
+	}
 	return f.job, f.jobErr
 }
 func (f *fakeClient) FollowJob(ctx context.Context, _ string, _ int64) (<-chan apicontract.JobEvent, <-chan error) {
@@ -90,7 +102,10 @@ func (f *fakeClient) CancelJob(_ context.Context, id, key string) (apicontract.J
 	defer f.mu.Unlock()
 	f.cancelCalls++
 	f.lastJob, f.lastKey = id, key
-	job := f.job
+	job := f.cancelJobResponse
+	if job.ID == "" {
+		job = f.job
+	}
 	if job.ID == "" {
 		job = activeJob(id, "app-a", "deploy")
 	}
@@ -365,6 +380,9 @@ func TestFollowEscapeContinuesAndCancellationIsSeparate(t *testing.T) {
 	}
 	m.screen = screenJobProgress
 	m.Update(key("c"))
+	pending := job
+	pending.Status, pending.Phase = "waiting_external", "cancelling"
+	f.cancelJobResponse = pending
 	_, cmd := m.Update(key("enter"))
 	if cmd == nil {
 		t.Fatal("cancel command missing")
@@ -373,6 +391,10 @@ func TestFollowEscapeContinuesAndCancellationIsSeparate(t *testing.T) {
 	m.Update(msg)
 	if f.cancelCalls != 1 || f.lastJob != "job-1" {
 		t.Fatalf("cancel=%d job=%s", f.cancelCalls, f.lastJob)
+	}
+	m.Update(key("c"))
+	if f.cancelCalls != 1 || m.screen != screenJobProgress {
+		t.Fatalf("pending cancellation repeated: cancel=%d screen=%v", f.cancelCalls, m.screen)
 	}
 }
 
@@ -567,5 +589,211 @@ func TestRunProgramOptionsNeverIncludeMouse(t *testing.T) {
 		if count != want {
 			t.Fatalf("accessible=%v options=%d want=%d", accessible, count, want)
 		}
+	}
+}
+
+func TestActionSelectionReconcilesWhenPolicyChanges(t *testing.T) {
+	m := switchboardModel(&fakeClient{})
+	m.screen = screenActions
+	initial := actionsFor(m.apps[0], nil, m.status)
+	m.selectedAction = len(initial) - 1
+	m.actionOffset = m.selectedAction
+	m.overviewGen = 12
+	m.overviewLoading = true
+	job := activeJob("job-a", "app-a", "deploy")
+	m.Update(overviewMsg{
+		generation: 12,
+		status:     m.status,
+		apps:       apicontract.ApplicationList{Items: m.apps},
+		jobs:       apicontract.JobList{Items: []apicontract.Job{job}},
+	})
+	_, current, ok := m.currentActions()
+	if !ok || m.selectedAction < 0 || m.selectedAction >= len(current) {
+		t.Fatalf("selection=%d actions=%d", m.selectedAction, len(current))
+	}
+	if view := m.View(); !strings.Contains(view, "Back") {
+		t.Fatalf("reconciled action not rendered:\n%s", view)
+	}
+	if _, cmd := m.Update(key("enter")); cmd != nil || m.screen != screenSwitchboard {
+		t.Fatalf("clamped Back action did not navigate: screen=%v cmd=%v", m.screen, cmd)
+	}
+}
+
+func TestActionViewWindowsSelectionAndFooterAtCompactSizes(t *testing.T) {
+	for _, size := range [][2]int{{32, 8}, {50, 12}} {
+		t.Run(fmt.Sprintf("%dx%d", size[0], size[1]), func(t *testing.T) {
+			m := switchboardModel(&fakeClient{})
+			m.accessible = true
+			m.screen = screenActions
+			m.err = "action unavailable"
+			_, items, _ := m.currentActions()
+			m.selectedAction = len(items) - 1
+			m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+			view := m.View()
+			if len(strings.Split(view, "\n")) > size[1] {
+				t.Fatalf("height overflow:\n%s", view)
+			}
+			if !strings.Contains(view, "> Back") || !strings.Contains(view, "Esc Back") || !strings.Contains(view, "action unavailable") {
+				t.Fatalf("selection, error, or footer hidden:\n%s", view)
+			}
+		})
+	}
+}
+
+func TestViewingTerminalJobDoesNotReplaceLiveFollow(t *testing.T) {
+	f := &fakeClient{}
+	m := switchboardModel(f)
+	live := activeJob("live-a", "app-a", "deploy")
+	terminal := activeJob("done-b", "app-b", "deploy")
+	terminal.Status = "succeeded"
+	m.jobs = []apicontract.Job{live, terminal}
+	m.selectedAppID = "app-b"
+	m.followedJob, m.followedJobID = live, live.ID
+	m.followGeneration = 7
+	m.followCancel = func() {}
+	_, cmd := m.chooseAction(actionItem{Kind: actionViewLast, Enabled: true}, m.apps[1])
+	if cmd != nil || m.screen != screenResult || m.followedJobID != live.ID || m.followedJob.ID != live.ID || m.followGeneration != 7 {
+		t.Fatalf("terminal view corrupted live follow: id=%q job=%q generation=%d", m.followedJobID, m.followedJob.ID, m.followGeneration)
+	}
+	f.jobsByID = map[string]apicontract.Job{live.ID: live}
+	_, fetch := m.Update(followEventMsg{generation: 7, event: apicontract.JobEvent{ID: 2, JobID: live.ID, Message: "still live"}})
+	if fetch == nil {
+		t.Fatal("live follow event was no longer accepted")
+	}
+	_ = fetch().(jobSnapshotMsg)
+	if f.lastJob != live.ID {
+		t.Fatalf("fetched %q want %q", f.lastJob, live.ID)
+	}
+}
+
+func TestCancellationPendingSuppressesRepeatedIntent(t *testing.T) {
+	f := &fakeClient{}
+	m := switchboardModel(f)
+	job := activeJob("job-1", "app-a", "deploy")
+	job.Status, job.Phase = "waiting_external", "cancelling"
+	m.jobs = []apicontract.Job{job}
+	m.followedJob, m.followedJobID = job, job.ID
+	m.screen = screenJobProgress
+	if _, cmd := m.Update(key("c")); cmd != nil || m.screen != screenJobProgress {
+		t.Fatalf("pending cancellation accepted again: screen=%v cmd=%v", m.screen, cmd)
+	}
+	if view := m.View(); strings.Contains(view, "c Cancel job") || !strings.Contains(view, "Cancellation pending") {
+		t.Fatalf("pending footer is misleading:\n%s", view)
+	}
+	items := actionsFor(m.apps[0], &job, m.status)
+	for _, item := range items {
+		if item.Kind == actionCancelJob && (item.Enabled || item.DisabledBy == "") {
+			t.Fatalf("pending cancel action=%+v", item)
+		}
+	}
+	if view := (&Model{width: 80, height: 24, layout: calculateLayout(80, 24), screen: screenConfirmation, confirmation: &confirmation{Action: actionCancelJob, App: m.apps[0], Job: job}}).View(); !strings.Contains(view, "Job ID") || !strings.Contains(view, job.ID) {
+		t.Fatalf("cancel confirmation omits job identity:\n%s", view)
+	}
+}
+
+func TestStaleAndMismatchedMutationResponsesAreIgnored(t *testing.T) {
+	f := &fakeClient{}
+	m := switchboardModel(f)
+	m.confirmation = &confirmation{Action: actionDeploy, App: m.apps[0], ReturnScreen: screenActions}
+	m.screen = screenConfirmation
+	_, cmd := m.Update(key("enter"))
+	msg := cmd().(mutationMsg)
+	m.showLogin("Session expired. Sign in again.")
+	m.Update(msg)
+	if m.screen != screenLogin || m.followedJobID != "" || m.overviewLoaded || len(m.apps) != 0 {
+		t.Fatalf("stale mutation changed cleared auth state: screen=%v follow=%q apps=%d", m.screen, m.followedJobID, len(m.apps))
+	}
+
+	f = &fakeClient{mutationJob: activeJob("wrong", "app-b", "deploy")}
+	m = switchboardModel(f)
+	m.confirmation = &confirmation{Action: actionDeploy, App: m.apps[0], ReturnScreen: screenActions}
+	m.screen = screenConfirmation
+	_, cmd = m.Update(key("enter"))
+	m.Update(cmd())
+	if m.screen != screenActions || m.followedJobID != "" || !strings.Contains(m.err, "unexpected application") {
+		t.Fatalf("mismatched response accepted: screen=%v follow=%q err=%q", m.screen, m.followedJobID, m.err)
+	}
+}
+
+func TestMismatchedCancelResponseDoesNotRetargetFollow(t *testing.T) {
+	job := activeJob("job-a", "app-a", "deploy")
+	f := &fakeClient{cancelJobResponse: activeJob("job-b", "app-a", "deploy")}
+	m := switchboardModel(f)
+	m.followedJob, m.followedJobID = job, job.ID
+	m.confirmation = &confirmation{Action: actionCancelJob, App: m.apps[0], Job: job, ReturnScreen: screenJobProgress}
+	m.screen = screenConfirmation
+	_, cmd := m.Update(key("enter"))
+	m.Update(cmd())
+	if m.screen != screenJobProgress || m.followedJobID != job.ID || !strings.Contains(m.err, "unexpected cancellation job") {
+		t.Fatalf("mismatched cancellation accepted: screen=%v follow=%q err=%q", m.screen, m.followedJobID, m.err)
+	}
+
+	f = &fakeClient{}
+	m = switchboardModel(f)
+	m.followedJob, m.followedJobID = job, job.ID
+	m.confirmation = &confirmation{Action: actionCancelJob, App: m.apps[0], Job: job, ReturnScreen: screenJobProgress}
+	m.screen = screenConfirmation
+	_, cmd = m.Update(key("enter"))
+	msg := cmd().(cancelMsg)
+	m.goOffline(errors.New("connection lost"))
+	m.Update(msg)
+	if m.screen != screenOffline || m.followedJobID != "" || len(m.apps) != 0 {
+		t.Fatalf("stale cancellation changed offline state: screen=%v follow=%q apps=%d", m.screen, m.followedJobID, len(m.apps))
+	}
+}
+
+func TestFollowStreamFailureStopsWithoutRetryLoop(t *testing.T) {
+	f := &fakeClient{}
+	m := switchboardModel(f)
+	job := activeJob("job-a", "app-a", "deploy")
+	m.followedJob, m.followedJobID = job, job.ID
+	m.followGeneration = 4
+	cancelled := 0
+	m.followCancel = func() { cancelled++ }
+	_, cmd := m.Update(followEventMsg{generation: 4, err: errors.New("transport failed")})
+	if cmd != nil || m.followCancel != nil || cancelled != 1 || f.jobCalls != 0 || !strings.Contains(m.err, "Reopen") {
+		t.Fatalf("stream failure retried: cmd=%v cancel=%d jobs=%d err=%q", cmd, cancelled, f.jobCalls, m.err)
+	}
+	_, cmd = m.Update(followEventMsg{generation: 4, err: errors.New("again")})
+	if cmd != nil || f.jobCalls != 0 {
+		t.Fatalf("stale failure produced work: cmd=%v jobs=%d", cmd, f.jobCalls)
+	}
+}
+
+func TestStrictIdentitySanitization(t *testing.T) {
+	raw := "Al\r\npha\t\u202e\u200b\ufe0fBeta" + strings.Repeat("界", 20)
+	got := sanitizeIdentity(raw, 16)
+	if !utf8.ValidString(got) || len(got) > 16 || strings.ContainsAny(got, "\r\n\t") || strings.ContainsRune(got, '\u202e') || strings.ContainsRune(got, '\u200b') || strings.ContainsRune(got, '\ufe0f') {
+		t.Fatalf("unsafe identity %q (%d bytes)", got, len(got))
+	}
+	app := runningApp("app-a", raw)
+	m := switchboardModel(&fakeClient{})
+	m.accessible = true
+	m.apps, m.selectedAppID = []apicontract.Application{app}, app.ID
+	if view := m.View(); strings.ContainsAny(view, "\r\t") || strings.ContainsRune(view, '\u202e') || strings.ContainsRune(view, '\u200b') {
+		t.Fatalf("unsafe identity rendered: %q", view)
+	}
+}
+
+func TestDashboardOpenerBusyGuardStartsExactlyOnce(t *testing.T) {
+	m := switchboardModel(&fakeClient{})
+	calls := 0
+	m.openURL = func(context.Context, string) error { calls++; return nil }
+	first := m.openDashboard()
+	if first == nil || m.openDashboard() != nil {
+		t.Fatal("busy opener did not suppress duplicate")
+	}
+	msg := first().(openURLMsg)
+	if calls != 1 || m.openDashboard() != nil {
+		t.Fatalf("opener calls=%d busy=%v", calls, m.openURLBusy)
+	}
+	m.Update(msg)
+	second := m.openDashboard()
+	if second == nil {
+		t.Fatal("opener remained busy after completion")
+	}
+	m.Update(second())
+	if calls != 2 {
+		t.Fatalf("opener calls=%d want=2", calls)
 	}
 }

@@ -40,6 +40,11 @@ func isActiveJob(job apicontract.Job) bool {
 	}
 }
 
+func isCancellationPending(job apicontract.Job) bool {
+	status, phase := strings.ToLower(strings.TrimSpace(job.Status)), strings.ToLower(strings.TrimSpace(job.Phase))
+	return status == "cancelling" || phase == "cancelling" || (status == "waiting_external" && phase == "cancelling")
+}
+
 func relevantJob(appID string, jobs []apicontract.Job) *apicontract.Job {
 	matched := make([]apicontract.Job, 0)
 	for _, job := range jobs {
@@ -67,8 +72,8 @@ func relevantJob(appID string, jobs []apicontract.Job) *apicontract.Job {
 }
 
 func appendBoundedEvent(events []apicontract.JobEvent, event apicontract.JobEvent) []apicontract.JobEvent {
-	event.Message = truncateUTF8Bytes(sanitizeAPIText(event.Message), maxAPITextBytes)
-	event.Phase = truncateUTF8Bytes(sanitizeAPIText(event.Phase), 256)
+	event.Message = sanitizeIdentity(event.Message, maxAPITextBytes)
+	event.Phase = sanitizeIdentity(event.Phase, 256)
 	events = append(events, event)
 	bytes, start := 0, len(events)
 	for start > 0 && len(events)-start < maxRecentEvents {
@@ -83,7 +88,7 @@ func appendBoundedEvent(events []apicontract.JobEvent, event apicontract.JobEven
 }
 
 func updatePhases(phases []phaseState, phase string) []phaseState {
-	phase = truncateUTF8Bytes(sanitizeAPIText(strings.TrimSpace(phase)), 256)
+	phase = sanitizeIdentity(phase, 256)
 	if phase == "" {
 		return phases
 	}
@@ -107,10 +112,13 @@ func updatePhases(phases []phaseState, phase string) []phaseState {
 
 func jobSummary(job apicontract.Job) string {
 	label := statusWord(job.Status)
+	if isCancellationPending(job) {
+		label = "Cancelling"
+	}
 	if isActiveJob(job) {
 		label += " " + percent(job.Progress)
 	}
-	return sanitizeAPIText(job.Type) + " · " + label
+	return sanitizeIdentity(job.Type, 128) + " · " + label
 }
 func percent(value int) string {
 	if value < 0 {

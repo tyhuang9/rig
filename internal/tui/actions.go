@@ -42,6 +42,8 @@ type mutationRequest struct {
 	AppID          string
 	JobID          string
 	IdempotencyKey string
+	Epoch          uint64
+	RequestID      uint64
 }
 
 // actionsFor is capability-authoritative: deploy is supported by either
@@ -52,9 +54,13 @@ func actionsFor(app apicontract.Application, job *apicontract.Job, status apicon
 	if job != nil {
 		kind, label := actionViewLast, "View last operation"
 		if isActiveJob(*job) {
+			cancelReason := ""
+			if isCancellationPending(*job) {
+				cancelReason = "cancellation already requested"
+			}
 			return []actionItem{
 				{Kind: actionViewCurrent, Label: "View current operation", Detail: jobSummary(*job), Enabled: true},
-				{Kind: actionCancelJob, Label: "Cancel current operation", Detail: "requires confirmation", Enabled: true},
+				{Kind: actionCancelJob, Label: "Cancel current operation", Detail: "requires confirmation", Enabled: cancelReason == "", DisabledBy: cancelReason},
 				{Kind: actionOpenDashboard, Label: "Open in web dashboard", Enabled: true},
 				{Kind: actionBack, Label: "Back", Enabled: true},
 			}
@@ -96,9 +102,9 @@ func actionsFor(app apicontract.Application, job *apicontract.Job, status apicon
 
 func deployDetail(app apicontract.Application) string {
 	if app.Source.TrackedBranch != "" && app.Source.ResolvedSha != "" {
-		return sanitizeAPIText(app.Source.TrackedBranch) + " @ " + shortRevision(app.Source.ResolvedSha)
+		return sanitizeIdentity(app.Source.TrackedBranch, 256) + " @ " + shortRevision(app.Source.ResolvedSha)
 	}
-	return sanitizeAPIText(app.Source.TrackedBranch)
+	return sanitizeIdentity(app.Source.TrackedBranch, 256)
 }
 
 func isMutationAction(action actionKind) bool {
