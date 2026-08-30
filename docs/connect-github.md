@@ -14,7 +14,7 @@ Forks and custom deployments can override the official GitHub App identity by su
 
 The two flags are an atomic pair. Supplying only one is invalid rather than combining a custom value with an official default. These values identify the app; they are not credentials. A client secret, GitHub App private key, access token, refresh token, or webhook secret must never be placed in this command, committed to the repository, or pasted into Rig's application configuration.
 
-Administrators can deliberately turn the connector off with `--github-connections=false`. If the dashboard says **GitHub connections are unavailable**, refreshing the page will not enable the feature. An administrator must restart the controller without that opt-out or, for a fork or custom deployment, with a valid `--github-client-id` and `--github-app-slug` pair. Do not invent placeholder values.
+Administrators can deliberately turn the connector off with `--github-connections=false`. If the dashboard says **GitHub connections are disabled**, refreshing the page will not enable the feature. An administrator must restart the controller without that opt-out or, for a fork or custom deployment, with a valid `--github-client-id` and `--github-app-slug` pair. Do not invent placeholder values.
 
 ::: info Verification status
 The official default identity and deterministic coverage for the connection flow, storage boundaries, and user interface are implemented. A complete live authorization and repository-discovery exercise against the official app remains an external verification step; this guide does not claim that promotion check has completed.
@@ -24,10 +24,10 @@ The official default identity and deterministic coverage for the connection flow
 
 1. In the dashboard, select **Add application**.
 2. Enter the application name and choose **GitHub repository**.
-3. Select **Connect GitHub**.
+3. Select **Sign in to GitHub**.
 4. Open the GitHub device-authorization link shown by Rig and enter the displayed code.
 5. Review the GitHub identity and permissions before authorizing.
-6. Use Rig's **Install or configure the Rig GitHub App** link to grant the app access to the intended account and repositories.
+6. Use Rig's **Install or configure repository access** link to grant the app access to the intended account and repositories.
 7. Return to Rig and choose the GitHub App installation, repository, tracked branch, and discovered Compose file.
 8. Run the exact-source inspection, resolve any findings, and save the application.
 
