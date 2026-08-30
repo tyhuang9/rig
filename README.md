@@ -59,7 +59,9 @@ In **Add application**, keep **Local folder** selected, enter an absolute path o
 
 ### GitHub repository
 
-GitHub sources use GitHub's device authorization flow and do not require an installed Git CLI or a user-managed checkout. The controller must first be configured with a GitHub App's public client ID and app slug. Then choose **GitHub repository**, select **Connect GitHub**, complete authorization and app installation on GitHub, and choose an installation, repository, branch, and Compose file.
+GitHub sources use GitHub's device authorization flow and do not require an installed Git CLI or a user-managed checkout. Standard Rig builds enable GitHub connections through the official `rig-deployment-connector`; no GitHub flags are needed. Choose **GitHub repository**, select **Connect GitHub**, complete authorization and app installation on GitHub, and then choose an installation, repository, branch, and Compose file.
+
+Forks and custom deployments can replace the official identity by supplying `--github-client-id` and `--github-app-slug` together. The override is atomic: do not supply only one flag. Administrators can explicitly disable the feature with `--github-connections=false`.
 
 GitHub credentials stay in purpose-bound protected files on the controller. Do not put a client secret, private key, access token, or webhook secret in command-line flags or in the repository. See [Connect GitHub](docs/connect-github.md) for the user flow and [GitHub-connected deployments](docs/github-connected-deployments.md) for administrator setup and operational behavior.
 

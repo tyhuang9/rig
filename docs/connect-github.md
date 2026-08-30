@@ -4,18 +4,20 @@ Rig can create an application from a GitHub.com repository without an installed 
 
 ## Before you connect
 
-The controller must report that GitHub connections are available. On the current release, an administrator enables this by configuring both public identifiers for a GitHub App:
+Standard Rig builds enable GitHub connections by default through the official `rig-deployment-connector`. No GitHub command-line flags are needed for standard use.
+
+Forks and custom deployments can override the official GitHub App identity by supplying both public identifiers:
 
 ```text
 --github-client-id <public-client-id> --github-app-slug <github-app-slug>
 ```
 
-These values identify the app; they are not credentials. A client secret, GitHub App private key, access token, refresh token, or webhook secret must never be placed in this command, committed to the repository, or pasted into Rig's application configuration.
+The two flags are an atomic pair. Supplying only one is invalid rather than combining a custom value with an official default. These values identify the app; they are not credentials. A client secret, GitHub App private key, access token, refresh token, or webhook secret must never be placed in this command, committed to the repository, or pasted into Rig's application configuration.
 
-If the dashboard says **GitHub connections are unavailable**, refreshing the page will not enable the feature. The controller must be restarted with a valid public client ID and app slug. Administrators should follow [GitHub-connected deployments](./github-connected-deployments.md#controller-setup) rather than inventing placeholder values.
+Administrators can deliberately turn the connector off with `--github-connections=false`. If the dashboard says **GitHub connections are unavailable**, refreshing the page will not enable the feature. An administrator must restart the controller without that opt-out or, for a fork or custom deployment, with a valid `--github-client-id` and `--github-app-slug` pair. Do not invent placeholder values.
 
 ::: info Verification status
-The repository includes deterministic coverage for the connection flow, storage boundaries, and user interface. Live authorization against a production GitHub App is still an external verification step.
+The official default identity and deterministic coverage for the connection flow, storage boundaries, and user interface are implemented. A complete live authorization and repository-discovery exercise against the official app remains an external verification step; this guide does not claim that promotion check has completed.
 :::
 
 ## Connect an account and repository
