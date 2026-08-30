@@ -19,6 +19,7 @@ type fakeClient struct {
 	mu                                                                          sync.Mutex
 	bootstrapStatus                                                             apicontract.BootstrapStatus
 	bootstrapStatusErr                                                          error
+	authErr                                                                     error
 	me                                                                          apicontract.MeResponse
 	meErr                                                                       error
 	status                                                                      apicontract.SystemStatus
@@ -42,10 +43,10 @@ func (f *fakeClient) BootstrapStatus(context.Context) (apicontract.BootstrapStat
 	return f.bootstrapStatus, f.bootstrapStatusErr
 }
 func (f *fakeClient) Bootstrap(_ context.Context, r apicontract.BootstrapRequest) (apicontract.SessionResponse, error) {
-	return apicontract.SessionResponse{User: apicontract.User{Username: r.Username}}, nil
+	return apicontract.SessionResponse{User: apicontract.User{Username: r.Username}}, f.authErr
 }
 func (f *fakeClient) Login(_ context.Context, r apicontract.LoginRequest) (apicontract.SessionResponse, error) {
-	return apicontract.SessionResponse{User: apicontract.User{Username: r.Username}}, nil
+	return apicontract.SessionResponse{User: apicontract.User{Username: r.Username}}, f.authErr
 }
 func (f *fakeClient) Logout(context.Context) error {
 	f.mu.Lock()
@@ -181,6 +182,72 @@ func TestStartupOfflineBootstrapLoginAndOverview(t *testing.T) {
 	if m.screen != screenSwitchboard || cmd == nil {
 		t.Fatalf("screen=%v cmd=%v", m.screen, cmd)
 	}
+}
+
+func TestAuthSubmissionClearsCredentialsAndKeepsFailuresSafe(t *testing.T) {
+	t.Run("login failure", func(t *testing.T) {
+		f := &fakeClient{authErr: errors.New("invalid\x1b]0;unsafe\a credentials")}
+		m := NewModel(context.Background(), f, "http://127.0.0.1:7345")
+		m.showLogin("")
+		m.authInputs[0].SetValue("operator")
+		m.authInputs[1].SetValue("do-not-render")
+		m.focusAuth(1)
+
+		_, cmd := m.submitAuth()
+		if cmd == nil {
+			t.Fatal("login submission returned no command")
+		}
+		for i := range m.authInputs {
+			if got := m.authInputs[i].Value(); got != "" {
+				t.Fatalf("credential field %d retained %q before request completion", i, got)
+			}
+		}
+
+		m.Update(cmd())
+		if m.screen != screenLogin || m.authIndex != 0 {
+			t.Fatalf("screen=%v focus=%d", m.screen, m.authIndex)
+		}
+		if strings.ContainsAny(m.err, "\x1b\a") || !strings.Contains(m.err, "invalid") {
+			t.Fatalf("unsafe or missing login failure: %q", m.err)
+		}
+		if view := m.View(); strings.Contains(view, "do-not-render") {
+			t.Fatalf("login secret rendered after failure:\n%s", view)
+		}
+	})
+
+	t.Run("bootstrap confirmation and success", func(t *testing.T) {
+		f := &fakeClient{}
+		m := NewModel(context.Background(), f, "http://127.0.0.1:7345")
+		m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+		m.showBootstrap()
+		m.authInputs[0].SetValue("bootstrap-secret")
+		m.authInputs[1].SetValue("admin")
+		m.authInputs[2].SetValue("do-not-render")
+		m.focusAuth(2)
+
+		m.Update(key("enter"))
+		if !m.bootstrapConfirm {
+			t.Fatal("bootstrap submission did not enter confirmation")
+		}
+		if view := m.View(); strings.Contains(view, "bootstrap-secret") || strings.Contains(view, "do-not-render") {
+			t.Fatalf("bootstrap confirmation rendered credentials:\n%s", view)
+		}
+
+		_, cmd := m.Update(key("enter"))
+		if cmd == nil {
+			t.Fatal("confirmed bootstrap returned no command")
+		}
+		for i := range m.authInputs {
+			if got := m.authInputs[i].Value(); got != "" {
+				t.Fatalf("credential field %d retained %q before request completion", i, got)
+			}
+		}
+
+		m.Update(cmd())
+		if m.screen != screenSwitchboard || m.user.Username != "admin" {
+			t.Fatalf("screen=%v user=%q", m.screen, m.user.Username)
+		}
+	})
 }
 
 func TestOverviewSortSelectionGenerationAndAdvisoryFailure(t *testing.T) {
