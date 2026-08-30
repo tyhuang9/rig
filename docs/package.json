@@ -11,6 +11,7 @@
     "dev": "vitepress dev .",
     "build": "vitepress build .",
     "check:workflow": "node scripts/check-pages-workflow.mjs",
+    "check:accessibility": "node scripts/check-accessibility.mjs",
     "preview": "vitepress preview ."
   },
   "devDependencies": {

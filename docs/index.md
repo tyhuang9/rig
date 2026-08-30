@@ -1,5 +1,6 @@
 ---
-layout: home
+layout: accessible-home
+sidebar: false
 
 hero:
   name: Rig

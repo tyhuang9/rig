@@ -38,29 +38,16 @@ export default defineConfig({
       },
     ],
     sidebar: [
-      {
-        text: "Start here",
-        items: [
-          { text: "Overview", link: "/" },
-          { text: "Getting started", link: "/getting-started" },
-          { text: "Connect GitHub", link: "/connect-github" },
-        ],
-      },
-      {
-        text: "Operations",
-        items: [
-          { text: "Docker Compose runtime", link: "/compose-runtime" },
-          { text: "GitHub-connected deployments", link: "/github-connected-deployments" },
-          { text: "Official webhook relay", link: "/relay-operations" },
-        ],
-      },
+      { text: "Overview", link: "/" },
+      { text: "Getting started", link: "/getting-started" },
+      { text: "Connect GitHub", link: "/connect-github" },
+      { text: "Docker Compose runtime", link: "/compose-runtime" },
+      { text: "GitHub-connected deployments", link: "/github-connected-deployments" },
+      { text: "Official webhook relay", link: "/relay-operations" },
     ],
     socialLinks: [
       { icon: "github", link: "https://github.com/tyhuang9/rig" },
     ],
-    search: {
-      provider: "local",
-    },
     editLink: {
       pattern: "https://github.com/tyhuang9/rig/edit/main/docs/:path",
       text: "Edit this page on GitHub",
