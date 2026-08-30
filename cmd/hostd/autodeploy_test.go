@@ -63,7 +63,12 @@ func (runner *autoDeployRunnerFake) wakeCount() int {
 func TestAutoDeployDefaultOffDoesNotConstruct(t *testing.T) {
 	for _, cfg := range []config.Config{
 		config.Defaults(),
-		func() config.Config { value := config.Defaults(); value.ComposeRuntime = true; return value }(),
+		func() config.Config {
+			value := config.Defaults()
+			value.ComposeRuntime = true
+			value.GitHubClientID, value.GitHubAppSlug = "", ""
+			return value
+		}(),
 		func() config.Config {
 			value := config.Defaults()
 			value.GitHubClientID, value.GitHubAppSlug = "client", "app"
