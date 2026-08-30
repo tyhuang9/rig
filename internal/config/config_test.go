@@ -65,21 +65,33 @@ func TestListenAddressMustBeExplicitLoopback(t *testing.T) {
 	}
 }
 
-func TestGitHubAppPublicConfigurationIsPairwiseAndBounded(t *testing.T) {
+func TestGitHubAppPublicConfigurationDefaultsOverridesAndOptOut(t *testing.T) {
 	tests := []struct {
-		name string
-		args []string
-		ok   bool
+		name       string
+		args       []string
+		ok         bool
+		enabled    bool
+		clientID   string
+		appSlug    string
+		errorMatch string
 	}{
-		{name: "disabled", ok: true},
-		{name: "enabled", args: []string{"--github-client-id", "Iv1.abc_123", "--github-app-slug", "hostd-app"}, ok: true},
-		{name: "client only", args: []string{"--github-client-id", "Iv1_abc"}},
-		{name: "slug only", args: []string{"--github-app-slug", "hostd-app"}},
-		{name: "client whitespace", args: []string{"--github-client-id", "client id", "--github-app-slug", "hostd-app"}},
-		{name: "slug URL", args: []string{"--github-client-id", "client", "--github-app-slug", "https://evil.example/app"}},
-		{name: "slug traversal", args: []string{"--github-client-id", "client", "--github-app-slug", "../app"}},
-		{name: "slug uppercase", args: []string{"--github-client-id", "client", "--github-app-slug", "Hostd-App"}},
-		{name: "oversized client", args: []string{"--github-client-id", strings.Repeat("a", 256), "--github-app-slug", "hostd-app"}},
+		{name: "official defaults", ok: true, enabled: true, clientID: officialGitHubClientID, appSlug: officialGitHubAppSlug},
+		{name: "explicitly enabled defaults", args: []string{"--github-connections=true"}, ok: true, enabled: true, clientID: officialGitHubClientID, appSlug: officialGitHubAppSlug},
+		{name: "custom pair", args: []string{"--github-client-id", "Iv1.abc_123", "--github-app-slug", "hostd-app"}, ok: true, enabled: true, clientID: "Iv1.abc_123", appSlug: "hostd-app"},
+		{name: "disabled", args: []string{"--github-connections=false"}, ok: true},
+		{name: "client only", args: []string{"--github-client-id", "Iv1_abc"}, errorMatch: "overrides must be provided together"},
+		{name: "slug only", args: []string{"--github-app-slug", "hostd-app"}, errorMatch: "overrides must be provided together"},
+		{name: "empty client override", args: []string{"--github-client-id=", "--github-app-slug", "hostd-app"}, errorMatch: "invalid"},
+		{name: "empty slug override", args: []string{"--github-client-id", "client", "--github-app-slug="}, errorMatch: "invalid"},
+		{name: "client whitespace", args: []string{"--github-client-id", "client id", "--github-app-slug", "hostd-app"}, errorMatch: "invalid"},
+		{name: "slug URL", args: []string{"--github-client-id", "client", "--github-app-slug", "https://evil.example/app"}, errorMatch: "invalid"},
+		{name: "slug traversal", args: []string{"--github-client-id", "client", "--github-app-slug", "../app"}, errorMatch: "invalid"},
+		{name: "slug uppercase", args: []string{"--github-client-id", "client", "--github-app-slug", "Hostd-App"}, errorMatch: "invalid"},
+		{name: "oversized client", args: []string{"--github-client-id", strings.Repeat("a", 256), "--github-app-slug", "hostd-app"}, errorMatch: "invalid"},
+		{name: "disabled with client override", args: []string{"--github-connections=false", "--github-client-id", "client"}, errorMatch: "cannot be combined"},
+		{name: "disabled with slug override", args: []string{"--github-connections=false", "--github-app-slug", "hostd-app"}, errorMatch: "cannot be combined"},
+		{name: "disabled with custom pair", args: []string{"--github-connections=false", "--github-client-id", "client", "--github-app-slug", "hostd-app"}, errorMatch: "cannot be combined"},
+		{name: "disabled with controller relay", args: []string{"--github-connections=false", "--controller-relay", "--relay-origin", "https://relay.example"}, errorMatch: "controller relay requires GitHub connections"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -87,10 +99,25 @@ func TestGitHubAppPublicConfigurationIsPairwiseAndBounded(t *testing.T) {
 			if (err == nil) != test.ok {
 				t.Fatalf("FromFlags() error = %v, want success %v", err, test.ok)
 			}
-			if err == nil && configuration.GitHubConnectionsEnabled() != (test.name == "enabled") {
-				t.Fatalf("GitHubConnectionsEnabled = %v", configuration.GitHubConnectionsEnabled())
+			if err != nil {
+				if test.errorMatch != "" && !strings.Contains(err.Error(), test.errorMatch) {
+					t.Fatalf("FromFlags() error = %q, want it to contain %q", err, test.errorMatch)
+				}
+				return
+			}
+			if configuration.GitHubConnectionsEnabled() != test.enabled {
+				t.Fatalf("GitHubConnectionsEnabled = %v, want %v", configuration.GitHubConnectionsEnabled(), test.enabled)
+			}
+			if configuration.GitHubClientID != test.clientID || configuration.GitHubAppSlug != test.appSlug {
+				t.Fatalf("GitHub App identity = %q / %q, want %q / %q", configuration.GitHubClientID, configuration.GitHubAppSlug, test.clientID, test.appSlug)
 			}
 		})
+	}
+}
+
+func TestZeroConfigDoesNotImplicitlyEnableGitHubConnections(t *testing.T) {
+	if (Config{}).GitHubConnectionsEnabled() {
+		t.Fatal("zero Config implicitly enabled GitHub connections")
 	}
 }
 
