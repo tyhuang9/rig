@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { APIError, api } from "./api";
+import { APIError, api, type SourceConnection } from "./api";
 import { isDeviceAuthorizationExpired, SourceWizard } from "./source-wizard";
 
 const connection = {
@@ -18,6 +18,18 @@ const otherConnection = {
   id: "fedcba9876543210fedcba9876543210",
   providerLogin: "rig-backup",
 };
+
+function pendingConnection(overrides: Partial<SourceConnection> = {}): SourceConnection {
+  return {
+    ...connection,
+    status: "pending",
+    providerLogin: "",
+    pendingExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    nextPollAt: new Date(Date.now() + 5_000).toISOString(),
+    installUrl: "https://github.com/apps/rig/installations/new",
+    ...overrides,
+  };
+}
 
 function renderWizard() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -51,6 +63,20 @@ async function selectConnectedGitHub() {
   const connectionSelect = await screen.findByLabelText(/^github connection$/i);
   await screen.findByRole("option", { name: /@rig-admin/i });
   fireEvent.change(connectionSelect, { target: { value: connection.id } });
+}
+
+async function selectPendingGitHub(connectionId = connection.id) {
+  fireEvent.click(screen.getByLabelText(/^github repository$/i));
+  const connectionSelect = await screen.findByLabelText(/^github connection$/i);
+  await screen.findAllByRole("option", { name: /github connection \(pending\)/i });
+  fireEvent.change(connectionSelect, { target: { value: connectionId } });
+}
+
+async function flushAsyncWork() {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
 }
 
 async function selectInstallation() {
@@ -399,6 +425,128 @@ describe("SourceWizard", () => {
     await waitFor(() => expect(screen.queryByRole("link", { name: /install or configure repository access/i })).toBeNull());
     expect(screen.getByText(/connection status: connected/i).closest("[role='status']")).toBe(liveRegion);
 
+  });
+
+  it("resumes a pending authorization after reload, honors nextPollAt, and continues to installation", async () => {
+    const pending = pendingConnection({ nextPollAt: new Date(Date.now() + 30_000).toISOString() });
+    const connected = { ...connection, installUrl: pending.installUrl };
+    vi.mocked(api.sourceConnections).mockResolvedValueOnce({ items: [pending] }).mockResolvedValue({ items: [connected] });
+    vi.spyOn(api, "pollGitHubConnection").mockResolvedValue(connected);
+    vi.mocked(api.githubInstallations).mockResolvedValue({ page: 1, perPage: 30, totalCount: 0, items: [] });
+    renderWizard();
+    await selectPendingGitHub();
+
+    expect(screen.getByRole("button", { name: /resume authorization check/i })).toBeTruthy();
+    expect(screen.getByText(/authorization started earlier/i)).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/USER-CODE|device-code-sentinel|verificationUri/i);
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    expect(screen.getByRole("button", { name: /checking authorization/i }).hasAttribute("disabled")).toBe(true);
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(api.pollGitHubConnection).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(api.pollGitHubConnection).toHaveBeenCalledWith(connection.id);
+    await vi.advanceTimersByTimeAsync(0);
+    await flushAsyncWork();
+
+    expect(screen.getByText(/step 1 complete: signed in to github/i)).toBeTruthy();
+    const install = screen.getByRole("link", { name: /install or configure repository access/i });
+    expect(install.getAttribute("href")).toBe(pending.installUrl);
+    expect(document.body.textContent).not.toMatch(/USER-CODE|device-code-sentinel|verificationUri/i);
+  });
+
+  it("uses Retry-After when a resumed authorization is polled too soon", async () => {
+    const pending = pendingConnection({ nextPollAt: new Date(Date.now() - 1000).toISOString() });
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
+    vi.spyOn(api, "pollGitHubConnection")
+      .mockRejectedValueOnce(new APIError({ status: 429, code: "poll_too_soon", detail: "Try again shortly.", retryAfterSeconds: 9 }))
+      .mockResolvedValueOnce({ ...connection, installUrl: pending.installUrl });
+    renderWizard();
+    await selectPendingGitHub();
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(8_999);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
+  });
+
+  it("pauses a resumed authorization after a transient error and allows manual retry", async () => {
+    const pending = pendingConnection({ nextPollAt: new Date(Date.now() - 1000).toISOString() });
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
+    vi.spyOn(api, "pollGitHubConnection")
+      .mockRejectedValueOnce(new APIError({ status: 503, code: "provider_unavailable", detail: "GitHub is temporarily unavailable." }))
+      .mockResolvedValueOnce({ ...connection, installUrl: pending.installUrl });
+    renderWizard();
+    await selectPendingGitHub();
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    await flushAsyncWork();
+
+    expect(screen.getByText(/select resume authorization check to try again/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    await flushAsyncWork();
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(/step 1 complete: signed in to github/i)).toBeTruthy();
+  });
+
+  it.each([
+    ["authorization_denied", "denied"],
+    ["identity_already_connected", "access_lost"],
+    ["invalid_connection_state", "access_lost"],
+  ] as const)("stops a resumed authorization on %s", async (code, status) => {
+    const pending = pendingConnection({ nextPollAt: new Date(Date.now() - 1000).toISOString() });
+    vi.mocked(api.sourceConnections)
+      .mockResolvedValueOnce({ items: [pending] })
+      .mockResolvedValue({ items: [{ ...pending, status }] });
+    vi.spyOn(api, "pollGitHubConnection").mockRejectedValue(new APIError({ status: code === "identity_already_connected" ? 409 : 400, code, detail: "Authorization cannot continue." }));
+    renderWizard();
+    await selectPendingGitHub();
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    await flushAsyncWork();
+
+    expect(screen.getByText(new RegExp(`connection status: ${status.replace("_", " ")}`, "i"))).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it("expires a resumed authorization locally without polling past its pending expiry", async () => {
+    const pending = pendingConnection({ pendingExpiresAt: new Date(Date.now() - 1000).toISOString(), nextPollAt: new Date(Date.now() - 2000).toISOString() });
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
+    const poll = vi.spyOn(api, "pollGitHubConnection");
+    renderWizard();
+    await selectPendingGitHub();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+
+    expect(await screen.findByText(/github authorization expired/i)).toBeTruthy();
+    expect(screen.getByText(/connection status: expired/i)).toBeTruthy();
+    expect(poll).not.toHaveBeenCalled();
+  });
+
+  it("ignores a resumed poll completion after another pending connection is selected", async () => {
+    const pendingA = pendingConnection({ nextPollAt: new Date(Date.now() - 1000).toISOString() });
+    const pendingB = pendingConnection({ id: otherConnection.id, nextPollAt: new Date(Date.now() - 1000).toISOString() });
+    const poll = deferred<Awaited<ReturnType<typeof api.pollGitHubConnection>>>();
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pendingA, pendingB] });
+    vi.spyOn(api, "pollGitHubConnection").mockReturnValue(poll.promise);
+    renderWizard();
+    await selectPendingGitHub(pendingA.id);
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.pollGitHubConnection).toHaveBeenCalledWith(pendingA.id);
+
+    fireEvent.change(screen.getByLabelText(/^github connection$/i), { target: { value: pendingB.id } });
+    await act(async () => poll.resolve({ ...connection, id: pendingA.id, installUrl: pendingA.installUrl }));
+    expect((screen.getByLabelText(/^github connection$/i) as HTMLSelectElement).value).toBe(pendingB.id);
+    expect(screen.queryByText(/step 1 complete: signed in to github/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /resume authorization check/i })).toBeTruthy();
   });
 
   it("disables every connection action while one mutation is pending", async () => {
