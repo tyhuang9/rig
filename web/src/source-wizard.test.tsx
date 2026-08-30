@@ -215,7 +215,8 @@ describe("SourceWizard", () => {
     renderWizard();
     fireEvent.click(screen.getByLabelText(/github repository/i));
 
-    expect(await screen.findByText(/^github connections are unavailable$/i, { selector: "strong" })).toBeTruthy();
+    expect(await screen.findByText(/^github connections are disabled$/i, { selector: "strong" })).toBeTruthy();
+    expect(screen.getByText(/^the administrator disabled github connections on this controller\.$/i)).toBeTruthy();
     expect(api.sourceConnections).not.toHaveBeenCalled();
   });
 
@@ -228,7 +229,7 @@ describe("SourceWizard", () => {
     const capabilityStatus = screen.getByText(/^checking github connection capability\.$/i, { selector: ".capability-status" });
     expect(capabilityStatus.getAttribute("aria-live")).toBe("polite");
     await act(async () => capabilityResult.resolve({ capabilities: { githubConnections: false } } as never));
-    expect(await screen.findByText(/^github connections are unavailable\.$/i, { selector: ".capability-status" })).toBe(capabilityStatus);
+    expect(await screen.findByText(/^github connections are disabled\.$/i, { selector: ".capability-status" })).toBe(capabilityStatus);
   });
 
   it("announces a capability error after checking", async () => {
@@ -266,7 +267,7 @@ describe("SourceWizard", () => {
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
 
     expect(await screen.findByText(/controller status is temporarily unavailable/i)).toBeTruthy();
-    expect(screen.queryByText(/github connections are unavailable/i)).toBeNull();
+    expect(screen.queryByText(/github connections are disabled/i)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /retry capability check/i }));
     expect(await screen.findByLabelText(/^github connection$/i)).toBeTruthy();
   });

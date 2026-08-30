@@ -364,7 +364,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const githubEnabled = capability.data?.capabilities.githubConnections === true;
   const sourceIsBusy = beginConnection.isPending || refreshConnection.isPending || disconnectConnection.isPending;
   const githubSaveHelp = !githubEnabled
-    ? "GitHub connections must be available before this application can be saved."
+    ? "GitHub connections must be enabled before this application can be saved."
     : deviceAuthorization
       ? "Finish GitHub device authorization before choosing the application source."
       : !isConnected
@@ -421,8 +421,8 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         <InspectionSummary inspection={inspection} />
       </section> : <section className="source-panel" aria-labelledby="github-source-title">
         <h3 id="github-source-title">GitHub repository</h3>
-        <span className="sr-only capability-status" role="status" aria-live="polite" aria-atomic="true">{capability.isFetching ? "Checking GitHub connection capability." : capability.isError ? "GitHub connection capability check failed." : githubEnabled ? "GitHub connections are available." : "GitHub connections are unavailable."}</span>
-        {capability.isLoading ? <div className="callout info">Checking GitHub connection capability…</div> : capability.isError ? <div className="callout danger"><strong>Could not check GitHub capability</strong><span>{safeMessage(capability.error, "The controller status could not be loaded.")}</span><button type="button" className="button small" onClick={() => void capability.refetch()}>Retry capability check</button></div> : !githubEnabled ? <div className="callout warning"><strong>GitHub connections are unavailable</strong><span>This controller has not enabled the GitHub App client configuration.</span></div> : <>
+        <span className="sr-only capability-status" role="status" aria-live="polite" aria-atomic="true">{capability.isFetching ? "Checking GitHub connection capability." : capability.isError ? "GitHub connection capability check failed." : githubEnabled ? "GitHub connections are available." : "GitHub connections are disabled."}</span>
+        {capability.isLoading ? <div className="callout info">Checking GitHub connection capability…</div> : capability.isError ? <div className="callout danger"><strong>Could not check GitHub capability</strong><span>{safeMessage(capability.error, "The controller status could not be loaded.")}</span><button type="button" className="button small" onClick={() => void capability.refetch()}>Retry capability check</button></div> : !githubEnabled ? <div className="callout warning"><strong>GitHub connections are disabled</strong><span>The administrator disabled GitHub connections on this controller.</span></div> : <>
           <div className="connection-actions">
             <button type="button" className="button" disabled={sourceIsBusy} onClick={() => beginConnection.mutate(connectionContext.current)}>{beginConnection.isPending ? "Starting…" : "Connect GitHub"}</button>
             {selectedConnectionId && selectedStatus === "connected" && <button type="button" className="button" disabled={sourceIsBusy} onClick={() => refreshConnection.mutate({ connectionId: selectedConnectionId, context: connectionContext.current })}>{refreshConnection.isPending ? "Refreshing…" : "Refresh connection"}</button>}
