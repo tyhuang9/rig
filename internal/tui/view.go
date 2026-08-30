@@ -84,11 +84,8 @@ func (m *Model) authView(title, subtitle string) string {
 		marker := "  "
 		if i == m.authIndex {
 			marker = "> "
-			if m.accessible {
-				marker = "Current field: "
-			}
 		}
-		lines = append(lines, cropWidth(marker+authFieldLabel(m.screen, i)+": "+m.authInputs[i].View(), m.width))
+		lines = append(lines, cropWidth(marker+authDisplayLabel(m.screen, i)+": "+m.authInputs[i].View(), m.width))
 	}
 	if m.err != "" {
 		lines = append(lines, m.bannerLine(m.width))
@@ -117,6 +114,7 @@ func (m *Model) switchboardView() string {
 	}
 	if len(m.apps) == 0 {
 		lines := []string{m.header(), titleStyle.Render("No applications yet"), "Create or import an application in the web dashboard,", "then return here and refresh."}
+		lines = append(lines, m.runtimeGuidanceLines()...)
 		if m.err != "" {
 			lines = append(lines, m.bannerLine(m.width))
 		}
@@ -131,6 +129,7 @@ func (m *Model) switchboardView() string {
 	} else {
 		lines = append(lines, "")
 	}
+	lines = append(lines, m.runtimeGuidanceLines()...)
 	if !m.layout.compact {
 		lines = append(lines, titleStyle.Render("Applications"))
 	}
@@ -161,6 +160,7 @@ func (m *Model) wideSwitchboardView() string {
 	} else {
 		lines = append(lines, "")
 	}
+	lines = append(lines, m.runtimeGuidanceLines()...)
 	lines = append(lines, body)
 	return m.screenLines(lines, m.switchboardFooter())
 }
@@ -201,7 +201,7 @@ func (m *Model) compactAppSummary(app apicontract.Application) string {
 		summary += " · " + source
 	}
 	if job := relevantJob(app.ID, m.jobs); job != nil {
-		summary += " · " + jobSummary(*job)
+		summary += " · " + jobSummaryAt(*job, m.now())
 	}
 	return cropWidth(summary, m.width)
 }
@@ -220,7 +220,7 @@ func (m *Model) appDetails(app apicontract.Application) []string {
 		lines = append(lines, "Machine    "+sanitizeIdentity(app.MachineName, 256))
 	}
 	if job := relevantJob(app.ID, m.jobs); job != nil {
-		lines = append(lines, "Operation  "+jobSummary(*job))
+		lines = append(lines, "Operation  "+jobSummaryAt(*job, m.now()))
 		if job.ErrorDetail != "" {
 			lines = append(lines, "Error      "+cropWidth(sanitizeIdentity(job.ErrorDetail, maxAPITextBytes), max(8, m.width-11)))
 		}
@@ -228,10 +228,31 @@ func (m *Model) appDetails(app apicontract.Application) []string {
 	return lines
 }
 func (m *Model) switchboardFooter() string {
-	if m.layout.compact {
-		return "Enter | r Refresh | q Quit"
+	items := []string{"Enter Actions", "r Refresh", "o Open Web", "? Help", "l Logout", "q Quit"}
+	for _, drop := range []string{"l Logout", "o Open Web", "r Refresh"} {
+		if ansi.StringWidth(strings.Join(items, " | ")) <= m.width {
+			break
+		}
+		for i, item := range items {
+			if item == drop {
+				items = append(items[:i], items[i+1:]...)
+				break
+			}
+		}
 	}
-	return "Enter Actions | r Refresh | o Open Web | ? Help | l Logout | q Quit"
+	return strings.Join(items, " | ")
+}
+
+func (m *Model) runtimeGuidanceLines() []string {
+	runtime := runtimeState(m.status)
+	if runtime.DeployReady {
+		return nil
+	}
+	message := "Runtime unavailable."
+	if runtime.Label == "Not configured" {
+		message = "Runtime not configured."
+	}
+	return []string{warningStyle.Render(message), "r Retry | o Web | hostctl doctor"}
 }
 
 func (m *Model) actionsView() string {
@@ -458,6 +479,9 @@ func relativeUpdatedAt(value string, now time.Time) string {
 		return ""
 	}
 	age := now.Sub(updated)
+	if age < 0 {
+		return ""
+	}
 	if age < time.Minute {
 		return "updated just now"
 	}
@@ -608,6 +632,12 @@ func authFieldLabel(current screen, index int) string {
 	}
 	return []string{"Username", "Passphrase"}[index]
 }
+func authDisplayLabel(current screen, index int) string {
+	if current == screenBootstrap {
+		return []string{"Token", "Admin username", "Passphrase"}[index]
+	}
+	return []string{"Username", "Passphrase"}[index]
+}
 func endpointLabel(endpoint string) string {
 	parsed, err := url.Parse(endpoint)
 	if err == nil && parsed.Scheme != "" && parsed.Host != "" {
@@ -634,12 +664,29 @@ func (m *Model) finishView(value string) string {
 	}
 	lines := strings.Split(value, "\n")
 	for i := range lines {
-		lines[i] = cropWidth(lines[i], m.width)
+		if m.accessible {
+			lines[i] = cropWidthASCII(lines[i], m.width)
+		} else {
+			lines[i] = cropWidth(lines[i], m.width)
+		}
 	}
 	if len(lines) > m.height {
 		lines = lines[:m.height]
 	}
 	return strings.Join(lines, "\n")
+}
+
+func cropWidthASCII(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if ansi.StringWidth(value) <= width {
+		return value
+	}
+	if width < 3 {
+		return ansi.Truncate(value, width, "")
+	}
+	return ansi.Truncate(value, width, "...")
 }
 
 func asciiSafe(value string) string {

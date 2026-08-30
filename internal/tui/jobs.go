@@ -120,6 +120,14 @@ func jobSummary(job apicontract.Job) string {
 	}
 	return sanitizeIdentity(job.Type, 128) + " · " + label
 }
+
+func jobSummaryAt(job apicontract.Job, now time.Time) string {
+	summary := jobSummary(job)
+	if updated := relativeUpdatedAt(job.UpdatedAt, now); updated != "" {
+		summary += " · " + updated
+	}
+	return summary
+}
 func percent(value int) string {
 	if value < 0 {
 		value = 0

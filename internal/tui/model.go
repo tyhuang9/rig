@@ -13,6 +13,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/hostd/hostd/internal/apicontract"
 )
 
@@ -897,7 +898,8 @@ func (m *Model) resizeAuthInputs() {
 	}
 	for i := range m.authInputs {
 		if m.compactAuthLayout() {
-			m.authInputs[i].Width = max(6, width-len(authFieldLabel(m.screen, i))-3)
+			prefixWidth := ansi.StringWidth("  " + authDisplayLabel(m.screen, i) + ": ")
+			m.authInputs[i].Width = max(1, width-prefixWidth)
 		} else {
 			m.authInputs[i].Width = max(12, min(width-8, 64))
 		}

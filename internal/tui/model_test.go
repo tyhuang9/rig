@@ -872,7 +872,7 @@ func TestMajorScreensReserveEssentialControlsAtSupportedSizes(t *testing.T) {
 		{name: "login", setup: func(m *Model) { m.showLogin("Session expired") }, want: []string{"Enter", "Ctrl+C Quit"}},
 		{name: "bootstrap", setup: func(m *Model) { m.showBootstrap(); m.err = "Check token" }, want: []string{"Enter", "Ctrl+C Quit"}},
 		{name: "bootstrap confirmation", setup: func(m *Model) { m.showBootstrap(); m.bootstrapConfirm = true; m.bootstrapUsername = "admin" }, want: []string{"Enter", "Esc Cancel"}},
-		{name: "switchboard", setup: func(m *Model) { m.screen = screenSwitchboard }, want: []string{"Enter", "r Refresh", "q Quit"}},
+		{name: "switchboard", setup: func(m *Model) { m.screen = screenSwitchboard }, want: []string{"Enter", "? Help", "q Quit"}},
 		{name: "actions", setup: func(m *Model) { m.screen = screenActions }, want: []string{"Enter", "Esc Back", "q Quit"}},
 		{name: "deploy confirmation", setup: func(m *Model) {
 			m.screen = screenConfirmation
@@ -1017,7 +1017,7 @@ func TestAccessibleRenderingIsASCIIAndNamesCurrentControls(t *testing.T) {
 	m.accessible = true
 	m.showLogin("")
 	login := m.View()
-	if !strings.Contains(login, "Current field: Username") {
+	if !strings.Contains(login, "> Username:") {
 		t.Fatalf("auth focus missing:\n%s", login)
 	}
 	m = switchboardModel(&fakeClient{})
@@ -1128,5 +1128,127 @@ func TestBannerIntentAndCtrlCRemainSemanticallyDistinct(t *testing.T) {
 	}
 	if _, ok := cmd().(tea.QuitMsg); !ok {
 		t.Fatal("Ctrl+C did not return Bubble Tea quit message")
+	}
+}
+
+func TestCompactAuthFieldsPreserveFocusedLabelAndInputCell(t *testing.T) {
+	tests := []struct {
+		name   string
+		setup  func(*Model)
+		labels []string
+	}{
+		{name: "login", setup: func(m *Model) { m.showLogin("") }, labels: []string{"Username", "Passphrase"}},
+		{name: "bootstrap", setup: func(m *Model) { m.showBootstrap() }, labels: []string{"Token", "Admin username", "Passphrase"}},
+	}
+	for _, size := range [][2]int{{32, 8}, {40, 10}, {50, 12}} {
+		for _, test := range tests {
+			for index, label := range test.labels {
+				t.Run(fmt.Sprintf("%s/%s/%dx%d", test.name, label, size[0], size[1]), func(t *testing.T) {
+					m := switchboardModel(&fakeClient{})
+					m.accessible = true
+					test.setup(m)
+					m.focusAuth(index)
+					m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+					prefix := "> " + label + ": "
+					var focused string
+					for _, line := range strings.Split(m.View(), "\n") {
+						if strings.HasPrefix(line, prefix) {
+							focused = line
+							break
+						}
+					}
+					if focused == "" || ansi.StringWidth(focused) <= ansi.StringWidth(prefix) {
+						t.Fatalf("focused label or input cell cropped; prefix=%q view:\n%s", prefix, m.View())
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestAccessibleFinalCropUsesASCIIEllipsis(t *testing.T) {
+	m := switchboardModel(&fakeClient{})
+	m.accessible = true
+	m.Update(tea.WindowSizeMsg{Width: 32, Height: 8})
+	view := m.finishView(strings.Repeat("long ", 20) + "—…·●✓")
+	if !strings.Contains(view, "...") {
+		t.Fatalf("ASCII truncation marker missing: %q", view)
+	}
+	for _, unsafe := range []string{"…", "—", "·", "●", "✓"} {
+		if strings.Contains(view, unsafe) {
+			t.Fatalf("accessible crop contains %q: %q", unsafe, view)
+		}
+	}
+	if ansi.StringWidth(view) > 32 {
+		t.Fatalf("accessible crop width=%d: %q", ansi.StringWidth(view), view)
+	}
+}
+
+func TestSwitchboardFooterDropsOptionalItemsByPriority(t *testing.T) {
+	tests := []struct {
+		width int
+		want  string
+	}{
+		{32, "Enter Actions | ? Help | q Quit"},
+		{50, "Enter Actions | r Refresh | ? Help | q Quit"},
+		{60, "Enter Actions | r Refresh | o Open Web | ? Help | q Quit"},
+		{80, "Enter Actions | r Refresh | o Open Web | ? Help | l Logout | q Quit"},
+		{99, "Enter Actions | r Refresh | o Open Web | ? Help | l Logout | q Quit"},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprint(test.width), func(t *testing.T) {
+			m := switchboardModel(&fakeClient{})
+			m.width = test.width
+			if got := m.switchboardFooter(); got != test.want {
+				t.Fatalf("footer=%q want=%q", got, test.want)
+			}
+			if ansi.StringWidth(m.switchboardFooter()) > test.width {
+				t.Fatalf("footer exceeds width %d: %q", test.width, m.switchboardFooter())
+			}
+		})
+	}
+}
+
+func TestSelectedApplicationJobSummaryShowsValidRecency(t *testing.T) {
+	m := switchboardModel(&fakeClient{})
+	now := time.Date(2026, 8, 30, 15, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return now }
+	job := activeJob("job-a", "app-a", "deploy")
+	job.UpdatedAt = now.Add(-5 * time.Minute).Format(time.RFC3339Nano)
+	m.jobs = []apicontract.Job{job}
+	for name, value := range map[string]string{
+		"compact": m.compactAppSummary(m.apps[0]),
+		"details": strings.Join(m.appDetails(m.apps[0]), "\n"),
+	} {
+		if !strings.Contains(value, "updated 5m ago") {
+			t.Fatalf("%s summary missing recency: %q", name, value)
+		}
+	}
+}
+
+func TestRelativeUpdatedAtOmitsFutureTimestamp(t *testing.T) {
+	now := time.Date(2026, 8, 30, 15, 0, 0, 0, time.UTC)
+	if got := relativeUpdatedAt(now.Add(time.Second).Format(time.RFC3339Nano), now); got != "" {
+		t.Fatalf("future timestamp rendered as %q", got)
+	}
+}
+
+func TestUnavailableRuntimeGuidanceIsCompactAndActionable(t *testing.T) {
+	for _, size := range [][2]int{{32, 8}, {40, 10}, {50, 12}} {
+		t.Run(fmt.Sprintf("%dx%d", size[0], size[1]), func(t *testing.T) {
+			m := switchboardModel(&fakeClient{})
+			m.accessible = true
+			m.status = apicontract.SystemStatus{Capabilities: apicontract.Capabilities{ComposeRuntime: true}}
+			m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+			view := m.View()
+			for _, want := range []string{"Runtime unavailable.", "r Retry | o Web | hostctl doctor", "Enter Actions", "? Help", "q Quit"} {
+				if !strings.Contains(view, want) {
+					t.Fatalf("guidance missing %q:\n%s", want, view)
+				}
+			}
+			if len(strings.Split(view, "\n")) != size[1] {
+				t.Fatalf("height mismatch:\n%s", view)
+			}
+		})
 	}
 }
