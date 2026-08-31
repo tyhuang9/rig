@@ -33,6 +33,10 @@ func TestArtifactRepositoryRetriesTerminalAttemptsAndReusesReady(t *testing.T) {
 		time.Date(2026, 8, 31, 12, 3, 0, 0, time.UTC),
 		time.Date(2026, 8, 31, 12, 4, 0, 0, time.UTC),
 		time.Date(2026, 8, 31, 12, 5, 0, 0, time.UTC),
+		time.Date(2026, 8, 31, 12, 6, 0, 0, time.UTC),
+		time.Date(2026, 8, 31, 12, 7, 0, 0, time.UTC),
+		time.Date(2026, 8, 31, 12, 8, 0, 0, time.UTC),
+		time.Date(2026, 8, 31, 12, 9, 0, 0, time.UTC),
 	)
 	repository.now = clock
 	input := artifactInput()
@@ -74,9 +78,20 @@ func TestArtifactRepositoryRetriesTerminalAttemptsAndReusesReady(t *testing.T) {
 	if err != nil || created || reusedReady.ID != ready.ID || reusedReady.AttemptNumber != 3 {
 		t.Fatalf("reuse ready=%#v created=%t err=%v", reusedReady, created, err)
 	}
+	unavailable, err := repository.MarkUnavailable(context.Background(), ready.ID)
+	if err != nil || unavailable.State != ArtifactUnavailable || unavailable.DiagnosticCode != DiagnosticImageUnavailable || unavailable.ImageContentID != imageID || !unavailable.FinishedAt.Equal(ready.FinishedAt) || !unavailable.UpdatedAt.After(unavailable.FinishedAt) {
+		t.Fatalf("unavailable=%#v err=%v", unavailable, err)
+	}
+	if _, err := repository.MarkUnavailable(context.Background(), ready.ID); !errors.Is(err, ErrInvalidArtifactTransition) {
+		t.Fatalf("repeated unavailable transition err=%v", err)
+	}
+	fourth, created, err := repository.Begin(context.Background(), input)
+	if err != nil || !created || fourth.AttemptNumber != 4 || fourth.ID == ready.ID {
+		t.Fatalf("replacement=%#v created=%t err=%v", fourth, created, err)
+	}
 
 	var attempts int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM generated_image_artifacts WHERE release_id=?`, testReleaseID).Scan(&attempts); err != nil || attempts != 3 {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM generated_image_artifacts WHERE release_id=?`, testReleaseID).Scan(&attempts); err != nil || attempts != 4 {
 		t.Fatalf("attempts=%d err=%v", attempts, err)
 	}
 }
@@ -154,6 +169,9 @@ func TestArtifactRepositoryValidatesProvenanceAndTransitions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := repository.MarkUnavailable(context.Background(), artifact.ID); !errors.Is(err, ErrInvalidArtifactTransition) {
+		t.Fatalf("building unavailable transition err=%v", err)
+	}
 	if _, err := repository.Fail(context.Background(), artifact.ID, DiagnosticCode("docker said no")); !errors.Is(err, ErrInvalidArtifact) {
 		t.Fatalf("raw diagnostic err=%v", err)
 	}
@@ -163,6 +181,9 @@ func TestArtifactRepositoryValidatesProvenanceAndTransitions(t *testing.T) {
 	ready, err := repository.Complete(context.Background(), artifact.ID, "sha256:"+strings.Repeat("c", 64))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE generated_image_artifacts SET image_content_id=?,state='unavailable',diagnostic_code='image_unavailable',updated_at=datetime('now') WHERE id=?`, "sha256:"+strings.Repeat("e", 64), ready.ID); err == nil || !strings.Contains(err.Error(), "provenance is immutable") {
+		t.Fatalf("ready image identity rewrite err=%v", err)
 	}
 	if _, err := repository.Fail(context.Background(), ready.ID, DiagnosticBuildFailed); !errors.Is(err, ErrInvalidArtifactTransition) {
 		t.Fatalf("terminal rewrite err=%v", err)

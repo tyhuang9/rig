@@ -14,7 +14,7 @@ CREATE TABLE generated_image_artifacts (
     ),
     attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
     image_content_id TEXT,
-    state TEXT NOT NULL CHECK (state IN ('building','ready','failed','cancelled')),
+    state TEXT NOT NULL CHECK (state IN ('building','ready','failed','cancelled','unavailable')),
     diagnostic_code TEXT CHECK (diagnostic_code IS NULL OR diagnostic_code IN (
         'build_failed',
         'build_timeout',
@@ -29,7 +29,8 @@ CREATE TABLE generated_image_artifacts (
         'process_termination_failed',
         'daemon_restarted',
         'internal_error',
-        'build_cancelled'
+        'build_cancelled',
+        'image_unavailable'
     )),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -63,6 +64,15 @@ CREATE TABLE generated_image_artifacts (
             AND finished_at IS NOT NULL
             AND updated_at = finished_at
         )
+        OR
+        (
+            state = 'unavailable'
+            AND length(image_content_id) = 71
+            AND substr(image_content_id, 1, 7) = 'sha256:'
+            AND substr(image_content_id, 8) NOT GLOB '*[^0-9a-f]*'
+            AND diagnostic_code = 'image_unavailable'
+            AND finished_at IS NOT NULL
+        )
     ),
     UNIQUE(release_id, component_id, compiler_version, build_definition_digest, attempt_number),
     FOREIGN KEY(release_id, deployment_plan_revision_id, deployment_plan_revision_number)
@@ -81,7 +91,7 @@ CREATE INDEX generated_image_artifacts_release
 ON generated_image_artifacts(release_id, component_id, attempt_number DESC);
 
 CREATE TRIGGER generated_image_artifact_provenance_immutable
-BEFORE UPDATE OF id, release_id, deployment_plan_revision_id, deployment_plan_revision_number, component_id, compiler_version, build_definition_digest, attempt_number, created_at
+BEFORE UPDATE OF id, release_id, deployment_plan_revision_id, deployment_plan_revision_number, component_id, compiler_version, build_definition_digest, attempt_number, image_content_id, created_at
 ON generated_image_artifacts
 WHEN NEW.id IS NOT OLD.id
   OR NEW.release_id IS NOT OLD.release_id
@@ -91,12 +101,16 @@ WHEN NEW.id IS NOT OLD.id
   OR NEW.compiler_version IS NOT OLD.compiler_version
   OR NEW.build_definition_digest IS NOT OLD.build_definition_digest
   OR NEW.attempt_number IS NOT OLD.attempt_number
+  OR (OLD.image_content_id IS NOT NULL AND NEW.image_content_id IS NOT OLD.image_content_id)
   OR NEW.created_at IS NOT OLD.created_at
 BEGIN SELECT RAISE(ABORT, 'generated image artifact provenance is immutable'); END;
 
 CREATE TRIGGER generated_image_artifact_transition
 BEFORE UPDATE ON generated_image_artifacts
-WHEN OLD.state != 'building' OR NEW.state NOT IN ('ready','failed','cancelled')
+WHEN NOT (
+    (OLD.state = 'building' AND NEW.state IN ('ready','failed','cancelled'))
+    OR (OLD.state = 'ready' AND NEW.state = 'unavailable')
+)
 BEGIN SELECT RAISE(ABORT, 'invalid generated image artifact transition'); END;
 
 CREATE TRIGGER generated_image_artifact_retain

@@ -44,6 +44,16 @@ func TestGeneratedImageArtifactsMigrationMirrorAndSafeColumns(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
+	var tableDefinition, transitionDefinition string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='generated_image_artifacts'`).Scan(&tableDefinition); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='generated_image_artifact_transition'`).Scan(&transitionDefinition); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(tableDefinition, "'unavailable'") || !strings.Contains(tableDefinition, "'image_unavailable'") || !strings.Contains(transitionDefinition, "OLD.state = 'ready' AND NEW.state = 'unavailable'") {
+		t.Fatal("migration does not retain missing ready images as unavailable artifacts")
+	}
 	var applied int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=?`, generatedImageArtifactsMigration).Scan(&applied); err != nil || applied != 1 {
 		t.Fatalf("migration record=%d err=%v", applied, err)

@@ -17,10 +17,11 @@ import (
 type ArtifactState string
 
 const (
-	ArtifactBuilding  ArtifactState = "building"
-	ArtifactReady     ArtifactState = "ready"
-	ArtifactFailed    ArtifactState = "failed"
-	ArtifactCancelled ArtifactState = "cancelled"
+	ArtifactBuilding    ArtifactState = "building"
+	ArtifactReady       ArtifactState = "ready"
+	ArtifactFailed      ArtifactState = "failed"
+	ArtifactCancelled   ArtifactState = "cancelled"
+	ArtifactUnavailable ArtifactState = "unavailable"
 )
 
 type DiagnosticCode string
@@ -40,6 +41,7 @@ const (
 	DiagnosticDaemonRestarted          DiagnosticCode = "daemon_restarted"
 	DiagnosticInternalError            DiagnosticCode = "internal_error"
 	DiagnosticBuildCancelled           DiagnosticCode = "build_cancelled"
+	DiagnosticImageUnavailable         DiagnosticCode = "image_unavailable"
 )
 
 var (
@@ -172,6 +174,26 @@ func (r *ArtifactRepository) Complete(ctx context.Context, artifactID, imageCont
 	}
 	now := r.now().UTC().Format(time.RFC3339Nano)
 	result, err := r.db.ExecContext(ctx, `UPDATE generated_image_artifacts SET image_content_id=?,state='ready',updated_at=?,finished_at=? WHERE id=? AND state='building'`, imageContentID, now, now, artifactID)
+	if err != nil {
+		return Artifact{}, err
+	}
+	if changed, err := result.RowsAffected(); err != nil {
+		return Artifact{}, err
+	} else if changed != 1 {
+		return Artifact{}, r.transitionError(ctx, artifactID)
+	}
+	return r.Get(ctx, artifactID)
+}
+
+// MarkUnavailable records that Docker no longer has a previously completed
+// image. It retains the content ID and original completion timestamp so the
+// missing artifact remains auditable while Begin creates a new attempt.
+func (r *ArtifactRepository) MarkUnavailable(ctx context.Context, artifactID string) (Artifact, error) {
+	if r == nil || r.db == nil || ctx == nil || !canonicalUUID(artifactID) {
+		return Artifact{}, ErrInvalidArtifact
+	}
+	now := r.now().UTC().Format(time.RFC3339Nano)
+	result, err := r.db.ExecContext(ctx, `UPDATE generated_image_artifacts SET state='unavailable',diagnostic_code=?,updated_at=? WHERE id=? AND state='ready'`, DiagnosticImageUnavailable, now, artifactID)
 	if err != nil {
 		return Artifact{}, err
 	}
