@@ -442,12 +442,17 @@ func (m *Manager) copyConfig(ctx context.Context, contents []byte, filename stri
 		file.Close()
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
-	if _, err := file.Write(contents); err != nil || file.Sync() != nil || file.Close() != nil {
+	if _, err := file.Write(contents); err != nil || file.Sync() != nil {
+		file.Close()
+		return &Error{Code: DiagnosticIngressUnavailable}
+	}
+	createdInfo, err := file.Stat()
+	if err != nil || !createdInfo.Mode().IsRegular() || file.Close() != nil {
 		file.Close()
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
 	fileInfo, err := os.Lstat(path)
-	if err != nil || !fileInfo.Mode().IsRegular() || fileInfo.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(path) || !m.validWorkingDirectory() {
+	if err != nil || !fileInfo.Mode().IsRegular() || fileInfo.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(path) || !os.SameFile(createdInfo, fileInfo) || !m.validWorkingDirectory() {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
 	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "cp", path, caddyContainerName+":/config/"+filename); err != nil {
