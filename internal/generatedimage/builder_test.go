@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,14 +19,17 @@ import (
 type builderDaemonFake struct {
 	mu sync.Mutex
 
-	network  *dockerNetwork
-	builders map[string]buildxBuilder
-	nodes    map[string]builderIdentity
-	boxes    map[string]buildkitContainer
-	calls    []runtimeprocess.CommandRequest
-	err      error
-	stderr   []byte
-	outputs  [][]byte
+	network            *dockerNetwork
+	builders           map[string]buildxBuilder
+	nodes              map[string]builderIdentity
+	boxes              map[string]buildkitContainer
+	calls              []runtimeprocess.CommandRequest
+	err                error
+	stderr             []byte
+	outputs            [][]byte
+	osType             string
+	containerRunErr    error
+	containerRunStderr []byte
 }
 
 func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -43,6 +47,14 @@ func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.Comman
 		return runtimeprocess.CommandResult{}, errors.New("invalid fake Docker command")
 	}
 	switch request.Args[0] {
+	case "info":
+		osType := d.osType
+		if osType == "" {
+			osType = "linux"
+		}
+		body, _ := json.Marshal(dockerInfo{OSType: osType})
+		d.outputs = append(d.outputs, body)
+		return runtimeprocess.CommandResult{Stdout: body}, nil
 	case "network":
 		switch request.Args[1] {
 		case "inspect":
@@ -84,27 +96,20 @@ func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.Comman
 			if d.nodes == nil {
 				d.nodes = make(map[string]builderIdentity)
 			}
-			d.builders[name] = buildxBuilder{Name: name, Driver: flagArgument(request.Args, "--driver")}
-			d.nodes[name] = builderIdentity{BuilderName: name, NodeName: flagArgument(request.Args, "--node"), NetworkName: strings.TrimPrefix(driverOption(request.Args, "network"), "network=")}
+			endpoint := request.Args[len(request.Args)-1]
+			d.builders[name] = buildxBuilder{Name: name, Driver: flagArgument(request.Args, "--driver"), Nodes: []buildxNode{{Name: flagArgument(request.Args, "--node"), Endpoint: endpoint}}}
+			d.nodes[name] = builderIdentity{BuilderName: name, NodeName: flagArgument(request.Args, "--node")}
 			output := []byte(name)
 			d.outputs = append(d.outputs, output)
 			return runtimeprocess.CommandResult{Stdout: output}, nil
 		case "inspect":
-			name := flagArgument(request.Args, "--builder")
-			if identity, exists := d.nodes[name]; exists {
-				if d.boxes == nil {
-					d.boxes = make(map[string]buildkitContainer)
-				}
-				if _, exists := d.boxes[buildkitContainerName(identity)]; !exists {
-					d.boxes[buildkitContainerName(identity)] = validBuildkitContainer(identity)
-				}
-			}
-			output := []byte("Name: fake\nDriver: docker-container\n")
+			output := []byte("Name: fake\nDriver: remote\n")
 			d.outputs = append(d.outputs, output)
 			return runtimeprocess.CommandResult{Stdout: output}, nil
 		}
 	case "container":
-		if request.Args[1] == "inspect" {
+		switch request.Args[1] {
+		case "inspect":
 			name := request.Args[len(request.Args)-1]
 			container, exists := d.boxes[name]
 			if !exists {
@@ -115,18 +120,30 @@ func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.Comman
 			body, _ := json.Marshal(container)
 			d.outputs = append(d.outputs, body)
 			return runtimeprocess.CommandResult{Stdout: body}, nil
+		case "run":
+			if d.containerRunErr != nil {
+				output := append([]byte(nil), d.containerRunStderr...)
+				d.outputs = append(d.outputs, output)
+				return runtimeprocess.CommandResult{Stderr: output}, d.containerRunErr
+			}
+			if d.boxes == nil {
+				d.boxes = make(map[string]buildkitContainer)
+			}
+			name := flagArgument(request.Args, "--name")
+			labels := labelsFromCreate(request.Args)
+			identity := builderIdentity{
+				Schema: builderStateSchema, BuilderName: labels["rig.builder"], NetworkName: labels["rig.network"],
+				NodeName: "rig-node-" + strings.TrimPrefix(name, "rig-buildkitd-"),
+			}
+			quota := defaultStateQuotaBytes
+			if value := labels["rig.quota.bytes"]; value != "" {
+				_, _ = fmt.Sscan(value, &quota)
+			}
+			d.boxes[name] = validBuildkitContainer(identity, quota)
+			output := []byte("sha256:" + strings.Repeat("1", 64))
+			d.outputs = append(d.outputs, output)
+			return runtimeprocess.CommandResult{Stdout: output}, nil
 		}
-	case "update":
-		name := request.Args[len(request.Args)-1]
-		container, exists := d.boxes[name]
-		if !exists || flagArgument(request.Args, "--pids-limit") != "512" {
-			return runtimeprocess.CommandResult{}, errors.New("invalid fake container update")
-		}
-		container.HostConfig.PidsLimit = 512
-		d.boxes[name] = container
-		output := []byte(name)
-		d.outputs = append(d.outputs, output)
-		return runtimeprocess.CommandResult{Stdout: output}, nil
 	}
 	return runtimeprocess.CommandResult{}, errors.New("unsupported fake Docker command")
 }
@@ -182,27 +199,27 @@ func TestBuilderManagerCreatesBootstrapsAndScopesTheBuilder(t *testing.T) {
 	}
 
 	requests := daemon.requests()
-	if got, want := commandKinds(requests), []string{"network inspect", "network create", "network inspect", "buildx ls", "buildx create", "buildx inspect", "buildx ls", "update --pids-limit", "container inspect"}; !sameStrings(got, want) {
+	if got, want := commandKinds(requests), []string{"info --format", "network inspect", "network create", "network inspect", "container inspect", "container run", "container inspect", "buildx ls", "buildx create", "buildx ls", "buildx inspect", "buildx ls", "container inspect"}; !sameStrings(got, want) {
 		t.Fatalf("commands = %#v, want %#v", got, want)
 	}
-	if !containsExactOrPrefix(requests[1].Args, "com.docker.network.bridge.enable_icc=false") {
-		t.Fatalf("network create did not disable ICC: %#v", requests[1].Args)
+	if !containsExactOrPrefix(requests[2].Args, "com.docker.network.bridge.enable_icc=false") {
+		t.Fatalf("network create did not disable ICC: %#v", requests[2].Args)
 	}
-	create := requests[4]
+	containerRun := requests[5]
 	for _, required := range []string{
-		"--driver", "docker-container", "--node", "--driver-opt", "network=rig-buildnet-",
-		"image=" + buildkitImage,
-		"memory=2147483648", "memory-swap=2147483648", "cpu-period=100000", "cpu-quota=100000",
-		"--buildkitd-config", "--use",
+		"--privileged", "--network", "rig-buildnet-", "--memory", "3221225472", "--memory-swap",
+		"--pids-limit", "512", "type=tmpfs,destination=/var/lib/buildkit,tmpfs-size=2147483648,tmpfs-mode=0700",
+		"rig.quota.bytes=2147483648", buildkitImage,
 	} {
+		if !containsExactOrPrefix(containerRun.Args, required) {
+			t.Fatalf("container run lacks %q: %#v", required, containerRun.Args)
+		}
+	}
+	create := requests[8]
+	for _, required := range []string{"--driver", "remote", "--node", "--driver-opt", "default-load=false", "--use", "docker-container://rig-buildkitd-"} {
 		if !containsExactOrPrefix(create.Args, required) {
 			t.Fatalf("buildx create lacks %q: %#v", required, create.Args)
 		}
-	}
-	configPath := flagArgument(create.Args, "--buildkitd-config")
-	body, readErr := os.ReadFile(configPath)
-	if readErr != nil || string(body) != buildkitdConfiguration {
-		t.Fatalf("buildkit config = %q, %v", body, readErr)
 	}
 	for _, path := range []string{environment["DOCKER_CONFIG"], environment["BUILDX_CONFIG"]} {
 		info, statErr := os.Stat(path)
@@ -238,7 +255,7 @@ func TestBuilderManagerReusesAndRevalidatesExistingBuilder(t *testing.T) {
 		t.Fatalf("sessions differ: %#v %#v", first, second)
 	}
 	requests := daemon.requests()[firstCount:]
-	if got, want := commandKinds(requests), []string{"network inspect", "buildx ls", "buildx inspect", "buildx ls", "update --pids-limit", "container inspect"}; !sameStrings(got, want) {
+	if got, want := commandKinds(requests), []string{"info --format", "network inspect", "container inspect", "buildx ls", "buildx inspect", "buildx ls", "container inspect"}; !sameStrings(got, want) {
 		t.Fatalf("reuse commands = %#v, want %#v", got, want)
 	}
 }
@@ -259,6 +276,112 @@ func TestBuilderManagerRefusesPostBootstrapContainerResourceDrift(t *testing.T) 
 	_, err = manager.Prepare(context.Background())
 	if !IsBuilderError(err, BuilderDriftDetected) {
 		t.Fatalf("resource drift error = %v", err)
+	}
+}
+
+func TestBuilderManagerRefusesHardQuotaMountDriftBeforeBuilderMutation(t *testing.T) {
+	for name, mutate := range map[string]func(*buildkitContainer){
+		"configured size": func(container *buildkitContainer) {
+			container.HostConfig.Mounts[0].TmpfsOptions.SizeBytes--
+		},
+		"active type": func(container *buildkitContainer) {
+			container.Mounts[0].Type = "volume"
+		},
+		"additional mount": func(container *buildkitContainer) {
+			container.Mounts = append(container.Mounts, dockerMount{Type: "bind", Source: "C:\\private", Destination: "/private", RW: true})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+			manager := newBuilderManagerForTest(t, daemon)
+			session, err := manager.Prepare(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			daemon.mu.Lock()
+			identity := daemon.nodes[session.BuilderName]
+			container := daemon.boxes[buildkitContainerName(identity)]
+			mutate(&container)
+			daemon.boxes[buildkitContainerName(identity)] = container
+			before := len(daemon.calls)
+			daemon.mu.Unlock()
+
+			_, err = manager.Prepare(context.Background())
+			if !IsBuilderError(err, BuilderDriftDetected) {
+				t.Fatalf("mount drift error = %v", err)
+			}
+			if got, want := commandKinds(daemon.requests()[before:]), []string{"info --format", "network inspect", "container inspect"}; !sameStrings(got, want) {
+				t.Fatalf("commands after mount drift = %#v, want read-only %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestBuilderManagerFailsClosedWhenHardQuotaIsUnsupported(t *testing.T) {
+	t.Run("non Linux Docker engine", func(t *testing.T) {
+		daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder), osType: "windows"}
+		manager := newBuilderManagerForTest(t, daemon)
+		_, err := manager.Prepare(context.Background())
+		if !IsBuilderError(err, BuilderHardQuotaUnavailable) {
+			t.Fatalf("unsupported platform error = %v", err)
+		}
+		if got, want := commandKinds(daemon.requests()), []string{"info --format"}; !sameStrings(got, want) {
+			t.Fatalf("unsupported platform commands = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("tmpfs creation rejected", func(t *testing.T) {
+		daemon := &builderDaemonFake{
+			builders: make(map[string]buildxBuilder), containerRunErr: errors.New("exit status 1"),
+			containerRunStderr: []byte("tmpfs mounts are not supported by this runtime"),
+		}
+		manager := newBuilderManagerForTest(t, daemon)
+		_, err := manager.Prepare(context.Background())
+		if !IsBuilderError(err, BuilderHardQuotaUnavailable) {
+			t.Fatalf("unsupported tmpfs error = %v", err)
+		}
+		for _, request := range daemon.requests() {
+			if len(request.Args) >= 2 && request.Args[0] == "buildx" {
+				t.Fatalf("Buildx mutated before quota establishment: %#v", request.Args)
+			}
+		}
+	})
+}
+
+func TestBuilderManagerClassifiesHardQuotaExhaustion(t *testing.T) {
+	daemon := &builderDaemonFake{
+		builders: make(map[string]buildxBuilder), containerRunErr: errors.New("exit status 1"),
+		containerRunStderr: []byte("failed to mount tmpfs: no space left on device"),
+	}
+	manager := newBuilderManagerForTest(t, daemon)
+	_, err := manager.Prepare(context.Background())
+	if !IsBuilderError(err, BuilderHardQuotaExhausted) {
+		t.Fatalf("quota exhaustion error = %v", err)
+	}
+}
+
+func TestBuilderManagerRefusesRemoteEndpointDrift(t *testing.T) {
+	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+	manager := newBuilderManagerForTest(t, daemon)
+	session, err := manager.Prepare(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon.mu.Lock()
+	builder := daemon.builders[session.BuilderName]
+	builder.Nodes[0].Endpoint = "tcp://127.0.0.1:1234"
+	daemon.builders[session.BuilderName] = builder
+	before := len(daemon.calls)
+	daemon.mu.Unlock()
+
+	_, err = manager.Prepare(context.Background())
+	if !IsBuilderError(err, BuilderDriftDetected) {
+		t.Fatalf("endpoint drift error = %v", err)
+	}
+	for _, request := range daemon.requests()[before:] {
+		if len(request.Args) >= 2 && request.Args[0] == "buildx" && request.Args[1] != "ls" {
+			t.Fatalf("drifted endpoint was used or replaced: %#v", request.Args)
+		}
 	}
 }
 
@@ -406,16 +529,32 @@ func driverOption(args []string, key string) string {
 	return ""
 }
 
-func validBuildkitContainer(identity builderIdentity) buildkitContainer {
+func validBuildkitContainer(identity builderIdentity, quotaBytes int64) buildkitContainer {
 	var container buildkitContainer
 	container.Name = "/" + buildkitContainerName(identity)
-	container.HostConfig.Memory = 2 << 30
-	container.HostConfig.MemorySwap = 2 << 30
+	container.Image = "sha256:" + strings.Repeat("a", 64)
+	container.State.Running = true
+	container.Config.Image = buildkitImage
+	container.Config.Cmd = []string{"--oci-worker-net", "bridge"}
+	container.Config.Labels = map[string]string{
+		"rig.controller": "generated-builder", "rig.builder": identity.BuilderName,
+		"rig.network": identity.NetworkName, "rig.quota.bytes": fmt.Sprintf("%d", quotaBytes),
+	}
+	container.HostConfig.Memory = buildkitMemoryBytes
+	container.HostConfig.MemorySwap = buildkitMemoryBytes
 	container.HostConfig.CPUPeriod = 100000
 	container.HostConfig.CPUQuota = 100000
-	container.HostConfig.PidsLimit = 512
+	container.HostConfig.PidsLimit = buildkitPIDsLimit
+	container.HostConfig.Privileged = true
 	container.HostConfig.NetworkMode = identity.NetworkName
+	container.HostConfig.RestartPolicy.Name = "no"
+	tmpfs := &struct {
+		SizeBytes int64 `json:"SizeBytes"`
+		Mode      int64 `json:"Mode"`
+	}{SizeBytes: quotaBytes, Mode: 0o700}
+	container.HostConfig.Mounts = []dockerConfiguredMount{{Type: "tmpfs", Target: buildkitStatePath, TmpfsOptions: tmpfs}}
 	container.NetworkSettings.Networks = map[string]json.RawMessage{identity.NetworkName: json.RawMessage(`{}`)}
+	container.Mounts = []dockerMount{{Type: "tmpfs", Destination: buildkitStatePath, RW: true}}
 	return container
 }
 

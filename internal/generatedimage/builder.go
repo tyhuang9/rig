@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,14 +21,20 @@ import (
 
 const (
 	builderIdentityFilename = "builder-identity.json"
-	buildkitConfigFilename  = "buildkitd.toml"
 	dockerConfigDirectory   = "docker-config"
 	buildxConfigDirectory   = "buildx-config"
 	buildkitImage           = "moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
+	buildkitStatePath       = "/var/lib/buildkit"
+	buildkitRemoteScheme    = "docker-container://"
+	defaultStateQuotaBytes  = int64(2 << 30)
+	minimumStateQuotaBytes  = int64(512 << 20)
+	maximumStateQuotaBytes  = int64(16 << 30)
+	buildkitMemoryBytes     = int64(3 << 30)
+	buildkitPIDsLimit       = int64(512)
 
 	defaultBuilderPrepareTimeout = 2 * time.Minute
 	defaultBuilderOutputLimit    = 64 << 10
-	builderStateSchema           = 1
+	builderStateSchema           = 2
 )
 
 // BuilderErrorCode is a durable, non-secret outcome of preparing the
@@ -46,6 +53,8 @@ const (
 	BuilderOutputTruncated      BuilderErrorCode = "builder_output_truncated"
 	BuilderTerminationFailed    BuilderErrorCode = "builder_process_termination_failed"
 	BuilderCancelled            BuilderErrorCode = "builder_cancelled"
+	BuilderHardQuotaUnavailable BuilderErrorCode = "builder_hard_quota_unavailable"
+	BuilderHardQuotaExhausted   BuilderErrorCode = "builder_hard_quota_exhausted"
 )
 
 // BuilderError carries only a stable code. Raw CLI output is cleared while
@@ -68,15 +77,17 @@ type BuilderManagerOptions struct {
 	DockerEndpoint   string
 	PrepareTimeout   time.Duration
 	OutputLimit      int
+	StateQuotaBytes  int64
 }
 
 // BuilderSession is an immutable view of a prepared BuildKit builder. It owns
 // no credentials. Environment returns a copy so callers cannot mutate the
 // manager's scoped Docker configuration.
 type BuilderSession struct {
-	DockerExecutable string
-	BuilderName      string
-	environment      []string
+	DockerExecutable  string
+	BuilderName       string
+	environment       []string
+	storageQuotaBytes int64
 }
 
 func (s BuilderSession) Environment() []string { return append([]string(nil), s.environment...) }
@@ -98,26 +109,71 @@ type dockerNetwork struct {
 }
 
 type buildxBuilder struct {
-	Name   string `json:"Name"`
-	Driver string `json:"Driver"`
+	Name   string       `json:"Name"`
+	Driver string       `json:"Driver"`
+	Nodes  []buildxNode `json:"Nodes"`
+}
+
+type dockerInfo struct {
+	OSType string `json:"OSType"`
+}
+
+type buildxNode struct {
+	Name     string `json:"Name"`
+	Endpoint string `json:"Endpoint"`
+}
+
+type dockerMount struct {
+	Type        string `json:"Type"`
+	Source      string `json:"Source"`
+	Destination string `json:"Destination"`
+	Mode        string `json:"Mode"`
+	RW          bool   `json:"RW"`
+	Propagation string `json:"Propagation"`
+}
+
+type dockerConfiguredMount struct {
+	Type         string `json:"Type"`
+	Source       string `json:"Source"`
+	Target       string `json:"Target"`
+	ReadOnly     bool   `json:"ReadOnly"`
+	TmpfsOptions *struct {
+		SizeBytes int64 `json:"SizeBytes"`
+		Mode      int64 `json:"Mode"`
+	} `json:"TmpfsOptions"`
 }
 
 type buildkitContainer struct {
-	Name   string `json:"Name"`
+	Name  string `json:"Name"`
+	Image string `json:"Image"`
+	State struct {
+		Running    bool `json:"Running"`
+		Restarting bool `json:"Restarting"`
+	} `json:"State"`
 	Config struct {
+		Image  string            `json:"Image"`
+		Cmd    []string          `json:"Cmd"`
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	HostConfig struct {
-		Memory      int64  `json:"Memory"`
-		MemorySwap  int64  `json:"MemorySwap"`
-		CPUPeriod   int64  `json:"CpuPeriod"`
-		CPUQuota    int64  `json:"CpuQuota"`
-		PidsLimit   int64  `json:"PidsLimit"`
-		NetworkMode string `json:"NetworkMode"`
+		Memory        int64                      `json:"Memory"`
+		MemorySwap    int64                      `json:"MemorySwap"`
+		CPUPeriod     int64                      `json:"CpuPeriod"`
+		CPUQuota      int64                      `json:"CpuQuota"`
+		PidsLimit     int64                      `json:"PidsLimit"`
+		NetworkMode   string                     `json:"NetworkMode"`
+		Privileged    bool                       `json:"Privileged"`
+		Binds         []string                   `json:"Binds"`
+		Mounts        []dockerConfiguredMount    `json:"Mounts"`
+		PortBindings  map[string]json.RawMessage `json:"PortBindings"`
+		RestartPolicy struct {
+			Name string `json:"Name"`
+		} `json:"RestartPolicy"`
 	} `json:"HostConfig"`
 	NetworkSettings struct {
 		Networks map[string]json.RawMessage `json:"Networks"`
 	} `json:"NetworkSettings"`
+	Mounts []dockerMount `json:"Mounts"`
 }
 
 // BuilderManager provisions and validates one durable Buildx builder. The
@@ -149,6 +205,12 @@ func NewBuilderManager(runner runtimeprocess.CommandRunner, options BuilderManag
 	if options.OutputLimit == 0 {
 		options.OutputLimit = defaultBuilderOutputLimit
 	}
+	if options.StateQuotaBytes == 0 {
+		options.StateQuotaBytes = defaultStateQuotaBytes
+	}
+	if options.StateQuotaBytes < minimumStateQuotaBytes || options.StateQuotaBytes > maximumStateQuotaBytes {
+		return nil, &BuilderError{Code: BuilderConfigurationInvalid}
+	}
 	directory, err := securetemp.NewGeneratedBuilderDirectory(options.DataRoot)
 	if err != nil {
 		return nil, &BuilderError{Code: BuilderFilesystemInvalid}
@@ -173,19 +235,40 @@ func (m *BuilderManager) Prepare(ctx context.Context) (BuilderSession, error) {
 	if err != nil {
 		return BuilderSession{}, err
 	}
+	if err := m.verifyQuotaPlatform(ctx, env); err != nil {
+		return BuilderSession{}, err
+	}
 	if err := m.ensureNetwork(ctx, identity, env); err != nil {
+		return BuilderSession{}, err
+	}
+	if err := m.ensureBuildkitContainer(ctx, identity, env); err != nil {
 		return BuilderSession{}, err
 	}
 	if err := m.ensureBuilder(ctx, identity, env); err != nil {
 		return BuilderSession{}, err
 	}
 	session := BuilderSession{
-		DockerExecutable: m.options.DockerExecutable,
-		BuilderName:      identity.BuilderName,
-		environment:      append([]string(nil), env...),
+		DockerExecutable:  m.options.DockerExecutable,
+		BuilderName:       identity.BuilderName,
+		environment:       append([]string(nil), env...),
+		storageQuotaBytes: m.options.StateQuotaBytes,
 	}
 	m.session = &session
 	return session, nil
+}
+
+func (m *BuilderManager) verifyQuotaPlatform(ctx context.Context, env []string) error {
+	result, runErr := m.run(ctx, []string{"info", "--format", "{{json .}}"}, env)
+	defer clear(result.Stdout)
+	defer clear(result.Stderr)
+	if runErr != nil {
+		return provisionError(ctx, result, runErr)
+	}
+	var info dockerInfo
+	if json.Unmarshal(result.Stdout, &info) != nil || info.OSType != "linux" {
+		return &BuilderError{Code: BuilderHardQuotaUnavailable}
+	}
+	return nil
 }
 
 func (m *BuilderManager) preparePersistentState() (builderIdentity, []string, error) {
@@ -197,32 +280,11 @@ func (m *BuilderManager) preparePersistentState() (builderIdentity, []string, er
 	if err != nil {
 		return builderIdentity{}, nil, &BuilderError{Code: BuilderFilesystemInvalid}
 	}
-	if err := m.ensureFixedFile(buildkitConfigFilename, []byte(buildkitdConfiguration)); err != nil {
-		return builderIdentity{}, nil, err
-	}
 	identity, err := m.loadOrCreateIdentity()
 	if err != nil {
 		return builderIdentity{}, nil, err
 	}
 	return identity, generatedBuilderEnvironment(m.options.DockerEndpoint, dockerConfig, buildxConfig), nil
-}
-
-func (m *BuilderManager) ensureFixedFile(name string, contents []byte) error {
-	existing, err := m.directory.ReadFile(name, 16<<10)
-	if errors.Is(err, os.ErrNotExist) {
-		if writeErr := m.directory.WriteNewFile(name, append([]byte(nil), contents...)); writeErr != nil && !errors.Is(writeErr, os.ErrExist) {
-			return &BuilderError{Code: BuilderFilesystemInvalid}
-		}
-		existing, err = m.directory.ReadFile(name, 16<<10)
-	}
-	if err != nil {
-		return &BuilderError{Code: BuilderFilesystemInvalid}
-	}
-	defer clear(existing)
-	if string(existing) != string(contents) {
-		return &BuilderError{Code: BuilderDriftDetected}
-	}
-	return nil
 }
 
 func (m *BuilderManager) loadOrCreateIdentity() (builderIdentity, error) {
@@ -340,31 +402,29 @@ func (m *BuilderManager) ensureBuilder(ctx context.Context, identity builderIden
 	if err != nil {
 		return err
 	}
-	if found && builder.Driver != "docker-container" {
+	if found && !matchesBuildxBuilder(builder, identity) {
 		return &BuilderError{Code: BuilderDriftDetected}
 	}
 	if !found {
 		result, runErr := m.run(ctx, []string{
 			"buildx", "create", "--name", identity.BuilderName, "--node", identity.NodeName,
-			"--driver", "docker-container",
-			"--driver-opt", "image=" + buildkitImage,
-			"--driver-opt", "network=" + identity.NetworkName,
-			"--driver-opt", "memory=2147483648",
-			"--driver-opt", "memory-swap=2147483648",
-			"--driver-opt", "cpu-period=100000",
-			"--driver-opt", "cpu-quota=100000",
-			"--buildkitd-config", filepath.Join(m.directory.Root(), buildkitConfigFilename),
-			"--use",
+			"--driver", "remote", "--driver-opt", "default-load=false", "--use",
+			buildkitRemoteEndpoint(identity),
 		}, env)
 		defer clear(result.Stdout)
 		defer clear(result.Stderr)
 		if runErr != nil {
-			// Do not assume an "already exists" error is safe: exact listing is
-			// required before another process's builder can be reused.
-			if retry, retryFound, retryErr := m.findBuilder(ctx, identity.BuilderName, env); retryErr == nil && retryFound && retry.Driver == "docker-container" {
+			if retry, retryFound, retryErr := m.findBuilder(ctx, identity.BuilderName, env); retryErr == nil && retryFound && matchesBuildxBuilder(retry, identity) {
 				return m.bootstrapAndVerify(ctx, identity, env)
 			}
 			return provisionError(ctx, result, runErr)
+		}
+		builder, found, err = m.findBuilder(ctx, identity.BuilderName, env)
+		if err != nil {
+			return err
+		}
+		if !found || !matchesBuildxBuilder(builder, identity) {
+			return &BuilderError{Code: BuilderDriftDetected}
 		}
 	}
 	return m.bootstrapAndVerify(ctx, identity, env)
@@ -381,55 +441,127 @@ func (m *BuilderManager) bootstrapAndVerify(ctx context.Context, identity builde
 	if err != nil {
 		return err
 	}
-	if !found || builder.Driver != "docker-container" {
+	if !found || !matchesBuildxBuilder(builder, identity) {
 		return &BuilderError{Code: BuilderDriftDetected}
 	}
-	if err := m.enforceBuildkitPIDsLimit(ctx, identity, env); err != nil {
+	container, found, err := m.inspectBuildkitContainer(ctx, identity, env)
+	if err != nil {
 		return err
 	}
-	return m.verifyBuildkitContainer(ctx, identity, env)
-}
-
-func (m *BuilderManager) enforceBuildkitPIDsLimit(ctx context.Context, identity builderIdentity, env []string) error {
-	result, runErr := m.run(ctx, []string{"update", "--pids-limit", "512", buildkitContainerName(identity)}, env)
-	defer clear(result.Stdout)
-	defer clear(result.Stderr)
-	if runErr != nil {
-		return provisionError(ctx, result, runErr)
+	if !found || !matchesBuildkitContainer(container, identity, m.options.StateQuotaBytes) {
+		return &BuilderError{Code: BuilderDriftDetected}
 	}
 	return nil
 }
 
-func (m *BuilderManager) verifyBuildkitContainer(ctx context.Context, identity builderIdentity, env []string) error {
+func matchesBuildxBuilder(builder buildxBuilder, identity builderIdentity) bool {
+	return builder.Name == identity.BuilderName && builder.Driver == "remote" && len(builder.Nodes) == 1 && builder.Nodes[0].Name == identity.NodeName && builder.Nodes[0].Endpoint == buildkitRemoteEndpoint(identity)
+}
+
+func buildkitRemoteEndpoint(identity builderIdentity) string {
+	return buildkitRemoteScheme + buildkitContainerName(identity)
+}
+
+func (m *BuilderManager) ensureBuildkitContainer(ctx context.Context, identity builderIdentity, env []string) error {
+	container, found, err := m.inspectBuildkitContainer(ctx, identity, env)
+	if err != nil {
+		return err
+	}
+	if found {
+		if !matchesBuildkitContainer(container, identity, m.options.StateQuotaBytes) {
+			return &BuilderError{Code: BuilderDriftDetected}
+		}
+		return nil
+	}
+
+	quota := fmt.Sprintf("%d", m.options.StateQuotaBytes)
+	result, runErr := m.run(ctx, []string{
+		"container", "run", "--detach", "--name", buildkitContainerName(identity),
+		"--privileged", "--network", identity.NetworkName,
+		"--memory", fmt.Sprintf("%d", buildkitMemoryBytes), "--memory-swap", fmt.Sprintf("%d", buildkitMemoryBytes),
+		"--cpu-period", "100000", "--cpu-quota", "100000", "--pids-limit", fmt.Sprintf("%d", buildkitPIDsLimit),
+		"--mount", "type=tmpfs,destination=" + buildkitStatePath + ",tmpfs-size=" + quota + ",tmpfs-mode=0700",
+		"--label", "rig.controller=generated-builder", "--label", "rig.builder=" + identity.BuilderName,
+		"--label", "rig.network=" + identity.NetworkName, "--label", "rig.quota.bytes=" + quota,
+		buildkitImage, "--oci-worker-net", "bridge",
+	}, env)
+	defer clear(result.Stdout)
+	defer clear(result.Stderr)
+	if runErr != nil {
+		if retried, retryFound, retryErr := m.inspectBuildkitContainer(ctx, identity, env); retryErr == nil && retryFound && matchesBuildkitContainer(retried, identity, m.options.StateQuotaBytes) {
+			return nil
+		}
+		return quotaProvisionError(ctx, result, runErr)
+	}
+	container, found, err = m.inspectBuildkitContainer(ctx, identity, env)
+	if err != nil {
+		return err
+	}
+	if !found || !matchesBuildkitContainer(container, identity, m.options.StateQuotaBytes) {
+		return &BuilderError{Code: BuilderDriftDetected}
+	}
+	return nil
+}
+
+func (m *BuilderManager) inspectBuildkitContainer(ctx context.Context, identity builderIdentity, env []string) (buildkitContainer, bool, error) {
 	name := buildkitContainerName(identity)
 	result, runErr := m.run(ctx, []string{"container", "inspect", "--format", "{{json .}}", name}, env)
 	defer clear(result.Stdout)
 	defer clear(result.Stderr)
 	if runErr != nil {
 		if dockerNotFound(result) {
-			return &BuilderError{Code: BuilderDriftDetected}
+			return buildkitContainer{}, false, nil
 		}
-		return provisionError(ctx, result, runErr)
+		return buildkitContainer{}, false, provisionError(ctx, result, runErr)
 	}
 	var container buildkitContainer
-	if json.Unmarshal(result.Stdout, &container) != nil || !matchesBuildkitContainer(container, identity) {
-		return &BuilderError{Code: BuilderDriftDetected}
+	if json.Unmarshal(result.Stdout, &container) != nil {
+		return buildkitContainer{}, false, &BuilderError{Code: BuilderDriftDetected}
 	}
-	return nil
+	return container, true, nil
 }
 
 func buildkitContainerName(identity builderIdentity) string {
-	// docker-container Buildx names the Docker container from the Buildx node,
-	// not from arbitrary repository input. NodeName is persisted and random.
-	return "buildx_buildkit_" + identity.NodeName
+	return "rig-buildkitd-" + strings.TrimPrefix(identity.NodeName, "rig-node-")
 }
 
-func matchesBuildkitContainer(container buildkitContainer, identity builderIdentity) bool {
-	if container.Name != "/"+buildkitContainerName(identity) || container.HostConfig.Memory != 2<<30 || container.HostConfig.MemorySwap != 2<<30 || container.HostConfig.CPUPeriod != 100000 || container.HostConfig.CPUQuota != 100000 || container.HostConfig.PidsLimit != 512 || container.HostConfig.NetworkMode != identity.NetworkName || len(container.NetworkSettings.Networks) != 1 {
+func matchesBuildkitContainer(container buildkitContainer, identity builderIdentity, quotaBytes int64) bool {
+	wantLabels := map[string]string{
+		"rig.controller":  "generated-builder",
+		"rig.builder":     identity.BuilderName,
+		"rig.network":     identity.NetworkName,
+		"rig.quota.bytes": fmt.Sprintf("%d", quotaBytes),
+	}
+	if container.Name != "/"+buildkitContainerName(identity) || !validImageContentID(container.Image) || container.Config.Image != buildkitImage || !equalStringSlices(container.Config.Cmd, []string{"--oci-worker-net", "bridge"}) || !container.State.Running || container.State.Restarting {
+		return false
+	}
+	for key, value := range wantLabels {
+		if container.Config.Labels[key] != value {
+			return false
+		}
+	}
+	if container.HostConfig.Memory != buildkitMemoryBytes || container.HostConfig.MemorySwap != buildkitMemoryBytes || container.HostConfig.CPUPeriod != 100000 || container.HostConfig.CPUQuota != 100000 || container.HostConfig.PidsLimit != buildkitPIDsLimit || !container.HostConfig.Privileged || container.HostConfig.NetworkMode != identity.NetworkName || len(container.HostConfig.Binds) != 0 || len(container.HostConfig.PortBindings) != 0 || (container.HostConfig.RestartPolicy.Name != "" && container.HostConfig.RestartPolicy.Name != "no") || len(container.NetworkSettings.Networks) != 1 {
 		return false
 	}
 	_, connected := container.NetworkSettings.Networks[identity.NetworkName]
-	return connected
+	if !connected || len(container.HostConfig.Mounts) != 1 || len(container.Mounts) != 1 {
+		return false
+	}
+	configured := container.HostConfig.Mounts[0]
+	active := container.Mounts[0]
+	return configured.Type == "tmpfs" && configured.Source == "" && configured.Target == buildkitStatePath && !configured.ReadOnly && configured.TmpfsOptions != nil && configured.TmpfsOptions.SizeBytes == quotaBytes && configured.TmpfsOptions.Mode == 0o700 && active.Type == "tmpfs" && active.Source == "" && active.Destination == buildkitStatePath && active.RW && active.Mode == "" && active.Propagation == ""
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *BuilderManager) findBuilder(ctx context.Context, name string, env []string) (buildxBuilder, bool, error) {
@@ -513,6 +645,17 @@ func provisionError(ctx context.Context, result runtimeprocess.CommandResult, er
 	return &BuilderError{Code: BuilderProvisionFailed}
 }
 
+func quotaProvisionError(ctx context.Context, result runtimeprocess.CommandResult, err error) error {
+	if code := commandErrorCode(ctx, result, err); code != "" {
+		return &BuilderError{Code: code}
+	}
+	output := strings.ToLower(string(append(append([]byte(nil), result.Stdout...), result.Stderr...)))
+	if strings.Contains(output, "no space left on device") || strings.Contains(output, "disk quota exceeded") {
+		return &BuilderError{Code: BuilderHardQuotaExhausted}
+	}
+	return &BuilderError{Code: BuilderHardQuotaUnavailable}
+}
+
 func bootstrapError(ctx context.Context, result runtimeprocess.CommandResult, err error) error {
 	if code := commandErrorCode(ctx, result, err); code != "" {
 		return &BuilderError{Code: code}
@@ -549,12 +692,3 @@ func commandErrorCode(ctx context.Context, result runtimeprocess.CommandResult, 
 	}
 	return ""
 }
-
-const buildkitdConfiguration = `# Controller-owned generated-image BuildKit policy.
-[worker.oci]
-  max-parallelism = 1
-  gc = true
-  reservedSpace = "256MB"
-  maxUsedSpace = "1GB"
-  minFreeSpace = "512MB"
-`
