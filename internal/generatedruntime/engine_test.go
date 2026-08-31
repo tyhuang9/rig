@@ -424,6 +424,32 @@ func TestGeneratedRuntimeDescriptionsExposeDeterministicPreMutationIdentity(t *t
 	}
 }
 
+func TestGeneratedRuntimeEnsureAppNetworkReusesExactOwnershipChecks(t *testing.T) {
+	spec := candidateSpec()
+	inspections := 0
+	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		switch commandKind(request.Args) {
+		case "network inspect":
+			inspections++
+			if inspections == 1 {
+				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such network")}, err: errors.New("exit")}
+			}
+			return runtimeJSON(networkInspection{Name: networkName(spec.AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": spec.AppID}})
+		case "network create":
+			return runtimeRequestResult{}
+		default:
+			t.Fatalf("unexpected network request: %#v", request.Args)
+			return runtimeRequestResult{}
+		}
+	})
+	if err := engine.EnsureAppNetwork(context.Background(), spec.AppID); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(runner.requests), 3; got != want {
+		t.Fatalf("network requests=%d want=%d", got, want)
+	}
+}
+
 func candidateSpec() CandidateSpec {
 	return CandidateSpec{
 		AppID: "11111111-1111-4111-8111-111111111111", ReleaseID: "22222222-2222-4222-8222-222222222222",

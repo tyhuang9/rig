@@ -379,6 +379,15 @@ func DescribeAppNetwork(appID string) (AppNetworkDescription, error) {
 	return AppNetworkDescription{Name: networkName(appID)}, nil
 }
 
+// EnsureAppNetwork is the explicit mutating counterpart to DescribeAppNetwork.
+// Coordinators call it only after their final policy/approval gate.
+func (e *Engine) EnsureAppNetwork(ctx context.Context, appID string) error {
+	if e == nil || ctx == nil || !canonicalUUID(appID) {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
+	return e.ensureNetwork(ctx, appID, networkName(appID))
+}
+
 func (e *Engine) inspectImage(ctx context.Context, spec CandidateSpec) (imageInspection, error) {
 	return e.inspectImageSpec(ctx, ImageSpec{
 		AppID: spec.AppID, ReleaseID: spec.ReleaseID, ArtifactID: spec.ArtifactID,
