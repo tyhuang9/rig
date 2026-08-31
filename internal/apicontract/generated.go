@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "cd589cb0411eb00e84863e154fcc52f38e15adfa56f797c929a28648b69729f2"
+const SourceSHA256 = "efba4be18103c4fdf804e654f7cf2a52284bb34b2db13d6bb0bd6405b3526e09"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -85,6 +85,7 @@ type AnalysisAdvancedInput struct {
 type AnalysisCommand struct {
 	Command          string             `json:"command,omitempty"`
 	Confidence       string             `json:"confidence,omitempty"`
+	EnvironmentKeys  []string           `json:"environmentKeys,omitempty"`
 	Evidence         []AnalysisEvidence `json:"evidence"`
 	Origin           string             `json:"origin,omitempty"`
 	Phase            string             `json:"phase,omitempty"`
@@ -320,12 +321,15 @@ type DeploymentPlanFieldProvenance struct {
 }
 
 type DeploymentPlanMigration struct {
-	ApprovalStatus string `json:"approvalStatus,omitempty"`
-	ApprovedAt     string `json:"approvedAt,omitempty"`
-	ApprovedBy     string `json:"approvedBy,omitempty"`
-	Command        string `json:"command,omitempty"`
-	EvidenceDigest string `json:"evidenceDigest,omitempty"`
-	Present        bool   `json:"present"`
+	ApprovalStatus  string   `json:"approvalStatus,omitempty"`
+	ApprovedAt      string   `json:"approvedAt,omitempty"`
+	ApprovedBy      string   `json:"approvedBy,omitempty"`
+	Command         string   `json:"command,omitempty"`
+	ComponentName   string   `json:"componentName,omitempty"`
+	EnvironmentKeys []string `json:"environmentKeys,omitempty"`
+	EvidenceDigest  string   `json:"evidenceDigest,omitempty"`
+	Present         bool     `json:"present"`
+	RootDirectory   string   `json:"rootDirectory,omitempty"`
 }
 
 type DeploymentPlanRevision struct {

@@ -213,7 +213,11 @@ func acceptedGeneratedPlan(candidate projectanalysis.DeploymentPlanCandidate, in
 			if command == "" {
 				command = component.Migration.Command
 			}
-			plan.Migration = &deploymentplans.Migration{Command: command, EvidenceDigest: component.MigrationFingerprint, Approval: deploymentplans.MigrationApproval{Status: deploymentplans.MigrationApprovalPending}}
+			plan.Migration = &deploymentplans.Migration{
+				ComponentName: component.ID, RootDirectory: root, Command: command,
+				EnvironmentKeys: append([]string(nil), component.Migration.EnvironmentKeys...), EvidenceDigest: component.MigrationFingerprint,
+				Approval: deploymentplans.MigrationApproval{Status: deploymentplans.MigrationApprovalPending},
+			}
 		}
 	}
 	if migrationCount > 1 || (migrationCount == 0 && body.MigrationCommand != "") {
@@ -396,7 +400,11 @@ func contractDeploymentPlanRevision(value deploymentplans.DeploymentPlanRevision
 		result.FieldProvenance = append(result.FieldProvenance, apicontract.DeploymentPlanFieldProvenance{Field: field.Field, Origin: string(field.Origin), Confidence: field.Confidence, Evidence: append([]string(nil), field.Evidence...)})
 	}
 	if value.Plan.Migration != nil {
-		result.Migration = apicontract.DeploymentPlanMigration{Present: true, Command: value.Plan.Migration.Command, EvidenceDigest: value.Plan.Migration.EvidenceDigest, ApprovalStatus: string(value.Plan.Migration.Approval.Status), ApprovedBy: value.Plan.Migration.Approval.ActorID, ApprovedAt: value.Plan.Migration.Approval.At}
+		result.Migration = apicontract.DeploymentPlanMigration{
+			Present: true, ComponentName: value.Plan.Migration.ComponentName, RootDirectory: value.Plan.Migration.RootDirectory,
+			Command: value.Plan.Migration.Command, EnvironmentKeys: append([]string(nil), value.Plan.Migration.EnvironmentKeys...), EvidenceDigest: value.Plan.Migration.EvidenceDigest,
+			ApprovalStatus: string(value.Plan.Migration.Approval.Status), ApprovedBy: value.Plan.Migration.Approval.ActorID, ApprovedAt: value.Plan.Migration.Approval.At,
+		}
 	} else {
 		result.Migration = apicontract.DeploymentPlanMigration{Present: false}
 	}

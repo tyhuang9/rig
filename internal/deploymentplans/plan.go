@@ -108,9 +108,12 @@ type FieldProvenance struct {
 // Migration is protected plan content. Its approval is independent from plan
 // acceptance; a later runtime must require Approved before running it.
 type Migration struct {
-	Command        string            `json:"command"`
-	EvidenceDigest string            `json:"evidenceDigest"`
-	Approval       MigrationApproval `json:"approval"`
+	ComponentName   string            `json:"componentName,omitempty"`
+	RootDirectory   string            `json:"rootDirectory,omitempty"`
+	Command         string            `json:"command"`
+	EnvironmentKeys []string          `json:"environmentKeys,omitempty"`
+	EvidenceDigest  string            `json:"evidenceDigest"`
+	Approval        MigrationApproval `json:"approval"`
 }
 
 type MigrationApproval struct {
@@ -163,6 +166,10 @@ func CanonicalDigest(plan Plan) (string, error) {
 }
 
 func canonicalPlan(plan Plan) (Plan, error) {
+	return canonicalPlanWithLegacyMigration(plan, false)
+}
+
+func canonicalPlanWithLegacyMigration(plan Plan, allowLegacyMigration bool) (Plan, error) {
 	if plan.Strategy != StrategyGeneratedNode && plan.Strategy != StrategyCompose {
 		return Plan{}, invalid("strategy", "Must be generated_node or compose")
 	}
@@ -209,11 +216,38 @@ func canonicalPlan(plan Plan) (Plan, error) {
 		if ValidateCommand(result.Migration.Command) != nil || !validDigest(result.Migration.EvidenceDigest) {
 			return Plan{}, invalid("migration", "Migration command and evidence digest are required")
 		}
+		if result.Migration.ComponentName == "" || result.Migration.RootDirectory == "" {
+			if !allowLegacyMigration || result.Migration.ComponentName != "" || result.Migration.RootDirectory != "" || len(result.Migration.EnvironmentKeys) != 0 {
+				return Plan{}, invalid("migration", "Migration must be bound to one component and root directory")
+			}
+		} else {
+			component, exists := componentByName(result.Components, result.Migration.ComponentName)
+			if !exists || component.RootDirectory != result.Migration.RootDirectory {
+				return Plan{}, invalid("migration", "Migration component and root directory must match the accepted component")
+			}
+			keys := append([]string(nil), result.Migration.EnvironmentKeys...)
+			sort.Strings(keys)
+			for index, key := range keys {
+				if key != "DATABASE_URL" || (index > 0 && keys[index-1] == key) {
+					return Plan{}, invalid("migration", "Migration environment keys must use the supported explicit allowlist")
+				}
+			}
+			result.Migration.EnvironmentKeys = keys
+		}
 		if result.Migration.Approval.Status != MigrationApprovalPending || result.Migration.Approval.ActorID != "" || result.Migration.Approval.At != "" {
 			return Plan{}, invalid("migration", "Migration approval is granted only through its explicit approval operation")
 		}
 	}
 	return result, nil
+}
+
+func componentByName(components []Component, name string) (Component, bool) {
+	for _, component := range components {
+		if component.Name == name {
+			return component, true
+		}
+	}
+	return Component{}, false
 }
 
 func supportedRole(value string) bool { return value == "server" || value == "static" }

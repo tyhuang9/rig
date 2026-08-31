@@ -89,7 +89,7 @@ func TestDeploymentPlanMigrationApprovalIsSeparateAndCASProtected(t *testing.T) 
 			"dependencies":{"express":"5","prisma":"6"}
 		}`,
 		"package-lock.json":    `{"lockfileVersion":3}`,
-		"prisma/schema.prisma": `model App { id Int @id }`,
+		"prisma/schema.prisma": `datasource db { provider = "postgresql" url = env("DATABASE_URL") } model App { id Int @id }`,
 	})
 	inspection := inspectLocalProject(t, handler, session, source)
 	candidate := inspection.Analysis.Candidates[0]
@@ -114,7 +114,7 @@ func TestDeploymentPlanMigrationApprovalIsSeparateAndCASProtected(t *testing.T) 
 	if err := json.Unmarshal(saved.Body.Bytes(), &revision); err != nil {
 		t.Fatal(err)
 	}
-	if !revision.Migration.Present || revision.Migration.ApprovalStatus != "pending" {
+	if !revision.Migration.Present || revision.Migration.ApprovalStatus != "pending" || revision.Migration.ComponentName != component.ID || revision.Migration.RootDirectory != "." || len(revision.Migration.EnvironmentKeys) != 1 || revision.Migration.EnvironmentKeys[0] != "DATABASE_URL" {
 		t.Fatalf("migration was not pending: %#v", revision.Migration)
 	}
 	approval := apicontract.ApproveDeploymentPlanMigrationRequest{RevisionID: revision.RevisionID, RevisionNumber: revision.RevisionNumber, ExpectedApprovalRevision: 0}

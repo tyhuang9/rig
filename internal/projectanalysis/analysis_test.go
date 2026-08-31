@@ -314,6 +314,26 @@ func TestAnalyzeDoesNotInferUndeclaredOrAmbiguousMigrationCLI(t *testing.T) {
 	})
 }
 
+func TestAnalyzeAllowsOnlyEvidencedDatabaseURLForMigration(t *testing.T) {
+	withDatabaseURL := analyzeMemory(t, memoryReader{
+		"package.json":         []byte(`{"scripts":{"start":"node server.js"},"dependencies":{"express":"5","prisma":"6"}}`),
+		"package-lock.json":    []byte(`{"lockfileVersion":3}`),
+		"prisma/schema.prisma": []byte(`datasource db { provider = "postgresql" url = env("DATABASE_URL") }`),
+	}).Candidates[0].Components[0].Migration
+	if withDatabaseURL == nil || !slices.Equal(withDatabaseURL.EnvironmentKeys, []string{"DATABASE_URL"}) {
+		t.Fatalf("evidenced environment keys = %#v", withDatabaseURL)
+	}
+
+	withoutDatabaseURL := analyzeMemory(t, memoryReader{
+		"package.json":         []byte(`{"scripts":{"start":"node server.js"},"dependencies":{"express":"5","prisma":"6"}}`),
+		"package-lock.json":    []byte(`{"lockfileVersion":3}`),
+		"prisma/schema.prisma": []byte(`model App { id Int @id }`),
+	}).Candidates[0].Components[0].Migration
+	if withoutDatabaseURL == nil || len(withoutDatabaseURL.EnvironmentKeys) != 0 {
+		t.Fatalf("unevidenced environment keys = %#v", withoutDatabaseURL)
+	}
+}
+
 func TestAnalyzeIsByteStableAcrossInputOrder(t *testing.T) {
 	contents := memoryReader{
 		"package.json":      []byte(`{"scripts":{"build":"vite build"},"dependencies":{"vite":"6"}}`),

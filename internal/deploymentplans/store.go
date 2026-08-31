@@ -3,7 +3,9 @@ package deploymentplans
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -26,6 +28,8 @@ type bundle struct {
 	Version  int                    `json:"version"`
 	Revision DeploymentPlanRevision `json:"revision"`
 }
+
+const currentBundleVersion = 2
 
 type Store struct {
 	db                *sql.DB
@@ -134,7 +138,7 @@ func (s *Store) Replace(ctx context.Context, appID, actorID string, input Replac
 	number := current + 1
 	now := s.now().UTC().Format(time.RFC3339Nano)
 	revision := DeploymentPlanRevision{ID: id, AppID: appID, RevisionNumber: number, Plan: canonical, CanonicalDigest: digest, RevisedBy: actorID, RevisedAt: now, AcceptedBy: actorID, AcceptedAt: now, State: RevisionAccepted}
-	plaintext, err := json.Marshal(bundle{Version: 1, Revision: revision})
+	plaintext, err := json.Marshal(bundle{Version: currentBundleVersion, Revision: revision})
 	if err != nil || len(plaintext) > maxBundleBytes {
 		return DeploymentPlanRevision{}, invalid("plan", "Deployment plan is too large")
 	}
@@ -268,12 +272,18 @@ func (s *Store) readRevision(ctx context.Context, appID, id string, number int64
 	if err := decoder.Decode(&stored); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return DeploymentPlanRevision{}, errors.New("invalid deployment plan bundle")
 	}
-	canonical, err := canonicalPlan(stored.Revision.Plan)
+	if stored.Version != 1 && stored.Version != currentBundleVersion {
+		return DeploymentPlanRevision{}, errors.New("unsupported deployment plan bundle version")
+	}
+	canonical, err := canonicalPlanWithLegacyMigration(stored.Revision.Plan, stored.Version == 1)
 	if err != nil {
 		return DeploymentPlanRevision{}, err
 	}
 	computed, err := CanonicalDigest(canonical)
-	if err != nil || stored.Version != 1 || stored.Revision.ID != id || stored.Revision.AppID != appID || stored.Revision.RevisionNumber != number || stored.Revision.CanonicalDigest != computed || digest != computed || string(canonical.Strategy) != strategy || canonical.Detector.Name != detector || canonical.Detector.Version != detectorVersion || canonical.Detector.SourceStructuralFingerprint != structuralFingerprint || canonical.Source.Provider != sourceProvider || canonical.Source.RepositoryID != sourceRepositoryID || canonical.Source.ResolvedDigest != sourceDigest || len(canonical.Components) != componentCount || len(canonical.FieldProvenance) != fieldCount || migrationEvidenceDigest(canonical.Migration) != migrationDigest || stored.Revision.RevisedBy != revisedBy || stored.Revision.RevisedAt != revisedAt || stored.Revision.AcceptedBy != acceptedBy || stored.Revision.AcceptedAt != acceptedAt || status != string(RevisionAccepted) {
+	if stored.Version == 1 && canonical.Migration != nil && canonical.Migration.ComponentName == "" {
+		computed, err = canonicalDigestLegacy(canonical)
+	}
+	if err != nil || stored.Revision.ID != id || stored.Revision.AppID != appID || stored.Revision.RevisionNumber != number || stored.Revision.CanonicalDigest != computed || digest != computed || string(canonical.Strategy) != strategy || canonical.Detector.Name != detector || canonical.Detector.Version != detectorVersion || canonical.Detector.SourceStructuralFingerprint != structuralFingerprint || canonical.Source.Provider != sourceProvider || canonical.Source.RepositoryID != sourceRepositoryID || canonical.Source.ResolvedDigest != sourceDigest || len(canonical.Components) != componentCount || len(canonical.FieldProvenance) != fieldCount || migrationEvidenceDigest(canonical.Migration) != migrationDigest || stored.Revision.RevisedBy != revisedBy || stored.Revision.RevisedAt != revisedAt || stored.Revision.AcceptedBy != acceptedBy || stored.Revision.AcceptedAt != acceptedAt || status != string(RevisionAccepted) {
 		return DeploymentPlanRevision{}, errors.New("deployment plan bundle metadata mismatch")
 	}
 	stored.Revision.Plan = canonical
@@ -294,6 +304,15 @@ func (s *Store) readRevision(ctx context.Context, appID, id string, number int64
 		stored.Revision.State = RevisionAccepted
 	}
 	return stored.Revision, nil
+}
+
+func canonicalDigestLegacy(plan Plan) (string, error) {
+	body, err := json.Marshal(plan)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // Recover validates every referenced bundle and deletes only recognized

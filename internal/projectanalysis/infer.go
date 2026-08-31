@@ -678,12 +678,29 @@ func inferMigration(source snapshot, pkg packageFile, manager PackageManager, co
 			evidence = append(evidence, Evidence{Code: "migration_input", Path: file.Path})
 		}
 		command := packageExecCommand(manager.Name, matched.kind.command)
+		environmentKeys := migrationEnvironmentKeys(matched.files, source.contents)
 		return &Command{
 			Origin: OriginInferred, Phase: "migrate", Command: command, WorkingDirectory: pkg.dir,
-			Provenance: ProvenanceFrameworkDefault, Confidence: ConfidenceHigh, Evidence: evidence,
+			EnvironmentKeys: environmentKeys,
+			Provenance:      ProvenanceFrameworkDefault, Confidence: ConfidenceHigh, Evidence: evidence,
 		}, fileFingerprint("rig-migration-v1", matched.files, source.contents), nil, nil
 	}
 	return nil, "", nil, nil
+}
+
+func migrationEnvironmentKeys(files []File, contents map[string][]byte) []string {
+	for _, file := range files {
+		body := string(contents[file.Path])
+		for _, marker := range []string{
+			`env("DATABASE_URL")`, `env('DATABASE_URL')`,
+			`process.env.DATABASE_URL`, `process.env["DATABASE_URL"]`, `process.env['DATABASE_URL']`,
+		} {
+			if strings.Contains(body, marker) {
+				return []string{"DATABASE_URL"}
+			}
+		}
+	}
+	return nil
 }
 
 func migrationFiles(files []File, root, kind string) []File {
