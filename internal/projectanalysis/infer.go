@@ -106,11 +106,13 @@ func javascriptCandidates(source snapshot) []DeploymentPlanCandidate {
 		if len(valid) == 1 {
 			return append(invalid, inferJavaScriptPlan(source, valid[0], []packageFile{valid[0]}, false))
 		}
-		plan := inferJavaScriptPlan(source, valid[0], valid, true)
-		plan.Findings = append(plan.Findings, Finding{Code: "ambiguous_package_roots", Severity: "error", Message: "Multiple package roots were found without a root workspace manifest."})
-		plan.MissingFields = append(plan.MissingFields, "workspace.root")
-		plan.Status = StatusNeedsInput
-		return append(invalid, plan)
+		plans := append([]DeploymentPlanCandidate{}, invalid...)
+		for _, pkg := range valid {
+			plan := inferJavaScriptPlan(source, pkg, []packageFile{pkg}, false)
+			plan.Evidence = append(plan.Evidence, Evidence{Code: "candidate_root", Path: pkg.path, Detail: "Choose this project root to deploy it independently."})
+			plans = append(plans, plan)
+		}
+		return plans
 	}
 
 	root := valid[rootIndex]

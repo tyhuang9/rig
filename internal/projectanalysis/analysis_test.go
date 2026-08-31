@@ -180,6 +180,29 @@ func TestAnalyzeNeedsInputForAmbiguousAPIsAndMissingStart(t *testing.T) {
 	}
 }
 
+func TestAnalyzeOffersIndependentCandidatesForUndeclaredRoots(t *testing.T) {
+	got := analyzeMemory(t, memoryReader{
+		"apps/api/package.json":      []byte(`{"scripts":{"start":"node index.js"},"dependencies":{"express":"5"}}`),
+		"apps/api/package-lock.json": []byte(`{"lockfileVersion":3}`),
+		"apps/web/package.json":      []byte(`{"scripts":{"build":"vite build"},"dependencies":{"vite":"6"}}`),
+		"apps/web/package-lock.json": []byte(`{"lockfileVersion":3}`),
+	})
+	if len(got.Candidates) != 2 {
+		t.Fatalf("candidates = %#v", got.Candidates)
+	}
+	api := got.Candidates[0]
+	web := got.Candidates[1]
+	if api.RootDirectory != "apps/api" || web.RootDirectory != "apps/web" {
+		t.Fatalf("candidate roots = %q / %q", api.RootDirectory, web.RootDirectory)
+	}
+	if slices.Contains(api.MissingFields, "workspace.root") || slices.Contains(web.MissingFields, "workspace.root") {
+		t.Fatalf("root choice was not represented by candidates: %#v", got.Candidates)
+	}
+	if web.Status != StatusReady || api.Status != StatusNeedsInput {
+		t.Fatalf("candidate status = %q / %q", api.Status, web.Status)
+	}
+}
+
 func TestAnalyzeDetectsContainerCandidates(t *testing.T) {
 	got := analyzeMemory(t, memoryReader{
 		"compose.yaml": []byte("services: {}\n"),
