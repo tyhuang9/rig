@@ -1,0 +1,20 @@
+{
+  "name": "rig-documentation",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "vitepress dev .",
+    "build": "vitepress build .",
+    "check:workflow": "node scripts/check-pages-workflow.mjs",
+    "check:accessibility": "node scripts/check-accessibility.mjs",
+    "preview": "vitepress preview ."
+  },
+  "devDependencies": {
+    "vitepress": "1.6.4"
+  }
+}
