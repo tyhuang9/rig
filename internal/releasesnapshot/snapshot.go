@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -745,13 +746,25 @@ func (m *Materializer) validateMaterializedWorkspace(ctx context.Context, releas
 		return &Error{Code: "deployment_plan_review_required"}
 	}
 	inspection, err := sourceinspection.InspectLocalContext(ctx, workspace)
-	if err != nil || !hasGeneratedAnalysis(inspection.Analysis) {
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	}
+	if !hasGeneratedAnalysis(inspection.Analysis) {
 		return &Error{Code: "deployment_plan_review_required"}
 	}
 	var strategy, detectorVersion, fingerprint, provider, sourceDigest string
 	var repositoryID int64
 	err = m.db.QueryRowContext(ctx, `SELECT strategy,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest FROM deployment_plan_revisions WHERE id=? AND app_id=? AND revision_number=? AND acceptance_status='accepted'`, release.DeploymentPlanRevisionID, release.AppID, release.DeploymentPlanRevisionNumber).Scan(&strategy, &detectorVersion, &fingerprint, &provider, &repositoryID, &sourceDigest)
-	if err != nil || strategy != "generated_node" || detectorVersion != projectanalysis.SchemaVersion || fingerprint != inspection.Analysis.StructuralFingerprint || provider != release.SourceProvider || repositoryID != release.RepositoryID {
+	if errors.Is(err, sql.ErrNoRows) {
+		return &Error{Code: "deployment_plan_review_required"}
+	}
+	if err != nil {
+		return fmt.Errorf("%w: deployment plan lookup", errLocal)
+	}
+	if strategy != "generated_node" || detectorVersion != projectanalysis.SchemaVersion || fingerprint != inspection.Analysis.StructuralFingerprint || provider != release.SourceProvider || repositoryID != release.RepositoryID {
 		return &Error{Code: "deployment_plan_review_required"}
 	}
 	if provider == "local" && sourceDigest != inspection.Analysis.StructuralFingerprint {

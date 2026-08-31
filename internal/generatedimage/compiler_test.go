@@ -42,9 +42,10 @@ func (r compilerPlanReader) GetRevision(context.Context, string, string, int64) 
 }
 
 type compilerArtifactWriter struct {
-	artifact Artifact
-	failed   DiagnosticCode
-	canceled bool
+	artifact    Artifact
+	failed      DiagnosticCode
+	canceled    bool
+	completeErr error
 }
 
 func (w *compilerArtifactWriter) Begin(_ context.Context, input BeginArtifactInput) (Artifact, bool, error) {
@@ -57,6 +58,9 @@ func (w *compilerArtifactWriter) Begin(_ context.Context, input BeginArtifactInp
 }
 
 func (w *compilerArtifactWriter) Complete(_ context.Context, id, imageID string) (Artifact, error) {
+	if w.completeErr != nil {
+		return Artifact{}, w.completeErr
+	}
 	if id != w.artifact.ID {
 		return Artifact{}, errors.New("wrong artifact")
 	}
@@ -200,6 +204,18 @@ func TestCompilerFailsClosedWhenOwnedBuilderIsUnavailable(t *testing.T) {
 	_, err = fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
 	if !IsCompileCode(err, string(DiagnosticRuntimeUnavailable)) || fixture.artifacts.failed != DiagnosticRuntimeUnavailable {
 		t.Fatalf("builder runtime result = %v, diagnostic = %q", err, fixture.artifacts.failed)
+	}
+}
+
+func TestCompilerTerminalizesAttemptWhenCompletionPersistenceFails(t *testing.T) {
+	fixture := newCompilerFixture(t)
+	fixture.artifacts.completeErr = errors.New("database unavailable")
+	fixture.runner.run = func(request runtimeprocess.CommandRequest) error {
+		return os.WriteFile(flagValue(t, request.Args, "--iidfile"), []byte("sha256:"+strings.Repeat("2", 64)), 0o600)
+	}
+	_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+	if !IsCompileCode(err, string(DiagnosticInternalError)) || fixture.artifacts.failed != DiagnosticInternalError || fixture.artifacts.artifact.State != ArtifactFailed {
+		t.Fatalf("completion persistence result = %v, artifact = %#v", err, fixture.artifacts.artifact)
 	}
 }
 

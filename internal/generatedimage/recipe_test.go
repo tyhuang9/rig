@@ -39,6 +39,10 @@ func TestDefinitionAndRecipeAreDeterministicAndCommandSafe(t *testing.T) {
 	if !strings.Contains(first.baseImage, "@sha256:") || !strings.HasPrefix(first.baseImage, "node:22-bookworm-slim@") {
 		t.Fatalf("base image is not digest pinned: %q", first.baseImage)
 	}
+	_, imageDigest, found := strings.Cut(first.baseImage, "@sha256:")
+	if !found || !lowerHex(imageDigest, 64) {
+		t.Fatalf("base image digest is malformed: %q", first.baseImage)
+	}
 	recipe := containerfile(true, true, first.baseImage)
 	for _, required := range []string{"USER node", "ENTRYPOINT", "--mount=type=secret,id=rig-install-command", "--mount=type=secret,id=rig-build-command", "corepack"} {
 		if !strings.Contains(recipe, required) {

@@ -229,7 +229,7 @@ func (c *Compiler) build(ctx context.Context, appID string, release releasesnaps
 	}
 	completed, err := c.artifacts.Complete(ctx, artifact.ID, imageID)
 	if err != nil {
-		return Artifact{}, &CompileError{Code: "internal_error"}
+		return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticInternalError)
 	}
 	return completed, nil
 }
