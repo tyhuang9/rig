@@ -113,6 +113,9 @@ func InspectGitHub(ctx context.Context, reader GitHubReader, owner string, sourc
 		return Result{}, projectAnalysisError(err)
 	}
 	selected, findings := selectCompose(composePath, result.ComposeCandidates, blobs)
+	if composePath == "" && hasGeneratedCandidate(result.Analysis) {
+		selected, findings = "", nil
+	}
 	result.Findings = append(result.Findings, findings...)
 	if selected == "" {
 		return result, nil
@@ -208,6 +211,9 @@ func InspectLocalContext(ctx context.Context, sourcePath string) (Result, error)
 	}
 	if selected == "" {
 		selected, result.Findings = selectCompose("", result.ComposeCandidates, nil)
+		if hasGeneratedCandidate(result.Analysis) {
+			selected, result.Findings = "", nil
+		}
 	} else {
 		result.Source.ComposePath = filepath.ToSlash(selected)
 	}
@@ -224,6 +230,15 @@ func InspectLocalContext(ctx context.Context, sourcePath string) (Result, error)
 	}
 	result.Services, result.Findings = inspectCompose(contents, result.Source.ComposePath)
 	return result, nil
+}
+
+func hasGeneratedCandidate(analysis projectanalysis.SourceAnalysis) bool {
+	for _, candidate := range analysis.Candidates {
+		if candidate.Kind == projectanalysis.PlanKindJavaScript && candidate.Status != projectanalysis.StatusUnsupported && len(candidate.Components) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 type githubProjectReader struct {

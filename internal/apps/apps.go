@@ -149,7 +149,7 @@ func validateSource(source *Source) error {
 		}
 		return nil
 	}
-	if source.Type != SourceGitHub || source.Path != "" || !lowerHex(source.ConnectionID, 32) || source.InstallationID < 1 || source.RepositoryID < 1 || source.RepositoryOwner == "" || source.RepositoryName == "" || source.TrackedBranch == "" || source.TrackedRef != "refs/heads/"+source.TrackedBranch || !normalizedRepositoryPath(source.ComposePath) || !lowerHex(source.ResolvedSHA, 40) {
+	if source.Type != SourceGitHub || source.Path != "" || !lowerHex(source.ConnectionID, 32) || source.InstallationID < 1 || source.RepositoryID < 1 || source.RepositoryOwner == "" || source.RepositoryName == "" || source.TrackedBranch == "" || source.TrackedRef != "refs/heads/"+source.TrackedBranch || (source.ComposePath != "" && !normalizedRepositoryPath(source.ComposePath)) || !lowerHex(source.ResolvedSHA, 40) {
 		return errors.New("invalid GitHub source")
 	}
 	return nil

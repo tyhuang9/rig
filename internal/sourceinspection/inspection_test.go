@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/hostd/hostd/internal/githubapp"
@@ -154,8 +155,8 @@ func TestInspectLocalInfersJavaScriptProjectWithoutExecutingIt(t *testing.T) {
 	if len(result.Analysis.Candidates) != 1 || result.Analysis.Candidates[0].Status != "ready" || result.Analysis.StructuralFingerprint == "" {
 		t.Fatalf("analysis=%#v", result.Analysis)
 	}
-	if !hasFinding(result.Findings, "compose_not_found") {
-		t.Fatalf("legacy Compose finding missing: %#v", result.Findings)
+	if len(result.Findings) != 0 || result.Source.ComposePath != "" {
+		t.Fatalf("generated candidate was forced through Compose selection: %#v", result)
 	}
 }
 
@@ -175,8 +176,11 @@ func TestInspectGitHubInfersJavaScriptMetadataWithoutCompose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Analysis.Candidates) != 1 || result.Analysis.Candidates[0].Status != "ready" || reader.contentReads != 1 {
+	if len(result.Analysis.Candidates) != 1 || result.Analysis.Candidates[0].Status != "needs_input" || reader.contentReads != 1 {
 		t.Fatalf("analysis=%#v reads=%d", result.Analysis, reader.contentReads)
+	}
+	if !slices.Contains(result.Analysis.Candidates[0].MissingFields, "components.app.internal_port") || !slices.Contains(result.Analysis.Candidates[0].MissingFields, "components.app.health_probe") {
+		t.Fatalf("server review fields=%#v", result.Analysis.Candidates[0].MissingFields)
 	}
 }
 
