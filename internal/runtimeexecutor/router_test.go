@@ -2,6 +2,7 @@ package runtimeexecutor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -119,5 +120,6 @@ func generatedPlan() deploymentplans.DeploymentPlanRevision {
 }
 
 func routerJob(releaseID string) jobs.Job {
-	return jobs.Job{ID: routerJobID, Type: "deploy", ResourceType: "application", ResourceID: routerAppID, RequestedBy: routerActorID, Attempt: 1, Input: jobs.DeploymentInput{ReleaseID: releaseID, ConfigurationMode: jobs.ConfigurationCurrent}}
+	input, _ := json.Marshal(jobs.DeploymentInput{ReleaseID: releaseID, ConfigurationMode: jobs.ConfigurationCurrent})
+	return jobs.Job{ID: routerJobID, Type: "deploy", ResourceType: "application", ResourceID: routerAppID, RequestedBy: routerActorID, Attempt: 1, Input: input}
 }
