@@ -66,6 +66,9 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 		}
 		return runtimeprocess.CommandResult{}, nil
 	}
+	if len(args) == 6 && args[0] == "container" && args[1] == "exec" && args[3] == "sh" && args[4] == "-c" && args[5] == capacityProbeCommand {
+		return runtimeprocess.CommandResult{Stdout: []byte("2147483648 8589934592\n")}, nil
+	}
 	if len(args) >= 4 && args[0] == "container" && args[1] == "exec" {
 		return runtimeprocess.CommandResult{}, nil
 	}
@@ -125,6 +128,29 @@ func TestSwitchReloadFailureRollsBackFirstDeploymentAndClearsPendingState(t *tes
 	}
 	if reloads != 2 {
 		t.Fatalf("reload attempts = %d, want proposed plus rollback", reloads)
+	}
+}
+
+func TestProvisionAndCapacitySnapshotUsePinnedDockerDataPlane(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	if err := manager.Provision(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.MemoryAvailableBytes != 2147483648 || snapshot.DiskAvailableBytes != 8589934592 {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+	foundProbe := false
+	for _, command := range runner.commands {
+		if len(command) == 6 && command[3] == "sh" && command[5] == capacityProbeCommand {
+			foundProbe = true
+		}
+	}
+	if !foundProbe {
+		t.Fatal("capacity did not execute the fixed in-container probe")
 	}
 }
 

@@ -162,6 +162,13 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 // Recover rolls back an uncertain pending switch to the last committed route,
 // then reapplies the committed aggregate config and restart file.
 func (m *Manager) Recover(ctx context.Context) error {
+	return m.Provision(ctx)
+}
+
+// Provision creates or verifies the pinned Caddy boundary and reapplies its
+// committed routes. Startup calls it before generated deployment workers so
+// capacity checks can query the Docker VM through this exact container.
+func (m *Manager) Provision(ctx context.Context) error {
 	if m == nil || ctx == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
@@ -175,9 +182,6 @@ func (m *Manager) Recover(ctx context.Context) error {
 		if err := m.rollbackPending(ctx, &state); err != nil {
 			return err
 		}
-	}
-	if len(state.Active) == 0 {
-		return nil
 	}
 	if err := m.ensureCaddy(ctx, state.Active); err != nil {
 		return err
