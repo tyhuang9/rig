@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,6 +21,7 @@ import (
 const (
 	caddyContainerName = "rig-generated-caddy-v1"
 	caddyVolumeName    = "rig-generated-caddy-config-v1"
+	caddyNetworkName   = "rig-generated-caddy-ingress-v1"
 	caddyImage         = "caddy@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
 	caddyImageDigest   = "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
 	defaultHostPort    = uint16(8080)
@@ -42,11 +44,12 @@ type Options struct {
 }
 
 type Manager struct {
-	runner    runtimeprocess.CommandRunner
-	store     *stateStore
-	options   Options
-	dockerEnv []string
-	mu        sync.Mutex
+	runner                   runtimeprocess.CommandRunner
+	store                    *stateStore
+	options                  Options
+	dockerEnv                []string
+	workingDirectoryIdentity os.FileInfo
+	mu                       sync.Mutex
 }
 
 func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error) {
@@ -76,13 +79,17 @@ func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error)
 	if err != nil {
 		return nil, err
 	}
-	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv}, nil
+	workingDirectoryIdentity, err := os.Lstat(options.WorkingDirectory)
+	if err != nil {
+		return nil, err
+	}
+	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv, workingDirectoryIdentity: workingDirectoryIdentity}, nil
 }
 
 // Switch atomically reloads the aggregate Caddy route set, durably records the
-// new active route, installs it as Caddy's restart configuration, and then
-// waits for the requested bounded drain period. It never stops application
-// containers; the deployment coordinator owns that final step.
+// new active route, and installs it as Caddy's restart configuration. It never
+// stops application containers or waits for connection draining; the
+// deployment coordinator owns those post-commit operations.
 func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwitchRequest) error {
 	if m == nil || ctx == nil || !validSwitchRequest(request) {
 		return &Error{Code: DiagnosticValidationFailed}
@@ -102,6 +109,9 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 	previous, hadPrevious := state.Active[request.AppID]
 	committedRoutes := cloneRoutes(state.Active)
 	proposed := routeRecord{Slot: request.ToSlot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), request.Endpoints...)}
+	if hadPrevious && sameRoute(previous, proposed) {
+		return m.ensureCaddy(ctx, state.Active)
+	}
 	if request.FromSlot == "" {
 		if hadPrevious {
 			return &Error{Code: DiagnosticRouteInvalid}
@@ -116,15 +126,8 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 	if err := m.verifyEndpoints(ctx, request.AppID, proposed); err != nil {
 		return err
 	}
-	if err := m.connectAppNetwork(ctx, request.AppID, proposed.Endpoints[0].NetworkName); err != nil {
-		return err
-	}
-
 	updated := cloneRoutes(state.Active)
 	updated[request.AppID] = proposed
-	if err := m.verifyCaddyNetworks(ctx, updated); err != nil {
-		return err
-	}
 	state.Pending = &pendingRoute{AppID: request.AppID, Proposed: proposed}
 	if hadPrevious {
 		copy := previous
@@ -133,6 +136,9 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 	}
 	if err := m.store.save(state); err != nil {
 		return &Error{Code: DiagnosticRouteStateFailed}
+	}
+	if err := m.reconcileCaddyNetworks(ctx, updated); err != nil {
+		return m.rollbackAfterFailure(err, &state)
 	}
 	if err := m.applyRoutes(ctx, updated, "proposed.json"); err != nil {
 		return m.rollbackAfterFailure(err, &state)
@@ -146,15 +152,6 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 	}
 	if err := m.installRestartConfig(context.WithoutCancel(ctx)); err != nil {
 		return &Error{Code: DiagnosticRouteUnresolved}
-	}
-	if request.DrainPeriod > 0 {
-		timer := time.NewTimer(request.DrainPeriod)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			return &Error{Code: DiagnosticCancelled}
-		}
 	}
 	return nil
 }
@@ -186,12 +183,7 @@ func (m *Manager) Provision(ctx context.Context) error {
 	if err := m.ensureCaddy(ctx, state.Active); err != nil {
 		return err
 	}
-	for appID, route := range state.Active {
-		if err := m.connectAppNetwork(ctx, appID, route.Endpoints[0].NetworkName); err != nil {
-			return err
-		}
-	}
-	if err := m.verifyCaddyNetworks(ctx, state.Active); err != nil {
+	if err := m.reconcileCaddyNetworks(ctx, state.Active); err != nil {
 		return err
 	}
 	if err := m.applyRoutes(ctx, state.Active, "recovery.json"); err != nil {
@@ -212,6 +204,9 @@ func (m *Manager) rollbackPending(ctx context.Context, state *routeState) error 
 	if err := m.ensureCaddy(rollbackCtx, state.Active); err != nil {
 		return &Error{Code: DiagnosticRouteUnresolved}
 	}
+	if err := m.reconcileCaddyNetworks(rollbackCtx, state.Active); err != nil {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
 	if err := m.applyRoutes(rollbackCtx, state.Active, "rollback.json"); err != nil {
 		return &Error{Code: DiagnosticRouteUnresolved}
 	}
@@ -225,6 +220,9 @@ func (m *Manager) rollbackPending(ctx context.Context, state *routeState) error 
 func (m *Manager) rollbackAfterFailure(original error, state *routeState) error {
 	rollbackCtx, cancel := context.WithTimeout(context.Background(), m.options.CommandTimeout*3)
 	defer cancel()
+	if err := m.reconcileCaddyNetworks(rollbackCtx, state.Active); err != nil {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
 	if err := m.applyRoutes(rollbackCtx, state.Active, "rollback.json"); err != nil {
 		return &Error{Code: DiagnosticRouteUnresolved}
 	}
@@ -243,12 +241,15 @@ func (m *Manager) ensureCaddy(ctx context.Context, routes map[string]routeRecord
 	if err := m.ensureVolume(ctx); err != nil {
 		return err
 	}
+	if err := m.ensureIngressNetwork(ctx); err != nil {
+		return err
+	}
 	inspection, found, err := m.inspectCaddy(ctx)
 	if err != nil {
 		return err
 	}
 	if !found {
-		if err := m.createCaddy(ctx, imageID, routes); err != nil {
+		if err := m.createCaddy(ctx, imageID); err != nil {
 			return err
 		}
 		inspection, found, err = m.inspectCaddy(ctx)
@@ -260,13 +261,32 @@ func (m *Manager) ensureCaddy(ctx context.Context, routes map[string]routeRecord
 		return &Error{Code: DiagnosticIngressDrift}
 	}
 	if !inspection.Running {
-		if _, err := m.run(ctx, m.options.CommandTimeout, "container", "start", caddyContainerName); err != nil {
+		if err := m.disconnectApplicationNetworks(ctx, inspection); err != nil {
+			return err
+		}
+		bootConfig, buildErr := buildCaddyConfig(map[string]routeRecord{}, "0.0.0.0:8080")
+		if buildErr != nil || m.copyConfig(ctx, bootConfig, "active.json") != nil {
 			return &Error{Code: DiagnosticIngressUnavailable}
 		}
-		inspection, found, err = m.inspectCaddy(ctx)
+		startErr := m.runDiscard(ctx, m.options.CommandTimeout, "container", "start", caddyContainerName)
+		reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.options.CommandTimeout)
+		inspection, found, err = m.inspectCaddy(reconcileCtx)
+		cancel()
 		if err != nil || !found || !inspection.Running || !validCaddyInspection(inspection, imageID, m.options.HostPort) {
+			if startErr != nil {
+				return startErr
+			}
 			return &Error{Code: DiagnosticIngressUnavailable}
 		}
+	}
+	if err := m.applyRoutes(ctx, routes, "recovery.json"); err != nil {
+		return err
+	}
+	if err := m.installRestartConfig(context.WithoutCancel(ctx)); err != nil {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	if err := m.reconcileCaddyNetworks(ctx, routes); err != nil {
+		return err
 	}
 	return nil
 }
@@ -277,11 +297,14 @@ func (m *Manager) ensureImage(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if !found {
-		if _, err := m.run(ctx, m.options.PullTimeout, "image", "pull", caddyImage); err != nil {
-			return "", &Error{Code: DiagnosticIngressUnavailable}
-		}
-		inspection, found, err = m.inspectImage(ctx)
+		pullErr := m.runDiscard(ctx, m.options.PullTimeout, "image", "pull", caddyImage)
+		reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.options.CommandTimeout)
+		inspection, found, err = m.inspectImage(reconcileCtx)
+		cancel()
 		if err != nil || !found {
+			if pullErr != nil {
+				return "", pullErr
+			}
 			return "", &Error{Code: DiagnosticIngressUnavailable}
 		}
 	}
@@ -297,28 +320,51 @@ func (m *Manager) ensureVolume(ctx context.Context) error {
 		return err
 	}
 	if !found {
-		if _, err := m.run(ctx, m.options.CommandTimeout, "volume", "create", "--driver", "local", "--label", "io.rig.managed=generated-ingress", "--label", "io.rig.identity-version=v1", caddyVolumeName); err != nil {
-			return &Error{Code: DiagnosticIngressUnavailable}
+		createErr := m.runDiscard(ctx, m.options.CommandTimeout, "volume", "create", "--driver", "local", "--label", "io.rig.managed=generated-ingress", "--label", "io.rig.identity-version=v1", caddyVolumeName)
+		reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.options.CommandTimeout)
+		inspection, found, err = m.inspectVolume(reconcileCtx)
+		cancel()
+		if (err != nil || !found) && createErr != nil {
+			return createErr
 		}
-		inspection, found, err = m.inspectVolume(ctx)
 	}
-	if err != nil || !found || inspection.Name != caddyVolumeName || inspection.Driver != "local" || inspection.Labels["io.rig.managed"] != "generated-ingress" || inspection.Labels["io.rig.identity-version"] != "v1" {
+	if err != nil || !found || inspection.Name != caddyVolumeName || inspection.Driver != "local" || inspection.Scope != "local" || len(inspection.Options) != 0 || inspection.Labels["io.rig.managed"] != "generated-ingress" || inspection.Labels["io.rig.identity-version"] != "v1" {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
 	return nil
 }
 
-func (m *Manager) createCaddy(ctx context.Context, imageID string, routes map[string]routeRecord) error {
-	args := []string{"container", "create", "--name", caddyContainerName, "--hostname", caddyContainerName, "--network", "none",
+func (m *Manager) ensureIngressNetwork(ctx context.Context) error {
+	inspection, found, err := m.inspectNetwork(ctx, caddyNetworkName)
+	if err != nil {
+		return err
+	}
+	if !found {
+		createErr := m.runDiscard(ctx, m.options.CommandTimeout, "network", "create", "--driver", "bridge", "--label", "io.rig.managed=generated-ingress-network", "--label", "io.rig.identity-version=v1", caddyNetworkName)
+		reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.options.CommandTimeout)
+		inspection, found, err = m.inspectNetwork(reconcileCtx, caddyNetworkName)
+		cancel()
+		if (err != nil || !found) && createErr != nil {
+			return createErr
+		}
+	}
+	if err != nil || !found || !validIngressNetwork(inspection) {
+		return &Error{Code: DiagnosticIngressDrift}
+	}
+	return nil
+}
+
+func (m *Manager) createCaddy(ctx context.Context, imageID string) error {
+	args := []string{"container", "create", "--name", caddyContainerName, "--hostname", caddyContainerName, "--network", caddyNetworkName,
 		"--mount", "type=volume,src=" + caddyVolumeName + ",dst=/config", "--user", "1000:1000", "--read-only",
 		"--tmpfs", "/data:rw,noexec,nosuid,nodev,size=67108864", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
 		"--memory", "268435456", "--memory-swap", "268435456", "--cpus", "1.000", "--pids-limit", "128", "--ulimit", "nofile=1024:1024",
 		"--publish", "127.0.0.1:" + strconv.FormatUint(uint64(m.options.HostPort), 10) + ":8080/tcp", "--restart", "unless-stopped",
 		"--log-driver", "local", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
 		"--env", "XDG_CONFIG_HOME=/config", "--env", "XDG_DATA_HOME=/data",
-		"--label", "io.rig.managed=generated-ingress", "--label", "io.rig.identity-version=v1",
+		"--label", "io.rig.managed=generated-ingress", "--label", "io.rig.identity-version=v1", "--label", "io.rig.listener-isolation=v1",
 		imageID, "run", "--config", "/config/active.json"}
-	_, createErr := m.run(ctx, m.options.CommandTimeout, args...)
+	createErr := m.runDiscard(ctx, m.options.CommandTimeout, args...)
 	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.options.CommandTimeout)
 	defer cancel()
 	inspection, found, inspectErr := m.inspectCaddy(reconcileCtx)
@@ -328,21 +374,30 @@ func (m *Manager) createCaddy(ctx context.Context, imageID string, routes map[st
 		}
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
-	config, err := buildCaddyConfig(routes)
+	config, err := buildCaddyConfig(map[string]routeRecord{}, "0.0.0.0:8080")
 	if err != nil {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
 	if err := m.copyConfig(reconcileCtx, config, "active.json"); err != nil {
 		return err
 	}
-	if _, err := m.run(reconcileCtx, m.options.CommandTimeout, "container", "start", caddyContainerName); err != nil {
+	startErr := m.runDiscard(reconcileCtx, m.options.CommandTimeout, "container", "start", caddyContainerName)
+	started, startedFound, inspectStartedErr := m.inspectCaddy(reconcileCtx)
+	if inspectStartedErr != nil || !startedFound || !started.Running || !validCaddyInspection(started, imageID, m.options.HostPort) {
+		if startErr != nil {
+			return startErr
+		}
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
 	return nil
 }
 
 func (m *Manager) applyRoutes(ctx context.Context, routes map[string]routeRecord, filename string) error {
-	config, err := buildCaddyConfig(routes)
+	listenAddress, err := m.caddyListenAddress(ctx)
+	if err != nil {
+		return err
+	}
+	config, err := buildCaddyConfig(routes, listenAddress)
 	if err != nil {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
@@ -350,24 +405,23 @@ func (m *Manager) applyRoutes(ctx context.Context, routes map[string]routeRecord
 		return err
 	}
 	containerPath := "/config/" + filename
-	if _, err := m.run(ctx, m.options.CommandTimeout, "container", "exec", caddyContainerName, "caddy", "validate", "--config", containerPath); err != nil {
+	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", caddyContainerName, "caddy", "validate", "--config", containerPath); err != nil {
 		return &Error{Code: DiagnosticRouteValidateFailed}
 	}
-	if _, err := m.run(ctx, m.options.CommandTimeout, "container", "exec", caddyContainerName, "caddy", "reload", "--config", containerPath); err != nil {
+	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", caddyContainerName, "caddy", "reload", "--config", containerPath); err != nil {
 		return &Error{Code: DiagnosticRouteReloadFailed}
 	}
-	if _, err := m.run(ctx, m.options.CommandTimeout, "container", "exec", caddyContainerName, "cp", containerPath, "/config/current.json"); err != nil {
+	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", "--user", "0:0", caddyContainerName, "cp", containerPath, "/config/current.json"); err != nil {
 		return &Error{Code: DiagnosticRouteReloadFailed}
 	}
 	return nil
 }
 
 func (m *Manager) installRestartConfig(ctx context.Context) error {
-	if _, err := m.run(ctx, m.options.CommandTimeout, "container", "exec", caddyContainerName, "cp", "/config/current.json", "/config/active.next.json"); err != nil {
+	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", "--user", "0:0", caddyContainerName, "cp", "/config/current.json", "/config/active.next.json"); err != nil {
 		return err
 	}
-	_, err := m.run(ctx, m.options.CommandTimeout, "container", "exec", caddyContainerName, "mv", "/config/active.next.json", "/config/active.json")
-	return err
+	return m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", "--user", "0:0", caddyContainerName, "mv", "/config/active.next.json", "/config/active.json")
 }
 
 func (m *Manager) copyConfig(ctx context.Context, contents []byte, filename string) error {
@@ -375,13 +429,16 @@ func (m *Manager) copyConfig(ctx context.Context, contents []byte, filename stri
 	if len(contents) == 0 || !validConfigFilename(filename) {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
+	if !m.validWorkingDirectory() {
+		return &Error{Code: DiagnosticIngressDrift}
+	}
 	file, err := os.CreateTemp(m.options.WorkingDirectory, ".rig-caddy-*.json")
 	if err != nil {
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
 	path := file.Name()
 	defer os.Remove(path)
-	if err := file.Chmod(0o600); err != nil {
+	if err := file.Chmod(0o644); err != nil {
 		file.Close()
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
@@ -389,55 +446,136 @@ func (m *Manager) copyConfig(ctx context.Context, contents []byte, filename stri
 		file.Close()
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
-	if _, err := m.run(ctx, m.options.CommandTimeout, "container", "cp", path, caddyContainerName+":/config/"+filename); err != nil {
+	fileInfo, err := os.Lstat(path)
+	if err != nil || !fileInfo.Mode().IsRegular() || fileInfo.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(path) || !m.validWorkingDirectory() {
+		return &Error{Code: DiagnosticIngressDrift}
+	}
+	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "cp", path, caddyContainerName+":/config/"+filename); err != nil {
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
 	return nil
 }
 
-func (m *Manager) connectAppNetwork(ctx context.Context, appID, network string) error {
-	if !validName(network, 96) {
-		return &Error{Code: DiagnosticRouteInvalid}
+func (m *Manager) caddyListenAddress(ctx context.Context) (string, error) {
+	inspection, found, err := m.inspectCaddy(ctx)
+	if err != nil || !found || !inspection.Running {
+		return "", &Error{Code: DiagnosticIngressUnavailable}
 	}
-	inspection, found, err := m.inspectNetwork(ctx, network)
-	if err != nil || !found || inspection.Name != network || inspection.Driver != "bridge" || inspection.Scope != "local" ||
-		inspection.Labels["io.rig.managed"] != "generated-runtime" || inspection.Labels["io.rig.application"] != appID {
-		return &Error{Code: DiagnosticIngressDrift}
+	attachment := inspection.Networks[caddyNetworkName]
+	if attachment == nil || net.ParseIP(attachment.IPAddress) == nil {
+		return "", &Error{Code: DiagnosticIngressDrift}
+	}
+	return net.JoinHostPort(attachment.IPAddress, "8080"), nil
+}
+
+func (m *Manager) reconcileCaddyNetworks(ctx context.Context, routes map[string]routeRecord) error {
+	desired, err := m.desiredNetworks(ctx, routes)
+	if err != nil {
+		return err
 	}
 	caddy, found, err := m.inspectCaddy(ctx)
-	if err != nil || !found {
+	if err != nil || !found || !validContainerID(caddy.ID) {
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
-	if _, exists := caddy.Networks[network]; !exists {
-		if _, err := m.run(ctx, m.options.CommandTimeout, "network", "connect", network, caddyContainerName); err != nil {
-			return &Error{Code: DiagnosticIngressUnavailable}
+	expectedID := normalizeID(caddy.ID)
+	for network := range caddy.Networks {
+		if _, keep := desired[network]; keep {
+			continue
 		}
-		caddy, found, err = m.inspectCaddy(ctx)
-		if err != nil || !found {
-			return &Error{Code: DiagnosticIngressUnavailable}
+		inspection, exists, inspectErr := m.inspectNetwork(ctx, network)
+		if inspectErr != nil || !exists || !validApplicationNetwork(inspection, inspection.Labels["io.rig.application"]) {
+			return &Error{Code: DiagnosticIngressDrift}
+		}
+		if err := m.runDiscard(ctx, m.options.CommandTimeout, "network", "disconnect", network, caddy.ID); err != nil {
+			refreshed, ok, _ := m.inspectCaddy(context.WithoutCancel(ctx))
+			if !ok || normalizeID(refreshed.ID) != expectedID {
+				return &Error{Code: DiagnosticIngressUnavailable}
+			}
+			if _, attached := refreshed.Networks[network]; attached {
+				return &Error{Code: DiagnosticIngressUnavailable}
+			}
 		}
 	}
-	if _, exists := caddy.Networks[network]; !exists {
+	for network := range desired {
+		if network == caddyNetworkName {
+			continue
+		}
+		refreshed, ok, inspectErr := m.inspectCaddy(ctx)
+		if inspectErr != nil || !ok || normalizeID(refreshed.ID) != expectedID {
+			return &Error{Code: DiagnosticIngressUnavailable}
+		}
+		if _, attached := refreshed.Networks[network]; attached {
+			continue
+		}
+		if err := m.runDiscard(ctx, m.options.CommandTimeout, "network", "connect", network, caddy.ID); err != nil {
+			refreshed, ok, _ = m.inspectCaddy(context.WithoutCancel(ctx))
+			if !ok || normalizeID(refreshed.ID) != expectedID {
+				return &Error{Code: DiagnosticIngressUnavailable}
+			}
+			if _, attached := refreshed.Networks[network]; !attached {
+				return &Error{Code: DiagnosticIngressUnavailable}
+			}
+		}
+	}
+	final, found, err := m.inspectCaddy(ctx)
+	if err != nil || !found || normalizeID(final.ID) != expectedID || len(final.Networks) != len(desired) {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
-	return nil
-}
-
-func (m *Manager) verifyCaddyNetworks(ctx context.Context, routes map[string]routeRecord) error {
-	inspection, found, err := m.inspectCaddy(ctx)
-	if err != nil || !found {
-		return &Error{Code: DiagnosticIngressUnavailable}
-	}
-	allowed := map[string]bool{"none": true}
-	for _, route := range routes {
-		allowed[route.Endpoints[0].NetworkName] = true
-	}
-	for network := range inspection.Networks {
-		if !allowed[network] {
+	for network := range desired {
+		attachment := final.Networks[network]
+		if attachment == nil || network == caddyNetworkName && net.ParseIP(attachment.IPAddress) == nil {
 			return &Error{Code: DiagnosticIngressDrift}
 		}
 	}
 	return nil
+}
+
+func (m *Manager) desiredNetworks(ctx context.Context, routes map[string]routeRecord) (map[string]string, error) {
+	desired := map[string]string{caddyNetworkName: ""}
+	for appID, route := range routes {
+		if validateRoute(route) != nil {
+			return nil, &Error{Code: DiagnosticRouteInvalid}
+		}
+		network := route.Endpoints[0].NetworkName
+		if owner, exists := desired[network]; exists && owner != appID {
+			return nil, &Error{Code: DiagnosticIngressDrift}
+		}
+		inspection, found, err := m.inspectNetwork(ctx, network)
+		if err != nil || !found || !validApplicationNetwork(inspection, appID) {
+			return nil, &Error{Code: DiagnosticIngressDrift}
+		}
+		desired[network] = appID
+	}
+	return desired, nil
+}
+
+func (m *Manager) disconnectApplicationNetworks(ctx context.Context, caddy caddyInspection) error {
+	if !validContainerID(caddy.ID) {
+		return &Error{Code: DiagnosticIngressDrift}
+	}
+	for network := range caddy.Networks {
+		if network == caddyNetworkName {
+			continue
+		}
+		inspection, found, err := m.inspectNetwork(ctx, network)
+		if err != nil || !found || !validApplicationNetwork(inspection, inspection.Labels["io.rig.application"]) {
+			return &Error{Code: DiagnosticIngressDrift}
+		}
+		if err := m.runDiscard(ctx, m.options.CommandTimeout, "network", "disconnect", network, caddy.ID); err != nil {
+			return &Error{Code: DiagnosticIngressUnavailable}
+		}
+	}
+	return nil
+}
+
+func validIngressNetwork(value networkInspection) bool {
+	return value.Name == caddyNetworkName && value.Driver == "bridge" && value.Scope == "local" && !value.Internal && len(value.Options) == 0 &&
+		value.Labels["io.rig.managed"] == "generated-ingress-network" && value.Labels["io.rig.identity-version"] == "v1"
+}
+
+func validApplicationNetwork(value networkInspection, appID string) bool {
+	return validAppID(appID) && value.Name != caddyNetworkName && value.Driver == "bridge" && value.Scope == "local" && !value.Internal &&
+		value.Labels["io.rig.managed"] == generatedruntime.NetworkOwnershipLabelValue && value.Labels["io.rig.application"] == appID
 }
 
 func (m *Manager) verifyEndpoints(ctx context.Context, appID string, route routeRecord) error {
@@ -453,7 +591,7 @@ func (m *Manager) verifyEndpoints(ctx context.Context, appID string, route route
 		attachment := inspection.Networks[endpoint.NetworkName]
 		if decodeErr != nil || normalizeID(inspection.ID) != normalizeID(endpoint.ContainerID) || !inspection.Running || inspection.Health != "healthy" ||
 			inspection.Labels["io.rig.managed"] != "generated-runtime" || inspection.Labels["io.rig.application"] != appID ||
-			inspection.Labels["io.rig.component"] != endpoint.Component || inspection.Labels["io.rig.slot"] != string(route.Slot) ||
+			inspection.Labels["io.rig.component"] != endpoint.Component || inspection.Labels["io.rig.slot"] != string(route.Slot) || inspection.Labels["io.rig.role"] != endpoint.Role ||
 			attachment == nil || !containsString(attachment.Aliases, endpoint.NetworkAlias) {
 			return &Error{Code: DiagnosticIngressDrift}
 		}
@@ -478,6 +616,12 @@ func (m *Manager) run(ctx context.Context, timeout time.Duration, args ...string
 	return result, nil
 }
 
+func (m *Manager) runDiscard(ctx context.Context, timeout time.Duration, args ...string) error {
+	result, err := m.run(ctx, timeout, args...)
+	clearResult(&result)
+	return err
+}
+
 type imageInspection struct {
 	ID          string   `json:"id"`
 	OS          string   `json:"os"`
@@ -485,9 +629,11 @@ type imageInspection struct {
 }
 
 type volumeInspection struct {
-	Name   string            `json:"name"`
-	Driver string            `json:"driver"`
-	Labels map[string]string `json:"labels"`
+	Name    string            `json:"name"`
+	Driver  string            `json:"driver"`
+	Scope   string            `json:"scope"`
+	Options map[string]string `json:"options"`
+	Labels  map[string]string `json:"labels"`
 }
 
 type caddyInspection struct {
@@ -495,7 +641,9 @@ type caddyInspection struct {
 	Name         string                         `json:"name"`
 	Image        string                         `json:"image"`
 	Labels       map[string]string              `json:"labels"`
+	Hostname     string                         `json:"hostname"`
 	User         string                         `json:"user"`
+	Env          []string                       `json:"env"`
 	Cmd          []string                       `json:"cmd"`
 	ReadOnly     bool                           `json:"readOnly"`
 	Privileged   bool                           `json:"privileged"`
@@ -512,6 +660,8 @@ type caddyInspection struct {
 	LogType      string                         `json:"logType"`
 	LogConfig    map[string]string              `json:"logConfig"`
 	Restart      string                         `json:"restart"`
+	NetworkMode  string                         `json:"networkMode"`
+	Ulimits      []ulimitInspection             `json:"ulimits"`
 	Running      bool                           `json:"running"`
 	PortBindings map[string][]map[string]string `json:"portBindings"`
 	Networks     map[string]*networkAttachment  `json:"networks"`
@@ -525,10 +675,12 @@ type mountInspection struct {
 }
 
 type networkInspection struct {
-	Name   string            `json:"name"`
-	Driver string            `json:"driver"`
-	Scope  string            `json:"scope"`
-	Labels map[string]string `json:"labels"`
+	Name     string            `json:"name"`
+	Driver   string            `json:"driver"`
+	Scope    string            `json:"scope"`
+	Internal bool              `json:"internal"`
+	Options  map[string]string `json:"options"`
+	Labels   map[string]string `json:"labels"`
 }
 
 type endpointInspection struct {
@@ -540,14 +692,21 @@ type endpointInspection struct {
 }
 
 type networkAttachment struct {
-	Aliases []string `json:"Aliases"`
+	Aliases   []string `json:"Aliases"`
+	IPAddress string   `json:"IPAddress"`
+}
+
+type ulimitInspection struct {
+	Name string `json:"Name"`
+	Hard int64  `json:"Hard"`
+	Soft int64  `json:"Soft"`
 }
 
 const (
 	imageInspectFormat    = `{"id":{{json .Id}},"os":{{json .Os}},"repoDigests":{{json .RepoDigests}}}`
-	volumeInspectFormat   = `{"name":{{json .Name}},"driver":{{json .Driver}},"labels":{{json .Labels}}}`
-	caddyInspectFormat    = `{"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"user":{{json .Config.User}},"cmd":{{json .Config.Cmd}},"readOnly":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"tmpfs":{{json .HostConfig.Tmpfs}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCpus}},"pidsLimit":{{json .HostConfig.PidsLimit}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"running":{{json .State.Running}},"portBindings":{{json .HostConfig.PortBindings}},"networks":{{json .NetworkSettings.Networks}}}`
-	networkInspectFormat  = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"labels":{{json .Labels}}}`
+	volumeInspectFormat   = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"options":{{json .Options}},"labels":{{json .Labels}}}`
+	caddyInspectFormat    = `{"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"hostname":{{json .Config.Hostname}},"user":{{json .Config.User}},"env":{{json .Config.Env}},"cmd":{{json .Config.Cmd}},"readOnly":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"tmpfs":{{json .HostConfig.Tmpfs}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCpus}},"pidsLimit":{{json .HostConfig.PidsLimit}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"networkMode":{{json .HostConfig.NetworkMode}},"ulimits":{{json .HostConfig.Ulimits}},"running":{{json .State.Running}},"portBindings":{{json .HostConfig.PortBindings}},"networks":{{json .NetworkSettings.Networks}}}`
+	networkInspectFormat  = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"internal":{{json .Internal}},"options":{{json .Options}},"labels":{{json .Labels}}}`
 	endpointInspectFormat = `{"id":{{json .Id}},"labels":{{json .Config.Labels}},"running":{{json .State.Running}},"health":{{json .State.Health.Status}},"networks":{{json .NetworkSettings.Networks}}}`
 )
 
@@ -595,12 +754,14 @@ func (m *Manager) inspectJSON(ctx context.Context, destination any, args ...stri
 
 func validCaddyInspection(value caddyInspection, imageID string, hostPort uint16) bool {
 	if normalizeID(value.Image) != normalizeID(imageID) || strings.TrimPrefix(value.Name, "/") != caddyContainerName || value.User != "1000:1000" ||
+		value.Hostname != caddyContainerName || value.NetworkMode != caddyNetworkName || !containsString(value.Env, "XDG_CONFIG_HOME=/config") || !containsString(value.Env, "XDG_DATA_HOME=/data") ||
 		!value.ReadOnly || value.Privileged || len(value.CapAdd) != 0 || !containsFold(value.CapDrop, "ALL") || !containsString(value.SecurityOpt, "no-new-privileges") ||
 		len(value.Binds) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 || value.NanoCPUs != 1_000_000_000 || value.PIDsLimit != 128 ||
 		len(value.Tmpfs) != 1 || value.Tmpfs["/data"] != "rw,noexec,nosuid,nodev,size=67108864" ||
 		value.LogType != "local" || value.LogConfig["max-size"] != "10m" || value.LogConfig["max-file"] != "3" || value.Restart != "unless-stopped" ||
 		len(value.Cmd) != 3 || value.Cmd[0] != "run" || value.Cmd[1] != "--config" || value.Cmd[2] != "/config/active.json" ||
-		value.Labels["io.rig.managed"] != "generated-ingress" || value.Labels["io.rig.identity-version"] != "v1" {
+		value.Labels["io.rig.managed"] != "generated-ingress" || value.Labels["io.rig.identity-version"] != "v1" || value.Labels["io.rig.listener-isolation"] != "v1" ||
+		len(value.Ulimits) != 1 || value.Ulimits[0] != (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}) {
 		return false
 	}
 	mountOK := false
@@ -635,7 +796,15 @@ func validAbsoluteDirectory(value string) bool {
 		return false
 	}
 	info, err := os.Lstat(value)
-	return err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0
+	return err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && !generatedIngressPathIsReparsePoint(value)
+}
+
+func (m *Manager) validWorkingDirectory() bool {
+	if m == nil || m.workingDirectoryIdentity == nil || !validAbsoluteDirectory(m.options.WorkingDirectory) {
+		return false
+	}
+	current, err := os.Lstat(m.options.WorkingDirectory)
+	return err == nil && os.SameFile(m.workingDirectoryIdentity, current)
 }
 
 func dockerEnvironment(endpoint, config string) ([]string, error) {

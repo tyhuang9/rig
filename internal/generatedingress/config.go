@@ -46,8 +46,9 @@ type caddyUpstream struct {
 	Dial string `json:"dial"`
 }
 
-func buildCaddyConfig(routes map[string]routeRecord) ([]byte, error) {
-	if routes == nil || len(routes) > maxStateApps {
+func buildCaddyConfig(routes map[string]routeRecord, listenAddress string) ([]byte, error) {
+	listenHost, listenPort, listenErr := net.SplitHostPort(listenAddress)
+	if routes == nil || len(routes) > maxStateApps || listenErr != nil || net.ParseIP(listenHost) == nil || listenPort != "8080" {
 		return nil, errors.New("invalid generated ingress routes")
 	}
 	appIDs := make([]string, 0, len(routes))
@@ -59,7 +60,7 @@ func buildCaddyConfig(routes map[string]routeRecord) ([]byte, error) {
 	}
 	sort.Strings(appIDs)
 	result := caddyConfig{Admin: caddyAdmin{Listen: "localhost:2019"}, Apps: caddyApps{HTTP: caddyHTTP{Servers: map[string]caddyServer{
-		"generated": {Listen: []string{":8080"}, Routes: make([]caddyRoute, 0, len(routes)*2)},
+		"generated": {Listen: []string{listenAddress}, Routes: make([]caddyRoute, 0, len(routes)*2)},
 	}}}}
 	server := result.Apps.HTTP.Servers["generated"]
 	for _, appID := range appIDs {
@@ -143,10 +144,17 @@ func validName(value string, maximum int) bool {
 	if len(value) < 1 || len(value) > maximum {
 		return false
 	}
+	if !asciiAlphaNumeric(value[0]) || !asciiAlphaNumeric(value[len(value)-1]) {
+		return false
+	}
 	for _, character := range value {
 		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' && character != '_' && character != '.' {
 			return false
 		}
 	}
 	return !strings.Contains(value, "..")
+}
+
+func asciiAlphaNumeric(value byte) bool {
+	return (value >= 'a' && value <= 'z') || (value >= '0' && value <= '9')
 }

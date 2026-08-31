@@ -20,7 +20,7 @@ func TestBuildCaddyConfigSupportsServerStaticAndStaticAPI(t *testing.T) {
 			endpoint("web", "server", "net-a", "web-blue", 3000, 'a'),
 		}},
 	}
-	body, err := buildCaddyConfig(routes)
+	body, err := buildCaddyConfig(routes, "172.28.0.2:8080")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,6 +29,9 @@ func TestBuildCaddyConfigSupportsServerStaticAndStaticAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := config.Apps.HTTP.Servers["generated"]
+	if len(server.Listen) != 1 || server.Listen[0] != "172.28.0.2:8080" {
+		t.Fatalf("listener = %#v, want dedicated ingress address", server.Listen)
+	}
 	if len(server.Routes) != 3 {
 		t.Fatalf("routes = %d, want 3", len(server.Routes))
 	}
@@ -46,6 +49,14 @@ func TestBuildCaddyConfigSupportsServerStaticAndStaticAPI(t *testing.T) {
 	}
 }
 
+func TestBuildCaddyConfigRejectsWildcardOrApplicationSideListeners(t *testing.T) {
+	for _, address := range []string{"", ":8080", "0.0.0.0:3000", "rig-app-network:8080"} {
+		if _, err := buildCaddyConfig(map[string]routeRecord{}, address); err == nil {
+			t.Fatalf("listener %q was accepted", address)
+		}
+	}
+}
+
 func TestBuildCaddyConfigRejectsAmbiguousOrCrossNetworkTopologies(t *testing.T) {
 	appID := "11111111-1111-4111-8111-111111111111"
 	tests := []routeRecord{
@@ -59,7 +70,7 @@ func TestBuildCaddyConfigRejectsAmbiguousOrCrossNetworkTopologies(t *testing.T) 
 		}},
 	}
 	for _, route := range tests {
-		if _, err := buildCaddyConfig(map[string]routeRecord{appID: route}); err == nil {
+		if _, err := buildCaddyConfig(map[string]routeRecord{appID: route}, "172.28.0.2:8080"); err == nil {
 			t.Fatal("expected invalid topology to fail closed")
 		}
 	}
