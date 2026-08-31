@@ -65,16 +65,16 @@ func (provider *controllerProvider) Repositories(context.Context, string, int64,
 func (provider *controllerProvider) Repository(context.Context, string, int64, int64) (githubapp.Repository, error) {
 	return provider.repository, nil
 }
-func (provider *controllerProvider) Branches(context.Context, string, int64, int, int) (githubapp.BranchPage, error) {
+func (provider *controllerProvider) Branches(context.Context, string, string, string, int, int) (githubapp.BranchPage, error) {
 	return provider.branchPage, nil
 }
-func (provider *controllerProvider) Branch(context.Context, string, int64, string) (githubapp.Branch, error) {
+func (provider *controllerProvider) Branch(context.Context, string, string, string, string) (githubapp.Branch, error) {
 	return provider.branch, nil
 }
-func (provider *controllerProvider) Tree(context.Context, string, int64, string) (githubapp.Tree, error) {
+func (provider *controllerProvider) Tree(context.Context, string, string, string, string) (githubapp.Tree, error) {
 	return provider.tree, nil
 }
-func (provider *controllerProvider) Content(context.Context, string, int64, string, string) ([]byte, error) {
+func (provider *controllerProvider) Content(context.Context, string, string, string, string, string) ([]byte, error) {
 	return provider.content, nil
 }
 

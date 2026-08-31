@@ -60,8 +60,8 @@ type Result struct {
 
 type GitHubReader interface {
 	Resolve(context.Context, string, string, int64, int64, string) (sourceconnections.SourceRepository, sourceconnections.Branch, error)
-	ReadTree(context.Context, string, string, int64, string) (githubapp.Tree, error)
-	ReadContent(context.Context, string, string, int64, string, string) ([]byte, error)
+	ReadTree(context.Context, string, string, int64, sourceconnections.SourceRepository, string) (githubapp.Tree, error)
+	ReadContent(context.Context, string, string, int64, sourceconnections.SourceRepository, string, string) ([]byte, error)
 }
 
 func InspectGitHub(ctx context.Context, reader GitHubReader, owner string, source GitHubSource) (Result, error) {
@@ -73,7 +73,7 @@ func InspectGitHub(ctx context.Context, reader GitHubReader, owner string, sourc
 	if err != nil {
 		return Result{}, err
 	}
-	tree, err := reader.ReadTree(ctx, owner, source.ConnectionID, source.RepositoryID, branch.SHA)
+	tree, err := reader.ReadTree(ctx, owner, source.ConnectionID, source.InstallationID, repository, branch.SHA)
 	if err != nil {
 		return Result{}, err
 	}
@@ -109,7 +109,7 @@ func InspectGitHub(ctx context.Context, reader GitHubReader, owner string, sourc
 		return result, nil
 	}
 	result.Source.ComposePath = selected
-	contents, err := reader.ReadContent(ctx, owner, source.ConnectionID, source.RepositoryID, selected, branch.SHA)
+	contents, err := reader.ReadContent(ctx, owner, source.ConnectionID, source.InstallationID, repository, selected, branch.SHA)
 	if err != nil {
 		return Result{}, err
 	}

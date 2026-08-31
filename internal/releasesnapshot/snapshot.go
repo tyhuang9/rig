@@ -67,8 +67,8 @@ type RetentionOptions struct {
 
 type SourceReader interface {
 	Resolve(context.Context, string, string, int64, int64, string) (sourceconnections.SourceRepository, sourceconnections.Branch, error)
-	ReadTree(context.Context, string, string, int64, string) (githubapp.Tree, error)
-	DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error)
+	ReadTree(context.Context, string, string, int64, sourceconnections.SourceRepository, string) (githubapp.Tree, error)
+	DownloadArchive(context.Context, string, string, int64, sourceconnections.SourceRepository, string) (io.ReadCloser, error)
 }
 
 type Materializer struct {
@@ -153,7 +153,7 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 	if err := m.refreshSource(ctx, appID, repository, branch); err != nil {
 		return Release{}, internal(err)
 	}
-	tree, err := m.sources.ReadTree(ctx, owner, source.connectionID, source.repositoryID, branch.SHA)
+	tree, err := m.sources.ReadTree(ctx, owner, source.connectionID, source.installationID, repository, branch.SHA)
 	if err != nil {
 		return Release{}, sourceError(err)
 	}
@@ -192,7 +192,7 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 		m.abort(ctx, appID, release.ID, "internal_error")
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	body, err := m.sources.DownloadArchive(ctx, owner, source.connectionID, source.repositoryID, branch.SHA)
+	body, err := m.sources.DownloadArchive(ctx, owner, source.connectionID, source.installationID, repository, branch.SHA)
 	if err != nil {
 		code := sourceError(err).(*Error).Code
 		if m.abort(ctx, appID, release.ID, code) != nil {
