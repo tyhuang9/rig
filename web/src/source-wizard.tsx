@@ -3,15 +3,19 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   APIError,
   api,
+  type AcceptDeploymentPlanRequest,
   type CreateApplicationRequest,
+  type DeploymentPlanRevision,
   type GitHubDeviceAuthorization,
   type GitHubSource,
   type InspectResponse,
   type SourceConnection,
 } from "./api";
+import { DeploymentPlanReview } from "./deployment-plan-review";
 
 const pageSize = 30;
 type SourceKind = "local" | "github";
+type WizardStage = "source" | "review" | "ready";
 type ConnectionContext = { generation: number; kind: SourceKind; selectedConnectionId: string };
 type InstallationAction = { connectionId: string; url: string };
 type AuthorizationSession = { context: ConnectionContext; expiresAt: string; nextPollAt: string; reconcilingExpiry?: boolean };
@@ -59,6 +63,7 @@ function CollectionStatus({ id, label, page, loading, error, count }: { id: stri
 export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; onCreated: (id: string) => void }) {
   const queryClient = useQueryClient();
   const [kind, setKind] = useState<SourceKind>("local");
+  const [stage, setStage] = useState<WizardStage>("source");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [localPath, setLocalPath] = useState("");
@@ -81,6 +86,8 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const [fieldErrors, setFieldErrors] = useState<{ name?: string; description?: string; localPath?: string }>({});
   const [inspection, setInspection] = useState<InspectResponse | null>(null);
   const [inspectedKey, setInspectedKey] = useState("");
+  const [draftApplicationId, setDraftApplicationId] = useState("");
+  const [acceptedRevision, setAcceptedRevision] = useState<DeploymentPlanRevision | null>(null);
   const connectionContext = useRef<ConnectionContext>({ generation: 0, kind: "local", selectedConnectionId: "" });
   const connectionSelect = useRef<HTMLSelectElement>(null);
   const resumeAuthorizationButton = useRef<HTMLButtonElement>(null);
@@ -93,7 +100,11 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const inspectionGeneration = useRef(0);
   const inspectionRequest = useRef<{ generation: number; key: string } | null>(null);
   const priorConnection = useRef<{ id: string; status: string }>({ id: "", status: "" });
+  const draftApplicationIdRef = useRef("");
+  const priorStage = useRef<WizardStage>("source");
   const errorSummary = useRef<HTMLDivElement>(null);
+  const sourceHeading = useRef<HTMLHeadingElement>(null);
+  const readyHeading = useRef<HTMLHeadingElement>(null);
 
   const capability = useQuery({ queryKey: ["system-status"], queryFn: api.status });
   const connections = useQuery({ queryKey: ["source-connections"], queryFn: api.sourceConnections, enabled: kind === "github" && capability.data?.capabilities.githubConnections === true });
@@ -123,8 +134,9 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     if (!selectedConnectionId || installationId === null || repositoryId === null || !branch) return null;
     return { connectionId: selectedConnectionId, installationId, repositoryId, branch, ...(composePath ? { composePath } : {}) };
   }, [selectedConnectionId, installationId, repositoryId, branch, composePath]);
-  const exactSourceKey = source?.composePath ? JSON.stringify(source) : "";
-  const exactInspection = Boolean(source?.composePath) && inspection !== null && inspectedKey === exactSourceKey && inspection.findings.length === 0;
+  const exactSourceKey = source ? JSON.stringify(source) : "";
+  const exactInspection = Boolean(exactSourceKey) && inspection !== null && inspectedKey === exactSourceKey && inspection.findings.length === 0;
+  const generatedCandidates = inspection?.analysis.candidates.filter((candidate) => candidate.kind === "javascript" && candidate.status !== "unsupported" && candidate.components.length > 0) ?? [];
 
   const clearInspection = () => {
     setInspection(null);
@@ -135,6 +147,8 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     inspectionGeneration.current += 1;
     inspectionRequest.current = null;
     clearInspection();
+    setAcceptedRevision(null);
+    if (!draftApplicationId) setStage("source");
   };
   const advanceConnectionContext = (nextKind: SourceKind, nextConnectionId: string) => {
     const next = { generation: connectionContext.current.generation + 1, kind: nextKind, selectedConnectionId: nextConnectionId };
@@ -220,6 +234,16 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     if (document.activeElement === installActionLink.current) focusAfterAuthorization.current = "connection";
     setInstallationAction((current) => current?.connectionId === selectedConnectionId ? null : current);
   }, [installations.data, selectedConnectionId]);
+
+  useEffect(() => {
+    const previous = priorStage.current;
+    priorStage.current = stage;
+    if (previous === stage) return;
+    window.setTimeout(() => {
+      if (stage === "source") sourceHeading.current?.focus();
+      if (stage === "ready") readyHeading.current?.focus();
+    }, 0);
+  }, [stage]);
 
   useEffect(() => {
     if (!focusResumeAfterSelection.current) return;
@@ -311,6 +335,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
       setInspection(result);
       setInspectedKey(key);
       setInspectionError("");
+      if (result.analysis.candidates.some((candidate) => candidate.kind === "javascript" && candidate.status !== "unsupported" && candidate.components.length > 0)) setStage("review");
     },
     onError: (error, operation) => {
       const currentRequest = inspectionRequest.current;
@@ -333,6 +358,69 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     },
     onError: (error) => {
       setFormError(safeMessage(error, "Could not save the application."));
+      focusErrorSummary();
+    },
+  });
+  const acceptPlan = useMutation({
+    mutationFn: async (plan: AcceptDeploymentPlanRequest) => {
+      let applicationId = draftApplicationIdRef.current;
+      if (!applicationId) {
+        const application = await api.createApp(createRequest());
+        applicationId = application.id;
+        draftApplicationIdRef.current = applicationId;
+        setDraftApplicationId(applicationId);
+        await queryClient.invalidateQueries({ queryKey: ["apps"] });
+      }
+      const revision = await api.acceptDeploymentPlan(applicationId, plan);
+      return { applicationId, revision };
+    },
+    onSuccess: async ({ applicationId, revision }) => {
+      setAcceptedRevision(revision);
+      setStage("ready");
+      await queryClient.invalidateQueries({ queryKey: ["apps"] });
+      await queryClient.invalidateQueries({ queryKey: ["deployment-plan", applicationId] });
+    },
+    onError: async (error) => {
+      const applicationId = draftApplicationIdRef.current;
+      if (applicationId) await queryClient.invalidateQueries({ queryKey: ["apps"] });
+      if (error instanceof APIError && error.code === "deployment_plan_review_required") {
+        setFormError("The project setup changed while you were reviewing it. Review the updated setup before trying again.");
+      } else if (error instanceof APIError && error.code === "deployment_plan_conflict") {
+        if (applicationId) {
+          try {
+            const revision = await api.deploymentPlan(applicationId);
+            setAcceptedRevision(revision);
+            setFormError("");
+            setStage("ready");
+            await queryClient.invalidateQueries({ queryKey: ["deployment-plan", applicationId] });
+            return;
+          } catch (reloadError) {
+            setFormError(safeMessage(reloadError, "This setup was updated in another session, but Rig could not load the accepted revision."));
+          }
+        } else {
+          setFormError("This setup was updated in another session, but the saved application draft is unavailable.");
+        }
+      } else {
+        setFormError(safeMessage(error, "Could not accept the deployment setup."));
+      }
+      focusErrorSummary();
+    },
+  });
+  const approveMigration = useMutation({
+    mutationFn: async () => {
+      if (!draftApplicationId || !acceptedRevision?.revisionId) throw new Error("The accepted setup is unavailable.");
+      return api.approveDeploymentPlanMigration(draftApplicationId, {
+        revisionId: acceptedRevision.revisionId,
+        revisionNumber: acceptedRevision.revisionNumber,
+        expectedApprovalRevision: 0,
+      });
+    },
+    onSuccess: (revision) => {
+      setFormError("");
+      setAcceptedRevision(revision);
+    },
+    onError: (error) => {
+      setFormError(safeMessage(error, "Could not approve the database migration."));
       focusErrorSummary();
     },
   });
@@ -500,7 +588,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     });
   };
 
-  const save = () => {
+  const validateApplicationDetails = () => {
     setFormError("");
     const errors: { name?: string; description?: string; localPath?: string } = {};
     if (!name.trim()) errors.name = "Enter an application name.";
@@ -511,20 +599,36 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     if (Object.keys(errors).length > 0) {
       setFormError("Check the highlighted fields.");
       focusErrorSummary();
+      return false;
+    }
+    return true;
+  };
+
+  const createRequest = (): CreateApplicationRequest => {
+    if (kind === "local") {
+      return { name: name.trim(), description, sourcePath: localPath.trim() };
+    }
+    if (!source) throw new Error("Complete the GitHub source selection before continuing.");
+    return { name: name.trim(), description, githubSource: source };
+  };
+
+  const saveCompose = () => {
+    if (!validateApplicationDetails()) return;
+    if (kind === "github" && (!source?.composePath || !exactInspection)) {
+      setFormError("Choose and inspect a Compose file before saving.");
+      focusErrorSummary();
       return;
     }
-    let request: CreateApplicationRequest;
-    if (kind === "local") {
-      request = { name: name.trim(), description, sourcePath: localPath.trim() };
-    } else {
-      if (!source || !source.composePath || !exactInspection) {
-        setFormError("Complete the GitHub source steps and a clean exact-source inspection before saving.");
-        focusErrorSummary();
-        return;
-      }
-      request = { name: name.trim(), description, githubSource: source };
+    create.mutate(createRequest());
+  };
+
+  const acceptGeneratedPlan = (request: AcceptDeploymentPlanRequest) => {
+    if (!validateApplicationDetails()) {
+      setStage("source");
+      return;
     }
-    create.mutate(request);
+    setFormError("");
+    acceptPlan.mutate(request);
   };
 
   const githubEnabled = capability.data?.capabilities.githubConnections === true;
@@ -545,22 +649,83 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
             ? "Choose a repository before saving."
             : !branch
               ? "Choose a tracked branch before saving."
-              : !composePath
-                ? inspection?.composeCandidates.length
-                  ? "Choose a Compose file, then inspect the exact source before saving."
-                  : inspection
-                    ? "Add a Compose file to the tracked branch, then inspect again before saving."
-                    : "Find and choose a Compose file before saving."
-                : !exactInspection
+              : composePath
+                ? !exactInspection
                   ? inspection?.findings.length
                     ? "Resolve the source findings, then inspect the exact source again before saving."
                     : "Inspect the selected Compose file before saving."
-                  : "The exact source inspection is clean. This application is ready to save.";
+                  : "The exact source inspection is clean. This application is ready to save."
+                : !inspection
+                  ? "Analyze the selected repository before continuing."
+                  : generatedCandidates.length > 0
+                    ? "Review how Rig will build and run the detected project."
+                    : inspection.composeCandidates.length
+                      ? "Choose a Compose file, then inspect the exact source before saving."
+                      : "Add a supported JavaScript project or a Compose file, then analyze again.";
+  const analyzeCurrentSource = () => {
+    setFormError("");
+    if (kind === "local") {
+      if (!localPath.trim()) {
+        setFieldErrors((current) => ({ ...current, localPath: "Enter a local source path." }));
+        setFormError("Check the highlighted fields.");
+        focusErrorSummary();
+        return;
+      }
+      runInspection({ sourcePath: localPath.trim() }, `local:${localPath.trim()}`);
+      return;
+    }
+    if (!source) {
+      setFormError("Choose a connected GitHub repository and tracked branch before analysis.");
+      focusErrorSummary();
+      return;
+    }
+    runInspection({ githubSource: source }, JSON.stringify(source));
+  };
+
+  if (stage === "review" && inspection) return <div className="wizard source-wizard">
+    <ol aria-label="Setup progress"><li>Source</li><li aria-current="step">How Rig will run it</li><li>Ready to deploy</li></ol>
+    <form onSubmit={(event) => event.preventDefault()} noValidate>
+      <DeploymentPlanReview
+        inspection={inspection}
+        expectedRevisionNumber={acceptedRevision?.revisionNumber ?? 0}
+        pending={acceptPlan.isPending}
+        error={formError}
+        onBack={() => { setFormError(""); setStage("source"); }}
+        onRefresh={analyzeCurrentSource}
+        onAccept={acceptGeneratedPlan}
+        onUseCompose={inspection.composeCandidates.length > 0 && !draftApplicationId ? () => { setFormError(""); setStage("source"); } : undefined}
+        draftSaved={Boolean(draftApplicationId)}
+        onOpenSavedDraft={draftApplicationId ? () => onCreated(draftApplicationId) : undefined}
+      />
+    </form>
+  </div>;
+
+  if (stage === "ready" && acceptedRevision && draftApplicationId) {
+    const migrationPending = acceptedRevision.migration.present && acceptedRevision.migration.approvalStatus !== "approved";
+    return <div className="wizard source-wizard">
+      <ol aria-label="Setup progress"><li>Source</li><li>How Rig will run it</li><li aria-current="step">Ready to deploy</li></ol>
+      <form onSubmit={(event) => event.preventDefault()} noValidate>
+        <section className="plan-ready" aria-labelledby="plan-ready-title">
+          <h2 id="plan-ready-title" ref={readyHeading} tabIndex={-1}>Setup accepted</h2>
+          <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{approveMigration.isPending ? "Approving database migration." : "Deployment setup accepted."}</span>
+          <p>Rig saved this immutable setup as revision {acceptedRevision.revisionNumber}. It will reuse it until relevant project metadata changes.</p>
+          {formError && <div ref={errorSummary} className="error-summary" role="alert" tabIndex={-1}>{formError}</div>}
+          {acceptedRevision.migration.present && <div className={migrationPending ? "migration-review" : "callout success"}>
+            <strong>{migrationPending ? "Database migration needs separate approval" : "Database migration approved"}</strong>
+            {migrationPending ? <><p>This command can change persistent data. The old and new app versions briefly share the migrated database, and Rig will not automatically roll it back.</p><button className="button" type="button" disabled={approveMigration.isPending} onClick={() => { setFormError(""); approveMigration.mutate(); }}>{approveMigration.isPending ? "Approving migration…" : "Approve migration before the next deployment"}</button></> : <span>The migration is approved for this plan revision.</span>}
+          </div>}
+          <div className="callout info"><strong>Generated runtime is not enabled yet</strong><span>The setup is saved and ready for the generated-image runtime milestone. No repository command has run.</span></div>
+          <footer><button className="button primary" type="button" onClick={() => onCreated(draftApplicationId)}>Open application</button></footer>
+        </section>
+      </form>
+    </div>;
+  }
+
   return <div className="wizard source-wizard">
-    <ol aria-label="Setup progress"><li aria-current="step">Source and review</li><li>Review and save</li></ol>
-    <form onSubmit={(event) => { event.preventDefault(); save(); }} noValidate>
-      <h2>Application source</h2>
-      <p>Save a local project draft, or connect a GitHub repository without keeping a checkout on this computer.</p>
+    <ol aria-label="Setup progress"><li aria-current="step">Source</li><li>How Rig will run it</li><li>Ready to deploy</li></ol>
+    <form onSubmit={(event) => { event.preventDefault(); generatedCandidates.length > 0 ? setStage("review") : saveCompose(); }} noValidate>
+      <h2 ref={sourceHeading} tabIndex={-1}>Application source</h2>
+      <p>Choose a project for Rig to analyze. Rig reads project files to suggest setup; it won’t run your code.</p>
       {formError && <div ref={errorSummary} className="error-summary" role="alert" tabIndex={-1}>{formError}</div>}
       <div className="field">
         <label htmlFor="wizard-name">Application name <span aria-hidden="true">*</span></label>
@@ -586,7 +751,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
           <input id="wizard-source-path" required placeholder="C:\projects\my-app" value={localPath} aria-invalid={Boolean(fieldErrors.localPath)} aria-describedby={fieldErrors.localPath ? "wizard-source-path-error" : undefined} onChange={(event) => { setLocalPath(event.target.value); setFieldErrors((current) => ({ ...current, localPath: undefined })); setFormError(""); invalidateInspection(); }} />
           {fieldErrors.localPath && <p id="wizard-source-path-error" className="form-error">{fieldErrors.localPath}</p>}
         </div>
-        <button type="button" className="button" disabled={!localPath.trim() || inspectSource.isPending} onClick={() => runInspection({ sourcePath: localPath.trim() }, `local:${localPath.trim()}`)}>{inspectSource.isPending ? "Checking…" : "Check source"}</button>
+        <button type="button" className="button primary" disabled={!localPath.trim() || inspectSource.isPending} onClick={analyzeCurrentSource}>{inspectSource.isPending ? "Analyzing…" : "Analyze project"}</button>
         {inspectionError && <div className="callout danger" role="alert">{inspectionError}</div>}
         <InspectionSummary inspection={inspection} />
       </section> : <section className="source-panel" aria-labelledby="github-source-title">
@@ -638,7 +803,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
             {repositoryId !== null && <><SourceSelect label="Tracked branch" collectionLabel="Branches" page={branchPage} id="github-branch" value={branch} onChange={(value) => { setBranch(value); resetAfterBranch(); }} loading={branches.isFetching} error={branches.error} disabled={branches.isFetching} placeholder="Choose a branch" emptyTitle="No branches found" emptyMessage="No branches are available. Push a tracked branch or choose another repository, then retry." onRetry={() => void branches.refetch()} items={branches.data?.items.map((item) => ({ value: item.name, label: item.protected ? `${item.name} (protected)` : item.name })) ?? []} />
             <PaginationControls label="branches" page={branchPage} onPageChange={changeBranchPage} hasNext={(branches.data?.items.length ?? 0) === (branches.data?.perPage ?? pageSize)} loading={branches.isFetching} statusId="github-branch-status" /></>}
           </div>}
-          {source && !composePath && <button type="button" className="button" disabled={inspectSource.isPending} onClick={() => runInspection({ githubSource: source }, "")}>{inspectSource.isPending ? "Finding Compose files…" : "Find Compose files"}</button>}
+          {source && !composePath && <button type="button" className="button primary" disabled={inspectSource.isPending} onClick={analyzeCurrentSource}>{inspectSource.isPending ? "Analyzing…" : "Analyze project"}</button>}
           {inspectionError && <div className="callout danger" role="alert">{inspectionError}</div>}
           {inspection && source && !composePath && inspection.composeCandidates.length > 0 && <div className="field"><label htmlFor="github-compose-path">Compose file</label><select id="github-compose-path" value={composePath} onChange={(event) => { setComposePath(event.target.value); invalidateInspection(); }}><option value="">Choose a Compose file</option>{inspection.composeCandidates.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}</select></div>}
           {source?.composePath && <button type="button" className="button" disabled={inspectSource.isPending} onClick={() => runInspection({ githubSource: source }, JSON.stringify(source))}>{inspectSource.isPending ? "Inspecting…" : "Inspect selected Compose file"}</button>}
@@ -646,7 +811,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         </>}
       </section>}
       {kind === "github" && <p id="github-save-help" className="save-help">{githubSaveHelp}</p>}
-      <footer><button className="button" type="button" onClick={onCancel}>Back</button><button className="button primary" aria-describedby={kind === "github" ? "github-save-help" : undefined} disabled={create.isPending || (kind === "github" && (!githubEnabled || !exactInspection))}>{create.isPending ? "Saving…" : "Save application"}</button></footer>
+      <footer><button className="button" type="button" onClick={onCancel}>Back</button>{generatedCandidates.length > 0 ? <button className="button primary" type="button" onClick={() => setStage("review")}>Review setup</button> : inspection?.composeCandidates.length ? <button className="button primary" aria-describedby={kind === "github" ? "github-save-help" : undefined} disabled={create.isPending || (kind === "github" && (!composePath || !exactInspection))}>{create.isPending ? "Saving…" : "Save application"}</button> : <button className="button primary" type="button" disabled aria-describedby={kind === "github" ? "github-save-help" : undefined}>Save application</button>}</footer>
     </form>
   </div>;
 }

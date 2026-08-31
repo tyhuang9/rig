@@ -61,6 +61,20 @@ function mockCommon(enabled = true) {
   vi.spyOn(api, "githubBranches").mockResolvedValue({ page: 1, perPage: 30, items: [{ name: "main", sha: "abc123", protected: true }] });
   vi.spyOn(api, "inspect");
   vi.spyOn(api, "createApp").mockResolvedValue({ id: "app-1" } as never);
+  vi.spyOn(api, "acceptDeploymentPlan").mockResolvedValue({
+    revisionId: "11111111-1111-4111-8111-111111111111",
+    revisionNumber: 1,
+    canonicalDigest: "f".repeat(64),
+    strategy: "generated_node",
+    state: "accepted",
+    source: { provider: "local", repositoryId: 0, resolvedDigest: "a".repeat(64) },
+    detector: { name: "projectanalysis", version: "2", sourceStructuralFingerprint: "b".repeat(64) },
+    components: [],
+    fieldProvenance: [],
+    migration: { present: false },
+  });
+  vi.spyOn(api, "deploymentPlan");
+  vi.spyOn(api, "approveDeploymentPlanMigration");
 }
 
 function deferred<T>() {
@@ -114,7 +128,7 @@ async function selectBranch() {
 }
 
 async function inspectExactSource() {
-  fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
+  fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
   const composeFile = await screen.findByLabelText(/^compose file$/i);
   fireEvent.change(composeFile, { target: { value: "compose.yaml" } });
   fireEvent.click(screen.getByRole("button", { name: /inspect selected compose file/i }));
@@ -125,6 +139,44 @@ function mockCleanInspection() {
   vi.mocked(api.inspect)
     .mockResolvedValueOnce(inspectionFixture({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [], findings: [] }))
     .mockResolvedValueOnce(inspectionFixture({ source: { type: "github", composePath: "compose.yaml" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [{ name: "web" }], findings: [] }));
+}
+
+function mockLocalComposeInspection() {
+  vi.mocked(api.inspect).mockResolvedValueOnce(inspectionFixture({ source: { type: "local", path: "C:/projects/local" }, composeCandidates: ["compose.yaml"], services: [{ name: "web" }], findings: [] }));
+}
+
+function generatedInspection(source: InspectResponse["source"] = { type: "local", path: "C:/projects/generated" }): InspectResponse {
+  return {
+    source,
+    resolvedSha: source.type === "github" ? "a".repeat(40) : undefined,
+    composeCandidates: [],
+    services: [],
+    findings: [],
+    analysis: {
+      source,
+      resolvedDigest: source.type === "github" ? "a".repeat(40) : "a".repeat(64),
+      schemaVersion: "2",
+      structuralFingerprint: "b".repeat(64),
+      findings: [],
+      candidates: [{
+        id: "candidate-web",
+        origin: "inferred",
+        status: "ready",
+        kind: "javascript",
+        rootDirectory: ".",
+        configPath: "package.json",
+        digest: "c".repeat(64),
+        packageManager: { present: true, name: "npm", version: "11", lockfile: "package-lock.json", evidence: [] },
+        nodeVersion: { present: true, value: "24", evidence: [] },
+        install: { present: true, command: "npm ci", evidence: [] },
+        components: [{ id: "web-12345678", origin: "inferred", name: "web", kind: "server", framework: "express", rootDirectory: ".", staticOutputDirectory: "", migrationFingerprint: "", build: { present: true, command: "npm run build", evidence: [] }, run: { present: true, command: "npm start", evidence: [] }, internalPort: { present: true, value: "3000", evidence: [] }, healthProbe: { present: true, path: "/health", evidence: [] }, evidence: [], findings: [] }],
+        evidence: [],
+        findings: [],
+        missingFields: [],
+        advancedInputs: [],
+      }],
+    },
+  };
 }
 
 async function reachCleanExactSource() {
@@ -161,18 +213,117 @@ describe("SourceWizard", () => {
   });
 
   it("keeps the local source create flow usable", async () => {
+    mockLocalComposeInspection();
     const { onCreated } = renderWizard();
     fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Local app" } });
     fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/local" } });
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
+    await screen.findByText(/source inspection completed/i);
     fireEvent.click(screen.getByRole("button", { name: /save application/i }));
 
     await waitFor(() => expect(api.createApp).toHaveBeenCalledWith({ name: "Local app", description: "", sourcePath: "C:/projects/local" }, expect.anything()));
     expect(onCreated).toHaveBeenCalledWith("app-1");
   });
 
+  it("analyzes, reviews, and accepts a generated local application before saving it", async () => {
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection());
+    const { onCreated } = renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Generated app" } });
+    fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
+
+    expect(await screen.findByRole("heading", { name: /how rig will run this app/i })).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: /how rig will run this app/i })));
+    fireEvent.change(screen.getByRole("textbox", { name: "Run command (required)" }), { target: { value: "node server.js && echo ${READY} $()" } });
+    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+
+    await waitFor(() => expect(api.createApp).toHaveBeenCalledWith({ name: "Generated app", description: "", sourcePath: "C:/projects/generated" }));
+    expect(api.acceptDeploymentPlan).toHaveBeenCalledWith("app-1", expect.objectContaining({
+      candidateId: "candidate-web",
+      expectedCandidateDigest: "c".repeat(64),
+      expectedSourceStructuralFingerprint: "b".repeat(64),
+      components: [expect.objectContaining({ runCommand: "node server.js && echo ${READY} $()" })],
+    }));
+    expect(await screen.findByRole("heading", { name: /setup accepted/i })).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: /setup accepted/i })));
+    expect(onCreated).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /open application/i }));
+    expect(onCreated).toHaveBeenCalledWith("app-1");
+  });
+
+  it("reuses its draft application when plan acceptance must be retried", async () => {
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection());
+    vi.mocked(api.acceptDeploymentPlan)
+      .mockRejectedValueOnce(new APIError({ status: 409, code: "deployment_plan_review_required", detail: "Project structure changed." }))
+      .mockResolvedValueOnce({
+        revisionId: "11111111-1111-4111-8111-111111111111", revisionNumber: 1, canonicalDigest: "f".repeat(64), strategy: "generated_node", state: "accepted",
+        source: { provider: "local", repositoryId: 0, resolvedDigest: "a".repeat(64) }, detector: { name: "projectanalysis", version: "2", sourceStructuralFingerprint: "b".repeat(64) }, components: [], fieldProvenance: [], migration: { present: false },
+      });
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Generated app" } });
+    fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
+    await screen.findByRole("heading", { name: /how rig will run this app/i });
+    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+    expect(await screen.findByText(/project setup changed while you were reviewing it/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /back to source/i }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("button", { name: /open saved draft/i })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+    await screen.findByRole("heading", { name: /setup accepted/i });
+    expect(api.createApp).toHaveBeenCalledTimes(1);
+    expect(api.acceptDeploymentPlan).toHaveBeenCalledTimes(2);
+  });
+
+  it("locks navigation and alternate strategies as soon as a generated draft is created", async () => {
+    const response = deferred<Awaited<ReturnType<typeof api.acceptDeploymentPlan>>>();
+    const detected = generatedInspection();
+    detected.composeCandidates = ["compose.yaml"];
+    vi.mocked(api.inspect).mockResolvedValueOnce(detected);
+    vi.mocked(api.acceptDeploymentPlan).mockReturnValueOnce(response.promise);
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Generated app" } });
+    fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
+    await screen.findByRole("heading", { name: /how rig will run this app/i });
+    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+
+    await screen.findByText(/application draft saved/i);
+    expect(screen.getByRole("button", { name: /back to source/i }).hasAttribute("disabled")).toBe(true);
+    expect(screen.queryByRole("button", { name: /use existing compose setup/i })).toBeNull();
+
+    await act(async () => response.resolve({
+      revisionId: "11111111-1111-4111-8111-111111111111", revisionNumber: 1, canonicalDigest: "f".repeat(64), strategy: "generated_node", state: "accepted",
+      source: { provider: "local", repositoryId: 0, resolvedDigest: "a".repeat(64) }, detector: { name: "projectanalysis", version: "2", sourceStructuralFingerprint: "b".repeat(64) }, components: [], fieldProvenance: [], migration: { present: false },
+    }));
+    await screen.findByRole("heading", { name: /setup accepted/i });
+    expect(api.createApp).toHaveBeenCalledTimes(1);
+  });
+
+  it("adopts the server plan when another session wins the acceptance race", async () => {
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection());
+    vi.mocked(api.acceptDeploymentPlan).mockRejectedValueOnce(new APIError({ status: 409, code: "deployment_plan_conflict", detail: "Revision changed." }));
+    vi.mocked(api.deploymentPlan).mockResolvedValueOnce({
+      revisionId: "22222222-2222-4222-8222-222222222222", revisionNumber: 2, canonicalDigest: "e".repeat(64), strategy: "generated_node", state: "accepted",
+      source: { provider: "local", repositoryId: 0, resolvedDigest: "a".repeat(64) }, detector: { name: "projectanalysis", version: "2", sourceStructuralFingerprint: "b".repeat(64) }, components: [], fieldProvenance: [], migration: { present: false },
+    });
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Generated app" } });
+    fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
+    await screen.findByRole("heading", { name: /how rig will run this app/i });
+    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+
+    expect(await screen.findByRole("heading", { name: /setup accepted/i })).toBeTruthy();
+    expect(screen.getByText(/revision 2/i)).toBeTruthy();
+    expect(api.deploymentPlan).toHaveBeenCalledWith("app-1");
+    expect(api.createApp).toHaveBeenCalledTimes(1);
+  });
+
   it("focuses the error summary and links name and local path validation messages", async () => {
     renderWizard();
-    fireEvent.click(screen.getByRole("button", { name: /save application/i }));
+    const form = screen.getByText("Application source").closest("form");
+    if (!form) throw new Error("Expected source wizard form");
+    fireEvent.submit(form);
 
     const summary = await screen.findByText(/check the highlighted fields/i);
     await waitFor(() => expect(document.activeElement).toBe(summary));
@@ -192,7 +343,9 @@ describe("SourceWizard", () => {
     fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/local" } });
     const description = screen.getByLabelText(/^description$/i);
     fireEvent.change(description, { target: { value: "x".repeat(301) } });
-    fireEvent.click(screen.getByRole("button", { name: /save application/i }));
+    const form = screen.getByText("Application source").closest("form");
+    if (!form) throw new Error("Expected source wizard form");
+    fireEvent.submit(form);
 
     expect(await screen.findByText(/description must be 300 characters or fewer/i)).toBeTruthy();
     expect(description.getAttribute("aria-invalid")).toBe("true");
@@ -204,10 +357,13 @@ describe("SourceWizard", () => {
   });
 
   it("focuses the error summary after a create failure", async () => {
+    mockLocalComposeInspection();
     vi.mocked(api.createApp).mockRejectedValueOnce(new APIError({ status: 503, code: "provider_unavailable", detail: "Application storage is temporarily unavailable." }));
     renderWizard();
     fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Local app" } });
     fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/local" } });
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
+    await screen.findByText(/source inspection completed/i);
     fireEvent.click(screen.getByRole("button", { name: /save application/i }));
 
     const summary = await screen.findByText(/application storage is temporarily unavailable/i);
@@ -219,7 +375,7 @@ describe("SourceWizard", () => {
     renderWizard();
     const localPath = screen.getByLabelText(/local source path/i);
     fireEvent.change(localPath, { target: { value: "C:/projects/broken" } });
-    fireEvent.click(screen.getByRole("button", { name: /check source/i }));
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
     expect(await screen.findByText(/selected folder could not be inspected/i)).toBeTruthy();
 
     fireEvent.change(localPath, { target: { value: "C:/projects/fixed" } });
@@ -235,7 +391,7 @@ describe("SourceWizard", () => {
     renderWizard();
     const localPath = screen.getByLabelText(/local source path/i);
     fireEvent.change(localPath, { target: { value: "C:/projects/first" } });
-    fireEvent.click(screen.getByRole("button", { name: /check source/i }));
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
     fireEvent.change(localPath, { target: { value: "C:/projects/second" } });
 
     await act(async () => {
@@ -297,7 +453,7 @@ describe("SourceWizard", () => {
     if (!form) throw new Error("Expected source wizard form");
     fireEvent.submit(form);
 
-    const summary = await screen.findByText(/complete the github source steps and a clean exact-source inspection/i);
+    const summary = await screen.findByText(/choose and inspect a compose file before saving/i);
     await waitFor(() => expect(document.activeElement).toBe(summary));
   });
 
@@ -821,13 +977,13 @@ describe("SourceWizard", () => {
     await selectInstallation();
     await selectRepository();
     await selectBranch();
-    fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
 
     const emptyResult = (await screen.findByText(/no compose files found/i)).closest("[role='status']");
     expect(emptyResult?.getAttribute("aria-live")).toBe("polite");
     expect(emptyResult?.getAttribute("aria-atomic")).toBe("true");
     expect(screen.getByText("Add a Compose file to the tracked branch, then inspect again.")).toBeTruthy();
-    expect(screen.getByText("Add a Compose file to the tracked branch, then inspect again before saving.")).toBeTruthy();
+    expect(screen.getByText("Add a supported JavaScript project or a Compose file, then analyze again.")).toBeTruthy();
     expect(screen.queryByText(/source inspection completed/i)).toBeNull();
     expect(screen.queryByText(/ready to save/i)).toBeNull();
     expect(screen.queryByLabelText(/^compose file$/i)).toBeNull();
@@ -846,7 +1002,7 @@ describe("SourceWizard", () => {
     await selectInstallation();
     await selectRepository();
     await selectBranch();
-    fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
 
     expect(await screen.findByText("The controller returned an invalid source inspection response.")).toBeTruthy();
     expect(screen.queryByText(/source inspection completed/i)).toBeNull();
@@ -864,7 +1020,7 @@ describe("SourceWizard", () => {
     await selectInstallation();
     await selectRepository();
     await selectBranch();
-    fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
     fireEvent.change(screen.getByLabelText(/^tracked branch$/i), { target: { value: "" } });
 
     await act(async () => {
@@ -892,7 +1048,7 @@ describe("SourceWizard", () => {
     await selectInstallation();
     await selectRepository();
     await selectBranch();
-    fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
     const composeFile = await screen.findByLabelText(/^compose file$/i);
     fireEvent.change(composeFile, { target: { value: "compose.yaml" } });
     fireEvent.click(screen.getByRole("button", { name: /inspect selected compose file/i }));
@@ -915,8 +1071,8 @@ describe("SourceWizard", () => {
     await selectInstallation();
     await selectRepository();
     await selectBranch();
-    expect(document.getElementById("github-save-help")?.textContent).toMatch(/find and choose a compose file before saving/i);
-    fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
+    expect(document.getElementById("github-save-help")?.textContent).toMatch(/analyze the selected repository before continuing/i);
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
     await screen.findByLabelText(/^compose file$/i);
     expect(screen.getByRole("button", { name: /save application/i }).hasAttribute("disabled")).toBe(true);
     fireEvent.change(screen.getByLabelText(/compose file/i), { target: { value: "compose.yaml" } });
@@ -936,6 +1092,26 @@ describe("SourceWizard", () => {
     expect(onCreated).toHaveBeenCalledWith("app-1");
   });
 
+  it("accepts a generated GitHub application without requiring a Compose path", async () => {
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection({ type: "github", connectionId: connection.id, installationId: 10, repositoryId: 20, trackedBranch: "main", resolvedSha: "a".repeat(40) }));
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Generated GitHub app" } });
+    await selectConnectedGitHub();
+    await selectInstallation();
+    await selectRepository();
+    await selectBranch();
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
+    await screen.findByRole("heading", { name: /how rig will run this app/i });
+    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+
+    await waitFor(() => expect(api.createApp).toHaveBeenCalledWith({
+      name: "Generated GitHub app",
+      description: "",
+      githubSource: { connectionId: connection.id, installationId: 10, repositoryId: 20, branch: "main" },
+    }));
+    expect(api.acceptDeploymentPlan).toHaveBeenCalledWith("app-1", expect.objectContaining({ candidateId: "candidate-web" }));
+  });
+
   it("describes policy findings truthfully and keeps saving blocked", async () => {
     vi.mocked(api.inspect)
       .mockResolvedValueOnce(inspectionFixture({ source: { type: "github" }, composeCandidates: ["compose.yaml"], services: [], findings: [] }))
@@ -946,7 +1122,7 @@ describe("SourceWizard", () => {
     await selectInstallation();
     await selectRepository();
     await selectBranch();
-    fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
     const composeFile = await screen.findByLabelText(/^compose file$/i);
     fireEvent.change(composeFile, { target: { value: "compose.yaml" } });
     fireEvent.click(screen.getByRole("button", { name: /inspect selected compose file/i }));
