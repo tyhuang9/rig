@@ -171,6 +171,7 @@ type EnvironmentStager interface {
 
 type RouteEndpoint struct {
 	Component    string
+	Role         string
 	ContainerID  string
 	NetworkName  string
 	NetworkAlias string
