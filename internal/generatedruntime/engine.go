@@ -415,7 +415,7 @@ func (e *Engine) inspectImage(ctx context.Context, spec CandidateSpec) (imageIns
 	return e.inspectImageSpec(ctx, ImageSpec{
 		AppID: spec.AppID, ReleaseID: spec.ReleaseID, ArtifactID: spec.ArtifactID,
 		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, ImageContentID: spec.ImageContentID,
-		BuildDefinitionDigest: spec.BuildDefinitionDigest,
+		ComponentName: spec.ComponentName, BuildDefinitionDigest: spec.BuildDefinitionDigest,
 	})
 }
 
@@ -727,7 +727,7 @@ func minimumReplacementDiskBytes(limits ContainerLimits) uint64 {
 }
 
 func validCandidateSpec(spec CandidateSpec) bool {
-	if !validImageSpec(ImageSpec{AppID: spec.AppID, ReleaseID: spec.ReleaseID, ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, ImageContentID: spec.ImageContentID, BuildDefinitionDigest: spec.BuildDefinitionDigest}) || !canonicalUUID(spec.DeploymentID) || !validText(spec.ComponentName, 256) || !validRootDirectory(spec.RootDirectory) || deploymentplans.ValidateCommand(spec.RunCommand) != nil || spec.InternalPort == 0 || !validHealthProbe(spec.HealthProbe) || !canonicalUUID(spec.EnvironmentOperationID) || spec.EnvironmentOperationAttempt < 1 || !validEnvironment(spec.Environment) {
+	if !validImageSpec(ImageSpec{AppID: spec.AppID, ReleaseID: spec.ReleaseID, ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, ComponentName: spec.ComponentName, ImageContentID: spec.ImageContentID, BuildDefinitionDigest: spec.BuildDefinitionDigest}) || !canonicalUUID(spec.DeploymentID) || !validRootDirectory(spec.RootDirectory) || deploymentplans.ValidateCommand(spec.RunCommand) != nil || spec.InternalPort == 0 || !validHealthProbe(spec.HealthProbe) || !validEnvironmentOperation(spec) || !validEnvironment(spec.Environment) {
 		return false
 	}
 	_, err := InactiveSlot(spec.ActiveSlot)
@@ -735,7 +735,14 @@ func validCandidateSpec(spec CandidateSpec) bool {
 }
 
 func validImageSpec(spec ImageSpec) bool {
-	return canonicalUUID(spec.AppID) && validReleaseID(spec.ReleaseID) && canonicalUUID(spec.ArtifactID) && canonicalUUID(spec.DeploymentPlanRevisionID) && validImageID(spec.ImageContentID) && lowerHex(spec.BuildDefinitionDigest, 64)
+	return canonicalUUID(spec.AppID) && validReleaseID(spec.ReleaseID) && canonicalUUID(spec.ArtifactID) && canonicalUUID(spec.DeploymentPlanRevisionID) && validText(spec.ComponentName, 256) && validImageID(spec.ImageContentID) && lowerHex(spec.BuildDefinitionDigest, 64)
+}
+
+func validEnvironmentOperation(spec CandidateSpec) bool {
+	if len(spec.Environment) == 0 && spec.EnvironmentOperationID == "" && spec.EnvironmentOperationAttempt == 0 {
+		return true
+	}
+	return canonicalUUID(spec.EnvironmentOperationID) && spec.EnvironmentOperationAttempt >= 1
 }
 
 func validEnvironment(environment []byte) bool {

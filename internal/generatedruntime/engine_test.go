@@ -246,6 +246,8 @@ func TestGeneratedRuntimeOmitsEnvironmentFileWhenConfigurationIsEmpty(t *testing
 	})
 	environment := engine.environment.(*runtimeFakeEnvironment)
 	spec.Environment = nil
+	spec.EnvironmentOperationID = ""
+	spec.EnvironmentOperationAttempt = 0
 	if _, err := engine.CreateInactiveCandidate(context.Background(), spec); err != nil {
 		t.Fatal(err)
 	}

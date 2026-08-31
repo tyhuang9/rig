@@ -80,7 +80,7 @@ func imageSpec(resolved resolvedDeployment, artifact generatedimage.Artifact) ge
 	return generatedruntime.ImageSpec{
 		AppID: resolved.deployment.AppID, ReleaseID: resolved.release.ID, ArtifactID: artifact.ID,
 		DeploymentPlanRevisionID: resolved.plan.ID, ImageContentID: artifact.ImageContentID,
-		BuildDefinitionDigest: artifact.BuildDefinitionDigest,
+		ComponentName: artifact.ComponentID, BuildDefinitionDigest: artifact.BuildDefinitionDigest,
 	}
 }
 
@@ -287,16 +287,17 @@ func reconstructCandidate(resolved resolvedDeployment, runtimeDeployment generat
 	}, nil
 }
 
-func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, candidates map[string]generatedruntime.Candidate) (generatedruntimestate.Deployment, error) {
+func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, candidates map[string]generatedruntime.Candidate) (generatedruntimestate.Deployment, bool, error) {
 	head, err := e.state.Active(ctx, resolved.deployment.AppID)
 	if err != nil {
-		return runtimeDeployment, staticError("active head unavailable")
+		return runtimeDeployment, false, staticError("active head unavailable")
 	}
 	if head.DeploymentID == resolved.deployment.ID {
-		return e.state.Advance(ctx, resolved.deployment.AppID, resolved.deployment.ID, generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, "")
+		updated, advanceErr := e.state.Advance(ctx, resolved.deployment.AppID, resolved.deployment.ID, generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, "")
+		return updated, true, advanceErr
 	}
 	if head.DeploymentID != runtimeDeployment.PreviousActiveDeploymentID || head.Slot != runtimeDeployment.PreviousActiveSlot {
-		return runtimeDeployment, staticError("active head changed")
+		return runtimeDeployment, false, staticError("active head changed")
 	}
 	request := generatedruntime.RouteSwitchRequest{
 		AppID: resolved.deployment.AppID, FromSlot: generatedruntime.Slot(runtimeDeployment.PreviousActiveSlot),
@@ -304,30 +305,30 @@ func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment,
 		Endpoints: routeEndpoints(resolved.plan, candidates),
 	}
 	if err = e.routes.Switch(ctx, request); err != nil {
-		return runtimeDeployment, staticError("route switch failed")
+		return runtimeDeployment, false, staticError("route switch failed")
 	}
 	if _, _, err = e.state.SwitchActive(ctx, resolved.deployment.AppID, resolved.deployment.ID, head.Generation); err != nil {
 		_ = e.restorePreviousRoute(context.WithoutCancel(ctx), resolved, runtimeDeployment)
-		return runtimeDeployment, staticError("active head compare-and-swap failed")
+		return runtimeDeployment, false, staticError("active head compare-and-swap failed")
 	}
 	updated, err := e.state.Advance(ctx, resolved.deployment.AppID, resolved.deployment.ID, generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, "")
 	if err != nil {
-		return runtimeDeployment, staticError("persist draining phase")
+		return runtimeDeployment, true, staticError("persist draining phase")
 	}
 	if runtimeDeployment.PreviousActiveDeploymentID != "" {
 		previous, getErr := e.state.Get(ctx, resolved.deployment.AppID, runtimeDeployment.PreviousActiveDeploymentID)
 		if getErr != nil {
-			return updated, staticError("previous deployment unavailable")
+			return updated, true, staticError("previous deployment unavailable")
 		}
 		for _, component := range previous.Components {
 			if component.State == generatedruntimestate.ComponentActive {
 				if _, err = e.state.AdvanceComponent(ctx, resolved.deployment.AppID, previous.DeploymentID, component.Name, generatedruntimestate.ComponentActive, generatedruntimestate.ComponentDraining); err != nil {
-					return updated, staticError("persist previous draining component")
+					return updated, true, staticError("persist previous draining component")
 				}
 			}
 		}
 	}
-	return updated, nil
+	return updated, true, nil
 }
 
 func routeEndpoints(plan deploymentplans.DeploymentPlanRevision, candidates map[string]generatedruntime.Candidate) []generatedruntime.RouteEndpoint {
@@ -456,10 +457,14 @@ func reconstructPreviousCandidates(appID string, previous generatedruntimestate.
 	return result, nil
 }
 
-func (e *Executor) cleanupCandidates(ctx context.Context, candidates map[string]generatedruntime.Candidate) {
+func (e *Executor) cleanupCandidates(ctx context.Context, candidates map[string]generatedruntime.Candidate) error {
 	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.options.CleanupTimeout)
 	defer cancel()
+	var firstErr error
 	for _, candidate := range candidates {
-		_ = e.runtime.StopAndRemove(cleanup, candidate, 0)
+		if err := e.runtime.StopAndRemove(cleanup, candidate, 0); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
+	return firstErr
 }

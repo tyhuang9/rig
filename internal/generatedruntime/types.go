@@ -101,6 +101,7 @@ type ImageSpec struct {
 	ReleaseID                string
 	ArtifactID               string
 	DeploymentPlanRevisionID string
+	ComponentName            string
 	ImageContentID           string
 	BuildDefinitionDigest    string
 }
