@@ -82,6 +82,38 @@ func TestRecoverRemovesOnlyExactOwnedOperations(t *testing.T) {
 	}
 }
 
+func TestGeneratedBuildNamespaceIsSeparateAndRecoversExactly(t *testing.T) {
+	dataRoot := t.TempDir()
+	compose, err := New(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builds, err := NewGeneratedBuild(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	composeFiles, err := compose.Create(uuid.NewString(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildFiles, err := builds.Create(uuid.NewString(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(composeFiles.Directory) == filepath.Dir(buildFiles.Directory) {
+		t.Fatal("compose and generated builds share a cleanup namespace")
+	}
+	if err := builds.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(buildFiles.Directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("generated build operation remains: %v", err)
+	}
+	if _, err := os.Stat(composeFiles.Directory); err != nil {
+		t.Fatalf("generated recovery touched compose operation: %v", err)
+	}
+}
+
 func TestNewRejectsRelativeAndSymlinkedRuntimeAncestorBeforeCreation(t *testing.T) {
 	if _, err := New("relative"); err == nil {
 		t.Fatal("relative data root was accepted")

@@ -31,8 +31,22 @@ type Files struct {
 }
 
 func New(dataRoot string) (*Manager, error) {
+	return newManager(dataRoot, "compose")
+}
+
+// NewGeneratedBuild creates a separate protected namespace for compiler-owned
+// build contexts. Keeping it separate prevents runtime configuration files and
+// untrusted source trees from sharing a cleanup boundary.
+func NewGeneratedBuild(dataRoot string) (*Manager, error) {
+	return newManager(dataRoot, "generated-build")
+}
+
+func newManager(dataRoot, namespace string) (*Manager, error) {
 	if dataRoot == "" || pathsecurity.RejectWindowsNamespace(dataRoot) || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
 		return nil, errors.New("data root must be an absolute clean path")
+	}
+	if namespace != "compose" && namespace != "generated-build" {
+		return nil, errors.New("unsupported runtime temp namespace")
 	}
 	if err := rejectPathAncestors(dataRoot); err != nil {
 		return nil, fmt.Errorf("protect data root: %w", err)
@@ -41,9 +55,9 @@ func New(dataRoot string) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create runtime root: %w", err)
 	}
-	root, err := ensureSecureDirectory(runtimeRoot, "compose")
+	root, err := ensureSecureDirectory(runtimeRoot, namespace)
 	if err != nil {
-		return nil, fmt.Errorf("create compose runtime root: %w", err)
+		return nil, fmt.Errorf("create %s runtime root: %w", namespace, err)
 	}
 	return &Manager{root: root}, nil
 }
