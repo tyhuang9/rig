@@ -820,6 +820,27 @@ describe("SourceWizard", () => {
     expect(api.createApp).not.toHaveBeenCalled();
   });
 
+  it("fails closed when findings is a present malformed collection", async () => {
+    vi.mocked(api.inspect).mockRestore();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [], findings: { code: "hidden_finding" } }), { status: 200 }),
+    ));
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "GitHub app" } });
+    await selectConnectedGitHub();
+    await selectInstallation();
+    await selectRepository();
+    await selectBranch();
+    fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
+
+    expect(await screen.findByText("The controller returned an invalid source inspection response.")).toBeTruthy();
+    expect(screen.queryByText(/source inspection completed/i)).toBeNull();
+    expect(screen.queryByText(/ready to save/i)).toBeNull();
+    expect(screen.queryByLabelText(/^compose file$/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /save application/i }).hasAttribute("disabled")).toBe(true);
+    expect(api.createApp).not.toHaveBeenCalled();
+  });
+
   it.each(["success", "error"] as const)("ignores a stale GitHub inspection %s after an upstream branch change", async (outcome) => {
     const inspectionResult = deferred<Awaited<ReturnType<typeof api.inspect>>>();
     vi.mocked(api.inspect).mockReturnValueOnce(inspectionResult.promise);

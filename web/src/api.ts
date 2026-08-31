@@ -161,12 +161,24 @@ function pagedPath(path: string, values: Record<string, string | number>, page: 
   return `${operationPath(path, values)}?${query.toString()}`;
 }
 
+function inspectionCollection<T>(value: unknown): T[] {
+  if (value === null || value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new APIError({
+      status: 502,
+      code: "invalid_inspection_response",
+      detail: "The controller returned an invalid source inspection response.",
+    });
+  }
+  return value as T[];
+}
+
 function normalizeInspectionResponse(value: InspectResponse): InspectResponse {
   return {
     ...value,
-    composeCandidates: Array.isArray(value.composeCandidates) ? value.composeCandidates : [],
-    services: Array.isArray(value.services) ? value.services : [],
-    findings: Array.isArray(value.findings) ? value.findings : [],
+    composeCandidates: inspectionCollection<string>(value.composeCandidates),
+    services: inspectionCollection<InspectResponse["services"][number]>(value.services),
+    findings: inspectionCollection<InspectResponse["findings"][number]>(value.findings),
   };
 }
 
