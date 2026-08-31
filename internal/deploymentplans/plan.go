@@ -62,9 +62,15 @@ func IsCode(err error, code string) bool {
 type Plan struct {
 	Strategy        Strategy          `json:"strategy"`
 	Detector        Detector          `json:"detector"`
+	Source          SourceIdentity    `json:"source"`
 	Components      []Component       `json:"components"`
 	FieldProvenance []FieldProvenance `json:"fieldProvenance"`
 	Migration       *Migration        `json:"migration,omitempty"`
+}
+type SourceIdentity struct {
+	Provider       string `json:"provider"`
+	RepositoryID   int64  `json:"repositoryId"`
+	ResolvedDigest string `json:"resolvedDigest"`
 }
 
 type Detector struct {
@@ -159,10 +165,13 @@ func canonicalPlan(plan Plan) (Plan, error) {
 	if validateText(plan.Detector.Name, 256) != nil || validateText(plan.Detector.Version, 256) != nil || !validDigest(plan.Detector.SourceStructuralFingerprint) {
 		return Plan{}, invalid("detector", "Must include name, version, and lowercase structural fingerprint")
 	}
+	if plan.Source.Provider != "github" || plan.Source.RepositoryID <= 0 || !validResolvedDigest(plan.Source.ResolvedDigest) {
+		return Plan{}, invalid("source", "Must bind a GitHub repository and resolved digest")
+	}
 	if len(plan.Components) > 64 || len(plan.FieldProvenance) > 256 || (plan.Strategy == StrategyGeneratedNode && (len(plan.Components) < 1 || len(plan.Components) > 2)) {
 		return Plan{}, invalid("plan", "Contains too many entries")
 	}
-	result := Plan{Strategy: plan.Strategy, Detector: plan.Detector, Migration: plan.Migration}
+	result := Plan{Strategy: plan.Strategy, Detector: plan.Detector, Source: plan.Source, Migration: plan.Migration}
 	result.Components = append([]Component(nil), plan.Components...)
 	sort.Slice(result.Components, func(i, j int) bool { return result.Components[i].Name < result.Components[j].Name })
 	seen := map[string]bool{}
@@ -196,17 +205,8 @@ func canonicalPlan(plan Plan) (Plan, error) {
 		if ValidateCommand(result.Migration.Command) != nil || !validDigest(result.Migration.EvidenceDigest) {
 			return Plan{}, invalid("migration", "Migration command and evidence digest are required")
 		}
-		approval := result.Migration.Approval
-		if approval.Status == MigrationApprovalPending {
-			if approval.ActorID != "" || approval.At != "" {
-				return Plan{}, invalid("migration", "Pending approval cannot name an actor")
-			}
-		} else if approval.Status == MigrationApprovalApproved {
-			if validateText(approval.ActorID, 256) != nil || validateText(approval.At, 128) != nil {
-				return Plan{}, invalid("migration", "Approved migration requires actor and timestamp")
-			}
-		} else {
-			return Plan{}, invalid("migration", "Approval must be pending or approved")
+		if result.Migration.Approval.Status != MigrationApprovalPending || result.Migration.Approval.ActorID != "" || result.Migration.Approval.At != "" {
+			return Plan{}, invalid("migration", "Migration approval is granted only through its explicit approval operation")
 		}
 	}
 	return result, nil
@@ -266,6 +266,17 @@ func validateText(value string, maximum int) error {
 
 func validDigest(value string) bool {
 	if len(value) != 64 {
+		return false
+	}
+	for _, value := range value {
+		if !(value >= '0' && value <= '9') && !(value >= 'a' && value <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+func validResolvedDigest(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
 		return false
 	}
 	for _, value := range value {

@@ -133,6 +133,7 @@ func testPlan() Plan {
 	return Plan{
 		Strategy: StrategyGeneratedNode,
 		Detector: Detector{Name: "package-json", Version: "1", SourceStructuralFingerprint: strings.Repeat("a", 64)},
+		Source:   SourceIdentity{Provider: "github", RepositoryID: 7, ResolvedDigest: strings.Repeat("c", 64)},
 		Components: []Component{
 			{Name: "web", Role: "server", RootDirectory: "apps/web", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm run start", InternalPort: 3000, HealthProbe: "/health"},
 			{Name: "worker", Role: "server", RootDirectory: "apps/worker", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", RunCommand: "npm run worker", InternalPort: 3001, HealthProbe: "/health"},

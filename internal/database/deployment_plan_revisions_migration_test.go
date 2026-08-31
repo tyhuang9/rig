@@ -42,8 +42,8 @@ func TestDeploymentPlanRevisionsMigration(t *testing.T) {
 		if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES('owner','owner','hash',datetime('now'),datetime('now'))`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at)
-			VALUES(?,?,1,?,'compose','compose','1',?,?,0,0,'','owner',datetime('now'),'accepted','owner',datetime('now'))`, id, "plan-fresh", "apps/plan-fresh/deployment-plans/"+id+".secret", strings.Repeat("b", 64), strings.Repeat("c", 64)); err != nil {
+		if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at)
+			VALUES(?,?,1,?,'compose','compose','1',?,'github',1,?, ?,0,0,'','owner',datetime('now'),'accepted','owner',datetime('now'))`, id, "plan-fresh", "apps/plan-fresh/deployment-plans/"+id+".secret", strings.Repeat("b", 64), strings.Repeat("c", 64), strings.Repeat("d", 64)); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := db.Exec(`UPDATE deployment_plan_heads SET revision_id=?,revision_number=1,updated_at=datetime('now') WHERE app_id='plan-fresh'`, id); err != nil {

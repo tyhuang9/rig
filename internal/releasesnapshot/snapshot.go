@@ -521,7 +521,7 @@ func (m *Materializer) reserve(ctx context.Context, app string, source appSource
 	}
 	var deploymentPlanID sql.NullString
 	var deploymentPlanNumber int64
-	if err = tx.QueryRowContext(ctx, `SELECT revision_id,revision_number FROM deployment_plan_heads WHERE app_id=?`, app).Scan(&deploymentPlanID, &deploymentPlanNumber); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT CASE WHEN h.revision_number=0 THEN NULL WHEN r.analyzed_source_provider='github' AND r.analyzed_repository_id=? AND r.analyzed_resolved_digest=? THEN h.revision_id ELSE NULL END,CASE WHEN h.revision_number>0 AND r.analyzed_source_provider='github' AND r.analyzed_repository_id=? AND r.analyzed_resolved_digest=? THEN h.revision_number ELSE 0 END FROM deployment_plan_heads h LEFT JOIN deployment_plan_revisions r ON r.id=h.revision_id WHERE h.app_id=?`, repository.ID, branch.SHA, repository.ID, branch.SHA, app).Scan(&deploymentPlanID, &deploymentPlanNumber); err != nil {
 		return Release{}, err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,compose_path,workspace_state,configuration_revision_id,configuration_revision_number,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,?,?,'materializing','{}',?,'github',?,?,?,?,?,?,?,?,?,?,?)`, id, app, branch.SHA, branch.Name, now, repository.ID, repository.Owner, repository.Name, "refs/heads/"+branch.Name, branch.SHA, source.composePath, WorkspaceStateMaterializing, nullableString(configurationID), configurationNumber, nullableString(deploymentPlanID), nullablePlanNumber(deploymentPlanID, deploymentPlanNumber))

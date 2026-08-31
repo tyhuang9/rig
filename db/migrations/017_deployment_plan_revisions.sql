@@ -16,6 +16,9 @@ CREATE TABLE deployment_plan_revisions (
     detector TEXT NOT NULL,
     detector_version TEXT NOT NULL,
     source_structural_fingerprint TEXT NOT NULL CHECK (length(source_structural_fingerprint) = 64 AND source_structural_fingerprint NOT GLOB '*[^0-9a-f]*'),
+    analyzed_source_provider TEXT NOT NULL CHECK (analyzed_source_provider = 'github'),
+    analyzed_repository_id INTEGER NOT NULL CHECK (analyzed_repository_id > 0),
+    analyzed_resolved_digest TEXT NOT NULL CHECK (length(analyzed_resolved_digest) IN (40,64) AND analyzed_resolved_digest NOT GLOB '*[^0-9a-f]*'),
     canonical_digest TEXT NOT NULL CHECK (length(canonical_digest) = 64 AND canonical_digest NOT GLOB '*[^0-9a-f]*'),
     component_count INTEGER NOT NULL CHECK (component_count >= 0),
     field_provenance_count INTEGER NOT NULL CHECK (field_provenance_count >= 0),
@@ -27,6 +30,14 @@ CREATE TABLE deployment_plan_revisions (
     accepted_at TEXT NOT NULL,
     UNIQUE(app_id, revision_number),
     UNIQUE(app_id, id)
+);
+CREATE TABLE deployment_plan_migration_approvals (
+    revision_id TEXT PRIMARY KEY REFERENCES deployment_plan_revisions(id) ON DELETE CASCADE,
+    app_id TEXT NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+    approval_revision INTEGER NOT NULL CHECK (approval_revision = 1),
+    approved_by TEXT NOT NULL REFERENCES users(id),
+    approved_at TEXT NOT NULL,
+    UNIQUE(revision_id, app_id)
 );
 
 CREATE TRIGGER deployment_plan_head_valid_insert BEFORE INSERT ON deployment_plan_heads
@@ -45,6 +56,8 @@ CREATE TRIGGER deployment_plan_revision_immutable BEFORE UPDATE ON deployment_pl
 BEGIN SELECT RAISE(ABORT, 'deployment plan revisions are immutable'); END;
 CREATE TRIGGER deployment_plan_revision_retain BEFORE DELETE ON deployment_plan_revisions
 BEGIN SELECT RAISE(ABORT, 'deployment plan revisions are retained'); END;
+CREATE TRIGGER deployment_plan_migration_approval_immutable BEFORE UPDATE ON deployment_plan_migration_approvals
+BEGIN SELECT RAISE(ABORT, 'deployment plan migration approvals are immutable'); END;
 
 INSERT INTO deployment_plan_heads(app_id) SELECT id FROM applications;
 CREATE TRIGGER deployment_plan_head_create AFTER INSERT ON applications

@@ -164,7 +164,7 @@ func (s *Store) Replace(ctx context.Context, appID, actorID string, input Replac
 	}
 	defer tx.Rollback()
 	ref := filepath.ToSlash(filepath.Join("apps", appID, "deployment-plans", id+".secret"))
-	_, err = tx.ExecContext(ctx, `INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, appID, number, ref, canonical.Strategy, canonical.Detector.Name, canonical.Detector.Version, canonical.Detector.SourceStructuralFingerprint, digest, len(canonical.Components), len(canonical.FieldProvenance), migrationEvidenceDigest(canonical.Migration), actorID, now, RevisionAccepted, actorID, now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, appID, number, ref, canonical.Strategy, canonical.Detector.Name, canonical.Detector.Version, canonical.Detector.SourceStructuralFingerprint, canonical.Source.Provider, canonical.Source.RepositoryID, canonical.Source.ResolvedDigest, digest, len(canonical.Components), len(canonical.FieldProvenance), migrationEvidenceDigest(canonical.Migration), actorID, now, RevisionAccepted, actorID, now)
 	if err != nil {
 		return DeploymentPlanRevision{}, s.classifyWriteError(ctx, appID, input.ExpectedRevisionNumber, err)
 	}
@@ -186,6 +186,42 @@ func (s *Store) Replace(ctx context.Context, appID, actorID string, input Replac
 	return revision, nil
 }
 
+// ApproveMigration records one actor-authenticated approval without rewriting
+// the immutable command-bearing revision bundle. expectedApprovalRevision must
+// be zero because each accepted revision can be approved once.
+func (s *Store) ApproveMigration(ctx context.Context, appID, revisionID string, revisionNumber, expectedApprovalRevision int64, actorID string) error {
+	if !validUUID(appID) || !validUUID(revisionID) || revisionNumber <= 0 || expectedApprovalRevision != 0 || validateText(actorID, 256) != nil {
+		return invalid("migration", "Invalid migration approval request")
+	}
+	unlock := s.lock(appID)
+	defer unlock()
+	var digest string
+	if err := s.db.QueryRowContext(ctx, `SELECT migration_evidence_digest FROM deployment_plan_revisions WHERE id=? AND app_id=? AND revision_number=?`, revisionID, appID, revisionNumber).Scan(&digest); err != nil {
+		return &Error{Code: "deployment_plan_unavailable"}
+	}
+	if digest == "" {
+		return invalid("migration", "Plan has no migration command")
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO deployment_plan_migration_approvals(revision_id,app_id,approval_revision,approved_by,approved_at) VALUES(?,?,1,?,?) ON CONFLICT(revision_id) DO NOTHING`, revisionID, appID, actorID, now)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return &Error{Code: "migration_approval_conflict"}
+	}
+	metadata, _ := json.Marshal(map[string]any{"revisionId": revisionID, "revisionNumber": revisionNumber, "approvalRevision": 1, "migrationEvidenceDigest": digest})
+	if _, err = tx.ExecContext(ctx, `INSERT INTO audit_events(actor_id,action,resource_type,resource_id,metadata_json,created_at) VALUES(?,?,?,?,?,?)`, actorID, "deployment_plan.migration.approve", "application", appID, string(metadata), now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) classifyWriteError(ctx context.Context, appID string, expected int64, cause error) error {
 	var current int64
 	if err := s.db.QueryRowContext(ctx, `SELECT revision_number FROM deployment_plan_heads WHERE app_id=?`, appID).Scan(&current); err == nil && current != expected {
@@ -195,11 +231,12 @@ func (s *Store) classifyWriteError(ctx context.Context, appID string, expected i
 }
 
 func (s *Store) readRevision(ctx context.Context, appID, id string, number int64) (DeploymentPlanRevision, error) {
-	var ref, digest, revisedAt, status, detector, detectorVersion, structuralFingerprint, migrationDigest string
+	var ref, digest, revisedAt, status, detector, detectorVersion, structuralFingerprint, migrationDigest, sourceProvider, sourceDigest string
+	var sourceRepositoryID int64
 	var revisedBy, acceptedBy, acceptedAt string
 	var strategy string
 	var componentCount, fieldCount int
-	err := s.db.QueryRowContext(ctx, `SELECT bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at FROM deployment_plan_revisions WHERE id=? AND app_id=? AND revision_number=?`, id, appID, number).Scan(&ref, &strategy, &detector, &detectorVersion, &structuralFingerprint, &digest, &componentCount, &fieldCount, &migrationDigest, &revisedBy, &revisedAt, &status, &acceptedBy, &acceptedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at FROM deployment_plan_revisions WHERE id=? AND app_id=? AND revision_number=?`, id, appID, number).Scan(&ref, &strategy, &detector, &detectorVersion, &structuralFingerprint, &sourceProvider, &sourceRepositoryID, &sourceDigest, &digest, &componentCount, &fieldCount, &migrationDigest, &revisedBy, &revisedAt, &status, &acceptedBy, &acceptedAt)
 	if err != nil {
 		return DeploymentPlanRevision{}, err
 	}
@@ -228,10 +265,20 @@ func (s *Store) readRevision(ctx context.Context, appID, id string, number int64
 		return DeploymentPlanRevision{}, err
 	}
 	computed, err := CanonicalDigest(canonical)
-	if err != nil || stored.Version != 1 || stored.Revision.ID != id || stored.Revision.AppID != appID || stored.Revision.RevisionNumber != number || stored.Revision.CanonicalDigest != computed || digest != computed || string(canonical.Strategy) != strategy || canonical.Detector.Name != detector || canonical.Detector.Version != detectorVersion || canonical.Detector.SourceStructuralFingerprint != structuralFingerprint || len(canonical.Components) != componentCount || len(canonical.FieldProvenance) != fieldCount || migrationEvidenceDigest(canonical.Migration) != migrationDigest || stored.Revision.RevisedBy != revisedBy || stored.Revision.RevisedAt != revisedAt || stored.Revision.AcceptedBy != acceptedBy || stored.Revision.AcceptedAt != acceptedAt || status != string(RevisionAccepted) {
+	if err != nil || stored.Version != 1 || stored.Revision.ID != id || stored.Revision.AppID != appID || stored.Revision.RevisionNumber != number || stored.Revision.CanonicalDigest != computed || digest != computed || string(canonical.Strategy) != strategy || canonical.Detector.Name != detector || canonical.Detector.Version != detectorVersion || canonical.Detector.SourceStructuralFingerprint != structuralFingerprint || canonical.Source.Provider != sourceProvider || canonical.Source.RepositoryID != sourceRepositoryID || canonical.Source.ResolvedDigest != sourceDigest || len(canonical.Components) != componentCount || len(canonical.FieldProvenance) != fieldCount || migrationEvidenceDigest(canonical.Migration) != migrationDigest || stored.Revision.RevisedBy != revisedBy || stored.Revision.RevisedAt != revisedAt || stored.Revision.AcceptedBy != acceptedBy || stored.Revision.AcceptedAt != acceptedAt || status != string(RevisionAccepted) {
 		return DeploymentPlanRevision{}, errors.New("deployment plan bundle metadata mismatch")
 	}
 	stored.Revision.Plan = canonical
+	if stored.Revision.Plan.Migration != nil {
+		var approval MigrationApproval
+		err := s.db.QueryRowContext(ctx, `SELECT approved_by,approved_at FROM deployment_plan_migration_approvals WHERE revision_id=? AND app_id=?`, id, appID).Scan(&approval.ActorID, &approval.At)
+		if err == nil {
+			approval.Status = MigrationApprovalApproved
+			stored.Revision.Plan.Migration.Approval = approval
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return DeploymentPlanRevision{}, err
+		}
+	}
 	var headNumber int64
 	if err := s.db.QueryRowContext(ctx, `SELECT revision_number FROM deployment_plan_heads WHERE app_id=?`, appID).Scan(&headNumber); err == nil && headNumber != number {
 		stored.Revision.State = RevisionSuperseded

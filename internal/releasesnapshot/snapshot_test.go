@@ -186,8 +186,8 @@ func TestMaterializePinsAcceptedDeploymentPlanRevision(t *testing.T) {
 		t.Fatalf("legacy=%#v err=%v", legacy, err)
 	}
 	id := "11111111-1111-1111-8111-111111111111"
-	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at)
-		VALUES(?,?,1,?,'generated_node','package-json','1',?,?,1,1,'','owner',datetime('now'),'accepted','owner',datetime('now'))`, id, app, "apps/"+app+"/deployment-plans/"+id+".secret", strings.Repeat("a", 64), strings.Repeat("b", 64)); err != nil {
+	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at)
+		VALUES(?,?,1,?,'generated_node','package-json','1',?,'github',7,?,?,1,1,'','owner',datetime('now'),'accepted','owner',datetime('now'))`, id, app, "apps/"+app+"/deployment-plans/"+id+".secret", strings.Repeat("a", 64), snapshotSHA, strings.Repeat("b", 64)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE deployment_plan_heads SET revision_id=?,revision_number=1,updated_at=datetime('now') WHERE app_id=?`, id, app); err != nil {
