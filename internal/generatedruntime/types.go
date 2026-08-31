@@ -96,6 +96,15 @@ type CandidateSpec struct {
 	Environment []byte
 }
 
+type ImageSpec struct {
+	AppID                    string
+	ReleaseID                string
+	ArtifactID               string
+	DeploymentPlanRevisionID string
+	ImageContentID           string
+	BuildDefinitionDigest    string
+}
+
 type Candidate struct {
 	AppID                    string
 	ReleaseID                string
@@ -115,6 +124,20 @@ type Candidate struct {
 
 	lease *capacityLease
 }
+
+// CandidateDescription exposes only deterministic, non-secret resource
+// identity. Coordinators persist it before Docker mutation so recovery never
+// has to infer intent from an existing container.
+type CandidateDescription struct {
+	Slot          Slot
+	ContainerName string
+	NetworkName   string
+	NetworkAlias  string
+}
+
+// AppNetworkDescription lets migration and ingress implementations join the
+// exact app-private network without duplicating the naming algorithm.
+type AppNetworkDescription struct{ Name string }
 
 type CapacitySnapshot struct {
 	MemoryAvailableBytes uint64
@@ -180,6 +203,7 @@ type MigrationRequest struct {
 	Command                     string
 	ConfigurationRevisionID     string
 	ConfigurationRevisionNumber int64
+	AllowedEnvironmentKeys      []string
 }
 
 // MigrationRunner is implemented separately because a migration has a

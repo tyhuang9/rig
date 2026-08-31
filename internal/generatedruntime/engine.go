@@ -347,7 +347,47 @@ func (e *Engine) ReleaseAdmission(candidate Candidate) {
 	candidate.lease.Release()
 }
 
+// ValidateImage is a read-only preflight. It proves that an artifact still
+// resolves to the exact compiler-owned image before a coordinator persists
+// ImageReady or performs any Docker mutation.
+func (e *Engine) ValidateImage(ctx context.Context, spec ImageSpec) error {
+	if e == nil || ctx == nil || !validImageSpec(spec) {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
+	_, err := e.inspectImageSpec(ctx, spec)
+	return err
+}
+
+func DescribeInactiveCandidate(appID, component string, active Slot) (CandidateDescription, error) {
+	if !canonicalUUID(appID) || !validText(component, 256) {
+		return CandidateDescription{}, &Error{Code: DiagnosticValidationFailed}
+	}
+	slot, err := InactiveSlot(active)
+	if err != nil {
+		return CandidateDescription{}, &Error{Code: DiagnosticValidationFailed}
+	}
+	return CandidateDescription{
+		Slot: slot, ContainerName: containerName(appID, component, slot),
+		NetworkName: networkName(appID), NetworkAlias: containerAlias(component, slot),
+	}, nil
+}
+
+func DescribeAppNetwork(appID string) (AppNetworkDescription, error) {
+	if !canonicalUUID(appID) {
+		return AppNetworkDescription{}, &Error{Code: DiagnosticValidationFailed}
+	}
+	return AppNetworkDescription{Name: networkName(appID)}, nil
+}
+
 func (e *Engine) inspectImage(ctx context.Context, spec CandidateSpec) (imageInspection, error) {
+	return e.inspectImageSpec(ctx, ImageSpec{
+		AppID: spec.AppID, ReleaseID: spec.ReleaseID, ArtifactID: spec.ArtifactID,
+		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, ImageContentID: spec.ImageContentID,
+		BuildDefinitionDigest: spec.BuildDefinitionDigest,
+	})
+}
+
+func (e *Engine) inspectImageSpec(ctx context.Context, spec ImageSpec) (imageInspection, error) {
 	result, runErr := e.run(ctx, []string{"image", "inspect", "--format", imageInspectFormat, spec.ImageContentID}, e.options.CommandTimeout)
 	if runErr != nil {
 		notFound := dockerNotFound(result)
@@ -597,11 +637,15 @@ func validEngineOptions(options EngineOptions) bool {
 }
 
 func validCandidateSpec(spec CandidateSpec) bool {
-	if !canonicalUUID(spec.AppID) || !validReleaseID(spec.ReleaseID) || !canonicalUUID(spec.DeploymentID) || !canonicalUUID(spec.ArtifactID) || !canonicalUUID(spec.DeploymentPlanRevisionID) || !validText(spec.ComponentName, 256) || !validRootDirectory(spec.RootDirectory) || deploymentplans.ValidateCommand(spec.RunCommand) != nil || spec.InternalPort == 0 || !validHealthProbe(spec.HealthProbe) || !validImageID(spec.ImageContentID) || !lowerHex(spec.BuildDefinitionDigest, 64) || !canonicalUUID(spec.EnvironmentOperationID) || spec.EnvironmentOperationAttempt < 1 || !validEnvironment(spec.Environment) {
+	if !validImageSpec(ImageSpec{AppID: spec.AppID, ReleaseID: spec.ReleaseID, ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, ImageContentID: spec.ImageContentID, BuildDefinitionDigest: spec.BuildDefinitionDigest}) || !canonicalUUID(spec.DeploymentID) || !validText(spec.ComponentName, 256) || !validRootDirectory(spec.RootDirectory) || deploymentplans.ValidateCommand(spec.RunCommand) != nil || spec.InternalPort == 0 || !validHealthProbe(spec.HealthProbe) || !canonicalUUID(spec.EnvironmentOperationID) || spec.EnvironmentOperationAttempt < 1 || !validEnvironment(spec.Environment) {
 		return false
 	}
 	_, err := InactiveSlot(spec.ActiveSlot)
 	return err == nil
+}
+
+func validImageSpec(spec ImageSpec) bool {
+	return canonicalUUID(spec.AppID) && validReleaseID(spec.ReleaseID) && canonicalUUID(spec.ArtifactID) && canonicalUUID(spec.DeploymentPlanRevisionID) && validImageID(spec.ImageContentID) && lowerHex(spec.BuildDefinitionDigest, 64)
 }
 
 func validEnvironment(environment []byte) bool {

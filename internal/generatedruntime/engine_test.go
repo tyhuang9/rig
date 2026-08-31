@@ -382,6 +382,48 @@ func TestGeneratedRuntimeIdentitiesAndSlotsAreDeterministic(t *testing.T) {
 	}
 }
 
+func TestGeneratedRuntimeValidateImageIsReadOnly(t *testing.T) {
+	expected := candidateSpec()
+	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		if commandKind(request.Args) != "image inspect" {
+			t.Fatalf("read-only image validation mutated Docker: %#v", request.Args)
+		}
+		return runtimeJSON(validImageInspection(expected))
+	})
+	err := engine.ValidateImage(context.Background(), ImageSpec{
+		AppID: expected.AppID, ReleaseID: expected.ReleaseID, ArtifactID: expected.ArtifactID,
+		DeploymentPlanRevisionID: expected.DeploymentPlanRevisionID, ImageContentID: expected.ImageContentID,
+		BuildDefinitionDigest: expected.BuildDefinitionDigest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.requests) != 1 || commandKind(runner.requests[0].Args) != "image inspect" {
+		t.Fatalf("validation requests = %#v", runner.requests)
+	}
+}
+
+func TestGeneratedRuntimeDescriptionsExposeDeterministicPreMutationIdentity(t *testing.T) {
+	spec := candidateSpec()
+	description, err := DescribeInactiveCandidate(spec.AppID, spec.ComponentName, SlotBlue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if description.Slot != SlotGreen || description.ContainerName != containerName(spec.AppID, spec.ComponentName, SlotGreen) || description.NetworkName != networkName(spec.AppID) || description.NetworkAlias != containerAlias(spec.ComponentName, SlotGreen) {
+		t.Fatalf("unexpected candidate description: %+v", description)
+	}
+	network, err := DescribeAppNetwork(spec.AppID)
+	if err != nil || network.Name != description.NetworkName {
+		t.Fatalf("unexpected app network: %+v %v", network, err)
+	}
+	if _, err := DescribeInactiveCandidate("invalid", spec.ComponentName, SlotBlue); !IsCode(err, DiagnosticValidationFailed) {
+		t.Fatalf("invalid app description error = %v", err)
+	}
+	if _, err := DescribeAppNetwork("invalid"); !IsCode(err, DiagnosticValidationFailed) {
+		t.Fatalf("invalid app network error = %v", err)
+	}
+}
+
 func candidateSpec() CandidateSpec {
 	return CandidateSpec{
 		AppID: "11111111-1111-4111-8111-111111111111", ReleaseID: "22222222-2222-4222-8222-222222222222",
