@@ -33,6 +33,7 @@ func TestRepositoryRecoveryPreservesGeneratedAndKeepsComposeBehavior(t *testing.
 		t.Fatal(err)
 	}
 	assertJob(t, fixture.db, fixture.jobID, "queued", "queued", "", 2, fixture.inputJSON)
+	assertRequeueReset(t, fixture.db, fixture.jobID)
 	assertJob(t, fixture.db, composeJobID, "interrupted", "interrupted", "daemon_restarted", 1, []byte("{}"))
 	assertEventCount(t, fixture.db, fixture.jobID, "daemon_restarted", 1)
 
@@ -48,6 +49,74 @@ func TestRepositoryRecoveryPreservesGeneratedAndKeepsComposeBehavior(t *testing.
 	assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
 	assertJob(t, fixture.db, fixture.jobID, "queued", "queued", "", 2, fixture.inputJSON)
 	assertEventCount(t, fixture.db, fixture.jobID, "daemon_restarted", 1)
+}
+
+func TestRecoveryRequeuesSafeGeneratedContinuationPoints(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		migration      bool
+		prepare        func(*testing.T, *recoveryFixture)
+		phase          string
+		migrationState string
+	}{
+		{
+			name: "migration not started", migration: true, phase: "migrating", migrationState: "pending",
+			prepare: func(t *testing.T, fixture *recoveryFixture) {
+				fixture.advance(t, generatedruntimestate.PhaseBuilding)
+				fixture.imageReady(t)
+				fixture.advance(t, generatedruntimestate.PhaseMigrating)
+			},
+		},
+		{
+			name: "migration already succeeded", migration: true, phase: "migrating", migrationState: "succeeded",
+			prepare: func(t *testing.T, fixture *recoveryFixture) {
+				fixture.advance(t, generatedruntimestate.PhaseBuilding)
+				fixture.imageReady(t)
+				fixture.advance(t, generatedruntimestate.PhaseMigrating)
+				if _, err := fixture.state.BeginMigration(context.Background(), fixture.appID, fixture.deploymentID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := fixture.state.FinishMigration(context.Background(), fixture.appID, fixture.deploymentID, true); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "candidate has durable container id", phase: "starting_candidate", migrationState: "not_required",
+			prepare: func(t *testing.T, fixture *recoveryFixture) {
+				fixture.advance(t, generatedruntimestate.PhaseBuilding)
+				fixture.imageReady(t)
+				fixture.advance(t, generatedruntimestate.PhaseStartingCandidate)
+				fixture.startRunning(t)
+			},
+		},
+		{
+			name: "candidate awaiting health", phase: "waiting_health", migrationState: "not_required",
+			prepare: func(t *testing.T, fixture *recoveryFixture) {
+				fixture.advance(t, generatedruntimestate.PhaseBuilding)
+				fixture.imageReady(t)
+				fixture.advance(t, generatedruntimestate.PhaseStartingCandidate)
+				fixture.startRunning(t)
+				fixture.advance(t, generatedruntimestate.PhaseWaitingHealth)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRecoveryFixture(t, test.migration)
+			test.prepare(t, fixture)
+			deploymentResult, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute))
+			if err != nil || deploymentResult.PreservedGenerated != 1 || deploymentResult.FailedGenerated != 0 {
+				t.Fatalf("deployment recovery = %#v err=%v", deploymentResult, err)
+			}
+			jobResult, err := generatedrecovery.RecoverJobs(context.Background(), fixture.db, fixture.now.Add(2*time.Minute))
+			if err != nil || jobResult.RequeuedGenerated != 1 || jobResult.Interrupted != 0 {
+				t.Fatalf("job recovery = %#v err=%v", jobResult, err)
+			}
+			assertRuntime(t, fixture.db, fixture.deploymentID, test.phase, test.migrationState, "")
+			assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
+			assertJob(t, fixture.db, fixture.jobID, "queued", "queued", "", 2, fixture.inputJSON)
+		})
+	}
 }
 
 func TestRecoveryFailsClosedForUnsafeGeneratedStates(t *testing.T) {
@@ -112,6 +181,45 @@ func TestRecoveryFailsClosedForUnsafeGeneratedStates(t *testing.T) {
 		}
 		assertRuntime(t, fixture.db, fixture.deploymentID, "failed", "not_required", "daemon_restarted")
 		assertMainDeployment(t, fixture.db, fixture.deploymentID, "failed", "daemon_restarted")
+	})
+
+	t.Run("job input no longer matches pinned provenance", func(t *testing.T) {
+		fixture := newRecoveryFixture(t, false)
+		wrongInput, err := json.Marshal(jobs.DeploymentInput{ReleaseID: fixture.releaseID, ConfigurationMode: jobs.ConfigurationOriginal})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.Exec(`UPDATE jobs SET input_json=? WHERE id=?`, string(wrongInput), fixture.jobID); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		assertRuntime(t, fixture.db, fixture.deploymentID, "failed", "not_required", "daemon_restarted")
+		assertMainDeployment(t, fixture.db, fixture.deploymentID, "failed", "daemon_restarted")
+	})
+
+	t.Run("post switch artifact provenance is unavailable", func(t *testing.T) {
+		fixture := newRecoveryFixture(t, false)
+		fixture.toSwitching(t)
+		if _, switched, err := fixture.state.SwitchActive(context.Background(), fixture.appID, fixture.deploymentID, 0); err != nil || !switched {
+			t.Fatalf("switch active: switched=%t err=%v", switched, err)
+		}
+		var artifactID string
+		if err := fixture.db.QueryRow(`SELECT image_artifact_id FROM generated_runtime_components WHERE deployment_id=? AND component_name=?`, fixture.deploymentID, fixture.component).Scan(&artifactID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.Exec(`UPDATE generated_image_artifacts SET state='unavailable',updated_at=? WHERE id=? AND state='ready'`, timestamp(fixture.now.Add(time.Second)), artifactID); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		assertRuntime(t, fixture.db, fixture.deploymentID, "failed", "not_required", "daemon_restarted")
+		assertMainDeployment(t, fixture.db, fixture.deploymentID, "failed", "daemon_restarted")
+		assertComponent(t, fixture.db, fixture.deploymentID, fixture.component, "failed", "daemon_restarted")
 	})
 }
 
@@ -214,7 +322,7 @@ func newRecoveryFixture(t *testing.T, migration bool) *recoveryFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,input_json,attempt,started_at,created_at,updated_at) VALUES(?,'deploy','application',?,'running','apply_runtime',?,?,2,?,?,?)`, fixture.jobID, fixture.appID, fixture.actorID, string(fixture.inputJSON), timestamp(fixture.now), timestamp(fixture.now), timestamp(fixture.now)); err != nil {
+	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,input_json,attempt,progress_percent,checkpoint_json,started_at,created_at,updated_at) VALUES(?,'deploy','application',?,'running','apply_runtime',?,?,2,60,'{"phase":"apply_runtime"}',?,?,?)`, fixture.jobID, fixture.appID, fixture.actorID, string(fixture.inputJSON), timestamp(fixture.now), timestamp(fixture.now), timestamp(fixture.now)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,release_id,job_id,status,configuration_mode,provenance_initialized,runtime_strategy,deployment_plan_revision_id,deployment_plan_revision_number,started_at) VALUES(?,?,?,?,'applying','current',1,'generated_node',?,1,?)`, fixture.deploymentID, fixture.appID, fixture.releaseID, fixture.jobID, fixture.planID, timestamp(fixture.now)); err != nil {
@@ -258,6 +366,16 @@ func (f *recoveryFixture) toSwitching(t *testing.T) {
 	f.advance(t, generatedruntimestate.PhaseBuilding)
 	f.imageReady(t)
 	f.advance(t, generatedruntimestate.PhaseStartingCandidate)
+	f.startRunning(t)
+	f.advance(t, generatedruntimestate.PhaseWaitingHealth)
+	if _, err := f.state.AdvanceComponent(context.Background(), f.appID, f.deploymentID, f.component, generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
+		t.Fatal(err)
+	}
+	f.advance(t, generatedruntimestate.PhaseSwitchingRoute)
+}
+
+func (f *recoveryFixture) startRunning(t *testing.T) {
+	t.Helper()
 	description, err := generatedruntime.DescribeInactiveCandidate(f.appID, f.component, "")
 	if err != nil {
 		t.Fatal(err)
@@ -268,11 +386,6 @@ func (f *recoveryFixture) toSwitching(t *testing.T) {
 	if _, err := f.state.SetContainerRunning(context.Background(), f.appID, f.deploymentID, f.component, strings.Repeat("d", 64)); err != nil {
 		t.Fatal(err)
 	}
-	f.advance(t, generatedruntimestate.PhaseWaitingHealth)
-	if _, err := f.state.AdvanceComponent(context.Background(), f.appID, f.deploymentID, f.component, generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
-		t.Fatal(err)
-	}
-	f.advance(t, generatedruntimestate.PhaseSwitchingRoute)
 }
 
 func (f *recoveryFixture) seedComposeDeployment(t *testing.T) (string, string) {
@@ -314,6 +427,18 @@ func assertRuntime(t *testing.T, db *sql.DB, deploymentID, wantPhase, wantMigrat
 	}
 }
 
+func assertComponent(t *testing.T, db *sql.DB, deploymentID, componentName, wantState, wantDiagnostic string) {
+	t.Helper()
+	var state string
+	var diagnostic sql.NullString
+	if err := db.QueryRow(`SELECT state,diagnostic_code FROM generated_runtime_components WHERE deployment_id=? AND component_name=?`, deploymentID, componentName).Scan(&state, &diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if state != wantState || diagnostic.String != wantDiagnostic {
+		t.Fatalf("component %s/%s = state %q diagnostic %q", deploymentID, componentName, state, diagnostic.String)
+	}
+}
+
 func assertJob(t *testing.T, db *sql.DB, jobID, wantStatus, wantPhase, wantError string, wantAttempt int, wantInput []byte) {
 	t.Helper()
 	var status, phase, input string
@@ -335,6 +460,19 @@ func assertEventCount(t *testing.T, db *sql.DB, jobID, code string, want int) {
 	}
 	if count != want {
 		t.Fatalf("job %s event %q count = %d, want %d", jobID, code, count, want)
+	}
+}
+
+func assertRequeueReset(t *testing.T, db *sql.DB, jobID string) {
+	t.Helper()
+	var progress int
+	var checkpoint string
+	var started, finished sql.NullString
+	if err := db.QueryRow(`SELECT progress_percent,checkpoint_json,started_at,finished_at FROM jobs WHERE id=?`, jobID).Scan(&progress, &checkpoint, &started, &finished); err != nil {
+		t.Fatal(err)
+	}
+	if progress != 0 || checkpoint != "{}" || started.Valid || finished.Valid {
+		t.Fatalf("requeued job state = progress %d checkpoint %q started %q finished %q", progress, checkpoint, started.String, finished.String)
 	}
 }
 

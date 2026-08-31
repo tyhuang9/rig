@@ -515,7 +515,7 @@ func failRuntimeDeployment(ctx context.Context, tx *sql.Tx, value runtimeDeploym
 	}
 	for _, component := range value.components {
 		switch component.state {
-		case "pending", "image_ready", "starting", "running", "healthy":
+		case "pending", "image_ready", "starting", "running", "healthy", "active", "draining":
 		default:
 			continue
 		}
