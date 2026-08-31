@@ -69,6 +69,7 @@ async function selectPendingGitHub(connectionId = connection.id) {
   fireEvent.click(screen.getByLabelText(/^github repository$/i));
   const connectionSelect = await screen.findByLabelText(/^github connection$/i);
   await screen.findAllByRole("option", { name: /github connection \(pending\)/i });
+  connectionSelect.focus();
   fireEvent.change(connectionSelect, { target: { value: connectionId } });
 }
 
@@ -436,12 +437,14 @@ describe("SourceWizard", () => {
     renderWizard();
     await selectPendingGitHub();
 
-    expect(screen.getByRole("button", { name: /resume authorization check/i })).toBeTruthy();
+    const resume = screen.getByRole("button", { name: /resume authorization check/i });
+    expect(resume).toBeTruthy();
+    expect(document.activeElement).toBe(resume);
     expect(screen.getByText(/authorization started earlier/i)).toBeTruthy();
     expect(document.body.textContent).not.toMatch(/USER-CODE|device-code-sentinel|verificationUri/i);
     vi.useFakeTimers();
     fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
-    expect(screen.getByRole("button", { name: /checking authorization/i }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("button", { name: /checking authorization/i }).getAttribute("aria-disabled")).toBe("true");
     await vi.advanceTimersByTimeAsync(29_000);
     expect(api.pollGitHubConnection).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1_000);
@@ -452,6 +455,7 @@ describe("SourceWizard", () => {
     expect(screen.getByText(/step 1 complete: signed in to github/i)).toBeTruthy();
     const install = screen.getByRole("link", { name: /install or configure repository access/i });
     expect(install.getAttribute("href")).toBe(pending.installUrl);
+    expect(document.activeElement).toBe(install);
     expect(document.body.textContent).not.toMatch(/USER-CODE|device-code-sentinel|verificationUri/i);
   });
 
@@ -487,7 +491,9 @@ describe("SourceWizard", () => {
     await flushAsyncWork();
 
     expect(screen.getByText(/select resume authorization check to try again/i)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    const retry = screen.getByRole("button", { name: /resume authorization check/i });
+    expect(document.activeElement).toBe(retry);
+    fireEvent.click(retry);
     await vi.advanceTimersByTimeAsync(0);
     await flushAsyncWork();
     expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
@@ -513,19 +519,20 @@ describe("SourceWizard", () => {
 
     expect(screen.getByText(new RegExp(`connection status: ${status.replace("_", " ")}`, "i"))).toBeTruthy();
     expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByLabelText(/^github connection$/i));
     expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
   });
 
-  it("expires a resumed authorization locally without polling past its pending expiry", async () => {
+  it("does not offer or invoke resume for an already-expired raw pending connection", async () => {
     const pending = pendingConnection({ pendingExpiresAt: new Date(Date.now() - 1000).toISOString(), nextPollAt: new Date(Date.now() - 2000).toISOString() });
     vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
     const poll = vi.spyOn(api, "pollGitHubConnection");
     renderWizard();
     await selectPendingGitHub();
-    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
 
-    expect(await screen.findByText(/github authorization expired/i)).toBeTruthy();
     expect(screen.getByText(/connection status: expired/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByLabelText(/^github connection$/i));
     expect(poll).not.toHaveBeenCalled();
   });
 

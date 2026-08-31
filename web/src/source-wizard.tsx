@@ -81,6 +81,12 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const [inspection, setInspection] = useState<InspectResponse | null>(null);
   const [inspectedKey, setInspectedKey] = useState("");
   const connectionContext = useRef<ConnectionContext>({ generation: 0, kind: "local", selectedConnectionId: "" });
+  const connectionSelect = useRef<HTMLSelectElement>(null);
+  const resumeAuthorizationButton = useRef<HTMLButtonElement>(null);
+  const installActionLink = useRef<HTMLAnchorElement>(null);
+  const focusResumeAfterSelection = useRef(false);
+  const authorizationFocusOrigin = useRef(false);
+  const focusAfterAuthorization = useRef<"connection" | "install" | null>(null);
   const inspectionGeneration = useRef(0);
   const inspectionRequest = useRef<{ generation: number; key: string } | null>(null);
   const priorConnection = useRef<{ id: string; status: string }>({ id: "", status: "" });
@@ -89,8 +95,9 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const capability = useQuery({ queryKey: ["system-status"], queryFn: api.status });
   const connections = useQuery({ queryKey: ["source-connections"], queryFn: api.sourceConnections, enabled: kind === "github" && capability.data?.capabilities.githubConnections === true });
   const selectedConnection = connections.data?.items.find((connection) => connection.id === selectedConnectionId);
-  const selectedStatus = connectionStatus(selectedConnection, pendingStatus);
+  const selectedStatus = pendingStatus ?? (selectedConnection?.status === "pending" && selectedConnection.pendingExpiresAt && isDeviceAuthorizationExpired(selectedConnection.pendingExpiresAt) ? "expired" : connectionStatus(selectedConnection));
   const isConnected = selectedStatus === "connected";
+  const canResumeAuthorization = selectedStatus === "pending" && selectedConnection?.status === "pending" && Boolean(selectedConnection.pendingExpiresAt) && !isDeviceAuthorizationExpired(selectedConnection.pendingExpiresAt!) && !deviceAuthorization;
 
   const installations = useQuery({
     queryKey: ["github-installations", selectedConnectionId, installationPage, pageSize],
@@ -130,6 +137,8 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     connectionContext.current = next;
     setAuthorizationSession(null);
     setInstallationAction(null);
+    authorizationFocusOrigin.current = false;
+    focusAfterAuthorization.current = null;
     return next;
   };
   const focusErrorSummary = () => window.setTimeout(() => errorSummary.current?.focus(), 0);
@@ -202,8 +211,24 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
 
   useEffect(() => {
     if (!installations.data?.items.length) return;
+    if (document.activeElement === installActionLink.current) focusAfterAuthorization.current = "connection";
     setInstallationAction((current) => current?.connectionId === selectedConnectionId ? null : current);
   }, [installations.data, selectedConnectionId]);
+
+  useEffect(() => {
+    if (!focusResumeAfterSelection.current) return;
+    focusResumeAfterSelection.current = false;
+    if (canResumeAuthorization) resumeAuthorizationButton.current?.focus();
+  }, [canResumeAuthorization, selectedConnectionId]);
+
+  useEffect(() => {
+    const target = focusAfterAuthorization.current;
+    if (!target) return;
+    const destination = target === "install" ? installActionLink.current ?? connectionSelect.current : connectionSelect.current;
+    if (!destination) return;
+    focusAfterAuthorization.current = null;
+    destination.focus();
+  });
 
   const beginConnection = useMutation({
     mutationFn: (_context: ConnectionContext) => api.startGitHubConnection(),
@@ -297,8 +322,13 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     const { context, expiresAt, nextPollAt } = authorizationSession;
     const expiration = Date.parse(expiresAt);
     const nextPoll = Date.parse(nextPollAt);
+    const queueFocusAfterAuthorization = (target: "connection" | "install") => {
+      if (authorizationFocusOrigin.current && document.activeElement === resumeAuthorizationButton.current) focusAfterAuthorization.current = target;
+      authorizationFocusOrigin.current = false;
+    };
     const finish = (status: SourceConnection["status"], message: string) => {
       if (!sameConnectionContext(context, connectionContext.current)) return;
+      queueFocusAfterAuthorization("connection");
       setPendingStatus(status);
       setAuthorizationSession(null);
       setDeviceAuthorization(null);
@@ -323,6 +353,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
       try {
         const connection = await api.pollGitHubConnection(context.selectedConnectionId);
         if (cancelled || !sameConnectionContext(context, connectionContext.current)) return;
+        if (connection.status !== "pending") queueFocusAfterAuthorization(connection.status === "connected" && Boolean(connection.installUrl) ? "install" : "connection");
         setPendingStatus(connection.status);
         if (connection.installUrl) setInstallationAction({ connectionId: connection.id, url: connection.installUrl });
         await queryClient.invalidateQueries({ queryKey: ["source-connections"] });
@@ -385,12 +416,12 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   }, [authorizationSession, queryClient]);
 
   const resumeAuthorization = () => {
-    if (!selectedConnection || selectedConnection.status !== "pending") return;
-    if (!selectedConnection.pendingExpiresAt) {
+    if (!canResumeAuthorization || !selectedConnection?.pendingExpiresAt) {
       setSourceError("Authorization timing is unavailable. Start a new connection.");
       return;
     }
     const context = advanceConnectionContext("github", selectedConnection.id);
+    authorizationFocusOrigin.current = document.activeElement === resumeAuthorizationButton.current;
     setDeviceAuthorization(null);
     setPendingStatus("pending");
     setSourceError("");
@@ -431,6 +462,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
 
   const githubEnabled = capability.data?.capabilities.githubConnections === true;
   const sourceIsBusy = beginConnection.isPending || refreshConnection.isPending || disconnectConnection.isPending;
+  const resumeUnavailable = sourceIsBusy || authorizationSession !== null;
   const installUrl = installationAction?.connectionId === selectedConnectionId ? installationAction.url : "";
   const githubSaveHelp = !githubEnabled
     ? "GitHub connections must be enabled before this application can be saved."
@@ -496,7 +528,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         {capability.isLoading ? <div className="callout info">Checking GitHub connection capability…</div> : capability.isError ? <div className="callout danger"><strong>Could not check GitHub capability</strong><span>{safeMessage(capability.error, "The controller status could not be loaded.")}</span><button type="button" className="button small" onClick={() => void capability.refetch()}>Retry capability check</button></div> : !githubEnabled ? <div className="callout warning"><strong>GitHub connections are disabled</strong><span>The administrator disabled GitHub connections on this controller.</span></div> : <>
           <div className="connection-actions">
             <button type="button" className="button" disabled={sourceIsBusy || authorizationSession !== null} onClick={() => beginConnection.mutate(connectionContext.current)}>{beginConnection.isPending ? "Starting…" : "Sign in to GitHub"}</button>
-            {selectedConnection?.status === "pending" && !deviceAuthorization && <button type="button" className="button primary" disabled={sourceIsBusy || authorizationSession !== null} onClick={resumeAuthorization}>{authorizationSession ? "Checking authorization…" : "Resume authorization check"}</button>}
+            {canResumeAuthorization && <button ref={resumeAuthorizationButton} type="button" className="button primary" aria-disabled={resumeUnavailable} onClick={() => { if (!resumeUnavailable) resumeAuthorization(); }}>{authorizationSession ? "Checking authorization…" : "Resume authorization check"}</button>}
             {selectedConnectionId && selectedStatus === "connected" && <button type="button" className="button" disabled={sourceIsBusy} onClick={() => refreshConnection.mutate({ connectionId: selectedConnectionId, context: connectionContext.current })}>{refreshConnection.isPending ? "Refreshing…" : "Refresh connection"}</button>}
             {selectedConnectionId && <button type="button" className="button" disabled={sourceIsBusy} onClick={() => disconnectConnection.mutate({ connectionId: selectedConnectionId, context: connectionContext.current })}>{disconnectConnection.isPending ? "Disconnecting…" : "Disconnect"}</button>}
           </div>
@@ -510,19 +542,19 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
               <strong>Step 1 complete: Signed in to GitHub</strong>
               <span>Step 2 of 2: Install or configure repository access.</span>
               <span>Choose the personal account or organization that owns the repository, then grant Rig access to the repositories you want to deploy.</span>
-              <span><a className="button primary" href={installUrl} target="_blank" rel="noreferrer">Install or configure repository access (opens in a new tab)</a></span>
+              <span><a ref={installActionLink} className="button primary" href={installUrl} target="_blank" rel="noreferrer">Install or configure repository access (opens in a new tab)</a></span>
             </> : selectedConnectionId ? <>
               <strong>{isConnected ? "GitHub connection ready" : selectedStatus === "pending" ? "GitHub authorization pending" : "GitHub connection needs attention"}</strong>
               <span>{`Connection status: ${selectedStatus.replaceAll("_", " ")}.`}</span>
               {sourceError && <span>{sourceError}</span>}
-              {!sourceError && selectedStatus === "pending" && <span>{authorizationSession ? "Rig is checking this authorization. Keep this page open." : "Select Resume authorization check to continue checking the authorization started earlier."}</span>}
+              {!sourceError && selectedStatus === "pending" && <span>{authorizationSession ? "Rig is checking this authorization. Keep this page open." : canResumeAuthorization ? "Select Resume authorization check to continue checking the authorization started earlier." : "This authorization can no longer be resumed. Start a new connection."}</span>}
               {!sourceError && selectedStatus === "access_lost" && <span>GitHub access was lost. Start a new connection before browsing repositories.</span>}
               {!sourceError && !isConnected && selectedStatus !== "access_lost" && selectedStatus !== "pending" && <span>Start a new connection or choose another connection.</span>}
             </> : sourceError ? <><strong>GitHub connection failed</strong><span>{sourceError}</span></> : connections.isFetching ? <span>Loading GitHub connections.</span> : connections.isError ? <span>GitHub connections could not be loaded.</span> : <span>{`GitHub connections loaded. ${connections.data?.items.length ? "Choose an existing connection or start a new one." : "Start a new connection."}`}</span>}
           </div>
           <div className="field">
             <label htmlFor="github-connection">GitHub connection</label>
-            <select id="github-connection" value={selectedConnectionId} disabled={connections.isFetching || connections.isError} onChange={(event) => { advanceConnectionContext("github", event.target.value); setSelectedConnectionId(event.target.value); setPendingStatus(undefined); setDeviceAuthorization(null); setSourceError(""); resetAfterConnection(); }}>
+            <select ref={connectionSelect} id="github-connection" value={selectedConnectionId} disabled={connections.isFetching || connections.isError} onChange={(event) => { const nextConnection = connections.data?.items.find((connection) => connection.id === event.target.value); focusResumeAfterSelection.current = nextConnection?.status === "pending" && Boolean(nextConnection.pendingExpiresAt) && !isDeviceAuthorizationExpired(nextConnection.pendingExpiresAt!); advanceConnectionContext("github", event.target.value); setSelectedConnectionId(event.target.value); setPendingStatus(undefined); setDeviceAuthorization(null); setSourceError(""); resetAfterConnection(); }}>
               <option value="">{connections.isFetching ? "Loading connections…" : connections.isError ? "Connections unavailable" : "Choose a connection"}</option>
               {connections.data?.items.map((connection) => <option key={connection.id} value={connection.id}>{connectionLabel(connection)}</option>)}
             </select>
