@@ -151,6 +151,24 @@ func TestApproveMigrationIsCASAndAudited(t *testing.T) {
 	}
 }
 
+func TestApproveMigrationRejectsSupersededRevision(t *testing.T) {
+	db := planDB(t)
+	store, err := New(db, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Replace(context.Background(), planTestApp, "owner", ReplaceInput{Plan: testPlan()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Replace(context.Background(), planTestApp, "owner", ReplaceInput{ExpectedRevisionNumber: first.RevisionNumber, Plan: testPlan()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApproveMigration(context.Background(), planTestApp, first.ID, first.RevisionNumber, 0, "owner"); !IsCode(err, "deployment_plan_conflict") {
+		t.Fatalf("stale approval=%v", err)
+	}
+}
+
 func planDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := database.Open(t.TempDir())
