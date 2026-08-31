@@ -12,6 +12,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/projectanalysis"
+	"github.com/hostd/hostd/internal/sourceinspection"
 )
 
 func TestMaterializeLocalRetainsBoundedSnapshotAndReusesByTreeAndRevision(t *testing.T) {
@@ -70,6 +72,62 @@ func TestMaterializeLocalSupportsLegacyDirectAndNestedCompose(t *testing.T) {
 				t.Fatalf("release=%#v", release)
 			}
 		})
+	}
+}
+
+func TestMaterializeLocalGeneratedPlanAllowsCodeChangesAndPausesOnStructuralDrift(t *testing.T) {
+	materializer, db, _, appID, actorID, source := localMaterializerFixture(t, false)
+	if err := os.Remove(filepath.Join(source, "deploy", "compose.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		filepath.Join(source, "package.json"):      `{"name":"demo","scripts":{"build":"npm run compile","start":"node server.js"},"dependencies":{"express":"1.0.0"}}`,
+		filepath.Join(source, "package-lock.json"): `{"lockfileVersion":3,"packages":{}}`,
+		filepath.Join(source, "server.js"):         "console.log('one')",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspection, err := sourceinspection.InspectLocalContext(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := inspection.Analysis.StructuralFingerprint
+	revisionID := uuid.NewString()
+	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at)
+		VALUES(?,?,1,?,'generated_node','projectanalysis',?,?,'local',0,?,?,1,1,'',?,datetime('now'),'accepted',?,datetime('now'))`, revisionID, appID, "apps/"+appID+"/deployment-plans/"+revisionID+".secret", projectanalysis.SchemaVersion, fingerprint, fingerprint, strings.Repeat("a", 64), actorID, actorID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE deployment_plan_heads SET revision_id=?,revision_number=1,updated_at=datetime('now') WHERE app_id=?`, revisionID, appID); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := materializer.MaterializeLocal(context.Background(), appID, source)
+	if err != nil || first.ComposePath != "" || first.DeploymentPlanRevisionID != revisionID {
+		t.Fatalf("generated release=%#v err=%v", first, err)
+	}
+	if ready, err := materializer.ReadyWorkspace(context.Background(), appID, first.ID); err != nil || ready.ID != first.ID {
+		t.Fatalf("generated ready workspace=%#v err=%v", ready, err)
+	}
+
+	if err := os.WriteFile(filepath.Join(source, "server.js"), []byte("console.log('ordinary code change')"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changedCode, err := materializer.MaterializeLocal(context.Background(), appID, source)
+	if err != nil || changedCode.ID == first.ID || changedCode.DeploymentPlanRevisionID != revisionID {
+		t.Fatalf("ordinary code release=%#v first=%#v err=%v", changedCode, first, err)
+	}
+
+	if err := os.WriteFile(filepath.Join(source, "package.json"), []byte(`{"name":"demo","scripts":{"build":"npm run compile","start":"node changed.js"},"dependencies":{"express":"1.0.0"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := materializer.MaterializeLocal(context.Background(), appID, source); !IsCode(err, "deployment_plan_review_required") {
+		t.Fatalf("structural drift error=%v", err)
+	}
+	var state, code string
+	if err := db.QueryRow(`SELECT workspace_state,materialization_error_code FROM releases ORDER BY created_at DESC LIMIT 1`).Scan(&state, &code); err != nil || state != WorkspaceStateFailed || code != "deployment_plan_review_required" {
+		t.Fatalf("drift release state=%q code=%q err=%v", state, code, err)
 	}
 }
 

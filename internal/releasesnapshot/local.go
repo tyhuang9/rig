@@ -46,8 +46,8 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 	if sourceType != "local" || strings.TrimSpace(storedPath) != strings.TrimSpace(sourcePath) {
 		return Release{}, &Error{Code: "invalid_source"}
 	}
-	inspection, err := sourceinspection.InspectLocal(sourcePath)
-	if err != nil || inspection.Source.ComposePath == "" || len(inspection.Findings) != 0 {
+	inspection, err := sourceinspection.InspectLocalContext(ctx, sourcePath)
+	if err != nil || len(inspection.Findings) != 0 || (inspection.Source.ComposePath == "" && !hasGeneratedAnalysis(inspection.Analysis)) {
 		return Release{}, &Error{Code: "invalid_source"}
 	}
 	sourceRoot := inspection.Source.Path
@@ -88,7 +88,7 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 		err = verifyLocalTree(ctx, sourceRoot, manifest, digest)
 	}
 	if err == nil {
-		err = validateComposeWorkspace(filepath.Join(staging, "workspace"), inspection.Source.ComposePath)
+		err = m.validateMaterializedWorkspace(ctx, release, filepath.Join(staging, "workspace"))
 	}
 	if err != nil {
 		code := "invalid_source"
@@ -96,6 +96,11 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 			code = "source_too_large"
 		} else if errors.Is(err, context.Canceled) {
 			code = "internal_error"
+		} else {
+			var releaseErr *Error
+			if errors.As(err, &releaseErr) {
+				code = releaseErr.Code
+			}
 		}
 		if m.abort(ctx, appID, release.ID, code) != nil {
 			return Release{}, &Error{Code: "internal_error"}
