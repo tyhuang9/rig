@@ -15,6 +15,7 @@ import (
 )
 
 type Status string
+type RuntimeStrategy string
 
 const (
 	Preparing      Status = "preparing"
@@ -24,6 +25,11 @@ const (
 	Failed         Status = "failed"
 	Cancelled      Status = "cancelled"
 	NeedsAttention Status = "needs_attention"
+)
+
+const (
+	RuntimeCompose       RuntimeStrategy = "compose"
+	RuntimeGeneratedNode RuntimeStrategy = "generated_node"
 )
 
 var (
@@ -36,40 +42,45 @@ var (
 )
 
 type Deployment struct {
-	ID                                string    `json:"id"`
-	AppID                             string    `json:"appId"`
-	ReleaseID                         string    `json:"releaseId,omitempty"`
-	JobID                             string    `json:"jobId"`
-	MachineID                         string    `json:"machineId,omitempty"`
-	Status                            Status    `json:"status"`
-	ConfigurationMode                 string    `json:"configurationMode"`
-	ActualConfigurationRevisionID     string    `json:"actualConfigurationRevisionId,omitempty"`
-	ActualConfigurationRevisionNumber int64     `json:"actualConfigurationRevisionNumber"`
-	ProvenanceInitialized             bool      `json:"-"`
-	StartedAt                         time.Time `json:"startedAt,omitempty"`
-	FinishedAt                        time.Time `json:"finishedAt,omitempty"`
-	DiagnosticCode                    string    `json:"diagnosticCode,omitempty"`
-	FailureSummary                    string    `json:"failureSummary,omitempty"`
-	Findings                          []Finding `json:"findings"`
+	ID                                string          `json:"id"`
+	AppID                             string          `json:"appId"`
+	ReleaseID                         string          `json:"releaseId,omitempty"`
+	JobID                             string          `json:"jobId"`
+	MachineID                         string          `json:"machineId,omitempty"`
+	Status                            Status          `json:"status"`
+	ConfigurationMode                 string          `json:"configurationMode"`
+	ActualConfigurationRevisionID     string          `json:"actualConfigurationRevisionId,omitempty"`
+	ActualConfigurationRevisionNumber int64           `json:"actualConfigurationRevisionNumber"`
+	RuntimeStrategy                   RuntimeStrategy `json:"runtimeStrategy"`
+	DeploymentPlanRevisionID          string          `json:"deploymentPlanRevisionId,omitempty"`
+	DeploymentPlanRevisionNumber      int64           `json:"deploymentPlanRevisionNumber"`
+	ProvenanceInitialized             bool            `json:"-"`
+	StartedAt                         time.Time       `json:"startedAt,omitempty"`
+	FinishedAt                        time.Time       `json:"finishedAt,omitempty"`
+	DiagnosticCode                    string          `json:"diagnosticCode,omitempty"`
+	FailureSummary                    string          `json:"failureSummary,omitempty"`
+	Findings                          []Finding       `json:"findings"`
 }
 
 type Release struct {
-	ID                          string    `json:"id"`
-	AppID                       string    `json:"appId"`
-	SourceProvider              string    `json:"sourceProvider"`
-	RepositoryID                int64     `json:"repositoryId,omitempty"`
-	RepositoryOwner             string    `json:"repositoryOwner,omitempty"`
-	RepositoryName              string    `json:"repositoryName,omitempty"`
-	TrackedRef                  string    `json:"trackedRef,omitempty"`
-	ResolvedSHA                 string    `json:"resolvedSha,omitempty"`
-	SourceCommitSHA             string    `json:"sourceCommitSha,omitempty"`
-	SourceBranch                string    `json:"sourceBranch,omitempty"`
-	ComposePath                 string    `json:"composePath,omitempty"`
-	ArchiveSHA256               string    `json:"archiveSha256,omitempty"`
-	WorkspaceState              string    `json:"workspaceState,omitempty"`
-	ConfigurationRevisionID     string    `json:"configurationRevisionId,omitempty"`
-	ConfigurationRevisionNumber int64     `json:"configurationRevisionNumber"`
-	CreatedAt                   time.Time `json:"createdAt"`
+	ID                           string    `json:"id"`
+	AppID                        string    `json:"appId"`
+	SourceProvider               string    `json:"sourceProvider"`
+	RepositoryID                 int64     `json:"repositoryId,omitempty"`
+	RepositoryOwner              string    `json:"repositoryOwner,omitempty"`
+	RepositoryName               string    `json:"repositoryName,omitempty"`
+	TrackedRef                   string    `json:"trackedRef,omitempty"`
+	ResolvedSHA                  string    `json:"resolvedSha,omitempty"`
+	SourceCommitSHA              string    `json:"sourceCommitSha,omitempty"`
+	SourceBranch                 string    `json:"sourceBranch,omitempty"`
+	ComposePath                  string    `json:"composePath,omitempty"`
+	ArchiveSHA256                string    `json:"archiveSha256,omitempty"`
+	WorkspaceState               string    `json:"workspaceState,omitempty"`
+	ConfigurationRevisionID      string    `json:"configurationRevisionId,omitempty"`
+	ConfigurationRevisionNumber  int64     `json:"configurationRevisionNumber"`
+	DeploymentPlanRevisionID     string    `json:"deploymentPlanRevisionId,omitempty"`
+	DeploymentPlanRevisionNumber int64     `json:"deploymentPlanRevisionNumber"`
+	CreatedAt                    time.Time `json:"createdAt"`
 }
 
 type Finding struct {
@@ -176,15 +187,76 @@ func (r *Repository) Create(ctx context.Context, appID, jobID, configurationMode
 // Initialize resolves immutable release and actual configuration provenance.
 // The migration permits this exactly once while the deployment is preparing.
 func (r *Repository) Initialize(ctx context.Context, appID, deploymentID, releaseID, configurationID string, configurationNumber int64) (Deployment, error) {
-	if (releaseID != "" && !validReleaseID(releaseID)) || configurationNumber < 0 || (configurationNumber == 0) != (configurationID == "") {
+	return r.InitializeRuntime(ctx, appID, deploymentID, releaseID, configurationID, configurationNumber, RuntimeCompose, "", 0)
+}
+
+// InitializeRuntime resolves immutable release, configuration, runtime
+// strategy, and accepted-plan provenance in one transaction. Compose callers
+// may omit plan provenance; when a release pins a Compose plan it is inherited.
+func (r *Repository) InitializeRuntime(ctx context.Context, appID, deploymentID, releaseID, configurationID string, configurationNumber int64, strategy RuntimeStrategy, planRevisionID string, planRevisionNumber int64) (Deployment, error) {
+	if r == nil || r.db == nil || ctx == nil || uuid.Validate(appID) != nil || uuid.Validate(deploymentID) != nil ||
+		(releaseID != "" && !validReleaseID(releaseID)) || configurationNumber < 0 || (configurationNumber == 0) != (configurationID == "") ||
+		(strategy != RuntimeCompose && strategy != RuntimeGeneratedNode) || (planRevisionNumber == 0) != (planRevisionID == "") ||
+		(planRevisionID != "" && (uuid.Validate(planRevisionID) != nil || planRevisionNumber < 1)) {
 		return Deployment{}, ErrInvalidDeployment
 	}
-	result, err := r.db.ExecContext(ctx, `UPDATE deployments SET release_id=?,actual_configuration_revision_id=?,actual_configuration_revision_number=?,provenance_initialized=1 WHERE id=? AND app_id=? AND status='preparing' AND provenance_initialized=0`, nullable(releaseID), nullable(configurationID), configurationNumber, deploymentID, appID)
+	if strategy == RuntimeGeneratedNode && (releaseID == "" || planRevisionID == "") {
+		return Deployment{}, ErrInvalidDeployment
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Deployment{}, err
+	}
+	defer tx.Rollback()
+	var currentStatus Status
+	var initialized bool
+	if err := tx.QueryRowContext(ctx, `SELECT status,provenance_initialized FROM deployments WHERE id=? AND app_id=?`, deploymentID, appID).Scan(&currentStatus, &initialized); errors.Is(err, sql.ErrNoRows) {
+		return Deployment{}, ErrNotFound
+	} else if err != nil {
+		return Deployment{}, err
+	}
+	if currentStatus != Preparing || initialized {
+		return Deployment{}, ErrInvalidTransition
+	}
+	if releaseID == "" {
+		if strategy != RuntimeCompose || planRevisionID != "" {
+			return Deployment{}, ErrInvalidDeployment
+		}
+	} else {
+		var releasePlanID, releasePlanStrategy string
+		var releasePlanNumber int64
+		err := tx.QueryRowContext(ctx, `SELECT COALESCE(r.deployment_plan_revision_id,''),COALESCE(r.deployment_plan_revision_number,0),COALESCE(p.strategy,'')
+			FROM releases r LEFT JOIN deployment_plan_revisions p ON p.id=r.deployment_plan_revision_id AND p.app_id=r.app_id AND p.revision_number=r.deployment_plan_revision_number
+			WHERE r.id=? AND r.app_id=? AND (r.workspace_state='ready' OR r.workspace_state IS NULL)`, releaseID, appID).Scan(&releasePlanID, &releasePlanNumber, &releasePlanStrategy)
+		if errors.Is(err, sql.ErrNoRows) {
+			return Deployment{}, ErrInvalidDeployment
+		}
+		if err != nil {
+			return Deployment{}, err
+		}
+		if releasePlanID != "" {
+			if releasePlanStrategy != string(strategy) {
+				return Deployment{}, ErrInvalidDeployment
+			}
+			if planRevisionID == "" && strategy == RuntimeCompose {
+				planRevisionID, planRevisionNumber = releasePlanID, releasePlanNumber
+			}
+			if planRevisionID != releasePlanID || planRevisionNumber != releasePlanNumber {
+				return Deployment{}, ErrInvalidDeployment
+			}
+		} else if planRevisionID != "" {
+			return Deployment{}, ErrInvalidDeployment
+		}
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE deployments SET release_id=?,actual_configuration_revision_id=?,actual_configuration_revision_number=?,runtime_strategy=?,deployment_plan_revision_id=?,deployment_plan_revision_number=?,provenance_initialized=1 WHERE id=? AND app_id=? AND status='preparing' AND provenance_initialized=0`, nullable(releaseID), nullable(configurationID), configurationNumber, strategy, nullable(planRevisionID), nullableInt(planRevisionNumber), deploymentID, appID)
 	if err != nil {
 		return Deployment{}, err
 	}
 	if count, err := result.RowsAffected(); err != nil || count != 1 {
 		return Deployment{}, ErrInvalidTransition
+	}
+	if err := tx.Commit(); err != nil {
+		return Deployment{}, err
 	}
 	return r.Get(ctx, appID, deploymentID)
 }
@@ -357,14 +429,14 @@ func (r *Repository) List(ctx context.Context, appID string, limit int) ([]Deplo
 	return result, nil
 }
 
-const deploymentSelect = `SELECT d.id,d.app_id,COALESCE(d.release_id,''),COALESCE(d.job_id,''),COALESCE(d.machine_id,''),d.status,d.configuration_mode,COALESCE(d.actual_configuration_revision_id,''),d.actual_configuration_revision_number,d.provenance_initialized,COALESCE(d.started_at,''),COALESCE(d.finished_at,''),COALESCE(d.diagnostic_code,''),COALESCE(d.failure_summary,'') FROM deployments d`
+const deploymentSelect = `SELECT d.id,d.app_id,COALESCE(d.release_id,''),COALESCE(d.job_id,''),COALESCE(d.machine_id,''),d.status,d.configuration_mode,COALESCE(d.actual_configuration_revision_id,''),d.actual_configuration_revision_number,d.runtime_strategy,COALESCE(d.deployment_plan_revision_id,''),COALESCE(d.deployment_plan_revision_number,0),d.provenance_initialized,COALESCE(d.started_at,''),COALESCE(d.finished_at,''),COALESCE(d.diagnostic_code,''),COALESCE(d.failure_summary,'') FROM deployments d`
 
 type scanner interface{ Scan(...any) error }
 
 func scanDeployment(row scanner) (Deployment, error) {
 	var value Deployment
 	var started, finished string
-	err := row.Scan(&value.ID, &value.AppID, &value.ReleaseID, &value.JobID, &value.MachineID, &value.Status, &value.ConfigurationMode, &value.ActualConfigurationRevisionID, &value.ActualConfigurationRevisionNumber, &value.ProvenanceInitialized, &started, &finished, &value.DiagnosticCode, &value.FailureSummary)
+	err := row.Scan(&value.ID, &value.AppID, &value.ReleaseID, &value.JobID, &value.MachineID, &value.Status, &value.ConfigurationMode, &value.ActualConfigurationRevisionID, &value.ActualConfigurationRevisionNumber, &value.RuntimeStrategy, &value.DeploymentPlanRevisionID, &value.DeploymentPlanRevisionNumber, &value.ProvenanceInitialized, &started, &finished, &value.DiagnosticCode, &value.FailureSummary)
 	value.StartedAt, _ = time.Parse(time.RFC3339Nano, started)
 	value.FinishedAt, _ = time.Parse(time.RFC3339Nano, finished)
 	return value, err
@@ -390,12 +462,12 @@ func (r *Repository) Releases(ctx context.Context, appID string, limit int) ([]R
 	return result, rows.Err()
 }
 
-const releaseSelect = `SELECT id,app_id,COALESCE(source_provider,''),COALESCE(repository_id,0),COALESCE(repository_owner,''),COALESCE(repository_name,''),COALESCE(tracked_ref,''),COALESCE(resolved_sha,''),source_commit_sha,source_branch,COALESCE(compose_path,''),COALESCE(archive_sha256,''),COALESCE(workspace_state,''),COALESCE(configuration_revision_id,''),configuration_revision_number,created_at FROM releases`
+const releaseSelect = `SELECT id,app_id,COALESCE(source_provider,''),COALESCE(repository_id,0),COALESCE(repository_owner,''),COALESCE(repository_name,''),COALESCE(tracked_ref,''),COALESCE(resolved_sha,''),source_commit_sha,source_branch,COALESCE(compose_path,''),COALESCE(archive_sha256,''),COALESCE(workspace_state,''),COALESCE(configuration_revision_id,''),configuration_revision_number,COALESCE(deployment_plan_revision_id,''),COALESCE(deployment_plan_revision_number,0),created_at FROM releases`
 
 func scanRelease(row scanner) (Release, error) {
 	var value Release
 	var created string
-	err := row.Scan(&value.ID, &value.AppID, &value.SourceProvider, &value.RepositoryID, &value.RepositoryOwner, &value.RepositoryName, &value.TrackedRef, &value.ResolvedSHA, &value.SourceCommitSHA, &value.SourceBranch, &value.ComposePath, &value.ArchiveSHA256, &value.WorkspaceState, &value.ConfigurationRevisionID, &value.ConfigurationRevisionNumber, &created)
+	err := row.Scan(&value.ID, &value.AppID, &value.SourceProvider, &value.RepositoryID, &value.RepositoryOwner, &value.RepositoryName, &value.TrackedRef, &value.ResolvedSHA, &value.SourceCommitSHA, &value.SourceBranch, &value.ComposePath, &value.ArchiveSHA256, &value.WorkspaceState, &value.ConfigurationRevisionID, &value.ConfigurationRevisionNumber, &value.DeploymentPlanRevisionID, &value.DeploymentPlanRevisionNumber, &created)
 	value.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	return value, err
 }
@@ -434,6 +506,13 @@ func (r *Repository) Findings(ctx context.Context, appID, deploymentID string) (
 
 func nullable(value string) any {
 	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func nullableInt(value int64) any {
+	if value == 0 {
 		return nil
 	}
 	return value

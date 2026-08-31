@@ -164,6 +164,78 @@ func TestInitializeLocksLocalAndReleaseProvenanceAndEnforcesIDOR(t *testing.T) {
 	}
 }
 
+func TestInitializeRuntimePinsGeneratedPlanAndComposeRemainsCompatible(t *testing.T) {
+	t.Run("generated plan is exact and immutable", func(t *testing.T) {
+		fixture := newRepositoryFixture(t)
+		planID, releaseID := seedRuntimePlanRelease(t, fixture, RuntimeGeneratedNode)
+		deployment, err := fixture.repository.Create(context.Background(), fixture.appA, fixture.jobA, "current")
+		if err != nil {
+			t.Fatal(err)
+		}
+		deployment, err = fixture.repository.InitializeRuntime(context.Background(), fixture.appA, deployment.ID, releaseID, "", 0, RuntimeGeneratedNode, planID, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if deployment.RuntimeStrategy != RuntimeGeneratedNode || deployment.DeploymentPlanRevisionID != planID || deployment.DeploymentPlanRevisionNumber != 1 {
+			t.Fatalf("runtime provenance = %#v", deployment)
+		}
+		if _, err := fixture.repository.db.Exec(`UPDATE deployments SET deployment_plan_revision_number=2 WHERE id=?`, deployment.ID); err == nil {
+			t.Fatal("generated runtime plan provenance was mutable")
+		}
+	})
+
+	t.Run("compose inherits a release-pinned compose plan", func(t *testing.T) {
+		fixture := newRepositoryFixture(t)
+		planID, releaseID := seedRuntimePlanRelease(t, fixture, RuntimeCompose)
+		deployment, err := fixture.repository.Create(context.Background(), fixture.appA, fixture.jobA, "current")
+		if err != nil {
+			t.Fatal(err)
+		}
+		deployment, err = fixture.repository.Initialize(context.Background(), fixture.appA, deployment.ID, releaseID, "", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if deployment.RuntimeStrategy != RuntimeCompose || deployment.DeploymentPlanRevisionID != planID || deployment.DeploymentPlanRevisionNumber != 1 {
+			t.Fatalf("compose runtime provenance = %#v", deployment)
+		}
+	})
+
+	t.Run("compose cannot execute a generated release", func(t *testing.T) {
+		fixture := newRepositoryFixture(t)
+		_, releaseID := seedRuntimePlanRelease(t, fixture, RuntimeGeneratedNode)
+		deployment, err := fixture.repository.Create(context.Background(), fixture.appA, fixture.jobA, "current")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.repository.Initialize(context.Background(), fixture.appA, deployment.ID, releaseID, "", 0); !errors.Is(err, ErrInvalidDeployment) {
+			t.Fatalf("generated release initialized as Compose: %v", err)
+		}
+	})
+}
+
+func seedRuntimePlanRelease(t *testing.T, fixture repositoryFixture, strategy RuntimeStrategy) (string, string) {
+	t.Helper()
+	planID := uuid.NewString()
+	releaseID := uuid.NewString()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := fixture.repository.db.Exec(`INSERT INTO deployment_plan_revisions(
+		id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,
+		analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,
+		field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at
+	) VALUES(?,?,1,?,?,'test','1',?,'local',0,?,?,1,8,'',?,?,'accepted',?,?)`,
+		planID, fixture.appA, "apps/"+fixture.appA+"/deployment-plans/"+planID+".secret", strategy,
+		strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64), fixture.actor, now, fixture.actor, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repository.db.Exec(`INSERT INTO releases(
+		id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,workspace_state,workspace_tree_sha256,
+		deployment_plan_revision_id,deployment_plan_revision_number
+	) VALUES(?,?,'ready','{}',?,'local',0,?,'ready',?,?,1)`, releaseID, fixture.appA, now, strings.Repeat("b", 64), strings.Repeat("d", 64), planID); err != nil {
+		t.Fatal(err)
+	}
+	return planID, releaseID
+}
+
 func TestGatePersistsFullFindingSetAndAtomicallyRechecksApprovals(t *testing.T) {
 	fixture := newRepositoryFixture(t)
 	ctx := context.Background()
