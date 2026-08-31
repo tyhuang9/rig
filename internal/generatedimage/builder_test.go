@@ -497,6 +497,32 @@ func TestBuilderManagerRecoversExactOwnedContainerLifecycle(t *testing.T) {
 	}
 }
 
+func TestBuilderManagerRefusesLifecycleRecoveryWhenOwnershipDrifts(t *testing.T) {
+	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+	manager := newBuilderManagerForTest(t, daemon)
+	session, err := manager.Prepare(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon.mu.Lock()
+	identity := daemon.nodes[session.BuilderName]
+	containerName := buildkitContainerName(identity)
+	container := daemon.boxes[containerName]
+	container.State.Running = false
+	container.Config.Labels["rig.builder"] = "rig-buildkit-aaaaaaaaaaaaaaaaaaaaaaaa"
+	daemon.boxes[containerName] = container
+	before := len(daemon.calls)
+	daemon.mu.Unlock()
+
+	_, err = manager.Prepare(context.Background())
+	if !IsBuilderError(err, BuilderDriftDetected) {
+		t.Fatalf("ownership drift error = %v", err)
+	}
+	if got, want := commandKinds(daemon.requests()[before:]), []string{"info --format", "network inspect", "container inspect"}; !sameStrings(got, want) {
+		t.Fatalf("commands after lifecycle ownership drift = %#v, want read-only %#v", got, want)
+	}
+}
+
 func TestBuilderManagerBlocksLegacyV1StateBeforeDockerMutation(t *testing.T) {
 	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
 	manager := newBuilderManagerForTest(t, daemon)

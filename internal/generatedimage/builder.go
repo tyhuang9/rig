@@ -556,10 +556,10 @@ func (m *BuilderManager) ensureBuildkitContainer(ctx context.Context, identity b
 	if err != nil {
 		return err
 	}
-	if !found || !matchesBuildkitContainer(container, identity, m.options.StateQuotaBytes) {
+	if !found || !matchesBuildkitContainerConfiguration(container, identity, m.options.StateQuotaBytes) {
 		return &BuilderError{Code: BuilderDriftDetected}
 	}
-	return nil
+	return m.recoverBuildkitContainer(ctx, identity, container, env)
 }
 
 func (m *BuilderManager) recoverBuildkitContainer(ctx context.Context, identity builderIdentity, container buildkitContainer, env []string) error {
