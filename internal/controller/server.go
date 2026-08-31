@@ -701,7 +701,9 @@ func inspectionGitHubSource(value apicontract.GitHubSource) sourceinspection.Git
 	return sourceinspection.GitHubSource{ConnectionID: value.ConnectionID, InstallationID: value.InstallationID, RepositoryID: value.RepositoryID, Branch: value.Branch, ComposePath: value.ComposePath}
 }
 func contractInspection(value sourceinspection.Result) apicontract.InspectResponse {
-	result := apicontract.InspectResponse{ResolvedSha: value.ResolvedSHA, ComposeCandidates: value.ComposeCandidates, Services: make([]apicontract.DetectedService, 0, len(value.Services)), Findings: make([]apicontract.SourceFinding, 0, len(value.Findings)), Source: apicontract.SourceSummary{Type: value.Source.Type, Path: value.Source.Path, ConnectionID: value.Source.ConnectionID, InstallationID: value.Source.InstallationID, RepositoryID: value.Source.RepositoryID, RepositoryOwner: value.Source.RepositoryOwner, RepositoryName: value.Source.RepositoryName, TrackedBranch: value.Source.TrackedBranch, TrackedRef: value.Source.TrackedRef, ComposePath: value.Source.ComposePath, ResolvedSha: value.ResolvedSHA}}
+	composeCandidates := make([]string, len(value.ComposeCandidates))
+	copy(composeCandidates, value.ComposeCandidates)
+	result := apicontract.InspectResponse{ResolvedSha: value.ResolvedSHA, ComposeCandidates: composeCandidates, Services: make([]apicontract.DetectedService, 0, len(value.Services)), Findings: make([]apicontract.SourceFinding, 0, len(value.Findings)), Source: apicontract.SourceSummary{Type: value.Source.Type, Path: value.Source.Path, ConnectionID: value.Source.ConnectionID, InstallationID: value.Source.InstallationID, RepositoryID: value.Source.RepositoryID, RepositoryOwner: value.Source.RepositoryOwner, RepositoryName: value.Source.RepositoryName, TrackedBranch: value.Source.TrackedBranch, TrackedRef: value.Source.TrackedRef, ComposePath: value.Source.ComposePath, ResolvedSha: value.ResolvedSHA}}
 	for _, service := range value.Services {
 		result.Services = append(result.Services, apicontract.DetectedService{Name: service.Name, Image: service.Image, BuildContext: service.BuildContext})
 	}

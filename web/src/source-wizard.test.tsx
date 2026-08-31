@@ -795,9 +795,13 @@ describe("SourceWizard", () => {
     expect(screen.queryByRole("navigation", { name: /branches pagination/i })).toBeNull();
   });
 
-  it("does not report a clean discovery with no Compose candidates as successful", async () => {
-    vi.mocked(api.inspect).mockResolvedValueOnce({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: [], services: [], findings: [] });
+  it("normalizes null inspection collections into the no-Compose state without enabling save", async () => {
+    vi.mocked(api.inspect).mockRestore();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: null, services: null, findings: null }), { status: 200 }),
+    ));
     renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "GitHub app" } });
     await selectConnectedGitHub();
     await selectInstallation();
     await selectRepository();
@@ -807,9 +811,13 @@ describe("SourceWizard", () => {
     const emptyResult = (await screen.findByText(/no compose files found/i)).closest("[role='status']");
     expect(emptyResult?.getAttribute("aria-live")).toBe("polite");
     expect(emptyResult?.getAttribute("aria-atomic")).toBe("true");
-    expect(emptyResult?.textContent).toMatch(/add a compose file to the tracked branch, then inspect again/i);
+    expect(screen.getByText("Add a Compose file to the tracked branch, then inspect again.")).toBeTruthy();
+    expect(screen.getByText("Add a Compose file to the tracked branch, then inspect again before saving.")).toBeTruthy();
     expect(screen.queryByText(/source inspection completed/i)).toBeNull();
+    expect(screen.queryByText(/ready to save/i)).toBeNull();
     expect(screen.queryByLabelText(/^compose file$/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /save application/i }).hasAttribute("disabled")).toBe(true);
+    expect(api.createApp).not.toHaveBeenCalled();
   });
 
   it.each(["success", "error"] as const)("ignores a stale GitHub inspection %s after an upstream branch change", async (outcome) => {

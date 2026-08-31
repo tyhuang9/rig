@@ -161,6 +161,15 @@ function pagedPath(path: string, values: Record<string, string | number>, page: 
   return `${operationPath(path, values)}?${query.toString()}`;
 }
 
+function normalizeInspectionResponse(value: InspectResponse): InspectResponse {
+  return {
+    ...value,
+    composeCandidates: Array.isArray(value.composeCandidates) ? value.composeCandidates : [],
+    services: Array.isArray(value.services) ? value.services : [],
+    findings: Array.isArray(value.findings) ? value.findings : [],
+  };
+}
+
 export const api = {
   bootstrapStatus: () => request<BootstrapStatus>(operations.bootstrapStatus.path),
   bootstrap: (data: BootstrapRequest) =>
@@ -218,11 +227,11 @@ export const api = {
     }),
   createApp: (data: CreateApplicationRequest) =>
     request<Application>(operations.createApplication.path, { method: "POST", body: JSON.stringify(data) }),
-  inspect: (data: InspectRequest) =>
-    request<InspectResponse>(operations.inspectImport.path, {
+  inspect: async (data: InspectRequest) =>
+    normalizeInspectionResponse(await request<InspectResponse>(operations.inspectImport.path, {
       method: "POST",
       body: JSON.stringify(data),
-    }),
+    })),
   sourceConnections: () => request<SourceConnectionList>(operations.listSourceConnections.path),
   startGitHubConnection: () =>
     request<GitHubDeviceAuthorization>(operations.startGitHubDeviceConnection.path, {

@@ -166,8 +166,6 @@ func TestGitHubRepositoryBranchInspectionAndApplicationCreationAPI(t *testing.T)
 	harness.provider.repositoryPage = githubapp.RepositoryPage{TotalCount: 1, Repositories: []githubapp.Repository{harness.provider.repository}}
 	harness.provider.branch = githubapp.Branch{Name: "feature/slash", SHA: sha, Protected: true}
 	harness.provider.branchPage = githubapp.BranchPage{Branches: []githubapp.Branch{harness.provider.branch}}
-	harness.provider.tree = githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "deploy/compose.yaml", Type: "blob", SHA: sha}}}
-	harness.provider.content = []byte("services:\n  api:\n    image: example/api\n")
 	base := "/api/v1/source-connections/" + connection.ID + "/github/installations/9/repositories"
 	repositories := sourceRequest(harness.handler, harness.session, http.MethodGet, base+"?page=1&perPage=30", "", true)
 	if repositories.Code != http.StatusOK || !strings.Contains(repositories.Body.String(), `"owner":"new-owner"`) {
@@ -177,11 +175,20 @@ func TestGitHubRepositoryBranchInspectionAndApplicationCreationAPI(t *testing.T)
 	if branches.Code != http.StatusOK || !strings.Contains(branches.Body.String(), `"name":"feature/slash"`) {
 		t.Fatalf("branches=%d %s", branches.Code, branches.Body.String())
 	}
+	githubDiscoveryJSON := `{"connectionId":"` + connection.ID + `","installationId":9,"repositoryId":77,"branch":"feature/slash"}`
+	noCompose := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps/import/inspect", `{"githubSource":`+githubDiscoveryJSON+`}`, true)
+	if noCompose.Code != http.StatusOK || !strings.Contains(noCompose.Body.String(), `"code":"compose_not_found"`) {
+		t.Fatalf("GitHub no-Compose inspect=%d %s", noCompose.Code, noCompose.Body.String())
+	}
+	assertInspectionCollections(t, noCompose, map[string]bool{"composeCandidates": true, "services": true})
+	harness.provider.tree = githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "deploy/compose.yaml", Type: "blob", SHA: sha}}}
+	harness.provider.content = []byte("services:\n  api:\n    image: example/api\n")
 	githubJSON := `{"connectionId":"` + connection.ID + `","installationId":9,"repositoryId":77,"branch":"feature/slash","composePath":"deploy/compose.yaml"}`
 	inspected := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps/import/inspect", `{"githubSource":`+githubJSON+`}`, true)
 	if inspected.Code != http.StatusOK || !strings.Contains(inspected.Body.String(), `"resolvedSha":"`+sha+`"`) || !strings.Contains(inspected.Body.String(), `"name":"api"`) {
 		t.Fatalf("inspect=%d %s", inspected.Code, inspected.Body.String())
 	}
+	assertInspectionCollections(t, inspected, map[string]bool{"findings": true})
 	created := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps", `{"name":"GitHub App","githubSource":`+githubJSON+`}`, true)
 	if created.Code != http.StatusCreated || !strings.Contains(created.Body.String(), `"repositoryName":"renamed"`) {
 		t.Fatalf("create=%d %s", created.Code, created.Body.String())
@@ -204,6 +211,31 @@ func TestInspectRequiresExactlyOneSourceAndLocalInspectionRemainsUseful(t *testi
 	response := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps/import/inspect", `{"sourcePath":`+strconv.Quote(root)+`}`, true)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"name":"local"`) {
 		t.Fatalf("local=%d %s", response.Code, response.Body.String())
+	}
+	assertInspectionCollections(t, response, map[string]bool{"findings": true})
+
+	empty := t.TempDir()
+	noCompose := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps/import/inspect", `{"sourcePath":`+strconv.Quote(empty)+`}`, true)
+	if noCompose.Code != http.StatusOK || !strings.Contains(noCompose.Body.String(), `"code":"compose_not_found"`) {
+		t.Fatalf("local no-Compose=%d %s", noCompose.Code, noCompose.Body.String())
+	}
+	assertInspectionCollections(t, noCompose, map[string]bool{"composeCandidates": true, "services": true})
+}
+
+func assertInspectionCollections(t *testing.T, response *httptest.ResponseRecorder, empty map[string]bool) {
+	t.Helper()
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode inspection response: %v", err)
+	}
+	for _, field := range []string{"composeCandidates", "services", "findings"} {
+		value, ok := body[field]
+		if !ok || len(value) == 0 || value[0] != '[' {
+			t.Fatalf("inspection %s is not an array: %s", field, value)
+		}
+		if empty[field] && string(value) != "[]" {
+			t.Fatalf("inspection %s = %s, want []", field, value)
+		}
 	}
 }
 

@@ -137,6 +137,21 @@ describe("API client", () => {
     );
   });
 
+  it.each([
+    ["null", { source: { type: "github" }, composeCandidates: null, services: null, findings: null }],
+    ["missing", { source: { type: "local" } }],
+  ])("normalizes %s inspection collections at the API boundary", async (_name, body) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(body), { status: 200 }),
+    ));
+
+    await expect(api.inspect({ sourcePath: "C:/fixture" })).resolves.toMatchObject({
+      composeCandidates: [],
+      services: [],
+      findings: [],
+    });
+  });
+
   it("uses generated deployment and approval operation paths with CSRF and deploy idempotency", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] }), { status: 200 }))
