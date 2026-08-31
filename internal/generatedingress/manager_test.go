@@ -25,6 +25,8 @@ type ingressRunner struct {
 	volumeOptions      map[string]string
 	endpointRoleLabel  string
 	capacityOutput     []byte
+	caddyMissing       bool
+	ingressMissing     bool
 }
 
 func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -39,10 +41,17 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 	if len(args) >= 3 && args[0] == "network" && args[1] == "inspect" {
 		name := args[len(args)-1]
 		if name == caddyNetworkName {
+			if r.ingressMissing {
+				return runtimeprocess.CommandResult{Stderr: []byte("no such network")}, errors.New("missing")
+			}
 			subnet, gateway, _ := ingressNetworkCandidate(0)
 			return jsonResult(networkInspection{Name: caddyNetworkName, Driver: "bridge", Scope: "local", Options: map[string]string{}, IPAM: []networkIPAM{{Subnet: subnet, Gateway: gateway}}, Labels: map[string]string{"io.rig.managed": "generated-ingress-network", "io.rig.identity-version": "v1"}}), nil
 		}
 		return jsonResult(networkInspection{Name: r.network, Driver: "bridge", Scope: "local", Options: map[string]string{}, Labels: map[string]string{"io.rig.managed": generatedruntime.NetworkOwnershipLabelValue, "io.rig.application": r.appID}}), nil
+	}
+	if len(args) >= 3 && args[0] == "network" && args[1] == "create" {
+		r.ingressMissing = false
+		return runtimeprocess.CommandResult{}, nil
 	}
 	if len(args) == 4 && args[0] == "network" && args[1] == "connect" {
 		r.caddyNetworks[args[2]] = &networkAttachment{}
@@ -55,6 +64,9 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 	if len(args) >= 3 && args[0] == "container" && args[1] == "inspect" {
 		identity := args[len(args)-1]
 		if identity == caddyContainerName {
+			if r.caddyMissing {
+				return runtimeprocess.CommandResult{Stderr: []byte("no such container")}, errors.New("missing")
+			}
 			return jsonResult(r.caddyInspection()), nil
 		}
 		if identity == r.endpoint.ContainerID {
@@ -67,6 +79,16 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 			}, Running: true, Health: "healthy", Networks: map[string]*networkAttachment{r.network: {Aliases: []string{r.endpoint.NetworkAlias}}}}), nil
 		}
 		return runtimeprocess.CommandResult{Stderr: []byte("no such container")}, errors.New("missing")
+	}
+	if len(args) >= 3 && args[0] == "container" && args[1] == "create" {
+		r.caddyMissing = false
+		r.stopped = true
+		ipIndex := argumentIndex(args, "--ip")
+		if ipIndex < 0 || ipIndex+1 >= len(args) {
+			return runtimeprocess.CommandResult{}, errors.New("missing static ingress address")
+		}
+		r.caddyNetworks[caddyNetworkName] = &networkAttachment{IPAddress: args[ipIndex+1]}
+		return runtimeprocess.CommandResult{}, nil
 	}
 	if len(args) == 4 && args[0] == "container" && args[1] == "cp" {
 		body, err := os.ReadFile(args[2])
@@ -224,6 +246,22 @@ func TestCapacitySnapshotPreservesGenuinelyLowCapacity(t *testing.T) {
 	}
 }
 
+func TestLowIngressCapacityBecomesReplacementCapacityDiagnostic(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	runner.capacityOutput = []byte("1024 2048\n")
+	engine, err := generatedruntime.NewEngine(runner, unusedEnvironmentStager{}, manager, generatedruntime.EngineOptions{
+		DockerExecutable:      manager.options.DockerExecutable,
+		DockerConfigDirectory: manager.options.DockerConfigDirectory,
+		WorkingDirectory:      manager.options.WorkingDirectory,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.ReserveReplacement(context.Background(), 1); !generatedruntime.IsCode(err, generatedruntime.DiagnosticInsufficientReplacementSpace) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestProvisionRejectsListenerAddressOutsideOwnedSubnet(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	runner.caddyNetworks[caddyNetworkName].IPAddress = "10.203.0.3"
@@ -295,15 +333,38 @@ func TestCaddyInspectionRequiresNetworkEnvironmentAndUlimit(t *testing.T) {
 		func(value *caddyInspection) { value.NetworkMode = "bridge" },
 		func(value *caddyInspection) { value.Env = []string{"XDG_CONFIG_HOME=/config"} },
 		func(value *caddyInspection) { value.Ulimits[0].Hard = 2048 },
+		func(value *caddyInspection) { value.SecurityOpt = append(value.SecurityOpt, "seccomp=unconfined") },
+		func(value *caddyInspection) {
+			value.PortBindings["9000/tcp"] = []map[string]string{{"HostIp": "127.0.0.1", "HostPort": "9000"}}
+		},
 	}
 	for index, mutate := range mutations {
 		candidate := valid
 		candidate.Env = append([]string(nil), valid.Env...)
 		candidate.Ulimits = append([]ulimitInspection(nil), valid.Ulimits...)
+		candidate.SecurityOpt = append([]string(nil), valid.SecurityOpt...)
+		candidate.PortBindings = clonePortBindings(valid.PortBindings)
 		mutate(&candidate)
 		if validCaddyInspection(candidate, "sha256:"+strings.Repeat("a", 64), 8080) {
 			t.Fatalf("drift mutation %d was accepted", index)
 		}
+	}
+}
+
+func TestProvisionCreatesPinnedIngressNetworkAndStaticCaddyAddress(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	runner.ingressMissing = true
+	runner.caddyMissing = true
+	runner.caddyNetworks = map[string]*networkAttachment{}
+	if err := manager.Provision(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	subnet, gateway, address := ingressNetworkCandidate(0)
+	if !hasCommandArguments(runner.commands, "network", "create", "--subnet", subnet, "--gateway", gateway, caddyNetworkName) {
+		t.Fatalf("network create did not use pinned IPAM: %#v", runner.commands)
+	}
+	if !hasCommandArguments(runner.commands, "container", "create", "--network", caddyNetworkName, "--ip", address) {
+		t.Fatalf("container create did not use static ingress address: %#v", runner.commands)
 	}
 }
 
@@ -389,4 +450,48 @@ func containsArgument(command []string, expected string) bool {
 		}
 	}
 	return false
+}
+
+func argumentIndex(command []string, expected string) int {
+	for index, argument := range command {
+		if argument == expected {
+			return index
+		}
+	}
+	return -1
+}
+
+func hasCommandArguments(commands [][]string, expected ...string) bool {
+	for _, command := range commands {
+		position := 0
+		for _, argument := range command {
+			if position < len(expected) && argument == expected[position] {
+				position++
+			}
+		}
+		if position == len(expected) {
+			return true
+		}
+	}
+	return false
+}
+
+func clonePortBindings(values map[string][]map[string]string) map[string][]map[string]string {
+	result := make(map[string][]map[string]string, len(values))
+	for port, bindings := range values {
+		result[port] = make([]map[string]string, len(bindings))
+		for index, binding := range bindings {
+			result[port][index] = make(map[string]string, len(binding))
+			for key, value := range binding {
+				result[port][index][key] = value
+			}
+		}
+	}
+	return result
+}
+
+type unusedEnvironmentStager struct{}
+
+func (unusedEnvironmentStager) Stage(string, int, []byte) (generatedruntime.EnvironmentLease, error) {
+	return nil, errors.New("environment staging must not run during capacity admission")
 }

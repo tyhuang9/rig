@@ -818,7 +818,7 @@ func (m *Manager) inspectJSON(ctx context.Context, destination any, args ...stri
 func validCaddyInspection(value caddyInspection, imageID string, hostPort uint16) bool {
 	if normalizeID(value.Image) != normalizeID(imageID) || strings.TrimPrefix(value.Name, "/") != caddyContainerName || value.User != "1000:1000" ||
 		value.Hostname != caddyContainerName || value.NetworkMode != caddyNetworkName || !containsString(value.Env, "XDG_CONFIG_HOME=/config") || !containsString(value.Env, "XDG_DATA_HOME=/data") ||
-		!value.ReadOnly || value.Privileged || len(value.CapAdd) != 0 || !containsFold(value.CapDrop, "ALL") || !containsString(value.SecurityOpt, "no-new-privileges") ||
+		!value.ReadOnly || value.Privileged || len(value.CapAdd) != 0 || !exactFoldSet(value.CapDrop, "ALL") || !exactStringSet(value.SecurityOpt, "no-new-privileges") ||
 		len(value.Binds) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 || value.NanoCPUs != 1_000_000_000 || value.PIDsLimit != 128 ||
 		len(value.Tmpfs) != 1 || value.Tmpfs["/data"] != "rw,noexec,nosuid,nodev,size=67108864" ||
 		value.LogType != "local" || value.LogConfig["max-size"] != "10m" || value.LogConfig["max-file"] != "3" || value.Restart != "unless-stopped" ||
@@ -836,7 +836,7 @@ func validCaddyInspection(value caddyInspection, imageID string, hostPort uint16
 		}
 	}
 	binding := value.PortBindings["8080/tcp"]
-	return mountOK && len(binding) == 1 && binding[0]["HostIp"] == "127.0.0.1" && binding[0]["HostPort"] == strconv.FormatUint(uint64(hostPort), 10)
+	return mountOK && len(value.PortBindings) == 1 && len(binding) == 1 && len(binding[0]) == 2 && binding[0]["HostIp"] == "127.0.0.1" && binding[0]["HostPort"] == strconv.FormatUint(uint64(hostPort), 10)
 }
 
 func validOptions(options Options) bool {
@@ -941,6 +941,14 @@ func containsFold(values []string, expected string) bool {
 		}
 	}
 	return false
+}
+
+func exactStringSet(values []string, expected string) bool {
+	return len(values) == 1 && values[0] == expected
+}
+
+func exactFoldSet(values []string, expected string) bool {
+	return len(values) == 1 && strings.EqualFold(values[0], expected)
 }
 
 func clearResult(result *runtimeprocess.CommandResult) {
