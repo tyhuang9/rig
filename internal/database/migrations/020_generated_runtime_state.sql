@@ -166,12 +166,11 @@ WHEN NOT EXISTS (
         JOIN deployment_plan_migration_approvals a ON a.revision_id=p.id AND a.app_id=p.app_id
         WHERE p.id=NEW.deployment_plan_revision_id AND p.app_id=NEW.app_id AND p.migration_evidence_digest<>''
     ))
-) OR (
-    NEW.previous_active_deployment_id IS NOT NULL AND NOT EXISTS (
-        SELECT 1 FROM generated_runtime_active_heads h
-        JOIN generated_runtime_deployments old ON old.deployment_id=h.deployment_id AND old.app_id=h.app_id
-        WHERE h.app_id=NEW.app_id AND h.deployment_id=NEW.previous_active_deployment_id
-          AND h.slot=NEW.previous_active_slot
+) OR NOT EXISTS (
+    SELECT 1 FROM generated_runtime_active_heads h
+    WHERE h.app_id=NEW.app_id AND (
+        (h.deployment_id IS NULL AND NEW.previous_active_deployment_id IS NULL AND NEW.previous_active_slot IS NULL AND NEW.candidate_slot='blue')
+        OR (h.deployment_id=NEW.previous_active_deployment_id AND h.slot=NEW.previous_active_slot AND h.slot<>NEW.candidate_slot)
     )
 )
 BEGIN SELECT RAISE(ABORT, 'invalid generated runtime deployment'); END;
@@ -184,8 +183,11 @@ BEGIN SELECT RAISE(ABORT, 'generated runtime deployments are retained'); END;
 CREATE TRIGGER generated_runtime_deployment_phase_transition BEFORE UPDATE OF phase ON generated_runtime_deployments
 WHEN NOT (
     (OLD.phase='preflight' AND NEW.phase IN ('building','failed','cancelled'))
-    OR (OLD.phase='building' AND NEW.phase IN ('migrating','starting_candidate','failed','cancelled'))
-    OR (OLD.phase='migrating' AND NEW.phase IN ('starting_candidate','failed','cancelled'))
+    OR (OLD.phase='building' AND NEW.phase='migrating' AND OLD.migration_state='pending')
+    OR (OLD.phase='building' AND NEW.phase='starting_candidate' AND OLD.migration_state='not_required')
+    OR (OLD.phase='building' AND NEW.phase IN ('failed','cancelled'))
+    OR (OLD.phase='migrating' AND NEW.phase='starting_candidate' AND OLD.migration_state='succeeded')
+    OR (OLD.phase='migrating' AND NEW.phase IN ('failed','cancelled'))
     OR (OLD.phase='starting_candidate' AND NEW.phase IN ('waiting_health','failed','cancelled'))
     OR (OLD.phase='waiting_health' AND NEW.phase IN ('switching_route','failed','cancelled'))
     OR (OLD.phase='switching_route' AND NEW.phase IN ('draining','failed','cancelled'))
@@ -217,6 +219,23 @@ WHEN NEW.image_artifact_id IS NOT NULL AND NOT EXISTS (
       AND a.component_id=NEW.component_name AND a.state='ready'
 )
 BEGIN SELECT RAISE(ABORT, 'invalid generated runtime component artifact'); END;
+
+CREATE TRIGGER generated_runtime_component_artifact_valid_insert BEFORE INSERT ON generated_runtime_components
+WHEN NEW.image_artifact_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM generated_image_artifacts a
+    JOIN generated_runtime_deployments d ON d.deployment_id=NEW.deployment_id
+    WHERE a.id=NEW.image_artifact_id AND a.release_id=d.release_id
+      AND a.deployment_plan_revision_id=d.deployment_plan_revision_id
+      AND a.deployment_plan_revision_number=d.deployment_plan_revision_number
+      AND a.component_id=NEW.component_name AND a.state='ready'
+)
+BEGIN SELECT RAISE(ABORT, 'invalid generated runtime component artifact'); END;
+
+CREATE TRIGGER generated_runtime_component_runtime_identity_immutable BEFORE UPDATE OF image_artifact_id,container_name,container_id ON generated_runtime_components
+WHEN (NEW.image_artifact_id IS NOT OLD.image_artifact_id AND NOT (OLD.state='pending' AND NEW.state='image_ready' AND OLD.image_artifact_id IS NULL AND NEW.image_artifact_id IS NOT NULL))
+  OR (NEW.container_name IS NOT OLD.container_name AND NOT (OLD.state='image_ready' AND NEW.state='starting' AND OLD.container_name IS NULL AND NEW.container_name IS NOT NULL))
+  OR (NEW.container_id IS NOT OLD.container_id AND NOT (OLD.state='starting' AND NEW.state='running' AND OLD.container_id IS NULL AND NEW.container_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'generated runtime component identity is immutable'); END;
 
 CREATE TRIGGER generated_runtime_component_identity_immutable BEFORE UPDATE OF deployment_id,component_name,slot,created_at ON generated_runtime_components
 BEGIN SELECT RAISE(ABORT, 'generated runtime component identity is immutable'); END;
