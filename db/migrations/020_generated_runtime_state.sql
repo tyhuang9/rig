@@ -254,12 +254,30 @@ WHEN NOT (
 )
 BEGIN SELECT RAISE(ABORT, 'invalid generated runtime component state transition'); END;
 
+CREATE TRIGGER generated_runtime_component_activation_valid BEFORE UPDATE OF state ON generated_runtime_components
+WHEN NEW.state='active' AND NOT EXISTS (
+    SELECT 1 FROM generated_runtime_active_heads h
+    JOIN generated_runtime_deployments d ON d.deployment_id=NEW.deployment_id AND d.app_id=h.app_id
+    WHERE h.deployment_id=NEW.deployment_id AND h.slot=NEW.slot
+)
+BEGIN SELECT RAISE(ABORT, 'generated runtime component is not the active head'); END;
+
+CREATE TRIGGER generated_runtime_active_component_retain BEFORE UPDATE OF state ON generated_runtime_components
+WHEN OLD.state='active' AND NEW.state IN ('draining','stopped') AND EXISTS (
+    SELECT 1 FROM generated_runtime_active_heads h WHERE h.deployment_id=OLD.deployment_id AND h.slot=OLD.slot
+)
+BEGIN SELECT RAISE(ABORT, 'generated runtime active component is still routed'); END;
+
 CREATE TRIGGER generated_runtime_active_head_valid_update BEFORE UPDATE OF deployment_id,release_id,slot,generation,updated_at ON generated_runtime_active_heads
 WHEN NEW.generation<>OLD.generation+1 OR NEW.deployment_id IS NULL OR NOT EXISTS (
     SELECT 1 FROM generated_runtime_deployments d
     WHERE d.deployment_id=NEW.deployment_id AND d.app_id=NEW.app_id
       AND d.release_id=NEW.release_id AND d.candidate_slot=NEW.slot
       AND d.phase IN ('switching_route','draining','succeeded')
+      AND ((OLD.deployment_id IS NULL AND d.previous_active_deployment_id IS NULL AND d.previous_active_slot IS NULL)
+           OR (d.previous_active_deployment_id=OLD.deployment_id AND d.previous_active_slot=OLD.slot))
+      AND EXISTS (SELECT 1 FROM generated_runtime_components c WHERE c.deployment_id=d.deployment_id)
+      AND NOT EXISTS (SELECT 1 FROM generated_runtime_components c WHERE c.deployment_id=d.deployment_id AND c.state<>'healthy')
 )
 BEGIN SELECT RAISE(ABORT, 'invalid generated runtime active head'); END;
 INSERT INTO generated_runtime_active_heads(app_id) SELECT id FROM applications;

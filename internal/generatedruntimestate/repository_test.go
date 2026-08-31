@@ -91,6 +91,9 @@ func TestComponentLifecycleAndActiveHeadCAS(t *testing.T) {
 	if err != nil || component.State != ComponentHealthy {
 		t.Fatalf("healthy = %#v err=%v", component, err)
 	}
+	if _, err := fixture.repository.AdvanceComponent(context.Background(), fixture.appID, fixture.deploymentID, "api", ComponentHealthy, ComponentActive); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("component activated outside head switch: %v", err)
+	}
 	value = advance(t, fixture.repository, value, PhaseBuilding)
 	value = advance(t, fixture.repository, value, PhaseStartingCandidate)
 	value = advance(t, fixture.repository, value, PhaseWaitingHealth)
@@ -103,6 +106,9 @@ func TestComponentLifecycleAndActiveHeadCAS(t *testing.T) {
 	component, err = fixture.repository.Component(context.Background(), fixture.appID, fixture.deploymentID, "api")
 	if err != nil || component.State != ComponentActive {
 		t.Fatalf("active component = %#v err=%v", component, err)
+	}
+	if _, err := fixture.repository.AdvanceComponent(context.Background(), fixture.appID, fixture.deploymentID, "api", ComponentActive, ComponentDraining); err == nil {
+		t.Fatal("currently routed component began draining")
 	}
 	if replay, switched, err := fixture.repository.SwitchActive(context.Background(), fixture.appID, fixture.deploymentID, 0); err != nil || switched || replay.Generation != 1 {
 		t.Fatalf("active switch replay = %#v switched=%t err=%v", replay, switched, err)

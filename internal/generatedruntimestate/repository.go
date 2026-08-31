@@ -268,7 +268,16 @@ func (r *Repository) Advance(ctx context.Context, appID, deploymentID string, ex
 	if terminalPhase(next) {
 		finished = now
 	}
-	result, err := r.db.ExecContext(ctx, `UPDATE generated_runtime_deployments SET phase=?,diagnostic_code=?,updated_at=?,finished_at=? WHERE deployment_id=? AND app_id=? AND phase=?`, next, nullable(string(diagnostic)), now, finished, deploymentID, appID, expected)
+	condition := ""
+	switch {
+	case expected == PhaseBuilding && next == PhaseMigrating:
+		condition = " AND migration_state='pending'"
+	case expected == PhaseBuilding && next == PhaseStartingCandidate:
+		condition = " AND migration_state='not_required'"
+	case expected == PhaseMigrating && next == PhaseStartingCandidate:
+		condition = " AND migration_state='succeeded'"
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE generated_runtime_deployments SET phase=?,diagnostic_code=?,updated_at=?,finished_at=? WHERE deployment_id=? AND app_id=? AND phase=?`+condition, next, nullable(string(diagnostic)), now, finished, deploymentID, appID, expected)
 	if err != nil {
 		return Deployment{}, err
 	}
@@ -347,7 +356,7 @@ func (r *Repository) SetContainerRunning(ctx context.Context, appID, deploymentI
 }
 
 func (r *Repository) AdvanceComponent(ctx context.Context, appID, deploymentID, componentName string, expected, next ComponentState) (Component, error) {
-	if !allowedComponentTransition(expected, next) || next == ComponentFailed || next == ComponentStarting || next == ComponentRunning || next == ComponentImageReady {
+	if !allowedComponentTransition(expected, next) || next == ComponentFailed || next == ComponentStarting || next == ComponentRunning || next == ComponentImageReady || next == ComponentActive {
 		return Component{}, ErrInvalidTransition
 	}
 	return r.updateComponent(ctx, appID, deploymentID, componentName, expected, next, "", "", "")
@@ -433,9 +442,6 @@ func (r *Repository) SwitchActive(ctx context.Context, appID, deploymentID strin
 		return ActiveHead{}, false, ErrInvalidTransition
 	}
 	now := r.now().UTC().Format(time.RFC3339Nano)
-	if _, err := tx.ExecContext(ctx, `UPDATE generated_runtime_components SET state='active',updated_at=? WHERE deployment_id=? AND state='healthy'`, now, deploymentID); err != nil {
-		return ActiveHead{}, false, err
-	}
 	result, err := tx.ExecContext(ctx, `UPDATE generated_runtime_active_heads SET deployment_id=?,release_id=?,slot=?,generation=generation+1,updated_at=? WHERE app_id=? AND generation=?`, deploymentID, releaseID, slot, now, appID, expectedGeneration)
 	if err != nil {
 		return ActiveHead{}, false, err
@@ -444,6 +450,9 @@ func (r *Repository) SwitchActive(ctx context.Context, appID, deploymentID strin
 		return ActiveHead{}, false, err
 	} else if changed != 1 {
 		return ActiveHead{}, false, ErrConflict
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE generated_runtime_components SET state='active',updated_at=? WHERE deployment_id=? AND state='healthy'`, now, deploymentID); err != nil {
+		return ActiveHead{}, false, err
 	}
 	value, err := scanActiveHead(tx.QueryRowContext(ctx, activeHeadSelect+` WHERE app_id=?`, appID))
 	if err != nil {
