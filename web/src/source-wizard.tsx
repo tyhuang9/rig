@@ -14,7 +14,7 @@ const pageSize = 30;
 type SourceKind = "local" | "github";
 type ConnectionContext = { generation: number; kind: SourceKind; selectedConnectionId: string };
 type InstallationAction = { connectionId: string; url: string };
-type AuthorizationSession = { context: ConnectionContext; expiresAt: string; nextPollAt: string };
+type AuthorizationSession = { context: ConnectionContext; expiresAt: string; nextPollAt: string; reconcilingExpiry?: boolean };
 
 function sameConnectionContext(left: ConnectionContext, right: ConnectionContext) {
   return left.generation === right.generation && left.kind === right.kind && left.selectedConnectionId === right.selectedConnectionId;
@@ -72,6 +72,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const [branchPage, setBranchPage] = useState(1);
   const [deviceAuthorization, setDeviceAuthorization] = useState<GitHubDeviceAuthorization | null>(null);
   const [authorizationSession, setAuthorizationSession] = useState<AuthorizationSession | null>(null);
+  const [expiryRetryConnectionId, setExpiryRetryConnectionId] = useState("");
   const [installationAction, setInstallationAction] = useState<InstallationAction | null>(null);
   const [pendingStatus, setPendingStatus] = useState<SourceConnection["status"] | undefined>();
   const [sourceError, setSourceError] = useState("");
@@ -83,10 +84,12 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const connectionContext = useRef<ConnectionContext>({ generation: 0, kind: "local", selectedConnectionId: "" });
   const connectionSelect = useRef<HTMLSelectElement>(null);
   const resumeAuthorizationButton = useRef<HTMLButtonElement>(null);
+  const expiryRetryButton = useRef<HTMLButtonElement>(null);
   const installActionLink = useRef<HTMLAnchorElement>(null);
   const focusResumeAfterSelection = useRef(false);
   const authorizationFocusOrigin = useRef(false);
-  const focusAfterAuthorization = useRef<"connection" | "install" | null>(null);
+  const focusAfterAuthorization = useRef<"connection" | "expiryRetry" | "install" | null>(null);
+  const expiryReconciliationAttempts = useRef(new Set<string>());
   const inspectionGeneration = useRef(0);
   const inspectionRequest = useRef<{ generation: number; key: string } | null>(null);
   const priorConnection = useRef<{ id: string; status: string }>({ id: "", status: "" });
@@ -98,6 +101,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const selectedStatus = pendingStatus ?? (selectedConnection?.status === "pending" && selectedConnection.pendingExpiresAt && isDeviceAuthorizationExpired(selectedConnection.pendingExpiresAt) ? "expired" : connectionStatus(selectedConnection));
   const isConnected = selectedStatus === "connected";
   const canResumeAuthorization = selectedStatus === "pending" && selectedConnection?.status === "pending" && Boolean(selectedConnection.pendingExpiresAt) && !isDeviceAuthorizationExpired(selectedConnection.pendingExpiresAt!) && !deviceAuthorization;
+  const canRetryExpiryReconciliation = expiryRetryConnectionId === selectedConnectionId && selectedStatus === "expired" && selectedConnection?.status === "pending" && !deviceAuthorization;
 
   const installations = useQuery({
     queryKey: ["github-installations", selectedConnectionId, installationPage, pageSize],
@@ -136,11 +140,13 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     const next = { generation: connectionContext.current.generation + 1, kind: nextKind, selectedConnectionId: nextConnectionId };
     connectionContext.current = next;
     setAuthorizationSession(null);
+    setExpiryRetryConnectionId("");
     setInstallationAction(null);
     authorizationFocusOrigin.current = false;
     focusAfterAuthorization.current = null;
     return next;
   };
+  const markExpiryReconciliationAttempt = (connectionId: string, expiresAt: string) => expiryReconciliationAttempts.current.add(`${connectionId}:${expiresAt}`);
   const focusErrorSummary = () => window.setTimeout(() => errorSummary.current?.focus(), 0);
   const resetAfterConnection = () => {
     setInstallationId(null);
@@ -224,11 +230,25 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   useEffect(() => {
     const target = focusAfterAuthorization.current;
     if (!target) return;
-    const destination = target === "install" ? installActionLink.current ?? connectionSelect.current : connectionSelect.current;
+    const destination = target === "install" ? installActionLink.current ?? connectionSelect.current : target === "expiryRetry" ? expiryRetryButton.current ?? connectionSelect.current : connectionSelect.current;
     if (!destination) return;
     focusAfterAuthorization.current = null;
     destination.focus();
   });
+
+  useEffect(() => {
+    if (kind !== "github" || !selectedConnection || selectedConnection.status !== "pending" || !selectedConnection.pendingExpiresAt || !isDeviceAuthorizationExpired(selectedConnection.pendingExpiresAt) || authorizationSession || expiryRetryConnectionId === selectedConnection.id) return;
+    const attemptKey = `${selectedConnection.id}:${selectedConnection.pendingExpiresAt}`;
+    if (expiryReconciliationAttempts.current.has(attemptKey)) return;
+    expiryReconciliationAttempts.current.add(attemptKey);
+    setPendingStatus("expired");
+    setAuthorizationSession({
+      context: connectionContext.current,
+      expiresAt: selectedConnection.pendingExpiresAt,
+      nextPollAt: new Date().toISOString(),
+      reconcilingExpiry: true,
+    });
+  }, [authorizationSession, expiryRetryConnectionId, kind, selectedConnection]);
 
   const beginConnection = useMutation({
     mutationFn: (_context: ConnectionContext) => api.startGitHubConnection(),
@@ -319,11 +339,11 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
 
   useEffect(() => {
     if (!authorizationSession || !sameConnectionContext(authorizationSession.context, connectionContext.current)) return;
-    const { context, expiresAt, nextPollAt } = authorizationSession;
+    const { context, expiresAt, nextPollAt, reconcilingExpiry = false } = authorizationSession;
     const expiration = Date.parse(expiresAt);
     const nextPoll = Date.parse(nextPollAt);
-    const queueFocusAfterAuthorization = (target: "connection" | "install") => {
-      if (authorizationFocusOrigin.current && document.activeElement === resumeAuthorizationButton.current) focusAfterAuthorization.current = target;
+    const queueFocusAfterAuthorization = (target: "connection" | "expiryRetry" | "install") => {
+      if (authorizationFocusOrigin.current && (document.activeElement === resumeAuthorizationButton.current || document.activeElement === expiryRetryButton.current)) focusAfterAuthorization.current = target;
       authorizationFocusOrigin.current = false;
     };
     const finish = (status: SourceConnection["status"], message: string) => {
@@ -331,22 +351,41 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
       queueFocusAfterAuthorization("connection");
       setPendingStatus(status);
       setAuthorizationSession(null);
+      setExpiryRetryConnectionId("");
       setDeviceAuthorization(null);
       setSourceError(message);
       void queryClient.invalidateQueries({ queryKey: ["source-connections"] });
     };
-    if (!Number.isFinite(expiration) || expiration <= Date.now()) {
-      finish("expired", "GitHub authorization expired. Start a new connection.");
+    const pauseExpiredReconciliation = (error: unknown) => {
+      if (!sameConnectionContext(context, connectionContext.current)) return;
+      queueFocusAfterAuthorization("expiryRetry");
+      setAuthorizationSession(null);
+      setDeviceAuthorization(null);
+      setPendingStatus("expired");
+      setExpiryRetryConnectionId(context.selectedConnectionId);
+      setSourceError(`${safeMessage(error, "Could not confirm the expired GitHub authorization.")} Select Retry authorization status to try again.`);
+      void queryClient.invalidateQueries({ queryKey: ["source-connections"] });
+    };
+    if ((!Number.isFinite(expiration) || expiration <= Date.now()) && !reconcilingExpiry) {
+      markExpiryReconciliationAttempt(context.selectedConnectionId, expiresAt);
+      queueFocusAfterAuthorization("connection");
+      setPendingStatus("expired");
+      setDeviceAuthorization(null);
+      setAuthorizationSession({ ...authorizationSession, nextPollAt: new Date().toISOString(), reconcilingExpiry: true });
       return;
     }
 
     let cancelled = false;
     let pollInFlight = false;
-    const delay = Math.max(0, Math.min(Number.isFinite(nextPoll) ? nextPoll : Date.now(), expiration) - Date.now());
+    const delay = reconcilingExpiry ? 0 : Math.max(0, Math.min(Number.isFinite(nextPoll) ? nextPoll : Date.now(), expiration) - Date.now());
     const timer = window.setTimeout(async () => {
       if (cancelled || pollInFlight || !sameConnectionContext(context, connectionContext.current)) return;
-      if (Date.now() >= expiration) {
-        finish("expired", "GitHub authorization expired. Start a new connection.");
+      if ((!Number.isFinite(expiration) || Date.now() >= expiration) && !reconcilingExpiry) {
+        markExpiryReconciliationAttempt(context.selectedConnectionId, expiresAt);
+        queueFocusAfterAuthorization("connection");
+        setPendingStatus("expired");
+        setDeviceAuthorization(null);
+        setAuthorizationSession({ ...authorizationSession, nextPollAt: new Date().toISOString(), reconcilingExpiry: true });
         return;
       }
       pollInFlight = true;
@@ -355,13 +394,20 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         if (cancelled || !sameConnectionContext(context, connectionContext.current)) return;
         if (connection.status !== "pending") queueFocusAfterAuthorization(connection.status === "connected" && Boolean(connection.installUrl) ? "install" : "connection");
         setPendingStatus(connection.status);
+        if (connection.status !== "pending") setExpiryRetryConnectionId("");
         if (connection.installUrl) setInstallationAction({ connectionId: connection.id, url: connection.installUrl });
         await queryClient.invalidateQueries({ queryKey: ["source-connections"] });
         if (cancelled || !sameConnectionContext(context, connectionContext.current)) return;
         if (connection.status === "pending") {
           const pendingExpiration = connection.pendingExpiresAt ?? expiresAt;
           if (isDeviceAuthorizationExpired(pendingExpiration)) {
-            finish("expired", "GitHub authorization expired. Start a new connection.");
+            if (reconcilingExpiry) pauseExpiredReconciliation(new Error("The controller still reports this authorization as pending."));
+            else {
+              markExpiryReconciliationAttempt(context.selectedConnectionId, pendingExpiration);
+              setDeviceAuthorization(null);
+              setPendingStatus("expired");
+              setAuthorizationSession({ context, expiresAt: pendingExpiration, nextPollAt: new Date().toISOString(), reconcilingExpiry: true });
+            }
           } else {
             setAuthorizationSession({
               context,
@@ -377,6 +423,10 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
       } catch (error) {
         if (cancelled || !sameConnectionContext(context, connectionContext.current)) return;
         if (error instanceof APIError && error.status === 429 && error.retryAfterSeconds) {
+          if (reconcilingExpiry || !Number.isFinite(expiration) || Date.now() >= expiration) {
+            pauseExpiredReconciliation(error);
+            return;
+          }
           setAuthorizationSession({
             context,
             expiresAt,
@@ -398,6 +448,10 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         }
         if (error instanceof APIError && (error.status === 404 || error.code === "invalid_connection_state" || error.code === "github_connections_disabled")) {
           finish("access_lost", error.detail);
+          return;
+        }
+        if (reconcilingExpiry || !Number.isFinite(expiration) || Date.now() >= expiration) {
+          pauseExpiredReconciliation(error);
           return;
         }
         setAuthorizationSession(null);
@@ -430,6 +484,19 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
       context,
       expiresAt: selectedConnection.pendingExpiresAt,
       nextPollAt: selectedConnection.nextPollAt ?? new Date().toISOString(),
+    });
+  };
+
+  const retryExpiryReconciliation = () => {
+    if (!canRetryExpiryReconciliation || !selectedConnection?.pendingExpiresAt || authorizationSession) return;
+    authorizationFocusOrigin.current = document.activeElement === expiryRetryButton.current;
+    markExpiryReconciliationAttempt(selectedConnection.id, selectedConnection.pendingExpiresAt);
+    setSourceError("");
+    setAuthorizationSession({
+      context: connectionContext.current,
+      expiresAt: selectedConnection.pendingExpiresAt,
+      nextPollAt: new Date().toISOString(),
+      reconcilingExpiry: true,
     });
   };
 
@@ -529,6 +596,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
           <div className="connection-actions">
             <button type="button" className="button" disabled={sourceIsBusy || authorizationSession !== null} onClick={() => beginConnection.mutate(connectionContext.current)}>{beginConnection.isPending ? "Starting…" : "Sign in to GitHub"}</button>
             {canResumeAuthorization && <button ref={resumeAuthorizationButton} type="button" className="button primary" aria-disabled={resumeUnavailable} onClick={() => { if (!resumeUnavailable) resumeAuthorization(); }}>{authorizationSession ? "Checking authorization…" : "Resume authorization check"}</button>}
+            {canRetryExpiryReconciliation && <button ref={expiryRetryButton} type="button" className="button primary" aria-disabled={resumeUnavailable} onClick={() => { if (!resumeUnavailable) retryExpiryReconciliation(); }}>{authorizationSession?.reconcilingExpiry ? "Checking authorization status…" : "Retry authorization status"}</button>}
             {selectedConnectionId && selectedStatus === "connected" && <button type="button" className="button" disabled={sourceIsBusy} onClick={() => refreshConnection.mutate({ connectionId: selectedConnectionId, context: connectionContext.current })}>{refreshConnection.isPending ? "Refreshing…" : "Refresh connection"}</button>}
             {selectedConnectionId && <button type="button" className="button" disabled={sourceIsBusy} onClick={() => disconnectConnection.mutate({ connectionId: selectedConnectionId, context: connectionContext.current })}>{disconnectConnection.isPending ? "Disconnecting…" : "Disconnect"}</button>}
           </div>
@@ -548,8 +616,9 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
               <span>{`Connection status: ${selectedStatus.replaceAll("_", " ")}.`}</span>
               {sourceError && <span>{sourceError}</span>}
               {!sourceError && selectedStatus === "pending" && <span>{authorizationSession ? "Rig is checking this authorization. Keep this page open." : canResumeAuthorization ? "Select Resume authorization check to continue checking the authorization started earlier." : "This authorization can no longer be resumed. Start a new connection."}</span>}
+              {!sourceError && selectedStatus === "expired" && authorizationSession?.reconcilingExpiry && <span>Rig is confirming the expired authorization with the controller.</span>}
               {!sourceError && selectedStatus === "access_lost" && <span>GitHub access was lost. Start a new connection before browsing repositories.</span>}
-              {!sourceError && !isConnected && selectedStatus !== "access_lost" && selectedStatus !== "pending" && <span>Start a new connection or choose another connection.</span>}
+              {!sourceError && !isConnected && selectedStatus !== "access_lost" && selectedStatus !== "pending" && !authorizationSession?.reconcilingExpiry && <span>Start a new connection or choose another connection.</span>}
             </> : sourceError ? <><strong>GitHub connection failed</strong><span>{sourceError}</span></> : connections.isFetching ? <span>Loading GitHub connections.</span> : connections.isError ? <span>GitHub connections could not be loaded.</span> : <span>{`GitHub connections loaded. ${connections.data?.items.length ? "Choose an existing connection or start a new one." : "Start a new connection."}`}</span>}
           </div>
           <div className="field">

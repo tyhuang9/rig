@@ -477,6 +477,30 @@ describe("SourceWizard", () => {
     expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
   });
 
+  it("caps Retry-After at expiry and performs only one terminal reconciliation", async () => {
+    const pending = pendingConnection({ pendingExpiresAt: new Date(Date.now() + 30_000).toISOString(), nextPollAt: new Date(Date.now() - 1000).toISOString() });
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
+    vi.spyOn(api, "pollGitHubConnection")
+      .mockRejectedValueOnce(new APIError({ status: 429, code: "poll_too_soon", detail: "Try again shortly.", retryAfterSeconds: 120 }))
+      .mockRejectedValueOnce(new APIError({ status: 410, code: "authorization_expired", detail: "GitHub authorization expired." }));
+    renderWizard();
+    await selectPendingGitHub();
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flushAsyncWork();
+    await vi.advanceTimersByTimeAsync(0);
+    await flushAsyncWork();
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+  });
+
   it("pauses a resumed authorization after a transient error and allows manual retry", async () => {
     const pending = pendingConnection({ nextPollAt: new Date(Date.now() - 1000).toISOString() });
     vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
@@ -523,17 +547,44 @@ describe("SourceWizard", () => {
     expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
   });
 
-  it("does not offer or invoke resume for an already-expired raw pending connection", async () => {
+  it("reconciles an already-expired raw pending connection exactly once without offering Resume", async () => {
     const pending = pendingConnection({ pendingExpiresAt: new Date(Date.now() - 1000).toISOString(), nextPollAt: new Date(Date.now() - 2000).toISOString() });
     vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
-    const poll = vi.spyOn(api, "pollGitHubConnection");
+    const poll = vi.spyOn(api, "pollGitHubConnection").mockRejectedValue(new APIError({ status: 410, code: "authorization_expired", detail: "GitHub authorization expired." }));
     renderWizard();
     await selectPendingGitHub();
 
     expect(screen.getByText(/connection status: expired/i)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
     expect(document.activeElement).toBe(screen.getByLabelText(/^github connection$/i));
-    expect(poll).not.toHaveBeenCalled();
+    await waitFor(() => expect(poll).toHaveBeenCalledTimes(1));
+    expect(poll).toHaveBeenCalledWith(pending.id);
+    await act(async () => new Promise((resolve) => window.setTimeout(resolve, 20)));
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+  });
+
+  it.each([
+    new APIError({ status: 503, code: "provider_unavailable", detail: "GitHub is temporarily unavailable." }),
+    new APIError({ status: 429, code: "poll_too_soon", detail: "Try again shortly.", retryAfterSeconds: 30 }),
+  ])("pauses an expired reconciliation after %s and retries only on explicit action", async (firstError) => {
+    const pending = pendingConnection({ pendingExpiresAt: new Date(Date.now() - 1000).toISOString(), nextPollAt: new Date(Date.now() + 30_000).toISOString() });
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
+    const poll = vi.spyOn(api, "pollGitHubConnection")
+      .mockRejectedValueOnce(firstError)
+      .mockRejectedValueOnce(new APIError({ status: 410, code: "authorization_expired", detail: "GitHub authorization expired." }));
+    renderWizard();
+    await selectPendingGitHub();
+
+    await waitFor(() => expect(poll).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+    const retry = await screen.findByRole("button", { name: /retry authorization status/i });
+    retry.focus();
+    fireEvent.click(retry);
+    await waitFor(() => expect(poll).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("button", { name: /retry authorization status/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByLabelText(/^github connection$/i));
   });
 
   it("ignores a resumed poll completion after another pending connection is selected", async () => {
@@ -670,9 +721,9 @@ describe("SourceWizard", () => {
     expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
   });
 
-  it("treats an invalid device expiration as terminal and never polls", async () => {
+  it("reconciles an invalid device expiration once and treats authorization_expired as terminal", async () => {
     vi.spyOn(api, "startGitHubConnection").mockResolvedValue({ connectionId: "new-connection", userCode: "ABCD-EFGH", verificationUri: "https://github.com/login/device", installUrl: "https://github.com/apps/rig/installations/new", expiresAt: "invalid", pollIntervalSeconds: 5 });
-    const poll = vi.spyOn(api, "pollGitHubConnection");
+    const poll = vi.spyOn(api, "pollGitHubConnection").mockRejectedValue(new APIError({ status: 410, code: "authorization_expired", detail: "GitHub authorization expired." }));
     renderWizard();
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
     await screen.findByLabelText(/^github connection$/i);
@@ -684,7 +735,7 @@ describe("SourceWizard", () => {
     expect(expiration.closest("[role='status']")).toBe(connectionRegion);
     expect(connectionRegion.textContent).toMatch(/connection status: expired/i);
     expect(screen.queryByText("ABCD-EFGH")).toBeNull();
-    expect(poll).not.toHaveBeenCalled();
+    expect(poll).toHaveBeenCalledTimes(1);
   });
 
   it("shows recovery guidance when no installations are available", async () => {

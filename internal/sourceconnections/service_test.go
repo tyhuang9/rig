@@ -193,6 +193,34 @@ func TestPollEnforcesTimingSlowDownAndFinalizesWithoutPersistingDeviceCode(t *te
 	assertSQLiteHasNoSentinels(t, db, "device-sensitive", "ghu_sensitive", "ghr_sensitive", "raw provider description")
 }
 
+func TestExpiredPollIsOwnerScopedPurgesDeviceSecretAndMarksTerminal(t *testing.T) {
+	service, provider, clock, _, store := testService(t)
+	started, err := service.Start(context.Background(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(15 * time.Minute)
+	if _, err := service.Poll(context.Background(), "other", started.ConnectionID); !IsCode(err, "connection_not_found") {
+		t.Fatalf("other owner poll = %v", err)
+	}
+	if _, err := store.ReadDevice(started.ConnectionID); err != nil {
+		t.Fatalf("other owner removed device credential: %v", err)
+	}
+	if _, err := service.Poll(context.Background(), "owner", started.ConnectionID); !IsCode(err, "authorization_expired") {
+		t.Fatalf("expired poll = %v", err)
+	}
+	if provider.pollCalls != 0 {
+		t.Fatalf("expired poll made %d provider calls", provider.pollCalls)
+	}
+	if _, err := store.ReadDevice(started.ConnectionID); err == nil {
+		t.Fatal("expired device credential remains")
+	}
+	connection, err := service.repository.Get(context.Background(), "owner", started.ConnectionID)
+	if err != nil || connection.Status != StatusExpired || connection.LastErrorCode != "authorization_expired" || connection.PendingExpiresAt != nil || connection.NextPollAt != nil {
+		t.Fatalf("expired connection = %#v, %v", connection, err)
+	}
+}
+
 func TestInstallationsRefreshesOnceOnUnauthorizedAndCachesOnlyReturnedPage(t *testing.T) {
 	service, provider, clock, db, _ := testService(t)
 	connection := connectService(t, service, clock)

@@ -294,6 +294,37 @@ func TestSourceConnectionAPIUsesNoStoreOwnerScopeAndFixedSafeProblems(t *testing
 	assertAbsent(t, safePoll.Body.String()+harness.logs.String(), "device-code-sentinel", "ghu_api_sentinel", "ghr_api_sentinel", "raw provider description")
 }
 
+func TestExpiredSourceConnectionPollPurgesSecretAndPersistsTerminalStatus(t *testing.T) {
+	harness := newSourceHarness(t, true)
+	started := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/source-connections/github/device", "", true)
+	var body struct {
+		ConnectionID string `json:"connectionId"`
+	}
+	if started.Code != http.StatusCreated || json.Unmarshal(started.Body.Bytes(), &body) != nil || body.ConnectionID == "" {
+		t.Fatalf("start = %d %s", started.Code, started.Body.String())
+	}
+	harness.clock.now = harness.clock.now.Add(15 * time.Minute)
+	other := sourceRequest(harness.handler, harness.otherSession, http.MethodPost, "/api/v1/source-connections/"+body.ConnectionID+"/device/poll", "", true)
+	if other.Code != http.StatusNotFound {
+		t.Fatalf("other owner poll = %d %s", other.Code, other.Body.String())
+	}
+	if _, err := harness.credentials.ReadDevice(body.ConnectionID); err != nil {
+		t.Fatalf("other owner removed device credential: %v", err)
+	}
+	expired := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/source-connections/"+body.ConnectionID+"/device/poll", "", true)
+	if expired.Code != http.StatusGone || !strings.Contains(expired.Body.String(), `"code":"authorization_expired"`) || harness.provider.pollCalls != 0 {
+		t.Fatalf("expired poll = %d calls=%d body=%s", expired.Code, harness.provider.pollCalls, expired.Body.String())
+	}
+	if _, err := harness.credentials.ReadDevice(body.ConnectionID); err == nil {
+		t.Fatal("expired device credential remains")
+	}
+	connection, err := harness.repository.Get(context.Background(), harness.sessionUserID(t, harness.session), body.ConnectionID)
+	if err != nil || connection.Status != sourceconnections.StatusExpired || connection.LastErrorCode != "authorization_expired" || connection.PendingExpiresAt != nil || connection.NextPollAt != nil {
+		t.Fatalf("expired connection = %#v, %v", connection, err)
+	}
+	assertAbsent(t, expired.Body.String()+harness.logs.String(), "USER-CODE", "userCode", "verificationUri", "device-code-sentinel")
+}
+
 func newSourceHarness(t *testing.T, enabled bool) *sourceHarness {
 	t.Helper()
 	root := filepath.Join(t.TempDir(), "state")
