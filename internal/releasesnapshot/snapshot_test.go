@@ -173,6 +173,35 @@ func TestMaterializePinsConfigurationRevisionAndDoesNotReuseAfterChange(t *testi
 	}
 }
 
+func TestMaterializePinsAcceptedDeploymentPlanRevision(t *testing.T) {
+	db := snapshotDB(t)
+	source := &fakeSources{archive: composeArchive(t, "services: {}\n")}
+	m, err := New(db, source, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	legacy, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil || legacy.DeploymentPlanRevisionID != "" || legacy.DeploymentPlanRevisionNumber != 0 {
+		t.Fatalf("legacy=%#v err=%v", legacy, err)
+	}
+	id := "11111111-1111-1111-8111-111111111111"
+	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at)
+		VALUES(?,?,1,?,'generated_node','package-json','1',?,?,1,1,'','owner',datetime('now'),'accepted','owner',datetime('now'))`, id, app, "apps/"+app+"/deployment-plans/"+id+".secret", strings.Repeat("a", 64), strings.Repeat("b", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE deployment_plan_heads SET revision_id=?,revision_number=1,updated_at=datetime('now') WHERE app_id=?`, id, app); err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil || pinned.ID == legacy.ID || pinned.DeploymentPlanRevisionID != id || pinned.DeploymentPlanRevisionNumber != 1 {
+		t.Fatalf("pinned=%#v legacy=%#v err=%v", pinned, legacy, err)
+	}
+	if _, err := db.Exec(`UPDATE releases SET deployment_plan_revision_number=2 WHERE id=?`, pinned.ID); err == nil {
+		t.Fatal("immutable deployment plan provenance accepted")
+	}
+}
+
 func TestReadyReleaseReturnsOnlyAppBoundReadyValidatedWorkspace(t *testing.T) {
 	db := snapshotDB(t)
 	m, err := New(db, &fakeSources{archive: composeArchive(t, "services: {}\n")}, t.TempDir())
