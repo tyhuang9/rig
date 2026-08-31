@@ -12,10 +12,16 @@ import (
 	"github.com/hostd/hostd/internal/database"
 )
 
-type pauseExecutor struct{}
+type pauseExecutor struct {
+	disposition string
+}
 
-func (pauseExecutor) Execute(context.Context, Job, ProgressReporter) (ExecutionResult, error) {
-	return ExecutionResult{Disposition: ExecutionWaitingUser, PauseDisposition: "approval_required"}, nil
+func (executor pauseExecutor) Execute(context.Context, Job, ProgressReporter) (ExecutionResult, error) {
+	disposition := executor.disposition
+	if disposition == "" {
+		disposition = PauseApprovalRequired
+	}
+	return ExecutionResult{Disposition: ExecutionWaitingUser, PauseDisposition: disposition}, nil
 }
 
 func TestCreateRejectsOversizedIdempotencyKeyAtServiceBoundary(t *testing.T) {
@@ -116,7 +122,7 @@ func TestWaitingUserResumeStartsANewAttemptAndPausedCancelIsTerminal(t *testing.
 		t.Fatal(err)
 	}
 	paused, err := service.Get(job.ID)
-	if err != nil || paused.Status != string(WaitingUser) || paused.PauseDisposition != "approval_required" || paused.Attempt != 1 || paused.RequestedBy != "owner" {
+	if err != nil || paused.Status != string(WaitingUser) || paused.PauseDisposition != PauseApprovalRequired || paused.Attempt != 1 || paused.RequestedBy != "owner" {
 		t.Fatalf("paused = %#v, %v", paused, err)
 	}
 	resumed, err := service.Resume(job.ID)
@@ -127,7 +133,7 @@ func TestWaitingUserResumeStartsANewAttemptAndPausedCancelIsTerminal(t *testing.
 	if err != nil || !ok || claimed.Attempt != 2 {
 		t.Fatalf("second claim = %#v, %t, %v", claimed, ok, err)
 	}
-	if err := service.pause(job.ID, "approval_required"); err != nil {
+	if err := service.pause(job.ID, PauseApprovalRequired); err != nil {
 		t.Fatal(err)
 	}
 	cancelled, err := service.Cancel(job.ID)
@@ -136,6 +142,145 @@ func TestWaitingUserResumeStartsANewAttemptAndPausedCancelIsTerminal(t *testing.
 	}
 	if _, err := service.Resume(job.ID); !errors.Is(err, ErrJobNotPaused) {
 		t.Fatalf("resume cancelled = %v", err)
+	}
+}
+
+func TestWorkerPersistsOnlyStablePauseStates(t *testing.T) {
+	testCases := []struct {
+		disposition string
+		message     string
+	}{
+		{PauseApprovalRequired, "Deployment requires approval"},
+		{PauseMigrationApprovalRequired, "Deployment migration requires approval"},
+		{PauseInsufficientReplacementCapacity, "Deployment is waiting for replacement capacity"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.disposition, func(t *testing.T) {
+			service, closeDB := newTestService(t)
+			defer closeDB()
+			releaseID := uuid.NewString()
+			insertReadyReleaseFixture(t, service, "app", releaseID)
+			job, _, err := service.CreateWithInput(CreateRequest{
+				Type: "deploy", ResourceType: "application", ResourceID: "app",
+				RequestedBy: "owner", Input: DeploymentInput{ReleaseID: releaseID, ConfigurationMode: ConfigurationOriginal},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.runOne(context.Background(), pauseExecutor{disposition: testCase.disposition}); err != nil {
+				t.Fatal(err)
+			}
+			paused, err := service.Get(job.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCheckpoint := `{"phase":"` + testCase.disposition + `"}`
+			if paused.Status != string(WaitingUser) || paused.Phase != testCase.disposition || paused.PauseDisposition != testCase.disposition || paused.Checkpoint != wantCheckpoint {
+				t.Fatalf("paused = %#v, want disposition %q", paused, testCase.disposition)
+			}
+			events, err := service.Events(job.ID, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			last := events[len(events)-1]
+			if last.Level != "warn" || last.Phase != testCase.disposition || last.Code != testCase.disposition || last.Message != testCase.message {
+				t.Fatalf("pause event = %#v", last)
+			}
+		})
+	}
+
+	service, closeDB := newTestService(t)
+	defer closeDB()
+	job, _, err := service.Create("deploy", "application", "invalid-pause", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := service.claimNext(context.Background()); err != nil || !ok {
+		t.Fatalf("claim = %t, %v", ok, err)
+	}
+	if err := service.pause(job.ID, "untrusted-detail"); !errors.Is(err, ErrInvalidProgress) {
+		t.Fatalf("invalid pause disposition = %v", err)
+	}
+}
+
+func TestCapacityPauseCanBeRetriedWithoutApproval(t *testing.T) {
+	service, closeDB := newTestService(t)
+	defer closeDB()
+	job, _, err := service.Create("deploy", "application", "capacity-retry", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := service.claimNext(context.Background()); err != nil || !ok {
+		t.Fatalf("claim = %t, %v", ok, err)
+	}
+	if err := service.pause(job.ID, PauseInsufficientReplacementCapacity); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := service.Resume(job.ID)
+	if err != nil || resumed.Status != string(Queued) || resumed.Phase != "queued" || resumed.PauseDisposition != "" || resumed.Checkpoint != "{}" {
+		t.Fatalf("resumed = %#v, %v", resumed, err)
+	}
+}
+
+func TestMigrationPauseRequiresExactPlanApproval(t *testing.T) {
+	dataRoot := filepath.Join(t.TempDir(), "state")
+	db, err := database.Open(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	service := New(db)
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	appID, actorID, planID, releaseID := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?, 'hash',?,?)`, actorID, actorID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?)`, appID, appID, appID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(
+		id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,
+		analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,
+		field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at
+	) VALUES(?,?,1,?,'generated_node','test','1',?,'local',0,?,?,1,8,?,?,?,'accepted',?,?)`,
+		planID, appID, "apps/"+appID+"/deployment-plans/"+planID+".secret", strings.Repeat("a", 64),
+		strings.Repeat("b", 64), strings.Repeat("c", 64), strings.Repeat("d", 64), actorID, now, actorID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE deployment_plan_heads SET revision_id=?,revision_number=1,updated_at=? WHERE app_id=?`, planID, now, appID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,workspace_state,workspace_tree_sha256,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,'ready','{}',?,'local',0,?,'ready',?,?,1)`, releaseID, appID, now, strings.Repeat("b", 64), strings.Repeat("e", 64), planID); err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := service.CreateWithInput(CreateRequest{
+		Type: "deploy", ResourceType: "application", ResourceID: appID, RequestedBy: actorID,
+		Input: DeploymentInput{ReleaseID: releaseID, ConfigurationMode: ConfigurationOriginal},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,release_id,job_id,status,configuration_mode,provenance_initialized,runtime_strategy,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,?,?, 'needs_attention','original',1,'generated_node',?,1)`, uuid.NewString(), appID, releaseID, job.ID, planID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE jobs SET status='waiting_user',phase=?,checkpoint_json=?,pause_disposition=?,attempt=1 WHERE id=?`, PauseMigrationApprovalRequired, `{"phase":"migration_approval_required"}`, PauseMigrationApprovalRequired, job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.Resume(job.ID); !errors.Is(err, ErrMigrationApprovalRequired) {
+		t.Fatalf("resume without approval = %v", err)
+	}
+	persisted, err := service.Get(job.ID)
+	if err != nil || persisted.Status != string(WaitingUser) || persisted.PauseDisposition != PauseMigrationApprovalRequired || persisted.Attempt != 1 {
+		t.Fatalf("unapproved migration changed job = %#v, %v", persisted, err)
+	}
+	if _, err := db.Exec(`INSERT INTO deployment_plan_migration_approvals(revision_id,app_id,approval_revision,approved_by,approved_at) VALUES(?,?,1,?,?)`, planID, appID, actorID, now); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := service.Resume(job.ID)
+	if err != nil || resumed.Status != string(Queued) || resumed.PauseDisposition != "" || resumed.Attempt != 1 {
+		t.Fatalf("approved migration resume = %#v, %v", resumed, err)
 	}
 }
 
@@ -242,23 +387,27 @@ func TestResumeWaitsForConcurrentApprovalRevocationAndFailsClosed(t *testing.T) 
 }
 
 func TestRecoveryPreservesIntentionalUserPause(t *testing.T) {
-	service, closeDB := newTestService(t)
-	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "paused-recovery", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok, err := service.claimNext(context.Background()); err != nil || !ok {
-		t.Fatalf("claim = %t, %v", ok, err)
-	}
-	if err := service.pause(job.ID, "approval_required"); err != nil {
-		t.Fatal(err)
-	}
-	if err := service.RecoverInterrupted(); err != nil {
-		t.Fatal(err)
-	}
-	persisted, err := service.Get(job.ID)
-	if err != nil || persisted.Status != string(WaitingUser) {
-		t.Fatalf("recovered pause = %#v, %v", persisted, err)
+	for _, disposition := range []string{PauseApprovalRequired, PauseMigrationApprovalRequired, PauseInsufficientReplacementCapacity} {
+		t.Run(disposition, func(t *testing.T) {
+			service, closeDB := newTestService(t)
+			defer closeDB()
+			job, _, err := service.Create("deploy", "application", "paused-recovery", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok, err := service.claimNext(context.Background()); err != nil || !ok {
+				t.Fatalf("claim = %t, %v", ok, err)
+			}
+			if err := service.pause(job.ID, disposition); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.RecoverInterrupted(); err != nil {
+				t.Fatal(err)
+			}
+			persisted, err := service.Get(job.ID)
+			if err != nil || persisted.Status != string(WaitingUser) || persisted.PauseDisposition != disposition {
+				t.Fatalf("recovered pause = %#v, %v", persisted, err)
+			}
+		})
 	}
 }
