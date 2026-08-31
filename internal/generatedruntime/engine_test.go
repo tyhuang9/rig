@@ -275,6 +275,66 @@ func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testin
 	findRuntimeRequest(t, runner.requests, "container rm")
 }
 
+func TestGeneratedRuntimeHealthWaitFailsClosed(t *testing.T) {
+	tests := []struct {
+		name     string
+		running  bool
+		health   string
+		cancel   bool
+		expected DiagnosticCode
+	}{
+		{name: "unhealthy", running: true, health: "unhealthy", expected: DiagnosticCandidateUnhealthy},
+		{name: "exited", running: false, health: "starting", expected: DiagnosticCandidateExited},
+		{name: "missing health", running: true, health: "", expected: DiagnosticCandidateHardeningFailed},
+		{name: "cancelled", running: true, health: "starting", cancel: true, expected: DiagnosticCancelled},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			spec := candidateSpec()
+			candidate := candidateForSpec(spec)
+			engine, _, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+				if commandKind(request.Args) != "container inspect" {
+					t.Fatalf("unexpected health command: %#v", request.Args)
+				}
+				inspection := hardenedInspection(spec, defaultLimits())
+				inspection.Running = test.running
+				inspection.Health = test.health
+				return runtimeJSON(inspection)
+			})
+			ctx := context.Background()
+			if test.cancel {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+			if err := engine.WaitHealthy(ctx, candidate); !IsCode(err, test.expected) {
+				t.Fatalf("expected %s, got %v", test.expected, err)
+			}
+		})
+	}
+}
+
+func TestGeneratedRuntimeRefusesNetworkOwnershipDrift(t *testing.T) {
+	engine, runner, spec := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		switch commandKind(request.Args) {
+		case "image inspect":
+			return runtimeJSON(validImageInspection(candidateSpec()))
+		case "network inspect":
+			return runtimeJSON(networkInspection{Name: networkName(candidateSpec().AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "somebody-else"}})
+		default:
+			t.Fatalf("network drift reached mutation: %#v", request.Args)
+			return runtimeRequestResult{}
+		}
+	})
+	_, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	if !IsCode(err, DiagnosticNetworkDriftDetected) {
+		t.Fatalf("expected network drift, got %v", err)
+	}
+	if len(runner.requests) != 2 {
+		t.Fatalf("network drift should stop after two read-only inspections, got %d", len(runner.requests))
+	}
+}
+
 func TestGeneratedRuntimeErrorsNeverIncludeDockerOutput(t *testing.T) {
 	secret := "super-secret-docker-output"
 	engine, _, spec := newRuntimeTestEngine(t, func(runtimeprocess.CommandRequest) runtimeRequestResult {
@@ -320,6 +380,18 @@ func candidateSpec() CandidateSpec {
 	}
 }
 
+func candidateForSpec(spec CandidateSpec) Candidate {
+	slot, _ := InactiveSlot(spec.ActiveSlot)
+	return Candidate{
+		AppID: spec.AppID, ReleaseID: spec.ReleaseID, DeploymentID: spec.DeploymentID,
+		ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID,
+		Component: spec.ComponentName, Slot: slot, ContainerID: testContainerID,
+		ContainerName: containerName(spec.AppID, spec.ComponentName, slot), NetworkName: networkName(spec.AppID),
+		NetworkAlias: containerAlias(spec.ComponentName, slot), InternalPort: spec.InternalPort,
+		ImageContentID: spec.ImageContentID, WorkingDirectory: runtimeWorkingDirectory(spec.RootDirectory), RunCommandDigest: sha256Hex(spec.RunCommand),
+	}
+}
+
 func defaultLimits() ContainerLimits {
 	return ContainerLimits{MemoryBytes: 512 << 20, MilliCPUs: 1000, PIDs: 256, TmpfsBytes: 64 << 20, LogSize: "10m", LogFiles: 3}
 }
@@ -341,7 +413,7 @@ func hardenedInspection(spec CandidateSpec, limits ContainerLimits) containerIns
 		Command: []string{"/bin/sh", "-lc", spec.RunCommand}, HealthTest: []string{"CMD-SHELL", healthCommand},
 		HealthInterval: int64(2 * time.Second), HealthTimeout: int64(2 * time.Second), HealthStartPeriod: int64(5 * time.Second), HealthRetries: 3,
 		Memory: limits.MemoryBytes, MemorySwap: limits.MemoryBytes, NanoCPUs: limits.MilliCPUs * 1_000_000, PIDs: limits.PIDs,
-		NetworkMode: network, ReadonlyRootfs: true, CapDrop: []string{"ALL"}, SecurityOptions: []string{"no-new-privileges:true"}, Ulimits: []ulimitInspection{{Name: "nofile", Soft: 1024, Hard: 1024}},
+		NetworkMode: network, ReadonlyRootfs: true, Init: true, CapDrop: []string{"ALL"}, SecurityOptions: []string{"no-new-privileges:true"}, Ulimits: []ulimitInspection{{Name: "nofile", Soft: 1024, Hard: 1024}},
 		Tmpfs:   map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=" + stringInt(limits.TmpfsBytes)},
 		LogType: "local", LogConfig: map[string]string{"max-size": limits.LogSize, "max-file": stringInt(int64(limits.LogFiles))}, Restart: "no",
 		Mounts: []mountInspection{{Type: "tmpfs", Destination: "/tmp", RW: true}}, Networks: map[string]json.RawMessage{network: json.RawMessage(`{}`)},

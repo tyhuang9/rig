@@ -37,7 +37,7 @@ const (
 const (
 	networkInspectFormat   = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"internal":{{json .Internal}},"labels":{{json .Labels}}}`
 	imageInspectFormat     = `{"id":{{json .Id}},"size":{{json .Size}},"labels":{{json .Config.Labels}},"user":{{json .Config.User}},"workingDir":{{json .Config.WorkingDir}},"entrypoint":{{json .Config.Entrypoint}}}`
-	containerInspectFormat = `{"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"user":{{json .Config.User}},"workingDir":{{json .Config.WorkingDir}},"cmd":{{json .Config.Cmd}},"healthTest":{{json .Config.Healthcheck.Test}},"healthInterval":{{json .Config.Healthcheck.Interval}},"healthTimeout":{{json .Config.Healthcheck.Timeout}},"healthStartPeriod":{{json .Config.Healthcheck.StartPeriod}},"healthRetries":{{json .Config.Healthcheck.Retries}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCpus}},"pidsLimit":{{json .HostConfig.PidsLimit}},"ulimits":{{json .HostConfig.Ulimits}},"networkMode":{{json .HostConfig.NetworkMode}},"readonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"portBindings":{{json .HostConfig.PortBindings}},"tmpfs":{{json .HostConfig.Tmpfs}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"mounts":{{json .Mounts}},"running":{{json .State.Running}},"exitCode":{{json .State.ExitCode}},"health":{{json .State.Health.Status}},"networks":{{json .NetworkSettings.Networks}}}`
+	containerInspectFormat = `{"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"user":{{json .Config.User}},"workingDir":{{json .Config.WorkingDir}},"cmd":{{json .Config.Cmd}},"healthTest":{{json .Config.Healthcheck.Test}},"healthInterval":{{json .Config.Healthcheck.Interval}},"healthTimeout":{{json .Config.Healthcheck.Timeout}},"healthStartPeriod":{{json .Config.Healthcheck.StartPeriod}},"healthRetries":{{json .Config.Healthcheck.Retries}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCpus}},"pidsLimit":{{json .HostConfig.PidsLimit}},"ulimits":{{json .HostConfig.Ulimits}},"init":{{json .HostConfig.Init}},"networkMode":{{json .HostConfig.NetworkMode}},"readonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"portBindings":{{json .HostConfig.PortBindings}},"tmpfs":{{json .HostConfig.Tmpfs}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"mounts":{{json .Mounts}},"running":{{json .State.Running}},"exitCode":{{json .State.ExitCode}},"health":{{json .State.Health.Status}},"networks":{{json .NetworkSettings.Networks}}}`
 )
 
 // The string is controller-owned and contains no plan values. Port and path
@@ -178,6 +178,7 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 		"--user", containerUser,
 		"--workdir", workingDirectory,
 		"--read-only",
+		"--init",
 		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=" + strconv.FormatInt(e.options.Limits.TmpfsBytes, 10),
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges=true",
@@ -205,13 +206,18 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 	diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticCandidateCreateFailed)
 	clearResult(&result)
 	if diagnostic != "" || !lowerHex(containerID, 64) {
+		if lowerHex(containerID, 64) {
+			_ = e.removeUnstarted(context.WithoutCancel(ctx), containerID)
+		}
 		if diagnostic == "" {
 			diagnostic = DiagnosticCandidateCreateFailed
 		}
 		return Candidate{}, &Error{Code: diagnostic}
 	}
 	if err := cleanupEnvironment(); err != nil {
-		e.removeUnstarted(context.WithoutCancel(ctx), containerID)
+		if cleanupErr := e.removeUnstarted(context.WithoutCancel(ctx), containerID); cleanupErr != nil {
+			return Candidate{}, cleanupErr
+		}
 		return Candidate{}, &Error{Code: DiagnosticConfigurationUnavailable}
 	}
 
@@ -225,7 +231,9 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 	}
 	container, found, err := e.inspectContainer(ctx, containerID)
 	if err != nil || !found || !matchesCreatedContainer(container, spec, candidate, image.ID, workingDirectory, labels, e.options.Limits) {
-		e.removeUnstarted(context.WithoutCancel(ctx), containerID)
+		if cleanupErr := e.removeUnstarted(context.WithoutCancel(ctx), containerID); cleanupErr != nil {
+			return Candidate{}, cleanupErr
+		}
 		return Candidate{}, &Error{Code: DiagnosticCandidateHardeningFailed}
 	}
 	releaseOnFailure = false
@@ -455,12 +463,17 @@ func (e *Engine) inspectContainer(ctx context.Context, identity string) (contain
 	return container, true, nil
 }
 
-func (e *Engine) removeUnstarted(ctx context.Context, containerID string) {
+func (e *Engine) removeUnstarted(ctx context.Context, containerID string) error {
 	if !lowerHex(containerID, 64) {
-		return
+		return &Error{Code: DiagnosticCandidateCleanupFailed}
 	}
-	result, _ := e.run(ctx, []string{"container", "rm", "--force", containerID}, e.options.CommandTimeout)
+	result, runErr := e.run(ctx, []string{"container", "rm", "--force", containerID}, e.options.CommandTimeout)
+	diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticCandidateCleanupFailed)
 	clearResult(&result)
+	if diagnostic != "" {
+		return &Error{Code: diagnostic}
+	}
+	return nil
 }
 
 func (e *Engine) run(ctx context.Context, args []string, timeout time.Duration) (runtimeprocess.CommandResult, error) {
@@ -533,6 +546,7 @@ type containerInspection struct {
 	NanoCPUs          int64                      `json:"nanoCpus"`
 	PIDs              int64                      `json:"pidsLimit"`
 	Ulimits           []ulimitInspection         `json:"ulimits"`
+	Init              bool                       `json:"init"`
 	NetworkMode       string                     `json:"networkMode"`
 	ReadonlyRootfs    bool                       `json:"readonlyRootfs"`
 	Privileged        bool                       `json:"privileged"`
@@ -718,7 +732,7 @@ func matchesCandidateHardening(container containerInspection, candidate Candidat
 	if len(container.HealthTest) != 2 || container.HealthTest[0] != "CMD-SHELL" || container.HealthTest[1] != healthCommand || container.HealthInterval != int64(2*time.Second) || container.HealthTimeout != int64(2*time.Second) || container.HealthStartPeriod != int64(5*time.Second) || container.HealthRetries != 3 {
 		return false
 	}
-	if container.Memory != limits.MemoryBytes || container.MemorySwap != limits.MemoryBytes || container.NanoCPUs != limits.MilliCPUs*1_000_000 || container.PIDs != limits.PIDs || len(container.Ulimits) != 1 || container.Ulimits[0] != (ulimitInspection{Name: "nofile", Soft: 1024, Hard: 1024}) || container.NetworkMode != candidate.NetworkName || !container.ReadonlyRootfs || container.Privileged || len(container.CapAdd) != 0 || len(container.CapDrop) != 1 || !containsFold(container.CapDrop, "ALL") || !onlyNoNewPrivileges(container.SecurityOptions) {
+	if container.Memory != limits.MemoryBytes || container.MemorySwap != limits.MemoryBytes || container.NanoCPUs != limits.MilliCPUs*1_000_000 || container.PIDs != limits.PIDs || len(container.Ulimits) != 1 || container.Ulimits[0] != (ulimitInspection{Name: "nofile", Soft: 1024, Hard: 1024}) || !container.Init || container.NetworkMode != candidate.NetworkName || !container.ReadonlyRootfs || container.Privileged || len(container.CapAdd) != 0 || len(container.CapDrop) != 1 || !containsFold(container.CapDrop, "ALL") || !onlyNoNewPrivileges(container.SecurityOptions) {
 		return false
 	}
 	if len(container.Binds) != 0 || len(container.PortBindings) != 0 || container.Restart != "no" || container.LogType != "local" || container.LogConfig["max-size"] != limits.LogSize || container.LogConfig["max-file"] != strconv.Itoa(limits.LogFiles) || !onlyRuntimeTmpfsMount(container.Mounts) {
