@@ -535,19 +535,21 @@ func validBuildkitContainer(identity builderIdentity, quotaBytes int64) buildkit
 	container.Image = "sha256:" + strings.Repeat("a", 64)
 	container.State.Running = true
 	container.Config.Image = buildkitImage
-	container.Config.Cmd = []string{"--oci-worker-net", "bridge"}
+	container.Config.Cmd = buildkitCommand(quotaBytes)
 	container.Config.Labels = map[string]string{
 		"rig.controller": "generated-builder", "rig.builder": identity.BuilderName,
 		"rig.network": identity.NetworkName, "rig.quota.bytes": fmt.Sprintf("%d", quotaBytes),
 	}
-	container.HostConfig.Memory = buildkitMemoryBytes
-	container.HostConfig.MemorySwap = buildkitMemoryBytes
+	container.HostConfig.Memory = buildkitMemoryLimit(quotaBytes)
+	container.HostConfig.MemorySwap = buildkitMemoryLimit(quotaBytes)
 	container.HostConfig.CPUPeriod = 100000
 	container.HostConfig.CPUQuota = 100000
 	container.HostConfig.PidsLimit = buildkitPIDsLimit
 	container.HostConfig.Privileged = true
 	container.HostConfig.NetworkMode = identity.NetworkName
 	container.HostConfig.RestartPolicy.Name = "no"
+	container.HostConfig.LogConfig.Type = "json-file"
+	container.HostConfig.LogConfig.Config = map[string]string{"max-size": "10m", "max-file": "1"}
 	tmpfs := &struct {
 		SizeBytes int64 `json:"SizeBytes"`
 		Mode      int64 `json:"Mode"`

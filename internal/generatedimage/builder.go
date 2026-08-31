@@ -29,8 +29,8 @@ const (
 	defaultStateQuotaBytes  = int64(2 << 30)
 	minimumStateQuotaBytes  = int64(512 << 20)
 	maximumStateQuotaBytes  = int64(16 << 30)
-	buildkitMemoryBytes     = int64(3 << 30)
 	buildkitPIDsLimit       = int64(512)
+	buildkitMemoryHeadroom  = int64(1 << 30)
 
 	defaultBuilderPrepareTimeout = 2 * time.Minute
 	defaultBuilderOutputLimit    = 64 << 10
@@ -156,16 +156,20 @@ type buildkitContainer struct {
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	HostConfig struct {
-		Memory        int64                      `json:"Memory"`
-		MemorySwap    int64                      `json:"MemorySwap"`
-		CPUPeriod     int64                      `json:"CpuPeriod"`
-		CPUQuota      int64                      `json:"CpuQuota"`
-		PidsLimit     int64                      `json:"PidsLimit"`
-		NetworkMode   string                     `json:"NetworkMode"`
-		Privileged    bool                       `json:"Privileged"`
-		Binds         []string                   `json:"Binds"`
-		Mounts        []dockerConfiguredMount    `json:"Mounts"`
-		PortBindings  map[string]json.RawMessage `json:"PortBindings"`
+		Memory       int64                      `json:"Memory"`
+		MemorySwap   int64                      `json:"MemorySwap"`
+		CPUPeriod    int64                      `json:"CpuPeriod"`
+		CPUQuota     int64                      `json:"CpuQuota"`
+		PidsLimit    int64                      `json:"PidsLimit"`
+		NetworkMode  string                     `json:"NetworkMode"`
+		Privileged   bool                       `json:"Privileged"`
+		Binds        []string                   `json:"Binds"`
+		Mounts       []dockerConfiguredMount    `json:"Mounts"`
+		PortBindings map[string]json.RawMessage `json:"PortBindings"`
+		LogConfig    struct {
+			Type   string            `json:"Type"`
+			Config map[string]string `json:"Config"`
+		} `json:"LogConfig"`
 		RestartPolicy struct {
 			Name string `json:"Name"`
 		} `json:"RestartPolicy"`
@@ -475,21 +479,27 @@ func (m *BuilderManager) ensureBuildkitContainer(ctx context.Context, identity b
 	}
 
 	quota := fmt.Sprintf("%d", m.options.StateQuotaBytes)
-	result, runErr := m.run(ctx, []string{
+	args := []string{
 		"container", "run", "--detach", "--name", buildkitContainerName(identity),
 		"--privileged", "--network", identity.NetworkName,
-		"--memory", fmt.Sprintf("%d", buildkitMemoryBytes), "--memory-swap", fmt.Sprintf("%d", buildkitMemoryBytes),
+		"--memory", fmt.Sprintf("%d", buildkitMemoryLimit(m.options.StateQuotaBytes)), "--memory-swap", fmt.Sprintf("%d", buildkitMemoryLimit(m.options.StateQuotaBytes)),
 		"--cpu-period", "100000", "--cpu-quota", "100000", "--pids-limit", fmt.Sprintf("%d", buildkitPIDsLimit),
+		"--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=1",
 		"--mount", "type=tmpfs,destination=" + buildkitStatePath + ",tmpfs-size=" + quota + ",tmpfs-mode=0700",
 		"--label", "rig.controller=generated-builder", "--label", "rig.builder=" + identity.BuilderName,
 		"--label", "rig.network=" + identity.NetworkName, "--label", "rig.quota.bytes=" + quota,
-		buildkitImage, "--oci-worker-net", "bridge",
-	}, env)
+		buildkitImage,
+	}
+	args = append(args, buildkitCommand(m.options.StateQuotaBytes)...)
+	result, runErr := m.run(ctx, args, env)
 	defer clear(result.Stdout)
 	defer clear(result.Stderr)
 	if runErr != nil {
-		if retried, retryFound, retryErr := m.inspectBuildkitContainer(ctx, identity, env); retryErr == nil && retryFound && matchesBuildkitContainer(retried, identity, m.options.StateQuotaBytes) {
-			return nil
+		if retried, retryFound, retryErr := m.inspectBuildkitContainer(ctx, identity, env); retryErr == nil && retryFound {
+			if matchesBuildkitContainer(retried, identity, m.options.StateQuotaBytes) {
+				return nil
+			}
+			return &BuilderError{Code: BuilderDriftDetected}
 		}
 		return quotaProvisionError(ctx, result, runErr)
 	}
@@ -525,6 +535,19 @@ func buildkitContainerName(identity builderIdentity) string {
 	return "rig-buildkitd-" + strings.TrimPrefix(identity.NodeName, "rig-node-")
 }
 
+func buildkitMemoryLimit(quotaBytes int64) int64 {
+	return quotaBytes + buildkitMemoryHeadroom
+}
+
+func buildkitCommand(quotaBytes int64) []string {
+	return []string{
+		"--oci-worker-net", "bridge",
+		"--oci-worker-gc",
+		"--oci-worker-gc-keepstorage=" + fmt.Sprintf("%d", quotaBytes/2),
+		"--oci-max-parallelism=1",
+	}
+}
+
 func matchesBuildkitContainer(container buildkitContainer, identity builderIdentity, quotaBytes int64) bool {
 	wantLabels := map[string]string{
 		"rig.controller":  "generated-builder",
@@ -532,7 +555,7 @@ func matchesBuildkitContainer(container buildkitContainer, identity builderIdent
 		"rig.network":     identity.NetworkName,
 		"rig.quota.bytes": fmt.Sprintf("%d", quotaBytes),
 	}
-	if container.Name != "/"+buildkitContainerName(identity) || !validImageContentID(container.Image) || container.Config.Image != buildkitImage || !equalStringSlices(container.Config.Cmd, []string{"--oci-worker-net", "bridge"}) || !container.State.Running || container.State.Restarting {
+	if container.Name != "/"+buildkitContainerName(identity) || !validImageContentID(container.Image) || container.Config.Image != buildkitImage || !equalStringSlices(container.Config.Cmd, buildkitCommand(quotaBytes)) || !container.State.Running || container.State.Restarting {
 		return false
 	}
 	for key, value := range wantLabels {
@@ -540,7 +563,7 @@ func matchesBuildkitContainer(container buildkitContainer, identity builderIdent
 			return false
 		}
 	}
-	if container.HostConfig.Memory != buildkitMemoryBytes || container.HostConfig.MemorySwap != buildkitMemoryBytes || container.HostConfig.CPUPeriod != 100000 || container.HostConfig.CPUQuota != 100000 || container.HostConfig.PidsLimit != buildkitPIDsLimit || !container.HostConfig.Privileged || container.HostConfig.NetworkMode != identity.NetworkName || len(container.HostConfig.Binds) != 0 || len(container.HostConfig.PortBindings) != 0 || (container.HostConfig.RestartPolicy.Name != "" && container.HostConfig.RestartPolicy.Name != "no") || len(container.NetworkSettings.Networks) != 1 {
+	if container.HostConfig.Memory != buildkitMemoryLimit(quotaBytes) || container.HostConfig.MemorySwap != buildkitMemoryLimit(quotaBytes) || container.HostConfig.CPUPeriod != 100000 || container.HostConfig.CPUQuota != 100000 || container.HostConfig.PidsLimit != buildkitPIDsLimit || !container.HostConfig.Privileged || container.HostConfig.NetworkMode != identity.NetworkName || len(container.HostConfig.Binds) != 0 || len(container.HostConfig.PortBindings) != 0 || (container.HostConfig.RestartPolicy.Name != "" && container.HostConfig.RestartPolicy.Name != "no") || container.HostConfig.LogConfig.Type != "json-file" || len(container.HostConfig.LogConfig.Config) != 2 || container.HostConfig.LogConfig.Config["max-size"] != "10m" || container.HostConfig.LogConfig.Config["max-file"] != "1" || len(container.NetworkSettings.Networks) != 1 {
 		return false
 	}
 	_, connected := container.NetworkSettings.Networks[identity.NetworkName]
