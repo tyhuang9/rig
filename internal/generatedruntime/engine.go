@@ -106,7 +106,7 @@ func NewEngine(runner runtimeprocess.CommandRunner, environment EnvironmentStage
 
 func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec) (Candidate, error) {
 	defer clear(spec.Environment)
-	if e == nil || !validCandidateSpec(spec) {
+	if e == nil || ctx == nil || !validCandidateSpec(spec) {
 		return Candidate{}, &Error{Code: DiagnosticValidationFailed}
 	}
 	slot, err := InactiveSlot(spec.ActiveSlot)
@@ -241,7 +241,7 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 }
 
 func (e *Engine) StartCandidate(ctx context.Context, candidate Candidate) error {
-	if e == nil || !validCandidate(candidate) {
+	if e == nil || ctx == nil || !validCandidate(candidate) {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
 	container, found, err := e.inspectContainer(ctx, candidate.ContainerID)
@@ -261,7 +261,7 @@ func (e *Engine) StartCandidate(ctx context.Context, candidate Candidate) error 
 }
 
 func (e *Engine) WaitHealthy(ctx context.Context, candidate Candidate) error {
-	if e == nil || !validCandidate(candidate) {
+	if e == nil || ctx == nil || !validCandidate(candidate) {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, e.options.HealthTimeout)
@@ -306,7 +306,7 @@ func (e *Engine) WaitHealthy(ctx context.Context, candidate Candidate) error {
 // after Docker confirms removal; a failed cleanup remains reserved so another
 // deployment cannot overcommit the host.
 func (e *Engine) StopAndRemove(ctx context.Context, candidate Candidate, grace time.Duration) error {
-	if e == nil || !validCandidate(candidate) || grace < 0 || grace > 30*time.Second {
+	if e == nil || ctx == nil || !validCandidate(candidate) || grace < 0 || grace > 30*time.Second {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
 	container, found, err := e.inspectContainer(ctx, candidate.ContainerID)
@@ -597,11 +597,23 @@ func validEngineOptions(options EngineOptions) bool {
 }
 
 func validCandidateSpec(spec CandidateSpec) bool {
-	if !canonicalUUID(spec.AppID) || !validReleaseID(spec.ReleaseID) || !canonicalUUID(spec.DeploymentID) || !canonicalUUID(spec.ArtifactID) || !canonicalUUID(spec.DeploymentPlanRevisionID) || !validText(spec.ComponentName, 256) || !validRootDirectory(spec.RootDirectory) || deploymentplans.ValidateCommand(spec.RunCommand) != nil || spec.InternalPort == 0 || !validHealthProbe(spec.HealthProbe) || !validImageID(spec.ImageContentID) || !lowerHex(spec.BuildDefinitionDigest, 64) || !canonicalUUID(spec.EnvironmentOperationID) || spec.EnvironmentOperationAttempt < 1 || len(spec.Environment) == 0 || len(spec.Environment) > maximumEnvironmentBytes {
+	if !canonicalUUID(spec.AppID) || !validReleaseID(spec.ReleaseID) || !canonicalUUID(spec.DeploymentID) || !canonicalUUID(spec.ArtifactID) || !canonicalUUID(spec.DeploymentPlanRevisionID) || !validText(spec.ComponentName, 256) || !validRootDirectory(spec.RootDirectory) || deploymentplans.ValidateCommand(spec.RunCommand) != nil || spec.InternalPort == 0 || !validHealthProbe(spec.HealthProbe) || !validImageID(spec.ImageContentID) || !lowerHex(spec.BuildDefinitionDigest, 64) || !canonicalUUID(spec.EnvironmentOperationID) || spec.EnvironmentOperationAttempt < 1 || !validEnvironment(spec.Environment) {
 		return false
 	}
 	_, err := InactiveSlot(spec.ActiveSlot)
 	return err == nil
+}
+
+func validEnvironment(environment []byte) bool {
+	if len(environment) == 0 || len(environment) > maximumEnvironmentBytes || !utf8.Valid(environment) {
+		return false
+	}
+	for _, value := range environment {
+		if value == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func validCandidate(candidate Candidate) bool {

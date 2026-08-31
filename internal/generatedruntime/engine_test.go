@@ -346,6 +346,20 @@ func TestGeneratedRuntimeErrorsNeverIncludeDockerOutput(t *testing.T) {
 	}
 }
 
+func TestGeneratedRuntimeRejectsInvalidEnvironmentBeforeInspection(t *testing.T) {
+	engine, runner, spec := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		t.Fatalf("invalid configuration reached Docker: %#v", request.Args)
+		return runtimeRequestResult{}
+	})
+	spec.Environment = []byte{'A', '=', 'x', 0, 'y'}
+	if _, err := engine.CreateInactiveCandidate(context.Background(), spec); !IsCode(err, DiagnosticValidationFailed) {
+		t.Fatalf("expected validation failure, got %v", err)
+	}
+	if len(runner.requests) != 0 {
+		t.Fatalf("invalid configuration reached Docker: %d requests", len(runner.requests))
+	}
+}
+
 func TestGeneratedRuntimeIdentitiesAndSlotsAreDeterministic(t *testing.T) {
 	app := "11111111-1111-4111-8111-111111111111"
 	if first, second := networkName(app), networkName(app); first != second || len(first) > 63 {
