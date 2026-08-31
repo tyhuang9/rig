@@ -31,6 +31,7 @@ type builderDaemonFake struct {
 	containerRunErr    error
 	containerRunStderr []byte
 	infoOverride       *dockerInfo
+	replaceOnLifecycle bool
 }
 
 func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -155,6 +156,9 @@ func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.Comman
 				container.State.Running = true
 				container.State.Paused = false
 				container.State.Restarting = false
+				if d.replaceOnLifecycle {
+					container.ID = strings.Repeat("c", 64)
+				}
 				d.boxes[name] = container
 				output := []byte(id)
 				d.outputs = append(d.outputs, output)
@@ -520,6 +524,28 @@ func TestBuilderManagerRefusesLifecycleRecoveryWhenOwnershipDrifts(t *testing.T)
 	}
 	if got, want := commandKinds(daemon.requests()[before:]), []string{"info --format", "network inspect", "container inspect"}; !sameStrings(got, want) {
 		t.Fatalf("commands after lifecycle ownership drift = %#v, want read-only %#v", got, want)
+	}
+}
+
+func TestBuilderManagerRefusesContainerReplacementDuringLifecycleRecovery(t *testing.T) {
+	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+	manager := newBuilderManagerForTest(t, daemon)
+	session, err := manager.Prepare(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon.mu.Lock()
+	identity := daemon.nodes[session.BuilderName]
+	containerName := buildkitContainerName(identity)
+	container := daemon.boxes[containerName]
+	container.State.Running = false
+	daemon.boxes[containerName] = container
+	daemon.replaceOnLifecycle = true
+	daemon.mu.Unlock()
+
+	_, err = manager.Prepare(context.Background())
+	if !IsBuilderError(err, BuilderDriftDetected) {
+		t.Fatalf("replacement race error = %v", err)
 	}
 }
 
