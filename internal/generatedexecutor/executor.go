@@ -145,26 +145,25 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 		}
 	}
 
-	if runtimeDeployment.Phase != generatedruntimestate.PhaseDraining {
-		err = e.authorization.Authorize(ctx, AuthorizationRequest{
-			AppID: deployment.AppID, DeploymentID: deployment.ID, ReleaseID: deployment.ReleaseID,
-			DeploymentPlanRevisionID:     deployment.DeploymentPlanRevisionID,
-			DeploymentPlanRevisionNumber: deployment.DeploymentPlanRevisionNumber,
-			CandidateSlot:                generatedruntime.Slot(runtimeDeployment.CandidateSlot), ComponentCount: len(componentNames),
-		})
-		if errors.Is(err, ErrInsufficientReplacementCapacity) {
-			return waitingForApproval(), nil
-		}
-		if errors.Is(err, deployments.ErrApprovalRequired) {
-			return waitingForApproval(), nil
-		}
-		if err != nil {
-			return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
-		}
-		deployment, err = e.deployments.Get(ctx, deployment.AppID, deployment.ID)
-		if err != nil {
-			return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
-		}
+	reservation, err := e.authorization.Authorize(ctx, AuthorizationRequest{
+		AppID: deployment.AppID, DeploymentID: deployment.ID, ReleaseID: deployment.ReleaseID,
+		DeploymentPlanRevisionID:     deployment.DeploymentPlanRevisionID,
+		DeploymentPlanRevisionNumber: deployment.DeploymentPlanRevisionNumber,
+		CandidateSlot:                generatedruntime.Slot(runtimeDeployment.CandidateSlot), ComponentCount: len(componentNames),
+	})
+	if errors.Is(err, ErrInsufficientReplacementCapacity) {
+		return waitingForApproval(), nil
+	}
+	if errors.Is(err, deployments.ErrApprovalRequired) {
+		return waitingForApproval(), nil
+	}
+	if err != nil || reservation == nil {
+		return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
+	}
+	defer reservation.Release()
+	deployment, err = e.deployments.Get(ctx, deployment.AppID, deployment.ID)
+	if err != nil {
+		return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 	}
 
 	artifacts := make(map[string]generatedimage.Artifact, len(componentNames))
@@ -226,7 +225,7 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticRuntimeUnavailable)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
 			}
-			candidates, err = e.startCandidates(ctx, job, resolved, runtimeDeployment, artifacts)
+			candidates, err = e.startCandidates(ctx, job, resolved, runtimeDeployment, artifacts, reservation)
 			if err != nil {
 				if cleanupErr := e.cleanupCandidates(ctx, candidates); cleanupErr != nil {
 					err = cleanupErr
@@ -257,7 +256,7 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 				}
 			}
-			candidates, err = e.healthyCandidates(ctx, resolved, runtimeDeployment, artifacts, candidates)
+			candidates, err = e.healthyCandidates(ctx, resolved, runtimeDeployment, artifacts, candidates, reservation)
 			if err != nil {
 				if cleanupErr := e.cleanupCandidates(ctx, candidates); cleanupErr != nil {
 					err = cleanupErr
@@ -278,7 +277,7 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 				}
 			}
-			candidates, err = e.reconstructCandidates(resolved, runtimeDeployment, artifacts)
+			candidates, err = e.reconstructCandidates(resolved, runtimeDeployment, artifacts, reservation)
 			if err != nil {
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 			}

@@ -242,7 +242,16 @@ type fakeRuntime struct {
 	validateCalls int
 	healthErr     error
 	createdSpecs  []generatedruntime.CandidateSpec
+	adopted       int
 	stopped       int
+}
+
+type fakeReplacementReservation struct{ releases int }
+
+func (r *fakeReplacementReservation) Release() { r.releases++ }
+
+func (f *fakeRuntime) ReserveReplacement(context.Context, int) (generatedruntime.ReplacementReservation, error) {
+	return &fakeReplacementReservation{}, nil
 }
 
 func (f *fakeRuntime) ValidateImage(context.Context, generatedruntime.ImageSpec) error {
@@ -264,11 +273,15 @@ func (f *fakeRuntime) CreateInactiveCandidate(_ context.Context, spec generatedr
 	description, _ := generatedruntime.DescribeInactiveCandidate(spec.AppID, spec.ComponentName, spec.ActiveSlot)
 	return generatedruntime.Candidate{
 		AppID: spec.AppID, ReleaseID: spec.ReleaseID, DeploymentID: spec.DeploymentID, ArtifactID: spec.ArtifactID,
-		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, Component: spec.ComponentName, Slot: description.Slot,
+		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, Component: spec.ComponentName, Role: spec.Role, Slot: description.Slot,
 		ContainerID: "a" + string(make([]byte, 63)), ContainerName: description.ContainerName,
 		NetworkName: description.NetworkName, NetworkAlias: description.NetworkAlias, InternalPort: spec.InternalPort,
 		ImageContentID: spec.ImageContentID, WorkingDirectory: runtimeWorkingDirectory(spec.RootDirectory), RunCommandDigest: commandDigest(spec.RunCommand),
 	}, nil
+}
+func (f *fakeRuntime) AdoptCandidate(candidate generatedruntime.Candidate, _ generatedruntime.ReplacementReservation) (generatedruntime.Candidate, error) {
+	f.adopted++
+	return candidate, nil
 }
 func (f *fakeRuntime) StartCandidate(context.Context, generatedruntime.Candidate) error {
 	*f.events = append(*f.events, "start")
@@ -285,19 +298,25 @@ func (f *fakeRuntime) StopAndRemove(context.Context, generatedruntime.Candidate,
 func (f *fakeRuntime) ReleaseAdmission(generatedruntime.Candidate) {}
 
 type fakeAuthorization struct {
-	events      *[]string
-	err         error
-	deployments *fakeDeployments
-	calls       int
+	events       *[]string
+	err          error
+	deployments  *fakeDeployments
+	calls        int
+	reservations []*fakeReplacementReservation
 }
 
-func (f *fakeAuthorization) Authorize(context.Context, AuthorizationRequest) error {
+func (f *fakeAuthorization) Authorize(context.Context, AuthorizationRequest) (generatedruntime.ReplacementReservation, error) {
 	f.calls++
 	*f.events = append(*f.events, "authorize")
-	if f.err == nil {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.deployments.deployment.Status == deployments.Preparing || f.deployments.deployment.Status == deployments.NeedsAttention {
 		f.deployments.deployment.Status = deployments.Applying
 	}
-	return f.err
+	reservation := &fakeReplacementReservation{}
+	f.reservations = append(f.reservations, reservation)
+	return reservation, nil
 }
 
 type fakeRoutes struct {
@@ -347,7 +366,7 @@ type executorFixture struct {
 func newExecutorFixture(t *testing.T, migration bool) *executorFixture {
 	t.Helper()
 	events := []string{}
-	component := deploymentplans.Component{Name: "api", Role: "api", RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm start && echo $READY", InternalPort: 3000, HealthProbe: "/health"}
+	component := deploymentplans.Component{Name: "api", Role: generatedruntime.RoleServer, RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm start && echo $READY", InternalPort: 3000, HealthProbe: "/health"}
 	plan := deploymentplans.DeploymentPlanRevision{ID: testPlanID, AppID: testAppID, RevisionNumber: 2, State: deploymentplans.RevisionAccepted, Plan: deploymentplans.Plan{Strategy: deploymentplans.StrategyGeneratedNode, Components: []deploymentplans.Component{component}}}
 	if migration {
 		plan.Plan.Migration = &deploymentplans.Migration{ComponentName: "api", RootDirectory: ".", Command: "npm run migrate && echo $DATABASE_URL", EnvironmentKeys: []string{"DATABASE_URL"}, EvidenceDigest: string(make([]byte, 64)), Approval: deploymentplans.MigrationApproval{Status: deploymentplans.MigrationApprovalApproved}}
@@ -404,13 +423,16 @@ func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen
 	if fixture.migrations.requests[0].Command != fixture.plan.Plan.Migration.Command {
 		t.Fatal("accepted migration command was not preserved exactly")
 	}
-	if len(fixture.runtime.createdSpecs) != 1 || fixture.runtime.createdSpecs[0].RunCommand != fixture.plan.Plan.Components[0].RunCommand {
+	if len(fixture.runtime.createdSpecs) != 1 || fixture.runtime.createdSpecs[0].RunCommand != fixture.plan.Plan.Components[0].RunCommand || fixture.runtime.createdSpecs[0].Role != generatedruntime.RoleServer || fixture.runtime.createdSpecs[0].Reservation == nil {
 		t.Fatal("accepted run command was not preserved exactly")
+	}
+	if len(fixture.authorization.reservations) != 1 || fixture.authorization.reservations[0].releases != 1 {
+		t.Fatal("successful deployment did not release its aggregate reservation exactly once")
 	}
 	if fixture.state.switchCalls != 1 || len(fixture.routes.requests) != 1 {
 		t.Fatalf("switch calls=%d route requests=%d", fixture.state.switchCalls, len(fixture.routes.requests))
 	}
-	if endpoints := fixture.routes.requests[0].Endpoints; len(endpoints) != 1 || endpoints[0].Role != "api" {
+	if endpoints := fixture.routes.requests[0].Endpoints; len(endpoints) != 1 || endpoints[0].Role != generatedruntime.RoleServer {
 		t.Fatalf("route endpoints=%+v", endpoints)
 	}
 }
@@ -496,6 +518,9 @@ func TestGeneratedExecutorHealthFailurePreservesOldActiveHead(t *testing.T) {
 	if fixture.runtime.stopped != 1 {
 		t.Fatalf("candidate cleanup calls=%d", fixture.runtime.stopped)
 	}
+	if len(fixture.authorization.reservations) != 1 || fixture.authorization.reservations[0].releases != 1 {
+		t.Fatal("failed candidate lifecycle did not release aggregate admission exactly once")
+	}
 }
 
 func TestGeneratedExecutorDoesNotRerunInterruptedMigration(t *testing.T) {
@@ -510,6 +535,36 @@ func TestGeneratedExecutorDoesNotRerunInterruptedMigration(t *testing.T) {
 	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err == nil || len(fixture.migrations.requests) != 0 {
 		t.Fatalf("err=%v migration calls=%d", err, len(fixture.migrations.requests))
+	}
+}
+
+func TestGeneratedExecutorRecoveryAcquiresAndConsumesNewProcessReservation(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.deployments.deployment = initializedDeployment(deployments.WaitingHealth)
+	description, err := generatedruntime.DescribeInactiveCandidate(testAppID, "api", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.state.deployment = generatedruntimestate.Deployment{
+		DeploymentID: testDeploymentID, AppID: testAppID, ReleaseID: testReleaseID,
+		DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2,
+		CandidateSlot: string(description.Slot), Phase: generatedruntimestate.PhaseWaitingHealth,
+		MigrationState: generatedruntimestate.MigrationNotRequired,
+		Components: []generatedruntimestate.Component{{
+			DeploymentID: testDeploymentID, Name: "api", Slot: string(description.Slot),
+			ImageArtifactID: testArtifactID, ContainerID: "a" + string(make([]byte, 63)),
+			ContainerName: description.ContainerName, State: generatedruntimestate.ComponentRunning,
+		}},
+	}
+	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CompletionCode != "deployment_completed" || fixture.compiler.calls != 0 || len(fixture.runtime.createdSpecs) != 0 {
+		t.Fatalf("result=%+v compiler=%d creates=%d", result, fixture.compiler.calls, len(fixture.runtime.createdSpecs))
+	}
+	if fixture.authorization.calls != 1 || fixture.runtime.adopted < 1 || len(fixture.authorization.reservations) != 1 || fixture.authorization.reservations[0].releases != 1 {
+		t.Fatalf("authorization=%d adopted=%d reservations=%+v", fixture.authorization.calls, fixture.runtime.adopted, fixture.authorization.reservations)
 	}
 }
 

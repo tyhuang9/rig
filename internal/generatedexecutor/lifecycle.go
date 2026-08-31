@@ -77,10 +77,11 @@ func (e *Executor) compileValidated(ctx context.Context, resolved resolvedDeploy
 }
 
 func imageSpec(resolved resolvedDeployment, artifact generatedimage.Artifact) generatedruntime.ImageSpec {
+	component, _ := componentPlan(resolved.plan, artifact.ComponentID)
 	return generatedruntime.ImageSpec{
 		AppID: resolved.deployment.AppID, ReleaseID: resolved.release.ID, ArtifactID: artifact.ID,
 		DeploymentPlanRevisionID: resolved.plan.ID, ImageContentID: artifact.ImageContentID,
-		ComponentName: artifact.ComponentID, BuildDefinitionDigest: artifact.BuildDefinitionDigest,
+		ComponentName: artifact.ComponentID, Role: component.Role, BuildDefinitionDigest: artifact.BuildDefinitionDigest,
 	}
 }
 
@@ -152,7 +153,7 @@ func (e *Executor) runMigration(ctx context.Context, resolved resolvedDeployment
 	return updated, nil
 }
 
-func (e *Executor) startCandidates(ctx context.Context, job jobs.Job, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact) (map[string]generatedruntime.Candidate, error) {
+func (e *Executor) startCandidates(ctx context.Context, job jobs.Job, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact, reservation generatedruntime.ReplacementReservation) (map[string]generatedruntime.Candidate, error) {
 	result := make(map[string]generatedruntime.Candidate, len(runtimeDeployment.Components))
 	activeSlot := generatedruntime.Slot(runtimeDeployment.PreviousActiveSlot)
 	for _, persisted := range sortedComponents(runtimeDeployment.Components) {
@@ -176,11 +177,12 @@ func (e *Executor) startCandidates(ctx context.Context, job jobs.Job, resolved r
 			}
 			candidate, createErr := e.runtime.CreateInactiveCandidate(ctx, generatedruntime.CandidateSpec{
 				AppID: resolved.deployment.AppID, ReleaseID: resolved.release.ID, DeploymentID: resolved.deployment.ID,
-				ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, ComponentName: component.Name,
+				ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, ComponentName: component.Name, Role: component.Role,
 				RootDirectory: component.RootDirectory, RunCommand: component.RunCommand, InternalPort: component.InternalPort,
 				HealthProbe: component.HealthProbe, ImageContentID: artifact.ImageContentID,
 				BuildDefinitionDigest: artifact.BuildDefinitionDigest, ActiveSlot: activeSlot,
 				EnvironmentOperationID: artifact.ID, EnvironmentOperationAttempt: job.Attempt, Environment: configuration.Environment,
+				Reservation: reservation,
 			})
 			configuration.Environment = nil
 			configuration.Clear()
@@ -203,6 +205,10 @@ func (e *Executor) startCandidates(ctx context.Context, job jobs.Job, resolved r
 			if err != nil {
 				return result, err
 			}
+			candidate, err = e.runtime.AdoptCandidate(candidate, reservation)
+			if err != nil {
+				return result, err
+			}
 			result[component.Name] = candidate
 			if err = e.runtime.StartCandidate(ctx, candidate); err != nil {
 				return result, err
@@ -214,7 +220,7 @@ func (e *Executor) startCandidates(ctx context.Context, job jobs.Job, resolved r
 	return result, nil
 }
 
-func (e *Executor) healthyCandidates(ctx context.Context, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact, existing map[string]generatedruntime.Candidate) (map[string]generatedruntime.Candidate, error) {
+func (e *Executor) healthyCandidates(ctx context.Context, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact, existing map[string]generatedruntime.Candidate, reservation generatedruntime.ReplacementReservation) (map[string]generatedruntime.Candidate, error) {
 	result := existing
 	if result == nil {
 		result = make(map[string]generatedruntime.Candidate, len(runtimeDeployment.Components))
@@ -228,6 +234,10 @@ func (e *Executor) healthyCandidates(ctx context.Context, resolved resolvedDeplo
 		if !exists {
 			var err error
 			candidate, err = reconstructCandidate(resolved, runtimeDeployment, persisted, artifact)
+			if err != nil {
+				return result, err
+			}
+			candidate, err = e.runtime.AdoptCandidate(candidate, reservation)
 			if err != nil {
 				return result, err
 			}
@@ -249,7 +259,7 @@ func (e *Executor) healthyCandidates(ctx context.Context, resolved resolvedDeplo
 	return result, nil
 }
 
-func (e *Executor) reconstructCandidates(resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact) (map[string]generatedruntime.Candidate, error) {
+func (e *Executor) reconstructCandidates(resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact, reservation generatedruntime.ReplacementReservation) (map[string]generatedruntime.Candidate, error) {
 	result := make(map[string]generatedruntime.Candidate, len(runtimeDeployment.Components))
 	for _, component := range sortedComponents(runtimeDeployment.Components) {
 		if component.State != generatedruntimestate.ComponentHealthy && component.State != generatedruntimestate.ComponentActive {
@@ -260,6 +270,10 @@ func (e *Executor) reconstructCandidates(resolved resolvedDeployment, runtimeDep
 			return nil, staticError("route artifact unavailable")
 		}
 		candidate, err := reconstructCandidate(resolved, runtimeDeployment, component, artifact)
+		if err != nil {
+			return nil, err
+		}
+		candidate, err = e.runtime.AdoptCandidate(candidate, reservation)
 		if err != nil {
 			return nil, err
 		}
@@ -279,7 +293,7 @@ func reconstructCandidate(resolved resolvedDeployment, runtimeDeployment generat
 	}
 	return generatedruntime.Candidate{
 		AppID: resolved.deployment.AppID, ReleaseID: resolved.release.ID, DeploymentID: resolved.deployment.ID,
-		ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, Component: persisted.Name,
+		ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, Component: persisted.Name, Role: component.Role,
 		Slot: description.Slot, ContainerID: persisted.ContainerID, ContainerName: description.ContainerName,
 		NetworkName: description.NetworkName, NetworkAlias: description.NetworkAlias, InternalPort: component.InternalPort,
 		ImageContentID: artifact.ImageContentID, WorkingDirectory: runtimeWorkingDirectory(component.RootDirectory),
@@ -449,7 +463,7 @@ func reconstructPreviousCandidates(appID string, previous generatedruntimestate.
 		}
 		result[persisted.Name] = generatedruntime.Candidate{
 			AppID: appID, ReleaseID: previous.ReleaseID, DeploymentID: previous.DeploymentID,
-			ArtifactID: artifact.ID, DeploymentPlanRevisionID: plan.ID, Component: persisted.Name,
+			ArtifactID: artifact.ID, DeploymentPlanRevisionID: plan.ID, Component: persisted.Name, Role: component.Role,
 			Slot: description.Slot, ContainerID: persisted.ContainerID, ContainerName: description.ContainerName,
 			NetworkName: description.NetworkName, NetworkAlias: description.NetworkAlias,
 			InternalPort: component.InternalPort, ImageContentID: artifact.ImageContentID,

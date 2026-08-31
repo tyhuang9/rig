@@ -71,9 +71,11 @@ type runtimeState interface {
 }
 
 type runtimeEngine interface {
+	ReserveReplacement(context.Context, int) (generatedruntime.ReplacementReservation, error)
 	ValidateImage(context.Context, generatedruntime.ImageSpec) error
 	EnsureAppNetwork(context.Context, string) error
 	CreateInactiveCandidate(context.Context, generatedruntime.CandidateSpec) (generatedruntime.Candidate, error)
+	AdoptCandidate(generatedruntime.Candidate, generatedruntime.ReplacementReservation) (generatedruntime.Candidate, error)
 	StartCandidate(context.Context, generatedruntime.Candidate) error
 	WaitHealthy(context.Context, generatedruntime.Candidate) error
 	StopAndRemove(context.Context, generatedruntime.Candidate, time.Duration) error
@@ -96,7 +98,7 @@ type AuthorizationRequest struct {
 // must be idempotent for an already authorized deployment, recheck approvals
 // and capacity, and move the main deployment to Applying before returning.
 type AuthorizationGate interface {
-	Authorize(context.Context, AuthorizationRequest) error
+	Authorize(context.Context, AuthorizationRequest) (generatedruntime.ReplacementReservation, error)
 }
 
 type Options struct {
