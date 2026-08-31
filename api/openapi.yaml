@@ -482,7 +482,7 @@ components:
     SessionResponse: {type: object, required: [user, csrfToken], properties: {user: {$ref: '#/components/schemas/User'}, csrfToken: {type: string}}}
     MeResponse: {type: object, required: [user], properties: {user: {$ref: '#/components/schemas/User'}}}
     CSRFResponse: {type: object, required: [csrfToken], properties: {csrfToken: {type: string}}}
-    Capabilities: {type: object, required: [fakeRuntime, composeRuntime, githubConnections], properties: {fakeRuntime: {type: boolean}, composeRuntime: {type: boolean}, githubConnections: {type: boolean}}}
+    Capabilities: {type: object, required: [fakeRuntime, composeRuntime, generatedRuntime, githubConnections], properties: {fakeRuntime: {type: boolean}, composeRuntime: {type: boolean}, generatedRuntime: {type: boolean}, githubConnections: {type: boolean}}}
     Diagnostics:
       type: object
       required: [daemonRunning, clientAvailable, engineReady, composeAvailable, caddyManaged, os, architecture, dockerVersion, composeVersion, dockerDetail, composeDetail, startupLimitation, resources]
