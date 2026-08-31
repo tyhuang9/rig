@@ -116,6 +116,17 @@ func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.Comman
 			d.outputs = append(d.outputs, body)
 			return runtimeprocess.CommandResult{Stdout: body}, nil
 		}
+	case "update":
+		name := request.Args[len(request.Args)-1]
+		container, exists := d.boxes[name]
+		if !exists || flagArgument(request.Args, "--pids-limit") != "512" {
+			return runtimeprocess.CommandResult{}, errors.New("invalid fake container update")
+		}
+		container.HostConfig.PidsLimit = 512
+		d.boxes[name] = container
+		output := []byte(name)
+		d.outputs = append(d.outputs, output)
+		return runtimeprocess.CommandResult{Stdout: output}, nil
 	}
 	return runtimeprocess.CommandResult{}, errors.New("unsupported fake Docker command")
 }
@@ -171,7 +182,7 @@ func TestBuilderManagerCreatesBootstrapsAndScopesTheBuilder(t *testing.T) {
 	}
 
 	requests := daemon.requests()
-	if got, want := commandKinds(requests), []string{"network inspect", "network create", "network inspect", "buildx ls", "buildx create", "buildx inspect", "buildx ls", "container inspect"}; !sameStrings(got, want) {
+	if got, want := commandKinds(requests), []string{"network inspect", "network create", "network inspect", "buildx ls", "buildx create", "buildx inspect", "buildx ls", "update --pids-limit", "container inspect"}; !sameStrings(got, want) {
 		t.Fatalf("commands = %#v, want %#v", got, want)
 	}
 	if !containsExactOrPrefix(requests[1].Args, "com.docker.network.bridge.enable_icc=false") {
@@ -226,7 +237,7 @@ func TestBuilderManagerReusesAndRevalidatesExistingBuilder(t *testing.T) {
 		t.Fatalf("sessions differ: %#v %#v", first, second)
 	}
 	requests := daemon.requests()[firstCount:]
-	if got, want := commandKinds(requests), []string{"network inspect", "buildx ls", "buildx inspect", "buildx ls", "container inspect"}; !sameStrings(got, want) {
+	if got, want := commandKinds(requests), []string{"network inspect", "buildx ls", "buildx inspect", "buildx ls", "update --pids-limit", "container inspect"}; !sameStrings(got, want) {
 		t.Fatalf("reuse commands = %#v, want %#v", got, want)
 	}
 }
@@ -401,6 +412,7 @@ func validBuildkitContainer(identity builderIdentity) buildkitContainer {
 	container.HostConfig.MemorySwap = 2 << 30
 	container.HostConfig.CPUPeriod = 100000
 	container.HostConfig.CPUQuota = 100000
+	container.HostConfig.PidsLimit = 512
 	container.HostConfig.NetworkMode = identity.NetworkName
 	container.NetworkSettings.Networks = map[string]json.RawMessage{identity.NetworkName: json.RawMessage(`{}`)}
 	return container

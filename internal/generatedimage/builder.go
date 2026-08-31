@@ -111,6 +111,7 @@ type buildkitContainer struct {
 		MemorySwap  int64  `json:"MemorySwap"`
 		CPUPeriod   int64  `json:"CpuPeriod"`
 		CPUQuota    int64  `json:"CpuQuota"`
+		PidsLimit   int64  `json:"PidsLimit"`
 		NetworkMode string `json:"NetworkMode"`
 	} `json:"HostConfig"`
 	NetworkSettings struct {
@@ -381,7 +382,20 @@ func (m *BuilderManager) bootstrapAndVerify(ctx context.Context, identity builde
 	if !found || builder.Driver != "docker-container" {
 		return &BuilderError{Code: BuilderDriftDetected}
 	}
+	if err := m.enforceBuildkitPIDsLimit(ctx, identity, env); err != nil {
+		return err
+	}
 	return m.verifyBuildkitContainer(ctx, identity, env)
+}
+
+func (m *BuilderManager) enforceBuildkitPIDsLimit(ctx context.Context, identity builderIdentity, env []string) error {
+	result, runErr := m.run(ctx, []string{"update", "--pids-limit", "512", buildkitContainerName(identity)}, env)
+	defer clear(result.Stdout)
+	defer clear(result.Stderr)
+	if runErr != nil {
+		return provisionError(ctx, result, runErr)
+	}
+	return nil
 }
 
 func (m *BuilderManager) verifyBuildkitContainer(ctx context.Context, identity builderIdentity, env []string) error {
@@ -409,7 +423,7 @@ func buildkitContainerName(identity builderIdentity) string {
 }
 
 func matchesBuildkitContainer(container buildkitContainer, identity builderIdentity) bool {
-	if container.Name != "/"+buildkitContainerName(identity) || container.HostConfig.Memory != 2<<30 || container.HostConfig.MemorySwap != 2<<30 || container.HostConfig.CPUPeriod != 100000 || container.HostConfig.CPUQuota != 100000 || container.HostConfig.NetworkMode != identity.NetworkName || len(container.NetworkSettings.Networks) != 1 {
+	if container.Name != "/"+buildkitContainerName(identity) || container.HostConfig.Memory != 2<<30 || container.HostConfig.MemorySwap != 2<<30 || container.HostConfig.CPUPeriod != 100000 || container.HostConfig.CPUQuota != 100000 || container.HostConfig.PidsLimit != 512 || container.HostConfig.NetworkMode != identity.NetworkName || len(container.NetworkSettings.Networks) != 1 {
 		return false
 	}
 	_, connected := container.NetworkSettings.Networks[identity.NetworkName]
