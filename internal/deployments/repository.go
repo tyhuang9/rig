@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/generatedrecovery"
 )
 
 type Status string
@@ -380,8 +381,7 @@ func diagnosticSummary(value string) string {
 }
 
 func (r *Repository) Recover(ctx context.Context) error {
-	now := r.now().UTC().Format(time.RFC3339Nano)
-	_, err := r.db.ExecContext(ctx, `UPDATE deployments SET status='failed',finished_at=?,diagnostic_code='daemon_restarted',failure_code='daemon_restarted',failure_summary='Deployment interrupted because hostd restarted' WHERE status IN ('preparing','applying','waiting_health')`, now)
+	_, err := generatedrecovery.RecoverDeployments(ctx, r.db, r.now().UTC())
 	return err
 }
 

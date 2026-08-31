@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/generatedrecovery"
 )
 
 type Status string
@@ -187,41 +188,11 @@ func (s *Service) signal() {
 }
 
 func (s *Service) RecoverInterrupted() error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
+	result, err := generatedrecovery.RecoverJobs(context.Background(), s.db, s.now().UTC())
+	if err == nil && result.RequeuedGenerated > 0 {
+		s.signal()
 	}
-	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT id FROM jobs WHERE status IN ('assigned','running','waiting_external') ORDER BY created_at`)
-	if err != nil {
-		return err
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	now := s.now().UTC()
-	for _, id := range ids {
-		if _, err := tx.Exec(`UPDATE jobs SET status='interrupted',phase='interrupted',pause_disposition=NULL,error_code='daemon_restarted',error_detail='Job interrupted because hostd restarted',updated_at=?,finished_at=? WHERE id=?`, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
-			return err
-		}
-		if _, err := appendEvent(tx, now, id, "error", "interrupted", "daemon_restarted", "Job interrupted because hostd restarted"); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return err
 }
 
 // Create preserves the legacy no-input API.
