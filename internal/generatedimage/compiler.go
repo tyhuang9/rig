@@ -202,6 +202,7 @@ func (c *Compiler) build(ctx context.Context, appID string, release releasesnaps
 		"--label", "io.rig.artifact="+artifact.ID,
 		"--label", "io.rig.plan="+revision.ID,
 		"--label", "io.rig.component="+definition.name,
+		"--label", "io.rig.role="+definition.role,
 		"--label", "io.rig.definition="+definitionDigest,
 		"--tag", tag, layout.contextDirectory,
 	)

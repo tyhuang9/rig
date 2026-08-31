@@ -133,12 +133,20 @@ func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
+	reservation, err := engine.ReserveReplacement(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.Reservation = reservation
 	candidate, err := engine.CreateInactiveCandidate(context.Background(), spec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if candidate.Slot != SlotGreen || candidate.ContainerName != containerName(spec.AppID, spec.ComponentName, SlotGreen) || candidate.NetworkName != networkName(spec.AppID) {
 		t.Fatalf("unexpected candidate identity: %+v", candidate)
+	}
+	if candidate.Role != RoleServer || candidate.lease != nil {
+		t.Fatalf("candidate did not consume aggregate admission: %+v", candidate)
 	}
 	if err := engine.StartCandidate(context.Background(), candidate); err != nil {
 		t.Fatal(err)
@@ -149,6 +157,8 @@ func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *t
 	if err := engine.StopAndRemove(context.Background(), candidate, 1500*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
+	reservation.Release()
+	reservation.Release()
 	if environment.cleaned != 1 || string(environment.contents) != "SECRET='value'\n" {
 		t.Fatalf("environment was not scoped and cleaned: cleaned=%d contents=%q", environment.cleaned, environment.contents)
 	}
@@ -163,6 +173,7 @@ func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *t
 	assertArgumentPair(t, create.Args, "--cpus", "0.750")
 	assertArgumentPair(t, create.Args, "--pids-limit", "192")
 	assertArgumentPair(t, create.Args, "--health-cmd", healthCommand)
+	assertArgumentPair(t, create.Args, "--label", "io.rig.role="+RoleServer)
 	if got := create.Args[len(create.Args)-4:]; !reflect.DeepEqual(got, []string{spec.ImageContentID, "/bin/sh", "-lc", command}) {
 		t.Fatalf("runtime command lost exact argument boundaries: %#v", got)
 	}
@@ -219,6 +230,24 @@ func TestGeneratedRuntimeRejectsImageComponentDriftBeforeDockerMutation(t *testi
 	}
 	if len(runner.requests) != 1 {
 		t.Fatalf("component drift reached Docker mutation: %d requests", len(runner.requests))
+	}
+}
+
+func TestGeneratedRuntimeRejectsImageRoleDriftBeforeDockerMutation(t *testing.T) {
+	engine, runner, spec := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		if commandKind(request.Args) != "image inspect" {
+			t.Fatalf("role drift reached Docker mutation: %#v", request.Args)
+		}
+		image := validImageInspection(candidateSpec())
+		image.Labels["io.rig.role"] = RoleStatic
+		return runtimeJSON(image)
+	})
+	_, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	if !IsCode(err, DiagnosticImageDriftDetected) {
+		t.Fatalf("expected image role drift, got %v", err)
+	}
+	if len(runner.requests) != 1 {
+		t.Fatalf("role drift reached Docker mutation: %d requests", len(runner.requests))
 	}
 }
 
@@ -653,7 +682,7 @@ func TestGeneratedRuntimeValidateImageIsReadOnly(t *testing.T) {
 	err := engine.ValidateImage(context.Background(), ImageSpec{
 		AppID: expected.AppID, ReleaseID: expected.ReleaseID, ArtifactID: expected.ArtifactID,
 		DeploymentPlanRevisionID: expected.DeploymentPlanRevisionID, ImageContentID: expected.ImageContentID,
-		ComponentName: expected.ComponentName, BuildDefinitionDigest: expected.BuildDefinitionDigest,
+		ComponentName: expected.ComponentName, Role: expected.Role, BuildDefinitionDigest: expected.BuildDefinitionDigest,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -714,7 +743,7 @@ func candidateSpec() CandidateSpec {
 	return CandidateSpec{
 		AppID: "11111111-1111-4111-8111-111111111111", ReleaseID: "22222222-2222-4222-8222-222222222222",
 		DeploymentID: "33333333-3333-4333-8333-333333333333", ArtifactID: "44444444-4444-4444-8444-444444444444",
-		DeploymentPlanRevisionID: "55555555-5555-4555-8555-555555555555", ComponentName: "api", RootDirectory: "apps/api",
+		DeploymentPlanRevisionID: "55555555-5555-4555-8555-555555555555", ComponentName: "api", Role: RoleServer, RootDirectory: "apps/api",
 		RunCommand: "node server.js", InternalPort: 3000, HealthProbe: "/health?ready=1", ImageContentID: testImageID,
 		BuildDefinitionDigest: strings.Repeat("d", 64),
 		ActiveSlot:            SlotBlue, EnvironmentOperationID: "66666666-6666-4666-8666-666666666666", EnvironmentOperationAttempt: 1,
@@ -727,7 +756,7 @@ func candidateForSpec(spec CandidateSpec) Candidate {
 	return Candidate{
 		AppID: spec.AppID, ReleaseID: spec.ReleaseID, DeploymentID: spec.DeploymentID,
 		ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID,
-		Component: spec.ComponentName, Slot: slot, ContainerID: testContainerID,
+		Component: spec.ComponentName, Role: spec.Role, Slot: slot, ContainerID: testContainerID,
 		ContainerName: containerName(spec.AppID, spec.ComponentName, slot), NetworkName: networkName(spec.AppID),
 		NetworkAlias: containerAlias(spec.ComponentName, slot), InternalPort: spec.InternalPort,
 		ImageContentID: spec.ImageContentID, WorkingDirectory: runtimeWorkingDirectory(spec.RootDirectory), RunCommandDigest: sha256Hex(spec.RunCommand),
@@ -739,7 +768,7 @@ func defaultLimits() ContainerLimits {
 }
 
 func imageLabels(spec CandidateSpec) map[string]string {
-	return map[string]string{"io.rig.managed": "generated-image", "io.rig.application": spec.AppID, "io.rig.release": spec.ReleaseID, "io.rig.artifact": spec.ArtifactID, "io.rig.plan": spec.DeploymentPlanRevisionID, "io.rig.component": spec.ComponentName, "io.rig.definition": spec.BuildDefinitionDigest}
+	return map[string]string{"io.rig.managed": "generated-image", "io.rig.application": spec.AppID, "io.rig.release": spec.ReleaseID, "io.rig.artifact": spec.ArtifactID, "io.rig.plan": spec.DeploymentPlanRevisionID, "io.rig.component": spec.ComponentName, "io.rig.role": spec.Role, "io.rig.definition": spec.BuildDefinitionDigest}
 }
 
 func validImageInspection(spec CandidateSpec) imageInspection {

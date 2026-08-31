@@ -121,6 +121,9 @@ func TestCompilerKeepsCommandsAndConfigurationOutOfDockerArguments(t *testing.T)
 		if !hasArgumentPair(request.Args, "--label", "io.rig.component=app") {
 			t.Fatalf("component provenance label is missing: %#v", request.Args)
 		}
+		if !hasArgumentPair(request.Args, "--label", "io.rig.role=server") {
+			t.Fatalf("component role provenance label is missing: %#v", request.Args)
+		}
 		containerfile := flagValue(t, request.Args, "--file")
 		body, err := os.ReadFile(containerfile)
 		if err != nil {

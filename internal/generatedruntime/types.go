@@ -15,6 +15,13 @@ type Slot string
 const (
 	SlotBlue  Slot = "blue"
 	SlotGreen Slot = "green"
+
+	RoleServer = "server"
+	RoleStatic = "static"
+
+	// NetworkOwnershipLabelValue is shared with ingress so it can attest the
+	// exact controller-owned application network before joining it.
+	NetworkOwnershipLabelValue = "generated-runtime-network"
 )
 
 // InactiveSlot deterministically selects the replacement slot. An empty active
@@ -82,6 +89,7 @@ type CandidateSpec struct {
 	ArtifactID                  string
 	DeploymentPlanRevisionID    string
 	ComponentName               string
+	Role                        string
 	RootDirectory               string
 	RunCommand                  string
 	InternalPort                uint16
@@ -94,6 +102,9 @@ type CandidateSpec struct {
 	// Environment is protected configuration exported for this exact release.
 	// CreateInactiveCandidate takes ownership and clears it before returning.
 	Environment []byte
+	// Reservation is an opaque, process-local aggregate admission acquired
+	// before the final deployment gate. Direct callers may leave it nil.
+	Reservation ReplacementReservation
 }
 
 type ImageSpec struct {
@@ -102,6 +113,7 @@ type ImageSpec struct {
 	ArtifactID               string
 	DeploymentPlanRevisionID string
 	ComponentName            string
+	Role                     string
 	ImageContentID           string
 	BuildDefinitionDigest    string
 }
@@ -113,6 +125,7 @@ type Candidate struct {
 	ArtifactID               string
 	DeploymentPlanRevisionID string
 	Component                string
+	Role                     string
 	Slot                     Slot
 	ContainerID              string
 	ContainerName            string
@@ -124,6 +137,13 @@ type Candidate struct {
 	RunCommandDigest         string
 
 	lease *capacityLease
+}
+
+// ReplacementReservation represents one atomic admission for every
+// component in a blue/green replacement. Resource and share accounting are
+// intentionally opaque to coordinators.
+type ReplacementReservation interface {
+	Release()
 }
 
 // CandidateDescription exposes only deterministic, non-secret resource

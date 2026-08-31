@@ -108,6 +108,42 @@ func NewEngine(runner runtimeprocess.CommandRunner, environment EnvironmentStage
 	return &Engine{runner: runner, environment: environment, capacity: gate, options: options, dockerEnv: dockerEnv}, nil
 }
 
+// ReserveReplacement atomically admits all components required for one
+// blue/green replacement. Callers release the opaque reservation on every
+// terminal, failed, or paused path.
+func (e *Engine) ReserveReplacement(ctx context.Context, componentCount int) (ReplacementReservation, error) {
+	if e == nil || ctx == nil || componentCount < 1 || componentCount > 2 {
+		return nil, &Error{Code: DiagnosticValidationFailed}
+	}
+	lease, err := e.capacity.acquireCount(ctx, capacityRequest{
+		memory: uint64(e.options.Limits.MemoryBytes),
+		disk:   e.options.ReplacementDiskBytes,
+	}, componentCount)
+	if err != nil {
+		return nil, err
+	}
+	return &replacementReservation{
+		owner: e.capacity, lease: lease, limit: componentCount,
+		components: make(map[string]struct{}, componentCount),
+	}, nil
+}
+
+// AdoptCandidate consumes the matching share for a durable candidate during
+// daemon-restart recovery without inspecting or mutating Docker.
+func (e *Engine) AdoptCandidate(candidate Candidate, reservation ReplacementReservation) (Candidate, error) {
+	if e == nil || !validCandidate(candidate) || reservation == nil {
+		return Candidate{}, &Error{Code: DiagnosticValidationFailed}
+	}
+	value, ok := reservation.(*replacementReservation)
+	if !ok {
+		return Candidate{}, &Error{Code: DiagnosticValidationFailed}
+	}
+	if accepted, _ := value.consume(e.capacity, candidate.Component); !accepted {
+		return Candidate{}, &Error{Code: DiagnosticInsufficientReplacementSpace}
+	}
+	return candidate, nil
+}
+
 func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec) (Candidate, error) {
 	defer clear(spec.Environment)
 	if e == nil || ctx == nil || !validCandidateSpec(spec) {
@@ -121,14 +157,33 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 	if err != nil {
 		return Candidate{}, err
 	}
-	lease, err := e.capacity.acquire(ctx, capacityRequest{memory: uint64(e.options.Limits.MemoryBytes), disk: e.options.ReplacementDiskBytes})
-	if err != nil {
-		return Candidate{}, err
+	var lease *capacityLease
+	var reservation *replacementReservation
+	reservationConsumed := false
+	if spec.Reservation != nil {
+		var ok bool
+		reservation, ok = spec.Reservation.(*replacementReservation)
+		if !ok {
+			return Candidate{}, &Error{Code: DiagnosticValidationFailed}
+		}
+		accepted, newlyConsumed := reservation.consume(e.capacity, spec.ComponentName)
+		if !accepted {
+			return Candidate{}, &Error{Code: DiagnosticInsufficientReplacementSpace}
+		}
+		reservationConsumed = newlyConsumed
+	} else {
+		lease, err = e.capacity.acquire(ctx, capacityRequest{memory: uint64(e.options.Limits.MemoryBytes), disk: e.options.ReplacementDiskBytes})
+		if err != nil {
+			return Candidate{}, err
+		}
 	}
 	releaseOnFailure := true
 	defer func() {
 		if releaseOnFailure {
 			lease.Release()
+			if reservationConsumed {
+				reservation.unconsume(spec.ComponentName)
+			}
 		}
 	}()
 
@@ -181,7 +236,7 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 	candidate := Candidate{
 		AppID: spec.AppID, ReleaseID: spec.ReleaseID, DeploymentID: spec.DeploymentID,
 		ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID,
-		Component: spec.ComponentName, Slot: slot,
+		Component: spec.ComponentName, Role: spec.Role, Slot: slot,
 		ContainerName: name, NetworkName: network, NetworkAlias: alias,
 		InternalPort: spec.InternalPort, ImageContentID: spec.ImageContentID,
 		WorkingDirectory: workingDirectory, RunCommandDigest: sha256Hex(spec.RunCommand), lease: lease,
@@ -415,7 +470,7 @@ func (e *Engine) inspectImage(ctx context.Context, spec CandidateSpec) (imageIns
 	return e.inspectImageSpec(ctx, ImageSpec{
 		AppID: spec.AppID, ReleaseID: spec.ReleaseID, ArtifactID: spec.ArtifactID,
 		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, ImageContentID: spec.ImageContentID,
-		ComponentName: spec.ComponentName, BuildDefinitionDigest: spec.BuildDefinitionDigest,
+		ComponentName: spec.ComponentName, Role: spec.Role, BuildDefinitionDigest: spec.BuildDefinitionDigest,
 	})
 }
 
@@ -447,6 +502,7 @@ func (e *Engine) inspectImageSpec(ctx context.Context, spec ImageSpec) (imageIns
 		"io.rig.artifact":    spec.ArtifactID,
 		"io.rig.plan":        spec.DeploymentPlanRevisionID,
 		"io.rig.component":   spec.ComponentName,
+		"io.rig.role":        spec.Role,
 		"io.rig.definition":  spec.BuildDefinitionDigest,
 	}
 	if !containsLabels(image.Labels, expected) || image.User != "node" || image.WorkingDirectory != "/workspace" || len(image.Entrypoint) != 1 || image.Entrypoint[0] != "/usr/local/bin/rig-entrypoint" {
@@ -466,7 +522,7 @@ func (e *Engine) ensureNetwork(ctx context.Context, appID, name string) error {
 		}
 		return &Error{Code: DiagnosticNetworkDriftDetected}
 	}
-	args := []string{"network", "create", "--driver", "bridge", "--label", "io.rig.managed=generated-runtime-network", "--label", "io.rig.application=" + appID, name}
+	args := []string{"network", "create", "--driver", "bridge", "--label", "io.rig.managed=" + NetworkOwnershipLabelValue, "--label", "io.rig.application=" + appID, name}
 	result, runErr := e.run(ctx, args, e.options.CommandTimeout)
 	diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticNetworkProvisionFailed)
 	clearResult(&result)
@@ -727,7 +783,7 @@ func minimumReplacementDiskBytes(limits ContainerLimits) uint64 {
 }
 
 func validCandidateSpec(spec CandidateSpec) bool {
-	if !validImageSpec(ImageSpec{AppID: spec.AppID, ReleaseID: spec.ReleaseID, ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, ComponentName: spec.ComponentName, ImageContentID: spec.ImageContentID, BuildDefinitionDigest: spec.BuildDefinitionDigest}) || !canonicalUUID(spec.DeploymentID) || !validRootDirectory(spec.RootDirectory) || deploymentplans.ValidateCommand(spec.RunCommand) != nil || spec.InternalPort == 0 || !validHealthProbe(spec.HealthProbe) || !validEnvironmentOperation(spec) || !validEnvironment(spec.Environment) {
+	if !validImageSpec(ImageSpec{AppID: spec.AppID, ReleaseID: spec.ReleaseID, ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, ComponentName: spec.ComponentName, Role: spec.Role, ImageContentID: spec.ImageContentID, BuildDefinitionDigest: spec.BuildDefinitionDigest}) || !canonicalUUID(spec.DeploymentID) || !validRootDirectory(spec.RootDirectory) || deploymentplans.ValidateCommand(spec.RunCommand) != nil || spec.InternalPort == 0 || !validHealthProbe(spec.HealthProbe) || !validEnvironmentOperation(spec) || !validEnvironment(spec.Environment) {
 		return false
 	}
 	_, err := InactiveSlot(spec.ActiveSlot)
@@ -735,7 +791,7 @@ func validCandidateSpec(spec CandidateSpec) bool {
 }
 
 func validImageSpec(spec ImageSpec) bool {
-	return canonicalUUID(spec.AppID) && validReleaseID(spec.ReleaseID) && canonicalUUID(spec.ArtifactID) && canonicalUUID(spec.DeploymentPlanRevisionID) && validText(spec.ComponentName, 256) && validImageID(spec.ImageContentID) && lowerHex(spec.BuildDefinitionDigest, 64)
+	return canonicalUUID(spec.AppID) && validReleaseID(spec.ReleaseID) && canonicalUUID(spec.ArtifactID) && canonicalUUID(spec.DeploymentPlanRevisionID) && validText(spec.ComponentName, 256) && validRole(spec.Role) && validImageID(spec.ImageContentID) && lowerHex(spec.BuildDefinitionDigest, 64)
 }
 
 func validEnvironmentOperation(spec CandidateSpec) bool {
@@ -758,7 +814,7 @@ func validEnvironment(environment []byte) bool {
 }
 
 func validCandidate(candidate Candidate) bool {
-	if !canonicalUUID(candidate.AppID) || !validReleaseID(candidate.ReleaseID) || !canonicalUUID(candidate.DeploymentID) || !canonicalUUID(candidate.ArtifactID) || !canonicalUUID(candidate.DeploymentPlanRevisionID) || !validText(candidate.Component, 256) || !validImageContainerID(candidate.ContainerID) || candidate.InternalPort == 0 || !validImageID(candidate.ImageContentID) || !validRuntimeWorkingDirectory(candidate.WorkingDirectory) || !lowerHex(candidate.RunCommandDigest, 64) {
+	if !canonicalUUID(candidate.AppID) || !validReleaseID(candidate.ReleaseID) || !canonicalUUID(candidate.DeploymentID) || !canonicalUUID(candidate.ArtifactID) || !canonicalUUID(candidate.DeploymentPlanRevisionID) || !validText(candidate.Component, 256) || !validRole(candidate.Role) || !validImageContainerID(candidate.ContainerID) || candidate.InternalPort == 0 || !validImageID(candidate.ImageContentID) || !validRuntimeWorkingDirectory(candidate.WorkingDirectory) || !lowerHex(candidate.RunCommandDigest, 64) {
 		return false
 	}
 	if candidate.Slot != SlotBlue && candidate.Slot != SlotGreen {
@@ -817,6 +873,7 @@ func canonicalUUID(value string) bool {
 }
 
 func validReleaseID(value string) bool { return canonicalUUID(value) || lowerHex(value, 32) }
+func validRole(value string) bool      { return value == RoleServer || value == RoleStatic }
 func validImageID(value string) bool {
 	return strings.HasPrefix(value, "sha256:") && lowerHex(strings.TrimPrefix(value, "sha256:"), 64)
 }
@@ -863,12 +920,13 @@ func runtimeLabels(spec CandidateSpec, slot Slot) map[string]string {
 		"io.rig.artifact":    spec.ArtifactID,
 		"io.rig.plan":        spec.DeploymentPlanRevisionID,
 		"io.rig.component":   spec.ComponentName,
+		"io.rig.role":        spec.Role,
 		"io.rig.slot":        string(slot),
 	}
 }
 
 func matchesNetwork(network networkInspection, appID, name string) bool {
-	return network.Name == name && network.Driver == "bridge" && network.Scope == "local" && !network.Internal && containsLabels(network.Labels, map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": appID})
+	return network.Name == name && network.Driver == "bridge" && network.Scope == "local" && !network.Internal && containsLabels(network.Labels, map[string]string{"io.rig.managed": NetworkOwnershipLabelValue, "io.rig.application": appID})
 }
 
 func matchesCreatedContainer(container containerInspection, spec CandidateSpec, candidate Candidate, imageID, workingDirectory string, labels map[string]string, limits ContainerLimits) bool {
@@ -918,6 +976,7 @@ func matchesCandidateOwnership(container containerInspection, candidate Candidat
 		"io.rig.release": candidate.ReleaseID, "io.rig.deployment": candidate.DeploymentID,
 		"io.rig.artifact": candidate.ArtifactID, "io.rig.plan": candidate.DeploymentPlanRevisionID,
 		"io.rig.component": candidate.Component, "io.rig.slot": string(candidate.Slot),
+		"io.rig.role": candidate.Role,
 	}
 	_, attached := container.Networks[candidate.NetworkName]
 	return container.ID == candidate.ContainerID && strings.TrimPrefix(container.Name, "/") == candidate.ContainerName && containsLabels(container.Labels, expected) && container.NetworkMode == candidate.NetworkName && attached
