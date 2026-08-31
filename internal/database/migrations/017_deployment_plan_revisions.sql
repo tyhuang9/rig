@@ -18,7 +18,7 @@ CREATE TABLE deployment_plan_revisions (
     source_structural_fingerprint TEXT NOT NULL CHECK (length(source_structural_fingerprint) = 64 AND source_structural_fingerprint NOT GLOB '*[^0-9a-f]*'),
     analyzed_source_provider TEXT NOT NULL CHECK (analyzed_source_provider IN ('github','local')),
     analyzed_repository_id INTEGER NOT NULL CHECK ((analyzed_source_provider = 'github' AND analyzed_repository_id > 0) OR (analyzed_source_provider = 'local' AND analyzed_repository_id = 0)),
-    analyzed_resolved_digest TEXT NOT NULL CHECK ((analyzed_source_provider = 'github' AND length(analyzed_resolved_digest) IN (40,64)) OR (analyzed_source_provider = 'local' AND length(analyzed_resolved_digest) = 64)) AND analyzed_resolved_digest NOT GLOB '*[^0-9a-f]*',
+    analyzed_resolved_digest TEXT NOT NULL CHECK (((analyzed_source_provider = 'github' AND length(analyzed_resolved_digest) IN (40,64)) OR (analyzed_source_provider = 'local' AND length(analyzed_resolved_digest) = 64)) AND analyzed_resolved_digest NOT GLOB '*[^0-9a-f]*'),
     canonical_digest TEXT NOT NULL CHECK (length(canonical_digest) = 64 AND canonical_digest NOT GLOB '*[^0-9a-f]*'),
     component_count INTEGER NOT NULL CHECK (component_count >= 0),
     field_provenance_count INTEGER NOT NULL CHECK (field_provenance_count >= 0),
