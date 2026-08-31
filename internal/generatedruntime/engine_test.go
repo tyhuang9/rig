@@ -653,7 +653,7 @@ func TestGeneratedRuntimeValidateImageIsReadOnly(t *testing.T) {
 	err := engine.ValidateImage(context.Background(), ImageSpec{
 		AppID: expected.AppID, ReleaseID: expected.ReleaseID, ArtifactID: expected.ArtifactID,
 		DeploymentPlanRevisionID: expected.DeploymentPlanRevisionID, ImageContentID: expected.ImageContentID,
-		BuildDefinitionDigest: expected.BuildDefinitionDigest,
+		ComponentName: expected.ComponentName, BuildDefinitionDigest: expected.BuildDefinitionDigest,
 	})
 	if err != nil {
 		t.Fatal(err)
