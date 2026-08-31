@@ -132,11 +132,12 @@ func (f *fakeArtifacts) MarkUnavailable(_ context.Context, id string) (generated
 }
 
 type fakeRuntimeState struct {
-	deployment        generatedruntimestate.Deployment
-	active            generatedruntimestate.ActiveHead
-	beginErr          error
-	migrationRequired bool
-	switchCalls       int
+	deployment            generatedruntimestate.Deployment
+	active                generatedruntimestate.ActiveHead
+	beginErr              error
+	migrationRequired     bool
+	switchCalls           int
+	failAdvanceToDraining bool
 }
 
 func (f *fakeRuntimeState) Begin(_ context.Context, input generatedruntimestate.BeginInput) (generatedruntimestate.Deployment, bool, error) {
@@ -148,14 +149,18 @@ func (f *fakeRuntimeState) Begin(_ context.Context, input generatedruntimestate.
 		if f.migrationRequired {
 			migrationState = generatedruntimestate.MigrationPending
 		}
+		candidateSlot := "blue"
+		if f.active.Slot == "blue" {
+			candidateSlot = "green"
+		}
 		f.deployment = generatedruntimestate.Deployment{
 			DeploymentID: input.DeploymentID, AppID: input.AppID, ReleaseID: input.ReleaseID,
 			DeploymentPlanRevisionID: input.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: input.DeploymentPlanRevisionNumber,
-			CandidateSlot: "blue", PreviousActiveDeploymentID: f.active.DeploymentID, PreviousActiveSlot: f.active.Slot,
+			CandidateSlot: candidateSlot, PreviousActiveDeploymentID: f.active.DeploymentID, PreviousActiveSlot: f.active.Slot,
 			Phase: generatedruntimestate.PhasePreflight, MigrationState: migrationState,
 		}
 		for _, name := range input.ComponentNames {
-			f.deployment.Components = append(f.deployment.Components, generatedruntimestate.Component{DeploymentID: input.DeploymentID, Name: name, Slot: "blue", State: generatedruntimestate.ComponentPending})
+			f.deployment.Components = append(f.deployment.Components, generatedruntimestate.Component{DeploymentID: input.DeploymentID, Name: name, Slot: candidateSlot, State: generatedruntimestate.ComponentPending})
 		}
 	}
 	return f.deployment, true, nil
@@ -170,6 +175,9 @@ func (f *fakeRuntimeState) Active(context.Context, string) (generatedruntimestat
 	return f.active, nil
 }
 func (f *fakeRuntimeState) Advance(_ context.Context, _, _ string, _, next generatedruntimestate.Phase, diagnostic generatedruntimestate.DiagnosticCode) (generatedruntimestate.Deployment, error) {
+	if next == generatedruntimestate.PhaseDraining && f.failAdvanceToDraining {
+		return f.deployment, generatedruntimestate.ErrInvalidTransition
+	}
 	f.deployment.Phase = next
 	f.deployment.DiagnosticCode = diagnostic
 	return f.deployment, nil
@@ -454,15 +462,35 @@ func TestGeneratedExecutorMarksDriftedImageUnavailableAndRebuildsOnce(t *testing
 	}
 }
 
+func TestGeneratedExecutorFailsClosedWhenRebuiltImageStillDrifts(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	second := readyArtifact(testArtifactID2)
+	fixture.compiler.artifacts = append(fixture.compiler.artifacts, second)
+	fixture.artifacts.values[second.ID] = second
+	fixture.runtime.validateErrs = []error{
+		&generatedruntime.Error{Code: generatedruntime.DiagnosticImageDriftDetected},
+		&generatedruntime.Error{Code: generatedruntime.DiagnosticImageDriftDetected},
+	}
+	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err == nil || fixture.compiler.calls != 2 || len(fixture.runtime.createdSpecs) != 0 {
+		t.Fatalf("err=%v compile calls=%d create calls=%d", err, fixture.compiler.calls, len(fixture.runtime.createdSpecs))
+	}
+	if !reflect.DeepEqual(fixture.artifacts.markedUnavailable, []string{testArtifactID}) {
+		t.Fatalf("marked unavailable=%v", fixture.artifacts.markedUnavailable)
+	}
+}
+
 func TestGeneratedExecutorHealthFailurePreservesOldActiveHead(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
+	oldDeploymentID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	fixture.state.active = generatedruntimestate.ActiveHead{AppID: testAppID, DeploymentID: oldDeploymentID, ReleaseID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Slot: "blue", Generation: 4}
 	fixture.runtime.healthErr = &generatedruntime.Error{Code: generatedruntime.DiagnosticCandidateUnhealthy}
 	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
 	var executionErr *jobs.ExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "health_failed" {
 		t.Fatalf("err=%v", err)
 	}
-	if fixture.state.switchCalls != 0 || len(fixture.routes.requests) != 0 || fixture.state.active.DeploymentID != "" {
+	if fixture.state.switchCalls != 0 || len(fixture.routes.requests) != 0 || fixture.state.active.DeploymentID != oldDeploymentID || fixture.state.active.Generation != 4 {
 		t.Fatalf("old active changed before healthy switch: active=%+v route=%d", fixture.state.active, len(fixture.routes.requests))
 	}
 	if fixture.runtime.stopped != 1 {
@@ -482,6 +510,22 @@ func TestGeneratedExecutorDoesNotRerunInterruptedMigration(t *testing.T) {
 	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err == nil || len(fixture.migrations.requests) != 0 {
 		t.Fatalf("err=%v migration calls=%d", err, len(fixture.migrations.requests))
+	}
+}
+
+func TestGeneratedExecutorNeverCleansNewSlotAfterActiveCAS(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.state.failAdvanceToDraining = true
+	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	var executionErr *jobs.ExecutionError
+	if !errors.As(err, &executionErr) || executionErr.Code != "apply_failed" {
+		t.Fatalf("err=%v", err)
+	}
+	if fixture.state.active.DeploymentID != testDeploymentID || fixture.runtime.stopped != 0 {
+		t.Fatalf("active=%+v candidate cleanup=%d", fixture.state.active, fixture.runtime.stopped)
+	}
+	if fixture.state.deployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
+		t.Fatalf("durable phase=%s", fixture.state.deployment.Phase)
 	}
 }
 

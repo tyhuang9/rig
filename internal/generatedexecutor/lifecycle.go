@@ -308,7 +308,9 @@ func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment,
 		return runtimeDeployment, false, staticError("route switch failed")
 	}
 	if _, _, err = e.state.SwitchActive(ctx, resolved.deployment.AppID, resolved.deployment.ID, head.Generation); err != nil {
-		_ = e.restorePreviousRoute(context.WithoutCancel(ctx), resolved, runtimeDeployment)
+		rollback, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.options.CleanupTimeout)
+		_ = e.restorePreviousRoute(rollback, resolved, runtimeDeployment)
+		cancel()
 		return runtimeDeployment, false, staticError("active head compare-and-swap failed")
 	}
 	updated, err := e.state.Advance(ctx, resolved.deployment.AppID, resolved.deployment.ID, generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, "")

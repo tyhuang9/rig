@@ -43,6 +43,8 @@ type Executor struct {
 	waitDrain     func(context.Context, time.Duration) error
 }
 
+var _ jobs.Executor = (*Executor)(nil)
+
 func NewExecutor(
 	applications applicationReader,
 	releases releaseResolver,
@@ -226,19 +228,21 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 			}
 			candidates, err = e.startCandidates(ctx, job, resolved, runtimeDeployment, artifacts)
 			if err != nil {
-				e.cleanupCandidates(ctx, candidates)
+				if cleanupErr := e.cleanupCandidates(ctx, candidates); cleanupErr != nil {
+					err = cleanupErr
+				}
 				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticStartFailed)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
 			}
 			runtimeDeployment, err = e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseStartingCandidate, generatedruntimestate.PhaseWaitingHealth, "")
 			if err != nil {
-				e.cleanupCandidates(ctx, candidates)
+				_ = e.cleanupCandidates(ctx, candidates)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 			}
 			if deployment.Status == deployments.Applying {
 				deployment, err = e.deployments.Transition(ctx, deployment.AppID, deployment.ID, deployments.WaitingHealth, "")
 				if err != nil {
-					e.cleanupCandidates(ctx, candidates)
+					_ = e.cleanupCandidates(ctx, candidates)
 					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 				}
 			}
@@ -255,13 +259,15 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 			}
 			candidates, err = e.healthyCandidates(ctx, resolved, runtimeDeployment, artifacts, candidates)
 			if err != nil {
-				e.cleanupCandidates(ctx, candidates)
+				if cleanupErr := e.cleanupCandidates(ctx, candidates); cleanupErr != nil {
+					err = cleanupErr
+				}
 				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticHealthFailed)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
 			}
 			runtimeDeployment, err = e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute, "")
 			if err != nil {
-				e.cleanupCandidates(ctx, candidates)
+				_ = e.cleanupCandidates(ctx, candidates)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 			}
 
@@ -276,15 +282,21 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 			if err != nil {
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 			}
-			runtimeDeployment, err = e.switchRoute(ctx, resolved, runtimeDeployment, candidates)
+			var switched bool
+			runtimeDeployment, switched, err = e.switchRoute(ctx, resolved, runtimeDeployment, candidates)
 			if err != nil {
-				e.cleanupCandidates(ctx, candidates)
+				if switched {
+					return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "apply_failed")
+				}
+				_ = e.cleanupCandidates(ctx, candidates)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "apply_failed", generatedruntimestate.DiagnosticRouteSwitchFailed)
 			}
 
 		case generatedruntimestate.PhaseDraining:
 			if err = e.drainPrevious(ctx, resolved, runtimeDeployment); err != nil {
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "apply_failed", generatedruntimestate.DiagnosticRuntimeUnavailable)
+				// The new slot is already active. Keep Draining recoverable and
+				// never tear down the serving candidate on cleanup failure.
+				return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "apply_failed")
 			}
 			for _, candidate := range candidates {
 				e.runtime.ReleaseAdmission(candidate)
@@ -417,7 +429,7 @@ func cancellationCode(ctx context.Context) string {
 }
 
 func runtimeFailure(ctx context.Context, err error, fallback generatedruntimestate.DiagnosticCode) (string, generatedruntimestate.DiagnosticCode) {
-	if errors.Is(err, context.Canceled) || generatedruntime.IsCode(err, generatedruntime.DiagnosticCancelled) {
+	if errors.Is(err, context.Canceled) || generatedruntime.IsCode(err, generatedruntime.DiagnosticCancelled) || generatedimage.IsCompileCode(err, string(generatedimage.DiagnosticBuildCancelled)) {
 		return cancellationCode(ctx), generatedruntimestate.DiagnosticCancelled
 	}
 	if generatedruntime.IsCode(err, generatedruntime.DiagnosticRuntimeUnavailable) || generatedimage.IsCompileCode(err, "runtime_unavailable") {
@@ -425,6 +437,9 @@ func runtimeFailure(ctx context.Context, err error, fallback generatedruntimesta
 	}
 	if generatedruntime.IsCode(err, generatedruntime.DiagnosticProcessTerminationFailed) || generatedimage.IsCompileCode(err, "process_termination_failed") {
 		return "process_termination_failed", generatedruntimestate.DiagnosticRuntimeUnavailable
+	}
+	if generatedruntime.IsCode(err, generatedruntime.DiagnosticCandidateCleanupFailed) {
+		return "apply_failed", generatedruntimestate.DiagnosticRuntimeUnavailable
 	}
 	if fallback == generatedruntimestate.DiagnosticHealthFailed {
 		return "health_failed", fallback
@@ -435,6 +450,9 @@ func runtimeFailure(ctx context.Context, err error, fallback generatedruntimesta
 func (e *Executor) fail(ctx context.Context, deployment deployments.Deployment, runtimeDeployment generatedruntimestate.Deployment, code string, diagnostic generatedruntimestate.DiagnosticCode) error {
 	finalize, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
+	if persisted, err := e.state.Get(finalize, runtimeDeployment.AppID, runtimeDeployment.DeploymentID); err == nil {
+		runtimeDeployment = persisted
+	}
 	if runtimeDeployment.DeploymentID != "" && runtimeDeployment.Phase != generatedruntimestate.PhaseFailed && runtimeDeployment.Phase != generatedruntimestate.PhaseCancelled && runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded {
 		componentDiagnostic, markComponents := failureComponentDiagnostic(diagnostic)
 		if markComponents {
