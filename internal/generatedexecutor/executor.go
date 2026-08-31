@@ -123,7 +123,7 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 		ComponentNames:               componentNames,
 	})
 	if errors.Is(err, generatedruntimestate.ErrMigrationApprovalRequired) {
-		return waitingForApproval(), nil
+		return waitingFor(jobs.PauseMigrationApprovalRequired), nil
 	}
 	if err != nil {
 		return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "internal_error")
@@ -152,10 +152,10 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 		CandidateSlot:                generatedruntime.Slot(runtimeDeployment.CandidateSlot), ComponentCount: len(componentNames),
 	})
 	if errors.Is(err, ErrInsufficientReplacementCapacity) {
-		return waitingForApproval(), nil
+		return waitingFor(jobs.PauseInsufficientReplacementCapacity), nil
 	}
 	if errors.Is(err, deployments.ErrApprovalRequired) {
-		return waitingForApproval(), nil
+		return waitingFor(jobs.PauseApprovalRequired), nil
 	}
 	if err != nil || reservation == nil {
 		return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
@@ -390,8 +390,8 @@ func report(reporter jobs.ProgressReporter, status jobs.Status, phase string, pr
 	return reporter.Report(jobs.ProgressUpdate{Status: status, Phase: phase, Progress: progress, Code: "phase_started"})
 }
 
-func waitingForApproval() jobs.ExecutionResult {
-	return jobs.ExecutionResult{Disposition: jobs.ExecutionWaitingUser, PauseDisposition: "approval_required"}
+func waitingFor(disposition string) jobs.ExecutionResult {
+	return jobs.ExecutionResult{Disposition: jobs.ExecutionWaitingUser, PauseDisposition: disposition}
 }
 
 type runtimeError struct{ code string }
