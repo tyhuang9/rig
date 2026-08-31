@@ -402,6 +402,9 @@ func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen
 	if fixture.state.switchCalls != 1 || len(fixture.routes.requests) != 1 {
 		t.Fatalf("switch calls=%d route requests=%d", fixture.state.switchCalls, len(fixture.routes.requests))
 	}
+	if endpoints := fixture.routes.requests[0].Endpoints; len(endpoints) != 1 || endpoints[0].Role != "api" {
+		t.Fatalf("route endpoints=%+v", endpoints)
+	}
 }
 
 func TestGeneratedExecutorWaitsBeforeMutationWhenMigrationApprovalIsMissing(t *testing.T) {

@@ -339,12 +339,12 @@ func routeEndpoints(plan deploymentplans.DeploymentPlanRevision, candidates map[
 	result := make([]generatedruntime.RouteEndpoint, 0, len(names))
 	for _, name := range names {
 		candidate := candidates[name]
-		_, exists := componentPlan(plan, name)
+		component, exists := componentPlan(plan, name)
 		if !exists {
 			continue
 		}
 		result = append(result, generatedruntime.RouteEndpoint{
-			Component: name, ContainerID: candidate.ContainerID,
+			Component: name, Role: component.Role, ContainerID: candidate.ContainerID,
 			NetworkName: candidate.NetworkName, NetworkAlias: candidate.NetworkAlias, InternalPort: candidate.InternalPort,
 		})
 	}
