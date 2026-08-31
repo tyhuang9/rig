@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { APIError, api, type SourceConnection } from "./api";
+import { APIError, api, type InspectResponse, type SourceConnection } from "./api";
 import { isDeviceAuthorizationExpired, SourceWizard } from "./source-wizard";
 
 const connection = {
@@ -18,6 +18,21 @@ const otherConnection = {
   id: "fedcba9876543210fedcba9876543210",
   providerLogin: "rig-backup",
 };
+
+function inspectionFixture(value: Omit<InspectResponse, "analysis">): InspectResponse {
+  const resolvedDigest = value.resolvedSha || "a".repeat(64);
+  return {
+    ...value,
+    analysis: {
+      source: value.source,
+      resolvedDigest,
+      schemaVersion: "2",
+      structuralFingerprint: "b".repeat(64),
+      candidates: [],
+      findings: [],
+    },
+  };
+}
 
 function pendingConnection(overrides: Partial<SourceConnection> = {}): SourceConnection {
   return {
@@ -108,8 +123,8 @@ async function inspectExactSource() {
 
 function mockCleanInspection() {
   vi.mocked(api.inspect)
-    .mockResolvedValueOnce({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [], findings: [] })
-    .mockResolvedValueOnce({ source: { type: "github", composePath: "compose.yaml" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [{ name: "web" }], findings: [] });
+    .mockResolvedValueOnce(inspectionFixture({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [], findings: [] }))
+    .mockResolvedValueOnce(inspectionFixture({ source: { type: "github", composePath: "compose.yaml" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [{ name: "web" }], findings: [] }));
 }
 
 async function reachCleanExactSource() {
@@ -225,7 +240,7 @@ describe("SourceWizard", () => {
 
     await act(async () => {
       if (outcome === "success") {
-        inspectionResult.resolve({ source: { type: "local", path: "C:/projects/first" }, composeCandidates: ["compose.yaml"], services: [{ name: "stale" }], findings: [] });
+        inspectionResult.resolve(inspectionFixture({ source: { type: "local", path: "C:/projects/first" }, composeCandidates: ["compose.yaml"], services: [{ name: "stale" }], findings: [] }));
       } else {
         inspectionResult.reject(new APIError({ status: 422, code: "invalid_source", detail: "The stale local path failed." }));
       }
@@ -854,7 +869,7 @@ describe("SourceWizard", () => {
 
     await act(async () => {
       if (outcome === "success") {
-        inspectionResult.resolve({ source: { type: "github" }, resolvedSha: "stale-sha", composeCandidates: ["compose.yaml"], services: [], findings: [] });
+        inspectionResult.resolve(inspectionFixture({ source: { type: "github" }, resolvedSha: "stale-sha", composeCandidates: ["compose.yaml"], services: [], findings: [] }));
       } else {
         inspectionResult.reject(new APIError({ status: 422, code: "invalid_source", detail: "The stale GitHub source failed." }));
       }
@@ -869,7 +884,7 @@ describe("SourceWizard", () => {
   it("does not let a stale exact inspection satisfy save gating", async () => {
     const exactInspectionResult = deferred<Awaited<ReturnType<typeof api.inspect>>>();
     vi.mocked(api.inspect)
-      .mockResolvedValueOnce({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [], findings: [] })
+      .mockResolvedValueOnce(inspectionFixture({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [], findings: [] }))
       .mockReturnValueOnce(exactInspectionResult.promise);
     renderWizard();
     fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "GitHub app" } });
@@ -883,7 +898,7 @@ describe("SourceWizard", () => {
     fireEvent.click(screen.getByRole("button", { name: /inspect selected compose file/i }));
     fireEvent.change(screen.getByLabelText(/^tracked branch$/i), { target: { value: "" } });
 
-    await act(async () => exactInspectionResult.resolve({ source: { type: "github", composePath: "compose.yaml" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [{ name: "web" }], findings: [] }));
+    await act(async () => exactInspectionResult.resolve(inspectionFixture({ source: { type: "github", composePath: "compose.yaml" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [{ name: "web" }], findings: [] })));
 
     expect(screen.queryByText(/source inspection completed/i)).toBeNull();
     expect(screen.getByRole("button", { name: /save application/i }).hasAttribute("disabled")).toBe(true);
@@ -892,8 +907,8 @@ describe("SourceWizard", () => {
 
   it("selects a GitHub source, requires an exact clean inspection, and sends only githubSource", async () => {
     vi.mocked(api.inspect)
-      .mockResolvedValueOnce({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [], findings: [] })
-      .mockResolvedValueOnce({ source: { type: "github", composePath: "compose.yaml" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [{ name: "web" }], findings: [] });
+      .mockResolvedValueOnce(inspectionFixture({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [], findings: [] }))
+      .mockResolvedValueOnce(inspectionFixture({ source: { type: "github", composePath: "compose.yaml" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [{ name: "web" }], findings: [] }));
     const { onCreated } = renderWizard();
     fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "GitHub app" } });
     await selectConnectedGitHub();
@@ -923,8 +938,8 @@ describe("SourceWizard", () => {
 
   it("describes policy findings truthfully and keeps saving blocked", async () => {
     vi.mocked(api.inspect)
-      .mockResolvedValueOnce({ source: { type: "github" }, composeCandidates: ["compose.yaml"], services: [], findings: [] })
-      .mockResolvedValueOnce({ source: { type: "github", composePath: "compose.yaml" }, composeCandidates: ["compose.yaml"], services: [], findings: [{ code: "unsupported_path", message: "A referenced file leaves the release workspace." }] });
+      .mockResolvedValueOnce(inspectionFixture({ source: { type: "github" }, composeCandidates: ["compose.yaml"], services: [], findings: [] }))
+      .mockResolvedValueOnce(inspectionFixture({ source: { type: "github", composePath: "compose.yaml" }, composeCandidates: ["compose.yaml"], services: [], findings: [{ code: "unsupported_path", message: "A referenced file leaves the release workspace." }] }));
     renderWizard();
     fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "GitHub app" } });
     await selectConnectedGitHub();
@@ -945,8 +960,8 @@ describe("SourceWizard", () => {
 
   it("clears a successful inspection when an upstream branch changes", async () => {
     vi.mocked(api.inspect)
-      .mockResolvedValueOnce({ source: { type: "github" }, composeCandidates: ["compose.yaml"], services: [], findings: [] })
-      .mockResolvedValueOnce({ source: { type: "github" }, composeCandidates: ["compose.yaml"], services: [], findings: [] });
+      .mockResolvedValueOnce(inspectionFixture({ source: { type: "github" }, composeCandidates: ["compose.yaml"], services: [], findings: [] }))
+      .mockResolvedValueOnce(inspectionFixture({ source: { type: "github" }, composeCandidates: ["compose.yaml"], services: [], findings: [] }));
     renderWizard();
     await selectConnectedGitHub();
     await selectInstallation();
