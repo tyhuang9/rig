@@ -29,6 +29,8 @@ func TestCanonicalDigestSortsUnorderedMetadata(t *testing.T) {
 	first := testPlan()
 	second := testPlan()
 	second.Components[0], second.Components[1] = second.Components[1], second.Components[0]
+	first.FieldProvenance[0].Evidence = append(first.FieldProvenance[0].Evidence, "package-lock.json")
+	second.FieldProvenance[0].Evidence = append(second.FieldProvenance[0].Evidence, "package-lock.json")
 	second.FieldProvenance[0].Evidence[0], second.FieldProvenance[0].Evidence[1] = second.FieldProvenance[0].Evidence[1], second.FieldProvenance[0].Evidence[0]
 	firstDigest, err := CanonicalDigest(first)
 	if err != nil {
@@ -132,10 +134,23 @@ func testPlan() Plan {
 		Strategy: StrategyGeneratedNode,
 		Detector: Detector{Name: "package-json", Version: "1", SourceStructuralFingerprint: strings.Repeat("a", 64)},
 		Components: []Component{
-			{Name: "web", Role: "web", RootDirectory: "apps/web", PackageManager: "npm", InstallBehavior: "ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm run start", InternalPort: 3000, HealthProbe: "/health"},
-			{Name: "worker", Role: "worker", RootDirectory: "apps/worker", PackageManager: "npm", InstallBehavior: "ci", NodeVersion: "22", RunCommand: "npm run worker", HealthProbe: "process"},
+			{Name: "web", Role: "server", RootDirectory: "apps/web", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm run start", InternalPort: 3000, HealthProbe: "/health"},
+			{Name: "worker", Role: "server", RootDirectory: "apps/worker", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", RunCommand: "npm run worker", InternalPort: 3001, HealthProbe: "/health"},
 		},
-		FieldProvenance: []FieldProvenance{{Field: "start", Origin: ProvenanceInferred, Confidence: 90, Evidence: []string{"scripts.start", "engines.node"}}},
-		Migration:       &Migration{Command: "npm run migrate", EvidenceDigest: strings.Repeat("b", 64), Approval: MigrationApproval{Status: MigrationApprovalPending}},
+		FieldProvenance: provenanceFor(
+			Component{Name: "web", Role: "server", RootDirectory: "apps/web", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm run start", InternalPort: 3000, HealthProbe: "/health"},
+			Component{Name: "worker", Role: "server", RootDirectory: "apps/worker", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", RunCommand: "npm run worker", InternalPort: 3001, HealthProbe: "/health"},
+		),
+		Migration: &Migration{Command: "npm run migrate", EvidenceDigest: strings.Repeat("b", 64), Approval: MigrationApproval{Status: MigrationApprovalPending}},
 	}
+}
+
+func provenanceFor(components ...Component) []FieldProvenance {
+	var values []FieldProvenance
+	for _, component := range components {
+		for _, field := range componentExecutionFields(component) {
+			values = append(values, FieldProvenance{Field: field, Origin: ProvenanceInferred, Confidence: 90, Evidence: []string{"package.json"}})
+		}
+	}
+	return values
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"path"
 	"sort"
 	"strings"
 	"unicode"
@@ -158,7 +159,7 @@ func canonicalPlan(plan Plan) (Plan, error) {
 	if validateText(plan.Detector.Name, 256) != nil || validateText(plan.Detector.Version, 256) != nil || !validDigest(plan.Detector.SourceStructuralFingerprint) {
 		return Plan{}, invalid("detector", "Must include name, version, and lowercase structural fingerprint")
 	}
-	if len(plan.Components) > 64 || len(plan.FieldProvenance) > 256 {
+	if len(plan.Components) > 64 || len(plan.FieldProvenance) > 256 || (plan.Strategy == StrategyGeneratedNode && (len(plan.Components) < 1 || len(plan.Components) > 2)) {
 		return Plan{}, invalid("plan", "Contains too many entries")
 	}
 	result := Plan{Strategy: plan.Strategy, Detector: plan.Detector, Migration: plan.Migration}
@@ -166,7 +167,7 @@ func canonicalPlan(plan Plan) (Plan, error) {
 	sort.Slice(result.Components, func(i, j int) bool { return result.Components[i].Name < result.Components[j].Name })
 	seen := map[string]bool{}
 	for _, component := range result.Components {
-		if seen[component.Name] || validateText(component.Name, 256) != nil || validateText(component.Role, 256) != nil || validateText(component.RootDirectory, 1024) != nil || validateText(component.PackageManager, 256) != nil || validateText(component.InstallBehavior, 256) != nil || validateText(component.NodeVersion, 256) != nil || ValidateCommand(component.RunCommand) != nil || validateText(component.HealthProbe, 1024) != nil {
+		if seen[component.Name] || validateText(component.Name, 256) != nil || !supportedRole(component.Role) || !validRootDirectory(component.RootDirectory) || !supportedPackageManager(component.PackageManager) || ValidateCommand(component.InstallBehavior) != nil || validateText(component.NodeVersion, 256) != nil || ValidateCommand(component.RunCommand) != nil || component.InternalPort == 0 || !validHealthProbe(component.HealthProbe) {
 			return Plan{}, invalid("components", "Components must use complete bounded execution fields")
 		}
 		if component.BuildCommand != "" && ValidateCommand(component.BuildCommand) != nil {
@@ -183,6 +184,13 @@ func canonicalPlan(plan Plan) (Plan, error) {
 			return Plan{}, invalid("fieldProvenance", "Fields require inferred or user provenance, confidence, and evidence")
 		}
 		fields[field.Field] = true
+	}
+	for _, component := range result.Components {
+		for _, field := range componentExecutionFields(component) {
+			if !fields[field] {
+				return Plan{}, invalid("fieldProvenance", "Every execution field requires provenance")
+			}
+		}
 	}
 	if result.Migration != nil {
 		if ValidateCommand(result.Migration.Command) != nil || !validDigest(result.Migration.EvidenceDigest) {
@@ -202,6 +210,31 @@ func canonicalPlan(plan Plan) (Plan, error) {
 		}
 	}
 	return result, nil
+}
+
+func supportedRole(value string) bool { return value == "server" || value == "static" }
+func supportedPackageManager(value string) bool {
+	return value == "npm" || value == "pnpm" || value == "yarn"
+}
+func validRootDirectory(value string) bool {
+	if value == "." {
+		return true
+	}
+	if value == "" || strings.Contains(value, `\\`) || strings.HasPrefix(value, "/") || strings.Contains(value, ":") || path.Clean(value) != value || value == ".." || strings.HasPrefix(value, "../") {
+		return false
+	}
+	return validateText(value, 1024) == nil
+}
+func validHealthProbe(value string) bool {
+	return strings.HasPrefix(value, "/") && !strings.Contains(value, "?") && !strings.Contains(value, "#") && path.Clean(value) == value && validateText(value, 1024) == nil
+}
+func componentExecutionFields(component Component) []string {
+	prefix := "components." + component.Name + "."
+	fields := []string{prefix + "role", prefix + "rootDirectory", prefix + "packageManager", prefix + "installBehavior", prefix + "nodeVersion", prefix + "runCommand", prefix + "internalPort", prefix + "healthProbe"}
+	if component.BuildCommand != "" {
+		fields = append(fields, prefix+"buildCommand")
+	}
+	return fields
 }
 
 func canonicalEvidence(values *[]string) error {

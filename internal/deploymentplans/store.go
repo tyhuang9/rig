@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -174,7 +175,7 @@ func (s *Store) Replace(ctx context.Context, appID, actorID string, input Replac
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return DeploymentPlanRevision{}, &Error{Code: "deployment_plan_conflict"}
 	}
-	metadata, _ := json.Marshal(map[string]any{"strategy": canonical.Strategy, "detector": canonical.Detector.Name, "detectorVersion": canonical.Detector.Version, "canonicalDigest": digest, "components": len(canonical.Components), "fieldProvenance": len(canonical.FieldProvenance), "acceptanceStatus": RevisionAccepted})
+	metadata, _ := json.Marshal(map[string]any{"revisionId": id, "revisionNumber": number, "strategy": canonical.Strategy, "detector": canonical.Detector.Name, "detectorVersion": canonical.Detector.Version, "canonicalDigest": digest, "components": len(canonical.Components), "fieldProvenance": len(canonical.FieldProvenance), "changedFields": changedFieldNames(canonical), "acceptanceStatus": RevisionAccepted})
 	if _, err = tx.ExecContext(ctx, `INSERT INTO audit_events(actor_id,action,resource_type,resource_id,metadata_json,created_at) VALUES(?,?,?,?,?,?)`, nullable(actorID), "deployment_plan.replace", "application", appID, string(metadata), now); err != nil {
 		return DeploymentPlanRevision{}, s.classifyWriteError(ctx, appID, input.ExpectedRevisionNumber, err)
 	}
@@ -243,68 +244,107 @@ func (s *Store) readRevision(ctx context.Context, appID, id string, number int64
 // Recover validates every referenced bundle and deletes only recognized
 // unreferenced bundle or temporary files from managed plan directories.
 func (s *Store) Recover(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,app_id,revision_number FROM deployment_plan_revisions ORDER BY app_id,revision_number`)
+	rows, err := s.db.QueryContext(ctx, `SELECT app_id FROM deployment_plan_heads ORDER BY app_id`)
+	if err != nil {
+		return err
+	}
+	var apps []string
+	for rows.Next() {
+		var app string
+		if err := rows.Scan(&app); err != nil {
+			rows.Close()
+			return err
+		}
+		if !validUUID(app) {
+			rows.Close()
+			return errors.New("invalid deployment plan identity")
+		}
+		apps = append(apps, app)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := safeDirectory(s.root, true); err != nil {
+		return err
+	}
+	for _, app := range apps {
+		unlock := s.lock(app)
+		if err := s.recoverApp(ctx, app); err != nil {
+			unlock()
+			return err
+		}
+		unlock()
+	}
+	return nil
+}
+
+func (s *Store) recoverApp(ctx context.Context, app string) error {
+	appRoot := filepath.Join(s.root, app)
+	if _, err := os.Lstat(appRoot); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if err := safeDirectory(appRoot, false); err != nil {
+		return err
+	}
+	directory := filepath.Join(appRoot, "deployment-plans")
+	if _, err := os.Lstat(directory); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if err := safeDirectory(directory, false); err != nil {
+		return err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,revision_number FROM deployment_plan_revisions WHERE app_id=? ORDER BY revision_number`, app)
 	if err != nil {
 		return err
 	}
 	type reference struct {
-		id, app string
-		number  int64
+		id     string
+		number int64
 	}
 	var references []reference
-	apps := map[string]bool{}
 	known := map[string]bool{}
 	for rows.Next() {
 		var reference reference
-		if err := rows.Scan(&reference.id, &reference.app, &reference.number); err != nil {
+		if err := rows.Scan(&reference.id, &reference.number); err != nil {
 			rows.Close()
 			return err
 		}
-		if !validUUID(reference.id) || !validUUID(reference.app) {
-			rows.Close()
-			return errors.New("invalid deployment plan identity")
-		}
 		references = append(references, reference)
-		apps[reference.app] = true
-		known[filepath.Clean(s.bundlePath(reference.app, reference.id))] = true
 	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
 	for _, reference := range references {
-		if _, err := s.readRevision(ctx, reference.app, reference.id, reference.number); err != nil {
+		if _, err := s.readRevision(ctx, app, reference.id, reference.number); err != nil {
 			return err
 		}
+		known[filepath.Clean(s.bundlePath(app, reference.id))] = true
 	}
-	if err := safeDirectory(s.root, true); err != nil {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
 		return err
 	}
-	for app := range apps {
-		directory := filepath.Join(s.root, app, "deployment-plans")
-		if _, err := os.Lstat(directory); errors.Is(err, os.ErrNotExist) {
+	for _, entry := range entries {
+		path := filepath.Join(directory, entry.Name())
+		if entry.IsDir() || deploymentPlanPathIsReparsePoint(path) {
+			return errors.New("unrecognized directory in deployment plan directory")
+		}
+		if known[filepath.Clean(path)] {
 			continue
-		} else if err != nil {
+		}
+		id := strings.TrimSuffix(entry.Name(), ".secret")
+		if !(strings.HasSuffix(entry.Name(), ".secret") && validUUID(id)) && !temporarySecretName.MatchString(entry.Name()) {
+			return errors.New("unrecognized file in deployment plan directory")
+		}
+		var exists int
+		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM deployment_plan_revisions WHERE app_id=? AND bundle_ref=?)`, app, filepath.ToSlash(filepath.Join("apps", app, "deployment-plans", entry.Name()))).Scan(&exists); err != nil {
 			return err
 		}
-		if err := safeDirectory(directory, false); err != nil {
-			return err
-		}
-		entries, err := os.ReadDir(directory)
-		if err != nil {
-			return err
-		}
-		for _, entry := range entries {
-			path := filepath.Join(directory, entry.Name())
-			if entry.IsDir() {
-				return errors.New("unrecognized directory in deployment plan directory")
-			}
-			if known[filepath.Clean(path)] {
-				continue
-			}
-			id := strings.TrimSuffix(entry.Name(), ".secret")
-			if !(strings.HasSuffix(entry.Name(), ".secret") && validUUID(id)) && !temporarySecretName.MatchString(entry.Name()) {
-				return errors.New("unrecognized file in deployment plan directory")
-			}
+		if exists == 0 {
 			if err := os.Remove(path); err != nil {
 				return err
 			}
@@ -344,7 +384,7 @@ func safeDirectory(path string, create bool) error {
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || deploymentPlanPathIsReparsePoint(path) {
 		return errors.New("managed deployment plan path is not a directory")
 	}
 	return nil
@@ -371,4 +411,16 @@ func migrationEvidenceDigest(migration *Migration) string {
 		return ""
 	}
 	return migration.EvidenceDigest
+}
+
+func changedFieldNames(plan Plan) []string {
+	fields := make([]string, 0, len(plan.FieldProvenance))
+	for _, field := range plan.FieldProvenance {
+		fields = append(fields, field.Field)
+	}
+	if plan.Migration != nil {
+		fields = append(fields, "migration.approval", "migration.evidenceDigest")
+	}
+	sort.Strings(fields)
+	return fields
 }
