@@ -12,7 +12,7 @@ import (
 	"github.com/hostd/hostd/internal/deploymentplans"
 )
 
-const CompilerVersion = "generated-node-v1"
+const CompilerVersion = "generated-node-v2"
 
 var nodeImages = map[string]string{
 	"20": "node:20-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0",
