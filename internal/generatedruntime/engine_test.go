@@ -26,14 +26,18 @@ type runtimeRequestResult struct {
 }
 
 type runtimeFakeRunner struct {
-	requests []runtimeprocess.CommandRequest
-	run      func(runtimeprocess.CommandRequest) runtimeRequestResult
+	requests        []runtimeprocess.CommandRequest
+	rejectCancelled bool
+	run             func(runtimeprocess.CommandRequest) runtimeRequestResult
 }
 
-func (r *runtimeFakeRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+func (r *runtimeFakeRunner) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
 	request.Args = append([]string(nil), request.Args...)
 	request.Env = append([]string(nil), request.Env...)
 	r.requests = append(r.requests, request)
+	if r.rejectCancelled && ctx.Err() != nil {
+		return runtimeprocess.CommandResult{}, ctx.Err()
+	}
 	response := r.run(request)
 	return response.result, response.err
 }
@@ -343,6 +347,8 @@ func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testin
 	}
 	spec := candidateSpec()
 	networkInspections := 0
+	created := false
+	removed := false
 	runner := &runtimeFakeRunner{}
 	runner.run = func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
@@ -357,18 +363,21 @@ func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testin
 		case "network create":
 			return runtimeRequestResult{}
 		case "container inspect":
-			if request.Args[len(request.Args)-1] != testContainerID {
+			identity := request.Args[len(request.Args)-1]
+			if removed || (!created && identity != testContainerID) || (identity != testContainerID && identity != containerName(spec.AppID, spec.ComponentName, SlotGreen)) {
 				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
 			}
 			inspection := hardenedInspection(spec, defaultLimits())
 			inspection.Privileged = true
 			return runtimeJSON(inspection)
 		case "container create":
+			created = true
 			return runtimeRequestResult{result: runtimeprocess.CommandResult{Stdout: []byte(testContainerID)}}
 		case "container rm":
 			if !containsArgument(request.Args, "--force") {
 				t.Fatalf("unsafe candidate cleanup was not forced: %#v", request.Args)
 			}
+			removed = true
 			return runtimeRequestResult{}
 		default:
 			t.Fatalf("unexpected request: %#v", request.Args)
@@ -382,6 +391,127 @@ func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testin
 	_, err = engine.CreateInactiveCandidate(context.Background(), spec)
 	if !IsCode(err, DiagnosticCandidateHardeningFailed) {
 		t.Fatalf("expected hardening failure, got %v", err)
+	}
+	findRuntimeRequest(t, runner.requests, "container rm")
+}
+
+func TestGeneratedRuntimeReconcilesAmbiguousCreateByDeterministicName(t *testing.T) {
+	spec := candidateSpec()
+	created := false
+	removed := false
+	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		switch commandKind(request.Args) {
+		case "image inspect":
+			return runtimeJSON(validImageInspection(spec))
+		case "network inspect":
+			return runtimeJSON(networkInspection{Name: networkName(spec.AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": spec.AppID}})
+		case "container inspect":
+			identity := request.Args[len(request.Args)-1]
+			if removed || !created {
+				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
+			}
+			if identity != testContainerID && identity != containerName(spec.AppID, spec.ComponentName, SlotGreen) {
+				t.Fatalf("ambiguous create reconciled through unexpected identity: %q", identity)
+			}
+			return runtimeJSON(hardenedInspection(spec, defaultLimits()))
+		case "container create":
+			created = true
+			return runtimeRequestResult{err: context.DeadlineExceeded}
+		case "container rm":
+			removed = true
+			return runtimeRequestResult{}
+		default:
+			t.Fatalf("unexpected request: %#v", request.Args)
+			return runtimeRequestResult{}
+		}
+	})
+	_, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	if !IsCode(err, DiagnosticRuntimeTimeout) {
+		t.Fatalf("expected original create timeout after successful reconciliation, got %v", err)
+	}
+	if !removed {
+		t.Fatal("ambiguous create was not removed")
+	}
+	findRuntimeRequest(t, runner.requests, "container rm")
+}
+
+func TestGeneratedRuntimeFailsClosedWhenAmbiguousCreateOwnershipCannotBeProved(t *testing.T) {
+	spec := candidateSpec()
+	created := false
+	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		switch commandKind(request.Args) {
+		case "image inspect":
+			return runtimeJSON(validImageInspection(spec))
+		case "network inspect":
+			return runtimeJSON(networkInspection{Name: networkName(spec.AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": spec.AppID}})
+		case "container inspect":
+			if !created {
+				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
+			}
+			inspection := hardenedInspection(spec, defaultLimits())
+			inspection.Labels["io.rig.deployment"] = uuid.NewString()
+			return runtimeJSON(inspection)
+		case "container create":
+			created = true
+			return runtimeRequestResult{err: context.DeadlineExceeded}
+		case "container rm":
+			t.Fatal("container with unproved ownership was removed")
+			return runtimeRequestResult{}
+		default:
+			t.Fatalf("unexpected request: %#v", request.Args)
+			return runtimeRequestResult{}
+		}
+	})
+	_, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	if !IsCode(err, DiagnosticCandidateCleanupFailed) {
+		t.Fatalf("expected fail-closed cleanup diagnostic, got %v", err)
+	}
+	engine.capacity.mu.Lock()
+	reservedMemory := engine.capacity.memory
+	engine.capacity.mu.Unlock()
+	if reservedMemory != uint64(defaultLimits().MemoryBytes) {
+		t.Fatalf("unresolved candidate released admission: reserved=%d", reservedMemory)
+	}
+	for _, request := range runner.requests {
+		if commandKind(request.Args) == "container rm" {
+			t.Fatal("unowned container reached removal")
+		}
+	}
+}
+
+func TestGeneratedRuntimeReconcilesAmbiguousStart(t *testing.T) {
+	spec := candidateSpec()
+	candidate := candidateForSpec(spec)
+	started := false
+	removed := false
+	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		switch commandKind(request.Args) {
+		case "container inspect":
+			if removed {
+				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
+			}
+			inspection := hardenedInspection(spec, defaultLimits())
+			inspection.Running = started
+			if started {
+				inspection.Health = "starting"
+			}
+			return runtimeJSON(inspection)
+		case "container start":
+			started = true
+			return runtimeRequestResult{err: context.DeadlineExceeded}
+		case "container rm":
+			removed = true
+			return runtimeRequestResult{}
+		default:
+			t.Fatalf("unexpected request: %#v", request.Args)
+			return runtimeRequestResult{}
+		}
+	})
+	if err := engine.StartCandidate(context.Background(), candidate); !IsCode(err, DiagnosticRuntimeTimeout) {
+		t.Fatalf("expected original start timeout after successful reconciliation, got %v", err)
+	}
+	if !started || !removed {
+		t.Fatalf("ambiguous start was not reconciled: started=%t removed=%t", started, removed)
 	}
 	findRuntimeRequest(t, runner.requests, "container rm")
 }
@@ -403,23 +533,40 @@ func TestGeneratedRuntimeHealthWaitFailsClosed(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			spec := candidateSpec()
 			candidate := candidateForSpec(spec)
-			engine, _, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-				if commandKind(request.Args) != "container inspect" {
+			removed := false
+			engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+				switch commandKind(request.Args) {
+				case "container inspect":
+					if removed {
+						return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
+					}
+					inspection := hardenedInspection(spec, defaultLimits())
+					inspection.Running = test.running
+					inspection.Health = test.health
+					return runtimeJSON(inspection)
+				case "container rm":
+					if !containsExactArgument(request.Args, "--force") {
+						t.Fatalf("failed candidate cleanup was not forced: %#v", request.Args)
+					}
+					removed = true
+					return runtimeRequestResult{}
+				default:
 					t.Fatalf("unexpected health command: %#v", request.Args)
+					return runtimeRequestResult{}
 				}
-				inspection := hardenedInspection(spec, defaultLimits())
-				inspection.Running = test.running
-				inspection.Health = test.health
-				return runtimeJSON(inspection)
 			})
 			ctx := context.Background()
 			if test.cancel {
 				cancelled, cancel := context.WithCancel(ctx)
 				cancel()
 				ctx = cancelled
+				runner.rejectCancelled = true
 			}
 			if err := engine.WaitHealthy(ctx, candidate); !IsCode(err, test.expected) {
 				t.Fatalf("expected %s, got %v", test.expected, err)
+			}
+			if !removed {
+				t.Fatal("failed health candidate was not removed")
 			}
 		})
 	}

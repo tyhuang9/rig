@@ -178,6 +178,14 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 
 	workingDirectory := runtimeWorkingDirectory(spec.RootDirectory)
 	labels := runtimeLabels(spec, slot)
+	candidate := Candidate{
+		AppID: spec.AppID, ReleaseID: spec.ReleaseID, DeploymentID: spec.DeploymentID,
+		ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID,
+		Component: spec.ComponentName, Slot: slot,
+		ContainerName: name, NetworkName: network, NetworkAlias: alias,
+		InternalPort: spec.InternalPort, ImageContentID: spec.ImageContentID,
+		WorkingDirectory: workingDirectory, RunCommandDigest: sha256Hex(spec.RunCommand), lease: lease,
+	}
 	args := []string{
 		"container", "create",
 		"--name", name,
@@ -223,31 +231,30 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 	clearResult(&result)
 	if diagnostic != "" || !lowerHex(containerID, 64) {
 		if lowerHex(containerID, 64) {
-			_ = e.removeUnstarted(context.WithoutCancel(ctx), containerID)
+			candidate.ContainerID = containerID
+		}
+		if cleanupErr := e.cleanupOwnedCandidate(ctx, candidate, name); cleanupErr != nil {
+			releaseOnFailure = false
+			return Candidate{}, cleanupErr
 		}
 		if diagnostic == "" {
 			diagnostic = DiagnosticCandidateCreateFailed
 		}
 		return Candidate{}, &Error{Code: diagnostic}
 	}
+	candidate.ContainerID = containerID
 	if err := cleanupEnvironment(); err != nil {
-		if cleanupErr := e.removeUnstarted(context.WithoutCancel(ctx), containerID); cleanupErr != nil {
+		if cleanupErr := e.cleanupOwnedCandidate(ctx, candidate, name); cleanupErr != nil {
+			releaseOnFailure = false
 			return Candidate{}, cleanupErr
 		}
 		return Candidate{}, &Error{Code: DiagnosticConfigurationUnavailable}
 	}
 
-	candidate := Candidate{
-		AppID: spec.AppID, ReleaseID: spec.ReleaseID, DeploymentID: spec.DeploymentID,
-		ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID,
-		Component: spec.ComponentName, Slot: slot, ContainerID: containerID,
-		ContainerName: name, NetworkName: network, NetworkAlias: alias,
-		InternalPort: spec.InternalPort, ImageContentID: spec.ImageContentID,
-		WorkingDirectory: workingDirectory, RunCommandDigest: sha256Hex(spec.RunCommand), lease: lease,
-	}
 	container, found, err := e.inspectContainer(ctx, containerID)
 	if err != nil || !found || !matchesCreatedContainer(container, spec, candidate, image.ID, workingDirectory, labels, e.options.Limits) {
-		if cleanupErr := e.removeUnstarted(context.WithoutCancel(ctx), containerID); cleanupErr != nil {
+		if cleanupErr := e.cleanupOwnedCandidate(ctx, candidate, name); cleanupErr != nil {
+			releaseOnFailure = false
 			return Candidate{}, cleanupErr
 		}
 		return Candidate{}, &Error{Code: DiagnosticCandidateHardeningFailed}
@@ -262,16 +269,16 @@ func (e *Engine) StartCandidate(ctx context.Context, candidate Candidate) error 
 	}
 	container, found, err := e.inspectContainer(ctx, candidate.ContainerID)
 	if err != nil {
-		return err
+		return e.failInactiveCandidate(ctx, candidate, err)
 	}
 	if !found || !matchesCandidateHardening(container, candidate, e.options.Limits) {
-		return &Error{Code: DiagnosticCandidateHardeningFailed}
+		return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateHardeningFailed})
 	}
 	result, runErr := e.run(ctx, []string{"container", "start", candidate.ContainerID}, e.options.CommandTimeout)
 	diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticCandidateStartFailed)
 	clearResult(&result)
 	if diagnostic != "" {
-		return &Error{Code: diagnostic}
+		return e.failInactiveCandidate(ctx, candidate, &Error{Code: diagnostic})
 	}
 	return nil
 }
@@ -286,33 +293,33 @@ func (e *Engine) WaitHealthy(ctx context.Context, candidate Candidate) error {
 		container, found, err := e.inspectContainer(waitCtx, candidate.ContainerID)
 		if err != nil {
 			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-				return &Error{Code: DiagnosticCandidateUnhealthy}
+				return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateUnhealthy})
 			}
-			return err
+			return e.failInactiveCandidate(ctx, candidate, err)
 		}
 		if !found || !matchesCandidateHardening(container, candidate, e.options.Limits) {
-			return &Error{Code: DiagnosticCandidateHardeningFailed}
+			return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateHardeningFailed})
 		}
 		if !container.Running {
-			return &Error{Code: DiagnosticCandidateExited}
+			return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateExited})
 		}
 		switch container.Health {
 		case "healthy":
 			return nil
 		case "unhealthy":
-			return &Error{Code: DiagnosticCandidateUnhealthy}
+			return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateUnhealthy})
 		case "starting":
 		default:
-			return &Error{Code: DiagnosticCandidateHardeningFailed}
+			return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateHardeningFailed})
 		}
 		timer := time.NewTimer(e.options.HealthPollInterval)
 		select {
 		case <-waitCtx.Done():
 			timer.Stop()
 			if errors.Is(ctx.Err(), context.Canceled) {
-				return &Error{Code: DiagnosticCancelled}
+				return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCancelled})
 			}
-			return &Error{Code: DiagnosticCandidateUnhealthy}
+			return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateUnhealthy})
 		case <-timer.C:
 		}
 	}
@@ -529,16 +536,52 @@ func (e *Engine) inspectContainer(ctx context.Context, identity string) (contain
 	return container, true, nil
 }
 
-func (e *Engine) removeUnstarted(ctx context.Context, containerID string) error {
-	if !lowerHex(containerID, 64) {
+func (e *Engine) failInactiveCandidate(ctx context.Context, candidate Candidate, cause error) error {
+	if cleanupErr := e.cleanupOwnedCandidate(ctx, candidate, candidate.ContainerName); cleanupErr != nil {
+		return cleanupErr
+	}
+	return cause
+}
+
+// cleanupOwnedCandidate reconciles uncertain Docker mutations without trusting
+// command output. It removes only a container whose deterministic identity and
+// complete ownership labels match the candidate, and releases admission only
+// after a follow-up inspection proves the container is absent.
+func (e *Engine) cleanupOwnedCandidate(parent context.Context, candidate Candidate, identity string) error {
+	if identity == "" {
 		return &Error{Code: DiagnosticCandidateCleanupFailed}
 	}
-	result, runErr := e.run(ctx, []string{"container", "rm", "--force", containerID}, e.options.CommandTimeout)
-	diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticCandidateCleanupFailed)
-	clearResult(&result)
-	if diagnostic != "" {
-		return &Error{Code: diagnostic}
+	timeout := 3 * e.options.CommandTimeout
+	if timeout > 5*time.Minute {
+		timeout = 5 * time.Minute
 	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	defer cancel()
+
+	container, found, err := e.inspectContainer(cleanupCtx, identity)
+	if err != nil {
+		return &Error{Code: DiagnosticCandidateCleanupFailed}
+	}
+	if !found {
+		candidate.lease.Release()
+		return nil
+	}
+	if !validImageContainerID(container.ID) || (candidate.ContainerID != "" && candidate.ContainerID != container.ID) {
+		return &Error{Code: DiagnosticCandidateCleanupFailed}
+	}
+	candidate.ContainerID = container.ID
+	if !matchesCandidateOwnership(container, candidate) {
+		return &Error{Code: DiagnosticCandidateCleanupFailed}
+	}
+
+	result, runErr := e.run(cleanupCtx, []string{"container", "rm", "--force", candidate.ContainerID}, e.options.CommandTimeout)
+	_ = e.commandDiagnostic(cleanupCtx, result, runErr, DiagnosticCandidateCleanupFailed)
+	clearResult(&result)
+	_, found, err = e.inspectContainer(cleanupCtx, candidate.ContainerID)
+	if err != nil || found {
+		return &Error{Code: DiagnosticCandidateCleanupFailed}
+	}
+	candidate.lease.Release()
 	return nil
 }
 
