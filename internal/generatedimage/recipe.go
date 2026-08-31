@@ -102,8 +102,7 @@ func containerfile(hasBuild, enableCorepack bool, baseImage string) string {
 	if hasBuild {
 		build = "RUN --mount=type=secret,id=rig-build-command,required=true [\"/bin/sh\", \"-c\", \"root=$(cat /run/rig/root.path); cd -- \\\"/workspace/$root\\\" && exec /bin/sh -lc \\\"$(cat /run/secrets/rig-build-command)\\\"\"]\n"
 	}
-	return fmt.Sprintf(`# syntax=docker/dockerfile:1.7
-FROM %s AS builder
+	return fmt.Sprintf(`FROM %s AS builder
 %sWORKDIR /workspace
 COPY --chown=node:node source/ /workspace/
 COPY --chown=node:node rig/root.path /run/rig/root.path

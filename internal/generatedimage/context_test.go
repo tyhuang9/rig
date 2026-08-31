@@ -70,6 +70,7 @@ func TestPrepareBuildContextRejectsCredentialFiles(t *testing.T) {
 	for name, body := range map[string]string{
 		".npmrc":           "//registry.npmjs.org/:_authToken=secret",
 		".yarnrc.yml":      "npmAuthToken: secret",
+		".pnpmrc":          strings.Repeat("# safe padding\n", 30<<10) + "//registry.npmjs.org/:_authToken=late-secret",
 		"deploy.pem":       "-----BEGIN PRIVATE KEY-----\nsecret",
 		"credentials.json": `{"token":"secret"}`,
 	} {

@@ -23,6 +23,7 @@ const (
 	buildkitConfigFilename  = "buildkitd.toml"
 	dockerConfigDirectory   = "docker-config"
 	buildxConfigDirectory   = "buildx-config"
+	buildkitImage           = "moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
 
 	defaultBuilderPrepareTimeout = 2 * time.Minute
 	defaultBuilderOutputLimit    = 64 << 10
@@ -346,6 +347,7 @@ func (m *BuilderManager) ensureBuilder(ctx context.Context, identity builderIden
 		result, runErr := m.run(ctx, []string{
 			"buildx", "create", "--name", identity.BuilderName, "--node", identity.NodeName,
 			"--driver", "docker-container",
+			"--driver-opt", "image=" + buildkitImage,
 			"--driver-opt", "network=" + identity.NetworkName,
 			"--driver-opt", "memory=2147483648",
 			"--driver-opt", "memory-swap=2147483648",

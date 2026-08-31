@@ -249,25 +249,44 @@ func protectedCredentialFile(target, canonical string) bool {
 		return true
 	}
 	defer file.Close()
-	contents, err := io.ReadAll(io.LimitReader(file, 256<<10))
-	if err != nil {
-		return true
-	}
-	defer clear(contents)
-	lower := bytes.ToLower(contents)
-	if bytes.Contains(lower, []byte("-----begin ")) && bytes.Contains(lower, []byte(" private key-----")) {
-		return true
-	}
 	name := strings.ToLower(filepath.Base(filepath.FromSlash(canonical)))
-	if name != ".npmrc" && name != ".yarnrc" && name != ".yarnrc.yml" && name != ".pnpmrc" {
-		return false
+	packageConfig := name == ".npmrc" || name == ".yarnrc" || name == ".yarnrc.yml" || name == ".pnpmrc"
+	markers := [][]byte{[]byte("-----begin "), []byte(" private key-----")}
+	if packageConfig {
+		markers = append(markers, []byte("_authtoken"), []byte("npmauthtoken"), []byte("npmauthident"), []byte("_auth="), []byte("password="), []byte("password:"), []byte("username="), []byte("username:"))
 	}
-	for _, marker := range [][]byte{[]byte("_authtoken"), []byte("npmauthtoken"), []byte("npmauthident"), []byte("_auth="), []byte("password="), []byte("password:"), []byte("username="), []byte("username:")} {
-		if bytes.Contains(lower, marker) {
+	buffer := make([]byte, 64<<10)
+	tail := make([]byte, 0, 128)
+	for {
+		count, readErr := file.Read(buffer)
+		window := append(tail, buffer[:count]...)
+		lower := bytes.ToLower(window)
+		privateKey := bytes.Contains(lower, markers[0]) && bytes.Contains(lower, markers[1])
+		credential := false
+		for _, marker := range markers[2:] {
+			credential = credential || bytes.Contains(lower, marker)
+		}
+		clear(lower)
+		if privateKey || credential {
+			clear(window)
+			clear(buffer)
 			return true
 		}
+		if readErr != nil {
+			clear(window)
+			clear(buffer)
+			return readErr != io.EOF
+		}
+		const overlap = 128
+		start := len(window) - overlap
+		if start < 0 {
+			start = 0
+		}
+		nextTail := append([]byte(nil), window[start:]...)
+		clear(window)
+		clear(tail)
+		tail = nextTail
 	}
-	return false
 }
 
 func writeBuildFile(path string, contents []byte, mode os.FileMode) error {

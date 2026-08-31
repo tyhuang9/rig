@@ -191,6 +191,7 @@ func TestBuilderManagerCreatesBootstrapsAndScopesTheBuilder(t *testing.T) {
 	create := requests[4]
 	for _, required := range []string{
 		"--driver", "docker-container", "--node", "--driver-opt", "network=rig-buildnet-",
+		"image=" + buildkitImage,
 		"memory=2147483648", "memory-swap=2147483648", "cpu-period=100000", "cpu-quota=100000",
 		"--buildkitd-config", "--use",
 	} {

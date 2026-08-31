@@ -48,6 +48,9 @@ func TestDefinitionAndRecipeAreDeterministicAndCommandSafe(t *testing.T) {
 	if strings.Contains(recipe, command) || strings.Contains(recipe, first.installBehavior) || strings.Contains(recipe, "COPY --chown=node:node rig/build.command") {
 		t.Fatal("raw command was serialized into the container recipe or image layer")
 	}
+	if strings.Contains(recipe, "# syntax=") {
+		t.Fatal("recipe requested a mutable external Dockerfile frontend")
+	}
 
 	revision.Plan.Components[0].RunCommand = "pnpm run serve"
 	_, changed, err := definitionFor(revision, "web")
