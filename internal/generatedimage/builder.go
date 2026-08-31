@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	builderIdentityFilename = "builder-identity.json"
+	builderIdentityFilename = "builder-identity-v2.json"
 	dockerConfigDirectory   = "docker-config"
 	buildxConfigDirectory   = "buildx-config"
 	buildkitImage           = "moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
@@ -482,6 +482,7 @@ func (m *BuilderManager) ensureBuildkitContainer(ctx context.Context, identity b
 	args := []string{
 		"container", "run", "--detach", "--name", buildkitContainerName(identity),
 		"--privileged", "--network", identity.NetworkName,
+		"--restart", "unless-stopped",
 		"--memory", fmt.Sprintf("%d", buildkitMemoryLimit(m.options.StateQuotaBytes)), "--memory-swap", fmt.Sprintf("%d", buildkitMemoryLimit(m.options.StateQuotaBytes)),
 		"--cpu-period", "100000", "--cpu-quota", "100000", "--pids-limit", fmt.Sprintf("%d", buildkitPIDsLimit),
 		"--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=1",
@@ -563,7 +564,7 @@ func matchesBuildkitContainer(container buildkitContainer, identity builderIdent
 			return false
 		}
 	}
-	if container.HostConfig.Memory != buildkitMemoryLimit(quotaBytes) || container.HostConfig.MemorySwap != buildkitMemoryLimit(quotaBytes) || container.HostConfig.CPUPeriod != 100000 || container.HostConfig.CPUQuota != 100000 || container.HostConfig.PidsLimit != buildkitPIDsLimit || !container.HostConfig.Privileged || container.HostConfig.NetworkMode != identity.NetworkName || len(container.HostConfig.Binds) != 0 || len(container.HostConfig.PortBindings) != 0 || (container.HostConfig.RestartPolicy.Name != "" && container.HostConfig.RestartPolicy.Name != "no") || container.HostConfig.LogConfig.Type != "json-file" || len(container.HostConfig.LogConfig.Config) != 2 || container.HostConfig.LogConfig.Config["max-size"] != "10m" || container.HostConfig.LogConfig.Config["max-file"] != "1" || len(container.NetworkSettings.Networks) != 1 {
+	if container.HostConfig.Memory != buildkitMemoryLimit(quotaBytes) || container.HostConfig.MemorySwap != buildkitMemoryLimit(quotaBytes) || container.HostConfig.CPUPeriod != 100000 || container.HostConfig.CPUQuota != 100000 || container.HostConfig.PidsLimit != buildkitPIDsLimit || !container.HostConfig.Privileged || container.HostConfig.NetworkMode != identity.NetworkName || len(container.HostConfig.Binds) != 0 || len(container.HostConfig.PortBindings) != 0 || container.HostConfig.RestartPolicy.Name != "unless-stopped" || container.HostConfig.LogConfig.Type != "json-file" || len(container.HostConfig.LogConfig.Config) != 2 || container.HostConfig.LogConfig.Config["max-size"] != "10m" || container.HostConfig.LogConfig.Config["max-file"] != "1" || len(container.NetworkSettings.Networks) != 1 {
 		return false
 	}
 	_, connected := container.NetworkSettings.Networks[identity.NetworkName]

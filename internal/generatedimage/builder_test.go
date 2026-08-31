@@ -207,7 +207,7 @@ func TestBuilderManagerCreatesBootstrapsAndScopesTheBuilder(t *testing.T) {
 	}
 	containerRun := requests[5]
 	for _, required := range []string{
-		"--privileged", "--network", "rig-buildnet-", "--memory", "3221225472", "--memory-swap",
+		"--privileged", "--network", "rig-buildnet-", "--restart", "unless-stopped", "--memory", "3221225472", "--memory-swap",
 		"--pids-limit", "512", "type=tmpfs,destination=/var/lib/buildkit,tmpfs-size=2147483648,tmpfs-mode=0700",
 		"rig.quota.bytes=2147483648", buildkitImage,
 	} {
@@ -276,6 +276,30 @@ func TestBuilderManagerRefusesPostBootstrapContainerResourceDrift(t *testing.T) 
 	_, err = manager.Prepare(context.Background())
 	if !IsBuilderError(err, BuilderDriftDetected) {
 		t.Fatalf("resource drift error = %v", err)
+	}
+}
+
+func TestBuilderManagerRefusesRestartPolicyDrift(t *testing.T) {
+	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+	manager := newBuilderManagerForTest(t, daemon)
+	session, err := manager.Prepare(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon.mu.Lock()
+	identity := daemon.nodes[session.BuilderName]
+	container := daemon.boxes[buildkitContainerName(identity)]
+	container.HostConfig.RestartPolicy.Name = "no"
+	daemon.boxes[buildkitContainerName(identity)] = container
+	before := len(daemon.calls)
+	daemon.mu.Unlock()
+
+	_, err = manager.Prepare(context.Background())
+	if !IsBuilderError(err, BuilderDriftDetected) {
+		t.Fatalf("restart-policy drift error = %v", err)
+	}
+	if got, want := commandKinds(daemon.requests()[before:]), []string{"info --format", "network inspect", "container inspect"}; !sameStrings(got, want) {
+		t.Fatalf("commands after restart-policy drift = %#v, want read-only %#v", got, want)
 	}
 }
 
@@ -547,7 +571,7 @@ func validBuildkitContainer(identity builderIdentity, quotaBytes int64) buildkit
 	container.HostConfig.PidsLimit = buildkitPIDsLimit
 	container.HostConfig.Privileged = true
 	container.HostConfig.NetworkMode = identity.NetworkName
-	container.HostConfig.RestartPolicy.Name = "no"
+	container.HostConfig.RestartPolicy.Name = "unless-stopped"
 	container.HostConfig.LogConfig.Type = "json-file"
 	container.HostConfig.LogConfig.Config = map[string]string{"max-size": "10m", "max-file": "1"}
 	tmpfs := &struct {
