@@ -146,13 +146,18 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 		return Candidate{}, &Error{Code: DiagnosticCandidateSlotOccupied}
 	}
 
-	environmentLease, err := e.environment.Stage(spec.EnvironmentOperationID, spec.EnvironmentOperationAttempt, spec.Environment)
-	spec.Environment = nil
-	if err != nil || environmentLease == nil || !validAbsolutePath(environmentLease.Path()) {
-		if environmentLease != nil {
-			_ = environmentLease.Cleanup()
+	var environmentLease EnvironmentLease
+	if len(spec.Environment) > 0 {
+		environmentLease, err = e.environment.Stage(spec.EnvironmentOperationID, spec.EnvironmentOperationAttempt, spec.Environment)
+		spec.Environment = nil
+		if err != nil || environmentLease == nil || !validAbsolutePath(environmentLease.Path()) {
+			if environmentLease != nil {
+				_ = environmentLease.Cleanup()
+			}
+			return Candidate{}, &Error{Code: DiagnosticConfigurationUnavailable}
 		}
-		return Candidate{}, &Error{Code: DiagnosticConfigurationUnavailable}
+	} else {
+		spec.Environment = nil
 	}
 	cleaned := false
 	cleanupEnvironment := func() error {
@@ -160,6 +165,9 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 			return nil
 		}
 		cleaned = true
+		if environmentLease == nil {
+			return nil
+		}
 		return environmentLease.Cleanup()
 	}
 	defer func() { _ = cleanupEnvironment() }()
@@ -172,14 +180,18 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 		"--hostname", name,
 		"--network", network,
 		"--network-alias", alias,
-		"--env-file", environmentLease.Path(),
-		"--env", "RIG_RUNTIME_INTERNAL_PORT=" + strconv.FormatUint(uint64(spec.InternalPort), 10),
-		"--env", "RIG_RUNTIME_HEALTH_PATH=" + spec.HealthProbe,
+	}
+	if environmentLease != nil {
+		args = append(args, "--env-file", environmentLease.Path())
+	}
+	args = append(args,
+		"--env", "RIG_RUNTIME_INTERNAL_PORT="+strconv.FormatUint(uint64(spec.InternalPort), 10),
+		"--env", "RIG_RUNTIME_HEALTH_PATH="+spec.HealthProbe,
 		"--user", containerUser,
 		"--workdir", workingDirectory,
 		"--read-only",
 		"--init",
-		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=" + strconv.FormatInt(e.options.Limits.TmpfsBytes, 10),
+		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size="+strconv.FormatInt(e.options.Limits.TmpfsBytes, 10),
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges=true",
 		"--memory", strconv.FormatInt(e.options.Limits.MemoryBytes, 10),
@@ -188,15 +200,15 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 		"--pids-limit", strconv.FormatInt(e.options.Limits.PIDs, 10),
 		"--ulimit", "nofile=1024:1024",
 		"--log-driver", "local",
-		"--log-opt", "max-size=" + e.options.Limits.LogSize,
-		"--log-opt", "max-file=" + strconv.Itoa(e.options.Limits.LogFiles),
+		"--log-opt", "max-size="+e.options.Limits.LogSize,
+		"--log-opt", "max-file="+strconv.Itoa(e.options.Limits.LogFiles),
 		"--restart", "no",
 		"--health-cmd", healthCommand,
 		"--health-interval", "2s",
 		"--health-timeout", "2s",
 		"--health-start-period", "5s",
 		"--health-retries", "3",
-	}
+	)
 	for _, key := range sortedKeys(labels) {
 		args = append(args, "--label", key+"="+labels[key])
 	}
@@ -423,6 +435,7 @@ func (e *Engine) inspectImageSpec(ctx context.Context, spec ImageSpec) (imageIns
 		"io.rig.release":     spec.ReleaseID,
 		"io.rig.artifact":    spec.ArtifactID,
 		"io.rig.plan":        spec.DeploymentPlanRevisionID,
+		"io.rig.component":   spec.ComponentName,
 		"io.rig.definition":  spec.BuildDefinitionDigest,
 	}
 	if !containsLabels(image.Labels, expected) || image.User != "node" || image.WorkingDirectory != "/workspace" || len(image.Entrypoint) != 1 || image.Entrypoint[0] != "/usr/local/bin/rig-entrypoint" {
@@ -658,7 +671,7 @@ func validImageSpec(spec ImageSpec) bool {
 }
 
 func validEnvironment(environment []byte) bool {
-	if len(environment) == 0 || len(environment) > maximumEnvironmentBytes || !utf8.Valid(environment) {
+	if len(environment) > maximumEnvironmentBytes || !utf8.Valid(environment) {
 		return false
 	}
 	for _, value := range environment {

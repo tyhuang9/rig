@@ -41,11 +41,13 @@ func (r *runtimeFakeRunner) Run(_ context.Context, request runtimeprocess.Comman
 type runtimeFakeEnvironment struct {
 	path       string
 	contents   []byte
+	staged     int
 	cleaned    int
 	stageError error
 }
 
 func (s *runtimeFakeEnvironment) Stage(_ string, _ int, contents []byte) (EnvironmentLease, error) {
+	s.staged++
 	s.contents = append([]byte(nil), contents...)
 	clear(contents)
 	if s.stageError != nil {
@@ -195,6 +197,56 @@ func TestGeneratedRuntimeRejectsImageLabelDriftBeforeDockerMutation(t *testing.T
 	}
 	if len(runner.requests) != 1 {
 		t.Fatalf("image drift reached Docker mutation: %d requests", len(runner.requests))
+	}
+}
+
+func TestGeneratedRuntimeRejectsImageComponentDriftBeforeDockerMutation(t *testing.T) {
+	engine, runner, spec := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		if commandKind(request.Args) != "image inspect" {
+			t.Fatalf("component drift reached Docker mutation: %#v", request.Args)
+		}
+		image := validImageInspection(candidateSpec())
+		image.Labels["io.rig.component"] = "other-component"
+		return runtimeJSON(image)
+	})
+	_, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	if !IsCode(err, DiagnosticImageDriftDetected) {
+		t.Fatalf("expected image drift, got %v", err)
+	}
+	if len(runner.requests) != 1 {
+		t.Fatalf("component drift reached Docker mutation: %d requests", len(runner.requests))
+	}
+}
+
+func TestGeneratedRuntimeOmitsEnvironmentFileWhenConfigurationIsEmpty(t *testing.T) {
+	var create runtimeprocess.CommandRequest
+	expected := candidateSpec()
+	engine, _, spec := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		switch commandKind(request.Args) {
+		case "image inspect":
+			return runtimeJSON(validImageInspection(expected))
+		case "network inspect":
+			return runtimeJSON(networkInspection{Name: networkName(expected.AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": expected.AppID}})
+		case "container inspect":
+			if request.Args[len(request.Args)-1] != testContainerID {
+				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
+			}
+			return runtimeJSON(hardenedInspection(expected, defaultLimits()))
+		case "container create":
+			create = request
+			return runtimeRequestResult{result: runtimeprocess.CommandResult{Stdout: []byte(testContainerID)}}
+		default:
+			t.Fatalf("unexpected request: %#v", request.Args)
+			return runtimeRequestResult{}
+		}
+	})
+	environment := engine.environment.(*runtimeFakeEnvironment)
+	spec.Environment = nil
+	if _, err := engine.CreateInactiveCandidate(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if environment.staged != 0 || containsExactArgument(create.Args, "--env-file") {
+		t.Fatalf("empty configuration was staged: calls=%d args=%#v", environment.staged, create.Args)
 	}
 }
 
@@ -479,7 +531,7 @@ func defaultLimits() ContainerLimits {
 }
 
 func imageLabels(spec CandidateSpec) map[string]string {
-	return map[string]string{"io.rig.managed": "generated-image", "io.rig.application": spec.AppID, "io.rig.release": spec.ReleaseID, "io.rig.artifact": spec.ArtifactID, "io.rig.plan": spec.DeploymentPlanRevisionID, "io.rig.definition": spec.BuildDefinitionDigest}
+	return map[string]string{"io.rig.managed": "generated-image", "io.rig.application": spec.AppID, "io.rig.release": spec.ReleaseID, "io.rig.artifact": spec.ArtifactID, "io.rig.plan": spec.DeploymentPlanRevisionID, "io.rig.component": spec.ComponentName, "io.rig.definition": spec.BuildDefinitionDigest}
 }
 
 func validImageInspection(spec CandidateSpec) imageInspection {
