@@ -282,7 +282,7 @@ func classifyBuildResult(ctx context.Context, result runtimeprocess.CommandResul
 	}
 	if err != nil {
 		output := strings.ToLower(string(result.Stderr))
-		if strings.Contains(output, "no space left on device") {
+		if strings.Contains(output, "no space left on device") || strings.Contains(output, "disk quota exceeded") {
 			return DiagnosticBuildDiskExhausted
 		}
 		if strings.Contains(output, "cannot connect to the docker daemon") || strings.Contains(output, "error during connect") {
@@ -322,7 +322,7 @@ func localDockerEndpoint(value string) bool {
 }
 
 func validBuilderSession(session BuilderSession) bool {
-	if session.DockerExecutable == "" || pathsecurity.RejectWindowsNamespace(session.DockerExecutable) || !filepath.IsAbs(session.DockerExecutable) || filepath.Clean(session.DockerExecutable) != session.DockerExecutable || !validBuilderName(session.BuilderName) {
+	if session.DockerExecutable == "" || pathsecurity.RejectWindowsNamespace(session.DockerExecutable) || !filepath.IsAbs(session.DockerExecutable) || filepath.Clean(session.DockerExecutable) != session.DockerExecutable || !validBuilderName(session.BuilderName) || session.storageQuotaBytes < minimumStateQuotaBytes || session.storageQuotaBytes > maximumStateQuotaBytes {
 		return false
 	}
 	allowed := map[string]bool{"PATH": true, "PATHEXT": true, "SystemRoot": true, "TEMP": true, "TMP": true, "WINDIR": true, "DOCKER_CONFIG": true, "BUILDX_CONFIG": true, "DOCKER_HOST": true}
@@ -357,6 +357,10 @@ func builderDiagnostic(err error) DiagnosticCode {
 		return DiagnosticBuildOutputTruncated
 	case BuilderTerminationFailed:
 		return DiagnosticProcessTerminationFailed
+	case BuilderHardQuotaUnavailable:
+		return DiagnosticBuildCapacityExceeded
+	case BuilderHardQuotaExhausted:
+		return DiagnosticBuildDiskExhausted
 	case BuilderRuntimeUnavailable, BuilderProvisionFailed, BuilderBootstrapFailed:
 		return DiagnosticRuntimeUnavailable
 	default:

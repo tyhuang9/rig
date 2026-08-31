@@ -234,11 +234,46 @@ func TestClassifyBuildResultUsesOnlyStableBoundaryState(t *testing.T) {
 		"missing client":     {ctx: context.Background(), err: &os.PathError{Op: "fork", Path: "secret-path", Err: os.ErrNotExist}, want: DiagnosticRuntimeUnavailable},
 		"truncated":          {ctx: context.Background(), result: runtimeprocess.CommandResult{StdoutTruncated: true}, want: DiagnosticBuildOutputTruncated},
 		"daemon unavailable": {ctx: context.Background(), result: runtimeprocess.CommandResult{Stderr: []byte("Cannot connect to the Docker daemon at private endpoint")}, err: errors.New("raw"), want: DiagnosticRuntimeUnavailable},
+		"quota exceeded":     {ctx: context.Background(), result: runtimeprocess.CommandResult{Stderr: []byte("disk quota exceeded")}, err: errors.New("raw"), want: DiagnosticBuildDiskExhausted},
 		"generic":            {ctx: context.Background(), result: runtimeprocess.CommandResult{Stderr: []byte("repository-secret")}, err: errors.New("repository-secret"), want: DiagnosticBuildFailed},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := classifyBuildResult(test.ctx, test.result, test.err); got != test.want {
 				t.Fatalf("diagnostic = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCompilerRejectsBuilderSessionWithoutVerifiedHardQuota(t *testing.T) {
+	fixture := newCompilerFixture(t)
+	fixture.builder.session.storageQuotaBytes = 0
+	_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+	if !IsCompileCode(err, string(DiagnosticInternalError)) || fixture.artifacts.failed != DiagnosticInternalError {
+		t.Fatalf("unverified quota result = %v, diagnostic = %q", err, fixture.artifacts.failed)
+	}
+	if fixture.runner.request.Executable != "" {
+		t.Fatal("build ran without a verified hard-quota session")
+	}
+}
+
+func TestBuilderQuotaErrorsUseStableCompilerDiagnostics(t *testing.T) {
+	for name, test := range map[string]struct {
+		builder BuilderErrorCode
+		want    DiagnosticCode
+	}{
+		"unsupported": {builder: BuilderHardQuotaUnavailable, want: DiagnosticBuildCapacityExceeded},
+		"exhausted":   {builder: BuilderHardQuotaExhausted, want: DiagnosticBuildDiskExhausted},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newCompilerFixture(t)
+			fixture.builder.err = &BuilderError{Code: test.builder}
+			_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+			if !IsCompileCode(err, string(test.want)) || fixture.artifacts.failed != test.want {
+				t.Fatalf("quota result = %v, diagnostic = %q", err, fixture.artifacts.failed)
+			}
+			if fixture.runner.request.Executable != "" {
+				t.Fatal("build ran after quota preparation failed")
 			}
 		})
 	}
@@ -324,7 +359,7 @@ func newCompilerFixture(t *testing.T) compilerFixture {
 	}
 	builder := &compilerBuilder{session: BuilderSession{
 		DockerExecutable: filepath.Join(t.TempDir(), "docker.exe"), BuilderName: "rig-buildkit-0123456789abcdef01234567",
-		environment: []string{"BUILDX_CONFIG=" + buildxConfig, "DOCKER_CONFIG=" + dockerConfig},
+		environment: []string{"BUILDX_CONFIG=" + buildxConfig, "DOCKER_CONFIG=" + dockerConfig}, storageQuotaBytes: defaultStateQuotaBytes,
 	}}
 	temporary, err := securetemp.NewGeneratedBuild(t.TempDir())
 	if err != nil {
