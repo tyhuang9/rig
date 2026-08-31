@@ -3,10 +3,12 @@ package securetemp
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
@@ -21,6 +23,12 @@ const (
 var operationName = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[1-9][0-9]*$`)
 
 type Manager struct{ root string }
+
+// GeneratedBuilderDirectory is a persistent, controller-owned location for
+// BuildKit's identity and configuration. It is intentionally distinct from
+// short-lived generated build contexts: recovery of the latter must never
+// delete the builder that may be serving another compile.
+type GeneratedBuilderDirectory struct{ root string }
 
 type Files struct {
 	Directory   string
@@ -39,6 +47,105 @@ func New(dataRoot string) (*Manager, error) {
 // untrusted source trees from sharing a cleanup boundary.
 func NewGeneratedBuild(dataRoot string) (*Manager, error) {
 	return newManager(dataRoot, "generated-build")
+}
+
+// NewGeneratedBuilderDirectory creates the persistent protected namespace
+// used by the generated-image BuildKit controller. Callers can create only
+// direct, simple child directories and files through this value, preventing a
+// builder configuration path from escaping the controller data root.
+func NewGeneratedBuilderDirectory(dataRoot string) (*GeneratedBuilderDirectory, error) {
+	if dataRoot == "" || pathsecurity.RejectWindowsNamespace(dataRoot) || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
+		return nil, errors.New("data root must be an absolute clean path")
+	}
+	if err := rejectPathAncestors(dataRoot); err != nil {
+		return nil, fmt.Errorf("protect data root: %w", err)
+	}
+	runtimeRoot, err := ensureSecureDirectory(dataRoot, "runtime")
+	if err != nil {
+		return nil, fmt.Errorf("create runtime root: %w", err)
+	}
+	root, err := ensureSecureDirectory(runtimeRoot, "generated-builder")
+	if err != nil {
+		return nil, fmt.Errorf("create generated builder root: %w", err)
+	}
+	return &GeneratedBuilderDirectory{root: root}, nil
+}
+
+// Root returns the protected persistent directory. It is suitable as a
+// process working directory, but all controller-created children should use
+// EnsureDirectory or WriteNewFile so Windows ACLs and reparse-point checks are
+// preserved.
+func (d *GeneratedBuilderDirectory) Root() string {
+	if d == nil {
+		return ""
+	}
+	return d.root
+}
+
+// EnsureDirectory returns a direct protected child of the builder root.
+func (d *GeneratedBuilderDirectory) EnsureDirectory(name string) (string, error) {
+	if d == nil || !validBuilderChildName(name) {
+		return "", errors.New("invalid generated builder directory")
+	}
+	if err := rejectReparseAncestors(d.root, d.root); err != nil {
+		return "", err
+	}
+	return ensureSecureDirectory(d.root, name)
+}
+
+// WriteNewFile writes a direct protected child exactly once. It never follows
+// a link and deliberately does not replace an existing identity/config file.
+func (d *GeneratedBuilderDirectory) WriteNewFile(name string, contents []byte) error {
+	defer clear(contents)
+	if d == nil || !validBuilderChildName(name) {
+		return errors.New("invalid generated builder file")
+	}
+	path := filepath.Join(d.root, name)
+	if !within(d.root, path) {
+		return errors.New("generated builder file escaped root")
+	}
+	return writeNew(d.root, path, contents)
+}
+
+// ReadFile returns the direct regular child after validating the protected
+// parent and entry. The returned bytes belong to the caller and may contain
+// controller state, so callers should clear them after parsing.
+func (d *GeneratedBuilderDirectory) ReadFile(name string, maximum int64) ([]byte, error) {
+	if d == nil || !validBuilderChildName(name) || maximum < 1 {
+		return nil, errors.New("invalid generated builder file")
+	}
+	path := filepath.Join(d.root, name)
+	if !within(d.root, path) || rejectReparseAncestors(d.root, d.root) != nil {
+		return nil, errors.New("generated builder file escaped root")
+	}
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || isReparsePoint(path) || before.Size() > maximum {
+		return nil, errors.New("generated builder file is unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	body, readErr := func() ([]byte, error) {
+		defer file.Close()
+		body, err := io.ReadAll(io.LimitReader(file, maximum+1))
+		if err != nil {
+			return nil, err
+		}
+		opened, err := file.Stat()
+		if err != nil || len(body) > int(maximum) || !os.SameFile(before, opened) || !opened.Mode().IsRegular() || opened.Size() != before.Size() || int64(len(body)) != before.Size() {
+			clear(body)
+			return nil, errors.New("generated builder file changed")
+		}
+		return body, nil
+	}()
+	if readErr != nil {
+		return nil, readErr
+	}
+	return body, nil
 }
 
 func newManager(dataRoot, namespace string) (*Manager, error) {
@@ -70,7 +177,9 @@ func ensureSecureDirectory(parent, name string) (string, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := secureMkdir(path); err != nil {
-			return "", err
+			if !errors.Is(err, os.ErrExist) {
+				return "", err
+			}
 		}
 		info, err = os.Lstat(path)
 	}
@@ -78,6 +187,18 @@ func ensureSecureDirectory(parent, name string) (string, error) {
 		return "", errors.New("runtime directory is unsafe")
 	}
 	return path, nil
+}
+
+func validBuilderChildName(name string) bool {
+	if len(name) < 1 || len(name) > 80 || name == "." || name == ".." {
+		return false
+	}
+	for _, character := range name {
+		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' && character != '_' && character != '.' {
+			return false
+		}
+	}
+	return !strings.Contains(name, "..")
 }
 
 func (m *Manager) Create(jobID string, attempt int) (*Files, error) {
