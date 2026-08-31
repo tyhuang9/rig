@@ -137,6 +137,34 @@ describe("API client", () => {
     );
   });
 
+  it.each([
+    ["null", { source: { type: "github" }, composeCandidates: null, services: null, findings: null }],
+    ["missing", { source: { type: "local" } }],
+  ])("normalizes %s inspection collections at the API boundary", async (_name, body) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(body), { status: 200 }),
+    ));
+
+    await expect(api.inspect({ sourcePath: "C:/fixture" })).resolves.toMatchObject({
+      composeCandidates: [],
+      services: [],
+      findings: [],
+    });
+  });
+
+  it("rejects a present malformed inspection collection with a stable safe error", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ source: { type: "github" }, composeCandidates: ["compose.yaml"], services: [], findings: { code: "hidden_finding" } }), { status: 200 }),
+    ));
+
+    await expect(api.inspect({ sourcePath: "C:/fixture" })).rejects.toMatchObject({
+      name: "APIError",
+      status: 502,
+      code: "invalid_inspection_response",
+      detail: "The controller returned an invalid source inspection response.",
+    });
+  });
+
   it("uses generated deployment and approval operation paths with CSRF and deploy idempotency", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] }), { status: 200 }))

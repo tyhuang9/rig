@@ -29,6 +29,8 @@ const (
 	archiveTimeout            = 5 * time.Minute
 	maxAccessLifetimeSeconds  = 7 * 24 * 60 * 60
 	maxRefreshLifetimeSeconds = 2 * 365 * 24 * 60 * 60
+	repositoryLookupPerPage   = 100
+	maxRepositoryLookupPages  = 100
 	userAgent                 = "hostd-github-app/1"
 )
 
@@ -121,11 +123,12 @@ type Tree struct {
 // caller owns and must close the returned body. Authentication is deliberately
 // limited to the initial API request: redirects are followed only to the
 // canonical codeload host without forwarding the bearer token.
-func (c *Client) Archive(ctx context.Context, accessToken string, repositoryID int64, sha string) (io.ReadCloser, error) {
-	if !validSecret(accessToken) || repositoryID < 1 || !validSHA(sha) {
+func (c *Client) Archive(ctx context.Context, accessToken, owner, repository string, sha string) (io.ReadCloser, error) {
+	repositoryEndpoint, err := canonicalRepositoryEndpoint(owner, repository)
+	if !validSecret(accessToken) || err != nil || !validSHA(sha) {
 		return nil, &Error{Code: "invalid_request"}
 	}
-	endpoint := APIOrigin + "/repositories/" + strconv.FormatInt(repositoryID, 10) + "/tarball/" + sha
+	endpoint := repositoryEndpoint + "/tarball/" + sha
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, &Error{Code: "invalid_request"}
@@ -139,10 +142,10 @@ func (c *Client) Archive(ctx context.Context, accessToken string, repositoryID i
 	// bounded request lifetime without inheriting the metadata client's 15s
 	// whole-body timeout.
 	archiveClient.Timeout = archiveTimeout
-	return c.archiveRequest(&archiveClient, request, true, sha)
+	return c.archiveRequest(&archiveClient, request, true, owner, repository, sha)
 }
 
-func (c *Client) archiveRequest(client *http.Client, request *http.Request, initial bool, sha string) (io.ReadCloser, error) {
+func (c *Client) archiveRequest(client *http.Client, request *http.Request, initial bool, owner, repository, sha string) (io.ReadCloser, error) {
 	for {
 		response, err := client.Do(request)
 		if err != nil {
@@ -154,7 +157,7 @@ func (c *Client) archiveRequest(client *http.Client, request *http.Request, init
 			if !initial {
 				return nil, &Error{Code: "provider_rejected"}
 			}
-			next, err := validArchiveRedirect(location, sha)
+			next, err := validArchiveRedirect(location, owner, repository, sha)
 			if err != nil {
 				return nil, &Error{Code: "provider_rejected"}
 			}
@@ -175,9 +178,10 @@ func (c *Client) archiveRequest(client *http.Client, request *http.Request, init
 	}
 }
 
-func validArchiveRedirect(value, sha string) (*url.URL, error) {
+func validArchiveRedirect(value, owner, repository, sha string) (*url.URL, error) {
 	u, err := url.Parse(value)
-	if err != nil || !validSHA(sha) || u.Scheme != "https" || u.Host != "codeload.github.com" || u.User != nil || u.Port() != "" || u.RawQuery != "" || u.Fragment != "" || !strings.HasPrefix(u.Path, "/") || path.Clean(u.Path) != u.Path || !strings.HasSuffix(u.Path, "/"+sha) {
+	expectedPrefix := "/" + owner + "/" + repository + "/"
+	if err != nil || !validRepositoryOwner(owner) || !validRepositoryName(repository) || !validSHA(sha) || u.Scheme != "https" || u.Host != "codeload.github.com" || u.User != nil || u.Port() != "" || u.RawQuery != "" || u.Fragment != "" || !strings.HasPrefix(u.Path, expectedPrefix) || path.Clean(u.Path) != u.Path || !strings.HasSuffix(u.Path, "/"+sha) {
 		return nil, errors.New("unsafe archive redirect")
 	}
 	return u, nil
@@ -355,26 +359,56 @@ func (c *Client) Repository(ctx context.Context, accessToken string, installatio
 	if !validSecret(accessToken) || installationID < 1 || repositoryID < 1 {
 		return Repository{}, &Error{Code: "invalid_request"}
 	}
-	endpoint := APIOrigin + "/user/installations/" + strconv.FormatInt(installationID, 10) + "/repositories/" + strconv.FormatInt(repositoryID, 10)
-	var response repositoryResponse
-	if err := c.api(ctx, endpoint, accessToken, &response); err != nil {
-		return Repository{}, err
+	seen := make(map[int64]struct{})
+	total := -1
+	for page := 1; page <= maxRepositoryLookupPages; page++ {
+		result, err := c.Repositories(ctx, accessToken, installationID, page, repositoryLookupPerPage)
+		if err != nil {
+			return Repository{}, err
+		}
+		if total < 0 {
+			total = result.TotalCount
+			if total > repositoryLookupPerPage*maxRepositoryLookupPages {
+				return Repository{}, &Error{Code: "response_too_large"}
+			}
+		} else if result.TotalCount != total {
+			return Repository{}, &Error{Code: "invalid_response"}
+		}
+		offset := (page - 1) * repositoryLookupPerPage
+		expected := total - offset
+		if expected > repositoryLookupPerPage {
+			expected = repositoryLookupPerPage
+		}
+		if expected < 0 || len(result.Repositories) != expected {
+			return Repository{}, &Error{Code: "invalid_response"}
+		}
+		var matched *Repository
+		for _, repository := range result.Repositories {
+			if _, duplicate := seen[repository.ID]; duplicate {
+				return Repository{}, &Error{Code: "invalid_response"}
+			}
+			seen[repository.ID] = struct{}{}
+			if repository.ID == repositoryID {
+				copy := repository
+				matched = &copy
+			}
+		}
+		if matched != nil {
+			return *matched, nil
+		}
+		if offset+len(result.Repositories) == total {
+			return Repository{}, &Error{Code: "not_found"}
+		}
 	}
-	repository, err := validateRepository(response)
-	if err != nil {
-		return Repository{}, err
-	}
-	if repository.ID != repositoryID {
-		return Repository{}, &Error{Code: "invalid_response"}
-	}
-	return repository, nil
+	return Repository{}, &Error{Code: "response_too_large"}
 }
 
-func (c *Client) Branches(ctx context.Context, accessToken string, repositoryID int64, page, perPage int) (BranchPage, error) {
-	if !validSecret(accessToken) || repositoryID < 1 || !validPage(page, perPage) {
+func (c *Client) Branches(ctx context.Context, accessToken, owner, repository string, page, perPage int) (BranchPage, error) {
+	repositoryEndpoint, err := canonicalRepositoryEndpoint(owner, repository)
+	if !validSecret(accessToken) || err != nil || !validPage(page, perPage) {
 		return BranchPage{}, &Error{Code: "invalid_request"}
 	}
-	endpoint := APIOrigin + "/repositories/" + strconv.FormatInt(repositoryID, 10) + "/branches?page=" + strconv.Itoa(page) + "&per_page=" + strconv.Itoa(perPage)
+	endpoint := repositoryEndpoint + "/branches?page=" + strconv.Itoa(page) + "&per_page=" + strconv.Itoa(perPage)
 	var response []struct {
 		Name   string `json:"name"`
 		Commit struct {
@@ -398,11 +432,12 @@ func (c *Client) Branches(ctx context.Context, accessToken string, repositoryID 
 	return result, nil
 }
 
-func (c *Client) Branch(ctx context.Context, accessToken string, repositoryID int64, branch string) (Branch, error) {
-	if !validSecret(accessToken) || repositoryID < 1 || !validBranch(branch) {
+func (c *Client) Branch(ctx context.Context, accessToken, owner, repository, branch string) (Branch, error) {
+	repositoryEndpoint, err := canonicalRepositoryEndpoint(owner, repository)
+	if !validSecret(accessToken) || err != nil || !validBranch(branch) {
 		return Branch{}, &Error{Code: "invalid_request"}
 	}
-	endpoint := APIOrigin + "/repositories/" + strconv.FormatInt(repositoryID, 10) + "/branches/" + url.PathEscape(branch)
+	endpoint := repositoryEndpoint + "/branches/" + url.PathEscape(branch)
 	var response struct {
 		Name   string `json:"name"`
 		Commit struct {
@@ -419,11 +454,12 @@ func (c *Client) Branch(ctx context.Context, accessToken string, repositoryID in
 	return Branch{Name: response.Name, SHA: response.Commit.SHA, Protected: response.Protected}, nil
 }
 
-func (c *Client) Tree(ctx context.Context, accessToken string, repositoryID int64, sha string) (Tree, error) {
-	if !validSecret(accessToken) || repositoryID < 1 || !validSHA(sha) {
+func (c *Client) Tree(ctx context.Context, accessToken, owner, repository, sha string) (Tree, error) {
+	repositoryEndpoint, err := canonicalRepositoryEndpoint(owner, repository)
+	if !validSecret(accessToken) || err != nil || !validSHA(sha) {
 		return Tree{}, &Error{Code: "invalid_request"}
 	}
-	endpoint := APIOrigin + "/repositories/" + strconv.FormatInt(repositoryID, 10) + "/git/trees/" + sha + "?recursive=1"
+	endpoint := repositoryEndpoint + "/git/trees/" + sha + "?recursive=1"
 	var response struct {
 		Truncated bool `json:"truncated"`
 		Tree      []struct {
@@ -456,15 +492,16 @@ func (c *Client) Tree(ctx context.Context, accessToken string, repositoryID int6
 	return result, nil
 }
 
-func (c *Client) Content(ctx context.Context, accessToken string, repositoryID int64, path, sha string) ([]byte, error) {
-	if !validSecret(accessToken) || repositoryID < 1 || !validRepositoryPath(path) || !validSHA(sha) {
+func (c *Client) Content(ctx context.Context, accessToken, owner, repository, path, sha string) ([]byte, error) {
+	repositoryEndpoint, err := canonicalRepositoryEndpoint(owner, repository)
+	if !validSecret(accessToken) || err != nil || !validRepositoryPath(path) || !validSHA(sha) {
 		return nil, &Error{Code: "invalid_request"}
 	}
 	segments := strings.Split(path, "/")
 	for index := range segments {
 		segments[index] = url.PathEscape(segments[index])
 	}
-	endpoint := APIOrigin + "/repositories/" + strconv.FormatInt(repositoryID, 10) + "/contents/" + strings.Join(segments, "/") + "?ref=" + url.QueryEscape(sha)
+	endpoint := repositoryEndpoint + "/contents/" + strings.Join(segments, "/") + "?ref=" + url.QueryEscape(sha)
 	var response struct {
 		Type     string `json:"type"`
 		Encoding string `json:"encoding"`
@@ -499,10 +536,41 @@ type repositoryResponse struct {
 }
 
 func validateRepository(value repositoryResponse) (Repository, error) {
-	if value.ID < 1 || !validASCII(value.Owner.Login, 1, 255) || !validASCII(value.Name, 1, 255) || !validBranch(value.DefaultBranch) {
+	if value.ID < 1 || !validRepositoryOwner(value.Owner.Login) || !validRepositoryName(value.Name) || !validBranch(value.DefaultBranch) {
 		return Repository{}, &Error{Code: "invalid_response"}
 	}
 	return Repository{ID: value.ID, Owner: value.Owner.Login, Name: value.Name, DefaultBranch: value.DefaultBranch, Private: value.Private, Archived: value.Archived, Disabled: value.Disabled}, nil
+}
+
+func canonicalRepositoryEndpoint(owner, repository string) (string, error) {
+	if !validRepositoryOwner(owner) || !validRepositoryName(repository) {
+		return "", errors.New("invalid repository identity")
+	}
+	return APIOrigin + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repository), nil
+}
+
+func validRepositoryOwner(value string) bool {
+	if len(value) < 1 || len(value) > 39 || value[0] == '-' || value[len(value)-1] == '-' {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if (character < 'a' || character > 'z') && (character < 'A' || character > 'Z') && (character < '0' || character > '9') && character != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func validRepositoryName(value string) bool {
+	if len(value) < 1 || len(value) > 100 || value == "." || value == ".." {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if (character < 'a' || character > 'z') && (character < 'A' || character > 'Z') && (character < '0' || character > '9') && character != '-' && character != '_' && character != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 func validPage(page, perPage int) bool {

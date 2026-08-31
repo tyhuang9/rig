@@ -74,11 +74,11 @@ func (reader unreachableSourceReader) Resolve(context.Context, string, string, i
 	reader.calls.record()
 	return sourceconnections.SourceRepository{}, sourceconnections.Branch{}, errors.New("unexpected provider resolution")
 }
-func (reader unreachableSourceReader) ReadTree(context.Context, string, string, int64, string) (githubapp.Tree, error) {
+func (reader unreachableSourceReader) ReadTree(context.Context, string, string, int64, sourceconnections.SourceRepository, string) (githubapp.Tree, error) {
 	reader.calls.record()
 	return githubapp.Tree{}, errors.New("unexpected provider tree")
 }
-func (reader unreachableSourceReader) DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error) {
+func (reader unreachableSourceReader) DownloadArchive(context.Context, string, string, int64, sourceconnections.SourceRepository, string) (io.ReadCloser, error) {
 	reader.calls.record()
 	return nil, errors.New("unexpected provider archive")
 }
@@ -123,15 +123,15 @@ func (source *ownerScopedGitHubSources) ResolveHead(ctx context.Context, scope a
 	return branch.SHA, nil
 }
 
-func (source *ownerScopedGitHubSources) ReadTree(_ context.Context, owner, connection string, repository int64, sha string) (githubapp.Tree, error) {
-	if owner != source.owner || connection != source.connection || repository != source.repo || sha != source.sha {
+func (source *ownerScopedGitHubSources) ReadTree(_ context.Context, owner, connection string, installation int64, repository sourceconnections.SourceRepository, sha string) (githubapp.Tree, error) {
+	if owner != source.owner || connection != source.connection || installation != source.installation || repository.ID != source.repo || repository.Owner != "octo" || repository.Name != "app" || sha != source.sha {
 		return githubapp.Tree{}, errors.New("unexpected tree scope")
 	}
 	return githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "compose.yaml", Type: "blob", SHA: source.sha}}}, nil
 }
 
-func (source *ownerScopedGitHubSources) DownloadArchive(_ context.Context, owner, connection string, repository int64, sha string) (io.ReadCloser, error) {
-	if owner != source.owner || connection != source.connection || repository != source.repo || sha != source.sha {
+func (source *ownerScopedGitHubSources) DownloadArchive(_ context.Context, owner, connection string, installation int64, repository sourceconnections.SourceRepository, sha string) (io.ReadCloser, error) {
+	if owner != source.owner || connection != source.connection || installation != source.installation || repository.ID != source.repo || repository.Owner != "octo" || repository.Name != "app" || sha != source.sha {
 		return nil, errors.New("unexpected archive scope")
 	}
 	source.mu.Lock()

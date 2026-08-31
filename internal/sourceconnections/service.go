@@ -22,14 +22,14 @@ type Provider interface {
 type repositoryProvider interface {
 	Repositories(context.Context, string, int64, int, int) (githubapp.RepositoryPage, error)
 	Repository(context.Context, string, int64, int64) (githubapp.Repository, error)
-	Branches(context.Context, string, int64, int, int) (githubapp.BranchPage, error)
-	Branch(context.Context, string, int64, string) (githubapp.Branch, error)
-	Tree(context.Context, string, int64, string) (githubapp.Tree, error)
-	Content(context.Context, string, int64, string, string) ([]byte, error)
+	Branches(context.Context, string, string, string, int, int) (githubapp.BranchPage, error)
+	Branch(context.Context, string, string, string, string) (githubapp.Branch, error)
+	Tree(context.Context, string, string, string, string) (githubapp.Tree, error)
+	Content(context.Context, string, string, string, string, string) ([]byte, error)
 }
 
 type archiveProvider interface {
-	Archive(context.Context, string, int64, string) (io.ReadCloser, error)
+	Archive(context.Context, string, string, string, string) (io.ReadCloser, error)
 }
 
 type Error struct {
@@ -62,6 +62,13 @@ func NewService(repository *Repository, provider Provider, credentials Credentia
 
 func (service *Service) ProviderEnabled() bool {
 	return service.provider != nil && service.appSlug != ""
+}
+
+func (service *Service) InstallURL() string {
+	if !service.ProviderEnabled() {
+		return ""
+	}
+	return githubapp.WebOrigin + "/apps/" + service.appSlug + "/installations/new"
 }
 
 func (service *Service) List(ctx context.Context, owner string) ([]Connection, error) {
@@ -98,7 +105,7 @@ func (service *Service) Start(ctx context.Context, owner string) (DeviceStart, e
 	}
 	return DeviceStart{
 		ConnectionID: connection.ID, UserCode: authorization.UserCode, VerificationURI: githubapp.VerificationURI,
-		InstallURL: githubapp.WebOrigin + "/apps/" + service.appSlug + "/installations/new", ExpiresAt: expiresAt, PollInterval: authorization.Interval,
+		InstallURL: service.InstallURL(), ExpiresAt: expiresAt, PollInterval: authorization.Interval,
 	}, nil
 }
 
@@ -294,7 +301,7 @@ func (service *Service) Repositories(ctx context.Context, owner, id string, inst
 		return err
 	})
 	if err != nil {
-		return RepositoryPage{}, sourceOperationError(err, true)
+		return RepositoryPage{}, sourceOperationError(err)
 	}
 	result := RepositoryPage{Page: page, PerPage: perPage, TotalCount: providerPage.TotalCount, Repositories: make([]SourceRepository, 0, len(providerPage.Repositories))}
 	for _, item := range providerPage.Repositories {
@@ -311,23 +318,23 @@ func (service *Service) Repository(ctx context.Context, owner, id string, instal
 		return err
 	})
 	if err != nil {
-		return SourceRepository{}, sourceOperationError(err, true)
+		return SourceRepository{}, sourceOperationError(err)
 	}
-	return SourceRepository{ID: item.ID, Owner: item.Owner, Name: item.Name, DefaultBranch: item.DefaultBranch, Private: item.Private, Archived: item.Archived, Disabled: item.Disabled}, nil
+	return sourceRepository(item), nil
 }
 
 func (service *Service) Branches(ctx context.Context, owner, id string, installationID, repositoryID int64, page, perPage int) (BranchPage, error) {
-	if _, err := service.Repository(ctx, owner, id, installationID, repositoryID); err != nil {
-		return BranchPage{}, err
-	}
 	var providerPage githubapp.BranchPage
 	err := service.withAccess(ctx, owner, id, func(provider repositoryProvider, token string) error {
-		var err error
-		providerPage, err = provider.Branches(ctx, token, repositoryID, page, perPage)
+		repository, err := provider.Repository(ctx, token, installationID, repositoryID)
+		if err != nil {
+			return err
+		}
+		providerPage, err = provider.Branches(ctx, token, repository.Owner, repository.Name, page, perPage)
 		return err
 	})
 	if err != nil {
-		return BranchPage{}, sourceOperationError(err, false)
+		return BranchPage{}, sourceOperationError(err)
 	}
 	result := BranchPage{Page: page, PerPage: perPage, Branches: make([]Branch, 0, len(providerPage.Branches))}
 	for _, item := range providerPage.Branches {
@@ -337,44 +344,51 @@ func (service *Service) Branches(ctx context.Context, owner, id string, installa
 }
 
 func (service *Service) Resolve(ctx context.Context, owner, id string, installationID, repositoryID int64, branch string) (SourceRepository, Branch, error) {
-	repository, err := service.Repository(ctx, owner, id, installationID, repositoryID)
-	if err != nil {
-		return SourceRepository{}, Branch{}, err
-	}
+	var repository githubapp.Repository
 	var resolved githubapp.Branch
-	err = service.withAccess(ctx, owner, id, func(provider repositoryProvider, token string) error {
-		var providerErr error
-		resolved, providerErr = provider.Branch(ctx, token, repositoryID, branch)
-		return providerErr
-	})
-	if err != nil {
-		return SourceRepository{}, Branch{}, sourceOperationError(err, false)
-	}
-	return repository, Branch{Name: resolved.Name, SHA: resolved.SHA, Protected: resolved.Protected}, nil
-}
-
-func (service *Service) ReadTree(ctx context.Context, owner, id string, repositoryID int64, sha string) (githubapp.Tree, error) {
-	var result githubapp.Tree
 	err := service.withAccess(ctx, owner, id, func(provider repositoryProvider, token string) error {
 		var err error
-		result, err = provider.Tree(ctx, token, repositoryID, sha)
+		repository, err = provider.Repository(ctx, token, installationID, repositoryID)
+		if err != nil {
+			return err
+		}
+		resolved, err = provider.Branch(ctx, token, repository.Owner, repository.Name, branch)
 		return err
 	})
 	if err != nil {
-		return githubapp.Tree{}, sourceOperationError(err, false)
+		return SourceRepository{}, Branch{}, sourceOperationError(err)
+	}
+	return sourceRepository(repository), Branch{Name: resolved.Name, SHA: resolved.SHA, Protected: resolved.Protected}, nil
+}
+
+func (service *Service) ReadTree(ctx context.Context, owner, id string, installationID int64, repository SourceRepository, sha string) (githubapp.Tree, error) {
+	var result githubapp.Tree
+	err := service.withAccess(ctx, owner, id, func(provider repositoryProvider, token string) error {
+		canonical, err := provider.Repository(ctx, token, installationID, repository.ID)
+		if err != nil {
+			return err
+		}
+		result, err = provider.Tree(ctx, token, canonical.Owner, canonical.Name, sha)
+		return err
+	})
+	if err != nil {
+		return githubapp.Tree{}, sourceOperationError(err)
 	}
 	return result, nil
 }
 
-func (service *Service) ReadContent(ctx context.Context, owner, id string, repositoryID int64, path, sha string) ([]byte, error) {
+func (service *Service) ReadContent(ctx context.Context, owner, id string, installationID int64, repository SourceRepository, path, sha string) ([]byte, error) {
 	var result []byte
 	err := service.withAccess(ctx, owner, id, func(provider repositoryProvider, token string) error {
-		var err error
-		result, err = provider.Content(ctx, token, repositoryID, path, sha)
+		canonical, err := provider.Repository(ctx, token, installationID, repository.ID)
+		if err != nil {
+			return err
+		}
+		result, err = provider.Content(ctx, token, canonical.Owner, canonical.Name, path, sha)
 		return err
 	})
 	if err != nil {
-		return nil, sourceOperationError(err, false)
+		return nil, sourceOperationError(err)
 	}
 	return result, nil
 }
@@ -382,24 +396,31 @@ func (service *Service) ReadContent(ctx context.Context, owner, id string, repos
 // DownloadArchive opens a short-lived, authenticated archive stream for an
 // immutable commit. Callers must close the result promptly and never retain
 // the access token or provider response metadata.
-func (service *Service) DownloadArchive(ctx context.Context, owner, id string, repositoryID int64, sha string) (io.ReadCloser, error) {
+func (service *Service) DownloadArchive(ctx context.Context, owner, id string, installationID int64, repository SourceRepository, sha string) (io.ReadCloser, error) {
 	provider, ok := service.provider.(archiveProvider)
 	if !ok {
 		return nil, &Error{Code: "provider_unavailable"}
 	}
 	var result io.ReadCloser
-	err := service.withAccess(ctx, owner, id, func(_ repositoryProvider, token string) error {
-		var providerErr error
-		result, providerErr = provider.Archive(ctx, token, repositoryID, sha)
-		return providerErr
+	err := service.withAccess(ctx, owner, id, func(repositoryProvider repositoryProvider, token string) error {
+		canonical, err := repositoryProvider.Repository(ctx, token, installationID, repository.ID)
+		if err != nil {
+			return err
+		}
+		result, err = provider.Archive(ctx, token, canonical.Owner, canonical.Name, sha)
+		return err
 	})
 	if err != nil {
-		return nil, sourceOperationError(err, true)
+		return nil, sourceOperationError(err)
 	}
 	if result == nil {
 		return nil, &Error{Code: "provider_unavailable"}
 	}
 	return result, nil
+}
+
+func sourceRepository(item githubapp.Repository) SourceRepository {
+	return SourceRepository{ID: item.ID, Owner: item.Owner, Name: item.Name, DefaultBranch: item.DefaultBranch, Private: item.Private, Archived: item.Archived, Disabled: item.Disabled}
 }
 
 func (service *Service) withAccess(ctx context.Context, owner, id string, operation func(repositoryProvider, string) error) error {
@@ -434,15 +455,12 @@ func (service *Service) withAccess(ctx context.Context, owner, id string, operat
 	return err
 }
 
-func sourceOperationError(err error, accessLoss bool) error {
+func sourceOperationError(err error) error {
 	var serviceErr *Error
 	if errors.As(err, &serviceErr) {
 		return err
 	}
 	if githubapp.IsCode(err, "not_found") || githubapp.IsCode(err, "forbidden") {
-		if accessLoss {
-			return &Error{Code: "source_access_lost"}
-		}
 		return &Error{Code: "invalid_source"}
 	}
 	if githubapp.IsCode(err, "response_too_large") {

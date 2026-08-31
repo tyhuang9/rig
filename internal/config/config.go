@@ -40,6 +40,8 @@ const (
 	minReleaseWorkspaceQuotaBytes      = int64(1 << 20)
 	maxReleaseWorkspacePerAppBytes     = int64(1 << 40)
 	maxReleaseWorkspaceGlobalBytes     = int64(16 << 40)
+	officialGitHubClientID             = "Iv23liDUN8TZv2ZW9Hjn"
+	officialGitHubAppSlug              = "rig-deployment-connector"
 )
 
 var (
@@ -62,6 +64,8 @@ func Defaults() Config {
 		ComposeWaitTimeout:          2 * time.Minute,
 		ReleaseWorkspacePerAppBytes: defaultReleaseWorkspacePerAppBytes,
 		ReleaseWorkspaceGlobalBytes: defaultReleaseWorkspaceGlobalBytes,
+		GitHubClientID:              officialGitHubClientID,
+		GitHubAppSlug:               officialGitHubAppSlug,
 	}
 }
 
@@ -81,13 +85,19 @@ func FromFlags(args []string) (Config, error) {
 	fs.Int64Var(&c.ReleaseWorkspacePerAppBytes, "release-workspace-per-app-bytes", c.ReleaseWorkspacePerAppBytes, "maximum retained release workspace bytes per application")
 	fs.Int64Var(&c.ReleaseWorkspaceGlobalBytes, "release-workspace-global-bytes", c.ReleaseWorkspaceGlobalBytes, "maximum retained release workspace bytes across applications")
 	fs.BoolVar(&c.CaddyManagement, "caddy-management", false, "enable Caddy management")
-	fs.StringVar(&c.GitHubClientID, "github-client-id", "", "public GitHub App client ID")
-	fs.StringVar(&c.GitHubAppSlug, "github-app-slug", "", "public GitHub App slug")
+	githubConnections := true
+	fs.BoolVar(&githubConnections, "github-connections", githubConnections, "enable GitHub connections")
+	fs.StringVar(&c.GitHubClientID, "github-client-id", c.GitHubClientID, "public GitHub App client ID override")
+	fs.StringVar(&c.GitHubAppSlug, "github-app-slug", c.GitHubAppSlug, "public GitHub App slug override")
 	fs.BoolVar(&c.ControllerRelay, "controller-relay", false, "enable controller relay lifecycle")
 	fs.StringVar(&c.RelayOrigin, "relay-origin", "", "canonical HTTPS controller relay origin")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
+	provided := make(map[string]bool)
+	fs.Visit(func(flag *flag.Flag) {
+		provided[flag.Name] = true
+	})
 	if c.Mode != "controller-agent" && c.Mode != "agent" {
 		return Config{}, errors.New("mode must be controller-agent or agent")
 	}
@@ -128,10 +138,23 @@ func FromFlags(args []string) (Config, error) {
 		c.ReleaseWorkspacePerAppBytes > c.ReleaseWorkspaceGlobalBytes {
 		return Config{}, errors.New("release workspace quotas are outside supported bounds")
 	}
-	if (c.GitHubClientID == "") != (c.GitHubAppSlug == "") {
-		return Config{}, errors.New("github-client-id and github-app-slug must be provided together")
+	clientOverride := provided["github-client-id"]
+	slugOverride := provided["github-app-slug"]
+	if !githubConnections {
+		if clientOverride || slugOverride {
+			return Config{}, errors.New("github-connections=false cannot be combined with GitHub App overrides")
+		}
+		if c.ControllerRelay {
+			return Config{}, errors.New("controller relay requires GitHub connections")
+		}
+		c.GitHubClientID = ""
+		c.GitHubAppSlug = ""
+		return c, nil
 	}
-	if c.GitHubClientID != "" && (!githubClientIDPattern.MatchString(c.GitHubClientID) || !githubAppSlugPattern.MatchString(c.GitHubAppSlug)) {
+	if clientOverride != slugOverride {
+		return Config{}, errors.New("github-client-id and github-app-slug overrides must be provided together")
+	}
+	if !githubClientIDPattern.MatchString(c.GitHubClientID) || !githubAppSlugPattern.MatchString(c.GitHubAppSlug) {
 		return Config{}, errors.New("GitHub App client ID or slug is invalid")
 	}
 	return c, nil

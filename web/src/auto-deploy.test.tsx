@@ -56,7 +56,7 @@ describe("AutoDeployPanel", () => {
   });
 
   it.each([
-    ["GitHub connections are unavailable on this controller.", { githubConnections: false }],
+    ["GitHub connections are disabled by the administrator on this controller.", { githubConnections: false }],
     ["Connect the GitHub source used by this application.", {}],
   ])("blocks enabling for gate prerequisite %s", async (reason, props) => {
     if (reason === "Connect the GitHub source used by this application.") vi.mocked(api.sourceConnections).mockResolvedValue({ items: [] } as never);
