@@ -26,12 +26,13 @@ import (
 )
 
 const (
-	defaultCommandTimeout  = 30 * time.Second
-	defaultHealthTimeout   = 2 * time.Minute
-	defaultHealthPoll      = time.Second
-	defaultRuntimeOutput   = 64 << 10
-	defaultReplacementDisk = 256 << 20
-	containerUser          = "node"
+	defaultCommandTimeout   = 30 * time.Second
+	defaultHealthTimeout    = 2 * time.Minute
+	defaultHealthPoll       = time.Second
+	defaultRuntimeOutput    = 64 << 10
+	defaultReplacementDisk  = 256 << 20
+	replacementDiskHeadroom = 64 << 20
+	containerUser           = "node"
 )
 
 const (
@@ -89,6 +90,9 @@ func NewEngine(runner runtimeprocess.CommandRunner, environment EnvironmentStage
 	}
 	if options.ReplacementDiskBytes == 0 {
 		options.ReplacementDiskBytes = defaultReplacementDisk
+	}
+	if minimum := minimumReplacementDiskBytes(options.Limits); options.ReplacementDiskBytes < minimum {
+		options.ReplacementDiskBytes = minimum
 	}
 	if !validEngineOptions(options) {
 		return nil, errors.New("generated runtime options are invalid")
@@ -591,41 +595,45 @@ type imageInspection struct {
 }
 
 type containerInspection struct {
-	ID                string                     `json:"id"`
-	Name              string                     `json:"name"`
-	Image             string                     `json:"image"`
-	Labels            map[string]string          `json:"labels"`
-	User              string                     `json:"user"`
-	WorkingDirectory  string                     `json:"workingDir"`
-	Command           []string                   `json:"cmd"`
-	HealthTest        []string                   `json:"healthTest"`
-	HealthInterval    int64                      `json:"healthInterval"`
-	HealthTimeout     int64                      `json:"healthTimeout"`
-	HealthStartPeriod int64                      `json:"healthStartPeriod"`
-	HealthRetries     int                        `json:"healthRetries"`
-	Memory            int64                      `json:"memory"`
-	MemorySwap        int64                      `json:"memorySwap"`
-	NanoCPUs          int64                      `json:"nanoCpus"`
-	PIDs              int64                      `json:"pidsLimit"`
-	Ulimits           []ulimitInspection         `json:"ulimits"`
-	Init              bool                       `json:"init"`
-	NetworkMode       string                     `json:"networkMode"`
-	ReadonlyRootfs    bool                       `json:"readonlyRootfs"`
-	Privileged        bool                       `json:"privileged"`
-	CapAdd            []string                   `json:"capAdd"`
-	CapDrop           []string                   `json:"capDrop"`
-	SecurityOptions   []string                   `json:"securityOpt"`
-	Binds             []string                   `json:"binds"`
-	PortBindings      map[string]json.RawMessage `json:"portBindings"`
-	Tmpfs             map[string]string          `json:"tmpfs"`
-	LogType           string                     `json:"logType"`
-	LogConfig         map[string]string          `json:"logConfig"`
-	Restart           string                     `json:"restart"`
-	Mounts            []mountInspection          `json:"mounts"`
-	Running           bool                       `json:"running"`
-	ExitCode          int                        `json:"exitCode"`
-	Health            string                     `json:"health"`
-	Networks          map[string]json.RawMessage `json:"networks"`
+	ID                string                                 `json:"id"`
+	Name              string                                 `json:"name"`
+	Image             string                                 `json:"image"`
+	Labels            map[string]string                      `json:"labels"`
+	User              string                                 `json:"user"`
+	WorkingDirectory  string                                 `json:"workingDir"`
+	Command           []string                               `json:"cmd"`
+	HealthTest        []string                               `json:"healthTest"`
+	HealthInterval    int64                                  `json:"healthInterval"`
+	HealthTimeout     int64                                  `json:"healthTimeout"`
+	HealthStartPeriod int64                                  `json:"healthStartPeriod"`
+	HealthRetries     int                                    `json:"healthRetries"`
+	Memory            int64                                  `json:"memory"`
+	MemorySwap        int64                                  `json:"memorySwap"`
+	NanoCPUs          int64                                  `json:"nanoCpus"`
+	PIDs              int64                                  `json:"pidsLimit"`
+	Ulimits           []ulimitInspection                     `json:"ulimits"`
+	Init              bool                                   `json:"init"`
+	NetworkMode       string                                 `json:"networkMode"`
+	ReadonlyRootfs    bool                                   `json:"readonlyRootfs"`
+	Privileged        bool                                   `json:"privileged"`
+	CapAdd            []string                               `json:"capAdd"`
+	CapDrop           []string                               `json:"capDrop"`
+	SecurityOptions   []string                               `json:"securityOpt"`
+	Binds             []string                               `json:"binds"`
+	PortBindings      map[string]json.RawMessage             `json:"portBindings"`
+	Tmpfs             map[string]string                      `json:"tmpfs"`
+	LogType           string                                 `json:"logType"`
+	LogConfig         map[string]string                      `json:"logConfig"`
+	Restart           string                                 `json:"restart"`
+	Mounts            []mountInspection                      `json:"mounts"`
+	Running           bool                                   `json:"running"`
+	ExitCode          int                                    `json:"exitCode"`
+	Health            string                                 `json:"health"`
+	Networks          map[string]networkAttachmentInspection `json:"networks"`
+}
+
+type networkAttachmentInspection struct {
+	Aliases []string `json:"Aliases"`
 }
 
 type mountInspection struct {
@@ -656,6 +664,23 @@ func validEngineOptions(options EngineOptions) bool {
 		return false
 	}
 	return options.ReplacementDiskBytes >= 64<<20 && options.ReplacementDiskBytes <= 64<<30
+}
+
+func minimumReplacementDiskBytes(limits ContainerLimits) uint64 {
+	megabytes := uint64(0)
+	switch limits.LogSize {
+	case "1m":
+		megabytes = 1
+	case "5m":
+		megabytes = 5
+	case "10m":
+		megabytes = 10
+	case "20m":
+		megabytes = 20
+	case "50m":
+		megabytes = 50
+	}
+	return megabytes*uint64(limits.LogFiles)*(1<<20) + replacementDiskHeadroom
 }
 
 func validCandidateSpec(spec CandidateSpec) bool {
@@ -817,7 +842,8 @@ func matchesCandidateHardening(container containerInspection, candidate Candidat
 		return false
 	}
 	tmpfs, exists := container.Tmpfs["/tmp"]
-	return exists && containsAllCommaValues(tmpfs, []string{"rw", "noexec", "nosuid", "nodev", "size=" + strconv.FormatInt(limits.TmpfsBytes, 10)}) && len(container.Networks) == 1 && container.Networks[candidate.NetworkName] != nil
+	attachment, attached := container.Networks[candidate.NetworkName]
+	return exists && len(container.Tmpfs) == 1 && exactCommaValues(tmpfs, []string{"rw", "noexec", "nosuid", "nodev", "size=" + strconv.FormatInt(limits.TmpfsBytes, 10)}) && len(container.Networks) == 1 && attached && containsExact(attachment.Aliases, candidate.NetworkAlias)
 }
 
 func onlyRuntimeTmpfsMount(mounts []mountInspection) bool {
@@ -843,7 +869,8 @@ func matchesCandidateOwnership(container containerInspection, candidate Candidat
 		"io.rig.artifact": candidate.ArtifactID, "io.rig.plan": candidate.DeploymentPlanRevisionID,
 		"io.rig.component": candidate.Component, "io.rig.slot": string(candidate.Slot),
 	}
-	return container.ID == candidate.ContainerID && strings.TrimPrefix(container.Name, "/") == candidate.ContainerName && containsLabels(container.Labels, expected) && container.NetworkMode == candidate.NetworkName && container.Networks[candidate.NetworkName] != nil
+	_, attached := container.Networks[candidate.NetworkName]
+	return container.ID == candidate.ContainerID && strings.TrimPrefix(container.Name, "/") == candidate.ContainerName && containsLabels(container.Labels, expected) && container.NetworkMode == candidate.NetworkName && attached
 }
 
 func containsLabels(actual, expected map[string]string) bool {
@@ -864,17 +891,30 @@ func containsFold(values []string, expected string) bool {
 	return false
 }
 
-func containsAllCommaValues(value string, expected []string) bool {
-	actual := map[string]bool{}
-	for _, item := range strings.Split(value, ",") {
-		actual[item] = true
+func exactCommaValues(value string, expected []string) bool {
+	parts := strings.Split(value, ",")
+	if len(parts) != len(expected) {
+		return false
+	}
+	actual := make(map[string]int, len(parts))
+	for _, item := range parts {
+		actual[item]++
 	}
 	for _, item := range expected {
-		if !actual[item] {
+		if actual[item] != 1 {
 			return false
 		}
 	}
 	return true
+}
+
+func containsExact(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedKeys(values map[string]string) []string {

@@ -276,6 +276,65 @@ func TestGeneratedRuntimeRejectsCapacityBeforeDockerMutation(t *testing.T) {
 	}
 }
 
+func TestGeneratedRuntimeDerivesDiskAdmissionFromMaximumLogs(t *testing.T) {
+	root := t.TempDir()
+	config := filepath.Join(root, "docker-config")
+	if err := os.Mkdir(config, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	spec := candidateSpec()
+	runner := &runtimeFakeRunner{run: func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		if commandKind(request.Args) != "image inspect" {
+			t.Fatalf("under-reserved replacement reached mutation: %#v", request.Args)
+		}
+		return runtimeJSON(validImageInspection(spec))
+	}}
+	limits := defaultLimits()
+	limits.LogSize = "50m"
+	limits.LogFiles = 10
+	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 550 << 20}}, EngineOptions{
+		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root,
+		CommandTimeout: time.Second, Limits: limits, ReplacementDiskBytes: 64 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.CreateInactiveCandidate(context.Background(), spec); !IsCode(err, DiagnosticInsufficientReplacementSpace) {
+		t.Fatalf("expected derived disk capacity rejection, got %v", err)
+	}
+	if engine.options.ReplacementDiskBytes != 564<<20 {
+		t.Fatalf("derived replacement disk = %d, want %d", engine.options.ReplacementDiskBytes, uint64(564<<20))
+	}
+}
+
+func TestGeneratedRuntimeHardeningRequiresAliasAndExactTmpfsPolicy(t *testing.T) {
+	spec := candidateSpec()
+	candidate := candidateForSpec(spec)
+	tests := []struct {
+		name   string
+		mutate func(*containerInspection)
+	}{
+		{name: "missing network alias", mutate: func(container *containerInspection) {
+			container.Networks[candidate.NetworkName] = networkAttachmentInspection{Aliases: []string{"other"}}
+		}},
+		{name: "contradictory tmpfs option", mutate: func(container *containerInspection) {
+			container.Tmpfs["/tmp"] += ",exec"
+		}},
+		{name: "additional tmpfs", mutate: func(container *containerInspection) {
+			container.Tmpfs["/run"] = "rw,nosuid,nodev"
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			container := hardenedInspection(spec, defaultLimits())
+			test.mutate(&container)
+			if matchesCandidateHardening(container, candidate, defaultLimits()) {
+				t.Fatal("unsafe hardening inspection was accepted")
+			}
+		})
+	}
+}
+
 func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testing.T) {
 	root := t.TempDir()
 	config := filepath.Join(root, "docker-config")
@@ -550,7 +609,7 @@ func hardenedInspection(spec CandidateSpec, limits ContainerLimits) containerIns
 		NetworkMode: network, ReadonlyRootfs: true, Init: true, CapDrop: []string{"ALL"}, SecurityOptions: []string{"no-new-privileges:true"}, Ulimits: []ulimitInspection{{Name: "nofile", Soft: 1024, Hard: 1024}},
 		Tmpfs:   map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=" + stringInt(limits.TmpfsBytes)},
 		LogType: "local", LogConfig: map[string]string{"max-size": limits.LogSize, "max-file": stringInt(int64(limits.LogFiles))}, Restart: "no",
-		Mounts: []mountInspection{{Type: "tmpfs", Destination: "/tmp", RW: true}}, Networks: map[string]json.RawMessage{network: json.RawMessage(`{}`)},
+		Mounts: []mountInspection{{Type: "tmpfs", Destination: "/tmp", RW: true}}, Networks: map[string]networkAttachmentInspection{network: {Aliases: []string{containerAlias(spec.ComponentName, slot)}}},
 	}
 }
 
