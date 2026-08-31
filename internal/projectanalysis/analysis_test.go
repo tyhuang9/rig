@@ -66,8 +66,8 @@ func TestAnalyzeViteAndExpressWorkspace(t *testing.T) {
 		t.Fatalf("candidate count = %d, want 1: %#v", len(got.Candidates), got.Candidates)
 	}
 	plan := got.Candidates[0]
-	if plan.Status != StatusReady || plan.Kind != PlanKindJavaScript {
-		t.Fatalf("status/kind = %q/%q, want ready/javascript: %#v", plan.Status, plan.Kind, plan)
+	if plan.Status != StatusNeedsInput || plan.Kind != PlanKindJavaScript {
+		t.Fatalf("status/kind = %q/%q, want needs_input/javascript: %#v", plan.Status, plan.Kind, plan)
 	}
 	if plan.PackageManager.Name != "pnpm" || plan.Install.Command != "corepack pnpm install --frozen-lockfile" {
 		t.Fatalf("package manager/install = %#v / %#v", plan.PackageManager, plan.Install)
@@ -92,6 +92,9 @@ func TestAnalyzeViteAndExpressWorkspace(t *testing.T) {
 	if api.Migration == nil || api.Migration.Command != "pnpm exec prisma migrate deploy" || api.MigrationFingerprint == "" {
 		t.Fatalf("migration = %#v", api.Migration)
 	}
+	if !slices.Contains(plan.MissingFields, "components."+api.ID+".internal_port") || !slices.Contains(plan.MissingFields, "components."+api.ID+".health_probe") {
+		t.Fatalf("server network review fields = %#v", plan.MissingFields)
+	}
 	if plan.Digest == "" {
 		t.Fatal("candidate digest is empty")
 	}
@@ -108,7 +111,7 @@ func TestAnalyzeNestUsesStartProdAndPinnedNodeFallback(t *testing.T) {
 	})
 	plan := got.Candidates[0]
 	component := plan.Components[0]
-	if plan.Status != StatusReady || component.Framework != FrameworkNestJS {
+	if plan.Status != StatusNeedsInput || component.Framework != FrameworkNestJS {
 		t.Fatalf("plan = %#v", plan)
 	}
 	if component.Run == nil || component.Run.Command != "npm run start:prod" {
@@ -116,6 +119,9 @@ func TestAnalyzeNestUsesStartProdAndPinnedNodeFallback(t *testing.T) {
 	}
 	if plan.NodeVersion.Value != PinnedNodeLTS || plan.NodeVersion.Provenance != ProvenanceRuntimeDefault {
 		t.Fatalf("node fallback = %#v", plan.NodeVersion)
+	}
+	if !slices.Contains(plan.MissingFields, "components."+component.ID+".internal_port") || !slices.Contains(plan.MissingFields, "components."+component.ID+".health_probe") {
+		t.Fatalf("server network review fields = %#v", plan.MissingFields)
 	}
 }
 
@@ -126,6 +132,30 @@ func TestAnalyzeNeedsInputForConflictingLockfiles(t *testing.T) {
 		"yarn.lock":         []byte("# yarn lockfile v1\n"),
 	})
 	plan := got.Candidates[0]
+	if plan.Status != StatusNeedsInput || !slices.Contains(plan.MissingFields, FieldPackageManager) {
+		t.Fatalf("plan = %#v", plan)
+	}
+	assertFinding(t, plan.Findings, "conflicting_lockfiles")
+}
+
+func TestAnalyzeNeedsInstallReviewWithoutLockfile(t *testing.T) {
+	got := analyzeMemory(t, memoryReader{
+		"package.json": []byte(`{"packageManager":"npm@11","scripts":{"start":"node server.js"},"dependencies":{"express":"5"}}`),
+	})
+	plan := got.Candidates[0]
+	if plan.Status != StatusNeedsInput || !slices.Contains(plan.MissingFields, FieldInstallBehavior) {
+		t.Fatalf("plan = %#v", plan)
+	}
+	assertFinding(t, plan.Findings, "unlocked_install")
+}
+
+func TestAnalyzeNeedsInputForSameFamilyLockfiles(t *testing.T) {
+	contents := memoryReader{
+		"package.json":        []byte(`{"scripts":{"start":"node server.js"},"dependencies":{"express":"5"}}`),
+		"package-lock.json":   []byte(`{"lockfileVersion":3}`),
+		"npm-shrinkwrap.json": []byte(`{"lockfileVersion":3}`),
+	}
+	plan := analyzeMemory(t, contents).Candidates[0]
 	if plan.Status != StatusNeedsInput || !slices.Contains(plan.MissingFields, FieldPackageManager) {
 		t.Fatalf("plan = %#v", plan)
 	}
@@ -144,7 +174,8 @@ func TestAnalyzeNeedsInputForAmbiguousAPIsAndMissingStart(t *testing.T) {
 		t.Fatalf("status = %q", plan.Status)
 	}
 	assertFinding(t, plan.Findings, "multiple_server_components")
-	if !slices.Contains(plan.MissingFields, "components.apps-b.run") {
+	b := componentByRoot(t, plan, "apps/b")
+	if !slices.Contains(plan.MissingFields, "components."+b.ID+".run") {
 		t.Fatalf("missing fields = %#v", plan.MissingFields)
 	}
 }
@@ -160,9 +191,104 @@ func TestAnalyzeDetectsContainerCandidates(t *testing.T) {
 	if got.Candidates[0].Kind != PlanKindCompose || got.Candidates[0].ConfigPath != "compose.yaml" || got.Candidates[0].Status != StatusNeedsInput {
 		t.Fatalf("compose candidate = %#v", got.Candidates[0])
 	}
-	if got.Candidates[1].Kind != PlanKindDockerfile || got.Candidates[1].ConfigPath != "Dockerfile" || got.Candidates[1].Status != StatusNeedsInput {
+	if got.Candidates[1].Kind != PlanKindDockerfile || got.Candidates[1].ConfigPath != "Dockerfile" || got.Candidates[1].Status != StatusUnsupported {
 		t.Fatalf("docker candidate = %#v", got.Candidates[1])
 	}
+}
+
+func TestAnalyzeIncludesDeployableWorkspaceRootAndRejectsUnaccountedPackages(t *testing.T) {
+	contents := memoryReader{
+		"package.json": []byte(`{
+			"packageManager":"npm@11","workspaces":["apps/*"],
+			"scripts":{"start":"node root.js"},"dependencies":{"express":"5"}
+		}`),
+		"package-lock.json":     []byte(`{"lockfileVersion":3}`),
+		"apps/web/package.json": []byte(`{"scripts":{"build":"vite build"},"dependencies":{"vite":"6"}}`),
+	}
+	plan := analyzeMemory(t, contents).Candidates[0]
+	if len(plan.Components) != 2 {
+		t.Fatalf("root workspace component omitted: %#v", plan.Components)
+	}
+	componentByRoot(t, plan, "")
+	componentByRoot(t, plan, "apps/web")
+
+	contents["services/api/package.json"] = []byte(`{"scripts":{"start":"node api.js"},"dependencies":{"fastify":"5"}}`)
+	plan = analyzeMemory(t, contents).Candidates[0]
+	if plan.Status != StatusNeedsInput {
+		t.Fatalf("status = %q", plan.Status)
+	}
+	assertFinding(t, plan.Findings, "unaccounted_workspace_packages")
+}
+
+func TestAnalyzeUsesStableUniqueComponentIDs(t *testing.T) {
+	contents := memoryReader{
+		"package.json":        []byte(`{"packageManager":"npm@11","workspaces":["apps/*","apps_*" ]}`),
+		"package-lock.json":   []byte(`{"lockfileVersion":3}`),
+		"apps/a/package.json": []byte(`{"scripts":{"start":"node a.js"},"dependencies":{"express":"5"}}`),
+		"apps_a/package.json": []byte(`{"scripts":{"build":"vite build"},"dependencies":{"vite":"6"}}`),
+	}
+	first := analyzeMemory(t, contents).Candidates[0]
+	second := analyzeMemory(t, contents).Candidates[0]
+	if len(first.Components) != 2 || first.Components[0].ID == first.Components[1].ID {
+		t.Fatalf("component IDs collide: %#v", first.Components)
+	}
+	if first.Components[0].ID != second.Components[0].ID || first.Components[1].ID != second.Components[1].ID {
+		t.Fatalf("component IDs are unstable: %#v / %#v", first.Components, second.Components)
+	}
+}
+
+func TestAnalyzeRequiresReviewForNodeAndViteAmbiguity(t *testing.T) {
+	t.Run("conflicting node metadata", func(t *testing.T) {
+		plan := analyzeMemory(t, memoryReader{
+			"package.json":      []byte(`{"engines":{"node":">=24"},"scripts":{"start":"node server.js"},"dependencies":{"express":"5"}}`),
+			"package-lock.json": []byte(`{"lockfileVersion":3}`),
+			".nvmrc":            []byte("22\n"),
+		}).Candidates[0]
+		if plan.Status != StatusNeedsInput || !slices.Contains(plan.MissingFields, "node_version") {
+			t.Fatalf("plan = %#v", plan)
+		}
+		assertFinding(t, plan.Findings, "conflicting_node_versions")
+	})
+
+	t.Run("vite config", func(t *testing.T) {
+		plan := analyzeMemory(t, memoryReader{
+			"package.json":      []byte(`{"scripts":{"build":"vite build"},"dependencies":{"vite":"6"}}`),
+			"package-lock.json": []byte(`{"lockfileVersion":3}`),
+			"vite.config.ts":    []byte(`export default { build: { outDir: "public" } }`),
+		}).Candidates[0]
+		component := plan.Components[0]
+		if plan.Status != StatusNeedsInput || !slices.Contains(plan.MissingFields, "components."+component.ID+".role") || !slices.Contains(plan.MissingFields, "components."+component.ID+".static_output_directory") {
+			t.Fatalf("plan = %#v", plan)
+		}
+		assertFinding(t, plan.Findings, "vite_config_requires_review")
+	})
+}
+
+func TestAnalyzeDoesNotInferUndeclaredOrAmbiguousMigrationCLI(t *testing.T) {
+	t.Run("client only", func(t *testing.T) {
+		plan := analyzeMemory(t, memoryReader{
+			"package.json":         []byte(`{"scripts":{"start":"node server.js"},"dependencies":{"express":"5","@prisma/client":"6"}}`),
+			"package-lock.json":    []byte(`{"lockfileVersion":3}`),
+			"prisma/schema.prisma": []byte("model A { id Int @id }\n"),
+		}).Candidates[0]
+		if plan.Components[0].Migration != nil {
+			t.Fatalf("undeclared Prisma CLI inferred: %#v", plan.Components[0].Migration)
+		}
+	})
+
+	t.Run("multiple frameworks", func(t *testing.T) {
+		plan := analyzeMemory(t, memoryReader{
+			"package.json":            []byte(`{"scripts":{"start":"node server.js"},"dependencies":{"express":"5","prisma":"6","knex":"3"}}`),
+			"package-lock.json":       []byte(`{"lockfileVersion":3}`),
+			"prisma/schema.prisma":    []byte("model A { id Int @id }\n"),
+			"migrations/001_init.sql": []byte("select 1;\n"),
+		}).Candidates[0]
+		component := plan.Components[0]
+		if plan.Status != StatusNeedsInput || !slices.Contains(plan.MissingFields, "components."+component.ID+".migration") {
+			t.Fatalf("plan = %#v", plan)
+		}
+		assertFinding(t, plan.Findings, "multiple_migration_frameworks")
+	})
 }
 
 func TestAnalyzeIsByteStableAcrossInputOrder(t *testing.T) {
@@ -206,6 +332,40 @@ func TestMigrationContentChangeInvalidatesCandidateDigest(t *testing.T) {
 	}
 	if before.Digest == after.Digest {
 		t.Fatal("same-size migration edit did not invalidate candidate digest")
+	}
+}
+
+func TestStructuralFingerprintTracksOnlyDeploymentStructure(t *testing.T) {
+	contents := memoryReader{
+		"package.json":      []byte(`{"scripts":{"build":"vite build"},"dependencies":{"vite":"6"}}`),
+		"package-lock.json": []byte(`{"lockfileVersion":3,"packages":{}}`),
+		"src/main.ts":       []byte("console.log('one')\n"),
+	}
+	baseline := analyzeMemory(t, contents).StructuralFingerprint
+	contents["src/main.ts"] = []byte("console.log('ordinary source edit')\n")
+	if got := analyzeMemory(t, contents).StructuralFingerprint; got != baseline {
+		t.Fatalf("ordinary source edit changed structural fingerprint: %s != %s", got, baseline)
+	}
+	contents["package-lock.json"] = []byte(`{"lockfileVersion":3,"packages":{"x":{}}}`)
+	if got := analyzeMemory(t, contents).StructuralFingerprint; got != baseline {
+		t.Fatalf("lockfile content edit changed structural fingerprint: %s != %s", got, baseline)
+	}
+	contents["package.json"] = []byte(`{"scripts":{"build":"vite build --outDir public"},"dependencies":{"vite":"6"}}`)
+	if got := analyzeMemory(t, contents).StructuralFingerprint; got == baseline {
+		t.Fatal("deployment metadata edit did not change structural fingerprint")
+	}
+}
+
+func TestStructuralFingerprintTracksViteConfigurationContent(t *testing.T) {
+	contents := memoryReader{
+		"package.json":      []byte(`{"scripts":{"build":"vite build"},"dependencies":{"vite":"6"}}`),
+		"package-lock.json": []byte(`{"lockfileVersion":3}`),
+		"vite.config.ts":    []byte(`export default { build: { outDir: "dist" } }`),
+	}
+	baseline := analyzeMemory(t, contents).StructuralFingerprint
+	contents["vite.config.ts"] = []byte(`export default { build: { outDir: "public" } }`)
+	if got := analyzeMemory(t, contents).StructuralFingerprint; got == baseline {
+		t.Fatal("Vite configuration edit did not change structural fingerprint")
 	}
 }
 

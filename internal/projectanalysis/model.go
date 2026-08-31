@@ -10,14 +10,15 @@ import (
 
 const (
 	// SchemaVersion is incremented when the serialized analysis contract changes.
-	SchemaVersion = "1"
+	SchemaVersion = "2"
 
 	// PinnedNodeLTS is the deterministic fallback used when a repository does not
 	// declare a Node.js version. It must only change with a schema version change.
 	PinnedNodeLTS = "24"
 
 	// ManagedStaticServerCommand is supplied by Rig's runtime, not the repository.
-	ManagedStaticServerCommand = "rig-static --root dist --port $PORT"
+	ManagedStaticServerPort    = "8080"
+	ManagedStaticServerCommand = "rig-static --root dist --port " + ManagedStaticServerPort
 )
 
 const (
@@ -70,7 +71,10 @@ const (
 	OriginUser     = "user"
 )
 
-const FieldPackageManager = "package_manager"
+const (
+	FieldPackageManager  = "package_manager"
+	FieldInstallBehavior = "install_behavior"
+)
 
 // File describes an entry in a normalized repository snapshot. Paths must be
 // slash-separated, relative, and unique under case-insensitive comparison.

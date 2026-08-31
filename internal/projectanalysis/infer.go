@@ -56,14 +56,26 @@ func containerCandidate(kind, configPath string) DeploymentPlanCandidate {
 	if kind == PlanKindCompose {
 		label = "Compose file"
 	}
+	status := StatusNeedsInput
+	missing := []string{"container.review_approval"}
+	severity := "warning"
+	message := label + " is an advanced candidate and requires explicit review before use."
+	if kind == PlanKindDockerfile {
+		status, missing, severity = StatusUnsupported, []string{}, "error"
+		message = "Dockerfile execution is not a supported runtime strategy in this milestone."
+	}
+	advancedInputs := []AdvancedInput{{Field: "container.review_approval", Required: true, Reason: "Repository container definitions are untrusted executable build configuration."}}
+	if kind == PlanKindDockerfile {
+		advancedInputs = []AdvancedInput{}
+	}
 	return DeploymentPlanCandidate{
 		ID: "inferred:" + kind + ":" + configPath, Origin: OriginInferred,
-		Status: StatusNeedsInput, Kind: kind, RootDirectory: packageDirectory(configPath), ConfigPath: configPath,
+		Status: status, Kind: kind, RootDirectory: packageDirectory(configPath), ConfigPath: configPath,
 		Components:     []Component{},
 		Evidence:       []Evidence{{Code: kind + "_candidate", Path: configPath, Detail: label + " detected; contents were not executed or adopted as a generated build recipe."}},
-		Findings:       []Finding{{Code: "container_definition_requires_review", Severity: "warning", Message: label + " is an advanced candidate and requires explicit review before use.", Path: configPath}},
-		MissingFields:  []string{"container.review_approval"},
-		AdvancedInputs: []AdvancedInput{{Field: "container.review_approval", Required: true, Reason: "Repository container definitions are untrusted executable build configuration."}},
+		Findings:       []Finding{{Code: "container_definition_requires_review", Severity: severity, Message: message, Path: configPath}},
+		MissingFields:  missing,
+		AdvancedInputs: advancedInputs,
 	}
 }
 
@@ -129,18 +141,27 @@ func javascriptCandidates(source snapshot) []DeploymentPlanCandidate {
 	}
 
 	members := make([]packageFile, 0)
+	unmatched := make([]packageFile, 0)
 	for _, pkg := range valid {
 		if pkg.dir == "" {
 			continue
 		}
 		if matchesWorkspace(pkg.dir, patterns) {
 			members = append(members, pkg)
+		} else {
+			unmatched = append(unmatched, pkg)
 		}
 	}
-	plan := inferJavaScriptPlan(source, root, members, true)
+	packages := append([]packageFile{root}, members...)
+	plan := inferJavaScriptPlan(source, root, packages, true)
 	if len(members) == 0 {
 		plan.Status = StatusNeedsInput
 		plan.Findings = append(plan.Findings, Finding{Code: "empty_workspace", Severity: "error", Message: "Workspace patterns did not match a package manifest."})
+		plan.MissingFields = append(plan.MissingFields, "workspace.packages")
+	}
+	if len(unmatched) > 0 || len(invalid) > 0 {
+		plan.Status = StatusNeedsInput
+		plan.Findings = append(plan.Findings, Finding{Code: "unaccounted_workspace_packages", Severity: "error", Message: "Every package manifest must be included in or explicitly excluded from the deployment topology."})
 		plan.MissingFields = append(plan.MissingFields, "workspace.packages")
 	}
 	return append(invalid, plan)
@@ -157,6 +178,12 @@ func inferJavaScriptPlan(source snapshot, root packageFile, packages []packageFi
 	plan.Install = install
 	plan.Findings = append(plan.Findings, managerFindings...)
 	plan.MissingFields = append(plan.MissingFields, managerMissing...)
+	if slices.Contains(managerMissing, FieldInstallBehavior) {
+		plan.AdvancedInputs = append(plan.AdvancedInputs, AdvancedInput{
+			Field: FieldInstallBehavior, Required: true,
+			Reason: "Without a lockfile, dependency installation is not reproducible and must be explicitly accepted or replaced.",
+		})
+	}
 	plan.NodeVersion, managerFindings, managerMissing = inferNodeVersion(source, root)
 	plan.Findings = append(plan.Findings, managerFindings...)
 	plan.MissingFields = append(plan.MissingFields, managerMissing...)
@@ -181,11 +208,15 @@ func inferJavaScriptPlan(source snapshot, root packageFile, packages []packageFi
 		case ComponentWorker:
 			workerCount++
 		}
-		if component.InternalPort == nil {
-			plan.AdvancedInputs = append(plan.AdvancedInputs, AdvancedInput{Field: "components." + component.ID + ".internal_port", ComponentID: component.ID, Required: false, Reason: "The manifest does not reliably declare the application's listening port."})
+		if component.InternalPort == nil && component.Kind != ComponentWorker {
+			field := "components." + component.ID + ".internal_port"
+			plan.MissingFields = append(plan.MissingFields, field)
+			plan.AdvancedInputs = append(plan.AdvancedInputs, AdvancedInput{Field: field, ComponentID: component.ID, Required: true, Reason: "The manifest does not reliably declare the application's listening port."})
 		}
-		if component.HealthProbe == nil {
-			plan.AdvancedInputs = append(plan.AdvancedInputs, AdvancedInput{Field: "components." + component.ID + ".health_probe", ComponentID: component.ID, Required: false, Reason: "A health endpoint cannot be safely inferred from package metadata."})
+		if component.HealthProbe == nil && component.Kind != ComponentWorker {
+			field := "components." + component.ID + ".health_probe"
+			plan.MissingFields = append(plan.MissingFields, field)
+			plan.AdvancedInputs = append(plan.AdvancedInputs, AdvancedInput{Field: field, ComponentID: component.ID, Required: true, Reason: "A health endpoint cannot be safely inferred from package metadata."})
 		}
 	}
 	if len(plan.Components) == 0 {
@@ -226,9 +257,7 @@ func inferPackageManager(source snapshot, root packageFile) (PackageManager, *Co
 	}
 	lockName, lockPath := "", ""
 	if len(lockfiles) == 1 {
-		for name, file := range lockfiles {
-			lockName, lockPath = name, file
-		}
+		lockName, lockPath = lockfiles[0].manager, lockfiles[0].path
 	}
 	if metadataOK {
 		manager.Name, manager.Version = metadataName, metadataVersion
@@ -248,7 +277,10 @@ func inferPackageManager(source snapshot, root packageFile) (PackageManager, *Co
 	} else if root.manifest.PackageManager == "" {
 		manager.Name, manager.Provenance, manager.Confidence = "npm", ProvenanceRuntimeDefault, ConfidenceMedium
 		manager.Evidence = append(manager.Evidence, Evidence{Code: "npm_default", Path: root.path})
-		findings = append(findings, Finding{Code: "unlocked_install", Severity: "warning", Message: "No lockfile was detected; dependency installation is not reproducible.", Path: root.path})
+	}
+	if len(lockfiles) == 0 {
+		findings = append(findings, Finding{Code: "unlocked_install", Severity: "warning", Message: "No lockfile was detected; dependency installation is not reproducible and requires review.", Path: root.path})
+		missing = append(missing, FieldInstallBehavior)
 	}
 	if lockName == manager.Name {
 		manager.Lockfile = lockPath
@@ -263,14 +295,19 @@ func inferPackageManager(source snapshot, root packageFile) (PackageManager, *Co
 	}, findings, missing
 }
 
-func managerLockfiles(source snapshot, root string) map[string]string {
-	result := map[string]string{}
-	for name, manager := range map[string]string{
-		"package-lock.json": "npm", "npm-shrinkwrap.json": "npm", "pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn",
+type managerLockfile struct{ manager, path string }
+
+func managerLockfiles(source snapshot, root string) []managerLockfile {
+	result := []managerLockfile{}
+	for _, definition := range []managerLockfile{
+		{manager: "npm", path: "package-lock.json"},
+		{manager: "npm", path: "npm-shrinkwrap.json"},
+		{manager: "pnpm", path: "pnpm-lock.yaml"},
+		{manager: "yarn", path: "yarn.lock"},
 	} {
-		candidate := joinRoot(root, name)
+		candidate := joinRoot(root, definition.path)
 		if _, ok := source.fileSet[candidate]; ok {
-			result[manager] = candidate
+			result = append(result, managerLockfile{manager: definition.manager, path: candidate})
 		}
 	}
 	return result
@@ -324,7 +361,13 @@ func inferNodeVersion(source snapshot, root packageFile) (InferredValue, []Findi
 		if body, ok := source.contents[candidate]; ok {
 			trimmed := strings.TrimSpace(string(body))
 			if trimmed != "" {
-				hints = append(hints, struct{ path, value string }{candidate, trimmed})
+				normalized, ok := normalizeConcreteNodeVersion(trimmed)
+				if !ok {
+					findings = append(findings, Finding{Code: "invalid_node_version", Severity: "error", Message: "Node version files must contain one supported concrete version.", Path: candidate})
+					missing = append(missing, "node_version")
+					continue
+				}
+				hints = append(hints, struct{ path, value string }{candidate, normalized})
 			}
 		}
 	}
@@ -334,6 +377,11 @@ func inferNodeVersion(source snapshot, root packageFile) (InferredValue, []Findi
 		return value, findings, missing
 	}
 	if len(hints) > 0 {
+		if root.manifest.EnginesNode != "" && !engineSupportsVersion(root.manifest.EnginesNode, hints[0].value) {
+			findings = append(findings, Finding{Code: "conflicting_node_versions", Severity: "error", Message: "The concrete Node version conflicts with engines.node.", Path: root.path, Field: "engines.node"})
+			missing = append(missing, "node_version")
+			return value, findings, missing
+		}
 		value.Value, value.Provenance, value.Confidence = hints[0].value, ProvenanceRuntimeFile, ConfidenceHigh
 		value.Evidence = append(value.Evidence, Evidence{Code: "node_version_file", Path: hints[0].path, Detail: hints[0].value})
 		if root.manifest.EnginesNode != "" {
@@ -342,13 +390,109 @@ func inferNodeVersion(source snapshot, root packageFile) (InferredValue, []Findi
 		return value, findings, missing
 	}
 	if root.manifest.EnginesNode != "" {
-		value.Value, value.Provenance, value.Confidence = root.manifest.EnginesNode, ProvenanceEngineConstraint, ConfidenceHigh
+		resolved, ok := resolveEngineNodeVersion(root.manifest.EnginesNode)
+		if !ok {
+			findings = append(findings, Finding{Code: "unsupported_node_engine", Severity: "error", Message: "engines.node cannot be resolved to a supported pinned Node runtime.", Path: root.path, Field: "engines.node"})
+			missing = append(missing, "node_version")
+			return value, findings, missing
+		}
+		value.Value, value.Provenance, value.Confidence = resolved, ProvenanceEngineConstraint, ConfidenceHigh
 		value.Evidence = append(value.Evidence, Evidence{Code: "node_engine_constraint", Path: root.path, Field: "engines.node", Detail: root.manifest.EnginesNode})
 		return value, findings, missing
 	}
 	value.Value, value.Provenance, value.Confidence = PinnedNodeLTS, ProvenanceRuntimeDefault, ConfidenceMedium
 	value.Evidence = append(value.Evidence, Evidence{Code: "pinned_node_lts", Detail: PinnedNodeLTS})
 	return value, findings, missing
+}
+
+func normalizeConcreteNodeVersion(value string) (string, bool) {
+	value = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "v"))
+	parts := strings.Split(value, ".")
+	if len(parts) < 1 || len(parts) > 3 {
+		return "", false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return "", false
+		}
+		for _, character := range part {
+			if character < '0' || character > '9' {
+				return "", false
+			}
+		}
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil || !supportedNodeMajor(major) {
+		return "", false
+	}
+	return strings.Join(parts, "."), true
+}
+
+func supportedNodeMajor(major int) bool { return major == 20 || major == 22 || major == 24 }
+
+func resolveEngineNodeVersion(engine string) (string, bool) {
+	if concrete, ok := normalizeConcreteNodeVersion(engine); ok {
+		return concrete, true
+	}
+	if engineSupportsVersion(engine, PinnedNodeLTS) {
+		return PinnedNodeLTS, true
+	}
+	for _, fallback := range []string{"22", "20"} {
+		if engineSupportsVersion(engine, fallback) {
+			return fallback, true
+		}
+	}
+	return "", false
+}
+
+func engineSupportsVersion(engine, version string) bool {
+	major, err := strconv.Atoi(strings.SplitN(version, ".", 2)[0])
+	if err != nil || !supportedNodeMajor(major) {
+		return false
+	}
+	for _, clause := range strings.Split(engine, "||") {
+		clause = strings.TrimSpace(clause)
+		if clause == "" {
+			continue
+		}
+		matched := true
+		for _, token := range strings.Fields(strings.ReplaceAll(clause, " - ", " ")) {
+			token = strings.TrimSpace(token)
+			if token == "" || token == "*" {
+				continue
+			}
+			operator := "="
+			for _, prefix := range []string{">=", "<=", ">", "<", "^", "~", "="} {
+				if strings.HasPrefix(token, prefix) {
+					operator, token = prefix, strings.TrimPrefix(token, prefix)
+					break
+				}
+			}
+			token = strings.TrimPrefix(token, "v")
+			token = strings.TrimSuffix(strings.TrimSuffix(token, ".x"), ".*")
+			required, parseErr := strconv.Atoi(strings.SplitN(token, ".", 2)[0])
+			if parseErr != nil {
+				matched = false
+				break
+			}
+			switch operator {
+			case ">=":
+				matched = matched && major >= required
+			case ">":
+				matched = matched && major > required
+			case "<=":
+				matched = matched && major <= required
+			case "<":
+				matched = matched && major < required
+			default:
+				matched = matched && major == required
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }
 
 func inferComponent(source snapshot, pkg packageFile, manager PackageManager) (*Component, []Finding, []string) {
@@ -390,13 +534,19 @@ func inferComponent(source snapshot, pkg packageFile, manager PackageManager) (*
 		findings = append(findings, Finding{Code: "missing_build_script", Severity: "error", Message: "The detected framework requires an exact build script.", Path: pkg.path, Field: "scripts.build"})
 	}
 	if kind == ComponentStatic {
-		component.StaticOutputDirectory = "dist"
-		component.Run = &Command{
-			Origin: OriginInferred, Phase: "run", Command: ManagedStaticServerCommand, WorkingDirectory: pkg.dir,
-			Provenance: ProvenanceManagedRuntime, Confidence: ConfidenceHigh,
-			Evidence: []Evidence{{Code: "vite_static_output", Path: pkg.path, Detail: "dist"}},
+		output, viteFindings, viteMissing := inferViteOutput(source, pkg, component.ID)
+		component.StaticOutputDirectory = output
+		findings = append(findings, viteFindings...)
+		missing = append(missing, viteMissing...)
+		if output == "" {
+			output = "dist"
 		}
-		component.InternalPort = &InferredValue{Origin: OriginInferred, Value: "$PORT", Provenance: ProvenanceManagedRuntime, Confidence: ConfidenceHigh, Evidence: []Evidence{{Code: "managed_static_port"}}}
+		component.Run = &Command{
+			Origin: OriginInferred, Phase: "run", Command: "rig-static --root " + output + " --port " + ManagedStaticServerPort, WorkingDirectory: pkg.dir,
+			Provenance: ProvenanceManagedRuntime, Confidence: ConfidenceHigh,
+			Evidence: []Evidence{{Code: "vite_static_output", Path: pkg.path, Detail: output}},
+		}
+		component.InternalPort = &InferredValue{Origin: OriginInferred, Value: ManagedStaticServerPort, Provenance: ProvenanceManagedRuntime, Confidence: ConfidenceHigh, Evidence: []Evidence{{Code: "managed_static_port"}}}
 		component.HealthProbe = &HealthProbe{Origin: OriginInferred, Path: "/", Method: "GET", Provenance: ProvenanceManagedRuntime, Confidence: ConfidenceHigh, Evidence: []Evidence{{Code: "managed_static_root"}}}
 	} else {
 		runScript := "start"
@@ -415,9 +565,48 @@ func inferComponent(source snapshot, pkg packageFile, manager PackageManager) (*
 			findings = append(findings, Finding{Code: "missing_start_script", Severity: "error", Message: "No production start script was found.", Path: pkg.path, Field: "scripts.start"})
 		}
 	}
-	component.Migration, component.MigrationFingerprint = inferMigration(source, pkg, manager)
+	var migrationFindings []Finding
+	var migrationMissing []string
+	component.Migration, component.MigrationFingerprint, migrationFindings, migrationMissing = inferMigration(source, pkg, manager, component.ID)
+	findings = append(findings, migrationFindings...)
+	missing = append(missing, migrationMissing...)
 	component.Findings = slices.Clone(findings)
 	return component, findings, missing
+}
+
+func inferViteOutput(source snapshot, pkg packageFile, componentID string) (string, []Finding, []string) {
+	for _, name := range []string{"vite.config.js", "vite.config.mjs", "vite.config.cjs", "vite.config.ts", "vite.config.mts", "vite.config.cts"} {
+		candidate := joinRoot(pkg.dir, name)
+		if _, exists := source.fileSet[candidate]; exists {
+			return "", []Finding{{Code: "vite_config_requires_review", Severity: "error", Message: "Vite configuration may change static output or enable SSR/library mode.", Path: candidate}}, []string{
+				"components." + componentID + ".role",
+				"components." + componentID + ".static_output_directory",
+			}
+		}
+	}
+	script := strings.TrimSpace(pkg.manifest.Scripts["build"])
+	if strings.Contains(script, "--ssr") || strings.Contains(script, "--lib") || strings.Contains(script, "build --lib") {
+		return "", []Finding{{Code: "vite_non_static_build", Severity: "error", Message: "Vite SSR and library builds are not inferred as static sites.", Path: pkg.path, Field: "scripts.build"}}, []string{"components." + componentID + ".role"}
+	}
+	fields := strings.Fields(script)
+	for index, field := range fields {
+		var output string
+		switch {
+		case field == "--outDir" && index+1 < len(fields):
+			output = fields[index+1]
+		case strings.HasPrefix(field, "--outDir="):
+			output = strings.TrimPrefix(field, "--outDir=")
+		}
+		if output == "" {
+			continue
+		}
+		output = strings.Trim(output, "'\"")
+		if output == "" || strings.ContainsAny(output, "\\:") || strings.HasPrefix(output, "/") || path.Clean(output) != output || output == ".." || strings.HasPrefix(output, "../") {
+			return "", []Finding{{Code: "invalid_vite_output", Severity: "error", Message: "Vite output directory must be repository-relative.", Path: pkg.path, Field: "scripts.build"}}, []string{"components." + componentID + ".static_output_directory"}
+		}
+		return output, nil, nil
+	}
+	return "dist", nil, nil
 }
 
 func detectedFrameworks(manifest packageManifest) []string {
@@ -455,32 +644,44 @@ func scriptCommand(manager string, pkg packageFile, script, phase string) *Comma
 	}
 }
 
-func inferMigration(source snapshot, pkg packageFile, manager PackageManager) (*Command, string) {
+func inferMigration(source snapshot, pkg packageFile, manager PackageManager, componentID string) (*Command, string, []Finding, []string) {
 	type migrationKind struct{ name, dependency, command string }
 	kinds := []migrationKind{
 		{"prisma", "prisma", "prisma migrate deploy"},
 		{"drizzle", "drizzle-orm", "drizzle-kit migrate"},
 		{"knex", "knex", "knex migrate:latest"},
 	}
+	type match struct {
+		kind  migrationKind
+		files []File
+	}
+	matches := []match{}
 	for _, kind := range kinds {
-		if !hasDependency(pkg.manifest, kind.dependency) && !(kind.name == "prisma" && hasDependency(pkg.manifest, "@prisma/client")) {
+		if !hasDependency(pkg.manifest, kind.dependency) {
 			continue
 		}
 		evidenceFiles := migrationFiles(source.files, pkg.dir, kind.name)
 		if len(evidenceFiles) == 0 {
 			continue
 		}
-		evidence := []Evidence{{Code: kind.name + "_migration", Path: pkg.path, Detail: kind.dependency}}
-		for _, file := range evidenceFiles {
+		matches = append(matches, match{kind: kind, files: evidenceFiles})
+	}
+	if len(matches) > 1 {
+		return nil, "", []Finding{{Code: "multiple_migration_frameworks", Severity: "error", Message: "Multiple migration frameworks require an explicit deployment migration choice.", Path: pkg.path}}, []string{"components." + componentID + ".migration"}
+	}
+	if len(matches) == 1 {
+		matched := matches[0]
+		evidence := []Evidence{{Code: matched.kind.name + "_migration", Path: pkg.path, Detail: matched.kind.dependency}}
+		for _, file := range matched.files {
 			evidence = append(evidence, Evidence{Code: "migration_input", Path: file.Path})
 		}
-		command := packageExecCommand(manager.Name, kind.command)
+		command := packageExecCommand(manager.Name, matched.kind.command)
 		return &Command{
 			Origin: OriginInferred, Phase: "migrate", Command: command, WorkingDirectory: pkg.dir,
 			Provenance: ProvenanceFrameworkDefault, Confidence: ConfidenceHigh, Evidence: evidence,
-		}, fileFingerprint("rig-migration-v1", evidenceFiles, source.contents)
+		}, fileFingerprint("rig-migration-v1", matched.files, source.contents), nil, nil
 	}
-	return nil, ""
+	return nil, "", nil, nil
 }
 
 func migrationFiles(files []File, root, kind string) []File {
@@ -600,13 +801,11 @@ func dockerfile(name string) bool {
 }
 
 func componentID(pkg packageFile) string {
-	if pkg.manifest.Name != "" {
-		return sanitizeID(pkg.manifest.Name)
-	}
 	if pkg.dir == "" {
 		return "app"
 	}
-	return sanitizeID(pkg.dir)
+	sum := sha256.Sum256([]byte(pkg.dir))
+	return sanitizeID(pkg.dir) + "-" + hex.EncodeToString(sum[:4])
 }
 
 func sanitizeID(value string) string {

@@ -206,6 +206,9 @@ func analysisReadLimit(name string) (int64, bool) {
 	case ".nvmrc", ".node-version", "pnpm-workspace.yaml", "pnpm-workspace.yml":
 		return maxMetadataBytes, true
 	default:
+		if strings.HasPrefix(base, "vite.config.") {
+			return maxMetadataBytes, true
+		}
 		if migrationFingerprintPath(name) {
 			return maxMigrationBytes, true
 		}
@@ -236,16 +239,50 @@ func packageDirectory(manifestPath string) string {
 
 func structuralFingerprint(files []File, contents map[string][]byte) string {
 	hash := sha256.New()
-	_, _ = hash.Write([]byte("rig-source-analysis-v1\n"))
+	_, _ = hash.Write([]byte("rig-source-analysis-v2\n"))
 	for _, file := range files {
-		_, _ = fmt.Fprintf(hash, "%s\x00%d\x00", file.Path, file.Size)
-		if body, ok := contents[file.Path]; ok {
+		mode := structuralFingerprintMode(file.Path)
+		if mode == "" {
+			continue
+		}
+		_, _ = fmt.Fprintf(hash, "%s\x00%s\x00", file.Path, mode)
+		if mode == "content" {
+			body, ok := contents[file.Path]
+			if !ok {
+				// Structural files that are content-sensitive are always read by
+				// loadSnapshot. Keeping this marker makes a broken invariant fail
+				// closed by changing the fingerprint instead of silently matching.
+				_, _ = hash.Write([]byte("missing"))
+				_, _ = hash.Write([]byte{'\n'})
+				continue
+			}
 			sum := sha256.Sum256(body)
 			_, _ = hash.Write(sum[:])
 		}
 		_, _ = hash.Write([]byte{'\n'})
 	}
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func structuralFingerprintMode(name string) string {
+	base := path.Base(name)
+	switch base {
+	case "package.json", ".nvmrc", ".node-version", "pnpm-workspace.yaml", "pnpm-workspace.yml":
+		return "content"
+	case "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock":
+		// Dependency contents change on normal application edits. The selected
+		// package-manager strategy depends on lockfile identity, not its bytes.
+		return "presence"
+	case "Dockerfile", "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml":
+		return "presence"
+	}
+	if strings.HasPrefix(base, "vite.config.") {
+		return "content"
+	}
+	if migrationFingerprintPath(name) {
+		return "content"
+	}
+	return ""
 }
 
 func decodePackageManifest(name string, body []byte) (packageManifest, *Finding) {
