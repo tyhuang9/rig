@@ -17,11 +17,13 @@ import (
 )
 
 const (
-	maxSourceEntries = 20_000
-	maxPackageFiles  = 256
-	maxPackageBytes  = int64(256 << 10)
-	maxMetadataBytes = int64(64 << 10)
-	maxJSONDepth     = 64
+	maxSourceEntries  = 20_000
+	maxPackageFiles   = 256
+	maxPackageBytes   = int64(256 << 10)
+	maxMetadataBytes  = int64(64 << 10)
+	maxMigrationBytes = int64(1 << 20)
+	maxTotalReadBytes = int64(16 << 20)
+	maxJSONDepth      = 64
 )
 
 type snapshot struct {
@@ -100,6 +102,7 @@ func loadSnapshot(ctx context.Context, files []File, reader FileReader) (snapsho
 
 	contents := make(map[string][]byte)
 	packages := make([]packageFile, 0, packageCount)
+	var totalReadBytes int64
 	for _, file := range kept {
 		limit, shouldRead := analysisReadLimit(file.Path)
 		if !shouldRead {
@@ -113,6 +116,9 @@ func loadSnapshot(ctx context.Context, files []File, reader FileReader) (snapsho
 			}
 			return snapshot{}, &AnalysisError{Code: CodeFileTooLarge, Path: file.Path, Err: ErrFileTooLarge}
 		}
+		if totalReadBytes+file.Size > maxTotalReadBytes {
+			return snapshot{}, &AnalysisError{Code: CodeSourceTooLarge, Path: file.Path, Err: fmt.Errorf("analysis read budget exceeds %d bytes", maxTotalReadBytes)}
+		}
 		body, err := reader.ReadFile(ctx, file.Path, limit)
 		if err != nil {
 			code := CodeReadFailed
@@ -121,6 +127,7 @@ func loadSnapshot(ctx context.Context, files []File, reader FileReader) (snapsho
 			}
 			return snapshot{}, &AnalysisError{Code: code, Path: file.Path, Err: err}
 		}
+		totalReadBytes += int64(len(body))
 		if int64(len(body)) != file.Size {
 			return snapshot{}, &AnalysisError{Code: CodeSourceChanged, Path: file.Path, Err: fmt.Errorf("declared %d bytes, read %d", file.Size, len(body))}
 		}
@@ -199,8 +206,24 @@ func analysisReadLimit(name string) (int64, bool) {
 	case ".nvmrc", ".node-version", "pnpm-workspace.yaml", "pnpm-workspace.yml":
 		return maxMetadataBytes, true
 	default:
+		if migrationFingerprintPath(name) {
+			return maxMigrationBytes, true
+		}
 		return 0, false
 	}
+}
+
+func migrationFingerprintPath(name string) bool {
+	base := path.Base(name)
+	if base == "schema.prisma" || strings.HasPrefix(base, "drizzle.config.") || strings.HasPrefix(base, "knexfile.") {
+		return true
+	}
+	for _, segment := range strings.Split(name, "/") {
+		if segment == "migrations" || segment == "drizzle" {
+			return true
+		}
+	}
+	return false
 }
 
 func packageDirectory(manifestPath string) string {

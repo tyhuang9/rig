@@ -478,7 +478,7 @@ func inferMigration(source snapshot, pkg packageFile, manager PackageManager) (*
 		return &Command{
 			Origin: OriginInferred, Phase: "migrate", Command: command, WorkingDirectory: pkg.dir,
 			Provenance: ProvenanceFrameworkDefault, Confidence: ConfidenceHigh, Evidence: evidence,
-		}, fileFingerprint("rig-migration-v1", evidenceFiles)
+		}, fileFingerprint("rig-migration-v1", evidenceFiles, source.contents)
 	}
 	return nil, ""
 }
@@ -522,11 +522,16 @@ func packageExecCommand(manager, suffix string) string {
 	}
 }
 
-func fileFingerprint(domain string, files []File) string {
+func fileFingerprint(domain string, files []File, contents map[string][]byte) string {
 	hash := sha256.New()
 	_, _ = hash.Write([]byte(domain + "\n"))
 	for _, file := range files {
-		_, _ = fmt.Fprintf(hash, "%s\x00%d\n", file.Path, file.Size)
+		_, _ = fmt.Fprintf(hash, "%s\x00%d\x00", file.Path, file.Size)
+		if body, ok := contents[file.Path]; ok {
+			sum := sha256.Sum256(body)
+			_, _ = hash.Write(sum[:])
+		}
+		_, _ = hash.Write([]byte{'\n'})
 	}
 	return hex.EncodeToString(hash.Sum(nil))
 }

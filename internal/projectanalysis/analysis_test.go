@@ -187,6 +187,28 @@ func TestAnalyzeIsByteStableAcrossInputOrder(t *testing.T) {
 	}
 }
 
+func TestMigrationContentChangeInvalidatesCandidateDigest(t *testing.T) {
+	contents := memoryReader{
+		"package.json": []byte(`{
+			"packageManager":"npm@11.0.0",
+			"scripts":{"start":"node index.js"},
+			"dependencies":{"express":"5","prisma":"6"}
+		}`),
+		"package-lock.json":       []byte(`{"lockfileVersion":3}`),
+		"prisma/schema.prisma":    []byte("model A { id Int @id }\n"),
+		"prisma/migrations/1.sql": []byte("SELECT 1;\n"),
+	}
+	before := analyzeMemory(t, contents).Candidates[0]
+	contents["prisma/migrations/1.sql"] = []byte("SELECT 2;\n") // same byte length
+	after := analyzeMemory(t, contents).Candidates[0]
+	if before.Components[0].MigrationFingerprint == after.Components[0].MigrationFingerprint {
+		t.Fatal("same-size migration edit did not change migration fingerprint")
+	}
+	if before.Digest == after.Digest {
+		t.Fatal("same-size migration edit did not invalidate candidate digest")
+	}
+}
+
 func TestAnalyzeRejectsUnsafeDuplicateAndChangedPaths(t *testing.T) {
 	tests := []struct {
 		name   string
