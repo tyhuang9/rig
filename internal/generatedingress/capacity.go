@@ -38,7 +38,7 @@ func (m *Manager) Snapshot(ctx context.Context) (generatedruntime.CapacitySnapsh
 	}
 	memory, memoryErr := strconv.ParseUint(fields[0], 10, 64)
 	disk, diskErr := strconv.ParseUint(fields[1], 10, 64)
-	if memoryErr != nil || diskErr != nil || memory < 64<<20 || disk < 64<<20 {
+	if memoryErr != nil || diskErr != nil {
 		return generatedruntime.CapacitySnapshot{}, errors.New("generated ingress capacity probe is invalid")
 	}
 	return generatedruntime.CapacitySnapshot{MemoryAvailableBytes: memory, DiskAvailableBytes: disk}, nil

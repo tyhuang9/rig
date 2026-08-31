@@ -20,7 +20,7 @@ func TestBuildCaddyConfigSupportsServerStaticAndStaticAPI(t *testing.T) {
 			endpoint("web", "server", "net-a", "web-blue", 3000, 'a'),
 		}},
 	}
-	body, err := buildCaddyConfig(routes, "172.28.0.2:8080")
+	body, err := buildCaddyConfig(routes, "10.203.0.2:8080")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +29,7 @@ func TestBuildCaddyConfigSupportsServerStaticAndStaticAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := config.Apps.HTTP.Servers["generated"]
-	if len(server.Listen) != 1 || server.Listen[0] != "172.28.0.2:8080" {
+	if len(server.Listen) != 1 || server.Listen[0] != "10.203.0.2:8080" {
 		t.Fatalf("listener = %#v, want dedicated ingress address", server.Listen)
 	}
 	if len(server.Routes) != 3 {
@@ -70,7 +70,7 @@ func TestBuildCaddyConfigRejectsAmbiguousOrCrossNetworkTopologies(t *testing.T) 
 		}},
 	}
 	for _, route := range tests {
-		if _, err := buildCaddyConfig(map[string]routeRecord{appID: route}, "172.28.0.2:8080"); err == nil {
+		if _, err := buildCaddyConfig(map[string]routeRecord{appID: route}, "10.203.0.2:8080"); err == nil {
 			t.Fatal("expected invalid topology to fail closed")
 		}
 	}

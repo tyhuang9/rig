@@ -24,6 +24,7 @@ type ingressRunner struct {
 	stopped            bool
 	volumeOptions      map[string]string
 	endpointRoleLabel  string
+	capacityOutput     []byte
 }
 
 func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -38,7 +39,8 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 	if len(args) >= 3 && args[0] == "network" && args[1] == "inspect" {
 		name := args[len(args)-1]
 		if name == caddyNetworkName {
-			return jsonResult(networkInspection{Name: caddyNetworkName, Driver: "bridge", Scope: "local", Options: map[string]string{}, Labels: map[string]string{"io.rig.managed": "generated-ingress-network", "io.rig.identity-version": "v1"}}), nil
+			subnet, gateway, _ := ingressNetworkCandidate(0)
+			return jsonResult(networkInspection{Name: caddyNetworkName, Driver: "bridge", Scope: "local", Options: map[string]string{}, IPAM: []networkIPAM{{Subnet: subnet, Gateway: gateway}}, Labels: map[string]string{"io.rig.managed": "generated-ingress-network", "io.rig.identity-version": "v1"}}), nil
 		}
 		return jsonResult(networkInspection{Name: r.network, Driver: "bridge", Scope: "local", Options: map[string]string{}, Labels: map[string]string{"io.rig.managed": generatedruntime.NetworkOwnershipLabelValue, "io.rig.application": r.appID}}), nil
 	}
@@ -86,7 +88,11 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 		return runtimeprocess.CommandResult{}, nil
 	}
 	if len(args) == 6 && args[0] == "container" && args[1] == "exec" && args[3] == "sh" && args[4] == "-c" && args[5] == capacityProbeCommand {
-		return runtimeprocess.CommandResult{Stdout: []byte("2147483648 8589934592\n")}, nil
+		output := r.capacityOutput
+		if output == nil {
+			output = []byte("2147483648 8589934592\n")
+		}
+		return runtimeprocess.CommandResult{Stdout: append([]byte(nil), output...)}, nil
 	}
 	if len(args) >= 4 && args[0] == "container" && args[1] == "exec" {
 		return runtimeprocess.CommandResult{}, nil
@@ -202,6 +208,30 @@ func TestProvisionAndCapacitySnapshotUsePinnedDockerDataPlane(t *testing.T) {
 	}
 }
 
+func TestCapacitySnapshotPreservesGenuinelyLowCapacity(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	runner.capacityOutput = []byte("1024 2048\n")
+	snapshot, err := manager.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.MemoryAvailableBytes != 1024 || snapshot.DiskAvailableBytes != 2048 {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+	runner.capacityOutput = []byte("malformed\n")
+	if _, err := manager.Snapshot(context.Background()); err == nil {
+		t.Fatal("malformed capacity output was accepted")
+	}
+}
+
+func TestProvisionRejectsListenerAddressOutsideOwnedSubnet(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	runner.caddyNetworks[caddyNetworkName].IPAddress = "10.203.0.3"
+	if err := manager.Provision(context.Background()); !IsCode(err, DiagnosticIngressDrift) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestProvisionRepairsStoppedCaddyBeforeReconnectingApplicationNetwork(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	runner.stopped = true
@@ -309,7 +339,8 @@ func newManagerFixture(t *testing.T, failReload bool) (*Manager, *ingressRunner)
 	}
 	appID := "11111111-1111-4111-8111-111111111111"
 	endpoint := endpoint("web", "server", "rig-app-network", "web-blue", 3000, 'b')
-	runner := &ingressRunner{appID: appID, network: endpoint.NetworkName, endpoint: endpoint, caddyNetworks: map[string]*networkAttachment{caddyNetworkName: {IPAddress: "172.28.0.2"}}, files: map[string][]byte{}, failProposedReload: failReload}
+	_, _, ingressIP := ingressNetworkCandidate(0)
+	runner := &ingressRunner{appID: appID, network: endpoint.NetworkName, endpoint: endpoint, caddyNetworks: map[string]*networkAttachment{caddyNetworkName: {IPAddress: ingressIP}}, files: map[string][]byte{}, failProposedReload: failReload}
 	manager, err := New(runner, Options{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: dockerConfig, WorkingDirectory: root, DataRoot: root})
 	if err != nil {
 		t.Fatal(err)

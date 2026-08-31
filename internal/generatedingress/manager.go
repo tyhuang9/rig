@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -241,7 +242,8 @@ func (m *Manager) ensureCaddy(ctx context.Context, routes map[string]routeRecord
 	if err := m.ensureVolume(ctx); err != nil {
 		return err
 	}
-	if err := m.ensureIngressNetwork(ctx); err != nil {
+	ingressIP, err := m.ensureIngressNetwork(ctx)
+	if err != nil {
 		return err
 	}
 	inspection, found, err := m.inspectCaddy(ctx)
@@ -249,7 +251,7 @@ func (m *Manager) ensureCaddy(ctx context.Context, routes map[string]routeRecord
 		return err
 	}
 	if !found {
-		if err := m.createCaddy(ctx, imageID); err != nil {
+		if err := m.createCaddy(ctx, imageID, ingressIP); err != nil {
 			return err
 		}
 		inspection, found, err = m.inspectCaddy(ctx)
@@ -334,28 +336,46 @@ func (m *Manager) ensureVolume(ctx context.Context) error {
 	return nil
 }
 
-func (m *Manager) ensureIngressNetwork(ctx context.Context) error {
+func (m *Manager) ensureIngressNetwork(ctx context.Context) (string, error) {
 	inspection, found, err := m.inspectNetwork(ctx, caddyNetworkName)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !found {
-		createErr := m.runDiscard(ctx, m.options.CommandTimeout, "network", "create", "--driver", "bridge", "--label", "io.rig.managed=generated-ingress-network", "--label", "io.rig.identity-version=v1", caddyNetworkName)
-		reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.options.CommandTimeout)
-		inspection, found, err = m.inspectNetwork(reconcileCtx, caddyNetworkName)
-		cancel()
-		if (err != nil || !found) && createErr != nil {
-			return createErr
+		attemptCtx, cancelAttempts := context.WithTimeout(ctx, m.options.CommandTimeout)
+		defer cancelAttempts()
+		for index := 0; index < 64 && !found; index++ {
+			subnet, gateway, _ := ingressNetworkCandidate(index)
+			createErr := m.runDiscard(attemptCtx, m.options.CommandTimeout, "network", "create", "--driver", "bridge", "--subnet", subnet, "--gateway", gateway,
+				"--label", "io.rig.managed=generated-ingress-network", "--label", "io.rig.identity-version=v1", caddyNetworkName)
+			inspection, found, err = m.inspectNetwork(attemptCtx, caddyNetworkName)
+			if err != nil {
+				return "", err
+			}
+			if !found && attemptCtx.Err() != nil {
+				if createErr != nil {
+					return "", createErr
+				}
+				return "", &Error{Code: DiagnosticIngressUnavailable}
+			}
 		}
 	}
-	if err != nil || !found || !validIngressNetwork(inspection) {
-		return &Error{Code: DiagnosticIngressDrift}
+	ip, valid := ingressNetworkIdentity(inspection)
+	if !found {
+		return "", &Error{Code: DiagnosticIngressUnavailable}
 	}
-	return nil
+	if !valid {
+		return "", &Error{Code: DiagnosticIngressDrift}
+	}
+	return ip, nil
 }
 
-func (m *Manager) createCaddy(ctx context.Context, imageID string) error {
+func (m *Manager) createCaddy(ctx context.Context, imageID, ingressIP string) error {
+	if net.ParseIP(ingressIP) == nil {
+		return &Error{Code: DiagnosticIngressDrift}
+	}
 	args := []string{"container", "create", "--name", caddyContainerName, "--hostname", caddyContainerName, "--network", caddyNetworkName,
+		"--ip", ingressIP,
 		"--mount", "type=volume,src=" + caddyVolumeName + ",dst=/config", "--user", "1000:1000", "--read-only",
 		"--tmpfs", "/data:rw,noexec,nosuid,nodev,size=67108864", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
 		"--memory", "268435456", "--memory-swap", "268435456", "--cpus", "1.000", "--pids-limit", "128", "--ulimit", "nofile=1024:1024",
@@ -467,7 +487,9 @@ func (m *Manager) caddyListenAddress(ctx context.Context) (string, error) {
 		return "", &Error{Code: DiagnosticIngressUnavailable}
 	}
 	attachment := inspection.Networks[caddyNetworkName]
-	if attachment == nil || net.ParseIP(attachment.IPAddress) == nil {
+	network, networkFound, networkErr := m.inspectNetwork(ctx, caddyNetworkName)
+	expectedIP, networkValid := ingressNetworkIdentity(network)
+	if attachment == nil || !networkFound || networkErr != nil || !networkValid || attachment.IPAddress != expectedIP {
 		return "", &Error{Code: DiagnosticIngressDrift}
 	}
 	return net.JoinHostPort(attachment.IPAddress, "8080"), nil
@@ -528,8 +550,15 @@ func (m *Manager) reconcileCaddyNetworks(ctx context.Context, routes map[string]
 	}
 	for network := range desired {
 		attachment := final.Networks[network]
-		if attachment == nil || network == caddyNetworkName && net.ParseIP(attachment.IPAddress) == nil {
+		if attachment == nil {
 			return &Error{Code: DiagnosticIngressDrift}
+		}
+		if network == caddyNetworkName {
+			ingress, ok, inspectErr := m.inspectNetwork(ctx, caddyNetworkName)
+			expectedIP, valid := ingressNetworkIdentity(ingress)
+			if inspectErr != nil || !ok || !valid || attachment.IPAddress != expectedIP {
+				return &Error{Code: DiagnosticIngressDrift}
+			}
 		}
 	}
 	return nil
@@ -574,8 +603,31 @@ func (m *Manager) disconnectApplicationNetworks(ctx context.Context, caddy caddy
 }
 
 func validIngressNetwork(value networkInspection) bool {
-	return value.Name == caddyNetworkName && value.Driver == "bridge" && value.Scope == "local" && !value.Internal && len(value.Options) == 0 &&
-		value.Labels["io.rig.managed"] == "generated-ingress-network" && value.Labels["io.rig.identity-version"] == "v1"
+	_, valid := ingressNetworkIdentity(value)
+	return valid
+}
+
+func ingressNetworkIdentity(value networkInspection) (string, bool) {
+	if value.Name != caddyNetworkName || value.Driver != "bridge" || value.Scope != "local" || value.Internal || len(value.Options) != 0 ||
+		value.Labels["io.rig.managed"] != "generated-ingress-network" || value.Labels["io.rig.identity-version"] != "v1" || len(value.IPAM) != 1 {
+		return "", false
+	}
+	for index := 0; index < 64; index++ {
+		subnet, gateway, address := ingressNetworkCandidate(index)
+		if value.IPAM[0].Subnet == subnet && value.IPAM[0].Gateway == gateway {
+			return address, true
+		}
+	}
+	return "", false
+}
+
+func ingressNetworkCandidate(index int) (subnet, gateway, address string) {
+	if index < 0 || index >= 64 {
+		return "", "", ""
+	}
+	base := netip.AddrFrom4([4]byte{10, 203, byte(index / 16), byte(index%16) * 16})
+	prefix := netip.PrefixFrom(base, 28)
+	return prefix.String(), base.Next().String(), base.Next().Next().String()
 }
 
 func validApplicationNetwork(value networkInspection, appID string) bool {
@@ -685,7 +737,13 @@ type networkInspection struct {
 	Scope    string            `json:"scope"`
 	Internal bool              `json:"internal"`
 	Options  map[string]string `json:"options"`
+	IPAM     []networkIPAM     `json:"ipam"`
 	Labels   map[string]string `json:"labels"`
+}
+
+type networkIPAM struct {
+	Subnet  string `json:"Subnet"`
+	Gateway string `json:"Gateway"`
 }
 
 type endpointInspection struct {
@@ -711,7 +769,7 @@ const (
 	imageInspectFormat    = `{"id":{{json .Id}},"os":{{json .Os}},"repoDigests":{{json .RepoDigests}}}`
 	volumeInspectFormat   = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"options":{{json .Options}},"labels":{{json .Labels}}}`
 	caddyInspectFormat    = `{"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"hostname":{{json .Config.Hostname}},"user":{{json .Config.User}},"env":{{json .Config.Env}},"cmd":{{json .Config.Cmd}},"readOnly":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"tmpfs":{{json .HostConfig.Tmpfs}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCpus}},"pidsLimit":{{json .HostConfig.PidsLimit}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"networkMode":{{json .HostConfig.NetworkMode}},"ulimits":{{json .HostConfig.Ulimits}},"running":{{json .State.Running}},"portBindings":{{json .HostConfig.PortBindings}},"networks":{{json .NetworkSettings.Networks}}}`
-	networkInspectFormat  = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"internal":{{json .Internal}},"options":{{json .Options}},"labels":{{json .Labels}}}`
+	networkInspectFormat  = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"internal":{{json .Internal}},"options":{{json .Options}},"ipam":{{json .IPAM.Config}},"labels":{{json .Labels}}}`
 	endpointInspectFormat = `{"id":{{json .Id}},"labels":{{json .Config.Labels}},"running":{{json .State.Running}},"health":{{json .State.Health.Status}},"networks":{{json .NetworkSettings.Networks}}}`
 )
 
