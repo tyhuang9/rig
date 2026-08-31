@@ -87,6 +87,7 @@ type CandidateSpec struct {
 	InternalPort                uint16
 	HealthProbe                 string
 	ImageContentID              string
+	BuildDefinitionDigest       string
 	ActiveSlot                  Slot
 	EnvironmentOperationID      string
 	EnvironmentOperationAttempt int
