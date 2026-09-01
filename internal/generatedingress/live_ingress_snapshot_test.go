@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/netip"
 	"reflect"
 	"strconv"
 	"strings"
@@ -95,7 +96,7 @@ func liveIngressFailureDiagnostic(ctx context.Context, manager *Manager) string 
 }
 
 func liveIngressRouteFailureDiagnostic(ctx context.Context, manager *Manager, request generatedruntime.RouteSwitchRequest) string {
-	const unavailable = "route_snapshot=listen:not_attempted,endpoints:not_attempted"
+	const unavailable = "route_snapshot=listen:not_attempted,listen_reason:not_attempted,endpoints:not_attempted"
 	if manager == nil || ctx == nil || ctx.Err() != nil || !validSwitchRequest(request) {
 		return unavailable
 	}
@@ -104,17 +105,80 @@ func liveIngressRouteFailureDiagnostic(ctx context.Context, manager *Manager, re
 	endpoints := append([]generatedruntime.RouteEndpoint(nil), request.Endpoints...)
 	defer clearLiveRouteEndpoints(endpoints)
 
-	listenStatus := "unavailable"
+	listenStatus, listenReason := "unavailable", "caddy_unavailable"
 	if diagnosticCtx.Err() == nil {
-		_, err := manager.caddyListenAddress(diagnosticCtx)
-		listenStatus = liveIngressReadOnlyStatus(err)
+		listenStatus, listenReason = liveIngressListenReason(diagnosticCtx, manager)
 	}
 	endpointStatus := "not_attempted"
 	if diagnosticCtx.Err() == nil {
 		err := manager.verifyEndpoints(diagnosticCtx, request.AppID, routeRecord{Slot: request.ToSlot, Endpoints: endpoints})
 		endpointStatus = liveIngressReadOnlyStatus(err)
 	}
-	return "route_snapshot=listen:" + listenStatus + ",endpoints:" + endpointStatus
+	return "route_snapshot=listen:" + listenStatus + ",listen_reason:" + listenReason + ",endpoints:" + endpointStatus
+}
+
+func liveIngressListenReason(ctx context.Context, manager *Manager) (string, string) {
+	if ctx == nil || manager == nil || ctx.Err() != nil {
+		return "unavailable", "caddy_unavailable"
+	}
+	caddy, found, err := manager.inspectCaddy(ctx)
+	defer clearLiveCaddyInspection(&caddy)
+	if err != nil {
+		return "unavailable", "caddy_unavailable"
+	}
+	if !found {
+		return "unavailable", "caddy_missing"
+	}
+	if !caddy.Running || !validContainerID(caddy.ID) || strings.TrimPrefix(caddy.Name, "/") != caddyContainerName || caddy.Labels["io.rig.managed"] != "generated-ingress" || caddy.Labels["io.rig.identity-version"] != "v1" || caddy.Labels["io.rig.listener-isolation"] != "v1" {
+		return "unavailable", "caddy_unavailable"
+	}
+	attachment := caddy.Networks[caddyNetworkName]
+	if attachment == nil {
+		return "drift", "attachment_missing"
+	}
+	attachmentIP := attachment.IPAddress
+	if ctx.Err() != nil {
+		attachmentIP = ""
+		return "unavailable", "network_unavailable"
+	}
+	network, networkFound, networkErr := manager.inspectNetwork(ctx, caddyNetworkName)
+	defer clearLiveNetworkInspection(&network)
+	if networkErr != nil {
+		attachmentIP = ""
+		return "drift", "network_unavailable"
+	}
+	if !networkFound {
+		attachmentIP = ""
+		return "drift", "network_missing"
+	}
+	expectedIP, networkValid := ingressNetworkIdentity(network)
+	if !networkValid {
+		attachmentIP = ""
+		expectedIP = ""
+		return "drift", "network_invalid"
+	}
+	if attachmentIP == "" {
+		expectedIP = ""
+		return "drift", "ip_missing"
+	}
+	parsedIP, parseErr := netip.ParseAddr(attachmentIP)
+	if parseErr != nil {
+		attachmentIP = ""
+		expectedIP = ""
+		return "drift", "ip_invalid"
+	}
+	if attachmentIP == expectedIP {
+		attachmentIP = ""
+		expectedIP = ""
+		return "valid", "ip_expected"
+	}
+	prefix, prefixErr := netip.ParsePrefix(network.IPAM[0].Subnet)
+	attachmentIP = ""
+	expectedIP = ""
+	if prefixErr == nil && prefix.Contains(parsedIP) {
+		return "drift", "ip_other_in_subnet"
+	}
+	return "drift", "ip_outside_subnet"
 }
 
 func liveIngressReadOnlyStatus(err error) string {
@@ -1047,7 +1111,7 @@ func TestLiveIngressRouteFailureDiagnosticIsReadOnlyAndIndependent(t *testing.T)
 	request := switchRequest(runner)
 	original := request
 	original.Endpoints = append([]generatedruntime.RouteEndpoint(nil), request.Endpoints...)
-	if diagnostic := liveIngressRouteFailureDiagnostic(context.Background(), manager, request); diagnostic != "route_snapshot=listen:valid,endpoints:valid" {
+	if diagnostic := liveIngressRouteFailureDiagnostic(context.Background(), manager, request); diagnostic != "route_snapshot=listen:valid,listen_reason:ip_expected,endpoints:valid" {
 		t.Fatalf("valid route diagnostic = %q", diagnostic)
 	}
 	if !reflect.DeepEqual(request, original) {
@@ -1063,14 +1127,14 @@ func TestLiveIngressRouteFailureDiagnosticIsReadOnlyAndIndependent(t *testing.T)
 
 	manager, runner = newManagerFixture(t, false)
 	runner.caddyNetworks[caddyNetworkName].IPAddress = "10.0.0.1"
-	if diagnostic := liveIngressRouteFailureDiagnostic(context.Background(), manager, switchRequest(runner)); diagnostic != "route_snapshot=listen:drift,endpoints:valid" {
+	if diagnostic := liveIngressRouteFailureDiagnostic(context.Background(), manager, switchRequest(runner)); diagnostic != "route_snapshot=listen:drift,listen_reason:ip_outside_subnet,endpoints:valid" {
 		t.Fatalf("listen drift diagnostic = %q", diagnostic)
 	}
 
 	manager, runner = newManagerFixture(t, false)
 	request = switchRequest(runner)
 	request.Endpoints[0].NetworkAlias = "wrong-alias"
-	if diagnostic := liveIngressRouteFailureDiagnostic(context.Background(), manager, request); diagnostic != "route_snapshot=listen:valid,endpoints:drift" {
+	if diagnostic := liveIngressRouteFailureDiagnostic(context.Background(), manager, request); diagnostic != "route_snapshot=listen:valid,listen_reason:ip_expected,endpoints:drift" {
 		t.Fatalf("endpoint drift diagnostic = %q", diagnostic)
 	}
 }
@@ -1079,7 +1143,7 @@ func TestLiveIngressRouteFailureDiagnosticSkipsInvalidOrCancelledRequests(t *tes
 	manager, runner := newManagerFixture(t, false)
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	const skipped = "route_snapshot=listen:not_attempted,endpoints:not_attempted"
+	const skipped = "route_snapshot=listen:not_attempted,listen_reason:not_attempted,endpoints:not_attempted"
 	if diagnostic := liveIngressRouteFailureDiagnostic(cancelled, manager, switchRequest(runner)); diagnostic != skipped || len(runner.commands) != 0 {
 		t.Fatalf("cancelled route diagnostic = %q, commands = %v", diagnostic, runner.commands)
 	}
