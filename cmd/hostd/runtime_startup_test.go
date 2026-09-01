@@ -23,10 +23,6 @@ func TestPrepareRuntimeWorkerRecoversInOrderBeforeStartingOneWorker(t *testing.T
 
 	var calls []string
 	recovery := runtimeRecovery{
-		temporary: func() error {
-			calls = append(calls, "temporary")
-			return nil
-		},
 		deployments: func(recoveryContext context.Context) error {
 			if recoveryContext.Err() != nil {
 				t.Fatalf("deployment recovery inherited cancelled startup context: %v", recoveryContext.Err())
@@ -65,7 +61,7 @@ func TestPrepareRuntimeWorkerRecoversInOrderBeforeStartingOneWorker(t *testing.T
 	if got := runCount.Load(); got != 1 {
 		t.Fatalf("worker run count = %d, want 1", got)
 	}
-	if want := []string{"temporary", "deployments", "jobs", "worker"}; !reflect.DeepEqual(calls, want) {
+	if want := []string{"deployments", "jobs", "worker"}; !reflect.DeepEqual(calls, want) {
 		t.Fatalf("startup calls = %v, want %v", calls, want)
 	}
 }
@@ -73,10 +69,6 @@ func TestPrepareRuntimeWorkerRecoversInOrderBeforeStartingOneWorker(t *testing.T
 func TestPrepareRuntimeWorkerDefaultOffRecoversWithoutStartingWorker(t *testing.T) {
 	var calls []string
 	recovery := runtimeRecovery{
-		temporary: func() error {
-			calls = append(calls, "temporary")
-			return nil
-		},
 		deployments: func(context.Context) error {
 			calls = append(calls, "deployments")
 			return nil
@@ -102,7 +94,7 @@ func TestPrepareRuntimeWorkerDefaultOffRecoversWithoutStartingWorker(t *testing.
 	if got := runCount.Load(); got != 0 {
 		t.Fatalf("worker run count = %d, want 0", got)
 	}
-	if want := []string{"temporary", "deployments", "jobs"}; !reflect.DeepEqual(calls, want) {
+	if want := []string{"deployments", "jobs"}; !reflect.DeepEqual(calls, want) {
 		t.Fatalf("startup calls = %v, want %v", calls, want)
 	}
 }
@@ -113,9 +105,8 @@ func TestPrepareRuntimeWorkerRecoveryFailurePreventsWorker(t *testing.T) {
 		failAt    string
 		wantCalls []string
 	}{
-		{name: "temporary cleanup", failAt: "temporary", wantCalls: []string{"temporary"}},
-		{name: "deployment recovery", failAt: "deployments", wantCalls: []string{"temporary", "deployments"}},
-		{name: "job recovery", failAt: "jobs", wantCalls: []string{"temporary", "deployments", "jobs"}},
+		{name: "deployment recovery", failAt: "deployments", wantCalls: []string{"deployments"}},
+		{name: "job recovery", failAt: "jobs", wantCalls: []string{"deployments", "jobs"}},
 	}
 
 	for _, test := range tests {
@@ -131,7 +122,6 @@ func TestPrepareRuntimeWorkerRecoveryFailurePreventsWorker(t *testing.T) {
 			}
 			var runCount atomic.Int32
 			done, err := prepareRuntimeWorker(context.Background(), runtimeRecovery{
-				temporary: func() error { return step("temporary") },
 				deployments: func(context.Context) error {
 					return step("deployments")
 				},
