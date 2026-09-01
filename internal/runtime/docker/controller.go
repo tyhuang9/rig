@@ -10,12 +10,10 @@ import (
 )
 
 // ControllerDirectories are persistent, protected paths owned only by the
-// generated-runtime controller. RuntimeEnvironmentRoot is a separate data
-// root so its securetemp recovery cannot touch Compose or generated builds.
+// generated-runtime controller.
 type ControllerDirectories struct {
-	DockerConfigDirectory  string
-	WorkingDirectory       string
-	RuntimeEnvironmentRoot string
+	DockerConfigDirectory string
+	WorkingDirectory      string
 }
 
 // ResolveExecutable resolves the Docker CLI once so every generated-runtime
@@ -59,11 +57,7 @@ func PrepareControllerDirectories(dataRoot string) (ControllerDirectories, error
 	if err != nil {
 		return ControllerDirectories{}, err
 	}
-	environment, err := directory.EnsureDirectory("runtime-environment")
-	if err != nil {
-		return ControllerDirectories{}, err
-	}
 	return ControllerDirectories{
-		DockerConfigDirectory: dockerConfig, WorkingDirectory: working, RuntimeEnvironmentRoot: environment,
+		DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 	}, nil
 }

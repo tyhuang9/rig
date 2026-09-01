@@ -60,7 +60,7 @@ func TestPrepareControllerDirectoriesKeepsRecoveryBoundariesSeparate(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	paths := []string{directories.DockerConfigDirectory, directories.WorkingDirectory, directories.RuntimeEnvironmentRoot}
+	paths := []string{directories.DockerConfigDirectory, directories.WorkingDirectory}
 	seen := map[string]bool{}
 	for _, path := range paths {
 		if !filepath.IsAbs(path) || seen[path] {
@@ -80,7 +80,7 @@ func TestPrepareControllerDirectoriesKeepsRecoveryBoundariesSeparate(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	environment, err := securetemp.New(directories.RuntimeEnvironmentRoot)
+	environment, err := securetemp.NewGeneratedRuntime(root)
 	if err != nil {
 		t.Fatal(err)
 	}

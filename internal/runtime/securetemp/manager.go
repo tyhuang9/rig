@@ -49,6 +49,13 @@ func NewGeneratedBuild(dataRoot string) (*Manager, error) {
 	return newManager(dataRoot, "generated-build")
 }
 
+// NewGeneratedRuntime creates a separate protected namespace for generated
+// runtime environment files. Its recovery can never remove Compose material or
+// generated build contexts.
+func NewGeneratedRuntime(dataRoot string) (*Manager, error) {
+	return newManager(dataRoot, "generated-runtime")
+}
+
 // NewGeneratedBuilderDirectory creates the persistent protected namespace
 // used by the generated-image BuildKit controller. Callers can create only
 // direct, simple child directories and files through this value, preventing a
@@ -152,7 +159,7 @@ func newManager(dataRoot, namespace string) (*Manager, error) {
 	if dataRoot == "" || pathsecurity.RejectWindowsNamespace(dataRoot) || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
 		return nil, errors.New("data root must be an absolute clean path")
 	}
-	if namespace != "compose" && namespace != "generated-build" {
+	if namespace != "compose" && namespace != "generated-build" && namespace != "generated-runtime" {
 		return nil, errors.New("unsupported runtime temp namespace")
 	}
 	if err := rejectPathAncestors(dataRoot); err != nil {
