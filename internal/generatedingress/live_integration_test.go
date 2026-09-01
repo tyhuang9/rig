@@ -86,19 +86,36 @@ const (
 type liveStartReason string
 
 const (
-	liveStartNone                 liveStartReason = "none"
-	liveStartCancelled            liveStartReason = "cancelled"
-	liveStartTimeout              liveStartReason = "timeout"
-	liveStartProcessTermination   liveStartReason = "process_termination_failed"
-	liveStartOutputTruncated      liveStartReason = "output_truncated"
-	liveStartDaemonUnavailable    liveStartReason = "daemon_unavailable"
-	liveStartOCIMountFailed       liveStartReason = "oci_mount_failed"
-	liveStartOCIEntrypointDenied  liveStartReason = "oci_entrypoint_permission"
-	liveStartOCIEntrypointMissing liveStartReason = "oci_entrypoint_missing"
-	liveStartOCINetworkFailed     liveStartReason = "oci_network_failed"
-	liveStartOCIResourceFailed    liveStartReason = "oci_resource_failed"
-	liveStartOCIRuntimeFailed     liveStartReason = "oci_runtime_failed"
-	liveStartCommandFailed        liveStartReason = "command_failed"
+	liveStartNone                  liveStartReason = "none"
+	liveStartCancelled             liveStartReason = "cancelled"
+	liveStartTimeout               liveStartReason = "timeout"
+	liveStartProcessTermination    liveStartReason = "process_termination_failed"
+	liveStartOutputTruncated       liveStartReason = "output_truncated"
+	liveStartDaemonUnavailable     liveStartReason = "daemon_unavailable"
+	liveStartDockerInitFailed      liveStartReason = "docker_init_failed"
+	liveStartDockerInitMissing     liveStartReason = "docker_init_missing"
+	liveStartUserLookupFailed      liveStartReason = "user_lookup_failed"
+	liveStartWorkdirFailed         liveStartReason = "workdir_failed"
+	liveStartOCIMountFailed        liveStartReason = "oci_mount_failed"
+	liveStartOCIEntrypointDenied   liveStartReason = "oci_entrypoint_permission"
+	liveStartOCIEntrypointMissing  liveStartReason = "oci_entrypoint_missing"
+	liveStartOCINetworkFailed      liveStartReason = "oci_network_failed"
+	liveStartOCIResourceFailed     liveStartReason = "oci_resource_failed"
+	liveStartPermissionDenied      liveStartReason = "permission_denied"
+	liveStartFileMissing           liveStartReason = "file_missing"
+	liveStartReadOnlyFilesystem    liveStartReason = "read_only_filesystem"
+	liveStartOperationNotPermitted liveStartReason = "operation_not_permitted"
+	liveStartInvalidArgument       liveStartReason = "invalid_argument"
+	liveStartNoSpace               liveStartReason = "no_space"
+	liveStartMemoryExhausted       liveStartReason = "memory_exhausted"
+	liveStartPIDsExhausted         liveStartReason = "pids_exhausted"
+	liveStartResourceFailed        liveStartReason = "resource_failed"
+	liveStartSecurityPolicyFailed  liveStartReason = "security_policy_failed"
+	liveStartCreateTaskFailed      liveStartReason = "create_task_failed"
+	liveStartShimTaskFailed        liveStartReason = "shim_task_failed"
+	liveStartTaskStartFailed       liveStartReason = "task_start_failed"
+	liveStartOCIRuntimeFailed      liveStartReason = "oci_runtime_failed"
+	liveStartCommandFailed         liveStartReason = "command_failed"
 )
 
 type liveCreateExpectation struct {
@@ -376,6 +393,18 @@ func classifyLiveStartResult(ctx context.Context, result runtimeprocess.CommandR
 	if liveStartOutputContains(result, "failed to set up container networking") {
 		return liveStartOCINetworkFailed
 	}
+	if liveStartOutputContainsAll(result, "docker-init", "no such file or directory") || liveStartOutputContainsAll(result, "docker-init", "executable file not found") {
+		return liveStartDockerInitMissing
+	}
+	if liveStartOutputContains(result, "docker-init") {
+		return liveStartDockerInitFailed
+	}
+	if liveStartOutputContainsAll(result, "unable to find user", "no matching entries in passwd file") {
+		return liveStartUserLookupFailed
+	}
+	if liveStartOutputContainsAll(result, "chdir to cwd (", ") set in config.json failed") {
+		return liveStartWorkdirFailed
+	}
 	if liveStartOutputContainsAll(result, "oci runtime create failed", "error mounting") || liveStartOutputContainsAll(result, "oci runtime create failed", "failed to mount") {
 		return liveStartOCIMountFailed
 	}
@@ -388,25 +417,62 @@ func classifyLiveStartResult(ctx context.Context, result runtimeprocess.CommandR
 	if liveStartOutputContainsAll(result, "oci runtime create failed", "failed to setup network") || liveStartOutputContainsAll(result, "oci runtime create failed", "network namespace") {
 		return liveStartOCINetworkFailed
 	}
-	if liveStartOutputContainsAll(result, "oci runtime create failed", "cgroup") || liveStartOutputContainsAll(result, "oci runtime create failed", "pids") || liveStartOutputContainsAll(result, "oci runtime create failed", "cannot allocate memory") {
+	if liveStartOutputContains(result, "invalid tmpfs option") {
+		return liveStartInvalidArgument
+	}
+	if liveStartOutputContainsAll(result, "pids", "resource temporarily unavailable") || liveStartOutputContainsAny(result, "cannot set pids limit", "pids.max") {
+		return liveStartPIDsExhausted
+	}
+	if liveStartOutputContainsAny(result, "unable to init seccomp", "unable to apply apparmor profile") {
+		return liveStartSecurityPolicyFailed
+	}
+	if liveStartOutputContains(result, "unable to apply cgroup configuration") {
+		return liveStartResourceFailed
+	}
+	if liveStartOutputContainsAll(result, "oci runtime create failed", "cgroup") {
 		return liveStartOCIResourceFailed
+	}
+	if liveStartOutputContains(result, "cannot allocate memory") {
+		return liveStartMemoryExhausted
+	}
+	if liveStartOutputContainsAny(result, "error setting rootfs as readonly", "read-only file system") {
+		return liveStartReadOnlyFilesystem
+	}
+	if liveStartOutputContains(result, "operation not permitted") {
+		return liveStartOperationNotPermitted
+	}
+	if liveStartOutputContains(result, "invalid argument") {
+		return liveStartInvalidArgument
+	}
+	if liveStartOutputContains(result, "no space left on device") {
+		return liveStartNoSpace
+	}
+	if liveStartOutputContains(result, "permission denied") {
+		return liveStartPermissionDenied
+	}
+	if liveStartOutputContainsAny(result, "no such file or directory", "executable file not found") {
+		return liveStartFileMissing
+	}
+	if liveStartOutputContains(result, "resource temporarily unavailable") {
+		return liveStartResourceFailed
+	}
+	if liveStartOutputContains(result, "failed to create shim task") {
+		return liveStartShimTaskFailed
+	}
+	if liveStartOutputContains(result, "failed to create task") {
+		return liveStartCreateTaskFailed
+	}
+	if liveStartOutputContainsAny(result, "failed to start task", "oci runtime start failed") {
+		return liveStartTaskStartFailed
 	}
 	if liveStartOutputContainsAny(result, "oci runtime create failed", "runc create failed") {
 		return liveStartOCIRuntimeFailed
 	}
-	if err != nil {
-		return liveStartCommandFailed
-	}
-	return liveStartNone
+	return liveStartCommandFailed
 }
 
 func liveStartOutputContainsAll(result runtimeprocess.CommandResult, patterns ...string) bool {
-	for _, pattern := range patterns {
-		if !liveStartOutputContains(result, pattern) {
-			return false
-		}
-	}
-	return true
+	return containsAllASCIIInsensitive(result.Stdout, patterns...) || containsAllASCIIInsensitive(result.Stderr, patterns...)
 }
 
 func liveStartOutputContainsAny(result runtimeprocess.CommandResult, patterns ...string) bool {
@@ -420,6 +486,15 @@ func liveStartOutputContainsAny(result runtimeprocess.CommandResult, patterns ..
 
 func liveStartOutputContains(result runtimeprocess.CommandResult, pattern string) bool {
 	return containsASCIIInsensitive(result.Stdout, pattern) || containsASCIIInsensitive(result.Stderr, pattern)
+}
+
+func containsAllASCIIInsensitive(value []byte, patterns ...string) bool {
+	for _, pattern := range patterns {
+		if !containsASCIIInsensitive(value, pattern) {
+			return false
+		}
+	}
+	return true
 }
 
 func containsASCIIInsensitive(value []byte, pattern string) bool {
@@ -725,11 +800,33 @@ func TestLiveStartResultClassifiesFixedReasonsWithoutDisclosure(t *testing.T) {
 		{name: "output truncated", output: "sensitive-start-output", truncated: true, err: errors.New("command exited"), want: liveStartOutputTruncated},
 		{name: "typed daemon unavailable", output: "sensitive-start-output", err: &exec.Error{Name: "docker", Err: errors.New("sensitive-typed-error")}, want: liveStartDaemonUnavailable},
 		{name: "daemon unavailable", output: "cannot connect to the Docker daemon: sensitive-start-output", err: errors.New("command exited"), want: liveStartDaemonUnavailable},
-		{name: "oci mount", output: "OCI runtime create failed: error mounting sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIMountFailed},
-		{name: "oci entrypoint permission", output: "OCI runtime create failed: exec /usr/local/bin/rig-entrypoint: permission denied: sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIEntrypointDenied},
-		{name: "oci entrypoint missing", output: "OCI runtime create failed: exec /usr/local/bin/rig-entrypoint: no such file or directory: sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIEntrypointMissing},
 		{name: "network before oci", output: "failed to set up container networking: sensitive-start-output", err: errors.New("command exited"), want: liveStartOCINetworkFailed},
+		{name: "missing docker init", output: "docker-init: no such file or directory: sensitive-start-output", err: errors.New("command exited"), want: liveStartDockerInitMissing},
+		{name: "missing docker init executable", output: "docker-init: executable file not found: sensitive-start-output", err: errors.New("command exited"), want: liveStartDockerInitMissing},
+		{name: "docker init failed", output: "docker-init failed: sensitive-start-output", err: errors.New("command exited"), want: liveStartDockerInitFailed},
+		{name: "user lookup", output: "unable to find user sensitive-user: no matching entries in passwd file: sensitive-start-output", err: errors.New("command exited"), want: liveStartUserLookupFailed},
+		{name: "workdir", output: "chdir to cwd (sensitive-workdir) set in config.json failed: sensitive-start-output", err: errors.New("command exited"), want: liveStartWorkdirFailed},
+		{name: "oci mount", output: "OCI runtime create failed: error mounting sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIMountFailed},
+		{name: "oci entrypoint permission", output: "OCI runtime create failed: exec sensitive-rig-entrypoint: permission denied: sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIEntrypointDenied},
+		{name: "oci entrypoint missing", output: "OCI runtime create failed: exec sensitive-rig-entrypoint: no such file or directory: sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIEntrypointMissing},
+		{name: "invalid tmpfs", output: "invalid tmpfs option: sensitive-start-output", err: errors.New("command exited"), want: liveStartInvalidArgument},
+		{name: "source cgroup", output: "unable to apply cgroup configuration: sensitive-start-output", err: errors.New("command exited"), want: liveStartResourceFailed},
+		{name: "source security", output: "unable to init seccomp: sensitive-start-output", err: errors.New("command exited"), want: liveStartSecurityPolicyFailed},
 		{name: "oci resource", output: "OCI runtime create failed: cgroup configuration failed: sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIResourceFailed},
+		{name: "pids exhausted", output: "pids: resource temporarily unavailable: sensitive-start-output", err: errors.New("command exited"), want: liveStartPIDsExhausted},
+		{name: "pids max", output: "failed to write pids.max: sensitive-start-output", err: errors.New("command exited"), want: liveStartPIDsExhausted},
+		{name: "memory exhausted", output: "cannot allocate memory: sensitive-start-output", err: errors.New("command exited"), want: liveStartMemoryExhausted},
+		{name: "read only filesystem", output: "error setting rootfs as readonly: sensitive-start-output", err: errors.New("command exited"), want: liveStartReadOnlyFilesystem},
+		{name: "operation not permitted", output: "operation not permitted: sensitive-start-output", err: errors.New("command exited"), want: liveStartOperationNotPermitted},
+		{name: "invalid argument", output: "invalid argument: sensitive-start-output", err: errors.New("command exited"), want: liveStartInvalidArgument},
+		{name: "no space", output: "no space left on device: sensitive-start-output", err: errors.New("command exited"), want: liveStartNoSpace},
+		{name: "permission denied", output: "permission denied: sensitive-start-output", err: errors.New("command exited"), want: liveStartPermissionDenied},
+		{name: "file missing", output: "no such file or directory: sensitive-start-output", err: errors.New("command exited"), want: liveStartFileMissing},
+		{name: "resource failed", output: "resource temporarily unavailable: sensitive-start-output", err: errors.New("command exited"), want: liveStartResourceFailed},
+		{name: "shim task", output: "failed to create shim task: sensitive-start-output", err: errors.New("command exited"), want: liveStartShimTaskFailed},
+		{name: "create task", output: "failed to create task: sensitive-start-output", err: errors.New("command exited"), want: liveStartCreateTaskFailed},
+		{name: "task start", output: "failed to start task: sensitive-start-output", err: errors.New("command exited"), want: liveStartTaskStartFailed},
+		{name: "oci runtime start", output: "OCI runtime start failed: sensitive-start-output", err: errors.New("command exited"), want: liveStartTaskStartFailed},
 		{name: "oci runtime", output: "OCI runtime create failed: runc create failed: sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIRuntimeFailed},
 		{name: "command failed", output: "sensitive-start-output", err: errors.New("command exited"), want: liveStartCommandFailed},
 	} {
@@ -749,6 +846,30 @@ func TestLiveStartResultClassifiesFixedReasonsWithoutDisclosure(t *testing.T) {
 			}
 			if strings.Contains(diagnostic, "sensitive-start-output") || strings.Contains(diagnostic, "sensitive-typed-error") || strings.Contains(diagnostic, "rig-entrypoint") {
 				t.Fatal("start diagnostic exposed command output or error details")
+			}
+		})
+	}
+}
+
+func TestLiveStartResultClassifierPrecedence(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		result runtimeprocess.CommandResult
+		err    error
+		want   liveStartReason
+	}{
+		{name: "success wins over sensitive output", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: permission denied: sensitive-start-output")}, want: liveStartNone},
+		{name: "truncation before content", result: runtimeprocess.CommandResult{Stderr: []byte("failed to set up container networking: sensitive-start-output"), StderrTruncated: true}, err: errors.New("command exited"), want: liveStartOutputTruncated},
+		{name: "source entrypoint before generic permission", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: exec sensitive-rig-entrypoint: permission denied: sensitive-start-output")}, err: errors.New("command exited"), want: liveStartOCIEntrypointDenied},
+		{name: "pids before generic cgroup", result: runtimeprocess.CommandResult{Stderr: []byte("cannot set pids limit: unable to apply cgroup configuration: sensitive-start-output")}, err: errors.New("command exited"), want: liveStartPIDsExhausted},
+		{name: "security before generic resource", result: runtimeprocess.CommandResult{Stderr: []byte("unable to apply apparmor profile: resource temporarily unavailable: sensitive-start-output")}, err: errors.New("command exited"), want: liveStartSecurityPolicyFailed},
+		{name: "source workdir before generic file", result: runtimeprocess.CommandResult{Stderr: []byte("chdir to cwd (sensitive-workdir) set in config.json failed: no such file or directory: sensitive-start-output")}, err: errors.New("command exited"), want: liveStartWorkdirFailed},
+		{name: "shim task before generic oci", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: failed to create shim task: sensitive-start-output")}, err: errors.New("command exited"), want: liveStartShimTaskFailed},
+		{name: "no cross stream cause synthesis", result: runtimeprocess.CommandResult{Stdout: []byte("OCI runtime create failed: sensitive-start-output"), Stderr: []byte("error mounting sensitive-start-output")}, err: errors.New("command exited"), want: liveStartOCIRuntimeFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if reason := classifyLiveStartResult(context.Background(), test.result, test.err); reason != test.want {
+				t.Fatalf("start reason = %q, want %q", reason, test.want)
 			}
 		})
 	}
