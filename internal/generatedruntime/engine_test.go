@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"text/template"
 	"time"
 
 	"github.com/google/uuid"
@@ -926,6 +927,123 @@ func defaultLimits() ContainerLimits {
 
 func imageLabels(spec CandidateSpec) map[string]string {
 	return map[string]string{"io.rig.managed": "generated-image", "io.rig.application": spec.AppID, "io.rig.release": spec.ReleaseID, "io.rig.artifact": spec.ArtifactID, "io.rig.plan": spec.DeploymentPlanRevisionID, "io.rig.component": spec.ComponentName, "io.rig.role": spec.Role, "io.rig.definition": spec.BuildDefinitionDigest}
+}
+
+type templateDockerContainer struct {
+	Id              string
+	Name            string
+	Image           string
+	Config          templateDockerConfig
+	HostConfig      templateDockerHostConfig
+	Mounts          []templateDockerMount
+	State           templateDockerState
+	NetworkSettings *templateDockerNetworkSettings
+}
+
+type templateDockerConfig struct {
+	Labels      map[string]string
+	User        string
+	WorkingDir  string
+	Cmd         []string
+	Healthcheck templateDockerHealthcheck
+}
+
+type templateDockerHealthcheck struct {
+	Test        []string
+	Interval    int64
+	Timeout     int64
+	StartPeriod int64
+	Retries     int
+}
+
+type templateDockerHostConfig struct {
+	Memory         int64
+	MemorySwap     int64
+	NanoCpus       int64
+	PidsLimit      int64
+	Ulimits        []templateDockerUlimit
+	Init           bool
+	NetworkMode    string
+	ReadonlyRootfs bool
+	Privileged     bool
+	CapAdd         []string
+	CapDrop        []string
+	SecurityOpt    []string
+	Binds          []string
+	PortBindings   map[string]any
+	Tmpfs          map[string]string
+	LogConfig      templateDockerLogConfig
+	RestartPolicy  templateDockerRestartPolicy
+}
+
+type templateDockerUlimit struct {
+	Name string
+	Soft int64
+	Hard int64
+}
+
+type templateDockerLogConfig struct {
+	Type   string
+	Config map[string]string
+}
+
+type templateDockerRestartPolicy struct {
+	Name string
+}
+
+type templateDockerMount struct {
+	Type        string
+	Source      string
+	Destination string
+	RW          bool
+}
+
+type templateDockerState struct {
+	Running  bool
+	ExitCode int
+	Health   *templateDockerHealth
+}
+
+type templateDockerHealth struct {
+	Status string
+}
+
+type templateDockerNetworkSettings struct {
+	Networks map[string]struct{}
+}
+
+func TestContainerInspectFormatHandlesMissingHealthAndNetworkState(t *testing.T) {
+	templateValue, err := template.New("container-inspect").Funcs(template.FuncMap{
+		"json": func(value any) (string, error) {
+			encoded, err := json.Marshal(value)
+			return string(encoded), err
+		},
+	}).Parse(containerInspectFormat)
+	if err != nil {
+		t.Fatal("container inspection template did not parse")
+	}
+	var rendered strings.Builder
+	input := templateDockerContainer{
+		Id:              "container-id",
+		State:           templateDockerState{Health: nil},
+		NetworkSettings: nil,
+	}
+	if err := templateValue.Execute(&rendered, input); err != nil {
+		t.Fatal("container inspection template did not execute")
+	}
+	var decoded struct {
+		Health   string                     `json:"health"`
+		Networks map[string]json.RawMessage `json:"networks"`
+	}
+	if err := json.Unmarshal([]byte(rendered.String()), &decoded); err != nil {
+		t.Fatal("container inspection template output was not JSON")
+	}
+	if decoded.Health != "" {
+		t.Fatal("missing health state was not rendered as an empty string")
+	}
+	if decoded.Networks != nil {
+		t.Fatal("missing network state was not rendered as null")
+	}
 }
 
 func validImageInspection(spec CandidateSpec) imageInspection {

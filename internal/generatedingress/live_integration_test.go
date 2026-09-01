@@ -140,7 +140,7 @@ func (observer *liveCreateObserver) inspectCreatedContainer(ctx context.Context,
 }
 
 func liveCreateInspectionFormat(expectation liveCreateExpectation) string {
-	return fmt.Sprintf(`{"network_mode":{{if eq .HostConfig.NetworkMode %s}}true{{else}}false{{end}},"tmpfs":{{if and (eq (len .HostConfig.Tmpfs) 1) (eq (index .HostConfig.Tmpfs "/tmp") %s)}}true{{else}}false{{end}},"pids_limit":{{if eq .HostConfig.PidsLimit %d}}true{{else}}false{{end}},"security_options":{{if and (eq (len .HostConfig.SecurityOpt) 1) (or (eq (index .HostConfig.SecurityOpt 0) "no-new-privileges") (eq (index .HostConfig.SecurityOpt 0) "no-new-privileges:true") (eq (index .HostConfig.SecurityOpt 0) "no-new-privileges=true"))}}true{{else}}false{{end}},"health_start_period":{{if eq .Config.Healthcheck.StartPeriod 5000000000}}true{{else}}false{{end}},"mounts_realized":{{if .Mounts}}true{{else}}false{{end}},"network_realized":{{if index .NetworkSettings.Networks %s}}true{{else}}false{{end}}}`,
+	return fmt.Sprintf(`{"network_mode":{{if eq .HostConfig.NetworkMode %s}}true{{else}}false{{end}},"tmpfs":{{if and (eq (len .HostConfig.Tmpfs) 1) (eq (index .HostConfig.Tmpfs "/tmp") %s)}}true{{else}}false{{end}},"pids_limit":{{if eq .HostConfig.PidsLimit %d}}true{{else}}false{{end}},"security_options":{{if and (eq (len .HostConfig.SecurityOpt) 1) (or (eq (index .HostConfig.SecurityOpt 0) "no-new-privileges") (eq (index .HostConfig.SecurityOpt 0) "no-new-privileges:true") (eq (index .HostConfig.SecurityOpt 0) "no-new-privileges=true"))}}true{{else}}false{{end}},"health_start_period":{{if eq .Config.Healthcheck.StartPeriod 5000000000}}true{{else}}false{{end}},"mounts_realized":{{if .Mounts}}true{{else}}false{{end}},"network_realized":{{if and .NetworkSettings .NetworkSettings.Networks}}{{if index .NetworkSettings.Networks %s}}true{{else}}false{{end}}{{else}}false{{end}}}`,
 		strconv.Quote(expectation.network), strconv.Quote(expectation.tmpfs), expectation.pids, strconv.Quote(expectation.network))
 }
 
@@ -347,6 +347,70 @@ func TestLiveCreateObserverFiltersOtherContainerCreates(t *testing.T) {
 	}
 	if _, err := template.New("docker-inspect").Parse(liveCreateInspectionFormat(expectation)); err != nil {
 		t.Fatal("Docker inspect format is not a valid Go template")
+	}
+}
+
+type liveTemplateDockerContainer struct {
+	HostConfig      liveTemplateDockerHostConfig
+	Config          liveTemplateDockerConfig
+	Mounts          []struct{}
+	State           liveTemplateDockerState
+	NetworkSettings *liveTemplateDockerNetworkSettings
+}
+
+type liveTemplateDockerHostConfig struct {
+	NetworkMode string
+	Tmpfs       map[string]string
+	PidsLimit   int64
+	SecurityOpt []string
+}
+
+type liveTemplateDockerConfig struct {
+	Healthcheck liveTemplateDockerHealthcheck
+}
+
+type liveTemplateDockerHealthcheck struct {
+	StartPeriod int64
+}
+
+type liveTemplateDockerState struct {
+	Health *liveTemplateDockerHealth
+}
+
+type liveTemplateDockerHealth struct {
+	Status string
+}
+
+type liveTemplateDockerNetworkSettings struct {
+	Networks map[string]struct{}
+}
+
+func TestLiveCreateInspectionFormatHandlesMissingNetworkState(t *testing.T) {
+	expectation := liveCreateExpectation{network: "test-network", tmpfs: "/tmp:rw", pids: 128}
+	for name, networkSettings := range map[string]*liveTemplateDockerNetworkSettings{
+		"network settings absent": nil,
+		"networks absent":         {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var rendered strings.Builder
+			templateValue, err := template.New("live-create-inspect").Parse(liveCreateInspectionFormat(expectation))
+			if err != nil {
+				t.Fatal("live inspection template did not parse")
+			}
+			input := liveTemplateDockerContainer{NetworkSettings: networkSettings}
+			if err := templateValue.Execute(&rendered, input); err != nil {
+				t.Fatal("live inspection template did not execute")
+			}
+			var decoded struct {
+				NetworkRealized bool `json:"network_realized"`
+			}
+			if err := json.Unmarshal([]byte(rendered.String()), &decoded); err != nil {
+				t.Fatal("live inspection template output was not JSON")
+			}
+			if decoded.NetworkRealized {
+				t.Fatal("missing network state was reported as realized")
+			}
+		})
 	}
 }
 
