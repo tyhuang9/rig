@@ -370,6 +370,91 @@ func TestGeneratedRuntimeHardeningRequiresAliasAndExactTmpfsPolicy(t *testing.T)
 	}
 }
 
+func TestGeneratedRuntimeCreatedCandidateAllowsUnrealizedRuntimeStateUntilHealthCheck(t *testing.T) {
+	spec := candidateSpec()
+	created := false
+	started := false
+	removed := false
+	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		switch commandKind(request.Args) {
+		case "image inspect":
+			return runtimeJSON(validImageInspection(spec))
+		case "network inspect":
+			return runtimeJSON(networkInspection{Name: networkName(spec.AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": spec.AppID}})
+		case "container inspect":
+			identity := request.Args[len(request.Args)-1]
+			if removed || !created || (identity != testContainerID && identity != containerName(spec.AppID, spec.ComponentName, SlotGreen)) {
+				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
+			}
+			inspection := configuredInspection(spec, defaultLimits())
+			inspection.Running = started
+			inspection.Health = "starting"
+			return runtimeJSON(inspection)
+		case "container create":
+			created = true
+			return runtimeRequestResult{result: runtimeprocess.CommandResult{Stdout: []byte(testContainerID)}}
+		case "container start":
+			started = true
+			return runtimeRequestResult{}
+		case "container rm":
+			if !containsExactArgument(request.Args, "--force") {
+				t.Fatalf("failed candidate cleanup was not forced: %#v", request.Args)
+			}
+			removed = true
+			return runtimeRequestResult{}
+		default:
+			t.Fatalf("unexpected request: %#v", request.Args)
+			return runtimeRequestResult{}
+		}
+	})
+	candidate, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("created candidate rejected before runtime state materialized: %v", err)
+	}
+	if err := engine.StartCandidate(context.Background(), candidate); err != nil {
+		t.Fatalf("created candidate rejected before start: %v", err)
+	}
+	if err := engine.WaitHealthy(context.Background(), candidate); !IsCode(err, DiagnosticCandidateHardeningFailed) {
+		t.Fatalf("health check accepted missing realized mounts or network attachment: %v", err)
+	}
+	if !removed {
+		t.Fatal("fully labeled created candidate was not removed during failure cleanup")
+	}
+	findRuntimeRequest(t, runner.requests, "container start")
+	findRuntimeRequest(t, runner.requests, "container rm")
+}
+
+func TestGeneratedRuntimeStopAndRemoveAllowsUnrealizedCreatedCandidate(t *testing.T) {
+	spec := candidateSpec()
+	candidate := candidateForSpec(spec)
+	removed := false
+	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		switch commandKind(request.Args) {
+		case "container inspect":
+			if removed {
+				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
+			}
+			return runtimeJSON(configuredInspection(spec, defaultLimits()))
+		case "container rm":
+			removed = true
+			return runtimeRequestResult{}
+		case "container stop":
+			t.Fatal("created candidate should be removed without a stop request")
+			return runtimeRequestResult{}
+		default:
+			t.Fatalf("unexpected request: %#v", request.Args)
+			return runtimeRequestResult{}
+		}
+	})
+	if err := engine.StopAndRemove(context.Background(), candidate, time.Second); err != nil {
+		t.Fatalf("unrealized created candidate was not removed: %v", err)
+	}
+	if !removed {
+		t.Fatal("created candidate was not removed")
+	}
+	findRuntimeRequest(t, runner.requests, "container rm")
+}
+
 func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testing.T) {
 	root := t.TempDir()
 	config := filepath.Join(root, "docker-config")
@@ -398,7 +483,7 @@ func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testin
 			if removed || (!created && identity != testContainerID) || (identity != testContainerID && identity != containerName(spec.AppID, spec.ComponentName, SlotGreen)) {
 				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
 			}
-			inspection := hardenedInspection(spec, defaultLimits())
+			inspection := configuredInspection(spec, defaultLimits())
 			inspection.Privileged = true
 			return runtimeJSON(inspection)
 		case "container create":
@@ -789,6 +874,13 @@ func hardenedInspection(spec CandidateSpec, limits ContainerLimits) containerIns
 		LogType: "local", LogConfig: map[string]string{"max-size": limits.LogSize, "max-file": stringInt(int64(limits.LogFiles))}, Restart: "no",
 		Mounts: []mountInspection{{Type: "tmpfs", Destination: "/tmp", RW: true}}, Networks: map[string]networkAttachmentInspection{network: {Aliases: []string{containerAlias(spec.ComponentName, slot)}}},
 	}
+}
+
+func configuredInspection(spec CandidateSpec, limits ContainerLimits) containerInspection {
+	inspection := hardenedInspection(spec, limits)
+	inspection.Mounts = nil
+	inspection.Networks = nil
+	return inspection
 }
 
 func stringInt(value int64) string { return strings.TrimSpace(string(mustJSONNumber(value))) }

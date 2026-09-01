@@ -326,7 +326,7 @@ func (e *Engine) StartCandidate(ctx context.Context, candidate Candidate) error 
 	if err != nil {
 		return e.failInactiveCandidate(ctx, candidate, err)
 	}
-	if !found || !matchesCandidateHardening(container, candidate, e.options.Limits) {
+	if !found || !matchesCandidateConfiguredHardening(container, candidate, e.options.Limits) {
 		return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateHardeningFailed})
 	}
 	result, runErr := e.run(ctx, []string{"container", "start", candidate.ContainerID}, e.options.CommandTimeout)
@@ -398,18 +398,20 @@ func (e *Engine) StopAndRemove(ctx context.Context, candidate Candidate, grace t
 	if !matchesCandidateOwnership(container, candidate) {
 		return &Error{Code: DiagnosticCandidateHardeningFailed}
 	}
-	seconds := int64(grace / time.Second)
-	if grace%time.Second != 0 {
-		seconds++
+	if container.Running {
+		seconds := int64(grace / time.Second)
+		if grace%time.Second != 0 {
+			seconds++
+		}
+		result, runErr := e.run(ctx, []string{"container", "stop", "--time", strconv.FormatInt(seconds, 10), candidate.ContainerID}, grace+e.options.CommandTimeout)
+		diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticCandidateCleanupFailed)
+		clearResult(&result)
+		if diagnostic != "" {
+			return &Error{Code: diagnostic}
+		}
 	}
-	result, runErr := e.run(ctx, []string{"container", "stop", "--time", strconv.FormatInt(seconds, 10), candidate.ContainerID}, grace+e.options.CommandTimeout)
+	result, runErr := e.run(ctx, []string{"container", "rm", candidate.ContainerID}, e.options.CommandTimeout)
 	diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticCandidateCleanupFailed)
-	clearResult(&result)
-	if diagnostic != "" {
-		return &Error{Code: diagnostic}
-	}
-	result, runErr = e.run(ctx, []string{"container", "rm", candidate.ContainerID}, e.options.CommandTimeout)
-	diagnostic = e.commandDiagnostic(ctx, result, runErr, DiagnosticCandidateCleanupFailed)
 	clearResult(&result)
 	if diagnostic != "" {
 		return &Error{Code: diagnostic}
@@ -930,13 +932,17 @@ func matchesNetwork(network networkInspection, appID, name string) bool {
 }
 
 func matchesCreatedContainer(container containerInspection, spec CandidateSpec, candidate Candidate, imageID, workingDirectory string, labels map[string]string, limits ContainerLimits) bool {
-	if !matchesCandidateHardening(container, candidate, limits) || container.Image != imageID || container.WorkingDirectory != workingDirectory || container.Command[2] != spec.RunCommand || !containsLabels(container.Labels, labels) {
+	if !matchesCandidateConfiguredHardening(container, candidate, limits) || container.Image != imageID || container.WorkingDirectory != workingDirectory || container.Command[2] != spec.RunCommand || !containsLabels(container.Labels, labels) {
 		return false
 	}
 	return true
 }
 
-func matchesCandidateHardening(container containerInspection, candidate Candidate, limits ContainerLimits) bool {
+// matchesCandidateConfiguredHardening validates controller-owned configuration
+// that Docker records when a container is created. Runtime Mounts and network
+// attachment are deliberately excluded because Docker may not materialize them
+// until the container starts.
+func matchesCandidateConfiguredHardening(container containerInspection, candidate Candidate, limits ContainerLimits) bool {
 	if !matchesCandidateOwnership(container, candidate) || container.Image != candidate.ImageContentID || container.User != containerUser || container.WorkingDirectory != candidate.WorkingDirectory || len(container.Command) != 3 || container.Command[0] != "/bin/sh" || container.Command[1] != "-lc" || sha256Hex(container.Command[2]) != candidate.RunCommandDigest {
 		return false
 	}
@@ -946,12 +952,22 @@ func matchesCandidateHardening(container containerInspection, candidate Candidat
 	if container.Memory != limits.MemoryBytes || container.MemorySwap != limits.MemoryBytes || container.NanoCPUs != limits.MilliCPUs*1_000_000 || container.PIDs != limits.PIDs || len(container.Ulimits) != 1 || container.Ulimits[0] != (ulimitInspection{Name: "nofile", Soft: 1024, Hard: 1024}) || !container.Init || container.NetworkMode != candidate.NetworkName || !container.ReadonlyRootfs || container.Privileged || len(container.CapAdd) != 0 || len(container.CapDrop) != 1 || !containsFold(container.CapDrop, "ALL") || !onlyNoNewPrivileges(container.SecurityOptions) {
 		return false
 	}
-	if len(container.Binds) != 0 || len(container.PortBindings) != 0 || container.Restart != "no" || container.LogType != "local" || container.LogConfig["max-size"] != limits.LogSize || container.LogConfig["max-file"] != strconv.Itoa(limits.LogFiles) || !onlyRuntimeTmpfsMount(container.Mounts) {
+	if len(container.Binds) != 0 || len(container.PortBindings) != 0 || container.Restart != "no" || container.LogType != "local" || container.LogConfig["max-size"] != limits.LogSize || container.LogConfig["max-file"] != strconv.Itoa(limits.LogFiles) {
 		return false
 	}
 	tmpfs, exists := container.Tmpfs["/tmp"]
+	return exists && len(container.Tmpfs) == 1 && exactCommaValues(tmpfs, []string{"rw", "noexec", "nosuid", "nodev", "size=" + strconv.FormatInt(limits.TmpfsBytes, 10)})
+}
+
+// matchesCandidateHardening also validates Docker's runtime-realized state.
+// Health checks require this stronger predicate so a started container cannot
+// be accepted before its tmpfs mount and network alias are visible.
+func matchesCandidateHardening(container containerInspection, candidate Candidate, limits ContainerLimits) bool {
+	if !matchesCandidateConfiguredHardening(container, candidate, limits) || !onlyRuntimeTmpfsMount(container.Mounts) {
+		return false
+	}
 	attachment, attached := container.Networks[candidate.NetworkName]
-	return exists && len(container.Tmpfs) == 1 && exactCommaValues(tmpfs, []string{"rw", "noexec", "nosuid", "nodev", "size=" + strconv.FormatInt(limits.TmpfsBytes, 10)}) && len(container.Networks) == 1 && attached && containsExact(attachment.Aliases, candidate.NetworkAlias)
+	return len(container.Networks) == 1 && attached && containsExact(attachment.Aliases, candidate.NetworkAlias)
 }
 
 func onlyRuntimeTmpfsMount(mounts []mountInspection) bool {
@@ -978,8 +994,7 @@ func matchesCandidateOwnership(container containerInspection, candidate Candidat
 		"io.rig.component": candidate.Component, "io.rig.slot": string(candidate.Slot),
 		"io.rig.role": candidate.Role,
 	}
-	_, attached := container.Networks[candidate.NetworkName]
-	return container.ID == candidate.ContainerID && strings.TrimPrefix(container.Name, "/") == candidate.ContainerName && containsLabels(container.Labels, expected) && container.NetworkMode == candidate.NetworkName && attached
+	return container.ID == candidate.ContainerID && strings.TrimPrefix(container.Name, "/") == candidate.ContainerName && containsLabels(container.Labels, expected) && container.NetworkMode == candidate.NetworkName
 }
 
 func containsLabels(actual, expected map[string]string) bool {
