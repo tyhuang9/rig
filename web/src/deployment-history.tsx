@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  APIError,
   api,
   type Deployment,
   type Job,
@@ -10,6 +11,55 @@ import {
 import { Dialog } from "./dialog";
 
 type Mode = "current" | "original";
+type RuntimeStrategy = "compose" | "generated_node";
+type RuntimeCapabilities = {
+  compose: boolean;
+  fake: boolean;
+  generated: boolean;
+};
+type PauseDisposition =
+  | "approval_required"
+  | "migration_approval_required"
+  | "insufficient_replacement_capacity";
+
+const runtimeStrategy = (value?: string): RuntimeStrategy | undefined =>
+  value === "compose" || value === "generated_node" ? value : undefined;
+const runtimeAvailable = (
+  strategy: RuntimeStrategy | undefined,
+  capabilities: RuntimeCapabilities,
+  allowFakeCompose: boolean,
+) =>
+  strategy === "generated_node"
+    ? capabilities.generated
+    : strategy === "compose"
+      ? capabilities.compose || (allowFakeCompose && capabilities.fake)
+      : false;
+type ReleaseWithRuntimeStrategy = Release & { runtimeStrategy?: string };
+const pinnedReleaseStrategy = (release: Release): RuntimeStrategy | undefined =>
+  runtimeStrategy((release as ReleaseWithRuntimeStrategy).runtimeStrategy);
+const deploymentResult = (item: Deployment) => {
+  switch (item.diagnosticCode) {
+    case "migration_approval_required":
+      return "Database migration approval is required.";
+    case "insufficient_replacement_capacity":
+      return "More temporary capacity is required for a safe replacement.";
+    default:
+      return item.failureSummary || item.diagnosticCode || "No failure recorded";
+  }
+};
+const deploymentPlanOrLegacy = async (appId: string) => {
+  try {
+    return await api.deploymentPlan(appId);
+  } catch (error) {
+    if (
+      error instanceof APIError &&
+      error.status === 404 &&
+      error.code === "deployment_plan_not_found"
+    )
+      return null;
+    throw error;
+  }
+};
 const stamp = (value?: string) => {
   if (!value) return "Not recorded";
   const date = new Date(value);
@@ -188,9 +238,7 @@ function DeploymentRow({
       </div>
       <div className="deployment-meta deployment-result">
         <small>Result</small>
-        <span>
-          {item.failureSummary || item.diagnosticCode || "No failure recorded"}
-        </span>
+        <span>{deploymentResult(item)}</span>
         {findings.length > 0 && (
           <span className="deployment-findings">
             Policy:{" "}
@@ -227,18 +275,24 @@ function DeploymentRow({
   );
 }
 
+const pauseDisposition = (value?: string): PauseDisposition | undefined =>
+  value === "approval_required" ||
+  value === "migration_approval_required" ||
+  value === "insufficient_replacement_capacity"
+    ? value
+    : undefined;
 const waiting = (job: Job, appId: string) =>
   job.type === "deploy" &&
   job.resourceType === "application" &&
   job.resourceId === appId &&
   job.status === "waiting_user" &&
-  job.pauseDisposition === "approval_required";
+  Boolean(pauseDisposition(job.pauseDisposition));
 
 type AppMutation = { appId: string };
 type PriorDeployMutation = AppMutation & { release: Release; mode: Mode };
 type GrantMutation = AppMutation & { fingerprint: string };
 type RevokeMutation = AppMutation & { approvalId: string };
-type ResumeMutation = AppMutation & { jobId: string };
+type ResumeMutation = AppMutation & { jobId: string; successMessage: string };
 
 const activeJobStatuses = new Set([
   "queued",
@@ -257,10 +311,12 @@ export function DeploymentHistoryPanel({
   appId,
   composeRuntime,
   fakeRuntime,
+  generatedRuntime,
 }: {
   appId: string;
   composeRuntime: boolean;
   fakeRuntime: boolean;
+  generatedRuntime: boolean;
 }) {
   const client = useQueryClient();
   const errorRef = useRef<HTMLDivElement>(null);
@@ -311,6 +367,11 @@ export function DeploymentHistoryPanel({
   const jobs = useQuery({
     queryKey: ["jobs"],
     queryFn: api.jobs,
+    refetchInterval,
+  });
+  const deploymentPlan = useQuery({
+    queryKey: ["deployment-plan", appId],
+    queryFn: () => deploymentPlanOrLegacy(appId),
     refetchInterval,
   });
   const invalidate = (targetAppId: string) =>
@@ -384,7 +445,7 @@ export function DeploymentHistoryPanel({
     mutationFn: ({ jobId }: ResumeMutation) => api.resumeJob(jobId),
     onSuccess: async (_, variables) => {
       if (variables.appId === currentAppId.current) {
-        setMessage("Waiting deployment resumed.");
+        setMessage(variables.successMessage);
       }
       await invalidate(variables.appId);
     },
@@ -441,7 +502,7 @@ export function DeploymentHistoryPanel({
     : undefined;
   const required = useMemo(
     () =>
-      matched
+      matched && job?.pauseDisposition === "approval_required"
         ? Array.from(
             new Map(
               matched.findings
@@ -452,9 +513,53 @@ export function DeploymentHistoryPanel({
             ).values(),
           )
         : [],
-    [matched],
+    [job?.pauseDisposition, matched],
   );
-  const runtimeAvailable = composeRuntime || fakeRuntime;
+  const capabilities: RuntimeCapabilities = {
+    compose: composeRuntime,
+    fake: fakeRuntime,
+    generated: generatedRuntime,
+  };
+  const currentStrategy = deploymentPlan.isSuccess
+    ? deploymentPlan.data === null
+      ? "compose"
+      : runtimeStrategy(deploymentPlan.data.strategy)
+    : undefined;
+  const latestRuntimeAvailable = runtimeAvailable(
+    currentStrategy,
+    capabilities,
+    true,
+  );
+  const disposition = pauseDisposition(job?.pauseDisposition);
+  const matchedStrategy = runtimeStrategy(matched?.runtimeStrategy);
+  const resumeRuntimeAvailable = runtimeAvailable(
+    matchedStrategy,
+    capabilities,
+    false,
+  );
+  const migrationPlanMatches = Boolean(
+    matched?.deploymentPlanRevisionId &&
+      deploymentPlan.data?.revisionId ===
+        matched.deploymentPlanRevisionId &&
+      deploymentPlan.data.revisionNumber ===
+        matched.deploymentPlanRevisionNumber,
+  );
+  const migrationApproved = Boolean(
+    migrationPlanMatches &&
+      deploymentPlan.data?.migration.present &&
+      deploymentPlan.data.migration.approvalStatus === "approved",
+  );
+  const canResume = Boolean(
+    job &&
+      matched &&
+      resumeRuntimeAvailable &&
+      (disposition === "approval_required"
+        ? required.length > 0 &&
+          required.every((finding) => active.has(finding.fingerprint))
+        : disposition === "migration_approval_required"
+          ? migrationApproved
+          : disposition === "insufficient_replacement_capacity"),
+  );
   const hasPendingMutationForCurrentApp = () =>
     [...inFlight.current].some((key) => key.endsWith(`:${appId}`));
   const deployLatest = () => {
@@ -462,7 +567,7 @@ export function DeploymentHistoryPanel({
     if (
       inFlight.current.has(key) ||
       hasPendingMutationForCurrentApp() ||
-      !runtimeAvailable
+      !latestRuntimeAvailable
     )
       return;
     inFlight.current.add(key);
@@ -470,7 +575,16 @@ export function DeploymentHistoryPanel({
   };
   const deployPrior = (release: Release) => {
     const key = `prior:${appId}`;
-    if (inFlight.current.has(key) || hasPendingMutationForCurrentApp()) return;
+    if (
+      inFlight.current.has(key) ||
+      hasPendingMutationForCurrentApp() ||
+      !runtimeAvailable(
+        pinnedReleaseStrategy(release),
+        capabilities,
+        false,
+      )
+    )
+      return;
     inFlight.current.add(key);
     priorDeploy.mutate({ appId, release, mode });
   };
@@ -486,19 +600,17 @@ export function DeploymentHistoryPanel({
     inFlight.current.add(key);
     revoke.mutate({ appId, approvalId });
   };
-  const resumeWaitingJob = (jobId: string) => {
+  const resumeWaitingJob = (jobId: string, successMessage: string) => {
     const key = `resume:${appId}`;
-    if (inFlight.current.has(key) || hasPendingMutationForCurrentApp()) return;
+    if (
+      inFlight.current.has(key) ||
+      hasPendingMutationForCurrentApp() ||
+      !canResume
+    )
+      return;
     inFlight.current.add(key);
-    resume.mutate({ appId, jobId });
+    resume.mutate({ appId, jobId, successMessage });
   };
-  const canResume = Boolean(
-    composeRuntime &&
-      job &&
-      matched &&
-      required.length &&
-      required.every((finding) => active.has(finding.fingerprint)),
-  );
   const currentPending =
     current.isPending && hasActiveVariables(current.variables);
   const priorPending =
@@ -514,6 +626,21 @@ export function DeploymentHistoryPanel({
     grantPending ||
     revokePending ||
     resumePending;
+  const selectedPriorStrategy = prior
+    ? pinnedReleaseStrategy(prior)
+    : undefined;
+  const selectedPriorRuntimeAvailable = runtimeAvailable(
+    selectedPriorStrategy,
+    capabilities,
+    false,
+  );
+  const latestUnavailableMessage = deploymentPlan.isLoading
+    ? "Checking which runtime this application requires."
+    : currentStrategy === "generated_node"
+      ? "Deploy latest requires the generated runtime on this controller."
+      : currentStrategy === "compose"
+        ? "Deploy latest requires the Compose runtime or the development fake runtime."
+        : "Rig could not verify the runtime required by the current deployment plan.";
   return (
     <section
       className="deployment-panel"
@@ -530,19 +657,43 @@ export function DeploymentHistoryPanel({
         <button
           type="button"
           className="button primary"
-          disabled={panelMutationPending || !runtimeAvailable}
+          disabled={panelMutationPending || !latestRuntimeAvailable}
+          aria-describedby={
+            !latestRuntimeAvailable ? "deploy-latest-availability" : undefined
+          }
           onClick={deployLatest}
         >
           {currentPending ? "Queuing..." : "Deploy latest"}
         </button>
       </div>
-      {!runtimeAvailable && (
-        <p className="deployment-empty">
-          Deployment actions require a configured runtime.
+      {deploymentPlan.isError ? (
+        <div
+          id="deploy-latest-availability"
+          className="callout danger deployment-query-error"
+          role="alert"
+        >
+          <strong>Could not verify the deployment runtime.</strong>
+          <span>Deployment actions remain disabled until Rig reloads the accepted plan.</span>
+          <button
+            className="button small"
+            type="button"
+            onClick={() => deploymentPlan.refetch()}
+          >
+            Retry runtime check
+          </button>
+        </div>
+      ) : !latestRuntimeAvailable ? (
+        <p id="deploy-latest-availability" className="deployment-empty">
+          {latestUnavailableMessage}
         </p>
-      )}
+      ) : null}
       {message && (
-        <p className="deployment-message" role="status">
+        <p
+          className="deployment-message"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
           {message}
         </p>
       )}
@@ -593,6 +744,20 @@ export function DeploymentHistoryPanel({
         >
           {releaseList.map((release) => {
             const ready = release.workspaceState === "ready";
+            const strategy = pinnedReleaseStrategy(release);
+            const strategyAvailable = runtimeAvailable(
+              strategy,
+              capabilities,
+              false,
+            );
+            const unavailable = !ready || !strategyAvailable;
+            const unavailableMessage = !ready
+              ? "This release is not ready for deployment."
+              : !strategy
+                ? "Rig cannot yet verify this release's pinned runtime."
+                : strategy === "generated_node"
+                  ? "This release requires the generated runtime."
+                  : "This release requires the Compose runtime.";
             return (
               <article className="release-row" key={release.id}>
                 <div>
@@ -620,11 +785,9 @@ export function DeploymentHistoryPanel({
                   <button
                     type="button"
                     className="button small"
-                    disabled={!ready || panelMutationPending || !composeRuntime}
+                    disabled={unavailable || panelMutationPending}
                     aria-describedby={
-                      !ready || !composeRuntime
-                        ? `${release.id}-availability`
-                        : undefined
+                      unavailable ? `${release.id}-availability` : undefined
                     }
                     onClick={() => {
                       setMode("current");
@@ -633,11 +796,9 @@ export function DeploymentHistoryPanel({
                   >
                     Deploy release
                   </button>
-                  {(!ready || !composeRuntime) && (
+                  {unavailable && (
                     <span className="sr-only" id={`${release.id}-availability`}>
-                      {!ready
-                        ? "This release is not ready for deployment."
-                        : "Prior-release deployment requires the compose runtime."}
+                      {unavailableMessage}
                     </span>
                   )}
                 </div>
@@ -721,29 +882,110 @@ export function DeploymentHistoryPanel({
             error={jobs.error}
             empty={!job}
             loadingLabel="Checking waiting deployment jobs..."
-            emptyLabel="No waiting deployment requires approval."
+            emptyLabel="No waiting deployment requires action."
             retry={() => jobs.refetch()}
           >
-            {job && (
-              <div className="callout warning">
-                <Status value={job.status} />
-                <strong>Deployment is waiting for approval.</strong>
-                <span>
-                  {matched
-                    ? "Grant every listed matching fingerprint before resuming this job."
-                    : "The matching deployment record is not available yet."}
+            {job && disposition && (
+              <>
+                <span
+                  className="sr-only"
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                >
+                  {disposition === "approval_required"
+                    ? "Deployment is waiting for runtime approval."
+                    : disposition === "migration_approval_required"
+                      ? "Deployment is waiting for database migration approval."
+                      : "Deployment is waiting for temporary replacement capacity."}
                 </span>
-                {canResume && (
-                  <button
-                    type="button"
-                    className="button small"
-                    disabled={panelMutationPending}
-                    onClick={() => resumeWaitingJob(job.id)}
-                  >
-                    {resumePending ? "Resuming..." : "Resume waiting job"}
-                  </button>
-                )}
-              </div>
+                <div className="callout warning">
+                <Status value={job.status} />
+                  {disposition === "approval_required" && (
+                    <>
+                      <strong>Deployment is waiting for approval.</strong>
+                      <span>
+                        {matched
+                          ? "Grant every listed matching fingerprint before resuming this job."
+                          : "The matching deployment record is not available yet."}
+                      </span>
+                      {canResume && (
+                        <button
+                          type="button"
+                          className="button small"
+                          disabled={panelMutationPending}
+                          onClick={() =>
+                            resumeWaitingJob(
+                              job.id,
+                              "Waiting deployment resumed.",
+                            )
+                          }
+                        >
+                          {resumePending ? "Resuming..." : "Resume waiting job"}
+                        </button>
+                      )}
+                    </>
+                  )}
+                  {disposition === "migration_approval_required" && (
+                    <>
+                      <strong>Database migration approval required.</strong>
+                      <span>
+                        {migrationApproved
+                          ? "The migration is approved for this deployment plan. Resume the deployment when ready."
+                          : "Review and approve the database migration in the deployment plan panel before resuming this deployment."}
+                      </span>
+                      {!resumeRuntimeAvailable && (
+                        <span>The runtime pinned to this deployment is not available on this controller.</span>
+                      )}
+                      {canResume && (
+                        <button
+                          type="button"
+                          className="button small"
+                          disabled={panelMutationPending}
+                          onClick={() =>
+                            resumeWaitingJob(
+                              job.id,
+                              "Deployment resumed after migration approval.",
+                            )
+                          }
+                        >
+                          {resumePending
+                            ? "Resuming deployment..."
+                            : "Resume after migration approval"}
+                        </button>
+                      )}
+                    </>
+                  )}
+                  {disposition === "insufficient_replacement_capacity" && (
+                    <>
+                      <strong>Deployment needs temporary replacement capacity.</strong>
+                      <span>
+                        Blue/green replacement briefly runs both versions and needs enough free memory and disk. Free capacity, then retry.
+                      </span>
+                      {!resumeRuntimeAvailable && (
+                        <span>The runtime pinned to this deployment is not available on this controller.</span>
+                      )}
+                      {canResume && (
+                        <button
+                          type="button"
+                          className="button small"
+                          disabled={panelMutationPending}
+                          onClick={() =>
+                            resumeWaitingJob(
+                              job.id,
+                              "Replacement capacity retry queued.",
+                            )
+                          }
+                        >
+                          {resumePending
+                            ? "Retrying replacement capacity..."
+                            : "Retry replacement capacity"}
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              </>
             )}
           </Section>
         </Section>
@@ -821,11 +1063,21 @@ export function DeploymentHistoryPanel({
             <button
               type="button"
               className="button primary"
-              disabled={priorPending}
+              disabled={priorPending || !selectedPriorRuntimeAvailable}
+              aria-describedby={
+                !selectedPriorRuntimeAvailable
+                  ? "selected-prior-runtime-unavailable"
+                  : undefined
+              }
               onClick={() => deployPrior(prior)}
             >
               {priorPending ? "Queuing..." : "Deploy release"}
             </button>
+            {!selectedPriorRuntimeAvailable && (
+              <span id="selected-prior-runtime-unavailable" className="sr-only">
+                Rig can no longer verify the runtime pinned to this release.
+              </span>
+            )}
           </div>
         </Dialog>
       )}

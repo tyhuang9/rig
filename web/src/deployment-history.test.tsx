@@ -23,7 +23,9 @@ const release = {
   repositoryName: "service",
   trackedRef: "refs/heads/main",
   composePath: "deploy/compose.yaml",
+  runtimeStrategy: "compose",
   configurationRevisionNumber: 4,
+  deploymentPlanRevisionNumber: 0,
   createdAt: "2026-08-01T10:00:00Z",
   resolvedSha: "abcdef1234567890fedcba9876543210",
   workspaceState: "ready",
@@ -39,6 +41,8 @@ const deployment = {
   status: "needs_attention",
   configurationMode: "current",
   actualConfigurationRevisionNumber: 4,
+  runtimeStrategy: "compose",
+  deploymentPlanRevisionNumber: 0,
   startedAt: "2026-08-01T10:00:00Z",
   findings: [
     {
@@ -67,6 +71,55 @@ const waitingJob = {
   createdAt: "2026-08-01T10:00:00Z",
   updatedAt: "2026-08-01T10:00:00Z",
 };
+const generatedPlan = {
+  revisionId: "plan-generated-1",
+  revisionNumber: 2,
+  strategy: "generated_node",
+  state: "accepted",
+  canonicalDigest: "b".repeat(64),
+  source: {
+    provider: "github",
+    repositoryId: 1,
+    resolvedDigest: "c".repeat(64),
+  },
+  detector: {
+    name: "projectanalysis",
+    version: "2",
+    sourceStructuralFingerprint: "d".repeat(64),
+  },
+  components: [],
+  fieldProvenance: [],
+  migration: {
+    present: true,
+    approvalStatus: "pending",
+    command: "npm run migrate -- --token secret-command-value",
+  },
+};
+const generatedRelease = {
+  ...release,
+  id: "release-generated",
+  runtimeStrategy: "generated_node",
+  deploymentPlanRevisionId: generatedPlan.revisionId,
+  deploymentPlanRevisionNumber: generatedPlan.revisionNumber,
+};
+const generatedDeployment = {
+  ...deployment,
+  id: "deployment-generated",
+  jobId: "job-generated",
+  releaseId: generatedRelease.id,
+  runtimeStrategy: "generated_node",
+  deploymentPlanRevisionId: generatedPlan.revisionId,
+  deploymentPlanRevisionNumber: generatedPlan.revisionNumber,
+  findings: [],
+};
+
+const generatedWaitingJob = (pauseDisposition: string) => ({
+  ...waitingJob,
+  id: "job-generated",
+  pauseDisposition,
+  checkpoint: pauseDisposition,
+  phase: pauseDisposition,
+});
 
 function renderPanel(
   props: Partial<React.ComponentProps<typeof DeploymentHistoryPanel>> = {},
@@ -87,6 +140,7 @@ function renderPanel(
         appId={appId}
         composeRuntime
         fakeRuntime={false}
+        generatedRuntime={false}
         {...props}
       />
     </QueryClientProvider>,
@@ -114,6 +168,13 @@ function mockData({
     items: approvals,
   } as never);
   vi.spyOn(api, "jobs").mockResolvedValue({ items: jobs } as never);
+  vi.spyOn(api, "deploymentPlan").mockRejectedValue(
+    new APIError({
+      status: 404,
+      code: "deployment_plan_not_found",
+      detail: "No deployment plan has been accepted",
+    }),
+  );
   vi.spyOn(api, "deployApplication").mockResolvedValue({
     created: true,
     job: { id: "queued-1" },
@@ -157,8 +218,135 @@ describe("DeploymentHistoryPanel", () => {
         .hasAttribute("disabled"),
     ).toBe(true);
     expect(
-      screen.getByText("Deployment actions require a configured runtime."),
+      screen.getByText(
+        "Deploy latest requires the Compose runtime or the development fake runtime.",
+      ),
     ).not.toBeNull();
+  });
+
+  it("uses the accepted plan strategy to gate current and exact pinned generated deployments", async () => {
+    mockData({
+      deployments: [generatedDeployment] as never,
+      releases: [generatedRelease] as never,
+      approvals: [],
+      jobs: [],
+    });
+    vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan as never);
+    renderPanel({
+      composeRuntime: false,
+      fakeRuntime: false,
+      generatedRuntime: true,
+    });
+
+    const latest = await screen.findByRole("button", { name: "Deploy latest" });
+    const prior = screen.getByRole("button", { name: "Deploy release" });
+    await waitFor(() => expect((latest as HTMLButtonElement).disabled).toBe(false));
+    expect((prior as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      screen.queryByText(/requires the Compose runtime/i),
+    ).toBeNull();
+  });
+
+  it("does not substitute Compose or the fake runtime for generated deployments", async () => {
+    mockData({
+      deployments: [generatedDeployment] as never,
+      releases: [generatedRelease] as never,
+      approvals: [],
+      jobs: [],
+    });
+    vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan as never);
+    renderPanel({
+      composeRuntime: true,
+      fakeRuntime: true,
+      generatedRuntime: false,
+    });
+
+    const latest = await screen.findByRole("button", { name: "Deploy latest" });
+    await screen.findByText(
+      "Deploy latest requires the generated runtime on this controller.",
+    );
+    expect((latest as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      (screen.getByRole("button", { name: "Deploy release" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+  });
+
+  it("allows the fake runtime only for latest legacy Compose deployments", async () => {
+    mockData({ deployments: [], releases: [release], approvals: [], jobs: [] });
+    renderPanel({
+      composeRuntime: false,
+      fakeRuntime: true,
+      generatedRuntime: false,
+    });
+
+    const latest = await screen.findByRole("button", { name: "Deploy latest" });
+    await waitFor(() => expect((latest as HTMLButtonElement).disabled).toBe(false));
+    expect(
+      (screen.getByRole("button", { name: "Deploy release" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      screen.getByText("This release requires the Compose runtime."),
+    ).not.toBeNull();
+  });
+
+  it("uses exact release strategy provenance for superseded releases", async () => {
+    const superseded = {
+      ...generatedRelease,
+      id: "release-superseded",
+      deploymentPlanRevisionId: "plan-generated-old",
+      deploymentPlanRevisionNumber: 1,
+    };
+    mockData({
+      deployments: [],
+      releases: [superseded] as never,
+      approvals: [],
+      jobs: [],
+    });
+    vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan as never);
+    renderPanel({ generatedRuntime: true });
+
+    const prior = await screen.findByRole("button", { name: "Deploy release" });
+    expect((prior as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("fails closed when a release does not provide a known pinned strategy", async () => {
+    const unknownStrategy = { ...release, runtimeStrategy: "worker" };
+    mockData({
+      deployments: [],
+      releases: [unknownStrategy] as never,
+      approvals: [],
+      jobs: [],
+    });
+    renderPanel({ composeRuntime: true, generatedRuntime: true });
+
+    const prior = await screen.findByRole("button", { name: "Deploy release" });
+    expect((prior as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      screen.getByText("Rig cannot yet verify this release's pinned runtime."),
+    ).not.toBeNull();
+  });
+
+  it("keeps actions disabled and reports a safe error when plan lookup fails", async () => {
+    vi.mocked(api.deploymentPlan).mockRejectedValue(
+      new Error("database command secret-command-value"),
+    );
+    renderPanel({ composeRuntime: true, generatedRuntime: true });
+
+    expect(
+      await screen.findByText("Could not verify the deployment runtime."),
+    ).not.toBeNull();
+    expect(
+      (screen.getByRole("button", { name: "Deploy latest" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole("button", {
+        name: "Retry runtime check",
+      }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    expect(document.body.textContent).not.toContain("secret-command-value");
   });
 
   it("keeps waiting-job loading visible instead of showing completed approvals empty state", async () => {
@@ -389,6 +577,108 @@ describe("DeploymentHistoryPanel", () => {
     expect(prior.disabled).toBe(true);
     expect((revoke as HTMLButtonElement).disabled).toBe(true);
     await act(async () => resolve({ job: { id: waitingJob.id } } as never));
+  });
+
+  it("directs migration pauses to plan approval without exposing command text", async () => {
+    const migrationDeployment = {
+      ...generatedDeployment,
+      diagnosticCode: "migration_approval_required",
+      failureSummary: "secret-command-value",
+    };
+    mockData({
+      deployments: [migrationDeployment] as never,
+      releases: [generatedRelease] as never,
+      approvals: [],
+      jobs: [generatedWaitingJob("migration_approval_required")] as never,
+    });
+    vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan as never);
+    renderPanel({ generatedRuntime: true });
+
+    expect(
+      await screen.findByText("Database migration approval required."),
+    ).not.toBeNull();
+    expect(
+      screen.getByText(
+        "Review and approve the database migration in the deployment plan panel before resuming this deployment.",
+      ),
+    ).not.toBeNull();
+    expect(
+      screen.getAllByText("Database migration approval is required.").length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.queryByRole("button", { name: "Resume after migration approval" }),
+    ).toBeNull();
+    expect(document.body.textContent).not.toContain("secret-command-value");
+  });
+
+  it("resumes an approved migration through its exact generated runtime", async () => {
+    mockData({
+      deployments: [generatedDeployment] as never,
+      releases: [generatedRelease] as never,
+      approvals: [],
+      jobs: [generatedWaitingJob("migration_approval_required")] as never,
+    });
+    vi.mocked(api.deploymentPlan).mockResolvedValue({
+      ...generatedPlan,
+      migration: { ...generatedPlan.migration, approvalStatus: "approved" },
+    } as never);
+    renderPanel({ generatedRuntime: true });
+
+    const resume = await screen.findByRole("button", {
+      name: "Resume after migration approval",
+    });
+    resume.focus();
+    fireEvent.click(resume);
+    await waitFor(() =>
+      expect(api.resumeJob).toHaveBeenCalledWith("job-generated"),
+    );
+    expect(
+      await screen.findByText("Deployment resumed after migration approval."),
+    ).not.toBeNull();
+  });
+
+  it("explains blue-green capacity and retries only with the generated runtime", async () => {
+    const capacityDeployment = {
+      ...generatedDeployment,
+      diagnosticCode: "insufficient_replacement_capacity",
+      failureSummary: "secret-command-value",
+    };
+    mockData({
+      deployments: [capacityDeployment] as never,
+      releases: [generatedRelease] as never,
+      approvals: [],
+      jobs: [
+        generatedWaitingJob("insufficient_replacement_capacity"),
+      ] as never,
+    });
+    vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan as never);
+    renderPanel({ generatedRuntime: true });
+
+    expect(
+      await screen.findByText(
+        "Deployment needs temporary replacement capacity.",
+      ),
+    ).not.toBeNull();
+    expect(
+      screen.getByText(/Blue\/green replacement briefly runs both versions/),
+    ).not.toBeNull();
+    expect(
+      screen.getAllByText(
+        "More temporary capacity is required for a safe replacement.",
+      ).length,
+    ).toBeGreaterThan(0);
+    const retry = screen.getByRole("button", {
+      name: "Retry replacement capacity",
+    });
+    retry.focus();
+    fireEvent.click(retry);
+    await waitFor(() =>
+      expect(api.resumeJob).toHaveBeenCalledWith("job-generated"),
+    );
+    expect(
+      await screen.findByText("Replacement capacity retry queued."),
+    ).not.toBeNull();
+    expect(document.body.textContent).not.toContain("secret-command-value");
   });
 
   it("uses the selected current or original configuration for ready prior releases", async () => {
@@ -765,6 +1055,7 @@ describe("DeploymentHistoryPanel", () => {
           appId="app-b"
           composeRuntime
           fakeRuntime={false}
+          generatedRuntime={false}
         />
       </QueryClientProvider>,
     );
@@ -798,6 +1089,7 @@ describe("DeploymentHistoryPanel", () => {
           appId="app-b"
           composeRuntime
           fakeRuntime={false}
+          generatedRuntime={false}
         />
       </QueryClientProvider>,
     );
@@ -805,7 +1097,11 @@ describe("DeploymentHistoryPanel", () => {
       resolveOld({ created: true, job: { id: "old-job" } } as never),
     );
     expect(screen.queryByText("Deployment job old-job queued.")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Deploy latest" }));
+    const deployLatest = screen.getByRole("button", { name: "Deploy latest" });
+    await waitFor(() =>
+      expect((deployLatest as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(deployLatest);
     await waitFor(() =>
       expect(api.deployApplication).toHaveBeenLastCalledWith("app-b"),
     );
@@ -833,6 +1129,7 @@ describe("DeploymentHistoryPanel", () => {
           appId="app-b"
           composeRuntime
           fakeRuntime={false}
+          generatedRuntime={false}
         />
       </QueryClientProvider>,
     );
