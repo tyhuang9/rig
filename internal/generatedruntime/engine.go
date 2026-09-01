@@ -38,7 +38,7 @@ const (
 const (
 	networkInspectFormat   = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"internal":{{json .Internal}},"labels":{{json .Labels}}}`
 	imageInspectFormat     = `{"id":{{json .ID}},"size":{{json .Size}},"labels":{{json .Config.Labels}},"user":{{json .Config.User}},"workingDir":{{json .Config.WorkingDir}},"entrypoint":{{json .Config.Entrypoint}}}`
-	containerInspectFormat = `{"id":{{json .ID}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"user":{{json .Config.User}},"workingDir":{{json .Config.WorkingDir}},"cmd":{{json .Config.Cmd}},"healthTest":{{if .Config.Healthcheck}}{{json .Config.Healthcheck.Test}}{{else}}null{{end}},"healthInterval":{{if .Config.Healthcheck}}{{json .Config.Healthcheck.Interval}}{{else}}null{{end}},"healthTimeout":{{if .Config.Healthcheck}}{{json .Config.Healthcheck.Timeout}}{{else}}null{{end}},"healthStartPeriod":{{if .Config.Healthcheck}}{{json .Config.Healthcheck.StartPeriod}}{{else}}null{{end}},"healthRetries":{{if .Config.Healthcheck}}{{json .Config.Healthcheck.Retries}}{{else}}null{{end}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCPUs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"ulimits":{{json .HostConfig.Ulimits}},"init":{{json .HostConfig.Init}},"networkMode":{{json .HostConfig.NetworkMode}},"readonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"portBindings":{{json .HostConfig.PortBindings}},"tmpfs":{{json .HostConfig.Tmpfs}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"mounts":{{json .Mounts}},"running":{{json .State.Running}},"exitCode":{{json .State.ExitCode}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
+	containerInspectFormat = `{"id":{{json .ID}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"user":{{json .Config.User}},"workingDir":{{json .Config.WorkingDir}},"cmd":{{json .Config.Cmd}},"healthTest":{{if .Config.Healthcheck}}{{json .Config.Healthcheck.Test}}{{else}}null{{end}},"healthInterval":{{if .Config.Healthcheck}}{{json .Config.Healthcheck.Interval}}{{else}}null{{end}},"healthTimeout":{{if .Config.Healthcheck}}{{json .Config.Healthcheck.Timeout}}{{else}}null{{end}},"healthStartPeriod":{{if .Config.Healthcheck}}{{json .Config.Healthcheck.StartPeriod}}{{else}}null{{end}},"healthRetries":{{if .Config.Healthcheck}}{{json .Config.Healthcheck.Retries}}{{else}}null{{end}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCPUs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"ulimits":{{json .HostConfig.Ulimits}},"init":{{json .HostConfig.Init}},"networkMode":{{json .HostConfig.NetworkMode}},"readonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"portBindings":{{json .HostConfig.PortBindings}},"tmpfs":{{json .HostConfig.Tmpfs}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"running":{{json .State.Running}},"exitCode":{{json .State.ExitCode}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
 )
 
 // The string is controller-owned and contains no plan values. Port and path
@@ -726,7 +726,6 @@ type containerInspection struct {
 	LogType           string                                 `json:"logType"`
 	LogConfig         map[string]string                      `json:"logConfig"`
 	Restart           string                                 `json:"restart"`
-	Mounts            []mountInspection                      `json:"mounts"`
 	Running           bool                                   `json:"running"`
 	ExitCode          int                                    `json:"exitCode"`
 	Health            string                                 `json:"health"`
@@ -735,13 +734,6 @@ type containerInspection struct {
 
 type networkAttachmentInspection struct {
 	Aliases []string `json:"Aliases"`
-}
-
-type mountInspection struct {
-	Type        string `json:"Type"`
-	Source      string `json:"Source"`
-	Destination string `json:"Destination"`
-	RW          bool   `json:"RW"`
 }
 
 type ulimitInspection struct {
@@ -960,19 +952,16 @@ func matchesCandidateConfiguredHardening(container containerInspection, candidat
 	return exists && len(container.Tmpfs) == 1 && exactCommaValues(tmpfs, []string{"rw", "noexec", "nosuid", "nodev", "size=" + strconv.FormatInt(limits.TmpfsBytes, 10)})
 }
 
-// matchesCandidateHardening also validates Docker's runtime-realized state.
-// Health checks require this stronger predicate so a started container cannot
-// be accepted before its tmpfs mount and network alias are visible.
+// matchesCandidateHardening also validates Docker's runtime-realized network
+// state. The --tmpfs policy is recorded in HostConfig.Tmpfs and validated by
+// matchesCandidateConfiguredHardening; Docker does not consistently expose
+// --tmpfs entries through the runtime Mounts array.
 func matchesCandidateHardening(container containerInspection, candidate Candidate, limits ContainerLimits) bool {
-	if !matchesCandidateConfiguredHardening(container, candidate, limits) || !onlyRuntimeTmpfsMount(container.Mounts) {
+	if !matchesCandidateConfiguredHardening(container, candidate, limits) {
 		return false
 	}
 	attachment, attached := container.Networks[candidate.NetworkName]
 	return len(container.Networks) == 1 && attached && containsExact(attachment.Aliases, candidate.NetworkAlias)
-}
-
-func onlyRuntimeTmpfsMount(mounts []mountInspection) bool {
-	return len(mounts) == 1 && mounts[0].Type == "tmpfs" && mounts[0].Source == "" && mounts[0].Destination == "/tmp" && mounts[0].RW
 }
 
 func onlyNoNewPrivileges(values []string) bool {

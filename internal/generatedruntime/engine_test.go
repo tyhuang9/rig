@@ -391,6 +391,9 @@ func TestGeneratedRuntimeRequiresTwoLocalLogFiles(t *testing.T) {
 func TestGeneratedRuntimeHardeningRequiresAliasAndExactTmpfsPolicy(t *testing.T) {
 	spec := candidateSpec()
 	candidate := candidateForSpec(spec)
+	if !matchesCandidateHardening(hardenedInspection(spec, defaultLimits()), candidate, defaultLimits()) {
+		t.Fatal("exact tmpfs policy with realized network was rejected")
+	}
 	tests := []struct {
 		name   string
 		mutate func(*containerInspection)
@@ -416,7 +419,7 @@ func TestGeneratedRuntimeHardeningRequiresAliasAndExactTmpfsPolicy(t *testing.T)
 	}
 }
 
-func TestGeneratedRuntimeCreatedCandidateAllowsUnrealizedRuntimeStateUntilHealthCheck(t *testing.T) {
+func TestGeneratedRuntimeCreatedCandidateAllowsUnavailableNetworkUntilHealthCheck(t *testing.T) {
 	spec := candidateSpec()
 	created := false
 	started := false
@@ -461,7 +464,7 @@ func TestGeneratedRuntimeCreatedCandidateAllowsUnrealizedRuntimeStateUntilHealth
 		t.Fatalf("created candidate rejected before start: %v", err)
 	}
 	if err := engine.WaitHealthy(context.Background(), candidate); !IsCode(err, DiagnosticCandidateHardeningFailed) {
-		t.Fatalf("health check accepted missing realized mounts or network attachment: %v", err)
+		t.Fatalf("health check accepted missing runtime network attachment: %v", err)
 	}
 	if !removed {
 		t.Fatal("fully labeled created candidate was not removed during failure cleanup")
@@ -980,7 +983,6 @@ type templateDockerContainer struct {
 	Image           string
 	Config          templateDockerConfig
 	HostConfig      templateDockerHostConfig
-	Mounts          []templateDockerMount
 	State           templateDockerState
 	NetworkSettings *templateDockerNetworkSettings
 }
@@ -1034,13 +1036,6 @@ type templateDockerLogConfig struct {
 
 type templateDockerRestartPolicy struct {
 	Name string
-}
-
-type templateDockerMount struct {
-	Type        string
-	Source      string
-	Destination string
-	RW          bool
 }
 
 type templateDockerState struct {
@@ -1110,13 +1105,12 @@ func hardenedInspection(spec CandidateSpec, limits ContainerLimits) containerIns
 		NetworkMode: network, ReadonlyRootfs: true, Init: true, CapDrop: []string{"ALL"}, SecurityOptions: []string{"no-new-privileges:true"}, Ulimits: []ulimitInspection{{Name: "nofile", Soft: 1024, Hard: 1024}},
 		Tmpfs:   map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=" + stringInt(limits.TmpfsBytes)},
 		LogType: "local", LogConfig: map[string]string{"max-size": limits.LogSize, "max-file": stringInt(int64(limits.LogFiles))}, Restart: "no",
-		Mounts: []mountInspection{{Type: "tmpfs", Destination: "/tmp", RW: true}}, Networks: map[string]networkAttachmentInspection{network: {Aliases: []string{containerAlias(spec.ComponentName, slot)}}},
+		Networks: map[string]networkAttachmentInspection{network: {Aliases: []string{containerAlias(spec.ComponentName, slot)}}},
 	}
 }
 
 func configuredInspection(spec CandidateSpec, limits ContainerLimits) containerInspection {
 	inspection := hardenedInspection(spec, limits)
-	inspection.Mounts = nil
 	inspection.Networks = nil
 	return inspection
 }
