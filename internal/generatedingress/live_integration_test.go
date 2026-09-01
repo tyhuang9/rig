@@ -3,6 +3,10 @@ package generatedingress
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,10 +49,11 @@ const (
 // without retaining IDs or Docker output. It stores only fixed booleans and
 // fixed diagnostic reasons.
 type liveCreateObserver struct {
-	delegate      runtimeprocess.CommandRunner
-	mu            sync.Mutex
-	latest        liveCreateObservation
-	awaitingStart bool
+	delegate runtimeprocess.CommandRunner
+	random   io.Reader
+	mu       sync.Mutex
+	latest   liveCreateObservation
+	pending  livePendingStart
 }
 
 type liveCreateObservation struct {
@@ -58,6 +63,15 @@ type liveCreateObservation struct {
 	realization     liveCreateRealization
 	startReason     liveStartReason
 	createTaskMarks uint32
+	stateStatus     liveStateInspectStatus
+	stateReason     liveStartReason
+	stateMarks      uint32
+}
+
+type livePendingStart struct {
+	key    [sha256.Size]byte
+	tag    [sha256.Size]byte
+	active bool
 }
 
 type liveCreateHardening struct {
@@ -82,6 +96,21 @@ const (
 	liveCreateInspectOutputTruncated liveCreateInspectReason = "inspect_output_truncated"
 	liveCreateInspectDecodeFailed    liveCreateInspectReason = "inspect_decode_failed"
 	liveCreateInspectMissing         liveCreateInspectReason = "inspect_missing"
+)
+
+type liveStateInspectStatus string
+
+const (
+	liveStateInspectNotAttempted liveStateInspectStatus = "not_attempted"
+	liveStateInspectNone         liveStateInspectStatus = "none"
+	liveStateInspectCancelled    liveStateInspectStatus = "cancelled"
+	liveStateInspectCommand      liveStateInspectStatus = "command_failed"
+	liveStateInspectDeadline     liveStateInspectStatus = "deadline_exceeded"
+	liveStateInspectTruncated    liveStateInspectStatus = "output_truncated"
+	liveStateInspectDecode       liveStateInspectStatus = "decode_failed"
+	liveStateInspectNonString    liveStateInspectStatus = "non_string"
+	liveStateInspectMissing      liveStateInspectStatus = "missing"
+	liveStateInspectEmpty        liveStateInspectStatus = "empty"
 )
 
 type liveStartReason string
@@ -125,6 +154,7 @@ const (
 	liveStartOCIEntrypointMissing  liveStartReason = "oci_entrypoint_missing"
 	liveStartOCINetworkFailed      liveStartReason = "oci_network_failed"
 	liveStartOCIResourceFailed     liveStartReason = "oci_resource_failed"
+	liveStartOCIErrorUnavailable   liveStartReason = "oci_error_unavailable"
 	liveStartPermissionDenied      liveStartReason = "permission_denied"
 	liveStartFileMissing           liveStartReason = "file_missing"
 	liveStartReadOnlyFilesystem    liveStartReason = "read_only_filesystem"
@@ -186,7 +216,7 @@ type liveRawNetworkSettings struct {
 func (observer *liveCreateObserver) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
 	result, err := observer.delegate.Run(ctx, request)
 	if liveContainerStart(request.Args) {
-		observer.observeStartResult(ctx, result, err)
+		observer.observeStartResult(ctx, request, result, err)
 		return result, err
 	}
 	expectation, observe := liveGeneratedRuntimeCreateExpectation(request.Args)
@@ -200,13 +230,52 @@ func (observer *liveCreateObserver) Run(ctx context.Context, request runtimeproc
 	observation := observer.inspectCreatedContainer(ctx, request, string(containerID), expectation)
 	observer.mu.Lock()
 	observer.latest = observation
-	observer.awaitingStart = true
+	observer.clearPendingStartLocked()
+	observer.bindPendingStartLocked(containerID)
 	observer.mu.Unlock()
 	return result, err
 }
 
 func liveContainerStart(args []string) bool {
 	return len(args) == 3 && args[0] == "container" && args[1] == "start"
+}
+
+func (observer *liveCreateObserver) randomReader() io.Reader {
+	if observer.random != nil {
+		return observer.random
+	}
+	return cryptorand.Reader
+}
+
+func (observer *liveCreateObserver) bindPendingStartLocked(containerID []byte) bool {
+	if _, err := io.ReadFull(observer.randomReader(), observer.pending.key[:]); err != nil {
+		observer.clearPendingStartLocked()
+		return false
+	}
+	mac := hmac.New(sha256.New, observer.pending.key[:])
+	_, _ = mac.Write(containerID)
+	mac.Sum(observer.pending.tag[:0])
+	observer.pending.active = true
+	return true
+}
+
+func (observer *liveCreateObserver) pendingStartMatchesLocked(args []string) bool {
+	if !observer.pending.active || !liveContainerStart(args) || !liveContainerIDString(args[2]) {
+		return false
+	}
+	mac := hmac.New(sha256.New, observer.pending.key[:])
+	_, _ = mac.Write([]byte(args[2]))
+	var tag [sha256.Size]byte
+	mac.Sum(tag[:0])
+	matches := subtle.ConstantTimeCompare(tag[:], observer.pending.tag[:]) == 1
+	clear(tag[:])
+	return matches
+}
+
+func (observer *liveCreateObserver) clearPendingStartLocked() {
+	clear(observer.pending.key[:])
+	clear(observer.pending.tag[:])
+	observer.pending.active = false
 }
 
 func liveGeneratedRuntimeCreateExpectation(args []string) (liveCreateExpectation, bool) {
@@ -374,6 +443,19 @@ func liveContainerID(value []byte) bool {
 	return true
 }
 
+func liveContainerIDString(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for index := range value {
+		character := value[index]
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func clearLiveCommandResult(result *runtimeprocess.CommandResult) {
 	if result == nil {
 		return
@@ -383,12 +465,13 @@ func clearLiveCommandResult(result *runtimeprocess.CommandResult) {
 	*result = runtimeprocess.CommandResult{}
 }
 
-func (observer *liveCreateObserver) observeStartResult(ctx context.Context, result runtimeprocess.CommandResult, err error) {
+func (observer *liveCreateObserver) observeStartResult(ctx context.Context, request runtimeprocess.CommandRequest, result runtimeprocess.CommandResult, err error) {
 	observer.mu.Lock()
 	defer observer.mu.Unlock()
-	if !observer.awaitingStart {
+	if !observer.pendingStartMatchesLocked(request.Args) {
 		return
 	}
+	observer.clearPendingStartLocked()
 	reason := classifyLiveStartResult(ctx, result, err)
 	observer.latest.startReason = reason
 	if liveStartReasonAllowsCreateTaskMarkers(reason) {
@@ -396,7 +479,16 @@ func (observer *liveCreateObserver) observeStartResult(ctx context.Context, resu
 	} else {
 		observer.latest.createTaskMarks = 0
 	}
-	observer.awaitingStart = false
+	observer.latest.stateStatus = liveStateInspectNotAttempted
+	observer.latest.stateReason = liveStartNone
+	observer.latest.stateMarks = 0
+	if !liveStartReasonAllowsStateInspect(reason) {
+		return
+	}
+	status, stateReason, stateMarks := observer.inspectStartStateError(ctx, request)
+	observer.latest.stateStatus = status
+	observer.latest.stateReason = stateReason
+	observer.latest.stateMarks = stateMarks
 }
 
 func liveStartReasonAllowsCreateTaskMarkers(reason liveStartReason) bool {
@@ -406,6 +498,99 @@ func liveStartReasonAllowsCreateTaskMarkers(reason liveStartReason) bool {
 	default:
 		return true
 	}
+}
+
+func liveStartReasonAllowsStateInspect(reason liveStartReason) bool {
+	switch reason {
+	case liveStartNone, liveStartCancelled, liveStartTimeout, liveStartProcessTermination, liveStartOutputTruncated:
+		return false
+	default:
+		return true
+	}
+}
+
+func (observer *liveCreateObserver) inspectStartStateError(ctx context.Context, request runtimeprocess.CommandRequest) (liveStateInspectStatus, liveStartReason, uint32) {
+	inspectionRequest := runtimeprocess.CommandRequest{
+		Executable:  request.Executable,
+		Args:        []string{"container", "inspect", "--format", "{{json .State.Error}}", request.Args[2]},
+		Directory:   request.Directory,
+		Env:         request.Env,
+		Timeout:     liveCreateObservationTimeout,
+		OutputLimit: liveCreateObservationOutputLimit,
+	}
+	result, err := observer.delegate.Run(ctx, inspectionRequest)
+	clear(inspectionRequest.Args)
+	inspectionRequest.Args = nil
+	return liveStateObservationFromInspectResult(ctx, &result, err)
+}
+
+func liveStateObservationFromInspectResult(ctx context.Context, result *runtimeprocess.CommandResult, err error) (liveStateInspectStatus, liveStartReason, uint32) {
+	defer clearLiveCommandResult(result)
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		return liveStateInspectCancelled, liveStartNone, 0
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return liveStateInspectDeadline, liveStartNone, 0
+	}
+	if result.StdoutTruncated || result.StderrTruncated {
+		return liveStateInspectTruncated, liveStartNone, 0
+	}
+	if err != nil {
+		return liveStateInspectCommand, liveStartNone, 0
+	}
+	encoded := bytes.TrimSpace(result.Stdout)
+	if len(encoded) == 0 {
+		return liveStateInspectMissing, liveStartNone, 0
+	}
+	if !json.Valid(encoded) {
+		return liveStateInspectDecode, liveStartNone, 0
+	}
+	if encoded[0] != '"' {
+		return liveStateInspectNonString, liveStartNone, 0
+	}
+	if len(encoded) == 2 {
+		return liveStateInspectEmpty, liveStartNone, 0
+	}
+	return liveStateInspectNone, classifyLiveStateError(encoded), liveStateErrorMarkers(encoded)
+}
+
+func classifyLiveStateError(encoded []byte) liveStartReason {
+	return classifyLiveStartResult(context.Background(), runtimeprocess.CommandResult{Stderr: encoded}, errors.New("state error"))
+}
+
+func liveStateErrorMarkers(encoded []byte) uint32 {
+	var markers uint32
+	if containsAllASCIIInsensitive(encoded, "failed to start shim", "start failed") {
+		markers |= liveCreateTaskMarkShimLaunch
+	}
+	for _, marker := range []struct {
+		value   uint32
+		pattern string
+	}{
+		{value: liveCreateTaskMarkShimStart, pattern: "failed to start shim"},
+		{value: liveCreateTaskMarkRuntimePath, pattern: "failed to resolve runtime path"},
+		{value: liveCreateTaskMarkShimLogPipe, pattern: "open shim log pipe"},
+		{value: liveCreateTaskMarkBootstrapWrite, pattern: "failed to write bootstrap.json"},
+		{value: liveCreateTaskMarkTaskAdd, pattern: "failed to add task"},
+		{value: liveCreateTaskMarkShimTaskCreate, pattern: "failed to create shim task"},
+		{value: liveCreateTaskMarkShimIO, pattern: "failed to create init process i/o"},
+		{value: liveCreateTaskMarkOCICreate, pattern: "oci runtime create failed"},
+		{value: liveCreateTaskMarkOCIErrorUnavailable, pattern: "unable to retrieve oci runtime error"},
+		{value: liveCreateTaskMarkRunCCreate, pattern: "runc create failed"},
+		{value: liveCreateTaskMarkRunCParent, pattern: "unable to create new parent process"},
+		{value: liveCreateTaskMarkRunCProcess, pattern: "unable to start container process"},
+		{value: liveCreateTaskMarkExecFIFO, pattern: "unable to setup exec fifo"},
+		{value: liveCreateTaskMarkContainerInit, pattern: "error during container init"},
+		{value: liveCreateTaskMarkExecFormat, pattern: "exec format error"},
+		{value: liveCreateTaskMarkFileExists, pattern: "file exists"},
+		{value: liveCreateTaskMarkConnectionRefused, pattern: "connection refused"},
+		{value: liveCreateTaskMarkPIDPipeEOF, pattern: "pipe: eof"},
+	} {
+		if containsASCIIInsensitive(encoded, marker.pattern) {
+			markers |= marker.value
+		}
+	}
+	return markers
 }
 
 func classifyLiveStartResult(ctx context.Context, result runtimeprocess.CommandResult, err error) liveStartReason {
@@ -418,11 +603,11 @@ func classifyLiveStartResult(ctx context.Context, result runtimeprocess.CommandR
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
 		return liveStartTimeout
 	}
-	if errors.Is(err, runtimeprocess.ErrTerminationFailed) {
-		return liveStartProcessTermination
-	}
 	if result.StdoutTruncated || result.StderrTruncated {
 		return liveStartOutputTruncated
+	}
+	if errors.Is(err, runtimeprocess.ErrTerminationFailed) {
+		return liveStartProcessTermination
 	}
 	var executableError *exec.Error
 	var pathError *os.PathError
@@ -471,6 +656,9 @@ func classifyLiveStartResult(ctx context.Context, result runtimeprocess.CommandR
 	if liveStartOutputContainsAll(result, "oci runtime create failed", "cgroup") {
 		return liveStartOCIResourceFailed
 	}
+	if liveStartOutputContains(result, "unable to retrieve oci runtime error") {
+		return liveStartOCIErrorUnavailable
+	}
 	if liveStartOutputContains(result, "cannot allocate memory") {
 		return liveStartMemoryExhausted
 	}
@@ -498,14 +686,14 @@ func classifyLiveStartResult(ctx context.Context, result runtimeprocess.CommandR
 	if liveStartOutputContains(result, "failed to create shim task") {
 		return liveStartShimTaskFailed
 	}
-	if liveStartOutputContains(result, "failed to create task") {
-		return liveStartCreateTaskFailed
-	}
 	if liveStartOutputContainsAny(result, "failed to start task", "oci runtime start failed") {
 		return liveStartTaskStartFailed
 	}
 	if liveStartOutputContainsAny(result, "oci runtime create failed", "runc create failed") {
 		return liveStartOCIRuntimeFailed
+	}
+	if liveStartOutputContains(result, "failed to create task") {
+		return liveStartCreateTaskFailed
 	}
 	return liveStartCommandFailed
 }
@@ -644,7 +832,7 @@ func liveCreateTaskMarkerNames(markers uint32) string {
 func (observer *liveCreateObserver) reset() {
 	observer.mu.Lock()
 	observer.latest = liveCreateObservation{}
-	observer.awaitingStart = false
+	observer.clearPendingStartLocked()
 	observer.mu.Unlock()
 }
 
@@ -667,6 +855,15 @@ func (observer *liveCreateObserver) failureDiagnostic() string {
 		startReason = liveStartNone
 	}
 	createTaskMarkers := liveCreateTaskMarkerNames(observation.createTaskMarks)
+	stateStatus := observation.stateStatus
+	if stateStatus == "" {
+		stateStatus = liveStateInspectNotAttempted
+	}
+	stateReason := observation.stateReason
+	if stateReason == "" {
+		stateReason = liveStartNone
+	}
+	stateMarkers := liveCreateTaskMarkerNames(observation.stateMarks)
 	realization := "unobserved"
 	if observation.createSucceeded && reason == liveCreateInspectNone {
 		realization = "mounts_realized:" + strconv.FormatBool(observation.realization.MountsRealized) + ",network_realized:" + strconv.FormatBool(observation.realization.NetworkRealized)
@@ -676,7 +873,10 @@ func (observer *liveCreateObserver) failureDiagnostic() string {
 		" hardening_mismatches=" + mismatches +
 		" realization_state=" + realization +
 		" start_reason=" + string(startReason) +
-		" create_task_markers=" + createTaskMarkers
+		" create_task_markers=" + createTaskMarkers +
+		" state_error_status=" + string(stateStatus) +
+		" state_error_reason=" + string(stateReason) +
+		" state_error_markers=" + stateMarkers
 }
 
 func liveCreateHardeningMismatches(hardening liveCreateHardening) []string {
@@ -803,7 +1003,7 @@ func TestLiveCreateObservationDiagnosticIsRedacted(t *testing.T) {
 		},
 		realization: liveCreateRealization{NetworkRealized: true},
 	}}).failureDiagnostic()
-	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=network_mode,tmpfs,security_options realization_state=mounts_realized:false,network_realized:true start_reason=none create_task_markers=none"
+	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=network_mode,tmpfs,security_options realization_state=mounts_realized:false,network_realized:true start_reason=none create_task_markers=none state_error_status=not_attempted state_error_reason=none state_error_markers=none"
 	if diagnostic != want {
 		t.Fatalf("redacted observation diagnostic = %q, want %q", diagnostic, want)
 	}
@@ -819,7 +1019,7 @@ func TestLiveCreateObserverResetDropsPriorAttempt(t *testing.T) {
 		createSucceeded: true, inspectReason: liveCreateInspectNone, hardening: liveCreateHardening{NetworkMode: false}, startReason: liveStartCreateTaskFailed, createTaskMarks: liveCreateTaskMarkOuter,
 	}}
 	observer.reset()
-	const want = " generated_runtime_create_observed=false inspect_reason=none hardening_mismatches=none realization_state=unobserved start_reason=none create_task_markers=none"
+	const want = " generated_runtime_create_observed=false inspect_reason=none hardening_mismatches=none realization_state=unobserved start_reason=none create_task_markers=none state_error_status=not_attempted state_error_reason=none state_error_markers=none"
 	if diagnostic := observer.failureDiagnostic(); diagnostic != want {
 		t.Fatalf("reset observation diagnostic = %q, want %q", diagnostic, want)
 	}
@@ -860,7 +1060,7 @@ func TestLiveRawInspectDecodeClassifiesAndRedacts(t *testing.T) {
 		t.Fatal("raw inspect result was retained")
 	}
 	diagnostic := (&liveCreateObserver{latest: observation}).failureDiagnostic()
-	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=none realization_state=mounts_realized:true,network_realized:true start_reason=none create_task_markers=none"
+	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=none realization_state=mounts_realized:true,network_realized:true start_reason=none create_task_markers=none state_error_status=not_attempted state_error_reason=none state_error_markers=none"
 	if diagnostic != want {
 		t.Fatalf("redacted raw inspect diagnostic = %q, want %q", diagnostic, want)
 	}
@@ -979,7 +1179,10 @@ func TestLiveStartResultClassifierPrecedence(t *testing.T) {
 		want   liveStartReason
 	}{
 		{name: "success wins over sensitive output", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: permission denied: sensitive-start-output")}, want: liveStartNone},
-		{name: "truncation before content", result: runtimeprocess.CommandResult{Stderr: []byte("failed to set up container networking: sensitive-start-output"), StderrTruncated: true}, err: errors.New("command exited"), want: liveStartOutputTruncated},
+		{name: "cancellation before truncation", result: runtimeprocess.CommandResult{StderrTruncated: true}, err: errors.Join(context.Canceled, errors.New("command exited")), want: liveStartCancelled},
+		{name: "deadline before truncation", result: runtimeprocess.CommandResult{StderrTruncated: true}, err: errors.Join(context.DeadlineExceeded, errors.New("command exited")), want: liveStartTimeout},
+		{name: "truncation before process termination", result: runtimeprocess.CommandResult{StderrTruncated: true}, err: runtimeprocess.ErrTerminationFailed, want: liveStartOutputTruncated},
+		{name: "truncation before generic command", result: runtimeprocess.CommandResult{Stderr: []byte("failed to set up container networking: sensitive-start-output"), StderrTruncated: true}, err: errors.New("command exited"), want: liveStartOutputTruncated},
 		{name: "source entrypoint before generic permission", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: exec sensitive-rig-entrypoint: permission denied: sensitive-start-output")}, err: errors.New("command exited"), want: liveStartOCIEntrypointDenied},
 		{name: "pids before generic cgroup", result: runtimeprocess.CommandResult{Stderr: []byte("cannot set pids limit: unable to apply cgroup configuration: sensitive-start-output")}, err: errors.New("command exited"), want: liveStartPIDsExhausted},
 		{name: "security before generic resource", result: runtimeprocess.CommandResult{Stderr: []byte("unable to apply apparmor profile: resource temporarily unavailable: sensitive-start-output")}, err: errors.New("command exited"), want: liveStartSecurityPolicyFailed},
@@ -990,6 +1193,26 @@ func TestLiveStartResultClassifierPrecedence(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if reason := classifyLiveStartResult(context.Background(), test.result, test.err); reason != test.want {
 				t.Fatalf("start reason = %q, want %q", reason, test.want)
+			}
+		})
+	}
+}
+
+func TestLiveOCIErrorUnavailablePrecedesGenericErrnoReasons(t *testing.T) {
+	for _, generic := range []string{
+		"cannot allocate memory",
+		"read-only file system",
+		"operation not permitted",
+		"invalid argument",
+		"no space left on device",
+		"permission denied",
+		"no such file or directory",
+		"resource temporarily unavailable",
+	} {
+		t.Run(generic, func(t *testing.T) {
+			result := runtimeprocess.CommandResult{Stderr: []byte("unable to retrieve OCI runtime error: " + generic + ": sensitive-start-output")}
+			if reason := classifyLiveStartResult(context.Background(), result, errors.New("command exited")); reason != liveStartOCIErrorUnavailable {
+				t.Fatalf("start reason = %q, want %q", reason, liveStartOCIErrorUnavailable)
 			}
 		})
 	}
@@ -1078,32 +1301,299 @@ func TestLiveCreateTaskMarkersRequireShimLaunchContext(t *testing.T) {
 }
 
 func TestLiveCreateTaskMarkersAreClearedForControlAndTruncation(t *testing.T) {
-	observer := &liveCreateObserver{awaitingStart: true, latest: liveCreateObservation{createSucceeded: true, inspectReason: liveCreateInspectNone}}
-	observer.observeStartResult(context.Background(), runtimeprocess.CommandResult{
+	runner := &liveStateInspectRunner{}
+	observer, request := newLivePendingStartObserver(t, runner)
+	observer.observeStartResult(context.Background(), request, runtimeprocess.CommandResult{
 		Stderr:          []byte("failed to create task for container: oci runtime create failed: sensitive-create-task-output"),
 		StderrTruncated: true,
 	}, errors.New("command exited"))
-	if observer.latest.startReason != liveStartOutputTruncated || observer.latest.createTaskMarks != 0 {
+	if observer.latest.startReason != liveStartOutputTruncated || observer.latest.createTaskMarks != 0 || runner.calls != 0 {
 		t.Fatal("truncated start retained create-task markers")
 	}
-	observer.awaitingStart = true
-	observer.observeStartResult(context.Background(), runtimeprocess.CommandResult{Stderr: []byte("failed to create task for container: oci runtime create failed: sensitive-create-task-output")}, nil)
-	if observer.latest.startReason != liveStartNone || observer.latest.createTaskMarks != 0 {
+	observer, request = newLivePendingStartObserver(t, runner)
+	observer.observeStartResult(context.Background(), request, runtimeprocess.CommandResult{Stderr: []byte("failed to create task for container: oci runtime create failed: sensitive-create-task-output")}, nil)
+	if observer.latest.startReason != liveStartNone || observer.latest.createTaskMarks != 0 || runner.calls != 0 {
 		t.Fatal("successful start retained create-task markers")
 	}
 }
 
 func TestLiveStartObserverRequiresPendingGeneratedCreate(t *testing.T) {
-	observer := &liveCreateObserver{latest: liveCreateObservation{createSucceeded: true, inspectReason: liveCreateInspectNone}}
-	observer.observeStartResult(context.Background(), runtimeprocess.CommandResult{Stderr: []byte("sensitive-start-output")}, errors.New("command exited"))
+	runner := &liveStateInspectRunner{}
+	observer := &liveCreateObserver{delegate: runner, latest: liveCreateObservation{createSucceeded: true, inspectReason: liveCreateInspectNone}}
+	request := runtimeprocess.CommandRequest{Args: []string{"container", "start", strings.Repeat("a", 64)}}
+	observer.observeStartResult(context.Background(), request, runtimeprocess.CommandResult{Stderr: []byte("sensitive-start-output")}, errors.New("command exited"))
 	if observer.latest.startReason != "" {
 		t.Fatal("start result without a generated create was retained")
 	}
-	observer.awaitingStart = true
-	observer.observeStartResult(context.Background(), runtimeprocess.CommandResult{Stderr: []byte("sensitive-start-output")}, errors.New("command exited"))
-	if observer.latest.startReason != liveStartCommandFailed || observer.awaitingStart {
+	observer, request = newLivePendingStartObserver(t, runner)
+	runner.result = runtimeprocess.CommandResult{Stdout: []byte(`""`)}
+	observer.observeStartResult(context.Background(), request, runtimeprocess.CommandResult{Stderr: []byte("sensitive-start-output")}, errors.New("command exited"))
+	if observer.latest.startReason != liveStartCommandFailed || observer.pending.active || runner.calls != 1 {
 		t.Fatal("pending generated create did not retain only a fixed start reason")
 	}
+}
+
+type liveStateInspectRunner struct {
+	result        runtimeprocess.CommandResult
+	err           error
+	calls         int
+	inspectShape  bool
+	inspectConfig bool
+}
+
+func (runner *liveStateInspectRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	runner.calls++
+	runner.inspectShape = len(request.Args) == 5 && request.Args[0] == "container" && request.Args[1] == "inspect" && request.Args[2] == "--format" && request.Args[3] == "{{json .State.Error}}" && liveContainerIDString(request.Args[4])
+	runner.inspectConfig = request.Executable == "docker" && request.Directory == "test-directory" && len(request.Env) == 1 && request.Env[0] == "SENSITIVE_ENV=value" && request.Timeout <= liveCreateObservationTimeout && request.Timeout > 0 && request.OutputLimit == liveCreateObservationOutputLimit
+	return runner.result, runner.err
+}
+
+func newLivePendingStartObserver(t *testing.T, runner *liveStateInspectRunner) (*liveCreateObserver, runtimeprocess.CommandRequest) {
+	t.Helper()
+	observer := &liveCreateObserver{
+		delegate: runner,
+		random:   bytes.NewReader(bytes.Repeat([]byte{0x5a}, sha256.Size)),
+		latest:   liveCreateObservation{createSucceeded: true, inspectReason: liveCreateInspectNone},
+	}
+	id := strings.Repeat("a", 64)
+	observer.mu.Lock()
+	if !observer.bindPendingStartLocked([]byte(id)) {
+		observer.mu.Unlock()
+		t.Fatal("bind pending start")
+	}
+	observer.mu.Unlock()
+	return observer, runtimeprocess.CommandRequest{Executable: "docker", Args: []string{"container", "start", id}, Directory: "test-directory", Env: []string{"SENSITIVE_ENV=value"}}
+}
+
+func TestLiveStartObserverRequiresExactBoundIDAndClearsHMAC(t *testing.T) {
+	runner := &liveStateInspectRunner{result: runtimeprocess.CommandResult{Stdout: []byte(`""`)}}
+	observer, request := newLivePendingStartObserver(t, runner)
+	if !observer.pending.active || allZero(observer.pending.key[:]) || allZero(observer.pending.tag[:]) {
+		t.Fatal("pending HMAC was not bound")
+	}
+	for _, args := range [][]string{
+		{"container", "start", strings.Repeat("b", 64)},
+		{"container", "start", request.Args[2][:63]},
+		{"container", "start", "candidate-name"},
+		{"container", "start", strings.Repeat("A", 64)},
+		{"container", "start"},
+	} {
+		observer.observeStartResult(context.Background(), runtimeprocess.CommandRequest{Args: args}, runtimeprocess.CommandResult{Stderr: []byte("sensitive-start-output")}, errors.New("command exited"))
+		if !observer.pending.active || runner.calls != 0 {
+			t.Fatal("mismatched or invalid start consumed pending state")
+		}
+	}
+	start := runtimeprocess.CommandResult{Stderr: []byte("sensitive-start-output")}
+	observer.observeStartResult(context.Background(), request, start, errors.New("command exited"))
+	if observer.pending.active || !allZero(observer.pending.key[:]) || !allZero(observer.pending.tag[:]) || runner.calls != 1 || !runner.inspectShape || !runner.inspectConfig {
+		t.Fatal("exact start did not consume and clear the bound HMAC")
+	}
+	if !bytes.Contains(start.Stderr, []byte("sensitive-start-output")) {
+		t.Fatal("state inspection cleared the original start result")
+	}
+	observer.observeStartResult(context.Background(), request, start, errors.New("command exited"))
+	if runner.calls != 1 {
+		t.Fatal("replayed start triggered a second inspection")
+	}
+
+	observer, request = newLivePendingStartObserver(t, runner)
+	observer.reset()
+	if observer.pending.active || !allZero(observer.pending.key[:]) || !allZero(observer.pending.tag[:]) {
+		t.Fatal("reset did not clear the pending HMAC")
+	}
+	observer.observeStartResult(context.Background(), request, start, errors.New("command exited"))
+	if runner.calls != 1 {
+		t.Fatal("reset pending start triggered inspection")
+	}
+}
+
+func TestLiveStateInspectClassifiesAndClearsOwnedBuffers(t *testing.T) {
+	cancelledCtx, cancelCancelled := context.WithCancel(context.Background())
+	cancelCancelled()
+	deadlineCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	for _, test := range []struct {
+		name   string
+		ctx    context.Context
+		stdout string
+		err    error
+		trunc  bool
+		want   liveStateInspectStatus
+	}{
+		{name: "command", ctx: context.Background(), stdout: "sensitive-state-output", err: errors.New("inspect failed"), want: liveStateInspectCommand},
+		{name: "cancelled before truncation", ctx: cancelledCtx, stdout: "sensitive-state-output", trunc: true, err: errors.New("inspect failed"), want: liveStateInspectCancelled},
+		{name: "deadline before truncation", ctx: deadlineCtx, stdout: "sensitive-state-output", trunc: true, err: errors.New("inspect failed"), want: liveStateInspectDeadline},
+		{name: "truncated before command", ctx: context.Background(), stdout: "sensitive-state-output", trunc: true, err: errors.New("inspect failed"), want: liveStateInspectTruncated},
+		{name: "decode", ctx: context.Background(), stdout: "{sensitive-state-output", want: liveStateInspectDecode},
+		{name: "non string", ctx: context.Background(), stdout: "null", want: liveStateInspectNonString},
+		{name: "missing", ctx: context.Background(), stdout: " \n\t", want: liveStateInspectMissing},
+		{name: "empty", ctx: context.Background(), stdout: `""`, want: liveStateInspectEmpty},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stdout := []byte(test.stdout)
+			stderr := []byte("sensitive-inspect-stderr")
+			result := runtimeprocess.CommandResult{Stdout: stdout, Stderr: stderr, StdoutTruncated: test.trunc}
+			status, reason, marks := liveStateObservationFromInspectResult(test.ctx, &result, test.err)
+			if status != test.want || reason != liveStartNone || marks != 0 {
+				t.Fatalf("state inspection = (%q, %q, %#x), want (%q, none, 0)", status, reason, marks, test.want)
+			}
+			if result.Stdout != nil || result.Stderr != nil || !allZero(stdout) || !allZero(stderr) {
+				t.Fatal("state inspection retained owned buffers")
+			}
+		})
+	}
+}
+
+func TestLiveStateInspectAugmentsDiagnosticsWithoutCrossSourceSynthesis(t *testing.T) {
+	runner := &liveStateInspectRunner{result: runtimeprocess.CommandResult{Stdout: []byte(`"OCI runtime create failed: runc create failed: sensitive-state-output"`)}}
+	observer, request := newLivePendingStartObserver(t, runner)
+	observer.observeStartResult(context.Background(), request, runtimeprocess.CommandResult{Stderr: []byte("failed to create task for container: sensitive-start-output")}, errors.New("command exited"))
+	if observer.latest.startReason != liveStartCreateTaskFailed || observer.latest.createTaskMarks != liveCreateTaskMarkOuter || observer.latest.stateStatus != liveStateInspectNone || observer.latest.stateReason != liveStartOCIRuntimeFailed || observer.latest.stateMarks != liveCreateTaskMarkOCICreate|liveCreateTaskMarkRunCCreate {
+		t.Fatal("state inspection did not retain only fixed augmenting signals")
+	}
+	diagnostic := observer.failureDiagnostic()
+	if !strings.Contains(diagnostic, "create_task_markers=create_task_outer") || !strings.Contains(diagnostic, "state_error_reason=oci_runtime_failed") || !strings.Contains(diagnostic, "state_error_markers=oci_create,runc_create") || strings.Contains(diagnostic, "sensitive-start-output") || strings.Contains(diagnostic, "sensitive-state-output") {
+		t.Fatal("state inspection diagnostic was not redacted")
+	}
+
+	stdout := []byte(`"OCI runtime create failed: sensitive-state-output"`)
+	stderr := []byte("runc create failed: sensitive-inspect-stderr")
+	status, reason, marks := liveStateObservationFromInspectResult(context.Background(), &runtimeprocess.CommandResult{Stdout: stdout, Stderr: stderr}, nil)
+	if status != liveStateInspectNone || reason != liveStartOCIRuntimeFailed || marks != liveCreateTaskMarkOCICreate || !allZero(stdout) || !allZero(stderr) {
+		t.Fatal("state inspection synthesized markers across streams")
+	}
+}
+
+func TestLiveStateInspectOCIErrorUnavailablePrecedesMissingFile(t *testing.T) {
+	stdout := []byte(`"unable to retrieve OCI runtime error: no such file or directory: sensitive-state-output"`)
+	status, reason, marks := liveStateObservationFromInspectResult(context.Background(), &runtimeprocess.CommandResult{Stdout: stdout}, nil)
+	if status != liveStateInspectNone || reason != liveStartOCIErrorUnavailable || marks != liveCreateTaskMarkOCIErrorUnavailable || !allZero(stdout) {
+		t.Fatal("OCI error-unavailable did not precede generic missing-file classification")
+	}
+}
+
+func TestLivePendingStartEntropyFailureClearsInactiveHMAC(t *testing.T) {
+	observer := &liveCreateObserver{random: livePartialEntropyReader{}}
+	for index := range observer.pending.key {
+		observer.pending.key[index] = 0xff
+		observer.pending.tag[index] = 0xff
+	}
+	observer.pending.active = true
+	observer.mu.Lock()
+	bound := observer.bindPendingStartLocked([]byte(strings.Repeat("a", 64)))
+	observer.mu.Unlock()
+	if bound || observer.pending.active || !allZero(observer.pending.key[:]) || !allZero(observer.pending.tag[:]) {
+		t.Fatal("entropy failure retained a pending HMAC")
+	}
+}
+
+func TestLiveStateDiagnosticRedactsFixedCanaries(t *testing.T) {
+	canaries := []string{
+		strings.Repeat("d", 64),
+		"sensitive-container-name",
+		"/host/sensitive/path",
+		"sensitive-command --flag",
+		"SENSITIVE_ENV=value",
+		"sensitive-image:tag",
+		"sensitive-label=value",
+		"raw-error-canary",
+	}
+	rawState := "OCI runtime create failed: " + strings.Join(canaries, " | ")
+	state := []byte(strconv.Quote(rawState))
+	runner := &liveStateInspectRunner{result: runtimeprocess.CommandResult{Stdout: state}}
+	observer, request := newLivePendingStartObserver(t, runner)
+	start := runtimeprocess.CommandResult{Stderr: []byte("failed to create task for container: " + strings.Join(canaries, " | "))}
+	observer.observeStartResult(context.Background(), request, start, errors.New("command exited"))
+	diagnostic := observer.failureDiagnostic()
+	for _, canary := range canaries {
+		if strings.Contains(diagnostic, canary) {
+			t.Fatal("state diagnostic exposed a sensitive canary")
+		}
+	}
+	if !allZero(state) || !bytes.Contains(start.Stderr, []byte("raw-error-canary")) {
+		t.Fatal("observer did not clear only its owned state output")
+	}
+}
+
+func TestLiveStartObserverResetDuringBlockedStateInspectIsRaceSafe(t *testing.T) {
+	runner := &liveBlockingStateInspectRunner{
+		liveStateInspectRunner: liveStateInspectRunner{result: runtimeprocess.CommandResult{Stdout: []byte(`""`)}},
+		started:                make(chan struct{}),
+		release:                make(chan struct{}),
+	}
+	observer, request := newLivePendingStartObserver(t, &runner.liveStateInspectRunner)
+	observer.delegate = runner
+	startDone := make(chan struct{})
+	go func() {
+		observer.observeStartResult(context.Background(), request, runtimeprocess.CommandResult{Stderr: []byte("sensitive-start-output")}, errors.New("command exited"))
+		close(startDone)
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("state inspection did not start")
+	}
+	resetStarted := make(chan struct{})
+	resetDone := make(chan struct{})
+	go func() {
+		close(resetStarted)
+		observer.reset()
+		close(resetDone)
+	}()
+	<-resetStarted
+	select {
+	case <-resetDone:
+		t.Fatal("reset completed while state inspection held the observer lock")
+	default:
+	}
+	close(runner.release)
+	select {
+	case <-startDone:
+	case <-time.After(time.Second):
+		t.Fatal("start observation did not finish")
+	}
+	select {
+	case <-resetDone:
+	case <-time.After(time.Second):
+		t.Fatal("reset did not finish")
+	}
+	observer.mu.Lock()
+	latest := observer.latest
+	observer.mu.Unlock()
+	if latest != (liveCreateObservation{}) || observer.pending.active {
+		t.Fatal("reset did not win after blocked state inspection")
+	}
+}
+
+type livePartialEntropyReader struct{}
+
+func (livePartialEntropyReader) Read(values []byte) (int, error) {
+	if len(values) == 0 {
+		return 0, errors.New("entropy unavailable")
+	}
+	values[0] = 0xff
+	return 1, errors.New("entropy unavailable")
+}
+
+type liveBlockingStateInspectRunner struct {
+	liveStateInspectRunner
+	started chan struct{}
+	release chan struct{}
+}
+
+func (runner *liveBlockingStateInspectRunner) Run(context.Context, runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	close(runner.started)
+	<-runner.release
+	return runner.result, runner.err
+}
+
+func allZero(values []byte) bool {
+	for _, value := range values {
+		if value != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func liveCandidateSpec(version, appID, planID string) generatedruntime.CandidateSpec {
