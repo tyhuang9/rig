@@ -1,0 +1,68 @@
+name: Generated runtime lifecycle CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+  GOFLAGS: -mod=readonly
+  GOTOOLCHAIN: local
+
+jobs:
+  generated-runtime-lifecycle:
+    name: Disposable Docker blue-green verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        timeout-minutes: 2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        timeout-minutes: 3
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Exercise generated blue-green replacement
+        timeout-minutes: 20
+        env:
+          RIG_RUN_LIVE_GENERATED_RUNTIME: "1"
+        run: go test -count=1 -timeout=19m ./internal/generatedingress -run '^TestLiveGeneratedBlueGreenLifecycle$'
+
+      - name: Run generated-runtime race tests
+        timeout-minutes: 10
+        run: >-
+          go test -race -count=1 -timeout=9m
+          ./internal/projectanalysis
+          ./internal/deploymentplans
+          ./internal/generatedimage
+          ./internal/generatedruntime
+          ./internal/generatedingress
+          ./internal/generatedexecutor
+          ./internal/generatedruntimestate
+          ./internal/generatedrecovery
+          ./internal/autodeploy
+
+      - name: Require complete Docker cleanup
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          containers="$(docker ps --all --filter label=io.rig.managed --format '{{.ID}} {{.Names}} {{.Status}}')"
+          networks="$(docker network ls --filter label=io.rig.managed --format '{{.ID}} {{.Name}}')"
+          if [[ -n "$containers" || -n "$networks" ]] || docker volume inspect rig-generated-caddy-config-v1 >/dev/null 2>&1; then
+            printf 'Generated runtime resources were not cleaned up.\nContainers:\n%s\nNetworks:\n%s\n' "$containers" "$networks" >&2
+            exit 1
+          fi
