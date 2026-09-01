@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/generatedrecovery"
 )
 
 type Status string
@@ -63,24 +64,25 @@ type Deployment struct {
 }
 
 type Release struct {
-	ID                           string    `json:"id"`
-	AppID                        string    `json:"appId"`
-	SourceProvider               string    `json:"sourceProvider"`
-	RepositoryID                 int64     `json:"repositoryId,omitempty"`
-	RepositoryOwner              string    `json:"repositoryOwner,omitempty"`
-	RepositoryName               string    `json:"repositoryName,omitempty"`
-	TrackedRef                   string    `json:"trackedRef,omitempty"`
-	ResolvedSHA                  string    `json:"resolvedSha,omitempty"`
-	SourceCommitSHA              string    `json:"sourceCommitSha,omitempty"`
-	SourceBranch                 string    `json:"sourceBranch,omitempty"`
-	ComposePath                  string    `json:"composePath,omitempty"`
-	ArchiveSHA256                string    `json:"archiveSha256,omitempty"`
-	WorkspaceState               string    `json:"workspaceState,omitempty"`
-	ConfigurationRevisionID      string    `json:"configurationRevisionId,omitempty"`
-	ConfigurationRevisionNumber  int64     `json:"configurationRevisionNumber"`
-	DeploymentPlanRevisionID     string    `json:"deploymentPlanRevisionId,omitempty"`
-	DeploymentPlanRevisionNumber int64     `json:"deploymentPlanRevisionNumber"`
-	CreatedAt                    time.Time `json:"createdAt"`
+	ID                           string          `json:"id"`
+	AppID                        string          `json:"appId"`
+	SourceProvider               string          `json:"sourceProvider"`
+	RepositoryID                 int64           `json:"repositoryId,omitempty"`
+	RepositoryOwner              string          `json:"repositoryOwner,omitempty"`
+	RepositoryName               string          `json:"repositoryName,omitempty"`
+	TrackedRef                   string          `json:"trackedRef,omitempty"`
+	ResolvedSHA                  string          `json:"resolvedSha,omitempty"`
+	SourceCommitSHA              string          `json:"sourceCommitSha,omitempty"`
+	SourceBranch                 string          `json:"sourceBranch,omitempty"`
+	ComposePath                  string          `json:"composePath,omitempty"`
+	ArchiveSHA256                string          `json:"archiveSha256,omitempty"`
+	WorkspaceState               string          `json:"workspaceState,omitempty"`
+	ConfigurationRevisionID      string          `json:"configurationRevisionId,omitempty"`
+	ConfigurationRevisionNumber  int64           `json:"configurationRevisionNumber"`
+	DeploymentPlanRevisionID     string          `json:"deploymentPlanRevisionId,omitempty"`
+	DeploymentPlanRevisionNumber int64           `json:"deploymentPlanRevisionNumber"`
+	RuntimeStrategy              RuntimeStrategy `json:"runtimeStrategy"`
+	CreatedAt                    time.Time       `json:"createdAt"`
 }
 
 type Finding struct {
@@ -380,8 +382,7 @@ func diagnosticSummary(value string) string {
 }
 
 func (r *Repository) Recover(ctx context.Context) error {
-	now := r.now().UTC().Format(time.RFC3339Nano)
-	_, err := r.db.ExecContext(ctx, `UPDATE deployments SET status='failed',finished_at=?,diagnostic_code='daemon_restarted',failure_code='daemon_restarted',failure_summary='Deployment interrupted because hostd restarted' WHERE status IN ('preparing','applying','waiting_health')`, now)
+	_, err := generatedrecovery.RecoverDeployments(ctx, r.db, r.now().UTC())
 	return err
 }
 
@@ -462,12 +463,12 @@ func (r *Repository) Releases(ctx context.Context, appID string, limit int) ([]R
 	return result, rows.Err()
 }
 
-const releaseSelect = `SELECT id,app_id,COALESCE(source_provider,''),COALESCE(repository_id,0),COALESCE(repository_owner,''),COALESCE(repository_name,''),COALESCE(tracked_ref,''),COALESCE(resolved_sha,''),source_commit_sha,source_branch,COALESCE(compose_path,''),COALESCE(archive_sha256,''),COALESCE(workspace_state,''),COALESCE(configuration_revision_id,''),configuration_revision_number,COALESCE(deployment_plan_revision_id,''),COALESCE(deployment_plan_revision_number,0),created_at FROM releases`
+const releaseSelect = `SELECT id,app_id,COALESCE(source_provider,''),COALESCE(repository_id,0),COALESCE(repository_owner,''),COALESCE(repository_name,''),COALESCE(tracked_ref,''),COALESCE(resolved_sha,''),source_commit_sha,source_branch,COALESCE(compose_path,''),COALESCE(archive_sha256,''),COALESCE(workspace_state,''),COALESCE(configuration_revision_id,''),configuration_revision_number,COALESCE(deployment_plan_revision_id,''),COALESCE(deployment_plan_revision_number,0),CASE WHEN COALESCE(deployment_plan_revision_number,0)=0 THEN 'compose' ELSE COALESCE((SELECT strategy FROM deployment_plan_revisions WHERE id=releases.deployment_plan_revision_id AND app_id=releases.app_id AND revision_number=releases.deployment_plan_revision_number),'') END,created_at FROM releases`
 
 func scanRelease(row scanner) (Release, error) {
 	var value Release
 	var created string
-	err := row.Scan(&value.ID, &value.AppID, &value.SourceProvider, &value.RepositoryID, &value.RepositoryOwner, &value.RepositoryName, &value.TrackedRef, &value.ResolvedSHA, &value.SourceCommitSHA, &value.SourceBranch, &value.ComposePath, &value.ArchiveSHA256, &value.WorkspaceState, &value.ConfigurationRevisionID, &value.ConfigurationRevisionNumber, &value.DeploymentPlanRevisionID, &value.DeploymentPlanRevisionNumber, &created)
+	err := row.Scan(&value.ID, &value.AppID, &value.SourceProvider, &value.RepositoryID, &value.RepositoryOwner, &value.RepositoryName, &value.TrackedRef, &value.ResolvedSHA, &value.SourceCommitSHA, &value.SourceBranch, &value.ComposePath, &value.ArchiveSHA256, &value.WorkspaceState, &value.ConfigurationRevisionID, &value.ConfigurationRevisionNumber, &value.DeploymentPlanRevisionID, &value.DeploymentPlanRevisionNumber, &value.RuntimeStrategy, &created)
 	value.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	return value, err
 }

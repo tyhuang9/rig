@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/projectanalysis"
@@ -86,6 +87,11 @@ type Materializer struct {
 	hashTree       func(context.Context, string) (string, error)
 	afterLocalCopy func()
 	retention      RetentionOptions
+	plans          deploymentPlanReader
+}
+
+type deploymentPlanReader interface {
+	GetRevision(context.Context, string, string, int64) (deploymentplans.DeploymentPlanRevision, error)
 }
 type lifecycleFS struct {
 	mkdirAll  func(string, os.FileMode) error
@@ -114,7 +120,11 @@ func New(db *sql.DB, sources SourceReader, dataRoot string, options ...Retention
 	if retention.PerAppBytes <= 0 || retention.GlobalBytes <= 0 || retention.PerAppBytes > retention.GlobalBytes || retention.PerAppBytes > MaxPerAppWorkspaceQuota || retention.GlobalBytes > MaxGlobalWorkspaceQuota {
 		return nil, errors.New("release retention quotas must be positive and the per-app quota must not exceed the global quota")
 	}
-	return &Materializer{db: db, sources: sources, dataRoot: dataRoot, now: time.Now, fs: realLifecycleFS(), hashTree: hashLocalTree, retention: retention}, nil
+	plans, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		return nil, err
+	}
+	return &Materializer{db: db, sources: sources, dataRoot: dataRoot, now: time.Now, fs: realLifecycleFS(), hashTree: hashLocalTree, retention: retention, plans: plans}, nil
 }
 
 // ValidateComposeWorkspace validates the selected Compose file and every local
@@ -755,19 +765,29 @@ func (m *Materializer) validateMaterializedWorkspace(ctx context.Context, releas
 	if !hasGeneratedAnalysis(inspection.Analysis) {
 		return &Error{Code: "deployment_plan_review_required"}
 	}
-	var strategy, detectorVersion, fingerprint, provider, sourceDigest string
-	var repositoryID int64
-	err = m.db.QueryRowContext(ctx, `SELECT strategy,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest FROM deployment_plan_revisions WHERE id=? AND app_id=? AND revision_number=? AND acceptance_status='accepted'`, release.DeploymentPlanRevisionID, release.AppID, release.DeploymentPlanRevisionNumber).Scan(&strategy, &detectorVersion, &fingerprint, &provider, &repositoryID, &sourceDigest)
-	if errors.Is(err, sql.ErrNoRows) {
+	if m.plans == nil {
+		return fmt.Errorf("%w: deployment plan reader", errLocal)
+	}
+	var stored int
+	err = m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM deployment_plan_revisions WHERE id=? AND app_id=? AND revision_number=? AND acceptance_status='accepted'`, release.DeploymentPlanRevisionID, release.AppID, release.DeploymentPlanRevisionNumber).Scan(&stored)
+	if err != nil {
+		return fmt.Errorf("%w: deployment plan lookup", errLocal)
+	}
+	if stored != 1 {
+		return &Error{Code: "deployment_plan_review_required"}
+	}
+	revision, err := m.plans.GetRevision(ctx, release.AppID, release.DeploymentPlanRevisionID, release.DeploymentPlanRevisionNumber)
+	if deploymentplans.IsCode(err, "deployment_plan_unavailable") {
 		return &Error{Code: "deployment_plan_review_required"}
 	}
 	if err != nil {
 		return fmt.Errorf("%w: deployment plan lookup", errLocal)
 	}
-	if strategy != "generated_node" || detectorVersion != projectanalysis.SchemaVersion || fingerprint != inspection.Analysis.StructuralFingerprint || provider != release.SourceProvider || repositoryID != release.RepositoryID {
+	if revision.ID != release.DeploymentPlanRevisionID || revision.RevisionNumber != release.DeploymentPlanRevisionNumber || revision.Plan.Strategy != deploymentplans.StrategyGeneratedNode || revision.Plan.Source.Provider != release.SourceProvider || revision.Plan.Source.RepositoryID != release.RepositoryID {
 		return &Error{Code: "deployment_plan_review_required"}
 	}
-	if provider == "local" && sourceDigest != inspection.Analysis.StructuralFingerprint {
+	differences, compareErr := deploymentplans.CompareAnalysis(revision.Plan, inspection.Analysis)
+	if compareErr != nil || len(differences) != 0 {
 		return &Error{Code: "deployment_plan_review_required"}
 	}
 	return nil

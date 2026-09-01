@@ -25,6 +25,7 @@ import (
 	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
@@ -41,6 +42,7 @@ type deploymentAPIFixture struct {
 	apps        *apps.Store
 	jobs        *jobs.Service
 	deployments *deployments.Repository
+	plans       *deploymentplans.Store
 	handler     http.Handler
 	app         apps.Application
 	otherApp    apps.Application
@@ -49,6 +51,10 @@ type deploymentAPIFixture struct {
 }
 
 func newDeploymentAPIFixture(t *testing.T, composeRuntime, fakeRuntime bool) deploymentAPIFixture {
+	return newDeploymentAPIFixtureWithRuntimes(t, composeRuntime, false, fakeRuntime)
+}
+
+func newDeploymentAPIFixtureWithRuntimes(t *testing.T, composeRuntime, generatedRuntime, fakeRuntime bool) deploymentAPIFixture {
 	t.Helper()
 	stateRoot := filepath.Join(t.TempDir(), "state")
 	db, err := database.Open(stateRoot)
@@ -88,13 +94,17 @@ func newDeploymentAPIFixture(t *testing.T, composeRuntime, fakeRuntime bool) dep
 	}
 	jobService := jobs.New(db)
 	deploymentStore := deployments.New(db)
+	planStore, err := deploymentplans.New(db, stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
 	logs := &bytes.Buffer{}
 	handler := (&controller.Server{
 		Auth: authService, Apps: appStore, Jobs: jobService, Machines: machineStore,
-		Deployments: deploymentStore, ComposeRuntime: composeRuntime, FakeRuntime: fakeRuntime,
+		Deployments: deploymentStore, DeploymentPlans: planStore, ComposeRuntime: composeRuntime, GeneratedRuntime: generatedRuntime, FakeRuntime: fakeRuntime,
 		DataRoot: t.TempDir(), Logger: slog.New(slog.NewJSONHandler(logs, nil)),
 	}).Handler()
-	return deploymentAPIFixture{db: db, auth: authService, session: session, otherUserID: otherID, apps: appStore, jobs: jobService, deployments: deploymentStore, handler: handler, app: app, otherApp: otherApp, stateRoot: stateRoot, logs: logs}
+	return deploymentAPIFixture{db: db, auth: authService, session: session, otherUserID: otherID, apps: appStore, jobs: jobService, deployments: deploymentStore, plans: planStore, handler: handler, app: app, otherApp: otherApp, stateRoot: stateRoot, logs: logs}
 }
 
 func (f deploymentAPIFixture) request(method, path, body string) *httptest.ResponseRecorder {
@@ -179,18 +189,21 @@ func TestDeploymentMutationsRequireAuthenticationAndCSRF(t *testing.T) {
 	}
 }
 
-func TestComposeRuntimeCapabilityDefaultsOffAndDoesNotImplyFakeRuntime(t *testing.T) {
+func TestRuntimeCapabilitiesAreIndependentAndDefaultOff(t *testing.T) {
 	for _, testCase := range []struct {
-		name    string
-		compose bool
-		fake    bool
+		name      string
+		compose   bool
+		generated bool
+		fake      bool
 	}{
-		{"default", false, false},
-		{"compose only", true, false},
-		{"fake only", false, true},
+		{name: "default"},
+		{name: "compose only", compose: true},
+		{name: "generated only", generated: true},
+		{name: "compose and generated", compose: true, generated: true},
+		{name: "fake only", fake: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			f := newDeploymentAPIFixture(t, testCase.compose, testCase.fake)
+			f := newDeploymentAPIFixtureWithRuntimes(t, testCase.compose, testCase.generated, testCase.fake)
 			w := f.request(http.MethodGet, "/api/v1/system/status", "")
 			if w.Code != http.StatusOK {
 				t.Fatalf("status endpoint: %d %s", w.Code, w.Body.String())
@@ -199,7 +212,7 @@ func TestComposeRuntimeCapabilityDefaultsOffAndDoesNotImplyFakeRuntime(t *testin
 			if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil {
 				t.Fatal(err)
 			}
-			if status.Capabilities.ComposeRuntime != testCase.compose || status.Capabilities.FakeRuntime != testCase.fake {
+			if status.Capabilities.ComposeRuntime != testCase.compose || status.Capabilities.GeneratedRuntime != testCase.generated || status.Capabilities.FakeRuntime != testCase.fake {
 				t.Fatalf("capabilities = %#v", status.Capabilities)
 			}
 		})
@@ -241,6 +254,49 @@ func TestLatestDeploymentIsTypedActorBoundAndIdempotent(t *testing.T) {
 	}
 	if replayed.Created || replayed.Job.ID != initial.Job.ID || replayed.Job.RequestedBy != initial.Job.RequestedBy {
 		t.Fatalf("idempotent replay = %#v", replayed)
+	}
+}
+
+func TestLatestDeploymentUsesExactAcceptedPlanStrategy(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		strategy  deploymentplans.Strategy
+		compose   bool
+		generated bool
+		fake      bool
+		allowed   bool
+	}{
+		{name: "legacy uses compose", compose: true, allowed: true},
+		{name: "legacy does not use generated", generated: true},
+		{name: "legacy fake compatibility", fake: true, allowed: true},
+		{name: "compose plan uses compose", strategy: deploymentplans.StrategyCompose, compose: true, allowed: true},
+		{name: "compose plan does not use generated", strategy: deploymentplans.StrategyCompose, generated: true},
+		{name: "generated plan uses generated", strategy: deploymentplans.StrategyGeneratedNode, generated: true, allowed: true},
+		{name: "generated plan does not use compose", strategy: deploymentplans.StrategyGeneratedNode, compose: true},
+		{name: "generated plan does not use fake", strategy: deploymentplans.StrategyGeneratedNode, fake: true},
+		{name: "both real runtimes select generated", strategy: deploymentplans.StrategyGeneratedNode, compose: true, generated: true, allowed: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			f := newDeploymentAPIFixtureWithRuntimes(t, testCase.compose, testCase.generated, testCase.fake)
+			if testCase.strategy != "" {
+				f.acceptPlan(t, f.app.ID, testCase.strategy)
+			}
+			response := f.request(http.MethodPost, "/api/v1/apps/"+f.app.ID+"/deployments", "{}")
+			if !testCase.allowed {
+				assertProblemCode(t, response, http.StatusConflict, "capability_unavailable")
+				return
+			}
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("deployment status = %d: %s", response.Code, response.Body.String())
+			}
+			var body apicontract.JobMutationResponse
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.jobs.Cancel(body.Job.ID); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -311,6 +367,47 @@ func TestPriorReleaseDeploymentValidatesReadinessModeAndAppBoundary(t *testing.T
 				t.Fatalf("prior input = %#v, err=%v", input, err)
 			}
 			if _, err := f.jobs.Cancel(response.Job.ID); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPriorReleaseDeploymentUsesPinnedPlanStrategy(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		strategy  deploymentplans.Strategy
+		compose   bool
+		generated bool
+		allowed   bool
+	}{
+		{name: "legacy uses compose", compose: true, allowed: true},
+		{name: "legacy does not use generated", generated: true},
+		{name: "compose plan uses compose", strategy: deploymentplans.StrategyCompose, compose: true, allowed: true},
+		{name: "compose plan does not use generated", strategy: deploymentplans.StrategyCompose, generated: true},
+		{name: "generated plan uses generated", strategy: deploymentplans.StrategyGeneratedNode, generated: true, allowed: true},
+		{name: "generated plan does not use compose", strategy: deploymentplans.StrategyGeneratedNode, compose: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			f := newDeploymentAPIFixtureWithRuntimes(t, testCase.compose, testCase.generated, false)
+			var revision deploymentplans.DeploymentPlanRevision
+			if testCase.strategy != "" {
+				revision = f.acceptPlan(t, f.app.ID, testCase.strategy)
+			}
+			releaseID := f.insertReleaseWithPlan(t, f.app.ID, "ready", revision)
+			response := f.request(http.MethodPost, "/api/v1/apps/"+f.app.ID+"/releases/"+releaseID+"/deployments", `{"configurationMode":"current"}`)
+			if !testCase.allowed {
+				assertProblemCode(t, response, http.StatusConflict, "capability_unavailable")
+				return
+			}
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("deployment status = %d: %s", response.Code, response.Body.String())
+			}
+			var body apicontract.JobMutationResponse
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.jobs.Cancel(body.Job.ID); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -396,8 +493,26 @@ func TestDeploymentAndReleaseListsExposeSafeHistory(t *testing.T) {
 		t.Fatalf("release contract: %s (%v)", releasesResponse.Body.String(), err)
 	}
 	release := releases.Items[0]
-	if release.ID != releaseID || release.SourceProvider != "github" || release.RepositoryID != 17 || release.RepositoryOwner != "owner" || release.RepositoryName != "repository" || release.TrackedRef != "refs/heads/main" || release.ResolvedSha == "" || release.ArchiveSha256 == "" || release.ConfigurationRevisionNumber != 0 {
+	if release.ID != releaseID || release.SourceProvider != "github" || release.RepositoryID != 17 || release.RepositoryOwner != "owner" || release.RepositoryName != "repository" || release.TrackedRef != "refs/heads/main" || release.ResolvedSha == "" || release.ArchiveSha256 == "" || release.ConfigurationRevisionNumber != 0 || release.RuntimeStrategy != "compose" {
 		t.Fatalf("release provenance incomplete: %#v", release)
+	}
+}
+
+func TestReleaseHistoryExposesExactPinnedGeneratedRuntime(t *testing.T) {
+	f := newDeploymentAPIFixture(t, true, true)
+	revision := f.acceptPlan(t, f.app.ID, deploymentplans.StrategyGeneratedNode)
+	releaseID := f.insertReleaseWithPlan(t, f.app.ID, "ready", revision)
+
+	response := f.request(http.MethodGet, "/api/v1/apps/"+f.app.ID+"/releases", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("release history: %d %s", response.Code, response.Body.String())
+	}
+	var releases apicontract.ReleaseList
+	if err := json.Unmarshal(response.Body.Bytes(), &releases); err != nil {
+		t.Fatal(err)
+	}
+	if len(releases.Items) != 1 || releases.Items[0].ID != releaseID || releases.Items[0].RuntimeStrategy != "generated_node" {
+		t.Fatalf("generated release provenance = %#v", releases.Items)
 	}
 }
 
@@ -651,6 +766,96 @@ func TestResumeOnlyRequeuesOwnWaitingDeploymentOnComposeRuntime(t *testing.T) {
 	assertProblemCode(t, crossApp, http.StatusNotFound, "job_not_found")
 }
 
+func TestResumeUsesPinnedDeploymentStrategy(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		strategy  deploymentplans.Strategy
+		compose   bool
+		generated bool
+		allowed   bool
+	}{
+		{name: "compose uses compose", strategy: deploymentplans.StrategyCompose, compose: true, allowed: true},
+		{name: "compose does not use generated", strategy: deploymentplans.StrategyCompose, generated: true},
+		{name: "generated uses generated", strategy: deploymentplans.StrategyGeneratedNode, generated: true, allowed: true},
+		{name: "generated does not use compose", strategy: deploymentplans.StrategyGeneratedNode, compose: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			f := newDeploymentAPIFixtureWithRuntimes(t, testCase.compose, testCase.generated, false)
+			revision := f.acceptPlan(t, f.app.ID, testCase.strategy)
+			job := f.createDeploymentWithPlan(t, revision)
+			if _, err := f.db.Exec(`UPDATE jobs SET status='waiting_user',phase='approval_required',pause_disposition='approval_required' WHERE id=?`, job.ID); err != nil {
+				t.Fatal(err)
+			}
+			response := f.request(http.MethodPost, "/api/v1/jobs/"+job.ID+"/resume", "")
+			if !testCase.allowed {
+				assertProblemCode(t, response, http.StatusConflict, "capability_unavailable")
+				return
+			}
+			if response.Code != http.StatusOK {
+				t.Fatalf("resume status = %d: %s", response.Code, response.Body.String())
+			}
+			if _, err := f.jobs.Cancel(job.ID); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestGeneratedResumeRequiresMigrationApprovalButRetriesCapacityImmediately(t *testing.T) {
+	t.Run("migration approval", func(t *testing.T) {
+		f := newDeploymentAPIFixtureWithRuntimes(t, false, true, false)
+		revision := f.acceptPlanWithMigration(t, f.app.ID)
+		job := f.createDeploymentWithPlan(t, revision)
+		if _, err := f.db.Exec(`UPDATE jobs SET status='waiting_user',phase=?,checkpoint_json=?,pause_disposition=?,attempt=2 WHERE id=?`, jobs.PauseMigrationApprovalRequired, `{"phase":"migration_approval_required"}`, jobs.PauseMigrationApprovalRequired, job.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		path := "/api/v1/jobs/" + job.ID + "/resume"
+		unapproved := f.request(http.MethodPost, path, "")
+		assertProblemCode(t, unapproved, http.StatusConflict, "migration_approval_required")
+		assertNoSensitiveDetail(t, unapproved.Body.String())
+		if strings.Contains(unapproved.Body.String(), revision.Plan.Migration.Command) || strings.Contains(unapproved.Body.String(), revision.Plan.Migration.EvidenceDigest) {
+			t.Fatalf("migration identity leaked: %s", unapproved.Body.String())
+		}
+		persisted, err := f.jobs.Get(job.ID)
+		if err != nil || persisted.Status != string(jobs.WaitingUser) || persisted.PauseDisposition != jobs.PauseMigrationApprovalRequired || persisted.Attempt != 2 {
+			t.Fatalf("unapproved migration changed job = %#v, %v", persisted, err)
+		}
+
+		if err := f.plans.ApproveMigration(context.Background(), f.app.ID, revision.ID, revision.RevisionNumber, 0, f.userID(t)); err != nil {
+			t.Fatal(err)
+		}
+		resumed := f.request(http.MethodPost, path, "")
+		if resumed.Code != http.StatusOK {
+			t.Fatalf("approved resume: %d %s", resumed.Code, resumed.Body.String())
+		}
+		if _, err := f.jobs.Cancel(job.ID); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("replacement capacity", func(t *testing.T) {
+		f := newDeploymentAPIFixtureWithRuntimes(t, false, true, false)
+		revision := f.acceptPlan(t, f.app.ID, deploymentplans.StrategyGeneratedNode)
+		job := f.createDeploymentWithPlan(t, revision)
+		if _, err := f.db.Exec(`UPDATE jobs SET status='waiting_user',phase=?,checkpoint_json=?,pause_disposition=?,attempt=3 WHERE id=?`, jobs.PauseInsufficientReplacementCapacity, `{"phase":"insufficient_replacement_capacity"}`, jobs.PauseInsufficientReplacementCapacity, job.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		resumed := f.request(http.MethodPost, "/api/v1/jobs/"+job.ID+"/resume", "")
+		if resumed.Code != http.StatusOK {
+			t.Fatalf("capacity retry: %d %s", resumed.Code, resumed.Body.String())
+		}
+		var body apicontract.JobResponse
+		if err := json.Unmarshal(resumed.Body.Bytes(), &body); err != nil || body.Job.Status != string(jobs.Queued) || body.Job.PauseDisposition != "" || body.Job.Attempt != 3 {
+			t.Fatalf("capacity retry = %#v, %v", body.Job, err)
+		}
+		if _, err := f.jobs.Cancel(job.ID); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestResumeRequiresEveryExactActiveRuntimeApproval(t *testing.T) {
 	f := newDeploymentAPIFixture(t, true, false)
 	job, deployment := f.createDeployment(t, f.app.ID, "current")
@@ -781,11 +986,75 @@ func policyFindingFingerprint(version, capability, scope string) string {
 }
 
 func (f deploymentAPIFixture) insertRelease(t *testing.T, appID, state string) string {
+	return f.insertReleaseWithPlan(t, appID, state, deploymentplans.DeploymentPlanRevision{})
+}
+
+func (f deploymentAPIFixture) insertReleaseWithPlan(t *testing.T, appID, state string, revision deploymentplans.DeploymentPlanRevision) string {
 	t.Helper()
 	id := uuid.NewString()
-	_, err := f.db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,source_commit_sha,source_branch,compose_path,archive_sha256,workspace_tree_sha256,workspace_state,configuration_revision_number) VALUES(?,?,?,'{}',?,'github',17,'owner','repository','refs/heads/main','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','main','compose.yaml','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',?,0)`, id, appID, state, time.Now().UTC().Format(time.RFC3339Nano), state)
+	var planID, planNumber any
+	if revision.ID != "" {
+		planID, planNumber = revision.ID, revision.RevisionNumber
+	}
+	_, err := f.db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,source_commit_sha,source_branch,compose_path,archive_sha256,workspace_tree_sha256,workspace_state,configuration_revision_number,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,?,'{}',?,'github',17,'owner','repository','refs/heads/main','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','main','compose.yaml','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',?,0,?,?)`, id, appID, state, time.Now().UTC().Format(time.RFC3339Nano), state, planID, planNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return id
+}
+
+func (f deploymentAPIFixture) acceptPlan(t *testing.T, appID string, strategy deploymentplans.Strategy) deploymentplans.DeploymentPlanRevision {
+	return f.acceptPlanFixture(t, appID, strategy, false)
+}
+
+func (f deploymentAPIFixture) acceptPlanWithMigration(t *testing.T, appID string) deploymentplans.DeploymentPlanRevision {
+	return f.acceptPlanFixture(t, appID, deploymentplans.StrategyGeneratedNode, true)
+}
+
+func (f deploymentAPIFixture) acceptPlanFixture(t *testing.T, appID string, strategy deploymentplans.Strategy, migration bool) deploymentplans.DeploymentPlanRevision {
+	t.Helper()
+	plan := deploymentplans.Plan{
+		Strategy: strategy,
+		Detector: deploymentplans.Detector{Name: "fixture-detector", Version: "1", SourceStructuralFingerprint: strings.Repeat("a", 64)},
+		Source:   deploymentplans.SourceIdentity{Provider: "github", RepositoryID: 17, ResolvedDigest: strings.Repeat("b", 40)},
+	}
+	if plan.Strategy == deploymentplans.StrategyGeneratedNode {
+		component := deploymentplans.Component{Name: "web", Role: "server", RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm start", InternalPort: 3000, HealthProbe: "/health"}
+		plan.Components = []deploymentplans.Component{component}
+		for _, field := range []string{"role", "rootDirectory", "packageManager", "installBehavior", "nodeVersion", "runCommand", "internalPort", "healthProbe", "buildCommand"} {
+			plan.FieldProvenance = append(plan.FieldProvenance, deploymentplans.FieldProvenance{Field: "components.web." + field, Origin: deploymentplans.ProvenanceInferred, Confidence: 90, Evidence: []string{"package.json"}})
+		}
+	}
+	if migration {
+		plan.Migration = &deploymentplans.Migration{
+			ComponentName: "web", RootDirectory: ".", Command: "npm run migrate", EnvironmentKeys: []string{"DATABASE_URL"},
+			EvidenceDigest: strings.Repeat("c", 64), Approval: deploymentplans.MigrationApproval{Status: deploymentplans.MigrationApprovalPending},
+		}
+	}
+	revision, err := f.plans.Replace(context.Background(), appID, f.userID(t), deploymentplans.ReplaceInput{Plan: plan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return revision
+}
+
+func (f deploymentAPIFixture) createDeploymentWithPlan(t *testing.T, revision deploymentplans.DeploymentPlanRevision) jobs.Job {
+	t.Helper()
+	releaseID := f.insertReleaseWithPlan(t, revision.AppID, "ready", revision)
+	job, _, err := f.jobs.CreateWithInput(jobs.CreateRequest{Type: "deploy", ResourceType: "application", ResourceID: revision.AppID, RequestedBy: f.userID(t), Input: jobs.DeploymentInput{ReleaseID: releaseID, ConfigurationMode: jobs.ConfigurationCurrent}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployment, _, err := f.deployments.GetOrCreateByJob(context.Background(), revision.AppID, job.ID, string(jobs.ConfigurationCurrent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	strategy := deployments.RuntimeCompose
+	if revision.Plan.Strategy == deploymentplans.StrategyGeneratedNode {
+		strategy = deployments.RuntimeGeneratedNode
+	}
+	if _, err := f.deployments.InitializeRuntime(context.Background(), revision.AppID, deployment.ID, releaseID, "", 0, strategy, revision.ID, revision.RevisionNumber); err != nil {
+		t.Fatal(err)
+	}
+	return job
 }

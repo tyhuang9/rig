@@ -41,6 +41,7 @@ type SourceScope struct {
 	RepositoryID   int64
 	Branch         string
 	Ref            string
+	ComposePath    string
 }
 
 type SourceResolver interface {
@@ -72,6 +73,7 @@ type CoordinatorRepository interface {
 	PrepareDispatch(context.Context, WorkLease, time.Time) (PreparedDispatch, error)
 	LinkDispatchJob(context.Context, WorkLease, uint64, uint64, string, time.Time) error
 	LinkDispatchJobTx(context.Context, *sql.Tx, WorkLease, uint64, uint64, string, time.Time) error
+	RestartPreparedDispatch(context.Context, WorkLease, uint64, uint64, time.Time) error
 	RefreshActiveJob(context.Context, WorkLease, time.Time) (Status, error)
 	Pause(context.Context, WorkLease, string, time.Time) error
 	ScheduleRetry(context.Context, WorkLease, time.Time, time.Time) error
@@ -120,6 +122,7 @@ type CoordinatorConfig struct {
 	RecoveryLimit      int
 	Observer           CoordinatorObserver
 	Clock              Clock
+	Preflight          DispatchPreflight
 }
 
 func DefaultCoordinatorConfig() CoordinatorConfig {
@@ -386,7 +389,7 @@ func (coordinator *Coordinator) processOne(ctx context.Context) (bool, Coordinat
 	scope := SourceScope{
 		OwnerUserID: status.SourceOwnerUserID, ConnectionID: status.SourceConnectionID,
 		InstallationID: status.InstallationID, RepositoryID: status.RepositoryID,
-		Branch: status.TrackedBranch, Ref: status.TrackedRef,
+		Branch: status.TrackedBranch, Ref: status.TrackedRef, ComposePath: status.ComposePath,
 	}
 	now, valid = coordinator.mutationTime(lease, &event)
 	if !valid {
@@ -507,11 +510,27 @@ func (coordinator *Coordinator) dispatch(ctx context.Context, status Status, lea
 	event.PauseCode = ObservedPauseNone
 	event.RetryAttempt = 0
 	event.NextAction = NextActionDispatch
+	preflight := DispatchPreflightResult{}
+	if coordinator.config.Preflight != nil {
+		preflight, err = coordinator.config.Preflight.Prepare(ctx, DispatchPreflightRequest{
+			ApplicationID: dispatch.ApplicationID, OwnerUserID: status.SourceOwnerUserID,
+			Source: SourceScope{
+				OwnerUserID: status.SourceOwnerUserID, ConnectionID: status.SourceConnectionID,
+				InstallationID: status.InstallationID, RepositoryID: status.RepositoryID,
+				Branch: status.TrackedBranch, Ref: status.TrackedRef, ComposePath: status.ComposePath,
+			},
+			ResolvedSHA: dispatch.SHA,
+		})
+		if err != nil {
+			coordinator.handlePreflightError(ctx, status, lease, dispatch, err, event)
+			return
+		}
+	}
 	_, _, err = coordinator.jobs.CreateWithInputFinalized(jobs.CreateRequest{
 		Type: "deploy", ResourceType: "application", ResourceID: dispatch.ApplicationID,
 		IdempotencyKey: DispatchIdempotencyKey(lease.ConfigRevision, dispatch.Sequence),
 		RequestedBy:    status.SourceOwnerUserID,
-		Input:          jobs.DeploymentInput{ReleaseID: "", ConfigurationMode: jobs.ConfigurationCurrent},
+		Input:          jobs.DeploymentInput{ReleaseID: preflight.ReleaseID, ConfigurationMode: jobs.ConfigurationCurrent},
 	}, func(tx *sql.Tx, job jobs.Job) error {
 		linkAt := coordinator.config.Clock.Now().UTC()
 		if !linkAt.Before(lease.ExpiresAt) {
@@ -520,6 +539,10 @@ func (coordinator *Coordinator) dispatch(ctx context.Context, status Status, lea
 		return coordinator.repository.LinkDispatchJobTx(ctx, tx, lease, dispatch.Sequence, dispatch.Generation, job.ID, linkAt)
 	})
 	if err != nil {
+		if errors.Is(err, ErrDispatchPreflightChanged) {
+			coordinator.restartPreparedDispatch(ctx, lease, dispatch, event)
+			return
+		}
 		if errors.Is(err, ErrSourceAccessLost) {
 			event.Paused++
 			setPausedLifecycle(event, PauseSourceAccessLost)
@@ -540,6 +563,47 @@ func (coordinator *Coordinator) dispatch(ctx context.Context, status Status, lea
 	event.PauseCode = ObservedPauseNone
 	event.RetryAttempt = 0
 	event.NextAction = NextActionPollJob
+}
+
+func (coordinator *Coordinator) handlePreflightError(ctx context.Context, status Status, lease WorkLease, dispatch PreparedDispatch, preflightErr error, event *CoordinatorEvent) {
+	var typed *PreflightError
+	if errors.As(preflightErr, &typed) {
+		switch typed.Code {
+		case PreflightHeadChanged:
+			coordinator.restartPreparedDispatch(ctx, lease, dispatch, event)
+			return
+		case PreflightPlanReview:
+			now, valid := coordinator.mutationTime(lease, event)
+			if !valid {
+				return
+			}
+			if err := coordinator.repository.Pause(ctx, lease, PauseDeploymentPlanReviewRequired, now); err != nil {
+				event.Outcome = OutcomePersistenceUnavailable
+				return
+			}
+			event.Paused++
+			setPausedLifecycle(event, PauseDeploymentPlanReviewRequired)
+			event.Outcome = OutcomeInvalidSource
+			return
+		}
+	}
+	status.State = StateDispatching
+	coordinator.handleSourceError(ctx, status, lease, preflightErr, event)
+}
+
+func (coordinator *Coordinator) restartPreparedDispatch(ctx context.Context, lease WorkLease, dispatch PreparedDispatch, event *CoordinatorEvent) {
+	now, valid := coordinator.mutationTime(lease, event)
+	if !valid {
+		return
+	}
+	if err := coordinator.repository.RestartPreparedDispatch(ctx, lease, dispatch.Sequence, dispatch.Generation, now); err != nil {
+		event.Outcome = OutcomePersistenceUnavailable
+		return
+	}
+	event.State = StateIdle
+	event.PauseCode = ObservedPauseNone
+	event.NextAction = NextActionResolve
+	event.Outcome = OutcomeIdle
 }
 
 func (coordinator *Coordinator) handleSourceError(ctx context.Context, status Status, lease WorkLease, resolveErr error, event *CoordinatorEvent) {
@@ -708,8 +772,11 @@ func nextActionForStatus(status Status, now time.Time, minResolveInterval time.D
 }
 
 func nextActionForPause(pauseCode string, activeJob bool) string {
-	if pauseCode == PauseApprovalRequired {
+	if pauseCode == PauseApprovalRequired || pauseCode == PauseMigrationApprovalRequired {
 		return NextActionApprovalRequired
+	}
+	if pauseCode == PauseInsufficientReplacementCapacity {
+		return NextActionResumeRequired
 	}
 	if activeJob {
 		return NextActionPollJob
@@ -754,7 +821,8 @@ func normalizeCoordinatorState(value string) string {
 
 func normalizeCoordinatorPauseCode(value string) string {
 	switch value {
-	case PauseApprovalRequired, PauseDeploymentFailed, PauseMissingConfig, PauseSourceAccessLost,
+	case PauseApprovalRequired, PauseMigrationApprovalRequired, PauseInsufficientReplacementCapacity, PauseDeploymentPlanReviewRequired,
+		PauseDeploymentFailed, PauseMissingConfig, PauseSourceAccessLost,
 		PauseInvalidSource, PauseProviderUnavailable, PauseRelayUnavailable:
 		return value
 	default:

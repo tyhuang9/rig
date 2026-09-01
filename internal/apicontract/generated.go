@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "c3f7b0ed5399b8cc3ccb9dfb151cc71f7223b5cd752af0de56ae9200a53153a6"
+const SourceSHA256 = "d3c8bb75b1b14fdb3e4046e9d86fe2f087b0c52d385216cd926f1798bdd0b308"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -220,6 +220,7 @@ type CSRFResponse struct {
 type Capabilities struct {
 	ComposeRuntime    bool `json:"composeRuntime"`
 	FakeRuntime       bool `json:"fakeRuntime"`
+	GeneratedRuntime  bool `json:"generatedRuntime"`
 	GithubConnections bool `json:"githubConnections"`
 }
 
@@ -645,6 +646,7 @@ type Release struct {
 	RepositoryName               string `json:"repositoryName,omitempty"`
 	RepositoryOwner              string `json:"repositoryOwner,omitempty"`
 	ResolvedSha                  string `json:"resolvedSha,omitempty"`
+	RuntimeStrategy              string `json:"runtimeStrategy"`
 	SourceBranch                 string `json:"sourceBranch,omitempty"`
 	SourceCommitSha              string `json:"sourceCommitSha,omitempty"`
 	SourceProvider               string `json:"sourceProvider"`

@@ -214,14 +214,16 @@ function ApplicationDetailPage() {
   if (!appQuery.data || !statusQuery.data) return <QueryError message="The API returned an incomplete response."/>;
   const app = appQuery.data;
   const fakeRuntime = statusQuery.data.capabilities.fakeRuntime;
+  const generatedRuntime = statusQuery.data.capabilities.generatedRuntime;
+  const composeRuntime = statusQuery.data.capabilities.composeRuntime;
   const currentDeployment = deploymentQuery.data?.items[0];
   return <>
     <PageHeader title={app.name} subtitle={`${app.machineName || "Local machine"} · ${app.status}`}/>
     <p className="section-kicker">Overview</p>
     <div className="summary"><article><small>Current deployment</small><strong>{currentDeployment ? <StatusText value={currentDeployment.status}/> : deploymentQuery.isLoading ? "Loading..." : "Not deployed"}</strong><span>{currentDeployment ? `Configuration ${currentDeployment.configurationMode}` : deploymentQuery.isError ? "History unavailable" : "No deployment record"}</span></article><article><small>Source</small><strong className="mono">{app.slug}</strong><span>Runtime is not inferred</span></article><article><small>Health</small><strong>Not verified</strong><span>Health reporting is not available</span></article></div>
-    {fakeRuntime ? <div className="callout warning"><strong>Development capability</strong><span>The fake runtime persists job progress but executes no workload.</span></div> : !statusQuery.data.capabilities.composeRuntime && <div className="callout info"><strong>Runtime actions unavailable</strong><span>Configure a runtime to deploy this application.</span></div>}
-    <AutoDeployPanel appId={id} composeRuntime={statusQuery.data.capabilities.composeRuntime} githubConnections={statusQuery.data.capabilities.githubConnections}/>
-    <DeploymentHistoryPanel appId={id} composeRuntime={statusQuery.data.capabilities.composeRuntime} fakeRuntime={fakeRuntime}/>
+    {fakeRuntime ? <div className="callout warning"><strong>Development capability</strong><span>The fake runtime persists job progress but executes no workload.</span></div> : !composeRuntime && !generatedRuntime && <div className="callout info"><strong>Runtime actions unavailable</strong><span>Configure a runtime to deploy this application.</span></div>}
+    <AutoDeployPanel appId={id} composeRuntime={composeRuntime} generatedRuntime={generatedRuntime} githubConnections={statusQuery.data.capabilities.githubConnections}/>
+    <DeploymentHistoryPanel appId={id} composeRuntime={composeRuntime} fakeRuntime={fakeRuntime} generatedRuntime={generatedRuntime}/>
     <ApplicationConfigurationPanel appId={id}/>
   </>;
 }

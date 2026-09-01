@@ -13,9 +13,13 @@ import (
 	"github.com/hostd/hostd/internal/autodeploy"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/jobs"
+	"github.com/hostd/hostd/internal/projectanalysis"
+	"github.com/hostd/hostd/internal/releasesnapshot"
 	"github.com/hostd/hostd/internal/sourceconnections"
+	"github.com/hostd/hostd/internal/sourceinspection"
 )
 
 type autoDeployRunnerFake struct {
@@ -130,6 +134,20 @@ func TestAutoDeployEnabledIsAsyncIndependentAndForwardsPendingWake(t *testing.T)
 	}
 }
 
+func TestAutoDeployGeneratedRuntimeStartsFactory(t *testing.T) {
+	cfg := enabledAutoDeployConfig()
+	cfg.ComposeRuntime = false
+	cfg.GeneratedRuntime = true
+	calls := 0
+	done, _, _ := startAutoDeploy(context.Background(), cfg, newStructuredLogger(&bytes.Buffer{}, "info"), func() (autoDeployRunner, error) {
+		calls++
+		return &autoDeployRunnerFake{}, nil
+	})
+	if !waitForWorker(done, time.Second) || calls != 1 {
+		t.Fatalf("generated factory calls=%d", calls)
+	}
+}
+
 func TestAutoDeployConstructionAndRunFailuresAreSanitized(t *testing.T) {
 	const secret = "token=secret repository=private sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	for _, factory := range []autoDeployFactory{
@@ -189,6 +207,296 @@ func TestNewAutoDeployRunnerRetainsInjectedRepository(t *testing.T) {
 	retained := reflect.ValueOf(coordinator).Elem().FieldByName("repository")
 	if !retained.IsValid() || retained.IsNil() || retained.Elem().Pointer() != reflect.ValueOf(repository).Pointer() {
 		t.Fatal("coordinator did not retain the injected auto-deploy repository")
+	}
+}
+
+type autoDeployPlanReaderStub struct {
+	revisions []deploymentplans.DeploymentPlanRevision
+	err       error
+	calls     int
+}
+
+type autoDeployDispatchPreflightStub struct{}
+
+func (autoDeployDispatchPreflightStub) Prepare(context.Context, autodeploy.DispatchPreflightRequest) (autodeploy.DispatchPreflightResult, error) {
+	return autodeploy.DispatchPreflightResult{}, nil
+}
+
+func TestGeneratedAwareAutoDeployRunnerRequiresPreflight(t *testing.T) {
+	cfg := enabledAutoDeployConfig()
+	cfg.ComposeRuntime = false
+	cfg.GeneratedRuntime = true
+	db, err := database.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := autodeploy.NewRepository(db)
+	sources := sourceconnections.NewService(nil, autoDeployProviderStub{}, nil, "app", time.Now)
+	logger := newStructuredLogger(&bytes.Buffer{}, "info")
+	if runner, err := newGeneratedAwareAutoDeployRunner(cfg, repository, sources, jobs.New(db), nil, logger); err == nil || runner != nil {
+		t.Fatal("generated runtime accepted a nil dispatch preflight")
+	}
+	runner, err := newGeneratedAwareAutoDeployRunner(cfg, repository, sources, jobs.New(db), autoDeployDispatchPreflightStub{}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := runner.(*autodeploy.Coordinator); !ok {
+		t.Fatalf("runner type=%T", runner)
+	}
+	if legacy, err := newAutoDeployRunner(cfg, repository, sources, jobs.New(db), logger); err == nil || legacy != nil {
+		t.Fatal("legacy compose constructor accepted generated runtime without preflight")
+	}
+}
+
+func (reader *autoDeployPlanReaderStub) Get(context.Context, string) (deploymentplans.DeploymentPlanRevision, error) {
+	reader.calls++
+	if reader.err != nil {
+		return deploymentplans.DeploymentPlanRevision{}, reader.err
+	}
+	if len(reader.revisions) == 0 {
+		return deploymentplans.DeploymentPlanRevision{}, nil
+	}
+	index := reader.calls - 1
+	if index >= len(reader.revisions) {
+		index = len(reader.revisions) - 1
+	}
+	return reader.revisions[index], nil
+}
+
+type autoDeployReleaseMaterializerStub struct {
+	materialized     releasesnapshot.Release
+	ready            releasesnapshot.Release
+	materializeErr   error
+	readyErr         error
+	materializeCalls int
+	readyCalls       int
+}
+
+func (materializer *autoDeployReleaseMaterializerStub) Materialize(context.Context, string, string) (releasesnapshot.Release, error) {
+	materializer.materializeCalls++
+	return materializer.materialized, materializer.materializeErr
+}
+
+func (materializer *autoDeployReleaseMaterializerStub) ReadyWorkspace(context.Context, string, string) (releasesnapshot.Release, error) {
+	materializer.readyCalls++
+	return materializer.ready, materializer.readyErr
+}
+
+func TestGeneratedAutoDeployPreflightMaterializesCompatiblePinnedRelease(t *testing.T) {
+	revision, analysis := generatedAutoDeployPlanFixture(t, false)
+	request := generatedAutoDeployPreflightRequest()
+	release := generatedAutoDeployRelease(request, revision)
+	plans := &autoDeployPlanReaderStub{revisions: []deploymentplans.DeploymentPlanRevision{revision, revision}}
+	materializer := &autoDeployReleaseMaterializerStub{materialized: release, ready: release}
+	preflight := generatedAutoDeployPreflightFixture(plans, materializer, sourceinspection.Result{
+		Source: sourceinspection.SourceMetadata{
+			Type: "github", ConnectionID: request.Source.ConnectionID, InstallationID: request.Source.InstallationID,
+			RepositoryID: request.Source.RepositoryID, TrackedBranch: request.Source.Branch, TrackedRef: request.Source.Ref,
+		},
+		ResolvedSHA: request.ResolvedSHA,
+		Analysis:    analysis,
+	})
+
+	result, err := preflight.Prepare(context.Background(), request)
+	if err != nil || result.ReleaseID != release.ID {
+		t.Fatalf("preflight result=%#v err=%v", result, err)
+	}
+	if plans.calls != 2 || materializer.materializeCalls != 1 || materializer.readyCalls != 1 {
+		t.Fatalf("calls plans=%d materialize=%d ready=%d", plans.calls, materializer.materializeCalls, materializer.readyCalls)
+	}
+}
+
+func TestGeneratedAutoDeployPreflightPreservesManualCommandOverride(t *testing.T) {
+	revision, analysis := generatedAutoDeployPlanFixture(t, true)
+	request := generatedAutoDeployPreflightRequest()
+	release := generatedAutoDeployRelease(request, revision)
+	plans := &autoDeployPlanReaderStub{revisions: []deploymentplans.DeploymentPlanRevision{revision, revision}}
+	materializer := &autoDeployReleaseMaterializerStub{materialized: release, ready: release}
+	preflight := generatedAutoDeployPreflightFixture(plans, materializer, sourceinspection.Result{
+		Source: sourceinspection.SourceMetadata{
+			Type: "github", ConnectionID: request.Source.ConnectionID, InstallationID: request.Source.InstallationID,
+			RepositoryID: request.Source.RepositoryID, TrackedBranch: request.Source.Branch, TrackedRef: request.Source.Ref,
+		},
+		ResolvedSHA: request.ResolvedSHA,
+		Analysis:    analysis,
+	})
+
+	if result, err := preflight.Prepare(context.Background(), request); err != nil || result.ReleaseID != release.ID {
+		t.Fatalf("manual override result=%#v err=%v", result, err)
+	}
+}
+
+func TestGeneratedAutoDeployPreflightPausesDriftBeforeMaterialization(t *testing.T) {
+	revision, analysis := generatedAutoDeployPlanFixture(t, false)
+	analysis.Candidates[0].Components[0].Run.Command = "npm run dev"
+	request := generatedAutoDeployPreflightRequest()
+	plans := &autoDeployPlanReaderStub{revisions: []deploymentplans.DeploymentPlanRevision{revision}}
+	materializer := &autoDeployReleaseMaterializerStub{}
+	preflight := generatedAutoDeployPreflightFixture(plans, materializer, sourceinspection.Result{
+		Source: sourceinspection.SourceMetadata{
+			Type: "github", ConnectionID: request.Source.ConnectionID, InstallationID: request.Source.InstallationID,
+			RepositoryID: request.Source.RepositoryID, TrackedBranch: request.Source.Branch, TrackedRef: request.Source.Ref,
+		},
+		ResolvedSHA: request.ResolvedSHA,
+		Analysis:    analysis,
+	})
+
+	_, err := preflight.Prepare(context.Background(), request)
+	var preflightErr *autodeploy.PreflightError
+	if !errors.As(err, &preflightErr) || preflightErr.Code != autodeploy.PreflightPlanReview {
+		t.Fatalf("drift error=%v", err)
+	}
+	if materializer.materializeCalls != 0 || materializer.readyCalls != 0 {
+		t.Fatalf("drift materialized calls=%d ready=%d", materializer.materializeCalls, materializer.readyCalls)
+	}
+}
+
+func TestGeneratedAutoDeployPreflightDetectsHeadAndPlanRaces(t *testing.T) {
+	t.Run("source head", func(t *testing.T) {
+		revision, analysis := generatedAutoDeployPlanFixture(t, false)
+		request := generatedAutoDeployPreflightRequest()
+		preflight := generatedAutoDeployPreflightFixture(&autoDeployPlanReaderStub{revisions: []deploymentplans.DeploymentPlanRevision{revision}}, &autoDeployReleaseMaterializerStub{}, sourceinspection.Result{
+			Source: sourceinspection.SourceMetadata{
+				Type: "github", ConnectionID: request.Source.ConnectionID, InstallationID: request.Source.InstallationID,
+				RepositoryID: request.Source.RepositoryID, TrackedBranch: request.Source.Branch, TrackedRef: request.Source.Ref,
+			},
+			ResolvedSHA: strings.Repeat("b", 40), Analysis: analysis,
+		})
+		_, err := preflight.Prepare(context.Background(), request)
+		var preflightErr *autodeploy.PreflightError
+		if !errors.As(err, &preflightErr) || preflightErr.Code != autodeploy.PreflightHeadChanged {
+			t.Fatalf("head race error=%v", err)
+		}
+	})
+
+	t.Run("accepted plan head", func(t *testing.T) {
+		revision, analysis := generatedAutoDeployPlanFixture(t, false)
+		changed := revision
+		changed.ID = "55555555-5555-4555-8555-555555555555"
+		changed.RevisionNumber = 2
+		request := generatedAutoDeployPreflightRequest()
+		release := generatedAutoDeployRelease(request, revision)
+		preflight := generatedAutoDeployPreflightFixture(&autoDeployPlanReaderStub{revisions: []deploymentplans.DeploymentPlanRevision{revision, changed}}, &autoDeployReleaseMaterializerStub{materialized: release, ready: release}, sourceinspection.Result{
+			Source: sourceinspection.SourceMetadata{
+				Type: "github", ConnectionID: request.Source.ConnectionID, InstallationID: request.Source.InstallationID,
+				RepositoryID: request.Source.RepositoryID, TrackedBranch: request.Source.Branch, TrackedRef: request.Source.Ref,
+			},
+			ResolvedSHA: request.ResolvedSHA, Analysis: analysis,
+		})
+		_, err := preflight.Prepare(context.Background(), request)
+		var preflightErr *autodeploy.PreflightError
+		if !errors.As(err, &preflightErr) || preflightErr.Code != autodeploy.PreflightHeadChanged {
+			t.Fatalf("plan race error=%v", err)
+		}
+	})
+}
+
+func TestGeneratedAutoDeployPreflightLeavesLegacyAndComposeUnchanged(t *testing.T) {
+	request := generatedAutoDeployPreflightRequest()
+	request.Source.ComposePath = "compose.yaml"
+	for name, revision := range map[string]deploymentplans.DeploymentPlanRevision{
+		"legacy":  {AppID: request.ApplicationID},
+		"compose": {ID: "33333333-3333-4333-8333-333333333333", AppID: request.ApplicationID, RevisionNumber: 1, Plan: deploymentplans.Plan{Strategy: deploymentplans.StrategyCompose}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			plans := &autoDeployPlanReaderStub{revisions: []deploymentplans.DeploymentPlanRevision{revision}}
+			materializer := &autoDeployReleaseMaterializerStub{}
+			preflight := generatedAutoDeployPreflightFixture(plans, materializer, sourceinspection.Result{})
+			result, err := preflight.Prepare(context.Background(), request)
+			if err != nil || result.ReleaseID != "" || plans.calls != 1 || materializer.materializeCalls != 0 {
+				t.Fatalf("result=%#v plans=%d materialize=%d err=%v", result, plans.calls, materializer.materializeCalls, err)
+			}
+		})
+	}
+}
+
+func TestGeneratedAutoDeployPreflightRequiresPlanWhenComposeIsOmitted(t *testing.T) {
+	request := generatedAutoDeployPreflightRequest()
+	plans := &autoDeployPlanReaderStub{revisions: []deploymentplans.DeploymentPlanRevision{{AppID: request.ApplicationID}}}
+	materializer := &autoDeployReleaseMaterializerStub{}
+	preflight := generatedAutoDeployPreflightFixture(plans, materializer, sourceinspection.Result{})
+	_, err := preflight.Prepare(context.Background(), request)
+	var preflightErr *autodeploy.PreflightError
+	if !errors.As(err, &preflightErr) || preflightErr.Code != autodeploy.PreflightPlanReview {
+		t.Fatalf("missing generated plan error=%v", err)
+	}
+	if materializer.materializeCalls != 0 {
+		t.Fatalf("missing plan materialize calls=%d", materializer.materializeCalls)
+	}
+}
+
+func generatedAutoDeployPreflightFixture(plans autoDeployPlanReader, materializer autoDeployReleaseMaterializer, inspection sourceinspection.Result) *generatedAutoDeployPreflight {
+	return &generatedAutoDeployPreflight{
+		plans: plans, sources: sourceconnections.NewService(nil, autoDeployProviderStub{}, nil, "app", time.Now), releases: materializer,
+		inspect: func(context.Context, sourceinspection.GitHubReader, string, sourceinspection.GitHubSource) (sourceinspection.Result, error) {
+			return inspection, nil
+		},
+	}
+}
+
+func generatedAutoDeployPreflightRequest() autodeploy.DispatchPreflightRequest {
+	return autodeploy.DispatchPreflightRequest{
+		ApplicationID: "11111111-1111-4111-8111-111111111111", OwnerUserID: "owner", ResolvedSHA: strings.Repeat("a", 40),
+		Source: autodeploy.SourceScope{
+			OwnerUserID: "owner", ConnectionID: "connection", InstallationID: 10, RepositoryID: 20,
+			Branch: "main", Ref: "refs/heads/main",
+		},
+	}
+}
+
+func generatedAutoDeployPlanFixture(t *testing.T, manualRun bool) (deploymentplans.DeploymentPlanRevision, projectanalysis.SourceAnalysis) {
+	t.Helper()
+	component := deploymentplans.Component{
+		Name: "app", Role: "server", RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci",
+		NodeVersion: "22.14.0", RunCommand: "npm start", InternalPort: 3000, HealthProbe: "/health",
+	}
+	provenance := make([]deploymentplans.FieldProvenance, 0, 8)
+	for _, field := range []string{"role", "rootDirectory", "packageManager", "installBehavior", "nodeVersion", "runCommand", "internalPort", "healthProbe"} {
+		origin := deploymentplans.ProvenanceInferred
+		if manualRun && field == "runCommand" {
+			origin = deploymentplans.ProvenanceUser
+			component.RunCommand = "node custom.js && echo ready"
+		}
+		provenance = append(provenance, deploymentplans.FieldProvenance{
+			Field: "components.app." + field, Origin: origin, Confidence: 100, Evidence: []string{"package.json"},
+		})
+	}
+	plan := deploymentplans.Plan{
+		Strategy:   deploymentplans.StrategyGeneratedNode,
+		Detector:   deploymentplans.Detector{Name: "projectanalysis", Version: projectanalysis.SchemaVersion, SourceStructuralFingerprint: strings.Repeat("1", 64)},
+		Source:     deploymentplans.SourceIdentity{Provider: "github", RepositoryID: 20, ResolvedDigest: strings.Repeat("a", 40)},
+		Components: []deploymentplans.Component{component}, FieldProvenance: provenance,
+	}
+	digest, err := deploymentplans.CanonicalDigest(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := deploymentplans.DeploymentPlanRevision{
+		ID: "22222222-2222-4222-8222-222222222222", AppID: "11111111-1111-4111-8111-111111111111",
+		RevisionNumber: 1, Plan: plan, CanonicalDigest: digest, State: deploymentplans.RevisionAccepted,
+	}
+	analysis := projectanalysis.SourceAnalysis{
+		SchemaVersion: projectanalysis.SchemaVersion, StructuralFingerprint: strings.Repeat("1", 64),
+		Candidates: []projectanalysis.DeploymentPlanCandidate{{
+			Kind: projectanalysis.PlanKindJavaScript, Status: projectanalysis.StatusReady,
+			PackageManager: projectanalysis.PackageManager{Name: "npm"}, NodeVersion: projectanalysis.InferredValue{Value: "22.14.0"},
+			Install: &projectanalysis.Command{Command: "npm ci"},
+			Components: []projectanalysis.Component{{
+				ID: "app", Kind: "server", RootDirectory: ".", Run: &projectanalysis.Command{Command: "npm start"},
+				InternalPort: &projectanalysis.InferredValue{Value: "3000"}, HealthProbe: &projectanalysis.HealthProbe{Path: "/health"},
+			}},
+		}},
+	}
+	return revision, analysis
+}
+
+func generatedAutoDeployRelease(request autodeploy.DispatchPreflightRequest, revision deploymentplans.DeploymentPlanRevision) releasesnapshot.Release {
+	return releasesnapshot.Release{
+		ID: "44444444-4444-4444-8444-444444444444", AppID: request.ApplicationID,
+		SourceProvider: "github", RepositoryID: request.Source.RepositoryID, ResolvedSHA: request.ResolvedSHA,
+		WorkspaceState: releasesnapshot.WorkspaceStateReady, DeploymentPlanRevisionID: revision.ID,
+		DeploymentPlanRevisionNumber: revision.RevisionNumber,
 	}
 }
 

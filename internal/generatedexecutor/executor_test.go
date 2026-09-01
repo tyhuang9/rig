@@ -444,7 +444,7 @@ func TestGeneratedExecutorWaitsBeforeMutationWhenMigrationApprovalIsMissing(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != "approval_required" {
+	if result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseMigrationApprovalRequired {
 		t.Fatalf("result=%+v", result)
 	}
 	if fixture.authorization.calls != 0 || fixture.compiler.calls != 0 || len(*fixture.events) != 0 {
@@ -459,7 +459,22 @@ func TestGeneratedExecutorWaitsBeforeMutationWhenCapacityAdmissionFails(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Disposition != jobs.ExecutionWaitingUser || fixture.compiler.calls != 0 {
+	if result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseInsufficientReplacementCapacity || fixture.compiler.calls != 0 {
+		t.Fatalf("result=%+v compile calls=%d", result, fixture.compiler.calls)
+	}
+	if !reflect.DeepEqual(*fixture.events, []string{"authorize"}) {
+		t.Fatalf("events=%v", *fixture.events)
+	}
+}
+
+func TestGeneratedExecutorPreservesRuntimePolicyApprovalPause(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.authorization.err = deployments.ErrApprovalRequired
+	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseApprovalRequired || fixture.compiler.calls != 0 {
 		t.Fatalf("result=%+v compile calls=%d", result, fixture.compiler.calls)
 	}
 	if !reflect.DeepEqual(*fixture.events, []string{"authorize"}) {

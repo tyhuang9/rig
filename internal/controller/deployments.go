@@ -1,12 +1,14 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/apicontract"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
 )
@@ -64,15 +66,23 @@ func (s *Server) listReleases(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deployApplication(w http.ResponseWriter, r *http.Request) {
-	s.createDeploymentJob(w, r, "", jobs.ConfigurationCurrent)
+	if !s.appExists(w, r) {
+		return
+	}
+	strategy, err := s.currentDeploymentStrategy(r.Context(), r.PathValue("appId"))
+	if err != nil {
+		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not verify the deployment runtime", nil)
+		return
+	}
+	if !s.runtimeStrategyAvailable(strategy, true) {
+		problem(w, r, http.StatusConflict, "capability_unavailable", "Runtime actions are unavailable in this configuration", nil)
+		return
+	}
+	s.enqueueDeployment(w, r, "", jobs.ConfigurationCurrent)
 }
 
 func (s *Server) deployRelease(w http.ResponseWriter, r *http.Request) {
 	if !s.appExists(w, r) {
-		return
-	}
-	if !s.ComposeRuntime {
-		problem(w, r, http.StatusConflict, "capability_unavailable", "Runtime actions are unavailable in this configuration", nil)
 		return
 	}
 	if s.Deployments == nil {
@@ -80,8 +90,18 @@ func (s *Server) deployRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	releaseID := r.PathValue("releaseId")
-	if _, err := s.Deployments.Release(r.Context(), r.PathValue("appId"), releaseID); err != nil {
+	release, err := s.Deployments.Release(r.Context(), r.PathValue("appId"), releaseID)
+	if err != nil {
 		problem(w, r, http.StatusNotFound, "release_not_found", "Release was not found", nil)
+		return
+	}
+	strategy, err := s.revisionDeploymentStrategy(r.Context(), release.AppID, release.DeploymentPlanRevisionID, release.DeploymentPlanRevisionNumber)
+	if err != nil {
+		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not verify the release runtime", nil)
+		return
+	}
+	if !s.runtimeStrategyAvailable(strategy, false) {
+		problem(w, r, http.StatusConflict, "capability_unavailable", "Runtime actions are unavailable in this configuration", nil)
 		return
 	}
 	var request apicontract.DeployReleaseRequest
@@ -90,17 +110,6 @@ func (s *Server) deployRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.enqueueDeployment(w, r, releaseID, jobs.ConfigurationMode(request.ConfigurationMode))
-}
-
-func (s *Server) createDeploymentJob(w http.ResponseWriter, r *http.Request, releaseID string, mode jobs.ConfigurationMode) {
-	if !s.appExists(w, r) {
-		return
-	}
-	if !s.runtimeAvailable() {
-		problem(w, r, http.StatusConflict, "capability_unavailable", "Runtime actions are unavailable in this configuration", nil)
-		return
-	}
-	s.enqueueDeployment(w, r, releaseID, mode)
 }
 
 func (s *Server) enqueueDeployment(w http.ResponseWriter, r *http.Request, releaseID string, mode jobs.ConfigurationMode) {
@@ -135,8 +144,6 @@ func (s *Server) enqueueDeployment(w http.ResponseWriter, r *http.Request, relea
 		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not create deployment job", nil)
 	}
 }
-
-func (s *Server) runtimeAvailable() bool { return s.ComposeRuntime || s.FakeRuntime }
 
 func (s *Server) listRuntimeApprovals(w http.ResponseWriter, r *http.Request) {
 	if !s.appExists(w, r) {
@@ -228,8 +235,13 @@ func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
 		return
 	}
-	if !s.ComposeRuntime {
-		problem(w, r, http.StatusConflict, "capability_unavailable", "Compose runtime is unavailable in this configuration", nil)
+	strategy, err := s.jobDeploymentStrategy(r.Context(), job)
+	if err != nil {
+		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not verify the deployment runtime", nil)
+		return
+	}
+	if !s.runtimeStrategyAvailable(strategy, false) {
+		problem(w, r, http.StatusConflict, "capability_unavailable", "Runtime actions are unavailable in this configuration", nil)
 		return
 	}
 	job, err = s.Jobs.Resume(job.ID)
@@ -240,10 +252,103 @@ func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, http.StatusConflict, "job_not_paused", "Job is not waiting for user action", nil)
 	case errors.Is(err, jobs.ErrApprovalRequired):
 		problem(w, r, http.StatusConflict, "approval_required", "Deployment still requires runtime approval", nil)
+	case errors.Is(err, jobs.ErrMigrationApprovalRequired):
+		problem(w, r, http.StatusConflict, "migration_approval_required", "Deployment migration still requires approval", nil)
 	case errors.Is(err, jobs.ErrJobNotFound):
 		problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
 	default:
 		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not resume job", nil)
+	}
+}
+
+func (s *Server) currentDeploymentStrategy(ctx context.Context, appID string) (deploymentplans.Strategy, error) {
+	if s.DeploymentPlans == nil {
+		return deploymentplans.StrategyCompose, nil
+	}
+	revision, err := s.DeploymentPlans.Get(ctx, appID)
+	if err != nil {
+		return "", err
+	}
+	if revision.ID == "" && revision.RevisionNumber == 0 {
+		return deploymentplans.StrategyCompose, nil
+	}
+	if revision.ID == "" || revision.RevisionNumber < 1 {
+		return "", errors.New("deployment plan head provenance is invalid")
+	}
+	return validatedPlanStrategy(revision)
+}
+
+func (s *Server) revisionDeploymentStrategy(ctx context.Context, appID, revisionID string, revisionNumber int64) (deploymentplans.Strategy, error) {
+	if revisionID == "" && revisionNumber == 0 {
+		return deploymentplans.StrategyCompose, nil
+	}
+	if s.DeploymentPlans == nil || revisionID == "" || revisionNumber < 1 {
+		return "", errors.New("deployment plan provenance is invalid")
+	}
+	revision, err := s.DeploymentPlans.GetRevision(ctx, appID, revisionID, revisionNumber)
+	if err != nil {
+		return "", err
+	}
+	return validatedPlanStrategy(revision)
+}
+
+func (s *Server) jobDeploymentStrategy(ctx context.Context, job jobs.Job) (deploymentplans.Strategy, error) {
+	if s.Deployments == nil {
+		return "", errors.New("deployment history is unavailable")
+	}
+	values, err := s.Deployments.List(ctx, job.ResourceID, 100)
+	if err != nil {
+		return "", err
+	}
+	for _, value := range values {
+		if value.JobID != job.ID {
+			continue
+		}
+		strategy, strategyErr := s.revisionDeploymentStrategy(ctx, value.AppID, value.DeploymentPlanRevisionID, value.DeploymentPlanRevisionNumber)
+		if strategyErr != nil {
+			return "", strategyErr
+		}
+		if value.ProvenanceInitialized {
+			expected, ok := deploymentRuntimeStrategy(strategy)
+			if !ok || value.RuntimeStrategy != expected {
+				return "", errors.New("deployment runtime provenance is invalid")
+			}
+		} else if strategy != deploymentplans.StrategyCompose || (value.RuntimeStrategy != "" && value.RuntimeStrategy != deployments.RuntimeCompose) {
+			return "", errors.New("deployment runtime provenance is invalid")
+		}
+		return strategy, nil
+	}
+	return "", errors.New("deployment was not found for job")
+}
+
+func validatedPlanStrategy(revision deploymentplans.DeploymentPlanRevision) (deploymentplans.Strategy, error) {
+	switch revision.Plan.Strategy {
+	case deploymentplans.StrategyCompose, deploymentplans.StrategyGeneratedNode:
+		return revision.Plan.Strategy, nil
+	default:
+		return "", errors.New("deployment plan strategy is invalid")
+	}
+}
+
+func deploymentRuntimeStrategy(strategy deploymentplans.Strategy) (deployments.RuntimeStrategy, bool) {
+	switch strategy {
+	case deploymentplans.StrategyCompose:
+		return deployments.RuntimeCompose, true
+	case deploymentplans.StrategyGeneratedNode:
+		return deployments.RuntimeGeneratedNode, true
+	default:
+		return "", false
+	}
+}
+
+func (s *Server) runtimeStrategyAvailable(strategy deploymentplans.Strategy, allowFakeCompose bool) bool {
+	switch strategy {
+	case deploymentplans.StrategyCompose:
+		return s.ComposeRuntime || (allowFakeCompose && s.FakeRuntime)
+	case deploymentplans.StrategyGeneratedNode:
+		return s.GeneratedRuntime
+	default:
+		return false
 	}
 }
 
@@ -256,7 +361,7 @@ func contractDeployment(value deployments.Deployment) apicontract.Deployment {
 }
 
 func contractRelease(value deployments.Release) apicontract.Release {
-	return apicontract.Release{ID: value.ID, AppID: value.AppID, SourceProvider: value.SourceProvider, RepositoryID: value.RepositoryID, RepositoryOwner: value.RepositoryOwner, RepositoryName: value.RepositoryName, TrackedRef: value.TrackedRef, ResolvedSha: value.ResolvedSHA, SourceCommitSha: value.SourceCommitSHA, SourceBranch: value.SourceBranch, ComposePath: value.ComposePath, ArchiveSha256: value.ArchiveSHA256, WorkspaceState: value.WorkspaceState, ConfigurationRevisionID: value.ConfigurationRevisionID, ConfigurationRevisionNumber: value.ConfigurationRevisionNumber, DeploymentPlanRevisionID: value.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: value.DeploymentPlanRevisionNumber, CreatedAt: formatContractTime(value.CreatedAt)}
+	return apicontract.Release{ID: value.ID, AppID: value.AppID, SourceProvider: value.SourceProvider, RepositoryID: value.RepositoryID, RepositoryOwner: value.RepositoryOwner, RepositoryName: value.RepositoryName, TrackedRef: value.TrackedRef, ResolvedSha: value.ResolvedSHA, SourceCommitSha: value.SourceCommitSHA, SourceBranch: value.SourceBranch, ComposePath: value.ComposePath, ArchiveSha256: value.ArchiveSHA256, WorkspaceState: value.WorkspaceState, ConfigurationRevisionID: value.ConfigurationRevisionID, ConfigurationRevisionNumber: value.ConfigurationRevisionNumber, DeploymentPlanRevisionID: value.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: value.DeploymentPlanRevisionNumber, RuntimeStrategy: string(value.RuntimeStrategy), CreatedAt: formatContractTime(value.CreatedAt)}
 }
 
 func contractRuntimeApproval(value deployments.Approval) apicontract.RuntimeApproval {

@@ -45,6 +45,7 @@ type Server struct {
 	Caddy               bool
 	FakeRuntime         bool
 	ComposeRuntime      bool
+	GeneratedRuntime    bool
 	DockerEndpoint      string
 	DataRoot            string
 	Logger              *slog.Logger
@@ -614,7 +615,7 @@ func (s *Server) rotateCSRF(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	d := s.runDiagnostics(r.Context())
-	writeJSON(w, 200, apicontract.SystemStatus{Daemon: "running", Diagnostics: contractDiagnostics(d), Capabilities: apicontract.Capabilities{FakeRuntime: s.FakeRuntime, ComposeRuntime: s.ComposeRuntime, GithubConnections: s.Sources != nil && s.Sources.ProviderEnabled()}})
+	writeJSON(w, 200, apicontract.SystemStatus{Daemon: "running", Diagnostics: contractDiagnostics(d), Capabilities: apicontract.Capabilities{FakeRuntime: s.FakeRuntime, ComposeRuntime: s.ComposeRuntime, GeneratedRuntime: s.GeneratedRuntime, GithubConnections: s.Sources != nil && s.Sources.ProviderEnabled()}})
 }
 func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
 	d := s.runDiagnostics(r.Context())

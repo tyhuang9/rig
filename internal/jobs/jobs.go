@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/generatedrecovery"
 )
 
 type Status string
@@ -30,16 +31,17 @@ const (
 )
 
 var (
-	ErrJobNotFound           = errors.New("job not found")
-	ErrJobTerminal           = errors.New("job is already terminal")
-	ErrInvalidInput          = errors.New("invalid job input")
-	ErrInvalidProgress       = errors.New("invalid job progress")
-	ErrEventBudget           = errors.New("job event budget exhausted")
-	ErrJobNotPaused          = errors.New("job is not waiting for user action")
-	ErrApprovalRequired      = errors.New("job still requires runtime approval")
-	ErrIdempotency           = errors.New("idempotency key conflicts with the original request")
-	ErrApplicationBusy       = errors.New("application already has an active mutation")
-	ErrCancellationRequested = errors.New("job cancellation requested")
+	ErrJobNotFound               = errors.New("job not found")
+	ErrJobTerminal               = errors.New("job is already terminal")
+	ErrInvalidInput              = errors.New("invalid job input")
+	ErrInvalidProgress           = errors.New("invalid job progress")
+	ErrEventBudget               = errors.New("job event budget exhausted")
+	ErrJobNotPaused              = errors.New("job is not waiting for user action")
+	ErrApprovalRequired          = errors.New("job still requires runtime approval")
+	ErrMigrationApprovalRequired = errors.New("job still requires migration approval")
+	ErrIdempotency               = errors.New("idempotency key conflicts with the original request")
+	ErrApplicationBusy           = errors.New("application already has an active mutation")
+	ErrCancellationRequested     = errors.New("job cancellation requested")
 )
 
 // JobInput is deliberately sealed so new persisted input schemas are reviewed
@@ -146,6 +148,12 @@ const (
 	ExecutionWaitingUser ExecutionDisposition = "waiting_user"
 )
 
+const (
+	PauseApprovalRequired                = "approval_required"
+	PauseMigrationApprovalRequired       = "migration_approval_required"
+	PauseInsufficientReplacementCapacity = "insufficient_replacement_capacity"
+)
+
 // ExecutionError identifies a known executor failure. Detail is retained for
 // executor diagnostics only and is never persisted or returned to clients.
 type ExecutionError struct {
@@ -187,41 +195,11 @@ func (s *Service) signal() {
 }
 
 func (s *Service) RecoverInterrupted() error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
+	result, err := generatedrecovery.RecoverJobs(context.Background(), s.db, s.now().UTC())
+	if err == nil && result.RequeuedGenerated > 0 {
+		s.signal()
 	}
-	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT id FROM jobs WHERE status IN ('assigned','running','waiting_external') ORDER BY created_at`)
-	if err != nil {
-		return err
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	now := s.now().UTC()
-	for _, id := range ids {
-		if _, err := tx.Exec(`UPDATE jobs SET status='interrupted',phase='interrupted',pause_disposition=NULL,error_code='daemon_restarted',error_detail='Job interrupted because hostd restarted',updated_at=?,finished_at=? WHERE id=?`, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id); err != nil {
-			return err
-		}
-		if _, err := appendEvent(tx, now, id, "error", "interrupted", "daemon_restarted", "Job interrupted because hostd restarted"); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return err
 }
 
 // Create preserves the legacy no-input API.
@@ -597,14 +575,24 @@ func (s *Service) Resume(id string) (Job, error) {
 	// Make the approval check and requeue one serialized write. A controller-side
 	// preflight would allow an approval revocation to race the state mutation.
 	result, err := tx.Exec(`UPDATE jobs SET status='queued',phase='queued',progress_percent=0,checkpoint_json='{}',pause_disposition=NULL,error_code=NULL,error_detail=NULL,started_at=NULL,finished_at=NULL,updated_at=?
-		WHERE id=? AND status='waiting_user' AND NOT EXISTS (
-			SELECT 1 FROM deployments d
-			JOIN deployment_policy_findings f ON f.deployment_id=d.id AND f.disposition='approval_required'
-			WHERE d.job_id=jobs.id AND d.app_id=jobs.resource_id AND NOT EXISTS (
-				SELECT 1 FROM runtime_approvals a
-				WHERE a.app_id=d.app_id AND a.policy_version=f.policy_version AND a.capability=f.capability
-					AND a.scope=f.scope AND a.fingerprint=f.fingerprint AND a.revoked_at IS NULL
-			)
+		WHERE id=? AND status='waiting_user' AND (
+			(pause_disposition='approval_required' AND NOT EXISTS (
+				SELECT 1 FROM deployments d
+				JOIN deployment_policy_findings f ON f.deployment_id=d.id AND f.disposition='approval_required'
+				WHERE d.job_id=jobs.id AND d.app_id=jobs.resource_id AND NOT EXISTS (
+					SELECT 1 FROM runtime_approvals a
+					WHERE a.app_id=d.app_id AND a.policy_version=f.policy_version AND a.capability=f.capability
+						AND a.scope=f.scope AND a.fingerprint=f.fingerprint AND a.revoked_at IS NULL
+				)
+			))
+			OR (pause_disposition='migration_approval_required' AND EXISTS (
+				SELECT 1 FROM deployments d
+				JOIN deployment_plan_revisions p ON p.id=d.deployment_plan_revision_id AND p.app_id=d.app_id AND p.revision_number=d.deployment_plan_revision_number
+				JOIN deployment_plan_migration_approvals a ON a.revision_id=p.id AND a.app_id=p.app_id
+				WHERE d.job_id=jobs.id AND d.app_id=jobs.resource_id AND d.runtime_strategy='generated_node'
+					AND d.provenance_initialized=1 AND p.strategy='generated_node' AND p.migration_evidence_digest<>''
+			))
+			OR pause_disposition='insufficient_replacement_capacity'
 		)`, formattedNow, id)
 	if err != nil {
 		return Job{}, err
@@ -614,9 +602,9 @@ func (s *Service) Resume(id string) (Job, error) {
 		return Job{}, err
 	}
 	if updated != 1 {
-		var status string
-		var missingApproval bool
-		err := tx.QueryRow(`SELECT j.status,EXISTS (
+		var status, disposition string
+		var missingApproval, migrationApproved bool
+		err := tx.QueryRow(`SELECT j.status,COALESCE(j.pause_disposition,''),EXISTS (
 			SELECT 1 FROM deployments d
 			JOIN deployment_policy_findings f ON f.deployment_id=d.id AND f.disposition='approval_required'
 			WHERE d.job_id=j.id AND d.app_id=j.resource_id AND NOT EXISTS (
@@ -624,7 +612,13 @@ func (s *Service) Resume(id string) (Job, error) {
 				WHERE a.app_id=d.app_id AND a.policy_version=f.policy_version AND a.capability=f.capability
 					AND a.scope=f.scope AND a.fingerprint=f.fingerprint AND a.revoked_at IS NULL
 			)
-		) FROM jobs j WHERE j.id=?`, id).Scan(&status, &missingApproval)
+		),EXISTS (
+			SELECT 1 FROM deployments d
+			JOIN deployment_plan_revisions p ON p.id=d.deployment_plan_revision_id AND p.app_id=d.app_id AND p.revision_number=d.deployment_plan_revision_number
+			JOIN deployment_plan_migration_approvals a ON a.revision_id=p.id AND a.app_id=p.app_id
+			WHERE d.job_id=j.id AND d.app_id=j.resource_id AND d.runtime_strategy='generated_node'
+				AND d.provenance_initialized=1 AND p.strategy='generated_node' AND p.migration_evidence_digest<>''
+		) FROM jobs j WHERE j.id=?`, id).Scan(&status, &disposition, &missingApproval, &migrationApproved)
 		if errors.Is(err, sql.ErrNoRows) {
 			return Job{}, ErrJobNotFound
 		}
@@ -634,8 +628,11 @@ func (s *Service) Resume(id string) (Job, error) {
 		if status != string(WaitingUser) {
 			return Job{}, ErrJobNotPaused
 		}
-		if missingApproval {
+		if disposition == PauseApprovalRequired && missingApproval {
 			return Job{}, ErrApprovalRequired
+		}
+		if disposition == PauseMigrationApprovalRequired && !migrationApproved {
+			return Job{}, ErrMigrationApprovalRequired
 		}
 		return Job{}, ErrJobNotPaused
 	}
@@ -889,7 +886,8 @@ func (s *Service) runOne(ctx context.Context, executor Executor) error {
 	result, executionErr := invokeExecutor(jobCtx, executor, job, reporter{service: s, jobID: job.ID})
 	watcherErr := stopWatching()
 	s.unregister(job.ID, finishExecution)
-	validPause := executionErr == nil && result.Disposition == ExecutionWaitingUser && result.PauseDisposition == "approval_required" && result.CompletionCode == ""
+	_, pauseAllowed := pauseStateFor(result.PauseDisposition)
+	validPause := executionErr == nil && result.Disposition == ExecutionWaitingUser && pauseAllowed && result.CompletionCode == ""
 	if validPause {
 		pauseErr := s.pause(job.ID, result.PauseDisposition)
 		if watcherErr != nil {
@@ -941,7 +939,8 @@ func (s *Service) runOne(ctx context.Context, executor Executor) error {
 }
 
 func (s *Service) pause(id, disposition string) error {
-	if disposition != "approval_required" {
+	state, ok := pauseStateFor(disposition)
+	if !ok {
 		return ErrInvalidProgress
 	}
 	tx, err := s.db.Begin()
@@ -951,7 +950,7 @@ func (s *Service) pause(id, disposition string) error {
 	defer tx.Rollback()
 	now := s.now().UTC()
 	formattedNow := now.Format(time.RFC3339Nano)
-	result, err := tx.Exec(`UPDATE jobs SET status='waiting_user',phase='approval_required',pause_disposition=?,updated_at=?,started_at=COALESCE(started_at,?) WHERE id=? AND status IN ('assigned','running','waiting_external') AND NOT (status='waiting_external' AND phase='cancelling')`, disposition, formattedNow, formattedNow, id)
+	result, err := tx.Exec(`UPDATE jobs SET status='waiting_user',phase=?,checkpoint_json=?,pause_disposition=?,updated_at=?,started_at=COALESCE(started_at,?) WHERE id=? AND status IN ('assigned','running','waiting_external') AND NOT (status='waiting_external' AND phase='cancelling')`, state.phase, state.checkpoint, disposition, formattedNow, formattedNow, id)
 	if err != nil {
 		return err
 	}
@@ -962,7 +961,7 @@ func (s *Service) pause(id, disposition string) error {
 	if updated != 1 {
 		return ErrJobTerminal
 	}
-	if _, err := appendEvent(tx, now, id, "warn", "approval_required", "approval_required", "Deployment requires approval"); err != nil {
+	if _, err := appendEvent(tx, now, id, "warn", state.phase, state.code, state.message); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -970,6 +969,26 @@ func (s *Service) pause(id, disposition string) error {
 	}
 	s.signal()
 	return nil
+}
+
+type pauseState struct {
+	phase      string
+	checkpoint string
+	code       string
+	message    string
+}
+
+func pauseStateFor(disposition string) (pauseState, bool) {
+	switch disposition {
+	case PauseApprovalRequired:
+		return pauseState{phase: PauseApprovalRequired, checkpoint: `{"phase":"approval_required"}`, code: PauseApprovalRequired, message: "Deployment requires approval"}, true
+	case PauseMigrationApprovalRequired:
+		return pauseState{phase: PauseMigrationApprovalRequired, checkpoint: `{"phase":"migration_approval_required"}`, code: PauseMigrationApprovalRequired, message: "Deployment migration requires approval"}, true
+	case PauseInsufficientReplacementCapacity:
+		return pauseState{phase: PauseInsufficientReplacementCapacity, checkpoint: `{"phase":"insufficient_replacement_capacity"}`, code: PauseInsufficientReplacementCapacity, message: "Deployment is waiting for replacement capacity"}, true
+	default:
+		return pauseState{}, false
+	}
 }
 
 // SQLite cancellation polling intentionally runs at a bounded 250ms cadence:

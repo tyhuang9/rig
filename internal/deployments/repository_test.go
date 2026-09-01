@@ -236,6 +236,47 @@ func seedRuntimePlanRelease(t *testing.T, fixture repositoryFixture, strategy Ru
 	return planID, releaseID
 }
 
+func TestReleaseRuntimeStrategyComesFromPinnedPlan(t *testing.T) {
+	tests := []struct {
+		name     string
+		strategy RuntimeStrategy
+		legacy   bool
+	}{
+		{name: "legacy release defaults to compose", strategy: RuntimeCompose, legacy: true},
+		{name: "compose plan remains compose", strategy: RuntimeCompose},
+		{name: "generated plan is exposed", strategy: RuntimeGeneratedNode},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRepositoryFixture(t)
+			var releaseID string
+			if test.legacy {
+				releaseID = uuid.NewString()
+				if _, err := fixture.repository.db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,workspace_state,workspace_tree_sha256) VALUES(?,?,'ready','{}',datetime('now'),'ready',?)`, releaseID, fixture.appA, strings.Repeat("d", 64)); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				_, releaseID = seedRuntimePlanRelease(t, fixture, test.strategy)
+			}
+
+			release, err := fixture.repository.Release(context.Background(), fixture.appA, releaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if release.RuntimeStrategy != test.strategy {
+				t.Fatalf("release runtime strategy = %q, want %q", release.RuntimeStrategy, test.strategy)
+			}
+			releases, err := fixture.repository.Releases(context.Background(), fixture.appA, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(releases) != 1 || releases[0].RuntimeStrategy != test.strategy {
+				t.Fatalf("release history = %#v", releases)
+			}
+		})
+	}
+}
+
 func TestGatePersistsFullFindingSetAndAtomicallyRechecksApprovals(t *testing.T) {
 	fixture := newRepositoryFixture(t)
 	ctx := context.Background()

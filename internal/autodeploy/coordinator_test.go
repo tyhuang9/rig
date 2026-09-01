@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -278,6 +279,34 @@ func (repository *finalizeBarrierRepository) FinalizeResolvedHead(ctx context.Co
 
 type busyJobCreator struct{ calls int }
 
+type scriptedDispatchPreflight struct {
+	mutex    sync.Mutex
+	results  []DispatchPreflightResult
+	errors   []error
+	requests []DispatchPreflightRequest
+}
+
+func (preflight *scriptedDispatchPreflight) Prepare(_ context.Context, request DispatchPreflightRequest) (DispatchPreflightResult, error) {
+	preflight.mutex.Lock()
+	defer preflight.mutex.Unlock()
+	preflight.requests = append(preflight.requests, request)
+	index := len(preflight.requests) - 1
+	var result DispatchPreflightResult
+	if index < len(preflight.results) {
+		result = preflight.results[index]
+	}
+	if index < len(preflight.errors) {
+		return result, preflight.errors[index]
+	}
+	return result, nil
+}
+
+func (preflight *scriptedDispatchPreflight) Requests() []DispatchPreflightRequest {
+	preflight.mutex.Lock()
+	defer preflight.mutex.Unlock()
+	return append([]DispatchPreflightRequest(nil), preflight.requests...)
+}
+
 func (creator *busyJobCreator) CreateWithInputFinalized(jobs.CreateRequest, jobs.CreateFinalizer) (jobs.Job, bool, error) {
 	creator.calls++
 	return jobs.Job{}, false, jobs.ErrApplicationBusy
@@ -341,10 +370,173 @@ func TestCoordinatorOfflineStartupUsesPersistedScopeAndCreatesSanitizedJob(t *te
 	if err != nil || resolved.ActiveSHA != secondSHA || resolved.LatestResolvedSHA != secondSHA {
 		t.Fatalf("resolved status=%#v err=%v", resolved, err)
 	}
-	if len(resolver.scopes) != 1 || resolver.scopes[0] != (SourceScope{OwnerUserID: testOwner, ConnectionID: testConnection, InstallationID: testInstallation, RepositoryID: testRepository, Branch: "main", Ref: testRef}) {
+	if len(resolver.scopes) != 1 || resolver.scopes[0] != (SourceScope{OwnerUserID: testOwner, ConnectionID: testConnection, InstallationID: testInstallation, RepositoryID: testRepository, Branch: "main", Ref: testRef, ComposePath: "compose.yaml"}) {
 		t.Fatalf("resolver scope=%#v configured=%#v", resolver.scopes, status)
 	}
 	assertSingleCoordinatorJob(t, fixture, resolved, 1)
+}
+
+func TestCoordinatorGeneratedPreflightPinsMaterializedRelease(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	releaseID := seedGeneratedAutoDeployRuntime(t, fixture, secondSHA)
+	if _, err := fixture.repository.Configure(context.Background(), ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, Enabled: true}, fixture.now); err != nil {
+		t.Fatal(err)
+	}
+	clock := &coordinatorTestClock{now: fixture.now}
+	preflight := &scriptedDispatchPreflight{results: []DispatchPreflightResult{{ReleaseID: releaseID}}}
+	config := DefaultCoordinatorConfig()
+	config.Clock = clock
+	config.MinResolveInterval = time.Nanosecond
+	config.Preflight = preflight
+	coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: secondSHA}, jobs.New(fixture.db), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, event := coordinator.processOne(context.Background())
+	if !claimed || event.Dispatched != 1 || event.State != StateDeploying {
+		t.Fatalf("generated dispatch claimed=%v event=%#v", claimed, event)
+	}
+	requests := preflight.Requests()
+	if len(requests) != 1 || requests[0].ApplicationID != testApp || requests[0].OwnerUserID != testOwner || requests[0].ResolvedSHA != secondSHA || requests[0].Source.RepositoryID != testRepository || requests[0].Source.Ref != testRef {
+		t.Fatalf("preflight requests=%#v", requests)
+	}
+	var input string
+	if err := fixture.db.QueryRow(`SELECT input_json FROM jobs WHERE resource_id=?`, testApp).Scan(&input); err != nil {
+		t.Fatal(err)
+	}
+	want := `{"releaseId":"` + releaseID + `","configurationMode":"current"}`
+	if input != want {
+		t.Fatalf("job input=%q want=%q", input, want)
+	}
+}
+
+func TestCoordinatorRestartReplaysGeneratedPreparedDispatchThroughPreflight(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	releaseID := seedGeneratedAutoDeployRuntime(t, fixture, testSHA)
+	_, lease, prepared := prepareCoordinatorDispatch(t, fixture)
+	if err := fixture.repository.ReleaseLease(context.Background(), lease, fixture.now.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	clock := &coordinatorTestClock{now: fixture.now.Add(2 * time.Millisecond)}
+	preflight := &scriptedDispatchPreflight{results: []DispatchPreflightResult{{ReleaseID: releaseID}}}
+	config := DefaultCoordinatorConfig()
+	config.Clock = clock
+	config.MinResolveInterval = time.Nanosecond
+	config.Preflight = preflight
+	coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: secondSHA}, jobs.New(fixture.db), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, event := coordinator.processOne(context.Background())
+	if !claimed || event.Dispatched != 1 || event.Resolved != 0 || event.State != StateDeploying {
+		t.Fatalf("restart claimed=%v event=%#v", claimed, event)
+	}
+	requests := preflight.Requests()
+	if len(requests) != 1 || requests[0].ResolvedSHA != prepared.SHA {
+		t.Fatalf("restart preflight requests=%#v prepared=%#v", requests, prepared)
+	}
+	var input string
+	if err := fixture.db.QueryRow(`SELECT input_json FROM jobs WHERE resource_id=?`, testApp).Scan(&input); err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"releaseId":"` + releaseID + `","configurationMode":"current"}`; input != want {
+		t.Fatalf("restart job input=%q want=%q", input, want)
+	}
+}
+
+func TestCoordinatorGeneratedPlanReviewPausesBeforeCreatingJob(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	if _, err := fixture.repository.Configure(context.Background(), ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, Enabled: true}, fixture.now); err != nil {
+		t.Fatal(err)
+	}
+	clock := &coordinatorTestClock{now: fixture.now}
+	preflight := &scriptedDispatchPreflight{errors: []error{&PreflightError{Code: PreflightPlanReview}}}
+	config := DefaultCoordinatorConfig()
+	config.Clock = clock
+	config.MinResolveInterval = time.Nanosecond
+	config.Preflight = preflight
+	coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: secondSHA}, jobs.New(fixture.db), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, event := coordinator.processOne(context.Background())
+	if !claimed || event.Dispatched != 0 || event.PauseCode != PauseDeploymentPlanReviewRequired || event.State != StatePaused {
+		t.Fatalf("plan review claimed=%v event=%#v", claimed, event)
+	}
+	status, err := fixture.repository.Get(context.Background(), testApp)
+	if err != nil || status.State != StatePaused || status.PauseCode != PauseDeploymentPlanReviewRequired || status.PausedSHA != secondSHA {
+		t.Fatalf("plan review status=%#v err=%v", status, err)
+	}
+	assertSingleCoordinatorJob(t, fixture, status, 0)
+}
+
+func TestCoordinatorHeadRaceRestartsPreparedDispatchAndReresolves(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	if _, err := fixture.repository.Configure(context.Background(), ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, Enabled: true}, fixture.now); err != nil {
+		t.Fatal(err)
+	}
+	clock := &coordinatorTestClock{now: fixture.now}
+	preflight := &scriptedDispatchPreflight{
+		results: []DispatchPreflightResult{{}, {}},
+		errors:  []error{&PreflightError{Code: PreflightHeadChanged}, nil},
+	}
+	resolver := &coordinatorTestResolver{sha: secondSHA}
+	config := DefaultCoordinatorConfig()
+	config.Clock = clock
+	config.MinResolveInterval = time.Nanosecond
+	config.Preflight = preflight
+	coordinator, err := NewCoordinator(fixture.repository, resolver, jobs.New(fixture.db), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, event := coordinator.processOne(context.Background()); !claimed || event.State != StateIdle || event.NextAction != NextActionResolve || event.Dispatched != 0 {
+		t.Fatalf("race restart claimed=%v event=%#v", claimed, event)
+	}
+	status, err := fixture.repository.Get(context.Background(), testApp)
+	if err != nil || status.State != StateIdle || status.PreparedDispatchSequence != 0 {
+		t.Fatalf("race restart status=%#v err=%v", status, err)
+	}
+	clock.Advance(time.Nanosecond)
+	if claimed, event := coordinator.processOne(context.Background()); !claimed || event.State != StateDeploying || event.Dispatched != 1 {
+		t.Fatalf("race retry claimed=%v event=%#v", claimed, event)
+	}
+	if resolver.Calls() != 2 || len(preflight.Requests()) != 2 {
+		t.Fatalf("resolver calls=%d preflight requests=%d", resolver.Calls(), len(preflight.Requests()))
+	}
+}
+
+func TestCoordinatorPlanHeadRaceRollsBackJobAndRestartsDispatch(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	releaseID := seedGeneratedAutoDeployRuntime(t, fixture, secondSHA)
+	if _, err := fixture.repository.Configure(context.Background(), ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, Enabled: true}, fixture.now); err != nil {
+		t.Fatal(err)
+	}
+	clock := &coordinatorTestClock{now: fixture.now}
+	preflight := &scriptedDispatchPreflight{results: []DispatchPreflightResult{{ReleaseID: releaseID}}}
+	creator := &beforeCreateJobCreator{
+		delegate: jobs.New(fixture.db),
+		before: func() error {
+			_, err := fixture.db.Exec(`UPDATE deployment_plan_heads SET revision_id=NULL,revision_number=0,updated_at=NULL WHERE app_id=?`, testApp)
+			return err
+		},
+	}
+	config := DefaultCoordinatorConfig()
+	config.Clock = clock
+	config.MinResolveInterval = time.Nanosecond
+	config.Preflight = preflight
+	coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: secondSHA}, creator, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, event := coordinator.processOne(context.Background())
+	if !claimed || event.State != StateIdle || event.NextAction != NextActionResolve || event.Dispatched != 0 {
+		t.Fatalf("plan head race claimed=%v event=%#v", claimed, event)
+	}
+	status, err := fixture.repository.Get(context.Background(), testApp)
+	if err != nil || status.State != StateIdle || status.PreparedDispatchSequence != 0 || status.ActiveJobID != "" {
+		t.Fatalf("plan head race status=%#v err=%v", status, err)
+	}
+	assertSingleCoordinatorJob(t, fixture, status, 0)
 }
 
 func TestCoordinatorConsumesNewestACKAndCoalescesSeveralPushes(t *testing.T) {
@@ -1182,7 +1374,8 @@ func TestCoordinatorObserverEmitsOnlyAllowlistedLifecycleValues(t *testing.T) {
 		StateDeploying: true, StatePaused: true, StateRetryWait: true,
 	}
 	allowedPauses := map[string]bool{
-		ObservedPauseNone: true, PauseApprovalRequired: true, PauseDeploymentFailed: true,
+		ObservedPauseNone: true, PauseApprovalRequired: true, PauseMigrationApprovalRequired: true,
+		PauseInsufficientReplacementCapacity: true, PauseDeploymentPlanReviewRequired: true, PauseDeploymentFailed: true,
 		PauseMissingConfig: true, PauseSourceAccessLost: true, PauseInvalidSource: true,
 		PauseProviderUnavailable: true, PauseRelayUnavailable: true,
 	}
@@ -1223,6 +1416,8 @@ func TestCoordinatorObservesJobPauseLifecycle(t *testing.T) {
 		wantAction  string
 	}{
 		{name: "approval", jobStatus: "waiting_user", phase: PauseApprovalRequired, disposition: PauseApprovalRequired, wantPause: PauseApprovalRequired, wantAction: NextActionApprovalRequired},
+		{name: "migration approval", jobStatus: "waiting_user", phase: PauseMigrationApprovalRequired, disposition: PauseMigrationApprovalRequired, wantPause: PauseMigrationApprovalRequired, wantAction: NextActionApprovalRequired},
+		{name: "replacement capacity", jobStatus: "waiting_user", phase: PauseInsufficientReplacementCapacity, disposition: PauseInsufficientReplacementCapacity, wantPause: PauseInsufficientReplacementCapacity, wantAction: NextActionResumeRequired},
 		{name: "missing configuration", jobStatus: "needs_attention", phase: "needs_attention", errorCode: "configuration_unavailable", finished: true, wantPause: PauseMissingConfig, wantAction: NextActionResumeRequired},
 		{name: "deployment failed", jobStatus: "failed", phase: "failed", errorCode: "compose_apply_failed", finished: true, wantPause: PauseDeploymentFailed, wantAction: NextActionResumeRequired},
 	}
@@ -1806,4 +2001,36 @@ func assertSingleCoordinatorJob(t *testing.T, fixture *repositoryFixture, status
 	if requestedBy != status.SourceOwnerUserID || input != `{"releaseId":"","configurationMode":"current"}` {
 		t.Fatalf("unsafe coordinator job actor=%q input=%q status=%#v", requestedBy, input, status)
 	}
+}
+
+func seedGeneratedAutoDeployRuntime(t *testing.T, fixture *repositoryFixture, sha string) string {
+	t.Helper()
+	planID := uuid.NewString()
+	releaseID := uuid.NewString()
+	stamp := timestamp(fixture.now)
+	if _, err := fixture.db.Exec(`UPDATE application_sources SET compose_path=NULL WHERE application_id=?`, testApp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`INSERT INTO deployment_plan_revisions(
+		id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,
+		analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,
+		field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at)
+		VALUES(?,?,1,?,'generated_node','projectanalysis','1',?,'github',?,?,?,1,1,'',?,?,'accepted',?,?)`,
+		planID, testApp, "apps/"+testApp+"/deployment-plans/"+planID+".secret", strings.Repeat("1", 64), testRepository, testSHA,
+		strings.Repeat("2", 64), testOwner, stamp, testOwner, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`UPDATE deployment_plan_heads SET revision_id=?,revision_number=1,updated_at=? WHERE app_id=?`, planID, stamp, testApp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`INSERT INTO releases(
+		id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,
+		repository_owner,repository_name,tracked_ref,resolved_sha,archive_sha256,workspace_tree_sha256,workspace_path,
+		workspace_state,materialized_at,deployment_plan_revision_id,deployment_plan_revision_number)
+		VALUES(?,?,?,'main','ready','{}',?,'github',?,'octo','app',?,?,?,? ,?,'ready',?,?,1)`,
+		releaseID, testApp, sha, stamp, testRepository, testRef, sha, strings.Repeat("3", 64), strings.Repeat("4", 64),
+		"releases/"+releaseID, stamp, planID); err != nil {
+		t.Fatal(err)
+	}
+	return releaseID
 }
