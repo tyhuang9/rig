@@ -25,7 +25,7 @@ const (
 )
 
 const (
-	liveCaddyStartupInspectFormat = `{"id":{{json .ID}},"name":{{json .Name}},"labels":{{json .Config.Labels}},"running":{{json .State.Running}},"restarting":{{json .State.Restarting}},"exitCode":{{json .State.ExitCode}},"error":{{json .State.Error}}}`
+	liveCaddyStartupInspectFormat = `{"id":{{json .ID}},"name":{{json .Name}},"labels":{{json .Config.Labels}},"status":{{json .State.Status}},"running":{{json .State.Running}},"restarting":{{json .State.Restarting}},"oomKilled":{{json .State.OOMKilled}},"dead":{{json .State.Dead}},"exitCode":{{json .State.ExitCode}},"error":{{json .State.Error}}}`
 	liveCaddyStartupOutputLimit   = 16 << 10
 )
 
@@ -33,8 +33,11 @@ type liveCaddyStartupInspection struct {
 	ID         string            `json:"id"`
 	Name       string            `json:"name"`
 	Labels     map[string]string `json:"labels"`
+	Status     string            `json:"status"`
 	Running    bool              `json:"running"`
 	Restarting bool              `json:"restarting"`
+	OOMKilled  bool              `json:"oomKilled"`
+	Dead       bool              `json:"dead"`
 	ExitCode   int               `json:"exitCode"`
 	Error      json.RawMessage   `json:"error"`
 }
@@ -42,7 +45,11 @@ type liveCaddyStartupInspection struct {
 type liveCaddyStartupDiagnostic struct {
 	Status        string
 	Exit          string
-	StateMarkers  string
+	StateStatus   string
+	OOMKilled     string
+	Dead          string
+	StateWrappers string
+	StateCauses   string
 	StdoutMarkers string
 	StderrMarkers string
 }
@@ -50,13 +57,17 @@ type liveCaddyStartupDiagnostic struct {
 func (value liveCaddyStartupDiagnostic) String() string {
 	return "caddy_startup_status:" + value.Status +
 		",caddy_exit:" + value.Exit +
-		",caddy_state_markers:" + value.StateMarkers +
+		",caddy_state_status:" + value.StateStatus +
+		",caddy_oom_killed:" + value.OOMKilled +
+		",caddy_dead:" + value.Dead +
+		",caddy_state_wrappers:" + value.StateWrappers +
+		",caddy_state_causes:" + value.StateCauses +
 		",caddy_stdout_markers:" + value.StdoutMarkers +
 		",caddy_stderr_markers:" + value.StderrMarkers
 }
 
 func liveCaddyStartupNotAttempted() liveCaddyStartupDiagnostic {
-	return liveCaddyStartupDiagnostic{Status: "not_attempted", Exit: "unobserved", StateMarkers: "unobserved", StdoutMarkers: "unobserved", StderrMarkers: "unobserved"}
+	return liveCaddyStartupDiagnostic{Status: "not_attempted", Exit: "unobserved", StateStatus: "unobserved", OOMKilled: "unobserved", Dead: "unobserved", StateWrappers: "unobserved", StateCauses: "unobserved", StdoutMarkers: "unobserved", StderrMarkers: "unobserved"}
 }
 
 const (
@@ -205,7 +216,10 @@ func liveCaddyStartupExitDiagnostic(ctx context.Context, manager *Manager, caddy
 	}
 	defer clearLiveCaddyStartupInspection(&state)
 	diagnostic.Exit = liveCaddyExitBucket(state.ExitCode)
-	diagnostic.StateMarkers = liveCaddyStartupStateMarkers(state.Error)
+	diagnostic.StateStatus = liveCaddyStateStatus(state.Status)
+	diagnostic.OOMKilled = strconv.FormatBool(state.OOMKilled)
+	diagnostic.Dead = strconv.FormatBool(state.Dead)
+	diagnostic.StateWrappers, diagnostic.StateCauses = liveCaddyStartupStateClassifiers(state.Error)
 	if state.ID != caddyID || strings.TrimPrefix(state.Name, "/") != caddyContainerName || state.Labels["io.rig.managed"] != "generated-ingress" || state.Labels["io.rig.identity-version"] != "v1" || state.Labels["io.rig.listener-isolation"] != "v1" {
 		diagnostic.Status = "ownership_changed"
 		diagnostic.StdoutMarkers = "unobserved"
@@ -276,11 +290,39 @@ func liveCaddyStartupRequest(ctx context.Context, manager *Manager, args []strin
 func liveCaddyExitBucket(exitCode int) string {
 	switch exitCode {
 	case 0:
-		return "zero"
+		return "success"
 	case 1:
-		return "one"
+		return "general_failure"
+	case 2:
+		return "shell_misuse"
+	case 126:
+		return "cannot_execute"
+	case 127:
+		return "command_not_found"
+	case 128:
+		return "invalid_exit"
+	case 137:
+		return "sigkill"
+	case 139:
+		return "segfault"
+	case 143:
+		return "terminated"
+	case 255:
+		return "runtime_255"
 	default:
-		return "other"
+		if exitCode >= 129 && exitCode <= 192 {
+			return "signal_other"
+		}
+		return "other_nonzero"
+	}
+}
+
+func liveCaddyStateStatus(value string) string {
+	switch value {
+	case "created", "running", "paused", "restarting", "removing", "exited", "dead":
+		return value
+	default:
+		return "unknown"
 	}
 }
 
@@ -325,12 +367,99 @@ func liveCaddyStartupMarkers(value []byte) string {
 	return strings.Join(names, "+")
 }
 
-func liveCaddyStartupStateMarkers(value json.RawMessage) string {
+func liveCaddyStartupStateClassifiers(value json.RawMessage) (string, string) {
 	trimmed := bytes.TrimSpace(value)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte(`""`)) {
-		return "none"
+		return "none", "none"
 	}
-	return liveCaddyStartupMarkers(trimmed)
+	lower := bytes.ToLower(trimmed)
+	defer clear(lower)
+	wrapperPatterns := []struct {
+		name    string
+		pattern []byte
+	}{
+		{"create_task", []byte("failed to create task")},
+		{"shim_task", []byte("failed to create shim task")},
+		{"oci_create", []byte("oci runtime create failed")},
+		{"oci_start", []byte("oci runtime start failed")},
+		{"runc_create", []byte("runc create failed")},
+		{"start_process", []byte("unable to start container process")},
+		{"container_init", []byte("error during container init")},
+		{"exec", []byte("exec:")},
+	}
+	wrapperFound := make([]bool, len(wrapperPatterns))
+	causeFound := make(map[string]bool, 8)
+	for _, line := range bytes.Split(lower, []byte{'\n'}) {
+		for index, wrapper := range wrapperPatterns {
+			if bytes.Contains(line, wrapper.pattern) {
+				wrapperFound[index] = true
+			}
+		}
+		causeFound[liveCaddyStartupStateCause(line)] = true
+	}
+	wrappers := make([]string, 0, len(wrapperPatterns))
+	for index, wrapper := range wrapperPatterns {
+		if wrapperFound[index] {
+			wrappers = append(wrappers, wrapper.name)
+		}
+	}
+	if len(wrappers) == 0 {
+		wrappers = append(wrappers, "none")
+	}
+	causeOrder := []string{"docker_init_missing", "docker_init_failed", "user_lookup", "workdir", "exec_format", "executable_missing", "entrypoint_denied", "mount_failed", "network_failed", "security_policy", "cgroup_failed", "pids_exhausted", "resource_exhausted", "no_space", "read_only", "operation_not_permitted", "permission_denied", "invalid_argument", "resource_unavailable", "other"}
+	causes := make([]string, 0, len(causeFound))
+	for _, cause := range causeOrder {
+		if causeFound[cause] {
+			causes = append(causes, cause)
+		}
+	}
+	return strings.Join(wrappers, "+"), strings.Join(causes, "+")
+}
+
+func liveCaddyStartupStateCause(line []byte) string {
+	contains := func(pattern string) bool { return bytes.Contains(line, []byte(pattern)) }
+	switch {
+	case contains("docker-init") && (contains("no such file") || contains("not found")):
+		return "docker_init_missing"
+	case contains("docker-init"):
+		return "docker_init_failed"
+	case contains("unable to setup user") || contains("unable to find user") || contains("no matching entries in passwd") || contains("unable to find group"):
+		return "user_lookup"
+	case contains("chdir to cwd") || contains("working directory") || contains("current working directory"):
+		return "workdir"
+	case contains("exec format error"):
+		return "exec_format"
+	case contains("executable file not found") || contains("executable not found"):
+		return "executable_missing"
+	case contains("exec:") && contains("permission denied"):
+		return "entrypoint_denied"
+	case (contains("mount") || contains("tmpfs")) && (contains("failed") || contains("error") || contains("invalid")):
+		return "mount_failed"
+	case contains("failed to set up container networking") || contains("failed programming external connectivity") || contains("port is already allocated") || contains("network namespace"):
+		return "network_failed"
+	case contains("apparmor") || contains("seccomp") || contains("selinux") || contains("security policy"):
+		return "security_policy"
+	case contains("cgroup"):
+		return "cgroup_failed"
+	case contains("pids limit") || contains("too many processes"):
+		return "pids_exhausted"
+	case contains("out of memory") || contains("cannot allocate memory") || contains("oom"):
+		return "resource_exhausted"
+	case contains("no space left on device"):
+		return "no_space"
+	case contains("read-only file system") || contains("read only file system"):
+		return "read_only"
+	case contains("operation not permitted"):
+		return "operation_not_permitted"
+	case contains("permission denied"):
+		return "permission_denied"
+	case contains("invalid argument"):
+		return "invalid_argument"
+	case contains("resource temporarily unavailable"):
+		return "resource_unavailable"
+	default:
+		return "other"
+	}
 }
 
 func clearLiveCaddyStartupInspection(value *liveCaddyStartupInspection) {
@@ -705,7 +834,7 @@ func TestLiveCaddyStartupDiagnosticPinsIdentityAndClassifiesStreams(t *testing.T
 	}
 	diagnostic := liveIngressFailureDiagnosticWithin(context.Background(), manager, time.Second)
 	want := "ingress_snapshot=image:valid,volume:valid,network:valid,caddy:valid,caddy_running:false,caddy_mismatches=none," +
-		"caddy_startup_status:ok,caddy_exit:one,caddy_state_markers:none,caddy_stdout_markers:other,caddy_stderr_markers:autosave_failed+permission_denied"
+		"caddy_startup_status:ok,caddy_exit:general_failure,caddy_state_status:unknown,caddy_oom_killed:false,caddy_dead:false,caddy_state_wrappers:none,caddy_state_causes:none,caddy_stdout_markers:other,caddy_stderr_markers:autosave_failed+permission_denied"
 	if diagnostic != want || strings.Contains(diagnostic, runner.id) || strings.Contains(diagnostic, caddyContainerName) {
 		t.Fatalf("diagnostic = %q", diagnostic)
 	}
@@ -791,8 +920,58 @@ func TestLiveCaddyStartupClassifierDoesNotSynthesizeMarkers(t *testing.T) {
 	if got := liveCaddyStartupMarkers([]byte("UNKNOWN COMMAND\naddress already in use\nconfig file does not exist\nunable to autosave\nread-only file system\npermission denied\nloading initial config\x00sensitive-canary")); got != "unknown_command+address_in_use+config_missing+autosave_failed+read_only+permission_denied+load_failed" {
 		t.Fatalf("canonical marker union = %q", got)
 	}
-	if got := liveCaddyStartupStateMarkers(json.RawMessage(`""`)); got != "none" {
-		t.Fatalf("empty state marker = %q", got)
+	if wrappers, causes := liveCaddyStartupStateClassifiers(json.RawMessage(`""`)); wrappers != "none" || causes != "none" {
+		t.Fatalf("empty state classifiers = %q/%q", wrappers, causes)
+	}
+}
+
+func TestLiveCaddyStartupStateClassifierUsesFixedBuckets(t *testing.T) {
+	for code, want := range map[int]string{
+		0: "success", 1: "general_failure", 2: "shell_misuse", 126: "cannot_execute", 127: "command_not_found",
+		128: "invalid_exit", 137: "sigkill", 139: "segfault", 143: "terminated", 255: "runtime_255", 130: "signal_other", 42: "other_nonzero",
+	} {
+		if got := liveCaddyExitBucket(code); got != want {
+			t.Fatalf("exit %d bucket = %q, want %q", code, got, want)
+		}
+	}
+	for status, want := range map[string]string{"created": "created", "running": "running", "paused": "paused", "restarting": "restarting", "removing": "removing", "exited": "exited", "dead": "dead", "sensitive-canary": "unknown"} {
+		if got := liveCaddyStateStatus(status); got != want {
+			t.Fatalf("state %q bucket = %q, want %q", status, got, want)
+		}
+	}
+
+	wrappers, cause := liveCaddyStartupStateClassifiers(json.RawMessage(`"failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: unable to setup user: operation not permitted: sensitive-canary"`))
+	if wrappers != "create_task+shim_task+oci_create+runc_create+start_process+container_init" || cause != "user_lookup" {
+		t.Fatalf("runtime state classifiers = %q/%q", wrappers, cause)
+	}
+	for _, test := range []struct {
+		message string
+		want    string
+	}{
+		{"docker-init: no such file or directory", "docker_init_missing"},
+		{"docker-init failed", "docker_init_failed"},
+		{"chdir to cwd permission denied", "workdir"},
+		{"exec format error", "exec_format"},
+		{"executable file not found", "executable_missing"},
+		{"exec: permission denied", "entrypoint_denied"},
+		{"error mounting tmpfs: permission denied", "mount_failed"},
+		{"failed to set up container networking: port is already allocated", "network_failed"},
+		{"apparmor denied operation", "security_policy"},
+		{"setting cgroup config failed", "cgroup_failed"},
+		{"pids limit reached", "pids_exhausted"},
+		{"cannot allocate memory", "resource_exhausted"},
+		{"no space left on device", "no_space"},
+		{"read-only file system", "read_only"},
+		{"operation not permitted", "operation_not_permitted"},
+		{"permission denied", "permission_denied"},
+		{"invalid argument", "invalid_argument"},
+		{"resource temporarily unavailable", "resource_unavailable"},
+		{"sensitive-canary", "other"},
+	} {
+		_, got := liveCaddyStartupStateClassifiers(json.RawMessage(strconv.Quote(test.message)))
+		if got != test.want || strings.Contains(got, "sensitive-canary") {
+			t.Fatalf("state cause for %q = %q, want %q", test.message, got, test.want)
+		}
 	}
 }
 
