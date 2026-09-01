@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/jobs"
 )
 
 const (
@@ -775,6 +776,9 @@ func (r *Repository) LinkDispatchJobTx(ctx context.Context, tx *sql.Tx, lease Wo
 	if state != StateDispatching || activeJob != "" || activeSHA != "" || !preparedSequence.Valid || !preparedGeneration.Valid || preparedSequence.Int64 != int64(sequence) || preparedGeneration.Int64 != int64(generation) || preparedSHA == "" {
 		return ErrState
 	}
+	if err := validateDispatchRuntimeTx(ctx, tx, lease.ApplicationID, preparedSHA, job.ReleaseID); err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
 		SET state='deploying',pause_code=NULL,paused_sha=NULL,
 			active_job_id=?,active_dispatch_sequence=prepared_dispatch_sequence,active_generation=prepared_dispatch_generation,active_sha=prepared_dispatch_sha,
@@ -791,6 +795,64 @@ func (r *Repository) LinkDispatchJobTx(ctx context.Context, tx *sql.Tx, lease Wo
 	}
 	if err = applyJobStateTx(ctx, tx, lease.ApplicationID, job, at); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (r *Repository) RestartPreparedDispatch(ctx context.Context, lease WorkLease, sequence, generation uint64, at time.Time) error {
+	if !validLease(lease) || sequence == 0 || sequence > math.MaxInt64 || generation > math.MaxInt64 || at.IsZero() {
+		return ErrInvalid
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = requireLease(ctx, tx, lease, at); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads
+		SET state='idle',prepared_dispatch_sequence=NULL,prepared_dispatch_generation=NULL,prepared_dispatch_sha=NULL,
+			resolving_generation=NULL,resolving_lease_fence=NULL,next_reconcile_at=?,updated_at=?
+		WHERE application_id=? AND config_revision=? AND lease_fence=? AND lease_token=? AND state='dispatching'
+		  AND prepared_dispatch_sequence=? AND prepared_dispatch_generation=? AND active_job_id IS NULL`,
+		timestamp(at), timestamp(at), lease.ApplicationID, lease.ConfigRevision, lease.Fence, lease.Token, sequence, generation)
+	if err = mutationResult(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func validateDispatchRuntimeTx(ctx context.Context, tx *sql.Tx, applicationID, resolvedSHA, releaseID string) error {
+	var planID, strategy string
+	var planNumber int64
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(h.revision_id,''),h.revision_number,COALESCE(p.strategy,'')
+		FROM deployment_plan_heads h LEFT JOIN deployment_plan_revisions p ON p.id=h.revision_id AND p.app_id=h.app_id AND p.revision_number=h.revision_number
+		WHERE h.app_id=?`, applicationID).Scan(&planID, &planNumber, &strategy)
+	if err != nil {
+		return err
+	}
+	if planNumber == 0 || strategy == "compose" {
+		if releaseID != "" {
+			return ErrDispatchPreflightChanged
+		}
+		return nil
+	}
+	if strategy != "generated_node" || releaseID == "" {
+		return ErrDispatchPreflightChanged
+	}
+	var found int
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM releases r
+		JOIN application_sources s ON s.application_id=r.app_id AND s.source_type='github'
+		WHERE r.id=? AND r.app_id=? AND r.status='ready' AND r.workspace_state='ready' AND r.source_provider='github'
+		  AND r.repository_id=s.repository_id AND r.tracked_ref=s.tracked_ref AND r.resolved_sha=?
+		  AND r.deployment_plan_revision_id=? AND r.deployment_plan_revision_number=?`,
+		releaseID, applicationID, resolvedSHA, planID, planNumber).Scan(&found)
+	if err != nil {
+		return err
+	}
+	if found != 1 {
+		return ErrDispatchPreflightChanged
 	}
 	return nil
 }
@@ -1096,6 +1158,7 @@ type coordinatorJob struct {
 	Status           string
 	ErrorCode        string
 	PauseDisposition string
+	ReleaseID        string
 }
 
 func loadCoordinatorJobTx(ctx context.Context, tx *sql.Tx, applicationID string, configRevision, sequence uint64, jobID string) (coordinatorJob, error) {
@@ -1110,10 +1173,12 @@ func loadCoordinatorJobTx(ctx context.Context, tx *sql.Tx, applicationID string,
 	if requestedBy == "" || requestedBy != sourceOwner || idempotency != DispatchIdempotencyKey(configRevision, sequence) {
 		return coordinatorJob{}, ErrUnauthorized
 	}
-	if input != `{"releaseId":"","configurationMode":"current"}` {
+	decoded, decodeErr := jobs.DeploymentInputFor(jobs.Job{Type: "deploy", Input: []byte(input)})
+	if decodeErr != nil || decoded.ConfigurationMode != jobs.ConfigurationCurrent {
 		return coordinatorJob{}, ErrState
 	}
-	if value.Status == "waiting_user" && value.PauseDisposition != PauseApprovalRequired {
+	value.ReleaseID = decoded.ReleaseID
+	if value.Status == "waiting_user" && !validJobPauseDisposition(value.PauseDisposition) {
 		return coordinatorJob{}, ErrState
 	}
 	return value, nil
@@ -1140,7 +1205,7 @@ func applyJobStateTx(ctx context.Context, tx *sql.Tx, applicationID string, job 
 		if sourceAccessOverlay {
 			result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET next_job_poll_at=?,updated_at=? WHERE application_id=? AND active_job_id=? AND state='paused' AND pause_code='source_access_lost'`, timestamp(at.Add(waitingJobPollInterval)), stamp, applicationID, job.ID)
 		} else {
-			result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET state='paused',pause_code='approval_required',paused_sha=active_sha,retry_attempt=0,next_retry_at=NULL,next_job_poll_at=?,updated_at=? WHERE application_id=? AND active_job_id=?`, timestamp(at.Add(waitingJobPollInterval)), stamp, applicationID, job.ID)
+			result, err = tx.ExecContext(ctx, `UPDATE github_auto_deploy_heads SET state='paused',pause_code=?,paused_sha=active_sha,retry_attempt=0,next_retry_at=NULL,next_job_poll_at=?,updated_at=? WHERE application_id=? AND active_job_id=?`, autoDeployPauseForJob(job.PauseDisposition), timestamp(at.Add(waitingJobPollInterval)), stamp, applicationID, job.ID)
 		}
 	case "succeeded":
 		var actualSHA string
@@ -1230,6 +1295,26 @@ func pauseCodeForJobError(code string) string {
 	}
 }
 
+func validJobPauseDisposition(value string) bool {
+	switch value {
+	case jobs.PauseApprovalRequired, jobs.PauseMigrationApprovalRequired, jobs.PauseInsufficientReplacementCapacity:
+		return true
+	default:
+		return false
+	}
+}
+
+func autoDeployPauseForJob(value string) string {
+	switch value {
+	case jobs.PauseMigrationApprovalRequired:
+		return PauseMigrationApprovalRequired
+	case jobs.PauseInsufficientReplacementCapacity:
+		return PauseInsufficientReplacementCapacity
+	default:
+		return PauseApprovalRequired
+	}
+}
+
 func mutationResult(result sql.Result, err error) error {
 	if err != nil {
 		return classifyConstraint(err)
@@ -1261,7 +1346,8 @@ func validLease(value WorkLease) bool {
 
 func validPauseCode(value string) bool {
 	switch value {
-	case PauseApprovalRequired, PauseDeploymentFailed, PauseMissingConfig, PauseSourceAccessLost, PauseInvalidSource, PauseProviderUnavailable, PauseRelayUnavailable:
+	case PauseApprovalRequired, PauseMigrationApprovalRequired, PauseInsufficientReplacementCapacity, PauseDeploymentPlanReviewRequired,
+		PauseDeploymentFailed, PauseMissingConfig, PauseSourceAccessLost, PauseInvalidSource, PauseProviderUnavailable, PauseRelayUnavailable:
 		return true
 	default:
 		return false

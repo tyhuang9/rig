@@ -14,23 +14,27 @@ const (
 	StatePaused      = "paused"
 	StateRetryWait   = "retry_wait"
 
-	PauseApprovalRequired    = "approval_required"
-	PauseDeploymentFailed    = "deployment_failed"
-	PauseMissingConfig       = "missing_configuration"
-	PauseSourceAccessLost    = "source_access_lost"
-	PauseInvalidSource       = "invalid_source"
-	PauseProviderUnavailable = "provider_unavailable"
-	PauseRelayUnavailable    = "relay_unavailable"
+	PauseApprovalRequired                = "approval_required"
+	PauseMigrationApprovalRequired       = "migration_approval_required"
+	PauseInsufficientReplacementCapacity = "insufficient_replacement_capacity"
+	PauseDeploymentPlanReviewRequired    = "deployment_plan_review_required"
+	PauseDeploymentFailed                = "deployment_failed"
+	PauseMissingConfig                   = "missing_configuration"
+	PauseSourceAccessLost                = "source_access_lost"
+	PauseInvalidSource                   = "invalid_source"
+	PauseProviderUnavailable             = "provider_unavailable"
+	PauseRelayUnavailable                = "relay_unavailable"
 )
 
 var (
-	ErrNotFound         = errors.New("auto-deploy configuration not found")
-	ErrInvalid          = errors.New("invalid auto-deploy request")
-	ErrConflict         = errors.New("auto-deploy revision conflict")
-	ErrState            = errors.New("invalid auto-deploy state transition")
-	ErrUnauthorized     = errors.New("auto-deploy actor is not authorized")
-	ErrApplicationBusy  = errors.New("application has an active auto-deploy job")
-	ErrSourceAccessLost = errors.New("auto-deploy source access lost")
+	ErrNotFound                 = errors.New("auto-deploy configuration not found")
+	ErrInvalid                  = errors.New("invalid auto-deploy request")
+	ErrConflict                 = errors.New("auto-deploy revision conflict")
+	ErrState                    = errors.New("invalid auto-deploy state transition")
+	ErrUnauthorized             = errors.New("auto-deploy actor is not authorized")
+	ErrApplicationBusy          = errors.New("application has an active auto-deploy job")
+	ErrSourceAccessLost         = errors.New("auto-deploy source access lost")
+	ErrDispatchPreflightChanged = errors.New("auto-deploy dispatch preflight changed")
 )
 
 type ConfigureRequest struct {

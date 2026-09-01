@@ -180,7 +180,8 @@ func safeAutoDeployState(value string) string {
 
 func safeAutoDeployPauseCode(value string) string {
 	switch value {
-	case autodeploy.PauseApprovalRequired, autodeploy.PauseDeploymentFailed, autodeploy.PauseMissingConfig,
+	case autodeploy.PauseApprovalRequired, autodeploy.PauseMigrationApprovalRequired, autodeploy.PauseInsufficientReplacementCapacity,
+		autodeploy.PauseDeploymentPlanReviewRequired, autodeploy.PauseDeploymentFailed, autodeploy.PauseMissingConfig,
 		autodeploy.PauseSourceAccessLost, autodeploy.PauseInvalidSource, autodeploy.PauseProviderUnavailable,
 		autodeploy.PauseRelayUnavailable:
 		return value
