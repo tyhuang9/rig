@@ -118,6 +118,12 @@ func TestCompilerKeepsCommandsAndConfigurationOutOfDockerArguments(t *testing.T)
 		buildPath := secretSource(t, request.Args, "rig-build-command")
 		assertFileEquals(t, installPath, fixture.revision.Plan.Components[0].InstallBehavior)
 		assertFileEquals(t, buildPath, buildCommand)
+		if !hasArgumentPair(request.Args, "--label", "io.rig.component=app") {
+			t.Fatalf("component provenance label is missing: %#v", request.Args)
+		}
+		if !hasArgumentPair(request.Args, "--label", "io.rig.role=server") {
+			t.Fatalf("component role provenance label is missing: %#v", request.Args)
+		}
 		containerfile := flagValue(t, request.Args, "--file")
 		body, err := os.ReadFile(containerfile)
 		if err != nil {
@@ -381,6 +387,15 @@ func flagValue(t *testing.T, args []string, flag string) string {
 	}
 	t.Fatalf("flag %s not found in %#v", flag, args)
 	return ""
+}
+
+func hasArgumentPair(args []string, key, value string) bool {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == key && args[index+1] == value {
+			return true
+		}
+	}
+	return false
 }
 
 func secretSource(t *testing.T, args []string, id string) string {

@@ -30,6 +30,8 @@ type builderDaemonFake struct {
 	osType             string
 	containerRunErr    error
 	containerRunStderr []byte
+	infoOverride       *dockerInfo
+	replaceOnLifecycle bool
 }
 
 func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -48,11 +50,13 @@ func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.Comman
 	}
 	switch request.Args[0] {
 	case "info":
-		osType := d.osType
-		if osType == "" {
-			osType = "linux"
+		info := validDockerInfo()
+		if d.infoOverride != nil {
+			info = *d.infoOverride
+		} else if d.osType != "" {
+			info.OSType = d.osType
 		}
-		body, _ := json.Marshal(dockerInfo{OSType: osType})
+		body, _ := json.Marshal(info)
 		d.outputs = append(d.outputs, body)
 		return runtimeprocess.CommandResult{Stdout: body}, nil
 	case "network":
@@ -143,6 +147,26 @@ func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.Comman
 			output := []byte("sha256:" + strings.Repeat("1", 64))
 			d.outputs = append(d.outputs, output)
 			return runtimeprocess.CommandResult{Stdout: output}, nil
+		case "start", "restart", "unpause":
+			id := request.Args[len(request.Args)-1]
+			for name, container := range d.boxes {
+				if container.ID != id {
+					continue
+				}
+				container.State.Running = true
+				container.State.Paused = false
+				container.State.Restarting = false
+				if d.replaceOnLifecycle {
+					container.ID = strings.Repeat("c", 64)
+				}
+				d.boxes[name] = container
+				output := []byte(id)
+				d.outputs = append(d.outputs, output)
+				return runtimeprocess.CommandResult{Stdout: output}, nil
+			}
+			output := []byte("Error response from daemon: No such container")
+			d.outputs = append(d.outputs, output)
+			return runtimeprocess.CommandResult{Stderr: output}, errors.New("exit status 1")
 		}
 	}
 	return runtimeprocess.CommandResult{}, errors.New("unsupported fake Docker command")
@@ -215,6 +239,9 @@ func TestBuilderManagerCreatesBootstrapsAndScopesTheBuilder(t *testing.T) {
 			t.Fatalf("container run lacks %q: %#v", required, containerRun.Args)
 		}
 	}
+	if !containsExactOrPrefix(containerRun.Args, "--oci-worker-gc-keepstorage=1073") {
+		t.Fatalf("BuildKit GC keepstorage was not expressed in MB: %#v", containerRun.Args)
+	}
 	create := requests[8]
 	for _, required := range []string{"--driver", "remote", "--node", "--driver-opt", "default-load=false", "--use", "docker-container://rig-buildkitd-"} {
 		if !containsExactOrPrefix(create.Args, required) {
@@ -236,6 +263,13 @@ func TestBuilderManagerCreatesBootstrapsAndScopesTheBuilder(t *testing.T) {
 	}
 	if !daemon.outputWasCleared() {
 		t.Fatal("raw builder output was retained after preparation")
+	}
+}
+
+func TestBuildkitCommandExpressesGCKeepStorageInMegabytes(t *testing.T) {
+	got := buildkitCommand(defaultStateQuotaBytes)
+	if !sameStrings(got, []string{"--oci-worker-net", "bridge", "--oci-worker-gc", "--oci-worker-gc-keepstorage=1073", "--oci-max-parallelism=1"}) {
+		t.Fatalf("buildkit command = %#v", got)
 	}
 }
 
@@ -354,6 +388,29 @@ func TestBuilderManagerFailsClosedWhenHardQuotaIsUnsupported(t *testing.T) {
 		}
 	})
 
+	for name, mutate := range map[string]func(*dockerInfo){
+		"memory controls": func(info *dockerInfo) { info.MemoryLimit = false },
+		"swap controls":   func(info *dockerInfo) { info.SwapLimit = false },
+		"CPU period":      func(info *dockerInfo) { info.CPUCfsPeriod = false },
+		"CPU quota":       func(info *dockerInfo) { info.CPUCfsQuota = false },
+		"PID controls":    func(info *dockerInfo) { info.PidsLimit = false },
+		"warning":         func(info *dockerInfo) { info.Warnings = []string{"WARNING: No swap limit support"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			info := validDockerInfo()
+			mutate(&info)
+			daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder), infoOverride: &info}
+			manager := newBuilderManagerForTest(t, daemon)
+			_, err := manager.Prepare(context.Background())
+			if !IsBuilderError(err, BuilderHardQuotaUnavailable) {
+				t.Fatalf("unsupported controller error = %v", err)
+			}
+			if got, want := commandKinds(daemon.requests()), []string{"info --format"}; !sameStrings(got, want) {
+				t.Fatalf("unsupported controller commands = %#v, want %#v", got, want)
+			}
+		})
+	}
+
 	t.Run("tmpfs creation rejected", func(t *testing.T) {
 		daemon := &builderDaemonFake{
 			builders: make(map[string]buildxBuilder), containerRunErr: errors.New("exit status 1"),
@@ -381,6 +438,135 @@ func TestBuilderManagerClassifiesHardQuotaExhaustion(t *testing.T) {
 	_, err := manager.Prepare(context.Background())
 	if !IsBuilderError(err, BuilderHardQuotaExhausted) {
 		t.Fatalf("quota exhaustion error = %v", err)
+	}
+}
+
+func TestBuilderManagerMapsOnlyRecognizedQuotaFailures(t *testing.T) {
+	for name, test := range map[string]struct {
+		stderr string
+		want   BuilderErrorCode
+	}{
+		"unsupported tmpfs":      {stderr: "tmpfs mounts are not supported by this runtime", want: BuilderHardQuotaUnavailable},
+		"invalid tmpfs mount":    {stderr: `invalid mount config for type "tmpfs"`, want: BuilderHardQuotaUnavailable},
+		"generic Docker failure": {stderr: "container creation failed", want: BuilderProvisionFailed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			daemon := &builderDaemonFake{
+				builders: make(map[string]buildxBuilder), containerRunErr: errors.New("exit status 1"),
+				containerRunStderr: []byte(test.stderr),
+			}
+			manager := newBuilderManagerForTest(t, daemon)
+			_, err := manager.Prepare(context.Background())
+			if !IsBuilderError(err, test.want) {
+				t.Fatalf("quota provisioning error = %v, want %s", err, test.want)
+			}
+		})
+	}
+}
+
+func TestBuilderManagerRecoversExactOwnedContainerLifecycle(t *testing.T) {
+	for name, mutate := range map[string]func(*buildkitContainer){
+		"stopped":    func(container *buildkitContainer) { container.State.Running = false },
+		"paused":     func(container *buildkitContainer) { container.State.Paused = true },
+		"restarting": func(container *buildkitContainer) { container.State.Restarting = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+			manager := newBuilderManagerForTest(t, daemon)
+			session, err := manager.Prepare(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			daemon.mu.Lock()
+			identity := daemon.nodes[session.BuilderName]
+			containerName := buildkitContainerName(identity)
+			container := daemon.boxes[containerName]
+			mutate(&container)
+			daemon.boxes[containerName] = container
+			before := len(daemon.calls)
+			daemon.mu.Unlock()
+
+			if _, err := manager.Prepare(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			requests := daemon.requests()[before:]
+			wantAction := map[string]string{"stopped": "container start", "paused": "container unpause", "restarting": "container restart"}[name]
+			if got := commandKinds(requests); len(got) < 6 || got[3] != wantAction || got[4] != "container inspect" {
+				t.Fatalf("recovery commands = %#v, want verified %q followed by inspect", got, wantAction)
+			}
+			if target := requests[3].Args[len(requests[3].Args)-1]; target != container.ID {
+				t.Fatalf("recovery target = %q, want exact container ID %q", target, container.ID)
+			}
+		})
+	}
+}
+
+func TestBuilderManagerRefusesLifecycleRecoveryWhenOwnershipDrifts(t *testing.T) {
+	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+	manager := newBuilderManagerForTest(t, daemon)
+	session, err := manager.Prepare(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon.mu.Lock()
+	identity := daemon.nodes[session.BuilderName]
+	containerName := buildkitContainerName(identity)
+	container := daemon.boxes[containerName]
+	container.State.Running = false
+	container.Config.Labels["rig.builder"] = "rig-buildkit-aaaaaaaaaaaaaaaaaaaaaaaa"
+	daemon.boxes[containerName] = container
+	before := len(daemon.calls)
+	daemon.mu.Unlock()
+
+	_, err = manager.Prepare(context.Background())
+	if !IsBuilderError(err, BuilderDriftDetected) {
+		t.Fatalf("ownership drift error = %v", err)
+	}
+	if got, want := commandKinds(daemon.requests()[before:]), []string{"info --format", "network inspect", "container inspect"}; !sameStrings(got, want) {
+		t.Fatalf("commands after lifecycle ownership drift = %#v, want read-only %#v", got, want)
+	}
+}
+
+func TestBuilderManagerRefusesContainerReplacementDuringLifecycleRecovery(t *testing.T) {
+	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+	manager := newBuilderManagerForTest(t, daemon)
+	session, err := manager.Prepare(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon.mu.Lock()
+	identity := daemon.nodes[session.BuilderName]
+	containerName := buildkitContainerName(identity)
+	container := daemon.boxes[containerName]
+	container.State.Running = false
+	daemon.boxes[containerName] = container
+	daemon.replaceOnLifecycle = true
+	daemon.mu.Unlock()
+
+	_, err = manager.Prepare(context.Background())
+	if !IsBuilderError(err, BuilderDriftDetected) {
+		t.Fatalf("replacement race error = %v", err)
+	}
+}
+
+func TestBuilderManagerBlocksLegacyV1StateBeforeDockerMutation(t *testing.T) {
+	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+	manager := newBuilderManagerForTest(t, daemon)
+	legacy := []byte(`{"schema":1,"builderName":"rig-buildkit-aaaaaaaaaaaaaaaaaaaaaaaa","nodeName":"rig-node-aaaaaaaaaaaaaaaaaaaaaaaa","networkName":"rig-buildnet-aaaaaaaaaaaaaaaaaaaaaaaa"}`)
+	if err := manager.directory.WriteNewFile(legacyBuilderIdentityFilename, legacy); err != nil {
+		t.Fatal(err)
+	}
+	clear(legacy)
+
+	_, err := manager.Prepare(context.Background())
+	if !IsBuilderError(err, BuilderDriftDetected) {
+		t.Fatalf("legacy identity error = %v", err)
+	}
+	if requests := daemon.requests(); len(requests) != 0 {
+		t.Fatalf("Docker was contacted for legacy state: %#v", requests)
+	}
+	if _, err := manager.directory.ReadFile(builderIdentityFilename, 8<<10); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("v2 identity created beside legacy state: %v", err)
 	}
 }
 
@@ -555,6 +741,7 @@ func driverOption(args []string, key string) string {
 
 func validBuildkitContainer(identity builderIdentity, quotaBytes int64) buildkitContainer {
 	var container buildkitContainer
+	container.ID = strings.Repeat("b", 64)
 	container.Name = "/" + buildkitContainerName(identity)
 	container.Image = "sha256:" + strings.Repeat("a", 64)
 	container.State.Running = true
@@ -582,6 +769,13 @@ func validBuildkitContainer(identity builderIdentity, quotaBytes int64) buildkit
 	container.NetworkSettings.Networks = map[string]json.RawMessage{identity.NetworkName: json.RawMessage(`{}`)}
 	container.Mounts = []dockerMount{{Type: "tmpfs", Destination: buildkitStatePath, RW: true}}
 	return container
+}
+
+func validDockerInfo() dockerInfo {
+	return dockerInfo{
+		OSType: "linux", MemoryLimit: true, SwapLimit: true,
+		CPUCfsPeriod: true, CPUCfsQuota: true, PidsLimit: true,
+	}
 }
 
 func flagArgument(args []string, flag string) string {

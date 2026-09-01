@@ -192,6 +192,28 @@ func (s *Store) Get(ctx context.Context, appID string) (Configuration, error) {
 // Compose-compatible dotenv document. It never silently substitutes the head
 // revision. Revision zero is represented by a nonempty comment-only document.
 func (s *Store) ExportRevisionForExecution(ctx context.Context, appID, revisionID string, revisionNumber int64) (ExecutionConfiguration, error) {
+	return s.exportRevisionForExecution(ctx, appID, revisionID, revisionNumber, nil, false)
+}
+
+// ExportRevisionKeysForExecution returns one exact historical revision while
+// exposing only the explicitly accepted environment keys. Every requested key
+// must exist in the pinned revision; missing or malformed allowlists fail
+// closed instead of silently broadening or weakening migration configuration.
+func (s *Store) ExportRevisionKeysForExecution(ctx context.Context, appID, revisionID string, revisionNumber int64, allowedKeys []string) (ExecutionConfiguration, error) {
+	if len(allowedKeys) > 8 {
+		return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+	}
+	keys := append([]string(nil), allowedKeys...)
+	sort.Strings(keys)
+	for index, key := range keys {
+		if validateKey(key) != nil || (index > 0 && keys[index-1] == key) {
+			return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+		}
+	}
+	return s.exportRevisionForExecution(ctx, appID, revisionID, revisionNumber, keys, true)
+}
+
+func (s *Store) exportRevisionForExecution(ctx context.Context, appID, revisionID string, revisionNumber int64, allowedKeys []string, filtered bool) (ExecutionConfiguration, error) {
 	if !validUUID(appID) || revisionNumber < 0 || (revisionNumber == 0) != (revisionID == "") {
 		return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
 	}
@@ -211,9 +233,18 @@ func (s *Store) ExportRevisionForExecution(ctx context.Context, appID, revisionI
 		entries = b.Entries
 	}
 
+	keys := sortedBundleKeys(entries)
+	if filtered {
+		keys = allowedKeys
+		for _, key := range keys {
+			if _, exists := entries[key]; !exists {
+				return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+			}
+		}
+	}
 	environment := []byte("# hostd application configuration\n")
 	secretOrigins := make([]SecretOrigin, 0)
-	for _, key := range sortedBundleKeys(entries) {
+	for _, key := range keys {
 		entry := entries[key]
 		environment = append(environment, key...)
 		environment = append(environment, '=')
