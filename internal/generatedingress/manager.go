@@ -840,7 +840,7 @@ func (m *Manager) inspectJSON(ctx context.Context, destination any, args ...stri
 func validCaddyInspection(value caddyInspection, imageID string, hostPort uint16) bool {
 	if normalizeID(value.Image) != normalizeID(imageID) || strings.TrimPrefix(value.Name, "/") != caddyContainerName || value.User != "1000:1000" ||
 		value.Hostname != caddyContainerName || value.NetworkMode != caddyNetworkName || !containsString(value.Env, "XDG_CONFIG_HOME=/config") || !containsString(value.Env, "XDG_DATA_HOME=/data") ||
-		!value.ReadOnly || value.Privileged || len(value.CapAdd) != 0 || !exactFoldSet(value.CapDrop, "ALL") || !exactStringSet(value.SecurityOpt, "no-new-privileges") ||
+		!value.ReadOnly || value.Privileged || len(value.CapAdd) != 0 || !exactFoldSet(value.CapDrop, "ALL") || !onlyNoNewPrivileges(value.SecurityOpt) ||
 		len(value.Binds) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 || value.NanoCPUs != 1_000_000_000 || value.PIDsLimit != 128 ||
 		len(value.Tmpfs) != 1 || value.Tmpfs["/data"] != "rw,noexec,nosuid,nodev,size=67108864" ||
 		value.LogType != "local" || value.LogConfig["max-size"] != "10m" || value.LogConfig["max-file"] != "3" || value.Restart != "unless-stopped" ||
@@ -965,8 +965,16 @@ func containsFold(values []string, expected string) bool {
 	return false
 }
 
-func exactStringSet(values []string, expected string) bool {
-	return len(values) == 1 && values[0] == expected
+func onlyNoNewPrivileges(values []string) bool {
+	if len(values) != 1 {
+		return false
+	}
+	switch strings.ToLower(values[0]) {
+	case "no-new-privileges", "no-new-privileges:true", "no-new-privileges=true":
+		return true
+	default:
+		return false
+	}
 }
 
 func exactFoldSet(values []string, expected string) bool {

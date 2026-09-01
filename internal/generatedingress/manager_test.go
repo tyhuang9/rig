@@ -517,6 +517,30 @@ func TestCaddyInspectionRequiresNetworkEnvironmentAndUlimit(t *testing.T) {
 	}
 }
 
+func TestCaddyInspectionAcceptsOnlyEnabledNoNewPrivileges(t *testing.T) {
+	_, runner := newManagerFixture(t, false)
+	for _, option := range []string{"no-new-privileges", "no-new-privileges:true", "no-new-privileges=true", "NO-NEW-PRIVILEGES=TRUE"} {
+		candidate := runner.caddyInspection()
+		candidate.SecurityOpt = []string{option}
+		if !validCaddyInspection(candidate, "sha256:"+strings.Repeat("a", 64), 8080) {
+			t.Fatalf("enabled security option %q was rejected", option)
+		}
+	}
+	for _, options := range [][]string{
+		nil,
+		{"no-new-privileges:false"},
+		{"no-new-privileges=false"},
+		{"no-new-privileges", "no-new-privileges"},
+		{"no-new-privileges", "seccomp=unconfined"},
+	} {
+		candidate := runner.caddyInspection()
+		candidate.SecurityOpt = options
+		if validCaddyInspection(candidate, "sha256:"+strings.Repeat("a", 64), 8080) {
+			t.Fatalf("unsafe security options %#v were accepted", options)
+		}
+	}
+}
+
 func TestIngressInspectFormatsUseCanonicalDockerFieldsAndNilGuards(t *testing.T) {
 	imageID := "sha256:" + strings.Repeat("a", 64)
 	var image imageInspection
