@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "fc5e2dbe609d304e93f7855af4746575877b3427977297e17eb70620e120b827"
+const SourceSHA256 = "44471107c9b603462ee06a505fa478b5fb96e5444f2c54eed866cc4bf2209725"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -290,16 +290,17 @@ type DeploymentPlanCandidate struct {
 }
 
 type DeploymentPlanComponent struct {
-	BuildCommand    string `json:"buildCommand"`
-	HealthProbe     string `json:"healthProbe"`
-	InstallBehavior string `json:"installBehavior"`
-	InternalPort    int    `json:"internalPort"`
-	Name            string `json:"name"`
-	NodeVersion     string `json:"nodeVersion"`
-	PackageManager  string `json:"packageManager"`
-	Role            string `json:"role"`
-	RootDirectory   string `json:"rootDirectory"`
-	RunCommand      string `json:"runCommand"`
+	BuildCommand     string `json:"buildCommand"`
+	HealthProbe      string `json:"healthProbe"`
+	InstallBehavior  string `json:"installBehavior"`
+	InstallDirectory string `json:"installDirectory"`
+	InternalPort     int    `json:"internalPort"`
+	Name             string `json:"name"`
+	NodeVersion      string `json:"nodeVersion"`
+	PackageManager   string `json:"packageManager"`
+	Role             string `json:"role"`
+	RootDirectory    string `json:"rootDirectory"`
+	RunCommand       string `json:"runCommand"`
 }
 
 type DeploymentPlanComponentInput struct {

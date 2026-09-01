@@ -59,6 +59,20 @@ describe("ActivityRow cancellation convergence", () => {
   beforeEach(() => vi.restoreAllMocks());
   afterEach(cleanup);
 
+  it("keeps route reconciliation pauses recoverable by hiding unsafe cancellation", () => {
+	const cancel = vi.spyOn(api, "cancelJob");
+	const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+	render(
+	  <QueryClientProvider client={client}>
+		<ActivityRow job={{ ...activeJob, status: "waiting_user", phase: "route_reconciliation_required", pauseDisposition: "route_reconciliation_required" }}/>
+	  </QueryClientProvider>,
+	);
+
+	expect(screen.getByText(/Retry route reconciliation from Deployment history/i)).not.toBeNull();
+	expect(screen.queryByRole("button", { name: "Cancel job" })).toBeNull();
+	expect(cancel).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["cancelled", "Cancellation recorded. Job cancelled."],
     ["succeeded", "Cancellation recorded. Job succeeded."],

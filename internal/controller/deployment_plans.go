@@ -171,6 +171,8 @@ func acceptedGeneratedPlan(candidate projectanalysis.DeploymentPlanCandidate, in
 	packageConfidence := confidenceScore(candidate.PackageManager.Confidence)
 	if body.PackageManager != candidate.PackageManager.Name {
 		packageOrigin, packageConfidence, packageEvidence = deploymentplans.ProvenanceUser, 100, []string{"user:package-manager"}
+	} else if slices.Contains(candidate.MissingFields, "package_manager.version") {
+		packageOrigin, packageConfidence, packageEvidence = deploymentplans.ProvenanceUser, 100, []string{"user:package-manager-review"}
 	}
 	installOrigin, installConfidence := deploymentplans.ProvenanceInferred, 90
 	if candidate.Install == nil || body.InstallBehavior != candidate.Install.Command {
@@ -178,6 +180,13 @@ func acceptedGeneratedPlan(candidate projectanalysis.DeploymentPlanCandidate, in
 	} else {
 		installConfidence = confidenceScore(candidate.Install.Confidence)
 		installEvidence = evidenceStrings(candidate.Install.Evidence, "install-behavior")
+	}
+	installDirectory := candidate.RootDirectory
+	if candidate.Install != nil {
+		installDirectory = candidate.Install.WorkingDirectory
+	}
+	if installDirectory == "" {
+		installDirectory = "."
 	}
 	migrationCount := 0
 	for _, component := range candidate.Components {
@@ -202,12 +211,13 @@ func acceptedGeneratedPlan(candidate projectanalysis.DeploymentPlanCandidate, in
 		}
 		plan.Components = append(plan.Components, deploymentplans.Component{
 			Name: component.ID, Role: component.Kind, RootDirectory: root, PackageManager: body.PackageManager,
-			InstallBehavior: body.InstallBehavior, NodeVersion: input.NodeVersion, BuildCommand: input.BuildCommand,
+			InstallBehavior: body.InstallBehavior, InstallDirectory: installDirectory, NodeVersion: input.NodeVersion, BuildCommand: input.BuildCommand,
 			RunCommand: input.RunCommand, InternalPort: uint16(input.InternalPort), HealthProbe: input.HealthProbe,
 		})
 		plan.FieldProvenance = append(plan.FieldProvenance,
 			deploymentplans.FieldProvenance{Field: "components." + component.ID + ".packageManager", Origin: packageOrigin, Confidence: packageConfidence, Evidence: packageEvidence},
 			deploymentplans.FieldProvenance{Field: "components." + component.ID + ".installBehavior", Origin: installOrigin, Confidence: installConfidence, Evidence: installEvidence},
+			deploymentplans.FieldProvenance{Field: "components." + component.ID + ".installDirectory", Origin: deploymentplans.ProvenanceInferred, Confidence: 90, Evidence: []string{"analysis:install-directory"}},
 		)
 		appendComponentProvenance(&plan, component, candidate.NodeVersion, input)
 		if component.Migration != nil {
@@ -236,7 +246,7 @@ func acceptedGeneratedPlan(candidate projectanalysis.DeploymentPlanCandidate, in
 }
 
 func deploymentPlanFieldCanBeOverridden(field string) bool {
-	if field == projectanalysis.FieldPackageManager || field == projectanalysis.FieldInstallBehavior || field == "node_version" {
+	if field == projectanalysis.FieldPackageManager || field == "package_manager.version" || field == projectanalysis.FieldInstallBehavior || field == "node_version" {
 		return true
 	}
 	return strings.HasSuffix(field, ".build") || strings.HasSuffix(field, ".run") || strings.HasSuffix(field, ".internal_port") || strings.HasSuffix(field, ".health_probe")
@@ -400,7 +410,7 @@ func contractDeploymentPlanRevision(value deploymentplans.DeploymentPlanRevision
 		Components: make([]apicontract.DeploymentPlanComponent, 0, len(value.Plan.Components)), FieldProvenance: make([]apicontract.DeploymentPlanFieldProvenance, 0, len(value.Plan.FieldProvenance)),
 	}
 	for _, component := range value.Plan.Components {
-		result.Components = append(result.Components, apicontract.DeploymentPlanComponent{Name: component.Name, Role: component.Role, RootDirectory: component.RootDirectory, PackageManager: component.PackageManager, InstallBehavior: component.InstallBehavior, NodeVersion: component.NodeVersion, BuildCommand: component.BuildCommand, RunCommand: component.RunCommand, InternalPort: int(component.InternalPort), HealthProbe: component.HealthProbe})
+		result.Components = append(result.Components, apicontract.DeploymentPlanComponent{Name: component.Name, Role: component.Role, RootDirectory: component.RootDirectory, PackageManager: component.PackageManager, InstallBehavior: component.InstallBehavior, InstallDirectory: component.InstallDirectory, NodeVersion: component.NodeVersion, BuildCommand: component.BuildCommand, RunCommand: component.RunCommand, InternalPort: int(component.InternalPort), HealthProbe: component.HealthProbe})
 	}
 	for _, field := range value.Plan.FieldProvenance {
 		result.FieldProvenance = append(result.FieldProvenance, apicontract.DeploymentPlanFieldProvenance{Field: field.Field, Origin: string(field.Origin), Confidence: field.Confidence, Evidence: append([]string(nil), field.Evidence...)})

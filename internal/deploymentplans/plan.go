@@ -11,6 +11,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -86,16 +87,17 @@ type Detector struct {
 // Component has explicit execution-contract fields, preventing later layers
 // from reinterpreting generic command positions.
 type Component struct {
-	Name            string `json:"name"`
-	Role            string `json:"role"`
-	RootDirectory   string `json:"rootDirectory"`
-	PackageManager  string `json:"packageManager"`
-	InstallBehavior string `json:"installBehavior"`
-	NodeVersion     string `json:"nodeVersion"`
-	BuildCommand    string `json:"buildCommand,omitempty"`
-	RunCommand      string `json:"runCommand"`
-	InternalPort    uint16 `json:"internalPort"`
-	HealthProbe     string `json:"healthProbe"`
+	Name             string `json:"name"`
+	Role             string `json:"role"`
+	RootDirectory    string `json:"rootDirectory"`
+	PackageManager   string `json:"packageManager"`
+	InstallBehavior  string `json:"installBehavior"`
+	InstallDirectory string `json:"installDirectory"`
+	NodeVersion      string `json:"nodeVersion"`
+	BuildCommand     string `json:"buildCommand,omitempty"`
+	RunCommand       string `json:"runCommand"`
+	InternalPort     uint16 `json:"internalPort"`
+	HealthProbe      string `json:"healthProbe"`
 }
 
 type FieldProvenance struct {
@@ -169,6 +171,29 @@ func canonicalPlan(plan Plan) (Plan, error) {
 	return canonicalPlanWithLegacyMigration(plan, false)
 }
 
+// canonicalPlanForAnalysisComparison validates the immutable deployment
+// contract while deliberately excluding the separately stored migration
+// approval lifecycle. Approvals are not part of an accepted revision's
+// canonical digest and must not make an otherwise compatible source require a
+// new review.
+func canonicalPlanForAnalysisComparison(plan Plan) (Plan, error) {
+	if plan.Migration == nil || plan.Migration.Approval.Status == MigrationApprovalPending {
+		return canonicalPlan(plan)
+	}
+	if plan.Migration.Approval.Status != MigrationApprovalApproved || validateText(plan.Migration.Approval.ActorID, 256) != nil {
+		return Plan{}, invalid("migration", "Migration approval lifecycle is invalid")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, plan.Migration.Approval.At); err != nil {
+		return Plan{}, invalid("migration", "Migration approval timestamp is invalid")
+	}
+	comparable := plan
+	migration := *plan.Migration
+	migration.EnvironmentKeys = append([]string(nil), plan.Migration.EnvironmentKeys...)
+	migration.Approval = MigrationApproval{Status: MigrationApprovalPending}
+	comparable.Migration = &migration
+	return canonicalPlan(comparable)
+}
+
 func canonicalPlanWithLegacyMigration(plan Plan, allowLegacyMigration bool) (Plan, error) {
 	if plan.Strategy != StrategyGeneratedNode && plan.Strategy != StrategyCompose {
 		return Plan{}, invalid("strategy", "Must be generated_node or compose")
@@ -187,7 +212,7 @@ func canonicalPlanWithLegacyMigration(plan Plan, allowLegacyMigration bool) (Pla
 	sort.Slice(result.Components, func(i, j int) bool { return result.Components[i].Name < result.Components[j].Name })
 	seen := map[string]bool{}
 	for _, component := range result.Components {
-		if seen[component.Name] || validateText(component.Name, 256) != nil || !supportedRole(component.Role) || !validRootDirectory(component.RootDirectory) || !supportedPackageManager(component.PackageManager) || ValidateCommand(component.InstallBehavior) != nil || validateText(component.NodeVersion, 256) != nil || ValidateCommand(component.RunCommand) != nil || component.InternalPort == 0 || !validHealthProbe(component.HealthProbe) {
+		if seen[component.Name] || validateText(component.Name, 256) != nil || !supportedRole(component.Role) || !validRootDirectory(component.RootDirectory) || !supportedPackageManager(component.PackageManager) || ValidateCommand(component.InstallBehavior) != nil || !validRootDirectory(component.InstallDirectory) || validateText(component.NodeVersion, 256) != nil || ValidateCommand(component.RunCommand) != nil || component.InternalPort == 0 || !validHealthProbe(component.HealthProbe) {
 			return Plan{}, invalid("components", "Components must use complete bounded execution fields")
 		}
 		if component.BuildCommand != "" && ValidateCommand(component.BuildCommand) != nil {
@@ -268,7 +293,7 @@ func validHealthProbe(value string) bool {
 }
 func componentExecutionFields(component Component) []string {
 	prefix := "components." + component.Name + "."
-	fields := []string{prefix + "role", prefix + "rootDirectory", prefix + "packageManager", prefix + "installBehavior", prefix + "nodeVersion", prefix + "runCommand", prefix + "internalPort", prefix + "healthProbe"}
+	fields := []string{prefix + "role", prefix + "rootDirectory", prefix + "packageManager", prefix + "installBehavior", prefix + "installDirectory", prefix + "nodeVersion", prefix + "runCommand", prefix + "internalPort", prefix + "healthProbe"}
 	if component.BuildCommand != "" {
 		fields = append(fields, prefix+"buildCommand")
 	}

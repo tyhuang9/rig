@@ -125,6 +125,9 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 	if errors.Is(err, generatedruntimestate.ErrMigrationApprovalRequired) {
 		return waitingFor(jobs.PauseMigrationApprovalRequired), nil
 	}
+	if errors.Is(err, generatedruntimestate.ErrDeploymentInProgress) {
+		return waitingFor(jobs.PauseRouteReconciliationRequired), nil
+	}
 	if err != nil {
 		return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "internal_error")
 	}
@@ -146,22 +149,25 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 		runtimeDeployment = advanced
 	}
 
-	reservation, err := e.authorization.Authorize(ctx, AuthorizationRequest{
-		AppID: deployment.AppID, DeploymentID: deployment.ID, ReleaseID: deployment.ReleaseID,
-		DeploymentPlanRevisionID:     deployment.DeploymentPlanRevisionID,
-		DeploymentPlanRevisionNumber: deployment.DeploymentPlanRevisionNumber,
-		CandidateSlot:                generatedruntime.Slot(runtimeDeployment.CandidateSlot), ComponentCount: len(componentNames),
-	})
-	if errors.Is(err, ErrInsufficientReplacementCapacity) {
-		return waitingFor(jobs.PauseInsufficientReplacementCapacity), nil
+	var reservation generatedruntime.ReplacementReservation
+	if runtimeDeployment.Phase != generatedruntimestate.PhaseDraining {
+		reservation, err = e.authorization.Authorize(ctx, AuthorizationRequest{
+			AppID: deployment.AppID, DeploymentID: deployment.ID, ReleaseID: deployment.ReleaseID,
+			DeploymentPlanRevisionID:     deployment.DeploymentPlanRevisionID,
+			DeploymentPlanRevisionNumber: deployment.DeploymentPlanRevisionNumber,
+			CandidateSlot:                generatedruntime.Slot(runtimeDeployment.CandidateSlot), ComponentCount: len(componentNames),
+		})
+		if errors.Is(err, ErrInsufficientReplacementCapacity) {
+			return waitingFor(jobs.PauseInsufficientReplacementCapacity), nil
+		}
+		if errors.Is(err, deployments.ErrApprovalRequired) {
+			return waitingFor(jobs.PauseApprovalRequired), nil
+		}
+		if err != nil || reservation == nil {
+			return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
+		}
+		defer reservation.Release()
 	}
-	if errors.Is(err, deployments.ErrApprovalRequired) {
-		return waitingFor(jobs.PauseApprovalRequired), nil
-	}
-	if err != nil || reservation == nil {
-		return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
-	}
-	defer reservation.Release()
 	persistedDeployment, getErr := e.deployments.Get(ctx, deployment.AppID, deployment.ID)
 	if getErr != nil {
 		return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
@@ -291,7 +297,7 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 			advanced, switched, switchErr := e.switchRoute(ctx, resolved, runtimeDeployment, candidates)
 			if switchErr != nil {
 				if switched {
-					return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "apply_failed")
+					return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 				}
 				_ = e.cleanupCandidates(ctx, candidates)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "apply_failed", generatedruntimestate.DiagnosticRouteSwitchFailed)
@@ -300,16 +306,16 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 
 		case generatedruntimestate.PhaseDraining:
 			if err = e.drainPrevious(ctx, resolved, runtimeDeployment); err != nil {
-				// The new slot is already active. Keep Draining recoverable and
-				// never tear down the serving candidate on cleanup failure.
-				return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "apply_failed")
+				// The new slot is already active. Keep the deployment and job
+				// nonterminal so retry or restart recovery can finish old-slot cleanup.
+				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 			}
 			for _, candidate := range candidates {
 				e.runtime.ReleaseAdmission(candidate)
 			}
 			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded, "")
 			if advanceErr != nil {
-				return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "internal_error")
+				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 			}
 			runtimeDeployment = advanced
 			if err = report(reporter, jobs.Running, "finalize", 100); err != nil {

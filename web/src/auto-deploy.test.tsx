@@ -339,6 +339,7 @@ describe("AutoDeployPanel", () => {
     ["deployment_plan_review_required", "repository structure changed", true],
     ["migration_approval_required", "approve the pinned plan", false],
     ["insufficient_replacement_capacity", "temporary RAM or disk", false],
+    ["route_reconciliation_required", "preserved both application slots", false],
     ["deployment_failed", "previous auto-deployment failed", true],
     ["missing_configuration", "configuration is missing", true],
     ["source_access_lost", "GitHub access has been lost", true],
@@ -368,7 +369,7 @@ describe("AutoDeployPanel", () => {
     target.remove();
   });
 
-  it.each(["approval_required", "migration_approval_required", "insufficient_replacement_capacity"])("routes active-job pause %s to deployment history", async (pauseCode) => {
+  it.each(["approval_required", "migration_approval_required", "insufficient_replacement_capacity", "route_reconciliation_required"])("routes active-job pause %s to deployment history", async (pauseCode) => {
     const target = document.createElement("h2");
     target.id = "deployment-history-title";
     target.tabIndex = -1;

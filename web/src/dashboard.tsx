@@ -260,12 +260,14 @@ export function ActivityRow({ job }: { job: Job }) {
   });
   const current = terminalJobStatuses.has(job.status) ? job : cancellation.data?.job ?? job;
   const cancellationFeedback = terminalCancellationMessages.get(current.status) ?? "Cancellation recorded.";
+  const cancellationUnsafe = current.status === "waiting_user" && current.pauseDisposition === "route_reconciliation_required";
   return <article className="activity-row">
     <time dateTime={current.createdAt}>{new Date(current.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
     <div><strong>{current.type} application</strong><small className="mono">{current.id}</small></div>
     <StatusText value={current.status}/>
     <div className="job-actions">
-      {cancellableStatuses.has(current.status) && <button className="button small" onClick={() => cancellation.mutate()} disabled={cancellation.isPending || cancellation.isSuccess}>{cancellation.isPending ? "Cancelling…" : cancellation.isSuccess ? "Cancellation requested" : "Cancel job"}</button>}
+      {cancellationUnsafe && <span className="activity-feedback">Retry route reconciliation from Deployment history before cancelling.</span>}
+      {cancellableStatuses.has(current.status) && !cancellationUnsafe && <button className="button small" onClick={() => cancellation.mutate()} disabled={cancellation.isPending || cancellation.isSuccess}>{cancellation.isPending ? "Cancelling…" : cancellation.isSuccess ? "Cancellation requested" : "Cancel job"}</button>}
       {cancellation.isSuccess && <span className="activity-feedback" role="status" aria-live="polite" aria-atomic="true">{cancellationFeedback}</span>}
       {cancellation.isError && <span className="activity-feedback error" role="alert">{cancellation.error.message}</span>}
     </div>

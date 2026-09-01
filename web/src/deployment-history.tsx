@@ -20,7 +20,8 @@ type RuntimeCapabilities = {
 type PauseDisposition =
   | "approval_required"
   | "migration_approval_required"
-  | "insufficient_replacement_capacity";
+  | "insufficient_replacement_capacity"
+  | "route_reconciliation_required";
 
 const runtimeStrategy = (value?: string): RuntimeStrategy | undefined =>
   value === "compose" || value === "generated_node" ? value : undefined;
@@ -42,6 +43,8 @@ const deploymentResult = (item: Deployment) => {
       return "Database migration approval is required.";
     case "insufficient_replacement_capacity":
       return "More temporary capacity is required for a safe replacement.";
+    case "route_reconciliation_required":
+      return "Route state must be reconciled before deployment can continue.";
     default:
       return item.failureSummary || item.diagnosticCode || "No failure recorded";
   }
@@ -277,7 +280,8 @@ function DeploymentRow({
 const pauseDisposition = (value?: string): PauseDisposition | undefined =>
   value === "approval_required" ||
   value === "migration_approval_required" ||
-  value === "insufficient_replacement_capacity"
+  value === "insufficient_replacement_capacity" ||
+  value === "route_reconciliation_required"
     ? value
     : undefined;
 const waiting = (job: Job, appId: string) =>
@@ -333,6 +337,7 @@ function deploymentStatusUpdate(appId: string, deployments: Deployment[], jobs: 
     if (currentJob.pauseDisposition === "approval_required") parts.push("Runtime approval is required.");
     if (currentJob.pauseDisposition === "migration_approval_required") parts.push("Database migration approval is required.");
     if (currentJob.pauseDisposition === "insufficient_replacement_capacity") parts.push("Temporary replacement capacity is required.");
+    if (currentJob.pauseDisposition === "route_reconciliation_required") parts.push("Rig preserved both slots because the active route could not be verified. Retry once the local Docker and Caddy runtime is available.");
   }
   return {
     signature: `${appId}:${deploymentSignature}:${jobSignature}`,
@@ -635,7 +640,8 @@ export function DeploymentHistoryPanel({
           required.every((finding) => active.has(finding.fingerprint))
         : disposition === "migration_approval_required"
           ? migrationApproved
-          : disposition === "insufficient_replacement_capacity"),
+          : disposition === "insufficient_replacement_capacity" ||
+            disposition === "route_reconciliation_required"),
   );
   const hasPendingMutationForCurrentApp = () =>
     [...inFlight.current].some((key) => key.endsWith(`:${appId}`));
@@ -1054,6 +1060,35 @@ export function DeploymentHistoryPanel({
                           {resumePending
                             ? "Retrying replacement capacity..."
                             : "Retry replacement capacity"}
+                        </button>
+                      )}
+                    </>
+                  )}
+                  {disposition === "route_reconciliation_required" && (
+                    <>
+                      <strong>Deployment route state needs reconciliation.</strong>
+                      <span>
+                        Rig could not prove whether the old or new slot is serving, so it preserved both. Confirm the local Docker runtime and Caddy are available, then retry; Rig will attest the candidate and reconcile the route before changing the active slot.
+                      </span>
+                      {!resumeRuntimeAvailable && (
+                        <span>The generated runtime pinned to this deployment is not available on this controller.</span>
+                      )}
+                      {canResume && (
+                        <button
+                          type="button"
+                          className="button small"
+                          disabled={panelMutationPending}
+                          onClick={(event) =>
+                            resumeWaitingJob(
+                              job.id,
+                              "Route reconciliation retry queued.",
+                              event.currentTarget,
+                            )
+                          }
+                        >
+                          {resumePending
+                            ? "Retrying route reconciliation..."
+                            : "Retry route reconciliation"}
                         </button>
                       )}
                     </>

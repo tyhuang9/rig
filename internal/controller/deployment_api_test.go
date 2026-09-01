@@ -1019,9 +1019,9 @@ func (f deploymentAPIFixture) acceptPlanFixture(t *testing.T, appID string, stra
 		Source:   deploymentplans.SourceIdentity{Provider: "github", RepositoryID: 17, ResolvedDigest: strings.Repeat("b", 40)},
 	}
 	if plan.Strategy == deploymentplans.StrategyGeneratedNode {
-		component := deploymentplans.Component{Name: "web", Role: "server", RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm start", InternalPort: 3000, HealthProbe: "/health"}
+		component := deploymentplans.Component{Name: "web", Role: "server", RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci", InstallDirectory: ".", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm start", InternalPort: 3000, HealthProbe: "/health"}
 		plan.Components = []deploymentplans.Component{component}
-		for _, field := range []string{"role", "rootDirectory", "packageManager", "installBehavior", "nodeVersion", "runCommand", "internalPort", "healthProbe", "buildCommand"} {
+		for _, field := range []string{"role", "rootDirectory", "packageManager", "installBehavior", "installDirectory", "nodeVersion", "runCommand", "internalPort", "healthProbe", "buildCommand"} {
 			plan.FieldProvenance = append(plan.FieldProvenance, deploymentplans.FieldProvenance{Field: "components.web." + field, Origin: deploymentplans.ProvenanceInferred, Confidence: 90, Evidence: []string{"package.json"}})
 		}
 	}

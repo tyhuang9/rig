@@ -743,6 +743,42 @@ describe("DeploymentHistoryPanel", () => {
     expect(document.body.textContent).not.toContain("secret-command-value");
   });
 
+  it("preserves both slots and exposes an explicit route reconciliation retry", async () => {
+	const routeDeployment = {
+		...generatedDeployment,
+		diagnosticCode: "route_reconciliation_required",
+		failureSummary: "secret-command-value",
+	};
+	mockData({
+		deployments: [routeDeployment] as never,
+		releases: [generatedRelease] as never,
+		approvals: [],
+		jobs: [generatedWaitingJob("route_reconciliation_required")] as never,
+	});
+	vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan as never);
+	renderPanel({ generatedRuntime: true });
+
+	expect(
+		await screen.findByText("Deployment route state needs reconciliation."),
+	).not.toBeNull();
+	expect(screen.getByText(/could not prove whether the old or new slot/i)).not.toBeNull();
+	expect(
+		screen.getAllByText("Route state must be reconciled before deployment can continue.").length,
+	).toBeGreaterThan(0);
+	const retry = screen.getByRole("button", {
+		name: "Retry route reconciliation",
+	});
+	retry.focus();
+	fireEvent.click(retry);
+	await waitFor(() =>
+		expect(api.resumeJob).toHaveBeenCalledWith("job-generated"),
+	);
+	expect(
+		await screen.findByText("Route reconciliation retry queued."),
+	).not.toBeNull();
+	expect(document.body.textContent).not.toContain("secret-command-value");
+  });
+
   it("keeps generated pause recovery unavailable without its pinned runtime", async () => {
     mockData({
       deployments: [generatedDeployment] as never,

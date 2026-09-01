@@ -126,8 +126,11 @@ Durable surfaces and ordinary APIs contain stable diagnostic codes, not commands
 
 - `deployment_plan_review_required` — reanalyze and accept the current setup, then resume auto-deploy;
 - `migration_approval_required` — approve the exact migration and resume the waiting job;
-- `insufficient_replacement_capacity` — free capacity and resume the waiting job; and
+- `insufficient_replacement_capacity` — free capacity and resume the waiting job;
+- `route_reconciliation_required` — Rig could not prove and persist one safe routing, drain, or finalization outcome. Retry the same waiting job so Rig can re-attest the candidate route and finish cleanup; do not create a replacement deployment; and
 - stable build, runtime, health, ingress, and recovery failure codes in deployment history.
+
+A route-reconciliation pause is deliberately resumable but not cancellable. The candidate may already be serving traffic, so cancellation cannot safely assume that deleting it is harmless. Rig preserves the pinned deployment and both slots until retry proves the route state and completes the remaining drain or finalization work.
 
 ## Verification
 

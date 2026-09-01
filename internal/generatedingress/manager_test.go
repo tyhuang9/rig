@@ -1,6 +1,7 @@
 package generatedingress
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,11 @@ type ingressRunner struct {
 	capacityOutput     []byte
 	caddyMissing       bool
 	ingressMissing     bool
+	liveConfig         []byte
+	startConfig        []byte
+	restartInstalls    int
+	failRestartInstall int
+	failRollbackReload bool
 }
 
 func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -100,12 +106,49 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 	}
 	if len(args) == 3 && args[0] == "container" && args[1] == "start" {
 		r.stopped = false
+		r.startConfig = append([]byte(nil), r.files[caddyContainerName+":/config/active.json"]...)
 		return runtimeprocess.CommandResult{}, nil
 	}
 	if len(args) >= 7 && args[0] == "container" && args[1] == "exec" && args[3] == "caddy" && args[4] == "reload" {
 		if r.failProposedReload && args[6] == "/config/proposed.json" {
 			r.failProposedReload = false
 			return runtimeprocess.CommandResult{Stderr: []byte("untrusted caddy output")}, errors.New("reload failed")
+		}
+		if r.failRollbackReload && args[6] == "/config/rollback.json" {
+			r.failRollbackReload = false
+			return runtimeprocess.CommandResult{Stderr: []byte("untrusted caddy output")}, errors.New("reload failed")
+		}
+		body, exists := r.files[caddyContainerName+":"+args[6]]
+		if !exists {
+			return runtimeprocess.CommandResult{}, errors.New("config missing")
+		}
+		r.liveConfig = append(r.liveConfig[:0], body...)
+		return runtimeprocess.CommandResult{}, nil
+	}
+	if len(args) == 8 && args[0] == "container" && args[1] == "exec" && args[2] == "--user" && args[3] == "0:0" && args[4] == caddyContainerName {
+		source, destination := caddyContainerName+":"+args[6], caddyContainerName+":"+args[7]
+		switch args[5] {
+		case "cp":
+			if args[7] == "/config/active.next.json" {
+				r.restartInstalls++
+				if r.restartInstalls == r.failRestartInstall {
+					return runtimeprocess.CommandResult{Stderr: []byte("untrusted caddy output")}, errors.New("restart install failed")
+				}
+			}
+			body, exists := r.files[source]
+			if !exists {
+				return runtimeprocess.CommandResult{}, errors.New("config missing")
+			}
+			r.files[destination] = append([]byte(nil), body...)
+			return runtimeprocess.CommandResult{}, nil
+		case "mv":
+			body, exists := r.files[source]
+			if !exists {
+				return runtimeprocess.CommandResult{}, errors.New("config missing")
+			}
+			r.files[destination] = append([]byte(nil), body...)
+			delete(r.files, source)
+			return runtimeprocess.CommandResult{}, nil
 		}
 		return runtimeprocess.CommandResult{}, nil
 	}
@@ -160,18 +203,71 @@ func TestSwitchIdempotentlyRepairsCommittedRoute(t *testing.T) {
 	if err := manager.Switch(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
+	committed, err := manager.store.load()
+	if err != nil || !sameRoute(committed.Active[runner.appID], routeRecord{Slot: request.ToSlot, Endpoints: request.Endpoints}) {
+		t.Fatalf("committed route before repair = %#v, error = %v", committed, err)
+	}
+	runner.liveConfig = []byte("drifted live configuration")
 	commandCount := len(runner.commands)
 	if err := manager.Switch(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
+	attested, reconciled := false, false
 	for _, command := range runner.commands[commandCount:] {
-		if containsArgument(command, "/config/proposed.json") || containsArgument(command, runner.endpoint.ContainerID) {
+		if containsArgument(command, "/config/proposed.json") {
 			t.Fatalf("idempotent repair re-ran the proposed switch: %v", command)
 		}
+		attested = attested || containsArgument(command, runner.endpoint.ContainerID)
+		reconciled = reconciled || containsArgument(command, "/config/reconcile.json")
+	}
+	if !attested || !reconciled {
+		t.Fatalf("idempotent repair attested=%t reconciled=%t commands=%v", attested, reconciled, runner.commands[commandCount:])
 	}
 	state, err := manager.store.load()
 	if err != nil || state.Pending != nil || !sameRoute(state.Active[runner.appID], routeRecord{Slot: request.ToSlot, Endpoints: request.Endpoints}) {
 		t.Fatalf("state = %#v, error = %v", state, err)
+	}
+	expected := expectedConfig(t, runner, state.Active)
+	if !bytes.Equal(runner.liveConfig, expected) || !bytes.Equal(runner.files[caddyContainerName+":/config/active.json"], expected) {
+		t.Fatal("idempotent repair did not restore live and restart configurations")
+	}
+}
+
+func TestSwitchIdempotentRepairFailureMarksCandidateLive(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	request := switchRequest(runner)
+	if err := manager.Switch(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	runner.failRestartInstall = runner.restartInstalls + 1
+
+	err := manager.Switch(context.Background(), request)
+	if !generatedruntime.RouteCandidateMayBeLive(err) {
+		t.Fatalf("error = %v, candidate may be live = false", err)
+	}
+	state, loadErr := manager.store.load()
+	if loadErr != nil || state.Pending != nil || !sameRoute(state.Active[runner.appID], routeRecord{Slot: request.ToSlot, Endpoints: request.Endpoints}) {
+		t.Fatalf("state = %#v, error = %v", state, loadErr)
+	}
+}
+
+func TestSwitchIdempotentRepairAttestsCandidateBeforePublishing(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	request := switchRequest(runner)
+	if err := manager.Switch(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	commandCount := len(runner.commands)
+	runner.endpointRoleLabel = "static"
+
+	err := manager.Switch(context.Background(), request)
+	if !IsCode(err, DiagnosticIngressDrift) || !generatedruntime.RouteCandidateMayBeLive(err) {
+		t.Fatalf("error = %v, candidate may be live = %t", err, generatedruntime.RouteCandidateMayBeLive(err))
+	}
+	for _, command := range runner.commands[commandCount:] {
+		if containsArgument(command, "/config/reconcile.json") {
+			t.Fatalf("drifted candidate was published before attestation: %v", command)
+		}
 	}
 }
 
@@ -204,6 +300,75 @@ func TestSwitchReloadFailureRollsBackFirstDeploymentAndClearsPendingState(t *tes
 	}
 	if reloads != 3 {
 		t.Fatalf("reload attempts = %d, want committed recovery, proposed, and rollback", reloads)
+	}
+}
+
+func TestSwitchRestartInstallFailureCompensatesBeforeCleanupSafeError(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	previous := routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+		endpoint("web", "server", runner.network, "web-green", 3000, 'c'),
+	}}
+	if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{runner.appID: previous}}); err != nil {
+		t.Fatal(err)
+	}
+	runner.failRestartInstall = 2
+	request := switchRequest(runner)
+	request.FromSlot = generatedruntime.SlotGreen
+
+	err := manager.Switch(context.Background(), request)
+	if !IsCode(err, DiagnosticRouteUnresolved) || generatedruntime.RouteCandidateMayBeLive(err) {
+		t.Fatalf("error = %v, candidate may be live = %t", err, generatedruntime.RouteCandidateMayBeLive(err))
+	}
+	state, loadErr := manager.store.load()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if state.Pending != nil || !sameRoute(state.Active[runner.appID], previous) {
+		t.Fatalf("compensated state = %#v", state)
+	}
+	expected := expectedConfig(t, runner, map[string]routeRecord{runner.appID: previous})
+	for name, body := range map[string][]byte{
+		"live":    runner.liveConfig,
+		"current": runner.files[caddyContainerName+":/config/current.json"],
+		"restart": runner.files[caddyContainerName+":/config/active.json"],
+	} {
+		if !bytes.Equal(body, expected) {
+			t.Fatalf("%s config did not roll back to the old slot", name)
+		}
+	}
+}
+
+func TestSwitchFailedCompensationMarksCandidateLiveAndRemainsRecoverable(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	previous := routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+		endpoint("web", "server", runner.network, "web-green", 3000, 'c'),
+	}}
+	if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{runner.appID: previous}}); err != nil {
+		t.Fatal(err)
+	}
+	runner.failRestartInstall = 2
+	runner.failRollbackReload = true
+	request := switchRequest(runner)
+	request.FromSlot = generatedruntime.SlotGreen
+
+	err := manager.Switch(context.Background(), request)
+	if !IsCode(err, DiagnosticRouteUnresolved) || !generatedruntime.RouteCandidateMayBeLive(err) {
+		t.Fatalf("error = %v, candidate may be live = %t", err, generatedruntime.RouteCandidateMayBeLive(err))
+	}
+	proposed := routeRecord{Slot: request.ToSlot, Endpoints: request.Endpoints}
+	state, loadErr := manager.store.load()
+	if loadErr != nil || state.Pending != nil || !sameRoute(state.Active[runner.appID], proposed) {
+		t.Fatalf("committed state = %#v, error = %v", state, loadErr)
+	}
+	if !bytes.Equal(runner.liveConfig, expectedConfig(t, runner, map[string]routeRecord{runner.appID: proposed})) {
+		t.Fatal("candidate was not left live after uncertain compensation")
+	}
+	if err := manager.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	expected := expectedConfig(t, runner, map[string]routeRecord{runner.appID: proposed})
+	if !bytes.Equal(runner.liveConfig, expected) || !bytes.Equal(runner.files[caddyContainerName+":/config/active.json"], expected) {
+		t.Fatal("recovery did not reconcile the live and restart configs to durable state")
 	}
 }
 
@@ -285,7 +450,7 @@ func TestProvisionRepairsStoppedCaddyBeforeReconnectingApplicationNetwork(t *tes
 	if disconnect < 0 || start <= disconnect || connect <= start {
 		t.Fatalf("command order disconnect=%d start=%d connect=%d", disconnect, start, connect)
 	}
-	boot := runner.files[caddyContainerName+":/config/active.json"]
+	boot := runner.startConfig
 	var config caddyConfig
 	if json.Unmarshal(boot, &config) != nil || len(config.Apps.HTTP.Servers["generated"].Routes) != 0 {
 		t.Fatalf("stopped Caddy was not seeded with an empty boot config: %s", boot)
@@ -411,6 +576,16 @@ func newManagerFixture(t *testing.T, failReload bool) (*Manager, *ingressRunner)
 
 func switchRequest(runner *ingressRunner) generatedruntime.RouteSwitchRequest {
 	return generatedruntime.RouteSwitchRequest{AppID: runner.appID, ToSlot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{runner.endpoint}}
+}
+
+func expectedConfig(t *testing.T, runner *ingressRunner, routes map[string]routeRecord) []byte {
+	t.Helper()
+	_, _, ingressIP := ingressNetworkCandidate(0)
+	config, err := buildCaddyConfig(routes, ingressIP+":8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return config
 }
 
 func jsonResult(value any) runtimeprocess.CommandResult {

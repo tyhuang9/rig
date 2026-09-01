@@ -111,7 +111,22 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 	committedRoutes := cloneRoutes(state.Active)
 	proposed := routeRecord{Slot: request.ToSlot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), request.Endpoints...)}
 	if hadPrevious && sameRoute(previous, proposed) {
-		return m.ensureCaddy(ctx, state.Active)
+		if err := m.verifyEndpoints(ctx, request.AppID, proposed); err != nil {
+			return markCandidateMayBeLive(err)
+		}
+		if err := m.ensureCaddy(ctx, state.Active); err != nil {
+			return markCandidateMayBeLive(err)
+		}
+		if err := m.reconcileCaddyNetworks(ctx, state.Active); err != nil {
+			return markCandidateMayBeLive(err)
+		}
+		if err := m.applyRoutes(ctx, state.Active, "reconcile.json"); err != nil {
+			return markCandidateMayBeLive(err)
+		}
+		if err := m.installRestartConfig(context.WithoutCancel(ctx)); err != nil {
+			return markCandidateMayBeLive(err)
+		}
+		return nil
 	}
 	if request.FromSlot == "" {
 		if hadPrevious {
@@ -152,7 +167,8 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 		return m.rollbackAfterFailure(&Error{Code: DiagnosticRouteStateFailed}, &rollback)
 	}
 	if err := m.installRestartConfig(context.WithoutCancel(ctx)); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		rollback := routeState{Version: stateVersion, Active: committedRoutes}
+		return m.rollbackAfterFailure(&Error{Code: DiagnosticRouteUnresolved}, &rollback)
 	}
 	return nil
 }
@@ -203,17 +219,20 @@ func (m *Manager) rollbackPending(ctx context.Context, state *routeState) error 
 	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.options.CommandTimeout*3)
 	defer cancel()
 	if err := m.ensureCaddy(rollbackCtx, state.Active); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
 	}
 	if err := m.reconcileCaddyNetworks(rollbackCtx, state.Active); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
 	}
 	if err := m.applyRoutes(rollbackCtx, state.Active, "rollback.json"); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
+	}
+	if err := m.installRestartConfig(rollbackCtx); err != nil {
+		return candidateMayBeLiveError()
 	}
 	state.Pending = nil
 	if err := m.store.save(*state); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
 	}
 	return nil
 }
@@ -222,14 +241,17 @@ func (m *Manager) rollbackAfterFailure(original error, state *routeState) error 
 	rollbackCtx, cancel := context.WithTimeout(context.Background(), m.options.CommandTimeout*3)
 	defer cancel()
 	if err := m.reconcileCaddyNetworks(rollbackCtx, state.Active); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
 	}
 	if err := m.applyRoutes(rollbackCtx, state.Active, "rollback.json"); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
+	}
+	if err := m.installRestartConfig(rollbackCtx); err != nil {
+		return candidateMayBeLiveError()
 	}
 	state.Pending = nil
 	if err := m.store.save(*state); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
 	}
 	return original
 }
@@ -911,7 +933,7 @@ func localDockerEndpoint(value string) bool {
 }
 
 func validConfigFilename(value string) bool {
-	return value == "active.json" || value == "proposed.json" || value == "recovery.json" || value == "rollback.json"
+	return value == "active.json" || value == "proposed.json" || value == "recovery.json" || value == "reconcile.json" || value == "rollback.json"
 }
 
 func containsDigest(values []string, digest string) bool {

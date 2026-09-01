@@ -24,6 +24,7 @@ const jobResumePauseCodes = new Set([
   "approval_required",
   "migration_approval_required",
   "insufficient_replacement_capacity",
+  "route_reconciliation_required",
 ]);
 
 const formatTime = (value?: string) => {
@@ -73,6 +74,8 @@ function pauseDescription(code?: string) {
       return "The approved migration changed or has not been approved yet. Review the migration warning and approve the pinned plan, then resume the waiting job in Deployment history.";
     case "insufficient_replacement_capacity":
       return "Rig cannot reserve enough temporary RAM or disk to run the old and new versions together. Free capacity, then resume the waiting job in Deployment history; Rig will not fall back to a downtime-producing replacement.";
+    case "route_reconciliation_required":
+      return "Rig preserved both application slots because it could not verify the active Caddy route. Restore the local Docker and Caddy runtime, then retry route reconciliation from Deployment history.";
     case "deployment_failed":
       return "The previous auto-deployment failed. After resolving the failure, choose Resume to ask Rig to revalidate and retry.";
     case "missing_configuration":

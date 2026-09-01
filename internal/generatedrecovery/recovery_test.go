@@ -119,6 +119,54 @@ func TestRecoveryRequeuesSafeGeneratedContinuationPoints(t *testing.T) {
 	}
 }
 
+func TestRecoveryPreservesExplicitRouteReconciliationPause(t *testing.T) {
+	fixture := newRecoveryFixture(t, false)
+	fixture.toSwitching(t)
+	if _, err := fixture.db.Exec(`UPDATE jobs SET status='waiting_user',phase='route_reconciliation_required',pause_disposition='route_reconciliation_required' WHERE id=?`, fixture.jobID); err != nil {
+		t.Fatal(err)
+	}
+
+	deploymentResult, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute))
+	if err != nil || deploymentResult.PreservedGenerated != 1 || deploymentResult.FailedGenerated != 0 {
+		t.Fatalf("deployment recovery = %#v err=%v", deploymentResult, err)
+	}
+	jobResult, err := generatedrecovery.RecoverJobs(context.Background(), fixture.db, fixture.now.Add(2*time.Minute))
+	if err != nil || jobResult.RequeuedGenerated != 0 || jobResult.Interrupted != 0 {
+		t.Fatalf("job recovery = %#v err=%v", jobResult, err)
+	}
+	assertRuntime(t, fixture.db, fixture.deploymentID, "switching_route", "not_required", "")
+	assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
+	assertJob(t, fixture.db, fixture.jobID, "waiting_user", "route_reconciliation_required", "", 2, fixture.inputJSON)
+	var pause string
+	if err := fixture.db.QueryRow(`SELECT pause_disposition FROM jobs WHERE id=?`, fixture.jobID).Scan(&pause); err != nil || pause != "route_reconciliation_required" {
+		t.Fatalf("pause disposition = %q, %v", pause, err)
+	}
+}
+
+func TestRecoveryPreservesExplicitRouteReconciliationPauseWhileDraining(t *testing.T) {
+	fixture := newRecoveryFixture(t, false)
+	fixture.toSwitching(t)
+	if _, switched, err := fixture.state.SwitchActive(context.Background(), fixture.appID, fixture.deploymentID, 0); err != nil || !switched {
+		t.Fatalf("switch active: switched=%t err=%v", switched, err)
+	}
+	fixture.advance(t, generatedruntimestate.PhaseDraining)
+	if _, err := fixture.db.Exec(`UPDATE jobs SET status='waiting_user',phase='route_reconciliation_required',pause_disposition='route_reconciliation_required' WHERE id=?`, fixture.jobID); err != nil {
+		t.Fatal(err)
+	}
+
+	deploymentResult, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute))
+	if err != nil || deploymentResult.PreservedGenerated != 1 || deploymentResult.FailedGenerated != 0 {
+		t.Fatalf("deployment recovery = %#v err=%v", deploymentResult, err)
+	}
+	jobResult, err := generatedrecovery.RecoverJobs(context.Background(), fixture.db, fixture.now.Add(2*time.Minute))
+	if err != nil || jobResult.RequeuedGenerated != 0 || jobResult.Interrupted != 0 {
+		t.Fatalf("job recovery = %#v err=%v", jobResult, err)
+	}
+	assertRuntime(t, fixture.db, fixture.deploymentID, "draining", "not_required", "")
+	assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
+	assertJob(t, fixture.db, fixture.jobID, "waiting_user", "route_reconciliation_required", "", 2, fixture.inputJSON)
+}
+
 func TestRecoveryFailsClosedForUnsafeGeneratedStates(t *testing.T) {
 	t.Run("migration running", func(t *testing.T) {
 		fixture := newRecoveryFixture(t, true)

@@ -124,6 +124,9 @@ func TestCompilerKeepsCommandsAndConfigurationOutOfDockerArguments(t *testing.T)
 		if !hasArgumentPair(request.Args, "--label", "io.rig.role=server") {
 			t.Fatalf("component role provenance label is missing: %#v", request.Args)
 		}
+		contextDirectory := request.Args[len(request.Args)-1]
+		assertFileEquals(t, filepath.Join(contextDirectory, "rig", "root.path"), ".")
+		assertFileEquals(t, filepath.Join(contextDirectory, "rig", "install.path"), ".")
 		containerfile := flagValue(t, request.Args, "--file")
 		body, err := os.ReadFile(containerfile)
 		if err != nil {
@@ -326,6 +329,7 @@ type compilerFixture struct {
 	artifacts     *compilerArtifactWriter
 	runner        *compilerRunner
 	builder       *compilerBuilder
+	temporary     *securetemp.Manager
 }
 
 func newCompilerFixture(t *testing.T) compilerFixture {
@@ -351,7 +355,7 @@ func newCompilerFixture(t *testing.T) compilerFixture {
 			Strategy:   deploymentplans.StrategyGeneratedNode,
 			Detector:   deploymentplans.Detector{Name: "projectanalysis", Version: projectanalysis.SchemaVersion, SourceStructuralFingerprint: inspection.Analysis.StructuralFingerprint},
 			Source:     deploymentplans.SourceIdentity{Provider: "local", ResolvedDigest: inspection.Analysis.StructuralFingerprint},
-			Components: []deploymentplans.Component{{Name: "app", Role: "server", RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "24", BuildCommand: "npm run compile", RunCommand: "node server.js", InternalPort: 3000, HealthProbe: "/"}},
+			Components: []deploymentplans.Component{{Name: "app", Role: "server", RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci", InstallDirectory: ".", NodeVersion: "24", BuildCommand: "npm run compile", RunCommand: "node server.js", InternalPort: 3000, HealthProbe: "/"}},
 		},
 	}
 	releaseReader := &compilerReleaseReader{release: release}
@@ -375,7 +379,64 @@ func newCompilerFixture(t *testing.T) compilerFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return compilerFixture{compiler: compiler, release: release, revision: revision, releaseReader: releaseReader, artifacts: artifacts, runner: runner, builder: builder}
+	return compilerFixture{compiler: compiler, release: release, revision: revision, releaseReader: releaseReader, artifacts: artifacts, runner: runner, builder: builder, temporary: temporary}
+}
+
+func TestCompilerBuildsWorkspaceDependenciesAtRepositoryRoot(t *testing.T) {
+	cases := []struct {
+		name, packageManager, lockfile, install string
+	}{
+		{name: "npm", packageManager: "npm", lockfile: "package-lock.json", install: "npm ci"},
+		{name: "pnpm", packageManager: "pnpm", lockfile: "pnpm-lock.yaml", install: "corepack pnpm install --frozen-lockfile"},
+		{name: "yarn", packageManager: "yarn", lockfile: "yarn.lock", install: "corepack yarn install --immutable"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newCompilerFixture(t)
+			workspace := fixture.release.WorkspacePath
+			writeTestFile(t, filepath.Join(workspace, "package.json"), `{"packageManager":"`+test.packageManager+`@`+map[string]string{"npm": "11.0.0", "pnpm": "10.0.0", "yarn": "4.6.0"}[test.packageManager]+`","workspaces":["apps/*"]}`)
+			for _, lockfile := range []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"} {
+				if err := os.Remove(filepath.Join(workspace, lockfile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+			}
+			writeTestFile(t, filepath.Join(workspace, test.lockfile), "locked\n")
+			writeTestFile(t, filepath.Join(workspace, "apps", "api", "package.json"), `{"name":"api","scripts":{"build":"node build.js","start":"node server.js"},"dependencies":{"express":"5"}}`)
+			writeTestFile(t, filepath.Join(workspace, "apps", "api", "build.js"), "console.log('build')")
+			writeTestFile(t, filepath.Join(workspace, "apps", "api", "server.js"), "console.log('ready')")
+			inspection, err := sourceinspection.InspectLocalContext(context.Background(), workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.release.ResolvedSHA = inspection.Analysis.StructuralFingerprint
+			fixture.releaseReader.release = fixture.release
+			fixture.revision.Plan.Detector.SourceStructuralFingerprint = inspection.Analysis.StructuralFingerprint
+			fixture.revision.Plan.Source.ResolvedDigest = inspection.Analysis.StructuralFingerprint
+			fixture.revision.Plan.Components = []deploymentplans.Component{{Name: "app", Role: "server", RootDirectory: "apps/api", PackageManager: test.packageManager, InstallBehavior: test.install, InstallDirectory: ".", NodeVersion: "24", BuildCommand: "node build.js", RunCommand: "node server.js", InternalPort: 3000, HealthProbe: "/"}}
+			fixture.compiler, err = NewCompiler(fixture.releaseReader, compilerPlanReader{revision: fixture.revision}, fixture.artifacts, fixture.temporary, fixture.builder, fixture.runner, CompilerOptions{BuildTimeout: time.Minute})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.runner.run = func(request runtimeprocess.CommandRequest) error {
+				contextDirectory := request.Args[len(request.Args)-1]
+				assertFileEquals(t, filepath.Join(contextDirectory, "rig", "root.path"), "apps/api")
+				assertFileEquals(t, filepath.Join(contextDirectory, "rig", "install.path"), ".")
+				assertFileEquals(t, secretSource(t, request.Args, "rig-install-command"), test.install)
+				recipe, err := os.ReadFile(flagValue(t, request.Args, "--file"))
+				if err != nil {
+					return err
+				}
+				if !strings.Contains(string(recipe), "install=$(cat /run/rig/install.path); cd -- \\\"/workspace/$install\\\"") || !strings.Contains(string(recipe), "root=$(cat /run/rig/root.path); cd -- \\\"/workspace/$root\\\"") {
+					return errors.New("workspace recipe did not separate installation and build roots")
+				}
+				return os.WriteFile(flagValue(t, request.Args, "--iidfile"), []byte("sha256:"+strings.Repeat("3", 64)), 0o600)
+			}
+			artifact, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+			if err != nil || artifact.State != ArtifactReady {
+				t.Fatalf("workspace compile artifact=%#v err=%v", artifact, err)
+			}
+		})
+	}
 }
 
 func flagValue(t *testing.T, args []string, flag string) string {

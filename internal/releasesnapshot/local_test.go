@@ -196,6 +196,10 @@ func acceptLocalAnalysisPlan(t *testing.T, db *sql.DB, dataRoot, appID, actorID 
 	if root == "" {
 		root = "."
 	}
+	installDirectory := candidate.Install.WorkingDirectory
+	if installDirectory == "" {
+		installDirectory = "."
+	}
 	port := uint64(3000)
 	if inferred.InternalPort != nil {
 		var err error
@@ -211,7 +215,8 @@ func acceptLocalAnalysisPlan(t *testing.T, db *sql.DB, dataRoot, appID, actorID 
 	component := deploymentplans.Component{
 		Name: inferred.ID, Role: inferred.Kind, RootDirectory: root,
 		PackageManager: candidate.PackageManager.Name, InstallBehavior: candidate.Install.Command,
-		NodeVersion: candidate.NodeVersion.Value, RunCommand: inferred.Run.Command,
+		InstallDirectory: installDirectory,
+		NodeVersion:      candidate.NodeVersion.Value, RunCommand: inferred.Run.Command,
 		InternalPort: uint16(port), HealthProbe: healthProbe,
 	}
 	if inferred.Build != nil {
@@ -233,7 +238,7 @@ func acceptLocalAnalysisPlan(t *testing.T, db *sql.DB, dataRoot, appID, actorID 
 			Approval:        deploymentplans.MigrationApproval{Status: deploymentplans.MigrationApprovalPending},
 		}
 	}
-	fields := []string{"role", "rootDirectory", "packageManager", "installBehavior", "nodeVersion", "runCommand", "internalPort", "healthProbe"}
+	fields := []string{"role", "rootDirectory", "packageManager", "installBehavior", "installDirectory", "nodeVersion", "runCommand", "internalPort", "healthProbe"}
 	if component.BuildCommand != "" {
 		fields = append(fields, "buildCommand")
 	}

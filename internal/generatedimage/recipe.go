@@ -21,34 +21,36 @@ var nodeImages = map[string]string{
 }
 
 type componentDefinition struct {
-	name            string
-	role            string
-	rootDirectory   string
-	packageManager  string
-	installBehavior string
-	buildCommand    string
-	runCommand      string
-	nodeVersion     string
-	internalPort    uint16
-	healthProbe     string
-	baseImage       string
+	name             string
+	role             string
+	rootDirectory    string
+	packageManager   string
+	installBehavior  string
+	installDirectory string
+	buildCommand     string
+	runCommand       string
+	nodeVersion      string
+	internalPort     uint16
+	healthProbe      string
+	baseImage        string
 }
 
 type digestDefinition struct {
-	CompilerVersion string `json:"compilerVersion"`
-	PlanDigest      string `json:"planDigest"`
-	Component       string `json:"component"`
-	Role            string `json:"role"`
-	RootDirectory   string `json:"rootDirectory"`
-	PackageManager  string `json:"packageManager"`
-	InstallBehavior string `json:"installBehavior"`
-	BuildCommand    string `json:"buildCommand"`
-	RunCommand      string `json:"runCommand"`
-	NodeVersion     string `json:"nodeVersion"`
-	InternalPort    uint16 `json:"internalPort"`
-	HealthProbe     string `json:"healthProbe"`
-	BaseImage       string `json:"baseImage"`
-	RecipeDigest    string `json:"recipeDigest"`
+	CompilerVersion  string `json:"compilerVersion"`
+	PlanDigest       string `json:"planDigest"`
+	Component        string `json:"component"`
+	Role             string `json:"role"`
+	RootDirectory    string `json:"rootDirectory"`
+	PackageManager   string `json:"packageManager"`
+	InstallBehavior  string `json:"installBehavior"`
+	InstallDirectory string `json:"installDirectory"`
+	BuildCommand     string `json:"buildCommand"`
+	RunCommand       string `json:"runCommand"`
+	NodeVersion      string `json:"nodeVersion"`
+	InternalPort     uint16 `json:"internalPort"`
+	HealthProbe      string `json:"healthProbe"`
+	BaseImage        string `json:"baseImage"`
+	RecipeDigest     string `json:"recipeDigest"`
 }
 
 func definitionFor(revision deploymentplans.DeploymentPlanRevision, componentName string) (componentDefinition, string, error) {
@@ -72,7 +74,7 @@ func definitionFor(revision deploymentplans.DeploymentPlanRevision, componentNam
 	}
 	definition := componentDefinition{
 		name: component.Name, role: component.Role, rootDirectory: component.RootDirectory,
-		packageManager: component.PackageManager, installBehavior: component.InstallBehavior,
+		packageManager: component.PackageManager, installBehavior: component.InstallBehavior, installDirectory: component.InstallDirectory,
 		buildCommand: component.BuildCommand, runCommand: component.RunCommand,
 		nodeVersion: component.NodeVersion, internalPort: component.InternalPort,
 		healthProbe: component.HealthProbe, baseImage: base,
@@ -82,7 +84,7 @@ func definitionFor(revision deploymentplans.DeploymentPlanRevision, componentNam
 	canonical, err := json.Marshal(digestDefinition{
 		CompilerVersion: CompilerVersion, PlanDigest: revision.CanonicalDigest, Component: definition.name,
 		Role: definition.role, RootDirectory: definition.rootDirectory, PackageManager: definition.packageManager,
-		InstallBehavior: definition.installBehavior, BuildCommand: definition.buildCommand,
+		InstallBehavior: definition.installBehavior, InstallDirectory: definition.installDirectory, BuildCommand: definition.buildCommand,
 		RunCommand: definition.runCommand, NodeVersion: definition.nodeVersion, InternalPort: definition.internalPort,
 		HealthProbe: definition.healthProbe, BaseImage: definition.baseImage, RecipeDigest: hex.EncodeToString(recipeSum[:]),
 	})
@@ -105,9 +107,9 @@ func containerfile(hasBuild, enableCorepack bool, baseImage string) string {
 	return fmt.Sprintf(`FROM %s AS builder
 %sWORKDIR /workspace
 COPY --chown=node:node source/ /workspace/
-COPY --chown=node:node rig/root.path /run/rig/root.path
+COPY --chown=node:node rig/root.path rig/install.path /run/rig/
 USER node
-RUN --mount=type=secret,id=rig-install-command,required=true ["/bin/sh", "-c", "root=$(cat /run/rig/root.path); cd -- \"/workspace/$root\" && exec /bin/sh -lc \"$(cat /run/secrets/rig-install-command)\""]
+RUN --mount=type=secret,id=rig-install-command,required=true ["/bin/sh", "-c", "install=$(cat /run/rig/install.path); cd -- \"/workspace/$install\" && exec /bin/sh -lc \"$(cat /run/secrets/rig-install-command)\""]
 %sFROM %s AS runtime
 ENV NODE_ENV=production
 %sWORKDIR /workspace
@@ -122,6 +124,9 @@ ENTRYPOINT ["/usr/local/bin/rig-entrypoint"]
 
 func writeRecipe(layout buildLayout, definition componentDefinition) error {
 	if err := writeBuildFile(filepath.Join(layout.contextDirectory, "rig", "root.path"), []byte(definition.rootDirectory), 0o600); err != nil {
+		return err
+	}
+	if err := writeBuildFile(filepath.Join(layout.contextDirectory, "rig", "install.path"), []byte(definition.installDirectory), 0o600); err != nil {
 		return err
 	}
 	return writeBuildFile(layout.containerfile, []byte(containerfile(definition.buildCommand != "", definition.packageManager != "npm", definition.baseImage)), 0o600)

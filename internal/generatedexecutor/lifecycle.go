@@ -307,6 +307,16 @@ func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment,
 		return runtimeDeployment, false, staticError("active head unavailable")
 	}
 	if head.DeploymentID == resolved.deployment.ID {
+		request := generatedruntime.RouteSwitchRequest{
+			AppID: resolved.deployment.AppID, FromSlot: generatedruntime.Slot(runtimeDeployment.PreviousActiveSlot),
+			ToSlot: generatedruntime.Slot(runtimeDeployment.CandidateSlot), DrainPeriod: e.options.DrainPeriod,
+			Endpoints: routeEndpoints(resolved.plan, candidates),
+		}
+		if err = e.routes.Switch(ctx, request); err != nil {
+			// The durable active head already names this candidate. Never clean it
+			// up merely because reattesting or reinstalling its route failed.
+			return runtimeDeployment, true, staticError("route reconciliation failed")
+		}
 		updated, advanceErr := e.state.Advance(ctx, resolved.deployment.AppID, resolved.deployment.ID, generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, "")
 		return updated, true, advanceErr
 	}
@@ -319,12 +329,24 @@ func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment,
 		Endpoints: routeEndpoints(resolved.plan, candidates),
 	}
 	if err = e.routes.Switch(ctx, request); err != nil {
-		return runtimeDeployment, false, staticError("route switch failed")
+		return runtimeDeployment, generatedruntime.RouteCandidateMayBeLive(err), staticError("route switch failed")
 	}
 	if _, _, err = e.state.SwitchActive(ctx, resolved.deployment.AppID, resolved.deployment.ID, head.Generation); err != nil {
+		if runtimeDeployment.PreviousActiveDeploymentID == "" {
+			// A first deployment has no previous route to restore. The candidate
+			// route was already committed, so preserve it until reconciliation can
+			// prove and persist the serving state.
+			return runtimeDeployment, true, staticError("active head compare-and-swap failed")
+		}
 		rollback, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.options.CleanupTimeout)
-		_ = e.restorePreviousRoute(rollback, resolved, runtimeDeployment)
+		restoreErr := e.restorePreviousRoute(rollback, resolved, runtimeDeployment)
 		cancel()
+		if restoreErr != nil {
+			// The route already switched to the candidate, and restoring the
+			// previous route was not proven successful. Preserve both slots and
+			// require reconciliation rather than deleting a possibly live target.
+			return runtimeDeployment, true, staticError("active head compare-and-swap failed")
+		}
 		return runtimeDeployment, false, staticError("active head compare-and-swap failed")
 	}
 	updated, err := e.state.Advance(ctx, resolved.deployment.AppID, resolved.deployment.ID, generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, "")
