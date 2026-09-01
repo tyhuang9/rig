@@ -3,6 +3,7 @@ package releasesnapshot
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +18,12 @@ import (
 	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/sourceinspection"
 )
+
+type failingLocalPlanReader struct{ err error }
+
+func (r failingLocalPlanReader) GetRevision(context.Context, string, string, int64) (deploymentplans.DeploymentPlanRevision, error) {
+	return deploymentplans.DeploymentPlanRevision{}, r.err
+}
 
 func TestMaterializeLocalRetainsBoundedSnapshotAndReusesByTreeAndRevision(t *testing.T) {
 	materializer, db, dataRoot, appID, actorID, source := localMaterializerFixture(t, false)
@@ -139,6 +146,36 @@ func TestMaterializeLocalGeneratedPlanAllowsCodeChangesAndPausesOnStructuralDrif
 	var state, code string
 	if err := db.QueryRow(`SELECT workspace_state,materialization_error_code FROM releases ORDER BY created_at DESC LIMIT 1`).Scan(&state, &code); err != nil || state != WorkspaceStateFailed || code != "deployment_plan_review_required" {
 		t.Fatalf("drift release state=%q code=%q err=%v", state, code, err)
+	}
+}
+
+func TestMaterializeLocalClassifiesInternalPlanLookupFailure(t *testing.T) {
+	materializer, db, dataRoot, appID, actorID, source := localMaterializerFixture(t, false)
+	if err := os.Remove(filepath.Join(source, "deploy", "compose.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		filepath.Join(source, "package.json"):      `{"name":"demo","scripts":{"start":"node server.js"},"dependencies":{"express":"1.0.0"}}`,
+		filepath.Join(source, "package-lock.json"): `{"lockfileVersion":3,"packages":{}}`,
+		filepath.Join(source, "server.js"):         "console.log('ready')",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspection, err := sourceinspection.InspectLocalContext(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptLocalAnalysisPlan(t, db, dataRoot, appID, actorID, inspection.Analysis, nil)
+	materializer.plans = failingLocalPlanReader{err: errors.New("plan storage unavailable")}
+
+	if _, err := materializer.MaterializeLocal(context.Background(), appID, source); !IsCode(err, "internal_error") {
+		t.Fatalf("materialization error=%v", err)
+	}
+	var state, code string
+	if err := db.QueryRow(`SELECT workspace_state,materialization_error_code FROM releases ORDER BY created_at DESC LIMIT 1`).Scan(&state, &code); err != nil || state != WorkspaceStateFailed || code != "internal_error" {
+		t.Fatalf("state=%q code=%q err=%v", state, code, err)
 	}
 }
 

@@ -139,10 +139,11 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 		return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 	}
 	if runtimeDeployment.Phase == generatedruntimestate.PhasePreflight {
-		runtimeDeployment, err = e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhasePreflight, generatedruntimestate.PhaseBuilding, "")
-		if err != nil {
+		advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhasePreflight, generatedruntimestate.PhaseBuilding, "")
+		if advanceErr != nil {
 			return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 		}
+		runtimeDeployment = advanced
 	}
 
 	reservation, err := e.authorization.Authorize(ctx, AuthorizationRequest{
@@ -161,10 +162,11 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 		return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 	}
 	defer reservation.Release()
-	deployment, err = e.deployments.Get(ctx, deployment.AppID, deployment.ID)
-	if err != nil {
+	persistedDeployment, getErr := e.deployments.Get(ctx, deployment.AppID, deployment.ID)
+	if getErr != nil {
 		return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 	}
+	deployment = persistedDeployment
 
 	artifacts := make(map[string]generatedimage.Artifact, len(componentNames))
 	candidates := make(map[string]generatedruntime.Candidate, len(componentNames))
@@ -184,10 +186,11 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 			if runtimeDeployment.MigrationState == generatedruntimestate.MigrationPending {
 				next = generatedruntimestate.PhaseMigrating
 			}
-			runtimeDeployment, err = e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseBuilding, next, "")
-			if err != nil {
+			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseBuilding, next, "")
+			if advanceErr != nil {
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 			}
+			runtimeDeployment = advanced
 
 		case generatedruntimestate.PhaseMigrating:
 			if len(artifacts) == 0 {
@@ -209,10 +212,11 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 				}
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
 			}
-			runtimeDeployment, err = e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseMigrating, generatedruntimestate.PhaseStartingCandidate, "")
-			if err != nil {
+			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseMigrating, generatedruntimestate.PhaseStartingCandidate, "")
+			if advanceErr != nil {
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 			}
+			runtimeDeployment = advanced
 
 		case generatedruntimestate.PhaseStartingCandidate:
 			if len(artifacts) == 0 {
@@ -233,17 +237,19 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticStartFailed)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
 			}
-			runtimeDeployment, err = e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseStartingCandidate, generatedruntimestate.PhaseWaitingHealth, "")
-			if err != nil {
+			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseStartingCandidate, generatedruntimestate.PhaseWaitingHealth, "")
+			if advanceErr != nil {
 				_ = e.cleanupCandidates(ctx, candidates)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 			}
+			runtimeDeployment = advanced
 			if deployment.Status == deployments.Applying {
-				deployment, err = e.deployments.Transition(ctx, deployment.AppID, deployment.ID, deployments.WaitingHealth, "")
-				if err != nil {
+				waitingDeployment, transitionErr := e.deployments.Transition(ctx, deployment.AppID, deployment.ID, deployments.WaitingHealth, "")
+				if transitionErr != nil {
 					_ = e.cleanupCandidates(ctx, candidates)
 					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 				}
+				deployment = waitingDeployment
 			}
 
 		case generatedruntimestate.PhaseWaitingHealth:
@@ -264,11 +270,12 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticHealthFailed)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
 			}
-			runtimeDeployment, err = e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute, "")
-			if err != nil {
+			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute, "")
+			if advanceErr != nil {
 				_ = e.cleanupCandidates(ctx, candidates)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 			}
+			runtimeDeployment = advanced
 
 		case generatedruntimestate.PhaseSwitchingRoute:
 			if len(artifacts) == 0 {
@@ -281,15 +288,15 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 			if err != nil {
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 			}
-			var switched bool
-			runtimeDeployment, switched, err = e.switchRoute(ctx, resolved, runtimeDeployment, candidates)
-			if err != nil {
+			advanced, switched, switchErr := e.switchRoute(ctx, resolved, runtimeDeployment, candidates)
+			if switchErr != nil {
 				if switched {
 					return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "apply_failed")
 				}
 				_ = e.cleanupCandidates(ctx, candidates)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "apply_failed", generatedruntimestate.DiagnosticRouteSwitchFailed)
 			}
+			runtimeDeployment = advanced
 
 		case generatedruntimestate.PhaseDraining:
 			if err = e.drainPrevious(ctx, resolved, runtimeDeployment); err != nil {
@@ -300,10 +307,11 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 			for _, candidate := range candidates {
 				e.runtime.ReleaseAdmission(candidate)
 			}
-			runtimeDeployment, err = e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded, "")
-			if err != nil {
+			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded, "")
+			if advanceErr != nil {
 				return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "internal_error")
 			}
+			runtimeDeployment = advanced
 			if err = report(reporter, jobs.Running, "finalize", 100); err != nil {
 				return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "internal_error")
 			}
@@ -323,7 +331,7 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.DeploymentInput, deployment deployments.Deployment, reporter jobs.ProgressReporter) (resolvedDeployment, error) {
 	application, err := e.applications.Get(job.ResourceID)
 	if err != nil {
-		return resolvedDeployment{}, codedError("invalid_source")
+		return resolvedDeployment{}, codedError("internal_error")
 	}
 	if err := report(reporter, jobs.Running, "prepare_workspace", 20); err != nil {
 		return resolvedDeployment{}, err
@@ -355,7 +363,10 @@ func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.Deploym
 	}
 
 	plan, err := e.plans.GetRevision(ctx, job.ResourceID, release.DeploymentPlanRevisionID, release.DeploymentPlanRevisionNumber)
-	if err != nil || plan.ID != release.DeploymentPlanRevisionID || plan.RevisionNumber != release.DeploymentPlanRevisionNumber ||
+	if err != nil {
+		return resolvedDeployment{}, codedError("internal_error")
+	}
+	if plan.ID != release.DeploymentPlanRevisionID || plan.RevisionNumber != release.DeploymentPlanRevisionNumber ||
 		plan.AppID != job.ResourceID || plan.Plan.Strategy != deploymentplans.StrategyGeneratedNode || len(plan.Plan.Components) == 0 {
 		return resolvedDeployment{}, codedError("invalid_source")
 	}
