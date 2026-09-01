@@ -41,6 +41,7 @@ type SourceScope struct {
 	RepositoryID   int64
 	Branch         string
 	Ref            string
+	ComposePath    string
 }
 
 type SourceResolver interface {
@@ -388,7 +389,7 @@ func (coordinator *Coordinator) processOne(ctx context.Context) (bool, Coordinat
 	scope := SourceScope{
 		OwnerUserID: status.SourceOwnerUserID, ConnectionID: status.SourceConnectionID,
 		InstallationID: status.InstallationID, RepositoryID: status.RepositoryID,
-		Branch: status.TrackedBranch, Ref: status.TrackedRef,
+		Branch: status.TrackedBranch, Ref: status.TrackedRef, ComposePath: status.ComposePath,
 	}
 	now, valid = coordinator.mutationTime(lease, &event)
 	if !valid {
@@ -516,7 +517,7 @@ func (coordinator *Coordinator) dispatch(ctx context.Context, status Status, lea
 			Source: SourceScope{
 				OwnerUserID: status.SourceOwnerUserID, ConnectionID: status.SourceConnectionID,
 				InstallationID: status.InstallationID, RepositoryID: status.RepositoryID,
-				Branch: status.TrackedBranch, Ref: status.TrackedRef,
+				Branch: status.TrackedBranch, Ref: status.TrackedRef, ComposePath: status.ComposePath,
 			},
 			ResolvedSHA: dispatch.SHA,
 		})

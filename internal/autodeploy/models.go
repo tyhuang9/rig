@@ -58,6 +58,7 @@ type Status struct {
 	RepositoryID               int64
 	TrackedBranch              string
 	TrackedRef                 string
+	ComposePath                string
 	SourceScopeActive          bool
 	State                      string
 	LastConsumedGeneration     uint64

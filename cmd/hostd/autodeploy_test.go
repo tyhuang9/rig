@@ -394,6 +394,7 @@ func TestGeneratedAutoDeployPreflightDetectsHeadAndPlanRaces(t *testing.T) {
 
 func TestGeneratedAutoDeployPreflightLeavesLegacyAndComposeUnchanged(t *testing.T) {
 	request := generatedAutoDeployPreflightRequest()
+	request.Source.ComposePath = "compose.yaml"
 	for name, revision := range map[string]deploymentplans.DeploymentPlanRevision{
 		"legacy":  {AppID: request.ApplicationID},
 		"compose": {ID: "33333333-3333-4333-8333-333333333333", AppID: request.ApplicationID, RevisionNumber: 1, Plan: deploymentplans.Plan{Strategy: deploymentplans.StrategyCompose}},
@@ -407,6 +408,21 @@ func TestGeneratedAutoDeployPreflightLeavesLegacyAndComposeUnchanged(t *testing.
 				t.Fatalf("result=%#v plans=%d materialize=%d err=%v", result, plans.calls, materializer.materializeCalls, err)
 			}
 		})
+	}
+}
+
+func TestGeneratedAutoDeployPreflightRequiresPlanWhenComposeIsOmitted(t *testing.T) {
+	request := generatedAutoDeployPreflightRequest()
+	plans := &autoDeployPlanReaderStub{revisions: []deploymentplans.DeploymentPlanRevision{{AppID: request.ApplicationID}}}
+	materializer := &autoDeployReleaseMaterializerStub{}
+	preflight := generatedAutoDeployPreflightFixture(plans, materializer, sourceinspection.Result{})
+	_, err := preflight.Prepare(context.Background(), request)
+	var preflightErr *autodeploy.PreflightError
+	if !errors.As(err, &preflightErr) || preflightErr.Code != autodeploy.PreflightPlanReview {
+		t.Fatalf("missing generated plan error=%v", err)
+	}
+	if materializer.materializeCalls != 0 {
+		t.Fatalf("missing plan materialize calls=%d", materializer.materializeCalls)
 	}
 }
 

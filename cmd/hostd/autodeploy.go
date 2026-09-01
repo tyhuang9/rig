@@ -163,10 +163,19 @@ func (preflight *generatedAutoDeployPreflight) Prepare(ctx context.Context, requ
 	if err != nil {
 		return autodeploy.DispatchPreflightResult{}, safePlanPreflightError(err)
 	}
-	if revision.RevisionNumber == 0 || revision.Plan.Strategy == deploymentplans.StrategyCompose {
+	if revision.RevisionNumber == 0 {
+		if request.Source.ComposePath == "" {
+			return autodeploy.DispatchPreflightResult{}, &autodeploy.PreflightError{Code: autodeploy.PreflightPlanReview}
+		}
 		return autodeploy.DispatchPreflightResult{}, nil
 	}
-	if revision.Plan.Strategy != deploymentplans.StrategyGeneratedNode || revision.ID == "" || revision.AppID != request.ApplicationID || revision.State != deploymentplans.RevisionAccepted || revision.Plan.Source.Provider != "github" || revision.Plan.Source.RepositoryID != request.Source.RepositoryID {
+	if revision.Plan.Strategy == deploymentplans.StrategyCompose {
+		if request.Source.ComposePath == "" {
+			return autodeploy.DispatchPreflightResult{}, &autodeploy.PreflightError{Code: autodeploy.PreflightPlanReview}
+		}
+		return autodeploy.DispatchPreflightResult{}, nil
+	}
+	if revision.Plan.Strategy != deploymentplans.StrategyGeneratedNode || request.Source.ComposePath != "" || revision.ID == "" || revision.AppID != request.ApplicationID || revision.State != deploymentplans.RevisionAccepted || revision.Plan.Source.Provider != "github" || revision.Plan.Source.RepositoryID != request.Source.RepositoryID {
 		return autodeploy.DispatchPreflightResult{}, &autodeploy.PreflightError{Code: autodeploy.PreflightPlanReview}
 	}
 	inspection, err := preflight.inspect(ctx, preflight.sources, request.OwnerUserID, sourceinspection.GitHubSource{

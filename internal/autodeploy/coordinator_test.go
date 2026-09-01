@@ -370,7 +370,7 @@ func TestCoordinatorOfflineStartupUsesPersistedScopeAndCreatesSanitizedJob(t *te
 	if err != nil || resolved.ActiveSHA != secondSHA || resolved.LatestResolvedSHA != secondSHA {
 		t.Fatalf("resolved status=%#v err=%v", resolved, err)
 	}
-	if len(resolver.scopes) != 1 || resolver.scopes[0] != (SourceScope{OwnerUserID: testOwner, ConnectionID: testConnection, InstallationID: testInstallation, RepositoryID: testRepository, Branch: "main", Ref: testRef}) {
+	if len(resolver.scopes) != 1 || resolver.scopes[0] != (SourceScope{OwnerUserID: testOwner, ConnectionID: testConnection, InstallationID: testInstallation, RepositoryID: testRepository, Branch: "main", Ref: testRef, ComposePath: "compose.yaml"}) {
 		t.Fatalf("resolver scope=%#v configured=%#v", resolver.scopes, status)
 	}
 	assertSingleCoordinatorJob(t, fixture, resolved, 1)
@@ -1974,6 +1974,9 @@ func seedGeneratedAutoDeployRuntime(t *testing.T, fixture *repositoryFixture, sh
 	planID := uuid.NewString()
 	releaseID := uuid.NewString()
 	stamp := timestamp(fixture.now)
+	if _, err := fixture.db.Exec(`UPDATE application_sources SET compose_path=NULL WHERE application_id=?`, testApp); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := fixture.db.Exec(`INSERT INTO deployment_plan_revisions(
 		id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,
 		analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,

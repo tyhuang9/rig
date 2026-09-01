@@ -1029,7 +1029,7 @@ func (r *Repository) Resume(ctx context.Context, applicationID, actorUserID stri
 const statusSelect = `SELECT
 	c.application_id,c.revision,c.enabled,COALESCE(c.source_owner_user_id,''),COALESCE(c.configured_by_user_id,''),
 	COALESCE(c.controller_id,''),COALESCE(c.binding_id,''),COALESCE(c.subscription_id,''),
-	COALESCE(s.connection_id,''),COALESCE(s.installation_id,0),COALESCE(s.repository_id,0),COALESCE(s.tracked_branch,''),COALESCE(s.tracked_ref,''),
+	COALESCE(s.connection_id,''),COALESCE(s.installation_id,0),COALESCE(s.repository_id,0),COALESCE(s.tracked_branch,''),COALESCE(s.tracked_ref,''),COALESCE(s.compose_path,''),
 	CASE WHEN EXISTS (
 		SELECT 1 FROM relay_controller_subscriptions rs
 		JOIN relay_installation_bindings rb ON rb.binding_id=c.binding_id AND rb.controller_id=c.controller_id
@@ -1057,7 +1057,7 @@ func scanStatus(row scanner) (Status, error) {
 	err := row.Scan(
 		&value.ApplicationID, &revision, &enabled, &value.SourceOwnerUserID, &value.ConfiguredByUserID,
 		&value.ControllerID, &value.BindingID, &value.SubscriptionID,
-		&value.SourceConnectionID, &value.InstallationID, &value.RepositoryID, &value.TrackedBranch, &value.TrackedRef, &sourceScopeActive,
+		&value.SourceConnectionID, &value.InstallationID, &value.RepositoryID, &value.TrackedBranch, &value.TrackedRef, &value.ComposePath, &sourceScopeActive,
 		&value.State, &consumed, &resolved, &value.LatestResolvedSHA, &dispatch,
 		&preparedSequence, &preparedGeneration, &value.PreparedDispatchSHA,
 		&value.ActiveJobID, &activeSequence, &activeGeneration, &value.ActiveSHA,
