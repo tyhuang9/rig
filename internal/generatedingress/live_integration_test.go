@@ -1,7 +1,9 @@
 package generatedingress
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,8 +12,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"text/template"
 	"time"
 
 	"github.com/hostd/hostd/internal/generatedruntime"
@@ -30,6 +35,177 @@ type liveCapacitySource struct{}
 
 func (liveCapacitySource) Snapshot(context.Context) (generatedruntime.CapacitySnapshot, error) {
 	return generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 8 << 30}, nil
+}
+
+const (
+	liveCreateObservationTimeout     = 5 * time.Second
+	liveCreateObservationOutputLimit = 1024
+)
+
+// liveCreateObserver is test-only. It observes the generated-runtime create
+// result before Engine can inspect or clean it, but retains only fixed boolean
+// hardening checks; IDs, inspect output, and Docker configuration never leave
+// Run's stack frame.
+type liveCreateObserver struct {
+	delegate runtimeprocess.CommandRunner
+	mu       sync.Mutex
+	latest   liveCreateObservation
+}
+
+type liveCreateObservation struct {
+	createSucceeded  bool
+	inspectCompleted bool
+	hardening        liveCreateHardening
+}
+
+type liveCreateHardening struct {
+	NetworkMode       bool `json:"network_mode"`
+	Tmpfs             bool `json:"tmpfs"`
+	PIDsLimit         bool `json:"pids_limit"`
+	SecurityOptions   bool `json:"security_options"`
+	HealthStartPeriod bool `json:"health_start_period"`
+	MountsRealized    bool `json:"mounts_realized"`
+	NetworkRealized   bool `json:"network_realized"`
+}
+
+type liveCreateExpectation struct {
+	network string
+	tmpfs   string
+	pids    int64
+}
+
+func (observer *liveCreateObserver) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	result, err := observer.delegate.Run(ctx, request)
+	expectation, observe := liveGeneratedRuntimeCreateExpectation(request.Args)
+	if !observe || err != nil || result.StdoutTruncated || result.StderrTruncated {
+		return result, err
+	}
+	containerID := bytes.TrimSpace(result.Stdout)
+	if !liveContainerID(containerID) {
+		return result, err
+	}
+	observation := observer.inspectCreatedContainer(ctx, request, string(containerID), expectation)
+	observer.mu.Lock()
+	observer.latest = observation
+	observer.mu.Unlock()
+	return result, err
+}
+
+func liveGeneratedRuntimeCreateExpectation(args []string) (liveCreateExpectation, bool) {
+	if len(args) < 2 || args[0] != "container" || args[1] != "create" {
+		return liveCreateExpectation{}, false
+	}
+	var expectation liveCreateExpectation
+	managed := false
+	for index := 2; index+1 < len(args); index++ {
+		switch args[index] {
+		case "--network":
+			expectation.network = args[index+1]
+			index++
+		case "--tmpfs":
+			expectation.tmpfs = args[index+1]
+			index++
+		case "--pids-limit":
+			value, err := strconv.ParseInt(args[index+1], 10, 64)
+			if err == nil && value > 0 {
+				expectation.pids = value
+			}
+			index++
+		case "--label":
+			managed = args[index+1] == "io.rig.managed=generated-runtime" || managed
+			index++
+		}
+	}
+	return expectation, managed && expectation.network != "" && expectation.tmpfs != "" && expectation.pids > 0
+}
+
+func (observer *liveCreateObserver) inspectCreatedContainer(ctx context.Context, request runtimeprocess.CommandRequest, containerID string, expectation liveCreateExpectation) liveCreateObservation {
+	inspection, err := observer.delegate.Run(ctx, runtimeprocess.CommandRequest{
+		Executable:  request.Executable,
+		Args:        []string{"container", "inspect", "--format", liveCreateInspectionFormat(expectation), containerID},
+		Directory:   request.Directory,
+		Env:         append([]string(nil), request.Env...),
+		Timeout:     liveCreateObservationTimeout,
+		OutputLimit: liveCreateObservationOutputLimit,
+	})
+	defer clearLiveCommandResult(&inspection)
+	if err != nil || inspection.StdoutTruncated || inspection.StderrTruncated {
+		return liveCreateObservation{createSucceeded: true}
+	}
+	var hardening liveCreateHardening
+	if err := json.Unmarshal(inspection.Stdout, &hardening); err != nil {
+		return liveCreateObservation{createSucceeded: true}
+	}
+	return liveCreateObservation{createSucceeded: true, inspectCompleted: true, hardening: hardening}
+}
+
+func liveCreateInspectionFormat(expectation liveCreateExpectation) string {
+	return fmt.Sprintf(`{"network_mode":{{if eq .HostConfig.NetworkMode %s}}true{{else}}false{{end}},"tmpfs":{{if and (eq (len .HostConfig.Tmpfs) 1) (eq (index .HostConfig.Tmpfs "/tmp") %s)}}true{{else}}false{{end}},"pids_limit":{{if eq .HostConfig.PidsLimit %d}}true{{else}}false{{end}},"security_options":{{if and (eq (len .HostConfig.SecurityOpt) 1) (or (eq (index .HostConfig.SecurityOpt 0) "no-new-privileges") (eq (index .HostConfig.SecurityOpt 0) "no-new-privileges:true") (eq (index .HostConfig.SecurityOpt 0) "no-new-privileges=true"))}}true{{else}}false{{end}},"health_start_period":{{if eq .Config.Healthcheck.StartPeriod 5000000000}}true{{else}}false{{end}},"mounts_realized":{{if .Mounts}}true{{else}}false{{end}},"network_realized":{{if index .NetworkSettings.Networks %s}}true{{else}}false{{end}}}`,
+		strconv.Quote(expectation.network), strconv.Quote(expectation.tmpfs), expectation.pids, strconv.Quote(expectation.network))
+}
+
+func liveContainerID(value []byte) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func clearLiveCommandResult(result *runtimeprocess.CommandResult) {
+	if result == nil {
+		return
+	}
+	clear(result.Stdout)
+	clear(result.Stderr)
+	*result = runtimeprocess.CommandResult{}
+}
+
+func (observer *liveCreateObserver) reset() {
+	observer.mu.Lock()
+	observer.latest = liveCreateObservation{}
+	observer.mu.Unlock()
+}
+
+func (observer *liveCreateObserver) failureDiagnostic() string {
+	observer.mu.Lock()
+	observation := observer.latest
+	observer.mu.Unlock()
+	mismatches := "none"
+	if observation.inspectCompleted {
+		if names := liveCreateHardeningMismatches(observation.hardening); len(names) > 0 {
+			mismatches = strings.Join(names, ",")
+		}
+	}
+	return " generated_runtime_create_observed=" + strconv.FormatBool(observation.createSucceeded) +
+		" inspect_completed=" + strconv.FormatBool(observation.inspectCompleted) +
+		" hardening_mismatches=" + mismatches
+}
+
+func liveCreateHardeningMismatches(hardening liveCreateHardening) []string {
+	checks := []struct {
+		name string
+		ok   bool
+	}{
+		{name: "network_mode", ok: hardening.NetworkMode},
+		{name: "tmpfs", ok: hardening.Tmpfs},
+		{name: "pids_limit", ok: hardening.PIDsLimit},
+		{name: "security_options", ok: hardening.SecurityOptions},
+		{name: "health_start_period", ok: hardening.HealthStartPeriod},
+		{name: "mounts_realized", ok: hardening.MountsRealized},
+		{name: "network_realized", ok: hardening.NetworkRealized},
+	}
+	mismatches := make([]string, 0, len(checks))
+	for _, check := range checks {
+		if !check.ok {
+			mismatches = append(mismatches, check.name)
+		}
+	}
+	return mismatches
 }
 
 func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
@@ -70,7 +246,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	imageTags := []string{"rig-generated-live-test:blue", "rig-generated-live-test:green"}
 	defer cleanupLiveDocker(t, docker, root, network.Name, imageTags)
 
-	runner := runtimeprocess.ExecRunner{}
+	runner := &liveCreateObserver{delegate: runtimeprocess.ExecRunner{}}
 	limits := generatedruntime.ContainerLimits{
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 1,
@@ -94,7 +270,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 
 	blueSpec := liveCandidateSpec("blue", appID, planID)
 	blueSpec.ImageContentID = buildLiveImage(t, ctx, docker, root, imageTags[0], blueSpec, "blue")
-	blue := startLiveCandidate(t, ctx, engine, blueSpec)
+	blue := startLiveCandidate(t, ctx, engine, runner, blueSpec)
 	defer func() { _ = engine.StopAndRemove(context.Background(), blue, 0) }()
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{
 		AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(blue)},
@@ -107,7 +283,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	greenSpec := liveCandidateSpec("green", appID, planID)
 	greenSpec.ActiveSlot = blue.Slot
 	greenSpec.ImageContentID = buildLiveImage(t, ctx, docker, root, imageTags[1], greenSpec, "green")
-	green := startLiveCandidate(t, ctx, engine, greenSpec)
+	green := startLiveCandidate(t, ctx, engine, runner, greenSpec)
 	defer func() { _ = engine.StopAndRemove(context.Background(), green, 0) }()
 
 	// A healthy inactive candidate must not receive traffic before the route commit.
@@ -124,6 +300,54 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	}
 	assertLiveResponse(t, hostPort, appID, "green")
 	engine.ReleaseAdmission(green)
+}
+
+func TestLiveCreateObservationDiagnosticIsRedacted(t *testing.T) {
+	diagnostic := (&liveCreateObserver{latest: liveCreateObservation{
+		createSucceeded: true, inspectCompleted: true,
+		hardening: liveCreateHardening{
+			NetworkMode: false, Tmpfs: false, PIDsLimit: true, SecurityOptions: false,
+			HealthStartPeriod: true, MountsRealized: false, NetworkRealized: true,
+		},
+	}}).failureDiagnostic()
+	const want = " generated_runtime_create_observed=true inspect_completed=true hardening_mismatches=network_mode,tmpfs,security_options,mounts_realized"
+	if diagnostic != want {
+		t.Fatalf("redacted observation diagnostic = %q, want %q", diagnostic, want)
+	}
+	for _, forbidden := range []string{"sha256:", "io.rig.", "/workspace", "container", "label"} {
+		if strings.Contains(diagnostic, forbidden) {
+			t.Fatalf("redacted observation diagnostic exposed %q: %q", forbidden, diagnostic)
+		}
+	}
+}
+
+func TestLiveCreateObserverResetDropsPriorAttempt(t *testing.T) {
+	observer := &liveCreateObserver{latest: liveCreateObservation{
+		createSucceeded: true, inspectCompleted: true, hardening: liveCreateHardening{NetworkMode: false},
+	}}
+	observer.reset()
+	const want = " generated_runtime_create_observed=false inspect_completed=false hardening_mismatches=none"
+	if diagnostic := observer.failureDiagnostic(); diagnostic != want {
+		t.Fatalf("reset observation diagnostic = %q, want %q", diagnostic, want)
+	}
+}
+
+func TestLiveCreateObserverFiltersOtherContainerCreates(t *testing.T) {
+	arguments := []string{
+		"container", "create", "--network", "test-network", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16777216",
+		"--pids-limit", "128", "--label", "io.rig.managed=generated-runtime",
+	}
+	expectation, observed := liveGeneratedRuntimeCreateExpectation(arguments)
+	if !observed || expectation.network != "test-network" || expectation.tmpfs == "" || expectation.pids != 128 {
+		t.Fatalf("generated-runtime create was not observed: observed=%t network_present=%t tmpfs_present=%t pids_valid=%t", observed, expectation.network != "", expectation.tmpfs != "", expectation.pids == 128)
+	}
+	arguments[len(arguments)-1] = "io.rig.managed=generated-ingress"
+	if _, observed := liveGeneratedRuntimeCreateExpectation(arguments); observed {
+		t.Fatal("non-runtime container create reached the diagnostic observer")
+	}
+	if _, err := template.New("docker-inspect").Parse(liveCreateInspectionFormat(expectation)); err != nil {
+		t.Fatal("Docker inspect format is not a valid Go template")
+	}
 }
 
 func liveCandidateSpec(version, appID, planID string) generatedruntime.CandidateSpec {
@@ -175,17 +399,18 @@ func buildLiveImage(t *testing.T, ctx context.Context, docker, root, tag string,
 	return strings.TrimSpace(output)
 }
 
-func startLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
+func startLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, observer *liveCreateObserver, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
 	t.Helper()
+	observer.reset()
 	candidate, err := engine.CreateInactiveCandidate(ctx, spec)
 	if err != nil {
-		t.Fatalf("create %s candidate: %v", spec.ReleaseID, err)
+		t.Fatalf("create candidate: %v%s", err, observer.failureDiagnostic())
 	}
 	if err := engine.StartCandidate(ctx, candidate); err != nil {
-		t.Fatalf("start %s candidate: %v", spec.ReleaseID, err)
+		t.Fatalf("start candidate: %v%s", err, observer.failureDiagnostic())
 	}
 	if err := engine.WaitHealthy(ctx, candidate); err != nil {
-		t.Fatalf("wait for %s candidate: %v", spec.ReleaseID, err)
+		t.Fatalf("wait for candidate: %v%s", err, observer.failureDiagnostic())
 	}
 	return candidate
 }

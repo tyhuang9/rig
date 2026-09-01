@@ -994,7 +994,7 @@ func matchesCandidateOwnership(container containerInspection, candidate Candidat
 		"io.rig.component": candidate.Component, "io.rig.slot": string(candidate.Slot),
 		"io.rig.role": candidate.Role,
 	}
-	return container.ID == candidate.ContainerID && strings.TrimPrefix(container.Name, "/") == candidate.ContainerName && containsLabels(container.Labels, expected) && container.NetworkMode == candidate.NetworkName
+	return container.ID == candidate.ContainerID && strings.TrimPrefix(container.Name, "/") == candidate.ContainerName && containsLabels(container.Labels, expected)
 }
 
 func containsLabels(actual, expected map[string]string) bool {

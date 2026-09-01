@@ -455,6 +455,78 @@ func TestGeneratedRuntimeStopAndRemoveAllowsUnrealizedCreatedCandidate(t *testin
 	findRuntimeRequest(t, runner.requests, "container rm")
 }
 
+func TestGeneratedRuntimeCleanupOwnershipDoesNotRequireConfiguredNetwork(t *testing.T) {
+	spec := candidateSpec()
+	for _, test := range []struct {
+		name             string
+		networkMode      string
+		mutateLabels     func(map[string]string)
+		wantCleanupError bool
+	}{
+		{name: "empty network mode", networkMode: ""},
+		{name: "wrong network mode", networkMode: "unexpected-network"},
+		{
+			name:             "missing ownership label stays protected",
+			networkMode:      "",
+			mutateLabels:     func(labels map[string]string) { delete(labels, "io.rig.deployment") },
+			wantCleanupError: true,
+		},
+		{
+			name:        "wrong ownership label stays protected",
+			networkMode: "",
+			mutateLabels: func(labels map[string]string) {
+				labels["io.rig.deployment"] = uuid.NewString()
+			},
+			wantCleanupError: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := candidateForSpec(spec)
+			removed := false
+			inspection := configuredInspection(spec, defaultLimits())
+			inspection.NetworkMode = test.networkMode
+			if test.mutateLabels != nil {
+				test.mutateLabels(inspection.Labels)
+			}
+			if matchesCandidateConfiguredHardening(inspection, candidate, defaultLimits()) {
+				t.Fatal("network configuration drift passed configured hardening")
+			}
+			engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+				switch commandKind(request.Args) {
+				case "container inspect":
+					if removed {
+						return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
+					}
+					return runtimeJSON(inspection)
+				case "container rm":
+					removed = true
+					return runtimeRequestResult{}
+				default:
+					t.Fatalf("unexpected request: %#v", request.Args)
+					return runtimeRequestResult{}
+				}
+			})
+			err := engine.StopAndRemove(context.Background(), candidate, time.Second)
+			if test.wantCleanupError {
+				if !IsCode(err, DiagnosticCandidateHardeningFailed) {
+					t.Fatalf("expected protected ownership failure, got %v", err)
+				}
+				if removed {
+					t.Fatal("container with incomplete ownership reached removal")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("fully owned container with network drift was not removed: %v", err)
+			}
+			if !removed {
+				t.Fatal("fully owned container with network drift was not removed")
+			}
+			findRuntimeRequest(t, runner.requests, "container rm")
+		})
+	}
+}
+
 func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testing.T) {
 	root := t.TempDir()
 	config := filepath.Join(root, "docker-config")
