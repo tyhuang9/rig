@@ -714,7 +714,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
             <strong>{migrationPending ? "Database migration needs separate approval" : "Database migration approved"}</strong>
             {migrationPending ? <><p>This command can change persistent data. The old and new app versions briefly share the migrated database, and Rig will not automatically roll it back.</p><button className="button" type="button" disabled={approveMigration.isPending} onClick={() => { setFormError(""); approveMigration.mutate(); }}>{approveMigration.isPending ? "Approving migration…" : "Approve migration before the next deployment"}</button></> : <span>The migration is approved for this plan revision.</span>}
           </div>}
-          <div className="callout info"><strong>Generated runtime is not enabled yet</strong><span>The setup is saved and ready for the generated-image runtime milestone. No repository command has run.</span></div>
+          <div className="callout success"><strong>Ready to deploy</strong><span>Analysis did not execute repository code. Open the application and choose Deploy latest to build and start this accepted setup in containers.</span></div>
           <footer><button className="button primary" type="button" onClick={() => onCreated(draftApplicationId)}>Open application</button></footer>
         </section>
       </form>

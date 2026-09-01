@@ -246,6 +246,8 @@ describe("SourceWizard", () => {
     }));
     expect(await screen.findByRole("heading", { name: /setup accepted/i })).toBeTruthy();
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: /setup accepted/i })));
+    expect(screen.getByText(/analysis did not execute repository code/i)).toBeTruthy();
+    expect(screen.queryByText(/runtime milestone/i)).toBeNull();
     expect(onCreated).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: /open application/i }));
     expect(onCreated).toHaveBeenCalledWith("app-1");
