@@ -63,7 +63,7 @@ func contractAnalysisCommand(value *projectanalysis.Command) apicontract.Analysi
 	if value == nil {
 		return apicontract.AnalysisCommand{Present: false, Evidence: []apicontract.AnalysisEvidence{}}
 	}
-	return apicontract.AnalysisCommand{Present: true, Origin: value.Origin, Phase: value.Phase, Command: value.Command, WorkingDirectory: value.WorkingDirectory, Provenance: value.Provenance, Confidence: value.Confidence, Evidence: contractAnalysisEvidence(value.Evidence)}
+	return apicontract.AnalysisCommand{Present: true, Origin: value.Origin, Phase: value.Phase, Command: value.Command, WorkingDirectory: value.WorkingDirectory, EnvironmentKeys: append([]string(nil), value.EnvironmentKeys...), Provenance: value.Provenance, Confidence: value.Confidence, Evidence: contractAnalysisEvidence(value.Evidence)}
 }
 
 func contractSourceSummary(value sourceinspection.SourceMetadata, resolvedDigest string) apicontract.SourceSummary {

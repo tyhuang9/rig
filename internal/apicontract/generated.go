@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "cd589cb0411eb00e84863e154fcc52f38e15adfa56f797c929a28648b69729f2"
+const SourceSHA256 = "c3f7b0ed5399b8cc3ccb9dfb151cc71f7223b5cd752af0de56ae9200a53153a6"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -85,6 +85,7 @@ type AnalysisAdvancedInput struct {
 type AnalysisCommand struct {
 	Command          string             `json:"command,omitempty"`
 	Confidence       string             `json:"confidence,omitempty"`
+	EnvironmentKeys  []string           `json:"environmentKeys,omitempty"`
 	Evidence         []AnalysisEvidence `json:"evidence"`
 	Origin           string             `json:"origin,omitempty"`
 	Phase            string             `json:"phase,omitempty"`
@@ -250,6 +251,8 @@ type Deployment struct {
 	ActualConfigurationRevisionNumber int64           `json:"actualConfigurationRevisionNumber"`
 	AppID                             string          `json:"appId"`
 	ConfigurationMode                 string          `json:"configurationMode"`
+	DeploymentPlanRevisionID          string          `json:"deploymentPlanRevisionId,omitempty"`
+	DeploymentPlanRevisionNumber      int64           `json:"deploymentPlanRevisionNumber"`
 	DiagnosticCode                    string          `json:"diagnosticCode,omitempty"`
 	FailureSummary                    string          `json:"failureSummary,omitempty"`
 	Findings                          []PolicyFinding `json:"findings"`
@@ -258,6 +261,7 @@ type Deployment struct {
 	JobID                             string          `json:"jobId,omitempty"`
 	MachineID                         string          `json:"machineId,omitempty"`
 	ReleaseID                         string          `json:"releaseId,omitempty"`
+	RuntimeStrategy                   string          `json:"runtimeStrategy"`
 	StartedAt                         string          `json:"startedAt,omitempty"`
 	Status                            string          `json:"status"`
 }
@@ -320,12 +324,15 @@ type DeploymentPlanFieldProvenance struct {
 }
 
 type DeploymentPlanMigration struct {
-	ApprovalStatus string `json:"approvalStatus,omitempty"`
-	ApprovedAt     string `json:"approvedAt,omitempty"`
-	ApprovedBy     string `json:"approvedBy,omitempty"`
-	Command        string `json:"command,omitempty"`
-	EvidenceDigest string `json:"evidenceDigest,omitempty"`
-	Present        bool   `json:"present"`
+	ApprovalStatus  string   `json:"approvalStatus,omitempty"`
+	ApprovedAt      string   `json:"approvedAt,omitempty"`
+	ApprovedBy      string   `json:"approvedBy,omitempty"`
+	Command         string   `json:"command,omitempty"`
+	ComponentName   string   `json:"componentName,omitempty"`
+	EnvironmentKeys []string `json:"environmentKeys,omitempty"`
+	EvidenceDigest  string   `json:"evidenceDigest,omitempty"`
+	Present         bool     `json:"present"`
+	RootDirectory   string   `json:"rootDirectory,omitempty"`
 }
 
 type DeploymentPlanRevision struct {
@@ -625,22 +632,24 @@ type RelayStatus struct {
 }
 
 type Release struct {
-	AppID                       string `json:"appId"`
-	ArchiveSha256               string `json:"archiveSha256,omitempty"`
-	ComposePath                 string `json:"composePath,omitempty"`
-	ConfigurationRevisionID     string `json:"configurationRevisionId,omitempty"`
-	ConfigurationRevisionNumber int64  `json:"configurationRevisionNumber"`
-	CreatedAt                   string `json:"createdAt"`
-	ID                          string `json:"id"`
-	RepositoryID                int64  `json:"repositoryId,omitempty"`
-	RepositoryName              string `json:"repositoryName,omitempty"`
-	RepositoryOwner             string `json:"repositoryOwner,omitempty"`
-	ResolvedSha                 string `json:"resolvedSha,omitempty"`
-	SourceBranch                string `json:"sourceBranch,omitempty"`
-	SourceCommitSha             string `json:"sourceCommitSha,omitempty"`
-	SourceProvider              string `json:"sourceProvider"`
-	TrackedRef                  string `json:"trackedRef,omitempty"`
-	WorkspaceState              string `json:"workspaceState,omitempty"`
+	AppID                        string `json:"appId"`
+	ArchiveSha256                string `json:"archiveSha256,omitempty"`
+	ComposePath                  string `json:"composePath,omitempty"`
+	ConfigurationRevisionID      string `json:"configurationRevisionId,omitempty"`
+	ConfigurationRevisionNumber  int64  `json:"configurationRevisionNumber"`
+	CreatedAt                    string `json:"createdAt"`
+	DeploymentPlanRevisionID     string `json:"deploymentPlanRevisionId,omitempty"`
+	DeploymentPlanRevisionNumber int64  `json:"deploymentPlanRevisionNumber"`
+	ID                           string `json:"id"`
+	RepositoryID                 int64  `json:"repositoryId,omitempty"`
+	RepositoryName               string `json:"repositoryName,omitempty"`
+	RepositoryOwner              string `json:"repositoryOwner,omitempty"`
+	ResolvedSha                  string `json:"resolvedSha,omitempty"`
+	SourceBranch                 string `json:"sourceBranch,omitempty"`
+	SourceCommitSha              string `json:"sourceCommitSha,omitempty"`
+	SourceProvider               string `json:"sourceProvider"`
+	TrackedRef                   string `json:"trackedRef,omitempty"`
+	WorkspaceState               string `json:"workspaceState,omitempty"`
 }
 
 type ReleaseList struct {

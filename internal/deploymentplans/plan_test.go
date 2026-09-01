@@ -57,6 +57,27 @@ func TestCanonicalPlanAcceptsLocalSnapshotIdentity(t *testing.T) {
 	}
 }
 
+func TestMigrationIsBoundToAcceptedComponentAndExplicitEnvironmentKeys(t *testing.T) {
+	plan := testPlan()
+	if _, err := CanonicalDigest(plan); err != nil {
+		t.Fatalf("valid migration binding rejected: %v", err)
+	}
+	plan.Migration.ComponentName = "missing"
+	if _, err := CanonicalDigest(plan); err == nil {
+		t.Fatal("unknown migration component accepted")
+	}
+	plan = testPlan()
+	plan.Migration.RootDirectory = "."
+	if _, err := CanonicalDigest(plan); err == nil {
+		t.Fatal("mismatched migration root accepted")
+	}
+	plan = testPlan()
+	plan.Migration.EnvironmentKeys = []string{"AWS_SECRET_ACCESS_KEY"}
+	if _, err := CanonicalDigest(plan); err == nil {
+		t.Fatal("unsupported migration environment key accepted")
+	}
+}
+
 func TestStorePersistsProtectedImmutableRevisionAndCASHead(t *testing.T) {
 	db := planDB(t)
 	root := t.TempDir()
@@ -198,7 +219,7 @@ func testPlan() Plan {
 			Component{Name: "web", Role: "server", RootDirectory: "apps/web", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm run start", InternalPort: 3000, HealthProbe: "/health"},
 			Component{Name: "worker", Role: "server", RootDirectory: "apps/worker", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", RunCommand: "npm run worker", InternalPort: 3001, HealthProbe: "/health"},
 		),
-		Migration: &Migration{Command: "npm run migrate", EvidenceDigest: strings.Repeat("b", 64), Approval: MigrationApproval{Status: MigrationApprovalPending}},
+		Migration: &Migration{ComponentName: "web", RootDirectory: "apps/web", Command: "npm run migrate", EnvironmentKeys: []string{"DATABASE_URL"}, EvidenceDigest: strings.Repeat("b", 64), Approval: MigrationApproval{Status: MigrationApprovalPending}},
 	}
 }
 

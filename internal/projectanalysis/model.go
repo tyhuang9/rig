@@ -10,7 +10,7 @@ import (
 
 const (
 	// SchemaVersion is incremented when the serialized analysis contract changes.
-	SchemaVersion = "2"
+	SchemaVersion = "3"
 
 	// PinnedNodeLTS is the deterministic fallback used when a repository does not
 	// declare a Node.js version. It must only change with a schema version change.
@@ -157,6 +157,7 @@ type Command struct {
 	Phase            string     `json:"phase"`
 	Command          string     `json:"command"`
 	WorkingDirectory string     `json:"working_directory"`
+	EnvironmentKeys  []string   `json:"environment_keys,omitempty"`
 	Provenance       string     `json:"provenance"`
 	Confidence       string     `json:"confidence"`
 	Evidence         []Evidence `json:"evidence"`
