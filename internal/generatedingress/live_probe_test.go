@@ -32,9 +32,13 @@ const (
 	liveProbeIdentity   liveProbeGroup = "identity"
 	liveProbeNetwork    liveProbeGroup = "network"
 	liveProbeOperations liveProbeGroup = "operations"
+	liveProbeLogging    liveProbeGroup = "logging"
+	liveProbeHealth     liveProbeGroup = "health"
 )
 
 var liveProbeGroups = []liveProbeGroup{liveProbeInit, liveProbeFilesystem, liveProbePIDs, liveProbeCompute, liveProbeSecurity, liveProbeIdentity, liveProbeNetwork, liveProbeOperations}
+
+const liveProbeOperationsMaximum = 7
 
 // All fields come from the exact synthetic candidate which failed StartCandidate.
 // This remains test-only; it does not change runtime production behavior.
@@ -157,6 +161,120 @@ func liveRunStartBisection(ctx context.Context, c liveProbeConfig) liveProbeOutc
 	}
 	o.status = "multi_group_or_invariant"
 	return o
+}
+
+// liveRunOperationsSplit is a fixed, hosted-only follow-up after the broad
+// candidate start failure. It narrows the combined operations group without
+// changing any production runtime option and emits fixed labels only.
+func liveRunOperationsSplit(ctx context.Context, c liveProbeConfig) liveProbeOutcome {
+	if !c.valid() {
+		return liveProbeOutcome{status: "fixture_invalid"}
+	}
+	name, nonce, ok := liveProbeName()
+	if !ok {
+		return liveProbeOutcome{status: "nonce_unavailable"}
+	}
+	defer clear(name)
+	defer clear(nonce)
+	f, ok := newLiveProbeFixture(string(name), string(nonce))
+	if !ok {
+		return liveProbeOutcome{status: "fixture_invalid"}
+	}
+	defer f.clear()
+	o := liveProbeOutcome{cleanup: "none"}
+	run := func(name string, omit []liveProbeGroup) (probeResult, bool) {
+		if len(o.attempts) >= liveProbeOperationsMaximum {
+			o.status = "budget"
+			return probeResult{}, false
+		}
+		r := liveProbeRun(ctx, c, f, name, omit)
+		o.attempts = append(o.attempts, liveProbeAttempt{name, r.status})
+		o.cleanup = r.cleanup
+		if !r.safe {
+			o.status, o.cleanup = "aborted", r.cleanup
+			return r, false
+		}
+		return r, true
+	}
+	all, ok := run("all_options", nil)
+	if !ok {
+		return o
+	}
+	if all.status == "pass" {
+		o.status = "non_reproducible"
+		return o
+	}
+	operations, ok := run("without_operations", []liveProbeGroup{liveProbeOperations})
+	if !ok {
+		return o
+	}
+	if operations.status != "pass" {
+		o.status = "operations_not_reproduced"
+		return o
+	}
+	logging, ok := run("without_logging", []liveProbeGroup{liveProbeLogging})
+	if !ok {
+		return o
+	}
+	health, ok := run("without_health", []liveProbeGroup{liveProbeHealth})
+	if !ok {
+		return o
+	}
+	loggingPass, healthPass := logging.status == "pass", health.status == "pass"
+	if !loggingPass && !healthPass {
+		o.status = "neither_subgroup"
+		return o
+	}
+	confirmAll, ok := run("confirm_all_options", nil)
+	if !ok {
+		return o
+	}
+	if confirmAll.status != "fail" {
+		if loggingPass && healthPass {
+			o.status = "unconfirmed_both"
+		} else {
+			o.status = "unconfirmed_" + firstLiveProbeSubgroup(loggingPass, healthPass)
+		}
+		return o
+	}
+	confirmedLogging, confirmedHealth := false, false
+	if loggingPass {
+		confirmation, ok := run("confirm_logging", []liveProbeGroup{liveProbeLogging})
+		if !ok {
+			return o
+		}
+		confirmedLogging = confirmation.status == "pass"
+	}
+	if healthPass {
+		confirmation, ok := run("confirm_health", []liveProbeGroup{liveProbeHealth})
+		if !ok {
+			return o
+		}
+		confirmedHealth = confirmation.status == "pass"
+	}
+	switch {
+	case confirmedLogging && confirmedHealth:
+		o.status = "confirmed_both"
+	case confirmedLogging:
+		o.status = "confirmed_logging"
+	case confirmedHealth:
+		o.status = "confirmed_health"
+	case loggingPass && healthPass:
+		o.status = "unconfirmed_both"
+	default:
+		o.status = "unconfirmed_" + firstLiveProbeSubgroup(loggingPass, healthPass)
+	}
+	return o
+}
+
+func firstLiveProbeSubgroup(logging, health bool) string {
+	if logging {
+		return string(liveProbeLogging)
+	}
+	if health {
+		return string(liveProbeHealth)
+	}
+	return "none"
 }
 
 type liveProbeFixture struct{ name, nonce string }
@@ -320,8 +438,11 @@ func liveProbeCreateArgs(c liveProbeConfig, f liveProbeFixture, attempt string, 
 	} else {
 		a = append(a, "--network", c.network, "--network-alias", c.alias)
 	}
-	if !m[liveProbeOperations] {
-		a = append(a, "--log-driver", "local", "--log-opt", "max-size="+c.logSize, "--log-opt", "max-file="+c.logFiles, "--health-cmd", liveProbeHealthCommand, "--health-interval", "2s", "--health-timeout", "2s", "--health-start-period", "5s", "--health-retries", "3")
+	if !m[liveProbeOperations] && !m[liveProbeLogging] {
+		a = append(a, "--log-driver", "local", "--log-opt", "max-size="+c.logSize, "--log-opt", "max-file="+c.logFiles)
+	}
+	if !m[liveProbeOperations] && !m[liveProbeHealth] {
+		a = append(a, "--health-cmd", liveProbeHealthCommand, "--health-interval", "2s", "--health-timeout", "2s", "--health-start-period", "5s", "--health-retries", "3")
 	}
 	return append(a, c.image, "/bin/sh", "-lc", c.command), true
 }
@@ -345,7 +466,7 @@ func omittedProbeGroups(args []string) []liveProbeGroup {
 	checks := []struct {
 		g liveProbeGroup
 		s string
-	}{{liveProbeInit, "--init"}, {liveProbeFilesystem, "--read-only"}, {liveProbePIDs, "--pids-limit"}, {liveProbeCompute, "--memory"}, {liveProbeSecurity, "--cap-drop"}, {liveProbeIdentity, "--user"}, {liveProbeOperations, "--log-driver"}}
+	}{{liveProbeInit, "--init"}, {liveProbeFilesystem, "--read-only"}, {liveProbePIDs, "--pids-limit"}, {liveProbeCompute, "--memory"}, {liveProbeSecurity, "--cap-drop"}, {liveProbeIdentity, "--user"}}
 	var out []liveProbeGroup
 	for _, x := range checks {
 		if !hasArgs(args, x.s) {
@@ -354,6 +475,15 @@ func omittedProbeGroups(args []string) []liveProbeGroup {
 	}
 	if hasArgs(args, "--network", "none") {
 		out = append(out, liveProbeNetwork)
+	}
+	hasLogging, hasHealth := hasArgs(args, "--log-driver"), hasArgs(args, "--health-cmd")
+	switch {
+	case !hasLogging && !hasHealth:
+		out = append(out, liveProbeOperations)
+	case !hasLogging:
+		out = append(out, liveProbeLogging)
+	case !hasHealth:
+		out = append(out, liveProbeHealth)
 	}
 	return out
 }
@@ -456,6 +586,30 @@ func TestLiveProbeFixtureFidelityAndGroupOmission(t *testing.T) {
 		clear(a)
 	}
 }
+
+func TestLiveProbeOperationsSubgroupsOmitExactBoundaries(t *testing.T) {
+	c, f := testProbeConfig(&liveProbeRunner{}), testProbeFixture(t)
+	for _, test := range []struct {
+		name                    string
+		omit                    liveProbeGroup
+		wantLogging, wantHealth bool
+	}{
+		{"operations", liveProbeOperations, false, false},
+		{"logging", liveProbeLogging, false, true},
+		{"health", liveProbeHealth, true, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args, ok := liveProbeCreateArgs(c, f, test.name, []liveProbeGroup{test.omit})
+			defer clear(args)
+			if !ok || !liveValidateProbeCreate(c, f, test.name, args) {
+				t.Fatal("subgroup request was rejected")
+			}
+			if hasArgs(args, "--log-driver") != test.wantLogging || hasArgs(args, "--health-cmd") != test.wantHealth {
+				t.Fatal("subgroup omitted an incorrect operation boundary")
+			}
+		})
+	}
+}
 func TestLiveProbeRejectsRequestDrift(t *testing.T) {
 	c := testProbeConfig(&liveProbeRunner{})
 	f := testProbeFixture(t)
@@ -469,6 +623,11 @@ func TestLiveProbeRejectsRequestDrift(t *testing.T) {
 		}
 		clear(v)
 	}
+	duplicate := append(append([]string(nil), a...), "--health-cmd", liveProbeHealthCommand)
+	if liveValidateProbeCreate(c, f, "all_options", duplicate) {
+		t.Fatal("duplicate health flags accepted")
+	}
+	clear(duplicate)
 }
 func TestLiveProbeBisectionBounded(t *testing.T) {
 	r := &liveProbeRunner{passWhenMissing: "--init"}
@@ -481,6 +640,50 @@ func TestLiveProbeBisectionBounded(t *testing.T) {
 	}
 	if len(r.names) != len(o.attempts) || r.names[0] == r.names[1] {
 		t.Fatalf("attempt names were not unique: %#v", r.names)
+	}
+}
+
+func TestLiveOperationsSplitSequences(t *testing.T) {
+	for _, test := range []struct {
+		name, mode, want, sequence string
+	}{
+		{"logging", "logging", "confirmed_logging", ""},
+		{"health", "health", "confirmed_health", ""},
+		{"both", "both", "confirmed_both", ""},
+		{"both_logging", "both_logging", "confirmed_logging", "all_options,without_operations,without_logging,without_health,confirm_all_options,confirm_logging,confirm_health"},
+		{"both_health", "both_health", "confirmed_health", "all_options,without_operations,without_logging,without_health,confirm_all_options,confirm_logging,confirm_health"},
+		{"both_neither", "both_neither", "unconfirmed_both", "all_options,without_operations,without_logging,without_health,confirm_all_options,confirm_logging,confirm_health"},
+		{"both_confirm_all_nonfail", "both_confirm_all_nonfail", "unconfirmed_both", "all_options,without_operations,without_logging,without_health,confirm_all_options"},
+		{"neither", "neither", "neither_subgroup", ""},
+		{"unconfirmed", "unconfirmed", "unconfirmed_logging", ""},
+		{"not_reproduced", "not_reproduced", "operations_not_reproduced", ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &liveProbeRunner{operationsMode: test.mode}
+			outcome := liveRunOperationsSplit(context.Background(), testProbeConfig(runner))
+			if outcome.status != test.want || len(outcome.attempts) > liveProbeOperationsMaximum || outcome.cleanup != "removed" || runner.concurrent {
+				t.Fatalf("outcome=%+v", outcome)
+			}
+			if test.sequence != "" && liveProbeAttemptNames(outcome.attempts) != test.sequence {
+				t.Fatalf("sequence=%q", liveProbeAttemptNames(outcome.attempts))
+			}
+		})
+	}
+}
+
+func liveProbeAttemptNames(attempts []liveProbeAttempt) string {
+	names := make([]string, 0, len(attempts))
+	for _, attempt := range attempts {
+		names = append(names, attempt.name)
+	}
+	return strings.Join(names, ",")
+}
+
+func TestLiveOperationsSplitStopsOnCleanupUncertainty(t *testing.T) {
+	runner := &liveProbeRunner{operationsMode: "logging", drift: "name"}
+	outcome := liveRunOperationsSplit(context.Background(), testProbeConfig(runner))
+	if outcome.status != "aborted" || len(outcome.attempts) != 1 || runner.removes != 0 {
+		t.Fatalf("outcome=%+v removes=%d", outcome, runner.removes)
 	}
 }
 func TestLiveProbeRecoveryAndCleanupSafety(t *testing.T) {
@@ -557,12 +760,12 @@ func TestLiveProbeDiagnosticRedacts(t *testing.T) {
 }
 
 type liveProbeRunner struct {
-	passWhenMissing, name, nonce, group, drift                                                                       string
-	names                                                                                                            []string
-	active, hasPass, createErr, createTruncated, badAttest, truncated, attestErr, removeErr, absence, startTruncated bool
-	startErr                                                                                                         error
-	creates, removes, starts, attests                                                                                int
-	running, concurrent                                                                                              bool
+	passWhenMissing, name, nonce, group, drift, operationsMode                                                                              string
+	names                                                                                                                                   []string
+	active, hasPass, hasLogging, hasHealth, createErr, createTruncated, badAttest, truncated, attestErr, removeErr, absence, startTruncated bool
+	startErr                                                                                                                                error
+	creates, removes, starts, attests                                                                                                       int
+	running, concurrent                                                                                                                     bool
 }
 
 func (r *liveProbeRunner) Run(ctx context.Context, q runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -581,6 +784,8 @@ func (r *liveProbeRunner) Run(ctx context.Context, q runtimeprocess.CommandReque
 		r.names = append(r.names, r.name)
 		r.active = true
 		r.hasPass = hasArgs(q.Args, r.passWhenMissing)
+		r.hasLogging = hasArgs(q.Args, "--log-driver")
+		r.hasHealth = hasArgs(q.Args, "--health-cmd")
 		for i := 0; i+1 < len(q.Args); i++ {
 			if q.Args[i] == "--label" {
 				if strings.HasPrefix(q.Args[i+1], "io.rig.probe.session=") {
@@ -604,6 +809,9 @@ func (r *liveProbeRunner) Run(ctx context.Context, q runtimeprocess.CommandReque
 		}
 		if r.startErr != nil {
 			return runtimeprocess.CommandResult{}, r.startErr
+		}
+		if r.operationsFailure() {
+			return runtimeprocess.CommandResult{}, errLiveProbe
 		}
 		if r.hasPass {
 			return runtimeprocess.CommandResult{}, errLiveProbe
@@ -653,4 +861,31 @@ func (r *liveProbeRunner) Run(ctx context.Context, q runtimeprocess.CommandReque
 		return runtimeprocess.CommandResult{}, nil
 	}
 	return runtimeprocess.CommandResult{}, errLiveProbe
+}
+
+func (r *liveProbeRunner) operationsFailure() bool {
+	switch r.operationsMode {
+	case "logging":
+		return r.hasLogging
+	case "health":
+		return r.hasHealth
+	case "both":
+		return r.hasLogging && r.hasHealth
+	case "neither":
+		return r.hasLogging || r.hasHealth
+	case "unconfirmed":
+		return r.hasLogging || r.group == "confirm_logging"
+	case "not_reproduced":
+		return true
+	case "both_logging":
+		return (r.hasLogging && r.hasHealth) || r.group == "confirm_health"
+	case "both_health":
+		return (r.hasLogging && r.hasHealth) || r.group == "confirm_logging"
+	case "both_neither":
+		return (r.hasLogging && r.hasHealth) || r.group == "confirm_logging" || r.group == "confirm_health"
+	case "both_confirm_all_nonfail":
+		return r.hasLogging && r.hasHealth && r.group != "confirm_all_options"
+	default:
+		return false
+	}
 }
