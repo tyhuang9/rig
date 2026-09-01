@@ -174,6 +174,7 @@ export function AutoDeployPanel({
   const inFlight = useRef(new Set<string>());
   const reloadInFlight = useRef(new Set<string>());
   const lastAnnouncedSignature = useRef("");
+  const resumeFocusOrigin = useRef<{ appId: string; element: HTMLButtonElement } | null>(null);
   const currentAppId = useRef(appId);
   currentAppId.current = appId;
   const [message, setMessage] = useState("");
@@ -286,11 +287,19 @@ export function AutoDeployPanel({
     ),
     onSettled: (_, __, variables) => {
       setAppPending(variables.appId, false);
+      const origin = resumeFocusOrigin.current;
+      if (origin?.appId === variables.appId) {
+        window.setTimeout(() => {
+          if (currentAppId.current === variables.appId && !origin.element.isConnected) headingRef.current?.focus();
+        }, 0);
+        resumeFocusOrigin.current = null;
+      }
     },
   });
   useEffect(() => {
     setMessage("");
     lastAnnouncedSignature.current = "";
+    resumeFocusOrigin.current = null;
     update.reset();
     resume.reset();
   }, [appId]);
@@ -367,10 +376,14 @@ export function AutoDeployPanel({
     setAppPending(appId, true);
     update.mutate({ appId, expectedRevision: status.revision, enabled });
   };
-  const performResume = () => {
+  const performResume = (activatedElement: HTMLButtonElement) => {
     if (!statusValid || activeForThisApp() || !canResume) return;
     setAppPending(appId, true);
+    resumeFocusOrigin.current = { appId, element: activatedElement };
     resume.mutate({ appId, expectedRevision: status.revision });
+  };
+  const focusFragmentTarget = (targetId: string) => {
+    window.setTimeout(() => document.getElementById(targetId)?.focus(), 0);
   };
   const reloadStatus = async (activatedElement: HTMLButtonElement) => {
     const targetAppId = appId;
@@ -442,10 +455,10 @@ export function AutoDeployPanel({
         {!status.enabled && <><button className="button primary" type="button" onClick={() => performUpdate(true)} disabled={!canEnable} aria-describedby={canEnable ? undefined : "auto-deploy-enable-reason"}>{update.isPending && activeUpdate ? "Enabling…" : "Enable"}</button><span id="auto-deploy-enable-reason" className="auto-deploy-disabled-reason">{canEnable ? "" : enableReason}</span></>}
         {status.enabled && <button className="button" type="button" onClick={() => performUpdate(false)} disabled={!canDisable} aria-describedby={canDisable ? undefined : "auto-deploy-disable-reason"}>{update.isPending && activeUpdate ? "Turning off…" : "Turn off"}</button>}
         {status.enabled && !canDisable && <span id="auto-deploy-disable-reason" className="auto-deploy-disabled-reason">{!knownState ? unknownStateReason : manualReloadRequired ? "Reload status successfully before changing auto-deploy." : busyReason || "Auto-deploy is being updated."}</span>}
-        {resumeMeaningful && <button className="button" type="button" onClick={performResume} disabled={!canResume} aria-describedby={canResume ? undefined : "auto-deploy-resume-reason"}>{resume.isPending && activeResume ? "Resuming…" : "Resume"}</button>}
+        {resumeMeaningful && <button className="button" type="button" onClick={(event) => performResume(event.currentTarget)} disabled={!canResume} aria-describedby={canResume ? undefined : "auto-deploy-resume-reason"}>{resume.isPending && activeResume ? "Resuming…" : "Resume"}</button>}
         {resumeMeaningful && !canResume && <span id="auto-deploy-resume-reason" className="auto-deploy-disabled-reason">{manualReloadRequired ? "Reload status successfully before resuming auto-deploy." : sourceAccessResumeReason || "Auto-deploy is being updated."}</span>}
-        {status.state === "paused" && status.pauseCode === "deployment_plan_review_required" && <a className="button small" href="#application-plan-title">Review deployment setup</a>}
-        {status.state === "paused" && jobResumePauseCodes.has(status.pauseCode ?? "") && <a className="button small" href="#deployment-history-title">Review waiting deployment</a>}
+        {status.state === "paused" && status.pauseCode === "deployment_plan_review_required" && <a className="button small" href="#application-plan-title" onClick={() => focusFragmentTarget("application-plan-title")}>Review deployment setup</a>}
+        {status.state === "paused" && jobResumePauseCodes.has(status.pauseCode ?? "") && <a className="button small" href="#deployment-history-title" onClick={() => focusFragmentTarget("deployment-history-title")}>Review waiting deployment</a>}
         {sourceAccessPause && sourceAccessResumeReason && <button className="button small" type="button" onClick={(event) => void refreshSourceAccessRecovery(event.currentTarget)}>Retry connection check</button>}
       </div>
       <dl className="auto-deploy-diagnostics" aria-label="Auto-deploy diagnostics">

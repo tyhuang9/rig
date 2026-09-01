@@ -355,27 +355,47 @@ describe("AutoDeployPanel", () => {
   });
 
   it("routes plan-review pauses to the deployment setup panel", async () => {
+    const target = document.createElement("h2");
+    target.id = "application-plan-title";
+    target.tabIndex = -1;
+    document.body.append(target);
     mockData({ enabled: true, state: "paused", pauseCode: "deployment_plan_review_required" });
     renderPanel();
     const action = await screen.findByRole("link", { name: "Review deployment setup" });
     expect(action.getAttribute("href")).toBe("#application-plan-title");
+    fireEvent.click(action);
+    await waitFor(() => expect(document.activeElement).toBe(target));
+    target.remove();
   });
 
   it.each(["approval_required", "migration_approval_required", "insufficient_replacement_capacity"])("routes active-job pause %s to deployment history", async (pauseCode) => {
+    const target = document.createElement("h2");
+    target.id = "deployment-history-title";
+    target.tabIndex = -1;
+    document.body.append(target);
     mockData({ enabled: true, state: "paused", pauseCode, activeJobId: "job-1" });
     renderPanel();
     const action = await screen.findByRole("link", { name: "Review waiting deployment" });
     expect(action.getAttribute("href")).toBe("#deployment-history-title");
+    fireEvent.click(action);
+    await waitFor(() => expect(document.activeElement).toBe(target));
     expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    target.remove();
   });
 
   it("resumes a known non-approval pause without requiring an active job or SHA", async () => {
-    mockData({ enabled: true, state: "paused", pauseCode: "deployment_failed", revision: 7, activeJobId: undefined, activeSha: "", pausedSha: "", latestResolvedSha: "" });
-    vi.mocked(api.resumeApplicationAutoDeploy).mockResolvedValue({ ...status, enabled: true, state: "paused", pauseCode: "deployment_failed", revision: 8, activeJobId: undefined, activeSha: "", pausedSha: "", latestResolvedSha: "" } as never);
+    const paused = { ...status, enabled: true, state: "paused", pauseCode: "deployment_failed", revision: 7, activeJobId: undefined, activeSha: "", pausedSha: "", latestResolvedSha: "" };
+    const resumed = { ...paused, state: "idle", pauseCode: undefined, revision: 8 };
+    mockData(paused);
+    vi.mocked(api.getApplicationAutoDeploy).mockResolvedValueOnce(paused as never).mockResolvedValue(resumed as never);
+    vi.mocked(api.resumeApplicationAutoDeploy).mockResolvedValue(resumed as never);
     renderPanel();
-    fireEvent.click(await screen.findByRole("button", { name: "Resume" }));
+    const resume = await screen.findByRole("button", { name: "Resume" });
+    resume.focus();
+    fireEvent.click(resume);
     await waitFor(() => expect(api.resumeApplicationAutoDeploy).toHaveBeenCalledWith(appId, { expectedRevision: 7 }));
     expect(screen.getByText("Auto-deploy resumed.")).not.toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Auto-deploy" })));
   });
 
   it("holds source-access-lost resume until the matching connection is connected and the source is subscribed", async () => {
