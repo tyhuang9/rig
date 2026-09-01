@@ -33,6 +33,9 @@ func (s *Server) getApplicationDeploymentPlan(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) acceptApplicationDeploymentPlan(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdministrator(w, r, operationAcceptDeploymentPlan, "deployment_plan_forbidden", "Administrator access is required") {
+		return
+	}
 	if s.DeploymentPlans == nil || s.Apps == nil {
 		problem(w, r, http.StatusInternalServerError, "internal_error", "Deployment plan storage is unavailable", nil)
 		return
@@ -80,6 +83,9 @@ func (s *Server) acceptApplicationDeploymentPlan(w http.ResponseWriter, r *http.
 }
 
 func (s *Server) approveApplicationDeploymentPlanMigration(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdministrator(w, r, operationApproveDeploymentMigration, "deployment_plan_forbidden", "Administrator access is required") {
+		return
+	}
 	if s.DeploymentPlans == nil {
 		problem(w, r, http.StatusInternalServerError, "internal_error", "Deployment plan storage is unavailable", nil)
 		return

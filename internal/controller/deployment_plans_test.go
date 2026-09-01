@@ -23,7 +23,7 @@ import (
 )
 
 func TestDeploymentPlanAPIAnalyzesAcceptsAndRejectsStaleState(t *testing.T) {
-	handler, session, app, source := deploymentPlanAPIFixture(t, map[string]string{
+	handler, session, _, app, source := deploymentPlanAPIFixture(t, map[string]string{
 		"package.json":      `{"packageManager":"npm@11","scripts":{"build":"vite build"},"dependencies":{"vite":"6"}}`,
 		"package-lock.json": `{"lockfileVersion":3}`,
 	})
@@ -83,7 +83,7 @@ func TestDeploymentPlanAPIAnalyzesAcceptsAndRejectsStaleState(t *testing.T) {
 }
 
 func TestDeploymentPlanMigrationApprovalIsSeparateAndCASProtected(t *testing.T) {
-	handler, session, app, source := deploymentPlanAPIFixture(t, map[string]string{
+	handler, session, _, app, source := deploymentPlanAPIFixture(t, map[string]string{
 		"package.json": `{
 			"packageManager":"npm@11","scripts":{"build":"tsc","start":"node dist/index.js"},
 			"dependencies":{"express":"5","prisma":"6"}
@@ -131,7 +131,26 @@ func TestDeploymentPlanMigrationApprovalIsSeparateAndCASProtected(t *testing.T) 
 	}
 }
 
-func deploymentPlanAPIFixture(t *testing.T, files map[string]string) (http.Handler, auth.Session, apps.Application, string) {
+func TestDeploymentPlanMutationsRequireAdministrator(t *testing.T) {
+	handler, admin, operator, app, _ := deploymentPlanAPIFixture(t, map[string]string{
+		"package.json":      `{"packageManager":"npm@11","scripts":{"start":"node server.js"},"dependencies":{"express":"5"}}`,
+		"package-lock.json": `{"lockfileVersion":3}`,
+	})
+	denied := rawAuthenticatedJSONRequest(t, handler, operator, http.MethodPut, "/api/v1/apps/"+app.ID+"/deployment-plan", apicontract.AcceptDeploymentPlanRequest{})
+	if denied.Code != http.StatusForbidden || !jsonProblemCode(denied.Body.Bytes(), "deployment_plan_forbidden") || denied.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("operator acceptance=%d %s headers=%v", denied.Code, denied.Body.String(), denied.Header())
+	}
+	current := rawAuthenticatedJSONRequest(t, handler, admin, http.MethodGet, "/api/v1/apps/"+app.ID+"/deployment-plan", nil)
+	if current.Code != http.StatusNotFound || !jsonProblemCode(current.Body.Bytes(), "deployment_plan_not_found") {
+		t.Fatalf("operator acceptance changed the plan head: %d %s", current.Code, current.Body.String())
+	}
+	migrationDenied := rawAuthenticatedJSONRequest(t, handler, operator, http.MethodPost, "/api/v1/apps/"+app.ID+"/deployment-plan/migration-approval", apicontract.ApproveDeploymentPlanMigrationRequest{})
+	if migrationDenied.Code != http.StatusForbidden || !jsonProblemCode(migrationDenied.Body.Bytes(), "deployment_plan_forbidden") || migrationDenied.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("operator migration approval=%d %s headers=%v", migrationDenied.Code, migrationDenied.Body.String(), migrationDenied.Header())
+	}
+}
+
+func deploymentPlanAPIFixture(t *testing.T, files map[string]string) (http.Handler, auth.Session, auth.Session, apps.Application, string) {
 	t.Helper()
 	root := t.TempDir()
 	stateRoot := filepath.Join(root, "state")
@@ -147,6 +166,15 @@ func deploymentPlanAPIFixture(t *testing.T, files map[string]string) (http.Handl
 	authService := auth.New(db)
 	token, _ := authService.EnsureBootstrapToken()
 	_, session, err := authService.Bootstrap(token, "admin", "a sufficiently long local passphrase")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const operatorID = "99999999-9999-4999-8999-999999999999"
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,role,created_at,updated_at)
+		SELECT ?, 'operator', passphrase_hash, 'operator', datetime('now'), datetime('now') FROM users WHERE username='admin'`, operatorID); err != nil {
+		t.Fatal(err)
+	}
+	operatorSession, err := authService.NewSession(operatorID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +195,7 @@ func deploymentPlanAPIFixture(t *testing.T, files map[string]string) (http.Handl
 		Auth: authService, Apps: appStore, Jobs: jobs.New(db), Machines: machineStore, DeploymentPlans: planStore,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}).Handler()
-	return handler, session, app, sourceRoot
+	return handler, session, operatorSession, app, sourceRoot
 }
 
 func inspectLocalProject(t *testing.T, handler http.Handler, session auth.Session, source string) apicontract.InspectResponse {

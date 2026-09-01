@@ -21,6 +21,7 @@ x-rig-problem-codes:
   deployment_plan_not_found: {description: No accepted deployment plan exists for the application, statuses: [404]}
   invalid_deployment_plan: {description: One or more deployment plan fields are invalid, statuses: [422]}
   migration_approval_conflict: {description: The migration approval changed while this request was being reviewed, statuses: [409]}
+  deployment_plan_forbidden: {description: Administrator access is required to accept a deployment plan or approve its migration, statuses: [403]}
   relay_unavailable: {description: The configured controller relay is unavailable, statuses: [503]}
 x-job-responses: &jobResponses
   '200': {description: Existing idempotent job, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
@@ -124,7 +125,7 @@ paths:
         default: {$ref: '#/components/responses/Problem'}
     put:
       operationId: acceptApplicationDeploymentPlan
-      x-rig-problem-codes: [authentication_required, source_access_lost, provider_unavailable, invalid_source, source_too_large, deployment_plan_conflict, deployment_plan_review_required, invalid_deployment_plan]
+      x-rig-problem-codes: [authentication_required, source_access_lost, provider_unavailable, invalid_source, source_too_large, deployment_plan_conflict, deployment_plan_review_required, invalid_deployment_plan, deployment_plan_forbidden]
       security: [{sessionCookie: [], csrfHeader: []}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AcceptDeploymentPlanRequest'}}}}
       responses:
@@ -134,7 +135,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/AppId'}]
     post:
       operationId: approveApplicationDeploymentPlanMigration
-      x-rig-problem-codes: [deployment_plan_not_found, deployment_plan_conflict, migration_approval_conflict, invalid_deployment_plan]
+      x-rig-problem-codes: [deployment_plan_not_found, deployment_plan_conflict, migration_approval_conflict, invalid_deployment_plan, deployment_plan_forbidden]
       security: [{sessionCookie: [], csrfHeader: []}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ApproveDeploymentPlanMigrationRequest'}}}}
       responses:
