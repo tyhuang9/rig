@@ -57,6 +57,7 @@ type liveCreateObservation struct {
 	hardening       liveCreateHardening
 	realization     liveCreateRealization
 	startReason     liveStartReason
+	createTaskMarks uint32
 }
 
 type liveCreateHardening struct {
@@ -84,6 +85,29 @@ const (
 )
 
 type liveStartReason string
+
+const (
+	liveCreateTaskMarkOuter uint32 = 1 << iota
+	liveCreateTaskMarkShimStart
+	liveCreateTaskMarkRuntimePath
+	liveCreateTaskMarkShimLaunch
+	liveCreateTaskMarkShimLogPipe
+	liveCreateTaskMarkBootstrapWrite
+	liveCreateTaskMarkTaskAdd
+	liveCreateTaskMarkShimTaskCreate
+	liveCreateTaskMarkShimIO
+	liveCreateTaskMarkOCICreate
+	liveCreateTaskMarkOCIErrorUnavailable
+	liveCreateTaskMarkRunCCreate
+	liveCreateTaskMarkRunCParent
+	liveCreateTaskMarkRunCProcess
+	liveCreateTaskMarkExecFIFO
+	liveCreateTaskMarkContainerInit
+	liveCreateTaskMarkExecFormat
+	liveCreateTaskMarkFileExists
+	liveCreateTaskMarkConnectionRefused
+	liveCreateTaskMarkPIDPipeEOF
+)
 
 const (
 	liveStartNone                  liveStartReason = "none"
@@ -365,8 +389,23 @@ func (observer *liveCreateObserver) observeStartResult(ctx context.Context, resu
 	if !observer.awaitingStart {
 		return
 	}
-	observer.latest.startReason = classifyLiveStartResult(ctx, result, err)
+	reason := classifyLiveStartResult(ctx, result, err)
+	observer.latest.startReason = reason
+	if liveStartReasonAllowsCreateTaskMarkers(reason) {
+		observer.latest.createTaskMarks = liveCreateTaskMarkers(result)
+	} else {
+		observer.latest.createTaskMarks = 0
+	}
 	observer.awaitingStart = false
+}
+
+func liveStartReasonAllowsCreateTaskMarkers(reason liveStartReason) bool {
+	switch reason {
+	case liveStartNone, liveStartCancelled, liveStartTimeout, liveStartProcessTermination, liveStartOutputTruncated:
+		return false
+	default:
+		return true
+	}
 }
 
 func classifyLiveStartResult(ctx context.Context, result runtimeprocess.CommandResult, err error) liveStartReason {
@@ -523,6 +562,85 @@ func lowerASCII(value byte) byte {
 	return value
 }
 
+func liveCreateTaskMarkers(result runtimeprocess.CommandResult) uint32 {
+	return liveCreateTaskMarkersInStream(result.Stdout) | liveCreateTaskMarkersInStream(result.Stderr)
+}
+
+func liveCreateTaskMarkersInStream(value []byte) uint32 {
+	if !containsASCIIInsensitive(value, "failed to create task for container") {
+		return 0
+	}
+	markers := liveCreateTaskMarkOuter
+	if containsAllASCIIInsensitive(value, "failed to start shim", "start failed") {
+		markers |= liveCreateTaskMarkShimLaunch
+	}
+	for _, marker := range []struct {
+		value   uint32
+		pattern string
+	}{
+		{value: liveCreateTaskMarkShimStart, pattern: "failed to start shim"},
+		{value: liveCreateTaskMarkRuntimePath, pattern: "failed to resolve runtime path"},
+		{value: liveCreateTaskMarkShimLogPipe, pattern: "open shim log pipe"},
+		{value: liveCreateTaskMarkBootstrapWrite, pattern: "failed to write bootstrap.json"},
+		{value: liveCreateTaskMarkTaskAdd, pattern: "failed to add task"},
+		{value: liveCreateTaskMarkShimTaskCreate, pattern: "failed to create shim task"},
+		{value: liveCreateTaskMarkShimIO, pattern: "failed to create init process i/o"},
+		{value: liveCreateTaskMarkOCICreate, pattern: "oci runtime create failed"},
+		{value: liveCreateTaskMarkOCIErrorUnavailable, pattern: "unable to retrieve oci runtime error"},
+		{value: liveCreateTaskMarkRunCCreate, pattern: "runc create failed"},
+		{value: liveCreateTaskMarkRunCParent, pattern: "unable to create new parent process"},
+		{value: liveCreateTaskMarkRunCProcess, pattern: "unable to start container process"},
+		{value: liveCreateTaskMarkExecFIFO, pattern: "unable to setup exec fifo"},
+		{value: liveCreateTaskMarkContainerInit, pattern: "error during container init"},
+		{value: liveCreateTaskMarkExecFormat, pattern: "exec format error"},
+		{value: liveCreateTaskMarkFileExists, pattern: "file exists"},
+		{value: liveCreateTaskMarkConnectionRefused, pattern: "connection refused"},
+		{value: liveCreateTaskMarkPIDPipeEOF, pattern: "pipe: eof"},
+	} {
+		if containsASCIIInsensitive(value, marker.pattern) {
+			markers |= marker.value
+		}
+	}
+	return markers
+}
+
+func liveCreateTaskMarkerNames(markers uint32) string {
+	var names []string
+	for _, marker := range []struct {
+		value uint32
+		name  string
+	}{
+		{value: liveCreateTaskMarkOuter, name: "create_task_outer"},
+		{value: liveCreateTaskMarkShimStart, name: "shim_start"},
+		{value: liveCreateTaskMarkRuntimePath, name: "runtime_path"},
+		{value: liveCreateTaskMarkShimLaunch, name: "shim_launch"},
+		{value: liveCreateTaskMarkShimLogPipe, name: "shim_log_pipe"},
+		{value: liveCreateTaskMarkBootstrapWrite, name: "bootstrap_write"},
+		{value: liveCreateTaskMarkTaskAdd, name: "task_add"},
+		{value: liveCreateTaskMarkShimTaskCreate, name: "shim_task_create"},
+		{value: liveCreateTaskMarkShimIO, name: "shim_io"},
+		{value: liveCreateTaskMarkOCICreate, name: "oci_create"},
+		{value: liveCreateTaskMarkOCIErrorUnavailable, name: "oci_error_unavailable"},
+		{value: liveCreateTaskMarkRunCCreate, name: "runc_create"},
+		{value: liveCreateTaskMarkRunCParent, name: "runc_parent"},
+		{value: liveCreateTaskMarkRunCProcess, name: "runc_process"},
+		{value: liveCreateTaskMarkExecFIFO, name: "exec_fifo"},
+		{value: liveCreateTaskMarkContainerInit, name: "container_init"},
+		{value: liveCreateTaskMarkExecFormat, name: "exec_format"},
+		{value: liveCreateTaskMarkFileExists, name: "file_exists"},
+		{value: liveCreateTaskMarkConnectionRefused, name: "connection_refused"},
+		{value: liveCreateTaskMarkPIDPipeEOF, name: "pid_pipe_eof"},
+	} {
+		if markers&marker.value != 0 {
+			names = append(names, marker.name)
+		}
+	}
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ",")
+}
+
 func (observer *liveCreateObserver) reset() {
 	observer.mu.Lock()
 	observer.latest = liveCreateObservation{}
@@ -548,6 +666,7 @@ func (observer *liveCreateObserver) failureDiagnostic() string {
 	if startReason == "" {
 		startReason = liveStartNone
 	}
+	createTaskMarkers := liveCreateTaskMarkerNames(observation.createTaskMarks)
 	realization := "unobserved"
 	if observation.createSucceeded && reason == liveCreateInspectNone {
 		realization = "mounts_realized:" + strconv.FormatBool(observation.realization.MountsRealized) + ",network_realized:" + strconv.FormatBool(observation.realization.NetworkRealized)
@@ -556,7 +675,8 @@ func (observer *liveCreateObserver) failureDiagnostic() string {
 		" inspect_reason=" + string(reason) +
 		" hardening_mismatches=" + mismatches +
 		" realization_state=" + realization +
-		" start_reason=" + string(startReason)
+		" start_reason=" + string(startReason) +
+		" create_task_markers=" + createTaskMarkers
 }
 
 func liveCreateHardeningMismatches(hardening liveCreateHardening) []string {
@@ -683,7 +803,7 @@ func TestLiveCreateObservationDiagnosticIsRedacted(t *testing.T) {
 		},
 		realization: liveCreateRealization{NetworkRealized: true},
 	}}).failureDiagnostic()
-	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=network_mode,tmpfs,security_options realization_state=mounts_realized:false,network_realized:true start_reason=none"
+	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=network_mode,tmpfs,security_options realization_state=mounts_realized:false,network_realized:true start_reason=none create_task_markers=none"
 	if diagnostic != want {
 		t.Fatalf("redacted observation diagnostic = %q, want %q", diagnostic, want)
 	}
@@ -696,10 +816,10 @@ func TestLiveCreateObservationDiagnosticIsRedacted(t *testing.T) {
 
 func TestLiveCreateObserverResetDropsPriorAttempt(t *testing.T) {
 	observer := &liveCreateObserver{latest: liveCreateObservation{
-		createSucceeded: true, inspectReason: liveCreateInspectNone, hardening: liveCreateHardening{NetworkMode: false},
+		createSucceeded: true, inspectReason: liveCreateInspectNone, hardening: liveCreateHardening{NetworkMode: false}, startReason: liveStartCreateTaskFailed, createTaskMarks: liveCreateTaskMarkOuter,
 	}}
 	observer.reset()
-	const want = " generated_runtime_create_observed=false inspect_reason=none hardening_mismatches=none realization_state=unobserved start_reason=none"
+	const want = " generated_runtime_create_observed=false inspect_reason=none hardening_mismatches=none realization_state=unobserved start_reason=none create_task_markers=none"
 	if diagnostic := observer.failureDiagnostic(); diagnostic != want {
 		t.Fatalf("reset observation diagnostic = %q, want %q", diagnostic, want)
 	}
@@ -740,7 +860,7 @@ func TestLiveRawInspectDecodeClassifiesAndRedacts(t *testing.T) {
 		t.Fatal("raw inspect result was retained")
 	}
 	diagnostic := (&liveCreateObserver{latest: observation}).failureDiagnostic()
-	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=none realization_state=mounts_realized:true,network_realized:true start_reason=none"
+	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=none realization_state=mounts_realized:true,network_realized:true start_reason=none create_task_markers=none"
 	if diagnostic != want {
 		t.Fatalf("redacted raw inspect diagnostic = %q, want %q", diagnostic, want)
 	}
@@ -872,6 +992,104 @@ func TestLiveStartResultClassifierPrecedence(t *testing.T) {
 				t.Fatalf("start reason = %q, want %q", reason, test.want)
 			}
 		})
+	}
+}
+
+func TestLiveCreateTaskMarkersAreFixedAndRedacted(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		cause string
+		marks uint32
+		names string
+	}{
+		{name: "outer", marks: liveCreateTaskMarkOuter, names: "create_task_outer"},
+		{name: "shim start", cause: "failed to start shim", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkShimStart, names: "create_task_outer,shim_start"},
+		{name: "runtime path", cause: "failed to resolve runtime path", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkRuntimePath, names: "create_task_outer,runtime_path"},
+		{name: "shim launch", cause: "failed to start shim: start failed", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkShimStart | liveCreateTaskMarkShimLaunch, names: "create_task_outer,shim_start,shim_launch"},
+		{name: "shim log pipe", cause: "open shim log pipe", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkShimLogPipe, names: "create_task_outer,shim_log_pipe"},
+		{name: "bootstrap write", cause: "failed to write bootstrap.json", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkBootstrapWrite, names: "create_task_outer,bootstrap_write"},
+		{name: "task add", cause: "failed to add task", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkTaskAdd, names: "create_task_outer,task_add"},
+		{name: "shim task create", cause: "failed to create shim task", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkShimTaskCreate, names: "create_task_outer,shim_task_create"},
+		{name: "shim io", cause: "failed to create init process i/o", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkShimIO, names: "create_task_outer,shim_io"},
+		{name: "oci create", cause: "oci runtime create failed", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkOCICreate, names: "create_task_outer,oci_create"},
+		{name: "oci error unavailable", cause: "unable to retrieve oci runtime error", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkOCIErrorUnavailable, names: "create_task_outer,oci_error_unavailable"},
+		{name: "runc create", cause: "runc create failed", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkRunCCreate, names: "create_task_outer,runc_create"},
+		{name: "runc parent", cause: "unable to create new parent process", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkRunCParent, names: "create_task_outer,runc_parent"},
+		{name: "runc process", cause: "unable to start container process", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkRunCProcess, names: "create_task_outer,runc_process"},
+		{name: "exec fifo", cause: "unable to setup exec fifo", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkExecFIFO, names: "create_task_outer,exec_fifo"},
+		{name: "container init", cause: "error during container init", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkContainerInit, names: "create_task_outer,container_init"},
+		{name: "exec format", cause: "exec format error", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkExecFormat, names: "create_task_outer,exec_format"},
+		{name: "file exists", cause: "file exists", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkFileExists, names: "create_task_outer,file_exists"},
+		{name: "connection refused", cause: "connection refused", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkConnectionRefused, names: "create_task_outer,connection_refused"},
+		{name: "pid pipe eof", cause: "pipe: eof", marks: liveCreateTaskMarkOuter | liveCreateTaskMarkPIDPipeEOF, names: "create_task_outer,pid_pipe_eof"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output := []byte("failed to create task for container: " + test.cause + ": sensitive-create-task-output")
+			marks := liveCreateTaskMarkers(runtimeprocess.CommandResult{Stderr: output})
+			if marks != test.marks {
+				t.Fatalf("create-task markers = %#x, want %#x", marks, test.marks)
+			}
+			if names := liveCreateTaskMarkerNames(marks); names != test.names {
+				t.Fatalf("create-task marker names = %q, want %q", names, test.names)
+			}
+			diagnostic := (&liveCreateObserver{latest: liveCreateObservation{createSucceeded: true, inspectReason: liveCreateInspectNone, startReason: liveStartCreateTaskFailed, createTaskMarks: marks}}).failureDiagnostic()
+			if !strings.Contains(diagnostic, "create_task_markers="+test.names) {
+				t.Fatal("create-task diagnostic did not report its fixed markers")
+			}
+			if strings.Contains(diagnostic, "sensitive-create-task-output") || (test.cause != "" && strings.Contains(diagnostic, test.cause)) {
+				t.Fatal("create-task diagnostic exposed start output")
+			}
+		})
+	}
+}
+
+func TestLiveCreateTaskMarkersStayWithinOneStreamAndCanonicalOrder(t *testing.T) {
+	outer := []byte("failed to create task for container: failed to resolve runtime path: sensitive-create-task-output")
+	separateCause := []byte("runc create failed: sensitive-create-task-output")
+	if marks := liveCreateTaskMarkers(runtimeprocess.CommandResult{Stdout: outer, Stderr: separateCause}); marks != liveCreateTaskMarkOuter|liveCreateTaskMarkRuntimePath {
+		t.Fatalf("cross-stream markers = %#x, want only stdout markers", marks)
+	}
+	if marks := liveCreateTaskMarkers(runtimeprocess.CommandResult{
+		Stdout: []byte("failed to create task for container: pipe: eof: sensitive-create-task-output"),
+		Stderr: []byte("failed to create task for container: runc create failed: sensitive-create-task-output"),
+	}); liveCreateTaskMarkerNames(marks) != "create_task_outer,runc_create,pid_pipe_eof" {
+		t.Fatalf("canonical marker names = %q", liveCreateTaskMarkerNames(marks))
+	}
+	if marks := liveCreateTaskMarkers(runtimeprocess.CommandResult{Stderr: separateCause}); marks != 0 {
+		t.Fatalf("marker without outer create-task phrase = %#x, want 0", marks)
+	}
+}
+
+func TestLiveCreateTaskMarkersRequireShimLaunchContext(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		output string
+		want   uint32
+	}{
+		{name: "oci runtime start is not shim launch", output: "failed to create task for container: OCI runtime start failed: sensitive-create-task-output", want: liveCreateTaskMarkOuter},
+		{name: "shim source chain is shim launch", output: "failed to create task for container: failed to start shim: start failed: sensitive-create-task-output", want: liveCreateTaskMarkOuter | liveCreateTaskMarkShimStart | liveCreateTaskMarkShimLaunch},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if marks := liveCreateTaskMarkers(runtimeprocess.CommandResult{Stderr: []byte(test.output)}); marks != test.want {
+				t.Fatalf("create-task markers = %#x, want %#x", marks, test.want)
+			}
+		})
+	}
+}
+
+func TestLiveCreateTaskMarkersAreClearedForControlAndTruncation(t *testing.T) {
+	observer := &liveCreateObserver{awaitingStart: true, latest: liveCreateObservation{createSucceeded: true, inspectReason: liveCreateInspectNone}}
+	observer.observeStartResult(context.Background(), runtimeprocess.CommandResult{
+		Stderr:          []byte("failed to create task for container: oci runtime create failed: sensitive-create-task-output"),
+		StderrTruncated: true,
+	}, errors.New("command exited"))
+	if observer.latest.startReason != liveStartOutputTruncated || observer.latest.createTaskMarks != 0 {
+		t.Fatal("truncated start retained create-task markers")
+	}
+	observer.awaitingStart = true
+	observer.observeStartResult(context.Background(), runtimeprocess.CommandResult{Stderr: []byte("failed to create task for container: oci runtime create failed: sensitive-create-task-output")}, nil)
+	if observer.latest.startReason != liveStartNone || observer.latest.createTaskMarks != 0 {
+		t.Fatal("successful start retained create-task markers")
 	}
 }
 
