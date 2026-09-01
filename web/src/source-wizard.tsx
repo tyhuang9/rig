@@ -240,7 +240,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     priorStage.current = stage;
     if (previous === stage) return;
     window.setTimeout(() => {
-      if (stage === "source") sourceHeading.current?.focus();
+      if (stage === "source") (formError ? errorSummary.current : sourceHeading.current)?.focus();
       if (stage === "ready") readyHeading.current?.focus();
     }, 0);
   }, [stage]);

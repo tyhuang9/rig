@@ -253,6 +253,20 @@ describe("SourceWizard", () => {
     expect(onCreated).toHaveBeenCalledWith("app-1");
   });
 
+  it("returns focus to application validation when plan acceptance is missing required details", async () => {
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection());
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
+
+    await screen.findByRole("heading", { name: /how rig will run this app/i });
+    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+
+    const summary = await screen.findByText("Check the highlighted fields.");
+    await waitFor(() => expect(document.activeElement).toBe(summary));
+    expect(screen.getByLabelText(/application name/i).getAttribute("aria-invalid")).toBe("true");
+  });
+
   it("reuses its draft application when plan acceptance must be retried", async () => {
     vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection());
     vi.mocked(api.acceptDeploymentPlan)
