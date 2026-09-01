@@ -1,7 +1,9 @@
 package generatedingress
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strconv"
@@ -21,6 +23,41 @@ const (
 	liveIngressSnapshotMissing      liveIngressSnapshotStatus = "missing"
 	liveIngressSnapshotError        liveIngressSnapshotStatus = "error"
 )
+
+const (
+	liveCaddyStartupInspectFormat = `{"id":{{json .ID}},"name":{{json .Name}},"labels":{{json .Config.Labels}},"running":{{json .State.Running}},"restarting":{{json .State.Restarting}},"exitCode":{{json .State.ExitCode}},"error":{{json .State.Error}}}`
+	liveCaddyStartupOutputLimit   = 16 << 10
+)
+
+type liveCaddyStartupInspection struct {
+	ID         string            `json:"id"`
+	Name       string            `json:"name"`
+	Labels     map[string]string `json:"labels"`
+	Running    bool              `json:"running"`
+	Restarting bool              `json:"restarting"`
+	ExitCode   int               `json:"exitCode"`
+	Error      json.RawMessage   `json:"error"`
+}
+
+type liveCaddyStartupDiagnostic struct {
+	Status        string
+	Exit          string
+	StateMarkers  string
+	StdoutMarkers string
+	StderrMarkers string
+}
+
+func (value liveCaddyStartupDiagnostic) String() string {
+	return "caddy_startup_status:" + value.Status +
+		",caddy_exit:" + value.Exit +
+		",caddy_state_markers:" + value.StateMarkers +
+		",caddy_stdout_markers:" + value.StdoutMarkers +
+		",caddy_stderr_markers:" + value.StderrMarkers
+}
+
+func liveCaddyStartupNotAttempted() liveCaddyStartupDiagnostic {
+	return liveCaddyStartupDiagnostic{Status: "not_attempted", Exit: "unobserved", StateMarkers: "unobserved", StdoutMarkers: "unobserved", StderrMarkers: "unobserved"}
+}
 
 const (
 	liveCaddyMismatchIdentity uint64 = 1 << iota
@@ -45,8 +82,9 @@ func liveIngressFailureDiagnostic(ctx context.Context, manager *Manager) string 
 }
 
 func liveIngressFailureDiagnosticWithin(ctx context.Context, manager *Manager, timeout time.Duration) string {
+	startup := liveCaddyStartupNotAttempted()
 	if manager == nil || ctx == nil || ctx.Err() != nil || timeout <= 0 {
-		return "ingress_snapshot=image:not_attempted,volume:not_attempted,network:not_attempted,caddy:not_attempted,caddy_running:unobserved,caddy_mismatches=unobserved"
+		return "ingress_snapshot=image:not_attempted,volume:not_attempted,network:not_attempted,caddy:not_attempted,caddy_running:unobserved,caddy_mismatches=unobserved," + startup.String()
 	}
 	diagnosticCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
@@ -101,6 +139,7 @@ func liveIngressFailureDiagnosticWithin(ctx context.Context, manager *Manager, t
 	caddyStatus := liveIngressSnapshotNotAttempted
 	caddyRunning := "unobserved"
 	caddyMismatches := "unobserved"
+	caddyID := ""
 	if diagnosticCtx.Err() == nil {
 		caddy, caddyFound, caddyErr := manager.inspectCaddy(diagnosticCtx)
 		caddyStatus = liveIngressSnapshotError
@@ -120,11 +159,18 @@ func liveIngressFailureDiagnosticWithin(ctx context.Context, manager *Manager, t
 				caddyMismatches = liveCaddyMismatchNames(mismatches)
 				if mismatches == 0 {
 					caddyStatus = liveIngressSnapshotValid
+					if imageStatus == liveIngressSnapshotValid && volumeStatus == liveIngressSnapshotValid && networkStatus == liveIngressSnapshotValid && !caddy.Running && validContainerID(caddy.ID) {
+						caddyID = caddy.ID
+					}
 				}
 			}
 		}
 		clearLiveCaddyInspection(&caddy)
 	}
+	if caddyStatus == liveIngressSnapshotValid && caddyRunning == "false" && caddyID != "" && diagnosticCtx.Err() == nil {
+		startup = liveCaddyStartupExitDiagnostic(diagnosticCtx, manager, caddyID)
+	}
+	caddyID = ""
 	imageID = ""
 
 	return "ingress_snapshot=image:" + string(imageStatus) +
@@ -132,7 +178,168 @@ func liveIngressFailureDiagnosticWithin(ctx context.Context, manager *Manager, t
 		",network:" + string(networkStatus) +
 		",caddy:" + string(caddyStatus) +
 		",caddy_running:" + caddyRunning +
-		",caddy_mismatches=" + caddyMismatches
+		",caddy_mismatches=" + caddyMismatches +
+		"," + startup.String()
+}
+
+func liveCaddyStartupExitDiagnostic(ctx context.Context, manager *Manager, caddyID string) liveCaddyStartupDiagnostic {
+	diagnostic := liveCaddyStartupNotAttempted()
+	if ctx == nil || manager == nil || ctx.Err() != nil || !validContainerID(caddyID) {
+		return diagnostic
+	}
+
+	stateResult, stateErr := manager.runner.Run(ctx, liveCaddyStartupRequest(ctx, manager, []string{"container", "inspect", "--format", liveCaddyStartupInspectFormat, caddyID}))
+	defer clearResult(&stateResult)
+	if status := liveCaddyStartupCommandFailure(ctx, stateErr); status != "" {
+		diagnostic.Status = status
+		return diagnostic
+	}
+	if stateResult.StdoutTruncated || stateResult.StderrTruncated {
+		diagnostic.Status = "state_truncated"
+		return diagnostic
+	}
+	var state liveCaddyStartupInspection
+	if json.Unmarshal(stateResult.Stdout, &state) != nil {
+		diagnostic.Status = "state_decode_error"
+		return diagnostic
+	}
+	defer clearLiveCaddyStartupInspection(&state)
+	diagnostic.Exit = liveCaddyExitBucket(state.ExitCode)
+	diagnostic.StateMarkers = liveCaddyStartupStateMarkers(state.Error)
+	if state.ID != caddyID || strings.TrimPrefix(state.Name, "/") != caddyContainerName || state.Labels["io.rig.managed"] != "generated-ingress" || state.Labels["io.rig.identity-version"] != "v1" || state.Labels["io.rig.listener-isolation"] != "v1" {
+		diagnostic.Status = "ownership_changed"
+		diagnostic.StdoutMarkers = "unobserved"
+		diagnostic.StderrMarkers = "unobserved"
+		return diagnostic
+	}
+	if state.Running || state.Restarting {
+		diagnostic.Status = "state_changed"
+		diagnostic.StdoutMarkers = "unobserved"
+		diagnostic.StderrMarkers = "unobserved"
+		return diagnostic
+	}
+	if status := liveCaddyStartupCommandFailure(ctx, nil); status != "" {
+		diagnostic.Status = status
+		return diagnostic
+	}
+
+	logsResult, logsErr := manager.runner.Run(ctx, liveCaddyStartupRequest(ctx, manager, []string{"container", "logs", "--tail", "64", caddyID}))
+	defer clearResult(&logsResult)
+	if status := liveCaddyStartupCommandFailure(ctx, logsErr); status != "" {
+		diagnostic.Status = status
+		return diagnostic
+	}
+	if logsResult.StdoutTruncated || logsResult.StderrTruncated {
+		diagnostic.Status = "logs_truncated"
+		return diagnostic
+	}
+	diagnostic.Status = "ok"
+	diagnostic.StdoutMarkers = liveCaddyStartupMarkers(logsResult.Stdout)
+	diagnostic.StderrMarkers = liveCaddyStartupMarkers(logsResult.Stderr)
+	return diagnostic
+}
+
+func liveCaddyStartupCommandFailure(ctx context.Context, err error) string {
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, runtimeprocess.ErrTerminationFailed) {
+		return "termination_failed"
+	}
+	if err != nil {
+		return "command_error"
+	}
+	return ""
+}
+
+func liveCaddyStartupRequest(ctx context.Context, manager *Manager, args []string) runtimeprocess.CommandRequest {
+	timeout := manager.options.CommandTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining < timeout {
+			timeout = remaining
+		}
+	}
+	if timeout <= 0 {
+		timeout = time.Nanosecond
+	}
+	return runtimeprocess.CommandRequest{
+		Executable: manager.options.DockerExecutable,
+		Args:       append([]string(nil), args...), Directory: manager.options.WorkingDirectory,
+		Env: append([]string(nil), manager.dockerEnv...), Timeout: timeout, OutputLimit: liveCaddyStartupOutputLimit,
+	}
+}
+
+func liveCaddyExitBucket(exitCode int) string {
+	switch exitCode {
+	case 0:
+		return "zero"
+	case 1:
+		return "one"
+	default:
+		return "other"
+	}
+}
+
+func liveCaddyStartupMarkers(value []byte) string {
+	if len(bytes.TrimSpace(value)) == 0 {
+		return "none"
+	}
+	lower := bytes.ToLower(value)
+	defer clear(lower)
+	markers := []struct {
+		name     string
+		patterns [][]byte
+	}{
+		{"unknown_command", [][]byte{[]byte("unknown command")}},
+		{"address_in_use", [][]byte{[]byte("address already in use")}},
+		{"config_missing", [][]byte{[]byte("no such file or directory"), []byte("config file does not exist")}},
+		{"autosave_failed", [][]byte{[]byte("unable to autosave"), []byte("autosave failed")}},
+		{"read_only", [][]byte{[]byte("read-only file system"), []byte("read only file system")}},
+		{"permission_denied", [][]byte{[]byte("permission denied")}},
+		{"load_failed", [][]byte{[]byte("loading initial config"), []byte("loading new config"), []byte("adapting config"), []byte("cannot unmarshal"), []byte("invalid character")}},
+	}
+	found := make([]bool, len(markers))
+	for _, line := range bytes.Split(lower, []byte{'\n'}) {
+		for index, marker := range markers {
+			for _, pattern := range marker.patterns {
+				if bytes.Contains(line, pattern) {
+					found[index] = true
+					break
+				}
+			}
+		}
+	}
+	names := make([]string, 0, len(markers))
+	for index, marker := range markers {
+		if found[index] {
+			names = append(names, marker.name)
+		}
+	}
+	if len(names) == 0 {
+		return "other"
+	}
+	return strings.Join(names, "+")
+}
+
+func liveCaddyStartupStateMarkers(value json.RawMessage) string {
+	trimmed := bytes.TrimSpace(value)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte(`""`)) {
+		return "none"
+	}
+	return liveCaddyStartupMarkers(trimmed)
+}
+
+func clearLiveCaddyStartupInspection(value *liveCaddyStartupInspection) {
+	if value == nil {
+		return
+	}
+	clear(value.Labels)
+	clear(value.Error)
+	*value = liveCaddyStartupInspection{}
 }
 
 func liveCaddyMismatchBits(value caddyInspection, imageID string, hostPort uint16) uint64 {
@@ -293,7 +500,7 @@ func (run liveSnapshotRunnerFunc) Run(ctx context.Context, request runtimeproces
 
 func TestLiveIngressFailureDiagnosticUsesOnlyFixedStates(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	const expected = "ingress_snapshot=image:valid,volume:valid,network:valid,caddy:valid,caddy_running:true,caddy_mismatches=none"
+	expected := "ingress_snapshot=image:valid,volume:valid,network:valid,caddy:valid,caddy_running:true,caddy_mismatches=none," + liveCaddyStartupNotAttempted().String()
 	if diagnostic := liveIngressFailureDiagnostic(context.Background(), manager); diagnostic != expected {
 		t.Fatalf("diagnostic = %q", diagnostic)
 	}
@@ -356,7 +563,7 @@ func TestLiveIngressFailureDiagnosticClassifiesMissingErrorsAndTotalTimeout(t *t
 		}
 		return runtimeprocess.CommandResult{Stderr: []byte("No such " + kind + ": sensitive-canary")}, errors.New("sensitive-canary")
 	})
-	const missing = "ingress_snapshot=image:missing,volume:missing,network:missing,caddy:missing,caddy_running:unobserved,caddy_mismatches=unobserved"
+	missing := "ingress_snapshot=image:missing,volume:missing,network:missing,caddy:missing,caddy_running:unobserved,caddy_mismatches=unobserved," + liveCaddyStartupNotAttempted().String()
 	if diagnostic := liveIngressFailureDiagnosticWithin(context.Background(), manager, time.Second); diagnostic != missing {
 		t.Fatalf("missing diagnostic = %q", diagnostic)
 	}
@@ -364,7 +571,7 @@ func TestLiveIngressFailureDiagnosticClassifiesMissingErrorsAndTotalTimeout(t *t
 	manager.runner = liveSnapshotRunnerFunc(func(context.Context, runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
 		return runtimeprocess.CommandResult{}, errors.New("sensitive-canary")
 	})
-	const failed = "ingress_snapshot=image:error,volume:error,network:error,caddy:error,caddy_running:unobserved,caddy_mismatches=unobserved"
+	failed := "ingress_snapshot=image:error,volume:error,network:error,caddy:error,caddy_running:unobserved,caddy_mismatches=unobserved," + liveCaddyStartupNotAttempted().String()
 	if diagnostic := liveIngressFailureDiagnosticWithin(context.Background(), manager, time.Second); diagnostic != failed {
 		t.Fatalf("error diagnostic = %q", diagnostic)
 	}
@@ -374,7 +581,7 @@ func TestLiveIngressFailureDiagnosticClassifiesMissingErrorsAndTotalTimeout(t *t
 		return runtimeprocess.CommandResult{}, ctx.Err()
 	})
 	started := time.Now()
-	const timedOut = "ingress_snapshot=image:error,volume:not_attempted,network:not_attempted,caddy:not_attempted,caddy_running:unobserved,caddy_mismatches=unobserved"
+	timedOut := "ingress_snapshot=image:error,volume:not_attempted,network:not_attempted,caddy:not_attempted,caddy_running:unobserved,caddy_mismatches=unobserved," + liveCaddyStartupNotAttempted().String()
 	if diagnostic := liveIngressFailureDiagnosticWithin(context.Background(), manager, 20*time.Millisecond); diagnostic != timedOut {
 		t.Fatalf("timeout diagnostic = %q", diagnostic)
 	}
@@ -384,7 +591,7 @@ func TestLiveIngressFailureDiagnosticClassifiesMissingErrorsAndTotalTimeout(t *t
 
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	const notAttempted = "ingress_snapshot=image:not_attempted,volume:not_attempted,network:not_attempted,caddy:not_attempted,caddy_running:unobserved,caddy_mismatches=unobserved"
+	notAttempted := "ingress_snapshot=image:not_attempted,volume:not_attempted,network:not_attempted,caddy:not_attempted,caddy_running:unobserved,caddy_mismatches=unobserved," + liveCaddyStartupNotAttempted().String()
 	if diagnostic := liveIngressFailureDiagnosticWithin(cancelled, manager, time.Second); diagnostic != notAttempted {
 		t.Fatalf("cancelled diagnostic = %q", diagnostic)
 	}
@@ -402,7 +609,7 @@ func TestLiveIngressFailureDiagnosticSuppressesForeignAndIncompleteComparisons(t
 		}
 		return delegate.Run(ctx, request)
 	})
-	const suppressed = "ingress_snapshot=image:valid,volume:valid,network:valid,caddy:invalid,caddy_running:true,caddy_mismatches=suppressed"
+	suppressed := "ingress_snapshot=image:valid,volume:valid,network:valid,caddy:invalid,caddy_running:true,caddy_mismatches=suppressed," + liveCaddyStartupNotAttempted().String()
 	if diagnostic := liveIngressFailureDiagnosticWithin(context.Background(), manager, time.Second); diagnostic != suppressed || strings.Contains(diagnostic, "sensitive-canary") {
 		t.Fatalf("foreign diagnostic = %q", diagnostic)
 	}
@@ -416,7 +623,7 @@ func TestLiveIngressFailureDiagnosticSuppressesForeignAndIncompleteComparisons(t
 		}
 		return delegate.Run(ctx, request)
 	})
-	const incomplete = "ingress_snapshot=image:invalid,volume:valid,network:valid,caddy:invalid,caddy_running:true,caddy_mismatches=comparison_incomplete"
+	incomplete := "ingress_snapshot=image:invalid,volume:valid,network:valid,caddy:invalid,caddy_running:true,caddy_mismatches=comparison_incomplete," + liveCaddyStartupNotAttempted().String()
 	if diagnostic := liveIngressFailureDiagnosticWithin(context.Background(), manager, time.Second); diagnostic != incomplete || strings.Contains(diagnostic, "sensitive-canary") {
 		t.Fatalf("incomplete diagnostic = %q", diagnostic)
 	}
@@ -434,5 +641,176 @@ func TestLiveIngressInspectionClearHelpersZeroDecodedState(t *testing.T) {
 	clearLiveCaddyInspection(&caddy)
 	if !reflect.DeepEqual(image, imageInspection{}) || !reflect.DeepEqual(volume, volumeInspection{}) || !reflect.DeepEqual(network, networkInspection{}) || !reflect.DeepEqual(caddy, caddyInspection{}) {
 		t.Fatal("decoded inspection state was not cleared")
+	}
+}
+
+type liveCaddyStartupRunner struct {
+	delegate      runtimeprocess.CommandRunner
+	id            string
+	state         liveCaddyStartupInspection
+	stateResult   *runtimeprocess.CommandResult
+	stateErr      error
+	logsResult    runtimeprocess.CommandResult
+	logsErr       error
+	requests      []runtimeprocess.CommandRequest
+	stateRaw      []byte
+	logsStdoutRaw []byte
+	logsStderrRaw []byte
+}
+
+func (runner *liveCaddyStartupRunner) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	if reflect.DeepEqual(request.Args, []string{"container", "inspect", "--format", liveCaddyStartupInspectFormat, runner.id}) {
+		runner.requests = append(runner.requests, request)
+		if runner.stateResult != nil {
+			result := *runner.stateResult
+			runner.stateRaw = result.Stdout
+			return result, runner.stateErr
+		}
+		result := jsonResult(runner.state)
+		runner.stateRaw = result.Stdout
+		return result, runner.stateErr
+	}
+	if reflect.DeepEqual(request.Args, []string{"container", "logs", "--tail", "64", runner.id}) {
+		runner.requests = append(runner.requests, request)
+		runner.logsStdoutRaw = runner.logsResult.Stdout
+		runner.logsStderrRaw = runner.logsResult.Stderr
+		return runner.logsResult, runner.logsErr
+	}
+	return runner.delegate.Run(ctx, request)
+}
+
+func newLiveCaddyStartupRunner(t *testing.T) (*Manager, *liveCaddyStartupRunner) {
+	t.Helper()
+	manager, fixture := newManagerFixture(t, false)
+	fixture.stopped = true
+	caddy := fixture.caddyInspection()
+	runner := &liveCaddyStartupRunner{
+		delegate: manager.runner,
+		id:       caddy.ID,
+		state: liveCaddyStartupInspection{
+			ID: caddy.ID, Name: caddy.Name, Labels: map[string]string{
+				"io.rig.managed": "generated-ingress", "io.rig.identity-version": "v1", "io.rig.listener-isolation": "v1",
+			}, ExitCode: 1, Error: json.RawMessage(`""`),
+		},
+	}
+	manager.runner = runner
+	return manager, runner
+}
+
+func TestLiveCaddyStartupDiagnosticPinsIdentityAndClassifiesStreams(t *testing.T) {
+	manager, runner := newLiveCaddyStartupRunner(t)
+	runner.logsResult = runtimeprocess.CommandResult{
+		Stdout: []byte("serving initial configuration\n"),
+		Stderr: []byte("unable to autosave config: permission denied\n"),
+	}
+	diagnostic := liveIngressFailureDiagnosticWithin(context.Background(), manager, time.Second)
+	want := "ingress_snapshot=image:valid,volume:valid,network:valid,caddy:valid,caddy_running:false,caddy_mismatches=none," +
+		"caddy_startup_status:ok,caddy_exit:one,caddy_state_markers:none,caddy_stdout_markers:other,caddy_stderr_markers:autosave_failed+permission_denied"
+	if diagnostic != want || strings.Contains(diagnostic, runner.id) || strings.Contains(diagnostic, caddyContainerName) {
+		t.Fatalf("diagnostic = %q", diagnostic)
+	}
+	if len(runner.requests) != 2 {
+		t.Fatalf("startup requests = %d", len(runner.requests))
+	}
+	for _, request := range runner.requests {
+		if request.Executable != manager.options.DockerExecutable || request.Directory != manager.options.WorkingDirectory || !reflect.DeepEqual(request.Env, manager.dockerEnv) || request.OutputLimit != liveCaddyStartupOutputLimit || request.Timeout <= 0 || request.Timeout > time.Second {
+			t.Fatalf("startup request configuration = %#v", request)
+		}
+		if request.Args[len(request.Args)-1] != runner.id || containsArgument(request.Args, caddyContainerName) {
+			t.Fatalf("startup request did not pin the validated ID: %v", request.Args)
+		}
+	}
+	if !allZero(runner.stateRaw) || !allZero(runner.logsStdoutRaw) || !allZero(runner.logsStderrRaw) {
+		t.Fatal("startup diagnostic did not clear owned command buffers")
+	}
+}
+
+func TestLiveCaddyStartupDiagnosticReattestsBeforeLogs(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*liveCaddyStartupInspection)
+		want   string
+	}{
+		{"id changed", func(state *liveCaddyStartupInspection) { state.ID = strings.Repeat("e", 64) }, "ownership_changed"},
+		{"name changed", func(state *liveCaddyStartupInspection) { state.Name = "/foreign" }, "ownership_changed"},
+		{"ownership changed", func(state *liveCaddyStartupInspection) { state.Labels["io.rig.managed"] = "foreign" }, "ownership_changed"},
+		{"running", func(state *liveCaddyStartupInspection) { state.Running = true }, "state_changed"},
+		{"restarting", func(state *liveCaddyStartupInspection) { state.Restarting = true }, "state_changed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, runner := newLiveCaddyStartupRunner(t)
+			test.mutate(&runner.state)
+			diagnostic := liveCaddyStartupExitDiagnostic(context.Background(), manager, runner.id)
+			if diagnostic.Status != test.want || len(runner.requests) != 1 {
+				t.Fatalf("diagnostic = %#v, requests = %v", diagnostic, runner.requests)
+			}
+		})
+	}
+}
+
+func TestLiveCaddyStartupDiagnosticFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*liveCaddyStartupRunner)
+		ctx   func() context.Context
+		want  string
+	}{
+		{"state command", func(runner *liveCaddyStartupRunner) { runner.stateErr = errors.New("sensitive-canary") }, context.Background, "command_error"},
+		{"state termination", func(runner *liveCaddyStartupRunner) { runner.stateErr = runtimeprocess.ErrTerminationFailed }, context.Background, "termination_failed"},
+		{"state truncated", func(runner *liveCaddyStartupRunner) {
+			runner.stateResult = &runtimeprocess.CommandResult{Stdout: []byte("sensitive-canary"), StdoutTruncated: true}
+		}, context.Background, "state_truncated"},
+		{"state decode", func(runner *liveCaddyStartupRunner) {
+			runner.stateResult = &runtimeprocess.CommandResult{Stdout: []byte("sensitive-canary")}
+		}, context.Background, "state_decode_error"},
+		{"logs command", func(runner *liveCaddyStartupRunner) { runner.logsErr = errors.New("sensitive-canary") }, context.Background, "command_error"},
+		{"logs truncated", func(runner *liveCaddyStartupRunner) {
+			runner.logsResult = runtimeprocess.CommandResult{Stderr: []byte("sensitive-canary"), StderrTruncated: true}
+		}, context.Background, "logs_truncated"},
+		{"cancelled", func(runner *liveCaddyStartupRunner) { runner.stateErr = context.Canceled }, context.Background, "cancelled"},
+		{"deadline", func(runner *liveCaddyStartupRunner) { runner.stateErr = context.DeadlineExceeded }, context.Background, "timeout"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, runner := newLiveCaddyStartupRunner(t)
+			test.setup(runner)
+			diagnostic := liveCaddyStartupExitDiagnostic(test.ctx(), manager, runner.id)
+			if diagnostic.Status != test.want || strings.Contains(diagnostic.String(), "sensitive-canary") {
+				t.Fatalf("diagnostic = %#v", diagnostic)
+			}
+		})
+	}
+}
+
+func TestLiveCaddyStartupClassifierDoesNotSynthesizeMarkers(t *testing.T) {
+	if got := liveCaddyStartupMarkers([]byte("permission\ndenied")); got != "other" {
+		t.Fatalf("cross-line marker = %q", got)
+	}
+	if stdout, stderr := liveCaddyStartupMarkers([]byte("permission")), liveCaddyStartupMarkers([]byte("denied")); stdout != "other" || stderr != "other" {
+		t.Fatalf("cross-stream markers = %q/%q", stdout, stderr)
+	}
+	if got := liveCaddyStartupMarkers([]byte("UNKNOWN COMMAND\naddress already in use\nconfig file does not exist\nunable to autosave\nread-only file system\npermission denied\nloading initial config\x00sensitive-canary")); got != "unknown_command+address_in_use+config_missing+autosave_failed+read_only+permission_denied+load_failed" {
+		t.Fatalf("canonical marker union = %q", got)
+	}
+	if got := liveCaddyStartupStateMarkers(json.RawMessage(`""`)); got != "none" {
+		t.Fatalf("empty state marker = %q", got)
+	}
+}
+
+func TestLiveCaddyStartupDiagnosticSharesSnapshotDeadline(t *testing.T) {
+	manager, runner := newLiveCaddyStartupRunner(t)
+	runner.delegate = liveSnapshotRunnerFunc(func(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+		if len(request.Args) > 0 && request.Args[0] == "image" {
+			<-ctx.Done()
+			return runtimeprocess.CommandResult{}, ctx.Err()
+		}
+		return runtimeprocess.CommandResult{}, errors.New("unexpected command")
+	})
+	started := time.Now()
+	diagnostic := liveIngressFailureDiagnosticWithin(context.Background(), manager, 20*time.Millisecond)
+	if len(runner.requests) != 0 || !strings.Contains(diagnostic, "caddy_startup_status:not_attempted") {
+		t.Fatalf("diagnostic = %q, startup requests = %v", diagnostic, runner.requests)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("diagnostic exceeded total deadline: %v", elapsed)
 	}
 }
