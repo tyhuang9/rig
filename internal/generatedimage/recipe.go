@@ -110,14 +110,14 @@ USER node
 RUN --mount=type=secret,id=rig-install-command,required=true ["/bin/sh", "-c", "root=$(cat /run/rig/root.path); cd -- \"/workspace/$root\" && exec /bin/sh -lc \"$(cat /run/secrets/rig-install-command)\""]
 %sFROM %s AS runtime
 ENV NODE_ENV=production
-WORKDIR /workspace
+%sWORKDIR /workspace
 COPY --from=builder --chown=node:node /workspace/ /workspace/
 COPY --chmod=0555 rig/rig-entrypoint /usr/local/bin/rig-entrypoint
 COPY --chmod=0555 rig/rig-static /usr/local/bin/rig-static
 COPY --chmod=0444 rig/rig-static.mjs /usr/local/lib/rig/static.mjs
 USER node
 ENTRYPOINT ["/usr/local/bin/rig-entrypoint"]
-`, baseImage, corepack, build, baseImage)
+`, baseImage, corepack, build, baseImage, corepack)
 }
 
 func writeRecipe(layout buildLayout, definition componentDefinition) error {

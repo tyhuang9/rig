@@ -78,6 +78,19 @@ func TestMigrationIsBoundToAcceptedComponentAndExplicitEnvironmentKeys(t *testin
 	}
 }
 
+func TestCanonicalPlanRejectsBackslashRootDirectories(t *testing.T) {
+	for _, root := range []string{`apps\web`, `apps\\web`} {
+		t.Run(root, func(t *testing.T) {
+			plan := testPlan()
+			plan.Components[0].RootDirectory = root
+			plan.Migration.RootDirectory = root
+			if _, err := CanonicalDigest(plan); err == nil {
+				t.Fatalf("backslash root directory %q accepted", root)
+			}
+		})
+	}
+}
+
 func TestStorePersistsProtectedImmutableRevisionAndCASHead(t *testing.T) {
 	db := planDB(t)
 	root := t.TempDir()

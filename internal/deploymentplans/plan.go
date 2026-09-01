@@ -258,7 +258,7 @@ func validRootDirectory(value string) bool {
 	if value == "." {
 		return true
 	}
-	if value == "" || strings.Contains(value, `\\`) || strings.HasPrefix(value, "/") || strings.Contains(value, ":") || path.Clean(value) != value || value == ".." || strings.HasPrefix(value, "../") {
+	if value == "" || strings.Contains(value, `\`) || strings.HasPrefix(value, "/") || strings.Contains(value, ":") || path.Clean(value) != value || value == ".." || strings.HasPrefix(value, "../") {
 		return false
 	}
 	return validateText(value, 1024) == nil

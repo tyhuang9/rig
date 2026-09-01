@@ -66,6 +66,29 @@ func TestDefinitionAndRecipeAreDeterministicAndCommandSafe(t *testing.T) {
 	}
 }
 
+func TestContainerfileEnablesCorepackBeforeNonRootUsersInBothStages(t *testing.T) {
+	const baseImage = "node:test"
+	for _, packageManager := range []string{"pnpm", "yarn"} {
+		t.Run(packageManager, func(t *testing.T) {
+			recipe := containerfile(false, packageManager != "npm", baseImage)
+			builder, runtimeStage, found := strings.Cut(recipe, "FROM "+baseImage+" AS runtime\n")
+			if !found {
+				t.Fatal("runtime stage missing")
+			}
+			for stageName, stage := range map[string]string{"builder": builder, "runtime": runtimeStage} {
+				corepackIndex := strings.Index(stage, `RUN ["corepack", "enable"]`)
+				userIndex := strings.Index(stage, "USER node")
+				if corepackIndex < 0 || userIndex < 0 || corepackIndex > userIndex {
+					t.Errorf("%s stage does not enable Corepack before USER node:\n%s", stageName, stage)
+				}
+			}
+		})
+	}
+	if recipe := containerfile(false, false, baseImage); strings.Contains(recipe, `RUN ["corepack", "enable"]`) {
+		t.Fatal("npm recipe unexpectedly enables Corepack")
+	}
+}
+
 func TestManagedStaticServerDoesNotFollowSymlinksOutsideRoot(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
