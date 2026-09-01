@@ -41,20 +41,22 @@ const (
 	liveCreateObservationOutputLimit = 64 << 10
 )
 
-// liveCreateObserver is test-only. It observes the generated-runtime create
-// result before Engine can inspect or clean it, but retains only fixed boolean
-// hardening checks; IDs, inspect output, and Docker configuration never leave
-// Run's stack frame.
+// liveCreateObserver is test-only. It observes the generated-runtime lifecycle
+// without retaining IDs or Docker output. It stores only fixed booleans and
+// fixed diagnostic reasons.
 type liveCreateObserver struct {
-	delegate runtimeprocess.CommandRunner
-	mu       sync.Mutex
-	latest   liveCreateObservation
+	delegate      runtimeprocess.CommandRunner
+	mu            sync.Mutex
+	latest        liveCreateObservation
+	awaitingStart bool
 }
 
 type liveCreateObservation struct {
 	createSucceeded bool
 	inspectReason   liveCreateInspectReason
 	hardening       liveCreateHardening
+	realization     liveCreateRealization
+	startReason     liveStartReason
 }
 
 type liveCreateHardening struct {
@@ -64,8 +66,11 @@ type liveCreateHardening struct {
 	Init              bool
 	SecurityOptions   bool
 	HealthStartPeriod bool
-	MountsRealized    bool
-	NetworkRealized   bool
+}
+
+type liveCreateRealization struct {
+	MountsRealized  bool
+	NetworkRealized bool
 }
 
 type liveCreateInspectReason string
@@ -76,6 +81,24 @@ const (
 	liveCreateInspectOutputTruncated liveCreateInspectReason = "inspect_output_truncated"
 	liveCreateInspectDecodeFailed    liveCreateInspectReason = "inspect_decode_failed"
 	liveCreateInspectMissing         liveCreateInspectReason = "inspect_missing"
+)
+
+type liveStartReason string
+
+const (
+	liveStartNone                 liveStartReason = "none"
+	liveStartCancelled            liveStartReason = "cancelled"
+	liveStartTimeout              liveStartReason = "timeout"
+	liveStartProcessTermination   liveStartReason = "process_termination_failed"
+	liveStartOutputTruncated      liveStartReason = "output_truncated"
+	liveStartDaemonUnavailable    liveStartReason = "daemon_unavailable"
+	liveStartOCIMountFailed       liveStartReason = "oci_mount_failed"
+	liveStartOCIEntrypointDenied  liveStartReason = "oci_entrypoint_permission"
+	liveStartOCIEntrypointMissing liveStartReason = "oci_entrypoint_missing"
+	liveStartOCINetworkFailed     liveStartReason = "oci_network_failed"
+	liveStartOCIResourceFailed    liveStartReason = "oci_resource_failed"
+	liveStartOCIRuntimeFailed     liveStartReason = "oci_runtime_failed"
+	liveStartCommandFailed        liveStartReason = "command_failed"
 )
 
 type liveCreateExpectation struct {
@@ -121,6 +144,10 @@ type liveRawNetworkSettings struct {
 
 func (observer *liveCreateObserver) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
 	result, err := observer.delegate.Run(ctx, request)
+	if liveContainerStart(request.Args) {
+		observer.observeStartResult(ctx, result, err)
+		return result, err
+	}
 	expectation, observe := liveGeneratedRuntimeCreateExpectation(request.Args)
 	if !observe || err != nil || result.StdoutTruncated || result.StderrTruncated {
 		return result, err
@@ -132,8 +159,13 @@ func (observer *liveCreateObserver) Run(ctx context.Context, request runtimeproc
 	observation := observer.inspectCreatedContainer(ctx, request, string(containerID), expectation)
 	observer.mu.Lock()
 	observer.latest = observation
+	observer.awaitingStart = true
 	observer.mu.Unlock()
 	return result, err
+}
+
+func liveContainerStart(args []string) bool {
+	return len(args) == 3 && args[0] == "container" && args[1] == "start"
 }
 
 func liveGeneratedRuntimeCreateExpectation(args []string) (liveCreateExpectation, bool) {
@@ -148,7 +180,7 @@ func liveGeneratedRuntimeCreateExpectation(args []string) (liveCreateExpectation
 			expectation.network = args[index+1]
 			index++
 		case "--tmpfs":
-			expectation.tmpfs = args[index+1]
+			expectation.tmpfs = liveTmpfsOptions(args[index+1])
 			index++
 		case "--pids-limit":
 			value, err := strconv.ParseInt(args[index+1], 10, 64)
@@ -162,6 +194,13 @@ func liveGeneratedRuntimeCreateExpectation(args []string) (liveCreateExpectation
 		}
 	}
 	return expectation, managed && expectation.network != "" && expectation.tmpfs != "" && expectation.pids > 0
+}
+
+func liveTmpfsOptions(value string) string {
+	if !strings.HasPrefix(value, "/tmp:") {
+		return ""
+	}
+	return strings.TrimPrefix(value, "/tmp:")
 }
 
 func (observer *liveCreateObserver) inspectCreatedContainer(ctx context.Context, request runtimeprocess.CommandRequest, containerID string, expectation liveCreateExpectation) liveCreateObservation {
@@ -188,37 +227,40 @@ func liveCreateObservationFromInspectResult(result *runtimeprocess.CommandResult
 		observation.inspectReason = liveCreateInspectOutputTruncated
 		return observation
 	}
-	hardening, reason := decodeLiveCreateInspection(result.Stdout, expectation)
+	hardening, realization, reason := decodeLiveCreateInspection(result.Stdout, expectation)
 	clearLiveCommandResult(result)
 	if reason != liveCreateInspectNone {
 		observation.inspectReason = reason
 		return observation
 	}
 	observation.hardening = hardening
+	observation.realization = realization
 	return observation
 }
 
-func decodeLiveCreateInspection(raw []byte, expectation liveCreateExpectation) (liveCreateHardening, liveCreateInspectReason) {
+func decodeLiveCreateInspection(raw []byte, expectation liveCreateExpectation) (liveCreateHardening, liveCreateRealization, liveCreateInspectReason) {
 	var containers []liveRawContainerInspection
 	err := json.Unmarshal(raw, &containers)
 	clear(raw)
 	if err != nil {
-		return liveCreateHardening{}, liveCreateInspectDecodeFailed
+		return liveCreateHardening{}, liveCreateRealization{}, liveCreateInspectDecodeFailed
 	}
 	if len(containers) != 1 {
 		clearLiveRawContainerInspections(containers)
-		return liveCreateHardening{}, liveCreateInspectMissing
+		return liveCreateHardening{}, liveCreateRealization{}, liveCreateInspectMissing
 	}
-	hardening := liveCreateHardeningFromRaw(containers[0], expectation)
+	hardening, realization := liveCreateHardeningFromRaw(containers[0], expectation)
 	clearLiveRawContainerInspections(containers)
-	return hardening, liveCreateInspectNone
+	return hardening, realization, liveCreateInspectNone
 }
 
-func liveCreateHardeningFromRaw(container liveRawContainerInspection, expectation liveCreateExpectation) liveCreateHardening {
+func liveCreateHardeningFromRaw(container liveRawContainerInspection, expectation liveCreateExpectation) (liveCreateHardening, liveCreateRealization) {
 	hardening := liveCreateHardening{
 		NetworkMode:     container.HostConfig.NetworkMode == expectation.network,
 		Tmpfs:           len(container.HostConfig.Tmpfs) == 1 && container.HostConfig.Tmpfs["/tmp"] == expectation.tmpfs,
 		SecurityOptions: liveOnlyNoNewPrivileges(container.HostConfig.SecurityOpt),
+	}
+	realization := liveCreateRealization{
 		MountsRealized:  liveOnlyRuntimeTmpfsMount(container.Mounts),
 		NetworkRealized: container.NetworkSettings != nil && networkExists(container.NetworkSettings.Networks, expectation.network),
 	}
@@ -231,7 +273,7 @@ func liveCreateHardeningFromRaw(container liveRawContainerInspection, expectatio
 	if container.Config.Healthcheck != nil {
 		hardening.HealthStartPeriod = container.Config.Healthcheck.StartPeriod == int64(5*time.Second)
 	}
-	return hardening
+	return hardening, realization
 }
 
 func liveOnlyNoNewPrivileges(values []string) bool {
@@ -300,9 +342,116 @@ func clearLiveCommandResult(result *runtimeprocess.CommandResult) {
 	*result = runtimeprocess.CommandResult{}
 }
 
+func (observer *liveCreateObserver) observeStartResult(ctx context.Context, result runtimeprocess.CommandResult, err error) {
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	if !observer.awaitingStart {
+		return
+	}
+	observer.latest.startReason = classifyLiveStartResult(ctx, result, err)
+	observer.awaitingStart = false
+}
+
+func classifyLiveStartResult(ctx context.Context, result runtimeprocess.CommandResult, err error) liveStartReason {
+	if err == nil {
+		return liveStartNone
+	}
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		return liveStartCancelled
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return liveStartTimeout
+	}
+	if errors.Is(err, runtimeprocess.ErrTerminationFailed) {
+		return liveStartProcessTermination
+	}
+	if result.StdoutTruncated || result.StderrTruncated {
+		return liveStartOutputTruncated
+	}
+	var executableError *exec.Error
+	var pathError *os.PathError
+	if errors.As(err, &executableError) || errors.As(err, &pathError) || liveStartOutputContainsAny(result, "cannot connect to the docker daemon", "error during connect", "is the docker daemon running") {
+		return liveStartDaemonUnavailable
+	}
+	if liveStartOutputContains(result, "failed to set up container networking") {
+		return liveStartOCINetworkFailed
+	}
+	if liveStartOutputContainsAll(result, "oci runtime create failed", "error mounting") || liveStartOutputContainsAll(result, "oci runtime create failed", "failed to mount") {
+		return liveStartOCIMountFailed
+	}
+	if liveStartOutputContainsAll(result, "oci runtime create failed", "rig-entrypoint", "permission denied") {
+		return liveStartOCIEntrypointDenied
+	}
+	if liveStartOutputContainsAll(result, "oci runtime create failed", "rig-entrypoint") && liveStartOutputContainsAny(result, "no such file or directory", "executable file not found") {
+		return liveStartOCIEntrypointMissing
+	}
+	if liveStartOutputContainsAll(result, "oci runtime create failed", "failed to setup network") || liveStartOutputContainsAll(result, "oci runtime create failed", "network namespace") {
+		return liveStartOCINetworkFailed
+	}
+	if liveStartOutputContainsAll(result, "oci runtime create failed", "cgroup") || liveStartOutputContainsAll(result, "oci runtime create failed", "pids") || liveStartOutputContainsAll(result, "oci runtime create failed", "cannot allocate memory") {
+		return liveStartOCIResourceFailed
+	}
+	if liveStartOutputContainsAny(result, "oci runtime create failed", "runc create failed") {
+		return liveStartOCIRuntimeFailed
+	}
+	if err != nil {
+		return liveStartCommandFailed
+	}
+	return liveStartNone
+}
+
+func liveStartOutputContainsAll(result runtimeprocess.CommandResult, patterns ...string) bool {
+	for _, pattern := range patterns {
+		if !liveStartOutputContains(result, pattern) {
+			return false
+		}
+	}
+	return true
+}
+
+func liveStartOutputContainsAny(result runtimeprocess.CommandResult, patterns ...string) bool {
+	for _, pattern := range patterns {
+		if liveStartOutputContains(result, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func liveStartOutputContains(result runtimeprocess.CommandResult, pattern string) bool {
+	return containsASCIIInsensitive(result.Stdout, pattern) || containsASCIIInsensitive(result.Stderr, pattern)
+}
+
+func containsASCIIInsensitive(value []byte, pattern string) bool {
+	if len(pattern) == 0 || len(value) < len(pattern) {
+		return false
+	}
+	for start := 0; start <= len(value)-len(pattern); start++ {
+		matched := true
+		for offset := range len(pattern) {
+			if lowerASCII(value[start+offset]) != lowerASCII(pattern[offset]) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+func lowerASCII(value byte) byte {
+	if value >= 'A' && value <= 'Z' {
+		return value + ('a' - 'A')
+	}
+	return value
+}
+
 func (observer *liveCreateObserver) reset() {
 	observer.mu.Lock()
 	observer.latest = liveCreateObservation{}
+	observer.awaitingStart = false
 	observer.mu.Unlock()
 }
 
@@ -320,9 +469,19 @@ func (observer *liveCreateObserver) failureDiagnostic() string {
 			mismatches = strings.Join(names, ",")
 		}
 	}
+	startReason := observation.startReason
+	if startReason == "" {
+		startReason = liveStartNone
+	}
+	realization := "unobserved"
+	if observation.createSucceeded && reason == liveCreateInspectNone {
+		realization = "mounts_realized:" + strconv.FormatBool(observation.realization.MountsRealized) + ",network_realized:" + strconv.FormatBool(observation.realization.NetworkRealized)
+	}
 	return " generated_runtime_create_observed=" + strconv.FormatBool(observation.createSucceeded) +
 		" inspect_reason=" + string(reason) +
-		" hardening_mismatches=" + mismatches
+		" hardening_mismatches=" + mismatches +
+		" realization_state=" + realization +
+		" start_reason=" + string(startReason)
 }
 
 func liveCreateHardeningMismatches(hardening liveCreateHardening) []string {
@@ -336,8 +495,6 @@ func liveCreateHardeningMismatches(hardening liveCreateHardening) []string {
 		{name: "init", ok: hardening.Init},
 		{name: "security_options", ok: hardening.SecurityOptions},
 		{name: "health_start_period", ok: hardening.HealthStartPeriod},
-		{name: "mounts_realized", ok: hardening.MountsRealized},
-		{name: "network_realized", ok: hardening.NetworkRealized},
 	}
 	mismatches := make([]string, 0, len(checks))
 	for _, check := range checks {
@@ -447,10 +604,11 @@ func TestLiveCreateObservationDiagnosticIsRedacted(t *testing.T) {
 		createSucceeded: true, inspectReason: liveCreateInspectNone,
 		hardening: liveCreateHardening{
 			NetworkMode: false, Tmpfs: false, PIDsLimit: true, Init: true, SecurityOptions: false,
-			HealthStartPeriod: true, MountsRealized: false, NetworkRealized: true,
+			HealthStartPeriod: true,
 		},
+		realization: liveCreateRealization{NetworkRealized: true},
 	}}).failureDiagnostic()
-	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=network_mode,tmpfs,security_options,mounts_realized"
+	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=network_mode,tmpfs,security_options realization_state=mounts_realized:false,network_realized:true start_reason=none"
 	if diagnostic != want {
 		t.Fatalf("redacted observation diagnostic = %q, want %q", diagnostic, want)
 	}
@@ -466,7 +624,7 @@ func TestLiveCreateObserverResetDropsPriorAttempt(t *testing.T) {
 		createSucceeded: true, inspectReason: liveCreateInspectNone, hardening: liveCreateHardening{NetworkMode: false},
 	}}
 	observer.reset()
-	const want = " generated_runtime_create_observed=false inspect_reason=none hardening_mismatches=none"
+	const want = " generated_runtime_create_observed=false inspect_reason=none hardening_mismatches=none realization_state=unobserved start_reason=none"
 	if diagnostic := observer.failureDiagnostic(); diagnostic != want {
 		t.Fatalf("reset observation diagnostic = %q, want %q", diagnostic, want)
 	}
@@ -478,8 +636,8 @@ func TestLiveCreateObserverFiltersOtherContainerCreates(t *testing.T) {
 		"--pids-limit", "128", "--label", "io.rig.managed=generated-runtime",
 	}
 	expectation, observed := liveGeneratedRuntimeCreateExpectation(arguments)
-	if !observed || expectation.network != "test-network" || expectation.tmpfs == "" || expectation.pids != 128 {
-		t.Fatalf("generated-runtime create was not observed: observed=%t network_present=%t tmpfs_present=%t pids_valid=%t", observed, expectation.network != "", expectation.tmpfs != "", expectation.pids == 128)
+	if !observed || expectation.network != "test-network" || expectation.tmpfs != "rw,noexec,nosuid,nodev,size=16777216" || expectation.pids != 128 {
+		t.Fatalf("generated-runtime create was not observed: observed=%t network_present=%t tmpfs_normalized=%t pids_valid=%t", observed, expectation.network != "", expectation.tmpfs == "rw,noexec,nosuid,nodev,size=16777216", expectation.pids == 128)
 	}
 	arguments[len(arguments)-1] = "io.rig.managed=generated-ingress"
 	if _, observed := liveGeneratedRuntimeCreateExpectation(arguments); observed {
@@ -488,8 +646,8 @@ func TestLiveCreateObserverFiltersOtherContainerCreates(t *testing.T) {
 }
 
 func TestLiveRawInspectDecodeClassifiesAndRedacts(t *testing.T) {
-	expectation := liveCreateExpectation{network: "test-network", tmpfs: "/tmp:rw,noexec,nosuid,nodev,size=16777216", pids: 128}
-	raw := []byte(`[{"Name":"sensitive-container","Image":"sha256:aaaaaaaa","Config":{"Healthcheck":{"StartPeriod":5000000000},"Cmd":["sensitive-command"],"Env":["SENSITIVE=value"]},"HostConfig":{"NetworkMode":"test-network","Tmpfs":{"/tmp":"/tmp:rw,noexec,nosuid,nodev,size=16777216"},"PidsLimit":128,"Init":true,"SecurityOpt":["no-new-privileges:true"]},"Mounts":[{"Type":"tmpfs","Source":"","Destination":"/tmp","RW":true}],"NetworkSettings":{"Networks":{"test-network":{"Aliases":["sensitive-alias"]}}},"Labels":{"sensitive-label":"sensitive-value"}}]`)
+	expectation := liveCreateExpectation{network: "test-network", tmpfs: "rw,noexec,nosuid,nodev,size=16777216", pids: 128}
+	raw := []byte(`[{"Name":"sensitive-container","Image":"sha256:aaaaaaaa","Config":{"Healthcheck":{"StartPeriod":5000000000},"Cmd":["sensitive-command"],"Env":["SENSITIVE=value"]},"HostConfig":{"NetworkMode":"test-network","Tmpfs":{"/tmp":"rw,noexec,nosuid,nodev,size=16777216"},"PidsLimit":128,"Init":true,"SecurityOpt":["no-new-privileges:true"]},"Mounts":[{"Type":"tmpfs","Source":"","Destination":"/tmp","RW":true}],"NetworkSettings":{"Networks":{"test-network":{"Aliases":["sensitive-alias"]}}},"Labels":{"sensitive-label":"sensitive-value"}}]`)
 	result := runtimeprocess.CommandResult{Stdout: raw, Stderr: []byte("sensitive-stderr")}
 	observation := liveCreateObservationFromInspectResult(&result, nil, expectation)
 	if observation.inspectReason != liveCreateInspectNone {
@@ -507,7 +665,7 @@ func TestLiveRawInspectDecodeClassifiesAndRedacts(t *testing.T) {
 		t.Fatal("raw inspect result was retained")
 	}
 	diagnostic := (&liveCreateObserver{latest: observation}).failureDiagnostic()
-	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=none"
+	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=none realization_state=mounts_realized:true,network_realized:true start_reason=none"
 	if diagnostic != want {
 		t.Fatalf("redacted raw inspect diagnostic = %q, want %q", diagnostic, want)
 	}
@@ -549,6 +707,63 @@ func TestLiveRawInspectClassifiesFixedReasons(t *testing.T) {
 				t.Fatalf("fixed inspect classification diagnostic = %q", diagnostic)
 			}
 		})
+	}
+}
+
+func TestLiveStartResultClassifiesFixedReasonsWithoutDisclosure(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		output    string
+		truncated bool
+		err       error
+		want      liveStartReason
+	}{
+		{name: "none", output: "sensitive-start-output", want: liveStartNone},
+		{name: "cancelled", output: "sensitive-start-output", err: context.Canceled, want: liveStartCancelled},
+		{name: "timeout", output: "sensitive-start-output", err: context.DeadlineExceeded, want: liveStartTimeout},
+		{name: "process termination", output: "sensitive-start-output", err: runtimeprocess.ErrTerminationFailed, want: liveStartProcessTermination},
+		{name: "output truncated", output: "sensitive-start-output", truncated: true, err: errors.New("command exited"), want: liveStartOutputTruncated},
+		{name: "typed daemon unavailable", output: "sensitive-start-output", err: &exec.Error{Name: "docker", Err: errors.New("sensitive-typed-error")}, want: liveStartDaemonUnavailable},
+		{name: "daemon unavailable", output: "cannot connect to the Docker daemon: sensitive-start-output", err: errors.New("command exited"), want: liveStartDaemonUnavailable},
+		{name: "oci mount", output: "OCI runtime create failed: error mounting sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIMountFailed},
+		{name: "oci entrypoint permission", output: "OCI runtime create failed: exec /usr/local/bin/rig-entrypoint: permission denied: sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIEntrypointDenied},
+		{name: "oci entrypoint missing", output: "OCI runtime create failed: exec /usr/local/bin/rig-entrypoint: no such file or directory: sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIEntrypointMissing},
+		{name: "network before oci", output: "failed to set up container networking: sensitive-start-output", err: errors.New("command exited"), want: liveStartOCINetworkFailed},
+		{name: "oci resource", output: "OCI runtime create failed: cgroup configuration failed: sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIResourceFailed},
+		{name: "oci runtime", output: "OCI runtime create failed: runc create failed: sensitive-start-output", err: errors.New("command exited"), want: liveStartOCIRuntimeFailed},
+		{name: "command failed", output: "sensitive-start-output", err: errors.New("command exited"), want: liveStartCommandFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stderr := []byte(test.output)
+			result := runtimeprocess.CommandResult{Stderr: stderr, StderrTruncated: test.truncated}
+			reason := classifyLiveStartResult(context.Background(), result, test.err)
+			if reason != test.want {
+				t.Fatalf("start reason = %q, want %q", reason, test.want)
+			}
+			if !bytes.Contains(stderr, []byte("sensitive-start-output")) {
+				t.Fatal("start classifier cleared output needed by Engine")
+			}
+			diagnostic := (&liveCreateObserver{latest: liveCreateObservation{createSucceeded: true, inspectReason: liveCreateInspectNone, startReason: reason}}).failureDiagnostic()
+			if !strings.Contains(diagnostic, "start_reason="+string(test.want)) {
+				t.Fatal("start diagnostic did not report its fixed reason")
+			}
+			if strings.Contains(diagnostic, "sensitive-start-output") || strings.Contains(diagnostic, "sensitive-typed-error") || strings.Contains(diagnostic, "rig-entrypoint") {
+				t.Fatal("start diagnostic exposed command output or error details")
+			}
+		})
+	}
+}
+
+func TestLiveStartObserverRequiresPendingGeneratedCreate(t *testing.T) {
+	observer := &liveCreateObserver{latest: liveCreateObservation{createSucceeded: true, inspectReason: liveCreateInspectNone}}
+	observer.observeStartResult(context.Background(), runtimeprocess.CommandResult{Stderr: []byte("sensitive-start-output")}, errors.New("command exited"))
+	if observer.latest.startReason != "" {
+		t.Fatal("start result without a generated create was retained")
+	}
+	observer.awaitingStart = true
+	observer.observeStartResult(context.Background(), runtimeprocess.CommandResult{Stderr: []byte("sensitive-start-output")}, errors.New("command exited"))
+	if observer.latest.startReason != liveStartCommandFailed || observer.awaitingStart {
+		t.Fatal("pending generated create did not retain only a fixed start reason")
 	}
 }
 
