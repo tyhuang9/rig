@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/pathsecurity"
+	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/sourceconnections"
 	"gopkg.in/yaml.v3"
 )
@@ -56,6 +58,7 @@ type Result struct {
 	ComposeCandidates []string
 	Services          []Service
 	Findings          []Finding
+	Analysis          projectanalysis.SourceAnalysis
 }
 
 type GitHubReader interface {
@@ -82,6 +85,7 @@ func InspectGitHub(ctx context.Context, reader GitHubReader, owner string, sourc
 	}
 	result := Result{Source: SourceMetadata{Type: "github", ConnectionID: source.ConnectionID, InstallationID: source.InstallationID, RepositoryID: repository.ID, RepositoryOwner: repository.Owner, RepositoryName: repository.Name, TrackedBranch: branch.Name, TrackedRef: "refs/heads/" + branch.Name}, ResolvedSHA: branch.SHA}
 	blobs := make(map[string]githubapp.TreeEntry)
+	analysisFiles := make([]projectanalysis.File, 0, len(tree.Entries))
 	seenPaths := make(map[string]struct{}, len(tree.Entries))
 	for _, entry := range tree.Entries {
 		normalized, normalizeErr := normalizePath(entry.Path)
@@ -97,13 +101,21 @@ func InspectGitHub(ctx context.Context, reader GitHubReader, owner string, sourc
 		}
 		if entry.Type == "blob" {
 			blobs[entry.Path] = entry
+			analysisFiles = append(analysisFiles, projectanalysis.File{Path: entry.Path, Size: entry.Size})
 			if isComposeName(path.Base(entry.Path)) {
 				result.ComposeCandidates = append(result.ComposeCandidates, entry.Path)
 			}
 		}
 	}
 	sort.Strings(result.ComposeCandidates)
+	result.Analysis, err = projectanalysis.Analyze(ctx, analysisFiles, githubProjectReader{ctx: ctx, reader: reader, owner: owner, connectionID: source.ConnectionID, installationID: source.InstallationID, repository: repository, sha: branch.SHA})
+	if err != nil {
+		return Result{}, projectAnalysisError(err)
+	}
 	selected, findings := selectCompose(composePath, result.ComposeCandidates, blobs)
+	if composePath == "" && hasGeneratedCandidate(result.Analysis) {
+		selected, findings = "", nil
+	}
 	result.Findings = append(result.Findings, findings...)
 	if selected == "" {
 		return result, nil
@@ -120,6 +132,10 @@ func InspectGitHub(ctx context.Context, reader GitHubReader, owner string, sourc
 }
 
 func InspectLocal(sourcePath string) (Result, error) {
+	return InspectLocalContext(context.Background(), sourcePath)
+}
+
+func InspectLocalContext(ctx context.Context, sourcePath string) (Result, error) {
 	sourcePath = strings.TrimSpace(sourcePath)
 	if sourcePath == "" || pathsecurity.RejectWindowsNamespace(sourcePath) {
 		return Result{}, &Error{Code: "invalid_source"}
@@ -145,6 +161,7 @@ func InspectLocal(sourcePath string) (Result, error) {
 		}
 	}
 	entries := 0
+	analysisFiles := make([]projectanalysis.File, 0)
 	err = filepath.WalkDir(root, func(current string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -159,14 +176,25 @@ func InspectLocal(sourcePath string) (Result, error) {
 			}
 			return nil
 		}
-		if entry.IsDir() || !isComposeName(entry.Name()) {
+		if entry.IsDir() {
+			if current != root && excludedAnalysisDirectory(entry.Name()) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		relative, err := filepath.Rel(root, current)
 		if err != nil {
 			return err
 		}
-		result.ComposeCandidates = append(result.ComposeCandidates, filepath.ToSlash(relative))
+		normalized := filepath.ToSlash(relative)
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			return err
+		}
+		analysisFiles = append(analysisFiles, projectanalysis.File{Path: normalized, Size: info.Size()})
+		if isComposeName(entry.Name()) {
+			result.ComposeCandidates = append(result.ComposeCandidates, normalized)
+		}
 		return nil
 	})
 	if err != nil {
@@ -177,8 +205,15 @@ func InspectLocal(sourcePath string) (Result, error) {
 		return Result{}, &Error{Code: "invalid_source"}
 	}
 	sort.Strings(result.ComposeCandidates)
+	result.Analysis, err = projectanalysis.Analyze(ctx, analysisFiles, localProjectReader{root: root})
+	if err != nil {
+		return Result{}, projectAnalysisError(err)
+	}
 	if selected == "" {
 		selected, result.Findings = selectCompose("", result.ComposeCandidates, nil)
+		if hasGeneratedCandidate(result.Analysis) {
+			selected, result.Findings = "", nil
+		}
 	} else {
 		result.Source.ComposePath = filepath.ToSlash(selected)
 	}
@@ -195,6 +230,109 @@ func InspectLocal(sourcePath string) (Result, error) {
 	}
 	result.Services, result.Findings = inspectCompose(contents, result.Source.ComposePath)
 	return result, nil
+}
+
+func hasGeneratedCandidate(analysis projectanalysis.SourceAnalysis) bool {
+	for _, candidate := range analysis.Candidates {
+		if candidate.Kind == projectanalysis.PlanKindJavaScript && candidate.Status != projectanalysis.StatusUnsupported && len(candidate.Components) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+type githubProjectReader struct {
+	ctx            context.Context
+	reader         GitHubReader
+	owner          string
+	connectionID   string
+	installationID int64
+	repository     sourceconnections.SourceRepository
+	sha            string
+}
+
+func (reader githubProjectReader) ReadFile(ctx context.Context, name string, maxBytes int64) ([]byte, error) {
+	if ctx == nil {
+		ctx = reader.ctx
+	}
+	contents, err := reader.reader.ReadContent(ctx, reader.owner, reader.connectionID, reader.installationID, reader.repository, name, reader.sha)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(contents)) > maxBytes {
+		clear(contents)
+		return nil, projectanalysis.ErrFileTooLarge
+	}
+	return contents, nil
+}
+
+type localProjectReader struct{ root string }
+
+func (reader localProjectReader) ReadFile(ctx context.Context, name string, maxBytes int64) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := normalizePath(name); err != nil {
+		return nil, err
+	}
+	root := filepath.Clean(reader.root)
+	candidate := filepath.Clean(filepath.Join(root, filepath.FromSlash(name)))
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return nil, errors.New("analysis path escapes source root")
+	}
+	current := root
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, statErr := os.Lstat(current)
+		if statErr != nil {
+			return nil, statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, errors.New("analysis path contains a link")
+		}
+	}
+	info, err := os.Stat(candidate)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, errors.New("analysis path is not a regular file")
+	}
+	if info.Size() > maxBytes {
+		return nil, projectanalysis.ErrFileTooLarge
+	}
+	file, err := os.Open(candidate)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	contents, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(contents)) > maxBytes {
+		clear(contents)
+		return nil, projectanalysis.ErrFileTooLarge
+	}
+	return contents, nil
+}
+
+func excludedAnalysisDirectory(name string) bool {
+	switch strings.ToLower(name) {
+	case ".git", "node_modules", ".next", "dist", "build", "out", "coverage", ".turbo", ".cache":
+		return true
+	default:
+		return false
+	}
+}
+
+func projectAnalysisError(err error) error {
+	var sourceError *sourceconnections.Error
+	if errors.As(err, &sourceError) {
+		return sourceError
+	}
+	if projectanalysis.IsErrorCode(err, projectanalysis.CodeSourceTooLarge) || projectanalysis.IsErrorCode(err, projectanalysis.CodeFileTooLarge) {
+		return &Error{Code: "source_too_large"}
+	}
+	return &Error{Code: "invalid_source"}
 }
 
 func selectCompose(requested string, candidates []string, blobs map[string]githubapp.TreeEntry) (string, []Finding) {

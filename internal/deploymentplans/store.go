@@ -208,6 +208,14 @@ func (s *Store) ApproveMigration(ctx context.Context, appID, revisionID string, 
 		return err
 	}
 	defer tx.Rollback()
+	var headID sql.NullString
+	var headNumber int64
+	if err := tx.QueryRowContext(ctx, `SELECT revision_id,revision_number FROM deployment_plan_heads WHERE app_id=?`, appID).Scan(&headID, &headNumber); err != nil {
+		return err
+	}
+	if !headID.Valid || headID.String != revisionID || headNumber != revisionNumber {
+		return &Error{Code: "deployment_plan_conflict"}
+	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO deployment_plan_migration_approvals(revision_id,app_id,approval_revision,approved_by,approved_at) VALUES(?,?,1,?,?) ON CONFLICT(revision_id) DO NOTHING`, revisionID, appID, actorID, now)
 	if err != nil {
 		return err

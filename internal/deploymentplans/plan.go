@@ -67,6 +67,10 @@ type Plan struct {
 	FieldProvenance []FieldProvenance `json:"fieldProvenance"`
 	Migration       *Migration        `json:"migration,omitempty"`
 }
+
+// SourceIdentity binds acceptance to the analyzed immutable snapshot. Later
+// releases are compatible only after their own immutable snapshot is analyzed;
+// they are not required to reuse this historical digest.
 type SourceIdentity struct {
 	Provider       string `json:"provider"`
 	RepositoryID   int64  `json:"repositoryId"`
@@ -165,7 +169,7 @@ func canonicalPlan(plan Plan) (Plan, error) {
 	if validateText(plan.Detector.Name, 256) != nil || validateText(plan.Detector.Version, 256) != nil || !validDigest(plan.Detector.SourceStructuralFingerprint) {
 		return Plan{}, invalid("detector", "Must include name, version, and lowercase structural fingerprint")
 	}
-	if plan.Source.Provider != "github" || plan.Source.RepositoryID <= 0 || !validResolvedDigest(plan.Source.ResolvedDigest) {
+	if !validSourceIdentity(plan.Source) {
 		return Plan{}, invalid("source", "Must bind a GitHub repository and resolved digest")
 	}
 	if len(plan.Components) > 64 || len(plan.FieldProvenance) > 256 || (plan.Strategy == StrategyGeneratedNode && (len(plan.Components) < 1 || len(plan.Components) > 2)) {
@@ -285,6 +289,16 @@ func validResolvedDigest(value string) bool {
 		}
 	}
 	return true
+}
+func validSourceIdentity(source SourceIdentity) bool {
+	switch source.Provider {
+	case "github":
+		return source.RepositoryID > 0 && validResolvedDigest(source.ResolvedDigest)
+	case "local":
+		return source.RepositoryID == 0 && validDigest(source.ResolvedDigest)
+	default:
+		return false
+	}
 }
 
 func invalid(field, message string) error {

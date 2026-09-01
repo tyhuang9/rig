@@ -7,9 +7,11 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "32c2f421e8a6ba1a5ade84bbe79da9d6dec56bb197de09f23abc85234c4429dd"
+const SourceSHA256 = "cd589cb0411eb00e84863e154fcc52f38e15adfa56f797c929a28648b69729f2"
 
 var Operations = map[string]Operation{
+	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
+	"approveApplicationDeploymentPlanMigration": {Method: "POST", Path: "/api/v1/apps/{appId}/deployment-plan/migration-approval"},
 	"bootstrap":                       {Method: "POST", Path: "/api/v1/auth/bootstrap"},
 	"bootstrapStatus":                 {Method: "GET", Path: "/api/v1/auth/bootstrap/status"},
 	"cancelJob":                       {Method: "POST", Path: "/api/v1/jobs/{jobId}/cancel"},
@@ -21,6 +23,7 @@ var Operations = map[string]Operation{
 	"getApplication":                  {Method: "GET", Path: "/api/v1/apps/{appId}"},
 	"getApplicationAutoDeploy":        {Method: "GET", Path: "/api/v1/apps/{appId}/auto-deploy"},
 	"getApplicationConfiguration":     {Method: "GET", Path: "/api/v1/apps/{appId}/configuration"},
+	"getApplicationDeploymentPlan":    {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-plan"},
 	"getJob":                          {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
 	"getRelayStatus":                  {Method: "GET", Path: "/api/v1/relay/status"},
 	"grantRuntimeApproval":            {Method: "POST", Path: "/api/v1/apps/{appId}/runtime-approvals"},
@@ -61,6 +64,98 @@ var Operations = map[string]Operation{
 	"updateApplicationAutoDeploy":     {Method: "PUT", Path: "/api/v1/apps/{appId}/auto-deploy"},
 }
 
+type AcceptDeploymentPlanRequest struct {
+	CandidateID                         string                         `json:"candidateId"`
+	Components                          []DeploymentPlanComponentInput `json:"components"`
+	ExpectedCandidateDigest             string                         `json:"expectedCandidateDigest"`
+	ExpectedRevisionNumber              int64                          `json:"expectedRevisionNumber"`
+	ExpectedSourceStructuralFingerprint string                         `json:"expectedSourceStructuralFingerprint"`
+	InstallBehavior                     string                         `json:"installBehavior"`
+	MigrationCommand                    string                         `json:"migrationCommand"`
+	PackageManager                      string                         `json:"packageManager"`
+}
+
+type AnalysisAdvancedInput struct {
+	ComponentID string `json:"componentId"`
+	Field       string `json:"field"`
+	Reason      string `json:"reason"`
+	Required    bool   `json:"required"`
+}
+
+type AnalysisCommand struct {
+	Command          string             `json:"command,omitempty"`
+	Confidence       string             `json:"confidence,omitempty"`
+	Evidence         []AnalysisEvidence `json:"evidence"`
+	Origin           string             `json:"origin,omitempty"`
+	Phase            string             `json:"phase,omitempty"`
+	Present          bool               `json:"present"`
+	Provenance       string             `json:"provenance,omitempty"`
+	WorkingDirectory string             `json:"workingDirectory,omitempty"`
+}
+
+type AnalysisComponent struct {
+	Build                 AnalysisCommand     `json:"build,omitempty"`
+	Evidence              []AnalysisEvidence  `json:"evidence"`
+	Findings              []AnalysisFinding   `json:"findings"`
+	Framework             string              `json:"framework"`
+	HealthProbe           AnalysisHealthProbe `json:"healthProbe,omitempty"`
+	ID                    string              `json:"id"`
+	InternalPort          AnalysisValue       `json:"internalPort,omitempty"`
+	Kind                  string              `json:"kind"`
+	Migration             AnalysisCommand     `json:"migration,omitempty"`
+	MigrationFingerprint  string              `json:"migrationFingerprint"`
+	Name                  string              `json:"name"`
+	Origin                string              `json:"origin"`
+	RootDirectory         string              `json:"rootDirectory"`
+	Run                   AnalysisCommand     `json:"run,omitempty"`
+	StaticOutputDirectory string              `json:"staticOutputDirectory"`
+}
+
+type AnalysisEvidence struct {
+	Code   string `json:"code"`
+	Detail string `json:"detail,omitempty"`
+	Field  string `json:"field,omitempty"`
+	Path   string `json:"path,omitempty"`
+}
+
+type AnalysisFinding struct {
+	Code     string `json:"code"`
+	Field    string `json:"field,omitempty"`
+	Message  string `json:"message"`
+	Path     string `json:"path,omitempty"`
+	Severity string `json:"severity"`
+}
+
+type AnalysisHealthProbe struct {
+	Confidence string             `json:"confidence,omitempty"`
+	Evidence   []AnalysisEvidence `json:"evidence"`
+	Method     string             `json:"method,omitempty"`
+	Origin     string             `json:"origin,omitempty"`
+	Path       string             `json:"path,omitempty"`
+	Present    bool               `json:"present"`
+	Provenance string             `json:"provenance,omitempty"`
+}
+
+type AnalysisPackageManager struct {
+	Confidence string             `json:"confidence,omitempty"`
+	Evidence   []AnalysisEvidence `json:"evidence"`
+	Lockfile   string             `json:"lockfile,omitempty"`
+	Name       string             `json:"name,omitempty"`
+	Origin     string             `json:"origin,omitempty"`
+	Present    bool               `json:"present"`
+	Provenance string             `json:"provenance,omitempty"`
+	Version    string             `json:"version,omitempty"`
+}
+
+type AnalysisValue struct {
+	Confidence string             `json:"confidence,omitempty"`
+	Evidence   []AnalysisEvidence `json:"evidence"`
+	Origin     string             `json:"origin,omitempty"`
+	Present    bool               `json:"present"`
+	Provenance string             `json:"provenance,omitempty"`
+	Value      string             `json:"value,omitempty"`
+}
+
 type Application struct {
 	CreatedAt   string        `json:"createdAt"`
 	Description string        `json:"description"`
@@ -99,6 +194,12 @@ type ApplicationConfiguration struct {
 
 type ApplicationList struct {
 	Items []Application `json:"items"`
+}
+
+type ApproveDeploymentPlanMigrationRequest struct {
+	ExpectedApprovalRevision int64  `json:"expectedApprovalRevision"`
+	RevisionID               string `json:"revisionId"`
+	RevisionNumber           int64  `json:"revisionNumber"`
 }
 
 type BootstrapRequest struct {
@@ -163,6 +264,89 @@ type Deployment struct {
 
 type DeploymentList struct {
 	Items []Deployment `json:"items"`
+}
+
+type DeploymentPlanCandidate struct {
+	AdvancedInputs []AnalysisAdvancedInput `json:"advancedInputs"`
+	Components     []AnalysisComponent     `json:"components"`
+	ConfigPath     string                  `json:"configPath"`
+	Digest         string                  `json:"digest"`
+	Evidence       []AnalysisEvidence      `json:"evidence"`
+	Findings       []AnalysisFinding       `json:"findings"`
+	ID             string                  `json:"id"`
+	Install        AnalysisCommand         `json:"install,omitempty"`
+	Kind           string                  `json:"kind"`
+	MissingFields  []string                `json:"missingFields"`
+	NodeVersion    AnalysisValue           `json:"nodeVersion"`
+	Origin         string                  `json:"origin"`
+	PackageManager AnalysisPackageManager  `json:"packageManager"`
+	RootDirectory  string                  `json:"rootDirectory"`
+	Status         string                  `json:"status"`
+}
+
+type DeploymentPlanComponent struct {
+	BuildCommand    string `json:"buildCommand"`
+	HealthProbe     string `json:"healthProbe"`
+	InstallBehavior string `json:"installBehavior"`
+	InternalPort    int    `json:"internalPort"`
+	Name            string `json:"name"`
+	NodeVersion     string `json:"nodeVersion"`
+	PackageManager  string `json:"packageManager"`
+	Role            string `json:"role"`
+	RootDirectory   string `json:"rootDirectory"`
+	RunCommand      string `json:"runCommand"`
+}
+
+type DeploymentPlanComponentInput struct {
+	BuildCommand string `json:"buildCommand"`
+	ComponentID  string `json:"componentId"`
+	HealthProbe  string `json:"healthProbe"`
+	InternalPort int    `json:"internalPort"`
+	NodeVersion  string `json:"nodeVersion"`
+	RunCommand   string `json:"runCommand"`
+}
+
+type DeploymentPlanDetector struct {
+	Name                        string `json:"name"`
+	SourceStructuralFingerprint string `json:"sourceStructuralFingerprint"`
+	Version                     string `json:"version"`
+}
+
+type DeploymentPlanFieldProvenance struct {
+	Confidence int      `json:"confidence"`
+	Evidence   []string `json:"evidence"`
+	Field      string   `json:"field"`
+	Origin     string   `json:"origin"`
+}
+
+type DeploymentPlanMigration struct {
+	ApprovalStatus string `json:"approvalStatus,omitempty"`
+	ApprovedAt     string `json:"approvedAt,omitempty"`
+	ApprovedBy     string `json:"approvedBy,omitempty"`
+	Command        string `json:"command,omitempty"`
+	EvidenceDigest string `json:"evidenceDigest,omitempty"`
+	Present        bool   `json:"present"`
+}
+
+type DeploymentPlanRevision struct {
+	AcceptedAt      string                          `json:"acceptedAt,omitempty"`
+	AcceptedBy      string                          `json:"acceptedBy,omitempty"`
+	CanonicalDigest string                          `json:"canonicalDigest"`
+	Components      []DeploymentPlanComponent       `json:"components"`
+	Detector        DeploymentPlanDetector          `json:"detector"`
+	FieldProvenance []DeploymentPlanFieldProvenance `json:"fieldProvenance"`
+	Migration       DeploymentPlanMigration         `json:"migration"`
+	RevisionID      string                          `json:"revisionId,omitempty"`
+	RevisionNumber  int64                           `json:"revisionNumber"`
+	Source          DeploymentPlanSource            `json:"source"`
+	State           string                          `json:"state"`
+	Strategy        string                          `json:"strategy"`
+}
+
+type DeploymentPlanSource struct {
+	Provider       string `json:"provider"`
+	RepositoryID   int64  `json:"repositoryId"`
+	ResolvedDigest string `json:"resolvedDigest"`
 }
 
 type DetectedService struct {
@@ -278,6 +462,7 @@ type InspectRequest struct {
 }
 
 type InspectResponse struct {
+	Analysis          SourceAnalysis    `json:"analysis"`
 	ComposeCandidates []string          `json:"composeCandidates"`
 	Findings          []SourceFinding   `json:"findings"`
 	ResolvedSha       string            `json:"resolvedSha,omitempty"`
@@ -519,6 +704,15 @@ type ServiceList struct {
 type SessionResponse struct {
 	CSRFToken string `json:"csrfToken"`
 	User      User   `json:"user"`
+}
+
+type SourceAnalysis struct {
+	Candidates            []DeploymentPlanCandidate `json:"candidates"`
+	Findings              []AnalysisFinding         `json:"findings"`
+	ResolvedDigest        string                    `json:"resolvedDigest"`
+	SchemaVersion         string                    `json:"schemaVersion"`
+	Source                SourceSummary             `json:"source"`
+	StructuralFingerprint string                    `json:"structuralFingerprint"`
 }
 
 type SourceConnection struct {

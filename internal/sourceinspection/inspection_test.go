@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/hostd/hostd/internal/githubapp"
@@ -15,6 +16,7 @@ const testSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 type fakeReader struct {
 	tree         githubapp.Tree
 	content      []byte
+	contents     map[string][]byte
 	repository   sourceconnections.SourceRepository
 	branch       sourceconnections.Branch
 	contentReads int
@@ -35,6 +37,9 @@ func (reader *fakeReader) ReadContent(_ context.Context, _ string, _ string, ins
 	reader.contentReads++
 	reader.installation = installation
 	reader.contentScope = repository
+	if content, ok := reader.contents[path]; ok {
+		return content, nil
+	}
 	return reader.content, nil
 }
 
@@ -131,6 +136,51 @@ func TestInspectLocalDiscoversAndParsesCompose(t *testing.T) {
 	}
 	if result.Source.Type != "local" || len(result.Services) != 1 || result.Services[0].Name != "web" {
 		t.Fatalf("result=%#v", result)
+	}
+}
+
+func TestInspectLocalInfersJavaScriptProjectWithoutExecutingIt(t *testing.T) {
+	root := t.TempDir()
+	manifest := []byte(`{"scripts":{"build":"vite build"},"dependencies":{"vite":"6"}}`)
+	if err := os.WriteFile(filepath.Join(root, "package.json"), manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "package-lock.json"), []byte(`{"lockfileVersion":3}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := InspectLocalContext(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Analysis.Candidates) != 1 || result.Analysis.Candidates[0].Status != "ready" || result.Analysis.StructuralFingerprint == "" {
+		t.Fatalf("analysis=%#v", result.Analysis)
+	}
+	if len(result.Findings) != 0 || result.Source.ComposePath != "" {
+		t.Fatalf("generated candidate was forced through Compose selection: %#v", result)
+	}
+}
+
+func TestInspectGitHubInfersJavaScriptMetadataWithoutCompose(t *testing.T) {
+	manifest := []byte(`{"scripts":{"start":"node server.js"},"dependencies":{"express":"5"}}`)
+	lock := []byte(`{"lockfileVersion":3}`)
+	reader := &fakeReader{
+		repository: sourceconnections.SourceRepository{ID: 9, Owner: "o", Name: "r"},
+		branch:     sourceconnections.Branch{Name: "main", SHA: testSHA},
+		tree: githubapp.Tree{Entries: []githubapp.TreeEntry{
+			{Path: "package.json", Type: "blob", Size: int64(len(manifest)), SHA: testSHA},
+			{Path: "package-lock.json", Type: "blob", Size: int64(len(lock)), SHA: testSHA},
+		}},
+		contents: map[string][]byte{"package.json": manifest, "package-lock.json": lock},
+	}
+	result, err := InspectGitHub(context.Background(), reader, "owner", GitHubSource{ConnectionID: "c", InstallationID: 1, RepositoryID: 9, Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Analysis.Candidates) != 1 || result.Analysis.Candidates[0].Status != "needs_input" || reader.contentReads != 1 {
+		t.Fatalf("analysis=%#v reads=%d", result.Analysis, reader.contentReads)
+	}
+	if !slices.Contains(result.Analysis.Candidates[0].MissingFields, "components.app.internal_port") || !slices.Contains(result.Analysis.Candidates[0].MissingFields, "components.app.health_probe") {
+		t.Fatalf("server review fields=%#v", result.Analysis.Candidates[0].MissingFields)
 	}
 }
 

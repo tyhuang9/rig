@@ -200,6 +200,18 @@ func TestMaterializePinsAcceptedDeploymentPlanRevision(t *testing.T) {
 	if _, err := db.Exec(`UPDATE releases SET deployment_plan_revision_number=2 WHERE id=?`, pinned.ID); err == nil {
 		t.Fatal("immutable deployment plan provenance accepted")
 	}
+	mismatchID := "22222222-2222-2222-8222-222222222222"
+	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at)
+		VALUES(?,?,2,?,'generated_node','package-json','1',?,'github',7,?,?,1,1,'','owner',datetime('now'),'accepted','owner',datetime('now'))`, mismatchID, app, "apps/"+app+"/deployment-plans/"+mismatchID+".secret", strings.Repeat("c", 64), strings.Repeat("d", 40), strings.Repeat("e", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE deployment_plan_heads SET revision_id=?,revision_number=2,updated_at=datetime('now') WHERE app_id=?`, mismatchID, app); err != nil {
+		t.Fatal(err)
+	}
+	mismatched, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil || mismatched.DeploymentPlanRevisionID != "" || mismatched.DeploymentPlanRevisionNumber != 0 {
+		t.Fatalf("mismatched=%#v err=%v", mismatched, err)
+	}
 }
 
 func TestReadyReleaseReturnsOnlyAppBoundReadyValidatedWorkspace(t *testing.T) {

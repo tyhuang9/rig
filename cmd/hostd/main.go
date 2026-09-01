@@ -22,6 +22,7 @@ import (
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/jobs"
@@ -109,6 +110,15 @@ func runServer(args []string) int {
 		return 1
 	}
 	applications := apps.New(db)
+	planStore, err := deploymentplans.New(db, cfg.DataRoot)
+	if err != nil {
+		logger.Error("deployment plan storage setup failed", "error", err)
+		return 1
+	}
+	if err := planStore.Recover(context.Background()); err != nil {
+		logger.Error("deployment plan recovery failed", "error", err)
+		return 1
+	}
 	deploymentRepository := deployments.New(db)
 	temporary, err := securetemp.New(cfg.DataRoot)
 	if err != nil {
@@ -154,7 +164,7 @@ func runServer(args []string) int {
 		return newControllerRelayRuntime(cfg, db, sources, logger, autoDeployWake, autoDeployReconcile)
 	})
 	effectiveAutoDeploy := cfg.ComposeRuntime && cfg.GitHubConnectionsEnabled() && sources.ProviderEnabled()
-	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, ComposeRuntime: cfg.ComposeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, DeploymentPlans: planStore, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, ComposeRuntime: cfg.ComposeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -45,6 +45,18 @@ func TestCanonicalDigestSortsUnorderedMetadata(t *testing.T) {
 	}
 }
 
+func TestCanonicalPlanAcceptsLocalSnapshotIdentity(t *testing.T) {
+	plan := testPlan()
+	plan.Source = SourceIdentity{Provider: "local", RepositoryID: 0, ResolvedDigest: strings.Repeat("d", 64)}
+	if _, err := CanonicalDigest(plan); err != nil {
+		t.Fatalf("local plan rejected: %v", err)
+	}
+	plan.Source.ResolvedDigest = strings.Repeat("d", 40)
+	if _, err := CanonicalDigest(plan); err == nil {
+		t.Fatal("short local digest accepted")
+	}
+}
+
 func TestStorePersistsProtectedImmutableRevisionAndCASHead(t *testing.T) {
 	db := planDB(t)
 	root := t.TempDir()
@@ -110,6 +122,50 @@ func TestRecoverDeletesRecognizedOrphanOnly(t *testing.T) {
 	}
 	if err := store.Recover(context.Background()); err == nil {
 		t.Fatal("unrecognized file accepted")
+	}
+}
+
+func TestApproveMigrationIsCASAndAudited(t *testing.T) {
+	db := planDB(t)
+	store, err := New(db, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := store.Replace(context.Background(), planTestApp, "owner", ReplaceInput{Plan: testPlan()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApproveMigration(context.Background(), planTestApp, revision.ID, revision.RevisionNumber, 0, "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApproveMigration(context.Background(), planTestApp, revision.ID, revision.RevisionNumber, 0, "owner"); !IsCode(err, "migration_approval_conflict") {
+		t.Fatalf("second approval=%v", err)
+	}
+	loaded, err := store.GetRevision(context.Background(), planTestApp, revision.ID, revision.RevisionNumber)
+	if err != nil || loaded.Plan.Migration.Approval.Status != MigrationApprovalApproved || loaded.Plan.Migration.Approval.ActorID != "owner" {
+		t.Fatalf("approval=%#v err=%v", loaded.Plan.Migration, err)
+	}
+	var metadata string
+	if err := db.QueryRow(`SELECT metadata_json FROM audit_events WHERE action='deployment_plan.migration.approve'`).Scan(&metadata); err != nil || !strings.Contains(metadata, revision.ID) || strings.Contains(metadata, "npm run migrate") {
+		t.Fatalf("audit=%q err=%v", metadata, err)
+	}
+}
+
+func TestApproveMigrationRejectsSupersededRevision(t *testing.T) {
+	db := planDB(t)
+	store, err := New(db, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Replace(context.Background(), planTestApp, "owner", ReplaceInput{Plan: testPlan()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Replace(context.Background(), planTestApp, "owner", ReplaceInput{ExpectedRevisionNumber: first.RevisionNumber, Plan: testPlan()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApproveMigration(context.Background(), planTestApp, first.ID, first.RevisionNumber, 0, "owner"); !IsCode(err, "deployment_plan_conflict") {
+		t.Fatalf("stale approval=%v", err)
 	}
 }
 
