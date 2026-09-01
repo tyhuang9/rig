@@ -62,7 +62,8 @@ jobs:
           set -euo pipefail
           containers="$(docker ps --all --filter label=io.rig.managed --format '{{.ID}} {{.Names}} {{.Status}}')"
           networks="$(docker network ls --filter label=io.rig.managed --format '{{.ID}} {{.Name}}')"
-          if [[ -n "$containers" || -n "$networks" ]] || docker volume inspect rig-generated-caddy-config-v1 >/dev/null 2>&1; then
-            printf 'Generated runtime resources were not cleaned up.\nContainers:\n%s\nNetworks:\n%s\n' "$containers" "$networks" >&2
+          images="$(docker image ls --filter label=io.rig.managed=generated-image --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
+          if [[ -n "$containers" || -n "$networks" || -n "$images" ]] || docker volume inspect rig-generated-caddy-config-v1 >/dev/null 2>&1; then
+            printf 'Generated runtime resources were not cleaned up.\nContainers:\n%s\nNetworks:\n%s\nImages:\n%s\n' "$containers" "$networks" "$images" >&2
             exit 1
           fi
