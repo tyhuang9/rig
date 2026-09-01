@@ -136,46 +136,42 @@ func liveIngressListenReason(ctx context.Context, manager *Manager) (string, str
 	if attachment == nil {
 		return "drift", "attachment_missing"
 	}
-	attachmentIP := attachment.IPAddress
 	if ctx.Err() != nil {
-		attachmentIP = ""
 		return "unavailable", "network_unavailable"
 	}
 	network, networkFound, networkErr := manager.inspectNetwork(ctx, caddyNetworkName)
 	defer clearLiveNetworkInspection(&network)
 	if networkErr != nil {
-		attachmentIP = ""
 		return "drift", "network_unavailable"
 	}
 	if !networkFound {
-		attachmentIP = ""
 		return "drift", "network_missing"
 	}
 	expectedIP, networkValid := ingressNetworkIdentity(network)
 	if !networkValid {
-		attachmentIP = ""
 		expectedIP = ""
 		return "drift", "network_invalid"
 	}
-	if attachmentIP == "" {
+	if len(network.Containers) == 0 || network.Containers[0].IPv4Address == "" {
 		expectedIP = ""
 		return "drift", "ip_missing"
 	}
-	parsedIP, parseErr := netip.ParseAddr(attachmentIP)
-	if parseErr != nil {
-		attachmentIP = ""
+	if len(network.Containers) != 1 || normalizeID(network.Containers[0].ID) != normalizeID(caddy.ID) || network.Containers[0].Name != caddyContainerName {
 		expectedIP = ""
 		return "drift", "ip_invalid"
 	}
-	if attachmentIP == expectedIP {
-		attachmentIP = ""
+	parsedPrefix, parseErr := netip.ParsePrefix(network.Containers[0].IPv4Address)
+	if parseErr != nil || !parsedPrefix.Addr().Is4() {
+		expectedIP = ""
+		return "drift", "ip_invalid"
+	}
+	if parsedPrefix.Addr().String() == expectedIP {
 		expectedIP = ""
 		return "valid", "ip_expected"
 	}
 	prefix, prefixErr := netip.ParsePrefix(network.IPAM[0].Subnet)
-	attachmentIP = ""
 	expectedIP = ""
-	if prefixErr == nil && prefix.Contains(parsedIP) {
+	if prefixErr == nil && prefix.Contains(parsedPrefix.Addr()) {
 		return "drift", "ip_other_in_subnet"
 	}
 	return "drift", "ip_outside_subnet"
@@ -696,6 +692,10 @@ func clearLiveNetworkInspection(value *networkInspection) {
 	clear(value.Options)
 	clear(value.Labels)
 	clear(value.IPAM)
+	for index := range value.Containers {
+		value.Containers[index] = networkContainerInspection{}
+	}
+	clear(value.Containers)
 	*value = networkInspection{}
 }
 
@@ -874,7 +874,7 @@ func TestLiveIngressInspectionClearHelpersZeroDecodedState(t *testing.T) {
 	_, runner := newManagerFixture(t, false)
 	image := imageInspection{ID: "sensitive", OS: "linux", RepoDigests: []string{"sensitive"}}
 	volume := volumeInspection{Name: "sensitive", Options: map[string]string{"sensitive": "sensitive"}, Labels: map[string]string{"sensitive": "sensitive"}}
-	network := networkInspection{Name: "sensitive", Options: map[string]string{"sensitive": "sensitive"}, IPAM: []networkIPAM{{Subnet: "sensitive"}}, Labels: map[string]string{"sensitive": "sensitive"}}
+	network := networkInspection{Name: "sensitive", Options: map[string]string{"sensitive": "sensitive"}, IPAM: []networkIPAM{{Subnet: "sensitive"}}, Labels: map[string]string{"sensitive": "sensitive"}, Containers: []networkContainerInspection{{ID: "sensitive", Name: "sensitive", IPv4Address: "sensitive"}}}
 	caddy := runner.caddyInspection()
 	clearLiveImageInspection(&image)
 	clearLiveVolumeInspection(&volume)
@@ -1126,7 +1126,7 @@ func TestLiveIngressRouteFailureDiagnosticIsReadOnlyAndIndependent(t *testing.T)
 	}
 
 	manager, runner = newManagerFixture(t, false)
-	runner.caddyNetworks[caddyNetworkName].IPAddress = "10.0.0.1"
+	runner.ingressContainers[0].IPv4Address = "10.0.0.1/28"
 	if diagnostic := liveIngressRouteFailureDiagnostic(context.Background(), manager, switchRequest(runner)); diagnostic != "route_snapshot=listen:drift,listen_reason:ip_outside_subnet,endpoints:valid" {
 		t.Fatalf("listen drift diagnostic = %q", diagnostic)
 	}

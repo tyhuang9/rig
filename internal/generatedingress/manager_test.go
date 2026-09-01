@@ -21,6 +21,7 @@ type ingressRunner struct {
 	network            string
 	endpoint           generatedruntime.RouteEndpoint
 	caddyNetworks      map[string]*networkAttachment
+	ingressContainers  []networkContainerInspection
 	files              map[string][]byte
 	commands           [][]string
 	failProposedReload bool
@@ -53,7 +54,11 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 				return runtimeprocess.CommandResult{Stderr: []byte("no such network")}, errors.New("missing")
 			}
 			subnet, gateway, _ := ingressNetworkCandidate(0)
-			return jsonResult(networkInspection{Name: caddyNetworkName, Driver: "bridge", Scope: "local", Options: map[string]string{}, IPAM: []networkIPAM{{Subnet: subnet, Gateway: gateway}}, Labels: map[string]string{"io.rig.managed": "generated-ingress-network", "io.rig.identity-version": "v1"}}), nil
+			containers := r.ingressContainers
+			if r.caddyMissing {
+				containers = nil
+			}
+			return jsonResult(networkInspection{Name: caddyNetworkName, Driver: "bridge", Scope: "local", Options: map[string]string{}, IPAM: []networkIPAM{{Subnet: subnet, Gateway: gateway}}, Labels: map[string]string{"io.rig.managed": "generated-ingress-network", "io.rig.identity-version": "v1"}, Containers: containers}), nil
 		}
 		return jsonResult(networkInspection{Name: r.network, Driver: "bridge", Scope: "local", Options: map[string]string{}, Labels: map[string]string{"io.rig.managed": generatedruntime.NetworkOwnershipLabelValue, "io.rig.application": r.appID}}), nil
 	}
@@ -96,6 +101,7 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 			return runtimeprocess.CommandResult{}, errors.New("missing static ingress address")
 		}
 		r.caddyNetworks[caddyNetworkName] = &networkAttachment{IPAddress: args[ipIndex+1]}
+		r.ingressContainers = []networkContainerInspection{{ID: strings.Repeat("d", 64), Name: caddyContainerName, IPv4Address: args[ipIndex+1] + "/28"}}
 		return runtimeprocess.CommandResult{}, nil
 	}
 	if len(args) == 4 && args[0] == "container" && args[1] == "cp" {
@@ -431,9 +437,49 @@ func TestLowIngressCapacityBecomesReplacementCapacityDiagnostic(t *testing.T) {
 
 func TestProvisionRejectsListenerAddressOutsideOwnedSubnet(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	runner.caddyNetworks[caddyNetworkName].IPAddress = "10.203.0.3"
+	_, _, expected := ingressNetworkCandidate(0)
+	runner.caddyNetworks[caddyNetworkName].IPAddress = expected
+	runner.ingressContainers[0].IPv4Address = "10.203.0.3/28"
 	if err := manager.Provision(context.Background()); !IsCode(err, DiagnosticIngressDrift) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestCaddyIngressAddressRequiresExactNetworkEndpoint(t *testing.T) {
+	caddyID := "sha256:" + strings.Repeat("d", 64)
+	subnet, gateway, expected := ingressNetworkCandidate(0)
+	valid := func() networkInspection {
+		return networkInspection{
+			Name: caddyNetworkName, Driver: "bridge", Scope: "local", Options: map[string]string{},
+			IPAM:       []networkIPAM{{Subnet: subnet, Gateway: gateway}},
+			Labels:     map[string]string{"io.rig.managed": "generated-ingress-network", "io.rig.identity-version": "v1"},
+			Containers: []networkContainerInspection{{ID: strings.Repeat("d", 64), Name: caddyContainerName, IPv4Address: expected + "/28"}},
+		}
+	}
+	if address, ok := caddyIngressAddress(valid(), caddyID); !ok || address != expected {
+		t.Fatalf("valid endpoint address = %q, valid = %t", address, ok)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*networkInspection)
+	}{
+		{"missing", func(value *networkInspection) { value.Containers = nil }},
+		{"extra", func(value *networkInspection) { value.Containers = append(value.Containers, value.Containers[0]) }},
+		{"foreign id", func(value *networkInspection) { value.Containers[0].ID = strings.Repeat("e", 64) }},
+		{"wrong name", func(value *networkInspection) { value.Containers[0].Name = "foreign" }},
+		{"missing cidr", func(value *networkInspection) { value.Containers[0].IPv4Address = expected }},
+		{"wrong prefix", func(value *networkInspection) { value.Containers[0].IPv4Address = expected + "/24" }},
+		{"other address", func(value *networkInspection) { value.Containers[0].IPv4Address = "10.203.0.3/28" }},
+		{"outside subnet", func(value *networkInspection) { value.Containers[0].IPv4Address = "10.0.0.2/28" }},
+		{"invalid network", func(value *networkInspection) { value.Labels = nil }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := valid()
+			test.mutate(&candidate)
+			if address, ok := caddyIngressAddress(candidate, caddyID); ok || address != "" {
+				t.Fatalf("unsafe endpoint address = %q, valid = %t", address, ok)
+			}
+		})
 	}
 }
 
@@ -566,6 +612,26 @@ func TestIngressInspectFormatsUseCanonicalDockerFieldsAndNilGuards(t *testing.T)
 	if image.ID != imageID || image.OS != "linux" || len(image.RepoDigests) != 1 || image.RepoDigests[0] != "caddy@digest" {
 		t.Fatalf("image inspection = %#v", image)
 	}
+	subnet, gateway, ingressAddress := ingressNetworkCandidate(0)
+	networkInput := templateIngressDockerNetwork{
+		Name: caddyNetworkName, Driver: "bridge", Scope: "local", Options: map[string]string{},
+		IPAM:   templateIngressDockerIPAM{Config: []networkIPAM{{Subnet: subnet, Gateway: gateway}}},
+		Labels: map[string]string{"io.rig.managed": "generated-ingress-network", "io.rig.identity-version": "v1"},
+		Containers: map[string]templateIngressDockerNetworkContainer{
+			strings.Repeat("d", 64): {Name: caddyContainerName, IPv4Address: ingressAddress + "/28", EndpointID: "sensitive-endpoint", MacAddress: "sensitive-mac", IPv6Address: "sensitive-ipv6"},
+		},
+	}
+	var network networkInspection
+	renderedNetwork := renderIngressInspectTemplate(t, networkInspectFormat, networkInput)
+	if strings.Contains(renderedNetwork, "sensitive-endpoint") || strings.Contains(renderedNetwork, "sensitive-mac") || strings.Contains(renderedNetwork, "sensitive-ipv6") {
+		t.Fatal("network inspection projected a non-allowlisted endpoint field")
+	}
+	if err := json.Unmarshal([]byte(renderedNetwork), &network); err != nil {
+		t.Fatal("network inspection template output was not JSON")
+	}
+	if len(network.Containers) != 1 || network.Containers[0].ID != strings.Repeat("d", 64) || network.Containers[0].Name != caddyContainerName || network.Containers[0].IPv4Address != ingressAddress+"/28" {
+		t.Fatalf("network container projection = %#v", network.Containers)
+	}
 
 	containerID := strings.Repeat("b", 64)
 	networkName := "rig-app-network"
@@ -670,7 +736,12 @@ func newManagerFixture(t *testing.T, failReload bool) (*Manager, *ingressRunner)
 	appID := "11111111-1111-4111-8111-111111111111"
 	endpoint := endpoint("web", "server", "rig-app-network", "web-blue", 3000, 'b')
 	_, _, ingressIP := ingressNetworkCandidate(0)
-	runner := &ingressRunner{appID: appID, network: endpoint.NetworkName, endpoint: endpoint, caddyNetworks: map[string]*networkAttachment{caddyNetworkName: {IPAddress: ingressIP}}, files: map[string][]byte{}, failProposedReload: failReload}
+	runner := &ingressRunner{
+		appID: appID, network: endpoint.NetworkName, endpoint: endpoint,
+		caddyNetworks:     map[string]*networkAttachment{caddyNetworkName: {}},
+		ingressContainers: []networkContainerInspection{{ID: strings.Repeat("d", 64), Name: caddyContainerName, IPv4Address: ingressIP + "/28"}},
+		files:             map[string][]byte{}, failProposedReload: failReload,
+	}
 	manager, err := New(runner, Options{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: dockerConfig, WorkingDirectory: root, DataRoot: root})
 	if err != nil {
 		t.Fatal(err)
@@ -759,7 +830,38 @@ type templateIngressDockerNetworkSettings struct {
 	Networks map[string]*networkAttachment
 }
 
+type templateIngressDockerNetwork struct {
+	Name       string
+	Driver     string
+	Scope      string
+	Internal   bool
+	Options    map[string]string
+	IPAM       templateIngressDockerIPAM
+	Labels     map[string]string
+	Containers map[string]templateIngressDockerNetworkContainer
+}
+
+type templateIngressDockerIPAM struct {
+	Config []networkIPAM
+}
+
+type templateIngressDockerNetworkContainer struct {
+	Name        string
+	IPv4Address string
+	EndpointID  string
+	MacAddress  string
+	IPv6Address string
+}
+
 func executeIngressInspectTemplate(t *testing.T, format string, input, output any) {
+	t.Helper()
+	rendered := renderIngressInspectTemplate(t, format, input)
+	if err := json.Unmarshal([]byte(rendered), output); err != nil {
+		t.Fatal("Docker inspection template output was not JSON")
+	}
+}
+
+func renderIngressInspectTemplate(t *testing.T, format string, input any) string {
 	t.Helper()
 	templateValue, err := template.New("docker-inspect").Funcs(template.FuncMap{
 		"json": func(value any) (string, error) {
@@ -774,9 +876,7 @@ func executeIngressInspectTemplate(t *testing.T, format string, input, output an
 	if err := templateValue.Execute(&rendered, input); err != nil {
 		t.Fatal("Docker inspection template did not execute")
 	}
-	if err := json.Unmarshal([]byte(rendered.String()), output); err != nil {
-		t.Fatal("Docker inspection template output was not JSON")
-	}
+	return rendered.String()
 }
 
 func jsonResult(value any) runtimeprocess.CommandResult {
