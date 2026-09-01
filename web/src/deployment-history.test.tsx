@@ -681,6 +681,29 @@ describe("DeploymentHistoryPanel", () => {
     expect(document.body.textContent).not.toContain("secret-command-value");
   });
 
+  it("keeps generated pause recovery unavailable without its pinned runtime", async () => {
+    mockData({
+      deployments: [generatedDeployment] as never,
+      releases: [generatedRelease] as never,
+      approvals: [],
+      jobs: [
+        generatedWaitingJob("insufficient_replacement_capacity"),
+      ] as never,
+    });
+    vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan as never);
+    renderPanel({ composeRuntime: true, generatedRuntime: false });
+
+    expect(
+      await screen.findByText(
+        "The runtime pinned to this deployment is not available on this controller.",
+      ),
+    ).not.toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Retry replacement capacity" }),
+    ).toBeNull();
+    expect(api.resumeJob).not.toHaveBeenCalled();
+  });
+
   it("uses the selected current or original configuration for ready prior releases", async () => {
     renderPanel();
     fireEvent.click(
