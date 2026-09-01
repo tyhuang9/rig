@@ -643,7 +643,7 @@ func liveProbeAttest(ctx context.Context, c liveProbeConfig, id []byte, f livePr
 var errLiveProbe = errors.New("live probe command failed")
 
 func testProbeConfig(r runtimeprocess.CommandRunner) liveProbeConfig {
-	return liveProbeConfig{runner: r, executable: "docker", directory: "test", env: []string{"DOCKER_CONFIG=test"}, image: "sha256:" + strings.Repeat("a", 64), command: "node server.mjs", network: "rig-private", alias: "runtime-blue", hostname: "runtime-blue-container", user: "node", workdir: "/workspace", internalPort: "8080", healthPath: "/healthz", tmpfs: "/tmp:rw,noexec,nosuid,nodev,size=16777216", memory: "134217728", cpus: "0.500", pids: "128", logSize: "1m", logFiles: "1"}
+	return liveProbeConfig{runner: r, executable: "docker", directory: "test", env: []string{"DOCKER_CONFIG=test"}, image: "sha256:" + strings.Repeat("a", 64), command: "node server.mjs", network: "rig-private", alias: "runtime-blue", hostname: "runtime-blue-container", user: "node", workdir: "/workspace", internalPort: "8080", healthPath: "/healthz", tmpfs: "/tmp:rw,noexec,nosuid,nodev,size=16777216", memory: "134217728", cpus: "0.500", pids: "128", logSize: "1m", logFiles: "2"}
 }
 func testProbeFixture(t *testing.T) liveProbeFixture {
 	t.Helper()

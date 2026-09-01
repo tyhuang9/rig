@@ -941,7 +941,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	runner := &liveCreateObserver{delegate: runtimeprocess.ExecRunner{}}
 	limits := generatedruntime.ContainerLimits{
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
-		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 1,
+		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
 	engine, err := generatedruntime.NewEngine(runner, liveEnvironmentStager{}, liveCapacitySource{}, generatedruntime.EngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,

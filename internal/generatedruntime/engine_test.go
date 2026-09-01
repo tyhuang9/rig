@@ -343,6 +343,51 @@ func TestGeneratedRuntimeDerivesDiskAdmissionFromMaximumLogs(t *testing.T) {
 	}
 }
 
+func TestGeneratedRuntimeRequiresTwoLocalLogFiles(t *testing.T) {
+	root := t.TempDir()
+	config := filepath.Join(root, "docker-config")
+	if err := os.Mkdir(config, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	options := EngineOptions{
+		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root,
+		CommandTimeout: time.Second, HealthTimeout: time.Second, HealthPollInterval: 100 * time.Millisecond,
+		OutputLimit: 1024, Limits: defaultLimits(), ReplacementDiskBytes: 1 << 30,
+	}
+	for _, test := range []struct {
+		files int
+		valid bool
+	}{
+		{files: 0, valid: false},
+		{files: 1, valid: false},
+		{files: 2, valid: true},
+		{files: 10, valid: true},
+		{files: 11, valid: false},
+	} {
+		options.Limits.LogFiles = test.files
+		if got := validEngineOptions(options); got != test.valid {
+			t.Fatalf("validEngineOptions with max-file=%d = %t, want %t", test.files, got, test.valid)
+		}
+	}
+
+	engine, err := NewEngine(
+		&runtimeFakeRunner{run: func(runtimeprocess.CommandRequest) runtimeRequestResult { return runtimeRequestResult{} }},
+		&runtimeFakeEnvironment{path: filepath.Join(root, "runtime.env")},
+		fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}},
+		EngineOptions{
+			DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root,
+			CommandTimeout: time.Second, HealthTimeout: time.Second, HealthPollInterval: 100 * time.Millisecond,
+			OutputLimit: 1024, ReplacementDiskBytes: 1 << 30,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if engine.options.Limits.LogFiles != 3 {
+		t.Fatalf("default log files = %d, want 3", engine.options.Limits.LogFiles)
+	}
+}
+
 func TestGeneratedRuntimeHardeningRequiresAliasAndExactTmpfsPolicy(t *testing.T) {
 	spec := candidateSpec()
 	candidate := candidateForSpec(spec)

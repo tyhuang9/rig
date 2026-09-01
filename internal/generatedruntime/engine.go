@@ -758,7 +758,8 @@ func validEngineOptions(options EngineOptions) bool {
 		return false
 	}
 	limits := options.Limits
-	if limits.MemoryBytes < 64<<20 || limits.MemoryBytes > 64<<30 || limits.MilliCPUs < 100 || limits.MilliCPUs > 16000 || limits.PIDs < 32 || limits.PIDs > 4096 || limits.TmpfsBytes < 1<<20 || limits.TmpfsBytes > 1<<30 || limits.LogFiles < 1 || limits.LogFiles > 10 {
+	// Docker's local log driver enables compression by default and rejects max-file=1.
+	if limits.MemoryBytes < 64<<20 || limits.MemoryBytes > 64<<30 || limits.MilliCPUs < 100 || limits.MilliCPUs > 16000 || limits.PIDs < 32 || limits.PIDs > 4096 || limits.TmpfsBytes < 1<<20 || limits.TmpfsBytes > 1<<30 || limits.LogFiles < 2 || limits.LogFiles > 10 {
 		return false
 	}
 	if limits.LogSize != "1m" && limits.LogSize != "5m" && limits.LogSize != "10m" && limits.LogSize != "20m" && limits.LogSize != "50m" {
