@@ -354,6 +354,13 @@ describe("AutoDeployPanel", () => {
     if (resume) expect(screen.getByText(/Resume to ask Rig to revalidate and retry/i)).not.toBeNull();
   });
 
+  it("routes plan-review pauses to the deployment setup panel", async () => {
+    mockData({ enabled: true, state: "paused", pauseCode: "deployment_plan_review_required" });
+    renderPanel();
+    const action = await screen.findByRole("link", { name: "Review deployment setup" });
+    expect(action.getAttribute("href")).toBe("#application-plan-title");
+  });
+
   it.each(["approval_required", "migration_approval_required", "insufficient_replacement_capacity"])("routes active-job pause %s to deployment history", async (pauseCode) => {
     mockData({ enabled: true, state: "paused", pauseCode, activeJobId: "job-1" });
     renderPanel();

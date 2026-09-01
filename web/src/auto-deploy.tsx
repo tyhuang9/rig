@@ -444,6 +444,7 @@ export function AutoDeployPanel({
         {status.enabled && !canDisable && <span id="auto-deploy-disable-reason" className="auto-deploy-disabled-reason">{!knownState ? unknownStateReason : manualReloadRequired ? "Reload status successfully before changing auto-deploy." : busyReason || "Auto-deploy is being updated."}</span>}
         {resumeMeaningful && <button className="button" type="button" onClick={performResume} disabled={!canResume} aria-describedby={canResume ? undefined : "auto-deploy-resume-reason"}>{resume.isPending && activeResume ? "Resuming…" : "Resume"}</button>}
         {resumeMeaningful && !canResume && <span id="auto-deploy-resume-reason" className="auto-deploy-disabled-reason">{manualReloadRequired ? "Reload status successfully before resuming auto-deploy." : sourceAccessResumeReason || "Auto-deploy is being updated."}</span>}
+        {status.state === "paused" && status.pauseCode === "deployment_plan_review_required" && <a className="button small" href="#application-plan-title">Review deployment setup</a>}
         {status.state === "paused" && jobResumePauseCodes.has(status.pauseCode ?? "") && <a className="button small" href="#deployment-history-title">Review waiting deployment</a>}
         {sourceAccessPause && sourceAccessResumeReason && <button className="button small" type="button" onClick={(event) => void refreshSourceAccessRecovery(event.currentTarget)}>Retry connection check</button>}
       </div>

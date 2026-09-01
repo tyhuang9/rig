@@ -14,6 +14,7 @@ import {
 } from "./api";
 import { SourceWizard } from "./source-wizard";
 import { ApplicationConfigurationPanel } from "./application-configuration";
+import { ApplicationPlanPanel } from "./application-plan-panel";
 import { AutoDeployPanel } from "./auto-deploy";
 import { DeploymentHistoryPanel } from "./deployment-history";
 import { UnsavedChangesGuard, useConfirmDiscard } from "./unsaved-changes";
@@ -222,6 +223,7 @@ function ApplicationDetailPage() {
     <p className="section-kicker">Overview</p>
     <div className="summary"><article><small>Current deployment</small><strong>{currentDeployment ? <StatusText value={currentDeployment.status}/> : deploymentQuery.isLoading ? "Loading..." : "Not deployed"}</strong><span>{currentDeployment ? `Configuration ${currentDeployment.configurationMode}` : deploymentQuery.isError ? "History unavailable" : "No deployment record"}</span></article><article><small>Source</small><strong className="mono">{app.slug}</strong><span>Runtime is not inferred</span></article><article><small>Health</small><strong>Not verified</strong><span>Health reporting is not available</span></article></div>
     {fakeRuntime ? <div className="callout warning"><strong>Development capability</strong><span>The fake runtime persists job progress but executes no workload.</span></div> : !composeRuntime && !generatedRuntime && <div className="callout info"><strong>Runtime actions unavailable</strong><span>Configure a runtime to deploy this application.</span></div>}
+    <ApplicationPlanPanel app={app}/>
     <AutoDeployPanel appId={id} composeRuntime={composeRuntime} generatedRuntime={generatedRuntime} githubConnections={statusQuery.data.capabilities.githubConnections}/>
     <DeploymentHistoryPanel appId={id} composeRuntime={composeRuntime} fakeRuntime={fakeRuntime} generatedRuntime={generatedRuntime}/>
     <ApplicationConfigurationPanel appId={id}/>
