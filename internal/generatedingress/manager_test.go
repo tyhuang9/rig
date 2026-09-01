@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"text/template"
@@ -170,7 +171,7 @@ func (r *ingressRunner) caddyInspection() caddyInspection {
 	return caddyInspection{
 		ID: "sha256:" + strings.Repeat("d", 64), Name: "/" + caddyContainerName, Image: "sha256:" + strings.Repeat("a", 64),
 		Labels: map[string]string{"io.rig.managed": "generated-ingress", "io.rig.identity-version": "v1", "io.rig.listener-isolation": "v1"}, Hostname: caddyContainerName, User: "1000:1000", Env: []string{"XDG_CONFIG_HOME=/config", "XDG_DATA_HOME=/data"},
-		Cmd: []string{"run", "--config", "/config/active.json"}, ReadOnly: true, CapDrop: []string{"ALL"}, SecurityOpt: []string{"no-new-privileges"},
+		Entrypoint: []string{caddyExecutable}, Cmd: []string{"run", "--config", "/config/active.json"}, ReadOnly: true, CapDrop: []string{"ALL"}, SecurityOpt: []string{"no-new-privileges"},
 		Mounts: []mountInspection{{Type: "volume", Name: caddyVolumeName, Destination: "/config", RW: true}}, Tmpfs: map[string]string{"/data": "rw,noexec,nosuid,nodev,size=67108864"},
 		Memory: 268435456, MemorySwap: 268435456, NanoCPUs: 1_000_000_000, PIDsLimit: 128, LogType: "local", LogConfig: map[string]string{"max-size": "10m", "max-file": "3"}, Restart: "unless-stopped", Running: !r.stopped,
 		NetworkMode: caddyNetworkName, Ulimits: []ulimitInspection{{Name: "nofile", Hard: 1024, Soft: 1024}}, PortBindings: map[string][]map[string]string{"8080/tcp": {{"HostIp": "127.0.0.1", "HostPort": "8080"}}}, Networks: r.caddyNetworks,
@@ -517,6 +518,23 @@ func TestCaddyInspectionRequiresNetworkEnvironmentAndUlimit(t *testing.T) {
 	}
 }
 
+func TestCaddyInspectionRequiresAbsoluteSingletonEntrypoint(t *testing.T) {
+	_, runner := newManagerFixture(t, false)
+	imageID := "sha256:" + strings.Repeat("a", 64)
+	for _, entrypoint := range [][]string{nil, {}, {"caddy"}, {"/bin/sh"}, {caddyExecutable, "extra"}} {
+		candidate := runner.caddyInspection()
+		candidate.Entrypoint = entrypoint
+		if validCaddyInspection(candidate, imageID, 8080) {
+			t.Fatalf("unsafe entrypoint %#v was accepted", entrypoint)
+		}
+	}
+	candidate := runner.caddyInspection()
+	candidate.Cmd = []string{caddyExecutable, "run", "--config", "/config/active.json"}
+	if validCaddyInspection(candidate, imageID, 8080) {
+		t.Fatal("entrypoint was accepted when duplicated into Cmd")
+	}
+}
+
 func TestCaddyInspectionAcceptsOnlyEnabledNoNewPrivileges(t *testing.T) {
 	_, runner := newManagerFixture(t, false)
 	for _, option := range []string{"no-new-privileges", "no-new-privileges:true", "no-new-privileges=true", "NO-NEW-PRIVILEGES=TRUE"} {
@@ -553,6 +571,9 @@ func TestIngressInspectFormatsUseCanonicalDockerFieldsAndNilGuards(t *testing.T)
 	networkName := "rig-app-network"
 	input := templateIngressDockerContainer{
 		ID: containerID,
+		Config: templateIngressDockerConfig{
+			Entrypoint: []string{caddyExecutable},
+		},
 		HostConfig: templateIngressDockerHostConfig{
 			NanoCPUs: 1_000_000_000,
 		},
@@ -563,7 +584,7 @@ func TestIngressInspectFormatsUseCanonicalDockerFieldsAndNilGuards(t *testing.T)
 	}
 	var caddy caddyInspection
 	executeIngressInspectTemplate(t, caddyInspectFormat, input, &caddy)
-	if caddy.ID != containerID || caddy.NanoCPUs != 1_000_000_000 || caddy.Networks[networkName] == nil || !containsString(caddy.Networks[networkName].Aliases, "api-green") {
+	if caddy.ID != containerID || len(caddy.Entrypoint) != 1 || caddy.Entrypoint[0] != caddyExecutable || caddy.NanoCPUs != 1_000_000_000 || caddy.Networks[networkName] == nil || !containsString(caddy.Networks[networkName].Aliases, "api-green") {
 		t.Fatalf("caddy inspection = %#v", caddy)
 	}
 
@@ -601,6 +622,18 @@ func TestProvisionCreatesPinnedIngressNetworkAndStaticCaddyAddress(t *testing.T)
 	}
 	if !hasCommandArguments(runner.commands, "container", "create", "--network", caddyNetworkName, "--ip", address) {
 		t.Fatalf("container create did not use static ingress address: %#v", runner.commands)
+	}
+	var create []string
+	for _, command := range runner.commands {
+		if len(command) > 1 && command[0] == "container" && command[1] == "create" {
+			create = command
+			break
+		}
+	}
+	entrypointIndex := argumentIndex(create, "--entrypoint")
+	imageIndex := argumentIndex(create, "sha256:"+strings.Repeat("a", 64))
+	if entrypointIndex < 0 || entrypointIndex+1 >= len(create) || create[entrypointIndex+1] != caddyExecutable || imageIndex <= entrypointIndex || !reflect.DeepEqual(create[imageIndex:], []string{"sha256:" + strings.Repeat("a", 64), "run", "--config", "/config/active.json"}) {
+		t.Fatalf("container create did not pin the absolute Caddy entrypoint: %v", create)
 	}
 }
 
@@ -677,11 +710,12 @@ type templateIngressDockerContainer struct {
 }
 
 type templateIngressDockerConfig struct {
-	Labels   map[string]string
-	Hostname string
-	User     string
-	Env      []string
-	Cmd      []string
+	Labels     map[string]string
+	Hostname   string
+	User       string
+	Env        []string
+	Entrypoint []string
+	Cmd        []string
 }
 
 type templateIngressDockerHostConfig struct {

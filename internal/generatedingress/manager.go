@@ -23,6 +23,7 @@ const (
 	caddyContainerName = "rig-generated-caddy-v1"
 	caddyVolumeName    = "rig-generated-caddy-config-v1"
 	caddyNetworkName   = "rig-generated-caddy-ingress-v1"
+	caddyExecutable    = "/usr/bin/caddy"
 	caddyImage         = "caddy@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
 	caddyImageDigest   = "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
 	defaultHostPort    = uint16(8080)
@@ -398,7 +399,7 @@ func (m *Manager) createCaddy(ctx context.Context, imageID, ingressIP string) er
 	}
 	args := []string{"container", "create", "--name", caddyContainerName, "--hostname", caddyContainerName, "--network", caddyNetworkName,
 		"--ip", ingressIP,
-		"--mount", "type=volume,src=" + caddyVolumeName + ",dst=/config", "--user", "1000:1000", "--read-only",
+		"--mount", "type=volume,src=" + caddyVolumeName + ",dst=/config", "--user", "1000:1000", "--entrypoint", caddyExecutable, "--read-only",
 		"--tmpfs", "/data:rw,noexec,nosuid,nodev,size=67108864", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
 		"--memory", "268435456", "--memory-swap", "268435456", "--cpus", "1.000", "--pids-limit", "128", "--ulimit", "nofile=1024:1024",
 		"--publish", "127.0.0.1:" + strconv.FormatUint(uint64(m.options.HostPort), 10) + ":8080/tcp", "--restart", "unless-stopped",
@@ -723,6 +724,7 @@ type caddyInspection struct {
 	Hostname     string                         `json:"hostname"`
 	User         string                         `json:"user"`
 	Env          []string                       `json:"env"`
+	Entrypoint   []string                       `json:"entrypoint"`
 	Cmd          []string                       `json:"cmd"`
 	ReadOnly     bool                           `json:"readOnly"`
 	Privileged   bool                           `json:"privileged"`
@@ -790,7 +792,7 @@ type ulimitInspection struct {
 const (
 	imageInspectFormat    = `{"id":{{json .ID}},"os":{{json .Os}},"repoDigests":{{json .RepoDigests}}}`
 	volumeInspectFormat   = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"options":{{json .Options}},"labels":{{json .Labels}}}`
-	caddyInspectFormat    = `{"id":{{json .ID}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"hostname":{{json .Config.Hostname}},"user":{{json .Config.User}},"env":{{json .Config.Env}},"cmd":{{json .Config.Cmd}},"readOnly":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"tmpfs":{{json .HostConfig.Tmpfs}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCPUs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"networkMode":{{json .HostConfig.NetworkMode}},"ulimits":{{json .HostConfig.Ulimits}},"running":{{json .State.Running}},"portBindings":{{json .HostConfig.PortBindings}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
+	caddyInspectFormat    = `{"id":{{json .ID}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"hostname":{{json .Config.Hostname}},"user":{{json .Config.User}},"env":{{json .Config.Env}},"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"readOnly":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"tmpfs":{{json .HostConfig.Tmpfs}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCPUs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"networkMode":{{json .HostConfig.NetworkMode}},"ulimits":{{json .HostConfig.Ulimits}},"running":{{json .State.Running}},"portBindings":{{json .HostConfig.PortBindings}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
 	networkInspectFormat  = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"internal":{{json .Internal}},"options":{{json .Options}},"ipam":{{json .IPAM.Config}},"labels":{{json .Labels}}}`
 	endpointInspectFormat = `{"id":{{json .ID}},"labels":{{json .Config.Labels}},"running":{{json .State.Running}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
 )
@@ -844,6 +846,7 @@ func validCaddyInspection(value caddyInspection, imageID string, hostPort uint16
 		len(value.Binds) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 || value.NanoCPUs != 1_000_000_000 || value.PIDsLimit != 128 ||
 		len(value.Tmpfs) != 1 || value.Tmpfs["/data"] != "rw,noexec,nosuid,nodev,size=67108864" ||
 		value.LogType != "local" || value.LogConfig["max-size"] != "10m" || value.LogConfig["max-file"] != "3" || value.Restart != "unless-stopped" ||
+		len(value.Entrypoint) != 1 || value.Entrypoint[0] != caddyExecutable ||
 		len(value.Cmd) != 3 || value.Cmd[0] != "run" || value.Cmd[1] != "--config" || value.Cmd[2] != "/config/active.json" ||
 		value.Labels["io.rig.managed"] != "generated-ingress" || value.Labels["io.rig.identity-version"] != "v1" || value.Labels["io.rig.listener-isolation"] != "v1" ||
 		len(value.Ulimits) != 1 || value.Ulimits[0] != (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}) {

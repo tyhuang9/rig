@@ -81,6 +81,7 @@ const (
 	liveCaddyMismatchResources
 	liveCaddyMismatchTmpfs
 	liveCaddyMismatchLogging
+	liveCaddyMismatchEntrypoint
 	liveCaddyMismatchCommand
 	liveCaddyMismatchLabels
 	liveCaddyMismatchUlimit
@@ -503,6 +504,9 @@ func liveCaddyMismatchBits(value caddyInspection, imageID string, hostPort uint1
 	if value.LogType != "local" || value.LogConfig["max-size"] != "10m" || value.LogConfig["max-file"] != "3" || value.Restart != "unless-stopped" {
 		mismatches |= liveCaddyMismatchLogging
 	}
+	if len(value.Entrypoint) != 1 || value.Entrypoint[0] != caddyExecutable {
+		mismatches |= liveCaddyMismatchEntrypoint
+	}
 	if len(value.Cmd) != 3 || value.Cmd[0] != "run" || value.Cmd[1] != "--config" || value.Cmd[2] != "/config/active.json" {
 		mismatches |= liveCaddyMismatchCommand
 	}
@@ -534,7 +538,7 @@ func liveCaddyMismatchNames(bits uint64) string {
 	if bits == 0 {
 		return "none"
 	}
-	names := make([]string, 0, 15)
+	names := make([]string, 0, 16)
 	for _, mismatch := range []struct {
 		bit  uint64
 		name string
@@ -549,6 +553,7 @@ func liveCaddyMismatchNames(bits uint64) string {
 		{liveCaddyMismatchResources, "resources"},
 		{liveCaddyMismatchTmpfs, "tmpfs"},
 		{liveCaddyMismatchLogging, "logging"},
+		{liveCaddyMismatchEntrypoint, "entrypoint"},
 		{liveCaddyMismatchCommand, "command"},
 		{liveCaddyMismatchLabels, "labels"},
 		{liveCaddyMismatchUlimit, "ulimit"},
@@ -595,6 +600,7 @@ func clearLiveCaddyInspection(value *caddyInspection) {
 	}
 	clear(value.Labels)
 	clear(value.Env)
+	clear(value.Entrypoint)
 	clear(value.Cmd)
 	clear(value.CapAdd)
 	clear(value.CapDrop)
@@ -662,6 +668,7 @@ func TestLiveCaddyMismatchBitsMatchValidator(t *testing.T) {
 		{"resources", liveCaddyMismatchResources, func(value *caddyInspection) { value.Memory = 1 }},
 		{"tmpfs", liveCaddyMismatchTmpfs, func(value *caddyInspection) { value.Tmpfs["/data"] = "rw" }},
 		{"logging", liveCaddyMismatchLogging, func(value *caddyInspection) { value.LogType = "json-file" }},
+		{"entrypoint", liveCaddyMismatchEntrypoint, func(value *caddyInspection) { value.Entrypoint = []string{"caddy"} }},
 		{"command", liveCaddyMismatchCommand, func(value *caddyInspection) { value.Cmd = nil }},
 		{"labels", liveCaddyMismatchLabels, func(value *caddyInspection) { value.Labels = nil }},
 		{"ulimit", liveCaddyMismatchUlimit, func(value *caddyInspection) { value.Ulimits = nil }},
