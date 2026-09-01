@@ -252,6 +252,8 @@ func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, http.StatusConflict, "job_not_paused", "Job is not waiting for user action", nil)
 	case errors.Is(err, jobs.ErrApprovalRequired):
 		problem(w, r, http.StatusConflict, "approval_required", "Deployment still requires runtime approval", nil)
+	case errors.Is(err, jobs.ErrMigrationApprovalRequired):
+		problem(w, r, http.StatusConflict, "migration_approval_required", "Deployment migration still requires approval", nil)
 	case errors.Is(err, jobs.ErrJobNotFound):
 		problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
 	default:

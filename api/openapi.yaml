@@ -13,6 +13,7 @@ x-rig-problem-codes:
   provider_unavailable: {description: GitHub or its configured integration is temporarily unavailable, statuses: [503]}
   invalid_source: {description: The selected GitHub source is invalid or cannot be used, statuses: [400, 422]}
   approval_required: {description: Deployment requires an administrator approval before it can continue, statuses: [409]}
+  migration_approval_required: {description: Deployment migration requires approval before it can continue, statuses: [409]}
   application_busy: {description: The application already has an active conflicting operation, statuses: [409]}
   source_too_large: {description: The source exceeds the supported inspection limits, statuses: [413]}
   deployment_plan_conflict: {description: The accepted deployment plan changed while this request was being reviewed, statuses: [409]}
@@ -258,7 +259,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/JobId'}]
     post:
       operationId: resumeJob
-      x-rig-problem-codes: [approval_required]
+      x-rig-problem-codes: [approval_required, migration_approval_required]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
         '200': {description: Paused job atomically requeued, content: {application/json: {schema: {$ref: '#/components/schemas/JobResponse'}}}}
@@ -537,7 +538,7 @@ components:
     InspectResponse: {type: object, required: [source, composeCandidates, services, findings, analysis], properties: {source: {$ref: '#/components/schemas/SourceSummary'}, resolvedSha: {type: string}, composeCandidates: {type: array, items: {type: string}}, services: {type: array, items: {$ref: '#/components/schemas/DetectedService'}}, findings: {type: array, items: {$ref: '#/components/schemas/SourceFinding'}}, analysis: {$ref: '#/components/schemas/SourceAnalysis'}}}
     Service: {type: object, required: [id, name, kind, status], properties: {id: {type: string, format: uuid}, name: {type: string}, kind: {type: string}, status: {type: string}, port: {type: integer}}}
     ServiceList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Service'}}}}
-    Job: {type: object, required: [id, type, resourceType, resourceId, status, phase, checkpoint, progress, attempt, createdAt, updatedAt], properties: {id: {type: string, format: uuid}, type: {type: string}, resourceType: {type: string}, resourceId: {type: string}, status: {type: string}, phase: {type: string}, checkpoint: {type: string}, errorCode: {type: string}, errorDetail: {type: string}, requestedBy: {type: string, format: uuid}, pauseDisposition: {type: string}, progress: {type: integer}, attempt: {type: integer, minimum: 0}, createdAt: {type: string, format: date-time}, updatedAt: {type: string, format: date-time}}}
+    Job: {type: object, required: [id, type, resourceType, resourceId, status, phase, checkpoint, progress, attempt, createdAt, updatedAt], properties: {id: {type: string, format: uuid}, type: {type: string}, resourceType: {type: string}, resourceId: {type: string}, status: {type: string}, phase: {type: string}, checkpoint: {type: string}, errorCode: {type: string}, errorDetail: {type: string}, requestedBy: {type: string, format: uuid}, pauseDisposition: {type: string, enum: [approval_required, migration_approval_required, insufficient_replacement_capacity]}, progress: {type: integer}, attempt: {type: integer, minimum: 0}, createdAt: {type: string, format: date-time}, updatedAt: {type: string, format: date-time}}}
     JobMutationResponse: {type: object, required: [job, created], properties: {job: {$ref: '#/components/schemas/Job'}, created: {type: boolean}}}
     JobResponse: {type: object, required: [job], properties: {job: {$ref: '#/components/schemas/Job'}}}
     JobList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Job'}}}}

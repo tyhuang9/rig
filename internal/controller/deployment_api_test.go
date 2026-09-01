@@ -783,6 +783,61 @@ func TestResumeUsesPinnedDeploymentStrategy(t *testing.T) {
 	}
 }
 
+func TestGeneratedResumeRequiresMigrationApprovalButRetriesCapacityImmediately(t *testing.T) {
+	t.Run("migration approval", func(t *testing.T) {
+		f := newDeploymentAPIFixtureWithRuntimes(t, false, true, false)
+		revision := f.acceptPlanWithMigration(t, f.app.ID)
+		job := f.createDeploymentWithPlan(t, revision)
+		if _, err := f.db.Exec(`UPDATE jobs SET status='waiting_user',phase=?,checkpoint_json=?,pause_disposition=?,attempt=2 WHERE id=?`, jobs.PauseMigrationApprovalRequired, `{"phase":"migration_approval_required"}`, jobs.PauseMigrationApprovalRequired, job.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		path := "/api/v1/jobs/" + job.ID + "/resume"
+		unapproved := f.request(http.MethodPost, path, "")
+		assertProblemCode(t, unapproved, http.StatusConflict, "migration_approval_required")
+		assertNoSensitiveDetail(t, unapproved.Body.String())
+		if strings.Contains(unapproved.Body.String(), revision.Plan.Migration.Command) || strings.Contains(unapproved.Body.String(), revision.Plan.Migration.EvidenceDigest) {
+			t.Fatalf("migration identity leaked: %s", unapproved.Body.String())
+		}
+		persisted, err := f.jobs.Get(job.ID)
+		if err != nil || persisted.Status != string(jobs.WaitingUser) || persisted.PauseDisposition != jobs.PauseMigrationApprovalRequired || persisted.Attempt != 2 {
+			t.Fatalf("unapproved migration changed job = %#v, %v", persisted, err)
+		}
+
+		if err := f.plans.ApproveMigration(context.Background(), f.app.ID, revision.ID, revision.RevisionNumber, 0, f.userID(t)); err != nil {
+			t.Fatal(err)
+		}
+		resumed := f.request(http.MethodPost, path, "")
+		if resumed.Code != http.StatusOK {
+			t.Fatalf("approved resume: %d %s", resumed.Code, resumed.Body.String())
+		}
+		if _, err := f.jobs.Cancel(job.ID); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("replacement capacity", func(t *testing.T) {
+		f := newDeploymentAPIFixtureWithRuntimes(t, false, true, false)
+		revision := f.acceptPlan(t, f.app.ID, deploymentplans.StrategyGeneratedNode)
+		job := f.createDeploymentWithPlan(t, revision)
+		if _, err := f.db.Exec(`UPDATE jobs SET status='waiting_user',phase=?,checkpoint_json=?,pause_disposition=?,attempt=3 WHERE id=?`, jobs.PauseInsufficientReplacementCapacity, `{"phase":"insufficient_replacement_capacity"}`, jobs.PauseInsufficientReplacementCapacity, job.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		resumed := f.request(http.MethodPost, "/api/v1/jobs/"+job.ID+"/resume", "")
+		if resumed.Code != http.StatusOK {
+			t.Fatalf("capacity retry: %d %s", resumed.Code, resumed.Body.String())
+		}
+		var body apicontract.JobResponse
+		if err := json.Unmarshal(resumed.Body.Bytes(), &body); err != nil || body.Job.Status != string(jobs.Queued) || body.Job.PauseDisposition != "" || body.Job.Attempt != 3 {
+			t.Fatalf("capacity retry = %#v, %v", body.Job, err)
+		}
+		if _, err := f.jobs.Cancel(job.ID); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestResumeRequiresEveryExactActiveRuntimeApproval(t *testing.T) {
 	f := newDeploymentAPIFixture(t, true, false)
 	job, deployment := f.createDeployment(t, f.app.ID, "current")
@@ -931,17 +986,31 @@ func (f deploymentAPIFixture) insertReleaseWithPlan(t *testing.T, appID, state s
 }
 
 func (f deploymentAPIFixture) acceptPlan(t *testing.T, appID string, strategy deploymentplans.Strategy) deploymentplans.DeploymentPlanRevision {
+	return f.acceptPlanFixture(t, appID, strategy, false)
+}
+
+func (f deploymentAPIFixture) acceptPlanWithMigration(t *testing.T, appID string) deploymentplans.DeploymentPlanRevision {
+	return f.acceptPlanFixture(t, appID, deploymentplans.StrategyGeneratedNode, true)
+}
+
+func (f deploymentAPIFixture) acceptPlanFixture(t *testing.T, appID string, strategy deploymentplans.Strategy, migration bool) deploymentplans.DeploymentPlanRevision {
 	t.Helper()
 	plan := deploymentplans.Plan{
 		Strategy: strategy,
 		Detector: deploymentplans.Detector{Name: "fixture-detector", Version: "1", SourceStructuralFingerprint: strings.Repeat("a", 64)},
 		Source:   deploymentplans.SourceIdentity{Provider: "github", RepositoryID: 17, ResolvedDigest: strings.Repeat("b", 40)},
 	}
-	if strategy == deploymentplans.StrategyGeneratedNode {
+	if plan.Strategy == deploymentplans.StrategyGeneratedNode {
 		component := deploymentplans.Component{Name: "web", Role: "server", RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm start", InternalPort: 3000, HealthProbe: "/health"}
 		plan.Components = []deploymentplans.Component{component}
 		for _, field := range []string{"role", "rootDirectory", "packageManager", "installBehavior", "nodeVersion", "runCommand", "internalPort", "healthProbe", "buildCommand"} {
 			plan.FieldProvenance = append(plan.FieldProvenance, deploymentplans.FieldProvenance{Field: "components.web." + field, Origin: deploymentplans.ProvenanceInferred, Confidence: 90, Evidence: []string{"package.json"}})
+		}
+	}
+	if migration {
+		plan.Migration = &deploymentplans.Migration{
+			ComponentName: "web", RootDirectory: ".", Command: "npm run migrate", EnvironmentKeys: []string{"DATABASE_URL"},
+			EvidenceDigest: strings.Repeat("c", 64), Approval: deploymentplans.MigrationApproval{Status: deploymentplans.MigrationApprovalPending},
 		}
 	}
 	revision, err := f.plans.Replace(context.Background(), appID, f.userID(t), deploymentplans.ReplaceInput{Plan: plan})
