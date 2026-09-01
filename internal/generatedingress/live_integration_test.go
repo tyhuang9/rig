@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"text/template"
 	"time"
 
 	"github.com/hostd/hostd/internal/generatedruntime"
@@ -39,7 +38,7 @@ func (liveCapacitySource) Snapshot(context.Context) (generatedruntime.CapacitySn
 
 const (
 	liveCreateObservationTimeout     = 5 * time.Second
-	liveCreateObservationOutputLimit = 1024
+	liveCreateObservationOutputLimit = 64 << 10
 )
 
 // liveCreateObserver is test-only. It observes the generated-runtime create
@@ -53,25 +52,71 @@ type liveCreateObserver struct {
 }
 
 type liveCreateObservation struct {
-	createSucceeded  bool
-	inspectCompleted bool
-	hardening        liveCreateHardening
+	createSucceeded bool
+	inspectReason   liveCreateInspectReason
+	hardening       liveCreateHardening
 }
 
 type liveCreateHardening struct {
-	NetworkMode       bool `json:"network_mode"`
-	Tmpfs             bool `json:"tmpfs"`
-	PIDsLimit         bool `json:"pids_limit"`
-	SecurityOptions   bool `json:"security_options"`
-	HealthStartPeriod bool `json:"health_start_period"`
-	MountsRealized    bool `json:"mounts_realized"`
-	NetworkRealized   bool `json:"network_realized"`
+	NetworkMode       bool
+	Tmpfs             bool
+	PIDsLimit         bool
+	Init              bool
+	SecurityOptions   bool
+	HealthStartPeriod bool
+	MountsRealized    bool
+	NetworkRealized   bool
 }
+
+type liveCreateInspectReason string
+
+const (
+	liveCreateInspectNone            liveCreateInspectReason = "none"
+	liveCreateInspectCommandFailed   liveCreateInspectReason = "inspect_command_failed"
+	liveCreateInspectOutputTruncated liveCreateInspectReason = "inspect_output_truncated"
+	liveCreateInspectDecodeFailed    liveCreateInspectReason = "inspect_decode_failed"
+	liveCreateInspectMissing         liveCreateInspectReason = "inspect_missing"
+)
 
 type liveCreateExpectation struct {
 	network string
 	tmpfs   string
 	pids    int64
+}
+
+// liveRawContainerInspection is deliberately allowlisted. It exists only
+// while the bounded inspect output is decoded and is cleared before a caller
+// can store any observation.
+type liveRawContainerInspection struct {
+	Config struct {
+		Healthcheck *liveRawHealthcheck `json:"Healthcheck"`
+	} `json:"Config"`
+	HostConfig      liveRawHostConfig       `json:"HostConfig"`
+	Mounts          []liveRawMount          `json:"Mounts"`
+	NetworkSettings *liveRawNetworkSettings `json:"NetworkSettings"`
+}
+
+type liveRawHealthcheck struct {
+	StartPeriod int64 `json:"StartPeriod"`
+}
+
+type liveRawHostConfig struct {
+	NetworkMode string            `json:"NetworkMode"`
+	Tmpfs       map[string]string `json:"Tmpfs"`
+	PidsLimit   *int64            `json:"PidsLimit"`
+	Init        *bool             `json:"Init"`
+	SecurityOpt []string          `json:"SecurityOpt"`
+}
+
+type liveRawMount struct {
+	Type        string `json:"Type"`
+	Source      string `json:"Source"`
+	Destination string `json:"Destination"`
+	RW          bool   `json:"RW"`
+}
+
+type liveRawNetworkSettings struct {
+	Networks map[string]struct{} `json:"Networks"`
 }
 
 func (observer *liveCreateObserver) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -122,26 +167,116 @@ func liveGeneratedRuntimeCreateExpectation(args []string) (liveCreateExpectation
 func (observer *liveCreateObserver) inspectCreatedContainer(ctx context.Context, request runtimeprocess.CommandRequest, containerID string, expectation liveCreateExpectation) liveCreateObservation {
 	inspection, err := observer.delegate.Run(ctx, runtimeprocess.CommandRequest{
 		Executable:  request.Executable,
-		Args:        []string{"container", "inspect", "--format", liveCreateInspectionFormat(expectation), containerID},
+		Args:        []string{"container", "inspect", containerID},
 		Directory:   request.Directory,
 		Env:         append([]string(nil), request.Env...),
 		Timeout:     liveCreateObservationTimeout,
 		OutputLimit: liveCreateObservationOutputLimit,
 	})
-	defer clearLiveCommandResult(&inspection)
-	if err != nil || inspection.StdoutTruncated || inspection.StderrTruncated {
-		return liveCreateObservation{createSucceeded: true}
-	}
-	var hardening liveCreateHardening
-	if err := json.Unmarshal(inspection.Stdout, &hardening); err != nil {
-		return liveCreateObservation{createSucceeded: true}
-	}
-	return liveCreateObservation{createSucceeded: true, inspectCompleted: true, hardening: hardening}
+	return liveCreateObservationFromInspectResult(&inspection, err, expectation)
 }
 
-func liveCreateInspectionFormat(expectation liveCreateExpectation) string {
-	return fmt.Sprintf(`{"network_mode":{{if eq .HostConfig.NetworkMode %s}}true{{else}}false{{end}},"tmpfs":{{if and (eq (len .HostConfig.Tmpfs) 1) (eq (index .HostConfig.Tmpfs "/tmp") %s)}}true{{else}}false{{end}},"pids_limit":{{if eq .HostConfig.PidsLimit %d}}true{{else}}false{{end}},"security_options":{{if and (eq (len .HostConfig.SecurityOpt) 1) (or (eq (index .HostConfig.SecurityOpt 0) "no-new-privileges") (eq (index .HostConfig.SecurityOpt 0) "no-new-privileges:true") (eq (index .HostConfig.SecurityOpt 0) "no-new-privileges=true"))}}true{{else}}false{{end}},"health_start_period":{{if eq .Config.Healthcheck.StartPeriod 5000000000}}true{{else}}false{{end}},"mounts_realized":{{if .Mounts}}true{{else}}false{{end}},"network_realized":{{if and .NetworkSettings .NetworkSettings.Networks}}{{if index .NetworkSettings.Networks %s}}true{{else}}false{{end}}{{else}}false{{end}}}`,
-		strconv.Quote(expectation.network), strconv.Quote(expectation.tmpfs), expectation.pids, strconv.Quote(expectation.network))
+func liveCreateObservationFromInspectResult(result *runtimeprocess.CommandResult, err error, expectation liveCreateExpectation) liveCreateObservation {
+	observation := liveCreateObservation{createSucceeded: true, inspectReason: liveCreateInspectNone}
+	if err != nil {
+		clearLiveCommandResult(result)
+		observation.inspectReason = liveCreateInspectCommandFailed
+		return observation
+	}
+	if result.StdoutTruncated || result.StderrTruncated {
+		clearLiveCommandResult(result)
+		observation.inspectReason = liveCreateInspectOutputTruncated
+		return observation
+	}
+	hardening, reason := decodeLiveCreateInspection(result.Stdout, expectation)
+	clearLiveCommandResult(result)
+	if reason != liveCreateInspectNone {
+		observation.inspectReason = reason
+		return observation
+	}
+	observation.hardening = hardening
+	return observation
+}
+
+func decodeLiveCreateInspection(raw []byte, expectation liveCreateExpectation) (liveCreateHardening, liveCreateInspectReason) {
+	var containers []liveRawContainerInspection
+	err := json.Unmarshal(raw, &containers)
+	clear(raw)
+	if err != nil {
+		return liveCreateHardening{}, liveCreateInspectDecodeFailed
+	}
+	if len(containers) != 1 {
+		clearLiveRawContainerInspections(containers)
+		return liveCreateHardening{}, liveCreateInspectMissing
+	}
+	hardening := liveCreateHardeningFromRaw(containers[0], expectation)
+	clearLiveRawContainerInspections(containers)
+	return hardening, liveCreateInspectNone
+}
+
+func liveCreateHardeningFromRaw(container liveRawContainerInspection, expectation liveCreateExpectation) liveCreateHardening {
+	hardening := liveCreateHardening{
+		NetworkMode:     container.HostConfig.NetworkMode == expectation.network,
+		Tmpfs:           len(container.HostConfig.Tmpfs) == 1 && container.HostConfig.Tmpfs["/tmp"] == expectation.tmpfs,
+		SecurityOptions: liveOnlyNoNewPrivileges(container.HostConfig.SecurityOpt),
+		MountsRealized:  liveOnlyRuntimeTmpfsMount(container.Mounts),
+		NetworkRealized: container.NetworkSettings != nil && networkExists(container.NetworkSettings.Networks, expectation.network),
+	}
+	if container.HostConfig.PidsLimit != nil {
+		hardening.PIDsLimit = *container.HostConfig.PidsLimit == expectation.pids
+	}
+	if container.HostConfig.Init != nil {
+		hardening.Init = *container.HostConfig.Init
+	}
+	if container.Config.Healthcheck != nil {
+		hardening.HealthStartPeriod = container.Config.Healthcheck.StartPeriod == int64(5*time.Second)
+	}
+	return hardening
+}
+
+func liveOnlyNoNewPrivileges(values []string) bool {
+	if len(values) != 1 {
+		return false
+	}
+	switch strings.ToLower(values[0]) {
+	case "no-new-privileges", "no-new-privileges:true", "no-new-privileges=true":
+		return true
+	default:
+		return false
+	}
+}
+
+func liveOnlyRuntimeTmpfsMount(mounts []liveRawMount) bool {
+	return len(mounts) == 1 && mounts[0].Type == "tmpfs" && mounts[0].Source == "" && mounts[0].Destination == "/tmp" && mounts[0].RW
+}
+
+func networkExists(networks map[string]struct{}, expected string) bool {
+	_, exists := networks[expected]
+	return exists
+}
+
+func clearLiveRawContainerInspections(containers []liveRawContainerInspection) {
+	for index := range containers {
+		container := &containers[index]
+		if container.Config.Healthcheck != nil {
+			*container.Config.Healthcheck = liveRawHealthcheck{}
+		}
+		if container.HostConfig.PidsLimit != nil {
+			*container.HostConfig.PidsLimit = 0
+		}
+		if container.HostConfig.Init != nil {
+			*container.HostConfig.Init = false
+		}
+		clear(container.HostConfig.Tmpfs)
+		clear(container.HostConfig.SecurityOpt)
+		clear(container.Mounts)
+		if container.NetworkSettings != nil {
+			clear(container.NetworkSettings.Networks)
+			*container.NetworkSettings = liveRawNetworkSettings{}
+		}
+		*container = liveRawContainerInspection{}
+	}
+	clear(containers)
 }
 
 func liveContainerID(value []byte) bool {
@@ -176,13 +311,17 @@ func (observer *liveCreateObserver) failureDiagnostic() string {
 	observation := observer.latest
 	observer.mu.Unlock()
 	mismatches := "none"
-	if observation.inspectCompleted {
+	reason := observation.inspectReason
+	if reason == "" {
+		reason = liveCreateInspectNone
+	}
+	if observation.createSucceeded && reason == liveCreateInspectNone {
 		if names := liveCreateHardeningMismatches(observation.hardening); len(names) > 0 {
 			mismatches = strings.Join(names, ",")
 		}
 	}
 	return " generated_runtime_create_observed=" + strconv.FormatBool(observation.createSucceeded) +
-		" inspect_completed=" + strconv.FormatBool(observation.inspectCompleted) +
+		" inspect_reason=" + string(reason) +
 		" hardening_mismatches=" + mismatches
 }
 
@@ -194,6 +333,7 @@ func liveCreateHardeningMismatches(hardening liveCreateHardening) []string {
 		{name: "network_mode", ok: hardening.NetworkMode},
 		{name: "tmpfs", ok: hardening.Tmpfs},
 		{name: "pids_limit", ok: hardening.PIDsLimit},
+		{name: "init", ok: hardening.Init},
 		{name: "security_options", ok: hardening.SecurityOptions},
 		{name: "health_start_period", ok: hardening.HealthStartPeriod},
 		{name: "mounts_realized", ok: hardening.MountsRealized},
@@ -304,13 +444,13 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 
 func TestLiveCreateObservationDiagnosticIsRedacted(t *testing.T) {
 	diagnostic := (&liveCreateObserver{latest: liveCreateObservation{
-		createSucceeded: true, inspectCompleted: true,
+		createSucceeded: true, inspectReason: liveCreateInspectNone,
 		hardening: liveCreateHardening{
-			NetworkMode: false, Tmpfs: false, PIDsLimit: true, SecurityOptions: false,
+			NetworkMode: false, Tmpfs: false, PIDsLimit: true, Init: true, SecurityOptions: false,
 			HealthStartPeriod: true, MountsRealized: false, NetworkRealized: true,
 		},
 	}}).failureDiagnostic()
-	const want = " generated_runtime_create_observed=true inspect_completed=true hardening_mismatches=network_mode,tmpfs,security_options,mounts_realized"
+	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=network_mode,tmpfs,security_options,mounts_realized"
 	if diagnostic != want {
 		t.Fatalf("redacted observation diagnostic = %q, want %q", diagnostic, want)
 	}
@@ -323,10 +463,10 @@ func TestLiveCreateObservationDiagnosticIsRedacted(t *testing.T) {
 
 func TestLiveCreateObserverResetDropsPriorAttempt(t *testing.T) {
 	observer := &liveCreateObserver{latest: liveCreateObservation{
-		createSucceeded: true, inspectCompleted: true, hardening: liveCreateHardening{NetworkMode: false},
+		createSucceeded: true, inspectReason: liveCreateInspectNone, hardening: liveCreateHardening{NetworkMode: false},
 	}}
 	observer.reset()
-	const want = " generated_runtime_create_observed=false inspect_completed=false hardening_mismatches=none"
+	const want = " generated_runtime_create_observed=false inspect_reason=none hardening_mismatches=none"
 	if diagnostic := observer.failureDiagnostic(); diagnostic != want {
 		t.Fatalf("reset observation diagnostic = %q, want %q", diagnostic, want)
 	}
@@ -345,70 +485,68 @@ func TestLiveCreateObserverFiltersOtherContainerCreates(t *testing.T) {
 	if _, observed := liveGeneratedRuntimeCreateExpectation(arguments); observed {
 		t.Fatal("non-runtime container create reached the diagnostic observer")
 	}
-	if _, err := template.New("docker-inspect").Parse(liveCreateInspectionFormat(expectation)); err != nil {
-		t.Fatal("Docker inspect format is not a valid Go template")
+}
+
+func TestLiveRawInspectDecodeClassifiesAndRedacts(t *testing.T) {
+	expectation := liveCreateExpectation{network: "test-network", tmpfs: "/tmp:rw,noexec,nosuid,nodev,size=16777216", pids: 128}
+	raw := []byte(`[{"Name":"sensitive-container","Image":"sha256:aaaaaaaa","Config":{"Healthcheck":{"StartPeriod":5000000000},"Cmd":["sensitive-command"],"Env":["SENSITIVE=value"]},"HostConfig":{"NetworkMode":"test-network","Tmpfs":{"/tmp":"/tmp:rw,noexec,nosuid,nodev,size=16777216"},"PidsLimit":128,"Init":true,"SecurityOpt":["no-new-privileges:true"]},"Mounts":[{"Type":"tmpfs","Source":"","Destination":"/tmp","RW":true}],"NetworkSettings":{"Networks":{"test-network":{"Aliases":["sensitive-alias"]}}},"Labels":{"sensitive-label":"sensitive-value"}}]`)
+	result := runtimeprocess.CommandResult{Stdout: raw, Stderr: []byte("sensitive-stderr")}
+	observation := liveCreateObservationFromInspectResult(&result, nil, expectation)
+	if observation.inspectReason != liveCreateInspectNone {
+		t.Fatalf("raw inspect reason = %q", observation.inspectReason)
+	}
+	if names := liveCreateHardeningMismatches(observation.hardening); len(names) != 0 {
+		t.Fatalf("raw inspect hardening mismatches = %v", names)
+	}
+	for _, value := range raw {
+		if value != 0 {
+			t.Fatal("raw inspect stdout was retained")
+		}
+	}
+	if result.Stdout != nil || result.Stderr != nil {
+		t.Fatal("raw inspect result was retained")
+	}
+	diagnostic := (&liveCreateObserver{latest: observation}).failureDiagnostic()
+	const want = " generated_runtime_create_observed=true inspect_reason=none hardening_mismatches=none"
+	if diagnostic != want {
+		t.Fatalf("redacted raw inspect diagnostic = %q, want %q", diagnostic, want)
+	}
+	for _, forbidden := range []string{"sensitive-container", "sha256:", "sensitive-command", "SENSITIVE=", "/tmp", "sensitive-label", "sensitive-stderr"} {
+		if strings.Contains(diagnostic, forbidden) {
+			t.Fatalf("raw inspect diagnostic exposed %q", forbidden)
+		}
 	}
 }
 
-type liveTemplateDockerContainer struct {
-	HostConfig      liveTemplateDockerHostConfig
-	Config          liveTemplateDockerConfig
-	Mounts          []struct{}
-	State           liveTemplateDockerState
-	NetworkSettings *liveTemplateDockerNetworkSettings
-}
-
-type liveTemplateDockerHostConfig struct {
-	NetworkMode string
-	Tmpfs       map[string]string
-	PidsLimit   int64
-	SecurityOpt []string
-}
-
-type liveTemplateDockerConfig struct {
-	Healthcheck liveTemplateDockerHealthcheck
-}
-
-type liveTemplateDockerHealthcheck struct {
-	StartPeriod int64
-}
-
-type liveTemplateDockerState struct {
-	Health *liveTemplateDockerHealth
-}
-
-type liveTemplateDockerHealth struct {
-	Status string
-}
-
-type liveTemplateDockerNetworkSettings struct {
-	Networks map[string]struct{}
-}
-
-func TestLiveCreateInspectionFormatHandlesMissingNetworkState(t *testing.T) {
+func TestLiveRawInspectClassifiesFixedReasons(t *testing.T) {
 	expectation := liveCreateExpectation{network: "test-network", tmpfs: "/tmp:rw", pids: 128}
-	for name, networkSettings := range map[string]*liveTemplateDockerNetworkSettings{
-		"network settings absent": nil,
-		"networks absent":         {},
+	for _, test := range []struct {
+		name      string
+		output    string
+		truncated bool
+		err       error
+		want      liveCreateInspectReason
+	}{
+		{name: "command failed", output: "[]", err: errors.New("inspect failed"), want: liveCreateInspectCommandFailed},
+		{name: "output truncated", output: "[]", truncated: true, want: liveCreateInspectOutputTruncated},
+		{name: "decode failed", output: "{", want: liveCreateInspectDecodeFailed},
+		{name: "container missing", output: "[]", want: liveCreateInspectMissing},
 	} {
-		t.Run(name, func(t *testing.T) {
-			var rendered strings.Builder
-			templateValue, err := template.New("live-create-inspect").Parse(liveCreateInspectionFormat(expectation))
-			if err != nil {
-				t.Fatal("live inspection template did not parse")
+		t.Run(test.name, func(t *testing.T) {
+			stdout := []byte(test.output)
+			stderr := []byte("sensitive-stderr")
+			result := runtimeprocess.CommandResult{Stdout: stdout, Stderr: stderr, StdoutTruncated: test.truncated}
+			observation := liveCreateObservationFromInspectResult(&result, test.err, expectation)
+			if observation.inspectReason != test.want {
+				t.Fatalf("inspect reason = %q, want %q", observation.inspectReason, test.want)
 			}
-			input := liveTemplateDockerContainer{NetworkSettings: networkSettings}
-			if err := templateValue.Execute(&rendered, input); err != nil {
-				t.Fatal("live inspection template did not execute")
+			for _, value := range append(stdout, stderr...) {
+				if value != 0 {
+					t.Fatal("inspect result bytes were retained")
+				}
 			}
-			var decoded struct {
-				NetworkRealized bool `json:"network_realized"`
-			}
-			if err := json.Unmarshal([]byte(rendered.String()), &decoded); err != nil {
-				t.Fatal("live inspection template output was not JSON")
-			}
-			if decoded.NetworkRealized {
-				t.Fatal("missing network state was reported as realized")
+			if diagnostic := (&liveCreateObserver{latest: observation}).failureDiagnostic(); !strings.Contains(diagnostic, "inspect_reason="+string(test.want)) || strings.Contains(diagnostic, "sensitive-stderr") {
+				t.Fatalf("fixed inspect classification diagnostic = %q", diagnostic)
 			}
 		})
 	}
@@ -456,7 +594,7 @@ func buildLiveImage(t *testing.T, ctx context.Context, docker, root, tag string,
 	if output, err := dockerCommand(ctx, docker, root, args...); err != nil {
 		t.Fatalf("build %s image: %v: %s", version, err, output)
 	}
-	output, err := dockerCommand(ctx, docker, root, "image", "inspect", "--format", "{{.Id}}", tag)
+	output, err := dockerCommand(ctx, docker, root, "image", "inspect", "--format", "{{.ID}}", tag)
 	if err != nil {
 		t.Fatalf("inspect %s image: %v: %s", version, err, output)
 	}

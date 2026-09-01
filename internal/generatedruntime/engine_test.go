@@ -930,7 +930,7 @@ func imageLabels(spec CandidateSpec) map[string]string {
 }
 
 type templateDockerContainer struct {
-	Id              string
+	ID              string
 	Name            string
 	Image           string
 	Config          templateDockerConfig
@@ -945,7 +945,7 @@ type templateDockerConfig struct {
 	User        string
 	WorkingDir  string
 	Cmd         []string
-	Healthcheck templateDockerHealthcheck
+	Healthcheck *templateDockerHealthcheck
 }
 
 type templateDockerHealthcheck struct {
@@ -959,10 +959,10 @@ type templateDockerHealthcheck struct {
 type templateDockerHostConfig struct {
 	Memory         int64
 	MemorySwap     int64
-	NanoCpus       int64
-	PidsLimit      int64
+	NanoCPUs       int64
+	PidsLimit      *int64
 	Ulimits        []templateDockerUlimit
-	Init           bool
+	Init           *bool
 	NetworkMode    string
 	ReadonlyRootfs bool
 	Privileged     bool
@@ -1024,19 +1024,22 @@ func TestContainerInspectFormatHandlesMissingHealthAndNetworkState(t *testing.T)
 	}
 	var rendered strings.Builder
 	input := templateDockerContainer{
-		Id:              "container-id",
+		ID:              "container-id",
 		State:           templateDockerState{Health: nil},
 		NetworkSettings: nil,
 	}
 	if err := templateValue.Execute(&rendered, input); err != nil {
 		t.Fatal("container inspection template did not execute")
 	}
-	var decoded struct {
-		Health   string                     `json:"health"`
-		Networks map[string]json.RawMessage `json:"networks"`
-	}
+	var decoded containerInspection
 	if err := json.Unmarshal([]byte(rendered.String()), &decoded); err != nil {
 		t.Fatal("container inspection template output was not JSON")
+	}
+	if decoded.HealthTest != nil || decoded.HealthInterval != 0 || decoded.HealthTimeout != 0 || decoded.HealthStartPeriod != 0 || decoded.HealthRetries != 0 {
+		t.Fatal("missing configured health check was not rendered as null defaults")
+	}
+	if decoded.PIDs != 0 || decoded.Init {
+		t.Fatal("missing pointer hardening values were not rendered as null defaults")
 	}
 	if decoded.Health != "" {
 		t.Fatal("missing health state was not rendered as an empty string")
