@@ -968,7 +968,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{
 		AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(blue)},
 	}); err != nil {
-		t.Fatalf("route first slot: %v", err)
+		t.Fatalf("route first slot: %v %s", err, liveIngressFailureDiagnostic(ctx, ingress))
 	}
 	assertLiveResponse(t, hostPort, appID, "blue")
 	engine.ReleaseAdmission(blue)
@@ -985,7 +985,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 		AppID: appID, FromSlot: blue.Slot, ToSlot: green.Slot,
 		Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(green)}, DrainPeriod: 100 * time.Millisecond,
 	}); err != nil {
-		t.Fatalf("switch to replacement slot: %v", err)
+		t.Fatalf("switch to replacement slot: %v %s", err, liveIngressFailureDiagnostic(ctx, ingress))
 	}
 	assertLiveResponse(t, hostPort, appID, "green")
 	if err := engine.StopAndRemove(ctx, blue, time.Second); err != nil {
