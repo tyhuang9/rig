@@ -410,6 +410,40 @@ func TestCoordinatorGeneratedPreflightPinsMaterializedRelease(t *testing.T) {
 	}
 }
 
+func TestCoordinatorRestartReplaysGeneratedPreparedDispatchThroughPreflight(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	releaseID := seedGeneratedAutoDeployRuntime(t, fixture, testSHA)
+	_, lease, prepared := prepareCoordinatorDispatch(t, fixture)
+	if err := fixture.repository.ReleaseLease(context.Background(), lease, fixture.now.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	clock := &coordinatorTestClock{now: fixture.now.Add(2 * time.Millisecond)}
+	preflight := &scriptedDispatchPreflight{results: []DispatchPreflightResult{{ReleaseID: releaseID}}}
+	config := DefaultCoordinatorConfig()
+	config.Clock = clock
+	config.MinResolveInterval = time.Nanosecond
+	config.Preflight = preflight
+	coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: secondSHA}, jobs.New(fixture.db), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, event := coordinator.processOne(context.Background())
+	if !claimed || event.Dispatched != 1 || event.Resolved != 0 || event.State != StateDeploying {
+		t.Fatalf("restart claimed=%v event=%#v", claimed, event)
+	}
+	requests := preflight.Requests()
+	if len(requests) != 1 || requests[0].ResolvedSHA != prepared.SHA {
+		t.Fatalf("restart preflight requests=%#v prepared=%#v", requests, prepared)
+	}
+	var input string
+	if err := fixture.db.QueryRow(`SELECT input_json FROM jobs WHERE resource_id=?`, testApp).Scan(&input); err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"releaseId":"` + releaseID + `","configurationMode":"current"}`; input != want {
+		t.Fatalf("restart job input=%q want=%q", input, want)
+	}
+}
+
 func TestCoordinatorGeneratedPlanReviewPausesBeforeCreatingJob(t *testing.T) {
 	fixture := newRepositoryFixture(t)
 	if _, err := fixture.repository.Configure(context.Background(), ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, Enabled: true}, fixture.now); err != nil {
