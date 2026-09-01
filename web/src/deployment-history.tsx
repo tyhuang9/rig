@@ -34,9 +34,8 @@ const runtimeAvailable = (
     : strategy === "compose"
       ? capabilities.compose || (allowFakeCompose && capabilities.fake)
       : false;
-type ReleaseWithRuntimeStrategy = Release & { runtimeStrategy?: string };
 const pinnedReleaseStrategy = (release: Release): RuntimeStrategy | undefined =>
-  runtimeStrategy((release as ReleaseWithRuntimeStrategy).runtimeStrategy);
+  runtimeStrategy(release.runtimeStrategy);
 const deploymentResult = (item: Deployment) => {
   switch (item.diagnosticCode) {
     case "migration_approval_required":
@@ -634,6 +633,11 @@ export function DeploymentHistoryPanel({
     capabilities,
     false,
   );
+  const selectedPriorRuntimeUnavailableMessage = !selectedPriorStrategy
+    ? "Rig cannot verify the runtime pinned to this release."
+    : selectedPriorStrategy === "generated_node"
+      ? "The generated runtime pinned to this release is not available on this controller."
+      : "The Compose runtime pinned to this release is not available on this controller.";
   const latestUnavailableMessage = deploymentPlan.isLoading
     ? "Checking which runtime this application requires."
     : currentStrategy === "generated_node"
@@ -1075,7 +1079,7 @@ export function DeploymentHistoryPanel({
             </button>
             {!selectedPriorRuntimeAvailable && (
               <span id="selected-prior-runtime-unavailable" className="sr-only">
-                Rig can no longer verify the runtime pinned to this release.
+                {selectedPriorRuntimeUnavailableMessage}
               </span>
             )}
           </div>
