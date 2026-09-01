@@ -965,10 +965,11 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	blueSpec.ImageContentID = buildLiveImage(t, ctx, docker, root, imageTags[0], blueSpec, "blue")
 	blue := startLiveCandidate(t, ctx, engine, runner, probeConfig, limits, blueSpec)
 	defer func() { _ = engine.StopAndRemove(context.Background(), blue, 0) }()
-	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{
+	blueRoute := generatedruntime.RouteSwitchRequest{
 		AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(blue)},
-	}); err != nil {
-		t.Fatalf("route first slot: %v %s", err, liveIngressFailureDiagnostic(ctx, ingress))
+	}
+	if err := ingress.Switch(ctx, blueRoute); err != nil {
+		t.Fatalf("route first slot: %v %s %s", err, liveIngressFailureDiagnostic(ctx, ingress), liveIngressRouteFailureDiagnostic(ctx, ingress, blueRoute))
 	}
 	assertLiveResponse(t, hostPort, appID, "blue")
 	engine.ReleaseAdmission(blue)
@@ -981,11 +982,12 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 
 	// A healthy inactive candidate must not receive traffic before the route commit.
 	assertLiveResponse(t, hostPort, appID, "blue")
-	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{
+	greenRoute := generatedruntime.RouteSwitchRequest{
 		AppID: appID, FromSlot: blue.Slot, ToSlot: green.Slot,
 		Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(green)}, DrainPeriod: 100 * time.Millisecond,
-	}); err != nil {
-		t.Fatalf("switch to replacement slot: %v %s", err, liveIngressFailureDiagnostic(ctx, ingress))
+	}
+	if err := ingress.Switch(ctx, greenRoute); err != nil {
+		t.Fatalf("switch to replacement slot: %v %s %s", err, liveIngressFailureDiagnostic(ctx, ingress), liveIngressRouteFailureDiagnostic(ctx, ingress, greenRoute))
 	}
 	assertLiveResponse(t, hostPort, appID, "green")
 	if err := engine.StopAndRemove(ctx, blue, time.Second); err != nil {
