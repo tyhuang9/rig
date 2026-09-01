@@ -189,7 +189,7 @@ button:disabled { cursor: wait; opacity: .62; }
 .field { display: grid; max-width: 680px; gap: 6px; margin-bottom: 14px; }
 .field label { color: #4e5561; font-size: 12px; font-weight: 650; }
 .field-label { color: #4e5561; font-size: 12px; font-weight: 650; }
-.field input { width: 100%; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #c9ced6; border-radius: 8px; background: #fff; color: #17191d; }
+.field input { width: 100%; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #737d8d; border-radius: 8px; background: #fff; color: #17191d; }
 .field input[aria-invalid="true"] { border-color: #b43d44; }
 .form-error { margin: 0; color: #a42f37; font-size: 12px; }
 .wizard form > .save-help { max-width: 680px; margin: 16px 0 0; color: #4e5561; font-size: 12px; line-height: 1.5; }
@@ -241,7 +241,7 @@ button:disabled { cursor: wait; opacity: .62; }
 .source-panel h3 { margin: 0 0 5px; font-size: 14px; }
 .source-panel > p { margin-bottom: 14px; }
 .source-panel .field { width: 100%; margin-top: 14px; margin-bottom: 0; }
-.field select { width: 100%; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #c9ced6; border-radius: 8px; background: #fff; color: #17191d; }
+.field select { width: 100%; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #737d8d; border-radius: 8px; background: #fff; color: #17191d; }
 .connection-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
 .wizard-status { min-height: 20px; margin: 2px 0 4px; color: #4e5561; font-size: 12px; }
 .connection-status { display: grid; gap: 4px; }
