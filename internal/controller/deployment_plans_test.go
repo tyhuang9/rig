@@ -204,6 +204,21 @@ func inspectLocalProject(t *testing.T, handler http.Handler, session auth.Sessio
 	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("inspect=%d %s headers=%v", response.Code, response.Body.String(), response.Header())
 	}
+	var collections struct {
+		Analysis struct {
+			Candidates []struct {
+				MissingFields json.RawMessage `json:"missingFields"`
+			} `json:"candidates"`
+		} `json:"analysis"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &collections); err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range collections.Analysis.Candidates {
+		if len(candidate.MissingFields) == 0 || candidate.MissingFields[0] != '[' {
+			t.Fatalf("candidate missingFields is not an array: %s", candidate.MissingFields)
+		}
+	}
 	var result apicontract.InspectResponse
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)

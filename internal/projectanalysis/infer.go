@@ -758,7 +758,7 @@ func fileFingerprint(domain string, files []File, contents map[string][]byte) st
 
 func normalizeCandidate(candidate *DeploymentPlanCandidate) {
 	slices.Sort(candidate.MissingFields)
-	candidate.MissingFields = slices.Compact(candidate.MissingFields)
+	candidate.MissingFields = append([]string{}, slices.Compact(candidate.MissingFields)...)
 	sort.Slice(candidate.AdvancedInputs, func(i, j int) bool { return candidate.AdvancedInputs[i].Field < candidate.AdvancedInputs[j].Field })
 	sort.Slice(candidate.Components, func(i, j int) bool {
 		return candidate.Components[i].RootDirectory < candidate.Components[j].RootDirectory
