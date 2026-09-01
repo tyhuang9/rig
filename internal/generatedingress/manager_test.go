@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"text/template"
 
 	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
@@ -516,6 +517,52 @@ func TestCaddyInspectionRequiresNetworkEnvironmentAndUlimit(t *testing.T) {
 	}
 }
 
+func TestIngressInspectFormatsUseCanonicalDockerFieldsAndNilGuards(t *testing.T) {
+	imageID := "sha256:" + strings.Repeat("a", 64)
+	var image imageInspection
+	executeIngressInspectTemplate(t, imageInspectFormat, templateIngressDockerImage{ID: imageID, Os: "linux", RepoDigests: []string{"caddy@digest"}}, &image)
+	if image.ID != imageID || image.OS != "linux" || len(image.RepoDigests) != 1 || image.RepoDigests[0] != "caddy@digest" {
+		t.Fatalf("image inspection = %#v", image)
+	}
+
+	containerID := strings.Repeat("b", 64)
+	networkName := "rig-app-network"
+	input := templateIngressDockerContainer{
+		ID: containerID,
+		HostConfig: templateIngressDockerHostConfig{
+			NanoCPUs: 1_000_000_000,
+		},
+		State: templateIngressDockerState{Health: &templateIngressDockerHealth{Status: "healthy"}},
+		NetworkSettings: &templateIngressDockerNetworkSettings{Networks: map[string]*networkAttachment{
+			networkName: {Aliases: []string{"api-green"}},
+		}},
+	}
+	var caddy caddyInspection
+	executeIngressInspectTemplate(t, caddyInspectFormat, input, &caddy)
+	if caddy.ID != containerID || caddy.NanoCPUs != 1_000_000_000 || caddy.Networks[networkName] == nil || !containsString(caddy.Networks[networkName].Aliases, "api-green") {
+		t.Fatalf("caddy inspection = %#v", caddy)
+	}
+
+	var endpoint endpointInspection
+	executeIngressInspectTemplate(t, endpointInspectFormat, input, &endpoint)
+	if endpoint.ID != containerID || endpoint.Health != "healthy" || endpoint.Networks[networkName] == nil || !containsString(endpoint.Networks[networkName].Aliases, "api-green") {
+		t.Fatalf("endpoint inspection = %#v", endpoint)
+	}
+
+	input.State.Health = nil
+	input.NetworkSettings = nil
+	var missingCaddyNetwork caddyInspection
+	executeIngressInspectTemplate(t, caddyInspectFormat, input, &missingCaddyNetwork)
+	if missingCaddyNetwork.Networks != nil {
+		t.Fatalf("missing Caddy network state = %#v", missingCaddyNetwork.Networks)
+	}
+	var missingEndpointState endpointInspection
+	executeIngressInspectTemplate(t, endpointInspectFormat, input, &missingEndpointState)
+	if missingEndpointState.Health != "" || missingEndpointState.Networks != nil {
+		t.Fatalf("missing endpoint state = %#v", missingEndpointState)
+	}
+}
+
 func TestProvisionCreatesPinnedIngressNetworkAndStaticCaddyAddress(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	runner.ingressMissing = true
@@ -586,6 +633,92 @@ func expectedConfig(t *testing.T, runner *ingressRunner, routes map[string]route
 		t.Fatal(err)
 	}
 	return config
+}
+
+type templateIngressDockerImage struct {
+	ID          string
+	Os          string
+	RepoDigests []string
+}
+
+type templateIngressDockerContainer struct {
+	ID              string
+	Name            string
+	Image           string
+	Config          templateIngressDockerConfig
+	HostConfig      templateIngressDockerHostConfig
+	Mounts          []mountInspection
+	State           templateIngressDockerState
+	NetworkSettings *templateIngressDockerNetworkSettings
+}
+
+type templateIngressDockerConfig struct {
+	Labels   map[string]string
+	Hostname string
+	User     string
+	Env      []string
+	Cmd      []string
+}
+
+type templateIngressDockerHostConfig struct {
+	ReadonlyRootfs bool
+	Privileged     bool
+	CapAdd         []string
+	CapDrop        []string
+	SecurityOpt    []string
+	Binds          []string
+	Tmpfs          map[string]string
+	Memory         int64
+	MemorySwap     int64
+	NanoCPUs       int64
+	PidsLimit      int64
+	LogConfig      templateIngressDockerLogConfig
+	RestartPolicy  templateIngressDockerRestartPolicy
+	NetworkMode    string
+	Ulimits        []ulimitInspection
+	PortBindings   map[string][]map[string]string
+}
+
+type templateIngressDockerLogConfig struct {
+	Type   string
+	Config map[string]string
+}
+
+type templateIngressDockerRestartPolicy struct {
+	Name string
+}
+
+type templateIngressDockerState struct {
+	Running bool
+	Health  *templateIngressDockerHealth
+}
+
+type templateIngressDockerHealth struct {
+	Status string
+}
+
+type templateIngressDockerNetworkSettings struct {
+	Networks map[string]*networkAttachment
+}
+
+func executeIngressInspectTemplate(t *testing.T, format string, input, output any) {
+	t.Helper()
+	templateValue, err := template.New("docker-inspect").Funcs(template.FuncMap{
+		"json": func(value any) (string, error) {
+			encoded, err := json.Marshal(value)
+			return string(encoded), err
+		},
+	}).Parse(format)
+	if err != nil {
+		t.Fatal("Docker inspection template did not parse")
+	}
+	var rendered strings.Builder
+	if err := templateValue.Execute(&rendered, input); err != nil {
+		t.Fatal("Docker inspection template did not execute")
+	}
+	if err := json.Unmarshal([]byte(rendered.String()), output); err != nil {
+		t.Fatal("Docker inspection template output was not JSON")
+	}
 }
 
 func jsonResult(value any) runtimeprocess.CommandResult {
