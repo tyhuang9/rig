@@ -1,6 +1,6 @@
 # hostd
 
-`hostd` is a local-first deployment manager with a durable authenticated control plane, independent local diagnostics, an explicitly enabled development fake runtime, and an opt-in controller-local Docker Compose runtime. Runtime execution is disabled by default. Caddy configuration is not implemented.
+`hostd` is a local-first deployment manager with a durable authenticated control plane, independent local diagnostics, an explicitly enabled development fake runtime, an opt-in controller-local Docker Compose runtime, and an opt-in generated runtime for inferred JavaScript/TypeScript applications. Runtime execution is disabled by default. Generated applications use controller-managed Caddy ingress and blue/green replacement.
 
 ## Prerequisites
 
@@ -49,6 +49,8 @@ Phase A accepts only an explicit loopback IP literal for `--listen`, such as `12
 Fake runtime is fail-closed. It must be explicitly enabled and its resolved data root must either be named `.hostd-dev` or be an isolated `hostd-*` directory under the system temporary directory. It persists job progress but never executes a workload.
 
 The real Docker Compose runtime requires `--compose-runtime`, is mutually exclusive with the fake runtime, and accepts only a controller-local Docker endpoint. The authenticated API and embedded dashboard expose deployment history, releases, exact runtime approvals, waiting-job resume, and explicit prior-release recovery. See [Docker Compose runtime operations](docs/compose-runtime.md) for security boundaries, timeout flags, dashboard and API verification, crash recovery, and disable/rollback guidance.
+
+The generated runtime requires `--generated-runtime` and supports inferred npm, pnpm, and Yarn applications on Node.js 20, 22, or 24. Rig reviews Build and Run commands before executing them, builds immutable non-root images in a bounded controller-owned BuildKit environment, and replaces healthy applications through private blue/green slots. Compose and generated runtimes may be enabled together; neither may be combined with the fake runtime. See [Generated JavaScript runtime operations](docs/generated-runtime.md) for the supported project shapes, review workflow, resource model, security boundaries, recovery states, and verification checklist.
 
 Applications can continue to use a local source path or connect to a selected GitHub.com repository without a user-managed checkout or installed Git CLI. GitHub credentials remain in controller-protected files, releases are immutable commit snapshots, and automatic deployment is disabled per application by default. See [GitHub-connected deployments](docs/github-connected-deployments.md) for the controller workflow, supported source model, relay enrollment, failure behavior, and acceptance checklist.
 
