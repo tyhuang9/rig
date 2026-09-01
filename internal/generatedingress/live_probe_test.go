@@ -32,13 +32,23 @@ const (
 	liveProbeIdentity   liveProbeGroup = "identity"
 	liveProbeNetwork    liveProbeGroup = "network"
 	liveProbeOperations liveProbeGroup = "operations"
-	liveProbeLogging    liveProbeGroup = "logging"
-	liveProbeHealth     liveProbeGroup = "health"
 )
 
 var liveProbeGroups = []liveProbeGroup{liveProbeInit, liveProbeFilesystem, liveProbePIDs, liveProbeCompute, liveProbeSecurity, liveProbeIdentity, liveProbeNetwork, liveProbeOperations}
 
-const liveProbeOperationsMaximum = 7
+const liveProbeLoggingMaximum = 7
+
+// liveProbeLoggingProfile is closed so the hosted follow-up can only vary the
+// fixed logging tuple already present in the synthetic candidate.
+type liveProbeLoggingProfile string
+
+const (
+	liveProbeLocalMaxSize    liveProbeLoggingProfile = "local_max_size"
+	liveProbeLocalMaxFile    liveProbeLoggingProfile = "local_max_file"
+	liveProbeLocalOnly       liveProbeLoggingProfile = "local_only"
+	liveProbeLocalBounded    liveProbeLoggingProfile = "local_bounded"
+	liveProbeBoundedJSONFile liveProbeLoggingProfile = "bounded_json_file"
+)
 
 // All fields come from the exact synthetic candidate which failed StartCandidate.
 // This remains test-only; it does not change runtime production behavior.
@@ -56,8 +66,8 @@ func (c liveProbeConfig) valid() bool {
 
 type liveProbeAttempt struct{ name, status string }
 type liveProbeOutcome struct {
-	status, cleanup string
-	attempts        []liveProbeAttempt
+	status, cleanup, diagnosis string
+	attempts                   []liveProbeAttempt
 }
 
 func (o liveProbeOutcome) diagnostic() string {
@@ -68,6 +78,10 @@ func (o liveProbeOutcome) diagnostic() string {
 	if c == "" {
 		c = "none"
 	}
+	d := o.diagnosis
+	if d == "" {
+		d = "none"
+	}
 	v := make([]string, 0, len(o.attempts))
 	for _, a := range o.attempts {
 		v = append(v, a.name+":"+a.status)
@@ -75,7 +89,7 @@ func (o liveProbeOutcome) diagnostic() string {
 	if len(v) == 0 {
 		v = []string{"none"}
 	}
-	return " live_probe_status=" + s + " live_probe_cleanup=" + c + " live_probe_groups=" + strings.Join(v, ",")
+	return " live_probe_status=" + s + " live_probe_cleanup=" + c + " live_probe_diagnosis=" + d + " live_probe_groups=" + strings.Join(v, ",")
 }
 
 func liveRunStartBisection(ctx context.Context, c liveProbeConfig) liveProbeOutcome {
@@ -163,10 +177,10 @@ func liveRunStartBisection(ctx context.Context, c liveProbeConfig) liveProbeOutc
 	return o
 }
 
-// liveRunOperationsSplit is a fixed, hosted-only follow-up after the broad
-// candidate start failure. It narrows the combined operations group without
-// changing any production runtime option and emits fixed labels only.
-func liveRunOperationsSplit(ctx context.Context, c liveProbeConfig) liveProbeOutcome {
+// liveRunLoggingTupleSplit is a fixed, hosted-only follow-up for the confirmed
+// Docker logging tuple. It keeps every non-logging candidate argument exact
+// and emits only fixed labels and statuses.
+func liveRunLoggingTupleSplit(ctx context.Context, c liveProbeConfig) liveProbeOutcome {
 	if !c.valid() {
 		return liveProbeOutcome{status: "fixture_invalid"}
 	}
@@ -182,12 +196,12 @@ func liveRunOperationsSplit(ctx context.Context, c liveProbeConfig) liveProbeOut
 	}
 	defer f.clear()
 	o := liveProbeOutcome{cleanup: "none"}
-	run := func(name string, omit []liveProbeGroup) (probeResult, bool) {
-		if len(o.attempts) >= liveProbeOperationsMaximum {
-			o.status = "budget"
+	run := func(name string, profile liveProbeLoggingProfile) (probeResult, bool) {
+		if len(o.attempts) >= liveProbeLoggingMaximum {
+			o.status = "budget_exhausted"
 			return probeResult{}, false
 		}
-		r := liveProbeRun(ctx, c, f, name, omit)
+		r := liveProbeRunLoggingProfile(ctx, c, f, name, profile)
 		o.attempts = append(o.attempts, liveProbeAttempt{name, r.status})
 		o.cleanup = r.cleanup
 		if !r.safe {
@@ -196,85 +210,121 @@ func liveRunOperationsSplit(ctx context.Context, c liveProbeConfig) liveProbeOut
 		}
 		return r, true
 	}
-	all, ok := run("all_options", nil)
+	confirm := func(name string, profile liveProbeLoggingProfile, expected, mismatch string) bool {
+		r, ok := run(name, profile)
+		if !ok {
+			return false
+		}
+		if !liveProbeBinaryResult(r) {
+			o.status = "non_binary_result"
+			return false
+		}
+		if r.status != expected {
+			o.status = mismatch
+			return false
+		}
+		return true
+	}
+
+	maxSize, ok := run("local_max_size", liveProbeLocalMaxSize)
 	if !ok {
 		return o
 	}
-	if all.status == "pass" {
-		o.status = "non_reproducible"
+	if !liveProbeBinaryResult(maxSize) {
+		o.status = "non_binary_result"
 		return o
 	}
-	operations, ok := run("without_operations", []liveProbeGroup{liveProbeOperations})
+	maxFile, ok := run("local_max_file", liveProbeLocalMaxFile)
 	if !ok {
 		return o
 	}
-	if operations.status != "pass" {
-		o.status = "operations_not_reproduced"
+	if !liveProbeBinaryResult(maxFile) {
+		o.status = "non_binary_result"
 		return o
 	}
-	logging, ok := run("without_logging", []liveProbeGroup{liveProbeLogging})
-	if !ok {
-		return o
-	}
-	health, ok := run("without_health", []liveProbeGroup{liveProbeHealth})
-	if !ok {
-		return o
-	}
-	loggingPass, healthPass := logging.status == "pass", health.status == "pass"
-	if !loggingPass && !healthPass {
-		o.status = "neither_subgroup"
-		return o
-	}
-	confirmAll, ok := run("confirm_all_options", nil)
-	if !ok {
-		return o
-	}
-	if confirmAll.status != "fail" {
-		if loggingPass && healthPass {
-			o.status = "unconfirmed_both"
+
+	switch {
+	case maxSize.status == "pass" && maxFile.status == "pass":
+		if !confirm("confirm_local_max_size", liveProbeLocalMaxSize, "pass", "unconfirmed_option_combination") ||
+			!confirm("confirm_local_max_file", liveProbeLocalMaxFile, "pass", "unconfirmed_option_combination") {
+			return o
+		}
+		localBounded, ok := run("local_bounded", liveProbeLocalBounded)
+		if !ok {
+			return o
+		}
+		if !liveProbeBinaryResult(localBounded) {
+			o.status = "non_binary_result"
+			return o
+		}
+		if localBounded.status != "fail" {
+			o.status = "unconfirmed_option_combination"
+			return o
+		}
+		o.diagnosis = "confirmed_option_combination"
+	case maxSize.status == "fail" && maxFile.status == "pass":
+		if !confirm("confirm_local_max_size", liveProbeLocalMaxSize, "fail", "unconfirmed_max_size") ||
+			!confirm("confirm_local_max_file", liveProbeLocalMaxFile, "pass", "unconfirmed_max_size") {
+			return o
+		}
+		o.diagnosis = "confirmed_max_size"
+	case maxSize.status == "pass" && maxFile.status == "fail":
+		if !confirm("confirm_local_max_size", liveProbeLocalMaxSize, "pass", "unconfirmed_max_file") ||
+			!confirm("confirm_local_max_file", liveProbeLocalMaxFile, "fail", "unconfirmed_max_file") {
+			return o
+		}
+		o.diagnosis = "confirmed_max_file"
+	case maxSize.status == "fail" && maxFile.status == "fail":
+		localOnly, ok := run("local_only", liveProbeLocalOnly)
+		if !ok {
+			return o
+		}
+		if !liveProbeBinaryResult(localOnly) {
+			o.status = "non_binary_result"
+			return o
+		}
+		if localOnly.status == "fail" {
+			if !confirm("confirm_local_only", liveProbeLocalOnly, "fail", "unconfirmed_local_driver") {
+				return o
+			}
+			o.diagnosis = "confirmed_local_driver"
+		} else if !confirm("confirm_local_max_size", liveProbeLocalMaxSize, "fail", "unconfirmed_multiple_log_options") ||
+			!confirm("confirm_local_max_file", liveProbeLocalMaxFile, "fail", "unconfirmed_multiple_log_options") {
+			return o
 		} else {
-			o.status = "unconfirmed_" + firstLiveProbeSubgroup(loggingPass, healthPass)
+			o.diagnosis = "observed_multiple_log_options"
 		}
+	}
+
+	boundedJSON, ok := run("bounded_json_file", liveProbeBoundedJSONFile)
+	if !ok {
 		return o
 	}
-	confirmedLogging, confirmedHealth := false, false
-	if loggingPass {
-		confirmation, ok := run("confirm_logging", []liveProbeGroup{liveProbeLogging})
-		if !ok {
-			return o
-		}
-		confirmedLogging = confirmation.status == "pass"
+	if !liveProbeBinaryResult(boundedJSON) {
+		o.status = "non_binary_result"
+		return o
 	}
-	if healthPass {
-		confirmation, ok := run("confirm_health", []liveProbeGroup{liveProbeHealth})
-		if !ok {
-			return o
-		}
-		confirmedHealth = confirmation.status == "pass"
+	confirmedJSON, ok := run("confirm_bounded_json_file", liveProbeBoundedJSONFile)
+	if !ok {
+		return o
+	}
+	if !liveProbeBinaryResult(confirmedJSON) {
+		o.status = "non_binary_result"
+		return o
 	}
 	switch {
-	case confirmedLogging && confirmedHealth:
-		o.status = "confirmed_both"
-	case confirmedLogging:
-		o.status = "confirmed_logging"
-	case confirmedHealth:
-		o.status = "confirmed_health"
-	case loggingPass && healthPass:
-		o.status = "unconfirmed_both"
+	case boundedJSON.status == "pass" && confirmedJSON.status == "pass":
+		o.status = "confirmed_bounded_json_file"
+	case boundedJSON.status == "fail" && confirmedJSON.status == "fail":
+		o.status = "confirmed_json_file_incompatible"
 	default:
-		o.status = "unconfirmed_" + firstLiveProbeSubgroup(loggingPass, healthPass)
+		o.status = "unconfirmed_bounded_json_file"
 	}
 	return o
 }
 
-func firstLiveProbeSubgroup(logging, health bool) string {
-	if logging {
-		return string(liveProbeLogging)
-	}
-	if health {
-		return string(liveProbeHealth)
-	}
-	return "none"
+func liveProbeBinaryResult(r probeResult) bool {
+	return r.status == "pass" || r.status == "fail"
 }
 
 type liveProbeFixture struct{ name, nonce string }
@@ -319,9 +369,27 @@ func liveProbeRun(ctx context.Context, c liveProbeConfig, f liveProbeFixture, at
 	}
 	args, ok := liveProbeCreateArgs(c, f, attempt, omit)
 	defer clear(args)
-	if !ok || !liveValidateProbeCreate(c, f, attempt, args) {
+	if !ok || !liveValidateProbeCreate(c, f, attempt, omit, args) {
 		return probeResult{"fixture_invalid", "none", true}
 	}
+	return liveProbeRunCreateArgs(ctx, c, f, attempt, args)
+}
+
+func liveProbeRunLoggingProfile(ctx context.Context, c liveProbeConfig, f liveProbeFixture, attempt string, profile liveProbeLoggingProfile) probeResult {
+	var ok bool
+	f, ok = f.forAttempt(attempt)
+	if !ok {
+		return probeResult{"fixture_invalid", "none", true}
+	}
+	args, ok := liveProbeLoggingProfileCreateArgs(c, f, attempt, profile)
+	defer clear(args)
+	if !ok || !liveValidateLoggingProfileCreate(c, f, attempt, profile, args) {
+		return probeResult{"fixture_invalid", "none", true}
+	}
+	return liveProbeRunCreateArgs(ctx, c, f, attempt, args)
+}
+
+func liveProbeRunCreateArgs(ctx context.Context, c liveProbeConfig, f liveProbeFixture, attempt string, args []string) probeResult {
 	create, createErr := liveProbeCommand(ctx, c, args)
 	createTruncated := create.StdoutTruncated || create.StderrTruncated
 	id := copyProbeID(create.Stdout)
@@ -438,13 +506,62 @@ func liveProbeCreateArgs(c liveProbeConfig, f liveProbeFixture, attempt string, 
 	} else {
 		a = append(a, "--network", c.network, "--network-alias", c.alias)
 	}
-	if !m[liveProbeOperations] && !m[liveProbeLogging] {
-		a = append(a, "--log-driver", "local", "--log-opt", "max-size="+c.logSize, "--log-opt", "max-file="+c.logFiles)
-	}
-	if !m[liveProbeOperations] && !m[liveProbeHealth] {
-		a = append(a, "--health-cmd", liveProbeHealthCommand, "--health-interval", "2s", "--health-timeout", "2s", "--health-start-period", "5s", "--health-retries", "3")
+	if !m[liveProbeOperations] {
+		a = append(a, "--log-driver", "local", "--log-opt", "max-size="+c.logSize, "--log-opt", "max-file="+c.logFiles, "--health-cmd", liveProbeHealthCommand, "--health-interval", "2s", "--health-timeout", "2s", "--health-start-period", "5s", "--health-retries", "3")
 	}
 	return append(a, c.image, "/bin/sh", "-lc", c.command), true
+}
+
+func liveProbeLoggingProfileCreateArgs(c liveProbeConfig, f liveProbeFixture, attempt string, profile liveProbeLoggingProfile) ([]string, bool) {
+	args, ok := liveProbeCreateArgs(c, f, attempt, nil)
+	if !ok {
+		return nil, false
+	}
+	logging := liveProbeLoggingProfileArgs(c, profile)
+	if logging == nil {
+		clear(args)
+		return nil, false
+	}
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--log-driver" && args[i+1] == "local" {
+			end := i
+			for end < len(args) && args[end] != "--health-cmd" {
+				end++
+			}
+			if end == len(args) {
+				clear(args)
+				clear(logging)
+				return nil, false
+			}
+			replaced := make([]string, 0, len(args)-end+i+len(logging))
+			replaced = append(replaced, args[:i]...)
+			replaced = append(replaced, logging...)
+			replaced = append(replaced, args[end:]...)
+			clear(args)
+			clear(logging)
+			return replaced, true
+		}
+	}
+	clear(args)
+	clear(logging)
+	return nil, false
+}
+
+func liveProbeLoggingProfileArgs(c liveProbeConfig, profile liveProbeLoggingProfile) []string {
+	switch profile {
+	case liveProbeLocalMaxSize:
+		return []string{"--log-driver", "local", "--log-opt", "max-size=" + c.logSize}
+	case liveProbeLocalMaxFile:
+		return []string{"--log-driver", "local", "--log-opt", "max-file=" + c.logFiles}
+	case liveProbeLocalOnly:
+		return []string{"--log-driver", "local"}
+	case liveProbeLocalBounded:
+		return []string{"--log-driver", "local", "--log-opt", "max-size=" + c.logSize, "--log-opt", "max-file=" + c.logFiles}
+	case liveProbeBoundedJSONFile:
+		return []string{"--log-driver", "json-file", "--log-opt", "max-size=" + c.logSize, "--log-opt", "max-file=" + c.logFiles}
+	default:
+		return nil
+	}
 }
 func validAttempt(s string) bool {
 	if s == "" || len(s) > 64 {
@@ -457,35 +574,15 @@ func validAttempt(s string) bool {
 	}
 	return true
 }
-func liveValidateProbeCreate(c liveProbeConfig, f liveProbeFixture, attempt string, args []string) bool {
-	expected, ok := liveProbeCreateArgs(c, f, attempt, omittedProbeGroups(args))
+func liveValidateProbeCreate(c liveProbeConfig, f liveProbeFixture, attempt string, omit []liveProbeGroup, args []string) bool {
+	expected, ok := liveProbeCreateArgs(c, f, attempt, omit)
 	defer clear(expected)
 	return ok && sameArgs(args, expected)
 }
-func omittedProbeGroups(args []string) []liveProbeGroup {
-	checks := []struct {
-		g liveProbeGroup
-		s string
-	}{{liveProbeInit, "--init"}, {liveProbeFilesystem, "--read-only"}, {liveProbePIDs, "--pids-limit"}, {liveProbeCompute, "--memory"}, {liveProbeSecurity, "--cap-drop"}, {liveProbeIdentity, "--user"}}
-	var out []liveProbeGroup
-	for _, x := range checks {
-		if !hasArgs(args, x.s) {
-			out = append(out, x.g)
-		}
-	}
-	if hasArgs(args, "--network", "none") {
-		out = append(out, liveProbeNetwork)
-	}
-	hasLogging, hasHealth := hasArgs(args, "--log-driver"), hasArgs(args, "--health-cmd")
-	switch {
-	case !hasLogging && !hasHealth:
-		out = append(out, liveProbeOperations)
-	case !hasLogging:
-		out = append(out, liveProbeLogging)
-	case !hasHealth:
-		out = append(out, liveProbeHealth)
-	}
-	return out
+func liveValidateLoggingProfileCreate(c liveProbeConfig, f liveProbeFixture, attempt string, profile liveProbeLoggingProfile, args []string) bool {
+	expected, ok := liveProbeLoggingProfileCreateArgs(c, f, attempt, profile)
+	defer clear(expected)
+	return ok && sameArgs(args, expected)
 }
 func sameArgs(a, b []string) bool {
 	if len(a) != len(b) {
@@ -562,7 +659,7 @@ func TestLiveProbeFixtureFidelityAndGroupOmission(t *testing.T) {
 	c := testProbeConfig(&liveProbeRunner{})
 	f := testProbeFixture(t)
 	a, ok := liveProbeCreateArgs(c, f, "all_options", nil)
-	if !ok || !liveValidateProbeCreate(c, f, "all_options", a) {
+	if !ok || !liveValidateProbeCreate(c, f, "all_options", nil, a) {
 		t.Fatal("valid fixture rejected")
 	}
 	for _, w := range []string{c.image, c.command, c.network, c.alias, c.hostname, "--cpus", "0.500", "--user", "node", liveProbeHealthCommand, "io.rig.managed=generated-runtime-probe"} {
@@ -573,7 +670,7 @@ func TestLiveProbeFixtureFidelityAndGroupOmission(t *testing.T) {
 	clear(a)
 	for _, g := range liveProbeGroups {
 		a, ok = liveProbeCreateArgs(c, f, string(g), []liveProbeGroup{g})
-		if !ok || !liveValidateProbeCreate(c, f, string(g), a) {
+		if !ok || !liveValidateProbeCreate(c, f, string(g), []liveProbeGroup{g}, a) {
 			t.Fatalf("invalid group %s", g)
 		}
 		if g == liveProbeNetwork {
@@ -587,29 +684,6 @@ func TestLiveProbeFixtureFidelityAndGroupOmission(t *testing.T) {
 	}
 }
 
-func TestLiveProbeOperationsSubgroupsOmitExactBoundaries(t *testing.T) {
-	c, f := testProbeConfig(&liveProbeRunner{}), testProbeFixture(t)
-	for _, test := range []struct {
-		name                    string
-		omit                    liveProbeGroup
-		wantLogging, wantHealth bool
-	}{
-		{"operations", liveProbeOperations, false, false},
-		{"logging", liveProbeLogging, false, true},
-		{"health", liveProbeHealth, true, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			args, ok := liveProbeCreateArgs(c, f, test.name, []liveProbeGroup{test.omit})
-			defer clear(args)
-			if !ok || !liveValidateProbeCreate(c, f, test.name, args) {
-				t.Fatal("subgroup request was rejected")
-			}
-			if hasArgs(args, "--log-driver") != test.wantLogging || hasArgs(args, "--health-cmd") != test.wantHealth {
-				t.Fatal("subgroup omitted an incorrect operation boundary")
-			}
-		})
-	}
-}
 func TestLiveProbeRejectsRequestDrift(t *testing.T) {
 	c := testProbeConfig(&liveProbeRunner{})
 	f := testProbeFixture(t)
@@ -618,13 +692,13 @@ func TestLiveProbeRejectsRequestDrift(t *testing.T) {
 	for _, fn := range []func([]string){func(v []string) { v[6] = "--env-file" }, func(v []string) { v[len(v)-1] = "wrong" }, func(v []string) { v[15] = "io.rig.probe.group=wrong" }} {
 		v := append([]string(nil), a...)
 		fn(v)
-		if liveValidateProbeCreate(c, f, "all_options", v) {
+		if liveValidateProbeCreate(c, f, "all_options", nil, v) {
 			t.Fatal("drift accepted")
 		}
 		clear(v)
 	}
 	duplicate := append(append([]string(nil), a...), "--health-cmd", liveProbeHealthCommand)
-	if liveValidateProbeCreate(c, f, "all_options", duplicate) {
+	if liveValidateProbeCreate(c, f, "all_options", nil, duplicate) {
 		t.Fatal("duplicate health flags accepted")
 	}
 	clear(duplicate)
@@ -643,29 +717,149 @@ func TestLiveProbeBisectionBounded(t *testing.T) {
 	}
 }
 
-func TestLiveOperationsSplitSequences(t *testing.T) {
+func TestLiveLoggingProfileArgumentFidelity(t *testing.T) {
+	c, f := testProbeConfig(&liveProbeRunner{}), testProbeFixture(t)
 	for _, test := range []struct {
-		name, mode, want, sequence string
+		name    string
+		profile liveProbeLoggingProfile
+		want    []string
 	}{
-		{"logging", "logging", "confirmed_logging", ""},
-		{"health", "health", "confirmed_health", ""},
-		{"both", "both", "confirmed_both", ""},
-		{"both_logging", "both_logging", "confirmed_logging", "all_options,without_operations,without_logging,without_health,confirm_all_options,confirm_logging,confirm_health"},
-		{"both_health", "both_health", "confirmed_health", "all_options,without_operations,without_logging,without_health,confirm_all_options,confirm_logging,confirm_health"},
-		{"both_neither", "both_neither", "unconfirmed_both", "all_options,without_operations,without_logging,without_health,confirm_all_options,confirm_logging,confirm_health"},
-		{"both_confirm_all_nonfail", "both_confirm_all_nonfail", "unconfirmed_both", "all_options,without_operations,without_logging,without_health,confirm_all_options"},
-		{"neither", "neither", "neither_subgroup", ""},
-		{"unconfirmed", "unconfirmed", "unconfirmed_logging", ""},
-		{"not_reproduced", "not_reproduced", "operations_not_reproduced", ""},
+		{"local_max_size", liveProbeLocalMaxSize, []string{"--log-driver", "local", "--log-opt", "max-size=" + c.logSize}},
+		{"local_max_file", liveProbeLocalMaxFile, []string{"--log-driver", "local", "--log-opt", "max-file=" + c.logFiles}},
+		{"local_only", liveProbeLocalOnly, []string{"--log-driver", "local"}},
+		{"local_bounded", liveProbeLocalBounded, []string{"--log-driver", "local", "--log-opt", "max-size=" + c.logSize, "--log-opt", "max-file=" + c.logFiles}},
+		{"bounded_json_file", liveProbeBoundedJSONFile, []string{"--log-driver", "json-file", "--log-opt", "max-size=" + c.logSize, "--log-opt", "max-file=" + c.logFiles}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			runner := &liveProbeRunner{operationsMode: test.mode}
-			outcome := liveRunOperationsSplit(context.Background(), testProbeConfig(runner))
-			if outcome.status != test.want || len(outcome.attempts) > liveProbeOperationsMaximum || outcome.cleanup != "removed" || runner.concurrent {
+			candidate, ok := liveProbeCreateArgs(c, f, test.name, nil)
+			if !ok {
+				t.Fatal("candidate create arguments")
+			}
+			defer clear(candidate)
+			args, ok := liveProbeLoggingProfileCreateArgs(c, f, test.name, test.profile)
+			defer clear(args)
+			if !ok || !liveValidateLoggingProfileCreate(c, f, test.name, test.profile, args) {
+				t.Fatal("profile request was rejected")
+			}
+			if !sameArgs(liveProbeLoggingTuple(args), test.want) {
+				t.Fatal("logging tuple mismatch")
+			}
+			if !sameArgs(liveProbeWithoutLogging(candidate), liveProbeWithoutLogging(args)) {
+				t.Fatal("non-logging candidate arguments drifted")
+			}
+		})
+	}
+	if args, ok := liveProbeLoggingProfileCreateArgs(c, f, "invalid_profile", liveProbeLoggingProfile("invalid")); ok || args != nil {
+		t.Fatal("unknown logging profile was accepted")
+	}
+}
+
+func TestLiveLoggingProfileRejectsTupleDrift(t *testing.T) {
+	c, f := testProbeConfig(&liveProbeRunner{}), testProbeFixture(t)
+	for _, profile := range []liveProbeLoggingProfile{liveProbeLocalBounded, liveProbeBoundedJSONFile} {
+		t.Run(string(profile), func(t *testing.T) {
+			args, ok := liveProbeLoggingProfileCreateArgs(c, f, string(profile), profile)
+			if !ok {
+				t.Fatal("profile create arguments")
+			}
+			defer clear(args)
+			otherDriver := "json-file"
+			if profile == liveProbeBoundedJSONFile {
+				otherDriver = "local"
+			}
+			for _, mutate := range []func([]string){
+				func(v []string) { v[liveProbeLoggingStart(v)+1] = otherDriver },
+				func(v []string) { v[liveProbeLoggingStart(v)+3] = "max-files=" + c.logFiles },
+				func(v []string) { v[liveProbeLoggingStart(v)+3] = "max-size=wrong" },
+				func(v []string) { i := liveProbeLoggingStart(v); v[i+3], v[i+5] = v[i+5], v[i+3] },
+			} {
+				v := append([]string(nil), args...)
+				mutate(v)
+				if liveValidateLoggingProfileCreate(c, f, string(profile), profile, v) {
+					t.Fatal("logging tuple drift accepted")
+				}
+				clear(v)
+			}
+			extraAt := liveProbeLoggingEnd(args)
+			extra := make([]string, 0, len(args)+2)
+			extra = append(extra, args[:extraAt]...)
+			extra = append(extra, "--log-opt", "max-file="+c.logFiles)
+			extra = append(extra, args[extraAt:]...)
+			defer clear(extra)
+			if liveValidateLoggingProfileCreate(c, f, string(profile), profile, extra) {
+				t.Fatal("extra logging option accepted")
+			}
+		})
+	}
+}
+
+func liveProbeLoggingStart(args []string) int {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--log-driver" {
+			return i
+		}
+	}
+	return -1
+}
+
+func liveProbeLoggingEnd(args []string) int {
+	for i := liveProbeLoggingStart(args); i >= 0 && i < len(args); i++ {
+		if args[i] == "--health-cmd" {
+			return i
+		}
+	}
+	return -1
+}
+
+func liveProbeLoggingTuple(args []string) []string {
+	start, end := liveProbeLoggingStart(args), liveProbeLoggingEnd(args)
+	if start < 0 || end < start {
+		return nil
+	}
+	return args[start:end]
+}
+
+func liveProbeWithoutLogging(args []string) []string {
+	start, end := liveProbeLoggingStart(args), liveProbeLoggingEnd(args)
+	if start < 0 || end < start {
+		return nil
+	}
+	out := make([]string, 0, len(args)-end+start)
+	out = append(out, args[:start]...)
+	out = append(out, args[end:]...)
+	return out
+}
+
+func TestLiveLoggingTupleSplitSequences(t *testing.T) {
+	for _, test := range []struct {
+		name, mode, status, diagnosis, cleanup, sequence string
+	}{
+		{"option_combination", "option_combination", "confirmed_bounded_json_file", "confirmed_option_combination", "removed", "local_max_size,local_max_file,confirm_local_max_size,confirm_local_max_file,local_bounded,bounded_json_file,confirm_bounded_json_file"},
+		{"max_size", "max_size", "confirmed_bounded_json_file", "confirmed_max_size", "removed", "local_max_size,local_max_file,confirm_local_max_size,confirm_local_max_file,bounded_json_file,confirm_bounded_json_file"},
+		{"max_file", "max_file", "confirmed_bounded_json_file", "confirmed_max_file", "removed", "local_max_size,local_max_file,confirm_local_max_size,confirm_local_max_file,bounded_json_file,confirm_bounded_json_file"},
+		{"local_driver", "local_driver", "confirmed_bounded_json_file", "confirmed_local_driver", "removed", "local_max_size,local_max_file,local_only,confirm_local_only,bounded_json_file,confirm_bounded_json_file"},
+		{"multiple_log_options", "multiple_log_options", "confirmed_bounded_json_file", "observed_multiple_log_options", "removed", "local_max_size,local_max_file,local_only,confirm_local_max_size,confirm_local_max_file,bounded_json_file,confirm_bounded_json_file"},
+		{"json_incompatible", "json_incompatible", "confirmed_json_file_incompatible", "confirmed_option_combination", "removed", "local_max_size,local_max_file,confirm_local_max_size,confirm_local_max_file,local_bounded,bounded_json_file,confirm_bounded_json_file"},
+		{"json_mismatch", "json_mismatch", "unconfirmed_bounded_json_file", "confirmed_option_combination", "removed", "local_max_size,local_max_file,confirm_local_max_size,confirm_local_max_file,local_bounded,bounded_json_file,confirm_bounded_json_file"},
+		{"local_bounded_pass_mismatch", "local_bounded_pass_mismatch", "unconfirmed_option_combination", "", "removed", "local_max_size,local_max_file,confirm_local_max_size,confirm_local_max_file,local_bounded"},
+		{"local_bounded_non_binary", "local_bounded_non_binary", "aborted", "", "removed", "local_max_size,local_max_file,confirm_local_max_size,confirm_local_max_file,local_bounded"},
+		{"local_bounded_unsafe", "local_bounded_unsafe", "aborted", "", "attestation_failed", "local_max_size,local_max_file,confirm_local_max_size,confirm_local_max_file,local_bounded"},
+		{"option_combination_first_confirmation_mismatch", "option_combination_first_confirmation_mismatch", "unconfirmed_option_combination", "", "removed", "local_max_size,local_max_file,confirm_local_max_size"},
+		{"option_combination_second_confirmation_mismatch", "option_combination_second_confirmation_mismatch", "unconfirmed_option_combination", "", "removed", "local_max_size,local_max_file,confirm_local_max_size,confirm_local_max_file"},
+		{"max_size_confirmation_mismatch", "max_size_confirmation_mismatch", "unconfirmed_max_size", "", "removed", "local_max_size,local_max_file,confirm_local_max_size"},
+		{"max_file_confirmation_mismatch", "max_file_confirmation_mismatch", "unconfirmed_max_file", "", "removed", "local_max_size,local_max_file,confirm_local_max_size,confirm_local_max_file"},
+		{"local_driver_confirmation_mismatch", "local_driver_confirmation_mismatch", "unconfirmed_local_driver", "", "removed", "local_max_size,local_max_file,local_only,confirm_local_only"},
+		{"multiple_options_confirmation_mismatch", "multiple_options_confirmation_mismatch", "unconfirmed_multiple_log_options", "", "removed", "local_max_size,local_max_file,local_only,confirm_local_max_size"},
+		{"non_binary", "non_binary", "aborted", "", "removed", "local_max_size"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &liveProbeRunner{loggingMode: test.mode}
+			outcome := liveRunLoggingTupleSplit(context.Background(), testProbeConfig(runner))
+			if outcome.status != test.status || outcome.diagnosis != test.diagnosis || len(outcome.attempts) > liveProbeLoggingMaximum || outcome.cleanup != test.cleanup || runner.concurrent || len(runner.names) != len(outcome.attempts) || !liveProbeUniqueNames(runner.names) {
 				t.Fatalf("outcome=%+v", outcome)
 			}
-			if test.sequence != "" && liveProbeAttemptNames(outcome.attempts) != test.sequence {
-				t.Fatalf("sequence=%q", liveProbeAttemptNames(outcome.attempts))
+			if sequence := liveProbeAttemptNames(outcome.attempts); sequence != test.sequence {
+				t.Fatalf("sequence=%q", sequence)
 			}
 		})
 	}
@@ -679,11 +873,31 @@ func liveProbeAttemptNames(attempts []liveProbeAttempt) string {
 	return strings.Join(names, ",")
 }
 
-func TestLiveOperationsSplitStopsOnCleanupUncertainty(t *testing.T) {
-	runner := &liveProbeRunner{operationsMode: "logging", drift: "name"}
-	outcome := liveRunOperationsSplit(context.Background(), testProbeConfig(runner))
-	if outcome.status != "aborted" || len(outcome.attempts) != 1 || runner.removes != 0 {
-		t.Fatalf("outcome=%+v removes=%d", outcome, runner.removes)
+func liveProbeUniqueNames(names []string) bool {
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, ok := seen[name]; ok {
+			return false
+		}
+		seen[name] = struct{}{}
+	}
+	return true
+}
+
+func TestLiveLoggingTupleSplitStopsOnOwnershipAndCleanupUncertainty(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		runner *liveProbeRunner
+	}{
+		{"early_attestation", &liveProbeRunner{loggingMode: "option_combination", badAttest: true}},
+		{"late_reattest", &liveProbeRunner{loggingMode: "option_combination", drift: "name"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			outcome := liveRunLoggingTupleSplit(context.Background(), testProbeConfig(test.runner))
+			if outcome.status != "aborted" || len(outcome.attempts) != 1 || test.runner.removes != 0 {
+				t.Fatalf("outcome=%+v removes=%d", outcome, test.runner.removes)
+			}
+		})
 	}
 }
 func TestLiveProbeRecoveryAndCleanupSafety(t *testing.T) {
@@ -751,7 +965,7 @@ func TestLiveProbeCleanupRejectsAttestationDrift(t *testing.T) {
 	}
 }
 func TestLiveProbeDiagnosticRedacts(t *testing.T) {
-	d := (liveProbeOutcome{status: "confirmed_init", cleanup: "removed", attempts: []liveProbeAttempt{{"init", "pass"}}}).diagnostic()
+	d := (liveProbeOutcome{status: "confirmed_bounded_json_file", cleanup: "removed", diagnosis: "observed_multiple_log_options", attempts: []liveProbeAttempt{{"local_max_size", "fail"}}}).diagnostic()
 	for _, s := range []string{strings.Repeat("a", 64), "name", "/path", "command", "SECRET=value", "image", "label", "raw-error"} {
 		if strings.Contains(d, s) {
 			t.Fatal("canary leaked")
@@ -760,12 +974,12 @@ func TestLiveProbeDiagnosticRedacts(t *testing.T) {
 }
 
 type liveProbeRunner struct {
-	passWhenMissing, name, nonce, group, drift, operationsMode                                                                              string
-	names                                                                                                                                   []string
-	active, hasPass, hasLogging, hasHealth, createErr, createTruncated, badAttest, truncated, attestErr, removeErr, absence, startTruncated bool
-	startErr                                                                                                                                error
-	creates, removes, starts, attests                                                                                                       int
-	running, concurrent                                                                                                                     bool
+	passWhenMissing, name, nonce, group, drift, loggingMode                                                          string
+	names                                                                                                            []string
+	active, hasPass, createErr, createTruncated, badAttest, truncated, attestErr, removeErr, absence, startTruncated bool
+	startErr                                                                                                         error
+	creates, removes, starts, attests                                                                                int
+	running, concurrent                                                                                              bool
 }
 
 func (r *liveProbeRunner) Run(ctx context.Context, q runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -784,8 +998,6 @@ func (r *liveProbeRunner) Run(ctx context.Context, q runtimeprocess.CommandReque
 		r.names = append(r.names, r.name)
 		r.active = true
 		r.hasPass = hasArgs(q.Args, r.passWhenMissing)
-		r.hasLogging = hasArgs(q.Args, "--log-driver")
-		r.hasHealth = hasArgs(q.Args, "--health-cmd")
 		for i := 0; i+1 < len(q.Args); i++ {
 			if q.Args[i] == "--label" {
 				if strings.HasPrefix(q.Args[i+1], "io.rig.probe.session=") {
@@ -810,7 +1022,10 @@ func (r *liveProbeRunner) Run(ctx context.Context, q runtimeprocess.CommandReque
 		if r.startErr != nil {
 			return runtimeprocess.CommandResult{}, r.startErr
 		}
-		if r.operationsFailure() {
+		if r.loggingInconclusive() {
+			return runtimeprocess.CommandResult{}, context.Canceled
+		}
+		if r.loggingFailure() {
 			return runtimeprocess.CommandResult{}, errLiveProbe
 		}
 		if r.hasPass {
@@ -831,7 +1046,7 @@ func (r *liveProbeRunner) Run(ctx context.Context, q runtimeprocess.CommandReque
 		if r.truncated {
 			return runtimeprocess.CommandResult{StdoutTruncated: true}, nil
 		}
-		if r.badAttest {
+		if r.badAttest || (r.loggingMode == "local_bounded_unsafe" && r.group == "local_bounded") {
 			return runtimeprocess.CommandResult{Stdout: []byte("bad")}, nil
 		}
 		if r.attests > 1 {
@@ -863,29 +1078,40 @@ func (r *liveProbeRunner) Run(ctx context.Context, q runtimeprocess.CommandReque
 	return runtimeprocess.CommandResult{}, errLiveProbe
 }
 
-func (r *liveProbeRunner) operationsFailure() bool {
-	switch r.operationsMode {
-	case "logging":
-		return r.hasLogging
-	case "health":
-		return r.hasHealth
-	case "both":
-		return r.hasLogging && r.hasHealth
-	case "neither":
-		return r.hasLogging || r.hasHealth
-	case "unconfirmed":
-		return r.hasLogging || r.group == "confirm_logging"
-	case "not_reproduced":
-		return true
-	case "both_logging":
-		return (r.hasLogging && r.hasHealth) || r.group == "confirm_health"
-	case "both_health":
-		return (r.hasLogging && r.hasHealth) || r.group == "confirm_logging"
-	case "both_neither":
-		return (r.hasLogging && r.hasHealth) || r.group == "confirm_logging" || r.group == "confirm_health"
-	case "both_confirm_all_nonfail":
-		return r.hasLogging && r.hasHealth && r.group != "confirm_all_options"
+func (r *liveProbeRunner) loggingFailure() bool {
+	switch r.loggingMode {
+	case "option_combination":
+		return r.group == "local_bounded"
+	case "max_size":
+		return r.group == "local_max_size" || r.group == "confirm_local_max_size"
+	case "max_file":
+		return r.group == "local_max_file" || r.group == "confirm_local_max_file"
+	case "local_driver":
+		return r.group == "local_max_size" || r.group == "local_max_file" || r.group == "local_only" || r.group == "confirm_local_only"
+	case "multiple_log_options":
+		return r.group == "local_max_size" || r.group == "local_max_file" || r.group == "confirm_local_max_size" || r.group == "confirm_local_max_file"
+	case "json_incompatible":
+		return r.group == "local_bounded" || r.group == "bounded_json_file" || r.group == "confirm_bounded_json_file"
+	case "json_mismatch":
+		return r.group == "local_bounded" || r.group == "confirm_bounded_json_file"
+	case "option_combination_first_confirmation_mismatch":
+		return r.group == "confirm_local_max_size"
+	case "option_combination_second_confirmation_mismatch":
+		return r.group == "confirm_local_max_file"
+	case "max_size_confirmation_mismatch":
+		return r.group == "local_max_size"
+	case "max_file_confirmation_mismatch":
+		return r.group == "local_max_file"
+	case "local_driver_confirmation_mismatch":
+		return r.group == "local_max_size" || r.group == "local_max_file" || r.group == "local_only"
+	case "multiple_options_confirmation_mismatch":
+		return r.group == "local_max_size" || r.group == "local_max_file"
 	default:
 		return false
 	}
+}
+
+func (r *liveProbeRunner) loggingInconclusive() bool {
+	return (r.loggingMode == "non_binary" && r.group == "local_max_size") ||
+		(r.loggingMode == "local_bounded_non_binary" && r.group == "local_bounded")
 }

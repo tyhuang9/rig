@@ -1656,7 +1656,7 @@ func startLiveCandidate(t *testing.T, ctx context.Context, engine *generatedrunt
 	if err := engine.StartCandidate(ctx, candidate); err != nil {
 		probe := liveProbeOutcome{status: "not_eligible"}
 		if observer.startFailureAllowsProbe() {
-			probe = liveRunOperationsSplit(ctx, liveProbeConfigForCandidate(probeConfig, spec, candidate, limits))
+			probe = liveRunLoggingTupleSplit(ctx, liveProbeConfigForCandidate(probeConfig, spec, candidate, limits))
 		}
 		t.Fatalf("start candidate: %v%s%s", err, observer.failureDiagnostic(), probe.diagnostic())
 	}
