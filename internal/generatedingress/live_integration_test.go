@@ -960,9 +960,10 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 		t.Fatalf("create generated ingress: %v", err)
 	}
 
+	probeConfig := liveProbeConfig{runner: runner.delegate, executable: docker, directory: working, env: []string{"DOCKER_CONFIG=" + dockerConfig}}
 	blueSpec := liveCandidateSpec("blue", appID, planID)
 	blueSpec.ImageContentID = buildLiveImage(t, ctx, docker, root, imageTags[0], blueSpec, "blue")
-	blue := startLiveCandidate(t, ctx, engine, runner, blueSpec)
+	blue := startLiveCandidate(t, ctx, engine, runner, probeConfig, limits, blueSpec)
 	defer func() { _ = engine.StopAndRemove(context.Background(), blue, 0) }()
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{
 		AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(blue)},
@@ -975,7 +976,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	greenSpec := liveCandidateSpec("green", appID, planID)
 	greenSpec.ActiveSlot = blue.Slot
 	greenSpec.ImageContentID = buildLiveImage(t, ctx, docker, root, imageTags[1], greenSpec, "green")
-	green := startLiveCandidate(t, ctx, engine, runner, greenSpec)
+	green := startLiveCandidate(t, ctx, engine, runner, probeConfig, limits, greenSpec)
 	defer func() { _ = engine.StopAndRemove(context.Background(), green, 0) }()
 
 	// A healthy inactive candidate must not receive traffic before the route commit.
@@ -1645,7 +1646,7 @@ func buildLiveImage(t *testing.T, ctx context.Context, docker, root, tag string,
 	return strings.TrimSpace(output)
 }
 
-func startLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, observer *liveCreateObserver, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
+func startLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, observer *liveCreateObserver, probeConfig liveProbeConfig, limits generatedruntime.ContainerLimits, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
 	t.Helper()
 	observer.reset()
 	candidate, err := engine.CreateInactiveCandidate(ctx, spec)
@@ -1653,12 +1654,75 @@ func startLiveCandidate(t *testing.T, ctx context.Context, engine *generatedrunt
 		t.Fatalf("create candidate: %v%s", err, observer.failureDiagnostic())
 	}
 	if err := engine.StartCandidate(ctx, candidate); err != nil {
-		t.Fatalf("start candidate: %v%s", err, observer.failureDiagnostic())
+		probe := liveProbeOutcome{status: "not_eligible"}
+		if observer.startFailureAllowsProbe() {
+			probe = liveRunStartBisection(ctx, liveProbeConfigForCandidate(probeConfig, spec, candidate, limits))
+		}
+		t.Fatalf("start candidate: %v%s%s", err, observer.failureDiagnostic(), probe.diagnostic())
 	}
 	if err := engine.WaitHealthy(ctx, candidate); err != nil {
 		t.Fatalf("wait for candidate: %v%s", err, observer.failureDiagnostic())
 	}
 	return candidate
+}
+
+// startFailureAllowsProbe keeps the bisection narrowly diagnostic: cancellation,
+// timeouts, truncation, daemon failures, and source-specific causes are already
+// actionable and must never create extra containers. Only wrapper/inconclusive
+// failures with no State.Error detail may exercise the fixed probe matrix.
+func (observer *liveCreateObserver) startFailureAllowsProbe() bool {
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	return observer.latest.startReason == liveStartCreateTaskFailed &&
+		observer.latest.createTaskMarks == liveCreateTaskMarkOuter &&
+		observer.latest.stateStatus == liveStateInspectNone &&
+		observer.latest.stateReason == liveStartCreateTaskFailed &&
+		observer.latest.stateMarks == 0
+}
+
+func TestLiveStartFailureAllowsProbeOnlyForExactOuterWrapper(t *testing.T) {
+	observer := &liveCreateObserver{latest: liveCreateObservation{
+		startReason: liveStartCreateTaskFailed, createTaskMarks: liveCreateTaskMarkOuter,
+		stateStatus: liveStateInspectNone, stateReason: liveStartCreateTaskFailed,
+	}}
+	if !observer.startFailureAllowsProbe() {
+		t.Fatal("exact outer wrapper was not eligible")
+	}
+	for _, mutate := range []func(*liveCreateObservation){
+		func(o *liveCreateObservation) { o.createTaskMarks |= liveCreateTaskMarkOCICreate },
+		func(o *liveCreateObservation) { o.startReason = liveStartCommandFailed },
+		func(o *liveCreateObservation) { o.stateReason = liveStartNone },
+		func(o *liveCreateObservation) { o.stateStatus = liveStateInspectTruncated },
+	} {
+		candidate := observer.latest
+		mutate(&candidate)
+		observer.latest = candidate
+		if observer.startFailureAllowsProbe() {
+			t.Fatal("non-exact start detail was eligible")
+		}
+	}
+}
+
+// liveProbeConfigForCandidate copies only the fixed, non-secret runtime shape
+// already asserted by this synthetic live fixture. The probe must exercise the
+// image and launch contract that actually failed, never a convenient base image.
+func liveProbeConfigForCandidate(base liveProbeConfig, spec generatedruntime.CandidateSpec, candidate generatedruntime.Candidate, limits generatedruntime.ContainerLimits) liveProbeConfig {
+	base.image = candidate.ImageContentID
+	base.command = spec.RunCommand
+	base.network = candidate.NetworkName
+	base.alias = candidate.NetworkAlias
+	base.hostname = candidate.ContainerName
+	base.user = "node"
+	base.workdir = candidate.WorkingDirectory
+	base.internalPort = strconv.FormatUint(uint64(candidate.InternalPort), 10)
+	base.healthPath = spec.HealthProbe
+	base.memory = strconv.FormatInt(limits.MemoryBytes, 10)
+	base.pids = strconv.FormatInt(limits.PIDs, 10)
+	base.tmpfs = "/tmp:rw,noexec,nosuid,nodev,size=" + strconv.FormatInt(limits.TmpfsBytes, 10)
+	base.cpus = fmt.Sprintf("%.3f", float64(limits.MilliCPUs)/1000)
+	base.logSize = limits.LogSize
+	base.logFiles = strconv.Itoa(limits.LogFiles)
+	return base
 }
 
 func liveEndpoint(candidate generatedruntime.Candidate) generatedruntime.RouteEndpoint {
