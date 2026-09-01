@@ -502,4 +502,24 @@ describe("ApplicationPlanPanel", () => {
     ).not.toBeNull();
     await waitFor(() => expect(document.activeElement).toBe(alert));
   });
+
+  it("keeps arbitrary inspection failures out of recovery feedback", async () => {
+    vi.mocked(api.inspect).mockRejectedValue(
+      new Error("npm run secret-command && send-token"),
+    );
+    renderPanel();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Review current source" }),
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain(
+      "Rig could not analyze the current source.",
+    );
+    expect(alert.textContent).not.toContain("secret-command");
+    expect(
+      screen.getByRole("button", { name: "Review current source" }),
+    ).not.toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(alert));
+  });
 });
