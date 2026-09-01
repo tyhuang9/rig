@@ -152,4 +152,4 @@ On a disposable Linux Docker host, also verify:
 7. Existing local and GitHub Compose deployments remain unchanged when both runtimes are enabled.
 8. Synthetic credentials and commands are absent from SQLite, retained files, images, logs, events, audits, metrics, and problem responses.
 
-This Windows checkout does not provide a Docker daemon, so live BuildKit, Caddy, container hardening, route switching, and blue/green execution remain an external Linux verification gate.
+Pull requests run `.github/workflows/generated-runtime-lifecycle-ci.yml` on a disposable Ubuntu Docker host. That gate starts hardened blue and green application slots through the production runtime engine, proves that traffic stays on blue until the Caddy route commit, switches traffic to green, removes the drained slot, checks cleanup, and runs the generated-runtime packages with Go's race detector. A checkout without a Docker daemon can compile and skip the opt-in live test, but cannot substitute for a passing hosted lifecycle job.
