@@ -493,8 +493,26 @@ func TestDeploymentAndReleaseListsExposeSafeHistory(t *testing.T) {
 		t.Fatalf("release contract: %s (%v)", releasesResponse.Body.String(), err)
 	}
 	release := releases.Items[0]
-	if release.ID != releaseID || release.SourceProvider != "github" || release.RepositoryID != 17 || release.RepositoryOwner != "owner" || release.RepositoryName != "repository" || release.TrackedRef != "refs/heads/main" || release.ResolvedSha == "" || release.ArchiveSha256 == "" || release.ConfigurationRevisionNumber != 0 {
+	if release.ID != releaseID || release.SourceProvider != "github" || release.RepositoryID != 17 || release.RepositoryOwner != "owner" || release.RepositoryName != "repository" || release.TrackedRef != "refs/heads/main" || release.ResolvedSha == "" || release.ArchiveSha256 == "" || release.ConfigurationRevisionNumber != 0 || release.RuntimeStrategy != "compose" {
 		t.Fatalf("release provenance incomplete: %#v", release)
+	}
+}
+
+func TestReleaseHistoryExposesExactPinnedGeneratedRuntime(t *testing.T) {
+	f := newDeploymentAPIFixture(t, true, true)
+	revision := f.acceptPlan(t, f.app.ID, deploymentplans.StrategyGeneratedNode)
+	releaseID := f.insertReleaseWithPlan(t, f.app.ID, "ready", revision)
+
+	response := f.request(http.MethodGet, "/api/v1/apps/"+f.app.ID+"/releases", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("release history: %d %s", response.Code, response.Body.String())
+	}
+	var releases apicontract.ReleaseList
+	if err := json.Unmarshal(response.Body.Bytes(), &releases); err != nil {
+		t.Fatal(err)
+	}
+	if len(releases.Items) != 1 || releases.Items[0].ID != releaseID || releases.Items[0].RuntimeStrategy != "generated_node" {
+		t.Fatalf("generated release provenance = %#v", releases.Items)
 	}
 }
 

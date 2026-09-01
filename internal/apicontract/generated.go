@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "bd76202fb2263034dd27566558fea71b3abe64ec74b567f74beca50e30fd6d5f"
+const SourceSHA256 = "d3c8bb75b1b14fdb3e4046e9d86fe2f087b0c52d385216cd926f1798bdd0b308"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -646,6 +646,7 @@ type Release struct {
 	RepositoryName               string `json:"repositoryName,omitempty"`
 	RepositoryOwner              string `json:"repositoryOwner,omitempty"`
 	ResolvedSha                  string `json:"resolvedSha,omitempty"`
+	RuntimeStrategy              string `json:"runtimeStrategy"`
 	SourceBranch                 string `json:"sourceBranch,omitempty"`
 	SourceCommitSha              string `json:"sourceCommitSha,omitempty"`
 	SourceProvider               string `json:"sourceProvider"`
