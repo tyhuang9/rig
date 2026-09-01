@@ -20,6 +20,11 @@ const knownAutoDeployStates = new Set([
   "retry_wait",
 ]);
 const relayAvailabilities = new Set(["initializing", "available", "unavailable"]);
+const jobResumePauseCodes = new Set([
+  "approval_required",
+  "migration_approval_required",
+  "insufficient_replacement_capacity",
+]);
 
 const formatTime = (value?: string) => {
   if (!value) return "Not recorded";
@@ -62,6 +67,12 @@ function pauseDescription(code?: string) {
   switch (code) {
     case "approval_required":
       return "A deployment approval is required. Review Deployment history below; auto-deploy cannot resume this approval step.";
+    case "deployment_plan_review_required":
+      return "The repository structure changed. Review and accept how Rig will build and run this app, then choose Resume to ask Rig to revalidate and retry the exact source before creating a job.";
+    case "migration_approval_required":
+      return "The approved migration changed or has not been approved yet. Review the migration warning and approve the pinned plan, then resume the waiting job in Deployment history.";
+    case "insufficient_replacement_capacity":
+      return "Rig cannot reserve enough temporary RAM or disk to run the old and new versions together. Free capacity, then resume the waiting job in Deployment history; Rig will not fall back to a downtime-producing replacement.";
     case "deployment_failed":
       return "The previous auto-deployment failed. After resolving the failure, choose Resume to ask Rig to revalidate and retry.";
     case "missing_configuration":
@@ -149,10 +160,12 @@ function panelAnnouncement(
 export function AutoDeployPanel({
   appId,
   composeRuntime,
+  generatedRuntime = false,
   githubConnections,
 }: {
   appId: string;
   composeRuntime: boolean;
+  generatedRuntime?: boolean;
   githubConnections: boolean;
 }) {
   const client = useQueryClient();
@@ -331,7 +344,7 @@ export function AutoDeployPanel({
     !knownState ? unknownStateReason :
     busyReason ? busyReason :
     status.source.type !== "github" ? "Auto-deploy requires a GitHub source." :
-    !composeRuntime ? "A compose runtime is required." :
+    !composeRuntime && !generatedRuntime ? "A compatible runtime is required." :
     !githubConnections ? "GitHub connections are disabled by the administrator on this controller." :
     sourceConnections.isLoading ? "Checking the GitHub connection." :
     sourceConnectionsQueryError ? "The GitHub connection could not be checked." :
@@ -341,7 +354,7 @@ export function AutoDeployPanel({
     relayStatus.availability !== "available" ? relayStatus.availability === "initializing" ? "The relay is still initializing." : "The relay is unavailable." : "";
   const canEnable = knownState && !status.enabled && !busyState && !panelPending && !enableReason;
   const canDisable = knownState && status.enabled && !busyState && !panelPending && !manualReloadRequired;
-  const resumeMeaningful = knownState && status.state === "paused" && status.pauseCode !== "approval_required";
+  const resumeMeaningful = knownState && status.state === "paused" && !jobResumePauseCodes.has(status.pauseCode ?? "");
   const sourceAccessPause = statusValid && status.pauseCode === "source_access_lost";
   const sourceAccessResumeReason = !sourceAccessPause ? "" :
     sourceConnections.isLoading ? "Checking the GitHub connection before resuming." :
@@ -429,8 +442,9 @@ export function AutoDeployPanel({
         {!status.enabled && <><button className="button primary" type="button" onClick={() => performUpdate(true)} disabled={!canEnable} aria-describedby={canEnable ? undefined : "auto-deploy-enable-reason"}>{update.isPending && activeUpdate ? "Enabling…" : "Enable"}</button><span id="auto-deploy-enable-reason" className="auto-deploy-disabled-reason">{canEnable ? "" : enableReason}</span></>}
         {status.enabled && <button className="button" type="button" onClick={() => performUpdate(false)} disabled={!canDisable} aria-describedby={canDisable ? undefined : "auto-deploy-disable-reason"}>{update.isPending && activeUpdate ? "Turning off…" : "Turn off"}</button>}
         {status.enabled && !canDisable && <span id="auto-deploy-disable-reason" className="auto-deploy-disabled-reason">{!knownState ? unknownStateReason : manualReloadRequired ? "Reload status successfully before changing auto-deploy." : busyReason || "Auto-deploy is being updated."}</span>}
-        {status.state === "paused" && status.pauseCode !== "approval_required" && <button className="button" type="button" onClick={performResume} disabled={!canResume} aria-describedby={canResume ? undefined : "auto-deploy-resume-reason"}>{resume.isPending && activeResume ? "Resuming…" : "Resume"}</button>}
-        {status.state === "paused" && status.pauseCode !== "approval_required" && !canResume && <span id="auto-deploy-resume-reason" className="auto-deploy-disabled-reason">{manualReloadRequired ? "Reload status successfully before resuming auto-deploy." : sourceAccessResumeReason || "Auto-deploy is being updated."}</span>}
+        {resumeMeaningful && <button className="button" type="button" onClick={performResume} disabled={!canResume} aria-describedby={canResume ? undefined : "auto-deploy-resume-reason"}>{resume.isPending && activeResume ? "Resuming…" : "Resume"}</button>}
+        {resumeMeaningful && !canResume && <span id="auto-deploy-resume-reason" className="auto-deploy-disabled-reason">{manualReloadRequired ? "Reload status successfully before resuming auto-deploy." : sourceAccessResumeReason || "Auto-deploy is being updated."}</span>}
+        {status.state === "paused" && jobResumePauseCodes.has(status.pauseCode ?? "") && <a className="button small" href="#deployment-history-title">Review waiting deployment</a>}
         {sourceAccessPause && sourceAccessResumeReason && <button className="button small" type="button" onClick={(event) => void refreshSourceAccessRecovery(event.currentTarget)}>Retry connection check</button>}
       </div>
       <dl className="auto-deploy-diagnostics" aria-label="Auto-deploy diagnostics">

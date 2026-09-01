@@ -67,12 +67,17 @@ describe("AutoDeployPanel", () => {
 
   it.each([
     ["local", "Auto-deploy requires a GitHub source."],
-    ["github", "A compose runtime is required."],
+    ["github", "A compatible runtime is required."],
   ])("communicates static enable prerequisites", async (sourceType, text) => {
     mockData({ source: { ...status.source, type: sourceType } });
     renderPanel({ composeRuntime: sourceType !== "github" ? true : false });
     expect((await screen.findByRole("button", { name: "Enable" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText(text)).not.toBeNull();
+  });
+
+  it("allows generated-only controllers to enable auto-deploy", async () => {
+    renderPanel({ composeRuntime: false, generatedRuntime: true });
+    expect((await screen.findByRole("button", { name: "Enable" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("does not fetch GitHub prerequisites for a local application source", async () => {
@@ -331,6 +336,9 @@ describe("AutoDeployPanel", () => {
 
   it.each([
     ["approval_required", "Review Deployment history below", false],
+    ["deployment_plan_review_required", "repository structure changed", true],
+    ["migration_approval_required", "approve the pinned plan", false],
+    ["insufficient_replacement_capacity", "temporary RAM or disk", false],
     ["deployment_failed", "previous auto-deployment failed", true],
     ["missing_configuration", "configuration is missing", true],
     ["source_access_lost", "GitHub access has been lost", true],
@@ -344,6 +352,14 @@ describe("AutoDeployPanel", () => {
     expect(await screen.findByText(new RegExp(text, "i"))).not.toBeNull();
     expect(Boolean(screen.queryByRole("button", { name: "Resume" }))).toBe(resume);
     if (resume) expect(screen.getByText(/Resume to ask Rig to revalidate and retry/i)).not.toBeNull();
+  });
+
+  it.each(["approval_required", "migration_approval_required", "insufficient_replacement_capacity"])("routes active-job pause %s to deployment history", async (pauseCode) => {
+    mockData({ enabled: true, state: "paused", pauseCode, activeJobId: "job-1" });
+    renderPanel();
+    const action = await screen.findByRole("link", { name: "Review waiting deployment" });
+    expect(action.getAttribute("href")).toBe("#deployment-history-title");
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
   });
 
   it("resumes a known non-approval pause without requiring an active job or SHA", async () => {
