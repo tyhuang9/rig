@@ -147,14 +147,22 @@ func runServer(args []string) int {
 		return 1
 	}
 	autoDeployRepository := autodeploy.NewRepository(db)
+	var autoDeployPreflight autodeploy.DispatchPreflight
+	if cfg.GeneratedRuntime {
+		autoDeployPreflight, err = newGeneratedAutoDeployPreflight(planStore, sources, snapshots)
+		if err != nil {
+			logger.Error("generated auto-deploy preflight setup failed", "error", err)
+			return 1
+		}
+	}
 	autoDeployDone, autoDeployWake, autoDeployReconcile := startAutoDeploy(ctx, cfg, logger, func() (autoDeployRunner, error) {
-		return newAutoDeployRunner(cfg, autoDeployRepository, sources, j, logger)
+		return newGeneratedAwareAutoDeployRunner(cfg, autoDeployRepository, sources, j, autoDeployPreflight, logger)
 	})
 	relayManagement := newControllerRelayManagementTarget()
 	relayDone := startControllerRelay(ctx, cfg, logger, relayManagement, func() (controllerRelayRunner, error) {
 		return newControllerRelayRuntime(cfg, db, sources, logger, autoDeployWake, autoDeployReconcile)
 	})
-	effectiveAutoDeploy := cfg.ComposeRuntime && cfg.GitHubConnectionsEnabled() && sources.ProviderEnabled()
+	effectiveAutoDeploy := (cfg.ComposeRuntime || cfg.GeneratedRuntime) && cfg.GitHubConnectionsEnabled() && sources.ProviderEnabled()
 	controllerServer := &controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, DeploymentPlans: planStore, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}
 	applyRuntimeCapabilities(controllerServer, capabilities)
 	s := &http.Server{Addr: cfg.ListenAddress, Handler: controllerServer.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
