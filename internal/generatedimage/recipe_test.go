@@ -2,6 +2,7 @@ package generatedimage
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -34,7 +35,7 @@ func TestDefinitionAndRecipeAreDeterministicAndCommandSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	if first != second || firstDigest != secondDigest || len(firstDigest) != 64 {
-		t.Fatalf("definition is not deterministic: %#v/%s %#v/%s", first, firstDigest, second, secondDigest)
+		t.Fatal("definition or digest is not deterministic")
 	}
 	if !strings.Contains(first.baseImage, "@sha256:") || !strings.HasPrefix(first.baseImage, "node:22-bookworm-slim@") {
 		t.Fatalf("base image is not digest pinned: %q", first.baseImage)
@@ -91,11 +92,99 @@ func TestWorkspaceRootInstallRecipeUsesSeparateWorkingDirectories(t *testing.T) 
 				t.Fatal(err)
 			}
 			recipe := containerfile(true, test.manager != "npm", definition.baseImage)
-			if !strings.Contains(recipe, "COPY --chown=node:node rig/root.path rig/install.path /run/rig/") || !strings.Contains(recipe, "install=$(cat /run/rig/install.path); cd -- \\\"/workspace/$install\\\"") || !strings.Contains(recipe, "root=$(cat /run/rig/root.path); cd -- \\\"/workspace/$root\\\"") {
-				t.Fatalf("workspace recipe did not preserve separate install/build roots:\n%s", recipe)
+			assertCommandSecretRun(t, recipe, "rig-install-command", installShellScript)
+			assertCommandSecretRun(t, recipe, "rig-build-command", buildShellScript)
+			if !hasExactRecipeLine(recipe, "COPY --chown=1000:1000 --chmod=0400 rig/root.path rig/install.path /run/rig/") {
+				t.Fatal("workspace selectors are not explicitly node-owned and read-only")
+			}
+			userIndex := strings.Index(recipe, "USER node\n")
+			installIndex := strings.Index(recipe, "RUN --mount=type=secret,id=rig-install-command,")
+			if userIndex < 0 || installIndex < 0 || userIndex > installIndex {
+				t.Fatal("command secrets would execute before switching to the node user")
+			}
+
+			corepackRuns := 0
+			for _, run := range parseRunExecInstructions(t, recipe) {
+				if len(run.argv) == 2 && run.argv[0] == "corepack" && run.argv[1] == "enable" {
+					if run.options != "" {
+						t.Fatalf("Corepack RUN options = %q, want none", run.options)
+					}
+					corepackRuns++
+				}
+			}
+			wantCorepackRuns := 0
+			if test.manager != "npm" {
+				wantCorepackRuns = 2
+			}
+			if corepackRuns != wantCorepackRuns {
+				t.Fatalf("Corepack RUN count = %d, want %d", corepackRuns, wantCorepackRuns)
 			}
 		})
 	}
+}
+
+type parsedRunInstruction struct {
+	options string
+	argv    []string
+}
+
+func parseRunExecInstructions(t *testing.T, recipe string) []parsedRunInstruction {
+	t.Helper()
+	var runs []parsedRunInstruction
+	for _, line := range strings.Split(recipe, "\n") {
+		if !strings.HasPrefix(line, "RUN ") {
+			continue
+		}
+		arrayIndex := strings.IndexByte(line, '[')
+		if arrayIndex < 0 {
+			t.Fatalf("RUN is not an exec-form JSON array: %q", line)
+		}
+		var argv []string
+		if err := json.Unmarshal([]byte(line[arrayIndex:]), &argv); err != nil {
+			t.Fatalf("decode RUN exec array: %v", err)
+		}
+		if len(argv) == 0 {
+			t.Fatal("RUN exec array is empty")
+		}
+		runs = append(runs, parsedRunInstruction{
+			options: strings.TrimSpace(line[len("RUN "):arrayIndex]),
+			argv:    argv,
+		})
+	}
+	return runs
+}
+
+func assertCommandSecretRun(t *testing.T, recipe, secretID, wantScript string) {
+	t.Helper()
+	wantOptions := "--mount=type=secret,id=" + secretID + ",required=true,uid=1000,gid=1000,mode=0400"
+	wantArgv := []string{"/bin/sh", "-c", wantScript}
+	matches := 0
+	for _, run := range parseRunExecInstructions(t, recipe) {
+		if run.options != wantOptions {
+			continue
+		}
+		matches++
+		if len(run.argv) != len(wantArgv) {
+			t.Fatalf("%s argv length = %d, want %d", secretID, len(run.argv), len(wantArgv))
+		}
+		for index := range wantArgv {
+			if run.argv[index] != wantArgv[index] {
+				t.Fatalf("%s argv[%d] = %q, want %q", secretID, index, run.argv[index], wantArgv[index])
+			}
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("%s semantic RUN matches = %d, want 1", secretID, matches)
+	}
+}
+
+func hasExactRecipeLine(recipe, want string) bool {
+	for _, line := range strings.Split(recipe, "\n") {
+		if line == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestContainerfileEnablesCorepackBeforeNonRootUsersInBothStages(t *testing.T) {

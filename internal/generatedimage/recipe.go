@@ -12,7 +12,12 @@ import (
 	"github.com/hostd/hostd/internal/deploymentplans"
 )
 
-const CompilerVersion = "generated-node-v2"
+const CompilerVersion = "generated-node-v3"
+
+const (
+	installShellScript = `install=$(cat /run/rig/install.path); cd -- "/workspace/$install" && exec /bin/sh -lc "$(cat /run/secrets/rig-install-command)"`
+	buildShellScript   = `root=$(cat /run/rig/root.path); cd -- "/workspace/$root" && exec /bin/sh -lc "$(cat /run/secrets/rig-build-command)"`
+)
 
 var nodeImages = map[string]string{
 	"20": "node:20-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0",
@@ -102,15 +107,15 @@ func containerfile(hasBuild, enableCorepack bool, baseImage string) string {
 	}
 	build := ""
 	if hasBuild {
-		build = "RUN --mount=type=secret,id=rig-build-command,required=true [\"/bin/sh\", \"-c\", \"root=$(cat /run/rig/root.path); cd -- \\\"/workspace/$root\\\" && exec /bin/sh -lc \\\"$(cat /run/secrets/rig-build-command)\\\"\"]\n"
+		build = commandSecretRun("rig-build-command", buildShellScript)
 	}
+	install := commandSecretRun("rig-install-command", installShellScript)
 	return fmt.Sprintf(`FROM %s AS builder
 %sWORKDIR /workspace
 COPY --chown=node:node source/ /workspace/
-COPY --chown=node:node rig/root.path rig/install.path /run/rig/
+COPY --chown=1000:1000 --chmod=0400 rig/root.path rig/install.path /run/rig/
 USER node
-RUN --mount=type=secret,id=rig-install-command,required=true ["/bin/sh", "-c", "install=$(cat /run/rig/install.path); cd -- \"/workspace/$install\" && exec /bin/sh -lc \"$(cat /run/secrets/rig-install-command)\""]
-%sFROM %s AS runtime
+%s%sFROM %s AS runtime
 ENV NODE_ENV=production
 %sWORKDIR /workspace
 COPY --from=builder --chown=node:node /workspace/ /workspace/
@@ -119,7 +124,15 @@ COPY --chmod=0555 rig/rig-static /usr/local/bin/rig-static
 COPY --chmod=0444 rig/rig-static.mjs /usr/local/lib/rig/static.mjs
 USER node
 ENTRYPOINT ["/usr/local/bin/rig-entrypoint"]
-`, baseImage, corepack, build, baseImage, corepack)
+`, baseImage, corepack, install, build, baseImage, corepack)
+}
+
+func commandSecretRun(secretID, script string) string {
+	argv, err := json.Marshal([]string{"/bin/sh", "-c", script})
+	if err != nil {
+		panic("marshal fixed generated build argv: " + err.Error())
+	}
+	return "RUN --mount=type=secret,id=" + secretID + ",required=true,uid=1000,gid=1000,mode=0400 " + string(argv) + "\n"
 }
 
 func writeRecipe(layout buildLayout, definition componentDefinition) error {
