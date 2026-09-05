@@ -280,7 +280,7 @@ func liveIngressFailureDiagnosticWithin(ctx context.Context, manager *Manager, t
 				caddyMismatches = liveCaddyMismatchNames(mismatches)
 				if mismatches == 0 {
 					caddyStatus = liveIngressSnapshotValid
-					if imageStatus == liveIngressSnapshotValid && volumeStatus == liveIngressSnapshotValid && networkStatus == liveIngressSnapshotValid && !caddy.Running && validContainerID(caddy.ID) {
+					if imageStatus == liveIngressSnapshotValid && volumeStatus == liveIngressSnapshotValid && networkStatus == liveIngressSnapshotValid && validContainerID(caddy.ID) {
 						caddyID = caddy.ID
 					}
 				}
@@ -288,7 +288,7 @@ func liveIngressFailureDiagnosticWithin(ctx context.Context, manager *Manager, t
 		}
 		clearLiveCaddyInspection(&caddy)
 	}
-	if caddyStatus == liveIngressSnapshotValid && caddyRunning == "false" && caddyID != "" && diagnosticCtx.Err() == nil {
+	if caddyStatus == liveIngressSnapshotValid && caddyID != "" && diagnosticCtx.Err() == nil {
 		startup = liveCaddyStartupExitDiagnostic(diagnosticCtx, manager, caddyID)
 	}
 	caddyID = ""
@@ -332,12 +332,6 @@ func liveCaddyStartupExitDiagnostic(ctx context.Context, manager *Manager, caddy
 	diagnostic.StateWrappers, diagnostic.StateCauses = liveCaddyStartupStateClassifiers(state.Error)
 	if state.ID != caddyID || strings.TrimPrefix(state.Name, "/") != caddyContainerName || state.Labels["io.rig.managed"] != "generated-ingress" || state.Labels["io.rig.identity-version"] != "v1" || state.Labels["io.rig.listener-isolation"] != "v1" {
 		diagnostic.Status = "ownership_changed"
-		diagnostic.StdoutMarkers = "unobserved"
-		diagnostic.StderrMarkers = "unobserved"
-		return diagnostic
-	}
-	if state.Running || state.Restarting {
-		diagnostic.Status = "state_changed"
 		diagnostic.StdoutMarkers = "unobserved"
 		diagnostic.StderrMarkers = "unobserved"
 		return diagnostic
@@ -749,7 +743,9 @@ func (run liveSnapshotRunnerFunc) Run(ctx context.Context, request runtimeproces
 
 func TestLiveIngressFailureDiagnosticUsesOnlyFixedStates(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	expected := "ingress_snapshot=image:valid,volume:valid,network:valid,caddy:valid,caddy_running:true,caddy_mismatches=none," + liveCaddyStartupNotAttempted().String()
+	startup := liveCaddyStartupNotAttempted()
+	startup.Status = "command_error"
+	expected := "ingress_snapshot=image:valid,volume:valid,network:valid,caddy:valid,caddy_running:true,caddy_mismatches=none," + startup.String()
 	if diagnostic := liveIngressFailureDiagnostic(context.Background(), manager); diagnostic != expected {
 		t.Fatalf("diagnostic = %q", diagnostic)
 	}
@@ -984,14 +980,22 @@ func TestLiveCaddyStartupDiagnosticReattestsBeforeLogs(t *testing.T) {
 		{"id changed", func(state *liveCaddyStartupInspection) { state.ID = strings.Repeat("e", 64) }, "ownership_changed"},
 		{"name changed", func(state *liveCaddyStartupInspection) { state.Name = "/foreign" }, "ownership_changed"},
 		{"ownership changed", func(state *liveCaddyStartupInspection) { state.Labels["io.rig.managed"] = "foreign" }, "ownership_changed"},
-		{"running", func(state *liveCaddyStartupInspection) { state.Running = true }, "state_changed"},
-		{"restarting", func(state *liveCaddyStartupInspection) { state.Restarting = true }, "state_changed"},
+		{"running", func(state *liveCaddyStartupInspection) { state.Running = true }, "ok"},
+		{"restarting", func(state *liveCaddyStartupInspection) {
+			state.Running = true
+			state.Restarting = true
+			state.Status = "restarting"
+		}, "ok"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			manager, runner := newLiveCaddyStartupRunner(t)
 			test.mutate(&runner.state)
 			diagnostic := liveCaddyStartupExitDiagnostic(context.Background(), manager, runner.id)
-			if diagnostic.Status != test.want || len(runner.requests) != 1 {
+			wantRequests := 1
+			if test.want == "ok" {
+				wantRequests = 2
+			}
+			if diagnostic.Status != test.want || len(runner.requests) != wantRequests {
 				t.Fatalf("diagnostic = %#v, requests = %v", diagnostic, runner.requests)
 			}
 		})
