@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,6 +83,275 @@ func (service *Service) Get(ctx context.Context, owner, id string) (Connection, 
 		return Connection{}, connectionError(err)
 	}
 	return connection, nil
+}
+
+func (service *Service) Default(ctx context.Context, owner string) (Connection, bool, error) {
+	connection, configured, err := service.repository.Default(ctx, owner)
+	if err != nil {
+		return Connection{}, false, internalError()
+	}
+	return connection, configured, nil
+}
+
+func (service *Service) StartDefault(ctx context.Context, owner string) (ConnectionAuthorization, error) {
+	if service.provider == nil || service.appSlug == "" {
+		return ConnectionAuthorization{}, &Error{Code: "provider_unavailable"}
+	}
+	authorization, err := service.provider.StartDevice(ctx)
+	if err != nil {
+		return ConnectionAuthorization{}, providerError(err)
+	}
+	now := service.now().UTC()
+	expiresAt := now.Add(authorization.ExpiresIn)
+	unlockOwner := service.locks.lock("owner:" + owner)
+	defer unlockOwner()
+	existing, configured, err := service.repository.Default(ctx, owner)
+	if err != nil {
+		return ConnectionAuthorization{}, internalError()
+	}
+	var unlockConnection func()
+	if configured {
+		unlockConnection = service.locks.lock(existing.ID)
+		defer unlockConnection()
+	}
+	connection, attempt, superseded, err := service.repository.StartDefaultAuthorization(ctx, owner, expiresAt, authorization.Interval, now.Add(authorization.Interval), now)
+	if err != nil {
+		return ConnectionAuthorization{}, internalError()
+	}
+	for _, id := range superseded {
+		if err := service.destroyAttemptCredentials(id); err != nil {
+			return ConnectionAuthorization{}, internalError()
+		}
+	}
+	if err := service.credentials.WriteDevice(attempt.ID, authorization.DeviceCode); err != nil {
+		_ = service.repository.MarkAuthorization(ctx, owner, connection.ID, attempt.ID, "failed", "credential_write_failed", now)
+		_ = service.destroyAttemptCredentials(attempt.ID)
+		return ConnectionAuthorization{}, internalError()
+	}
+	return ConnectionAuthorization{AuthorizationID: attempt.ID, DeviceStart: DeviceStart{
+		ConnectionID: connection.ID, UserCode: authorization.UserCode, VerificationURI: githubapp.VerificationURI,
+		InstallURL: service.InstallURL(), ExpiresAt: expiresAt, PollInterval: authorization.Interval,
+	}}, nil
+}
+
+func (service *Service) PollDefault(ctx context.Context, owner, connectionID, authorizationID string) (AuthorizationStatus, error) {
+	unlock := service.locks.lock(connectionID)
+	defer unlock()
+	attempt, err := service.repository.Authorization(ctx, owner, connectionID, authorizationID)
+	if err != nil {
+		return AuthorizationStatus{}, connectionError(err)
+	}
+	connection, err := service.repository.Get(ctx, owner, connectionID)
+	if err != nil {
+		return AuthorizationStatus{}, connectionError(err)
+	}
+	if attempt.Status == "connected" {
+		if err := service.destroyAttemptCredentials(attempt.ID); err != nil {
+			return AuthorizationStatus{}, internalError()
+		}
+		return AuthorizationStatus{Authorization: attempt, Connection: connection}, nil
+	}
+	if attempt.Status != "pending" {
+		return AuthorizationStatus{Authorization: attempt, Connection: connection}, authorizationStatusError(attempt.Status)
+	}
+	if staged, readErr := service.credentials.ReadBundle(attempt.ID); readErr == nil {
+		return service.finishDefaultBundle(ctx, owner, connection, attempt, staged)
+	} else if !credentialMissing(readErr) {
+		return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "credential_invalid")
+	}
+	now := service.now().UTC()
+	exchange, exchangeErr := service.credentials.ReadExchange(attempt.ID)
+	if exchangeErr == nil {
+		if now.Before(attempt.NextPollAt) {
+			return AuthorizationStatus{}, &Error{Code: "poll_too_soon", RetryAfter: attempt.NextPollAt.Sub(now)}
+		}
+		return service.finalizeDefaultExchange(ctx, owner, connection, attempt, exchange)
+	}
+	if !credentialMissing(exchangeErr) {
+		return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "credential_invalid")
+	}
+	if !now.Before(attempt.PendingExpiresAt) {
+		return AuthorizationStatus{}, service.endAuthorization(ctx, owner, attempt, "expired", "authorization_expired")
+	}
+	if now.Before(attempt.NextPollAt) {
+		return AuthorizationStatus{}, &Error{Code: "poll_too_soon", RetryAfter: attempt.NextPollAt.Sub(now)}
+	}
+	deviceCode, err := service.credentials.ReadDevice(attempt.ID)
+	if err != nil {
+		return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "device_credential_missing")
+	}
+	tokens, err := service.provider.PollDevice(ctx, deviceCode)
+	deviceCode = ""
+	if err != nil {
+		return AuthorizationStatus{}, service.handleDefaultPollError(ctx, owner, attempt, err, service.now().UTC())
+	}
+	postProviderNow := service.now().UTC()
+	exchange = TokenExchange{Version: tokenBundleVersion, AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken, AccessExpiresAt: postProviderNow.Add(tokens.AccessExpiresIn), RefreshExpiresAt: postProviderNow.Add(tokens.RefreshExpiresIn)}
+	if err := service.credentials.WriteExchange(attempt.ID, exchange); err != nil {
+		return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "credential_write_failed")
+	}
+	if err := service.repository.AdvanceAuthorization(ctx, owner, connectionID, authorizationID, attempt.PollInterval, postProviderNow.Add(attempt.PollInterval), postProviderNow); err != nil {
+		return AuthorizationStatus{}, internalError()
+	}
+	attempt.NextPollAt = postProviderNow.Add(attempt.PollInterval)
+	return service.finalizeDefaultExchange(ctx, owner, connection, attempt, exchange)
+}
+
+func (service *Service) GetAuthorizationStatus(ctx context.Context, owner, connectionID, authorizationID string) (AuthorizationStatus, error) {
+	attempt, err := service.repository.Authorization(ctx, owner, connectionID, authorizationID)
+	if err != nil {
+		return AuthorizationStatus{}, connectionError(err)
+	}
+	connection, err := service.repository.Get(ctx, owner, connectionID)
+	if err != nil {
+		return AuthorizationStatus{}, connectionError(err)
+	}
+	return AuthorizationStatus{Authorization: attempt, Connection: connection}, nil
+}
+
+func (service *Service) finalizeDefaultExchange(ctx context.Context, owner string, connection Connection, attempt AuthorizationAttempt, exchange TokenExchange) (AuthorizationStatus, error) {
+	now := service.now().UTC()
+	if !now.Before(exchange.RefreshExpiresAt) {
+		return AuthorizationStatus{}, service.endAuthorization(ctx, owner, attempt, "expired", "authorization_expired")
+	}
+	if !now.Before(exchange.AccessExpiresAt) {
+		tokens, err := service.provider.Refresh(ctx, exchange.RefreshToken)
+		if err != nil {
+			if githubapp.IsCode(err, "oauth_failed") || githubapp.IsCode(err, "unauthorized") || githubapp.IsCode(err, "expired_token") || githubapp.IsCode(err, "access_denied") {
+				return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "authorization_invalid")
+			}
+			return AuthorizationStatus{}, service.advanceDefaultProviderError(ctx, owner, attempt, err)
+		}
+		exchange = TokenExchange{Version: tokenBundleVersion, AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken, AccessExpiresAt: now.Add(tokens.AccessExpiresIn), RefreshExpiresAt: now.Add(tokens.RefreshExpiresIn)}
+		if err := service.credentials.WriteExchange(attempt.ID, exchange); err != nil {
+			return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "credential_write_failed")
+		}
+	}
+	user, err := service.provider.CurrentUser(ctx, exchange.AccessToken)
+	if err != nil {
+		if githubapp.IsCode(err, "unauthorized") {
+			return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "authorization_invalid")
+		}
+		return AuthorizationStatus{}, service.advanceDefaultProviderError(ctx, owner, attempt, err)
+	}
+	if connection.ProviderUserID != "" && connection.ProviderUserID != user.ID {
+		return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "authorization_identity_mismatch")
+	}
+	bundle := TokenBundle{Version: tokenBundleVersion, Generation: attempt.CredentialGeneration + 1, AccessToken: exchange.AccessToken, RefreshToken: exchange.RefreshToken, AccessExpiresAt: exchange.AccessExpiresAt, RefreshExpiresAt: exchange.RefreshExpiresAt, ProviderUserID: user.ID, ProviderLogin: user.Login}
+	if err := service.credentials.WriteBundle(attempt.ID, bundle); err != nil {
+		return AuthorizationStatus{}, internalError()
+	}
+	return service.finishDefaultBundle(ctx, owner, connection, attempt, bundle)
+}
+
+func (service *Service) finishDefaultBundle(ctx context.Context, owner string, connection Connection, attempt AuthorizationAttempt, bundle TokenBundle) (AuthorizationStatus, error) {
+	if connection.ProviderUserID != "" && connection.ProviderUserID != bundle.ProviderUserID {
+		return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "authorization_identity_mismatch")
+	}
+	previous, previousErr := service.credentials.ReadBundle(connection.ID)
+	if err := service.credentials.WriteBundle(connection.ID, bundle); err != nil {
+		return AuthorizationStatus{}, internalError()
+	}
+	if err := service.repository.FinishAuthorization(ctx, owner, attempt, bundle, service.now().UTC()); err != nil {
+		if previousErr == nil {
+			_ = service.credentials.WriteBundle(connection.ID, previous)
+		} else if credentialMissing(previousErr) {
+			_ = service.credentials.RemoveBundle(connection.ID)
+		}
+		if errors.Is(err, ErrIdentityMismatch) {
+			return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "authorization_identity_mismatch")
+		}
+		if errors.Is(err, ErrIdentityExists) {
+			return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "identity_already_connected")
+		}
+		if errors.Is(err, ErrStaleGeneration) {
+			return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "authorization_superseded")
+		}
+		return AuthorizationStatus{}, internalError()
+	}
+	if err := service.destroyAttemptCredentials(attempt.ID); err != nil {
+		return AuthorizationStatus{}, internalError()
+	}
+	connected, err := service.repository.Get(ctx, owner, connection.ID)
+	if err != nil {
+		return AuthorizationStatus{}, internalError()
+	}
+	attempt.Status = "connected"
+	return AuthorizationStatus{Authorization: attempt, Connection: connected}, nil
+}
+
+func (service *Service) handleDefaultPollError(ctx context.Context, owner string, attempt AuthorizationAttempt, providerErr error, now time.Time) error {
+	interval := attempt.PollInterval
+	switch {
+	case githubapp.IsCode(providerErr, "authorization_pending"):
+		if err := service.repository.AdvanceAuthorization(ctx, owner, attempt.ConnectionID, attempt.ID, interval, now.Add(interval), now); err != nil {
+			return internalError()
+		}
+		return &Error{Code: "authorization_pending", RetryAfter: interval}
+	case githubapp.IsCode(providerErr, "slow_down"):
+		if interval > 295*time.Second {
+			interval = 300 * time.Second
+		} else {
+			interval += 5 * time.Second
+		}
+		if err := service.repository.AdvanceAuthorization(ctx, owner, attempt.ConnectionID, attempt.ID, interval, now.Add(interval), now); err != nil {
+			return internalError()
+		}
+		return &Error{Code: "authorization_pending", RetryAfter: interval}
+	case githubapp.IsCode(providerErr, "expired_token"):
+		return service.endAuthorization(ctx, owner, attempt, "expired", "authorization_expired")
+	case githubapp.IsCode(providerErr, "access_denied"):
+		return service.endAuthorization(ctx, owner, attempt, "denied", "authorization_denied")
+	default:
+		return service.advanceDefaultProviderError(ctx, owner, attempt, providerErr)
+	}
+}
+
+func (service *Service) advanceDefaultProviderError(ctx context.Context, owner string, attempt AuthorizationAttempt, providerErr error) error {
+	now := service.now().UTC()
+	if err := service.repository.AdvanceAuthorization(ctx, owner, attempt.ConnectionID, attempt.ID, attempt.PollInterval, now.Add(attempt.PollInterval), now); err != nil {
+		return internalError()
+	}
+	return providerError(providerErr)
+}
+
+func (service *Service) endAuthorization(ctx context.Context, owner string, attempt AuthorizationAttempt, status, code string) error {
+	if err := service.destroyAttemptCredentials(attempt.ID); err != nil {
+		return internalError()
+	}
+	if err := service.repository.MarkAuthorization(ctx, owner, attempt.ConnectionID, attempt.ID, status, code, service.now().UTC()); err != nil {
+		return internalError()
+	}
+	return &Error{Code: code}
+}
+
+func (service *Service) failAuthorization(ctx context.Context, owner string, attempt AuthorizationAttempt, code string) error {
+	if err := service.destroyAttemptCredentials(attempt.ID); err != nil {
+		return internalError()
+	}
+	if err := service.repository.MarkAuthorization(ctx, owner, attempt.ConnectionID, attempt.ID, "failed", code, service.now().UTC()); err != nil {
+		return internalError()
+	}
+	if code == "authorization_identity_mismatch" {
+		return &Error{Code: code}
+	}
+	if code == "identity_already_connected" {
+		return &Error{Code: code}
+	}
+	return &Error{Code: "authorization_failed"}
+}
+
+func authorizationStatusError(status string) error {
+	switch status {
+	case "denied":
+		return &Error{Code: "authorization_denied"}
+	case "expired":
+		return &Error{Code: "authorization_expired"}
+	case "superseded":
+		return &Error{Code: "authorization_superseded"}
+	default:
+		return &Error{Code: "authorization_failed"}
+	}
 }
 
 func (service *Service) Start(ctx context.Context, owner string) (DeviceStart, error) {
@@ -310,6 +581,120 @@ func (service *Service) Repositories(ctx context.Context, owner, id string, inst
 	return result, nil
 }
 
+func (service *Service) DefaultRepositories(ctx context.Context, owner, query string, page, perPage int) (RepositorySelectionPage, error) {
+	connection, configured, err := service.repository.Default(ctx, owner)
+	if err != nil {
+		return RepositorySelectionPage{}, internalError()
+	}
+	if !configured {
+		return RepositorySelectionPage{}, &Error{Code: "connection_not_found"}
+	}
+	query = strings.ToLower(strings.TrimSpace(query))
+	const providerPageSize = 100
+	const maximumProviderPages = 100
+	var selections []RepositorySelection
+	providerPages := 0
+	err = service.withAccess(ctx, owner, connection.ID, func(provider repositoryProvider, token string) error {
+		var installations []githubapp.Installation
+		installationIDs := make(map[int64]struct{})
+		installationTotal := -1
+		for installationPage := 1; ; installationPage++ {
+			providerPages++
+			if providerPages > maximumProviderPages {
+				return &githubapp.Error{Code: "response_too_large"}
+			}
+			result, listErr := service.provider.Installations(ctx, token, installationPage, providerPageSize)
+			if listErr != nil {
+				return listErr
+			}
+			if installationTotal < 0 {
+				installationTotal = result.TotalCount
+			} else if result.TotalCount != installationTotal {
+				return &githubapp.Error{Code: "invalid_response"}
+			}
+			for _, installation := range result.Installations {
+				if _, duplicate := installationIDs[installation.ID]; duplicate {
+					return &githubapp.Error{Code: "invalid_response"}
+				}
+				installationIDs[installation.ID] = struct{}{}
+				installations = append(installations, installation)
+			}
+			if len(installations) >= installationTotal {
+				break
+			}
+			if len(result.Installations) == 0 {
+				return &githubapp.Error{Code: "invalid_response"}
+			}
+		}
+		for _, installation := range installations {
+			if installation.SuspendedAt != nil {
+				continue
+			}
+			repositoryTotal := -1
+			seen := 0
+			repositoryIDs := make(map[int64]struct{})
+			for repositoryPage := 1; ; repositoryPage++ {
+				providerPages++
+				if providerPages > maximumProviderPages {
+					return &githubapp.Error{Code: "response_too_large"}
+				}
+				result, listErr := provider.Repositories(ctx, token, installation.ID, repositoryPage, providerPageSize)
+				if listErr != nil {
+					return listErr
+				}
+				if repositoryTotal < 0 {
+					repositoryTotal = result.TotalCount
+				} else if result.TotalCount != repositoryTotal {
+					return &githubapp.Error{Code: "invalid_response"}
+				}
+				for _, item := range result.Repositories {
+					if _, duplicate := repositoryIDs[item.ID]; duplicate {
+						return &githubapp.Error{Code: "invalid_response"}
+					}
+					repositoryIDs[item.ID] = struct{}{}
+					seen++
+					fullName := strings.ToLower(item.Owner + "/" + item.Name)
+					if query != "" && !strings.Contains(fullName, query) && !strings.Contains(strings.ToLower(installation.AccountLogin), query) {
+						continue
+					}
+					selections = append(selections, RepositorySelection{ConnectionID: connection.ID, InstallationID: installation.ID, AccountLogin: installation.AccountLogin, SourceRepository: sourceRepository(item)})
+				}
+				if seen >= repositoryTotal {
+					break
+				}
+				if len(result.Repositories) == 0 {
+					return &githubapp.Error{Code: "invalid_response"}
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return RepositorySelectionPage{}, sourceOperationError(err)
+	}
+	sort.Slice(selections, func(i, j int) bool {
+		left := strings.ToLower(selections[i].Owner + "/" + selections[i].Name)
+		right := strings.ToLower(selections[j].Owner + "/" + selections[j].Name)
+		if left != right {
+			return left < right
+		}
+		if selections[i].InstallationID != selections[j].InstallationID {
+			return selections[i].InstallationID < selections[j].InstallationID
+		}
+		return selections[i].ID < selections[j].ID
+	})
+	total := len(selections)
+	start := (page - 1) * perPage
+	if start > total {
+		start = total
+	}
+	end := start + perPage
+	if end > total {
+		end = total
+	}
+	return RepositorySelectionPage{Page: page, PerPage: perPage, TotalCount: total, Repositories: selections[start:end]}, nil
+}
+
 func (service *Service) Repository(ctx context.Context, owner, id string, installationID, repositoryID int64) (SourceRepository, error) {
 	var item githubapp.Repository
 	err := service.withAccess(ctx, owner, id, func(provider repositoryProvider, token string) error {
@@ -478,6 +863,15 @@ func (service *Service) Disconnect(ctx context.Context, owner, id string) error 
 	if _, err := service.repository.Get(ctx, owner, id); err != nil {
 		return connectionError(err)
 	}
+	pending, err := service.repository.PendingAuthorizationIDs(ctx, owner, id)
+	if err != nil {
+		return internalError()
+	}
+	for _, authorizationID := range pending {
+		if err := service.destroyAttemptCredentials(authorizationID); err != nil {
+			return internalError()
+		}
+	}
 	if err := service.destroyCredentials(id); err != nil {
 		return internalError()
 	}
@@ -605,6 +999,10 @@ func (service *Service) destroyCredentials(id string) error {
 	exchangeErr := service.credentials.RemoveExchange(id)
 	bundleErr := service.credentials.RemoveBundle(id)
 	return errors.Join(deviceErr, exchangeErr, bundleErr)
+}
+
+func (service *Service) destroyAttemptCredentials(id string) error {
+	return service.destroyCredentials(id)
 }
 
 func providerError(err error) error {

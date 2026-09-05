@@ -6,7 +6,7 @@ Rig can deploy a selected GitHub.com repository without a user-managed checkout 
 
 - GitHub.com is the only provider/host in v1.
 - GitHub connections are enabled by default through the official `rig-deployment-connector` GitHub App owned by `@tyhuang9`.
-- A GitHub App device connection and its rotating user credential stay on the controller in purpose-bound protected files. SQLite contains safe identity, status, and expiry metadata only.
+- Each signed-in Rig user has at most one saved GitHub connection per controller data root. Its stable local ID and rotating user credential survive page reloads, sign-out, and controller restarts. Device grants, in-progress exchanges, and active token bundles stay in separate purpose-bound protected files. SQLite contains safe identity, status, authorization-attempt timing, and expiry metadata only.
 - Sources are either `local` or `github`. A GitHub source binds a connection, installation ID, immutable repository ID, display owner/name, tracked branch, and normalized repository-relative Compose path.
 - Automatic deployment is disabled per application by default. The relay is optional: a relay outage leaves GitHub-connected manual deployment operable.
 - Docker Compose execution is disabled unless `hostd` starts with `--compose-runtime`; `--fake-runtime` remains isolated development behavior. This flag enables execution only; it does not configure GitHub or the relay.
@@ -21,8 +21,9 @@ V1 does not expand submodules or Git LFS, fetch Git history, deploy pull-request
 2. To use a different GitHub App for a fork or private deployment, pass its public `--github-client-id` and `--github-app-slug` together. A partial, empty, or invalid override fails startup before the controller begins serving; Rig never combines one custom identifier with one official identifier.
 3. Add `--compose-runtime` only when this controller is authorized to execute its selected application's Docker Compose workload through its local Docker endpoint. It is required to execute a manual deployment, but it neither enables GitHub connection nor automatic deployment.
 4. Bootstrap and sign in as the local administrator.
-5. In **Add application**, choose **GitHub repository**. First select **Sign in to GitHub**, enter the displayed device code, and authorize Rig with an account that can manage access for the repository owner. Then select **Install or configure repository access**, choose the personal account or organization that owns the repository, and grant the app access to the repositories you want to deploy. Return to Rig, retry installation discovery if needed, then select the installation, repository, branch, and discovered Compose file.
-6. Create the application, add visible/secret configuration as needed, and use **Deploy latest**. The resulting release records the resolved commit SHA, archive hash, Compose path, managed workspace state, and configuration revision without credentials.
+5. Open **Connections**, select **Connect GitHub**, enter the displayed device code, and authorize Rig. Then select **Manage repository access**, choose each personal account or organization that owns a repository, and grant the app access. Reconnect must use the same GitHub identity as the saved connection; a mismatch leaves the prior credential and source bindings unchanged.
+6. In **Add application**, choose **GitHub repository**, search the single repository picker, then select the branch and discovered Compose file. The picker aggregates accessible personal and organization installations and retains the connection, installation, and immutable repository IDs internally.
+7. Create the application, add visible/secret configuration as needed, and use **Deploy latest**. The resulting release records the resolved commit SHA, archive hash, Compose path, managed workspace state, and configuration revision without credentials.
 
 For a GitHub-connected controller that can execute manual deployments, only the execution flag is required:
 
@@ -47,6 +48,16 @@ hostd serve --data-root <absolute-data-root> --github-connections=false
 Opt-out cannot be combined with either GitHub App override or with controller relay mode, and it clears the effective public app identifiers.
 
 If authorization expires or repository access is removed, reconnect before inspection/deployment. Rig returns a stable local problem code and never forwards the provider response body.
+
+### Upgrade, backup, disablement, and rollback
+
+Migration `023_persistent_github_connection.sql` is additive. It creates owner-scoped default-connection and authorization-attempt metadata, then maps each user to the most recently connected usable legacy identity. It does not rewrite or delete legacy connection rows, application source bindings, relay enrollments, or relay bindings. Legacy connections remain available through the compatibility API, while new dashboard workflows use the saved default.
+
+Before deploying this migration, stop the controller cleanly and back up the complete data root, including `control.db`, its WAL/SHM companions when present, and the protected `secrets` directory. Preserve access controls and encryption for the backup: the database contains identity and source topology, and the protected files contain GitHub credentials. Test restore with the same approved binary in an isolated location. Never copy selected database files while the controller is writing.
+
+Starting with `--github-connections=false` disables new GitHub connection and repository-provider operations but retains saved metadata and protected credentials so the capability can be restored without changing immutable source or relay IDs. Use **Disconnect** first when credentials must be destroyed; disabling the feature alone is not credential revocation. Revoke the GitHub grant separately when provider-side access must end.
+
+For binary rollback, prefer a prior version that has been verified against schema 023. The migration has no automatic down step. If the prior binary is incompatible, stop the controller and restore the full pre-upgrade data-root backup. Do not drop the new tables or edit connection IDs in place: application and relay rows may still reference them.
 
 ## Compose review and recovery
 
@@ -73,7 +84,7 @@ hostd serve --data-root <absolute-data-root> --compose-runtime --controller-rela
 
 In the dashboard **Relay management** panel:
 
-1. Start enrollment for the selected GitHub installation/repository and complete the canonical GitHub OAuth/PKCE authorization.
+1. Select a repository from the same aggregate picker, choose **Authorize automatic deployments**, and complete the canonical GitHub OAuth/PKCE authorization. This relay authorization is separate from the controller's saved device connection.
 2. Poll or resume enrollment until the controller binding becomes ready.
 3. Enable automatic deployment on an eligible GitHub-source application.
 

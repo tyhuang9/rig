@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -28,10 +29,12 @@ type fakeProvider struct {
 	refreshError       error
 	refreshCalls       int
 	installationPage   githubapp.InstallationPage
+	installationPages  map[int]githubapp.InstallationPage
 	installationErrors []error
 	installationCalls  int
 	installationGate   chan struct{}
 	repositoryPage     githubapp.RepositoryPage
+	repositoryPages    map[int64]map[int]githubapp.RepositoryPage
 	repository         githubapp.Repository
 	branchPage         githubapp.BranchPage
 	branch             githubapp.Branch
@@ -71,7 +74,7 @@ func (provider *fakeProvider) CurrentUser(context.Context, string) (githubapp.Us
 	provider.userCalls++
 	return provider.user, provider.userError
 }
-func (provider *fakeProvider) Installations(context.Context, string, int, int) (githubapp.InstallationPage, error) {
+func (provider *fakeProvider) Installations(_ context.Context, _ string, page, _ int) (githubapp.InstallationPage, error) {
 	if provider.installationGate != nil {
 		<-provider.installationGate
 	}
@@ -85,10 +88,16 @@ func (provider *fakeProvider) Installations(context.Context, string, int, int) (
 			return githubapp.InstallationPage{}, err
 		}
 	}
+	if provider.installationPages != nil {
+		return provider.installationPages[page], nil
+	}
 	return provider.installationPage, nil
 }
-func (provider *fakeProvider) Repositories(context.Context, string, int64, int, int) (githubapp.RepositoryPage, error) {
+func (provider *fakeProvider) Repositories(_ context.Context, _ string, installationID int64, page, _ int) (githubapp.RepositoryPage, error) {
 	provider.repositoryCalls++
+	if provider.repositoryPages != nil {
+		return provider.repositoryPages[installationID][page], provider.repositoryError
+	}
 	return provider.repositoryPage, provider.repositoryError
 }
 func (provider *fakeProvider) Repository(_ context.Context, _ string, installationID, _ int64) (githubapp.Repository, error) {
@@ -678,6 +687,271 @@ func TestExpiredExchangeAccessRefreshesWithoutUsingDeviceGrantExpiry(t *testing.
 	}
 }
 
+func TestDefaultConnectionPersistsAndReconnectsStableIdentity(t *testing.T) {
+	service, provider, clock, db, store := testService(t)
+	first := connectDefaultService(t, service, clock)
+	if first.CredentialGeneration != 1 {
+		t.Fatalf("initial generation = %d", first.CredentialGeneration)
+	}
+
+	restarted := NewService(NewRepository(db), provider, store, "hostd-test", clock.Time)
+	persisted, configured, err := restarted.Default(context.Background(), "owner")
+	if err != nil || !configured || persisted.ID != first.ID || persisted.ProviderLogin != "octo" {
+		t.Fatalf("persisted default = %#v configured=%v err=%v", persisted, configured, err)
+	}
+	started, err := restarted.StartDefault(context.Background(), "owner")
+	if err != nil || started.ConnectionID != first.ID {
+		t.Fatalf("reconnect start = %#v err=%v", started, err)
+	}
+	clock.Advance(5 * time.Second)
+	reconnected, err := restarted.PollDefault(context.Background(), "owner", started.ConnectionID, started.AuthorizationID)
+	if err != nil || reconnected.Connection.ID != first.ID || reconnected.Connection.CredentialGeneration != 2 {
+		t.Fatalf("reconnected = %#v err=%v", reconnected, err)
+	}
+	var defaults int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM github_default_connections WHERE owner_user_id='owner'`).Scan(&defaults); err != nil || defaults != 1 {
+		t.Fatalf("default mappings = %d err=%v", defaults, err)
+	}
+}
+
+func TestDefaultReconnectMismatchAndTransientFailuresPreserveCredentials(t *testing.T) {
+	service, provider, clock, db, store := testService(t)
+	connection := connectDefaultService(t, service, clock)
+	original, err := store.ReadBundle(connection.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	provider.pollErrors = []error{&githubapp.Error{Code: "provider_unavailable"}}
+	started, err := service.StartDefault(context.Background(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(5 * time.Second)
+	if _, err := service.PollDefault(context.Background(), "owner", connection.ID, started.AuthorizationID); !IsCode(err, "provider_unavailable") {
+		t.Fatalf("transient poll = %v", err)
+	}
+	current, err := service.repository.Get(context.Background(), "owner", connection.ID)
+	if err != nil || current.Status != StatusConnected || current.CredentialGeneration != original.Generation {
+		t.Fatalf("connection after transient = %#v err=%v", current, err)
+	}
+	retained, err := store.ReadBundle(connection.ID)
+	if err != nil || retained.AccessToken != original.AccessToken {
+		t.Fatalf("bundle after transient = %v err=%v", retained, err)
+	}
+
+	clock.Advance(5 * time.Second)
+	provider.user = githubapp.User{ID: "84", Login: "other-octo"}
+	if _, err := service.PollDefault(context.Background(), "owner", connection.ID, started.AuthorizationID); !IsCode(err, "authorization_identity_mismatch") {
+		t.Fatalf("identity mismatch = %v", err)
+	}
+	current, err = service.repository.Get(context.Background(), "owner", connection.ID)
+	if err != nil || current.Status != StatusConnected || current.ProviderUserID != "42" || current.CredentialGeneration != original.Generation {
+		t.Fatalf("connection after mismatch = %#v err=%v", current, err)
+	}
+	retained, err = store.ReadBundle(connection.ID)
+	if err != nil || retained.ProviderUserID != "42" || retained.AccessToken != original.AccessToken {
+		t.Fatalf("bundle after mismatch = %v err=%v", retained, err)
+	}
+	assertSQLiteHasNoSentinels(t, db, "device-sensitive", "ghu_sensitive", "ghr_sensitive", "other-octo")
+}
+
+func TestDefaultAuthorizationSupersessionAndOwnerIsolation(t *testing.T) {
+	service, _, clock, _, store := testService(t)
+	first, err := service.StartDefault(context.Background(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.StartDefault(context.Background(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ConnectionID != second.ConnectionID || first.AuthorizationID == second.AuthorizationID {
+		t.Fatalf("attempt identities first=%#v second=%#v", first, second)
+	}
+	if _, err := store.ReadDevice(first.AuthorizationID); !credentialMissing(err) {
+		t.Fatalf("superseded device credential remains: %v", err)
+	}
+	if _, err := service.PollDefault(context.Background(), "owner", first.ConnectionID, first.AuthorizationID); !IsCode(err, "authorization_superseded") {
+		t.Fatalf("superseded poll = %v", err)
+	}
+	if _, err := service.PollDefault(context.Background(), "other", second.ConnectionID, second.AuthorizationID); !IsCode(err, "connection_not_found") {
+		t.Fatalf("cross-owner poll = %v", err)
+	}
+	if _, configured, err := service.Default(context.Background(), "other"); err != nil || configured {
+		t.Fatalf("cross-owner default configured=%v err=%v", configured, err)
+	}
+	clock.Advance(5 * time.Second)
+	if result, err := service.PollDefault(context.Background(), "owner", second.ConnectionID, second.AuthorizationID); err != nil || result.Connection.Status != StatusConnected {
+		t.Fatalf("current poll = %#v err=%v", result, err)
+	}
+}
+
+func TestConcurrentDefaultStartsLeaveOnePollableAttemptWithoutCredentialLeaks(t *testing.T) {
+	service, _, _, db, store := testService(t)
+	const starts = 12
+	results := make(chan ConnectionAuthorization, starts)
+	errorsFound := make(chan error, starts)
+	var group sync.WaitGroup
+	for range starts {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			started, err := service.StartDefault(context.Background(), "owner")
+			if err != nil {
+				errorsFound <- err
+				return
+			}
+			results <- started
+		}()
+	}
+	group.Wait()
+	close(results)
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Errorf("concurrent start: %v", err)
+	}
+	var pendingID string
+	if err := db.QueryRow(`SELECT id FROM github_connection_authorizations WHERE owner_user_id='owner' AND status='pending'`).Scan(&pendingID); err != nil {
+		t.Fatal(err)
+	}
+	var pendingCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM github_connection_authorizations WHERE owner_user_id='owner' AND status='pending'`).Scan(&pendingCount); err != nil || pendingCount != 1 {
+		t.Fatalf("pending attempts=%d err=%v", pendingCount, err)
+	}
+	seen := 0
+	for result := range results {
+		seen++
+		_, err := store.ReadDevice(result.AuthorizationID)
+		if result.AuthorizationID == pendingID {
+			if err != nil {
+				t.Errorf("pending credential missing: %v", err)
+			}
+		} else if !credentialMissing(err) {
+			t.Errorf("superseded credential %s remains: %v", result.AuthorizationID, err)
+		}
+	}
+	if seen != starts {
+		t.Fatalf("successful starts=%d", seen)
+	}
+}
+
+func TestReconnectSerializesWithRefreshAndDisconnect(t *testing.T) {
+	t.Run("refresh", func(t *testing.T) {
+		service, _, clock, _, store := testService(t)
+		connection := connectDefaultService(t, service, clock)
+		started, err := service.StartDefault(context.Background(), "owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(5 * time.Second)
+		begin := make(chan struct{})
+		results := make(chan error, 2)
+		go func() {
+			<-begin
+			_, err := service.Refresh(context.Background(), "owner", connection.ID)
+			results <- err
+		}()
+		go func() {
+			<-begin
+			_, err := service.PollDefault(context.Background(), "owner", connection.ID, started.AuthorizationID)
+			results <- err
+		}()
+		close(begin)
+		first, second := <-results, <-results
+		for _, result := range []error{first, second} {
+			if result != nil && !IsCode(result, "authorization_superseded") {
+				t.Fatalf("race result = %v", result)
+			}
+		}
+		persisted, err := service.repository.Get(context.Background(), "owner", connection.ID)
+		if err != nil || persisted.Status != StatusConnected {
+			t.Fatalf("persisted = %#v err=%v", persisted, err)
+		}
+		bundle, err := store.ReadBundle(connection.ID)
+		if err != nil || bundle.Generation != persisted.CredentialGeneration || bundle.ProviderUserID != persisted.ProviderUserID {
+			t.Fatalf("bundle=%v persisted=%#v err=%v", bundle, persisted, err)
+		}
+	})
+
+	t.Run("disconnect", func(t *testing.T) {
+		service, _, clock, _, store := testService(t)
+		connection := connectDefaultService(t, service, clock)
+		started, err := service.StartDefault(context.Background(), "owner")
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(5 * time.Second)
+		begin := make(chan struct{})
+		results := make(chan error, 2)
+		go func() { <-begin; results <- service.Disconnect(context.Background(), "owner", connection.ID) }()
+		go func() {
+			<-begin
+			_, err := service.PollDefault(context.Background(), "owner", connection.ID, started.AuthorizationID)
+			results <- err
+		}()
+		close(begin)
+		first, second := <-results, <-results
+		for _, result := range []error{first, second} {
+			if result != nil && !IsCode(result, "authorization_failed") {
+				t.Fatalf("race result = %v", result)
+			}
+		}
+		persisted, err := service.repository.Get(context.Background(), "owner", connection.ID)
+		if err != nil || persisted.Status != StatusDisconnected || persisted.CredentialGeneration != 0 {
+			t.Fatalf("persisted = %#v err=%v", persisted, err)
+		}
+		if _, err := store.ReadBundle(connection.ID); !credentialMissing(err) {
+			t.Fatalf("bundle remains after disconnect: %v", err)
+		}
+		pending, err := service.repository.PendingAuthorizationIDs(context.Background(), "owner", connection.ID)
+		if err != nil || len(pending) != 0 {
+			t.Fatalf("pending attempts=%v err=%v", pending, err)
+		}
+	})
+}
+
+func TestDefaultRepositorySearchAggregatesPersonalAndOrganizationPages(t *testing.T) {
+	service, provider, clock, _, _ := testService(t)
+	connectDefaultService(t, service, clock)
+	installations := make([]githubapp.Installation, 100)
+	for i := range installations {
+		when := clock.Time()
+		installations[i] = githubapp.Installation{ID: int64(i + 1), AccountLogin: "unused", AccountType: "Organization", TargetType: "Organization", RepositorySelection: "selected", SuspendedAt: &when}
+	}
+	installations[0] = githubapp.Installation{ID: 1, AccountLogin: "octo", AccountType: "User", TargetType: "User", RepositorySelection: "all"}
+	provider.installationPages = map[int]githubapp.InstallationPage{
+		1: {TotalCount: 101, Installations: installations},
+		2: {TotalCount: 101, Installations: []githubapp.Installation{{ID: 101, AccountLogin: "acme", AccountType: "Organization", TargetType: "Organization", RepositorySelection: "selected"}}},
+	}
+	personal := make([]githubapp.Repository, 100)
+	for i := range personal {
+		personal[i] = githubapp.Repository{ID: int64(i + 1), Owner: "octo", Name: fmt.Sprintf("repo-%03d", i), DefaultBranch: "main"}
+	}
+	provider.repositoryPages = map[int64]map[int]githubapp.RepositoryPage{
+		1: {
+			1: {TotalCount: 101, Repositories: personal},
+			2: {TotalCount: 101, Repositories: []githubapp.Repository{{ID: 1001, Owner: "octo", Name: "needle-personal", DefaultBranch: "main"}}},
+		},
+		101: {1: {TotalCount: 1, Repositories: []githubapp.Repository{{ID: 2001, Owner: "acme", Name: "needle-org", DefaultBranch: "trunk", Private: true}}}},
+	}
+	result, err := service.DefaultRepositories(context.Background(), "owner", "needle", 1, 30)
+	if err != nil || result.TotalCount != 2 || len(result.Repositories) != 2 {
+		t.Fatalf("aggregate = %#v err=%v", result, err)
+	}
+	if result.Repositories[0].InstallationID != 101 || result.Repositories[1].InstallationID != 1 {
+		t.Fatalf("aggregate ordering/identity = %#v", result.Repositories)
+	}
+	provider.repositoryError = &githubapp.Error{Code: "provider_unavailable"}
+	if _, err := service.DefaultRepositories(context.Background(), "owner", "", 1, 30); !IsCode(err, "provider_unavailable") {
+		t.Fatalf("aggregate transient error = %v", err)
+	}
+	provider.repositoryError = nil
+	if recovered, err := service.DefaultRepositories(context.Background(), "owner", "needle-org", 1, 30); err != nil || recovered.TotalCount != 1 {
+		t.Fatalf("aggregate recovery = %#v err=%v", recovered, err)
+	}
+}
+
 func testService(t *testing.T) (*Service, *fakeProvider, *testClock, *sql.DB, *FileCredentialStore) {
 	t.Helper()
 	root := t.TempDir()
@@ -715,10 +989,24 @@ func connectService(t *testing.T, service *Service, clock *testClock) Connection
 	return connection
 }
 
+func connectDefaultService(t *testing.T, service *Service, clock *testClock) Connection {
+	t.Helper()
+	started, err := service.StartDefault(context.Background(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(5 * time.Second)
+	result, err := service.PollDefault(context.Background(), "owner", started.ConnectionID, started.AuthorizationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result.Connection
+}
+
 func assertSQLiteHasNoSentinels(t *testing.T, db *sql.DB, sentinels ...string) {
 	t.Helper()
 	var values []byte
-	for _, table := range []string{"source_connections", "github_installations", "jobs", "job_events", "audit_events"} {
+	for _, table := range []string{"source_connections", "github_installations", "github_default_connections", "github_connection_authorizations", "jobs", "job_events", "audit_events"} {
 		rows, err := db.Query(`SELECT * FROM ` + table)
 		if err != nil {
 			t.Fatal(err)
