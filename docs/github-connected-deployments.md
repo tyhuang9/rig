@@ -6,7 +6,7 @@ Rig can deploy a selected GitHub.com repository without a user-managed checkout 
 
 - GitHub.com is the only provider/host in v1.
 - GitHub connections are enabled by default through the official `rig-deployment-connector` GitHub App owned by `@tyhuang9`.
-- Each signed-in Rig user has at most one saved GitHub connection per controller data root. Its stable local ID and rotating user credential survive page reloads, sign-out, and controller restarts. Device grants, in-progress exchanges, and active token bundles stay in separate purpose-bound protected files. SQLite contains safe identity, status, authorization-attempt timing, and expiry metadata only.
+- Each signed-in Rig user has one default reusable GitHub connector per controller data root. Its stable local ID and rotating user credential survive page reloads, sign-out, and controller restarts. Historical legacy connections remain retained for existing bindings and compatibility APIs. Device grants, in-progress exchanges, and active token bundles stay in separate purpose-bound protected files. SQLite contains safe identity, status, authorization-attempt timing, and expiry metadata only.
 - Sources are either `local` or `github`. A GitHub source binds a connection, installation ID, immutable repository ID, display owner/name, tracked branch, and normalized repository-relative Compose path.
 - Automatic deployment is disabled per application by default. The relay is optional: a relay outage leaves GitHub-connected manual deployment operable.
 - Docker Compose execution is disabled unless `hostd` starts with `--compose-runtime`; `--fake-runtime` remains isolated development behavior. This flag enables execution only; it does not configure GitHub or the relay.
@@ -47,7 +47,7 @@ hostd serve --data-root <absolute-data-root> --github-connections=false
 
 Opt-out cannot be combined with either GitHub App override or with controller relay mode, and it clears the effective public app identifiers.
 
-If authorization expires or repository access is removed, reconnect before inspection/deployment. Rig returns a stable local problem code and never forwards the provider response body.
+Rig refreshes valid GitHub credentials automatically. If the saved credential becomes unavailable or unusable, reconnect before inspection or deployment. If a repository is removed from the GitHub App grant, use **Manage repository access**, restore the grant, and retry. Rig returns a stable local problem code and never forwards the provider response body.
 
 ### Upgrade, backup, disablement, and rollback
 
