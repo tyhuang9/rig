@@ -27,8 +27,12 @@ type caddyHTTP struct {
 	Servers map[string]caddyServer `json:"servers"`
 }
 type caddyServer struct {
-	Listen []string     `json:"listen"`
-	Routes []caddyRoute `json:"routes"`
+	Listen         []string            `json:"listen"`
+	AutomaticHTTPS caddyAutomaticHTTPS `json:"automatic_https"`
+	Routes         []caddyRoute        `json:"routes"`
+}
+type caddyAutomaticHTTPS struct {
+	Disable bool `json:"disable"`
 }
 type caddyRoute struct {
 	Match  []caddyMatch  `json:"match"`
@@ -60,7 +64,7 @@ func buildCaddyConfig(routes map[string]routeRecord, listenAddress string) ([]by
 	}
 	sort.Strings(appIDs)
 	result := caddyConfig{Admin: caddyAdmin{Listen: "localhost:2019"}, Apps: caddyApps{HTTP: caddyHTTP{Servers: map[string]caddyServer{
-		"generated": {Listen: []string{listenAddress}, Routes: make([]caddyRoute, 0, len(routes)*2)},
+		"generated": {Listen: []string{listenAddress}, AutomaticHTTPS: caddyAutomaticHTTPS{Disable: true}, Routes: make([]caddyRoute, 0, len(routes)*2)},
 	}}}}
 	server := result.Apps.HTTP.Servers["generated"]
 	for _, appID := range appIDs {
