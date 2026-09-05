@@ -95,7 +95,9 @@ func proxyRoute(host string, paths []string, endpoint generatedruntime.RouteEndp
 	return caddyRoute{
 		Match: []caddyMatch{{Host: []string{host}, Path: paths}},
 		Handle: []caddyHandle{{Handler: "reverse_proxy", Upstreams: []caddyUpstream{{
-			Dial: net.JoinHostPort(endpoint.NetworkAlias, strconv.FormatUint(uint64(endpoint.InternalPort), 10)),
+			// Aliases are scoped to an application's network, but Caddy joins many
+			// networks. Qualify DNS so identical component names cannot cross-route.
+			Dial: net.JoinHostPort(endpoint.NetworkAlias+"."+endpoint.NetworkName, strconv.FormatUint(uint64(endpoint.InternalPort), 10)),
 		}}}},
 	}
 }

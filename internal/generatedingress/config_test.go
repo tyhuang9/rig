@@ -42,10 +42,10 @@ func TestBuildCaddyConfigSupportsServerStaticAndStaticAPI(t *testing.T) {
 	if got := server.Routes[1].Match[0].Path; len(got) != 2 || got[0] != "/api" || got[1] != "/api/*" {
 		t.Fatalf("API paths = %#v", got)
 	}
-	if got := server.Routes[1].Handle[0].Upstreams[0].Dial; got != "api-green:3000" {
+	if got := server.Routes[1].Handle[0].Upstreams[0].Dial; got != "api-green.net-b:3000" {
 		t.Fatalf("API upstream = %q", got)
 	}
-	if got := server.Routes[2].Handle[0].Upstreams[0].Dial; got != "frontend-green:4173" {
+	if got := server.Routes[2].Handle[0].Upstreams[0].Dial; got != "frontend-green.net-b:4173" {
 		t.Fatalf("static upstream = %q", got)
 	}
 }
@@ -93,6 +93,42 @@ func TestBuildCaddyConfigExplicitlyDisablesAutomaticHTTPS(t *testing.T) {
 				t.Fatalf("serialized automatic_https = %s, want exact disabled object", raw)
 			}
 		})
+	}
+}
+
+func TestBuildCaddyConfigScopesSharedAliasesToEachApplicationNetwork(t *testing.T) {
+	appA := "11111111-1111-4111-8111-111111111111"
+	appB := "22222222-2222-4222-8222-222222222222"
+	routes := map[string]routeRecord{
+		appA: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+			endpoint("api", "server", "rig-a-first", "api-blue", 3000, 'a'),
+		}},
+		appB: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+			endpoint("api", "server", "rig-a-second", "api-blue", 3000, 'b'),
+		}},
+	}
+	body, err := buildCaddyConfig(routes, "10.203.0.2:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config caddyConfig
+	if err := json.Unmarshal(body, &config); err != nil {
+		t.Fatal(err)
+	}
+	actual := map[string]string{}
+	for _, route := range config.Apps.HTTP.Servers["generated"].Routes {
+		actual[route.Match[0].Host[0]] = route.Handle[0].Upstreams[0].Dial
+	}
+	for host, want := range map[string]string{
+		appA + ".rig.localhost": "api-blue.rig-a-first:3000",
+		appB + ".rig.localhost": "api-blue.rig-a-second:3000",
+	} {
+		if actual[host] != want {
+			t.Fatalf("upstream for %s = %q, want network-scoped %q", host, actual[host], want)
+		}
+	}
+	if routes[appA].Endpoints[0].NetworkAlias != "api-blue" || routes[appB].Endpoints[0].NetworkAlias != "api-blue" {
+		t.Fatal("config generation mutated accepted endpoint aliases")
 	}
 }
 
