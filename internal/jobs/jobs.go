@@ -42,6 +42,7 @@ var (
 	ErrIdempotency               = errors.New("idempotency key conflicts with the original request")
 	ErrApplicationBusy           = errors.New("application already has an active mutation")
 	ErrCancellationRequested     = errors.New("job cancellation requested")
+	ErrCancellationUnsafe        = errors.New("job cannot be cancelled while route reconciliation is required")
 )
 
 // JobInput is deliberately sealed so new persisted input schemas are reviewed
@@ -152,6 +153,7 @@ const (
 	PauseApprovalRequired                = "approval_required"
 	PauseMigrationApprovalRequired       = "migration_approval_required"
 	PauseInsufficientReplacementCapacity = "insufficient_replacement_capacity"
+	PauseRouteReconciliationRequired     = "route_reconciliation_required"
 )
 
 // ExecutionError identifies a known executor failure. Detail is retained for
@@ -495,14 +497,17 @@ func (s *Service) Cancel(id string) (Job, error) {
 		return Job{}, err
 	}
 	defer tx.Rollback()
-	var status, phase string
-	if err := tx.QueryRow(`SELECT status,phase FROM jobs WHERE id=?`, id).Scan(&status, &phase); errors.Is(err, sql.ErrNoRows) {
+	var status, phase, pauseDisposition string
+	if err := tx.QueryRow(`SELECT status,phase,COALESCE(pause_disposition,'') FROM jobs WHERE id=?`, id).Scan(&status, &phase, &pauseDisposition); errors.Is(err, sql.ErrNoRows) {
 		return Job{}, ErrJobNotFound
 	} else if err != nil {
 		return Job{}, err
 	}
 	if terminal(status) {
 		return Job{}, ErrJobTerminal
+	}
+	if status == string(WaitingUser) && pauseDisposition == PauseRouteReconciliationRequired {
+		return Job{}, ErrCancellationUnsafe
 	}
 	if status == string(Waiting) && phase == "cancelling" {
 		if err := tx.Commit(); err != nil {
@@ -593,6 +598,7 @@ func (s *Service) Resume(id string) (Job, error) {
 					AND d.provenance_initialized=1 AND p.strategy='generated_node' AND p.migration_evidence_digest<>''
 			))
 			OR pause_disposition='insufficient_replacement_capacity'
+			OR pause_disposition='route_reconciliation_required'
 		)`, formattedNow, id)
 	if err != nil {
 		return Job{}, err
@@ -986,6 +992,8 @@ func pauseStateFor(disposition string) (pauseState, bool) {
 		return pauseState{phase: PauseMigrationApprovalRequired, checkpoint: `{"phase":"migration_approval_required"}`, code: PauseMigrationApprovalRequired, message: "Deployment migration requires approval"}, true
 	case PauseInsufficientReplacementCapacity:
 		return pauseState{phase: PauseInsufficientReplacementCapacity, checkpoint: `{"phase":"insufficient_replacement_capacity"}`, code: PauseInsufficientReplacementCapacity, message: "Deployment is waiting for replacement capacity"}, true
+	case PauseRouteReconciliationRequired:
+		return pauseState{phase: PauseRouteReconciliationRequired, checkpoint: `{"phase":"route_reconciliation_required"}`, code: PauseRouteReconciliationRequired, message: "Deployment route state requires reconciliation"}, true
 	default:
 		return pauseState{}, false
 	}

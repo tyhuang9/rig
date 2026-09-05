@@ -93,7 +93,6 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const resumeAuthorizationButton = useRef<HTMLButtonElement>(null);
   const expiryRetryButton = useRef<HTMLButtonElement>(null);
   const installActionLink = useRef<HTMLAnchorElement>(null);
-  const focusResumeAfterSelection = useRef(false);
   const authorizationFocusOrigin = useRef(false);
   const focusAfterAuthorization = useRef<"connection" | "expiryRetry" | "install" | null>(null);
   const expiryReconciliationAttempts = useRef(new Set<string>());
@@ -136,6 +135,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   }, [selectedConnectionId, installationId, repositoryId, branch, composePath]);
   const exactSourceKey = source ? JSON.stringify(source) : "";
   const exactInspection = Boolean(exactSourceKey) && inspection !== null && inspectedKey === exactSourceKey && inspection.findings.length === 0;
+  const composeSelected = kind === "github" && Boolean(composePath) && exactInspection;
   const generatedCandidates = inspection?.analysis.candidates.filter((candidate) => candidate.kind === "javascript" && candidate.status !== "unsupported" && candidate.components.length > 0) ?? [];
 
   const clearInspection = () => {
@@ -240,16 +240,10 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     priorStage.current = stage;
     if (previous === stage) return;
     window.setTimeout(() => {
-      if (stage === "source") sourceHeading.current?.focus();
+      if (stage === "source") (formError ? errorSummary.current : sourceHeading.current)?.focus();
       if (stage === "ready") readyHeading.current?.focus();
     }, 0);
   }, [stage]);
-
-  useEffect(() => {
-    if (!focusResumeAfterSelection.current) return;
-    focusResumeAfterSelection.current = false;
-    if (canResumeAuthorization) resumeAuthorizationButton.current?.focus();
-  }, [canResumeAuthorization, selectedConnectionId]);
 
   useEffect(() => {
     const target = focusAfterAuthorization.current;
@@ -328,14 +322,15 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     },
   });
   const inspectSource = useMutation({
-    mutationFn: (operation: { request: { sourcePath?: string; githubSource?: GitHubSource }; key: string; generation: number }) => api.inspect(operation.request).then((result) => ({ result, key: operation.key, generation: operation.generation })),
-    onSuccess: ({ result, key, generation }) => {
+    mutationFn: (operation: { request: { sourcePath?: string; githubSource?: GitHubSource }; key: string; generation: number }) => api.inspect(operation.request).then((result) => ({ result, ...operation })),
+    onSuccess: ({ result, request, key, generation }) => {
       const currentRequest = inspectionRequest.current;
       if (!currentRequest || generation !== inspectionGeneration.current || currentRequest.generation !== generation || currentRequest.key !== key) return;
       setInspection(result);
       setInspectedKey(key);
       setInspectionError("");
-      if (result.analysis.candidates.some((candidate) => candidate.kind === "javascript" && candidate.status !== "unsupported" && candidate.components.length > 0)) setStage("review");
+      const explicitlySelectedCompose = Boolean(request.githubSource?.composePath);
+      if (!explicitlySelectedCompose && result.analysis.candidates.some((candidate) => candidate.kind === "javascript" && candidate.status !== "unsupported" && candidate.components.length > 0)) setStage("review");
     },
     onError: (error, operation) => {
       const currentRequest = inspectionRequest.current;
@@ -418,6 +413,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     onSuccess: (revision) => {
       setFormError("");
       setAcceptedRevision(revision);
+      window.setTimeout(() => readyHeading.current?.focus(), 0);
     },
     onError: (error) => {
       setFormError(safeMessage(error, "Could not approve the database migration."));
@@ -702,19 +698,26 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
 
   if (stage === "ready" && acceptedRevision && draftApplicationId) {
     const migrationPending = acceptedRevision.migration.present && acceptedRevision.migration.approvalStatus !== "approved";
+    const readyAnnouncement = approveMigration.isPending
+      ? "Approving database migration."
+      : acceptedRevision.migration.present
+        ? migrationPending
+          ? "Deployment setup accepted. Database migration approval is required before deployment."
+          : "Database migration approved. Deployment setup is ready."
+        : "Deployment setup accepted. The application is ready to open.";
     return <div className="wizard source-wizard">
       <ol aria-label="Setup progress"><li>Source</li><li>How Rig will run it</li><li aria-current="step">Ready to deploy</li></ol>
       <form onSubmit={(event) => event.preventDefault()} noValidate>
         <section className="plan-ready" aria-labelledby="plan-ready-title">
           <h2 id="plan-ready-title" ref={readyHeading} tabIndex={-1}>Setup accepted</h2>
-          <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{approveMigration.isPending ? "Approving database migration." : "Deployment setup accepted."}</span>
+          <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{readyAnnouncement}</span>
           <p>Rig saved this immutable setup as revision {acceptedRevision.revisionNumber}. It will reuse it until relevant project metadata changes.</p>
           {formError && <div ref={errorSummary} className="error-summary" role="alert" tabIndex={-1}>{formError}</div>}
           {acceptedRevision.migration.present && <div className={migrationPending ? "migration-review" : "callout success"}>
             <strong>{migrationPending ? "Database migration needs separate approval" : "Database migration approved"}</strong>
             {migrationPending ? <><p>This command can change persistent data. The old and new app versions briefly share the migrated database, and Rig will not automatically roll it back.</p><button className="button" type="button" disabled={approveMigration.isPending} onClick={() => { setFormError(""); approveMigration.mutate(); }}>{approveMigration.isPending ? "Approving migration…" : "Approve migration before the next deployment"}</button></> : <span>The migration is approved for this plan revision.</span>}
           </div>}
-          <div className="callout info"><strong>Generated runtime is not enabled yet</strong><span>The setup is saved and ready for the generated-image runtime milestone. No repository command has run.</span></div>
+          <div className="callout success"><strong>Ready to deploy</strong><span>Analysis did not execute repository code. Open the application and choose Deploy latest to build and start this accepted setup in containers.</span></div>
           <footer><button className="button primary" type="button" onClick={() => onCreated(draftApplicationId)}>Open application</button></footer>
         </section>
       </form>
@@ -723,7 +726,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
 
   return <div className="wizard source-wizard">
     <ol aria-label="Setup progress"><li aria-current="step">Source</li><li>How Rig will run it</li><li>Ready to deploy</li></ol>
-    <form onSubmit={(event) => { event.preventDefault(); generatedCandidates.length > 0 ? setStage("review") : saveCompose(); }} noValidate>
+    <form onSubmit={(event) => { event.preventDefault(); composeSelected ? saveCompose() : generatedCandidates.length > 0 ? setStage("review") : saveCompose(); }} noValidate>
       <h2 ref={sourceHeading} tabIndex={-1}>Application source</h2>
       <p>Choose a project for Rig to analyze. Rig reads project files to suggest setup; it won’t run your code.</p>
       {formError && <div ref={errorSummary} className="error-summary" role="alert" tabIndex={-1}>{formError}</div>}
@@ -780,7 +783,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
               <strong>{isConnected ? "GitHub connection ready" : selectedStatus === "pending" ? "GitHub authorization pending" : "GitHub connection needs attention"}</strong>
               <span>{`Connection status: ${selectedStatus.replaceAll("_", " ")}.`}</span>
               {sourceError && <span>{sourceError}</span>}
-              {!sourceError && selectedStatus === "pending" && <span>{authorizationSession ? "Rig is checking this authorization. Keep this page open." : canResumeAuthorization ? "Select Resume authorization check to continue checking the authorization started earlier." : "This authorization can no longer be resumed. Start a new connection."}</span>}
+              {!sourceError && selectedStatus === "pending" && <span>{authorizationSession ? "Rig is checking this authorization. Keep this page open." : canResumeAuthorization ? "Resume authorization check is now available. Select it to continue checking the authorization started earlier." : "This authorization can no longer be resumed. Start a new connection."}</span>}
               {!sourceError && selectedStatus === "expired" && authorizationSession?.reconcilingExpiry && <span>Rig is confirming the expired authorization with the controller.</span>}
               {!sourceError && selectedStatus === "access_lost" && <span>GitHub access was lost. Start a new connection before browsing repositories.</span>}
               {!sourceError && !isConnected && selectedStatus !== "access_lost" && selectedStatus !== "pending" && !authorizationSession?.reconcilingExpiry && <span>Start a new connection or choose another connection.</span>}
@@ -788,7 +791,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
           </div>
           <div className="field">
             <label htmlFor="github-connection">GitHub connection</label>
-            <select ref={connectionSelect} id="github-connection" value={selectedConnectionId} disabled={connections.isFetching || connections.isError} onChange={(event) => { const nextConnection = connections.data?.items.find((connection) => connection.id === event.target.value); focusResumeAfterSelection.current = nextConnection?.status === "pending" && Boolean(nextConnection.pendingExpiresAt) && !isDeviceAuthorizationExpired(nextConnection.pendingExpiresAt!); advanceConnectionContext("github", event.target.value); setSelectedConnectionId(event.target.value); setPendingStatus(undefined); setDeviceAuthorization(null); setSourceError(""); resetAfterConnection(); }}>
+            <select ref={connectionSelect} id="github-connection" value={selectedConnectionId} disabled={connections.isFetching || connections.isError} onChange={(event) => { advanceConnectionContext("github", event.target.value); setSelectedConnectionId(event.target.value); setPendingStatus(undefined); setDeviceAuthorization(null); setSourceError(""); resetAfterConnection(); }}>
               <option value="">{connections.isFetching ? "Loading connections…" : connections.isError ? "Connections unavailable" : "Choose a connection"}</option>
               {connections.data?.items.map((connection) => <option key={connection.id} value={connection.id}>{connectionLabel(connection)}</option>)}
             </select>
@@ -811,7 +814,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         </>}
       </section>}
       {kind === "github" && <p id="github-save-help" className="save-help">{githubSaveHelp}</p>}
-      <footer><button className="button" type="button" onClick={onCancel}>Back</button>{generatedCandidates.length > 0 ? <button className="button primary" type="button" onClick={() => setStage("review")}>Review setup</button> : inspection?.composeCandidates.length ? <button className="button primary" aria-describedby={kind === "github" ? "github-save-help" : undefined} disabled={create.isPending || (kind === "github" && (!composePath || !exactInspection))}>{create.isPending ? "Saving…" : "Save application"}</button> : <button className="button primary" type="button" disabled aria-describedby={kind === "github" ? "github-save-help" : undefined}>Save application</button>}</footer>
+      <footer><button className="button" type="button" onClick={onCancel}>Back</button>{composeSelected ? <button className="button primary" aria-describedby="github-save-help" disabled={create.isPending}>{create.isPending ? "Saving…" : "Save application"}</button> : generatedCandidates.length > 0 ? <button className="button primary" type="button" onClick={() => setStage("review")}>Review setup</button> : inspection?.composeCandidates.length ? <button className="button primary" aria-describedby={kind === "github" ? "github-save-help" : undefined} disabled={create.isPending || (kind === "github" && (!composePath || !exactInspection))}>{create.isPending ? "Saving…" : "Save application"}</button> : <button className="button primary" type="button" disabled aria-describedby={kind === "github" ? "github-save-help" : undefined}>Save application</button>}</footer>
     </form>
   </div>;
 }

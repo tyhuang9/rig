@@ -96,6 +96,8 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 			code = "source_too_large"
 		} else if errors.Is(err, context.Canceled) {
 			code = "internal_error"
+		} else if errors.Is(err, errLocal) {
+			code = "internal_error"
 		} else {
 			var releaseErr *Error
 			if errors.As(err, &releaseErr) {

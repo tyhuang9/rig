@@ -18,13 +18,32 @@ const (
 	DiagnosticCancelled           DiagnosticCode = "cancelled"
 )
 
-// Error carries only an audit-safe diagnostic code. Docker and Caddy output is
-// deliberately discarded inside the package.
-type Error struct{ Code DiagnosticCode }
+// Error carries only an audit-safe diagnostic code and route safety outcome.
+// Docker and Caddy output is deliberately discarded inside the package.
+type Error struct {
+	Code               DiagnosticCode
+	candidateMayBeLive bool
+}
 
 func (e *Error) Error() string { return "generated ingress: " + string(e.Code) }
+
+// CandidateMayBeLive tells the deployment coordinator that failed
+// reconciliation could not prove the candidate is no longer serving traffic.
+func (e *Error) CandidateMayBeLive() bool { return e != nil && e.candidateMayBeLive }
 
 func IsCode(err error, code DiagnosticCode) bool {
 	var target *Error
 	return errors.As(err, &target) && target.Code == code
+}
+
+func candidateMayBeLiveError() *Error {
+	return &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
+}
+
+func markCandidateMayBeLive(err error) *Error {
+	var target *Error
+	if errors.As(err, &target) {
+		return &Error{Code: target.Code, candidateMayBeLive: true}
+	}
+	return candidateMayBeLiveError()
 }

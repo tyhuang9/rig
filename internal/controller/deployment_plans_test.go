@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -23,9 +24,10 @@ import (
 )
 
 func TestDeploymentPlanAPIAnalyzesAcceptsAndRejectsStaleState(t *testing.T) {
-	handler, session, app, source := deploymentPlanAPIFixture(t, map[string]string{
-		"package.json":      `{"packageManager":"npm@11","scripts":{"build":"vite build"},"dependencies":{"vite":"6"}}`,
-		"package-lock.json": `{"lockfileVersion":3}`,
+	handler, session, _, app, source := deploymentPlanAPIFixture(t, map[string]string{
+		"package.json":          `{"packageManager":"npm@11","workspaces":["apps/*"]}`,
+		"package-lock.json":     `{"lockfileVersion":3}`,
+		"apps/web/package.json": `{"name":"web","scripts":{"build":"vite build"},"dependencies":{"vite":"6"}}`,
 	})
 
 	inspection := inspectLocalProject(t, handler, session, source)
@@ -62,7 +64,7 @@ func TestDeploymentPlanAPIAnalyzesAcceptsAndRejectsStaleState(t *testing.T) {
 	if err := json.Unmarshal(saved.Body.Bytes(), &revision); err != nil {
 		t.Fatal(err)
 	}
-	if revision.RevisionNumber != 1 || revision.Source.Provider != "local" || revision.Components[0].BuildCommand != buildCommand || revision.Migration.Present {
+	if revision.RevisionNumber != 1 || revision.Source.Provider != "local" || revision.Components[0].RootDirectory != "apps/web" || revision.Components[0].InstallDirectory != "." || revision.Components[0].BuildCommand != buildCommand || revision.Migration.Present {
 		t.Fatalf("revision = %#v", revision)
 	}
 	if _, err := os.Stat(filepath.Join(source, "rig-command-ran")); !os.IsNotExist(err) {
@@ -83,7 +85,7 @@ func TestDeploymentPlanAPIAnalyzesAcceptsAndRejectsStaleState(t *testing.T) {
 }
 
 func TestDeploymentPlanMigrationApprovalIsSeparateAndCASProtected(t *testing.T) {
-	handler, session, app, source := deploymentPlanAPIFixture(t, map[string]string{
+	handler, session, _, app, source := deploymentPlanAPIFixture(t, map[string]string{
 		"package.json": `{
 			"packageManager":"npm@11","scripts":{"build":"tsc","start":"node dist/index.js"},
 			"dependencies":{"express":"5","prisma":"6"}
@@ -131,7 +133,62 @@ func TestDeploymentPlanMigrationApprovalIsSeparateAndCASProtected(t *testing.T) 
 	}
 }
 
-func deploymentPlanAPIFixture(t *testing.T, files map[string]string) (http.Handler, auth.Session, apps.Application, string) {
+func TestDeploymentPlanAPIAcceptsReviewedYarnLockfileInstall(t *testing.T) {
+	handler, session, _, app, source := deploymentPlanAPIFixture(t, map[string]string{
+		"package.json": `{"scripts":{"start":"node server.js"},"dependencies":{"express":"5"}}`,
+		"yarn.lock":    "# yarn lockfile v1\n",
+	})
+	inspection := inspectLocalProject(t, handler, session, source)
+	candidate := inspection.Analysis.Candidates[0]
+	component := candidate.Components[0]
+	if candidate.PackageManager.Name != "yarn" || candidate.PackageManager.Version != "" || candidate.Install.Present || !slices.Contains(candidate.MissingFields, "package_manager.version") {
+		t.Fatalf("yarn review candidate = %#v", candidate)
+	}
+	request := apicontract.AcceptDeploymentPlanRequest{
+		ExpectedRevisionNumber: 0, ExpectedSourceStructuralFingerprint: inspection.Analysis.StructuralFingerprint,
+		ExpectedCandidateDigest: candidate.Digest, CandidateID: candidate.ID, PackageManager: "yarn",
+		InstallBehavior: "corepack prepare yarn@1.22.22 --activate && corepack yarn install --frozen-lockfile",
+		Components: []apicontract.DeploymentPlanComponentInput{{
+			ComponentID: component.ID, RunCommand: component.Run.Command, NodeVersion: candidate.NodeVersion.Value, InternalPort: 3000, HealthProbe: "/health",
+		}},
+	}
+	saved := authenticatedJSONRequest(t, handler, session, http.MethodPut, "/api/v1/apps/"+app.ID+"/deployment-plan", request)
+	var revision apicontract.DeploymentPlanRevision
+	if err := json.Unmarshal(saved.Body.Bytes(), &revision); err != nil {
+		t.Fatal(err)
+	}
+	var packageManagerProvenance apicontract.DeploymentPlanFieldProvenance
+	for _, field := range revision.FieldProvenance {
+		if field.Field == "components."+component.ID+".packageManager" {
+			packageManagerProvenance = field
+			break
+		}
+	}
+	if packageManagerProvenance.Origin != "user" || !slices.Contains(packageManagerProvenance.Evidence, "user:package-manager-review") {
+		t.Fatalf("package manager review provenance = %#v", packageManagerProvenance)
+	}
+}
+
+func TestDeploymentPlanMutationsRequireAdministrator(t *testing.T) {
+	handler, admin, operator, app, _ := deploymentPlanAPIFixture(t, map[string]string{
+		"package.json":      `{"packageManager":"npm@11","scripts":{"start":"node server.js"},"dependencies":{"express":"5"}}`,
+		"package-lock.json": `{"lockfileVersion":3}`,
+	})
+	denied := rawAuthenticatedJSONRequest(t, handler, operator, http.MethodPut, "/api/v1/apps/"+app.ID+"/deployment-plan", apicontract.AcceptDeploymentPlanRequest{})
+	if denied.Code != http.StatusForbidden || !jsonProblemCode(denied.Body.Bytes(), "deployment_plan_forbidden") || denied.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("operator acceptance=%d %s headers=%v", denied.Code, denied.Body.String(), denied.Header())
+	}
+	current := rawAuthenticatedJSONRequest(t, handler, admin, http.MethodGet, "/api/v1/apps/"+app.ID+"/deployment-plan", nil)
+	if current.Code != http.StatusNotFound || !jsonProblemCode(current.Body.Bytes(), "deployment_plan_not_found") {
+		t.Fatalf("operator acceptance changed the plan head: %d %s", current.Code, current.Body.String())
+	}
+	migrationDenied := rawAuthenticatedJSONRequest(t, handler, operator, http.MethodPost, "/api/v1/apps/"+app.ID+"/deployment-plan/migration-approval", apicontract.ApproveDeploymentPlanMigrationRequest{})
+	if migrationDenied.Code != http.StatusForbidden || !jsonProblemCode(migrationDenied.Body.Bytes(), "deployment_plan_forbidden") || migrationDenied.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("operator migration approval=%d %s headers=%v", migrationDenied.Code, migrationDenied.Body.String(), migrationDenied.Header())
+	}
+}
+
+func deploymentPlanAPIFixture(t *testing.T, files map[string]string) (http.Handler, auth.Session, auth.Session, apps.Application, string) {
 	t.Helper()
 	root := t.TempDir()
 	stateRoot := filepath.Join(root, "state")
@@ -147,6 +204,15 @@ func deploymentPlanAPIFixture(t *testing.T, files map[string]string) (http.Handl
 	authService := auth.New(db)
 	token, _ := authService.EnsureBootstrapToken()
 	_, session, err := authService.Bootstrap(token, "admin", "a sufficiently long local passphrase")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const operatorID = "99999999-9999-4999-8999-999999999999"
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,role,created_at,updated_at)
+		SELECT ?, 'operator', passphrase_hash, 'operator', datetime('now'), datetime('now') FROM users WHERE username='admin'`, operatorID); err != nil {
+		t.Fatal(err)
+	}
+	operatorSession, err := authService.NewSession(operatorID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +233,7 @@ func deploymentPlanAPIFixture(t *testing.T, files map[string]string) (http.Handl
 		Auth: authService, Apps: appStore, Jobs: jobs.New(db), Machines: machineStore, DeploymentPlans: planStore,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}).Handler()
-	return handler, session, app, sourceRoot
+	return handler, session, operatorSession, app, sourceRoot
 }
 
 func inspectLocalProject(t *testing.T, handler http.Handler, session auth.Session, source string) apicontract.InspectResponse {
@@ -175,6 +241,21 @@ func inspectLocalProject(t *testing.T, handler http.Handler, session auth.Sessio
 	response := authenticatedJSONRequest(t, handler, session, http.MethodPost, "/api/v1/apps/import/inspect", map[string]string{"sourcePath": source})
 	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("inspect=%d %s headers=%v", response.Code, response.Body.String(), response.Header())
+	}
+	var collections struct {
+		Analysis struct {
+			Candidates []struct {
+				MissingFields json.RawMessage `json:"missingFields"`
+			} `json:"candidates"`
+		} `json:"analysis"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &collections); err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range collections.Analysis.Candidates {
+		if len(candidate.MissingFields) == 0 || candidate.MissingFields[0] != '[' {
+			t.Fatalf("candidate missingFields is not an array: %s", candidate.MissingFields)
+		}
 	}
 	var result apicontract.InspectResponse
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {

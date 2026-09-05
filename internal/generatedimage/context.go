@@ -39,7 +39,7 @@ type buildLayout struct {
 }
 
 func prepareBuildContext(ctx context.Context, workspace, operationDirectory string, component componentDefinition, limits contextLimits) (buildLayout, error) {
-	if !validComponentRoot(component.rootDirectory) {
+	if !validComponentRoot(component.rootDirectory) || !validComponentRoot(component.installDirectory) {
 		return buildLayout{}, errInvalidBuildContext
 	}
 	if limits.bytes <= 0 {
@@ -65,6 +65,10 @@ func prepareBuildContext(ctx context.Context, workspace, operationDirectory stri
 	}
 	root := filepath.Join(layout.contextDirectory, "source", filepath.FromSlash(component.rootDirectory))
 	if info, err := os.Lstat(root); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || generatedImagePathIsReparsePoint(root) {
+		return buildLayout{}, errInvalidBuildContext
+	}
+	installRoot := filepath.Join(layout.contextDirectory, "source", filepath.FromSlash(component.installDirectory))
+	if info, err := os.Lstat(installRoot); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || generatedImagePathIsReparsePoint(installRoot) {
 		return buildLayout{}, errInvalidBuildContext
 	}
 	if err := writeBuildFile(layout.installCommand, []byte(component.installBehavior), 0o600); err != nil {

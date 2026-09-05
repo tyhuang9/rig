@@ -127,6 +127,21 @@ describe("DeploymentPlanReview", () => {
     await waitFor(() => expect(onAccept).toHaveBeenCalled());
   });
 
+  it("allows a Yarn lockfile with no declared version to be reviewed through an explicit install command", async () => {
+    const yarn = candidate({
+      status: "needs_input",
+      packageManager: { present: true, name: "yarn", version: "", lockfile: "yarn.lock", origin: "inferred", provenance: "lockfile", confidence: "high", evidence },
+      install: { present: false, command: "", phase: "", workingDirectory: ".", origin: "", provenance: "", confidence: "", evidence: [] },
+      missingFields: ["package_manager.version"],
+    });
+    const onAccept = renderReview([yarn]);
+    expect(screen.getByText(/Yarn does not declare its version/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /accept setup/i }).hasAttribute("disabled")).toBe(false);
+    fireEvent.change(screen.getByRole("textbox", { name: "Dependency installation (required)" }), { target: { value: "corepack prepare yarn@1.22.22 --activate && corepack yarn install --frozen-lockfile" } });
+    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+    await waitFor(() => expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ packageManager: "yarn", installBehavior: "corepack prepare yarn@1.22.22 --activate && corepack yarn install --frozen-lockfile" })));
+  });
+
   it("requires an explicit root choice when independent projects are found", () => {
     const api = candidate({ id: "candidate-api", rootDirectory: "apps/api", digest: "d".repeat(64), components: [{ ...candidate().components[0], id: "api-12345678", name: "api", rootDirectory: "apps/api", framework: "fastify" }] });
     renderReview([candidate({ rootDirectory: "apps/web" }), api]);

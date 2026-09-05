@@ -32,6 +32,7 @@ type builderDaemonFake struct {
 	containerRunStderr []byte
 	infoOverride       *dockerInfo
 	replaceOnLifecycle bool
+	duplicateBuilders  bool
 }
 
 func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -81,10 +82,16 @@ func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.Comman
 	case "buildx":
 		switch request.Args[1] {
 		case "ls":
+			if got := flagArgument(request.Args, "--format"); got != "json" {
+				return runtimeprocess.CommandResult{}, errors.New("unexpected Buildx builder-list format")
+			}
 			var lines []string
 			for _, builder := range d.builders {
 				body, _ := json.Marshal(builder)
 				lines = append(lines, string(body))
+				if d.duplicateBuilders {
+					lines = append(lines, string(body))
+				}
 			}
 			output := []byte(strings.Join(lines, "\n"))
 			d.outputs = append(d.outputs, output)
@@ -263,6 +270,39 @@ func TestBuilderManagerCreatesBootstrapsAndScopesTheBuilder(t *testing.T) {
 	}
 	if !daemon.outputWasCleared() {
 		t.Fatal("raw builder output was retained after preparation")
+	}
+}
+
+func TestBuilderManagerRefusesDuplicateBuilderRecords(t *testing.T) {
+	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+	manager := newBuilderManagerForTest(t, daemon)
+	identity, _, err := manager.preparePersistentState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon.network = &dockerNetwork{
+		Name: identity.NetworkName, Driver: "bridge", Scope: "local",
+		Labels: map[string]string{
+			"rig.controller": "generated-builder", "rig.builder": identity.BuilderName,
+			"rig.network": identity.NetworkName,
+		},
+		Options: map[string]string{"com.docker.network.bridge.enable_icc": "false"},
+	}
+	daemon.boxes = map[string]buildkitContainer{
+		buildkitContainerName(identity): validBuildkitContainer(identity, defaultStateQuotaBytes),
+	}
+	daemon.builders[identity.BuilderName] = buildxBuilder{
+		Name: identity.BuilderName, Driver: "remote",
+		Nodes: []buildxNode{{Name: identity.NodeName, Endpoint: buildkitRemoteEndpoint(identity)}},
+	}
+	daemon.duplicateBuilders = true
+
+	_, err = manager.Prepare(context.Background())
+	if !IsBuilderError(err, BuilderDriftDetected) {
+		t.Fatalf("duplicate builder records error = %v", err)
+	}
+	if got, want := commandKinds(daemon.requests()), []string{"info --format", "network inspect", "container inspect", "buildx ls"}; !sameStrings(got, want) {
+		t.Fatalf("commands after duplicate builder records = %#v, want read-only %#v", got, want)
 	}
 }
 

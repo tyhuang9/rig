@@ -27,8 +27,12 @@ type caddyHTTP struct {
 	Servers map[string]caddyServer `json:"servers"`
 }
 type caddyServer struct {
-	Listen []string     `json:"listen"`
-	Routes []caddyRoute `json:"routes"`
+	Listen         []string            `json:"listen"`
+	AutomaticHTTPS caddyAutomaticHTTPS `json:"automatic_https"`
+	Routes         []caddyRoute        `json:"routes"`
+}
+type caddyAutomaticHTTPS struct {
+	Disable bool `json:"disable"`
 }
 type caddyRoute struct {
 	Match  []caddyMatch  `json:"match"`
@@ -60,7 +64,7 @@ func buildCaddyConfig(routes map[string]routeRecord, listenAddress string) ([]by
 	}
 	sort.Strings(appIDs)
 	result := caddyConfig{Admin: caddyAdmin{Listen: "localhost:2019"}, Apps: caddyApps{HTTP: caddyHTTP{Servers: map[string]caddyServer{
-		"generated": {Listen: []string{listenAddress}, Routes: make([]caddyRoute, 0, len(routes)*2)},
+		"generated": {Listen: []string{listenAddress}, AutomaticHTTPS: caddyAutomaticHTTPS{Disable: true}, Routes: make([]caddyRoute, 0, len(routes)*2)},
 	}}}}
 	server := result.Apps.HTTP.Servers["generated"]
 	for _, appID := range appIDs {
@@ -91,7 +95,9 @@ func proxyRoute(host string, paths []string, endpoint generatedruntime.RouteEndp
 	return caddyRoute{
 		Match: []caddyMatch{{Host: []string{host}, Path: paths}},
 		Handle: []caddyHandle{{Handler: "reverse_proxy", Upstreams: []caddyUpstream{{
-			Dial: net.JoinHostPort(endpoint.NetworkAlias, strconv.FormatUint(uint64(endpoint.InternalPort), 10)),
+			// Aliases are scoped to an application's network, but Caddy joins many
+			// networks. Qualify DNS so identical component names cannot cross-route.
+			Dial: net.JoinHostPort(endpoint.NetworkAlias+"."+endpoint.NetworkName, strconv.FormatUint(uint64(endpoint.InternalPort), 10)),
 		}}}},
 	}
 }

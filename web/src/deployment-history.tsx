@@ -20,7 +20,8 @@ type RuntimeCapabilities = {
 type PauseDisposition =
   | "approval_required"
   | "migration_approval_required"
-  | "insufficient_replacement_capacity";
+  | "insufficient_replacement_capacity"
+  | "route_reconciliation_required";
 
 const runtimeStrategy = (value?: string): RuntimeStrategy | undefined =>
   value === "compose" || value === "generated_node" ? value : undefined;
@@ -42,6 +43,8 @@ const deploymentResult = (item: Deployment) => {
       return "Database migration approval is required.";
     case "insufficient_replacement_capacity":
       return "More temporary capacity is required for a safe replacement.";
+    case "route_reconciliation_required":
+      return "Route state must be reconciled before deployment can continue.";
     default:
       return item.failureSummary || item.diagnosticCode || "No failure recorded";
   }
@@ -156,7 +159,7 @@ function Section({
   empty: boolean;
   loadingLabel: string;
   emptyLabel: string;
-  retry: () => void;
+  retry: (activatedElement: HTMLButtonElement) => void;
   children: React.ReactNode;
 }) {
   const [showSkeleton, setShowSkeleton] = useState(false);
@@ -170,7 +173,7 @@ function Section({
   }, [loading]);
   if (loading)
     return (
-      <div className="deployment-loading" role="status" aria-live="polite">
+      <div className="deployment-loading">
         <span>{loadingLabel}</span>
         {showSkeleton && (
           <div className="deployment-skeletons" aria-hidden="true">
@@ -185,7 +188,7 @@ function Section({
       <div className="callout danger deployment-query-error" role="alert">
         <strong>Could not load this section.</strong>
         <span>{error.message}</span>
-        <button className="button small" type="button" onClick={retry}>
+        <button className="button small" type="button" onClick={(event) => retry(event.currentTarget)}>
           Retry
         </button>
       </div>
@@ -211,7 +214,7 @@ function DeploymentRow({
       finding.disposition === "rejected",
   );
   return (
-    <article className="deployment-row">
+    <article className="deployment-row" aria-label={`Deployment ${item.id.slice(0, 8)}, ${statusLabel(item.status)}`}>
       <div className="deployment-row-primary">
         <Status value={item.status} />
         <strong className="mono">{sha(release)}</strong>
@@ -277,7 +280,8 @@ function DeploymentRow({
 const pauseDisposition = (value?: string): PauseDisposition | undefined =>
   value === "approval_required" ||
   value === "migration_approval_required" ||
-  value === "insufficient_replacement_capacity"
+  value === "insufficient_replacement_capacity" ||
+  value === "route_reconciliation_required"
     ? value
     : undefined;
 const waiting = (job: Job, appId: string) =>
@@ -306,6 +310,41 @@ const transientDeploymentStatuses = new Set([
   "waiting_health",
 ]);
 
+function deploymentStatusUpdate(appId: string, deployments: Deployment[], jobs: Job[]) {
+  const currentDeployment = deployments[0];
+  const applicationJobs = jobs.filter(
+    (job) =>
+      job.type === "deploy" &&
+      job.resourceType === "application" &&
+      job.resourceId === appId,
+  );
+  const currentJob = applicationJobs.find((job) => job.id === currentDeployment?.jobId) ??
+    applicationJobs.find((job) => activeJobStatuses.has(job.status)) ??
+    applicationJobs[0];
+  const deploymentSignature = currentDeployment
+    ? `${currentDeployment.id}:${currentDeployment.status}:${currentDeployment.diagnosticCode ?? ""}`
+    : "none";
+  const jobSignature = currentJob
+    ? `${currentJob.id}:${currentJob.status}:${currentJob.pauseDisposition ?? ""}`
+    : "none";
+  const parts = [
+    currentDeployment
+      ? `Current deployment ${currentDeployment.id.slice(0, 8)} is ${statusLabel(currentDeployment.status)}.`
+      : "No current deployment is recorded.",
+  ];
+  if (currentJob) {
+    parts.push(`Deployment job ${currentJob.id.slice(0, 8)} is ${statusLabel(currentJob.status)}.`);
+    if (currentJob.pauseDisposition === "approval_required") parts.push("Runtime approval is required.");
+    if (currentJob.pauseDisposition === "migration_approval_required") parts.push("Database migration approval is required.");
+    if (currentJob.pauseDisposition === "insufficient_replacement_capacity") parts.push("Temporary replacement capacity is required.");
+    if (currentJob.pauseDisposition === "route_reconciliation_required") parts.push("Rig preserved both slots because the active route could not be verified. Retry once the local Docker and Caddy runtime is available.");
+  }
+  return {
+    signature: `${appId}:${deploymentSignature}:${jobSignature}`,
+    message: parts.join(" "),
+  };
+}
+
 export function DeploymentHistoryPanel({
   appId,
   composeRuntime,
@@ -318,18 +357,45 @@ export function DeploymentHistoryPanel({
   generatedRuntime: boolean;
 }) {
   const client = useQueryClient();
+  const panelHeadingRef = useRef<HTMLHeadingElement>(null);
+  const currentHeadingRef = useRef<HTMLHeadingElement>(null);
+  const releasesHeadingRef = useRef<HTMLHeadingElement>(null);
+  const approvalsHeadingRef = useRef<HTMLHeadingElement>(null);
+  const recentHeadingRef = useRef<HTMLHeadingElement>(null);
   const errorRef = useRef<HTMLDivElement>(null);
   const inFlight = useRef(new Set<string>());
   const currentAppId = useRef(appId);
   currentAppId.current = appId;
   const priorErrorRef = useRef<HTMLDivElement>(null);
   const revokeErrorRef = useRef<HTMLDivElement>(null);
+  const grantFocusOrigin = useRef<{ appId: string; element: HTMLButtonElement } | null>(null);
+  const resumeFocusOrigin = useRef<{ appId: string; element: HTMLButtonElement } | null>(null);
+  const lastStatusSignature = useRef("");
   const [prior, setPrior] = useState<Release | null>(null);
   const [mode, setMode] = useState<Mode>("current");
   const [revokeTarget, setRevokeTarget] = useState<RuntimeApproval | null>(
     null,
   );
   const [message, setMessage] = useState("");
+  const restoreFocusAfterRemoval = (
+    targetAppId: string,
+    activatedElement: HTMLElement | undefined,
+    fallback: React.RefObject<HTMLElement | null>,
+  ) => {
+    if (!activatedElement) return;
+    window.setTimeout(() => {
+      if (currentAppId.current === targetAppId && !activatedElement.isConnected) fallback.current?.focus();
+    }, 0);
+  };
+  const retrySection = async (
+    targetAppId: string,
+    activatedElement: HTMLButtonElement,
+    fallback: React.RefObject<HTMLElement | null>,
+    refetch: () => Promise<unknown>,
+  ) => {
+    await refetch();
+    restoreFocusAfterRemoval(targetAppId, activatedElement, fallback);
+  };
   const cachedJobs = client.getQueryData<{ items: Job[] }>(["jobs"]);
   const cachedDeployments = client.getQueryData<{ items: Deployment[] }>([
     "deployments",
@@ -421,9 +487,12 @@ export function DeploymentHistoryPanel({
         );
       }
       await invalidate(variables.appId);
+      const origin = grantFocusOrigin.current;
+      if (origin?.appId === variables.appId) restoreFocusAfterRemoval(variables.appId, origin.element, approvalsHeadingRef);
     },
     onSettled: (_, __, variables) => {
       inFlight.current.delete(`grant:${variables.appId}`);
+      if (grantFocusOrigin.current?.appId === variables.appId) grantFocusOrigin.current = null;
     },
   });
   const revoke = useMutation({
@@ -447,15 +516,21 @@ export function DeploymentHistoryPanel({
         setMessage(variables.successMessage);
       }
       await invalidate(variables.appId);
+      const origin = resumeFocusOrigin.current;
+      if (origin?.appId === variables.appId) restoreFocusAfterRemoval(variables.appId, origin.element, approvalsHeadingRef);
     },
     onSettled: (_, __, variables) => {
       inFlight.current.delete(`resume:${variables.appId}`);
+      if (resumeFocusOrigin.current?.appId === variables.appId) resumeFocusOrigin.current = null;
     },
   });
   useEffect(() => {
     setPrior(null);
     setRevokeTarget(null);
     setMessage("");
+    lastStatusSignature.current = "";
+    grantFocusOrigin.current = null;
+    resumeFocusOrigin.current = null;
     current.reset();
     priorDeploy.reset();
     grant.reset();
@@ -489,6 +564,14 @@ export function DeploymentHistoryPanel({
   const history = deployments.data?.items ?? [],
     releaseList = releases.data?.items ?? [],
     approvalList = approvals.data?.items ?? [];
+  const statusUpdate = deployments.isLoading || jobs.isLoading
+    ? { signature: `${appId}:loading`, message: "Loading deployment status." }
+    : deploymentStatusUpdate(appId, history, jobs.data?.items ?? []);
+  useEffect(() => {
+    if (lastStatusSignature.current === statusUpdate.signature) return;
+    lastStatusSignature.current = statusUpdate.signature;
+    setMessage(statusUpdate.message);
+  }, [statusUpdate.message, statusUpdate.signature]);
   const activeApprovalList = approvalList.filter(
     (approval) => !approval.revokedAt,
   );
@@ -557,7 +640,8 @@ export function DeploymentHistoryPanel({
           required.every((finding) => active.has(finding.fingerprint))
         : disposition === "migration_approval_required"
           ? migrationApproved
-          : disposition === "insufficient_replacement_capacity"),
+          : disposition === "insufficient_replacement_capacity" ||
+            disposition === "route_reconciliation_required"),
   );
   const hasPendingMutationForCurrentApp = () =>
     [...inFlight.current].some((key) => key.endsWith(`:${appId}`));
@@ -587,10 +671,11 @@ export function DeploymentHistoryPanel({
     inFlight.current.add(key);
     priorDeploy.mutate({ appId, release, mode });
   };
-  const grantApproval = (fingerprint: string) => {
+  const grantApproval = (fingerprint: string, activatedElement: HTMLButtonElement) => {
     const key = `grant:${appId}`;
     if (inFlight.current.has(key) || hasPendingMutationForCurrentApp()) return;
     inFlight.current.add(key);
+    grantFocusOrigin.current = { appId, element: activatedElement };
     grant.mutate({ appId, fingerprint });
   };
   const revokeApproval = (approvalId: string) => {
@@ -599,7 +684,7 @@ export function DeploymentHistoryPanel({
     inFlight.current.add(key);
     revoke.mutate({ appId, approvalId });
   };
-  const resumeWaitingJob = (jobId: string, successMessage: string) => {
+  const resumeWaitingJob = (jobId: string, successMessage: string, activatedElement: HTMLButtonElement) => {
     const key = `resume:${appId}`;
     if (
       inFlight.current.has(key) ||
@@ -608,6 +693,7 @@ export function DeploymentHistoryPanel({
     )
       return;
     inFlight.current.add(key);
+    resumeFocusOrigin.current = { appId, element: activatedElement };
     resume.mutate({ appId, jobId, successMessage });
   };
   const currentPending =
@@ -652,7 +738,7 @@ export function DeploymentHistoryPanel({
     >
       <div className="deployment-heading">
         <div>
-          <h2 id="deployment-history-title">Deployment history</h2>
+          <h2 id="deployment-history-title" ref={panelHeadingRef} tabIndex={-1}>Deployment history</h2>
           <p>
             Release provenance, policy decisions, and recoverable deployment
             work.
@@ -681,7 +767,7 @@ export function DeploymentHistoryPanel({
           <button
             className="button small"
             type="button"
-            onClick={() => deploymentPlan.refetch()}
+            onClick={(event) => void retrySection(appId, event.currentTarget, panelHeadingRef, deploymentPlan.refetch)}
           >
             Retry runtime check
           </button>
@@ -691,16 +777,14 @@ export function DeploymentHistoryPanel({
           {latestUnavailableMessage}
         </p>
       ) : null}
-      {message && (
-        <p
-          className="deployment-message"
-          role="status"
-          aria-live="polite"
-          aria-atomic="true"
-        >
-          {message}
-        </p>
-      )}
+      <p
+        className="deployment-message"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        {message}
+      </p>
       {errors.length > 0 && (
         <div
           ref={errorRef}
@@ -713,7 +797,7 @@ export function DeploymentHistoryPanel({
       )}
       <div className="deployment-section">
         <div className="deployment-section-heading">
-          <h3>Current deployment</h3>
+          <h3 ref={currentHeadingRef} tabIndex={-1}>Current deployment</h3>
           <span>
             {history[0] ? (
               <Status value={history[0].status} />
@@ -728,14 +812,14 @@ export function DeploymentHistoryPanel({
           empty={!history.length}
           loadingLabel="Loading current deployment..."
           emptyLabel="No deployment has been recorded yet."
-          retry={() => deployments.refetch()}
+          retry={(activatedElement) => void retrySection(appId, activatedElement, currentHeadingRef, deployments.refetch)}
         >
           <DeploymentRow item={history[0]!} releases={releaseList} />
         </Section>
       </div>
       <div className="deployment-section">
         <div className="deployment-section-heading">
-          <h3>Release history</h3>
+          <h3 ref={releasesHeadingRef} tabIndex={-1}>Release history</h3>
           <span>{releaseList.length} recorded</span>
         </div>
         <Section
@@ -744,7 +828,7 @@ export function DeploymentHistoryPanel({
           empty={!releaseList.length}
           loadingLabel="Loading release history..."
           emptyLabel="No releases are available yet."
-          retry={() => releases.refetch()}
+          retry={(activatedElement) => void retrySection(appId, activatedElement, releasesHeadingRef, releases.refetch)}
         >
           {releaseList.map((release) => {
             const ready = release.workspaceState === "ready";
@@ -763,7 +847,7 @@ export function DeploymentHistoryPanel({
                   ? "This release requires the generated runtime."
                   : "This release requires the Compose runtime.";
             return (
-              <article className="release-row" key={release.id}>
+              <article className="release-row" key={release.id} aria-label={`Release ${sha(release)}, revision ${release.configurationRevisionNumber}`}>
                 <div>
                   <strong className="mono">{sha(release)}</strong>
                   <span>
@@ -813,7 +897,7 @@ export function DeploymentHistoryPanel({
       </div>
       <div className="deployment-section">
         <div className="deployment-section-heading">
-          <h3>Runtime approvals</h3>
+          <h3 ref={approvalsHeadingRef} tabIndex={-1}>Runtime approvals</h3>
           <span>{activeApprovalList.length} active</span>
         </div>
         <Section
@@ -828,10 +912,10 @@ export function DeploymentHistoryPanel({
           }
           loadingLabel="Loading runtime approvals..."
           emptyLabel="No runtime approvals or waiting policy findings."
-          retry={() => approvals.refetch()}
+          retry={(activatedElement) => void retrySection(appId, activatedElement, approvalsHeadingRef, approvals.refetch)}
         >
           {required.map((finding) => (
-            <article className="approval-row" key={finding.fingerprint}>
+            <article className="approval-row" key={finding.fingerprint} aria-label={`Runtime approval required for ${finding.capability}, ${finding.scope}`}>
               <div>
                 <strong>{finding.capability}</strong>
                 <Fingerprint value={finding.fingerprint} />
@@ -844,7 +928,7 @@ export function DeploymentHistoryPanel({
                   type="button"
                   className="button small"
                   disabled={panelMutationPending || jobs.isLoading}
-                  onClick={() => grantApproval(finding.fingerprint)}
+                  onClick={(event) => grantApproval(finding.fingerprint, event.currentTarget)}
                 >
                   {grantPending &&
                   grant.variables?.fingerprint === finding.fingerprint
@@ -865,6 +949,7 @@ export function DeploymentHistoryPanel({
               <article
                 className="approval-row active-approval"
                 key={approval.id}
+                aria-label={`Active runtime approval for ${approval.capability}`}
               >
                 <div>
                   <strong>{approval.capability}</strong>
@@ -887,22 +972,10 @@ export function DeploymentHistoryPanel({
             empty={!job}
             loadingLabel="Checking waiting deployment jobs..."
             emptyLabel="No waiting deployment requires action."
-            retry={() => jobs.refetch()}
+            retry={(activatedElement) => void retrySection(appId, activatedElement, approvalsHeadingRef, jobs.refetch)}
           >
             {job && disposition && (
               <>
-                <span
-                  className="sr-only"
-                  role="status"
-                  aria-live="polite"
-                  aria-atomic="true"
-                >
-                  {disposition === "approval_required"
-                    ? "Deployment is waiting for runtime approval."
-                    : disposition === "migration_approval_required"
-                      ? "Deployment is waiting for database migration approval."
-                      : "Deployment is waiting for temporary replacement capacity."}
-                </span>
                 <div className="callout warning">
                 <Status value={job.status} />
                   {disposition === "approval_required" && (
@@ -918,10 +991,11 @@ export function DeploymentHistoryPanel({
                           type="button"
                           className="button small"
                           disabled={panelMutationPending}
-                          onClick={() =>
+                          onClick={(event) =>
                             resumeWaitingJob(
                               job.id,
                               "Waiting deployment resumed.",
+                              event.currentTarget,
                             )
                           }
                         >
@@ -946,10 +1020,11 @@ export function DeploymentHistoryPanel({
                           type="button"
                           className="button small"
                           disabled={panelMutationPending}
-                          onClick={() =>
+                          onClick={(event) =>
                             resumeWaitingJob(
                               job.id,
                               "Deployment resumed after migration approval.",
+                              event.currentTarget,
                             )
                           }
                         >
@@ -974,16 +1049,46 @@ export function DeploymentHistoryPanel({
                           type="button"
                           className="button small"
                           disabled={panelMutationPending}
-                          onClick={() =>
+                          onClick={(event) =>
                             resumeWaitingJob(
                               job.id,
                               "Replacement capacity retry queued.",
+                              event.currentTarget,
                             )
                           }
                         >
                           {resumePending
                             ? "Retrying replacement capacity..."
                             : "Retry replacement capacity"}
+                        </button>
+                      )}
+                    </>
+                  )}
+                  {disposition === "route_reconciliation_required" && (
+                    <>
+                      <strong>Deployment route state needs reconciliation.</strong>
+                      <span>
+                        Rig could not prove whether the old or new slot is serving, so it preserved both. Confirm the local Docker runtime and Caddy are available, then retry; Rig will attest the candidate and reconcile the route before changing the active slot.
+                      </span>
+                      {!resumeRuntimeAvailable && (
+                        <span>The generated runtime pinned to this deployment is not available on this controller.</span>
+                      )}
+                      {canResume && (
+                        <button
+                          type="button"
+                          className="button small"
+                          disabled={panelMutationPending}
+                          onClick={(event) =>
+                            resumeWaitingJob(
+                              job.id,
+                              "Route reconciliation retry queued.",
+                              event.currentTarget,
+                            )
+                          }
+                        >
+                          {resumePending
+                            ? "Retrying route reconciliation..."
+                            : "Retry route reconciliation"}
                         </button>
                       )}
                     </>
@@ -996,7 +1101,7 @@ export function DeploymentHistoryPanel({
       </div>
       <div className="deployment-section">
         <div className="deployment-section-heading">
-          <h3>Recent deployments</h3>
+          <h3 ref={recentHeadingRef} tabIndex={-1}>Recent deployments</h3>
           <span>{history.length} recorded</span>
         </div>
         <Section
@@ -1005,7 +1110,7 @@ export function DeploymentHistoryPanel({
           empty={!history.length}
           loadingLabel="Loading deployment history..."
           emptyLabel="No deployments have been recorded yet."
-          retry={() => deployments.refetch()}
+          retry={(activatedElement) => void retrySection(appId, activatedElement, recentHeadingRef, deployments.refetch)}
         >
           <div className="deployment-list">
             {history.map((item) => (

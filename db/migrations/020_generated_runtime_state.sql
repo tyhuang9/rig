@@ -156,16 +156,15 @@ WHEN NOT EXISTS (
       AND d.deployment_plan_revision_id=NEW.deployment_plan_revision_id
       AND d.deployment_plan_revision_number=NEW.deployment_plan_revision_number
       AND p.strategy='generated_node'
-) OR (
-    (NEW.migration_state='not_required' AND EXISTS (
-        SELECT 1 FROM deployment_plan_revisions p
-        WHERE p.id=NEW.deployment_plan_revision_id AND p.app_id=NEW.app_id AND p.migration_evidence_digest<>''
-    ))
-    OR (NEW.migration_state='pending' AND NOT EXISTS (
-        SELECT 1 FROM deployment_plan_revisions p
-        JOIN deployment_plan_migration_approvals a ON a.revision_id=p.id AND a.app_id=p.app_id
-        WHERE p.id=NEW.deployment_plan_revision_id AND p.app_id=NEW.app_id AND p.migration_evidence_digest<>''
-    ))
+) OR NEW.phase<>'preflight'
+  OR NEW.migration_state NOT IN ('not_required','pending')
+  OR NOT EXISTS (
+    SELECT 1 FROM deployment_plan_revisions p
+    LEFT JOIN deployment_plan_migration_approvals a ON a.revision_id=p.id AND a.app_id=p.app_id
+    WHERE p.id=NEW.deployment_plan_revision_id AND p.app_id=NEW.app_id AND (
+        (NEW.migration_state='not_required' AND p.migration_evidence_digest='' AND a.revision_id IS NULL)
+        OR (NEW.migration_state='pending' AND p.migration_evidence_digest<>'' AND a.revision_id IS NOT NULL)
+    )
 ) OR NOT EXISTS (
     SELECT 1 FROM generated_runtime_active_heads h
     WHERE h.app_id=NEW.app_id AND (

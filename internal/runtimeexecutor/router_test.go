@@ -115,6 +115,63 @@ func TestRouterDoesNotFallBackWhenPinnedGeneratedRuntimeIsUnavailable(t *testing
 	}
 }
 
+func TestRouterDistinguishesRepositoryAndStrategyValidationFailures(t *testing.T) {
+	storageErr := errors.New("repository unavailable")
+	tests := []struct {
+		name      string
+		releaseID string
+		plans     routerPlans
+		releases  routerReleases
+		wantCode  string
+	}{
+		{name: "head repository error", plans: routerPlans{err: storageErr}, wantCode: "internal_error"},
+		{name: "release repository error", releaseID: routerReleaseID, releases: routerReleases{err: storageErr}, wantCode: "internal_error"},
+		{
+			name:      "revision repository error",
+			releaseID: routerReleaseID,
+			releases:  routerReleases{release: releasesnapshot.Release{ID: routerReleaseID, AppID: routerAppID, DeploymentPlanRevisionID: routerPlanID, DeploymentPlanRevisionNumber: 1}},
+			plans:     routerPlans{err: storageErr},
+			wantCode:  "internal_error",
+		},
+		{
+			name:      "malformed release provenance",
+			releaseID: routerReleaseID,
+			releases:  routerReleases{release: releasesnapshot.Release{ID: "different", AppID: routerAppID}},
+			wantCode:  "invalid_source",
+		},
+		{
+			name:      "mismatched plan provenance",
+			releaseID: routerReleaseID,
+			releases:  routerReleases{release: releasesnapshot.Release{ID: routerReleaseID, AppID: routerAppID, DeploymentPlanRevisionID: routerPlanID, DeploymentPlanRevisionNumber: 1}},
+			plans:     routerPlans{revision: deploymentplans.DeploymentPlanRevision{ID: routerPlanID, AppID: routerActorID, RevisionNumber: 1, Plan: deploymentplans.Plan{Strategy: deploymentplans.StrategyGeneratedNode}}},
+			wantCode:  "invalid_source",
+		},
+		{
+			name:     "unsupported strategy",
+			plans:    routerPlans{head: deploymentplans.DeploymentPlanRevision{ID: routerPlanID, AppID: routerAppID, RevisionNumber: 1, Plan: deploymentplans.Plan{Strategy: "unsupported"}}},
+			wantCode: "invalid_source",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			compose, generated := &recordingExecutor{}, &recordingExecutor{}
+			router, err := New(routerDeployments{}, test.plans, test.releases, compose, generated)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = router.Execute(context.Background(), routerJob(test.releaseID), noopReporter{})
+			var executionErr *jobs.ExecutionError
+			if !errors.As(err, &executionErr) || executionErr.Code != test.wantCode {
+				t.Fatalf("error=%v want code=%q", err, test.wantCode)
+			}
+			if compose.calls != 0 || generated.calls != 0 {
+				t.Fatalf("executors called after routing failure: compose=%d generated=%d", compose.calls, generated.calls)
+			}
+		})
+	}
+}
+
 func generatedPlan() deploymentplans.DeploymentPlanRevision {
 	return deploymentplans.DeploymentPlanRevision{ID: routerPlanID, AppID: routerAppID, RevisionNumber: 1, Plan: deploymentplans.Plan{Strategy: deploymentplans.StrategyGeneratedNode}}
 }

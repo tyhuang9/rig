@@ -153,6 +153,7 @@ func TestWorkerPersistsOnlyStablePauseStates(t *testing.T) {
 		{PauseApprovalRequired, "Deployment requires approval"},
 		{PauseMigrationApprovalRequired, "Deployment migration requires approval"},
 		{PauseInsufficientReplacementCapacity, "Deployment is waiting for replacement capacity"},
+		{PauseRouteReconciliationRequired, "Deployment route state requires reconciliation"},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.disposition, func(t *testing.T) {
@@ -218,6 +219,32 @@ func TestCapacityPauseCanBeRetriedWithoutApproval(t *testing.T) {
 	}
 	resumed, err := service.Resume(job.ID)
 	if err != nil || resumed.Status != string(Queued) || resumed.Phase != "queued" || resumed.PauseDisposition != "" || resumed.Checkpoint != "{}" {
+		t.Fatalf("resumed = %#v, %v", resumed, err)
+	}
+}
+
+func TestRouteReconciliationPauseCanBeResumedButNotCancelled(t *testing.T) {
+	service, closeDB := newTestService(t)
+	defer closeDB()
+	job, _, err := service.Create("deploy", "application", "route-reconciliation", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := service.claimNext(context.Background()); err != nil || !ok {
+		t.Fatalf("claim = %t, %v", ok, err)
+	}
+	if err := service.pause(job.ID, PauseRouteReconciliationRequired); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Cancel(job.ID); !errors.Is(err, ErrCancellationUnsafe) {
+		t.Fatalf("cancel route reconciliation pause = %v", err)
+	}
+	paused, err := service.Get(job.ID)
+	if err != nil || paused.Status != string(WaitingUser) || paused.PauseDisposition != PauseRouteReconciliationRequired {
+		t.Fatalf("paused job changed = %#v, %v", paused, err)
+	}
+	resumed, err := service.Resume(job.ID)
+	if err != nil || resumed.Status != string(Queued) || resumed.PauseDisposition != "" {
 		t.Fatalf("resumed = %#v, %v", resumed, err)
 	}
 }
@@ -387,7 +414,7 @@ func TestResumeWaitsForConcurrentApprovalRevocationAndFailsClosed(t *testing.T) 
 }
 
 func TestRecoveryPreservesIntentionalUserPause(t *testing.T) {
-	for _, disposition := range []string{PauseApprovalRequired, PauseMigrationApprovalRequired, PauseInsufficientReplacementCapacity} {
+	for _, disposition := range []string{PauseApprovalRequired, PauseMigrationApprovalRequired, PauseInsufficientReplacementCapacity, PauseRouteReconciliationRequired} {
 		t.Run(disposition, func(t *testing.T) {
 			service, closeDB := newTestService(t)
 			defer closeDB()

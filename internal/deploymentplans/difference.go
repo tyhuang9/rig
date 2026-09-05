@@ -24,7 +24,7 @@ func CompareAnalysis(plan Plan, analysis projectanalysis.SourceAnalysis) ([]Plan
 	if plan.Strategy != StrategyGeneratedNode {
 		return nil, errors.New("analysis comparison requires a generated plan")
 	}
-	if _, err := CanonicalDigest(plan); err != nil {
+	if _, err := canonicalPlanForAnalysisComparison(plan); err != nil {
 		return nil, err
 	}
 
@@ -51,6 +51,7 @@ func CompareAnalysis(plan Plan, analysis projectanalysis.SourceAnalysis) ([]Plan
 		compareInferred(differences, provenance, prefix+"rootDirectory", accepted.RootDirectory, normalizedRoot(inferred.RootDirectory))
 		compareInferred(differences, provenance, prefix+"packageManager", accepted.PackageManager, candidate.PackageManager.Name)
 		compareInferred(differences, provenance, prefix+"installBehavior", accepted.InstallBehavior, commandValue(candidate.Install))
+		compareInferred(differences, provenance, prefix+"installDirectory", accepted.InstallDirectory, normalizedInstallDirectory(candidate))
 		compareInferred(differences, provenance, prefix+"nodeVersion", accepted.NodeVersion, candidate.NodeVersion.Value)
 		compareOptionalBuild(differences, provenance, prefix+"buildCommand", accepted.BuildCommand, commandValue(inferred.Build))
 		compareInferred(differences, provenance, prefix+"runCommand", accepted.RunCommand, commandValue(inferred.Run))
@@ -65,7 +66,7 @@ func CompareAnalysis(plan Plan, analysis projectanalysis.SourceAnalysis) ([]Plan
 func recordMissingFields(differences map[string]struct{}, provenance map[string]Provenance, components []Component, missing []string) {
 	for _, field := range missing {
 		switch field {
-		case projectanalysis.FieldPackageManager:
+		case projectanalysis.FieldPackageManager, "package_manager.version":
 			for _, component := range components {
 				addMissingInferred(differences, provenance, "components."+component.Name+".packageManager")
 			}
@@ -219,6 +220,14 @@ func commandValue(value *projectanalysis.Command) string {
 		return ""
 	}
 	return value.Command
+}
+
+func normalizedInstallDirectory(candidate projectanalysis.DeploymentPlanCandidate) string {
+	directory := candidate.RootDirectory
+	if candidate.Install != nil {
+		directory = candidate.Install.WorkingDirectory
+	}
+	return normalizedRoot(directory)
 }
 
 func inferredValue(value *projectanalysis.InferredValue) string {

@@ -23,13 +23,20 @@ const (
 	caddyContainerName = "rig-generated-caddy-v1"
 	caddyVolumeName    = "rig-generated-caddy-config-v1"
 	caddyNetworkName   = "rig-generated-caddy-ingress-v1"
-	caddyImage         = "caddy@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
-	caddyImageDigest   = "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
-	defaultHostPort    = uint16(8080)
-	defaultOutputLimit = 64 << 10
-	defaultTimeout     = 30 * time.Second
-	defaultPullTimeout = 5 * time.Minute
-	maximumDrain       = 30 * time.Second
+	caddyExecutable    = "/usr/bin/caddy"
+	// The pinned upstream binary has a file-effective capability. Linux refuses
+	// exec when that capability is absent from the bounding set, even on :8080.
+	caddyCapability = "NET_BIND_SERVICE"
+	// Published ports follow Docker's selected gateway endpoint. Keep ingress
+	// preferred when lexically earlier application networks are attached.
+	caddyGatewayPriority = 1
+	caddyImage           = "caddy@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
+	caddyImageDigest     = "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
+	defaultHostPort      = uint16(8080)
+	defaultOutputLimit   = 64 << 10
+	defaultTimeout       = 30 * time.Second
+	defaultPullTimeout   = 5 * time.Minute
+	maximumDrain         = 30 * time.Second
 )
 
 type Options struct {
@@ -111,7 +118,22 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 	committedRoutes := cloneRoutes(state.Active)
 	proposed := routeRecord{Slot: request.ToSlot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), request.Endpoints...)}
 	if hadPrevious && sameRoute(previous, proposed) {
-		return m.ensureCaddy(ctx, state.Active)
+		if err := m.verifyEndpoints(ctx, request.AppID, proposed); err != nil {
+			return markCandidateMayBeLive(err)
+		}
+		if err := m.ensureCaddy(ctx, state.Active); err != nil {
+			return markCandidateMayBeLive(err)
+		}
+		if err := m.reconcileCaddyNetworks(ctx, state.Active); err != nil {
+			return markCandidateMayBeLive(err)
+		}
+		if err := m.applyRoutes(ctx, state.Active, "reconcile.json"); err != nil {
+			return markCandidateMayBeLive(err)
+		}
+		if err := m.installRestartConfig(context.WithoutCancel(ctx)); err != nil {
+			return markCandidateMayBeLive(err)
+		}
+		return nil
 	}
 	if request.FromSlot == "" {
 		if hadPrevious {
@@ -152,7 +174,8 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 		return m.rollbackAfterFailure(&Error{Code: DiagnosticRouteStateFailed}, &rollback)
 	}
 	if err := m.installRestartConfig(context.WithoutCancel(ctx)); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		rollback := routeState{Version: stateVersion, Active: committedRoutes}
+		return m.rollbackAfterFailure(&Error{Code: DiagnosticRouteUnresolved}, &rollback)
 	}
 	return nil
 }
@@ -203,17 +226,20 @@ func (m *Manager) rollbackPending(ctx context.Context, state *routeState) error 
 	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.options.CommandTimeout*3)
 	defer cancel()
 	if err := m.ensureCaddy(rollbackCtx, state.Active); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
 	}
 	if err := m.reconcileCaddyNetworks(rollbackCtx, state.Active); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
 	}
 	if err := m.applyRoutes(rollbackCtx, state.Active, "rollback.json"); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
+	}
+	if err := m.installRestartConfig(rollbackCtx); err != nil {
+		return candidateMayBeLiveError()
 	}
 	state.Pending = nil
 	if err := m.store.save(*state); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
 	}
 	return nil
 }
@@ -222,14 +248,17 @@ func (m *Manager) rollbackAfterFailure(original error, state *routeState) error 
 	rollbackCtx, cancel := context.WithTimeout(context.Background(), m.options.CommandTimeout*3)
 	defer cancel()
 	if err := m.reconcileCaddyNetworks(rollbackCtx, state.Active); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
 	}
 	if err := m.applyRoutes(rollbackCtx, state.Active, "rollback.json"); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
+	}
+	if err := m.installRestartConfig(rollbackCtx); err != nil {
+		return candidateMayBeLiveError()
 	}
 	state.Pending = nil
 	if err := m.store.save(*state); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
+		return candidateMayBeLiveError()
 	}
 	return original
 }
@@ -262,6 +291,9 @@ func (m *Manager) ensureCaddy(ctx context.Context, routes map[string]routeRecord
 	if !validCaddyInspection(inspection, imageID, m.options.HostPort) {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
+	if inspection.Restarting {
+		return &Error{Code: DiagnosticIngressUnavailable}
+	}
 	if !inspection.Running {
 		if err := m.disconnectApplicationNetworks(ctx, inspection); err != nil {
 			return err
@@ -274,7 +306,7 @@ func (m *Manager) ensureCaddy(ctx context.Context, routes map[string]routeRecord
 		reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.options.CommandTimeout)
 		inspection, found, err = m.inspectCaddy(reconcileCtx)
 		cancel()
-		if err != nil || !found || !inspection.Running || !validCaddyInspection(inspection, imageID, m.options.HostPort) {
+		if err != nil || !found || !inspection.Running || inspection.Restarting || !validCaddyInspection(inspection, imageID, m.options.HostPort) {
 			if startErr != nil {
 				return startErr
 			}
@@ -374,10 +406,10 @@ func (m *Manager) createCaddy(ctx context.Context, imageID, ingressIP string) er
 	if net.ParseIP(ingressIP) == nil {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
-	args := []string{"container", "create", "--name", caddyContainerName, "--hostname", caddyContainerName, "--network", caddyNetworkName,
+	args := []string{"container", "create", "--name", caddyContainerName, "--hostname", caddyContainerName, "--network", "name=" + caddyNetworkName + ",gw-priority=1",
 		"--ip", ingressIP,
-		"--mount", "type=volume,src=" + caddyVolumeName + ",dst=/config", "--user", "1000:1000", "--read-only",
-		"--tmpfs", "/data:rw,noexec,nosuid,nodev,size=67108864", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+		"--mount", "type=volume,src=" + caddyVolumeName + ",dst=/config", "--user", "1000:1000", "--entrypoint", caddyExecutable, "--read-only",
+		"--tmpfs", "/data:rw,noexec,nosuid,nodev,size=67108864", "--cap-drop", "ALL", "--cap-add", caddyCapability, "--security-opt", "no-new-privileges",
 		"--memory", "268435456", "--memory-swap", "268435456", "--cpus", "1.000", "--pids-limit", "128", "--ulimit", "nofile=1024:1024",
 		"--publish", "127.0.0.1:" + strconv.FormatUint(uint64(m.options.HostPort), 10) + ":8080/tcp", "--restart", "unless-stopped",
 		"--log-driver", "local", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
@@ -403,7 +435,7 @@ func (m *Manager) createCaddy(ctx context.Context, imageID, ingressIP string) er
 	}
 	startErr := m.runDiscard(reconcileCtx, m.options.CommandTimeout, "container", "start", caddyContainerName)
 	started, startedFound, inspectStartedErr := m.inspectCaddy(reconcileCtx)
-	if inspectStartedErr != nil || !startedFound || !started.Running || !validCaddyInspection(started, imageID, m.options.HostPort) {
+	if inspectStartedErr != nil || !startedFound || !started.Running || started.Restarting || !validCaddyInspection(started, imageID, m.options.HostPort) {
 		if startErr != nil {
 			return startErr
 		}
@@ -483,16 +515,20 @@ func (m *Manager) copyConfig(ctx context.Context, contents []byte, filename stri
 
 func (m *Manager) caddyListenAddress(ctx context.Context) (string, error) {
 	inspection, found, err := m.inspectCaddy(ctx)
-	if err != nil || !found || !inspection.Running {
+	if err != nil || !found || !inspection.Running || inspection.Restarting {
 		return "", &Error{Code: DiagnosticIngressUnavailable}
 	}
-	attachment := inspection.Networks[caddyNetworkName]
-	network, networkFound, networkErr := m.inspectNetwork(ctx, caddyNetworkName)
-	expectedIP, networkValid := ingressNetworkIdentity(network)
-	if attachment == nil || !networkFound || networkErr != nil || !networkValid || attachment.IPAddress != expectedIP {
+	if !validCaddyGatewayPriorities(inspection.Networks) {
 		return "", &Error{Code: DiagnosticIngressDrift}
 	}
-	return net.JoinHostPort(attachment.IPAddress, "8080"), nil
+	attachment := inspection.Networks[caddyNetworkName]
+	network, networkFound, networkErr := m.inspectCaddyNetwork(ctx)
+	defer clearCaddyNetworkInspection(&network)
+	listenAddress, networkValid := caddyIngressAddress(network, inspection.ID)
+	if attachment == nil || !networkFound || networkErr != nil || !networkValid {
+		return "", &Error{Code: DiagnosticIngressDrift}
+	}
+	return net.JoinHostPort(listenAddress, "8080"), nil
 }
 
 func (m *Manager) reconcileCaddyNetworks(ctx context.Context, routes map[string]routeRecord) error {
@@ -545,7 +581,7 @@ func (m *Manager) reconcileCaddyNetworks(ctx context.Context, routes map[string]
 		}
 	}
 	final, found, err := m.inspectCaddy(ctx)
-	if err != nil || !found || normalizeID(final.ID) != expectedID || len(final.Networks) != len(desired) {
+	if err != nil || !found || normalizeID(final.ID) != expectedID || len(final.Networks) != len(desired) || !validCaddyGatewayPriorities(final.Networks) {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
 	for network := range desired {
@@ -554,9 +590,10 @@ func (m *Manager) reconcileCaddyNetworks(ctx context.Context, routes map[string]
 			return &Error{Code: DiagnosticIngressDrift}
 		}
 		if network == caddyNetworkName {
-			ingress, ok, inspectErr := m.inspectNetwork(ctx, caddyNetworkName)
-			expectedIP, valid := ingressNetworkIdentity(ingress)
-			if inspectErr != nil || !ok || !valid || attachment.IPAddress != expectedIP {
+			ingress, ok, inspectErr := m.inspectCaddyNetwork(ctx)
+			_, valid := caddyIngressAddress(ingress, final.ID)
+			clearCaddyNetworkInspection(&ingress)
+			if inspectErr != nil || !ok || !valid {
 				return &Error{Code: DiagnosticIngressDrift}
 			}
 		}
@@ -619,6 +656,33 @@ func ingressNetworkIdentity(value networkInspection) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func caddyIngressAddress(network caddyNetworkInspection, caddyID string) (string, bool) {
+	expectedIP, valid := ingressNetworkIdentity(network.identity())
+	if !valid || !validContainerID(caddyID) || len(network.Containers) != 1 {
+		return "", false
+	}
+	var containerID string
+	var container caddyNetworkContainerInspection
+	for containerID, container = range network.Containers {
+	}
+	if normalizeID(containerID) != normalizeID(caddyID) || container.Name != caddyContainerName {
+		return "", false
+	}
+	addressPrefix, err := netip.ParsePrefix(container.IPv4Address)
+	if err != nil || !addressPrefix.Addr().Is4() {
+		return "", false
+	}
+	networkPrefix, err := netip.ParsePrefix(network.IPAM.Config[0].Subnet)
+	if err != nil || addressPrefix.Bits() != networkPrefix.Bits() || addressPrefix.Masked() != networkPrefix.Masked() {
+		return "", false
+	}
+	expectedAddress, err := netip.ParseAddr(expectedIP)
+	if err != nil || addressPrefix.Addr() != expectedAddress {
+		return "", false
+	}
+	return expectedIP, true
 }
 
 func ingressNetworkCandidate(index int) (subnet, gateway, address string) {
@@ -701,6 +765,7 @@ type caddyInspection struct {
 	Hostname     string                         `json:"hostname"`
 	User         string                         `json:"user"`
 	Env          []string                       `json:"env"`
+	Entrypoint   []string                       `json:"entrypoint"`
 	Cmd          []string                       `json:"cmd"`
 	ReadOnly     bool                           `json:"readOnly"`
 	Privileged   bool                           `json:"privileged"`
@@ -720,6 +785,7 @@ type caddyInspection struct {
 	NetworkMode  string                         `json:"networkMode"`
 	Ulimits      []ulimitInspection             `json:"ulimits"`
 	Running      bool                           `json:"running"`
+	Restarting   bool                           `json:"restarting"`
 	PortBindings map[string][]map[string]string `json:"portBindings"`
 	Networks     map[string]*networkAttachment  `json:"networks"`
 }
@@ -741,6 +807,30 @@ type networkInspection struct {
 	Labels   map[string]string `json:"labels"`
 }
 
+type caddyNetworkInspection struct {
+	Name       string                                     `json:"Name"`
+	Driver     string                                     `json:"Driver"`
+	Scope      string                                     `json:"Scope"`
+	Internal   bool                                       `json:"Internal"`
+	Options    map[string]string                          `json:"Options"`
+	IPAM       caddyNetworkIPAM                           `json:"IPAM"`
+	Labels     map[string]string                          `json:"Labels"`
+	Containers map[string]caddyNetworkContainerInspection `json:"Containers"`
+}
+
+func (value caddyNetworkInspection) identity() networkInspection {
+	return networkInspection{Name: value.Name, Driver: value.Driver, Scope: value.Scope, Internal: value.Internal, Options: value.Options, IPAM: value.IPAM.Config, Labels: value.Labels}
+}
+
+type caddyNetworkIPAM struct {
+	Config []networkIPAM `json:"Config"`
+}
+
+type caddyNetworkContainerInspection struct {
+	Name        string `json:"Name"`
+	IPv4Address string `json:"IPv4Address"`
+}
+
 type networkIPAM struct {
 	Subnet  string `json:"Subnet"`
 	Gateway string `json:"Gateway"`
@@ -755,8 +845,10 @@ type endpointInspection struct {
 }
 
 type networkAttachment struct {
-	Aliases   []string `json:"Aliases"`
-	IPAddress string   `json:"IPAddress"`
+	Aliases     []string `json:"Aliases"`
+	IPAddress   string   `json:"IPAddress"`
+	GwPriority  int      `json:"GwPriority"`
+	IPv6Gateway string   `json:"IPv6Gateway"`
 }
 
 type ulimitInspection struct {
@@ -766,11 +858,11 @@ type ulimitInspection struct {
 }
 
 const (
-	imageInspectFormat    = `{"id":{{json .Id}},"os":{{json .Os}},"repoDigests":{{json .RepoDigests}}}`
+	imageInspectFormat    = `{"id":{{json .ID}},"os":{{json .Os}},"repoDigests":{{json .RepoDigests}}}`
 	volumeInspectFormat   = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"options":{{json .Options}},"labels":{{json .Labels}}}`
-	caddyInspectFormat    = `{"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"hostname":{{json .Config.Hostname}},"user":{{json .Config.User}},"env":{{json .Config.Env}},"cmd":{{json .Config.Cmd}},"readOnly":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"tmpfs":{{json .HostConfig.Tmpfs}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCpus}},"pidsLimit":{{json .HostConfig.PidsLimit}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"networkMode":{{json .HostConfig.NetworkMode}},"ulimits":{{json .HostConfig.Ulimits}},"running":{{json .State.Running}},"portBindings":{{json .HostConfig.PortBindings}},"networks":{{json .NetworkSettings.Networks}}}`
+	caddyInspectFormat    = `{"id":{{json .ID}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"hostname":{{json .Config.Hostname}},"user":{{json .Config.User}},"env":{{json .Config.Env}},"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"readOnly":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"tmpfs":{{json .HostConfig.Tmpfs}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCPUs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"networkMode":{{json .HostConfig.NetworkMode}},"ulimits":{{json .HostConfig.Ulimits}},"running":{{json .State.Running}},"restarting":{{json .State.Restarting}},"portBindings":{{json .HostConfig.PortBindings}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
 	networkInspectFormat  = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"internal":{{json .Internal}},"options":{{json .Options}},"ipam":{{json .IPAM.Config}},"labels":{{json .Labels}}}`
-	endpointInspectFormat = `{"id":{{json .Id}},"labels":{{json .Config.Labels}},"running":{{json .State.Running}},"health":{{json .State.Health.Status}},"networks":{{json .NetworkSettings.Networks}}}`
+	endpointInspectFormat = `{"id":{{json .ID}},"labels":{{json .Config.Labels}},"running":{{json .State.Running}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
 )
 
 func (m *Manager) inspectImage(ctx context.Context) (imageInspection, bool, error) {
@@ -797,6 +889,73 @@ func (m *Manager) inspectNetwork(ctx context.Context, name string) (networkInspe
 	return value, found, err
 }
 
+func (m *Manager) inspectCaddyNetwork(ctx context.Context) (caddyNetworkInspection, bool, error) {
+	var value caddyNetworkInspection
+	outputLimit := m.options.OutputLimit
+	if outputLimit > defaultOutputLimit {
+		outputLimit = defaultOutputLimit
+	}
+	result, err := m.runner.Run(ctx, runtimeprocess.CommandRequest{
+		Executable:  m.options.DockerExecutable,
+		Args:        []string{"network", "inspect", "--format", "json", caddyNetworkName},
+		Directory:   m.options.WorkingDirectory,
+		Env:         append([]string(nil), m.dockerEnv...),
+		Timeout:     m.options.CommandTimeout,
+		OutputLimit: outputLimit,
+	})
+	if result.StdoutTruncated || result.StderrTruncated {
+		clearResult(&result)
+		return value, false, &Error{Code: DiagnosticIngressDrift}
+	}
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, runtimeprocess.ErrTerminationFailed) {
+		clearResult(&result)
+		return value, false, &Error{Code: DiagnosticIngressUnavailable}
+	}
+	if err != nil {
+		notFound := dockerNotFound(result)
+		clearResult(&result)
+		if notFound {
+			return value, false, nil
+		}
+		return value, false, &Error{Code: DiagnosticIngressUnavailable}
+	}
+	var values []caddyNetworkInspection
+	decodeErr := json.Unmarshal(result.Stdout, &values)
+	clearResult(&result)
+	if decodeErr != nil || len(values) != 1 {
+		clearCaddyNetworkInspections(values)
+		return value, false, &Error{Code: DiagnosticIngressDrift}
+	}
+	value = values[0]
+	values[0] = caddyNetworkInspection{}
+	clear(values)
+	return value, true, nil
+}
+
+func clearCaddyNetworkInspections(values []caddyNetworkInspection) {
+	for index := range values {
+		clearCaddyNetworkInspection(&values[index])
+	}
+	clear(values)
+}
+
+func clearCaddyNetworkInspection(value *caddyNetworkInspection) {
+	if value == nil {
+		return
+	}
+	clear(value.Options)
+	clear(value.Labels)
+	for index := range value.IPAM.Config {
+		value.IPAM.Config[index] = networkIPAM{}
+	}
+	clear(value.IPAM.Config)
+	for id := range value.Containers {
+		value.Containers[id] = caddyNetworkContainerInspection{}
+		delete(value.Containers, id)
+	}
+	*value = caddyNetworkInspection{}
+}
+
 func (m *Manager) inspectJSON(ctx context.Context, destination any, args ...string) (bool, error) {
 	result, err := m.runner.Run(ctx, runtimeprocess.CommandRequest{Executable: m.options.DockerExecutable, Args: append([]string(nil), args...), Directory: m.options.WorkingDirectory, Env: append([]string(nil), m.dockerEnv...), Timeout: m.options.CommandTimeout, OutputLimit: m.options.OutputLimit})
 	if err != nil {
@@ -818,10 +977,12 @@ func (m *Manager) inspectJSON(ctx context.Context, destination any, args ...stri
 func validCaddyInspection(value caddyInspection, imageID string, hostPort uint16) bool {
 	if normalizeID(value.Image) != normalizeID(imageID) || strings.TrimPrefix(value.Name, "/") != caddyContainerName || value.User != "1000:1000" ||
 		value.Hostname != caddyContainerName || value.NetworkMode != caddyNetworkName || !containsString(value.Env, "XDG_CONFIG_HOME=/config") || !containsString(value.Env, "XDG_DATA_HOME=/data") ||
-		!value.ReadOnly || value.Privileged || len(value.CapAdd) != 0 || !exactFoldSet(value.CapDrop, "ALL") || !exactStringSet(value.SecurityOpt, "no-new-privileges") ||
+		!validCaddyGatewayPriorities(value.Networks) ||
+		!value.ReadOnly || value.Privileged || !onlyCaddyCapability(value.CapAdd) || !exactFoldSet(value.CapDrop, "ALL") || !onlyNoNewPrivileges(value.SecurityOpt) ||
 		len(value.Binds) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 || value.NanoCPUs != 1_000_000_000 || value.PIDsLimit != 128 ||
 		len(value.Tmpfs) != 1 || value.Tmpfs["/data"] != "rw,noexec,nosuid,nodev,size=67108864" ||
 		value.LogType != "local" || value.LogConfig["max-size"] != "10m" || value.LogConfig["max-file"] != "3" || value.Restart != "unless-stopped" ||
+		len(value.Entrypoint) != 1 || value.Entrypoint[0] != caddyExecutable ||
 		len(value.Cmd) != 3 || value.Cmd[0] != "run" || value.Cmd[1] != "--config" || value.Cmd[2] != "/config/active.json" ||
 		value.Labels["io.rig.managed"] != "generated-ingress" || value.Labels["io.rig.identity-version"] != "v1" || value.Labels["io.rig.listener-isolation"] != "v1" ||
 		len(value.Ulimits) != 1 || value.Ulimits[0] != (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}) {
@@ -837,6 +998,24 @@ func validCaddyInspection(value caddyInspection, imageID string, hostPort uint16
 	}
 	binding := value.PortBindings["8080/tcp"]
 	return mountOK && len(value.PortBindings) == 1 && len(binding) == 1 && len(binding[0]) == 2 && binding[0]["HostIp"] == "127.0.0.1" && binding[0]["HostPort"] == strconv.FormatUint(uint64(hostPort), 10)
+}
+
+func validCaddyGatewayPriorities(networks map[string]*networkAttachment) bool {
+	if networks[caddyNetworkName] == nil {
+		return false
+	}
+	for name, attachment := range networks {
+		priority := 0
+		if name == caddyNetworkName {
+			priority = caddyGatewayPriority
+		}
+		// Moby 28 can prefer a dual-stack endpoint over an IPv4-only endpoint
+		// despite its priority. This managed ingress boundary is IPv4-only.
+		if attachment == nil || attachment.GwPriority != priority || attachment.IPv6Gateway != "" {
+			return false
+		}
+	}
+	return true
 }
 
 func validOptions(options Options) bool {
@@ -911,7 +1090,7 @@ func localDockerEndpoint(value string) bool {
 }
 
 func validConfigFilename(value string) bool {
-	return value == "active.json" || value == "proposed.json" || value == "recovery.json" || value == "rollback.json"
+	return value == "active.json" || value == "proposed.json" || value == "recovery.json" || value == "reconcile.json" || value == "rollback.json"
 }
 
 func containsDigest(values []string, digest string) bool {
@@ -943,12 +1122,24 @@ func containsFold(values []string, expected string) bool {
 	return false
 }
 
-func exactStringSet(values []string, expected string) bool {
-	return len(values) == 1 && values[0] == expected
+func onlyNoNewPrivileges(values []string) bool {
+	if len(values) != 1 {
+		return false
+	}
+	switch strings.ToLower(values[0]) {
+	case "no-new-privileges", "no-new-privileges:true", "no-new-privileges=true":
+		return true
+	default:
+		return false
+	}
 }
 
 func exactFoldSet(values []string, expected string) bool {
 	return len(values) == 1 && strings.EqualFold(values[0], expected)
+}
+
+func onlyCaddyCapability(values []string) bool {
+	return len(values) == 1 && strings.TrimPrefix(strings.ToUpper(values[0]), "CAP_") == caddyCapability
 }
 
 func clearResult(result *runtimeprocess.CommandResult) {

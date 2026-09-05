@@ -100,6 +100,32 @@ func TestAnalyzeViteAndExpressWorkspace(t *testing.T) {
 	}
 }
 
+func TestAnalyzeWorkspaceInstallsAtRepositoryRoot(t *testing.T) {
+	cases := []struct {
+		name, packageManager, lockfile, install string
+	}{
+		{name: "npm", packageManager: "npm@11.0.0", lockfile: "package-lock.json", install: "npm ci"},
+		{name: "pnpm", packageManager: "pnpm@10.0.0", lockfile: "pnpm-lock.yaml", install: "corepack pnpm install --frozen-lockfile"},
+		{name: "yarn", packageManager: "yarn@4.6.0", lockfile: "yarn.lock", install: "corepack yarn install --immutable"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			analysis := analyzeMemory(t, memoryReader{
+				"package.json":          []byte(`{"packageManager":"` + test.packageManager + `","workspaces":["apps/*"]}`),
+				test.lockfile:           []byte("locked\n"),
+				"apps/api/package.json": []byte(`{"name":"api","scripts":{"start":"node server.js"},"dependencies":{"express":"5"}}`),
+			})
+			plan := analysis.Candidates[0]
+			if plan.RootDirectory != "" || plan.Install == nil || plan.Install.Command != test.install || plan.Install.WorkingDirectory != "" {
+				t.Fatalf("workspace installation = root %q, install %#v; want repository root and %q", plan.RootDirectory, plan.Install, test.install)
+			}
+			if component := componentByRoot(t, plan, "apps/api"); component.RootDirectory != "apps/api" {
+				t.Fatalf("nested component = %#v", component)
+			}
+		})
+	}
+}
+
 func TestAnalyzeNestUsesStartProdAndPinnedNodeFallback(t *testing.T) {
 	got := analyzeMemory(t, memoryReader{
 		"package.json": []byte(`{
@@ -136,6 +162,18 @@ func TestAnalyzeNeedsInputForConflictingLockfiles(t *testing.T) {
 		t.Fatalf("plan = %#v", plan)
 	}
 	assertFinding(t, plan.Findings, "conflicting_lockfiles")
+}
+
+func TestAnalyzeYarnLockfileWithoutPackageManagerRequiresReviewedInstallOverride(t *testing.T) {
+	got := analyzeMemory(t, memoryReader{
+		"package.json": []byte(`{"scripts":{"start":"node server.js"},"dependencies":{"express":"5"}}`),
+		"yarn.lock":    []byte("# yarn lockfile v1\n"),
+	})
+	plan := got.Candidates[0]
+	if plan.Status != StatusNeedsInput || plan.PackageManager.Name != "yarn" || plan.PackageManager.Version != "" || plan.Install != nil || !slices.Contains(plan.MissingFields, "package_manager.version") {
+		t.Fatalf("yarn review candidate = %#v", plan)
+	}
+	assertFinding(t, plan.Findings, "yarn_version_required")
 }
 
 func TestAnalyzeNeedsInstallReviewWithoutLockfile(t *testing.T) {

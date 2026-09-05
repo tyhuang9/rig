@@ -35,6 +35,8 @@ type Router struct {
 	generated   jobs.Executor
 }
 
+var errInvalidSource = errors.New("runtime strategy provenance is invalid")
+
 func New(deploymentRepository deploymentReader, plans planReader, releases releaseReader, compose, generated jobs.Executor) (*Router, error) {
 	if deploymentRepository == nil || plans == nil || releases == nil || (compose == nil && generated == nil) {
 		return nil, errors.New("runtime strategy router dependencies are required")
@@ -56,7 +58,11 @@ func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.Progre
 	}
 	strategy, err := r.strategy(ctx, job.ResourceID, input.ReleaseID, deployment)
 	if err != nil {
-		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "invalid_source"}
+		code := "internal_error"
+		if errors.Is(err, errInvalidSource) {
+			code = "invalid_source"
+		}
+		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: code}
 	}
 	var executor jobs.Executor
 	switch strategy {
@@ -76,7 +82,7 @@ func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.Progre
 func (r *Router) strategy(ctx context.Context, appID, releaseID string, deployment deployments.Deployment) (deployments.RuntimeStrategy, error) {
 	if deployment.ProvenanceInitialized {
 		if deployment.RuntimeStrategy != deployments.RuntimeCompose && deployment.RuntimeStrategy != deployments.RuntimeGeneratedNode {
-			return "", errors.New("deployment runtime provenance is invalid")
+			return "", errInvalidSource
 		}
 		return deployment.RuntimeStrategy, nil
 	}
@@ -84,6 +90,9 @@ func (r *Router) strategy(ctx context.Context, appID, releaseID string, deployme
 		release, err := r.releases.ReadyWorkspace(ctx, appID, releaseID)
 		if err != nil {
 			return "", err
+		}
+		if release.ID != releaseID || release.AppID != appID {
+			return "", errInvalidSource
 		}
 		if release.DeploymentPlanRevisionID == "" && release.DeploymentPlanRevisionNumber == 0 {
 			return deployments.RuntimeCompose, nil
@@ -97,16 +106,22 @@ func (r *Router) strategy(ctx context.Context, appID, releaseID string, deployme
 	if head.ID == "" && head.RevisionNumber == 0 {
 		return deployments.RuntimeCompose, nil
 	}
+	if head.ID == "" || head.AppID != appID || head.RevisionNumber < 1 {
+		return "", errInvalidSource
+	}
 	return strategyFromPlan(head)
 }
 
 func (r *Router) planStrategy(ctx context.Context, appID, planID string, planNumber int64) (deployments.RuntimeStrategy, error) {
 	if planID == "" || planNumber < 1 {
-		return "", errors.New("release deployment plan provenance is invalid")
+		return "", errInvalidSource
 	}
 	plan, err := r.plans.GetRevision(ctx, appID, planID, planNumber)
 	if err != nil {
 		return "", err
+	}
+	if plan.ID != planID || plan.AppID != appID || plan.RevisionNumber != planNumber {
+		return "", errInvalidSource
 	}
 	return strategyFromPlan(plan)
 }
@@ -118,6 +133,6 @@ func strategyFromPlan(plan deploymentplans.DeploymentPlanRevision) (deployments.
 	case deploymentplans.StrategyCompose:
 		return deployments.RuntimeCompose, nil
 	default:
-		return "", errors.New("deployment plan strategy is unsupported")
+		return "", errInvalidSource
 	}
 }

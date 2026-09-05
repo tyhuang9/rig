@@ -23,6 +23,8 @@ const (
 	operationGetApplicationAutoDeploy    = "getApplicationAutoDeploy"
 	operationUpdateApplicationAutoDeploy = "updateApplicationAutoDeploy"
 	operationResumeApplicationAutoDeploy = "resumeApplicationAutoDeploy"
+	operationAcceptDeploymentPlan        = "acceptApplicationDeploymentPlan"
+	operationApproveDeploymentMigration  = "approveApplicationDeploymentPlanMigration"
 )
 
 func (s *Server) getRelayStatus(w http.ResponseWriter, r *http.Request) {
@@ -276,7 +278,8 @@ func safeHandlerOperation(operation string) string {
 	case operationGetRelayStatus, operationStartRelayEnrollment, operationPollRelayEnrollment,
 		operationRemoveRelayBinding, operationStartRelayKeyRotation,
 		operationGetApplicationAutoDeploy, operationUpdateApplicationAutoDeploy,
-		operationResumeApplicationAutoDeploy:
+		operationResumeApplicationAutoDeploy, operationAcceptDeploymentPlan,
+		operationApproveDeploymentMigration:
 		return operation
 	default:
 		return "unknown"
@@ -291,7 +294,7 @@ func safeHandlerProblemCode(code string) string {
 		"invalid_source", "authentication_required", "source_access_lost",
 		"invalid_auto_deploy_request", "auto_deploy_conflict", "auto_deploy_state_conflict",
 		"application_busy", "auto_deploy_forbidden", "auto_deploy_prerequisite_missing",
-		"app_not_found", "capability_unavailable", "internal_error":
+		"app_not_found", "capability_unavailable", "deployment_plan_forbidden", "internal_error":
 		return code
 	default:
 		return "internal_error"

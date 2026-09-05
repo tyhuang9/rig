@@ -23,7 +23,7 @@ type Draft = {
 };
 
 const overrideableMissingField = (field: string) =>
-  field === "package_manager" || field === "install_behavior" || field === "node_version" ||
+  field === "package_manager" || field === "package_manager.version" || field === "install_behavior" || field === "node_version" ||
   field.endsWith(".build") || field.endsWith(".run") || field.endsWith(".internal_port") || field.endsWith(".health_probe");
 
 function inferredDraft(candidate: DeploymentPlanCandidate): Draft {
@@ -224,6 +224,7 @@ export function DeploymentPlanReview({
             <label htmlFor="plan-install-behavior">Dependency installation (required)</label>
             <input className="command-input" id="plan-install-behavior" required value={draft.installBehavior} aria-invalid={Boolean(errors.installBehavior)} aria-describedby={errors.installBehavior ? "plan-install-behavior-error" : undefined} onChange={(event) => editTop("installBehavior", event.target.value)} />
             <FieldMeta label="dependency installation" fieldId="plan-install-behavior" changed={changed.has("installBehavior")} evidence={candidate.install?.evidence ?? []} onReset={() => resetField("installBehavior", "plan-install-behavior", () => editTop("installBehavior", inferred!.installBehavior))} />
+            {candidate.missingFields.includes("package_manager.version") && <small>Yarn does not declare its version in this repository. Enter the exact Corepack/Yarn install command your project requires; Rig will record it as a reviewed override.</small>}
             {errors.installBehavior && <p id="plan-install-behavior-error" className="form-error">{errors.installBehavior}</p>}
           </div>
           {candidate.components.map((component) => <ComponentAdvanced key={component.id} component={component} draft={draft.components[component.id]} errors={errors} changed={changed} inferred={inferred!.components[component.id]} onEdit={editComponent} onReset={resetField} />)}

@@ -3,6 +3,7 @@ package deploymentplans
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/hostd/hostd/internal/projectanalysis"
 )
@@ -13,6 +14,26 @@ func TestCompareAnalysisAcceptsUnchangedInferenceAndManualOverrides(t *testing.T
 	setOrigin(&plan, "components.web.runCommand", ProvenanceUser)
 	analysis.Candidates[0].Components[0].Run.Command = "npm start"
 	analysis.Candidates[0].MissingFields = []string{"components.web.run"}
+
+	differences, err := CompareAnalysis(plan, analysis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(differences) != 0 {
+		t.Fatalf("differences = %#v", differences)
+	}
+}
+
+func TestCompareAnalysisAcceptsReviewedYarnVersionAmbiguity(t *testing.T) {
+	plan, analysis := comparisonFixture()
+	plan.Components[0].PackageManager = "yarn"
+	plan.Components[0].InstallBehavior = "corepack prepare yarn@1.22.22 --activate && corepack yarn install --frozen-lockfile"
+	setOrigin(&plan, "components.web.packageManager", ProvenanceUser)
+	setOrigin(&plan, "components.web.installBehavior", ProvenanceUser)
+	analysis.Candidates[0].PackageManager.Name = "yarn"
+	analysis.Candidates[0].PackageManager.Version = ""
+	analysis.Candidates[0].Install = nil
+	analysis.Candidates[0].MissingFields = []string{"package_manager.version"}
 
 	differences, err := CompareAnalysis(plan, analysis)
 	if err != nil {
@@ -97,10 +118,29 @@ func TestCompareAnalysisTracksMigrationEvidenceWithoutCommandContent(t *testing.
 	}
 }
 
+func TestCompareAnalysisIgnoresApprovedExternalMigrationLifecycle(t *testing.T) {
+	plan, analysis := comparisonFixture()
+	plan.Migration = &Migration{
+		ComponentName: "web", RootDirectory: ".", Command: "npm run migrate",
+		EnvironmentKeys: []string{"DATABASE_URL"}, EvidenceDigest: digestOf("b"),
+		Approval: MigrationApproval{Status: MigrationApprovalApproved, ActorID: "admin", At: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC).Format(time.RFC3339Nano)},
+	}
+	analysis.Candidates[0].Components[0].Migration = &projectanalysis.Command{Command: "npm run migrate"}
+	analysis.Candidates[0].Components[0].MigrationFingerprint = digestOf("b")
+
+	if _, err := CanonicalDigest(plan); err == nil {
+		t.Fatal("strict immutable plan canonicalization accepted an externally applied approval")
+	}
+	differences, err := CompareAnalysis(plan, analysis)
+	if err != nil || len(differences) != 0 {
+		t.Fatalf("approved lifecycle differences = %#v, err=%v", differences, err)
+	}
+}
+
 func comparisonFixture() (Plan, projectanalysis.SourceAnalysis) {
 	component := Component{
 		Name: "web", Role: "server", RootDirectory: ".", PackageManager: "npm",
-		InstallBehavior: "npm ci", NodeVersion: "24", RunCommand: "npm start",
+		InstallBehavior: "npm ci", InstallDirectory: ".", NodeVersion: "24", RunCommand: "npm start",
 		InternalPort: 3000, HealthProbe: "/health",
 	}
 	fields := componentExecutionFields(component)

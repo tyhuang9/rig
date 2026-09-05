@@ -239,7 +239,7 @@ describe("DeploymentHistoryPanel", () => {
     });
 
     const latest = await screen.findByRole("button", { name: "Deploy latest" });
-    const prior = screen.getByRole("button", { name: "Deploy release" });
+    const prior = await screen.findByRole("button", { name: "Deploy release" });
     await waitFor(() => expect((latest as HTMLButtonElement).disabled).toBe(false));
     expect((prior as HTMLButtonElement).disabled).toBe(false);
     expect(
@@ -438,11 +438,69 @@ describe("DeploymentHistoryPanel", () => {
       .mockResolvedValue({ items: [release] } as never);
     renderPanel();
     const retry = await screen.findAllByRole("button", { name: "Retry" });
+    retry[0].focus();
     fireEvent.click(retry[0]);
     await waitFor(() => expect(api.releases).toHaveBeenCalledTimes(2));
     expect((await screen.findAllByText("abcdef123456")).length).toBeGreaterThan(
       0,
     );
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Release history" })));
+  });
+
+  it("keeps one atomic status region and ignores timestamp-only job updates", async () => {
+    const { client } = renderPanel();
+    const statusRegion = screen.getByRole("status");
+    expect(statusRegion.getAttribute("aria-live")).toBe("polite");
+    expect(statusRegion.getAttribute("aria-atomic")).toBe("true");
+    await waitFor(() => expect(statusRegion.textContent).toContain("Deployment job job-1 is Waiting for approval."));
+    expect(screen.getByRole("status")).toBe(statusRegion);
+
+    const observer = vi.fn();
+    const mutations = new MutationObserver(observer);
+    mutations.observe(statusRegion, { childList: true, characterData: true, subtree: true });
+    act(() => client.setQueryData(["jobs"], { items: [{ ...waitingJob, updatedAt: "2026-08-01T10:05:00Z" }] }));
+    await act(async () => Promise.resolve());
+    expect(observer).not.toHaveBeenCalled();
+
+    act(() => client.setQueryData(["jobs"], { items: [{ ...waitingJob, status: "running", pauseDisposition: undefined, updatedAt: "2026-08-01T10:06:00Z" }] }));
+    await waitFor(() => expect(statusRegion.textContent).toContain("Deployment job job-1 is running."));
+    expect(observer).toHaveBeenCalled();
+    mutations.disconnect();
+  });
+
+  it("restores focus when grant and resume actions disappear after success", async () => {
+    const approval = {
+      id: "approval-1",
+      appId,
+      capability: "privileged",
+      fingerprint,
+      grantedAt: "2026-08-01T10:00:00Z",
+      grantedBy: "user",
+      policyVersion: "v1",
+      scope: "service:web",
+    };
+    vi.mocked(api.runtimeApprovals)
+      .mockResolvedValueOnce({ items: [] } as never)
+      .mockResolvedValue({ items: [approval] } as never);
+    const first = renderPanel();
+    const grant = await screen.findByRole("button", { name: "Grant approval" });
+    grant.focus();
+    fireEvent.click(grant);
+    await screen.findByText("Approved");
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Runtime approvals" })));
+    first.unmount();
+
+    cleanup();
+    mockData({ approvals: [approval] });
+    vi.mocked(api.jobs)
+      .mockResolvedValueOnce({ items: [waitingJob] } as never)
+      .mockResolvedValue({ items: [{ ...waitingJob, status: "succeeded", pauseDisposition: undefined }] } as never);
+    renderPanel();
+    const resume = await screen.findByRole("button", { name: "Resume waiting job" });
+    resume.focus();
+    fireEvent.click(resume);
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Resume waiting job" })).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Runtime approvals" })));
   });
 
   it("shows copyable deployment diagnostics and safe release provenance", async () => {
@@ -463,6 +521,9 @@ describe("DeploymentHistoryPanel", () => {
       expect(row?.textContent).not.toContain(release.sourceProviderBody);
       expect(row?.textContent).not.toContain(release.secretToken);
     }
+    expect(screen.getAllByRole("article", { name: /Deployment deployme, Needs attention/i })).toHaveLength(2);
+    expect(screen.getByRole("article", { name: /Release abcdef123456, revision 4/i })).not.toBeNull();
+    expect(screen.getByRole("article", { name: /Runtime approval required for privileged, service:web/i })).not.toBeNull();
   });
 
   it("queues latest deployment without claiming success and serializes the button", async () => {
@@ -474,6 +535,7 @@ describe("DeploymentHistoryPanel", () => {
     );
     renderPanel();
     const deploy = await screen.findByRole("button", { name: "Deploy latest" });
+    await waitFor(() => expect((deploy as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(deploy);
     fireEvent.click(deploy);
     await waitFor(() => expect(api.deployApplication).toHaveBeenCalledTimes(1));
@@ -679,6 +741,42 @@ describe("DeploymentHistoryPanel", () => {
       await screen.findByText("Replacement capacity retry queued."),
     ).not.toBeNull();
     expect(document.body.textContent).not.toContain("secret-command-value");
+  });
+
+  it("preserves both slots and exposes an explicit route reconciliation retry", async () => {
+	const routeDeployment = {
+		...generatedDeployment,
+		diagnosticCode: "route_reconciliation_required",
+		failureSummary: "secret-command-value",
+	};
+	mockData({
+		deployments: [routeDeployment] as never,
+		releases: [generatedRelease] as never,
+		approvals: [],
+		jobs: [generatedWaitingJob("route_reconciliation_required")] as never,
+	});
+	vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan as never);
+	renderPanel({ generatedRuntime: true });
+
+	expect(
+		await screen.findByText("Deployment route state needs reconciliation."),
+	).not.toBeNull();
+	expect(screen.getByText(/could not prove whether the old or new slot/i)).not.toBeNull();
+	expect(
+		screen.getAllByText("Route state must be reconciled before deployment can continue.").length,
+	).toBeGreaterThan(0);
+	const retry = screen.getByRole("button", {
+		name: "Retry route reconciliation",
+	});
+	retry.focus();
+	fireEvent.click(retry);
+	await waitFor(() =>
+		expect(api.resumeJob).toHaveBeenCalledWith("job-generated"),
+	);
+	expect(
+		await screen.findByText("Route reconciliation retry queued."),
+	).not.toBeNull();
+	expect(document.body.textContent).not.toContain("secret-command-value");
   });
 
   it("keeps generated pause recovery unavailable without its pinned runtime", async () => {
@@ -1066,9 +1164,9 @@ describe("DeploymentHistoryPanel", () => {
       async (id) => ({ items: id === "app-a" ? [release] : [] }) as never,
     );
     const { client, rerender } = renderPanel({ appId: "app-a" });
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Deploy latest" }),
-    );
+    const appADeploy = await screen.findByRole("button", { name: "Deploy latest" });
+    await waitFor(() => expect((appADeploy as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(appADeploy);
     expect(
       await screen.findByText("Deployment job queued-1 queued."),
     ).not.toBeNull();
@@ -1084,7 +1182,9 @@ describe("DeploymentHistoryPanel", () => {
     );
     await screen.findByText("No deployment has been recorded yet.");
     expect(screen.queryByText("Deployment job queued-1 queued.")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Deploy latest" }));
+    const appBDeploy = screen.getByRole("button", { name: "Deploy latest" });
+    await waitFor(() => expect((appBDeploy as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(appBDeploy);
     await waitFor(() =>
       expect(api.deployApplication).toHaveBeenLastCalledWith("app-b"),
     );
@@ -1100,9 +1200,9 @@ describe("DeploymentHistoryPanel", () => {
         : Promise.resolve({ created: true, job: { id: "new-job" } } as never),
     );
     const { client, rerender } = renderPanel({ appId: "app-a" });
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Deploy latest" }),
-    );
+    const appADeploy = await screen.findByRole("button", { name: "Deploy latest" });
+    await waitFor(() => expect((appADeploy as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(appADeploy);
     await waitFor(() =>
       expect(api.deployApplication).toHaveBeenCalledWith("app-a"),
     );
@@ -1140,9 +1240,9 @@ describe("DeploymentHistoryPanel", () => {
         : Promise.resolve({ created: true, job: { id: "new-job" } } as never),
     );
     const { client, rerender } = renderPanel({ appId: "app-a" });
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Deploy latest" }),
-    );
+    const appADeploy = await screen.findByRole("button", { name: "Deploy latest" });
+    await waitFor(() => expect((appADeploy as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(appADeploy);
     await waitFor(() =>
       expect(api.deployApplication).toHaveBeenCalledWith("app-a"),
     );
