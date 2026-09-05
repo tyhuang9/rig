@@ -49,7 +49,9 @@ Commands are non-secret configuration. Put credentials and application values in
 
 ## Immutable plans and source drift
 
-An accepted deployment-plan revision records the strategy, detector version, structural source fingerprint, component roots and roles, package manager, Node.js version, Build and Run commands, ports, health probes, migration evidence, field provenance, canonical digest, actor, and time. Command text lives only in an application-purpose-bound protected bundle; SQLite retains metadata and digests without the commands.
+An accepted deployment-plan revision records the strategy, detector version, structural source fingerprint, component roots and roles, package manager, Node.js version, Build and Run commands, ports, health probes, migration evidence, field provenance, canonical digest, actor, and time. In Rig-controlled durable storage, command text lives only in an application-purpose-bound protected bundle; SQLite retains metadata and digests without the commands. Authenticated plan-review responses return the commands with `Cache-Control: no-store`; execution surfaces handle them only as described below.
+
+Bundle protection uses DPAPI and restrictive ACLs on Windows. On POSIX it uses purpose binding and `0600` files in `0700` directories, not encryption at rest; it does not protect against root or another process running as the controller user.
 
 Every release pins both its configuration revision and deployment-plan revision. Redeploying an older release uses those original pins even after a newer plan is accepted.
 
@@ -73,7 +75,7 @@ For each component Rig:
 
 The build context cannot be broadened by a repository `.dockerignore`. GitHub credentials, runtime secrets, application configuration, host directories, SSH agents, the Docker socket, and controller files are not supplied to the build. One build runs at a time, with a 30-minute default timeout and bounded output. Temporary material is removed on success, failure, cancellation, timeout, and restart recovery.
 
-Build and Run commands are bounded UTF-8 strings. NUL, newlines, control characters, and excessive length are rejected. Shell operators remain supported, but Docker receives the whole command as one fixed argument to `/bin/sh -lc`; Rig never interpolates it into a Windows shell, Docker argument, tag, path, project name, YAML document, log, job, audit, metric, or problem response.
+Build and Run commands are bounded UTF-8 strings. NUL, newlines, control characters, and excessive length are rejected. Shell operators remain supported. Dependency-install and Build commands are written to controller-owned `0600` temporary files, supplied to BuildKit as secret mounts, and removed with the rest of the build operation; their text is not placed in the Containerfile, image, or image history. Each Run or migration command is passed whole as one fixed argument to `/bin/sh -lc`, so it is present in the live Docker container configuration until that container is removed. Rig never expands a command through a Windows shell or concatenates it into a tag, path, project name, YAML document, log, job, audit, metric, or problem response.
 
 ## Runtime and blue/green replacement
 
@@ -122,7 +124,7 @@ The current alpha uses fixed generated-runtime limits rather than per-applicatio
 
 Generated deployment phases, active slot state, image artifacts, routes, plan pins, and release provenance are durable. On daemon restart, Rig recovers ingress before job execution, revalidates owned containers and networks, removes controller-owned temporary files, and resumes only phases that are safe to replay. A migration recorded as running is never rerun automatically after an uncertain interruption.
 
-Durable surfaces and ordinary APIs contain stable diagnostic codes, not commands or raw Docker/build output. Raw build output is cleared and is not persisted. Relevant recovery states include:
+Deployment history, jobs, events, audits, metrics, problem responses, and ordinary logs contain stable diagnostic codes, not commands or raw Docker/build output. The protected plan bundle, authenticated no-store plan-review response, and live Docker runtime configuration contain command text only as described above. Controller-captured Docker and build output is cleared and is not persisted. Relevant recovery states include:
 
 - `deployment_plan_review_required` — reanalyze and accept the current setup, then resume auto-deploy;
 - `migration_approval_required` — approve the exact migration and resume the waiting job;
@@ -153,6 +155,6 @@ On a disposable Linux Docker host, also verify:
 5. Migration approval is bound to the exact revision and executes once per deployment attempt.
 6. Source drift pauses auto-deploy before job creation, while an unchanged plan continues without repeated approval.
 7. Existing local and GitHub Compose deployments remain unchanged when both runtimes are enabled.
-8. Synthetic credentials and commands are absent from SQLite, retained files, images, logs, events, audits, metrics, and problem responses.
+8. Synthetic credentials and commands are absent from SQLite, generated images and image history, logs, events, audits, metrics, problem responses, and retained temporary files after cleanup. Accepted command text remains in the purpose-bound plan bundle and, during execution, the bounded temporary BuildKit-secret and live Docker runtime surfaces described above.
 
 Pull requests run `.github/workflows/generated-runtime-lifecycle-ci.yml` on a disposable Ubuntu Docker host. That gate starts hardened blue and green application slots through the production runtime engine, proves that traffic stays on blue until the Caddy route commit, switches traffic to green, removes the drained slot, checks cleanup, and runs the generated-runtime packages with Go's race detector. A checkout without a Docker daemon can compile and skip the opt-in live test, but cannot substitute for a passing hosted lifecycle job.
