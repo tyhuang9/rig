@@ -83,6 +83,8 @@ Build and Run commands are bounded UTF-8 strings. NUL, newlines, control charact
 
 Each inferred component receives its own generated image and container. A static frontend plus API therefore runs as two component containers, not one combined container. Components share the application's private network, while other applications use different networks.
 
+Local ingress uses `<application-id>.rig.localhost` on the configured Caddy port (8080 by default). A single component receives every path. For a static frontend plus API, `/api` and `/api/*` go to the API without stripping that prefix; remaining paths go to the frontend. The frontend must use this API path convention or an explicitly configured external API URL. Custom ingress path mappings are not available in this alpha.
+
 Each component has stable blue and green slots. A deployment:
 
 1. builds the new images;
