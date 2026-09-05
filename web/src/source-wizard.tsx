@@ -6,6 +6,7 @@ import {
   type AcceptDeploymentPlanRequest,
   type CreateApplicationRequest,
   type DeploymentPlanRevision,
+  type DeploymentSetupInput,
   type GitHubDeviceAuthorization,
   type GitHubSource,
   type InspectResponse,
@@ -85,6 +86,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const [formError, setFormError] = useState("");
   const [fieldErrors, setFieldErrors] = useState<{ name?: string; description?: string; localPath?: string }>({});
   const [inspection, setInspection] = useState<InspectResponse | null>(null);
+  const [reviewedSetup, setReviewedSetup] = useState<DeploymentSetupInput | null>(null);
   const [inspectedKey, setInspectedKey] = useState("");
   const [draftApplicationId, setDraftApplicationId] = useState("");
   const [acceptedRevision, setAcceptedRevision] = useState<DeploymentPlanRevision | null>(null);
@@ -140,6 +142,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
 
   const clearInspection = () => {
     setInspection(null);
+    setReviewedSetup(null);
     setInspectedKey("");
     setInspectionError("");
   };
@@ -322,28 +325,30 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     },
   });
   const inspectSource = useMutation({
-    mutationFn: (operation: { request: { sourcePath?: string; githubSource?: GitHubSource }; key: string; generation: number }) => api.inspect(operation.request).then((result) => ({ result, ...operation })),
-    onSuccess: ({ result, request, key, generation }) => {
+    mutationFn: (operation: { request: { sourcePath?: string; githubSource?: GitHubSource; setup?: DeploymentSetupInput }; key: string; generation: number; review: boolean }) => api.inspect(operation.request).then((result) => ({ result, ...operation })),
+    onSuccess: ({ result, request, key, generation, review }) => {
       const currentRequest = inspectionRequest.current;
       if (!currentRequest || generation !== inspectionGeneration.current || currentRequest.generation !== generation || currentRequest.key !== key) return;
       setInspection(result);
+      setReviewedSetup(review && request.setup && result.analysis.candidates.some((candidate) => candidate.id === "user:deployment-setup" || candidate.origin.toLowerCase() === "user") ? { components: request.setup.components.map((component) => ({ ...component })), ...(request.setup.migrationCommand ? { migrationCommand: request.setup.migrationCommand } : {}) } : null);
       setInspectedKey(key);
       setInspectionError("");
       const explicitlySelectedCompose = Boolean(request.githubSource?.composePath);
-      if (!explicitlySelectedCompose && result.analysis.candidates.some((candidate) => candidate.kind === "javascript" && candidate.status !== "unsupported" && candidate.components.length > 0)) setStage("review");
+      if (review || (!explicitlySelectedCompose && result.analysis.candidates.some((candidate) => candidate.kind === "javascript" && candidate.status !== "unsupported" && candidate.components.length > 0))) setStage("review");
     },
     onError: (error, operation) => {
       const currentRequest = inspectionRequest.current;
       if (!currentRequest || operation.generation !== inspectionGeneration.current || currentRequest.generation !== operation.generation || currentRequest.key !== operation.key) return;
-      clearInspection();
+      if (!operation.review) clearInspection();
       setInspectionError(safeMessage(error, "Could not inspect this source."));
     },
   });
-  const runInspection = (request: { sourcePath?: string; githubSource?: GitHubSource }, key: string) => {
+  const runInspection = (request: { sourcePath?: string; githubSource?: GitHubSource; setup?: DeploymentSetupInput }, key: string, review = false) => {
+    if (review) setReviewedSetup(null);
     const generation = inspectionGeneration.current + 1;
     inspectionGeneration.current = generation;
     inspectionRequest.current = { generation, key };
-    inspectSource.mutate({ request, key, generation });
+    inspectSource.mutate({ request, key, generation, review });
   };
   const create = useMutation({
     mutationFn: api.createApp,
@@ -360,7 +365,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     mutationFn: async (plan: AcceptDeploymentPlanRequest) => {
       let applicationId = draftApplicationIdRef.current;
       if (!applicationId) {
-        const application = await api.createApp(createRequest());
+        const application = await api.createApp(createRequest(plan.setup));
         applicationId = application.id;
         draftApplicationIdRef.current = applicationId;
         setDraftApplicationId(applicationId);
@@ -375,11 +380,12 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
       await queryClient.invalidateQueries({ queryKey: ["apps"] });
       await queryClient.invalidateQueries({ queryKey: ["deployment-plan", applicationId] });
     },
-    onError: async (error) => {
+    onError: async (error, plan) => {
       const applicationId = draftApplicationIdRef.current;
       if (applicationId) await queryClient.invalidateQueries({ queryKey: ["apps"] });
       if (error instanceof APIError && error.code === "deployment_plan_review_required") {
         setFormError("The project setup changed while you were reviewing it. Review the updated setup before trying again.");
+        analyzeCurrentSource(plan.setup, true);
       } else if (error instanceof APIError && error.code === "deployment_plan_conflict") {
         if (applicationId) {
           try {
@@ -600,12 +606,12 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     return true;
   };
 
-  const createRequest = (): CreateApplicationRequest => {
+  const createRequest = (setup?: DeploymentSetupInput): CreateApplicationRequest => {
     if (kind === "local") {
-      return { name: name.trim(), description, sourcePath: localPath.trim() };
+      return { name: name.trim(), description, sourcePath: localPath.trim(), ...(setup ? { setup } : {}) };
     }
     if (!source) throw new Error("Complete the GitHub source selection before continuing.");
-    return { name: name.trim(), description, githubSource: source };
+    return { name: name.trim(), description, githubSource: source, ...(setup ? { setup } : {}) };
   };
 
   const saveCompose = () => {
@@ -658,8 +664,8 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
                     : inspection.composeCandidates.length
                       ? "Choose a Compose file, then inspect the exact source before saving."
                       : "Add a supported JavaScript project or a Compose file, then analyze again.";
-  const analyzeCurrentSource = () => {
-    setFormError("");
+  const analyzeCurrentSource = (setup?: DeploymentSetupInput, preserveError = false) => {
+    if (!preserveError) setFormError("");
     if (kind === "local") {
       if (!localPath.trim()) {
         setFieldErrors((current) => ({ ...current, localPath: "Enter a local source path." }));
@@ -667,7 +673,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         focusErrorSummary();
         return;
       }
-      runInspection({ sourcePath: localPath.trim() }, `local:${localPath.trim()}`);
+      runInspection({ sourcePath: localPath.trim(), ...(setup ? { setup } : {}) }, `local:${localPath.trim()}${setup ? `:${JSON.stringify(setup)}` : ""}`, Boolean(setup));
       return;
     }
     if (!source) {
@@ -675,7 +681,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
       focusErrorSummary();
       return;
     }
-    runInspection({ githubSource: source }, JSON.stringify(source));
+    runInspection({ githubSource: source, ...(setup ? { setup } : {}) }, `${JSON.stringify(source)}${setup ? `:${JSON.stringify(setup)}` : ""}`, Boolean(setup));
   };
 
   if (stage === "review" && inspection) return <div className="wizard source-wizard">
@@ -685,9 +691,11 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         inspection={inspection}
         expectedRevisionNumber={acceptedRevision?.revisionNumber ?? 0}
         pending={acceptPlan.isPending}
-        error={formError}
+        error={formError || (inspectSource.error ? safeMessage(inspectSource.error, "Could not review the deployment setup.") : acceptPlan.error ? safeMessage(acceptPlan.error, "Could not accept the deployment setup.") : "")}
+        apiErrors={inspectSource.error instanceof APIError ? inspectSource.error.errors : acceptPlan.error instanceof APIError ? acceptPlan.error.errors : {}}
+        reviewedSetup={reviewedSetup}
         onBack={() => { setFormError(""); setStage("source"); }}
-        onRefresh={analyzeCurrentSource}
+        onAnalyze={analyzeCurrentSource}
         onAccept={acceptGeneratedPlan}
         onUseCompose={inspection.composeCandidates.length > 0 && !draftApplicationId ? () => { setFormError(""); setStage("source"); } : undefined}
         draftSaved={Boolean(draftApplicationId)}
@@ -754,7 +762,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
           <input id="wizard-source-path" required placeholder="C:\projects\my-app" value={localPath} aria-invalid={Boolean(fieldErrors.localPath)} aria-describedby={fieldErrors.localPath ? "wizard-source-path-error" : undefined} onChange={(event) => { setLocalPath(event.target.value); setFieldErrors((current) => ({ ...current, localPath: undefined })); setFormError(""); invalidateInspection(); }} />
           {fieldErrors.localPath && <p id="wizard-source-path-error" className="form-error">{fieldErrors.localPath}</p>}
         </div>
-        <button type="button" className="button primary" disabled={!localPath.trim() || inspectSource.isPending} onClick={analyzeCurrentSource}>{inspectSource.isPending ? "Analyzing…" : "Analyze project"}</button>
+        <button type="button" className="button primary" disabled={!localPath.trim() || inspectSource.isPending} onClick={() => analyzeCurrentSource()}>{inspectSource.isPending ? "Analyzing…" : "Analyze project"}</button>
         {inspectionError && <div className="callout danger" role="alert">{inspectionError}</div>}
         <InspectionSummary inspection={inspection} />
       </section> : <section className="source-panel" aria-labelledby="github-source-title">
@@ -806,7 +814,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
             {repositoryId !== null && <><SourceSelect label="Tracked branch" collectionLabel="Branches" page={branchPage} id="github-branch" value={branch} onChange={(value) => { setBranch(value); resetAfterBranch(); }} loading={branches.isFetching} error={branches.error} disabled={branches.isFetching} placeholder="Choose a branch" emptyTitle="No branches found" emptyMessage="No branches are available. Push a tracked branch or choose another repository, then retry." onRetry={() => void branches.refetch()} items={branches.data?.items.map((item) => ({ value: item.name, label: item.protected ? `${item.name} (protected)` : item.name })) ?? []} />
             <PaginationControls label="branches" page={branchPage} onPageChange={changeBranchPage} hasNext={(branches.data?.items.length ?? 0) === (branches.data?.perPage ?? pageSize)} loading={branches.isFetching} statusId="github-branch-status" /></>}
           </div>}
-          {source && !composePath && <button type="button" className="button primary" disabled={inspectSource.isPending} onClick={analyzeCurrentSource}>{inspectSource.isPending ? "Analyzing…" : "Analyze project"}</button>}
+          {source && !composePath && <button type="button" className="button primary" disabled={inspectSource.isPending} onClick={() => analyzeCurrentSource()}>{inspectSource.isPending ? "Analyzing…" : "Analyze project"}</button>}
           {inspectionError && <div className="callout danger" role="alert">{inspectionError}</div>}
           {inspection && source && !composePath && inspection.composeCandidates.length > 0 && <div className="field"><label htmlFor="github-compose-path">Compose file</label><select id="github-compose-path" value={composePath} onChange={(event) => { setComposePath(event.target.value); invalidateInspection(); }}><option value="">Choose a Compose file</option>{inspection.composeCandidates.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}</select></div>}
           {source?.composePath && <button type="button" className="button" disabled={inspectSource.isPending} onClick={() => runInspection({ githubSource: source }, JSON.stringify(source))}>{inspectSource.isPending ? "Inspecting…" : "Inspect selected Compose file"}</button>}
@@ -814,7 +822,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
         </>}
       </section>}
       {kind === "github" && <p id="github-save-help" className="save-help">{githubSaveHelp}</p>}
-      <footer><button className="button" type="button" onClick={onCancel}>Back</button>{composeSelected ? <button className="button primary" aria-describedby="github-save-help" disabled={create.isPending}>{create.isPending ? "Saving…" : "Save application"}</button> : generatedCandidates.length > 0 ? <button className="button primary" type="button" onClick={() => setStage("review")}>Review setup</button> : inspection?.composeCandidates.length ? <button className="button primary" aria-describedby={kind === "github" ? "github-save-help" : undefined} disabled={create.isPending || (kind === "github" && (!composePath || !exactInspection))}>{create.isPending ? "Saving…" : "Save application"}</button> : <button className="button primary" type="button" disabled aria-describedby={kind === "github" ? "github-save-help" : undefined}>Save application</button>}</footer>
+      <footer><button className="button" type="button" onClick={onCancel}>Back</button>{composeSelected ? <button className="button primary" aria-describedby="github-save-help" disabled={create.isPending}>{create.isPending ? "Saving…" : "Save application"}</button> : generatedCandidates.length > 0 ? <button className="button primary" type="button" onClick={() => setStage("review")}>Review setup</button> : inspection?.composeCandidates.length ? <><button className="button" type="button" onClick={() => setStage("review")}>Configure build and run</button><button className="button primary" aria-describedby={kind === "github" ? "github-save-help" : undefined} disabled={create.isPending || (kind === "github" && (!composePath || !exactInspection))}>{create.isPending ? "Saving…" : "Save application"}</button></> : inspection ? <button className="button primary" type="button" onClick={() => setStage("review")}>Configure build and run</button> : <button className="button primary" type="button" disabled aria-describedby={kind === "github" ? "github-save-help" : undefined}>Save application</button>}</footer>
     </form>
   </div>;
 }

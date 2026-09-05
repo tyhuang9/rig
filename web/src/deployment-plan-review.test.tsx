@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DeploymentPlanCandidate, InspectResponse } from "./api";
-import { DeploymentPlanReview } from "./deployment-plan-review";
+import type { DeploymentPlanCandidate, DeploymentPlanRevision, InspectResponse } from "./api";
+import { DeploymentPlanReview, deploymentPlanRequest, deploymentSetupFromRevision } from "./deployment-plan-review";
 
 const evidence = [{ code: "package_script", path: "package.json", field: "scripts.start" }];
 
@@ -59,40 +59,57 @@ function inspection(candidates: DeploymentPlanCandidate[]): InspectResponse {
 }
 
 function renderReview(candidates = [candidate()]) {
+  const onAnalyze = vi.fn();
   const onAccept = vi.fn();
-  render(<DeploymentPlanReview inspection={inspection(candidates)} expectedRevisionNumber={0} pending={false} error="" onBack={vi.fn()} onRefresh={vi.fn()} onAccept={onAccept} />);
-  return onAccept;
+  const view = render(<DeploymentPlanReview inspection={inspection(candidates)} expectedRevisionNumber={0} pending={false} error="" onBack={vi.fn()} onAnalyze={onAnalyze} onAccept={onAccept} />);
+  return { onAnalyze, onAccept, view };
 }
 
 afterEach(cleanup);
 
 describe("DeploymentPlanReview", () => {
-  it("auto-populates one ready project and submits the immutable candidate identity", async () => {
-    const onAccept = renderReview();
-    expect(screen.getByRole("textbox", { name: "Build command" })).toHaveProperty("value", "npm run build");
-    expect(screen.getByRole("textbox", { name: "Run command (required)" })).toHaveProperty("value", "npm start");
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+  it("prefills detected server settings and reviews the exact editable setup", () => {
+    const { onAnalyze } = renderReview();
+    expect((screen.getByLabelText("Technology") as HTMLSelectElement).value).toBe("nextjs");
+    expect((screen.getByLabelText("Install command (optional)") as HTMLInputElement).value).toBe("npm ci");
+    expect((screen.getByLabelText("Build command (optional)") as HTMLInputElement).value).toBe("npm run build");
+    expect((screen.getByLabelText("Start command") as HTMLInputElement).value).toBe("npm start");
+
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+
+    expect(onAnalyze).toHaveBeenCalledWith({
+      components: [{ id: "web-12345678", technology: "nextjs", rootDirectory: ".", packageManager: "npm", nodeVersion: "24", installCommand: "npm ci", buildCommand: "npm run build", startCommand: "npm start", outputDirectory: "", internalPort: 3000, healthProbe: "/" }],
+    });
+  });
+
+  it("accepts only the user-reviewed candidate and sends setup with immutable identity", async () => {
+    const { onAnalyze, onAccept, view } = renderReview();
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    const setup = onAnalyze.mock.calls[0][0];
+    const reviewed = candidate({ id: "user:deployment-setup", origin: "user", digest: "d".repeat(64) });
+    view.rerender(<DeploymentPlanReview inspection={inspection([reviewed])} expectedRevisionNumber={4} pending={false} error="" reviewedSetup={setup} onAnalyze={onAnalyze} onAccept={onAccept} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Accept setup" })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
 
     expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({
-      candidateId: "candidate-web",
-      expectedCandidateDigest: "c".repeat(64),
+      candidateId: "user:deployment-setup",
+      expectedCandidateDigest: "d".repeat(64),
+      expectedRevisionNumber: 4,
       expectedSourceStructuralFingerprint: "b".repeat(64),
-      packageManager: "npm",
-      installBehavior: "npm ci",
-      components: [{ componentId: "web-12345678", buildCommand: "npm run build", runCommand: "npm start", nodeVersion: "24", internalPort: 3000, healthProbe: "/" }],
+      setup,
     }));
   });
 
-  it("keeps exact shell syntax as one command and marks the user edit", () => {
-    const onAccept = renderReview();
-    fireEvent.change(screen.getByRole("textbox", { name: "Run command (required)" }), { target: { value: "node server.js && echo ${READY} $()" } });
-    expect(screen.getByText("Changed")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
-    expect(onAccept.mock.calls[0][0].components[0].runCommand).toBe("node server.js && echo ${READY} $()");
+  it("keeps exact shell syntax in commands and requires a new review after an edit", () => {
+    const { onAnalyze } = renderReview();
+    fireEvent.change(screen.getByLabelText("Start command"), { target: { value: "node server.js && echo ${READY} $()" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    expect(onAnalyze.mock.calls[0][0].components[0].startCommand).toBe("node server.js && echo ${READY} $()");
   });
 
-  it("shows managed Vite serving behavior without exposing an editable run command", () => {
-    const vite = candidate({ components: [{
+  it("uses managed static serving and lets empty install and build commands explicitly skip phases", () => {
+    const staticCandidate = candidate({ components: [{
       ...candidate().components[0],
       kind: "static",
       framework: "vite",
@@ -100,108 +117,105 @@ describe("DeploymentPlanReview", () => {
       run: { present: true, command: "rig-static --root dist --port 8080", evidence },
       internalPort: { present: true, value: "8080", evidence },
     }] });
-    renderReview([vite]);
-    expect(screen.getByText(/serve generated static files/i)).toBeTruthy();
-    expect(screen.queryByDisplayValue(/rig-static/i)).toBeNull();
+    const { onAnalyze } = renderReview([staticCandidate]);
+    expect(screen.queryByLabelText("Start command")).toBeNull();
+    expect((screen.getByLabelText("Output directory") as HTMLInputElement).value).toBe("dist");
+    fireEvent.change(screen.getByLabelText("Install command (optional)"), { target: { value: "" } });
+    fireEvent.change(screen.getByLabelText("Build command (optional)"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    expect(onAnalyze.mock.calls[0][0].components[0]).toMatchObject({ technology: "static", installCommand: "", buildCommand: "", startCommand: "", outputDirectory: "dist", internalPort: 8080 });
   });
 
-  it("opens Advanced and validates user-supplied port and health settings", async () => {
-    const missing = candidate({
-      status: "needs_input",
-      missingFields: ["components.web-12345678.internal_port", "components.web-12345678.health_probe"],
-      advancedInputs: [
-        { componentId: "web-12345678", field: "components.web-12345678.internal_port", reason: "Port was not detected.", required: true },
-        { componentId: "web-12345678", field: "components.web-12345678.health_probe", reason: "Health path was not detected.", required: true },
-      ],
-      components: [{ ...candidate().components[0], internalPort: { present: false, evidence: [] }, healthProbe: { present: false, evidence: [] } }],
-    });
-    const onAccept = renderReview([missing]);
-    const details = screen.getByText(/advanced settings/i).closest("details");
-    expect(details?.hasAttribute("open")).toBe(true);
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
-    await waitFor(() => expect(document.getElementById("plan-web-12345678-internalPort-error")?.textContent).toMatch(/enter a port from 1 to 65535/i));
-    expect(document.getElementById("plan-web-12345678-healthProbe-error")?.textContent).toMatch(/enter a health-check path beginning with/i);
-    fireEvent.change(screen.getByRole("spinbutton", { name: "Internal port (required)" }), { target: { value: "4000" } });
-    fireEvent.change(screen.getByRole("textbox", { name: "Health-check path (required)" }), { target: { value: "/healthz" } });
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
-    await waitFor(() => expect(onAccept).toHaveBeenCalled());
+  it("offers a complete manual form when detection has no candidate", () => {
+    const { onAnalyze } = renderReview([]);
+    expect(screen.getByText(/no supported setup was detected/i)).toBeTruthy();
+    expect((screen.getByLabelText("Root directory") as HTMLInputElement).value).toBe(".");
+    expect((screen.getByLabelText("Start command") as HTMLInputElement).value).toBe("");
+    expect(screen.getByLabelText("Start command").getAttribute("aria-invalid")).toBe("true");
+    fireEvent.change(screen.getByLabelText("Start command"), { target: { value: "node server.js" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add static site" }));
+    expect(screen.getAllByLabelText("Technology")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    expect(onAnalyze).toHaveBeenCalledWith(expect.objectContaining({ components: expect.arrayContaining([expect.objectContaining({ technology: "static", outputDirectory: "dist", startCommand: "" })]) }));
   });
 
-  it("allows a Yarn lockfile with no declared version to be reviewed through an explicit install command", async () => {
-    const yarn = candidate({
-      status: "needs_input",
-      packageManager: { present: true, name: "yarn", version: "", lockfile: "yarn.lock", origin: "inferred", provenance: "lockfile", confidence: "high", evidence },
-      install: { present: false, command: "", phase: "", workingDirectory: ".", origin: "", provenance: "", confidence: "", evidence: [] },
-      missingFields: ["package_manager.version"],
-    });
-    const onAccept = renderReview([yarn]);
-    expect(screen.getByText(/Yarn does not declare its version/i)).toBeTruthy();
-    expect(screen.getByRole("button", { name: /accept setup/i }).hasAttribute("disabled")).toBe(false);
-    fireEvent.change(screen.getByRole("textbox", { name: "Dependency installation (required)" }), { target: { value: "corepack prepare yarn@1.22.22 --activate && corepack yarn install --frozen-lockfile" } });
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
-    await waitFor(() => expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ packageManager: "yarn", installBehavior: "corepack prepare yarn@1.22.22 --activate && corepack yarn install --frozen-lockfile" })));
-  });
-
-  it("requires an explicit root choice when independent projects are found", () => {
-    const api = candidate({ id: "candidate-api", rootDirectory: "apps/api", digest: "d".repeat(64), components: [{ ...candidate().components[0], id: "api-12345678", name: "api", rootDirectory: "apps/api", framework: "fastify" }] });
-    renderReview([candidate({ rootDirectory: "apps/web" }), api]);
-    expect(screen.getByRole("group", { name: /which app do you want to deploy/i })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /accept setup/i }).hasAttribute("disabled")).toBe(true);
-    fireEvent.click(screen.getByRole("radio", { name: /apps\/api/i }));
-    expect(screen.getByRole("button", { name: /accept setup/i }).hasAttribute("disabled")).toBe(false);
-  });
-
-  it("blocks unsupported topology instead of presenting editable commands", () => {
-    renderReview([candidate({ status: "unsupported", findings: [{ code: "worker", severity: "error", message: "Worker topologies need explicit configuration." }] })]);
-    expect(screen.getByRole("heading", { name: /can’t safely identify/i })).toBeTruthy();
-    expect(screen.queryByLabelText(/run command/i)).toBeNull();
-  });
-
-  it("shows migration risk and keeps approval separate from setup acceptance", () => {
-    const migration = candidate({ components: [{ ...candidate().components[0], migrationFingerprint: "e".repeat(64), migration: { present: true, command: "npx prisma migrate deploy", evidence } }] });
-    const onAccept = renderReview([migration]);
-    expect(screen.getByText(/will not automatically undo database changes/i)).toBeTruthy();
-    expect(screen.getByText(/does not approve the migration/i)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
-    expect(onAccept.mock.calls[0][0].migrationCommand).toBe("npx prisma migrate deploy");
-  });
-
-  it("reconciles a refreshed single candidate and accepts its new immutable identity", async () => {
-    const onAccept = vi.fn();
-    const initial = inspection([candidate()]);
-    const refreshed = inspection([candidate({ id: "candidate-refreshed", digest: "d".repeat(64), components: [{ ...candidate().components[0], build: { present: true, command: "npm run build:new", evidence } }] })]);
-    const view = render(<DeploymentPlanReview inspection={initial} expectedRevisionNumber={0} pending={false} error="" onBack={vi.fn()} onRefresh={vi.fn()} onAccept={onAccept} />);
-
-    view.rerender(<DeploymentPlanReview inspection={refreshed} expectedRevisionNumber={0} pending={false} error="" onBack={vi.fn()} onRefresh={vi.fn()} onAccept={onAccept} />);
-
-    await waitFor(() => expect(screen.getByRole("textbox", { name: "Build command" })).toHaveProperty("value", "npm run build:new"));
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
-    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ candidateId: "candidate-refreshed", expectedCandidateDigest: "d".repeat(64) }));
-  });
-
-  it("opens collapsed Advanced settings and associates validation errors with their fields", async () => {
+  it("validates advanced port and health fields and focuses the error summary", async () => {
     renderReview();
-    const details = screen.getByText(/advanced settings/i).closest("details");
-    expect(details?.hasAttribute("open")).toBe(false);
-    const port = document.getElementById("plan-web-12345678-internalPort") as HTMLInputElement;
-    fireEvent.change(port, { target: { value: "" } });
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
-
-    await waitFor(() => expect(details?.hasAttribute("open")).toBe(true));
-    expect(port.getAttribute("aria-describedby")).toBe("plan-web-12345678-internalPort-error");
+    fireEvent.change(screen.getByLabelText("Internal port"), { target: { value: "0" } });
+    fireEvent.change(screen.getByLabelText("Health-check path"), { target: { value: "health" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    await waitFor(() => expect(document.getElementById("deployment-setup-0-internalPort-error")?.textContent).toMatch(/port from 1/i));
+    expect(document.getElementById("deployment-setup-0-healthProbe-error")?.textContent).toMatch(/beginning with/i);
     expect(document.activeElement).toHaveProperty("className", "error-summary");
   });
 
-  it("keeps reset available and returns focus to the edited command", async () => {
-    renderReview();
-    const run = screen.getByRole("textbox", { name: "Run command (required)" }) as HTMLInputElement;
-    fireEvent.change(run, { target: { value: "node custom.js" } });
-    const reset = screen.getByRole("button", { name: /reset web run command to suggestion/i });
-    reset.focus();
-    fireEvent.click(reset);
+  it("preserves edits during reanalysis until Reset to detected settings is selected", async () => {
+    const { onAnalyze, onAccept, view } = renderReview();
+    fireEvent.change(screen.getByLabelText("Start command"), { target: { value: "node custom.js" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    const reviewed = candidate({ id: "user:deployment-setup", origin: "user", components: [{ ...candidate().components[0], build: { present: true, command: "npm run build:changed", evidence } }] });
+    view.rerender(<DeploymentPlanReview inspection={inspection([reviewed])} expectedRevisionNumber={0} pending={false} error="" onAnalyze={onAnalyze} onAccept={onAccept} />);
 
-    await waitFor(() => expect(document.activeElement).toBe(run));
-    expect(run.value).toBe("npm start");
-    expect(reset.hasAttribute("disabled")).toBe(true);
+    await waitFor(() => expect((screen.getByLabelText("Start command") as HTMLInputElement).value).toBe("node custom.js"));
+    fireEvent.click(screen.getByRole("button", { name: "Reset to detected settings" }));
+    expect((screen.getByLabelText("Start command") as HTMLInputElement).value).toBe("npm start");
+  });
+
+  it("creates an acceptance request that does not include legacy override fields", () => {
+    const source = inspection([candidate()]);
+    const setup = { components: [{ id: "web-12345678", technology: "nextjs", rootDirectory: ".", packageManager: "npm", nodeVersion: "24", installCommand: "npm ci", buildCommand: "npm run build", startCommand: "npm start", outputDirectory: "", internalPort: 3000, healthProbe: "/" }] };
+    const request = deploymentPlanRequest(source, candidate({ id: "user:deployment-setup", origin: "user" }), setup, 2);
+    expect(request).toEqual(expect.objectContaining({ setup, expectedRevisionNumber: 2 }));
+    expect(request).not.toHaveProperty("installBehavior");
+    expect(request).not.toHaveProperty("components");
+  });
+
+  it("uses static setup defaults only for a newly added static site and limits the layout", () => {
+    renderReview();
+    fireEvent.click(screen.getByRole("button", { name: "Add static site" }));
+    expect((screen.getAllByLabelText("Install command (optional)")[1] as HTMLInputElement).value).toBe("npm install");
+    expect((screen.getAllByLabelText("Build command (optional)")[1] as HTMLInputElement).value).toBe("npm run build");
+    expect((screen.getByRole("button", { name: "Add server" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Add static site" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("does not overwrite edited values when a different detection is selected", () => {
+    const alternative = candidate({ id: "candidate-alternative", rootDirectory: "apps/web", components: [{ ...candidate().components[0], id: "alt", rootDirectory: "apps/web", run: { present: true, command: "node detected.js", evidence } }] });
+    renderReview([candidate(), alternative]);
+    fireEvent.change(screen.getByLabelText("Start command"), { target: { value: "node custom.js" } });
+    fireEvent.click(screen.getByLabelText(/apps\/web/i));
+    expect((screen.getByLabelText("Start command") as HTMLInputElement).value).toBe("node custom.js");
+    fireEvent.click(screen.getByRole("button", { name: "Reset to detected settings" }));
+    expect((screen.getByLabelText("Start command") as HTMLInputElement).value).toBe("node detected.js");
+  });
+
+  it("sends an edited advanced port as a number", () => {
+    const { onAnalyze } = renderReview();
+    fireEvent.change(screen.getByLabelText("Internal port"), { target: { value: "4100" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    expect(onAnalyze.mock.calls[0][0].components[0].internalPort).toBe(4100);
+  });
+
+  it("reconstructs legacy component names and only parses a managed static output command", () => {
+    const revision = {
+      components: [
+        { name: "public.site", role: "static", rootDirectory: ".", packageManager: "npm", nodeVersion: "24", installBehavior: "npm ci", buildCommand: "npm run build", runCommand: "rig-static --root 'public/site' --port 8080", internalPort: 8080, healthProbe: "/" },
+        { name: "unknown", role: "static", rootDirectory: ".", packageManager: "npm", nodeVersion: "24", installBehavior: "", buildCommand: "", runCommand: "serve dist", internalPort: 8080, healthProbe: "/" },
+      ],
+      migration: { present: false },
+    } as DeploymentPlanRevision;
+    expect(deploymentSetupFromRevision(revision).components).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "public.site", outputDirectory: "public/site" }),
+      expect.objectContaining({ id: "unknown", outputDirectory: "" }),
+    ]));
+  });
+
+  it("marks command errors and anchors dotted component identities to the affected input", () => {
+    const dotted = candidate({ components: [{ ...candidate().components[0], id: "apps.web" }] });
+    render(<DeploymentPlanReview inspection={inspection([dotted])} expectedRevisionNumber={0} pending={false} error="" apiErrors={{ "components.0.installCommand": "Use a supported command." }} onAnalyze={vi.fn()} onAccept={vi.fn()} />);
+    const input = screen.getByLabelText("Install command (optional)");
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(input.getAttribute("aria-describedby")).toBe("deployment-setup-0-installCommand-error");
+    expect(screen.getByRole("link", { name: /install command/i }).getAttribute("href")).toBe("#deployment-setup-0-installCommand");
   });
 });

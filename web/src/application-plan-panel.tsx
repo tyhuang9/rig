@@ -6,10 +6,14 @@ import {
   type AcceptDeploymentPlanRequest,
   type Application,
   type DeploymentPlanRevision,
+  type DeploymentSetupInput,
   type InspectRequest,
   type InspectResponse,
 } from "./api";
-import { DeploymentPlanReview } from "./deployment-plan-review";
+import {
+  DeploymentPlanReview,
+  deploymentSetupFromRevision,
+} from "./deployment-plan-review";
 
 const noPlan = (error: unknown) =>
   error instanceof APIError &&
@@ -64,6 +68,9 @@ const runtimeLabel = (strategy?: string) =>
       ? "Compose runtime"
       : "Runtime not recognized";
 
+const composeStrategy = (strategy?: string) =>
+  strategy?.toLowerCase().includes("compose") ?? false;
+
 export function ApplicationPlanPanel({ app }: { app: Application }) {
   const queryClient = useQueryClient();
   const contextKey = sourceIdentity(app);
@@ -83,6 +90,9 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
   const [approvingMigration, setApprovingMigration] = useState(false);
   const [panelError, setPanelError] = useState("");
   const [reviewError, setReviewError] = useState("");
+  const [reviewFieldErrors, setReviewFieldErrors] = useState<Record<string, string>>({});
+  const [reviewedSetup, setReviewedSetup] = useState<DeploymentSetupInput | null>(null);
+  const [reviewNeedsRefresh, setReviewNeedsRefresh] = useState(false);
   const [announcement, setAnnouncement] = useState("");
   const plan = useQuery({
     queryKey: ["deployment-plan", app.id],
@@ -104,6 +114,9 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
     setApprovingMigration(false);
     setPanelError("");
     setReviewError("");
+    setReviewFieldErrors({});
+    setReviewedSetup(null);
+    setReviewNeedsRefresh(false);
     setAnnouncement("");
     return () => {
       if (context.current === contextKey) context.current = "";
@@ -133,7 +146,10 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
     return revision;
   };
 
-  const analyze = async (reason: "requested" | "stale" = "requested") => {
+  const analyze = async (
+    setup?: DeploymentSetupInput,
+    reason: "requested" | "stale" = "requested",
+  ) => {
     const request = applicationInspectionRequest(app);
     if (!request) {
       setPanelError(
@@ -142,18 +158,26 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
       setAnnouncement("Source analysis is unavailable.");
       return;
     }
+    if (setup && composeStrategy(plan.data?.strategy) && !plan.data?.setup) {
+      setPanelError("This application uses its accepted Compose setup. Edit and review that Compose source without changing deployment strategies.");
+      setAnnouncement("The existing Compose strategy remains in use.");
+      return;
+    }
     const operationContext = context.current;
     const expectedRevisionNumber = plan.data?.revisionNumber ?? 0;
     const generation = inspectionGeneration.current + 1;
     inspectionGeneration.current = generation;
+    const retainingEditor = Boolean(setup) || Boolean(reviewing && inspection && inspectionContext === operationContext);
+    if (!retainingEditor) setInspection(null);
     setReviewing(true);
-    setInspection(null);
     setInspectionPending(true);
     setPanelError("");
     setReviewError("");
+    setReviewFieldErrors({});
+    setReviewedSetup(null);
     setAnnouncement("Analyzing the current application source.");
     try {
-      const result = await api.inspect(request);
+      const result = await api.inspect({ ...request, ...(setup ? { setup } : {}) });
       if (
         context.current !== operationContext ||
         inspectionGeneration.current !== generation
@@ -162,6 +186,8 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
       setInspection(result);
       setInspectionContext(operationContext);
       setInspectionRevision(expectedRevisionNumber);
+      setReviewedSetup(setup && result.analysis.candidates.some((candidate) => candidate.id === "user:deployment-setup" || candidate.origin.toLowerCase() === "user") ? { components: setup.components.map((component) => ({ ...component })), ...(setup.migrationCommand ? { migrationCommand: setup.migrationCommand } : {}) } : null);
+      setReviewNeedsRefresh(false);
       if (reason === "stale") {
         setReviewError(
           "The source changed while this setup was being accepted. Review the updated setup before trying again.",
@@ -170,17 +196,25 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
       } else {
         setAnnouncement("Current source analysis is ready for review.");
       }
-    } catch {
+    } catch (error) {
       if (
         context.current !== operationContext ||
         inspectionGeneration.current !== generation
       )
         return;
-      setReviewing(false);
-      setPanelError(
-        "Rig could not analyze the current source. Check source access and try again.",
-      );
-      setAnnouncement("Source analysis failed.");
+      if (error instanceof APIError && error.code === "invalid_deployment_setup") {
+        setReviewError(error.detail);
+        setReviewFieldErrors(error.errors);
+        setAnnouncement("Deployment settings need changes before review.");
+      } else {
+        const message = "Rig could not analyze the current source. Check source access and try again.";
+        if (retainingEditor) setReviewError(message);
+        else {
+          setReviewing(false);
+          setPanelError(message);
+        }
+        setAnnouncement("Source analysis failed.");
+      }
     } finally {
       if (
         context.current === operationContext &&
@@ -220,7 +254,7 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
         error instanceof APIError &&
         error.code === "deployment_plan_review_required"
       ) {
-        await analyze("stale");
+        await analyze(request.setup, "stale");
       } else if (
         error instanceof APIError &&
         error.code === "deployment_plan_conflict"
@@ -228,26 +262,24 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
         try {
           await reloadAcceptedPlan(operationContext);
           if (context.current !== operationContext) return;
-          setReviewing(false);
-          setInspection(null);
-          setInspectionContext("");
-          setPanelError(
+          setReviewing(true);
+          setReviewNeedsRefresh(true);
+          setReviewError(
             "The deployment setup was updated in another session. Review the current source again before making another change.",
           );
           setAnnouncement("A newer accepted deployment setup was loaded.");
         } catch {
           if (context.current !== operationContext) return;
-          setReviewing(false);
-          setInspectionContext("");
-          setPanelError(
+          setReviewing(true);
+          setReviewNeedsRefresh(true);
+          setReviewError(
             "The deployment setup changed, but Rig could not load the accepted revision. Try again.",
           );
           setAnnouncement("The accepted deployment setup could not be reloaded.");
         }
       } else {
-        setReviewError(
-          "Rig could not accept this deployment setup. Analyze the current source and try again.",
-        );
+        setReviewError(error instanceof APIError ? error.detail : "Rig could not accept this deployment setup. Analyze the current source and try again.");
+        setReviewFieldErrors(error instanceof APIError && error.code === "invalid_deployment_setup" ? error.errors : {});
         setAnnouncement("Deployment setup was not accepted.");
       }
     } finally {
@@ -328,7 +360,9 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
     }
   };
 
-  if (reviewing && inspection && inspectionContext === contextKey) {
+  const accepted = plan.data ?? null;
+  const directEditableSetup = Boolean(accepted && !composeStrategy(accepted.strategy) && (accepted.setup || accepted.components.length > 0));
+  if (directEditableSetup || (reviewing && inspection && inspectionContext === contextKey)) {
     return (
       <div className="application-plan-review">
         <span
@@ -339,28 +373,53 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
         >
           {announcement}
         </span>
+        {accepted?.migration.present && (
+          <div
+            className={
+              accepted.migration.approvalStatus === "approved"
+                ? "callout success"
+                : "migration-review"
+            }
+          >
+            <strong>
+              {accepted.migration.approvalStatus === "approved"
+                ? "Database migration approved"
+                : "Database migration needs separate approval"}
+            </strong>
+            {accepted.migration.approvalStatus === "approved" ? (
+              <span>The migration is approved for deployment setup revision {accepted.revisionNumber}.</span>
+            ) : (
+              <><p>This can change persistent data. Old and new versions may briefly share the migrated database, and Rig will not automatically roll it back.</p><button className="button" type="button" disabled={approvingMigration || !accepted.revisionId} onClick={() => void approveMigration(accepted)}>{approvingMigration ? "Approving migration…" : `Approve migration for revision ${accepted.revisionNumber}`}</button></>
+            )}
+          </div>
+        )}
         <DeploymentPlanReview
-          key={`${contextKey}:${inspection.analysis.structuralFingerprint}`}
-          inspection={inspection}
-          expectedRevisionNumber={inspectionRevision}
-          pending={accepting}
+          inspection={inspection ?? undefined}
+          initialSetup={directEditableSetup && accepted ? deploymentSetupFromRevision(accepted) : undefined}
+          expectedRevisionNumber={directEditableSetup && accepted ? accepted.revisionNumber : inspectionRevision}
+          pending={accepting || inspectionPending}
           error={reviewError}
-          onBack={() => {
+          apiErrors={reviewFieldErrors}
+          reviewedSetup={reviewedSetup}
+          reviewRequired={reviewNeedsRefresh}
+          onBack={!directEditableSetup ? () => {
             setReviewing(false);
             setInspection(null);
             setInspectionContext("");
             setReviewError("");
+            setReviewFieldErrors({});
+            setReviewedSetup(null);
+            setReviewNeedsRefresh(false);
             setAnnouncement("Returned to the accepted deployment setup.");
             focusHeading();
-          }}
-          onRefresh={() => void analyze()}
+          } : undefined}
+          onAnalyze={(setup) => void analyze(setup)}
           onAccept={(request) => void accept(request)}
         />
       </div>
     );
   }
 
-  const accepted = plan.data ?? null;
   const sourceRequest = applicationInspectionRequest(app);
   const busy =
     plan.isLoading || inspectionPending || accepting || approvingMigration;
@@ -425,10 +484,7 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
                 </div>
                 <span className="badge">Accepted</span>
               </header>
-              <p>
-                Rig will keep using this immutable revision until a reviewed
-                source change is accepted.
-              </p>
+              <p>{composeStrategy(accepted.strategy) ? "This application continues to use its accepted Compose source. Build and run settings are not switched to a generated strategy here." : "Rig will keep using this immutable revision until a reviewed source change is accepted."}</p>
             </article>
           ) : (
             <div className="callout info">
@@ -487,7 +543,7 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
               </span>
             </div>
           )}
-          <footer>
+          {!composeStrategy(accepted?.strategy) && <footer>
             <button
               className="button primary"
               type="button"
@@ -499,7 +555,7 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
             >
               {inspectionPending ? "Analyzing current source…" : "Review current source"}
             </button>
-          </footer>
+          </footer>}
         </>
       ) : null}
     </section>

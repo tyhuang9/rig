@@ -1,289 +1,414 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   AcceptDeploymentPlanRequest,
-  AnalysisComponent,
-  AnalysisEvidence,
   DeploymentPlanCandidate,
+  DeploymentPlanRevision,
+  DeploymentSetupComponentInput,
+  DeploymentSetupInput,
   InspectResponse,
 } from "./api";
 
-type ComponentDraft = {
-  buildCommand: string;
-  runCommand: string;
-  nodeVersion: string;
-  internalPort: string;
-  healthProbe: string;
-};
+type Technology = "node" | "nextjs" | "static";
+type FieldErrors = Record<string, string>;
 
-type Draft = {
-  packageManager: string;
-  installBehavior: string;
-  migrationCommand: string;
-  components: Record<string, ComponentDraft>;
-};
+const supportedNodeVersions = ["20", "22", "24"] as const;
 
-const overrideableMissingField = (field: string) =>
-  field === "package_manager" || field === "package_manager.version" || field === "install_behavior" || field === "node_version" ||
-  field.endsWith(".build") || field.endsWith(".run") || field.endsWith(".internal_port") || field.endsWith(".health_probe");
+function technologyFor(component: DeploymentPlanCandidate["components"][number]): Technology {
+  if (component.kind === "static") return "static";
+  if (component.framework.toLowerCase() === "nextjs" || component.framework.toLowerCase() === "next.js") return "nextjs";
+  return "node";
+}
 
-function inferredDraft(candidate: DeploymentPlanCandidate): Draft {
+function supportedNodeVersion(value: string | undefined) {
+  const match = value?.match(/(?:^|v)(20|22|24)(?:$|\D)/);
+  return match?.[1] ?? "24";
+}
+
+function defaultComponent(id = "component-1", technology: Technology = "node"): DeploymentSetupComponentInput {
+  const staticSite = technology === "static";
   return {
-    packageManager: candidate.packageManager.name ?? "",
-    installBehavior: candidate.install?.command ?? "",
-    migrationCommand: candidate.components.find((component) => component.migration?.present)?.migration?.command ?? "",
-    components: Object.fromEntries(candidate.components.map((component) => [component.id, {
-      buildCommand: component.build?.command ?? "",
-      runCommand: component.run?.command ?? "",
-      nodeVersion: candidate.nodeVersion.value ?? "",
-      internalPort: component.internalPort?.value ?? "",
-      healthProbe: component.healthProbe?.path ?? "",
-    }])),
+    id,
+    technology,
+    rootDirectory: ".",
+    packageManager: "npm",
+    nodeVersion: "24",
+    installCommand: staticSite ? "npm install" : "",
+    buildCommand: staticSite ? "npm run build" : "",
+    startCommand: "",
+    outputDirectory: staticSite ? "dist" : "",
+    internalPort: staticSite ? 8080 : 3000,
+    healthProbe: "/",
   };
 }
 
-function evidenceLabel(evidence: AnalysisEvidence[]) {
-  if (evidence.length === 0) return "Rig did not record supporting evidence for this value.";
-  return evidence.map((item) => [item.path, item.field || item.code].filter(Boolean).join(" · ")).join(", ");
+export function defaultDeploymentSetup(): DeploymentSetupInput {
+  return { components: [defaultComponent()] };
 }
 
-function fieldMissing(candidate: DeploymentPlanCandidate, componentId: string, suffix: string) {
-  return candidate.missingFields.includes(`components.${componentId}.${suffix}`);
+export function deploymentSetupFromCandidate(candidate: DeploymentPlanCandidate): DeploymentSetupInput {
+  const migrationCommand = candidate.components.find((component) => component.migration?.present)?.migration?.command;
+  return {
+    components: candidate.components.map((component) => {
+      const technology = technologyFor(component);
+      const staticSite = technology === "static";
+      return {
+        id: component.id,
+        technology,
+        rootDirectory: component.rootDirectory || ".",
+        packageManager: ["npm", "pnpm", "yarn"].includes(candidate.packageManager.name ?? "") ? candidate.packageManager.name! : "npm",
+        nodeVersion: supportedNodeVersion(candidate.nodeVersion.value),
+        installCommand: candidate.install?.command ?? "",
+        buildCommand: component.build?.command ?? "",
+        startCommand: staticSite ? "" : component.run?.command ?? "",
+        outputDirectory: staticSite ? component.staticOutputDirectory || "dist" : "",
+        internalPort: Number(component.internalPort?.value) || (staticSite ? 8080 : 3000),
+        healthProbe: component.healthProbe?.path || "/",
+      };
+    }),
+    ...(migrationCommand ? { migrationCommand } : {}),
+  };
 }
 
-function validate(candidate: DeploymentPlanCandidate, draft: Draft) {
-  const errors: Record<string, string> = {};
-  if (!draft.packageManager) errors.packageManager = "Choose npm, pnpm, or Yarn.";
-  if (!draft.installBehavior.trim()) errors.installBehavior = "Enter the dependency installation command.";
-  for (const component of candidate.components) {
-    const value = draft.components[component.id];
-    if (!value) continue;
-    if (fieldMissing(candidate, component.id, "build") && !value.buildCommand.trim()) errors[`${component.id}.buildCommand`] = "Enter a build command.";
-    if (!value.runCommand.trim()) errors[`${component.id}.runCommand`] = "Enter a run command.";
-    if (!value.nodeVersion.trim()) errors[`${component.id}.nodeVersion`] = "Enter a supported Node.js version.";
-    const port = Number(value.internalPort);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) errors[`${component.id}.internalPort`] = "Enter a port from 1 to 65535.";
-    if (!value.healthProbe.startsWith("/")) errors[`${component.id}.healthProbe`] = "Enter a health-check path beginning with /.";
+export function deploymentSetupFromRevision(revision: DeploymentPlanRevision): DeploymentSetupInput {
+  if (revision.setup) return copySetup(revision.setup);
+  return {
+    components: revision.components.map((component, index) => {
+      const staticSite = component.role.toLowerCase().includes("static");
+      return {
+        id: component.name || `legacy-component-${index + 1}`,
+        technology: staticSite ? "static" : "node",
+        rootDirectory: component.rootDirectory || ".",
+        packageManager: ["npm", "pnpm", "yarn"].includes(component.packageManager) ? component.packageManager : "npm",
+        nodeVersion: supportedNodeVersion(component.nodeVersion),
+        installCommand: component.installBehavior ?? "",
+        buildCommand: component.buildCommand ?? "",
+        startCommand: staticSite ? "" : component.runCommand ?? "",
+        outputDirectory: staticSite ? legacyStaticOutputDirectory(component.runCommand) : "",
+        internalPort: component.internalPort || (staticSite ? 8080 : 3000),
+        healthProbe: component.healthProbe || "/",
+      };
+    }),
+    ...(revision.migration.command ? { migrationCommand: revision.migration.command } : {}),
+  };
+}
+
+function legacyStaticOutputDirectory(command: string) {
+  const quoted = command.match(/^rig-static\s+--root\s+'((?:[^']|'"'"')*)'\s+--port\s+\d+\s*$/);
+  if (quoted) return quoted[1].replaceAll("'\"'\"'", "'");
+  const plain = command.match(/^rig-static\s+--root\s+([A-Za-z0-9._/-]+)\s+--port\s+\d+\s*$/);
+  return plain?.[1] ?? "";
+}
+
+function copySetup(setup: DeploymentSetupInput): DeploymentSetupInput {
+  return {
+    components: setup.components.map((component) => ({ ...component })),
+    ...(setup.migrationCommand ? { migrationCommand: setup.migrationCommand } : {}),
+  };
+}
+
+function setupKey(setup: DeploymentSetupInput) {
+  return JSON.stringify({
+    components: setup.components.map((component) => ({
+      ...component,
+      rootDirectory: component.rootDirectory.trim(),
+      healthProbe: component.healthProbe.trim(),
+      outputDirectory: component.outputDirectory.trim(),
+    })),
+    migrationCommand: setup.migrationCommand ?? "",
+  });
+}
+
+function fieldKey(componentId: string, field: string) {
+  return `components.${componentId}.${field}`;
+}
+
+function fieldId(index: number, field: string) {
+  return `deployment-setup-${index}-${field}`;
+}
+
+function userCandidate(candidate: DeploymentPlanCandidate | undefined) {
+  return candidate?.id === "user:deployment-setup" || candidate?.origin.toLowerCase() === "user";
+}
+
+function viableCandidates(inspection: InspectResponse | undefined) {
+  return inspection?.analysis.candidates.filter((candidate) => candidate.kind === "javascript" && candidate.status !== "unsupported") ?? [];
+}
+
+function validate(setup: DeploymentSetupInput): FieldErrors {
+  const errors: FieldErrors = {};
+  if (setup.components.length === 0) errors.components = "Add a server or static-site component.";
+  const staticCount = setup.components.filter((component) => component.technology === "static").length;
+  const serverCount = setup.components.length - staticCount;
+  if (staticCount > 1 || serverCount > 1 || setup.components.length > 2) {
+    errors.components = "Choose one server, one static site, or a static site and server.";
+  }
+  const ids = new Set<string>();
+  for (const component of setup.components) {
+    const prefix = (field: string) => fieldKey(component.id, field);
+    if (!component.id || ids.has(component.id)) errors[prefix("id")] = "Components need unique identities.";
+    ids.add(component.id);
+    if (!(["node", "nextjs", "static"] as string[]).includes(component.technology)) errors[prefix("technology")] = "Choose Node.js, Next.js, or Static site.";
+    if (!component.rootDirectory.trim()) errors[prefix("rootDirectory")] = "Enter the component root directory.";
+    if (!(["npm", "pnpm", "yarn"] as string[]).includes(component.packageManager)) errors[prefix("packageManager")] = "Choose npm, pnpm, or Yarn.";
+    if (!supportedNodeVersions.includes(component.nodeVersion as (typeof supportedNodeVersions)[number])) errors[prefix("nodeVersion")] = "Choose Node.js 20, 22, or 24.";
+    const port = Number(component.internalPort);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) errors[prefix("internalPort")] = "Enter a port from 1 to 65535.";
+    if (!component.healthProbe.trim().startsWith("/")) errors[prefix("healthProbe")] = "Enter a health-check path beginning with /.";
+    if (component.technology === "static") {
+      if (!component.outputDirectory.trim()) errors[prefix("outputDirectory")] = "Enter the generated static directory.";
+    } else if (!component.startCommand.trim()) errors[prefix("startCommand")] = "Enter a server start command.";
   }
   return errors;
 }
 
-function errorTarget(key: string) {
-  if (key === "packageManager") return { id: "plan-package-manager", label: "Package manager" };
-  if (key === "installBehavior") return { id: "plan-install-behavior", label: "Dependency installation" };
-  const separator = key.lastIndexOf(".");
-  const componentId = key.slice(0, separator);
-  const field = key.slice(separator + 1);
-  const labels: Record<string, string> = { buildCommand: "Build command", runCommand: "Run command", nodeVersion: "Node.js version", internalPort: "Internal port", healthProbe: "Health-check path" };
-  return { id: `plan-${componentId}-${field}`, label: labels[field] ?? field };
+function errorTarget(key: string, components: DeploymentSetupComponentInput[]) {
+  if (key === "components") return { id: "deployment-setup-components", label: "Components" };
+  const component = components.find((item) => key.startsWith(`components.${item.id}.`));
+  const field = component ? key.slice(`components.${component.id}.`.length) : "";
+  const index = component ? components.indexOf(component) : -1;
+  const labels: Record<string, string> = {
+    rootDirectory: "Root directory", packageManager: "Package manager", nodeVersion: "Node.js version",
+    installCommand: "Install command", buildCommand: "Build command", startCommand: "Start command",
+    outputDirectory: "Output directory", internalPort: "Internal port", healthProbe: "Health-check path",
+  };
+  return { id: index >= 0 ? fieldId(index, field) : "deployment-setup-components", label: labels[field] ?? "Component" };
 }
 
-export function deploymentPlanRequest(inspection: InspectResponse, candidate: DeploymentPlanCandidate, draft: Draft, expectedRevisionNumber: number): AcceptDeploymentPlanRequest {
+function normalizedFieldErrors(errors: FieldErrors, components: DeploymentSetupComponentInput[]) {
+  return Object.fromEntries(Object.entries(errors).map(([key, message]) => {
+    const match = key.match(/^components\.(\d+)\.(.+)$/);
+    if (!match) return [key, message];
+    const component = components[Number(match[1])];
+    return [component ? fieldKey(component.id, match[2]) : key, message];
+  }));
+}
+
+export function deploymentPlanRequest(inspection: InspectResponse, candidate: DeploymentPlanCandidate, setup: DeploymentSetupInput, expectedRevisionNumber: number): AcceptDeploymentPlanRequest {
   return {
     candidateId: candidate.id,
     expectedCandidateDigest: candidate.digest,
     expectedRevisionNumber,
     expectedSourceStructuralFingerprint: inspection.analysis.structuralFingerprint,
-    packageManager: draft.packageManager,
-    installBehavior: draft.installBehavior,
-    migrationCommand: draft.migrationCommand,
-    components: candidate.components.map((component) => ({
-      componentId: component.id,
-      buildCommand: draft.components[component.id]?.buildCommand ?? "",
-      runCommand: draft.components[component.id]?.runCommand ?? "",
-      nodeVersion: draft.components[component.id]?.nodeVersion ?? "",
-      internalPort: Number(draft.components[component.id]?.internalPort ?? 0),
-      healthProbe: draft.components[component.id]?.healthProbe ?? "",
-    })),
+    setup: copySetup(setup),
   };
 }
 
 export function DeploymentPlanReview({
   inspection,
+  initialSetup,
   expectedRevisionNumber,
   pending,
   error,
+  apiErrors = {},
+  reviewedSetup = null,
+  reviewRequired = false,
   onBack,
-  onRefresh,
+  onAnalyze,
   onAccept,
   onUseCompose,
   draftSaved = false,
   onOpenSavedDraft,
 }: {
-  inspection: InspectResponse;
+  inspection?: InspectResponse;
+  initialSetup?: DeploymentSetupInput;
   expectedRevisionNumber: number;
   pending: boolean;
   error: string;
-  onBack: () => void;
-  onRefresh: () => void;
+  apiErrors?: FieldErrors;
+  reviewedSetup?: DeploymentSetupInput | null;
+  reviewRequired?: boolean;
+  onBack?: () => void;
+  onAnalyze: (setup: DeploymentSetupInput) => void;
   onAccept: (request: AcceptDeploymentPlanRequest) => void;
   onUseCompose?: () => void;
   draftSaved?: boolean;
   onOpenSavedDraft?: () => void;
 }) {
-  const candidates = useMemo(() => inspection.analysis.candidates.filter((candidate) => candidate.kind === "javascript" && candidate.status !== "unsupported" && candidate.components.length > 0), [inspection]);
-  const [candidateId, setCandidateId] = useState(candidates.length === 1 ? candidates[0].id : "");
-  const candidate = candidates.find((item) => item.id === candidateId);
-  const [draft, setDraft] = useState<Draft | null>(() => candidate ? inferredDraft(candidate) : null);
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  const [changed, setChanged] = useState(new Set<string>());
+  const candidates = useMemo(() => viableCandidates(inspection), [inspection]);
+  const initialCandidate = candidates.length === 1 ? candidates[0] : undefined;
+  const [candidateId, setCandidateId] = useState(initialCandidate?.id ?? "");
+  const initialDraft = useRef<DeploymentSetupInput | null>(null);
+  if (!initialDraft.current) initialDraft.current = copySetup(initialSetup ?? (initialCandidate ? deploymentSetupFromCandidate(initialCandidate) : defaultDeploymentSetup()));
+  const [draft, setDraft] = useState<DeploymentSetupInput>(initialDraft.current);
+  const [detectedSetup, setDetectedSetup] = useState<DeploymentSetupInput | null>(() => initialCandidate && !userCandidate(initialCandidate) ? deploymentSetupFromCandidate(initialCandidate) : null);
+  const [errors, setErrors] = useState<FieldErrors>(() => validate(initialDraft.current!));
+  const [dirty, setDirty] = useState(false);
+  const [dismissedAPIErrorKeys, setDismissedAPIErrorKeys] = useState<Set<string>>(new Set());
+  const [errorDismissed, setErrorDismissed] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [componentSequence, setComponentSequence] = useState(() => draft.components.length + 1);
   const errorSummary = useRef<HTMLDivElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
+  const previousInspection = useRef<InspectResponse | undefined>(inspection);
+
+  const candidate = candidates.find((item) => item.id === candidateId) ?? (candidates.length === 1 ? candidates[0] : undefined);
+  const reviewed = !reviewRequired && userCandidate(candidate) && Boolean(reviewedSetup) && setupKey(reviewedSetup!) === setupKey(draft);
+  const hasDetectedSettings = detectedSetup !== null;
+  const serverErrors = normalizedFieldErrors(apiErrors, draft.components);
+  const visibleErrors = { ...Object.fromEntries(Object.entries(serverErrors).filter(([key]) => !dismissedAPIErrorKeys.has(key))), ...errors };
+  const apiErrorSignature = JSON.stringify(apiErrors);
 
   useEffect(() => { heading.current?.focus(); }, []);
   useEffect(() => {
-    const selectedStillExists = candidates.some((item) => item.id === candidateId);
-    const nextCandidateId = selectedStillExists ? candidateId : candidates.length === 1 ? candidates[0].id : "";
-    if (nextCandidateId !== candidateId) {
-      setCandidateId(nextCandidateId);
-      return;
+    if (previousInspection.current === inspection) return;
+    previousInspection.current = inspection;
+    if (!candidates.some((item) => item.id === candidateId)) {
+      const next = candidates.find(userCandidate) ?? (candidates.length === 1 ? candidates[0] : undefined);
+      setCandidateId(next?.id ?? "");
     }
-    const next = candidates.find((item) => item.id === nextCandidateId);
-    setDraft(next ? inferredDraft(next) : null);
-    setErrors({});
-    setChanged(new Set());
-    setAdvancedOpen((next?.missingFields.filter(overrideableMissingField).length ?? 0) > 0);
-  }, [candidateId, candidates]);
-  useEffect(() => { if (error) window.setTimeout(() => errorSummary.current?.focus(), 0); }, [error]);
+    const detected = candidates.find((item) => !userCandidate(item));
+    if (detected) {
+      const setup = deploymentSetupFromCandidate(detected);
+      setDetectedSetup(setup);
+      if (!dirty) {
+        setDraft(setup);
+        setErrors(validate(setup));
+      }
+    }
+  }, [candidateId, candidates, dirty, inspection]);
+  useEffect(() => {
+    setDismissedAPIErrorKeys(new Set());
+    setErrorDismissed(false);
+    if (error) window.setTimeout(() => errorSummary.current?.focus(), 0);
+  }, [apiErrorSignature, error]);
 
-  const chooseCandidate = (nextId: string) => setCandidateId(nextId);
-  const editTop = (field: "packageManager" | "installBehavior" | "migrationCommand", value: string) => {
-    setDraft((current) => current ? { ...current, [field]: value } : current);
-    setChanged((current) => new Set(current).add(field));
-    setErrors((current) => ({ ...current, [field]: "" }));
+  const updateSetup = (updater: (current: DeploymentSetupInput) => DeploymentSetupInput, errorKey?: string) => {
+    setDraft((current) => updater(current));
+    setDirty(true);
+    setErrorDismissed(true);
+    if (errorKey) setDismissedAPIErrorKeys((current) => new Set(current).add(errorKey));
+    if (errorKey) setErrors((current) => ({ ...current, [errorKey]: "" }));
   };
-  const editComponent = (componentId: string, field: keyof ComponentDraft, value: string) => {
-    setDraft((current) => current ? { ...current, components: { ...current.components, [componentId]: { ...current.components[componentId], [field]: value } } } : current);
-    const key = `${componentId}.${field}`;
-    setChanged((current) => new Set(current).add(key));
-    setErrors((current) => ({ ...current, [key]: "" }));
+  const updateComponent = (index: number, field: keyof DeploymentSetupComponentInput, value: string | number) => {
+    const component = draft.components[index];
+    const key = component ? fieldKey(component.id, String(field)) : undefined;
+    updateSetup((current) => ({ ...current, components: current.components.map((item, itemIndex) => {
+      if (itemIndex !== index) return item;
+      if (field === "technology") {
+        const technology = value as Technology;
+        const staticSite = technology === "static";
+        return { ...item, technology, startCommand: staticSite ? "" : item.startCommand || "npm start", outputDirectory: staticSite ? item.outputDirectory || "dist" : "", internalPort: staticSite ? (item.technology === "static" ? item.internalPort || 8080 : 8080) : (item.technology === "static" ? 3000 : item.internalPort || 3000) };
+      }
+      return { ...item, [field]: field === "internalPort" ? Number(value) : value };
+    }) }), key);
   };
-  const resetField = (key: string, fieldId: string, action: () => void) => {
-    action();
-    setChanged((current) => { const next = new Set(current); next.delete(key); return next; });
-    window.setTimeout(() => document.getElementById(fieldId)?.focus(), 0);
+  const chooseCandidate = (next: DeploymentPlanCandidate) => {
+    const setup = deploymentSetupFromCandidate(next);
+    setCandidateId(next.id);
+    setDetectedSetup(setup);
+    if (!dirty) {
+      setDraft(setup);
+      setErrors(validate(setup));
+    }
+  };
+  const addComponent = (technology: Technology) => {
+    const id = `component-${componentSequence}`;
+    setComponentSequence((current) => current + 1);
+    updateSetup((current) => ({ ...current, components: [...current.components, defaultComponent(id, technology)] }));
+  };
+  const removeComponent = (index: number) => updateSetup((current) => ({ ...current, components: current.components.filter((_, itemIndex) => itemIndex !== index) }));
+  const resetDetected = () => {
+    if (!detectedSetup) return;
+    setDraft(copySetup(detectedSetup));
+    setDirty(false);
+    setErrorDismissed(true);
+    setDismissedAPIErrorKeys(new Set(Object.keys(serverErrors)));
+    setErrors(validate(detectedSetup));
+    window.setTimeout(() => document.getElementById(fieldId(0, "rootDirectory"))?.focus(), 0);
   };
   const submit = () => {
-    if (!candidate || !draft) return;
-    const nextErrors = validate(candidate, draft);
+    const nextErrors = validate(draft);
     setErrors(nextErrors);
     if (Object.keys(nextErrors).length > 0) {
-      if (Object.keys(nextErrors).some((key) => !key.endsWith(".buildCommand") && !key.endsWith(".runCommand"))) setAdvancedOpen(true);
+      setAdvancedOpen(true);
       window.setTimeout(() => errorSummary.current?.focus(), 0);
       return;
     }
-    onAccept(deploymentPlanRequest(inspection, candidate, draft, expectedRevisionNumber));
+    if (reviewed && inspection && candidate) {
+      onAccept(deploymentPlanRequest(inspection, candidate, draft, expectedRevisionNumber));
+      return;
+    }
+    onAnalyze(copySetup(draft));
   };
 
-  if (candidates.length === 0) return <section className="plan-review" aria-labelledby="plan-review-title" aria-busy={pending}>
-    <h2 id="plan-review-title" ref={heading} tabIndex={-1}>Rig can’t safely identify the app yet</h2>
-    <p>The repository does not contain a supported project layout that Rig can build automatically.</p>
-    <AnalysisProblems inspection={inspection} />
-    {draftSaved && onOpenSavedDraft && <SavedDraftNotice onOpen={onOpenSavedDraft} />}
-    <footer><button className="button" type="button" disabled={pending || draftSaved} onClick={onBack}>Back to source</button><button className="button" type="button" disabled={pending} onClick={onRefresh}>Analyze again</button></footer>
-  </section>;
-
-  const blocking = candidate?.missingFields.filter((field) => !overrideableMissingField(field)) ?? [];
-  const inferred = candidate ? inferredDraft(candidate) : null;
-  const advancedRequired = candidate?.missingFields.filter(overrideableMissingField).length ?? 0;
-
+  const detectedCandidates = candidates.filter((item) => !userCandidate(item));
   return <section className="plan-review" aria-labelledby="plan-review-title" aria-busy={pending}>
     <h2 id="plan-review-title" ref={heading} tabIndex={-1}>How Rig will run this app</h2>
-    <p>Review the suggestions. Change only what your project needs.</p>
-    <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{pending ? "Accepting deployment setup." : ""}</span>
+    <p>Build and run settings start with Rig’s detection, but remain fully editable even when detection is incomplete.</p>
+    <span className="sr-only" aria-live="polite" aria-atomic="true">{pending ? (reviewed ? "Accepting deployment setup." : "Reviewing deployment setup.") : ""}</span>
     {draftSaved && onOpenSavedDraft && <SavedDraftNotice onOpen={onOpenSavedDraft} />}
-    {(error || Object.values(errors).some(Boolean)) && <div ref={errorSummary} className="error-summary" role="alert" tabIndex={-1}>
-      {error || "Check the highlighted deployment settings."}
-      {!error && <ul>{Object.entries(errors).filter(([, message]) => Boolean(message)).map(([key, message]) => { const target = errorTarget(key); return <li key={key}><a href={`#${target.id}`}>{target.label}: {message}</a></li>; })}</ul>}
-      {error && <button className="button small" type="button" disabled={pending} onClick={onRefresh}>Review updated setup</button>}
+    {((!errorDismissed && error) || Object.values(visibleErrors).some(Boolean)) && <div ref={errorSummary} className="error-summary" role="alert" tabIndex={-1}>
+      <span>{(!errorDismissed && error) || "Check the highlighted deployment settings."}</span>
+      {Object.values(visibleErrors).some(Boolean) && <ul>{Object.entries(visibleErrors).filter(([, message]) => Boolean(message)).map(([key, message]) => {
+        const target = errorTarget(key, draft.components);
+        return <li key={key}><a href={`#${target.id}`}>{target.label}: {message}</a></li>;
+      })}</ul>}
+      {!errorDismissed && error && <button className="button small" type="button" disabled={pending} onClick={submit}>Retry review</button>}
     </div>}
-    {candidates.length > 1 && <fieldset className="candidate-picker">
-      <legend>Which app do you want to deploy?</legend>
-      {candidates.map((item) => <label key={item.id} className={candidateId === item.id ? "candidate-option selected" : "candidate-option"}>
-        <input type="radio" name="deployment-candidate" disabled={pending} checked={candidateId === item.id} onChange={() => chooseCandidate(item.id)} />
+    {detectedCandidates.length > 1 && <fieldset className="candidate-picker">
+      <legend>Detected project layouts</legend>
+      {detectedCandidates.map((item) => <label key={item.id} className={candidateId === item.id ? "candidate-option selected" : "candidate-option"}>
+        <input type="radio" name="deployment-candidate" disabled={pending} checked={candidateId === item.id} onChange={() => chooseCandidate(item)} />
         <span><strong>{item.rootDirectory === "." ? "Repository root" : item.rootDirectory}</strong><small>{item.components.map((component) => component.framework || component.kind).join(" + ")}</small></span>
       </label>)}
     </fieldset>}
-    {!candidate && <div className="callout warning" role="alert"><strong>Choose a project</strong><span>Rig found more than one independent app. Select the one to configure.</span></div>}
-    {candidate && draft && <>
-      {blocking.length > 0 && <div className="callout warning" role="alert"><strong>Rig needs a safer project choice</strong><span>{candidate.findings.map((finding) => finding.message).join(" ") || `Unresolved fields: ${blocking.join(", ")}.`}</span></div>}
-      <div className="component-plans">
-        {candidate.components.map((component) => <ComponentPlanCard key={component.id} component={component} candidate={candidate} draft={draft.components[component.id]} errors={errors} changed={changed} inferred={inferred!.components[component.id]} onEdit={editComponent} onReset={resetField} />)}
-      </div>
-      <p className="command-security-note">Commands run inside the project container, never directly on Windows. Don’t put passwords or API keys in commands; add them to application configuration.</p>
-      <details className="advanced-settings" open={advancedOpen || advancedRequired > 0} onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}>
-        <summary>Advanced settings {advancedRequired > 0 && <span className="badge warning">{advancedRequired} required</span>}</summary>
-        <div className="advanced-settings-content">
-          <div className="field">
-            <label htmlFor="plan-package-manager">Package manager (required)</label>
-            <select id="plan-package-manager" required value={draft.packageManager} aria-invalid={Boolean(errors.packageManager)} aria-describedby={errors.packageManager ? "plan-package-manager-error" : undefined} onChange={(event) => editTop("packageManager", event.target.value)}><option value="">Choose one</option><option value="npm">npm</option><option value="pnpm">pnpm</option><option value="yarn">Yarn</option></select>
-            <FieldMeta label="package manager" fieldId="plan-package-manager" changed={changed.has("packageManager")} evidence={candidate.packageManager.evidence} onReset={() => resetField("packageManager", "plan-package-manager", () => editTop("packageManager", inferred!.packageManager))} />
-            {errors.packageManager && <p id="plan-package-manager-error" className="form-error">{errors.packageManager}</p>}
-          </div>
-          <div className="field">
-            <label htmlFor="plan-install-behavior">Dependency installation (required)</label>
-            <input className="command-input" id="plan-install-behavior" required value={draft.installBehavior} aria-invalid={Boolean(errors.installBehavior)} aria-describedby={errors.installBehavior ? "plan-install-behavior-error" : undefined} onChange={(event) => editTop("installBehavior", event.target.value)} />
-            <FieldMeta label="dependency installation" fieldId="plan-install-behavior" changed={changed.has("installBehavior")} evidence={candidate.install?.evidence ?? []} onReset={() => resetField("installBehavior", "plan-install-behavior", () => editTop("installBehavior", inferred!.installBehavior))} />
-            {candidate.missingFields.includes("package_manager.version") && <small>Yarn does not declare its version in this repository. Enter the exact Corepack/Yarn install command your project requires; Rig will record it as a reviewed override.</small>}
-            {errors.installBehavior && <p id="plan-install-behavior-error" className="form-error">{errors.installBehavior}</p>}
-          </div>
-          {candidate.components.map((component) => <ComponentAdvanced key={component.id} component={component} draft={draft.components[component.id]} errors={errors} changed={changed} inferred={inferred!.components[component.id]} onEdit={editComponent} onReset={resetField} />)}
-          {candidate.components.some((component) => component.migration?.present) && <div className="migration-review">
-            <strong>Database migration detected</strong>
-            <p>Rig will run this before the new version starts. The old and new versions briefly share the migrated database, so the migration should remain backward-compatible. Rig will not automatically undo database changes.</p>
-            <div className="field"><label htmlFor="plan-migration-command">Migration command</label><input className="command-input" id="plan-migration-command" value={draft.migrationCommand} onChange={(event) => editTop("migrationCommand", event.target.value)} /></div>
-            <small>Accepting this setup does not approve the migration. Approval is a separate action.</small>
-          </div>}
+    {inspection && candidates.length === 0 && <div className="callout info" role="status"><strong>No supported setup was detected</strong><span>Enter the commands and paths Rig should review. Empty install and build commands explicitly skip those steps.</span></div>}
+    {inspection?.analysis.findings.length ? <div className="callout warning" role="status"><strong>Detection findings</strong>{inspection.analysis.findings.map((finding, index) => <span key={`${finding.code}:${index}`}>{finding.message}</span>)}</div> : null}
+    <div className="deployment-setup-actions" id="deployment-setup-components">
+      <div><strong>Application components</strong><span>Use one server, one static site, or a static site and server together.</span></div>
+      <div><button className="button small" type="button" disabled={pending || draft.components.some((component) => component.technology !== "static")} onClick={() => addComponent("node")}>Add server</button><button className="button small" type="button" disabled={pending || draft.components.some((component) => component.technology === "static")} onClick={() => addComponent("static")}>Add static site</button></div>
+    </div>
+    <div className="component-plans">
+      {draft.components.map((component, index) => <ComponentSetupCard key={component.id} component={component} index={index} errors={visibleErrors} pending={pending} removable={draft.components.length > 1} allowStatic={component.technology === "static" || !draft.components.some((item) => item.technology === "static")} allowServer={component.technology !== "static" || !draft.components.some((item) => item.technology !== "static")} onChange={updateComponent} onRemove={() => removeComponent(index)} />)}
+    </div>
+    {hasDetectedSettings && <button className="text-button reset-detected" type="button" disabled={pending} onClick={resetDetected}>Reset to detected settings</button>}
+    <details className="advanced-settings" open={advancedOpen} onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}>
+      <summary>Advanced settings</summary>
+      <div className="advanced-settings-content">
+        <div className="field">
+          <label htmlFor="deployment-setup-migration-command">Migration command <span className="field-optional">(optional)</span></label>
+          <input className="command-input" id="deployment-setup-migration-command" value={draft.migrationCommand ?? ""} disabled={pending} onChange={(event) => updateSetup((current) => ({ ...current, ...(event.target.value ? { migrationCommand: event.target.value } : { migrationCommand: undefined }) }))} />
+          <small>Rig runs an accepted migration before new containers start. Approval remains a separate action.</small>
         </div>
-      </details>
-    </>}
-    <footer><button className="button" type="button" disabled={pending || draftSaved} onClick={onBack}>Back to source</button><button className="button primary" type="button" disabled={!candidate || !draft || blocking.length > 0 || pending} onClick={submit}>{pending ? "Accepting…" : "Accept setup"}</button></footer>
+        {draft.components.map((component, index) => <ComponentAdvanced key={component.id} component={component} index={index} errors={visibleErrors} pending={pending} onChange={updateComponent} />)}
+      </div>
+    </details>
+    <p className="command-security-note">Commands run inside the project container, never directly on Windows. Leave install or build empty only when that phase should be skipped. Keep passwords and API keys in application configuration.</p>
+    {!reviewed && <p className="plan-review-hint">Review setup validates these exact settings against the current source before Rig can accept them.</p>}
+    <footer>
+      {onBack && <button className="button" type="button" disabled={pending || draftSaved} onClick={onBack}>Back to source</button>}
+      <button className="button primary" type="button" disabled={pending} onClick={submit}>{pending ? (reviewed ? "Accepting…" : "Reviewing…") : reviewed ? "Accept setup" : "Review setup"}</button>
+    </footer>
     {onUseCompose && !draftSaved && <details className="other-strategies"><summary>Other setup options</summary><button className="text-button" type="button" disabled={pending} onClick={onUseCompose}>Use existing Compose setup</button></details>}
   </section>;
 }
 
-function SavedDraftNotice({ onOpen }: { onOpen: () => void }) {
-  return <div className="callout info"><strong>Application draft saved</strong><span>Rig created this application before accepting its setup. Its source and application details are now locked in this wizard.</span><button className="button small" type="button" onClick={onOpen}>Open saved draft</button></div>;
-}
-
-function ComponentPlanCard({ component, candidate, draft, errors, changed, inferred, onEdit, onReset }: { component: AnalysisComponent; candidate: DeploymentPlanCandidate; draft: ComponentDraft; errors: Record<string, string>; changed: Set<string>; inferred: ComponentDraft; onEdit: (id: string, field: keyof ComponentDraft, value: string) => void; onReset: (key: string, fieldId: string, action: () => void) => void }) {
-  const staticRuntime = component.kind === "static";
-  const buildId = `plan-${component.id}-buildCommand`;
-  const runId = `plan-${component.id}-runCommand`;
+function ComponentSetupCard({ component, index, errors, pending, removable, allowStatic, allowServer, onChange, onRemove }: { component: DeploymentSetupComponentInput; index: number; errors: FieldErrors; pending: boolean; removable: boolean; allowStatic: boolean; allowServer: boolean; onChange: (index: number, field: keyof DeploymentSetupComponentInput, value: string | number) => void; onRemove: () => void }) {
+  const error = (field: string) => errors[fieldKey(component.id, field)];
+  const describe = (field: string) => error(field) ? `${fieldId(index, field)}-error` : undefined;
+  const staticSite = component.technology === "static";
   return <article className="component-plan">
-    <header><div><h3>{component.name || "Application"}</h3><p>{component.kind.replaceAll("_", " ")} · {component.rootDirectory === "." ? "repository root" : component.rootDirectory}</p></div>{component.framework && <span className="badge">{component.framework}</span>}</header>
-    <div className="field">
-      <label htmlFor={buildId}>Build command{fieldMissing(candidate, component.id, "build") && " (required)"}</label>
-      <input className="command-input" id={buildId} required={fieldMissing(candidate, component.id, "build")} value={draft.buildCommand} aria-invalid={Boolean(errors[`${component.id}.buildCommand`])} aria-describedby={errors[`${component.id}.buildCommand`] ? `${buildId}-error` : undefined} onChange={(event) => onEdit(component.id, "buildCommand", event.target.value)} />
-      <FieldMeta label={`${component.name} build command`} fieldId={buildId} changed={changed.has(`${component.id}.buildCommand`)} evidence={component.build?.evidence ?? []} onReset={() => onReset(`${component.id}.buildCommand`, buildId, () => onEdit(component.id, "buildCommand", inferred.buildCommand))} />
-      {errors[`${component.id}.buildCommand`] && <p id={`${buildId}-error`} className="form-error">{errors[`${component.id}.buildCommand`]}</p>}
+    <header><div><h3>{staticSite ? "Static site" : component.technology === "nextjs" ? "Next.js server" : "Node.js server"}</h3><p>{component.rootDirectory === "." ? "Repository root" : component.rootDirectory || "Choose a root directory"}</p></div>{removable && <button className="text-button inline" type="button" disabled={pending} onClick={onRemove}>Remove component</button>}</header>
+    <div className="component-setup-grid">
+      <div className="field"><label htmlFor={fieldId(index, "technology")}>Technology</label><select id={fieldId(index, "technology")} value={component.technology} disabled={pending} aria-invalid={Boolean(error("technology"))} aria-describedby={describe("technology")} onChange={(event) => onChange(index, "technology", event.target.value)}><option value="node" disabled={!allowServer}>Node.js</option><option value="nextjs" disabled={!allowServer}>Next.js</option><option value="static" disabled={!allowStatic}>Static site</option></select>{error("technology") && <p id={`${fieldId(index, "technology")}-error`} className="form-error">{error("technology")}</p>}</div>
+      <div className="field"><label htmlFor={fieldId(index, "rootDirectory")}>Root directory</label><input id={fieldId(index, "rootDirectory")} value={component.rootDirectory} disabled={pending} aria-invalid={Boolean(error("rootDirectory"))} aria-describedby={describe("rootDirectory")} onChange={(event) => onChange(index, "rootDirectory", event.target.value)} />{error("rootDirectory") && <p id={`${fieldId(index, "rootDirectory")}-error`} className="form-error">{error("rootDirectory")}</p>}</div>
+      <div className="field"><label htmlFor={fieldId(index, "packageManager")}>Package manager</label><select id={fieldId(index, "packageManager")} value={component.packageManager} disabled={pending} aria-invalid={Boolean(error("packageManager"))} aria-describedby={describe("packageManager")} onChange={(event) => onChange(index, "packageManager", event.target.value)}><option value="npm">npm</option><option value="pnpm">pnpm</option><option value="yarn">Yarn</option></select>{error("packageManager") && <p id={`${fieldId(index, "packageManager")}-error`} className="form-error">{error("packageManager")}</p>}</div>
+      <div className="field"><label htmlFor={fieldId(index, "nodeVersion")}>Node.js version</label><select id={fieldId(index, "nodeVersion")} value={component.nodeVersion} disabled={pending} aria-invalid={Boolean(error("nodeVersion"))} aria-describedby={describe("nodeVersion")} onChange={(event) => onChange(index, "nodeVersion", event.target.value)}>{supportedNodeVersions.map((version) => <option value={version} key={version}>{version}</option>)}</select>{error("nodeVersion") && <p id={`${fieldId(index, "nodeVersion")}-error`} className="form-error">{error("nodeVersion")}</p>}</div>
     </div>
-    <div className="field">
-      {staticRuntime ? <><span id={`${runId}-label`} className="field-label">Run command</span><div id={runId} aria-labelledby={`${runId}-label`} className="managed-command">Serve generated static files <span className="badge">Managed by Rig</span></div></> : <><label htmlFor={runId}>Run command (required)</label><input className="command-input" id={runId} required value={draft.runCommand} aria-invalid={Boolean(errors[`${component.id}.runCommand`])} aria-describedby={errors[`${component.id}.runCommand`] ? `${runId}-error` : undefined} onChange={(event) => onEdit(component.id, "runCommand", event.target.value)} /></>}
-      {!staticRuntime && <FieldMeta label={`${component.name} run command`} fieldId={runId} changed={changed.has(`${component.id}.runCommand`)} evidence={component.run?.evidence ?? []} onReset={() => onReset(`${component.id}.runCommand`, runId, () => onEdit(component.id, "runCommand", inferred.runCommand))} />}
-      {errors[`${component.id}.runCommand`] && <p id={`${runId}-error`} className="form-error">{errors[`${component.id}.runCommand`]}</p>}
-    </div>
+    <div className="field"><label htmlFor={fieldId(index, "installCommand")}>Install command <span className="field-optional">(optional)</span></label><input className="command-input" id={fieldId(index, "installCommand")} value={component.installCommand} disabled={pending} aria-invalid={Boolean(error("installCommand"))} aria-describedby={describe("installCommand")} onChange={(event) => onChange(index, "installCommand", event.target.value)} />{error("installCommand") && <p id={`${fieldId(index, "installCommand")}-error`} className="form-error">{error("installCommand")}</p>}<small>Leave empty to skip dependency installation.</small></div>
+    <div className="field"><label htmlFor={fieldId(index, "buildCommand")}>Build command <span className="field-optional">(optional)</span></label><input className="command-input" id={fieldId(index, "buildCommand")} value={component.buildCommand} disabled={pending} aria-invalid={Boolean(error("buildCommand"))} aria-describedby={describe("buildCommand")} onChange={(event) => onChange(index, "buildCommand", event.target.value)} />{error("buildCommand") && <p id={`${fieldId(index, "buildCommand")}-error`} className="form-error">{error("buildCommand")}</p>}<small>Leave empty to skip the build step.</small></div>
+    {staticSite ? <div className="field"><label htmlFor={fieldId(index, "outputDirectory")}>Output directory</label><input id={fieldId(index, "outputDirectory")} value={component.outputDirectory} disabled={pending} aria-invalid={Boolean(error("outputDirectory"))} aria-describedby={describe("outputDirectory")} onChange={(event) => onChange(index, "outputDirectory", event.target.value)} />{error("outputDirectory") && <p id={`${fieldId(index, "outputDirectory")}-error`} className="form-error">{error("outputDirectory")}</p>}<small>Rig’s managed static server serves this directory; there is no start command.</small></div> : <div className="field"><label htmlFor={fieldId(index, "startCommand")}>Start command</label><input className="command-input" id={fieldId(index, "startCommand")} value={component.startCommand} disabled={pending} aria-invalid={Boolean(error("startCommand"))} aria-describedby={describe("startCommand")} onChange={(event) => onChange(index, "startCommand", event.target.value)} />{error("startCommand") && <p id={`${fieldId(index, "startCommand")}-error`} className="form-error">{error("startCommand")}</p>}</div>}
   </article>;
 }
 
-function ComponentAdvanced({ component, draft, errors, changed, inferred, onEdit, onReset }: { component: AnalysisComponent; draft: ComponentDraft; errors: Record<string, string>; changed: Set<string>; inferred: ComponentDraft; onEdit: (id: string, field: keyof ComponentDraft, value: string) => void; onReset: (key: string, fieldId: string, action: () => void) => void }) {
-  const fields: Array<{ key: keyof ComponentDraft; label: string; evidence: AnalysisEvidence[]; type?: string }> = [
-    { key: "nodeVersion", label: "Node.js version", evidence: [] },
-    { key: "internalPort", label: "Internal port", evidence: component.internalPort?.evidence ?? [], type: "number" },
-    { key: "healthProbe", label: "Health-check path", evidence: component.healthProbe?.evidence ?? [] },
-  ];
-  return <fieldset className="component-advanced"><legend>{component.name || component.rootDirectory}</legend>{fields.map((field) => {
-    const id = `plan-${component.id}-${field.key}`;
-    const error = errors[`${component.id}.${field.key}`];
-    return <div className="field" key={field.key}><label htmlFor={id}>{field.label} (required)</label><input id={id} required type={field.type} value={draft[field.key]} aria-invalid={Boolean(error)} aria-describedby={error ? `${id}-error` : undefined} onChange={(event) => onEdit(component.id, field.key, event.target.value)} /><FieldMeta label={`${component.name} ${field.label}`} fieldId={id} changed={changed.has(`${component.id}.${field.key}`)} evidence={field.evidence} onReset={() => onReset(`${component.id}.${field.key}`, id, () => onEdit(component.id, field.key, inferred[field.key]))} />{error && <p id={`${id}-error`} className="form-error">{error}</p>}</div>;
-  })}</fieldset>;
+function ComponentAdvanced({ component, index, errors, pending, onChange }: { component: DeploymentSetupComponentInput; index: number; errors: FieldErrors; pending: boolean; onChange: (index: number, field: keyof DeploymentSetupComponentInput, value: string | number) => void }) {
+  const error = (field: string) => errors[fieldKey(component.id, field)];
+  return <fieldset className="component-advanced"><legend>{component.rootDirectory || `Component ${index + 1}`}</legend>
+    <div className="field"><label htmlFor={fieldId(index, "internalPort")}>Internal port</label><input id={fieldId(index, "internalPort")} type="number" min="1" max="65535" value={component.internalPort} disabled={pending} aria-invalid={Boolean(error("internalPort"))} aria-describedby={error("internalPort") ? `${fieldId(index, "internalPort")}-error` : undefined} onChange={(event) => onChange(index, "internalPort", event.target.value)} />{error("internalPort") && <p id={`${fieldId(index, "internalPort")}-error`} className="form-error">{error("internalPort")}</p>}</div>
+    <div className="field"><label htmlFor={fieldId(index, "healthProbe")}>Health-check path</label><input id={fieldId(index, "healthProbe")} value={component.healthProbe} disabled={pending} aria-invalid={Boolean(error("healthProbe"))} aria-describedby={error("healthProbe") ? `${fieldId(index, "healthProbe")}-error` : undefined} onChange={(event) => onChange(index, "healthProbe", event.target.value)} />{error("healthProbe") && <p id={`${fieldId(index, "healthProbe")}-error`} className="form-error">{error("healthProbe")}</p>}</div>
+  </fieldset>;
 }
 
-function FieldMeta({ label, fieldId, changed, evidence, onReset }: { label: string; fieldId: string; changed: boolean; evidence: AnalysisEvidence[]; onReset: () => void }) {
-  return <div className="field-meta" data-field-id={fieldId}>{changed && <span className="badge changed">Changed</span>}<button type="button" className="text-button inline" disabled={!changed} aria-label={`Reset ${label} to suggestion`} onClick={onReset}>Reset to suggestion</button><details><summary aria-label={`Why this ${label}?`}>Why this?</summary><span>{evidenceLabel(evidence)}</span></details><span className="sr-only" aria-live="polite" aria-atomic="true">{changed ? `${label} changed.` : `${label} uses the suggested value.`}</span></div>;
-}
-
-function AnalysisProblems({ inspection }: { inspection: InspectResponse }) {
-  const findings = [...inspection.analysis.findings, ...inspection.analysis.candidates.flatMap((candidate) => candidate.findings)];
-  return <div className="callout warning" role="alert"><strong>Analysis needs more information</strong>{findings.length ? findings.map((finding, index) => <span key={`${finding.code}:${finding.path ?? ""}:${index}`}>{finding.message}</span>) : <span>Choose another source or add a supported JavaScript/TypeScript application.</span>}</div>;
+function SavedDraftNotice({ onOpen }: { onOpen: () => void }) {
+  return <div className="callout info"><strong>Application draft saved</strong><span>Rig created this application before accepting its setup. Its source and application details are now locked in this wizard.</span><button className="button small" type="button" onClick={onOpen}>Open saved draft</button></div>;
 }

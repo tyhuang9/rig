@@ -137,6 +137,8 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
   await page.getByLabel("Local source path").fill(sourceRoot);
   await page.getByRole("button", { name: "Analyze project" }).click();
   await expect(page.getByRole("heading", { name: "How Rig will run this app" })).toBeFocused();
+  await page.getByRole("button", { name: "Review setup" }).click();
+  await expect(page.getByRole("button", { name: "Accept setup" })).toBeVisible();
   await page.getByRole("button", { name: "Accept setup" }).click();
   await expect(page.locator(".error-summary")).toBeFocused();
   await expect(page.getByLabel("Application name")).toHaveAttribute("aria-invalid", "true");

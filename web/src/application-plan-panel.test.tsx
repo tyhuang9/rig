@@ -128,6 +128,10 @@ function candidate(
   };
 }
 
+function reviewedCandidate() {
+  return candidate({ id: "user:deployment-setup", origin: "user", digest: "e".repeat(64) });
+}
+
 function inspection(
   app: Application = localApp,
   selected = candidate(),
@@ -186,11 +190,20 @@ function renderPanel(app: Application = localApp) {
   return { client, ...view };
 }
 
+async function reviewSetup() {
+  fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+  await screen.findByRole("button", { name: "Accept setup" });
+}
+
 describe("ApplicationPlanPanel", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.spyOn(api, "deploymentPlan").mockResolvedValue(plan());
-    vi.spyOn(api, "inspect").mockResolvedValue(inspection());
+    vi.spyOn(api, "inspect").mockImplementation((request) => Promise.resolve(
+      request.setup
+        ? inspection(request.githubSource ? githubApp : localApp, reviewedCandidate())
+        : inspection(request.githubSource ? githubApp : localApp),
+    ));
     vi.spyOn(api, "acceptDeploymentPlan").mockResolvedValue(
       plan({ revisionId: "plan-revision-4", revisionNumber: 4 }),
     );
@@ -211,13 +224,14 @@ describe("ApplicationPlanPanel", () => {
       name: "How Rig will run this app",
     });
     await waitFor(() => expect(document.activeElement).toBe(heading));
+    await reviewSetup();
     fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
     await waitFor(() =>
       expect(api.acceptDeploymentPlan).toHaveBeenCalledWith(
         localApp.id,
         expect.objectContaining({
           expectedRevisionNumber: 3,
-          expectedCandidateDigest: "c".repeat(64),
+          expectedCandidateDigest: "e".repeat(64),
           expectedSourceStructuralFingerprint: "b".repeat(64),
         }),
       ),
@@ -226,6 +240,34 @@ describe("ApplicationPlanPanel", () => {
     const status = screen.getByRole("status");
     expect(status.getAttribute("aria-live")).toBe("polite");
     expect(status.getAttribute("aria-atomic")).toBe("true");
+  });
+
+  it("opens an accepted explicit setup for editing and reanalyzes the exact edited draft", async () => {
+    vi.mocked(api.deploymentPlan).mockResolvedValue(plan({
+      setup: { components: [{ id: "web", technology: "node", rootDirectory: ".", packageManager: "npm", nodeVersion: "24", installCommand: "npm ci", buildCommand: "npm run build", startCommand: "npm start", outputDirectory: "", internalPort: 3000, healthProbe: "/" }] },
+    }));
+    renderPanel();
+    await screen.findByRole("heading", { name: "How Rig will run this app" });
+    fireEvent.change(screen.getByRole("textbox", { name: "Start command" }), { target: { value: "node production.js" } });
+    await reviewSetup();
+    expect(api.inspect).toHaveBeenCalledWith({
+      sourcePath: "C:\\projects\\local-app",
+      setup: expect.objectContaining({ components: [expect.objectContaining({ startCommand: "node production.js" })] }),
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
+    await waitFor(() => expect(api.acceptDeploymentPlan).toHaveBeenCalledWith(localApp.id, expect.objectContaining({
+      candidateId: "user:deployment-setup",
+      expectedRevisionNumber: 3,
+      setup: expect.objectContaining({ components: [expect.objectContaining({ startCommand: "node production.js" })] }),
+    })));
+  });
+
+  it("does not offer a generated setup editor for an existing Compose plan", async () => {
+    vi.mocked(api.deploymentPlan).mockResolvedValue(plan({ strategy: "compose" }));
+    renderPanel();
+    expect(await screen.findByText(/continues to use its accepted Compose source/i)).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Review current source" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review setup" })).toBeNull();
   });
 
   it("constructs the exact GitHub inspection request", async () => {
@@ -258,6 +300,7 @@ describe("ApplicationPlanPanel", () => {
       ["deployment-plan", localApp.id],
       plan({ revisionId: "unreviewed-head", revisionNumber: 9 }),
     );
+    await reviewSetup();
     fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
     await waitFor(() =>
       expect(api.acceptDeploymentPlan).toHaveBeenCalledWith(
@@ -279,6 +322,7 @@ describe("ApplicationPlanPanel", () => {
     expect(await screen.findByText("Legacy Compose setup")).not.toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Review current source" }));
     await screen.findByRole("heading", { name: "How Rig will run this app" });
+    await reviewSetup();
     fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
     await waitFor(() =>
       expect(api.acceptDeploymentPlan).toHaveBeenCalledWith(
@@ -365,7 +409,8 @@ describe("ApplicationPlanPanel", () => {
     });
     vi.mocked(api.inspect)
       .mockResolvedValueOnce(inspection())
-      .mockResolvedValueOnce(inspection(localApp, refreshed));
+      .mockResolvedValueOnce(inspection(localApp, reviewedCandidate()))
+      .mockResolvedValueOnce(inspection(localApp, { ...reviewedCandidate(), components: refreshed.components }));
     vi.mocked(api.acceptDeploymentPlan).mockRejectedValueOnce(
       new APIError({
         status: 409,
@@ -378,16 +423,15 @@ describe("ApplicationPlanPanel", () => {
       await screen.findByRole("button", { name: "Review current source" }),
     );
     await screen.findByRole("heading", { name: "How Rig will run this app" });
+    await reviewSetup();
     fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
     expect(
       await screen.findByText(
         "The source changed while this setup was being accepted. Review the updated setup before trying again.",
       ),
     ).not.toBeNull();
-    expect(
-      await screen.findByDisplayValue("npm run build:refreshed"),
-    ).not.toBeNull();
-    expect(api.inspect).toHaveBeenCalledTimes(2);
+    expect(await screen.findByDisplayValue("npm run build")).not.toBeNull();
+    expect(api.inspect).toHaveBeenCalledTimes(3);
     expect(document.body.textContent).not.toContain("secret-error-command");
   });
 
@@ -409,12 +453,12 @@ describe("ApplicationPlanPanel", () => {
       await screen.findByRole("button", { name: "Review current source" }),
     );
     await screen.findByRole("heading", { name: "How Rig will run this app" });
+    await reviewSetup();
     fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("updated in another session");
-    expect(await screen.findByText("Revision 8 · Generated runtime")).not.toBeNull();
-    expect(screen.getByRole("button", { name: "Review current source" })).not.toBeNull();
-    expect(api.inspect).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Review setup" })).not.toBeNull();
+    expect(api.inspect).toHaveBeenCalledTimes(2);
     expect(document.body.textContent).not.toContain("secret-conflicting-command");
   });
 
@@ -521,5 +565,19 @@ describe("ApplicationPlanPanel", () => {
       screen.getByRole("button", { name: "Review current source" }),
     ).not.toBeNull();
     await waitFor(() => expect(document.activeElement).toBe(alert));
+  });
+
+  it("preserves an edited setup after a transient reanalysis failure", async () => {
+    vi.mocked(api.deploymentPlan).mockResolvedValue(plan({
+      setup: { components: [{ id: "web", technology: "node", rootDirectory: ".", packageManager: "npm", nodeVersion: "24", installCommand: "npm ci", buildCommand: "npm run build", startCommand: "npm start", outputDirectory: "", internalPort: 3000, healthProbe: "/" }] },
+    }));
+    vi.mocked(api.inspect).mockRejectedValueOnce(new Error("temporary source failure"));
+    renderPanel();
+    await screen.findByRole("heading", { name: "How Rig will run this app" });
+    fireEvent.change(screen.getByRole("textbox", { name: "Start command" }), { target: { value: "node custom.js" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("Rig could not analyze the current source");
+    expect((screen.getByRole("textbox", { name: "Start command" }) as HTMLInputElement).value).toBe("node custom.js");
+    expect((screen.getByRole("button", { name: "Review setup" }) as HTMLButtonElement).disabled).toBe(false);
   });
 });

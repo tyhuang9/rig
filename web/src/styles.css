@@ -204,6 +204,19 @@ button:disabled { cursor: wait; opacity: .62; }
 .component-plan h3 { margin: 0; font-size: 15px; }
 .component-plan header p { margin: 3px 0 0; color: #69717d; font-size: 12px; }
 .component-plan .field { max-width: none; }
+.deployment-setup-panel { margin-top: 28px; padding: 20px; border: 1px solid #e3e6ea; border-radius: 10px; background: #fff; }
+.deployment-setup-panel .plan-review { max-width: none; }
+.deployment-setup-panel > h2 { margin: 0; font-size: 16px; }
+.deployment-setup-message { margin: 0 0 14px; color: #195e47; font-size: 12px; }
+.deployment-setup-actions { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 0 0 14px; padding: 12px; border: 1px solid #dfe3e8; border-radius: 9px; background: #fbfcfd; }
+.deployment-setup-actions > div:first-child { display: grid; gap: 3px; font-size: 13px; }
+.deployment-setup-actions span { color: #626a76; font-size: 12px; }
+.deployment-setup-actions > div:last-child { display: flex; flex-wrap: wrap; gap: 8px; }
+.component-setup-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.field-optional { color: #626a76; font-weight: 400; }
+.component-plan small, .advanced-settings-content small { display: block; margin-top: 4px; color: #626a76; font-size: 11px; line-height: 1.4; }
+.reset-detected { margin-top: 12px; }
+.plan-review-hint { margin: 12px 0 0; color: #4e5561; font-size: 12px; line-height: 1.5; }
 .command-input { font-family: ui-monospace, SFMono-Regular, Consolas, monospace !important; }
 .managed-command { display: flex; min-height: 38px; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 10px; border: 1px solid #d5d9df; border-radius: 8px; background: #f1f3f5; color: #303641; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .command-security-note { max-width: 760px; margin: 12px 0 18px; color: #4e5561; font-size: 12px; line-height: 1.5; }
@@ -531,8 +544,13 @@ button:disabled { cursor: wait; opacity: .62; }
   .field input, .field select { height: 44px; }
   .wizard footer { flex-direction: column-reverse; }
   .wizard footer .button { width: 100%; }
-  .component-plan header { align-items: stretch; flex-direction: column; }
-  .managed-command { min-height: 44px; flex-wrap: wrap; }
+    .component-plan header { align-items: stretch; flex-direction: column; }
+    .deployment-setup-panel { padding: 16px 14px; overflow: hidden; }
+    .deployment-setup-actions { align-items: stretch; flex-direction: column; }
+    .deployment-setup-actions > div:last-child { display: grid; grid-template-columns: minmax(0, 1fr); }
+    .deployment-setup-actions .button { width: 100%; }
+    .component-setup-grid { grid-template-columns: minmax(0, 1fr); }
+    .managed-command { min-height: 44px; flex-wrap: wrap; }
 }
 
 @media (prefers-reduced-motion: reduce) {
