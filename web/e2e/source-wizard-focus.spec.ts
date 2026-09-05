@@ -5,9 +5,9 @@ import path from "node:path";
 import type {
   BootstrapStatus,
   CSRFResponse,
-  GitHubInstallationPage,
+  ConnectedGitHubRepositoryPage,
   MeResponse,
-  SourceConnectionList,
+  DefaultSourceConnection,
   SystemStatus,
 } from "../src/generated/api-contract";
 
@@ -69,7 +69,7 @@ test("keeps focusable pagination guarded while loading and on an empty final pag
   let reportSecondPageStarted!: () => void;
   const secondPageGate = new Promise<void>((resolve) => { releaseSecondPage = resolve; });
   const secondPageStarted = new Promise<void>((resolve) => { reportSecondPageStarted = resolve; });
-  const requestedInstallationPages: number[] = [];
+  const requestedRepositoryPages: number[] = [];
 
   await page.route("**/api/v1/**", async (route) => {
     const url = new URL(route.request().url());
@@ -97,9 +97,9 @@ test("keeps focusable pagination guarded while loading and on an empty final pag
         },
       } satisfies SystemStatus,
     });
-    if (url.pathname === "/api/v1/source-connections") return route.fulfill({
+    if (url.pathname === "/api/v1/source-connections/default") return route.fulfill({
       json: {
-        items: [{
+        configured: true, connection: {
           id: connectionId,
           provider: "github",
           status: "connected",
@@ -107,33 +107,29 @@ test("keeps focusable pagination guarded while loading and on an empty final pag
           credentialGeneration: 1,
           createdAt: "2026-01-01T00:00:00Z",
           updatedAt: "2026-01-01T00:00:00Z",
-        }],
-      } satisfies SourceConnectionList,
+        },
+      } satisfies DefaultSourceConnection,
     });
-    if (url.pathname === `/api/v1/source-connections/${connectionId}/github/installations`) {
+    if (url.pathname === "/api/v1/source-connections/default/github/repositories") {
       const requestedPage = Number(url.searchParams.get("page") ?? "1");
-      requestedInstallationPages.push(requestedPage);
+      requestedRepositoryPages.push(requestedPage);
       if (requestedPage === 2) {
         reportSecondPageStarted();
         await secondPageGate;
-        return route.fulfill({ json: { page: 2, perPage: 30, totalCount: 30, items: [] } satisfies GitHubInstallationPage });
+        return route.fulfill({ json: { page: 2, perPage: 30, totalCount: 30, truncated: false, items: [] } satisfies ConnectedGitHubRepositoryPage });
       }
       if (requestedPage === 1) return route.fulfill({
         json: {
           page: 1,
           perPage: 30,
           totalCount: 60,
+          truncated: false,
           items: [{
-            id: 10,
-            accountLogin: "octo-org",
-            accountType: "Organization",
-            targetType: "Organization",
-            repositorySelection: "selected",
-            cachedAt: "2026-01-01T00:00:00Z",
+            id: 10, connectionId, installationId: 7, accountLogin: "octo-org", owner: "octo-org", name: "web", defaultBranch: "main", archived: false, disabled: false, private: false,
           }],
-        } satisfies GitHubInstallationPage,
+        } satisfies ConnectedGitHubRepositoryPage,
       });
-      return route.fulfill({ json: { page: requestedPage, perPage: 30, totalCount: 30, items: [] } satisfies GitHubInstallationPage });
+      return route.fulfill({ json: { page: requestedPage, perPage: 30, totalCount: 30, truncated: false, items: [] } satisfies ConnectedGitHubRepositoryPage });
     }
     return route.fulfill({ status: 404, json: { code: "not_found", detail: "Unexpected browser-test request." } });
   });
@@ -141,12 +137,13 @@ test("keeps focusable pagination guarded while loading and on an empty final pag
   await page.goto(`${baseURL}/apps/new`);
   await expect(page.getByRole("heading", { name: "Add application" })).toBeVisible();
   await page.getByLabel("GitHub repository").check();
-  await page.getByLabel("GitHub connection").selectOption(connectionId);
+  await expect(page.getByLabel("GitHub connection")).toHaveCount(0);
+  await expect(page.getByLabel("GitHub App installation")).toHaveCount(0);
   await expect(page.getByRole("option", { name: /octo-org/i })).toBeAttached();
 
-  const pagination = page.getByRole("navigation", { name: "GitHub App installations pagination" });
-  const previous = page.getByRole("button", { name: "Previous GitHub App installations page" });
-  const next = page.getByRole("button", { name: "Next GitHub App installations page" });
+  const pagination = page.getByRole("navigation", { name: "repositories pagination" });
+  const previous = page.getByRole("button", { name: "Previous repositories page" });
+  const next = page.getByRole("button", { name: "Next repositories page" });
   await expect(next).toHaveAttribute("aria-disabled", "false");
   await next.focus();
   await expect(next).toBeFocused();
@@ -161,10 +158,10 @@ test("keeps focusable pagination guarded while loading and on an empty final pag
   await next.press("Enter");
   await next.press("Space");
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-  expect(requestedInstallationPages).toEqual([1, 2]);
+  expect(requestedRepositoryPages).toEqual([1, 2]);
 
   releaseSecondPage();
-  await expect(page.locator("#github-installation-status")).toHaveText("GitHub App installations page 2 loaded. 0 results.");
+  await expect(page.locator("#github-repository-status")).toHaveText("Repositories page 2 loaded. 0 results.");
   await expect(pagination).toHaveAttribute("aria-busy", "false");
   await expect(previous).toHaveAttribute("aria-disabled", "false");
   await expect(next).toHaveAttribute("aria-disabled", "true");
@@ -172,11 +169,53 @@ test("keeps focusable pagination guarded while loading and on an empty final pag
   await next.press("Enter");
   await next.press("Space");
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-  expect(requestedInstallationPages).toEqual([1, 2]);
+  expect(requestedRepositoryPages).toEqual([1, 2]);
 
   await previous.press("Enter");
-  await expect(page.locator("#github-installation-status")).toHaveText("GitHub App installations page 1 loaded. 1 result.");
+  await expect(page.locator("#github-repository-status")).toHaveText("Repositories page 1 loaded. 1 result.");
   await expect(pagination).toContainText("Page 1");
   await expect(previous).toHaveAttribute("aria-disabled", "true");
   await expect(next).toHaveAttribute("aria-disabled", "false");
+});
+
+test("reuses the account connector across navigation and reload without another authorization", async ({ page }) => {
+  let authorizations = 0;
+  const accountLogin = "a".repeat(39);
+  const connection = { id: connectionId, provider: "github", status: "connected", providerLogin: accountLogin, installUrl: "https://github.com/apps/rig/installations/new", credentialGeneration: 1, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
+  await page.route("**/api/v1/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/api/v1/auth/bootstrap/status") return route.fulfill({ json: { bootstrapRequired: false } });
+    if (url.pathname === "/api/v1/auth/me") return route.fulfill({ json: { user: { id: "user-1", username: "browser-admin", role: "administrator" } } });
+    if (url.pathname === "/api/v1/auth/csrf") return route.fulfill({ json: { csrfToken: "browser-csrf" } });
+    if (url.pathname === "/api/v1/system/status") return route.fulfill({ json: { capabilities: { githubConnections: true } } });
+    if (url.pathname === "/api/v1/apps") return route.fulfill({ json: { items: [] } });
+    if (url.pathname === "/api/v1/source-connections/default") return route.fulfill({ json: { configured: true, connection } });
+    if (url.pathname === "/api/v1/source-connections/default/github/repositories") return route.fulfill({ json: { page: 1, perPage: 30, totalCount: 1, truncated: false, items: [{ connectionId, installationId: 7, id: 10, accountLogin: "octo-org", owner: "octo-org", name: "web", defaultBranch: "main", private: false, archived: false, disabled: false }] } });
+    if (url.pathname.endsWith("/github/device")) authorizations += 1;
+    return route.fulfill({ status: 404, json: { code: "not_found" } });
+  });
+  await page.goto(`${baseURL}/apps`);
+  await page.getByRole("link", { name: "Connections", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Connections", exact: true })).toBeFocused();
+  await expect(page.getByText(`Connected as @${accountLogin}`)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Reconnect", exact: true })).toHaveCount(0);
+  await page.setViewportSize({ width: 320, height: 800 });
+  const accountStatus = page.getByText(`Connected as @${accountLogin}`);
+  await expect(accountStatus).toBeVisible();
+  expect(await accountStatus.evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    return { fitsViewport: bounds.left >= 0 && bounds.right <= window.innerWidth, fitsContent: element.scrollWidth <= element.clientWidth };
+  })).toEqual({ fitsViewport: true, fitsContent: true });
+  const accessLink = page.getByRole("link", { name: "Manage repository access (opens in a new tab)" });
+  await expect(accessLink).toBeVisible();
+  expect(await accessLink.evaluate((element) => element.getBoundingClientRect().right <= window.innerWidth)).toBe(true);
+  await page.reload();
+  await expect(page.getByText(`Connected as @${accountLogin}`)).toBeVisible();
+  await page.getByRole("link", { name: "Applications", exact: true }).click();
+  await page.getByRole("link", { name: "Add application", exact: true }).first().click();
+  await page.getByLabel("GitHub repository").check();
+  await expect(page.getByRole("option", { name: "octo-org/web" })).toBeAttached();
+  await expect(page.getByLabel("GitHub connection", { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("GitHub App installation")).toHaveCount(0);
+  expect(authorizations).toBe(0);
 });

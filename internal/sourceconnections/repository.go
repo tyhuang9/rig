@@ -14,9 +14,10 @@ import (
 )
 
 var (
-	ErrNotFound        = errors.New("source connection not found")
-	ErrIdentityExists  = errors.New("source identity is already connected")
-	ErrStaleGeneration = errors.New("source credential generation is stale")
+	ErrNotFound         = errors.New("source connection not found")
+	ErrIdentityExists   = errors.New("source identity is already connected")
+	ErrIdentityMismatch = errors.New("source identity does not match durable connection")
+	ErrStaleGeneration  = errors.New("source credential generation is stale")
 )
 
 type Repository struct{ db *sql.DB }
@@ -61,6 +62,204 @@ func (repository *Repository) List(ctx context.Context, owner string) ([]Connect
 	return result, rows.Err()
 }
 
+func (repository *Repository) Default(ctx context.Context, owner string) (Connection, bool, error) {
+	row := repository.db.QueryRowContext(ctx, connectionSelect+` WHERE id=(SELECT connection_id FROM github_default_connections WHERE owner_user_id=?) AND owner_user_id=?`, owner, owner)
+	connection, err := scanConnection(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Connection{}, false, nil
+	}
+	return connection, err == nil, err
+}
+
+func (repository *Repository) StartDefaultAuthorization(ctx context.Context, owner string, expiresAt time.Time, interval time.Duration, nextPollAt, now time.Time) (Connection, AuthorizationAttempt, []string, error) {
+	authorizationID, err := newConnectionID()
+	if err != nil {
+		return Connection{}, AuthorizationAttempt{}, nil, err
+	}
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Connection{}, AuthorizationAttempt{}, nil, err
+	}
+	defer tx.Rollback()
+
+	var connectionID string
+	err = tx.QueryRowContext(ctx, `SELECT connection_id FROM github_default_connections WHERE owner_user_id=?`, owner).Scan(&connectionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		connectionID, err = newConnectionID()
+		if err != nil {
+			return Connection{}, AuthorizationAttempt{}, nil, err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO source_connections(id,owner_user_id,provider,status,created_at,updated_at) VALUES(?,?,'github','disconnected',?,?)`, connectionID, owner, timestamp(now), timestamp(now)); err != nil {
+			return Connection{}, AuthorizationAttempt{}, nil, err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO github_default_connections(owner_user_id,connection_id,created_at,updated_at) VALUES(?,?,?,?)`, owner, connectionID, timestamp(now), timestamp(now)); err != nil {
+			return Connection{}, AuthorizationAttempt{}, nil, err
+		}
+	} else if err != nil {
+		return Connection{}, AuthorizationAttempt{}, nil, err
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM github_connection_authorizations WHERE owner_user_id=? AND connection_id=? AND status='pending'`, owner, connectionID)
+	if err != nil {
+		return Connection{}, AuthorizationAttempt{}, nil, err
+	}
+	var superseded []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return Connection{}, AuthorizationAttempt{}, nil, err
+		}
+		superseded = append(superseded, id)
+	}
+	if err := rows.Close(); err != nil {
+		return Connection{}, AuthorizationAttempt{}, nil, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE github_connection_authorizations SET status='superseded',last_error_code='authorization_superseded',updated_at=? WHERE owner_user_id=? AND connection_id=? AND status='pending'`, timestamp(now), owner, connectionID); err != nil {
+		return Connection{}, AuthorizationAttempt{}, nil, err
+	}
+	var generation int64
+	if err = tx.QueryRowContext(ctx, `SELECT credential_generation FROM source_connections WHERE id=? AND owner_user_id=?`, connectionID, owner).Scan(&generation); err != nil {
+		return Connection{}, AuthorizationAttempt{}, nil, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO github_connection_authorizations(id,owner_user_id,connection_id,status,credential_generation,pending_expires_at,poll_interval_seconds,next_poll_at,created_at,updated_at) VALUES(?,?,?,'pending',?,?,?,?,?,?)`, authorizationID, owner, connectionID, generation, timestamp(expiresAt), int(interval/time.Second), timestamp(nextPollAt), timestamp(now), timestamp(now)); err != nil {
+		return Connection{}, AuthorizationAttempt{}, nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return Connection{}, AuthorizationAttempt{}, nil, err
+	}
+	connection, err := repository.Get(ctx, owner, connectionID)
+	if err != nil {
+		return Connection{}, AuthorizationAttempt{}, nil, err
+	}
+	attempt, err := repository.Authorization(ctx, owner, connectionID, authorizationID)
+	return connection, attempt, superseded, err
+}
+
+func (repository *Repository) Authorization(ctx context.Context, owner, connectionID, authorizationID string) (AuthorizationAttempt, error) {
+	row := repository.db.QueryRowContext(ctx, `SELECT id,owner_user_id,connection_id,status,credential_generation,pending_expires_at,poll_interval_seconds,next_poll_at,COALESCE(last_error_code,''),created_at,updated_at FROM github_connection_authorizations WHERE id=? AND owner_user_id=? AND connection_id=?`, authorizationID, owner, connectionID)
+	var attempt AuthorizationAttempt
+	var expiresAt, nextPollAt, createdAt, updatedAt string
+	var interval int64
+	if err := row.Scan(&attempt.ID, &attempt.OwnerUserID, &attempt.ConnectionID, &attempt.Status, &attempt.CredentialGeneration, &expiresAt, &interval, &nextPollAt, &attempt.LastErrorCode, &createdAt, &updatedAt); errors.Is(err, sql.ErrNoRows) {
+		return AuthorizationAttempt{}, ErrNotFound
+	} else if err != nil {
+		return AuthorizationAttempt{}, err
+	}
+	var err error
+	if attempt.PendingExpiresAt, err = time.Parse(time.RFC3339Nano, expiresAt); err != nil {
+		return AuthorizationAttempt{}, err
+	}
+	if attempt.NextPollAt, err = time.Parse(time.RFC3339Nano, nextPollAt); err != nil {
+		return AuthorizationAttempt{}, err
+	}
+	if attempt.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt); err != nil {
+		return AuthorizationAttempt{}, err
+	}
+	if attempt.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt); err != nil {
+		return AuthorizationAttempt{}, err
+	}
+	attempt.PollInterval = time.Duration(interval) * time.Second
+	return attempt, nil
+}
+
+func (repository *Repository) AdvanceAuthorization(ctx context.Context, owner, connectionID, authorizationID string, interval time.Duration, nextPollAt, now time.Time) error {
+	result, err := repository.db.ExecContext(ctx, `UPDATE github_connection_authorizations SET poll_interval_seconds=?,next_poll_at=?,updated_at=? WHERE id=? AND owner_user_id=? AND connection_id=? AND status='pending'`, int(interval/time.Second), timestamp(nextPollAt), timestamp(now), authorizationID, owner, connectionID)
+	return mutationResult(result, err)
+}
+
+func (repository *Repository) FinishAuthorization(ctx context.Context, owner string, attempt AuthorizationAttempt, bundle TokenBundle, now time.Time) error {
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var currentGeneration int64
+	var providerUserID sql.NullString
+	if err = tx.QueryRowContext(ctx, `SELECT credential_generation,provider_user_id FROM source_connections WHERE id=? AND owner_user_id=?`, attempt.ConnectionID, owner).Scan(&currentGeneration, &providerUserID); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if currentGeneration != attempt.CredentialGeneration || bundle.Generation != currentGeneration+1 {
+		return ErrStaleGeneration
+	}
+	if providerUserID.Valid && providerUserID.String != bundle.ProviderUserID {
+		return ErrIdentityMismatch
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE source_connections SET status='connected',provider_user_id=?,provider_login=?,credential_generation=?,pending_expires_at=NULL,poll_interval_seconds=NULL,next_poll_at=NULL,access_expires_at=?,refresh_expires_at=?,last_error_code=NULL,connected_at=COALESCE(connected_at,?),disconnected_at=NULL,updated_at=? WHERE id=? AND owner_user_id=? AND credential_generation=?`, bundle.ProviderUserID, bundle.ProviderLogin, bundle.Generation, timestamp(bundle.AccessExpiresAt), timestamp(bundle.RefreshExpiresAt), timestamp(now), timestamp(now), attempt.ConnectionID, owner, attempt.CredentialGeneration)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return ErrIdentityExists
+		}
+		return err
+	}
+	if err = mutationResult(result, nil); err != nil {
+		return err
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE github_connection_authorizations SET status='connected',last_error_code=NULL,updated_at=? WHERE id=? AND owner_user_id=? AND connection_id=? AND status='pending'`, timestamp(now), attempt.ID, owner, attempt.ConnectionID)
+	if err = mutationResult(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ReconcilePromotedAuthorization completes an attempt whose validated bundle
+// was already promoted from the protected file after a process interruption.
+// The caller must separately verify that the active and staged files contain
+// the same bundle; SQLite deliberately contains no credential material.
+func (repository *Repository) ReconcilePromotedAuthorization(ctx context.Context, owner string, attempt AuthorizationAttempt, bundle TokenBundle, now time.Time) error {
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var currentGeneration int64
+	var providerUserID sql.NullString
+	var connectionStatus string
+	if err = tx.QueryRowContext(ctx, `SELECT credential_generation,provider_user_id,status FROM source_connections WHERE id=? AND owner_user_id=?`, attempt.ConnectionID, owner).Scan(&currentGeneration, &providerUserID, &connectionStatus); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if connectionStatus != StatusConnected || bundle.Generation != attempt.CredentialGeneration+1 || currentGeneration != bundle.Generation {
+		return ErrStaleGeneration
+	}
+	if !providerUserID.Valid || providerUserID.String != bundle.ProviderUserID {
+		return ErrIdentityMismatch
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE github_connection_authorizations SET status='connected',last_error_code=NULL,updated_at=? WHERE id=? AND owner_user_id=? AND connection_id=? AND status='pending' AND credential_generation=?`, timestamp(now), attempt.ID, owner, attempt.ConnectionID, attempt.CredentialGeneration)
+	if err = mutationResult(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (repository *Repository) MarkAuthorization(ctx context.Context, owner, connectionID, authorizationID, status, code string, now time.Time) error {
+	if status != "denied" && status != "expired" && status != "failed" && status != "superseded" {
+		return errors.New("invalid authorization status")
+	}
+	result, err := repository.db.ExecContext(ctx, `UPDATE github_connection_authorizations SET status=?,last_error_code=?,updated_at=? WHERE id=? AND owner_user_id=? AND connection_id=? AND status='pending'`, status, nullable(code), timestamp(now), authorizationID, owner, connectionID)
+	return mutationResult(result, err)
+}
+
+func (repository *Repository) PendingAuthorizationIDs(ctx context.Context, owner, connectionID string) ([]string, error) {
+	rows, err := repository.db.QueryContext(ctx, `SELECT id FROM github_connection_authorizations WHERE owner_user_id=? AND connection_id=? AND status='pending'`, owner, connectionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (repository *Repository) AdvancePoll(ctx context.Context, owner, id string, interval time.Duration, nextPollAt, now time.Time) error {
 	result, err := repository.db.ExecContext(ctx, `UPDATE source_connections SET poll_interval_seconds = ?, next_poll_at = ?, updated_at = ? WHERE owner_user_id = ? AND id = ? AND status = 'pending'`, int(interval/time.Second), timestamp(nextPollAt), timestamp(now), owner, id)
 	return mutationResult(result, err)
@@ -102,7 +301,7 @@ func (repository *Repository) markAccessLost(ctx context.Context, owner, id, cod
 }
 
 func (repository *Repository) Connect(ctx context.Context, owner, id string, bundle TokenBundle, now time.Time) error {
-	result, err := repository.db.ExecContext(ctx, `UPDATE source_connections SET status = 'connected', provider_user_id = ?, provider_login = ?, credential_generation = ?, pending_expires_at = NULL, poll_interval_seconds = NULL, next_poll_at = NULL, access_expires_at = ?, refresh_expires_at = ?, last_error_code = NULL, connected_at = COALESCE(connected_at, ?), disconnected_at = NULL, updated_at = ? WHERE owner_user_id = ? AND id = ? AND status IN ('pending','connected','access_lost') AND credential_generation < ?`, bundle.ProviderUserID, bundle.ProviderLogin, bundle.Generation, timestamp(bundle.AccessExpiresAt), timestamp(bundle.RefreshExpiresAt), timestamp(now), timestamp(now), owner, id, bundle.Generation)
+	result, err := repository.db.ExecContext(ctx, `UPDATE source_connections SET status = 'connected', provider_user_id = ?, provider_login = ?, credential_generation = ?, pending_expires_at = NULL, poll_interval_seconds = NULL, next_poll_at = NULL, access_expires_at = ?, refresh_expires_at = ?, last_error_code = NULL, connected_at = COALESCE(connected_at, ?), disconnected_at = NULL, updated_at = ? WHERE owner_user_id = ? AND id = ? AND status IN ('pending','connected','access_lost','disconnected') AND credential_generation < ?`, bundle.ProviderUserID, bundle.ProviderLogin, bundle.Generation, timestamp(bundle.AccessExpiresAt), timestamp(bundle.RefreshExpiresAt), timestamp(now), timestamp(now), owner, id, bundle.Generation)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
 			return ErrIdentityExists
@@ -135,6 +334,9 @@ func (repository *Repository) Disconnect(ctx context.Context, owner, id string, 
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM github_installations WHERE connection_id IN (SELECT id FROM source_connections WHERE owner_user_id = ? AND id = ?)`, owner, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE github_connection_authorizations SET status='failed',last_error_code='connection_disconnected',updated_at=? WHERE owner_user_id=? AND connection_id=? AND status='pending'`, timestamp(now), owner, id); err != nil {
 		return err
 	}
 	if current != StatusDisconnected {

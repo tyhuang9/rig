@@ -43,6 +43,33 @@ type DeviceStart struct {
 	PollInterval    time.Duration
 }
 
+// ConnectionAuthorization is a device authorization attempt for a durable
+// connection. Attempt credentials are stored separately from the active token
+// bundle so reconnect failures cannot destroy a still-usable connection.
+type ConnectionAuthorization struct {
+	AuthorizationID string
+	DeviceStart
+}
+
+type AuthorizationAttempt struct {
+	ID                   string
+	OwnerUserID          string
+	ConnectionID         string
+	Status               string
+	CredentialGeneration int64
+	PendingExpiresAt     time.Time
+	PollInterval         time.Duration
+	NextPollAt           time.Time
+	LastErrorCode        string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+}
+
+type AuthorizationStatus struct {
+	Authorization AuthorizationAttempt
+	Connection    Connection
+}
+
 type Installation struct {
 	ID                  int64
 	AccountLogin        string
@@ -68,6 +95,21 @@ type SourceRepository struct {
 	Private       bool
 	Archived      bool
 	Disabled      bool
+}
+
+type RepositorySelection struct {
+	ConnectionID   string
+	InstallationID int64
+	AccountLogin   string
+	SourceRepository
+}
+
+type RepositorySelectionPage struct {
+	Page         int
+	PerPage      int
+	TotalCount   int
+	Truncated    bool
+	Repositories []RepositorySelection
 }
 
 type RepositoryPage struct {
