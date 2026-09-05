@@ -204,6 +204,37 @@ func (repository *Repository) FinishAuthorization(ctx context.Context, owner str
 	return tx.Commit()
 }
 
+// ReconcilePromotedAuthorization completes an attempt whose validated bundle
+// was already promoted from the protected file after a process interruption.
+// The caller must separately verify that the active and staged files contain
+// the same bundle; SQLite deliberately contains no credential material.
+func (repository *Repository) ReconcilePromotedAuthorization(ctx context.Context, owner string, attempt AuthorizationAttempt, bundle TokenBundle, now time.Time) error {
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var currentGeneration int64
+	var providerUserID sql.NullString
+	var connectionStatus string
+	if err = tx.QueryRowContext(ctx, `SELECT credential_generation,provider_user_id,status FROM source_connections WHERE id=? AND owner_user_id=?`, attempt.ConnectionID, owner).Scan(&currentGeneration, &providerUserID, &connectionStatus); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if connectionStatus != StatusConnected || bundle.Generation != attempt.CredentialGeneration+1 || currentGeneration != bundle.Generation {
+		return ErrStaleGeneration
+	}
+	if !providerUserID.Valid || providerUserID.String != bundle.ProviderUserID {
+		return ErrIdentityMismatch
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE github_connection_authorizations SET status='connected',last_error_code=NULL,updated_at=? WHERE id=? AND owner_user_id=? AND connection_id=? AND status='pending' AND credential_generation=?`, timestamp(now), attempt.ID, owner, attempt.ConnectionID, attempt.CredentialGeneration)
+	if err = mutationResult(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (repository *Repository) MarkAuthorization(ctx context.Context, owner, connectionID, authorizationID, status, code string, now time.Time) error {
 	if status != "denied" && status != "expired" && status != "failed" && status != "superseded" {
 		return errors.New("invalid authorization status")

@@ -272,7 +272,7 @@ paths:
     get:
       operationId: getDefaultSourceConnection
       responses:
-        '200': {description: Saved default GitHub connection state, content: {application/json: {schema: {$ref: '#/components/schemas/DefaultSourceConnection'}}}}
+        '200': {description: Saved default GitHub connection state, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/DefaultSourceConnection'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/source-connections/default/github/device:
     post:
@@ -288,7 +288,7 @@ paths:
       x-rig-problem-codes: [source_access_lost, provider_unavailable, source_too_large]
       description: Returns one deterministic page aggregated from all accessible personal and organization installations. Provider failures are returned as errors and never represented as an empty successful page.
       responses:
-        '200': {description: Accessible repositories with their durable source identifiers, content: {application/json: {schema: {$ref: '#/components/schemas/ConnectedGitHubRepositoryPage'}}}}
+        '200': {description: Accessible repositories with their durable source identifiers, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/ConnectedGitHubRepositoryPage'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/source-connections/github/device:
     post:
@@ -324,8 +324,8 @@ paths:
       x-rig-problem-codes: [authentication_required, authorization_identity_mismatch, authorization_superseded, authorization_failed, provider_unavailable]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
-        '200': {description: GitHub authorization completed, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubConnectionAuthorizationStatus'}}}}
-        '202': {description: GitHub authorization remains pending, headers: {Retry-After: {schema: {type: integer, minimum: 1}}}, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubConnectionAuthorizationStatus'}}}}
+        '200': {description: GitHub authorization completed, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubConnectionAuthorizationStatus'}}}}
+        '202': {description: GitHub authorization remains pending, headers: {Cache-Control: {schema: {type: string, const: no-store}}, Retry-After: {schema: {type: integer, minimum: 1}}}, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubConnectionAuthorizationStatus'}}}}
         '429': {description: Poll attempted before the persisted next-poll time, headers: {Retry-After: {schema: {type: integer, minimum: 1}}}, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/source-connections/{connectionId}/refresh:

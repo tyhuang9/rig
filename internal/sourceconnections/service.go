@@ -118,6 +118,19 @@ func (service *Service) StartDefault(ctx context.Context, owner string) (Connect
 	if err != nil {
 		return ConnectionAuthorization{}, internalError()
 	}
+	if !configured {
+		unlockConnection = service.locks.lock(connection.ID)
+		defer unlockConnection()
+		currentAttempt, readErr := service.repository.Authorization(ctx, owner, connection.ID, attempt.ID)
+		if readErr != nil {
+			return ConnectionAuthorization{}, internalError()
+		}
+		if currentAttempt.Status != "pending" {
+			_ = service.destroyAttemptCredentials(attempt.ID)
+			return ConnectionAuthorization{}, &Error{Code: "authorization_failed"}
+		}
+		attempt = currentAttempt
+	}
 	for _, id := range superseded {
 		if err := service.destroyAttemptCredentials(id); err != nil {
 			return ConnectionAuthorization{}, internalError()
@@ -249,6 +262,25 @@ func (service *Service) finishDefaultBundle(ctx context.Context, owner string, c
 		return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "authorization_identity_mismatch")
 	}
 	previous, previousErr := service.credentials.ReadBundle(connection.ID)
+	if previousErr == nil && connection.CredentialGeneration == bundle.Generation && attempt.CredentialGeneration+1 == bundle.Generation && tokenBundlesEqual(previous, bundle) {
+		if err := service.repository.ReconcilePromotedAuthorization(ctx, owner, attempt, bundle, service.now().UTC()); err != nil {
+			if errors.Is(err, ErrIdentityMismatch) {
+				return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "authorization_identity_mismatch")
+			}
+			if errors.Is(err, ErrStaleGeneration) {
+				return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "authorization_superseded")
+			}
+			return AuthorizationStatus{}, internalError()
+		}
+		if err := service.destroyAttemptCredentials(attempt.ID); err != nil {
+			return AuthorizationStatus{}, internalError()
+		}
+		attempt.Status = "connected"
+		return AuthorizationStatus{Authorization: attempt, Connection: connection}, nil
+	}
+	if connection.CredentialGeneration != attempt.CredentialGeneration {
+		return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "authorization_superseded")
+	}
 	if err := service.credentials.WriteBundle(connection.ID, bundle); err != nil {
 		return AuthorizationStatus{}, internalError()
 	}
@@ -278,6 +310,13 @@ func (service *Service) finishDefaultBundle(ctx context.Context, owner string, c
 	}
 	attempt.Status = "connected"
 	return AuthorizationStatus{Authorization: attempt, Connection: connected}, nil
+}
+
+func tokenBundlesEqual(left, right TokenBundle) bool {
+	return left.Version == right.Version && left.Generation == right.Generation &&
+		left.AccessToken == right.AccessToken && left.RefreshToken == right.RefreshToken &&
+		left.AccessExpiresAt.Equal(right.AccessExpiresAt) && left.RefreshExpiresAt.Equal(right.RefreshExpiresAt) &&
+		left.ProviderUserID == right.ProviderUserID && left.ProviderLogin == right.ProviderLogin
 }
 
 func (service *Service) handleDefaultPollError(ctx context.Context, owner string, attempt AuthorizationAttempt, providerErr error, now time.Time) error {
@@ -329,13 +368,14 @@ func (service *Service) failAuthorization(ctx context.Context, owner string, att
 	if err := service.destroyAttemptCredentials(attempt.ID); err != nil {
 		return internalError()
 	}
-	if err := service.repository.MarkAuthorization(ctx, owner, attempt.ConnectionID, attempt.ID, "failed", code, service.now().UTC()); err != nil {
+	status := "failed"
+	if code == "authorization_superseded" {
+		status = "superseded"
+	}
+	if err := service.repository.MarkAuthorization(ctx, owner, attempt.ConnectionID, attempt.ID, status, code, service.now().UTC()); err != nil {
 		return internalError()
 	}
-	if code == "authorization_identity_mismatch" {
-		return &Error{Code: code}
-	}
-	if code == "identity_already_connected" {
+	if code == "authorization_identity_mismatch" || code == "identity_already_connected" || code == "authorization_superseded" {
 		return &Error{Code: code}
 	}
 	return &Error{Code: "authorization_failed"}
@@ -593,8 +633,9 @@ func (service *Service) DefaultRepositories(ctx context.Context, owner, query st
 	const providerPageSize = 100
 	const maximumProviderPages = 100
 	var selections []RepositorySelection
-	providerPages := 0
 	err = service.withAccess(ctx, owner, connection.ID, func(provider repositoryProvider, token string) error {
+		attemptSelections := make([]RepositorySelection, 0)
+		providerPages := 0
 		var installations []githubapp.Installation
 		installationIDs := make(map[int64]struct{})
 		installationTotal := -1
@@ -618,6 +659,9 @@ func (service *Service) DefaultRepositories(ctx context.Context, owner, query st
 				}
 				installationIDs[installation.ID] = struct{}{}
 				installations = append(installations, installation)
+			}
+			if len(installations) > installationTotal {
+				return &githubapp.Error{Code: "invalid_response"}
 			}
 			if len(installations) >= installationTotal {
 				break
@@ -653,11 +697,17 @@ func (service *Service) DefaultRepositories(ctx context.Context, owner, query st
 					}
 					repositoryIDs[item.ID] = struct{}{}
 					seen++
+					if item.Archived || item.Disabled {
+						continue
+					}
 					fullName := strings.ToLower(item.Owner + "/" + item.Name)
 					if query != "" && !strings.Contains(fullName, query) && !strings.Contains(strings.ToLower(installation.AccountLogin), query) {
 						continue
 					}
-					selections = append(selections, RepositorySelection{ConnectionID: connection.ID, InstallationID: installation.ID, AccountLogin: installation.AccountLogin, SourceRepository: sourceRepository(item)})
+					attemptSelections = append(attemptSelections, RepositorySelection{ConnectionID: connection.ID, InstallationID: installation.ID, AccountLogin: installation.AccountLogin, SourceRepository: sourceRepository(item)})
+				}
+				if seen > repositoryTotal {
+					return &githubapp.Error{Code: "invalid_response"}
 				}
 				if seen >= repositoryTotal {
 					break
@@ -667,6 +717,7 @@ func (service *Service) DefaultRepositories(ctx context.Context, owner, query st
 				}
 			}
 		}
+		selections = attemptSelections
 		return nil
 	})
 	if err != nil {

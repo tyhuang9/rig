@@ -331,15 +331,29 @@ func TestSourceConnectionAPIUsesNoStoreOwnerScopeAndFixedSafeProblems(t *testing
 
 func TestDefaultSourceConnectionAuthorizationAndAggregateRepositoryAPI(t *testing.T) {
 	harness := newSourceHarness(t, true)
+	assertNoStore := func(name string, response *httptest.ResponseRecorder) {
+		t.Helper()
+		if response.Header().Get("Cache-Control") != "no-store" {
+			t.Errorf("%s cache control = %q", name, response.Header().Get("Cache-Control"))
+		}
+	}
+	unauthenticated := sourceRequest(harness.handler, auth.Session{}, http.MethodGet, "/api/v1/source-connections/default", "", false)
+	assertNoStore("unauthenticated default", unauthenticated)
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated default = %d %s", unauthenticated.Code, unauthenticated.Body.String())
+	}
 	empty := sourceRequest(harness.handler, harness.session, http.MethodGet, "/api/v1/source-connections/default", "", true)
+	assertNoStore("empty default", empty)
 	if empty.Code != http.StatusOK || empty.Body.String() != "{\"configured\":false}\n" {
 		t.Fatalf("empty default = %d %s", empty.Code, empty.Body.String())
 	}
 	withoutCSRF := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/source-connections/default/github/device", "", false)
+	assertNoStore("default start CSRF failure", withoutCSRF)
 	if withoutCSRF.Code != http.StatusForbidden || harness.provider.deviceCalls != 0 {
 		t.Fatalf("default start without CSRF = %d calls=%d", withoutCSRF.Code, harness.provider.deviceCalls)
 	}
 	started := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/source-connections/default/github/device", "", true)
+	assertNoStore("default start", started)
 	var authorization struct {
 		AuthorizationID string `json:"authorizationId"`
 		ConnectionID    string `json:"connectionId"`
@@ -349,22 +363,26 @@ func TestDefaultSourceConnectionAuthorizationAndAggregateRepositoryAPI(t *testin
 	}
 	assertAbsent(t, started.Body.String()+harness.logs.String(), "device-code-sentinel", "ghu_api_sentinel", "ghr_api_sentinel")
 	otherPoll := sourceRequest(harness.handler, harness.otherSession, http.MethodPost, "/api/v1/source-connections/"+authorization.ConnectionID+"/device/"+authorization.AuthorizationID+"/poll", "", true)
+	assertNoStore("cross-owner poll", otherPoll)
 	if otherPoll.Code != http.StatusNotFound || harness.provider.pollCalls != 0 {
 		t.Fatalf("cross-owner authorization poll = %d calls=%d body=%s", otherPoll.Code, harness.provider.pollCalls, otherPoll.Body.String())
 	}
 	harness.clock.now = harness.clock.now.Add(5 * time.Second)
 	harness.provider.pollError = &githubapp.Error{Code: "authorization_pending"}
 	pending := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/source-connections/"+authorization.ConnectionID+"/device/"+authorization.AuthorizationID+"/poll", "", true)
+	assertNoStore("pending poll", pending)
 	if pending.Code != http.StatusAccepted || !strings.Contains(pending.Body.String(), `"status":"pending"`) || !strings.Contains(pending.Body.String(), `"id":"`+authorization.ConnectionID+`"`) || !strings.Contains(pending.Body.String(), `"status":"disconnected"`) {
 		t.Fatalf("default pending = %d %s", pending.Code, pending.Body.String())
 	}
 	harness.clock.now = harness.clock.now.Add(5 * time.Second)
 	harness.provider.pollError = nil
 	connected := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/source-connections/"+authorization.ConnectionID+"/device/"+authorization.AuthorizationID+"/poll", "", true)
+	assertNoStore("connected poll", connected)
 	if connected.Code != http.StatusOK || !strings.Contains(connected.Body.String(), `"status":"connected"`) {
 		t.Fatalf("default connected = %d %s", connected.Code, connected.Body.String())
 	}
 	defaultConnection := sourceRequest(harness.handler, harness.session, http.MethodGet, "/api/v1/source-connections/default", "", true)
+	assertNoStore("saved default", defaultConnection)
 	if defaultConnection.Code != http.StatusOK || !strings.Contains(defaultConnection.Body.String(), `"providerLogin":"octo"`) {
 		t.Fatalf("saved default = %d %s", defaultConnection.Code, defaultConnection.Body.String())
 	}
@@ -372,15 +390,18 @@ func TestDefaultSourceConnectionAuthorizationAndAggregateRepositoryAPI(t *testin
 	harness.provider.installationPage = githubapp.InstallationPage{TotalCount: 1, Installations: []githubapp.Installation{{ID: 9, AccountLogin: "acme", AccountType: "Organization", TargetType: "Organization", RepositorySelection: "selected"}}}
 	harness.provider.repositoryPage = githubapp.RepositoryPage{TotalCount: 1, Repositories: []githubapp.Repository{{ID: 77, Owner: "acme", Name: "service", DefaultBranch: "main", Private: true}}}
 	repositories := sourceRequest(harness.handler, harness.session, http.MethodGet, "/api/v1/source-connections/default/github/repositories?q=service&page=1&perPage=30", "", true)
+	assertNoStore("aggregate repositories", repositories)
 	if repositories.Code != http.StatusOK || !strings.Contains(repositories.Body.String(), `"connectionId":"`+authorization.ConnectionID+`"`) || !strings.Contains(repositories.Body.String(), `"installationId":9`) || !strings.Contains(repositories.Body.String(), `"accountLogin":"acme"`) {
 		t.Fatalf("aggregate repositories = %d %s", repositories.Code, repositories.Body.String())
 	}
 	harness.provider.repositoryError = errors.New("provider detail sentinel")
 	failed := sourceRequest(harness.handler, harness.session, http.MethodGet, "/api/v1/source-connections/default/github/repositories", "", true)
+	assertNoStore("aggregate failure", failed)
 	if failed.Code != http.StatusServiceUnavailable || strings.Contains(failed.Body.String(), `"items":[]`) || strings.Contains(failed.Body.String(), "provider detail sentinel") {
 		t.Fatalf("aggregate failure = %d %s", failed.Code, failed.Body.String())
 	}
 	invalid := sourceRequest(harness.handler, harness.session, http.MethodGet, "/api/v1/source-connections/default/github/repositories?q="+strings.Repeat("x", 201), "", true)
+	assertNoStore("invalid aggregate request", invalid)
 	if invalid.Code != http.StatusBadRequest {
 		t.Fatalf("oversized search = %d %s", invalid.Code, invalid.Body.String())
 	}
