@@ -76,10 +76,10 @@ function deferred<T>() {
 }
 
 function mockData() {
+  vi.spyOn(api, "status").mockResolvedValue({ capabilities: { githubConnections: true } } as never);
   vi.spyOn(api, "relayStatus").mockResolvedValue(relayStatus as never);
-  vi.spyOn(api, "sourceConnections").mockResolvedValue({ items: [connection] } as never);
-  vi.spyOn(api, "githubInstallations").mockResolvedValue({ page: 1, perPage: 30, totalCount: 1, items: [installation] } as never);
-  vi.spyOn(api, "githubRepositories").mockResolvedValue({ page: 1, perPage: 30, totalCount: 1, items: [repository] } as never);
+  vi.spyOn(api, "defaultSourceConnection").mockResolvedValue({ configured: true, connection } as never);
+  vi.spyOn(api, "defaultGitHubRepositories").mockResolvedValue({ page: 1, perPage: 30, totalCount: 1, truncated: false, items: [{ ...repository, connectionId, installationId: 7, accountLogin: "octocat" }] } as never);
   vi.spyOn(api, "startRelayEnrollment").mockResolvedValue({ enrollmentId, authorizationUrl: authorizationURL(), status: "pending", expiresAt: future } as never);
   vi.spyOn(api, "pollRelayEnrollment").mockResolvedValue({ enrollmentId, status: "pending", createdAt: timestamp, expiresAt: future, updatedAt: timestamp } as never);
   vi.spyOn(api, "removeRelayBinding").mockResolvedValue({ bindingId, state: "removed", updatedAt: timestamp } as never);
@@ -97,11 +97,8 @@ function renderPanel(
 }
 
 async function chooseRepository() {
-  fireEvent.change(await screen.findByLabelText("GitHub connection"), { target: { value: connectionId } });
-  await screen.findByRole("option", { name: "octocat (selected)" });
-  fireEvent.change(screen.getByLabelText("GitHub App installation"), { target: { value: "7" } });
   await screen.findByRole("option", { name: "octocat/service (private)" });
-  fireEvent.change(screen.getByLabelText("Repository"), { target: { value: "9" } });
+  fireEvent.change(screen.getByLabelText("Repository"), { target: { value: `${connectionId}:7:9` } });
 }
 
 async function startRotation() {
@@ -111,7 +108,7 @@ async function startRotation() {
 }
 
 describe("RelayManagementPanel", () => {
-  beforeEach(() => { vi.restoreAllMocks(); mockData(); });
+  beforeEach(() => { vi.restoreAllMocks(); sessionStorage.clear(); mockData(); });
   afterEach(() => { vi.useRealTimers(); cleanup(); });
 
   it("renders loading, empty, diagnostics, and administrator-safe controls without identifiers", async () => {
@@ -153,10 +150,10 @@ describe("RelayManagementPanel", () => {
       .mockResolvedValueOnce({ enrollmentId, authorizationUrl: authorizationURL(9, alternateOAuthState), status: "pending", expiresAt: future } as never);
     renderPanel();
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     expect((await screen.findByRole("alert")).textContent).toContain("expired before it could be opened");
     expect(screen.queryByRole("link", { name: /Open GitHub authorization/ })).toBeNull();
-    expect((screen.getByRole("button", { name: "Start relay authorization" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Authorize automatic deployments" }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "Start again" }));
     expect((await screen.findByRole("link", { name: /Open GitHub authorization/ })).getAttribute("href")).toBe(authorizationURL(9, alternateOAuthState));
     expect(api.startRelayEnrollment).toHaveBeenCalledTimes(2);
@@ -168,7 +165,7 @@ describe("RelayManagementPanel", () => {
       .mockResolvedValueOnce({ enrollmentId: "44444444-4444-4444-8444-444444444444", authorizationUrl: authorizationURL(9, alternateOAuthState), status: "pending", expiresAt: future } as never);
     renderPanel("administrator", { intervalMs: 40, maxAttempts: 1, maxDurationMs: 1_000 });
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     expect(await screen.findByRole("link", { name: /Open GitHub authorization/ })).not.toBeNull();
     const alert = await screen.findByRole("alert", {}, { timeout: 1_000 });
     expect(alert.textContent).toContain("polling limit");
@@ -182,7 +179,7 @@ describe("RelayManagementPanel", () => {
   it("ends an enrollment when its actual duration window elapses before polling", async () => {
     renderPanel("administrator", { intervalMs: 30, maxAttempts: 99, maxDurationMs: 1 });
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     const alert = await screen.findByRole("alert", {}, { timeout: 1_000 });
     expect(alert.textContent).toContain("polling limit");
     expect(api.pollRelayEnrollment).not.toHaveBeenCalled();
@@ -199,7 +196,7 @@ describe("RelayManagementPanel", () => {
     } as never);
     renderPanel("administrator", { intervalMs: 20, maxAttempts: 99, maxDurationMs: RELAY_POLL_MAX_DURATION_MS });
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     expect(await screen.findByRole("link", { name: /Open GitHub authorization/ })).not.toBeNull();
     vi.spyOn(Date, "now").mockReturnValue(Date.parse(future) + 1);
     const alert = await screen.findByRole("alert", {}, { timeout: 1_000 });
@@ -219,7 +216,7 @@ describe("RelayManagementPanel", () => {
     } as never);
     renderPanel("administrator", { intervalMs: 50 });
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     expect(await screen.findByRole("link", { name: /Open GitHub authorization/ })).not.toBeNull();
     const alert = await screen.findByRole("alert", {}, { timeout: 1_000 });
     expect(alert.textContent).toContain("expired");
@@ -257,74 +254,18 @@ describe("RelayManagementPanel", () => {
     expectHostileDetailHidden();
   });
 
-  it.each([
-    ["connections", "GitHub connections could not be loaded."],
-    ["installations", "GitHub App installations could not be loaded."],
-    ["repositories", "Repositories could not be loaded."],
-  ])("does not render hostile remote detail from the %s query", async (operation, expected) => {
-    if (operation === "connections") vi.mocked(api.sourceConnections).mockRejectedValue(hostileAPIError());
-    if (operation === "installations") vi.mocked(api.githubInstallations).mockRejectedValue(hostileAPIError());
-    if (operation === "repositories") vi.mocked(api.githubRepositories).mockRejectedValue(hostileAPIError());
+  it.each(["connections", "repositories"])("does not render hostile remote detail from the %s query", async (operation) => {
+    if (operation === "connections") vi.mocked(api.defaultSourceConnection).mockRejectedValue(hostileAPIError());
+    else vi.mocked(api.defaultGitHubRepositories).mockRejectedValue(hostileAPIError());
     renderPanel();
-    if (operation !== "connections") {
-      fireEvent.change(await screen.findByLabelText("GitHub connection"), { target: { value: connectionId } });
-    }
-    if (operation === "repositories") {
-      await screen.findByRole("option", { name: "octocat (selected)" });
-      fireEvent.change(screen.getByLabelText("GitHub App installation"), { target: { value: "7" } });
-    }
-    const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toContain(expected);
+    await screen.findByText(operation === "connections" ? "GitHub connection could not be loaded." : "Repositories unavailable", operation === "connections" ? {} : { selector: "strong" });
     expectHostileDetailHidden();
-  });
-
-  it("paginates installations and resets dependent selectors", async () => {
-    vi.mocked(api.githubInstallations).mockImplementation(async (_connection, page) => ({ page, perPage: 30, totalCount: 31, items: [{ ...installation, id: page === 1 ? 7 : 8 }] }) as never);
-    renderPanel();
-    fireEvent.change(await screen.findByLabelText("GitHub connection"), { target: { value: connectionId } });
-    await screen.findByRole("option", { name: "octocat (selected)" });
-    const installationSelect = screen.getByLabelText("GitHub App installation") as HTMLSelectElement;
-    fireEvent.change(installationSelect, { target: { value: "7" } });
-    await screen.findByLabelText("Repository");
-    fireEvent.click(within(screen.getByRole("navigation", { name: "installations pagination" })).getByRole("button", { name: "Next" }));
-    await waitFor(() => expect(api.githubInstallations).toHaveBeenLastCalledWith(connectionId, 2, 30));
-    await waitFor(() => expect(screen.getByRole("status", { name: "" }).textContent).toContain("1 GitHub App installation is available on page 2"));
-    expect(document.querySelectorAll(".relay-source-status")).toHaveLength(1);
-    expect((screen.getByLabelText("GitHub App installation") as HTMLSelectElement).value).toBe("");
-    expect(screen.queryByLabelText("Repository")).toBeNull();
-  });
-
-  it("uses one scoped source announcement and exposes source failures as alerts", async () => {
-    vi.mocked(api.githubInstallations).mockRejectedValue(new Error("installations offline"));
-    renderPanel();
-    const sourceRegion = await screen.findByText(/connected GitHub source is available/);
-    expect(sourceRegion.getAttribute("role")).toBe("status");
-    expect(sourceRegion.getAttribute("aria-live")).toBe("polite");
-    expect(document.querySelectorAll(".relay-source-status")).toHaveLength(1);
-    fireEvent.change(screen.getByLabelText("GitHub connection"), { target: { value: connectionId } });
-    const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toContain("GitHub App installations could not be loaded.");
-    expect(alert.textContent).not.toContain("installations offline");
-    expect(document.querySelectorAll(".relay-source-status")).toHaveLength(1);
-  });
-
-  it("keeps source loading and empty results in the same polite region", async () => {
-    const sources = deferred<unknown>();
-    vi.mocked(api.sourceConnections).mockReturnValue(sources.promise as never);
-    renderPanel();
-    const region = await screen.findByText("Loading connected GitHub sources…");
-    expect(region.classList.contains("relay-source-status")).toBe(true);
-    expect(region.getAttribute("aria-live")).toBe("polite");
-    expect(document.querySelectorAll(".relay-source-status")).toHaveLength(1);
-    await act(async () => sources.resolve({ items: [] }));
-    await waitFor(() => expect(region.textContent).toContain("No connected GitHub sources are available."));
-    expect(document.querySelectorAll(".relay-source-status")).toHaveLength(1);
   });
 
   it("starts enrollment only for an exact source and exposes only a canonical HTTPS link", async () => {
     renderPanel();
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     await waitFor(() => expect(api.startRelayEnrollment).toHaveBeenCalledWith({ connectionId, installationId: 7, repositoryId: 9 }));
     const link = await screen.findByRole("link", { name: /Open GitHub authorization/ });
     expect(link.getAttribute("href")).toBe(authorizationURL());
@@ -337,14 +278,14 @@ describe("RelayManagementPanel", () => {
   it("keeps request fences usable after the development StrictMode effect cycle", async () => {
     renderPanel("administrator", { intervalMs: 500 }, true);
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     expect(await screen.findByRole("link", { name: /Open GitHub authorization/ })).not.toBeNull();
     expect(api.startRelayEnrollment).toHaveBeenCalledTimes(1);
   });
 
   it("discards a delayed enrollment start when its selected repository changes", async () => {
     const firstStart = deferred<unknown>();
-    vi.mocked(api.githubRepositories).mockResolvedValue({ page: 1, perPage: 30, totalCount: 2, items: [repository, secondRepository] } as never);
+    vi.mocked(api.defaultGitHubRepositories).mockResolvedValue({ page: 1, perPage: 30, totalCount: 2, truncated: false, items: [repository, secondRepository].map((item) => ({ ...item, connectionId, installationId: 7, accountLogin: "octocat" })) } as never);
     vi.mocked(api.startRelayEnrollment)
       .mockReturnValueOnce(firstStart.promise as never)
       .mockResolvedValueOnce({
@@ -355,12 +296,12 @@ describe("RelayManagementPanel", () => {
       } as never);
     renderPanel("administrator", { intervalMs: 500 });
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     await waitFor(() => expect(api.startRelayEnrollment).toHaveBeenCalledTimes(1));
 
-    fireEvent.change(screen.getByLabelText("Repository"), { target: { value: "10" } });
-    await waitFor(() => expect((screen.getByRole("button", { name: "Start relay authorization" }) as HTMLButtonElement).disabled).toBe(false));
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.change(screen.getByLabelText("Repository"), { target: { value: `${connectionId}:7:10` } });
+    await waitFor(() => expect((screen.getByRole("button", { name: "Authorize automatic deployments" }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     const currentLink = await screen.findByRole("link", { name: /Open GitHub authorization/ });
     expect(currentLink.getAttribute("href")).toBe(authorizationURL(10, workerOAuthState));
     expect(screen.getByText("octocat/worker (10)")).not.toBeNull();
@@ -380,7 +321,7 @@ describe("RelayManagementPanel", () => {
     vi.mocked(api.startRelayEnrollment).mockResolvedValue({ enrollmentId, authorizationUrl: authorizationURL().replace("https://", "http://"), status: "pending", expiresAt: future } as never);
     renderPanel();
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     expect((await screen.findByRole("alert")).textContent).toContain("unsupported relay response");
     expect(screen.queryByRole("link", { name: /Open GitHub authorization/ })).toBeNull();
   });
@@ -389,7 +330,7 @@ describe("RelayManagementPanel", () => {
     vi.mocked(api.startRelayEnrollment).mockResolvedValue({ enrollmentId, authorizationUrl: "https://attacker.example/login/oauth/authorize?state=safe", status: "pending", expiresAt: future } as never);
     renderPanel();
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     expect((await screen.findByRole("alert")).textContent).toContain("unsupported relay response");
     expect(screen.queryByRole("link", { name: /Open GitHub authorization/ })).toBeNull();
     expect(document.body.textContent).not.toContain("attacker.example");
@@ -405,7 +346,7 @@ describe("RelayManagementPanel", () => {
     vi.mocked(api.startRelayEnrollment).mockResolvedValue({ enrollmentId, authorizationUrl: hostileURL, status: "pending", expiresAt: future } as never);
     renderPanel();
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     expect((await screen.findByRole("alert")).textContent).toContain("unsupported relay response");
     expect(screen.queryByRole("link", { name: /Open GitHub authorization/ })).toBeNull();
     expect(document.body.textContent).not.toContain(hostileURL);
@@ -415,7 +356,7 @@ describe("RelayManagementPanel", () => {
     vi.mocked(api.pollRelayEnrollment).mockResolvedValue({ enrollmentId, bindingId, status: "authorized", createdAt: timestamp, expiresAt: future, updatedAt: timestamp, completedAt: timestamp } as never);
     renderPanel("administrator", { intervalMs: 10 });
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     await waitFor(() => expect(api.pollRelayEnrollment).toHaveBeenCalledWith(enrollmentId));
     const notice = (await screen.findByText("Relay binding authorized")).closest("[role='status']")!;
     expect(notice.classList.contains("success")).toBe(true);
@@ -430,7 +371,7 @@ describe("RelayManagementPanel", () => {
     vi.mocked(api.pollRelayEnrollment).mockResolvedValue({ enrollmentId, status: terminal, createdAt: timestamp, expiresAt: future, updatedAt: timestamp, completedAt: timestamp } as never);
     renderPanel("administrator", { intervalMs: 10 });
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     const notice = (await screen.findByText(title)).closest<HTMLElement>("[role='status']")!;
     expect(notice.classList.contains("warning")).toBe(true);
     expect(notice.classList.contains("success")).toBe(false);
@@ -442,7 +383,7 @@ describe("RelayManagementPanel", () => {
     vi.mocked(api.pollRelayEnrollment).mockResolvedValue({ enrollmentId, status: "failed", createdAt: timestamp, expiresAt: future, updatedAt: timestamp, completedAt: timestamp } as never);
     renderPanel("administrator", { intervalMs: 10 });
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     const alert = await screen.findByRole("alert");
     expect(alert.classList.contains("danger")).toBe(true);
     expect(alert.classList.contains("success")).toBe(false);
@@ -457,7 +398,7 @@ describe("RelayManagementPanel", () => {
     vi.mocked(api.pollRelayEnrollment).mockRejectedValue(new Error("poll offline"));
     renderPanel();
     await chooseRepository();
-    fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+    fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     const alert = await screen.findByRole("alert", {}, { timeout: RELAY_POLL_INTERVAL_MS + 2_000 });
     expect(alert.textContent).toContain("Could not check relay authorization.");
     expect(alert.textContent).not.toContain("poll offline");
@@ -481,12 +422,12 @@ describe("RelayManagementPanel", () => {
       vi.mocked(api.startRelayEnrollment).mockRejectedValue(hostileAPIError());
       renderPanel();
       await chooseRepository();
-      fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+      fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     } else if (operation === "enrollment poll") {
       vi.mocked(api.pollRelayEnrollment).mockRejectedValue(hostileAPIError());
       renderPanel("administrator", { intervalMs: 10 });
       await chooseRepository();
-      fireEvent.click(screen.getByRole("button", { name: "Start relay authorization" }));
+      fireEvent.click(screen.getByRole("button", { name: "Authorize automatic deployments" }));
     } else if (operation === "binding removal") {
       vi.mocked(api.relayStatus).mockResolvedValue({ ...relayStatus, removableBindings: [{ bindingId, connectionId, installationId: 7, repositoryId: 9, state: "authorized", updatedAt: timestamp }] } as never);
       vi.mocked(api.removeRelayBinding).mockRejectedValue(hostileAPIError());

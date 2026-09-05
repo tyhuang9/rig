@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api, type Job } from "./api";
-import { ActivityRow, MachinesPage } from "./dashboard";
+import { ActivityRow, ConnectionsPage, MachinesPage } from "./dashboard";
 import { DASHBOARD_CAUGHT_ERROR_MESSAGE, handleDashboardCaughtError } from "./root-errors";
 
 const unavailableRelayStatus = {
@@ -21,6 +21,21 @@ const unavailableRelayStatus = {
   removableBindings: [],
   keyRotation: { inProgress: false },
 };
+
+describe("ConnectionsPage", () => {
+  afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+  it("opens the saved GitHub connector and focuses the page heading", async () => {
+    vi.spyOn(api, "status").mockResolvedValue({ capabilities: { githubConnections: true } } as never);
+    vi.spyOn(api, "defaultSourceConnection").mockResolvedValue({ configured: true, connection: { id: "a".repeat(32), provider: "github", status: "connected", providerLogin: "octocat", credentialGeneration: 1, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" } });
+    const start = vi.spyOn(api, "startDefaultGitHubConnection");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={client}><ConnectionsPage/></QueryClientProvider>);
+    await screen.findByText("Connected as @octocat");
+    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Connections" }));
+    expect(document.title).toBe("Connections · hostd");
+    expect(start).not.toHaveBeenCalled();
+  });
+});
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
