@@ -24,6 +24,9 @@ const (
 	caddyVolumeName    = "rig-generated-caddy-config-v1"
 	caddyNetworkName   = "rig-generated-caddy-ingress-v1"
 	caddyExecutable    = "/usr/bin/caddy"
+	// The pinned upstream binary has a file-effective capability. Linux refuses
+	// exec when that capability is absent from the bounding set, even on :8080.
+	caddyCapability    = "NET_BIND_SERVICE"
 	caddyImage         = "caddy@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
 	caddyImageDigest   = "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
 	defaultHostPort    = uint16(8080)
@@ -403,7 +406,7 @@ func (m *Manager) createCaddy(ctx context.Context, imageID, ingressIP string) er
 	args := []string{"container", "create", "--name", caddyContainerName, "--hostname", caddyContainerName, "--network", caddyNetworkName,
 		"--ip", ingressIP,
 		"--mount", "type=volume,src=" + caddyVolumeName + ",dst=/config", "--user", "1000:1000", "--entrypoint", caddyExecutable, "--read-only",
-		"--tmpfs", "/data:rw,noexec,nosuid,nodev,size=67108864", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+		"--tmpfs", "/data:rw,noexec,nosuid,nodev,size=67108864", "--cap-drop", "ALL", "--cap-add", caddyCapability, "--security-opt", "no-new-privileges",
 		"--memory", "268435456", "--memory-swap", "268435456", "--cpus", "1.000", "--pids-limit", "128", "--ulimit", "nofile=1024:1024",
 		"--publish", "127.0.0.1:" + strconv.FormatUint(uint64(m.options.HostPort), 10) + ":8080/tcp", "--restart", "unless-stopped",
 		"--log-driver", "local", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
@@ -966,7 +969,7 @@ func (m *Manager) inspectJSON(ctx context.Context, destination any, args ...stri
 func validCaddyInspection(value caddyInspection, imageID string, hostPort uint16) bool {
 	if normalizeID(value.Image) != normalizeID(imageID) || strings.TrimPrefix(value.Name, "/") != caddyContainerName || value.User != "1000:1000" ||
 		value.Hostname != caddyContainerName || value.NetworkMode != caddyNetworkName || !containsString(value.Env, "XDG_CONFIG_HOME=/config") || !containsString(value.Env, "XDG_DATA_HOME=/data") ||
-		!value.ReadOnly || value.Privileged || len(value.CapAdd) != 0 || !exactFoldSet(value.CapDrop, "ALL") || !onlyNoNewPrivileges(value.SecurityOpt) ||
+		!value.ReadOnly || value.Privileged || !onlyCaddyCapability(value.CapAdd) || !exactFoldSet(value.CapDrop, "ALL") || !onlyNoNewPrivileges(value.SecurityOpt) ||
 		len(value.Binds) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 || value.NanoCPUs != 1_000_000_000 || value.PIDsLimit != 128 ||
 		len(value.Tmpfs) != 1 || value.Tmpfs["/data"] != "rw,noexec,nosuid,nodev,size=67108864" ||
 		value.LogType != "local" || value.LogConfig["max-size"] != "10m" || value.LogConfig["max-file"] != "3" || value.Restart != "unless-stopped" ||
@@ -1106,6 +1109,10 @@ func onlyNoNewPrivileges(values []string) bool {
 
 func exactFoldSet(values []string, expected string) bool {
 	return len(values) == 1 && strings.EqualFold(values[0], expected)
+}
+
+func onlyCaddyCapability(values []string) bool {
+	return len(values) == 1 && strings.TrimPrefix(strings.ToUpper(values[0]), "CAP_") == caddyCapability
 }
 
 func clearResult(result *runtimeprocess.CommandResult) {

@@ -184,7 +184,7 @@ func (r *ingressRunner) caddyInspection() caddyInspection {
 	return caddyInspection{
 		ID: "sha256:" + strings.Repeat("d", 64), Name: "/" + caddyContainerName, Image: "sha256:" + strings.Repeat("a", 64),
 		Labels: map[string]string{"io.rig.managed": "generated-ingress", "io.rig.identity-version": "v1", "io.rig.listener-isolation": "v1"}, Hostname: caddyContainerName, User: "1000:1000", Env: []string{"XDG_CONFIG_HOME=/config", "XDG_DATA_HOME=/data"},
-		Entrypoint: []string{caddyExecutable}, Cmd: []string{"run", "--config", "/config/active.json"}, ReadOnly: true, CapDrop: []string{"ALL"}, SecurityOpt: []string{"no-new-privileges"},
+		Entrypoint: []string{caddyExecutable}, Cmd: []string{"run", "--config", "/config/active.json"}, ReadOnly: true, CapDrop: []string{"ALL"}, CapAdd: []string{caddyCapability}, SecurityOpt: []string{"no-new-privileges"},
 		Mounts: []mountInspection{{Type: "volume", Name: caddyVolumeName, Destination: "/config", RW: true}}, Tmpfs: map[string]string{"/data": "rw,noexec,nosuid,nodev,size=67108864"},
 		Memory: 268435456, MemorySwap: 268435456, NanoCPUs: 1_000_000_000, PIDsLimit: 128, LogType: "local", LogConfig: map[string]string{"max-size": "10m", "max-file": "3"}, Restart: "unless-stopped", Running: !r.stopped, Restarting: r.restarting,
 		NetworkMode: caddyNetworkName, Ulimits: []ulimitInspection{{Name: "nofile", Hard: 1024, Soft: 1024}}, PortBindings: map[string][]map[string]string{"8080/tcp": {{"HostIp": "127.0.0.1", "HostPort": "8080"}}}, Networks: r.caddyNetworks,
@@ -778,6 +778,25 @@ func TestCaddyInspectionAcceptsOnlyEnabledNoNewPrivileges(t *testing.T) {
 	}
 }
 
+func TestCaddyInspectionRequiresOnlyGatewayBindCapability(t *testing.T) {
+	_, runner := newManagerFixture(t, false)
+	imageID := "sha256:" + strings.Repeat("a", 64)
+	for _, capability := range []string{"NET_BIND_SERVICE", "CAP_NET_BIND_SERVICE", "net_bind_service", "cap_net_bind_service"} {
+		candidate := runner.caddyInspection()
+		candidate.CapAdd = []string{capability}
+		if !validCaddyInspection(candidate, imageID, 8080) {
+			t.Fatalf("required Caddy capability variant %q was rejected", capability)
+		}
+	}
+	for _, capabilities := range [][]string{nil, {}, {"ALL"}, {"NET_ADMIN"}, {"NET_BIND_SERVICE", "NET_ADMIN"}, {"NET_BIND_SERVICE", "CAP_NET_BIND_SERVICE"}, {"NET_BIND_SERVICE "}} {
+		candidate := runner.caddyInspection()
+		candidate.CapAdd = capabilities
+		if validCaddyInspection(candidate, imageID, 8080) {
+			t.Fatalf("incorrect Caddy capability set %#v was accepted", capabilities)
+		}
+	}
+}
+
 func TestIngressInspectFormatsUseCanonicalDockerFieldsAndNilGuards(t *testing.T) {
 	imageID := "sha256:" + strings.Repeat("a", 64)
 	var image imageInspection
@@ -873,6 +892,18 @@ func TestProvisionCreatesPinnedIngressNetworkAndStaticCaddyAddress(t *testing.T)
 		}
 	}
 	entrypointIndex := argumentIndex(create, "--entrypoint")
+	if !hasCommandArguments([][]string{create}, "container", "create", "--cap-drop", "ALL", "--cap-add", caddyCapability) {
+		t.Fatal("Caddy create did not use its exact gateway capability policy")
+	}
+	capAdds := 0
+	for _, argument := range create {
+		if argument == "--cap-add" {
+			capAdds++
+		}
+	}
+	if capAdds != 1 {
+		t.Fatalf("Caddy create capability flag count = %d", capAdds)
+	}
 	imageIndex := argumentIndex(create, "sha256:"+strings.Repeat("a", 64))
 	if entrypointIndex < 0 || entrypointIndex+1 >= len(create) || create[entrypointIndex+1] != caddyExecutable || imageIndex <= entrypointIndex || !reflect.DeepEqual(create[imageIndex:], []string{"sha256:" + strings.Repeat("a", 64), "run", "--config", "/config/active.json"}) {
 		t.Fatalf("container create did not pin the absolute Caddy entrypoint: %v", create)

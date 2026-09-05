@@ -601,7 +601,7 @@ func liveCaddyMismatchBits(value caddyInspection, imageID string, hostPort uint1
 	if !value.ReadOnly || value.Privileged {
 		mismatches |= liveCaddyMismatchRootfs
 	}
-	if len(value.CapAdd) != 0 || !exactFoldSet(value.CapDrop, "ALL") {
+	if !onlyCaddyCapability(value.CapAdd) || !exactFoldSet(value.CapDrop, "ALL") {
 		mismatches |= liveCaddyMismatchCapabilities
 	}
 	if !onlyNoNewPrivileges(value.SecurityOpt) {

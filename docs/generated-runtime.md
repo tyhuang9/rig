@@ -96,6 +96,8 @@ Neither slot publishes a host port. Caddy joins each application network separat
 
 Runtime containers run as the non-root `node` user, drop all Linux capabilities, set `no-new-privileges`, use a read-only root filesystem plus bounded tmpfs, have no host binds or Docker socket, and use bounded CPU, memory, PIDs, file descriptors, and local logs.
 
+The trusted Caddy gateway has one explicit exception: it drops all capabilities then adds only `NET_BIND_SERVICE`. The pinned official Caddy binary carries that file capability, so Linux refuses to execute it without the matching bounding-set permission, even on port 8080 ([upstream report](https://github.com/caddyserver/caddy-docker/issues/396)). This permits low-port binding only within Caddy's network namespace; it publishes no additional host ports. Non-root execution, `no-new-privileges`, read-only rootfs, and network isolation remain enforced. Application containers receive no such exception. Remove this compatibility exception when repinning to a verified file-capability-free upstream image. Generated local routes explicitly disable automatic HTTPS.
+
 ## Migrations
 
 Prisma, Drizzle, and Knex can produce a proposed deployment migration under Advanced. A migration requires approval before its first execution and whenever its command or migration evidence changes.
