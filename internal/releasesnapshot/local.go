@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/sourceinspection"
 )
@@ -47,6 +48,24 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 		return Release{}, &Error{Code: "invalid_source"}
 	}
 	inspection, err := sourceinspection.InspectLocalContext(ctx, sourcePath)
+	if err == nil {
+		planID, number, lookupErr := m.currentDeploymentPlan(ctx, appID)
+		if lookupErr != nil {
+			return Release{}, internal(lookupErr)
+		}
+		if planID.Valid && m.plans != nil {
+			revision, lookupErr := m.plans.GetRevision(ctx, appID, planID.String, number)
+			if lookupErr != nil {
+				return Release{}, &Error{Code: "deployment_plan_review_required"}
+			}
+			if setup, explicit := deploymentplans.SetupFromPlan(revision.Plan); explicit {
+				inspection, err = sourceinspection.WithSetup(inspection, setup)
+				if err != nil {
+					return Release{}, &Error{Code: "deployment_plan_review_required"}
+				}
+			}
+		}
+	}
 	if err != nil || len(inspection.Findings) != 0 || (inspection.Source.ComposePath == "" && !hasGeneratedAnalysis(inspection.Analysis)) {
 		return Release{}, &Error{Code: "invalid_source"}
 	}

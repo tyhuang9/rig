@@ -99,7 +99,7 @@ func InspectGitHub(ctx context.Context, reader GitHubReader, owner string, sourc
 		if entry.Type == "commit" {
 			result.Findings = append(result.Findings, Finding{Code: "unsupported_submodule", Message: "Git submodules are not supported", Path: entry.Path})
 		}
-		if entry.Type == "blob" {
+		if entry.Type == "blob" && entry.Mode != "120000" {
 			blobs[entry.Path] = entry
 			analysisFiles = append(analysisFiles, projectanalysis.File{Path: entry.Path, Size: entry.Size})
 			if isComposeName(path.Base(entry.Path)) {
@@ -145,7 +145,7 @@ func InspectLocalContext(ctx context.Context, sourcePath string) (Result, error)
 		return Result{}, &Error{Code: "invalid_source"}
 	}
 	linkInfo, err := os.Lstat(absolute)
-	if err != nil || linkInfo.Mode()&os.ModeSymlink != 0 {
+	if err != nil || linkInfo.Mode()&os.ModeSymlink != 0 || inspectionReparsePoint(absolute) {
 		return Result{}, &Error{Code: "invalid_source"}
 	}
 	info, err := os.Stat(absolute)
@@ -170,7 +170,7 @@ func InspectLocalContext(ctx context.Context, sourcePath string) (Result, error)
 		if entries > maxLocalEntries {
 			return &Error{Code: "source_too_large"}
 		}
-		if entry.Type()&os.ModeSymlink != 0 {
+		if entry.Type()&os.ModeSymlink != 0 || inspectionReparsePoint(current) {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}
@@ -288,7 +288,7 @@ func (reader localProjectReader) ReadFile(ctx context.Context, name string, maxB
 		if statErr != nil {
 			return nil, statErr
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
+		if info.Mode()&os.ModeSymlink != 0 || inspectionReparsePoint(current) {
 			return nil, errors.New("analysis path contains a link")
 		}
 	}

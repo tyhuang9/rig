@@ -71,8 +71,10 @@ func prepareBuildContext(ctx context.Context, workspace, operationDirectory stri
 	if info, err := os.Lstat(installRoot); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || generatedImagePathIsReparsePoint(installRoot) {
 		return buildLayout{}, errInvalidBuildContext
 	}
-	if err := writeBuildFile(layout.installCommand, []byte(component.installBehavior), 0o600); err != nil {
-		return buildLayout{}, err
+	if component.installBehavior != "" {
+		if err := writeBuildFile(layout.installCommand, []byte(component.installBehavior), 0o600); err != nil {
+			return buildLayout{}, err
+		}
 	}
 	if component.buildCommand != "" {
 		if err := writeBuildFile(layout.buildCommand, []byte(component.buildCommand), 0o600); err != nil {

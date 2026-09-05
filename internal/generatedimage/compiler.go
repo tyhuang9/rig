@@ -191,7 +191,10 @@ func (c *Compiler) build(ctx context.Context, appID string, release releasesnaps
 	}
 
 	tag := imageTag(appID, release.ID, definition.name, definitionDigest)
-	args := []string{"buildx", "build", "--builder", session.BuilderName, "--file", layout.containerfile, "--iidfile", layout.imageIDFile, "--load", "--no-cache", "--progress", "plain", "--secret", "id=rig-install-command,src=" + layout.installCommand}
+	args := []string{"buildx", "build", "--builder", session.BuilderName, "--file", layout.containerfile, "--iidfile", layout.imageIDFile, "--load", "--no-cache", "--progress", "plain"}
+	if definition.installBehavior != "" {
+		args = append(args, "--secret", "id=rig-install-command,src="+layout.installCommand)
+	}
 	if definition.buildCommand != "" {
 		args = append(args, "--secret", "id=rig-build-command,src="+layout.buildCommand)
 	}
