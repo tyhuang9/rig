@@ -29,7 +29,7 @@ type bundle struct {
 	Revision DeploymentPlanRevision `json:"revision"`
 }
 
-const currentBundleVersion = 2
+const currentBundleVersion = 3
 
 type Store struct {
 	db                *sql.DB
@@ -272,7 +272,7 @@ func (s *Store) readRevision(ctx context.Context, appID, id string, number int64
 	if err := decoder.Decode(&stored); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return DeploymentPlanRevision{}, errors.New("invalid deployment plan bundle")
 	}
-	if stored.Version != 1 && stored.Version != currentBundleVersion {
+	if stored.Version != 1 && stored.Version != 2 && stored.Version != currentBundleVersion {
 		return DeploymentPlanRevision{}, errors.New("unsupported deployment plan bundle version")
 	}
 	canonical, err := canonicalPlanWithLegacyMigration(stored.Revision.Plan, stored.Version == 1)

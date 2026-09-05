@@ -179,6 +179,20 @@ function generatedInspection(source: InspectResponse["source"] = { type: "local"
   };
 }
 
+function reviewedSetupInspection(source: InspectResponse["source"] = { type: "local", path: "C:/projects/generated" }): InspectResponse {
+  const result = generatedInspection(source);
+  const candidate = result.analysis.candidates[0];
+  candidate.id = "user:deployment-setup";
+  candidate.origin = "user";
+  candidate.digest = "d".repeat(64);
+  return result;
+}
+
+async function reviewGeneratedSetup() {
+  fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+  await screen.findByRole("button", { name: "Accept setup" });
+}
+
 async function reachCleanExactSource() {
   fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "GitHub app" } });
   await selectConnectedGitHub();
@@ -226,7 +240,7 @@ describe("SourceWizard", () => {
   });
 
   it("analyzes, reviews, and accepts a generated local application before saving it", async () => {
-    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection());
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection()).mockResolvedValueOnce(reviewedSetupInspection());
     const { onCreated } = renderWizard();
     fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Generated app" } });
     fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
@@ -234,15 +248,16 @@ describe("SourceWizard", () => {
 
     expect(await screen.findByRole("heading", { name: /how rig will run this app/i })).toBeTruthy();
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: /how rig will run this app/i })));
-    fireEvent.change(screen.getByRole("textbox", { name: "Run command (required)" }), { target: { value: "node server.js && echo ${READY} $()" } });
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Start command" }), { target: { value: "node server.js && echo ${READY} $()" } });
+    await reviewGeneratedSetup();
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
 
-    await waitFor(() => expect(api.createApp).toHaveBeenCalledWith({ name: "Generated app", description: "", sourcePath: "C:/projects/generated" }));
+    await waitFor(() => expect(api.createApp).toHaveBeenCalledWith(expect.objectContaining({ name: "Generated app", description: "", sourcePath: "C:/projects/generated", setup: expect.any(Object) })));
     expect(api.acceptDeploymentPlan).toHaveBeenCalledWith("app-1", expect.objectContaining({
-      candidateId: "candidate-web",
-      expectedCandidateDigest: "c".repeat(64),
+      candidateId: "user:deployment-setup",
+      expectedCandidateDigest: "d".repeat(64),
       expectedSourceStructuralFingerprint: "b".repeat(64),
-      components: [expect.objectContaining({ runCommand: "node server.js && echo ${READY} $()" })],
+      setup: expect.objectContaining({ components: [expect.objectContaining({ startCommand: "node server.js && echo ${READY} $()" })] }),
     }));
     expect(await screen.findByRole("heading", { name: /setup accepted/i })).toBeTruthy();
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: /setup accepted/i })));
@@ -254,12 +269,13 @@ describe("SourceWizard", () => {
   });
 
   it("returns focus to application validation when plan acceptance is missing required details", async () => {
-    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection());
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection()).mockResolvedValueOnce(reviewedSetupInspection());
     renderWizard();
     fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
     fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
 
     await screen.findByRole("heading", { name: /how rig will run this app/i });
+    await reviewGeneratedSetup();
     fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
 
     const summary = await screen.findByText("Check the highlighted fields.");
@@ -268,7 +284,7 @@ describe("SourceWizard", () => {
   });
 
   it("reuses its draft application when plan acceptance must be retried", async () => {
-    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection());
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection()).mockResolvedValueOnce(reviewedSetupInspection()).mockResolvedValueOnce(reviewedSetupInspection());
     vi.mocked(api.acceptDeploymentPlan)
       .mockRejectedValueOnce(new APIError({ status: 409, code: "deployment_plan_review_required", detail: "Project structure changed." }))
       .mockResolvedValueOnce({
@@ -280,11 +296,13 @@ describe("SourceWizard", () => {
     fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
     fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
     await screen.findByRole("heading", { name: /how rig will run this app/i });
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+    await reviewGeneratedSetup();
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
     expect(await screen.findByText(/project setup changed while you were reviewing it/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: /back to source/i }).hasAttribute("disabled")).toBe(true);
     expect(screen.getByRole("button", { name: /open saved draft/i })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+    await screen.findByRole("button", { name: "Accept setup" });
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
     await screen.findByRole("heading", { name: /setup accepted/i });
     expect(api.createApp).toHaveBeenCalledTimes(1);
     expect(api.acceptDeploymentPlan).toHaveBeenCalledTimes(2);
@@ -303,7 +321,7 @@ describe("SourceWizard", () => {
       fieldProvenance: [],
       migration: { present: true, approvalStatus: "pending" },
     };
-    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection());
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection()).mockResolvedValueOnce(reviewedSetupInspection());
     vi.mocked(api.acceptDeploymentPlan).mockResolvedValueOnce(pendingRevision as never);
     vi.mocked(api.approveDeploymentPlanMigration).mockResolvedValueOnce({
       ...pendingRevision,
@@ -314,6 +332,7 @@ describe("SourceWizard", () => {
     fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
     fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
     await screen.findByRole("heading", { name: /how rig will run this app/i });
+    await reviewGeneratedSetup();
     fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
 
     const readyHeading = await screen.findByRole("heading", { name: /setup accepted/i });
@@ -331,14 +350,15 @@ describe("SourceWizard", () => {
     const response = deferred<Awaited<ReturnType<typeof api.acceptDeploymentPlan>>>();
     const detected = generatedInspection();
     detected.composeCandidates = ["compose.yaml"];
-    vi.mocked(api.inspect).mockResolvedValueOnce(detected);
+    vi.mocked(api.inspect).mockResolvedValueOnce(detected).mockResolvedValueOnce(reviewedSetupInspection());
     vi.mocked(api.acceptDeploymentPlan).mockReturnValueOnce(response.promise);
     renderWizard();
     fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Generated app" } });
     fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
     fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
     await screen.findByRole("heading", { name: /how rig will run this app/i });
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+    await reviewGeneratedSetup();
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
 
     await screen.findByText(/application draft saved/i);
     expect(screen.getByRole("button", { name: /back to source/i }).hasAttribute("disabled")).toBe(true);
@@ -353,7 +373,7 @@ describe("SourceWizard", () => {
   });
 
   it("adopts the server plan when another session wins the acceptance race", async () => {
-    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection());
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection()).mockResolvedValueOnce(reviewedSetupInspection());
     vi.mocked(api.acceptDeploymentPlan).mockRejectedValueOnce(new APIError({ status: 409, code: "deployment_plan_conflict", detail: "Revision changed." }));
     vi.mocked(api.deploymentPlan).mockResolvedValueOnce({
       revisionId: "22222222-2222-4222-8222-222222222222", revisionNumber: 2, canonicalDigest: "e".repeat(64), strategy: "generated_node", state: "accepted",
@@ -364,7 +384,8 @@ describe("SourceWizard", () => {
     fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
     fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
     await screen.findByRole("heading", { name: /how rig will run this app/i });
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+    await reviewGeneratedSetup();
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
 
     expect(await screen.findByRole("heading", { name: /setup accepted/i })).toBeTruthy();
     expect(screen.getByText(/revision 2/i)).toBeTruthy();
@@ -1024,7 +1045,7 @@ describe("SourceWizard", () => {
     expect(screen.queryByRole("navigation", { name: /branches pagination/i })).toBeNull();
   });
 
-  it("normalizes null inspection collections into the no-Compose state without enabling save", async () => {
+  it("normalizes null inspection collections and keeps the manual setup path available", async () => {
     vi.mocked(api.inspect).mockRestore();
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: null, services: null, findings: null }), { status: 200 }),
@@ -1037,15 +1058,37 @@ describe("SourceWizard", () => {
     await selectBranch();
     fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
 
-    const emptyResult = (await screen.findByText(/no compose files found/i)).closest("[role='status']");
-    expect(emptyResult?.getAttribute("aria-live")).toBe("polite");
-    expect(emptyResult?.getAttribute("aria-atomic")).toBe("true");
-    expect(screen.getByText("Add a Compose file to the tracked branch, then inspect again.")).toBeTruthy();
-    expect(screen.getByText("Add a supported JavaScript project or a Compose file, then analyze again.")).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: /how rig will run this app/i })).toBeTruthy();
+    expect(screen.getByText("No supported setup was detected")).toBeTruthy();
+    expect(screen.getByLabelText(/^start command$/i).getAttribute("aria-invalid")).toBe("true");
     expect(screen.queryByText(/source inspection completed/i)).toBeNull();
-    expect(screen.queryByText(/ready to save/i)).toBeNull();
-    expect(screen.queryByLabelText(/^compose file$/i)).toBeNull();
-    expect(screen.getByRole("button", { name: /save application/i }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("button", { name: "Review setup" }).hasAttribute("disabled")).toBe(false);
+    expect(api.createApp).not.toHaveBeenCalled();
+  });
+
+  it("opens undetected local settings, serializes numeric ports, and preserves edits through failed review", async () => {
+    const review = deferred<InspectResponse>();
+    vi.mocked(api.inspect).mockResolvedValueOnce(inspectionFixture({source: {type: "local", path: "C:/projects/manual"}, composeCandidates: [], services: [], findings: [{code: "compose_not_found", message: "No Compose file"}]})).mockReturnValueOnce(review.promise);
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), {target: {value: "Manual app"}});
+    fireEvent.change(screen.getByLabelText(/local source path/i), {target: {value: "C:/projects/manual"}});
+    fireEvent.click(screen.getByRole("button", {name: "Analyze project"}));
+    expect(await screen.findByRole("heading", {name: /how rig will run this app/i})).toBeTruthy();
+    fireEvent.change(screen.getByLabelText(/^start command$/i), {target: {value: "node server.js"}});
+    fireEvent.change(screen.getByLabelText(/^internal port$/i), {target: {value: "3001"}});
+    fireEvent.click(screen.getByRole("button", {name: "Back to source"}));
+    fireEvent.click(screen.getByRole("button", {name: "Configure build and run"}));
+    expect((screen.getByLabelText(/^start command$/i) as HTMLInputElement).value).toBe("node server.js");
+    expect((screen.getByLabelText(/^internal port$/i) as HTMLInputElement).value).toBe("3001");
+    fireEvent.click(screen.getByRole("button", {name: "Review setup"}));
+    await waitFor(() => expect(api.inspect).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(api.inspect).mock.calls[1][0].setup?.components[0]).toMatchObject({rootDirectory: ".", startCommand: "node server.js", internalPort: 3001, installCommand: "", buildCommand: ""});
+    expect(screen.getByRole("button", {name: /^Reviewing/}).hasAttribute("disabled")).toBe(true);
+    fireEvent.click(screen.getByRole("button", {name: /^Reviewing/}));
+    expect(api.inspect).toHaveBeenCalledTimes(2);
+    await act(async () => {review.reject(new APIError({status: 503, code: "source_unavailable", detail: "Source temporarily unavailable"}));});
+    expect((screen.getByLabelText(/^start command$/i) as HTMLInputElement).value).toBe("node server.js");
+    expect(await screen.findByRole("button", {name: "Retry review"})).toBeTruthy();
     expect(api.createApp).not.toHaveBeenCalled();
   });
 
@@ -1151,7 +1194,8 @@ describe("SourceWizard", () => {
   });
 
   it("accepts a generated GitHub application without requiring a Compose path", async () => {
-    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection({ type: "github", connectionId: connection.id, installationId: 10, repositoryId: 20, trackedBranch: "main", resolvedSha: "a".repeat(40) }));
+    const githubSource = { type: "github" as const, connectionId: connection.id, installationId: 10, repositoryId: 20, trackedBranch: "main", resolvedSha: "a".repeat(40) };
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection(githubSource)).mockResolvedValueOnce(reviewedSetupInspection(githubSource));
     renderWizard();
     fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Generated GitHub app" } });
     await selectConnectedGitHub();
@@ -1160,14 +1204,16 @@ describe("SourceWizard", () => {
     await selectBranch();
     fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
     await screen.findByRole("heading", { name: /how rig will run this app/i });
-    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+    await reviewGeneratedSetup();
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
 
-    await waitFor(() => expect(api.createApp).toHaveBeenCalledWith({
+    await waitFor(() => expect(api.createApp).toHaveBeenCalledWith(expect.objectContaining({
       name: "Generated GitHub app",
       description: "",
       githubSource: { connectionId: connection.id, installationId: 10, repositoryId: 20, branch: "main" },
-    }));
-    expect(api.acceptDeploymentPlan).toHaveBeenCalledWith("app-1", expect.objectContaining({ candidateId: "candidate-web" }));
+      setup: expect.any(Object),
+    })));
+    expect(api.acceptDeploymentPlan).toHaveBeenCalledWith("app-1", expect.objectContaining({ candidateId: "user:deployment-setup" }));
   });
 
   it("keeps an explicitly selected clean Compose source ahead of generated candidates", async () => {

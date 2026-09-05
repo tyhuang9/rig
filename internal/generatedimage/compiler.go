@@ -191,7 +191,10 @@ func (c *Compiler) build(ctx context.Context, appID string, release releasesnaps
 	}
 
 	tag := imageTag(appID, release.ID, definition.name, definitionDigest)
-	args := []string{"buildx", "build", "--builder", session.BuilderName, "--file", layout.containerfile, "--iidfile", layout.imageIDFile, "--load", "--no-cache", "--progress", "plain", "--secret", "id=rig-install-command,src=" + layout.installCommand}
+	args := []string{"buildx", "build", "--builder", session.BuilderName, "--file", layout.containerfile, "--iidfile", layout.imageIDFile, "--load", "--no-cache", "--progress", "plain"}
+	if definition.installBehavior != "" {
+		args = append(args, "--secret", "id=rig-install-command,src="+layout.installCommand)
+	}
 	if definition.buildCommand != "" {
 		args = append(args, "--secret", "id=rig-build-command,src="+layout.buildCommand)
 	}
@@ -237,11 +240,22 @@ func (c *Compiler) build(ctx context.Context, appID string, release releasesnaps
 }
 
 func compatiblePlan(ctx context.Context, release releasesnapshot.Release, revision deploymentplans.DeploymentPlanRevision) bool {
-	if revision.ID != release.DeploymentPlanRevisionID || revision.AppID != release.AppID || revision.RevisionNumber != release.DeploymentPlanRevisionNumber || revision.Plan.Strategy != deploymentplans.StrategyGeneratedNode || revision.Plan.Detector.Name != "projectanalysis" || revision.Plan.Detector.Version != projectanalysis.SchemaVersion || revision.Plan.Source.Provider != release.SourceProvider || revision.Plan.Source.RepositoryID != release.RepositoryID {
+	if revision.ID != release.DeploymentPlanRevisionID || revision.AppID != release.AppID || revision.RevisionNumber != release.DeploymentPlanRevisionNumber || revision.Plan.Strategy != deploymentplans.StrategyGeneratedNode || revision.Plan.Source.Provider != release.SourceProvider || revision.Plan.Source.RepositoryID != release.RepositoryID {
 		return false
 	}
 	inspection, err := sourceinspection.InspectLocalContext(ctx, release.WorkspacePath)
-	if err != nil || inspection.Analysis.StructuralFingerprint != revision.Plan.Detector.SourceStructuralFingerprint {
+	if err != nil {
+		return false
+	}
+	if setup, explicit := deploymentplans.SetupFromPlan(revision.Plan); explicit {
+		configured, err := sourceinspection.WithSetup(inspection, setup)
+		if err != nil {
+			return false
+		}
+		differences, err := deploymentplans.CompareAnalysis(revision.Plan, configured.Analysis)
+		return err == nil && len(differences) == 0
+	}
+	if revision.Plan.Detector.Name != "projectanalysis" || revision.Plan.Detector.Version != projectanalysis.SchemaVersion || inspection.Analysis.StructuralFingerprint != revision.Plan.Detector.SourceStructuralFingerprint {
 		return false
 	}
 	if release.SourceProvider == "local" && revision.Plan.Source.ResolvedDigest != inspection.Analysis.StructuralFingerprint {

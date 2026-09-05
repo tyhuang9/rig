@@ -27,12 +27,13 @@ const (
 )
 
 type snapshot struct {
-	files       []File
-	fileSet     map[string]File
-	contents    map[string][]byte
-	packages    []packageFile
-	findings    []Finding
-	fingerprint string
+	files         []File
+	prebuiltFiles []File
+	fileSet       map[string]File
+	contents      map[string][]byte
+	packages      []packageFile
+	findings      []Finding
+	fingerprint   string
 }
 
 type packageFile struct {
@@ -65,6 +66,7 @@ func loadSnapshot(ctx context.Context, files []File, reader FileReader) (snapsho
 	sort.Slice(normalized, func(i, j int) bool { return normalized[i].Path < normalized[j].Path })
 	seen := make(map[string]string, len(normalized))
 	kept := make([]File, 0, len(normalized))
+	prebuiltFiles := make([]File, 0)
 	fileSet := make(map[string]File, len(normalized))
 	findings := make([]Finding, 0)
 	packageCount := 0
@@ -81,6 +83,9 @@ func loadSnapshot(ctx context.Context, files []File, reader FileReader) (snapsho
 		}
 		seen[key] = file.Path
 		if excludedDirectory(file.Path) {
+			if prebuiltStaticArtifact(file.Path) && !sensitiveFile(file.Path) {
+				prebuiltFiles = append(prebuiltFiles, file)
+			}
 			continue
 		}
 		if sensitiveFile(file.Path) {
@@ -141,9 +146,113 @@ func loadSnapshot(ctx context.Context, files []File, reader FileReader) (snapsho
 
 	fingerprint := structuralFingerprint(kept, contents)
 	return snapshot{
-		files: kept, fileSet: fileSet, contents: contents, packages: packages,
+		files: kept, prebuiltFiles: prebuiltFiles, fileSet: fileSet, contents: contents, packages: packages,
 		findings: findings, fingerprint: fingerprint,
 	}, nil
+}
+
+// prebuiltStaticArtifact records only private existence evidence for a normal
+// static artifact root. It never makes build output available to inference or
+// structural fingerprints. PrepareSetup can use that evidence when a user
+// explicitly chooses a build-skipped static directory.
+func prebuiltStaticArtifact(name string) bool {
+	segments := strings.Split(name, "/")
+	root := -1
+	for index, segment := range segments {
+		if excludedDirectoryName(segment) {
+			if root >= 0 {
+				return false
+			}
+			switch strings.ToLower(segment) {
+			case "dist", "build", "out":
+				root = index
+			default:
+				return false
+			}
+		}
+	}
+	return root >= 0
+}
+
+func prebuiltStaticOutputDirectory(name string) bool {
+	segments := strings.Split(name, "/")
+	artifactRoot := false
+	for _, segment := range segments {
+		if !excludedDirectoryName(segment) {
+			continue
+		}
+		if artifactRoot {
+			return false
+		}
+		switch strings.ToLower(segment) {
+		case "dist", "build", "out":
+			artifactRoot = true
+		default:
+			return false
+		}
+	}
+	return artifactRoot
+}
+
+func unsafeStaticOutputDirectory(name string) bool {
+	segments := strings.Split(strings.ToLower(name), "/")
+	for index, segment := range segments {
+		if sensitiveStaticOutputSegment(segment) {
+			return true
+		}
+		switch segment {
+		case ".git", ".hg", ".svn", ".rig", ".hostd", "node_modules", ".next", ".nuxt", ".svelte-kit", "coverage", ".turbo", ".cache", ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker":
+			return true
+		case ".config":
+			if index+1 < len(segments) {
+				switch segments[index+1] {
+				case "gcloud", "gh", "hub":
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func sensitiveStaticOutputSegment(name string) bool {
+	if strings.HasPrefix(name, ".env") {
+		return true
+	}
+	switch name {
+	case ".netrc", ".git-credentials", "credentials", "credentials.json", "auth.json", ".pypirc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519":
+		return true
+	}
+	if strings.HasPrefix(name, "service-account") && strings.HasSuffix(name, ".json") {
+		return true
+	}
+	for _, suffix := range []string{".pem", ".key", ".p12", ".pfx"} {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (source snapshot) hasStaticOutput(root, output string) bool {
+	selected := output
+	if root != "." {
+		selected = path.Join(root, output)
+	}
+	if selected == "." {
+		return len(source.files) > 0
+	}
+	for _, file := range source.files {
+		if file.Path == selected || strings.HasPrefix(file.Path, selected+"/") {
+			return true
+		}
+	}
+	for _, file := range source.prebuiltFiles {
+		if file.Path == selected || strings.HasPrefix(file.Path, selected+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func validateRepositoryPath(name string) error {
@@ -170,16 +279,21 @@ func validateRepositoryPath(name string) error {
 }
 
 func excludedDirectory(name string) bool {
-	excluded := map[string]bool{
-		".git": true, "node_modules": true, ".next": true, "dist": true,
-		"build": true, "out": true, "coverage": true, ".turbo": true, ".cache": true,
-	}
 	for _, segment := range strings.Split(name, "/") {
-		if excluded[segment] {
+		if excludedDirectoryName(segment) {
 			return true
 		}
 	}
 	return false
+}
+
+func excludedDirectoryName(name string) bool {
+	switch strings.ToLower(name) {
+	case ".git", "node_modules", ".next", "dist", "build", "out", "coverage", ".turbo", ".cache":
+		return true
+	default:
+		return false
+	}
 }
 
 func sensitiveFile(name string) bool {
