@@ -159,8 +159,9 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 		t.Fatal("live generated image protected build material was not removed")
 	}
 
-	if !liveRunBuiltImage(liveContext, runner, dockerExecutable, builder.directory.Root(), dockerEnvironment, containerName, artifact.ImageContentID, componentRoot) {
-		t.Fatal("live generated image artifact execution failed")
+	if status := liveRunBuiltImage(liveContext, runner, dockerExecutable, builder.directory.Root(), dockerEnvironment, containerName, artifact.ImageContentID, componentRoot); status != "success" {
+		identityStatus := liveGeneratedImageIdentityStatus(liveContext, runner, dockerExecutable, builder.directory.Root(), dockerEnvironment, artifact.ImageContentID, imageReference)
+		t.Fatalf("live generated image artifact execution failed: runtime_status=%s,image_identity=%s", status, identityStatus)
 	}
 	if !liveImageExcludesCommands(liveContext, runner, dockerExecutable, builder.directory.Root(), dockerEnvironment, artifact.ImageContentID, installCommand, buildCommand) {
 		t.Fatal("live generated image persisted command material")
@@ -405,7 +406,7 @@ func liveDockerIsLinux(ctx context.Context, runner runtimeprocess.CommandRunner,
 	return ok
 }
 
-func liveRunBuiltImage(ctx context.Context, runner runtimeprocess.CommandRunner, executable, directory string, environment []string, containerName, imageID, componentRoot string) bool {
+func liveRunBuiltImage(ctx context.Context, runner runtimeprocess.CommandRunner, executable, directory string, environment []string, containerName, imageID, componentRoot string) string {
 	result, err := runner.Run(ctx, runtimeprocess.CommandRequest{
 		Executable: executable,
 		Args: []string{
@@ -417,10 +418,187 @@ func liveRunBuiltImage(ctx context.Context, runner runtimeprocess.CommandRunner,
 		},
 		Directory: directory, Env: environment, Timeout: time.Minute, OutputLimit: 4 << 10,
 	})
-	ok := err == nil && !result.StdoutTruncated && !result.StderrTruncated && len(result.Stdout) == 0 && len(result.Stderr) == 0
+	status := liveGeneratedImageRuntimeStatus(ctx, result, err)
 	clear(result.Stdout)
 	clear(result.Stderr)
-	return ok
+	return status
+}
+
+func liveGeneratedImageRuntimeStatus(ctx context.Context, result runtimeprocess.CommandResult, err error) string {
+	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		return "cancelled"
+	case errors.Is(err, runtimeprocess.ErrTerminationFailed):
+		return "termination_failed"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case result.StdoutTruncated || result.StderrTruncated:
+		return "output_truncated"
+	case err == nil && len(result.Stdout) == 0 && len(result.Stderr) == 0:
+		return "success"
+	case err == nil:
+		return "unexpected_output"
+	}
+	var executableError *exec.Error
+	var pathError *os.PathError
+	if errors.As(err, &executableError) || errors.As(err, &pathError) {
+		return "runtime_unavailable"
+	}
+	combined := make([]byte, 0, len(result.Stdout)+len(result.Stderr))
+	combined = append(combined, result.Stdout...)
+	combined = append(combined, result.Stderr...)
+	lower := bytes.ToLower(combined)
+	clear(combined)
+	defer clear(lower)
+	switch {
+	case bytes.Contains(lower, []byte("unable to find image")), bytes.Contains(lower, []byte("no such image")), bytes.Contains(lower, []byte("pull access denied")):
+		return "image_unavailable"
+	case bytes.Contains(lower, []byte("working directory")):
+		return "workdir_invalid"
+	case bytes.Contains(lower, []byte("read-only file system")):
+		return "rootfs_read_only"
+	case bytes.Contains(lower, []byte("operation not permitted")), bytes.Contains(lower, []byte("permission denied")):
+		return "permission_denied"
+	default:
+		return "unclassified"
+	}
+}
+
+func liveGeneratedImageIdentityStatus(ctx context.Context, runner runtimeprocess.CommandRunner, executable, directory string, environment []string, artifactID, tag string) string {
+	artifact, artifactStatus := liveInspectImageID(ctx, runner, executable, directory, environment, artifactID)
+	defer clear(artifact)
+	loaded, tagStatus := liveInspectImageID(ctx, runner, executable, directory, environment, tag)
+	defer clear(loaded)
+	if artifactStatus != "found" {
+		return "artifact_" + artifactStatus + "_tag_" + tagStatus
+	}
+	if tagStatus != "found" {
+		return "tag_" + tagStatus
+	}
+	if bytes.Equal(artifact, loaded) {
+		return "same"
+	}
+	return "different"
+}
+
+func liveInspectImageID(ctx context.Context, runner runtimeprocess.CommandRunner, executable, directory string, environment []string, reference string) ([]byte, string) {
+	result, err := runner.Run(ctx, runtimeprocess.CommandRequest{
+		Executable: executable, Args: []string{"image", "inspect", "--format", "{{.ID}}", reference},
+		Directory: directory, Env: environment, Timeout: time.Minute, OutputLimit: 4 << 10,
+	})
+	defer clear(result.Stdout)
+	defer clear(result.Stderr)
+	if err != nil || result.StdoutTruncated || result.StderrTruncated {
+		combined := make([]byte, 0, len(result.Stdout)+len(result.Stderr))
+		combined = append(combined, result.Stdout...)
+		combined = append(combined, result.Stderr...)
+		lower := bytes.ToLower(combined)
+		clear(combined)
+		defer clear(lower)
+		if bytes.Contains(lower, []byte("no such image")) {
+			return nil, "missing"
+		}
+		return nil, "unavailable"
+	}
+	value := bytes.TrimSpace(result.Stdout)
+	if !validImageContentID(string(value)) {
+		return nil, "invalid"
+	}
+	return append([]byte(nil), value...), "found"
+}
+
+type liveImageInspectResponse struct {
+	result runtimeprocess.CommandResult
+	err    error
+}
+
+type liveImageInspectRunner struct {
+	responses []liveImageInspectResponse
+	calls     int
+}
+
+func (runner *liveImageInspectRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	if runner.calls >= len(runner.responses) || len(request.Args) != 5 || request.Args[0] != "image" || request.Args[1] != "inspect" || request.Args[2] != "--format" || request.Args[3] != "{{.ID}}" {
+		return runtimeprocess.CommandResult{}, errors.New("unexpected image inspection")
+	}
+	response := runner.responses[runner.calls]
+	runner.calls++
+	return response.result, response.err
+}
+
+func TestLiveGeneratedImageIdentityStatusIsFixedAndClearsResults(t *testing.T) {
+	firstID, secondID := "sha256:"+strings.Repeat("a", 64)+"\n", "sha256:"+strings.Repeat("b", 64)+"\n"
+	for _, test := range []struct {
+		name      string
+		responses []liveImageInspectResponse
+		want      string
+	}{
+		{name: "same", responses: []liveImageInspectResponse{{result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}, {result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}}, want: "same"},
+		{name: "different", responses: []liveImageInspectResponse{{result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}, {result: runtimeprocess.CommandResult{Stdout: []byte(secondID)}}}, want: "different"},
+		{name: "artifact missing", responses: []liveImageInspectResponse{{result: runtimeprocess.CommandResult{Stderr: []byte("No such image: sensitive/reference")}, err: errors.New("sensitive error")}, {result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}}, want: "artifact_missing_tag_found"},
+		{name: "tag missing", responses: []liveImageInspectResponse{{result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}, {result: runtimeprocess.CommandResult{Stderr: []byte("No such image: sensitive/reference")}, err: errors.New("sensitive error")}}, want: "tag_missing"},
+		{name: "artifact invalid", responses: []liveImageInspectResponse{{result: runtimeprocess.CommandResult{Stdout: []byte("sensitive malformed output")}}, {result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}}, want: "artifact_invalid_tag_found"},
+		{name: "artifact unavailable", responses: []liveImageInspectResponse{{result: runtimeprocess.CommandResult{Stderr: []byte("sensitive daemon failure"), StderrTruncated: true}, err: errors.New("sensitive error")}, {result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}}, want: "artifact_unavailable_tag_found"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &liveImageInspectRunner{responses: test.responses}
+			if got := liveGeneratedImageIdentityStatus(context.Background(), runner, "docker", t.TempDir(), nil, "artifact", "tag"); got != test.want || !validLiveGeneratedImageDiagnostic(got) {
+				t.Fatalf("image identity status = %q, want %q", got, test.want)
+			}
+			for _, response := range runner.responses {
+				if !liveAllZero(response.result.Stdout) || !liveAllZero(response.result.Stderr) {
+					t.Fatal("image inspection output was not cleared")
+				}
+			}
+		})
+	}
+}
+
+func liveAllZero(value []byte) bool {
+	return len(bytes.Trim(value, "\x00")) == 0
+}
+
+func TestLiveGeneratedImageRuntimeStatusIsFixedAndRedacted(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		result    runtimeprocess.CommandResult
+		err       error
+		cancelled bool
+		want      string
+	}{
+		{name: "success", want: "success"},
+		{name: "unexpected output", result: runtimeprocess.CommandResult{Stderr: []byte("sensitive output")}, want: "unexpected_output"},
+		{name: "image unavailable", result: runtimeprocess.CommandResult{Stderr: []byte("No such image: sensitive/image")}, err: errors.New("sensitive error"), want: "image_unavailable"},
+		{name: "workdir", result: runtimeprocess.CommandResult{Stderr: []byte("working directory sensitive/path")}, err: errors.New("sensitive error"), want: "workdir_invalid"},
+		{name: "rootfs", result: runtimeprocess.CommandResult{Stderr: []byte("read-only file system sensitive/path")}, err: errors.New("sensitive error"), want: "rootfs_read_only"},
+		{name: "permission", result: runtimeprocess.CommandResult{Stderr: []byte("operation not permitted sensitive/path")}, err: errors.New("sensitive error"), want: "permission_denied"},
+		{name: "runtime", err: &exec.Error{Name: "sensitive executable", Err: errors.New("sensitive error")}, want: "runtime_unavailable"},
+		{name: "timeout", err: context.DeadlineExceeded, want: "timeout"},
+		{name: "termination", err: runtimeprocess.ErrTerminationFailed, want: "termination_failed"},
+		{name: "truncated", result: runtimeprocess.CommandResult{Stderr: []byte("No such image: sensitive/image"), StderrTruncated: true}, err: errors.New("sensitive error"), want: "output_truncated"},
+		{name: "cancelled", err: errors.New("sensitive error"), cancelled: true, want: "cancelled"},
+		{name: "unclassified", result: runtimeprocess.CommandResult{Stderr: []byte("sensitive output")}, err: errors.New("sensitive error"), want: "unclassified"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			if test.cancelled {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+			stdoutBefore, stderrBefore := append([]byte(nil), test.result.Stdout...), append([]byte(nil), test.result.Stderr...)
+			if got := liveGeneratedImageRuntimeStatus(ctx, test.result, test.err); got != test.want || !validLiveGeneratedImageDiagnostic(got) {
+				t.Fatalf("runtime status = %q, want %q", got, test.want)
+			}
+			if !bytes.Equal(test.result.Stdout, stdoutBefore) || !bytes.Equal(test.result.Stderr, stderrBefore) {
+				t.Fatal("runtime classification mutated the runner result")
+			}
+			clear(test.result.Stdout)
+			clear(test.result.Stderr)
+			clear(stdoutBefore)
+			clear(stderrBefore)
+		})
+	}
 }
 
 func liveImageExcludesCommands(ctx context.Context, runner runtimeprocess.CommandRunner, executable, directory string, environment []string, imageID, installCommand, buildCommand string) bool {
