@@ -912,6 +912,70 @@ func TestGeneratedExecutorRetriesOldSlotCleanupWithoutTerminalizingDeployment(t 
 	}
 }
 
+func TestGeneratedExecutorStopsPreviousSlotOnlyAfterDrainCompletes(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	oldDeploymentID, _ := configurePreviousActive(t, fixture)
+	drainEntered := make(chan struct{})
+	releaseDrain := make(chan struct{})
+	fixture.executor.waitDrain = func(ctx context.Context, _ time.Duration) error {
+		close(drainEntered)
+		select {
+		case <-releaseDrain:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	testContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	type outcome struct {
+		result jobs.ExecutionResult
+		err    error
+	}
+	completed := make(chan outcome, 1)
+	go func() {
+		result, err := fixture.executor.Execute(testContext, deploymentJob(), fixture.reporter)
+		completed <- outcome{result: result, err: err}
+	}()
+
+	drainReleased := false
+	release := func() {
+		if !drainReleased {
+			close(releaseDrain)
+			drainReleased = true
+		}
+	}
+	defer release()
+	select {
+	case <-drainEntered:
+	case <-testContext.Done():
+		t.Fatalf("executor did not enter drain: %v", testContext.Err())
+	}
+	if previous := fixture.state.previous[oldDeploymentID]; len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentDraining {
+		t.Fatalf("previous slot=%+v", previous)
+	}
+	if fixture.runtime.stopped != 0 {
+		t.Fatalf("old slot stopped before drain completed: %d", fixture.runtime.stopped)
+	}
+
+	release()
+	select {
+	case execution := <-completed:
+		if execution.err != nil || execution.result.CompletionCode != "deployment_completed" {
+			t.Fatalf("result=%+v err=%v", execution.result, execution.err)
+		}
+	case <-testContext.Done():
+		t.Fatalf("executor did not complete after drain release: %v", testContext.Err())
+	}
+	if fixture.runtime.stopped != 1 {
+		t.Fatalf("old slot stop calls=%d", fixture.runtime.stopped)
+	}
+	if previous := fixture.state.previous[oldDeploymentID]; len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentStopped {
+		t.Fatalf("previous slot=%+v", previous)
+	}
+}
+
 func TestGeneratedExecutorPreservesCandidateWhenFailedRouteMayBeLive(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
 	oldDeploymentID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
