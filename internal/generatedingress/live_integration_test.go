@@ -109,7 +109,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	}
 
 	blueSpec := liveCandidateSpec("blue", appID, planID)
-	blueSpec.ImageContentID = buildLiveImage(t, ctx, runner, docker, root, dockerConfig, imageTags[0], blueSpec, "blue")
+	blueSpec.ImageContentID = buildLiveImage(t, ctx, runner, docker, root, imageTags[0], blueSpec, "blue")
 	blue := startLiveCandidate(t, ctx, engine, blueSpec)
 	bluePresent := true
 	defer func() {
@@ -129,7 +129,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	// Caddy is attached to every private application network. A qualified
 	// network alias must keep identical component/slot aliases isolated.
 	otherSpec := liveCandidateSpec("other", otherAppID, planID)
-	otherSpec.ImageContentID = buildLiveImage(t, ctx, runner, docker, root, dockerConfig, imageTags[2], otherSpec, "other")
+	otherSpec.ImageContentID = buildLiveImage(t, ctx, runner, docker, root, imageTags[2], otherSpec, "other")
 	other := startLiveCandidate(t, ctx, engine, otherSpec)
 	defer func() { _ = engine.StopAndRemove(context.Background(), other, 0) }()
 	if other.Slot != generatedruntime.SlotBlue || other.NetworkAlias != blue.NetworkAlias || other.NetworkName == blue.NetworkName {
@@ -147,7 +147,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 
 	greenSpec := liveCandidateSpec("green", appID, planID)
 	greenSpec.ActiveSlot = blue.Slot
-	greenSpec.ImageContentID = buildLiveImage(t, ctx, runner, docker, root, dockerConfig, imageTags[1], greenSpec, "green")
+	greenSpec.ImageContentID = buildLiveImage(t, ctx, runner, docker, root, imageTags[1], greenSpec, "green")
 
 	// A failed inactive candidate is never committed. The engine owns its exact
 	// cleanup, while Caddy must continue serving the active blue route.
@@ -226,8 +226,12 @@ func liveCandidateSpec(version, appID, planID string) generatedruntime.Candidate
 	}
 }
 
-func buildLiveImage(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, root, dockerConfig, tag string, spec generatedruntime.CandidateSpec, version string) string {
+func buildLiveImage(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, root, tag string, spec generatedruntime.CandidateSpec, version string) string {
 	t.Helper()
+	// Buildx writes state beneath DOCKER_CONFIG/buildx by default. Fixture
+	// builds must never share the runtime engine's deliberately empty config.
+	// Keep this outside the build context and discard it with the test.
+	dockerConfig := t.TempDir()
 	contextRoot := filepath.Join(root, "image-"+version)
 	if err := os.Mkdir(contextRoot, 0o700); err != nil {
 		t.Fatal("create image fixture")
@@ -268,6 +272,50 @@ func buildLiveImage(t *testing.T, ctx context.Context, runner runtimeprocess.Com
 		t.Fatal("inspect live image")
 	}
 	return imageID
+}
+
+type liveFixtureRunner func(context.Context, runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error)
+
+func (run liveFixtureRunner) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	return run(ctx, request)
+}
+
+func TestLiveFixtureBuildKeepsRuntimeDockerConfigurationEmpty(t *testing.T) {
+	runtimeConfig := t.TempDir()
+	t.Setenv("DOCKER_CONFIG", runtimeConfig)
+	var buildConfig string
+	calls := 0
+	imageID := "sha256:" + strings.Repeat("a", 64)
+	runner := liveFixtureRunner(func(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+		calls++
+		if len(request.Env) != 1 || !strings.HasPrefix(request.Env[0], "DOCKER_CONFIG=") {
+			t.Fatal("fixture Docker environment must be explicit")
+		}
+		config := strings.TrimPrefix(request.Env[0], "DOCKER_CONFIG=")
+		if config == runtimeConfig || !filepath.IsAbs(config) {
+			t.Fatal("fixture build used runtime Docker configuration")
+		}
+		if request.Args[0] == "build" {
+			buildConfig = config
+			// Model the Buildx fallback without requiring a Docker daemon.
+			if err := os.Mkdir(filepath.Join(config, "buildx"), 0o700); err != nil {
+				t.Fatal("create fixture Buildx state")
+			}
+			return runtimeprocess.CommandResult{}, nil
+		}
+		if config != buildConfig || request.Args[0] != "image" {
+			t.Fatal("unexpected fixture Docker request")
+		}
+		return runtimeprocess.CommandResult{Stdout: []byte(imageID)}, nil
+	})
+	spec := liveCandidateSpec("blue", "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222")
+	if got := buildLiveImage(t, context.Background(), runner, "docker", t.TempDir(), "rig-generated-live-test:blue", spec, "blue"); got != imageID || calls != 2 {
+		t.Fatal("fixture image was not built and inspected")
+	}
+	entries, err := os.ReadDir(runtimeConfig)
+	if err != nil || len(entries) != 0 {
+		t.Fatal("fixture build contaminated runtime Docker configuration")
+	}
 }
 
 func createAndStartLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
