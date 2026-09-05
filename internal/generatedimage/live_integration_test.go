@@ -147,7 +147,11 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 	}
 	artifact, err := compiler.Compile(liveContext, appID, releaseID, "app")
 	if err != nil {
-		t.Fatalf("live generated image production compile failed: diagnostic=%s,builder_status=%s", liveGeneratedImageFailureCode(err), builderObservation.status)
+		driftStatus := "not_applicable"
+		if builderObservation.status == string(BuilderDriftDetected) {
+			driftStatus = liveGeneratedImageBuilderDriftStatus(liveContext, builder, identity, dockerEnvironment)
+		}
+		t.Fatalf("live generated image production compile failed: diagnostic=%s,builder_status=%s,builder_drift=%s", liveGeneratedImageFailureCode(err), builderObservation.status, driftStatus)
 	}
 	if artifact.State != ArtifactReady || !validImageContentID(artifact.ImageContentID) || artifacts.failed != "" {
 		t.Fatal("live generated image production compile returned an invalid artifact")
@@ -182,6 +186,137 @@ func (observation *liveGeneratedImageBuilderObservation) Prepare(ctx context.Con
 	}
 	observation.status = "ready"
 	return session, nil
+}
+
+func liveGeneratedImageBuilderDriftStatus(ctx context.Context, manager *BuilderManager, identity builderIdentity, environment []string) string {
+	if ctx.Err() != nil {
+		return "observation_cancelled"
+	}
+	observationContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	network, found, err := manager.inspectNetwork(observationContext, identity.NetworkName, environment)
+	if err != nil {
+		return "network_unavailable"
+	}
+	if !found {
+		return "network_missing"
+	}
+	if !matchesNetwork(network, identity) {
+		return "network_mismatch"
+	}
+	network = dockerNetwork{}
+
+	container, found, err := manager.inspectBuildkitContainer(observationContext, identity, environment)
+	if err != nil {
+		return "container_unavailable"
+	}
+	if !found {
+		return "container_missing"
+	}
+	containerStatus := liveGeneratedImageBuildkitContainerDrift(container, identity, manager.options.StateQuotaBytes)
+	clearLiveGeneratedImageBuildkitContainer(&container)
+	if containerStatus != "none" {
+		return containerStatus
+	}
+
+	builder, found, err := manager.findBuilder(observationContext, identity.BuilderName, environment)
+	if err != nil {
+		return "builder_unavailable"
+	}
+	if !found {
+		return "builder_missing"
+	}
+	builderStatus := liveGeneratedImageBuildxBuilderDrift(builder, identity)
+	clearLiveGeneratedImageBuildxBuilder(&builder)
+	return builderStatus
+}
+
+func liveGeneratedImageBuildkitContainerDrift(container buildkitContainer, identity builderIdentity, quotaBytes int64) string {
+	if !lowerHex(container.ID, 64) || container.Name != "/"+buildkitContainerName(identity) {
+		return "container_identity"
+	}
+	if !validImageContentID(container.Image) || container.Config.Image != buildkitImage {
+		return "container_image"
+	}
+	if !equalStringSlices(container.Config.Cmd, buildkitCommand(quotaBytes)) {
+		return "container_command"
+	}
+	for key, value := range map[string]string{
+		"rig.controller": "generated-builder", "rig.builder": identity.BuilderName,
+		"rig.network": identity.NetworkName, "rig.quota.bytes": fmt.Sprintf("%d", quotaBytes),
+	} {
+		if container.Config.Labels[key] != value {
+			return "container_labels"
+		}
+	}
+	if container.HostConfig.Memory != buildkitMemoryLimit(quotaBytes) || container.HostConfig.MemorySwap != buildkitMemoryLimit(quotaBytes) || container.HostConfig.CPUPeriod != 100000 || container.HostConfig.CPUQuota != 100000 || container.HostConfig.PidsLimit != buildkitPIDsLimit || !container.HostConfig.Privileged || len(container.HostConfig.Binds) != 0 || len(container.HostConfig.PortBindings) != 0 || container.HostConfig.RestartPolicy.Name != "unless-stopped" || container.HostConfig.LogConfig.Type != "json-file" || len(container.HostConfig.LogConfig.Config) != 2 || container.HostConfig.LogConfig.Config["max-size"] != "10m" || container.HostConfig.LogConfig.Config["max-file"] != "1" {
+		return "container_resources"
+	}
+	if container.HostConfig.NetworkMode != identity.NetworkName || len(container.NetworkSettings.Networks) != 1 {
+		return "container_network"
+	}
+	if _, connected := container.NetworkSettings.Networks[identity.NetworkName]; !connected {
+		return "container_network"
+	}
+	if len(container.HostConfig.Mounts) != 1 {
+		return "container_configured_mount"
+	}
+	configured := container.HostConfig.Mounts[0]
+	if configured.Type != "tmpfs" || configured.Source != "" || configured.Target != buildkitStatePath || configured.ReadOnly || configured.TmpfsOptions == nil || configured.TmpfsOptions.SizeBytes != quotaBytes || configured.TmpfsOptions.Mode != 0o700 {
+		return "container_configured_mount"
+	}
+	if len(container.Mounts) != 1 {
+		return "container_active_mount"
+	}
+	active := container.Mounts[0]
+	if active.Type != "tmpfs" || active.Source != "" || active.Destination != buildkitStatePath || !active.RW || active.Mode != "" || active.Propagation != "" {
+		return "container_active_mount"
+	}
+	if !buildkitContainerReady(container) {
+		return "container_lifecycle"
+	}
+	return "none"
+}
+
+func liveGeneratedImageBuildxBuilderDrift(builder buildxBuilder, identity builderIdentity) string {
+	if builder.Name != identity.BuilderName {
+		return "builder_identity"
+	}
+	if builder.Driver != "remote" {
+		return "builder_driver"
+	}
+	if len(builder.Nodes) != 1 {
+		return "builder_nodes"
+	}
+	if builder.Nodes[0].Name != identity.NodeName {
+		return "builder_node_name"
+	}
+	if builder.Nodes[0].Endpoint != buildkitRemoteEndpoint(identity) {
+		return "builder_endpoint"
+	}
+	return "none"
+}
+
+func clearLiveGeneratedImageBuildkitContainer(container *buildkitContainer) {
+	for key := range container.Config.Labels {
+		delete(container.Config.Labels, key)
+	}
+	for key := range container.HostConfig.LogConfig.Config {
+		delete(container.HostConfig.LogConfig.Config, key)
+	}
+	for key, value := range container.NetworkSettings.Networks {
+		clear(value)
+		delete(container.NetworkSettings.Networks, key)
+	}
+	*container = buildkitContainer{}
+}
+
+func clearLiveGeneratedImageBuildxBuilder(builder *buildxBuilder) {
+	for index := range builder.Nodes {
+		builder.Nodes[index] = buildxNode{}
+	}
+	*builder = buildxBuilder{}
 }
 
 func liveGeneratedImageFailureCode(err error) string {
@@ -249,6 +384,62 @@ func TestLiveGeneratedImageBuilderObservationUsesOnlyFixedStatus(t *testing.T) {
 			_, _ = observation.Prepare(context.Background())
 			if observation.status != test.want || !validLiveGeneratedImageDiagnostic(observation.status) {
 				t.Fatalf("builder observation = %q, want %q", observation.status, test.want)
+			}
+		})
+	}
+}
+
+func TestLiveGeneratedImageBuilderDriftClassifiersUseOnlyFixedGroups(t *testing.T) {
+	identity := builderIdentity{
+		Schema: builderStateSchema, BuilderName: "rig-buildkit-0123456789abcdef01234567",
+		NodeName: "rig-node-0123456789abcdef01234567", NetworkName: "rig-buildnet-0123456789abcdef01234567",
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*buildkitContainer)
+		want   string
+	}{
+		{"valid", func(*buildkitContainer) {}, "none"},
+		{"identity", func(container *buildkitContainer) { container.ID = "sensitive/raw/id" }, "container_identity"},
+		{"resources", func(container *buildkitContainer) { container.HostConfig.Memory-- }, "container_resources"},
+		{"network", func(container *buildkitContainer) { container.NetworkSettings.Networks = nil }, "container_network"},
+		{"configured mount", func(container *buildkitContainer) { container.HostConfig.Mounts[0].TmpfsOptions.Mode-- }, "container_configured_mount"},
+		{"active mount", func(container *buildkitContainer) { container.Mounts[0].Mode = "sensitive/raw/mode" }, "container_active_mount"},
+		{"lifecycle", func(container *buildkitContainer) { container.State.Restarting = true }, "container_lifecycle"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			container := validBuildkitContainer(identity, defaultStateQuotaBytes)
+			test.mutate(&container)
+			if got := liveGeneratedImageBuildkitContainerDrift(container, identity, defaultStateQuotaBytes); got != test.want || !validLiveGeneratedImageDiagnostic(got) {
+				t.Fatalf("container drift group = %q, want %q", got, test.want)
+			}
+			clearLiveGeneratedImageBuildkitContainer(&container)
+			if container.ID != "" || container.Name != "" || container.Config.Labels != nil || container.HostConfig.Mounts != nil || container.NetworkSettings.Networks != nil || container.Mounts != nil {
+				t.Fatal("container observation was not cleared")
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*buildxBuilder)
+		want   string
+	}{
+		{"valid", func(*buildxBuilder) {}, "none"},
+		{"driver", func(builder *buildxBuilder) { builder.Driver = "sensitive/raw/driver" }, "builder_driver"},
+		{"nodes", func(builder *buildxBuilder) { builder.Nodes = nil }, "builder_nodes"},
+		{"endpoint", func(builder *buildxBuilder) { builder.Nodes[0].Endpoint = "sensitive/raw/endpoint" }, "builder_endpoint"},
+	} {
+		t.Run("builder "+test.name, func(t *testing.T) {
+			builder := buildxBuilder{Name: identity.BuilderName, Driver: "remote", Nodes: []buildxNode{{Name: identity.NodeName, Endpoint: buildkitRemoteEndpoint(identity)}}}
+			test.mutate(&builder)
+			if got := liveGeneratedImageBuildxBuilderDrift(builder, identity); got != test.want || !validLiveGeneratedImageDiagnostic(got) {
+				t.Fatalf("builder drift group = %q, want %q", got, test.want)
+			}
+			clearLiveGeneratedImageBuildxBuilder(&builder)
+			if builder.Name != "" || builder.Driver != "" || builder.Nodes != nil {
+				t.Fatal("builder observation was not cleared")
 			}
 		})
 	}
