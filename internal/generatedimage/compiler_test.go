@@ -426,9 +426,8 @@ func TestCompilerBuildsWorkspaceDependenciesAtRepositoryRoot(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				if !strings.Contains(string(recipe), "install=$(cat /run/rig/install.path); cd -- \\\"/workspace/$install\\\"") || !strings.Contains(string(recipe), "root=$(cat /run/rig/root.path); cd -- \\\"/workspace/$root\\\"") {
-					return errors.New("workspace recipe did not separate installation and build roots")
-				}
+				assertCommandSecretRun(t, string(recipe), "rig-install-command", `install=$(cat /run/rig/install.path) && rig_command=$(cat /run/secrets/rig-install-command) && cd -- "/workspace/$install" && exec /bin/sh -lc "$rig_command"`)
+				assertCommandSecretRun(t, string(recipe), "rig-build-command", `root=$(cat /run/rig/root.path) && rig_command=$(cat /run/secrets/rig-build-command) && cd -- "/workspace/$root" && exec /bin/sh -lc "$rig_command"`)
 				return os.WriteFile(flagValue(t, request.Args, "--iidfile"), []byte("sha256:"+strings.Repeat("3", 64)), 0o600)
 			}
 			artifact, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")

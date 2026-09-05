@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -92,9 +93,10 @@ func TestWorkspaceRootInstallRecipeUsesSeparateWorkingDirectories(t *testing.T) 
 				t.Fatal(err)
 			}
 			recipe := containerfile(true, test.manager != "npm", definition.baseImage)
-			assertCommandSecretRun(t, recipe, "rig-install-command", installShellScript)
-			assertCommandSecretRun(t, recipe, "rig-build-command", buildShellScript)
+			assertCommandSecretRun(t, recipe, "rig-install-command", `install=$(cat /run/rig/install.path) && rig_command=$(cat /run/secrets/rig-install-command) && cd -- "/workspace/$install" && exec /bin/sh -lc "$rig_command"`)
+			assertCommandSecretRun(t, recipe, "rig-build-command", `root=$(cat /run/rig/root.path) && rig_command=$(cat /run/secrets/rig-build-command) && cd -- "/workspace/$root" && exec /bin/sh -lc "$rig_command"`)
 			assertWorkspaceOwnershipRun(t, recipe)
+			assertSelectorDirectoryRun(t, recipe)
 			if !hasExactRecipeLine(recipe, "COPY --chown=1000:1000 --chmod=0400 rig/root.path rig/install.path /run/rig/") {
 				t.Fatal("workspace selectors are not explicitly node-owned and read-only")
 			}
@@ -121,6 +123,29 @@ func TestWorkspaceRootInstallRecipeUsesSeparateWorkingDirectories(t *testing.T) 
 				t.Fatalf("Corepack RUN count = %d, want %d", corepackRuns, wantCorepackRuns)
 			}
 		})
+	}
+}
+
+func assertSelectorDirectoryRun(t *testing.T, recipe string) {
+	t.Helper()
+	want := []string{"install", "-d", "-o", "0", "-g", "0", "-m", "0555", "/run/rig", "/run/secrets"}
+	matches := 0
+	for _, run := range parseRunExecInstructions(t, recipe) {
+		if reflect.DeepEqual(run.argv, want) {
+			matches++
+			if run.options != "" {
+				t.Fatalf("selector directory RUN options = %q, want none", run.options)
+			}
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("selector directory RUN matches = %d, want 1", matches)
+	}
+	directoryIndex := strings.Index(recipe, `RUN ["install", "-d", "-o", "0", "-g", "0", "-m", "0555", "/run/rig", "/run/secrets"]`)
+	selectorIndex := strings.Index(recipe, "COPY --chown=1000:1000 --chmod=0400 rig/root.path rig/install.path /run/rig/")
+	userIndex := strings.Index(recipe, "USER node\n")
+	if directoryIndex < 0 || selectorIndex < 0 || userIndex < 0 || directoryIndex > selectorIndex || selectorIndex > userIndex {
+		t.Fatal("selector directory is not established before the non-root command runs")
 	}
 }
 

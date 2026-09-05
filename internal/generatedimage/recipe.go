@@ -15,8 +15,8 @@ import (
 const CompilerVersion = "generated-node-v3"
 
 const (
-	installShellScript = `install=$(cat /run/rig/install.path); cd -- "/workspace/$install" && exec /bin/sh -lc "$(cat /run/secrets/rig-install-command)"`
-	buildShellScript   = `root=$(cat /run/rig/root.path); cd -- "/workspace/$root" && exec /bin/sh -lc "$(cat /run/secrets/rig-build-command)"`
+	installShellScript = `install=$(cat /run/rig/install.path) && rig_command=$(cat /run/secrets/rig-install-command) && cd -- "/workspace/$install" && exec /bin/sh -lc "$rig_command"`
+	buildShellScript   = `root=$(cat /run/rig/root.path) && rig_command=$(cat /run/secrets/rig-build-command) && cd -- "/workspace/$root" && exec /bin/sh -lc "$rig_command"`
 )
 
 var nodeImages = map[string]string{
@@ -114,6 +114,7 @@ func containerfile(hasBuild, enableCorepack bool, baseImage string) string {
 %sWORKDIR /workspace
 RUN ["chown", "node:node", "/workspace"]
 COPY --chown=node:node source/ /workspace/
+RUN ["install", "-d", "-o", "0", "-g", "0", "-m", "0555", "/run/rig", "/run/secrets"]
 COPY --chown=1000:1000 --chmod=0400 rig/root.path rig/install.path /run/rig/
 USER node
 %s%sFROM %s AS runtime

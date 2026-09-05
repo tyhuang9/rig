@@ -87,7 +87,7 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 	}
 
 	installCommand := `test -w . && npm ci && test "$(id -u):$(id -g)" = "1000:1000" && install_marker=` + liveInstallCanary + ` && test "$install_marker" = ` + liveInstallCanary
-	buildCommand := `build_marker=` + liveBuildCanary + ` && expanded="$(printf '%s' shell-ok)" && test "$build_marker" = ` + liveBuildCanary + ` && test "$expanded" = shell-ok && node -e "require('node:fs').writeFileSync('artifact.txt','generated-image-ok')"`
+	buildCommand := `test "$PWD" = "/workspace/app root" && build_marker=` + liveBuildCanary + ` && expanded="$(printf '%s' shell-ok)" && test "$build_marker" = ` + liveBuildCanary + ` && test "$expanded" = shell-ok && node -e "require('node:fs').writeFileSync('artifact.txt','generated-image-ok')"`
 	appID, releaseID, revisionID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	release := releasesnapshot.Release{
 		ID: releaseID, AppID: appID, SourceProvider: "local",
