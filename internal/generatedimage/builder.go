@@ -27,6 +27,7 @@ const (
 	buildkitImage                 = "moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
 	buildkitStatePath             = "/var/lib/buildkit"
 	buildkitRemoteScheme          = "docker-container://"
+	buildxBuilderListFormat       = "json"
 	defaultStateQuotaBytes        = int64(2 << 30)
 	minimumStateQuotaBytes        = int64(512 << 20)
 	maximumStateQuotaBytes        = int64(16 << 30)
@@ -677,7 +678,9 @@ func equalStringSlices(left, right []string) bool {
 }
 
 func (m *BuilderManager) findBuilder(ctx context.Context, name string, env []string) (buildxBuilder, bool, error) {
-	result, runErr := m.run(ctx, []string{"buildx", "ls", "--format", "{{json .}}"}, env)
+	// Buildx emits one record per builder only in its native JSON mode. A
+	// custom {{json .}} template also emits one duplicate record per node.
+	result, runErr := m.run(ctx, []string{"buildx", "ls", "--format", buildxBuilderListFormat}, env)
 	defer clear(result.Stdout)
 	defer clear(result.Stderr)
 	if runErr != nil {
