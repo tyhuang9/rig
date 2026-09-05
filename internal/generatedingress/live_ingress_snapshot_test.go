@@ -452,6 +452,13 @@ func liveCaddyStartupMarkers(value []byte) string {
 		{"unknown_module_or_field", [][]byte{[]byte("module not registered"), []byte("unknown field")}},
 		{"executable_missing", [][]byte{[]byte("executable file not found"), []byte("executable not found")}},
 		{"container_not_running", [][]byte{[]byte("is not running"), []byte("is restarting")}},
+		{"go_runtime_fatal", [][]byte{[]byte("fatal error:"), []byte("runtime:"), []byte("panic:")}},
+		{"runtime_resource_exhausted", [][]byte{[]byte("out of memory"), []byte("cannot allocate memory"), []byte("failed to create new os thread"), []byte("newosproc"), []byte("resource temporarily unavailable")}},
+		{"runtime_signal_fault", [][]byte{[]byte("signal:"), []byte("sigsegv"), []byte("sigbus"), []byte("sigill"), []byte("illegal instruction")}},
+		{"caddy_provision_failed", [][]byte{[]byte("provisioning"), []byte("starting admin endpoint"), []byte("starting server"), []byte("server failed"), []byte("failed to start")}},
+		{"operation_not_permitted", [][]byte{[]byte("operation not permitted")}},
+		{"exec_format", [][]byte{[]byte("exec format error")}},
+		{"shared_library", [][]byte{[]byte("shared library"), []byte("error relocating")}},
 	}
 	found := make([]bool, len(markers))
 	for _, line := range bytes.Split(lower, []byte{'\n'}) {
@@ -1036,6 +1043,19 @@ func TestLiveCaddyStartupDiagnosticFailsClosed(t *testing.T) {
 }
 
 func TestLiveCaddyStartupClassifierDoesNotSynthesizeMarkers(t *testing.T) {
+	for message, want := range map[string]string{
+		"fatal error: private-canary":                   "go_runtime_fatal",
+		"failed to create new OS thread private-canary": "runtime_resource_exhausted",
+		"SIGSEGV private-canary":                        "runtime_signal_fault",
+		"starting admin endpoint private-canary":        "caddy_provision_failed",
+		"operation not permitted private-canary":        "operation_not_permitted",
+		"exec format error private-canary":              "exec_format",
+		"Error relocating private-canary":               "shared_library",
+	} {
+		if got := liveCaddyStartupMarkers([]byte(message)); got != want {
+			t.Fatalf("startup marker = %q, want %q", got, want)
+		}
+	}
 	if got := liveCaddyStartupMarkers([]byte("permission\ndenied")); got != "other" {
 		t.Fatalf("cross-line marker = %q", got)
 	}
