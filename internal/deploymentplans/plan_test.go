@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/secretfile"
 )
 
 const planTestApp = "11111111-1111-1111-1111-111111111111"
@@ -132,8 +134,24 @@ func TestStorePersistsProtectedImmutableRevisionAndCASHead(t *testing.T) {
 	}
 	path := filepath.Join(root, "apps", planTestApp, "deployment-plans", created.ID+".secret")
 	persisted, err := os.ReadFile(path)
-	if err != nil || strings.Contains(string(persisted), "npm run build") {
-		t.Fatalf("protected bundle path=%q err=%v contains command=%t", path, err, strings.Contains(string(persisted), "npm run build"))
+	if err != nil {
+		t.Fatalf("read protected bundle path=%q: %v", path, err)
+	}
+	if runtime.GOOS == "windows" && strings.Contains(string(persisted), "npm run build") {
+		t.Fatalf("Windows protected bundle path=%q contains plaintext command", path)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat POSIX protected bundle path=%q: %v", path, err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("POSIX protected bundle path=%q mode=%o", path, info.Mode().Perm())
+		}
+	}
+	if plaintext, err := secretfile.Read(path, purpose(planTestApp, uuid.NewString())); err == nil {
+		clear(plaintext)
+		t.Fatal("purpose-mismatched deployment plan bundle was accepted")
 	}
 	var commands int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('deployment_plan_revisions') WHERE lower(name) LIKE '%command%'`).Scan(&commands); err != nil || commands != 0 {
