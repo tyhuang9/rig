@@ -414,7 +414,7 @@ func liveRunBuiltImage(ctx context.Context, runner runtimeprocess.CommandRunner,
 			"--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
 			"--label", "io.rig.managed=generated-image-live-test", "--label", "rig.live=" + containerName,
 			"--workdir", "/workspace/" + componentRoot,
-			imageID, "/bin/sh", "-lc", `test "$(cat artifact.txt)" = generated-image-ok && test "$(id -u):$(id -g)" = "1000:1000"`,
+			imageID, "/bin/sh", "-lc", `test "$PWD" = "/workspace/app root" || exit 81; test -f artifact.txt || exit 82; test -r artifact.txt || exit 83; test "$(cat artifact.txt)" = generated-image-ok || exit 84; test "$(id -u)" = 1000 || exit 85; test "$(id -g)" = 1000 || exit 86`,
 		},
 		Directory: directory, Env: environment, Timeout: time.Minute, OutputLimit: 4 << 10,
 	})
@@ -444,6 +444,12 @@ func liveGeneratedImageRuntimeStatus(ctx context.Context, result runtimeprocess.
 	if errors.As(err, &executableError) || errors.As(err, &pathError) {
 		return "runtime_unavailable"
 	}
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) {
+		if status := liveGeneratedImageRuntimeExitStatus(exitError.ExitCode()); status != "unclassified" {
+			return status
+		}
+	}
 	combined := make([]byte, 0, len(result.Stdout)+len(result.Stderr))
 	combined = append(combined, result.Stdout...)
 	combined = append(combined, result.Stderr...)
@@ -461,6 +467,42 @@ func liveGeneratedImageRuntimeStatus(ctx context.Context, result runtimeprocess.
 		return "permission_denied"
 	default:
 		return "unclassified"
+	}
+}
+
+func liveGeneratedImageRuntimeExitStatus(code int) string {
+	switch code {
+	case 81:
+		return "workdir_mismatch"
+	case 82:
+		return "artifact_missing"
+	case 83:
+		return "artifact_unreadable"
+	case 84:
+		return "artifact_mismatch"
+	case 85:
+		return "user_mismatch"
+	case 86:
+		return "group_mismatch"
+	case 125:
+		return "docker_run_failed"
+	case 126:
+		return "command_not_executable"
+	case 127:
+		return "command_not_found"
+	default:
+		return "unclassified"
+	}
+}
+
+func TestLiveGeneratedImageRuntimeExitStatusIsFixed(t *testing.T) {
+	for code, want := range map[int]string{
+		0: "unclassified", 1: "unclassified", 81: "workdir_mismatch", 82: "artifact_missing", 83: "artifact_unreadable",
+		84: "artifact_mismatch", 85: "user_mismatch", 86: "group_mismatch", 125: "docker_run_failed", 126: "command_not_executable", 127: "command_not_found",
+	} {
+		if got := liveGeneratedImageRuntimeExitStatus(code); got != want || !validLiveGeneratedImageDiagnostic(got) {
+			t.Fatalf("runtime exit status for %d = %q, want %q", code, got, want)
+		}
 	}
 }
 
