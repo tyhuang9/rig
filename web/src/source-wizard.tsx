@@ -87,6 +87,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   const [fieldErrors, setFieldErrors] = useState<{ name?: string; description?: string; localPath?: string }>({});
   const [inspection, setInspection] = useState<InspectResponse | null>(null);
   const [reviewedSetup, setReviewedSetup] = useState<DeploymentSetupInput | null>(null);
+  const [setupDraft, setSetupDraft] = useState<DeploymentSetupInput | null>(null);
   const [inspectedKey, setInspectedKey] = useState("");
   const [draftApplicationId, setDraftApplicationId] = useState("");
   const [acceptedRevision, setAcceptedRevision] = useState<DeploymentPlanRevision | null>(null);
@@ -150,6 +151,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     inspectionGeneration.current += 1;
     inspectionRequest.current = null;
     clearInspection();
+    setSetupDraft(null);
     setAcceptedRevision(null);
     if (!draftApplicationId) setStage("source");
   };
@@ -334,7 +336,9 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
       setInspectedKey(key);
       setInspectionError("");
       const explicitlySelectedCompose = Boolean(request.githubSource?.composePath);
-      if (review || (!explicitlySelectedCompose && result.analysis.candidates.some((candidate) => candidate.kind === "javascript" && candidate.status !== "unsupported" && candidate.components.length > 0))) setStage("review");
+      const hasGeneratedSetup = result.analysis.candidates.some((candidate) => candidate.kind === "javascript" && candidate.status !== "unsupported" && candidate.components.length > 0);
+      const needsManualSetup = result.composeCandidates.length === 0 && result.findings.every((finding) => finding.code === "compose_not_found");
+      if (review || (!explicitlySelectedCompose && (hasGeneratedSetup || needsManualSetup))) setStage("review");
     },
     onError: (error, operation) => {
       const currentRequest = inspectionRequest.current;
@@ -689,8 +693,10 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
     <form onSubmit={(event) => event.preventDefault()} noValidate>
       <DeploymentPlanReview
         inspection={inspection}
+        initialSetup={setupDraft ?? undefined}
+        onDraftChange={setSetupDraft}
         expectedRevisionNumber={acceptedRevision?.revisionNumber ?? 0}
-        pending={acceptPlan.isPending}
+        pending={inspectSource.isPending || acceptPlan.isPending}
         error={formError || (inspectSource.error ? safeMessage(inspectSource.error, "Could not review the deployment setup.") : acceptPlan.error ? safeMessage(acceptPlan.error, "Could not accept the deployment setup.") : "")}
         apiErrors={inspectSource.error instanceof APIError ? inspectSource.error.errors : acceptPlan.error instanceof APIError ? acceptPlan.error.errors : {}}
         reviewedSetup={reviewedSetup}

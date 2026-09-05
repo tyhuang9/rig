@@ -1058,17 +1058,37 @@ describe("SourceWizard", () => {
     await selectBranch();
     fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
 
-    const emptyResult = (await screen.findByText(/no compose files found/i)).closest("[role='status']");
-    expect(emptyResult?.getAttribute("aria-live")).toBe("polite");
-    expect(emptyResult?.getAttribute("aria-atomic")).toBe("true");
-    expect(screen.getByText("Add a Compose file to the tracked branch, then inspect again.")).toBeTruthy();
-    expect(screen.getByText("Add a supported JavaScript project or a Compose file, then analyze again.")).toBeTruthy();
-    expect(screen.queryByText(/source inspection completed/i)).toBeNull();
-    expect(screen.queryByText(/ready to save/i)).toBeNull();
-    expect(screen.queryByLabelText(/^compose file$/i)).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: /configure build and run/i }));
     expect(await screen.findByRole("heading", { name: /how rig will run this app/i })).toBeTruthy();
+    expect(screen.getByText("No supported setup was detected")).toBeTruthy();
+    expect(screen.getByLabelText(/^start command$/i).getAttribute("aria-invalid")).toBe("true");
+    expect(screen.queryByText(/source inspection completed/i)).toBeNull();
     expect(screen.getByRole("button", { name: "Review setup" }).hasAttribute("disabled")).toBe(false);
+    expect(api.createApp).not.toHaveBeenCalled();
+  });
+
+  it("opens undetected local settings, serializes numeric ports, and preserves edits through failed review", async () => {
+    const review = deferred<InspectResponse>();
+    vi.mocked(api.inspect).mockResolvedValueOnce(inspectionFixture({source: {type: "local", path: "C:/projects/manual"}, composeCandidates: [], services: [], findings: [{code: "compose_not_found", message: "No Compose file"}]})).mockReturnValueOnce(review.promise);
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), {target: {value: "Manual app"}});
+    fireEvent.change(screen.getByLabelText(/local source path/i), {target: {value: "C:/projects/manual"}});
+    fireEvent.click(screen.getByRole("button", {name: "Analyze project"}));
+    expect(await screen.findByRole("heading", {name: /how rig will run this app/i})).toBeTruthy();
+    fireEvent.change(screen.getByLabelText(/^start command$/i), {target: {value: "node server.js"}});
+    fireEvent.change(screen.getByLabelText(/^internal port$/i), {target: {value: "3001"}});
+    fireEvent.click(screen.getByRole("button", {name: "Back to source"}));
+    fireEvent.click(screen.getByRole("button", {name: "Configure build and run"}));
+    expect((screen.getByLabelText(/^start command$/i) as HTMLInputElement).value).toBe("node server.js");
+    expect((screen.getByLabelText(/^internal port$/i) as HTMLInputElement).value).toBe("3001");
+    fireEvent.click(screen.getByRole("button", {name: "Review setup"}));
+    await waitFor(() => expect(api.inspect).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(api.inspect).mock.calls[1][0].setup?.components[0]).toMatchObject({rootDirectory: ".", startCommand: "node server.js", internalPort: 3001, installCommand: "", buildCommand: ""});
+    expect(screen.getByRole("button", {name: /^Reviewing/}).hasAttribute("disabled")).toBe(true);
+    fireEvent.click(screen.getByRole("button", {name: /^Reviewing/}));
+    expect(api.inspect).toHaveBeenCalledTimes(2);
+    await act(async () => {review.reject(new APIError({status: 503, code: "source_unavailable", detail: "Source temporarily unavailable"}));});
+    expect((screen.getByLabelText(/^start command$/i) as HTMLInputElement).value).toBe("node server.js");
+    expect(await screen.findByRole("button", {name: "Retry review"})).toBeTruthy();
     expect(api.createApp).not.toHaveBeenCalled();
   });
 

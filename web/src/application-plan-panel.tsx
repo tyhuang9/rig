@@ -80,6 +80,7 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
   const acceptanceGeneration = useRef(0);
   const migrationGeneration = useRef(0);
   const heading = useRef<HTMLHeadingElement>(null);
+  const reviewPanel = useRef<HTMLDivElement>(null);
   const errorSummary = useRef<HTMLDivElement>(null);
   const [reviewing, setReviewing] = useState(false);
   const [inspection, setInspection] = useState<InspectResponse | null>(null);
@@ -133,7 +134,7 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
   }, [panelError, plan.isError]);
 
   const focusHeading = () =>
-    window.setTimeout(() => heading.current?.focus(), 0);
+    window.setTimeout(() => (heading.current ?? reviewPanel.current?.querySelector<HTMLHeadingElement>("h2"))?.focus(), 0);
 
   const updatePlan = (revision: DeploymentPlanRevision | null) => {
     queryClient.setQueryData(["deployment-plan", app.id], revision);
@@ -364,7 +365,7 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
   const directEditableSetup = Boolean(accepted && !composeStrategy(accepted.strategy) && (accepted.setup || accepted.components.length > 0));
   if (directEditableSetup || (reviewing && inspection && inspectionContext === contextKey)) {
     return (
-      <div className="application-plan-review">
+      <div className="application-plan-review" ref={reviewPanel}>
         <span
           className="sr-only"
           role="status"
@@ -373,6 +374,10 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
         >
           {announcement}
         </span>
+        {(panelError || plan.isError) && <div ref={errorSummary} className="error-summary" role="alert" tabIndex={-1}>
+          {panelError || "Rig could not load the accepted deployment setup. Try again."}
+          {plan.isError && <button className="button small" type="button" onClick={() => void plan.refetch()}>Retry deployment setup</button>}
+        </div>}
         {accepted?.migration.present && (
           <div
             className={
@@ -396,7 +401,7 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
         <DeploymentPlanReview
           inspection={inspection ?? undefined}
           initialSetup={directEditableSetup && accepted ? deploymentSetupFromRevision(accepted) : undefined}
-          expectedRevisionNumber={directEditableSetup && accepted ? accepted.revisionNumber : inspectionRevision}
+          expectedRevisionNumber={inspectionRevision}
           pending={accepting || inspectionPending}
           error={reviewError}
           apiErrors={reviewFieldErrors}

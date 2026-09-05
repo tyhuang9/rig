@@ -270,6 +270,23 @@ describe("ApplicationPlanPanel", () => {
     expect(screen.queryByRole("button", { name: "Review setup" })).toBeNull();
   });
 
+  it("keeps an explicit setup bound to its reviewed revision after a background head update", async () => {
+    const accepted = plan({
+      setup: { components: [{ id: "web", technology: "node", rootDirectory: ".", packageManager: "npm", nodeVersion: "24", installCommand: "", buildCommand: "", startCommand: "node server.js", outputDirectory: "", internalPort: 3000, healthProbe: "/" }] },
+    });
+    vi.mocked(api.deploymentPlan).mockResolvedValue(accepted);
+    const { client } = renderPanel();
+    await screen.findByRole("heading", { name: "How Rig will run this app" });
+    fireEvent.change(screen.getByRole("textbox", { name: "Start command" }), { target: { value: "node edited.js" } });
+    await reviewSetup();
+    await act(async () => { client.setQueryData(["deployment-plan", localApp.id], { ...accepted, revisionId: "concurrent-revision", revisionNumber: 9 }); });
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
+    await waitFor(() => expect(api.acceptDeploymentPlan).toHaveBeenCalledWith(localApp.id, expect.objectContaining({
+      expectedRevisionNumber: 3,
+      setup: expect.objectContaining({ components: [expect.objectContaining({ startCommand: "node edited.js" })] }),
+    })));
+  });
+
   it("constructs the exact GitHub inspection request", async () => {
     vi.mocked(api.inspect).mockResolvedValue(inspection(githubApp));
     renderPanel(githubApp);
@@ -498,6 +515,31 @@ describe("ApplicationPlanPanel", () => {
     );
     expect(await screen.findByText("Database migration approved")).not.toBeNull();
     expect(document.body.textContent).not.toContain("secret-migration-command");
+  });
+
+  it("shows migration failures in the editable setup and returns focus after a successful retry", async () => {
+    const accepted = plan({
+      setup: { components: [{ id: "web", technology: "node", rootDirectory: ".", packageManager: "npm", nodeVersion: "24", installCommand: "", buildCommand: "", startCommand: "node server.js", outputDirectory: "", internalPort: 3000, healthProbe: "/" }] },
+      migration: { present: true, approvalStatus: "pending" },
+    });
+    vi.mocked(api.deploymentPlan).mockResolvedValue(accepted);
+    vi.mocked(api.approveDeploymentPlanMigration)
+      .mockRejectedValueOnce(new APIError({ status: 503, code: "unavailable", detail: "private provider details" }))
+      .mockResolvedValueOnce({ ...accepted, migration: { present: true, approvalStatus: "approved" } });
+    renderPanel();
+    const approve = await screen.findByRole("button", { name: "Approve migration for revision 3" });
+    approve.focus();
+    fireEvent.click(approve);
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Rig could not approve this database migration.");
+    expect(document.body.textContent).not.toContain("private provider details");
+    await waitFor(() => expect(document.activeElement).toBe(alert));
+    approve.focus();
+    fireEvent.click(approve);
+    await screen.findByText("Database migration approved");
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "How Rig will run this app" })));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect((screen.getByRole("textbox", { name: "Start command" }) as HTMLInputElement).value).toBe("node server.js");
   });
 
   it("reloads migration conflicts with fixed non-secret recovery", async () => {

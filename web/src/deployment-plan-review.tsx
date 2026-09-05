@@ -162,6 +162,7 @@ function validate(setup: DeploymentSetupInput): FieldErrors {
 }
 
 function errorTarget(key: string, components: DeploymentSetupComponentInput[]) {
+  if (key === "migrationCommand") return { id: "deployment-setup-migration-command", label: "Migration command" };
   if (key === "components") return { id: "deployment-setup-components", label: "Components" };
   const component = components.find((item) => key.startsWith(`components.${item.id}.`));
   const field = component ? key.slice(`components.${component.id}.`.length) : "";
@@ -206,6 +207,7 @@ export function DeploymentPlanReview({
   onAnalyze,
   onAccept,
   onUseCompose,
+  onDraftChange,
   draftSaved = false,
   onOpenSavedDraft,
 }: {
@@ -221,6 +223,7 @@ export function DeploymentPlanReview({
   onAnalyze: (setup: DeploymentSetupInput) => void;
   onAccept: (request: AcceptDeploymentPlanRequest) => void;
   onUseCompose?: () => void;
+  onDraftChange?: (setup: DeploymentSetupInput) => void;
   draftSaved?: boolean;
   onOpenSavedDraft?: () => void;
 }) {
@@ -232,16 +235,17 @@ export function DeploymentPlanReview({
   const [draft, setDraft] = useState<DeploymentSetupInput>(initialDraft.current);
   const [detectedSetup, setDetectedSetup] = useState<DeploymentSetupInput | null>(() => initialCandidate && !userCandidate(initialCandidate) ? deploymentSetupFromCandidate(initialCandidate) : null);
   const [errors, setErrors] = useState<FieldErrors>(() => validate(initialDraft.current!));
-  const [dirty, setDirty] = useState(false);
+  const [dirty, setDirty] = useState(Boolean(initialSetup));
   const [dismissedAPIErrorKeys, setDismissedAPIErrorKeys] = useState<Set<string>>(new Set());
   const [errorDismissed, setErrorDismissed] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [componentSequence, setComponentSequence] = useState(() => draft.components.length + 1);
   const errorSummary = useRef<HTMLDivElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
+  const componentFocus = useRef<string | null>(null);
   const previousInspection = useRef<InspectResponse | undefined>(inspection);
 
-  const candidate = candidates.find((item) => item.id === candidateId) ?? (candidates.length === 1 ? candidates[0] : undefined);
+  const candidate = (reviewedSetup ? candidates.find(userCandidate) : undefined) ?? candidates.find((item) => item.id === candidateId) ?? (candidates.length === 1 ? candidates[0] : undefined);
   const reviewed = !reviewRequired && userCandidate(candidate) && Boolean(reviewedSetup) && setupKey(reviewedSetup!) === setupKey(draft);
   const hasDetectedSettings = detectedSetup !== null;
   const serverErrors = normalizedFieldErrors(apiErrors, draft.components);
@@ -249,6 +253,15 @@ export function DeploymentPlanReview({
   const apiErrorSignature = JSON.stringify(apiErrors);
 
   useEffect(() => { heading.current?.focus(); }, []);
+  useEffect(() => { onDraftChange?.(draft); }, [draft, onDraftChange]);
+  useEffect(() => {
+    if (pending || !componentFocus.current) return;
+    const target = document.getElementById(componentFocus.current);
+    if (target) {
+      target.focus();
+      componentFocus.current = null;
+    }
+  }, [draft.components, pending]);
   useEffect(() => {
     if (previousInspection.current === inspection) return;
     previousInspection.current = inspection;
@@ -269,7 +282,12 @@ export function DeploymentPlanReview({
   useEffect(() => {
     setDismissedAPIErrorKeys(new Set());
     setErrorDismissed(false);
-    if (error) window.setTimeout(() => errorSummary.current?.focus(), 0);
+    const hasFieldErrors = Object.values(apiErrors).some(Boolean);
+    if (Object.entries(apiErrors).some(([key, message]) => message && (key === "migrationCommand" || /\.(internalPort|healthProbe)$/.test(key)))) setAdvancedOpen(true);
+    if (error || hasFieldErrors) {
+      const timer = window.setTimeout(() => errorSummary.current?.focus(), 0);
+      return () => window.clearTimeout(timer);
+    }
   }, [apiErrorSignature, error]);
 
   const updateSetup = (updater: (current: DeploymentSetupInput) => DeploymentSetupInput, errorKey?: string) => {
@@ -303,10 +321,18 @@ export function DeploymentPlanReview({
   };
   const addComponent = (technology: Technology) => {
     const id = `component-${componentSequence}`;
+    componentFocus.current = fieldId(draft.components.length, "technology");
     setComponentSequence((current) => current + 1);
     updateSetup((current) => ({ ...current, components: [...current.components, defaultComponent(id, technology)] }));
   };
-  const removeComponent = (index: number) => updateSetup((current) => ({ ...current, components: current.components.filter((_, itemIndex) => itemIndex !== index) }));
+  const removeComponent = (index: number) => {
+    const next = { ...draft, components: draft.components.filter((_, itemIndex) => itemIndex !== index) };
+    componentFocus.current = fieldId(Math.min(index, next.components.length - 1), "technology");
+    updateSetup(() => next);
+    setErrors(validate(next));
+    // Indexed server errors describe the old component order and must be reviewed again.
+    setDismissedAPIErrorKeys(new Set([...Object.keys(serverErrors), ...Object.keys(normalizedFieldErrors(apiErrors, next.components))]));
+  };
   const resetDetected = () => {
     if (!detectedSetup) return;
     setDraft(copySetup(detectedSetup));
@@ -341,7 +367,11 @@ export function DeploymentPlanReview({
       <span>{(!errorDismissed && error) || "Check the highlighted deployment settings."}</span>
       {Object.values(visibleErrors).some(Boolean) && <ul>{Object.entries(visibleErrors).filter(([, message]) => Boolean(message)).map(([key, message]) => {
         const target = errorTarget(key, draft.components);
-        return <li key={key}><a href={`#${target.id}`}>{target.label}: {message}</a></li>;
+        return <li key={key}><a href={`#${target.id}`} onClick={(event) => {
+          event.preventDefault();
+          if (key === "migrationCommand" || /\.(internalPort|healthProbe)$/.test(key)) setAdvancedOpen(true);
+          window.setTimeout(() => document.getElementById(target.id)?.focus(), 0);
+        }}>{target.label}: {message}</a></li>;
       })}</ul>}
       {!errorDismissed && error && <button className="button small" type="button" disabled={pending} onClick={submit}>Retry review</button>}
     </div>}
@@ -354,7 +384,7 @@ export function DeploymentPlanReview({
     </fieldset>}
     {inspection && candidates.length === 0 && <div className="callout info" role="status"><strong>No supported setup was detected</strong><span>Enter the commands and paths Rig should review. Empty install and build commands explicitly skip those steps.</span></div>}
     {inspection?.analysis.findings.length ? <div className="callout warning" role="status"><strong>Detection findings</strong>{inspection.analysis.findings.map((finding, index) => <span key={`${finding.code}:${index}`}>{finding.message}</span>)}</div> : null}
-    <div className="deployment-setup-actions" id="deployment-setup-components">
+    <div className="deployment-setup-actions" id="deployment-setup-components" tabIndex={-1}>
       <div><strong>Application components</strong><span>Use one server, one static site, or a static site and server together.</span></div>
       <div><button className="button small" type="button" disabled={pending || draft.components.some((component) => component.technology !== "static")} onClick={() => addComponent("node")}>Add server</button><button className="button small" type="button" disabled={pending || draft.components.some((component) => component.technology === "static")} onClick={() => addComponent("static")}>Add static site</button></div>
     </div>
@@ -367,7 +397,8 @@ export function DeploymentPlanReview({
       <div className="advanced-settings-content">
         <div className="field">
           <label htmlFor="deployment-setup-migration-command">Migration command <span className="field-optional">(optional)</span></label>
-          <input className="command-input" id="deployment-setup-migration-command" value={draft.migrationCommand ?? ""} disabled={pending} onChange={(event) => updateSetup((current) => ({ ...current, ...(event.target.value ? { migrationCommand: event.target.value } : { migrationCommand: undefined }) }))} />
+          <input className="command-input" id="deployment-setup-migration-command" value={draft.migrationCommand ?? ""} disabled={pending} aria-invalid={Boolean(visibleErrors.migrationCommand)} aria-describedby={visibleErrors.migrationCommand ? "deployment-setup-migration-command-error" : undefined} onChange={(event) => updateSetup((current) => ({ ...current, ...(event.target.value ? { migrationCommand: event.target.value } : { migrationCommand: undefined }) }), "migrationCommand")} />
+          {visibleErrors.migrationCommand && <p id="deployment-setup-migration-command-error" className="form-error">{visibleErrors.migrationCommand}</p>}
           <small>Rig runs an accepted migration before new containers start. Approval remains a separate action.</small>
         </div>
         {draft.components.map((component, index) => <ComponentAdvanced key={component.id} component={component} index={index} errors={visibleErrors} pending={pending} onChange={updateComponent} />)}

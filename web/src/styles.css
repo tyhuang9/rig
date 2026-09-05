@@ -199,8 +199,9 @@ button:disabled { cursor: wait; opacity: .62; }
 .plan-review, .plan-ready { min-width: 0; max-width: 800px; }
 .plan-review > p, .plan-ready > p { margin: 0 0 20px; color: #4e5561; font-size: 12px; }
 .component-plans { display: grid; gap: 14px; }
-.component-plan { padding: 16px; border: 1px solid #dfe3e8; border-radius: 10px; background: #fbfcfd; }
+.component-plan { min-width: 0; padding: 16px; border: 1px solid #dfe3e8; border-radius: 10px; background: #fbfcfd; }
 .component-plan header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.component-plan header > div { min-width: 0; overflow-wrap: anywhere; }
 .component-plan h3 { margin: 0; font-size: 15px; }
 .component-plan header p { margin: 3px 0 0; color: #69717d; font-size: 12px; }
 .component-plan .field { max-width: none; }
@@ -470,6 +471,12 @@ button:disabled { cursor: wait; opacity: .62; }
 }
 
 @media (max-width: 560px) {
+  .component-plan header { align-items: stretch; flex-direction: column; }
+  .deployment-setup-panel { padding: 16px 14px; }
+  .deployment-setup-actions { align-items: stretch; flex-direction: column; }
+  .deployment-setup-actions > div:last-child { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .deployment-setup-actions .button { width: 100%; }
+  .component-setup-grid { grid-template-columns: minmax(0, 1fr); }
   .shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; }
   .rail { position: static; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; min-height: 0; height: auto; padding: 10px 12px; }
   .wordmark { padding: 0; }
@@ -544,13 +551,7 @@ button:disabled { cursor: wait; opacity: .62; }
   .field input, .field select { height: 44px; }
   .wizard footer { flex-direction: column-reverse; }
   .wizard footer .button { width: 100%; }
-    .component-plan header { align-items: stretch; flex-direction: column; }
-    .deployment-setup-panel { padding: 16px 14px; overflow: hidden; }
-    .deployment-setup-actions { align-items: stretch; flex-direction: column; }
-    .deployment-setup-actions > div:last-child { display: grid; grid-template-columns: minmax(0, 1fr); }
-    .deployment-setup-actions .button { width: 100%; }
-    .component-setup-grid { grid-template-columns: minmax(0, 1fr); }
-    .managed-command { min-height: 44px; flex-wrap: wrap; }
+  .managed-command { min-height: 44px; flex-wrap: wrap; }
 }
 
 @media (prefers-reduced-motion: reduce) {

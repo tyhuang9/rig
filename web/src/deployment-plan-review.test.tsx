@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DeploymentPlanCandidate, DeploymentPlanRevision, InspectResponse } from "./api";
-import { DeploymentPlanReview, deploymentPlanRequest, deploymentSetupFromRevision } from "./deployment-plan-review";
+import { DeploymentPlanReview, deploymentPlanRequest, deploymentSetupFromCandidate, deploymentSetupFromRevision } from "./deployment-plan-review";
 
 const evidence = [{ code: "package_script", path: "package.json", field: "scripts.start" }];
 
@@ -87,7 +87,7 @@ describe("DeploymentPlanReview", () => {
     fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
     const setup = onAnalyze.mock.calls[0][0];
     const reviewed = candidate({ id: "user:deployment-setup", origin: "user", digest: "d".repeat(64) });
-    view.rerender(<DeploymentPlanReview inspection={inspection([reviewed])} expectedRevisionNumber={4} pending={false} error="" reviewedSetup={setup} onAnalyze={onAnalyze} onAccept={onAccept} />);
+    view.rerender(<DeploymentPlanReview inspection={inspection([candidate(), reviewed])} expectedRevisionNumber={4} pending={false} error="" reviewedSetup={setup} onAnalyze={onAnalyze} onAccept={onAccept} />);
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Accept setup" })).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
@@ -170,6 +170,21 @@ describe("DeploymentPlanReview", () => {
     expect(request).not.toHaveProperty("components");
   });
 
+  it("preserves saved explicit settings when review also returns different detected suggestions", async () => {
+    const setup = deploymentSetupFromCandidate(candidate());
+    setup.components[0].startCommand = "node saved.js";
+    const onAnalyze = vi.fn();
+    const onAccept = vi.fn();
+    const view = render(<DeploymentPlanReview initialSetup={setup} expectedRevisionNumber={3} pending={false} error="" onAnalyze={onAnalyze} onAccept={onAccept} />);
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    const reviewed = candidate({ id: "user:deployment-setup", origin: "user" });
+    view.rerender(<DeploymentPlanReview initialSetup={setup} inspection={inspection([candidate(), reviewed])} expectedRevisionNumber={3} pending={false} error="" reviewedSetup={setup} onAnalyze={onAnalyze} onAccept={onAccept} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Accept setup" })).toBeTruthy());
+    expect((screen.getByLabelText("Start command") as HTMLInputElement).value).toBe("node saved.js");
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
+    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ setup, candidateId: "user:deployment-setup" }));
+  });
+
   it("uses static setup defaults only for a newly added static site and limits the layout", () => {
     renderReview();
     fireEvent.click(screen.getByRole("button", { name: "Add static site" }));
@@ -217,5 +232,53 @@ describe("DeploymentPlanReview", () => {
     expect(input.getAttribute("aria-invalid")).toBe("true");
     expect(input.getAttribute("aria-describedby")).toBe("deployment-setup-0-installCommand-error");
     expect(screen.getByRole("link", { name: /install command/i }).getAttribute("href")).toBe("#deployment-setup-0-installCommand");
+  });
+
+  it("reveals migration API errors, focuses their summary, and clears them when edited", async () => {
+    const props = { inspection: inspection([candidate()]), expectedRevisionNumber: 0, onAnalyze: vi.fn(), onAccept: vi.fn() };
+    const view = render(<DeploymentPlanReview {...props} pending error="" />);
+    view.rerender(<DeploymentPlanReview {...props} pending={false} error="Check the migration." apiErrors={{ migrationCommand: "Choose the detected migration command." }} />);
+    const input = screen.getByLabelText("Migration command (optional)");
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("alert")));
+    expect(input.closest("details")?.open).toBe(true);
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(document.getElementById(input.getAttribute("aria-describedby")!)?.textContent).toBe("Choose the detected migration command.");
+    const link = screen.getByRole("link", { name: /migration command: choose/i });
+    expect(link.getAttribute("href")).toBe("#deployment-setup-migration-command");
+    fireEvent.click(link);
+    await waitFor(() => expect(document.activeElement).toBe(input));
+    fireEvent.change(input, { target: { value: "npm run migrate" } });
+    expect(input.getAttribute("aria-invalid")).toBe("false");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("opens advanced server errors and reopens their field when an error link is followed", async () => {
+    render(<DeploymentPlanReview inspection={inspection([candidate()])} expectedRevisionNumber={0} pending={false} error="" apiErrors={{ "components.0.healthProbe": "Use a normalized path." }} onAnalyze={vi.fn()} onAccept={vi.fn()} />);
+    const input = screen.getByLabelText("Health-check path");
+    const details = input.closest("details")!;
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("alert")));
+    expect(details.open).toBe(true);
+    details.open = false;
+    fireEvent(details, new Event("toggle"));
+    fireEvent.click(screen.getByRole("link", { name: /health-check path: use/i }));
+    await waitFor(() => expect(document.activeElement).toBe(input));
+    expect(details.open).toBe(true);
+  });
+
+  it("moves focus to added and surviving component controls and drops removed field errors", async () => {
+    renderReview();
+    const add = screen.getByRole("button", { name: "Add static site" });
+    add.focus();
+    fireEvent.click(add);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getAllByLabelText("Technology")[1]));
+    fireEvent.change(screen.getByLabelText("Start command"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("alert")));
+    const remove = screen.getAllByRole("button", { name: "Remove component" })[0];
+    remove.focus();
+    fireEvent.click(remove);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText("Technology")));
+    expect((screen.getByLabelText("Technology") as HTMLSelectElement).value).toBe("static");
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });

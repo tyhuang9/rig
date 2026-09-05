@@ -14,6 +14,7 @@ let daemon: ChildProcessWithoutNullStreams;
 let dataRoot = "";
 let sourceRoot = "";
 let composeSourceRoot = "";
+let manualSourceRoot = "";
 let baseURL = "";
 let bootstrapToken = "";
 let bootstrapTokenFile = "";
@@ -34,6 +35,8 @@ test.beforeAll(async () => {
   dataRoot = await mkdtemp(path.join(tmpdir(), "hostd-e2e-"));
   sourceRoot = await mkdtemp(path.join(tmpdir(), "hostd-e2e-source-"));
   composeSourceRoot = await mkdtemp(path.join(tmpdir(), "hostd-e2e-compose-source-"));
+  manualSourceRoot = await mkdtemp(path.join(tmpdir(), "hostd-e2e-manual-source-"));
+  await writeFile(path.join(manualSourceRoot, "server.js"), "console.log('manual source fixture');\n", "utf8");
   await writeFile(path.join(sourceRoot, "package.json"), JSON.stringify({
     name: "hostd-e2e-fixture",
     packageManager: "npm@11",
@@ -88,6 +91,7 @@ test.afterAll(async () => {
   if (dataRoot) await rm(dataRoot, { recursive: true, force: true });
   if (sourceRoot) await rm(sourceRoot, { recursive: true, force: true });
   if (composeSourceRoot) await rm(composeSourceRoot, { recursive: true, force: true });
+  if (manualSourceRoot) await rm(manualSourceRoot, { recursive: true, force: true });
 });
 
 test("bootstraps, restores a fresh tab, cancels work, and stays responsive", async ({ page, context }) => {
@@ -159,6 +163,48 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
   await expect(restoredPage.getByText("Development capability")).toBeVisible();
   await expect(restoredPage.getByRole("button", { name: "Deploy latest" })).toBeDisabled();
   await expect(restoredPage.getByText("Deploy latest requires the generated runtime on this controller.")).toBeVisible();
+
+  await restoredPage.getByRole("link", { name: "Applications" }).click();
+  await restoredPage.getByRole("link", { name: "Add application" }).first().click();
+  await restoredPage.getByLabel("Application name").fill("Manual settings fixture");
+  await restoredPage.getByLabel("Local source path").fill(manualSourceRoot);
+  await restoredPage.getByRole("button", { name: "Analyze project" }).click();
+  await expect(restoredPage.getByRole("heading", { name: "How Rig will run this app" })).toBeFocused();
+  const originalViewport = restoredPage.viewportSize();
+  await restoredPage.setViewportSize({ width: 320, height: 800 });
+  await restoredPage.getByLabel("Root directory", { exact: true }).fill("apps/thisisaverylongunbrokendirectorynamethatmustwrapwithinthevisiblesetupcard");
+  const setupCard = restoredPage.locator(".component-plan");
+  await expect.poll(async () => {
+    const bounds = await setupCard.boundingBox();
+    return Boolean(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 320);
+  }).toBe(true);
+  for (const control of await setupCard.locator("input, select").all()) {
+    const bounds = await control.boundingBox();
+    expect(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 320).toBe(true);
+  }
+  await restoredPage.getByLabel("Root directory", { exact: true }).fill(".");
+  if (originalViewport) await restoredPage.setViewportSize(originalViewport);
+  await expect(restoredPage.getByLabel("Start command", { exact: true })).toHaveAttribute("aria-invalid", "true");
+  await restoredPage.getByRole("link", { name: /Start command:/ }).click();
+  await expect(restoredPage.getByLabel("Start command", { exact: true })).toBeFocused();
+  await restoredPage.getByLabel("Start command", { exact: true }).fill("node server.js");
+  await restoredPage.getByText("Advanced settings", { exact: true }).click();
+  await restoredPage.getByLabel("Internal port", { exact: true }).fill("3001");
+  await restoredPage.getByRole("button", { name: "Review setup", exact: true }).click();
+  await restoredPage.getByRole("button", { name: "Accept setup", exact: true }).click();
+  await expect(restoredPage.getByRole("heading", { name: "Setup accepted" })).toBeFocused();
+  await restoredPage.getByRole("button", { name: "Open application" }).click();
+  await expect(restoredPage.getByLabel("Start command", { exact: true })).toHaveValue("node server.js");
+  await restoredPage.getByLabel("Start command", { exact: true }).fill("node --enable-source-maps server.js");
+  await restoredPage.getByRole("button", { name: "Review setup", exact: true }).click();
+  await restoredPage.getByRole("button", { name: "Accept setup", exact: true }).click();
+  await expect(restoredPage.getByText("Deployment setup revision 2 accepted.", { exact: true })).toBeAttached();
+  await restoredPage.reload();
+  await expect(restoredPage.getByLabel("Start command", { exact: true })).toHaveValue("node --enable-source-maps server.js");
+  await restoredPage.getByText("Advanced settings", { exact: true }).click();
+  await expect(restoredPage.getByLabel("Internal port", { exact: true })).toHaveValue("3001");
+  await expect(restoredPage.getByLabel("Install command", { exact: false })).toHaveValue("");
+  await expect(restoredPage.getByLabel("Build command", { exact: false })).toHaveValue("");
 
   await restoredPage.getByRole("link", { name: "Applications" }).click();
   await restoredPage.getByRole("link", { name: "Add application" }).first().click();
