@@ -274,10 +274,10 @@ func createAndStartLiveCandidate(t *testing.T, ctx context.Context, engine *gene
 	t.Helper()
 	candidate, err := engine.CreateInactiveCandidate(ctx, spec)
 	if err != nil {
-		t.Fatal("create candidate")
+		t.Fatalf("create candidate: runtime=%s", liveRuntimeDiagnostic(err))
 	}
 	if err := engine.StartCandidate(ctx, candidate); err != nil {
-		t.Fatal("start candidate")
+		t.Fatalf("start candidate: runtime=%s", liveRuntimeDiagnostic(err))
 	}
 	return candidate
 }
@@ -286,7 +286,7 @@ func startLiveCandidate(t *testing.T, ctx context.Context, engine *generatedrunt
 	t.Helper()
 	candidate := createAndStartLiveCandidate(t, ctx, engine, spec)
 	if err := engine.WaitHealthy(ctx, candidate); err != nil {
-		t.Fatal("wait for candidate")
+		t.Fatalf("wait for candidate: runtime=%s", liveRuntimeDiagnostic(err))
 	}
 	return candidate
 }
@@ -429,6 +429,44 @@ func failLiveIngress(t *testing.T, phase string, err error) {
 		t.Fatalf("%s: ingress=%s", phase, diagnostic.Code)
 	}
 	t.Fatalf("%s: ingress=unclassified", phase)
+}
+
+func liveRuntimeDiagnostic(err error) string {
+	var diagnostic *generatedruntime.Error
+	if !errors.As(err, &diagnostic) || diagnostic == nil {
+		return "unclassified"
+	}
+	switch diagnostic.Code {
+	case generatedruntime.DiagnosticValidationFailed, generatedruntime.DiagnosticRuntimeUnavailable,
+		generatedruntime.DiagnosticRuntimeTimeout, generatedruntime.DiagnosticProcessTerminationFailed,
+		generatedruntime.DiagnosticRuntimeOutputTruncated, generatedruntime.DiagnosticImageUnavailable,
+		generatedruntime.DiagnosticImageDriftDetected, generatedruntime.DiagnosticNetworkDriftDetected,
+		generatedruntime.DiagnosticNetworkProvisionFailed, generatedruntime.DiagnosticCandidateSlotOccupied,
+		generatedruntime.DiagnosticCandidateCreateFailed, generatedruntime.DiagnosticCandidateStartFailed,
+		generatedruntime.DiagnosticCandidateHardeningFailed, generatedruntime.DiagnosticCandidateUnhealthy,
+		generatedruntime.DiagnosticCandidateExited, generatedruntime.DiagnosticCandidateCleanupFailed,
+		generatedruntime.DiagnosticInsufficientReplacementSpace, generatedruntime.DiagnosticConfigurationUnavailable,
+		generatedruntime.DiagnosticInternalError, generatedruntime.DiagnosticCancelled:
+		return string(diagnostic.Code)
+	default:
+		return "unclassified"
+	}
+}
+
+func TestLiveRuntimeDiagnosticOmitsRawAndUnknownErrors(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf("sensitive output: %w", &generatedruntime.Error{Code: generatedruntime.DiagnosticCandidateHardeningFailed}), "candidate_hardening_failed"},
+		{&generatedruntime.Error{Code: "sensitive_command"}, "unclassified"},
+		{errors.New("sensitive output"), "unclassified"},
+		{nil, "unclassified"},
+	} {
+		if got := liveRuntimeDiagnostic(test.err); got != test.want {
+			t.Fatal("runtime diagnostic disclosed raw or unknown text")
+		}
+	}
 }
 
 func TestLiveHTTPDiagnosticIsRedacted(t *testing.T) {

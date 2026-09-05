@@ -132,12 +132,13 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 	}
 	releaseReader := &compilerReleaseReader{release: release}
 	artifacts := &compilerArtifactWriter{}
+	builderObservation := &liveGeneratedImageBuilderObservation{delegate: builder, status: "not_attempted"}
 	compiler, err := NewCompiler(
 		releaseReader,
 		compilerPlanReader{revision: revision},
 		artifacts,
 		temporary,
-		builder,
+		builderObservation,
 		runner,
 		CompilerOptions{BuildTimeout: 6 * time.Minute},
 	)
@@ -146,7 +147,7 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 	}
 	artifact, err := compiler.Compile(liveContext, appID, releaseID, "app")
 	if err != nil {
-		t.Fatalf("live generated image production compile failed: diagnostic=%s", liveGeneratedImageFailureCode(err))
+		t.Fatalf("live generated image production compile failed: diagnostic=%s,builder_status=%s", liveGeneratedImageFailureCode(err), builderObservation.status)
 	}
 	if artifact.State != ArtifactReady || !validImageContentID(artifact.ImageContentID) || artifacts.failed != "" {
 		t.Fatal("live generated image production compile returned an invalid artifact")
@@ -162,6 +163,25 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 	if !liveImageExcludesCommands(liveContext, runner, dockerExecutable, builder.directory.Root(), dockerEnvironment, artifact.ImageContentID, installCommand, buildCommand) {
 		t.Fatal("live generated image persisted command material")
 	}
+}
+
+type liveGeneratedImageBuilderObservation struct {
+	delegate builderPreparer
+	status   string
+}
+
+func (observation *liveGeneratedImageBuilderObservation) Prepare(ctx context.Context) (BuilderSession, error) {
+	session, err := observation.delegate.Prepare(ctx)
+	if err != nil {
+		observation.status = liveGeneratedImageFailureCode(err)
+		return BuilderSession{}, err
+	}
+	if !validBuilderSession(session) {
+		observation.status = "invalid_session"
+		return session, nil
+	}
+	observation.status = "ready"
+	return session, nil
 }
 
 func liveGeneratedImageFailureCode(err error) string {
@@ -201,6 +221,36 @@ func TestLiveGeneratedImageFailureCodeIsTypedAndRedacted(t *testing.T) {
 		if got := liveGeneratedImageFailureCode(test.err); got != test.want {
 			t.Fatalf("live generated image diagnostic = %q, want %q", got, test.want)
 		}
+	}
+}
+
+func TestLiveGeneratedImageBuilderObservationUsesOnlyFixedStatus(t *testing.T) {
+	validSession := BuilderSession{
+		DockerExecutable: filepath.Join(t.TempDir(), "docker"),
+		BuilderName:      "rig-buildkit-0123456789abcdef01234567",
+		environment: []string{
+			"BUILDX_CONFIG=" + filepath.Join(t.TempDir(), "buildx"),
+			"DOCKER_CONFIG=" + filepath.Join(t.TempDir(), "docker"),
+		},
+		storageQuotaBytes: defaultStateQuotaBytes,
+	}
+	for _, test := range []struct {
+		name    string
+		builder *compilerBuilder
+		want    string
+	}{
+		{"ready", &compilerBuilder{session: validSession}, "ready"},
+		{"invalid session", &compilerBuilder{session: BuilderSession{}}, "invalid_session"},
+		{"typed failure", &compilerBuilder{err: &BuilderError{Code: BuilderDriftDetected}}, "builder_drift_detected"},
+		{"raw failure", &compilerBuilder{err: errors.New("sensitive raw builder error")}, "unclassified"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			observation := &liveGeneratedImageBuilderObservation{delegate: test.builder, status: "not_attempted"}
+			_, _ = observation.Prepare(context.Background())
+			if observation.status != test.want || !validLiveGeneratedImageDiagnostic(observation.status) {
+				t.Fatalf("builder observation = %q, want %q", observation.status, test.want)
+			}
+		})
 	}
 }
 
