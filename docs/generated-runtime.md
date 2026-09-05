@@ -58,7 +58,7 @@ An accepted deployment-plan revision records the strategy, detector version, str
 
 Bundle protection uses DPAPI and restrictive ACLs on Windows. On POSIX it uses purpose binding and `0600` files in `0700` directories, not encryption at rest; it does not protect against root or another process running as the controller user.
 
-The protected deployment bundle format is now version 4. Existing version 1, 2, and 3 revisions remain readable and their release pins remain valid, but a downgraded controller cannot read a version 4 revision. Before accepting the first edited setup on an existing controller, retain a backup of both the controller database and its protected data root; restore them together if a rollback to older controller software is required.
+The protected deployment bundle format is now version 3. Existing version 1 and 2 revisions remain readable and their release pins remain valid, but a downgraded controller cannot read a version 3 revision. Before accepting the first edited setup on an existing controller, retain a backup of both the controller database and its protected data root; restore them together if a rollback to older controller software is required.
 
 Every release pins both its configuration revision and deployment-plan revision. Redeploying an older release uses those original pins even after a newer plan is accepted.
 
