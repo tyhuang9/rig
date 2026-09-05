@@ -49,11 +49,12 @@ const (
 // without retaining IDs or Docker output. It stores only fixed booleans and
 // fixed diagnostic reasons.
 type liveCreateObserver struct {
-	delegate runtimeprocess.CommandRunner
-	random   io.Reader
-	mu       sync.Mutex
-	latest   liveCreateObservation
-	pending  livePendingStart
+	delegate        runtimeprocess.CommandRunner
+	random          io.Reader
+	mu              sync.Mutex
+	latest          liveCreateObservation
+	pending         livePendingStart
+	caddyValidation string
 }
 
 type liveCreateObservation struct {
@@ -215,6 +216,21 @@ type liveRawNetworkSettings struct {
 
 func (observer *liveCreateObserver) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
 	result, err := observer.delegate.Run(ctx, request)
+	if len(request.Args) == 7 && request.Args[0] == "container" && request.Args[1] == "exec" && request.Args[2] == caddyContainerName && request.Args[3] == "caddy" && request.Args[4] == "validate" && request.Args[5] == "--config" && strings.HasPrefix(request.Args[6], "/config/") && validConfigFilename(strings.TrimPrefix(request.Args[6], "/config/")) {
+		diagnostic := "success"
+		if result.StdoutTruncated || result.StderrTruncated {
+			diagnostic = "truncated"
+		} else if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, runtimeprocess.ErrTerminationFailed) {
+			diagnostic = "interrupted"
+		} else if err != nil {
+			diagnostic = "stdout:" + liveCaddyStartupMarkers(result.Stdout) + ",stderr:" + liveCaddyStartupMarkers(result.Stderr)
+		}
+		observer.mu.Lock()
+		if observer.caddyValidation == "" || observer.caddyValidation == "success" {
+			observer.caddyValidation = diagnostic
+		}
+		observer.mu.Unlock()
+	}
 	if liveContainerStart(request.Args) {
 		observer.observeStartResult(ctx, request, result, err)
 		return result, err
@@ -832,8 +848,54 @@ func liveCreateTaskMarkerNames(markers uint32) string {
 func (observer *liveCreateObserver) reset() {
 	observer.mu.Lock()
 	observer.latest = liveCreateObservation{}
+	observer.caddyValidation = ""
 	observer.clearPendingStartLocked()
 	observer.mu.Unlock()
+}
+
+func (observer *liveCreateObserver) caddyValidationDiagnostic() string {
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	if observer.caddyValidation == "" {
+		return "validate_observation=not_attempted"
+	}
+	return "validate_observation=" + observer.caddyValidation
+}
+
+func TestLiveCaddyValidationObservationIsExactAndRedacted(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		err    error
+		result runtimeprocess.CommandResult
+		want   string
+	}{
+		{"success", nil, runtimeprocess.CommandResult{}, "success"},
+		{"failure", errors.New("private error"), runtimeprocess.CommandResult{Stderr: []byte("permission denied private-canary")}, "stdout:none,stderr:permission_denied"},
+		{"truncation", errors.New("private error"), runtimeprocess.CommandResult{Stderr: []byte("permission denied private-canary"), StderrTruncated: true}, "truncated"},
+		{"canceled", context.Canceled, runtimeprocess.CommandResult{Stderr: []byte("permission denied private-canary")}, "interrupted"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			delegate := &caddyNetworkInspectRunner{result: test.result, err: test.err}
+			observer := &liveCreateObserver{delegate: delegate}
+			request := runtimeprocess.CommandRequest{Args: []string{"container", "exec", "foreign", "caddy", "validate", "--config", "/config/recovery.json"}}
+			_, _ = observer.Run(context.Background(), request)
+			if observer.caddyValidationDiagnostic() != "validate_observation=not_attempted" {
+				t.Fatal("foreign command was observed")
+			}
+			request.Args[2] = caddyContainerName
+			returned, _ := observer.Run(context.Background(), request)
+			if got := observer.caddyValidationDiagnostic(); got != "validate_observation="+test.want || strings.Contains(got, "private") {
+				t.Fatalf("diagnostic = %q", got)
+			}
+			if !bytes.Equal(returned.Stderr, test.result.Stderr) || len(delegate.requests) != 2 {
+				t.Fatal("observer modified borrowed output or issued extra commands")
+			}
+			observer.reset()
+			if observer.caddyValidationDiagnostic() != "validate_observation=not_attempted" {
+				t.Fatal("reset retained validation observation")
+			}
+		})
+	}
 }
 
 func (observer *liveCreateObserver) failureDiagnostic() string {
@@ -969,7 +1031,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 		AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(blue)},
 	}
 	if err := ingress.Switch(ctx, blueRoute); err != nil {
-		t.Fatalf("route first slot: %v %s %s", err, liveIngressFailureDiagnostic(ctx, ingress), liveIngressRouteFailureDiagnostic(ctx, ingress, blueRoute))
+		t.Fatalf("route first slot: %v %s %s %s", err, runner.caddyValidationDiagnostic(), liveIngressFailureDiagnostic(ctx, ingress), liveIngressRouteFailureDiagnostic(ctx, ingress, blueRoute))
 	}
 	assertLiveResponse(t, hostPort, appID, "blue")
 	engine.ReleaseAdmission(blue)
@@ -987,7 +1049,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 		Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(green)}, DrainPeriod: 100 * time.Millisecond,
 	}
 	if err := ingress.Switch(ctx, greenRoute); err != nil {
-		t.Fatalf("switch to replacement slot: %v %s %s", err, liveIngressFailureDiagnostic(ctx, ingress), liveIngressRouteFailureDiagnostic(ctx, ingress, greenRoute))
+		t.Fatalf("switch to replacement slot: %v %s %s %s", err, runner.caddyValidationDiagnostic(), liveIngressFailureDiagnostic(ctx, ingress), liveIngressRouteFailureDiagnostic(ctx, ingress, greenRoute))
 	}
 	assertLiveResponse(t, hostPort, appID, "green")
 	if err := engine.StopAndRemove(ctx, blue, time.Second); err != nil {

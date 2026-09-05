@@ -453,6 +453,11 @@ func liveCaddyStartupMarkers(value []byte) string {
 		{"read_only", [][]byte{[]byte("read-only file system"), []byte("read only file system")}},
 		{"permission_denied", [][]byte{[]byte("permission denied")}},
 		{"load_failed", [][]byte{[]byte("loading initial config"), []byte("loading new config"), []byte("adapting config"), []byte("cannot unmarshal"), []byte("invalid character")}},
+		{"address_unavailable", [][]byte{[]byte("cannot assign requested address")}},
+		{"json_decode", [][]byte{[]byte("unexpected end of json"), []byte("decoding config")}},
+		{"unknown_module_or_field", [][]byte{[]byte("module not registered"), []byte("unknown field")}},
+		{"executable_missing", [][]byte{[]byte("executable file not found"), []byte("executable not found")}},
+		{"container_not_running", [][]byte{[]byte("is not running"), []byte("is restarting")}},
 	}
 	found := make([]bool, len(markers))
 	for _, line := range bytes.Split(lower, []byte{'\n'}) {
