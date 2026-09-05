@@ -31,9 +31,12 @@ const (
 	testArtifactID2  = "99999999-9999-4999-8999-999999999999"
 )
 
-type fakeApplications struct{ app apps.Application }
+type fakeApplications struct {
+	app apps.Application
+	err error
+}
 
-func (f *fakeApplications) Get(string) (apps.Application, error) { return f.app, nil }
+func (f *fakeApplications) Get(string) (apps.Application, error) { return f.app, f.err }
 
 type fakeReleases struct{ release releasesnapshot.Release }
 
@@ -63,12 +66,20 @@ func (f *fakeConfiguration) export() appconfig.ExecutionConfiguration {
 	return appconfig.ExecutionConfiguration{RevisionID: testConfigID, RevisionNumber: 3, Environment: append([]byte(nil), f.value...)}
 }
 
-type fakeDeployments struct{ deployment deployments.Deployment }
+type fakeDeployments struct {
+	deployment          deployments.Deployment
+	getErr              error
+	transitionErr       error
+	transitionErrStatus deployments.Status
+}
 
 func (f *fakeDeployments) GetOrCreateByJob(context.Context, string, string, string) (deployments.Deployment, bool, error) {
 	return f.deployment, false, nil
 }
 func (f *fakeDeployments) Get(context.Context, string, string) (deployments.Deployment, error) {
+	if f.getErr != nil {
+		return deployments.Deployment{}, f.getErr
+	}
 	return f.deployment, nil
 }
 func (f *fakeDeployments) InitializeRuntime(_ context.Context, _, _, releaseID, configurationID string, configurationNumber int64, strategy deployments.RuntimeStrategy, planID string, planNumber int64) (deployments.Deployment, error) {
@@ -82,6 +93,9 @@ func (f *fakeDeployments) InitializeRuntime(_ context.Context, _, _, releaseID, 
 	return f.deployment, nil
 }
 func (f *fakeDeployments) Transition(_ context.Context, _, _ string, status deployments.Status, diagnostic string) (deployments.Deployment, error) {
+	if f.transitionErr != nil && status == f.transitionErrStatus {
+		return deployments.Deployment{}, f.transitionErr
+	}
 	f.deployment.Status = status
 	f.deployment.DiagnosticCode = diagnostic
 	return f.deployment, nil
@@ -89,10 +103,11 @@ func (f *fakeDeployments) Transition(_ context.Context, _, _ string, status depl
 
 type fakePlans struct {
 	revision deploymentplans.DeploymentPlanRevision
+	err      error
 }
 
 func (f *fakePlans) GetRevision(context.Context, string, string, int64) (deploymentplans.DeploymentPlanRevision, error) {
-	return f.revision, nil
+	return f.revision, f.err
 }
 
 type fakeCompiler struct {
@@ -133,11 +148,15 @@ func (f *fakeArtifacts) MarkUnavailable(_ context.Context, id string) (generated
 
 type fakeRuntimeState struct {
 	deployment            generatedruntimestate.Deployment
+	previous              map[string]generatedruntimestate.Deployment
 	active                generatedruntimestate.ActiveHead
 	beginErr              error
 	migrationRequired     bool
 	switchCalls           int
+	failSwitchActive      bool
 	failAdvanceToDraining bool
+	advanceErrTo          generatedruntimestate.Phase
+	advanceErr            error
 }
 
 func (f *fakeRuntimeState) Begin(_ context.Context, input generatedruntimestate.BeginInput) (generatedruntimestate.Deployment, bool, error) {
@@ -169,6 +188,9 @@ func (f *fakeRuntimeState) Get(_ context.Context, _, deploymentID string) (gener
 	if deploymentID == f.deployment.DeploymentID {
 		return f.deployment, nil
 	}
+	if previous, exists := f.previous[deploymentID]; exists {
+		return previous, nil
+	}
 	return generatedruntimestate.Deployment{}, generatedruntimestate.ErrNotFound
 }
 func (f *fakeRuntimeState) Active(context.Context, string) (generatedruntimestate.ActiveHead, error) {
@@ -177,6 +199,9 @@ func (f *fakeRuntimeState) Active(context.Context, string) (generatedruntimestat
 func (f *fakeRuntimeState) Advance(_ context.Context, _, _ string, _, next generatedruntimestate.Phase, diagnostic generatedruntimestate.DiagnosticCode) (generatedruntimestate.Deployment, error) {
 	if next == generatedruntimestate.PhaseDraining && f.failAdvanceToDraining {
 		return f.deployment, generatedruntimestate.ErrInvalidTransition
+	}
+	if next == f.advanceErrTo && f.advanceErr != nil {
+		return generatedruntimestate.Deployment{}, f.advanceErr
 	}
 	f.deployment.Phase = next
 	f.deployment.DiagnosticCode = diagnostic
@@ -209,18 +234,32 @@ func (f *fakeRuntimeState) SetContainerRunning(_ context.Context, _, _, name, co
 	return *component, nil
 }
 func (f *fakeRuntimeState) AdvanceComponent(_ context.Context, _, deploymentID, name string, _, next generatedruntimestate.ComponentState) (generatedruntimestate.Component, error) {
-	if deploymentID != f.deployment.DeploymentID {
+	if deploymentID == f.deployment.DeploymentID {
+		component := f.component(name)
+		component.State = next
+		return *component, nil
+	}
+	previous, exists := f.previous[deploymentID]
+	if !exists {
 		return generatedruntimestate.Component{}, generatedruntimestate.ErrNotFound
 	}
-	component := f.component(name)
-	component.State = next
-	return *component, nil
+	for index := range previous.Components {
+		if previous.Components[index].Name == name {
+			previous.Components[index].State = next
+			f.previous[deploymentID] = previous
+			return previous.Components[index], nil
+		}
+	}
+	return generatedruntimestate.Component{}, generatedruntimestate.ErrNotFound
 }
 func (f *fakeRuntimeState) FailComponent(context.Context, string, string, string, generatedruntimestate.ComponentState, generatedruntimestate.DiagnosticCode) (generatedruntimestate.Component, error) {
 	return generatedruntimestate.Component{}, nil
 }
 func (f *fakeRuntimeState) SwitchActive(context.Context, string, string, int64) (generatedruntimestate.ActiveHead, bool, error) {
 	f.switchCalls++
+	if f.failSwitchActive {
+		return generatedruntimestate.ActiveHead{}, false, generatedruntimestate.ErrConflict
+	}
 	f.active = generatedruntimestate.ActiveHead{AppID: testAppID, DeploymentID: testDeploymentID, ReleaseID: testReleaseID, Slot: "blue", Generation: f.active.Generation + 1}
 	for index := range f.deployment.Components {
 		f.deployment.Components[index].State = generatedruntimestate.ComponentActive
@@ -244,6 +283,7 @@ type fakeRuntime struct {
 	createdSpecs  []generatedruntime.CandidateSpec
 	adopted       int
 	stopped       int
+	stopErrs      []error
 }
 
 type fakeReplacementReservation struct{ releases int }
@@ -292,7 +332,11 @@ func (f *fakeRuntime) WaitHealthy(context.Context, generatedruntime.Candidate) e
 	return f.healthErr
 }
 func (f *fakeRuntime) StopAndRemove(context.Context, generatedruntime.Candidate, time.Duration) error {
+	call := f.stopped
 	f.stopped++
+	if call < len(f.stopErrs) {
+		return f.stopErrs[call]
+	}
 	return nil
 }
 func (f *fakeRuntime) ReleaseAdmission(generatedruntime.Candidate) {}
@@ -322,13 +366,24 @@ func (f *fakeAuthorization) Authorize(context.Context, AuthorizationRequest) (ge
 type fakeRoutes struct {
 	events   *[]string
 	requests []generatedruntime.RouteSwitchRequest
+	err      error
+	errs     []error
 }
 
 func (f *fakeRoutes) Switch(_ context.Context, request generatedruntime.RouteSwitchRequest) error {
 	*f.events = append(*f.events, "route")
+	call := len(f.requests)
 	f.requests = append(f.requests, request)
-	return nil
+	if call < len(f.errs) {
+		return f.errs[call]
+	}
+	return f.err
 }
+
+type candidateMayBeLiveRouteError struct{}
+
+func (candidateMayBeLiveRouteError) Error() string            { return "route outcome unresolved" }
+func (candidateMayBeLiveRouteError) CandidateMayBeLive() bool { return true }
 
 type fakeMigrations struct {
 	events   *[]string
@@ -402,6 +457,116 @@ func readyArtifact(id string) generatedimage.Artifact {
 func deploymentJob() jobs.Job {
 	input, _ := json.Marshal(jobs.DeploymentInput{ReleaseID: testReleaseID, ConfigurationMode: jobs.ConfigurationCurrent})
 	return jobs.Job{ID: testJobID, Type: "deploy", ResourceType: "application", ResourceID: testAppID, RequestedBy: testActorID, Attempt: 1, Input: input}
+}
+
+func requireExecutionErrorCode(t *testing.T, err error, code string) {
+	t.Helper()
+	var executionErr *jobs.ExecutionError
+	if !errors.As(err, &executionErr) || executionErr.Code != code {
+		t.Fatalf("execution error=%v want code=%q", err, code)
+	}
+}
+
+func TestGeneratedExecutorRepositoryFailuresPreserveDurableTerminalState(t *testing.T) {
+	tests := []struct {
+		name   string
+		inject func(*executorFixture)
+	}{
+		{
+			name: "runtime advance",
+			inject: func(fixture *executorFixture) {
+				fixture.state.advanceErrTo = generatedruntimestate.PhaseBuilding
+				fixture.state.advanceErr = errors.New("runtime state storage unavailable")
+			},
+		},
+		{
+			name: "deployment reload",
+			inject: func(fixture *executorFixture) {
+				fixture.deployments.getErr = errors.New("deployment storage unavailable")
+			},
+		},
+		{
+			name: "deployment waiting health transition",
+			inject: func(fixture *executorFixture) {
+				fixture.deployments.transitionErrStatus = deployments.WaitingHealth
+				fixture.deployments.transitionErr = errors.New("deployment transition storage unavailable")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, false)
+			test.inject(fixture)
+			_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+			requireExecutionErrorCode(t, err, "internal_error")
+			if fixture.state.deployment.Phase != generatedruntimestate.PhaseFailed {
+				t.Fatalf("runtime phase=%q want=%q", fixture.state.deployment.Phase, generatedruntimestate.PhaseFailed)
+			}
+			if fixture.deployments.deployment.Status != deployments.Failed || fixture.deployments.deployment.DiagnosticCode != "internal_error" {
+				t.Fatalf("deployment=%+v", fixture.deployments.deployment)
+			}
+		})
+	}
+}
+
+func TestGeneratedExecutorFinalAdvanceFailureRetainsRecoverableRuntimeState(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.state.advanceErrTo = generatedruntimestate.PhaseSucceeded
+	fixture.state.advanceErr = errors.New("runtime state storage unavailable")
+
+	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if fixture.state.deployment.Phase != generatedruntimestate.PhaseDraining {
+		t.Fatalf("runtime phase=%q want recoverable %q", fixture.state.deployment.Phase, generatedruntimestate.PhaseDraining)
+	}
+	if fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled {
+		t.Fatalf("deployment became terminal: %+v", fixture.deployments.deployment)
+	}
+
+	fixture.state.advanceErr = nil
+	fixture.authorization.err = ErrInsufficientReplacementCapacity
+	result, err = fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.CompletionCode != "deployment_completed" || fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded || fixture.deployments.deployment.Status != deployments.Succeeded {
+		t.Fatalf("retry result=%+v err=%v runtime=%+v deployment=%+v", result, err, fixture.state.deployment, fixture.deployments.deployment)
+	}
+	if fixture.authorization.calls != 1 {
+		t.Fatalf("draining retry requested replacement capacity: authorization calls=%d", fixture.authorization.calls)
+	}
+}
+
+func TestGeneratedExecutorDistinguishesPlanStorageAndValidationFailures(t *testing.T) {
+	t.Run("application repository error", func(t *testing.T) {
+		fixture := newExecutorFixture(t, false)
+		fixture.executor.applications = &fakeApplications{err: errors.New("application storage unavailable")}
+		_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+		requireExecutionErrorCode(t, err, "internal_error")
+	})
+
+	t.Run("repository error", func(t *testing.T) {
+		fixture := newExecutorFixture(t, false)
+		fixture.executor.plans = &fakePlans{err: errors.New("plan storage unavailable")}
+		_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+		requireExecutionErrorCode(t, err, "internal_error")
+	})
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*deploymentplans.DeploymentPlanRevision)
+	}{
+		{name: "mismatched provenance", mutate: func(plan *deploymentplans.DeploymentPlanRevision) { plan.AppID = testActorID }},
+		{name: "unsupported strategy", mutate: func(plan *deploymentplans.DeploymentPlanRevision) { plan.Plan.Strategy = "unsupported" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, false)
+			plan := fixture.plan
+			test.mutate(&plan)
+			fixture.executor.plans = &fakePlans{revision: plan}
+			_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+			requireExecutionErrorCode(t, err, "invalid_source")
+		})
+	}
 }
 
 func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen(t *testing.T) {
@@ -583,18 +748,207 @@ func TestGeneratedExecutorRecoveryAcquiresAndConsumesNewProcessReservation(t *te
 	}
 }
 
-func TestGeneratedExecutorNeverCleansNewSlotAfterActiveCAS(t *testing.T) {
+func TestGeneratedExecutorCleansCandidateWhenActiveCASRollbackSucceeds(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
-	fixture.state.failAdvanceToDraining = true
+	oldDeploymentID, oldContainerID := configurePreviousActive(t, fixture)
+	fixture.state.failSwitchActive = true
+	fixture.routes.errs = []error{nil, nil}
+
 	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
 	var executionErr *jobs.ExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "apply_failed" {
 		t.Fatalf("err=%v", err)
 	}
+	if fixture.runtime.stopped != 1 {
+		t.Fatalf("candidate cleanup calls=%d", fixture.runtime.stopped)
+	}
+	if fixture.state.active.DeploymentID != oldDeploymentID || fixture.state.active.Generation != 4 {
+		t.Fatalf("active head changed: %+v", fixture.state.active)
+	}
+	if fixture.state.deployment.Phase != generatedruntimestate.PhaseFailed || fixture.deployments.deployment.Status != deployments.Failed {
+		t.Fatalf("runtime=%+v deployment=%+v", fixture.state.deployment, fixture.deployments.deployment)
+	}
+	if len(fixture.routes.requests) != 2 || fixture.routes.requests[1].ToSlot != generatedruntime.SlotGreen || len(fixture.routes.requests[1].Endpoints) != 1 || fixture.routes.requests[1].Endpoints[0].ContainerID != oldContainerID {
+		t.Fatalf("route requests=%+v", fixture.routes.requests)
+	}
+}
+
+func TestGeneratedExecutorPreservesFirstSlotWhenActiveCASFails(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.state.failSwitchActive = true
+
+	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if fixture.runtime.stopped != 0 {
+		t.Fatalf("candidate cleanup calls=%d", fixture.runtime.stopped)
+	}
+	if fixture.state.active.DeploymentID != "" || fixture.state.active.Generation != 0 {
+		t.Fatalf("active head changed: %+v", fixture.state.active)
+	}
+	if fixture.state.deployment.Phase != generatedruntimestate.PhaseSwitchingRoute || fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled {
+		t.Fatalf("runtime=%+v deployment=%+v", fixture.state.deployment, fixture.deployments.deployment)
+	}
+	if len(fixture.routes.requests) != 1 || fixture.routes.requests[0].ToSlot != generatedruntime.SlotBlue {
+		t.Fatalf("route requests=%+v", fixture.routes.requests)
+	}
+}
+
+func TestGeneratedExecutorPreservesBothSlotsWhenActiveCASRollbackFails(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	oldDeploymentID, oldContainerID := configurePreviousActive(t, fixture)
+	fixture.state.failSwitchActive = true
+	fixture.routes.errs = []error{nil, errors.New("rollback route unavailable")}
+
+	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if fixture.runtime.stopped != 0 {
+		t.Fatalf("candidate cleanup calls=%d", fixture.runtime.stopped)
+	}
+	if fixture.state.active.DeploymentID != oldDeploymentID || fixture.state.active.Generation != 4 {
+		t.Fatalf("active head changed: %+v", fixture.state.active)
+	}
+	if fixture.state.deployment.Phase != generatedruntimestate.PhaseSwitchingRoute || fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled {
+		t.Fatalf("runtime=%+v deployment=%+v", fixture.state.deployment, fixture.deployments.deployment)
+	}
+	previous := fixture.state.previous[oldDeploymentID]
+	if len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentActive || previous.Components[0].ContainerID != oldContainerID {
+		t.Fatalf("previous slot was not preserved: %+v", previous)
+	}
+	if len(fixture.routes.requests) != 2 || fixture.routes.requests[1].ToSlot != generatedruntime.SlotGreen {
+		t.Fatalf("route requests=%+v", fixture.routes.requests)
+	}
+}
+
+func TestGeneratedExecutorNeverCleansNewSlotAfterActiveCAS(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.state.failAdvanceToDraining = true
+	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
 	if fixture.state.active.DeploymentID != testDeploymentID || fixture.runtime.stopped != 0 {
 		t.Fatalf("active=%+v candidate cleanup=%d", fixture.state.active, fixture.runtime.stopped)
 	}
 	if fixture.state.deployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
+		t.Fatalf("durable phase=%s", fixture.state.deployment.Phase)
+	}
+	if fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled {
+		t.Fatalf("main deployment became terminal: %+v", fixture.deployments.deployment)
+	}
+}
+
+func TestGeneratedExecutorReattestsRouteBeforeResumingAfterActiveCAS(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.state.failAdvanceToDraining = true
+
+	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired || len(fixture.routes.requests) != 1 {
+		t.Fatalf("first result=%+v err=%v routes=%+v", result, err, fixture.routes.requests)
+	}
+
+	fixture.state.failAdvanceToDraining = false
+	result, err = fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.CompletionCode != "deployment_completed" {
+		t.Fatalf("retry result=%+v err=%v", result, err)
+	}
+	if len(fixture.routes.requests) != 2 || fixture.routes.requests[1].ToSlot != generatedruntime.SlotBlue || fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded {
+		t.Fatalf("routes=%+v runtime=%+v", fixture.routes.requests, fixture.state.deployment)
+	}
+}
+
+func TestGeneratedExecutorDoesNotDrainWhenRouteReattestationFails(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.state.failAdvanceToDraining = true
+	fixture.routes.errs = []error{nil, errors.New("route reattestation unavailable")}
+
+	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("first result=%+v err=%v", result, err)
+	}
+	fixture.state.failAdvanceToDraining = false
+	result, err = fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("retry result=%+v err=%v", result, err)
+	}
+	if len(fixture.routes.requests) != 2 || fixture.runtime.stopped != 0 || fixture.state.deployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
+		t.Fatalf("routes=%+v stopped=%d runtime=%+v", fixture.routes.requests, fixture.runtime.stopped, fixture.state.deployment)
+	}
+}
+
+func TestGeneratedExecutorRetriesOldSlotCleanupWithoutTerminalizingDeployment(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	oldDeploymentID, _ := configurePreviousActive(t, fixture)
+	fixture.executor.waitDrain = func(context.Context, time.Duration) error { return nil }
+	fixture.runtime.stopErrs = []error{errors.New("old slot cleanup unavailable"), nil}
+
+	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if fixture.state.deployment.Phase != generatedruntimestate.PhaseDraining || fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled {
+		t.Fatalf("runtime=%+v deployment=%+v", fixture.state.deployment, fixture.deployments.deployment)
+	}
+	if previous := fixture.state.previous[oldDeploymentID]; len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentDraining {
+		t.Fatalf("previous slot=%+v", previous)
+	}
+
+	fixture.authorization.err = ErrInsufficientReplacementCapacity
+	result, err = fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.CompletionCode != "deployment_completed" || fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded || fixture.deployments.deployment.Status != deployments.Succeeded {
+		t.Fatalf("retry result=%+v err=%v runtime=%+v deployment=%+v", result, err, fixture.state.deployment, fixture.deployments.deployment)
+	}
+	if fixture.runtime.stopped != 2 {
+		t.Fatalf("cleanup attempts=%d", fixture.runtime.stopped)
+	}
+	if fixture.authorization.calls != 1 {
+		t.Fatalf("draining retry requested replacement capacity: authorization calls=%d", fixture.authorization.calls)
+	}
+	if previous := fixture.state.previous[oldDeploymentID]; previous.Components[0].State != generatedruntimestate.ComponentStopped {
+		t.Fatalf("previous slot=%+v", previous)
+	}
+}
+
+func TestGeneratedExecutorPreservesCandidateWhenFailedRouteMayBeLive(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	oldDeploymentID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	fixture.state.active = generatedruntimestate.ActiveHead{AppID: testAppID, DeploymentID: oldDeploymentID, ReleaseID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Slot: "green", Generation: 4}
+	fixture.routes.err = candidateMayBeLiveRouteError{}
+
+	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if fixture.runtime.stopped != 0 {
+		t.Fatalf("candidate cleanup calls=%d", fixture.runtime.stopped)
+	}
+	if fixture.state.active.DeploymentID != oldDeploymentID || fixture.state.active.Generation != 4 {
+		t.Fatalf("old active head changed: %+v", fixture.state.active)
+	}
+	if fixture.state.deployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
+		t.Fatalf("durable phase=%s", fixture.state.deployment.Phase)
+	}
+	if fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled {
+		t.Fatalf("main deployment became terminal: %+v", fixture.deployments.deployment)
+	}
+}
+
+func TestGeneratedExecutorCleansCandidateAfterRolledBackRouteFailure(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.routes.err = errors.New("route rolled back")
+
+	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	var executionErr *jobs.ExecutionError
+	if !errors.As(err, &executionErr) || executionErr.Code != "apply_failed" {
+		t.Fatalf("err=%v", err)
+	}
+	if fixture.runtime.stopped != 1 {
+		t.Fatalf("candidate cleanup calls=%d", fixture.runtime.stopped)
+	}
+	if fixture.state.deployment.Phase != generatedruntimestate.PhaseFailed {
 		t.Fatalf("durable phase=%s", fixture.state.deployment.Phase)
 	}
 }
@@ -606,4 +960,37 @@ func initializedDeployment(status deployments.Status) deployments.Deployment {
 		RuntimeStrategy: deployments.RuntimeGeneratedNode, DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2,
 		ProvenanceInitialized: true,
 	}
+}
+
+func configurePreviousActive(t *testing.T, fixture *executorFixture) (string, string) {
+	t.Helper()
+	const (
+		oldDeploymentID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+		oldReleaseID    = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+		oldContainerID  = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	)
+	description, err := generatedruntime.DescribeInactiveCandidate(testAppID, "api", generatedruntime.SlotBlue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldArtifact := readyArtifact(testArtifactID2)
+	oldArtifact.ReleaseID = oldReleaseID
+	fixture.artifacts.values[oldArtifact.ID] = oldArtifact
+	fixture.state.active = generatedruntimestate.ActiveHead{
+		AppID: testAppID, DeploymentID: oldDeploymentID, ReleaseID: oldReleaseID,
+		Slot: string(generatedruntime.SlotGreen), Generation: 4,
+	}
+	fixture.state.previous = map[string]generatedruntimestate.Deployment{
+		oldDeploymentID: {
+			DeploymentID: oldDeploymentID, AppID: testAppID, ReleaseID: oldReleaseID,
+			DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2,
+			CandidateSlot: string(generatedruntime.SlotGreen), Phase: generatedruntimestate.PhaseSucceeded,
+			Components: []generatedruntimestate.Component{{
+				DeploymentID: oldDeploymentID, Name: "api", Slot: string(generatedruntime.SlotGreen),
+				ImageArtifactID: oldArtifact.ID, ContainerID: oldContainerID,
+				ContainerName: description.ContainerName, State: generatedruntimestate.ComponentActive,
+			}},
+		},
+	}
+	return oldDeploymentID, oldContainerID
 }

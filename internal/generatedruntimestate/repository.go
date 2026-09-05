@@ -73,6 +73,7 @@ var (
 	ErrInvalidTransition         = errors.New("invalid generated runtime state transition")
 	ErrConflict                  = errors.New("generated runtime active head conflict")
 	ErrMigrationApprovalRequired = errors.New("generated runtime migration approval required")
+	ErrDeploymentInProgress      = errors.New("generated runtime deployment already in progress")
 )
 
 type Deployment struct {
@@ -156,6 +157,12 @@ func (r *Repository) Begin(ctx context.Context, input BeginInput) (Deployment, b
 		}
 		return existing, false, tx.Commit()
 	} else if !errors.Is(err, ErrNotFound) {
+		return Deployment{}, false, err
+	}
+	var inProgressDeploymentID string
+	if err := tx.QueryRowContext(ctx, `SELECT deployment_id FROM generated_runtime_deployments WHERE app_id=? AND phase NOT IN ('succeeded','failed','cancelled') ORDER BY created_at,deployment_id LIMIT 1`, input.AppID).Scan(&inProgressDeploymentID); err == nil {
+		return Deployment{}, false, ErrDeploymentInProgress
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, false, err
 	}
 

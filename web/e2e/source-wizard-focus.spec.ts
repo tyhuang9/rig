@@ -13,6 +13,7 @@ import type {
 
 const webRoot = path.resolve(import.meta.dirname, "..");
 const connectionId = "0123456789abcdef0123456789abcdef";
+const pendingConnectionId = "fedcba9876543210fedcba9876543210";
 let baseURL = "";
 let vite: ChildProcessWithoutNullStreams;
 
@@ -107,6 +108,15 @@ test("keeps focusable pagination guarded while loading and on an empty final pag
           credentialGeneration: 1,
           createdAt: "2026-01-01T00:00:00Z",
           updatedAt: "2026-01-01T00:00:00Z",
+        }, {
+          id: pendingConnectionId,
+          provider: "github",
+          status: "pending",
+          credentialGeneration: 1,
+          pendingExpiresAt: "2099-01-01T00:00:00Z",
+          nextPollAt: "2099-01-01T00:00:00Z",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
         }],
       } satisfies SourceConnectionList,
     });
@@ -141,7 +151,12 @@ test("keeps focusable pagination guarded while loading and on an empty final pag
   await page.goto(`${baseURL}/apps/new`);
   await expect(page.getByRole("heading", { name: "Add application" })).toBeVisible();
   await page.getByLabel("GitHub repository").check();
-  await page.getByLabel("GitHub connection").selectOption(connectionId);
+  const connectionSelect = page.getByLabel("GitHub connection");
+  await connectionSelect.focus();
+  await connectionSelect.selectOption(pendingConnectionId);
+  await expect(connectionSelect).toBeFocused();
+  await expect(page.locator(".connection-status")).toContainText("Resume authorization check is now available.");
+  await connectionSelect.selectOption(connectionId);
   await expect(page.getByRole("option", { name: /octo-org/i })).toBeAttached();
 
   const pagination = page.getByRole("navigation", { name: "GitHub App installations pagination" });

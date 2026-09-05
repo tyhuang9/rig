@@ -39,6 +39,25 @@ func TestBeginRequiresApprovedMigrationAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestBeginBlocksSecondGeneratedDeploymentUntilCurrentRuntimeIsTerminal(t *testing.T) {
+	fixture := newFixture(t, []string{"api"}, false, false)
+	input := fixture.beginInput([]string{"api"})
+	if _, created, err := fixture.repository.Begin(context.Background(), input); err != nil || !created {
+		t.Fatalf("first begin created=%t err=%v", created, err)
+	}
+	second := input
+	second.DeploymentID = uuid.NewString()
+	if _, _, err := fixture.repository.Begin(context.Background(), second); !errors.Is(err, ErrDeploymentInProgress) {
+		t.Fatalf("second begin = %v", err)
+	}
+	if _, err := fixture.repository.Advance(context.Background(), fixture.appID, fixture.deploymentID, PhasePreflight, PhaseFailed, DiagnosticInternalError); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fixture.repository.Begin(context.Background(), second); errors.Is(err, ErrDeploymentInProgress) {
+		t.Fatalf("terminal first runtime still blocked next deployment: %v", err)
+	}
+}
+
 func TestMigrationAttemptCannotBeSilentlyRepeated(t *testing.T) {
 	fixture := newFixture(t, []string{"api"}, true, true)
 	value, _, err := fixture.repository.Begin(context.Background(), fixture.beginInput([]string{"api"}))

@@ -33,7 +33,7 @@ func contractSourceAnalysis(inspection sourceinspection.Result) apicontract.Sour
 			Components:     make([]apicontract.AnalysisComponent, 0, len(candidate.Components)),
 			Evidence:       contractAnalysisEvidence(candidate.Evidence),
 			Findings:       contractAnalysisFindings(candidate.Findings),
-			MissingFields:  append([]string(nil), candidate.MissingFields...),
+			MissingFields:  append(make([]string, 0, len(candidate.MissingFields)), candidate.MissingFields...),
 			AdvancedInputs: make([]apicontract.AnalysisAdvancedInput, 0, len(candidate.AdvancedInputs)),
 		}
 		for _, advanced := range candidate.AdvancedInputs {

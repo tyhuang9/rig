@@ -449,10 +449,11 @@ func generatedAutoDeployPlanFixture(t *testing.T, manualRun bool) (deploymentpla
 	t.Helper()
 	component := deploymentplans.Component{
 		Name: "app", Role: "server", RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci",
-		NodeVersion: "22.14.0", RunCommand: "npm start", InternalPort: 3000, HealthProbe: "/health",
+		InstallDirectory: ".",
+		NodeVersion:      "22.14.0", RunCommand: "npm start", InternalPort: 3000, HealthProbe: "/health",
 	}
-	provenance := make([]deploymentplans.FieldProvenance, 0, 8)
-	for _, field := range []string{"role", "rootDirectory", "packageManager", "installBehavior", "nodeVersion", "runCommand", "internalPort", "healthProbe"} {
+	provenance := make([]deploymentplans.FieldProvenance, 0, 9)
+	for _, field := range []string{"role", "rootDirectory", "packageManager", "installBehavior", "installDirectory", "nodeVersion", "runCommand", "internalPort", "healthProbe"} {
 		origin := deploymentplans.ProvenanceInferred
 		if manualRun && field == "runCommand" {
 			origin = deploymentplans.ProvenanceUser

@@ -246,9 +246,25 @@ describe("SourceWizard", () => {
     }));
     expect(await screen.findByRole("heading", { name: /setup accepted/i })).toBeTruthy();
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: /setup accepted/i })));
+    expect(screen.getByText(/analysis did not execute repository code/i)).toBeTruthy();
+    expect(screen.queryByText(/runtime milestone/i)).toBeNull();
     expect(onCreated).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: /open application/i }));
     expect(onCreated).toHaveBeenCalledWith("app-1");
+  });
+
+  it("returns focus to application validation when plan acceptance is missing required details", async () => {
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection());
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
+
+    await screen.findByRole("heading", { name: /how rig will run this app/i });
+    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+
+    const summary = await screen.findByText("Check the highlighted fields.");
+    await waitFor(() => expect(document.activeElement).toBe(summary));
+    expect(screen.getByLabelText(/application name/i).getAttribute("aria-invalid")).toBe("true");
   });
 
   it("reuses its draft application when plan acceptance must be retried", async () => {
@@ -272,6 +288,43 @@ describe("SourceWizard", () => {
     await screen.findByRole("heading", { name: /setup accepted/i });
     expect(api.createApp).toHaveBeenCalledTimes(1);
     expect(api.acceptDeploymentPlan).toHaveBeenCalledTimes(2);
+  });
+
+  it("announces migration approval and restores focus to the ready heading", async () => {
+    const pendingRevision = {
+      revisionId: "11111111-1111-4111-8111-111111111111",
+      revisionNumber: 1,
+      canonicalDigest: "f".repeat(64),
+      strategy: "generated_node",
+      state: "accepted",
+      source: { provider: "local", repositoryId: 0, resolvedDigest: "a".repeat(64) },
+      detector: { name: "projectanalysis", version: "2", sourceStructuralFingerprint: "b".repeat(64) },
+      components: [],
+      fieldProvenance: [],
+      migration: { present: true, approvalStatus: "pending" },
+    };
+    vi.mocked(api.inspect).mockResolvedValueOnce(generatedInspection());
+    vi.mocked(api.acceptDeploymentPlan).mockResolvedValueOnce(pendingRevision as never);
+    vi.mocked(api.approveDeploymentPlanMigration).mockResolvedValueOnce({
+      ...pendingRevision,
+      migration: { present: true, approvalStatus: "approved" },
+    } as never);
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Generated app" } });
+    fireEvent.change(screen.getByLabelText(/local source path/i), { target: { value: "C:/projects/generated" } });
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
+    await screen.findByRole("heading", { name: /how rig will run this app/i });
+    fireEvent.click(screen.getByRole("button", { name: /accept setup/i }));
+
+    const readyHeading = await screen.findByRole("heading", { name: /setup accepted/i });
+    const approval = screen.getByRole("button", { name: /approve migration before the next deployment/i });
+    expect(screen.getByRole("status").textContent).toContain("Database migration approval is required before deployment.");
+    approval.focus();
+    fireEvent.click(approval);
+
+    await screen.findByText("The migration is approved for this plan revision.");
+    expect(screen.getByRole("status").textContent).toBe("Database migration approved. Deployment setup is ready.");
+    await waitFor(() => expect(document.activeElement).toBe(readyHeading));
   });
 
   it("locks navigation and alternate strategies as soon as a generated draft is created", async () => {
@@ -610,11 +663,12 @@ describe("SourceWizard", () => {
 
     const resume = screen.getByRole("button", { name: /resume authorization check/i });
     expect(resume).toBeTruthy();
-    expect(document.activeElement).toBe(resume);
-    expect(screen.getByText(/authorization started earlier/i)).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByLabelText(/^github connection$/i));
+    expect(screen.getByText(/resume authorization check is now available/i)).toBeTruthy();
     expect(document.body.textContent).not.toMatch(/USER-CODE|device-code-sentinel|verificationUri/i);
     vi.useFakeTimers();
-    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    resume.focus();
+    fireEvent.click(resume);
     expect(screen.getByRole("button", { name: /checking authorization/i }).getAttribute("aria-disabled")).toBe("true");
     await vi.advanceTimersByTimeAsync(29_000);
     expect(api.pollGitHubConnection).not.toHaveBeenCalled();
@@ -639,7 +693,9 @@ describe("SourceWizard", () => {
     renderWizard();
     await selectPendingGitHub();
     vi.useFakeTimers();
-    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    const initialResume = screen.getByRole("button", { name: /resume authorization check/i });
+    initialResume.focus();
+    fireEvent.click(initialResume);
     await vi.advanceTimersByTimeAsync(0);
     expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(8_999);
@@ -681,7 +737,9 @@ describe("SourceWizard", () => {
     renderWizard();
     await selectPendingGitHub();
     vi.useFakeTimers();
-    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    const initialResume = screen.getByRole("button", { name: /resume authorization check/i });
+    initialResume.focus();
+    fireEvent.click(initialResume);
     await vi.advanceTimersByTimeAsync(0);
     await flushAsyncWork();
 
@@ -1110,6 +1168,42 @@ describe("SourceWizard", () => {
       githubSource: { connectionId: connection.id, installationId: 10, repositoryId: 20, branch: "main" },
     }));
     expect(api.acceptDeploymentPlan).toHaveBeenCalledWith("app-1", expect.objectContaining({ candidateId: "candidate-web" }));
+  });
+
+  it("keeps an explicitly selected clean Compose source ahead of generated candidates", async () => {
+    const discovery = generatedInspection({ type: "github" });
+    discovery.composeCandidates = ["compose.yaml"];
+    const exactCompose = generatedInspection({ type: "github", composePath: "compose.yaml" });
+    exactCompose.composeCandidates = ["compose.yaml"];
+    exactCompose.services = [{ name: "web" }];
+    vi.mocked(api.inspect)
+      .mockResolvedValueOnce(discovery)
+      .mockResolvedValueOnce(exactCompose);
+    const { onCreated } = renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "Compose app" } });
+    await selectConnectedGitHub();
+    await selectInstallation();
+    await selectRepository();
+    await selectBranch();
+    fireEvent.click(screen.getByRole("button", { name: /analyze project/i }));
+    await screen.findByRole("heading", { name: /how rig will run this app/i });
+    fireEvent.click(screen.getByRole("button", { name: /use existing compose setup/i }));
+
+    fireEvent.change(await screen.findByLabelText(/^compose file$/i), { target: { value: "compose.yaml" } });
+    fireEvent.click(screen.getByRole("button", { name: /inspect selected compose file/i }));
+    await screen.findByText(/source inspection completed/i);
+    expect(screen.queryByRole("heading", { name: /how rig will run this app/i })).toBeNull();
+    const save = screen.getByRole("button", { name: /save application/i });
+    expect((save as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(save);
+
+    await waitFor(() => expect(api.createApp).toHaveBeenCalled());
+    expect(vi.mocked(api.createApp).mock.calls[0]?.[0]).toEqual(expect.objectContaining({
+      name: "Compose app",
+      githubSource: expect.objectContaining({ composePath: "compose.yaml" }),
+    }));
+    expect(api.acceptDeploymentPlan).not.toHaveBeenCalled();
+    expect(onCreated).toHaveBeenCalledWith("app-1");
   });
 
   it("describes policy findings truthfully and keeps saving blocked", async () => {

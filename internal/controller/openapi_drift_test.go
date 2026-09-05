@@ -41,6 +41,7 @@ var expectedOpenAPIProblemCatalog = map[string]openAPIProblemCode{
 	"invalid_source":                  {Description: "The selected GitHub source is invalid or cannot be used", Statuses: []int{400, 422}},
 	"approval_required":               {Description: "Deployment requires an administrator approval before it can continue", Statuses: []int{409}},
 	"migration_approval_required":     {Description: "Deployment migration requires approval before it can continue", Statuses: []int{409}},
+	"route_reconciliation_required":   {Description: "Deployment route state must be reconciled before it can be cancelled", Statuses: []int{409}},
 	"application_busy":                {Description: "The application already has an active conflicting operation", Statuses: []int{409}},
 	"source_too_large":                {Description: "The source exceeds the supported inspection limits", Statuses: []int{413}},
 	"deployment_plan_conflict":        {Description: "The accepted deployment plan changed while this request was being reviewed", Statuses: []int{409}},
@@ -48,6 +49,7 @@ var expectedOpenAPIProblemCatalog = map[string]openAPIProblemCode{
 	"deployment_plan_not_found":       {Description: "No accepted deployment plan exists for the application", Statuses: []int{404}},
 	"invalid_deployment_plan":         {Description: "One or more deployment plan fields are invalid", Statuses: []int{422}},
 	"migration_approval_conflict":     {Description: "The migration approval changed while this request was being reviewed", Statuses: []int{409}},
+	"deployment_plan_forbidden":       {Description: "Administrator access is required to accept a deployment plan or approve its migration", Statuses: []int{403}},
 	"relay_unavailable":               {Description: "The configured controller relay is unavailable", Statuses: []int{503}},
 }
 
@@ -55,13 +57,14 @@ var expectedOpenAPIOperationProblemCodes = map[string][]string{
 	"createApplication":                         {"authentication_required", "source_access_lost", "provider_unavailable", "invalid_source", "source_too_large"},
 	"inspectImport":                             {"authentication_required", "source_access_lost", "provider_unavailable", "invalid_source", "source_too_large"},
 	"getApplicationDeploymentPlan":              {"deployment_plan_not_found"},
-	"acceptApplicationDeploymentPlan":           {"authentication_required", "source_access_lost", "provider_unavailable", "invalid_source", "source_too_large", "deployment_plan_conflict", "deployment_plan_review_required", "invalid_deployment_plan"},
-	"approveApplicationDeploymentPlanMigration": {"deployment_plan_not_found", "deployment_plan_conflict", "migration_approval_conflict", "invalid_deployment_plan"},
+	"acceptApplicationDeploymentPlan":           {"authentication_required", "source_access_lost", "provider_unavailable", "invalid_source", "source_too_large", "deployment_plan_conflict", "deployment_plan_review_required", "invalid_deployment_plan", "deployment_plan_forbidden"},
+	"approveApplicationDeploymentPlanMigration": {"deployment_plan_not_found", "deployment_plan_conflict", "migration_approval_conflict", "invalid_deployment_plan", "deployment_plan_forbidden"},
 	"deployApplication":                         {"application_busy"},
 	"deployRelease":                             {"application_busy"},
 	"startApplication":                          {"application_busy"},
 	"stopApplication":                           {"application_busy"},
 	"restartApplication":                        {"application_busy"},
+	"cancelJob":                                 {"route_reconciliation_required"},
 	"resumeJob":                                 {"approval_required", "migration_approval_required"},
 	"startGitHubDeviceConnection":               {"authentication_required", "provider_unavailable"},
 	"pollGitHubDeviceConnection":                {"authentication_required", "source_access_lost", "provider_unavailable"},
@@ -98,7 +101,7 @@ func TestOpenAPIContractMatchesRegisteredRoutes(t *testing.T) {
 			t.Errorf("missing required schema %q", required)
 		}
 	}
-	if !strings.Contains(string(content), "pauseDisposition: {type: string, enum: [approval_required, migration_approval_required, insufficient_replacement_capacity]}") {
+	if !strings.Contains(string(content), "pauseDisposition: {type: string, enum: [approval_required, migration_approval_required, insufficient_replacement_capacity, route_reconciliation_required]}") {
 		t.Error("job pause dispositions must remain an explicit stable enum")
 	}
 	if _, ok := document.Components.Responses["Problem"]; !ok {

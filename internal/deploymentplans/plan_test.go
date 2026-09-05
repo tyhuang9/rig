@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/secretfile"
 )
 
 const planTestApp = "11111111-1111-1111-1111-111111111111"
@@ -78,6 +80,40 @@ func TestMigrationIsBoundToAcceptedComponentAndExplicitEnvironmentKeys(t *testin
 	}
 }
 
+func TestCanonicalPlanRejectsBackslashRootDirectories(t *testing.T) {
+	for _, root := range []string{`apps\web`, `apps\\web`} {
+		t.Run(root, func(t *testing.T) {
+			plan := testPlan()
+			plan.Components[0].RootDirectory = root
+			plan.Components[0].InstallDirectory = root
+			plan.Migration.RootDirectory = root
+			if _, err := CanonicalDigest(plan); err == nil {
+				t.Fatalf("backslash root directory %q accepted", root)
+			}
+		})
+	}
+}
+
+func TestCanonicalPlanBindsInstallDirectory(t *testing.T) {
+	plan := testPlan()
+	before, err := CanonicalDigest(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Components[0].InstallDirectory = "."
+	after, err := CanonicalDigest(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after {
+		t.Fatal("install directory did not change the immutable plan digest")
+	}
+	plan.Components[0].InstallDirectory = "../outside"
+	if _, err := CanonicalDigest(plan); err == nil {
+		t.Fatal("unsafe install directory accepted")
+	}
+}
+
 func TestStorePersistsProtectedImmutableRevisionAndCASHead(t *testing.T) {
 	db := planDB(t)
 	root := t.TempDir()
@@ -98,8 +134,24 @@ func TestStorePersistsProtectedImmutableRevisionAndCASHead(t *testing.T) {
 	}
 	path := filepath.Join(root, "apps", planTestApp, "deployment-plans", created.ID+".secret")
 	persisted, err := os.ReadFile(path)
-	if err != nil || strings.Contains(string(persisted), "npm run build") {
-		t.Fatalf("protected bundle path=%q err=%v contains command=%t", path, err, strings.Contains(string(persisted), "npm run build"))
+	if err != nil {
+		t.Fatalf("read protected bundle path=%q: %v", path, err)
+	}
+	if runtime.GOOS == "windows" && strings.Contains(string(persisted), "npm run build") {
+		t.Fatalf("Windows protected bundle path=%q contains plaintext command", path)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat POSIX protected bundle path=%q: %v", path, err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("POSIX protected bundle path=%q mode=%o", path, info.Mode().Perm())
+		}
+	}
+	if plaintext, err := secretfile.Read(path, purpose(planTestApp, uuid.NewString())); err == nil {
+		clear(plaintext)
+		t.Fatal("purpose-mismatched deployment plan bundle was accepted")
 	}
 	var commands int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('deployment_plan_revisions') WHERE lower(name) LIKE '%command%'`).Scan(&commands); err != nil || commands != 0 {
@@ -212,12 +264,12 @@ func testPlan() Plan {
 		Detector: Detector{Name: "package-json", Version: "1", SourceStructuralFingerprint: strings.Repeat("a", 64)},
 		Source:   SourceIdentity{Provider: "github", RepositoryID: 7, ResolvedDigest: strings.Repeat("c", 64)},
 		Components: []Component{
-			{Name: "web", Role: "server", RootDirectory: "apps/web", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm run start", InternalPort: 3000, HealthProbe: "/health"},
-			{Name: "worker", Role: "server", RootDirectory: "apps/worker", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", RunCommand: "npm run worker", InternalPort: 3001, HealthProbe: "/health"},
+			{Name: "web", Role: "server", RootDirectory: "apps/web", PackageManager: "npm", InstallBehavior: "npm ci", InstallDirectory: "apps/web", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm run start", InternalPort: 3000, HealthProbe: "/health"},
+			{Name: "worker", Role: "server", RootDirectory: "apps/worker", PackageManager: "npm", InstallBehavior: "npm ci", InstallDirectory: "apps/worker", NodeVersion: "22", RunCommand: "npm run worker", InternalPort: 3001, HealthProbe: "/health"},
 		},
 		FieldProvenance: provenanceFor(
-			Component{Name: "web", Role: "server", RootDirectory: "apps/web", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm run start", InternalPort: 3000, HealthProbe: "/health"},
-			Component{Name: "worker", Role: "server", RootDirectory: "apps/worker", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", RunCommand: "npm run worker", InternalPort: 3001, HealthProbe: "/health"},
+			Component{Name: "web", Role: "server", RootDirectory: "apps/web", PackageManager: "npm", InstallBehavior: "npm ci", InstallDirectory: "apps/web", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm run start", InternalPort: 3000, HealthProbe: "/health"},
+			Component{Name: "worker", Role: "server", RootDirectory: "apps/worker", PackageManager: "npm", InstallBehavior: "npm ci", InstallDirectory: "apps/worker", NodeVersion: "22", RunCommand: "npm run worker", InternalPort: 3001, HealthProbe: "/health"},
 		),
 		Migration: &Migration{ComponentName: "web", RootDirectory: "apps/web", Command: "npm run migrate", EnvironmentKeys: []string{"DATABASE_URL"}, EvidenceDigest: strings.Repeat("b", 64), Approval: MigrationApproval{Status: MigrationApprovalPending}},
 	}

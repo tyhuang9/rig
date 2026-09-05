@@ -14,6 +14,7 @@ import {
 } from "./api";
 import { SourceWizard } from "./source-wizard";
 import { ApplicationConfigurationPanel } from "./application-configuration";
+import { ApplicationPlanPanel } from "./application-plan-panel";
 import { AutoDeployPanel } from "./auto-deploy";
 import { DeploymentHistoryPanel } from "./deployment-history";
 import { UnsavedChangesGuard, useConfirmDiscard } from "./unsaved-changes";
@@ -222,6 +223,7 @@ function ApplicationDetailPage() {
     <p className="section-kicker">Overview</p>
     <div className="summary"><article><small>Current deployment</small><strong>{currentDeployment ? <StatusText value={currentDeployment.status}/> : deploymentQuery.isLoading ? "Loading..." : "Not deployed"}</strong><span>{currentDeployment ? `Configuration ${currentDeployment.configurationMode}` : deploymentQuery.isError ? "History unavailable" : "No deployment record"}</span></article><article><small>Source</small><strong className="mono">{app.slug}</strong><span>Runtime is not inferred</span></article><article><small>Health</small><strong>Not verified</strong><span>Health reporting is not available</span></article></div>
     {fakeRuntime ? <div className="callout warning"><strong>Development capability</strong><span>The fake runtime persists job progress but executes no workload.</span></div> : !composeRuntime && !generatedRuntime && <div className="callout info"><strong>Runtime actions unavailable</strong><span>Configure a runtime to deploy this application.</span></div>}
+    <ApplicationPlanPanel app={app}/>
     <AutoDeployPanel appId={id} composeRuntime={composeRuntime} generatedRuntime={generatedRuntime} githubConnections={statusQuery.data.capabilities.githubConnections}/>
     <DeploymentHistoryPanel appId={id} composeRuntime={composeRuntime} fakeRuntime={fakeRuntime} generatedRuntime={generatedRuntime}/>
     <ApplicationConfigurationPanel appId={id}/>
@@ -258,12 +260,14 @@ export function ActivityRow({ job }: { job: Job }) {
   });
   const current = terminalJobStatuses.has(job.status) ? job : cancellation.data?.job ?? job;
   const cancellationFeedback = terminalCancellationMessages.get(current.status) ?? "Cancellation recorded.";
+  const cancellationUnsafe = current.status === "waiting_user" && current.pauseDisposition === "route_reconciliation_required";
   return <article className="activity-row">
     <time dateTime={current.createdAt}>{new Date(current.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
     <div><strong>{current.type} application</strong><small className="mono">{current.id}</small></div>
     <StatusText value={current.status}/>
     <div className="job-actions">
-      {cancellableStatuses.has(current.status) && <button className="button small" onClick={() => cancellation.mutate()} disabled={cancellation.isPending || cancellation.isSuccess}>{cancellation.isPending ? "Cancelling…" : cancellation.isSuccess ? "Cancellation requested" : "Cancel job"}</button>}
+      {cancellationUnsafe && <span className="activity-feedback">Retry route reconciliation from Deployment history before cancelling.</span>}
+      {cancellableStatuses.has(current.status) && !cancellationUnsafe && <button className="button small" onClick={() => cancellation.mutate()} disabled={cancellation.isPending || cancellation.isSuccess}>{cancellation.isPending ? "Cancelling…" : cancellation.isSuccess ? "Cancellation requested" : "Cancel job"}</button>}
       {cancellation.isSuccess && <span className="activity-feedback" role="status" aria-live="polite" aria-atomic="true">{cancellationFeedback}</span>}
       {cancellation.isError && <span className="activity-feedback error" role="alert">{cancellation.error.message}</span>}
     </div>

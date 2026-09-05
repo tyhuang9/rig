@@ -809,6 +809,8 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
 	case errors.Is(err, jobs.ErrJobTerminal):
 		problem(w, r, http.StatusConflict, "job_terminal", "Job is already terminal and cannot be cancelled", nil)
+	case errors.Is(err, jobs.ErrCancellationUnsafe):
+		problem(w, r, http.StatusConflict, "route_reconciliation_required", "Retry route reconciliation before cancelling this deployment", nil)
 	default:
 		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not cancel job", nil)
 	}

@@ -207,6 +207,19 @@ type RouteSwitchRequest struct {
 	DrainPeriod time.Duration
 }
 
+// RouteSwitchFailure describes whether a failed route switch may still be
+// using the candidate. Callers must preserve the candidate when this is true
+// because removing it could tear down live traffic.
+type RouteSwitchFailure interface {
+	error
+	CandidateMayBeLive() bool
+}
+
+func RouteCandidateMayBeLive(err error) bool {
+	var failure RouteSwitchFailure
+	return errors.As(err, &failure) && failure.CandidateMayBeLive()
+}
+
 // RouteSwitcher is implemented by the ingress milestone. The runtime engine
 // stops at a healthy, isolated candidate and never edits Caddy itself.
 type RouteSwitcher interface {

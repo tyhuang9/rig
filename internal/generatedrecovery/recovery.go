@@ -22,6 +22,7 @@ const (
 	restartSummary            = "Deployment interrupted because hostd restarted"
 	interruptedJobSummary     = "Job interrupted because hostd restarted"
 	requeuedJobSummary        = "Generated deployment requeued because hostd restarted"
+	routeReconciliationPause  = "route_reconciliation_required"
 )
 
 var (
@@ -77,6 +78,7 @@ type recoveryBinding struct {
 	planRevisionNumber int64
 	jobStatus          string
 	jobPhase           string
+	pauseDisposition   string
 	jobType            string
 	jobResourceType    string
 	jobResourceID      string
@@ -335,7 +337,7 @@ func loadRuntimeComponents(ctx context.Context, tx *sql.Tx, deployment runtimeDe
 
 func loadRecoveryBinding(ctx context.Context, tx *sql.Tx, deploymentID string) (recoveryBinding, bool, error) {
 	row := tx.QueryRowContext(ctx, `SELECT d.id,d.app_id,d.release_id,d.job_id,d.status,d.configuration_mode,d.deployment_plan_revision_id,d.deployment_plan_revision_number,
-		j.status,j.phase,j.type,j.resource_type,j.resource_id,COALESCE(j.requested_by,''),j.input_json,j.attempt
+		j.status,j.phase,COALESCE(j.pause_disposition,''),j.type,j.resource_type,j.resource_id,COALESCE(j.requested_by,''),j.input_json,j.attempt
 	FROM deployments d
 	JOIN jobs j ON j.id=d.job_id AND j.type='deploy' AND j.resource_type='application' AND j.resource_id=d.app_id
 	JOIN releases r ON r.id=d.release_id AND r.app_id=d.app_id AND (r.workspace_state='ready' OR r.workspace_state IS NULL)
@@ -351,11 +353,12 @@ func loadRecoveryBinding(ctx context.Context, tx *sql.Tx, deploymentID string) (
 	  AND (p.migration_evidence_digest='' OR EXISTS(
 		SELECT 1 FROM deployment_plan_migration_approvals a WHERE a.revision_id=p.id AND a.app_id=p.app_id
 	  ))
-	  AND j.status IN ('queued','assigned','running','waiting_external')`, deploymentID)
+	  AND (j.status IN ('queued','assigned','running','waiting_external') OR
+	       (j.status='waiting_user' AND j.phase=? AND j.pause_disposition=?))`, deploymentID, routeReconciliationPause, routeReconciliationPause)
 	var value recoveryBinding
 	var input string
 	if err := row.Scan(&value.deploymentID, &value.appID, &value.releaseID, &value.jobID, &value.deploymentStatus, &value.configurationMode, &value.planRevisionID, &value.planRevisionNumber,
-		&value.jobStatus, &value.jobPhase, &value.jobType, &value.jobResourceType, &value.jobResourceID, &value.requestedBy, &input, &value.jobAttempt); errors.Is(err, sql.ErrNoRows) {
+		&value.jobStatus, &value.jobPhase, &value.pauseDisposition, &value.jobType, &value.jobResourceType, &value.jobResourceID, &value.requestedBy, &input, &value.jobAttempt); errors.Is(err, sql.ErrNoRows) {
 		return recoveryBinding{}, false, nil
 	} else if err != nil {
 		return recoveryBinding{}, false, err
@@ -378,7 +381,8 @@ func bindingMatchesRuntime(binding recoveryBinding, runtimeDeployment runtimeDep
 		binding.deploymentID != runtimeDeployment.deploymentID || binding.appID != runtimeDeployment.appID || binding.releaseID != runtimeDeployment.releaseID ||
 		binding.planRevisionID != runtimeDeployment.planRevisionID || binding.planRevisionNumber != runtimeDeployment.planRevisionNumber || binding.jobResourceID != binding.appID ||
 		binding.jobType != "deploy" || binding.jobResourceType != "application" || binding.jobAttempt < 1 ||
-		(binding.jobStatus == "waiting_external" && binding.jobPhase == "cancelling") {
+		(binding.jobStatus == "waiting_external" && binding.jobPhase == "cancelling") ||
+		(binding.jobStatus == "waiting_user" && (binding.jobPhase != routeReconciliationPause || binding.pauseDisposition != routeReconciliationPause)) {
 		return false
 	}
 	input, ok := decodeDeploymentInput(binding.jobInput)

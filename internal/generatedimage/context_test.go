@@ -24,7 +24,7 @@ func TestPrepareBuildContextExcludesSensitiveAndGeneratedPaths(t *testing.T) {
 	if err := os.Mkdir(operation, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	component := componentDefinition{rootDirectory: ".", installBehavior: "npm ci --ignore-scripts", buildCommand: `npm run build && echo "$VALUE"`}
+	component := componentDefinition{rootDirectory: ".", installBehavior: "npm ci --ignore-scripts", installDirectory: ".", buildCommand: `npm run build && echo "$VALUE"`}
 	layout, err := prepareBuildContext(context.Background(), workspace, operation, component, contextLimits{})
 	if err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestPrepareBuildContextRejectsCredentialFiles(t *testing.T) {
 			if err := os.Mkdir(operation, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			_, err := prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: ".", installBehavior: "npm ci"}, contextLimits{})
+			_, err := prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: ".", installBehavior: "npm ci", installDirectory: "."}, contextLimits{})
 			if !errors.Is(err, errInvalidBuildContext) {
 				t.Fatalf("credential-bearing source error = %v", err)
 			}
@@ -97,7 +97,7 @@ func TestPrepareBuildContextRejectsUnsafeRootsAndBounds(t *testing.T) {
 	if err := os.Mkdir(operation, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	_, err := prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: "..", installBehavior: "npm ci"}, contextLimits{})
+	_, err := prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: "..", installBehavior: "npm ci", installDirectory: "."}, contextLimits{})
 	if !errors.Is(err, errInvalidBuildContext) {
 		t.Fatalf("unsafe component root error = %v", err)
 	}
@@ -106,7 +106,16 @@ func TestPrepareBuildContextRejectsUnsafeRootsAndBounds(t *testing.T) {
 	if err := os.Mkdir(operation, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	_, err = prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: ".", installBehavior: "npm ci"}, contextLimits{bytes: 1, entries: 10})
+	_, err = prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: ".", installBehavior: "npm ci", installDirectory: ".."}, contextLimits{})
+	if !errors.Is(err, errInvalidBuildContext) {
+		t.Fatalf("unsafe install root error = %v", err)
+	}
+
+	operation = filepath.Join(t.TempDir(), "operation")
+	if err := os.Mkdir(operation, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err = prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: ".", installBehavior: "npm ci", installDirectory: "."}, contextLimits{bytes: 1, entries: 10})
 	if !errors.Is(err, errBuildContextTooLarge) {
 		t.Fatalf("bounded context error = %v", err)
 	}
@@ -127,7 +136,7 @@ func TestPrepareBuildContextRejectsLinks(t *testing.T) {
 	if err := os.Mkdir(operation, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	_, err := prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: ".", installBehavior: "npm ci"}, contextLimits{})
+	_, err := prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: ".", installBehavior: "npm ci", installDirectory: "."}, contextLimits{})
 	if !errors.Is(err, errInvalidBuildContext) {
 		t.Fatalf("linked source error = %v", err)
 	}

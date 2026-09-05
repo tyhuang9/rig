@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"text/template"
 	"time"
 
 	"github.com/google/uuid"
@@ -342,9 +343,57 @@ func TestGeneratedRuntimeDerivesDiskAdmissionFromMaximumLogs(t *testing.T) {
 	}
 }
 
+func TestGeneratedRuntimeRequiresTwoLocalLogFiles(t *testing.T) {
+	root := t.TempDir()
+	config := filepath.Join(root, "docker-config")
+	if err := os.Mkdir(config, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	options := EngineOptions{
+		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root,
+		CommandTimeout: time.Second, HealthTimeout: time.Second, HealthPollInterval: 100 * time.Millisecond,
+		OutputLimit: 1024, Limits: defaultLimits(), ReplacementDiskBytes: 1 << 30,
+	}
+	for _, test := range []struct {
+		files int
+		valid bool
+	}{
+		{files: 0, valid: false},
+		{files: 1, valid: false},
+		{files: 2, valid: true},
+		{files: 10, valid: true},
+		{files: 11, valid: false},
+	} {
+		options.Limits.LogFiles = test.files
+		if got := validEngineOptions(options); got != test.valid {
+			t.Fatalf("validEngineOptions with max-file=%d = %t, want %t", test.files, got, test.valid)
+		}
+	}
+
+	engine, err := NewEngine(
+		&runtimeFakeRunner{run: func(runtimeprocess.CommandRequest) runtimeRequestResult { return runtimeRequestResult{} }},
+		&runtimeFakeEnvironment{path: filepath.Join(root, "runtime.env")},
+		fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}},
+		EngineOptions{
+			DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root,
+			CommandTimeout: time.Second, HealthTimeout: time.Second, HealthPollInterval: 100 * time.Millisecond,
+			OutputLimit: 1024, ReplacementDiskBytes: 1 << 30,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if engine.options.Limits.LogFiles != 3 {
+		t.Fatalf("default log files = %d, want 3", engine.options.Limits.LogFiles)
+	}
+}
+
 func TestGeneratedRuntimeHardeningRequiresAliasAndExactTmpfsPolicy(t *testing.T) {
 	spec := candidateSpec()
 	candidate := candidateForSpec(spec)
+	if !matchesCandidateHardening(hardenedInspection(spec, defaultLimits()), candidate, defaultLimits()) {
+		t.Fatal("exact tmpfs policy with realized network was rejected")
+	}
 	tests := []struct {
 		name   string
 		mutate func(*containerInspection)
@@ -366,6 +415,163 @@ func TestGeneratedRuntimeHardeningRequiresAliasAndExactTmpfsPolicy(t *testing.T)
 			if matchesCandidateHardening(container, candidate, defaultLimits()) {
 				t.Fatal("unsafe hardening inspection was accepted")
 			}
+		})
+	}
+}
+
+func TestGeneratedRuntimeCreatedCandidateAllowsUnavailableNetworkUntilHealthCheck(t *testing.T) {
+	spec := candidateSpec()
+	created := false
+	started := false
+	removed := false
+	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		switch commandKind(request.Args) {
+		case "image inspect":
+			return runtimeJSON(validImageInspection(spec))
+		case "network inspect":
+			return runtimeJSON(networkInspection{Name: networkName(spec.AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": spec.AppID}})
+		case "container inspect":
+			identity := request.Args[len(request.Args)-1]
+			if removed || !created || (identity != testContainerID && identity != containerName(spec.AppID, spec.ComponentName, SlotGreen)) {
+				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
+			}
+			inspection := configuredInspection(spec, defaultLimits())
+			inspection.Running = started
+			inspection.Health = "starting"
+			return runtimeJSON(inspection)
+		case "container create":
+			created = true
+			return runtimeRequestResult{result: runtimeprocess.CommandResult{Stdout: []byte(testContainerID)}}
+		case "container start":
+			started = true
+			return runtimeRequestResult{}
+		case "container rm":
+			if !containsExactArgument(request.Args, "--force") {
+				t.Fatalf("failed candidate cleanup was not forced: %#v", request.Args)
+			}
+			removed = true
+			return runtimeRequestResult{}
+		default:
+			t.Fatalf("unexpected request: %#v", request.Args)
+			return runtimeRequestResult{}
+		}
+	})
+	candidate, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("created candidate rejected before runtime state materialized: %v", err)
+	}
+	if err := engine.StartCandidate(context.Background(), candidate); err != nil {
+		t.Fatalf("created candidate rejected before start: %v", err)
+	}
+	if err := engine.WaitHealthy(context.Background(), candidate); !IsCode(err, DiagnosticCandidateHardeningFailed) {
+		t.Fatalf("health check accepted missing runtime network attachment: %v", err)
+	}
+	if !removed {
+		t.Fatal("fully labeled created candidate was not removed during failure cleanup")
+	}
+	findRuntimeRequest(t, runner.requests, "container start")
+	findRuntimeRequest(t, runner.requests, "container rm")
+}
+
+func TestGeneratedRuntimeStopAndRemoveAllowsUnrealizedCreatedCandidate(t *testing.T) {
+	spec := candidateSpec()
+	candidate := candidateForSpec(spec)
+	removed := false
+	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		switch commandKind(request.Args) {
+		case "container inspect":
+			if removed {
+				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
+			}
+			return runtimeJSON(configuredInspection(spec, defaultLimits()))
+		case "container rm":
+			removed = true
+			return runtimeRequestResult{}
+		case "container stop":
+			t.Fatal("created candidate should be removed without a stop request")
+			return runtimeRequestResult{}
+		default:
+			t.Fatalf("unexpected request: %#v", request.Args)
+			return runtimeRequestResult{}
+		}
+	})
+	if err := engine.StopAndRemove(context.Background(), candidate, time.Second); err != nil {
+		t.Fatalf("unrealized created candidate was not removed: %v", err)
+	}
+	if !removed {
+		t.Fatal("created candidate was not removed")
+	}
+	findRuntimeRequest(t, runner.requests, "container rm")
+}
+
+func TestGeneratedRuntimeCleanupOwnershipDoesNotRequireConfiguredNetwork(t *testing.T) {
+	spec := candidateSpec()
+	for _, test := range []struct {
+		name             string
+		networkMode      string
+		mutateLabels     func(map[string]string)
+		wantCleanupError bool
+	}{
+		{name: "empty network mode", networkMode: ""},
+		{name: "wrong network mode", networkMode: "unexpected-network"},
+		{
+			name:             "missing ownership label stays protected",
+			networkMode:      "",
+			mutateLabels:     func(labels map[string]string) { delete(labels, "io.rig.deployment") },
+			wantCleanupError: true,
+		},
+		{
+			name:        "wrong ownership label stays protected",
+			networkMode: "",
+			mutateLabels: func(labels map[string]string) {
+				labels["io.rig.deployment"] = uuid.NewString()
+			},
+			wantCleanupError: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := candidateForSpec(spec)
+			removed := false
+			inspection := configuredInspection(spec, defaultLimits())
+			inspection.NetworkMode = test.networkMode
+			if test.mutateLabels != nil {
+				test.mutateLabels(inspection.Labels)
+			}
+			if matchesCandidateConfiguredHardening(inspection, candidate, defaultLimits()) {
+				t.Fatal("network configuration drift passed configured hardening")
+			}
+			engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+				switch commandKind(request.Args) {
+				case "container inspect":
+					if removed {
+						return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
+					}
+					return runtimeJSON(inspection)
+				case "container rm":
+					removed = true
+					return runtimeRequestResult{}
+				default:
+					t.Fatalf("unexpected request: %#v", request.Args)
+					return runtimeRequestResult{}
+				}
+			})
+			err := engine.StopAndRemove(context.Background(), candidate, time.Second)
+			if test.wantCleanupError {
+				if !IsCode(err, DiagnosticCandidateHardeningFailed) {
+					t.Fatalf("expected protected ownership failure, got %v", err)
+				}
+				if removed {
+					t.Fatal("container with incomplete ownership reached removal")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("fully owned container with network drift was not removed: %v", err)
+			}
+			if !removed {
+				t.Fatal("fully owned container with network drift was not removed")
+			}
+			findRuntimeRequest(t, runner.requests, "container rm")
 		})
 	}
 }
@@ -398,7 +604,7 @@ func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testin
 			if removed || (!created && identity != testContainerID) || (identity != testContainerID && identity != containerName(spec.AppID, spec.ComponentName, SlotGreen)) {
 				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
 			}
-			inspection := hardenedInspection(spec, defaultLimits())
+			inspection := configuredInspection(spec, defaultLimits())
 			inspection.Privileged = true
 			return runtimeJSON(inspection)
 		case "container create":
@@ -771,6 +977,118 @@ func imageLabels(spec CandidateSpec) map[string]string {
 	return map[string]string{"io.rig.managed": "generated-image", "io.rig.application": spec.AppID, "io.rig.release": spec.ReleaseID, "io.rig.artifact": spec.ArtifactID, "io.rig.plan": spec.DeploymentPlanRevisionID, "io.rig.component": spec.ComponentName, "io.rig.role": spec.Role, "io.rig.definition": spec.BuildDefinitionDigest}
 }
 
+type templateDockerContainer struct {
+	ID              string
+	Name            string
+	Image           string
+	Config          templateDockerConfig
+	HostConfig      templateDockerHostConfig
+	State           templateDockerState
+	NetworkSettings *templateDockerNetworkSettings
+}
+
+type templateDockerConfig struct {
+	Labels      map[string]string
+	User        string
+	WorkingDir  string
+	Cmd         []string
+	Healthcheck *templateDockerHealthcheck
+}
+
+type templateDockerHealthcheck struct {
+	Test        []string
+	Interval    int64
+	Timeout     int64
+	StartPeriod int64
+	Retries     int
+}
+
+type templateDockerHostConfig struct {
+	Memory         int64
+	MemorySwap     int64
+	NanoCPUs       int64
+	PidsLimit      *int64
+	Ulimits        []templateDockerUlimit
+	Init           *bool
+	NetworkMode    string
+	ReadonlyRootfs bool
+	Privileged     bool
+	CapAdd         []string
+	CapDrop        []string
+	SecurityOpt    []string
+	Binds          []string
+	PortBindings   map[string]any
+	Tmpfs          map[string]string
+	LogConfig      templateDockerLogConfig
+	RestartPolicy  templateDockerRestartPolicy
+}
+
+type templateDockerUlimit struct {
+	Name string
+	Soft int64
+	Hard int64
+}
+
+type templateDockerLogConfig struct {
+	Type   string
+	Config map[string]string
+}
+
+type templateDockerRestartPolicy struct {
+	Name string
+}
+
+type templateDockerState struct {
+	Running  bool
+	ExitCode int
+	Health   *templateDockerHealth
+}
+
+type templateDockerHealth struct {
+	Status string
+}
+
+type templateDockerNetworkSettings struct {
+	Networks map[string]struct{}
+}
+
+func TestContainerInspectFormatHandlesMissingHealthAndNetworkState(t *testing.T) {
+	templateValue, err := template.New("container-inspect").Funcs(template.FuncMap{
+		"json": func(value any) (string, error) {
+			encoded, err := json.Marshal(value)
+			return string(encoded), err
+		},
+	}).Parse(containerInspectFormat)
+	if err != nil {
+		t.Fatal("container inspection template did not parse")
+	}
+	var rendered strings.Builder
+	input := templateDockerContainer{
+		ID:              "container-id",
+		State:           templateDockerState{Health: nil},
+		NetworkSettings: nil,
+	}
+	if err := templateValue.Execute(&rendered, input); err != nil {
+		t.Fatal("container inspection template did not execute")
+	}
+	var decoded containerInspection
+	if err := json.Unmarshal([]byte(rendered.String()), &decoded); err != nil {
+		t.Fatal("container inspection template output was not JSON")
+	}
+	if decoded.HealthTest != nil || decoded.HealthInterval != 0 || decoded.HealthTimeout != 0 || decoded.HealthStartPeriod != 0 || decoded.HealthRetries != 0 {
+		t.Fatal("missing configured health check was not rendered as null defaults")
+	}
+	if decoded.PIDs != 0 || decoded.Init {
+		t.Fatal("missing pointer hardening values were not rendered as null defaults")
+	}
+	if decoded.Health != "" {
+		t.Fatal("missing health state was not rendered as an empty string")
+	}
+	if decoded.Networks != nil {
+		t.Fatal("missing network state was not rendered as null")
+	}
+}
+
 func validImageInspection(spec CandidateSpec) imageInspection {
 	return imageInspection{ID: spec.ImageContentID, Size: 100, Labels: imageLabels(spec), User: "node", WorkingDirectory: "/workspace", Entrypoint: []string{"/usr/local/bin/rig-entrypoint"}}
 }
@@ -787,8 +1105,14 @@ func hardenedInspection(spec CandidateSpec, limits ContainerLimits) containerIns
 		NetworkMode: network, ReadonlyRootfs: true, Init: true, CapDrop: []string{"ALL"}, SecurityOptions: []string{"no-new-privileges:true"}, Ulimits: []ulimitInspection{{Name: "nofile", Soft: 1024, Hard: 1024}},
 		Tmpfs:   map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=" + stringInt(limits.TmpfsBytes)},
 		LogType: "local", LogConfig: map[string]string{"max-size": limits.LogSize, "max-file": stringInt(int64(limits.LogFiles))}, Restart: "no",
-		Mounts: []mountInspection{{Type: "tmpfs", Destination: "/tmp", RW: true}}, Networks: map[string]networkAttachmentInspection{network: {Aliases: []string{containerAlias(spec.ComponentName, slot)}}},
+		Networks: map[string]networkAttachmentInspection{network: {Aliases: []string{containerAlias(spec.ComponentName, slot)}}},
 	}
+}
+
+func configuredInspection(spec CandidateSpec, limits ContainerLimits) containerInspection {
+	inspection := hardenedInspection(spec, limits)
+	inspection.Networks = nil
+	return inspection
 }
 
 func stringInt(value int64) string { return strings.TrimSpace(string(mustJSONNumber(value))) }

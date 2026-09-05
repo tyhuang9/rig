@@ -22,7 +22,7 @@ func TestDefinitionAndRecipeAreDeterministicAndCommandSafe(t *testing.T) {
 	revision := deploymentplans.DeploymentPlanRevision{
 		CanonicalDigest: strings.Repeat("a", 64),
 		Plan: deploymentplans.Plan{Strategy: deploymentplans.StrategyGeneratedNode, Components: []deploymentplans.Component{{
-			Name: "web", Role: "server", RootDirectory: "apps/web", PackageManager: "pnpm", InstallBehavior: "pnpm install --frozen-lockfile", NodeVersion: "22.14.0", BuildCommand: command, RunCommand: "pnpm start", InternalPort: 3000, HealthProbe: "/health",
+			Name: "web", Role: "server", RootDirectory: "apps/web", PackageManager: "pnpm", InstallBehavior: "pnpm install --frozen-lockfile", InstallDirectory: ".", NodeVersion: "22.14.0", BuildCommand: command, RunCommand: "pnpm start", InternalPort: 3000, HealthProbe: "/health",
 		}}},
 	}
 	first, firstDigest, err := definitionFor(revision, "web")
@@ -63,6 +63,61 @@ func TestDefinitionAndRecipeAreDeterministicAndCommandSafe(t *testing.T) {
 	}
 	if changed == firstDigest {
 		t.Fatal("run-command change did not invalidate the build definition")
+	}
+	revision.Plan.Components[0].InstallDirectory = "apps/web"
+	_, changed, err = definitionFor(revision, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == firstDigest {
+		t.Fatal("install-directory change did not invalidate the build definition")
+	}
+}
+
+func TestWorkspaceRootInstallRecipeUsesSeparateWorkingDirectories(t *testing.T) {
+	for _, test := range []struct {
+		manager, install string
+	}{
+		{manager: "npm", install: "npm ci"},
+		{manager: "pnpm", install: "corepack pnpm install --frozen-lockfile"},
+		{manager: "yarn", install: "corepack yarn install --immutable"},
+	} {
+		t.Run(test.manager, func(t *testing.T) {
+			revision := deploymentplans.DeploymentPlanRevision{CanonicalDigest: strings.Repeat("c", 64), Plan: deploymentplans.Plan{Strategy: deploymentplans.StrategyGeneratedNode, Components: []deploymentplans.Component{{
+				Name: "api", Role: "server", RootDirectory: "apps/api", PackageManager: test.manager, InstallBehavior: test.install, InstallDirectory: ".", NodeVersion: "24", BuildCommand: "npm run build", RunCommand: "node server.js", InternalPort: 3000, HealthProbe: "/health",
+			}}}}
+			definition, _, err := definitionFor(revision, "api")
+			if err != nil {
+				t.Fatal(err)
+			}
+			recipe := containerfile(true, test.manager != "npm", definition.baseImage)
+			if !strings.Contains(recipe, "COPY --chown=node:node rig/root.path rig/install.path /run/rig/") || !strings.Contains(recipe, "install=$(cat /run/rig/install.path); cd -- \\\"/workspace/$install\\\"") || !strings.Contains(recipe, "root=$(cat /run/rig/root.path); cd -- \\\"/workspace/$root\\\"") {
+				t.Fatalf("workspace recipe did not preserve separate install/build roots:\n%s", recipe)
+			}
+		})
+	}
+}
+
+func TestContainerfileEnablesCorepackBeforeNonRootUsersInBothStages(t *testing.T) {
+	const baseImage = "node:test"
+	for _, packageManager := range []string{"pnpm", "yarn"} {
+		t.Run(packageManager, func(t *testing.T) {
+			recipe := containerfile(false, packageManager != "npm", baseImage)
+			builder, runtimeStage, found := strings.Cut(recipe, "FROM "+baseImage+" AS runtime\n")
+			if !found {
+				t.Fatal("runtime stage missing")
+			}
+			for stageName, stage := range map[string]string{"builder": builder, "runtime": runtimeStage} {
+				corepackIndex := strings.Index(stage, `RUN ["corepack", "enable"]`)
+				userIndex := strings.Index(stage, "USER node")
+				if corepackIndex < 0 || userIndex < 0 || corepackIndex > userIndex {
+					t.Errorf("%s stage does not enable Corepack before USER node:\n%s", stageName, stage)
+				}
+			}
+		})
+	}
+	if recipe := containerfile(false, false, baseImage); strings.Contains(recipe, `RUN ["corepack", "enable"]`) {
+		t.Fatal("npm recipe unexpectedly enables Corepack")
 	}
 }
 
