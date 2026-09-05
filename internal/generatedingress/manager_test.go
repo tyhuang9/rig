@@ -21,7 +21,7 @@ type ingressRunner struct {
 	network            string
 	endpoint           generatedruntime.RouteEndpoint
 	caddyNetworks      map[string]*networkAttachment
-	ingressContainers  []networkContainerInspection
+	ingressContainers  map[string]caddyNetworkContainerInspection
 	files              map[string][]byte
 	commands           [][]string
 	failProposedReload bool
@@ -54,11 +54,15 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 				return runtimeprocess.CommandResult{Stderr: []byte("no such network")}, errors.New("missing")
 			}
 			subnet, gateway, _ := ingressNetworkCandidate(0)
+			identity := networkInspection{Name: caddyNetworkName, Driver: "bridge", Scope: "local", Options: map[string]string{}, IPAM: []networkIPAM{{Subnet: subnet, Gateway: gateway}}, Labels: map[string]string{"io.rig.managed": "generated-ingress-network", "io.rig.identity-version": "v1"}}
 			containers := r.ingressContainers
 			if r.caddyMissing {
 				containers = nil
 			}
-			return jsonResult(networkInspection{Name: caddyNetworkName, Driver: "bridge", Scope: "local", Options: map[string]string{}, IPAM: []networkIPAM{{Subnet: subnet, Gateway: gateway}}, Labels: map[string]string{"io.rig.managed": "generated-ingress-network", "io.rig.identity-version": "v1"}, Containers: containers}), nil
+			if len(args) == 5 && args[2] == "--format" && args[3] == "json" {
+				return jsonResult([]caddyNetworkInspection{{Name: identity.Name, Driver: identity.Driver, Scope: identity.Scope, Internal: identity.Internal, Options: identity.Options, IPAM: caddyNetworkIPAM{Config: identity.IPAM}, Labels: identity.Labels, Containers: containers}}), nil
+			}
+			return jsonResult(identity), nil
 		}
 		return jsonResult(networkInspection{Name: r.network, Driver: "bridge", Scope: "local", Options: map[string]string{}, Labels: map[string]string{"io.rig.managed": generatedruntime.NetworkOwnershipLabelValue, "io.rig.application": r.appID}}), nil
 	}
@@ -101,7 +105,7 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 			return runtimeprocess.CommandResult{}, errors.New("missing static ingress address")
 		}
 		r.caddyNetworks[caddyNetworkName] = &networkAttachment{IPAddress: args[ipIndex+1]}
-		r.ingressContainers = []networkContainerInspection{{ID: strings.Repeat("d", 64), Name: caddyContainerName, IPv4Address: args[ipIndex+1] + "/28"}}
+		r.ingressContainers = map[string]caddyNetworkContainerInspection{strings.Repeat("d", 64): {Name: caddyContainerName, IPv4Address: args[ipIndex+1] + "/28"}}
 		return runtimeprocess.CommandResult{}, nil
 	}
 	if len(args) == 4 && args[0] == "container" && args[1] == "cp" {
@@ -439,7 +443,7 @@ func TestProvisionRejectsListenerAddressOutsideOwnedSubnet(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	_, _, expected := ingressNetworkCandidate(0)
 	runner.caddyNetworks[caddyNetworkName].IPAddress = expected
-	runner.ingressContainers[0].IPv4Address = "10.203.0.3/28"
+	runner.ingressContainers[strings.Repeat("d", 64)] = caddyNetworkContainerInspection{Name: caddyContainerName, IPv4Address: "10.203.0.3/28"}
 	if err := manager.Provision(context.Background()); !IsCode(err, DiagnosticIngressDrift) {
 		t.Fatalf("error = %v", err)
 	}
@@ -448,12 +452,12 @@ func TestProvisionRejectsListenerAddressOutsideOwnedSubnet(t *testing.T) {
 func TestCaddyIngressAddressRequiresExactNetworkEndpoint(t *testing.T) {
 	caddyID := "sha256:" + strings.Repeat("d", 64)
 	subnet, gateway, expected := ingressNetworkCandidate(0)
-	valid := func() networkInspection {
-		return networkInspection{
+	valid := func() caddyNetworkInspection {
+		return caddyNetworkInspection{
 			Name: caddyNetworkName, Driver: "bridge", Scope: "local", Options: map[string]string{},
-			IPAM:       []networkIPAM{{Subnet: subnet, Gateway: gateway}},
+			IPAM:       caddyNetworkIPAM{Config: []networkIPAM{{Subnet: subnet, Gateway: gateway}}},
 			Labels:     map[string]string{"io.rig.managed": "generated-ingress-network", "io.rig.identity-version": "v1"},
-			Containers: []networkContainerInspection{{ID: strings.Repeat("d", 64), Name: caddyContainerName, IPv4Address: expected + "/28"}},
+			Containers: map[string]caddyNetworkContainerInspection{strings.Repeat("d", 64): {Name: caddyContainerName, IPv4Address: expected + "/28"}},
 		}
 	}
 	if address, ok := caddyIngressAddress(valid(), caddyID); !ok || address != expected {
@@ -461,23 +465,135 @@ func TestCaddyIngressAddressRequiresExactNetworkEndpoint(t *testing.T) {
 	}
 	for _, test := range []struct {
 		name   string
-		mutate func(*networkInspection)
+		mutate func(*caddyNetworkInspection)
 	}{
-		{"missing", func(value *networkInspection) { value.Containers = nil }},
-		{"extra", func(value *networkInspection) { value.Containers = append(value.Containers, value.Containers[0]) }},
-		{"foreign id", func(value *networkInspection) { value.Containers[0].ID = strings.Repeat("e", 64) }},
-		{"wrong name", func(value *networkInspection) { value.Containers[0].Name = "foreign" }},
-		{"missing cidr", func(value *networkInspection) { value.Containers[0].IPv4Address = expected }},
-		{"wrong prefix", func(value *networkInspection) { value.Containers[0].IPv4Address = expected + "/24" }},
-		{"other address", func(value *networkInspection) { value.Containers[0].IPv4Address = "10.203.0.3/28" }},
-		{"outside subnet", func(value *networkInspection) { value.Containers[0].IPv4Address = "10.0.0.2/28" }},
-		{"invalid network", func(value *networkInspection) { value.Labels = nil }},
+		{"missing", func(value *caddyNetworkInspection) { value.Containers = nil }},
+		{"extra", func(value *caddyNetworkInspection) {
+			value.Containers[strings.Repeat("e", 64)] = caddyNetworkContainerInspection{Name: "foreign", IPv4Address: expected + "/28"}
+		}},
+		{"foreign id", func(value *caddyNetworkInspection) {
+			container := value.Containers[strings.Repeat("d", 64)]
+			delete(value.Containers, strings.Repeat("d", 64))
+			value.Containers[strings.Repeat("e", 64)] = container
+		}},
+		{"wrong name", func(value *caddyNetworkInspection) {
+			value.Containers[strings.Repeat("d", 64)] = caddyNetworkContainerInspection{Name: "foreign", IPv4Address: expected + "/28"}
+		}},
+		{"missing cidr", func(value *caddyNetworkInspection) {
+			value.Containers[strings.Repeat("d", 64)] = caddyNetworkContainerInspection{Name: caddyContainerName, IPv4Address: expected}
+		}},
+		{"wrong prefix", func(value *caddyNetworkInspection) {
+			value.Containers[strings.Repeat("d", 64)] = caddyNetworkContainerInspection{Name: caddyContainerName, IPv4Address: expected + "/24"}
+		}},
+		{"other address", func(value *caddyNetworkInspection) {
+			value.Containers[strings.Repeat("d", 64)] = caddyNetworkContainerInspection{Name: caddyContainerName, IPv4Address: "10.203.0.3/28"}
+		}},
+		{"outside subnet", func(value *caddyNetworkInspection) {
+			value.Containers[strings.Repeat("d", 64)] = caddyNetworkContainerInspection{Name: caddyContainerName, IPv4Address: "10.0.0.2/28"}
+		}},
+		{"invalid network", func(value *caddyNetworkInspection) { value.Labels = nil }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := valid()
 			test.mutate(&candidate)
 			if address, ok := caddyIngressAddress(candidate, caddyID); ok || address != "" {
 				t.Fatalf("unsafe endpoint address = %q, valid = %t", address, ok)
+			}
+		})
+	}
+}
+
+func TestInspectCaddyNetworkUsesBoundedRawEngineObservation(t *testing.T) {
+	manager, _ := newManagerFixture(t, false)
+	manager.options.OutputLimit = runtimeprocess.DefaultOutputLimit
+	subnet, gateway, expected := ingressNetworkCandidate(0)
+	containerID := strings.Repeat("d", 64)
+	raw, err := json.Marshal([]map[string]any{{
+		"Name": caddyNetworkName, "Driver": "bridge", "Scope": "local", "Internal": false,
+		"Options": map[string]string{}, "IPAM": map[string]any{"Config": []networkIPAM{{Subnet: subnet, Gateway: gateway}}},
+		"Labels": map[string]string{"io.rig.managed": "generated-ingress-network", "io.rig.identity-version": "v1"},
+		"Containers": map[string]any{containerID: map[string]any{
+			"Name": caddyContainerName, "IPv4Address": expected + "/28", "EndpointID": "sensitive-endpoint", "MacAddress": "sensitive-mac", "IPv6Address": "sensitive-ipv6",
+		}},
+		"Services": map[string]string{"sensitive-service": "sensitive-value"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &caddyNetworkInspectRunner{result: runtimeprocess.CommandResult{Stdout: raw}}
+	manager.runner = runner
+	inspection, found, inspectErr := manager.inspectCaddyNetwork(context.Background())
+	if inspectErr != nil || !found {
+		t.Fatalf("inspect error = %v, found = %t", inspectErr, found)
+	}
+	if !bytes.Equal(raw, make([]byte, len(raw))) {
+		t.Fatal("raw Caddy network inspection output was retained")
+	}
+	if len(runner.requests) != 1 {
+		t.Fatalf("request count = %d", len(runner.requests))
+	}
+	request := runner.requests[0]
+	if !reflect.DeepEqual(request.Args, []string{"network", "inspect", "--format", "json", caddyNetworkName}) || request.Executable != manager.options.DockerExecutable || request.Directory != manager.options.WorkingDirectory || !reflect.DeepEqual(request.Env, manager.dockerEnv) || request.Timeout != manager.options.CommandTimeout || request.OutputLimit != defaultOutputLimit {
+		t.Fatalf("unsafe Caddy network inspection request = %#v", request)
+	}
+	if address, valid := caddyIngressAddress(inspection, containerID); !valid || address != expected {
+		t.Fatalf("address = %q, valid = %t", address, valid)
+	}
+	if len(inspection.Containers) != 1 || inspection.Containers[containerID].Name != caddyContainerName || inspection.Containers[containerID].IPv4Address != expected+"/28" {
+		t.Fatalf("allowlisted endpoint = %#v", inspection.Containers)
+	}
+	clearCaddyNetworkInspection(&inspection)
+	if !reflect.DeepEqual(inspection, caddyNetworkInspection{}) {
+		t.Fatalf("cleared inspection retained state = %#v", inspection)
+	}
+}
+
+func TestInspectCaddyNetworkFailsClosed(t *testing.T) {
+	validRaw, err := json.Marshal([]caddyNetworkInspection{{
+		Name:       caddyNetworkName,
+		Containers: map[string]caddyNetworkContainerInspection{strings.Repeat("d", 64): {Name: caddyContainerName, IPv4Address: "10.203.0.2/28"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("missing", func(t *testing.T) {
+		manager, _ := newManagerFixture(t, false)
+		manager.runner = &caddyNetworkInspectRunner{result: runtimeprocess.CommandResult{Stderr: []byte("no such network")}, err: errors.New("missing")}
+		inspection, found, inspectErr := manager.inspectCaddyNetwork(context.Background())
+		if inspectErr != nil || found || !reflect.DeepEqual(inspection, caddyNetworkInspection{}) {
+			t.Fatalf("inspection = %#v, found = %t, error = %v", inspection, found, inspectErr)
+		}
+	})
+	for _, test := range []struct {
+		name   string
+		result runtimeprocess.CommandResult
+		err    error
+		code   DiagnosticCode
+	}{
+		{name: "malformed", result: runtimeprocess.CommandResult{Stdout: []byte("{")}, code: DiagnosticIngressDrift},
+		{name: "empty", result: runtimeprocess.CommandResult{Stdout: []byte("[]")}, code: DiagnosticIngressDrift},
+		{name: "multiple", result: runtimeprocess.CommandResult{Stdout: []byte("[{},{}]")}, code: DiagnosticIngressDrift},
+		{name: "stdout truncated", result: runtimeprocess.CommandResult{Stdout: validRaw, StdoutTruncated: true}, code: DiagnosticIngressDrift},
+		{name: "stderr truncated", result: runtimeprocess.CommandResult{Stdout: validRaw, StderrTruncated: true}, code: DiagnosticIngressDrift},
+		{name: "truncated missing", result: runtimeprocess.CommandResult{Stderr: []byte("no such network"), StderrTruncated: true}, err: errors.New("missing"), code: DiagnosticIngressDrift},
+		{name: "canceled missing", result: runtimeprocess.CommandResult{Stderr: []byte("no such network")}, err: context.Canceled, code: DiagnosticIngressUnavailable},
+		{name: "timed out missing", result: runtimeprocess.CommandResult{Stderr: []byte("no such network")}, err: context.DeadlineExceeded, code: DiagnosticIngressUnavailable},
+		{name: "termination failed missing", result: runtimeprocess.CommandResult{Stderr: []byte("no such network")}, err: runtimeprocess.ErrTerminationFailed, code: DiagnosticIngressUnavailable},
+		{name: "command failure", result: runtimeprocess.CommandResult{Stderr: []byte("sensitive daemon output")}, err: errors.New("failed"), code: DiagnosticIngressUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, _ := newManagerFixture(t, false)
+			result := test.result
+			result.Stdout = append([]byte(nil), test.result.Stdout...)
+			result.Stderr = append([]byte(nil), test.result.Stderr...)
+			runner := &caddyNetworkInspectRunner{result: result, err: test.err}
+			manager.runner = runner
+			inspection, found, inspectErr := manager.inspectCaddyNetwork(context.Background())
+			if found || !IsCode(inspectErr, test.code) || !reflect.DeepEqual(inspection, caddyNetworkInspection{}) {
+				t.Fatalf("inspection = %#v, found = %t, error = %v", inspection, found, inspectErr)
+			}
+			if !bytes.Equal(result.Stdout, make([]byte, len(result.Stdout))) || !bytes.Equal(result.Stderr, make([]byte, len(result.Stderr))) {
+				t.Fatal("failed Caddy network inspection retained raw output")
 			}
 		})
 	}
@@ -629,8 +745,8 @@ func TestIngressInspectFormatsUseCanonicalDockerFieldsAndNilGuards(t *testing.T)
 	if err := json.Unmarshal([]byte(renderedNetwork), &network); err != nil {
 		t.Fatal("network inspection template output was not JSON")
 	}
-	if len(network.Containers) != 1 || network.Containers[0].ID != strings.Repeat("d", 64) || network.Containers[0].Name != caddyContainerName || network.Containers[0].IPv4Address != ingressAddress+"/28" {
-		t.Fatalf("network container projection = %#v", network.Containers)
+	if network.Name != caddyNetworkName || len(network.IPAM) != 1 || network.IPAM[0].Subnet != subnet || len(network.Labels) != 2 {
+		t.Fatalf("network identity projection = %#v", network)
 	}
 
 	containerID := strings.Repeat("b", 64)
@@ -739,7 +855,7 @@ func newManagerFixture(t *testing.T, failReload bool) (*Manager, *ingressRunner)
 	runner := &ingressRunner{
 		appID: appID, network: endpoint.NetworkName, endpoint: endpoint,
 		caddyNetworks:     map[string]*networkAttachment{caddyNetworkName: {}},
-		ingressContainers: []networkContainerInspection{{ID: strings.Repeat("d", 64), Name: caddyContainerName, IPv4Address: ingressIP + "/28"}},
+		ingressContainers: map[string]caddyNetworkContainerInspection{strings.Repeat("d", 64): {Name: caddyContainerName, IPv4Address: ingressIP + "/28"}},
 		files:             map[string][]byte{}, failProposedReload: failReload,
 	}
 	manager, err := New(runner, Options{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: dockerConfig, WorkingDirectory: root, DataRoot: root})
@@ -828,6 +944,19 @@ type templateIngressDockerHealth struct {
 
 type templateIngressDockerNetworkSettings struct {
 	Networks map[string]*networkAttachment
+}
+
+type caddyNetworkInspectRunner struct {
+	requests []runtimeprocess.CommandRequest
+	result   runtimeprocess.CommandResult
+	err      error
+}
+
+func (runner *caddyNetworkInspectRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	request.Args = append([]string(nil), request.Args...)
+	request.Env = append([]string(nil), request.Env...)
+	runner.requests = append(runner.requests, request)
+	return runner.result, runner.err
 }
 
 type templateIngressDockerNetwork struct {

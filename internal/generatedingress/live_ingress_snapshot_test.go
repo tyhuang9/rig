@@ -139,28 +139,36 @@ func liveIngressListenReason(ctx context.Context, manager *Manager) (string, str
 	if ctx.Err() != nil {
 		return "unavailable", "network_unavailable"
 	}
-	network, networkFound, networkErr := manager.inspectNetwork(ctx, caddyNetworkName)
-	defer clearLiveNetworkInspection(&network)
+	network, networkFound, networkErr := manager.inspectCaddyNetwork(ctx)
+	defer clearCaddyNetworkInspection(&network)
 	if networkErr != nil {
 		return "drift", "network_unavailable"
 	}
 	if !networkFound {
 		return "drift", "network_missing"
 	}
-	expectedIP, networkValid := ingressNetworkIdentity(network)
+	expectedIP, networkValid := ingressNetworkIdentity(network.identity())
 	if !networkValid {
 		expectedIP = ""
 		return "drift", "network_invalid"
 	}
-	if len(network.Containers) == 0 || network.Containers[0].IPv4Address == "" {
+	if len(network.Containers) == 0 {
 		expectedIP = ""
 		return "drift", "ip_missing"
 	}
-	if len(network.Containers) != 1 || normalizeID(network.Containers[0].ID) != normalizeID(caddy.ID) || network.Containers[0].Name != caddyContainerName {
+	var containerID string
+	var container caddyNetworkContainerInspection
+	for containerID, container = range network.Containers {
+	}
+	if len(network.Containers) != 1 || normalizeID(containerID) != normalizeID(caddy.ID) || container.Name != caddyContainerName {
 		expectedIP = ""
 		return "drift", "ip_invalid"
 	}
-	parsedPrefix, parseErr := netip.ParsePrefix(network.Containers[0].IPv4Address)
+	if container.IPv4Address == "" {
+		expectedIP = ""
+		return "drift", "ip_missing"
+	}
+	parsedPrefix, parseErr := netip.ParsePrefix(container.IPv4Address)
 	if parseErr != nil || !parsedPrefix.Addr().Is4() {
 		expectedIP = ""
 		return "drift", "ip_invalid"
@@ -169,7 +177,7 @@ func liveIngressListenReason(ctx context.Context, manager *Manager) (string, str
 		expectedIP = ""
 		return "valid", "ip_expected"
 	}
-	prefix, prefixErr := netip.ParsePrefix(network.IPAM[0].Subnet)
+	prefix, prefixErr := netip.ParsePrefix(network.IPAM.Config[0].Subnet)
 	expectedIP = ""
 	if prefixErr == nil && prefix.Contains(parsedPrefix.Addr()) {
 		return "drift", "ip_other_in_subnet"
@@ -692,10 +700,6 @@ func clearLiveNetworkInspection(value *networkInspection) {
 	clear(value.Options)
 	clear(value.Labels)
 	clear(value.IPAM)
-	for index := range value.Containers {
-		value.Containers[index] = networkContainerInspection{}
-	}
-	clear(value.Containers)
 	*value = networkInspection{}
 }
 
@@ -874,7 +878,7 @@ func TestLiveIngressInspectionClearHelpersZeroDecodedState(t *testing.T) {
 	_, runner := newManagerFixture(t, false)
 	image := imageInspection{ID: "sensitive", OS: "linux", RepoDigests: []string{"sensitive"}}
 	volume := volumeInspection{Name: "sensitive", Options: map[string]string{"sensitive": "sensitive"}, Labels: map[string]string{"sensitive": "sensitive"}}
-	network := networkInspection{Name: "sensitive", Options: map[string]string{"sensitive": "sensitive"}, IPAM: []networkIPAM{{Subnet: "sensitive"}}, Labels: map[string]string{"sensitive": "sensitive"}, Containers: []networkContainerInspection{{ID: "sensitive", Name: "sensitive", IPv4Address: "sensitive"}}}
+	network := networkInspection{Name: "sensitive", Options: map[string]string{"sensitive": "sensitive"}, IPAM: []networkIPAM{{Subnet: "sensitive"}}, Labels: map[string]string{"sensitive": "sensitive"}}
 	caddy := runner.caddyInspection()
 	clearLiveImageInspection(&image)
 	clearLiveVolumeInspection(&volume)
@@ -1126,7 +1130,7 @@ func TestLiveIngressRouteFailureDiagnosticIsReadOnlyAndIndependent(t *testing.T)
 	}
 
 	manager, runner = newManagerFixture(t, false)
-	runner.ingressContainers[0].IPv4Address = "10.0.0.1/28"
+	runner.ingressContainers[strings.Repeat("d", 64)] = caddyNetworkContainerInspection{Name: caddyContainerName, IPv4Address: "10.0.0.1/28"}
 	if diagnostic := liveIngressRouteFailureDiagnostic(context.Background(), manager, switchRequest(runner)); diagnostic != "route_snapshot=listen:drift,listen_reason:ip_outside_subnet,endpoints:valid" {
 		t.Fatalf("listen drift diagnostic = %q", diagnostic)
 	}

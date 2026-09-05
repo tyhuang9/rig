@@ -510,7 +510,8 @@ func (m *Manager) caddyListenAddress(ctx context.Context) (string, error) {
 		return "", &Error{Code: DiagnosticIngressUnavailable}
 	}
 	attachment := inspection.Networks[caddyNetworkName]
-	network, networkFound, networkErr := m.inspectNetwork(ctx, caddyNetworkName)
+	network, networkFound, networkErr := m.inspectCaddyNetwork(ctx)
+	defer clearCaddyNetworkInspection(&network)
 	listenAddress, networkValid := caddyIngressAddress(network, inspection.ID)
 	if attachment == nil || !networkFound || networkErr != nil || !networkValid {
 		return "", &Error{Code: DiagnosticIngressDrift}
@@ -577,8 +578,9 @@ func (m *Manager) reconcileCaddyNetworks(ctx context.Context, routes map[string]
 			return &Error{Code: DiagnosticIngressDrift}
 		}
 		if network == caddyNetworkName {
-			ingress, ok, inspectErr := m.inspectNetwork(ctx, caddyNetworkName)
+			ingress, ok, inspectErr := m.inspectCaddyNetwork(ctx)
 			_, valid := caddyIngressAddress(ingress, final.ID)
+			clearCaddyNetworkInspection(&ingress)
 			if inspectErr != nil || !ok || !valid {
 				return &Error{Code: DiagnosticIngressDrift}
 			}
@@ -644,20 +646,23 @@ func ingressNetworkIdentity(value networkInspection) (string, bool) {
 	return "", false
 }
 
-func caddyIngressAddress(network networkInspection, caddyID string) (string, bool) {
-	expectedIP, valid := ingressNetworkIdentity(network)
+func caddyIngressAddress(network caddyNetworkInspection, caddyID string) (string, bool) {
+	expectedIP, valid := ingressNetworkIdentity(network.identity())
 	if !valid || !validContainerID(caddyID) || len(network.Containers) != 1 {
 		return "", false
 	}
-	container := network.Containers[0]
-	if normalizeID(container.ID) != normalizeID(caddyID) || container.Name != caddyContainerName {
+	var containerID string
+	var container caddyNetworkContainerInspection
+	for containerID, container = range network.Containers {
+	}
+	if normalizeID(containerID) != normalizeID(caddyID) || container.Name != caddyContainerName {
 		return "", false
 	}
 	addressPrefix, err := netip.ParsePrefix(container.IPv4Address)
 	if err != nil || !addressPrefix.Addr().Is4() {
 		return "", false
 	}
-	networkPrefix, err := netip.ParsePrefix(network.IPAM[0].Subnet)
+	networkPrefix, err := netip.ParsePrefix(network.IPAM.Config[0].Subnet)
 	if err != nil || addressPrefix.Bits() != networkPrefix.Bits() || addressPrefix.Masked() != networkPrefix.Masked() {
 		return "", false
 	}
@@ -780,20 +785,37 @@ type mountInspection struct {
 }
 
 type networkInspection struct {
-	Name       string                       `json:"name"`
-	Driver     string                       `json:"driver"`
-	Scope      string                       `json:"scope"`
-	Internal   bool                         `json:"internal"`
-	Options    map[string]string            `json:"options"`
-	IPAM       []networkIPAM                `json:"ipam"`
-	Labels     map[string]string            `json:"labels"`
-	Containers []networkContainerInspection `json:"containers"`
+	Name     string            `json:"name"`
+	Driver   string            `json:"driver"`
+	Scope    string            `json:"scope"`
+	Internal bool              `json:"internal"`
+	Options  map[string]string `json:"options"`
+	IPAM     []networkIPAM     `json:"ipam"`
+	Labels   map[string]string `json:"labels"`
 }
 
-type networkContainerInspection struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	IPv4Address string `json:"ipv4Address"`
+type caddyNetworkInspection struct {
+	Name       string                                     `json:"Name"`
+	Driver     string                                     `json:"Driver"`
+	Scope      string                                     `json:"Scope"`
+	Internal   bool                                       `json:"Internal"`
+	Options    map[string]string                          `json:"Options"`
+	IPAM       caddyNetworkIPAM                           `json:"IPAM"`
+	Labels     map[string]string                          `json:"Labels"`
+	Containers map[string]caddyNetworkContainerInspection `json:"Containers"`
+}
+
+func (value caddyNetworkInspection) identity() networkInspection {
+	return networkInspection{Name: value.Name, Driver: value.Driver, Scope: value.Scope, Internal: value.Internal, Options: value.Options, IPAM: value.IPAM.Config, Labels: value.Labels}
+}
+
+type caddyNetworkIPAM struct {
+	Config []networkIPAM `json:"Config"`
+}
+
+type caddyNetworkContainerInspection struct {
+	Name        string `json:"Name"`
+	IPv4Address string `json:"IPv4Address"`
 }
 
 type networkIPAM struct {
@@ -824,7 +846,7 @@ const (
 	imageInspectFormat    = `{"id":{{json .ID}},"os":{{json .Os}},"repoDigests":{{json .RepoDigests}}}`
 	volumeInspectFormat   = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"options":{{json .Options}},"labels":{{json .Labels}}}`
 	caddyInspectFormat    = `{"id":{{json .ID}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"hostname":{{json .Config.Hostname}},"user":{{json .Config.User}},"env":{{json .Config.Env}},"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"readOnly":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"tmpfs":{{json .HostConfig.Tmpfs}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCPUs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"networkMode":{{json .HostConfig.NetworkMode}},"ulimits":{{json .HostConfig.Ulimits}},"running":{{json .State.Running}},"portBindings":{{json .HostConfig.PortBindings}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
-	networkInspectFormat  = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"internal":{{json .Internal}},"options":{{json .Options}},"ipam":{{json .IPAM.Config}},"labels":{{json .Labels}},"containers":[{{$first := true}}{{range $id, $container := .Containers}}{{if $first}}{{$first = false}}{{else}},{{end}}{"id":{{json $id}},"name":{{json $container.Name}},"ipv4Address":{{json $container.IPv4Address}}}{{end}}]}`
+	networkInspectFormat  = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"internal":{{json .Internal}},"options":{{json .Options}},"ipam":{{json .IPAM.Config}},"labels":{{json .Labels}}}`
 	endpointInspectFormat = `{"id":{{json .ID}},"labels":{{json .Config.Labels}},"running":{{json .State.Running}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
 )
 
@@ -850,6 +872,73 @@ func (m *Manager) inspectNetwork(ctx context.Context, name string) (networkInspe
 	var value networkInspection
 	found, err := m.inspectJSON(ctx, &value, "network", "inspect", "--format", networkInspectFormat, name)
 	return value, found, err
+}
+
+func (m *Manager) inspectCaddyNetwork(ctx context.Context) (caddyNetworkInspection, bool, error) {
+	var value caddyNetworkInspection
+	outputLimit := m.options.OutputLimit
+	if outputLimit > defaultOutputLimit {
+		outputLimit = defaultOutputLimit
+	}
+	result, err := m.runner.Run(ctx, runtimeprocess.CommandRequest{
+		Executable:  m.options.DockerExecutable,
+		Args:        []string{"network", "inspect", "--format", "json", caddyNetworkName},
+		Directory:   m.options.WorkingDirectory,
+		Env:         append([]string(nil), m.dockerEnv...),
+		Timeout:     m.options.CommandTimeout,
+		OutputLimit: outputLimit,
+	})
+	if result.StdoutTruncated || result.StderrTruncated {
+		clearResult(&result)
+		return value, false, &Error{Code: DiagnosticIngressDrift}
+	}
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, runtimeprocess.ErrTerminationFailed) {
+		clearResult(&result)
+		return value, false, &Error{Code: DiagnosticIngressUnavailable}
+	}
+	if err != nil {
+		notFound := dockerNotFound(result)
+		clearResult(&result)
+		if notFound {
+			return value, false, nil
+		}
+		return value, false, &Error{Code: DiagnosticIngressUnavailable}
+	}
+	var values []caddyNetworkInspection
+	decodeErr := json.Unmarshal(result.Stdout, &values)
+	clearResult(&result)
+	if decodeErr != nil || len(values) != 1 {
+		clearCaddyNetworkInspections(values)
+		return value, false, &Error{Code: DiagnosticIngressDrift}
+	}
+	value = values[0]
+	values[0] = caddyNetworkInspection{}
+	clear(values)
+	return value, true, nil
+}
+
+func clearCaddyNetworkInspections(values []caddyNetworkInspection) {
+	for index := range values {
+		clearCaddyNetworkInspection(&values[index])
+	}
+	clear(values)
+}
+
+func clearCaddyNetworkInspection(value *caddyNetworkInspection) {
+	if value == nil {
+		return
+	}
+	clear(value.Options)
+	clear(value.Labels)
+	for index := range value.IPAM.Config {
+		value.IPAM.Config[index] = networkIPAM{}
+	}
+	clear(value.IPAM.Config)
+	for id := range value.Containers {
+		value.Containers[id] = caddyNetworkContainerInspection{}
+		delete(value.Containers, id)
+	}
+	*value = caddyNetworkInspection{}
 }
 
 func (m *Manager) inspectJSON(ctx context.Context, destination any, args ...string) (bool, error) {
