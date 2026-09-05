@@ -494,3 +494,16 @@ button:disabled { cursor: wait; opacity: .62; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
 }
+
+.github-connection-card { min-width: 0; padding: 1.25rem; border: 1px solid var(--border, #d4d4d4); border-radius: 12px; margin-bottom: 1rem; overflow-wrap: anywhere; }
+.connector-heading { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; flex-wrap: wrap; }
+.connector-heading > *, .github-connection-card .connection-status > * { min-width: 0; max-width: 100%; }
+.connector-heading h3 { margin-top: 0; }
+.connector-heading p { max-width: 60ch; }
+.github-connection-card .connection-status { display: flex; flex-direction: column; align-items: flex-start; gap: .65rem; margin: 1rem 0; }
+.github-connection-card .connection-actions { display: flex; gap: .65rem; flex-wrap: wrap; }
+.github-repository-picker { width: 100%; min-width: 0; }
+.repository-search > div { display: flex; gap: .5rem; }
+.repository-search input { flex: 1; min-width: 0; }
+.relay-source-grid > .github-repository-picker { grid-column: 1 / -1; }
+@media (max-width: 540px) { .repository-search > div { flex-wrap: wrap; } .repository-search input { width: 100%; flex-basis: 100%; } }
