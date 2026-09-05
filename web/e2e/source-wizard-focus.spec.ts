@@ -152,7 +152,9 @@ test("keeps focusable pagination guarded while loading and on an empty final pag
   await expect(page.getByRole("heading", { name: "Add application" })).toBeVisible();
   await page.getByLabel("GitHub repository").check();
   const connectionSelect = page.getByLabel("GitHub connection");
+  await expect(connectionSelect).toBeEnabled();
   await connectionSelect.focus();
+  await expect(connectionSelect).toBeFocused();
   await connectionSelect.selectOption(pendingConnectionId);
   await expect(connectionSelect).toBeFocused();
   await expect(page.locator(".connection-status")).toContainText("Resume authorization check is now available.");
