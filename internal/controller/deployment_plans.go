@@ -75,13 +75,14 @@ func (s *Server) acceptApplicationDeploymentPlan(w http.ResponseWriter, r *http.
 		if resolved == "" {
 			resolved = configured.Analysis.StructuralFingerprint
 		}
-		plan, candidate, setupErr := deploymentplans.AcceptSetup(configured.Analysis, deploymentSetupInput(body.Setup), deploymentplans.SourceIdentity{Provider: configured.Source.Type, RepositoryID: configured.Source.RepositoryID, ResolvedDigest: resolved})
+		plan, _, setupErr := deploymentplans.AcceptSetup(configured.Analysis, deploymentSetupInput(body.Setup), deploymentplans.SourceIdentity{Provider: configured.Source.Type, RepositoryID: configured.Source.RepositoryID, ResolvedDigest: resolved})
 		if setupErr != nil {
 			if !deploymentSetupProblem(w, r, setupErr) {
 				deploymentPlanProblem(w, r, setupErr)
 			}
 			return
 		}
+		candidate := configured.Analysis.Candidates[len(configured.Analysis.Candidates)-1]
 		if body.CandidateID != candidate.ID || body.ExpectedCandidateDigest != candidate.Digest {
 			problem(w, r, http.StatusConflict, "deployment_plan_review_required", "The deployment setup changed; review it again", nil)
 			return

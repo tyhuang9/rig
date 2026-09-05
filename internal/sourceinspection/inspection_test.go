@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/hostd/hostd/internal/githubapp"
+	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
@@ -157,6 +158,76 @@ func TestInspectLocalInfersJavaScriptProjectWithoutExecutingIt(t *testing.T) {
 	}
 	if len(result.Findings) != 0 || result.Source.ComposePath != "" {
 		t.Fatalf("generated candidate was forced through Compose selection: %#v", result)
+	}
+}
+
+func TestInspectLocalRetainsOnlyPrivateEvidenceForSelectedPrebuiltStaticOutput(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "dist"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "dist", "index.html"), []byte("<h1>prebuilt</h1>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := InspectLocalContext(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Analysis.Candidates) != 0 {
+		t.Fatalf("prebuilt output became an inferred candidate: %#v", result.Analysis.Candidates)
+	}
+	configured, err := WithSetup(result, projectanalysis.DeploymentSetup{Components: []projectanalysis.SetupComponent{{
+		ID: "site", Technology: "static", RootDirectory: ".", PackageManager: "npm", NodeVersion: "24",
+		OutputDirectory: "dist", InternalPort: 8080, HealthProbe: "/",
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configured.Analysis.Candidates) != 1 || configured.Analysis.Candidates[0].Components[0].StaticOutputDirectory != "dist" {
+		t.Fatalf("prebuilt static setup was not prepared: %#v", configured.Analysis.Candidates)
+	}
+}
+
+func TestInspectLocalRetainsPrivateEvidenceForContainedPrebuiltStaticOutput(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "dist", "client"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "dist", "client", "index.html"), []byte("<h1>prebuilt</h1>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := InspectLocalContext(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured, err := WithSetup(result, projectanalysis.DeploymentSetup{Components: []projectanalysis.SetupComponent{{
+		ID: "site", Technology: "static", RootDirectory: ".", PackageManager: "npm", NodeVersion: "24",
+		OutputDirectory: "dist/client", InternalPort: 8080, HealthProbe: "/",
+	}}})
+	if err != nil || len(configured.Analysis.Candidates) != 1 || configured.Analysis.Candidates[0].Components[0].StaticOutputDirectory != "dist/client" {
+		t.Fatalf("contained prebuilt static setup was not prepared: result=%#v err=%v", configured.Analysis.Candidates, err)
+	}
+}
+
+func TestInspectGitHubRetainsPrebuiltStaticOutputWithoutReadingIt(t *testing.T) {
+	reader := &fakeReader{
+		repository: sourceconnections.SourceRepository{ID: 9, Owner: "o", Name: "r"},
+		branch:     sourceconnections.Branch{Name: "main", SHA: testSHA},
+		tree:       githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "dist/index.html", Type: "blob", Size: 20, SHA: testSHA}}},
+	}
+	result, err := InspectGitHub(context.Background(), reader, "owner", GitHubSource{ConnectionID: "c", InstallationID: 1, RepositoryID: 9, Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reader.contentReads != 0 || len(result.Analysis.Candidates) != 0 {
+		t.Fatalf("prebuilt tree was read or inferred: reads=%d candidates=%#v", reader.contentReads, result.Analysis.Candidates)
+	}
+	configured, err := WithSetup(result, projectanalysis.DeploymentSetup{Components: []projectanalysis.SetupComponent{{
+		ID: "site", Technology: "static", RootDirectory: ".", PackageManager: "npm", NodeVersion: "24",
+		OutputDirectory: "dist", InternalPort: 8080, HealthProbe: "/",
+	}}})
+	if err != nil || len(configured.Analysis.Candidates) != 1 {
+		t.Fatalf("GitHub prebuilt static setup: result=%#v err=%v", configured, err)
 	}
 }
 

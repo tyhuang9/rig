@@ -177,7 +177,7 @@ func InspectLocalContext(ctx context.Context, sourcePath string) (Result, error)
 			return nil
 		}
 		if entry.IsDir() {
-			if current != root && excludedAnalysisDirectory(entry.Name()) {
+			if current != root && excludedAnalysisDirectory(entry.Name()) && !observedStaticOutputDirectory(root, current) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -322,6 +322,32 @@ func excludedAnalysisDirectory(name string) bool {
 	default:
 		return false
 	}
+}
+
+// observedStaticOutputDirectory is the small exception to ordinary analysis
+// traversal: it permits a normal dist/build/out directory to contribute only
+// private existence evidence for a later explicit, build-skipped static setup.
+// Project analysis still excludes it from detection and fingerprints.
+func observedStaticOutputDirectory(root, current string) bool {
+	relative, err := filepath.Rel(root, current)
+	if err != nil || relative == "." || filepath.IsAbs(relative) {
+		return false
+	}
+	segments := strings.Split(filepath.ToSlash(relative), "/")
+	if len(segments) == 0 {
+		return false
+	}
+	switch strings.ToLower(segments[len(segments)-1]) {
+	case "dist", "build", "out":
+	default:
+		return false
+	}
+	for _, segment := range segments[:len(segments)-1] {
+		if excludedAnalysisDirectory(segment) {
+			return false
+		}
+	}
+	return true
 }
 
 func projectAnalysisError(err error) error {

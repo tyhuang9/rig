@@ -13,7 +13,7 @@ import (
 func TestSkippedInstallBuildAndStaticValidationReachCompiler(t *testing.T) {
 	workspace, operation := t.TempDir(), t.TempDir()
 	writeTestFile(t, filepath.Join(workspace, "public", "index.html"), "hello")
-	definition := componentDefinition{name: "site", role: "static", rootDirectory: ".", packageManager: "npm", nodeVersion: "24", staticOutputDirectory: "public", baseImage: nodeImages["24"]}
+	definition := componentDefinition{name: "site", role: "static", rootDirectory: ".", installDirectory: ".", packageManager: "npm", nodeVersion: "24", staticOutputDirectory: "public", baseImage: nodeImages["24"]}
 	layout, err := prepareBuildContext(context.Background(), workspace, operation, definition, contextLimits{})
 	if err != nil {
 		t.Fatal(err)

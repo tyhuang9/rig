@@ -60,7 +60,11 @@ func prepareBuildContext(ctx context.Context, workspace, operationDirectory stri
 			return buildLayout{}, err
 		}
 	}
-	if err := copySanitizedTree(ctx, workspace, filepath.Join(layout.contextDirectory, "source"), limits); err != nil {
+	staticOutput, err := selectedStaticOutput(component)
+	if err != nil {
+		return buildLayout{}, err
+	}
+	if err := copySanitizedTree(ctx, workspace, filepath.Join(layout.contextDirectory, "source"), limits, staticOutput); err != nil {
 		return buildLayout{}, err
 	}
 	root := filepath.Join(layout.contextDirectory, "source", filepath.FromSlash(component.rootDirectory))
@@ -100,7 +104,100 @@ func validComponentRoot(value string) bool {
 	return value != "" && !strings.Contains(value, `\`) && !strings.Contains(value, ":") && !strings.HasPrefix(value, "/") && path.Clean(value) == value && value != ".." && !strings.HasPrefix(value, "../")
 }
 
-func copySanitizedTree(ctx context.Context, sourceRoot, destinationRoot string, limits contextLimits) error {
+func selectedStaticOutput(component componentDefinition) (string, error) {
+	if component.staticOutputDirectory == "" {
+		return "", nil
+	}
+	if !validComponentRoot(component.staticOutputDirectory) {
+		return "", errInvalidBuildContext
+	}
+	output := component.staticOutputDirectory
+	if component.rootDirectory != "." {
+		output = path.Join(component.rootDirectory, output)
+	}
+	if unsafeStaticOutputDirectory(output) {
+		return "", errInvalidBuildContext
+	}
+	if component.buildCommand != "" {
+		return "", nil
+	}
+	if hasStaticArtifactDirectory(output) && !prebuiltStaticOutputDirectory(output) {
+		return "", errInvalidBuildContext
+	}
+	if !prebuiltStaticOutputDirectory(output) {
+		return "", nil
+	}
+	return output, nil
+}
+
+func prebuiltStaticOutputDirectory(value string) bool {
+	segments := strings.Split(value, "/")
+	artifactRoot := false
+	for _, segment := range segments {
+		switch strings.ToLower(segment) {
+		case "dist", "build", "out":
+			if artifactRoot {
+				return false
+			}
+			artifactRoot = true
+		case ".git", ".hg", ".svn", ".rig", ".hostd", "node_modules", ".next", ".nuxt", ".svelte-kit", "coverage", ".turbo", ".cache":
+			return false
+		}
+	}
+	return artifactRoot
+}
+
+func hasStaticArtifactDirectory(value string) bool {
+	for _, segment := range strings.Split(value, "/") {
+		switch strings.ToLower(segment) {
+		case "dist", "build", "out":
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeStaticOutputDirectory(value string) bool {
+	segments := strings.Split(strings.ToLower(value), "/")
+	for index, segment := range segments {
+		if sensitiveStaticOutputSegment(segment) {
+			return true
+		}
+		switch segment {
+		case ".git", ".hg", ".svn", ".rig", ".hostd", "node_modules", ".next", ".nuxt", ".svelte-kit", "coverage", ".turbo", ".cache", ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker":
+			return true
+		case ".config":
+			if index+1 < len(segments) {
+				switch segments[index+1] {
+				case "gcloud", "gh", "hub":
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func sensitiveStaticOutputSegment(name string) bool {
+	if strings.HasPrefix(name, ".env") {
+		return true
+	}
+	switch name {
+	case ".netrc", ".git-credentials", "credentials", "credentials.json", "auth.json", ".pypirc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519":
+		return true
+	}
+	if strings.HasPrefix(name, "service-account") && strings.HasSuffix(name, ".json") {
+		return true
+	}
+	for _, suffix := range []string{".pem", ".key", ".p12", ".pfx"} {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func copySanitizedTree(ctx context.Context, sourceRoot, destinationRoot string, limits contextLimits, staticOutput string) error {
 	root, err := filepath.Abs(sourceRoot)
 	if err != nil || filepath.Clean(sourceRoot) != root {
 		return errInvalidBuildContext
@@ -131,7 +228,7 @@ func copySanitizedTree(ctx context.Context, sourceRoot, destinationRoot string, 
 			return errInvalidBuildContext
 		}
 		seen[key] = struct{}{}
-		excluded, rejected := classifiedBuildPath(canonical, entry.IsDir())
+		excluded, rejected := classifiedBuildPath(canonical, entry.IsDir(), staticOutput)
 		if rejected {
 			return errInvalidBuildContext
 		}
@@ -168,12 +265,29 @@ func copySanitizedTree(ctx context.Context, sourceRoot, destinationRoot string, 
 	return err
 }
 
-func classifiedBuildPath(canonical string, directory bool) (excluded, rejected bool) {
-	segments := strings.Split(strings.ToLower(canonical), "/")
+func classifiedBuildPath(canonical string, directory bool, staticOutput string) (excluded, rejected bool) {
+	canonical = strings.ToLower(canonical)
+	staticOutput = strings.ToLower(staticOutput)
+	if artifactRoot := prebuiltStaticArtifactRoot(staticOutput); artifactRoot != "" && (canonical == artifactRoot || strings.HasPrefix(canonical, artifactRoot+"/")) {
+		if canonical == staticOutput || strings.HasPrefix(staticOutput, canonical+"/") {
+			// Keep only the selected output's ancestors. Their ordinary artifact
+			// names would otherwise stop WalkDir before it reaches the selection.
+			return false, false
+		}
+		if !strings.HasPrefix(canonical, staticOutput+"/") {
+			return true, false
+		}
+	}
+	segments := strings.Split(canonical, "/")
 	name := segments[len(segments)-1]
 	if directory {
 		switch name {
-		case ".git", ".hg", ".svn", ".rig", ".hostd", "node_modules", ".next", ".nuxt", ".svelte-kit", "dist", "build", "out", "coverage", ".turbo":
+		case "dist", "build", "out":
+			if canonical == staticOutput {
+				return false, false
+			}
+			return true, false
+		case ".git", ".hg", ".svn", ".rig", ".hostd", "node_modules", ".next", ".nuxt", ".svelte-kit", "coverage", ".turbo":
 			return true, false
 		case ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker":
 			return false, true
@@ -195,6 +309,17 @@ func classifiedBuildPath(canonical string, directory bool) (excluded, rejected b
 		}
 	}
 	return false, false
+}
+
+func prebuiltStaticArtifactRoot(value string) string {
+	segments := strings.Split(strings.ToLower(value), "/")
+	for index, segment := range segments {
+		switch segment {
+		case "dist", "build", "out":
+			return strings.Join(segments[:index+1], "/")
+		}
+	}
+	return ""
 }
 
 func copyBuildFile(source, target, canonical string, before os.FileInfo) error {

@@ -18,7 +18,7 @@ func explicitSetup() *apicontract.DeploymentSetupInput {
 }
 
 func TestDeploymentSetupAPIAcceptsUndetectedAppAndRejectsStaleOrInvalidSetup(t *testing.T) {
-	handler, session, app, source := deploymentPlanAPIFixture(t, map[string]string{"server.js": "// metadata only"})
+	handler, session, _, app, source := deploymentPlanAPIFixture(t, map[string]string{"server.js": "// metadata only"})
 	setup := explicitSetup()
 	inspect := func() apicontract.InspectResponse {
 		t.Helper()
@@ -96,6 +96,19 @@ func TestGitHubManualSetupCreatesDraftWithoutInferredCandidate(t *testing.T) {
 	}
 	if app.Source.ComposePath != "" || app.Source.RepositoryID != 77 {
 		t.Fatalf("wrong source: %#v", app.Source)
+	}
+	// A branch advancing to a different commit invalidates the reviewed setup,
+	// even when its filenames and package metadata have not changed.
+	inspected := authenticatedJSONRequest(t, harness.handler, harness.session, http.MethodPost, "/api/v1/apps/import/inspect", apicontract.InspectRequest{GithubSource: source, Setup: explicitSetup()})
+	var inspection apicontract.InspectResponse
+	if err := json.Unmarshal(inspected.Body.Bytes(), &inspection); err != nil {
+		t.Fatal(err)
+	}
+	candidate := inspection.Analysis.Candidates[len(inspection.Analysis.Candidates)-1]
+	harness.provider.branch.SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	stale := rawAuthenticatedJSONRequest(t, harness.handler, harness.session, http.MethodPut, "/api/v1/apps/"+app.ID+"/deployment-plan", apicontract.AcceptDeploymentPlanRequest{Setup: explicitSetup(), CandidateID: candidate.ID, ExpectedCandidateDigest: candidate.Digest, ExpectedSourceStructuralFingerprint: inspection.Analysis.StructuralFingerprint})
+	if stale.Code != http.StatusConflict || !jsonProblemCode(stale.Body.Bytes(), "deployment_plan_review_required") {
+		t.Fatalf("changed commit accepted: %d %s", stale.Code, stale.Body.String())
 	}
 	// GitHub reports symbolic links as blobs; they are not evidence of a usable root.
 	harness.provider.tree.Entries[0].Mode = "120000"

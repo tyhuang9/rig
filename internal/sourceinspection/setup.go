@@ -1,6 +1,12 @@
 package sourceinspection
 
-import "github.com/hostd/hostd/internal/projectanalysis"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+
+	"github.com/hostd/hostd/internal/projectanalysis"
+)
 
 // WithSetup adds an explicitly configured candidate to the already inspected
 // snapshot. Compose discovery is irrelevant to this requested strategy; source
@@ -18,8 +24,20 @@ func WithSetup(result Result, setup projectanalysis.DeploymentSetup) (Result, er
 			return Result{}, &Error{Code: "invalid_source"}
 		}
 	}
-	result.Analysis.Candidates = append(result.Analysis.Candidates, candidate)
 	result.Source.ComposePath = ""
+	// Bind review to the chosen source and resolved GitHub commit as well as
+	// configuration. Identical project structure in another source is not consent.
+	binding, err := json.Marshal(struct {
+		CandidateDigest string
+		Source          SourceMetadata
+		ResolvedSHA     string
+	}{candidate.Digest, result.Source, result.ResolvedSHA})
+	if err != nil {
+		return Result{}, err
+	}
+	digest := sha256.Sum256(binding)
+	candidate.Digest = hex.EncodeToString(digest[:])
+	result.Analysis.Candidates = append(result.Analysis.Candidates, candidate)
 	result.Services, result.Findings = nil, nil
 	return result, nil
 }

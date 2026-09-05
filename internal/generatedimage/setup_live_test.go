@@ -25,12 +25,16 @@ func TestLiveManualSetupRecipes(t *testing.T) {
 	}{
 		{"node-skipped-steps", "app", "", "", "node server.js", "", true},
 		{"static-custom-output", "app", "", "mkdir -p 'public files' && printf 'STATIC_READY' > 'public files/index.html'", "node -e \"process.stdout.write(require('fs').readFileSync('public files/index.html','utf8'))\"", "public files", true},
+		{"static-prebuilt-nested-output", "app", "", "", "node -e \"process.stdout.write(require('fs').readFileSync('dist/client/index.html','utf8'))\"", "dist/client", true},
 		{"static-missing-output", "app", "", "true", "", "missing", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			workspace, operation := t.TempDir(), t.TempDir()
 			writeTestFile(t, filepath.Join(workspace, "app", "server.js"), "process.stdout.write('NODE_READY')")
-			definition := componentDefinition{name: "app", role: "server", rootDirectory: tc.root, packageManager: "npm", nodeVersion: "24", baseImage: nodeImages["24"], installBehavior: tc.install, buildCommand: tc.build, runCommand: tc.run, staticOutputDirectory: tc.output}
+			if tc.name == "static-prebuilt-nested-output" {
+				writeTestFile(t, filepath.Join(workspace, "app", "dist", "client", "index.html"), "STATIC_READY")
+			}
+			definition := componentDefinition{name: "app", role: "server", rootDirectory: tc.root, installDirectory: tc.root, packageManager: "npm", nodeVersion: "24", baseImage: nodeImages["24"], installBehavior: tc.install, buildCommand: tc.build, runCommand: tc.run, staticOutputDirectory: tc.output}
 			if tc.output != "" {
 				definition.role = "static"
 			}

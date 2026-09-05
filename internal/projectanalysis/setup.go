@@ -91,7 +91,7 @@ func NormalizeSetup(input DeploymentSetup) (DeploymentSetup, error) {
 			}
 		case "static":
 			statics++
-			if !SetupDirectory(c.OutputDirectory) || c.StartCommand != "" {
+			if !SetupDirectory(c.OutputDirectory) || unsafeStaticOutputDirectory(c.OutputDirectory) || (excludedDirectory(c.OutputDirectory) && !prebuiltStaticOutputDirectory(c.OutputDirectory)) || c.StartCommand != "" {
 				return DeploymentSetup{}, setupError(prefix+"outputDirectory", "Choose an output directory inside the project; Rig starts the static server.")
 			}
 		default:
@@ -154,6 +154,11 @@ func PrepareSetup(analysis SourceAnalysis, input DeploymentSetup) (DeploymentPla
 			if c.RootDirectory == "." || strings.HasPrefix(file.Path, c.RootDirectory+"/") {
 				found = true
 				break
+			}
+		}
+		if !found {
+			if c.Technology == "static" && c.BuildCommand == "" && source.hasStaticOutput(c.RootDirectory, c.OutputDirectory) {
+				found = true
 			}
 		}
 		if !found {

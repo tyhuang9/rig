@@ -98,6 +98,7 @@ func TestManualSetupSupportsIndependentStaticAndServerRoots(t *testing.T) {
 	server.ID, server.RootDirectory = "a-server", "api"
 	static.ID, static.RootDirectory, static.Technology = "z-site", "site", "static"
 	static.StartCommand, static.OutputDirectory, static.InternalPort = "", "public files'$(touch no)", 8080
+	static.BuildCommand = "npm run build"
 	candidate, _, err := PrepareSetup(analysis, DeploymentSetup{Components: []SetupComponent{static, server}})
 	if err != nil || len(candidate.Components) != 2 {
 		t.Fatalf("paired setup: %v", err)
@@ -121,5 +122,64 @@ func TestManualSetupPreservesMigrationEvidenceWithoutAStartScript(t *testing.T) 
 	}
 	if _, _, err := PrepareSetup(analyzeMemory(t, memoryReader{"server.js": []byte("// code")}), DeploymentSetup{Components: []SetupComponent{manualComponent()}, MigrationCommand: "wipe-database"}); err == nil {
 		t.Fatal("undetected migration accepted")
+	}
+}
+
+func TestManualStaticSetupAcceptsSelectedPrebuiltOutputWithoutMetadata(t *testing.T) {
+	analysis := analyzeMemory(t, memoryReader{"dist/index.html": []byte("<h1>prebuilt</h1>")})
+	setup := DeploymentSetup{Components: []SetupComponent{{
+		ID: "site", Technology: "static", RootDirectory: ".", PackageManager: "npm", NodeVersion: "24",
+		OutputDirectory: "dist", InternalPort: 8080, HealthProbe: "/",
+	}}}
+	candidate, normalized, err := PrepareSetup(analysis, setup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.Components[0].BuildCommand != "" || candidate.Components[0].StaticOutputDirectory != "dist" || candidate.Components[0].Run.Command != ManagedStaticCommand("dist", 8080) {
+		t.Fatalf("prebuilt static candidate = %#v", candidate)
+	}
+}
+
+func TestManualStaticSetupDefersSkippedOutputCheckUntilAfterInstall(t *testing.T) {
+	analysis := analyzeMemory(t, memoryReader{"index.html": []byte("<h1>source</h1>")})
+	setup := DeploymentSetup{Components: []SetupComponent{{
+		ID: "site", Technology: "static", RootDirectory: ".", PackageManager: "npm", NodeVersion: "24",
+		InstallCommand: "npm install", OutputDirectory: "dist", InternalPort: 8080, HealthProbe: "/",
+	}}}
+	candidate, _, err := PrepareSetup(analysis, setup)
+	if err != nil || candidate.Components[0].StaticOutputDirectory != "dist" {
+		t.Fatalf("skipped output was validated before install: candidate=%#v err=%v", candidate, err)
+	}
+}
+
+func TestManualStaticSetupAcceptsContainedPrebuiltOutput(t *testing.T) {
+	analysis := analyzeMemory(t, memoryReader{"dist/client/index.html": []byte("<h1>prebuilt</h1>")})
+	setup := DeploymentSetup{Components: []SetupComponent{{
+		ID: "site", Technology: "static", RootDirectory: ".", PackageManager: "npm", NodeVersion: "24",
+		OutputDirectory: "dist/client", InternalPort: 8080, HealthProbe: "/",
+	}}}
+	candidate, _, err := PrepareSetup(analysis, setup)
+	if err != nil || candidate.Components[0].StaticOutputDirectory != "dist/client" {
+		t.Fatalf("contained prebuilt output was not accepted: candidate=%#v err=%v", candidate, err)
+	}
+}
+
+func TestManualStaticSetupRejectsProtectedOutputDirectory(t *testing.T) {
+	for name, output := range map[string]string{
+		"dependencies":         "node_modules/dist",
+		"credential directory": "dist/.aws",
+		"protected ancestor":   "dist/.aws/client",
+		"protected config":     "dist/.config/gh",
+		"environment file":     "dist/.env.production",
+	} {
+		t.Run(name, func(t *testing.T) {
+			setup := DeploymentSetup{Components: []SetupComponent{{
+				ID: "site", Technology: "static", RootDirectory: ".", PackageManager: "npm", NodeVersion: "24",
+				OutputDirectory: output, BuildCommand: "npm run build", InternalPort: 8080, HealthProbe: "/",
+			}}}
+			if _, err := NormalizeSetup(setup); err == nil {
+				t.Fatalf("protected output directory %q accepted", output)
+			}
+		})
 	}
 }

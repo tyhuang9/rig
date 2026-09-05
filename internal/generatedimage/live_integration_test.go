@@ -27,7 +27,11 @@ const (
 	liveBuildCanary   = "rig_live_build_command_canary_278e491c"
 )
 
-func TestLiveGeneratedImageCompiler(t *testing.T) {
+func TestLiveGeneratedImageCompiler(t *testing.T) { runLiveGeneratedImageCompiler(t, false) }
+
+func TestLiveManualGeneratedImageCompiler(t *testing.T) { runLiveGeneratedImageCompiler(t, true) }
+
+func runLiveGeneratedImageCompiler(t *testing.T, manual bool) {
 	if os.Getenv("RIG_RUN_LIVE_GENERATED_RUNTIME") != "1" {
 		t.Skip("set RIG_RUN_LIVE_GENERATED_RUNTIME=1 on a disposable Linux Docker host")
 	}
@@ -63,6 +67,24 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 	identity, dockerEnvironment, err := builder.preparePersistentState()
 	if err != nil {
 		t.Fatal("live generated image builder state failed")
+	}
+	// A task-local verified Buildx binary may be supplied when this disposable
+	// host has no system plugin. The production builder still owns its config.
+	if plugin := os.Getenv("RIG_LIVE_BUILDX_PLUGIN"); plugin != "" {
+		if !filepath.IsAbs(plugin) {
+			t.Fatal("live Buildx plugin must be absolute")
+		}
+		for _, entry := range dockerEnvironment {
+			if config, ok := strings.CutPrefix(entry, "DOCKER_CONFIG="); ok {
+				pluginDirectory := filepath.Join(config, "cli-plugins")
+				if err := os.Mkdir(pluginDirectory, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(plugin, filepath.Join(pluginDirectory, "docker-buildx")); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
 	}
 	liveContext, cancelLive := context.WithTimeout(context.Background(), 7*time.Minute)
 	defer cancelLive()
@@ -111,6 +133,20 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 				InternalPort: 3000, HealthProbe: "/",
 			}},
 		},
+	}
+	if manual {
+		setup := projectanalysis.DeploymentSetup{Components: []projectanalysis.SetupComponent{{
+			ID: "app", Technology: "node", RootDirectory: componentRoot, PackageManager: "npm", NodeVersion: "24",
+			BuildCommand: buildCommand, StartCommand: "node server.js", InternalPort: 3000, HealthProbe: "/",
+		}}}
+		revision.Plan, _, err = deploymentplans.AcceptSetup(inspection.Analysis, setup, deploymentplans.SourceIdentity{Provider: "local", ResolvedDigest: inspection.Analysis.StructuralFingerprint})
+		if err != nil {
+			t.Fatal("live manual setup acceptance failed")
+		}
+		revision.CanonicalDigest, err = deploymentplans.CanonicalDigest(revision.Plan)
+		if err != nil {
+			t.Fatal("live manual setup digest failed")
+		}
 	}
 	definition, definitionDigest, err := definitionFor(revision, "app")
 	if err != nil {

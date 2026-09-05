@@ -87,3 +87,54 @@ func TestAcceptedManualSetupSurvivesReanalysisRestartAndRevisionReplacement(t *t
 		t.Fatal("missing root did not require review")
 	}
 }
+
+func TestManualMigrationRequiresSeparateApprovalAndChangedEvidenceRequiresReview(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "prisma"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"dependencies":{"prisma":"6"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	schema := filepath.Join(root, "prisma", "schema.prisma")
+	if err := os.WriteFile(schema, []byte(`datasource db { provider = "postgresql" url = env("DATABASE_URL") }`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := sourceinspection.InspectLocal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setup := projectanalysis.DeploymentSetup{Components: []projectanalysis.SetupComponent{{ID: "app", Technology: "node", RootDirectory: ".", PackageManager: "npm", NodeVersion: "24", StartCommand: "node server.js", InternalPort: 3000, HealthProbe: "/"}}}
+	plan, _, err := AcceptSetup(inspection.Analysis, setup, SourceIdentity{Provider: "local", ResolvedDigest: inspection.Analysis.StructuralFingerprint})
+	if err != nil || plan.Migration == nil || plan.Migration.Approval.Status != MigrationApprovalPending {
+		t.Fatalf("missing separate approval: %v", err)
+	}
+	store, err := New(planDB(t), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := store.Replace(context.Background(), planTestApp, "owner", ReplaceInput{Plan: plan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ApproveMigration(context.Background(), planTestApp, revision.ID, 1, 0, "owner"); err != nil {
+		t.Fatal(err)
+	}
+	approved, err := store.Get(context.Background(), planTestApp)
+	if err != nil || approved.Plan.Migration.Approval.Status != MigrationApprovalApproved || approved.CanonicalDigest != revision.CanonicalDigest {
+		t.Fatalf("approval changed plan identity: %v", err)
+	}
+	if differences, err := CompareAnalysis(approved.Plan, inspection.Analysis); err != nil || len(differences) != 0 {
+		t.Fatalf("unchanged approved migration: %v %v", differences, err)
+	}
+	if err := os.WriteFile(schema, []byte(`datasource db { provider = "postgresql" url = env("DATABASE_URL") } model User { id Int @id }`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := sourceinspection.InspectLocal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if differences, err := CompareAnalysis(approved.Plan, changed.Analysis); err != nil || len(differences) == 0 {
+		t.Fatalf("changed migration evidence accepted: %v %v", differences, err)
+	}
+}
