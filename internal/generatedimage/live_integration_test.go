@@ -160,8 +160,7 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 	}
 
 	if status := liveRunBuiltImage(liveContext, runner, dockerExecutable, builder.directory.Root(), dockerEnvironment, containerName, artifact.ImageContentID, componentRoot); status != "success" {
-		identityStatus := liveGeneratedImageIdentityStatus(liveContext, runner, dockerExecutable, builder.directory.Root(), dockerEnvironment, artifact.ImageContentID, imageReference)
-		t.Fatalf("live generated image artifact execution failed: runtime_status=%s,image_identity=%s", status, identityStatus)
+		t.Fatalf("live generated image artifact execution failed: runtime_status=%s", status)
 	}
 	if !liveImageExcludesCommands(liveContext, runner, dockerExecutable, builder.directory.Root(), dockerEnvironment, artifact.ImageContentID, installCommand, buildCommand) {
 		t.Fatal("live generated image persisted command material")
@@ -504,100 +503,6 @@ func TestLiveGeneratedImageRuntimeExitStatusIsFixed(t *testing.T) {
 			t.Fatalf("runtime exit status for %d = %q, want %q", code, got, want)
 		}
 	}
-}
-
-func liveGeneratedImageIdentityStatus(ctx context.Context, runner runtimeprocess.CommandRunner, executable, directory string, environment []string, artifactID, tag string) string {
-	artifact, artifactStatus := liveInspectImageID(ctx, runner, executable, directory, environment, artifactID)
-	defer clear(artifact)
-	loaded, tagStatus := liveInspectImageID(ctx, runner, executable, directory, environment, tag)
-	defer clear(loaded)
-	if artifactStatus != "found" {
-		return "artifact_" + artifactStatus + "_tag_" + tagStatus
-	}
-	if tagStatus != "found" {
-		return "tag_" + tagStatus
-	}
-	if bytes.Equal(artifact, loaded) {
-		return "same"
-	}
-	return "different"
-}
-
-func liveInspectImageID(ctx context.Context, runner runtimeprocess.CommandRunner, executable, directory string, environment []string, reference string) ([]byte, string) {
-	result, err := runner.Run(ctx, runtimeprocess.CommandRequest{
-		Executable: executable, Args: []string{"image", "inspect", "--format", "{{.ID}}", reference},
-		Directory: directory, Env: environment, Timeout: time.Minute, OutputLimit: 4 << 10,
-	})
-	defer clear(result.Stdout)
-	defer clear(result.Stderr)
-	if err != nil || result.StdoutTruncated || result.StderrTruncated {
-		combined := make([]byte, 0, len(result.Stdout)+len(result.Stderr))
-		combined = append(combined, result.Stdout...)
-		combined = append(combined, result.Stderr...)
-		lower := bytes.ToLower(combined)
-		clear(combined)
-		defer clear(lower)
-		if bytes.Contains(lower, []byte("no such image")) {
-			return nil, "missing"
-		}
-		return nil, "unavailable"
-	}
-	value := bytes.TrimSpace(result.Stdout)
-	if !validImageContentID(string(value)) {
-		return nil, "invalid"
-	}
-	return append([]byte(nil), value...), "found"
-}
-
-type liveImageInspectResponse struct {
-	result runtimeprocess.CommandResult
-	err    error
-}
-
-type liveImageInspectRunner struct {
-	responses []liveImageInspectResponse
-	calls     int
-}
-
-func (runner *liveImageInspectRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
-	if runner.calls >= len(runner.responses) || len(request.Args) != 5 || request.Args[0] != "image" || request.Args[1] != "inspect" || request.Args[2] != "--format" || request.Args[3] != "{{.ID}}" {
-		return runtimeprocess.CommandResult{}, errors.New("unexpected image inspection")
-	}
-	response := runner.responses[runner.calls]
-	runner.calls++
-	return response.result, response.err
-}
-
-func TestLiveGeneratedImageIdentityStatusIsFixedAndClearsResults(t *testing.T) {
-	firstID, secondID := "sha256:"+strings.Repeat("a", 64)+"\n", "sha256:"+strings.Repeat("b", 64)+"\n"
-	for _, test := range []struct {
-		name      string
-		responses []liveImageInspectResponse
-		want      string
-	}{
-		{name: "same", responses: []liveImageInspectResponse{{result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}, {result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}}, want: "same"},
-		{name: "different", responses: []liveImageInspectResponse{{result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}, {result: runtimeprocess.CommandResult{Stdout: []byte(secondID)}}}, want: "different"},
-		{name: "artifact missing", responses: []liveImageInspectResponse{{result: runtimeprocess.CommandResult{Stderr: []byte("No such image: sensitive/reference")}, err: errors.New("sensitive error")}, {result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}}, want: "artifact_missing_tag_found"},
-		{name: "tag missing", responses: []liveImageInspectResponse{{result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}, {result: runtimeprocess.CommandResult{Stderr: []byte("No such image: sensitive/reference")}, err: errors.New("sensitive error")}}, want: "tag_missing"},
-		{name: "artifact invalid", responses: []liveImageInspectResponse{{result: runtimeprocess.CommandResult{Stdout: []byte("sensitive malformed output")}}, {result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}}, want: "artifact_invalid_tag_found"},
-		{name: "artifact unavailable", responses: []liveImageInspectResponse{{result: runtimeprocess.CommandResult{Stderr: []byte("sensitive daemon failure"), StderrTruncated: true}, err: errors.New("sensitive error")}, {result: runtimeprocess.CommandResult{Stdout: []byte(firstID)}}}, want: "artifact_unavailable_tag_found"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			runner := &liveImageInspectRunner{responses: test.responses}
-			if got := liveGeneratedImageIdentityStatus(context.Background(), runner, "docker", t.TempDir(), nil, "artifact", "tag"); got != test.want || !validLiveGeneratedImageDiagnostic(got) {
-				t.Fatalf("image identity status = %q, want %q", got, test.want)
-			}
-			for _, response := range runner.responses {
-				if !liveAllZero(response.result.Stdout) || !liveAllZero(response.result.Stderr) {
-					t.Fatal("image inspection output was not cleared")
-				}
-			}
-		})
-	}
-}
-
-func liveAllZero(value []byte) bool {
-	return len(bytes.Trim(value, "\x00")) == 0
 }
 
 func TestLiveGeneratedImageRuntimeStatusIsFixedAndRedacted(t *testing.T) {
