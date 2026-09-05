@@ -47,21 +47,6 @@ jobs:
           RIG_RUN_LIVE_GENERATED_RUNTIME: "1"
         run: go test -count=1 -timeout=19m ./internal/generatedingress -run '^TestLiveGeneratedBlueGreenLifecycle$'
 
-      - name: Run generated-runtime race tests
-        if: ${{ !cancelled() }}
-        timeout-minutes: 10
-        run: >-
-          go test -race -count=1 -timeout=9m
-          ./internal/projectanalysis
-          ./internal/deploymentplans
-          ./internal/generatedimage
-          ./internal/generatedruntime
-          ./internal/generatedingress
-          ./internal/generatedexecutor
-          ./internal/generatedruntimestate
-          ./internal/generatedrecovery
-          ./internal/autodeploy
-
       - name: Require complete Docker cleanup
         if: always()
         timeout-minutes: 2
@@ -77,3 +62,35 @@ jobs:
             printf 'Generated runtime resources were not cleaned up.\n' >&2
             exit 1
           fi
+
+  generated-runtime-race:
+    name: Generated runtime race verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        timeout-minutes: 2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        timeout-minutes: 3
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Run generated-runtime race tests
+        timeout-minutes: 10
+        run: >-
+          go test -race -count=1 -timeout=9m
+          ./internal/projectanalysis
+          ./internal/deploymentplans
+          ./internal/generatedimage
+          ./internal/generatedruntime
+          ./internal/generatedingress
+          ./internal/generatedexecutor
+          ./internal/generatedruntimestate
+          ./internal/generatedrecovery
+          ./internal/autodeploy
