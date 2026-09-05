@@ -48,8 +48,9 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 	}
 
 	runner := runtimeprocess.ExecRunner{}
+	buildObservation := &liveGeneratedImageBuildObservation{delegate: runner, status: "not_attempted"}
 	dataRoot := t.TempDir()
-	builder, err := NewBuilderManager(runner, BuilderManagerOptions{
+	builder, err := NewBuilderManager(buildObservation, BuilderManagerOptions{
 		DataRoot:         dataRoot,
 		DockerExecutable: dockerExecutable,
 		DockerEndpoint:   dockerEndpoint,
@@ -75,6 +76,7 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 	if err := os.Mkdir(componentDirectory, 0o700); err != nil {
 		t.Fatal("live generated image fixture setup failed")
 	}
+	liveWriteFile(t, filepath.Join(componentDirectory, "server.js"), "'use strict';\n")
 	// The lockfile is deliberately at the workspace root while the component
 	// build runs in a spaced child path. This is the generated monorepo split.
 	liveWriteFile(t, filepath.Join(workspace, "package.json"), `{"name":"rig-live-generated-image","version":"1.0.0","private":true}`)
@@ -84,7 +86,7 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 		t.Fatal("live generated image fixture inspection failed")
 	}
 
-	installCommand := `npm ci && test "$(id -u):$(id -g)" = "1000:1000" && install_marker=` + liveInstallCanary + ` && test "$install_marker" = ` + liveInstallCanary
+	installCommand := `test -w . && npm ci && test "$(id -u):$(id -g)" = "1000:1000" && install_marker=` + liveInstallCanary + ` && test "$install_marker" = ` + liveInstallCanary
 	buildCommand := `build_marker=` + liveBuildCanary + ` && expanded="$(printf '%s' shell-ok)" && test "$build_marker" = ` + liveBuildCanary + ` && test "$expanded" = shell-ok && node -e "require('node:fs').writeFileSync('artifact.txt','generated-image-ok')"`
 	appID, releaseID, revisionID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	release := releasesnapshot.Release{
@@ -139,7 +141,7 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 		artifacts,
 		temporary,
 		builderObservation,
-		runner,
+		buildObservation,
 		CompilerOptions{BuildTimeout: 6 * time.Minute},
 	)
 	if err != nil {
@@ -147,7 +149,7 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 	}
 	artifact, err := compiler.Compile(liveContext, appID, releaseID, "app")
 	if err != nil {
-		t.Fatalf("live generated image production compile failed: diagnostic=%s,builder_status=%s", liveGeneratedImageFailureCode(err), builderObservation.status)
+		t.Fatalf("live generated image production compile failed: diagnostic=%s,builder_status=%s,build_status=%s", liveGeneratedImageFailureCode(err), builderObservation.status, buildObservation.status)
 	}
 	if artifact.State != ArtifactReady || !validImageContentID(artifact.ImageContentID) || artifacts.failed != "" {
 		t.Fatal("live generated image production compile returned an invalid artifact")
@@ -168,6 +170,75 @@ func TestLiveGeneratedImageCompiler(t *testing.T) {
 type liveGeneratedImageBuilderObservation struct {
 	delegate builderPreparer
 	status   string
+}
+
+type liveGeneratedImageBuildObservation struct {
+	delegate runtimeprocess.CommandRunner
+	status   string
+}
+
+func (observation *liveGeneratedImageBuildObservation) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	result, err := observation.delegate.Run(ctx, request)
+	if len(request.Args) >= 2 && request.Args[0] == "buildx" && request.Args[1] == "build" {
+		observation.status = liveGeneratedImageBuildResultStatus(ctx, result, err)
+	}
+	return result, err
+}
+
+func liveGeneratedImageBuildResultStatus(ctx context.Context, result runtimeprocess.CommandResult, err error) string {
+	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		return "cancelled"
+	case errors.Is(err, runtimeprocess.ErrTerminationFailed):
+		return "termination_failed"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case result.StdoutTruncated || result.StderrTruncated:
+		return "output_truncated"
+	case err == nil:
+		return "success"
+	}
+	var executableError *exec.Error
+	var pathError *os.PathError
+	if errors.As(err, &executableError) || errors.As(err, &pathError) {
+		return "runtime_unavailable"
+	}
+	combined := make([]byte, 0, len(result.Stdout)+len(result.Stderr))
+	combined = append(combined, result.Stdout...)
+	combined = append(combined, result.Stderr...)
+	lower := bytes.ToLower(combined)
+	clear(combined)
+	defer clear(lower)
+	containsAny := func(markers ...string) bool {
+		for _, marker := range markers {
+			if bytes.Contains(lower, []byte(marker)) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case containsAny("dockerfile parse error", "failed to parse dockerfile", "unknown instruction", "unknown flag:"):
+		return "dockerfile_invalid"
+	case containsAny("permission denied", "operation not permitted"):
+		return "permission_denied"
+	case containsAny("secret is required but not available", "failed to stat /run/secrets", "invalid mount config"):
+		return "secret_mount_invalid"
+	case containsAny("no space left on device", "disk quota exceeded"):
+		return "storage_exhausted"
+	case containsAny("network is unreachable", "temporary failure in name resolution", "dial tcp", "i/o timeout"):
+		return "network_unavailable"
+	case containsAny("failed to resolve source metadata", "pull access denied", "manifest unknown"):
+		return "base_image_unavailable"
+	case containsAny("exporting to docker image format", "failed to load", "failed to export"):
+		return "export_failed"
+	case bytes.LastIndex(lower, []byte("/run/rig/root.path")) > bytes.LastIndex(lower, []byte("/run/rig/install.path")):
+		return "build_step_failed"
+	case bytes.Contains(lower, []byte("/run/rig/install.path")):
+		return "install_step_failed"
+	default:
+		return "unclassified"
+	}
 }
 
 func (observation *liveGeneratedImageBuilderObservation) Prepare(ctx context.Context) (BuilderSession, error) {
@@ -252,6 +323,68 @@ func TestLiveGeneratedImageBuilderObservationUsesOnlyFixedStatus(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLiveGeneratedImageBuildObservationUsesOnlyFixedStatus(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		stdout    string
+		stderr    string
+		err       error
+		truncated bool
+		cancelled bool
+		want      string
+	}{
+		{name: "success", want: "success"},
+		{name: "Dockerfile", stderr: "dockerfile parse error: sensitive/path", err: errors.New("exit status 1"), want: "dockerfile_invalid"},
+		{name: "permission", stderr: "permission denied: sensitive/path", err: errors.New("exit status 1"), want: "permission_denied"},
+		{name: "secret mount", stderr: "secret is required but not available: sensitive material", err: errors.New("exit status 1"), want: "secret_mount_invalid"},
+		{name: "install", stderr: "process /run/rig/install.path failed with secret material", err: errors.New("exit status 1"), want: "install_step_failed"},
+		{name: "build", stderr: "completed /run/rig/install.path then failed /run/rig/root.path with secret material", err: errors.New("exit status 1"), want: "build_step_failed"},
+		{name: "storage", stderr: "no space left on device: sensitive/path", err: errors.New("exit status 1"), want: "storage_exhausted"},
+		{name: "network", stderr: "network is unreachable: sensitive host", err: errors.New("exit status 1"), want: "network_unavailable"},
+		{name: "base image", stderr: "failed to resolve source metadata for sensitive image", err: errors.New("exit status 1"), want: "base_image_unavailable"},
+		{name: "export", stderr: "completed /run/rig/root.path then failed to export sensitive image", err: errors.New("exit status 1"), want: "export_failed"},
+		{name: "runtime", err: &exec.Error{Name: "sensitive executable", Err: errors.New("sensitive error")}, want: "runtime_unavailable"},
+		{name: "timeout", err: context.DeadlineExceeded, want: "timeout"},
+		{name: "termination", err: runtimeprocess.ErrTerminationFailed, want: "termination_failed"},
+		{name: "cancelled", err: errors.New("sensitive raw error"), cancelled: true, want: "cancelled"},
+		{name: "raw", stdout: "sensitive stdout", stderr: "sensitive stderr", err: errors.New("sensitive raw error"), want: "unclassified"},
+		{name: "truncation precedence", stderr: "permission denied", err: errors.New("exit status 1"), truncated: true, want: "output_truncated"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := runtimeprocess.CommandResult{Stdout: []byte(test.stdout), Stderr: []byte(test.stderr), StderrTruncated: test.truncated}
+			stdoutBefore, stderrBefore := append([]byte(nil), result.Stdout...), append([]byte(nil), result.Stderr...)
+			ctx := context.Background()
+			if test.cancelled {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+			if got := liveGeneratedImageBuildResultStatus(ctx, result, test.err); got != test.want || !validLiveGeneratedImageDiagnostic(got) {
+				t.Fatalf("build observation = %q, want %q", got, test.want)
+			}
+			if !bytes.Equal(result.Stdout, stdoutBefore) || !bytes.Equal(result.Stderr, stderrBefore) {
+				t.Fatal("build observation mutated the compiler result")
+			}
+			clear(result.Stdout)
+			clear(result.Stderr)
+			clear(stdoutBefore)
+			clear(stderrBefore)
+		})
+	}
+
+	runner := &compilerRunner{result: runtimeprocess.CommandResult{Stderr: []byte("permission denied")}, err: errors.New("exit status 1")}
+	observation := &liveGeneratedImageBuildObservation{delegate: runner, status: "not_attempted"}
+	_, _ = observation.Run(context.Background(), runtimeprocess.CommandRequest{Args: []string{"buildx", "ls"}})
+	if observation.status != "not_attempted" {
+		t.Fatal("non-build command changed the build observation")
+	}
+	_, _ = observation.Run(context.Background(), runtimeprocess.CommandRequest{Args: []string{"buildx", "build"}})
+	if observation.status != "permission_denied" {
+		t.Fatalf("observed build status = %q, want permission_denied", observation.status)
+	}
+	clear(runner.result.Stderr)
 }
 
 func liveWriteFile(t *testing.T, path, body string) {

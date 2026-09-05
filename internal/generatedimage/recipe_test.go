@@ -94,6 +94,7 @@ func TestWorkspaceRootInstallRecipeUsesSeparateWorkingDirectories(t *testing.T) 
 			recipe := containerfile(true, test.manager != "npm", definition.baseImage)
 			assertCommandSecretRun(t, recipe, "rig-install-command", installShellScript)
 			assertCommandSecretRun(t, recipe, "rig-build-command", buildShellScript)
+			assertWorkspaceOwnershipRun(t, recipe)
 			if !hasExactRecipeLine(recipe, "COPY --chown=1000:1000 --chmod=0400 rig/root.path rig/install.path /run/rig/") {
 				t.Fatal("workspace selectors are not explicitly node-owned and read-only")
 			}
@@ -120,6 +121,37 @@ func TestWorkspaceRootInstallRecipeUsesSeparateWorkingDirectories(t *testing.T) 
 				t.Fatalf("Corepack RUN count = %d, want %d", corepackRuns, wantCorepackRuns)
 			}
 		})
+	}
+}
+
+func assertWorkspaceOwnershipRun(t *testing.T, recipe string) {
+	t.Helper()
+	want := []string{"chown", "node:node", "/workspace"}
+	matches := 0
+	for _, run := range parseRunExecInstructions(t, recipe) {
+		if len(run.argv) != len(want) {
+			continue
+		}
+		equal := true
+		for index := range want {
+			equal = equal && run.argv[index] == want[index]
+		}
+		if !equal {
+			continue
+		}
+		matches++
+		if run.options != "" {
+			t.Fatalf("workspace ownership RUN options = %q, want none", run.options)
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("workspace ownership RUN matches = %d, want 1", matches)
+	}
+	chownIndex := strings.Index(recipe, `RUN ["chown", "node:node", "/workspace"]`)
+	copyIndex := strings.Index(recipe, "COPY --chown=node:node source/ /workspace/")
+	userIndex := strings.Index(recipe, "USER node\n")
+	if chownIndex < 0 || copyIndex < 0 || userIndex < 0 || chownIndex > copyIndex || copyIndex > userIndex {
+		t.Fatal("workspace ownership is not established before the non-root build")
 	}
 }
 

@@ -112,6 +112,7 @@ func containerfile(hasBuild, enableCorepack bool, baseImage string) string {
 	install := commandSecretRun("rig-install-command", installShellScript)
 	return fmt.Sprintf(`FROM %s AS builder
 %sWORKDIR /workspace
+RUN ["chown", "node:node", "/workspace"]
 COPY --chown=node:node source/ /workspace/
 COPY --chown=1000:1000 --chmod=0400 rig/root.path rig/install.path /run/rig/
 USER node
