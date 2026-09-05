@@ -18,7 +18,9 @@ go run ./cmd/hostd serve --data-root /var/lib/hostd --generated-runtime
 
 Use both `--generated-runtime` and `--compose-runtime` when one controller must host both strategies. `--fake-runtime` is mutually exclusive with either real runtime. The Docker endpoint must be the local default, a local `unix:///...` socket, or a local `npipe:////./pipe/...` endpoint; TCP, HTTP(S), SSH, and `fd://` endpoints are rejected.
 
-Generated startup requires a Linux Docker engine with memory, swap, CPU quota, PID-limit, Buildx, and BuildKit support. Startup resolves the Docker executable once, prepares controller-owned Docker and Buildx configuration directories, recovers generated artifacts and ingress, and then starts the job worker. If those boundaries cannot be established, startup fails closed.
+Generated startup requires Docker Engine and CLI 28 or newer (API 1.48+) with a Linux engine, memory, swap, CPU quota, PID-limit, Buildx, and BuildKit support. Ingress requires Docker's explicit gateway-priority support; older engines/clients fail closed rather than falling back to ambiguous networking. Startup resolves the Docker executable once, prepares controller-owned Docker and Buildx configuration directories, recovers generated artifacts and ingress, and then starts the job worker. If those boundaries cannot be established, startup fails closed.
+
+The hosted compatibility gate uses Ubuntu 24.04 with its runner-provided Linux Docker engine. Other supported engine versions require their own live verification. Windows controller checks do not substitute for a Windows Docker Desktop end-to-end deployment test.
 
 ## Supported source model
 
@@ -94,9 +96,13 @@ Each component has stable blue and green slots. A deployment:
 
 Neither slot publishes a host port. Caddy joins each application network separately and does not create a shared lateral-access network. If build, migration, startup, health, or route validation fails, the old slots remain active. If temporary capacity cannot be reserved, the job pauses with `insufficient_replacement_capacity`; Rig never silently chooses a downtime-producing stop/start replacement.
 
+Caddy listens only on its dedicated IPv4 ingress interface. That interface has gateway priority 1; application attachments must retain priority 0 and have no IPv6 gateway. This prevents Docker from moving published-port connectivity when an application network is connected ([Docker networking](https://docs.docker.com/engine/network/#connecting-to-multiple-networks)). Each upstream name is qualified by its application network, so identical component aliases in different applications cannot resolve to each other's containers.
+
 Runtime containers run as the non-root `node` user, drop all Linux capabilities, set `no-new-privileges`, use a read-only root filesystem plus bounded tmpfs, have no host binds or Docker socket, and use bounded CPU, memory, PIDs, file descriptors, and local logs.
 
 The trusted Caddy gateway has one explicit exception: it drops all capabilities then adds only `NET_BIND_SERVICE`. The pinned official Caddy binary carries that file capability, so Linux refuses to execute it without the matching bounding-set permission, even on port 8080 ([upstream report](https://github.com/caddyserver/caddy-docker/issues/396)). This permits low-port binding only within Caddy's network namespace; it publishes no additional host ports. Non-root execution, `no-new-privileges`, read-only rootfs, and network isolation remain enforced. Application containers receive no such exception. Remove this compatibility exception when repinning to a verified file-capability-free upstream image. Generated local routes explicitly disable automatic HTTPS.
+
+Pre-release Caddy containers created without this capability or the pinned gateway priority are deliberately rejected as `ingress_drift_detected`, not silently replaced. Existing alpha testers must use a fresh disposable environment or explicitly recreate the exact managed gateway during a planned maintenance window; never remove a serving gateway as an automatic recovery step.
 
 ## Migrations
 

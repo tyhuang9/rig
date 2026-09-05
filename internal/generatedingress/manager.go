@@ -26,14 +26,17 @@ const (
 	caddyExecutable    = "/usr/bin/caddy"
 	// The pinned upstream binary has a file-effective capability. Linux refuses
 	// exec when that capability is absent from the bounding set, even on :8080.
-	caddyCapability    = "NET_BIND_SERVICE"
-	caddyImage         = "caddy@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
-	caddyImageDigest   = "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
-	defaultHostPort    = uint16(8080)
-	defaultOutputLimit = 64 << 10
-	defaultTimeout     = 30 * time.Second
-	defaultPullTimeout = 5 * time.Minute
-	maximumDrain       = 30 * time.Second
+	caddyCapability = "NET_BIND_SERVICE"
+	// Published ports follow Docker's selected gateway endpoint. Keep ingress
+	// preferred when lexically earlier application networks are attached.
+	caddyGatewayPriority = 1
+	caddyImage           = "caddy@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
+	caddyImageDigest     = "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
+	defaultHostPort      = uint16(8080)
+	defaultOutputLimit   = 64 << 10
+	defaultTimeout       = 30 * time.Second
+	defaultPullTimeout   = 5 * time.Minute
+	maximumDrain         = 30 * time.Second
 )
 
 type Options struct {
@@ -403,7 +406,7 @@ func (m *Manager) createCaddy(ctx context.Context, imageID, ingressIP string) er
 	if net.ParseIP(ingressIP) == nil {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
-	args := []string{"container", "create", "--name", caddyContainerName, "--hostname", caddyContainerName, "--network", caddyNetworkName,
+	args := []string{"container", "create", "--name", caddyContainerName, "--hostname", caddyContainerName, "--network", "name=" + caddyNetworkName + ",gw-priority=1",
 		"--ip", ingressIP,
 		"--mount", "type=volume,src=" + caddyVolumeName + ",dst=/config", "--user", "1000:1000", "--entrypoint", caddyExecutable, "--read-only",
 		"--tmpfs", "/data:rw,noexec,nosuid,nodev,size=67108864", "--cap-drop", "ALL", "--cap-add", caddyCapability, "--security-opt", "no-new-privileges",
@@ -515,6 +518,9 @@ func (m *Manager) caddyListenAddress(ctx context.Context) (string, error) {
 	if err != nil || !found || !inspection.Running || inspection.Restarting {
 		return "", &Error{Code: DiagnosticIngressUnavailable}
 	}
+	if !validCaddyGatewayPriorities(inspection.Networks) {
+		return "", &Error{Code: DiagnosticIngressDrift}
+	}
 	attachment := inspection.Networks[caddyNetworkName]
 	network, networkFound, networkErr := m.inspectCaddyNetwork(ctx)
 	defer clearCaddyNetworkInspection(&network)
@@ -575,7 +581,7 @@ func (m *Manager) reconcileCaddyNetworks(ctx context.Context, routes map[string]
 		}
 	}
 	final, found, err := m.inspectCaddy(ctx)
-	if err != nil || !found || normalizeID(final.ID) != expectedID || len(final.Networks) != len(desired) {
+	if err != nil || !found || normalizeID(final.ID) != expectedID || len(final.Networks) != len(desired) || !validCaddyGatewayPriorities(final.Networks) {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
 	for network := range desired {
@@ -839,8 +845,10 @@ type endpointInspection struct {
 }
 
 type networkAttachment struct {
-	Aliases   []string `json:"Aliases"`
-	IPAddress string   `json:"IPAddress"`
+	Aliases     []string `json:"Aliases"`
+	IPAddress   string   `json:"IPAddress"`
+	GwPriority  int      `json:"GwPriority"`
+	IPv6Gateway string   `json:"IPv6Gateway"`
 }
 
 type ulimitInspection struct {
@@ -969,6 +977,7 @@ func (m *Manager) inspectJSON(ctx context.Context, destination any, args ...stri
 func validCaddyInspection(value caddyInspection, imageID string, hostPort uint16) bool {
 	if normalizeID(value.Image) != normalizeID(imageID) || strings.TrimPrefix(value.Name, "/") != caddyContainerName || value.User != "1000:1000" ||
 		value.Hostname != caddyContainerName || value.NetworkMode != caddyNetworkName || !containsString(value.Env, "XDG_CONFIG_HOME=/config") || !containsString(value.Env, "XDG_DATA_HOME=/data") ||
+		!validCaddyGatewayPriorities(value.Networks) ||
 		!value.ReadOnly || value.Privileged || !onlyCaddyCapability(value.CapAdd) || !exactFoldSet(value.CapDrop, "ALL") || !onlyNoNewPrivileges(value.SecurityOpt) ||
 		len(value.Binds) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 || value.NanoCPUs != 1_000_000_000 || value.PIDsLimit != 128 ||
 		len(value.Tmpfs) != 1 || value.Tmpfs["/data"] != "rw,noexec,nosuid,nodev,size=67108864" ||
@@ -989,6 +998,24 @@ func validCaddyInspection(value caddyInspection, imageID string, hostPort uint16
 	}
 	binding := value.PortBindings["8080/tcp"]
 	return mountOK && len(value.PortBindings) == 1 && len(binding) == 1 && len(binding[0]) == 2 && binding[0]["HostIp"] == "127.0.0.1" && binding[0]["HostPort"] == strconv.FormatUint(uint64(hostPort), 10)
+}
+
+func validCaddyGatewayPriorities(networks map[string]*networkAttachment) bool {
+	if networks[caddyNetworkName] == nil {
+		return false
+	}
+	for name, attachment := range networks {
+		priority := 0
+		if name == caddyNetworkName {
+			priority = caddyGatewayPriority
+		}
+		// Moby 28 can prefer a dual-stack endpoint over an IPv4-only endpoint
+		// despite its priority. This managed ingress boundary is IPv4-only.
+		if attachment == nil || attachment.GwPriority != priority || attachment.IPv6Gateway != "" {
+			return false
+		}
+	}
+	return true
 }
 
 func validOptions(options Options) bool {

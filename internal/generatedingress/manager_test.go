@@ -17,27 +17,29 @@ import (
 )
 
 type ingressRunner struct {
-	restarting         bool
-	restartAfterStart  bool
-	appID              string
-	network            string
-	endpoint           generatedruntime.RouteEndpoint
-	caddyNetworks      map[string]*networkAttachment
-	ingressContainers  map[string]caddyNetworkContainerInspection
-	files              map[string][]byte
-	commands           [][]string
-	failProposedReload bool
-	stopped            bool
-	volumeOptions      map[string]string
-	endpointRoleLabel  string
-	capacityOutput     []byte
-	caddyMissing       bool
-	ingressMissing     bool
-	liveConfig         []byte
-	startConfig        []byte
-	restartInstalls    int
-	failRestartInstall int
-	failRollbackReload bool
+	restarting               bool
+	restartAfterStart        bool
+	appID                    string
+	network                  string
+	endpoint                 generatedruntime.RouteEndpoint
+	caddyNetworks            map[string]*networkAttachment
+	connectedGatewayPriority int
+	connectedIPv6Gateway     string
+	ingressContainers        map[string]caddyNetworkContainerInspection
+	files                    map[string][]byte
+	commands                 [][]string
+	failProposedReload       bool
+	stopped                  bool
+	volumeOptions            map[string]string
+	endpointRoleLabel        string
+	capacityOutput           []byte
+	caddyMissing             bool
+	ingressMissing           bool
+	liveConfig               []byte
+	startConfig              []byte
+	restartInstalls          int
+	failRestartInstall       int
+	failRollbackReload       bool
 }
 
 func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -73,7 +75,7 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 		return runtimeprocess.CommandResult{}, nil
 	}
 	if len(args) == 4 && args[0] == "network" && args[1] == "connect" {
-		r.caddyNetworks[args[2]] = &networkAttachment{}
+		r.caddyNetworks[args[2]] = &networkAttachment{GwPriority: r.connectedGatewayPriority, IPv6Gateway: r.connectedIPv6Gateway}
 		return runtimeprocess.CommandResult{}, nil
 	}
 	if len(args) == 4 && args[0] == "network" && args[1] == "disconnect" {
@@ -106,7 +108,7 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 		if ipIndex < 0 || ipIndex+1 >= len(args) {
 			return runtimeprocess.CommandResult{}, errors.New("missing static ingress address")
 		}
-		r.caddyNetworks[caddyNetworkName] = &networkAttachment{IPAddress: args[ipIndex+1]}
+		r.caddyNetworks[caddyNetworkName] = &networkAttachment{IPAddress: args[ipIndex+1], GwPriority: caddyGatewayPriority}
 		r.ingressContainers = map[string]caddyNetworkContainerInspection{strings.Repeat("d", 64): {Name: caddyContainerName, IPv4Address: args[ipIndex+1] + "/28"}}
 		return runtimeprocess.CommandResult{}, nil
 	}
@@ -797,6 +799,88 @@ func TestCaddyInspectionRequiresOnlyGatewayBindCapability(t *testing.T) {
 	}
 }
 
+func TestCaddyGatewayPriorityPolicyRejectsAmbiguousOrMissingGateways(t *testing.T) {
+	tests := []struct {
+		name     string
+		networks map[string]*networkAttachment
+		valid    bool
+	}{
+		{"ingress only", map[string]*networkAttachment{caddyNetworkName: {GwPriority: 1}}, true},
+		{"multiple apps", map[string]*networkAttachment{caddyNetworkName: {GwPriority: 1}, "rig-a-first": {}, "rig-a-second": {}}, true},
+		{"missing ingress", map[string]*networkAttachment{"rig-a-first": {}}, false},
+		{"nil ingress", map[string]*networkAttachment{caddyNetworkName: nil}, false},
+		{"legacy missing priority", map[string]*networkAttachment{caddyNetworkName: {}}, false},
+		{"different ingress priority", map[string]*networkAttachment{caddyNetworkName: {GwPriority: 2}}, false},
+		{"negative ingress priority", map[string]*networkAttachment{caddyNetworkName: {GwPriority: -1}}, false},
+		{"tied app priority", map[string]*networkAttachment{caddyNetworkName: {GwPriority: 1}, "rig-a-first": {GwPriority: 1}}, false},
+		{"higher app priority", map[string]*networkAttachment{caddyNetworkName: {GwPriority: 1}, "rig-a-first": {GwPriority: 2}}, false},
+		{"negative app priority", map[string]*networkAttachment{caddyNetworkName: {GwPriority: 1}, "rig-a-first": {GwPriority: -1}}, false},
+		{"nil app", map[string]*networkAttachment{caddyNetworkName: {GwPriority: 1}, "rig-a-first": nil}, false},
+		{"dual stack ingress", map[string]*networkAttachment{caddyNetworkName: {GwPriority: 1, IPv6Gateway: "fd00::1"}}, false},
+		{"dual stack app", map[string]*networkAttachment{caddyNetworkName: {GwPriority: 1}, "rig-a-first": {IPv6Gateway: "fd00::1"}}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, runner := newManagerFixture(t, false)
+			value := runner.caddyInspection()
+			value.Networks = test.networks
+			if got := validCaddyInspection(value, "sha256:"+strings.Repeat("a", 64), 8080); got != test.valid {
+				t.Fatalf("gateway policy valid = %t, want %t", got, test.valid)
+			}
+		})
+	}
+}
+
+func TestCaddyGatewayDriftBlocksProvisionSwitchAndConfigCopy(t *testing.T) {
+	for _, action := range []string{"provision", "switch", "apply"} {
+		t.Run(action, func(t *testing.T) {
+			manager, runner := newManagerFixture(t, false)
+			runner.caddyNetworks[caddyNetworkName].GwPriority = 0
+			var err error
+			switch action {
+			case "provision":
+				err = manager.Provision(context.Background())
+			case "switch":
+				err = manager.Switch(context.Background(), switchRequest(runner))
+			case "apply":
+				err = manager.applyRoutes(context.Background(), map[string]routeRecord{}, "reconcile.json")
+			}
+			if !IsCode(err, DiagnosticIngressDrift) {
+				t.Fatalf("gateway drift error = %v", err)
+			}
+			for _, command := range runner.commands {
+				if len(command) < 2 || command[1] != "inspect" {
+					t.Fatal("gateway drift reached a Docker mutation")
+				}
+			}
+		})
+	}
+}
+
+func TestCaddyGatewayPriorityIsReattestedAfterApplicationConnect(t *testing.T) {
+	for _, dualStack := range []bool{false, true} {
+		manager, runner := newManagerFixture(t, false)
+		if dualStack {
+			runner.connectedIPv6Gateway = "fd00::1"
+		} else {
+			runner.connectedGatewayPriority = 1
+		}
+		routes := map[string]routeRecord{runner.appID: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{runner.endpoint}}}
+		if err := manager.reconcileCaddyNetworks(context.Background(), routes); !IsCode(err, DiagnosticIngressDrift) {
+			t.Fatalf("post-connect gateway drift error = %v", err)
+		}
+		if commandIndex(runner.commands, "connect") < 0 {
+			t.Fatal("test did not reach the network attachment boundary")
+		}
+		if err := manager.applyRoutes(context.Background(), routes, "proposed.json"); !IsCode(err, DiagnosticIngressDrift) {
+			t.Fatalf("post-connect route publication error = %v", err)
+		}
+		if len(runner.files) != 0 {
+			t.Fatal("unattested gateway reached route copy")
+		}
+	}
+}
+
 func TestIngressInspectFormatsUseCanonicalDockerFieldsAndNilGuards(t *testing.T) {
 	imageID := "sha256:" + strings.Repeat("a", 64)
 	var image imageInspection
@@ -837,13 +921,16 @@ func TestIngressInspectFormatsUseCanonicalDockerFieldsAndNilGuards(t *testing.T)
 		},
 		State: templateIngressDockerState{Running: true, Restarting: true, Health: &templateIngressDockerHealth{Status: "healthy"}},
 		NetworkSettings: &templateIngressDockerNetworkSettings{Networks: map[string]*networkAttachment{
-			networkName: {Aliases: []string{"api-green"}},
+			networkName: {Aliases: []string{"api-green"}, GwPriority: 1, IPv6Gateway: "fd00::1"},
 		}},
 	}
 	var caddy caddyInspection
 	executeIngressInspectTemplate(t, caddyInspectFormat, input, &caddy)
 	if !caddy.Running || !caddy.Restarting {
 		t.Fatal("Caddy lifecycle fields were not projected exactly")
+	}
+	if caddy.Networks[networkName] == nil || caddy.Networks[networkName].GwPriority != 1 || caddy.Networks[networkName].IPv6Gateway != "fd00::1" {
+		t.Fatal("Caddy gateway selection fields were not projected exactly")
 	}
 	if caddy.ID != containerID || len(caddy.Entrypoint) != 1 || caddy.Entrypoint[0] != caddyExecutable || caddy.NanoCPUs != 1_000_000_000 || caddy.Networks[networkName] == nil || !containsString(caddy.Networks[networkName].Aliases, "api-green") {
 		t.Fatalf("caddy inspection = %#v", caddy)
@@ -881,7 +968,7 @@ func TestProvisionCreatesPinnedIngressNetworkAndStaticCaddyAddress(t *testing.T)
 	if !hasCommandArguments(runner.commands, "network", "create", "--subnet", subnet, "--gateway", gateway, caddyNetworkName) {
 		t.Fatalf("network create did not use pinned IPAM: %#v", runner.commands)
 	}
-	if !hasCommandArguments(runner.commands, "container", "create", "--network", caddyNetworkName, "--ip", address) {
+	if !hasCommandArguments(runner.commands, "container", "create", "--network", "name="+caddyNetworkName+",gw-priority=1", "--ip", address) {
 		t.Fatalf("container create did not use static ingress address: %#v", runner.commands)
 	}
 	var create []string
@@ -945,7 +1032,7 @@ func newManagerFixture(t *testing.T, failReload bool) (*Manager, *ingressRunner)
 	_, _, ingressIP := ingressNetworkCandidate(0)
 	runner := &ingressRunner{
 		appID: appID, network: endpoint.NetworkName, endpoint: endpoint,
-		caddyNetworks:     map[string]*networkAttachment{caddyNetworkName: {}},
+		caddyNetworks:     map[string]*networkAttachment{caddyNetworkName: {GwPriority: caddyGatewayPriority}},
 		ingressContainers: map[string]caddyNetworkContainerInspection{strings.Repeat("d", 64): {Name: caddyContainerName, IPv4Address: ingressIP + "/28"}},
 		files:             map[string][]byte{}, failProposedReload: failReload,
 	}
