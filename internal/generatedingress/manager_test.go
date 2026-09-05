@@ -17,6 +17,8 @@ import (
 )
 
 type ingressRunner struct {
+	restarting         bool
+	restartAfterStart  bool
 	appID              string
 	network            string
 	endpoint           generatedruntime.RouteEndpoint
@@ -118,6 +120,7 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 	}
 	if len(args) == 3 && args[0] == "container" && args[1] == "start" {
 		r.stopped = false
+		r.restarting = r.restartAfterStart
 		r.startConfig = append([]byte(nil), r.files[caddyContainerName+":/config/active.json"]...)
 		return runtimeprocess.CommandResult{}, nil
 	}
@@ -183,7 +186,7 @@ func (r *ingressRunner) caddyInspection() caddyInspection {
 		Labels: map[string]string{"io.rig.managed": "generated-ingress", "io.rig.identity-version": "v1", "io.rig.listener-isolation": "v1"}, Hostname: caddyContainerName, User: "1000:1000", Env: []string{"XDG_CONFIG_HOME=/config", "XDG_DATA_HOME=/data"},
 		Entrypoint: []string{caddyExecutable}, Cmd: []string{"run", "--config", "/config/active.json"}, ReadOnly: true, CapDrop: []string{"ALL"}, SecurityOpt: []string{"no-new-privileges"},
 		Mounts: []mountInspection{{Type: "volume", Name: caddyVolumeName, Destination: "/config", RW: true}}, Tmpfs: map[string]string{"/data": "rw,noexec,nosuid,nodev,size=67108864"},
-		Memory: 268435456, MemorySwap: 268435456, NanoCPUs: 1_000_000_000, PIDsLimit: 128, LogType: "local", LogConfig: map[string]string{"max-size": "10m", "max-file": "3"}, Restart: "unless-stopped", Running: !r.stopped,
+		Memory: 268435456, MemorySwap: 268435456, NanoCPUs: 1_000_000_000, PIDsLimit: 128, LogType: "local", LogConfig: map[string]string{"max-size": "10m", "max-file": "3"}, Restart: "unless-stopped", Running: !r.stopped, Restarting: r.restarting,
 		NetworkMode: caddyNetworkName, Ulimits: []ulimitInspection{{Name: "nofile", Hard: 1024, Soft: 1024}}, PortBindings: map[string][]map[string]string{"8080/tcp": {{"HostIp": "127.0.0.1", "HostPort": "8080"}}}, Networks: r.caddyNetworks,
 	}
 }
@@ -446,6 +449,60 @@ func TestProvisionRejectsListenerAddressOutsideOwnedSubnet(t *testing.T) {
 	runner.ingressContainers[strings.Repeat("d", 64)] = caddyNetworkContainerInspection{Name: caddyContainerName, IPv4Address: "10.203.0.3/28"}
 	if err := manager.Provision(context.Background()); !IsCode(err, DiagnosticIngressDrift) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRestartingCaddyCannotAcceptRoutesOrListenerObservation(t *testing.T) {
+	for _, action := range []string{"provision", "switch", "listen"} {
+		t.Run(action, func(t *testing.T) {
+			manager, runner := newManagerFixture(t, false)
+			runner.restarting = true
+			var err error
+			switch action {
+			case "provision":
+				err = manager.Provision(context.Background())
+			case "switch":
+				err = manager.Switch(context.Background(), switchRequest(runner))
+			case "listen":
+				_, err = manager.caddyListenAddress(context.Background())
+			}
+			if !IsCode(err, DiagnosticIngressUnavailable) {
+				t.Fatalf("restarting Caddy error = %v", err)
+			}
+			for _, args := range runner.commands {
+				if len(args) < 2 || args[1] != "inspect" {
+					t.Fatal("restarting Caddy triggered a Docker mutation")
+				}
+			}
+		})
+	}
+}
+
+func TestProvisionRejectsCaddyRestartLoopAfterStart(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stopped", true: "new"}[missing], func(t *testing.T) {
+			manager, runner := newManagerFixture(t, false)
+			runner.stopped = true
+			runner.caddyMissing = missing
+			runner.restartAfterStart = true
+			if err := manager.Provision(context.Background()); !IsCode(err, DiagnosticIngressUnavailable) {
+				t.Fatalf("post-start restart error = %v", err)
+			}
+			starts := 0
+			for _, args := range runner.commands {
+				if len(args) >= 2 && args[0] == "container" {
+					if args[1] == "start" {
+						starts++
+					}
+					if args[1] == "exec" {
+						t.Fatal("restart loop reached route execution")
+					}
+				}
+			}
+			if starts != 1 {
+				t.Fatalf("start count = %d", starts)
+			}
+		})
 	}
 }
 
@@ -759,13 +816,16 @@ func TestIngressInspectFormatsUseCanonicalDockerFieldsAndNilGuards(t *testing.T)
 		HostConfig: templateIngressDockerHostConfig{
 			NanoCPUs: 1_000_000_000,
 		},
-		State: templateIngressDockerState{Health: &templateIngressDockerHealth{Status: "healthy"}},
+		State: templateIngressDockerState{Running: true, Restarting: true, Health: &templateIngressDockerHealth{Status: "healthy"}},
 		NetworkSettings: &templateIngressDockerNetworkSettings{Networks: map[string]*networkAttachment{
 			networkName: {Aliases: []string{"api-green"}},
 		}},
 	}
 	var caddy caddyInspection
 	executeIngressInspectTemplate(t, caddyInspectFormat, input, &caddy)
+	if !caddy.Running || !caddy.Restarting {
+		t.Fatal("Caddy lifecycle fields were not projected exactly")
+	}
 	if caddy.ID != containerID || len(caddy.Entrypoint) != 1 || caddy.Entrypoint[0] != caddyExecutable || caddy.NanoCPUs != 1_000_000_000 || caddy.Networks[networkName] == nil || !containsString(caddy.Networks[networkName].Aliases, "api-green") {
 		t.Fatalf("caddy inspection = %#v", caddy)
 	}
@@ -934,8 +994,9 @@ type templateIngressDockerRestartPolicy struct {
 }
 
 type templateIngressDockerState struct {
-	Running bool
-	Health  *templateIngressDockerHealth
+	Running    bool
+	Restarting bool
+	Health     *templateIngressDockerHealth
 }
 
 type templateIngressDockerHealth struct {

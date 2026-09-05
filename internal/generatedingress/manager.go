@@ -285,6 +285,9 @@ func (m *Manager) ensureCaddy(ctx context.Context, routes map[string]routeRecord
 	if !validCaddyInspection(inspection, imageID, m.options.HostPort) {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
+	if inspection.Restarting {
+		return &Error{Code: DiagnosticIngressUnavailable}
+	}
 	if !inspection.Running {
 		if err := m.disconnectApplicationNetworks(ctx, inspection); err != nil {
 			return err
@@ -297,7 +300,7 @@ func (m *Manager) ensureCaddy(ctx context.Context, routes map[string]routeRecord
 		reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.options.CommandTimeout)
 		inspection, found, err = m.inspectCaddy(reconcileCtx)
 		cancel()
-		if err != nil || !found || !inspection.Running || !validCaddyInspection(inspection, imageID, m.options.HostPort) {
+		if err != nil || !found || !inspection.Running || inspection.Restarting || !validCaddyInspection(inspection, imageID, m.options.HostPort) {
 			if startErr != nil {
 				return startErr
 			}
@@ -426,7 +429,7 @@ func (m *Manager) createCaddy(ctx context.Context, imageID, ingressIP string) er
 	}
 	startErr := m.runDiscard(reconcileCtx, m.options.CommandTimeout, "container", "start", caddyContainerName)
 	started, startedFound, inspectStartedErr := m.inspectCaddy(reconcileCtx)
-	if inspectStartedErr != nil || !startedFound || !started.Running || !validCaddyInspection(started, imageID, m.options.HostPort) {
+	if inspectStartedErr != nil || !startedFound || !started.Running || started.Restarting || !validCaddyInspection(started, imageID, m.options.HostPort) {
 		if startErr != nil {
 			return startErr
 		}
@@ -506,7 +509,7 @@ func (m *Manager) copyConfig(ctx context.Context, contents []byte, filename stri
 
 func (m *Manager) caddyListenAddress(ctx context.Context) (string, error) {
 	inspection, found, err := m.inspectCaddy(ctx)
-	if err != nil || !found || !inspection.Running {
+	if err != nil || !found || !inspection.Running || inspection.Restarting {
 		return "", &Error{Code: DiagnosticIngressUnavailable}
 	}
 	attachment := inspection.Networks[caddyNetworkName]
@@ -773,6 +776,7 @@ type caddyInspection struct {
 	NetworkMode  string                         `json:"networkMode"`
 	Ulimits      []ulimitInspection             `json:"ulimits"`
 	Running      bool                           `json:"running"`
+	Restarting   bool                           `json:"restarting"`
 	PortBindings map[string][]map[string]string `json:"portBindings"`
 	Networks     map[string]*networkAttachment  `json:"networks"`
 }
@@ -845,7 +849,7 @@ type ulimitInspection struct {
 const (
 	imageInspectFormat    = `{"id":{{json .ID}},"os":{{json .Os}},"repoDigests":{{json .RepoDigests}}}`
 	volumeInspectFormat   = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"options":{{json .Options}},"labels":{{json .Labels}}}`
-	caddyInspectFormat    = `{"id":{{json .ID}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"hostname":{{json .Config.Hostname}},"user":{{json .Config.User}},"env":{{json .Config.Env}},"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"readOnly":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"tmpfs":{{json .HostConfig.Tmpfs}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCPUs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"networkMode":{{json .HostConfig.NetworkMode}},"ulimits":{{json .HostConfig.Ulimits}},"running":{{json .State.Running}},"portBindings":{{json .HostConfig.PortBindings}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
+	caddyInspectFormat    = `{"id":{{json .ID}},"name":{{json .Name}},"image":{{json .Image}},"labels":{{json .Config.Labels}},"hostname":{{json .Config.Hostname}},"user":{{json .Config.User}},"env":{{json .Config.Env}},"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"readOnly":{{json .HostConfig.ReadonlyRootfs}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"tmpfs":{{json .HostConfig.Tmpfs}},"memory":{{json .HostConfig.Memory}},"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCPUs}},"pidsLimit":{{json .HostConfig.PidsLimit}},"logType":{{json .HostConfig.LogConfig.Type}},"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},"networkMode":{{json .HostConfig.NetworkMode}},"ulimits":{{json .HostConfig.Ulimits}},"running":{{json .State.Running}},"restarting":{{json .State.Restarting}},"portBindings":{{json .HostConfig.PortBindings}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
 	networkInspectFormat  = `{"name":{{json .Name}},"driver":{{json .Driver}},"scope":{{json .Scope}},"internal":{{json .Internal}},"options":{{json .Options}},"ipam":{{json .IPAM.Config}},"labels":{{json .Labels}}}`
 	endpointInspectFormat = `{"id":{{json .ID}},"labels":{{json .Config.Labels}},"running":{{json .State.Running}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}""{{end}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
 )
