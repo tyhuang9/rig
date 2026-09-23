@@ -41,11 +41,14 @@ Analysis excludes Git metadata, environment files, credentials, private keys, de
 
 1. Add an application from a local folder or connected GitHub repository.
 2. Choose **Analyze project**. For GitHub, a generated application does not need a Compose path.
-3. Review **How Rig will run this app**. Normal review exposes the Build and Run commands. Package installation is inferred from the lockfile.
-4. Correct a Build or Run command when inference is incomplete. Advanced settings include dependency installation, Node.js version, internal port, health path, and a detected migration.
-5. Accept the setup. Acceptance uses the inspected source fingerprint, candidate digest, and expected revision so stale browser state cannot replace a newer decision.
-6. If a migration is detected, review its persistent-data warning and approve it separately.
-7. Open the application and choose **Deploy latest**.
+3. Review **Build and run settings**. Rig uses detection only as a starting point; every generated setup remains editable.
+4. Configure one Node.js or Next.js server, one static site, or a static site plus server. Each component has an editable root, package manager, Node.js 20/22/24 version, install command, build command, port, and health path. Server components also require a start command. Static sites use Rig’s managed static server and require an output directory instead.
+5. An empty install or build command explicitly skips that phase. Rig supplies `.` as the root, Node.js 24, port 3000 for servers, port 8080 for static sites, `/` as the health path, and `dist` as the default static output when detection has no value. A new static site starts with `npm install` and `npm run build`; an undetected server start command remains blank and is highlighted for review.
+6. Choose **Review setup** after editing. Rig reanalyzes the exact source with the submitted settings, then returns a user configuration candidate. **Accept setup** binds that candidate digest, source fingerprint, and expected revision so stale browser state cannot replace a newer decision.
+7. Detection never blocks the form: enter the commands and paths manually when Rig cannot identify a supported candidate. Retry and reanalysis keep unsaved form edits until you choose **Reset to detected settings**.
+8. Existing generated applications open the same editor from their application page, beginning with the immutable accepted revision. Reanalyzing keeps the draft; existing Compose applications stay on their Compose strategy.
+9. If a migration is detected, review its persistent-data warning and approve it separately.
+10. Open the application and choose **Deploy latest**.
 
 Commands are non-secret configuration. Put credentials and application values in **Configuration**, not in Build, Run, or migration commands. Authenticated plan responses use `Cache-Control: no-store`.
 
@@ -54,6 +57,8 @@ Commands are non-secret configuration. Put credentials and application values in
 An accepted deployment-plan revision records the strategy, detector version, structural source fingerprint, component roots and roles, package manager, Node.js version, Build and Run commands, ports, health probes, migration evidence, field provenance, canonical digest, actor, and time. In Rig-controlled durable storage, command text lives only in an application-purpose-bound protected bundle; SQLite retains metadata and digests without the commands. Authenticated plan-review responses return the commands with `Cache-Control: no-store`; execution surfaces handle them only as described below.
 
 Bundle protection uses DPAPI and restrictive ACLs on Windows. On POSIX it uses purpose binding and `0600` files in `0700` directories, not encryption at rest; it does not protect against root or another process running as the controller user.
+
+The protected deployment bundle format is now version 3. Existing version 1 and 2 revisions remain readable and their release pins remain valid, but a downgraded controller cannot read a version 3 revision. Before accepting the first edited setup on an existing controller, retain a backup of both the controller database and its protected data root; restore them together if a rollback to older controller software is required.
 
 Every release pins both its configuration revision and deployment-plan revision. Redeploying an older release uses those original pins even after a newer plan is accepted.
 

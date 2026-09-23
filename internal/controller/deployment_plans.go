@@ -59,6 +59,42 @@ func (s *Server) acceptApplicationDeploymentPlan(w http.ResponseWriter, r *http.
 		problem(w, r, http.StatusConflict, "deployment_plan_review_required", "Project structure changed; review how Rig will run it again", nil)
 		return
 	}
+	if setupPresent(body.Setup) {
+		// An existing Compose source must retain its explicit strategy. New
+		// generated-source drafts have no selected Compose path.
+		if application.Source.ComposePath != "" {
+			problem(w, r, http.StatusUnprocessableEntity, "invalid_deployment_setup", "Use the existing Compose configuration for this application", nil)
+			return
+		}
+		configured, setupErr := sourceinspection.WithSetup(inspection, deploymentSetupInput(body.Setup))
+		if setupErr != nil {
+			inspectionProblem(w, r, setupErr)
+			return
+		}
+		resolved := configured.ResolvedSHA
+		if resolved == "" {
+			resolved = configured.Analysis.StructuralFingerprint
+		}
+		plan, _, setupErr := deploymentplans.AcceptSetup(configured.Analysis, deploymentSetupInput(body.Setup), deploymentplans.SourceIdentity{Provider: configured.Source.Type, RepositoryID: configured.Source.RepositoryID, ResolvedDigest: resolved})
+		if setupErr != nil {
+			if !deploymentSetupProblem(w, r, setupErr) {
+				deploymentPlanProblem(w, r, setupErr)
+			}
+			return
+		}
+		candidate := configured.Analysis.Candidates[len(configured.Analysis.Candidates)-1]
+		if body.CandidateID != candidate.ID || body.ExpectedCandidateDigest != candidate.Digest {
+			problem(w, r, http.StatusConflict, "deployment_plan_review_required", "The deployment setup changed; review it again", nil)
+			return
+		}
+		revision, saveErr := s.DeploymentPlans.Replace(r.Context(), application.ID, sourceOwner(r), deploymentplans.ReplaceInput{ExpectedRevisionNumber: body.ExpectedRevisionNumber, Plan: plan})
+		if saveErr != nil {
+			deploymentPlanProblem(w, r, saveErr)
+			return
+		}
+		writeJSON(w, http.StatusOK, contractDeploymentPlanRevision(revision))
+		return
+	}
 	candidate, ok := findPlanCandidate(inspection.Analysis.Candidates, body.CandidateID)
 	if !ok || candidate.Digest != body.ExpectedCandidateDigest || candidate.Kind != projectanalysis.PlanKindJavaScript || candidate.Status == projectanalysis.StatusUnsupported {
 		problem(w, r, http.StatusConflict, "deployment_plan_review_required", "The inferred deployment plan changed; review it again", nil)
@@ -408,6 +444,9 @@ func contractDeploymentPlanRevision(value deploymentplans.DeploymentPlanRevision
 		Source:     apicontract.DeploymentPlanSource{Provider: value.Plan.Source.Provider, RepositoryID: value.Plan.Source.RepositoryID, ResolvedDigest: value.Plan.Source.ResolvedDigest},
 		Detector:   apicontract.DeploymentPlanDetector{Name: value.Plan.Detector.Name, Version: value.Plan.Detector.Version, SourceStructuralFingerprint: value.Plan.Detector.SourceStructuralFingerprint},
 		Components: make([]apicontract.DeploymentPlanComponent, 0, len(value.Plan.Components)), FieldProvenance: make([]apicontract.DeploymentPlanFieldProvenance, 0, len(value.Plan.FieldProvenance)),
+	}
+	if setup, explicit := deploymentplans.SetupFromPlan(value.Plan); explicit {
+		result.Setup = contractDeploymentSetup(setup)
 	}
 	for _, component := range value.Plan.Components {
 		result.Components = append(result.Components, apicontract.DeploymentPlanComponent{Name: component.Name, Role: component.Role, RootDirectory: component.RootDirectory, PackageManager: component.PackageManager, InstallBehavior: component.InstallBehavior, InstallDirectory: component.InstallDirectory, NodeVersion: component.NodeVersion, BuildCommand: component.BuildCommand, RunCommand: component.RunCommand, InternalPort: int(component.InternalPort), HealthProbe: component.HealthProbe})

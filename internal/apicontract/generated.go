@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "44471107c9b603462ee06a505fa478b5fb96e5444f2c54eed866cc4bf2209725"
+const SourceSHA256 = "616650b4de12cf29f58f800fc240199ed0cc62ecb171d7c97f23db8410002a45"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -66,13 +66,14 @@ var Operations = map[string]Operation{
 
 type AcceptDeploymentPlanRequest struct {
 	CandidateID                         string                         `json:"candidateId"`
-	Components                          []DeploymentPlanComponentInput `json:"components"`
+	Components                          []DeploymentPlanComponentInput `json:"components,omitempty"`
 	ExpectedCandidateDigest             string                         `json:"expectedCandidateDigest"`
 	ExpectedRevisionNumber              int64                          `json:"expectedRevisionNumber"`
 	ExpectedSourceStructuralFingerprint string                         `json:"expectedSourceStructuralFingerprint"`
-	InstallBehavior                     string                         `json:"installBehavior"`
-	MigrationCommand                    string                         `json:"migrationCommand"`
-	PackageManager                      string                         `json:"packageManager"`
+	InstallBehavior                     string                         `json:"installBehavior,omitempty"`
+	MigrationCommand                    string                         `json:"migrationCommand,omitempty"`
+	PackageManager                      string                         `json:"packageManager,omitempty"`
+	Setup                               *DeploymentSetupInput          `json:"setup,omitempty"`
 }
 
 type AnalysisAdvancedInput struct {
@@ -236,11 +237,12 @@ type ConfigurationValueInput struct {
 }
 
 type CreateApplicationRequest struct {
-	Description  string       `json:"description,omitempty"`
-	GithubSource GitHubSource `json:"githubSource,omitempty"`
-	MachineID    string       `json:"machineId,omitempty"`
-	Name         string       `json:"name"`
-	SourcePath   string       `json:"sourcePath,omitempty"`
+	Description  string                `json:"description,omitempty"`
+	GithubSource GitHubSource          `json:"githubSource,omitempty"`
+	MachineID    string                `json:"machineId,omitempty"`
+	Name         string                `json:"name"`
+	Setup        *DeploymentSetupInput `json:"setup,omitempty"`
+	SourcePath   string                `json:"sourcePath,omitempty"`
 }
 
 type DeployReleaseRequest struct {
@@ -347,6 +349,7 @@ type DeploymentPlanRevision struct {
 	Migration       DeploymentPlanMigration         `json:"migration"`
 	RevisionID      string                          `json:"revisionId,omitempty"`
 	RevisionNumber  int64                           `json:"revisionNumber"`
+	Setup           *DeploymentSetupInput           `json:"setup,omitempty"`
 	Source          DeploymentPlanSource            `json:"source"`
 	State           string                          `json:"state"`
 	Strategy        string                          `json:"strategy"`
@@ -356,6 +359,25 @@ type DeploymentPlanSource struct {
 	Provider       string `json:"provider"`
 	RepositoryID   int64  `json:"repositoryId"`
 	ResolvedDigest string `json:"resolvedDigest"`
+}
+
+type DeploymentSetupComponentInput struct {
+	BuildCommand    string `json:"buildCommand"`
+	HealthProbe     string `json:"healthProbe"`
+	ID              string `json:"id"`
+	InstallCommand  string `json:"installCommand"`
+	InternalPort    int    `json:"internalPort"`
+	NodeVersion     string `json:"nodeVersion"`
+	OutputDirectory string `json:"outputDirectory"`
+	PackageManager  string `json:"packageManager"`
+	RootDirectory   string `json:"rootDirectory"`
+	StartCommand    string `json:"startCommand"`
+	Technology      string `json:"technology"`
+}
+
+type DeploymentSetupInput struct {
+	Components       []DeploymentSetupComponentInput `json:"components"`
+	MigrationCommand string                          `json:"migrationCommand,omitempty"`
 }
 
 type DetectedService struct {
@@ -466,8 +488,9 @@ type HostResources struct {
 }
 
 type InspectRequest struct {
-	GithubSource GitHubSource `json:"githubSource,omitempty"`
-	SourcePath   string       `json:"sourcePath,omitempty"`
+	GithubSource GitHubSource          `json:"githubSource,omitempty"`
+	Setup        *DeploymentSetupInput `json:"setup,omitempty"`
+	SourcePath   string                `json:"sourcePath,omitempty"`
 }
 
 type InspectResponse struct {

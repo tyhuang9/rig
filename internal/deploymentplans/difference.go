@@ -30,6 +30,14 @@ func CompareAnalysis(plan Plan, analysis projectanalysis.SourceAnalysis) ([]Plan
 
 	differences := make(map[string]struct{})
 	add := func(field string) { differences[field] = struct{}{} }
+	if setup, explicit := SetupFromPlan(plan); explicit {
+		candidate, _, err := projectanalysis.PrepareSetup(analysis, setup)
+		if err != nil {
+			return []PlanDifference{{Field: "setup"}}, nil
+		}
+		compareMigrationEvidence(differences, plan, candidate)
+		return sortedDifferences(differences), nil
+	}
 	if plan.Detector.Name != "projectanalysis" || plan.Detector.Version != analysis.SchemaVersion {
 		add("detector")
 	}

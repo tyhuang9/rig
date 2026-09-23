@@ -19,6 +19,7 @@ import (
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
@@ -396,7 +397,11 @@ func newSourceHarness(t *testing.T, enabled bool) *sourceHarness {
 	credentials := sourceconnections.NewFileCredentialStore(root)
 	service := sourceconnections.NewService(repository, configured, credentials, appSlug, clock.Time)
 	logs := &bytes.Buffer{}
-	server := &controller.Server{Auth: authService, Apps: apps.New(db), Jobs: jobs.New(db), Machines: machineStore, Sources: service, Logger: slog.New(slog.NewJSONHandler(logs, nil))}
+	planStore, err := deploymentplans.New(db, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &controller.Server{DeploymentPlans: planStore, Auth: authService, Apps: apps.New(db), Jobs: jobs.New(db), Machines: machineStore, Sources: service, Logger: slog.New(slog.NewJSONHandler(logs, nil))}
 	return &sourceHarness{handler: server.Handler(), session: session, otherSession: otherSession, service: service, repository: repository, credentials: credentials, provider: provider, clock: clock, logs: logs}
 }
 

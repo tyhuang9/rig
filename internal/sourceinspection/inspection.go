@@ -99,7 +99,7 @@ func InspectGitHub(ctx context.Context, reader GitHubReader, owner string, sourc
 		if entry.Type == "commit" {
 			result.Findings = append(result.Findings, Finding{Code: "unsupported_submodule", Message: "Git submodules are not supported", Path: entry.Path})
 		}
-		if entry.Type == "blob" {
+		if entry.Type == "blob" && entry.Mode != "120000" {
 			blobs[entry.Path] = entry
 			analysisFiles = append(analysisFiles, projectanalysis.File{Path: entry.Path, Size: entry.Size})
 			if isComposeName(path.Base(entry.Path)) {
@@ -145,7 +145,7 @@ func InspectLocalContext(ctx context.Context, sourcePath string) (Result, error)
 		return Result{}, &Error{Code: "invalid_source"}
 	}
 	linkInfo, err := os.Lstat(absolute)
-	if err != nil || linkInfo.Mode()&os.ModeSymlink != 0 {
+	if err != nil || linkInfo.Mode()&os.ModeSymlink != 0 || inspectionReparsePoint(absolute) {
 		return Result{}, &Error{Code: "invalid_source"}
 	}
 	info, err := os.Stat(absolute)
@@ -170,14 +170,14 @@ func InspectLocalContext(ctx context.Context, sourcePath string) (Result, error)
 		if entries > maxLocalEntries {
 			return &Error{Code: "source_too_large"}
 		}
-		if entry.Type()&os.ModeSymlink != 0 {
+		if entry.Type()&os.ModeSymlink != 0 || inspectionReparsePoint(current) {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
 		if entry.IsDir() {
-			if current != root && excludedAnalysisDirectory(entry.Name()) {
+			if current != root && excludedAnalysisDirectory(entry.Name()) && !observedStaticOutputDirectory(root, current) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -288,7 +288,7 @@ func (reader localProjectReader) ReadFile(ctx context.Context, name string, maxB
 		if statErr != nil {
 			return nil, statErr
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
+		if info.Mode()&os.ModeSymlink != 0 || inspectionReparsePoint(current) {
 			return nil, errors.New("analysis path contains a link")
 		}
 	}
@@ -322,6 +322,32 @@ func excludedAnalysisDirectory(name string) bool {
 	default:
 		return false
 	}
+}
+
+// observedStaticOutputDirectory is the small exception to ordinary analysis
+// traversal: it permits a normal dist/build/out directory to contribute only
+// private existence evidence for a later explicit, build-skipped static setup.
+// Project analysis still excludes it from detection and fingerprints.
+func observedStaticOutputDirectory(root, current string) bool {
+	relative, err := filepath.Rel(root, current)
+	if err != nil || relative == "." || filepath.IsAbs(relative) {
+		return false
+	}
+	segments := strings.Split(filepath.ToSlash(relative), "/")
+	if len(segments) == 0 {
+		return false
+	}
+	switch strings.ToLower(segments[len(segments)-1]) {
+	case "dist", "build", "out":
+	default:
+		return false
+	}
+	for _, segment := range segments[:len(segments)-1] {
+		if excludedAnalysisDirectory(segment) {
+			return false
+		}
+	}
+	return true
 }
 
 func projectAnalysisError(err error) error {

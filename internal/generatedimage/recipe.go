@@ -12,7 +12,7 @@ import (
 	"github.com/hostd/hostd/internal/deploymentplans"
 )
 
-const CompilerVersion = "generated-node-v3"
+const CompilerVersion = "generated-node-v4"
 
 const (
 	installShellScript = `install=$(cat /run/rig/install.path) && rig_command=$(cat /run/secrets/rig-install-command) && cd -- "/workspace/$install" && exec /bin/sh -lc "$rig_command"`
@@ -26,18 +26,19 @@ var nodeImages = map[string]string{
 }
 
 type componentDefinition struct {
-	name             string
-	role             string
-	rootDirectory    string
-	packageManager   string
-	installBehavior  string
-	installDirectory string
-	buildCommand     string
-	runCommand       string
-	nodeVersion      string
-	internalPort     uint16
-	healthProbe      string
-	baseImage        string
+	name                  string
+	role                  string
+	rootDirectory         string
+	packageManager        string
+	installBehavior       string
+	installDirectory      string
+	buildCommand          string
+	runCommand            string
+	nodeVersion           string
+	internalPort          uint16
+	healthProbe           string
+	baseImage             string
+	staticOutputDirectory string
 }
 
 type digestDefinition struct {
@@ -83,9 +84,10 @@ func definitionFor(revision deploymentplans.DeploymentPlanRevision, componentNam
 		buildCommand: component.BuildCommand, runCommand: component.RunCommand,
 		nodeVersion: component.NodeVersion, internalPort: component.InternalPort,
 		healthProbe: component.HealthProbe, baseImage: base,
+		staticOutputDirectory: component.StaticOutputDirectory,
 	}
-	recipe := containerfile(definition.buildCommand != "", definition.packageManager != "npm", base)
-	recipeSum := sha256.Sum256([]byte(recipe + entrypointScript + staticLauncherScript + staticServerScript))
+	recipe := componentContainerfile(definition)
+	recipeSum := sha256.Sum256([]byte(recipe + entrypointScript + staticLauncherScript + staticServerScript + staticOutputCheckScript))
 	canonical, err := json.Marshal(digestDefinition{
 		CompilerVersion: CompilerVersion, PlanDigest: revision.CanonicalDigest, Component: definition.name,
 		Role: definition.role, RootDirectory: definition.rootDirectory, PackageManager: definition.packageManager,
@@ -101,23 +103,39 @@ func definitionFor(revision deploymentplans.DeploymentPlanRevision, componentNam
 }
 
 func containerfile(hasBuild, enableCorepack bool, baseImage string) string {
+	return containerfileWithOptions(true, hasBuild, enableCorepack, false, baseImage)
+}
+
+func componentContainerfile(definition componentDefinition) string {
+	return containerfileWithOptions(definition.installBehavior != "", definition.buildCommand != "", definition.packageManager != "npm", definition.staticOutputDirectory != "", definition.baseImage)
+}
+
+func containerfileWithOptions(hasInstall, hasBuild, enableCorepack, staticOutput bool, baseImage string) string {
 	corepack := ""
 	if enableCorepack {
 		corepack = "RUN [\"corepack\", \"enable\"]\n"
 	}
 	build := ""
+	install := ""
+	if hasInstall {
+		install = commandSecretRun("rig-install-command", installShellScript)
+	}
+	staticFiles, staticCheck := "", ""
+	if staticOutput {
+		staticFiles = "COPY --chmod=0444 rig/static-root.path /run/rig/static-root.path\nCOPY --chmod=0444 rig/check-static.mjs /run/rig/check-static.mjs\n"
+		staticCheck = "RUN [\"node\", \"/run/rig/check-static.mjs\"]\n"
+	}
 	if hasBuild {
 		build = commandSecretRun("rig-build-command", buildShellScript)
 	}
-	install := commandSecretRun("rig-install-command", installShellScript)
 	return fmt.Sprintf(`FROM %s AS builder
 %sWORKDIR /workspace
 RUN ["chown", "node:node", "/workspace"]
 COPY --chown=node:node source/ /workspace/
 RUN ["install", "-d", "-o", "0", "-g", "0", "-m", "0555", "/run/rig", "/run/secrets"]
 COPY --chown=1000:1000 --chmod=0400 rig/root.path rig/install.path /run/rig/
-USER node
-%s%sFROM %s AS runtime
+%sUSER node
+%s%s%sFROM %s AS runtime
 ENV NODE_ENV=production
 %sWORKDIR /workspace
 COPY --from=builder --chown=node:node /workspace/ /workspace/
@@ -126,7 +144,7 @@ COPY --chmod=0555 rig/rig-static /usr/local/bin/rig-static
 COPY --chmod=0444 rig/rig-static.mjs /usr/local/lib/rig/static.mjs
 USER node
 ENTRYPOINT ["/usr/local/bin/rig-entrypoint"]
-`, baseImage, corepack, install, build, baseImage, corepack)
+`, baseImage, corepack, staticFiles, install, build, staticCheck, baseImage, corepack)
 }
 
 func commandSecretRun(secretID, script string) string {
@@ -144,8 +162,36 @@ func writeRecipe(layout buildLayout, definition componentDefinition) error {
 	if err := writeBuildFile(filepath.Join(layout.contextDirectory, "rig", "install.path"), []byte(definition.installDirectory), 0o600); err != nil {
 		return err
 	}
-	return writeBuildFile(layout.containerfile, []byte(containerfile(definition.buildCommand != "", definition.packageManager != "npm", definition.baseImage)), 0o600)
+	if definition.staticOutputDirectory != "" {
+		if err := writeBuildFile(filepath.Join(layout.contextDirectory, "rig", "static-root.path"), []byte(definition.staticOutputDirectory), 0o600); err != nil {
+			return err
+		}
+		if err := writeBuildFile(filepath.Join(layout.contextDirectory, "rig", "check-static.mjs"), []byte(staticOutputCheckScript), 0o600); err != nil {
+			return err
+		}
+	}
+	return writeBuildFile(layout.containerfile, []byte(componentContainerfile(definition)), 0o600)
 }
+
+const staticOutputCheckScript = `import { readFileSync, lstatSync, realpathSync } from "node:fs";
+import { resolve, sep, relative } from "node:path";
+try {
+  const workspace = realpathSync("/workspace");
+  const root = resolve(workspace, readFileSync("/run/rig/root.path", "utf8"));
+  const output = resolve(root, readFileSync("/run/rig/static-root.path", "utf8"));
+  if (root !== workspace && !root.startsWith(workspace + sep)) throw new Error();
+  if (output !== root && !output.startsWith(root + sep)) throw new Error();
+  let current = workspace;
+  for (const part of relative(workspace, output).split(sep).filter(Boolean)) {
+    current = resolve(current, part);
+    const info = lstatSync(current);
+    if (!info.isDirectory() || info.isSymbolicLink() || realpathSync(current) !== current) throw new Error();
+  }
+} catch {
+  console.error("Rig static output directory is missing or unsafe. Check the build command and output directory.");
+  process.exit(65);
+}
+`
 
 const entrypointScript = `#!/bin/sh
 set -eu

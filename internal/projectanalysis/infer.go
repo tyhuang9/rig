@@ -23,6 +23,7 @@ func Analyze(ctx context.Context, files []File, reader FileReader) (SourceAnalys
 	result := SourceAnalysis{
 		SchemaVersion: SchemaVersion, StructuralFingerprint: source.fingerprint,
 		Candidates: []DeploymentPlanCandidate{}, Findings: slices.Clone(source.findings),
+		source: &source,
 	}
 	for _, file := range source.files {
 		switch {

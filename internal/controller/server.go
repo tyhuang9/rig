@@ -654,6 +654,9 @@ func (s *Server) createApp(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		inspection, inspectErr := sourceinspection.InspectGitHub(r.Context(), s.Sources, sourceOwner(r), inspectionGitHubSource(b.GithubSource))
+		if inspectErr == nil && setupPresent(b.Setup) {
+			inspection, inspectErr = sourceinspection.WithSetup(inspection, deploymentSetupInput(b.Setup))
+		}
 		if inspectErr != nil {
 			inspectionProblem(w, r, inspectErr)
 			return
@@ -664,6 +667,16 @@ func (s *Server) createApp(w http.ResponseWriter, r *http.Request) {
 		}
 		v, err = s.Apps.CreateWithSource(b.Name, b.Description, b.MachineID, apps.Source{Type: apps.SourceGitHub, ConnectionID: inspection.Source.ConnectionID, InstallationID: inspection.Source.InstallationID, RepositoryID: inspection.Source.RepositoryID, RepositoryOwner: inspection.Source.RepositoryOwner, RepositoryName: inspection.Source.RepositoryName, TrackedBranch: inspection.Source.TrackedBranch, TrackedRef: inspection.Source.TrackedRef, ComposePath: inspection.Source.ComposePath, ResolvedSHA: inspection.ResolvedSHA})
 	} else {
+		if setupPresent(b.Setup) {
+			inspection, inspectErr := sourceinspection.InspectLocalContext(r.Context(), b.SourcePath)
+			if inspectErr == nil {
+				_, inspectErr = sourceinspection.WithSetup(inspection, deploymentSetupInput(b.Setup))
+			}
+			if inspectErr != nil {
+				inspectionProblem(w, r, inspectErr)
+				return
+			}
+		}
 		v, err = s.Apps.Create(b.Name, b.Description, b.SourcePath, b.MachineID)
 	}
 	if err != nil {
@@ -697,6 +710,13 @@ func (s *Server) inspectApp(w http.ResponseWriter, r *http.Request) {
 		inspectionProblem(w, r, err)
 		return
 	}
+	if setupPresent(b.Setup) {
+		result, err = sourceinspection.WithSetup(result, deploymentSetupInput(b.Setup))
+		if err != nil {
+			inspectionProblem(w, r, err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, contractInspection(result))
 }
 
@@ -724,6 +744,9 @@ func contractInspection(value sourceinspection.Result) apicontract.InspectRespon
 }
 
 func inspectionProblem(w http.ResponseWriter, r *http.Request, err error) {
+	if deploymentSetupProblem(w, r, err) {
+		return
+	}
 	if sourceinspection.IsCode(err, "source_too_large") {
 		problem(w, r, http.StatusRequestEntityTooLarge, "source_too_large", "Source exceeds inspection limits", nil)
 		return

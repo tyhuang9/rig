@@ -14,6 +14,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/hostd/hostd/internal/projectanalysis"
 )
 
 const (
@@ -61,6 +63,7 @@ func IsCode(err error, code string) bool {
 }
 
 type Plan struct {
+	SetupVersion    int               `json:"setupVersion,omitempty"`
 	Strategy        Strategy          `json:"strategy"`
 	Detector        Detector          `json:"detector"`
 	Source          SourceIdentity    `json:"source"`
@@ -87,17 +90,19 @@ type Detector struct {
 // Component has explicit execution-contract fields, preventing later layers
 // from reinterpreting generic command positions.
 type Component struct {
-	Name             string `json:"name"`
-	Role             string `json:"role"`
-	RootDirectory    string `json:"rootDirectory"`
-	PackageManager   string `json:"packageManager"`
-	InstallBehavior  string `json:"installBehavior"`
-	InstallDirectory string `json:"installDirectory"`
-	NodeVersion      string `json:"nodeVersion"`
-	BuildCommand     string `json:"buildCommand,omitempty"`
-	RunCommand       string `json:"runCommand"`
-	InternalPort     uint16 `json:"internalPort"`
-	HealthProbe      string `json:"healthProbe"`
+	Name                  string `json:"name"`
+	Role                  string `json:"role"`
+	RootDirectory         string `json:"rootDirectory"`
+	PackageManager        string `json:"packageManager"`
+	InstallBehavior       string `json:"installBehavior"`
+	InstallDirectory      string `json:"installDirectory"`
+	NodeVersion           string `json:"nodeVersion"`
+	BuildCommand          string `json:"buildCommand,omitempty"`
+	RunCommand            string `json:"runCommand"`
+	InternalPort          uint16 `json:"internalPort"`
+	HealthProbe           string `json:"healthProbe"`
+	Technology            string `json:"technology,omitempty"`
+	StaticOutputDirectory string `json:"staticOutputDirectory,omitempty"`
 }
 
 type FieldProvenance struct {
@@ -198,6 +203,15 @@ func canonicalPlanWithLegacyMigration(plan Plan, allowLegacyMigration bool) (Pla
 	if plan.Strategy != StrategyGeneratedNode && plan.Strategy != StrategyCompose {
 		return Plan{}, invalid("strategy", "Must be generated_node or compose")
 	}
+	if plan.SetupVersion != 0 && (plan.SetupVersion != projectanalysis.SetupVersion || plan.Strategy != StrategyGeneratedNode || plan.Detector.Name != "manual-setup" || plan.Detector.Version != "1") {
+		return Plan{}, invalid("setupVersion", "Unsupported explicit deployment setup version")
+	}
+	if plan.SetupVersion != 0 {
+		setup, _ := SetupFromPlan(plan)
+		if _, err := projectanalysis.NormalizeSetup(setup); err != nil {
+			return Plan{}, invalid("components", "Explicit deployment setup is invalid")
+		}
+	}
 	if validateText(plan.Detector.Name, 256) != nil || validateText(plan.Detector.Version, 256) != nil || !validDigest(plan.Detector.SourceStructuralFingerprint) {
 		return Plan{}, invalid("detector", "Must include name, version, and lowercase structural fingerprint")
 	}
@@ -207,13 +221,26 @@ func canonicalPlanWithLegacyMigration(plan Plan, allowLegacyMigration bool) (Pla
 	if len(plan.Components) > 64 || len(plan.FieldProvenance) > 256 || (plan.Strategy == StrategyGeneratedNode && (len(plan.Components) < 1 || len(plan.Components) > 2)) {
 		return Plan{}, invalid("plan", "Contains too many entries")
 	}
-	result := Plan{Strategy: plan.Strategy, Detector: plan.Detector, Source: plan.Source, Migration: plan.Migration}
+	result := Plan{SetupVersion: plan.SetupVersion, Strategy: plan.Strategy, Detector: plan.Detector, Source: plan.Source, Migration: plan.Migration}
 	result.Components = append([]Component(nil), plan.Components...)
 	sort.Slice(result.Components, func(i, j int) bool { return result.Components[i].Name < result.Components[j].Name })
 	seen := map[string]bool{}
 	for _, component := range result.Components {
-		if seen[component.Name] || validateText(component.Name, 256) != nil || !supportedRole(component.Role) || !validRootDirectory(component.RootDirectory) || !supportedPackageManager(component.PackageManager) || ValidateCommand(component.InstallBehavior) != nil || !validRootDirectory(component.InstallDirectory) || validateText(component.NodeVersion, 256) != nil || ValidateCommand(component.RunCommand) != nil || component.InternalPort == 0 || !validHealthProbe(component.HealthProbe) {
+		installValid := ValidateCommand(component.InstallBehavior) == nil || (plan.SetupVersion != 0 && component.InstallBehavior == "")
+		if seen[component.Name] || validateText(component.Name, 256) != nil || !supportedRole(component.Role) || !validRootDirectory(component.RootDirectory) || !supportedPackageManager(component.PackageManager) || !installValid || !validRootDirectory(component.InstallDirectory) || validateText(component.NodeVersion, 256) != nil || ValidateCommand(component.RunCommand) != nil || component.InternalPort == 0 || !validHealthProbe(component.HealthProbe) {
 			return Plan{}, invalid("components", "Components must use complete bounded execution fields")
+		}
+		if plan.SetupVersion == 0 && (component.Technology != "" || component.StaticOutputDirectory != "") {
+			return Plan{}, invalid("components", "Explicit settings require a versioned setup")
+		}
+		if plan.SetupVersion != 0 {
+			role := "server"
+			if component.Technology == "static" {
+				role = "static"
+			}
+			if component.InstallDirectory != component.RootDirectory || component.Role != role || (role == "static" && component.RunCommand != projectanalysis.ManagedStaticCommand(component.StaticOutputDirectory, int(component.InternalPort))) {
+				return Plan{}, invalid("components", "Technology and execution fields must agree")
+			}
 		}
 		if component.BuildCommand != "" && ValidateCommand(component.BuildCommand) != nil {
 			return Plan{}, invalid("components", "Build command is invalid")
@@ -294,8 +321,11 @@ func validHealthProbe(value string) bool {
 func componentExecutionFields(component Component) []string {
 	prefix := "components." + component.Name + "."
 	fields := []string{prefix + "role", prefix + "rootDirectory", prefix + "packageManager", prefix + "installBehavior", prefix + "installDirectory", prefix + "nodeVersion", prefix + "runCommand", prefix + "internalPort", prefix + "healthProbe"}
-	if component.BuildCommand != "" {
+	if component.BuildCommand != "" || component.Technology != "" {
 		fields = append(fields, prefix+"buildCommand")
+	}
+	if component.Technology != "" {
+		fields = append(fields, prefix+"technology", prefix+"staticOutputDirectory")
 	}
 	return fields
 }

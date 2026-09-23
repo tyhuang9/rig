@@ -95,6 +95,9 @@ type SourceAnalysis struct {
 	StructuralFingerprint string                    `json:"structural_fingerprint"`
 	Candidates            []DeploymentPlanCandidate `json:"candidates"`
 	Findings              []Finding                 `json:"findings"`
+	// Only an analysis read from a bounded source snapshot can prepare user setup.
+	// This evidence is never serialized into API responses or persisted as a plan.
+	source *snapshot
 }
 
 // DeploymentPlanCandidate is a reviewable way Rig could deploy the source.

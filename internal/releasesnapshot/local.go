@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/sourceinspection"
 )
@@ -47,7 +48,30 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 		return Release{}, &Error{Code: "invalid_source"}
 	}
 	inspection, err := sourceinspection.InspectLocalContext(ctx, sourcePath)
-	if err != nil || len(inspection.Findings) != 0 || (inspection.Source.ComposePath == "" && !hasGeneratedAnalysis(inspection.Analysis)) {
+	var preflightPlanErr error
+	if err == nil {
+		planID, number, lookupErr := m.currentDeploymentPlan(ctx, appID)
+		if lookupErr != nil {
+			return Release{}, internal(lookupErr)
+		}
+		if planID.Valid && m.plans != nil {
+			revision, lookupErr := m.plans.GetRevision(ctx, appID, planID.String, number)
+			if lookupErr != nil {
+				preflightPlanErr = internal(lookupErr)
+				if deploymentplans.IsCode(lookupErr, "deployment_plan_unavailable") {
+					preflightPlanErr = &Error{Code: "deployment_plan_review_required"}
+				}
+			} else if setup, explicit := deploymentplans.SetupFromPlan(revision.Plan); explicit {
+				configured, setupErr := sourceinspection.WithSetup(inspection, setup)
+				if setupErr != nil {
+					preflightPlanErr = &Error{Code: "deployment_plan_review_required"}
+				} else {
+					inspection = configured
+				}
+			}
+		}
+	}
+	if err != nil || (preflightPlanErr == nil && (len(inspection.Findings) != 0 || (inspection.Source.ComposePath == "" && !hasGeneratedAnalysis(inspection.Analysis)))) {
 		return Release{}, &Error{Code: "invalid_source"}
 	}
 	sourceRoot := inspection.Source.Path
@@ -70,6 +94,17 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 	release, err := m.reserveLocal(ctx, appID, inspection.Source.ComposePath)
 	if err != nil {
 		return Release{}, internal(err)
+	}
+	if preflightPlanErr != nil {
+		var failure *Error
+		code := "internal_error"
+		if errors.As(preflightPlanErr, &failure) {
+			code = failure.Code
+		}
+		if m.abort(ctx, appID, release.ID, code) != nil {
+			return Release{}, &Error{Code: "internal_error"}
+		}
+		return Release{}, preflightPlanErr
 	}
 	staging, err := m.stagingPath(appID, release.ID)
 	if err != nil {

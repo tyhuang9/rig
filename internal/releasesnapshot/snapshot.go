@@ -762,9 +762,6 @@ func (m *Materializer) validateMaterializedWorkspace(ctx context.Context, releas
 		}
 		return err
 	}
-	if !hasGeneratedAnalysis(inspection.Analysis) {
-		return &Error{Code: "deployment_plan_review_required"}
-	}
 	if m.plans == nil {
 		return fmt.Errorf("%w: deployment plan reader", errLocal)
 	}
@@ -784,6 +781,14 @@ func (m *Materializer) validateMaterializedWorkspace(ctx context.Context, releas
 		return fmt.Errorf("%w: deployment plan lookup", errLocal)
 	}
 	if revision.ID != release.DeploymentPlanRevisionID || revision.RevisionNumber != release.DeploymentPlanRevisionNumber || revision.Plan.Strategy != deploymentplans.StrategyGeneratedNode || revision.Plan.Source.Provider != release.SourceProvider || revision.Plan.Source.RepositoryID != release.RepositoryID {
+		return &Error{Code: "deployment_plan_review_required"}
+	}
+	if setup, explicit := deploymentplans.SetupFromPlan(revision.Plan); explicit {
+		inspection, err = sourceinspection.WithSetup(inspection, setup)
+		if err != nil {
+			return &Error{Code: "deployment_plan_review_required"}
+		}
+	} else if !hasGeneratedAnalysis(inspection.Analysis) {
 		return &Error{Code: "deployment_plan_review_required"}
 	}
 	differences, compareErr := deploymentplans.CompareAnalysis(revision.Plan, inspection.Analysis)

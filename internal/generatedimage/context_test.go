@@ -142,6 +142,119 @@ func TestPrepareBuildContextRejectsLinks(t *testing.T) {
 	}
 }
 
+func TestPrepareBuildContextIncludesOnlyExplicitPrebuiltStaticOutput(t *testing.T) {
+	workspace := t.TempDir()
+	writeTestFile(t, filepath.Join(workspace, "package.json"), `{"name":"demo"}`)
+	writeTestFile(t, filepath.Join(workspace, "dist", "index.html"), "<h1>prebuilt</h1>")
+	writeTestFile(t, filepath.Join(workspace, "dist", ".env.production"), "TOKEN=do-not-copy")
+	writeTestFile(t, filepath.Join(workspace, "dist", "node_modules", "package", "index.js"), "do-not-copy")
+	writeTestFile(t, filepath.Join(workspace, "build", "index.html"), "other output")
+
+	operation := filepath.Join(t.TempDir(), "operation")
+	if err := os.Mkdir(operation, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: ".", installDirectory: ".", staticOutputDirectory: "dist"}, contextLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, relative := range []string{"source/dist/index.html", "source/package.json"} {
+		if _, err := os.Stat(filepath.Join(layout.contextDirectory, filepath.FromSlash(relative))); err != nil {
+			t.Fatalf("selected output file %q was not copied: %v", relative, err)
+		}
+	}
+	for _, relative := range []string{"source/dist/.env.production", "source/dist/node_modules", "source/build"} {
+		if _, err := os.Stat(filepath.Join(layout.contextDirectory, filepath.FromSlash(relative))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("unselected or protected output path %q reached build context: %v", relative, err)
+		}
+	}
+}
+
+func TestPrepareBuildContextIncludesOnlySelectedPrebuiltStaticSubtree(t *testing.T) {
+	workspace := t.TempDir()
+	writeTestFile(t, filepath.Join(workspace, "package.json"), `{"name":"demo"}`)
+	writeTestFile(t, filepath.Join(workspace, "dist", "client", "index.html"), "<h1>client</h1>")
+	writeTestFile(t, filepath.Join(workspace, "dist", "client", "assets", "app.js"), "window.ready = true")
+	writeTestFile(t, filepath.Join(workspace, "dist", "client", ".env.production"), "TOKEN=do-not-copy")
+	writeTestFile(t, filepath.Join(workspace, "dist", "client", "node_modules", "package", "index.js"), "do-not-copy")
+	writeTestFile(t, filepath.Join(workspace, "dist", "admin", "index.html"), "<h1>admin</h1>")
+	writeTestFile(t, filepath.Join(workspace, "dist", "other.html"), "other output")
+	writeTestFile(t, filepath.Join(workspace, "dist", ".aws", "credentials"), "do-not-copy")
+
+	operation := filepath.Join(t.TempDir(), "operation")
+	if err := os.Mkdir(operation, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: ".", installDirectory: ".", staticOutputDirectory: "dist/client"}, contextLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, relative := range []string{"source/dist/client/index.html", "source/dist/client/assets/app.js"} {
+		if _, err := os.Stat(filepath.Join(layout.contextDirectory, filepath.FromSlash(relative))); err != nil {
+			t.Fatalf("selected output file %q was not copied: %v", relative, err)
+		}
+	}
+	for _, relative := range []string{"source/dist/admin", "source/dist/other.html", "source/dist/.aws", "source/dist/client/.env.production", "source/dist/client/node_modules"} {
+		if _, err := os.Stat(filepath.Join(layout.contextDirectory, filepath.FromSlash(relative))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("unselected or protected output path %q reached build context: %v", relative, err)
+		}
+	}
+}
+
+func TestPrepareBuildContextRejectsProtectedPrebuiltStaticOutputSelection(t *testing.T) {
+	for name, output := range map[string]string{
+		"credential directory": "dist/.aws",
+		"protected ancestor":   "dist/.aws/client",
+		"protected config":     "dist/.config/gh",
+		"environment file":     "dist/.env.production",
+	} {
+		t.Run(name, func(t *testing.T) {
+			workspace := t.TempDir()
+			writeTestFile(t, filepath.Join(workspace, "package.json"), `{"name":"demo"}`)
+			writeTestFile(t, filepath.Join(workspace, filepath.FromSlash(output)), "sensitive")
+			operation := filepath.Join(t.TempDir(), "operation")
+			if err := os.Mkdir(operation, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			_, err := prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: ".", installDirectory: ".", staticOutputDirectory: output}, contextLimits{})
+			if !errors.Is(err, errInvalidBuildContext) {
+				t.Fatalf("protected output selection %q error = %v", output, err)
+			}
+		})
+	}
+}
+
+func TestPrepareBuildContextRejectsCredentialsInsideSelectedPrebuiltOutput(t *testing.T) {
+	workspace := t.TempDir()
+	writeTestFile(t, filepath.Join(workspace, "package.json"), `{"name":"demo"}`)
+	writeTestFile(t, filepath.Join(workspace, "dist", "credentials.json"), `{"token":"secret"}`)
+	operation := filepath.Join(t.TempDir(), "operation")
+	if err := os.Mkdir(operation, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: ".", installDirectory: ".", staticOutputDirectory: "dist"}, contextLimits{})
+	if !errors.Is(err, errInvalidBuildContext) {
+		t.Fatalf("credential in selected output error = %v", err)
+	}
+}
+
+func TestPrepareBuildContextStillExcludesStaleStaticOutputWhenBuilding(t *testing.T) {
+	workspace := t.TempDir()
+	writeTestFile(t, filepath.Join(workspace, "package.json"), `{"name":"demo"}`)
+	writeTestFile(t, filepath.Join(workspace, "dist", "index.html"), "stale output")
+	operation := filepath.Join(t.TempDir(), "operation")
+	if err := os.Mkdir(operation, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := prepareBuildContext(context.Background(), workspace, operation, componentDefinition{rootDirectory: ".", installDirectory: ".", buildCommand: "npm run build", staticOutputDirectory: "dist"}, contextLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(layout.contextDirectory, "source", "dist")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale static output reached a build-running context: %v", err)
+	}
+}
+
 func writeTestFile(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
