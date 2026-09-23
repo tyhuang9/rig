@@ -1,17 +1,27 @@
+import { z } from "zod";
 import {
   operations,
+  type AcceptDeploymentPlanRequest,
   type Application,
   type ApplicationAutoDeployStatus,
   type ApplicationConfiguration,
   type ApplicationList,
+  type ApproveDeploymentPlanMigrationRequest,
   type BootstrapRequest,
   type BootstrapStatus,
   type CreateApplicationRequest,
   type CSRFResponse,
   type DeploymentList,
+  type DeploymentPlanRevision,
+  type DeploymentSetupComponentInput,
+  type DeploymentSetupInput,
   type DeployReleaseRequest,
   type GitHubBranchPage,
   type GitHubDeviceAuthorization,
+  type GitHubConnectionAuthorization,
+  type GitHubConnectionAuthorizationStatus,
+  type DefaultSourceConnection,
+  type ConnectedGitHubRepositoryPage,
   type GitHubInstallationPage,
   type GitHubRepositoryPage,
   type InspectRequest,
@@ -43,12 +53,18 @@ import {
 } from "./generated/api-contract";
 
 export type {
+  AcceptDeploymentPlanRequest,
   Application,
   ApplicationAutoDeployStatus,
   ApplicationConfiguration,
+  ApproveDeploymentPlanMigrationRequest,
   CreateApplicationRequest,
   GitHubBranch,
   GitHubDeviceAuthorization,
+  GitHubConnectionAuthorization,
+  DefaultSourceConnection,
+  ConnectedGitHubRepository,
+  ConnectedGitHubRepositoryPage,
   GitHubInstallation,
   GitHubRepository,
   GitHubSource,
@@ -61,6 +77,13 @@ export type {
   User,
   ReplaceApplicationConfigurationRequest,
   Deployment,
+  DeploymentPlanCandidate,
+  DeploymentPlanRevision,
+  DeploymentSetupComponentInput,
+  DeploymentSetupInput,
+  AnalysisComponent,
+  AnalysisEvidence,
+  AnalysisFinding,
   Release,
   RuntimeApproval,
   RelayStatus,
@@ -107,6 +130,7 @@ export function setCSRF(token: string) {
 export function clearCSRF() {
   csrfToken = "";
   window.sessionStorage.removeItem("hostd-csrf");
+  window.sessionStorage.removeItem("rig-github-authorization");
 }
 
 async function rotateCSRF(): Promise<string> {
@@ -173,13 +197,101 @@ function inspectionCollection<T>(value: unknown): T[] {
   return value as T[];
 }
 
+function invalidInspectionResponse(): never {
+  throw new APIError({
+    status: 502,
+    code: "invalid_inspection_response",
+    detail: "The controller returned an invalid source inspection response.",
+  });
+}
+
+function inspectionRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) invalidInspectionResponse();
+  return value as Record<string, unknown>;
+}
+
+function requireInspectionString(record: Record<string, unknown>, field: string) {
+  if (typeof record[field] !== "string") invalidInspectionResponse();
+}
+
+function validateAnalysisCommand(value: unknown) {
+  if (value === undefined) return;
+  const command = inspectionRecord(value);
+  if (typeof command.present !== "boolean") invalidInspectionResponse();
+  if (command.command !== undefined && typeof command.command !== "string") invalidInspectionResponse();
+  inspectionCollection<unknown>(command.evidence);
+}
+
+function validateAnalysisCandidate(value: unknown) {
+  const candidate = inspectionRecord(value);
+  for (const field of ["id", "kind", "status", "rootDirectory", "configPath", "digest"]) requireInspectionString(candidate, field);
+  inspectionCollection<string>(candidate.missingFields).forEach((field) => { if (typeof field !== "string") invalidInspectionResponse(); });
+  inspectionCollection<unknown>(candidate.evidence);
+  inspectionCollection<unknown>(candidate.findings);
+  inspectionCollection<unknown>(candidate.advancedInputs);
+
+  const packageManager = inspectionRecord(candidate.packageManager);
+  inspectionCollection<unknown>(packageManager.evidence);
+  const nodeVersion = inspectionRecord(candidate.nodeVersion);
+  inspectionCollection<unknown>(nodeVersion.evidence);
+  validateAnalysisCommand(candidate.install);
+
+  inspectionCollection<unknown>(candidate.components).forEach((value) => {
+    const component = inspectionRecord(value);
+    for (const field of ["id", "kind", "rootDirectory", "name", "framework", "origin", "staticOutputDirectory", "migrationFingerprint"]) requireInspectionString(component, field);
+    inspectionCollection<unknown>(component.evidence);
+    inspectionCollection<unknown>(component.findings);
+    validateAnalysisCommand(component.build);
+    validateAnalysisCommand(component.run);
+    validateAnalysisCommand(component.migration);
+    if (component.internalPort !== undefined) inspectionCollection<unknown>(inspectionRecord(component.internalPort).evidence);
+    if (component.healthProbe !== undefined) inspectionCollection<unknown>(inspectionRecord(component.healthProbe).evidence);
+  });
+}
+
 function normalizeInspectionResponse(value: InspectResponse): InspectResponse {
+  inspectionRecord(value);
+  const analysis = value.analysis && typeof value.analysis === "object" ? value.analysis : {
+    source: value.source,
+    resolvedDigest: value.resolvedSha ?? "",
+    schemaVersion: "",
+    structuralFingerprint: "",
+    candidates: [],
+    findings: [],
+  };
+  const candidates = inspectionCollection<typeof analysis.candidates[number]>(analysis.candidates);
+  candidates.forEach(validateAnalysisCandidate);
   return {
     ...value,
     composeCandidates: inspectionCollection<string>(value.composeCandidates),
     services: inspectionCollection<InspectResponse["services"][number]>(value.services),
     findings: inspectionCollection<InspectResponse["findings"][number]>(value.findings),
+    analysis: {
+      ...analysis,
+      candidates,
+      findings: inspectionCollection<typeof analysis.findings[number]>(analysis.findings),
+    },
   };
+}
+
+const connectorID = z.string().regex(/^[a-f0-9]{32}$/);
+const connectorDate = z.string().refine((value) => Number.isFinite(Date.parse(value)));
+const connectorSourceSchema = z.object({
+  id: connectorID, provider: z.literal("github"), status: z.enum(["pending", "connected", "denied", "expired", "disconnected", "access_lost"]),
+  providerUserId: z.string().min(1).max(128).optional(), providerLogin: z.string().min(1).max(255).optional(), installUrl: z.string().optional(),
+  credentialGeneration: z.number().int().nonnegative(), createdAt: connectorDate, updatedAt: connectorDate,
+  pendingExpiresAt: connectorDate.optional(), nextPollAt: connectorDate.optional(), accessExpiresAt: connectorDate.optional(), refreshExpiresAt: connectorDate.optional(),
+  connectedAt: connectorDate.optional(), disconnectedAt: connectorDate.optional(), lastErrorCode: z.string().min(1).max(64).optional(),
+}).strict();
+const defaultConnectorSchema = z.object({ configured: z.boolean(), connection: connectorSourceSchema.optional() }).strict().refine((value) => value.configured === Boolean(value.connection));
+const connectorAuthorizationSchema = z.object({ authorizationId: connectorID, connectionId: connectorID, userCode: z.string().min(1).max(64), verificationUri: z.literal("https://github.com/login/device"), installUrl: z.string(), expiresAt: connectorDate, pollIntervalSeconds: z.number().int().min(1).max(300) }).strict();
+const connectorPollSchema = z.object({ authorizationId: connectorID, status: z.enum(["pending", "connected", "denied", "expired", "superseded", "failed"]), connection: connectorSourceSchema, nextPollAt: connectorDate.optional() }).strict();
+const connectorRepositoriesSchema = z.object({ page: z.number().int().positive(), perPage: z.number().int().min(1).max(100), totalCount: z.number().int().nonnegative(), truncated: z.boolean(), items: z.array(z.object({ connectionId: connectorID, installationId: z.number().int().positive().safe(), id: z.number().int().positive().safe(), accountLogin: z.string().min(1).max(255), owner: z.string(), name: z.string(), defaultBranch: z.string(), private: z.boolean(), archived: z.boolean(), disabled: z.boolean() }).strict()).max(100) }).strict();
+
+async function connectorResponse<T>(response: Promise<T>, schema: z.ZodType): Promise<T> {
+  const value = await response;
+  if (!schema.safeParse(value).success) throw new APIError({ status: 502, code: "invalid_connector_response", detail: "The controller returned an invalid GitHub connection response." });
+  return value;
 }
 
 export const api = {
@@ -239,12 +351,37 @@ export const api = {
     }),
   createApp: (data: CreateApplicationRequest) =>
     request<Application>(operations.createApplication.path, { method: "POST", body: JSON.stringify(data) }),
+  deploymentPlan: (id: string) =>
+    request<DeploymentPlanRevision>(operationPath(operations.getApplicationDeploymentPlan.path, { appId: id })),
+  acceptDeploymentPlan: (id: string, data: AcceptDeploymentPlanRequest) =>
+    request<DeploymentPlanRevision>(operationPath(operations.acceptApplicationDeploymentPlan.path, { appId: id }), {
+      method: operations.acceptApplicationDeploymentPlan.method,
+      body: JSON.stringify(data),
+    }),
+  approveDeploymentPlanMigration: (id: string, data: ApproveDeploymentPlanMigrationRequest) =>
+    request<DeploymentPlanRevision>(operationPath(operations.approveApplicationDeploymentPlanMigration.path, { appId: id }), {
+      method: operations.approveApplicationDeploymentPlanMigration.method,
+      body: JSON.stringify(data),
+    }),
   inspect: async (data: InspectRequest) =>
     normalizeInspectionResponse(await request<InspectResponse>(operations.inspectImport.path, {
       method: "POST",
       body: JSON.stringify(data),
     })),
   sourceConnections: () => request<SourceConnectionList>(operations.listSourceConnections.path),
+  defaultSourceConnection: () => connectorResponse(request<DefaultSourceConnection>(operations.getDefaultSourceConnection.path), defaultConnectorSchema),
+  startDefaultGitHubConnection: () =>
+    connectorResponse(request<GitHubConnectionAuthorization>(operations.startDefaultGitHubDeviceConnection.path, {
+      method: operations.startDefaultGitHubDeviceConnection.method,
+    }), connectorAuthorizationSchema),
+  pollDefaultGitHubConnection: (connectionId: string, authorizationId: string) =>
+    connectorResponse(request<GitHubConnectionAuthorizationStatus>(operationPath(operations.pollDefaultGitHubDeviceConnection.path, { connectionId, authorizationId }), {
+      method: operations.pollDefaultGitHubDeviceConnection.method,
+    }), connectorPollSchema),
+  defaultGitHubRepositories: (q = "", page = 1, perPage = 30) => {
+    const query = new URLSearchParams({ q, page: String(page), perPage: String(perPage) });
+    return connectorResponse(request<ConnectedGitHubRepositoryPage>(`${operations.listDefaultGitHubRepositories.path}?${query}`), connectorRepositoriesSchema);
+  },
   startGitHubConnection: () =>
     request<GitHubDeviceAuthorization>(operations.startGitHubDeviceConnection.path, {
       method: operations.startGitHubDeviceConnection.method,

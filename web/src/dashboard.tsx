@@ -13,7 +13,9 @@ import {
   type User,
 } from "./api";
 import { SourceWizard } from "./source-wizard";
+import { GitHubConnectionCard } from "./github-connection";
 import { ApplicationConfigurationPanel } from "./application-configuration";
+import { ApplicationPlanPanel } from "./application-plan-panel";
 import { AutoDeployPanel } from "./auto-deploy";
 import { DeploymentHistoryPanel } from "./deployment-history";
 import { UnsavedChangesGuard, useConfirmDiscard } from "./unsaved-changes";
@@ -56,13 +58,14 @@ function RelayPanelSlot({ role, loader }: RelayPanelProps & { loader: RelayPanel
   return <RelayPanelErrorBoundary key={attempt} fallback={errorFallback}><Suspense fallback={<RelayPanelLoading/>}><LazyRelayManagementPanel role={role}/></Suspense></RelayPanelErrorBoundary>;
 }
 
-type IconName = "apps" | "machines" | "activity" | "logout";
+type IconName = "apps" | "machines" | "activity" | "connections" | "logout";
 
 function Icon({ name }: { name: IconName }) {
   const paths: Record<IconName, React.ReactNode> = {
     apps: <><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></>,
     machines: <><rect x="3" y="4" width="18" height="6" rx="1"/><rect x="3" y="14" width="18" height="6" rx="1"/><path d="M7 7h.01M7 17h.01"/></>,
     activity: <><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></>,
+    connections: <><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-2 2M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l2-2"/></>,
     logout: <><path d="M10 17l5-5-5-5M15 12H3"/><path d="M14 3h5a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-5"/></>,
   };
   return <svg className="nav-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
@@ -75,7 +78,7 @@ function StatusText({ value }: { value: string }) {
 function Layout({ user, onLogout, children }: { user: User; onLogout: () => void; children: React.ReactNode }) {
   const location = useLocation();
   const confirmDiscard = useConfirmDiscard();
-  const routeName = location.pathname.startsWith("/machines") ? "Machines" : location.pathname.startsWith("/activity") ? "Activity" : location.pathname.startsWith("/apps/new") ? "Add application" : "Applications";
+  const routeName = location.pathname.startsWith("/connections") ? "Connections" : location.pathname.startsWith("/machines") ? "Machines" : location.pathname.startsWith("/activity") ? "Activity" : location.pathname.startsWith("/apps/new") ? "Add application" : "Applications";
   return <div className="shell">
     <a className="skip" href="#main">Skip to content</a>
     <aside className="rail">
@@ -84,6 +87,7 @@ function Layout({ user, onLogout, children }: { user: User; onLogout: () => void
       <nav aria-label="Primary navigation">
         <NavLink to="/apps" aria-label="Applications"><Icon name="apps"/><span>Applications</span></NavLink>
         <NavLink to="/machines" aria-label="Machines"><Icon name="machines"/><span>Machines</span></NavLink>
+        <NavLink to="/connections" aria-label="Connections"><Icon name="connections"/><span>Connections</span></NavLink>
         <NavLink to="/activity" aria-label="Activity"><Icon name="activity"/><span>Activity</span></NavLink>
       </nav>
       <div className="rail-fill"/>
@@ -195,6 +199,10 @@ function Meta({ label, value, mono = false }: { label: string; value: string; mo
   return <div className="meta"><small>{label}</small><span className={mono ? "mono" : undefined} title={value}>{value}</span></div>;
 }
 
+export function ConnectionsPage() {
+  return <><PageHeader title="Connections" subtitle="Manage the accounts you use across applications."/><GitHubConnectionCard/></>;
+}
+
 function AddApplicationPage() {
   const navigate = useNavigate();
   return <>
@@ -214,14 +222,17 @@ function ApplicationDetailPage() {
   if (!appQuery.data || !statusQuery.data) return <QueryError message="The API returned an incomplete response."/>;
   const app = appQuery.data;
   const fakeRuntime = statusQuery.data.capabilities.fakeRuntime;
+  const generatedRuntime = statusQuery.data.capabilities.generatedRuntime;
+  const composeRuntime = statusQuery.data.capabilities.composeRuntime;
   const currentDeployment = deploymentQuery.data?.items[0];
   return <>
     <PageHeader title={app.name} subtitle={`${app.machineName || "Local machine"} · ${app.status}`}/>
     <p className="section-kicker">Overview</p>
     <div className="summary"><article><small>Current deployment</small><strong>{currentDeployment ? <StatusText value={currentDeployment.status}/> : deploymentQuery.isLoading ? "Loading..." : "Not deployed"}</strong><span>{currentDeployment ? `Configuration ${currentDeployment.configurationMode}` : deploymentQuery.isError ? "History unavailable" : "No deployment record"}</span></article><article><small>Source</small><strong className="mono">{app.slug}</strong><span>Runtime is not inferred</span></article><article><small>Health</small><strong>Not verified</strong><span>Health reporting is not available</span></article></div>
-    {fakeRuntime ? <div className="callout warning"><strong>Development capability</strong><span>The fake runtime persists job progress but executes no workload.</span></div> : !statusQuery.data.capabilities.composeRuntime && <div className="callout info"><strong>Runtime actions unavailable</strong><span>Configure a runtime to deploy this application.</span></div>}
-    <AutoDeployPanel appId={id} composeRuntime={statusQuery.data.capabilities.composeRuntime} githubConnections={statusQuery.data.capabilities.githubConnections}/>
-    <DeploymentHistoryPanel appId={id} composeRuntime={statusQuery.data.capabilities.composeRuntime} fakeRuntime={fakeRuntime}/>
+    {fakeRuntime ? <div className="callout warning"><strong>Development capability</strong><span>The fake runtime persists job progress but executes no workload.</span></div> : !composeRuntime && !generatedRuntime && <div className="callout info"><strong>Runtime actions unavailable</strong><span>Configure a runtime to deploy this application.</span></div>}
+    <ApplicationPlanPanel app={app}/>
+    <AutoDeployPanel appId={id} composeRuntime={composeRuntime} generatedRuntime={generatedRuntime} githubConnections={statusQuery.data.capabilities.githubConnections}/>
+    <DeploymentHistoryPanel appId={id} composeRuntime={composeRuntime} fakeRuntime={fakeRuntime} generatedRuntime={generatedRuntime}/>
     <ApplicationConfigurationPanel appId={id}/>
   </>;
 }
@@ -256,12 +267,14 @@ export function ActivityRow({ job }: { job: Job }) {
   });
   const current = terminalJobStatuses.has(job.status) ? job : cancellation.data?.job ?? job;
   const cancellationFeedback = terminalCancellationMessages.get(current.status) ?? "Cancellation recorded.";
+  const cancellationUnsafe = current.status === "waiting_user" && current.pauseDisposition === "route_reconciliation_required";
   return <article className="activity-row">
     <time dateTime={current.createdAt}>{new Date(current.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
     <div><strong>{current.type} application</strong><small className="mono">{current.id}</small></div>
     <StatusText value={current.status}/>
     <div className="job-actions">
-      {cancellableStatuses.has(current.status) && <button className="button small" onClick={() => cancellation.mutate()} disabled={cancellation.isPending || cancellation.isSuccess}>{cancellation.isPending ? "Cancelling…" : cancellation.isSuccess ? "Cancellation requested" : "Cancel job"}</button>}
+      {cancellationUnsafe && <span className="activity-feedback">Retry route reconciliation from Deployment history before cancelling.</span>}
+      {cancellableStatuses.has(current.status) && !cancellationUnsafe && <button className="button small" onClick={() => cancellation.mutate()} disabled={cancellation.isPending || cancellation.isSuccess}>{cancellation.isPending ? "Cancelling…" : cancellation.isSuccess ? "Cancellation requested" : "Cancel job"}</button>}
       {cancellation.isSuccess && <span className="activity-feedback" role="status" aria-live="polite" aria-atomic="true">{cancellationFeedback}</span>}
       {cancellation.isError && <span className="activity-feedback error" role="alert">{cancellation.error.message}</span>}
     </div>
@@ -269,6 +282,7 @@ export function ActivityRow({ job }: { job: Job }) {
 }
 
 export function App() {
+  const queryClient = useQueryClient();
   const [bootstrapRequired, setBootstrapRequired] = useState<boolean | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const navigate = useNavigate();
@@ -288,6 +302,6 @@ export function App() {
   }, []);
   if (bootstrapRequired === null) return <main className="auth"><LoadingState/></main>;
   if (!user) return <Login setup={bootstrapRequired} onAuthenticated={(nextUser) => { setUser(nextUser); setBootstrapRequired(false); navigate("/apps"); }}/>;
-  const logout = async () => { try { await api.logout(); } finally { clearCSRF(); setUser(null); navigate("/login"); } };
-  return <UnsavedChangesGuard><Layout user={user} onLogout={logout}><Routes><Route path="/" element={<ApplicationsPage/>}/><Route path="/apps" element={<ApplicationsPage/>}/><Route path="/apps/new" element={<AddApplicationPage/>}/><Route path="/apps/:id" element={<ApplicationDetailPage/>}/><Route path="/machines" element={<MachinesPage role={user.role}/>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="*" element={<ApplicationsPage/>}/></Routes></Layout></UnsavedChangesGuard>;
+  const logout = async () => { try { await api.logout(); } finally { clearCSRF(); queryClient.clear(); setUser(null); navigate("/login"); } };
+  return <UnsavedChangesGuard><Layout user={user} onLogout={logout}><Routes><Route path="/" element={<ApplicationsPage/>}/><Route path="/apps" element={<ApplicationsPage/>}/><Route path="/apps/new" element={<AddApplicationPage/>}/><Route path="/apps/:id" element={<ApplicationDetailPage/>}/><Route path="/connections" element={<ConnectionsPage/>}/><Route path="/machines" element={<MachinesPage role={user.role}/>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="*" element={<ApplicationsPage/>}/></Routes></Layout></UnsavedChangesGuard>;
 }

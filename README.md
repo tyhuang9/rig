@@ -1,21 +1,21 @@
 # Rig
 
-Rig is a local-first deployment manager for Docker Compose applications. It gives one administrator a browser dashboard, an operator terminal, and a scriptable CLI while keeping the controller and its credentials on the machine that runs the workloads.
+Rig is a local-first deployment manager for Docker Compose applications and supported generated JavaScript or TypeScript applications. It gives one administrator a browser dashboard, an operator terminal, and a scriptable CLI while keeping the controller and its credentials on the machine that runs the workloads. Runtime execution is disabled by default; Compose and generated application runtimes are separate, opt-in controller-local capabilities.
 
 Rig is being built to make small, self-hosted deployments understandable and recoverable:
 
 - register an application from a local folder or a GitHub.com repository;
 - keep visible configuration and write-only secrets in versioned revisions;
-- inspect Compose capabilities before execution and require exact approval for elevated behavior;
+- inspect Compose capabilities or review an inferred generated-app plan before execution;
 - retain immutable releases and deployment history;
 - explicitly redeploy a prior release with its original or current configuration; and
 - optionally receive GitHub push events through the separately deployed relay.
 
 ## Current boundaries
 
-Rig is not a general-purpose cloud platform. The controller accepts local loopback connections only, and real workload execution is disabled unless it is explicitly started with `--compose-runtime`. Docker access is a high-trust boundary: a Docker administrator can inspect or alter managed workloads.
+Rig is not a general-purpose cloud platform. The controller accepts local loopback connections only, and real workload execution is disabled unless it is explicitly started with `--compose-runtime` for Compose applications or `--generated-runtime` for supported JavaScript and TypeScript applications. Docker access is a high-trust boundary: a Docker administrator can inspect or alter managed workloads.
 
-The included `--fake-runtime` is for development and testing. It records realistic job progress but never runs a workload. Rig does not currently configure Caddy, target remote agents, support GitHub Enterprise Server, expand Git submodules or Git LFS, or automatically roll back a failed deployment. Live GitHub authorization and production Compose execution still require verification in your own environment.
+The included `--fake-runtime` is for development and testing. It records realistic job progress but never runs a workload, and cannot be combined with either real runtime. The generated runtime manages a local Caddy ingress gateway for its own blue/green application slots; it does not configure ingress for Compose applications. Rig does not target remote agents, support GitHub Enterprise Server, expand Git submodules or Git LFS, or automatically roll back a failed deployment. Full live GitHub-to-Docker execution remains a promotion check for your own environment.
 
 ## Quick start
 
@@ -59,11 +59,17 @@ In **Add application**, keep **Local folder** selected, enter an absolute path o
 
 ### GitHub repository
 
-GitHub sources use GitHub's device authorization flow and do not require an installed Git CLI or a user-managed checkout. Standard Rig builds enable GitHub connections through the official `rig-deployment-connector`; no GitHub flags are needed. Choose **GitHub repository**, select **Sign in to GitHub**, complete authorization, then select **Install or configure repository access** and choose an installation, repository, branch, and Compose file.
+GitHub sources use GitHub's device authorization flow and do not require an installed Git CLI or a user-managed checkout. Standard Rig builds enable GitHub connections through the official `rig-deployment-connector`; no GitHub flags are needed. In **Connections**, select **Connect GitHub**, complete authorization, and use **Manage repository access** to grant access. In **Add application**, choose **GitHub repository**, use the one aggregate repository picker, then select the tracked branch. For a Compose application, choose a discovered Compose file; for a generated application, continue with its build and run setup instead.
 
 Forks and custom deployments can replace the official identity by supplying `--github-client-id` and `--github-app-slug` together. The override is atomic: do not supply only one flag. Administrators can explicitly disable the feature with `--github-connections=false`.
 
 GitHub credentials stay in purpose-bound protected files on the controller. Do not put a client secret, private key, access token, or webhook secret in command-line flags or in the repository. See [Connect GitHub](docs/connect-github.md) for the user flow and [GitHub-connected deployments](docs/github-connected-deployments.md) for administrator setup and operational behavior.
+
+## Choose a runtime
+
+The Docker Compose runtime requires `--compose-runtime` and reviews effective Compose configuration before execution. The generated runtime requires `--generated-runtime` and supports inferred npm, pnpm, and Yarn applications on Node.js 20, 22, or 24. Rig reviews editable build and run settings, builds immutable non-root images in a bounded controller-owned BuildKit environment, and replaces healthy generated applications through private blue/green slots behind controller-managed Caddy ingress. Both real runtimes can be enabled together; neither can be combined with the fake runtime.
+
+Read [Generated JavaScript runtime operations](docs/generated-runtime.md) for project support, plan review, resources, trust boundaries, recovery, and verification. [Editable deployment setup verification](docs/deployment-setup-verification.md) records its setup-specific failure behavior and verification scope.
 
 ## Safety model
 
@@ -78,6 +84,8 @@ GitHub credentials stay in purpose-bound protected files on the controller. Do n
 - [Getting started](docs/getting-started.md)
 - [Connect GitHub](docs/connect-github.md)
 - [Docker Compose runtime operations](docs/compose-runtime.md)
+- [Generated JavaScript runtime operations](docs/generated-runtime.md)
+- [Editable deployment setup verification](docs/deployment-setup-verification.md)
 - [GitHub-connected deployments](docs/github-connected-deployments.md)
 - [Official webhook relay operations](docs/relay-operations.md)
 

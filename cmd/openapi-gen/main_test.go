@@ -100,3 +100,24 @@ func TestConcreteModelGenerationRejectsMissingRequiredProperty(t *testing.T) {
 		t.Fatalf("TypeScript generation error = %v", err)
 	}
 }
+
+func TestOptionalPointerReferencePreservesAbsentNestedSetup(t *testing.T) {
+	schemas := map[string]schema{
+		"Setup":   {Type: "object", Properties: map[string]schema{"name": {Type: "string"}}},
+		"Request": {Type: "object", Properties: map[string]schema{"setup": {Ref: "#/components/schemas/Setup", GoPointer: true}}},
+	}
+	goArtifact, err := renderGo("fixture", nil, schemas)
+	if err != nil || !strings.Contains(string(goArtifact), "Setup *Setup `json:\"setup,omitempty\"`") {
+		t.Fatalf("optional setup cannot be distinguished from omitted: %s %v", goArtifact, err)
+	}
+	tsArtifact, err := renderTypeScript("fixture", nil, schemas)
+	if err != nil || !strings.Contains(string(tsArtifact), `"setup"?: Setup;`) {
+		t.Fatal("Go pointer leaked into public TypeScript type")
+	}
+	request := schemas["Request"]
+	request.Required = []string{"setup"}
+	schemas["Request"] = request
+	if _, err := renderGo("fixture", nil, schemas); err == nil {
+		t.Fatal("required optional-pointer extension accepted")
+	}
+}

@@ -5,6 +5,7 @@ import {
   APIError,
   api,
   type RelayBindingStatus,
+  type ConnectedGitHubRepository,
   type RelayEnrollmentStart,
   type RelayEnrollmentStatus,
   type RelayKeyRotationStatus,
@@ -12,8 +13,8 @@ import {
   type StartRelayEnrollmentRequest,
 } from "./api";
 import { Dialog } from "./dialog";
+import { GitHubConnectionCard, GitHubRepositoryPicker, githubConnectionKey } from "./github-connection";
 
-const PAGE_SIZE = 30;
 export const RELAY_POLL_INTERVAL_MS = 2_000;
 export const RELAY_POLL_MAX_DURATION_MS = 5 * 60_000;
 export const RELAY_POLL_MAX_ATTEMPTS = Math.ceil(RELAY_POLL_MAX_DURATION_MS / RELAY_POLL_INTERVAL_MS);
@@ -77,45 +78,6 @@ const rotationStatusSchema = z.object({
   state: z.enum(["prepare", "propose", "confirm", "new_key_auth", "finalize", "completed", "failed"]),
   expiresAt: dateTime,
 }).strict();
-const sourceConnectionSchema = z.object({
-  id: connectionId,
-  provider: z.literal("github"),
-  status: z.enum(["pending", "connected", "denied", "expired", "disconnected", "access_lost"]),
-  providerUserId: z.string().min(1).max(128).optional(),
-  providerLogin: z.string().min(1).max(255).optional(),
-  credentialGeneration: nonNegative,
-  pendingExpiresAt: dateTime.optional(),
-  nextPollAt: dateTime.optional(),
-  accessExpiresAt: dateTime.optional(),
-  refreshExpiresAt: dateTime.optional(),
-  lastErrorCode: z.string().min(1).max(64).optional(),
-  connectedAt: dateTime.optional(),
-  disconnectedAt: dateTime.optional(),
-  createdAt: dateTime,
-  updatedAt: dateTime,
-}).strict().transform(({ id, provider, status, providerLogin }) => ({ id, provider, status, providerLogin }));
-const connectionsSchema = z.object({ items: z.array(sourceConnectionSchema) }).strict();
-const installationPageSchema = z.object({
-  page: positiveId,
-  perPage: positiveId,
-  totalCount: nonNegative,
-  items: z.array(z.object({
-    id: positiveId,
-    accountLogin: z.string().min(1).max(255),
-    accountType: z.enum(["User", "Organization", "Enterprise", "Bot"]),
-    targetType: z.enum(["User", "Organization"]),
-    repositorySelection: z.enum(["all", "selected"]),
-    suspendedAt: dateTime.optional(),
-    cachedAt: dateTime,
-  }).strict().transform(({ id, accountLogin, repositorySelection }) => ({ id, accountLogin, repositorySelection }))).max(100),
-}).strict();
-const repositoryPageSchema = z.object({
-  page: positiveId,
-  perPage: positiveId,
-  totalCount: nonNegative,
-  items: z.array(z.object({ id: positiveId, owner: z.string(), name: z.string(), defaultBranch: z.string(), archived: z.boolean(), disabled: z.boolean(), private: z.boolean() }).strict().transform(({ id, owner, name, archived, disabled, private: privateRepository }) => ({ id, owner, name, archived, disabled, private: privateRepository }))).max(100),
-}).strict();
-
 type SafeRelayStatus = z.infer<typeof relayStatusSchema>;
 type SafeBinding = z.infer<typeof bindingSchema>;
 type EnrollmentTarget = { connectionId: string; installationId: number; repositoryId: number; repositoryLabel: string };
@@ -124,14 +86,13 @@ type EnrollmentOutcome = { status: "authorized" | "denied" | "expired" | "failed
 type OperationStatus = { message: string; tone: "info" | "success" };
 type PollingOptions = { intervalMs?: number; maxAttempts?: number; maxDurationMs?: number };
 type DurableStatusObservation = { seeded: boolean; rotationInProgress: boolean; pendingRemovalBindingIds: Set<string> };
-type RelayErrorOperation = "status" | "connections" | "installations" | "repositories" | "enrollmentStart" | "enrollmentPoll" | "bindingRemoval" | "keyRotation";
+type RelayErrorOperation = "status" | "enrollmentStart" | "enrollmentPoll" | "bindingRemoval" | "keyRotation";
 type StatusPollReason = "initializing" | "binding_removal" | "key_rotation" | "relay_operation";
 
 type RelayAPI = {
   relayStatus: () => Promise<RelayStatus>;
-  sourceConnections: typeof api.sourceConnections;
-  githubInstallations: typeof api.githubInstallations;
-  githubRepositories: typeof api.githubRepositories;
+  defaultSourceConnection: typeof api.defaultSourceConnection;
+  defaultGitHubRepositories: typeof api.defaultGitHubRepositories;
   startRelayEnrollment: (request: StartRelayEnrollmentRequest) => Promise<RelayEnrollmentStart>;
   pollRelayEnrollment: (enrollmentId: string) => Promise<RelayEnrollmentStatus>;
   removeRelayBinding: (bindingId: string) => Promise<RelayBindingStatus>;
@@ -211,9 +172,6 @@ function humanizeState(value?: string) {
 
 const relayErrorFallbacks: Record<RelayErrorOperation, string> = {
   status: "Relay status could not be loaded.",
-  connections: "GitHub connections could not be loaded.",
-  installations: "GitHub App installations could not be loaded.",
-  repositories: "Repositories could not be loaded.",
   enrollmentStart: "Could not start relay authorization.",
   enrollmentPoll: "Could not check relay authorization.",
   bindingRemoval: "Could not remove the relay binding.",
@@ -254,15 +212,6 @@ export function relayPollLimitReached(attempts: number, startedAt: number, now =
   return attempts >= maxAttempts || now - startedAt >= maxDurationMs;
 }
 
-function Pagination({ label, page, hasNext, loading, disabled = false, change }: { label: string; page: number; hasNext: boolean; loading: boolean; disabled?: boolean; change: (page: number) => void }) {
-  if (page === 1 && !hasNext && !loading) return null;
-  return <nav className="relay-pagination" aria-label={`${label} pagination`} aria-busy={loading}>
-    <button className="button small" type="button" disabled={disabled || loading || page === 1} onClick={() => change(page - 1)}>Previous</button>
-    <span>Page {page}</span>
-    <button className="button small" type="button" disabled={disabled || loading || !hasNext} onClick={() => change(page + 1)}>Next</button>
-  </nav>;
-}
-
 function RelayBindingCard({ binding, select }: { binding: SafeBinding; select: (binding: SafeBinding) => void }) {
   const headingId = useId();
   return <article className="relay-binding" aria-labelledby={headingId}>
@@ -289,11 +238,10 @@ export function RelayManagementPanel({ role, client = api, polling = {} }: { rol
   const pollIntervalMs = polling.intervalMs ?? RELAY_POLL_INTERVAL_MS;
   const pollMaxAttempts = polling.maxAttempts ?? RELAY_POLL_MAX_ATTEMPTS;
   const pollMaxDurationMs = polling.maxDurationMs ?? RELAY_POLL_MAX_DURATION_MS;
-  const [connection, setConnection] = useState("");
-  const [installation, setInstallation] = useState<number | null>(null);
-  const [repository, setRepository] = useState<number | null>(null);
-  const [installationPage, setInstallationPage] = useState(1);
-  const [repositoryPage, setRepositoryPage] = useState(1);
+  const [selectedRepository, setSelectedRepository] = useState<ConnectedGitHubRepository | null>(null);
+  const connection = selectedRepository?.connectionId ?? "";
+  const installation = selectedRepository?.installationId ?? null;
+  const repository = selectedRepository?.id ?? null;
   const [enrollment, setEnrollment] = useState<EnrollmentSession | null>(null);
   const [enrollmentStarting, setEnrollmentStarting] = useState(false);
   const [enrollmentOutcome, setEnrollmentOutcome] = useState<EnrollmentOutcome | null>(null);
@@ -393,42 +341,19 @@ export function RelayManagementPanel({ role, client = api, polling = {} }: { rol
     return () => window.clearTimeout(timer);
   }, [pollIntervalMs, pollMaxAttempts, pollMaxDurationMs, statusPollReason, statusQuery.dataUpdatedAt, statusQuery.isError, statusPolling, transientPolling]);
 
-  const connectionsQuery = useQuery({
-    queryKey: ["relay-source-connections"],
-    queryFn: async () => parse(connectionsSchema, await client.sourceConnections()),
+  const connectionQuery = useQuery({
+    queryKey: githubConnectionKey,
+    queryFn: client.defaultSourceConnection,
     enabled: status?.availability === "available" && status.readModelAvailable,
     retry: false,
   });
-  const connected = connectionsQuery.data?.items.filter((item) => item.provider === "github" && item.status === "connected") ?? [];
-  const installationsQuery = useQuery({
-    queryKey: ["relay-installations", connection, installationPage],
-    queryFn: async () => parse(installationPageSchema, await client.githubInstallations(connection, installationPage, PAGE_SIZE)),
-    enabled: Boolean(connection),
-    retry: false,
-  });
-  const repositoriesQuery = useQuery({
-    queryKey: ["relay-repositories", connection, installation, repositoryPage],
-    queryFn: async () => parse(repositoryPageSchema, await client.githubRepositories(connection, installation!, repositoryPage, PAGE_SIZE)),
-    enabled: Boolean(connection) && installation !== null,
-    retry: false,
-  });
-  const repositories = repositoriesQuery.data?.items.filter((item) => !item.archived && !item.disabled) ?? [];
-  const selectedRepository = repositories.find((item) => item.id === repository);
-  const sourceStatus = (() => {
-    if (connectionsQuery.isFetching) return "Loading connected GitHub sources…";
-    if (connectionsQuery.isError) return "";
-    if (connected.length === 0) return "No connected GitHub sources are available. Connect GitHub while adding an application, then return here.";
-    if (!connection) return `${connected.length} connected GitHub ${connected.length === 1 ? "source is" : "sources are"} available. Choose a source to continue.`;
-    if (installationsQuery.isFetching) return "Loading GitHub App installations for the selected source…";
-    if (installationsQuery.isError) return "";
-    const installationCount = installationsQuery.data?.items.length ?? 0;
-    if (installationCount === 0) return `No eligible GitHub App installations are available on page ${installationPage}.`;
-    if (installation === null) return `${installationCount} GitHub App ${installationCount === 1 ? "installation is" : "installations are"} available on page ${installationPage}. Choose an installation to continue.`;
-    if (repositoriesQuery.isFetching) return "Loading repositories for the selected installation…";
-    if (repositoriesQuery.isError) return "";
-    if (repositories.length === 0) return `No eligible repositories are available on page ${repositoryPage}.`;
-    return `${repositories.length} eligible ${repositories.length === 1 ? "repository is" : "repositories are"} available on page ${repositoryPage}.`;
-  })();
+  const githubConnected = connectionQuery.data?.connection?.status === "connected";
+  useEffect(() => {
+    if (selectedRepository && connectionQuery.data && (!githubConnected || connectionQuery.data.connection?.id !== selectedRepository.connectionId)) {
+      setSelectedRepository(null);
+      resetEnrollmentForScopeChange();
+    }
+  }, [connectionQuery.data, githubConnected, selectedRepository]);
 
   const resetEnrollmentForScopeChange = () => {
     enrollmentEpoch.current += 1;
@@ -639,7 +564,7 @@ export function RelayManagementPanel({ role, client = api, polling = {} }: { rol
   };
 
   const authorizationURL = enrollment ? githubAuthorizationURL(enrollment.authorizationUrl, enrollment.target.repositoryId) : null;
-  const enrollmentReady = Boolean(connection && installation && repository);
+  const enrollmentReady = Boolean(githubConnected && connection && installation && repository);
   const scopeLocked = Boolean(enrollment);
   const rotationReady = status?.availability === "available" && status.readModelAvailable;
   const rotationInProgress = status?.keyRotation.inProgress ?? false;
@@ -671,18 +596,13 @@ export function RelayManagementPanel({ role, client = api, polling = {} }: { rol
 
     {status?.availability === "available" && status.readModelAvailable && <>
       <div className="relay-section">
-        <div className="relay-section-heading"><div><h3>Repository enrollment</h3><p>Pair one connected GitHub repository with the relay. Authorization progress is held only in this browser tab.</p></div></div>
-        <p className="relay-muted relay-source-status" role="status" aria-live="polite" aria-atomic="true" aria-busy={connectionsQuery.isFetching || installationsQuery.isFetching || repositoriesQuery.isFetching}>{sourceStatus}</p>
-        {connectionsQuery.isError ? <div className="callout danger" role="alert"><strong>Connected sources unavailable</strong><span>{relayErrorMessage(connectionsQuery.error, "connections")}</span><button className="button small" type="button" onClick={() => void connectionsQuery.refetch()}>Retry connections</button></div>
-          : connected.length > 0 && <div className="relay-source-grid">
-                <div className="field"><label htmlFor="relay-connection">GitHub connection</label><select id="relay-connection" value={connection} disabled={scopeLocked} onChange={(event) => { resetEnrollmentForScopeChange(); setConnection(event.target.value); setInstallation(null); setRepository(null); setInstallationPage(1); setRepositoryPage(1); }}><option value="">Choose a connected source</option>{connected.map((item) => <option key={item.id} value={item.id}>{item.providerLogin ? `@${item.providerLogin}` : "Connected GitHub source"}</option>)}</select></div>
-                {connection && <><div className="field"><label htmlFor="relay-installation">GitHub App installation</label><select id="relay-installation" value={installation ?? ""} disabled={scopeLocked || installationsQuery.isFetching || installationsQuery.isError} onChange={(event) => { resetEnrollmentForScopeChange(); setInstallation(event.target.value ? Number(event.target.value) : null); setRepository(null); setRepositoryPage(1); }}><option value="">{installationsQuery.isFetching ? "Loading installations…" : installationsQuery.isError ? "Installations unavailable" : "Choose an installation"}</option>{installationsQuery.data?.items.map((item) => <option key={item.id} value={item.id}>{item.accountLogin} ({item.repositorySelection})</option>)}</select></div><Pagination label="installations" page={installationPage} loading={installationsQuery.isFetching} disabled={scopeLocked} hasNext={(installationsQuery.data?.page ?? 0) * (installationsQuery.data?.perPage ?? PAGE_SIZE) < (installationsQuery.data?.totalCount ?? 0)} change={(page) => { resetEnrollmentForScopeChange(); setInstallationPage(page); setInstallation(null); setRepository(null); setRepositoryPage(1); }}/></>}
-                {connection && installationsQuery.isError && <div className="callout danger" role="alert"><strong>Installations unavailable</strong><span>{relayErrorMessage(installationsQuery.error, "installations")}</span><button className="button small" type="button" onClick={() => void installationsQuery.refetch()}>Retry installations</button></div>}
-                {installation !== null && <><div className="field"><label htmlFor="relay-repository">Repository</label><select id="relay-repository" value={repository ?? ""} disabled={scopeLocked || repositoriesQuery.isFetching || repositoriesQuery.isError} onChange={(event) => { resetEnrollmentForScopeChange(); setRepository(event.target.value ? Number(event.target.value) : null); }}><option value="">{repositoriesQuery.isFetching ? "Loading repositories…" : repositoriesQuery.isError ? "Repositories unavailable" : "Choose a repository"}</option>{repositories.map((item) => <option key={item.id} value={item.id}>{item.owner}/{item.name}{item.private ? " (private)" : ""}</option>)}</select></div><Pagination label="repositories" page={repositoryPage} loading={repositoriesQuery.isFetching} disabled={scopeLocked} hasNext={(repositoriesQuery.data?.page ?? 0) * (repositoriesQuery.data?.perPage ?? PAGE_SIZE) < (repositoriesQuery.data?.totalCount ?? 0)} change={(page) => { resetEnrollmentForScopeChange(); setRepositoryPage(page); setRepository(null); }}/></>}
-                {installation !== null && repositoriesQuery.isError && <div className="callout danger" role="alert"><strong>Repositories unavailable</strong><span>{relayErrorMessage(repositoriesQuery.error, "repositories")}</span><button className="button small" type="button" onClick={() => void repositoriesQuery.refetch()}>Retry repositories</button></div>}
-                <div className="relay-enrollment-actions"><button className="button primary" type="button" disabled={!enrollmentReady || enrollmentStarting || Boolean(enrollment) || enrollmentRecovery === "restart"} onClick={() => void beginEnrollment()}>{enrollmentStarting ? "Starting authorization…" : "Start relay authorization"}</button>{selectedRepository && <span>Selected {selectedRepository.owner}/{selectedRepository.name}</span>}</div>
-              </div>}
-        {enrollment && authorizationURL && <div className="callout info relay-enrollment-status" role="status" aria-live="polite"><strong>Complete GitHub authorization</strong><span><a href={authorizationURL} target="_blank" rel="noopener noreferrer">Open GitHub authorization (opens in a new tab)</a></span><dl className="relay-enrollment-target"><div><dt>Connection</dt><dd className="mono">{enrollment.target.connectionId}</dd></div><div><dt>Installation</dt><dd>{enrollment.target.installationId}</dd></div><div><dt>Repository</dt><dd>{enrollment.target.repositoryLabel} ({enrollment.target.repositoryId})</dd></div></dl><span>Expires {displayTime(enrollment.expiresAt)}. Keep this tab open while Rig checks the result.</span><span>Reloading this page cannot rediscover a pending authorization. An authorized binding will appear here after status refresh.</span>{enrollment.paused && !enrollmentError && <button className="button small" type="button" onClick={resumeEnrollment}>Resume authorization check</button>}</div>}
+        <div className="relay-section-heading"><div><h3>Automatic deployment permissions</h3><p>Choose a repository from your connected account, then authorize event delivery for automatic deployments.</p></div></div>
+        <GitHubConnectionCard />
+        {githubConnected && <div className="relay-source-grid">
+          <GitHubRepositoryPicker id="relay-repository" value={selectedRepository} disabled={scopeLocked} client={client} onChange={(value) => { resetEnrollmentForScopeChange(); setSelectedRepository(value); }} />
+          <div className="relay-enrollment-actions"><button className="button primary" type="button" disabled={!enrollmentReady || enrollmentStarting || Boolean(enrollment) || enrollmentRecovery === "restart"} onClick={() => void beginEnrollment()}>{enrollmentStarting ? "Starting authorization..." : "Authorize automatic deployments"}</button>{selectedRepository && <span>Selected {selectedRepository.owner}/{selectedRepository.name}</span>}</div>
+        </div>}
+        {enrollment && authorizationURL && <div className="callout info relay-enrollment-status" role="status" aria-live="polite"><strong>Authorize automatic deployments</strong><span><a href={authorizationURL} target="_blank" rel="noopener noreferrer">Open GitHub authorization (opens in a new tab)</a></span><dl className="relay-enrollment-target"><div><dt>Repository</dt><dd>{enrollment.target.repositoryLabel} ({enrollment.target.repositoryId})</dd></div></dl><span>Expires {displayTime(enrollment.expiresAt)}. Keep this tab open while Rig checks the result.</span><span>Reloading this page cannot rediscover a pending authorization. An authorized binding will appear here after status refresh.</span>{enrollment.paused && !enrollmentError && <button className="button small" type="button" onClick={resumeEnrollment}>Resume authorization check</button>}</div>}
         {enrollmentError && <div className="callout danger" role="alert"><strong>Relay authorization needs attention</strong><span>{enrollmentError}</span>{enrollmentRecovery === "resume" && enrollment && <button className="button small" type="button" onClick={resumeEnrollment}>Resume authorization check</button>}{enrollmentRecovery === "restart" && <button className="button small" type="button" disabled={!enrollmentReady || enrollmentStarting} onClick={restartEnrollment}>{enrollmentStarting ? "Starting again…" : "Start again"}</button>}</div>}
         {enrollmentOutcome?.status === "authorized" && <div className="callout success" role="status"><strong>Relay binding authorized</strong><span>Repository event delivery is authorized.</span></div>}
         {enrollmentOutcome?.status === "denied" && <div className="callout warning" role="status"><strong>GitHub authorization denied</strong><span>Confirm the account and repository access, then start again.</span><button className="button small" type="button" disabled={!enrollmentReady || enrollmentStarting} onClick={restartEnrollment}>Start again</button></div>}

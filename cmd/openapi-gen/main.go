@@ -24,6 +24,7 @@ type document struct {
 }
 
 type schema struct {
+	GoPointer            bool              `yaml:"x-go-pointer"`
 	Ref                  string            `yaml:"$ref"`
 	Type                 string            `yaml:"type"`
 	Format               string            `yaml:"format"`
@@ -141,6 +142,12 @@ func renderGo(digest string, operations []operation, schemas map[string]schema) 
 			fieldType, err := goSchemaType(property)
 			if err != nil {
 				return nil, fmt.Errorf("schema %s property %s: %w", name, propertyName, err)
+			}
+			if property.GoPointer {
+				if required[propertyName] || property.Ref == "" {
+					return nil, fmt.Errorf("schema %s property %s: x-go-pointer requires an optional schema reference", name, propertyName)
+				}
+				fieldType = "*" + fieldType
 			}
 			jsonName := propertyName
 			if !required[propertyName] {

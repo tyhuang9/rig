@@ -25,6 +25,7 @@ import (
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/autodeploy"
 	"github.com/hostd/hostd/internal/controllerrelay"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
@@ -44,6 +45,7 @@ type Server struct {
 	Caddy               bool
 	FakeRuntime         bool
 	ComposeRuntime      bool
+	GeneratedRuntime    bool
 	DockerEndpoint      string
 	DataRoot            string
 	Logger              *slog.Logger
@@ -51,6 +53,7 @@ type Server struct {
 	Sources             *sourceconnections.Service
 	Configuration       *appconfig.Store
 	Deployments         *deployments.Repository
+	DeploymentPlans     *deploymentplans.Store
 	RelayManagement     RelayManagementService
 	AutoDeploy          AutoDeployService
 	AutoDeployAvailable bool
@@ -113,8 +116,11 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("doctor", s.require(s.doctor)),
 		contractRoute("listApplications", s.require(s.listApps)),
 		contractRoute("createApplication", s.require(s.createApp)),
-		contractRoute("inspectImport", s.require(s.inspectApp)),
+		contractRoute("inspectImport", noStore(s.require(s.inspectApp))),
 		contractRoute("getApplication", s.require(s.getApp)),
+		contractRoute("getApplicationDeploymentPlan", noStore(s.require(s.getApplicationDeploymentPlan))),
+		contractRoute("acceptApplicationDeploymentPlan", noStore(s.require(s.acceptApplicationDeploymentPlan))),
+		contractRoute("approveApplicationDeploymentPlanMigration", noStore(s.require(s.approveApplicationDeploymentPlanMigration))),
 		contractRoute("getApplicationConfiguration", s.require(s.getApplicationConfiguration)),
 		contractRoute("replaceApplicationConfiguration", s.require(s.replaceApplicationConfiguration)),
 		contractRoute("listServices", s.require(s.services)),
@@ -137,6 +143,10 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("streamJobEvents", s.require(s.eventsStream)),
 		contractRoute("listMachines", s.require(s.listMachines)),
 		contractRoute("listSourceConnections", s.require(s.listSourceConnections)),
+		contractRoute("getDefaultSourceConnection", noStore(s.require(s.getDefaultSourceConnection))),
+		contractRoute("startDefaultGitHubDeviceConnection", noStore(s.require(s.startDefaultGitHubDeviceConnection))),
+		contractRoute("pollDefaultGitHubDeviceConnection", noStore(s.require(s.pollDefaultGitHubDeviceConnection))),
+		contractRoute("listDefaultGitHubRepositories", noStore(s.require(s.listDefaultGitHubRepositories))),
 		contractRoute("startGitHubDeviceConnection", s.require(s.startGitHubDeviceConnection)),
 		contractRoute("pollGitHubDeviceConnection", s.require(s.pollGitHubDeviceConnection)),
 		contractRoute("refreshSourceConnection", s.require(s.refreshSourceConnection)),
@@ -609,7 +619,7 @@ func (s *Server) rotateCSRF(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	d := s.runDiagnostics(r.Context())
-	writeJSON(w, 200, apicontract.SystemStatus{Daemon: "running", Diagnostics: contractDiagnostics(d), Capabilities: apicontract.Capabilities{FakeRuntime: s.FakeRuntime, ComposeRuntime: s.ComposeRuntime, GithubConnections: s.Sources != nil && s.Sources.ProviderEnabled()}})
+	writeJSON(w, 200, apicontract.SystemStatus{Daemon: "running", Diagnostics: contractDiagnostics(d), Capabilities: apicontract.Capabilities{FakeRuntime: s.FakeRuntime, ComposeRuntime: s.ComposeRuntime, GeneratedRuntime: s.GeneratedRuntime, GithubConnections: s.Sources != nil && s.Sources.ProviderEnabled()}})
 }
 func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
 	d := s.runDiagnostics(r.Context())
@@ -648,6 +658,9 @@ func (s *Server) createApp(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		inspection, inspectErr := sourceinspection.InspectGitHub(r.Context(), s.Sources, sourceOwner(r), inspectionGitHubSource(b.GithubSource))
+		if inspectErr == nil && setupPresent(b.Setup) {
+			inspection, inspectErr = sourceinspection.WithSetup(inspection, deploymentSetupInput(b.Setup))
+		}
 		if inspectErr != nil {
 			inspectionProblem(w, r, inspectErr)
 			return
@@ -658,6 +671,16 @@ func (s *Server) createApp(w http.ResponseWriter, r *http.Request) {
 		}
 		v, err = s.Apps.CreateWithSource(b.Name, b.Description, b.MachineID, apps.Source{Type: apps.SourceGitHub, ConnectionID: inspection.Source.ConnectionID, InstallationID: inspection.Source.InstallationID, RepositoryID: inspection.Source.RepositoryID, RepositoryOwner: inspection.Source.RepositoryOwner, RepositoryName: inspection.Source.RepositoryName, TrackedBranch: inspection.Source.TrackedBranch, TrackedRef: inspection.Source.TrackedRef, ComposePath: inspection.Source.ComposePath, ResolvedSHA: inspection.ResolvedSHA})
 	} else {
+		if setupPresent(b.Setup) {
+			inspection, inspectErr := sourceinspection.InspectLocalContext(r.Context(), b.SourcePath)
+			if inspectErr == nil {
+				_, inspectErr = sourceinspection.WithSetup(inspection, deploymentSetupInput(b.Setup))
+			}
+			if inspectErr != nil {
+				inspectionProblem(w, r, inspectErr)
+				return
+			}
+		}
 		v, err = s.Apps.Create(b.Name, b.Description, b.SourcePath, b.MachineID)
 	}
 	if err != nil {
@@ -691,6 +714,13 @@ func (s *Server) inspectApp(w http.ResponseWriter, r *http.Request) {
 		inspectionProblem(w, r, err)
 		return
 	}
+	if setupPresent(b.Setup) {
+		result, err = sourceinspection.WithSetup(result, deploymentSetupInput(b.Setup))
+		if err != nil {
+			inspectionProblem(w, r, err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, contractInspection(result))
 }
 
@@ -703,7 +733,11 @@ func inspectionGitHubSource(value apicontract.GitHubSource) sourceinspection.Git
 func contractInspection(value sourceinspection.Result) apicontract.InspectResponse {
 	composeCandidates := make([]string, len(value.ComposeCandidates))
 	copy(composeCandidates, value.ComposeCandidates)
-	result := apicontract.InspectResponse{ResolvedSha: value.ResolvedSHA, ComposeCandidates: composeCandidates, Services: make([]apicontract.DetectedService, 0, len(value.Services)), Findings: make([]apicontract.SourceFinding, 0, len(value.Findings)), Source: apicontract.SourceSummary{Type: value.Source.Type, Path: value.Source.Path, ConnectionID: value.Source.ConnectionID, InstallationID: value.Source.InstallationID, RepositoryID: value.Source.RepositoryID, RepositoryOwner: value.Source.RepositoryOwner, RepositoryName: value.Source.RepositoryName, TrackedBranch: value.Source.TrackedBranch, TrackedRef: value.Source.TrackedRef, ComposePath: value.Source.ComposePath, ResolvedSha: value.ResolvedSHA}}
+	resolvedDigest := value.ResolvedSHA
+	if resolvedDigest == "" {
+		resolvedDigest = value.Analysis.StructuralFingerprint
+	}
+	result := apicontract.InspectResponse{ResolvedSha: resolvedDigest, ComposeCandidates: composeCandidates, Services: make([]apicontract.DetectedService, 0, len(value.Services)), Findings: make([]apicontract.SourceFinding, 0, len(value.Findings)), Source: contractSourceSummary(value.Source, resolvedDigest), Analysis: contractSourceAnalysis(value)}
 	for _, service := range value.Services {
 		result.Services = append(result.Services, apicontract.DetectedService{Name: service.Name, Image: service.Image, BuildContext: service.BuildContext})
 	}
@@ -714,6 +748,9 @@ func contractInspection(value sourceinspection.Result) apicontract.InspectRespon
 }
 
 func inspectionProblem(w http.ResponseWriter, r *http.Request, err error) {
+	if deploymentSetupProblem(w, r, err) {
+		return
+	}
 	if sourceinspection.IsCode(err, "source_too_large") {
 		problem(w, r, http.StatusRequestEntityTooLarge, "source_too_large", "Source exceeds inspection limits", nil)
 		return
@@ -799,6 +836,8 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
 	case errors.Is(err, jobs.ErrJobTerminal):
 		problem(w, r, http.StatusConflict, "job_terminal", "Job is already terminal and cannot be cancelled", nil)
+	case errors.Is(err, jobs.ErrCancellationUnsafe):
+		problem(w, r, http.StatusConflict, "route_reconciliation_required", "Retry route reconciliation before cancelling this deployment", nil)
 	default:
 		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not cancel job", nil)
 	}

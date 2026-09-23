@@ -18,18 +18,16 @@ import (
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/autodeploy"
-	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	"github.com/hostd/hostd/internal/runtime/docker"
-	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
-	"github.com/hostd/hostd/internal/runtime/securetemp"
 	"github.com/hostd/hostd/internal/secretfile"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
@@ -47,6 +45,11 @@ func runServer(args []string) int {
 		return 1
 	}
 	logger := newStructuredLogger(os.Stderr, cfg.LogLevel)
+	dockerExecutable, err := resolveRuntimeDockerExecutable(cfg, docker.ResolveExecutable)
+	if err != nil {
+		logger.Error("Docker executable resolution failed", "error", err)
+		return 1
+	}
 	db, err := database.Open(cfg.DataRoot)
 	if err != nil {
 		logger.Error("database startup failed", "error", err)
@@ -72,7 +75,10 @@ func runServer(args []string) int {
 		logger.Error("local machine setup failed", "error", err)
 		return 1
 	}
-	diagnostic := docker.Check(context.Background(), cfg.CaddyManagement, cfg.DockerEndpoint, cfg.DataRoot)
+	capabilities := runtimeCapabilitiesFor(cfg)
+	checker := docker.NewChecker(cfg.DockerEndpoint, cfg.DataRoot)
+	checker.DockerExecutable = dockerExecutable
+	diagnostic := checker.Check(context.Background(), capabilities.caddy)
 	if err := m.UpdateLocalDiagnostics(diagnostic.DockerVersion, diagnostic.ComposeVersion, diagnostic.Resources); err != nil {
 		logger.Error("local diagnostics persistence failed", "error", err)
 		return 1
@@ -109,35 +115,30 @@ func runServer(args []string) int {
 		return 1
 	}
 	applications := apps.New(db)
-	deploymentRepository := deployments.New(db)
-	temporary, err := securetemp.New(cfg.DataRoot)
+	planStore, err := deploymentplans.New(db, cfg.DataRoot)
 	if err != nil {
-		logger.Error("compose runtime temporary storage setup failed", "error", err)
+		logger.Error("deployment plan storage setup failed", "error", err)
 		return 1
 	}
-	var executor jobs.Executor
-	if cfg.FakeRuntime {
-		executor = jobs.NewFakeExecutor()
+	if err := planStore.Recover(context.Background()); err != nil {
+		logger.Error("deployment plan recovery failed", "error", err)
+		return 1
 	}
-	if cfg.ComposeRuntime {
-		executor, err = composeruntime.NewExecutor(applications, snapshots, applicationConfiguration, deploymentRepository, temporary, runtimeprocess.ExecRunner{}, composeruntime.ExecutorOptions{
-			DockerEndpoint: cfg.DockerEndpoint,
-			ConfigTimeout:  cfg.ComposeConfigTimeout,
-			ApplyTimeout:   cfg.ComposeApplyTimeout,
-			WaitTimeout:    cfg.ComposeWaitTimeout,
-		})
-		if err != nil {
-			logger.Error("compose runtime setup failed", "error", err)
-			return 1
-		}
+	deploymentRepository := deployments.New(db)
+	runtime, err := prepareRuntimeComposition(context.Background(), cfg, runtimeCompositionDependencies{
+		db: db, applications: applications, snapshots: snapshots, configuration: applicationConfiguration,
+		deployments: deploymentRepository, plans: planStore,
+	}, runtimeCompositionOptions{dockerExecutable: dockerExecutable})
+	if err != nil {
+		logger.Error("runtime composition failed", "error", err)
+		return 1
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	workerDone, err := prepareRuntimeWorker(ctx, runtimeRecovery{
-		temporary:   temporary.Recover,
 		deployments: deploymentRepository.Recover,
 		jobs:        j.RecoverInterrupted,
-	}, executor, j.RunWorker, func(err error) {
+	}, runtime.executor, j.RunWorker, func(err error) {
 		logger.Error("job worker stopped", "error", err)
 		stop()
 	})
@@ -146,22 +147,32 @@ func runServer(args []string) int {
 		return 1
 	}
 	autoDeployRepository := autodeploy.NewRepository(db)
+	var autoDeployPreflight autodeploy.DispatchPreflight
+	if cfg.GeneratedRuntime {
+		autoDeployPreflight, err = newGeneratedAutoDeployPreflight(planStore, sources, snapshots)
+		if err != nil {
+			logger.Error("generated auto-deploy preflight setup failed", "error", err)
+			return 1
+		}
+	}
 	autoDeployDone, autoDeployWake, autoDeployReconcile := startAutoDeploy(ctx, cfg, logger, func() (autoDeployRunner, error) {
-		return newAutoDeployRunner(cfg, autoDeployRepository, sources, j, logger)
+		return newGeneratedAwareAutoDeployRunner(cfg, autoDeployRepository, sources, j, autoDeployPreflight, logger)
 	})
 	relayManagement := newControllerRelayManagementTarget()
 	relayDone := startControllerRelay(ctx, cfg, logger, relayManagement, func() (controllerRelayRunner, error) {
 		return newControllerRelayRuntime(cfg, db, sources, logger, autoDeployWake, autoDeployReconcile)
 	})
-	effectiveAutoDeploy := cfg.ComposeRuntime && cfg.GitHubConnectionsEnabled() && sources.ProviderEnabled()
-	s := &http.Server{Addr: cfg.ListenAddress, Handler: (&controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, Caddy: cfg.CaddyManagement, FakeRuntime: cfg.FakeRuntime, ComposeRuntime: cfg.ComposeRuntime, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}).Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	effectiveAutoDeploy := (cfg.ComposeRuntime || cfg.GeneratedRuntime) && cfg.GitHubConnectionsEnabled() && sources.ProviderEnabled()
+	controllerServer := &controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, DeploymentPlans: planStore, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}
+	applyRuntimeCapabilities(controllerServer, capabilities)
+	s := &http.Server{Addr: cfg.ListenAddress, Handler: controllerServer.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = s.Shutdown(shutdown)
 	}()
-	logger.Info("hostd listening", "address", cfg.ListenAddress, "fake_runtime", cfg.FakeRuntime, "compose_runtime", cfg.ComposeRuntime)
+	logger.Info("hostd listening", "address", cfg.ListenAddress, "fake_runtime", capabilities.fake, "compose_runtime", capabilities.compose, "generated_runtime", capabilities.generated)
 	serveErr := s.ListenAndServe()
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		logger.Error("server stopped", "error", serveErr)
@@ -179,17 +190,13 @@ func runServer(args []string) int {
 }
 
 type runtimeRecovery struct {
-	temporary   func() error
 	deployments func(context.Context) error
 	jobs        func() error
 }
 
 func prepareRuntimeWorker(ctx context.Context, recovery runtimeRecovery, executor jobs.Executor, run func(context.Context, jobs.Executor) error, reportFailure func(error)) (<-chan struct{}, error) {
-	if recovery.temporary == nil || recovery.deployments == nil || recovery.jobs == nil {
+	if recovery.deployments == nil || recovery.jobs == nil {
 		return nil, errors.New("runtime recovery dependencies are required")
-	}
-	if err := recovery.temporary(); err != nil {
-		return nil, fmt.Errorf("clean compose runtime temporary files: %w", err)
 	}
 	if err := recovery.deployments(context.WithoutCancel(ctx)); err != nil {
 		return nil, fmt.Errorf("recover deployments: %w", err)

@@ -38,6 +38,39 @@ describe("API client", () => {
     );
   });
 
+  it("uses the account connector routes and keeps search values encoded", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ configured: false }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ page: 1, perPage: 30, totalCount: 0, truncated: false, items: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ authorizationId: "b".repeat(32), connectionId: "a".repeat(32), userCode: "ABCD-EFGH", verificationUri: "https://github.com/login/device", installUrl: "https://github.com/apps/rig/installations/new", expiresAt: "2099-01-01T00:00:00Z", pollIntervalSeconds: 5 }), { status: 201 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await api.defaultSourceConnection();
+    await api.defaultGitHubRepositories("org/repo & private", 1, 30);
+    await api.startDefaultGitHubConnection();
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/source-connections/default", expect.anything());
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/source-connections/default/github/repositories?q=org%2Frepo+%26+private&page=1&perPage=30", expect.anything());
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/v1/source-connections/default/github/device", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+  });
+
+  it("keeps pending authorization distinct from a connected durable account", async () => {
+    const connection = { id: "a".repeat(32), provider: "github", status: "connected", credentialGeneration: 1, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ authorizationId: "b".repeat(32), status: "pending", connection, nextPollAt: "2099-01-01T00:00:00Z" }), { status: 202, headers: { "Retry-After": "5" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.pollDefaultGitHubConnection(connection.id, "b".repeat(32))).resolves.toMatchObject({ status: "pending", connection: { status: "connected" } });
+    expect(fetchMock).toHaveBeenCalledWith(`/api/v1/source-connections/${connection.id}/device/${"b".repeat(32)}/poll`, expect.objectContaining({ method: "POST" }));
+  });
+
+  it.each([null, {}, { page: 1, perPage: 30, totalCount: 0, truncated: false, items: null }])("rejects malformed repository responses instead of reporting empty", async (body) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(body), { status: 200 })));
+    await expect(api.defaultGitHubRepositories()).rejects.toMatchObject({ code: "invalid_connector_response" });
+  });
+
+  it("rejects unexpected fields in saved connector responses before exposing the data to the UI", async () => {
+    const connection = { id: "a".repeat(32), provider: "github", status: "connected", credentialGeneration: 1, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", accessToken: "must-never-enter-query-cache" };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ configured: true, connection }), { status: 200 })));
+    await expect(api.defaultSourceConnection()).rejects.toMatchObject({ code: "invalid_connector_response", detail: "The controller returned an invalid GitHub connection response." });
+  });
+
   it("surfaces safe problem details", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ detail: "Invalid credentials" }), { status: 401 }),
@@ -94,6 +127,22 @@ describe("API client", () => {
       "/api/v1/source-connections/connection%2Fone/github/installations/42/repositories?page=2&perPage=30",
       expect.objectContaining({ credentials: "same-origin" }),
     );
+  });
+
+  it("uses generated deployment-plan paths with exact CAS and migration bodies", async () => {
+    const revision = { revisionNumber: 1, canonicalDigest: "a".repeat(64), strategy: "generated_node", state: "accepted", source: { provider: "local", repositoryId: 0, resolvedDigest: "b".repeat(64) }, detector: { name: "projectanalysis", version: "2", sourceStructuralFingerprint: "c".repeat(64) }, components: [], fieldProvenance: [], migration: { present: false } };
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify(revision), { status: 200 })));
+    vi.stubGlobal("fetch", fetchMock);
+    const acceptance = { expectedRevisionNumber: 0, expectedSourceStructuralFingerprint: "c".repeat(64), expectedCandidateDigest: "d".repeat(64), candidateId: "web", packageManager: "npm", installBehavior: "npm ci", migrationCommand: "", components: [{ componentId: "web", nodeVersion: "24", buildCommand: "npm run build", runCommand: "npm start", internalPort: 3000, healthProbe: "/" }] };
+    const approval = { revisionId: "11111111-1111-4111-8111-111111111111", revisionNumber: 1, expectedApprovalRevision: 0 };
+
+    await api.deploymentPlan("app/one");
+    await api.acceptDeploymentPlan("app/one", acceptance);
+    await api.approveDeploymentPlanMigration("app/one", approval);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/apps/app%2Fone/deployment-plan", expect.objectContaining({ credentials: "same-origin" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/apps/app%2Fone/deployment-plan", expect.objectContaining({ method: "PUT", body: JSON.stringify(acceptance), headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/v1/apps/app%2Fone/deployment-plan/migration-approval", expect.objectContaining({ method: "POST", body: JSON.stringify(approval), headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
   });
 
   it("treats a pending device poll as a successful 202 response", async () => {
@@ -162,6 +211,18 @@ describe("API client", () => {
       status: 502,
       code: "invalid_inspection_response",
       detail: "The controller returned an invalid source inspection response.",
+    });
+  });
+
+  it("rejects malformed analysis candidates before the wizard can render them", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ source: { type: "local" }, composeCandidates: [], services: [], findings: [], analysis: { source: { type: "local" }, resolvedDigest: "a", schemaVersion: "2", structuralFingerprint: "b", candidates: [null], findings: [] } }), { status: 200 }),
+    ));
+
+    await expect(api.inspect({ sourcePath: "C:/fixture" })).rejects.toMatchObject({
+      name: "APIError",
+      status: 502,
+      code: "invalid_inspection_response",
     });
   });
 

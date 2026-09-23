@@ -126,6 +126,58 @@ func TestExportRevisionForExecutionReturnsIndependentCallerOwnedBytes(t *testing
 	}
 }
 
+func TestExportRevisionKeysForExecutionUsesExactAllowlist(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	revision, err := store.Replace(ctx, configTestApp, "", ReplaceInput{
+		ExpectedRevisionNumber: 0,
+		Variables:              []ValueInput{{Key: "MODE", Value: "production"}},
+		Secrets:                []ValueInput{{Key: "DATABASE_URL", Value: "postgres://secret"}, {Key: "TOKEN", Value: "must-not-leak"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	filtered, err := store.ExportRevisionKeysForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber, []string{"DATABASE_URL"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer filtered.Clear()
+	if got, want := string(filtered.Environment), "# hostd application configuration\nDATABASE_URL='postgres://secret'\n"; got != want {
+		t.Fatalf("filtered environment=%q want=%q", got, want)
+	}
+	if strings.Contains(string(filtered.Environment), "must-not-leak") || strings.Contains(string(filtered.Environment), "MODE") || len(filtered.SecretOrigins) != 1 || string(filtered.SecretOrigins[0].Key) != "DATABASE_URL" {
+		t.Fatalf("filtered export escaped its allowlist: %#v", filtered)
+	}
+
+	empty, err := store.ExportRevisionKeysForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(empty.Environment); got != "# hostd application configuration\n" || len(empty.SecretOrigins) != 0 {
+		empty.Clear()
+		t.Fatalf("empty allowlist export=%q origins=%#v", got, empty.SecretOrigins)
+	}
+	empty.Clear()
+}
+
+func TestExportRevisionKeysForExecutionRejectsMissingOrInvalidKeys(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	revision, err := store.Replace(ctx, configTestApp, "", ReplaceInput{ExpectedRevisionNumber: 0, Secrets: []ValueInput{{Key: "DATABASE_URL", Value: "postgres://secret"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := [][]string{{"MISSING"}, {"DATABASE_URL", "DATABASE_URL"}, {"bad-key"}, {"DATABASE_URL", "TOKEN", "A", "B", "C", "D", "E", "F", "G"}}
+	for _, keys := range requests {
+		result, exportErr := store.ExportRevisionKeysForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber, keys)
+		result.Clear()
+		if !IsCode(exportErr, "configuration_unavailable") {
+			t.Fatalf("keys=%#v error=%v", keys, exportErr)
+		}
+	}
+}
+
 func TestExportRevisionForExecutionRejectsMismatchedIdentity(t *testing.T) {
 	store, _ := testStore(t)
 	revision, err := store.Replace(context.Background(), configTestApp, "", ReplaceInput{ExpectedRevisionNumber: 0, Variables: []ValueInput{{Key: "MODE", Value: "prod"}}})

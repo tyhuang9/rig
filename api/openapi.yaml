@@ -10,11 +10,22 @@ security:
 x-rig-problem-codes:
   authentication_required: {description: GitHub authorization does not permit the requested operation, statuses: [403]}
   source_access_lost: {description: Access to the selected GitHub source must be restored, statuses: [409]}
+  authorization_identity_mismatch: {description: GitHub authorization used a different identity than the saved connection, statuses: [409]}
+  authorization_superseded: {description: A newer GitHub authorization replaced this attempt, statuses: [409]}
+  authorization_failed: {description: GitHub authorization could not be completed, statuses: [409]}
   provider_unavailable: {description: GitHub or its configured integration is temporarily unavailable, statuses: [503]}
   invalid_source: {description: The selected GitHub source is invalid or cannot be used, statuses: [400, 422]}
   approval_required: {description: Deployment requires an administrator approval before it can continue, statuses: [409]}
+  migration_approval_required: {description: Deployment migration requires approval before it can continue, statuses: [409]}
+  route_reconciliation_required: {description: Deployment route state must be reconciled before it can be cancelled, statuses: [409]}
   application_busy: {description: The application already has an active conflicting operation, statuses: [409]}
   source_too_large: {description: The source exceeds the supported inspection limits, statuses: [413]}
+  deployment_plan_conflict: {description: The accepted deployment plan changed while this request was being reviewed, statuses: [409]}
+  deployment_plan_review_required: {description: The source structure or inferred deployment behavior changed and must be reviewed again, statuses: [409]}
+  deployment_plan_not_found: {description: No accepted deployment plan exists for the application, statuses: [404]}
+  invalid_deployment_plan: {description: One or more deployment plan fields are invalid, statuses: [422]}
+  migration_approval_conflict: {description: The migration approval changed while this request was being reviewed, statuses: [409]}
+  deployment_plan_forbidden: {description: Administrator access is required to accept a deployment plan or approve its migration, statuses: [403]}
   relay_unavailable: {description: The configured controller relay is unavailable, statuses: [503]}
 x-job-responses: &jobResponses
   '200': {description: Existing idempotent job, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
@@ -107,6 +118,32 @@ paths:
       operationId: getApplication
       responses:
         '200': {description: Application, content: {application/json: {schema: {$ref: '#/components/schemas/Application'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/deployment-plan:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    get:
+      operationId: getApplicationDeploymentPlan
+      x-rig-problem-codes: [deployment_plan_not_found]
+      responses:
+        '200': {description: Current accepted deployment plan, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/DeploymentPlanRevision'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    put:
+      operationId: acceptApplicationDeploymentPlan
+      x-rig-problem-codes: [authentication_required, source_access_lost, provider_unavailable, invalid_source, source_too_large, deployment_plan_conflict, deployment_plan_review_required, invalid_deployment_plan, deployment_plan_forbidden]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AcceptDeploymentPlanRequest'}}}}
+      responses:
+        '200': {description: Accepted immutable deployment plan revision, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/DeploymentPlanRevision'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/deployment-plan/migration-approval:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    post:
+      operationId: approveApplicationDeploymentPlanMigration
+      x-rig-problem-codes: [deployment_plan_not_found, deployment_plan_conflict, migration_approval_conflict, invalid_deployment_plan, deployment_plan_forbidden]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ApproveDeploymentPlanMigrationRequest'}}}}
+      responses:
+        '200': {description: Migration approval recorded, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/DeploymentPlanRevision'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/apps/{appId}/services:
     parameters: [{$ref: '#/components/parameters/AppId'}]
@@ -219,6 +256,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/JobId'}]
     post:
       operationId: cancelJob
+      x-rig-problem-codes: [route_reconciliation_required]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
         '200': {description: Job cancelled, content: {application/json: {schema: {$ref: '#/components/schemas/JobResponse'}}}}
@@ -227,7 +265,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/JobId'}]
     post:
       operationId: resumeJob
-      x-rig-problem-codes: [approval_required]
+      x-rig-problem-codes: [approval_required, migration_approval_required]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
         '200': {description: Paused job atomically requeued, content: {application/json: {schema: {$ref: '#/components/schemas/JobResponse'}}}}
@@ -265,6 +303,28 @@ paths:
       responses:
         '200': {description: Source connections owned by the authenticated user, content: {application/json: {schema: {$ref: '#/components/schemas/SourceConnectionList'}}}}
         default: {$ref: '#/components/responses/Problem'}
+  /api/v1/source-connections/default:
+    get:
+      operationId: getDefaultSourceConnection
+      responses:
+        '200': {description: Saved default GitHub connection state, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/DefaultSourceConnection'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/source-connections/default/github/device:
+    post:
+      operationId: startDefaultGitHubDeviceConnection
+      x-rig-problem-codes: [authentication_required, provider_unavailable]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      responses:
+        '201': {description: GitHub device authorization started for the durable connection, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubConnectionAuthorization'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/source-connections/default/github/repositories:
+    get:
+      operationId: listDefaultGitHubRepositories
+      x-rig-problem-codes: [source_access_lost, provider_unavailable, source_too_large]
+      description: Returns one deterministic page aggregated from all accessible personal and organization installations. Provider failures are returned as errors and never represented as an empty successful page.
+      responses:
+        '200': {description: Accessible repositories with their durable source identifiers, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/ConnectedGitHubRepositoryPage'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/source-connections/github/device:
     post:
       operationId: startGitHubDeviceConnection
@@ -290,6 +350,17 @@ paths:
       responses:
         '200': {description: GitHub connection established, content: {application/json: {schema: {$ref: '#/components/schemas/SourceConnection'}}}}
         '202': {description: GitHub authorization remains pending, headers: {Retry-After: {schema: {type: integer, minimum: 1}}}, content: {application/json: {schema: {$ref: '#/components/schemas/SourceConnection'}}}}
+        '429': {description: Poll attempted before the persisted next-poll time, headers: {Retry-After: {schema: {type: integer, minimum: 1}}}, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/source-connections/{connectionId}/device/{authorizationId}/poll:
+    parameters: [{$ref: '#/components/parameters/ConnectionId'}, {$ref: '#/components/parameters/AuthorizationId'}]
+    post:
+      operationId: pollDefaultGitHubDeviceConnection
+      x-rig-problem-codes: [authentication_required, authorization_identity_mismatch, authorization_superseded, authorization_failed, provider_unavailable]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      responses:
+        '200': {description: GitHub authorization completed, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubConnectionAuthorizationStatus'}}}}
+        '202': {description: GitHub authorization remains pending, headers: {Cache-Control: {schema: {type: string, const: no-store}}, Retry-After: {schema: {type: integer, minimum: 1}}}, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubConnectionAuthorizationStatus'}}}}
         '429': {description: Poll attempted before the persisted next-poll time, headers: {Retry-After: {schema: {type: integer, minimum: 1}}}, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/source-connections/{connectionId}/refresh:
@@ -422,6 +493,7 @@ components:
     AfterEventId: {name: after, in: query, required: false, schema: {type: integer, format: int64, minimum: 0}}
     LastEventId: {name: Last-Event-ID, in: header, required: false, schema: {type: integer, format: int64, minimum: 0}}
     ConnectionId: {name: connectionId, in: path, required: true, schema: {type: string, pattern: '^[a-f0-9]{32}$'}}
+    AuthorizationId: {name: authorizationId, in: path, required: true, schema: {type: string, pattern: '^[a-f0-9]{32}$'}}
     InstallationId: {name: installationId, in: path, required: true, schema: {type: integer, format: int64, minimum: 1}}
     RepositoryId: {name: repositoryId, in: path, required: true, schema: {type: integer, format: int64, minimum: 1}}
     EnrollmentId: {name: enrollmentId, in: path, required: true, schema: {type: string, format: uuid}}
@@ -451,7 +523,7 @@ components:
     SessionResponse: {type: object, required: [user, csrfToken], properties: {user: {$ref: '#/components/schemas/User'}, csrfToken: {type: string}}}
     MeResponse: {type: object, required: [user], properties: {user: {$ref: '#/components/schemas/User'}}}
     CSRFResponse: {type: object, required: [csrfToken], properties: {csrfToken: {type: string}}}
-    Capabilities: {type: object, required: [fakeRuntime, composeRuntime, githubConnections], properties: {fakeRuntime: {type: boolean}, composeRuntime: {type: boolean}, githubConnections: {type: boolean}}}
+    Capabilities: {type: object, required: [fakeRuntime, composeRuntime, generatedRuntime, githubConnections], properties: {fakeRuntime: {type: boolean}, composeRuntime: {type: boolean}, generatedRuntime: {type: boolean}, githubConnections: {type: boolean}}}
     Diagnostics:
       type: object
       required: [daemonRunning, clientAvailable, engineReady, composeAvailable, caddyManaged, os, architecture, dockerVersion, composeVersion, dockerDetail, composeDetail, startupLimitation, resources]
@@ -463,9 +535,9 @@ components:
     Application: {type: object, required: [id, slug, name, description, status, machineName, createdAt, source], properties: {id: {type: string, format: uuid}, slug: {type: string}, name: {type: string}, description: {type: string}, status: {type: string}, machineName: {type: string}, createdAt: {type: string, format: date-time}, source: {$ref: '#/components/schemas/SourceSummary'}}}
     ApplicationList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Application'}}}}
     PolicyFinding: {type: object, required: [id, deploymentId, policyVersion, capability, scope, fingerprint, disposition, createdAt], properties: {id: {type: string, format: uuid}, deploymentId: {type: string, format: uuid}, policyVersion: {type: string}, capability: {type: string}, scope: {type: string}, fingerprint: {type: string, pattern: '^[a-f0-9]{64}$'}, disposition: {type: string, enum: [allowed, approval_required, rejected]}, createdAt: {type: string, format: date-time}}}
-    Deployment: {type: object, required: [id, appId, status, configurationMode, actualConfigurationRevisionNumber, findings], properties: {id: {type: string, format: uuid}, appId: {type: string, format: uuid}, releaseId: {type: string}, jobId: {type: string, format: uuid}, machineId: {type: string, format: uuid}, status: {type: string, enum: [preparing, applying, waiting_health, succeeded, failed, cancelled, needs_attention]}, configurationMode: {type: string, enum: [current, original]}, actualConfigurationRevisionId: {type: string, format: uuid}, actualConfigurationRevisionNumber: {type: integer, format: int64, minimum: 0}, startedAt: {type: string, format: date-time}, finishedAt: {type: string, format: date-time}, diagnosticCode: {type: string}, failureSummary: {type: string}, findings: {type: array, items: {$ref: '#/components/schemas/PolicyFinding'}}}}
+    Deployment: {type: object, required: [id, appId, status, configurationMode, actualConfigurationRevisionNumber, runtimeStrategy, deploymentPlanRevisionNumber, findings], properties: {id: {type: string, format: uuid}, appId: {type: string, format: uuid}, releaseId: {type: string}, jobId: {type: string, format: uuid}, machineId: {type: string, format: uuid}, status: {type: string, enum: [preparing, applying, waiting_health, succeeded, failed, cancelled, needs_attention]}, configurationMode: {type: string, enum: [current, original]}, actualConfigurationRevisionId: {type: string, format: uuid}, actualConfigurationRevisionNumber: {type: integer, format: int64, minimum: 0}, runtimeStrategy: {type: string, enum: [compose, generated_node]}, deploymentPlanRevisionId: {type: string, format: uuid}, deploymentPlanRevisionNumber: {type: integer, format: int64, minimum: 0}, startedAt: {type: string, format: date-time}, finishedAt: {type: string, format: date-time}, diagnosticCode: {type: string}, failureSummary: {type: string}, findings: {type: array, items: {$ref: '#/components/schemas/PolicyFinding'}}}}
     DeploymentList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Deployment'}}}}
-    Release: {type: object, required: [id, appId, sourceProvider, configurationRevisionNumber, createdAt], properties: {id: {type: string}, appId: {type: string, format: uuid}, sourceProvider: {type: string}, repositoryId: {type: integer, format: int64}, repositoryOwner: {type: string}, repositoryName: {type: string}, trackedRef: {type: string}, resolvedSha: {type: string}, sourceCommitSha: {type: string}, sourceBranch: {type: string}, composePath: {type: string}, archiveSha256: {type: string, pattern: '^[a-f0-9]{64}$'}, workspaceState: {type: string}, configurationRevisionId: {type: string, format: uuid}, configurationRevisionNumber: {type: integer, format: int64, minimum: 0}, createdAt: {type: string, format: date-time}}}
+    Release: {type: object, required: [id, appId, sourceProvider, configurationRevisionNumber, deploymentPlanRevisionNumber, runtimeStrategy, createdAt], properties: {id: {type: string}, appId: {type: string, format: uuid}, sourceProvider: {type: string}, repositoryId: {type: integer, format: int64}, repositoryOwner: {type: string}, repositoryName: {type: string}, trackedRef: {type: string}, resolvedSha: {type: string}, sourceCommitSha: {type: string}, sourceBranch: {type: string}, composePath: {type: string}, archiveSha256: {type: string, pattern: '^[a-f0-9]{64}$'}, workspaceState: {type: string}, configurationRevisionId: {type: string, format: uuid}, configurationRevisionNumber: {type: integer, format: int64, minimum: 0}, deploymentPlanRevisionId: {type: string, format: uuid}, deploymentPlanRevisionNumber: {type: integer, format: int64, minimum: 0}, runtimeStrategy: {type: string, enum: [compose, generated_node]}, createdAt: {type: string, format: date-time}}}
     ReleaseList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Release'}}}}
     DeployReleaseRequest: {type: object, additionalProperties: false, required: [configurationMode], properties: {configurationMode: {type: string, enum: [current, original]}}}
     RuntimeApproval: {type: object, required: [id, appId, policyVersion, capability, scope, fingerprint, grantedBy, grantedAt], properties: {id: {type: string, format: uuid}, appId: {type: string, format: uuid}, policyVersion: {type: string}, capability: {type: string}, scope: {type: string}, fingerprint: {type: string, pattern: '^[a-f0-9]{64}$'}, grantedBy: {type: string, format: uuid}, grantedAt: {type: string, format: date-time}, revokedBy: {type: string, format: uuid}, revokedAt: {type: string, format: date-time}}}
@@ -480,14 +552,56 @@ components:
     ReplaceApplicationConfigurationRequest: {type: object, additionalProperties: false, required: [expectedRevisionNumber, variables, secrets, remove], properties: {expectedRevisionNumber: {type: integer, format: int64, minimum: 0}, variables: {type: array, maxItems: 256, items: {$ref: '#/components/schemas/ConfigurationValueInput'}}, secrets: {type: array, maxItems: 256, items: {$ref: '#/components/schemas/SecretConfigurationValueInput'}}, remove: {type: array, maxItems: 256, items: {type: string, pattern: '^[A-Za-z_][A-Za-z0-9_]*$', maxLength: 128}}}}
     GitHubSource: {type: object, additionalProperties: false, required: [connectionId, installationId, repositoryId, branch], properties: {connectionId: {type: string, pattern: '^[a-f0-9]{32}$'}, installationId: {type: integer, format: int64, minimum: 1}, repositoryId: {type: integer, format: int64, minimum: 1}, branch: {type: string, minLength: 1, maxLength: 255}, composePath: {type: string, minLength: 1, maxLength: 1024}}}
     SourceSummary: {type: object, required: [type], properties: {type: {type: string, enum: [local, github]}, path: {type: string}, connectionId: {type: string}, installationId: {type: integer, format: int64}, repositoryId: {type: integer, format: int64}, repositoryOwner: {type: string}, repositoryName: {type: string}, trackedBranch: {type: string}, trackedRef: {type: string}, composePath: {type: string}, resolvedSha: {type: string}}}
-    CreateApplicationRequest: {type: object, additionalProperties: false, required: [name], properties: {name: {type: string}, description: {type: string}, sourcePath: {type: string}, githubSource: {$ref: '#/components/schemas/GitHubSource'}, machineId: {type: string, format: uuid}}}
-    InspectRequest: {type: object, additionalProperties: false, properties: {sourcePath: {type: string}, githubSource: {$ref: '#/components/schemas/GitHubSource'}}}
+    CreateApplicationRequest: {type: object, additionalProperties: false, required: [name], properties: {setup: {$ref: '#/components/schemas/DeploymentSetupInput', x-go-pointer: true}, name: {type: string}, description: {type: string}, sourcePath: {type: string}, githubSource: {$ref: '#/components/schemas/GitHubSource'}, machineId: {type: string, format: uuid}}}
+    InspectRequest: {type: object, additionalProperties: false, properties: {setup: {$ref: '#/components/schemas/DeploymentSetupInput', x-go-pointer: true}, sourcePath: {type: string}, githubSource: {$ref: '#/components/schemas/GitHubSource'}}}
     SourceFinding: {type: object, required: [code, message], properties: {code: {type: string}, message: {type: string}, path: {type: string}}}
     DetectedService: {type: object, required: [name], properties: {name: {type: string}, image: {type: string}, buildContext: {type: string}}}
-    InspectResponse: {type: object, required: [source, composeCandidates, services, findings], properties: {source: {$ref: '#/components/schemas/SourceSummary'}, resolvedSha: {type: string}, composeCandidates: {type: array, items: {type: string}}, services: {type: array, items: {$ref: '#/components/schemas/DetectedService'}}, findings: {type: array, items: {$ref: '#/components/schemas/SourceFinding'}}}}
+    AnalysisEvidence: {type: object, required: [code], properties: {code: {type: string}, path: {type: string}, field: {type: string}, detail: {type: string}}}
+    AnalysisFinding: {type: object, required: [code, severity, message], properties: {code: {type: string}, severity: {type: string}, message: {type: string}, path: {type: string}, field: {type: string}}}
+    AnalysisValue: {type: object, required: [present, evidence], properties: {present: {type: boolean}, origin: {type: string, enum: [inferred, user]}, value: {type: string}, provenance: {type: string}, confidence: {type: string, enum: [high, medium, low]}, evidence: {type: array, items: {$ref: '#/components/schemas/AnalysisEvidence'}}}}
+    AnalysisCommand: {type: object, required: [present, evidence], properties: {present: {type: boolean}, origin: {type: string, enum: [inferred, user]}, phase: {type: string}, command: {type: string}, workingDirectory: {type: string}, environmentKeys: {type: array, maxItems: 8, items: {type: string}}, provenance: {type: string}, confidence: {type: string, enum: [high, medium, low]}, evidence: {type: array, items: {$ref: '#/components/schemas/AnalysisEvidence'}}}}
+    AnalysisHealthProbe: {type: object, required: [present, evidence], properties: {present: {type: boolean}, origin: {type: string, enum: [inferred, user]}, path: {type: string}, method: {type: string}, provenance: {type: string}, confidence: {type: string, enum: [high, medium, low]}, evidence: {type: array, items: {$ref: '#/components/schemas/AnalysisEvidence'}}}}
+    AnalysisPackageManager: {type: object, required: [present, evidence], properties: {present: {type: boolean}, origin: {type: string, enum: [inferred, user]}, name: {type: string}, version: {type: string}, lockfile: {type: string}, provenance: {type: string}, confidence: {type: string, enum: [high, medium, low]}, evidence: {type: array, items: {$ref: '#/components/schemas/AnalysisEvidence'}}}}
+    AnalysisComponent: {type: object, required: [id, origin, name, kind, framework, rootDirectory, staticOutputDirectory, migrationFingerprint, evidence, findings], properties: {id: {type: string}, origin: {type: string, enum: [inferred, user]}, name: {type: string}, kind: {type: string}, framework: {type: string}, rootDirectory: {type: string}, staticOutputDirectory: {type: string}, internalPort: {$ref: '#/components/schemas/AnalysisValue'}, healthProbe: {$ref: '#/components/schemas/AnalysisHealthProbe'}, migrationFingerprint: {type: string}, build: {$ref: '#/components/schemas/AnalysisCommand'}, run: {$ref: '#/components/schemas/AnalysisCommand'}, migration: {$ref: '#/components/schemas/AnalysisCommand'}, evidence: {type: array, items: {$ref: '#/components/schemas/AnalysisEvidence'}}, findings: {type: array, items: {$ref: '#/components/schemas/AnalysisFinding'}}}}
+    AnalysisAdvancedInput: {type: object, required: [field, componentId, required, reason], properties: {field: {type: string}, componentId: {type: string}, required: {type: boolean}, reason: {type: string}}}
+    DeploymentPlanCandidate: {type: object, required: [id, origin, status, kind, rootDirectory, configPath, packageManager, nodeVersion, components, evidence, findings, missingFields, advancedInputs, digest], properties: {id: {type: string}, origin: {type: string, enum: [inferred, user]}, status: {type: string, enum: [ready, needs_input, unsupported]}, kind: {type: string}, rootDirectory: {type: string}, configPath: {type: string}, packageManager: {$ref: '#/components/schemas/AnalysisPackageManager'}, nodeVersion: {$ref: '#/components/schemas/AnalysisValue'}, install: {$ref: '#/components/schemas/AnalysisCommand'}, components: {type: array, items: {$ref: '#/components/schemas/AnalysisComponent'}}, evidence: {type: array, items: {$ref: '#/components/schemas/AnalysisEvidence'}}, findings: {type: array, items: {$ref: '#/components/schemas/AnalysisFinding'}}, missingFields: {type: array, items: {type: string}}, advancedInputs: {type: array, items: {$ref: '#/components/schemas/AnalysisAdvancedInput'}}, digest: {type: string, pattern: '^[a-f0-9]{64}$'}}}
+    SourceAnalysis: {type: object, required: [source, resolvedDigest, schemaVersion, structuralFingerprint, candidates, findings], properties: {source: {$ref: '#/components/schemas/SourceSummary'}, resolvedDigest: {type: string, pattern: '^[a-f0-9]{40}$|^[a-f0-9]{64}$'}, schemaVersion: {type: string}, structuralFingerprint: {type: string, pattern: '^[a-f0-9]{64}$'}, candidates: {type: array, items: {$ref: '#/components/schemas/DeploymentPlanCandidate'}}, findings: {type: array, items: {$ref: '#/components/schemas/AnalysisFinding'}}}}
+    DeploymentSetupInput:
+      type: object
+      additionalProperties: false
+      required: [components]
+      properties:
+        components: {type: array, minItems: 1, maxItems: 2, items: {$ref: '#/components/schemas/DeploymentSetupComponentInput'}}
+        migrationCommand: {type: string, maxLength: 8192}
+    DeploymentSetupComponentInput:
+      type: object
+      additionalProperties: false
+      required: [id, technology, rootDirectory, packageManager, nodeVersion, installCommand, buildCommand, startCommand, outputDirectory, internalPort, healthProbe]
+      properties:
+        id: {type: string, minLength: 1, maxLength: 256}
+        technology: {type: string, enum: [node, nextjs, static]}
+        rootDirectory: {type: string, minLength: 1, maxLength: 1024}
+        packageManager: {type: string, enum: [npm, pnpm, yarn]}
+        nodeVersion: {type: string, enum: ['20', '22', '24']}
+        installCommand: {type: string, maxLength: 8192, description: Empty explicitly skips dependency installation.}
+        buildCommand: {type: string, maxLength: 8192, description: Empty explicitly skips the build step.}
+        startCommand: {type: string, maxLength: 8192, description: Required for servers; empty for managed static sites.}
+        outputDirectory: {type: string, maxLength: 1024, description: Required for static sites; relative to rootDirectory.}
+        internalPort: {type: integer, minimum: 1, maximum: 65535}
+        healthProbe: {type: string, minLength: 1, maxLength: 1024}
+    DeploymentPlanComponentInput: {type: object, additionalProperties: false, required: [componentId, buildCommand, runCommand, nodeVersion, internalPort, healthProbe], properties: {componentId: {type: string, minLength: 1, maxLength: 256}, buildCommand: {type: string, maxLength: 8192}, runCommand: {type: string, minLength: 1, maxLength: 8192}, nodeVersion: {type: string, minLength: 1, maxLength: 256}, internalPort: {type: integer, minimum: 1, maximum: 65535}, healthProbe: {type: string, minLength: 1, maxLength: 1024}}}
+    AcceptDeploymentPlanRequest: {type: object, additionalProperties: false, required: [expectedRevisionNumber, expectedSourceStructuralFingerprint, expectedCandidateDigest, candidateId], properties: {setup: {$ref: '#/components/schemas/DeploymentSetupInput', x-go-pointer: true}, expectedRevisionNumber: {type: integer, format: int64, minimum: 0}, expectedSourceStructuralFingerprint: {type: string, pattern: '^[a-f0-9]{64}$'}, expectedCandidateDigest: {type: string, pattern: '^[a-f0-9]{64}$'}, candidateId: {type: string, minLength: 1, maxLength: 512}, packageManager: {type: string, enum: [npm, pnpm, yarn]}, installBehavior: {type: string, minLength: 1, maxLength: 8192}, components: {type: array, minItems: 1, maxItems: 64, items: {$ref: '#/components/schemas/DeploymentPlanComponentInput'}}, migrationCommand: {type: string, maxLength: 8192}}}
+    ApproveDeploymentPlanMigrationRequest: {type: object, additionalProperties: false, required: [revisionId, revisionNumber, expectedApprovalRevision], properties: {revisionId: {type: string, format: uuid}, revisionNumber: {type: integer, format: int64, minimum: 1}, expectedApprovalRevision: {type: integer, format: int64, minimum: 0}}}
+    DeploymentPlanFieldProvenance: {type: object, required: [field, origin, confidence, evidence], properties: {field: {type: string}, origin: {type: string, enum: [inferred, user]}, confidence: {type: integer, minimum: 0, maximum: 100}, evidence: {type: array, items: {type: string}}}}
+    DeploymentPlanComponent: {type: object, required: [name, role, rootDirectory, packageManager, installBehavior, installDirectory, nodeVersion, buildCommand, runCommand, internalPort, healthProbe], properties: {name: {type: string}, role: {type: string}, rootDirectory: {type: string}, packageManager: {type: string}, installBehavior: {type: string}, installDirectory: {type: string}, nodeVersion: {type: string}, buildCommand: {type: string}, runCommand: {type: string}, internalPort: {type: integer, minimum: 1, maximum: 65535}, healthProbe: {type: string}}}
+    DeploymentPlanDetector: {type: object, required: [name, version, sourceStructuralFingerprint], properties: {name: {type: string}, version: {type: string}, sourceStructuralFingerprint: {type: string, pattern: '^[a-f0-9]{64}$'}}}
+    DeploymentPlanMigration: {type: object, required: [present], properties: {present: {type: boolean}, componentName: {type: string}, rootDirectory: {type: string}, command: {type: string}, environmentKeys: {type: array, maxItems: 8, items: {type: string}}, evidenceDigest: {type: string, pattern: '^[a-f0-9]{64}$'}, approvalStatus: {type: string, enum: [pending, approved]}, approvedBy: {type: string, format: uuid}, approvedAt: {type: string, format: date-time}}}
+    DeploymentPlanSource: {type: object, required: [provider, repositoryId, resolvedDigest], properties: {provider: {type: string, enum: [local, github]}, repositoryId: {type: integer, format: int64, minimum: 0}, resolvedDigest: {type: string, pattern: '^[a-f0-9]{40}$|^[a-f0-9]{64}$'}}}
+    DeploymentPlanRevision: {type: object, required: [revisionNumber, strategy, state, canonicalDigest, source, detector, components, fieldProvenance, migration], properties: {setup: {$ref: '#/components/schemas/DeploymentSetupInput', x-go-pointer: true}, revisionId: {type: string, format: uuid}, revisionNumber: {type: integer, format: int64, minimum: 0}, strategy: {type: string, enum: [generated_node, compose]}, state: {type: string, enum: [accepted, superseded]}, canonicalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}, source: {$ref: '#/components/schemas/DeploymentPlanSource'}, detector: {$ref: '#/components/schemas/DeploymentPlanDetector'}, components: {type: array, items: {$ref: '#/components/schemas/DeploymentPlanComponent'}}, fieldProvenance: {type: array, items: {$ref: '#/components/schemas/DeploymentPlanFieldProvenance'}}, migration: {$ref: '#/components/schemas/DeploymentPlanMigration'}, acceptedBy: {type: string, format: uuid}, acceptedAt: {type: string, format: date-time}}}
+    InspectResponse: {type: object, required: [source, composeCandidates, services, findings, analysis], properties: {source: {$ref: '#/components/schemas/SourceSummary'}, resolvedSha: {type: string}, composeCandidates: {type: array, items: {type: string}}, services: {type: array, items: {$ref: '#/components/schemas/DetectedService'}}, findings: {type: array, items: {$ref: '#/components/schemas/SourceFinding'}}, analysis: {$ref: '#/components/schemas/SourceAnalysis'}}}
     Service: {type: object, required: [id, name, kind, status], properties: {id: {type: string, format: uuid}, name: {type: string}, kind: {type: string}, status: {type: string}, port: {type: integer}}}
     ServiceList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Service'}}}}
-    Job: {type: object, required: [id, type, resourceType, resourceId, status, phase, checkpoint, progress, attempt, createdAt, updatedAt], properties: {id: {type: string, format: uuid}, type: {type: string}, resourceType: {type: string}, resourceId: {type: string}, status: {type: string}, phase: {type: string}, checkpoint: {type: string}, errorCode: {type: string}, errorDetail: {type: string}, requestedBy: {type: string, format: uuid}, pauseDisposition: {type: string}, progress: {type: integer}, attempt: {type: integer, minimum: 0}, createdAt: {type: string, format: date-time}, updatedAt: {type: string, format: date-time}}}
+    Job: {type: object, required: [id, type, resourceType, resourceId, status, phase, checkpoint, progress, attempt, createdAt, updatedAt], properties: {id: {type: string, format: uuid}, type: {type: string}, resourceType: {type: string}, resourceId: {type: string}, status: {type: string}, phase: {type: string}, checkpoint: {type: string}, errorCode: {type: string}, errorDetail: {type: string}, requestedBy: {type: string, format: uuid}, pauseDisposition: {type: string, enum: [approval_required, migration_approval_required, insufficient_replacement_capacity, route_reconciliation_required]}, progress: {type: integer}, attempt: {type: integer, minimum: 0}, createdAt: {type: string, format: date-time}, updatedAt: {type: string, format: date-time}}}
     JobMutationResponse: {type: object, required: [job, created], properties: {job: {$ref: '#/components/schemas/Job'}, created: {type: boolean}}}
     JobResponse: {type: object, required: [job], properties: {job: {$ref: '#/components/schemas/Job'}}}
     JobList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Job'}}}}
@@ -497,11 +611,16 @@ components:
     MachineList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Machine'}}}}
     SourceConnection: {type: object, required: [id, provider, status, credentialGeneration, createdAt, updatedAt], properties: {id: {type: string, pattern: '^[a-f0-9]{32}$'}, provider: {type: string, const: github}, status: {type: string, enum: [pending, connected, denied, expired, disconnected, access_lost]}, providerUserId: {type: string, minLength: 1, maxLength: 128}, providerLogin: {type: string, minLength: 1, maxLength: 255}, credentialGeneration: {type: integer, format: int64, minimum: 0}, installUrl: {type: string, format: uri}, pendingExpiresAt: {type: string, format: date-time}, nextPollAt: {type: string, format: date-time}, accessExpiresAt: {type: string, format: date-time}, refreshExpiresAt: {type: string, format: date-time}, lastErrorCode: {type: string, minLength: 1, maxLength: 64}, connectedAt: {type: string, format: date-time}, disconnectedAt: {type: string, format: date-time}, createdAt: {type: string, format: date-time}, updatedAt: {type: string, format: date-time}}}
     SourceConnectionList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/SourceConnection'}}}}
+    DefaultSourceConnection: {type: object, additionalProperties: false, required: [configured], properties: {configured: {type: boolean}, connection: {$ref: '#/components/schemas/SourceConnection'}}}
     GitHubDeviceAuthorization: {type: object, required: [connectionId, userCode, verificationUri, installUrl, expiresAt, pollIntervalSeconds], properties: {connectionId: {type: string, pattern: '^[a-f0-9]{32}$'}, userCode: {type: string, minLength: 1, maxLength: 64}, verificationUri: {type: string, const: 'https://github.com/login/device'}, installUrl: {type: string, format: uri}, expiresAt: {type: string, format: date-time}, pollIntervalSeconds: {type: integer, minimum: 1, maximum: 300}}}
+    GitHubConnectionAuthorization: {type: object, additionalProperties: false, required: [authorizationId, connectionId, userCode, verificationUri, installUrl, expiresAt, pollIntervalSeconds], properties: {authorizationId: {type: string, pattern: '^[a-f0-9]{32}$'}, connectionId: {type: string, pattern: '^[a-f0-9]{32}$'}, userCode: {type: string, minLength: 1, maxLength: 64}, verificationUri: {type: string, const: 'https://github.com/login/device'}, installUrl: {type: string, format: uri}, expiresAt: {type: string, format: date-time}, pollIntervalSeconds: {type: integer, minimum: 1, maximum: 300}}}
+    GitHubConnectionAuthorizationStatus: {type: object, additionalProperties: false, required: [authorizationId, status, connection], properties: {authorizationId: {type: string, pattern: '^[a-f0-9]{32}$'}, status: {type: string, enum: [pending, connected, denied, expired, superseded, failed]}, connection: {$ref: '#/components/schemas/SourceConnection'}, nextPollAt: {type: string, format: date-time}}}
     GitHubInstallation: {type: object, required: [id, accountLogin, accountType, targetType, repositorySelection, cachedAt], properties: {id: {type: integer, format: int64, minimum: 1}, accountLogin: {type: string, minLength: 1, maxLength: 255}, accountType: {type: string, enum: [User, Organization, Enterprise, Bot]}, targetType: {type: string, enum: [User, Organization]}, repositorySelection: {type: string, enum: [all, selected]}, suspendedAt: {type: string, format: date-time}, cachedAt: {type: string, format: date-time}}}
     GitHubInstallationPage: {type: object, required: [page, perPage, totalCount, items], properties: {page: {type: integer, minimum: 1, maximum: 10000}, perPage: {type: integer, minimum: 1, maximum: 100}, totalCount: {type: integer, minimum: 0}, items: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/GitHubInstallation'}}}}
     GitHubRepository: {type: object, required: [id, owner, name, defaultBranch, private, archived, disabled], properties: {id: {type: integer, format: int64, minimum: 1}, owner: {type: string}, name: {type: string}, defaultBranch: {type: string}, private: {type: boolean}, archived: {type: boolean}, disabled: {type: boolean}}}
     GitHubRepositoryPage: {type: object, required: [page, perPage, totalCount, items], properties: {page: {type: integer}, perPage: {type: integer}, totalCount: {type: integer}, items: {type: array, items: {$ref: '#/components/schemas/GitHubRepository'}}}}
+    ConnectedGitHubRepository: {type: object, additionalProperties: false, required: [connectionId, installationId, accountLogin, id, owner, name, defaultBranch, private, archived, disabled], properties: {connectionId: {type: string, pattern: '^[a-f0-9]{32}$'}, installationId: {type: integer, format: int64, minimum: 1}, accountLogin: {type: string, minLength: 1, maxLength: 255}, id: {type: integer, format: int64, minimum: 1}, owner: {type: string}, name: {type: string}, defaultBranch: {type: string}, private: {type: boolean}, archived: {type: boolean}, disabled: {type: boolean}}}
+    ConnectedGitHubRepositoryPage: {type: object, additionalProperties: false, required: [page, perPage, totalCount, truncated, items], properties: {page: {type: integer, minimum: 1}, perPage: {type: integer, minimum: 1, maximum: 100}, totalCount: {type: integer, minimum: 0}, truncated: {type: boolean}, items: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/ConnectedGitHubRepository'}}}}
     GitHubBranch: {type: object, required: [name, sha, protected], properties: {name: {type: string}, sha: {type: string}, protected: {type: boolean}}}
     GitHubBranchPage: {type: object, required: [page, perPage, items], properties: {page: {type: integer}, perPage: {type: integer}, items: {type: array, items: {$ref: '#/components/schemas/GitHubBranch'}}}}
     RelayStatus:

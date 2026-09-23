@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer } from "node:net";
-import { access, mkdtemp, mkdir, rm } from "node:fs/promises";
+import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { JobMutationResponse } from "../src/generated/api-contract";
@@ -9,8 +9,12 @@ import type { JobMutationResponse } from "../src/generated/api-contract";
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 const screenshotDir = process.env.HOSTD_SCREENSHOT_DIR ?? path.join(repoRoot, "artifacts", "screenshots");
 const longName = `Application ${"with-a-very-long-name-".repeat(3)}fixture`;
+const composeName = "Compose cancellation fixture";
 let daemon: ChildProcessWithoutNullStreams;
 let dataRoot = "";
+let sourceRoot = "";
+let composeSourceRoot = "";
+let manualSourceRoot = "";
 let baseURL = "";
 let bootstrapToken = "";
 let bootstrapTokenFile = "";
@@ -29,6 +33,18 @@ async function availablePort(): Promise<number> {
 
 test.beforeAll(async () => {
   dataRoot = await mkdtemp(path.join(tmpdir(), "hostd-e2e-"));
+  sourceRoot = await mkdtemp(path.join(tmpdir(), "hostd-e2e-source-"));
+  composeSourceRoot = await mkdtemp(path.join(tmpdir(), "hostd-e2e-compose-source-"));
+  manualSourceRoot = await mkdtemp(path.join(tmpdir(), "hostd-e2e-manual-source-"));
+  await writeFile(path.join(manualSourceRoot, "server.js"), "console.log('manual source fixture');\n", "utf8");
+  await writeFile(path.join(sourceRoot, "package.json"), JSON.stringify({
+    name: "hostd-e2e-fixture",
+    packageManager: "npm@11",
+    scripts: { build: "vite build" },
+    dependencies: { vite: "6" },
+  }), "utf8");
+  await writeFile(path.join(sourceRoot, "package-lock.json"), JSON.stringify({ lockfileVersion: 3 }), "utf8");
+  await writeFile(path.join(composeSourceRoot, "compose.yaml"), "services:\n  web:\n    image: nginx:alpine\n", "utf8");
   const binary = path.join(dataRoot, process.platform === "win32" ? "hostd-e2e.exe" : "hostd-e2e");
   const hostctl = path.join(dataRoot, process.platform === "win32" ? "hostctl-e2e.exe" : "hostctl-e2e");
   const build = spawnSync("go", ["build", "-o", binary, "./cmd/hostd"], { cwd: repoRoot, encoding: "utf8" });
@@ -73,12 +89,19 @@ test.afterAll(async () => {
     await new Promise((resolve) => daemon.once("exit", resolve));
   }
   if (dataRoot) await rm(dataRoot, { recursive: true, force: true });
+  if (sourceRoot) await rm(sourceRoot, { recursive: true, force: true });
+  if (composeSourceRoot) await rm(composeSourceRoot, { recursive: true, force: true });
+  if (manualSourceRoot) await rm(manualSourceRoot, { recursive: true, force: true });
 });
 
 test("bootstraps, restores a fresh tab, cancels work, and stays responsive", async ({ page, context }) => {
   const browserErrors: string[] = [];
   const watchForErrors = (target: typeof page) => {
-    target.on("console", (message) => { if (message.type() === "error") browserErrors.push(message.text()); });
+    target.on("console", (message) => {
+      if (message.type() !== "error") return;
+      const expectedLegacyPlanMiss = message.text().includes("status of 404") && /\/api\/v1\/apps\/[^/]+\/deployment-plan$/.test(message.location().url);
+      if (!expectedLegacyPlanMiss) browserErrors.push(message.text());
+    });
     target.on("pageerror", (error) => browserErrors.push(error.message));
   };
   watchForErrors(page);
@@ -113,13 +136,22 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
 
   await page.getByRole("link", { name: "Add application" }).first().click();
   await expect(page.getByRole("heading", { name: "Add application" })).toBeFocused();
-  await page.getByRole("button", { name: "Save application" }).click();
+  await expect(page.getByRole("button", { name: "Save application" })).toBeDisabled();
+  await page.getByLabel("Description").fill("A deterministic browser fixture");
+  await page.getByLabel("Local source path").fill(sourceRoot);
+  await page.getByRole("button", { name: "Analyze project" }).click();
+  await expect(page.getByRole("heading", { name: "How Rig will run this app" })).toBeFocused();
+  await page.getByRole("button", { name: "Review setup" }).click();
+  await expect(page.getByRole("button", { name: "Accept setup" })).toBeVisible();
+  await page.getByRole("button", { name: "Accept setup" }).click();
   await expect(page.locator(".error-summary")).toBeFocused();
   await expect(page.getByLabel("Application name")).toHaveAttribute("aria-invalid", "true");
   await page.getByLabel("Application name").fill(longName);
-  await page.getByLabel("Description").fill("A deterministic browser fixture");
-  await page.getByLabel("Local source path").fill("C:\\fixtures\\hostd-e2e");
-  await page.getByRole("button", { name: "Save application" }).click();
+  await page.getByRole("button", { name: "Review setup" }).click();
+  await expect(page.getByRole("heading", { name: "How Rig will run this app" })).toBeFocused();
+  await page.getByRole("button", { name: "Accept setup" }).click();
+  await expect(page.getByRole("heading", { name: "Setup accepted" })).toBeFocused();
+  await page.getByRole("button", { name: "Open application" }).click();
   await expect(page.getByRole("heading", { name: longName })).toBeVisible();
   const restoredPage = await context.newPage();
   watchForErrors(restoredPage);
@@ -128,14 +160,69 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
   expect((await csrfRestore).ok()).toBe(true);
   await expect(restoredPage.getByRole("heading", { name: longName })).toBeVisible();
   expect(await restoredPage.evaluate(() => window.sessionStorage.getItem("hostd-csrf"))).toBeTruthy();
-  await expect(restoredPage.getByRole("button", { name: "Deploy latest" })).toBeVisible();
   await expect(restoredPage.getByText("Development capability")).toBeVisible();
+  await expect(restoredPage.getByRole("button", { name: "Deploy latest" })).toBeDisabled();
+  await expect(restoredPage.getByText("Deploy latest requires the generated runtime on this controller.")).toBeVisible();
+
+  await restoredPage.getByRole("link", { name: "Applications" }).click();
+  await restoredPage.getByRole("link", { name: "Add application" }).first().click();
+  await restoredPage.getByLabel("Application name").fill("Manual settings fixture");
+  await restoredPage.getByLabel("Local source path").fill(manualSourceRoot);
+  await restoredPage.getByRole("button", { name: "Analyze project" }).click();
+  await expect(restoredPage.getByRole("heading", { name: "How Rig will run this app" })).toBeFocused();
+  const originalViewport = restoredPage.viewportSize();
+  await restoredPage.setViewportSize({ width: 320, height: 800 });
+  await restoredPage.getByLabel("Root directory", { exact: true }).fill("apps/thisisaverylongunbrokendirectorynamethatmustwrapwithinthevisiblesetupcard");
+  const setupCard = restoredPage.locator(".component-plan");
+  await expect.poll(async () => {
+    const bounds = await setupCard.boundingBox();
+    return Boolean(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 320);
+  }).toBe(true);
+  for (const control of await setupCard.locator("input, select").all()) {
+    const bounds = await control.boundingBox();
+    expect(bounds && bounds.x >= 0 && bounds.x + bounds.width <= 320).toBe(true);
+  }
+  await restoredPage.getByLabel("Root directory", { exact: true }).fill(".");
+  if (originalViewport) await restoredPage.setViewportSize(originalViewport);
+  await expect(restoredPage.getByLabel("Start command", { exact: true })).toHaveAttribute("aria-invalid", "true");
+  await restoredPage.getByRole("link", { name: /Start command:/ }).click();
+  await expect(restoredPage.getByLabel("Start command", { exact: true })).toBeFocused();
+  await restoredPage.getByLabel("Start command", { exact: true }).fill("node server.js");
+  await restoredPage.getByText("Advanced settings", { exact: true }).click();
+  await restoredPage.getByLabel("Internal port", { exact: true }).fill("3001");
+  await restoredPage.getByRole("button", { name: "Review setup", exact: true }).click();
+  await restoredPage.getByRole("button", { name: "Accept setup", exact: true }).click();
+  await expect(restoredPage.getByRole("heading", { name: "Setup accepted" })).toBeFocused();
+  await restoredPage.getByRole("button", { name: "Open application" }).click();
+  await expect(restoredPage.getByLabel("Start command", { exact: true })).toHaveValue("node server.js");
+  await restoredPage.getByLabel("Start command", { exact: true }).fill("node --enable-source-maps server.js");
+  await restoredPage.getByRole("button", { name: "Review setup", exact: true }).click();
+  await restoredPage.getByRole("button", { name: "Accept setup", exact: true }).click();
+  await expect(restoredPage.getByText("Deployment setup revision 2 accepted.", { exact: true })).toBeAttached();
+  await restoredPage.reload();
+  await expect(restoredPage.getByLabel("Start command", { exact: true })).toHaveValue("node --enable-source-maps server.js");
+  await restoredPage.getByText("Advanced settings", { exact: true }).click();
+  await expect(restoredPage.getByLabel("Internal port", { exact: true })).toHaveValue("3001");
+  await expect(restoredPage.getByLabel("Install command", { exact: false })).toHaveValue("");
+  await expect(restoredPage.getByLabel("Build command", { exact: false })).toHaveValue("");
+
+  await restoredPage.getByRole("link", { name: "Applications" }).click();
+  await restoredPage.getByRole("link", { name: "Add application" }).first().click();
+  await restoredPage.getByLabel("Application name").fill(composeName);
+  await restoredPage.getByLabel("Local source path").fill(composeSourceRoot);
+  await restoredPage.getByRole("button", { name: "Analyze project" }).click();
+  await expect(restoredPage.getByText("Source inspection completed")).toBeVisible();
+  await restoredPage.getByRole("button", { name: "Save application" }).click();
+  await expect(restoredPage.getByRole("heading", { name: composeName })).toBeVisible();
+  await expect(restoredPage.getByRole("button", { name: "Deploy latest" })).toBeEnabled();
   const deployResponse = restoredPage.waitForResponse((response) =>
     response.request().method() === "POST" && new URL(response.url()).pathname.endsWith("/deployments"),
   );
   await restoredPage.getByRole("button", { name: "Deploy latest" }).click();
-  const deployment = await (await deployResponse).json() as JobMutationResponse;
-  await expect(restoredPage.getByText(`Deployment job ${deployment.job.id} queued.`, { exact: true })).toBeVisible();
+  const deployHTTPResponse = await deployResponse;
+  expect(deployHTTPResponse.status()).toBe(202);
+  const deployment = await deployHTTPResponse.json() as JobMutationResponse;
+  expect(deployment.job.id).toMatch(/^[0-9a-f-]{36}$/);
   expect(await restoredPage.evaluate(() => window.sessionStorage.getItem("hostd-csrf"))).toBeTruthy();
 
   await restoredPage.getByRole("link", { name: "Activity" }).click();
@@ -168,9 +255,9 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
       await expect(restoredPage.getByRole("link", { name: "Activity" })).toBeVisible();
     }
     if (width === 768) {
-      await expect(restoredPage.getByText("Machine", { exact: true })).toBeVisible();
-      await expect(restoredPage.getByText("Release", { exact: true })).toBeVisible();
-      await expect(restoredPage.getByText("Created", { exact: true })).toBeVisible();
+      await expect(restoredPage.getByText("Machine", { exact: true }).first()).toBeVisible();
+      await expect(restoredPage.getByText("Release", { exact: true }).first()).toBeVisible();
+      await expect(restoredPage.getByText("Created", { exact: true }).first()).toBeVisible();
     }
     await restoredPage.screenshot({ path: path.join(screenshotDir, `apps-${width}.png`), fullPage: true });
   }

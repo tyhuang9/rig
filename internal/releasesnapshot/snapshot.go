@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,9 +16,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/pathsecurity"
+	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/sourceconnections"
+	"github.com/hostd/hostd/internal/sourceinspection"
 )
 
 const (
@@ -43,19 +47,21 @@ func (e *Error) Error() string           { return "release snapshot: " + e.Code 
 func IsCode(err error, code string) bool { var e *Error; return errors.As(err, &e) && e.Code == code }
 
 type Release struct {
-	ID                          string
-	AppID                       string
-	SourceProvider              string
-	RepositoryID                int64
-	ResolvedSHA                 string
-	ComposePath                 string
-	ArchiveSHA256               string
-	WorkspaceTreeSHA256         string
-	WorkspacePath               string
-	WorkspaceState              string
-	WorkspaceSizeBytes          int64
-	ConfigurationRevisionID     string
-	ConfigurationRevisionNumber int64
+	ID                           string
+	AppID                        string
+	SourceProvider               string
+	RepositoryID                 int64
+	ResolvedSHA                  string
+	ComposePath                  string
+	ArchiveSHA256                string
+	WorkspaceTreeSHA256          string
+	WorkspacePath                string
+	WorkspaceState               string
+	WorkspaceSizeBytes           int64
+	ConfigurationRevisionID      string
+	ConfigurationRevisionNumber  int64
+	DeploymentPlanRevisionID     string
+	DeploymentPlanRevisionNumber int64
 }
 
 // RetentionOptions bounds retained release workspaces. Both values are bytes.
@@ -81,6 +87,11 @@ type Materializer struct {
 	hashTree       func(context.Context, string) (string, error)
 	afterLocalCopy func()
 	retention      RetentionOptions
+	plans          deploymentPlanReader
+}
+
+type deploymentPlanReader interface {
+	GetRevision(context.Context, string, string, int64) (deploymentplans.DeploymentPlanRevision, error)
 }
 type lifecycleFS struct {
 	mkdirAll  func(string, os.FileMode) error
@@ -109,7 +120,11 @@ func New(db *sql.DB, sources SourceReader, dataRoot string, options ...Retention
 	if retention.PerAppBytes <= 0 || retention.GlobalBytes <= 0 || retention.PerAppBytes > retention.GlobalBytes || retention.PerAppBytes > MaxPerAppWorkspaceQuota || retention.GlobalBytes > MaxGlobalWorkspaceQuota {
 		return nil, errors.New("release retention quotas must be positive and the per-app quota must not exceed the global quota")
 	}
-	return &Materializer{db: db, sources: sources, dataRoot: dataRoot, now: time.Now, fs: realLifecycleFS(), hashTree: hashLocalTree, retention: retention}, nil
+	plans, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		return nil, err
+	}
+	return &Materializer{db: db, sources: sources, dataRoot: dataRoot, now: time.Now, fs: realLifecycleFS(), hashTree: hashLocalTree, retention: retention, plans: plans}, nil
 }
 
 // ValidateComposeWorkspace validates the selected Compose file and every local
@@ -169,10 +184,14 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 	if err != nil {
 		return Release{}, internal(err)
 	}
+	_, deploymentPlanNumber, err := m.currentDeploymentPlan(ctx, appID)
+	if err != nil {
+		return Release{}, internal(err)
+	}
 	if err := m.enforceRetention(ctx, appID, 0); err != nil {
 		return Release{}, err
 	}
-	if ready, err := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath, configurationNumber); err == nil {
+	if ready, err := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath, configurationNumber, deploymentPlanNumber); err == nil {
 		return ready, nil
 	} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return Release{}, sourceError(err)
@@ -217,7 +236,7 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 		}
 		return Release{}, &Error{Code: code}
 	}
-	if err := validateComposeWorkspace(workspace, source.composePath); err != nil {
+	if err := m.validateMaterializedWorkspace(ctx, release, workspace); err != nil {
 		code := archiveError(err)
 		if m.abort(ctx, appID, release.ID, code) != nil {
 			return Release{}, &Error{Code: "internal_error"}
@@ -269,7 +288,7 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 		if IsCode(err, ErrorCodeSourceStorageFull) {
 			return Release{}, err
 		}
-		if existing, lookupErr := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath, release.ConfigurationRevisionNumber); lookupErr == nil {
+		if existing, lookupErr := m.ready(ctx, appID, source.repositoryID, branch.SHA, source.composePath, release.ConfigurationRevisionNumber, release.DeploymentPlanRevisionNumber); lookupErr == nil {
 			return existing, nil
 		}
 		m.finalize(ctx, release.ID, "internal_error")
@@ -283,11 +302,22 @@ func (m *Materializer) Materialize(ctx context.Context, owner, appID string) (Re
 // managed workspace. Cross-application and non-ready releases are deliberately
 // indistinguishable from missing releases.
 func (m *Materializer) ReadyRelease(ctx context.Context, appID, releaseID string) (Release, error) {
+	return m.readyRelease(ctx, appID, releaseID, true)
+}
+
+// ReadyWorkspace returns one app-bound immutable release after validating its
+// controller-owned workspace without requiring a Compose file. Generated
+// runtimes use this entry point and validate their exact pinned plan separately.
+func (m *Materializer) ReadyWorkspace(ctx context.Context, appID, releaseID string) (Release, error) {
+	return m.readyRelease(ctx, appID, releaseID, false)
+}
+
+func (m *Materializer) readyRelease(ctx context.Context, appID, releaseID string, requireCompose bool) (Release, error) {
 	if m == nil || m.db == nil || !validAppID(appID) || !validID(releaseID) {
 		return Release{}, &Error{Code: "release_not_found"}
 	}
 	var release Release
-	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,COALESCE(source_provider,''),repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_tree_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(workspace_size_bytes,-1),COALESCE(configuration_revision_id,''),configuration_revision_number FROM releases WHERE id=? AND app_id=? AND workspace_state='ready'`, releaseID, appID).Scan(&release.ID, &release.AppID, &release.SourceProvider, &release.RepositoryID, &release.ResolvedSHA, &release.ComposePath, &release.ArchiveSHA256, &release.WorkspaceTreeSHA256, &release.WorkspacePath, &release.WorkspaceState, &release.WorkspaceSizeBytes, &release.ConfigurationRevisionID, &release.ConfigurationRevisionNumber)
+	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,COALESCE(source_provider,''),repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_tree_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(workspace_size_bytes,-1),COALESCE(configuration_revision_id,''),configuration_revision_number,COALESCE(deployment_plan_revision_id,''),COALESCE(deployment_plan_revision_number,0) FROM releases WHERE id=? AND app_id=? AND workspace_state='ready'`, releaseID, appID).Scan(&release.ID, &release.AppID, &release.SourceProvider, &release.RepositoryID, &release.ResolvedSHA, &release.ComposePath, &release.ArchiveSHA256, &release.WorkspaceTreeSHA256, &release.WorkspacePath, &release.WorkspaceState, &release.WorkspaceSizeBytes, &release.ConfigurationRevisionID, &release.ConfigurationRevisionNumber, &release.DeploymentPlanRevisionID, &release.DeploymentPlanRevisionNumber)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Release{}, &Error{Code: "release_not_found"}
 	}
@@ -297,7 +327,7 @@ func (m *Materializer) ReadyRelease(ctx context.Context, appID, releaseID string
 	if err != nil {
 		return Release{}, &Error{Code: "internal_error"}
 	}
-	release, err = m.validateReadyRelease(ctx, release)
+	release, err = m.validateReadyRelease(ctx, release, requireCompose)
 	if errors.Is(err, errInvalidReadyWorkspace) {
 		return Release{}, &Error{Code: "invalid_source"}
 	}
@@ -435,24 +465,27 @@ func (m *Materializer) appSource(ctx context.Context, owner, appID string) (appS
 	err := m.db.QueryRowContext(ctx, `SELECT s.source_type,COALESCE(s.connection_id,''),COALESCE(s.installation_id,0),COALESCE(s.repository_id,0),COALESCE(s.tracked_branch,''),COALESCE(s.compose_path,'') FROM application_sources s JOIN source_connections c ON c.id=s.connection_id AND c.owner_user_id=? WHERE s.application_id=?`, owner, appID).Scan(&s.typeName, &s.connectionID, &s.installationID, &s.repositoryID, &s.branch, &s.composePath)
 	return s, err
 }
-func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, compose string, configurationNumber int64) (Release, error) {
+func (m *Materializer) ready(ctx context.Context, app string, repo int64, sha, compose string, configurationNumber, deploymentPlanNumber int64) (Release, error) {
 	var r Release
-	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,COALESCE(source_provider,''),repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_tree_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(workspace_size_bytes,-1),COALESCE(configuration_revision_id,''),configuration_revision_number FROM releases WHERE app_id=? AND repository_id=? AND resolved_sha=? AND compose_path=? AND configuration_revision_number=? AND workspace_state='ready'`, app, repo, sha, compose, configurationNumber).Scan(&r.ID, &r.AppID, &r.SourceProvider, &r.RepositoryID, &r.ResolvedSHA, &r.ComposePath, &r.ArchiveSHA256, &r.WorkspaceTreeSHA256, &r.WorkspacePath, &r.WorkspaceState, &r.WorkspaceSizeBytes, &r.ConfigurationRevisionID, &r.ConfigurationRevisionNumber)
+	err := m.db.QueryRowContext(ctx, `SELECT id,app_id,COALESCE(source_provider,''),repository_id,resolved_sha,compose_path,COALESCE(archive_sha256,''),COALESCE(workspace_tree_sha256,''),COALESCE(workspace_path,''),workspace_state,COALESCE(workspace_size_bytes,-1),COALESCE(configuration_revision_id,''),configuration_revision_number,COALESCE(deployment_plan_revision_id,''),COALESCE(deployment_plan_revision_number,0) FROM releases WHERE app_id=? AND repository_id=? AND resolved_sha=? AND compose_path=? AND configuration_revision_number=? AND COALESCE(deployment_plan_revision_number,0)=? AND workspace_state='ready'`, app, repo, sha, compose, configurationNumber, deploymentPlanNumber).Scan(&r.ID, &r.AppID, &r.SourceProvider, &r.RepositoryID, &r.ResolvedSHA, &r.ComposePath, &r.ArchiveSHA256, &r.WorkspaceTreeSHA256, &r.WorkspacePath, &r.WorkspaceState, &r.WorkspaceSizeBytes, &r.ConfigurationRevisionID, &r.ConfigurationRevisionNumber, &r.DeploymentPlanRevisionID, &r.DeploymentPlanRevisionNumber)
 	if err != nil {
 		return r, err
 	}
-	r, err = m.validateReadyRelease(ctx, r)
+	r, err = m.validateReadyRelease(ctx, r, compose != "")
 	if errors.Is(err, errInvalidReadyWorkspace) {
 		return Release{}, sql.ErrNoRows
 	}
 	return r, err
 }
 
-func (m *Materializer) validateReadyRelease(ctx context.Context, release Release) (Release, error) {
+func (m *Materializer) validateReadyRelease(ctx context.Context, release Release, requireCompose bool) (Release, error) {
 	expected, pathErr := m.workspacePath(release.AppID, release.ID)
 	size, sizeErr := m.workspaceLogicalSize(retainedWorkspace{id: release.ID, appID: release.AppID, storedPath: release.WorkspacePath, state: release.WorkspaceState, size: release.WorkspaceSizeBytes})
 	safeForRemoval := pathErr == nil && sizeErr == nil
-	valid := safeForRemoval && release.WorkspaceSizeBytes >= 0 && size == release.WorkspaceSizeBytes && safeWorkspace(expected, release.ComposePath) && validateComposeWorkspace(expected, release.ComposePath) == nil
+	valid := safeForRemoval && release.WorkspaceSizeBytes >= 0 && size == release.WorkspaceSizeBytes && safeImmutableWorkspace(expected)
+	if valid && requireCompose {
+		valid = safeSelectedCompose(expected, release.ComposePath) && validateComposeWorkspace(expected, release.ComposePath) == nil
+	}
 	if valid {
 		digest, digestErr := m.hashTree(ctx, expected)
 		if errors.Is(digestErr, context.Canceled) || errors.Is(digestErr, context.DeadlineExceeded) {
@@ -513,7 +546,12 @@ func (m *Materializer) reserve(ctx context.Context, app string, source appSource
 	if err = tx.QueryRowContext(ctx, `SELECT revision_id,revision_number FROM application_configuration_heads WHERE app_id=?`, app).Scan(&configurationID, &configurationNumber); err != nil {
 		return Release{}, err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,compose_path,workspace_state,configuration_revision_id,configuration_revision_number) VALUES(?,?,?,?,'materializing','{}',?,'github',?,?,?,?,?,?,?,?,?)`, id, app, branch.SHA, branch.Name, now, repository.ID, repository.Owner, repository.Name, "refs/heads/"+branch.Name, branch.SHA, source.composePath, WorkspaceStateMaterializing, nullableString(configurationID), configurationNumber)
+	var deploymentPlanID sql.NullString
+	var deploymentPlanNumber int64
+	if err = tx.QueryRowContext(ctx, `SELECT CASE WHEN h.revision_number=0 THEN NULL WHEN r.analyzed_source_provider='github' AND r.analyzed_repository_id=? AND ((r.strategy='generated_node' AND ?='') OR r.analyzed_resolved_digest=?) THEN h.revision_id ELSE NULL END,CASE WHEN h.revision_number>0 AND r.analyzed_source_provider='github' AND r.analyzed_repository_id=? AND ((r.strategy='generated_node' AND ?='') OR r.analyzed_resolved_digest=?) THEN h.revision_number ELSE 0 END FROM deployment_plan_heads h LEFT JOIN deployment_plan_revisions r ON r.id=h.revision_id WHERE h.app_id=?`, repository.ID, source.composePath, branch.SHA, repository.ID, source.composePath, branch.SHA, app).Scan(&deploymentPlanID, &deploymentPlanNumber); err != nil {
+		return Release{}, err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,repository_owner,repository_name,tracked_ref,resolved_sha,compose_path,workspace_state,configuration_revision_id,configuration_revision_number,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,?,?,'materializing','{}',?,'github',?,?,?,?,?,?,?,?,?,?,?)`, id, app, branch.SHA, branch.Name, now, repository.ID, repository.Owner, repository.Name, "refs/heads/"+branch.Name, branch.SHA, source.composePath, WorkspaceStateMaterializing, nullableString(configurationID), configurationNumber, nullableString(deploymentPlanID), nullablePlanNumber(deploymentPlanID, deploymentPlanNumber))
 	if err != nil {
 		return Release{}, err
 	}
@@ -524,7 +562,7 @@ func (m *Materializer) reserve(ctx context.Context, app string, source appSource
 	if err := tx.Commit(); err != nil {
 		return Release{}, err
 	}
-	return Release{ID: id, AppID: app, RepositoryID: repository.ID, ResolvedSHA: branch.SHA, ComposePath: source.composePath, WorkspaceState: WorkspaceStateMaterializing, ConfigurationRevisionID: configurationID.String, ConfigurationRevisionNumber: configurationNumber}, nil
+	return Release{ID: id, AppID: app, SourceProvider: "github", RepositoryID: repository.ID, ResolvedSHA: branch.SHA, ComposePath: source.composePath, WorkspaceState: WorkspaceStateMaterializing, ConfigurationRevisionID: configurationID.String, ConfigurationRevisionNumber: configurationNumber, DeploymentPlanRevisionID: deploymentPlanID.String, DeploymentPlanRevisionNumber: deploymentPlanNumber}, nil
 }
 
 func (m *Materializer) currentConfiguration(ctx context.Context, app string) (string, int64, error) {
@@ -534,11 +572,25 @@ func (m *Materializer) currentConfiguration(ctx context.Context, app string) (st
 	return id.String, number, err
 }
 
+func (m *Materializer) currentDeploymentPlan(ctx context.Context, app string) (sql.NullString, int64, error) {
+	var id sql.NullString
+	var number int64
+	err := m.db.QueryRowContext(ctx, `SELECT revision_id,revision_number FROM deployment_plan_heads WHERE app_id=?`, app).Scan(&id, &number)
+	return id, number, err
+}
+
 func nullableString(value sql.NullString) any {
 	if value.Valid {
 		return value.String
 	}
 	return nil
+}
+
+func nullablePlanNumber(id sql.NullString, number int64) any {
+	if !id.Valid || number == 0 {
+		return nil
+	}
+	return number
 }
 func (m *Materializer) refreshSource(ctx context.Context, app string, repository sourceconnections.SourceRepository, branch sourceconnections.Branch) error {
 	_, err := m.db.ExecContext(ctx, `UPDATE application_sources SET repository_owner=?,repository_name=?,resolved_sha=?,updated_at=? WHERE application_id=?`, repository.Owner, repository.Name, branch.SHA, m.now().UTC().Format(time.RFC3339Nano), app)
@@ -685,7 +737,74 @@ func archiveError(err error) string {
 	return "invalid_source"
 }
 func safeWorkspace(workspace, compose string) bool {
-	return safeSelectedCompose(workspace, compose) && treeHasExactPaths(workspace)
+	return safeImmutableWorkspace(workspace) && safeSelectedCompose(workspace, compose)
+}
+
+func safeImmutableWorkspace(workspace string) bool {
+	if workspace == "" || pathsecurity.RejectWindowsNamespace(workspace) || !filepath.IsAbs(workspace) || filepath.Clean(workspace) != workspace {
+		return false
+	}
+	info, err := os.Lstat(workspace)
+	return err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && !localPathIsReparsePoint(workspace) && treeHasExactPaths(workspace)
+}
+
+func (m *Materializer) validateMaterializedWorkspace(ctx context.Context, release Release, workspace string) error {
+	if release.ComposePath != "" {
+		return validateComposeWorkspace(workspace, release.ComposePath)
+	}
+	if release.DeploymentPlanRevisionID == "" || release.DeploymentPlanRevisionNumber < 1 {
+		return &Error{Code: "deployment_plan_review_required"}
+	}
+	inspection, err := sourceinspection.InspectLocalContext(ctx, workspace)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	}
+	if m.plans == nil {
+		return fmt.Errorf("%w: deployment plan reader", errLocal)
+	}
+	var stored int
+	err = m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM deployment_plan_revisions WHERE id=? AND app_id=? AND revision_number=? AND acceptance_status='accepted'`, release.DeploymentPlanRevisionID, release.AppID, release.DeploymentPlanRevisionNumber).Scan(&stored)
+	if err != nil {
+		return fmt.Errorf("%w: deployment plan lookup", errLocal)
+	}
+	if stored != 1 {
+		return &Error{Code: "deployment_plan_review_required"}
+	}
+	revision, err := m.plans.GetRevision(ctx, release.AppID, release.DeploymentPlanRevisionID, release.DeploymentPlanRevisionNumber)
+	if deploymentplans.IsCode(err, "deployment_plan_unavailable") {
+		return &Error{Code: "deployment_plan_review_required"}
+	}
+	if err != nil {
+		return fmt.Errorf("%w: deployment plan lookup", errLocal)
+	}
+	if revision.ID != release.DeploymentPlanRevisionID || revision.RevisionNumber != release.DeploymentPlanRevisionNumber || revision.Plan.Strategy != deploymentplans.StrategyGeneratedNode || revision.Plan.Source.Provider != release.SourceProvider || revision.Plan.Source.RepositoryID != release.RepositoryID {
+		return &Error{Code: "deployment_plan_review_required"}
+	}
+	if setup, explicit := deploymentplans.SetupFromPlan(revision.Plan); explicit {
+		inspection, err = sourceinspection.WithSetup(inspection, setup)
+		if err != nil {
+			return &Error{Code: "deployment_plan_review_required"}
+		}
+	} else if !hasGeneratedAnalysis(inspection.Analysis) {
+		return &Error{Code: "deployment_plan_review_required"}
+	}
+	differences, compareErr := deploymentplans.CompareAnalysis(revision.Plan, inspection.Analysis)
+	if compareErr != nil || len(differences) != 0 {
+		return &Error{Code: "deployment_plan_review_required"}
+	}
+	return nil
+}
+
+func hasGeneratedAnalysis(analysis projectanalysis.SourceAnalysis) bool {
+	for _, candidate := range analysis.Candidates {
+		if candidate.Kind == projectanalysis.PlanKindJavaScript && candidate.Status != projectanalysis.StatusUnsupported && len(candidate.Components) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func safeSelectedCompose(workspace, compose string) bool {

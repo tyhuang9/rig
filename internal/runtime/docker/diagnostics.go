@@ -50,6 +50,7 @@ type Checker struct {
 	Runner           Runner
 	CommandTimeout   time.Duration
 	DockerEndpoint   string
+	DockerExecutable string
 	ResourceRoot     string
 	CollectResources func(string) (HostResources, error)
 }
@@ -93,11 +94,15 @@ func (c Checker) Check(ctx context.Context, caddy bool) Diagnostics {
 	if resources, err := c.CollectResources(c.ResourceRoot); err == nil {
 		diagnostic.Resources = resources
 	}
-	path, err := c.Runner.LookPath("docker")
-	if err != nil {
-		diagnostic.DockerDetail = "Docker CLI not found"
-		diagnostic.ComposeDetail = "Docker Compose V2 is unavailable"
-		return withStartupLimitation(diagnostic)
+	path := c.DockerExecutable
+	if path == "" {
+		var err error
+		path, err = c.Runner.LookPath("docker")
+		if err != nil {
+			diagnostic.DockerDetail = "Docker CLI not found"
+			diagnostic.ComposeDetail = "Docker Compose V2 is unavailable"
+			return withStartupLimitation(diagnostic)
+		}
 	}
 	diagnostic.ClientAvailable = true
 	environment := map[string]string{}

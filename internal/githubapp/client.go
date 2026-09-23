@@ -110,6 +110,7 @@ type BranchPage struct {
 type TreeEntry struct {
 	Path string
 	Type string
+	Mode string
 	Size int64
 	SHA  string
 }
@@ -465,6 +466,7 @@ func (c *Client) Tree(ctx context.Context, accessToken, owner, repository, sha s
 		Tree      []struct {
 			Path string `json:"path"`
 			Type string `json:"type"`
+			Mode string `json:"mode"`
 			Size *int64 `json:"size"`
 			SHA  string `json:"sha"`
 		} `json:"tree"`
@@ -487,7 +489,7 @@ func (c *Client) Tree(ctx context.Context, accessToken, owner, repository, sha s
 				return Tree{}, &Error{Code: "invalid_response"}
 			}
 		}
-		result.Entries = append(result.Entries, TreeEntry{Path: item.Path, Type: item.Type, Size: size, SHA: item.SHA})
+		result.Entries = append(result.Entries, TreeEntry{Path: item.Path, Type: item.Type, Mode: item.Mode, Size: size, SHA: item.SHA})
 	}
 	return result, nil
 }
