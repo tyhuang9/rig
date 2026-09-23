@@ -1,0 +1,11 @@
+:root:not(.dark) {
+  --vp-button-brand-bg: #3451b2;
+  --vp-button-brand-hover-bg: #2d469c;
+  --vp-button-brand-active-bg: #253a82;
+}
+
+:root.dark {
+  --vp-button-brand-bg: #3451b2;
+  --vp-button-brand-hover-bg: #2d469c;
+  --vp-button-brand-active-bg: #253a82;
+}
