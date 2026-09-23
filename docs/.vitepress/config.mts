@@ -3,7 +3,7 @@ import { defineConfig } from "vitepress";
 export default defineConfig({
   lang: "en-US",
   title: "Rig",
-  description: "Local-first Docker Compose deployment management.",
+  description: "Local-first Docker Compose and generated application deployment management.",
   base: "/rig/",
   ignoreDeadLinks: false,
   markdown: {
@@ -32,6 +32,7 @@ export default defineConfig({
         text: "Operations",
         items: [
           { text: "Docker Compose runtime", link: "/compose-runtime" },
+          { text: "Generated JavaScript runtime", link: "/generated-runtime" },
           { text: "GitHub deployments", link: "/github-connected-deployments" },
           { text: "Webhook relay", link: "/relay-operations" },
         ],
@@ -42,6 +43,8 @@ export default defineConfig({
       { text: "Getting started", link: "/getting-started" },
       { text: "Connect GitHub", link: "/connect-github" },
       { text: "Docker Compose runtime", link: "/compose-runtime" },
+      { text: "Generated JavaScript runtime", link: "/generated-runtime" },
+      { text: "Editable deployment setup verification", link: "/deployment-setup-verification" },
       { text: "GitHub-connected deployments", link: "/github-connected-deployments" },
       { text: "Official webhook relay", link: "/relay-operations" },
     ],

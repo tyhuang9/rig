@@ -79,10 +79,17 @@ Paste the token into the dashboard and create the first administrator. The boots
 
 Fake-runtime jobs demonstrate durable progress and history, but they do not build, start, stop, or change a workload.
 
+## Choose a real execution path
+
+Rig keeps both real runtimes controller-local and disabled by default. Start with `--compose-runtime` to execute a reviewed Docker Compose application, or start with `--generated-runtime` to build and run a supported JavaScript or TypeScript application from an accepted editable setup. One controller can enable both real runtimes; neither can be combined with `--fake-runtime`.
+
+For generated applications, select **Analyze project** after choosing a local or GitHub source, edit the detected build and run settings as needed, then review and accept the setup before deployment. [Generated JavaScript runtime operations](./generated-runtime.md) defines the supported project shapes, Caddy ingress, resource limits, and runtime trust boundary. [Editable deployment setup verification](./deployment-setup-verification.md) describes the setup-specific invariants and verification scope.
+
 ## Choose the next step
 
 - To use a repository instead of a local folder, continue to [Connect GitHub](./connect-github.md).
 - Before allowing real execution, read [Docker Compose runtime operations](./compose-runtime.md) in full.
+- For a supported JavaScript or TypeScript application, read [Generated JavaScript runtime operations](./generated-runtime.md) before enabling its runtime.
 - For the terminal interface and automation commands, see the [project README](https://github.com/tyhuang9/rig#operator-and-contributor-commands).
 
 ::: danger Docker is a trust boundary
