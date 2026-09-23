@@ -4,11 +4,110 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hostd/hostd/internal/apicontract"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
+
+func (s *Server) getDefaultSourceConnection(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLocalSources(w, r) {
+		return
+	}
+	connection, configured, err := s.Sources.Default(r.Context(), sourceOwner(r))
+	if err != nil {
+		sourceProblem(w, r, err)
+		return
+	}
+	response := apicontract.DefaultSourceConnection{Configured: configured}
+	if configured {
+		value := contractSourceConnection(connection, s.Sources.InstallURL())
+		response.Connection = value
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"configured": false})
+}
+
+func (s *Server) startDefaultGitHubDeviceConnection(w http.ResponseWriter, r *http.Request) {
+	if !s.requireProviderSources(w, r) {
+		return
+	}
+	started, err := s.Sources.StartDefault(r.Context(), sourceOwner(r))
+	if err != nil {
+		sourceProblem(w, r, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusCreated, apicontract.GitHubConnectionAuthorization{
+		AuthorizationID: started.AuthorizationID, ConnectionID: started.ConnectionID, UserCode: started.UserCode,
+		VerificationUri: started.VerificationURI, InstallUrl: started.InstallURL, ExpiresAt: started.ExpiresAt.Format(time.RFC3339Nano),
+		PollIntervalSeconds: int(started.PollInterval / time.Second),
+	})
+}
+
+func (s *Server) pollDefaultGitHubDeviceConnection(w http.ResponseWriter, r *http.Request) {
+	if !s.requireProviderSources(w, r) {
+		return
+	}
+	owner, connectionID, authorizationID := sourceOwner(r), r.PathValue("connectionId"), r.PathValue("authorizationId")
+	result, err := s.Sources.PollDefault(r.Context(), owner, connectionID, authorizationID)
+	if err == nil {
+		writeJSON(w, http.StatusOK, contractAuthorizationStatus(result, s.Sources.InstallURL()))
+		return
+	}
+	var serviceError *sourceconnections.Error
+	if errors.As(err, &serviceError) && serviceError.Code == "authorization_pending" {
+		result, getErr := s.Sources.GetAuthorizationStatus(r.Context(), owner, connectionID, authorizationID)
+		if getErr != nil {
+			sourceProblem(w, r, getErr)
+			return
+		}
+		setRetryAfter(w, serviceError.RetryAfter)
+		writeJSON(w, http.StatusAccepted, contractAuthorizationStatus(result, s.Sources.InstallURL()))
+		return
+	}
+	if errors.As(err, &serviceError) && serviceError.Code == "poll_too_soon" {
+		setRetryAfter(w, serviceError.RetryAfter)
+	}
+	sourceProblem(w, r, err)
+}
+
+func (s *Server) listDefaultGitHubRepositories(w http.ResponseWriter, r *http.Request) {
+	if !s.requireProviderSources(w, r) {
+		return
+	}
+	page, ok := boundedQueryInteger(r, "page", 1, 1, 10000)
+	if !ok {
+		problem(w, r, http.StatusBadRequest, "invalid_request", "Page must be an integer between 1 and 10000", nil)
+		return
+	}
+	perPage, ok := boundedQueryInteger(r, "perPage", 30, 1, 100)
+	if !ok {
+		problem(w, r, http.StatusBadRequest, "invalid_request", "Per-page count must be an integer between 1 and 100", nil)
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if len(query) > 200 {
+		problem(w, r, http.StatusBadRequest, "invalid_request", "Repository search must be at most 200 characters", nil)
+		return
+	}
+	result, err := s.Sources.DefaultRepositories(r.Context(), sourceOwner(r), query, page, perPage)
+	if err != nil {
+		sourceProblem(w, r, err)
+		return
+	}
+	items := make([]apicontract.ConnectedGitHubRepository, 0, len(result.Repositories))
+	for _, repository := range result.Repositories {
+		items = append(items, apicontract.ConnectedGitHubRepository{
+			ConnectionID: repository.ConnectionID, InstallationID: repository.InstallationID, AccountLogin: repository.AccountLogin,
+			ID: repository.ID, Owner: repository.Owner, Name: repository.Name, DefaultBranch: repository.DefaultBranch,
+			Private: repository.Private, Archived: repository.Archived, Disabled: repository.Disabled,
+		})
+	}
+	writeJSON(w, http.StatusOK, apicontract.ConnectedGitHubRepositoryPage{Page: result.Page, PerPage: result.PerPage, TotalCount: result.TotalCount, Truncated: result.Truncated, Items: items})
+}
 
 func (s *Server) listSourceConnections(w http.ResponseWriter, r *http.Request) {
 	if !s.requireLocalSources(w, r) {
@@ -231,6 +330,12 @@ func sourceProblem(w http.ResponseWriter, r *http.Request, err error) {
 		status, detail = http.StatusGone, "GitHub authorization expired"
 	case "identity_already_connected":
 		status, detail = http.StatusConflict, "This GitHub identity already has an active local connection"
+	case "authorization_identity_mismatch":
+		status, detail = http.StatusConflict, "Use the GitHub identity already saved for this connection"
+	case "authorization_superseded":
+		status, detail = http.StatusConflict, "A newer GitHub authorization replaced this attempt"
+	case "authorization_failed":
+		status, detail = http.StatusConflict, "GitHub authorization could not be completed; reconnect and try again"
 	case "source_access_lost":
 		status, detail = http.StatusConflict, "GitHub source access was lost; authorize the connection again"
 	case "authentication_required":
@@ -247,6 +352,18 @@ func sourceProblem(w http.ResponseWriter, r *http.Request, err error) {
 		status, detail = http.StatusConflict, "Source connection is not in the required state"
 	}
 	problem(w, r, status, serviceError.Code, detail, nil)
+}
+
+func contractAuthorizationStatus(status sourceconnections.AuthorizationStatus, installURL string) apicontract.GitHubConnectionAuthorizationStatus {
+	result := apicontract.GitHubConnectionAuthorizationStatus{
+		AuthorizationID: status.Authorization.ID,
+		Status:          status.Authorization.Status,
+		Connection:      contractSourceConnection(status.Connection, installURL),
+	}
+	if !status.Authorization.NextPollAt.IsZero() {
+		result.NextPollAt = status.Authorization.NextPollAt.Format(time.RFC3339Nano)
+	}
+	return result
 }
 
 func contractSourceConnection(connection sourceconnections.Connection, installURL string) apicontract.SourceConnection {
