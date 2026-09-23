@@ -1,0 +1,13 @@
+:root { color: #172033; background: #f8fafc; font-family: Inter, system-ui, sans-serif; }
+body { margin: 0; }
+main { box-sizing: border-box; margin: 4rem auto; max-width: 42rem; padding: 2rem; }
+.eyebrow { color: #315d9d; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+dl { display: grid; gap: .5rem; }
+dl div { display: flex; gap: .75rem; }
+dt { font-weight: 700; }
+dd { margin: 0; }
+form { margin-top: 2rem; }
+.add-note { display: flex; gap: .5rem; margin-top: .5rem; }
+input { flex: 1; min-width: 0; padding: .6rem; }
+button { background: #0c4a6e; border: 0; color: white; cursor: pointer; padding: .6rem .9rem; }
+li { margin: .45rem 0; }

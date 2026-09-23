@@ -1,0 +1,16 @@
+{
+  "name": "rig-hosting-notes-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter @rig-hosting-notes/frontend build",
+    "start:api": "pnpm --filter @rig-hosting-notes/api start",
+    "start:web": "pnpm --filter @rig-hosting-notes/frontend preview",
+    "schema:prepare": "pnpm --filter @rig-hosting-notes/api schema:prepare",
+    "test": "pnpm --filter @rig-hosting-notes/api test"
+  }
+}
