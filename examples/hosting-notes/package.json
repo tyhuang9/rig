@@ -11,6 +11,7 @@
     "start:api": "pnpm --filter @rig-hosting-notes/api start",
     "start:web": "pnpm --filter @rig-hosting-notes/frontend preview",
     "schema:prepare": "pnpm --filter @rig-hosting-notes/api schema:prepare",
-    "test": "pnpm --filter @rig-hosting-notes/api test"
+    "test": "pnpm --filter @rig-hosting-notes/api test",
+    "test:https-local": "node harness/verify-local-https.mjs"
   }
 }

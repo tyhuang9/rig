@@ -39,6 +39,15 @@ controlled `https://https.fixture.test:55443/` endpoint,
 CA. The API sends the token only in the HTTPS authorization header and returns
 only a generic result. The stub rejects a missing or mismatched token.
 
+For an HTTPS-only local smoke without Docker, generate the test CA and run
+`pnpm test:https-local` from the fixture root. This starts the actual HTTPS
+stub on a temporary loopback port and calls the backend's HTTPS client with
+the test CA. It verifies a successful call and rejects a wrong token, missing
+CA, and wrong certificate hostname. The test maps the fixture hostname to
+loopback inside its request; it does not establish container bridge DNS or
+egress. The generated private keys stay in ignored `harness/certs` and should
+be removed after the smoke.
+
 Stop and remove only the known harness project after evidence is captured:
 
 ```sh

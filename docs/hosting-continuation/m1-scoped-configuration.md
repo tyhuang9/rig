@@ -48,6 +48,7 @@ published, merged, or deployed. M1's live exit gate remains open.
 | `scripts/check-generation.ps1` | Passed; OpenAPI routes and migration mirrors agree. |
 | `pnpm --dir web e2e` | Passed: 3 existing Chromium journeys. |
 | `examples/hosting-notes: pnpm test` and public-label `pnpm build` | Passed: 9 API tests, including no-network rejection of TLS-disable URL parameters, bounded HTTPS probe, and secret-safe responses; frontend fixture build passed. |
+| `examples/hosting-notes: pnpm test:https-local` | Passed after generating a disposable test CA with OpenSSL. The actual HTTPS stub and backend client completed a loopback TLS call; wrong token, missing CA, and wrong hostname were rejected. The generated private keys were then removed. Test-only DNS mapping did not exercise container bridge egress. |
 
 The security review identified a PostgreSQL URL TLS-parameter override, an
 empty legacy migration export with a nonempty allowlist, implicit legacy
@@ -70,7 +71,7 @@ the new plan and has storage/editor regression coverage.
 | CFG-07 | A focused executor test holds the source release constant, advances current configuration from revision 3 to 4, and verifies both the deployment pin and compiler input use revision 4. | Run same-source configuration-only redeploy against real Docker. |
 | CFG-09, CFG-10, CFG-11 | Literal-value, invalid-input, immutable storage, masking, admin/CSRF, and editor tests pass. | Run real controller/browser and temporary-file checks. |
 | CFG-13 | Approved migration allowlist, custom key names, missing/ambiguous key rejection, and short-lived runner tests pass. | Inspect a real migration container and approval journey. |
-| CFG-02 through CFG-05, CFG-12, CFG-14, CFG-15 | Fixture and supporting implementation exist; unit tests prove the HTTPS client requests verified TLS with server-only credentials and a total deadline, but no external request ran. | Live TLS PostgreSQL/HTTPS services, replacement/rotation/failure runs, private-build negative run, and crash cleanup are not verified. |
+| CFG-02 through CFG-05, CFG-12, CFG-14, CFG-15 | Fixture and supporting implementation exist; unit tests prove the HTTPS client requests verified TLS with server-only credentials and a total deadline. A real loopback HTTPS smoke with the actual stub passed positive and negative CA, token, and hostname cases. | Container bridge DNS/egress, TLS PostgreSQL, replacement/rotation/failure runs, private-build negative run, and crash cleanup are not verified. |
 
 Neither this Windows host nor its available WSL environment has a Docker or
 Podman CLI, so it cannot run BuildKit, a container,
