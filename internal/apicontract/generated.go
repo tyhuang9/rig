@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "1c8ec9ebe9b0973b5daf64ceeb0aecb42abb0a7b4c011175facb9731ff525477"
+const SourceSHA256 = "32c2f421e8a6ba1a5ade84bbe79da9d6dec56bb197de09f23abc85234c4429dd"
 
 var Operations = map[string]Operation{
 	"bootstrap":                       {Method: "POST", Path: "/api/v1/auth/bootstrap"},
@@ -528,6 +528,7 @@ type SourceConnection struct {
 	CredentialGeneration int64  `json:"credentialGeneration"`
 	DisconnectedAt       string `json:"disconnectedAt,omitempty"`
 	ID                   string `json:"id"`
+	InstallUrl           string `json:"installUrl,omitempty"`
 	LastErrorCode        string `json:"lastErrorCode,omitempty"`
 	NextPollAt           string `json:"nextPollAt,omitempty"`
 	PendingExpiresAt     string `json:"pendingExpiresAt,omitempty"`

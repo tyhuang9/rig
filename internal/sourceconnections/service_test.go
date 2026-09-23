@@ -38,6 +38,11 @@ type fakeProvider struct {
 	repositoryError    error
 	branchError        error
 	repositoryCalls    int
+	repositoryInstalls []int64
+	branchIdentities   [][2]string
+	treeIdentities     [][2]string
+	contentIdentities  [][2]string
+	archiveIdentities  [][2]string
 }
 
 func (provider *fakeProvider) StartDevice(context.Context) (githubapp.DeviceAuthorization, error) {
@@ -86,32 +91,43 @@ func (provider *fakeProvider) Repositories(context.Context, string, int64, int, 
 	provider.repositoryCalls++
 	return provider.repositoryPage, provider.repositoryError
 }
-func (provider *fakeProvider) Repository(context.Context, string, int64, int64) (githubapp.Repository, error) {
+func (provider *fakeProvider) Repository(_ context.Context, _ string, installationID, _ int64) (githubapp.Repository, error) {
 	provider.repositoryCalls++
+	provider.repositoryInstalls = append(provider.repositoryInstalls, installationID)
 	return provider.repository, provider.repositoryError
 }
-func (provider *fakeProvider) Branches(context.Context, string, int64, int, int) (githubapp.BranchPage, error) {
+func (provider *fakeProvider) Branches(_ context.Context, _, owner, repository string, _, _ int) (githubapp.BranchPage, error) {
+	provider.branchIdentities = append(provider.branchIdentities, [2]string{owner, repository})
 	return provider.branchPage, provider.branchError
 }
-func (provider *fakeProvider) Branch(context.Context, string, int64, string) (githubapp.Branch, error) {
+func (provider *fakeProvider) Branch(_ context.Context, _, owner, repository, _ string) (githubapp.Branch, error) {
+	provider.branchIdentities = append(provider.branchIdentities, [2]string{owner, repository})
 	return provider.branch, provider.branchError
 }
-func (provider *fakeProvider) Tree(context.Context, string, int64, string) (githubapp.Tree, error) {
+func (provider *fakeProvider) Tree(_ context.Context, _, owner, repository, _ string) (githubapp.Tree, error) {
+	provider.treeIdentities = append(provider.treeIdentities, [2]string{owner, repository})
 	return githubapp.Tree{}, nil
 }
-func (provider *fakeProvider) Content(context.Context, string, int64, string, string) ([]byte, error) {
+func (provider *fakeProvider) Content(_ context.Context, _, owner, repository, _, _ string) ([]byte, error) {
+	provider.contentIdentities = append(provider.contentIdentities, [2]string{owner, repository})
 	return nil, nil
 }
-func (provider *fakeProvider) Archive(context.Context, string, int64, string) (io.ReadCloser, error) {
+func (provider *fakeProvider) Archive(_ context.Context, _, owner, repository, _ string) (io.ReadCloser, error) {
+	provider.archiveIdentities = append(provider.archiveIdentities, [2]string{owner, repository})
 	return nil, nil
 }
 
 func TestDownloadArchiveRejectsNilProviderBody(t *testing.T) {
-	service, _, clock, _, _ := testService(t)
+	service, provider, clock, _, _ := testService(t)
 	connection := connectService(t, service, clock)
-	body, err := service.DownloadArchive(context.Background(), "owner", connection.ID, 7, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	repository := SourceRepository{ID: 7, Owner: "stale", Name: "stale"}
+	provider.repository = githubapp.Repository{ID: 7, Owner: "canonical", Name: "repository", DefaultBranch: "main"}
+	body, err := service.DownloadArchive(context.Background(), "owner", connection.ID, 9, repository, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	if body != nil || !IsCode(err, "provider_unavailable") {
 		t.Fatalf("body=%v err=%v", body, err)
+	}
+	if len(provider.archiveIdentities) != 1 || provider.archiveIdentities[0] != [2]string{"canonical", "repository"} {
+		t.Fatalf("archive identity = %#v", provider.archiveIdentities)
 	}
 }
 
@@ -193,6 +209,34 @@ func TestPollEnforcesTimingSlowDownAndFinalizesWithoutPersistingDeviceCode(t *te
 	assertSQLiteHasNoSentinels(t, db, "device-sensitive", "ghu_sensitive", "ghr_sensitive", "raw provider description")
 }
 
+func TestExpiredPollIsOwnerScopedPurgesDeviceSecretAndMarksTerminal(t *testing.T) {
+	service, provider, clock, _, store := testService(t)
+	started, err := service.Start(context.Background(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(15 * time.Minute)
+	if _, err := service.Poll(context.Background(), "other", started.ConnectionID); !IsCode(err, "connection_not_found") {
+		t.Fatalf("other owner poll = %v", err)
+	}
+	if _, err := store.ReadDevice(started.ConnectionID); err != nil {
+		t.Fatalf("other owner removed device credential: %v", err)
+	}
+	if _, err := service.Poll(context.Background(), "owner", started.ConnectionID); !IsCode(err, "authorization_expired") {
+		t.Fatalf("expired poll = %v", err)
+	}
+	if provider.pollCalls != 0 {
+		t.Fatalf("expired poll made %d provider calls", provider.pollCalls)
+	}
+	if _, err := store.ReadDevice(started.ConnectionID); err == nil {
+		t.Fatal("expired device credential remains")
+	}
+	connection, err := service.repository.Get(context.Background(), "owner", started.ConnectionID)
+	if err != nil || connection.Status != StatusExpired || connection.LastErrorCode != "authorization_expired" || connection.PendingExpiresAt != nil || connection.NextPollAt != nil {
+		t.Fatalf("expired connection = %#v, %v", connection, err)
+	}
+}
+
 func TestInstallationsRefreshesOnceOnUnauthorizedAndCachesOnlyReturnedPage(t *testing.T) {
 	service, provider, clock, db, _ := testService(t)
 	connection := connectService(t, service, clock)
@@ -257,18 +301,81 @@ func TestRepositoryBrowsingIsOwnerScopedAndResolvesRenamedRepositoryBranch(t *te
 	if err != nil || repository.Name != "renamed" || branch.SHA == "" {
 		t.Fatalf("resolve = %#v %#v err=%v", repository, branch, err)
 	}
+	staleIdentity := SourceRepository{ID: 77, Owner: "ui-supplied-owner", Name: "ui-supplied-name"}
+	if _, err := service.ReadTree(context.Background(), "owner", connection.ID, 9, staleIdentity, branch.SHA); err != nil {
+		t.Fatalf("read tree = %v", err)
+	}
+	if _, err := service.ReadContent(context.Background(), "owner", connection.ID, 9, staleIdentity, "compose.yaml", branch.SHA); err != nil {
+		t.Fatalf("read content = %v", err)
+	}
+	if len(provider.branchIdentities) != 2 || provider.branchIdentities[0] != [2]string{"new-owner", "renamed"} || provider.branchIdentities[1] != [2]string{"new-owner", "renamed"} {
+		t.Fatalf("canonical branch identities = %#v", provider.branchIdentities)
+	}
+	if len(provider.treeIdentities) != 1 || provider.treeIdentities[0] != [2]string{"new-owner", "renamed"} || len(provider.contentIdentities) != 1 || provider.contentIdentities[0] != [2]string{"new-owner", "renamed"} {
+		t.Fatalf("canonical read identities tree=%#v content=%#v", provider.treeIdentities, provider.contentIdentities)
+	}
+	if len(provider.repositoryInstalls) != 4 {
+		t.Fatalf("repository installation scope = %#v", provider.repositoryInstalls)
+	}
+	for _, installationID := range provider.repositoryInstalls {
+		if installationID != 9 {
+			t.Fatalf("repository escaped installation 9: %#v", provider.repositoryInstalls)
+		}
+	}
 }
 
-func TestRepositoryAccessLossAndProviderFailuresAreSanitized(t *testing.T) {
-	service, provider, clock, _, _ := testService(t)
+func TestRepositoryItemFailuresDoNotPurgeConnectionAndProviderFailuresAreSanitized(t *testing.T) {
+	service, provider, clock, _, store := testService(t)
 	connection := connectService(t, service, clock)
-	provider.repositoryError = &githubapp.Error{Code: "not_found"}
-	if _, err := service.Repositories(context.Background(), "owner", connection.ID, 9, 1, 30); !IsCode(err, "source_access_lost") {
-		t.Fatalf("access loss = %v", err)
+	for _, code := range []string{"not_found", "forbidden"} {
+		provider.repositoryError = &githubapp.Error{Code: code}
+		if _, err := service.Repository(context.Background(), "owner", connection.ID, 9, 77); !IsCode(err, "invalid_source") {
+			t.Fatalf("%s repository error = %v", code, err)
+		}
+		got, err := service.repository.Get(context.Background(), "owner", connection.ID)
+		if err != nil || got.Status != StatusConnected {
+			t.Fatalf("%s changed connection = %#v, %v", code, got, err)
+		}
+		if _, err := store.ReadBundle(connection.ID); err != nil {
+			t.Fatalf("%s purged credential: %v", code, err)
+		}
 	}
 	provider.repositoryError = errors.New("raw provider body secret")
 	if _, err := service.Repositories(context.Background(), "owner", connection.ID, 9, 1, 30); !IsCode(err, "provider_unavailable") || strings.Contains(err.Error(), "raw") {
 		t.Fatalf("provider error = %v", err)
+	}
+}
+
+func TestRepositoryOperationsRejectCrossInstallationAndItemFailuresWithoutPurging(t *testing.T) {
+	service, provider, clock, _, store := testService(t)
+	connection := connectService(t, service, clock)
+	provider.repository = githubapp.Repository{ID: 77, Owner: "canonical-owner", Name: "canonical-repo", DefaultBranch: "main"}
+	provider.branch = githubapp.Branch{Name: "main", SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+
+	if _, err := service.Repository(context.Background(), "owner", connection.ID, 9, 77); err != nil {
+		t.Fatalf("selected installation membership = %v", err)
+	}
+	provider.repositoryError = &githubapp.Error{Code: "not_found"}
+	if _, err := service.Branches(context.Background(), "owner", connection.ID, 10, 77, 1, 30); !IsCode(err, "invalid_source") {
+		t.Fatalf("cross-installation repository = %v", err)
+	}
+	if len(provider.branchIdentities) != 0 || provider.repositoryInstalls[len(provider.repositoryInstalls)-1] != 10 {
+		t.Fatalf("cross-installation lookup reached item route: installs=%#v branches=%#v", provider.repositoryInstalls, provider.branchIdentities)
+	}
+
+	provider.repositoryError = nil
+	for _, code := range []string{"not_found", "forbidden"} {
+		provider.branchError = &githubapp.Error{Code: code}
+		if _, _, err := service.Resolve(context.Background(), "owner", connection.ID, 9, 77, "main"); !IsCode(err, "invalid_source") {
+			t.Fatalf("%s item error = %v", code, err)
+		}
+	}
+	got, err := service.repository.Get(context.Background(), "owner", connection.ID)
+	if err != nil || got.Status != StatusConnected {
+		t.Fatalf("repository failure changed connection = %#v, %v", got, err)
+	}
+	if _, err := store.ReadBundle(connection.ID); err != nil {
+		t.Fatalf("repository failure purged bundle: %v", err)
 	}
 }
 

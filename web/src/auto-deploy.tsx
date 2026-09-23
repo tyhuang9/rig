@@ -332,7 +332,7 @@ export function AutoDeployPanel({
     busyReason ? busyReason :
     status.source.type !== "github" ? "Auto-deploy requires a GitHub source." :
     !composeRuntime ? "A compose runtime is required." :
-    !githubConnections ? "GitHub connections are unavailable on this controller." :
+    !githubConnections ? "GitHub connections are disabled by the administrator on this controller." :
     sourceConnections.isLoading ? "Checking the GitHub connection." :
     sourceConnectionsQueryError ? "The GitHub connection could not be checked." :
     !hasConnectedSource ? "Connect the GitHub source used by this application." :

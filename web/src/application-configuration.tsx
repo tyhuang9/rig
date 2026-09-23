@@ -251,7 +251,7 @@ function ApplicationConfigurationEditor({ appId }: { appId: string }) {
         <textarea id="repository-analysis-prompt" className="repository-analysis-prompt" readOnly value={repositoryAnalysisPrompt} aria-describedby="repository-analysis-help" />
       </details>
       <p className="repository-analysis-warning">External-provider access is governed by Codex or Claude. Exclude sensitive files before granting access, and review suggestions before applying them.</p>
-      <p id="repository-analysis-help" className="repository-analysis-help">To connect a GitHub source: Add application → select GitHub repository → Connect GitHub, then complete GitHub device authorization. This creates a new GitHub-source app and does not change this app’s source here. If GitHub is unavailable, an administrator must start Rig with both <code>--github-client-id</code> and <code>--github-app-slug</code>.</p>
+      <p id="repository-analysis-help" className="repository-analysis-help">To connect a GitHub source: Add application → select GitHub repository → Sign in to GitHub. Complete account authorization, then install or configure repository access for the personal account or organization that owns the repository. This creates a new GitHub-source app and does not change this app’s source here. GitHub connections are enabled by default. Administrators can opt out for a controller; if they are disabled, ask the administrator to enable them.</p>
       <p className="repository-analysis-feedback" aria-live="polite" aria-atomic="true">{copyFeedback}</p>
     </aside>
     <form onSubmit={save} noValidate aria-busy={busy}>

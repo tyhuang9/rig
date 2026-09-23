@@ -31,7 +31,7 @@ type failingSources struct {
 	err error
 }
 
-func (f *failingSources) DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error) {
+func (f *failingSources) DownloadArchive(context.Context, string, string, int64, sourceconnections.SourceRepository, string) (io.ReadCloser, error) {
 	return nil, f.err
 }
 
@@ -40,7 +40,7 @@ type archiveBodySources struct {
 	body io.ReadCloser
 }
 
-func (f *archiveBodySources) DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error) {
+func (f *archiveBodySources) DownloadArchive(context.Context, string, string, int64, sourceconnections.SourceRepository, string) (io.ReadCloser, error) {
 	return f.body, nil
 }
 
@@ -70,10 +70,10 @@ type coordinatedSources struct {
 func (f *coordinatedSources) Resolve(context.Context, string, string, int64, int64, string) (sourceconnections.SourceRepository, sourceconnections.Branch, error) {
 	return sourceconnections.SourceRepository{ID: 7, Owner: "renamed", Name: "repo"}, sourceconnections.Branch{Name: "main", SHA: snapshotSHA}, nil
 }
-func (f *coordinatedSources) ReadTree(context.Context, string, string, int64, string) (githubapp.Tree, error) {
+func (f *coordinatedSources) ReadTree(context.Context, string, string, int64, sourceconnections.SourceRepository, string) (githubapp.Tree, error) {
 	return githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "compose.yaml", Type: "blob", SHA: snapshotSHA}}}, nil
 }
-func (f *coordinatedSources) DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error) {
+func (f *coordinatedSources) DownloadArchive(context.Context, string, string, int64, sourceconnections.SourceRepository, string) (io.ReadCloser, error) {
 	f.mu.Lock()
 	f.calls++
 	call := f.calls
@@ -89,10 +89,10 @@ func (f *coordinatedSources) DownloadArchive(context.Context, string, string, in
 func (f *fakeSources) Resolve(context.Context, string, string, int64, int64, string) (sourceconnections.SourceRepository, sourceconnections.Branch, error) {
 	return sourceconnections.SourceRepository{ID: 7, Owner: "renamed", Name: "repo"}, sourceconnections.Branch{Name: "main", SHA: snapshotSHA}, nil
 }
-func (f *fakeSources) ReadTree(context.Context, string, string, int64, string) (githubapp.Tree, error) {
+func (f *fakeSources) ReadTree(context.Context, string, string, int64, sourceconnections.SourceRepository, string) (githubapp.Tree, error) {
 	return githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "compose.yaml", Type: "blob", SHA: snapshotSHA}}}, nil
 }
-func (f *fakeSources) DownloadArchive(context.Context, string, string, int64, string) (io.ReadCloser, error) {
+func (f *fakeSources) DownloadArchive(context.Context, string, string, int64, sourceconnections.SourceRepository, string) (io.ReadCloser, error) {
 	f.calls++
 	return io.NopCloser(bytes.NewReader(f.archive)), nil
 }

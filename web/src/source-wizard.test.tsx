@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { APIError, api } from "./api";
+import { APIError, api, type SourceConnection } from "./api";
 import { isDeviceAuthorizationExpired, SourceWizard } from "./source-wizard";
 
 const connection = {
@@ -18,6 +18,18 @@ const otherConnection = {
   id: "fedcba9876543210fedcba9876543210",
   providerLogin: "rig-backup",
 };
+
+function pendingConnection(overrides: Partial<SourceConnection> = {}): SourceConnection {
+  return {
+    ...connection,
+    status: "pending",
+    providerLogin: "",
+    pendingExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    nextPollAt: new Date(Date.now() + 5_000).toISOString(),
+    installUrl: "https://github.com/apps/rig/installations/new",
+    ...overrides,
+  };
+}
 
 function renderWizard() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -51,6 +63,21 @@ async function selectConnectedGitHub() {
   const connectionSelect = await screen.findByLabelText(/^github connection$/i);
   await screen.findByRole("option", { name: /@rig-admin/i });
   fireEvent.change(connectionSelect, { target: { value: connection.id } });
+}
+
+async function selectPendingGitHub(connectionId = connection.id) {
+  fireEvent.click(screen.getByLabelText(/^github repository$/i));
+  const connectionSelect = await screen.findByLabelText(/^github connection$/i);
+  await screen.findAllByRole("option", { name: /github connection \(pending\)/i });
+  connectionSelect.focus();
+  fireEvent.change(connectionSelect, { target: { value: connectionId } });
+}
+
+async function flushAsyncWork() {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
 }
 
 async function selectInstallation() {
@@ -215,7 +242,8 @@ describe("SourceWizard", () => {
     renderWizard();
     fireEvent.click(screen.getByLabelText(/github repository/i));
 
-    expect(await screen.findByText(/^github connections are unavailable$/i, { selector: "strong" })).toBeTruthy();
+    expect(await screen.findByText(/^github connections are disabled$/i, { selector: "strong" })).toBeTruthy();
+    expect(screen.getByText(/^the administrator disabled github connections on this controller\.$/i)).toBeTruthy();
     expect(api.sourceConnections).not.toHaveBeenCalled();
   });
 
@@ -228,7 +256,7 @@ describe("SourceWizard", () => {
     const capabilityStatus = screen.getByText(/^checking github connection capability\.$/i, { selector: ".capability-status" });
     expect(capabilityStatus.getAttribute("aria-live")).toBe("polite");
     await act(async () => capabilityResult.resolve({ capabilities: { githubConnections: false } } as never));
-    expect(await screen.findByText(/^github connections are unavailable\.$/i, { selector: ".capability-status" })).toBe(capabilityStatus);
+    expect(await screen.findByText(/^github connections are disabled\.$/i, { selector: ".capability-status" })).toBe(capabilityStatus);
   });
 
   it("announces a capability error after checking", async () => {
@@ -266,7 +294,7 @@ describe("SourceWizard", () => {
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
 
     expect(await screen.findByText(/controller status is temporarily unavailable/i)).toBeTruthy();
-    expect(screen.queryByText(/github connections are unavailable/i)).toBeNull();
+    expect(screen.queryByText(/github connections are disabled/i)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /retry capability check/i }));
     expect(await screen.findByLabelText(/^github connection$/i)).toBeTruthy();
   });
@@ -356,13 +384,17 @@ describe("SourceWizard", () => {
   });
 
   it("uses one persistent atomic live region from device instructions through connection", async () => {
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [{ ...connection, id: "new-connection" }] });
     vi.spyOn(api, "startGitHubConnection").mockResolvedValue({ connectionId: "new-connection", userCode: "ABCD-EFGH", verificationUri: "https://github.com/login/device", installUrl: "https://github.com/apps/rig/installations/new", expiresAt: "2099-01-01T00:00:00Z", pollIntervalSeconds: 1 });
     vi.spyOn(api, "pollGitHubConnection").mockResolvedValue({ ...connection, id: "new-connection", status: "connected" });
-    const { client } = renderWizard();
+    vi.mocked(api.githubInstallations)
+      .mockResolvedValueOnce({ page: 1, perPage: 30, totalCount: 0, items: [] })
+      .mockResolvedValueOnce({ page: 1, perPage: 30, totalCount: 1, items: [{ id: 10, accountLogin: "octo-org", accountType: "Organization", targetType: "Organization", repositorySelection: "selected", cachedAt: "2026-01-01T00:00:00Z" }] });
+    renderWizard();
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
     await screen.findByLabelText(/^github connection$/i);
     vi.useFakeTimers();
-    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sign in to github/i }));
     await vi.advanceTimersByTimeAsync(0);
 
     const code = screen.getByText("ABCD-EFGH");
@@ -370,23 +402,209 @@ describe("SourceWizard", () => {
     expect(liveRegion?.getAttribute("aria-live")).toBe("polite");
     expect(liveRegion?.getAttribute("aria-atomic")).toBe("true");
     expect(document.querySelectorAll(".connection-status[role='status']")).toHaveLength(1);
-    expect(screen.getByRole("link", { name: /open github device authorization \(opens in a new tab\)/i }).getAttribute("rel")).toBe("noreferrer");
-    expect(screen.getByRole("link", { name: /install or configure the rig github app \(opens in a new tab\)/i }).getAttribute("target")).toBe("_blank");
+    const signIn = screen.getByRole("link", { name: /sign in to github \(opens in a new tab\)/i });
+    expect(signIn.getAttribute("href")).toBe("https://github.com/login/device");
+    expect(signIn.getAttribute("rel")).toBe("noreferrer");
+    expect(screen.queryByRole("link", { name: /install or configure repository access/i })).toBeNull();
 
     await vi.advanceTimersByTimeAsync(1000);
     expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
     await vi.runOnlyPendingTimersAsync();
-    const connectedRegion = screen.getByText(/connection status: connected/i).closest("[role='status']");
+    vi.useRealTimers();
+    const connectedRegion = await screen.findByText(/step 1 complete: signed in to github/i).then((element) => element.closest("[role='status']"));
     expect(connectedRegion).toBe(liveRegion);
     expect(screen.queryByText("ABCD-EFGH")).toBeNull();
+    const install = screen.getByRole("link", { name: /install or configure repository access \(opens in a new tab\)/i });
+    expect(install.getAttribute("href")).toBe("https://github.com/apps/rig/installations/new");
+    expect(install.getAttribute("target")).toBe("_blank");
+    expect(screen.getByText(/choose the personal account or organization that owns the repository/i)).toBeTruthy();
+    expect(document.getElementById("github-save-help")?.textContent).toMatch(/install or configure repository access, then choose the github app installation/i);
     expect(document.querySelectorAll(".connection-status[role='status']")).toHaveLength(1);
 
-    await act(async () => {
-      client.setQueryData(["source-connections"], { items: [{ ...connection, id: "new-connection", status: "access_lost" }] });
-      await vi.runOnlyPendingTimersAsync();
-    });
-    const accessLostRegion = screen.getByText(/connection status: access lost/i).closest("[role='status']");
-    expect(accessLostRegion).toBe(liveRegion);
+    fireEvent.click(screen.getByRole("button", { name: /retry github app installation/i }));
+    await screen.findByRole("option", { name: /octo-org/i });
+    await waitFor(() => expect(screen.queryByRole("link", { name: /install or configure repository access/i })).toBeNull());
+    expect(screen.getByText(/connection status: connected/i).closest("[role='status']")).toBe(liveRegion);
+
+  });
+
+  it("resumes a pending authorization after reload, honors nextPollAt, and continues to installation", async () => {
+    const pending = pendingConnection({ nextPollAt: new Date(Date.now() + 30_000).toISOString() });
+    const connected = { ...connection, installUrl: pending.installUrl };
+    vi.mocked(api.sourceConnections).mockResolvedValueOnce({ items: [pending] }).mockResolvedValue({ items: [connected] });
+    vi.spyOn(api, "pollGitHubConnection").mockResolvedValue(connected);
+    vi.mocked(api.githubInstallations).mockResolvedValue({ page: 1, perPage: 30, totalCount: 0, items: [] });
+    renderWizard();
+    await selectPendingGitHub();
+
+    const resume = screen.getByRole("button", { name: /resume authorization check/i });
+    expect(resume).toBeTruthy();
+    expect(document.activeElement).toBe(resume);
+    expect(screen.getByText(/authorization started earlier/i)).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/USER-CODE|device-code-sentinel|verificationUri/i);
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    expect(screen.getByRole("button", { name: /checking authorization/i }).getAttribute("aria-disabled")).toBe("true");
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(api.pollGitHubConnection).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(api.pollGitHubConnection).toHaveBeenCalledWith(connection.id);
+    await vi.advanceTimersByTimeAsync(0);
+    await flushAsyncWork();
+
+    expect(screen.getByText(/step 1 complete: signed in to github/i)).toBeTruthy();
+    const install = screen.getByRole("link", { name: /install or configure repository access/i });
+    expect(install.getAttribute("href")).toBe(pending.installUrl);
+    expect(document.activeElement).toBe(install);
+    expect(document.body.textContent).not.toMatch(/USER-CODE|device-code-sentinel|verificationUri/i);
+  });
+
+  it("uses Retry-After when a resumed authorization is polled too soon", async () => {
+    const pending = pendingConnection({ nextPollAt: new Date(Date.now() - 1000).toISOString() });
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
+    vi.spyOn(api, "pollGitHubConnection")
+      .mockRejectedValueOnce(new APIError({ status: 429, code: "poll_too_soon", detail: "Try again shortly.", retryAfterSeconds: 9 }))
+      .mockResolvedValueOnce({ ...connection, installUrl: pending.installUrl });
+    renderWizard();
+    await selectPendingGitHub();
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(8_999);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
+  });
+
+  it("caps Retry-After at expiry and performs only one terminal reconciliation", async () => {
+    const pending = pendingConnection({ pendingExpiresAt: new Date(Date.now() + 30_000).toISOString(), nextPollAt: new Date(Date.now() - 1000).toISOString() });
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
+    vi.spyOn(api, "pollGitHubConnection")
+      .mockRejectedValueOnce(new APIError({ status: 429, code: "poll_too_soon", detail: "Try again shortly.", retryAfterSeconds: 120 }))
+      .mockRejectedValueOnce(new APIError({ status: 410, code: "authorization_expired", detail: "GitHub authorization expired." }));
+    renderWizard();
+    await selectPendingGitHub();
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flushAsyncWork();
+    await vi.advanceTimersByTimeAsync(0);
+    await flushAsyncWork();
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+  });
+
+  it("pauses a resumed authorization after a transient error and allows manual retry", async () => {
+    const pending = pendingConnection({ nextPollAt: new Date(Date.now() - 1000).toISOString() });
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
+    vi.spyOn(api, "pollGitHubConnection")
+      .mockRejectedValueOnce(new APIError({ status: 503, code: "provider_unavailable", detail: "GitHub is temporarily unavailable." }))
+      .mockResolvedValueOnce({ ...connection, installUrl: pending.installUrl });
+    renderWizard();
+    await selectPendingGitHub();
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    await flushAsyncWork();
+
+    expect(screen.getByText(/select resume authorization check to try again/i)).toBeTruthy();
+    const retry = screen.getByRole("button", { name: /resume authorization check/i });
+    expect(document.activeElement).toBe(retry);
+    fireEvent.click(retry);
+    await vi.advanceTimersByTimeAsync(0);
+    await flushAsyncWork();
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(/step 1 complete: signed in to github/i)).toBeTruthy();
+  });
+
+  it.each([
+    ["authorization_denied", "denied"],
+    ["identity_already_connected", "access_lost"],
+    ["invalid_connection_state", "access_lost"],
+  ] as const)("stops a resumed authorization on %s", async (code, status) => {
+    const pending = pendingConnection({ nextPollAt: new Date(Date.now() - 1000).toISOString() });
+    vi.mocked(api.sourceConnections)
+      .mockResolvedValueOnce({ items: [pending] })
+      .mockResolvedValue({ items: [{ ...pending, status }] });
+    vi.spyOn(api, "pollGitHubConnection").mockRejectedValue(new APIError({ status: code === "identity_already_connected" ? 409 : 400, code, detail: "Authorization cannot continue." }));
+    renderWizard();
+    await selectPendingGitHub();
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    await flushAsyncWork();
+
+    expect(screen.getByText(new RegExp(`connection status: ${status.replace("_", " ")}`, "i"))).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByLabelText(/^github connection$/i));
+    expect(api.pollGitHubConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles an already-expired raw pending connection exactly once without offering Resume", async () => {
+    const pending = pendingConnection({ pendingExpiresAt: new Date(Date.now() - 1000).toISOString(), nextPollAt: new Date(Date.now() - 2000).toISOString() });
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
+    const poll = vi.spyOn(api, "pollGitHubConnection").mockRejectedValue(new APIError({ status: 410, code: "authorization_expired", detail: "GitHub authorization expired." }));
+    renderWizard();
+    await selectPendingGitHub();
+
+    expect(screen.getByText(/connection status: expired/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByLabelText(/^github connection$/i));
+    await waitFor(() => expect(poll).toHaveBeenCalledTimes(1));
+    expect(poll).toHaveBeenCalledWith(pending.id);
+    await act(async () => new Promise((resolve) => window.setTimeout(resolve, 20)));
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+  });
+
+  it.each([
+    new APIError({ status: 503, code: "provider_unavailable", detail: "GitHub is temporarily unavailable." }),
+    new APIError({ status: 429, code: "poll_too_soon", detail: "Try again shortly.", retryAfterSeconds: 30 }),
+  ])("pauses an expired reconciliation after %s and retries only on explicit action", async (firstError) => {
+    const pending = pendingConnection({ pendingExpiresAt: new Date(Date.now() - 1000).toISOString(), nextPollAt: new Date(Date.now() + 30_000).toISOString() });
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pending] });
+    const poll = vi.spyOn(api, "pollGitHubConnection")
+      .mockRejectedValueOnce(firstError)
+      .mockRejectedValueOnce(new APIError({ status: 410, code: "authorization_expired", detail: "GitHub authorization expired." }));
+    renderWizard();
+    await selectPendingGitHub();
+
+    await waitFor(() => expect(poll).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+    const retry = await screen.findByRole("button", { name: /retry authorization status/i });
+    retry.focus();
+    fireEvent.click(retry);
+    await waitFor(() => expect(poll).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("button", { name: /retry authorization status/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /resume authorization check/i })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByLabelText(/^github connection$/i));
+  });
+
+  it("ignores a resumed poll completion after another pending connection is selected", async () => {
+    const pendingA = pendingConnection({ nextPollAt: new Date(Date.now() - 1000).toISOString() });
+    const pendingB = pendingConnection({ id: otherConnection.id, nextPollAt: new Date(Date.now() - 1000).toISOString() });
+    const poll = deferred<Awaited<ReturnType<typeof api.pollGitHubConnection>>>();
+    vi.mocked(api.sourceConnections).mockResolvedValue({ items: [pendingA, pendingB] });
+    vi.spyOn(api, "pollGitHubConnection").mockReturnValue(poll.promise);
+    renderWizard();
+    await selectPendingGitHub(pendingA.id);
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: /resume authorization check/i }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.pollGitHubConnection).toHaveBeenCalledWith(pendingA.id);
+
+    fireEvent.change(screen.getByLabelText(/^github connection$/i), { target: { value: pendingB.id } });
+    await act(async () => poll.resolve({ ...connection, id: pendingA.id, installUrl: pendingA.installUrl }));
+    expect((screen.getByLabelText(/^github connection$/i) as HTMLSelectElement).value).toBe(pendingB.id);
+    expect(screen.queryByText(/step 1 complete: signed in to github/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /resume authorization check/i })).toBeTruthy();
   });
 
   it("disables every connection action while one mutation is pending", async () => {
@@ -397,11 +615,11 @@ describe("SourceWizard", () => {
     await screen.findByRole("button", { name: /refresh connection/i });
     fireEvent.click(screen.getByRole("button", { name: /refresh connection/i }));
 
-    await waitFor(() => expect((screen.getByRole("button", { name: /connect github/i }) as HTMLButtonElement).disabled).toBe(true));
+    await waitFor(() => expect((screen.getByRole("button", { name: /sign in to github/i }) as HTMLButtonElement).disabled).toBe(true));
     expect((screen.getByRole("button", { name: /refreshing/i }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: /disconnect/i }) as HTMLButtonElement).disabled).toBe(true);
     resolveRefresh?.(connection);
-    await waitFor(() => expect((screen.getByRole("button", { name: /connect github/i }) as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole("button", { name: /sign in to github/i }) as HTMLButtonElement).disabled).toBe(false));
   });
 
   it("ignores a refresh completion after selecting another connection", async () => {
@@ -448,7 +666,7 @@ describe("SourceWizard", () => {
     renderWizard();
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
     await screen.findByLabelText(/^github connection$/i);
-    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sign in to github/i }));
 
     if (destination === "local source") {
       fireEvent.click(screen.getByLabelText(/^local folder$/i));
@@ -482,7 +700,7 @@ describe("SourceWizard", () => {
     await screen.findByLabelText(/^github connection$/i);
     vi.useFakeTimers();
 
-    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sign in to github/i }));
     await vi.advanceTimersByTimeAsync(0);
     expect(screen.getByText("CODE-A")).toBeTruthy();
     await vi.advanceTimersByTimeAsync(1000);
@@ -490,7 +708,7 @@ describe("SourceWizard", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /^disconnect$/i }));
     await vi.advanceTimersByTimeAsync(0);
-    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sign in to github/i }));
     await vi.advanceTimersByTimeAsync(0);
     expect(screen.getByText("CODE-B")).toBeTruthy();
     await vi.advanceTimersByTimeAsync(1000);
@@ -503,21 +721,21 @@ describe("SourceWizard", () => {
     expect(api.pollGitHubConnection).toHaveBeenCalledTimes(2);
   });
 
-  it("treats an invalid device expiration as terminal and never polls", async () => {
+  it("reconciles an invalid device expiration once and treats authorization_expired as terminal", async () => {
     vi.spyOn(api, "startGitHubConnection").mockResolvedValue({ connectionId: "new-connection", userCode: "ABCD-EFGH", verificationUri: "https://github.com/login/device", installUrl: "https://github.com/apps/rig/installations/new", expiresAt: "invalid", pollIntervalSeconds: 5 });
-    const poll = vi.spyOn(api, "pollGitHubConnection");
+    const poll = vi.spyOn(api, "pollGitHubConnection").mockRejectedValue(new APIError({ status: 410, code: "authorization_expired", detail: "GitHub authorization expired." }));
     renderWizard();
     fireEvent.click(screen.getByLabelText(/^github repository$/i));
     await screen.findByLabelText(/^github connection$/i);
     const connectionRegion = document.querySelector(".connection-status[role='status']");
     if (!connectionRegion) throw new Error("Expected persistent connection status region");
-    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sign in to github/i }));
 
     const expiration = await screen.findByText(/github authorization expired/i);
     expect(expiration.closest("[role='status']")).toBe(connectionRegion);
     expect(connectionRegion.textContent).toMatch(/connection status: expired/i);
     expect(screen.queryByText("ABCD-EFGH")).toBeNull();
-    expect(poll).not.toHaveBeenCalled();
+    expect(poll).toHaveBeenCalledTimes(1);
   });
 
   it("shows recovery guidance when no installations are available", async () => {
@@ -528,7 +746,7 @@ describe("SourceWizard", () => {
     await selectConnectedGitHub();
 
     expect(await screen.findByText(/no github app installations found/i)).toBeTruthy();
-    expect(screen.getByText(/install or configure the rig github app, then retry/i)).toBeTruthy();
+    expect(screen.getByText(/sign in to github again to install or configure repository access, then retry/i)).toBeTruthy();
     const installation = screen.getByLabelText(/^github app installation$/i) as HTMLSelectElement;
     expect(installation.disabled).toBe(true);
     expect(screen.queryByRole("navigation", { name: /github app installations pagination/i })).toBeNull();
@@ -577,9 +795,13 @@ describe("SourceWizard", () => {
     expect(screen.queryByRole("navigation", { name: /branches pagination/i })).toBeNull();
   });
 
-  it("does not report a clean discovery with no Compose candidates as successful", async () => {
-    vi.mocked(api.inspect).mockResolvedValueOnce({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: [], services: [], findings: [] });
+  it("normalizes null inspection collections into the no-Compose state without enabling save", async () => {
+    vi.mocked(api.inspect).mockRestore();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: null, services: null, findings: null }), { status: 200 }),
+    ));
     renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "GitHub app" } });
     await selectConnectedGitHub();
     await selectInstallation();
     await selectRepository();
@@ -589,9 +811,34 @@ describe("SourceWizard", () => {
     const emptyResult = (await screen.findByText(/no compose files found/i)).closest("[role='status']");
     expect(emptyResult?.getAttribute("aria-live")).toBe("polite");
     expect(emptyResult?.getAttribute("aria-atomic")).toBe("true");
-    expect(emptyResult?.textContent).toMatch(/add a compose file to the tracked branch, then inspect again/i);
+    expect(screen.getByText("Add a Compose file to the tracked branch, then inspect again.")).toBeTruthy();
+    expect(screen.getByText("Add a Compose file to the tracked branch, then inspect again before saving.")).toBeTruthy();
     expect(screen.queryByText(/source inspection completed/i)).toBeNull();
+    expect(screen.queryByText(/ready to save/i)).toBeNull();
     expect(screen.queryByLabelText(/^compose file$/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /save application/i }).hasAttribute("disabled")).toBe(true);
+    expect(api.createApp).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when findings is a present malformed collection", async () => {
+    vi.mocked(api.inspect).mockRestore();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ source: { type: "github" }, resolvedSha: "abc123", composeCandidates: ["compose.yaml"], services: [], findings: { code: "hidden_finding" } }), { status: 200 }),
+    ));
+    renderWizard();
+    fireEvent.change(screen.getByLabelText(/application name/i), { target: { value: "GitHub app" } });
+    await selectConnectedGitHub();
+    await selectInstallation();
+    await selectRepository();
+    await selectBranch();
+    fireEvent.click(screen.getByRole("button", { name: /find compose files/i }));
+
+    expect(await screen.findByText("The controller returned an invalid source inspection response.")).toBeTruthy();
+    expect(screen.queryByText(/source inspection completed/i)).toBeNull();
+    expect(screen.queryByText(/ready to save/i)).toBeNull();
+    expect(screen.queryByLabelText(/^compose file$/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /save application/i }).hasAttribute("disabled")).toBe(true);
+    expect(api.createApp).not.toHaveBeenCalled();
   });
 
   it.each(["success", "error"] as const)("ignores a stale GitHub inspection %s after an upstream branch change", async (outcome) => {
@@ -864,7 +1111,7 @@ describe("SourceWizard", () => {
     await waitFor(() => expect(api.githubInstallations).toHaveBeenLastCalledWith(connection.id, 2, 30));
 
     vi.useFakeTimers();
-    fireEvent.click(screen.getByRole("button", { name: /connect github/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sign in to github/i }));
     await vi.advanceTimersByTimeAsync(0);
     expect(screen.getByText(/ABCD-EFGH/)).toBeTruthy();
     await vi.advanceTimersByTimeAsync(5000);

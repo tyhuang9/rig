@@ -19,7 +19,7 @@ func (s *Server) listSourceConnections(w http.ResponseWriter, r *http.Request) {
 		sourceProblem(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, apicontract.SourceConnectionList{Items: contractSourceConnections(connections)})
+	writeJSON(w, http.StatusOK, apicontract.SourceConnectionList{Items: contractSourceConnections(connections, s.Sources.InstallURL())})
 }
 
 func (s *Server) startGitHubDeviceConnection(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +45,7 @@ func (s *Server) pollGitHubDeviceConnection(w http.ResponseWriter, r *http.Reque
 	owner, id := sourceOwner(r), r.PathValue("connectionId")
 	connection, err := s.Sources.Poll(r.Context(), owner, id)
 	if err == nil {
-		writeJSON(w, http.StatusOK, contractSourceConnection(connection))
+		writeJSON(w, http.StatusOK, contractSourceConnection(connection, s.Sources.InstallURL()))
 		return
 	}
 	var serviceError *sourceconnections.Error
@@ -56,7 +56,7 @@ func (s *Server) pollGitHubDeviceConnection(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		setRetryAfter(w, serviceError.RetryAfter)
-		writeJSON(w, http.StatusAccepted, contractSourceConnection(pending))
+		writeJSON(w, http.StatusAccepted, contractSourceConnection(pending, s.Sources.InstallURL()))
 		return
 	}
 	if errors.As(err, &serviceError) && serviceError.Code == "poll_too_soon" {
@@ -74,7 +74,7 @@ func (s *Server) refreshSourceConnection(w http.ResponseWriter, r *http.Request)
 		sourceProblem(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, contractSourceConnection(connection))
+	writeJSON(w, http.StatusOK, contractSourceConnection(connection, s.Sources.InstallURL()))
 }
 
 func (s *Server) disconnectSourceConnection(w http.ResponseWriter, r *http.Request) {
@@ -249,8 +249,8 @@ func sourceProblem(w http.ResponseWriter, r *http.Request, err error) {
 	problem(w, r, status, serviceError.Code, detail, nil)
 }
 
-func contractSourceConnection(connection sourceconnections.Connection) apicontract.SourceConnection {
-	result := apicontract.SourceConnection{ID: connection.ID, Provider: "github", Status: connection.Status, ProviderUserID: connection.ProviderUserID, ProviderLogin: connection.ProviderLogin, CredentialGeneration: connection.CredentialGeneration, LastErrorCode: connection.LastErrorCode, CreatedAt: connection.CreatedAt.Format(time.RFC3339Nano), UpdatedAt: connection.UpdatedAt.Format(time.RFC3339Nano)}
+func contractSourceConnection(connection sourceconnections.Connection, installURL string) apicontract.SourceConnection {
+	result := apicontract.SourceConnection{ID: connection.ID, Provider: "github", Status: connection.Status, ProviderUserID: connection.ProviderUserID, ProviderLogin: connection.ProviderLogin, CredentialGeneration: connection.CredentialGeneration, InstallUrl: installURL, LastErrorCode: connection.LastErrorCode, CreatedAt: connection.CreatedAt.Format(time.RFC3339Nano), UpdatedAt: connection.UpdatedAt.Format(time.RFC3339Nano)}
 	for value, target := range map[*time.Time]*string{connection.PendingExpiresAt: &result.PendingExpiresAt, connection.NextPollAt: &result.NextPollAt, connection.AccessExpiresAt: &result.AccessExpiresAt, connection.RefreshExpiresAt: &result.RefreshExpiresAt, connection.ConnectedAt: &result.ConnectedAt, connection.DisconnectedAt: &result.DisconnectedAt} {
 		if value != nil {
 			*target = value.Format(time.RFC3339Nano)
@@ -259,10 +259,10 @@ func contractSourceConnection(connection sourceconnections.Connection) apicontra
 	return result
 }
 
-func contractSourceConnections(connections []sourceconnections.Connection) []apicontract.SourceConnection {
+func contractSourceConnections(connections []sourceconnections.Connection, installURL string) []apicontract.SourceConnection {
 	result := make([]apicontract.SourceConnection, 0, len(connections))
 	for _, connection := range connections {
-		result = append(result, contractSourceConnection(connection))
+		result = append(result, contractSourceConnection(connection, installURL))
 	}
 	return result
 }

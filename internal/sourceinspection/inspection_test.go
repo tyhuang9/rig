@@ -18,16 +18,23 @@ type fakeReader struct {
 	repository   sourceconnections.SourceRepository
 	branch       sourceconnections.Branch
 	contentReads int
+	treeScope    sourceconnections.SourceRepository
+	contentScope sourceconnections.SourceRepository
+	installation int64
 }
 
 func (reader *fakeReader) Resolve(context.Context, string, string, int64, int64, string) (sourceconnections.SourceRepository, sourceconnections.Branch, error) {
 	return reader.repository, reader.branch, nil
 }
-func (reader *fakeReader) ReadTree(context.Context, string, string, int64, string) (githubapp.Tree, error) {
+func (reader *fakeReader) ReadTree(_ context.Context, _, _ string, installation int64, repository sourceconnections.SourceRepository, _ string) (githubapp.Tree, error) {
+	reader.installation = installation
+	reader.treeScope = repository
 	return reader.tree, nil
 }
-func (reader *fakeReader) ReadContent(_ context.Context, _ string, _ string, _ int64, path, _ string) ([]byte, error) {
+func (reader *fakeReader) ReadContent(_ context.Context, _ string, _ string, installation int64, repository sourceconnections.SourceRepository, path, _ string) ([]byte, error) {
 	reader.contentReads++
+	reader.installation = installation
+	reader.contentScope = repository
 	return reader.content, nil
 }
 
@@ -42,6 +49,9 @@ func TestInspectGithubResolvesRenameAndReadsOnlySelectedCompose(t *testing.T) {
 	}
 	if reader.contentReads != 1 || len(result.ComposeCandidates) != 2 || len(result.Services) != 2 {
 		t.Fatalf("result=%#v reads=%d", result, reader.contentReads)
+	}
+	if reader.installation != 7 || reader.treeScope != reader.repository || reader.contentScope != reader.repository {
+		t.Fatalf("canonical repository scope not propagated: installation=%d tree=%#v content=%#v", reader.installation, reader.treeScope, reader.contentScope)
 	}
 	if len(result.Findings) != 0 {
 		t.Fatalf("findings=%#v", result.Findings)

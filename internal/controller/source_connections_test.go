@@ -65,16 +65,16 @@ func (provider *controllerProvider) Repositories(context.Context, string, int64,
 func (provider *controllerProvider) Repository(context.Context, string, int64, int64) (githubapp.Repository, error) {
 	return provider.repository, nil
 }
-func (provider *controllerProvider) Branches(context.Context, string, int64, int, int) (githubapp.BranchPage, error) {
+func (provider *controllerProvider) Branches(context.Context, string, string, string, int, int) (githubapp.BranchPage, error) {
 	return provider.branchPage, nil
 }
-func (provider *controllerProvider) Branch(context.Context, string, int64, string) (githubapp.Branch, error) {
+func (provider *controllerProvider) Branch(context.Context, string, string, string, string) (githubapp.Branch, error) {
 	return provider.branch, nil
 }
-func (provider *controllerProvider) Tree(context.Context, string, int64, string) (githubapp.Tree, error) {
+func (provider *controllerProvider) Tree(context.Context, string, string, string, string) (githubapp.Tree, error) {
 	return provider.tree, nil
 }
-func (provider *controllerProvider) Content(context.Context, string, int64, string, string) ([]byte, error) {
+func (provider *controllerProvider) Content(context.Context, string, string, string, string, string) ([]byte, error) {
 	return provider.content, nil
 }
 
@@ -166,8 +166,6 @@ func TestGitHubRepositoryBranchInspectionAndApplicationCreationAPI(t *testing.T)
 	harness.provider.repositoryPage = githubapp.RepositoryPage{TotalCount: 1, Repositories: []githubapp.Repository{harness.provider.repository}}
 	harness.provider.branch = githubapp.Branch{Name: "feature/slash", SHA: sha, Protected: true}
 	harness.provider.branchPage = githubapp.BranchPage{Branches: []githubapp.Branch{harness.provider.branch}}
-	harness.provider.tree = githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "deploy/compose.yaml", Type: "blob", SHA: sha}}}
-	harness.provider.content = []byte("services:\n  api:\n    image: example/api\n")
 	base := "/api/v1/source-connections/" + connection.ID + "/github/installations/9/repositories"
 	repositories := sourceRequest(harness.handler, harness.session, http.MethodGet, base+"?page=1&perPage=30", "", true)
 	if repositories.Code != http.StatusOK || !strings.Contains(repositories.Body.String(), `"owner":"new-owner"`) {
@@ -177,11 +175,20 @@ func TestGitHubRepositoryBranchInspectionAndApplicationCreationAPI(t *testing.T)
 	if branches.Code != http.StatusOK || !strings.Contains(branches.Body.String(), `"name":"feature/slash"`) {
 		t.Fatalf("branches=%d %s", branches.Code, branches.Body.String())
 	}
+	githubDiscoveryJSON := `{"connectionId":"` + connection.ID + `","installationId":9,"repositoryId":77,"branch":"feature/slash"}`
+	noCompose := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps/import/inspect", `{"githubSource":`+githubDiscoveryJSON+`}`, true)
+	if noCompose.Code != http.StatusOK || !strings.Contains(noCompose.Body.String(), `"code":"compose_not_found"`) {
+		t.Fatalf("GitHub no-Compose inspect=%d %s", noCompose.Code, noCompose.Body.String())
+	}
+	assertInspectionCollections(t, noCompose, map[string]bool{"composeCandidates": true, "services": true})
+	harness.provider.tree = githubapp.Tree{Entries: []githubapp.TreeEntry{{Path: "deploy/compose.yaml", Type: "blob", SHA: sha}}}
+	harness.provider.content = []byte("services:\n  api:\n    image: example/api\n")
 	githubJSON := `{"connectionId":"` + connection.ID + `","installationId":9,"repositoryId":77,"branch":"feature/slash","composePath":"deploy/compose.yaml"}`
 	inspected := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps/import/inspect", `{"githubSource":`+githubJSON+`}`, true)
 	if inspected.Code != http.StatusOK || !strings.Contains(inspected.Body.String(), `"resolvedSha":"`+sha+`"`) || !strings.Contains(inspected.Body.String(), `"name":"api"`) {
 		t.Fatalf("inspect=%d %s", inspected.Code, inspected.Body.String())
 	}
+	assertInspectionCollections(t, inspected, map[string]bool{"findings": true})
 	created := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps", `{"name":"GitHub App","githubSource":`+githubJSON+`}`, true)
 	if created.Code != http.StatusCreated || !strings.Contains(created.Body.String(), `"repositoryName":"renamed"`) {
 		t.Fatalf("create=%d %s", created.Code, created.Body.String())
@@ -205,6 +212,31 @@ func TestInspectRequiresExactlyOneSourceAndLocalInspectionRemainsUseful(t *testi
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"name":"local"`) {
 		t.Fatalf("local=%d %s", response.Code, response.Body.String())
 	}
+	assertInspectionCollections(t, response, map[string]bool{"findings": true})
+
+	empty := t.TempDir()
+	noCompose := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/apps/import/inspect", `{"sourcePath":`+strconv.Quote(empty)+`}`, true)
+	if noCompose.Code != http.StatusOK || !strings.Contains(noCompose.Body.String(), `"code":"compose_not_found"`) {
+		t.Fatalf("local no-Compose=%d %s", noCompose.Code, noCompose.Body.String())
+	}
+	assertInspectionCollections(t, noCompose, map[string]bool{"composeCandidates": true, "services": true})
+}
+
+func assertInspectionCollections(t *testing.T, response *httptest.ResponseRecorder, empty map[string]bool) {
+	t.Helper()
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode inspection response: %v", err)
+	}
+	for _, field := range []string{"composeCandidates", "services", "findings"} {
+		value, ok := body[field]
+		if !ok || len(value) == 0 || value[0] != '[' {
+			t.Fatalf("inspection %s is not an array: %s", field, value)
+		}
+		if empty[field] && string(value) != "[]" {
+			t.Fatalf("inspection %s = %s, want []", field, value)
+		}
+	}
 }
 
 func TestSourceConnectionAPIUsesNoStoreOwnerScopeAndFixedSafeProblems(t *testing.T) {
@@ -224,6 +256,11 @@ func TestSourceConnectionAPIUsesNoStoreOwnerScopeAndFixedSafeProblems(t *testing
 		t.Fatalf("start body = %s", started.Body.String())
 	}
 	assertAbsent(t, started.Body.String()+harness.logs.String(), "device-code-sentinel", "ghu_api_sentinel", "ghr_api_sentinel", "raw provider description")
+	listed := sourceRequest(harness.handler, harness.session, http.MethodGet, "/api/v1/source-connections", "", true)
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"installUrl":"https://github.com/apps/hostd-app/installations/new"`) || !strings.Contains(listed.Body.String(), `"pendingExpiresAt"`) || !strings.Contains(listed.Body.String(), `"nextPollAt"`) {
+		t.Fatalf("pending connection metadata = %d %s", listed.Code, listed.Body.String())
+	}
+	assertAbsent(t, listed.Body.String()+harness.logs.String(), "USER-CODE", "userCode", "verificationUri", "device-code-sentinel", "ghu_api_sentinel", "ghr_api_sentinel")
 	enabledStatus := sourceRequest(harness.handler, harness.session, http.MethodGet, "/api/v1/system/status", "", true)
 	if !strings.Contains(enabledStatus.Body.String(), `"githubConnections":true`) {
 		t.Fatalf("enabled capability = %s", enabledStatus.Body.String())
@@ -236,6 +273,10 @@ func TestSourceConnectionAPIUsesNoStoreOwnerScopeAndFixedSafeProblems(t *testing
 	otherDelete := sourceRequest(harness.handler, harness.otherSession, http.MethodDelete, "/api/v1/source-connections/"+body.ConnectionID, "", true)
 	if otherDelete.Code != http.StatusNotFound {
 		t.Fatalf("other owner delete = %d %s", otherDelete.Code, otherDelete.Body.String())
+	}
+	otherPoll := sourceRequest(harness.handler, harness.otherSession, http.MethodPost, "/api/v1/source-connections/"+body.ConnectionID+"/device/poll", "", true)
+	if otherPoll.Code != http.StatusNotFound || harness.provider.pollCalls != 0 {
+		t.Fatalf("other owner poll = %d calls=%d body=%s", otherPoll.Code, harness.provider.pollCalls, otherPoll.Body.String())
 	}
 
 	invalidPage := sourceRequest(harness.handler, harness.session, http.MethodGet, "/api/v1/source-connections/"+body.ConnectionID+"/github/installations?perPage=101", "", true)
@@ -253,7 +294,10 @@ func TestSourceConnectionAPIUsesNoStoreOwnerScopeAndFixedSafeProblems(t *testing
 	if pending.Code != http.StatusAccepted || pending.Header().Get("Retry-After") == "" || !strings.Contains(pending.Body.String(), `"status":"pending"`) {
 		t.Fatalf("pending poll = %d retry=%q body=%s", pending.Code, pending.Header().Get("Retry-After"), pending.Body.String())
 	}
-	assertAbsent(t, pending.Body.String()+harness.logs.String(), "device-code-sentinel", "ghu_api_sentinel", "ghr_api_sentinel", "raw provider description")
+	if !strings.Contains(pending.Body.String(), `"installUrl":"https://github.com/apps/hostd-app/installations/new"`) {
+		t.Fatalf("pending poll install URL = %s", pending.Body.String())
+	}
+	assertAbsent(t, pending.Body.String()+harness.logs.String(), "USER-CODE", "userCode", "verificationUri", "device-code-sentinel", "ghu_api_sentinel", "ghr_api_sentinel", "raw provider description")
 
 	harness.clock.now = harness.clock.now.Add(5 * time.Second)
 	harness.provider.pollError = errors.New("raw provider description")
@@ -280,6 +324,37 @@ func TestSourceConnectionAPIUsesNoStoreOwnerScopeAndFixedSafeProblems(t *testing
 		t.Fatalf("connected poll = %d %s", safePoll.Code, safePoll.Body.String())
 	}
 	assertAbsent(t, safePoll.Body.String()+harness.logs.String(), "device-code-sentinel", "ghu_api_sentinel", "ghr_api_sentinel", "raw provider description")
+}
+
+func TestExpiredSourceConnectionPollPurgesSecretAndPersistsTerminalStatus(t *testing.T) {
+	harness := newSourceHarness(t, true)
+	started := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/source-connections/github/device", "", true)
+	var body struct {
+		ConnectionID string `json:"connectionId"`
+	}
+	if started.Code != http.StatusCreated || json.Unmarshal(started.Body.Bytes(), &body) != nil || body.ConnectionID == "" {
+		t.Fatalf("start = %d %s", started.Code, started.Body.String())
+	}
+	harness.clock.now = harness.clock.now.Add(15 * time.Minute)
+	other := sourceRequest(harness.handler, harness.otherSession, http.MethodPost, "/api/v1/source-connections/"+body.ConnectionID+"/device/poll", "", true)
+	if other.Code != http.StatusNotFound {
+		t.Fatalf("other owner poll = %d %s", other.Code, other.Body.String())
+	}
+	if _, err := harness.credentials.ReadDevice(body.ConnectionID); err != nil {
+		t.Fatalf("other owner removed device credential: %v", err)
+	}
+	expired := sourceRequest(harness.handler, harness.session, http.MethodPost, "/api/v1/source-connections/"+body.ConnectionID+"/device/poll", "", true)
+	if expired.Code != http.StatusGone || !strings.Contains(expired.Body.String(), `"code":"authorization_expired"`) || harness.provider.pollCalls != 0 {
+		t.Fatalf("expired poll = %d calls=%d body=%s", expired.Code, harness.provider.pollCalls, expired.Body.String())
+	}
+	if _, err := harness.credentials.ReadDevice(body.ConnectionID); err == nil {
+		t.Fatal("expired device credential remains")
+	}
+	connection, err := harness.repository.Get(context.Background(), harness.sessionUserID(t, harness.session), body.ConnectionID)
+	if err != nil || connection.Status != sourceconnections.StatusExpired || connection.LastErrorCode != "authorization_expired" || connection.PendingExpiresAt != nil || connection.NextPollAt != nil {
+		t.Fatalf("expired connection = %#v, %v", connection, err)
+	}
+	assertAbsent(t, expired.Body.String()+harness.logs.String(), "USER-CODE", "userCode", "verificationUri", "device-code-sentinel")
 }
 
 func newSourceHarness(t *testing.T, enabled bool) *sourceHarness {

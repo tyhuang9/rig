@@ -12,6 +12,7 @@ button, input, select { font: inherit; }
 button, a { -webkit-tap-highlight-color: transparent; }
 button { cursor: pointer; }
 button:disabled { cursor: wait; opacity: .62; }
+.button[aria-disabled="true"] { cursor: wait; opacity: .62; }
 
 .sr-only {
   position: absolute;
