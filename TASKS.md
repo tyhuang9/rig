@@ -1,5 +1,9 @@
 # Milestone 1 — Foundation with a real local control plane
 
+The original foundation and generated-runtime stack is integrated on `main`.
+The current hosting continuation and its evidence are tracked in
+[the M0 integration baseline](docs/hosting-continuation/m0-integration-baseline.md).
+
 - [x] Establish repository layout, toolchain metadata, durable architecture and design documentation.
 - [x] Add SQLite migration and repositories for the Phase A control-plane records.
 - [x] Implement authenticated API shell, bootstrap, sessions, CSRF, diagnostics, and API contract.
@@ -20,7 +24,7 @@
 - [x] Add latest-head automatic deployment, reconciliation, coalescing, and pause/resume behavior.
 - [x] Add deployment, approval, auto-deploy, and relay-management dashboard experiences.
 - [x] Add hosted deterministic Chromium execution for the embedded hostd and GitHub source-wizard flows.
-- [x] Publish the implementation as a strictly ordered stack of narrow pull requests without merging them.
+- [x] Integrate the generated runtime, persistent GitHub connector, and editable setup on `main` through approved pull requests.
 
 ## External promotion gates
 
@@ -32,5 +36,5 @@
 
 ## Explicitly deferred
 
-- [ ] Caddy configuration, remote deployment agents, backup/restore product workflows, and movement workflows.
+- [ ] Public Caddy listeners and custom-domain routing, remote deployment agents, backup/restore product workflows, and movement workflows.
 - [ ] GitHub Enterprise Server, pull-request refs, submodules, Git LFS expansion, and Git history.

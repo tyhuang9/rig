@@ -1,2 +1,9 @@
 # Vite bundles are reproducible opaque artifacts; review their source and verify hashes instead of textual diffs.
 internal/controller/ui/assets/*.js binary
+
+# Byte-for-byte generation checks compare these files with LF output on every platform.
+internal/apicontract/generated.go text eol=lf
+web/src/generated/api-contract.ts text eol=lf
+web/index.html text eol=lf
+internal/controller/ui/index.html text eol=lf
+internal/controller/ui/assets/*.css text eol=lf
