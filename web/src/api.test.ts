@@ -96,6 +96,22 @@ describe("API client", () => {
     );
   });
 
+  it("uses generated deployment-plan paths with exact CAS and migration bodies", async () => {
+    const revision = { revisionNumber: 1, canonicalDigest: "a".repeat(64), strategy: "generated_node", state: "accepted", source: { provider: "local", repositoryId: 0, resolvedDigest: "b".repeat(64) }, detector: { name: "projectanalysis", version: "2", sourceStructuralFingerprint: "c".repeat(64) }, components: [], fieldProvenance: [], migration: { present: false } };
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify(revision), { status: 200 })));
+    vi.stubGlobal("fetch", fetchMock);
+    const acceptance = { expectedRevisionNumber: 0, expectedSourceStructuralFingerprint: "c".repeat(64), expectedCandidateDigest: "d".repeat(64), candidateId: "web", packageManager: "npm", installBehavior: "npm ci", migrationCommand: "", components: [{ componentId: "web", nodeVersion: "24", buildCommand: "npm run build", runCommand: "npm start", internalPort: 3000, healthProbe: "/" }] };
+    const approval = { revisionId: "11111111-1111-4111-8111-111111111111", revisionNumber: 1, expectedApprovalRevision: 0 };
+
+    await api.deploymentPlan("app/one");
+    await api.acceptDeploymentPlan("app/one", acceptance);
+    await api.approveDeploymentPlanMigration("app/one", approval);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/apps/app%2Fone/deployment-plan", expect.objectContaining({ credentials: "same-origin" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/apps/app%2Fone/deployment-plan", expect.objectContaining({ method: "PUT", body: JSON.stringify(acceptance), headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/v1/apps/app%2Fone/deployment-plan/migration-approval", expect.objectContaining({ method: "POST", body: JSON.stringify(approval), headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+  });
+
   it("treats a pending device poll as a successful 202 response", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ id: "a", provider: "github", status: "pending", credentialGeneration: 0, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }), { status: 202 }),
@@ -162,6 +178,18 @@ describe("API client", () => {
       status: 502,
       code: "invalid_inspection_response",
       detail: "The controller returned an invalid source inspection response.",
+    });
+  });
+
+  it("rejects malformed analysis candidates before the wizard can render them", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ source: { type: "local" }, composeCandidates: [], services: [], findings: [], analysis: { source: { type: "local" }, resolvedDigest: "a", schemaVersion: "2", structuralFingerprint: "b", candidates: [null], findings: [] } }), { status: 200 }),
+    ));
+
+    await expect(api.inspect({ sourcePath: "C:/fixture" })).rejects.toMatchObject({
+      name: "APIError",
+      status: 502,
+      code: "invalid_inspection_response",
     });
   });
 

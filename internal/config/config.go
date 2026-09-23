@@ -22,6 +22,7 @@ type Config struct {
 	DockerEndpoint              string
 	FakeRuntime                 bool
 	ComposeRuntime              bool
+	GeneratedRuntime            bool
 	ComposeConfigTimeout        time.Duration
 	ComposeApplyTimeout         time.Duration
 	ComposeWaitTimeout          time.Duration
@@ -79,6 +80,7 @@ func FromFlags(args []string) (Config, error) {
 	fs.StringVar(&c.DockerEndpoint, "docker-endpoint", "", "Docker endpoint override")
 	fs.BoolVar(&c.FakeRuntime, "fake-runtime", false, "enable fake runtime (development/test only)")
 	fs.BoolVar(&c.ComposeRuntime, "compose-runtime", false, "enable Docker Compose deployments")
+	fs.BoolVar(&c.GeneratedRuntime, "generated-runtime", false, "enable generated container deployments")
 	fs.DurationVar(&c.ComposeConfigTimeout, "compose-config-timeout", c.ComposeConfigTimeout, "Docker Compose configuration timeout")
 	fs.DurationVar(&c.ComposeApplyTimeout, "compose-apply-timeout", c.ComposeApplyTimeout, "Docker Compose apply timeout")
 	fs.DurationVar(&c.ComposeWaitTimeout, "compose-wait-timeout", c.ComposeWaitTimeout, "Docker Compose health wait timeout")
@@ -118,14 +120,14 @@ func FromFlags(args []string) (Config, error) {
 	if err := validateLoopbackListenAddress(c.ListenAddress); err != nil {
 		return Config{}, err
 	}
-	if c.FakeRuntime && c.ComposeRuntime {
-		return Config{}, errors.New("fake-runtime and compose-runtime are mutually exclusive")
+	if c.FakeRuntime && (c.ComposeRuntime || c.GeneratedRuntime) {
+		return Config{}, errors.New("fake-runtime is mutually exclusive with real runtimes")
 	}
 	if c.FakeRuntime && !safeFakeRuntimeRoot(c.DataRoot) {
 		return Config{}, errors.New("fake runtime requires a resolved .hostd-dev root or an isolated hostd-* test root under the system temporary directory")
 	}
-	if c.ComposeRuntime && !localDockerEndpoint(c.DockerEndpoint) {
-		return Config{}, errors.New("compose runtime requires a local Docker endpoint")
+	if (c.ComposeRuntime || c.GeneratedRuntime) && !localDockerEndpoint(c.DockerEndpoint) {
+		return Config{}, errors.New("container runtimes require a local Docker endpoint")
 	}
 	if c.ComposeConfigTimeout < time.Second || c.ComposeConfigTimeout > 5*time.Minute ||
 		c.ComposeApplyTimeout < time.Second || c.ComposeApplyTimeout > 2*time.Hour ||

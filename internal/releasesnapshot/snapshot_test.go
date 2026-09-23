@@ -15,8 +15,11 @@ import (
 	"testing"
 
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/githubapp"
+	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/sourceconnections"
+	"github.com/hostd/hostd/internal/sourceinspection"
 )
 
 const snapshotSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -170,6 +173,177 @@ func TestMaterializePinsConfigurationRevisionAndDoesNotReuseAfterChange(t *testi
 	var pinnedNumber int64
 	if err := db.QueryRow(`SELECT configuration_revision_id,configuration_revision_number FROM releases WHERE id=?`, initial.ID).Scan(&pinnedID, &pinnedNumber); err != nil || pinnedID.Valid || pinnedNumber != 0 {
 		t.Fatalf("initial database pin=%v/%d err=%v", pinnedID, pinnedNumber, err)
+	}
+}
+
+func TestMaterializePinsAcceptedDeploymentPlanRevision(t *testing.T) {
+	db := snapshotDB(t)
+	source := &fakeSources{archive: composeArchive(t, "services: {}\n")}
+	m, err := New(db, source, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	legacy, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil || legacy.DeploymentPlanRevisionID != "" || legacy.DeploymentPlanRevisionNumber != 0 {
+		t.Fatalf("legacy=%#v err=%v", legacy, err)
+	}
+	id := "11111111-1111-1111-8111-111111111111"
+	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at)
+		VALUES(?,?,1,?,'generated_node','package-json','1',?,'github',7,?,?,1,1,'','owner',datetime('now'),'accepted','owner',datetime('now'))`, id, app, "apps/"+app+"/deployment-plans/"+id+".secret", strings.Repeat("a", 64), snapshotSHA, strings.Repeat("b", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE deployment_plan_heads SET revision_id=?,revision_number=1,updated_at=datetime('now') WHERE app_id=?`, id, app); err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil || pinned.ID == legacy.ID || pinned.DeploymentPlanRevisionID != id || pinned.DeploymentPlanRevisionNumber != 1 {
+		t.Fatalf("pinned=%#v legacy=%#v err=%v", pinned, legacy, err)
+	}
+	if _, err := db.Exec(`UPDATE releases SET deployment_plan_revision_number=2 WHERE id=?`, pinned.ID); err == nil {
+		t.Fatal("immutable deployment plan provenance accepted")
+	}
+	mismatchID := "22222222-2222-2222-8222-222222222222"
+	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at)
+		VALUES(?,?,2,?,'generated_node','package-json','1',?,'github',7,?,?,1,1,'','owner',datetime('now'),'accepted','owner',datetime('now'))`, mismatchID, app, "apps/"+app+"/deployment-plans/"+mismatchID+".secret", strings.Repeat("c", 64), strings.Repeat("d", 40), strings.Repeat("e", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE deployment_plan_heads SET revision_id=?,revision_number=2,updated_at=datetime('now') WHERE app_id=?`, mismatchID, app); err != nil {
+		t.Fatal(err)
+	}
+	mismatched, err := m.Materialize(context.Background(), "owner", app)
+	if err != nil || mismatched.DeploymentPlanRevisionID != "" || mismatched.DeploymentPlanRevisionNumber != 0 {
+		t.Fatalf("mismatched=%#v err=%v", mismatched, err)
+	}
+}
+
+func TestApprovedMigrationPlanPassesUnchangedGeneratedWorkspacePreflight(t *testing.T) {
+	db := snapshotDB(t)
+	dataRoot := t.TempDir()
+	workspace := t.TempDir()
+	writeGeneratedWorkspaceFile(t, workspace, "package.json", `{"packageManager":"npm@11","scripts":{"build":"tsc","start":"node dist/index.js"},"dependencies":{"express":"5","prisma":"6"}}`)
+	writeGeneratedWorkspaceFile(t, workspace, "package-lock.json", `{"lockfileVersion":3}`)
+	writeGeneratedWorkspaceFile(t, workspace, "prisma/schema.prisma", `datasource db { provider = "postgresql" url = env("DATABASE_URL") } model App { id Int @id }`)
+
+	inspection, err := sourceinspection.InspectLocalContext(context.Background(), workspace)
+	if err != nil || len(inspection.Analysis.Candidates) != 1 {
+		t.Fatalf("inspection = %#v, err=%v", inspection, err)
+	}
+	candidate := inspection.Analysis.Candidates[0]
+	component := candidate.Components[0]
+	if candidate.Install == nil || component.Build == nil || component.Run == nil || component.Migration == nil || component.MigrationFingerprint == "" {
+		t.Fatalf("generated candidate = %#v", candidate)
+	}
+	fields := []string{"role", "rootDirectory", "packageManager", "installBehavior", "installDirectory", "nodeVersion", "buildCommand", "runCommand", "internalPort", "healthProbe"}
+	provenance := make([]deploymentplans.FieldProvenance, 0, len(fields))
+	for _, field := range fields {
+		origin, confidence, evidence := deploymentplans.ProvenanceInferred, 90, []string{"analysis:" + field}
+		if field == "internalPort" || field == "healthProbe" {
+			origin, confidence, evidence = deploymentplans.ProvenanceUser, 100, []string{"user:" + field}
+		}
+		provenance = append(provenance, deploymentplans.FieldProvenance{Field: "components." + component.ID + "." + field, Origin: origin, Confidence: confidence, Evidence: evidence})
+	}
+	plan := deploymentplans.Plan{
+		Strategy: deploymentplans.StrategyGeneratedNode,
+		Detector: deploymentplans.Detector{Name: "projectanalysis", Version: projectanalysis.SchemaVersion, SourceStructuralFingerprint: inspection.Analysis.StructuralFingerprint},
+		Source:   deploymentplans.SourceIdentity{Provider: "github", RepositoryID: 7, ResolvedDigest: snapshotSHA},
+		Components: []deploymentplans.Component{{
+			Name: component.ID, Role: component.Kind, RootDirectory: ".", PackageManager: candidate.PackageManager.Name,
+			InstallBehavior: candidate.Install.Command, InstallDirectory: ".", NodeVersion: candidate.NodeVersion.Value, BuildCommand: component.Build.Command,
+			RunCommand: component.Run.Command, InternalPort: 3000, HealthProbe: "/health",
+		}},
+		FieldProvenance: provenance,
+		Migration:       &deploymentplans.Migration{ComponentName: component.ID, RootDirectory: ".", Command: component.Migration.Command, EnvironmentKeys: []string{"DATABASE_URL"}, EvidenceDigest: component.MigrationFingerprint, Approval: deploymentplans.MigrationApproval{Status: deploymentplans.MigrationApprovalPending}},
+	}
+	plans, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	revision, err := plans.Replace(context.Background(), app, "owner", deploymentplans.ReplaceInput{Plan: plan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plans.ApproveMigration(context.Background(), app, revision.ID, revision.RevisionNumber, 0, "owner"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := plans.GetRevision(context.Background(), app, revision.ID, revision.RevisionNumber)
+	if err != nil || loaded.Plan.Migration == nil || loaded.Plan.Migration.Approval.Status != deploymentplans.MigrationApprovalApproved {
+		t.Fatalf("approved revision = %#v, err=%v", loaded, err)
+	}
+	differences, err := deploymentplans.CompareAnalysis(loaded.Plan, inspection.Analysis)
+	if err != nil || len(differences) != 0 {
+		t.Fatalf("approved comparison = %#v, err=%v", differences, err)
+	}
+
+	materializer, err := New(db, &fakeSources{}, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := Release{AppID: app, SourceProvider: "github", RepositoryID: 7, DeploymentPlanRevisionID: revision.ID, DeploymentPlanRevisionNumber: revision.RevisionNumber}
+	if err := materializer.validateMaterializedWorkspace(context.Background(), release, workspace); err != nil {
+		t.Fatalf("approved generated preflight = %v", err)
+	}
+}
+
+func TestReviewedYarnVersionAmbiguityPassesGeneratedWorkspacePreflight(t *testing.T) {
+	db := snapshotDB(t)
+	dataRoot := t.TempDir()
+	workspace := t.TempDir()
+	writeGeneratedWorkspaceFile(t, workspace, "package.json", `{"scripts":{"start":"node server.js"},"dependencies":{"express":"5"}}`)
+	writeGeneratedWorkspaceFile(t, workspace, "yarn.lock", "# yarn lockfile v1\n")
+
+	inspection, err := sourceinspection.InspectLocalContext(context.Background(), workspace)
+	if err != nil || len(inspection.Analysis.Candidates) != 1 {
+		t.Fatalf("inspection = %#v, err=%v", inspection, err)
+	}
+	candidate := inspection.Analysis.Candidates[0]
+	component := candidate.Components[0]
+	if candidate.PackageManager.Name != "yarn" || candidate.PackageManager.Version != "" || candidate.Install != nil {
+		t.Fatalf("reviewable Yarn candidate = %#v", candidate)
+	}
+	installCommand := "corepack prepare yarn@1.22.22 --activate && corepack yarn install --frozen-lockfile"
+	fields := []string{"role", "rootDirectory", "packageManager", "installBehavior", "installDirectory", "nodeVersion", "runCommand", "internalPort", "healthProbe"}
+	provenance := make([]deploymentplans.FieldProvenance, 0, len(fields))
+	for _, field := range fields {
+		origin, confidence, evidence := deploymentplans.ProvenanceInferred, 90, []string{"analysis:" + field}
+		if field == "packageManager" || field == "installBehavior" || field == "internalPort" || field == "healthProbe" {
+			origin, confidence, evidence = deploymentplans.ProvenanceUser, 100, []string{"user:" + field}
+		}
+		provenance = append(provenance, deploymentplans.FieldProvenance{Field: "components." + component.ID + "." + field, Origin: origin, Confidence: confidence, Evidence: evidence})
+	}
+	plan := deploymentplans.Plan{
+		Strategy: deploymentplans.StrategyGeneratedNode,
+		Detector: deploymentplans.Detector{Name: "projectanalysis", Version: projectanalysis.SchemaVersion, SourceStructuralFingerprint: inspection.Analysis.StructuralFingerprint},
+		Source:   deploymentplans.SourceIdentity{Provider: "github", RepositoryID: 7, ResolvedDigest: snapshotSHA},
+		Components: []deploymentplans.Component{{
+			Name: component.ID, Role: component.Kind, RootDirectory: ".", PackageManager: "yarn",
+			InstallBehavior: installCommand, InstallDirectory: ".", NodeVersion: candidate.NodeVersion.Value,
+			RunCommand: component.Run.Command, InternalPort: 3000, HealthProbe: "/health",
+		}},
+		FieldProvenance: provenance,
+	}
+	plans, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := "11111111-1111-1111-1111-111111111111"
+	revision, err := plans.Replace(context.Background(), app, "owner", deploymentplans.ReplaceInput{Plan: plan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	differences, err := deploymentplans.CompareAnalysis(revision.Plan, inspection.Analysis)
+	if err != nil || len(differences) != 0 {
+		t.Fatalf("reviewed Yarn comparison = %#v, err=%v", differences, err)
+	}
+
+	materializer, err := New(db, &fakeSources{}, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := Release{AppID: app, SourceProvider: "github", RepositoryID: 7, DeploymentPlanRevisionID: revision.ID, DeploymentPlanRevisionNumber: revision.RevisionNumber}
+	if err := materializer.validateMaterializedWorkspace(context.Background(), release, workspace); err != nil {
+		t.Fatalf("reviewed Yarn generated preflight = %v", err)
 	}
 }
 
@@ -870,6 +1044,17 @@ func snapshotDB(t *testing.T) *sql.DB {
 }
 func composeArchive(t *testing.T, compose string) []byte {
 	return composeAndDockerfileArchive(t, compose, "")
+}
+
+func writeGeneratedWorkspaceFile(t *testing.T, root, name, body string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func composeAndDockerfileArchive(t *testing.T, compose, dockerfile string) []byte {

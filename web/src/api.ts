@@ -1,14 +1,17 @@
 import {
   operations,
+  type AcceptDeploymentPlanRequest,
   type Application,
   type ApplicationAutoDeployStatus,
   type ApplicationConfiguration,
   type ApplicationList,
+  type ApproveDeploymentPlanMigrationRequest,
   type BootstrapRequest,
   type BootstrapStatus,
   type CreateApplicationRequest,
   type CSRFResponse,
   type DeploymentList,
+  type DeploymentPlanRevision,
   type DeployReleaseRequest,
   type GitHubBranchPage,
   type GitHubDeviceAuthorization,
@@ -43,9 +46,11 @@ import {
 } from "./generated/api-contract";
 
 export type {
+  AcceptDeploymentPlanRequest,
   Application,
   ApplicationAutoDeployStatus,
   ApplicationConfiguration,
+  ApproveDeploymentPlanMigrationRequest,
   CreateApplicationRequest,
   GitHubBranch,
   GitHubDeviceAuthorization,
@@ -61,6 +66,11 @@ export type {
   User,
   ReplaceApplicationConfigurationRequest,
   Deployment,
+  DeploymentPlanCandidate,
+  DeploymentPlanRevision,
+  AnalysisComponent,
+  AnalysisEvidence,
+  AnalysisFinding,
   Release,
   RuntimeApproval,
   RelayStatus,
@@ -173,12 +183,80 @@ function inspectionCollection<T>(value: unknown): T[] {
   return value as T[];
 }
 
+function invalidInspectionResponse(): never {
+  throw new APIError({
+    status: 502,
+    code: "invalid_inspection_response",
+    detail: "The controller returned an invalid source inspection response.",
+  });
+}
+
+function inspectionRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) invalidInspectionResponse();
+  return value as Record<string, unknown>;
+}
+
+function requireInspectionString(record: Record<string, unknown>, field: string) {
+  if (typeof record[field] !== "string") invalidInspectionResponse();
+}
+
+function validateAnalysisCommand(value: unknown) {
+  if (value === undefined) return;
+  const command = inspectionRecord(value);
+  if (typeof command.present !== "boolean") invalidInspectionResponse();
+  if (command.command !== undefined && typeof command.command !== "string") invalidInspectionResponse();
+  inspectionCollection<unknown>(command.evidence);
+}
+
+function validateAnalysisCandidate(value: unknown) {
+  const candidate = inspectionRecord(value);
+  for (const field of ["id", "kind", "status", "rootDirectory", "configPath", "digest"]) requireInspectionString(candidate, field);
+  inspectionCollection<string>(candidate.missingFields).forEach((field) => { if (typeof field !== "string") invalidInspectionResponse(); });
+  inspectionCollection<unknown>(candidate.evidence);
+  inspectionCollection<unknown>(candidate.findings);
+  inspectionCollection<unknown>(candidate.advancedInputs);
+
+  const packageManager = inspectionRecord(candidate.packageManager);
+  inspectionCollection<unknown>(packageManager.evidence);
+  const nodeVersion = inspectionRecord(candidate.nodeVersion);
+  inspectionCollection<unknown>(nodeVersion.evidence);
+  validateAnalysisCommand(candidate.install);
+
+  inspectionCollection<unknown>(candidate.components).forEach((value) => {
+    const component = inspectionRecord(value);
+    for (const field of ["id", "kind", "rootDirectory", "name", "framework", "origin", "staticOutputDirectory", "migrationFingerprint"]) requireInspectionString(component, field);
+    inspectionCollection<unknown>(component.evidence);
+    inspectionCollection<unknown>(component.findings);
+    validateAnalysisCommand(component.build);
+    validateAnalysisCommand(component.run);
+    validateAnalysisCommand(component.migration);
+    if (component.internalPort !== undefined) inspectionCollection<unknown>(inspectionRecord(component.internalPort).evidence);
+    if (component.healthProbe !== undefined) inspectionCollection<unknown>(inspectionRecord(component.healthProbe).evidence);
+  });
+}
+
 function normalizeInspectionResponse(value: InspectResponse): InspectResponse {
+  inspectionRecord(value);
+  const analysis = value.analysis && typeof value.analysis === "object" ? value.analysis : {
+    source: value.source,
+    resolvedDigest: value.resolvedSha ?? "",
+    schemaVersion: "",
+    structuralFingerprint: "",
+    candidates: [],
+    findings: [],
+  };
+  const candidates = inspectionCollection<typeof analysis.candidates[number]>(analysis.candidates);
+  candidates.forEach(validateAnalysisCandidate);
   return {
     ...value,
     composeCandidates: inspectionCollection<string>(value.composeCandidates),
     services: inspectionCollection<InspectResponse["services"][number]>(value.services),
     findings: inspectionCollection<InspectResponse["findings"][number]>(value.findings),
+    analysis: {
+      ...analysis,
+      candidates,
+      findings: inspectionCollection<typeof analysis.findings[number]>(analysis.findings),
+    },
   };
 }
 
@@ -239,6 +317,18 @@ export const api = {
     }),
   createApp: (data: CreateApplicationRequest) =>
     request<Application>(operations.createApplication.path, { method: "POST", body: JSON.stringify(data) }),
+  deploymentPlan: (id: string) =>
+    request<DeploymentPlanRevision>(operationPath(operations.getApplicationDeploymentPlan.path, { appId: id })),
+  acceptDeploymentPlan: (id: string, data: AcceptDeploymentPlanRequest) =>
+    request<DeploymentPlanRevision>(operationPath(operations.acceptApplicationDeploymentPlan.path, { appId: id }), {
+      method: operations.acceptApplicationDeploymentPlan.method,
+      body: JSON.stringify(data),
+    }),
+  approveDeploymentPlanMigration: (id: string, data: ApproveDeploymentPlanMigrationRequest) =>
+    request<DeploymentPlanRevision>(operationPath(operations.approveApplicationDeploymentPlanMigration.path, { appId: id }), {
+      method: operations.approveApplicationDeploymentPlanMigration.method,
+      body: JSON.stringify(data),
+    }),
   inspect: async (data: InspectRequest) =>
     normalizeInspectionResponse(await request<InspectResponse>(operations.inspectImport.path, {
       method: "POST",

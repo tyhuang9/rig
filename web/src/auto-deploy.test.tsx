@@ -67,12 +67,17 @@ describe("AutoDeployPanel", () => {
 
   it.each([
     ["local", "Auto-deploy requires a GitHub source."],
-    ["github", "A compose runtime is required."],
+    ["github", "A compatible runtime is required."],
   ])("communicates static enable prerequisites", async (sourceType, text) => {
     mockData({ source: { ...status.source, type: sourceType } });
     renderPanel({ composeRuntime: sourceType !== "github" ? true : false });
     expect((await screen.findByRole("button", { name: "Enable" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText(text)).not.toBeNull();
+  });
+
+  it("allows generated-only controllers to enable auto-deploy", async () => {
+    renderPanel({ composeRuntime: false, generatedRuntime: true });
+    expect((await screen.findByRole("button", { name: "Enable" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("does not fetch GitHub prerequisites for a local application source", async () => {
@@ -331,6 +336,10 @@ describe("AutoDeployPanel", () => {
 
   it.each([
     ["approval_required", "Review Deployment history below", false],
+    ["deployment_plan_review_required", "repository structure changed", true],
+    ["migration_approval_required", "approve the pinned plan", false],
+    ["insufficient_replacement_capacity", "temporary RAM or disk", false],
+    ["route_reconciliation_required", "preserved both application slots", false],
     ["deployment_failed", "previous auto-deployment failed", true],
     ["missing_configuration", "configuration is missing", true],
     ["source_access_lost", "GitHub access has been lost", true],
@@ -346,13 +355,48 @@ describe("AutoDeployPanel", () => {
     if (resume) expect(screen.getByText(/Resume to ask Rig to revalidate and retry/i)).not.toBeNull();
   });
 
-  it("resumes a known non-approval pause without requiring an active job or SHA", async () => {
-    mockData({ enabled: true, state: "paused", pauseCode: "deployment_failed", revision: 7, activeJobId: undefined, activeSha: "", pausedSha: "", latestResolvedSha: "" });
-    vi.mocked(api.resumeApplicationAutoDeploy).mockResolvedValue({ ...status, enabled: true, state: "paused", pauseCode: "deployment_failed", revision: 8, activeJobId: undefined, activeSha: "", pausedSha: "", latestResolvedSha: "" } as never);
+  it("routes plan-review pauses to the deployment setup panel", async () => {
+    const target = document.createElement("h2");
+    target.id = "application-plan-title";
+    target.tabIndex = -1;
+    document.body.append(target);
+    mockData({ enabled: true, state: "paused", pauseCode: "deployment_plan_review_required" });
     renderPanel();
-    fireEvent.click(await screen.findByRole("button", { name: "Resume" }));
+    const action = await screen.findByRole("link", { name: "Review deployment setup" });
+    expect(action.getAttribute("href")).toBe("#application-plan-title");
+    fireEvent.click(action);
+    await waitFor(() => expect(document.activeElement).toBe(target));
+    target.remove();
+  });
+
+  it.each(["approval_required", "migration_approval_required", "insufficient_replacement_capacity", "route_reconciliation_required"])("routes active-job pause %s to deployment history", async (pauseCode) => {
+    const target = document.createElement("h2");
+    target.id = "deployment-history-title";
+    target.tabIndex = -1;
+    document.body.append(target);
+    mockData({ enabled: true, state: "paused", pauseCode, activeJobId: "job-1" });
+    renderPanel();
+    const action = await screen.findByRole("link", { name: "Review waiting deployment" });
+    expect(action.getAttribute("href")).toBe("#deployment-history-title");
+    fireEvent.click(action);
+    await waitFor(() => expect(document.activeElement).toBe(target));
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    target.remove();
+  });
+
+  it("resumes a known non-approval pause without requiring an active job or SHA", async () => {
+    const paused = { ...status, enabled: true, state: "paused", pauseCode: "deployment_failed", revision: 7, activeJobId: undefined, activeSha: "", pausedSha: "", latestResolvedSha: "" };
+    const resumed = { ...paused, state: "idle", pauseCode: undefined, revision: 8 };
+    mockData(paused);
+    vi.mocked(api.getApplicationAutoDeploy).mockResolvedValueOnce(paused as never).mockResolvedValue(resumed as never);
+    vi.mocked(api.resumeApplicationAutoDeploy).mockResolvedValue(resumed as never);
+    renderPanel();
+    const resume = await screen.findByRole("button", { name: "Resume" });
+    resume.focus();
+    fireEvent.click(resume);
     await waitFor(() => expect(api.resumeApplicationAutoDeploy).toHaveBeenCalledWith(appId, { expectedRevision: 7 }));
     expect(screen.getByText("Auto-deploy resumed.")).not.toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Auto-deploy" })));
   });
 
   it("holds source-access-lost resume until the matching connection is connected and the source is subscribed", async () => {

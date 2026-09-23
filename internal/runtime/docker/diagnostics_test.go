@@ -74,3 +74,20 @@ func TestCheckerHandlesMissingCLI(t *testing.T) {
 		t.Fatalf("unexpected missing-client diagnostics: %#v", diagnostic)
 	}
 }
+
+func TestCheckerUsesSuppliedExecutableWithoutAnotherLookup(t *testing.T) {
+	runner := &fakeRunner{lookErr: errors.New("must not look up Docker")}
+	runner.run = func(_ context.Context, command Command) (string, error) {
+		if command.Executable != "/resolved/docker" {
+			t.Fatalf("executable = %q", command.Executable)
+		}
+		return "1", nil
+	}
+	diagnostic := (Checker{
+		Runner: runner, DockerExecutable: "/resolved/docker",
+		CollectResources: func(string) (HostResources, error) { return HostResources{}, nil },
+	}).Check(context.Background(), false)
+	if !diagnostic.EngineReady || !diagnostic.ComposeAvailable {
+		t.Fatalf("diagnostics = %#v", diagnostic)
+	}
+}

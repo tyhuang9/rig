@@ -10,13 +10,16 @@ import (
 
 func TestComposeRuntimeRequiresExplicitEnablement(t *testing.T) {
 	tests := []struct {
-		name    string
-		args    []string
-		compose bool
-		fake    bool
+		name      string
+		args      []string
+		compose   bool
+		generated bool
+		fake      bool
 	}{
 		{name: "default is non-executing"},
 		{name: "compose explicitly enabled", args: []string{"--compose-runtime"}, compose: true},
+		{name: "generated explicitly enabled", args: []string{"--generated-runtime"}, generated: true},
+		{name: "compose and generated enabled", args: []string{"--compose-runtime", "--generated-runtime"}, compose: true, generated: true},
 		{
 			name: "fake explicitly enabled",
 			args: []string{
@@ -33,12 +36,14 @@ func TestComposeRuntimeRequiresExplicitEnablement(t *testing.T) {
 			if err != nil {
 				t.Fatalf("FromFlags() error = %v", err)
 			}
-			if configuration.ComposeRuntime != test.compose || configuration.FakeRuntime != test.fake {
+			if configuration.ComposeRuntime != test.compose || configuration.GeneratedRuntime != test.generated || configuration.FakeRuntime != test.fake {
 				t.Fatalf(
-					"runtime flags = (compose %v, fake %v), want (compose %v, fake %v)",
+					"runtime flags = (compose %v, generated %v, fake %v), want (compose %v, generated %v, fake %v)",
 					configuration.ComposeRuntime,
+					configuration.GeneratedRuntime,
 					configuration.FakeRuntime,
 					test.compose,
+					test.generated,
 					test.fake,
 				)
 			}
@@ -46,21 +51,21 @@ func TestComposeRuntimeRequiresExplicitEnablement(t *testing.T) {
 	}
 }
 
-func TestComposeAndFakeRuntimeAreMutuallyExclusiveBeforeRootCreation(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "not-created", ".hostd-dev")
-	_, err := FromFlags([]string{
-		"--compose-runtime",
-		"--fake-runtime",
-		"--data-root", root,
-	})
-	if err == nil {
-		t.Fatal("FromFlags() succeeded with both runtime modes enabled")
-	}
-	if !strings.Contains(err.Error(), "mutually exclusive") {
-		t.Fatalf("FromFlags() error = %q, want mutual-exclusion diagnostic", err)
-	}
-	if _, statErr := os.Stat(root); !os.IsNotExist(statErr) {
-		t.Fatalf("data root was created before runtime-mode validation: stat error = %v", statErr)
+func TestFakeAndRealRuntimesAreMutuallyExclusiveBeforeRootCreation(t *testing.T) {
+	for _, runtimeFlag := range []string{"--compose-runtime", "--generated-runtime"} {
+		t.Run(runtimeFlag, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "not-created", ".hostd-dev")
+			_, err := FromFlags([]string{runtimeFlag, "--fake-runtime", "--data-root", root})
+			if err == nil {
+				t.Fatal("FromFlags() succeeded with fake and real runtime enabled")
+			}
+			if !strings.Contains(err.Error(), "mutually exclusive") {
+				t.Fatalf("FromFlags() error = %q, want mutual-exclusion diagnostic", err)
+			}
+			if _, statErr := os.Stat(root); !os.IsNotExist(statErr) {
+				t.Fatalf("data root was created before runtime-mode validation: stat error = %v", statErr)
+			}
+		})
 	}
 }
 
@@ -91,6 +96,17 @@ func TestComposeRuntimeRejectsRemoteDockerEndpoints(t *testing.T) {
 			}
 			if err == nil && configuration.DockerEndpoint != test.endpoint {
 				t.Fatalf("DockerEndpoint = %q, want %q", configuration.DockerEndpoint, test.endpoint)
+			}
+		})
+	}
+}
+
+func TestGeneratedRuntimeRejectsRemoteDockerEndpoints(t *testing.T) {
+	for _, endpoint := range []string{"tcp://127.0.0.1:2375", "http://127.0.0.1:2375", "https://docker.example.test", "ssh://host.example.test"} {
+		t.Run(endpoint, func(t *testing.T) {
+			_, err := FromFlags([]string{"--generated-runtime", "--docker-endpoint", endpoint})
+			if err == nil || !strings.Contains(err.Error(), "local Docker endpoint") {
+				t.Fatalf("FromFlags() error = %v, want local-endpoint diagnostic", err)
 			}
 		})
 	}

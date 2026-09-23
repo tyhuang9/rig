@@ -82,6 +82,61 @@ func TestRecoverRemovesOnlyExactOwnedOperations(t *testing.T) {
 	}
 }
 
+func TestRuntimeTempNamespacesAreSeparateAndRecoverExactly(t *testing.T) {
+	dataRoot := t.TempDir()
+	compose, err := New(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	builds, err := NewGeneratedBuild(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeEnvironment, err := NewGeneratedRuntime(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	composeFiles, err := compose.Create(uuid.NewString(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildFiles, err := builds.Create(uuid.NewString(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeFiles, err := runtimeEnvironment.Create(uuid.NewString(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespaces := map[string]bool{}
+	for _, files := range []*Files{composeFiles, buildFiles, runtimeFiles} {
+		namespaces[filepath.Dir(files.Directory)] = true
+	}
+	if len(namespaces) != 3 {
+		t.Fatalf("compose, generated builds, and generated runtime share cleanup namespaces: %v", namespaces)
+	}
+	if err := runtimeEnvironment.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(runtimeFiles.Directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("generated runtime environment operation remains: %v", err)
+	}
+	for _, files := range []*Files{composeFiles, buildFiles} {
+		if _, err := os.Stat(files.Directory); err != nil {
+			t.Fatalf("generated runtime recovery touched another namespace: %v", err)
+		}
+	}
+	if err := builds.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(buildFiles.Directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("generated build operation remains: %v", err)
+	}
+	if _, err := os.Stat(composeFiles.Directory); err != nil {
+		t.Fatalf("generated recovery touched compose operation: %v", err)
+	}
+}
+
 func TestNewRejectsRelativeAndSymlinkedRuntimeAncestorBeforeCreation(t *testing.T) {
 	if _, err := New("relative"); err == nil {
 		t.Fatal("relative data root was accepted")

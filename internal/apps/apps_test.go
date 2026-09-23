@@ -62,6 +62,24 @@ func TestCreateGithubApplicationIsAtomicAndCredentialFree(t *testing.T) {
 	}
 }
 
+func TestCreateGithubApplicationAllowsGeneratedRuntimeWithoutCompose(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES ('owner','owner','hash',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO source_connections(id,owner_user_id,provider,status,provider_user_id,provider_login,credential_generation,access_expires_at,refresh_expires_at,connected_at,created_at,updated_at) VALUES ('0123456789abcdef0123456789abcdef','owner','github','connected','1','octo',1,datetime('now','+1 hour'),datetime('now','+1 day'),datetime('now'),datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	source := Source{Type: SourceGitHub, ConnectionID: "0123456789abcdef0123456789abcdef", InstallationID: 3, RepositoryID: 7, RepositoryOwner: "owner", RepositoryName: "repo", TrackedBranch: "main", TrackedRef: "refs/heads/main", ResolvedSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	app, err := New(db).CreateWithSource("Generated GitHub App", "", "", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Source.ComposePath != "" || app.Source.RepositoryID != source.RepositoryID {
+		t.Fatalf("source = %#v", app.Source)
+	}
+}
+
 func openTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := database.Open(t.TempDir())

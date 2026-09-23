@@ -3,8 +3,10 @@ package releasesnapshot
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +14,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentplans"
+	"github.com/hostd/hostd/internal/projectanalysis"
+	"github.com/hostd/hostd/internal/sourceinspection"
 )
+
+type failingLocalPlanReader struct{ err error }
+
+func (r failingLocalPlanReader) GetRevision(context.Context, string, string, int64) (deploymentplans.DeploymentPlanRevision, error) {
+	return deploymentplans.DeploymentPlanRevision{}, r.err
+}
 
 func TestMaterializeLocalRetainsBoundedSnapshotAndReusesByTreeAndRevision(t *testing.T) {
 	materializer, db, dataRoot, appID, actorID, source := localMaterializerFixture(t, false)
@@ -70,6 +81,299 @@ func TestMaterializeLocalSupportsLegacyDirectAndNestedCompose(t *testing.T) {
 				t.Fatalf("release=%#v", release)
 			}
 		})
+	}
+}
+
+func TestMaterializeLocalGeneratedPlanAllowsCodeChangesAndPausesOnStructuralDrift(t *testing.T) {
+	materializer, db, dataRoot, appID, actorID, source := localMaterializerFixture(t, false)
+	if err := os.Remove(filepath.Join(source, "deploy", "compose.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		filepath.Join(source, "package.json"):      `{"name":"demo","scripts":{"build":"npm run compile","start":"node server.js"},"dependencies":{"express":"1.0.0"}}`,
+		filepath.Join(source, "package-lock.json"): `{"lockfileVersion":3,"packages":{}}`,
+		filepath.Join(source, "server.js"):         "console.log('one')",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspection, err := sourceinspection.InspectLocalContext(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := acceptLocalAnalysisPlan(t, db, dataRoot, appID, actorID, inspection.Analysis, nil)
+	revisionID := revision.ID
+
+	first, err := materializer.MaterializeLocal(context.Background(), appID, source)
+	if err != nil || first.ComposePath != "" || first.DeploymentPlanRevisionID != revisionID {
+		t.Fatalf("generated release=%#v err=%v", first, err)
+	}
+	if ready, err := materializer.ReadyWorkspace(context.Background(), appID, first.ID); err != nil || ready.ID != first.ID {
+		t.Fatalf("generated ready workspace=%#v err=%v", ready, err)
+	}
+
+	if err := os.WriteFile(filepath.Join(source, "server.js"), []byte("console.log('ordinary code change')"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changedCode, err := materializer.MaterializeLocal(context.Background(), appID, source)
+	if err != nil || changedCode.ID == first.ID || changedCode.DeploymentPlanRevisionID != revisionID {
+		t.Fatalf("ordinary code release=%#v first=%#v err=%v", changedCode, first, err)
+	}
+
+	if err := os.WriteFile(filepath.Join(source, "package.json"), []byte(`{"name":"demo","description":"metadata changed","scripts":{"build":"npm run compile","start":"node server.js"},"dependencies":{"express":"1.0.0"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	compatibleMetadata, err := materializer.MaterializeLocal(context.Background(), appID, source)
+	if err != nil || compatibleMetadata.ID == changedCode.ID || compatibleMetadata.DeploymentPlanRevisionID != revisionID {
+		t.Fatalf("compatible metadata release=%#v prior=%#v err=%v", compatibleMetadata, changedCode, err)
+	}
+
+	if err := os.WriteFile(filepath.Join(source, "package.json"), []byte(`{"name":"demo","scripts":{"build":"npm run compile"},"dependencies":{"express":"1.0.0"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	driftInspection, err := sourceinspection.InspectLocalContext(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	differences, err := deploymentplans.CompareAnalysis(revision.Plan, driftInspection.Analysis)
+	if err != nil || len(differences) == 0 {
+		t.Fatalf("changed start command differences=%#v err=%v", differences, err)
+	}
+	if _, err := materializer.MaterializeLocal(context.Background(), appID, source); !IsCode(err, "deployment_plan_review_required") {
+		t.Fatalf("structural drift error=%v", err)
+	}
+	var state, code string
+	if err := db.QueryRow(`SELECT workspace_state,materialization_error_code FROM releases ORDER BY created_at DESC LIMIT 1`).Scan(&state, &code); err != nil || state != WorkspaceStateFailed || code != "deployment_plan_review_required" {
+		t.Fatalf("drift release state=%q code=%q err=%v", state, code, err)
+	}
+}
+
+func TestMaterializeLocalClassifiesInternalPlanLookupFailure(t *testing.T) {
+	materializer, db, dataRoot, appID, actorID, source := localMaterializerFixture(t, false)
+	if err := os.Remove(filepath.Join(source, "deploy", "compose.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		filepath.Join(source, "package.json"):      `{"name":"demo","scripts":{"start":"node server.js"},"dependencies":{"express":"1.0.0"}}`,
+		filepath.Join(source, "package-lock.json"): `{"lockfileVersion":3,"packages":{}}`,
+		filepath.Join(source, "server.js"):         "console.log('ready')",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspection, err := sourceinspection.InspectLocalContext(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptLocalAnalysisPlan(t, db, dataRoot, appID, actorID, inspection.Analysis, nil)
+	materializer.plans = failingLocalPlanReader{err: errors.New("plan storage unavailable")}
+
+	if _, err := materializer.MaterializeLocal(context.Background(), appID, source); !IsCode(err, "internal_error") {
+		t.Fatalf("materialization error=%v", err)
+	}
+	var state, code string
+	if err := db.QueryRow(`SELECT workspace_state,materialization_error_code FROM releases ORDER BY created_at DESC LIMIT 1`).Scan(&state, &code); err != nil || state != WorkspaceStateFailed || code != "internal_error" {
+		t.Fatalf("state=%q code=%q err=%v", state, code, err)
+	}
+}
+
+func acceptLocalAnalysisPlan(t *testing.T, db *sql.DB, dataRoot, appID, actorID string, analysis projectanalysis.SourceAnalysis, mutate func(*deploymentplans.Plan)) deploymentplans.DeploymentPlanRevision {
+	t.Helper()
+	var candidate projectanalysis.DeploymentPlanCandidate
+	for _, value := range analysis.Candidates {
+		if value.Kind == projectanalysis.PlanKindJavaScript && len(value.Components) == 1 {
+			candidate = value
+			break
+		}
+	}
+	if candidate.Kind == "" {
+		t.Fatalf("analysis topology = %#v", analysis.Candidates)
+	}
+	inferred := candidate.Components[0]
+	root := inferred.RootDirectory
+	if root == "" {
+		root = "."
+	}
+	installDirectory := candidate.Install.WorkingDirectory
+	if installDirectory == "" {
+		installDirectory = "."
+	}
+	port := uint64(3000)
+	if inferred.InternalPort != nil {
+		var err error
+		port, err = strconv.ParseUint(inferred.InternalPort.Value, 10, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	healthProbe := "/health"
+	if inferred.HealthProbe != nil {
+		healthProbe = inferred.HealthProbe.Path
+	}
+	component := deploymentplans.Component{
+		Name: inferred.ID, Role: inferred.Kind, RootDirectory: root,
+		PackageManager: candidate.PackageManager.Name, InstallBehavior: candidate.Install.Command,
+		InstallDirectory: installDirectory,
+		NodeVersion:      candidate.NodeVersion.Value, RunCommand: inferred.Run.Command,
+		InternalPort: uint16(port), HealthProbe: healthProbe,
+	}
+	if inferred.Build != nil {
+		component.BuildCommand = inferred.Build.Command
+	}
+	plan := deploymentplans.Plan{
+		Strategy:   deploymentplans.StrategyGeneratedNode,
+		Detector:   deploymentplans.Detector{Name: "projectanalysis", Version: analysis.SchemaVersion, SourceStructuralFingerprint: analysis.StructuralFingerprint},
+		Source:     deploymentplans.SourceIdentity{Provider: "local", ResolvedDigest: analysis.StructuralFingerprint},
+		Components: []deploymentplans.Component{component},
+	}
+	if inferred.Migration != nil {
+		plan.Migration = &deploymentplans.Migration{
+			ComponentName:   component.Name,
+			RootDirectory:   component.RootDirectory,
+			Command:         inferred.Migration.Command,
+			EnvironmentKeys: append([]string(nil), inferred.Migration.EnvironmentKeys...),
+			EvidenceDigest:  inferred.MigrationFingerprint,
+			Approval:        deploymentplans.MigrationApproval{Status: deploymentplans.MigrationApprovalPending},
+		}
+	}
+	fields := []string{"role", "rootDirectory", "packageManager", "installBehavior", "installDirectory", "nodeVersion", "runCommand", "internalPort", "healthProbe"}
+	if component.BuildCommand != "" {
+		fields = append(fields, "buildCommand")
+	}
+	for _, field := range fields {
+		origin := deploymentplans.ProvenanceInferred
+		confidence := 90
+		evidence := []string{"package.json"}
+		if (field == "internalPort" && inferred.InternalPort == nil) || (field == "healthProbe" && inferred.HealthProbe == nil) {
+			origin, confidence, evidence = deploymentplans.ProvenanceUser, 100, []string{"user:override"}
+		}
+		plan.FieldProvenance = append(plan.FieldProvenance, deploymentplans.FieldProvenance{
+			Field: "components." + component.Name + "." + field, Origin: origin,
+			Confidence: confidence, Evidence: evidence,
+		})
+	}
+	if mutate != nil {
+		mutate(&plan)
+	}
+	store, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := store.Replace(context.Background(), appID, actorID, deploymentplans.ReplaceInput{Plan: plan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return revision
+}
+
+func TestMaterializeLocalGeneratedPlanPreservesManualCommandOverride(t *testing.T) {
+	materializer, db, dataRoot, appID, actorID, source := localMaterializerFixture(t, false)
+	if err := os.Remove(filepath.Join(source, "deploy", "compose.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		filepath.Join(source, "package.json"):      `{"name":"demo","scripts":{"start":"node server.js"},"dependencies":{"express":"1.0.0"}}`,
+		filepath.Join(source, "package-lock.json"): `{"lockfileVersion":3,"packages":{}}`,
+		filepath.Join(source, "server.js"):         "console.log('ready')",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspection, err := sourceinspection.InspectLocalContext(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := acceptLocalAnalysisPlan(t, db, dataRoot, appID, actorID, inspection.Analysis, func(plan *deploymentplans.Plan) {
+		componentName := plan.Components[0].Name
+		plan.Components[0].RunCommand = "node custom-server.js && echo ready"
+		for index := range plan.FieldProvenance {
+			if plan.FieldProvenance[index].Field == "components."+componentName+".runCommand" {
+				plan.FieldProvenance[index].Origin = deploymentplans.ProvenanceUser
+				plan.FieldProvenance[index].Confidence = 100
+				plan.FieldProvenance[index].Evidence = []string{"user:override"}
+			}
+		}
+	})
+
+	release, err := materializer.MaterializeLocal(context.Background(), appID, source)
+	if err != nil || release.DeploymentPlanRevisionID != revision.ID {
+		t.Fatalf("manual override release=%#v err=%v", release, err)
+	}
+}
+
+func TestMaterializeLocalGeneratedPlanPausesOnMigrationEvidenceChange(t *testing.T) {
+	materializer, db, dataRoot, appID, actorID, source := localMaterializerFixture(t, false)
+	if err := os.Remove(filepath.Join(source, "deploy", "compose.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		filepath.Join(source, "package.json"):                  `{"name":"demo","scripts":{"start":"node server.js"},"dependencies":{"express":"5","prisma":"6"}}`,
+		filepath.Join(source, "package-lock.json"):             `{"lockfileVersion":3,"packages":{}}`,
+		filepath.Join(source, "server.js"):                     "console.log('ready')",
+		filepath.Join(source, "prisma", "schema.prisma"):       `datasource db { provider = "postgresql" url = env("DATABASE_URL") }`,
+		filepath.Join(source, "prisma", "migrations", "1.sql"): "SELECT 1;",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspection, err := sourceinspection.InspectLocalContext(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := acceptLocalAnalysisPlan(t, db, dataRoot, appID, actorID, inspection.Analysis, nil)
+	if revision.Plan.Migration == nil {
+		t.Fatal("expected inferred migration")
+	}
+	if _, err := materializer.MaterializeLocal(context.Background(), appID, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "prisma", "migrations", "1.sql"), []byte("SELECT 2;"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := materializer.MaterializeLocal(context.Background(), appID, source); !IsCode(err, "deployment_plan_review_required") {
+		t.Fatalf("migration drift error=%v", err)
+	}
+}
+
+func TestReadyWorkspaceRejectsGeneratedSnapshotTamper(t *testing.T) {
+	materializer, db, dataRoot, appID, actorID, source := localMaterializerFixture(t, false)
+	if err := os.Remove(filepath.Join(source, "deploy", "compose.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		filepath.Join(source, "package.json"):      `{"name":"demo","scripts":{"start":"node server.js"},"dependencies":{"express":"1.0.0"}}`,
+		filepath.Join(source, "package-lock.json"): `{"lockfileVersion":3,"packages":{}}`,
+		filepath.Join(source, "server.js"):         "console.log('ready')",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspection, err := sourceinspection.InspectLocalContext(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptLocalAnalysisPlan(t, db, dataRoot, appID, actorID, inspection.Analysis, nil)
+	release, err := materializer.MaterializeLocal(context.Background(), appID, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(release.WorkspacePath, "server.js"), []byte("console.log('tampered')"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := materializer.ReadyWorkspace(context.Background(), appID, release.ID); !IsCode(err, "invalid_source") {
+		t.Fatalf("tampered generated workspace error=%v", err)
+	}
+	var state, code string
+	if err := db.QueryRow(`SELECT workspace_state,materialization_error_code FROM releases WHERE id=?`, release.ID).Scan(&state, &code); err != nil || state != WorkspaceStateFailed || code != "invalid_source" {
+		t.Fatalf("state=%q code=%q err=%v", state, code, err)
 	}
 }
 

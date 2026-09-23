@@ -46,8 +46,8 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 	if sourceType != "local" || strings.TrimSpace(storedPath) != strings.TrimSpace(sourcePath) {
 		return Release{}, &Error{Code: "invalid_source"}
 	}
-	inspection, err := sourceinspection.InspectLocal(sourcePath)
-	if err != nil || inspection.Source.ComposePath == "" || len(inspection.Findings) != 0 {
+	inspection, err := sourceinspection.InspectLocalContext(ctx, sourcePath)
+	if err != nil || len(inspection.Findings) != 0 || (inspection.Source.ComposePath == "" && !hasGeneratedAnalysis(inspection.Analysis)) {
 		return Release{}, &Error{Code: "invalid_source"}
 	}
 	sourceRoot := inspection.Source.Path
@@ -88,7 +88,7 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 		err = verifyLocalTree(ctx, sourceRoot, manifest, digest)
 	}
 	if err == nil {
-		err = validateComposeWorkspace(filepath.Join(staging, "workspace"), inspection.Source.ComposePath)
+		err = m.validateMaterializedWorkspace(ctx, release, filepath.Join(staging, "workspace"))
 	}
 	if err != nil {
 		code := "invalid_source"
@@ -96,6 +96,13 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 			code = "source_too_large"
 		} else if errors.Is(err, context.Canceled) {
 			code = "internal_error"
+		} else if errors.Is(err, errLocal) {
+			code = "internal_error"
+		} else {
+			var releaseErr *Error
+			if errors.As(err, &releaseErr) {
+				code = releaseErr.Code
+			}
 		}
 		if m.abort(ctx, appID, release.ID, code) != nil {
 			return Release{}, &Error{Code: "internal_error"}
@@ -103,7 +110,7 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 		return Release{}, &Error{Code: code}
 	}
 
-	if existing, lookupErr := m.ready(ctx, appID, 0, digest, inspection.Source.ComposePath, release.ConfigurationRevisionNumber); lookupErr == nil {
+	if existing, lookupErr := m.ready(ctx, appID, 0, digest, inspection.Source.ComposePath, release.ConfigurationRevisionNumber, release.DeploymentPlanRevisionNumber); lookupErr == nil {
 		if abortErr := m.abort(ctx, appID, release.ID, "superseded"); abortErr != nil {
 			return Release{}, &Error{Code: "internal_error"}
 		}
@@ -137,7 +144,7 @@ func (m *Materializer) MaterializeLocal(ctx context.Context, appID, sourcePath s
 			_ = m.abort(ctx, appID, release.ID, ErrorCodeSourceStorageFull)
 			return Release{}, err
 		}
-		if existing, lookupErr := m.ready(ctx, appID, 0, digest, inspection.Source.ComposePath, release.ConfigurationRevisionNumber); lookupErr == nil {
+		if existing, lookupErr := m.ready(ctx, appID, 0, digest, inspection.Source.ComposePath, release.ConfigurationRevisionNumber, release.DeploymentPlanRevisionNumber); lookupErr == nil {
 			_ = m.abort(ctx, appID, release.ID, "superseded")
 			return existing, nil
 		}
@@ -164,12 +171,16 @@ func (m *Materializer) reserveLocal(ctx context.Context, appID, composePath stri
 	if err != nil {
 		return Release{}, err
 	}
-	now := m.now().UTC().Format(timeFormat)
-	_, err = m.db.ExecContext(ctx, `INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,compose_path,workspace_state,configuration_revision_id,configuration_revision_number) VALUES(?,?, '', '', 'materializing','{}',?,'local',0,?,?, 'materializing',?,?)`, id, appID, now, id, composePath, nullableConfigurationID(configurationID), configurationNumber)
+	deploymentPlanID, deploymentPlanNumber, err := m.currentDeploymentPlan(ctx, appID)
 	if err != nil {
 		return Release{}, err
 	}
-	return Release{ID: id, AppID: appID, SourceProvider: "local", ComposePath: composePath, WorkspaceState: WorkspaceStateMaterializing, ConfigurationRevisionID: configurationID, ConfigurationRevisionNumber: configurationNumber}, nil
+	now := m.now().UTC().Format(timeFormat)
+	_, err = m.db.ExecContext(ctx, `INSERT INTO releases(id,app_id,source_commit_sha,source_branch,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,compose_path,workspace_state,configuration_revision_id,configuration_revision_number,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?, '', '', 'materializing','{}',?,'local',0,?,?, 'materializing',?,?,?,?)`, id, appID, now, id, composePath, nullableConfigurationID(configurationID), configurationNumber, nullableConfigurationID(deploymentPlanID.String), nullablePlanNumber(deploymentPlanID, deploymentPlanNumber))
+	if err != nil {
+		return Release{}, err
+	}
+	return Release{ID: id, AppID: appID, SourceProvider: "local", ComposePath: composePath, WorkspaceState: WorkspaceStateMaterializing, ConfigurationRevisionID: configurationID, ConfigurationRevisionNumber: configurationNumber, DeploymentPlanRevisionID: deploymentPlanID.String, DeploymentPlanRevisionNumber: deploymentPlanNumber}, nil
 }
 
 func (m *Materializer) markLocalReady(ctx context.Context, id, digest, workspace string, size int64) error {

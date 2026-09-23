@@ -1,0 +1,112 @@
+name: Generated runtime lifecycle CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+  GOFLAGS: -mod=readonly
+  GOTOOLCHAIN: local
+
+jobs:
+  generated-runtime-lifecycle:
+    name: Disposable Docker blue-green verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Check out source
+        timeout-minutes: 2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        timeout-minutes: 3
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Build a generated npm image through the production compiler
+        timeout-minutes: 10
+        shell: bash
+        env:
+          RIG_RUN_LIVE_GENERATED_RUNTIME: "1"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          test_name='TestLiveGeneratedImageCompiler'
+          package_name='github.com/hostd/hostd/internal/generatedimage'
+          go test -json -v -count=1 -timeout=9m ./internal/generatedimage -run "^${test_name}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
+
+      - name: Exercise generated blue-green replacement
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        shell: bash
+        env:
+          RIG_RUN_LIVE_GENERATED_RUNTIME: "1"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          test_name='TestLiveGeneratedBlueGreenLifecycle'
+          package_name='github.com/hostd/hostd/internal/generatedingress'
+          go test -json -v -count=1 -timeout=19m ./internal/generatedingress -run "^${test_name}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
+
+      - name: Require complete Docker cleanup
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          containers="$(docker ps --all --filter label=io.rig.managed --format '{{.ID}} {{.Names}} {{.Status}}')"
+          networks="$(docker network ls --filter label=io.rig.managed --format '{{.ID}} {{.Name}}')"
+          images="$(docker image ls --filter label=io.rig.managed=generated-image --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
+          builders="$(docker ps --all --quiet --filter label=rig.controller=generated-builder)"
+          builder_networks="$(docker network ls --quiet --filter label=rig.controller=generated-builder)"
+          if [[ -n "$containers" || -n "$networks" || -n "$images" || -n "$builders" || -n "$builder_networks" ]] || docker volume inspect rig-generated-caddy-config-v1 >/dev/null 2>&1; then
+            printf 'Generated runtime resources were not cleaned up.\n' >&2
+            exit 1
+          fi
+
+  generated-runtime-race:
+    name: Generated runtime race verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        timeout-minutes: 2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        timeout-minutes: 3
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Run generated-runtime race tests
+        timeout-minutes: 10
+        run: >-
+          go test -race -count=1 -timeout=9m
+          ./internal/projectanalysis
+          ./internal/deploymentplans
+          ./internal/generatedimage
+          ./internal/generatedruntime
+          ./internal/generatedingress
+          ./internal/generatedexecutor
+          ./internal/generatedruntimestate
+          ./internal/generatedrecovery
+          ./internal/autodeploy
