@@ -176,6 +176,32 @@ test("HTTPS probe sends scoped credentials through verified, bounded TLS options
   assert.deepEqual(clearedTimers, [timer]);
 });
 
+test("HTTPS probe omits SNI for IP hosts while retaining certificate checks", async () => {
+  for (const [url, expectedHost] of [
+    ["https://127.0.0.1:55443/", "127.0.0.1"],
+    ["https://[::1]:55443/", "::1"]
+  ]) {
+    let options;
+    const request = (received, callback) => {
+      options = received;
+      const handle = new EventEmitter();
+      handle.setTimeout = () => {};
+      handle.destroy = () => {};
+      handle.end = () => queueMicrotask(() => {
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        callback(response);
+        response.emit("end");
+      });
+      return handle;
+    };
+    await probeHttpsDependency({ HTTPS_DEPENDENCY_URL: url, HTTPS_DEPENDENCY_TOKEN: "fixture-token" }, { request });
+    assert.equal(options.hostname, expectedHost);
+    assert.equal(Object.hasOwn(options, "servername"), false);
+    assert.equal(options.rejectUnauthorized, true);
+  }
+});
+
 test("HTTPS probe enforces an absolute deadline while a response trickles", async () => {
   let deadline;
   let destroyed = 0;

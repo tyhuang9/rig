@@ -89,6 +89,11 @@ try {
   env.HTTPS_DEPENDENCY_TLS_CA_PEM_BASE64 = testCA.toString("base64");
   env.HTTPS_DEPENDENCY_URL = `https://wrong.fixture.test:${port}/`;
   await check(503, '{"error":"dependency_unavailable"}');
+  if (process.env.FIXTURE_HOST_GATEWAY_IP === "127.0.0.1") {
+    env.HTTPS_DEPENDENCY_URL = `https://127.0.0.1:${port}/`;
+    await check(200, '{"status":"ok","dependency":"reachable"}');
+    console.log("Local HTTPS fixture API: IP SAN accepted for 127.0.0.1 with the test CA.");
+  }
   console.log("Local HTTPS fixture API: trusted CA and token accepted; wrong token, missing CA, and wrong hostname rejected without exposing credentials.");
 } finally {
   if (apiServer) await new Promise((resolve) => apiServer.close(resolve));

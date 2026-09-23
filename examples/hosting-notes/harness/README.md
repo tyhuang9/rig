@@ -16,24 +16,36 @@ export FIXTURE_HTTPS_TOKEN=replace-with-a-second-disposable-value
 docker compose up -d
 ```
 
-The default published ports bind to loopback. An authorized Docker integration
-runner can choose a routable host interface with
-`FIXTURE_POSTGRES_BIND_ADDRESS` and `FIXTURE_HTTPS_BIND_ADDRESS`. It must map
-`postgres.fixture.test` and `https.fixture.test` to that controlled host
-gateway in the **application test container**, while keeping those containers
-off `fixture-external`. Docker Desktop normally supplies `host.docker.internal`;
-Linux runners need an explicit, tested host-gateway mapping. Resolve and test
-the controlled DNS path before the TLS test. The certificate SAN must stay the
-fixture hostname, so hostname validation remains meaningful.
+The default published ports bind to loopback for host-only checks. Rig's
+generated containers do not currently receive custom DNS or host entries, so
+the `*.fixture.test` names in the certificates will not resolve inside them
+without separately controlled DNS. `host.docker.internal` alone is a different
+certificate name and does not solve that mismatch. Do not count a host-only
+connection or an untested hostname mapping as backend bridge acceptance.
+
+For a disposable Linux Docker trial, first let Rig create its private app
+bridge and inspect that bridge's gateway IPv4. Set
+`FIXTURE_HOST_GATEWAY_IP` to that exact address before running
+`generate-test-ca.sh` (or pass `-HostGatewayIp` to the PowerShell script).
+The generated PostgreSQL and HTTPS certificates then contain the gateway as an
+additional IP SAN. Bind both published fixture ports to that same address via
+`FIXTURE_POSTGRES_BIND_ADDRESS` and `FIXTURE_HTTPS_BIND_ADDRESS`; supply
+numeric-gateway URLs and the test CA only to the API's scoped runtime
+configuration. Keep the Rig app containers off `fixture-external` and keep the
+database under this harness's ownership. Gateway port reachability and driver
+IP-certificate validation remain unverified until a real Docker run. This
+trial does not prove external hostname DNS resolution.
 
 The harness's private CA is test-only. Supply the encoded CA to the API using
 the server-only `DATABASE_TLS_CA_PEM_BASE64` configuration value. A correct
-test proves that the client accepts this CA and hostname; a bad CA or hostname
+test proves that the client accepts this CA and URL host identity; a bad CA or host
 must fail `/readyz` without an error response containing credentials. Never
 turn off certificate verification.
 
-For the HTTPS dependency probe, provide `HTTPS_DEPENDENCY_URL` with the
-controlled `https://https.fixture.test:55443/` endpoint,
+For the HTTPS dependency probe, set `HTTPS_DEPENDENCY_URL` to
+`https://<gateway-ip>:55443/` for the proposed bridge trial. The
+`https://https.fixture.test:55443/` form is only for a host or test environment
+that explicitly resolves that name to the controlled fixture endpoint. Set
 `HTTPS_DEPENDENCY_TOKEN` with the same disposable token as
 `FIXTURE_HTTPS_TOKEN`, and `HTTPS_DEPENDENCY_TLS_CA_PEM_BASE64` with the test
 CA. The API sends the token only in the HTTPS authorization header and returns
@@ -46,8 +58,10 @@ which uses its HTTPS client with the test CA. It verifies a successful call and
 generic failure responses for a wrong token, missing CA, and wrong certificate
 hostname. The test maps the fixture hostname to
 loopback inside its request; it does not establish container bridge DNS or
-egress. The generated private keys stay in ignored `harness/certs` and should
-be removed after the smoke.
+egress. For an additional local IP-SAN check, generate the certificates with
+`FIXTURE_HOST_GATEWAY_IP=127.0.0.1` and run `pnpm test:https-local` with that
+same variable set. The generated private keys stay in ignored `harness/certs`
+and should be removed after the smoke.
 
 Stop and remove only the known harness project after evidence is captured:
 

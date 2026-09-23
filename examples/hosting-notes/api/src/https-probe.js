@@ -1,4 +1,5 @@
 import { request as httpsRequest } from "node:https";
+import { isIP } from "node:net";
 import { configuredValue, tlsCertificateAuthority } from "./config.js";
 
 const requestTimeoutMs = 2_000;
@@ -20,13 +21,14 @@ function dependencyOptions(env) {
     throw new Error("The configured HTTPS dependency URL is unsupported");
   }
   const ca = tlsCertificateAuthority(env, "HTTPS_DEPENDENCY_TLS_CA_PEM_BASE64");
+  const hostname = endpoint.hostname.startsWith("[") ? endpoint.hostname.slice(1, -1) : endpoint.hostname;
   return {
     protocol: "https:",
-    hostname: endpoint.hostname,
+    hostname,
     port: endpoint.port || 443,
     path: `${endpoint.pathname}${endpoint.search}`,
     method: "GET",
-    servername: endpoint.hostname,
+    ...(isIP(hostname) ? {} : { servername: hostname }),
     headers: {
       accept: "application/json",
       authorization: `Bearer ${configuredValue(env, "HTTPS_DEPENDENCY_TOKEN_ENV", "HTTPS_DEPENDENCY_TOKEN", "HTTPS dependency token")}`

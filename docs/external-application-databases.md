@@ -38,10 +38,11 @@ The fixture's Node PostgreSQL client always sets `rejectUnauthorized: true`.
 With a public provider, the hostname in `DATABASE_URL` must match the server
 certificate and the platform trust store verifies the public CA. With the F7
 test harness, the runner encodes its short-lived test CA as
-`DATABASE_TLS_CA_PEM_BASE64`; the hostname remains
-`postgres.fixture.test`, matching the certificate SAN. A wrong CA or hostname
-is an expected readiness failure and must not be worked around by turning
-verification off.
+`DATABASE_TLS_CA_PEM_BASE64`. Its certificate has a
+`postgres.fixture.test` DNS SAN; an explicitly supplied test gateway IPv4 can
+also be added as an IP SAN. The URL host must match one of those identities.
+A wrong CA or host is an expected readiness failure and must not be worked
+around by turning verification off.
 
 The fixture rejects URL TLS modes that would disable certificate verification,
 including `sslmode=disable` and `sslmode=no-verify`. It removes permitted TLS
@@ -77,15 +78,15 @@ redeploying; a code rollback does not roll back an external schema or data.
 project. It starts a disposable TLS PostgreSQL service and TLS HTTPS stub on a
 network named `rig-hosting-notes-fixture-external`, then publishes controlled
 host ports. A Rig-generated app remains on its private application network and
-must reach the services through a tested host-gateway/DNS route; it must not
-join the harness network just to make the request succeed.
-
-The exact route differs by Docker platform. Docker Desktop generally exposes a
-host gateway as `host.docker.internal`; qualified Linux automation must create
-and verify its own host-gateway mapping. In both cases map the certificate
-hostname to that route in the controlled application test environment and
-verify name resolution separately before the database test. The harness README
-contains the commands and cleanup boundary. Starting it, populating its
-schema, or using a live provider are acceptance actions that need a
-pre-approved disposable environment; their absence is `blocked_external`, not
+must reach the services through a tested external route; it must not join the
+harness network just to make the request succeed. The current runtime sets
+neither custom DNS nor host entries for generated containers, so the fixture's
+`*.fixture.test` names cannot be assumed to resolve there. Loopback-published
+ports are also for host-only checks. The harness README describes an unverified
+Linux trial using the app bridge gateway IPv4 as a numeric URL host, an IP SAN
+in both test certificates, and published ports bound to that gateway. A real
+Docker run must establish reachability and TLS behavior before this becomes
+acceptance evidence. DNS resolution for a provider hostname remains a separate
+check. Starting the harness, populating its schema, or using a live provider
+requires a disposable environment; their absence is `blocked_external`, not
 a passing deployment claim.

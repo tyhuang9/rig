@@ -48,8 +48,10 @@ published, merged, or deployed. M1's live exit gate remains open.
 | `scripts/check-generation.ps1` | Passed; OpenAPI routes and migration mirrors agree. |
 | `pnpm --dir web e2e` | Passed on this worktree: all 3 Chromium journeys, including the new real-controller scoped-secret check. |
 | `pnpm --dir web e2e --grep "bootstraps, restores"` | Passed after adding a real-controller browser check for a synthetic scoped server secret. Its save and reload responses were `no-store` and omitted the value; the reloaded replacement field, page text, URL, and browser storage did not contain it. The controller ran with the fake runtime, so no container was started. The first run failed on a test selector that changed when the row was named; the selector was corrected and the rerun passed. |
-| `examples/hosting-notes: pnpm test` and public-label `pnpm build` | Passed: 9 API tests, including no-network rejection of TLS-disable URL parameters, bounded HTTPS probe, and secret-safe responses; frontend fixture build passed. |
+| `examples/hosting-notes: pnpm test` and public-label `pnpm build` | Passed: 10 API tests, including no-network rejection of TLS-disable URL parameters, bounded HTTPS probe, IP-host SNI handling, and secret-safe responses; frontend fixture build passed. |
 | `examples/hosting-notes: pnpm test:https-local` | Passed after generating a disposable test CA with OpenSSL. The API test endpoint called the actual HTTPS stub through the backend client over loopback TLS; wrong token, missing CA, and wrong hostname returned generic 503 responses without credential text. The generated private keys were then removed. Test-only DNS mapping did not exercise container bridge egress. |
+| F7 test CA with `FIXTURE_HOST_GATEWAY_IP=127.0.0.1`, then `pnpm test:https-local` | Passed. Both fixture certificates carried the DNS SAN and a verified `127.0.0.1` IP SAN; the API's HTTPS client accepted the IP URL with the test CA and without IP SNI. Invalid IPv4 input was rejected before certificate generation. This was a loopback test, not a Docker gateway or PostgreSQL run; the disposable certificates were removed. |
+| Fixture step in Linux fast-verification CI | Added a locked fixture install, API tests, public-label frontend build, and the disposable localhost IP-SAN HTTPS smoke. Both edited workflow YAML files parsed locally; this CI step has not run because the branch has not been published. |
 | `go test -count=1 -run '^TestHostingNotesFixtureAcceptsReviewedFrontendAndBackendSetup$' ./internal/sourceinspection` | Passed. Rig selected the generated API and frontend candidate instead of the external harness Compose file; an explicit two-component plan with database-backed `/readyz` health was accepted. |
 | `go test -count=1 -run '^TestCompilerStagesHostingNotesFixtureWithoutDocker$' ./internal/generatedimage` | Passed with clean source and again after a local frontend build. The actual fixture's checked-in setup staged both component contexts with a fake Docker runner; source lockfile and app files were present, local `node_modules`, built assets, and test certificates were absent, and only the frontend received its public build value. No image was built. |
 | `go test -tags live_docker -run '^$' ./internal/generatedimage` | Passed compile-only. The existing direct Docker recipe test now supplies the required empty public-build-values mount; it was not executed without Docker. |
@@ -68,6 +70,9 @@ with accepted 256-character component IDs. All were corrected, with focused
 regression tests. A subsequent review also caught obsolete-scope removal
 payloads during plan rebinding; that path now sends a full replacement against
 the new plan and has storage/editor regression coverage.
+An independent IP/TLS diff review found no certificate-verification weakening;
+it identified and prompted correction of a fixture guide URL that still
+assumed unavailable in-container DNS.
 
 ## Acceptance status
 
@@ -78,7 +83,7 @@ the new plan and has storage/editor regression coverage.
 | CFG-09, CFG-10 | Literal-value, invalid-input, immutable storage, masking, admin/CSRF, and editor tests pass. | Run byte-exact deployed environment checks and inspect temporary files. |
 | CFG-11 | A real-controller Chromium run saved a synthetic server secret and confirmed `no-store`, omission from save/read responses, and absence from the reloaded field, page, URL, and browser storage. Unit/controller tests cover authorization and CSRF. | Inspect safe diagnostics and viewer behavior in a real controller session; repeat on an enabled generated runtime. |
 | CFG-13 | Approved migration allowlist, custom key names, missing/ambiguous key rejection, and short-lived runner tests pass. | Inspect a real migration container and approval journey. |
-| CFG-02 through CFG-05, CFG-12, CFG-14, CFG-15 | Fixture and supporting implementation exist; unit tests prove the HTTPS client requests verified TLS with server-only credentials and a total deadline. A real loopback HTTPS smoke with the actual stub passed positive and negative CA, token, and hostname cases. | Container bridge DNS/egress, TLS PostgreSQL, replacement/rotation/failure runs, private-build negative run, and crash cleanup are not verified. |
+| CFG-02 through CFG-05, CFG-12, CFG-14, CFG-15 | Fixture and supporting implementation exist; unit tests prove the HTTPS client requests verified TLS with server-only credentials and a total deadline. Real loopback HTTPS smokes with the actual stub passed DNS-name and IP-SAN positive cases plus negative CA, token, and hostname cases. Review found that the previous harness guide assumed a fixture hostname mapping the generated runtime does not provide; it now labels a numeric app-gateway/IP-SAN route as an unverified Docker trial. | Container bridge DNS/egress, TLS PostgreSQL, replacement/rotation/failure runs, private-build negative run, and crash cleanup are not verified. |
 
 Neither this Windows host nor its available WSL environment has a Docker or
 Podman CLI, so it cannot run BuildKit, a container,

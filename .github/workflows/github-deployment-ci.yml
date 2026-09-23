@@ -62,6 +62,17 @@ jobs:
       - name: Test frontend
         run: pnpm --dir web test
 
+      - name: Verify hosting fixture and local TLS
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --dir examples/hosting-notes install --frozen-lockfile
+          pnpm --dir examples/hosting-notes test
+          VITE_BUILD_LABEL=fixture-ci pnpm --dir examples/hosting-notes build
+          trap 'test ! -d examples/hosting-notes/harness/certs || rm -r -- examples/hosting-notes/harness/certs' EXIT
+          FIXTURE_HOST_GATEWAY_IP=127.0.0.1 sh examples/hosting-notes/harness/generate-test-ca.sh 2>/dev/null
+          FIXTURE_HOST_GATEWAY_IP=127.0.0.1 pnpm --dir examples/hosting-notes test:https-local
+
       - name: Check generated contracts and migrations
         run: sh scripts/check-generation.sh
 

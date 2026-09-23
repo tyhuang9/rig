@@ -33,6 +33,10 @@ pnpm schema:prepare
 pnpm start:api
 ```
 
+This host-side example assumes `postgres.fixture.test` already resolves to the
+controlled fixture host. Rig-generated containers do not receive that alias;
+see the F7 harness guide for the separate, currently unverified bridge route.
+
 `pnpm start:api` binds to `0.0.0.0`; the static frontend can be inspected with
 `pnpm start:web`, which also binds to `0.0.0.0`. A generated static deployment
 serves `frontend/dist` through its ingress instead of using Vite preview.
