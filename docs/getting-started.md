@@ -93,5 +93,5 @@ For generated applications, select **Analyze project** after choosing a local or
 - For the terminal interface and automation commands, see the [project README](https://github.com/tyhuang9/rig#operator-and-contributor-commands).
 
 ::: danger Docker is a trust boundary
-`--compose-runtime` authorizes Rig to use a controller-local Docker endpoint. Anyone who controls that endpoint can inspect or alter containers and their environment. Enable it only on a machine whose Docker administrators are trusted.
+`--compose-runtime` and `--generated-runtime` each authorize Rig to use a controller-local Docker endpoint. Anyone who controls that endpoint can inspect or alter containers and their environment. Enable either runtime only on a machine whose Docker administrators are trusted.
 :::

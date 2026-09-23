@@ -22,16 +22,16 @@ The official default identity and deterministic coverage for the connection flow
 
 ## Connect an account and repository
 
-1. In the dashboard, select **Add application**.
-2. Enter the application name and choose **GitHub repository**.
-3. Select **Sign in to GitHub**.
-4. Open the GitHub device-authorization link shown by Rig and enter the displayed code.
-5. Review the GitHub identity and permissions before authorizing.
-6. Use Rig's **Manage repository access** link to grant the app access to the intended account and repositories.
-7. Return to Rig and use the single repository picker, which aggregates repositories available through the saved connection's personal and organization installations. Select the repository and tracked branch. For a Compose application, also choose a discovered Compose file; a generated application continues to build and run setup instead.
+1. In the dashboard, open **Connections**.
+2. In the GitHub card, select **Connect GitHub**. If access was lost, select **Reconnect** instead. Rig saves one reusable connector per signed-in user and reuses it across that user's applications on this controller.
+3. Open the GitHub device-authorization link shown by Rig and enter the displayed code.
+4. Review the GitHub identity and permissions before authorizing.
+5. Use Rig's **Manage repository access** link to grant the app access to the intended account and repositories.
+6. In **Add application**, choose **GitHub repository**.
+7. Use the single repository picker, which aggregates repositories available through the saved connection's personal and organization installations. Select the repository and tracked branch. For a Compose application, also choose a discovered Compose file; a generated application continues to build and run setup instead.
 8. Run the exact-source inspection, resolve any findings, and save the application.
 
-Rig polls only while the short-lived authorization is pending. If the code expires or authorization is denied, start a new connection. Do not send the code to another person.
+Rig polls only while the short-lived authorization is pending. If checking is paused, select **Retry authorization check**. If the code expires or authorization is denied, select **Start new authorization** from the same saved connector to receive a fresh code. Do not send the code to another person.
 
 ## What access Rig uses
 
