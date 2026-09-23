@@ -41,7 +41,10 @@ serves `frontend/dist` through its ingress instead of using Vite preview.
 
 Rig's analyzer finds the API and frontend, then requests review because the
 Vite config and API port/readiness are not fully inferred. Use the generated
-JavaScript strategy and enter these component settings in the setup review:
+JavaScript strategy and enter these component settings in the setup review.
+The checked-in `rig-setup.json` is the exact input exercised by the fixture
+preflight tests; the dashboard still requires an administrator to review and
+accept the plan:
 
 | Setting | API server | Static frontend |
 | --- | --- | --- |

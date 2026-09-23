@@ -1,0 +1,30 @@
+{
+  "components": [
+    {
+      "id": "api",
+      "technology": "node",
+      "rootDirectory": "api",
+      "packageManager": "pnpm",
+      "nodeVersion": "24",
+      "installCommand": "pnpm install --frozen-lockfile",
+      "buildCommand": "",
+      "startCommand": "node src/server.js",
+      "outputDirectory": "",
+      "internalPort": 3000,
+      "healthProbe": "/readyz"
+    },
+    {
+      "id": "frontend",
+      "technology": "static",
+      "rootDirectory": "frontend",
+      "packageManager": "pnpm",
+      "nodeVersion": "24",
+      "installCommand": "pnpm install --frozen-lockfile",
+      "buildCommand": "pnpm build",
+      "startCommand": "",
+      "outputDirectory": "dist",
+      "internalPort": 8080,
+      "healthProbe": "/"
+    }
+  ]
+}

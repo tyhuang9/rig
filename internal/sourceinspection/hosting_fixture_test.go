@@ -1,6 +1,8 @@
 package sourceinspection_test
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -37,10 +39,14 @@ func TestHostingNotesFixtureAcceptsReviewedFrontendAndBackendSetup(t *testing.T)
 		t.Fatalf("wrong generated fixture components: %+v", roots)
 	}
 
-	setup := projectanalysis.DeploymentSetup{Components: []projectanalysis.SetupComponent{
-		{ID: "api", Technology: "node", RootDirectory: "api", PackageManager: "pnpm", NodeVersion: "24", InstallCommand: "pnpm install --frozen-lockfile", StartCommand: "node src/server.js", InternalPort: 3000, HealthProbe: "/readyz"},
-		{ID: "frontend", Technology: "static", RootDirectory: "frontend", PackageManager: "pnpm", NodeVersion: "24", InstallCommand: "pnpm install --frozen-lockfile", BuildCommand: "pnpm build", OutputDirectory: "dist", InternalPort: 8080, HealthProbe: "/"},
-	}}
+	setupBody, err := os.ReadFile(filepath.Join(root, "rig-setup.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var setup projectanalysis.DeploymentSetup
+	if err := json.Unmarshal(setupBody, &setup); err != nil {
+		t.Fatal(err)
+	}
 	plan, _, err := deploymentplans.AcceptSetup(result.Analysis, setup, deploymentplans.SourceIdentity{Provider: "local", ResolvedDigest: result.Analysis.StructuralFingerprint})
 	if err != nil {
 		t.Fatal(err)
