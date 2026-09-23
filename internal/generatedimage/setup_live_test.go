@@ -52,7 +52,11 @@ func TestLiveManualSetupRecipes(t *testing.T) {
 				args = append(args, "--secret", "id=rig-install-command,src="+layout.installCommand)
 			}
 			if tc.build != "" {
+				if err := writeBuildFile(layout.publicBuildValues, []byte("[]"), 0o600); err != nil {
+					t.Fatal(err)
+				}
 				args = append(args, "--secret", "id=rig-build-command,src="+layout.buildCommand)
+				args = append(args, "--secret", "id=rig-public-build-values,src="+layout.publicBuildValues)
 			}
 			args = append(args, layout.contextDirectory)
 			output, buildErr := exec.CommandContext(ctx, docker, args...).CombinedOutput()

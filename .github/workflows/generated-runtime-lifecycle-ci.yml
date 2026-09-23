@@ -19,7 +19,7 @@ jobs:
   generated-runtime-lifecycle:
     name: Disposable Docker blue-green verification
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 80
     steps:
       - name: Check out source
         timeout-minutes: 2
@@ -60,6 +60,18 @@ jobs:
           go test -tags live_docker -json -v -count=1 -timeout=10m ./internal/generatedimage -run "^${test_name}$" | tee "$output"
           jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
 
+      - name: Build hosting fixture API and frontend images
+        timeout-minutes: 18
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          test_name='TestLiveHostingNotesFixtureImages'
+          package_name='github.com/hostd/hostd/internal/generatedimage'
+          go test -tags live_docker -json -v -count=1 -timeout=16m ./internal/generatedimage -run "^${test_name}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
+
       - name: Build an undetected manual setup through the production compiler
         timeout-minutes: 10
         shell: bash
@@ -98,9 +110,10 @@ jobs:
           containers="$(docker ps --all --filter label=io.rig.managed --format '{{.ID}} {{.Names}} {{.Status}}')"
           networks="$(docker network ls --filter label=io.rig.managed --format '{{.ID}} {{.Name}}')"
           images="$(docker image ls --filter label=io.rig.managed=generated-image --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
+          fixture_images="$(docker image ls --filter 'reference=rig-live-hosting-notes:*' --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
           builders="$(docker ps --all --quiet --filter label=rig.controller=generated-builder)"
           builder_networks="$(docker network ls --quiet --filter label=rig.controller=generated-builder)"
-          if [[ -n "$containers" || -n "$networks" || -n "$images" || -n "$builders" || -n "$builder_networks" ]] || docker volume inspect rig-generated-caddy-config-v1 >/dev/null 2>&1; then
+          if [[ -n "$containers" || -n "$networks" || -n "$images" || -n "$fixture_images" || -n "$builders" || -n "$builder_networks" ]] || docker volume inspect rig-generated-caddy-config-v1 >/dev/null 2>&1; then
             printf 'Generated runtime resources were not cleaned up.\n' >&2
             exit 1
           fi
