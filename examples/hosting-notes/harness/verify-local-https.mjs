@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import { request as httpsRequest } from "node:https";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createApp } from "../api/src/app.js";
 import { probeHttpsDependency } from "../api/src/https-probe.js";
 
 const harnessDirectory = dirname(fileURLToPath(import.meta.url));
@@ -55,18 +57,40 @@ const localRequest = (options, callback) => httpsRequest({
     : done(null, "127.0.0.1", 4),
 }, callback);
 
+let apiServer;
 try {
   const port = await waitForStub();
-  const base = {
+  const env = {
+    TEST_FIXTURE_MODE: "1",
     HTTPS_DEPENDENCY_URL: `https://https.fixture.test:${port}/`,
     HTTPS_DEPENDENCY_TOKEN: token,
     HTTPS_DEPENDENCY_TLS_CA_PEM_BASE64: testCA.toString("base64"),
   };
-  await probeHttpsDependency(base, { request: localRequest });
-  await assert.rejects(probeHttpsDependency({ ...base, HTTPS_DEPENDENCY_TOKEN: "wrong-token" }, { request: localRequest }));
-  await assert.rejects(probeHttpsDependency({ ...base, HTTPS_DEPENDENCY_TLS_CA_PEM_BASE64: "" }, { request: localRequest }));
-  await assert.rejects(probeHttpsDependency({ ...base, HTTPS_DEPENDENCY_URL: `https://wrong.fixture.test:${port}/` }, { request: localRequest }));
-  console.log("Local HTTPS fixture: trusted CA and token accepted; wrong token, missing CA, and wrong hostname rejected.");
+  apiServer = createApp({
+    database: { query: async () => ({ rows: [] }) },
+    env,
+    dependencyProbe: (configuration) => probeHttpsDependency(configuration, { request: localRequest }),
+  }).listen(0, "127.0.0.1");
+  await once(apiServer, "listening");
+  const endpoint = `http://127.0.0.1:${apiServer.address().port}/api/test/dependency`;
+  const check = async (status, expectedBody) => {
+    const response = await fetch(endpoint);
+    const body = await response.text();
+    assert.equal(response.status, status);
+    assert.equal(body, expectedBody);
+    assert.ok(!body.includes(token) && !body.includes(env.HTTPS_DEPENDENCY_URL));
+  };
+  await check(200, '{"status":"ok","dependency":"reachable"}');
+  env.HTTPS_DEPENDENCY_TOKEN = "wrong-token";
+  await check(503, '{"error":"dependency_unavailable"}');
+  env.HTTPS_DEPENDENCY_TOKEN = token;
+  env.HTTPS_DEPENDENCY_TLS_CA_PEM_BASE64 = "";
+  await check(503, '{"error":"dependency_unavailable"}');
+  env.HTTPS_DEPENDENCY_TLS_CA_PEM_BASE64 = testCA.toString("base64");
+  env.HTTPS_DEPENDENCY_URL = `https://wrong.fixture.test:${port}/`;
+  await check(503, '{"error":"dependency_unavailable"}');
+  console.log("Local HTTPS fixture API: trusted CA and token accepted; wrong token, missing CA, and wrong hostname rejected without exposing credentials.");
 } finally {
+  if (apiServer) await new Promise((resolve) => apiServer.close(resolve));
   stub.kill();
 }

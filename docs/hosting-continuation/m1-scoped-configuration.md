@@ -48,7 +48,7 @@ published, merged, or deployed. M1's live exit gate remains open.
 | `scripts/check-generation.ps1` | Passed; OpenAPI routes and migration mirrors agree. |
 | `pnpm --dir web e2e` | Passed: 3 existing Chromium journeys. |
 | `examples/hosting-notes: pnpm test` and public-label `pnpm build` | Passed: 9 API tests, including no-network rejection of TLS-disable URL parameters, bounded HTTPS probe, and secret-safe responses; frontend fixture build passed. |
-| `examples/hosting-notes: pnpm test:https-local` | Passed after generating a disposable test CA with OpenSSL. The actual HTTPS stub and backend client completed a loopback TLS call; wrong token, missing CA, and wrong hostname were rejected. The generated private keys were then removed. Test-only DNS mapping did not exercise container bridge egress. |
+| `examples/hosting-notes: pnpm test:https-local` | Passed after generating a disposable test CA with OpenSSL. The API test endpoint called the actual HTTPS stub through the backend client over loopback TLS; wrong token, missing CA, and wrong hostname returned generic 503 responses without credential text. The generated private keys were then removed. Test-only DNS mapping did not exercise container bridge egress. |
 
 The security review identified a PostgreSQL URL TLS-parameter override, an
 empty legacy migration export with a nonempty allowlist, implicit legacy
