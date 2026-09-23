@@ -227,18 +227,19 @@ type RouteSwitcher interface {
 }
 
 type MigrationRequest struct {
-	AppID                       string
-	ReleaseID                   string
-	DeploymentID                string
-	ArtifactID                  string
-	DeploymentPlanRevisionID    string
-	ComponentName               string
-	RootDirectory               string
-	ImageContentID              string
-	Command                     string
-	ConfigurationRevisionID     string
-	ConfigurationRevisionNumber int64
-	AllowedEnvironmentKeys      []string
+	AppID                        string
+	ReleaseID                    string
+	DeploymentID                 string
+	ArtifactID                   string
+	DeploymentPlanRevisionID     string
+	DeploymentPlanRevisionNumber int64
+	ComponentName                string
+	RootDirectory                string
+	ImageContentID               string
+	Command                      string
+	ConfigurationRevisionID      string
+	ConfigurationRevisionNumber  int64
+	AllowedEnvironmentKeys       []string
 }
 
 // MigrationRunner is implemented separately because a migration has a

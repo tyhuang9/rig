@@ -189,7 +189,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err := step("compiler_create"); err != nil {
 			return runtimeComposition{}, err
 		}
-		compiler, err := generatedimage.NewCompiler(dependencies.snapshots, dependencies.plans, artifacts, buildTemporary, builder, options.runner, generatedimage.CompilerOptions{})
+		compiler, err := generatedimage.NewCompiler(dependencies.snapshots, dependencies.plans, dependencies.configuration, artifacts, buildTemporary, builder, options.runner, generatedimage.CompilerOptions{})
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated compiler setup: %w", err)
 		}

@@ -191,6 +191,8 @@ button:disabled { cursor: wait; opacity: .62; }
 .field-label { color: #4e5561; font-size: 12px; font-weight: 650; }
 .field input { width: 100%; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #737d8d; border-radius: 8px; background: #fff; color: #17191d; }
 .field input[aria-invalid="true"] { border-color: #b43d44; }
+.field #deployment-setup-migration-environment-keys { width: 100%; min-width: 0; min-height: 96px; padding: 9px 10px; border: 1px solid #737d8d; border-radius: 8px; background: #fff; color: #17191d; line-height: 1.5; resize: vertical; }
+.field #deployment-setup-migration-environment-keys[aria-invalid="true"] { border-color: #b43d44; }
 .form-error { margin: 0; color: #a42f37; font-size: 12px; }
 .wizard form > .save-help { max-width: 680px; margin: 16px 0 0; color: #4e5561; font-size: 12px; line-height: 1.5; }
 .error-summary { margin: 14px 0; padding: 10px 12px; border: 1px solid #efc3c6; border-radius: 8px; background: #fff0f1; color: #842a31; font-size: 12px; }
@@ -312,6 +314,20 @@ button:disabled { cursor: wait; opacity: .62; }
 .configuration-footer { align-items: center; min-height: 44px; margin-top: 20px; padding-top: 16px; border-top: 1px solid #e3e6ea; }
 .configuration-footer [role="status"] { color: #195e47; font-size: 12px; }
 .configuration-panel .error-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.scoped-plan-identity { margin: 8px 0 0; color: #4e5561; font-size: 12px; font-weight: 650; }
+.scoped-configuration-review, .scoped-build-disclosure { display: grid; gap: 12px; margin-top: 18px; padding: 14px; border: 1px solid #d6c289; border-radius: 9px; background: #fff9eb; }
+.scoped-configuration-review { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.scoped-configuration-review h3, .scoped-build-disclosure h3 { margin: 0; font-size: 14px; }
+.scoped-configuration-review p, .scoped-build-disclosure p { margin: 5px 0 0; color: #5b512e; font-size: 12px; line-height: 1.5; }
+.scoped-plan-drift { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; margin-top: 18px; padding: 14px; border: 1px solid #d39a9a; border-radius: 9px; background: #fff5f5; }
+.scoped-plan-drift h3 { margin: 0; font-size: 14px; }
+.scoped-plan-drift p { margin: 5px 0 0; color: #713c3c; font-size: 12px; line-height: 1.5; }
+.scoped-configuration-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.scoped-configuration-fields { display: grid; grid-template-columns: minmax(140px, .8fr) minmax(170px, .9fr) minmax(170px, .9fr) minmax(190px, 1.1fr) auto; align-items: end; gap: 10px; min-width: 0; }
+.scoped-configuration-row .field { max-width: none; min-width: 0; margin: 0; }
+.scoped-configuration-row .field input, .scoped-configuration-row .field select { height: 40px; }
+.scoped-build-disclosure label { display: flex; align-items: flex-start; gap: 8px; color: #343a45; font-size: 12px; font-weight: 650; line-height: 1.5; }
+.scoped-build-disclosure input { flex: 0 0 auto; margin-top: 2px; }
 
 .auto-deploy-panel { margin-top: 28px; padding: 20px; border: 1px solid #e3e6ea; border-radius: 10px; background: #fff; }
 .auto-deploy-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
@@ -463,9 +479,11 @@ button:disabled { cursor: wait; opacity: .62; }
   .source-panel { width: 100%; }
   .summary, .machine-list, .relay-bindings { grid-template-columns: 1fr; }
   .configuration-row-fields { grid-template-columns: 1fr 1fr; }
+  .scoped-configuration-fields { grid-template-columns: 1fr 1fr; }
   .component-advanced { grid-template-columns: 1fr; }
   .configuration-remove { grid-column: 1 / -1; justify-self: start; }
   .configuration-row-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; }
+  .scoped-configuration-fields .configuration-row-actions { grid-column: 1 / -1; }
   .deployment-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .deployment-result { grid-column: 1 / -1; }
 }
@@ -511,8 +529,14 @@ button:disabled { cursor: wait; opacity: .62; }
   .repository-analysis-prompt { min-height: 330px; font-size: 16px; }
   .configuration-row { width: 100%; }
   .configuration-row-fields { grid-template-columns: minmax(0, 1fr); }
+  .scoped-configuration-fields { grid-template-columns: minmax(0, 1fr); }
   .configuration-remove { grid-column: auto; width: 100%; }
   .configuration-row-actions { grid-column: auto; display: grid; }
+  .scoped-configuration-fields .configuration-row-actions { grid-column: auto; }
+  .scoped-configuration-review { grid-template-columns: minmax(0, 1fr); }
+  .scoped-configuration-review .button { width: 100%; }
+  .scoped-plan-drift { grid-template-columns: minmax(0, 1fr); }
+  .scoped-plan-drift .button { width: 100%; }
   .configuration-group-heading .button, .configuration-footer .button, .configuration-panel .error-summary .button { width: 100%; }
   .configuration-panel .error-summary { align-items: stretch; flex-direction: column; }
   .auto-deploy-panel { padding: 16px 14px; overflow: hidden; }

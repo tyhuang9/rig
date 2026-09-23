@@ -7,16 +7,19 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
+	"unicode/utf8"
 
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deploymentplans"
 )
 
-const CompilerVersion = "generated-node-v4"
+const CompilerVersion = "generated-node-v5"
 
 const (
 	installShellScript = `install=$(cat /run/rig/install.path) && rig_command=$(cat /run/secrets/rig-install-command) && cd -- "/workspace/$install" && exec /bin/sh -lc "$rig_command"`
-	buildShellScript   = `root=$(cat /run/rig/root.path) && rig_command=$(cat /run/secrets/rig-build-command) && cd -- "/workspace/$root" && exec /bin/sh -lc "$rig_command"`
+	buildShellScript   = `root=$(cat /run/rig/root.path) && rig_command=$(cat /run/secrets/rig-build-command) && cd -- "/workspace/$root" && exec node /run/rig/run-build.mjs "$rig_command"`
 )
 
 var nodeImages = map[string]string{
@@ -42,24 +45,50 @@ type componentDefinition struct {
 }
 
 type digestDefinition struct {
-	CompilerVersion  string `json:"compilerVersion"`
-	PlanDigest       string `json:"planDigest"`
-	Component        string `json:"component"`
-	Role             string `json:"role"`
-	RootDirectory    string `json:"rootDirectory"`
-	PackageManager   string `json:"packageManager"`
-	InstallBehavior  string `json:"installBehavior"`
-	InstallDirectory string `json:"installDirectory"`
-	BuildCommand     string `json:"buildCommand"`
-	RunCommand       string `json:"runCommand"`
-	NodeVersion      string `json:"nodeVersion"`
-	InternalPort     uint16 `json:"internalPort"`
-	HealthProbe      string `json:"healthProbe"`
-	BaseImage        string `json:"baseImage"`
-	RecipeDigest     string `json:"recipeDigest"`
+	CompilerVersion   string                 `json:"compilerVersion"`
+	PlanDigest        string                 `json:"planDigest"`
+	Component         string                 `json:"component"`
+	Role              string                 `json:"role"`
+	RootDirectory     string                 `json:"rootDirectory"`
+	PackageManager    string                 `json:"packageManager"`
+	InstallBehavior   string                 `json:"installBehavior"`
+	InstallDirectory  string                 `json:"installDirectory"`
+	BuildCommand      string                 `json:"buildCommand"`
+	RunCommand        string                 `json:"runCommand"`
+	NodeVersion       string                 `json:"nodeVersion"`
+	InternalPort      uint16                 `json:"internalPort"`
+	HealthProbe       string                 `json:"healthProbe"`
+	BaseImage         string                 `json:"baseImage"`
+	RecipeDigest      string                 `json:"recipeDigest"`
+	PublicBuildValues []appconfig.ValueInput `json:"publicBuildValues,omitempty"`
+}
+
+func canonicalPublicBuildValues(values []appconfig.ValueInput) ([]appconfig.ValueInput, error) {
+	if len(values) > 256 {
+		return nil, errors.New("too many public build values")
+	}
+	canonical := make([]appconfig.ValueInput, len(values))
+	copy(canonical, values)
+	sort.Slice(canonical, func(i, j int) bool { return canonical[i].Key < canonical[j].Key })
+	for i, value := range canonical {
+		if err := appconfig.ValidateScopedEnvironmentKey(value.Key); err != nil {
+			return nil, err
+		}
+		if !utf8.ValidString(value.Value) || strings.ContainsAny(value.Value, "\x00\r\n") || len(value.Value) > 8<<10 {
+			return nil, errors.New("invalid public build value")
+		}
+		if i > 0 && canonical[i-1].Key == value.Key {
+			return nil, errors.New("duplicate public build key")
+		}
+	}
+	return canonical, nil
 }
 
 func definitionFor(revision deploymentplans.DeploymentPlanRevision, componentName string) (componentDefinition, string, error) {
+	return definitionForBuild(revision, componentName, nil)
+}
+
+func definitionForBuild(revision deploymentplans.DeploymentPlanRevision, componentName string, publicValues []appconfig.ValueInput) (componentDefinition, string, error) {
 	if revision.Plan.Strategy != deploymentplans.StrategyGeneratedNode || revision.CanonicalDigest == "" {
 		return componentDefinition{}, "", errors.New("generated plan required")
 	}
@@ -87,13 +116,13 @@ func definitionFor(revision deploymentplans.DeploymentPlanRevision, componentNam
 		staticOutputDirectory: component.StaticOutputDirectory,
 	}
 	recipe := componentContainerfile(definition)
-	recipeSum := sha256.Sum256([]byte(recipe + entrypointScript + staticLauncherScript + staticServerScript + staticOutputCheckScript))
+	recipeSum := sha256.Sum256([]byte(recipe + entrypointScript + staticLauncherScript + staticServerScript + staticOutputCheckScript + publicBuildRunnerScript))
 	canonical, err := json.Marshal(digestDefinition{
 		CompilerVersion: CompilerVersion, PlanDigest: revision.CanonicalDigest, Component: definition.name,
 		Role: definition.role, RootDirectory: definition.rootDirectory, PackageManager: definition.packageManager,
 		InstallBehavior: definition.installBehavior, InstallDirectory: definition.installDirectory, BuildCommand: definition.buildCommand,
 		RunCommand: definition.runCommand, NodeVersion: definition.nodeVersion, InternalPort: definition.internalPort,
-		HealthProbe: definition.healthProbe, BaseImage: definition.baseImage, RecipeDigest: hex.EncodeToString(recipeSum[:]),
+		HealthProbe: definition.healthProbe, BaseImage: definition.baseImage, RecipeDigest: hex.EncodeToString(recipeSum[:]), PublicBuildValues: publicValues,
 	})
 	if err != nil {
 		return componentDefinition{}, "", err
@@ -126,7 +155,7 @@ func containerfileWithOptions(hasInstall, hasBuild, enableCorepack, staticOutput
 		staticCheck = "RUN [\"node\", \"/run/rig/check-static.mjs\"]\n"
 	}
 	if hasBuild {
-		build = commandSecretRun("rig-build-command", buildShellScript)
+		build = publicBuildSecretRun(buildShellScript)
 	}
 	return fmt.Sprintf(`FROM %s AS builder
 %sWORKDIR /workspace
@@ -144,7 +173,22 @@ COPY --chmod=0555 rig/rig-static /usr/local/bin/rig-static
 COPY --chmod=0444 rig/rig-static.mjs /usr/local/lib/rig/static.mjs
 USER node
 ENTRYPOINT ["/usr/local/bin/rig-entrypoint"]
-`, baseImage, corepack, staticFiles, install, build, staticCheck, baseImage, corepack)
+`, baseImage, corepack, staticFiles+buildRunnerCopy(hasBuild), install, build, staticCheck, baseImage, corepack)
+}
+
+func buildRunnerCopy(hasBuild bool) string {
+	if !hasBuild {
+		return ""
+	}
+	return "COPY --chmod=0444 rig/run-build.mjs /run/rig/run-build.mjs\n"
+}
+
+func publicBuildSecretRun(script string) string {
+	argv, err := json.Marshal([]string{"/bin/sh", "-c", script})
+	if err != nil {
+		panic("marshal fixed generated build argv: " + err.Error())
+	}
+	return "RUN --mount=type=secret,id=rig-build-command,required=true,uid=1000,gid=1000,mode=0400 --mount=type=secret,id=rig-public-build-values,required=true,uid=1000,gid=1000,mode=0400 " + string(argv) + "\n"
 }
 
 func commandSecretRun(secretID, script string) string {
@@ -170,8 +214,32 @@ func writeRecipe(layout buildLayout, definition componentDefinition) error {
 			return err
 		}
 	}
+	if definition.buildCommand != "" {
+		if err := writeBuildFile(filepath.Join(layout.contextDirectory, "rig", "run-build.mjs"), []byte(publicBuildRunnerScript), 0o600); err != nil {
+			return err
+		}
+	}
 	return writeBuildFile(layout.containerfile, []byte(componentContainerfile(definition)), 0o600)
 }
+
+const publicBuildRunnerScript = `import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+
+const values = JSON.parse(readFileSync("/run/secrets/rig-public-build-values", "utf8"));
+if (!Array.isArray(values)) process.exit(64);
+const environment = { ...process.env };
+const seen = new Set();
+for (const entry of values) {
+  if (entry === null || typeof entry.key !== "string" || typeof entry.value !== "string" ||
+      !/^[A-Za-z_][A-Za-z0-9_]*$/.test(entry.key) || seen.has(entry.key)) process.exit(64);
+  seen.add(entry.key);
+  environment[entry.key] = entry.value;
+}
+const result = spawnSync("/bin/sh", ["-lc", process.argv[2]], { env: environment, stdio: "inherit" });
+if (result.error) process.exit(127);
+if (result.signal) process.kill(process.pid, result.signal);
+process.exit(result.status ?? 1);
+`
 
 const staticOutputCheckScript = `import { readFileSync, lstatSync, realpathSync } from "node:fs";
 import { resolve, sep, relative } from "node:path";

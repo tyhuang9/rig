@@ -377,22 +377,35 @@ func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.Deploym
 		return resolvedDeployment{}, codedError("invalid_source")
 	}
 
-	var configuration appconfig.ExecutionConfiguration
+	var configurationID string
+	var configurationNumber int64
 	if deployment.ProvenanceInitialized {
 		if deployment.RuntimeStrategy != deployments.RuntimeGeneratedNode || deployment.DeploymentPlanRevisionID != plan.ID || deployment.DeploymentPlanRevisionNumber != plan.RevisionNumber {
 			return resolvedDeployment{}, codedError("invalid_source")
 		}
-		configuration, err = e.configuration.ExportRevisionForExecution(ctx, job.ResourceID, deployment.ActualConfigurationRevisionID, deployment.ActualConfigurationRevisionNumber)
+		configurationID, configurationNumber = deployment.ActualConfigurationRevisionID, deployment.ActualConfigurationRevisionNumber
 	} else if input.ConfigurationMode == jobs.ConfigurationOriginal {
-		configuration, err = e.configuration.ExportRevisionForExecution(ctx, job.ResourceID, release.ConfigurationRevisionID, release.ConfigurationRevisionNumber)
+		configurationID, configurationNumber = release.ConfigurationRevisionID, release.ConfigurationRevisionNumber
 	} else {
-		configuration, err = e.configuration.ExportCurrentForExecution(ctx, job.ResourceID)
+		var identity appconfig.RevisionIdentity
+		identity, err = e.configuration.RevisionIdentity(ctx, job.ResourceID)
+		if err != nil {
+			return resolvedDeployment{}, codedError("configuration_unavailable")
+		}
+		configurationID, configurationNumber = identity.RevisionID, identity.RevisionNumber
 	}
-	if err != nil {
+	if configurationNumber < 0 || (configurationNumber == 0) != (configurationID == "") {
 		return resolvedDeployment{}, codedError("configuration_unavailable")
 	}
-	configurationID, configurationNumber := configuration.RevisionID, configuration.RevisionNumber
-	configuration.Clear()
+	if configurationNumber > 0 {
+		identity, identityErr := e.configuration.ExactRevisionIdentity(ctx, job.ResourceID, configurationID, configurationNumber)
+		if identityErr != nil {
+			return resolvedDeployment{}, codedError("configuration_unavailable")
+		}
+		if identity.RevisionID != configurationID || identity.RevisionNumber != configurationNumber || identity.FormatVersion < 2 || identity.DeploymentPlanRevisionID != plan.ID || identity.DeploymentPlanRevisionNumber != plan.RevisionNumber {
+			return resolvedDeployment{}, codedError("configuration_review_required")
+		}
+	}
 
 	if !deployment.ProvenanceInitialized {
 		deployment, err = e.deployments.InitializeRuntime(ctx, job.ResourceID, deployment.ID, release.ID, configurationID, configurationNumber, deployments.RuntimeGeneratedNode, plan.ID, plan.RevisionNumber)
@@ -445,6 +458,19 @@ func cancellationCode(ctx context.Context) string {
 }
 
 func runtimeFailure(ctx context.Context, err error, fallback generatedruntimestate.DiagnosticCode) (string, generatedruntimestate.DiagnosticCode) {
+	var runtimeErr *runtimeError
+	if (errors.As(err, &runtimeErr) && runtimeErr.code == "configuration_review_required") || generatedimage.IsCompileCode(err, "configuration_review_required") {
+		return "configuration_review_required", generatedruntimestate.DiagnosticInternalError
+	}
+	if errors.As(err, &runtimeErr) && runtimeErr.code == "configuration_unavailable" {
+		return "configuration_unavailable", generatedruntimestate.DiagnosticInternalError
+	}
+	if generatedimage.IsCompileCode(err, "build_configuration_requires_build_command") {
+		return "build_configuration_requires_build_command", generatedruntimestate.DiagnosticInternalError
+	}
+	if generatedimage.IsCompileCode(err, "configuration_unavailable") {
+		return "configuration_unavailable", generatedruntimestate.DiagnosticInternalError
+	}
 	if errors.Is(err, context.Canceled) || generatedruntime.IsCode(err, generatedruntime.DiagnosticCancelled) || generatedimage.IsCompileCode(err, string(generatedimage.DiagnosticBuildCancelled)) {
 		return cancellationCode(ctx), generatedruntimestate.DiagnosticCancelled
 	}

@@ -401,6 +401,7 @@ export function ApplicationPlanPanel({ app }: { app: Application }) {
         <DeploymentPlanReview
           inspection={inspection ?? undefined}
           initialSetup={directEditableSetup && accepted ? deploymentSetupFromRevision(accepted) : undefined}
+          initialMigrationEnvironmentKeys={directEditableSetup && accepted ? accepted.migration.environmentKeys ?? [] : undefined}
           expectedRevisionNumber={inspectionRevision}
           pending={accepting || inspectionPending}
           error={reviewError}

@@ -174,6 +174,7 @@ func runLiveGeneratedImageCompiler(t *testing.T, manual bool) {
 	compiler, err := NewCompiler(
 		releaseReader,
 		compilerPlanReader{revision: revision},
+		&compilerConfiguration{},
 		artifacts,
 		temporary,
 		builderObservation,
@@ -183,7 +184,7 @@ func runLiveGeneratedImageCompiler(t *testing.T, manual bool) {
 	if err != nil {
 		t.Fatal("live generated image compiler configuration failed")
 	}
-	artifact, err := compiler.Compile(liveContext, appID, releaseID, "app")
+	artifact, err := compiler.Compile(liveContext, appID, releaseID, "app", "", 0)
 	if err != nil {
 		t.Fatalf("live generated image production compile failed: diagnostic=%s,builder_status=%s,build_status=%s", liveGeneratedImageFailureCode(err), builderObservation.status, buildObservation.status)
 	}

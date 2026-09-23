@@ -51,19 +51,32 @@ func (f *fakeReleases) ReadyWorkspace(context.Context, string, string) (releases
 }
 
 type fakeConfiguration struct {
-	exports int
-	value   []byte
+	exports        int
+	value          []byte
+	currentID      string
+	currentNumber  int64
+	exportMismatch bool
 }
 
-func (f *fakeConfiguration) ExportCurrentForExecution(context.Context, string) (appconfig.ExecutionConfiguration, error) {
-	return f.export(), nil
+func (f *fakeConfiguration) RevisionIdentity(context.Context, string) (appconfig.RevisionIdentity, error) {
+	id, number := f.currentID, f.currentNumber
+	if id == "" {
+		id, number = testConfigID, 3
+	}
+	return appconfig.RevisionIdentity{RevisionID: id, RevisionNumber: number, FormatVersion: 2, DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2}, nil
 }
-func (f *fakeConfiguration) ExportRevisionForExecution(context.Context, string, string, int64) (appconfig.ExecutionConfiguration, error) {
-	return f.export(), nil
+func (f *fakeConfiguration) ExactRevisionIdentity(_ context.Context, _, revisionID string, revisionNumber int64) (appconfig.RevisionIdentity, error) {
+	return appconfig.RevisionIdentity{RevisionID: revisionID, RevisionNumber: revisionNumber, FormatVersion: 2, DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2}, nil
 }
-func (f *fakeConfiguration) export() appconfig.ExecutionConfiguration {
+func (f *fakeConfiguration) ExportComponentRuntimeForExecution(_ context.Context, _, revisionID string, revisionNumber int64, _ string, _ int64, _ string) (appconfig.ExecutionConfiguration, error) {
+	if f.exportMismatch {
+		revisionNumber++
+	}
+	return f.export(revisionID, revisionNumber), nil
+}
+func (f *fakeConfiguration) export(revisionID string, revisionNumber int64) appconfig.ExecutionConfiguration {
 	f.exports++
-	return appconfig.ExecutionConfiguration{RevisionID: testConfigID, RevisionNumber: 3, Environment: append([]byte(nil), f.value...)}
+	return appconfig.ExecutionConfiguration{RevisionID: revisionID, RevisionNumber: revisionNumber, Environment: append([]byte(nil), f.value...)}
 }
 
 type fakeDeployments struct {
@@ -114,10 +127,12 @@ type fakeCompiler struct {
 	events    *[]string
 	artifacts []generatedimage.Artifact
 	calls     int
+	pins      []appconfig.RevisionIdentity
 }
 
-func (f *fakeCompiler) Compile(context.Context, string, string, string) (generatedimage.Artifact, error) {
+func (f *fakeCompiler) Compile(_ context.Context, _, _, _, configurationID string, configurationNumber int64) (generatedimage.Artifact, error) {
 	*f.events = append(*f.events, "compile")
+	f.pins = append(f.pins, appconfig.RevisionIdentity{RevisionID: configurationID, RevisionNumber: configurationNumber})
 	index := f.calls
 	f.calls++
 	if index >= len(f.artifacts) {
@@ -405,6 +420,7 @@ func (f *fakeReporter) Report(update jobs.ProgressUpdate) error {
 
 type executorFixture struct {
 	executor      *Executor
+	configuration *fakeConfiguration
 	deployments   *fakeDeployments
 	state         *fakeRuntimeState
 	compiler      *fakeCompiler
@@ -431,6 +447,7 @@ func newExecutorFixture(t *testing.T, migration bool) *executorFixture {
 	deploymentsFake := &fakeDeployments{deployment: deployments.Deployment{ID: testDeploymentID, AppID: testAppID, JobID: testJobID, Status: deployments.Preparing, ConfigurationMode: "current"}}
 	state := &fakeRuntimeState{active: generatedruntimestate.ActiveHead{AppID: testAppID}, migrationRequired: migration}
 	compiler := &fakeCompiler{events: &events, artifacts: []generatedimage.Artifact{artifact}}
+	configuration := &fakeConfiguration{value: []byte("DATABASE_URL='secret'\n")}
 	artifacts := &fakeArtifacts{values: map[string]generatedimage.Artifact{artifact.ID: artifact}}
 	runtime := &fakeRuntime{events: &events}
 	authorization := &fakeAuthorization{events: &events, deployments: deploymentsFake}
@@ -438,13 +455,13 @@ func newExecutorFixture(t *testing.T, migration bool) *executorFixture {
 	migrations := &fakeMigrations{events: &events}
 	executor, err := NewExecutor(
 		&fakeApplications{app: apps.Application{ID: testAppID, Source: apps.Source{Type: apps.SourceLocal, Path: `C:\source`}}},
-		&fakeReleases{release: release}, &fakeConfiguration{value: []byte("DATABASE_URL='secret'\n")}, deploymentsFake,
+		&fakeReleases{release: release}, configuration, deploymentsFake,
 		&fakePlans{revision: plan}, compiler, artifacts, state, runtime, authorization, routes, migrations, Options{},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &executorFixture{executor: executor, deployments: deploymentsFake, state: state, compiler: compiler, artifacts: artifacts, runtime: runtime, authorization: authorization, routes: routes, migrations: migrations, reporter: &fakeReporter{}, events: &events, plan: plan}
+	return &executorFixture{executor: executor, configuration: configuration, deployments: deploymentsFake, state: state, compiler: compiler, artifacts: artifacts, runtime: runtime, authorization: authorization, routes: routes, migrations: migrations, reporter: &fakeReporter{}, events: &events, plan: plan}
 }
 
 func readyArtifact(id string) generatedimage.Artifact {
@@ -599,6 +616,33 @@ func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen
 	}
 	if endpoints := fixture.routes.requests[0].Endpoints; len(endpoints) != 1 || endpoints[0].Role != generatedruntime.RoleServer {
 		t.Fatalf("route endpoints=%+v", endpoints)
+	}
+}
+
+func TestGeneratedExecutorUsesCurrentConfigurationOnSameSourceRelease(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	const currentConfigurationID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	fixture.configuration.currentID = currentConfigurationID
+	fixture.configuration.currentNumber = 4
+	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	if err != nil || result.CompletionCode != "deployment_completed" {
+		t.Fatalf("same-source redeploy: result=%+v err=%v", result, err)
+	}
+	if fixture.deployments.deployment.ActualConfigurationRevisionID != currentConfigurationID || fixture.deployments.deployment.ActualConfigurationRevisionNumber != 4 {
+		t.Fatalf("deployment did not pin current configuration: %+v", fixture.deployments.deployment)
+	}
+	if len(fixture.compiler.pins) != 1 || fixture.compiler.pins[0].RevisionID != currentConfigurationID || fixture.compiler.pins[0].RevisionNumber != 4 {
+		t.Fatalf("compiler used release configuration rather than selected current revision: %+v", fixture.compiler.pins)
+	}
+}
+
+func TestGeneratedExecutorRejectsRuntimeExportWithDifferentConfigurationPin(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.configuration.exportMismatch = true
+	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	requireExecutionErrorCode(t, err, "configuration_unavailable")
+	if len(fixture.runtime.createdSpecs) != 0 {
+		t.Fatalf("mismatched runtime configuration reached Docker: creates=%d", len(fixture.runtime.createdSpecs))
 	}
 }
 

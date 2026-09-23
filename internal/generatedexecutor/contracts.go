@@ -31,8 +31,9 @@ type releaseResolver interface {
 }
 
 type configurationExporter interface {
-	ExportCurrentForExecution(context.Context, string) (appconfig.ExecutionConfiguration, error)
-	ExportRevisionForExecution(context.Context, string, string, int64) (appconfig.ExecutionConfiguration, error)
+	RevisionIdentity(context.Context, string) (appconfig.RevisionIdentity, error)
+	ExactRevisionIdentity(context.Context, string, string, int64) (appconfig.RevisionIdentity, error)
+	ExportComponentRuntimeForExecution(context.Context, string, string, int64, string, int64, string) (appconfig.ExecutionConfiguration, error)
 }
 
 type deploymentStore interface {
@@ -47,7 +48,7 @@ type planReader interface {
 }
 
 type imageCompiler interface {
-	Compile(context.Context, string, string, string) (generatedimage.Artifact, error)
+	Compile(context.Context, string, string, string, string, int64) (generatedimage.Artifact, error)
 }
 
 type artifactStore interface {

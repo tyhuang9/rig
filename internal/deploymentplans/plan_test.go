@@ -74,9 +74,14 @@ func TestMigrationIsBoundToAcceptedComponentAndExplicitEnvironmentKeys(t *testin
 		t.Fatal("mismatched migration root accepted")
 	}
 	plan = testPlan()
-	plan.Migration.EnvironmentKeys = []string{"AWS_SECRET_ACCESS_KEY"}
+	plan.Migration.EnvironmentKeys = []string{"RIG_INTERNAL"}
 	if _, err := CanonicalDigest(plan); err == nil {
-		t.Fatal("unsupported migration environment key accepted")
+		t.Fatal("reserved migration environment key accepted")
+	}
+	plan = testPlan()
+	plan.Migration.EnvironmentKeys = []string{"DIRECT_DATABASE_URL"}
+	if _, err := CanonicalDigest(plan); err != nil {
+		t.Fatalf("application-chosen migration key rejected: %v", err)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/generatedimage"
 	"github.com/hostd/hostd/internal/generatedruntime"
@@ -46,7 +47,7 @@ func (e *Executor) build(ctx context.Context, resolved resolvedDeployment, runti
 }
 
 func (e *Executor) compileValidated(ctx context.Context, resolved resolvedDeployment, component string) (generatedimage.Artifact, error) {
-	artifact, err := e.compiler.Compile(ctx, resolved.deployment.AppID, resolved.release.ID, component)
+	artifact, err := e.compiler.Compile(ctx, resolved.deployment.AppID, resolved.release.ID, component, resolved.configurationID, resolved.configurationNumber)
 	if err != nil {
 		return generatedimage.Artifact{}, err
 	}
@@ -63,7 +64,7 @@ func (e *Executor) compileValidated(ctx context.Context, resolved resolvedDeploy
 	if _, markErr := e.artifacts.MarkUnavailable(ctx, artifact.ID); markErr != nil {
 		return generatedimage.Artifact{}, staticError("mark image unavailable")
 	}
-	artifact, err = e.compiler.Compile(ctx, resolved.deployment.AppID, resolved.release.ID, component)
+	artifact, err = e.compiler.Compile(ctx, resolved.deployment.AppID, resolved.release.ID, component, resolved.configurationID, resolved.configurationNumber)
 	if err != nil {
 		return generatedimage.Artifact{}, err
 	}
@@ -133,7 +134,7 @@ func (e *Executor) runMigration(ctx context.Context, resolved resolvedDeployment
 	runtimeDeployment = updated
 	err = e.migrations.Run(ctx, generatedruntime.MigrationRequest{
 		AppID: resolved.deployment.AppID, ReleaseID: resolved.release.ID, DeploymentID: resolved.deployment.ID,
-		ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID,
+		ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, DeploymentPlanRevisionNumber: resolved.plan.RevisionNumber,
 		ComponentName: migration.ComponentName, RootDirectory: migration.RootDirectory,
 		ImageContentID: artifact.ImageContentID, Command: migration.Command,
 		ConfigurationRevisionID: resolved.configurationID, ConfigurationRevisionNumber: resolved.configurationNumber,
@@ -171,8 +172,15 @@ func (e *Executor) startCandidates(ctx context.Context, job jobs.Job, resolved r
 			if _, err = e.state.SetContainerStarting(ctx, resolved.deployment.AppID, resolved.deployment.ID, component.Name, description.ContainerName); err != nil {
 				return result, staticError("persist candidate intent")
 			}
-			configuration, err := e.configuration.ExportRevisionForExecution(ctx, resolved.deployment.AppID, resolved.configurationID, resolved.configurationNumber)
+			configuration, err := e.configuration.ExportComponentRuntimeForExecution(ctx, resolved.deployment.AppID, resolved.configurationID, resolved.configurationNumber, resolved.plan.ID, resolved.plan.RevisionNumber, component.Name)
 			if err != nil {
+				if appconfig.IsCode(err, "configuration_review_required") {
+					return result, codedError("configuration_review_required")
+				}
+				return result, codedError("configuration_unavailable")
+			}
+			if configuration.RevisionID != resolved.configurationID || configuration.RevisionNumber != resolved.configurationNumber {
+				configuration.Clear()
 				return result, codedError("configuration_unavailable")
 			}
 			candidate, createErr := e.runtime.CreateInactiveCandidate(ctx, generatedruntime.CandidateSpec{

@@ -94,7 +94,7 @@ func TestWorkspaceRootInstallRecipeUsesSeparateWorkingDirectories(t *testing.T) 
 			}
 			recipe := containerfile(true, test.manager != "npm", definition.baseImage)
 			assertCommandSecretRun(t, recipe, "rig-install-command", `install=$(cat /run/rig/install.path) && rig_command=$(cat /run/secrets/rig-install-command) && cd -- "/workspace/$install" && exec /bin/sh -lc "$rig_command"`)
-			assertCommandSecretRun(t, recipe, "rig-build-command", `root=$(cat /run/rig/root.path) && rig_command=$(cat /run/secrets/rig-build-command) && cd -- "/workspace/$root" && exec /bin/sh -lc "$rig_command"`)
+			assertCommandSecretRun(t, recipe, "rig-build-command", `root=$(cat /run/rig/root.path) && rig_command=$(cat /run/secrets/rig-build-command) && cd -- "/workspace/$root" && exec node /run/rig/run-build.mjs "$rig_command"`)
 			assertWorkspaceOwnershipRun(t, recipe)
 			assertSelectorDirectoryRun(t, recipe)
 			if !hasExactRecipeLine(recipe, "COPY --chown=1000:1000 --chmod=0400 rig/root.path rig/install.path /run/rig/") {
@@ -214,6 +214,9 @@ func parseRunExecInstructions(t *testing.T, recipe string) []parsedRunInstructio
 func assertCommandSecretRun(t *testing.T, recipe, secretID, wantScript string) {
 	t.Helper()
 	wantOptions := "--mount=type=secret,id=" + secretID + ",required=true,uid=1000,gid=1000,mode=0400"
+	if secretID == "rig-build-command" {
+		wantOptions += " --mount=type=secret,id=rig-public-build-values,required=true,uid=1000,gid=1000,mode=0400"
+	}
 	wantArgv := []string{"/bin/sh", "-c", wantScript}
 	matches := 0
 	for _, run := range parseRunExecInstructions(t, recipe) {

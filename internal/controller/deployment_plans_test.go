@@ -103,10 +103,17 @@ func TestDeploymentPlanMigrationApprovalIsSeparateAndCASProtected(t *testing.T) 
 		ExpectedRevisionNumber: 0, ExpectedSourceStructuralFingerprint: inspection.Analysis.StructuralFingerprint,
 		ExpectedCandidateDigest: candidate.Digest, CandidateID: candidate.ID, PackageManager: candidate.PackageManager.Name,
 		InstallBehavior: candidate.Install.Command, MigrationCommand: component.Migration.Command,
+		MigrationEnvironmentKeys: []string{"DIRECT_DATABASE_URL"},
 		Components: []apicontract.DeploymentPlanComponentInput{{
 			ComponentID: component.ID, BuildCommand: component.Build.Command, RunCommand: component.Run.Command,
 			NodeVersion: candidate.NodeVersion.Value, InternalPort: 3000, HealthProbe: "/health",
 		}},
+	}
+	reserved := request
+	reserved.MigrationEnvironmentKeys = []string{"RIG_INTERNAL"}
+	invalid := rawAuthenticatedJSONRequest(t, handler, session, http.MethodPut, "/api/v1/apps/"+app.ID+"/deployment-plan", reserved)
+	if invalid.Code != http.StatusUnprocessableEntity || !jsonProblemCode(invalid.Body.Bytes(), "invalid_deployment_plan") {
+		t.Fatalf("reserved migration key=%d %s", invalid.Code, invalid.Body.String())
 	}
 	saved := authenticatedJSONRequest(t, handler, session, http.MethodPut, "/api/v1/apps/"+app.ID+"/deployment-plan", request)
 	if saved.Code != http.StatusOK {
@@ -116,7 +123,7 @@ func TestDeploymentPlanMigrationApprovalIsSeparateAndCASProtected(t *testing.T) 
 	if err := json.Unmarshal(saved.Body.Bytes(), &revision); err != nil {
 		t.Fatal(err)
 	}
-	if !revision.Migration.Present || revision.Migration.ApprovalStatus != "pending" || revision.Migration.ComponentName != component.ID || revision.Migration.RootDirectory != "." || len(revision.Migration.EnvironmentKeys) != 1 || revision.Migration.EnvironmentKeys[0] != "DATABASE_URL" {
+	if !revision.Migration.Present || revision.Migration.ApprovalStatus != "pending" || revision.Migration.ComponentName != component.ID || revision.Migration.RootDirectory != "." || len(revision.Migration.EnvironmentKeys) != 1 || revision.Migration.EnvironmentKeys[0] != "DIRECT_DATABASE_URL" {
 		t.Fatalf("migration was not pending: %#v", revision.Migration)
 	}
 	approval := apicontract.ApproveDeploymentPlanMigrationRequest{RevisionID: revision.RevisionID, RevisionNumber: revision.RevisionNumber, ExpectedApprovalRevision: 0}

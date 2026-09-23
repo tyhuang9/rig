@@ -130,6 +130,32 @@ function userCandidate(candidate: DeploymentPlanCandidate | undefined) {
   return candidate?.id === "user:deployment-setup" || candidate?.origin.toLowerCase() === "user";
 }
 
+function inferredMigrationEnvironmentKeys(candidate: DeploymentPlanCandidate | undefined): string[] {
+  return candidate?.components.find((component) => component.migration?.present)?.migration?.environmentKeys ?? [];
+}
+
+function migrationEnvironmentKeysInput(keys: string[]): string {
+  return keys.join("\n");
+}
+
+function parseMigrationEnvironmentKeys(input: string): string[] {
+  return input.split(/[,\r\n]/).map((key) => key.trim()).filter(Boolean);
+}
+
+function validateMigrationEnvironmentKeys(input: string): string {
+  const keys = parseMigrationEnvironmentKeys(input);
+  if (keys.length > 8) return "Enter no more than eight migration environment names.";
+  const seen = new Set<string>();
+  for (const key of keys) {
+    if (key.length > 128 || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return "Use portable names beginning with a letter or underscore, followed by letters, numbers, or underscores (up to 128 characters).";
+    const upper = key.toUpperCase();
+    if (upper.startsWith("RIG_") || upper.startsWith("HOSTD_")) return "RIG_ and HOSTD_ names are reserved for Rig.";
+    if (seen.has(upper)) return "Enter each migration environment name only once.";
+    seen.add(upper);
+  }
+  return "";
+}
+
 function viableCandidates(inspection: InspectResponse | undefined) {
   return inspection?.analysis.candidates.filter((candidate) => candidate.kind === "javascript" && candidate.status !== "unsupported") ?? [];
 }
@@ -163,6 +189,7 @@ function validate(setup: DeploymentSetupInput): FieldErrors {
 
 function errorTarget(key: string, components: DeploymentSetupComponentInput[]) {
   if (key === "migrationCommand") return { id: "deployment-setup-migration-command", label: "Migration command" };
+  if (key === "migrationEnvironmentKeys") return { id: "deployment-setup-migration-environment-keys", label: "Migration environment names" };
   if (key === "components") return { id: "deployment-setup-components", label: "Components" };
   const component = components.find((item) => key.startsWith(`components.${item.id}.`));
   const field = component ? key.slice(`components.${component.id}.`.length) : "";
@@ -184,19 +211,21 @@ function normalizedFieldErrors(errors: FieldErrors, components: DeploymentSetupC
   }));
 }
 
-export function deploymentPlanRequest(inspection: InspectResponse, candidate: DeploymentPlanCandidate, setup: DeploymentSetupInput, expectedRevisionNumber: number): AcceptDeploymentPlanRequest {
+export function deploymentPlanRequest(inspection: InspectResponse, candidate: DeploymentPlanCandidate, setup: DeploymentSetupInput, expectedRevisionNumber: number, migrationEnvironmentKeys?: string[]): AcceptDeploymentPlanRequest {
   return {
     candidateId: candidate.id,
     expectedCandidateDigest: candidate.digest,
     expectedRevisionNumber,
     expectedSourceStructuralFingerprint: inspection.analysis.structuralFingerprint,
     setup: copySetup(setup),
+    ...(migrationEnvironmentKeys ? { migrationEnvironmentKeys } : {}),
   };
 }
 
 export function DeploymentPlanReview({
   inspection,
   initialSetup,
+  initialMigrationEnvironmentKeys,
   expectedRevisionNumber,
   pending,
   error,
@@ -213,6 +242,7 @@ export function DeploymentPlanReview({
 }: {
   inspection?: InspectResponse;
   initialSetup?: DeploymentSetupInput;
+  initialMigrationEnvironmentKeys?: string[];
   expectedRevisionNumber: number;
   pending: boolean;
   error: string;
@@ -233,6 +263,8 @@ export function DeploymentPlanReview({
   const initialDraft = useRef<DeploymentSetupInput | null>(null);
   if (!initialDraft.current) initialDraft.current = copySetup(initialSetup ?? (initialCandidate ? deploymentSetupFromCandidate(initialCandidate) : defaultDeploymentSetup()));
   const [draft, setDraft] = useState<DeploymentSetupInput>(initialDraft.current);
+  const [migrationKeysInput, setMigrationKeysInput] = useState(() => migrationEnvironmentKeysInput(initialMigrationEnvironmentKeys ?? inferredMigrationEnvironmentKeys(initialCandidate)));
+  const [migrationKeysDirty, setMigrationKeysDirty] = useState(false);
   const [detectedSetup, setDetectedSetup] = useState<DeploymentSetupInput | null>(() => initialCandidate && !userCandidate(initialCandidate) ? deploymentSetupFromCandidate(initialCandidate) : null);
   const [errors, setErrors] = useState<FieldErrors>(() => validate(initialDraft.current!));
   const [dirty, setDirty] = useState(Boolean(initialSetup));
@@ -273,17 +305,18 @@ export function DeploymentPlanReview({
     if (detected) {
       const setup = deploymentSetupFromCandidate(detected);
       setDetectedSetup(setup);
+      if (!migrationKeysDirty && !initialMigrationEnvironmentKeys) setMigrationKeysInput(migrationEnvironmentKeysInput(inferredMigrationEnvironmentKeys(detected)));
       if (!dirty) {
         setDraft(setup);
         setErrors(validate(setup));
       }
     }
-  }, [candidateId, candidates, dirty, inspection]);
+  }, [candidateId, candidates, dirty, initialMigrationEnvironmentKeys, inspection, migrationKeysDirty]);
   useEffect(() => {
     setDismissedAPIErrorKeys(new Set());
     setErrorDismissed(false);
     const hasFieldErrors = Object.values(apiErrors).some(Boolean);
-    if (Object.entries(apiErrors).some(([key, message]) => message && (key === "migrationCommand" || /\.(internalPort|healthProbe)$/.test(key)))) setAdvancedOpen(true);
+    if (Object.entries(apiErrors).some(([key, message]) => message && (["migrationCommand", "migrationEnvironmentKeys"].includes(key) || /\.(internalPort|healthProbe)$/.test(key)))) setAdvancedOpen(true);
     if (error || hasFieldErrors) {
       const timer = window.setTimeout(() => errorSummary.current?.focus(), 0);
       return () => window.clearTimeout(timer);
@@ -314,6 +347,7 @@ export function DeploymentPlanReview({
     const setup = deploymentSetupFromCandidate(next);
     setCandidateId(next.id);
     setDetectedSetup(setup);
+    if (!migrationKeysDirty) setMigrationKeysInput(migrationEnvironmentKeysInput(inferredMigrationEnvironmentKeys(next)));
     if (!dirty) {
       setDraft(setup);
       setErrors(validate(setup));
@@ -340,10 +374,15 @@ export function DeploymentPlanReview({
     setErrorDismissed(true);
     setDismissedAPIErrorKeys(new Set(Object.keys(serverErrors)));
     setErrors(validate(detectedSetup));
+    setMigrationKeysInput(migrationEnvironmentKeysInput(inferredMigrationEnvironmentKeys(candidates.find((item) => item.id === candidateId && !userCandidate(item)) ?? candidates.find((item) => !userCandidate(item)))));
+    setMigrationKeysDirty(false);
     window.setTimeout(() => document.getElementById(fieldId(0, "rootDirectory"))?.focus(), 0);
   };
   const submit = () => {
     const nextErrors = validate(draft);
+    const migrationKeysError = validateMigrationEnvironmentKeys(migrationKeysInput);
+    if (migrationKeysError) nextErrors.migrationEnvironmentKeys = migrationKeysError;
+    else if (!draft.migrationCommand?.trim() && parseMigrationEnvironmentKeys(migrationKeysInput).length > 0) nextErrors.migrationEnvironmentKeys = "Add a migration command before allowing environment names.";
     setErrors(nextErrors);
     if (Object.keys(nextErrors).length > 0) {
       setAdvancedOpen(true);
@@ -351,7 +390,7 @@ export function DeploymentPlanReview({
       return;
     }
     if (reviewed && inspection && candidate) {
-      onAccept(deploymentPlanRequest(inspection, candidate, draft, expectedRevisionNumber));
+      onAccept(deploymentPlanRequest(inspection, candidate, draft, expectedRevisionNumber, draft.migrationCommand?.trim() ? parseMigrationEnvironmentKeys(migrationKeysInput) : undefined));
       return;
     }
     onAnalyze(copySetup(draft));
@@ -369,7 +408,7 @@ export function DeploymentPlanReview({
         const target = errorTarget(key, draft.components);
         return <li key={key}><a href={`#${target.id}`} onClick={(event) => {
           event.preventDefault();
-          if (key === "migrationCommand" || /\.(internalPort|healthProbe)$/.test(key)) setAdvancedOpen(true);
+          if (["migrationCommand", "migrationEnvironmentKeys"].includes(key) || /\.(internalPort|healthProbe)$/.test(key)) setAdvancedOpen(true);
           window.setTimeout(() => document.getElementById(target.id)?.focus(), 0);
         }}>{target.label}: {message}</a></li>;
       })}</ul>}
@@ -400,6 +439,12 @@ export function DeploymentPlanReview({
           <input className="command-input" id="deployment-setup-migration-command" value={draft.migrationCommand ?? ""} disabled={pending} aria-invalid={Boolean(visibleErrors.migrationCommand)} aria-describedby={visibleErrors.migrationCommand ? "deployment-setup-migration-command-error" : undefined} onChange={(event) => updateSetup((current) => ({ ...current, ...(event.target.value ? { migrationCommand: event.target.value } : { migrationCommand: undefined }) }), "migrationCommand")} />
           {visibleErrors.migrationCommand && <p id="deployment-setup-migration-command-error" className="form-error">{visibleErrors.migrationCommand}</p>}
           <small>Rig runs an accepted migration before new containers start. Approval remains a separate action.</small>
+        </div>
+        <div className="field">
+          <label htmlFor="deployment-setup-migration-environment-keys">Migration environment names <span className="field-optional">(optional)</span></label>
+          <textarea className="command-input" id="deployment-setup-migration-environment-keys" rows={3} value={migrationKeysInput} disabled={pending} aria-invalid={Boolean(visibleErrors.migrationEnvironmentKeys)} aria-describedby={`deployment-setup-migration-environment-keys-help${visibleErrors.migrationEnvironmentKeys ? " deployment-setup-migration-environment-keys-error" : ""}`} onChange={(event) => { setMigrationKeysInput(event.target.value); setMigrationKeysDirty(true); setErrorDismissed(true); setDismissedAPIErrorKeys((current) => new Set(current).add("migrationEnvironmentKeys")); setErrors((current) => ({ ...current, migrationEnvironmentKeys: "" })); }} />
+          {visibleErrors.migrationEnvironmentKeys && <p id="deployment-setup-migration-environment-keys-error" className="form-error">{visibleErrors.migrationEnvironmentKeys}</p>}
+          <small id="deployment-setup-migration-environment-keys-help">One name per line or separated by commas. Only these names may reach the migration; set their values in application configuration. Accepting the setup does not approve the migration.</small>
         </div>
         {draft.components.map((component, index) => <ComponentAdvanced key={component.id} component={component} index={index} errors={visibleErrors} pending={pending} onChange={updateComponent} />)}
       </div>

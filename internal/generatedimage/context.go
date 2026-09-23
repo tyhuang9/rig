@@ -31,11 +31,12 @@ type contextLimits struct {
 }
 
 type buildLayout struct {
-	contextDirectory string
-	containerfile    string
-	imageIDFile      string
-	installCommand   string
-	buildCommand     string
+	contextDirectory  string
+	containerfile     string
+	imageIDFile       string
+	installCommand    string
+	buildCommand      string
+	publicBuildValues string
 }
 
 func prepareBuildContext(ctx context.Context, workspace, operationDirectory string, component componentDefinition, limits contextLimits) (buildLayout, error) {
@@ -49,11 +50,12 @@ func prepareBuildContext(ctx context.Context, workspace, operationDirectory stri
 		limits.entries = defaultContextEntries
 	}
 	layout := buildLayout{
-		contextDirectory: filepath.Join(operationDirectory, "context"),
-		containerfile:    filepath.Join(operationDirectory, "Containerfile"),
-		imageIDFile:      filepath.Join(operationDirectory, "image.id"),
-		installCommand:   filepath.Join(operationDirectory, "install.command"),
-		buildCommand:     filepath.Join(operationDirectory, "build.command"),
+		contextDirectory:  filepath.Join(operationDirectory, "context"),
+		containerfile:     filepath.Join(operationDirectory, "Containerfile"),
+		imageIDFile:       filepath.Join(operationDirectory, "image.id"),
+		installCommand:    filepath.Join(operationDirectory, "install.command"),
+		buildCommand:      filepath.Join(operationDirectory, "build.command"),
+		publicBuildValues: filepath.Join(operationDirectory, "public-build-values.json"),
 	}
 	for _, directory := range []string{layout.contextDirectory, filepath.Join(layout.contextDirectory, "source"), filepath.Join(layout.contextDirectory, "rig")} {
 		if err := os.Mkdir(directory, 0o700); err != nil {
