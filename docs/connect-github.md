@@ -31,7 +31,7 @@ The official default identity and deterministic coverage for the connection flow
 7. Use the single repository picker, which aggregates repositories available through the saved connection's personal and organization installations. Select the repository and tracked branch. For a Compose application, also choose a discovered Compose file; a generated application continues to build and run setup instead.
 8. Run the exact-source inspection, resolve any findings, and save the application.
 
-Rig polls only while the short-lived authorization is pending. If checking is paused, select **Retry authorization check**. If the code expires or authorization is denied, select **Start new authorization** from the same saved connector to receive a fresh code. Do not send the code to another person.
+Rig polls only while the short-lived authorization is pending. If checking is paused, select **Retry authorization check**, or **Start new authorization** for a fresh code. If the code expires or authorization is denied, select **Connect GitHub** or **Reconnect** on the same saved connector to authorize again. Do not send the code to another person.
 
 ## What access Rig uses
 
