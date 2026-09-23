@@ -37,6 +37,32 @@ pnpm start:api
 `pnpm start:web`, which also binds to `0.0.0.0`. A generated static deployment
 serves `frontend/dist` through its ingress instead of using Vite preview.
 
+## Reviewed Rig setup
+
+Rig's analyzer finds the API and frontend, then requests review because the
+Vite config and API port/readiness are not fully inferred. Use the generated
+JavaScript strategy and enter these component settings in the setup review:
+
+| Setting | API server | Static frontend |
+| --- | --- | --- |
+| Component ID | `api` | `frontend` |
+| Root | `api` | `frontend` |
+| Technology | Node.js | Static site |
+| Package manager / Node | pnpm / 24 | pnpm / 24 |
+| Install command | `pnpm install --frozen-lockfile` | `pnpm install --frozen-lockfile` |
+| Build command | Leave empty | `pnpm build` |
+| Start command | `node src/server.js` | Leave empty; Rig manages the static server |
+| Output directory | Leave empty | `dist` |
+| Internal port | `3000` | `8080` |
+| Health probe | `/readyz` | `/` |
+
+`/readyz` requires a successful database query, so a missing or invalid
+external database blocks deployment health. The separately checked-in
+`harness/docker-compose.yml` is an external dependency harness; do not select
+it as the application Compose deployment. A clean offline install run from the
+`api` directory resolved all three workspace packages and built the frontend
+from `frontend`; this verifies the package layout locally, not a Docker build.
+
 The database URL, CA, and sentinel are runtime-only values. Do not set them
 when running `pnpm build`. `schema:prepare` is deliberately a separate
 application script; use it only against a disposable application-owned

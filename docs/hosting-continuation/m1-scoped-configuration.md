@@ -49,6 +49,8 @@ published, merged, or deployed. M1's live exit gate remains open.
 | `pnpm --dir web e2e` | Passed: 3 existing Chromium journeys. |
 | `examples/hosting-notes: pnpm test` and public-label `pnpm build` | Passed: 9 API tests, including no-network rejection of TLS-disable URL parameters, bounded HTTPS probe, and secret-safe responses; frontend fixture build passed. |
 | `examples/hosting-notes: pnpm test:https-local` | Passed after generating a disposable test CA with OpenSSL. The API test endpoint called the actual HTTPS stub through the backend client over loopback TLS; wrong token, missing CA, and wrong hostname returned generic 503 responses without credential text. The generated private keys were then removed. Test-only DNS mapping did not exercise container bridge egress. |
+| `go test -count=1 -run '^TestHostingNotesFixtureAcceptsReviewedFrontendAndBackendSetup$' ./internal/sourceinspection` | Passed. Rig selected the generated API and frontend candidate instead of the external harness Compose file; an explicit two-component plan with database-backed `/readyz` health was accepted. |
+| Fresh copied fixture: `pnpm install --frozen-lockfile --offline` from `api`, then `VITE_BUILD_LABEL=workspace-install-check pnpm build` from `frontend` | Passed with an initially absent `node_modules`. pnpm resolved all three workspace packages and produced the frontend assets. The disposable copy was removed after the check. |
 
 The security review identified a PostgreSQL URL TLS-parameter override, an
 empty legacy migration export with a nonempty allowlist, implicit legacy
