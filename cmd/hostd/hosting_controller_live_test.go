@@ -467,6 +467,13 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		releases.Items[0].ConfigurationRevisionID != saved.RevisionID || releases.Items[0].ConfigurationRevisionNumber != saved.RevisionNumber {
 		t.Fatal("deployment did not pin one immutable release")
 	}
+	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(releases.Items[0].ArchiveSha256) {
+		t.Fatal("local release has no immutable source digest")
+	}
+	workspace, err := snapshots.ReadyWorkspace(ctx, application.ID, releases.Items[0].ID)
+	if err != nil || workspace.WorkspaceTreeSHA256 != releases.Items[0].ArchiveSha256 || workspace.WorkspaceState != "ready" {
+		t.Fatal("pinned local release workspace failed digest verification")
+	}
 	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/test/dependency", "", http.StatusOK, "reachable")
