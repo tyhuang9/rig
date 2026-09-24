@@ -40,8 +40,9 @@ import (
 )
 
 const (
-	hostingLiveProject = "rig-hosting-notes-live-test"
-	hostingLiveNetwork = "rig-hosting-notes-live-test-external"
+	hostingLiveProject        = "rig-hosting-notes-live-test"
+	hostingLiveNetwork        = "rig-hosting-notes-live-test-external"
+	hostingLiveSentinelPrefix = "rig-m1-runtime-secret-"
 	// Ingress has a controller-wide identity, so this test requires an otherwise
 	// empty disposable Docker daemon before it can take ownership of that name.
 	hostingLiveCaddyContainer = "rig-generated-caddy-v1"
@@ -218,7 +219,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 		t.Fatal("read fixture CA")
 	}
 	wrongCA := hostingLiveWrongCA(t, ctx, openssl, fixtureRoot)
-	password, token, sentinel := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	password, token, sentinel := uuid.NewString(), uuid.NewString(), hostingLiveSentinelPrefix+uuid.NewString()
 	composeEnv = []string{
 		"FIXTURE_NETWORK_NAME=" + hostingLiveNetwork,
 		"FIXTURE_HOST_GATEWAY_IP=" + gateway,

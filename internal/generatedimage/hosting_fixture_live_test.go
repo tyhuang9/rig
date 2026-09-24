@@ -141,7 +141,7 @@ func TestLiveHostingNotesFixtureImages(t *testing.T) {
 			}
 			command := `test -z "${DATABASE_URL+x}" && test -z "${TEST_SENTINEL_SECRET+x}"`
 			if fixture.component == "frontend" {
-				command += ` && test -f /workspace/frontend/dist/index.html && grep -R -F -q ` + fixture.publicLabel + ` /workspace/frontend/dist/assets && ! grep -R -F -q ` + fixture.absentLabel + ` /workspace/frontend/dist/assets && ! grep -R -E -q 'TEST_SENTINEL_SECRET|NOTES_FIXTURE_DB_URL' /workspace/frontend/dist`
+				command += ` && test -f /workspace/frontend/dist/index.html && grep -R -F -q ` + fixture.publicLabel + ` /workspace/frontend/dist/assets && ! grep -R -F -q ` + fixture.absentLabel + ` /workspace/frontend/dist/assets && ! grep -R -E -q 'TEST_SENTINEL_SECRET|NOTES_FIXTURE_DB_URL|` + hostingLiveSentinelPrefix + `' /workspace/frontend/dist`
 				if firstFrontendImage == "" {
 					firstFrontendImage = imageID
 				} else if firstFrontendImage == imageID {
@@ -214,6 +214,7 @@ func hostingLiveAssertFrontendHTTP(t *testing.T, ctx context.Context, docker, im
 	script, err := io.ReadAll(io.LimitReader(response.Body, (4<<20)+1))
 	if err != nil || response.StatusCode != http.StatusOK || len(script) > 4<<20 || !bytes.Contains(script, []byte(publicLabel)) || bytes.Contains(script, []byte(absentLabel)) ||
 		bytes.Contains(index, []byte("TEST_SENTINEL_SECRET")) || bytes.Contains(script, []byte("TEST_SENTINEL_SECRET")) ||
+		bytes.Contains(index, []byte(hostingLiveSentinelPrefix)) || bytes.Contains(script, []byte(hostingLiveSentinelPrefix)) ||
 		bytes.Contains(index, []byte("NOTES_FIXTURE_DB_URL")) || bytes.Contains(script, []byte("NOTES_FIXTURE_DB_URL")) {
 		t.Fatal("served frontend assets did not preserve the selected public label and exclude server secret keys")
 	}
