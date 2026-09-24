@@ -33,7 +33,7 @@ services:
       - -c
       - ssl_key_file=/certs/postgres.fixture.test.key
     ports:
-      - ${FIXTURE_POSTGRES_BIND_ADDRESS:-127.0.0.1}:55432:5432
+      - ${FIXTURE_POSTGRES_BIND_ADDRESS:-127.0.0.1}:${FIXTURE_POSTGRES_HOST_PORT:-55432}:5432
     volumes:
       - fixture-certs:/certs:ro
       - fixture-postgres-data:/var/lib/postgresql/data
@@ -48,7 +48,7 @@ services:
     environment:
       FIXTURE_HTTPS_TOKEN: ${FIXTURE_HTTPS_TOKEN:?set FIXTURE_HTTPS_TOKEN}
     ports:
-      - ${FIXTURE_HTTPS_BIND_ADDRESS:-127.0.0.1}:55443:8443
+      - ${FIXTURE_HTTPS_BIND_ADDRESS:-127.0.0.1}:${FIXTURE_HTTPS_HOST_PORT:-55443}:8443
     volumes:
       - ./https-stub.mjs:/fixture/https-stub.mjs:ro
       - fixture-certs:/certs:ro
@@ -56,7 +56,7 @@ services:
 
 networks:
   fixture-external:
-    name: rig-hosting-notes-fixture-external
+    name: ${FIXTURE_NETWORK_NAME:-rig-hosting-notes-fixture-external}
 
 volumes:
   fixture-certs:

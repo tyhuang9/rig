@@ -36,6 +36,12 @@ database under this harness's ownership. Gateway port reachability and driver
 IP-certificate validation remain unverified until a real Docker run. This
 trial does not prove external hostname DNS resolution.
 
+The host ports default to `55432` and `55443`. Disposable tests may set
+`FIXTURE_POSTGRES_HOST_PORT`, `FIXTURE_HTTPS_HOST_PORT`, and
+`FIXTURE_NETWORK_NAME` to avoid colliding with another fixture instance. Use a
+unique Compose project name for each such test and remove only that project's
+resources afterward.
+
 The harness's private CA is test-only. Supply the encoded CA to the API using
 the server-only `DATABASE_TLS_CA_PEM_BASE64` configuration value. A correct
 test proves that the client accepts this CA and URL host identity; a bad CA or host
