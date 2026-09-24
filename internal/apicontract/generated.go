@@ -7,65 +7,66 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "e2badf8e5fbe20c2282b81195beebda197026f62ad21c17d783c70a57c2a6cb6"
+const SourceSHA256 = "d9112ea3752141502691f67949d948276623f6e778de7d06bda0f408bfd0122e"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
 	"approveApplicationDeploymentPlanMigration": {Method: "POST", Path: "/api/v1/apps/{appId}/deployment-plan/migration-approval"},
-	"bootstrap":                          {Method: "POST", Path: "/api/v1/auth/bootstrap"},
-	"bootstrapStatus":                    {Method: "GET", Path: "/api/v1/auth/bootstrap/status"},
-	"cancelJob":                          {Method: "POST", Path: "/api/v1/jobs/{jobId}/cancel"},
-	"createApplication":                  {Method: "POST", Path: "/api/v1/apps"},
-	"deployApplication":                  {Method: "POST", Path: "/api/v1/apps/{appId}/deployments"},
-	"deployRelease":                      {Method: "POST", Path: "/api/v1/apps/{appId}/releases/{releaseId}/deployments"},
-	"disconnectSourceConnection":         {Method: "DELETE", Path: "/api/v1/source-connections/{connectionId}"},
-	"doctor":                             {Method: "GET", Path: "/api/v1/system/doctor"},
-	"getApplication":                     {Method: "GET", Path: "/api/v1/apps/{appId}"},
-	"getApplicationAutoDeploy":           {Method: "GET", Path: "/api/v1/apps/{appId}/auto-deploy"},
-	"getApplicationConfiguration":        {Method: "GET", Path: "/api/v1/apps/{appId}/configuration"},
-	"getApplicationDeploymentPlan":       {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-plan"},
-	"getDefaultSourceConnection":         {Method: "GET", Path: "/api/v1/source-connections/default"},
-	"getJob":                             {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
-	"getRelayStatus":                     {Method: "GET", Path: "/api/v1/relay/status"},
-	"grantRuntimeApproval":               {Method: "POST", Path: "/api/v1/apps/{appId}/runtime-approvals"},
-	"inspectImport":                      {Method: "POST", Path: "/api/v1/apps/import/inspect"},
-	"listApplications":                   {Method: "GET", Path: "/api/v1/apps"},
-	"listDefaultGitHubRepositories":      {Method: "GET", Path: "/api/v1/source-connections/default/github/repositories"},
-	"listDeployments":                    {Method: "GET", Path: "/api/v1/apps/{appId}/deployments"},
-	"listGitHubBranches":                 {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories/{repositoryId}/branches"},
-	"listGitHubInstallations":            {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations"},
-	"listGitHubRepositories":             {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories"},
-	"listJobEvents":                      {Method: "GET", Path: "/api/v1/jobs/{jobId}/events"},
-	"listJobs":                           {Method: "GET", Path: "/api/v1/jobs"},
-	"listMachines":                       {Method: "GET", Path: "/api/v1/machines"},
-	"listReleases":                       {Method: "GET", Path: "/api/v1/apps/{appId}/releases"},
-	"listRuntimeApprovals":               {Method: "GET", Path: "/api/v1/apps/{appId}/runtime-approvals"},
-	"listServices":                       {Method: "GET", Path: "/api/v1/apps/{appId}/services"},
-	"listSourceConnections":              {Method: "GET", Path: "/api/v1/source-connections"},
-	"login":                              {Method: "POST", Path: "/api/v1/auth/sessions"},
-	"logout":                             {Method: "DELETE", Path: "/api/v1/auth/sessions/current"},
-	"me":                                 {Method: "GET", Path: "/api/v1/auth/me"},
-	"pollDefaultGitHubDeviceConnection":  {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/{authorizationId}/poll"},
-	"pollGitHubDeviceConnection":         {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/poll"},
-	"pollRelayEnrollment":                {Method: "POST", Path: "/api/v1/relay/enrollments/{enrollmentId}/poll"},
-	"refreshSourceConnection":            {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/refresh"},
-	"removeRelayBinding":                 {Method: "DELETE", Path: "/api/v1/relay/bindings/{bindingId}"},
-	"replaceApplicationConfiguration":    {Method: "PUT", Path: "/api/v1/apps/{appId}/configuration"},
-	"restartApplication":                 {Method: "POST", Path: "/api/v1/apps/{appId}/restart"},
-	"resumeApplicationAutoDeploy":        {Method: "POST", Path: "/api/v1/apps/{appId}/auto-deploy/resume"},
-	"resumeJob":                          {Method: "POST", Path: "/api/v1/jobs/{jobId}/resume"},
-	"revokeRuntimeApproval":              {Method: "DELETE", Path: "/api/v1/apps/{appId}/runtime-approvals/{approvalId}"},
-	"rotateCSRF":                         {Method: "GET", Path: "/api/v1/auth/csrf"},
-	"startApplication":                   {Method: "POST", Path: "/api/v1/apps/{appId}/start"},
-	"startDefaultGitHubDeviceConnection": {Method: "POST", Path: "/api/v1/source-connections/default/github/device"},
-	"startGitHubDeviceConnection":        {Method: "POST", Path: "/api/v1/source-connections/github/device"},
-	"startRelayEnrollment":               {Method: "POST", Path: "/api/v1/relay/enrollments"},
-	"startRelayKeyRotation":              {Method: "POST", Path: "/api/v1/relay/key-rotations"},
-	"stopApplication":                    {Method: "POST", Path: "/api/v1/apps/{appId}/stop"},
-	"streamJobEvents":                    {Method: "GET", Path: "/api/v1/jobs/{jobId}/events/stream"},
-	"streamLogs":                         {Method: "GET", Path: "/api/v1/apps/{appId}/logs/stream"},
-	"systemStatus":                       {Method: "GET", Path: "/api/v1/system/status"},
-	"updateApplicationAutoDeploy":        {Method: "PUT", Path: "/api/v1/apps/{appId}/auto-deploy"},
+	"bootstrap":                             {Method: "POST", Path: "/api/v1/auth/bootstrap"},
+	"bootstrapStatus":                       {Method: "GET", Path: "/api/v1/auth/bootstrap/status"},
+	"cancelJob":                             {Method: "POST", Path: "/api/v1/jobs/{jobId}/cancel"},
+	"createApplication":                     {Method: "POST", Path: "/api/v1/apps"},
+	"deployApplication":                     {Method: "POST", Path: "/api/v1/apps/{appId}/deployments"},
+	"deployRelease":                         {Method: "POST", Path: "/api/v1/apps/{appId}/releases/{releaseId}/deployments"},
+	"disconnectSourceConnection":            {Method: "DELETE", Path: "/api/v1/source-connections/{connectionId}"},
+	"doctor":                                {Method: "GET", Path: "/api/v1/system/doctor"},
+	"getApplication":                        {Method: "GET", Path: "/api/v1/apps/{appId}"},
+	"getApplicationAutoDeploy":              {Method: "GET", Path: "/api/v1/apps/{appId}/auto-deploy"},
+	"getApplicationConfiguration":           {Method: "GET", Path: "/api/v1/apps/{appId}/configuration"},
+	"getApplicationDeploymentPlan":          {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-plan"},
+	"getDefaultSourceConnection":            {Method: "GET", Path: "/api/v1/source-connections/default"},
+	"getJob":                                {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
+	"getRelayStatus":                        {Method: "GET", Path: "/api/v1/relay/status"},
+	"grantRuntimeApproval":                  {Method: "POST", Path: "/api/v1/apps/{appId}/runtime-approvals"},
+	"inspectImport":                         {Method: "POST", Path: "/api/v1/apps/import/inspect"},
+	"listApplications":                      {Method: "GET", Path: "/api/v1/apps"},
+	"listDefaultGitHubRepositories":         {Method: "GET", Path: "/api/v1/source-connections/default/github/repositories"},
+	"listDeployments":                       {Method: "GET", Path: "/api/v1/apps/{appId}/deployments"},
+	"listGitHubBranches":                    {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories/{repositoryId}/branches"},
+	"listGitHubInstallations":               {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations"},
+	"listGitHubRepositories":                {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories"},
+	"listJobEvents":                         {Method: "GET", Path: "/api/v1/jobs/{jobId}/events"},
+	"listJobs":                              {Method: "GET", Path: "/api/v1/jobs"},
+	"listMachines":                          {Method: "GET", Path: "/api/v1/machines"},
+	"listReleases":                          {Method: "GET", Path: "/api/v1/apps/{appId}/releases"},
+	"listRuntimeApprovals":                  {Method: "GET", Path: "/api/v1/apps/{appId}/runtime-approvals"},
+	"listServices":                          {Method: "GET", Path: "/api/v1/apps/{appId}/services"},
+	"listSourceConnections":                 {Method: "GET", Path: "/api/v1/source-connections"},
+	"login":                                 {Method: "POST", Path: "/api/v1/auth/sessions"},
+	"logout":                                {Method: "DELETE", Path: "/api/v1/auth/sessions/current"},
+	"me":                                    {Method: "GET", Path: "/api/v1/auth/me"},
+	"pollDefaultGitHubDeviceConnection":     {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/{authorizationId}/poll"},
+	"pollGitHubDeviceConnection":            {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/poll"},
+	"pollRelayEnrollment":                   {Method: "POST", Path: "/api/v1/relay/enrollments/{enrollmentId}/poll"},
+	"refreshSourceConnection":               {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/refresh"},
+	"removeRelayBinding":                    {Method: "DELETE", Path: "/api/v1/relay/bindings/{bindingId}"},
+	"replaceApplicationConfiguration":       {Method: "PUT", Path: "/api/v1/apps/{appId}/configuration"},
+	"replaceScopedApplicationConfiguration": {Method: "PUT", Path: "/api/v1/apps/{appId}/scoped-configuration"},
+	"restartApplication":                    {Method: "POST", Path: "/api/v1/apps/{appId}/restart"},
+	"resumeApplicationAutoDeploy":           {Method: "POST", Path: "/api/v1/apps/{appId}/auto-deploy/resume"},
+	"resumeJob":                             {Method: "POST", Path: "/api/v1/jobs/{jobId}/resume"},
+	"revokeRuntimeApproval":                 {Method: "DELETE", Path: "/api/v1/apps/{appId}/runtime-approvals/{approvalId}"},
+	"rotateCSRF":                            {Method: "GET", Path: "/api/v1/auth/csrf"},
+	"startApplication":                      {Method: "POST", Path: "/api/v1/apps/{appId}/start"},
+	"startDefaultGitHubDeviceConnection":    {Method: "POST", Path: "/api/v1/source-connections/default/github/device"},
+	"startGitHubDeviceConnection":           {Method: "POST", Path: "/api/v1/source-connections/github/device"},
+	"startRelayEnrollment":                  {Method: "POST", Path: "/api/v1/relay/enrollments"},
+	"startRelayKeyRotation":                 {Method: "POST", Path: "/api/v1/relay/key-rotations"},
+	"stopApplication":                       {Method: "POST", Path: "/api/v1/apps/{appId}/stop"},
+	"streamJobEvents":                       {Method: "GET", Path: "/api/v1/jobs/{jobId}/events/stream"},
+	"streamLogs":                            {Method: "GET", Path: "/api/v1/apps/{appId}/logs/stream"},
+	"systemStatus":                          {Method: "GET", Path: "/api/v1/system/status"},
+	"updateApplicationAutoDeploy":           {Method: "PUT", Path: "/api/v1/apps/{appId}/auto-deploy"},
 }
 
 type AcceptDeploymentPlanRequest struct {
@@ -76,6 +77,7 @@ type AcceptDeploymentPlanRequest struct {
 	ExpectedSourceStructuralFingerprint string                         `json:"expectedSourceStructuralFingerprint"`
 	InstallBehavior                     string                         `json:"installBehavior,omitempty"`
 	MigrationCommand                    string                         `json:"migrationCommand,omitempty"`
+	MigrationEnvironmentKeys            []string                       `json:"migrationEnvironmentKeys,omitempty"`
 	PackageManager                      string                         `json:"packageManager,omitempty"`
 	Setup                               *DeploymentSetupInput          `json:"setup,omitempty"`
 }
@@ -192,10 +194,13 @@ type ApplicationAutoDeployStatus struct {
 }
 
 type ApplicationConfiguration struct {
-	Entries        []ConfigurationEntry `json:"entries"`
-	RevisionID     string               `json:"revisionId,omitempty"`
-	RevisionNumber int64                `json:"revisionNumber"`
-	UpdatedAt      string               `json:"updatedAt,omitempty"`
+	DeploymentPlanRevisionID     string               `json:"deploymentPlanRevisionId,omitempty"`
+	DeploymentPlanRevisionNumber int64                `json:"deploymentPlanRevisionNumber,omitempty"`
+	Entries                      []ConfigurationEntry `json:"entries"`
+	FormatVersion                int                  `json:"formatVersion,omitempty"`
+	RevisionID                   string               `json:"revisionId,omitempty"`
+	RevisionNumber               int64                `json:"revisionNumber"`
+	UpdatedAt                    string               `json:"updatedAt,omitempty"`
 }
 
 type ApplicationList struct {
@@ -230,9 +235,11 @@ type Capabilities struct {
 }
 
 type ConfigurationEntry struct {
-	Key       string `json:"key"`
-	Sensitive bool   `json:"sensitive"`
-	Value     string `json:"value,omitempty"`
+	Key             string `json:"key"`
+	Phase           string `json:"phase,omitempty"`
+	Sensitive       bool   `json:"sensitive"`
+	TargetComponent string `json:"targetComponent,omitempty"`
+	Value           string `json:"value,omitempty"`
 }
 
 type ConfigurationValueInput struct {
@@ -736,6 +743,15 @@ type ReplaceApplicationConfigurationRequest struct {
 	Variables              []ConfigurationValueInput       `json:"variables"`
 }
 
+type ReplaceScopedApplicationConfigurationRequest struct {
+	Entries                           []ScopedConfigurationValueInput `json:"entries"`
+	ExpectedRevisionNumber            int64                           `json:"expectedRevisionNumber"`
+	PlanRevisionID                    string                          `json:"planRevisionId"`
+	PlanRevisionNumber                int64                           `json:"planRevisionNumber"`
+	PublicBuildDisclosureAcknowledged bool                            `json:"publicBuildDisclosureAcknowledged"`
+	Remove                            []ScopedConfigurationKey        `json:"remove"`
+}
+
 type ResumeApplicationAutoDeployRequest struct {
 	ExpectedRevision int64 `json:"expectedRevision"`
 }
@@ -764,6 +780,21 @@ type RuntimeApprovalMutationResponse struct {
 
 type RuntimeApprovalResponse struct {
 	Approval RuntimeApproval `json:"approval"`
+}
+
+type ScopedConfigurationKey struct {
+	Key             string `json:"key"`
+	Phase           string `json:"phase"`
+	TargetComponent string `json:"targetComponent"`
+}
+
+type ScopedConfigurationValueInput struct {
+	Key                  string `json:"key"`
+	Phase                string `json:"phase"`
+	PreserveStoredSecret bool   `json:"preserveStoredSecret,omitempty"`
+	Sensitive            bool   `json:"sensitive"`
+	TargetComponent      string `json:"targetComponent"`
+	Value                string `json:"value"`
 }
 
 type SecretConfigurationValueInput struct {

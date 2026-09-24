@@ -17,9 +17,9 @@ env:
 
 jobs:
   generated-runtime-lifecycle:
-    name: Disposable Docker blue-green verification
+    name: Disposable Docker hosting and blue-green verification
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 105
     steps:
       - name: Check out source
         timeout-minutes: 2
@@ -33,6 +33,31 @@ jobs:
         with:
           go-version: 1.26.7
           cache: false
+
+      - name: Set up pnpm for application-owned fixture schema
+        timeout-minutes: 3
+        uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Set up Node.js for application-owned fixture schema
+        timeout-minutes: 3
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+
+      - name: Record hosted Docker versions
+        timeout-minutes: 1
+        run: |
+          docker version --format 'Docker CLI={{.Client.Version}} Engine={{.Server.Version}} API={{.Server.APIVersion}}'
+          docker buildx version
+          docker compose version
+
+      - name: Install hosting fixture dependencies for schema preparation
+        timeout-minutes: 5
+        run: pnpm --dir examples/hosting-notes install --frozen-lockfile
 
       - name: Build a generated npm image through the production compiler
         timeout-minutes: 10
@@ -58,6 +83,18 @@ jobs:
           test_name='TestLiveManualSetupRecipes'
           package_name='github.com/hostd/hostd/internal/generatedimage'
           go test -tags live_docker -json -v -count=1 -timeout=10m ./internal/generatedimage -run "^${test_name}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
+
+      - name: Build hosting fixture API and frontend images
+        timeout-minutes: 18
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          test_name='TestLiveHostingNotesFixtureImages'
+          package_name='github.com/hostd/hostd/internal/generatedimage'
+          go test -tags live_docker -json -v -count=1 -timeout=16m ./internal/generatedimage -run "^${test_name}$" | tee "$output"
           jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
 
       - name: Build an undetected manual setup through the production compiler
@@ -89,6 +126,21 @@ jobs:
           go test -json -v -count=1 -timeout=19m ./internal/generatedingress -run "^${test_name}$" | tee "$output"
           jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
 
+      - name: Verify deployed hosting API against disposable external TLS services
+        if: ${{ !cancelled() }}
+        timeout-minutes: 25
+        shell: bash
+        env:
+          RIG_RUN_LIVE_HOSTING_NOTES: "1"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          test_name='TestLiveHostingNotesDatabaseRoundtrip'
+          package_name='github.com/hostd/hostd/internal/generatedimage'
+          go test -tags live_docker -json -v -count=1 -timeout=24m ./internal/generatedimage -run "^${test_name}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
+
       - name: Require complete Docker cleanup
         if: always()
         timeout-minutes: 2
@@ -98,9 +150,13 @@ jobs:
           containers="$(docker ps --all --filter label=io.rig.managed --format '{{.ID}} {{.Names}} {{.Status}}')"
           networks="$(docker network ls --filter label=io.rig.managed --format '{{.ID}} {{.Name}}')"
           images="$(docker image ls --filter label=io.rig.managed=generated-image --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
+          fixture_images="$(docker image ls --filter 'reference=rig-live-hosting-notes:*' --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
+          fixture_containers="$(docker ps --all --filter label=com.docker.compose.project=rig-hosting-notes-live-test --format '{{.ID}} {{.Names}} {{.Status}}')"
+          fixture_networks="$(docker network ls --filter label=com.docker.compose.project=rig-hosting-notes-live-test --format '{{.ID}} {{.Name}}')"
+          fixture_volumes="$(docker volume ls --filter label=com.docker.compose.project=rig-hosting-notes-live-test --format '{{.Name}}')"
           builders="$(docker ps --all --quiet --filter label=rig.controller=generated-builder)"
           builder_networks="$(docker network ls --quiet --filter label=rig.controller=generated-builder)"
-          if [[ -n "$containers" || -n "$networks" || -n "$images" || -n "$builders" || -n "$builder_networks" ]] || docker volume inspect rig-generated-caddy-config-v1 >/dev/null 2>&1; then
+          if [[ -n "$containers" || -n "$networks" || -n "$images" || -n "$fixture_images" || -n "$fixture_containers" || -n "$fixture_networks" || -n "$fixture_volumes" || -n "$builders" || -n "$builder_networks" ]] || docker volume inspect rig-generated-caddy-config-v1 >/dev/null 2>&1 || docker network inspect rig-hosting-notes-live-test-external >/dev/null 2>&1; then
             printf 'Generated runtime resources were not cleaned up.\n' >&2
             exit 1
           fi

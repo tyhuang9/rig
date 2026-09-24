@@ -9,16 +9,21 @@ import (
 )
 
 type configurationEntryResponse struct {
-	Key       string  `json:"key"`
-	Sensitive bool    `json:"sensitive"`
-	Value     *string `json:"value,omitempty"`
+	Key             string  `json:"key"`
+	Sensitive       bool    `json:"sensitive"`
+	Phase           string  `json:"phase,omitempty"`
+	TargetComponent string  `json:"targetComponent,omitempty"`
+	Value           *string `json:"value,omitempty"`
 }
 
 type applicationConfigurationResponse struct {
-	RevisionID     string                       `json:"revisionId,omitempty"`
-	RevisionNumber int64                        `json:"revisionNumber"`
-	UpdatedAt      string                       `json:"updatedAt,omitempty"`
-	Entries        []configurationEntryResponse `json:"entries"`
+	RevisionID                   string                       `json:"revisionId,omitempty"`
+	RevisionNumber               int64                        `json:"revisionNumber"`
+	FormatVersion                int                          `json:"formatVersion,omitempty"`
+	DeploymentPlanRevisionID     string                       `json:"deploymentPlanRevisionId,omitempty"`
+	DeploymentPlanRevisionNumber int64                        `json:"deploymentPlanRevisionNumber,omitempty"`
+	UpdatedAt                    string                       `json:"updatedAt,omitempty"`
+	Entries                      []configurationEntryResponse `json:"entries"`
 }
 
 func (s *Server) getApplicationConfiguration(w http.ResponseWriter, r *http.Request) {
@@ -37,6 +42,9 @@ func (s *Server) getApplicationConfiguration(w http.ResponseWriter, r *http.Requ
 
 func (s *Server) replaceApplicationConfiguration(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	if !s.requireAdministrator(w, r, "replaceApplicationConfiguration", "configuration_forbidden", "Administrator access is required") {
+		return
+	}
 	if s.Configuration == nil {
 		problem(w, r, http.StatusServiceUnavailable, "configuration_unavailable", "Application configuration is unavailable", nil)
 		return
@@ -75,12 +83,12 @@ func configurationInputs(values []apicontract.ConfigurationValueInput) []appconf
 }
 
 func configurationResponse(value appconfig.Configuration) applicationConfigurationResponse {
-	response := applicationConfigurationResponse{RevisionID: value.RevisionID, RevisionNumber: value.RevisionNumber, Entries: make([]configurationEntryResponse, 0, len(value.Entries))}
+	response := applicationConfigurationResponse{RevisionID: value.RevisionID, RevisionNumber: value.RevisionNumber, FormatVersion: value.FormatVersion, DeploymentPlanRevisionID: value.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: value.DeploymentPlanRevisionNumber, Entries: make([]configurationEntryResponse, 0, len(value.Entries))}
 	if !value.UpdatedAt.IsZero() {
 		response.UpdatedAt = value.UpdatedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")
 	}
 	for _, entry := range value.Entries {
-		item := configurationEntryResponse{Key: entry.Key, Sensitive: entry.Sensitive}
+		item := configurationEntryResponse{Key: entry.Key, Sensitive: entry.Sensitive, Phase: string(entry.Phase), TargetComponent: entry.TargetComponent}
 		if !entry.Sensitive {
 			visible := entry.Value
 			item.Value = &visible
@@ -106,6 +114,10 @@ func configurationProblem(w http.ResponseWriter, r *http.Request, err error) {
 	}
 	if appconfig.IsCode(err, "configuration_conflict") {
 		problem(w, r, http.StatusConflict, "configuration_conflict", "Application configuration changed; reload and try again", nil)
+		return
+	}
+	if appconfig.IsCode(err, "configuration_review_required") {
+		problem(w, r, http.StatusConflict, "configuration_review_required", "Review the configuration scope against the accepted deployment plan", nil)
 		return
 	}
 	if appconfig.IsCode(err, "configuration_unavailable") {

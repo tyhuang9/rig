@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createMemoryRouter, Link, Outlet, RouterProvider, useParams } from "react-router-dom";
-import { APIError, api } from "./api";
+import { APIError, api, type DeploymentPlanRevision } from "./api";
 import { ApplicationConfigurationPanel } from "./application-configuration";
 import { UnsavedChangesGuard } from "./unsaved-changes";
 
@@ -15,6 +15,33 @@ const initial = {
     { key: "TOKEN", sensitive: true },
   ],
 };
+
+function plan(overrides: Partial<DeploymentPlanRevision> = {}): DeploymentPlanRevision {
+  return {
+    revisionId: "plan-revision-3",
+    revisionNumber: 3,
+    canonicalDigest: "a".repeat(64),
+    strategy: "compose",
+    state: "accepted",
+    source: { provider: "local", repositoryId: 0, resolvedDigest: "b".repeat(64) },
+    detector: { name: "projectanalysis", version: "2", sourceStructuralFingerprint: "c".repeat(64) },
+    components: [],
+    fieldProvenance: [],
+    migration: { present: false },
+    ...overrides,
+  };
+}
+
+function generatedPlan(overrides: Partial<DeploymentPlanRevision> = {}): DeploymentPlanRevision {
+  return plan({
+    strategy: "generated_node",
+    components: [
+      { name: "web", role: "static", rootDirectory: "web", packageManager: "npm", installBehavior: "npm ci", installDirectory: "web", nodeVersion: "24", buildCommand: "npm run build", runCommand: "node static.js", internalPort: 8080, healthProbe: "/" },
+      { name: "api", role: "server", rootDirectory: "api", packageManager: "npm", installBehavior: "npm ci", installDirectory: "api", nodeVersion: "24", buildCommand: "", runCommand: "node server.js", internalPort: 3000, healthProbe: "/health" },
+    ],
+    ...overrides,
+  });
+}
 
 const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
 
@@ -38,6 +65,7 @@ describe("ApplicationConfigurationPanel", () => {
     vi.restoreAllMocks();
     setClipboard(vi.fn().mockResolvedValue(undefined));
     vi.spyOn(api, "applicationConfiguration").mockResolvedValue(initial);
+    vi.spyOn(api, "deploymentPlan").mockResolvedValue(plan());
   });
   afterEach(() => {
     cleanup();
@@ -337,6 +365,228 @@ describe("ApplicationConfigurationPanel", () => {
       remove: [],
     }));
     expect(JSON.stringify(replace.mock.calls)).not.toContain("a-secret-replacement");
+  });
+
+  it("keeps the Compose v1 editor and request contract for accepted Compose plans", async () => {
+    const replaceLegacy = vi.spyOn(api, "replaceApplicationConfiguration").mockResolvedValue({ ...initial, revisionNumber: 2 });
+    const replaceScoped = vi.spyOn(api, "replaceScopedApplicationConfiguration");
+    renderPanel();
+    fireEvent.change(await screen.findByLabelText("Value"), { target: { value: "compose-value" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(replaceLegacy).toHaveBeenCalledWith("app-1", {
+      expectedRevisionNumber: 1,
+      variables: [{ key: "EMPTY", value: "compose-value" }],
+      secrets: [],
+      remove: [],
+    }));
+    expect(replaceScoped).not.toHaveBeenCalled();
+  });
+
+  it("blocks configuration writes when the deployment plan cannot be loaded", async () => {
+    vi.mocked(api.deploymentPlan).mockRejectedValue(new Error("controller offline"));
+    const replaceLegacy = vi.spyOn(api, "replaceApplicationConfiguration");
+    const replaceScoped = vi.spyOn(api, "replaceScopedApplicationConfiguration");
+    renderPanel();
+    expect(await screen.findByText("The deployment plan could not be loaded.")).not.toBeNull();
+    expect(screen.getByText(/Configuration changes are unavailable until Rig can load the deployment plan/i)).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Save configuration" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(api.deploymentPlan).toHaveBeenCalledTimes(2));
+    expect(replaceLegacy).not.toHaveBeenCalled();
+    expect(replaceScoped).not.toHaveBeenCalled();
+  });
+
+  it("offers only public build configuration for a static-only generated application and requires acknowledgement", async () => {
+    vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan({
+      revisionId: "plan-static-4",
+      revisionNumber: 4,
+      components: [{ name: "web", role: "static", rootDirectory: "web", packageManager: "npm", installBehavior: "npm ci", installDirectory: "web", nodeVersion: "24", buildCommand: "npm run build", runCommand: "node static.js", internalPort: 8080, healthProbe: "/" }],
+    }));
+    vi.mocked(api.applicationConfiguration).mockResolvedValue({ revisionNumber: 0, formatVersion: 2, entries: [] });
+    const replace = vi.spyOn(api, "replaceScopedApplicationConfiguration").mockResolvedValue({ revisionNumber: 1, formatVersion: 2, entries: [] });
+    renderPanel();
+    expect(await screen.findByRole("button", { name: "Add public build variable" })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Add server runtime secret" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add server runtime variable" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Add public build variable" }));
+    const group = await screen.findByRole("group", { name: "Public build variable 1" });
+    fireEvent.change(within(group).getByLabelText(/Variable name/), { target: { value: "VITE_API_URL" } });
+    fireEvent.change(within(group).getByLabelText("Value"), { target: { value: "https://example.test/api" } });
+    expect((within(group).getByLabelText("Target component") as HTMLSelectElement).value).toBe("web");
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    expect(await screen.findByText(/Acknowledge that public build values/i)).not.toBeNull();
+    expect(replace).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByLabelText(/I understand public build values/i));
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("app-1", {
+      expectedRevisionNumber: 0,
+      planRevisionId: "plan-static-4",
+      planRevisionNumber: 4,
+      entries: [{ key: "VITE_API_URL", sensitive: false, phase: "build", targetComponent: "web", value: "https://example.test/api" }],
+      remove: [],
+      publicBuildDisclosureAcknowledged: true,
+    }));
+  });
+
+  it("defaults a new generated secret to one server runtime component and preserves stored secret values", async () => {
+    vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan({ revisionId: "plan-server-4", revisionNumber: 4 }));
+    vi.mocked(api.applicationConfiguration).mockResolvedValue({
+      revisionId: "scoped-configuration-1",
+      revisionNumber: 2,
+      formatVersion: 2,
+      deploymentPlanRevisionId: "plan-server-4",
+      deploymentPlanRevisionNumber: 4,
+      entries: [{ key: "DATABASE_URL", sensitive: true, phase: "runtime", targetComponent: "api" }],
+    } as never);
+    const replace = vi.spyOn(api, "replaceScopedApplicationConfiguration").mockResolvedValue({ revisionNumber: 3, formatVersion: 2, entries: [] });
+    renderPanel();
+    const stored = await screen.findByRole("group", { name: "Server runtime secret DATABASE_URL" });
+    const replacement = within(stored).getByLabelText("Replacement value") as HTMLInputElement;
+    expect(replacement.value).toBe("");
+    expect(replacement.type).toBe("password");
+    expect(document.body.textContent).not.toContain("sentinel-stored-secret");
+    fireEvent.click(screen.getByRole("button", { name: "Add server runtime secret" }));
+    const newSecret = await screen.findByRole("group", { name: "Server runtime secret 2" });
+    fireEvent.change(within(newSecret).getByLabelText(/Secret name/), { target: { value: "SERVICE_TOKEN" } });
+    fireEvent.change(within(newSecret).getByLabelText(/Secret value/), { target: { value: "typed-secret" } });
+    expect((within(newSecret).getByLabelText("Target component") as HTMLSelectElement).value).toBe("api");
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("app-1", expect.objectContaining({
+      entries: [
+        { key: "DATABASE_URL", sensitive: true, phase: "runtime", targetComponent: "api", value: "", preserveStoredSecret: true },
+        { key: "SERVICE_TOKEN", sensitive: true, phase: "runtime", targetComponent: "api", value: "typed-secret" },
+      ],
+    })));
+    expect(JSON.stringify(replace.mock.calls)).not.toContain("sentinel-stored-secret");
+  });
+
+  it("blocks a legacy secret from being scoped by an unrelated dirty edit until its phase and target are selected", async () => {
+    vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan({ revisionId: "plan-review-4", revisionNumber: 4 }));
+    vi.mocked(api.applicationConfiguration).mockResolvedValue({
+      revisionId: "legacy-configuration-1",
+      revisionNumber: 1,
+      formatVersion: 1,
+      entries: [{ key: "LOG_LEVEL", sensitive: false, value: "info" }, { key: "DATABASE_URL", sensitive: true }],
+    });
+    const replace = vi.spyOn(api, "replaceScopedApplicationConfiguration").mockResolvedValue({ revisionNumber: 2, formatVersion: 2, entries: [] });
+    renderPanel();
+    expect(await screen.findByRole("heading", { name: "Scope review required" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Save configuration" }).hasAttribute("disabled")).toBe(true);
+    fireEvent.change(screen.getByLabelText("Value"), { target: { value: "debug" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    expect(await screen.findByText("Choose an available execution scope from the accepted plan.")).not.toBeNull();
+    expect(screen.getByText("Choose a component.")).not.toBeNull();
+    expect(replace).not.toHaveBeenCalled();
+    const legacySecret = screen.getByRole("group", { name: "Scope required for secret DATABASE_URL" });
+    expect((within(legacySecret).getByLabelText("Execution scope") as HTMLSelectElement).value).toBe("");
+    expect((within(legacySecret).getByLabelText("Target component") as HTMLSelectElement).value).toBe("");
+    fireEvent.change(within(legacySecret).getByLabelText("Execution scope"), { target: { value: "runtime" } });
+    fireEvent.change(within(screen.getByRole("group", { name: "Server runtime secret DATABASE_URL" })).getByLabelText("Target component"), { target: { value: "api" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("app-1", expect.objectContaining({
+      expectedRevisionNumber: 1,
+      planRevisionId: "plan-review-4",
+      planRevisionNumber: 4,
+      entries: [
+        { key: "LOG_LEVEL", sensitive: false, phase: "runtime", targetComponent: "api", value: "debug" },
+        { key: "DATABASE_URL", sensitive: true, phase: "runtime", targetComponent: "api", value: "", preserveStoredSecret: true },
+      ],
+    })));
+  });
+
+  it("requires review before an unchanged empty v2 configuration can rebind to an advanced accepted plan", async () => {
+    vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan({ revisionId: "plan-advanced-5", revisionNumber: 5 }));
+    vi.mocked(api.applicationConfiguration).mockResolvedValue({
+      revisionId: "scoped-empty-configuration",
+      revisionNumber: 2,
+      formatVersion: 2,
+      deploymentPlanRevisionId: "plan-original-4",
+      deploymentPlanRevisionNumber: 4,
+      entries: [],
+    } as never);
+    const replace = vi.spyOn(api, "replaceScopedApplicationConfiguration").mockResolvedValue({
+      revisionId: "scoped-empty-rebound",
+      revisionNumber: 3,
+      formatVersion: 2,
+      deploymentPlanRevisionId: "plan-advanced-5",
+      deploymentPlanRevisionNumber: 5,
+      entries: [],
+    } as never);
+    renderPanel();
+    expect(await screen.findByRole("heading", { name: "Deployment plan changed" })).not.toBeNull();
+    expect(screen.getByText(/Stored secrets are not carried to the new plan/i)).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Save configuration" }).hasAttribute("disabled")).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Review and rebind configuration" }));
+    expect(screen.getByRole("button", { name: "Save configuration" }).hasAttribute("disabled")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("app-1", {
+      expectedRevisionNumber: 2,
+      planRevisionId: "plan-advanced-5",
+      planRevisionNumber: 5,
+      entries: [],
+      remove: [],
+      publicBuildDisclosureAcknowledged: false,
+    }));
+  });
+
+  it("requires a stored secret to be entered again before rebinding a v2 configuration to a new plan", async () => {
+    vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan({ revisionId: "plan-advanced-5", revisionNumber: 5 }));
+    vi.mocked(api.applicationConfiguration).mockResolvedValue({
+      revisionId: "scoped-secret-configuration",
+      revisionNumber: 2,
+      formatVersion: 2,
+      deploymentPlanRevisionId: "plan-original-4",
+      deploymentPlanRevisionNumber: 4,
+      entries: [{ key: "DATABASE_URL", sensitive: true, phase: "runtime", targetComponent: "api" }],
+    } as never);
+    const replace = vi.spyOn(api, "replaceScopedApplicationConfiguration");
+    renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Review and rebind configuration" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    expect(await screen.findByText("Enter this secret again before rebinding it to the accepted deployment plan.")).not.toBeNull();
+    expect(replace).not.toHaveBeenCalled();
+  });
+
+  it("omits removals from an obsolete component when rebinding to a new plan", async () => {
+    vi.mocked(api.deploymentPlan).mockResolvedValue(generatedPlan({ revisionId: "plan-advanced-5", revisionNumber: 5 }));
+    vi.mocked(api.applicationConfiguration).mockResolvedValue({
+      revisionId: "scoped-old-component",
+      revisionNumber: 2,
+      formatVersion: 2,
+      deploymentPlanRevisionId: "plan-original-4",
+      deploymentPlanRevisionNumber: 4,
+      entries: [{ key: "OLD_VALUE", sensitive: false, phase: "runtime", targetComponent: "removed-api", value: "old" }],
+    } as never);
+    const replace = vi.spyOn(api, "replaceScopedApplicationConfiguration").mockResolvedValue({ revisionNumber: 3, formatVersion: 2, entries: [] });
+    renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Review and rebind configuration" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove variable OLD_VALUE" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("app-1", expect.objectContaining({
+      entries: [],
+      remove: [],
+      planRevisionId: "plan-advanced-5",
+    })));
+  });
+
+  it("reloads an updated accepted plan after plan drift and saves against its exact revision", async () => {
+    const deploymentPlan = vi.mocked(api.deploymentPlan);
+    deploymentPlan.mockReset();
+    deploymentPlan.mockResolvedValueOnce(generatedPlan({ revisionId: "plan-before-drift", revisionNumber: 4 })).mockResolvedValueOnce(generatedPlan({ revisionId: "plan-after-drift", revisionNumber: 5 }));
+    vi.mocked(api.applicationConfiguration).mockResolvedValue({ revisionNumber: 2, formatVersion: 2, deploymentPlanRevisionId: "plan-before-drift", deploymentPlanRevisionNumber: 4, entries: [{ key: "LOG_LEVEL", sensitive: false, phase: "runtime", targetComponent: "api", value: "info" }] } as never);
+    const replace = vi.spyOn(api, "replaceScopedApplicationConfiguration")
+      .mockRejectedValueOnce(new APIError({ status: 409, code: "configuration_review_required", detail: "Review the accepted deployment plan before saving scoped configuration" }))
+      .mockResolvedValueOnce({ revisionNumber: 3, formatVersion: 2, entries: [] });
+    renderPanel();
+    fireEvent.change(await screen.findByLabelText("Value"), { target: { value: "debug" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(replace).toHaveBeenCalledWith("app-1", expect.objectContaining({ planRevisionId: "plan-before-drift", planRevisionNumber: 4 })));
+    fireEvent.click(await screen.findByRole("button", { name: "Review accepted plan" }));
+    await waitFor(() => expect(deploymentPlan).toHaveBeenCalledTimes(2));
+    await screen.findByText("Accepted plan revision 5");
+    fireEvent.click(screen.getByRole("button", { name: "Review and rebind configuration" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
+    await waitFor(() => expect(replace).toHaveBeenLastCalledWith("app-1", expect.objectContaining({ planRevisionId: "plan-after-drift", planRevisionNumber: 5 })));
   });
 
   it("serializes saves, exposes busy status, and locks every edit until hydration", async () => {

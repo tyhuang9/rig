@@ -206,6 +206,34 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
   await expect(restoredPage.getByLabel("Install command", { exact: false })).toHaveValue("");
   await expect(restoredPage.getByLabel("Build command", { exact: false })).toHaveValue("");
 
+  const browserSecret = "synthetic-browser-secret-sentinel";
+  await restoredPage.getByRole("button", { name: "Add server runtime secret" }).click();
+  const newSecret = restoredPage.getByRole("group", { name: "Server runtime secret 1" });
+  await newSecret.getByLabel("Secret name").fill("BROWSER_SENTINEL");
+  await restoredPage.getByRole("group", { name: "Server runtime secret BROWSER_SENTINEL" }).getByLabel("Secret value").fill(browserSecret);
+  const scopedSave = restoredPage.waitForResponse((response) =>
+    response.request().method() === "PUT" && new URL(response.url()).pathname.endsWith("/scoped-configuration"),
+  );
+  await restoredPage.getByRole("button", { name: "Save configuration" }).click();
+  const savedConfiguration = await scopedSave;
+  expect(savedConfiguration.status()).toBe(200);
+  expect(savedConfiguration.headers()["cache-control"]).toBe("no-store");
+  expect(JSON.stringify(await savedConfiguration.json())).not.toContain(browserSecret);
+  await expect(restoredPage.getByText("Configuration revision 1 saved.")).toBeVisible();
+  const configurationRead = restoredPage.waitForResponse((response) =>
+    response.request().method() === "GET" && new URL(response.url()).pathname.endsWith("/configuration"),
+  );
+  await restoredPage.reload();
+  const readConfiguration = await configurationRead;
+  expect(readConfiguration.status()).toBe(200);
+  expect(readConfiguration.headers()["cache-control"]).toBe("no-store");
+  expect(JSON.stringify(await readConfiguration.json())).not.toContain(browserSecret);
+  const storedSecret = restoredPage.getByRole("group", { name: "Server runtime secret BROWSER_SENTINEL" });
+  await expect(storedSecret.getByLabel("Replacement value")).toHaveValue("");
+  expect(await restoredPage.locator("body").innerText()).not.toContain(browserSecret);
+  expect(restoredPage.url()).not.toContain(browserSecret);
+  expect(await restoredPage.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain(browserSecret);
+
   await restoredPage.getByRole("link", { name: "Applications" }).click();
   await restoredPage.getByRole("link", { name: "Add application" }).first().click();
   await restoredPage.getByLabel("Application name").fill(composeName);

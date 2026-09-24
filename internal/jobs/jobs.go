@@ -1256,6 +1256,10 @@ func safeExecutionFailure(err error) (string, string) {
 			return "source_storage_full", "Application source storage is full"
 		case "configuration_unavailable":
 			return "configuration_unavailable", "Application configuration is unavailable"
+		case "configuration_review_required":
+			return "configuration_review_required", "Review application configuration scope against the accepted deployment plan"
+		case "build_configuration_requires_build_command":
+			return "build_configuration_requires_build_command", "Public build configuration requires a reviewed build command"
 		case "compose_invalid", "compose_config_invalid":
 			return executionError.Code, "Compose configuration is invalid"
 		case "compose_config_timeout":

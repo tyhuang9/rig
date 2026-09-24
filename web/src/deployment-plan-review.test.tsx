@@ -41,6 +41,11 @@ function candidate(overrides: Partial<DeploymentPlanCandidate> = {}): Deployment
   };
 }
 
+function migrationCandidate(environmentKeys: string[] = ["DATABASE_URL"]): DeploymentPlanCandidate {
+  const base = candidate();
+  return candidate({ components: [{ ...base.components[0], migrationFingerprint: "e".repeat(64), migration: { present: true, command: "npm run migrate", environmentKeys, evidence } }] });
+}
+
 function inspection(candidates: DeploymentPlanCandidate[]): InspectResponse {
   return {
     source: { type: "local", path: "C:/projects/app" },
@@ -99,6 +104,75 @@ describe("DeploymentPlanReview", () => {
       expectedSourceStructuralFingerprint: "b".repeat(64),
       setup,
     }));
+  });
+
+  it("prefills inferred migration names and sends them with the accepted plan", async () => {
+    const detected = migrationCandidate(["DATABASE_URL", "SCHEMA_NAME"]);
+    const { onAnalyze, onAccept, view } = renderReview([detected]);
+    expect((screen.getByLabelText("Migration environment names (optional)") as HTMLTextAreaElement).value).toBe("DATABASE_URL\nSCHEMA_NAME");
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    const setup = onAnalyze.mock.calls[0][0];
+    view.rerender(<DeploymentPlanReview inspection={inspection([detected, candidate({ id: "user:deployment-setup", origin: "user" })])} expectedRevisionNumber={0} pending={false} error="" reviewedSetup={setup} onAnalyze={onAnalyze} onAccept={onAccept} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Accept setup" })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
+    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ migrationEnvironmentKeys: ["DATABASE_URL", "SCHEMA_NAME"] }));
+  });
+
+  it("retains edited migration names through analysis and sends only names", async () => {
+    const detected = migrationCandidate();
+    const { onAnalyze, onAccept, view } = renderReview([detected]);
+    fireEvent.change(screen.getByLabelText("Migration environment names (optional)"), { target: { value: "DIRECT_DATABASE_URL, SCHEMA_NAME" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    const setup = onAnalyze.mock.calls[0][0];
+    view.rerender(<DeploymentPlanReview inspection={inspection([candidate({ id: "user:deployment-setup", origin: "user" })])} expectedRevisionNumber={0} pending={false} error="" reviewedSetup={setup} onAnalyze={onAnalyze} onAccept={onAccept} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Accept setup" })).toBeTruthy());
+    expect((screen.getByLabelText("Migration environment names (optional)") as HTMLTextAreaElement).value).toBe("DIRECT_DATABASE_URL, SCHEMA_NAME");
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
+    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ migrationEnvironmentKeys: ["DIRECT_DATABASE_URL", "SCHEMA_NAME"] }));
+  });
+
+  it("sends an explicit empty list when clearing inferred migration names", async () => {
+    const detected = migrationCandidate();
+    const { onAnalyze, onAccept, view } = renderReview([detected]);
+    fireEvent.change(screen.getByLabelText("Migration environment names (optional)"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    const setup = onAnalyze.mock.calls[0][0];
+    view.rerender(<DeploymentPlanReview inspection={inspection([candidate({ id: "user:deployment-setup", origin: "user" })])} expectedRevisionNumber={0} pending={false} error="" reviewedSetup={setup} onAnalyze={onAnalyze} onAccept={onAccept} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Accept setup" })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Accept setup" }));
+    expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ migrationEnvironmentKeys: [] }));
+  });
+
+  it("uses accepted migration names as the initial edit value", () => {
+    render(<DeploymentPlanReview initialSetup={deploymentSetupFromCandidate(migrationCandidate())} initialMigrationEnvironmentKeys={["ACCEPTED_DATABASE_URL"]} expectedRevisionNumber={1} pending={false} error="" onAnalyze={vi.fn()} onAccept={vi.fn()} />);
+    expect((screen.getByLabelText("Migration environment names (optional)") as HTMLTextAreaElement).value).toBe("ACCEPTED_DATABASE_URL");
+  });
+
+  it("resets migration names to the selected detected layout", () => {
+    const alternative = { ...migrationCandidate(["ALTERNATE_DATABASE_URL"]), id: "candidate-alternative", rootDirectory: "apps/api" };
+    renderReview([migrationCandidate(), alternative]);
+    fireEvent.click(screen.getByLabelText(/apps\/api/i));
+    const input = screen.getByLabelText("Migration environment names (optional)") as HTMLTextAreaElement;
+    expect(input.value).toBe("ALTERNATE_DATABASE_URL");
+    fireEvent.change(input, { target: { value: "CUSTOM_DATABASE_URL" } });
+    fireEvent.click(screen.getByRole("button", { name: "Reset to detected settings" }));
+    expect(input.value).toBe("ALTERNATE_DATABASE_URL");
+  });
+
+  it.each([
+    ["DIRECT_DATABASE_URL, DIRECT_DATABASE_URL", /only once/i],
+    ["RIG_INTERNAL", /reserved/i],
+    ["HOSTD_INTERNAL", /reserved/i],
+    ["NOT-PORTABLE", /portable names/i],
+    ["A, B, C, D, E, F, G, H, I", /no more than eight/i],
+  ])("rejects invalid migration allowlist %s", (names, message) => {
+    const { onAnalyze } = renderReview([migrationCandidate()]);
+    const input = screen.getByLabelText("Migration environment names (optional)");
+    fireEvent.change(input, { target: { value: names } });
+    fireEvent.click(screen.getByRole("button", { name: "Review setup" }));
+    expect(onAnalyze).not.toHaveBeenCalled();
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(screen.getByRole("link", { name: /migration environment names/i }).textContent).toMatch(message);
   });
 
   it("keeps exact shell syntax in commands and requires a new review after an edit", () => {

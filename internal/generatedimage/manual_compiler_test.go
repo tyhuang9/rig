@@ -58,7 +58,7 @@ func TestCompilerBuildsUndetectedManualPlanAndCompatibleLaterSources(t *testing.
 			if changed {
 				writeTestFile(t, filepath.Join(fixture.release.WorkspacePath, "package.json"), `{"scripts":{"start":"different-detected-command"},"engines":{"node":">=24"}}`)
 			}
-			artifact, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+			artifact, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
 			if err != nil || artifact.State != ArtifactReady {
 				t.Fatalf("manual compiler: %v %#v", err, artifact)
 			}
@@ -86,7 +86,7 @@ func TestManualCompilerRetainsPinRuntimeAndWorkspaceChecks(t *testing.T) {
 				fixture.releaseReader.beforeSecond = func() { fixture.releaseReader.release.WorkspaceTreeSHA256 = strings.Repeat("d", 64) }
 			}
 			fixture.compiler.plans = compilerPlanReader{revision: fixture.revision}
-			_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+			_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
 			expected := "deployment_plan_review_required"
 			if condition == "workspace-changed" {
 				expected = string(DiagnosticSourceIntegrityFailed)

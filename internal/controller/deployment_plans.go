@@ -87,6 +87,10 @@ func (s *Server) acceptApplicationDeploymentPlan(w http.ResponseWriter, r *http.
 			problem(w, r, http.StatusConflict, "deployment_plan_review_required", "The deployment setup changed; review it again", nil)
 			return
 		}
+		if err := applyMigrationEnvironmentOverride(&plan, body.MigrationEnvironmentKeys); err != nil {
+			deploymentPlanProblem(w, r, err)
+			return
+		}
 		revision, saveErr := s.DeploymentPlans.Replace(r.Context(), application.ID, sourceOwner(r), deploymentplans.ReplaceInput{ExpectedRevisionNumber: body.ExpectedRevisionNumber, Plan: plan})
 		if saveErr != nil {
 			deploymentPlanProblem(w, r, saveErr)
@@ -275,10 +279,27 @@ func acceptedGeneratedPlan(candidate projectanalysis.DeploymentPlanCandidate, in
 	if migrationCount > 1 || (migrationCount == 0 && body.MigrationCommand != "") {
 		return deploymentplans.Plan{}, errors.New("migration input does not match analysis")
 	}
+	if err := applyMigrationEnvironmentOverride(&plan, body.MigrationEnvironmentKeys); err != nil {
+		return deploymentplans.Plan{}, err
+	}
 	if _, err := deploymentplans.CanonicalDigest(plan); err != nil {
 		return deploymentplans.Plan{}, err
 	}
 	return plan, nil
+}
+
+func applyMigrationEnvironmentOverride(plan *deploymentplans.Plan, keys []string) error {
+	if keys == nil {
+		return nil
+	}
+	if plan.Migration == nil {
+		return &deploymentplans.Error{Code: "invalid_deployment_plan", Fields: map[string]string{"migrationEnvironmentKeys": "An accepted migration is required"}}
+	}
+	plan.Migration.EnvironmentKeys = append([]string(nil), keys...)
+	if _, err := deploymentplans.CanonicalDigest(*plan); err != nil {
+		return &deploymentplans.Error{Code: "invalid_deployment_plan", Fields: map[string]string{"migrationEnvironmentKeys": "Use up to eight distinct portable, nonreserved environment names"}}
+	}
+	return nil
 }
 
 func deploymentPlanFieldCanBeOverridden(field string) bool {

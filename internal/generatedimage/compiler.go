@@ -3,6 +3,7 @@ package generatedimage
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/projectanalysis"
@@ -40,6 +42,10 @@ type deploymentPlanReader interface {
 	GetRevision(context.Context, string, string, int64) (deploymentplans.DeploymentPlanRevision, error)
 }
 
+type buildConfigurationExporter interface {
+	ExportComponentBuildForExecution(context.Context, string, string, int64, string, int64, string) (appconfig.ExecutionConfiguration, error)
+}
+
 type artifactWriter interface {
 	Begin(context.Context, BeginArtifactInput) (Artifact, bool, error)
 	Complete(context.Context, string, string) (Artifact, error)
@@ -61,6 +67,7 @@ type CompilerOptions struct {
 type Compiler struct {
 	releases  releaseWorkspaceReader
 	plans     deploymentPlanReader
+	config    buildConfigurationExporter
 	artifacts artifactWriter
 	temporary *securetemp.Manager
 	builder   builderPreparer
@@ -70,8 +77,8 @@ type Compiler struct {
 	buildSlot chan struct{}
 }
 
-func NewCompiler(releases releaseWorkspaceReader, plans deploymentPlanReader, artifacts artifactWriter, temporary *securetemp.Manager, builder builderPreparer, runner runtimeprocess.CommandRunner, options CompilerOptions) (*Compiler, error) {
-	if releases == nil || plans == nil || artifacts == nil || temporary == nil || builder == nil || runner == nil {
+func NewCompiler(releases releaseWorkspaceReader, plans deploymentPlanReader, config buildConfigurationExporter, artifacts artifactWriter, temporary *securetemp.Manager, builder builderPreparer, runner runtimeprocess.CommandRunner, options CompilerOptions) (*Compiler, error) {
+	if releases == nil || plans == nil || config == nil || artifacts == nil || temporary == nil || builder == nil || runner == nil {
 		return nil, errors.New("generated image compiler dependencies are required")
 	}
 	if options.BuildTimeout == 0 {
@@ -83,13 +90,13 @@ func NewCompiler(releases releaseWorkspaceReader, plans deploymentPlanReader, ar
 	if options.BuildTimeout < time.Second || options.BuildTimeout > 2*time.Hour || options.ContextBytes < 0 || options.ContextEntries < 0 || options.BuildConcurrency < 1 || options.BuildConcurrency > 4 {
 		return nil, errors.New("generated build limits are outside supported bounds")
 	}
-	return &Compiler{releases: releases, plans: plans, artifacts: artifacts, temporary: temporary, builder: builder, runner: runner, options: options, cleanup: func(files *securetemp.Files) error { return files.Cleanup() }, buildSlot: make(chan struct{}, options.BuildConcurrency)}, nil
+	return &Compiler{releases: releases, plans: plans, config: config, artifacts: artifacts, temporary: temporary, builder: builder, runner: runner, options: options, cleanup: func(files *securetemp.Files) error { return files.Cleanup() }, buildSlot: make(chan struct{}, options.BuildConcurrency)}, nil
 }
 
 // Compile produces or reuses the immutable image for one component. Repository
 // commands remain data until BuildKit executes the controller-generated recipe.
-func (c *Compiler) Compile(ctx context.Context, appID, releaseID, componentName string) (Artifact, error) {
-	if uuid.Validate(appID) != nil || !validReleaseID(releaseID) || !validText(componentName, 256) {
+func (c *Compiler) Compile(ctx context.Context, appID, releaseID, componentName, configurationRevisionID string, configurationRevisionNumber int64) (Artifact, error) {
+	if uuid.Validate(appID) != nil || !validReleaseID(releaseID) || !validText(componentName, 256) || configurationRevisionNumber < 0 || (configurationRevisionNumber == 0) != (configurationRevisionID == "") {
 		return Artifact{}, &CompileError{Code: "validation_failed"}
 	}
 	release, err := c.releases.ReadyWorkspace(ctx, appID, releaseID)
@@ -115,9 +122,31 @@ func (c *Compiler) Compile(ctx context.Context, appID, releaseID, componentName 
 		}
 		return Artifact{}, &CompileError{Code: "deployment_plan_review_required"}
 	}
-	definition, definitionDigest, err := definitionFor(revision, componentName)
+	configuration, err := c.config.ExportComponentBuildForExecution(ctx, appID, configurationRevisionID, configurationRevisionNumber, revision.ID, revision.RevisionNumber, componentName)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+			return Artifact{}, &CompileError{Code: string(DiagnosticBuildCancelled)}
+		}
+		if appconfig.IsCode(err, "configuration_review_required") {
+			return Artifact{}, &CompileError{Code: "configuration_review_required"}
+		}
+		return Artifact{}, &CompileError{Code: "configuration_unavailable"}
+	}
+	defer configuration.Clear()
+	if configuration.RevisionID != configurationRevisionID || configuration.RevisionNumber != configurationRevisionNumber || len(configuration.Environment) != 0 || len(configuration.SecretOrigins) != 0 {
+		return Artifact{}, &CompileError{Code: "configuration_unavailable"}
+	}
+	publicValues, err := canonicalPublicBuildValues(configuration.PublicBuildValues)
+	if err != nil {
+		return Artifact{}, &CompileError{Code: "configuration_unavailable"}
+	}
+	defer clear(publicValues)
+	definition, definitionDigest, err := definitionForBuild(revision, componentName, publicValues)
 	if err != nil {
 		return Artifact{}, &CompileError{Code: "unsupported_runtime"}
+	}
+	if len(publicValues) != 0 && definition.buildCommand == "" {
+		return Artifact{}, &CompileError{Code: "build_configuration_requires_build_command"}
 	}
 	artifact, created, err := c.artifacts.Begin(ctx, BeginArtifactInput{
 		ReleaseID: release.ID, DeploymentPlanRevisionID: revision.ID, DeploymentPlanRevisionNumber: revision.RevisionNumber,
@@ -135,10 +164,10 @@ func (c *Compiler) Compile(ctx context.Context, appID, releaseID, componentName 
 	case <-ctx.Done():
 		return Artifact{}, c.cancelArtifact(artifact.ID)
 	}
-	return c.build(ctx, appID, release, revision, definition, definitionDigest, artifact)
+	return c.build(ctx, appID, release, revision, definition, definitionDigest, publicValues, artifact)
 }
 
-func (c *Compiler) build(ctx context.Context, appID string, release releasesnapshot.Release, revision deploymentplans.DeploymentPlanRevision, definition componentDefinition, definitionDigest string, artifact Artifact) (Artifact, error) {
+func (c *Compiler) build(ctx context.Context, appID string, release releasesnapshot.Release, revision deploymentplans.DeploymentPlanRevision, definition componentDefinition, definitionDigest string, publicValues []appconfig.ValueInput, artifact Artifact) (Artifact, error) {
 	files, err := c.temporary.Create(artifact.ID, int(artifact.AttemptNumber))
 	if err != nil {
 		return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticInternalError)
@@ -176,6 +205,19 @@ func (c *Compiler) build(ctx context.Context, appID string, release releasesnaps
 		_ = cleanup()
 		return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticInternalError)
 	}
+	if definition.buildCommand != "" {
+		body, err := json.Marshal(publicValues)
+		if err != nil {
+			_ = cleanup()
+			return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticInternalError)
+		}
+		if err := writeBuildFile(layout.publicBuildValues, body, 0o600); err != nil {
+			clear(body)
+			_ = cleanup()
+			return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticInternalError)
+		}
+		clear(body)
+	}
 	session, err := c.builder.Prepare(ctx)
 	if err != nil {
 		_ = cleanup()
@@ -197,6 +239,7 @@ func (c *Compiler) build(ctx context.Context, appID string, release releasesnaps
 	}
 	if definition.buildCommand != "" {
 		args = append(args, "--secret", "id=rig-build-command,src="+layout.buildCommand)
+		args = append(args, "--secret", "id=rig-public-build-values,src="+layout.publicBuildValues)
 	}
 	args = append(args,
 		"--label", "io.rig.managed=generated-image",

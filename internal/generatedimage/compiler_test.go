@@ -2,6 +2,7 @@ package generatedimage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/releasesnapshot"
@@ -35,6 +37,27 @@ func (r *compilerReleaseReader) ReadyWorkspace(context.Context, string, string) 
 
 type compilerPlanReader struct {
 	revision deploymentplans.DeploymentPlanRevision
+}
+
+type compilerConfiguration struct {
+	values             []appconfig.ValueInput
+	err                error
+	calls              int
+	lastRevisionID     string
+	lastRevisionNumber int64
+	lastPlanID         string
+	lastPlanNumber     int64
+	lastComponent      string
+}
+
+func (c *compilerConfiguration) ExportComponentBuildForExecution(_ context.Context, _ string, revisionID string, revisionNumber int64, planID string, planNumber int64, component string) (appconfig.ExecutionConfiguration, error) {
+	c.calls++
+	c.lastRevisionID, c.lastRevisionNumber = revisionID, revisionNumber
+	c.lastPlanID, c.lastPlanNumber, c.lastComponent = planID, planNumber, component
+	if c.err != nil {
+		return appconfig.ExecutionConfiguration{}, c.err
+	}
+	return appconfig.ExecutionConfiguration{RevisionID: revisionID, RevisionNumber: revisionNumber, PublicBuildValues: append([]appconfig.ValueInput(nil), c.values...)}, nil
 }
 
 func (r compilerPlanReader) GetRevision(context.Context, string, string, int64) (deploymentplans.DeploymentPlanRevision, error) {
@@ -144,7 +167,7 @@ func TestCompilerKeepsCommandsAndConfigurationOutOfDockerArguments(t *testing.T)
 		return os.WriteFile(flagValue(t, request.Args, "--iidfile"), []byte("sha256:"+strings.Repeat("1", 64)), 0o600)
 	}
 
-	artifact, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+	artifact, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,12 +190,89 @@ func TestCompilerKeepsCommandsAndConfigurationOutOfDockerArguments(t *testing.T)
 	}
 }
 
+func TestCompilerBuildsWithOnlyPinnedPublicValues(t *testing.T) {
+	fixture := newCompilerFixture(t)
+	configurationID := uuid.NewString()
+	const publicValue = `literal $() ' " = & \\ 雪`
+	expectedPublicValue := publicValue
+	fixture.config.values = []appconfig.ValueInput{{Key: "VITE_LABEL", Value: publicValue}, {Key: "API_PUBLIC_MARKER", Value: "visible"}}
+	fixture.runner.run = func(request runtimeprocess.CommandRequest) error {
+		path := secretSource(t, request.Args, "rig-public-build-values")
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		var values []appconfig.ValueInput
+		if err := json.Unmarshal(body, &values); err != nil {
+			return err
+		}
+		if len(values) != 2 || values[0].Key != "API_PUBLIC_MARKER" || values[1].Key != "VITE_LABEL" || values[1].Value != expectedPublicValue {
+			t.Fatalf("public input was not transported literally in canonical order: %#v", values)
+		}
+		contextDirectory := request.Args[len(request.Args)-1]
+		containerfile := flagValue(t, request.Args, "--file")
+		recipe, err := os.ReadFile(containerfile)
+		if err != nil {
+			return err
+		}
+		metadata := strings.Join(append(append([]string{request.Executable}, request.Args...), request.Env...), "\n") + string(recipe)
+		if strings.Contains(metadata, expectedPublicValue) || strings.Contains(metadata, "VITE_LABEL") {
+			t.Fatal("public value or key was serialized into Docker arguments, environment, or recipe")
+		}
+		if _, err := os.Stat(filepath.Join(contextDirectory, "public-build-values.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("public input reached Docker context: %v", err)
+		}
+		if !strings.Contains(string(recipe), "--mount=type=secret,id=rig-public-build-values") || !strings.Contains(string(recipe), "run-build.mjs") {
+			t.Fatal("build recipe did not mount and consume protected public input")
+		}
+		return os.WriteFile(flagValue(t, request.Args, "--iidfile"), []byte("sha256:"+strings.Repeat("a", 64)), 0o600)
+	}
+	first, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", configurationID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixture.config.lastRevisionID != configurationID || fixture.config.lastRevisionNumber != 2 || fixture.config.lastPlanID != fixture.revision.ID || fixture.config.lastPlanNumber != 1 || fixture.config.lastComponent != "app" {
+		t.Fatalf("build config exporter received wrong pins: %#v", fixture.config)
+	}
+	fixture.config.values[0].Value = "changed"
+	expectedPublicValue = "changed"
+	second, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", uuid.NewString(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.BuildDefinitionDigest == second.BuildDefinitionDigest || first.ID == second.ID || fixture.config.calls != 2 {
+		t.Fatal("changed public value reused a build definition or artifact")
+	}
+	if _, err := os.Stat(filepath.Dir(secretSource(t, fixture.runner.request.Args, "rig-public-build-values"))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("protected build input remains after success: %v", err)
+	}
+}
+
+func TestCompilerEmptyBuildScopeAndLegacyReview(t *testing.T) {
+	fixture := newCompilerFixture(t)
+	fixture.runner.run = func(request runtimeprocess.CommandRequest) error {
+		assertFileEquals(t, secretSource(t, request.Args, "rig-public-build-values"), "[]")
+		return os.WriteFile(flagValue(t, request.Args, "--iidfile"), []byte("sha256:"+strings.Repeat("b", 64)), 0o600)
+	}
+	if _, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	fixture.config.err = &appconfig.Error{Code: "configuration_review_required"}
+	fixture.runner.request = runtimeprocess.CommandRequest{}
+	if _, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", uuid.NewString(), 1); !IsCompileCode(err, "configuration_review_required") {
+		t.Fatalf("legacy unscoped config diagnostic = %v", err)
+	}
+	if fixture.runner.request.Executable != "" {
+		t.Fatal("legacy unscoped config reached Docker")
+	}
+}
+
 func TestCompilerStopsStructuralDriftBeforeDocker(t *testing.T) {
 	fixture := newCompilerFixture(t)
 	fixture.releaseReader.beforeSecond = func() {
 		writeTestFile(t, filepath.Join(fixture.release.WorkspacePath, "package.json"), `{"name":"demo","scripts":{"build":"changed","start":"node server.js"},"dependencies":{"express":"1.0.0"}}`)
 	}
-	_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+	_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
 	if !IsCompileCode(err, string(DiagnosticSourceIntegrityFailed)) || fixture.artifacts.failed != DiagnosticSourceIntegrityFailed {
 		t.Fatalf("structural drift result = %v, artifact diagnostic = %q", err, fixture.artifacts.failed)
 	}
@@ -188,7 +288,7 @@ func TestCompilerUsesStableDiagnosticsAndCleansFailureMaterial(t *testing.T) {
 	fixture := newCompilerFixture(t)
 	fixture.runner.result = runtimeprocess.CommandResult{Stderr: []byte("no space left on device: raw details")}
 	fixture.runner.err = errors.New("exit status 1")
-	_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+	_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
 	if !IsCompileCode(err, string(DiagnosticBuildDiskExhausted)) || fixture.artifacts.failed != DiagnosticBuildDiskExhausted {
 		t.Fatalf("disk failure result = %v, diagnostic = %q", err, fixture.artifacts.failed)
 	}
@@ -200,7 +300,7 @@ func TestCompilerUsesStableDiagnosticsAndCleansFailureMaterial(t *testing.T) {
 func TestCompilerFailsClosedWhenOwnedBuilderIsUnavailable(t *testing.T) {
 	fixture := newCompilerFixture(t)
 	fixture.builder.err = &BuilderError{Code: BuilderDriftDetected}
-	_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+	_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
 	if !IsCompileCode(err, string(DiagnosticInternalError)) || fixture.artifacts.failed != DiagnosticInternalError {
 		t.Fatalf("builder drift result = %v, diagnostic = %q", err, fixture.artifacts.failed)
 	}
@@ -210,7 +310,7 @@ func TestCompilerFailsClosedWhenOwnedBuilderIsUnavailable(t *testing.T) {
 
 	fixture = newCompilerFixture(t)
 	fixture.builder.err = &BuilderError{Code: BuilderRuntimeUnavailable}
-	_, err = fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+	_, err = fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
 	if !IsCompileCode(err, string(DiagnosticRuntimeUnavailable)) || fixture.artifacts.failed != DiagnosticRuntimeUnavailable {
 		t.Fatalf("builder runtime result = %v, diagnostic = %q", err, fixture.artifacts.failed)
 	}
@@ -222,7 +322,7 @@ func TestCompilerTerminalizesAttemptWhenCompletionPersistenceFails(t *testing.T)
 	fixture.runner.run = func(request runtimeprocess.CommandRequest) error {
 		return os.WriteFile(flagValue(t, request.Args, "--iidfile"), []byte("sha256:"+strings.Repeat("2", 64)), 0o600)
 	}
-	_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+	_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
 	if !IsCompileCode(err, string(DiagnosticInternalError)) || fixture.artifacts.failed != DiagnosticInternalError || fixture.artifacts.artifact.State != ArtifactFailed {
 		t.Fatalf("completion persistence result = %v, artifact = %#v", err, fixture.artifacts.artifact)
 	}
@@ -257,7 +357,7 @@ func TestClassifyBuildResultUsesOnlyStableBoundaryState(t *testing.T) {
 func TestCompilerRejectsBuilderSessionWithoutVerifiedHardQuota(t *testing.T) {
 	fixture := newCompilerFixture(t)
 	fixture.builder.session.storageQuotaBytes = 0
-	_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+	_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
 	if !IsCompileCode(err, string(DiagnosticInternalError)) || fixture.artifacts.failed != DiagnosticInternalError {
 		t.Fatalf("unverified quota result = %v, diagnostic = %q", err, fixture.artifacts.failed)
 	}
@@ -277,7 +377,7 @@ func TestBuilderQuotaErrorsUseStableCompilerDiagnostics(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			fixture := newCompilerFixture(t)
 			fixture.builder.err = &BuilderError{Code: test.builder}
-			_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+			_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
 			if !IsCompileCode(err, string(test.want)) || fixture.artifacts.failed != test.want {
 				t.Fatalf("quota result = %v, diagnostic = %q", err, fixture.artifacts.failed)
 			}
@@ -330,6 +430,7 @@ type compilerFixture struct {
 	runner        *compilerRunner
 	builder       *compilerBuilder
 	temporary     *securetemp.Manager
+	config        *compilerConfiguration
 }
 
 func newCompilerFixture(t *testing.T) compilerFixture {
@@ -375,11 +476,12 @@ func newCompilerFixture(t *testing.T) compilerFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	compiler, err := NewCompiler(releaseReader, compilerPlanReader{revision: revision}, artifacts, temporary, builder, runner, CompilerOptions{BuildTimeout: time.Minute})
+	config := &compilerConfiguration{}
+	compiler, err := NewCompiler(releaseReader, compilerPlanReader{revision: revision}, config, artifacts, temporary, builder, runner, CompilerOptions{BuildTimeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return compilerFixture{compiler: compiler, release: release, revision: revision, releaseReader: releaseReader, artifacts: artifacts, runner: runner, builder: builder, temporary: temporary}
+	return compilerFixture{compiler: compiler, release: release, revision: revision, releaseReader: releaseReader, artifacts: artifacts, runner: runner, builder: builder, temporary: temporary, config: config}
 }
 
 func TestCompilerBuildsWorkspaceDependenciesAtRepositoryRoot(t *testing.T) {
@@ -413,7 +515,7 @@ func TestCompilerBuildsWorkspaceDependenciesAtRepositoryRoot(t *testing.T) {
 			fixture.revision.Plan.Detector.SourceStructuralFingerprint = inspection.Analysis.StructuralFingerprint
 			fixture.revision.Plan.Source.ResolvedDigest = inspection.Analysis.StructuralFingerprint
 			fixture.revision.Plan.Components = []deploymentplans.Component{{Name: "app", Role: "server", RootDirectory: "apps/api", PackageManager: test.packageManager, InstallBehavior: test.install, InstallDirectory: ".", NodeVersion: "24", BuildCommand: "node build.js", RunCommand: "node server.js", InternalPort: 3000, HealthProbe: "/"}}
-			fixture.compiler, err = NewCompiler(fixture.releaseReader, compilerPlanReader{revision: fixture.revision}, fixture.artifacts, fixture.temporary, fixture.builder, fixture.runner, CompilerOptions{BuildTimeout: time.Minute})
+			fixture.compiler, err = NewCompiler(fixture.releaseReader, compilerPlanReader{revision: fixture.revision}, fixture.config, fixture.artifacts, fixture.temporary, fixture.builder, fixture.runner, CompilerOptions{BuildTimeout: time.Minute})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -427,10 +529,10 @@ func TestCompilerBuildsWorkspaceDependenciesAtRepositoryRoot(t *testing.T) {
 					return err
 				}
 				assertCommandSecretRun(t, string(recipe), "rig-install-command", `install=$(cat /run/rig/install.path) && rig_command=$(cat /run/secrets/rig-install-command) && cd -- "/workspace/$install" && exec /bin/sh -lc "$rig_command"`)
-				assertCommandSecretRun(t, string(recipe), "rig-build-command", `root=$(cat /run/rig/root.path) && rig_command=$(cat /run/secrets/rig-build-command) && cd -- "/workspace/$root" && exec /bin/sh -lc "$rig_command"`)
+				assertCommandSecretRun(t, string(recipe), "rig-build-command", `root=$(cat /run/rig/root.path) && rig_command=$(cat /run/secrets/rig-build-command) && cd -- "/workspace/$root" && exec node /run/rig/run-build.mjs "$rig_command"`)
 				return os.WriteFile(flagValue(t, request.Args, "--iidfile"), []byte("sha256:"+strings.Repeat("3", 64)), 0o600)
 			}
-			artifact, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app")
+			artifact, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
 			if err != nil || artifact.State != ArtifactReady {
 				t.Fatalf("workspace compile artifact=%#v err=%v", artifact, err)
 			}

@@ -123,6 +123,7 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("approveApplicationDeploymentPlanMigration", noStore(s.require(s.approveApplicationDeploymentPlanMigration))),
 		contractRoute("getApplicationConfiguration", s.require(s.getApplicationConfiguration)),
 		contractRoute("replaceApplicationConfiguration", s.require(s.replaceApplicationConfiguration)),
+		contractRoute("replaceScopedApplicationConfiguration", s.require(s.replaceScopedApplicationConfiguration)),
 		contractRoute("listServices", s.require(s.services)),
 		contractRoute("listDeployments", s.require(s.listDeployments)),
 		contractRoute("deployApplication", s.require(s.deployApplication)),

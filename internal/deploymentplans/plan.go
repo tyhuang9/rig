@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -22,6 +23,8 @@ const (
 	maxBundleBytes  = 48 << 10
 	maxCommandBytes = 8 << 10
 )
+
+var migrationEnvironmentKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type Strategy string
 
@@ -279,8 +282,12 @@ func canonicalPlanWithLegacyMigration(plan Plan, allowLegacyMigration bool) (Pla
 			}
 			keys := append([]string(nil), result.Migration.EnvironmentKeys...)
 			sort.Strings(keys)
+			if len(keys) > 8 {
+				return Plan{}, invalid("migration", "Migration environment allows at most eight explicit keys")
+			}
 			for index, key := range keys {
-				if key != "DATABASE_URL" || (index > 0 && keys[index-1] == key) {
+				upper := strings.ToUpper(key)
+				if len(key) > 128 || !migrationEnvironmentKey.MatchString(key) || strings.HasPrefix(upper, "RIG_") || strings.HasPrefix(upper, "HOSTD_") || (index > 0 && keys[index-1] == key) {
 					return Plan{}, invalid("migration", "Migration environment keys must use the supported explicit allowlist")
 				}
 			}

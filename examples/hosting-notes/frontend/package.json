@@ -1,0 +1,18 @@
+{
+  "name": "@rig-hosting-notes/frontend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 4173"
+  },
+  "dependencies": {
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "5.1.1",
+    "vite": "7.3.0"
+  }
+}

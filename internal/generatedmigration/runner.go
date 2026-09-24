@@ -29,7 +29,7 @@ const (
 )
 
 type configurationExporter interface {
-	ExportRevisionKeysForExecution(context.Context, string, string, int64, []string) (appconfig.ExecutionConfiguration, error)
+	ExportComponentMigrationForExecution(context.Context, string, string, int64, string, int64, string, []string) (appconfig.ExecutionConfiguration, error)
 }
 
 type Options struct {
@@ -82,8 +82,12 @@ func (r *Runner) Run(ctx context.Context, request generatedruntime.MigrationRequ
 	if r == nil || ctx == nil || !validRequest(request) {
 		return &Error{Code: "validation_failed"}
 	}
-	configuration, err := r.configuration.ExportRevisionKeysForExecution(ctx, request.AppID, request.ConfigurationRevisionID, request.ConfigurationRevisionNumber, request.AllowedEnvironmentKeys)
+	configuration, err := r.configuration.ExportComponentMigrationForExecution(ctx, request.AppID, request.ConfigurationRevisionID, request.ConfigurationRevisionNumber, request.DeploymentPlanRevisionID, request.DeploymentPlanRevisionNumber, request.ComponentName, request.AllowedEnvironmentKeys)
 	if err != nil {
+		return &Error{Code: "configuration_unavailable"}
+	}
+	if configuration.RevisionID != request.ConfigurationRevisionID || configuration.RevisionNumber != request.ConfigurationRevisionNumber {
+		configuration.Clear()
 		return &Error{Code: "configuration_unavailable"}
 	}
 	defer configuration.Clear()
@@ -191,13 +195,13 @@ func validOptions(options Options) bool {
 }
 
 func validRequest(request generatedruntime.MigrationRequest) bool {
-	if uuid.Validate(request.AppID) != nil || uuid.Validate(request.DeploymentID) != nil || uuid.Validate(request.ArtifactID) != nil || uuid.Validate(request.DeploymentPlanRevisionID) != nil || !validReleaseID(request.ReleaseID) || !validText(request.ComponentName, 256) || !validRoot(request.RootDirectory) || !validImageID(request.ImageContentID) || deploymentplans.ValidateCommand(request.Command) != nil || request.ConfigurationRevisionNumber < 0 || (request.ConfigurationRevisionNumber == 0) != (request.ConfigurationRevisionID == "") || len(request.AllowedEnvironmentKeys) > 8 {
+	if uuid.Validate(request.AppID) != nil || uuid.Validate(request.DeploymentID) != nil || uuid.Validate(request.ArtifactID) != nil || uuid.Validate(request.DeploymentPlanRevisionID) != nil || request.DeploymentPlanRevisionNumber < 1 || !validReleaseID(request.ReleaseID) || !validText(request.ComponentName, 256) || !validRoot(request.RootDirectory) || !validImageID(request.ImageContentID) || deploymentplans.ValidateCommand(request.Command) != nil || request.ConfigurationRevisionNumber < 0 || (request.ConfigurationRevisionNumber == 0) != (request.ConfigurationRevisionID == "") || len(request.AllowedEnvironmentKeys) > 8 {
 		return false
 	}
 	keys := append([]string(nil), request.AllowedEnvironmentKeys...)
 	sort.Strings(keys)
 	for index, key := range keys {
-		if key != "DATABASE_URL" || (index > 0 && keys[index-1] == key) {
+		if appconfig.ValidateScopedEnvironmentKey(key) != nil || (index > 0 && keys[index-1] == key) {
 			return false
 		}
 	}

@@ -1,0 +1,63 @@
+name: rig-hosting-notes-external-deps
+
+services:
+  certificate-bootstrap:
+    image: alpine:3.21.3
+    volumes:
+      - ./certs:/source:ro
+      - fixture-certs:/target
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        cp /source/test-ca.crt /source/postgres.fixture.test.crt /source/postgres.fixture.test.key
+        /source/https.fixture.test.crt /source/https.fixture.test.key /target/ &&
+        chown 70:70 /target/postgres.fixture.test.key && chmod 600 /target/postgres.fixture.test.key
+    networks: [fixture-external]
+
+  postgres:
+    image: postgres:17.4-alpine
+    depends_on:
+      certificate-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_DB: ${FIXTURE_POSTGRES_DB:?set FIXTURE_POSTGRES_DB}
+      POSTGRES_USER: ${FIXTURE_POSTGRES_USER:?set FIXTURE_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${FIXTURE_POSTGRES_PASSWORD:?set FIXTURE_POSTGRES_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/certs/postgres.fixture.test.crt
+      - -c
+      - ssl_key_file=/certs/postgres.fixture.test.key
+    ports:
+      - ${FIXTURE_POSTGRES_BIND_ADDRESS:-127.0.0.1}:${FIXTURE_POSTGRES_HOST_PORT:-55432}:5432
+    volumes:
+      - fixture-certs:/certs:ro
+      - fixture-postgres-data:/var/lib/postgresql/data
+    networks: [fixture-external]
+
+  https-dependency:
+    image: node:24.15.0-alpine
+    depends_on:
+      certificate-bootstrap:
+        condition: service_completed_successfully
+    command: ["node", "/fixture/https-stub.mjs"]
+    environment:
+      FIXTURE_HTTPS_TOKEN: ${FIXTURE_HTTPS_TOKEN:?set FIXTURE_HTTPS_TOKEN}
+    ports:
+      - ${FIXTURE_HTTPS_BIND_ADDRESS:-127.0.0.1}:${FIXTURE_HTTPS_HOST_PORT:-55443}:8443
+    volumes:
+      - ./https-stub.mjs:/fixture/https-stub.mjs:ro
+      - fixture-certs:/certs:ro
+    networks: [fixture-external]
+
+networks:
+  fixture-external:
+    name: ${FIXTURE_NETWORK_NAME:-rig-hosting-notes-fixture-external}
+
+volumes:
+  fixture-certs:
+  fixture-postgres-data:

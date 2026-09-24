@@ -33,6 +33,7 @@ import {
   type MachineList,
   type MeResponse,
   type ReplaceApplicationConfigurationRequest,
+  type ReplaceScopedApplicationConfigurationRequest,
   type RelayStatus,
   type RelayBindingStatus,
   type RelayEnrollmentStart,
@@ -76,6 +77,7 @@ export type {
   SystemStatus,
   User,
   ReplaceApplicationConfigurationRequest,
+  ReplaceScopedApplicationConfigurationRequest,
   Deployment,
   DeploymentPlanCandidate,
   DeploymentPlanRevision,
@@ -347,6 +349,11 @@ export const api = {
   replaceApplicationConfiguration: (id: string, data: ReplaceApplicationConfigurationRequest) =>
     request<ApplicationConfiguration>(operationPath(operations.replaceApplicationConfiguration.path, { appId: id }), {
       method: operations.replaceApplicationConfiguration.method,
+      body: JSON.stringify(data),
+    }),
+  replaceScopedApplicationConfiguration: (id: string, data: ReplaceScopedApplicationConfigurationRequest) =>
+    request<ApplicationConfiguration>(operationPath(operations.replaceScopedApplicationConfiguration.path, { appId: id }), {
+      method: operations.replaceScopedApplicationConfiguration.method,
       body: JSON.stringify(data),
     }),
   createApp: (data: CreateApplicationRequest) =>

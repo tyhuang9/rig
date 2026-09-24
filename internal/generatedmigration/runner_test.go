@@ -19,7 +19,7 @@ type fakeConfiguration struct {
 	err       error
 }
 
-func (f *fakeConfiguration) ExportRevisionKeysForExecution(_ context.Context, _, _ string, _ int64, keys []string) (appconfig.ExecutionConfiguration, error) {
+func (f *fakeConfiguration) ExportComponentMigrationForExecution(_ context.Context, _, _ string, _ int64, _ string, _ int64, _ string, keys []string) (appconfig.ExecutionConfiguration, error) {
 	f.requested = append([]string(nil), keys...)
 	return f.value, f.err
 }
@@ -75,7 +75,7 @@ func TestRunnerUsesOnlyAllowedConfigurationAndExactCommandArgument(t *testing.T)
 	if len(configuration.requested) != 1 || configuration.requested[0] != "DATABASE_URL" {
 		t.Fatalf("requested keys=%#v", configuration.requested)
 	}
-	if string(stager.contents) != "DATABASE_URL='secret'\n" || !stager.lease.cleaned {
+	if string(stager.contents) != "DATABASE_URL=secret\n" || !stager.lease.cleaned {
 		t.Fatalf("staging=%q cleaned=%v", stager.contents, stager.lease.cleaned)
 	}
 	if len(commands.requests) != 4 {
@@ -111,12 +111,21 @@ func TestRunnerFailureCleansContainerAndReturnsStableCode(t *testing.T) {
 func TestRunnerRejectsInvalidInputBeforeConfigurationOrDocker(t *testing.T) {
 	runner, configuration, _, commands := newFixture(t)
 	request := validMigrationRequest()
-	request.AllowedEnvironmentKeys = []string{"TOKEN"}
+	request.AllowedEnvironmentKeys = []string{"RIG_INTERNAL"}
 	if err := runner.Run(context.Background(), request); !IsCode(err, "validation_failed") {
 		t.Fatalf("error=%v", err)
 	}
 	if configuration.requested != nil || len(commands.requests) != 0 {
 		t.Fatal("invalid input crossed execution boundary")
+	}
+}
+
+func TestRunnerRejectsExportWithDifferentConfigurationPinBeforeStaging(t *testing.T) {
+	runner, configuration, stager, commands := newFixture(t)
+	configuration.value.RevisionNumber = 2
+	err := runner.Run(context.Background(), validMigrationRequest())
+	if !IsCode(err, "configuration_unavailable") || stager.contents != nil || len(commands.requests) != 0 {
+		t.Fatalf("mismatched export crossed migration staging: err=%v staged=%q requests=%d", err, stager.contents, len(commands.requests))
 	}
 }
 
@@ -132,7 +141,7 @@ func newFixture(t *testing.T) (*Runner, *fakeConfiguration, *fakeStager, *fakeRu
 	if err := os.Mkdir(work, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	configuration := &fakeConfiguration{value: appconfig.ExecutionConfiguration{RevisionID: "55555555-5555-5555-5555-555555555555", RevisionNumber: 1, Environment: []byte("DATABASE_URL='secret'\n")}}
+	configuration := &fakeConfiguration{value: appconfig.ExecutionConfiguration{RevisionID: "55555555-5555-5555-5555-555555555555", RevisionNumber: 1, Environment: []byte("DATABASE_URL=secret\n")}}
 	stager := &fakeStager{lease: &fakeLease{path: filepath.Join(root, "runtime.env")}}
 	commands := &fakeRunner{}
 	runner, err := New(configuration, stager, commands, Options{DockerExecutable: docker, DockerConfigDirectory: config, WorkingDirectory: work})
@@ -144,6 +153,6 @@ func newFixture(t *testing.T) (*Runner, *fakeConfiguration, *fakeStager, *fakeRu
 
 func validMigrationRequest() generatedruntime.MigrationRequest {
 	return generatedruntime.MigrationRequest{
-		AppID: "11111111-1111-1111-1111-111111111111", ReleaseID: "22222222-2222-2222-2222-222222222222", DeploymentID: "33333333-3333-3333-3333-333333333333", ArtifactID: "44444444-4444-4444-4444-444444444444", DeploymentPlanRevisionID: "66666666-6666-6666-6666-666666666666", ComponentName: "api", RootDirectory: "apps/api", ImageContentID: "sha256:" + strings.Repeat("a", 64), Command: "npm run migrate", ConfigurationRevisionID: "55555555-5555-5555-5555-555555555555", ConfigurationRevisionNumber: 1, AllowedEnvironmentKeys: []string{"DATABASE_URL"},
+		AppID: "11111111-1111-1111-1111-111111111111", ReleaseID: "22222222-2222-2222-2222-222222222222", DeploymentID: "33333333-3333-3333-3333-333333333333", ArtifactID: "44444444-4444-4444-4444-444444444444", DeploymentPlanRevisionID: "66666666-6666-6666-6666-666666666666", DeploymentPlanRevisionNumber: 1, ComponentName: "api", RootDirectory: "apps/api", ImageContentID: "sha256:" + strings.Repeat("a", 64), Command: "npm run migrate", ConfigurationRevisionID: "55555555-5555-5555-5555-555555555555", ConfigurationRevisionNumber: 1, AllowedEnvironmentKeys: []string{"DATABASE_URL"},
 	}
 }

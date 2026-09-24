@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -29,6 +30,21 @@ const maxBundleBytes = 48 << 10
 
 var envKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 var temporarySecretName = regexp.MustCompile(`^\.hostd-secret-[A-Za-z0-9]{8,}$`)
+
+type Phase string
+
+const (
+	PhaseRuntime   Phase = "runtime"
+	PhaseBuild     Phase = "build"
+	PhaseMigration Phase = "migration"
+)
+
+type Sensitivity string
+
+const (
+	SensitivityPublic Sensitivity = "public"
+	SensitivitySecret Sensitivity = "secret"
+)
 
 type Error struct {
 	Code   string
@@ -42,26 +58,41 @@ func IsCode(err error, code string) bool {
 }
 
 type Entry struct {
-	Key       string `json:"key"`
-	Sensitive bool   `json:"sensitive"`
-	Value     string `json:"value,omitempty"`
+	Key             string      `json:"key"`
+	Sensitive       bool        `json:"sensitive"`
+	Value           string      `json:"value,omitempty"`
+	Phase           Phase       `json:"phase,omitempty"`
+	TargetComponent string      `json:"targetComponent,omitempty"`
+	Sensitivity     Sensitivity `json:"sensitivity,omitempty"`
 }
 
 type Configuration struct {
-	RevisionID     string    `json:"revisionId,omitempty"`
-	RevisionNumber int64     `json:"revisionNumber"`
-	UpdatedAt      time.Time `json:"updatedAt,omitempty"`
-	Entries        []Entry   `json:"entries"`
+	RevisionID                   string    `json:"revisionId,omitempty"`
+	RevisionNumber               int64     `json:"revisionNumber"`
+	FormatVersion                int       `json:"formatVersion,omitempty"`
+	DeploymentPlanRevisionID     string    `json:"deploymentPlanRevisionId,omitempty"`
+	DeploymentPlanRevisionNumber int64     `json:"deploymentPlanRevisionNumber,omitempty"`
+	UpdatedAt                    time.Time `json:"updatedAt,omitempty"`
+	Entries                      []Entry   `json:"entries"`
+}
+
+type RevisionIdentity struct {
+	RevisionID                   string
+	RevisionNumber               int64
+	FormatVersion                int
+	DeploymentPlanRevisionID     string
+	DeploymentPlanRevisionNumber int64
 }
 
 // ExecutionConfiguration is a decrypted, exact configuration revision for a
 // single runtime attempt. Environment is secret-bearing caller-owned memory and
 // must be cleared after it has been written to protected temporary storage.
 type ExecutionConfiguration struct {
-	RevisionID     string
-	RevisionNumber int64
-	Environment    []byte         `json:"-"`
-	SecretOrigins  []SecretOrigin `json:"-"`
+	RevisionID        string
+	RevisionNumber    int64
+	Environment       []byte         `json:"-"`
+	SecretOrigins     []SecretOrigin `json:"-"`
+	PublicBuildValues []ValueInput   `json:"-"`
 }
 
 // SecretOrigin is caller-owned metadata used to keep values originating from a
@@ -86,6 +117,11 @@ func (c *ExecutionConfiguration) Clear() {
 	}
 	clear(c.SecretOrigins)
 	c.SecretOrigins = nil
+	for index := range c.PublicBuildValues {
+		c.PublicBuildValues[index] = ValueInput{}
+	}
+	clear(c.PublicBuildValues)
+	c.PublicBuildValues = nil
 }
 
 type ValueInput struct {
@@ -100,6 +136,32 @@ type ReplaceInput struct {
 	Remove                 []string
 }
 
+type ComponentTarget struct {
+	Name string `json:"name"`
+	Role string `json:"role"`
+}
+
+type ScopedKey struct {
+	Phase     Phase
+	Component string
+	Key       string
+}
+
+type ScopedValueInput struct {
+	ScopedKey
+	Sensitivity Sensitivity
+	Value       *string
+}
+
+type ScopedReplaceInput struct {
+	ExpectedRevisionNumber int64
+	PlanRevisionID         string
+	PlanRevisionNumber     int64
+	Components             []ComponentTarget
+	Entries                []ScopedValueInput
+	Remove                 []ScopedKey
+}
+
 type bundleEntry struct {
 	Sensitive bool   `json:"sensitive"`
 	Value     string `json:"value"`
@@ -110,6 +172,31 @@ type bundle struct {
 	RevisionID     string                 `json:"revisionId"`
 	RevisionNumber int64                  `json:"revisionNumber"`
 	Entries        map[string]bundleEntry `json:"entries"`
+}
+
+type scopedBundleEntry struct {
+	Phase       Phase       `json:"phase"`
+	Component   string      `json:"component"`
+	Key         string      `json:"key"`
+	Sensitivity Sensitivity `json:"sensitivity"`
+	Value       string      `json:"value"`
+}
+
+type scopedBundle struct {
+	Version                      int                 `json:"version"`
+	ApplicationID                string              `json:"applicationId"`
+	RevisionID                   string              `json:"revisionId"`
+	RevisionNumber               int64               `json:"revisionNumber"`
+	DeploymentPlanRevisionID     string              `json:"deploymentPlanRevisionId"`
+	DeploymentPlanRevisionNumber int64               `json:"deploymentPlanRevisionNumber"`
+	Components                   []ComponentTarget   `json:"components"`
+	Entries                      []scopedBundleEntry `json:"entries"`
+}
+
+type revisionBundle struct {
+	Version int
+	Legacy  bundle
+	Scoped  scopedBundle
 }
 
 type Store struct {
@@ -171,21 +258,79 @@ func (s *Store) Get(ctx context.Context, appID string) (Configuration, error) {
 	if number == 0 {
 		return Configuration{RevisionNumber: 0, Entries: []Entry{}}, nil
 	}
-	b, err := s.readBundle(ctx, appID, revisionID.String, number)
+	stored, err := s.readRevisionBundle(ctx, appID, revisionID.String, number)
 	if err != nil {
 		return Configuration{}, &Error{Code: "configuration_unavailable"}
 	}
-	result := Configuration{RevisionID: revisionID.String, RevisionNumber: number, Entries: make([]Entry, 0, len(b.Entries))}
+	result := Configuration{RevisionID: revisionID.String, RevisionNumber: number, FormatVersion: stored.Version}
 	result.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated.String)
-	for key, value := range b.Entries {
-		entry := Entry{Key: key, Sensitive: value.Sensitive}
-		if !value.Sensitive {
+	if stored.Version == 1 {
+		result.Entries = make([]Entry, 0, len(stored.Legacy.Entries))
+		for key, value := range stored.Legacy.Entries {
+			entry := Entry{Key: key, Sensitive: value.Sensitive}
+			if !value.Sensitive {
+				entry.Value = value.Value
+			}
+			result.Entries = append(result.Entries, entry)
+		}
+		sort.Slice(result.Entries, func(i, j int) bool { return result.Entries[i].Key < result.Entries[j].Key })
+		return result, nil
+	}
+	result.DeploymentPlanRevisionID = stored.Scoped.DeploymentPlanRevisionID
+	result.DeploymentPlanRevisionNumber = stored.Scoped.DeploymentPlanRevisionNumber
+	result.Entries = make([]Entry, 0, len(stored.Scoped.Entries))
+	for _, value := range stored.Scoped.Entries {
+		entry := Entry{Key: value.Key, Sensitive: value.Sensitivity == SensitivitySecret, Phase: value.Phase, TargetComponent: value.Component, Sensitivity: value.Sensitivity}
+		if value.Sensitivity == SensitivityPublic {
 			entry.Value = value.Value
 		}
 		result.Entries = append(result.Entries, entry)
 	}
-	sort.Slice(result.Entries, func(i, j int) bool { return result.Entries[i].Key < result.Entries[j].Key })
 	return result, nil
+}
+
+// RevisionIdentity resolves the current head using metadata only. It does not
+// read or decrypt protected configuration values.
+func (s *Store) RevisionIdentity(ctx context.Context, appID string) (RevisionIdentity, error) {
+	if !validUUID(appID) {
+		return RevisionIdentity{}, &Error{Code: "app_not_found"}
+	}
+	var revisionID sql.NullString
+	var revisionNumber int64
+	err := s.db.QueryRowContext(ctx, `SELECT h.revision_id,h.revision_number FROM application_configuration_heads h JOIN applications a ON a.id=h.app_id AND a.archived_at IS NULL WHERE h.app_id=?`, appID).Scan(&revisionID, &revisionNumber)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RevisionIdentity{}, &Error{Code: "app_not_found"}
+	}
+	if err != nil {
+		return RevisionIdentity{}, err
+	}
+	if revisionNumber == 0 {
+		return RevisionIdentity{}, nil
+	}
+	return s.revisionIdentity(ctx, appID, revisionID.String, revisionNumber)
+}
+
+// ExactRevisionIdentity validates one exact immutable pin using metadata only.
+func (s *Store) ExactRevisionIdentity(ctx context.Context, appID, revisionID string, revisionNumber int64) (RevisionIdentity, error) {
+	if !validUUID(appID) || !validUUID(revisionID) || revisionNumber <= 0 {
+		return RevisionIdentity{}, &Error{Code: "configuration_unavailable"}
+	}
+	identity, err := s.revisionIdentity(ctx, appID, revisionID, revisionNumber)
+	if err != nil {
+		return RevisionIdentity{}, &Error{Code: "configuration_unavailable"}
+	}
+	return identity, nil
+}
+
+func (s *Store) revisionIdentity(ctx context.Context, appID, revisionID string, revisionNumber int64) (RevisionIdentity, error) {
+	var version int
+	var planID sql.NullString
+	var planNumber sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT bundle_version,deployment_plan_revision_id,deployment_plan_revision_number FROM application_configuration_revisions WHERE id=? AND app_id=? AND revision_number=?`, revisionID, appID, revisionNumber).Scan(&version, &planID, &planNumber)
+	if err != nil {
+		return RevisionIdentity{}, err
+	}
+	return RevisionIdentity{RevisionID: revisionID, RevisionNumber: revisionNumber, FormatVersion: version, DeploymentPlanRevisionID: planID.String, DeploymentPlanRevisionNumber: planNumber.Int64}, nil
 }
 
 // ExportRevisionForExecution returns one exact historical revision as a
@@ -226,11 +371,14 @@ func (s *Store) exportRevisionForExecution(ctx context.Context, appID, revisionI
 		}
 		entries = map[string]bundleEntry{}
 	} else {
-		b, err := s.readBundle(ctx, appID, revisionID, revisionNumber)
+		stored, err := s.readRevisionBundle(ctx, appID, revisionID, revisionNumber)
 		if err != nil {
 			return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
 		}
-		entries = b.Entries
+		if stored.Version != 1 {
+			return ExecutionConfiguration{}, &Error{Code: "configuration_review_required"}
+		}
+		entries = stored.Legacy.Entries
 	}
 
 	keys := sortedBundleKeys(entries)
@@ -260,6 +408,187 @@ func (s *Store) exportRevisionForExecution(ctx context.Context, appID, revisionI
 		}
 	}
 	return ExecutionConfiguration{RevisionID: revisionID, RevisionNumber: revisionNumber, Environment: environment, SecretOrigins: secretOrigins}, nil
+}
+
+// ExportComponentRuntimeForExecution exports only the runtime scope for one
+// component and one exact configuration/plan pin.
+func (s *Store) ExportComponentRuntimeForExecution(ctx context.Context, appID, configurationRevisionID string, configurationRevisionNumber int64, planRevisionID string, planRevisionNumber int64, component string) (ExecutionConfiguration, error) {
+	stored, err := s.scopedRevisionForExport(ctx, appID, configurationRevisionID, configurationRevisionNumber, planRevisionID, planRevisionNumber, component, false)
+	if err != nil {
+		return ExecutionConfiguration{}, err
+	}
+	if stored.Version == 1 {
+		return exportEmptyOrLegacyReview(stored, configurationRevisionID, configurationRevisionNumber)
+	}
+	entries := make([]scopedBundleEntry, 0)
+	for _, entry := range stored.Scoped.Entries {
+		if entry.Phase == PhaseRuntime && entry.Component == component {
+			entries = append(entries, entry)
+		}
+	}
+	return exportScopedEntries(configurationRevisionID, configurationRevisionNumber, entries), nil
+}
+
+// ExportComponentBuildForExecution exports the explicitly public build scope
+// for one component. Scoped bundle validation guarantees these entries are
+// non-secret.
+func (s *Store) ExportComponentBuildForExecution(ctx context.Context, appID, configurationRevisionID string, configurationRevisionNumber int64, planRevisionID string, planRevisionNumber int64, component string) (ExecutionConfiguration, error) {
+	stored, err := s.scopedRevisionForExport(ctx, appID, configurationRevisionID, configurationRevisionNumber, planRevisionID, planRevisionNumber, component, false)
+	if err != nil {
+		return ExecutionConfiguration{}, err
+	}
+	if stored.Version == 1 {
+		return ExecutionConfiguration{RevisionID: configurationRevisionID, RevisionNumber: configurationRevisionNumber}, nil
+	}
+	entries := make([]scopedBundleEntry, 0)
+	for _, entry := range stored.Scoped.Entries {
+		if entry.Phase == PhaseBuild && entry.Component == component {
+			entries = append(entries, entry)
+		}
+	}
+	result := ExecutionConfiguration{RevisionID: configurationRevisionID, RevisionNumber: configurationRevisionNumber}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	result.PublicBuildValues = make([]ValueInput, 0, len(entries))
+	for _, entry := range entries {
+		result.PublicBuildValues = append(result.PublicBuildValues, ValueInput{Key: entry.Key, Value: entry.Value})
+	}
+	return result, nil
+}
+
+// ExportComponentMigrationForExecution exports only explicitly selected keys
+// from the runtime or migration scope of one server component. A key present
+// in both eligible phases is ambiguous and fails closed.
+func (s *Store) ExportComponentMigrationForExecution(ctx context.Context, appID, configurationRevisionID string, configurationRevisionNumber int64, planRevisionID string, planRevisionNumber int64, component string, allowedKeys []string) (ExecutionConfiguration, error) {
+	keys, err := validatedAllowedKeys(allowedKeys)
+	if err != nil {
+		return ExecutionConfiguration{}, err
+	}
+	stored, err := s.scopedRevisionForExport(ctx, appID, configurationRevisionID, configurationRevisionNumber, planRevisionID, planRevisionNumber, component, true)
+	if err != nil {
+		return ExecutionConfiguration{}, err
+	}
+	if stored.Version == 1 {
+		if len(stored.Legacy.Entries) == 0 {
+			if len(keys) != 0 {
+				return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+			}
+			return exportScopedEntries(configurationRevisionID, configurationRevisionNumber, nil), nil
+		}
+		legacy := make([]scopedBundleEntry, 0, len(keys))
+		for _, key := range keys {
+			entry, exists := stored.Legacy.Entries[key]
+			if !exists {
+				return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+			}
+			// Docker's --env-file has no quoting or multiline value syntax.
+			// Keep legacy Compose revisions readable, but fail closed when an
+			// explicitly approved migration value cannot be passed to Docker.
+			if strings.ContainsAny(entry.Value, "\r\n") {
+				return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+			}
+			sensitivity := SensitivityPublic
+			if entry.Sensitive {
+				sensitivity = SensitivitySecret
+			}
+			legacy = append(legacy, scopedBundleEntry{Key: key, Sensitivity: sensitivity, Value: entry.Value})
+		}
+		return exportScopedEntries(configurationRevisionID, configurationRevisionNumber, legacy), nil
+	}
+	selected := make([]scopedBundleEntry, 0, len(keys))
+	for _, key := range keys {
+		var match *scopedBundleEntry
+		for index := range stored.Scoped.Entries {
+			entry := &stored.Scoped.Entries[index]
+			if entry.Component != component || entry.Key != key || (entry.Phase != PhaseRuntime && entry.Phase != PhaseMigration) {
+				continue
+			}
+			if match != nil {
+				return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+			}
+			match = entry
+		}
+		if match == nil {
+			return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+		}
+		selected = append(selected, *match)
+	}
+	return exportScopedEntries(configurationRevisionID, configurationRevisionNumber, selected), nil
+}
+
+func validatedAllowedKeys(allowedKeys []string) ([]string, error) {
+	if len(allowedKeys) > 8 {
+		return nil, &Error{Code: "configuration_unavailable"}
+	}
+	keys := append([]string(nil), allowedKeys...)
+	sort.Strings(keys)
+	for index, key := range keys {
+		if validateKey(key) != nil || isReservedKey(key) || (index > 0 && keys[index-1] == key) {
+			return nil, &Error{Code: "configuration_unavailable"}
+		}
+	}
+	return keys, nil
+}
+
+func (s *Store) scopedRevisionForExport(ctx context.Context, appID, configurationRevisionID string, configurationRevisionNumber int64, planRevisionID string, planRevisionNumber int64, component string, allowLegacy bool) (revisionBundle, error) {
+	if !validUUID(appID) || configurationRevisionNumber < 0 || (configurationRevisionNumber == 0) != (configurationRevisionID == "") || !validUUID(planRevisionID) || planRevisionNumber <= 0 || validateComponentName(component) != nil {
+		return revisionBundle{}, &Error{Code: "configuration_unavailable"}
+	}
+	if configurationRevisionNumber == 0 {
+		var exists int
+		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM deployment_plan_revisions WHERE id=? AND app_id=? AND revision_number=? AND acceptance_status='accepted')`, planRevisionID, appID, planRevisionNumber).Scan(&exists); err != nil || exists != 1 {
+			return revisionBundle{}, &Error{Code: "configuration_unavailable"}
+		}
+		return revisionBundle{Version: 1, Legacy: bundle{Version: 1, Entries: map[string]bundleEntry{}}}, nil
+	}
+	stored, err := s.readRevisionBundle(ctx, appID, configurationRevisionID, configurationRevisionNumber)
+	if err != nil {
+		return revisionBundle{}, &Error{Code: "configuration_unavailable"}
+	}
+	if stored.Version == 1 {
+		if len(stored.Legacy.Entries) != 0 && !allowLegacy {
+			return revisionBundle{}, &Error{Code: "configuration_review_required"}
+		}
+		return stored, nil
+	}
+	if stored.Scoped.DeploymentPlanRevisionID != planRevisionID || stored.Scoped.DeploymentPlanRevisionNumber != planRevisionNumber || !scopedComponentExists(stored.Scoped.Components, component) {
+		return revisionBundle{}, &Error{Code: "configuration_review_required"}
+	}
+	return stored, nil
+}
+
+func exportEmptyOrLegacyReview(stored revisionBundle, revisionID string, revisionNumber int64) (ExecutionConfiguration, error) {
+	if len(stored.Legacy.Entries) != 0 {
+		return ExecutionConfiguration{}, &Error{Code: "configuration_review_required"}
+	}
+	return exportScopedEntries(revisionID, revisionNumber, nil), nil
+}
+
+func exportScopedEntries(revisionID string, revisionNumber int64, entries []scopedBundleEntry) ExecutionConfiguration {
+	entries = append([]scopedBundleEntry(nil), entries...)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	// Generated containers use Docker CLI --env-file, which treats quotes as
+	// literal bytes. Scoped values cannot contain line breaks or NUL bytes.
+	environment := []byte("# hostd application configuration\n")
+	origins := make([]SecretOrigin, 0)
+	for _, entry := range entries {
+		environment = append(environment, entry.Key...)
+		environment = append(environment, '=')
+		environment = append(environment, entry.Value...)
+		environment = append(environment, '\n')
+		if entry.Sensitivity == SensitivitySecret && entry.Value != "" {
+			origins = append(origins, SecretOrigin{RevisionID: revisionID, RevisionNumber: revisionNumber, Key: append([]byte(nil), entry.Key...), Value: append([]byte(nil), entry.Value...)})
+		}
+	}
+	return ExecutionConfiguration{RevisionID: revisionID, RevisionNumber: revisionNumber, Environment: environment, SecretOrigins: origins}
+}
+
+func scopedComponentExists(components []ComponentTarget, component string) bool {
+	for _, target := range components {
+		if target.Name == component {
+			return true
+		}
+	}
+	return false
 }
 
 // ExportCurrentForExecution resolves the current head once, then delegates to
@@ -350,6 +679,14 @@ func (s *Store) Replace(ctx context.Context, appID, actorID string, input Replac
 		return Configuration{}, s.classifyWriteError(ctx, appID, input.ExpectedRevisionNumber, err)
 	}
 	defer tx.Rollback()
+	var acceptedStrategy string
+	err = tx.QueryRowContext(ctx, `SELECT r.strategy FROM deployment_plan_heads h JOIN deployment_plan_revisions r ON r.id=h.revision_id AND r.app_id=h.app_id AND r.revision_number=h.revision_number WHERE h.app_id=? AND r.acceptance_status='accepted'`, appID).Scan(&acceptedStrategy)
+	if err == nil && acceptedStrategy == "generated_node" {
+		return Configuration{}, &Error{Code: "configuration_review_required"}
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return Configuration{}, s.classifyWriteError(ctx, appID, input.ExpectedRevisionNumber, err)
+	}
 	now := s.now().UTC().Format(time.RFC3339Nano)
 	variables, secrets := counts(entries)
 	ref := filepath.ToSlash(filepath.Join("apps", appID, "configuration", revisionID+".secret"))
@@ -389,6 +726,164 @@ func (s *Store) Replace(ctx context.Context, appID, actorID string, input Replac
 	return s.Get(ctx, appID)
 }
 
+// ReplaceScoped saves a v2 immutable revision bound to one accepted generated
+// deployment plan. Protected content is installed before the metadata CAS; a
+// failed or conflicting transaction removes only the newly installed file.
+func (s *Store) ReplaceScoped(ctx context.Context, appID, actorID string, input ScopedReplaceInput) (Configuration, error) {
+	if !validUUID(appID) {
+		return Configuration{}, &Error{Code: "app_not_found"}
+	}
+	if input.ExpectedRevisionNumber < 0 {
+		return Configuration{}, invalid("expectedRevisionNumber", "Must be zero or greater")
+	}
+	if !validUUID(input.PlanRevisionID) || input.PlanRevisionNumber <= 0 {
+		return Configuration{}, invalid("deploymentPlan", "An accepted deployment plan revision is required")
+	}
+	components, componentRoles, err := validateComponentTargets(input.Components)
+	if err != nil {
+		return Configuration{}, err
+	}
+
+	unlock := s.lock(appID)
+	defer unlock()
+	current, err := s.loadHeadRevisionBundle(ctx, appID)
+	if err != nil {
+		return Configuration{}, err
+	}
+	currentNumber := int64(0)
+	mergeBase := current
+	if current.Version != 0 {
+		if current.Version == 1 {
+			currentNumber = current.Legacy.RevisionNumber
+		} else {
+			currentNumber = current.Scoped.RevisionNumber
+			if current.Scoped.DeploymentPlanRevisionID != input.PlanRevisionID || current.Scoped.DeploymentPlanRevisionNumber != input.PlanRevisionNumber {
+				// A newly accepted plan may receive a fully reviewed replacement,
+				// but secrets from the old plan are never carried across implicitly.
+				mergeBase = revisionBundle{}
+			}
+		}
+	}
+	if currentNumber != input.ExpectedRevisionNumber {
+		return Configuration{}, &Error{Code: "configuration_conflict"}
+	}
+	if err := s.validateAcceptedPlan(ctx, appID, input.PlanRevisionID, input.PlanRevisionNumber, len(components)); err != nil {
+		return Configuration{}, err
+	}
+	entries, err := mergeScoped(mergeBase, componentRoles, input)
+	if err != nil {
+		return Configuration{}, err
+	}
+
+	revisionID := uuid.NewString()
+	number := currentNumber + 1
+	stored := scopedBundle{
+		Version: 2, ApplicationID: appID, RevisionID: revisionID, RevisionNumber: number,
+		DeploymentPlanRevisionID: input.PlanRevisionID, DeploymentPlanRevisionNumber: input.PlanRevisionNumber,
+		Components: components, Entries: entries,
+	}
+	plaintext, err := json.Marshal(stored)
+	if err != nil || len(plaintext) > maxBundleBytes {
+		return Configuration{}, invalid("configuration", "Configuration is too large")
+	}
+	defer clear(plaintext)
+	path := s.bundlePath(appID, revisionID)
+	if err := s.configurationDirectory(appID, true); err != nil {
+		return Configuration{}, &Error{Code: "configuration_unavailable"}
+	}
+	if err := secretfile.WriteNew(path, scopedPurpose(appID, revisionID), plaintext); err != nil {
+		if secretfile.WasInstalled(err) {
+			_ = secretfile.Remove(path)
+		}
+		return Configuration{}, &Error{Code: "configuration_unavailable"}
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = secretfile.Remove(path)
+		}
+	}()
+	if s.beforeTransaction != nil {
+		s.beforeTransaction()
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Configuration{}, s.classifyScopedWriteError(ctx, appID, input.ExpectedRevisionNumber, input.PlanRevisionID, input.PlanRevisionNumber, err)
+	}
+	defer tx.Rollback()
+	var planID sql.NullString
+	var planNumber int64
+	var planComponents int
+	var strategy string
+	if err := tx.QueryRowContext(ctx, `SELECT h.revision_id,h.revision_number,r.component_count,r.strategy FROM deployment_plan_heads h JOIN deployment_plan_revisions r ON r.id=h.revision_id AND r.app_id=h.app_id AND r.revision_number=h.revision_number WHERE h.app_id=?`, appID).Scan(&planID, &planNumber, &planComponents, &strategy); err != nil || !planID.Valid || planID.String != input.PlanRevisionID || planNumber != input.PlanRevisionNumber || planComponents != len(components) || strategy != "generated_node" {
+		_ = tx.Rollback()
+		return Configuration{}, &Error{Code: "configuration_review_required"}
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	variables, secrets := scopedCounts(entries)
+	ref := filepath.ToSlash(filepath.Join("apps", appID, "configuration", revisionID+".secret"))
+	if _, err = tx.ExecContext(ctx, `INSERT INTO application_configuration_revisions(id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count,bundle_version,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,?,?,?,?,?,?,2,?,?)`, revisionID, appID, number, ref, nullable(actorID), now, variables, secrets, input.PlanRevisionID, input.PlanRevisionNumber); err != nil {
+		_ = tx.Rollback()
+		return Configuration{}, s.classifyScopedWriteError(ctx, appID, input.ExpectedRevisionNumber, input.PlanRevisionID, input.PlanRevisionNumber, err)
+	}
+	for _, entry := range entries {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO application_configuration_scoped_entries(revision_id,phase,target_component,key,sensitivity) VALUES(?,?,?,?,?)`, revisionID, entry.Phase, entry.Component, entry.Key, entry.Sensitivity); err != nil {
+			_ = tx.Rollback()
+			return Configuration{}, s.classifyScopedWriteError(ctx, appID, input.ExpectedRevisionNumber, input.PlanRevisionID, input.PlanRevisionNumber, err)
+		}
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE application_configuration_heads SET revision_id=?,revision_number=?,updated_at=? WHERE app_id=? AND revision_number=?`, revisionID, number, now, appID, input.ExpectedRevisionNumber)
+	if err != nil {
+		_ = tx.Rollback()
+		return Configuration{}, s.classifyScopedWriteError(ctx, appID, input.ExpectedRevisionNumber, input.PlanRevisionID, input.PlanRevisionNumber, err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return Configuration{}, &Error{Code: "configuration_conflict"}
+	}
+	metadata, _ := json.Marshal(map[string]any{"variables": variables, "secrets": secrets, "removed": len(input.Remove), "formatVersion": 2, "deploymentPlanRevisionId": input.PlanRevisionID, "deploymentPlanRevisionNumber": input.PlanRevisionNumber})
+	if _, err = tx.ExecContext(ctx, `INSERT INTO audit_events(actor_id,action,resource_type,resource_id,metadata_json,created_at) VALUES(?,?,?,?,?,?)`, nullable(actorID), "application.configuration.replace_scoped", "application", appID, string(metadata), now); err != nil {
+		_ = tx.Rollback()
+		return Configuration{}, s.classifyScopedWriteError(ctx, appID, input.ExpectedRevisionNumber, input.PlanRevisionID, input.PlanRevisionNumber, err)
+	}
+	if err = tx.Commit(); err != nil {
+		return Configuration{}, err
+	}
+	committed = true
+	return s.Get(ctx, appID)
+}
+
+func (s *Store) validateAcceptedPlan(ctx context.Context, appID, planID string, planNumber int64, componentCount int) error {
+	var currentID sql.NullString
+	var currentNumber int64
+	var storedComponentCount int
+	var strategy string
+	err := s.db.QueryRowContext(ctx, `SELECT h.revision_id,h.revision_number,r.component_count,r.strategy FROM deployment_plan_heads h JOIN deployment_plan_revisions r ON r.id=h.revision_id AND r.app_id=h.app_id AND r.revision_number=h.revision_number JOIN applications a ON a.id=h.app_id AND a.archived_at IS NULL WHERE h.app_id=?`, appID).Scan(&currentID, &currentNumber, &storedComponentCount, &strategy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return &Error{Code: "app_not_found"}
+	}
+	if err != nil {
+		return err
+	}
+	if !currentID.Valid || currentID.String != planID || currentNumber != planNumber || storedComponentCount != componentCount || strategy != "generated_node" {
+		return &Error{Code: "configuration_review_required"}
+	}
+	return nil
+}
+
+func (s *Store) classifyScopedWriteError(ctx context.Context, appID string, expected int64, planID string, planNumber int64, cause error) error {
+	var configurationNumber int64
+	if err := s.db.QueryRowContext(ctx, `SELECT revision_number FROM application_configuration_heads WHERE app_id=?`, appID).Scan(&configurationNumber); err == nil && configurationNumber != expected {
+		return &Error{Code: "configuration_conflict"}
+	}
+	var currentPlanID sql.NullString
+	var currentPlanNumber int64
+	if err := s.db.QueryRowContext(ctx, `SELECT revision_id,revision_number FROM deployment_plan_heads WHERE app_id=?`, appID).Scan(&currentPlanID, &currentPlanNumber); err == nil && (!currentPlanID.Valid || currentPlanID.String != planID || currentPlanNumber != planNumber) {
+		return &Error{Code: "configuration_review_required"}
+	}
+	return cause
+}
+
 func (s *Store) classifyWriteError(ctx context.Context, appID string, expected int64, cause error) error {
 	var current int64
 	if err := s.db.QueryRowContext(ctx, `SELECT revision_number FROM application_configuration_heads WHERE app_id=?`, appID).Scan(&current); err == nil && current != expected {
@@ -398,59 +893,101 @@ func (s *Store) classifyWriteError(ctx context.Context, appID string, expected i
 }
 
 func (s *Store) loadHeadBundle(ctx context.Context, appID string) (bundle, error) {
+	stored, err := s.loadHeadRevisionBundle(ctx, appID)
+	if err != nil {
+		return bundle{}, err
+	}
+	if stored.Version == 0 {
+		return bundle{Version: 1, ApplicationID: appID, Entries: map[string]bundleEntry{}}, nil
+	}
+	if stored.Version != 1 {
+		return bundle{}, &Error{Code: "configuration_review_required"}
+	}
+	return stored.Legacy, nil
+}
+
+func (s *Store) loadHeadRevisionBundle(ctx context.Context, appID string) (revisionBundle, error) {
 	var id sql.NullString
 	var number int64
 	err := s.db.QueryRowContext(ctx, `SELECT h.revision_id,h.revision_number FROM application_configuration_heads h JOIN applications a ON a.id=h.app_id AND a.archived_at IS NULL WHERE h.app_id=?`, appID).Scan(&id, &number)
 	if errors.Is(err, sql.ErrNoRows) {
-		return bundle{}, &Error{Code: "app_not_found"}
+		return revisionBundle{}, &Error{Code: "app_not_found"}
 	}
 	if err != nil {
-		return bundle{}, err
+		return revisionBundle{}, err
 	}
 	if number == 0 {
-		return bundle{Version: 1, ApplicationID: appID, Entries: map[string]bundleEntry{}}, nil
+		return revisionBundle{}, nil
 	}
-	return s.readBundle(ctx, appID, id.String, number)
+	return s.readRevisionBundle(ctx, appID, id.String, number)
 }
 
 func (s *Store) readBundle(ctx context.Context, appID, revisionID string, number int64) (bundle, error) {
-	var ref string
-	if err := s.db.QueryRowContext(ctx, `SELECT bundle_ref FROM application_configuration_revisions WHERE id=? AND app_id=? AND revision_number=?`, revisionID, appID, number).Scan(&ref); err != nil {
+	stored, err := s.readRevisionBundle(ctx, appID, revisionID, number)
+	if err != nil {
 		return bundle{}, err
+	}
+	if stored.Version != 1 {
+		return bundle{}, errors.New("scoped configuration requires a scoped reader")
+	}
+	return stored.Legacy, nil
+}
+
+func (s *Store) readRevisionBundle(ctx context.Context, appID, revisionID string, number int64) (revisionBundle, error) {
+	var ref string
+	var version, variableCount, secretCount int
+	var planID sql.NullString
+	var planNumber sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT bundle_ref,bundle_version,deployment_plan_revision_id,deployment_plan_revision_number,variable_count,secret_count FROM application_configuration_revisions WHERE id=? AND app_id=? AND revision_number=?`, revisionID, appID, number).Scan(&ref, &version, &planID, &planNumber, &variableCount, &secretCount); err != nil {
+		return revisionBundle{}, err
 	}
 	expected := filepath.ToSlash(filepath.Join("apps", appID, "configuration", revisionID+".secret"))
 	if ref != expected {
-		return bundle{}, errors.New("invalid configuration bundle reference")
+		return revisionBundle{}, errors.New("invalid configuration bundle reference")
+	}
+	if (version == 1 && (planID.Valid || planNumber.Valid)) || (version == 2 && (!planID.Valid || !planNumber.Valid || !validUUID(planID.String) || planNumber.Int64 <= 0)) || (version != 1 && version != 2) {
+		return revisionBundle{}, errors.New("invalid configuration revision metadata")
 	}
 	if err := s.configurationDirectory(appID, false); err != nil {
-		return bundle{}, err
+		return revisionBundle{}, err
 	}
-	plaintext, err := secretfile.Read(s.bundlePath(appID, revisionID), purpose(appID, revisionID))
+	purposeName := purpose(appID, revisionID)
+	if version == 2 {
+		purposeName = scopedPurpose(appID, revisionID)
+	}
+	plaintext, err := secretfile.Read(s.bundlePath(appID, revisionID), purposeName)
 	if err != nil {
-		return bundle{}, err
+		return revisionBundle{}, err
 	}
 	defer clear(plaintext)
 	if len(plaintext) > maxBundleBytes {
-		return bundle{}, errors.New("configuration bundle too large")
+		return revisionBundle{}, errors.New("configuration bundle too large")
 	}
-	var b bundle
 	if err := rejectDuplicateJSONKeys(plaintext); err != nil {
-		return bundle{}, err
+		return revisionBundle{}, err
 	}
+	if version == 1 {
+		return s.decodeLegacyBundle(ctx, plaintext, appID, revisionID, number, variableCount, secretCount)
+	}
+	return s.decodeScopedBundle(ctx, plaintext, appID, revisionID, number, planID.String, planNumber.Int64, variableCount, secretCount)
+}
+
+func (s *Store) decodeLegacyBundle(ctx context.Context, plaintext []byte, appID, revisionID string, number int64, variableCount, secretCount int) (revisionBundle, error) {
+	var b bundle
 	decoder := json.NewDecoder(bytes.NewReader(plaintext))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&b); err != nil {
-		return bundle{}, err
+		return revisionBundle{}, err
 	}
 	if decoder.Decode(&struct{}{}) != io.EOF {
-		return bundle{}, errors.New("configuration bundle has trailing content")
+		return revisionBundle{}, errors.New("configuration bundle has trailing content")
 	}
 	if b.Version != 1 || b.ApplicationID != appID || b.RevisionID != revisionID || b.RevisionNumber != number || b.Entries == nil {
-		return bundle{}, errors.New("configuration bundle metadata mismatch")
+		return revisionBundle{}, errors.New("configuration bundle metadata mismatch")
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT key,sensitive FROM application_configuration_entries WHERE revision_id=? ORDER BY key`, revisionID)
 	if err != nil {
-		return bundle{}, err
+		return revisionBundle{}, err
 	}
 	metadata := map[string]bool{}
 	for rows.Next() {
@@ -458,22 +995,85 @@ func (s *Store) readBundle(ctx context.Context, appID, revisionID string, number
 		var sensitive bool
 		if err := rows.Scan(&key, &sensitive); err != nil {
 			rows.Close()
-			return bundle{}, err
+			return revisionBundle{}, err
 		}
 		metadata[key] = sensitive
 	}
 	if err := rows.Close(); err != nil {
-		return bundle{}, err
+		return revisionBundle{}, err
 	}
-	if len(metadata) != len(b.Entries) {
-		return bundle{}, errors.New("configuration bundle entry metadata mismatch")
+	variables, secrets := counts(b.Entries)
+	if len(metadata) != len(b.Entries) || variables != variableCount || secrets != secretCount {
+		return revisionBundle{}, errors.New("configuration bundle entry metadata mismatch")
 	}
 	for key, value := range b.Entries {
 		if sensitive, ok := metadata[key]; !ok || sensitive != value.Sensitive {
-			return bundle{}, errors.New("configuration bundle entry metadata mismatch")
+			return revisionBundle{}, errors.New("configuration bundle entry metadata mismatch")
 		}
 	}
-	return b, nil
+	var scopedCount int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM application_configuration_scoped_entries WHERE revision_id=?`, revisionID).Scan(&scopedCount); err != nil || scopedCount != 0 {
+		return revisionBundle{}, errors.New("configuration bundle entry metadata mismatch")
+	}
+	return revisionBundle{Version: 1, Legacy: b}, nil
+}
+
+func (s *Store) decodeScopedBundle(ctx context.Context, plaintext []byte, appID, revisionID string, number int64, planID string, planNumber int64, variableCount, secretCount int) (revisionBundle, error) {
+	var b scopedBundle
+	decoder := json.NewDecoder(bytes.NewReader(plaintext))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&b); err != nil {
+		return revisionBundle{}, err
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return revisionBundle{}, errors.New("configuration bundle has trailing content")
+	}
+	if b.Version != 2 || b.ApplicationID != appID || b.RevisionID != revisionID || b.RevisionNumber != number || b.DeploymentPlanRevisionID != planID || b.DeploymentPlanRevisionNumber != planNumber || b.Components == nil || b.Entries == nil {
+		return revisionBundle{}, errors.New("configuration bundle metadata mismatch")
+	}
+	components, roles, err := validateComponentTargets(b.Components)
+	if err != nil || !equalComponentTargets(components, b.Components) {
+		return revisionBundle{}, errors.New("configuration bundle component metadata mismatch")
+	}
+	for index, entry := range b.Entries {
+		if err := validateScopedBundleEntry(entry, roles); err != nil || (index > 0 && !scopedEntryLess(b.Entries[index-1], entry)) {
+			return revisionBundle{}, errors.New("invalid scoped configuration bundle entry")
+		}
+	}
+	variables, secrets := scopedCounts(b.Entries)
+	if variables != variableCount || secrets != secretCount {
+		return revisionBundle{}, errors.New("configuration bundle entry metadata mismatch")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT phase,target_component,key,sensitivity FROM application_configuration_scoped_entries WHERE revision_id=? ORDER BY phase,target_component,key`, revisionID)
+	if err != nil {
+		return revisionBundle{}, err
+	}
+	metadata := make([]scopedBundleEntry, 0, len(b.Entries))
+	for rows.Next() {
+		var entry scopedBundleEntry
+		if err := rows.Scan(&entry.Phase, &entry.Component, &entry.Key, &entry.Sensitivity); err != nil {
+			rows.Close()
+			return revisionBundle{}, err
+		}
+		metadata = append(metadata, entry)
+	}
+	if err := rows.Close(); err != nil {
+		return revisionBundle{}, err
+	}
+	if len(metadata) != len(b.Entries) {
+		return revisionBundle{}, errors.New("configuration bundle entry metadata mismatch")
+	}
+	for index := range metadata {
+		stored := b.Entries[index]
+		if metadata[index].Phase != stored.Phase || metadata[index].Component != stored.Component || metadata[index].Key != stored.Key || metadata[index].Sensitivity != stored.Sensitivity {
+			return revisionBundle{}, errors.New("configuration bundle entry metadata mismatch")
+		}
+	}
+	var legacyCount int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM application_configuration_entries WHERE revision_id=?`, revisionID).Scan(&legacyCount); err != nil || legacyCount != 0 {
+		return revisionBundle{}, errors.New("configuration bundle entry metadata mismatch")
+	}
+	return revisionBundle{Version: 2, Scoped: b}, nil
 }
 
 func (s *Store) bundlePath(appID, revisionID string) string {
@@ -580,6 +1180,236 @@ func rejectDuplicateJSONKeys(document []byte) error {
 }
 func purpose(appID, revisionID string) string {
 	return "hostd/application-configuration/v1/" + appID + "/" + revisionID
+}
+
+func scopedPurpose(appID, revisionID string) string {
+	return "hostd/application-configuration/v2/" + appID + "/" + revisionID
+}
+
+func validateComponentTargets(values []ComponentTarget) ([]ComponentTarget, map[string]string, error) {
+	if len(values) < 1 || len(values) > 64 {
+		return nil, nil, invalid("components", "Accepted plan components are required")
+	}
+	components := append([]ComponentTarget(nil), values...)
+	sort.Slice(components, func(i, j int) bool { return components[i].Name < components[j].Name })
+	roles := make(map[string]string, len(components))
+	for _, component := range components {
+		if validateComponentName(component.Name) != nil || (component.Role != "server" && component.Role != "static") || roles[component.Name] != "" {
+			return nil, nil, invalid("components", "Components must uniquely match the accepted deployment plan")
+		}
+		roles[component.Name] = component.Role
+	}
+	return components, roles, nil
+}
+
+func validateComponentName(value string) error {
+	if !utf8.ValidString(value) || len(value) == 0 || len(value) > 256 || strings.TrimSpace(value) == "" {
+		return errors.New("invalid component name")
+	}
+	for _, character := range value {
+		if character == 0 || unicode.IsControl(character) {
+			return errors.New("invalid component name")
+		}
+	}
+	return nil
+}
+
+func equalComponentTargets(left, right []ComponentTarget) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func mergeScoped(current revisionBundle, componentRoles map[string]string, input ScopedReplaceInput) ([]scopedBundleEntry, error) {
+	if len(input.Entries) > 256 || len(input.Remove) > 256 || len(input.Entries)+len(input.Remove) > 512 {
+		return nil, invalid("configuration", "Too many entries")
+	}
+	result := make(map[string]scopedBundleEntry)
+	seen := make(map[string]string)
+	usedLegacySecrets := make(map[string]bool)
+	for _, key := range input.Remove {
+		if err := validateScopedKey(key, componentRoles); err != nil {
+			return nil, invalid("remove", err.Error())
+		}
+		identity := scopedKeyIdentity(key)
+		if seen[identity] != "" {
+			return nil, invalid("remove", "Contains duplicate scopes")
+		}
+		seen[identity] = "remove"
+	}
+	if current.Version == 2 {
+		for _, entry := range current.Scoped.Entries {
+			identity := scopedEntryIdentity(entry)
+			if entry.Sensitivity == SensitivitySecret && seen[identity] == "" {
+				result[identity] = entry
+			}
+		}
+	}
+	for _, item := range input.Entries {
+		if err := validateScopedInput(item, componentRoles); err != nil {
+			return nil, invalid("entries", err.Error())
+		}
+		identity := scopedKeyIdentity(item.ScopedKey)
+		if seen[identity] != "" {
+			return nil, invalid("entries", "Keys must be unique within each phase and target")
+		}
+		seen[identity] = "entry"
+		if item.Value == nil {
+			existing, exists := result[identity]
+			if exists && existing.Sensitivity == SensitivitySecret && item.Sensitivity == SensitivitySecret {
+				continue
+			}
+			if current.Version == 1 && item.Sensitivity == SensitivitySecret {
+				legacy, legacyExists := current.Legacy.Entries[item.Key]
+				if legacyExists && legacy.Sensitive && !usedLegacySecrets[item.Key] {
+					result[identity] = scopedBundleEntry{Phase: item.Phase, Component: item.Component, Key: item.Key, Sensitivity: SensitivitySecret, Value: legacy.Value}
+					usedLegacySecrets[item.Key] = true
+					continue
+				}
+			}
+			return nil, invalid("entries", "Only an existing secret in the same scope can be preserved")
+		}
+		result[identity] = scopedBundleEntry{Phase: item.Phase, Component: item.Component, Key: item.Key, Sensitivity: item.Sensitivity, Value: *item.Value}
+	}
+	if len(result) > 256 {
+		return nil, invalid("configuration", "Too many entries")
+	}
+	entries := make([]scopedBundleEntry, 0, len(result))
+	for _, entry := range result {
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool { return scopedEntryLess(entries[i], entries[j]) })
+	return entries, nil
+}
+
+func validateScopedInput(input ScopedValueInput, componentRoles map[string]string) error {
+	if err := validateScopedKey(input.ScopedKey, componentRoles); err != nil {
+		return err
+	}
+	if input.Sensitivity != SensitivityPublic && input.Sensitivity != SensitivitySecret {
+		return errors.New("Sensitivity must be public or secret")
+	}
+	if input.Phase == PhaseBuild && input.Sensitivity != SensitivityPublic {
+		return errors.New("Build values must be explicitly non-secret")
+	}
+	if input.Sensitivity == SensitivitySecret && hasPublicPrefix(input.Key) {
+		return errors.New("Browser-public environment names cannot be secret")
+	}
+	if input.Value == nil {
+		if input.Sensitivity != SensitivitySecret {
+			return errors.New("Public values must be supplied")
+		}
+		return nil
+	}
+	if err := validateScopedValue(*input.Value); err != nil {
+		return err
+	}
+	if input.Sensitivity == SensitivitySecret && *input.Value == "" {
+		return errors.New("Submitted secrets cannot be empty")
+	}
+	return nil
+}
+
+func validateScopedKey(input ScopedKey, componentRoles map[string]string) error {
+	if err := ValidateScopedEnvironmentKey(input.Key); err != nil {
+		return err
+	}
+	role, exists := componentRoles[input.Component]
+	if !exists {
+		return errors.New("Target component is not in the accepted deployment plan")
+	}
+	switch input.Phase {
+	case PhaseBuild:
+		return nil
+	case PhaseRuntime, PhaseMigration:
+		if role != "server" {
+			return errors.New("Runtime and migration values require a server component")
+		}
+		return nil
+	default:
+		return errors.New("Phase must be runtime, build, or migration")
+	}
+}
+
+func validateScopedBundleEntry(entry scopedBundleEntry, componentRoles map[string]string) error {
+	if err := validateScopedInput(ScopedValueInput{ScopedKey: ScopedKey{Phase: entry.Phase, Component: entry.Component, Key: entry.Key}, Sensitivity: entry.Sensitivity, Value: &entry.Value}, componentRoles); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateScopedValue(value string) error {
+	if !utf8.ValidString(value) {
+		return errors.New("Values must be valid UTF-8")
+	}
+	if strings.ContainsAny(value, "\x00\r\n") {
+		return errors.New("Values cannot contain NUL bytes or line breaks")
+	}
+	if len(value) > 8<<10 {
+		return errors.New("A value is too large")
+	}
+	return nil
+}
+
+// ValidateScopedEnvironmentKey applies the v2 portable-name and reserved-name
+// policy without assigning a phase, target, or sensitivity.
+func ValidateScopedEnvironmentKey(key string) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	if isReservedKey(key) {
+		return errors.New("RIG_ and HOSTD_ environment names are reserved")
+	}
+	return nil
+}
+
+func isReservedKey(key string) bool {
+	upper := strings.ToUpper(key)
+	return strings.HasPrefix(upper, "RIG_") || strings.HasPrefix(upper, "HOSTD_")
+}
+
+func hasPublicPrefix(key string) bool {
+	for _, prefix := range []string{"VITE_", "NEXT_PUBLIC_", "REACT_APP_", "PUBLIC_", "NUXT_PUBLIC_", "EXPO_PUBLIC_", "GATSBY_"} {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func scopedKeyIdentity(key ScopedKey) string {
+	return string(key.Phase) + "\x00" + key.Component + "\x00" + key.Key
+}
+
+func scopedEntryIdentity(entry scopedBundleEntry) string {
+	return scopedKeyIdentity(ScopedKey{Phase: entry.Phase, Component: entry.Component, Key: entry.Key})
+}
+
+func scopedEntryLess(left, right scopedBundleEntry) bool {
+	if left.Phase != right.Phase {
+		return left.Phase < right.Phase
+	}
+	if left.Component != right.Component {
+		return left.Component < right.Component
+	}
+	return left.Key < right.Key
+}
+
+func scopedCounts(entries []scopedBundleEntry) (variables, secrets int) {
+	for _, entry := range entries {
+		if entry.Sensitivity == SensitivitySecret {
+			secrets++
+		} else {
+			variables++
+		}
+	}
+	return variables, secrets
 }
 
 func merge(existing map[string]bundleEntry, input ReplaceInput) (map[string]bundleEntry, error) {
@@ -710,7 +1540,7 @@ func (s *Store) Recover(ctx context.Context) error {
 		return err
 	}
 	for _, r := range refs {
-		if _, err := s.readBundle(ctx, r.app, r.id, r.number); err != nil {
+		if _, err := s.readRevisionBundle(ctx, r.app, r.id, r.number); err != nil {
 			return fmt.Errorf("validate configuration bundle: %w", err)
 		}
 	}

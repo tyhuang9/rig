@@ -325,7 +325,7 @@ func terminal(value Status) bool {
 
 func knownDiagnostic(value string) bool {
 	switch value {
-	case "", "daemon_restarted", "runtime_unavailable", "process_termination_failed", "compose_invalid", "compose_config_invalid", "compose_config_timeout", "compose_config_output_truncated", "policy_rejected", "approval_required", "apply_failed", "compose_apply_failed", "compose_apply_timeout", "compose_apply_output_truncated", "health_failed", "cancelled", "internal_error", "invalid_source", "source_unavailable", "source_access_lost", "source_too_large", "source_storage_full", "provider_unavailable", "configuration_unavailable":
+	case "", "daemon_restarted", "runtime_unavailable", "process_termination_failed", "compose_invalid", "compose_config_invalid", "compose_config_timeout", "compose_config_output_truncated", "policy_rejected", "approval_required", "apply_failed", "compose_apply_failed", "compose_apply_timeout", "compose_apply_output_truncated", "health_failed", "cancelled", "internal_error", "invalid_source", "source_unavailable", "source_access_lost", "source_too_large", "source_storage_full", "provider_unavailable", "configuration_unavailable", "configuration_review_required", "build_configuration_requires_build_command":
 		return true
 	default:
 		return false
@@ -376,6 +376,10 @@ func diagnosticSummary(value string) string {
 		return "Application source provider is unavailable"
 	case "configuration_unavailable":
 		return "Application configuration is unavailable"
+	case "configuration_review_required":
+		return "Review application configuration scope against the accepted deployment plan"
+	case "build_configuration_requires_build_command":
+		return "Public build configuration requires a reviewed build command"
 	default:
 		return ""
 	}
