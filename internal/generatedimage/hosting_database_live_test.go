@@ -304,6 +304,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	}
 	blue = generatedruntime.Candidate{}
 	hostingLiveAssertRequest(t, ctx, port, appID, http.MethodGet, "/api/notes", "", http.StatusOK, "TLS bridge roundtrip")
+	t.Logf("M1 acceptance identities: app=%s strategy=generated plan=%s/%d config-initial=%s/%d config-final=%s/%d release=%s artifact=%s image=%s ingress-port=%d deployment=direct-runtime-gate", appID, plan.ID, plan.RevisionNumber, revisionA.RevisionID, revisionA.RevisionNumber, revisionB.RevisionID, revisionB.RevisionNumber, releaseID, artifactID, imageID, port)
 	t.Log("M1 hosted Docker gate: app-private bridge, verified TLS PostgreSQL roundtrip, HTTPS probe, bad-CA rollback, same-image scoped revision replacement, and persistent note read passed")
 }
 
