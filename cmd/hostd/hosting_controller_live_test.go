@@ -523,6 +523,77 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		bytes.Contains(index, []byte("NOTES_FIXTURE_DB_URL")) || bytes.Contains(script, []byte("NOTES_FIXTURE_DB_URL")) {
 		t.Fatal("deployed frontend exposed a scoped server secret or selector")
 	}
+	stopWorker()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("deployment worker did not stop for controller restart")
+	}
+	api.Close()
+	if err := db.Close(); err != nil {
+		t.Fatal("close controller database for restart")
+	}
+	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
+	reopenedDB, err := database.Open(dataRoot)
+	if err != nil {
+		t.Fatal("reopen durable controller database:", err)
+	}
+	defer reopenedDB.Close()
+	restartedApps := apps.New(reopenedDB)
+	restartedJobs := jobs.New(reopenedDB)
+	restartedDeployments := deployments.New(reopenedDB)
+	restartedConfiguration, err := appconfig.New(reopenedDB, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedPlans, err := deploymentplans.New(reopenedDB, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedSources := sourceconnections.NewService(sourceconnections.NewRepository(reopenedDB), nil, sourceconnections.NewFileCredentialStore(dataRoot), "", time.Now)
+	restartedSnapshots, err := releasesnapshot.New(reopenedDB, restartedSources, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedComposition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
+		db: reopenedDB, applications: restartedApps, snapshots: restartedSnapshots, configuration: restartedConfiguration,
+		deployments: restartedDeployments, plans: restartedPlans,
+	}, runtimeCompositionOptions{dockerExecutable: docker})
+	if err != nil {
+		t.Fatal("recover generated runtime after controller restart:", err)
+	}
+	restartedWorkerContext, stopRestartedWorker := context.WithCancel(ctx)
+	restartedDone, err := prepareRuntimeWorker(restartedWorkerContext, runtimeRecovery{
+		deployments: restartedDeployments.Recover, jobs: restartedJobs.RecoverInterrupted,
+	}, restartedComposition.executor, restartedJobs.RunWorker, func(error) {})
+	if err != nil {
+		t.Fatal("restart durable deployment worker:", err)
+	}
+	defer func() {
+		stopRestartedWorker()
+		select {
+		case <-restartedDone:
+		case <-time.After(10 * time.Second):
+			t.Error("restarted deployment worker did not stop")
+		}
+	}()
+	api = httptest.NewServer((&controller.Server{
+		Auth: auth.New(reopenedDB), Apps: restartedApps, Jobs: restartedJobs, Machines: machines.New(reopenedDB), Sources: restartedSources,
+		Configuration: restartedConfiguration, Deployments: restartedDeployments, DeploymentPlans: restartedPlans,
+		GeneratedRuntime: true, Caddy: true, DataRoot: dataRoot, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}).Handler())
+	defer api.Close()
+	var retainedJob jobs.Job
+	request(http.MethodGet, "/api/v1/jobs/"+completed.ID, nil, http.StatusOK, &retainedJob)
+	if retainedJob.ID != completed.ID || retainedJob.Status != string(jobs.Succeeded) {
+		t.Fatal("controller restart lost durable deployment job")
+	}
+	var retainedHistory apicontract.DeploymentList
+	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/deployments", nil, http.StatusOK, &retainedHistory)
+	if len(retainedHistory.Items) != 1 || retainedHistory.Items[0].ID != history.Items[0].ID || retainedHistory.Items[0].ReleaseID != releases.Items[0].ID {
+		t.Fatal("controller restart lost active deployment identity")
+	}
+	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	t.Logf("M2 controller journey identities: app=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s source=local-snapshot ingress=127.0.0.1:8080", application.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID)
 }
 

@@ -22,6 +22,12 @@ targets the unmerged M1 branch. Neither PR has been merged.
 - The test uses the existing `examples/hosting-notes` fixture. Its database
   schema and credentials remain application-owned; Rig does not provision a
   database. There is no managed database or Neon provisioning path.
+- The controller gate now closes its worker, HTTP server, and database after a
+  successful deployment; it checks the note through ingress while the
+  controller is stopped, then reopens the durable store, recreates the runtime
+  composition, restarts the worker and authenticated HTTP API, and checks the
+  original job, deployment, release, and note. Hosted evidence for this
+  extension is pending.
 
 ## Verification so far
 
@@ -98,8 +104,8 @@ prove whether the original request reached the controller.
 
 - Complete the hosted controller journey gate on the corrected branch head.
 - Exercise a real browser through frontend, Caddy, backend, and the external
-  fixture database; verify note persistence after controller restart and
-  healthy replacement.
+  fixture database; verify healthy replacement and rerun the new controller
+  restart check on the final head.
 - Add controlled GitHub archive/connection materialization to the continuous
   harness and perform a separate live GitHub authorization walkthrough.
 - Prove unhealthy replacement retains the old serving version, and cover the
