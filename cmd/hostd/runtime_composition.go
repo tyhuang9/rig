@@ -48,6 +48,8 @@ type runtimeComposition struct {
 	executor  jobs.Executor
 	compose   jobs.Executor
 	generated jobs.Executor
+	ingress   *generatedingress.Manager
+	state     *generatedruntimestate.Repository
 }
 
 type runtimeCapabilities struct {
@@ -211,6 +213,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated ingress setup: %w", err)
 		}
+		result.ingress = ingress
 		if err := step("ingress_recover"); err != nil {
 			return runtimeComposition{}, err
 		}
@@ -247,6 +250,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 			return runtimeComposition{}, err
 		}
 		state := generatedruntimestate.New(dependencies.db)
+		result.state = state
 		if err := step("authorization_gate_create"); err != nil {
 			return runtimeComposition{}, err
 		}

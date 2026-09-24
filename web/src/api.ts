@@ -11,6 +11,7 @@ import {
   type BootstrapStatus,
   type CreateApplicationRequest,
   type CSRFResponse,
+  type Deployment,
   type DeploymentList,
   type DeploymentPlanRevision,
   type DeploymentSetupComponentInput,
@@ -31,6 +32,7 @@ import {
   type JobMutationResponse,
   type JobResponse,
   type LoginRequest,
+  type LocalRoute,
   type MachineList,
   type MeResponse,
   type ReplaceApplicationConfigurationRequest,
@@ -73,6 +75,7 @@ export type {
   InspectRequest,
   InspectResponse,
   Job,
+  LocalRoute,
   Machine,
   SourceConnection,
   SystemStatus,
@@ -129,6 +132,44 @@ export type DeployExpectedRevisions = {
   expectedConfigurationRevisionId: string;
   expectedConfigurationRevisionNumber: number;
 };
+
+export const LOCAL_ROUTE_MAX_AGE_MS = 60_000;
+
+export function localRouteObservationFresh(route: Pick<LocalRoute, "observedAt"> | undefined, nowMs = Date.now()): boolean {
+  if (typeof route?.observedAt !== "string") return false;
+  const observedMs = Date.parse(route.observedAt);
+  const ageMs = nowMs - observedMs;
+  return Number.isFinite(observedMs) && ageMs >= -5_000 && ageMs < LOCAL_ROUTE_MAX_AGE_MS;
+}
+
+// A route is usable in the UI only when the controller's observation agrees with
+// the successful deployment being displayed. Keep this check at the last point
+// before rendering a link because query data can outlive a deployment switch.
+export function verifiedLocalRouteURL(route: LocalRoute | undefined, appId: string, deployment: Deployment | undefined, nowMs = Date.now()): string | null {
+  if (!route || route.status !== "verified" || route.scope !== "controller_loopback" ||
+      !deployment || deployment.status !== "succeeded" || deployment.runtimeStrategy !== "generated_node" ||
+      typeof route.deploymentId !== "string" || !route.deploymentId ||
+      typeof route.releaseId !== "string" || !route.releaseId ||
+      typeof route.planRevisionId !== "string" || !route.planRevisionId ||
+      !Number.isSafeInteger(route.planRevisionNumber) || (route.planRevisionNumber ?? 0) < 1 ||
+      typeof route.configurationRevisionId !== "string" ||
+      !Number.isSafeInteger(route.configurationRevisionNumber) || (route.configurationRevisionNumber ?? -1) < 0 ||
+      Boolean(route.configurationRevisionId) !== Boolean(route.configurationRevisionNumber) ||
+      route.deploymentId !== deployment.id || route.releaseId !== deployment.releaseId ||
+      route.planRevisionId !== deployment.deploymentPlanRevisionId ||
+      route.planRevisionNumber !== deployment.deploymentPlanRevisionNumber ||
+      route.configurationRevisionId !== (deployment.actualConfigurationRevisionId ?? "") ||
+      route.configurationRevisionNumber !== deployment.actualConfigurationRevisionNumber ||
+      typeof route.url !== "string" || !localRouteObservationFresh(route, nowMs)) return null;
+  try {
+    const parsed = new URL(route.url);
+    return parsed.protocol === "http:" && parsed.hostname === `${appId}.rig.localhost` &&
+      Boolean(parsed.port) && parsed.pathname === "/" && !parsed.search && !parsed.hash &&
+      !parsed.username && !parsed.password ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
 
 let csrfToken = window.sessionStorage.getItem("hostd-csrf") ?? "";
 
@@ -431,6 +472,10 @@ export const api = {
     }),
   deployments: (appId: string) =>
     request<DeploymentList>(operationPath(operations.listDeployments.path, { appId })),
+  localRoute: (appId: string) =>
+    request<LocalRoute>(operationPath(operations.getApplicationLocalRoute.path, { appId }), {
+      cache: "no-store",
+    }),
   releases: (appId: string) =>
     request<ReleaseList>(operationPath(operations.listReleases.path, { appId })),
   runtimeApprovals: (appId: string) =>

@@ -9,8 +9,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"text/template"
+	"time"
 
 	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
@@ -40,6 +42,31 @@ type ingressRunner struct {
 	restartInstalls          int
 	failRestartInstall       int
 	failRollbackReload       bool
+	failAdminRead            bool
+	truncateAdminRead        bool
+	bindIP                   string
+	bindPort                 string
+}
+
+type stalledObservationRunner struct {
+	delegate *ingressRunner
+	entered  chan struct{}
+	once     sync.Once
+}
+
+func (r *stalledObservationRunner) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	if len(request.Args) >= 2 && request.Args[0] == "image" && request.Args[1] == "inspect" {
+		blocked := false
+		r.once.Do(func() {
+			blocked = true
+			close(r.entered)
+			<-ctx.Done()
+		})
+		if blocked {
+			return runtimeprocess.CommandResult{}, ctx.Err()
+		}
+	}
+	return r.delegate.Run(ctx, request)
 }
 
 func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -176,6 +203,13 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 		}
 		return runtimeprocess.CommandResult{Stdout: append([]byte(nil), output...)}, nil
 	}
+	if reflect.DeepEqual(args, []string{"container", "exec", "sha256:" + strings.Repeat("d", 64),
+		"curl", "--silent", "--show-error", "--fail", "--max-time", "10", "http://127.0.0.1:2019/config/"}) {
+		if r.failAdminRead {
+			return runtimeprocess.CommandResult{Stderr: []byte("admin unavailable")}, errors.New("admin unavailable")
+		}
+		return runtimeprocess.CommandResult{Stdout: append([]byte(nil), r.liveConfig...), StdoutTruncated: r.truncateAdminRead}, nil
+	}
 	if len(args) >= 4 && args[0] == "container" && args[1] == "exec" {
 		return runtimeprocess.CommandResult{}, nil
 	}
@@ -183,13 +217,21 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 }
 
 func (r *ingressRunner) caddyInspection() caddyInspection {
+	bindIP := r.bindIP
+	if bindIP == "" {
+		bindIP = "127.0.0.1"
+	}
+	bindPort := r.bindPort
+	if bindPort == "" {
+		bindPort = "8080"
+	}
 	return caddyInspection{
 		ID: "sha256:" + strings.Repeat("d", 64), Name: "/" + caddyContainerName, Image: "sha256:" + strings.Repeat("a", 64),
 		Labels: map[string]string{"io.rig.managed": "generated-ingress", "io.rig.identity-version": "v1", "io.rig.listener-isolation": "v1"}, Hostname: caddyContainerName, User: "1000:1000", Env: []string{"XDG_CONFIG_HOME=/config", "XDG_DATA_HOME=/data"},
 		Entrypoint: []string{caddyExecutable}, Cmd: []string{"run", "--config", "/config/active.json"}, ReadOnly: true, CapDrop: []string{"ALL"}, CapAdd: []string{caddyCapability}, SecurityOpt: []string{"no-new-privileges"},
 		Mounts: []mountInspection{{Type: "volume", Name: caddyVolumeName, Destination: "/config", RW: true}}, Tmpfs: map[string]string{"/data": "rw,noexec,nosuid,nodev,size=67108864"},
 		Memory: 268435456, MemorySwap: 268435456, NanoCPUs: 1_000_000_000, PIDsLimit: 128, LogType: "local", LogConfig: map[string]string{"max-size": "10m", "max-file": "3"}, Restart: "unless-stopped", Running: !r.stopped, Restarting: r.restarting,
-		NetworkMode: caddyNetworkName, Ulimits: []ulimitInspection{{Name: "nofile", Hard: 1024, Soft: 1024}}, PortBindings: map[string][]map[string]string{"8080/tcp": {{"HostIp": "127.0.0.1", "HostPort": "8080"}}}, Networks: r.caddyNetworks,
+		NetworkMode: caddyNetworkName, Ulimits: []ulimitInspection{{Name: "nofile", Hard: 1024, Soft: 1024}}, PortBindings: map[string][]map[string]string{"8080/tcp": {{"HostIp": bindIP, "HostPort": bindPort}}}, Networks: r.caddyNetworks,
 	}
 }
 
@@ -211,6 +253,332 @@ func TestSwitchPersistsAcceptedRouteAfterValidatedReload(t *testing.T) {
 	}
 	if _, ok := runner.files[caddyContainerName+":/config/proposed.json"]; !ok {
 		t.Fatal("proposed aggregate config was not copied to Caddy")
+	}
+}
+
+func TestObserveAttestsLiveCommittedRouteWithoutMutation(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+		t.Fatal(err)
+	}
+	var live any
+	if err := json.Unmarshal(runner.liveConfig, &live); err != nil {
+		t.Fatal(err)
+	}
+	formatted, err := json.MarshalIndent(live, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.liveConfig = formatted
+	before := len(runner.commands)
+	observation, err := manager.Observe(context.Background(), runner.appID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.URL != "http://"+runner.appID+".rig.localhost:8080" || observation.Slot != generatedruntime.SlotBlue ||
+		!reflect.DeepEqual(observation.Endpoints, []generatedruntime.RouteEndpoint{runner.endpoint}) ||
+		observation.ObservedAt.IsZero() || observation.ObservedAt.Location() != time.UTC {
+		t.Fatalf("observation = %#v", observation)
+	}
+	for _, args := range runner.commands[before:] {
+		if !containsArgument(args, "inspect") && !containsArgument(args, "curl") {
+			t.Fatalf("observation mutated Docker: %v", args)
+		}
+	}
+}
+
+func TestWithObservationSerializesSwitchThroughCallback(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+		t.Fatal(err)
+	}
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	observeDone := make(chan error, 1)
+	go func() {
+		observeDone <- manager.WithObservation(context.Background(), runner.appID, func(_ context.Context, value Observation) error {
+			if value.URL == "" || value.ObservedAt.IsZero() {
+				return errors.New("missing attested observation")
+			}
+			close(callbackEntered)
+			<-releaseCallback
+			return nil
+		})
+	}()
+	select {
+	case <-callbackEntered:
+	case err := <-observeDone:
+		t.Fatalf("observation ended before callback: %v", err)
+	}
+	lockAvailable := make(chan bool, 1)
+	switchDone := make(chan error, 1)
+	go func() {
+		if manager.mu.TryLock() {
+			manager.mu.Unlock()
+			lockAvailable <- true
+		} else {
+			lockAvailable <- false
+		}
+		switchDone <- manager.Switch(context.Background(), switchRequest(runner))
+	}()
+	held := !<-lockAvailable
+	completedEarly := false
+	var switchErr error
+	select {
+	case switchErr = <-switchDone:
+		completedEarly = true
+	default:
+	}
+	close(releaseCallback)
+	if err := <-observeDone; err != nil {
+		t.Fatal(err)
+	}
+	if !completedEarly {
+		switchErr = <-switchDone
+	}
+	if switchErr != nil {
+		t.Fatal(switchErr)
+	}
+	if !held || completedEarly {
+		t.Fatalf("Switch was not serialized through the callback: lock held = %t, completed early = %t", held, completedEarly)
+	}
+}
+
+func TestCancelledObservationReleasesSwitchMutexAfterDockerStall(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+		t.Fatal(err)
+	}
+	stalled := &stalledObservationRunner{delegate: runner, entered: make(chan struct{})}
+	manager.runner = stalled
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	observeDone := make(chan error, 1)
+	go func() {
+		observeDone <- manager.WithObservation(ctx, runner.appID, func(context.Context, Observation) error { return nil })
+	}()
+	select {
+	case <-stalled.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("observation did not reach the stalled Docker command")
+	}
+	if manager.mu.TryLock() {
+		manager.mu.Unlock()
+		t.Fatal("stalled observation did not hold the switch mutex")
+	}
+	switchDone := make(chan error, 1)
+	go func() { switchDone <- manager.Switch(context.Background(), switchRequest(runner)) }()
+	cancel()
+	select {
+	case err := <-observeDone:
+		if !IsCode(err, DiagnosticCancelled) && !IsCode(err, DiagnosticIngressUnavailable) {
+			t.Fatalf("cancelled observation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled observation did not release the Docker stall")
+	}
+	select {
+	case err := <-switchDone:
+		if err != nil {
+			t.Fatalf("switch after observation cancellation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled observation did not release the switch mutex")
+	}
+}
+
+func TestCancelledObservationDoesNotWaitForSwitchMutex(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	manager.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			manager.mu.Unlock()
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	observeDone := make(chan error, 1)
+	go func() {
+		observeDone <- manager.WithObservation(ctx, runner.appID, func(context.Context, Observation) error {
+			return errors.New("callback must not run without the mutex")
+		})
+	}()
+	cancel()
+	select {
+	case err := <-observeDone:
+		if !IsCode(err, DiagnosticCancelled) {
+			t.Fatalf("observation after cancellation while switch mutex held: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled observation waited for the switch mutex")
+	}
+	manager.mu.Unlock()
+	locked = false
+	if len(runner.commands) != 0 {
+		t.Fatalf("cancelled observation used Docker: %v", runner.commands)
+	}
+}
+
+func TestObserveRejectsInvalidOrMissingActiveRouteWithoutDockerAccess(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	for _, test := range []struct {
+		name  string
+		ctx   context.Context
+		appID string
+		code  DiagnosticCode
+	}{
+		{"nil context", nil, runner.appID, DiagnosticValidationFailed},
+		{"invalid application ID", context.Background(), "invalid", DiagnosticValidationFailed},
+		{"no active route", context.Background(), runner.appID, DiagnosticRouteInvalid},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			observation, err := manager.Observe(test.ctx, test.appID)
+			if !IsCode(err, test.code) || !reflect.DeepEqual(observation, Observation{}) || len(runner.commands) != 0 {
+				t.Fatalf("observation = %#v, error = %v, commands = %v", observation, err, runner.commands)
+			}
+		})
+	}
+}
+
+func TestWithObservationRejectsNilCallbackWithoutDockerAccess(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	if err := manager.WithObservation(context.Background(), runner.appID, nil); !IsCode(err, DiagnosticValidationFailed) || len(runner.commands) != 0 {
+		t.Fatalf("error = %v, commands = %v", err, runner.commands)
+	}
+}
+
+func TestWithObservationPassesCallbackErrorThrough(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+		t.Fatal(err)
+	}
+	expected := errors.New("active head changed")
+	err := manager.WithObservation(context.Background(), runner.appID, func(_ context.Context, observation Observation) error {
+		if observation.URL == "" {
+			return errors.New("callback received no attested URL")
+		}
+		return expected
+	})
+	if err != expected {
+		t.Fatalf("callback error = %v; want original error", err)
+	}
+}
+
+func TestWithObservationPassesBoundedContextToCallback(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := manager.WithObservation(ctx, runner.appID, func(observationContext context.Context, observation Observation) error {
+		if observation.URL == "" {
+			t.Fatal("callback received no attested URL")
+		}
+		if _, hasDeadline := observationContext.Deadline(); !hasDeadline {
+			t.Fatal("callback did not receive the observation deadline")
+		}
+		cancel()
+		if observationContext.Err() != context.Canceled {
+			t.Fatalf("callback context after request cancellation = %v", observationContext.Err())
+		}
+		return observationContext.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("callback error = %v; want cancellation", err)
+	}
+	if !manager.mu.TryLock() {
+		t.Fatal("callback cancellation did not release the switch mutex")
+	}
+	manager.mu.Unlock()
+}
+
+func TestWithObservationRejectsCancellationAfterCallback(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := manager.WithObservation(ctx, runner.appID, func(context.Context, Observation) error {
+		cancel()
+		return nil
+	})
+	if !IsCode(err, DiagnosticCancelled) {
+		t.Fatalf("observation after callback cancellation = %v", err)
+	}
+}
+
+func TestObserveWithholdsURLOnUncertainOrDriftedIngress(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *Manager, *ingressRunner)
+		code   DiagnosticCode
+	}{
+		{"pending switch", func(t *testing.T, manager *Manager, runner *ingressRunner) {
+			t.Helper()
+			state, err := manager.store.load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			previous := state.Active[runner.appID]
+			state.Pending = &pendingRoute{AppID: runner.appID, Previous: &previous, Proposed: routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: previous.Endpoints}}
+			if err := manager.store.save(state); err != nil {
+				t.Fatal(err)
+			}
+		}, DiagnosticRouteUnresolved},
+		{"live config differs", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
+			runner.liveConfig = []byte(`{"admin":{"listen":"localhost:2019"},"apps":{}}`)
+		}, DiagnosticIngressDrift},
+		{"admin read unavailable", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
+			runner.failAdminRead = true
+		}, DiagnosticIngressUnavailable},
+		{"admin read truncated", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
+			runner.truncateAdminRead = true
+		}, DiagnosticIngressUnavailable},
+		{"caddy stopped", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
+			runner.stopped = true
+		}, DiagnosticIngressUnavailable},
+		{"caddy restarting", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
+			runner.restarting = true
+		}, DiagnosticIngressUnavailable},
+		{"public listener", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
+			runner.bindIP = "0.0.0.0"
+		}, DiagnosticIngressDrift},
+		{"wrong host port", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
+			runner.bindPort = "8888"
+		}, DiagnosticIngressDrift},
+		{"ingress network identity changed", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
+			runner.ingressContainers[strings.Repeat("d", 64)] = caddyNetworkContainerInspection{Name: caddyContainerName, IPv4Address: "10.203.0.3/28"}
+		}, DiagnosticIngressDrift},
+		{"ingress network detached", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
+			delete(runner.caddyNetworks, caddyNetworkName)
+		}, DiagnosticIngressDrift},
+		{"application network detached", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
+			delete(runner.caddyNetworks, runner.network)
+		}, DiagnosticIngressDrift},
+		{"endpoint role differs", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
+			runner.endpointRoleLabel = "static"
+		}, DiagnosticIngressDrift},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager, runner := newManagerFixture(t, false)
+			if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, manager, runner)
+			before := len(runner.commands)
+			observation, err := manager.Observe(context.Background(), runner.appID)
+			if !IsCode(err, test.code) || !reflect.DeepEqual(observation, Observation{}) {
+				t.Fatalf("observation = %#v, error = %v; want %s", observation, err, test.code)
+			}
+			for _, args := range runner.commands[before:] {
+				if !containsArgument(args, "inspect") && !containsArgument(args, "curl") {
+					t.Fatalf("observation mutated Docker: %v", args)
+				}
+			}
+		})
 	}
 }
 
@@ -1032,7 +1400,7 @@ func newManagerFixture(t *testing.T, failReload bool) (*Manager, *ingressRunner)
 	_, _, ingressIP := ingressNetworkCandidate(0)
 	runner := &ingressRunner{
 		appID: appID, network: endpoint.NetworkName, endpoint: endpoint,
-		caddyNetworks:     map[string]*networkAttachment{caddyNetworkName: {GwPriority: caddyGatewayPriority}},
+		caddyNetworks:     map[string]*networkAttachment{caddyNetworkName: {GwPriority: caddyGatewayPriority, IPAddress: ingressIP}},
 		ingressContainers: map[string]caddyNetworkContainerInspection{strings.Repeat("d", 64): {Name: caddyContainerName, IPv4Address: ingressIP + "/28"}},
 		files:             map[string][]byte{}, failProposedReload: failReload,
 	}

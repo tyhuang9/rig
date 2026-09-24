@@ -9,10 +9,10 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/hostd/hostd/internal/generatedruntime"
@@ -35,8 +35,11 @@ const (
 	defaultHostPort      = uint16(8080)
 	defaultOutputLimit   = 64 << 10
 	defaultTimeout       = 30 * time.Second
-	defaultPullTimeout   = 5 * time.Minute
-	maximumDrain         = 30 * time.Second
+	// A route read must not hold the switch mutex for the sum of many Docker
+	// command timeouts when the daemon is slow or unresponsive.
+	observationTimeout = 15 * time.Second
+	defaultPullTimeout = 5 * time.Minute
+	maximumDrain       = 30 * time.Second
 )
 
 type Options struct {
@@ -57,7 +60,43 @@ type Manager struct {
 	options                  Options
 	dockerEnv                []string
 	workingDirectoryIdentity os.FileInfo
-	mu                       sync.Mutex
+	mu                       contextMutex
+}
+
+// contextMutex lets a route observation abandon lock contention when its
+// request deadline expires, while preserving Switch and Provision ordering.
+type contextMutex struct{ token chan struct{} }
+
+func newContextMutex() contextMutex {
+	token := make(chan struct{}, 1)
+	token <- struct{}{}
+	return contextMutex{token: token}
+}
+
+func (m *contextMutex) Lock() { <-m.token }
+
+func (m *contextMutex) Unlock() { m.token <- struct{}{} }
+
+func (m *contextMutex) TryLock() bool {
+	select {
+	case <-m.token:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *contextMutex) LockContext(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-m.token:
+		if err := ctx.Err(); err != nil {
+			m.Unlock()
+			return err
+		}
+		return nil
+	}
 }
 
 func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error) {
@@ -91,7 +130,7 @@ func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error)
 	if err != nil {
 		return nil, err
 	}
-	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv, workingDirectoryIdentity: workingDirectoryIdentity}, nil
+	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv, workingDirectoryIdentity: workingDirectoryIdentity, mu: newContextMutex()}, nil
 }
 
 // Switch atomically reloads the aggregate Caddy route set, durably records the
@@ -1161,4 +1200,144 @@ func (m *Manager) URL(appID string) (string, error) {
 		return "", &Error{Code: DiagnosticValidationFailed}
 	}
 	return fmt.Sprintf("http://%s.rig.localhost:%d", appID, m.options.HostPort), nil
+}
+
+// Observe attests the protected route against the pinned, live Docker ingress.
+// It never provisions, reloads, repairs, or changes a route. An uncertain
+// switch, missing endpoint, or differing live Caddy config withholds the URL.
+func (m *Manager) Observe(ctx context.Context, appID string) (Observation, error) {
+	var observation Observation
+	err := m.WithObservation(ctx, appID, func(_ context.Context, value Observation) error {
+		observation = value
+		return nil
+	})
+	if err != nil {
+		return Observation{}, err
+	}
+	return observation, nil
+}
+
+// WithObservation holds the route switch mutex through the caller's read-only
+// cross-store check. A Switch cannot change Caddy between live attestation and
+// validation of the durable active deployment head. The callback must not call
+// Manager methods or perform writes.
+func (m *Manager) WithObservation(ctx context.Context, appID string, fn func(context.Context, Observation) error) error {
+	if m == nil || ctx == nil || !validAppID(appID) || fn == nil {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
+	bounded, cancel := context.WithTimeout(ctx, observationTimeout)
+	defer cancel()
+	if err := m.mu.LockContext(bounded); err != nil {
+		return &Error{Code: DiagnosticCancelled}
+	}
+	defer m.mu.Unlock()
+	if bounded.Err() != nil {
+		return &Error{Code: DiagnosticCancelled}
+	}
+	observation, err := m.observeLocked(bounded, appID)
+	if err != nil {
+		return err
+	}
+	if bounded.Err() != nil {
+		return &Error{Code: DiagnosticCancelled}
+	}
+	if err := fn(bounded, observation); err != nil {
+		return err
+	}
+	if bounded.Err() != nil {
+		return &Error{Code: DiagnosticCancelled}
+	}
+	return nil
+}
+
+func (m *Manager) observeLocked(ctx context.Context, appID string) (Observation, error) {
+	state, err := m.store.load()
+	if err != nil {
+		return Observation{}, &Error{Code: DiagnosticRouteStateFailed}
+	}
+	if state.Pending != nil {
+		return Observation{}, &Error{Code: DiagnosticRouteUnresolved}
+	}
+	route, exists := state.Active[appID]
+	if !exists {
+		return Observation{}, &Error{Code: DiagnosticRouteInvalid}
+	}
+
+	image, found, err := m.inspectImage(ctx)
+	if err != nil {
+		return Observation{}, err
+	}
+	if !found {
+		return Observation{}, &Error{Code: DiagnosticIngressUnavailable}
+	}
+	if image.OS != "linux" || !validContainerID(image.ID) || !containsDigest(image.RepoDigests, caddyImageDigest) {
+		return Observation{}, &Error{Code: DiagnosticIngressDrift}
+	}
+	caddy, found, err := m.inspectCaddy(ctx)
+	if err != nil {
+		return Observation{}, err
+	}
+	if !found || !caddy.Running || caddy.Restarting {
+		return Observation{}, &Error{Code: DiagnosticIngressUnavailable}
+	}
+	if !validContainerID(caddy.ID) || !validCaddyInspection(caddy, image.ID, m.options.HostPort) {
+		return Observation{}, &Error{Code: DiagnosticIngressDrift}
+	}
+
+	desired, err := m.desiredNetworks(ctx, state.Active)
+	if err != nil {
+		return Observation{}, err
+	}
+	if len(caddy.Networks) != len(desired) {
+		return Observation{}, &Error{Code: DiagnosticIngressDrift}
+	}
+	for network := range desired {
+		if caddy.Networks[network] == nil {
+			return Observation{}, &Error{Code: DiagnosticIngressDrift}
+		}
+	}
+	ingress, found, err := m.inspectCaddyNetwork(ctx)
+	defer clearCaddyNetworkInspection(&ingress)
+	listenIP, valid := caddyIngressAddress(ingress, caddy.ID)
+	if err != nil || !found || !valid {
+		return Observation{}, &Error{Code: DiagnosticIngressDrift}
+	}
+	if caddy.Networks[caddyNetworkName].IPAddress != listenIP {
+		return Observation{}, &Error{Code: DiagnosticIngressDrift}
+	}
+	expected, err := buildCaddyConfig(state.Active, net.JoinHostPort(listenIP, "8080"))
+	if err != nil {
+		return Observation{}, &Error{Code: DiagnosticRouteInvalid}
+	}
+	result, err := m.run(ctx, m.options.CommandTimeout, "container", "exec", caddy.ID,
+		"curl", "--silent", "--show-error", "--fail", "--max-time", "10", "http://127.0.0.1:2019/config/")
+	if err != nil {
+		return Observation{}, err
+	}
+	var expectedJSON, liveJSON any
+	expectedErr := json.Unmarshal(expected, &expectedJSON)
+	liveErr := json.Unmarshal(result.Stdout, &liveJSON)
+	clearResult(&result)
+	if expectedErr != nil || liveErr != nil || !reflect.DeepEqual(expectedJSON, liveJSON) {
+		return Observation{}, &Error{Code: DiagnosticIngressDrift}
+	}
+	if err := m.verifyEndpoints(ctx, appID, route); err != nil {
+		return Observation{}, err
+	}
+	confirmed, found, err := m.inspectCaddy(ctx)
+	if err != nil || !found || !reflect.DeepEqual(caddy, confirmed) {
+		return Observation{}, &Error{Code: DiagnosticIngressDrift}
+	}
+	confirmedState, err := m.store.load()
+	if err != nil || !reflect.DeepEqual(state, confirmedState) {
+		return Observation{}, &Error{Code: DiagnosticRouteStateFailed}
+	}
+	if ctx.Err() != nil {
+		return Observation{}, &Error{Code: DiagnosticCancelled}
+	}
+	url, err := m.URL(appID)
+	if err != nil {
+		return Observation{}, err
+	}
+	return Observation{URL: url, Slot: route.Slot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), route.Endpoints...), ObservedAt: time.Now().UTC()}, nil
 }

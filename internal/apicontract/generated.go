@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "4525769f9b26a4efcf2d77efb4ec1b0d11c0ce04200f1907405d97d815d5f353"
+const SourceSHA256 = "37210c5040b37953aa1d46a9230ad379593a1d19887ab216db3f04d0b31772f2"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -24,6 +24,7 @@ var Operations = map[string]Operation{
 	"getApplicationAutoDeploy":              {Method: "GET", Path: "/api/v1/apps/{appId}/auto-deploy"},
 	"getApplicationConfiguration":           {Method: "GET", Path: "/api/v1/apps/{appId}/configuration"},
 	"getApplicationDeploymentPlan":          {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-plan"},
+	"getApplicationLocalRoute":              {Method: "GET", Path: "/api/v1/apps/{appId}/local-route"},
 	"getDefaultSourceConnection":            {Method: "GET", Path: "/api/v1/source-connections/default"},
 	"getDeploymentJobByIdempotency":         {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-jobs/by-idempotency"},
 	"getJob":                                {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
@@ -609,6 +610,20 @@ type JobMutationResponse struct {
 
 type JobResponse struct {
 	Job Job `json:"job"`
+}
+
+type LocalRoute struct {
+	ConfigurationRevisionID     string `json:"configurationRevisionId,omitempty"`
+	ConfigurationRevisionNumber int64  `json:"configurationRevisionNumber,omitempty"`
+	DeploymentID                string `json:"deploymentId,omitempty"`
+	ObservedAt                  string `json:"observedAt"`
+	PlanRevisionID              string `json:"planRevisionId,omitempty"`
+	PlanRevisionNumber          int64  `json:"planRevisionNumber,omitempty"`
+	Reason                      string `json:"reason,omitempty"`
+	ReleaseID                   string `json:"releaseId,omitempty"`
+	Scope                       string `json:"scope,omitempty"`
+	Status                      string `json:"status"`
+	Url                         string `json:"url,omitempty"`
 }
 
 type LoginRequest struct {

@@ -1,8 +1,9 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { APIError, api, type Application, type ApplicationConfiguration, type Deployment, type DeploymentPlanRevision } from "./api";
+import { APIError, api, localRouteObservationFresh, verifiedLocalRouteURL, type Application, type ApplicationConfiguration, type Deployment, type DeploymentPlanRevision } from "./api";
 import { ApplicationConfigurationPanel } from "./application-configuration";
+import { useLocalRouteExpiry } from "./use-local-route-expiry";
 
 type SetupStep = "configuration" | "access" | "review" | "result";
 type RevisionPins = { planId: string; planNumber: number; configurationId: string; configurationNumber: number };
@@ -84,6 +85,21 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
   const deployments = useQuery({ queryKey: ["deployments", app.id], queryFn: () => api.deployments(app.id), enabled: step === "result" && Boolean(jobId), refetchInterval: (query) => step === "result" && jobId && !(job && terminalStatuses.has(job.status) && job.status !== "succeeded") && !query.state.data?.items.some((item) => item.jobId === jobId && terminalStatuses.has(item.status)) ? 1500 : false, retry: false });
   const deployment = deployments.data?.items.find((item) => item.jobId === jobId);
   const reviewedPinMatch = deploymentMatchesReviewedPins(deployment, attempt.current);
+  const routeEligible = step === "result" && job?.status === "succeeded" &&
+    deployment?.status === "succeeded" && reviewedPinMatch === true;
+  const localRoute = useQuery({
+    queryKey: ["local-route", app.id, deployment?.id ?? ""],
+    queryFn: () => api.localRoute(app.id),
+    enabled: routeEligible,
+    retry: false,
+    refetchOnMount: "always",
+    refetchOnWindowFocus: false,
+  });
+  useLocalRouteExpiry(localRoute.data?.observedAt);
+  const attestedURL = routeEligible && localRoute.isSuccess && !localRoute.isFetching
+    ? verifiedLocalRouteURL(localRoute.data, app.id, deployment)
+    : null;
+  const routeExpired = localRoute.isSuccess && localRoute.data?.status === "verified" && !localRouteObservationFresh(localRoute.data);
   const migrationPending = Boolean(plan.data?.migration.present && plan.data.migration.approvalStatus !== "approved");
   const configurationReady = Boolean(plan.data && configuration.data && configurationMatchesPlan(configuration.data, plan.data));
   const uncertainPreviousAttempt = Boolean(attempt.current && !attempt.current.jobId && attempt.current.signature !== signature);
@@ -91,6 +107,11 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
   const canDeploy = !lookupPending && !uncertainPreviousAttempt && !unpinnedPreviousAttempt && !plan.isError && !configuration.isError && !status.isError && plan.data?.state === "accepted" && plan.data?.strategy === "generated_node" && Boolean(plan.data.revisionId) && configurationReady && !migrationPending && status.data?.capabilities.generatedRuntime === true && status.data.capabilities.fakeRuntime !== true;
   const showingKnownJob = step === "result" && Boolean(jobId);
   const setupLoaded = Boolean(plan.data && configuration.data && status.data);
+
+  const checkLocalRoute = async () => {
+    if (localRoute.isFetching) return;
+    await localRoute.refetch();
+  };
 
   useEffect(() => {
     if (!signature) return;
@@ -157,6 +178,7 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
       }
       setRequestError("");
       setJobId(result.job.id);
+      client.removeQueries({ queryKey: ["local-route", app.id] });
       client.setQueryData(["job", result.job.id], result.job);
       setStep("result");
       void Promise.allSettled([client.invalidateQueries({ queryKey: ["job", result.job.id] }), client.invalidateQueries({ queryKey: ["deployments", app.id] }), client.invalidateQueries({ queryKey: ["jobs"] })]);
@@ -185,6 +207,7 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
   };
   const startNewAttempt = () => {
     attempt.current = null;
+    client.removeQueries({ queryKey: ["local-route", app.id] });
     window.sessionStorage.removeItem(attemptStorageKey(app.id));
     setJobId("");
     setRequestError("");
@@ -208,6 +231,7 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
         setPersistenceError("This browser could not save the recovered job ID for reload. Keep this page open or use application history to find the job.");
       }
       client.setQueryData(["job", found.id], found);
+      client.removeQueries({ queryKey: ["local-route", app.id] });
       setJobId(found.id);
       setRequestError("");
       setStep("result");
@@ -234,7 +258,7 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
     if (job.status === "succeeded" && deployment?.status === "succeeded") {
       if (reviewedPinMatch === false) return "The controller recorded success, but the deployed plan or configuration differs from the revision reviewed here. Check deployment history before relying on this route.";
       if (reviewedPinMatch === null) return "The controller recorded success, but this setup cannot verify which plan and configuration revisions were deployed. Check deployment history.";
-      return "The controller recorded a successful job and deployment for the reviewed revisions. An attested access URL is not available from this API.";
+      return "The controller recorded a successful job and deployment for the reviewed revisions.";
     }
     if (terminalStatuses.has(job.status) && job.status !== "succeeded") return job.errorDetail || deployment?.failureSummary || `The job ended with status ${job.status}.`;
     if (job.status === "waiting_user") return "Deployment needs your action. Open the application to review the required approval or recovery step.";
@@ -265,7 +289,7 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
       </>}
       {step === "access" && <section aria-labelledby="setup-access-title">
         <h2 id="setup-access-title" ref={heading} tabIndex={-1}>Access</h2>
-        <div className="callout info"><strong>Local controller route</strong><span>Rig will route this deployment through the controller's local Caddy runtime. Public domain setup and an attested external URL are not available in this flow.</span></div>
+        <div className="callout info"><strong>Local controller route</strong><span>After deployment, Rig can show a verified URL on the controller host when its local Caddy route is healthy. This flow does not set up a public domain.</span></div>
         <p>Keep external database credentials in server runtime secrets for the selected component. Rig does not provision a database.</p>
         <div className="setup-actions"><button className="button" type="button" onClick={() => setStep("configuration")}>Back to configuration</button><button className="button primary" type="button" onClick={() => setStep("review")}>Review deployment</button></div>
       </section>}
@@ -286,6 +310,18 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
         <p className="mono">Job {jobId}</p>
         {persistenceError && <div className="callout warning" role="alert">{persistenceError}</div>}
         <div className={reviewedPinMatch === false || job && (job.status === "waiting_user" || terminalStatuses.has(job.status) && job.status !== "succeeded") ? "callout warning" : "callout info"} role="status" aria-live="polite"><strong>{job ? `Job ${job.status}` : "Checking job"}</strong><span>{resultMessage}</span></div>
+        {routeEligible && <section className="callout info" aria-label="Controller-host route" aria-busy={localRoute.isFetching}>
+          <strong>Controller-host route</strong>
+          <span role="status" aria-live="polite">{attestedURL ? `Verified local route for this deployment. Accessible only from the controller host. Verified at ${localRoute.data?.observedAt}.`
+            : localRoute.isFetching || localRoute.isPending ? "Checking the local route before showing an address…"
+              : localRoute.isError ? "Rig could not verify the local route."
+                : routeExpired ? "The local route verification expired. Check the route again before opening it."
+                : `${localRoute.data?.status === "verified" ? "A different deployment is serving at the local route." : "No verified local route is available for this deployment."} Check application history for the current serving deployment.`}</span>
+          <a role="link" tabIndex={0} href={attestedURL ?? undefined} target="_blank" rel="noopener noreferrer" aria-disabled={!attestedURL}
+            onClick={(event) => { if (!attestedURL) event.preventDefault(); }}
+            onKeyDown={(event) => { if (!attestedURL && (event.key === "Enter" || event.key === " ")) event.preventDefault(); }}>Open verified local site</a>
+          <button className="button small" type="button" aria-disabled={localRoute.isFetching} onClick={() => void checkLocalRoute()}>Check route again</button>
+        </section>}
         {deployment && <dl className="setup-facts"><div><dt>Deployment ID</dt><dd className="mono">{deployment.id}</dd></div><div><dt>Deployment status</dt><dd>{deployment.status}</dd></div>{deployment.releaseId && <div><dt>Release ID</dt><dd className="mono">{deployment.releaseId}</dd></div>}<div><dt>Plan revision</dt><dd>{deployment.deploymentPlanRevisionNumber}</dd></div><div><dt>Configuration revision</dt><dd>{deployment.actualConfigurationRevisionNumber}</dd></div></dl>}
         {jobQuery.isError || deployments.isError ? <button className="button" type="button" onClick={() => void Promise.all([jobQuery.refetch(), deployments.refetch()])}>Retry status check</button> : null}
         <div className="setup-actions"><Link className="button primary" to={`/apps/${app.id}`}>Open application and history</Link>{job && terminalStatuses.has(job.status) && <button className="button" type="button" onClick={startNewAttempt}>Review a new deployment</button>}</div>
