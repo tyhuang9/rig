@@ -442,7 +442,8 @@ export const api = {
       headers: { "Idempotency-Key": idempotencyKey },
     }),
   deploymentJobByIdempotency: (appId: string, idempotencyKey: string) =>
-    request<Job>(`/api/v1/apps/${encodeURIComponent(appId)}/deployment-jobs/by-idempotency`, {
+    request<Job>(operationPath(operations.getDeploymentJobByIdempotency.path, { appId }), {
+      method: operations.getDeploymentJobByIdempotency.method,
       headers: { "Idempotency-Key": idempotencyKey },
       cache: "no-store",
     }),

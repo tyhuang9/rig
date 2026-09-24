@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { APIError, api, type Application, type ApplicationConfiguration, type Deployment, type DeploymentPlanRevision } from "./api";
@@ -73,6 +73,7 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
   const [persistenceError, setPersistenceError] = useState("");
   const [lookupPending, setLookupPending] = useState(false);
   const [lookupMessage, setLookupMessage] = useState("");
+  const recoveryId = useId();
   const heading = useRef<HTMLHeadingElement>(null);
   const plan = useQuery({ queryKey: ["deployment-plan", app.id], queryFn: () => api.deploymentPlan(app.id), retry: false });
   const configuration = useQuery({ queryKey: ["app-configuration", app.id], queryFn: () => api.applicationConfiguration(app.id), retry: false });
@@ -194,7 +195,7 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
   };
   const findSubmittedJob = async () => {
     const saved = attempt.current;
-    if (!saved || saved.jobId || lookupPending) return;
+    if (!saved || saved.jobId || lookupPending || deploy.isPending) return;
     setLookupPending(true);
     setLookupMessage("");
     try {
@@ -272,9 +273,8 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
         <h2 id="setup-review-title" ref={heading} tabIndex={-1}>Review and deploy</h2>
         <dl className="setup-facts"><div><dt>Application</dt><dd>{app.name}</dd></div><div><dt>Source</dt><dd>{sourceLabel}</dd></div><div><dt>Accepted plan</dt><dd>Revision {plan.data?.revisionNumber ?? "unavailable"}</dd></div><div><dt>Scoped configuration</dt><dd>Revision {configuration.data?.revisionNumber ?? "unavailable"}</dd></div><div><dt>Migration</dt><dd>{plan.data?.migration.present ? migrationPending ? "Approval required" : "Approved for this plan" : "None"}</dd></div><div><dt>Access</dt><dd>Local controller route</dd></div></dl>
         {!configurationReady && <div className="callout warning" role="alert">Configuration no longer matches this accepted plan. Review its scopes again before deploying.</div>}
-        {uncertainPreviousAttempt && <div className="callout warning" role="alert"><strong>Previous deployment request is unresolved.</strong><span>The setup changed after Rig sent a request. Its request key is preserved. Review the application history before starting another deployment.</span><Link className="button small" to={`/apps/${app.id}`}>Open application history</Link>{!deploy.isPending && <button className="button small" type="button" onClick={() => setRecoveryOpen(true)}>Resolve uncertain request</button>}{recoveryOpen && <div className="setup-recovery"><p>Rig cannot prove from this page whether the earlier request created a job. Starting again may queue another deployment. Check durable activity and deployment history first.</p><label><input type="checkbox" checked={recoveryAcknowledged} onChange={(event) => setRecoveryAcknowledged(event.target.checked)}/> I checked application history and accept the risk of another deployment job.</label><button className="button small" type="button" disabled={!recoveryAcknowledged || deploy.isPending} onClick={resetUnresolvedAttempt}>Start a new setup request</button></div>}</div>}
-        {unpinnedPreviousAttempt && <div className="callout warning" role="alert">This browser saved a request before exact revision pinning was available. Find its job before starting a new request.</div>}
-        {attempt.current && !attempt.current.jobId && <div className="setup-recovery"><button className="button small" type="button" disabled={lookupPending || deploy.isPending} onClick={() => void findSubmittedJob()}>{lookupPending ? "Finding submitted job…" : "Find submitted job"}</button>{lookupMessage && <p role="status">{lookupMessage}</p>}</div>}
+        {(uncertainPreviousAttempt || unpinnedPreviousAttempt) && <div className="callout warning" role="alert"><strong>Previous deployment request is unresolved.</strong><span>{unpinnedPreviousAttempt ? "This browser saved a request before exact revision pinning was available." : "The setup changed after Rig sent a request."} Its request key is preserved. Find its job before starting another deployment.</span><Link className="button small" to={`/apps/${app.id}`}>Open application history</Link>{!deploy.isPending && <button className="button small" type="button" aria-expanded={recoveryOpen} aria-controls={recoveryOpen ? recoveryId : undefined} onClick={() => setRecoveryOpen((open) => !open)}>Resolve uncertain request</button>}{recoveryOpen && <div className="setup-recovery" id={recoveryId}><p>Rig cannot prove from this page whether the earlier request created a job. Starting again may queue another deployment. Check durable activity and deployment history first.</p><label><input type="checkbox" checked={recoveryAcknowledged} onChange={(event) => setRecoveryAcknowledged(event.target.checked)}/> I checked application history and accept the risk of another deployment job.</label><button className="button small" type="button" disabled={!recoveryAcknowledged || deploy.isPending} onClick={resetUnresolvedAttempt}>Start a new setup request</button></div>}</div>}
+        {attempt.current && !attempt.current.jobId && <div className="setup-recovery"><button className="button small" type="button" aria-disabled={lookupPending || deploy.isPending} onClick={() => void findSubmittedJob()}>{lookupPending ? "Finding submitted job…" : "Find submitted job"}</button><p role="status" aria-live="polite">{lookupPending ? "Checking the saved deployment request…" : lookupMessage}</p></div>}
         {migrationPending && <div className="callout warning" role="alert">The database migration needs separate approval in the application plan. Deployment is disabled until it is approved.</div>}
         {!status.data?.capabilities.generatedRuntime && <div className="callout warning" role="alert">The generated runtime is unavailable on this controller.</div>}
         {status.data?.capabilities.fakeRuntime && <div className="callout warning" role="alert">The development fake runtime cannot attest an application deployment.</div>}

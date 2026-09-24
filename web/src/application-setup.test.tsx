@@ -170,7 +170,12 @@ describe("ApplicationDeploymentSetup", () => {
     expect(await screen.findByText("Previous deployment request is unresolved.")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Retry deployment request" }).hasAttribute("disabled")).toBe(true);
     expect(JSON.parse(sessionStorage.getItem("rig-setup-deployment:app-1") || "{}")).toMatchObject({ key: submittedKey });
-    fireEvent.click(screen.getByRole("button", { name: "Resolve uncertain request" }));
+    const disclosure = screen.getByRole("button", { name: "Resolve uncertain request" });
+    expect(disclosure.getAttribute("aria-expanded")).toBe("false");
+    expect(disclosure.hasAttribute("aria-controls")).toBe(false);
+    fireEvent.click(disclosure);
+    expect(disclosure.getAttribute("aria-expanded")).toBe("true");
+    expect(document.getElementById(disclosure.getAttribute("aria-controls") || "")).toBeTruthy();
     expect(screen.getByText(/starting again may queue another deployment/i)).toBeTruthy();
     const reset = screen.getByRole("button", { name: "Start a new setup request" });
     expect(reset.hasAttribute("disabled")).toBe(true);
@@ -189,7 +194,8 @@ describe("ApplicationDeploymentSetup", () => {
     renderSetup();
     expect(await screen.findByText("Previous deployment request is unresolved.")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Find submitted job" }));
-    expect(await screen.findByRole("heading", { name: "Deployment job" })).toBeTruthy();
+    const resultHeading = await screen.findByRole("heading", { name: "Deployment job" });
+    await waitFor(() => expect(document.activeElement).toBe(resultHeading));
     expect(lookup).toHaveBeenCalledWith("app-1", "prior-key");
     expect(deploy).not.toHaveBeenCalled();
     expect(JSON.parse(sessionStorage.getItem("rig-setup-deployment:app-1") || "{}")).toMatchObject({ key: "prior-key", jobId: "job-1" });
@@ -206,12 +212,34 @@ describe("ApplicationDeploymentSetup", () => {
     expect(screen.getByRole("button", { name: "Deploy application" }).hasAttribute("disabled")).toBe(true);
   });
 
+  it("keeps lookup focus and announces its progress and failed result", async () => {
+    sessionStorage.setItem("rig-setup-deployment:app-1", JSON.stringify({ signature: "plan-1:2:config-1:3", key: "prior-key", reviewedPins }));
+    const response = deferred<Awaited<ReturnType<typeof api.deploymentJobByIdempotency>>>();
+    vi.spyOn(api, "deploymentJobByIdempotency").mockReturnValue(response.promise);
+    renderSetup();
+    const lookup = await screen.findByRole("button", { name: "Find submitted job" });
+    lookup.focus();
+    expect(document.activeElement).toBe(lookup);
+    fireEvent.click(lookup);
+    expect(await screen.findByRole("status", { name: "" })).toHaveProperty("textContent", "Checking the saved deployment request…");
+    expect(lookup.getAttribute("aria-disabled")).toBe("true");
+    expect(document.activeElement).toBe(lookup);
+    await act(async () => response.reject(new Error("Connection interrupted")));
+    expect(await screen.findByText(/could not check the submitted request/i)).toBeTruthy();
+    expect(document.activeElement).toBe(lookup);
+    expect(lookup.getAttribute("aria-disabled")).toBe("false");
+  });
+
   it("requires lookup for a saved request that predates reviewed revision pins", async () => {
     sessionStorage.setItem("rig-setup-deployment:app-1", JSON.stringify({ signature: "plan-1:2:config-1:3", key: "legacy-key" }));
     renderSetup();
     expect(await screen.findByText(/before exact revision pinning was available/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Deploy application" }).hasAttribute("disabled")).toBe(true);
     expect(screen.getByRole("button", { name: "Find submitted job" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Resolve uncertain request" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /i checked application history/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Start a new setup request" }));
+    expect(sessionStorage.getItem("rig-setup-deployment:app-1")).toBeNull();
   });
 
   it("shows a known job even when the current plan, configuration, and status cannot load", async () => {

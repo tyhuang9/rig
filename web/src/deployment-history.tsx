@@ -648,6 +648,7 @@ export function DeploymentHistoryPanel({
   const deployLatest = () => {
     const key = `latest:${appId}`;
     if (
+      currentStrategy === "generated_node" ||
       inFlight.current.has(key) ||
       hasPendingMutationForCurrentApp() ||
       !latestRuntimeAvailable
@@ -744,17 +745,21 @@ export function DeploymentHistoryPanel({
             work.
           </p>
         </div>
-        <button
-          type="button"
-          className="button primary"
-          disabled={panelMutationPending || !latestRuntimeAvailable}
-          aria-describedby={
-            !latestRuntimeAvailable ? "deploy-latest-availability" : undefined
-          }
-          onClick={deployLatest}
-        >
-          {currentPending ? "Queuing..." : "Deploy latest"}
-        </button>
+        {currentStrategy === "generated_node" && latestRuntimeAvailable ? (
+          <a className="button primary" href={`/apps/${encodeURIComponent(appId)}/setup`}>Review and deploy latest</a>
+        ) : (
+          <button
+            type="button"
+            className="button primary"
+            disabled={panelMutationPending || !latestRuntimeAvailable}
+            aria-describedby={
+              !latestRuntimeAvailable ? "deploy-latest-availability" : undefined
+            }
+            onClick={deployLatest}
+          >
+            {currentPending ? "Queuing..." : "Deploy latest"}
+          </button>
+        )}
       </div>
       {deploymentPlan.isError ? (
         <div
