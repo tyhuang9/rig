@@ -248,6 +248,28 @@ describe("API client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(8, "/api/v1/jobs/job%2Fone/resume", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
   });
 
+  it("sends reviewed revision pins and looks up only the exact deployment request key", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ created: true, job: { id: "job-1" } }), { status: 202 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "job-1", status: "queued" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const expected = {
+      expectedPlanRevisionId: "plan-1", expectedPlanRevisionNumber: 2,
+      expectedConfigurationRevisionId: "config-1", expectedConfigurationRevisionNumber: 3,
+    };
+
+    await api.deployApplication("app/one", "retry-key", expected);
+    await api.deploymentJobByIdempotency("app/one", "retry-key");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/apps/app%2Fone/deployments", expect.objectContaining({
+      method: "POST", body: JSON.stringify(expected),
+      headers: expect.objectContaining({ "Idempotency-Key": "retry-key", "X-CSRF-Token": "csrf-token" }),
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/apps/app%2Fone/deployment-jobs/by-idempotency", expect.objectContaining({
+      cache: "no-store", headers: expect.objectContaining({ "Idempotency-Key": "retry-key" }),
+    }));
+  });
+
   it("reads an exact durable job and clears setup attempts on sign out", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: "job-1", status: "succeeded" }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { api, type Application, type ApplicationConfiguration, type Deployment, type DeploymentPlanRevision } from "./api";
+import { APIError, api, type Application, type ApplicationConfiguration, type Deployment, type DeploymentPlanRevision } from "./api";
 import { ApplicationConfigurationPanel } from "./application-configuration";
 
 type SetupStep = "configuration" | "access" | "review" | "result";
@@ -17,8 +17,16 @@ function attemptStorageKey(appId: string) {
 function readAttempt(appId: string): DeploymentAttempt | null {
   try {
     const value = JSON.parse(window.sessionStorage.getItem(attemptStorageKey(appId)) || "null");
-    return value && typeof value.signature === "string" && typeof value.key === "string" &&
-      (value.jobId === undefined || typeof value.jobId === "string") ? value as DeploymentAttempt : null;
+    if (!value || typeof value.signature !== "string" || typeof value.key !== "string" ||
+        value.jobId !== undefined && typeof value.jobId !== "string") return null;
+    const pins = value.reviewedPins;
+    if (pins !== undefined && (!pins || typeof pins.planId !== "string" || !pins.planId ||
+        !Number.isSafeInteger(pins.planNumber) || pins.planNumber < 1 ||
+        typeof pins.configurationId !== "string" || !Number.isSafeInteger(pins.configurationNumber) ||
+        pins.configurationNumber < 0 || Boolean(pins.configurationId) !== Boolean(pins.configurationNumber))) {
+      delete value.reviewedPins;
+    }
+    return value as DeploymentAttempt;
   } catch {
     return null;
   }
@@ -63,6 +71,8 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [recoveryAcknowledged, setRecoveryAcknowledged] = useState(false);
   const [persistenceError, setPersistenceError] = useState("");
+  const [lookupPending, setLookupPending] = useState(false);
+  const [lookupMessage, setLookupMessage] = useState("");
   const heading = useRef<HTMLHeadingElement>(null);
   const plan = useQuery({ queryKey: ["deployment-plan", app.id], queryFn: () => api.deploymentPlan(app.id), retry: false });
   const configuration = useQuery({ queryKey: ["app-configuration", app.id], queryFn: () => api.applicationConfiguration(app.id), retry: false });
@@ -76,7 +86,8 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
   const migrationPending = Boolean(plan.data?.migration.present && plan.data.migration.approvalStatus !== "approved");
   const configurationReady = Boolean(plan.data && configuration.data && configurationMatchesPlan(configuration.data, plan.data));
   const uncertainPreviousAttempt = Boolean(attempt.current && !attempt.current.jobId && attempt.current.signature !== signature);
-  const canDeploy = !uncertainPreviousAttempt && !plan.isError && !configuration.isError && !status.isError && plan.data?.state === "accepted" && plan.data?.strategy === "generated_node" && Boolean(plan.data.revisionId) && configurationReady && !migrationPending && status.data?.capabilities.generatedRuntime === true && status.data.capabilities.fakeRuntime !== true;
+  const unpinnedPreviousAttempt = Boolean(attempt.current && !attempt.current.jobId && !attempt.current.reviewedPins);
+  const canDeploy = !lookupPending && !uncertainPreviousAttempt && !unpinnedPreviousAttempt && !plan.isError && !configuration.isError && !status.isError && plan.data?.state === "accepted" && plan.data?.strategy === "generated_node" && Boolean(plan.data.revisionId) && configurationReady && !migrationPending && status.data?.capabilities.generatedRuntime === true && status.data.capabilities.fakeRuntime !== true;
   const showingKnownJob = step === "result" && Boolean(jobId);
   const setupLoaded = Boolean(plan.data && configuration.data && status.data);
 
@@ -127,7 +138,13 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
         saveAttempt(app.id, attempt.current);
       }
       const submittedAttempt = attempt.current;
-      const result = await api.deployApplication(app.id, submittedAttempt.key);
+      if (!submittedAttempt?.reviewedPins) throw new Error("The earlier request has no reviewed revision pins. Find its job before starting another request.");
+      const result = await api.deployApplication(app.id, submittedAttempt.key, {
+        expectedPlanRevisionId: submittedAttempt.reviewedPins.planId,
+        expectedPlanRevisionNumber: submittedAttempt.reviewedPins.planNumber,
+        expectedConfigurationRevisionId: submittedAttempt.reviewedPins.configurationId,
+        expectedConfigurationRevisionNumber: submittedAttempt.reviewedPins.configurationNumber,
+      });
       return { result, submittedAttempt };
     },
     onSuccess: ({ result, submittedAttempt }) => {
@@ -172,7 +189,35 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
     setRequestError("");
     setRecoveryOpen(false);
     setRecoveryAcknowledged(false);
+    setLookupMessage("");
     setStep("review");
+  };
+  const findSubmittedJob = async () => {
+    const saved = attempt.current;
+    if (!saved || saved.jobId || lookupPending) return;
+    setLookupPending(true);
+    setLookupMessage("");
+    try {
+      const found = await api.deploymentJobByIdempotency(app.id, saved.key);
+      if (attempt.current?.key !== saved.key) return;
+      attempt.current = { ...saved, jobId: found.id };
+      try {
+        saveAttempt(app.id, attempt.current);
+      } catch {
+        setPersistenceError("This browser could not save the recovered job ID for reload. Keep this page open or use application history to find the job.");
+      }
+      client.setQueryData(["job", found.id], found);
+      setJobId(found.id);
+      setRequestError("");
+      setStep("result");
+    } catch (error) {
+      if (attempt.current?.key !== saved.key) return;
+      setLookupMessage(error instanceof APIError && error.status === 404
+        ? "No matching job is recorded yet. The request may still be in flight; keep this request key and check again before starting a new request."
+        : "Rig could not check the submitted request. Keep this request key and retry the lookup.");
+    } finally {
+      setLookupPending(false);
+    }
   };
   const resetUnresolvedAttempt = () => {
     if (!recoveryAcknowledged || deploy.isPending) return;
@@ -228,6 +273,8 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
         <dl className="setup-facts"><div><dt>Application</dt><dd>{app.name}</dd></div><div><dt>Source</dt><dd>{sourceLabel}</dd></div><div><dt>Accepted plan</dt><dd>Revision {plan.data?.revisionNumber ?? "unavailable"}</dd></div><div><dt>Scoped configuration</dt><dd>Revision {configuration.data?.revisionNumber ?? "unavailable"}</dd></div><div><dt>Migration</dt><dd>{plan.data?.migration.present ? migrationPending ? "Approval required" : "Approved for this plan" : "None"}</dd></div><div><dt>Access</dt><dd>Local controller route</dd></div></dl>
         {!configurationReady && <div className="callout warning" role="alert">Configuration no longer matches this accepted plan. Review its scopes again before deploying.</div>}
         {uncertainPreviousAttempt && <div className="callout warning" role="alert"><strong>Previous deployment request is unresolved.</strong><span>The setup changed after Rig sent a request. Its request key is preserved. Review the application history before starting another deployment.</span><Link className="button small" to={`/apps/${app.id}`}>Open application history</Link>{!deploy.isPending && <button className="button small" type="button" onClick={() => setRecoveryOpen(true)}>Resolve uncertain request</button>}{recoveryOpen && <div className="setup-recovery"><p>Rig cannot prove from this page whether the earlier request created a job. Starting again may queue another deployment. Check durable activity and deployment history first.</p><label><input type="checkbox" checked={recoveryAcknowledged} onChange={(event) => setRecoveryAcknowledged(event.target.checked)}/> I checked application history and accept the risk of another deployment job.</label><button className="button small" type="button" disabled={!recoveryAcknowledged || deploy.isPending} onClick={resetUnresolvedAttempt}>Start a new setup request</button></div>}</div>}
+        {unpinnedPreviousAttempt && <div className="callout warning" role="alert">This browser saved a request before exact revision pinning was available. Find its job before starting a new request.</div>}
+        {attempt.current && !attempt.current.jobId && <div className="setup-recovery"><button className="button small" type="button" disabled={lookupPending || deploy.isPending} onClick={() => void findSubmittedJob()}>{lookupPending ? "Finding submitted job…" : "Find submitted job"}</button>{lookupMessage && <p role="status">{lookupMessage}</p>}</div>}
         {migrationPending && <div className="callout warning" role="alert">The database migration needs separate approval in the application plan. Deployment is disabled until it is approved.</div>}
         {!status.data?.capabilities.generatedRuntime && <div className="callout warning" role="alert">The generated runtime is unavailable on this controller.</div>}
         {status.data?.capabilities.fakeRuntime && <div className="callout warning" role="alert">The development fake runtime cannot attest an application deployment.</div>}

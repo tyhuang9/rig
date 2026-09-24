@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api, type Application, type ApplicationConfiguration, type DeploymentPlanRevision } from "./api";
+import { APIError, api, type Application, type ApplicationConfiguration, type DeploymentPlanRevision } from "./api";
 import { ApplicationDeploymentSetup } from "./application-setup";
 
 vi.mock("./application-configuration", () => ({
@@ -61,6 +61,11 @@ describe("ApplicationDeploymentSetup", () => {
     expect(deploy).toHaveBeenCalledTimes(2);
     expect(deploy.mock.calls[0][1]).toBe(deploy.mock.calls[1][1]);
     expect(deploy.mock.calls[0][1]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(deploy.mock.calls[0][2]).toEqual({
+      expectedPlanRevisionId: "plan-1", expectedPlanRevisionNumber: 2,
+      expectedConfigurationRevisionId: "config-1", expectedConfigurationRevisionNumber: 3,
+    });
+    expect(deploy.mock.calls[1][2]).toEqual(deploy.mock.calls[0][2]);
     expect(screen.getByText("deployment-1")).toBeTruthy();
     expect(screen.getByText("release-1")).toBeTruthy();
     expect(screen.queryByRole("link", { name: /visit|open site|live url/i })).toBeNull();
@@ -174,6 +179,39 @@ describe("ApplicationDeploymentSetup", () => {
     expect(await screen.findByRole("heading", { name: "Configure application" })).toBeTruthy();
     expect(sessionStorage.getItem("rig-setup-deployment:app-1")).toBeNull();
     expect(deploy).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers a submitted job by exact request key after setup drift", async () => {
+    sessionStorage.setItem("rig-setup-deployment:app-1", JSON.stringify({ signature: "plan-1:2:config-1:3", key: "prior-key", reviewedPins }));
+    vi.mocked(api.applicationConfiguration).mockResolvedValue({ ...configuration, revisionId: "config-2", revisionNumber: 4 });
+    const lookup = vi.spyOn(api, "deploymentJobByIdempotency").mockResolvedValue(completedJob as never);
+    const deploy = vi.spyOn(api, "deployApplication");
+    renderSetup();
+    expect(await screen.findByText("Previous deployment request is unresolved.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Find submitted job" }));
+    expect(await screen.findByRole("heading", { name: "Deployment job" })).toBeTruthy();
+    expect(lookup).toHaveBeenCalledWith("app-1", "prior-key");
+    expect(deploy).not.toHaveBeenCalled();
+    expect(JSON.parse(sessionStorage.getItem("rig-setup-deployment:app-1") || "{}")).toMatchObject({ key: "prior-key", jobId: "job-1" });
+  });
+
+  it("retains the exact key after a missing-job lookup because the request may still arrive", async () => {
+    sessionStorage.setItem("rig-setup-deployment:app-1", JSON.stringify({ signature: "plan-1:2:config-1:3", key: "prior-key", reviewedPins }));
+    vi.mocked(api.applicationConfiguration).mockResolvedValue({ ...configuration, revisionId: "config-2", revisionNumber: 4 });
+    vi.spyOn(api, "deploymentJobByIdempotency").mockRejectedValue(new APIError({ status: 404, code: "job_not_found", detail: "Job was not found" }));
+    renderSetup();
+    fireEvent.click(await screen.findByRole("button", { name: "Find submitted job" }));
+    expect(await screen.findByText(/request may still be in flight/i)).toBeTruthy();
+    expect(JSON.parse(sessionStorage.getItem("rig-setup-deployment:app-1") || "{}")).toMatchObject({ key: "prior-key" });
+    expect(screen.getByRole("button", { name: "Deploy application" }).hasAttribute("disabled")).toBe(true);
+  });
+
+  it("requires lookup for a saved request that predates reviewed revision pins", async () => {
+    sessionStorage.setItem("rig-setup-deployment:app-1", JSON.stringify({ signature: "plan-1:2:config-1:3", key: "legacy-key" }));
+    renderSetup();
+    expect(await screen.findByText(/before exact revision pinning was available/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Deploy application" }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("button", { name: "Find submitted job" })).toBeTruthy();
   });
 
   it("shows a known job even when the current plan, configuration, and status cannot load", async () => {
