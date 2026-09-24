@@ -16,6 +16,7 @@ import (
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
+	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 )
 
@@ -314,6 +315,8 @@ type fakeRuntime struct {
 	validateCalls int
 	healthErr     error
 	createdSpecs  []generatedruntime.CandidateSpec
+	started       []generatedruntime.Candidate
+	adoptedValues []generatedruntime.Candidate
 	adopted       int
 	stopped       int
 	stopErrs      []error
@@ -346,7 +349,7 @@ func (f *fakeRuntime) CreateInactiveCandidate(_ context.Context, spec generatedr
 	description, _ := generatedruntime.DescribeInactiveCandidate(spec.AppID, spec.ComponentName, spec.ActiveSlot)
 	return generatedruntime.Candidate{
 		AppID: spec.AppID, ReleaseID: spec.ReleaseID, DeploymentID: spec.DeploymentID, ArtifactID: spec.ArtifactID,
-		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, Component: spec.ComponentName, Role: spec.Role, Slot: description.Slot,
+		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, Component: spec.ComponentName, Role: spec.Role, Technology: spec.Technology, Slot: description.Slot,
 		ContainerID: "a" + string(make([]byte, 63)), ContainerName: description.ContainerName,
 		NetworkName: description.NetworkName, NetworkAlias: description.NetworkAlias, InternalPort: spec.InternalPort,
 		ImageContentID: spec.ImageContentID, WorkingDirectory: runtimeWorkingDirectory(spec.RootDirectory), RunCommandDigest: commandDigest(spec.RunCommand),
@@ -354,10 +357,12 @@ func (f *fakeRuntime) CreateInactiveCandidate(_ context.Context, spec generatedr
 }
 func (f *fakeRuntime) AdoptCandidate(candidate generatedruntime.Candidate, _ generatedruntime.ReplacementReservation) (generatedruntime.Candidate, error) {
 	f.adopted++
+	f.adoptedValues = append(f.adoptedValues, candidate)
 	return candidate, nil
 }
-func (f *fakeRuntime) StartCandidate(context.Context, generatedruntime.Candidate) error {
+func (f *fakeRuntime) StartCandidate(_ context.Context, candidate generatedruntime.Candidate) error {
 	*f.events = append(*f.events, "start")
+	f.started = append(f.started, candidate)
 	return nil
 }
 func (f *fakeRuntime) WaitHealthy(context.Context, generatedruntime.Candidate) error {
@@ -761,6 +766,27 @@ func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen
 	}
 }
 
+func TestGeneratedExecutorPassesAcceptedTechnologyToRuntime(t *testing.T) {
+	for _, technology := range []string{"", "node", "nextjs"} {
+		t.Run(technology, func(t *testing.T) {
+			fixture := newExecutorFixture(t, false)
+			if technology != "" {
+				fixture.plan.Plan.SetupVersion = projectanalysis.SetupVersion
+				fixture.plan.Plan.Components[0].InstallDirectory = fixture.plan.Plan.Components[0].RootDirectory
+				fixture.plan.Plan.Components[0].Technology = technology
+				fixture.executor.plans = &fakePlans{revision: fixture.plan}
+			}
+			result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+			if err != nil || result.CompletionCode != "deployment_completed" {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if len(fixture.runtime.createdSpecs) != 1 || fixture.runtime.createdSpecs[0].Technology != technology || len(fixture.runtime.started) != 1 || fixture.runtime.started[0].Technology != technology {
+				t.Fatalf("technology %q: specs=%+v started=%+v", technology, fixture.runtime.createdSpecs, fixture.runtime.started)
+			}
+		})
+	}
+}
+
 func TestGeneratedExecutorUsesCurrentConfigurationOnSameSourceRelease(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
 	const currentConfigurationID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -906,6 +932,10 @@ func TestGeneratedExecutorDoesNotRerunInterruptedMigration(t *testing.T) {
 
 func TestGeneratedExecutorRecoveryAcquiresAndConsumesNewProcessReservation(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
+	fixture.plan.Plan.SetupVersion = projectanalysis.SetupVersion
+	fixture.plan.Plan.Components[0].InstallDirectory = fixture.plan.Plan.Components[0].RootDirectory
+	fixture.plan.Plan.Components[0].Technology = "nextjs"
+	fixture.executor.plans = &fakePlans{revision: fixture.plan}
 	fixture.deployments.deployment = initializedDeployment(deployments.WaitingHealth)
 	description, err := generatedruntime.DescribeInactiveCandidate(testAppID, "api", "")
 	if err != nil {
@@ -931,6 +961,11 @@ func TestGeneratedExecutorRecoveryAcquiresAndConsumesNewProcessReservation(t *te
 	}
 	if fixture.authorization.calls != 1 || fixture.runtime.adopted < 1 || len(fixture.authorization.reservations) != 1 || fixture.authorization.reservations[0].releases != 1 {
 		t.Fatalf("authorization=%d adopted=%d reservations=%+v", fixture.authorization.calls, fixture.runtime.adopted, fixture.authorization.reservations)
+	}
+	for _, candidate := range fixture.runtime.adoptedValues {
+		if candidate.Technology != "nextjs" {
+			t.Fatalf("reconstructed candidate lost accepted technology: %+v", candidate)
+		}
 	}
 }
 

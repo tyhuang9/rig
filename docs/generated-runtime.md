@@ -109,6 +109,29 @@ Caddy listens only on its dedicated IPv4 ingress interface. That interface has g
 
 Runtime containers run as the non-root `node` user, drop all Linux capabilities, set `no-new-privileges`, use a read-only root filesystem plus bounded tmpfs, have no host binds or Docker socket, and use bounded CPU, memory, PIDs, file descriptors, and local logs.
 
+### Next.js runtime cache
+
+An accepted Next.js server gets a separate 32 MiB temporary filesystem at its
+`<component root>/.next/cache` directory. The image build checks that every
+directory in this path is real, including after the runtime-stage copy; it
+rejects a symlink introduced by an install or build command. The container
+remains non-root with a read-only root filesystem. Docker gives this mount to
+the `node` user with `0700` permissions and the runtime checks the exact mount
+on creation, start, health inspection, and recovery. The existing bounded
+`/tmp` mount remains separate. The cache consumes the container's memory limit
+as it fills; it is discarded when the container is removed and is never shared
+between blue and green slots.
+
+This supports ordinary `next start` serving and a small, disposable image
+optimization cache. Applications that require durable ISR output, shared cache
+or cache-tag coordination across replacement slots, or persistent local file
+uploads must supply their own external storage or cache and configure it in
+their application. Rig does not provide or provision that storage. A full
+32 MiB cache can cause cache writes to fail; applications should bound their
+image cache and test their own caching needs. Next.js documents its
+[per-instance self-hosted cache](https://nextjs.org/docs/app/guides/self-hosting)
+and [image disk-cache limit](https://nextjs.org/docs/app/api-reference/components/image).
+
 The trusted Caddy gateway has one explicit exception: it drops all capabilities then adds only `NET_BIND_SERVICE`. The pinned official Caddy binary carries that file capability, so Linux refuses to execute it without the matching bounding-set permission, even on port 8080 ([upstream report](https://github.com/caddyserver/caddy-docker/issues/396)). This permits low-port binding only within Caddy's network namespace; it publishes no additional host ports. Non-root execution, `no-new-privileges`, read-only rootfs, and network isolation remain enforced. Application containers receive no such exception. Remove this compatibility exception when repinning to a verified file-capability-free upstream image. Generated local routes explicitly disable automatic HTTPS.
 
 Pre-release Caddy containers created without this capability or the pinned gateway priority are deliberately rejected as `ingress_drift_detected`, not silently replaced. Existing alpha testers must use a fresh disposable environment or explicitly recreate the exact managed gateway during a planned maintenance window; never remove a serving gateway as an automatic recovery step.
@@ -129,7 +152,7 @@ Defaults are admission limits, not guaranteed steady-state consumption:
 | --- | --- |
 | Controller-managed BuildKit | 3 GiB memory limit, 2 GiB tmpfs state quota, 1 CPU, 512 PIDs, one parallel build |
 | Controller-managed Caddy | 256 MiB memory, 1 CPU, 128 PIDs |
-| Each active component | 512 MiB memory, 1 CPU, 256 PIDs, 64 MiB tmpfs, up to three 10 MiB local log files |
+| Each active component | 512 MiB memory, 1 CPU, 256 PIDs, 64 MiB `/tmp` tmpfs, up to three 10 MiB local log files; Next.js adds a separate 32 MiB cache tmpfs within the same memory limit |
 | Each temporary replacement component | an additional 512 MiB memory and 256 MiB disk admission reservation |
 | Retained source snapshots | 1 GiB per application and 8 GiB globally by default |
 

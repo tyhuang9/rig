@@ -79,6 +79,7 @@ func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *t
 		t.Fatal(err)
 	}
 	spec := candidateSpec()
+	spec.Technology = "nextjs"
 	command := `node server.js && printf '$() ${TOKEN}' \\unicode-✓`
 	spec.RunCommand = command
 	environment := &runtimeFakeEnvironment{path: filepath.Join(root, "runtime.env")}
@@ -174,6 +175,7 @@ func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *t
 	assertArgumentPair(t, create.Args, "--cpus", "0.750")
 	assertArgumentPair(t, create.Args, "--pids-limit", "192")
 	assertArgumentPair(t, create.Args, "--health-cmd", healthCommand)
+	assertArgumentPair(t, create.Args, "--tmpfs", nextCacheDirectory("/workspace/apps/api")+":rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size=33554432")
 	assertArgumentPair(t, create.Args, "--label", "io.rig.role="+RoleServer)
 	if got := create.Args[len(create.Args)-4:]; !reflect.DeepEqual(got, []string{spec.ImageContentID, "/bin/sh", "-lc", command}) {
 		t.Fatalf("runtime command lost exact argument boundaries: %#v", got)
@@ -416,6 +418,64 @@ func TestGeneratedRuntimeHardeningRequiresAliasAndExactTmpfsPolicy(t *testing.T)
 				t.Fatal("unsafe hardening inspection was accepted")
 			}
 		})
+	}
+}
+
+func TestGeneratedRuntimeNextCacheMountRequiresExactPolicy(t *testing.T) {
+	spec := candidateSpec()
+	spec.Technology = "nextjs"
+	candidate := candidateForSpec(spec)
+	cachePath := nextCacheDirectory(candidate.WorkingDirectory)
+	if !matchesCandidateHardening(hardenedInspection(spec, defaultLimits()), candidate, defaultLimits()) {
+		t.Fatal("exact Next.js cache mount was rejected")
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*containerInspection)
+	}{
+		{name: "missing cache", mutate: func(container *containerInspection) { delete(container.Tmpfs, cachePath) }},
+		{name: "wrong owner", mutate: func(container *containerInspection) {
+			container.Tmpfs[cachePath] = strings.Replace(container.Tmpfs[cachePath], "uid=1000", "uid=0", 1)
+		}},
+		{name: "larger cache", mutate: func(container *containerInspection) {
+			container.Tmpfs[cachePath] = strings.Replace(container.Tmpfs[cachePath], "size=33554432", "size=67108864", 1)
+		}},
+		{name: "extra writable path", mutate: func(container *containerInspection) { container.Tmpfs["/workspace/other"] = "rw,size=1024" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			container := hardenedInspection(spec, defaultLimits())
+			test.mutate(&container)
+			if matchesCandidateHardening(container, candidate, defaultLimits()) {
+				t.Fatal("drifted Next.js cache mount was accepted")
+			}
+		})
+	}
+}
+
+func TestGeneratedRuntimeRejectsUnsafeNextCacheRootAndTechnology(t *testing.T) {
+	spec := candidateSpec()
+	spec.Technology = "nextjs"
+	if !validCandidateSpec(spec) || !validCandidate(candidateForSpec(spec)) {
+		t.Fatal("valid Next.js candidate was rejected")
+	}
+	for _, root := range []string{"api:rw", "apps/api:rw,noexec", "../api"} {
+		invalid := spec
+		invalid.RootDirectory = root
+		if validCandidateSpec(invalid) {
+			t.Fatalf("unsafe Next.js mount root %q accepted", root)
+		}
+	}
+	invalid := candidateForSpec(spec)
+	invalid.WorkingDirectory = "/workspace/api:rw"
+	if validCandidate(invalid) {
+		t.Fatal("unsafe recovered Next.js mount root accepted")
+	}
+	for _, technology := range []string{"unknown", "NextJS", "static"} {
+		invalid := spec
+		invalid.Technology = technology
+		if validCandidateSpec(invalid) {
+			t.Fatalf("invalid server technology %q accepted", technology)
+		}
 	}
 }
 
@@ -962,7 +1022,7 @@ func candidateForSpec(spec CandidateSpec) Candidate {
 	return Candidate{
 		AppID: spec.AppID, ReleaseID: spec.ReleaseID, DeploymentID: spec.DeploymentID,
 		ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID,
-		Component: spec.ComponentName, Role: spec.Role, Slot: slot, ContainerID: testContainerID,
+		Component: spec.ComponentName, Role: spec.Role, Technology: spec.Technology, Slot: slot, ContainerID: testContainerID,
 		ContainerName: containerName(spec.AppID, spec.ComponentName, slot), NetworkName: networkName(spec.AppID),
 		NetworkAlias: containerAlias(spec.ComponentName, slot), InternalPort: spec.InternalPort,
 		ImageContentID: spec.ImageContentID, WorkingDirectory: runtimeWorkingDirectory(spec.RootDirectory), RunCommandDigest: sha256Hex(spec.RunCommand),
@@ -1096,7 +1156,7 @@ func validImageInspection(spec CandidateSpec) imageInspection {
 func hardenedInspection(spec CandidateSpec, limits ContainerLimits) containerInspection {
 	slot, _ := InactiveSlot(spec.ActiveSlot)
 	network := networkName(spec.AppID)
-	return containerInspection{
+	inspection := containerInspection{
 		ID: testContainerID, Name: "/" + containerName(spec.AppID, spec.ComponentName, slot), Image: spec.ImageContentID,
 		Labels: runtimeLabels(spec, slot), User: containerUser, WorkingDirectory: runtimeWorkingDirectory(spec.RootDirectory),
 		Command: []string{"/bin/sh", "-lc", spec.RunCommand}, HealthTest: []string{"CMD-SHELL", healthCommand},
@@ -1107,6 +1167,10 @@ func hardenedInspection(spec CandidateSpec, limits ContainerLimits) containerIns
 		LogType: "local", LogConfig: map[string]string{"max-size": limits.LogSize, "max-file": stringInt(int64(limits.LogFiles))}, Restart: "no",
 		Networks: map[string]networkAttachmentInspection{network: {Aliases: []string{containerAlias(spec.ComponentName, slot)}}},
 	}
+	if spec.Technology == "nextjs" {
+		inspection.Tmpfs[nextCacheDirectory(runtimeWorkingDirectory(spec.RootDirectory))] = "rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size=" + stringInt(nextCacheTmpfsBytes)
+	}
+	return inspection
 }
 
 func configuredInspection(spec CandidateSpec, limits ContainerLimits) containerInspection {

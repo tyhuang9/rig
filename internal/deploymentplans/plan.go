@@ -238,8 +238,12 @@ func canonicalPlanWithLegacyMigration(plan Plan, allowLegacyMigration bool) (Pla
 		}
 		if plan.SetupVersion != 0 {
 			role := "server"
-			if component.Technology == "static" {
+			switch component.Technology {
+			case "node", "nextjs":
+			case "static":
 				role = "static"
+			default:
+				return Plan{}, invalid("components", "Technology must be node, nextjs, or static")
 			}
 			if component.InstallDirectory != component.RootDirectory || component.Role != role || (role == "static" && component.RunCommand != projectanalysis.ManagedStaticCommand(component.StaticOutputDirectory, int(component.InternalPort))) {
 				return Plan{}, invalid("components", "Technology and execution fields must agree")
