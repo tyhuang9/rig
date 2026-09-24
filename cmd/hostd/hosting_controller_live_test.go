@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
@@ -200,7 +202,9 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans,
-	}, runtimeCompositionOptions{dockerExecutable: docker})
+	}, runtimeCompositionOptions{dockerExecutable: docker, runner: &controllerJourneyHealthObserver{
+		delegate: runtimeprocess.ExecRunner{}, test: t, last: make(map[string]string),
+	}})
 	if err != nil {
 		t.Fatal("compose production generated runtime:", err)
 	}
@@ -611,6 +615,41 @@ func TestControllerJourneyStageSource(t *testing.T) {
 			t.Fatal("unexpected source link was accepted")
 		}
 	}
+}
+
+// Record only Docker's component health transitions. Runtime command output
+// and healthcheck logs may contain application secrets and are never logged.
+type controllerJourneyHealthObserver struct {
+	delegate runtimeprocess.CommandRunner
+	test     *testing.T
+	mu       sync.Mutex
+	last     map[string]string
+}
+
+func (observer *controllerJourneyHealthObserver) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	result, err := observer.delegate.Run(ctx, request)
+	if err != nil || len(request.Args) < 4 || request.Args[0] != "container" || request.Args[1] != "inspect" {
+		return result, err
+	}
+	var state struct {
+		Name     string            `json:"name"`
+		Labels   map[string]string `json:"labels"`
+		Running  bool              `json:"running"`
+		ExitCode int               `json:"exitCode"`
+		Health   string            `json:"health"`
+	}
+	if json.Unmarshal(result.Stdout, &state) != nil || state.Labels["io.rig.managed"] != "generated-runtime" {
+		return result, err
+	}
+	status := fmt.Sprintf("running=%t health=%s exit=%d", state.Running, state.Health, state.ExitCode)
+	observer.mu.Lock()
+	previous := observer.last[state.Name]
+	observer.last[state.Name] = status
+	observer.mu.Unlock()
+	if previous != status {
+		observer.test.Logf("Docker candidate %s %s", state.Labels["io.rig.component"], status)
+	}
+	return result, err
 }
 
 func controllerJourneyDocker(ctx context.Context, docker string, extraEnv []string, args ...string) ([]byte, error) {

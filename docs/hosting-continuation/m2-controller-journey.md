@@ -41,7 +41,12 @@ head `58389f4`) reached the durable deployment job but failed with
 found that the workflow's pnpm install leaves package links under the fixture's
 `node_modules`; the local release materializer correctly rejects links. The
 controller test now stages a clean fixture source, keeping the installed copy
-only for application-owned schema preparation. The hosted rerun is pending.
+only for application-owned schema preparation. The second hosted run
+([workflow 36033350599](https://github.com/tyhuang9/rig/actions/runs/36033350599),
+head `1e429d0`) reached real image builds and container readiness, then failed
+with `health_failed`. Its cleanup step passed. The next run records only
+component names and Docker health transitions to identify the failing
+component without exposing application output or secret values.
 
 The QA and security reviews of the controller harness found no confirmed
 exploit. Their actionable gaps were addressed: the deployed API now probes
