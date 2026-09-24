@@ -69,8 +69,9 @@ jobs:
           output="$(mktemp)"
           trap 'rm -f "$output"' EXIT
           test_name='TestLiveControllerGeneratedDeploymentJourney'
+          test_pattern='^Test(ControllerJourneyStageSource|LiveControllerGeneratedDeploymentJourney)$'
           package_name='github.com/hostd/hostd/cmd/hostd'
-          go test -tags live_docker -json -v -count=1 -timeout=29m ./cmd/hostd -run "^${test_name}$" | tee "$output"
+          go test -tags live_docker -json -v -count=1 -timeout=29m ./cmd/hostd -run "$test_pattern" | tee "$output"
           jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
 
       - name: Require complete Docker cleanup

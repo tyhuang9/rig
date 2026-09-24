@@ -2,7 +2,8 @@
 
 **Recorded:** 2026-09-24. **Branch:** `feature/hosting-m2-controller-journey`,
 based on the unmerged M1 draft candidate. This is an M2 implementation slice,
-not an M2 acceptance claim. The branch has not been published or merged.
+not an M2 acceptance claim. Draft PR [#71](https://github.com/tyhuang9/rig/pull/71)
+targets the unmerged M1 branch. Neither PR has been merged.
 
 ## Implemented slice
 
@@ -34,14 +35,22 @@ not an M2 acceptance claim. The branch has not been published or merged.
 | Full Playwright suite | Passed: 3 tests, including the real-controller journey and two source-connection/focus journeys. Local runs set `GOFLAGS=-buildvcs=false` because the managed worktree's Git metadata is restricted to the spawned browser-test Go build. |
 | Embedded dashboard hash comparison | Passed after the final Vite build; the controller-served file set and SHA-256 hashes match `web/dist`. |
 
+The first hosted Docker run ([workflow 36032619684](https://github.com/tyhuang9/rig/actions/runs/36032619684),
+head `58389f4`) reached the durable deployment job but failed with
+`invalid_source` before image builds. The cleanup step passed. Investigation
+found that the workflow's pnpm install leaves package links under the fixture's
+`node_modules`; the local release materializer correctly rejects links. The
+controller test now stages a clean fixture source, keeping the installed copy
+only for application-owned schema preparation. The hosted rerun is pending.
+
 The QA and security reviews of the controller harness found no confirmed
 exploit. Their actionable gaps were addressed: the deployed API now probes
 the HTTPS fixture, a nonlocal Docker context is rejected before mutation,
 ingress cleanup is registered before composition, idempotent replay and exact
 release/configuration pins are asserted, and the Buildx record is checked after
 removal. Broader image-layer and frontend-asset secret coverage remains in
-the M1 hosted gate. The new controller gate itself has not yet run on Docker:
-the Windows host has no Docker CLI, and this M2 branch is local.
+the M1 hosted gate. The Windows host has no Docker CLI, so hosted CI is the
+authority for the Docker journey.
 
 Frontend review caught and fixed a job API response mismatch, loss of an
 uncertain idempotency key after configuration drift, inaccessible continuation
@@ -56,7 +65,7 @@ prove whether the original request reached the controller.
 
 ## Open M2 acceptance work
 
-- Run and debug the hosted controller journey gate on this exact branch.
+- Complete the hosted controller journey gate on the corrected branch head.
 - Exercise a real browser through frontend, Caddy, backend, and the external
   fixture database; verify note persistence after controller restart and
   healthy replacement.

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -59,14 +60,21 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	node := controllerJourneyExecutable(t, "node")
 	sh := controllerJourneyExecutable(t, "sh")
 	openssl := controllerJourneyExecutable(t, "openssl")
-	source, err := filepath.Abs(filepath.Join("..", "..", "examples", "hosting-notes"))
+	installedSource, err := filepath.Abs(filepath.Join("..", "..", "examples", "hosting-notes"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info, err := os.Stat(filepath.Join(source, "api", "node_modules", "pg")); err != nil || !info.IsDir() {
+	if info, err := os.Stat(filepath.Join(installedSource, "api", "node_modules", "pg")); err != nil || !info.IsDir() {
 		t.Fatal("install the hosting fixture with its frozen lockfile first")
 	}
 	root := t.TempDir()
+	// pnpm installs package links under node_modules. A local release must
+	// reject links, so present the controller with a clean source tree while
+	// the installed checkout remains available for schema preparation.
+	source := filepath.Join(root, "source")
+	if err := controllerJourneyStageSource(installedSource, source); err != nil {
+		t.Fatal("stage immutable fixture source:", err)
+	}
 	dataRoot := filepath.Join(root, "controller")
 	fixtureRoot := filepath.Join(root, "external")
 	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Minute)
@@ -389,7 +397,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	}
 	dbURL := fmt.Sprintf("postgresql://fixture_user:%s@%s:%d/fixture_notes?sslmode=verify-full", password, gateway, dbPort)
 	caBase64 := base64.StdEncoding.EncodeToString(ca)
-	controllerJourneyPrepareSchema(t, ctx, node, source, dbURL, caBase64)
+	controllerJourneyPrepareSchema(t, ctx, node, installedSource, dbURL, caBase64)
 	entries := []apicontract.ScopedConfigurationValueInput{}
 	add := func(component, key, value string, sensitive bool) {
 		entries = append(entries, apicontract.ScopedConfigurationValueInput{Phase: "runtime", TargetComponent: component, Key: key, Value: value, Sensitive: sensitive})
@@ -513,6 +521,96 @@ func controllerJourneyExecutable(t *testing.T, name string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func controllerJourneyStageSource(installed, destination string) error {
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		return err
+	}
+	return filepath.WalkDir(installed, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(installed, path)
+		if err != nil {
+			return err
+		}
+		if relative == "." {
+			return nil
+		}
+		canonical := filepath.ToSlash(relative)
+		if entry.IsDir() && (entry.Name() == "node_modules" || canonical == "frontend/dist" || canonical == "harness/certs") {
+			return filepath.SkipDir
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && !info.Mode().IsRegular() {
+			return fmt.Errorf("unsafe fixture entry %s", canonical)
+		}
+		target := filepath.Join(destination, relative)
+		if info.IsDir() {
+			return os.Mkdir(target, 0o700)
+		}
+		input, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		mode := fs.FileMode(0o600)
+		if info.Mode().Perm()&0o111 != 0 {
+			mode = 0o700
+		}
+		output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+		if err != nil {
+			_ = input.Close()
+			return err
+		}
+		_, copyErr := io.Copy(output, input)
+		closeOutputErr := output.Close()
+		closeInputErr := input.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeOutputErr != nil {
+			return closeOutputErr
+		}
+		return closeInputErr
+	})
+}
+
+func TestControllerJourneyStageSource(t *testing.T) {
+	installed := filepath.Join(t.TempDir(), "installed")
+	for _, directory := range []string{"api/src", "api/node_modules", "frontend/dist", "harness/certs"} {
+		if err := os.MkdirAll(filepath.Join(installed, directory), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, content := range map[string]string{
+		"api/src/server.js": "export default true", "api/node_modules/package.js": "installed",
+		"frontend/dist/index.html": "generated", "harness/certs/ca.pem": "private",
+	} {
+		if err := os.WriteFile(filepath.Join(installed, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	staged := filepath.Join(t.TempDir(), "source")
+	if err := controllerJourneyStageSource(installed, staged); err != nil {
+		t.Fatal(err)
+	}
+	if body, err := os.ReadFile(filepath.Join(staged, "api/src/server.js")); err != nil || string(body) != "export default true" {
+		t.Fatal("source file was not staged")
+	}
+	for _, excluded := range []string{"api/node_modules", "frontend/dist", "harness/certs"} {
+		if _, err := os.Lstat(filepath.Join(staged, excluded)); !os.IsNotExist(err) {
+			t.Fatalf("generated fixture directory %s was staged", excluded)
+		}
+	}
+	if err := os.Symlink(filepath.Join(installed, "api/src/server.js"), filepath.Join(installed, "unexpected-link")); err == nil {
+		if err := controllerJourneyStageSource(installed, filepath.Join(t.TempDir(), "rejected")); err == nil {
+			t.Fatal("unexpected source link was accepted")
+		}
+	}
 }
 
 func controllerJourneyDocker(ctx context.Context, docker string, extraEnv []string, args ...string) ([]byte, error) {
