@@ -2,8 +2,10 @@
 
 **Branch:** `feature/hosting-m2-next-cache`, stacked on unmerged
 [draft PR #73](https://github.com/tyhuang9/rig/pull/73). This is an M2
-implementation slice; it is not M2 acceptance. The branch is local and
-unpublished while hosted Docker evidence is pending.
+implementation slice; it is not M2 acceptance. The implementation at
+`540639194c07807680b2804f74fa68591d2510d0` was published as
+[draft PR #74](https://github.com/tyhuang9/rig/pull/74) with explicit user
+authorization. No merge or deployment has occurred.
 
 ## Contract
 
@@ -41,7 +43,7 @@ have separate hosted gates.
 | Real local fixture build and responses | `npm ci` and `NEXT_PUBLIC_BUILD_MARKER=next-public-A npm run build` passed, including a rebuild after adding the blue/green runtime marker. Local `next start` served the page, dynamic health, runtime-secret presence without exposing its value, and an optimized PNG with MISS then HIT. This did not use a read-only Docker rootfs. |
 | Full repository Go suite | `go test -p 1 -count=1 -timeout=15m ./...` passed with normal Windows workspace access. An initial sandboxed run failed existing Compose tests on file-access denials; the same Compose package and full suite passed outside that sandbox. |
 | Static and web checks | `go vet ./...`, `go run ./cmd/openapi-gen -check`, and `pnpm --dir web test` (400/400) passed. The docs VitePress build, accessibility check, and Pages workflow check passed with lockfile-installed dependencies. |
-| Hosted generated-recipe image and real runtime/Caddy gate | Pending publication and hosted Docker CI. The local Windows host has no Docker CLI. CI requires explicit pass events for both named live tests and detects leftover fixture resources. |
+| Hosted generated-recipe image and real runtime/Caddy gate | [Hosted Docker job 107853784107](https://github.com/tyhuang9/rig/actions/runs/36065375138/job/107853784107) passed in 4m33s on implementation head `5406391`. Its `TestLiveNextFixtureImage` and `TestLiveNextCacheRuntimeRoute` steps both passed with explicit named Go test pass events. The job also passed its existing generated-runtime, manual, hosting-notes, blue/green, external TLS, and owned-resource cleanup gates. The local Windows host has no Docker CLI. |
 
 The cache is temporary per container and can fill. Durable ISR output,
 shared cache coordination across slots, and persistent local uploads are not
