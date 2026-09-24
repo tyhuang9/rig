@@ -108,7 +108,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	}
 	// Composition can create ingress before an application exists. Register its
 	// ownership-checked cleanup before the first operation that can create it.
-	t.Cleanup(func() {
+	cleanupIngress := func() {
 		cleanup, stop := context.WithTimeout(context.Background(), time.Minute)
 		defer stop()
 		for _, resource := range [][]string{
@@ -137,7 +137,17 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 				t.Errorf("remove exact ingress %s", resource[0])
 			}
 		}
-	})
+		for _, resource := range [][]string{
+			{"container", "rig-generated-caddy-v1"},
+			{"volume", "rig-generated-caddy-config-v1"},
+			{"network", "rig-generated-caddy-ingress-v1"},
+		} {
+			if controllerJourneyExists(t, cleanup, docker, resource[0], resource[1]) {
+				t.Errorf("generated ingress %s remains after cleanup", resource[0])
+			}
+		}
+	}
+	t.Cleanup(cleanupIngress)
 
 	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -284,6 +294,9 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 				}
 			}
 		}
+		// Caddy may still be attached to the app bridge. Remove its exact
+		// owned resources before checking that bridge is empty.
+		cleanupIngress()
 		if fixtureStarted {
 			if _, err := controllerJourneyDocker(cleanup, docker, fixtureEnv, "compose", "-f", filepath.Join(fixtureRoot, "docker-compose.yml"), "-p", controllerJourneyProject, "down", "--volumes", "--remove-orphans"); err != nil {
 				t.Error("remove exact external fixture project")
@@ -301,9 +314,6 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		}
 		if controllerJourneyExists(t, cleanup, docker, "network", controllerJourneyNetwork) {
 			t.Error("external fixture network remains")
-		}
-		if controllerJourneyExists(t, cleanup, docker, "container", "rig-generated-caddy-v1") {
-			t.Error("generated ingress container remains")
 		}
 		if controllerJourneyExists(t, cleanup, docker, "network", network.Name) {
 			t.Error("app-private network remains")
