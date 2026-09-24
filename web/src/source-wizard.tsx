@@ -46,7 +46,7 @@ function CollectionStatus({ id, label, page, loading, error, count }: { id: stri
   return <span id={id} className="sr-only" role="status" aria-live="polite" aria-atomic="true">{message}</span>;
 }
 
-export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; onCreated: (id: string) => void }) {
+export function SourceWizard({ onCancel, onCreated, onSetupReady }: { onCancel: () => void; onCreated: (id: string) => void; onSetupReady?: (id: string) => void }) {
   const queryClient = useQueryClient();
   const [kind, setKind] = useState<SourceKind>("local");
   const [stage, setStage] = useState<WizardStage>("source");
@@ -335,7 +335,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
   };
 
   if (stage === "review" && inspection) return <div className="wizard source-wizard">
-    <ol aria-label="Setup progress"><li>Source</li><li aria-current="step">How Rig will run it</li><li>Ready to deploy</li></ol>
+    <ol aria-label="Setup progress"><li>Source</li><li aria-current="step">How Rig will run it</li><li>Setup accepted</li></ol>
     <form onSubmit={(event) => event.preventDefault()} noValidate>
       <DeploymentPlanReview
         inspection={inspection}
@@ -366,7 +366,7 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
           : "Database migration approved. Deployment setup is ready."
         : "Deployment setup accepted. The application is ready to open.";
     return <div className="wizard source-wizard">
-      <ol aria-label="Setup progress"><li>Source</li><li>How Rig will run it</li><li aria-current="step">Ready to deploy</li></ol>
+      <ol aria-label="Setup progress"><li>Source</li><li>How Rig will run it</li><li aria-current="step">Setup accepted</li></ol>
       <form onSubmit={(event) => event.preventDefault()} noValidate>
         <section className="plan-ready" aria-labelledby="plan-ready-title">
           <h2 id="plan-ready-title" ref={readyHeading} tabIndex={-1}>Setup accepted</h2>
@@ -377,15 +377,15 @@ export function SourceWizard({ onCancel, onCreated }: { onCancel: () => void; on
             <strong>{migrationPending ? "Database migration needs separate approval" : "Database migration approved"}</strong>
             {migrationPending ? <><p>This command can change persistent data. The old and new app versions briefly share the migrated database, and Rig will not automatically roll it back.</p><button className="button" type="button" disabled={approveMigration.isPending} onClick={() => { setFormError(""); approveMigration.mutate(); }}>{approveMigration.isPending ? "Approving migration…" : "Approve migration before the next deployment"}</button></> : <span>The migration is approved for this plan revision.</span>}
           </div>}
-          <div className="callout success"><strong>Ready to deploy</strong><span>Analysis did not execute repository code. Open the application and choose Deploy latest to build and start this accepted setup in containers.</span></div>
-          <footer><button className="button primary" type="button" onClick={() => onCreated(draftApplicationId)}>Open application</button></footer>
+          <div className="callout success"><strong>Setup saved</strong><span>Analysis did not execute repository code. Configure values for the accepted components before deployment.</span></div>
+          <footer>{onSetupReady && <button className="button primary" type="button" onClick={() => onSetupReady(draftApplicationId)}>Continue setup</button>}<button className={onSetupReady ? "button" : "button primary"} type="button" onClick={() => onCreated(draftApplicationId)}>Open application</button></footer>
         </section>
       </form>
     </div>;
   }
 
   return <div className="wizard source-wizard">
-    <ol aria-label="Setup progress"><li aria-current="step">Source</li><li>How Rig will run it</li><li>Ready to deploy</li></ol>
+    <ol aria-label="Setup progress"><li aria-current="step">Source</li><li>How Rig will run it</li><li>Setup accepted</li></ol>
     <form onSubmit={(event) => { event.preventDefault(); composeSelected ? saveCompose() : generatedCandidates.length > 0 ? setStage("review") : saveCompose(); }} noValidate>
       <h2 ref={sourceHeading} tabIndex={-1}>Application source</h2>
       <p>Choose a project for Rig to analyze. Rig reads project files to suggest setup; it won’t run your code.</p>
