@@ -2,7 +2,9 @@
 
 **Branch:** `feature/hosting-m2-attested-local-route`, stacked on unmerged
 [draft PR #72](https://github.com/tyhuang9/rig/pull/72). This is an M2
-implementation slice, not M2 acceptance. The branch is local and unpublished.
+implementation slice, not M2 acceptance. The tested code head is
+`df7e0f773855403a5147fd123f11db9845ae9cde`. The branch is local and
+unpublished.
 
 ## Route contract
 
@@ -33,7 +35,7 @@ disables a cached route after 60 seconds and offers a manual recheck.
 | Controller auth, no-store, app isolation, provenance and active-head race tests | Included in the focused Go test pass above. Runtime release and plan mismatches, unsucceeded main deployment, and concurrent head change withhold the URL. |
 | UI success, stale/mismatch, failed replacement, error, expiry, and focus tests | `pnpm test` in `web`: 400/400 passed; route-focused Vitest: 66/66 passed. `GOFLAGS=-buildvcs=false pnpm e2e`: 3/3 passed. |
 | OpenAPI drift, Go vet, web build, embedded assets, and docs | `go run ./cmd/openapi-gen -check`, `go vet ./...`, `pnpm build` in `web`, `scripts/check-embedded.ps1`, `pnpm build` and `pnpm check:accessibility` in `docs`, and the Pages workflow contract check passed. Tagged `live_docker` hostd test compiled with `-run '^$'`. |
-| Full serial Go suite | `go test -p 1 -count=1 -timeout=15m ./...` passed after the callback deadline change. |
+| Full serial Go suite | `go test -p 1 -count=1 -timeout=15m ./...` passed on the rebased code head. An earlier run under heavy Windows host load failed five existing `internal/runtime/process` termination timing tests after a 105-second snapshot package run. The process package passed alone (`go test -p 1 -count=1 -timeout=15m ./internal/runtime/process`), then the complete serial suite passed without concurrent builds. No files in that package changed in this slice. |
 | Hosted Linux Docker controller, TLS PostgreSQL, Caddy and Chromium journey using the returned URL | Pending publication and hosted CI. The local test requires `RIG_RUN_LIVE_CONTROLLER_JOURNEY=1` and a Docker host; neither was available locally. |
 
 This slice does not provision a database. The hosted fixture supplies an
