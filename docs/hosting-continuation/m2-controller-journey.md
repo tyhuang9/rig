@@ -67,6 +67,12 @@ Docker could copy that file from the stopped container even though Node exited
 with `MODULE_NOT_FOUND`; API health and cleanup passed. The next bounded probe
 records only the static module and parent directory modes/owners to resolve
 the apparent access mismatch.
+The seventh hosted run ([workflow 36036347990](https://github.com/tyhuang9/rig/actions/runs/36036347990),
+head `0a5a6e8`) found the exact mismatch: both `static.mjs` and its newly
+created parent `/usr/local/lib/rig` had mode `0444` and root ownership.
+The non-root runtime could read the file but could not traverse its parent.
+The generated image recipe now explicitly sets the parent directory to
+`0555` after copying the file. The post-fix hosted gate is pending.
 
 The QA and security reviews of the controller harness found no confirmed
 exploit. Their actionable gaps were addressed: the deployed API now probes

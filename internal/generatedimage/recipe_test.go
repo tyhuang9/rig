@@ -57,6 +57,12 @@ func TestDefinitionAndRecipeAreDeterministicAndCommandSafe(t *testing.T) {
 	if strings.Contains(recipe, "# syntax=") {
 		t.Fatal("recipe requested a mutable external Dockerfile frontend")
 	}
+	staticCopy := strings.Index(recipe, "COPY --chmod=0444 rig/rig-static.mjs /usr/local/lib/rig/static.mjs")
+	traversal := strings.Index(recipe, `RUN ["chmod", "0555", "/usr/local/lib/rig"]`)
+	nonRoot := strings.LastIndex(recipe, "USER node")
+	if staticCopy < 0 || traversal <= staticCopy || nonRoot <= traversal {
+		t.Fatal("static runtime library directory is not traversable before non-root startup")
+	}
 
 	revision.Plan.Components[0].RunCommand = "pnpm run serve"
 	_, changed, err := definitionFor(revision, "web")

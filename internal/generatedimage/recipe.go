@@ -171,6 +171,8 @@ COPY --from=builder --chown=node:node /workspace/ /workspace/
 COPY --chmod=0555 rig/rig-entrypoint /usr/local/bin/rig-entrypoint
 COPY --chmod=0555 rig/rig-static /usr/local/bin/rig-static
 COPY --chmod=0444 rig/rig-static.mjs /usr/local/lib/rig/static.mjs
+# A newly created COPY parent may inherit the file mode; node needs traversal.
+RUN ["chmod", "0555", "/usr/local/lib/rig"]
 USER node
 ENTRYPOINT ["/usr/local/bin/rig-entrypoint"]
 `, baseImage, corepack, staticFiles+buildRunnerCopy(hasBuild), install, build, staticCheck, baseImage, corepack)
