@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -76,7 +77,11 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	// reject links, so present the controller with a clean source tree while
 	// the installed checkout remains available for schema preparation.
 	source := filepath.Join(root, "source")
-	if err := controllerJourneyStageSource(installedSource, source); err != nil {
+	tracked, err := controllerJourneyTrackedFixtureFiles(installedSource)
+	if err != nil {
+		t.Fatal("verify committed GitHub fixture source:", err)
+	}
+	if err := controllerJourneyStageSource(installedSource, source, tracked); err != nil {
 		t.Fatal("stage immutable fixture source:", err)
 	}
 	dataRoot := filepath.Join(root, "controller")
@@ -765,11 +770,38 @@ func controllerJourneyExecutable(t *testing.T, name string) string {
 	return path
 }
 
-func controllerJourneyStageSource(installed, destination string) error {
+func controllerJourneyTrackedFixtureFiles(installed string) (map[string]struct{}, error) {
+	repositoryRoot := filepath.Dir(filepath.Dir(installed))
+	relative, err := filepath.Rel(repositoryRoot, installed)
+	if err != nil || filepath.ToSlash(relative) != "examples/hosting-notes" {
+		return nil, fmt.Errorf("fixture source path is unexpected")
+	}
+	if err := exec.Command("git", "-C", repositoryRoot, "diff", "--quiet", "HEAD", "--", "examples/hosting-notes").Run(); err != nil {
+		return nil, fmt.Errorf("fixture tracked files differ from HEAD")
+	}
+	listed, err := exec.Command("git", "-C", repositoryRoot, "ls-files", "-z", "--", "examples/hosting-notes").Output()
+	if err != nil {
+		return nil, fmt.Errorf("could not enumerate committed fixture files")
+	}
+	allowed := make(map[string]struct{})
+	for _, entry := range bytes.Split(listed, []byte{0}) {
+		name := strings.TrimPrefix(string(entry), "examples/hosting-notes/")
+		if name != "" && name != string(entry) {
+			allowed[name] = struct{}{}
+		}
+	}
+	if len(allowed) == 0 {
+		return nil, fmt.Errorf("committed fixture has no files")
+	}
+	return allowed, nil
+}
+
+func controllerJourneyStageSource(installed, destination string, allowed map[string]struct{}) error {
 	if err := os.Mkdir(destination, 0o700); err != nil {
 		return err
 	}
-	return filepath.WalkDir(installed, func(path string, entry fs.DirEntry, walkErr error) error {
+	seen := 0
+	err := filepath.WalkDir(installed, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -784,6 +816,18 @@ func controllerJourneyStageSource(installed, destination string) error {
 		if entry.IsDir() && (entry.Name() == "node_modules" || canonical == "frontend/dist" || canonical == "harness/certs") {
 			return filepath.SkipDir
 		}
+		if entry.IsDir() && allowed != nil {
+			containsTrackedFile := false
+			for name := range allowed {
+				if strings.HasPrefix(name, canonical+"/") {
+					containsTrackedFile = true
+					break
+				}
+			}
+			if !containsTrackedFile {
+				return filepath.SkipDir
+			}
+		}
 		info, err := entry.Info()
 		if err != nil {
 			return err
@@ -794,6 +838,12 @@ func controllerJourneyStageSource(installed, destination string) error {
 		target := filepath.Join(destination, relative)
 		if info.IsDir() {
 			return os.Mkdir(target, 0o700)
+		}
+		if allowed != nil {
+			if _, ok := allowed[canonical]; !ok {
+				return nil
+			}
+			seen++
 		}
 		input, err := os.Open(path)
 		if err != nil {
@@ -819,6 +869,13 @@ func controllerJourneyStageSource(installed, destination string) error {
 		}
 		return closeInputErr
 	})
+	if err != nil {
+		return err
+	}
+	if allowed != nil && seen != len(allowed) {
+		return fmt.Errorf("committed fixture files are missing")
+	}
+	return nil
 }
 
 func TestControllerJourneyStageSource(t *testing.T) {
@@ -837,7 +894,7 @@ func TestControllerJourneyStageSource(t *testing.T) {
 		}
 	}
 	staged := filepath.Join(t.TempDir(), "source")
-	if err := controllerJourneyStageSource(installed, staged); err != nil {
+	if err := controllerJourneyStageSource(installed, staged, nil); err != nil {
 		t.Fatal(err)
 	}
 	if body, err := os.ReadFile(filepath.Join(staged, "api/src/server.js")); err != nil || string(body) != "export default true" {
@@ -848,8 +905,18 @@ func TestControllerJourneyStageSource(t *testing.T) {
 			t.Fatalf("generated fixture directory %s was staged", excluded)
 		}
 	}
+	if err := os.WriteFile(filepath.Join(installed, "api", ".env"), []byte("untracked secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trackedStage := filepath.Join(t.TempDir(), "tracked-source")
+	if err := controllerJourneyStageSource(installed, trackedStage, map[string]struct{}{"api/src/server.js": {}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(trackedStage, "api", ".env")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("untracked fixture secret was staged")
+	}
 	if err := os.Symlink(filepath.Join(installed, "api/src/server.js"), filepath.Join(installed, "unexpected-link")); err == nil {
-		if err := controllerJourneyStageSource(installed, filepath.Join(t.TempDir(), "rejected")); err == nil {
+		if err := controllerJourneyStageSource(installed, filepath.Join(t.TempDir(), "rejected"), nil); err == nil {
 			t.Fatal("unexpected source link was accepted")
 		}
 	}
