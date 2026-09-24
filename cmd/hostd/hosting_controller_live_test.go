@@ -52,7 +52,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	if os.Getenv("RIG_RUN_LIVE_CONTROLLER_JOURNEY") != "1" {
 		t.Fatal("set RIG_RUN_LIVE_CONTROLLER_JOURNEY=1 to run the hosted Docker gate")
 	}
-	if runtime.GOOS != "linux" || os.Getenv("DOCKER_HOST") != "" {
+	if runtime.GOOS != "linux" || os.Getenv("DOCKER_HOST") != "" || os.Getenv("DOCKER_CONTEXT") != "" {
 		t.Fatal("hosted controller gate requires the local Linux Docker daemon")
 	}
 	docker := controllerJourneyExecutable(t, "docker")
@@ -71,6 +71,14 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	fixtureRoot := filepath.Join(root, "external")
 	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Minute)
 	defer cancel()
+	selectedContext, err := controllerJourneyDocker(ctx, docker, nil, "context", "show")
+	if err != nil || string(bytes.TrimSpace(selectedContext)) != "default" {
+		t.Fatal("hosted controller gate requires Docker's default local context")
+	}
+	endpoint, err := controllerJourneyDocker(ctx, docker, nil, "context", "inspect", "default", "--format", "{{.Endpoints.docker.Host}}")
+	if err != nil || !strings.HasPrefix(string(bytes.TrimSpace(endpoint)), "unix:///") {
+		t.Fatal("hosted controller gate requires a local Unix Docker endpoint")
+	}
 	if _, err := controllerJourneyDocker(ctx, docker, nil, "info"); err != nil {
 		t.Fatal("Docker daemon unavailable")
 	}
@@ -98,6 +106,38 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 			t.Fatal("disposable daemon already has a generated builder resource")
 		}
 	}
+	// Composition can create ingress before an application exists. Register its
+	// ownership-checked cleanup before the first operation that can create it.
+	t.Cleanup(func() {
+		cleanup, stop := context.WithTimeout(context.Background(), time.Minute)
+		defer stop()
+		for _, resource := range [][]string{
+			{"container", "rig-generated-caddy-v1", "generated-ingress"},
+			{"volume", "rig-generated-caddy-config-v1", "generated-ingress"},
+			{"network", "rig-generated-caddy-ingress-v1", "generated-ingress-network"},
+		} {
+			if !controllerJourneyExists(t, cleanup, docker, resource[0], resource[1]) {
+				continue
+			}
+			format := "{{json .Labels}}"
+			if resource[0] == "container" {
+				format = "{{json .Config.Labels}}"
+			}
+			body, err := controllerJourneyDocker(cleanup, docker, nil, resource[0], "inspect", "--format", format, resource[1])
+			var labels map[string]string
+			if err != nil || json.Unmarshal(bytes.TrimSpace(body), &labels) != nil || labels["io.rig.managed"] != resource[2] || labels["io.rig.identity-version"] != "v1" {
+				t.Errorf("global ingress %s ownership uncertain; retaining", resource[0])
+				continue
+			}
+			removal := []string{resource[0], "rm", resource[1]}
+			if resource[0] != "network" {
+				removal = []string{resource[0], "rm", "--force", resource[1]}
+			}
+			if _, err := controllerJourneyDocker(cleanup, docker, nil, removal...); err != nil {
+				t.Errorf("remove exact ingress %s", resource[0])
+			}
+		}
+	})
 
 	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -155,7 +195,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	api := httptest.NewServer(handler)
 	defer api.Close()
 	client := &http.Client{Timeout: 8 * time.Second}
-	request := func(method, path string, input any, want int, output any) []byte {
+	request := func(method, path string, input any, want int, output any, headers ...map[string]string) []byte {
 		t.Helper()
 		var body io.Reader
 		if input != nil {
@@ -175,6 +215,11 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		}
 		if method != http.MethodGet {
 			req.Header.Set("X-CSRF-Token", session.CSRF)
+		}
+		for _, values := range headers {
+			for key, value := range values {
+				req.Header.Set(key, value)
+			}
 		}
 		response, err := client.Do(req)
 		if err != nil {
@@ -237,32 +282,6 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 				if _, err := controllerJourneyDocker(cleanup, docker, nil, command...); err != nil {
 					t.Errorf("remove exact app-owned %s", kind)
 				}
-			}
-		}
-		for _, resource := range [][]string{
-			{"container", "rig-generated-caddy-v1", "generated-ingress"},
-			{"volume", "rig-generated-caddy-config-v1", "generated-ingress"},
-			{"network", "rig-generated-caddy-ingress-v1", "generated-ingress-network"},
-		} {
-			if !controllerJourneyExists(t, cleanup, docker, resource[0], resource[1]) {
-				continue
-			}
-			format := "{{json .Labels}}"
-			if resource[0] == "container" {
-				format = "{{json .Config.Labels}}"
-			}
-			body, err := controllerJourneyDocker(cleanup, docker, nil, resource[0], "inspect", "--format", format, resource[1])
-			var labels map[string]string
-			if err != nil || json.Unmarshal(bytes.TrimSpace(body), &labels) != nil || labels["io.rig.managed"] != resource[2] || labels["io.rig.identity-version"] != "v1" {
-				t.Errorf("global ingress %s ownership uncertain; retaining", resource[0])
-				continue
-			}
-			removal := []string{resource[0], "rm", resource[1]}
-			if resource[0] != "network" {
-				removal = []string{resource[0], "rm", "--force", resource[1]}
-			}
-			if _, err := controllerJourneyDocker(cleanup, docker, nil, removal...); err != nil {
-				t.Errorf("remove exact ingress %s", resource[0])
 			}
 		}
 		if fixtureStarted {
@@ -407,9 +426,16 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		}
 	}()
 	var mutation apicontract.JobMutationResponse
-	request(http.MethodPost, "/api/v1/apps/"+application.ID+"/deployments", map[string]any{}, http.StatusAccepted, &mutation)
+	deploymentPath := "/api/v1/apps/" + application.ID + "/deployments"
+	idempotencyKey := uuid.NewString()
+	request(http.MethodPost, deploymentPath, map[string]any{}, http.StatusAccepted, &mutation, map[string]string{"Idempotency-Key": idempotencyKey})
 	if !mutation.Created || mutation.Job.ID == "" || mutation.Job.RequestedBy != user.ID {
 		t.Fatal("controller did not enqueue an actor-bound durable job")
+	}
+	var replay apicontract.JobMutationResponse
+	request(http.MethodPost, deploymentPath, map[string]any{}, http.StatusOK, &replay, map[string]string{"Idempotency-Key": idempotencyKey})
+	if replay.Created || replay.Job.ID != mutation.Job.ID {
+		t.Fatal("controller did not replay the exact durable deployment job")
 	}
 	deadline := time.Now().Add(16 * time.Minute)
 	var completed jobs.Job
@@ -428,16 +454,22 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	}
 	var history apicontract.DeploymentList
 	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/deployments", nil, http.StatusOK, &history)
-	if len(history.Items) != 1 || history.Items[0].JobID != completed.ID || history.Items[0].RuntimeStrategy != string(deploymentplans.StrategyGeneratedNode) || history.Items[0].Status != "succeeded" {
+	if len(history.Items) != 1 || history.Items[0].JobID != completed.ID || history.Items[0].RuntimeStrategy != string(deploymentplans.StrategyGeneratedNode) || history.Items[0].Status != "succeeded" ||
+		history.Items[0].DeploymentPlanRevisionID != plan.RevisionID || history.Items[0].DeploymentPlanRevisionNumber != plan.RevisionNumber ||
+		history.Items[0].ActualConfigurationRevisionID != saved.RevisionID || history.Items[0].ActualConfigurationRevisionNumber != saved.RevisionNumber {
 		t.Fatal("successful durable deployment has no exact generated history")
 	}
 	var releases apicontract.ReleaseList
 	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/releases", nil, http.StatusOK, &releases)
-	if len(releases.Items) != 1 || releases.Items[0].ID != history.Items[0].ReleaseID {
+	if len(releases.Items) != 1 || releases.Items[0].ID != history.Items[0].ReleaseID ||
+		releases.Items[0].SourceProvider != "local" || releases.Items[0].WorkspaceState != "ready" ||
+		releases.Items[0].DeploymentPlanRevisionID != plan.RevisionID || releases.Items[0].DeploymentPlanRevisionNumber != plan.RevisionNumber ||
+		releases.Items[0].ConfigurationRevisionID != saved.RevisionID || releases.Items[0].ConfigurationRevisionNumber != saved.RevisionNumber {
 		t.Fatal("deployment did not pin one immutable release")
 	}
 	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey")
+	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/test/dependency", "", http.StatusOK, "reachable")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodPost, "/api/notes", `{"body":"controller TLS note"}`, http.StatusCreated, "controller TLS note")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	index := controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/", "", http.StatusOK, "<html")
@@ -621,8 +653,11 @@ func controllerJourneyRemoveBuilder(t *testing.T, ctx context.Context, docker, d
 		"DOCKER_CONFIG=" + filepath.Join(root, "docker-config"),
 		"BUILDX_CONFIG=" + filepath.Join(root, "buildx-config"),
 	}
-	if _, err := controllerJourneyDocker(ctx, docker, builderEnv, "buildx", "rm", "--builder", identity.BuilderName); err != nil {
+	if _, err := controllerJourneyDocker(ctx, docker, builderEnv, "buildx", "rm", "--force", identity.BuilderName); err != nil {
 		t.Error("remove exact generated Buildx record")
+	}
+	if _, err := controllerJourneyDocker(ctx, docker, builderEnv, "buildx", "inspect", identity.BuilderName); err == nil {
+		t.Error("generated Buildx record remains after cleanup")
 	}
 	for _, resource := range [][]string{{"container", containerName}, {"network", identity.NetworkName}} {
 		if !controllerJourneyExists(t, ctx, docker, resource[0], resource[1]) {
