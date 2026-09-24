@@ -1,0 +1,17 @@
+{
+  "components": [
+    {
+      "id": "web",
+      "technology": "nextjs",
+      "rootDirectory": ".",
+      "packageManager": "npm",
+      "nodeVersion": "24",
+      "installCommand": "npm ci",
+      "buildCommand": "npm run build",
+      "startCommand": "npm run start",
+      "outputDirectory": "",
+      "internalPort": 3000,
+      "healthProbe": "/api/health"
+    }
+  ]
+}

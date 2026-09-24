@@ -31,6 +31,7 @@ var nodeImages = map[string]string{
 type componentDefinition struct {
 	name                  string
 	role                  string
+	technology            string
 	rootDirectory         string
 	packageManager        string
 	installBehavior       string
@@ -108,7 +109,7 @@ func definitionForBuild(revision deploymentplans.DeploymentPlanRevision, compone
 		return componentDefinition{}, "", errors.New("unsupported node version")
 	}
 	definition := componentDefinition{
-		name: component.Name, role: component.Role, rootDirectory: component.RootDirectory,
+		name: component.Name, role: component.Role, technology: component.Technology, rootDirectory: component.RootDirectory,
 		packageManager: component.PackageManager, installBehavior: component.InstallBehavior, installDirectory: component.InstallDirectory,
 		buildCommand: component.BuildCommand, runCommand: component.RunCommand,
 		nodeVersion: component.NodeVersion, internalPort: component.InternalPort,
@@ -116,7 +117,11 @@ func definitionForBuild(revision deploymentplans.DeploymentPlanRevision, compone
 		staticOutputDirectory: component.StaticOutputDirectory,
 	}
 	recipe := componentContainerfile(definition)
-	recipeSum := sha256.Sum256([]byte(recipe + entrypointScript + staticLauncherScript + staticServerScript + staticOutputCheckScript + publicBuildRunnerScript))
+	recipeInputs := recipe + entrypointScript + staticLauncherScript + staticServerScript + staticOutputCheckScript + publicBuildRunnerScript
+	if definition.technology == "nextjs" {
+		recipeInputs += nextCacheCheckScript
+	}
+	recipeSum := sha256.Sum256([]byte(recipeInputs))
 	canonical, err := json.Marshal(digestDefinition{
 		CompilerVersion: CompilerVersion, PlanDigest: revision.CanonicalDigest, Component: definition.name,
 		Role: definition.role, RootDirectory: definition.rootDirectory, PackageManager: definition.packageManager,
@@ -132,14 +137,14 @@ func definitionForBuild(revision deploymentplans.DeploymentPlanRevision, compone
 }
 
 func containerfile(hasBuild, enableCorepack bool, baseImage string) string {
-	return containerfileWithOptions(true, hasBuild, enableCorepack, false, baseImage)
+	return containerfileWithOptions(true, hasBuild, enableCorepack, false, false, baseImage)
 }
 
 func componentContainerfile(definition componentDefinition) string {
-	return containerfileWithOptions(definition.installBehavior != "", definition.buildCommand != "", definition.packageManager != "npm", definition.staticOutputDirectory != "", definition.baseImage)
+	return containerfileWithOptions(definition.installBehavior != "", definition.buildCommand != "", definition.packageManager != "npm", definition.staticOutputDirectory != "", definition.technology == "nextjs", definition.baseImage)
 }
 
-func containerfileWithOptions(hasInstall, hasBuild, enableCorepack, staticOutput bool, baseImage string) string {
+func containerfileWithOptions(hasInstall, hasBuild, enableCorepack, staticOutput, nextCache bool, baseImage string) string {
 	corepack := ""
 	if enableCorepack {
 		corepack = "RUN [\"corepack\", \"enable\"]\n"
@@ -157,25 +162,32 @@ func containerfileWithOptions(hasInstall, hasBuild, enableCorepack, staticOutput
 	if hasBuild {
 		build = publicBuildSecretRun(buildShellScript)
 	}
+	nextBuilderFiles, nextBuilderCheck, nextRuntimeFiles, nextRuntimeCheck := "", "", "", ""
+	if nextCache {
+		nextBuilderFiles = "COPY --chmod=0444 rig/check-next-cache.mjs /run/rig/check-next-cache.mjs\n"
+		nextBuilderCheck = "RUN [\"node\", \"/run/rig/check-next-cache.mjs\", \"create\"]\n"
+		nextRuntimeFiles = "COPY --chmod=0444 rig/root.path /run/rig/root.path\nCOPY --chmod=0444 rig/check-next-cache.mjs /run/rig/check-next-cache.mjs\n"
+		nextRuntimeCheck = "RUN [\"node\", \"/run/rig/check-next-cache.mjs\", \"verify\"]\n"
+	}
 	return fmt.Sprintf(`FROM %s AS builder
 %sWORKDIR /workspace
 RUN ["chown", "node:node", "/workspace"]
 COPY --chown=node:node source/ /workspace/
 RUN ["install", "-d", "-o", "0", "-g", "0", "-m", "0555", "/run/rig", "/run/secrets"]
 COPY --chown=1000:1000 --chmod=0400 rig/root.path rig/install.path /run/rig/
-%sUSER node
-%s%s%sFROM %s AS runtime
+%s%sUSER node
+%s%s%s%sFROM %s AS runtime
 ENV NODE_ENV=production
 %sWORKDIR /workspace
 COPY --from=builder --chown=node:node /workspace/ /workspace/
-COPY --chmod=0555 rig/rig-entrypoint /usr/local/bin/rig-entrypoint
+%s%sCOPY --chmod=0555 rig/rig-entrypoint /usr/local/bin/rig-entrypoint
 COPY --chmod=0555 rig/rig-static /usr/local/bin/rig-static
 COPY --chmod=0444 rig/rig-static.mjs /usr/local/lib/rig/static.mjs
 # A newly created COPY parent may inherit the file mode; node needs traversal.
 RUN ["chmod", "0555", "/usr/local/lib/rig"]
 USER node
 ENTRYPOINT ["/usr/local/bin/rig-entrypoint"]
-`, baseImage, corepack, staticFiles+buildRunnerCopy(hasBuild), install, build, staticCheck, baseImage, corepack)
+`, baseImage, corepack, staticFiles+buildRunnerCopy(hasBuild), nextBuilderFiles, install, build, staticCheck, nextBuilderCheck, baseImage, corepack, nextRuntimeFiles, nextRuntimeCheck)
 }
 
 func buildRunnerCopy(hasBuild bool) string {
@@ -221,6 +233,11 @@ func writeRecipe(layout buildLayout, definition componentDefinition) error {
 			return err
 		}
 	}
+	if definition.technology == "nextjs" {
+		if err := writeBuildFile(filepath.Join(layout.contextDirectory, "rig", "check-next-cache.mjs"), []byte(nextCacheCheckScript), 0o600); err != nil {
+			return err
+		}
+	}
 	return writeBuildFile(layout.containerfile, []byte(componentContainerfile(definition)), 0o600)
 }
 
@@ -259,6 +276,50 @@ try {
   }
 } catch {
   console.error("Rig static output directory is missing or unsafe. Check the build command and output directory.");
+  process.exit(65);
+}
+`
+
+// This runs after all user-provided install/build commands and again after the
+// runtime-stage COPY. Docker must never mount a writable cache over a symlink
+// supplied by a build command. The builder creates only the final cache leaf;
+// a missing .next directory means the Next.js build did not produce an image.
+const nextCacheCheckScript = `import { accessSync, constants, lstatSync, mkdirSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+try {
+  const action = process.argv[2];
+  if (action !== "create" && action !== "verify") throw new Error();
+  const root = readFileSync("/run/rig/root.path", "utf8");
+  const parts = root === "." ? [] : root.split("/");
+  if (root !== "." && (root.startsWith("/") || parts.some(part =>
+      !part || part === "." || part === ".." || part.includes("\\") || part.includes("\u0000")))) throw new Error();
+  let current = "/workspace";
+  const directory = path => {
+    const info = lstatSync(path);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error();
+  };
+  directory(current);
+  for (const part of [...parts, ".next"]) {
+    current = resolve(current, part);
+    directory(current);
+  }
+  const cache = resolve(current, "cache");
+  if (action === "create") {
+    try {
+      lstatSync(cache);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      mkdirSync(cache, { mode: 0o700 });
+    }
+  }
+  directory(cache);
+  if (action === "create") {
+    // The builder runs as node, so an unusable cache fails before publication.
+    accessSync(cache, constants.W_OK | constants.X_OK);
+  }
+} catch {
+  console.error("Rig Next.js cache directory is missing or unsafe. Check the build output and component root.");
   process.exit(65);
 }
 `
