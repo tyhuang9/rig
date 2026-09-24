@@ -66,6 +66,44 @@ func TestPrepareBuildContextExcludesSensitiveAndGeneratedPaths(t *testing.T) {
 	}
 }
 
+func TestStagedFileTimeTracksEqualLengthContent(t *testing.T) {
+	workspace := t.TempDir()
+	source := filepath.Join(workspace, "package.json")
+	component := componentDefinition{rootDirectory: ".", installDirectory: "."}
+	stage := func(body string) (sourceTime, generatedTime int64) {
+		t.Helper()
+		if err := os.WriteFile(source, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		layout, err := prepareBuildContext(context.Background(), workspace, t.TempDir(), component, contextLimits{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		generated := filepath.Join(layout.contextDirectory, "rig", "install.path")
+		if err := writeBuildFile(generated, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stagedSource, err := os.Stat(filepath.Join(layout.contextDirectory, "source", "package.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stagedGenerated, err := os.Stat(generated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stagedSource.ModTime().UnixNano(), stagedGenerated.ModTime().UnixNano()
+	}
+	firstSource, firstGenerated := stage("api")
+	otherSource, otherGenerated := stage("app")
+	repeatSource, repeatGenerated := stage("api")
+	if firstSource == otherSource || firstGenerated == otherGenerated {
+		t.Fatal("equal-sized changed content retained its staged timestamp")
+	}
+	if firstSource != repeatSource || firstGenerated != repeatGenerated {
+		t.Fatal("identical staged content received a different timestamp")
+	}
+}
+
 func TestPrepareBuildContextRejectsCredentialFiles(t *testing.T) {
 	for name, body := range map[string]string{
 		".npmrc":           "//registry.npmjs.org/:_authToken=secret",

@@ -3,6 +3,8 @@ package generatedimage
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"io"
 	"io/fs"
@@ -19,6 +21,15 @@ const (
 )
 
 var normalizedBuildTime = time.Unix(0, 0).UTC()
+
+// BuildKit can reuse an earlier local-context file when only its bytes change
+// and its staged size and timestamp stay equal. Keep timestamps reproducible
+// while making equal-sized content changes visible to its file transfer.
+func buildContentTime(sum []byte) time.Time {
+	seconds := int64(946684800 + binary.BigEndian.Uint32(sum[:4])%1_000_000_000)
+	nanoseconds := int64(binary.BigEndian.Uint32(sum[4:8]) % 1_000_000_000)
+	return time.Unix(seconds, nanoseconds).UTC()
+}
 
 var (
 	errInvalidBuildContext  = errors.New("invalid build context")
@@ -345,7 +356,8 @@ func copyBuildFile(source, target, canonical string, before os.FileInfo) error {
 			_ = os.Remove(target)
 		}
 	}()
-	written, err := io.Copy(output, io.LimitReader(input, before.Size()+1))
+	digest := sha256.New()
+	written, err := io.Copy(io.MultiWriter(output, digest), io.LimitReader(input, before.Size()+1))
 	if err != nil || written != before.Size() {
 		return errors.New("copy source file")
 	}
@@ -369,7 +381,8 @@ func copyBuildFile(source, target, canonical string, before os.FileInfo) error {
 	if err := os.Chmod(target, mode); err != nil {
 		return err
 	}
-	if err := os.Chtimes(target, normalizedBuildTime, normalizedBuildTime); err != nil {
+	contentTime := buildContentTime(digest.Sum(nil))
+	if err := os.Chtimes(target, contentTime, contentTime); err != nil {
 		return err
 	}
 	ok = true
@@ -443,7 +456,9 @@ func writeBuildFile(path string, contents []byte, mode os.FileMode) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := os.Chtimes(path, normalizedBuildTime, normalizedBuildTime); err != nil {
+	contentSum := sha256.Sum256(contents)
+	contentTime := buildContentTime(contentSum[:])
+	if err := os.Chtimes(path, contentTime, contentTime); err != nil {
 		return err
 	}
 	ok = true

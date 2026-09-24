@@ -15,7 +15,7 @@ import (
 	"github.com/hostd/hostd/internal/deploymentplans"
 )
 
-const CompilerVersion = "generated-node-v5"
+const CompilerVersion = "generated-node-v6"
 
 const (
 	installShellScript = `install=$(cat /run/rig/install.path) && rig_command=$(cat /run/secrets/rig-install-command) && cd -- "/workspace/$install" && exec /bin/sh -lc "$rig_command"`
