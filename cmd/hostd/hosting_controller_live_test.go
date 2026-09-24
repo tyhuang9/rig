@@ -347,6 +347,17 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	if plan.RevisionNumber != 1 || plan.RevisionID == "" || plan.Strategy != string(deploymentplans.StrategyGeneratedNode) {
 		t.Fatal("controller did not persist the generated plan")
 	}
+	frontendPlan := false
+	for _, component := range plan.Components {
+		if component.Name == "frontend" {
+			frontendPlan = component.Role == "static" && component.RootDirectory == "frontend" &&
+				component.RunCommand == "rig-static --root 'dist' --port 8080" &&
+				component.InternalPort == 8080 && component.HealthProbe == "/"
+		}
+	}
+	if !frontendPlan {
+		t.Fatal("accepted frontend plan differs from the reviewed static recipe")
+	}
 	// Reserve the application bridge first so the external fixture can bind to
 	// its gateway. The production engine validates the same ownership labels.
 	if _, err := controllerJourneyDocker(ctx, docker, nil, "network", "create", "--driver", "bridge",
@@ -664,6 +675,12 @@ func (observer *controllerJourneyHealthObserver) Run(ctx context.Context, reques
 				}
 				for _, code := range regexp.MustCompile(`\bERR_[A-Z_]{3,64}\b`).FindAll(combined, 3) {
 					observer.test.Logf("static frontend Node error code: %s", code)
+				}
+				for _, match := range regexp.MustCompile(`Cannot find module ['"]([^'"\r\n]{1,256})['"]`).FindAllSubmatch(combined, 2) {
+					missing := string(match[1])
+					if strings.HasPrefix(missing, "/workspace/") || strings.HasPrefix(missing, "/usr/local/lib/rig/") {
+						observer.test.Logf("static frontend missing module basename: %s", filepath.Base(missing))
+					}
 				}
 				clear(combined)
 				clear(logs.Stdout)

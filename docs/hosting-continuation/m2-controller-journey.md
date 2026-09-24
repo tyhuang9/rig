@@ -51,6 +51,10 @@ component without exposing application output or secret values. That run
 head `b77facb`) showed the API healthy and the static frontend exited with
 code 1 before serving. Cleanup passed. A bounded error-category probe on the
 controlled frontend's startup log is pending in the next hosted run.
+The fourth hosted run ([workflow 36034611177](https://github.com/tyhuang9/rig/actions/runs/36034611177),
+head `b79d07b`) classified that startup failure as `MODULE_NOT_FOUND`;
+the API again became healthy and cleanup passed. The next diagnostic checks
+the accepted static run command and logs only the missing module's basename.
 
 The QA and security reviews of the controller harness found no confirmed
 exploit. Their actionable gaps were addressed: the deployed API now probes
