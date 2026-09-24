@@ -26,6 +26,7 @@ import {
   type GitHubRepositoryPage,
   type InspectRequest,
   type InspectResponse,
+  type Job,
   type JobList,
   type JobMutationResponse,
   type JobResponse,
@@ -133,6 +134,9 @@ export function clearCSRF() {
   csrfToken = "";
   window.sessionStorage.removeItem("hostd-csrf");
   window.sessionStorage.removeItem("rig-github-authorization");
+  for (const key of Object.keys(window.sessionStorage)) {
+    if (key.startsWith("rig-setup-deployment:")) window.sessionStorage.removeItem(key);
+  }
 }
 
 async function rotateCSRF(): Promise<string> {
@@ -413,6 +417,7 @@ export const api = {
     request<GitHubBranchPage>(pagedPath(operations.listGitHubBranches.path, { connectionId, installationId, repositoryId }, page, perPage)),
   machines: () => request<MachineList>(operations.listMachines.path),
   jobs: () => request<JobList>(operations.listJobs.path),
+  job: (id: string) => request<Job>(operationPath(operations.getJob.path, { jobId: id })),
   cancelJob: (id: string) =>
     request<JobResponse>(operationPath(operations.cancelJob.path, { jobId: id }), {
       method: operations.cancelJob.method,
@@ -423,10 +428,10 @@ export const api = {
     request<ReleaseList>(operationPath(operations.listReleases.path, { appId })),
   runtimeApprovals: (appId: string) =>
     request<RuntimeApprovalList>(operationPath(operations.listRuntimeApprovals.path, { appId })),
-  deployApplication: (appId: string) =>
+  deployApplication: (appId: string, idempotencyKey: string = crypto.randomUUID()) =>
     request<JobMutationResponse>(operationPath(operations.deployApplication.path, { appId }), {
       method: operations.deployApplication.method,
-      headers: { "Idempotency-Key": crypto.randomUUID() },
+      headers: { "Idempotency-Key": idempotencyKey },
     }),
   deployRelease: (appId: string, releaseId: string, data: DeployReleaseRequest) =>
     request<JobMutationResponse>(operationPath(operations.deployRelease.path, { appId, releaseId }), {

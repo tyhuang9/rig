@@ -239,13 +239,23 @@ describe("API client", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await api.deployments("app/one"); await api.releases("app/one"); await api.runtimeApprovals("app/one");
-    await api.deployApplication("app/one"); await api.deployRelease("app/one", "release/one", { configurationMode: "original" });
+    await api.deployApplication("app/one", "setup-request-key"); await api.deployRelease("app/one", "release/one", { configurationMode: "original" });
     await api.grantRuntimeApproval("app/one", { fingerprint: "a".repeat(64) }); await api.revokeRuntimeApproval("app/one", "approval/one"); await api.resumeJob("job/one");
 
-    expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/v1/apps/app%2Fone/deployments", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token", "Idempotency-Key": expect.any(String) }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/v1/apps/app%2Fone/deployments", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token", "Idempotency-Key": "setup-request-key" }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(5, "/api/v1/apps/app%2Fone/releases/release%2Fone/deployments", expect.objectContaining({ method: "POST", body: JSON.stringify({ configurationMode: "original" }), headers: expect.objectContaining({ "Idempotency-Key": expect.any(String) }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(6, "/api/v1/apps/app%2Fone/runtime-approvals", expect.objectContaining({ method: "POST", headers: expect.not.objectContaining({ "Idempotency-Key": expect.any(String) }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(8, "/api/v1/jobs/job%2Fone/resume", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+  });
+
+  it("reads an exact durable job and clears setup attempts on sign out", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: "job-1", status: "succeeded" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    window.sessionStorage.setItem("rig-setup-deployment:app-1", JSON.stringify({ signature: "plan:1:config:1", key: "key" }));
+    await expect(api.job("job/one")).resolves.toMatchObject({ id: "job-1", status: "succeeded" });
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/jobs/job%2Fone", expect.objectContaining({ credentials: "same-origin" }));
+    clearCSRF();
+    expect(window.sessionStorage.getItem("rig-setup-deployment:app-1")).toBeNull();
   });
 
   it("uses generated auto-deploy paths with exact CAS request bodies and CSRF", async () => {

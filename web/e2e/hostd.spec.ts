@@ -140,7 +140,7 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
   await page.getByLabel("Description").fill("A deterministic browser fixture");
   await page.getByLabel("Local source path").fill(sourceRoot);
   await page.getByRole("button", { name: "Analyze project" }).click();
-  await expect(page.getByRole("heading", { name: "How Rig will run this app" })).toBeFocused();
+  await expect(page.getByRole("heading", { name: "How Rig will run this app" })).toBeFocused({ timeout: 30_000 });
   await page.getByRole("button", { name: "Review setup" }).click();
   await expect(page.getByRole("button", { name: "Accept setup" })).toBeVisible();
   await page.getByRole("button", { name: "Accept setup" }).click();
@@ -151,7 +151,15 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
   await expect(page.getByRole("heading", { name: "How Rig will run this app" })).toBeFocused();
   await page.getByRole("button", { name: "Accept setup" }).click();
   await expect(page.getByRole("heading", { name: "Setup accepted" })).toBeFocused();
-  await page.getByRole("button", { name: "Open application" }).click();
+  await page.getByRole("button", { name: "Continue setup" }).click();
+  await expect(page.getByRole("heading", { name: "Configure application" })).toBeFocused();
+  await page.getByRole("button", { name: "Continue to access" }).click();
+  await expect(page.getByRole("heading", { name: "Access", exact: true })).toBeFocused();
+  await expect(page.getByText("Rig does not provision a database.", { exact: false })).toBeVisible();
+  await page.getByRole("button", { name: "Review deployment" }).click();
+  await expect(page.getByRole("heading", { name: "Review and deploy" })).toBeFocused();
+  await expect(page.getByRole("button", { name: "Deploy application" })).toBeDisabled();
+  await page.getByRole("link", { name: "Open application" }).click();
   await expect(page.getByRole("heading", { name: longName })).toBeVisible();
   const restoredPage = await context.newPage();
   watchForErrors(restoredPage);

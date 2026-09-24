@@ -1,0 +1,175 @@
+# Hosting continuation: M2 controller journey candidate
+
+**Recorded:** 2026-09-24. **Branch:** `feature/hosting-m2-controller-journey`,
+based on the unmerged M1 draft candidate. This is an M2 implementation slice,
+not an M2 acceptance claim. Draft PR [#71](https://github.com/tyhuang9/rig/pull/71)
+targets the unmerged M1 branch. Neither PR has been merged.
+
+## Implemented slice
+
+- The saved generated-application setup continues from accepted source and plan
+  review through scoped configuration, local access review, a guarded deployment
+  request, and the durable job/deployment result. Setup resumes by application
+  ID. The UI does not claim an access URL because the controller API does not
+  currently attest one.
+- An opt-in Linux Docker gate uses the authenticated controller HTTP API,
+  persisted synthetic GitHub device connection, repository/branch selection,
+  an authenticated local HTTP archive fixture, production generated-runtime
+  composition and worker, immutable release snapshot, public-package fixture,
+  real image builds, Caddy ingress, and application-owned external TLS
+  PostgreSQL and HTTPS services. It checks
+  controller idempotency replay, plan/configuration and source pins, scoped
+  container environment, API note create/read, frontend public label, and
+  ownership-checked cleanup. The gate is wired to a pull-request-only workflow.
+- The test uses the existing `examples/hosting-notes` fixture. Its database
+  schema and credentials remain application-owned; Rig does not provision a
+  database. There is no managed database or Neon provisioning path.
+- The archive fixture includes only committed example files that match `HEAD`.
+  Ignored files, generated dependencies, and local fixture edits are not
+  archived. The controlled provider uses synthetic credentials and a synthetic
+  commit SHA. It exercises Rig's persisted connection, source inspection,
+  materializer, and runtime path; the separate `githubapp.Client` tests cover
+  fixed provider origins and redirect rules. A live GitHub consent/archive
+  walkthrough remains unverified.
+- The controller gate now closes its worker, HTTP server, and database after a
+  successful deployment; it checks the note through ingress while the
+  controller is stopped, then reopens the durable store, recreates the runtime
+  composition, restarts the worker and authenticated HTTP API, and checks the
+  original job, deployment, release, and note. Hosted
+  [run 36037733718](https://github.com/tyhuang9/rig/actions/runs/36037733718)
+  passed this restart extension and exact cleanup on head `077f669`.
+- The next gate extension drives Chromium through the deployed frontend,
+  Caddy, API, and external TLS PostgreSQL to create/read a note, then opens
+  a fresh browser after controller restart to read the same note. Hosted
+  [run 36038405153](https://github.com/tyhuang9/rig/actions/runs/36038405153)
+  passed both Chromium journeys and exact cleanup on head `2903ca1`.
+- The next gate extension saves a second scoped configuration on the same
+  source, deploys it through the restarted controller, and checks the new
+  immutable pins, healthy replacement, scoped containers, and preserved note.
+  Hosted [run 36039019169](https://github.com/tyhuang9/rig/actions/runs/36039019169)
+  passed on head `2bab27d`: the second deployment switched to a new runtime
+  marker, preserved the source digest and database note, and passed a fresh
+  Chromium read. Exact cleanup passed.
+- The next gate extension installs a valid unrelated CA as a new scoped secret,
+  attempts replacement, and requires a `health_failed` job and immutable
+  failed deployment record while the previous healthy marker and note remain
+  available through Caddy and Chromium. Hosted
+  [run 36039760965](https://github.com/tyhuang9/rig/actions/runs/36039760965)
+  passed on head `04e4b65b98f41416a53bbe5941979f0f799fa63d`. The live test
+  `TestLiveControllerGeneratedDeploymentJourney` passed in 173.55 seconds;
+  the workflow's exact Docker cleanup step also passed. The record includes
+  plan, configuration, job, deployment, and release IDs for the initial,
+  healthy replacement, and failed replacement attempts without credentials.
+  The runner was Ubuntu 24.04 with Docker CLI/Engine 28.0.4, API 1.48,
+  Compose 2.38.2, and Buildx 0.37.1. This is hosted Linux evidence, not
+  Windows Docker Desktop or physical LAN evidence.
+- The first controlled GitHub path passed on head `51df587` in
+  [run 36041184071](https://github.com/tyhuang9/rig/actions/runs/36041184071).
+  Security review then narrowed source staging to committed fixture files.
+  The final controlled GitHub path passed on exact code head
+  `2a04a4039f600a5812e6fbdad51eec5f8eddbfa2` in
+  [run 36042000520](https://github.com/tyhuang9/rig/actions/runs/36042000520).
+  `TestLiveControllerGeneratedDeploymentJourney` passed in 164.53 seconds,
+  including the initial browser note, controller restart, healthy same-source
+  replacement, failed bad-CA replacement, three HTTP archive reads, and exact
+  Docker cleanup. The job ran on Ubuntu 24.04 with Docker CLI/Engine 28.0.4,
+  API 1.48, Compose 2.38.2, and Buildx 0.37.1.
+
+| Final controlled GitHub run identity | Value |
+| --- | --- |
+| Synthetic source commit / runtime strategy | `cccccccccccccccccccccccccccccccccccccccc` / generated static frontend + Node API |
+| Application / connection | `d27a974b-f0d8-4403-a35a-5e262e42e481` / `df86b22218da8ebf73a2144b4bbb68e6` |
+| Accepted plan | `0d2a2c01-ce39-4e90-82e0-eb8c22702f63/1` |
+| Initial configuration / job / deployment / release | `da43bbab-1c81-42ec-8c09-725111c9de43/1` / `a67ef2e3-82b9-4429-8009-d805a07ec2b2` / `3ab9e2ca-2c68-49b6-a1ff-186f164d8e0c` / `0d8ab723c5c467be9fa164a0f9b99bbf` |
+| Healthy replacement configuration / job / deployment / release | `f6efd31a-bee5-43d8-8fb7-49408bd4b67c/2` / `ddf1594e-f419-4a2b-be10-9cac4641b89f` / `25a1f953-aff4-46f2-8dfa-5d874c3acf21` / `9bb4e7f2f5d518498026a1f9b75b1085` |
+| Failed replacement configuration / job / deployment | `ef78e9c7-43d3-4f40-a469-fd295da728af/3` / `8b713011-d749-4f11-9add-fbcec6f566d6` / `cdbd9b0a-f317-4d78-8363-555b9202e9b5` |
+
+## Verification so far
+
+| Check | Result |
+| --- | --- |
+| `go test -count=1 -timeout=15m ./...` | Passed locally on Windows, including controller, generated runtime, source snapshot, and job packages. |
+| `go test -tags live_docker ./cmd/hostd -run '^TestPrepareRuntimeWorkerRecoversInOrderBeforeStartingOneWorker$' -count=1` | Passed locally; compiles the new tagged live harness and runs a focused existing test. It does **not** execute the Docker gate. |
+| `go vet -tags live_docker ./cmd/hostd` | Passed locally. |
+| Frontend TypeScript, production Vite build, and full Vitest suite | Passed after review fixes: 373 tests in 14 files. The Windows worktree used the installed TypeScript, Vite, and Vitest Node entrypoints directly because the local pnpm 11.19 shim attempted to replace the linked 11.22 dependencies. |
+| Real-controller Chromium (`web/e2e/hostd.spec.ts`) | Passed with the new setup navigation, heading focus, local-access review, fake-runtime deploy guard, and the existing Compose create/cancel path. The first run found a missing initial heading focus after query loading; a later run found a query-key collision that disabled legacy Compose deploy. Both were fixed. |
+| Full Playwright suite | Passed: 3 tests, including the real-controller journey and two source-connection/focus journeys. Local runs set `GOFLAGS=-buildvcs=false` because the managed worktree's Git metadata is restricted to the spawned browser-test Go build. |
+| Embedded dashboard hash comparison | Passed after the final Vite build; the controller-served file set and SHA-256 hashes match `web/dist`. |
+
+The first hosted Docker run ([workflow 36032619684](https://github.com/tyhuang9/rig/actions/runs/36032619684),
+head `58389f4`) reached the durable deployment job but failed with
+`invalid_source` before image builds. The cleanup step passed. Investigation
+found that the workflow's pnpm install leaves package links under the fixture's
+`node_modules`; the local release materializer correctly rejects links. The
+controller test now stages a clean fixture source, keeping the installed copy
+only for application-owned schema preparation. The second hosted run
+([workflow 36033350599](https://github.com/tyhuang9/rig/actions/runs/36033350599),
+head `1e429d0`) reached real image builds and container readiness, then failed
+with `health_failed`. Its cleanup step passed. The next run records only
+component names and Docker health transitions to identify the failing
+component without exposing application output or secret values. That run
+([workflow 36034083663](https://github.com/tyhuang9/rig/actions/runs/36034083663),
+head `b77facb`) showed the API healthy and the static frontend exited with
+code 1 before serving. Cleanup passed. A bounded error-category probe on the
+controlled frontend's startup log followed.
+The fourth hosted run ([workflow 36034611177](https://github.com/tyhuang9/rig/actions/runs/36034611177),
+head `b79d07b`) classified that startup failure as `MODULE_NOT_FOUND`;
+the API again became healthy and cleanup passed. The next diagnostic checked
+the accepted static run command and logged only the missing module's basename.
+The fifth hosted run ([workflow 36035148372](https://github.com/tyhuang9/rig/actions/runs/36035148372),
+head `688cee7`) confirmed the accepted static command and identified the
+missing module basename as `static.mjs`; the API was healthy and cleanup
+passed. The next run distinguished the application's workspace from Rig's
+runtime library path and probed that exact library file in the stopped
+container without printing its contents.
+The sixth hosted run ([workflow 36035720070](https://github.com/tyhuang9/rig/actions/runs/36035720070),
+head `ad5eb92`) located the error at Rig's `/usr/local/lib/rig/static.mjs`.
+Docker could copy that file from the stopped container even though Node exited
+with `MODULE_NOT_FOUND`; API health and cleanup passed. The next bounded probe
+recorded only the static module and parent directory modes/owners to resolve
+the apparent access mismatch.
+The seventh hosted run ([workflow 36036347990](https://github.com/tyhuang9/rig/actions/runs/36036347990),
+head `0a5a6e8`) found the exact mismatch: both `static.mjs` and its newly
+created parent `/usr/local/lib/rig` had mode `0444` and root ownership.
+The non-root runtime could read the file but could not traverse its parent.
+The generated image recipe now explicitly sets the parent directory to
+`0555` after copying the file. The first post-fix hosted gate,
+[run 36037028248](https://github.com/tyhuang9/rig/actions/runs/36037028248),
+passed on head `49be8ea`; later hosted gates above passed on their exact heads.
+
+The QA and security reviews of the controller harness found no confirmed
+exploit. Their actionable gaps were addressed: the deployed API now probes
+the HTTPS fixture, a nonlocal Docker context is rejected before mutation,
+ingress cleanup is registered before composition, idempotent replay and exact
+release/configuration pins are asserted, and the Buildx record is checked after
+removal. Broader image-layer and frontend-asset secret coverage remains in
+the M1 hosted gate. The Windows host has no Docker CLI, so hosted CI is the
+authority for the Docker journey.
+
+Frontend review caught and fixed a job API response mismatch, loss of an
+uncertain idempotency key after configuration drift, inaccessible continuation
+failure feedback, and hidden known-job results when current setup becomes
+unavailable. The UI now compares the recorded deployment pins with the
+reviewed revisions and warns if they differ. The backend still has no
+deployment precondition for the reviewed revisions and no lookup by
+idempotency key. If a response is lost and the setup changes, the UI preserves
+the unresolved key, blocks automatic replay, and requires an explicit
+history-check decision before starting a new request. It cannot automatically
+prove whether the original request reached the controller.
+
+## Open M2 acceptance work
+
+- Keep the hosted controller journey gate green on the final M2 head; the
+  current passed code head is `2a04a4039f600a5812e6fbdad51eec5f8eddbfa2`.
+- Perform a separate live GitHub authorization/archive walkthrough with a
+  disposable repository; controlled provider evidence does not establish it.
+- Cover the supported Node, Vite, Next.js, and package-manager recipe matrix.
+- Verify manual setup, backend interface binding, capacity pause, migration
+  failure, private-network isolation, and interrupted controller recovery.
+- Expose an attested route URL and a revision-pinned deployment precondition
+  through the controller before the UI can assert that the reviewed revision
+  and displayed URL are the ones actually serving.
+
+M1's direct-engine hosted run established its scoped configuration gate, but
+it does not substitute for these controller and browser checks. M2 remains
+open until its exit gate has executable evidence on the final candidate.

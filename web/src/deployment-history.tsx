@@ -49,7 +49,7 @@ const deploymentResult = (item: Deployment) => {
       return item.failureSummary || item.diagnosticCode || "No failure recorded";
   }
 };
-const deploymentPlanOrLegacy = async (appId: string) => {
+export const deploymentPlanOrLegacy = async (appId: string) => {
   try {
     return await api.deploymentPlan(appId);
   } catch (error) {

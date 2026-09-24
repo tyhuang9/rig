@@ -15,9 +15,10 @@ import {
 import { SourceWizard } from "./source-wizard";
 import { GitHubConnectionCard } from "./github-connection";
 import { ApplicationConfigurationPanel } from "./application-configuration";
+import { ApplicationDeploymentSetup } from "./application-setup";
 import { ApplicationPlanPanel } from "./application-plan-panel";
 import { AutoDeployPanel } from "./auto-deploy";
-import { DeploymentHistoryPanel } from "./deployment-history";
+import { DeploymentHistoryPanel, deploymentPlanOrLegacy } from "./deployment-history";
 import { UnsavedChangesGuard, useConfirmDiscard } from "./unsaved-changes";
 
 type RelayPanelProps = { role: string };
@@ -78,7 +79,7 @@ function StatusText({ value }: { value: string }) {
 function Layout({ user, onLogout, children }: { user: User; onLogout: () => void; children: React.ReactNode }) {
   const location = useLocation();
   const confirmDiscard = useConfirmDiscard();
-  const routeName = location.pathname.startsWith("/connections") ? "Connections" : location.pathname.startsWith("/machines") ? "Machines" : location.pathname.startsWith("/activity") ? "Activity" : location.pathname.startsWith("/apps/new") ? "Add application" : "Applications";
+  const routeName = location.pathname.startsWith("/connections") ? "Connections" : location.pathname.startsWith("/machines") ? "Machines" : location.pathname.startsWith("/activity") ? "Activity" : location.pathname.startsWith("/apps/new") ? "Add application" : location.pathname.endsWith("/setup") ? "Deployment setup" : "Applications";
   return <div className="shell">
     <a className="skip" href="#main">Skip to content</a>
     <aside className="rail">
@@ -207,8 +208,16 @@ function AddApplicationPage() {
   const navigate = useNavigate();
   return <>
     <PageHeader title="Add application" subtitle="Save a source reference and durable application draft." action={<button className="button" onClick={() => navigate("/apps")}>Cancel</button>}/>
-    <SourceWizard onCancel={() => navigate("/apps")} onCreated={(id) => navigate(`/apps/${id}`)} />
+    <SourceWizard onCancel={() => navigate("/apps")} onCreated={(id) => navigate(`/apps/${id}`)} onSetupReady={(id) => navigate(`/apps/${id}/setup`)} />
   </>;
+}
+
+function ApplicationSetupPage() {
+  const { id = "" } = useParams();
+  const appQuery = useQuery({ queryKey: ["app", id], queryFn: () => api.app(id) });
+  if (appQuery.isLoading) return <LoadingState/>;
+  if (appQuery.isError || !appQuery.data) return <QueryError message={appQuery.error?.message || "Application unavailable."}/>;
+  return <><PageHeader title={`Set up ${appQuery.data.name}`} subtitle="Configure and deploy the saved application." action={<NavLink className="button" to={`/apps/${id}`}>Open application</NavLink>}/><ApplicationDeploymentSetup app={appQuery.data}/></>;
 }
 
 function ApplicationDetailPage() {
@@ -216,6 +225,7 @@ function ApplicationDetailPage() {
   const appQuery = useQuery({ queryKey: ["app", id], queryFn: () => api.app(id) });
   const statusQuery = useQuery({ queryKey: ["system-status"], queryFn: api.status });
   const deploymentQuery = useQuery({ queryKey: ["deployments", id], queryFn: () => api.deployments(id) });
+  const planQuery = useQuery({ queryKey: ["deployment-plan", id], queryFn: () => deploymentPlanOrLegacy(id), retry: false });
   if (appQuery.isLoading || statusQuery.isLoading) return <LoadingState/>;
   if (appQuery.isError) return <QueryError message={appQuery.error.message}/>;
   if (statusQuery.isError) return <QueryError message={statusQuery.error.message}/>;
@@ -227,6 +237,7 @@ function ApplicationDetailPage() {
   const currentDeployment = deploymentQuery.data?.items[0];
   return <>
     <PageHeader title={app.name} subtitle={`${app.machineName || "Local machine"} · ${app.status}`}/>
+    {planQuery.data?.state === "accepted" && planQuery.data.strategy === "generated_node" && <NavLink className="button" to={`/apps/${id}/setup`}>Continue deployment setup</NavLink>}
     <p className="section-kicker">Overview</p>
     <div className="summary"><article><small>Current deployment</small><strong>{currentDeployment ? <StatusText value={currentDeployment.status}/> : deploymentQuery.isLoading ? "Loading..." : "Not deployed"}</strong><span>{currentDeployment ? `Configuration ${currentDeployment.configurationMode}` : deploymentQuery.isError ? "History unavailable" : "No deployment record"}</span></article><article><small>Source</small><strong className="mono">{app.slug}</strong><span>Runtime is not inferred</span></article><article><small>Health</small><strong>Not verified</strong><span>Health reporting is not available</span></article></div>
     {fakeRuntime ? <div className="callout warning"><strong>Development capability</strong><span>The fake runtime persists job progress but executes no workload.</span></div> : !composeRuntime && !generatedRuntime && <div className="callout info"><strong>Runtime actions unavailable</strong><span>Configure a runtime to deploy this application.</span></div>}
@@ -303,5 +314,5 @@ export function App() {
   if (bootstrapRequired === null) return <main className="auth"><LoadingState/></main>;
   if (!user) return <Login setup={bootstrapRequired} onAuthenticated={(nextUser) => { setUser(nextUser); setBootstrapRequired(false); navigate("/apps"); }}/>;
   const logout = async () => { try { await api.logout(); } finally { clearCSRF(); queryClient.clear(); setUser(null); navigate("/login"); } };
-  return <UnsavedChangesGuard><Layout user={user} onLogout={logout}><Routes><Route path="/" element={<ApplicationsPage/>}/><Route path="/apps" element={<ApplicationsPage/>}/><Route path="/apps/new" element={<AddApplicationPage/>}/><Route path="/apps/:id" element={<ApplicationDetailPage/>}/><Route path="/connections" element={<ConnectionsPage/>}/><Route path="/machines" element={<MachinesPage role={user.role}/>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="*" element={<ApplicationsPage/>}/></Routes></Layout></UnsavedChangesGuard>;
+  return <UnsavedChangesGuard><Layout user={user} onLogout={logout}><Routes><Route path="/" element={<ApplicationsPage/>}/><Route path="/apps" element={<ApplicationsPage/>}/><Route path="/apps/new" element={<AddApplicationPage/>}/><Route path="/apps/:id/setup" element={<ApplicationSetupPage/>}/><Route path="/apps/:id" element={<ApplicationDetailPage/>}/><Route path="/connections" element={<ConnectionsPage/>}/><Route path="/machines" element={<MachinesPage role={user.role}/>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="*" element={<ApplicationsPage/>}/></Routes></Layout></UnsavedChangesGuard>;
 }
