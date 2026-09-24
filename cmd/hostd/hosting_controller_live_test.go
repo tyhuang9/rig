@@ -6,6 +6,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -50,8 +51,8 @@ const (
 )
 
 // This hosted gate exercises the real controller API, durable worker, compiler,
-// runtime, and ingress. The source is a local immutable release snapshot; the
-// controlled GitHub archive/connection journey remains a separate M2 gate.
+// runtime, and ingress. The source comes through a controlled GitHub connection
+// and HTTP archive fixture into an immutable release snapshot.
 func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	if os.Getenv("RIG_RUN_LIVE_CONTROLLER_JOURNEY") != "1" {
 		t.Fatal("set RIG_RUN_LIVE_CONTROLLER_JOURNEY=1 to run the hosted Docker gate")
@@ -191,7 +192,9 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sources := sourceconnections.NewService(sourceconnections.NewRepository(db), nil, sourceconnections.NewFileCredentialStore(dataRoot), "", time.Now)
+	provider := controllerJourneyNewGitHubProvider(t, source)
+	sourceClock := time.Now().UTC()
+	sources := sourceconnections.NewService(sourceconnections.NewRepository(db), provider, sourceconnections.NewFileCredentialStore(dataRoot), "fixture-app", func() time.Time { return sourceClock })
 	snapshots, err := releasesnapshot.New(db, sources, dataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -266,16 +269,38 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	if err != nil || json.Unmarshal(setupBytes, &setup) != nil {
 		t.Fatal("read reviewed hosting setup")
 	}
+	var authorization apicontract.GitHubDeviceAuthorization
+	request(http.MethodPost, "/api/v1/source-connections/github/device", nil, http.StatusCreated, &authorization)
+	if authorization.ConnectionID == "" || authorization.PollIntervalSeconds != 1 {
+		t.Fatal("controlled GitHub connection did not start")
+	}
+	sourceClock = sourceClock.Add(2 * time.Second)
+	var connection apicontract.SourceConnection
+	request(http.MethodPost, "/api/v1/source-connections/"+authorization.ConnectionID+"/device/poll", nil, http.StatusOK, &connection)
+	if connection.Status != "connected" || connection.ProviderUserID != "4242" {
+		t.Fatal("controlled GitHub connection did not persist an authorized identity")
+	}
+	var repositories apicontract.GitHubRepositoryPage
+	request(http.MethodGet, "/api/v1/source-connections/"+connection.ID+"/github/installations/7/repositories", nil, http.StatusOK, &repositories)
+	if len(repositories.Items) != 1 || repositories.Items[0].ID != 17 {
+		t.Fatal("controlled GitHub repository selection failed")
+	}
+	var branches apicontract.GitHubBranchPage
+	request(http.MethodGet, "/api/v1/source-connections/"+connection.ID+"/github/installations/7/repositories/17/branches", nil, http.StatusOK, &branches)
+	if len(branches.Items) != 1 || branches.Items[0].Sha != controllerJourneyGitHubSHA {
+		t.Fatal("controlled GitHub branch selection failed")
+	}
+	githubSource := apicontract.GitHubSource{ConnectionID: connection.ID, InstallationID: 7, RepositoryID: 17, Branch: "main"}
 	var inspection apicontract.InspectResponse
-	request(http.MethodPost, "/api/v1/apps/import/inspect", apicontract.InspectRequest{SourcePath: source, Setup: &setup}, http.StatusOK, &inspection)
+	request(http.MethodPost, "/api/v1/apps/import/inspect", apicontract.InspectRequest{GithubSource: githubSource, Setup: &setup}, http.StatusOK, &inspection)
 	if len(inspection.Analysis.Candidates) == 0 || inspection.Analysis.StructuralFingerprint == "" {
 		t.Fatal("reviewed source inspection returned no candidate")
 	}
 	candidate := inspection.Analysis.Candidates[len(inspection.Analysis.Candidates)-1]
 	var application apicontract.Application
-	request(http.MethodPost, "/api/v1/apps", apicontract.CreateApplicationRequest{Name: "Controller Journey", SourcePath: source, Setup: &setup}, http.StatusCreated, &application)
-	if application.ID == "" || application.Source.Type != "local" {
-		t.Fatal("controller did not save the selected local source")
+	request(http.MethodPost, "/api/v1/apps", apicontract.CreateApplicationRequest{Name: "Controller Journey", GithubSource: githubSource, Setup: &setup}, http.StatusCreated, &application)
+	if application.ID == "" || application.Source.Type != "github" || application.Source.RepositoryID != 17 {
+		t.Fatal("controller did not save the selected GitHub source")
 	}
 	network, err := generatedruntime.DescribeAppNetwork(application.ID)
 	if err != nil {
@@ -496,17 +521,18 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	var releases apicontract.ReleaseList
 	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/releases", nil, http.StatusOK, &releases)
 	if len(releases.Items) != 1 || releases.Items[0].ID != history.Items[0].ReleaseID ||
-		releases.Items[0].SourceProvider != "local" || releases.Items[0].WorkspaceState != "ready" ||
+		releases.Items[0].SourceProvider != "github" || releases.Items[0].RepositoryID != 17 || releases.Items[0].ResolvedSha != controllerJourneyGitHubSHA || releases.Items[0].WorkspaceState != "ready" ||
 		releases.Items[0].DeploymentPlanRevisionID != plan.RevisionID || releases.Items[0].DeploymentPlanRevisionNumber != plan.RevisionNumber ||
 		releases.Items[0].ConfigurationRevisionID != saved.RevisionID || releases.Items[0].ConfigurationRevisionNumber != saved.RevisionNumber {
 		t.Fatal("deployment did not pin one immutable release")
 	}
-	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(releases.Items[0].ArchiveSha256) {
-		t.Fatal("local release has no immutable source digest")
+	archiveDigest := sha256.Sum256(provider.archive)
+	if releases.Items[0].ArchiveSha256 != fmt.Sprintf("%x", archiveDigest) || provider.archiveReads.Load() == 0 {
+		t.Fatal("GitHub release has no downloaded immutable archive digest")
 	}
 	workspace, err := snapshots.ReadyWorkspace(ctx, application.ID, releases.Items[0].ID)
-	if err != nil || workspace.WorkspaceTreeSHA256 != releases.Items[0].ArchiveSha256 || workspace.WorkspaceState != "ready" {
-		t.Fatal("pinned local release workspace failed digest verification")
+	if err != nil || workspace.WorkspaceTreeSHA256 == "" || workspace.WorkspaceState != "ready" {
+		t.Fatal("pinned GitHub release workspace failed digest verification")
 	}
 	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey")
@@ -552,7 +578,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restartedSources := sourceconnections.NewService(sourceconnections.NewRepository(reopenedDB), nil, sourceconnections.NewFileCredentialStore(dataRoot), "", time.Now)
+	restartedSources := sourceconnections.NewService(sourceconnections.NewRepository(reopenedDB), provider, sourceconnections.NewFileCredentialStore(dataRoot), "fixture-app", time.Now)
 	restartedSnapshots, err := releasesnapshot.New(reopenedDB, restartedSources, dataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -723,7 +749,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, "read", browserNote)
-	t.Logf("M2 controller journey identities: app=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s replacement-config=%s/%d replacement-job=%s replacement-deployment=%s replacement-release=%s bad-config=%s/%d failed-job=%s failed-deployment=%s source=local-snapshot ingress=127.0.0.1:8080", application.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID, replacementConfiguration.RevisionID, replacementConfiguration.RevisionNumber, replacementJob.ID, replacementDeployment.ID, replacementRelease.ID, badConfiguration.RevisionID, badConfiguration.RevisionNumber, failedJob.ID, failedDeployment.ID)
+	t.Logf("M2 controller journey identities: app=%s connection=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s replacement-config=%s/%d replacement-job=%s replacement-deployment=%s replacement-release=%s bad-config=%s/%d failed-job=%s failed-deployment=%s source=github-fixture sha=%s archive-reads=%d ingress=127.0.0.1:8080", application.ID, connection.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID, replacementConfiguration.RevisionID, replacementConfiguration.RevisionNumber, replacementJob.ID, replacementDeployment.ID, replacementRelease.ID, badConfiguration.RevisionID, badConfiguration.RevisionNumber, failedJob.ID, failedDeployment.ID, controllerJourneyGitHubSHA, provider.archiveReads.Load())
 }
 
 func controllerJourneyExecutable(t *testing.T, name string) string {
