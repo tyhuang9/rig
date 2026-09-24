@@ -3,6 +3,7 @@
 package generatedimage
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"database/sql"
@@ -646,6 +647,83 @@ func hostingLiveImageHasNoSecrets(t *testing.T, ctx context.Context, docker, con
 				t.Fatal("scoped runtime secret appeared in generated API image metadata")
 			}
 		}
+	}
+	archivePath := filepath.Join(t.TempDir(), "generated-api-image.tar")
+	if _, err := hostingLiveDockerOutput(ctx, docker, config, nil, "image", "save", "--output", archivePath, imageID); err != nil {
+		t.Fatal("save generated API image for layer inspection")
+	}
+	archiveFile, err := os.Open(archivePath)
+	if err != nil {
+		t.Fatal("open saved generated API image")
+	}
+	defer archiveFile.Close()
+	layers := 0
+	archive := tar.NewReader(archiveFile)
+	for {
+		header, err := archive.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal("read saved generated API image archive")
+		}
+		if header.Name != "layer.tar" && !strings.HasSuffix(header.Name, "/layer.tar") {
+			continue
+		}
+		layers++
+		found, err := hostingLiveContainsSecret(archive, forbidden)
+		if err != nil {
+			t.Fatal("read generated API image layer")
+		}
+		if found {
+			t.Fatal("scoped runtime secret appeared in a generated API image layer")
+		}
+	}
+	if layers == 0 {
+		t.Fatal("saved generated API image contained no inspectable layers")
+	}
+}
+
+func hostingLiveContainsSecret(reader io.Reader, forbidden []string) (bool, error) {
+	maximum := 0
+	for _, secret := range forbidden {
+		maximum = max(maximum, len(secret))
+	}
+	buffer := make([]byte, 64*1024+maximum)
+	defer clear(buffer)
+	carry := 0
+	for {
+		count, err := reader.Read(buffer[carry:])
+		window := buffer[:carry+count]
+		for _, secret := range forbidden {
+			if secret != "" && bytes.Contains(window, []byte(secret)) {
+				return true, nil
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if count == 0 {
+			return false, errors.New("image layer reader made no progress")
+		}
+		carry = min(len(window), max(0, maximum-1))
+		copy(buffer[:carry], window[len(window)-carry:])
+	}
+}
+
+func TestHostingLiveContainsSecretAcrossReadBoundary(t *testing.T) {
+	secret := "synthetic-secret"
+	prefix := strings.Repeat("x", 64*1024+len(secret)-2)
+	found, err := hostingLiveContainsSecret(strings.NewReader(prefix+secret+"tail"), []string{secret})
+	if err != nil || !found {
+		t.Fatal("layer scanner missed a secret across a read boundary")
+	}
+	found, err = hostingLiveContainsSecret(strings.NewReader(prefix+"safe-tail"), []string{secret})
+	if err != nil || found {
+		t.Fatal("layer scanner misclassified safe layer bytes")
 	}
 }
 
