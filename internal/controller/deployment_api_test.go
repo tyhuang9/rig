@@ -272,6 +272,9 @@ func TestReviewedGeneratedDeploymentRejectsDriftAndReplaysExactJob(t *testing.T)
 		return string(encoded)
 	}
 	firstBody := body(plan, "", 0)
+	for _, unreviewed := range []string{"{}", ""} {
+		assertProblemCode(t, f.request(http.MethodPost, path, unreviewed), http.StatusUnprocessableEntity, "reviewed_revisions_required")
+	}
 	first := f.requestWithKey(http.MethodPost, path, firstBody, "reviewed-first")
 	if first.Code != http.StatusAccepted {
 		t.Fatalf("first = %d %s", first.Code, first.Body.String())
@@ -306,6 +309,7 @@ func TestReviewedGeneratedDeploymentRejectsDriftAndReplaysExactJob(t *testing.T)
 	if replayMutation.Created || replayMutation.Job.ID != stored.ID {
 		t.Fatalf("replay = %+v", replayMutation)
 	}
+	assertProblemCode(t, f.requestWithKey(http.MethodPost, path, body(nextPlan, "", 0), "reviewed-first"), http.StatusConflict, "idempotency_conflict")
 	stalePlan := f.requestWithKey(http.MethodPost, path, firstBody, "reviewed-stale-plan")
 	assertProblemCode(t, stalePlan, http.StatusConflict, "reviewed_revision_stale")
 	if _, err := f.jobs.GetDeploymentByIdempotency(f.app.ID, f.userID(t), "reviewed-stale-plan"); !errors.Is(err, jobs.ErrJobNotFound) {
@@ -426,10 +430,14 @@ func TestLatestDeploymentUsesExactAcceptedPlanStrategy(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			f := newDeploymentAPIFixtureWithRuntimes(t, testCase.compose, testCase.generated, testCase.fake)
+			requestBody := "{}"
 			if testCase.strategy != "" {
-				f.acceptPlan(t, f.app.ID, testCase.strategy)
+				revision := f.acceptPlan(t, f.app.ID, testCase.strategy)
+				if testCase.strategy == deploymentplans.StrategyGeneratedNode {
+					requestBody = fmt.Sprintf(`{"expectedPlanRevisionId":%q,"expectedPlanRevisionNumber":%d,"expectedConfigurationRevisionId":"","expectedConfigurationRevisionNumber":0}`, revision.ID, revision.RevisionNumber)
+				}
 			}
-			response := f.request(http.MethodPost, "/api/v1/apps/"+f.app.ID+"/deployments", "{}")
+			response := f.request(http.MethodPost, "/api/v1/apps/"+f.app.ID+"/deployments", requestBody)
 			if !testCase.allowed {
 				assertProblemCode(t, response, http.StatusConflict, "capability_unavailable")
 				return

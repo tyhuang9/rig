@@ -529,6 +529,17 @@ func TestGeneratedExecutorRejectsReviewedRevisionDriftBeforeRuntimeSideEffects(t
 	}
 }
 
+func TestGeneratedExecutorRejectsUnpinnedLatestJobBeforeRuntimeSideEffects(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	job := deploymentJob()
+	job.Input, _ = json.Marshal(jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent})
+	_, err := fixture.executor.Execute(context.Background(), job, fixture.reporter)
+	requireExecutionErrorCode(t, err, "reviewed_revisions_required")
+	if fixture.executor.releases.(*fakeReleases).materializeCalls != 0 || fixture.compiler.calls != 0 || len(*fixture.events) != 0 || fixture.deployments.deployment.Status != deployments.Failed {
+		t.Fatalf("unpinned worker made side effects: release=%d compile=%d events=%v deployment=%+v", fixture.executor.releases.(*fakeReleases).materializeCalls, fixture.compiler.calls, *fixture.events, fixture.deployments.deployment)
+	}
+}
+
 func TestGeneratedExecutorUsesReviewedPinsOnSuccessfulDeployment(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
 	result, err := fixture.executor.Execute(context.Background(), reviewedDeploymentJob(), fixture.reporter)

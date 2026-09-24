@@ -42,6 +42,7 @@ var (
 	ErrIdempotency               = errors.New("idempotency key conflicts with the original request")
 	ErrApplicationBusy           = errors.New("application already has an active mutation")
 	ErrReviewedRevisionStale     = errors.New("reviewed deployment revision is stale")
+	ErrReviewedRevisionsRequired = errors.New("generated deployment requires reviewed revisions")
 	ErrCancellationRequested     = errors.New("job cancellation requested")
 	ErrCancellationUnsafe        = errors.New("job cannot be cancelled while route reconciliation is required")
 )
@@ -1304,6 +1305,8 @@ func safeExecutionFailure(err error) (string, string) {
 			return "configuration_review_required", "Review application configuration scope against the accepted deployment plan"
 		case "reviewed_revision_stale":
 			return "reviewed_revision_stale", "Reviewed plan or configuration changed before deployment execution"
+		case "reviewed_revisions_required":
+			return "reviewed_revisions_required", "Generated deployment requires reviewed plan and configuration revisions"
 		case "build_configuration_requires_build_command":
 			return "build_configuration_requires_build_command", "Public build configuration requires a reviewed build command"
 		case "compose_invalid", "compose_config_invalid":

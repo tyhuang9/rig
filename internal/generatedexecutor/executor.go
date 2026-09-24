@@ -339,6 +339,14 @@ func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.Deploym
 	if err != nil {
 		return resolvedDeployment{}, codedError("internal_error")
 	}
+	if !deployment.ProvenanceInitialized && input.ReleaseID == "" && !input.HasReviewedRevisions() {
+		return resolvedDeployment{}, codedError("reviewed_revisions_required")
+	}
+	if deployment.ProvenanceInitialized && input.HasReviewedRevisions() &&
+		(deployment.RuntimeStrategy != deployments.RuntimeGeneratedNode || deployment.DeploymentPlanRevisionID != input.ExpectedPlanRevisionID || deployment.DeploymentPlanRevisionNumber != input.ExpectedPlanRevisionNumber ||
+			deployment.ActualConfigurationRevisionID != input.ExpectedConfigurationRevisionID || deployment.ActualConfigurationRevisionNumber != input.ExpectedConfigurationRevisionNumber) {
+		return resolvedDeployment{}, codedError("invalid_source")
+	}
 	if input.HasReviewedRevisions() && !deployment.ProvenanceInitialized {
 		if err := e.checkReviewedHeads(ctx, job.ResourceID, input); err != nil {
 			return resolvedDeployment{}, err

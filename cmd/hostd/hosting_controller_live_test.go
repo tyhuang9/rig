@@ -491,13 +491,17 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	}()
 	var mutation apicontract.JobMutationResponse
 	deploymentPath := "/api/v1/apps/" + application.ID + "/deployments"
+	deployRequest := apicontract.DeployApplicationRequest{
+		ExpectedPlanRevisionID: plan.RevisionID, ExpectedPlanRevisionNumber: plan.RevisionNumber,
+		ExpectedConfigurationRevisionID: saved.RevisionID, ExpectedConfigurationRevisionNumber: saved.RevisionNumber,
+	}
 	idempotencyKey := uuid.NewString()
-	request(http.MethodPost, deploymentPath, map[string]any{}, http.StatusAccepted, &mutation, map[string]string{"Idempotency-Key": idempotencyKey})
+	request(http.MethodPost, deploymentPath, deployRequest, http.StatusAccepted, &mutation, map[string]string{"Idempotency-Key": idempotencyKey})
 	if !mutation.Created || mutation.Job.ID == "" || mutation.Job.RequestedBy != user.ID {
 		t.Fatal("controller did not enqueue an actor-bound durable job")
 	}
 	var replay apicontract.JobMutationResponse
-	request(http.MethodPost, deploymentPath, map[string]any{}, http.StatusOK, &replay, map[string]string{"Idempotency-Key": idempotencyKey})
+	request(http.MethodPost, deploymentPath, deployRequest, http.StatusOK, &replay, map[string]string{"Idempotency-Key": idempotencyKey})
 	if replay.Created || replay.Job.ID != mutation.Job.ID {
 		t.Fatal("controller did not replay the exact durable deployment job")
 	}
@@ -648,7 +652,10 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		t.Fatal("configuration-only replacement did not create a protected revision")
 	}
 	var replacementMutation apicontract.JobMutationResponse
-	request(http.MethodPost, deploymentPath, map[string]any{}, http.StatusAccepted, &replacementMutation, map[string]string{"Idempotency-Key": uuid.NewString()})
+	request(http.MethodPost, deploymentPath, apicontract.DeployApplicationRequest{
+		ExpectedPlanRevisionID: plan.RevisionID, ExpectedPlanRevisionNumber: plan.RevisionNumber,
+		ExpectedConfigurationRevisionID: replacementConfiguration.RevisionID, ExpectedConfigurationRevisionNumber: replacementConfiguration.RevisionNumber,
+	}, http.StatusAccepted, &replacementMutation, map[string]string{"Idempotency-Key": uuid.NewString()})
 	if !replacementMutation.Created || replacementMutation.Job.ID == completed.ID {
 		t.Fatal("controller did not enqueue a distinct replacement job")
 	}
@@ -713,7 +720,10 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		t.Fatal("bad-CA revision was not saved without exposing secrets")
 	}
 	var failedMutation apicontract.JobMutationResponse
-	request(http.MethodPost, deploymentPath, map[string]any{}, http.StatusAccepted, &failedMutation, map[string]string{"Idempotency-Key": uuid.NewString()})
+	request(http.MethodPost, deploymentPath, apicontract.DeployApplicationRequest{
+		ExpectedPlanRevisionID: plan.RevisionID, ExpectedPlanRevisionNumber: plan.RevisionNumber,
+		ExpectedConfigurationRevisionID: badConfiguration.RevisionID, ExpectedConfigurationRevisionNumber: badConfiguration.RevisionNumber,
+	}, http.StatusAccepted, &failedMutation, map[string]string{"Idempotency-Key": uuid.NewString()})
 	if !failedMutation.Created || failedMutation.Job.ID == replacementJob.ID {
 		t.Fatal("controller did not enqueue a distinct unhealthy replacement")
 	}

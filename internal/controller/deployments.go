@@ -100,12 +100,16 @@ func (s *Server) deployApplication(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not verify the deployment runtime", nil)
 		return
 	}
-	if !s.runtimeStrategyAvailable(strategy, true) {
-		problem(w, r, http.StatusConflict, "capability_unavailable", "Runtime actions are unavailable in this configuration", nil)
+	if strategy == deploymentplans.StrategyGeneratedNode && !input.HasReviewedRevisions() {
+		problem(w, r, http.StatusUnprocessableEntity, "reviewed_revisions_required", "Review the current plan and configuration revisions before deploying", nil)
 		return
 	}
 	if input.HasReviewedRevisions() && strategy != deploymentplans.StrategyGeneratedNode {
 		problem(w, r, http.StatusUnprocessableEntity, "invalid_deployment", "Reviewed revisions require a generated deployment plan", nil)
+		return
+	}
+	if !s.runtimeStrategyAvailable(strategy, true) {
+		problem(w, r, http.StatusConflict, "capability_unavailable", "Runtime actions are unavailable in this configuration", nil)
 		return
 	}
 	s.enqueueDeployment(w, r, input)
@@ -184,9 +188,12 @@ func (s *Server) enqueueDeployment(w http.ResponseWriter, r *http.Request, input
 	var job jobs.Job
 	var created bool
 	var err error
-	if input.HasReviewedRevisions() {
+	if input.ReleaseID == "" {
 		job, created, err = s.Jobs.CreateWithInputChecked(create, func(tx *sql.Tx, _ jobs.Job) error {
-			return checkReviewedHeads(tx, r.PathValue("appId"), input)
+			if input.HasReviewedRevisions() {
+				return checkReviewedHeads(tx, r.PathValue("appId"), input)
+			}
+			return checkUnpinnedComposeHead(tx, r.PathValue("appId"))
 		})
 	} else {
 		job, created, err = s.Jobs.CreateWithInput(create)
@@ -200,11 +207,28 @@ func (s *Server) enqueueDeployment(w http.ResponseWriter, r *http.Request, input
 		problem(w, r, http.StatusConflict, "application_busy", "Application already has an active mutation", nil)
 	case errors.Is(err, jobs.ErrReviewedRevisionStale):
 		problem(w, r, http.StatusConflict, "reviewed_revision_stale", "Reviewed plan or configuration changed; review the current revisions before deploying", nil)
+	case errors.Is(err, jobs.ErrReviewedRevisionsRequired):
+		problem(w, r, http.StatusUnprocessableEntity, "reviewed_revisions_required", "Review the current plan and configuration revisions before deploying", nil)
 	case errors.Is(err, jobs.ErrInvalidInput):
 		problem(w, r, http.StatusUnprocessableEntity, "invalid_deployment", "Deployment request is invalid", nil)
 	default:
 		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not create deployment job", nil)
 	}
+}
+
+func checkUnpinnedComposeHead(tx *sql.Tx, appID string) error {
+	var number int64
+	var strategy, acceptance sql.NullString
+	if err := tx.QueryRow(`SELECT h.revision_number,r.strategy,r.acceptance_status FROM deployment_plan_heads h LEFT JOIN deployment_plan_revisions r ON r.id=h.revision_id AND r.app_id=h.app_id AND r.revision_number=h.revision_number WHERE h.app_id=?`, appID).Scan(&number, &strategy, &acceptance); err != nil {
+		return jobs.ErrReviewedRevisionsRequired
+	}
+	if number == 0 && !strategy.Valid {
+		return nil
+	}
+	if number > 0 && strategy.String == string(deploymentplans.StrategyCompose) && acceptance.String == string(deploymentplans.RevisionAccepted) {
+		return nil
+	}
+	return jobs.ErrReviewedRevisionsRequired
 }
 
 func checkReviewedHeads(tx *sql.Tx, appID string, input jobs.DeploymentInput) error {
