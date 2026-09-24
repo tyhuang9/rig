@@ -667,7 +667,63 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, "read", browserNote)
-	t.Logf("M2 controller journey identities: app=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s replacement-config=%s/%d replacement-job=%s replacement-deployment=%s replacement-release=%s source=local-snapshot ingress=127.0.0.1:8080", application.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID, replacementConfiguration.RevisionID, replacementConfiguration.RevisionNumber, replacementJob.ID, replacementDeployment.ID, replacementRelease.ID)
+	wrongCA := controllerJourneyWrongCA(t, ctx, openssl, fixtureRoot)
+	wrongCABase64 := base64.StdEncoding.EncodeToString(wrongCA)
+	badEntries := append(append([]apicontract.ScopedConfigurationValueInput(nil), publicEntries...), apicontract.ScopedConfigurationValueInput{
+		Phase: "runtime", TargetComponent: "api", Key: "DATABASE_TLS_CA_PEM_BASE64", Value: wrongCABase64, Sensitive: true,
+	})
+	var badConfiguration apicontract.ApplicationConfiguration
+	badResponse := request(http.MethodPut, "/api/v1/apps/"+application.ID+"/scoped-configuration", apicontract.ReplaceScopedApplicationConfigurationRequest{
+		ExpectedRevisionNumber: replacementConfiguration.RevisionNumber, PlanRevisionID: plan.RevisionID, PlanRevisionNumber: plan.RevisionNumber,
+		PublicBuildDisclosureAcknowledged: true, Entries: badEntries, Remove: []apicontract.ScopedConfigurationKey{},
+	}, http.StatusOK, &badConfiguration)
+	if badConfiguration.RevisionNumber != replacementConfiguration.RevisionNumber+1 || badConfiguration.RevisionID == replacementConfiguration.RevisionID ||
+		bytes.Contains(badResponse, []byte(wrongCABase64)) || bytes.Contains(badResponse, []byte(dbURL)) {
+		t.Fatal("bad-CA revision was not saved without exposing secrets")
+	}
+	var failedMutation apicontract.JobMutationResponse
+	request(http.MethodPost, deploymentPath, map[string]any{}, http.StatusAccepted, &failedMutation, map[string]string{"Idempotency-Key": uuid.NewString()})
+	if !failedMutation.Created || failedMutation.Job.ID == replacementJob.ID {
+		t.Fatal("controller did not enqueue a distinct unhealthy replacement")
+	}
+	failedDeadline := time.Now().Add(8 * time.Minute)
+	var failedJob jobs.Job
+	for {
+		failedJob, err = restartedJobs.Get(failedMutation.Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if failedJob.Status == string(jobs.Failed) {
+			break
+		}
+		if failedJob.Status == string(jobs.Succeeded) || failedJob.Status == string(jobs.WaitingUser) || failedJob.Status == string(jobs.NeedsAttention) || time.Now().After(failedDeadline) || ctx.Err() != nil {
+			t.Fatalf("bad-CA replacement had unexpected result: status=%s phase=%s code=%s", failedJob.Status, failedJob.Phase, failedJob.ErrorCode)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if failedJob.ErrorCode != "health_failed" {
+		t.Fatalf("bad-CA candidate failed outside readiness: code=%s", failedJob.ErrorCode)
+	}
+	var failedHistory apicontract.DeploymentList
+	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/deployments", nil, http.StatusOK, &failedHistory)
+	if len(failedHistory.Items) != 3 {
+		t.Fatal("failed replacement did not retain immutable deployment history")
+	}
+	var failedDeployment apicontract.Deployment
+	for _, item := range failedHistory.Items {
+		if item.JobID == failedJob.ID {
+			failedDeployment = item
+		}
+	}
+	if failedDeployment.ID == "" || failedDeployment.Status != "failed" || failedDeployment.DiagnosticCode != "health_failed" ||
+		failedDeployment.ActualConfigurationRevisionID != badConfiguration.RevisionID {
+		t.Fatal("failed replacement did not retain its bad-CA configuration pin")
+	}
+	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
+	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
+	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
+	controllerJourneyBrowser(t, ctx, node, application.ID, "read", browserNote)
+	t.Logf("M2 controller journey identities: app=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s replacement-config=%s/%d replacement-job=%s replacement-deployment=%s replacement-release=%s bad-config=%s/%d failed-job=%s failed-deployment=%s source=local-snapshot ingress=127.0.0.1:8080", application.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID, replacementConfiguration.RevisionID, replacementConfiguration.RevisionNumber, replacementJob.ID, replacementDeployment.ID, replacementRelease.ID, badConfiguration.RevisionID, badConfiguration.RevisionNumber, failedJob.ID, failedDeployment.ID)
 }
 
 func controllerJourneyExecutable(t *testing.T, name string) string {
@@ -916,6 +972,22 @@ func controllerJourneyBrowser(t *testing.T, ctx context.Context, node, appID, mo
 		t.Fatalf("deployed Chromium %s journey failed: %v", mode, err)
 	}
 	t.Logf("deployed Chromium %s journey passed", mode)
+}
+
+func controllerJourneyWrongCA(t *testing.T, ctx context.Context, openssl, fixtureRoot string) []byte {
+	t.Helper()
+	key := filepath.Join(fixtureRoot, "wrong-ca.key")
+	certificate := filepath.Join(fixtureRoot, "wrong-ca.crt")
+	command := exec.CommandContext(ctx, openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+		"-keyout", key, "-out", certificate, "-subj", "/CN=Wrong disposable fixture CA")
+	if err := command.Run(); err != nil {
+		t.Fatal("generate unrelated disposable TLS CA")
+	}
+	body, err := os.ReadFile(certificate)
+	if err != nil {
+		t.Fatal("read unrelated disposable TLS CA")
+	}
+	return body
 }
 
 func controllerJourneyPrepareSchema(t *testing.T, ctx context.Context, node, source, dbURL, ca string) {

@@ -37,7 +37,14 @@ targets the unmerged M1 branch. Neither PR has been merged.
 - The next gate extension saves a second scoped configuration on the same
   source, deploys it through the restarted controller, and checks the new
   immutable pins, healthy replacement, scoped containers, and preserved note.
-  Its hosted result is pending.
+  Hosted [run 36039019169](https://github.com/tyhuang9/rig/actions/runs/36039019169)
+  passed on head `2bab27d`: the second deployment switched to a new runtime
+  marker, preserved the source digest and database note, and passed a fresh
+  Chromium read. Exact cleanup passed.
+- The next gate extension installs a valid unrelated CA as a new scoped secret,
+  attempts replacement, and requires a `health_failed` job and immutable
+  failed deployment record while the previous healthy marker and note remain
+  available through Caddy and Chromium. Its hosted result is pending.
 
 ## Verification so far
 
@@ -113,8 +120,8 @@ prove whether the original request reached the controller.
 ## Open M2 acceptance work
 
 - Complete the hosted controller journey gate on the corrected branch head.
-- Verify the new healthy replacement on the final head, then unhealthy
-  replacement that preserves the old serving version.
+- Verify the new unhealthy replacement on the final head, including preservation
+  of the old serving version.
 - Add controlled GitHub archive/connection materialization to the continuous
   harness and perform a separate live GitHub authorization walkthrough.
 - Prove unhealthy replacement retains the old serving version, and cover the
