@@ -90,6 +90,7 @@ type CandidateSpec struct {
 	DeploymentPlanRevisionID    string
 	ComponentName               string
 	Role                        string
+	Technology                  string
 	RootDirectory               string
 	RunCommand                  string
 	InternalPort                uint16
@@ -126,6 +127,7 @@ type Candidate struct {
 	DeploymentPlanRevisionID string
 	Component                string
 	Role                     string
+	Technology               string
 	Slot                     Slot
 	ContainerID              string
 	ContainerName            string

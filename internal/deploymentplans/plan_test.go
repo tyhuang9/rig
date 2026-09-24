@@ -59,6 +59,25 @@ func TestCanonicalPlanAcceptsLocalSnapshotIdentity(t *testing.T) {
 	}
 }
 
+func TestVersionedPlanRejectsUnknownTechnology(t *testing.T) {
+	plan := testPlan()
+	plan.SetupVersion = 1
+	plan.Detector.Name = "manual-setup"
+	plan.Components = plan.Components[:1]
+	for index := range plan.Components {
+		plan.Components[index].Technology = "node"
+		plan.Components[index].InstallDirectory = plan.Components[index].RootDirectory
+	}
+	plan.FieldProvenance = provenanceFor(plan.Components...)
+	if _, err := CanonicalDigest(plan); err != nil {
+		t.Fatalf("valid versioned plan rejected: %v", err)
+	}
+	plan.Components[0].Technology = "unknown"
+	if _, err := CanonicalDigest(plan); err == nil {
+		t.Fatal("unknown versioned technology accepted")
+	}
+}
+
 func TestMigrationIsBoundToAcceptedComponentAndExplicitEnvironmentKeys(t *testing.T) {
 	plan := testPlan()
 	if _, err := CanonicalDigest(plan); err != nil {

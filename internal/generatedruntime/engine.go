@@ -33,6 +33,7 @@ const (
 	defaultReplacementDisk  = 256 << 20
 	replacementDiskHeadroom = 64 << 20
 	containerUser           = "node"
+	nextCacheTmpfsBytes     = 32 << 20
 )
 
 const (
@@ -236,7 +237,7 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 	candidate := Candidate{
 		AppID: spec.AppID, ReleaseID: spec.ReleaseID, DeploymentID: spec.DeploymentID,
 		ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID,
-		Component: spec.ComponentName, Role: spec.Role, Slot: slot,
+		Component: spec.ComponentName, Role: spec.Role, Technology: spec.Technology, Slot: slot,
 		ContainerName: name, NetworkName: network, NetworkAlias: alias,
 		InternalPort: spec.InternalPort, ImageContentID: spec.ImageContentID,
 		WorkingDirectory: workingDirectory, RunCommandDigest: sha256Hex(spec.RunCommand), lease: lease,
@@ -276,6 +277,9 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 		"--health-start-period", "5s",
 		"--health-retries", "3",
 	)
+	if spec.Technology == "nextjs" {
+		args = append(args, "--tmpfs", nextCacheDirectory(workingDirectory)+":rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size="+strconv.FormatInt(nextCacheTmpfsBytes, 10))
+	}
 	for _, key := range sortedKeys(labels) {
 		args = append(args, "--label", key+"="+labels[key])
 	}
@@ -778,7 +782,7 @@ func minimumReplacementDiskBytes(limits ContainerLimits) uint64 {
 }
 
 func validCandidateSpec(spec CandidateSpec) bool {
-	if !validImageSpec(ImageSpec{AppID: spec.AppID, ReleaseID: spec.ReleaseID, ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, ComponentName: spec.ComponentName, Role: spec.Role, ImageContentID: spec.ImageContentID, BuildDefinitionDigest: spec.BuildDefinitionDigest}) || !canonicalUUID(spec.DeploymentID) || !validRootDirectory(spec.RootDirectory) || deploymentplans.ValidateCommand(spec.RunCommand) != nil || spec.InternalPort == 0 || !validHealthProbe(spec.HealthProbe) || !validEnvironmentOperation(spec) || !validEnvironment(spec.Environment) {
+	if !validImageSpec(ImageSpec{AppID: spec.AppID, ReleaseID: spec.ReleaseID, ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, ComponentName: spec.ComponentName, Role: spec.Role, ImageContentID: spec.ImageContentID, BuildDefinitionDigest: spec.BuildDefinitionDigest}) || !canonicalUUID(spec.DeploymentID) || !validRootDirectory(spec.RootDirectory) || !validTechnologyRole(spec.Technology, spec.Role) || (spec.Technology == "nextjs" && strings.Contains(spec.RootDirectory, ":")) || deploymentplans.ValidateCommand(spec.RunCommand) != nil || spec.InternalPort == 0 || !validHealthProbe(spec.HealthProbe) || !validEnvironmentOperation(spec) || !validEnvironment(spec.Environment) {
 		return false
 	}
 	_, err := InactiveSlot(spec.ActiveSlot)
@@ -809,13 +813,30 @@ func validEnvironment(environment []byte) bool {
 }
 
 func validCandidate(candidate Candidate) bool {
-	if !canonicalUUID(candidate.AppID) || !validReleaseID(candidate.ReleaseID) || !canonicalUUID(candidate.DeploymentID) || !canonicalUUID(candidate.ArtifactID) || !canonicalUUID(candidate.DeploymentPlanRevisionID) || !validText(candidate.Component, 256) || !validRole(candidate.Role) || !validImageContainerID(candidate.ContainerID) || candidate.InternalPort == 0 || !validImageID(candidate.ImageContentID) || !validRuntimeWorkingDirectory(candidate.WorkingDirectory) || !lowerHex(candidate.RunCommandDigest, 64) {
+	if !canonicalUUID(candidate.AppID) || !validReleaseID(candidate.ReleaseID) || !canonicalUUID(candidate.DeploymentID) || !canonicalUUID(candidate.ArtifactID) || !canonicalUUID(candidate.DeploymentPlanRevisionID) || !validText(candidate.Component, 256) || !validRole(candidate.Role) || !validTechnologyRole(candidate.Technology, candidate.Role) || !validImageContainerID(candidate.ContainerID) || candidate.InternalPort == 0 || !validImageID(candidate.ImageContentID) || !validRuntimeWorkingDirectory(candidate.WorkingDirectory) || (candidate.Technology == "nextjs" && strings.Contains(candidate.WorkingDirectory, ":")) || !lowerHex(candidate.RunCommandDigest, 64) {
 		return false
 	}
 	if candidate.Slot != SlotBlue && candidate.Slot != SlotGreen {
 		return false
 	}
 	return candidate.NetworkName == networkName(candidate.AppID) && candidate.ContainerName == containerName(candidate.AppID, candidate.Component, candidate.Slot) && candidate.NetworkAlias == containerAlias(candidate.Component, candidate.Slot)
+}
+
+func validTechnologyRole(technology, role string) bool {
+	switch technology {
+	case "":
+		return true // Candidates created before versioned setup retain their role.
+	case "node", "nextjs":
+		return role == "server"
+	case "static":
+		return role == "static"
+	default:
+		return false
+	}
+}
+
+func nextCacheDirectory(workingDirectory string) string {
+	return workingDirectory + "/.next/cache"
 }
 
 func validRuntimeWorkingDirectory(value string) bool {
@@ -949,7 +970,14 @@ func matchesCandidateConfiguredHardening(container containerInspection, candidat
 		return false
 	}
 	tmpfs, exists := container.Tmpfs["/tmp"]
-	return exists && len(container.Tmpfs) == 1 && exactCommaValues(tmpfs, []string{"rw", "noexec", "nosuid", "nodev", "size=" + strconv.FormatInt(limits.TmpfsBytes, 10)})
+	if !exists || !exactCommaValues(tmpfs, []string{"rw", "noexec", "nosuid", "nodev", "size=" + strconv.FormatInt(limits.TmpfsBytes, 10)}) {
+		return false
+	}
+	if candidate.Technology != "nextjs" {
+		return len(container.Tmpfs) == 1
+	}
+	cache, exists := container.Tmpfs[nextCacheDirectory(candidate.WorkingDirectory)]
+	return exists && len(container.Tmpfs) == 2 && exactCommaValues(cache, []string{"rw", "noexec", "nosuid", "nodev", "uid=1000", "gid=1000", "mode=0700", "size=" + strconv.FormatInt(nextCacheTmpfsBytes, 10)})
 }
 
 // matchesCandidateHardening also validates Docker's runtime-realized network

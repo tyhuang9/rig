@@ -185,7 +185,7 @@ func (e *Executor) startCandidates(ctx context.Context, job jobs.Job, resolved r
 			}
 			candidate, createErr := e.runtime.CreateInactiveCandidate(ctx, generatedruntime.CandidateSpec{
 				AppID: resolved.deployment.AppID, ReleaseID: resolved.release.ID, DeploymentID: resolved.deployment.ID,
-				ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, ComponentName: component.Name, Role: component.Role,
+				ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, ComponentName: component.Name, Role: component.Role, Technology: component.Technology,
 				RootDirectory: component.RootDirectory, RunCommand: component.RunCommand, InternalPort: component.InternalPort,
 				HealthProbe: component.HealthProbe, ImageContentID: artifact.ImageContentID,
 				BuildDefinitionDigest: artifact.BuildDefinitionDigest, ActiveSlot: activeSlot,
@@ -301,7 +301,7 @@ func reconstructCandidate(resolved resolvedDeployment, runtimeDeployment generat
 	}
 	return generatedruntime.Candidate{
 		AppID: resolved.deployment.AppID, ReleaseID: resolved.release.ID, DeploymentID: resolved.deployment.ID,
-		ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, Component: persisted.Name, Role: component.Role,
+		ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, Component: persisted.Name, Role: component.Role, Technology: component.Technology,
 		Slot: description.Slot, ContainerID: persisted.ContainerID, ContainerName: description.ContainerName,
 		NetworkName: description.NetworkName, NetworkAlias: description.NetworkAlias, InternalPort: component.InternalPort,
 		ImageContentID: artifact.ImageContentID, WorkingDirectory: runtimeWorkingDirectory(component.RootDirectory),
@@ -493,7 +493,7 @@ func reconstructPreviousCandidates(appID string, previous generatedruntimestate.
 		}
 		result[persisted.Name] = generatedruntime.Candidate{
 			AppID: appID, ReleaseID: previous.ReleaseID, DeploymentID: previous.DeploymentID,
-			ArtifactID: artifact.ID, DeploymentPlanRevisionID: plan.ID, Component: persisted.Name, Role: component.Role,
+			ArtifactID: artifact.ID, DeploymentPlanRevisionID: plan.ID, Component: persisted.Name, Role: component.Role, Technology: component.Technology,
 			Slot: description.Slot, ContainerID: persisted.ContainerID, ContainerName: description.ContainerName,
 			NetworkName: description.NetworkName, NetworkAlias: description.NetworkAlias,
 			InternalPort: component.InternalPort, ImageContentID: artifact.ImageContentID,
