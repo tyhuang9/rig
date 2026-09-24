@@ -131,6 +131,34 @@ test("database URLs cannot disable certificate verification", () => {
   }
 });
 
+test("database URLs cannot redirect the socket away from the verified host", () => {
+  for (const override of ["host=other.example", "HOST=other.example", "hostaddr=127.0.0.2", "port=55432"]) {
+    assert.throws(
+      () => createDatabase({ DATABASE_URL: `postgresql://fixture:password@postgres.fixture.test/notes?${override}` }),
+      /must put its host and port before the path/
+    );
+  }
+});
+
+test("database TLS verifier checks the configured URL host", async () => {
+  for (const [host, subjectAltName] of [
+    ["127.0.0.1", "IP Address:127.0.0.1"],
+    ["[::1]", "IP Address:::1"],
+    ["postgres.fixture.test", "DNS:postgres.fixture.test"]
+  ]) {
+    const pool = createDatabase({ DATABASE_URL: `postgresql://fixture:password@${host}/notes?sslmode=verify-full` });
+    try {
+      const verify = pool.options.ssl.checkServerIdentity;
+      assert.equal(pool.options.ssl.rejectUnauthorized, true);
+      assert.equal(verify("localhost", { subjectaltname: subjectAltName, subject: { CN: "other" } }), undefined);
+      const rejected = verify("localhost", { subjectaltname: "DNS:unrelated.test", subject: { CN: "unrelated.test" } });
+      assert.equal(rejected?.code, "ERR_TLS_CERT_ALTNAME_INVALID");
+    } finally {
+      await pool.end();
+    }
+  }
+});
+
 test("HTTPS probe sends scoped credentials through verified, bounded TLS options", async () => {
   let options;
   let timeout;

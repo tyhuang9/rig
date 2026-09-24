@@ -2,6 +2,7 @@ const schemaNamePattern = /^[a-z_][a-z0-9_]{0,62}$/;
 const environmentKeyPattern = /^[A-Z][A-Z0-9_]*$/;
 const permittedTlsModes = new Set(["require", "verify-ca", "verify-full"]);
 const tlsParameters = new Set(["ssl", "sslmode", "sslcert", "sslkey", "sslrootcert"]);
+const routingParameters = new Set(["host", "hostaddr", "port"]);
 
 export function fixtureSchema(env) {
   const schema = env.FIXTURE_SCHEMA || "rig_fixture_notes";
@@ -46,6 +47,11 @@ export function verifiedDatabaseUrl(env) {
   }
   for (const [key, value] of [...parsed.searchParams]) {
     const normalizedKey = key.toLowerCase();
+    // pg-connection-string accepts query host/port overrides. The TLS
+    // identity must be the same host that the socket actually reaches.
+    if (routingParameters.has(normalizedKey)) {
+      throw new Error("The configured database URL must put its host and port before the path");
+    }
     if (!tlsParameters.has(normalizedKey)) continue;
     if (normalizedKey === "sslmode" && !permittedTlsModes.has(value.toLowerCase())) {
       throw new Error("The configured database URL requests an unsupported TLS mode");
