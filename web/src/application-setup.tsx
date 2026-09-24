@@ -77,6 +77,8 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
   const configurationReady = Boolean(plan.data && configuration.data && configurationMatchesPlan(configuration.data, plan.data));
   const uncertainPreviousAttempt = Boolean(attempt.current && !attempt.current.jobId && attempt.current.signature !== signature);
   const canDeploy = !uncertainPreviousAttempt && !plan.isError && !configuration.isError && !status.isError && plan.data?.state === "accepted" && plan.data?.strategy === "generated_node" && Boolean(plan.data.revisionId) && configurationReady && !migrationPending && status.data?.capabilities.generatedRuntime === true && status.data.capabilities.fakeRuntime !== true;
+  const showingKnownJob = step === "result" && Boolean(jobId);
+  const setupLoaded = Boolean(plan.data && configuration.data && status.data);
 
   useEffect(() => {
     if (!signature) return;
@@ -95,8 +97,8 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
   }, [app.id, signature]);
 
   useEffect(() => {
-    heading.current?.focus();
-  }, [step]);
+    if (showingKnownJob || setupLoaded) heading.current?.focus();
+  }, [step, showingKnownJob, setupLoaded]);
 
   const deploy = useMutation({
     mutationFn: async () => {
@@ -195,7 +197,6 @@ function ApplicationDeploymentSetupContent({ app }: { app: Application }) {
     return `Deployment job is ${job.status}.`;
   }, [deployment, deployments.isError, job, jobQuery.isError, reviewedPinMatch]);
 
-  const showingKnownJob = step === "result" && Boolean(jobId);
   if (!showingKnownJob && (plan.isLoading || configuration.isLoading || status.isLoading)) return <div role="status">Loading saved setup…</div>;
   if (!showingKnownJob && (plan.isError || configuration.isError || status.isError)) return <div className="callout danger" role="alert"><strong>{continueError ? "Could not verify the saved setup." : "Could not load the saved setup."}</strong><span>{continueError || plan.error?.message || configuration.error?.message || status.error?.message}</span><button className="button small" type="button" onClick={() => void Promise.all([plan.refetch(), configuration.refetch(), status.refetch()])}>Retry loading</button></div>;
   if (!showingKnownJob && (!plan.data || !configuration.data || !status.data || plan.data.state !== "accepted" || plan.data.strategy !== "generated_node")) return <div className="callout warning"><strong>Generated setup is unavailable.</strong><span>Open the application to review its current deployment plan.</span><Link className="button small" to={`/apps/${app.id}`}>Open application</Link></div>;

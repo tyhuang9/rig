@@ -18,7 +18,7 @@ import { ApplicationConfigurationPanel } from "./application-configuration";
 import { ApplicationDeploymentSetup } from "./application-setup";
 import { ApplicationPlanPanel } from "./application-plan-panel";
 import { AutoDeployPanel } from "./auto-deploy";
-import { DeploymentHistoryPanel } from "./deployment-history";
+import { DeploymentHistoryPanel, deploymentPlanOrLegacy } from "./deployment-history";
 import { UnsavedChangesGuard, useConfirmDiscard } from "./unsaved-changes";
 
 type RelayPanelProps = { role: string };
@@ -225,7 +225,7 @@ function ApplicationDetailPage() {
   const appQuery = useQuery({ queryKey: ["app", id], queryFn: () => api.app(id) });
   const statusQuery = useQuery({ queryKey: ["system-status"], queryFn: api.status });
   const deploymentQuery = useQuery({ queryKey: ["deployments", id], queryFn: () => api.deployments(id) });
-  const planQuery = useQuery({ queryKey: ["deployment-plan", id], queryFn: () => api.deploymentPlan(id), retry: false });
+  const planQuery = useQuery({ queryKey: ["deployment-plan", id], queryFn: () => deploymentPlanOrLegacy(id), retry: false });
   if (appQuery.isLoading || statusQuery.isLoading) return <LoadingState/>;
   if (appQuery.isError) return <QueryError message={appQuery.error.message}/>;
   if (statusQuery.isError) return <QueryError message={statusQuery.error.message}/>;
