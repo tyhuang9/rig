@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -230,7 +231,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	}
 	dbURL := fmt.Sprintf("postgresql://fixture_user:%s@%s:%d/fixture_notes?sslmode=verify-full", password, gateway, postgresPort)
 	httpsURL := fmt.Sprintf("https://%s:%d/", gateway, httpsPort)
-	hostingLivePrepareSchema(t, ctx, node, workspace, dbURL, base64.StdEncoding.EncodeToString(ca))
+	hostingLivePrepareSchema(t, ctx, node, workspace, dbURL, base64.StdEncoding.EncodeToString(ca), docker, runtimeDockerConfig, fixtureRoot, composeEnv)
 	releaseID, artifactID := uuid.NewString(), uuid.NewString()
 	imageID, definitionDigest := hostingLiveBuildAPI(t, ctx, docker, buildDockerConfig, workspace, root, imageTag, plan, appID, releaseID, artifactID)
 	hostingLiveImageHasNoSecrets(t, ctx, docker, runtimeDockerConfig, imageID, dbURL, token, sentinel)
@@ -275,7 +276,8 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	if err := engine.WaitHealthy(ctx, bad); !generatedruntime.IsCode(err, generatedruntime.DiagnosticCandidateUnhealthy) {
 		t.Fatalf("bad-CA candidate did not fail readiness: %s", hostingLiveRuntimeCode(err))
 	}
-	if hostingLiveDockerOK(ctx, docker, runtimeDockerConfig, "container", "inspect", bad.ContainerID) {
+	badPresent, inspectErr := hostingLiveResourceExists(ctx, docker, runtimeDockerConfig, "container", bad.ContainerName)
+	if inspectErr != nil || badPresent {
 		t.Fatal("unhealthy bad-CA candidate still occupies the inactive slot")
 	}
 	bad = generatedruntime.Candidate{}
@@ -467,24 +469,66 @@ func hostingLiveWrongCA(t *testing.T, ctx context.Context, openssl, fixtureRoot 
 	return body
 }
 
-func hostingLivePrepareSchema(t *testing.T, ctx context.Context, node, workspace, dbURL, ca string) {
+func hostingLivePrepareSchema(t *testing.T, ctx context.Context, node, workspace, dbURL, ca, docker, dockerConfig, fixtureRoot string, composeEnv []string) {
 	t.Helper()
 	deadline := time.Now().Add(40 * time.Second)
+	lastFailure := "unclassified"
 	for {
 		attemptCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 		command := exec.CommandContext(attemptCtx, node, "src/prepare-schema.js")
 		command.Dir = filepath.Join(workspace, "api")
 		command.Env = append(os.Environ(), "DATABASE_URL_ENV=NOTES_FIXTURE_DB_URL", "NOTES_FIXTURE_DB_URL="+dbURL, "DATABASE_TLS_CA_PEM_BASE64="+ca)
-		_, err := command.CombinedOutput()
+		output, err := command.CombinedOutput()
 		cancel()
 		if err == nil {
 			return
 		}
+		lastFailure = hostingLiveSchemaFailureCode(output)
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			t.Fatal("application-owned schema preparation could not reach fixture PostgreSQL with verified TLS")
+			t.Fatalf("application-owned schema preparation failed with verified TLS: category=%s services=%s", lastFailure, hostingLiveComposeStatus(ctx, docker, dockerConfig, fixtureRoot, composeEnv))
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+}
+
+func hostingLiveSchemaFailureCode(output []byte) string {
+	for _, code := range []string{
+		"ECONNREFUSED", "ETIMEDOUT", "ENETUNREACH", "EHOSTUNREACH", "ECONNRESET",
+		"ERR_TLS_CERT_ALTNAME_INVALID", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "SELF_SIGNED_CERT_IN_CHAIN",
+		"DEPTH_ZERO_SELF_SIGNED_CERT", "CERT_HAS_EXPIRED", "ERR_SOCKET_CONNECTION_TIMEOUT",
+	} {
+		if bytes.Contains(output, []byte(code)) {
+			return code
+		}
+	}
+	if bytes.Contains(output, []byte("password authentication failed")) {
+		return "authentication-rejected"
+	}
+	return "unclassified"
+}
+
+func hostingLiveComposeStatus(ctx context.Context, docker, config, fixtureRoot string, composeEnv []string) string {
+	output, err := hostingLiveDockerOutput(ctx, docker, config, composeEnv, "compose", "-f", filepath.Join(fixtureRoot, "docker-compose.yml"), "-p", hostingLiveProject, "ps", "--all", "--format", "json")
+	if err != nil {
+		return "unavailable"
+	}
+	var states []string
+	for _, line := range bytes.Split(bytes.TrimSpace(output), []byte("\n")) {
+		var item struct {
+			Service string `json:"Service"`
+			State   string `json:"State"`
+			Health  string `json:"Health"`
+		}
+		if json.Unmarshal(line, &item) != nil || item.Service == "" {
+			return "unavailable"
+		}
+		states = append(states, item.Service+":"+item.State+":"+item.Health)
+	}
+	if len(states) == 0 {
+		return "empty"
+	}
+	sort.Strings(states)
+	return strings.Join(states, ",")
 }
 
 func hostingLivePlan(t *testing.T, ctx context.Context, workspace string, db *sql.DB, dataRoot, appID string) deploymentplans.DeploymentPlanRevision {
