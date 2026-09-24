@@ -505,21 +505,47 @@ func TestAnalyzeRejectsMalformedHostilePackageJSON(t *testing.T) {
 
 func TestAnalyzeDoesNotReadExcludedFiles(t *testing.T) {
 	reader := &recordingReader{memoryReader: memoryReader{
-		"package.json":      []byte(`{"scripts":{"start":"node server"},"dependencies":{"express":"5"}}`),
-		".env.production":   []byte("SECRET=value"),
-		"node_modules/x.js": []byte("malicious"),
-		"dist/package.json": []byte(`{"scripts":{"start":"malicious"}}`),
+		"package.json":           []byte(`{"scripts":{"start":"node server"},"dependencies":{"express":"5"}}`),
+		".env.production":        []byte("SECRET=value"),
+		"node_modules/x.js":      []byte("malicious"),
+		"dist/package.json":      []byte(`{"scripts":{"start":"malicious"}}`),
+		".yarn/install-state.gz": []byte("generated-state"),
 	}}
 	got, err := Analyze(context.Background(), sourceFiles(reader.memoryReader), reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []string{".env.production", "node_modules/x.js", "dist/package.json"} {
+	for _, forbidden := range []string{".env.production", "node_modules/x.js", "dist/package.json", ".yarn/install-state.gz"} {
 		if slices.Contains(reader.reads, forbidden) {
 			t.Fatalf("excluded file %q was read: %#v", forbidden, reader.reads)
 		}
 	}
+	baseline := analyzeMemory(t, memoryReader{"package.json": reader.memoryReader["package.json"]})
+	if got.StructuralFingerprint != baseline.StructuralFingerprint {
+		t.Fatal("generated Yarn state or excluded output changed source identity")
+	}
 	assertFinding(t, got.Findings, "excluded_sensitive_file")
+}
+
+func TestYarnInstallStateIsExcludedAtRootAndNestedPackage(t *testing.T) {
+	reader := memoryReader{
+		"package.json":                       []byte(`{"packageManager":"yarn@4.6.0","scripts":{"start":"node server.js"}}`),
+		".yarn/install-state.gz":             []byte("root-local-state"),
+		"apps/api/.yarn/install-state.gz":    []byte("nested-local-state"),
+		".yarn/cache/checked-in-package.zip": []byte("checked-in-cache"),
+	}
+	snapshot, err := loadSnapshot(context.Background(), sourceFiles(reader), reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{".yarn/install-state.gz", "apps/api/.yarn/install-state.gz"} {
+		if _, present := snapshot.fileSet[path]; present {
+			t.Fatalf("generated Yarn install state %q remained in source snapshot", path)
+		}
+	}
+	if _, present := snapshot.fileSet[".yarn/cache/checked-in-package.zip"]; !present {
+		t.Fatal("checked-in Yarn cache was excluded")
+	}
 }
 
 type recordingReader struct {

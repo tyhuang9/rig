@@ -293,6 +293,9 @@ func classifiedBuildPath(canonical string, directory bool, staticOutput string) 
 	}
 	segments := strings.Split(canonical, "/")
 	name := segments[len(segments)-1]
+	if !directory && name == "install-state.gz" && len(segments) >= 2 && segments[len(segments)-2] == ".yarn" {
+		return true, false
+	}
 	if directory {
 		switch name {
 		case "dist", "build", "out":

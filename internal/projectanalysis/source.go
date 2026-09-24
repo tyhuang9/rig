@@ -82,6 +82,9 @@ func loadSnapshot(ctx context.Context, files []File, reader FileReader) (snapsho
 			return snapshot{}, &AnalysisError{Code: CodeDuplicatePath, Path: file.Path, Err: fmt.Errorf("conflicts with %q", previous)}
 		}
 		seen[key] = file.Path
+		if key == ".yarn/install-state.gz" || strings.HasSuffix(key, "/.yarn/install-state.gz") {
+			continue
+		}
 		if excludedDirectory(file.Path) {
 			if prebuiltStaticArtifact(file.Path) && !sensitiveFile(file.Path) {
 				prebuiltFiles = append(prebuiltFiles, file)

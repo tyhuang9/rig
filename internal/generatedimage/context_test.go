@@ -19,6 +19,8 @@ func TestPrepareBuildContextExcludesSensitiveAndGeneratedPaths(t *testing.T) {
 	writeTestFile(t, filepath.Join(workspace, ".git", "config"), "do-not-copy")
 	writeTestFile(t, filepath.Join(workspace, "node_modules", "pkg", "index.js"), "do-not-copy")
 	writeTestFile(t, filepath.Join(workspace, "dist", "bundle.js"), "do-not-copy")
+	writeTestFile(t, filepath.Join(workspace, ".yarn", "install-state.gz"), "do-not-copy")
+	writeTestFile(t, filepath.Join(workspace, ".yarn", "cache", "safe.zip"), "safe-cache")
 
 	operation := filepath.Join(t.TempDir(), "operation")
 	if err := os.Mkdir(operation, 0o700); err != nil {
@@ -35,7 +37,10 @@ func TestPrepareBuildContextExcludesSensitiveAndGeneratedPaths(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(layout.contextDirectory, "source", ".npmrc")); err != nil {
 		t.Fatalf("non-secret package-manager configuration was not copied: %v", err)
 	}
-	for _, relative := range []string{"source/.env.production", "source/.git", "source/node_modules", "source/dist"} {
+	if _, err := os.Stat(filepath.Join(layout.contextDirectory, "source", ".yarn", "cache", "safe.zip")); err != nil {
+		t.Fatalf("checked-in Yarn cache was not copied: %v", err)
+	}
+	for _, relative := range []string{"source/.env.production", "source/.git", "source/node_modules", "source/dist", "source/.yarn/install-state.gz"} {
 		if _, err := os.Stat(filepath.Join(layout.contextDirectory, filepath.FromSlash(relative))); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("excluded path %q reached build context: %v", relative, err)
 		}

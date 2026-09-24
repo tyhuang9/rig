@@ -1,0 +1,17 @@
+{
+  "components": [
+    {
+      "id": "web",
+      "technology": "static",
+      "rootDirectory": ".",
+      "packageManager": "yarn",
+      "nodeVersion": "24",
+      "installCommand": "corepack yarn install --immutable",
+      "buildCommand": "corepack yarn build",
+      "startCommand": "",
+      "outputDirectory": "dist",
+      "internalPort": 8080,
+      "healthProbe": "/"
+    }
+  ]
+}

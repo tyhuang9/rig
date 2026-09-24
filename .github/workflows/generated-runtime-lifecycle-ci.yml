@@ -109,6 +109,18 @@ jobs:
           go test -tags live_docker -json -v -count=1 -timeout=15m ./internal/generatedimage -run "^${test_name}$" | tee "$output"
           jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
 
+      - name: Build and serve standalone npm and Yarn recipes
+        timeout-minutes: 18
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          test_name='TestLiveStandaloneRecipeMatrix'
+          package_name='github.com/hostd/hostd/internal/generatedimage'
+          go test -tags live_docker -json -v -count=1 -timeout=16m ./internal/generatedimage -run "^${test_name}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
+
       - name: Route the Next.js fixture with bounded runtime cache
         timeout-minutes: 19
         shell: bash
@@ -179,12 +191,13 @@ jobs:
           fixture_images="$(docker image ls --filter 'reference=rig-live-hosting-notes:*' --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
           next_recipe_images="$(docker image ls --filter 'reference=rig-live-nextjs-recipe:*' --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
           next_runtime_images="$(docker image ls --filter 'reference=rig-live-nextjs:*' --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
+          recipe_matrix_images="$(docker image ls --filter 'reference=rig-live-recipe-matrix:*' --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
           fixture_containers="$(docker ps --all --filter label=com.docker.compose.project=rig-hosting-notes-live-test --format '{{.ID}} {{.Names}} {{.Status}}')"
           fixture_networks="$(docker network ls --filter label=com.docker.compose.project=rig-hosting-notes-live-test --format '{{.ID}} {{.Name}}')"
           fixture_volumes="$(docker volume ls --filter label=com.docker.compose.project=rig-hosting-notes-live-test --format '{{.Name}}')"
           builders="$(docker ps --all --quiet --filter label=rig.controller=generated-builder)"
           builder_networks="$(docker network ls --quiet --filter label=rig.controller=generated-builder)"
-          if [[ -n "$containers" || -n "$networks" || -n "$images" || -n "$fixture_images" || -n "$next_recipe_images" || -n "$next_runtime_images" || -n "$fixture_containers" || -n "$fixture_networks" || -n "$fixture_volumes" || -n "$builders" || -n "$builder_networks" ]] || docker volume inspect rig-generated-caddy-config-v1 >/dev/null 2>&1 || docker network inspect rig-hosting-notes-live-test-external >/dev/null 2>&1; then
+          if [[ -n "$containers" || -n "$networks" || -n "$images" || -n "$fixture_images" || -n "$next_recipe_images" || -n "$next_runtime_images" || -n "$recipe_matrix_images" || -n "$fixture_containers" || -n "$fixture_networks" || -n "$fixture_volumes" || -n "$builders" || -n "$builder_networks" ]] || docker volume inspect rig-generated-caddy-config-v1 >/dev/null 2>&1 || docker network inspect rig-hosting-notes-live-test-external >/dev/null 2>&1; then
             printf 'Generated runtime resources were not cleaned up.\n' >&2
             exit 1
           fi
