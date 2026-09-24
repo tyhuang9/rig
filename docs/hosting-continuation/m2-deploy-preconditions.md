@@ -39,13 +39,15 @@ unpublished. These checks establish an integration candidate, not M2 acceptance.
 
 | Check | Result |
 | --- | --- |
-| `go test -p 1 -count=1 -timeout=15m ./...` | Passed on the committed implementation before the final recovery test addition. |
+| `go test -p 1 -count=1 -timeout=15m ./...` | Passed on exact code head `e10aad6`, including the reviewed in-flight recovery and mismatch tests. |
 | `go vet ./...` | Passed. |
 | `go build ./cmd/hostd ./cmd/hostctl ./cmd/rig-relay ./cmd/rig-relay-probe` | Passed. |
 | `go run ./cmd/openapi-gen -check` | Passed. |
 | `pnpm test` in `web` | Passed: 378 tests in 14 files. |
 | `pnpm typecheck` in `web` | Passed. |
 | `scripts/check-embedded.ps1` | Passed: deterministic production bundle equals controller-embedded assets. |
+| `pnpm e2e` in `web` with `GOFLAGS=-buildvcs=false` | Passed: 3 Chromium tests, including the real-controller dashboard journey. |
+| `pnpm --dir docs check:workflow`, `build`, `check:accessibility` | Passed after this evidence page was added. |
 
 Parallel Windows Go runs intermittently failed existing relay socket and
 Compose workspace tests. Representative Compose failures reproduced on the
