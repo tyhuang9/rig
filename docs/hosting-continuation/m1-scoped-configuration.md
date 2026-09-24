@@ -56,7 +56,7 @@ not been merged or deployed. M1's live exit gate remains open.
 | `go test -count=1 -run '^TestHostingNotesFixtureAcceptsReviewedFrontendAndBackendSetup$' ./internal/sourceinspection` | Passed. Rig selected the generated API and frontend candidate instead of the external harness Compose file; an explicit two-component plan with database-backed `/readyz` health was accepted. |
 | `go test -count=1 -run '^TestCompilerStagesHostingNotesFixtureWithoutDocker$' ./internal/generatedimage` | Passed with clean source and again after a local frontend build. The actual fixture's checked-in setup staged both component contexts with a fake Docker runner; source lockfile and app files were present, local `node_modules`, built assets, and test certificates were absent, and only the frontend received its public build value. No image was built. |
 | `go test -tags live_docker -run '^$' ./internal/generatedimage` | Passed compile-only. The existing direct Docker recipe test now supplies the required empty public-build-values mount; it was not executed without Docker. |
-| Opt-in `TestLiveHostingNotesFixtureImages` and generated-runtime CI step | The first hosted run on `14cb408a2d8ce0c2ed6633648ba2752146c942d6` passed the frontend image and existing blue-green lifecycle but failed the API image build: BuildKit reported `cd: can't cd to /workspace/app` in the install step. The `32e08ad76c6a3ddf236d4117aead851ac14264d1` diagnostic run proved that the staged path was `api` but a separate BuildKit context probe copied `app`; both values have the same length and staged timestamp in that revision. The candidate now derives reproducible file timestamps from content and awaits hosted verification. The live fixture image gate is not accepted. It does not prove external database connectivity or Rig ingress. |
+| Opt-in `TestLiveHostingNotesFixtureImages` and generated-runtime CI step | The first hosted run on `14cb408a2d8ce0c2ed6633648ba2752146c942d6` passed the frontend image and existing blue-green lifecycle but failed the API image build: BuildKit reported `cd: can't cd to /workspace/app`. The `32e08ad76c6a3ddf236d4117aead851ac14264d1` diagnostic run proved that the staged path was `api` but a separate BuildKit context probe copied `app`; both values had the same length and staged timestamp. The content-derived timestamp fix passed [hosted generated-runtime job 107463081017](https://github.com/tyhuang9/rig/actions/runs/35945723400/job/107463081017) on `b65bf1ebd8b95226231d36879ff1072c533c5866`: API and frontend image checks, blue-green lifecycle, and resource cleanup all passed. This verifies image builds and checks in CI, not external database connectivity or Rig ingress. |
 | Fresh copied fixture: `pnpm install --frozen-lockfile --offline` from `api`, then `VITE_BUILD_LABEL=workspace-install-check pnpm build` from `frontend` | Passed with an initially absent `node_modules`. pnpm resolved all three workspace packages and produced the frontend assets. The disposable copy was removed after the check. |
 
 The security review identified a PostgreSQL URL TLS-parameter override, an
@@ -79,7 +79,7 @@ assumed unavailable in-container DNS.
 
 | Cases | Evidence | Remaining gate |
 | --- | --- | --- |
-| CFG-01, CFG-06, CFG-08 | Scoped export, compiler identity, API/UI validation, and build-input tests pass. | Inspect real built image, layers, static assets, browser traffic, and component environments. |
+| CFG-01, CFG-06, CFG-08 | Scoped export, compiler identity, API/UI validation, and build-input tests pass. Hosted Docker built both fixture images, checked image environment, API dependencies, and the public frontend label in static assets. | Inspect image layers and browser traffic, then verify deployed component environments. |
 | CFG-07 | A focused executor test holds the source release constant, advances current configuration from revision 3 to 4, and verifies both the deployment pin and compiler input use revision 4. | Run same-source configuration-only redeploy against real Docker. |
 | CFG-09, CFG-10 | Literal-value, invalid-input, immutable storage, masking, admin/CSRF, and editor tests pass. | Run byte-exact deployed environment checks and inspect temporary files. |
 | CFG-11 | A real-controller Chromium run saved a synthetic server secret and confirmed `no-store`, omission from save/read responses, and absence from the reloaded field, page, URL, and browser storage. Unit/controller tests cover authorization and CSRF. | Inspect safe diagnostics and viewer behavior in a real controller session; repeat on an enabled generated runtime. |
@@ -93,7 +93,8 @@ roundtrip. No disposable external credential was provided; no Neon account,
 schema, or data was modified. A Go race run was unavailable because this host
 has CGO disabled. The user authorized draft publication to collect hosted
 Docker evidence; PR #70 was opened and its generated-runtime jobs exposed the
-API fixture build failure above. A separate relay outage race check timed out
-waiting for initial authenticated subscription sync on the diagnostic head;
-its cause remains unconfirmed. M1 is not an accepted live hosting
+API fixture build failure above. The content-derived timestamp fix passed the
+hosted image job. A separate PostgreSQL relay outage race check failed twice
+while reopening its test controller database on diagnostic heads, then passed
+on the fix head; the earlier cause remains unconfirmed. M1 is not an accepted live hosting
 milestone.
