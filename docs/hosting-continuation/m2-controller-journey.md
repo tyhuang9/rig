@@ -29,7 +29,10 @@ not an M2 acceptance claim. The branch has not been published or merged.
 | `go test -count=1 -timeout=15m ./...` | Passed locally on Windows, including controller, generated runtime, source snapshot, and job packages. |
 | `go test -tags live_docker ./cmd/hostd -run '^TestPrepareRuntimeWorkerRecoversInOrderBeforeStartingOneWorker$' -count=1` | Passed locally; compiles the new tagged live harness and runs a focused existing test. It does **not** execute the Docker gate. |
 | `go vet -tags live_docker ./cmd/hostd` | Passed locally. |
-| `pnpm --dir web typecheck`, `pnpm --dir web build`, `pnpm --dir web test` | Passed after the initial setup implementation (366 tests); rerun after final review fixes is pending. |
+| Frontend TypeScript, production Vite build, and full Vitest suite | Passed after review fixes: 373 tests in 14 files. The Windows worktree used the installed TypeScript, Vite, and Vitest Node entrypoints directly because the local pnpm 11.19 shim attempted to replace the linked 11.22 dependencies. |
+| Real-controller Chromium (`web/e2e/hostd.spec.ts`) | Passed with the new setup navigation, heading focus, local-access review, fake-runtime deploy guard, and the existing Compose create/cancel path. The first run found a missing initial heading focus after query loading; a later run found a query-key collision that disabled legacy Compose deploy. Both were fixed. |
+| Full Playwright suite | Passed: 3 tests, including the real-controller journey and two source-connection/focus journeys. Local runs set `GOFLAGS=-buildvcs=false` because the managed worktree's Git metadata is restricted to the spawned browser-test Go build. |
+| Embedded dashboard hash comparison | Passed after the final Vite build; the controller-served file set and SHA-256 hashes match `web/dist`. |
 
 The QA and security reviews of the controller harness found no confirmed
 exploit. Their actionable gaps were addressed: the deployed API now probes
@@ -39,6 +42,17 @@ release/configuration pins are asserted, and the Buildx record is checked after
 removal. Broader image-layer and frontend-asset secret coverage remains in
 the M1 hosted gate. The new controller gate itself has not yet run on Docker:
 the Windows host has no Docker CLI, and this M2 branch is local.
+
+Frontend review caught and fixed a job API response mismatch, loss of an
+uncertain idempotency key after configuration drift, inaccessible continuation
+failure feedback, and hidden known-job results when current setup becomes
+unavailable. The UI now compares the recorded deployment pins with the
+reviewed revisions and warns if they differ. The backend still has no
+deployment precondition for the reviewed revisions and no lookup by
+idempotency key. If a response is lost and the setup changes, the UI preserves
+the unresolved key, blocks automatic replay, and requires an explicit
+history-check decision before starting a new request. It cannot automatically
+prove whether the original request reached the controller.
 
 ## Open M2 acceptance work
 
