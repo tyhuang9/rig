@@ -7,7 +7,9 @@ reviewed generated plan uses Node 24, npm with `npm ci`, `npm run build`, and
 
 `NEXT_PUBLIC_BUILD_MARKER` is a public build input. The runtime-only
 `RIG_FIXTURE_RUNTIME_SECRET` belongs in a scoped server secret; `/api/runtime`
-reports only whether it is present. Never place that secret in a build input.
+reports only whether it is present. `RIG_FIXTURE_SLOT_MARKER` is a harmless
+runtime marker that identifies blue and green responses in the hosted test.
+Never place the secret in a build input.
 
 The page includes one local PNG served through Next.js image optimization so
 the hosted gate can inspect actual runtime cache behavior. This fixture does
