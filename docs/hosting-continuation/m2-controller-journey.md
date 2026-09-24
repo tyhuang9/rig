@@ -13,15 +13,24 @@ targets the unmerged M1 branch. Neither PR has been merged.
   ID. The UI does not claim an access URL because the controller API does not
   currently attest one.
 - An opt-in Linux Docker gate uses the authenticated controller HTTP API,
-  production generated-runtime composition and worker, immutable local source
-  snapshot, public-package fixture, real image builds, Caddy ingress, and
-  application-owned external TLS PostgreSQL and HTTPS services. It checks
+  persisted synthetic GitHub device connection, repository/branch selection,
+  an authenticated local HTTP archive fixture, production generated-runtime
+  composition and worker, immutable release snapshot, public-package fixture,
+  real image builds, Caddy ingress, and application-owned external TLS
+  PostgreSQL and HTTPS services. It checks
   controller idempotency replay, plan/configuration and source pins, scoped
   container environment, API note create/read, frontend public label, and
   ownership-checked cleanup. The gate is wired to a pull-request-only workflow.
 - The test uses the existing `examples/hosting-notes` fixture. Its database
   schema and credentials remain application-owned; Rig does not provision a
   database. There is no managed database or Neon provisioning path.
+- The archive fixture includes only committed example files that match `HEAD`.
+  Ignored files, generated dependencies, and local fixture edits are not
+  archived. The controlled provider uses synthetic credentials and a synthetic
+  commit SHA. It exercises Rig's persisted connection, source inspection,
+  materializer, and runtime path; the separate `githubapp.Client` tests cover
+  fixed provider origins and redirect rules. A live GitHub consent/archive
+  walkthrough remains unverified.
 - The controller gate now closes its worker, HTTP server, and database after a
   successful deployment; it checks the note through ingress while the
   controller is stopped, then reopens the durable store, recreates the runtime
@@ -54,6 +63,26 @@ targets the unmerged M1 branch. Neither PR has been merged.
   The runner was Ubuntu 24.04 with Docker CLI/Engine 28.0.4, API 1.48,
   Compose 2.38.2, and Buildx 0.37.1. This is hosted Linux evidence, not
   Windows Docker Desktop or physical LAN evidence.
+- The first controlled GitHub path passed on head `51df587` in
+  [run 36041184071](https://github.com/tyhuang9/rig/actions/runs/36041184071).
+  Security review then narrowed source staging to committed fixture files.
+  The final controlled GitHub path passed on exact code head
+  `2a04a4039f600a5812e6fbdad51eec5f8eddbfa2` in
+  [run 36042000520](https://github.com/tyhuang9/rig/actions/runs/36042000520).
+  `TestLiveControllerGeneratedDeploymentJourney` passed in 164.53 seconds,
+  including the initial browser note, controller restart, healthy same-source
+  replacement, failed bad-CA replacement, three HTTP archive reads, and exact
+  Docker cleanup. The job ran on Ubuntu 24.04 with Docker CLI/Engine 28.0.4,
+  API 1.48, Compose 2.38.2, and Buildx 0.37.1.
+
+| Final controlled GitHub run identity | Value |
+| --- | --- |
+| Synthetic source commit / runtime strategy | `cccccccccccccccccccccccccccccccccccccccc` / generated static frontend + Node API |
+| Application / connection | `d27a974b-f0d8-4403-a35a-5e262e42e481` / `df86b22218da8ebf73a2144b4bbb68e6` |
+| Accepted plan | `0d2a2c01-ce39-4e90-82e0-eb8c22702f63/1` |
+| Initial configuration / job / deployment / release | `da43bbab-1c81-42ec-8c09-725111c9de43/1` / `a67ef2e3-82b9-4429-8009-d805a07ec2b2` / `3ab9e2ca-2c68-49b6-a1ff-186f164d8e0c` / `0d8ab723c5c467be9fa164a0f9b99bbf` |
+| Healthy replacement configuration / job / deployment / release | `f6efd31a-bee5-43d8-8fb7-49408bd4b67c/2` / `ddf1594e-f419-4a2b-be10-9cac4641b89f` / `25a1f953-aff4-46f2-8dfa-5d874c3acf21` / `9bb4e7f2f5d518498026a1f9b75b1085` |
+| Failed replacement configuration / job / deployment | `ef78e9c7-43d3-4f40-a469-fd295da728af/3` / `8b713011-d749-4f11-9add-fbcec6f566d6` / `cdbd9b0a-f317-4d78-8363-555b9202e9b5` |
 
 ## Verification so far
 
@@ -82,22 +111,22 @@ component without exposing application output or secret values. That run
 ([workflow 36034083663](https://github.com/tyhuang9/rig/actions/runs/36034083663),
 head `b77facb`) showed the API healthy and the static frontend exited with
 code 1 before serving. Cleanup passed. A bounded error-category probe on the
-controlled frontend's startup log is pending in the next hosted run.
+controlled frontend's startup log followed.
 The fourth hosted run ([workflow 36034611177](https://github.com/tyhuang9/rig/actions/runs/36034611177),
 head `b79d07b`) classified that startup failure as `MODULE_NOT_FOUND`;
-the API again became healthy and cleanup passed. The next diagnostic checks
-the accepted static run command and logs only the missing module's basename.
+the API again became healthy and cleanup passed. The next diagnostic checked
+the accepted static run command and logged only the missing module's basename.
 The fifth hosted run ([workflow 36035148372](https://github.com/tyhuang9/rig/actions/runs/36035148372),
 head `688cee7`) confirmed the accepted static command and identified the
 missing module basename as `static.mjs`; the API was healthy and cleanup
-passed. The next run distinguishes the application's workspace from Rig's
-runtime library path and probes that exact library file in the stopped
+passed. The next run distinguished the application's workspace from Rig's
+runtime library path and probed that exact library file in the stopped
 container without printing its contents.
 The sixth hosted run ([workflow 36035720070](https://github.com/tyhuang9/rig/actions/runs/36035720070),
 head `ad5eb92`) located the error at Rig's `/usr/local/lib/rig/static.mjs`.
 Docker could copy that file from the stopped container even though Node exited
 with `MODULE_NOT_FOUND`; API health and cleanup passed. The next bounded probe
-records only the static module and parent directory modes/owners to resolve
+recorded only the static module and parent directory modes/owners to resolve
 the apparent access mismatch.
 The seventh hosted run ([workflow 36036347990](https://github.com/tyhuang9/rig/actions/runs/36036347990),
 head `0a5a6e8`) found the exact mismatch: both `static.mjs` and its newly
@@ -131,9 +160,9 @@ prove whether the original request reached the controller.
 ## Open M2 acceptance work
 
 - Keep the hosted controller journey gate green on the final M2 head; the
-  current passed head is `04e4b65b98f41416a53bbe5941979f0f799fa63d`.
-- Add controlled GitHub archive/connection materialization to the continuous
-  harness and perform a separate live GitHub authorization walkthrough.
+  current passed code head is `2a04a4039f600a5812e6fbdad51eec5f8eddbfa2`.
+- Perform a separate live GitHub authorization/archive walkthrough with a
+  disposable repository; controlled provider evidence does not establish it.
 - Cover the supported Node, Vite, Next.js, and package-manager recipe matrix.
 - Verify manual setup, backend interface binding, capacity pause, migration
   failure, private-network isolation, and interrupted controller recovery.
