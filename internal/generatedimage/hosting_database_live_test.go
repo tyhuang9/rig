@@ -233,11 +233,11 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	dbURL := fmt.Sprintf("postgresql://fixture_user:%s@%s:%d/fixture_notes?sslmode=verify-full", password, gateway, postgresPort)
 	httpsURL := fmt.Sprintf("https://%s:%d/", gateway, httpsPort)
 	hostingLivePrepareSchema(t, ctx, node, workspace, dbURL, base64.StdEncoding.EncodeToString(ca), docker, runtimeDockerConfig, fixtureRoot, composeEnv)
-	releaseID, artifactID := uuid.NewString(), uuid.NewString()
-	imageID, definitionDigest := hostingLiveBuildAPI(t, ctx, docker, buildDockerConfig, workspace, root, imageTag, plan, appID, releaseID, artifactID)
-	hostingLiveImageHasNoSecrets(t, ctx, docker, runtimeDockerConfig, imageID, dbURL, token, sentinel)
 	settings := hostingLiveSettings{dbURL: dbURL, httpsURL: httpsURL, ca: base64.StdEncoding.EncodeToString(ca), token: token, sentinel: sentinel}
 	revisionA := hostingLiveReplaceConfig(t, ctx, config, appID, plan, 0, settings, "runtime-A")
+	releaseID, artifactID := uuid.NewString(), uuid.NewString()
+	imageID, definitionDigest := hostingLiveBuildAPI(t, ctx, docker, buildDockerConfig, workspace, root, imageTag, plan, appID, releaseID, artifactID, dbURL, token, sentinel)
+	hostingLiveImageHasNoSecrets(t, ctx, docker, runtimeDockerConfig, imageID, dbURL, token, sentinel)
 	port := uint16(hostingLiveFreePort(t, "127.0.0.1"))
 	ingress, err := generatedingress.New(runtimeprocess.ExecRunner{}, generatedingress.Options{
 		DockerExecutable: docker, DockerConfigDirectory: runtimeDockerConfig,
@@ -248,7 +248,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 		t.Fatal("prepare generated ingress")
 	}
 	blueSpec := hostingLiveCandidateSpec(appID, plan, imageID, definitionDigest, releaseID, artifactID)
-	hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, config, revisionA, blueSpec, &blue)
+	hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, config, revisionA, settings, blueSpec, &blue)
 	hostingLiveOnlyAppNetwork(t, ctx, docker, runtimeDockerConfig, blue.ContainerID, appNetwork.Name)
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{hostingLiveEndpoint(blue)}}); err != nil {
 		t.Fatal("route initial API candidate")
@@ -271,7 +271,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create bad-CA candidate: %s", hostingLiveRuntimeCode(err))
 	}
-	hostingLiveAssertSelectedDockerEnv(t, ctx, docker, runtimeDockerConfig, bad.ContainerID)
+	hostingLiveAssertSelectedDockerEnv(t, ctx, docker, runtimeDockerConfig, bad.ContainerID, settings)
 	if err := engine.StartCandidate(ctx, bad); err != nil {
 		t.Fatalf("start bad-CA candidate: %s", hostingLiveRuntimeCode(err))
 	}
@@ -288,7 +288,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	revisionB := hostingLiveReplaceConfig(t, ctx, config, appID, plan, badRevision.RevisionNumber, settings, "runtime-B")
 	greenSpec := hostingLiveCandidateSpec(appID, plan, imageID, definitionDigest, releaseID, artifactID)
 	greenSpec.ActiveSlot = blue.Slot
-	hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, config, revisionB, greenSpec, &green)
+	hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, config, revisionB, settings, greenSpec, &green)
 	hostingLiveAssertAPI(t, ctx, port, appID, "runtime-A", false)
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, FromSlot: blue.Slot, ToSlot: green.Slot, Endpoints: []generatedruntime.RouteEndpoint{hostingLiveEndpoint(green)}}); err != nil {
 		t.Fatal("switch to configuration-only replacement")
@@ -562,7 +562,7 @@ func hostingLivePlan(t *testing.T, ctx context.Context, workspace string, db *sq
 	return revision
 }
 
-func hostingLiveBuildAPI(t *testing.T, ctx context.Context, docker, dockerConfig, workspace, root, tag string, plan deploymentplans.DeploymentPlanRevision, appID, releaseID, artifactID string) (string, string) {
+func hostingLiveBuildAPI(t *testing.T, ctx context.Context, docker, dockerConfig, workspace, root, tag string, plan deploymentplans.DeploymentPlanRevision, appID, releaseID, artifactID string, forbidden ...string) (string, string) {
 	t.Helper()
 	definition, digest, err := definitionForBuild(plan, "api", nil)
 	if err != nil {
@@ -579,6 +579,7 @@ func hostingLiveBuildAPI(t *testing.T, ctx context.Context, docker, dockerConfig
 	if err := writeRecipe(layout, definition); err != nil {
 		t.Fatal("write generated API recipe")
 	}
+	hostingLiveAssertNoSecretsInBuildContext(t, layout.contextDirectory, forbidden...)
 	// The runtime engine accepts only images with the exact compiler ownership
 	// labels. This build follows the production recipe and label contract.
 	args := []string{"buildx", "build", "--file", layout.containerfile, "--iidfile", layout.imageIDFile, "--load", "--no-cache", "--progress", "plain", "--tag", tag}
@@ -602,6 +603,32 @@ func hostingLiveBuildAPI(t *testing.T, ctx context.Context, docker, dockerConfig
 		t.Fatal("generated hosting API image identity is invalid")
 	}
 	return imageID, digest
+}
+
+func hostingLiveAssertNoSecretsInBuildContext(t *testing.T, directory string, forbidden ...string) {
+	t.Helper()
+	err := filepath.WalkDir(directory, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		defer clear(body)
+		for _, secret := range forbidden {
+			if secret != "" && bytes.Contains(body, []byte(secret)) {
+				return errors.New("runtime secret entered the generated build context")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("inspect generated API build context without printing secrets: %v", err)
+	}
 }
 
 func hostingLiveImageHasNoSecrets(t *testing.T, ctx context.Context, docker, config, imageID string, forbidden ...string) {
@@ -694,7 +721,7 @@ func hostingLiveCandidateSpec(appID string, plan deploymentplans.DeploymentPlanR
 	return generatedruntime.CandidateSpec{}
 }
 
-func hostingLiveStart(t *testing.T, ctx context.Context, docker, dockerConfig string, engine *generatedruntime.Engine, store *appconfig.Store, revision appconfig.Configuration, spec generatedruntime.CandidateSpec, candidate *generatedruntime.Candidate) {
+func hostingLiveStart(t *testing.T, ctx context.Context, docker, dockerConfig string, engine *generatedruntime.Engine, store *appconfig.Store, revision appconfig.Configuration, settings hostingLiveSettings, spec generatedruntime.CandidateSpec, candidate *generatedruntime.Candidate) {
 	t.Helper()
 	// The candidate's plan identity is part of its image contract. Build the
 	// export using the same accepted plan identity without a broad revision read.
@@ -710,7 +737,7 @@ func hostingLiveStart(t *testing.T, ctx context.Context, docker, dockerConfig st
 		t.Fatalf("create exact API candidate: %s", hostingLiveRuntimeCode(err))
 	}
 	*candidate = created
-	hostingLiveAssertSelectedDockerEnv(t, ctx, docker, dockerConfig, created.ContainerID)
+	hostingLiveAssertSelectedDockerEnv(t, ctx, docker, dockerConfig, created.ContainerID, settings)
 	if err := engine.StartCandidate(ctx, created); err != nil {
 		t.Fatalf("start exact API candidate: %s", hostingLiveRuntimeCode(err))
 	}
@@ -719,7 +746,7 @@ func hostingLiveStart(t *testing.T, ctx context.Context, docker, dockerConfig st
 	}
 }
 
-func hostingLiveAssertSelectedDockerEnv(t *testing.T, ctx context.Context, docker, dockerConfig, containerID string) {
+func hostingLiveAssertSelectedDockerEnv(t *testing.T, ctx context.Context, docker, dockerConfig, containerID string, settings hostingLiveSettings) {
 	t.Helper()
 	body, err := hostingLiveDockerOutput(ctx, docker, dockerConfig, nil, "container", "inspect", "--format", "{{json .Config.Env}}", containerID)
 	if err != nil {
@@ -729,7 +756,12 @@ func hostingLiveAssertSelectedDockerEnv(t *testing.T, ctx context.Context, docke
 	if err := json.Unmarshal(bytes.TrimSpace(body), &entries); err != nil {
 		t.Fatal("decode generated API environment transport")
 	}
-	for _, expected := range []string{"DATABASE_URL_ENV=NOTES_FIXTURE_DB_URL", "FIXTURE_SCHEMA=rig_fixture_notes"} {
+	for _, expected := range []string{
+		"DATABASE_URL_ENV=NOTES_FIXTURE_DB_URL", "FIXTURE_SCHEMA=rig_fixture_notes",
+		"NOTES_FIXTURE_DB_URL=" + settings.dbURL,
+		"NOTES_FIXTURE_HTTPS_TOKEN=" + settings.token,
+		"TEST_SENTINEL_SECRET=" + settings.sentinel,
+	} {
 		if !slices.Contains(entries, expected) {
 			t.Fatal("Docker did not receive an exact scoped runtime selector")
 		}

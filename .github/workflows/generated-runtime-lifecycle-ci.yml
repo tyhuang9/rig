@@ -48,6 +48,13 @@ jobs:
           node-version: 24.19.0
           package-manager-cache: false
 
+      - name: Record hosted Docker versions
+        timeout-minutes: 1
+        run: |
+          docker version --format 'Docker CLI={{.Client.Version}} Engine={{.Server.Version}} API={{.Server.APIVersion}}'
+          docker buildx version
+          docker compose version
+
       - name: Install hosting fixture dependencies for schema preparation
         timeout-minutes: 5
         run: pnpm --dir examples/hosting-notes install --frozen-lockfile

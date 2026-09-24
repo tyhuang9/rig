@@ -58,8 +58,13 @@ func TestLiveHostingNotesFixtureImages(t *testing.T) {
 	revision := deploymentplans.DeploymentPlanRevision{Plan: plan, CanonicalDigest: digest}
 	ctx, cancel := context.WithTimeout(context.Background(), 14*time.Minute)
 	defer cancel()
-	for _, name := range []string{"api", "frontend"} {
-		t.Run(name, func(t *testing.T) {
+	var firstFrontendImage string
+	for _, fixture := range []struct{ name, component, publicLabel, absentLabel string }{
+		{name: "api", component: "api"},
+		{name: "frontend-public-A", component: "frontend", publicLabel: "public-build-A", absentLabel: "public-build-B"},
+		{name: "frontend-public-B", component: "frontend", publicLabel: "public-build-B", absentLabel: "public-build-A"},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
 			imageTag := "rig-live-hosting-notes:" + uuid.NewString()
 			t.Cleanup(func() {
 				cleanupCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
@@ -74,15 +79,15 @@ func TestLiveHostingNotesFixtureImages(t *testing.T) {
 				}
 			})
 			values := []appconfig.ValueInput{}
-			if name == "frontend" {
-				values = append(values, appconfig.ValueInput{Key: "VITE_BUILD_LABEL", Value: "public-build-A"})
+			if fixture.component == "frontend" {
+				values = append(values, appconfig.ValueInput{Key: "VITE_BUILD_LABEL", Value: fixture.publicLabel})
 			}
-			definition, _, err := definitionForBuild(revision, name, values)
+			definition, _, err := definitionForBuild(revision, fixture.component, values)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if definition.rootDirectory != name || definition.installDirectory != name {
-				t.Fatalf("fixture %s paths: root=%q install=%q", name, definition.rootDirectory, definition.installDirectory)
+			if definition.rootDirectory != fixture.component || definition.installDirectory != fixture.component {
+				t.Fatalf("fixture %s paths: root=%q install=%q", fixture.component, definition.rootDirectory, definition.installDirectory)
 			}
 			layout, err := prepareBuildContext(ctx, workspace, t.TempDir(), definition, contextLimits{})
 			if err != nil {
@@ -92,11 +97,11 @@ func TestLiveHostingNotesFixtureImages(t *testing.T) {
 				t.Fatal(err)
 			}
 			installPath, err := os.ReadFile(filepath.Join(layout.contextDirectory, "rig", "install.path"))
-			if err != nil || string(installPath) != name {
-				t.Fatalf("fixture %s staged install path mismatch: %v %q", name, err, installPath)
+			if err != nil || string(installPath) != fixture.component {
+				t.Fatalf("fixture %s staged install path mismatch: %v %q", fixture.component, err, installPath)
 			}
-			if info, err := os.Stat(filepath.Join(layout.contextDirectory, "source", name)); err != nil || !info.IsDir() {
-				t.Fatalf("fixture %s staged source directory missing: %v", name, err)
+			if info, err := os.Stat(filepath.Join(layout.contextDirectory, "source", fixture.component)); err != nil || !info.IsDir() {
+				t.Fatalf("fixture %s staged source directory missing: %v", fixture.component, err)
 			}
 			args := []string{"buildx", "build", "--file", layout.containerfile, "--iidfile", layout.imageIDFile, "--load", "--no-cache", "--progress", "plain", "--tag", imageTag}
 			if definition.installBehavior != "" {
@@ -116,7 +121,7 @@ func TestLiveHostingNotesFixtureImages(t *testing.T) {
 			build := exec.CommandContext(ctx, docker, args...)
 			output, err := build.CombinedOutput()
 			if err != nil {
-				t.Fatalf("fixture %s image build failed: %v %s", name, err, output)
+				t.Fatalf("fixture %s image build failed: %v %s", fixture.name, err, output)
 			}
 			imageBody, err := os.ReadFile(layout.imageIDFile)
 			if err != nil {
@@ -128,17 +133,22 @@ func TestLiveHostingNotesFixtureImages(t *testing.T) {
 			}
 			inspect, err := exec.CommandContext(ctx, docker, "image", "inspect", "--format", "{{json .Config.Env}}", imageID).CombinedOutput()
 			if err != nil || bytes.Contains(inspect, []byte("DATABASE_URL")) || bytes.Contains(inspect, []byte("TEST_SENTINEL_SECRET")) {
-				t.Fatalf("fixture %s image environment check failed: %v", name, err)
+				t.Fatalf("fixture %s image environment check failed: %v", fixture.name, err)
 			}
 			command := `test -z "${DATABASE_URL+x}" && test -z "${TEST_SENTINEL_SECRET+x}"`
-			if name == "frontend" {
-				command += ` && test -f /workspace/frontend/dist/index.html && grep -R -F -q public-build-A /workspace/frontend/dist/assets`
+			if fixture.component == "frontend" {
+				command += ` && test -f /workspace/frontend/dist/index.html && grep -R -F -q ` + fixture.publicLabel + ` /workspace/frontend/dist/assets && ! grep -R -F -q ` + fixture.absentLabel + ` /workspace/frontend/dist/assets`
+				if firstFrontendImage == "" {
+					firstFrontendImage = imageID
+				} else if firstFrontendImage == imageID {
+					t.Fatal("changing only a public build value reused the prior frontend image")
+				}
 			} else {
 				command += ` && test -f /workspace/api/node_modules/express/package.json && test -f /workspace/api/src/server.js`
 			}
 			check := exec.CommandContext(ctx, docker, "container", "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--entrypoint", "/bin/sh", imageID, "-ec", command)
 			if output, err := check.CombinedOutput(); err != nil {
-				t.Fatalf("fixture %s image content check failed: %v %s", name, err, output)
+				t.Fatalf("fixture %s image content check failed: %v %s", fixture.name, err, output)
 			}
 		})
 	}
