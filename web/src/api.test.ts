@@ -249,10 +249,10 @@ describe("API client", () => {
   });
 
   it("reads an exact durable job and clears setup attempts on sign out", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ job: { id: "job-1", status: "succeeded" } }), { status: 200 }));
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: "job-1", status: "succeeded" }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
     window.sessionStorage.setItem("rig-setup-deployment:app-1", JSON.stringify({ signature: "plan:1:config:1", key: "key" }));
-    await expect(api.job("job/one")).resolves.toMatchObject({ job: { status: "succeeded" } });
+    await expect(api.job("job/one")).resolves.toMatchObject({ id: "job-1", status: "succeeded" });
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/jobs/job%2Fone", expect.objectContaining({ credentials: "same-origin" }));
     clearCSRF();
     expect(window.sessionStorage.getItem("rig-setup-deployment:app-1")).toBeNull();

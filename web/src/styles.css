@@ -189,6 +189,10 @@ button:disabled { cursor: wait; opacity: .62; }
 .setup-content .configuration-panel { margin-top: 18px; }
 .setup-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 20px; padding-top: 14px; border-top: 1px solid #e3e6ea; }
 .setup-actions > span { color: #4e5561; font-size: 12px; }
+.setup-recovery { display: grid; gap: 10px; margin-top: 8px; }
+.setup-recovery p { margin: 0; }
+.setup-recovery label { display: flex; align-items: center; gap: 8px; min-height: 44px; }
+.setup-recovery .button { justify-self: start; }
 .setup-facts { display: grid; gap: 0; margin: 16px 0; border: 1px solid #e3e6ea; border-radius: 8px; overflow: hidden; }
 .setup-facts > div { display: grid; grid-template-columns: minmax(130px, 1fr) minmax(0, 2fr); gap: 12px; padding: 10px 12px; border-bottom: 1px solid #e3e6ea; }
 .setup-facts > div:last-child { border-bottom: 0; }

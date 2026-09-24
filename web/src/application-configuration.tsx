@@ -34,11 +34,11 @@ Use valid portable names: letters, numbers, and underscores, beginning with a le
 
 Do not add configuration entries without evidence. If something is uncertain, say so in Evidence and omit it rather than guessing. Create one Rig row for each returned item, omit entries you omitted from the response, and replace User must provide with the actual secret before saving.`;
 
-export function ApplicationConfigurationPanel({ appId, onContinue }: { appId: string; onContinue?: () => void }) {
+export function ApplicationConfigurationPanel({ appId, onContinue, continuing = false }: { appId: string; onContinue?: () => void; continuing?: boolean }) {
   const planQuery = useQuery({ queryKey: ["deployment-plan", appId], queryFn: () => api.deploymentPlan(appId), retry: false });
   if (planQuery.isLoading) return <section className="configuration-panel" aria-labelledby="configuration-title" aria-busy="true"><h2 id="configuration-title">Configuration</h2><p role="status">Loading accepted deployment plan…</p><button className="button primary" disabled>Save configuration</button></section>;
   if (planQuery.isError) return <section className="configuration-panel" aria-labelledby="configuration-title"><h2 id="configuration-title">Configuration</h2><div className="callout danger" role="alert"><strong>The deployment plan could not be loaded.</strong><span>{planQuery.error.message}</span></div><p>Configuration changes are unavailable until Rig can load the deployment plan that defines the allowed scopes.</p><button className="button" onClick={() => planQuery.refetch()}>Try again</button></section>;
-  if (planQuery.data?.strategy === "generated_node") return <ScopedApplicationConfigurationEditor key={appId} appId={appId} plan={planQuery.data} refreshPlan={() => planQuery.refetch()} onContinue={onContinue}/>;
+  if (planQuery.data?.strategy === "generated_node") return <ScopedApplicationConfigurationEditor key={appId} appId={appId} plan={planQuery.data} refreshPlan={() => planQuery.refetch()} onContinue={onContinue} continuing={continuing}/>;
   return <ApplicationConfigurationEditor key={appId} appId={appId}/>;
 }
 
@@ -338,11 +338,12 @@ function scopedIdentity(value: { key: string; phase: ScopedPhaseSelection; targe
   return `${value.phase}\u0000${value.targetComponent}\u0000${value.key}`;
 }
 
-function ScopedApplicationConfigurationEditor({ appId, plan, refreshPlan, onContinue }: {
+function ScopedApplicationConfigurationEditor({ appId, plan, refreshPlan, onContinue, continuing }: {
   appId: string;
   plan: DeploymentPlanRevision;
   refreshPlan: () => Promise<unknown>;
   onContinue?: () => void;
+  continuing: boolean;
 }) {
   const queryClient = useQueryClient();
   const query = useQuery({ queryKey: ["app-configuration", appId], queryFn: () => api.applicationConfiguration(appId), retry: false });
@@ -694,6 +695,6 @@ function ScopedApplicationConfigurationEditor({ appId, plan, refreshPlan, onCont
       {hasPublicBuildValue && <aside className="scoped-build-disclosure" aria-labelledby="public-build-disclosure-title"><h3 id="public-build-disclosure-title">Public build values</h3><p>These non-secret values are supplied during the selected component build and can be embedded in browser assets. Do not enter passwords, database URLs, tokens, or other private values here.</p><label><input type="checkbox" checked={publicBuildDisclosureAcknowledged} disabled={busy} aria-invalid={Boolean(rowErrors.publicBuildDisclosure?.value)} aria-describedby={rowErrors.publicBuildDisclosure?.value ? "public-build-disclosure-error" : undefined} onChange={(event) => { setPublicBuildDisclosureAcknowledged(event.target.checked); clearRowError("publicBuildDisclosure", "value"); markDirty(); }}/> I understand public build values may be visible to browser users.</label>{rowErrors.publicBuildDisclosure?.value && <span id="public-build-disclosure-error" className="form-error" role="alert">{rowErrors.publicBuildDisclosure.value}</span>}</aside>}
       <div className="configuration-footer"><span aria-live="polite" aria-atomic="true" role="status">{statusMessage}</span><button className="button primary" disabled={busy || !dirty}>{busy ? "Saving…" : "Save configuration"}</button></div>
     </form>
-    {onContinue && <div className="setup-actions"><button type="button" className="button primary" disabled={busy || dirty || query.isError || scopedPlanDrift || legacyScopeReview} onClick={onContinue}>Continue to access</button>{dirty && <span>Save configuration before continuing.</span>}</div>}
+    {onContinue && <div className="setup-actions"><button type="button" className="button primary" disabled={continuing || busy || dirty || query.isError || scopedPlanDrift || legacyScopeReview} onClick={onContinue}>{continuing ? "Checking setup…" : "Continue to access"}</button>{dirty && <span>Save configuration before continuing.</span>}</div>}
   </section>;
 }

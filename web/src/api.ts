@@ -26,6 +26,7 @@ import {
   type GitHubRepositoryPage,
   type InspectRequest,
   type InspectResponse,
+  type Job,
   type JobList,
   type JobMutationResponse,
   type JobResponse,
@@ -416,7 +417,7 @@ export const api = {
     request<GitHubBranchPage>(pagedPath(operations.listGitHubBranches.path, { connectionId, installationId, repositoryId }, page, perPage)),
   machines: () => request<MachineList>(operations.listMachines.path),
   jobs: () => request<JobList>(operations.listJobs.path),
-  job: (id: string) => request<JobResponse>(operationPath(operations.getJob.path, { jobId: id })),
+  job: (id: string) => request<Job>(operationPath(operations.getJob.path, { jobId: id })),
   cancelJob: (id: string) =>
     request<JobResponse>(operationPath(operations.cancelJob.path, { jobId: id }), {
       method: operations.cancelJob.method,
