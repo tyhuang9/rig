@@ -597,7 +597,77 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	}
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, "read", browserNote)
-	t.Logf("M2 controller journey identities: app=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s source=local-snapshot ingress=127.0.0.1:8080", application.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID)
+	publicEntries := make([]apicontract.ScopedConfigurationValueInput, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Sensitive {
+			continue // The scoped store preserves secrets in the same plan and scope.
+		}
+		if entry.Key == "API_RUNTIME_MARKER" {
+			entry.Value = "controller-journey-v2"
+		}
+		publicEntries = append(publicEntries, entry)
+	}
+	var replacementConfiguration apicontract.ApplicationConfiguration
+	replacementResponse := request(http.MethodPut, "/api/v1/apps/"+application.ID+"/scoped-configuration", apicontract.ReplaceScopedApplicationConfigurationRequest{
+		ExpectedRevisionNumber: saved.RevisionNumber, PlanRevisionID: plan.RevisionID, PlanRevisionNumber: plan.RevisionNumber,
+		PublicBuildDisclosureAcknowledged: true, Entries: publicEntries, Remove: []apicontract.ScopedConfigurationKey{},
+	}, http.StatusOK, &replacementConfiguration)
+	if replacementConfiguration.RevisionNumber != saved.RevisionNumber+1 || replacementConfiguration.RevisionID == saved.RevisionID ||
+		bytes.Contains(replacementResponse, []byte(dbURL)) || bytes.Contains(replacementResponse, []byte(sentinel)) {
+		t.Fatal("configuration-only replacement did not create a protected revision")
+	}
+	var replacementMutation apicontract.JobMutationResponse
+	request(http.MethodPost, deploymentPath, map[string]any{}, http.StatusAccepted, &replacementMutation, map[string]string{"Idempotency-Key": uuid.NewString()})
+	if !replacementMutation.Created || replacementMutation.Job.ID == completed.ID {
+		t.Fatal("controller did not enqueue a distinct replacement job")
+	}
+	replacementDeadline := time.Now().Add(8 * time.Minute)
+	var replacementJob jobs.Job
+	for {
+		replacementJob, err = restartedJobs.Get(replacementMutation.Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if replacementJob.Status == string(jobs.Succeeded) {
+			break
+		}
+		if replacementJob.Status == string(jobs.Failed) || replacementJob.Status == string(jobs.WaitingUser) || replacementJob.Status == string(jobs.NeedsAttention) || time.Now().After(replacementDeadline) || ctx.Err() != nil {
+			t.Fatalf("healthy replacement did not succeed: status=%s phase=%s code=%s", replacementJob.Status, replacementJob.Phase, replacementJob.ErrorCode)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	var replacementHistory apicontract.DeploymentList
+	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/deployments", nil, http.StatusOK, &replacementHistory)
+	if len(replacementHistory.Items) != 2 {
+		t.Fatal("replacement history did not retain both deployments")
+	}
+	var replacementDeployment apicontract.Deployment
+	for _, item := range replacementHistory.Items {
+		if item.JobID == replacementJob.ID {
+			replacementDeployment = item
+		}
+	}
+	if replacementDeployment.ID == "" || replacementDeployment.Status != "succeeded" || replacementDeployment.ReleaseID == history.Items[0].ReleaseID ||
+		replacementDeployment.ActualConfigurationRevisionID != replacementConfiguration.RevisionID || replacementDeployment.ActualConfigurationRevisionNumber != replacementConfiguration.RevisionNumber {
+		t.Fatal("replacement deployment lacks the new configuration and source pins")
+	}
+	var replacementReleases apicontract.ReleaseList
+	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/releases", nil, http.StatusOK, &replacementReleases)
+	var replacementRelease apicontract.Release
+	for _, item := range replacementReleases.Items {
+		if item.ID == replacementDeployment.ReleaseID {
+			replacementRelease = item
+		}
+	}
+	if replacementRelease.ID == "" || replacementRelease.ArchiveSha256 != releases.Items[0].ArchiveSha256 ||
+		replacementRelease.ConfigurationRevisionID != replacementConfiguration.RevisionID || replacementRelease.ConfigurationRevisionNumber != replacementConfiguration.RevisionNumber {
+		t.Fatal("same-source replacement did not pin the new configuration")
+	}
+	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
+	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
+	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
+	controllerJourneyBrowser(t, ctx, node, application.ID, "read", browserNote)
+	t.Logf("M2 controller journey identities: app=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s replacement-config=%s/%d replacement-job=%s replacement-deployment=%s replacement-release=%s source=local-snapshot ingress=127.0.0.1:8080", application.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID, replacementConfiguration.RevisionID, replacementConfiguration.RevisionNumber, replacementJob.ID, replacementDeployment.ID, replacementRelease.ID)
 }
 
 func controllerJourneyExecutable(t *testing.T, name string) string {

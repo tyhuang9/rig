@@ -31,8 +31,13 @@ targets the unmerged M1 branch. Neither PR has been merged.
   passed this restart extension and exact cleanup on head `077f669`.
 - The next gate extension drives Chromium through the deployed frontend,
   Caddy, API, and external TLS PostgreSQL to create/read a note, then opens
-  a fresh browser after controller restart to read the same note. Its hosted
-  result is pending.
+  a fresh browser after controller restart to read the same note. Hosted
+  [run 36038405153](https://github.com/tyhuang9/rig/actions/runs/36038405153)
+  passed both Chromium journeys and exact cleanup on head `2903ca1`.
+- The next gate extension saves a second scoped configuration on the same
+  source, deploys it through the restarted controller, and checks the new
+  immutable pins, healthy replacement, scoped containers, and preserved note.
+  Its hosted result is pending.
 
 ## Verification so far
 
@@ -108,8 +113,8 @@ prove whether the original request reached the controller.
 ## Open M2 acceptance work
 
 - Complete the hosted controller journey gate on the corrected branch head.
-- Run the new real-browser journey on the final head, then verify healthy and
-  unhealthy replacement.
+- Verify the new healthy replacement on the final head, then unhealthy
+  replacement that preserves the old serving version.
 - Add controlled GitHub archive/connection materialization to the continuous
   harness and perform a separate live GitHub authorization walkthrough.
 - Prove unhealthy replacement retains the old serving version, and cover the
