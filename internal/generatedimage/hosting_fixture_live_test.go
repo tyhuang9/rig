@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -116,7 +117,13 @@ func TestLiveHostingNotesFixtureImages(t *testing.T) {
 			build := exec.CommandContext(ctx, docker, args...)
 			output, err := build.CombinedOutput()
 			if err != nil {
-				t.Fatalf("fixture %s image build failed: %v %s", name, err, output)
+				probeFile := filepath.Join(t.TempDir(), "Probe.Containerfile")
+				probeRecipe := fmt.Sprintf("FROM %s\nCOPY --chown=node:node source/ /workspace/\nCOPY --chown=1000:1000 --chmod=0400 rig/root.path rig/install.path /run/rig/\nRUN [\"/bin/sh\",\"-ec\",\"printf 'install='; cat /run/rig/install.path; echo; ls -ld /workspace/api /workspace/frontend\"]\n", definition.baseImage)
+				if writeErr := os.WriteFile(probeFile, []byte(probeRecipe), 0o600); writeErr != nil {
+					t.Fatalf("fixture %s image build failed: %v %s; probe setup: %v", name, err, output, writeErr)
+				}
+				probeOutput, probeErr := exec.CommandContext(ctx, docker, "buildx", "build", "--file", probeFile, "--no-cache", "--progress", "plain", layout.contextDirectory).CombinedOutput()
+				t.Fatalf("fixture %s image build failed: %v %s; staged context probe: %v %s", name, err, output, probeErr, probeOutput)
 			}
 			imageBody, err := os.ReadFile(layout.imageIDFile)
 			if err != nil {
