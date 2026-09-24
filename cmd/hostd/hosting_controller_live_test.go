@@ -523,6 +523,8 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		bytes.Contains(index, []byte("NOTES_FIXTURE_DB_URL")) || bytes.Contains(script, []byte("NOTES_FIXTURE_DB_URL")) {
 		t.Fatal("deployed frontend exposed a scoped server secret or selector")
 	}
+	browserNote := "browser TLS note " + uuid.NewString()
+	controllerJourneyBrowser(t, ctx, node, application.ID, "create", browserNote)
 	stopWorker()
 	select {
 	case <-done:
@@ -594,6 +596,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		t.Fatal("controller restart lost active deployment identity")
 	}
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
+	controllerJourneyBrowser(t, ctx, node, application.ID, "read", browserNote)
 	t.Logf("M2 controller journey identities: app=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s source=local-snapshot ingress=127.0.0.1:8080", application.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID)
 }
 
@@ -828,6 +831,21 @@ func controllerJourneyPort(t *testing.T, address string) int {
 		t.Fatal(err)
 	}
 	return port
+}
+
+func controllerJourneyBrowser(t *testing.T, ctx context.Context, node, appID, mode, note string) {
+	t.Helper()
+	script, err := filepath.Abs(filepath.Join("..", "..", "web", "scripts", "verify-hosted-notes.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.CommandContext(ctx, node, script, appID, "8080", mode, note)
+	command.Dir = filepath.Dir(script)
+	output, err := command.CombinedOutput()
+	if err != nil || !bytes.Contains(output, []byte("hosted Chromium "+mode+" passed")) {
+		t.Fatalf("deployed Chromium %s journey failed: %v", mode, err)
+	}
+	t.Logf("deployed Chromium %s journey passed", mode)
 }
 
 func controllerJourneyPrepareSchema(t *testing.T, ctx context.Context, node, source, dbURL, ca string) {

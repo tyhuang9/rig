@@ -26,8 +26,13 @@ targets the unmerged M1 branch. Neither PR has been merged.
   successful deployment; it checks the note through ingress while the
   controller is stopped, then reopens the durable store, recreates the runtime
   composition, restarts the worker and authenticated HTTP API, and checks the
-  original job, deployment, release, and note. Hosted evidence for this
-  extension is pending.
+  original job, deployment, release, and note. Hosted
+  [run 36037733718](https://github.com/tyhuang9/rig/actions/runs/36037733718)
+  passed this restart extension and exact cleanup on head `077f669`.
+- The next gate extension drives Chromium through the deployed frontend,
+  Caddy, API, and external TLS PostgreSQL to create/read a note, then opens
+  a fresh browser after controller restart to read the same note. Its hosted
+  result is pending.
 
 ## Verification so far
 
@@ -103,9 +108,8 @@ prove whether the original request reached the controller.
 ## Open M2 acceptance work
 
 - Complete the hosted controller journey gate on the corrected branch head.
-- Exercise a real browser through frontend, Caddy, backend, and the external
-  fixture database; verify healthy replacement and rerun the new controller
-  restart check on the final head.
+- Run the new real-browser journey on the final head, then verify healthy and
+  unhealthy replacement.
 - Add controlled GitHub archive/connection materialization to the continuous
   harness and perform a separate live GitHub authorization walkthrough.
 - Prove unhealthy replacement retains the old serving version, and cover the

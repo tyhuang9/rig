@@ -59,6 +59,14 @@ jobs:
         timeout-minutes: 5
         run: pnpm --dir examples/hosting-notes install --frozen-lockfile
 
+      - name: Install browser harness dependencies
+        timeout-minutes: 5
+        run: pnpm --dir web install --frozen-lockfile
+
+      - name: Install Chromium for the deployed-app journey
+        timeout-minutes: 10
+        run: pnpm --dir web exec playwright install --with-deps chromium
+
       - name: Exercise controller source to deployed external TLS note
         timeout-minutes: 30
         shell: bash
