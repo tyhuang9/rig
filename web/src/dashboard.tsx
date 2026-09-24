@@ -7,7 +7,9 @@ import { z } from "zod";
 import {
   api,
   clearCSRF,
+  localRouteObservationFresh,
   setCSRF,
+  verifiedLocalRouteURL,
   type Application,
   type Job,
   type User,
@@ -18,6 +20,7 @@ import { ApplicationConfigurationPanel } from "./application-configuration";
 import { ApplicationDeploymentSetup } from "./application-setup";
 import { ApplicationPlanPanel } from "./application-plan-panel";
 import { AutoDeployPanel } from "./auto-deploy";
+import { useLocalRouteExpiry } from "./use-local-route-expiry";
 import { DeploymentHistoryPanel, deploymentPlanOrLegacy } from "./deployment-history";
 import { UnsavedChangesGuard, useConfirmDiscard } from "./unsaved-changes";
 
@@ -220,12 +223,24 @@ function ApplicationSetupPage() {
   return <><PageHeader title={`Set up ${appQuery.data.name}`} subtitle="Configure and deploy the saved application." action={<NavLink className="button" to={`/apps/${id}`}>Open application</NavLink>}/><ApplicationDeploymentSetup app={appQuery.data}/></>;
 }
 
-function ApplicationDetailPage() {
+export function ApplicationDetailPage() {
   const { id = "" } = useParams();
   const appQuery = useQuery({ queryKey: ["app", id], queryFn: () => api.app(id) });
   const statusQuery = useQuery({ queryKey: ["system-status"], queryFn: api.status });
   const deploymentQuery = useQuery({ queryKey: ["deployments", id], queryFn: () => api.deployments(id) });
   const planQuery = useQuery({ queryKey: ["deployment-plan", id], queryFn: () => deploymentPlanOrLegacy(id), retry: false });
+  const routeEnabled = statusQuery.data?.capabilities.generatedRuntime === true &&
+    statusQuery.data?.capabilities.fakeRuntime !== true;
+  const deploymentSignature = deploymentQuery.data?.items.map((item) => `${item.id}:${item.status}`).join("|") ?? "";
+  const routeQuery = useQuery({
+    queryKey: ["local-route", id, deploymentSignature],
+    queryFn: () => api.localRoute(id),
+    enabled: routeEnabled && deploymentQuery.isSuccess,
+    retry: false,
+    refetchOnMount: "always",
+    refetchOnWindowFocus: false,
+  });
+  useLocalRouteExpiry(routeQuery.data?.observedAt);
   if (appQuery.isLoading || statusQuery.isLoading) return <LoadingState/>;
   if (appQuery.isError) return <QueryError message={appQuery.error.message}/>;
   if (statusQuery.isError) return <QueryError message={statusQuery.error.message}/>;
@@ -235,11 +250,38 @@ function ApplicationDetailPage() {
   const generatedRuntime = statusQuery.data.capabilities.generatedRuntime;
   const composeRuntime = statusQuery.data.capabilities.composeRuntime;
   const currentDeployment = deploymentQuery.data?.items[0];
+  const servingDeployment = routeEnabled && routeQuery.isSuccess && !routeQuery.isFetching &&
+    deploymentQuery.isSuccess && !deploymentQuery.isFetching
+    ? deploymentQuery.data.items.find((item) => Boolean(verifiedLocalRouteURL(routeQuery.data, id, item)))
+    : undefined;
+  const servingURL = servingDeployment ? verifiedLocalRouteURL(routeQuery.data, id, servingDeployment) : null;
+  const routeExpired = routeQuery.isSuccess && routeQuery.data?.status === "verified" && !localRouteObservationFresh(routeQuery.data);
+  const checkingRoute = routeQuery.isFetching || deploymentQuery.isFetching;
+  const checkLocalRoute = async () => {
+    if (checkingRoute) return;
+    await Promise.all([routeQuery.refetch(), deploymentQuery.refetch()]);
+  };
   return <>
     <PageHeader title={app.name} subtitle={`${app.machineName || "Local machine"} · ${app.status}`}/>
     {planQuery.data?.state === "accepted" && planQuery.data.strategy === "generated_node" && <NavLink className="button" to={`/apps/${id}/setup`}>Continue deployment setup</NavLink>}
     <p className="section-kicker">Overview</p>
     <div className="summary"><article><small>Current deployment</small><strong>{currentDeployment ? <StatusText value={currentDeployment.status}/> : deploymentQuery.isLoading ? "Loading..." : "Not deployed"}</strong><span>{currentDeployment ? `Configuration ${currentDeployment.configurationMode}` : deploymentQuery.isError ? "History unavailable" : "No deployment record"}</span></article><article><small>Source</small><strong className="mono">{app.slug}</strong><span>Runtime is not inferred</span></article><article><small>Health</small><strong>Not verified</strong><span>Health reporting is not available</span></article></div>
+    {routeEnabled && <section className="callout info" aria-label="Controller-host route" aria-busy={checkingRoute}>
+      <strong>Controller-host route</strong>
+      <span role="status" aria-live="polite">{servingURL ? <>{currentDeployment?.id !== servingDeployment?.id
+        ? currentDeployment?.status === "failed"
+          ? "A previous successful deployment remains serving after the latest deployment failed. "
+          : `A previous successful deployment remains serving while the latest deployment is ${currentDeployment?.status ?? "unknown"}. `
+        : "The current successful deployment is serving. "}Accessible only from the controller host. Verified at {routeQuery.data?.observedAt}.</>
+        : checkingRoute || routeQuery.isPending || deploymentQuery.isPending ? "Checking the active local route and deployment history…"
+          : routeQuery.isError || deploymentQuery.isError ? "Rig could not verify the local route against deployment history."
+            : routeExpired ? "The local route verification expired. Check the route again before opening it."
+            : "No verified local route matches a successful deployment in the loaded history."}</span>
+      <a role="link" tabIndex={0} href={servingURL ?? undefined} target="_blank" rel="noopener noreferrer" aria-disabled={!servingURL}
+        onClick={(event) => { if (!servingURL) event.preventDefault(); }}
+        onKeyDown={(event) => { if (!servingURL && (event.key === "Enter" || event.key === " ")) event.preventDefault(); }}>Open verified local site</a>
+      <button className="button small" type="button" aria-disabled={checkingRoute} onClick={() => void checkLocalRoute()}>Check route again</button>
+    </section>}
     {fakeRuntime ? <div className="callout warning"><strong>Development capability</strong><span>The fake runtime persists job progress but executes no workload.</span></div> : !composeRuntime && !generatedRuntime && <div className="callout info"><strong>Runtime actions unavailable</strong><span>Configure a runtime to deploy this application.</span></div>}
     <ApplicationPlanPanel app={app}/>
     <AutoDeployPanel appId={id} composeRuntime={composeRuntime} generatedRuntime={generatedRuntime} githubConnections={statusQuery.data.capabilities.githubConnections}/>

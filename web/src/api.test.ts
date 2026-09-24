@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { APIError, api, clearCSRF, setCSRF } from "./api";
+import { APIError, api, clearCSRF, localRouteObservationFresh, setCSRF, verifiedLocalRouteURL, type Deployment, type LocalRoute } from "./api";
 
 describe("API client", () => {
   beforeEach(() => {
@@ -325,5 +325,41 @@ describe("API client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/relay/enrollments/enrollment%2Fone/poll", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/v1/relay/bindings/binding%2Fone", expect.objectContaining({ method: "DELETE", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(4, "/api/v1/relay/key-rotations", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+  });
+});
+
+describe("verified local route link guard", () => {
+  const now = Date.parse("2026-09-24T19:00:30Z");
+  const deployment = {
+    id: "deployment-1", status: "succeeded", runtimeStrategy: "generated_node", releaseId: "release-1",
+    deploymentPlanRevisionId: "plan-1", deploymentPlanRevisionNumber: 2,
+    actualConfigurationRevisionId: "config-1", actualConfigurationRevisionNumber: 3,
+  } as Deployment;
+  const route = {
+    status: "verified", scope: "controller_loopback", url: "http://app-1.rig.localhost:8080/",
+    deploymentId: "deployment-1", releaseId: "release-1", planRevisionId: "plan-1", planRevisionNumber: 2,
+    configurationRevisionId: "config-1", configurationRevisionNumber: 3,
+    observedAt: "2026-09-24T19:00:00Z",
+  } as LocalRoute;
+
+  it("accepts the exact recent controller-host route", () => {
+    expect(verifiedLocalRouteURL(route, "app-1", deployment, now)).toBe(route.url);
+    expect(localRouteObservationFresh(route, now)).toBe(true);
+  });
+
+  it.each([
+    ["public origin", { url: "https://public.example/" }],
+    ["different app", { url: "http://app-2.rig.localhost:8080/" }],
+    ["embedded credentials", { url: "http://user:pass@app-1.rig.localhost:8080/" }],
+    ["extra path", { url: "http://app-1.rig.localhost:8080/admin" }],
+    ["query", { url: "http://app-1.rig.localhost:8080/?token=x" }],
+    ["different deployment", { deploymentId: "deployment-2" }],
+    ["different release", { releaseId: "release-2" }],
+    ["different plan", { planRevisionNumber: 3 }],
+    ["different configuration", { configurationRevisionId: "config-2" }],
+    ["expired observation", { observedAt: "2026-09-24T18:59:29Z" }],
+    ["far-future observation", { observedAt: "2026-09-24T19:00:36Z" }],
+  ] as const)("rejects %s", (_name, change) => {
+    expect(verifiedLocalRouteURL({ ...route, ...change }, "app-1", deployment, now)).toBeNull();
   });
 });

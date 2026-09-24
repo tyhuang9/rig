@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { APIError, api, type Application, type ApplicationConfiguration, type DeploymentPlanRevision } from "./api";
@@ -16,6 +16,7 @@ const queuedJob = { id: "job-1", status: "queued", type: "deploy", resourceId: "
 const completedJob = { ...queuedJob, status: "succeeded" };
 const recordedDeployment = { id: "deployment-1", jobId: "job-1", status: "succeeded", releaseId: "release-1", deploymentPlanRevisionId: "plan-1", deploymentPlanRevisionNumber: 2, actualConfigurationRevisionId: "config-1", actualConfigurationRevisionNumber: 3 };
 const reviewedPins = { planId: "plan-1", planNumber: 2, configurationId: "config-1", configurationNumber: 3 };
+const verifiedRoute = { status: "verified", scope: "controller_loopback", url: "http://app-1.rig.localhost:8080/", deploymentId: "deployment-1", releaseId: "release-1", planRevisionId: "plan-1", planRevisionNumber: 2, configurationRevisionId: "config-1", configurationRevisionNumber: 3, observedAt: new Date().toISOString() };
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -39,6 +40,7 @@ describe("ApplicationDeploymentSetup", () => {
     vi.spyOn(api, "status").mockResolvedValue({ capabilities: { generatedRuntime: true, fakeRuntime: false } } as never);
     vi.spyOn(api, "job").mockResolvedValue(completedJob as never);
     vi.spyOn(api, "deployments").mockResolvedValue({ items: [recordedDeployment] } as never);
+    vi.spyOn(api, "localRoute").mockResolvedValue({ status: "unavailable", observedAt: "2026-09-24T19:00:00Z" } as never);
   });
 
   afterEach(() => cleanup());
@@ -68,7 +70,7 @@ describe("ApplicationDeploymentSetup", () => {
     expect(deploy.mock.calls[1][2]).toEqual(deploy.mock.calls[0][2]);
     expect(screen.getByText("deployment-1")).toBeTruthy();
     expect(screen.getByText("release-1")).toBeTruthy();
-    expect(screen.queryByRole("link", { name: /visit|open site|live url/i })).toBeNull();
+    expect(screen.getByRole("link", { name: "Open verified local site" }).hasAttribute("href")).toBe(false);
   });
 
   it("resumes a known deployment job from the saved application ID after reload", async () => {
@@ -267,6 +269,74 @@ describe("ApplicationDeploymentSetup", () => {
     renderSetup();
     expect(await screen.findByText(/deployed plan or configuration differs from the revision reviewed here/i)).toBeTruthy();
     expect(screen.queryByText(/successful job and deployment for the reviewed revisions/i)).toBeNull();
+  });
+
+  it("links only the verified controller-host route for the reviewed successful deployment", async () => {
+    sessionStorage.setItem("rig-setup-deployment:app-1", JSON.stringify({ signature: "plan-1:2:config-1:3", key: "same-key", jobId: "job-1", reviewedPins }));
+    vi.mocked(api.deployments).mockResolvedValue({ items: [{ ...recordedDeployment, runtimeStrategy: "generated_node" }] } as never);
+    vi.mocked(api.localRoute).mockResolvedValue(verifiedRoute as never);
+    renderSetup();
+    const link = await screen.findByRole("link", { name: "Open verified local site" });
+    await waitFor(() => expect(link.getAttribute("href")).toBe("http://app-1.rig.localhost:8080/"));
+    expect(link.getAttribute("rel")).toContain("noopener");
+    expect(screen.getByText(/accessible only from the controller host/i)).toBeTruthy();
+    expect(within(screen.getByRole("region", { name: "Controller-host route" })).getByRole("status").textContent).toMatch(/verified local route for this deployment/i);
+  });
+
+  it("hides a route whose deployment does not match the successful job", async () => {
+    sessionStorage.setItem("rig-setup-deployment:app-1", JSON.stringify({ signature: "plan-1:2:config-1:3", key: "same-key", jobId: "job-1", reviewedPins }));
+    vi.mocked(api.deployments).mockResolvedValue({ items: [{ ...recordedDeployment, runtimeStrategy: "generated_node" }] } as never);
+    vi.mocked(api.localRoute).mockResolvedValue({ ...verifiedRoute, deploymentId: "another-deployment" } as never);
+    renderSetup();
+    expect(await screen.findByText(/a different deployment is serving/i)).toBeTruthy();
+    const link = screen.getByRole("link", { name: "Open verified local site" });
+    expect(link.hasAttribute("href")).toBe(false);
+    expect(link.getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("hides a cached URL during a new route check and after an error", async () => {
+    sessionStorage.setItem("rig-setup-deployment:app-1", JSON.stringify({ signature: "plan-1:2:config-1:3", key: "same-key", jobId: "job-1", reviewedPins }));
+    vi.mocked(api.deployments).mockResolvedValue({ items: [{ ...recordedDeployment, runtimeStrategy: "generated_node" }] } as never);
+    const checking = deferred<Awaited<ReturnType<typeof api.localRoute>>>();
+    vi.mocked(api.localRoute).mockResolvedValueOnce(verifiedRoute as never).mockReturnValueOnce(checking.promise);
+    const { client } = renderSetup();
+    const link = await screen.findByRole("link", { name: "Open verified local site" });
+    await waitFor(() => expect(link.hasAttribute("href")).toBe(true));
+    link.focus();
+    expect(document.activeElement).toBe(link);
+    act(() => { void client.invalidateQueries({ queryKey: ["local-route", "app-1"] }); });
+    expect(await screen.findByText(/checking the local route before showing an address/i)).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Open verified local site" })).toBe(link);
+    expect(document.activeElement).toBe(link);
+    expect(link.hasAttribute("href")).toBe(false);
+    const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    link.dispatchEvent(enter);
+    expect(enter.defaultPrevented).toBe(true);
+    await act(async () => checking.reject(new Error("Docker unavailable")));
+    expect(await screen.findByText(/could not verify the local route/i)).toBeTruthy();
+    expect(document.activeElement).toBe(link);
+    expect(link.hasAttribute("href")).toBe(false);
+    const retry = screen.getByRole("button", { name: "Check route again" });
+    retry.focus();
+    const retrying = deferred<Awaited<ReturnType<typeof api.localRoute>>>();
+    vi.mocked(api.localRoute).mockReturnValueOnce(retrying.promise);
+    fireEvent.click(retry);
+    expect(await screen.findByText(/checking the local route before showing an address/i)).toBeTruthy();
+    expect(document.activeElement).toBe(retry);
+    await act(async () => retrying.resolve({ status: "unavailable", observedAt: "2026-09-24T19:01:00Z" } as never));
+    expect(document.activeElement).toBe(retry);
+    await waitFor(() => expect(retry.getAttribute("aria-disabled")).toBe("false"));
+    expect(within(screen.getByRole("region", { name: "Controller-host route" })).getByRole("status").textContent).toMatch(/no verified local route is available/i);
+  });
+
+  it("does not request or show a URL for a failed replacement job", async () => {
+    sessionStorage.setItem("rig-setup-deployment:app-1", JSON.stringify({ signature: "plan-1:2:config-1:3", key: "same-key", jobId: "job-1", reviewedPins }));
+    vi.mocked(api.job).mockResolvedValue({ ...completedJob, status: "failed", errorDetail: "Replacement failed" } as never);
+    vi.mocked(api.deployments).mockResolvedValue({ items: [{ ...recordedDeployment, status: "failed", runtimeStrategy: "generated_node" }] } as never);
+    renderSetup();
+    expect(await screen.findByText("Replacement failed")).toBeTruthy();
+    expect(api.localRoute).not.toHaveBeenCalled();
+    expect(screen.queryByRole("link", { name: "Open verified local site" })).toBeNull();
   });
 
   it("announces a pending configuration check and offers a retry after plan drift", async () => {
