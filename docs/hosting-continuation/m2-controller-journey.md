@@ -61,6 +61,12 @@ missing module basename as `static.mjs`; the API was healthy and cleanup
 passed. The next run distinguishes the application's workspace from Rig's
 runtime library path and probes that exact library file in the stopped
 container without printing its contents.
+The sixth hosted run ([workflow 36035720070](https://github.com/tyhuang9/rig/actions/runs/36035720070),
+head `ad5eb92`) located the error at Rig's `/usr/local/lib/rig/static.mjs`.
+Docker could copy that file from the stopped container even though Node exited
+with `MODULE_NOT_FOUND`; API health and cleanup passed. The next bounded probe
+records only the static module and parent directory modes/owners to resolve
+the apparent access mismatch.
 
 The QA and security reviews of the controller harness found no confirmed
 exploit. Their actionable gaps were addressed: the deployed API now probes

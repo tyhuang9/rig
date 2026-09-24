@@ -3,6 +3,7 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -684,10 +685,22 @@ func (observer *controllerJourneyHealthObserver) Run(ctx context.Context, reques
 							observer.test.Log("static frontend missing module location: Rig runtime library")
 							copyResult, copyErr := observer.delegate.Run(ctx, runtimeprocess.CommandRequest{
 								Executable: request.Executable,
-								Args:       []string{"container", "cp", request.Args[len(request.Args)-1] + ":/usr/local/lib/rig/static.mjs", "-"},
-								Directory:  request.Directory, Env: request.Env, Timeout: 3 * time.Second, OutputLimit: 8 << 10,
+								Args:       []string{"container", "cp", request.Args[len(request.Args)-1] + ":/usr/local/lib/rig", "-"},
+								Directory:  request.Directory, Env: request.Env, Timeout: 3 * time.Second, OutputLimit: 32 << 10,
 							})
-							observer.test.Logf("static frontend runtime library file present: %t", copyErr == nil)
+							if copyErr == nil && !copyResult.StdoutTruncated {
+								contents := tar.NewReader(bytes.NewReader(copyResult.Stdout))
+								for {
+									entry, err := contents.Next()
+									if err != nil {
+										break
+									}
+									basename := filepath.Base(strings.TrimSuffix(entry.Name, "/"))
+									if basename == "rig" || basename == "static.mjs" {
+										observer.test.Logf("static frontend runtime library %s mode=%#o uid=%d type=%d", basename, entry.Mode, entry.Uid, entry.Typeflag)
+									}
+								}
+							}
 							clear(copyResult.Stdout)
 							clear(copyResult.Stderr)
 						} else {
