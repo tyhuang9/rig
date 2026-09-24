@@ -2,8 +2,10 @@
 
 **Recorded:** 2026-09-24. **Branch:** `feature/hosting-m2-deploy-preconditions`,
 based on the unmerged [M2 draft PR #71](https://github.com/tyhuang9/rig/pull/71)
-at `4331d626662db03cf27f7ce2e4f1eff0805a5197`. This branch is local and
-unpublished. These checks establish an integration candidate, not M2 acceptance.
+at `4331d626662db03cf27f7ce2e4f1eff0805a5197`. Published as
+[draft PR #72](https://github.com/tyhuang9/rig/pull/72) at
+`79b50039394e5a8e0e910c084f4d63f45c7bd065`. These checks establish an
+integration candidate, not M2 acceptance.
 
 ## Implemented slice
 
@@ -59,10 +61,19 @@ re-review found no remaining concrete issue in this slice.
 
 ## Qualification still open
 
-The revised hosted Docker journey has not run on this local branch. Draft PR
-#71's seven workflows passed on its own exact head `4331d626`; that result
-does not qualify this later branch. M2 still needs a real GitHub consent and
-archive walk, the documented recipe matrix and failure paths, and an attested
-route URL tied to the active deployment. Windows Docker Desktop and physical
-LAN checks are also unverified. No merge or deployment is authorized by this
-record.
+The revised [hosted controller journey](https://github.com/tyhuang9/rig/actions/runs/36048506542)
+passed on exact PR #72 head `79b5003`: `TestLiveControllerGeneratedDeploymentJourney`
+passed in 173.68 seconds. It exercised the reviewed pins through initial,
+healthy replacement, and failed bad-CA deployments; the Chromium note journey,
+controller restart, external TLS PostgreSQL, and exact Docker cleanup passed.
+On the same head, Documentation, Playwright browser, Relay Compose lifecycle,
+Windows controller, and Generated runtime lifecycle workflows passed. The
+[GitHub deployment CI run](https://github.com/tyhuang9/rig/actions/runs/36048506524)
+passed its fast verification, relay packaging, and PostgreSQL/Linux race jobs.
+All seven PR workflows passed on exact head `79b5003`; the race job finished
+after the other six workflows.
+
+M2 still needs a real GitHub consent and archive walk, the documented recipe
+matrix and failure paths, and an attested route URL tied to the active
+deployment. Windows Docker Desktop and physical LAN checks are unverified. No
+merge or deployment is authorized by this record.
