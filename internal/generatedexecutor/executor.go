@@ -339,6 +339,19 @@ func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.Deploym
 	if err != nil {
 		return resolvedDeployment{}, codedError("internal_error")
 	}
+	if !deployment.ProvenanceInitialized && input.ReleaseID == "" && !input.HasReviewedRevisions() {
+		return resolvedDeployment{}, codedError("reviewed_revisions_required")
+	}
+	if deployment.ProvenanceInitialized && input.HasReviewedRevisions() &&
+		(deployment.RuntimeStrategy != deployments.RuntimeGeneratedNode || deployment.DeploymentPlanRevisionID != input.ExpectedPlanRevisionID || deployment.DeploymentPlanRevisionNumber != input.ExpectedPlanRevisionNumber ||
+			deployment.ActualConfigurationRevisionID != input.ExpectedConfigurationRevisionID || deployment.ActualConfigurationRevisionNumber != input.ExpectedConfigurationRevisionNumber) {
+		return resolvedDeployment{}, codedError("invalid_source")
+	}
+	if input.HasReviewedRevisions() && !deployment.ProvenanceInitialized {
+		if err := e.checkReviewedHeads(ctx, job.ResourceID, input); err != nil {
+			return resolvedDeployment{}, err
+		}
+	}
 	if err := report(reporter, jobs.Running, "prepare_workspace", 20); err != nil {
 		return resolvedDeployment{}, err
 	}
@@ -367,6 +380,14 @@ func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.Deploym
 	if release.ID == "" || release.DeploymentPlanRevisionID == "" || release.DeploymentPlanRevisionNumber < 1 {
 		return resolvedDeployment{}, codedError("invalid_source")
 	}
+	if input.HasReviewedRevisions() && !deployment.ProvenanceInitialized {
+		if err := e.checkReviewedHeads(ctx, job.ResourceID, input); err != nil {
+			return resolvedDeployment{}, err
+		}
+		if release.DeploymentPlanRevisionID != input.ExpectedPlanRevisionID || release.DeploymentPlanRevisionNumber != input.ExpectedPlanRevisionNumber {
+			return resolvedDeployment{}, codedError("reviewed_revision_stale")
+		}
+	}
 
 	plan, err := e.plans.GetRevision(ctx, job.ResourceID, release.DeploymentPlanRevisionID, release.DeploymentPlanRevisionNumber)
 	if err != nil {
@@ -386,6 +407,8 @@ func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.Deploym
 		configurationID, configurationNumber = deployment.ActualConfigurationRevisionID, deployment.ActualConfigurationRevisionNumber
 	} else if input.ConfigurationMode == jobs.ConfigurationOriginal {
 		configurationID, configurationNumber = release.ConfigurationRevisionID, release.ConfigurationRevisionNumber
+	} else if input.HasReviewedRevisions() {
+		configurationID, configurationNumber = input.ExpectedConfigurationRevisionID, input.ExpectedConfigurationRevisionNumber
 	} else {
 		var identity appconfig.RevisionIdentity
 		identity, err = e.configuration.RevisionIdentity(ctx, job.ResourceID)
@@ -414,6 +437,22 @@ func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.Deploym
 		}
 	}
 	return resolvedDeployment{deployment: deployment, release: release, plan: plan, configurationID: configurationID, configurationNumber: configurationNumber}, nil
+}
+
+func (e *Executor) checkReviewedHeads(ctx context.Context, appID string, input jobs.DeploymentInput) error {
+	plan, err := e.plans.Get(ctx, appID)
+	if err != nil || plan.ID != input.ExpectedPlanRevisionID || plan.RevisionNumber != input.ExpectedPlanRevisionNumber ||
+		plan.Plan.Strategy != deploymentplans.StrategyGeneratedNode || plan.State != deploymentplans.RevisionAccepted {
+		return codedError("reviewed_revision_stale")
+	}
+	configuration, err := e.configuration.RevisionIdentity(ctx, appID)
+	if err != nil || configuration.RevisionID != input.ExpectedConfigurationRevisionID || configuration.RevisionNumber != input.ExpectedConfigurationRevisionNumber {
+		return codedError("reviewed_revision_stale")
+	}
+	if configuration.RevisionNumber > 0 && (configuration.FormatVersion != 2 || configuration.DeploymentPlanRevisionID != input.ExpectedPlanRevisionID || configuration.DeploymentPlanRevisionNumber != input.ExpectedPlanRevisionNumber) {
+		return codedError("reviewed_revision_stale")
+	}
+	return nil
 }
 
 func report(reporter jobs.ProgressReporter, status jobs.Status, phase string, progress int) error {

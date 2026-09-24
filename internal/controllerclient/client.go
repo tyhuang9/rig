@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/apicontract"
 	"github.com/hostd/hostd/internal/auth"
 )
@@ -183,9 +184,30 @@ func (c *Client) Events(ctx context.Context, session Session, jobID string, afte
 	return v, c.doJSONQuery(ctx, "listJobEvents", &session, nil, &v, false, url.Values{"after": []string{fmt.Sprint(after)}}, jobID)
 }
 
+// Deploy submits an empty latest-deploy request for Compose applications.
+// Generated applications return reviewed_revisions_required from the controller.
 func (c *Client) Deploy(ctx context.Context, session *Session, appID, idempotencyKey string) (apicontract.JobMutationResponse, error) {
 	var v apicontract.JobMutationResponse
 	return v, c.mutate(ctx, "deployApplication", session, nil, &v, idempotencyKey, appID)
+}
+
+// DeployReviewed submits the exact revisions the caller showed and reviewed.
+// The explicit body preserves configuration revision zero on the wire.
+func (c *Client) DeployReviewed(ctx context.Context, session *Session, appID, idempotencyKey string, reviewed apicontract.DeployApplicationRequest) (apicontract.JobMutationResponse, error) {
+	if uuid.Validate(reviewed.ExpectedPlanRevisionID) != nil || reviewed.ExpectedPlanRevisionNumber < 1 ||
+		reviewed.ExpectedConfigurationRevisionNumber < 0 ||
+		(reviewed.ExpectedConfigurationRevisionID == "") != (reviewed.ExpectedConfigurationRevisionNumber == 0) ||
+		(reviewed.ExpectedConfigurationRevisionID != "" && uuid.Validate(reviewed.ExpectedConfigurationRevisionID) != nil) {
+		return apicontract.JobMutationResponse{}, errors.New("exact reviewed plan and configuration revisions are required")
+	}
+	var v apicontract.JobMutationResponse
+	body := map[string]any{
+		"expectedPlanRevisionId":              reviewed.ExpectedPlanRevisionID,
+		"expectedPlanRevisionNumber":          reviewed.ExpectedPlanRevisionNumber,
+		"expectedConfigurationRevisionId":     reviewed.ExpectedConfigurationRevisionID,
+		"expectedConfigurationRevisionNumber": reviewed.ExpectedConfigurationRevisionNumber,
+	}
+	return v, c.mutate(ctx, "deployApplication", session, body, &v, idempotencyKey, appID)
 }
 func (c *Client) Start(ctx context.Context, session *Session, appID, idempotencyKey string) (apicontract.JobMutationResponse, error) {
 	var v apicontract.JobMutationResponse

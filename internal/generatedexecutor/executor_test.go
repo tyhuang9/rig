@@ -38,15 +38,25 @@ type fakeApplications struct {
 
 func (f *fakeApplications) Get(string) (apps.Application, error) { return f.app, f.err }
 
-type fakeReleases struct{ release releasesnapshot.Release }
+type fakeReleases struct {
+	release           releasesnapshot.Release
+	onMaterialize     func()
+	materializeCalls  int
+	readyWorkspaceIDs []string
+}
 
 func (f *fakeReleases) Materialize(context.Context, string, string) (releasesnapshot.Release, error) {
+	f.materializeCalls++
+	if f.onMaterialize != nil {
+		f.onMaterialize()
+	}
 	return f.release, nil
 }
 func (f *fakeReleases) MaterializeLocal(context.Context, string, string) (releasesnapshot.Release, error) {
-	return f.release, nil
+	return f.Materialize(context.Background(), "", "")
 }
-func (f *fakeReleases) ReadyWorkspace(context.Context, string, string) (releasesnapshot.Release, error) {
+func (f *fakeReleases) ReadyWorkspace(_ context.Context, _, releaseID string) (releasesnapshot.Release, error) {
+	f.readyWorkspaceIDs = append(f.readyWorkspaceIDs, releaseID)
 	return f.release, nil
 }
 
@@ -116,7 +126,15 @@ func (f *fakeDeployments) Transition(_ context.Context, _, _ string, status depl
 
 type fakePlans struct {
 	revision deploymentplans.DeploymentPlanRevision
+	head     *deploymentplans.DeploymentPlanRevision
 	err      error
+}
+
+func (f *fakePlans) Get(context.Context, string) (deploymentplans.DeploymentPlanRevision, error) {
+	if f.head != nil {
+		return *f.head, f.err
+	}
+	return f.revision, f.err
 }
 
 func (f *fakePlans) GetRevision(context.Context, string, string, int64) (deploymentplans.DeploymentPlanRevision, error) {
@@ -474,6 +492,130 @@ func readyArtifact(id string) generatedimage.Artifact {
 func deploymentJob() jobs.Job {
 	input, _ := json.Marshal(jobs.DeploymentInput{ReleaseID: testReleaseID, ConfigurationMode: jobs.ConfigurationCurrent})
 	return jobs.Job{ID: testJobID, Type: "deploy", ResourceType: "application", ResourceID: testAppID, RequestedBy: testActorID, Attempt: 1, Input: input}
+}
+
+func reviewedDeploymentJob() jobs.Job {
+	job := deploymentJob()
+	job.Input, _ = json.Marshal(jobs.DeploymentInput{
+		ConfigurationMode:      jobs.ConfigurationCurrent,
+		ExpectedPlanRevisionID: testPlanID, ExpectedPlanRevisionNumber: 2,
+		ExpectedConfigurationRevisionID: testConfigID, ExpectedConfigurationRevisionNumber: 3,
+	})
+	return job
+}
+
+func TestGeneratedExecutorRejectsReviewedRevisionDriftBeforeRuntimeSideEffects(t *testing.T) {
+	for _, testCase := range []struct {
+		name                 string
+		mutate               func(*executorFixture)
+		wantMaterializations int
+	}{
+		{"plan changed before worker", func(f *executorFixture) {
+			f.executor.plans = &fakePlans{revision: deploymentplans.DeploymentPlanRevision{ID: testArtifactID, AppID: testAppID, RevisionNumber: 3, State: deploymentplans.RevisionAccepted, Plan: f.plan.Plan}}
+		}, 0},
+		{"materialized release has a different plan", func(f *executorFixture) {
+			f.executor.releases.(*fakeReleases).release.DeploymentPlanRevisionID = testArtifactID
+		}, 1},
+		{"configuration changed during materialization", func(f *executorFixture) {
+			f.executor.releases.(*fakeReleases).onMaterialize = func() { f.configuration.currentID, f.configuration.currentNumber = testArtifactID, 4 }
+		}, 1},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, false)
+			testCase.mutate(fixture)
+			_, err := fixture.executor.Execute(context.Background(), reviewedDeploymentJob(), fixture.reporter)
+			requireExecutionErrorCode(t, err, "reviewed_revision_stale")
+			if fixture.compiler.calls != 0 || len(fixture.routes.requests) != 0 || len(*fixture.events) != 0 || fixture.executor.releases.(*fakeReleases).materializeCalls != testCase.wantMaterializations {
+				t.Fatalf("side effects: compiler=%d routes=%d events=%d materializations=%d", fixture.compiler.calls, len(fixture.routes.requests), len(*fixture.events), fixture.executor.releases.(*fakeReleases).materializeCalls)
+			}
+			if fixture.deployments.deployment.Status != deployments.Failed || fixture.deployments.deployment.DiagnosticCode != "reviewed_revision_stale" {
+				t.Fatalf("deployment state = %+v", fixture.deployments.deployment)
+			}
+		})
+	}
+}
+
+func TestGeneratedExecutorRejectsUnpinnedLatestJobBeforeRuntimeSideEffects(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	job := deploymentJob()
+	job.Input, _ = json.Marshal(jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent})
+	_, err := fixture.executor.Execute(context.Background(), job, fixture.reporter)
+	requireExecutionErrorCode(t, err, "reviewed_revisions_required")
+	if fixture.executor.releases.(*fakeReleases).materializeCalls != 0 || fixture.compiler.calls != 0 || len(*fixture.events) != 0 || fixture.deployments.deployment.Status != deployments.Failed {
+		t.Fatalf("unpinned worker made side effects: release=%d compile=%d events=%v deployment=%+v", fixture.executor.releases.(*fakeReleases).materializeCalls, fixture.compiler.calls, *fixture.events, fixture.deployments.deployment)
+	}
+}
+
+func TestGeneratedExecutorUsesReviewedPinsOnSuccessfulDeployment(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	result, err := fixture.executor.Execute(context.Background(), reviewedDeploymentJob(), fixture.reporter)
+	if err != nil || result.CompletionCode != "deployment_completed" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	deployment := fixture.deployments.deployment
+	if deployment.Status != deployments.Succeeded || deployment.DeploymentPlanRevisionID != testPlanID || deployment.DeploymentPlanRevisionNumber != 2 ||
+		deployment.ActualConfigurationRevisionID != testConfigID || deployment.ActualConfigurationRevisionNumber != 3 || fixture.compiler.calls != 1 ||
+		fixture.compiler.pins[0].RevisionID != testConfigID || fixture.compiler.pins[0].RevisionNumber != 3 {
+		t.Fatalf("reviewed deployment=%+v compiler pins=%+v", deployment, fixture.compiler.pins)
+	}
+}
+
+func TestGeneratedExecutorResumesReviewedLatestJobWithRecordedProvenanceAfterHeadDrift(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.authorization.err = ErrInsufficientReplacementCapacity
+	job := reviewedDeploymentJob()
+	result, err := fixture.executor.Execute(context.Background(), job, fixture.reporter)
+	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseInsufficientReplacementCapacity {
+		t.Fatalf("first result=%+v err=%v", result, err)
+	}
+	deployment := fixture.deployments.deployment
+	if !deployment.ProvenanceInitialized || deployment.ReleaseID != testReleaseID || deployment.DeploymentPlanRevisionID != testPlanID ||
+		deployment.DeploymentPlanRevisionNumber != 2 || deployment.ActualConfigurationRevisionID != testConfigID || deployment.ActualConfigurationRevisionNumber != 3 {
+		t.Fatalf("recorded provenance=%+v", deployment)
+	}
+	if fixture.compiler.calls != 0 || fixture.executor.releases.(*fakeReleases).materializeCalls != 1 {
+		t.Fatalf("work before pause: compiler=%d materializations=%d", fixture.compiler.calls, fixture.executor.releases.(*fakeReleases).materializeCalls)
+	}
+
+	newHead := fixture.plan
+	newHead.ID, newHead.RevisionNumber = testArtifactID2, 4
+	fixture.executor.plans.(*fakePlans).head = &newHead
+	fixture.configuration.currentID, fixture.configuration.currentNumber = testArtifactID, 4
+	fixture.authorization.err = nil
+	result, err = fixture.executor.Execute(context.Background(), job, fixture.reporter)
+	if err != nil || result.CompletionCode != "deployment_completed" {
+		t.Fatalf("resume result=%+v err=%v", result, err)
+	}
+	deployment = fixture.deployments.deployment
+	if deployment.Status != deployments.Succeeded || deployment.ReleaseID != testReleaseID || deployment.DeploymentPlanRevisionID != testPlanID ||
+		deployment.DeploymentPlanRevisionNumber != 2 || deployment.ActualConfigurationRevisionID != testConfigID || deployment.ActualConfigurationRevisionNumber != 3 {
+		t.Fatalf("resumed deployment=%+v", deployment)
+	}
+	releases := fixture.executor.releases.(*fakeReleases)
+	if releases.materializeCalls != 1 || !reflect.DeepEqual(releases.readyWorkspaceIDs, []string{testReleaseID}) ||
+		fixture.compiler.calls != 1 || !reflect.DeepEqual(fixture.compiler.pins, []appconfig.RevisionIdentity{{RevisionID: testConfigID, RevisionNumber: 3}}) || len(fixture.routes.requests) != 1 {
+		t.Fatalf("resume sources: materializations=%d ready=%v compiler pins=%+v routes=%d", releases.materializeCalls, releases.readyWorkspaceIDs, fixture.compiler.pins, len(fixture.routes.requests))
+	}
+}
+
+func TestGeneratedExecutorRejectsChangedReviewedProvenanceOnResume(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.authorization.err = ErrInsufficientReplacementCapacity
+	job := reviewedDeploymentJob()
+	result, err := fixture.executor.Execute(context.Background(), job, fixture.reporter)
+	if err != nil || result.PauseDisposition != jobs.PauseInsufficientReplacementCapacity || !fixture.deployments.deployment.ProvenanceInitialized {
+		t.Fatalf("first result=%+v err=%v deployment=%+v", result, err, fixture.deployments.deployment)
+	}
+	fixture.deployments.deployment.ActualConfigurationRevisionID = testArtifactID
+	fixture.authorization.err = nil
+	_, err = fixture.executor.Execute(context.Background(), job, fixture.reporter)
+	requireExecutionErrorCode(t, err, "invalid_source")
+	if fixture.deployments.deployment.Status != deployments.Failed || fixture.compiler.calls != 0 || len(fixture.routes.requests) != 0 ||
+		fixture.executor.releases.(*fakeReleases).materializeCalls != 1 || len(fixture.executor.releases.(*fakeReleases).readyWorkspaceIDs) != 0 || fixture.authorization.calls != 1 {
+		t.Fatalf("mismatched provenance side effects: deployment=%+v compiler=%d routes=%d materializations=%d ready=%v authorization=%d",
+			fixture.deployments.deployment, fixture.compiler.calls, len(fixture.routes.requests), fixture.executor.releases.(*fakeReleases).materializeCalls,
+			fixture.executor.releases.(*fakeReleases).readyWorkspaceIDs, fixture.authorization.calls)
+	}
 }
 
 func requireExecutionErrorCode(t *testing.T, err error, code string) {

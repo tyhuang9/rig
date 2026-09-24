@@ -2,6 +2,7 @@ package controllerclient
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -58,6 +59,38 @@ func TestLoginAndMutationRefreshesCSRFOnce(t *testing.T) {
 	}
 	if !response.Created || session.CSRFToken != "new" || requests.Load() != 2 {
 		t.Fatalf("response=%+v session=%+v requests=%d", response, session, requests.Load())
+	}
+}
+
+func TestDeployReviewedSendsExactZeroConfigurationPin(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/api/v1/apps/app/deployments" || r.Header.Get("Idempotency-Key") != "reviewed-key" {
+			t.Errorf("request path=%s key=%s", r.URL.Path, r.Header.Get("Idempotency-Key"))
+		}
+		var body map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 4 || string(body["expectedConfigurationRevisionNumber"]) != "0" || string(body["expectedConfigurationRevisionId"]) != `""` {
+			t.Errorf("reviewed body=%v err=%v", body, err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"created":true,"job":{"id":"job"}}`))
+	}))
+	defer server.Close()
+	client, err := New(Options{Endpoint: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{SessionToken: "session", CSRFToken: "csrf"}
+	if _, err := client.DeployReviewed(context.Background(), session, "app", "reviewed-key", apicontract.DeployApplicationRequest{}); err == nil || requests != 0 {
+		t.Fatalf("invalid pins dispatched: err=%v requests=%d", err, requests)
+	}
+	result, err := client.DeployReviewed(context.Background(), session, "app", "reviewed-key", apicontract.DeployApplicationRequest{
+		ExpectedPlanRevisionID: "11111111-1111-4111-8111-111111111111", ExpectedPlanRevisionNumber: 2,
+		ExpectedConfigurationRevisionID: "", ExpectedConfigurationRevisionNumber: 0,
+	})
+	if err != nil || !result.Created || requests != 1 {
+		t.Fatalf("reviewed result=%+v err=%v requests=%d", result, err, requests)
 	}
 }
 

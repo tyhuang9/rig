@@ -238,9 +238,10 @@ describe("DeploymentHistoryPanel", () => {
       generatedRuntime: true,
     });
 
-    const latest = await screen.findByRole("button", { name: "Deploy latest" });
+    const latest = await screen.findByRole("link", { name: "Review and deploy latest" });
     const prior = await screen.findByRole("button", { name: "Deploy release" });
-    await waitFor(() => expect((latest as HTMLButtonElement).disabled).toBe(false));
+    expect(latest.getAttribute("href")).toBe(`/apps/${appId}/setup`);
+    expect(screen.queryByRole("button", { name: "Deploy latest" })).toBeNull();
     expect((prior as HTMLButtonElement).disabled).toBe(false);
     expect(
       screen.queryByText(/requires the Compose runtime/i),

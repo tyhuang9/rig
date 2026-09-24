@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "d9112ea3752141502691f67949d948276623f6e778de7d06bda0f408bfd0122e"
+const SourceSHA256 = "4525769f9b26a4efcf2d77efb4ec1b0d11c0ce04200f1907405d97d815d5f353"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -25,6 +25,7 @@ var Operations = map[string]Operation{
 	"getApplicationConfiguration":           {Method: "GET", Path: "/api/v1/apps/{appId}/configuration"},
 	"getApplicationDeploymentPlan":          {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-plan"},
 	"getDefaultSourceConnection":            {Method: "GET", Path: "/api/v1/source-connections/default"},
+	"getDeploymentJobByIdempotency":         {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-jobs/by-idempotency"},
 	"getJob":                                {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
 	"getRelayStatus":                        {Method: "GET", Path: "/api/v1/relay/status"},
 	"grantRuntimeApproval":                  {Method: "POST", Path: "/api/v1/apps/{appId}/runtime-approvals"},
@@ -280,6 +281,13 @@ type CreateApplicationRequest struct {
 type DefaultSourceConnection struct {
 	Configured bool             `json:"configured"`
 	Connection SourceConnection `json:"connection,omitempty"`
+}
+
+type DeployApplicationRequest struct {
+	ExpectedConfigurationRevisionID     string `json:"expectedConfigurationRevisionId,omitempty"`
+	ExpectedConfigurationRevisionNumber int64  `json:"expectedConfigurationRevisionNumber,omitempty"`
+	ExpectedPlanRevisionID              string `json:"expectedPlanRevisionId,omitempty"`
+	ExpectedPlanRevisionNumber          int64  `json:"expectedPlanRevisionNumber,omitempty"`
 }
 
 type DeployReleaseRequest struct {

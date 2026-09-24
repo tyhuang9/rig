@@ -82,6 +82,31 @@ func TestRouterPreservesLegacyComposeAndUsesAcceptedGeneratedHead(t *testing.T) 
 	}
 }
 
+func TestRouterNeverSendsReviewedGeneratedJobToComposeAfterHeadDrift(t *testing.T) {
+	compose, generated := &recordingExecutor{}, &recordingExecutor{}
+	composeHead := deploymentplans.DeploymentPlanRevision{ID: routerPlanID, AppID: routerAppID, RevisionNumber: 2, Plan: deploymentplans.Plan{Strategy: deploymentplans.StrategyCompose}}
+	router, err := New(routerDeployments{}, routerPlans{head: composeHead}, routerReleases{}, compose, generated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := routerJob("")
+	job.Input, _ = json.Marshal(jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent, ExpectedPlanRevisionID: routerPlanID, ExpectedPlanRevisionNumber: 1, ExpectedConfigurationRevisionID: "", ExpectedConfigurationRevisionNumber: 0})
+	if _, err := router.Execute(context.Background(), job, noopReporter{}); err != nil {
+		t.Fatal(err)
+	}
+	if compose.calls != 0 || generated.calls != 1 {
+		t.Fatalf("compose=%d generated=%d", compose.calls, generated.calls)
+	}
+
+	compose, generated = &recordingExecutor{}, &recordingExecutor{}
+	router, _ = New(routerDeployments{deployment: deployments.Deployment{ProvenanceInitialized: true, RuntimeStrategy: deployments.RuntimeCompose}}, routerPlans{head: composeHead}, routerReleases{}, compose, generated)
+	_, err = router.Execute(context.Background(), job, noopReporter{})
+	var executionErr *jobs.ExecutionError
+	if !errors.As(err, &executionErr) || executionErr.Code != "invalid_source" || compose.calls != 0 || generated.calls != 0 {
+		t.Fatalf("initialized mismatch err=%v compose=%d generated=%d", err, compose.calls, generated.calls)
+	}
+}
+
 func TestRouterPinsPriorReleaseAndExistingDeploymentStrategy(t *testing.T) {
 	compose, generated := &recordingExecutor{}, &recordingExecutor{}
 	release := releasesnapshot.Release{ID: routerReleaseID, AppID: routerAppID, DeploymentPlanRevisionID: routerPlanID, DeploymentPlanRevisionNumber: 1}

@@ -56,13 +56,21 @@ func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.Progre
 	if err != nil {
 		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "internal_error"}
 	}
-	strategy, err := r.strategy(ctx, job.ResourceID, input.ReleaseID, deployment)
-	if err != nil {
-		code := "internal_error"
-		if errors.Is(err, errInvalidSource) {
-			code = "invalid_source"
+	var strategy deployments.RuntimeStrategy
+	if input.HasReviewedRevisions() {
+		if deployment.ProvenanceInitialized && deployment.RuntimeStrategy != deployments.RuntimeGeneratedNode {
+			return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "invalid_source"}
 		}
-		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: code}
+		strategy = deployments.RuntimeGeneratedNode
+	} else {
+		strategy, err = r.strategy(ctx, job.ResourceID, input.ReleaseID, deployment)
+		if err != nil {
+			code := "internal_error"
+			if errors.Is(err, errInvalidSource) {
+				code = "invalid_source"
+			}
+			return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: code}
+		}
 	}
 	var executor jobs.Executor
 	switch strategy {

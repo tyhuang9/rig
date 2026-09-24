@@ -41,6 +41,8 @@ var (
 	ErrMigrationApprovalRequired = errors.New("job still requires migration approval")
 	ErrIdempotency               = errors.New("idempotency key conflicts with the original request")
 	ErrApplicationBusy           = errors.New("application already has an active mutation")
+	ErrReviewedRevisionStale     = errors.New("reviewed deployment revision is stale")
+	ErrReviewedRevisionsRequired = errors.New("generated deployment requires reviewed revisions")
 	ErrCancellationRequested     = errors.New("job cancellation requested")
 	ErrCancellationUnsafe        = errors.New("job cannot be cancelled while route reconciliation is required")
 )
@@ -66,9 +68,15 @@ const (
 // Runtime-derived paths, environment values, approvals, and diagnostics must
 // never be accepted from an API caller or persisted in the job payload.
 type DeploymentInput struct {
-	ReleaseID         string            `json:"releaseId"`
-	ConfigurationMode ConfigurationMode `json:"configurationMode"`
+	ReleaseID                           string            `json:"releaseId"`
+	ConfigurationMode                   ConfigurationMode `json:"configurationMode"`
+	ExpectedPlanRevisionID              string            `json:"expectedPlanRevisionId,omitempty"`
+	ExpectedPlanRevisionNumber          int64             `json:"expectedPlanRevisionNumber,omitempty"`
+	ExpectedConfigurationRevisionID     string            `json:"expectedConfigurationRevisionId,omitempty"`
+	ExpectedConfigurationRevisionNumber int64             `json:"expectedConfigurationRevisionNumber,omitempty"`
 }
+
+func (input DeploymentInput) HasReviewedRevisions() bool { return input.ExpectedPlanRevisionID != "" }
 
 func (DeploymentInput) jobInput() {}
 
@@ -217,6 +225,16 @@ func (s *Service) CreateWithInput(request CreateRequest) (Job, bool, error) {
 // job and commits caller-owned trusted linkage in the same SQLite transaction.
 // The worker is signaled only after that combined transaction commits.
 func (s *Service) CreateWithInputFinalized(request CreateRequest, finalize CreateFinalizer) (Job, bool, error) {
+	return s.createWithInput(request, nil, finalize)
+}
+
+// CreateWithInputChecked runs check only for a newly inserted job, while the
+// SQLite writer transaction is held. Exact idempotent replays skip it.
+func (s *Service) CreateWithInputChecked(request CreateRequest, check CreateFinalizer) (Job, bool, error) {
+	return s.createWithInput(request, check, nil)
+}
+
+func (s *Service) createWithInput(request CreateRequest, check, finalize CreateFinalizer) (Job, bool, error) {
 	if request.Type == "" || request.ResourceType == "" || request.ResourceID == "" || len(request.IdempotencyKey) > 200 {
 		return Job{}, false, fmt.Errorf("%w: type, resource type, and resource id are required", ErrInvalidInput)
 	}
@@ -266,6 +284,11 @@ func (s *Service) CreateWithInputFinalized(request CreateRequest, finalize Creat
 	if _, err := appendEvent(tx, now, job.ID, "info", "queued", "job_queued", "Job queued"); err != nil {
 		return Job{}, false, err
 	}
+	if check != nil {
+		if err = check(tx, job); err != nil {
+			return Job{}, false, err
+		}
+	}
 	if finalize != nil {
 		if err = finalize(tx, job); err != nil {
 			return Job{}, false, err
@@ -301,6 +324,17 @@ func marshalInput(input JobInput) (json.RawMessage, error) {
 		}
 		if value.ConfigurationMode != ConfigurationCurrent && value.ConfigurationMode != ConfigurationOriginal {
 			return nil, fmt.Errorf("%w: configuration mode must be current or original", ErrInvalidInput)
+		}
+		if value.ExpectedPlanRevisionID == "" {
+			if value.ExpectedPlanRevisionNumber != 0 || value.ExpectedConfigurationRevisionID != "" || value.ExpectedConfigurationRevisionNumber != 0 {
+				return nil, ErrInvalidInput
+			}
+		} else if value.ReleaseID != "" || value.ConfigurationMode != ConfigurationCurrent ||
+			uuid.Validate(value.ExpectedPlanRevisionID) != nil || value.ExpectedPlanRevisionNumber < 1 ||
+			value.ExpectedConfigurationRevisionNumber < 0 ||
+			(value.ExpectedConfigurationRevisionID == "") != (value.ExpectedConfigurationRevisionNumber == 0) ||
+			(value.ExpectedConfigurationRevisionID != "" && uuid.Validate(value.ExpectedConfigurationRevisionID) != nil) {
+			return nil, ErrInvalidInput
 		}
 		encoded, err := json.Marshal(value)
 		if err != nil {
@@ -375,6 +409,17 @@ func byIdempotencyTx(tx *sql.Tx, kind, resourceType, resourceID, key string) (Jo
 }
 func (s *Service) Get(id string) (Job, error) {
 	return s.scan(s.db.QueryRow(`SELECT `+jobSelectColumns+` FROM jobs WHERE id=?`, id))
+}
+
+func (s *Service) GetDeploymentByIdempotency(appID, actorID, key string) (Job, error) {
+	if uuid.Validate(appID) != nil || uuid.Validate(actorID) != nil || key == "" || len(key) > 200 {
+		return Job{}, ErrJobNotFound
+	}
+	job, err := s.scan(s.db.QueryRow(`SELECT `+jobSelectColumns+` FROM jobs WHERE type='deploy' AND resource_type='application' AND resource_id=? AND requested_by=? AND idempotency_key=?`, appID, actorID, key))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Job{}, ErrJobNotFound
+	}
+	return job, err
 }
 
 func (s *Service) List(limit int) ([]Job, error) {
@@ -1258,6 +1303,10 @@ func safeExecutionFailure(err error) (string, string) {
 			return "configuration_unavailable", "Application configuration is unavailable"
 		case "configuration_review_required":
 			return "configuration_review_required", "Review application configuration scope against the accepted deployment plan"
+		case "reviewed_revision_stale":
+			return "reviewed_revision_stale", "Reviewed plan or configuration changed before deployment execution"
+		case "reviewed_revisions_required":
+			return "reviewed_revisions_required", "Generated deployment requires reviewed plan and configuration revisions"
 		case "build_configuration_requires_build_command":
 			return "build_configuration_requires_build_command", "Public build configuration requires a reviewed build command"
 		case "compose_invalid", "compose_config_invalid":

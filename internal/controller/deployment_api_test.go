@@ -257,6 +257,158 @@ func TestLatestDeploymentIsTypedActorBoundAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestReviewedGeneratedDeploymentRejectsDriftAndReplaysExactJob(t *testing.T) {
+	f := newDeploymentAPIFixtureWithRuntimes(t, false, true, false)
+	path := "/api/v1/apps/" + f.app.ID + "/deployments"
+	plan := f.acceptPlan(t, f.app.ID, deploymentplans.StrategyGeneratedNode)
+	body := func(plan deploymentplans.DeploymentPlanRevision, configurationID string, configurationNumber int64) string {
+		encoded, err := json.Marshal(map[string]any{
+			"expectedPlanRevisionId": plan.ID, "expectedPlanRevisionNumber": plan.RevisionNumber,
+			"expectedConfigurationRevisionId": configurationID, "expectedConfigurationRevisionNumber": configurationNumber,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(encoded)
+	}
+	firstBody := body(plan, "", 0)
+	for _, unreviewed := range []string{"{}", ""} {
+		assertProblemCode(t, f.request(http.MethodPost, path, unreviewed), http.StatusUnprocessableEntity, "reviewed_revisions_required")
+	}
+	first := f.requestWithKey(http.MethodPost, path, firstBody, "reviewed-first")
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first = %d %s", first.Code, first.Body.String())
+	}
+	var firstMutation apicontract.JobMutationResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &firstMutation); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := f.jobs.Get(firstMutation.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := jobs.DeploymentInputFor(stored)
+	if err != nil || input.ExpectedPlanRevisionID != plan.ID || input.ExpectedPlanRevisionNumber != plan.RevisionNumber || input.ExpectedConfigurationRevisionID != "" || input.ExpectedConfigurationRevisionNumber != 0 {
+		t.Fatalf("stored input = %+v, %v", input, err)
+	}
+	if _, err := f.jobs.Cancel(stored.ID); err != nil {
+		t.Fatal(err)
+	}
+	nextPlan, err := f.plans.Replace(context.Background(), f.app.ID, f.userID(t), deploymentplans.ReplaceInput{ExpectedRevisionNumber: plan.RevisionNumber, Plan: plan.Plan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay := f.requestWithKey(http.MethodPost, path, firstBody, "reviewed-first")
+	if replay.Code != http.StatusOK {
+		t.Fatalf("replay = %d %s", replay.Code, replay.Body.String())
+	}
+	var replayMutation apicontract.JobMutationResponse
+	if err := json.Unmarshal(replay.Body.Bytes(), &replayMutation); err != nil {
+		t.Fatal(err)
+	}
+	if replayMutation.Created || replayMutation.Job.ID != stored.ID {
+		t.Fatalf("replay = %+v", replayMutation)
+	}
+	assertProblemCode(t, f.requestWithKey(http.MethodPost, path, body(nextPlan, "", 0), "reviewed-first"), http.StatusConflict, "idempotency_conflict")
+	stalePlan := f.requestWithKey(http.MethodPost, path, firstBody, "reviewed-stale-plan")
+	assertProblemCode(t, stalePlan, http.StatusConflict, "reviewed_revision_stale")
+	if _, err := f.jobs.GetDeploymentByIdempotency(f.app.ID, f.userID(t), "reviewed-stale-plan"); !errors.Is(err, jobs.ErrJobNotFound) {
+		t.Fatalf("stale plan job = %v", err)
+	}
+
+	configurationStore, err := appconfig.New(f.db, f.stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := configurationStore.ReplaceScoped(context.Background(), f.app.ID, f.userID(t), appconfig.ScopedReplaceInput{
+		ExpectedRevisionNumber: 0, PlanRevisionID: nextPlan.ID, PlanRevisionNumber: nextPlan.RevisionNumber,
+		Components: []appconfig.ComponentTarget{{Name: "web", Role: "server"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBody := body(nextPlan, configuration.RevisionID, configuration.RevisionNumber)
+	second := f.requestWithKey(http.MethodPost, path, secondBody, "reviewed-second")
+	if second.Code != http.StatusAccepted {
+		t.Fatalf("second = %d %s", second.Code, second.Body.String())
+	}
+	var secondMutation apicontract.JobMutationResponse
+	if err := json.Unmarshal(second.Body.Bytes(), &secondMutation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.jobs.Cancel(secondMutation.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := configurationStore.ReplaceScoped(context.Background(), f.app.ID, f.userID(t), appconfig.ScopedReplaceInput{
+		ExpectedRevisionNumber: configuration.RevisionNumber, PlanRevisionID: nextPlan.ID, PlanRevisionNumber: nextPlan.RevisionNumber,
+		Components: []appconfig.ComponentTarget{{Name: "web", Role: "server"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	staleConfiguration := f.requestWithKey(http.MethodPost, path, secondBody, "reviewed-stale-config")
+	assertProblemCode(t, staleConfiguration, http.StatusConflict, "reviewed_revision_stale")
+	replay = f.requestWithKey(http.MethodPost, path, secondBody, "reviewed-second")
+	if replay.Code != http.StatusOK {
+		t.Fatalf("config replay = %d %s", replay.Code, replay.Body.String())
+	}
+	if err := json.Unmarshal(replay.Body.Bytes(), &replayMutation); err != nil || replayMutation.Job.ID != secondMutation.Job.ID || replayMutation.Created {
+		t.Fatalf("config replay = %+v, %v", replayMutation, err)
+	}
+	for _, malformed := range []string{`{"expectedPlanRevisionId":"` + nextPlan.ID + `"}`, `{"expectedPlanRevisionId":"` + nextPlan.ID + `","expectedPlanRevisionNumber":2,"expectedConfigurationRevisionId":"bad","expectedConfigurationRevisionNumber":1}`} {
+		assertProblemCode(t, f.request(http.MethodPost, path, malformed), http.StatusUnprocessableEntity, "invalid_deployment")
+	}
+	for _, malformed := range []string{`null`, `{"expectedPlanRevisionId":null,"expectedPlanRevisionNumber":2,"expectedConfigurationRevisionId":"","expectedConfigurationRevisionNumber":0}`, `{"unexpected":"value"}`} {
+		assertProblemCode(t, f.request(http.MethodPost, path, malformed), http.StatusUnprocessableEntity, "invalid_deployment")
+	}
+}
+
+func TestDeploymentIdempotencyLookupIsActorAndApplicationScoped(t *testing.T) {
+	f := newDeploymentAPIFixture(t, true, false)
+	key := "lookup-job"
+	created := f.requestWithKey(http.MethodPost, "/api/v1/apps/"+f.app.ID+"/deployments", "{}", key)
+	if created.Code != http.StatusAccepted {
+		t.Fatalf("create = %d %s", created.Code, created.Body.String())
+	}
+	var mutation apicontract.JobMutationResponse
+	if err := json.Unmarshal(created.Body.Bytes(), &mutation); err != nil {
+		t.Fatal(err)
+	}
+	lookup := func(appID string, session auth.Session, key string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/apps/"+appID+"/deployment-jobs/by-idempotency", nil)
+		r.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: session.Token})
+		r.Header.Set("Idempotency-Key", key)
+		w := httptest.NewRecorder()
+		f.handler.ServeHTTP(w, r)
+		return w
+	}
+	found := lookup(f.app.ID, f.session, key)
+	if found.Code != http.StatusOK || found.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("found = %d headers=%v %s", found.Code, found.Header(), found.Body.String())
+	}
+	var job apicontract.Job
+	if err := json.Unmarshal(found.Body.Bytes(), &job); err != nil || job.ID != mutation.Job.ID {
+		t.Fatalf("lookup = %+v, %v", job, err)
+	}
+	otherSession, err := f.auth.NewSession(f.otherUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hidden := range []*httptest.ResponseRecorder{lookup(f.app.ID, otherSession, key), lookup(f.otherApp.ID, f.session, key), lookup(f.app.ID, f.session, "unknown")} {
+		assertProblemCode(t, hidden, http.StatusNotFound, "job_not_found")
+		if hidden.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("missing no-store: %v", hidden.Header())
+		}
+	}
+	assertProblemCode(t, lookup(f.app.ID, f.session, ""), http.StatusUnprocessableEntity, "invalid_idempotency_key")
+	unauthenticated := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/apps/"+f.app.ID+"/deployment-jobs/by-idempotency", nil)
+	r.Header.Set("Idempotency-Key", key)
+	f.handler.ServeHTTP(unauthenticated, r)
+	if unauthenticated.Code != http.StatusUnauthorized || unauthenticated.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("unauthenticated lookup = %d headers=%v", unauthenticated.Code, unauthenticated.Header())
+	}
+}
+
 func TestLatestDeploymentUsesExactAcceptedPlanStrategy(t *testing.T) {
 	for _, testCase := range []struct {
 		name      string
@@ -278,10 +430,14 @@ func TestLatestDeploymentUsesExactAcceptedPlanStrategy(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			f := newDeploymentAPIFixtureWithRuntimes(t, testCase.compose, testCase.generated, testCase.fake)
+			requestBody := "{}"
 			if testCase.strategy != "" {
-				f.acceptPlan(t, f.app.ID, testCase.strategy)
+				revision := f.acceptPlan(t, f.app.ID, testCase.strategy)
+				if testCase.strategy == deploymentplans.StrategyGeneratedNode {
+					requestBody = fmt.Sprintf(`{"expectedPlanRevisionId":%q,"expectedPlanRevisionNumber":%d,"expectedConfigurationRevisionId":"","expectedConfigurationRevisionNumber":0}`, revision.ID, revision.RevisionNumber)
+				}
 			}
-			response := f.request(http.MethodPost, "/api/v1/apps/"+f.app.ID+"/deployments", "{}")
+			response := f.request(http.MethodPost, "/api/v1/apps/"+f.app.ID+"/deployments", requestBody)
 			if !testCase.allowed {
 				assertProblemCode(t, response, http.StatusConflict, "capability_unavailable")
 				return

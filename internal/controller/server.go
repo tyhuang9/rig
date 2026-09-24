@@ -127,6 +127,7 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("listServices", s.require(s.services)),
 		contractRoute("listDeployments", s.require(s.listDeployments)),
 		contractRoute("deployApplication", s.require(s.deployApplication)),
+		contractRoute("getDeploymentJobByIdempotency", noStore(s.require(s.getDeploymentJobByIdempotency))),
 		contractRoute("listReleases", s.require(s.listReleases)),
 		contractRoute("deployRelease", s.require(s.deployRelease)),
 		contractRoute("listRuntimeApprovals", s.require(s.listRuntimeApprovals)),

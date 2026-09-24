@@ -123,6 +123,13 @@ export class APIError extends Error {
   }
 }
 
+export type DeployExpectedRevisions = {
+  expectedPlanRevisionId: string;
+  expectedPlanRevisionNumber: number;
+  expectedConfigurationRevisionId: string;
+  expectedConfigurationRevisionNumber: number;
+};
+
 let csrfToken = window.sessionStorage.getItem("hostd-csrf") ?? "";
 
 export function setCSRF(token: string) {
@@ -428,10 +435,17 @@ export const api = {
     request<ReleaseList>(operationPath(operations.listReleases.path, { appId })),
   runtimeApprovals: (appId: string) =>
     request<RuntimeApprovalList>(operationPath(operations.listRuntimeApprovals.path, { appId })),
-  deployApplication: (appId: string, idempotencyKey: string = crypto.randomUUID()) =>
+  deployApplication: (appId: string, idempotencyKey: string = crypto.randomUUID(), expected?: DeployExpectedRevisions) =>
     request<JobMutationResponse>(operationPath(operations.deployApplication.path, { appId }), {
       method: operations.deployApplication.method,
+      ...(expected ? { body: JSON.stringify(expected) } : {}),
       headers: { "Idempotency-Key": idempotencyKey },
+    }),
+  deploymentJobByIdempotency: (appId: string, idempotencyKey: string) =>
+    request<Job>(operationPath(operations.getDeploymentJobByIdempotency.path, { appId }), {
+      method: operations.getDeploymentJobByIdempotency.method,
+      headers: { "Idempotency-Key": idempotencyKey },
+      cache: "no-store",
     }),
   deployRelease: (appId: string, releaseId: string, data: DeployReleaseRequest) =>
     request<JobMutationResponse>(operationPath(operations.deployRelease.path, { appId, releaseId }), {

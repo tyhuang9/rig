@@ -44,6 +44,7 @@ type deploymentStore interface {
 }
 
 type planReader interface {
+	Get(context.Context, string) (deploymentplans.DeploymentPlanRevision, error)
 	GetRevision(context.Context, string, string, int64) (deploymentplans.DeploymentPlanRevision, error)
 }
 
