@@ -81,12 +81,22 @@ func TestLiveHostingNotesFixtureImages(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if definition.rootDirectory != name || definition.installDirectory != name {
+				t.Fatalf("fixture %s paths: root=%q install=%q", name, definition.rootDirectory, definition.installDirectory)
+			}
 			layout, err := prepareBuildContext(ctx, workspace, t.TempDir(), definition, contextLimits{})
 			if err != nil {
 				t.Fatal(err)
 			}
 			if err := writeRecipe(layout, definition); err != nil {
 				t.Fatal(err)
+			}
+			installPath, err := os.ReadFile(filepath.Join(layout.contextDirectory, "rig", "install.path"))
+			if err != nil || string(installPath) != name {
+				t.Fatalf("fixture %s staged install path mismatch: %v %q", name, err, installPath)
+			}
+			if info, err := os.Stat(filepath.Join(layout.contextDirectory, "source", name)); err != nil || !info.IsDir() {
+				t.Fatalf("fixture %s staged source directory missing: %v", name, err)
 			}
 			args := []string{"buildx", "build", "--file", layout.containerfile, "--iidfile", layout.imageIDFile, "--load", "--no-cache", "--progress", "plain", "--tag", imageTag}
 			if definition.installBehavior != "" {

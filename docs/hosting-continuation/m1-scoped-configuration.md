@@ -2,8 +2,9 @@
 
 **Recorded:** 2026-09-23. **Base:** M0 local commit
 `1f217adc8bf52f715c9efbda0d65342c7331c1ec`.
-**Candidate branch:** `feature/hosting-m1-scoped-config`. This work has not been
-published, merged, or deployed. M1's live exit gate remains open.
+**Candidate branch:** `feature/hosting-m1-scoped-config`, published as draft
+[PR #70](https://github.com/tyhuang9/rig/pull/70) for hosted Docker CI. It has
+not been merged or deployed. M1's live exit gate remains open.
 
 ## Implemented boundary
 
@@ -51,11 +52,11 @@ published, merged, or deployed. M1's live exit gate remains open.
 | `examples/hosting-notes: pnpm test` and public-label `pnpm build` | Passed: 10 API tests, including no-network rejection of TLS-disable URL parameters, bounded HTTPS probe, IP-host SNI handling, and secret-safe responses; frontend fixture build passed. |
 | `examples/hosting-notes: pnpm test:https-local` | Passed after generating a disposable test CA with OpenSSL. The API test endpoint called the actual HTTPS stub through the backend client over loopback TLS; wrong token, missing CA, and wrong hostname returned generic 503 responses without credential text. The generated private keys were then removed. Test-only DNS mapping did not exercise container bridge egress. |
 | F7 test CA with `FIXTURE_HOST_GATEWAY_IP=127.0.0.1`, then `pnpm test:https-local` | Passed. Both fixture certificates carried the DNS SAN and a verified `127.0.0.1` IP SAN; the API's HTTPS client accepted the IP URL with the test CA and without IP SNI. Invalid IPv4 input was rejected before certificate generation. This was a loopback test, not a Docker gateway or PostgreSQL run; the disposable certificates were removed. |
-| Fixture step in Linux fast-verification CI | Added a locked fixture install, API tests, public-label frontend build, and the disposable localhost IP-SAN HTTPS smoke. Both edited workflow YAML files parsed locally; this CI step has not run because the branch has not been published. |
+| Fixture step in Linux fast-verification CI | Added a locked fixture install, API tests, public-label frontend build, and the disposable localhost IP-SAN HTTPS smoke. Both edited workflow YAML files parsed locally. Hosted results for PR #70 are being collected. |
 | `go test -count=1 -run '^TestHostingNotesFixtureAcceptsReviewedFrontendAndBackendSetup$' ./internal/sourceinspection` | Passed. Rig selected the generated API and frontend candidate instead of the external harness Compose file; an explicit two-component plan with database-backed `/readyz` health was accepted. |
 | `go test -count=1 -run '^TestCompilerStagesHostingNotesFixtureWithoutDocker$' ./internal/generatedimage` | Passed with clean source and again after a local frontend build. The actual fixture's checked-in setup staged both component contexts with a fake Docker runner; source lockfile and app files were present, local `node_modules`, built assets, and test certificates were absent, and only the frontend received its public build value. No image was built. |
 | `go test -tags live_docker -run '^$' ./internal/generatedimage` | Passed compile-only. The existing direct Docker recipe test now supplies the required empty public-build-values mount; it was not executed without Docker. |
-| Opt-in `TestLiveHostingNotesFixtureImages` and generated-runtime CI step | Added and compiled, but not run. On a local Linux Docker host it will build the fixture's API and frontend images from the reviewed setup, inspect image environment, verify the public frontend label in static assets, and remove the exact images. A local Vite build confirmed that exact label appears in the emitted asset. It does not prove external database connectivity or Rig ingress. |
+| Opt-in `TestLiveHostingNotesFixtureImages` and generated-runtime CI step | The first hosted run on `14cb408a2d8ce0c2ed6633648ba2752146c942d6` passed the frontend image and existing blue-green lifecycle but failed the API image build: BuildKit reported `cd: can't cd to /workspace/app` in the install step. The staged path and Docker context are being checked; the generated-runtime job is red, so the live fixture image gate is not accepted. It does not prove external database connectivity or Rig ingress. |
 | Fresh copied fixture: `pnpm install --frozen-lockfile --offline` from `api`, then `VITE_BUILD_LABEL=workspace-install-check pnpm build` from `frontend` | Passed with an initially absent `node_modules`. pnpm resolved all three workspace packages and produced the frontend assets. The disposable copy was removed after the check. |
 
 The security review identified a PostgreSQL URL TLS-parameter override, an
@@ -90,6 +91,7 @@ Podman CLI, so it cannot run BuildKit, a container,
 the disposable TLS PostgreSQL/HTTPS harness, or an actual backend database
 roundtrip. No disposable external credential was provided; no Neon account,
 schema, or data was modified. A Go race run was unavailable because this host
-has CGO disabled. Hosted candidate CI would require branch publication, which
-the user has not authorized. M1 is a tested local implementation candidate,
-not an accepted live hosting milestone.
+has CGO disabled. The user authorized draft publication to collect hosted
+Docker evidence; PR #70 was opened and its first generated-runtime job exposed
+the API fixture build failure above. M1 is not an accepted live hosting
+milestone.
