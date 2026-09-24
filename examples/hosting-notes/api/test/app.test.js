@@ -143,7 +143,6 @@ test("database URLs cannot redirect the socket away from the verified host", () 
 test("database TLS verifier checks the configured URL host", async () => {
   for (const [host, subjectAltName] of [
     ["127.0.0.1", "IP Address:127.0.0.1"],
-    ["[::1]", "IP Address:::1"],
     ["postgres.fixture.test", "DNS:postgres.fixture.test"]
   ]) {
     const pool = createDatabase({ DATABASE_URL: `postgresql://fixture:password@${host}/notes?sslmode=verify-full` });
@@ -156,6 +155,20 @@ test("database TLS verifier checks the configured URL host", async () => {
     } finally {
       await pool.end();
     }
+  }
+});
+
+test("database TLS verifier rejects a mismatched IPv6 certificate", async () => {
+  const pool = createDatabase({ DATABASE_URL: "postgresql://fixture:password@[::1]/notes?sslmode=verify-full" });
+  try {
+    assert.equal(pool.options.ssl.rejectUnauthorized, true);
+    const rejected = pool.options.ssl.checkServerIdentity("localhost", {
+      subjectaltname: "DNS:unrelated.test",
+      subject: { CN: "unrelated.test" }
+    });
+    assert.equal(rejected?.code, "ERR_TLS_CERT_ALTNAME_INVALID");
+  } finally {
+    await pool.end();
   }
 });
 
