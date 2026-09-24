@@ -38,28 +38,30 @@ import (
 var web embed.FS
 
 type Server struct {
-	Auth                authenticationService
-	Apps                *apps.Store
-	Jobs                *jobs.Service
-	Machines            *machines.Store
-	Caddy               bool
-	FakeRuntime         bool
-	ComposeRuntime      bool
-	GeneratedRuntime    bool
-	DockerEndpoint      string
-	DataRoot            string
-	Logger              *slog.Logger
-	BootstrapCompleted  func()
-	Sources             *sourceconnections.Service
-	Configuration       *appconfig.Store
-	Deployments         *deployments.Repository
-	DeploymentPlans     *deploymentplans.Store
-	RelayManagement     RelayManagementService
-	AutoDeploy          AutoDeployService
-	AutoDeployAvailable bool
-	RelayReconcile      func()
-	AutoDeployReconcile func()
-	authenticationWork  *authenticationWorkGate
+	Auth                  authenticationService
+	Apps                  *apps.Store
+	Jobs                  *jobs.Service
+	Machines              *machines.Store
+	Caddy                 bool
+	FakeRuntime           bool
+	ComposeRuntime        bool
+	GeneratedRuntime      bool
+	DockerEndpoint        string
+	DataRoot              string
+	Logger                *slog.Logger
+	BootstrapCompleted    func()
+	Sources               *sourceconnections.Service
+	Configuration         *appconfig.Store
+	Deployments           *deployments.Repository
+	GeneratedIngress      LocalRouteIngress
+	GeneratedRuntimeState LocalRouteRuntimeState
+	DeploymentPlans       *deploymentplans.Store
+	RelayManagement       RelayManagementService
+	AutoDeploy            AutoDeployService
+	AutoDeployAvailable   bool
+	RelayReconcile        func()
+	AutoDeployReconcile   func()
+	authenticationWork    *authenticationWorkGate
 }
 
 // RelayManagementService is the controller-safe relay management boundary.
@@ -118,6 +120,7 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("createApplication", s.require(s.createApp)),
 		contractRoute("inspectImport", noStore(s.require(s.inspectApp))),
 		contractRoute("getApplication", s.require(s.getApp)),
+		contractRoute("getApplicationLocalRoute", noStore(s.require(s.getApplicationLocalRoute))),
 		contractRoute("getApplicationDeploymentPlan", noStore(s.require(s.getApplicationDeploymentPlan))),
 		contractRoute("acceptApplicationDeploymentPlan", noStore(s.require(s.acceptApplicationDeploymentPlan))),
 		contractRoute("approveApplicationDeploymentPlanMigration", noStore(s.require(s.approveApplicationDeploymentPlanMigration))),

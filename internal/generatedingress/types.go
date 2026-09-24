@@ -2,7 +2,21 @@
 // generated runtimes. It never receives application commands or configuration.
 package generatedingress
 
-import "errors"
+import (
+	"errors"
+	"time"
+
+	"github.com/hostd/hostd/internal/generatedruntime"
+)
+
+// Observation is a read-only attestation of the active local ingress route.
+// Its URL is scoped to the controller host's loopback listener.
+type Observation struct {
+	URL        string
+	Slot       generatedruntime.Slot
+	Endpoints  []generatedruntime.RouteEndpoint
+	ObservedAt time.Time
+}
 
 type DiagnosticCode string
 

@@ -220,6 +220,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	handler := (&controller.Server{
 		Auth: authService, Apps: appStore, Jobs: jobStore, Machines: machineStore, Sources: sources,
 		Configuration: configuration, Deployments: deploymentStore, DeploymentPlans: plans,
+		GeneratedIngress: composition.ingress, GeneratedRuntimeState: composition.state,
 		GeneratedRuntime: true, Caddy: true, DataRoot: dataRoot,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}).Handler()
@@ -491,6 +492,47 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	}()
 	var mutation apicontract.JobMutationResponse
 	deploymentPath := "/api/v1/apps/" + application.ID + "/deployments"
+	assertAttestedRoute := func(expected apicontract.Deployment) string {
+		t.Helper()
+		var route struct {
+			Status                      string `json:"status"`
+			Scope                       string `json:"scope"`
+			URL                         string `json:"url"`
+			DeploymentID                string `json:"deploymentId"`
+			ReleaseID                   string `json:"releaseId"`
+			ConfigurationRevisionID     string `json:"configurationRevisionId"`
+			ConfigurationRevisionNumber int64  `json:"configurationRevisionNumber"`
+			PlanRevisionID              string `json:"planRevisionId"`
+			PlanRevisionNumber          int64  `json:"planRevisionNumber"`
+			ObservedAt                  string `json:"observedAt"`
+		}
+		body := request(http.MethodGet, "/api/v1/apps/"+application.ID+"/local-route", nil, http.StatusOK, &route)
+		if route.Status != "verified" || route.Scope != "controller_loopback" ||
+			route.URL != "http://"+application.ID+".rig.localhost:8080" ||
+			route.DeploymentID != expected.ID || route.ReleaseID != expected.ReleaseID ||
+			route.ConfigurationRevisionID != expected.ActualConfigurationRevisionID ||
+			route.ConfigurationRevisionNumber != expected.ActualConfigurationRevisionNumber ||
+			route.PlanRevisionID != expected.DeploymentPlanRevisionID ||
+			route.PlanRevisionNumber != expected.DeploymentPlanRevisionNumber {
+			t.Fatal("attested local route does not match the active immutable generated deployment")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, route.ObservedAt); err != nil {
+			t.Fatal("attested local route has no observation time")
+		}
+		if bytes.Contains(body, []byte(dbURL)) || bytes.Contains(body, []byte(sentinel)) {
+			t.Fatal("attested local route disclosed a scoped runtime secret")
+		}
+		return route.URL
+	}
+	var absentRoute struct {
+		Status       string `json:"status"`
+		URL          string `json:"url"`
+		DeploymentID string `json:"deploymentId"`
+	}
+	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/local-route", nil, http.StatusOK, &absentRoute)
+	if absentRoute.Status == "verified" || absentRoute.URL != "" || absentRoute.DeploymentID != "" {
+		t.Fatal("controller exposed a generated route before deployment")
+	}
 	deployRequest := apicontract.DeployApplicationRequest{
 		ExpectedPlanRevisionID: plan.RevisionID, ExpectedPlanRevisionNumber: plan.RevisionNumber,
 		ExpectedConfigurationRevisionID: saved.RevisionID, ExpectedConfigurationRevisionNumber: saved.RevisionNumber,
@@ -543,6 +585,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	if err != nil || workspace.WorkspaceTreeSHA256 == "" || workspace.WorkspaceState != "ready" {
 		t.Fatal("pinned GitHub release workspace failed digest verification")
 	}
+	initialRouteURL := assertAttestedRoute(history.Items[0])
 	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/test/dependency", "", http.StatusOK, "reachable")
@@ -559,7 +602,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		t.Fatal("deployed frontend exposed a scoped server secret or selector")
 	}
 	browserNote := "browser TLS note " + uuid.NewString()
-	controllerJourneyBrowser(t, ctx, node, application.ID, "create", browserNote)
+	controllerJourneyBrowser(t, ctx, node, application.ID, initialRouteURL, "create", browserNote)
 	stopWorker()
 	select {
 	case <-done:
@@ -617,6 +660,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	api = httptest.NewServer((&controller.Server{
 		Auth: auth.New(reopenedDB), Apps: restartedApps, Jobs: restartedJobs, Machines: machines.New(reopenedDB), Sources: restartedSources,
 		Configuration: restartedConfiguration, Deployments: restartedDeployments, DeploymentPlans: restartedPlans,
+		GeneratedIngress: restartedComposition.ingress, GeneratedRuntimeState: restartedComposition.state,
 		GeneratedRuntime: true, Caddy: true, DataRoot: dataRoot, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}).Handler())
 	defer api.Close()
@@ -630,8 +674,9 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	if len(retainedHistory.Items) != 1 || retainedHistory.Items[0].ID != history.Items[0].ID || retainedHistory.Items[0].ReleaseID != releases.Items[0].ID {
 		t.Fatal("controller restart lost active deployment identity")
 	}
+	retainedRouteURL := assertAttestedRoute(retainedHistory.Items[0])
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
-	controllerJourneyBrowser(t, ctx, node, application.ID, "read", browserNote)
+	controllerJourneyBrowser(t, ctx, node, application.ID, retainedRouteURL, "read", browserNote)
 	publicEntries := make([]apicontract.ScopedConfigurationValueInput, 0, len(entries))
 	for _, entry := range entries {
 		if entry.Sensitive {
@@ -701,10 +746,11 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		replacementRelease.ConfigurationRevisionID != replacementConfiguration.RevisionID || replacementRelease.ConfigurationRevisionNumber != replacementConfiguration.RevisionNumber {
 		t.Fatal("same-source replacement did not pin the new configuration")
 	}
+	replacementRouteURL := assertAttestedRoute(replacementDeployment)
 	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
-	controllerJourneyBrowser(t, ctx, node, application.ID, "read", browserNote)
+	controllerJourneyBrowser(t, ctx, node, application.ID, replacementRouteURL, "read", browserNote)
 	wrongCA := controllerJourneyWrongCA(t, ctx, openssl, fixtureRoot)
 	wrongCABase64 := base64.StdEncoding.EncodeToString(wrongCA)
 	badEntries := append(append([]apicontract.ScopedConfigurationValueInput(nil), publicEntries...), apicontract.ScopedConfigurationValueInput{
@@ -760,10 +806,11 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		failedDeployment.ActualConfigurationRevisionID != badConfiguration.RevisionID {
 		t.Fatal("failed replacement did not retain its bad-CA configuration pin")
 	}
+	retainedReplacementRouteURL := assertAttestedRoute(replacementDeployment)
 	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
-	controllerJourneyBrowser(t, ctx, node, application.ID, "read", browserNote)
+	controllerJourneyBrowser(t, ctx, node, application.ID, retainedReplacementRouteURL, "read", browserNote)
 	t.Logf("M2 controller journey identities: app=%s connection=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s replacement-config=%s/%d replacement-job=%s replacement-deployment=%s replacement-release=%s bad-config=%s/%d failed-job=%s failed-deployment=%s source=github-fixture sha=%s archive-reads=%d ingress=127.0.0.1:8080", application.ID, connection.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID, replacementConfiguration.RevisionID, replacementConfiguration.RevisionNumber, replacementJob.ID, replacementDeployment.ID, replacementRelease.ID, badConfiguration.RevisionID, badConfiguration.RevisionNumber, failedJob.ID, failedDeployment.ID, controllerJourneyGitHubSHA, provider.archiveReads.Load())
 }
 
@@ -1062,13 +1109,13 @@ func controllerJourneyPort(t *testing.T, address string) int {
 	return port
 }
 
-func controllerJourneyBrowser(t *testing.T, ctx context.Context, node, appID, mode, note string) {
+func controllerJourneyBrowser(t *testing.T, ctx context.Context, node, appID, routeURL, mode, note string) {
 	t.Helper()
 	script, err := filepath.Abs(filepath.Join("..", "..", "web", "scripts", "verify-hosted-notes.mjs"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.CommandContext(ctx, node, script, appID, "8080", mode, note)
+	command := exec.CommandContext(ctx, node, script, appID, "8080", mode, note, routeURL)
 	command.Dir = filepath.Dir(script)
 	output, err := command.CombinedOutput()
 	if err != nil || !bytes.Contains(output, []byte("hosted Chromium "+mode+" passed")) {

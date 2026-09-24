@@ -121,6 +121,15 @@ paths:
       responses:
         '200': {description: Application, content: {application/json: {schema: {$ref: '#/components/schemas/Application'}}}}
         default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/local-route:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    get:
+      operationId: getApplicationLocalRoute
+      security: [{sessionCookie: []}]
+      description: A fresh, controller-host-only generated-runtime route observation. A URL is returned only when live ingress and durable active deployment provenance agree.
+      responses:
+        '200': {description: Attested local route or safe unavailable state, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LocalRoute'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/apps/{appId}/deployment-plan:
     parameters: [{$ref: '#/components/parameters/AppId'}]
     get:
@@ -544,6 +553,22 @@ components:
     User: {type: object, required: [id, username, role], properties: {id: {type: string, format: uuid}, username: {type: string}, role: {type: string, const: administrator}}}
     SessionResponse: {type: object, required: [user, csrfToken], properties: {user: {$ref: '#/components/schemas/User'}, csrfToken: {type: string}}}
     MeResponse: {type: object, required: [user], properties: {user: {$ref: '#/components/schemas/User'}}}
+    LocalRoute:
+      type: object
+      description: Only verified responses include a URL and immutable deployment provenance. The URL resolves on the controller host.
+      required: [status, observedAt]
+      properties:
+        status: {type: string, enum: [verified, unavailable, unverified]}
+        observedAt: {type: string, format: date-time}
+        reason: {type: string, enum: [generated_runtime_disabled, no_active_deployment, runtime_state_unavailable, attestation_failed, provenance_mismatch]}
+        scope: {type: string, const: controller_loopback}
+        url: {type: string, format: uri}
+        deploymentId: {type: string, format: uuid}
+        releaseId: {type: string}
+        configurationRevisionId: {type: string}
+        configurationRevisionNumber: {type: integer, format: int64, minimum: 0}
+        planRevisionId: {type: string, format: uuid}
+        planRevisionNumber: {type: integer, format: int64, minimum: 1}
     CSRFResponse: {type: object, required: [csrfToken], properties: {csrfToken: {type: string}}}
     Capabilities: {type: object, required: [fakeRuntime, composeRuntime, generatedRuntime, githubConnections], properties: {fakeRuntime: {type: boolean}, composeRuntime: {type: boolean}, generatedRuntime: {type: boolean}, githubConnections: {type: boolean}}}
     Diagnostics:
