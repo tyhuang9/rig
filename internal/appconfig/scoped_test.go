@@ -69,8 +69,8 @@ func TestScopedConfigurationExportsArePhaseAndComponentIsolated(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtimeText := string(runtime.Environment)
-	if !strings.Contains(runtimeText, "MODE='production'") || !strings.Contains(runtimeText, "SHARED='postgres://") || strings.Contains(runtimeText, "MIGRATION_URL") || strings.Contains(runtimeText, "VITE_LABEL") || len(runtime.SecretOrigins) != 1 {
-		t.Fatalf("runtime export=%q origins=%+v", runtimeText, runtime.SecretOrigins)
+	if !strings.Contains(runtimeText, "MODE=production\n") || !strings.Contains(runtimeText, "SHARED=postgres://") || !strings.Contains(runtimeText, `&x=$VALUE\tail ' "`+"\n") || strings.Contains(runtimeText, "MIGRATION_URL") || strings.Contains(runtimeText, "VITE_LABEL") || len(runtime.SecretOrigins) != 1 {
+		t.Fatal("scoped Docker runtime export did not preserve the literal selected values")
 	}
 	build, err := store.ExportComponentBuildForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber, configTestPlan, 1, "web")
 	if err != nil {
@@ -80,8 +80,8 @@ func TestScopedConfigurationExportsArePhaseAndComponentIsolated(t *testing.T) {
 		t.Fatalf("build export=%q values=%+v origins=%+v", build.Environment, build.PublicBuildValues, build.SecretOrigins)
 	}
 	migration, err := store.ExportComponentMigrationForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber, configTestPlan, 1, "api", []string{"MIGRATION_URL", "MODE"})
-	if err != nil || !strings.Contains(string(migration.Environment), "MIGRATION_URL='postgres://migration-secret'") || !strings.Contains(string(migration.Environment), "MODE='production'") || strings.Contains(string(migration.Environment), "SHARED") {
-		t.Fatalf("migration export=%q err=%v", migration.Environment, err)
+	if err != nil || !strings.Contains(string(migration.Environment), "MIGRATION_URL=postgres://migration-secret\n") || !strings.Contains(string(migration.Environment), "MODE=production\n") || strings.Contains(string(migration.Environment), "SHARED") {
+		t.Fatalf("migration Docker export failed: %v", err)
 	}
 	if _, err := store.ExportRevisionForExecution(ctx, configTestApp, revision.RevisionID, revision.RevisionNumber); !IsCode(err, "configuration_review_required") {
 		t.Fatalf("broad v2 export err=%v", err)
@@ -165,8 +165,8 @@ func TestScopedUpgradeMapsOneLegacySecretWithoutRewritingHistory(t *testing.T) {
 		t.Fatalf("accepted generated plan allowed a new legacy revision: %v", err)
 	}
 	legacyMigration, err := store.ExportComponentMigrationForExecution(ctx, configTestApp, legacy.RevisionID, legacy.RevisionNumber, configTestPlan, 1, "api", []string{"DATABASE_URL"})
-	if err != nil || !strings.Contains(string(legacyMigration.Environment), "DATABASE_URL='legacy-secret'") || strings.Contains(string(legacyMigration.Environment), "MODE") {
-		t.Fatalf("legacy migration compatibility export=%q err=%v", legacyMigration.Environment, err)
+	if err != nil || !strings.Contains(string(legacyMigration.Environment), "DATABASE_URL=legacy-secret\n") || strings.Contains(string(legacyMigration.Environment), "MODE") {
+		t.Fatalf("legacy migration compatibility export failed: %v", err)
 	}
 	legacyPath := store.bundlePath(configTestApp, legacy.RevisionID)
 	before, err := os.ReadFile(legacyPath)
@@ -195,9 +195,30 @@ func TestScopedUpgradeMapsOneLegacySecretWithoutRewritingHistory(t *testing.T) {
 		t.Fatalf("legacy revision unreadable: %q err=%v", oldExport.Environment, err)
 	}
 	newExport, err := store.ExportComponentRuntimeForExecution(ctx, configTestApp, scoped.RevisionID, scoped.RevisionNumber, configTestPlan, 1, "api")
-	if err != nil || !strings.Contains(string(newExport.Environment), "DATABASE_URL='legacy-secret'") {
-		t.Fatalf("scoped preserved secret export=%q err=%v", newExport.Environment, err)
+	if err != nil || !strings.Contains(string(newExport.Environment), "DATABASE_URL=legacy-secret\n") {
+		t.Fatalf("scoped preserved secret export failed: %v", err)
 	}
+}
+
+func TestLegacyMigrationRejectsMultilineValueForDockerWithoutChangingHistory(t *testing.T) {
+	store, _ := testStore(t)
+	ctx := context.Background()
+	if _, err := store.db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES('owner','owner','hash',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := store.Replace(ctx, configTestApp, "owner", ReplaceInput{Secrets: []ValueInput{{Key: "DATABASE_URL", Value: "first\nsecond"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedScopedPlan(t, store, configTestPlan, 1)
+	if _, err := store.ExportComponentMigrationForExecution(ctx, configTestApp, legacy.RevisionID, legacy.RevisionNumber, configTestPlan, 1, "api", []string{"DATABASE_URL"}); !IsCode(err, "configuration_unavailable") {
+		t.Fatalf("multiline legacy value passed to Docker: %v", err)
+	}
+	previous, err := store.ExportRevisionForExecution(ctx, configTestApp, legacy.RevisionID, legacy.RevisionNumber)
+	if err != nil || !strings.Contains(string(previous.Environment), "DATABASE_URL='first\nsecond'") {
+		t.Fatal("legacy revision did not retain its original Compose export")
+	}
+	previous.Clear()
 }
 
 func TestReplaceScopedRejectsInvalidExposureAndTransport(t *testing.T) {

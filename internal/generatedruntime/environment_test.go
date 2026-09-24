@@ -18,7 +18,7 @@ func TestSecureEnvironmentStagerWritesAndRemovesProtectedEnvironment(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	contents := []byte("TOKEN='synthetic-secret'\n")
+	contents := []byte("TOKEN=synthetic-secret\n")
 	lease, err := stager.Stage(uuid.NewString(), 1, contents)
 	if err != nil {
 		t.Fatal(err)
@@ -28,8 +28,8 @@ func TestSecureEnvironmentStagerWritesAndRemovesProtectedEnvironment(t *testing.
 			t.Fatalf("caller environment byte %d was not cleared", index)
 		}
 	}
-	if body, err := os.ReadFile(lease.Path()); err != nil || string(body) != "TOKEN='synthetic-secret'\n" {
-		t.Fatalf("protected environment mismatch: %q %v", body, err)
+	if body, err := os.ReadFile(lease.Path()); err != nil || string(body) != "TOKEN=synthetic-secret\n" {
+		t.Fatalf("protected environment mismatch: %v", err)
 	}
 	directory := filepath.Dir(lease.Path())
 	if err := lease.Cleanup(); err != nil {

@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -247,7 +248,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 		t.Fatal("prepare generated ingress")
 	}
 	blueSpec := hostingLiveCandidateSpec(appID, plan, imageID, definitionDigest, releaseID, artifactID)
-	hostingLiveStart(t, ctx, engine, config, revisionA, blueSpec, &blue)
+	hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, config, revisionA, blueSpec, &blue)
 	hostingLiveOnlyAppNetwork(t, ctx, docker, runtimeDockerConfig, blue.ContainerID, appNetwork.Name)
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{hostingLiveEndpoint(blue)}}); err != nil {
 		t.Fatal("route initial API candidate")
@@ -270,6 +271,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create bad-CA candidate: %s", hostingLiveRuntimeCode(err))
 	}
+	hostingLiveAssertSelectedDockerEnv(t, ctx, docker, runtimeDockerConfig, bad.ContainerID)
 	if err := engine.StartCandidate(ctx, bad); err != nil {
 		t.Fatalf("start bad-CA candidate: %s", hostingLiveRuntimeCode(err))
 	}
@@ -286,7 +288,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	revisionB := hostingLiveReplaceConfig(t, ctx, config, appID, plan, badRevision.RevisionNumber, settings, "runtime-B")
 	greenSpec := hostingLiveCandidateSpec(appID, plan, imageID, definitionDigest, releaseID, artifactID)
 	greenSpec.ActiveSlot = blue.Slot
-	hostingLiveStart(t, ctx, engine, config, revisionB, greenSpec, &green)
+	hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, config, revisionB, greenSpec, &green)
 	hostingLiveAssertAPI(t, ctx, port, appID, "runtime-A", false)
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, FromSlot: blue.Slot, ToSlot: green.Slot, Endpoints: []generatedruntime.RouteEndpoint{hostingLiveEndpoint(green)}}); err != nil {
 		t.Fatal("switch to configuration-only replacement")
@@ -692,7 +694,7 @@ func hostingLiveCandidateSpec(appID string, plan deploymentplans.DeploymentPlanR
 	return generatedruntime.CandidateSpec{}
 }
 
-func hostingLiveStart(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, store *appconfig.Store, revision appconfig.Configuration, spec generatedruntime.CandidateSpec, candidate *generatedruntime.Candidate) {
+func hostingLiveStart(t *testing.T, ctx context.Context, docker, dockerConfig string, engine *generatedruntime.Engine, store *appconfig.Store, revision appconfig.Configuration, spec generatedruntime.CandidateSpec, candidate *generatedruntime.Candidate) {
 	t.Helper()
 	// The candidate's plan identity is part of its image contract. Build the
 	// export using the same accepted plan identity without a broad revision read.
@@ -708,11 +710,29 @@ func hostingLiveStart(t *testing.T, ctx context.Context, engine *generatedruntim
 		t.Fatalf("create exact API candidate: %s", hostingLiveRuntimeCode(err))
 	}
 	*candidate = created
+	hostingLiveAssertSelectedDockerEnv(t, ctx, docker, dockerConfig, created.ContainerID)
 	if err := engine.StartCandidate(ctx, created); err != nil {
 		t.Fatalf("start exact API candidate: %s", hostingLiveRuntimeCode(err))
 	}
 	if err := engine.WaitHealthy(ctx, created); err != nil {
 		t.Fatalf("API candidate did not pass database readiness: %s", hostingLiveRuntimeCode(err))
+	}
+}
+
+func hostingLiveAssertSelectedDockerEnv(t *testing.T, ctx context.Context, docker, dockerConfig, containerID string) {
+	t.Helper()
+	body, err := hostingLiveDockerOutput(ctx, docker, dockerConfig, nil, "container", "inspect", "--format", "{{json .Config.Env}}", containerID)
+	if err != nil {
+		t.Fatal("inspect generated API environment transport")
+	}
+	var entries []string
+	if err := json.Unmarshal(bytes.TrimSpace(body), &entries); err != nil {
+		t.Fatal("decode generated API environment transport")
+	}
+	for _, expected := range []string{"DATABASE_URL_ENV=NOTES_FIXTURE_DB_URL", "FIXTURE_SCHEMA=rig_fixture_notes"} {
+		if !slices.Contains(entries, expected) {
+			t.Fatal("Docker did not receive an exact scoped runtime selector")
+		}
 	}
 }
 

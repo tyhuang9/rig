@@ -480,6 +480,12 @@ func (s *Store) ExportComponentMigrationForExecution(ctx context.Context, appID,
 			if !exists {
 				return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
 			}
+			// Docker's --env-file has no quoting or multiline value syntax.
+			// Keep legacy Compose revisions readable, but fail closed when an
+			// explicitly approved migration value cannot be passed to Docker.
+			if strings.ContainsAny(entry.Value, "\r\n") {
+				return ExecutionConfiguration{}, &Error{Code: "configuration_unavailable"}
+			}
 			sensitivity := SensitivityPublic
 			if entry.Sensitive {
 				sensitivity = SensitivitySecret
@@ -560,12 +566,14 @@ func exportEmptyOrLegacyReview(stored revisionBundle, revisionID string, revisio
 func exportScopedEntries(revisionID string, revisionNumber int64, entries []scopedBundleEntry) ExecutionConfiguration {
 	entries = append([]scopedBundleEntry(nil), entries...)
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	// Generated containers use Docker CLI --env-file, which treats quotes as
+	// literal bytes. Scoped values cannot contain line breaks or NUL bytes.
 	environment := []byte("# hostd application configuration\n")
 	origins := make([]SecretOrigin, 0)
 	for _, entry := range entries {
 		environment = append(environment, entry.Key...)
 		environment = append(environment, '=')
-		environment = appendDotenvSingleQuoted(environment, entry.Value)
+		environment = append(environment, entry.Value...)
 		environment = append(environment, '\n')
 		if entry.Sensitivity == SensitivitySecret && entry.Value != "" {
 			origins = append(origins, SecretOrigin{RevisionID: revisionID, RevisionNumber: revisionNumber, Key: append([]byte(nil), entry.Key...), Value: append([]byte(nil), entry.Value...)})

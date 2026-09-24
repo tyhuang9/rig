@@ -447,7 +447,7 @@ func newExecutorFixture(t *testing.T, migration bool) *executorFixture {
 	deploymentsFake := &fakeDeployments{deployment: deployments.Deployment{ID: testDeploymentID, AppID: testAppID, JobID: testJobID, Status: deployments.Preparing, ConfigurationMode: "current"}}
 	state := &fakeRuntimeState{active: generatedruntimestate.ActiveHead{AppID: testAppID}, migrationRequired: migration}
 	compiler := &fakeCompiler{events: &events, artifacts: []generatedimage.Artifact{artifact}}
-	configuration := &fakeConfiguration{value: []byte("DATABASE_URL='secret'\n")}
+	configuration := &fakeConfiguration{value: []byte("DATABASE_URL=secret\n")}
 	artifacts := &fakeArtifacts{values: map[string]generatedimage.Artifact{artifact.ID: artifact}}
 	runtime := &fakeRuntime{events: &events}
 	authorization := &fakeAuthorization{events: &events, deployments: deploymentsFake}

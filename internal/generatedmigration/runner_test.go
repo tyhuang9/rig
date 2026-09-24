@@ -75,7 +75,7 @@ func TestRunnerUsesOnlyAllowedConfigurationAndExactCommandArgument(t *testing.T)
 	if len(configuration.requested) != 1 || configuration.requested[0] != "DATABASE_URL" {
 		t.Fatalf("requested keys=%#v", configuration.requested)
 	}
-	if string(stager.contents) != "DATABASE_URL='secret'\n" || !stager.lease.cleaned {
+	if string(stager.contents) != "DATABASE_URL=secret\n" || !stager.lease.cleaned {
 		t.Fatalf("staging=%q cleaned=%v", stager.contents, stager.lease.cleaned)
 	}
 	if len(commands.requests) != 4 {
@@ -141,7 +141,7 @@ func newFixture(t *testing.T) (*Runner, *fakeConfiguration, *fakeStager, *fakeRu
 	if err := os.Mkdir(work, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	configuration := &fakeConfiguration{value: appconfig.ExecutionConfiguration{RevisionID: "55555555-5555-5555-5555-555555555555", RevisionNumber: 1, Environment: []byte("DATABASE_URL='secret'\n")}}
+	configuration := &fakeConfiguration{value: appconfig.ExecutionConfiguration{RevisionID: "55555555-5555-5555-5555-555555555555", RevisionNumber: 1, Environment: []byte("DATABASE_URL=secret\n")}}
 	stager := &fakeStager{lease: &fakeLease{path: filepath.Join(root, "runtime.env")}}
 	commands := &fakeRunner{}
 	runner, err := New(configuration, stager, commands, Options{DockerExecutable: docker, DockerConfigDirectory: config, WorkingDirectory: work})
