@@ -1,0 +1,13 @@
+{
+  "name": "rig-hosting-vite-only",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "yarn@4.6.0",
+  "scripts": {
+    "build": "vite build"
+  },
+  "devDependencies": {
+    "vite": "7.3.0"
+  }
+}
