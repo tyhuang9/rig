@@ -680,6 +680,19 @@ func (observer *controllerJourneyHealthObserver) Run(ctx context.Context, reques
 					missing := string(match[1])
 					if strings.HasPrefix(missing, "/workspace/") || strings.HasPrefix(missing, "/usr/local/lib/rig/") {
 						observer.test.Logf("static frontend missing module basename: %s", filepath.Base(missing))
+						if strings.HasPrefix(missing, "/usr/local/lib/rig/") {
+							observer.test.Log("static frontend missing module location: Rig runtime library")
+							copyResult, copyErr := observer.delegate.Run(ctx, runtimeprocess.CommandRequest{
+								Executable: request.Executable,
+								Args:       []string{"container", "cp", request.Args[len(request.Args)-1] + ":/usr/local/lib/rig/static.mjs", "-"},
+								Directory:  request.Directory, Env: request.Env, Timeout: 3 * time.Second, OutputLimit: 8 << 10,
+							})
+							observer.test.Logf("static frontend runtime library file present: %t", copyErr == nil)
+							clear(copyResult.Stdout)
+							clear(copyResult.Stderr)
+						} else {
+							observer.test.Log("static frontend missing module location: application workspace")
+						}
 					}
 				}
 				clear(combined)

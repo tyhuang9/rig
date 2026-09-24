@@ -55,6 +55,12 @@ The fourth hosted run ([workflow 36034611177](https://github.com/tyhuang9/rig/ac
 head `b79d07b`) classified that startup failure as `MODULE_NOT_FOUND`;
 the API again became healthy and cleanup passed. The next diagnostic checks
 the accepted static run command and logs only the missing module's basename.
+The fifth hosted run ([workflow 36035148372](https://github.com/tyhuang9/rig/actions/runs/36035148372),
+head `688cee7`) confirmed the accepted static command and identified the
+missing module basename as `static.mjs`; the API was healthy and cleanup
+passed. The next run distinguishes the application's workspace from Rig's
+runtime library path and probes that exact library file in the stopped
+container without printing its contents.
 
 The QA and security reviews of the controller harness found no confirmed
 exploit. Their actionable gaps were addressed: the deployed API now probes
