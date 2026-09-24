@@ -648,6 +648,28 @@ func (observer *controllerJourneyHealthObserver) Run(ctx context.Context, reques
 	observer.mu.Unlock()
 	if previous != status {
 		observer.test.Logf("Docker candidate %s %s", state.Labels["io.rig.component"], status)
+		if state.Labels["io.rig.component"] == "frontend" && !state.Running && state.ExitCode != 0 {
+			logs, logErr := observer.delegate.Run(ctx, runtimeprocess.CommandRequest{
+				Executable: request.Executable, Args: []string{"container", "logs", request.Args[len(request.Args)-1]},
+				Directory: request.Directory, Env: request.Env, Timeout: 3 * time.Second, OutputLimit: 8 << 10,
+			})
+			if logErr == nil {
+				// Only fixed error categories enter the public CI log. The raw
+				// output belongs to the application and may contain secrets.
+				combined := append(logs.Stdout, logs.Stderr...)
+				for _, marker := range []string{"ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND", "ENOENT", "EACCES", "EPERM", "SyntaxError", "ReferenceError", "TypeError", "Permission denied", "not found"} {
+					if bytes.Contains(combined, []byte(marker)) {
+						observer.test.Logf("static frontend startup category: %s", marker)
+					}
+				}
+				for _, code := range regexp.MustCompile(`\bERR_[A-Z_]{3,64}\b`).FindAll(combined, 3) {
+					observer.test.Logf("static frontend Node error code: %s", code)
+				}
+				clear(combined)
+				clear(logs.Stdout)
+				clear(logs.Stderr)
+			}
+		}
 	}
 	return result, err
 }

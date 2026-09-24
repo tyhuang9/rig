@@ -46,7 +46,11 @@ only for application-owned schema preparation. The second hosted run
 head `1e429d0`) reached real image builds and container readiness, then failed
 with `health_failed`. Its cleanup step passed. The next run records only
 component names and Docker health transitions to identify the failing
-component without exposing application output or secret values.
+component without exposing application output or secret values. That run
+([workflow 36034083663](https://github.com/tyhuang9/rig/actions/runs/36034083663),
+head `b77facb`) showed the API healthy and the static frontend exited with
+code 1 before serving. Cleanup passed. A bounded error-category probe on the
+controlled frontend's startup log is pending in the next hosted run.
 
 The QA and security reviews of the controller harness found no confirmed
 exploit. Their actionable gaps were addressed: the deployed API now probes
