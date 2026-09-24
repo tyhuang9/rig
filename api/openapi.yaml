@@ -19,6 +19,7 @@ x-rig-problem-codes:
   migration_approval_required: {description: Deployment migration requires approval before it can continue, statuses: [409]}
   route_reconciliation_required: {description: Deployment route state must be reconciled before it can be cancelled, statuses: [409]}
   application_busy: {description: The application already has an active conflicting operation, statuses: [409]}
+  reviewed_revision_stale: {description: The reviewed deployment plan or configuration changed before deployment, statuses: [409]}
   source_too_large: {description: The source exceeds the supported inspection limits, statuses: [413]}
   deployment_plan_conflict: {description: The accepted deployment plan changed while this request was being reviewed, statuses: [409]}
   deployment_plan_review_required: {description: The source structure or inferred deployment behavior changed and must be reviewed again, statuses: [409]}
@@ -161,10 +162,20 @@ paths:
         default: {$ref: '#/components/responses/Problem'}
     post:
       operationId: deployApplication
-      x-rig-problem-codes: [application_busy]
+      x-rig-problem-codes: [application_busy, reviewed_revision_stale]
       security: [{sessionCookie: [], csrfHeader: []}]
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody: {required: false, content: {application/json: {schema: {$ref: '#/components/schemas/DeployApplicationRequest'}}}}
       responses: *jobResponses
+  /api/v1/apps/{appId}/deployment-jobs/by-idempotency:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    get:
+      operationId: getDeploymentJobByIdempotency
+      security: [{sessionCookie: []}]
+      parameters: [{name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 1, maxLength: 200}}]
+      responses:
+        '200': {description: Deployment job for this application, key, and requesting actor, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/apps/{appId}/releases:
     parameters: [{$ref: '#/components/parameters/AppId'}]
     get:
@@ -548,6 +559,7 @@ components:
     DeploymentList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Deployment'}}}}
     Release: {type: object, required: [id, appId, sourceProvider, configurationRevisionNumber, deploymentPlanRevisionNumber, runtimeStrategy, createdAt], properties: {id: {type: string}, appId: {type: string, format: uuid}, sourceProvider: {type: string}, repositoryId: {type: integer, format: int64}, repositoryOwner: {type: string}, repositoryName: {type: string}, trackedRef: {type: string}, resolvedSha: {type: string}, sourceCommitSha: {type: string}, sourceBranch: {type: string}, composePath: {type: string}, archiveSha256: {type: string, pattern: '^[a-f0-9]{64}$'}, workspaceState: {type: string}, configurationRevisionId: {type: string, format: uuid}, configurationRevisionNumber: {type: integer, format: int64, minimum: 0}, deploymentPlanRevisionId: {type: string, format: uuid}, deploymentPlanRevisionNumber: {type: integer, format: int64, minimum: 0}, runtimeStrategy: {type: string, enum: [compose, generated_node]}, createdAt: {type: string, format: date-time}}}
     ReleaseList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/Release'}}}}
+    DeployApplicationRequest: {type: object, additionalProperties: false, properties: {expectedPlanRevisionId: {type: string, format: uuid}, expectedPlanRevisionNumber: {type: integer, format: int64, minimum: 1}, expectedConfigurationRevisionId: {type: string}, expectedConfigurationRevisionNumber: {type: integer, format: int64, minimum: 0}}}
     DeployReleaseRequest: {type: object, additionalProperties: false, required: [configurationMode], properties: {configurationMode: {type: string, enum: [current, original]}}}
     RuntimeApproval: {type: object, required: [id, appId, policyVersion, capability, scope, fingerprint, grantedBy, grantedAt], properties: {id: {type: string, format: uuid}, appId: {type: string, format: uuid}, policyVersion: {type: string}, capability: {type: string}, scope: {type: string}, fingerprint: {type: string, pattern: '^[a-f0-9]{64}$'}, grantedBy: {type: string, format: uuid}, grantedAt: {type: string, format: date-time}, revokedBy: {type: string, format: uuid}, revokedAt: {type: string, format: date-time}}}
     RuntimeApprovalList: {type: object, required: [items], properties: {items: {type: array, items: {$ref: '#/components/schemas/RuntimeApproval'}}}}

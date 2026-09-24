@@ -1,7 +1,10 @@
 package controller
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -69,6 +72,29 @@ func (s *Server) deployApplication(w http.ResponseWriter, r *http.Request) {
 	if !s.appExists(w, r) {
 		return
 	}
+	var request map[string]json.RawMessage
+	if r.ContentLength != 0 {
+		if err := readJSON(r, &request); err != nil || request == nil {
+			problem(w, r, http.StatusUnprocessableEntity, "invalid_deployment", "Deployment request is invalid", nil)
+			return
+		}
+	}
+	input, err := reviewedDeploymentInput(request)
+	if err != nil {
+		problem(w, r, http.StatusUnprocessableEntity, "invalid_deployment", "Deployment request is invalid", nil)
+		return
+	}
+	actorID := r.Context().Value(principalKey{}).(principal).user.ID
+	key := r.Header.Get("Idempotency-Key")
+	if key != "" && s.Jobs != nil {
+		if _, err := s.Jobs.GetDeploymentByIdempotency(r.PathValue("appId"), actorID, key); err == nil {
+			s.enqueueDeployment(w, r, input)
+			return
+		} else if !errors.Is(err, jobs.ErrJobNotFound) {
+			problem(w, r, http.StatusInternalServerError, "internal_error", "Could not verify deployment job", nil)
+			return
+		}
+	}
 	strategy, err := s.currentDeploymentStrategy(r.Context(), r.PathValue("appId"))
 	if err != nil {
 		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not verify the deployment runtime", nil)
@@ -78,7 +104,31 @@ func (s *Server) deployApplication(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, http.StatusConflict, "capability_unavailable", "Runtime actions are unavailable in this configuration", nil)
 		return
 	}
-	s.enqueueDeployment(w, r, "", jobs.ConfigurationCurrent)
+	if input.HasReviewedRevisions() && strategy != deploymentplans.StrategyGeneratedNode {
+		problem(w, r, http.StatusUnprocessableEntity, "invalid_deployment", "Reviewed revisions require a generated deployment plan", nil)
+		return
+	}
+	s.enqueueDeployment(w, r, input)
+}
+
+func reviewedDeploymentInput(request map[string]json.RawMessage) (jobs.DeploymentInput, error) {
+	input := jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent}
+	if len(request) == 0 {
+		return input, nil
+	}
+	if len(request) != 4 {
+		return jobs.DeploymentInput{}, jobs.ErrInvalidInput
+	}
+	if err := json.Unmarshal(request["expectedPlanRevisionId"], &input.ExpectedPlanRevisionID); err != nil || bytes.Equal(bytes.TrimSpace(request["expectedPlanRevisionId"]), []byte("null")) ||
+		json.Unmarshal(request["expectedPlanRevisionNumber"], &input.ExpectedPlanRevisionNumber) != nil || bytes.Equal(bytes.TrimSpace(request["expectedPlanRevisionNumber"]), []byte("null")) ||
+		json.Unmarshal(request["expectedConfigurationRevisionId"], &input.ExpectedConfigurationRevisionID) != nil || bytes.Equal(bytes.TrimSpace(request["expectedConfigurationRevisionId"]), []byte("null")) ||
+		json.Unmarshal(request["expectedConfigurationRevisionNumber"], &input.ExpectedConfigurationRevisionNumber) != nil || bytes.Equal(bytes.TrimSpace(request["expectedConfigurationRevisionNumber"]), []byte("null")) ||
+		uuid.Validate(input.ExpectedPlanRevisionID) != nil || input.ExpectedPlanRevisionNumber < 1 || input.ExpectedConfigurationRevisionNumber < 0 ||
+		(input.ExpectedConfigurationRevisionID == "") != (input.ExpectedConfigurationRevisionNumber == 0) ||
+		(input.ExpectedConfigurationRevisionID != "" && uuid.Validate(input.ExpectedConfigurationRevisionID) != nil) {
+		return jobs.DeploymentInput{}, jobs.ErrInvalidInput
+	}
+	return input, nil
 }
 
 func (s *Server) deployRelease(w http.ResponseWriter, r *http.Request) {
@@ -109,10 +159,10 @@ func (s *Server) deployRelease(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, http.StatusUnprocessableEntity, "invalid_deployment", "Deployment request is invalid", map[string]string{"configurationMode": "Must be current or original"})
 		return
 	}
-	s.enqueueDeployment(w, r, releaseID, jobs.ConfigurationMode(request.ConfigurationMode))
+	s.enqueueDeployment(w, r, jobs.DeploymentInput{ReleaseID: releaseID, ConfigurationMode: jobs.ConfigurationMode(request.ConfigurationMode)})
 }
 
-func (s *Server) enqueueDeployment(w http.ResponseWriter, r *http.Request, releaseID string, mode jobs.ConfigurationMode) {
+func (s *Server) enqueueDeployment(w http.ResponseWriter, r *http.Request, input jobs.DeploymentInput) {
 	if s.Jobs == nil {
 		problem(w, r, http.StatusServiceUnavailable, "jobs_unavailable", "Job processing is unavailable", nil)
 		return
@@ -123,14 +173,24 @@ func (s *Server) enqueueDeployment(w http.ResponseWriter, r *http.Request, relea
 		return
 	}
 	actorID := r.Context().Value(principalKey{}).(principal).user.ID
-	job, created, err := s.Jobs.CreateWithInput(jobs.CreateRequest{
+	create := jobs.CreateRequest{
 		Type:           "deploy",
 		ResourceType:   "application",
 		ResourceID:     r.PathValue("appId"),
 		IdempotencyKey: idempotencyKey,
 		RequestedBy:    actorID,
-		Input:          jobs.DeploymentInput{ReleaseID: releaseID, ConfigurationMode: mode},
-	})
+		Input:          input,
+	}
+	var job jobs.Job
+	var created bool
+	var err error
+	if input.HasReviewedRevisions() {
+		job, created, err = s.Jobs.CreateWithInputChecked(create, func(tx *sql.Tx, _ jobs.Job) error {
+			return checkReviewedHeads(tx, r.PathValue("appId"), input)
+		})
+	} else {
+		job, created, err = s.Jobs.CreateWithInput(create)
+	}
 	switch {
 	case err == nil:
 		writeJSON(w, map[bool]int{true: http.StatusAccepted, false: http.StatusOK}[created], apicontract.JobMutationResponse{Job: contractJob(job), Created: created})
@@ -138,10 +198,63 @@ func (s *Server) enqueueDeployment(w http.ResponseWriter, r *http.Request, relea
 		problem(w, r, http.StatusConflict, "idempotency_conflict", "Idempotency key conflicts with the original deployment request", nil)
 	case errors.Is(err, jobs.ErrApplicationBusy):
 		problem(w, r, http.StatusConflict, "application_busy", "Application already has an active mutation", nil)
+	case errors.Is(err, jobs.ErrReviewedRevisionStale):
+		problem(w, r, http.StatusConflict, "reviewed_revision_stale", "Reviewed plan or configuration changed; review the current revisions before deploying", nil)
 	case errors.Is(err, jobs.ErrInvalidInput):
 		problem(w, r, http.StatusUnprocessableEntity, "invalid_deployment", "Deployment request is invalid", nil)
 	default:
 		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not create deployment job", nil)
+	}
+}
+
+func checkReviewedHeads(tx *sql.Tx, appID string, input jobs.DeploymentInput) error {
+	var planID, configurationID sql.NullString
+	var planNumber, configurationNumber int64
+	var strategy, acceptance string
+	if err := tx.QueryRow(`SELECT h.revision_id,h.revision_number,r.strategy,r.acceptance_status FROM deployment_plan_heads h JOIN deployment_plan_revisions r ON r.id=h.revision_id AND r.app_id=h.app_id AND r.revision_number=h.revision_number WHERE h.app_id=?`, appID).Scan(&planID, &planNumber, &strategy, &acceptance); err != nil {
+		return jobs.ErrReviewedRevisionStale
+	}
+	if !planID.Valid || planID.String != input.ExpectedPlanRevisionID || planNumber != input.ExpectedPlanRevisionNumber || strategy != string(deploymentplans.StrategyGeneratedNode) || acceptance != "accepted" {
+		return jobs.ErrReviewedRevisionStale
+	}
+	if err := tx.QueryRow(`SELECT revision_id,revision_number FROM application_configuration_heads WHERE app_id=?`, appID).Scan(&configurationID, &configurationNumber); err != nil ||
+		configurationID.String != input.ExpectedConfigurationRevisionID || configurationNumber != input.ExpectedConfigurationRevisionNumber {
+		return jobs.ErrReviewedRevisionStale
+	}
+	if configurationNumber > 0 {
+		var reviewedPlanID sql.NullString
+		var reviewedPlanNumber int64
+		var formatVersion int
+		if err := tx.QueryRow(`SELECT bundle_version,deployment_plan_revision_id,deployment_plan_revision_number FROM application_configuration_revisions WHERE id=? AND app_id=? AND revision_number=?`, configurationID.String, appID, configurationNumber).Scan(&formatVersion, &reviewedPlanID, &reviewedPlanNumber); err != nil ||
+			formatVersion != 2 || reviewedPlanID.String != input.ExpectedPlanRevisionID || reviewedPlanNumber != input.ExpectedPlanRevisionNumber {
+			return jobs.ErrReviewedRevisionStale
+		}
+	}
+	return nil
+}
+
+func (s *Server) getDeploymentJobByIdempotency(w http.ResponseWriter, r *http.Request) {
+	if !s.appExists(w, r) {
+		return
+	}
+	if s.Jobs == nil {
+		problem(w, r, http.StatusServiceUnavailable, "jobs_unavailable", "Job processing is unavailable", nil)
+		return
+	}
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" || len(key) > 200 {
+		problem(w, r, http.StatusUnprocessableEntity, "invalid_idempotency_key", "Idempotency key is invalid", map[string]string{"Idempotency-Key": "Must be between 1 and 200 bytes"})
+		return
+	}
+	actorID := r.Context().Value(principalKey{}).(principal).user.ID
+	job, err := s.Jobs.GetDeploymentByIdempotency(r.PathValue("appId"), actorID, key)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, contractJob(job))
+	case errors.Is(err, jobs.ErrJobNotFound):
+		problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
+	default:
+		problem(w, r, http.StatusInternalServerError, "internal_error", "Could not find deployment job", nil)
 	}
 }
 

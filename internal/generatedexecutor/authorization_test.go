@@ -55,6 +55,10 @@ type authorizationFixturePlans struct {
 	plan deploymentplans.DeploymentPlanRevision
 }
 
+func (p authorizationFixturePlans) Get(context.Context, string) (deploymentplans.DeploymentPlanRevision, error) {
+	return p.plan, nil
+}
+
 func (p authorizationFixturePlans) GetRevision(context.Context, string, string, int64) (deploymentplans.DeploymentPlanRevision, error) {
 	return p.plan, nil
 }
