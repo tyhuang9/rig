@@ -4,7 +4,9 @@ package generatedimage
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -657,6 +659,10 @@ func hostingLiveImageHasNoSecrets(t *testing.T, ctx context.Context, docker, con
 		t.Fatal("open saved generated API image")
 	}
 	defer archiveFile.Close()
+	layerPaths := hostingLiveImageLayerPaths(t, archiveFile)
+	if _, err := archiveFile.Seek(0, io.SeekStart); err != nil {
+		t.Fatal("rewind saved generated API image")
+	}
 	layers := 0
 	archive := tar.NewReader(archiveFile)
 	for {
@@ -667,21 +673,86 @@ func hostingLiveImageHasNoSecrets(t *testing.T, ctx context.Context, docker, con
 		if err != nil {
 			t.Fatal("read saved generated API image archive")
 		}
-		if header.Name != "layer.tar" && !strings.HasSuffix(header.Name, "/layer.tar") {
+		if _, selected := layerPaths[header.Name]; !selected {
 			continue
 		}
 		layers++
-		found, err := hostingLiveContainsSecret(archive, forbidden)
+		found, err := hostingLiveInspectLayer(archive, forbidden)
 		if err != nil {
-			t.Fatal("read generated API image layer")
+			t.Fatal("generated API image layer was not inspectable")
 		}
 		if found {
 			t.Fatal("scoped runtime secret appeared in a generated API image layer")
 		}
 	}
-	if layers == 0 {
-		t.Fatal("saved generated API image contained no inspectable layers")
+	if layers != len(layerPaths) {
+		t.Fatal("saved generated API image omitted a referenced layer")
 	}
+}
+
+func hostingLiveImageLayerPaths(t *testing.T, image *os.File) map[string]struct{} {
+	t.Helper()
+	archive := tar.NewReader(image)
+	for {
+		header, err := archive.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal("read generated API image manifest archive")
+		}
+		if header.Name != "manifest.json" {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(archive, (1<<20)+1))
+		if err != nil || len(body) > 1<<20 {
+			t.Fatal("read bounded generated API image manifest")
+		}
+		var manifests []struct{ Layers []string }
+		err = json.Unmarshal(body, &manifests)
+		clear(body)
+		if err != nil || len(manifests) == 0 {
+			t.Fatal("decode generated API image manifest")
+		}
+		paths := make(map[string]struct{})
+		for _, manifest := range manifests {
+			for _, layer := range manifest.Layers {
+				if layer == "" {
+					t.Fatal("generated API image manifest has an empty layer path")
+				}
+				paths[layer] = struct{}{}
+			}
+		}
+		if len(paths) == 0 {
+			t.Fatal("generated API image manifest has no layers")
+		}
+		return paths
+	}
+	t.Fatal("saved generated API image has no Docker manifest")
+	return nil
+}
+
+func hostingLiveInspectLayer(layer io.Reader, forbidden []string) (bool, error) {
+	input := bufio.NewReader(layer)
+	magic, err := input.Peek(2)
+	if err != nil {
+		return false, err
+	}
+	var payload io.Reader = input
+	if bytes.Equal(magic, []byte{0x1f, 0x8b}) {
+		compressed, err := gzip.NewReader(input)
+		if err != nil {
+			return false, err
+		}
+		defer compressed.Close()
+		payload = compressed
+	}
+	plain := bufio.NewReader(payload)
+	header, err := plain.Peek(512)
+	if err != nil || !bytes.Equal(header[257:262], []byte("ustar")) {
+		return false, errors.New("image layer is not a tar archive")
+	}
+	return hostingLiveContainsSecret(plain, forbidden)
 }
 
 func hostingLiveContainsSecret(reader io.Reader, forbidden []string) (bool, error) {
@@ -724,6 +795,63 @@ func TestHostingLiveContainsSecretAcrossReadBoundary(t *testing.T) {
 	found, err = hostingLiveContainsSecret(strings.NewReader(prefix+"safe-tail"), []string{secret})
 	if err != nil || found {
 		t.Fatal("layer scanner misclassified safe layer bytes")
+	}
+}
+
+func TestHostingLiveInspectManifestReferencedLayer(t *testing.T) {
+	secret := "synthetic-layer-secret"
+	var layer bytes.Buffer
+	inner := tar.NewWriter(&layer)
+	if err := inner.WriteHeader(&tar.Header{Name: "fixture.txt", Mode: 0o600, Size: int64(len(secret))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inner.Write([]byte(secret)); err != nil {
+		t.Fatal(err)
+	}
+	if err := inner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var compressed bytes.Buffer
+	zip := gzip.NewWriter(&compressed)
+	if _, err := zip.Write(layer.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := zip.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range [][]byte{layer.Bytes(), compressed.Bytes()} {
+		found, err := hostingLiveInspectLayer(bytes.NewReader(data), []string{secret})
+		if err != nil || !found {
+			t.Fatal("failed to inspect a manifest-referenced tar layer")
+		}
+	}
+	image, err := os.Create(filepath.Join(t.TempDir(), "image.tar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer image.Close()
+	outer := tar.NewWriter(image)
+	manifest := []byte(`[{"Layers":["blobs/sha256/synthetic"]}]`)
+	if err := outer.WriteHeader(&tar.Header{Name: "manifest.json", Mode: 0o600, Size: int64(len(manifest))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outer.Write(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := outer.WriteHeader(&tar.Header{Name: "blobs/sha256/synthetic", Mode: 0o600, Size: int64(layer.Len())}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outer.Write(layer.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := outer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := image.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if paths := hostingLiveImageLayerPaths(t, image); len(paths) != 1 {
+		t.Fatal("image manifest did not select the OCI-style blob path")
 	}
 }
 

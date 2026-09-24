@@ -6,10 +6,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -137,7 +141,7 @@ func TestLiveHostingNotesFixtureImages(t *testing.T) {
 			}
 			command := `test -z "${DATABASE_URL+x}" && test -z "${TEST_SENTINEL_SECRET+x}"`
 			if fixture.component == "frontend" {
-				command += ` && test -f /workspace/frontend/dist/index.html && grep -R -F -q ` + fixture.publicLabel + ` /workspace/frontend/dist/assets && ! grep -R -F -q ` + fixture.absentLabel + ` /workspace/frontend/dist/assets`
+				command += ` && test -f /workspace/frontend/dist/index.html && grep -R -F -q ` + fixture.publicLabel + ` /workspace/frontend/dist/assets && ! grep -R -F -q ` + fixture.absentLabel + ` /workspace/frontend/dist/assets && ! grep -R -E -q 'TEST_SENTINEL_SECRET|NOTES_FIXTURE_DB_URL' /workspace/frontend/dist`
 				if firstFrontendImage == "" {
 					firstFrontendImage = imageID
 				} else if firstFrontendImage == imageID {
@@ -150,6 +154,67 @@ func TestLiveHostingNotesFixtureImages(t *testing.T) {
 			if output, err := check.CombinedOutput(); err != nil {
 				t.Fatalf("fixture %s image content check failed: %v %s", fixture.name, err, output)
 			}
+			if fixture.component == "frontend" {
+				hostingLiveAssertFrontendHTTP(t, ctx, docker, imageID, fixture.publicLabel, fixture.absentLabel)
+			}
 		})
+	}
+}
+
+func hostingLiveAssertFrontendHTTP(t *testing.T, ctx context.Context, docker, imageID, publicLabel, absentLabel string) {
+	t.Helper()
+	name := "rig-fixture-static-" + uuid.NewString()
+	port := hostingLiveFreePort(t, "127.0.0.1")
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = exec.CommandContext(cleanupCtx, docker, "container", "rm", "--force", name).Run()
+		if exec.CommandContext(cleanupCtx, docker, "container", "inspect", name).Run() == nil {
+			t.Error("static frontend test container remains after cleanup")
+		}
+	})
+	start := exec.CommandContext(ctx, docker, "container", "run", "--detach", "--rm",
+		"--name", name, "--label", "io.rig.managed=generated-fixture-static",
+		"--publish", "127.0.0.1:"+strconv.Itoa(port)+":8080",
+		"--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+		"--workdir", "/workspace/frontend", "--entrypoint", "/usr/local/bin/rig-static",
+		imageID, "--root", "dist", "--port", "8080")
+	if _, err := start.CombinedOutput(); err != nil {
+		t.Fatal("start isolated static frontend image")
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	base := "http://127.0.0.1:" + strconv.Itoa(port)
+	deadline := time.Now().Add(12 * time.Second)
+	var index []byte
+	for {
+		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/", nil)
+		response, err := client.Do(request)
+		if err == nil {
+			index, err = io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
+			response.Body.Close()
+			if err == nil && response.StatusCode == http.StatusOK && len(index) <= 1<<20 {
+				break
+			}
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			t.Fatal("static frontend did not serve its index document")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	asset := regexp.MustCompile(`src="(/assets/[^"]+\.js)"`).FindSubmatch(index)
+	if len(asset) != 2 {
+		t.Fatal("static frontend index has no JavaScript asset")
+	}
+	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+string(asset[1]), nil)
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal("fetch frontend JavaScript through the static server")
+	}
+	defer response.Body.Close()
+	script, err := io.ReadAll(io.LimitReader(response.Body, (4<<20)+1))
+	if err != nil || response.StatusCode != http.StatusOK || len(script) > 4<<20 || !bytes.Contains(script, []byte(publicLabel)) || bytes.Contains(script, []byte(absentLabel)) ||
+		bytes.Contains(index, []byte("TEST_SENTINEL_SECRET")) || bytes.Contains(script, []byte("TEST_SENTINEL_SECRET")) ||
+		bytes.Contains(index, []byte("NOTES_FIXTURE_DB_URL")) || bytes.Contains(script, []byte("NOTES_FIXTURE_DB_URL")) {
+		t.Fatal("served frontend assets did not preserve the selected public label and exclude server secret keys")
 	}
 }
