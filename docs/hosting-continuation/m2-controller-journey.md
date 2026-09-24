@@ -44,7 +44,16 @@ targets the unmerged M1 branch. Neither PR has been merged.
 - The next gate extension installs a valid unrelated CA as a new scoped secret,
   attempts replacement, and requires a `health_failed` job and immutable
   failed deployment record while the previous healthy marker and note remain
-  available through Caddy and Chromium. Its hosted result is pending.
+  available through Caddy and Chromium. Hosted
+  [run 36039760965](https://github.com/tyhuang9/rig/actions/runs/36039760965)
+  passed on head `04e4b65b98f41416a53bbe5941979f0f799fa63d`. The live test
+  `TestLiveControllerGeneratedDeploymentJourney` passed in 173.55 seconds;
+  the workflow's exact Docker cleanup step also passed. The record includes
+  plan, configuration, job, deployment, and release IDs for the initial,
+  healthy replacement, and failed replacement attempts without credentials.
+  The runner was Ubuntu 24.04 with Docker CLI/Engine 28.0.4, API 1.48,
+  Compose 2.38.2, and Buildx 0.37.1. This is hosted Linux evidence, not
+  Windows Docker Desktop or physical LAN evidence.
 
 ## Verification so far
 
@@ -95,7 +104,9 @@ head `0a5a6e8`) found the exact mismatch: both `static.mjs` and its newly
 created parent `/usr/local/lib/rig` had mode `0444` and root ownership.
 The non-root runtime could read the file but could not traverse its parent.
 The generated image recipe now explicitly sets the parent directory to
-`0555` after copying the file. The post-fix hosted gate is pending.
+`0555` after copying the file. The first post-fix hosted gate,
+[run 36037028248](https://github.com/tyhuang9/rig/actions/runs/36037028248),
+passed on head `49be8ea`; later hosted gates above passed on their exact heads.
 
 The QA and security reviews of the controller harness found no confirmed
 exploit. Their actionable gaps were addressed: the deployed API now probes
@@ -119,13 +130,11 @@ prove whether the original request reached the controller.
 
 ## Open M2 acceptance work
 
-- Complete the hosted controller journey gate on the corrected branch head.
-- Verify the new unhealthy replacement on the final head, including preservation
-  of the old serving version.
+- Keep the hosted controller journey gate green on the final M2 head; the
+  current passed head is `04e4b65b98f41416a53bbe5941979f0f799fa63d`.
 - Add controlled GitHub archive/connection materialization to the continuous
   harness and perform a separate live GitHub authorization walkthrough.
-- Prove unhealthy replacement retains the old serving version, and cover the
-  supported Node, Vite, Next.js, and package-manager recipe matrix.
+- Cover the supported Node, Vite, Next.js, and package-manager recipe matrix.
 - Verify manual setup, backend interface binding, capacity pause, migration
   failure, private-network isolation, and interrupted controller recovery.
 - Expose an attested route URL and a revision-pinned deployment precondition
