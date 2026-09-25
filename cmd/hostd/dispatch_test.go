@@ -17,6 +17,7 @@ func TestClassifyHostdInvocation(t *testing.T) {
 		{name: "no arguments opens ui", wantMode: hostdModeUI},
 		{name: "explicit ui", args: []string{"ui", "--endpoint", "http://127.0.0.1:8000"}, wantMode: hostdModeUI, wantArgs: []string{"--endpoint", "http://127.0.0.1:8000"}},
 		{name: "explicit server", args: []string{"serve", "--fake-runtime"}, wantMode: hostdModeServe, wantArgs: []string{"--fake-runtime"}},
+		{name: "bootstrap token", args: []string{"bootstrap-token"}, wantMode: hostdModeBootstrapToken},
 		{name: "legacy server flags", args: []string{"--data-root", ".hostd-dev", "--fake-runtime"}, wantMode: hostdModeServe, wantArgs: []string{"--data-root", ".hostd-dev", "--fake-runtime"}, wantLegacy: true},
 		{name: "unknown command", args: []string{"deploy"}, wantError: true},
 	}
