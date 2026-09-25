@@ -39,15 +39,17 @@ data_root="$PWD/.hostd-dev"
 go run ./cmd/hostd serve --data-root "$data_root" --fake-runtime
 ```
 
-Open `http://127.0.0.1:7345`. The controller prints the path to a protected bootstrap file, not the token itself. Read the token explicitly and paste it into the dashboard:
+Open `http://127.0.0.1:7345`. In another terminal, reveal the first-run token and paste it into the dashboard:
 
 ```powershell
-go run ./cmd/hostctl bootstrap-token --file (Join-Path $dataRoot "bootstrap-token.secret")
+go run ./cmd/hostd bootstrap-token
 ```
 
 ```sh
-go run ./cmd/hostctl bootstrap-token --file "$data_root/bootstrap-token.secret"
+go run ./cmd/hostd bootstrap-token
 ```
+
+Once `hostd` is installed on your command path, the command is simply `hostd bootstrap-token` from any directory. `go install ./cmd/hostd` builds the binary into your Go binary directory; add that directory to your command path if needed. The command locates one active first-run controller, including one using a custom data root. If several controllers are awaiting setup, it refuses to choose one; the existing `hostctl bootstrap-token --file <protected-file>` command remains available for that case. The token expires after 15 minutes. Restart the controller to issue a fresh one.
 
 The fake runtime requires an isolated development data root and cannot execute the application. Follow the [Docker Compose runtime guide](docs/compose-runtime.md) before enabling real execution.
 

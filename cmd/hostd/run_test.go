@@ -74,3 +74,39 @@ func TestRemovedHistoryFlagIsRejected(t *testing.T) {
 		t.Fatalf("history flag error=%v", err)
 	}
 }
+
+func TestRunHostdBootstrapTokenNeedsNoTerminalOrArguments(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	called := false
+	code := runHostd([]string{"bootstrap-token"}, hostdRunners{
+		interactive:        func() bool { return false },
+		runUI:              func(tuiLaunchOptions) error { t.Fatal("UI opened"); return nil },
+		runServer:          func([]string) int { t.Fatal("server started"); return 0 },
+		readBootstrapToken: func() ([]byte, error) { called = true; return []byte("one-time-token"), nil },
+		stdout:             &stdout, stderr: &stderr,
+	})
+	if code != 0 || !called || stdout.String() != "one-time-token\n" || stderr.Len() != 0 {
+		t.Fatalf("code=%d called=%v stdout=%q stderr=%q", code, called, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	code = runHostd([]string{"bootstrap-token", "unexpected"}, hostdRunners{
+		interactive: func() bool { return false }, runUI: func(tuiLaunchOptions) error { return nil }, runServer: func([]string) int { return 0 },
+		readBootstrapToken: func() ([]byte, error) { t.Fatal("token read with invalid arguments"); return nil, nil },
+		stdout:             &stdout, stderr: &stderr,
+	})
+	if code != 2 || stdout.Len() != 0 {
+		t.Fatalf("invalid arguments: code=%d stdout=%q", code, stdout.String())
+	}
+}
+
+func TestRunHostdBootstrapTokenFailureHasNoSecretOutput(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runHostd([]string{"bootstrap-token"}, hostdRunners{
+		interactive: func() bool { return false }, runUI: func(tuiLaunchOptions) error { return nil }, runServer: func([]string) int { return 0 },
+		readBootstrapToken: func() ([]byte, error) { return nil, errors.New("no active bootstrap token") },
+		stdout:             &stdout, stderr: &stderr,
+	})
+	if code != 1 || stdout.Len() != 0 || !bytes.Contains(stderr.Bytes(), []byte("no active bootstrap token")) {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}

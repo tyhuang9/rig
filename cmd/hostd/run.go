@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/hostd/hostd/internal/bootstraplocator"
 	"github.com/hostd/hostd/internal/controllerclient"
 	"github.com/hostd/hostd/internal/tui"
 )
@@ -18,15 +19,16 @@ type tuiLaunchOptions struct {
 	accessible            bool
 }
 type hostdRunners struct {
-	interactive func() bool
-	runUI       func(tuiLaunchOptions) error
-	runServer   func([]string) int
-	stdout      io.Writer
-	stderr      io.Writer
+	interactive        func() bool
+	runUI              func(tuiLaunchOptions) error
+	runServer          func([]string) int
+	readBootstrapToken func() ([]byte, error)
+	stdout             io.Writer
+	stderr             io.Writer
 }
 
 func main() {
-	os.Exit(runHostd(os.Args[1:], hostdRunners{interactive: interactiveTerminal, runUI: runTUI, runServer: runServer, stdout: os.Stdout, stderr: os.Stderr}))
+	os.Exit(runHostd(os.Args[1:], hostdRunners{interactive: interactiveTerminal, runUI: runTUI, runServer: runServer, readBootstrapToken: bootstraplocator.DefaultStore().ReadToken, stdout: os.Stdout, stderr: os.Stderr}))
 }
 
 func runHostd(args []string, runners hostdRunners) int {
@@ -44,6 +46,27 @@ func runHostd(args []string, runners hostdRunners) int {
 			fmt.Fprintln(runners.stderr, "warning: invoking hostd with daemon flags is deprecated; use hostd serve ...")
 		}
 		return runners.runServer(invocation.args)
+	}
+	if invocation.mode == hostdModeBootstrapToken {
+		if len(invocation.args) != 0 {
+			fmt.Fprintln(runners.stderr, "hostd bootstrap-token does not accept arguments")
+			return 2
+		}
+		if runners.readBootstrapToken == nil {
+			fmt.Fprintln(runners.stderr, "hostd bootstrap-token is not configured")
+			return 1
+		}
+		token, err := runners.readBootstrapToken()
+		if err != nil {
+			fmt.Fprintln(runners.stderr, err)
+			return 1
+		}
+		defer clear(token)
+		if _, err := fmt.Fprintln(runners.stdout, string(token)); err != nil {
+			fmt.Fprintln(runners.stderr, "write bootstrap token:", err)
+			return 1
+		}
+		return 0
 	}
 	options, help, err := parseTUIOptions(invocation.args)
 	if err != nil {
