@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -801,8 +802,13 @@ func liveApplicationProbeDiagnostic(result liveApplicationProbeResult) string {
 
 func newLiveExternalTLSFixture(t *testing.T) liveExternalTLSFixture {
 	t.Helper()
+	return newLiveExternalTLSFixtureAt(t, "0.0.0.0:0")
+}
+
+func newLiveExternalTLSFixtureAt(t *testing.T, address string) liveExternalTLSFixture {
+	t.Helper()
 	certificate, ca := newLiveExternalTLSCertificate(t)
-	listener, err := tls.Listen("tcp4", "0.0.0.0:0", &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12})
+	listener, err := tls.Listen("tcp4", address, &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12})
 	if err != nil {
 		t.Fatal("start external TLS fixture")
 	}
@@ -841,7 +847,7 @@ func newLiveExternalTLSCertificate(t *testing.T) (tls.Certificate, []byte) {
 		t.Fatal("generate external TLS fixture CA")
 	}
 	now := time.Now()
-	caTemplate := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature}
+	caTemplate := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "Rig live external fixture CA"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature}
 	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, caPublic, caPrivate)
 	if err != nil {
 		t.Fatal("sign external TLS fixture CA")
@@ -850,7 +856,7 @@ func newLiveExternalTLSCertificate(t *testing.T) (tls.Certificate, []byte) {
 	if err != nil {
 		t.Fatal("generate external TLS fixture leaf")
 	}
-	leafTemplate := &x509.Certificate{SerialNumber: big.NewInt(2), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour), DNSNames: []string{liveExternalTLSName}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	leafTemplate := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: liveExternalTLSName}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour), DNSNames: []string{liveExternalTLSName}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
 	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caTemplate, leafPublic, caPrivate)
 	if err != nil {
 		t.Fatal("sign external TLS fixture leaf")
@@ -864,6 +870,46 @@ func newLiveExternalTLSCertificate(t *testing.T) (tls.Certificate, []byte) {
 		t.Fatal("load external TLS fixture certificate")
 	}
 	return certificate, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+}
+
+func TestLiveExternalTLSCertificateTrust(t *testing.T) {
+	certificate, caPEM := newLiveExternalTLSCertificate(t)
+	caBlock, rest := pem.Decode(caPEM)
+	if caBlock == nil || len(rest) != 0 || caBlock.Type != "CERTIFICATE" {
+		t.Fatal("external TLS fixture CA was not a single certificate")
+	}
+	ca, err := x509.ParseCertificate(caBlock.Bytes)
+	if err != nil || len(certificate.Certificate) != 1 {
+		t.Fatal("external TLS fixture certificate chain was invalid")
+	}
+	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
+	if err != nil || leaf.Subject.String() == ca.Subject.String() {
+		t.Fatal("external TLS fixture leaf was not distinct from its CA")
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, DNSName: liveExternalTLSName, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+		t.Fatal("external TLS fixture leaf failed CA and peer-name verification")
+	}
+}
+
+func TestLiveExternalTLSNodeTrust(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node is unavailable for the optional host-side TLS probe control")
+	}
+	fixture := newLiveExternalTLSFixtureAt(t, "127.0.0.1:0")
+	defer fixture.Close(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, node, "-e", liveApplicationHTTPSProbeCommand, "127.0.0.1", fmt.Sprintf("%d", fixture.port), "", fixture.ca).Output()
+	if err != nil || ctx.Err() != nil {
+		t.Fatal("host-side Node TLS probe did not complete")
+	}
+	result, valid := decodeLiveApplicationProbeResult(output)
+	if !valid || liveApplicationProbeClassification(result) != liveApplicationProbeReachable || result.Status != http.StatusNoContent {
+		t.Fatal("host-side Node TLS probe did not trust the fixture CA and peer name")
+	}
 }
 
 type liveHTTPTransport string

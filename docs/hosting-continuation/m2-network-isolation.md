@@ -123,7 +123,9 @@ also extracted and executed the exact checked-in Node probe/control constants
 locally against controlled loopback HTTP listeners; both stalled-header
 controls passed. The updated control additionally passed a never-connected
 socket and required a bounded `ETIMEDOUT` result. This verifies probe behavior;
-Docker network isolation remains unaccepted.
+Docker network isolation remains unaccepted. After the hosted TLS failure, the
+focused native X.509 chain/peer-name check and the exact Node HTTPS probe against
+the controlled fixture both passed with verification enabled.
 
 The complete local delivery checks also passed on the stable source:
 
@@ -163,7 +165,8 @@ The independent security specialist found no actionable source issue after
 these corrections. The `code-review` skill's local CodeRabbit CLI attempt
 stopped at `not_authenticated`; no automated CodeRabbit review or login ran.
 The skill prohibits a manual CodeRabbit fallback. That local automated review
-is unrun; the existing hosted CodeRabbit review remains a pending draft gate.
+is unrun. CodeRabbit's hosted status reported success because it skipped this
+draft PR; its bot comment confirms no source review occurred.
 No production-readiness or merge approval follows from this local record.
 
 ## First hosted result and remaining work
@@ -183,7 +186,15 @@ and complete Docker cleanup steps passed. That result is distinct from an
 execution timeout and remains unaccepted. The next revision adds bounded,
 sanitized classification of an invalid result and its static probe stage so
 the actual cause can be identified without exposing response bodies or
-credentials. It does not broaden the accepted transport outcomes.
+credentials. It does not broaden the accepted transport outcomes. At revision
+`dad04b920f62e17daa29fd3592bdbb93547a996f`, the third hosted Docker run
+identified the first application's external HTTPS probe and Node's
+`DEPTH_ZERO_SELF_SIGNED_CERT` transport code; external fixture and complete
+Docker cleanup steps again passed. The controlled CA and leaf had both been
+created with empty distinguished names. The candidate correction gives them
+distinct subjects while keeping the fixture CA, SNI peer name and certificate
+verification required. Native Go and exact Node probe controls passed locally;
+the hosted application-origin result is pending.
 
 Successful Docker and Linux race qualification require hosted CI here.
 Windows has CGO disabled, so local race execution is unavailable and was not
