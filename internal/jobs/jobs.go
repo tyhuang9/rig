@@ -1325,6 +1325,8 @@ func safeExecutionFailure(err error) (string, string) {
 			return "compose_apply_output_truncated", "Container runtime apply output exceeded the allowed limit"
 		case "health_failed":
 			return "health_failed", "Deployment did not become healthy"
+		case "gateway_readiness_failed":
+			return "gateway_readiness_failed", "Deployment is not reachable from the gateway"
 		case "internal_error":
 			return "internal_error", "Deployment failed because of an internal error"
 		}

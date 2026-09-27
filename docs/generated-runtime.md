@@ -99,9 +99,12 @@ Each component has stable blue and green slots. A deployment:
 3. runs an approved migration once, when present;
 4. starts the inactive slots;
 5. waits for Docker health checks;
-6. atomically reloads the controller-managed Caddy route;
-7. drains existing connections for 30 seconds; and
-8. stops and removes the previous slots.
+6. checks that Caddy can reach every inactive component over the application's network;
+7. atomically reloads the controller-managed Caddy route;
+8. drains existing connections for 30 seconds; and
+9. stops and removes the previous slots.
+
+Configure server applications to listen on `0.0.0.0` at their configured internal port. A server listening only on container loopback can pass its Docker health check while remaining unreachable from Caddy. Rig checks transport reachability separately with an HTTP HEAD request from the gateway before switching traffic. The server must return an HTTP response for `/` within the two-second probe limit; a root-path `404` or `405` still proves reachability. Application health remains the configured health probe. A failed check records `gateway_readiness_failed` and preserves the previous serving deployment. Active-route observations also require reachability before returning a verified URL.
 
 Neither slot publishes a host port. Caddy joins each application network separately and does not create a shared lateral-access network. If build, migration, startup, health, or route validation fails, the old slots remain active. If temporary capacity cannot be reserved, the job pauses with `insufficient_replacement_capacity`; Rig never silently chooses a downtime-producing stop/start replacement.
 

@@ -149,6 +149,21 @@ jobs:
           go test -json -v -count=1 -timeout=9m ./internal/generatedimage -run "^${test_name}$" | tee "$output"
           jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
 
+      - name: Reject a healthy container that the gateway cannot reach
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        shell: bash
+        env:
+          RIG_RUN_LIVE_GENERATED_RUNTIME: "1"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          test_name='TestLiveGeneratedGatewayReadiness'
+          package_name='github.com/hostd/hostd/internal/generatedingress'
+          go test -json -v -count=1 -timeout=19m ./internal/generatedingress -run "^${test_name}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
+
       - name: Exercise generated blue-green replacement
         if: ${{ !cancelled() }}
         timeout-minutes: 20
