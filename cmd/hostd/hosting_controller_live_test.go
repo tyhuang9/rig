@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,7 @@ import (
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
@@ -635,10 +637,21 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	capacityPressure := &controllerJourneyCapacitySource{}
+	restartedObserver := &controllerJourneyHealthObserver{
+		delegate: runtimeprocess.ExecRunner{}, test: t, last: make(map[string]string),
+	}
 	restartedComposition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: reopenedDB, applications: restartedApps, snapshots: restartedSnapshots, configuration: restartedConfiguration,
 		deployments: restartedDeployments, plans: restartedPlans,
-	}, runtimeCompositionOptions{dockerExecutable: docker})
+	}, runtimeCompositionOptions{
+		dockerExecutable: docker,
+		runner:           restartedObserver,
+		capacitySourceFactory: func(source generatedruntime.CapacitySource) generatedruntime.CapacitySource {
+			capacityPressure.SetDelegate(source)
+			return capacityPressure
+		},
+	})
 	if err != nil {
 		t.Fatal("recover generated runtime after controller restart:", err)
 	}
@@ -677,6 +690,15 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	retainedRouteURL := assertAttestedRoute(retainedHistory.Items[0])
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedRouteURL, "read", browserNote)
+	activeBeforeCapacity, err := restartedComposition.state.Active(ctx, application.ID)
+	if err != nil || activeBeforeCapacity.DeploymentID != retainedHistory.Items[0].ID || activeBeforeCapacity.ReleaseID != retainedHistory.Items[0].ReleaseID {
+		t.Fatal("restarted controller has no active immutable serving head")
+	}
+	servingContainerIDs := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=io.rig.application="+application.ID)
+	builderContainerIDs := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=rig.controller=generated-builder")
+	builderNetworkIDs := controllerJourneyDockerIDSet(t, ctx, docker, "network", "ls", "-q", "--filter", "label=rig.controller=generated-builder")
+	buildCallsBeforeCapacity := restartedObserver.BuildCalls()
+	archiveReadsBeforeCapacity := provider.archiveReads.Load()
 	publicEntries := make([]apicontract.ScopedConfigurationValueInput, 0, len(entries))
 	for _, entry := range entries {
 		if entry.Sensitive {
@@ -696,6 +718,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		bytes.Contains(replacementResponse, []byte(dbURL)) || bytes.Contains(replacementResponse, []byte(sentinel)) {
 		t.Fatal("configuration-only replacement did not create a protected revision")
 	}
+	capacityPressure.SetArmed(true)
 	var replacementMutation apicontract.JobMutationResponse
 	request(http.MethodPost, deploymentPath, apicontract.DeployApplicationRequest{
 		ExpectedPlanRevisionID: plan.RevisionID, ExpectedPlanRevisionNumber: plan.RevisionNumber,
@@ -703,6 +726,80 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	}, http.StatusAccepted, &replacementMutation, map[string]string{"Idempotency-Key": uuid.NewString()})
 	if !replacementMutation.Created || replacementMutation.Job.ID == completed.ID {
 		t.Fatal("controller did not enqueue a distinct replacement job")
+	}
+	pauseDeadline := time.Now().Add(4 * time.Minute)
+	var pausedReplacement jobs.Job
+	for {
+		pausedReplacement, err = restartedJobs.Get(replacementMutation.Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pausedReplacement.Status == string(jobs.WaitingUser) && pausedReplacement.PauseDisposition == jobs.PauseInsufficientReplacementCapacity {
+			break
+		}
+		if pausedReplacement.Status == string(jobs.Failed) || pausedReplacement.Status == string(jobs.Succeeded) || pausedReplacement.Status == string(jobs.NeedsAttention) || time.Now().After(pauseDeadline) || ctx.Err() != nil {
+			t.Fatalf("replacement did not pause for capacity: status=%s phase=%s code=%s disposition=%s", pausedReplacement.Status, pausedReplacement.Phase, pausedReplacement.ErrorCode, pausedReplacement.PauseDisposition)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if pausedReplacement.ID != replacementMutation.Job.ID || pausedReplacement.Attempt != 1 || pausedReplacement.Phase != jobs.PauseInsufficientReplacementCapacity || pausedReplacement.ErrorCode != "" {
+		t.Fatal("capacity pause did not preserve the original durable job")
+	}
+	var pausedHistory apicontract.DeploymentList
+	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/deployments", nil, http.StatusOK, &pausedHistory)
+	if len(pausedHistory.Items) != 2 {
+		t.Fatal("capacity pause did not retain one accepted replacement deployment")
+	}
+	var pausedDeployment apicontract.Deployment
+	for _, item := range pausedHistory.Items {
+		if item.JobID == pausedReplacement.ID {
+			pausedDeployment = item
+		}
+	}
+	if pausedDeployment.ID == "" || pausedDeployment.Status != "preparing" || pausedDeployment.ReleaseID == "" ||
+		pausedDeployment.RuntimeStrategy != string(deploymentplans.StrategyGeneratedNode) ||
+		pausedDeployment.DeploymentPlanRevisionID != plan.RevisionID || pausedDeployment.DeploymentPlanRevisionNumber != plan.RevisionNumber ||
+		pausedDeployment.ActualConfigurationRevisionID != replacementConfiguration.RevisionID || pausedDeployment.ActualConfigurationRevisionNumber != replacementConfiguration.RevisionNumber {
+		t.Fatal("capacity pause did not retain accepted immutable deployment pins")
+	}
+	if provider.archiveReads.Load() != archiveReadsBeforeCapacity+1 {
+		t.Fatal("capacity pause did not materialize exactly one accepted replacement release")
+	}
+	pausedRuntime, err := restartedComposition.state.Get(ctx, application.ID, pausedDeployment.ID)
+	if err != nil || pausedRuntime.Phase != generatedruntimestate.PhaseBuilding || pausedRuntime.ReleaseID != pausedDeployment.ReleaseID ||
+		pausedRuntime.DeploymentPlanRevisionID != pausedDeployment.DeploymentPlanRevisionID || pausedRuntime.DeploymentPlanRevisionNumber != pausedDeployment.DeploymentPlanRevisionNumber {
+		t.Fatal("capacity pause durable runtime state is not pinned before candidate work")
+	}
+	for _, component := range pausedRuntime.Components {
+		if component.State != generatedruntimestate.ComponentPending || component.ContainerID != "" {
+			t.Fatal("capacity pause created a candidate component")
+		}
+	}
+	if restartedObserver.BuildCalls() != buildCallsBeforeCapacity ||
+		controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=io.rig.application="+application.ID) != servingContainerIDs ||
+		controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=rig.controller=generated-builder") != builderContainerIDs ||
+		controllerJourneyDockerIDSet(t, ctx, docker, "network", "ls", "-q", "--filter", "label=rig.controller=generated-builder") != builderNetworkIDs {
+		t.Fatal("capacity pause performed a build or changed Docker resource identities")
+	}
+	activeAfterCapacity, err := restartedComposition.state.Active(ctx, application.ID)
+	if err != nil || activeAfterCapacity.DeploymentID != activeBeforeCapacity.DeploymentID || activeAfterCapacity.ReleaseID != activeBeforeCapacity.ReleaseID ||
+		activeAfterCapacity.Slot != activeBeforeCapacity.Slot || activeAfterCapacity.Generation != activeBeforeCapacity.Generation {
+		t.Fatal("capacity pause changed the active serving head")
+	}
+	pausedRouteURL := assertAttestedRoute(retainedHistory.Items[0])
+	if pausedRouteURL != retainedRouteURL {
+		t.Fatal("capacity pause changed the attested serving route")
+	}
+	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
+	controllerJourneyBrowser(t, ctx, node, application.ID, retainedRouteURL, "read", browserNote)
+	capacityPressure.SetArmed(false)
+	var resumedResponse apicontract.JobResponse
+	request(http.MethodPost, "/api/v1/jobs/"+pausedReplacement.ID+"/resume", nil, http.StatusOK, &resumedResponse)
+	resumedInProgress := resumedResponse.Job.Status == string(jobs.Queued) || resumedResponse.Job.Status == string(jobs.Assigned) ||
+		resumedResponse.Job.Status == string(jobs.Running) || resumedResponse.Job.Status == string(jobs.Waiting) || resumedResponse.Job.Status == string(jobs.Succeeded)
+	if resumedResponse.Job.ID != pausedReplacement.ID || !resumedInProgress || resumedResponse.Job.PauseDisposition != "" || resumedResponse.Job.ErrorCode != "" ||
+		(resumedResponse.Job.Attempt != pausedReplacement.Attempt && resumedResponse.Job.Attempt != pausedReplacement.Attempt+1) {
+		t.Fatal("authenticated capacity resume did not preserve the original job")
 	}
 	replacementDeadline := time.Now().Add(8 * time.Minute)
 	var replacementJob jobs.Job
@@ -719,6 +816,12 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+	if replacementJob.ID != pausedReplacement.ID || replacementJob.Attempt != pausedReplacement.Attempt+1 {
+		t.Fatal("capacity resume did not complete the original job on its next attempt")
+	}
+	if restartedObserver.BuildCalls() != buildCallsBeforeCapacity+len(plan.Components) || provider.archiveReads.Load() != archiveReadsBeforeCapacity+1 {
+		t.Fatal("capacity resume duplicated accepted replacement build or source materialization")
+	}
 	var replacementHistory apicontract.DeploymentList
 	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/deployments", nil, http.StatusOK, &replacementHistory)
 	if len(replacementHistory.Items) != 2 {
@@ -730,12 +833,16 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 			replacementDeployment = item
 		}
 	}
-	if replacementDeployment.ID == "" || replacementDeployment.Status != "succeeded" || replacementDeployment.ReleaseID == history.Items[0].ReleaseID ||
+	if replacementDeployment.ID != pausedDeployment.ID || replacementDeployment.ID == "" || replacementDeployment.Status != "succeeded" || replacementDeployment.ReleaseID == history.Items[0].ReleaseID ||
+		replacementDeployment.ReleaseID != pausedDeployment.ReleaseID ||
 		replacementDeployment.ActualConfigurationRevisionID != replacementConfiguration.RevisionID || replacementDeployment.ActualConfigurationRevisionNumber != replacementConfiguration.RevisionNumber {
 		t.Fatal("replacement deployment lacks the new configuration and source pins")
 	}
 	var replacementReleases apicontract.ReleaseList
 	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/releases", nil, http.StatusOK, &replacementReleases)
+	if len(replacementReleases.Items) != 2 {
+		t.Fatal("capacity resume did not retain exactly one replacement release")
+	}
 	var replacementRelease apicontract.Release
 	for _, item := range replacementReleases.Items {
 		if item.ID == replacementDeployment.ReleaseID {
@@ -811,7 +918,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedReplacementRouteURL, "read", browserNote)
-	t.Logf("M2 controller journey identities: app=%s connection=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s replacement-config=%s/%d replacement-job=%s replacement-deployment=%s replacement-release=%s bad-config=%s/%d failed-job=%s failed-deployment=%s source=github-fixture sha=%s archive-reads=%d ingress=127.0.0.1:8080", application.ID, connection.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID, replacementConfiguration.RevisionID, replacementConfiguration.RevisionNumber, replacementJob.ID, replacementDeployment.ID, replacementRelease.ID, badConfiguration.RevisionID, badConfiguration.RevisionNumber, failedJob.ID, failedDeployment.ID, controllerJourneyGitHubSHA, provider.archiveReads.Load())
+	t.Logf("M2 controller journey identities: app=%s connection=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s replacement-config=%s/%d capacity-pause-job=%s capacity-pause-disposition=%s capacity-pause-deployment=%s capacity-pause-release=%s capacity-pause-no-build=%t capacity-pause-serving-unchanged=%t capacity-resume-attempt=%d replacement-job=%s replacement-deployment=%s replacement-release=%s bad-config=%s/%d failed-job=%s failed-deployment=%s source=github-fixture sha=%s archive-reads=%d ingress=127.0.0.1:8080", application.ID, connection.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID, replacementConfiguration.RevisionID, replacementConfiguration.RevisionNumber, pausedReplacement.ID, pausedReplacement.PauseDisposition, pausedDeployment.ID, pausedDeployment.ReleaseID, true, true, replacementJob.Attempt, replacementJob.ID, replacementDeployment.ID, replacementRelease.ID, badConfiguration.RevisionID, badConfiguration.RevisionNumber, failedJob.ID, failedDeployment.ID, controllerJourneyGitHubSHA, provider.archiveReads.Load())
 }
 
 func controllerJourneyExecutable(t *testing.T, name string) string {
@@ -986,9 +1093,15 @@ type controllerJourneyHealthObserver struct {
 	test     *testing.T
 	mu       sync.Mutex
 	last     map[string]string
+	builds   int
 }
 
 func (observer *controllerJourneyHealthObserver) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	if len(request.Args) >= 2 && request.Args[0] == "buildx" && request.Args[1] == "build" {
+		observer.mu.Lock()
+		observer.builds++
+		observer.mu.Unlock()
+	}
 	result, err := observer.delegate.Run(ctx, request)
 	if err != nil || len(request.Args) < 4 || request.Args[0] != "container" || request.Args[1] != "inspect" {
 		return result, err
@@ -1067,10 +1180,58 @@ func (observer *controllerJourneyHealthObserver) Run(ctx context.Context, reques
 	return result, err
 }
 
+func (observer *controllerJourneyHealthObserver) BuildCalls() int {
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	return observer.builds
+}
+
+type controllerJourneyCapacitySource struct {
+	mu       sync.RWMutex
+	delegate generatedruntime.CapacitySource
+	armed    bool
+}
+
+func (source *controllerJourneyCapacitySource) SetDelegate(delegate generatedruntime.CapacitySource) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	source.delegate = delegate
+}
+
+func (source *controllerJourneyCapacitySource) SetArmed(armed bool) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	source.armed = armed
+}
+
+func (source *controllerJourneyCapacitySource) Snapshot(ctx context.Context) (generatedruntime.CapacitySnapshot, error) {
+	source.mu.RLock()
+	armed, delegate := source.armed, source.delegate
+	source.mu.RUnlock()
+	if armed {
+		return generatedruntime.CapacitySnapshot{}, nil
+	}
+	if delegate == nil {
+		return generatedruntime.CapacitySnapshot{}, errors.New("capacity source delegate is required")
+	}
+	return delegate.Snapshot(ctx)
+}
+
 func controllerJourneyDocker(ctx context.Context, docker string, extraEnv []string, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, docker, args...)
 	command.Env = append(os.Environ(), extraEnv...)
 	return command.CombinedOutput()
+}
+
+func controllerJourneyDockerIDSet(t *testing.T, ctx context.Context, docker string, args ...string) string {
+	t.Helper()
+	output, err := controllerJourneyDocker(ctx, docker, nil, args...)
+	if err != nil {
+		t.Fatal("list owned Docker resource identities")
+	}
+	identities := strings.Fields(string(output))
+	sort.Strings(identities)
+	return strings.Join(identities, ",")
 }
 
 func controllerJourneyExists(t *testing.T, ctx context.Context, docker, kind, name string) bool {
