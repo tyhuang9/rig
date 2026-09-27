@@ -38,10 +38,11 @@ type runtimeCompositionDependencies struct {
 }
 
 type runtimeCompositionOptions struct {
-	dockerExecutable string
-	runner           runtimeprocess.CommandRunner
-	beforeStep       func(string) error
-	recoverIngress   func(context.Context, *generatedingress.Manager) error
+	dockerExecutable      string
+	runner                runtimeprocess.CommandRunner
+	beforeStep            func(string) error
+	recoverIngress        func(context.Context, *generatedingress.Manager) error
+	capacitySourceFactory func(generatedruntime.CapacitySource) generatedruntime.CapacitySource
 }
 
 type runtimeComposition struct {
@@ -229,7 +230,11 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err := step("runtime_engine_create"); err != nil {
 			return runtimeComposition{}, err
 		}
-		engine, err := generatedruntime.NewEngine(options.runner, environment, ingress, generatedruntime.EngineOptions{
+		capacitySource := generatedruntime.CapacitySource(ingress)
+		if options.capacitySourceFactory != nil {
+			capacitySource = options.capacitySourceFactory(capacitySource)
+		}
+		engine, err := generatedruntime.NewEngine(options.runner, environment, capacitySource, generatedruntime.EngineOptions{
 			DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
 			DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
 		})
