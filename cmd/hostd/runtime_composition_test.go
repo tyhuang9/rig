@@ -19,6 +19,7 @@ import (
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedingress"
+	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
@@ -163,6 +164,60 @@ func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) 
 	if !reflect.DeepEqual(recoveryOrder, wantRecoveryOrder) {
 		t.Fatalf("recovery order = %v, want %v; all calls=%v", recoveryOrder, wantRecoveryOrder, calls)
 	}
+}
+
+func TestGeneratedCompositionCapacitySourceFactory(t *testing.T) {
+	t.Run("default ingress", func(t *testing.T) {
+		fixture := newRuntimeCompositionFixture(t)
+		fixture.configuration.GeneratedRuntime = true
+		composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+			dockerExecutable: fixture.dockerExecutable,
+			recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
+		})
+		if err != nil || composition.ingress == nil {
+			t.Fatalf("default ingress capacity source: ingress=%p err=%v", composition.ingress, err)
+		}
+	})
+
+	t.Run("wrapped ingress", func(t *testing.T) {
+		fixture := newRuntimeCompositionFixture(t)
+		fixture.configuration.GeneratedRuntime = true
+		var received generatedruntime.CapacitySource
+		composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+			dockerExecutable: fixture.dockerExecutable,
+			recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
+			capacitySourceFactory: func(source generatedruntime.CapacitySource) generatedruntime.CapacitySource {
+				received = source
+				return runtimeCompositionCapacitySource{delegate: source}
+			},
+		})
+		if err != nil || composition.ingress == nil || received != composition.ingress {
+			t.Fatalf("wrapped ingress capacity source: ingress=%p received=%T err=%v", composition.ingress, received, err)
+		}
+	})
+
+	t.Run("nil wrapped source rejected", func(t *testing.T) {
+		fixture := newRuntimeCompositionFixture(t)
+		fixture.configuration.GeneratedRuntime = true
+		_, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+			dockerExecutable: fixture.dockerExecutable,
+			recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
+			capacitySourceFactory: func(generatedruntime.CapacitySource) generatedruntime.CapacitySource {
+				return nil
+			},
+		})
+		if err == nil {
+			t.Fatal("generated composition accepted a nil wrapped capacity source")
+		}
+	})
+}
+
+type runtimeCompositionCapacitySource struct {
+	delegate generatedruntime.CapacitySource
+}
+
+func (source runtimeCompositionCapacitySource) Snapshot(ctx context.Context) (generatedruntime.CapacitySnapshot, error) {
+	return source.delegate.Snapshot(ctx)
 }
 
 func TestGeneratedCompositionRecoversEachTemporaryNamespace(t *testing.T) {
