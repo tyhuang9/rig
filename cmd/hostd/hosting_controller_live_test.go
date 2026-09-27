@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -230,6 +231,14 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	}).Handler()
 	api := httptest.NewServer(handler)
 	defer api.Close()
+	apiListenAddress, err := controllerJourneyFixtureControllerListenAddress(api.URL)
+	if err != nil {
+		t.Fatal("validate first fixture controller listener")
+	}
+	apiPort, err := controllerJourneyListenPort(apiListenAddress)
+	if err != nil {
+		t.Fatal("read first fixture controller listener port")
+	}
 	client := &http.Client{Timeout: 8 * time.Second}
 	request := func(method, path string, input any, want int, output any, headers ...map[string]string) []byte {
 		t.Helper()
@@ -407,11 +416,8 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		t.Fatal("inspect app bridge gateway")
 	}
 	gateway := gateways[0].Gateway
-	dbPort := controllerJourneyPort(t, gateway)
-	httpsPort := controllerJourneyPort(t, gateway)
-	for httpsPort == dbPort {
-		httpsPort = controllerJourneyPort(t, gateway)
-	}
+	dbPort := controllerJourneyPort(t, gateway, apiPort)
+	httpsPort := controllerJourneyPort(t, gateway, apiPort, dbPort)
 	if err := os.Mkdir(fixtureRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -528,6 +534,19 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		}
 		return route.URL
 	}
+	assertControllerAppIsolation := func(probeSources []controllerJourneyAppProbeSource) {
+		t.Helper()
+		target, err := controllerJourneyControllerProbeTarget(api.URL, gateway, application.ID)
+		if err != nil {
+			t.Fatal("derive the attested controller isolation probe target")
+		}
+		var deployments apicontract.DeploymentList
+		request(http.MethodGet, target.Path, nil, http.StatusOK, &deployments)
+		if len(deployments.Items) == 0 {
+			t.Fatal("authenticated controller read-only positive control returned no deployments")
+		}
+		controllerJourneyAssertAppControllerDenied(t, ctx, docker, dataRoot, probeSources, target)
+	}
 	var absentRoute struct {
 		Status       string `json:"status"`
 		URL          string `json:"url"`
@@ -590,7 +609,8 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		t.Fatal("pinned GitHub release workspace failed digest verification")
 	}
 	initialRouteURL := assertAttestedRoute(history.Items[0])
-	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
+	initialProbeSources := controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, network.Name, gateway, dbURL, sentinel)
+	assertControllerAppIsolation(initialProbeSources)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/test/dependency", "", http.StatusOK, "reachable")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodPost, "/api/notes", `{"body":"controller TLS note"}`, http.StatusCreated, "controller TLS note")
@@ -672,12 +692,12 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 			stop()
 			return nil, nil, nil, err
 		}
-		server := httptest.NewServer((&controller.Server{
+		server := controllerJourneyRestartControllerServer(t, (&controller.Server{
 			Auth: auth.New(value.db), Apps: value.apps, Jobs: value.jobs, Machines: machines.New(value.db), Sources: value.sources,
 			Configuration: value.configuration, Deployments: value.deployments, DeploymentPlans: value.plans,
 			GeneratedIngress: value.composition.ingress, GeneratedRuntimeState: value.composition.state,
 			GeneratedRuntime: true, Caddy: true, DataRoot: dataRoot, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		}).Handler())
+		}).Handler(), dbPort, httpsPort)
 		return server, stop, done, nil
 	}
 	reopenedDB, err := database.Open(dataRoot)
@@ -715,6 +735,8 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		t.Fatal("controller restart lost active deployment identity")
 	}
 	retainedRouteURL := assertAttestedRoute(retainedHistory.Items[0])
+	restartedProbeSources := controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, network.Name, gateway, dbURL, sentinel)
+	assertControllerAppIsolation(restartedProbeSources)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedRouteURL, "read", browserNote)
 	activeBeforeCapacity, err := restarted.composition.state.Active(ctx, application.ID)
@@ -987,7 +1009,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		t.Fatal("same-source replacement did not pin the new configuration")
 	}
 	replacementRouteURL := assertAttestedRoute(replacementDeployment)
-	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
+	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, network.Name, gateway, dbURL, sentinel)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, replacementRouteURL, "read", browserNote)
@@ -1047,7 +1069,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		t.Fatal("failed replacement did not retain its bad-CA configuration pin")
 	}
 	retainedReplacementRouteURL := assertAttestedRoute(replacementDeployment)
-	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
+	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, network.Name, gateway, dbURL, sentinel)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedReplacementRouteURL, "read", browserNote)
@@ -1136,7 +1158,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		t.Fatal("gateway readiness release did not retain same-source immutable pins")
 	}
 	retainedGatewayRouteURL := assertAttestedRoute(replacementDeployment)
-	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
+	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, network.Name, gateway, dbURL, sentinel)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedGatewayRouteURL, "read", browserNote)
@@ -1550,17 +1572,86 @@ func controllerJourneyExists(t *testing.T, ctx context.Context, docker, kind, na
 	return false
 }
 
-func controllerJourneyPort(t *testing.T, address string) int {
-	t.Helper()
-	listener, err := net.Listen("tcp4", net.JoinHostPort(address, "0"))
+func controllerJourneyFixtureControllerListenAddress(apiURL string) (string, error) {
+	parsed, err := url.Parse(apiURL)
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("invalid fixture controller URL")
+	}
+	configured, err := config.FromFlags([]string{"--listen", parsed.Host})
+	if err != nil || configured.ListenAddress != parsed.Host {
+		return "", errors.New("fixture controller listener is not an explicit loopback address")
+	}
+	host, _, err := net.SplitHostPort(configured.ListenAddress)
 	if err != nil {
-		t.Fatal(err)
+		return "", errors.New("invalid fixture controller listener")
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return "", errors.New("fixture controller listener is not loopback")
 	}
-	return port
+	return configured.ListenAddress, nil
+}
+
+func controllerJourneyListenPort(address string) (int, error) {
+	_, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return 0, errors.New("invalid controller listener")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, errors.New("invalid controller listener port")
+	}
+	return port, nil
+}
+
+func controllerJourneyPort(t *testing.T, address string, excludedPorts ...int) int {
+	t.Helper()
+	excluded := make(map[int]struct{}, len(excludedPorts))
+	for _, port := range excludedPorts {
+		excluded[port] = struct{}{}
+	}
+	for attempts := 0; attempts < 64; attempts++ {
+		listener, err := net.Listen("tcp4", net.JoinHostPort(address, "0"))
+		if err != nil {
+			t.Fatal("reserve fixture listener port")
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		if err := listener.Close(); err != nil {
+			t.Fatal("release fixture listener port")
+		}
+		if _, found := excluded[port]; !found {
+			return port
+		}
+	}
+	t.Fatal("could not reserve a fixture port disjoint from the controller listener")
+	return 0
+}
+
+func controllerJourneyRestartControllerServer(t *testing.T, handler http.Handler, excludedPorts ...int) *httptest.Server {
+	t.Helper()
+	excluded := make(map[int]struct{}, len(excludedPorts))
+	for _, port := range excludedPorts {
+		excluded[port] = struct{}{}
+	}
+	for attempts := 0; attempts < 16; attempts++ {
+		server := httptest.NewServer(handler)
+		address, err := controllerJourneyFixtureControllerListenAddress(server.URL)
+		if err != nil {
+			server.Close()
+			t.Fatal("validate restarted fixture controller listener")
+		}
+		port, err := controllerJourneyListenPort(address)
+		if err != nil {
+			server.Close()
+			t.Fatal("read restarted fixture controller listener port")
+		}
+		if _, found := excluded[port]; !found {
+			return server
+		}
+		server.Close()
+	}
+	t.Fatal("could not start a controller listener disjoint from external fixture services")
+	return nil
 }
 
 func controllerJourneyBrowser(t *testing.T, ctx context.Context, node, appID, routeURL, mode, note string) {
@@ -1648,29 +1739,313 @@ func controllerJourneyProblemCode(body []byte) string {
 	return problem.Code
 }
 
-func controllerJourneyAssertScopedContainers(t *testing.T, ctx context.Context, docker, appID, dbURL, sentinel string) {
+type controllerJourneyHTTPProbeTarget struct {
+	Gateway string
+	Port    int
+	Path    string
+}
+
+func controllerJourneyControllerProbeTarget(apiURL, gateway, appID string) (controllerJourneyHTTPProbeTarget, error) {
+	listenAddress, err := controllerJourneyFixtureControllerListenAddress(apiURL)
+	if err != nil {
+		return controllerJourneyHTTPProbeTarget{}, err
+	}
+	port, err := controllerJourneyListenPort(listenAddress)
+	if err != nil {
+		return controllerJourneyHTTPProbeTarget{}, err
+	}
+	gatewayIP := net.ParseIP(gateway)
+	if gatewayIP == nil || gatewayIP.To4() == nil || gatewayIP.IsLoopback() || gatewayIP.IsUnspecified() {
+		return controllerJourneyHTTPProbeTarget{}, errors.New("invalid application bridge gateway")
+	}
+	parsedAppID, err := uuid.Parse(appID)
+	if err != nil || parsedAppID.String() != appID {
+		return controllerJourneyHTTPProbeTarget{}, errors.New("invalid application identity")
+	}
+	return controllerJourneyHTTPProbeTarget{
+		Gateway: gatewayIP.To4().String(),
+		Port:    port,
+		Path:    "/api/v1/apps/" + appID + "/deployments",
+	}, nil
+}
+
+type controllerJourneyAppProbeSource struct {
+	ContainerID string
+	Component   string
+}
+
+type controllerJourneyAppProbeInspection struct {
+	ID               string                                        `json:"id"`
+	Labels           map[string]string                             `json:"labels"`
+	Running          bool                                          `json:"running"`
+	NetworkMode      string                                        `json:"networkMode"`
+	PIDMode          string                                        `json:"pidMode"`
+	IPCMode          string                                        `json:"ipcMode"`
+	Binds            []string                                      `json:"binds"`
+	Mounts           []controllerJourneyMountInspection            `json:"mounts"`
+	ConfiguredMounts []controllerJourneyMountInspection            `json:"configuredMounts"`
+	Networks         map[string]controllerJourneyNetworkAttachment `json:"networks"`
+}
+
+type controllerJourneyMountInspection struct {
+	Type        string `json:"Type"`
+	Source      string `json:"Source"`
+	Destination string `json:"Destination"`
+	Target      string `json:"Target"`
+}
+
+type controllerJourneyNetworkAttachment struct {
+	NetworkID string `json:"NetworkID"`
+	IPAddress string `json:"IPAddress"`
+	Gateway   string `json:"Gateway"`
+}
+
+const controllerJourneyAppProbeInspectFormat = `{"id":{{json .ID}},"labels":{{json .Config.Labels}},"running":{{json .State.Running}},"networkMode":{{json .HostConfig.NetworkMode}},"pidMode":{{json .HostConfig.PidMode}},"ipcMode":{{json .HostConfig.IpcMode}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"configuredMounts":{{json .HostConfig.Mounts}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
+
+const controllerJourneyAppNetworkInspectFormat = `{"id":{{json .Id}},"name":{{json .Name}},"labels":{{json .Labels}}}`
+
+func controllerJourneyAppProbeSources(t *testing.T, ctx context.Context, docker, appID, networkName, gateway string) []controllerJourneyAppProbeSource {
 	t.Helper()
-	ids, err := controllerJourneyDocker(ctx, docker, nil, "ps", "-q", "--filter", "label=io.rig.application="+appID)
+	networkBody, err := controllerJourneyDocker(ctx, docker, nil, "network", "inspect", "--format", controllerJourneyAppNetworkInspectFormat, networkName)
+	var network struct {
+		ID     string            `json:"id"`
+		Name   string            `json:"name"`
+		Labels map[string]string `json:"labels"`
+	}
+	networkDecodeErr := json.Unmarshal(bytes.TrimSpace(networkBody), &network)
+	clear(networkBody)
+	if err != nil || networkDecodeErr != nil || network.ID == "" || network.Name != networkName ||
+		network.Labels["io.rig.managed"] != generatedruntime.NetworkOwnershipLabelValue || network.Labels["io.rig.application"] != appID {
+		t.Fatal("app-private network identity is not attested")
+	}
+	ids, err := controllerJourneyDocker(ctx, docker, nil, "ps", "-q", "--no-trunc", "--filter", "label=io.rig.application="+appID)
 	if err != nil || len(strings.Fields(string(ids))) != 2 {
+		clear(ids)
 		t.Fatal("generated deployment did not start exactly two scoped components")
 	}
-	seen := map[string]bool{}
-	for _, id := range strings.Fields(string(ids)) {
-		body, err := controllerJourneyDocker(ctx, docker, nil, "container", "inspect", "--format", "{{json .Config}}", id)
+	containerIDs := strings.Fields(string(ids))
+	clear(ids)
+	seen := make(map[string]bool, len(containerIDs))
+	sources := make([]controllerJourneyAppProbeSource, 0, len(containerIDs))
+	for _, id := range containerIDs {
+		body, err := controllerJourneyDocker(ctx, docker, nil, "container", "inspect", "--format", controllerJourneyAppProbeInspectFormat, id)
+		var inspection controllerJourneyAppProbeInspection
+		decodeErr := json.Unmarshal(bytes.TrimSpace(body), &inspection)
+		clear(body)
+		component := inspection.Labels["io.rig.component"]
+		attachment, attached := inspection.Networks[networkName]
+		address := net.ParseIP(attachment.IPAddress)
+		if err != nil || decodeErr != nil || !controllerJourneyCanonicalContainerID(id) || inspection.ID != id || !inspection.Running || inspection.NetworkMode != networkName ||
+			!controllerJourneyPrivateNamespaceMode(inspection.PIDMode) || !controllerJourneyPrivateNamespaceMode(inspection.IPCMode) || len(inspection.Binds) != 0 ||
+			!controllerJourneyMountsArePrivate(inspection.Mounts) || !controllerJourneyMountsArePrivate(inspection.ConfiguredMounts) ||
+			len(inspection.Networks) != 1 || !attached || attachment.NetworkID != network.ID || attachment.Gateway != gateway || address == nil || address.IsLoopback() ||
+			inspection.Labels["io.rig.managed"] != "generated-runtime" || inspection.Labels["io.rig.application"] != appID || seen[component] ||
+			(component != "api" && component != "frontend") {
+			t.Fatal("generated app probe source is not an owned isolated running component")
+		}
+		seen[component] = true
+		sources = append(sources, controllerJourneyAppProbeSource{ContainerID: id, Component: component})
+	}
+	if !seen["api"] || !seen["frontend"] {
+		t.Fatal("generated app probe sources do not cover both components")
+	}
+	sort.Slice(sources, func(left, right int) bool { return sources[left].Component < sources[right].Component })
+	return sources
+}
+
+func controllerJourneyMountsArePrivate(mounts []controllerJourneyMountInspection) bool {
+	for _, mount := range mounts {
+		if !strings.EqualFold(mount.Type, "tmpfs") || strings.TrimSpace(mount.Source) != "" || controllerJourneyDockerSocketMount(mount.Source) ||
+			controllerJourneyDockerSocketMount(mount.Destination) || controllerJourneyDockerSocketMount(mount.Target) {
+			return false
+		}
+	}
+	return true
+}
+
+func controllerJourneyPrivateNamespaceMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "private":
+		return true
+	default:
+		return false
+	}
+}
+
+func controllerJourneyCanonicalContainerID(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func controllerJourneyDockerSocketMount(value string) bool {
+	value = strings.TrimSuffix(strings.ReplaceAll(strings.TrimSpace(value), "\\", "/"), "/")
+	return value == "/var/run/docker.sock" || value == "//./pipe/docker_engine"
+}
+
+const controllerJourneyAppControllerProbeScript = `const http=require("node:http");const host=process.argv[1],port=Number(process.argv[2]),path=process.argv[3];let reported=false;function report(value){if(reported)return;reported=true;process.stdout.write(JSON.stringify(value));}const request=http.request({host,port,path,method:"GET",headers:{connection:"close"},agent:false,timeout:1500},response=>{report({outcome:"response",status:response.statusCode});response.resume();});request.once("timeout",()=>request.destroy(Object.assign(new Error("timeout"),{code:"ETIMEDOUT"})));request.once("error",error=>report({outcome:"denied",code:typeof error.code==="string"?error.code:""}));request.end();`
+
+type controllerJourneyAppProbeResult struct {
+	Outcome string `json:"outcome"`
+	Status  int    `json:"status"`
+	Code    string `json:"code"`
+}
+
+func controllerJourneyClassifyAppControllerProbe(output []byte) (bool, error) {
+	if len(output) == 0 || len(output) > 512 {
+		return false, errors.New("invalid controller probe output")
+	}
+	var result controllerJourneyAppProbeResult
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&result) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return false, errors.New("invalid controller probe output")
+	}
+	if result.Outcome == "denied" && result.Status == 0 && controllerJourneyTransportDenied(result.Code) {
+		return true, nil
+	}
+	if result.Outcome == "response" && result.Status >= 100 && result.Status <= 599 && result.Code == "" {
+		return false, errors.New("controller probe received an HTTP response")
+	}
+	return false, errors.New("unknown controller probe result")
+}
+
+func controllerJourneyTransportDenied(code string) bool {
+	switch code {
+	case "ECONNREFUSED", "ECONNRESET", "EHOSTUNREACH", "ENETUNREACH", "ETIMEDOUT":
+		return true
+	default:
+		return false
+	}
+}
+
+func TestControllerJourneyControllerProbeTargetUsesLoopbackControllerPort(t *testing.T) {
+	const appID = "11111111-1111-4111-8111-111111111111"
+	target, err := controllerJourneyControllerProbeTarget("http://127.0.0.1:7345", "172.27.0.1", appID)
+	if err != nil || target.Gateway != "172.27.0.1" || target.Port != 7345 || target.Path != "/api/v1/apps/"+appID+"/deployments" {
+		t.Fatal("controller probe target did not preserve the validated controller port and read-only path")
+	}
+	for _, value := range []struct {
+		apiURL  string
+		gateway string
+		appID   string
+	}{
+		{apiURL: "http://localhost:7345", gateway: "172.27.0.1", appID: appID},
+		{apiURL: "http://0.0.0.0:7345", gateway: "172.27.0.1", appID: appID},
+		{apiURL: "http://127.0.0.1:7345", gateway: "controller.local", appID: appID},
+		{apiURL: "http://127.0.0.1:7345", gateway: "127.0.0.1", appID: appID},
+		{apiURL: "http://127.0.0.1:7345", gateway: "172.27.0.1", appID: "invalid"},
+	} {
+		if _, err := controllerJourneyControllerProbeTarget(value.apiURL, value.gateway, value.appID); err == nil {
+			t.Fatal("controller probe target accepted an untrusted endpoint input")
+		}
+	}
+}
+
+func TestControllerJourneyAppControllerProbeClassifierFailsClosed(t *testing.T) {
+	for _, value := range []struct {
+		result  string
+		blocked bool
+		valid   bool
+	}{
+		{result: `{"outcome":"denied","code":"ECONNREFUSED"}`, blocked: true, valid: true},
+		{result: `{"outcome":"response","status":200}`, valid: false},
+		{result: `{"outcome":"response","status":401}`, valid: false},
+		{result: `{"outcome":"denied","code":"EUNKNOWN"}`, valid: false},
+		{result: `{"outcome":"denied","code":"ECONNREFUSED","extra":true}`, valid: false},
+		{result: `not-json`, valid: false},
+	} {
+		blocked, err := controllerJourneyClassifyAppControllerProbe([]byte(value.result))
+		if (err == nil) != value.valid || blocked != value.blocked {
+			t.Fatal("controller probe classifier accepted an invalid result or misclassified reachability")
+		}
+	}
+}
+
+func TestControllerJourneyAppProbeAttestationBoundaries(t *testing.T) {
+	if !controllerJourneyCanonicalContainerID(strings.Repeat("a", 64)) || controllerJourneyCanonicalContainerID(strings.Repeat("a", 12)) ||
+		controllerJourneyCanonicalContainerID(strings.Repeat("A", 64)) {
+		t.Fatal("app probe source ID validation accepted an ambiguous container identity")
+	}
+	for _, value := range []struct {
+		mode string
+		ok   bool
+	}{
+		{mode: "", ok: true}, {mode: "private", ok: true}, {mode: "host"}, {mode: "container:abc"}, {mode: "shareable"},
+	} {
+		if controllerJourneyPrivateNamespaceMode(value.mode) != value.ok {
+			t.Fatal("app probe namespace mode validation accepted a shared namespace")
+		}
+	}
+	for _, value := range []struct {
+		mounts []controllerJourneyMountInspection
+		ok     bool
+	}{
+		{ok: true},
+		{mounts: []controllerJourneyMountInspection{{Type: "tmpfs", Destination: "/tmp"}}, ok: true},
+		{mounts: []controllerJourneyMountInspection{{Type: "bind", Source: "/host", Destination: "/tmp"}}},
+		{mounts: []controllerJourneyMountInspection{{Type: "volume", Source: "runtime-state", Destination: "/tmp"}}},
+		{mounts: []controllerJourneyMountInspection{{Type: "tmpfs", Source: "/host", Destination: "/tmp"}}},
+		{mounts: []controllerJourneyMountInspection{{Type: "tmpfs", Destination: "/var/run/docker.sock"}}},
+	} {
+		if controllerJourneyMountsArePrivate(value.mounts) != value.ok {
+			t.Fatal("app probe mount validation accepted a non-private mount")
+		}
+	}
+}
+
+func controllerJourneyAssertAppControllerDenied(t *testing.T, ctx context.Context, docker, directory string, sources []controllerJourneyAppProbeSource, target controllerJourneyHTTPProbeTarget) {
+	t.Helper()
+	if len(sources) != 2 || target.Gateway == "" || target.Port < 1 || target.Port > 65535 || target.Path == "" {
+		t.Fatal("controller isolation probe has no attested inputs")
+	}
+	for _, source := range sources {
+		result, err := (runtimeprocess.ExecRunner{}).Run(ctx, runtimeprocess.CommandRequest{
+			Executable: docker,
+			Args: []string{
+				"container", "exec", "--env", "HTTP_PROXY=", "--env", "HTTPS_PROXY=", "--env", "ALL_PROXY=", "--env", "NO_PROXY=*",
+				source.ContainerID, "node", "--no-warnings", "-e", controllerJourneyAppControllerProbeScript,
+				target.Gateway, strconv.Itoa(target.Port), target.Path,
+			},
+			Directory: directory, Env: os.Environ(), Timeout: 4 * time.Second, OutputLimit: 512,
+		})
+		if ctx.Err() != nil || err != nil || result.StdoutTruncated || result.StderrTruncated || len(result.Stderr) != 0 {
+			clear(result.Stdout)
+			clear(result.Stderr)
+			t.Fatalf("app-origin controller probe did not complete for %s", source.Component)
+		}
+		blocked, classifyErr := controllerJourneyClassifyAppControllerProbe(result.Stdout)
+		clear(result.Stdout)
+		clear(result.Stderr)
+		if classifyErr != nil || !blocked {
+			t.Fatalf("controller API was reachable or probe output was invalid from %s", source.Component)
+		}
+	}
+}
+
+func controllerJourneyAssertScopedContainers(t *testing.T, ctx context.Context, docker, appID, networkName, gateway, dbURL, sentinel string) []controllerJourneyAppProbeSource {
+	t.Helper()
+	sources := controllerJourneyAppProbeSources(t, ctx, docker, appID, networkName, gateway)
+	for _, source := range sources {
+		body, err := controllerJourneyDocker(ctx, docker, nil, "container", "inspect", "--format", "{{json .Config}}", source.ContainerID)
 		var configuration struct {
 			Labels map[string]string
 			Env    []string
 		}
-		if err != nil || json.Unmarshal(bytes.TrimSpace(body), &configuration) != nil {
+		decodeErr := json.Unmarshal(bytes.TrimSpace(body), &configuration)
+		clear(body)
+		if err != nil || decodeErr != nil || configuration.Labels["io.rig.component"] != source.Component ||
+			configuration.Labels["io.rig.managed"] != "generated-runtime" || configuration.Labels["io.rig.application"] != appID {
 			t.Fatal("inspect generated component configuration")
 		}
-		name := configuration.Labels["io.rig.component"]
-		if configuration.Labels["io.rig.managed"] != "generated-runtime" || seen[name] || (name != "api" && name != "frontend") {
-			t.Fatal("generated component ownership or identity is invalid")
-		}
-		seen[name] = true
 		entries := strings.Join(configuration.Env, "\n")
-		if name == "api" {
+		if source.Component == "api" {
 			if !strings.Contains(entries, "NOTES_FIXTURE_DB_URL="+dbURL) || !strings.Contains(entries, "TEST_SENTINEL_SECRET="+sentinel) {
 				t.Fatal("API container did not receive its exact scoped server secrets")
 			}
@@ -1678,6 +2053,7 @@ func controllerJourneyAssertScopedContainers(t *testing.T, ctx context.Context, 
 			t.Fatal("frontend container received a server runtime secret")
 		}
 	}
+	return sources
 }
 
 func controllerJourneyRemoveBuilder(t *testing.T, ctx context.Context, docker, dataRoot string) {
