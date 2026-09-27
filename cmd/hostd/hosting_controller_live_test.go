@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -616,49 +617,80 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		t.Fatal("close controller database for restart")
 	}
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
+	capacityPressure := &controllerJourneyCapacitySource{}
+	restartedObserver := &controllerJourneyHealthObserver{
+		delegate: runtimeprocess.ExecRunner{}, test: t, last: make(map[string]string),
+	}
+	type restartedController struct {
+		db            *sql.DB
+		apps          *apps.Store
+		jobs          *jobs.Service
+		deployments   *deployments.Repository
+		configuration *appconfig.Store
+		plans         *deploymentplans.Store
+		sources       *sourceconnections.Service
+		composition   runtimeComposition
+	}
+	openRestartedController := func(controllerDB *sql.DB) (restartedController, error) {
+		configuration, err := appconfig.New(controllerDB, dataRoot)
+		if err != nil {
+			return restartedController{}, err
+		}
+		plans, err := deploymentplans.New(controllerDB, dataRoot)
+		if err != nil {
+			return restartedController{}, err
+		}
+		sources := sourceconnections.NewService(sourceconnections.NewRepository(controllerDB), provider, sourceconnections.NewFileCredentialStore(dataRoot), "fixture-app", time.Now)
+		snapshots, err := releasesnapshot.New(controllerDB, sources, dataRoot)
+		if err != nil {
+			return restartedController{}, err
+		}
+		value := restartedController{
+			db: controllerDB, apps: apps.New(controllerDB), jobs: jobs.New(controllerDB), deployments: deployments.New(controllerDB),
+			configuration: configuration, plans: plans, sources: sources,
+		}
+		value.composition, err = prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
+			db: controllerDB, applications: value.apps, snapshots: snapshots, configuration: value.configuration,
+			deployments: value.deployments, plans: value.plans,
+		}, runtimeCompositionOptions{
+			dockerExecutable: docker,
+			runner:           restartedObserver,
+			capacitySourceFactory: func(source generatedruntime.CapacitySource) generatedruntime.CapacitySource {
+				capacityPressure.SetDelegate(source)
+				return capacityPressure
+			},
+		})
+		return value, err
+	}
+	startRestartedController := func(value restartedController) (*httptest.Server, context.CancelFunc, <-chan struct{}, error) {
+		workerContext, stop := context.WithCancel(ctx)
+		done, err := prepareRuntimeWorker(workerContext, runtimeRecovery{
+			deployments: value.deployments.Recover, jobs: value.jobs.RecoverInterrupted,
+		}, value.composition.executor, value.jobs.RunWorker, func(error) {})
+		if err != nil {
+			stop()
+			return nil, nil, nil, err
+		}
+		server := httptest.NewServer((&controller.Server{
+			Auth: auth.New(value.db), Apps: value.apps, Jobs: value.jobs, Machines: machines.New(value.db), Sources: value.sources,
+			Configuration: value.configuration, Deployments: value.deployments, DeploymentPlans: value.plans,
+			GeneratedIngress: value.composition.ingress, GeneratedRuntimeState: value.composition.state,
+			GeneratedRuntime: true, Caddy: true, DataRoot: dataRoot, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}).Handler())
+		return server, stop, done, nil
+	}
 	reopenedDB, err := database.Open(dataRoot)
 	if err != nil {
 		t.Fatal("reopen durable controller database:", err)
 	}
 	defer reopenedDB.Close()
-	restartedApps := apps.New(reopenedDB)
-	restartedJobs := jobs.New(reopenedDB)
-	restartedDeployments := deployments.New(reopenedDB)
-	restartedConfiguration, err := appconfig.New(reopenedDB, dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	restartedPlans, err := deploymentplans.New(reopenedDB, dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	restartedSources := sourceconnections.NewService(sourceconnections.NewRepository(reopenedDB), provider, sourceconnections.NewFileCredentialStore(dataRoot), "fixture-app", time.Now)
-	restartedSnapshots, err := releasesnapshot.New(reopenedDB, restartedSources, dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	capacityPressure := &controllerJourneyCapacitySource{}
-	restartedObserver := &controllerJourneyHealthObserver{
-		delegate: runtimeprocess.ExecRunner{}, test: t, last: make(map[string]string),
-	}
-	restartedComposition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
-		db: reopenedDB, applications: restartedApps, snapshots: restartedSnapshots, configuration: restartedConfiguration,
-		deployments: restartedDeployments, plans: restartedPlans,
-	}, runtimeCompositionOptions{
-		dockerExecutable: docker,
-		runner:           restartedObserver,
-		capacitySourceFactory: func(source generatedruntime.CapacitySource) generatedruntime.CapacitySource {
-			capacityPressure.SetDelegate(source)
-			return capacityPressure
-		},
-	})
+	restarted, err := openRestartedController(reopenedDB)
 	if err != nil {
 		t.Fatal("recover generated runtime after controller restart:", err)
 	}
-	restartedWorkerContext, stopRestartedWorker := context.WithCancel(ctx)
-	restartedDone, err := prepareRuntimeWorker(restartedWorkerContext, runtimeRecovery{
-		deployments: restartedDeployments.Recover, jobs: restartedJobs.RecoverInterrupted,
-	}, restartedComposition.executor, restartedJobs.RunWorker, func(error) {})
+	var stopRestartedWorker context.CancelFunc
+	var restartedDone <-chan struct{}
+	api, stopRestartedWorker, restartedDone, err = startRestartedController(restarted)
 	if err != nil {
 		t.Fatal("restart durable deployment worker:", err)
 	}
@@ -670,12 +702,6 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 			t.Error("restarted deployment worker did not stop")
 		}
 	}()
-	api = httptest.NewServer((&controller.Server{
-		Auth: auth.New(reopenedDB), Apps: restartedApps, Jobs: restartedJobs, Machines: machines.New(reopenedDB), Sources: restartedSources,
-		Configuration: restartedConfiguration, Deployments: restartedDeployments, DeploymentPlans: restartedPlans,
-		GeneratedIngress: restartedComposition.ingress, GeneratedRuntimeState: restartedComposition.state,
-		GeneratedRuntime: true, Caddy: true, DataRoot: dataRoot, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}).Handler())
 	defer api.Close()
 	var retainedJob jobs.Job
 	request(http.MethodGet, "/api/v1/jobs/"+completed.ID, nil, http.StatusOK, &retainedJob)
@@ -690,7 +716,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	retainedRouteURL := assertAttestedRoute(retainedHistory.Items[0])
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedRouteURL, "read", browserNote)
-	activeBeforeCapacity, err := restartedComposition.state.Active(ctx, application.ID)
+	activeBeforeCapacity, err := restarted.composition.state.Active(ctx, application.ID)
 	if err != nil || activeBeforeCapacity.DeploymentID != retainedHistory.Items[0].ID || activeBeforeCapacity.ReleaseID != retainedHistory.Items[0].ReleaseID {
 		t.Fatal("restarted controller has no active immutable serving head")
 	}
@@ -730,7 +756,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	pauseDeadline := time.Now().Add(4 * time.Minute)
 	var pausedReplacement jobs.Job
 	for {
-		pausedReplacement, err = restartedJobs.Get(replacementMutation.Job.ID)
+		pausedReplacement, err = restarted.jobs.Get(replacementMutation.Job.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -765,7 +791,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	if provider.archiveReads.Load() != archiveReadsBeforeCapacity+1 {
 		t.Fatal("capacity pause did not materialize exactly one accepted replacement release")
 	}
-	pausedRuntime, err := restartedComposition.state.Get(ctx, application.ID, pausedDeployment.ID)
+	pausedRuntime, err := restarted.composition.state.Get(ctx, application.ID, pausedDeployment.ID)
 	if err != nil || pausedRuntime.Phase != generatedruntimestate.PhaseBuilding || pausedRuntime.ReleaseID != pausedDeployment.ReleaseID ||
 		pausedRuntime.DeploymentPlanRevisionID != pausedDeployment.DeploymentPlanRevisionID || pausedRuntime.DeploymentPlanRevisionNumber != pausedDeployment.DeploymentPlanRevisionNumber {
 		t.Fatal("capacity pause durable runtime state is not pinned before candidate work")
@@ -781,7 +807,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 		controllerJourneyDockerIDSet(t, ctx, docker, "network", "ls", "-q", "--filter", "label=rig.controller=generated-builder") != builderNetworkIDs {
 		t.Fatal("capacity pause performed a build or changed Docker resource identities")
 	}
-	activeAfterCapacity, err := restartedComposition.state.Active(ctx, application.ID)
+	activeAfterCapacity, err := restarted.composition.state.Active(ctx, application.ID)
 	if err != nil || activeAfterCapacity.DeploymentID != activeBeforeCapacity.DeploymentID || activeAfterCapacity.ReleaseID != activeBeforeCapacity.ReleaseID ||
 		activeAfterCapacity.Slot != activeBeforeCapacity.Slot || activeAfterCapacity.Generation != activeBeforeCapacity.Generation {
 		t.Fatal("capacity pause changed the active serving head")
@@ -790,6 +816,112 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	if pausedRouteURL != retainedRouteURL {
 		t.Fatal("capacity pause changed the attested serving route")
 	}
+	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
+	controllerJourneyBrowser(t, ctx, node, application.ID, retainedRouteURL, "read", browserNote)
+	pausedInput := append([]byte(nil), pausedReplacement.Input...)
+	stopRestartedWorker()
+	select {
+	case <-restartedDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("capacity-paused deployment worker did not stop for controller restart")
+	}
+	api.Close()
+	if err := reopenedDB.Close(); err != nil {
+		t.Fatal("close capacity-paused controller database for restart")
+	}
+	capacityRestartDB, err := database.Open(dataRoot)
+	if err != nil {
+		t.Fatal("reopen capacity-paused controller database:", err)
+	}
+	defer capacityRestartDB.Close()
+	capacityRestart, err := openRestartedController(capacityRestartDB)
+	if err != nil {
+		t.Fatal("recover capacity-paused generated runtime after controller restart:", err)
+	}
+	api, stopCapacityRestartWorker, capacityRestartDone, err := startRestartedController(capacityRestart)
+	if err != nil {
+		t.Fatal("restart capacity-paused durable deployment worker:", err)
+	}
+	defer func() {
+		stopCapacityRestartWorker()
+		select {
+		case <-capacityRestartDone:
+		case <-time.After(10 * time.Second):
+			t.Error("capacity-restarted deployment worker did not stop")
+		}
+	}()
+	defer api.Close()
+	recoveredPaused, err := capacityRestart.jobs.Get(pausedReplacement.ID)
+	if err != nil || recoveredPaused.Status != string(jobs.WaitingUser) || recoveredPaused.Phase != jobs.PauseInsufficientReplacementCapacity ||
+		recoveredPaused.PauseDisposition != jobs.PauseInsufficientReplacementCapacity || recoveredPaused.ErrorCode != "" ||
+		recoveredPaused.Attempt != pausedReplacement.Attempt || !bytes.Equal(recoveredPaused.Input, pausedInput) {
+		t.Fatal("controller restart changed the intentional capacity pause")
+	}
+	var capacityRestartHistory apicontract.DeploymentList
+	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/deployments", nil, http.StatusOK, &capacityRestartHistory)
+	if len(capacityRestartHistory.Items) != 2 {
+		t.Fatal("controller restart changed capacity-paused deployment history")
+	}
+	var capacityRestartDeployment apicontract.Deployment
+	for _, item := range capacityRestartHistory.Items {
+		if item.JobID == pausedReplacement.ID {
+			capacityRestartDeployment = item
+		}
+	}
+	if capacityRestartDeployment.ID != pausedDeployment.ID || capacityRestartDeployment.ReleaseID != pausedDeployment.ReleaseID ||
+		capacityRestartDeployment.Status != pausedDeployment.Status || capacityRestartDeployment.RuntimeStrategy != pausedDeployment.RuntimeStrategy ||
+		capacityRestartDeployment.DeploymentPlanRevisionID != pausedDeployment.DeploymentPlanRevisionID || capacityRestartDeployment.DeploymentPlanRevisionNumber != pausedDeployment.DeploymentPlanRevisionNumber ||
+		capacityRestartDeployment.ActualConfigurationRevisionID != pausedDeployment.ActualConfigurationRevisionID || capacityRestartDeployment.ActualConfigurationRevisionNumber != pausedDeployment.ActualConfigurationRevisionNumber {
+		t.Fatal("controller restart changed capacity-paused immutable deployment pins")
+	}
+	var capacityRestartReleases apicontract.ReleaseList
+	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/releases", nil, http.StatusOK, &capacityRestartReleases)
+	if len(capacityRestartReleases.Items) != 2 {
+		t.Fatal("controller restart changed capacity-paused release history")
+	}
+	var capacityRestartRelease apicontract.Release
+	for _, item := range capacityRestartReleases.Items {
+		if item.ID == pausedDeployment.ReleaseID {
+			capacityRestartRelease = item
+		}
+	}
+	if capacityRestartRelease.ID != pausedDeployment.ReleaseID || capacityRestartRelease.ConfigurationRevisionID != replacementConfiguration.RevisionID ||
+		capacityRestartRelease.ConfigurationRevisionNumber != replacementConfiguration.RevisionNumber || capacityRestartRelease.DeploymentPlanRevisionID != plan.RevisionID ||
+		capacityRestartRelease.DeploymentPlanRevisionNumber != plan.RevisionNumber {
+		t.Fatal("controller restart changed capacity-paused release pins")
+	}
+	capacityRestartRuntime, err := capacityRestart.composition.state.Get(ctx, application.ID, pausedDeployment.ID)
+	if err != nil || capacityRestartRuntime.Phase != pausedRuntime.Phase || capacityRestartRuntime.MigrationState != pausedRuntime.MigrationState ||
+		capacityRestartRuntime.ReleaseID != pausedRuntime.ReleaseID || capacityRestartRuntime.DeploymentPlanRevisionID != pausedRuntime.DeploymentPlanRevisionID ||
+		capacityRestartRuntime.DeploymentPlanRevisionNumber != pausedRuntime.DeploymentPlanRevisionNumber {
+		t.Fatal("controller restart changed capacity-paused runtime state")
+	}
+	if len(capacityRestartRuntime.Components) != len(pausedRuntime.Components) {
+		t.Fatal("controller restart changed capacity-paused runtime components")
+	}
+	for index, component := range capacityRestartRuntime.Components {
+		before := pausedRuntime.Components[index]
+		if component.Name != before.Name || component.Slot != before.Slot || component.ImageArtifactID != before.ImageArtifactID ||
+			component.ContainerName != before.ContainerName || component.ContainerID != before.ContainerID || component.State != before.State {
+			t.Fatal("controller restart changed capacity-paused runtime component identity")
+		}
+	}
+	capacityRestartHead, err := capacityRestart.composition.state.Active(ctx, application.ID)
+	if err != nil || capacityRestartHead.DeploymentID != activeBeforeCapacity.DeploymentID || capacityRestartHead.ReleaseID != activeBeforeCapacity.ReleaseID ||
+		capacityRestartHead.Slot != activeBeforeCapacity.Slot || capacityRestartHead.Generation != activeBeforeCapacity.Generation {
+		t.Fatal("controller restart changed the active serving head during capacity pause")
+	}
+	if restartedObserver.BuildCalls() != buildCallsBeforeCapacity || provider.archiveReads.Load() != archiveReadsBeforeCapacity+1 ||
+		controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=io.rig.application="+application.ID) != servingContainerIDs ||
+		controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=rig.controller=generated-builder") != builderContainerIDs ||
+		controllerJourneyDockerIDSet(t, ctx, docker, "network", "ls", "-q", "--filter", "label=rig.controller=generated-builder") != builderNetworkIDs {
+		t.Fatal("controller restart changed capacity-paused runtime resources")
+	}
+	capacityRestartRouteURL := assertAttestedRoute(retainedHistory.Items[0])
+	if capacityRestartRouteURL != retainedRouteURL {
+		t.Fatal("controller restart changed the attested route during capacity pause")
+	}
+	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedRouteURL, "read", browserNote)
 	capacityPressure.SetArmed(false)
@@ -804,7 +936,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	replacementDeadline := time.Now().Add(8 * time.Minute)
 	var replacementJob jobs.Job
 	for {
-		replacementJob, err = restartedJobs.Get(replacementMutation.Job.ID)
+		replacementJob, err = capacityRestart.jobs.Get(replacementMutation.Job.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -883,7 +1015,7 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	failedDeadline := time.Now().Add(8 * time.Minute)
 	var failedJob jobs.Job
 	for {
-		failedJob, err = restartedJobs.Get(failedMutation.Job.ID)
+		failedJob, err = capacityRestart.jobs.Get(failedMutation.Job.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
