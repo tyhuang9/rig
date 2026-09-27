@@ -322,12 +322,33 @@ type recoveryFixture struct {
 	deploymentID string
 	releaseID    string
 	planID       string
+	configID     string
 	component    string
 	inputJSON    []byte
 	phase        generatedruntimestate.Phase
 }
 
 func newRecoveryFixture(t *testing.T, migration bool) *recoveryFixture {
+	return newRecoveryFixtureWithReviewedCurrent(t, migration, false)
+}
+
+func newRecoveryFixtureWithReviewedCurrent(t *testing.T, migration, reviewedCurrent bool) *recoveryFixture {
+	return newRecoveryFixtureWithReviewedConfiguration(t, migration, reviewedCurrent, jobs.ConfigurationCurrent, 2, false)
+}
+
+func newRecoveryFixtureWithConfigurationMode(t *testing.T, migration, reviewedCurrent bool, configurationMode jobs.ConfigurationMode) *recoveryFixture {
+	return newRecoveryFixtureWithReviewedConfiguration(t, migration, reviewedCurrent, configurationMode, 2, false)
+}
+
+func newRecoveryFixtureWithReviewedConfigurationVersion(t *testing.T, migration bool, bundleVersion int) *recoveryFixture {
+	return newRecoveryFixtureWithReviewedConfiguration(t, migration, true, jobs.ConfigurationCurrent, bundleVersion, false)
+}
+
+func newRecoveryFixtureWithForeignReviewedConfigurationPlan(t *testing.T) *recoveryFixture {
+	return newRecoveryFixtureWithReviewedConfiguration(t, false, true, jobs.ConfigurationCurrent, 2, true)
+}
+
+func newRecoveryFixtureWithReviewedConfiguration(t *testing.T, migration, reviewedCurrent bool, configurationMode jobs.ConfigurationMode, configurationBundleVersion int, foreignConfigurationPlan bool) *recoveryFixture {
 	t.Helper()
 	db, err := database.Open(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
@@ -358,6 +379,37 @@ func newRecoveryFixture(t *testing.T, migration bool) *recoveryFixture {
 		strings.Repeat("b", 64), strings.Repeat("c", 64), migrationDigest, fixture.actorID, timestamp(fixture.now), fixture.actorID, timestamp(fixture.now)); err != nil {
 		t.Fatal(err)
 	}
+	if reviewedCurrent {
+		fixture.configID = uuid.NewString()
+		configurationPlanID := any(fixture.planID)
+		configurationPlanNumber := any(int64(1))
+		if foreignConfigurationPlan {
+			foreignPlanID := uuid.NewString()
+			if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(
+				id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,
+				analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,
+				field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at
+			) VALUES(?,?,2,?,'generated_node','test','1',?,'local',0,?,?,1,8,'',?,?,'accepted',?,?)`,
+				foreignPlanID, fixture.appID, "apps/"+fixture.appID+"/deployment-plans/"+foreignPlanID+".secret", strings.Repeat("d", 64),
+				strings.Repeat("e", 64), strings.Repeat("f", 64), fixture.actorID, timestamp(fixture.now), fixture.actorID, timestamp(fixture.now)); err != nil {
+				t.Fatal(err)
+			}
+			configurationPlanID, configurationPlanNumber = foreignPlanID, int64(2)
+		}
+		if configurationBundleVersion == 1 {
+			configurationPlanID, configurationPlanNumber = nil, nil
+		}
+		if _, err := db.Exec(`INSERT INTO application_configuration_revisions(
+			id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count,
+			bundle_version,deployment_plan_revision_id,deployment_plan_revision_number
+		) VALUES(?,?,1,?,?,?,0,0,?,?,?)`, fixture.configID, fixture.appID,
+			"apps/"+fixture.appID+"/configuration/"+fixture.configID+".secret", fixture.actorID, timestamp(fixture.now), configurationBundleVersion, configurationPlanID, configurationPlanNumber); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE application_configuration_heads SET revision_id=?,revision_number=1,updated_at=? WHERE app_id=?`, fixture.configID, timestamp(fixture.now), fixture.appID); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if migration {
 		if _, err := db.Exec(`INSERT INTO deployment_plan_migration_approvals(revision_id,app_id,approval_revision,approved_by,approved_at) VALUES(?,?,1,?,?)`, fixture.planID, fixture.appID, fixture.actorID, timestamp(fixture.now)); err != nil {
 			t.Fatal(err)
@@ -366,14 +418,29 @@ func newRecoveryFixture(t *testing.T, migration bool) *recoveryFixture {
 	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,workspace_state,workspace_tree_sha256,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,'ready','{}',?,'local',0,?,'ready',?,?,1)`, fixture.releaseID, fixture.appID, timestamp(fixture.now), strings.Repeat("b", 64), strings.Repeat("f", 64), fixture.planID); err != nil {
 		t.Fatal(err)
 	}
-	fixture.inputJSON, err = json.Marshal(jobs.DeploymentInput{ReleaseID: fixture.releaseID, ConfigurationMode: jobs.ConfigurationCurrent})
+	input := jobs.DeploymentInput{ReleaseID: fixture.releaseID, ConfigurationMode: configurationMode}
+	if reviewedCurrent {
+		input = jobs.DeploymentInput{
+			ConfigurationMode:                   jobs.ConfigurationCurrent,
+			ExpectedPlanRevisionID:              fixture.planID,
+			ExpectedPlanRevisionNumber:          1,
+			ExpectedConfigurationRevisionID:     fixture.configID,
+			ExpectedConfigurationRevisionNumber: 1,
+		}
+	}
+	fixture.inputJSON, err = json.Marshal(input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,input_json,attempt,progress_percent,checkpoint_json,started_at,created_at,updated_at) VALUES(?,'deploy','application',?,'running','apply_runtime',?,?,2,60,'{"phase":"apply_runtime"}',?,?,?)`, fixture.jobID, fixture.appID, fixture.actorID, string(fixture.inputJSON), timestamp(fixture.now), timestamp(fixture.now), timestamp(fixture.now)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,release_id,job_id,status,configuration_mode,provenance_initialized,runtime_strategy,deployment_plan_revision_id,deployment_plan_revision_number,started_at) VALUES(?,?,?,?,'applying','current',1,'generated_node',?,1,?)`, fixture.deploymentID, fixture.appID, fixture.releaseID, fixture.jobID, fixture.planID, timestamp(fixture.now)); err != nil {
+	configurationID := any(nil)
+	configurationNumber := int64(0)
+	if reviewedCurrent {
+		configurationID, configurationNumber = fixture.configID, 1
+	}
+	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,release_id,job_id,status,configuration_mode,actual_configuration_revision_id,actual_configuration_revision_number,provenance_initialized,runtime_strategy,deployment_plan_revision_id,deployment_plan_revision_number,started_at) VALUES(?,?,?,?, 'applying',?,?,?,1,'generated_node',?,1,?)`, fixture.deploymentID, fixture.appID, fixture.releaseID, fixture.jobID, configurationMode, configurationID, configurationNumber, fixture.planID, timestamp(fixture.now)); err != nil {
 		t.Fatal(err)
 	}
 	if _, created, err := fixture.state.Begin(context.Background(), generatedruntimestate.BeginInput{

@@ -23,6 +23,7 @@ const (
 	interruptedJobSummary     = "Job interrupted because hostd restarted"
 	requeuedJobSummary        = "Generated deployment requeued because hostd restarted"
 	routeReconciliationPause  = "route_reconciliation_required"
+	replacementCapacityPause  = "insufficient_replacement_capacity"
 )
 
 var (
@@ -68,23 +69,28 @@ type runtimeComponent struct {
 }
 
 type recoveryBinding struct {
-	deploymentID       string
-	appID              string
-	releaseID          string
-	jobID              string
-	deploymentStatus   string
-	configurationMode  string
-	planRevisionID     string
-	planRevisionNumber int64
-	jobStatus          string
-	jobPhase           string
-	pauseDisposition   string
-	jobType            string
-	jobResourceType    string
-	jobResourceID      string
-	requestedBy        string
-	jobInput           []byte
-	jobAttempt         int
+	deploymentID        string
+	appID               string
+	releaseID           string
+	jobID               string
+	deploymentStatus    string
+	configurationMode   string
+	planRevisionID      string
+	planRevisionNumber  int64
+	actualConfigID      string
+	actualConfigNumber  int64
+	configBundleVersion int64
+	configPlanID        string
+	configPlanNumber    int64
+	jobStatus           string
+	jobPhase            string
+	pauseDisposition    string
+	jobType             string
+	jobResourceType     string
+	jobResourceID       string
+	requestedBy         string
+	jobInput            []byte
+	jobAttempt          int
 }
 
 type activeHead struct {
@@ -94,8 +100,12 @@ type activeHead struct {
 }
 
 type deploymentInput struct {
-	ReleaseID         string `json:"releaseId"`
-	ConfigurationMode string `json:"configurationMode"`
+	ReleaseID                           string `json:"releaseId"`
+	ConfigurationMode                   string `json:"configurationMode"`
+	ExpectedPlanRevisionID              string `json:"expectedPlanRevisionId"`
+	ExpectedPlanRevisionNumber          int64  `json:"expectedPlanRevisionNumber"`
+	ExpectedConfigurationRevisionID     string `json:"expectedConfigurationRevisionId"`
+	ExpectedConfigurationRevisionNumber int64  `json:"expectedConfigurationRevisionNumber"`
 }
 
 // RecoverDeployments preserves only exact generated deployments whose durable
@@ -337,6 +347,7 @@ func loadRuntimeComponents(ctx context.Context, tx *sql.Tx, deployment runtimeDe
 
 func loadRecoveryBinding(ctx context.Context, tx *sql.Tx, deploymentID string) (recoveryBinding, bool, error) {
 	row := tx.QueryRowContext(ctx, `SELECT d.id,d.app_id,d.release_id,d.job_id,d.status,d.configuration_mode,d.deployment_plan_revision_id,d.deployment_plan_revision_number,
+		COALESCE(d.actual_configuration_revision_id,''),d.actual_configuration_revision_number,COALESCE(c.bundle_version,0),COALESCE(c.deployment_plan_revision_id,''),COALESCE(c.deployment_plan_revision_number,0),
 		j.status,j.phase,COALESCE(j.pause_disposition,''),j.type,j.resource_type,j.resource_id,COALESCE(j.requested_by,''),j.input_json,j.attempt
 	FROM deployments d
 	JOIN jobs j ON j.id=d.job_id AND j.type='deploy' AND j.resource_type='application' AND j.resource_id=d.app_id
@@ -344,20 +355,23 @@ func loadRecoveryBinding(ctx context.Context, tx *sql.Tx, deploymentID string) (
 		AND r.deployment_plan_revision_id=d.deployment_plan_revision_id AND r.deployment_plan_revision_number=d.deployment_plan_revision_number
 	JOIN deployment_plan_revisions p ON p.id=d.deployment_plan_revision_id AND p.app_id=d.app_id
 		AND p.revision_number=d.deployment_plan_revision_number AND p.strategy='generated_node' AND p.acceptance_status='accepted'
+	LEFT JOIN application_configuration_revisions c ON c.id=d.actual_configuration_revision_id AND c.app_id=d.app_id
+		AND c.revision_number=d.actual_configuration_revision_number
 	WHERE d.id=? AND d.status IN ('preparing','applying','waiting_health')
 	  AND d.runtime_strategy='generated_node' AND d.provenance_initialized=1
 	  AND d.release_id IS NOT NULL AND d.deployment_plan_revision_id IS NOT NULL AND d.deployment_plan_revision_number>0
-	  AND ((d.actual_configuration_revision_number=0 AND d.actual_configuration_revision_id IS NULL) OR EXISTS(
-		SELECT 1 FROM application_configuration_revisions c WHERE c.id=d.actual_configuration_revision_id AND c.app_id=d.app_id AND c.revision_number=d.actual_configuration_revision_number
-	  ))
+	  AND ((d.actual_configuration_revision_number=0 AND d.actual_configuration_revision_id IS NULL) OR
+		(c.id IS NOT NULL AND c.bundle_version=2 AND c.deployment_plan_revision_id=d.deployment_plan_revision_id AND c.deployment_plan_revision_number=d.deployment_plan_revision_number))
 	  AND (p.migration_evidence_digest='' OR EXISTS(
 		SELECT 1 FROM deployment_plan_migration_approvals a WHERE a.revision_id=p.id AND a.app_id=p.app_id
 	  ))
 	  AND (j.status IN ('queued','assigned','running','waiting_external') OR
-	       (j.status='waiting_user' AND j.phase=? AND j.pause_disposition=?))`, deploymentID, routeReconciliationPause, routeReconciliationPause)
+	       (j.status='waiting_user' AND ((j.phase=? AND j.pause_disposition=?) OR (j.phase=? AND j.pause_disposition=?))))`, deploymentID,
+		routeReconciliationPause, routeReconciliationPause, replacementCapacityPause, replacementCapacityPause)
 	var value recoveryBinding
 	var input string
 	if err := row.Scan(&value.deploymentID, &value.appID, &value.releaseID, &value.jobID, &value.deploymentStatus, &value.configurationMode, &value.planRevisionID, &value.planRevisionNumber,
+		&value.actualConfigID, &value.actualConfigNumber, &value.configBundleVersion, &value.configPlanID, &value.configPlanNumber,
 		&value.jobStatus, &value.jobPhase, &value.pauseDisposition, &value.jobType, &value.jobResourceType, &value.jobResourceID, &value.requestedBy, &input, &value.jobAttempt); errors.Is(err, sql.ErrNoRows) {
 		return recoveryBinding{}, false, nil
 	} else if err != nil {
@@ -382,11 +396,11 @@ func bindingMatchesRuntime(binding recoveryBinding, runtimeDeployment runtimeDep
 		binding.planRevisionID != runtimeDeployment.planRevisionID || binding.planRevisionNumber != runtimeDeployment.planRevisionNumber || binding.jobResourceID != binding.appID ||
 		binding.jobType != "deploy" || binding.jobResourceType != "application" || binding.jobAttempt < 1 ||
 		(binding.jobStatus == "waiting_external" && binding.jobPhase == "cancelling") ||
-		(binding.jobStatus == "waiting_user" && (binding.jobPhase != routeReconciliationPause || binding.pauseDisposition != routeReconciliationPause)) {
+		!actualConfigurationMatchesPlan(binding) || !intentionalPauseMatchesRuntime(binding, runtimeDeployment) {
 		return false
 	}
 	input, ok := decodeDeploymentInput(binding.jobInput)
-	if !ok || input.ConfigurationMode != binding.configurationMode || (input.ReleaseID != "" && input.ReleaseID != binding.releaseID) {
+	if !ok || !inputMatchesBinding(input, binding) {
 		return false
 	}
 	switch runtimeDeployment.phase {
@@ -399,6 +413,49 @@ func bindingMatchesRuntime(binding recoveryBinding, runtimeDeployment runtimeDep
 	default:
 		return false
 	}
+}
+
+func actualConfigurationMatchesPlan(binding recoveryBinding) bool {
+	if binding.actualConfigNumber == 0 {
+		return binding.actualConfigID == "" && binding.configBundleVersion == 0 && binding.configPlanID == "" && binding.configPlanNumber == 0
+	}
+	return uuid.Validate(binding.actualConfigID) == nil && binding.configBundleVersion == 2 &&
+		binding.configPlanID == binding.planRevisionID && binding.configPlanNumber == binding.planRevisionNumber
+}
+
+func intentionalPauseMatchesRuntime(binding recoveryBinding, runtimeDeployment runtimeDeployment) bool {
+	if binding.jobStatus != "waiting_user" {
+		return true
+	}
+	if binding.jobPhase != binding.pauseDisposition {
+		return false
+	}
+	switch binding.pauseDisposition {
+	case routeReconciliationPause:
+		return true
+	case replacementCapacityPause:
+		switch runtimeDeployment.phase {
+		case "building", "starting_candidate", "waiting_health", "switching_route":
+			return true
+		case "migrating":
+			return runtimeDeployment.migrationState == "pending" || runtimeDeployment.migrationState == "succeeded"
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+func inputMatchesBinding(input deploymentInput, binding recoveryBinding) bool {
+	if input.ConfigurationMode != binding.configurationMode {
+		return false
+	}
+	if input.ExpectedPlanRevisionID == "" {
+		return input.ReleaseID == "" || input.ReleaseID == binding.releaseID
+	}
+	return input.ExpectedPlanRevisionID == binding.planRevisionID && input.ExpectedPlanRevisionNumber == binding.planRevisionNumber &&
+		input.ExpectedConfigurationRevisionID == binding.actualConfigID && input.ExpectedConfigurationRevisionNumber == binding.actualConfigNumber
 }
 
 func decodeDeploymentInput(raw []byte) (deploymentInput, bool) {
@@ -415,6 +472,17 @@ func decodeDeploymentInput(raw []byte) (deploymentInput, bool) {
 		if _, err := uuid.Parse(input.ReleaseID); err != nil {
 			return deploymentInput{}, false
 		}
+	}
+	if input.ExpectedPlanRevisionID == "" {
+		if input.ExpectedPlanRevisionNumber != 0 || input.ExpectedConfigurationRevisionID != "" || input.ExpectedConfigurationRevisionNumber != 0 {
+			return deploymentInput{}, false
+		}
+		return input, true
+	}
+	if input.ReleaseID != "" || input.ConfigurationMode != "current" || uuid.Validate(input.ExpectedPlanRevisionID) != nil || input.ExpectedPlanRevisionNumber < 1 ||
+		input.ExpectedConfigurationRevisionNumber < 0 || (input.ExpectedConfigurationRevisionID == "") != (input.ExpectedConfigurationRevisionNumber == 0) ||
+		(input.ExpectedConfigurationRevisionID != "" && uuid.Validate(input.ExpectedConfigurationRevisionID) != nil) {
+		return deploymentInput{}, false
 	}
 	return input, true
 }
