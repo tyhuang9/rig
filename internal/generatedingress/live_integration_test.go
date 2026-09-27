@@ -370,8 +370,8 @@ const (
 // into Docker command output.
 const liveApplicationHTTPProbeCommand = `const http=require('node:http');
 const [host,port,expected]=process.argv.slice(-3);
-let done=false,receivedStatus=0;
-const finish=value=>{if(done)return;done=true;process.stdout.write(JSON.stringify(value)+'\n',()=>process.exit(0));};
+let done=false,receivedStatus=0,timer;
+const finish=value=>{if(done)return;done=true;clearTimeout(timer);process.stdout.write(JSON.stringify(value)+'\n',()=>process.exit(0));};
 const received=bodyMatch=>finish({outcome:'response',status:receivedStatus,bodyMatch});
 const request=http.request({host,port:Number(port),path:'/',method:'GET',agent:false,headers:{connection:'close'}},response=>{
   receivedStatus=response.statusCode;
@@ -382,11 +382,11 @@ const request=http.request({host,port:Number(port),path:'/',method:'GET',agent:f
   response.once('error',()=>received(false));
   response.once('aborted',()=>received(false));
 });
-request.setTimeout(1500,()=>{if(receivedStatus){received(false);}request.destroy(Object.assign(new Error('timeout'),{code:'ETIMEDOUT'}));});
 request.once('error',error=>{if(receivedStatus){received(false);}else{finish({outcome:'error',code:typeof error.code==='string'?error.code:'unknown'});}});
+timer=setTimeout(()=>{if(receivedStatus){received(false);}request.destroy(Object.assign(new Error('timeout'),{code:'ETIMEDOUT'}));},1500);
 request.end();`
 
-const liveApplicationHTTPSProbeCommand = `const https=require('node:https');const [host,port,_expected,ca]=process.argv.slice(-4);let done=false;const finish=value=>{if(done)return;done=true;process.stdout.write(JSON.stringify(value)+'\n',()=>process.exit(0));};const request=https.request({host,port:Number(port),servername:'live-external.rig.test',ca:Buffer.from(ca,'base64'),rejectUnauthorized:true,path:'/',method:'GET',agent:false,headers:{connection:'close'}},response=>{response.resume();response.once('end',()=>finish({outcome:'response',status:response.statusCode}));});request.setTimeout(1500,()=>request.destroy(Object.assign(new Error('timeout'),{code:'ETIMEDOUT'})));request.once('error',error=>finish({outcome:'error',code:typeof error.code==='string'?error.code:'unknown'}));request.end();`
+const liveApplicationHTTPSProbeCommand = `const https=require('node:https');const [host,port,_expected,ca]=process.argv.slice(-4);let done=false,timer;const finish=value=>{if(done)return;done=true;clearTimeout(timer);process.stdout.write(JSON.stringify(value)+'\n',()=>process.exit(0));};const request=https.request({host,port:Number(port),servername:'live-external.rig.test',ca:Buffer.from(ca,'base64'),rejectUnauthorized:true,path:'/',method:'GET',agent:false,headers:{connection:'close'}},response=>{response.resume();response.once('end',()=>finish({outcome:'response',status:response.statusCode}));});timer=setTimeout(()=>request.destroy(Object.assign(new Error('timeout'),{code:'ETIMEDOUT'})),1500);request.once('error',error=>finish({outcome:'error',code:typeof error.code==='string'?error.code:'unknown'}));request.end();`
 
 type liveApplicationInspection struct {
 	ID           string                         `json:"id"`
@@ -607,35 +607,43 @@ func assertLiveCaddyAdminControl(t *testing.T, ctx context.Context, runner runti
 // must remain reachable, including when an alias body comparison times out.
 const liveHTTPResponseProbeControlCommand = `const http=require('node:http');const {spawn}=require('node:child_process');
 const script=process.argv.at(-1);
+async function probe(command,args){
+  return new Promise((resolve,reject)=>{
+    const child=spawn(process.execPath,['-e',command,...args],{stdio:['ignore','pipe','ignore']});
+    let output='';const timer=setTimeout(()=>{child.kill();reject(new Error('control deadline'));},4000);
+    child.stdout.on('data',chunk=>{output+=chunk;if(output.length>256){child.kill();reject(new Error('control output'));}});
+    child.once('error',error=>{clearTimeout(timer);reject(error);});
+    child.once('close',code=>{clearTimeout(timer);if(code!==0){reject(new Error('control exit'));return;}try{resolve(JSON.parse(output));}catch{reject(new Error('control result'));}});
+  });
+}
 async function control(expected,status){
   const server=http.createServer((_request,response)=>{response.writeHead(status);response.flushHeaders();});
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
   try{
-    const value=await new Promise((resolve,reject)=>{
-      const child=spawn(process.execPath,['-e',script,'127.0.0.1',String(server.address().port),expected],{stdio:['ignore','pipe','ignore']});
-      let output='';const timer=setTimeout(()=>{child.kill();reject(new Error('control deadline'));},4000);
-      child.stdout.on('data',chunk=>{output+=chunk;if(output.length>256){child.kill();reject(new Error('control output'));}});
-      child.once('error',error=>{clearTimeout(timer);reject(error);});
-      child.once('close',code=>{clearTimeout(timer);if(code!==0){reject(new Error('control exit'));return;}try{resolve(JSON.parse(output));}catch{reject(new Error('control result'));}});
-    });
+    const value=await probe(script,['127.0.0.1',String(server.address().port),expected]);
     if(value.outcome!=='response'||value.status!==status||value.code!==undefined||value.bodyMatch!==(expected===''))throw new Error('HTTP headers lost');
   }finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
 }
-(async()=>{await control('',403);await control('expected',401);process.stdout.write('2',()=>process.exit(0));})().catch(()=>process.exit(1));`
+async function unconnected(){
+  const fake="{const http=require('node:http');const {EventEmitter}=require('node:events');http.request=()=>{const request=new EventEmitter();request.end=()=>{};request.destroy=error=>queueMicrotask(()=>request.emit('error',error));return request;};}\n"+script;
+  const value=await probe(fake,['127.0.0.1','1','']);
+  if(value.outcome!=='error'||value.code!=='ETIMEDOUT'||value.status!==undefined)throw new Error('unconnected request did not reach probe deadline');
+}
+(async()=>{await control('',403);await control('expected',401);await unconnected();process.stdout.write('3',()=>process.exit(0));})().catch(()=>process.exit(1));`
 
 func assertLiveHTTPResponseProbeControl(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate) {
 	t.Helper()
 	result, err := runLiveDocker(ctx, runner, docker, working, dockerConfig, 10*time.Second,
 		"container", "exec", source.ContainerID, "node", "-e", liveHTTPResponseProbeControlCommand, liveApplicationHTTPProbeCommand)
 	defer clearLiveResult(&result)
-	if ctx.Err() != nil || err != nil || result.StdoutTruncated || result.StderrTruncated || string(result.Stdout) != "2" {
-		t.Fatal("HTTP headers followed by a stalled body were not classified as reachable")
+	if ctx.Err() != nil || err != nil || result.StdoutTruncated || result.StderrTruncated || string(result.Stdout) != "3" {
+		t.Fatal("HTTP response and unconnected socket controls did not retain their distinct classifications")
 	}
 }
 
 func assertLiveApplicationProbeSuccess(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, target netip.Addr, port uint16, failure string) {
 	t.Helper()
-	result := runLiveApplicationProbe(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPProbeCommand, target, port, "", "")
+	result := runLiveApplicationProbe(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPProbeCommand, target, port, "", "", failure)
 	if liveApplicationProbeClassification(result) != liveApplicationProbeReachable || result.Status < http.StatusOK || result.Status >= http.StatusMultipleChoices {
 		t.Fatalf("%s: %s", failure, liveApplicationProbeDiagnostic(result))
 	}
@@ -643,7 +651,7 @@ func assertLiveApplicationProbeSuccess(t *testing.T, ctx context.Context, runner
 
 func assertLiveApplicationProbeDenied(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, target netip.Addr, port uint16, failure string) {
 	t.Helper()
-	result := runLiveApplicationProbe(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPProbeCommand, target, port, "", "")
+	result := runLiveApplicationProbe(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPProbeCommand, target, port, "", "", failure)
 	if liveApplicationProbeClassification(result) != liveApplicationProbeBlocked {
 		t.Fatalf("%s: %s", failure, liveApplicationProbeDiagnostic(result))
 	}
@@ -654,7 +662,7 @@ func assertLiveApplicationAliasSuccess(t *testing.T, ctx context.Context, runner
 	if !validName(alias, 96) {
 		t.Fatal("application-origin alias probe had an invalid owned alias")
 	}
-	result := runLiveApplicationProbeTarget(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPProbeCommand, alias, source.InternalPort, expected, "")
+	result := runLiveApplicationProbeTarget(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPProbeCommand, alias, source.InternalPort, expected, "", failure)
 	if liveApplicationProbeClassification(result) != liveApplicationProbeReachable || result.Status < http.StatusOK || result.Status >= http.StatusMultipleChoices || !result.BodyMatch {
 		t.Fatalf("%s: %s", failure, liveApplicationProbeDiagnostic(result))
 	}
@@ -665,7 +673,7 @@ func assertLiveApplicationAliasDenied(t *testing.T, ctx context.Context, runner 
 	if !strings.Contains(alias, ".") {
 		t.Fatal("application-origin alias probe did not use a qualified private alias")
 	}
-	result := runLiveApplicationProbeTarget(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPProbeCommand, alias, port, "", "")
+	result := runLiveApplicationProbeTarget(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPProbeCommand, alias, port, "", "", failure)
 	if liveApplicationProbeClassification(result) != liveApplicationProbeBlocked {
 		t.Fatalf("%s: %s", failure, liveApplicationProbeDiagnostic(result))
 	}
@@ -673,21 +681,21 @@ func assertLiveApplicationAliasDenied(t *testing.T, ctx context.Context, runner 
 
 func assertLiveApplicationHTTPSProbeSuccess(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, gateway netip.Addr, external liveExternalTLSFixture, failure string) {
 	t.Helper()
-	result := runLiveApplicationProbe(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPSProbeCommand, gateway, external.port, "", external.ca)
+	result := runLiveApplicationProbe(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPSProbeCommand, gateway, external.port, "", external.ca, failure)
 	if liveApplicationProbeClassification(result) != liveApplicationProbeReachable || result.Status < http.StatusOK || result.Status >= http.StatusMultipleChoices {
 		t.Fatalf("%s: %s", failure, liveApplicationProbeDiagnostic(result))
 	}
 }
 
-func runLiveApplicationProbe(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, command string, target netip.Addr, port uint16, expected, ca string) liveApplicationProbeResult {
+func runLiveApplicationProbe(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, command string, target netip.Addr, port uint16, expected, ca, failure string) liveApplicationProbeResult {
 	t.Helper()
 	if !target.Is4() {
 		t.Fatal("application-origin probe had an invalid attested target")
 	}
-	return runLiveApplicationProbeTarget(t, ctx, runner, docker, working, dockerConfig, source, command, target.String(), port, expected, ca)
+	return runLiveApplicationProbeTarget(t, ctx, runner, docker, working, dockerConfig, source, command, target.String(), port, expected, ca, failure)
 }
 
-func runLiveApplicationProbeTarget(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, command, target string, port uint16, expected, ca string) liveApplicationProbeResult {
+func runLiveApplicationProbeTarget(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, command, target string, port uint16, expected, ca, failure string) liveApplicationProbeResult {
 	t.Helper()
 	if ctx.Err() != nil || !validContainerID(source.ContainerID) || target == "" || port == 0 {
 		t.Fatal("application-origin probe had an invalid attested target")
@@ -699,7 +707,19 @@ func runLiveApplicationProbeTarget(t *testing.T, ctx context.Context, runner run
 	result, err := runLiveDocker(ctx, runner, docker, working, dockerConfig, 8*time.Second, args...)
 	defer clearLiveResult(&result)
 	if ctx.Err() != nil || err != nil || result.StdoutTruncated || result.StderrTruncated {
-		t.Fatal("application-origin probe did not complete")
+		reason := "command failed"
+		var exitError *exec.ExitError
+		switch {
+		case ctx.Err() != nil:
+			reason = "parent canceled"
+		case errors.Is(err, context.DeadlineExceeded):
+			reason = "command deadline"
+		case errors.As(err, &exitError):
+			reason = fmt.Sprintf("command exit %d", exitError.ExitCode())
+		case result.StdoutTruncated || result.StderrTruncated:
+			reason = "output truncated"
+		}
+		t.Fatalf("%s: application-origin probe did not complete (%s)", failure, reason)
 	}
 	value, valid := decodeLiveApplicationProbeResult(result.Stdout)
 	if !valid {

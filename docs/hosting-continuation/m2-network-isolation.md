@@ -4,14 +4,15 @@
 network and control-plane isolation while retaining the generated runtime's
 ownership, route, hardening and cleanup safeguards.
 
-**Candidate branch:** `feature/hosting-m2-network-isolation`, local and
-unpublished, based on gateway-readiness revision
+**Candidate branch:** `feature/hosting-m2-network-isolation`, published as draft
+[PR 80](https://github.com/tyhuang9/rig/pull/80), based on gateway-readiness revision
 `26a2837a278d120d961fae58391b605c0b290226`.
 
-**Source revision:** `bd99246872918c5b6e1539c0e69011dee2ba29c8`.
+**Initial source revision:** `bd99246872918c5b6e1539c0e69011dee2ba29c8`.
 
-This records the local candidate and its verification. No new isolation probe
-has executed in Docker yet, and this page does not claim RUN-09 or M2 completion.
+This records the local candidate and its verification. The first hosted Docker
+run exposed a test-probe timeout issue; this page does not claim RUN-09 or M2
+completion.
 
 ## Actual baseline
 
@@ -94,7 +95,9 @@ The HTTP probes report received response headers immediately for denied
 targets: any HTTP status is reachable. An expected-body positive retains that
 received status if its body later stalls or fails. The mandatory Docker
 lifecycle test also exercises the exact Node script against 403 and 401
-listeners that send headers and deliberately leave their response unfinished.
+listeners that send headers and deliberately leave their response unfinished,
+plus a request whose socket never connects. The probes use a wall-clock
+deadline covering connection setup as well as response time.
 Execution errors, parent deadlines, truncated output, malformed/trailing JSON,
 unknown fields and unrecognized transport errors fail qualification.
 
@@ -118,8 +121,9 @@ All passed: ingress 3.374s, runtime 0.561s, generated OpenAPI/controller check
 0.517s. `gofmt` and the owned ingress-file whitespace check passed. The parent
 also extracted and executed the exact checked-in Node probe/control constants
 locally against controlled loopback HTTP listeners; both stalled-header
-controls passed. This is executable probe behavior evidence, not Docker
-network-isolation evidence.
+controls passed. The updated control additionally passed a never-connected
+socket and required a bounded `ETIMEDOUT` result. This verifies probe behavior;
+Docker network isolation remains unaccepted.
 
 The complete local delivery checks also passed on the stable source:
 
@@ -162,13 +166,24 @@ The skill prohibits a manual CodeRabbit fallback. That local automated review
 is unrun; the existing hosted CodeRabbit review remains a pending draft gate.
 No production-readiness or merge approval follows from this local record.
 
-## Verification and remaining work
+## First hosted result and remaining work
 
-Actual Docker execution and Linux race qualification require hosted CI here.
+The first hosted Docker gate for draft PR 80 at `e8824130c97113f5595378d916a4a2611bcfb52d`
+ran on 2026-09-27. Its controller journey, gateway-readiness and external
+database/HTTPS checks passed. The generated blue-green lifecycle failed at its
+new application-origin probe with the safe diagnostic "probe did not complete";
+the job's complete Docker cleanup step passed. This is a failed RUN-09 gate,
+not an accepted isolation result. The new probe had used Node's request socket
+timeout, which does not bound an unconnected socket. The pending correction
+uses an explicit wall-clock request deadline and labels the failed probe stage
+without printing command output or secrets. A fresh hosted run must establish
+the actual result.
+
+Successful Docker and Linux race qualification require hosted CI here.
 Windows has CGO disabled, so local race execution is unavailable and was not
 claimed. The live Docker tests are opt-in; their ordinary native-suite skips
-do not establish RUN-09. New publication requires the user's explicit
-authorization.
+do not establish RUN-09. Publication of PR 80 was explicitly authorized; a
+different branch requires separate authorization.
 
 No production network/firewall change, schema migration, history rewrite,
 managed database or external database provisioning is part of the initial
@@ -181,7 +196,8 @@ outside either app's container network namespace. Successful access proves
 that bridge isolation permits this outward path. It does not prove public
 Internet routing, a particular external provider, or LAN deployment. Existing
 controller evidence uses application-owned PostgreSQL and HTTPS fixtures.
-Actual Docker and Linux race qualification for this candidate remain pending.
+Successful Docker and Linux race qualification for this candidate remain
+pending.
 
 Other M2 acceptance remains incomplete: the live user GitHub walkthrough,
 approved migration and uncertainty boundaries, external-service outage during
