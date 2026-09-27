@@ -10,6 +10,7 @@ type hostdMode uint8
 const (
 	hostdModeUI hostdMode = iota
 	hostdModeServe
+	hostdModeBootstrapToken
 )
 
 type hostdInvocation struct {
@@ -28,6 +29,8 @@ func classifyHostdInvocation(args []string) (hostdInvocation, error) {
 		return hostdInvocation{mode: hostdModeUI, args: append([]string(nil), args[1:]...)}, nil
 	case "serve":
 		return hostdInvocation{mode: hostdModeServe, args: append([]string(nil), args[1:]...)}, nil
+	case "bootstrap-token":
+		return hostdInvocation{mode: hostdModeBootstrapToken, args: append([]string(nil), args[1:]...)}, nil
 	default:
 		if strings.HasPrefix(args[0], "-") {
 			return hostdInvocation{
@@ -36,6 +39,6 @@ func classifyHostdInvocation(args []string) (hostdInvocation, error) {
 				legacyServerArgs: true,
 			}, nil
 		}
-		return hostdInvocation{}, errors.New("unknown hostd command; use hostd, hostd ui, or hostd serve")
+		return hostdInvocation{}, errors.New("unknown hostd command; use hostd, hostd ui, hostd serve, or hostd bootstrap-token")
 	}
 }

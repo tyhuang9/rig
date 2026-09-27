@@ -18,6 +18,7 @@ import (
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/autodeploy"
+	"github.com/hostd/hostd/internal/bootstraplocator"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/database"
@@ -68,6 +69,20 @@ func runServer(args []string) int {
 	if err != nil {
 		logger.Error("bootstrap token file setup failed", "error", err)
 		return 1
+	}
+	if token != "" {
+		removeLocator, locatorErr := bootstraplocator.DefaultStore().Register(cfg.DataRoot, auth.BootstrapTokenLifetime)
+		if locatorErr != nil {
+			logger.Warn("bootstrap token command discovery unavailable; use the printed protected file path", "error", locatorErr)
+		} else {
+			removeToken := bootstrapCompleted
+			bootstrapCompleted = func() {
+				removeToken()
+				if err := removeLocator(); err != nil {
+					logger.Error("bootstrap token locator cleanup failed", "error", err)
+				}
+			}
+		}
 	}
 	defer bootstrapCompleted()
 	m := machines.New(db)

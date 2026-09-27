@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer } from "node:net";
-import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { JobMutationResponse } from "../src/generated/api-contract";
@@ -18,6 +18,7 @@ let manualSourceRoot = "";
 let baseURL = "";
 let bootstrapToken = "";
 let bootstrapTokenFile = "";
+let bootstrapLocatorDir = "";
 
 async function availablePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -46,14 +47,17 @@ test.beforeAll(async () => {
   await writeFile(path.join(sourceRoot, "package-lock.json"), JSON.stringify({ lockfileVersion: 3 }), "utf8");
   await writeFile(path.join(composeSourceRoot, "compose.yaml"), "services:\n  web:\n    image: nginx:alpine\n", "utf8");
   const binary = path.join(dataRoot, process.platform === "win32" ? "hostd-e2e.exe" : "hostd-e2e");
-  const hostctl = path.join(dataRoot, process.platform === "win32" ? "hostctl-e2e.exe" : "hostctl-e2e");
   const build = spawnSync("go", ["build", "-o", binary, "./cmd/hostd"], { cwd: repoRoot, encoding: "utf8" });
   if (build.status !== 0) throw new Error(`hostd build failed: ${build.stderr}`);
-  const ctlBuild = spawnSync("go", ["build", "-o", hostctl, "./cmd/hostctl"], { cwd: repoRoot, encoding: "utf8" });
-  if (ctlBuild.status !== 0) throw new Error(`hostctl build failed: ${ctlBuild.stderr}`);
+  const userConfigRoot = path.join(dataRoot, "user-config");
+  await mkdir(userConfigRoot);
+  const platformConfigRoot = process.platform === "darwin" ? path.join(userConfigRoot, "Library", "Application Support") : userConfigRoot;
+  bootstrapLocatorDir = path.join(platformConfigRoot, "hostd", "bootstrap-locators");
+  bootstrapTokenFile = path.join(dataRoot, "bootstrap-token.secret");
+  const bootstrapEnv = { ...process.env, APPDATA: userConfigRoot, XDG_CONFIG_HOME: userConfigRoot, ...(process.platform === "darwin" ? { HOME: userConfigRoot } : {}) };
   const port = await availablePort();
   baseURL = `http://127.0.0.1:${port}`;
-  daemon = spawn(binary, ["--data-root", dataRoot, "--listen", `127.0.0.1:${port}`, "--fake-runtime"], { cwd: repoRoot, windowsHide: true });
+  daemon = spawn(binary, ["--data-root", dataRoot, "--listen", `127.0.0.1:${port}`, "--fake-runtime"], { cwd: repoRoot, env: bootstrapEnv, windowsHide: true });
   let stderr = "";
   let stdout = "";
   daemon.stderr.on("data", (chunk) => {
@@ -61,26 +65,24 @@ test.beforeAll(async () => {
   });
   daemon.stdout.on("data", (chunk) => {
     stdout += chunk.toString("utf8");
-    const pathLine = stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find((line) => line.endsWith("bootstrap-token.secret"));
-    if (!pathLine || bootstrapToken) return;
-    bootstrapTokenFile = pathLine;
-    const read = spawnSync(hostctl, ["bootstrap-token", "--file", bootstrapTokenFile], { cwd: repoRoot, encoding: "utf8" });
-    if (read.status === 0) bootstrapToken = read.stdout.trim();
   });
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
     try {
       const response = await fetch(`${baseURL}/api/v1/auth/bootstrap/status`);
-      if (response.ok && bootstrapToken) return;
+      if (response.ok) {
+        const read = spawnSync(binary, ["bootstrap-token"], { cwd: dataRoot, env: bootstrapEnv, encoding: "utf8" });
+        if (read.status === 0) {
+          bootstrapToken = read.stdout.trim();
+          if (bootstrapToken) return;
+        }
+      }
     } catch {
       // The process may still be starting.
     }
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
-  throw new Error(`hostd did not start or expose a protected bootstrap token file. stdout: ${stdout}; stderr: ${stderr}`);
+  throw new Error(`hostd did not start or expose a protected bootstrap token through its command. stdout: ${stdout}; stderr: ${stderr}`);
 });
 
 test.afterAll(async () => {
@@ -125,6 +127,7 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
       return false;
     }
   }).toBe(false);
+  await expect.poll(async () => (await readdir(bootstrapLocatorDir)).length).toBe(0);
   await expect(page).toHaveTitle("Applications · hostd");
 
   await page.getByRole("button", { name: "Sign out" }).click();
