@@ -300,6 +300,9 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 					return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 				}
 				_ = e.cleanupCandidates(ctx, candidates)
+				if generatedruntime.RouteGatewayReadinessFailed(switchErr) {
+					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "gateway_readiness_failed", generatedruntimestate.DiagnosticRouteSwitchFailed)
+				}
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "apply_failed", generatedruntimestate.DiagnosticRouteSwitchFailed)
 			}
 			runtimeDeployment = advanced

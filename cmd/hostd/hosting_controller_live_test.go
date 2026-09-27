@@ -211,12 +211,13 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	settings := config.Defaults()
 	settings.DataRoot = dataRoot
 	settings.GeneratedRuntime = true
+	healthObserver := &controllerJourneyHealthObserver{
+		delegate: runtimeprocess.ExecRunner{}, test: t, last: make(map[string]string),
+	}
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans,
-	}, runtimeCompositionOptions{dockerExecutable: docker, runner: &controllerJourneyHealthObserver{
-		delegate: runtimeprocess.ExecRunner{}, test: t, last: make(map[string]string),
-	}})
+	}, runtimeCompositionOptions{dockerExecutable: docker, runner: healthObserver})
 	if err != nil {
 		t.Fatal("compose production generated runtime:", err)
 	}
@@ -1051,6 +1052,95 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedReplacementRouteURL, "read", browserNote)
 	t.Logf("M2 controller journey identities: app=%s connection=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s replacement-config=%s/%d capacity-pause-job=%s capacity-pause-disposition=%s capacity-pause-deployment=%s capacity-pause-release=%s capacity-pause-no-build=%t capacity-pause-serving-unchanged=%t capacity-resume-attempt=%d replacement-job=%s replacement-deployment=%s replacement-release=%s bad-config=%s/%d failed-job=%s failed-deployment=%s source=github-fixture sha=%s archive-reads=%d ingress=127.0.0.1:8080", application.ID, connection.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID, replacementConfiguration.RevisionID, replacementConfiguration.RevisionNumber, pausedReplacement.ID, pausedReplacement.PauseDisposition, pausedDeployment.ID, pausedDeployment.ReleaseID, true, true, replacementJob.Attempt, replacementJob.ID, replacementDeployment.ID, replacementRelease.ID, badConfiguration.RevisionID, badConfiguration.RevisionNumber, failedJob.ID, failedDeployment.ID, controllerJourneyGitHubSHA, provider.archiveReads.Load())
+
+	gatewayEntries := append([]apicontract.ScopedConfigurationValueInput(nil), publicEntries...)
+	for index := range gatewayEntries {
+		if gatewayEntries[index].Key == "API_RUNTIME_MARKER" {
+			gatewayEntries[index].Value = "controller-journey-gateway-loopback"
+		}
+	}
+	gatewayEntries = append(gatewayEntries,
+		apicontract.ScopedConfigurationValueInput{Phase: "runtime", TargetComponent: "api", Key: "DATABASE_TLS_CA_PEM_BASE64", Value: caBase64, Sensitive: true},
+		apicontract.ScopedConfigurationValueInput{Phase: "runtime", TargetComponent: "api", Key: "API_BIND_ADDRESS", Value: "127.0.0.1", Sensitive: false},
+	)
+	var gatewayConfiguration apicontract.ApplicationConfiguration
+	gatewayResponse := request(http.MethodPut, "/api/v1/apps/"+application.ID+"/scoped-configuration", apicontract.ReplaceScopedApplicationConfigurationRequest{
+		ExpectedRevisionNumber: badConfiguration.RevisionNumber, PlanRevisionID: plan.RevisionID, PlanRevisionNumber: plan.RevisionNumber,
+		PublicBuildDisclosureAcknowledged: true, Entries: gatewayEntries, Remove: []apicontract.ScopedConfigurationKey{},
+	}, http.StatusOK, &gatewayConfiguration)
+	if gatewayConfiguration.RevisionNumber != badConfiguration.RevisionNumber+1 || gatewayConfiguration.RevisionID == badConfiguration.RevisionID ||
+		bytes.Contains(gatewayResponse, []byte(caBase64)) || bytes.Contains(gatewayResponse, []byte(dbURL)) || bytes.Contains(gatewayResponse, []byte(sentinel)) {
+		t.Fatal("gateway loopback revision was not saved with restored protected configuration")
+	}
+
+	gatewayProbeTarget, err := controllerJourneyGatewayProbeTarget(application.ID)
+	if err != nil {
+		t.Fatal("derive expected gateway readiness target")
+	}
+	restartedObserver.beginGatewayReadinessCapture(gatewayProbeTarget)
+	var gatewayMutation apicontract.JobMutationResponse
+	request(http.MethodPost, deploymentPath, apicontract.DeployApplicationRequest{
+		ExpectedPlanRevisionID: plan.RevisionID, ExpectedPlanRevisionNumber: plan.RevisionNumber,
+		ExpectedConfigurationRevisionID: gatewayConfiguration.RevisionID, ExpectedConfigurationRevisionNumber: gatewayConfiguration.RevisionNumber,
+	}, http.StatusAccepted, &gatewayMutation, map[string]string{"Idempotency-Key": uuid.NewString()})
+	if !gatewayMutation.Created || gatewayMutation.Job.ID == failedJob.ID {
+		t.Fatal("controller did not enqueue a distinct gateway readiness failure")
+	}
+	gatewayDeadline := time.Now().Add(8 * time.Minute)
+	var gatewayJob jobs.Job
+	for {
+		gatewayJob, err = restarted.jobs.Get(gatewayMutation.Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gatewayJob.Status == string(jobs.Failed) {
+			break
+		}
+		if gatewayJob.Status == string(jobs.Succeeded) || gatewayJob.Status == string(jobs.WaitingUser) || gatewayJob.Status == string(jobs.NeedsAttention) || time.Now().After(gatewayDeadline) || ctx.Err() != nil {
+			t.Fatalf("gateway loopback replacement had unexpected result: status=%s phase=%s code=%s", gatewayJob.Status, gatewayJob.Phase, gatewayJob.ErrorCode)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	apiCandidate, gatewayProbeFailed := restartedObserver.gatewayReadinessCapture()
+	var gatewayHistory apicontract.DeploymentList
+	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/deployments", nil, http.StatusOK, &gatewayHistory)
+	if len(gatewayHistory.Items) != 4 {
+		t.Fatal("gateway readiness failure did not retain immutable deployment history")
+	}
+	var gatewayDeployment apicontract.Deployment
+	for _, item := range gatewayHistory.Items {
+		if item.JobID == gatewayJob.ID {
+			gatewayDeployment = item
+		}
+	}
+	if gatewayDeployment.ID == "" || gatewayDeployment.Status != "failed" || gatewayDeployment.DiagnosticCode != "gateway_readiness_failed" ||
+		gatewayDeployment.ActualConfigurationRevisionID != gatewayConfiguration.RevisionID || gatewayDeployment.ActualConfigurationRevisionNumber != gatewayConfiguration.RevisionNumber ||
+		gatewayDeployment.DeploymentPlanRevisionID != plan.RevisionID || gatewayDeployment.DeploymentPlanRevisionNumber != plan.RevisionNumber || gatewayDeployment.ReleaseID == "" {
+		t.Fatal("gateway readiness deployment did not retain its immutable pins")
+	}
+	if gatewayJob.ErrorCode != "gateway_readiness_failed" || apiCandidate.ID == "" ||
+		apiCandidate.AppID != application.ID || apiCandidate.DeploymentID != gatewayDeployment.ID || apiCandidate.ReleaseID != gatewayDeployment.ReleaseID || !gatewayProbeFailed {
+		t.Fatal("gateway loopback candidate did not fail after Docker health and the fixed Caddy probe")
+	}
+	var gatewayReleases apicontract.ReleaseList
+	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/releases", nil, http.StatusOK, &gatewayReleases)
+	var gatewayRelease apicontract.Release
+	for _, item := range gatewayReleases.Items {
+		if item.ID == gatewayDeployment.ReleaseID {
+			gatewayRelease = item
+		}
+	}
+	if gatewayRelease.ID == "" || gatewayRelease.ArchiveSha256 != replacementRelease.ArchiveSha256 ||
+		gatewayRelease.ConfigurationRevisionID != gatewayConfiguration.RevisionID || gatewayRelease.ConfigurationRevisionNumber != gatewayConfiguration.RevisionNumber ||
+		gatewayRelease.DeploymentPlanRevisionID != plan.RevisionID || gatewayRelease.DeploymentPlanRevisionNumber != plan.RevisionNumber {
+		t.Fatal("gateway readiness release did not retain same-source immutable pins")
+	}
+	retainedGatewayRouteURL := assertAttestedRoute(replacementDeployment)
+	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
+	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
+	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
+	controllerJourneyBrowser(t, ctx, node, application.ID, retainedGatewayRouteURL, "read", browserNote)
+	t.Logf("M2 gateway readiness identities: gateway-config=%s/%d gateway-job=%s gateway-deployment=%s gateway-release=%s serving-deployment=%s", gatewayConfiguration.RevisionID, gatewayConfiguration.RevisionNumber, gatewayJob.ID, gatewayDeployment.ID, gatewayRelease.ID, replacementDeployment.ID)
 }
 
 func controllerJourneyExecutable(t *testing.T, name string) string {
@@ -1221,11 +1311,22 @@ func TestControllerJourneyStageSource(t *testing.T) {
 // Record only Docker's component health transitions. Runtime command output
 // and healthcheck logs may contain application secrets and are never logged.
 type controllerJourneyHealthObserver struct {
-	delegate runtimeprocess.CommandRunner
-	test     *testing.T
-	mu       sync.Mutex
-	last     map[string]string
-	builds   int
+	delegate                runtimeprocess.CommandRunner
+	test                    *testing.T
+	mu                      sync.Mutex
+	last                    map[string]string
+	builds                  int
+	captureGatewayReadiness bool
+	expectedGatewayTarget   string
+	apiCandidate            controllerJourneyCandidate
+	gatewayProbeFailed      bool
+}
+
+type controllerJourneyCandidate struct {
+	ID           string
+	AppID        string
+	DeploymentID string
+	ReleaseID    string
 }
 
 func (observer *controllerJourneyHealthObserver) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -1235,10 +1336,18 @@ func (observer *controllerJourneyHealthObserver) Run(ctx context.Context, reques
 		observer.mu.Unlock()
 	}
 	result, err := observer.delegate.Run(ctx, request)
+	observer.mu.Lock()
+	if observer.captureGatewayReadiness && controllerJourneyGatewayProbe(request, observer.expectedGatewayTarget) {
+		if err != nil || result.StdoutTruncated || result.StderrTruncated {
+			observer.gatewayProbeFailed = true
+		}
+	}
+	observer.mu.Unlock()
 	if err != nil || len(request.Args) < 4 || request.Args[0] != "container" || request.Args[1] != "inspect" {
 		return result, err
 	}
 	var state struct {
+		ID       string            `json:"id"`
 		Name     string            `json:"name"`
 		Labels   map[string]string `json:"labels"`
 		Running  bool              `json:"running"`
@@ -1252,6 +1361,12 @@ func (observer *controllerJourneyHealthObserver) Run(ctx context.Context, reques
 	observer.mu.Lock()
 	previous := observer.last[state.Name]
 	observer.last[state.Name] = status
+	if observer.captureGatewayReadiness && state.Labels["io.rig.component"] == "api" && state.Running && state.Health == "healthy" && state.ID != "" {
+		observer.apiCandidate = controllerJourneyCandidate{
+			ID: state.ID, AppID: state.Labels["io.rig.application"],
+			DeploymentID: state.Labels["io.rig.deployment"], ReleaseID: state.Labels["io.rig.release"],
+		}
+	}
 	observer.mu.Unlock()
 	if previous != status {
 		observer.test.Logf("Docker candidate %s %s", state.Labels["io.rig.component"], status)
@@ -1347,6 +1462,52 @@ func (source *controllerJourneyCapacitySource) Snapshot(ctx context.Context) (ge
 		return generatedruntime.CapacitySnapshot{}, errors.New("capacity source delegate is required")
 	}
 	return delegate.Snapshot(ctx)
+}
+
+func (observer *controllerJourneyHealthObserver) beginGatewayReadinessCapture(expectedTarget string) {
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	observer.captureGatewayReadiness = true
+	observer.expectedGatewayTarget = expectedTarget
+	observer.apiCandidate = controllerJourneyCandidate{}
+	observer.gatewayProbeFailed = false
+}
+
+func (observer *controllerJourneyHealthObserver) gatewayReadinessCapture() (apiCandidate controllerJourneyCandidate, gatewayProbeFailed bool) {
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	observer.captureGatewayReadiness = false
+	observer.expectedGatewayTarget = ""
+	return observer.apiCandidate, observer.gatewayProbeFailed
+}
+
+// controllerJourneyGatewayProbe recognizes the fixed, body-discarding Caddy
+// readiness command against a controller-derived target. It retains neither
+// command output nor application data.
+func controllerJourneyGatewayProbe(request runtimeprocess.CommandRequest, expectedTarget string) bool {
+	if len(request.Args) != 21 || request.Args[0] != "container" || request.Args[1] != "exec" || request.Args[3] != "curl" {
+		return false
+	}
+	fixed := []string{
+		"curl", "--disable", "--silent", "--head", "--output", "/dev/null", "--write-out", "%{http_code}",
+		"--http1.1", "--proto", "=http", "--noproxy", "*", "--connect-timeout", "1", "--max-time", "2",
+	}
+	for index, expected := range fixed {
+		if request.Args[index+3] != expected {
+			return false
+		}
+	}
+	return expectedTarget != "" && request.Args[len(request.Args)-1] == expectedTarget
+}
+
+func controllerJourneyGatewayProbeTarget(appID string) (string, error) {
+	network, err := generatedruntime.DescribeAppNetwork(appID)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256([]byte("api"))
+	alias := "rig-c-" + fmt.Sprintf("%x", digest)[:12] + "-blue"
+	return "http://" + alias + "." + network.Name + ":3000/", nil
 }
 
 func controllerJourneyDocker(ctx context.Context, docker string, extraEnv []string, args ...string) ([]byte, error) {

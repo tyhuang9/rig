@@ -24,6 +24,12 @@ func (executor pauseExecutor) Execute(context.Context, Job, ProgressReporter) (E
 	return ExecutionResult{Disposition: ExecutionWaitingUser, PauseDisposition: disposition}, nil
 }
 
+type gatewayReadinessFailureExecutor struct{}
+
+func (gatewayReadinessFailureExecutor) Execute(context.Context, Job, ProgressReporter) (ExecutionResult, error) {
+	return ExecutionResult{}, &ExecutionError{Code: "gateway_readiness_failed", Detail: "untrusted endpoint output"}
+}
+
 func TestCreateRejectsOversizedIdempotencyKeyAtServiceBoundary(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
@@ -98,12 +104,38 @@ func TestRealDeploymentCompletionAndFailuresAreCentrallySanitized(t *testing.T) 
 		"compose_apply_timeout":                      "Container runtime apply timed out",
 		"compose_apply_output_truncated":             "Container runtime apply output exceeded the allowed limit",
 		"health_failed":                              "Deployment did not become healthy",
+		"gateway_readiness_failed":                   "Deployment is not reachable from the gateway",
 		"internal_error":                             "Deployment failed because of an internal error",
 	}
 	for code, message := range want {
 		gotCode, gotMessage := safeExecutionFailure(&ExecutionError{Code: code, Detail: "provider-secret raw stderr"})
 		if gotCode != code || gotMessage != message || gotMessage == "provider-secret raw stderr" {
 			t.Fatalf("code=%q got=%q/%q", code, gotCode, gotMessage)
+		}
+	}
+}
+
+func TestGatewayReadinessFailurePersistsOnlyTheSafeJobDiagnostic(t *testing.T) {
+	service, closeDB := newTestService(t)
+	defer closeDB()
+	job, _, err := service.Create("deploy", "application", "gateway-readiness", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.runOne(context.Background(), gatewayReadinessFailureExecutor{}); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := service.Get(job.ID)
+	if err != nil || persisted.Status != string(Failed) || persisted.ErrorCode != "gateway_readiness_failed" || persisted.ErrorDetail != "Deployment is not reachable from the gateway" {
+		t.Fatalf("job=%#v err=%v", persisted, err)
+	}
+	events, err := service.Events(job.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if strings.Contains(event.Message, "untrusted endpoint output") {
+			t.Fatalf("unsafe execution detail persisted: %#v", event)
 		}
 	}
 }

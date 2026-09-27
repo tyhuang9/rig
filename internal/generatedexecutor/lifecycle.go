@@ -323,7 +323,7 @@ func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment,
 		if err = e.routes.Switch(ctx, request); err != nil {
 			// The durable active head already names this candidate. Never clean it
 			// up merely because reattesting or reinstalling its route failed.
-			return runtimeDeployment, true, staticError("route reconciliation failed")
+			return runtimeDeployment, true, newRouteSwitchError(err, "route reconciliation failed")
 		}
 		updated, advanceErr := e.state.Advance(ctx, resolved.deployment.AppID, resolved.deployment.ID, generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, "")
 		return updated, true, advanceErr
@@ -337,7 +337,7 @@ func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment,
 		Endpoints: routeEndpoints(resolved.plan, candidates),
 	}
 	if err = e.routes.Switch(ctx, request); err != nil {
-		return runtimeDeployment, generatedruntime.RouteCandidateMayBeLive(err), staticError("route switch failed")
+		return runtimeDeployment, generatedruntime.RouteCandidateMayBeLive(err), newRouteSwitchError(err, "route switch failed")
 	}
 	if _, _, err = e.state.SwitchActive(ctx, resolved.deployment.AppID, resolved.deployment.ID, head.Generation); err != nil {
 		if runtimeDeployment.PreviousActiveDeploymentID == "" {
@@ -375,6 +375,22 @@ func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment,
 		}
 	}
 	return updated, true, nil
+}
+
+// routeSwitchError preserves only the safe, typed ingress readiness outcome.
+// It intentionally excludes the underlying ingress error because a route
+// switcher owns Docker command output and endpoint data.
+type routeSwitchError struct {
+	label                  string
+	gatewayReadinessFailed bool
+}
+
+func (e routeSwitchError) Error() string { return "generated executor: " + e.label }
+
+func (e routeSwitchError) GatewayReadinessFailed() bool { return e.gatewayReadinessFailed }
+
+func newRouteSwitchError(err error, label string) error {
+	return routeSwitchError{label: label, gatewayReadinessFailed: generatedruntime.RouteGatewayReadinessFailed(err)}
 }
 
 func routeEndpoints(plan deploymentplans.DeploymentPlanRevision, candidates map[string]generatedruntime.Candidate) []generatedruntime.RouteEndpoint {

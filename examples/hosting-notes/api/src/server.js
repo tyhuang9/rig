@@ -5,6 +5,7 @@ import { createDatabase } from "./database.js";
 import { runtimeMetadata } from "./config.js";
 
 const port = Number.parseInt(process.env.PORT || "3000", 10);
+const host = process.env.API_BIND_ADDRESS || "0.0.0.0";
 const database = createDatabase(process.env);
 const app = createApp({ database, env: process.env });
 const server = createServer(app);
@@ -32,8 +33,8 @@ server.on("upgrade", (request, socket, head) => {
   sockets.handleUpgrade(request, socket, head, (websocket) => sockets.emit("connection", websocket, request));
 });
 
-server.listen(port, "0.0.0.0", () => {
-  console.info(`hosting-notes API listening on 0.0.0.0:${port}`);
+server.listen(port, host, () => {
+  console.info(`hosting-notes API listening on ${host}:${port}`);
 });
 
 async function close(signal) {

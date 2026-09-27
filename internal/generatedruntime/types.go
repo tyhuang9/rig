@@ -222,6 +222,22 @@ func RouteCandidateMayBeLive(err error) bool {
 	return errors.As(err, &failure) && failure.CandidateMayBeLive()
 }
 
+// RouteReadinessFailure reports that a candidate passed its container-local
+// health check but was not reachable from the attested ingress boundary. The
+// contract deliberately exposes no command output, endpoint, or configuration
+// details to the deployment coordinator.
+type RouteReadinessFailure interface {
+	error
+	GatewayReadinessFailed() bool
+}
+
+// RouteGatewayReadinessFailed lets the deployment coordinator persist the
+// stable readiness outcome without depending on the ingress implementation.
+func RouteGatewayReadinessFailed(err error) bool {
+	var failure RouteReadinessFailure
+	return errors.As(err, &failure) && failure.GatewayReadinessFailed()
+}
+
 // RouteSwitcher is implemented by the ingress milestone. The runtime engine
 // stops at a healthy, isolated candidate and never edits Caddy itself.
 type RouteSwitcher interface {
