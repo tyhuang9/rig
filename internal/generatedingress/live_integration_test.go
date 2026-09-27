@@ -723,9 +723,37 @@ func runLiveApplicationProbeTarget(t *testing.T, ctx context.Context, runner run
 	}
 	value, valid := decodeLiveApplicationProbeResult(result.Stdout)
 	if !valid {
-		t.Fatal("application-origin probe returned an invalid or unknown result")
+		t.Fatalf("%s: application-origin probe returned an invalid or unknown result (%s)", failure, liveApplicationProbeFailureSummary(result.Stdout))
 	}
 	return value
+}
+
+func liveApplicationProbeFailureSummary(output []byte) string {
+	if len(output) == 0 {
+		return "empty output"
+	}
+	if len(output) > liveApplicationProbeLimit {
+		return "oversized output"
+	}
+	var value liveApplicationProbeResult
+	if json.Unmarshal(output, &value) != nil {
+		return "malformed output"
+	}
+	if value.Outcome == "error" {
+		if len(value.Code) == 0 || len(value.Code) > 32 {
+			return "invalid transport code"
+		}
+		for _, character := range value.Code {
+			if character != '_' && (character < 'A' || character > 'Z') && (character < '0' || character > '9') {
+				return "invalid transport code"
+			}
+		}
+		return "transport code " + value.Code
+	}
+	if value.Outcome == "response" {
+		return fmt.Sprintf("response status %d", value.Status)
+	}
+	return "unknown outcome"
 }
 
 func decodeLiveApplicationProbeResult(value []byte) (liveApplicationProbeResult, bool) {
@@ -1081,6 +1109,19 @@ func TestLiveApplicationProbeClassificationFailsClosed(t *testing.T) {
 	} {
 		if _, valid := decodeLiveApplicationProbeResult(value); valid {
 			t.Fatal("unknown probe result was accepted")
+		}
+	}
+	for _, test := range []struct {
+		output []byte
+		want   string
+	}{
+		{[]byte(`{"outcome":"error","code":"EAI_AGAIN"}`), "transport code EAI_AGAIN"},
+		{[]byte(`{"outcome":"error","code":"secret://host"}`), "invalid transport code"},
+		{[]byte(`{"outcome":"response","status":403}`), "response status 403"},
+		{[]byte(`not-json`), "malformed output"},
+	} {
+		if got := liveApplicationProbeFailureSummary(test.output); got != test.want {
+			t.Fatalf("safe failure summary=%q want=%q", got, test.want)
 		}
 	}
 }

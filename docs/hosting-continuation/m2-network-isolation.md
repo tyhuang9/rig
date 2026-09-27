@@ -174,10 +174,16 @@ database/HTTPS checks passed. The generated blue-green lifecycle failed at its
 new application-origin probe with the safe diagnostic "probe did not complete";
 the job's complete Docker cleanup step passed. This is a failed RUN-09 gate,
 not an accepted isolation result. The new probe had used Node's request socket
-timeout, which does not bound an unconnected socket. The pending correction
-uses an explicit wall-clock request deadline and labels the failed probe stage
-without printing command output or secrets. A fresh hosted run must establish
-the actual result.
+timeout, which does not bound an unconnected socket. Revision
+`558bf7d2edab289d642d51931a606122bf6dbb25` used an explicit wall-clock
+request deadline and labeled execution failures without printing command
+output or secrets. Its 2026-09-27 hosted Docker job again failed the blue-green
+lifecycle, this time at "invalid or unknown result"; the external TLS fixture
+and complete Docker cleanup steps passed. That result is distinct from an
+execution timeout and remains unaccepted. The next revision adds bounded,
+sanitized classification of an invalid result and its static probe stage so
+the actual cause can be identified without exposing response bodies or
+credentials. It does not broaden the accepted transport outcomes.
 
 Successful Docker and Linux race qualification require hosted CI here.
 Windows has CGO disabled, so local race execution is unavailable and was not
