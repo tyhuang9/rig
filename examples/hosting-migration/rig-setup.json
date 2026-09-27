@@ -1,0 +1,17 @@
+{
+  "components": [
+    {
+      "id": "api",
+      "technology": "node",
+      "rootDirectory": ".",
+      "packageManager": "npm",
+      "nodeVersion": "24",
+      "installCommand": "npm ci",
+      "buildCommand": "",
+      "startCommand": "node src/server.js",
+      "outputDirectory": "",
+      "internalPort": 3000,
+      "healthProbe": "/readyz"
+    }
+  ]
+}

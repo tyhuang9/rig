@@ -212,6 +212,48 @@ func TestGeneratedCompositionCapacitySourceFactory(t *testing.T) {
 	})
 }
 
+func TestGeneratedCompositionMigrationRunnerFactory(t *testing.T) {
+	t.Run("wrapped runner", func(t *testing.T) {
+		fixture := newRuntimeCompositionFixture(t)
+		fixture.configuration.GeneratedRuntime = true
+		var received generatedruntime.MigrationRunner
+		_, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+			dockerExecutable: fixture.dockerExecutable,
+			recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
+			migrationRunnerFactory: func(runner generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {
+				received = runner
+				return runtimeCompositionMigrationRunner{delegate: runner}
+			},
+		})
+		if err != nil || received == nil {
+			t.Fatalf("wrapped migration runner received=%T err=%v", received, err)
+		}
+	})
+
+	t.Run("nil runner rejected", func(t *testing.T) {
+		fixture := newRuntimeCompositionFixture(t)
+		fixture.configuration.GeneratedRuntime = true
+		_, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+			dockerExecutable: fixture.dockerExecutable,
+			recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
+			migrationRunnerFactory: func(generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {
+				return nil
+			},
+		})
+		if err == nil {
+			t.Fatal("generated composition accepted a nil wrapped migration runner")
+		}
+	})
+}
+
+type runtimeCompositionMigrationRunner struct {
+	delegate generatedruntime.MigrationRunner
+}
+
+func (runner runtimeCompositionMigrationRunner) Run(ctx context.Context, request generatedruntime.MigrationRequest) error {
+	return runner.delegate.Run(ctx, request)
+}
+
 type runtimeCompositionCapacitySource struct {
 	delegate generatedruntime.CapacitySource
 }

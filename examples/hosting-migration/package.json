@@ -1,0 +1,13 @@
+{
+  "name": "@rig-hosting-migration/api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "knex": "3.1.0",
+    "pg": "8.16.3"
+  }
+}

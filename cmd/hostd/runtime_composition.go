@@ -38,11 +38,12 @@ type runtimeCompositionDependencies struct {
 }
 
 type runtimeCompositionOptions struct {
-	dockerExecutable      string
-	runner                runtimeprocess.CommandRunner
-	beforeStep            func(string) error
-	recoverIngress        func(context.Context, *generatedingress.Manager) error
-	capacitySourceFactory func(generatedruntime.CapacitySource) generatedruntime.CapacitySource
+	dockerExecutable       string
+	runner                 runtimeprocess.CommandRunner
+	beforeStep             func(string) error
+	recoverIngress         func(context.Context, *generatedingress.Manager) error
+	capacitySourceFactory  func(generatedruntime.CapacitySource) generatedruntime.CapacitySource
+	migrationRunnerFactory func(generatedruntime.MigrationRunner) generatedruntime.MigrationRunner
 }
 
 type runtimeComposition struct {
@@ -251,6 +252,13 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated migration runner setup: %w", err)
 		}
+		var migrationRunner generatedruntime.MigrationRunner = migration
+		if options.migrationRunnerFactory != nil {
+			migrationRunner = options.migrationRunnerFactory(migrationRunner)
+			if migrationRunner == nil {
+				return runtimeComposition{}, errors.New("generated migration runner factory returned nil")
+			}
+		}
 		if err := step("runtime_state_create"); err != nil {
 			return runtimeComposition{}, err
 		}
@@ -268,7 +276,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		}
 		result.generated, err = generatedexecutor.NewExecutor(
 			dependencies.applications, dependencies.snapshots, dependencies.configuration, dependencies.deployments,
-			dependencies.plans, compiler, artifacts, state, engine, authorization, ingress, migration, generatedexecutor.Options{},
+			dependencies.plans, compiler, artifacts, state, engine, authorization, ingress, migrationRunner, generatedexecutor.Options{},
 		)
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated executor setup: %w", err)
