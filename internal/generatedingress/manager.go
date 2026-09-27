@@ -40,6 +40,11 @@ const (
 	observationTimeout = 15 * time.Second
 	defaultPullTimeout = 5 * time.Minute
 	maximumDrain       = 30 * time.Second
+	// Gateway probes run inside the already-attested Caddy container. Their
+	// output contains only the final three-digit HTTP status and remains too
+	// small to carry application response data across this boundary.
+	gatewayProbeProcessTimeout = 4 * time.Second
+	gatewayProbeOutputLimit    = 16
 )
 
 type Options struct {
@@ -166,6 +171,9 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 		if err := m.reconcileCaddyNetworks(ctx, state.Active); err != nil {
 			return markCandidateMayBeLive(err)
 		}
+		if err := m.verifyGatewayReadiness(ctx, proposed); err != nil {
+			return markCandidateMayBeLive(err)
+		}
 		if err := m.applyRoutes(ctx, state.Active, "reconcile.json"); err != nil {
 			return markCandidateMayBeLive(err)
 		}
@@ -200,6 +208,9 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 		return &Error{Code: DiagnosticRouteStateFailed}
 	}
 	if err := m.reconcileCaddyNetworks(ctx, updated); err != nil {
+		return m.rollbackAfterFailure(err, &state)
+	}
+	if err := m.verifyGatewayReadiness(ctx, proposed); err != nil {
 		return m.rollbackAfterFailure(err, &state)
 	}
 	if err := m.applyRoutes(ctx, updated, "proposed.json"); err != nil {
@@ -757,6 +768,103 @@ func (m *Manager) verifyEndpoints(ctx context.Context, appID string, route route
 		}
 	}
 	return nil
+}
+
+// verifyGatewayReadiness proves that the exact, pinned Caddy container can
+// connect to every candidate endpoint over its application network. Docker's
+// health status is deliberately insufficient here: an application bound only
+// to container loopback can pass it while Caddy cannot serve it.
+//
+// The candidate network is reconciled before this method is called. This
+// method only observes Caddy and executes a fixed, bounded HTTP transport
+// probe. It does not copy or reload a route configuration.
+func (m *Manager) verifyGatewayReadiness(ctx context.Context, route routeRecord) error {
+	if validateRoute(route) != nil {
+		return &Error{Code: DiagnosticRouteInvalid}
+	}
+	caddyID, err := m.attestedCaddyForGateway(ctx, route)
+	if err != nil {
+		return err
+	}
+	for _, endpoint := range route.Endpoints {
+		if err := m.probeGatewayEndpoint(ctx, caddyID, endpoint); err != nil {
+			return err
+		}
+	}
+	confirmedID, err := m.attestedCaddyForGateway(ctx, route)
+	if err != nil {
+		return err
+	}
+	if normalizeID(confirmedID) != normalizeID(caddyID) {
+		return &Error{Code: DiagnosticIngressDrift}
+	}
+	return nil
+}
+
+// attestedCaddyForGateway returns a stable container identity only after
+// reattesting the pinned Caddy image, hardening, listener policy, running
+// state, and candidate-network attachments. Using the immutable ID prevents a
+// name replacement from becoming the probe target.
+func (m *Manager) attestedCaddyForGateway(ctx context.Context, route routeRecord) (string, error) {
+	image, found, err := m.inspectImage(ctx)
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return "", &Error{Code: DiagnosticIngressUnavailable}
+	}
+	if image.OS != "linux" || !validContainerID(image.ID) || !containsDigest(image.RepoDigests, caddyImageDigest) {
+		return "", &Error{Code: DiagnosticIngressDrift}
+	}
+	caddy, found, err := m.inspectCaddy(ctx)
+	if err != nil {
+		return "", err
+	}
+	if !found || !caddy.Running || caddy.Restarting {
+		return "", &Error{Code: DiagnosticIngressUnavailable}
+	}
+	if !validContainerID(caddy.ID) || !validCaddyInspection(caddy, image.ID, m.options.HostPort) || !validCaddyGatewayPriorities(caddy.Networks) {
+		return "", &Error{Code: DiagnosticIngressDrift}
+	}
+	for _, endpoint := range route.Endpoints {
+		if caddy.Networks[endpoint.NetworkName] == nil {
+			return "", &Error{Code: DiagnosticIngressDrift}
+		}
+	}
+	return caddy.ID, nil
+}
+
+func (m *Manager) probeGatewayEndpoint(ctx context.Context, caddyID string, endpoint generatedruntime.RouteEndpoint) error {
+	if !validContainerID(caddyID) || !validName(endpoint.NetworkName, 96) || !validName(endpoint.NetworkAlias, 96) || endpoint.InternalPort == 0 {
+		return &Error{Code: DiagnosticIngressDrift}
+	}
+	address := net.JoinHostPort(endpoint.NetworkAlias+"."+endpoint.NetworkName, strconv.FormatUint(uint64(endpoint.InternalPort), 10))
+	result, runErr := m.runner.Run(ctx, runtimeprocess.CommandRequest{
+		Executable: m.options.DockerExecutable,
+		Args: []string{
+			"container", "exec", caddyID,
+			"curl", "--disable", "--silent", "--head", "--output", "/dev/null", "--write-out", "%{http_code}",
+			"--http1.1", "--proto", "=http", "--noproxy", "*", "--connect-timeout", "1", "--max-time", "2",
+			"http://" + address + "/",
+		},
+		Directory: m.options.WorkingDirectory, Env: append([]string(nil), m.dockerEnv...),
+		Timeout: gatewayProbeProcessTimeout, OutputLimit: gatewayProbeOutputLimit,
+	})
+	defer clearResult(&result)
+	if ctx.Err() != nil || errors.Is(runErr, context.Canceled) {
+		return &Error{Code: DiagnosticCancelled}
+	}
+	if errors.Is(runErr, runtimeprocess.ErrTerminationFailed) {
+		return &Error{Code: DiagnosticIngressUnavailable}
+	}
+	if runErr != nil || result.StdoutTruncated || result.StderrTruncated || !successfulGatewayStatus(result.Stdout) {
+		return gatewayReadinessError()
+	}
+	return nil
+}
+
+func successfulGatewayStatus(value []byte) bool {
+	return len(value) == 3 && value[0] >= '2' && value[0] <= '5' && value[1] >= '0' && value[1] <= '9' && value[2] >= '0' && value[2] <= '9'
 }
 
 func (m *Manager) run(ctx context.Context, timeout time.Duration, args ...string) (runtimeprocess.CommandResult, error) {
@@ -1322,6 +1430,9 @@ func (m *Manager) observeLocked(ctx context.Context, appID string) (Observation,
 		return Observation{}, &Error{Code: DiagnosticIngressDrift}
 	}
 	if err := m.verifyEndpoints(ctx, appID, route); err != nil {
+		return Observation{}, err
+	}
+	if err := m.verifyGatewayReadiness(ctx, route); err != nil {
 		return Observation{}, err
 	}
 	confirmed, found, err := m.inspectCaddy(ctx)

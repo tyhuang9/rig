@@ -21,15 +21,16 @@ type Observation struct {
 type DiagnosticCode string
 
 const (
-	DiagnosticValidationFailed    DiagnosticCode = "validation_failed"
-	DiagnosticIngressUnavailable  DiagnosticCode = "ingress_unavailable"
-	DiagnosticIngressDrift        DiagnosticCode = "ingress_drift_detected"
-	DiagnosticRouteInvalid        DiagnosticCode = "route_invalid"
-	DiagnosticRouteValidateFailed DiagnosticCode = "route_validate_failed"
-	DiagnosticRouteReloadFailed   DiagnosticCode = "route_reload_failed"
-	DiagnosticRouteStateFailed    DiagnosticCode = "route_state_failed"
-	DiagnosticRouteUnresolved     DiagnosticCode = "route_reconciliation_required"
-	DiagnosticCancelled           DiagnosticCode = "cancelled"
+	DiagnosticValidationFailed       DiagnosticCode = "validation_failed"
+	DiagnosticIngressUnavailable     DiagnosticCode = "ingress_unavailable"
+	DiagnosticIngressDrift           DiagnosticCode = "ingress_drift_detected"
+	DiagnosticRouteInvalid           DiagnosticCode = "route_invalid"
+	DiagnosticRouteValidateFailed    DiagnosticCode = "route_validate_failed"
+	DiagnosticRouteReloadFailed      DiagnosticCode = "route_reload_failed"
+	DiagnosticRouteStateFailed       DiagnosticCode = "route_state_failed"
+	DiagnosticRouteUnresolved        DiagnosticCode = "route_reconciliation_required"
+	DiagnosticGatewayReadinessFailed DiagnosticCode = "gateway_readiness_failed"
+	DiagnosticCancelled              DiagnosticCode = "cancelled"
 )
 
 // Error carries only an audit-safe diagnostic code and route safety outcome.
@@ -45,6 +46,12 @@ func (e *Error) Error() string { return "generated ingress: " + string(e.Code) }
 // reconciliation could not prove the candidate is no longer serving traffic.
 func (e *Error) CandidateMayBeLive() bool { return e != nil && e.candidateMayBeLive }
 
+// GatewayReadinessFailed lets callers record a stable, safe deployment
+// diagnostic without importing this ingress package.
+func (e *Error) GatewayReadinessFailed() bool {
+	return e != nil && e.Code == DiagnosticGatewayReadinessFailed
+}
+
 func IsCode(err error, code DiagnosticCode) bool {
 	var target *Error
 	return errors.As(err, &target) && target.Code == code
@@ -52,6 +59,10 @@ func IsCode(err error, code DiagnosticCode) bool {
 
 func candidateMayBeLiveError() *Error {
 	return &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
+}
+
+func gatewayReadinessError() *Error {
+	return &Error{Code: DiagnosticGatewayReadinessFailed}
 }
 
 func markCandidateMayBeLive(err error) *Error {

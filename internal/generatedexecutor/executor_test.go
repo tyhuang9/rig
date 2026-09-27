@@ -423,6 +423,11 @@ type candidateMayBeLiveRouteError struct{}
 func (candidateMayBeLiveRouteError) Error() string            { return "route outcome unresolved" }
 func (candidateMayBeLiveRouteError) CandidateMayBeLive() bool { return true }
 
+type gatewayReadinessRouteError struct{}
+
+func (gatewayReadinessRouteError) Error() string                { return "gateway probe failed" }
+func (gatewayReadinessRouteError) GatewayReadinessFailed() bool { return true }
+
 type fakeMigrations struct {
 	events   *[]string
 	requests []generatedruntime.MigrationRequest
@@ -1235,6 +1240,28 @@ func TestGeneratedExecutorCleansCandidateAfterRolledBackRouteFailure(t *testing.
 	}
 	if fixture.state.deployment.Phase != generatedruntimestate.PhaseFailed {
 		t.Fatalf("durable phase=%s", fixture.state.deployment.Phase)
+	}
+}
+
+func TestGeneratedExecutorPersistsGatewayReadinessFailureAndPreservesOldHead(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	oldDeploymentID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	fixture.state.active = generatedruntimestate.ActiveHead{AppID: testAppID, DeploymentID: oldDeploymentID, ReleaseID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Slot: "green", Generation: 4}
+	fixture.routes.err = gatewayReadinessRouteError{}
+
+	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	var executionErr *jobs.ExecutionError
+	if !errors.As(err, &executionErr) || executionErr.Code != "gateway_readiness_failed" {
+		t.Fatalf("err=%v", err)
+	}
+	if fixture.runtime.stopped != 1 || fixture.state.active.DeploymentID != oldDeploymentID || fixture.state.active.Generation != 4 {
+		t.Fatalf("candidate cleanup=%d active=%+v", fixture.runtime.stopped, fixture.state.active)
+	}
+	if fixture.state.deployment.Phase != generatedruntimestate.PhaseFailed || fixture.state.deployment.DiagnosticCode != generatedruntimestate.DiagnosticRouteSwitchFailed {
+		t.Fatalf("runtime deployment=%+v", fixture.state.deployment)
+	}
+	if fixture.deployments.deployment.Status != deployments.Failed || fixture.deployments.deployment.DiagnosticCode != "gateway_readiness_failed" {
+		t.Fatalf("deployment=%+v", fixture.deployments.deployment)
 	}
 }
 
