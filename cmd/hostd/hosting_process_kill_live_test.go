@@ -13,11 +13,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -27,7 +32,9 @@ import (
 	"github.com/hostd/hostd/internal/apicontract"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
+	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/config"
+	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
@@ -35,6 +42,7 @@ import (
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
+	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/sourceconnections"
@@ -277,12 +285,14 @@ func controllerProcessKillMarker(path string, boundary controllerProcessKillBoun
 }
 
 type controllerProcessKillManifest struct {
-	DataRoot string                        `json:"dataRoot"`
-	Source   string                        `json:"source"`
-	Docker   string                        `json:"docker"`
-	AppID    string                        `json:"appId"`
-	JobID    string                        `json:"jobId"`
-	Boundary controllerProcessKillBoundary `json:"boundary"`
+	DataRoot      string                        `json:"dataRoot"`
+	Source        string                        `json:"source"`
+	Docker        string                        `json:"docker"`
+	ListenAddress string                        `json:"listenAddress"`
+	APIMarker     string                        `json:"apiMarker"`
+	AppID         string                        `json:"appId"`
+	JobID         string                        `json:"jobId"`
+	Boundary      controllerProcessKillBoundary `json:"boundary"`
 }
 
 // The child executes production composition and the durable worker after
@@ -310,6 +320,11 @@ func controllerProcessKillRunChild(t *testing.T) {
 		uuid.Validate(manifest.AppID) != nil || uuid.Validate(manifest.JobID) != nil {
 		t.Fatal("process-kill child manifest invalid")
 	}
+	host, port, addressErr := net.SplitHostPort(manifest.ListenAddress)
+	portNumber, portErr := strconv.Atoi(port)
+	if addressErr != nil || portErr != nil || host != "127.0.0.1" || portNumber < 1 || portNumber > 65535 || filepath.Base(manifest.APIMarker) != "ready" {
+		t.Fatal("process-kill child requires an exact loopback API address and readiness marker")
+	}
 	if runtime.GOOS != "linux" || os.Getenv("DOCKER_HOST") != "" || os.Getenv("DOCKER_CONTEXT") != "" {
 		t.Fatal("process-kill child requires local Linux Docker")
 	}
@@ -324,16 +339,29 @@ func controllerProcessKillRunChild(t *testing.T) {
 	if err != nil {
 		t.Fatal("reopen immutable release materializer")
 	}
+	if err := snapshots.Recover(); err != nil {
+		t.Fatal("recover immutable release workspace")
+	}
 	configuration, err := appconfig.New(db, manifest.DataRoot)
 	if err != nil {
 		t.Fatal("reopen scoped configuration")
+	}
+	if err := configuration.Recover(context.Background()); err != nil {
+		t.Fatal("recover scoped configuration")
 	}
 	plans, err := deploymentplans.New(db, manifest.DataRoot)
 	if err != nil {
 		t.Fatal("reopen deployment plans")
 	}
+	if err := plans.Recover(context.Background()); err != nil {
+		t.Fatal("recover accepted deployment plans")
+	}
 	deploymentStore := deployments.New(db)
 	jobStore := jobs.New(db)
+	machineStore := machines.New(db)
+	if _, err := machineStore.EnsureLocal(); err != nil {
+		t.Fatal("reopen controller local machine")
+	}
 	settings := config.Defaults()
 	settings.DataRoot = manifest.DataRoot
 	settings.GeneratedRuntime = true
@@ -363,9 +391,28 @@ func controllerProcessKillRunChild(t *testing.T) {
 	if err != nil {
 		t.Fatal("recover production deployment worker")
 	}
+	handler := (&controller.Server{
+		Auth: auth.New(db), Apps: apps.New(db), Jobs: jobStore, Machines: machineStore, Sources: sources,
+		Configuration: configuration, Deployments: deploymentStore, DeploymentPlans: plans,
+		GeneratedIngress: composition.ingress, GeneratedRuntimeState: composition.state,
+		GeneratedRuntime: true, Caddy: true, DataRoot: manifest.DataRoot,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}).Handler()
+	listener, err := net.Listen("tcp", manifest.ListenAddress)
+	if err != nil || listener.Addr().String() != manifest.ListenAddress {
+		t.Fatal("child controller could not bind the same loopback API address")
+	}
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+	if err := controllerProcessKillMarker(manifest.APIMarker, "api_ready"); err != nil {
+		t.Fatal("child controller could not publish API readiness")
+	}
 	select {
 	case <-done:
 		t.Fatal("process-kill child worker stopped before parent termination")
+	case <-serveDone:
+		t.Fatal("process-kill child API stopped before parent termination")
 	case <-childContext.Done():
 		t.Fatal("process-kill child exceeded runtime bound")
 	}
@@ -375,6 +422,7 @@ func controllerProcessKillMatrix(
 	t *testing.T, ctx context.Context, docker, source, dataRoot, appID string,
 	plan apicontract.DeploymentPlanRevision, configuration apicontract.ApplicationConfiguration,
 	entries []apicontract.ScopedConfigurationValueInput,
+	api **httptest.Server, handler http.Handler,
 	ingress *generatedingress.Manager, jobStore *jobs.Service, db *sql.DB,
 	request func(string, string, any, int, any, ...map[string]string) []byte,
 ) {
@@ -384,11 +432,19 @@ func controllerProcessKillMatrix(
 	}
 	state := generatedruntimestate.New(db)
 	previousMarker := "controller-journey"
-	for _, boundary := range []controllerProcessKillBoundary{
+	for index, boundary := range []controllerProcessKillBoundary{
 		controllerKillBeforeBuild, controllerKillBeforeStart, controllerKillAfterRoute,
 		controllerKillBeforeDrain, controllerKillAfterSuccess, controllerKillAfterMain,
 	} {
 		t.Run(string(boundary), func(t *testing.T) {
+			if index > 0 {
+				// The previous controller was killed after convergence. Reopen
+				// the authenticated API only to accept the next immutable job;
+				// the child takes over the same listener before executing it.
+				server := httptest.NewServer(handler)
+				*api = server
+				t.Cleanup(server.Close)
+			}
 			previous, err := state.Active(ctx, appID)
 			if err != nil || previous.DeploymentID == "" {
 				t.Fatal("previous immutable serving head unavailable")
@@ -422,15 +478,21 @@ func controllerProcessKillMatrix(
 			folder := t.TempDir()
 			marker := filepath.Join(folder, "ready")
 			manifestPath := filepath.Join(folder, "manifest.json")
-			manifest := controllerProcessKillManifest{DataRoot: dataRoot, Source: source, Docker: docker, AppID: appID, JobID: mutation.Job.ID, Boundary: boundary}
+			apiMarker := controllerProcessKillAPIReadyPath(t, folder, "first")
+			listenAddress := strings.TrimPrefix((*api).URL, "http://")
+			manifest := controllerProcessKillManifest{DataRoot: dataRoot, Source: source, Docker: docker,
+				ListenAddress: listenAddress, APIMarker: apiMarker,
+				AppID: appID, JobID: mutation.Job.ID, Boundary: boundary}
 			encoded, err := json.Marshal(manifest)
 			if err != nil || os.WriteFile(manifestPath, encoded, 0o600) != nil {
 				t.Fatal("write non-secret process-kill child manifest")
 			}
+			(*api).Close()
 			child := controllerProcessKillChild(t, marker, []string{
 				"RIG_LIVE_PROCESS_KILL_CHILD=1", "RIG_LIVE_PROCESS_KILL_MANIFEST=" + manifestPath,
 			})
 			t.Cleanup(func() { controllerProcessKillCleanupChild(child) })
+			controllerProcessKillWaitMarker(t, apiMarker, child)
 			controllerProcessKillWaitMarker(t, marker, child)
 			body, err := os.ReadFile(marker)
 			var signal struct {
@@ -495,6 +557,7 @@ func controllerProcessKillMatrix(
 				}
 			}
 			manifest.Boundary = ""
+			manifest.APIMarker = controllerProcessKillAPIReadyPath(t, folder, "restarted")
 			encoded, err = json.Marshal(manifest)
 			if err != nil || os.WriteFile(manifestPath, encoded, 0o600) != nil {
 				t.Fatal("write restart manifest")
@@ -503,6 +566,7 @@ func controllerProcessKillMatrix(
 				"RIG_LIVE_PROCESS_KILL_CHILD=1", "RIG_LIVE_PROCESS_KILL_MANIFEST=" + manifestPath,
 			})
 			t.Cleanup(func() { controllerProcessKillCleanupChild(restarted) })
+			controllerProcessKillWaitMarker(t, manifest.APIMarker, restarted)
 			deadline := time.Now().Add(8 * time.Minute)
 			resumed := false
 			for {
@@ -584,6 +648,15 @@ type controllerProcessKillPins struct {
 	PlanNumber          int64
 	ConfigurationID     string
 	ConfigurationNumber int64
+}
+
+func controllerProcessKillAPIReadyPath(t *testing.T, folder, stage string) string {
+	t.Helper()
+	directory := filepath.Join(folder, "api-"+stage)
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal("prepare child controller API readiness directory")
+	}
+	return filepath.Join(directory, "ready")
 }
 
 func controllerProcessKillAssertRunningContainer(t *testing.T, ctx context.Context, docker string, component generatedruntimestate.Component) {

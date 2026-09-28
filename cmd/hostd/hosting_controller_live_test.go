@@ -646,7 +646,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("initial deployment worker did not stop before process-kill matrix")
 		}
-		controllerProcessKillMatrix(t, ctx, docker, source, dataRoot, application.ID, plan, saved, entries, composition.ingress, jobStore, db, request)
+		controllerProcessKillMatrix(t, ctx, docker, source, dataRoot, application.ID, plan, saved, entries, &api, handler, composition.ingress, jobStore, db, request)
 		return
 	}
 	stopWorker()

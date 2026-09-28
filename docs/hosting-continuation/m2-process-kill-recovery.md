@@ -49,12 +49,20 @@ route pauses for reconciliation with both possible serving slots retained.
 finalization: it completes the main deployment without rebuilding, rerouting,
 or deleting a container. A mismatched active head pauses instead.
 
-The process-kill test starts each controller worker in a separate test-binary
-process with the existing production composition and persisted data root. A
-test-only command/progress barrier writes a mode-0600 marker after the targeted
-durable state; the parent verifies it, kills and joins the process, observes
-traffic and identities, then starts a new process. The small child manifest
-contains paths and IDs only; scoped secrets remain in the existing protected
+The process-kill test starts an authenticated controller API and worker in a
+separate test-binary process with the production composition and persisted data
+root. After each job is accepted, the parent closes its API listener. The
+child binds that same loopback address, reconstructs the persisted session,
+and owns the API and worker when killed. A test-only command/progress barrier
+writes a mode-0600 marker after the targeted durable state; the parent
+verifies it, kills and joins the process, observes traffic and identities,
+then starts a new API and worker process on the same address. Authenticated
+resume calls reach the restarted child's API. Between replacements the parent
+opens an API solely to accept the next reviewed configuration and job, then
+closes it before the next child starts. The parent retains read-only database
+and ingress observation handles during the kill; this is not a direct
+`hostd serve` binary launch. The small child manifest contains paths, a local
+listener address and IDs only; scoped secrets remain in the existing protected
 data root. Child output is not echoed into CI diagnostics.
 
 The six boundaries are `before_build`, `before_candidate_start`,
@@ -69,14 +77,17 @@ The baseline at `7536c5c` passed the full Go suite with normal Windows fixture
 permissions. A pre-fix regression for a runtime already succeeded while the
 main deployment was still nonterminal failed at recovery: zero generated
 deployments were preserved. A second regression covers main deployment
-success before job completion. Both pass after the production fix.
+success before job completion. Both pass after the production fix. The
+post-success executor regression also starts from one already completed
+approved migration and asserts finalization does not call the migration
+runner a second time.
 
 | Command | Result |
 | --- | --- |
 | `go test -p 1 -count=1 ./internal/generatedrecovery ./internal/generatedexecutor` | Passed after production fix |
 | `go test -p 1 -count=1 -timeout=20m ./...` | Passed with normal Windows fixture permissions |
-| `go test -tags live_docker -count=1 ./cmd/hostd -run '^TestControllerProcessKillBoundaryControls$'` | Passed; test-only barrier controls |
 | `go test -tags live_docker ./cmd/hostd -run '^$'` | Passed; tagged compilation only |
+| `go test -tags live_docker -count=1 ./cmd/hostd -run '^TestControllerProcessKillBoundaryControls$'` | Passed after child-owned API extension; barrier and exclusive marker controls |
 | `go vet ./...` and `go vet -tags live_docker ./cmd/hostd` | Passed |
 | `go build -trimpath ./cmd/hostd ./cmd/hostctl ./cmd/rig-relay ./cmd/rig-relay-probe` | Passed |
 | `pwsh -NoProfile -File scripts/check-generation.ps1` | Passed |
@@ -87,6 +98,6 @@ success before job completion. Both pass after the production fix.
 The Linux Docker process-kill journey, hosted cleanup and Linux race checks
 have **not run** for this branch. The process-kill gate is a CI acceptance
 requirement, not local acceptance evidence. CodeRabbit CLI was unauthenticated
-and did not review the source; an independent manual review is required. A
-manual security audit found no Critical, High or Must Fix issue, but did not
-execute Docker.
+and did not review the source. Independent manual code and security reviews of
+the earlier worker-process harness found no Must Fix; the child-owned API
+extension needs focused rereview. Neither review executed Docker.
