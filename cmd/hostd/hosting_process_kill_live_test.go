@@ -84,24 +84,24 @@ func (r controllerProcessKillRunner) Run(ctx context.Context, request runtimepro
 		return runtimeprocess.CommandResult{}, errors.New("process-kill runner delegate is required")
 	}
 	if r.barrier != nil {
-		if controllerProcessKillBuild(request) {
+		if r.barrier.boundary == controllerKillBeforeBuild && controllerProcessKillBuild(request) {
 			if err := r.barrier.wait(ctx, generatedruntimestate.PhaseBuilding, func(generatedruntimestate.Deployment) bool { return true }); err != nil {
 				return runtimeprocess.CommandResult{}, err
 			}
 		}
-		if controllerProcessKillStart(request) {
+		if r.barrier.boundary == controllerKillBeforeStart && controllerProcessKillStart(request) {
 			if err := r.barrier.wait(ctx, generatedruntimestate.PhaseStartingCandidate, controllerProcessKillHasDurableCandidate); err != nil {
 				return runtimeprocess.CommandResult{}, err
 			}
 		}
-		if controllerProcessKillDrain(request) {
+		if r.barrier.boundary == controllerKillBeforeDrain && controllerProcessKillDrain(request) {
 			if err := r.barrier.wait(ctx, generatedruntimestate.PhaseDraining, func(d generatedruntimestate.Deployment) bool { return d.CandidateSlot != d.PreviousActiveSlot }); err != nil {
 				return runtimeprocess.CommandResult{}, err
 			}
 		}
 	}
 	result, err := r.delegate.Run(ctx, request)
-	if err == nil && r.barrier != nil && controllerProcessKillRouteCommit(request) {
+	if err == nil && r.barrier != nil && r.barrier.boundary == controllerKillAfterRoute && controllerProcessKillRouteCommit(request) {
 		if waitErr := r.barrier.wait(ctx, generatedruntimestate.PhaseSwitchingRoute, func(d generatedruntimestate.Deployment) bool { return d.PreviousActiveDeploymentID != "" }); waitErr != nil {
 			return result, waitErr
 		}
@@ -152,7 +152,7 @@ func (r controllerProcessKillReporter) Report(update jobs.ProgressUpdate) error 
 	if err := r.delegate.Report(update); err != nil {
 		return err
 	}
-	if r.barrier != nil && update.Status == jobs.Running && update.Phase == "finalize" {
+	if r.barrier != nil && r.barrier.boundary == controllerKillAfterSuccess && update.Status == jobs.Running && update.Phase == "finalize" {
 		return r.barrier.wait(context.Background(), generatedruntimestate.PhaseSucceeded, func(generatedruntimestate.Deployment) bool { return true })
 	}
 	return nil
@@ -191,7 +191,10 @@ func TestLiveControllerGeneratedProcessKillRecovery(t *testing.T) {
 		select {}
 	}
 	if os.Getenv("RIG_LIVE_PROCESS_KILL_CHILD") != "1" {
-		return
+		if os.Getenv("RIG_RUN_LIVE_CONTROLLER_JOURNEY") == "1" {
+			t.Fatal("process-kill recovery must be invoked by the retained-fixture journey parent")
+		}
+		t.Skip("set RIG_RUN_LIVE_CONTROLLER_JOURNEY=1 through the controller journey parent")
 	}
 	manifest := os.Getenv("RIG_LIVE_PROCESS_KILL_MANIFEST")
 	if manifest == "" {
