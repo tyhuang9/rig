@@ -74,6 +74,9 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 		t.Fatal("Docker Compose unavailable")
 	}
 	for _, resource := range [][]string{
+		{"container", "rig-generated-caddy-v1"},
+		{"volume", "rig-generated-caddy-config-v1"},
+		{"network", "rig-generated-caddy-ingress-v1"},
 		{"network", migrationJourneyNetwork},
 		{"volume", migrationJourneyProject + "_fixture-certs"},
 		{"volume", migrationJourneyProject + "_fixture-postgres-data"},
@@ -84,6 +87,14 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	}
 	if output, err := controllerJourneyDocker(ctx, docker, nil, "ps", "-aq", "--filter", "label=com.docker.compose.project="+migrationJourneyProject); err != nil || len(bytes.TrimSpace(output)) != 0 {
 		t.Fatal("disposable daemon already has the migration fixture project")
+	}
+	for _, args := range [][]string{
+		{"ps", "-aq", "--filter", "label=rig.controller=generated-builder"},
+		{"network", "ls", "-q", "--filter", "label=rig.controller=generated-builder"},
+	} {
+		if output, err := controllerJourneyDocker(ctx, docker, nil, args...); err != nil || len(bytes.TrimSpace(output)) != 0 {
+			t.Fatal("disposable daemon already has a generated builder resource")
+		}
 	}
 
 	root := t.TempDir()
@@ -375,16 +386,17 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	if migrationRunner.calls != 1 {
 		t.Fatalf("approved migration runner calls=%d, want 1", migrationRunner.calls)
 	}
-	running, err := composition.state.Get(ctx, application.ID, mutation.Job.ID)
-	if err != nil || running.Phase != generatedruntimestate.PhaseMigrating || running.MigrationState != generatedruntimestate.MigrationRunning || running.MigrationStartedAt.IsZero() || !running.MigrationFinishedAt.IsZero() {
-		t.Fatalf("interrupted migration state=%#v err=%v", running, err)
-	}
-	migrationJourneyAssertCounter(t, ctx, docker, fixtureEnv, fixtureRoot, 1, 1)
 	var history apicontract.DeploymentList
 	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/deployments", nil, http.StatusOK, &history)
 	if len(history.Items) != 1 || history.Items[0].ReleaseID == "" || history.Items[0].DeploymentPlanRevisionID != plan.RevisionID || history.Items[0].ActualConfigurationRevisionID != saved.RevisionID {
 		t.Fatal("interrupted deployment did not retain its immutable release, plan, and configuration pins")
 	}
+	deploymentID := history.Items[0].ID
+	running, err := composition.state.Get(ctx, application.ID, deploymentID)
+	if err != nil || running.Phase != generatedruntimestate.PhaseMigrating || running.MigrationState != generatedruntimestate.MigrationRunning || running.MigrationStartedAt.IsZero() || !running.MigrationFinishedAt.IsZero() {
+		t.Fatalf("interrupted migration state=%#v err=%v", running, err)
+	}
+	migrationJourneyAssertCounter(t, ctx, docker, fixtureEnv, fixtureRoot, 1, 1)
 	if provider.archiveReads.Load() == 0 {
 		t.Fatal("approved migration did not materialize an immutable GitHub archive")
 	}
@@ -436,7 +448,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	if recoveryRunner.calls != 0 {
 		t.Fatalf("durable interrupted migration replayed the real migration runner %d times", recoveryRunner.calls)
 	}
-	recovered, err := reopened.state.Get(ctx, application.ID, mutation.Job.ID)
+	recovered, err := reopened.state.Get(ctx, application.ID, deploymentID)
 	if err != nil || recovered.MigrationState != generatedruntimestate.MigrationRunning || recovered.DiagnosticCode != generatedruntimestate.DiagnosticDaemonRestarted {
 		t.Fatalf("reopened migration state=%#v err=%v", recovered, err)
 	}
@@ -477,15 +489,10 @@ func (runner *migrationJourneyRunner) Run(ctx context.Context, request generated
 
 func migrationJourneyExecuteAndRecover(t *testing.T, ctx context.Context, executor jobs.Executor, job jobs.Job) {
 	t.Helper()
-	interrupted := false
 	defer func() {
 		recovered := recover()
 		if _, ok := recovered.(migrationJourneyInterrupted); !ok {
 			t.Fatalf("migration interruption recovered=%T", recovered)
-		}
-		interrupted = true
-		if !interrupted {
-			t.Fatal("migration interruption was not observed")
 		}
 	}()
 	if result, err := executor.Execute(ctx, job, migrationJourneyReporter{}); err != nil || result.CompletionCode != "" {
