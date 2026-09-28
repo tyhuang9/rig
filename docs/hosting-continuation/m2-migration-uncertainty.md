@@ -18,8 +18,10 @@ authorization.
   configuration keys. The application owns its database driver, schema and
   credentials; Rig does not create or manage the database.
 - A compatible additive migration leaves the previous application version
-  usable. The disposable schema records a run-unique ledger/counter value so a
-  duplicate execution is observable.
+  usable. The disposable schema records one append-only ledger row and counter
+  increment per selected migration. Knex history makes a literal repeat a
+  no-op, so the journey separately asserts that recovery never invokes the
+  migration runner again.
 - If the database may have committed while completion remains uncertain,
   durable recovery cannot blindly execute the same migration again. Reverting
   application code does not execute a down migration or alter that ledger.
@@ -33,9 +35,10 @@ journey and its TLS contract unchanged. The new hosted test crosses production
 source inspection, accepted plan and approval API, scoped configuration,
 generated compiler, hardened Docker migration runner, durable runtime state,
 ingress and external PostgreSQL query path. A test-only wrapper around the real
-migration runner panics after its database side effect and before the durable
-completion write. It then reopens state and attempts continuation. This is a
-controlled crash seam, not evidence of an OS process kill.
+migration runner ends its worker goroutine after its database side effect and
+before the durable completion write. It then reopens state through the normal
+recovery worker. This is controlled worker-goroutine termination, not evidence
+of an OS process kill.
 
 Run the affected Go packages, tagged live-test compile and vet, full Go suite,
 vet, command builds, generation and Windows gates, fixture lockfile checks,
@@ -69,22 +72,23 @@ The controlled GitHub provider retains three immutable source revisions. The
 mandatory hosted journey is designed to prove the following in one controller
 and database lifetime:
 
-1. Deploy v1 without a migration and verify its actual local route reads a
-   counter value of zero.
+1. Deploy database-aware v1 without a migration and verify its actual local
+   route reads a counter value of zero while its table is absent.
 2. Advance to v2 with new detected migration evidence. The job must pause for
    approval while v1 still serves, with both migration tables absent. Approve
    the exact v2 plan revision, resume the same job, and verify a successful
    real migration, one ledger row and counter value one through v2's route.
-3. Deploy the pinned v1 release using its original configuration. Its route
-   must return v1's value, no migration runner call occurs, and the external
-   ledger/counter remain one. This is an application code recovery, with no
-   down migration.
+3. Deploy the pinned v1 release using its original configuration. Its
+   database-aware route must return counter value one, no migration runner call
+   occurs, and the external ledger/counter remain one. This is an application
+   code recovery, with no down migration.
 4. Advance to v3 with distinct additive evidence. Before its approval, verify
    no second write. After approval, the real Docker runner must commit a
-   second ledger row and counter increment; the test-only seam interrupts
-   before completion is persisted. Reopen durable controller state, retry the
-   accepted job and require zero new migration-runner calls, unchanged
-   PostgreSQL values, and a retained v1 route.
+   second ledger row and counter increment; the test-only worker termination
+   occurs before completion is persisted. Reopen durable controller state with
+   the normal recovery worker and require an interrupted job, failed deployment
+   with the daemon-restarted diagnostic, zero new migration-runner calls,
+   unchanged PostgreSQL values, and the retained database-aware v1 route.
 
 The same hosted workflow requires exact named Go pass events for the provider
 revision contract and the live journey, followed by an always-run check that
@@ -108,6 +112,14 @@ Git trust for this exact checkout.
 | `pwsh -NoProfile -File scripts/check-generation.ps1` and `scripts/check-windows-controller.ps1` | Passed: generated contracts, migration mirrors and Windows protection gate |
 | `npm --prefix examples/hosting-migration ci --ignore-scripts` | Passed from the committed lockfile; npm reported zero audited vulnerabilities |
 | `pnpm --dir docs build`, `check:accessibility`, `check:workflow` | Passed |
+
+The recovery-worker correction and per-SHA archive accounting were additionally
+checked locally with `go test -p 1 -count=1 -tags live_docker ./cmd/hostd -run
+'^(TestControllerJourneyGitHubProviderRetainsImmutableRevisions\|TestGeneratedCompositionMigrationRunnerFactory\|TestHostingMigrationFixtureAnalyzerContract)$'`,
+`go vet -tags live_docker ./cmd/hostd`, `go test -p 1 -count=1 -tags
+live_docker ./cmd/hostd -run '^$'`, `git diff --check`, and `node --check
+examples/hosting-migration/src/server.js`; all passed. These tagged checks
+compile the Docker journey but do not execute it.
 
 An earlier offline-only `npm ci` attempt failed because the local cache lacked
 one package. The normal lockfile install passed. The docs build initially
