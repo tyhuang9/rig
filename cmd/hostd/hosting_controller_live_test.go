@@ -59,8 +59,16 @@ const (
 // runtime, and ingress. The source comes through a controlled GitHub connection
 // and HTTP archive fixture into an immutable release snapshot.
 func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
-	if os.Getenv("RIG_RUN_LIVE_CONTROLLER_JOURNEY") != "1" {
-		t.Fatal("set RIG_RUN_LIVE_CONTROLLER_JOURNEY=1 to run the hosted Docker gate")
+	controllerJourneyRun(t, false)
+}
+
+func controllerJourneyRun(t *testing.T, processKill bool) {
+	requiredGate := "RIG_RUN_LIVE_CONTROLLER_JOURNEY"
+	if processKill {
+		requiredGate = "RIG_RUN_LIVE_PROCESS_KILL"
+	}
+	if os.Getenv(requiredGate) != "1" {
+		t.Fatalf("set %s=1 to run the hosted Docker gate", requiredGate)
 	}
 	if runtime.GOOS != "linux" || os.Getenv("DOCKER_HOST") != "" || os.Getenv("DOCKER_CONTEXT") != "" {
 		t.Fatal("hosted controller gate requires the local Linux Docker daemon")
@@ -90,7 +98,11 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	}
 	dataRoot := filepath.Join(root, "controller")
 	fixtureRoot := filepath.Join(root, "external")
-	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Minute)
+	journeyTimeout := 24 * time.Minute
+	if processKill {
+		journeyTimeout = 47 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), journeyTimeout)
 	defer cancel()
 	selectedContext, err := controllerJourneyDocker(ctx, docker, nil, "context", "show")
 	if err != nil || string(bytes.TrimSpace(selectedContext)) != "default" {
@@ -627,6 +639,16 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	}
 	browserNote := "browser TLS note " + uuid.NewString()
 	controllerJourneyBrowser(t, ctx, node, application.ID, initialRouteURL, "create", browserNote)
+	if processKill {
+		stopWorker()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("initial deployment worker did not stop before process-kill matrix")
+		}
+		controllerProcessKillMatrix(t, ctx, docker, source, dataRoot, application.ID, plan, saved, entries, composition.ingress, jobStore, db, request)
+		return
+	}
 	stopWorker()
 	select {
 	case <-done:
