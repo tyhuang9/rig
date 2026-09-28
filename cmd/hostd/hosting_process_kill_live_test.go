@@ -258,15 +258,22 @@ func controllerProcessKillMarker(path string, boundary controllerProcessKillBoun
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// Publish only after the full marker is durable to readers. Linking the
+	// completed file preserves O_EXCL behavior if a marker already exists.
+	staged := path + ".next"
+	f, err := os.OpenFile(staged, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
+	defer os.Remove(staged)
 	if _, err = f.Write(data); err != nil {
 		_ = f.Close()
 		return err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Link(staged, path)
 }
 
 type controllerProcessKillManifest struct {
