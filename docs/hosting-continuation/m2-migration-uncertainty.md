@@ -121,6 +121,13 @@ live_docker ./cmd/hostd -run '^$'`, `git diff --check`, and `node --check
 examples/hosting-migration/src/server.js`; all passed. These tagged checks
 compile the Docker journey but do not execute it.
 
+At corrected head `0acfa87`, the full `go test -p 1 -count=1
+-timeout=20m ./...` suite, `go vet ./...`, four-command `go build -trimpath`,
+generation script, Windows controller script, and documentation build,
+accessibility and workflow checks were rerun and passed. The documentation
+build required normal access to ignored pnpm dependency files; its sandboxed
+attempt could not read a Vite package through a local junction.
+
 An earlier offline-only `npm ci` attempt failed because the local cache lacked
 one package. The normal lockfile install passed. The docs build initially
 found an incomplete ignored dependency link in this checkout; reinstalling
