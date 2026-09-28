@@ -578,6 +578,7 @@ func TestGeneratedExecutorFinalizesCommittedRuntimeAfterRestart(t *testing.T) {
 		wantStatus      deployments.Status
 	}{
 		{name: "matching committed head", wantStatus: deployments.Succeeded},
+		{name: "deployment already finalized", wantStatus: deployments.Succeeded},
 		{name: "head no longer matches", invalidateHead: true, wantDisposition: jobs.PauseRouteReconciliationRequired, wantStatus: deployments.Applying},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -589,7 +590,9 @@ func TestGeneratedExecutorFinalizesCommittedRuntimeAfterRestart(t *testing.T) {
 			if fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded {
 				t.Fatal("runtime did not commit success")
 			}
-			fixture.deployments.deployment.Status = deployments.Applying
+			if test.name != "deployment already finalized" {
+				fixture.deployments.deployment.Status = deployments.Applying
+			}
 			if test.invalidateHead {
 				fixture.state.active.DeploymentID = testArtifactID
 			}

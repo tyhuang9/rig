@@ -234,7 +234,7 @@ func RecoverJobs(ctx context.Context, db *sql.DB, now time.Time) (JobResult, err
 		}
 		var jobID string
 		err := tx.QueryRowContext(ctx, `SELECT d.job_id FROM deployments d JOIN jobs j ON j.id=d.job_id
-			WHERE d.id=? AND d.app_id=? AND d.status IN ('preparing','applying','waiting_health')
+			WHERE d.id=? AND d.app_id=? AND d.status IN ('preparing','applying','waiting_health','succeeded')
 			AND j.type='deploy' AND j.resource_type='application' AND j.resource_id=d.app_id`,
 			runtimeDeployment.deploymentID, runtimeDeployment.appID).Scan(&jobID)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -386,7 +386,9 @@ func previousSlotDrained(ctx context.Context, tx *sql.Tx, value runtimeDeploymen
 
 func loadRuntimeDeployments(ctx context.Context, tx *sql.Tx) ([]runtimeDeployment, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT deployment_id,app_id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,candidate_slot,COALESCE(previous_active_deployment_id,''),COALESCE(previous_active_slot,''),phase,migration_state FROM generated_runtime_deployments r WHERE phase NOT IN ('failed','cancelled') AND (phase<>'succeeded' OR EXISTS(
-		SELECT 1 FROM deployments d WHERE d.id=r.deployment_id AND d.status IN ('preparing','applying','waiting_health')
+		SELECT 1 FROM deployments d JOIN jobs j ON j.id=d.job_id
+		WHERE d.id=r.deployment_id AND d.status IN ('preparing','applying','waiting_health','succeeded')
+		  AND j.status IN ('queued','assigned','running','waiting_external','waiting_user')
 	)) ORDER BY updated_at,deployment_id`)
 	if err != nil {
 		return nil, err
@@ -453,7 +455,7 @@ func loadRecoveryBinding(ctx context.Context, tx *sql.Tx, deploymentID string) (
 		AND p.revision_number=d.deployment_plan_revision_number AND p.strategy='generated_node' AND p.acceptance_status='accepted'
 	LEFT JOIN application_configuration_revisions c ON c.id=d.actual_configuration_revision_id AND c.app_id=d.app_id
 		AND c.revision_number=d.actual_configuration_revision_number
-	WHERE d.id=? AND d.status IN ('preparing','applying','waiting_health')
+	WHERE d.id=? AND d.status IN ('preparing','applying','waiting_health','succeeded')
 	  AND d.runtime_strategy='generated_node' AND d.provenance_initialized=1
 	  AND d.release_id IS NOT NULL AND d.deployment_plan_revision_id IS NOT NULL AND d.deployment_plan_revision_number>0
 	  AND ((d.actual_configuration_revision_number=0 AND d.actual_configuration_revision_id IS NULL) OR
@@ -507,6 +509,9 @@ func bindingMatchesRuntime(binding recoveryBinding, runtimeDeployment runtimeDep
 	case "waiting_health", "switching_route", "draining", "succeeded":
 		if runtimeDeployment.phase == "succeeded" && binding.jobStatus == "waiting_user" {
 			return false
+		}
+		if runtimeDeployment.phase == "succeeded" && binding.deploymentStatus == "succeeded" {
+			return true
 		}
 		return binding.deploymentStatus == "applying" || binding.deploymentStatus == "waiting_health"
 	default:
