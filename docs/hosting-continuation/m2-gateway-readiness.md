@@ -7,7 +7,9 @@ be reached from the gateway, while preserving the previous serving deployment.
 [recipe-matrix draft PR #75](https://github.com/tyhuang9/rig/pull/75) at
 `bf782685aed81e3d63ffe8e1c3c625622795237f`.
 Implementation commit: `cbea5267b718e353da3f5be288b947a498c6454d`.
-This candidate is local and unpublished. M2 remains open.
+This candidate was local at initial verification. It was subsequently published
+as [draft PR #77](https://github.com/tyhuang9/rig/pull/77) at
+`26a2837a278d120d961fae58391b605c0b290226`. M2 remains open.
 
 ## Behavior and invariants
 
@@ -108,8 +110,11 @@ not been executed. Reverting removes future gateway-readiness
 enforcement and its specific diagnostic. Existing deployment history and
 active routes must remain intact.
 
-The next acceptance action is an explicitly authorized draft publication and
-the named hosted Docker gates on its exact head. The separate live GitHub
-authorization/archive walkthrough and remaining M2 capacity, migration,
-isolation and recovery qualifications are still required. No merge or
-production deployment is authorized by these results.
+Publication of draft PR #77 was explicitly authorized. Its required hosted
+checks passed at the exact PR head above, including the controller/Docker,
+generated-runtime race, PostgreSQL/Linux race, Chromium, Windows, and fast
+verification jobs. Documentation deployment was skipped by its expected PR
+gate; CodeRabbit reported success because it skipped source review on the
+draft. These results qualify that source branch, not a combined M2 revision.
+The separate live GitHub authorization/archive walkthrough and M2 integration
+remain open. No merge or production deployment is authorized by these results.
