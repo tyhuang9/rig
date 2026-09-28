@@ -419,7 +419,7 @@ func controllerProcessKillRunChild(t *testing.T) {
 }
 
 func controllerProcessKillMatrix(
-	t *testing.T, ctx context.Context, docker, source, dataRoot, appID string,
+	t *testing.T, ctx context.Context, docker, source, dataRoot, appID, administratorID string,
 	plan apicontract.DeploymentPlanRevision, configuration apicontract.ApplicationConfiguration,
 	entries []apicontract.ScopedConfigurationValueInput,
 	api **httptest.Server, handler http.Handler,
@@ -493,6 +493,7 @@ func controllerProcessKillMatrix(
 			})
 			t.Cleanup(func() { controllerProcessKillCleanupChild(child) })
 			controllerProcessKillWaitMarker(t, apiMarker, child)
+			controllerProcessKillAssertAuthenticated(t, administratorID, request)
 			controllerProcessKillWaitMarker(t, marker, child)
 			body, err := os.ReadFile(marker)
 			var signal struct {
@@ -567,6 +568,7 @@ func controllerProcessKillMatrix(
 			})
 			t.Cleanup(func() { controllerProcessKillCleanupChild(restarted) })
 			controllerProcessKillWaitMarker(t, manifest.APIMarker, restarted)
+			controllerProcessKillAssertAuthenticated(t, administratorID, request)
 			deadline := time.Now().Add(8 * time.Minute)
 			resumed := false
 			for {
@@ -657,6 +659,18 @@ func controllerProcessKillAPIReadyPath(t *testing.T, folder, stage string) strin
 		t.Fatal("prepare child controller API readiness directory")
 	}
 	return filepath.Join(directory, "ready")
+}
+
+func controllerProcessKillAssertAuthenticated(
+	t *testing.T, administratorID string,
+	request func(string, string, any, int, any, ...map[string]string) []byte,
+) {
+	t.Helper()
+	var me apicontract.MeResponse
+	request(http.MethodGet, "/api/v1/auth/me", nil, http.StatusOK, &me)
+	if me.User.ID != administratorID || me.User.Username != "journey-admin" || me.User.Role != "administrator" {
+		t.Fatal("restarted child controller did not authenticate the original administrator session")
+	}
 }
 
 func controllerProcessKillAssertRunningContainer(t *testing.T, ctx context.Context, docker string, component generatedruntimestate.Component) {

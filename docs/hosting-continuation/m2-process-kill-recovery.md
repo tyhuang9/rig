@@ -57,7 +57,9 @@ and owns the API and worker when killed. A test-only command/progress barrier
 writes a mode-0600 marker after the targeted durable state; the parent
 verifies it, kills and joins the process, observes traffic and identities,
 then starts a new API and worker process on the same address. Authenticated
-resume calls reach the restarted child's API. Between replacements the parent
+`/api/v1/auth/me` requests must confirm the original administrator session
+against both children; reconciliation resume calls reach the restarted child's
+API. Between replacements the parent
 opens an API solely to accept the next reviewed configuration and job, then
 closes it before the next child starts. The parent retains read-only database
 and ingress observation handles during the kill; this is not a direct
