@@ -42,6 +42,7 @@ type controllerJourneyGitHubProvider struct {
 	mu           sync.RWMutex
 	activeSHA    string
 	revisions    map[string]controllerJourneyGitHubRevision
+	archiveBySHA map[string]int
 }
 
 type controllerJourneyGitHubRevision struct {
@@ -54,7 +55,8 @@ func controllerJourneyNewGitHubProvider(t *testing.T, source string) *controller
 	revision := controllerJourneyBuildGitHubRevision(t, source, controllerJourneyGitHubSHA)
 	provider := &controllerJourneyGitHubProvider{
 		files: revision.files, archive: revision.archive, activeSHA: controllerJourneyGitHubSHA,
-		revisions: map[string]controllerJourneyGitHubRevision{controllerJourneyGitHubSHA: revision},
+		revisions:    map[string]controllerJourneyGitHubRevision{controllerJourneyGitHubSHA: revision},
+		archiveBySHA: map[string]int{},
 	}
 	provider.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		const prefix = "/repos/fixture/hosting-notes/tarball/"
@@ -64,19 +66,27 @@ func controllerJourneyNewGitHubProvider(t *testing.T, source string) *controller
 			return
 		}
 		sha := strings.TrimPrefix(r.URL.Path, prefix)
-		provider.mu.RLock()
+		provider.mu.Lock()
 		snapshot, found := provider.revisions[sha]
-		provider.mu.RUnlock()
 		if !found {
+			provider.mu.Unlock()
 			http.Error(w, "fixture revision unavailable", http.StatusNotFound)
 			return
 		}
+		provider.archiveBySHA[sha]++
+		provider.mu.Unlock()
 		provider.archiveReads.Add(1)
 		w.Header().Set("Content-Type", "application/gzip")
 		_, _ = w.Write(snapshot.archive)
 	}))
 	t.Cleanup(provider.server.Close)
 	return provider
+}
+
+func (p *controllerJourneyGitHubProvider) ArchiveReadsFor(sha string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.archiveBySHA[sha]
 }
 
 // AddRevision freezes another controlled source under a distinct commit SHA.
@@ -375,6 +385,9 @@ func TestControllerJourneyGitHubProviderRetainsImmutableRevisions(t *testing.T) 
 		}
 		if closeErr := compressed.Close(); closeErr != nil || !found {
 			t.Fatalf("immutable archive for %s omitted its source: close=%v found=%t", item.sha, closeErr, found)
+		}
+		if reads := provider.ArchiveReadsFor(item.sha); reads != 1 {
+			t.Fatalf("immutable archive reads for %s=%d, want 1", item.sha, reads)
 		}
 	}
 	if err := provider.SelectRevision("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"); err == nil {

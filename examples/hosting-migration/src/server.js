@@ -24,10 +24,11 @@ const pool = new Pool({
 
 async function counter() {
   const result = await pool.query("SELECT value FROM rig_migration_counter WHERE counter_key='approved_migration'");
-  if (result.rows.length !== 1 || result.rows[0].value !== 1) {
+  const value = Number(result.rows[0]?.value);
+  if (result.rows.length !== 1 || !Number.isInteger(value) || value < 1) {
     throw new Error("approved migration counter is unavailable");
   }
-  return result.rows[0].value;
+  return value;
 }
 
 const server = http.createServer(async (request, response) => {
