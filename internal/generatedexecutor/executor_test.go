@@ -570,6 +570,41 @@ func TestGeneratedExecutorUsesReviewedPinsOnSuccessfulDeployment(t *testing.T) {
 	}
 }
 
+func TestGeneratedExecutorFinalizesCommittedRuntimeAfterRestart(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		invalidateHead  bool
+		wantDisposition string
+		wantStatus      deployments.Status
+	}{
+		{name: "matching committed head", wantStatus: deployments.Succeeded},
+		{name: "head no longer matches", invalidateHead: true, wantDisposition: jobs.PauseRouteReconciliationRequired, wantStatus: deployments.Applying},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, false)
+			job := reviewedDeploymentJob()
+			if _, err := fixture.executor.Execute(context.Background(), job, fixture.reporter); err != nil {
+				t.Fatal(err)
+			}
+			if fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded {
+				t.Fatal("runtime did not commit success")
+			}
+			fixture.deployments.deployment.Status = deployments.Applying
+			if test.invalidateHead {
+				fixture.state.active.DeploymentID = testArtifactID
+			}
+			builds, switches, removals := fixture.compiler.calls, len(fixture.routes.requests), fixture.runtime.stopped
+			result, err := fixture.executor.Execute(context.Background(), job, fixture.reporter)
+			if err != nil || result.PauseDisposition != test.wantDisposition || fixture.deployments.deployment.Status != test.wantStatus {
+				t.Fatalf("finalize result=%+v err=%v deployment=%+v", result, err, fixture.deployments.deployment)
+			}
+			if fixture.compiler.calls != builds || len(fixture.routes.requests) != switches || fixture.runtime.stopped != removals {
+				t.Fatal("finalization replay built, switched, or removed a runtime resource")
+			}
+		})
+	}
+}
+
 func TestGeneratedExecutorResumesReviewedLatestJobWithRecordedProvenanceAfterHeadDrift(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
 	fixture.authorization.err = ErrInsufficientReplacementCapacity

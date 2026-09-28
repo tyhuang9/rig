@@ -312,6 +312,57 @@ func TestRecoveryResumesSwitchingAndDrainingIdempotently(t *testing.T) {
 	}
 }
 
+func TestRecoveryPreservesCommittedRuntimeAwaitingDeploymentFinalization(t *testing.T) {
+	fixture := newRecoveryFixtureWithReviewedCurrent(t, false, true)
+	fixture.toSwitching(t)
+	if _, switched, err := fixture.state.SwitchActive(context.Background(), fixture.appID, fixture.deploymentID, 0); err != nil || !switched {
+		t.Fatalf("switch active: switched=%t err=%v", switched, err)
+	}
+	fixture.advance(t, generatedruntimestate.PhaseDraining)
+	fixture.advance(t, generatedruntimestate.PhaseSucceeded)
+
+	for repeat := 0; repeat < 2; repeat++ {
+		result, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Duration(repeat+1)*time.Minute))
+		if err != nil || result.PreservedGenerated != 1 || result.FailedGenerated != 0 {
+			t.Fatalf("deployment recovery %d = %#v err=%v", repeat, result, err)
+		}
+		jobResult, err := generatedrecovery.RecoverJobs(context.Background(), fixture.db, fixture.now.Add(time.Duration(repeat+2)*time.Minute))
+		if err != nil || jobResult.Interrupted != 0 || jobResult.RequeuedGenerated != 1-repeat {
+			t.Fatalf("job recovery %d = %#v err=%v", repeat, jobResult, err)
+		}
+		assertRuntime(t, fixture.db, fixture.deploymentID, "succeeded", "not_required", "")
+		assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
+		assertJob(t, fixture.db, fixture.jobID, "queued", "queued", "", 2, fixture.inputJSON)
+	}
+}
+
+func TestRecoveryPausesUncertainCommittedRuntimeWithoutDeletingServingState(t *testing.T) {
+	fixture := newRecoveryFixtureWithReviewedCurrent(t, false, true)
+	fixture.toSwitching(t)
+	if _, switched, err := fixture.state.SwitchActive(context.Background(), fixture.appID, fixture.deploymentID, 0); err != nil || !switched {
+		t.Fatalf("switch active: switched=%t err=%v", switched, err)
+	}
+	fixture.advance(t, generatedruntimestate.PhaseDraining)
+	fixture.advance(t, generatedruntimestate.PhaseSucceeded)
+	if _, err := fixture.db.Exec(`UPDATE jobs SET status='waiting_external',phase='cancelling' WHERE id=?`, fixture.jobID); err != nil {
+		t.Fatal(err)
+	}
+
+	for repeat := 0; repeat < 2; repeat++ {
+		result, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Duration(repeat+1)*time.Minute))
+		if err != nil || result.PreservedGenerated != 0 || result.PausedGenerated != 1 || result.FailedGenerated != 0 {
+			t.Fatalf("deployment recovery %d = %#v err=%v", repeat, result, err)
+		}
+		jobResult, err := generatedrecovery.RecoverJobs(context.Background(), fixture.db, fixture.now.Add(time.Duration(repeat+2)*time.Minute))
+		if err != nil || jobResult.Interrupted != 0 || jobResult.PausedGenerated != 1-repeat {
+			t.Fatalf("job recovery %d = %#v err=%v", repeat, jobResult, err)
+		}
+		assertRuntime(t, fixture.db, fixture.deploymentID, "succeeded", "not_required", "")
+		assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
+		assertJob(t, fixture.db, fixture.jobID, "waiting_user", "route_reconciliation_required", "", 2, fixture.inputJSON)
+	}
+}
+
 type recoveryFixture struct {
 	db           *sql.DB
 	state        *generatedruntimestate.Repository

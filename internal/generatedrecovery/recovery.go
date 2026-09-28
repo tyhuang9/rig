@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,6 +35,7 @@ var (
 // DeploymentResult contains non-secret aggregate recovery outcomes.
 type DeploymentResult struct {
 	PreservedGenerated int
+	PausedGenerated    int
 	FailedGenerated    int
 	FailedOther        int
 }
@@ -41,6 +43,7 @@ type DeploymentResult struct {
 // JobResult contains non-secret aggregate recovery outcomes.
 type JobResult struct {
 	RequeuedGenerated int
+	PausedGenerated   int
 	Interrupted       int
 }
 
@@ -132,8 +135,16 @@ func RecoverDeployments(ctx context.Context, db *sql.DB, now time.Time) (Deploym
 	}
 	formattedNow := now.UTC().Format(time.RFC3339Nano)
 	result := DeploymentResult{PreservedGenerated: len(safe)}
+	uncertainCommitted := make(map[string]struct{})
 	for _, runtimeDeployment := range runtimes {
 		if _, preserved := safe[runtimeDeployment.deploymentID]; preserved {
+			continue
+		}
+		if runtimeDeployment.phase == "succeeded" {
+			// A committed candidate may be serving. Preserve both its runtime
+			// state and its main deployment until an operator can reconcile it.
+			uncertainCommitted[runtimeDeployment.deploymentID] = struct{}{}
+			result.PausedGenerated++
 			continue
 		}
 		if err := failRuntimeDeployment(ctx, tx, runtimeDeployment, formattedNow); err != nil {
@@ -164,6 +175,9 @@ func RecoverDeployments(ctx context.Context, db *sql.DB, now time.Time) (Deploym
 	}
 	for _, deployment := range active {
 		if _, preserved := safe[deployment.id]; preserved {
+			continue
+		}
+		if _, uncertain := uncertainCommitted[deployment.id]; uncertain {
 			continue
 		}
 		updated, err := tx.ExecContext(ctx, `UPDATE deployments SET status='failed',finished_at=?,diagnostic_code=?,failure_code=?,failure_summary=? WHERE id=? AND status IN ('preparing','applying','waiting_health')`, formattedNow, diagnosticDaemonRestarted, diagnosticDaemonRestarted, restartSummary, deployment.id)
@@ -210,6 +224,27 @@ func RecoverJobs(ctx context.Context, db *sql.DB, now time.Time) (JobResult, err
 			safeJobs[value.jobID] = struct{}{}
 		}
 	}
+	uncertainJobs := make(map[string]struct{})
+	for _, runtimeDeployment := range runtimes {
+		if runtimeDeployment.phase != "succeeded" {
+			continue
+		}
+		if _, preserved := safe[runtimeDeployment.deploymentID]; preserved {
+			continue
+		}
+		var jobID string
+		err := tx.QueryRowContext(ctx, `SELECT d.job_id FROM deployments d JOIN jobs j ON j.id=d.job_id
+			WHERE d.id=? AND d.app_id=? AND d.status IN ('preparing','applying','waiting_health')
+			AND j.type='deploy' AND j.resource_type='application' AND j.resource_id=d.app_id`,
+			runtimeDeployment.deploymentID, runtimeDeployment.appID).Scan(&jobID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return JobResult{}, err
+		}
+		uncertainJobs[jobID] = struct{}{}
+	}
 
 	rows, err := tx.QueryContext(ctx, `SELECT id,status,phase FROM jobs WHERE status IN ('assigned','running','waiting_external') ORDER BY created_at,id`)
 	if err != nil {
@@ -250,6 +285,21 @@ func RecoverJobs(ctx context.Context, db *sql.DB, now time.Time) (JobResult, err
 			result.RequeuedGenerated++
 			continue
 		}
+		if _, uncertain := uncertainJobs[job.id]; uncertain {
+			updated, err := tx.ExecContext(ctx, `UPDATE jobs SET status='waiting_user',phase=?,checkpoint_json=?,pause_disposition=?,error_code=NULL,error_detail=NULL,updated_at=? WHERE id=? AND status=? AND phase=?`,
+				routeReconciliationPause, `{"phase":"route_reconciliation_required"}`, routeReconciliationPause, formattedNow, job.id, job.status, job.phase)
+			if err != nil {
+				return JobResult{}, err
+			}
+			if changed, err := updated.RowsAffected(); err != nil || changed != 1 {
+				return JobResult{}, ErrRecoveryConflict
+			}
+			if err := appendJobEvent(ctx, tx, formattedNow, job.id, "warn", routeReconciliationPause, diagnosticDaemonRestarted, "Committed route requires reconciliation after hostd restarted"); err != nil {
+				return JobResult{}, err
+			}
+			result.PausedGenerated++
+			continue
+		}
 		updated, err := tx.ExecContext(ctx, `UPDATE jobs SET status='interrupted',phase='interrupted',pause_disposition=NULL,error_code=?,error_detail=?,updated_at=?,finished_at=? WHERE id=? AND status=? AND phase=?`, diagnosticDaemonRestarted, interruptedJobSummary, formattedNow, formattedNow, job.id, job.status, job.phase)
 		if err != nil {
 			return JobResult{}, err
@@ -261,6 +311,30 @@ func RecoverJobs(ctx context.Context, db *sql.DB, now time.Time) (JobResult, err
 			return JobResult{}, err
 		}
 		result.Interrupted++
+	}
+	uncertainJobIDs := make([]string, 0, len(uncertainJobs))
+	for jobID := range uncertainJobs {
+		uncertainJobIDs = append(uncertainJobIDs, jobID)
+	}
+	sort.Strings(uncertainJobIDs)
+	for _, jobID := range uncertainJobIDs {
+		updated, err := tx.ExecContext(ctx, `UPDATE jobs SET phase=?,checkpoint_json=?,pause_disposition=?,error_code=NULL,error_detail=NULL,updated_at=?
+			WHERE id=? AND status='waiting_user' AND (phase<>? OR COALESCE(pause_disposition,'')<>?)`,
+			routeReconciliationPause, `{"phase":"route_reconciliation_required"}`, routeReconciliationPause, formattedNow,
+			jobID, routeReconciliationPause, routeReconciliationPause)
+		if err != nil {
+			return JobResult{}, err
+		}
+		changed, err := updated.RowsAffected()
+		if err != nil {
+			return JobResult{}, err
+		}
+		if changed == 1 {
+			if err := appendJobEvent(ctx, tx, formattedNow, jobID, "warn", routeReconciliationPause, diagnosticDaemonRestarted, "Committed route requires reconciliation after hostd restarted"); err != nil {
+				return JobResult{}, err
+			}
+			result.PausedGenerated++
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return JobResult{}, err
@@ -285,13 +359,35 @@ func resumableDeployments(ctx context.Context, tx *sql.Tx, runtimes []runtimeDep
 		if !found || !runtimeStateResumable(runtimeDeployment, head) {
 			continue
 		}
+		if runtimeDeployment.phase == "succeeded" {
+			drained, err := previousSlotDrained(ctx, tx, runtimeDeployment)
+			if err != nil {
+				return nil, err
+			}
+			if !drained {
+				continue
+			}
+		}
 		result[runtimeDeployment.deploymentID] = binding
 	}
 	return result, nil
 }
 
+func previousSlotDrained(ctx context.Context, tx *sql.Tx, value runtimeDeployment) (bool, error) {
+	if value.previousDeployment == "" {
+		return true, nil
+	}
+	var total, stopped int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN c.state='stopped' THEN 1 ELSE 0 END),0)
+		FROM generated_runtime_components c JOIN generated_runtime_deployments d ON d.deployment_id=c.deployment_id
+		WHERE d.deployment_id=? AND d.app_id=? AND d.candidate_slot=?`, value.previousDeployment, value.appID, value.previousSlot).Scan(&total, &stopped)
+	return total >= 1 && total <= 2 && stopped == total, err
+}
+
 func loadRuntimeDeployments(ctx context.Context, tx *sql.Tx) ([]runtimeDeployment, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT deployment_id,app_id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,candidate_slot,COALESCE(previous_active_deployment_id,''),COALESCE(previous_active_slot,''),phase,migration_state FROM generated_runtime_deployments WHERE phase NOT IN ('succeeded','failed','cancelled') ORDER BY updated_at,deployment_id`)
+	rows, err := tx.QueryContext(ctx, `SELECT deployment_id,app_id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,candidate_slot,COALESCE(previous_active_deployment_id,''),COALESCE(previous_active_slot,''),phase,migration_state FROM generated_runtime_deployments r WHERE phase NOT IN ('failed','cancelled') AND (phase<>'succeeded' OR EXISTS(
+		SELECT 1 FROM deployments d WHERE d.id=r.deployment_id AND d.status IN ('preparing','applying','waiting_health')
+	)) ORDER BY updated_at,deployment_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +504,10 @@ func bindingMatchesRuntime(binding recoveryBinding, runtimeDeployment runtimeDep
 		return binding.deploymentStatus == "preparing" || binding.deploymentStatus == "applying"
 	case "migrating", "starting_candidate":
 		return binding.deploymentStatus == "applying"
-	case "waiting_health", "switching_route", "draining":
+	case "waiting_health", "switching_route", "draining", "succeeded":
+		if runtimeDeployment.phase == "succeeded" && binding.jobStatus == "waiting_user" {
+			return false
+		}
 		return binding.deploymentStatus == "applying" || binding.deploymentStatus == "waiting_health"
 	default:
 		return false
@@ -544,7 +643,7 @@ func runtimeStateResumable(value runtimeDeployment, head activeHead) bool {
 		} else {
 			return false
 		}
-	case "draining":
+	case "draining", "succeeded":
 		if (value.migrationState != "not_required" && value.migrationState != "succeeded") || !headIsCandidate {
 			return false
 		}
