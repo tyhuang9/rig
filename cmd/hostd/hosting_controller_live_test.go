@@ -646,6 +646,10 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 			t.Fatal("PostgreSQL fixture is not running before outage")
 		}
 		archiveReadsBefore := provider.archiveReads.Load()
+		activeHeadBefore, err := composition.state.Active(ctx, application.ID)
+		if err != nil || activeHeadBefore.DeploymentID != history.Items[0].ID || activeHeadBefore.ReleaseID != releases.Items[0].ID {
+			t.Fatal("outage preflight has no exact durable serving head")
+		}
 		containersBefore := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=io.rig.application="+application.ID)
 		apiContainer := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-q", "--filter", "label=io.rig.application="+application.ID, "--filter", "label=io.rig.component=api")
 		frontendContainer := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-q", "--filter", "label=io.rig.application="+application.ID, "--filter", "label=io.rig.component=frontend")
@@ -700,8 +704,16 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		if !reflect.DeepEqual(duringReleases.Items, releases.Items) {
 			t.Fatal("workload dependency outage rewrote immutable release history")
 		}
-		if assertAttestedRoute(history.Items[0]) != initialRouteURL {
-			t.Fatal("external database outage changed the attested ingress route")
+		var outageRoute apicontract.LocalRoute
+		outageRouteBody := request(http.MethodGet, "/api/v1/apps/"+application.ID+"/local-route", nil, http.StatusOK, &outageRoute)
+		if outageRoute.Status != "unverified" || outageRoute.Reason != "attestation_failed" || outageRoute.Url != "" ||
+			outageRoute.DeploymentID != "" || outageRoute.ReleaseID != "" ||
+			bytes.Contains(outageRouteBody, []byte(dbURL)) || bytes.Contains(outageRouteBody, []byte(sentinel)) {
+			t.Fatal("local route was advertised as verified during external database outage")
+		}
+		duringHead, err := composition.state.Active(ctx, application.ID)
+		if err != nil || !reflect.DeepEqual(duringHead, activeHeadBefore) {
+			t.Fatal("external database outage changed the durable serving head")
 		}
 		if got := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=io.rig.application="+application.ID); got != containersBefore {
 			t.Fatal("external database outage replaced an application container")
@@ -721,6 +733,13 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		}
 		if !recovered {
 			t.Fatal("application did not reconnect to external PostgreSQL within 60 seconds")
+		}
+		if assertAttestedRoute(history.Items[0]) != initialRouteURL {
+			t.Fatal("external database recovery did not restore the same attested route")
+		}
+		afterHead, err := composition.state.Active(ctx, application.ID)
+		if err != nil || !reflect.DeepEqual(afterHead, activeHeadBefore) {
+			t.Fatal("external database recovery changed the durable serving head")
 		}
 		controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 		postgresAfter, err := controllerJourneyDocker(ctx, docker, fixtureEnv, append(append([]string{}, compose...), "ps", "-a", "-q", "postgres")...)

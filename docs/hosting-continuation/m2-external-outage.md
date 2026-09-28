@@ -22,16 +22,17 @@ The RUN-11 subtest then:
 2. Requires routed note reads to return a bounded `503 database_unavailable`,
    Docker to observe the API as unhealthy through its `/readyz` probe, and the
    frontend to remain healthy and serve its page. The independent HTTPS API
-   probe must still work. The route attestation must still describe the same
-   reachable Caddy route; it is a route observation, not a claim that the
-   database-backed API is ready.
+   probe must still work. The local-route API must withhold a verified URL
+   while the backend is unhealthy, while the durable serving head and
+   application container identities remain unchanged.
 3. Requires the authenticated controller to retain the connected GitHub
    source identity and credential generation and the complete initial
    deployment and release records. No application container may be replaced.
 4. Starts the same PostgreSQL container ID, waits at most 60 seconds for Docker
    API health and routed note reads to recover, and reads the original note.
    The PostgreSQL and application container IDs, deployment and release IDs,
-   source authorization, and archive-read count must remain unchanged.
+   source authorization, and archive-read count must remain unchanged. The
+   local-route API must then reattest the same serving URL and deployment.
 
 The subtest attempts to restart PostgreSQL on any assertion failure. The
 existing journey owns exact fixture and generated-resource cleanup. CI requires
