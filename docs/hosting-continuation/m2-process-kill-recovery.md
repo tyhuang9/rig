@@ -100,6 +100,8 @@ runner a second time.
 The Linux Docker process-kill journey, hosted cleanup and Linux race checks
 have **not run** for this branch. The process-kill gate is a CI acceptance
 requirement, not local acceptance evidence. CodeRabbit CLI was unauthenticated
-and did not review the source. Independent manual code and security reviews of
-the earlier worker-process harness found no Must Fix; the child-owned API
-extension needs focused rereview. Neither review executed Docker.
+and did not review the source. Independent manual code review found and verified
+fixes for the marker publication race and child API authentication proof.
+Manual security delta review found no actionable vulnerability, and final
+integration review approved draft PR qualification. These reviews did not
+execute Docker and do not establish acceptance of a standalone `hostd serve` kill.
