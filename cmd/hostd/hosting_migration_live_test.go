@@ -667,6 +667,7 @@ const migrationJourneyUncertainMigration = `exports.up = async function up(knex)
     table.bigIncrements("run_id").primary();
     table.text("migration_key").notNullable();
   });
+  await knex("rig_migration_uncertainty").insert({ migration_key: "202609270002_uncertainty" });
   await knex("rig_migration_ledger").insert({ migration_key: "202609270002_uncertainty" });
   await knex("rig_migration_counter").where({ counter_key: "approved_migration" }).increment("value", 1);
 };
