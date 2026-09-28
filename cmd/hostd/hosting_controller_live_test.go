@@ -628,7 +628,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/test/dependency", "", http.StatusOK, "reachable")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodPost, "/api/notes", `{"body":"controller TLS note"}`, http.StatusCreated, "controller TLS note")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
-	if !t.Run("ExternalDependencyOutage", func(t *testing.T) {
+	if !processKill && !t.Run("ExternalDependencyOutage", func(t *testing.T) {
 		compose := []string{"compose", "-f", filepath.Join(fixtureRoot, "docker-compose.yml"), "-p", controllerJourneyProject}
 		postgresID, err := controllerJourneyDocker(ctx, docker, fixtureEnv, append(append([]string{}, compose...), "ps", "-a", "-q", "postgres")...)
 		if err != nil || len(strings.Fields(string(postgresID))) != 1 {
