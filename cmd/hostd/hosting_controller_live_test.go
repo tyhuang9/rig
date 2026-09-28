@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -627,6 +628,128 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/test/dependency", "", http.StatusOK, "reachable")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodPost, "/api/notes", `{"body":"controller TLS note"}`, http.StatusCreated, "controller TLS note")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
+	if !t.Run("ExternalDependencyOutage", func(t *testing.T) {
+		compose := []string{"compose", "-f", filepath.Join(fixtureRoot, "docker-compose.yml"), "-p", controllerJourneyProject}
+		postgresID, err := controllerJourneyDocker(ctx, docker, fixtureEnv, append(append([]string{}, compose...), "ps", "-a", "-q", "postgres")...)
+		if err != nil || len(strings.Fields(string(postgresID))) != 1 {
+			t.Fatal("identify exactly one application-owned PostgreSQL fixture container")
+		}
+		postgresID = bytes.TrimSpace(postgresID)
+		postgresLabels, err := controllerJourneyDocker(ctx, docker, nil, "container", "inspect", "--format", "{{json .Config.Labels}}", string(postgresID))
+		var fixtureLabels map[string]string
+		if err != nil || json.Unmarshal(bytes.TrimSpace(postgresLabels), &fixtureLabels) != nil ||
+			fixtureLabels["com.docker.compose.project"] != controllerJourneyProject || fixtureLabels["com.docker.compose.service"] != "postgres" {
+			t.Fatal("PostgreSQL fixture ownership is uncertain")
+		}
+		beforeState, err := controllerJourneyDocker(ctx, docker, nil, "container", "inspect", "--format", "{{.State.Running}}", string(postgresID))
+		if err != nil || string(bytes.TrimSpace(beforeState)) != "true" {
+			t.Fatal("PostgreSQL fixture is not running before outage")
+		}
+		archiveReadsBefore := provider.archiveReads.Load()
+		containersBefore := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=io.rig.application="+application.ID)
+		apiContainer := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-q", "--filter", "label=io.rig.application="+application.ID, "--filter", "label=io.rig.component=api")
+		frontendContainer := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-q", "--filter", "label=io.rig.application="+application.ID, "--filter", "label=io.rig.component=frontend")
+		if apiContainer == "" || strings.Contains(apiContainer, ",") || frontendContainer == "" || strings.Contains(frontendContainer, ",") {
+			t.Fatal("outage preflight requires exactly one API and one frontend container")
+		}
+		stopped := true
+		defer func() {
+			if !stopped {
+				return
+			}
+			recovery, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			if _, err := controllerJourneyDocker(recovery, docker, nil, "container", "start", string(postgresID)); err != nil {
+				t.Error("restore application-owned PostgreSQL fixture after failed outage assertion")
+			}
+		}()
+		if _, err := controllerJourneyDocker(ctx, docker, nil, "container", "stop", "--time", "10", string(postgresID)); err != nil {
+			t.Fatal("stop only the exact external PostgreSQL container")
+		}
+		state, err := controllerJourneyDocker(ctx, docker, nil, "container", "inspect", "--format", "{{.State.Running}}", string(postgresID))
+		if err != nil || string(bytes.TrimSpace(state)) != "false" {
+			t.Fatal("external PostgreSQL fixture did not stop")
+		}
+		controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusServiceUnavailable, `"database_unavailable"`)
+		unhealthy := false
+		for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+			if controllerJourneyContainerHealth(ctx, docker, apiContainer) == "unhealthy" {
+				unhealthy = true
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if !unhealthy || controllerJourneyContainerHealth(ctx, docker, frontendContainer) != "healthy" {
+			t.Fatal("Docker did not observe API unready and frontend healthy during database outage")
+		}
+		controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/test/dependency", "", http.StatusOK, "reachable")
+		controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/", "", http.StatusOK, "<html")
+		var duringConnection apicontract.SourceConnectionList
+		request(http.MethodGet, "/api/v1/source-connections", nil, http.StatusOK, &duringConnection)
+		if len(duringConnection.Items) != 1 || duringConnection.Items[0].ID != connection.ID ||
+			duringConnection.Items[0].Status != "connected" || duringConnection.Items[0].CredentialGeneration != connection.CredentialGeneration {
+			t.Fatal("workload dependency outage changed GitHub source authorization")
+		}
+		var duringHistory apicontract.DeploymentList
+		request(http.MethodGet, deploymentPath, nil, http.StatusOK, &duringHistory)
+		if len(duringHistory.Items) != 1 || !reflect.DeepEqual(duringHistory.Items[0], history.Items[0]) {
+			t.Fatal("workload dependency outage rewrote immutable deployment history")
+		}
+		var duringReleases apicontract.ReleaseList
+		request(http.MethodGet, "/api/v1/apps/"+application.ID+"/releases", nil, http.StatusOK, &duringReleases)
+		if !reflect.DeepEqual(duringReleases.Items, releases.Items) {
+			t.Fatal("workload dependency outage rewrote immutable release history")
+		}
+		if assertAttestedRoute(history.Items[0]) != initialRouteURL {
+			t.Fatal("external database outage changed the attested ingress route")
+		}
+		if got := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=io.rig.application="+application.ID); got != containersBefore {
+			t.Fatal("external database outage replaced an application container")
+		}
+		if _, err := controllerJourneyDocker(ctx, docker, nil, "container", "start", string(postgresID)); err != nil {
+			t.Fatal("restore application-owned PostgreSQL fixture")
+		}
+		stopped = false
+		recovered := false
+		for deadline := time.Now().Add(60 * time.Second); time.Now().Before(deadline); {
+			if controllerJourneyContainerHealth(ctx, docker, apiContainer) == "healthy" &&
+				controllerJourneyRoutedStatus(ctx, application.ID, "/api/notes") == http.StatusOK {
+				recovered = true
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if !recovered {
+			t.Fatal("application did not reconnect to external PostgreSQL within 60 seconds")
+		}
+		controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
+		postgresAfter, err := controllerJourneyDocker(ctx, docker, fixtureEnv, append(append([]string{}, compose...), "ps", "-a", "-q", "postgres")...)
+		if err != nil || !bytes.Equal(bytes.TrimSpace(postgresAfter), postgresID) {
+			t.Fatal("external fixture recovery replaced its PostgreSQL container")
+		}
+		if got := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=io.rig.application="+application.ID); got != containersBefore {
+			t.Fatal("external dependency recovery replaced an application container")
+		}
+		var afterHistory apicontract.DeploymentList
+		request(http.MethodGet, deploymentPath, nil, http.StatusOK, &afterHistory)
+		if len(afterHistory.Items) != 1 || !reflect.DeepEqual(afterHistory.Items[0], history.Items[0]) || provider.archiveReads.Load() != archiveReadsBefore {
+			t.Fatal("external dependency recovery created a deployment or changed a release")
+		}
+		var afterReleases apicontract.ReleaseList
+		request(http.MethodGet, "/api/v1/apps/"+application.ID+"/releases", nil, http.StatusOK, &afterReleases)
+		if !reflect.DeepEqual(afterReleases.Items, releases.Items) {
+			t.Fatal("external dependency recovery rewrote immutable release history")
+		}
+		var afterConnection apicontract.SourceConnectionList
+		request(http.MethodGet, "/api/v1/source-connections", nil, http.StatusOK, &afterConnection)
+		if len(afterConnection.Items) != 1 || afterConnection.Items[0].ID != connection.ID ||
+			afterConnection.Items[0].Status != "connected" || afterConnection.Items[0].CredentialGeneration != connection.CredentialGeneration {
+			t.Fatal("external dependency recovery changed GitHub source authorization")
+		}
+		t.Logf("RUN-11 external PostgreSQL outage: app=%s deployment=%s release=%s source=%s status=connected route=%s api-health=unhealthy/recovered frontend-health=healthy notes=503/recovered postgres-container-preserved=true app-containers-preserved=true", application.ID, history.Items[0].ID, releases.Items[0].ID, connection.ID, initialRouteURL)
+	}) {
+		t.Fatal("RUN-11 external dependency outage failed")
+	}
 	index := controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/", "", http.StatusOK, "<html")
 	asset := regexp.MustCompile(`src="(/assets/[^"]+\.js)"`).FindSubmatch(index)
 	if len(asset) != 2 {
@@ -1752,6 +1875,28 @@ func controllerJourneyRoutedRequest(t *testing.T, ctx context.Context, appID, me
 		t.Fatalf("routed %s %s: status=%d want=%d fragment-present=%t", method, path, response.StatusCode, want, bytes.Contains(content, []byte(fragment)))
 	}
 	return content
+}
+
+func controllerJourneyRoutedStatus(ctx context.Context, appID, path string) int {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:8080"+path, nil)
+	if err != nil {
+		return 0
+	}
+	request.Host = appID + ".rig.localhost"
+	response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+	if err != nil {
+		return 0
+	}
+	defer response.Body.Close()
+	return response.StatusCode
+}
+
+func controllerJourneyContainerHealth(ctx context.Context, docker, containerID string) string {
+	output, err := controllerJourneyDocker(ctx, docker, nil, "container", "inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{end}}", containerID)
+	if err != nil {
+		return ""
+	}
+	return string(bytes.TrimSpace(output))
 }
 
 func controllerJourneyProblemCode(body []byte) string {
