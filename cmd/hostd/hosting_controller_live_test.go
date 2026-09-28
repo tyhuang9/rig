@@ -944,7 +944,8 @@ func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
 	if capacityRestartRouteURL != retainedRouteURL {
 		t.Fatal("controller restart changed the attested route during capacity pause")
 	}
-	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, dbURL, sentinel)
+	capacityRestartProbeSources := controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, network.Name, gateway, dbURL, sentinel)
+	assertControllerAppIsolation(capacityRestartProbeSources)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedRouteURL, "read", browserNote)
 	capacityPressure.SetArmed(false)
