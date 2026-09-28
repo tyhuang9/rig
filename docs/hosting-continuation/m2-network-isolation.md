@@ -10,9 +10,10 @@ ownership, route, hardening and cleanup safeguards.
 
 **Initial source revision:** `bd99246872918c5b6e1539c0e69011dee2ba29c8`.
 
-This records the local candidate and its verification. The first hosted Docker
-run exposed a test-probe timeout issue; this page does not claim RUN-09 or M2
-completion.
+This records the local and hosted qualification, including failed attempts.
+The controlled RUN-09 Docker probes passed at source revision
+`41b84a2b86b9c81472f150a88b95b95e53e076cc`. This does not claim M2
+completion or production/LAN deployment readiness.
 
 ## Actual baseline
 
@@ -169,7 +170,7 @@ is unrun. CodeRabbit's hosted status reported success because it skipped this
 draft PR; its bot comment confirms no source review occurred.
 No production-readiness or merge approval follows from this local record.
 
-## First hosted result and remaining work
+## Hosted runs and remaining work
 
 The first hosted Docker gate for draft PR 80 at `e8824130c97113f5595378d916a4a2611bcfb52d`
 ran on 2026-09-27. Its controller journey, gateway-readiness and external
@@ -194,9 +195,30 @@ Docker cleanup steps again passed. The controlled CA and leaf had both been
 created with empty distinguished names. The candidate correction gives them
 distinct subjects while keeping the fixture CA, SNI peer name and certificate
 verification required. Native Go and exact Node probe controls passed locally;
-the hosted application-origin result is pending.
+the next hosted application-origin result passed.
 
-Successful Docker and Linux race qualification require hosted CI here.
+At `41b84a2b86b9c81472f150a88b95b95e53e076cc`, the hosted run began on
+2026-09-27 and completed on 2026-09-28 UTC. Docker job `108736284315` passed
+all earlier recipe and gateway steps, then
+recorded exactly one Go JSON pass and no fail/skip for each required live test:
+
+| Named test | Observed result |
+| --- | --- |
+| `TestLiveGeneratedGatewayReadiness` | pass, 33.84s |
+| `TestLiveGeneratedBlueGreenLifecycle` | pass, 45.58s |
+| `TestLiveHostingNotesDatabaseRoundtrip` | pass, 52.21s |
+
+The same job passed `Require complete Docker cleanup`. Hosted controller job
+`108736284179` on that exact head recorded one Go JSON pass and no fail/skip
+for `TestLiveControllerGeneratedDeploymentJourney` (214.79s), and its complete
+Docker cleanup step passed. The journey retains the application-owned external
+PostgreSQL/HTTPS, browser, private controller, durable reopen and scoped-secret
+checks. These are the actual controlled RUN-09 Docker results; they do not
+establish public Internet or LAN access. The docs, fast, Chromium, Windows,
+relay, generated-runtime race, and packaging jobs passed at this code head.
+PostgreSQL/Linux race job `108736284331` also passed its repository-wide
+`go test -race -count=1 -timeout=30m ./...` step on this exact head.
+
 Windows has CGO disabled, so local race execution is unavailable and was not
 claimed. The live Docker tests are opt-in; their ordinary native-suite skips
 do not establish RUN-09. Publication of PR 80 was explicitly authorized; a
@@ -213,8 +235,8 @@ outside either app's container network namespace. Successful access proves
 that bridge isolation permits this outward path. It does not prove public
 Internet routing, a particular external provider, or LAN deployment. Existing
 controller evidence uses application-owned PostgreSQL and HTTPS fixtures.
-Successful Docker and Linux race qualification for this candidate remain
-pending.
+The controlled Docker fixture now has a successful isolation result; the
+remaining CI and wider M2 boundaries remain separate.
 
 Other M2 acceptance remains incomplete: the live user GitHub walkthrough,
 approved migration and uncertainty boundaries, external-service outage during
