@@ -573,22 +573,27 @@ func TestGeneratedExecutorUsesReviewedPinsOnSuccessfulDeployment(t *testing.T) {
 func TestGeneratedExecutorFinalizesCommittedRuntimeAfterRestart(t *testing.T) {
 	for _, test := range []struct {
 		name            string
+		migration       bool
 		invalidateHead  bool
 		wantDisposition string
 		wantStatus      deployments.Status
 	}{
-		{name: "matching committed head", wantStatus: deployments.Succeeded},
+		{name: "matching committed head with completed migration", migration: true, wantStatus: deployments.Succeeded},
 		{name: "deployment already finalized", wantStatus: deployments.Succeeded},
 		{name: "head no longer matches", invalidateHead: true, wantDisposition: jobs.PauseRouteReconciliationRequired, wantStatus: deployments.Applying},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newExecutorFixture(t, false)
+			fixture := newExecutorFixture(t, test.migration)
 			job := reviewedDeploymentJob()
 			if _, err := fixture.executor.Execute(context.Background(), job, fixture.reporter); err != nil {
 				t.Fatal(err)
 			}
 			if fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded {
 				t.Fatal("runtime did not commit success")
+			}
+			migrationRuns := len(fixture.migrations.requests)
+			if test.migration && (fixture.state.deployment.MigrationState != generatedruntimestate.MigrationSucceeded || migrationRuns != 1) {
+				t.Fatal("fixture did not complete exactly one approved migration")
 			}
 			if test.name != "deployment already finalized" {
 				fixture.deployments.deployment.Status = deployments.Applying
@@ -601,8 +606,8 @@ func TestGeneratedExecutorFinalizesCommittedRuntimeAfterRestart(t *testing.T) {
 			if err != nil || result.PauseDisposition != test.wantDisposition || fixture.deployments.deployment.Status != test.wantStatus {
 				t.Fatalf("finalize result=%+v err=%v deployment=%+v", result, err, fixture.deployments.deployment)
 			}
-			if fixture.compiler.calls != builds || len(fixture.routes.requests) != switches || fixture.runtime.stopped != removals {
-				t.Fatal("finalization replay built, switched, or removed a runtime resource")
+			if fixture.compiler.calls != builds || len(fixture.routes.requests) != switches || fixture.runtime.stopped != removals || len(fixture.migrations.requests) != migrationRuns {
+				t.Fatal("finalization replay built, migrated, switched, or removed a runtime resource")
 			}
 		})
 	}
