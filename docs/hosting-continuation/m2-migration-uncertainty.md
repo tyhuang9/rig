@@ -6,8 +6,8 @@ container. This is the RUN-08 slice; it is not the complete M2 exit gate.
 
 **Candidate branch:** `feature/hosting-m2-migration-uncertainty`, based on the
 unmerged reviewed-recovery head `7536c5c09351bdc6212ffe3c58638a62325e4d1a`.
-The branch is local; publication, deployment and merging require separate user
-authorization.
+The branch is published as draft PR #81 for hosted CI. Deployment and merging
+require separate user authorization.
 
 ## Required behavior
 
@@ -135,13 +135,43 @@ from its frozen lockfile with normal pnpm store access resolved it. No tracked
 dependency or lockfile was changed by either local install.
 
 The Windows host has no usable local Docker gate and CGO is disabled, so live
-Docker and local Go race execution remain unrun. The new workflow has not yet
-run on this unpublished branch. The existing hosting-notes journey establishes
+Docker and local Go race execution remain unrun. The first hosted workflow
+result is recorded below. The existing hosting-notes journey establishes
 external TLS access only on its own published head; that evidence is not
 transferred to this candidate. The Compose PostgreSQL fixture is controlled by
 the test harness and demonstrates Rig's non-provisioning boundary, rather than
 an independently administered external database. Live user GitHub consent,
 actual OS process-kill behavior and other M2 cases remain separate.
+
+## First hosted run and correction on 2026-09-28
+
+Draft PR #81 ran the hosted migration workflow at `982e123` (run
+`36374444867`, job `108777281176`). The controlled GitHub revision contract
+passed. The live journey reached the approved v2 deployment, which failed with
+the sanitized `apply_failed` job code before its success assertion. Cleanup
+then reported that the external fixture network and two volumes remained; the
+always-run resource gate also failed. This run is failed acceptance evidence,
+not a pass for RUN-08.
+
+The pinned Knex 3.1 CLI searches for `knexfile.js` and other supported
+extensions but not `knexfile.cjs`. A local invocation of the inferred
+`knex migrate:latest` command reproduced the missing-configuration failure
+with the original filename. With the file renamed to `knexfile.js`, the same
+synthetic invocation loaded the config and reached the expected absent local
+test certificate. This strongly identifies the v2 failure cause, though the
+hosted log exposes only the safe `apply_failed` code. A local fixture contract
+now requires the discoverable filename. The Compose teardown also omitted the
+required fixture environment supplied during `up`, so its `down` could not
+resolve the same project configuration. Teardown now passes that environment
+without logging its values. The next hosted run must establish whether both
+corrections work on Linux Docker and whether all owned resources are removed.
+
+After the correction, the focused tagged Go fixture/provider/composition tests,
+tagged live-test compile and vet, `node --check` for the Knex config and app,
+full `go test -p 1 -count=1 -timeout=20m ./...`, `go vet ./...`, four-command
+Go build, generation and Windows controller scripts, and documentation build,
+accessibility and workflow checks passed locally. The Windows host still did
+not execute the Docker migration or Linux race test.
 
 ## Rollback
 
