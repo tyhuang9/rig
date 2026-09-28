@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -182,6 +183,13 @@ func controllerProcessKillMarker(path string, boundary controllerProcessKillBoun
 // with a fixture manifest. Keeping the child name stable makes -test.run an
 // auditable process boundary.
 func TestLiveControllerGeneratedProcessKillRecovery(t *testing.T) {
+	if os.Getenv("RIG_LIVE_PROCESS_KILL_CHILD") == "block" {
+		marker := os.Getenv("RIG_LIVE_PROCESS_KILL_MARKER")
+		if marker == "" || controllerProcessKillMarker(marker, controllerKillBeforeBuild) != nil {
+			os.Exit(2)
+		}
+		select {}
+	}
 	if os.Getenv("RIG_LIVE_PROCESS_KILL_CHILD") != "1" {
 		return
 	}
@@ -196,5 +204,53 @@ func TestLiveControllerGeneratedProcessKillRecovery(t *testing.T) {
 	// This guard keeps accidental direct invocation from looking like coverage.
 	if os.Getenv("RIG_RUN_LIVE_CONTROLLER_JOURNEY") != "1" {
 		t.Fatal("process-kill child requires the live controller journey")
+	}
+}
+
+// controllerProcessKillChild starts a fresh go-test process with an exact
+// test selector. The parent owns the marker directory and kills only this
+// child after a barrier has recorded durable state. It is shared by the live
+// journey parent and keeps process management out of production code.
+func controllerProcessKillChild(t *testing.T, marker string, environment []string) *exec.Cmd {
+	t.Helper()
+	if filepath.Base(marker) != "ready" {
+		t.Fatal("process-kill marker name is unsafe")
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestLiveControllerGeneratedProcessKillRecovery$")
+	command.Env = append(append([]string(nil), os.Environ()...), environment...)
+	command.Env = append(command.Env, "RIG_LIVE_PROCESS_KILL_MARKER="+marker)
+	if err := command.Start(); err != nil {
+		t.Fatal("start process-kill child")
+	}
+	return command
+}
+
+func controllerProcessKillWaitMarker(t *testing.T, marker string, child *exec.Cmd) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Minute)
+	defer deadline.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			return
+		}
+		select {
+		case <-deadline.C:
+			_ = child.Process.Kill()
+			_, _ = child.Process.Wait()
+			t.Fatal("process-kill child did not reach barrier")
+		case <-tick.C:
+		}
+	}
+}
+
+func controllerProcessKillTerminate(t *testing.T, child *exec.Cmd) {
+	t.Helper()
+	if err := child.Process.Kill(); err != nil {
+		t.Fatal("SIGKILL process-kill child")
+	}
+	if err := child.Wait(); err == nil {
+		t.Fatal("process-kill child exited cleanly after kill")
 	}
 }
