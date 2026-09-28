@@ -218,6 +218,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	}
 
 	fixtureStarted := false
+	var fixtureEnv []string
 	var application apicontract.Application
 	var appNetwork generatedruntime.AppNetworkDescription
 	t.Cleanup(func() {
@@ -243,7 +244,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 		}
 		migrationJourneyCleanupIngress(t, cleanup, docker)
 		if fixtureStarted {
-			if _, downErr := controllerJourneyDocker(cleanup, docker, nil, "compose", "-f", filepath.Join(fixtureRoot, "docker-compose.yml"), "-p", migrationJourneyProject, "down", "--volumes", "--remove-orphans"); downErr != nil {
+			if _, downErr := controllerJourneyDocker(cleanup, docker, fixtureEnv, "compose", "-f", filepath.Join(fixtureRoot, "docker-compose.yml"), "-p", migrationJourneyProject, "down", "--volumes", "--remove-orphans"); downErr != nil {
 				t.Error("remove exact external migration fixture project")
 			}
 		}
@@ -346,7 +347,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 		httpsPort = controllerJourneyPort(t, gateway)
 	}
 	password := uuid.NewString()
-	fixtureEnv := []string{
+	fixtureEnv = []string{
 		"FIXTURE_NETWORK_NAME=" + migrationJourneyNetwork,
 		"FIXTURE_HOST_GATEWAY_IP=" + gateway,
 		"FIXTURE_POSTGRES_BIND_ADDRESS=" + gateway,
@@ -762,7 +763,7 @@ exports.down = async function down() {
 `
 
 func migrationJourneyMakeV1Source(root string) error {
-	if err := os.Remove(filepath.Join(root, "knexfile.cjs")); err != nil {
+	if err := os.Remove(filepath.Join(root, "knexfile.js")); err != nil {
 		return err
 	}
 	if err := os.RemoveAll(filepath.Join(root, "migrations")); err != nil {

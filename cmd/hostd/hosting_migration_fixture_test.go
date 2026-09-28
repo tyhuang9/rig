@@ -23,6 +23,14 @@ func TestHostingMigrationFixtureAnalyzerContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Knex 3.1's default CLI discovery includes knexfile.js but excludes
+	// knexfile.cjs. Keep the inferred command executable without a --knexfile flag.
+	if info, err := os.Stat(filepath.Join(root, "knexfile.js")); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("Knex CLI-discoverable configuration is required: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "knexfile.cjs")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ambiguous undiscoverable Knex configuration remains: %v", err)
+	}
 	files, err := migrationFixtureFiles(root)
 	if err != nil {
 		t.Fatal(err)
