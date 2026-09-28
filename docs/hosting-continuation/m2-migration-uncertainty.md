@@ -163,8 +163,7 @@ hosted log exposes only the safe `apply_failed` code. A local fixture contract
 now requires the discoverable filename. The Compose teardown also omitted the
 required fixture environment supplied during `up`, so its `down` could not
 resolve the same project configuration. Teardown now passes that environment
-without logging its values. The next hosted run must establish whether both
-corrections work on Linux Docker and whether all owned resources are removed.
+without logging its values. The corrected hosted result is recorded below.
 
 After the correction, the focused tagged Go fixture/provider/composition tests,
 tagged live-test compile and vet, `node --check` for the Knex config and app,
@@ -172,6 +171,28 @@ full `go test -p 1 -count=1 -timeout=20m ./...`, `go vet ./...`, four-command
 Go build, generation and Windows controller scripts, and documentation build,
 accessibility and workflow checks passed locally. The Windows host still did
 not execute the Docker migration or Linux race test.
+
+## Corrected hosted acceptance on 2026-09-28
+
+At source head `bd66acf098089b6154eb58a6b41d345b15ae7014`, the
+[hosted migration job](https://github.com/tyhuang9/rig/actions/runs/36376529012/job/108783414779)
+passed. Its JSON events contain one pass and no fail/skip for
+`TestControllerJourneyGitHubProviderRetainsImmutableRevisions` and one pass
+and no fail/skip for
+`TestLiveGeneratedMigrationApprovalAndUncertaintyJourney` (135.37 seconds).
+The always-run `Require complete owned Docker cleanup` step passed at the same
+head, including the external fixture network and volumes that remained on the
+first run.
+
+The [PostgreSQL and Linux race job](https://github.com/tyhuang9/rig/actions/runs/36376528993/job/108783414589)
+also passed at that exact head. Its PostgreSQL integration race, relay outage
+race, and repository-wide race steps all succeeded. The other required PR #81
+hosted controller, blue-green Docker, Chromium, Windows, documentation, fast,
+generated-runtime race, relay Compose, and packaging checks succeeded;
+documentation deployment was skipped by the pull-request gate. This qualifies
+RUN-08 against the controlled Docker fixture. It does not establish behavior
+against an independently administered database, live GitHub consent, or an OS
+process kill during migration.
 
 ## Rollback
 
