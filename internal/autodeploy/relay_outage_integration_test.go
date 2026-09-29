@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,8 @@ import (
 	"github.com/hostd/hostd/internal/relay/wss"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart exercises the
@@ -245,14 +248,148 @@ func relayOutagePostgres(t *testing.T, ctx context.Context, dsn string) (*pgxpoo
 	return pool, reopen
 }
 
+const (
+	relayOutageControllerOpenAttempts   = 21
+	relayOutageControllerOpenRetryDelay = 25 * time.Millisecond
+)
+
+type relayOutageControllerOpenFailure struct {
+	category string
+	attempts int
+}
+
 func relayOutageControllerDB(t *testing.T, root string) *sql.DB {
 	t.Helper()
-	db, err := controldb.Open(root)
-	if err != nil {
-		t.Fatal("open controller database")
+	// This fixture simulates a process restart by closing and reopening SQLite
+	// in one process. Retry only SQLite's explicit transient lock results; all
+	// other open failures remain immediate and their untrusted details stay out
+	// of hosted logs.
+	db, failure := relayOutageOpenControllerDB(root, relayOutageControllerOpenAttempts, controldb.Open, time.Sleep)
+	if db == nil {
+		t.Fatalf("open controller database: category=%s attempts=%d", failure.category, failure.attempts)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+func relayOutageOpenControllerDB(root string, maxAttempts int, open func(string) (*sql.DB, error), sleep func(time.Duration)) (*sql.DB, relayOutageControllerOpenFailure) {
+	if maxAttempts < 1 || open == nil || sleep == nil {
+		return nil, relayOutageControllerOpenFailure{category: "unavailable"}
+	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		db, err := open(root)
+		if err == nil && db != nil {
+			return db, relayOutageControllerOpenFailure{}
+		}
+		if db != nil {
+			_ = db.Close()
+		}
+		category, retryable := relayOutageSQLiteOpenFailure(err)
+		failure := relayOutageControllerOpenFailure{category: category, attempts: attempt}
+		if !retryable || attempt == maxAttempts {
+			return nil, failure
+		}
+		sleep(relayOutageControllerOpenRetryDelay)
+	}
+	return nil, relayOutageControllerOpenFailure{category: "unavailable", attempts: maxAttempts}
+}
+
+func relayOutageSQLiteOpenFailure(err error) (string, bool) {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return "unavailable", false
+	}
+	switch sqliteErr.Code() & 0xff {
+	case sqlite3.SQLITE_BUSY:
+		return "sqlite_busy", true
+	case sqlite3.SQLITE_LOCKED:
+		return "sqlite_locked", true
+	default:
+		return "sqlite_error", false
+	}
+}
+
+func TestRelayOutageControllerOpenRetriesOnlyTransientSQLiteLocks(t *testing.T) {
+	busyErr := relayOutageSQLiteBusyError(t)
+	ready, err := controldb.Open(t.TempDir())
+	if err != nil {
+		t.Fatal("open ready controller database")
+	}
+	t.Cleanup(func() { _ = ready.Close() })
+
+	t.Run("busy eventually opens", func(t *testing.T) {
+		calls, sleeps := 0, 0
+		db, failure := relayOutageOpenControllerDB("ignored", 3, func(string) (*sql.DB, error) {
+			calls++
+			if calls < 3 {
+				return nil, busyErr
+			}
+			return ready, nil
+		}, func(time.Duration) { sleeps++ })
+		if db != ready || failure != (relayOutageControllerOpenFailure{}) || calls != 3 || sleeps != 2 {
+			t.Fatalf("db=%p failure=%#v calls=%d sleeps=%d", db, failure, calls, sleeps)
+		}
+	})
+
+	t.Run("busy remains bounded", func(t *testing.T) {
+		calls, sleeps := 0, 0
+		db, failure := relayOutageOpenControllerDB("ignored", 3, func(string) (*sql.DB, error) {
+			calls++
+			return nil, busyErr
+		}, func(time.Duration) { sleeps++ })
+		if db != nil || failure.category != "sqlite_busy" || failure.attempts != 3 || calls != 3 || sleeps != 2 {
+			t.Fatalf("db=%p failure=%#v calls=%d sleeps=%d", db, failure, calls, sleeps)
+		}
+	})
+
+	t.Run("unknown fails immediately", func(t *testing.T) {
+		calls, sleeps := 0, 0
+		db, failure := relayOutageOpenControllerDB("ignored", 3, func(string) (*sql.DB, error) {
+			calls++
+			return nil, errors.New("private database detail")
+		}, func(time.Duration) { sleeps++ })
+		if db != nil || failure.category != "unavailable" || failure.attempts != 1 || calls != 1 || sleeps != 0 {
+			t.Fatalf("db=%p failure=%#v calls=%d sleeps=%d", db, failure, calls, sleeps)
+		}
+	})
+}
+
+func relayOutageSQLiteBusyError(t *testing.T) error {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "busy.db")
+	first, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal("open first busy database")
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	second, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal("open second busy database")
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	if _, err = first.Exec(`CREATE TABLE busy_fixture (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal("create busy database fixture")
+	}
+	if _, err = second.Exec(`PRAGMA busy_timeout = 0`); err != nil {
+		t.Fatal("disable second busy timeout")
+	}
+	tx, err := first.Begin()
+	if err != nil {
+		t.Fatal("begin busy database transaction")
+	}
+	if _, err = tx.Exec(`INSERT INTO busy_fixture(id) VALUES(1)`); err != nil {
+		_ = tx.Rollback()
+		t.Fatal("lock busy database fixture")
+	}
+	_, busyErr := second.Exec(`INSERT INTO busy_fixture(id) VALUES(2)`)
+	if rollbackErr := tx.Rollback(); rollbackErr != nil {
+		t.Fatal("release busy database fixture")
+	}
+	category, retryable := relayOutageSQLiteOpenFailure(busyErr)
+	if category != "sqlite_busy" || !retryable {
+		t.Fatalf("busy database category=%s retryable=%t", category, retryable)
+	}
+	return busyErr
 }
 
 func relayOutageSeedController(t *testing.T, ctx context.Context, db *sql.DB, at time.Time, controllerID, keyID, bindingID string, publicKey ed25519.PublicKey) {
