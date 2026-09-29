@@ -461,7 +461,7 @@ func controllerProcessKillMatrix(
 			request(http.MethodPut, "/api/v1/apps/"+appID+"/scoped-configuration", apicontract.ReplaceScopedApplicationConfigurationRequest{
 				ExpectedRevisionNumber: configuration.RevisionNumber,
 				PlanRevisionID:         plan.RevisionID, PlanRevisionNumber: plan.RevisionNumber,
-				PublicBuildDisclosureAcknowledged: true, Entries: updatedEntries,
+				PublicBuildDisclosureAcknowledged: true, Entries: updatedEntries, Remove: []apicontract.ScopedConfigurationKey{},
 			}, http.StatusOK, &nextConfiguration)
 			if nextConfiguration.RevisionNumber != configuration.RevisionNumber+1 || nextConfiguration.RevisionID == configuration.RevisionID {
 				t.Fatal("replacement did not create a reviewed immutable configuration revision")
