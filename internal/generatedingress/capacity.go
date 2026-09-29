@@ -17,12 +17,20 @@ const capacityProbeCommand = `memory=$(awk '/MemAvailable:/ {print $2*1024}' /pr
 // Snapshot implements generatedruntime.CapacitySource. Provision must have
 // succeeded at startup; this method is intentionally read-only apart from the
 // fixed process executed inside the already-running Caddy container.
-func (m *Manager) Snapshot(ctx context.Context) (generatedruntime.CapacitySnapshot, error) {
+func (m *Manager) Snapshot(ctx context.Context) (snapshot generatedruntime.CapacitySnapshot, resultErr error) {
 	if m == nil || ctx == nil {
 		return generatedruntime.CapacitySnapshot{}, errors.New("generated ingress capacity source is invalid")
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	release, err := m.lockGateway(ctx)
+	if err != nil {
+		return generatedruntime.CapacitySnapshot{}, err
+	}
+	defer func() {
+		releaseGatewayLock(release, &resultErr)
+		if resultErr != nil {
+			snapshot = generatedruntime.CapacitySnapshot{}
+		}
+	}()
 	inspection, found, err := m.inspectCaddy(ctx)
 	if err != nil || !found || !inspection.Running || inspection.Labels["io.rig.managed"] != "generated-ingress" || inspection.Labels["io.rig.identity-version"] != "v1" {
 		return generatedruntime.CapacitySnapshot{}, errors.New("generated ingress capacity probe is unavailable")

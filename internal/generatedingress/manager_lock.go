@@ -1,0 +1,52 @@
+package generatedingress
+
+import "context"
+
+var managerAcquireGatewayOSLock = acquireGatewayOSLock
+
+// lockGateway serializes the entire observation or mutation across Manager
+// instances sharing one data root. The local mutex is acquired first so a
+// single Manager cannot race its own callbacks while waiting for the OS lock.
+func (m *Manager) lockGateway(ctx context.Context) (func() error, error) {
+	if err := m.mu.LockContext(ctx); err != nil {
+		return nil, &Error{Code: DiagnosticCancelled}
+	}
+	releaseOS, err := managerAcquireGatewayOSLock(ctx, m.store)
+	if err != nil {
+		m.mu.Unlock()
+		if ctx.Err() != nil {
+			return nil, &Error{Code: DiagnosticCancelled}
+		}
+		return nil, &Error{Code: DiagnosticRouteUnresolved}
+	}
+	if ctx.Err() != nil {
+		_ = releaseOS()
+		m.mu.Unlock()
+		return nil, &Error{Code: DiagnosticCancelled}
+	}
+	return func() error {
+		defer m.mu.Unlock()
+		return releaseOS()
+	}, nil
+}
+
+func releaseGatewayLock(release func() error, result *error) {
+	if release == nil {
+		return
+	}
+	if err := release(); err != nil {
+		*result = &Error{Code: DiagnosticRouteUnresolved}
+	}
+}
+
+// A failed release after Switch cannot prove that a candidate route is no
+// longer serving. Preserve the executor's safety signal so it retains the
+// candidate container for reconciliation.
+func releaseGatewaySwitchLock(release func() error, result *error) {
+	if release == nil {
+		return
+	}
+	if err := release(); err != nil {
+		*result = candidateMayBeLiveError()
+	}
+}
