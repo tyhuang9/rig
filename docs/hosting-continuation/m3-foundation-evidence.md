@@ -10,6 +10,7 @@ unpublished. It does not enable a LAN listener or report a LAN URL.
 - Pure Caddy v2 config builder: `accf5fb4b755547f55f61de4bed34d21e0c63b09`.
 - Protected v1-to-v2 gateway journal: `9b0f3ae`, implemented in
   `internal/generatedingress/upgrade_state.go` and its focused tests.
+- Cross-process gateway lock on current Manager operations: `0695892`.
 
 The allocator stores approved desired gateway and per-app access revisions,
 action digests, compare-and-swap heads, and unique durable port ownership. It
@@ -37,6 +38,15 @@ contains the selected LAN address and rejects duplicate allocation or access
 revision identities across apps. These functions are not called by the live
 manager or controller yet.
 
+The current Manager now holds a persistent handle-based gateway lock across
+route switching, startup provision/recovery, route observation callbacks, and
+capacity observations. Two independent Manager instances targeting one data
+root cannot issue competing Docker commands while one holds the lock. A
+process-exit test proves the next instance can acquire the lock; an injected
+post-switch release failure preserves the executor's
+`CandidateMayBeLive` signal so it does not clean a potentially serving
+container. The lock adds no v2 gateway mutation or LAN listener.
+
 ## Executed verification
 
 | Check | Result |
@@ -53,6 +63,9 @@ manager or controller yet.
 | `go test ./internal/generatedingress` and `go vet ./internal/generatedingress` | Passed for the journal unit. |
 | `go test -count=1 ./...` after the journal unit | Passed with normal local Windows permissions. |
 | `go vet ./...` after the journal unit | Passed. |
+| `go test -count=1 ./...` and `go vet ./...` after the Manager lock | Passed with normal local Windows permissions. |
+| Gateway lock contention and process-exit tests | Passed on Windows; independent Manager contention and injected release-failure tests passed. |
+| Linux amd64 ingress test package cross-compilation | Passed; Linux runtime tests remain unrun locally. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -89,8 +102,13 @@ and interfaces, beyond the pure selected-address check. The journal's actor
 field records provenance; it does not authenticate or authorize the actor.
 The protected journal phase update checks the expected phase before replacing
 the file, but it is not an atomic compare-and-swap across processes. Gateway
-integration must provide one exclusive writer across controller processes or
-a transactional CAS before any Docker mutation. Every active LAN binding must
-also be compared with its approved SQLite row. A fresh upgrade after a
+cutover must use the new handle-held lock across its entire operation; the
+unwired journal methods alone do not enforce that boundary. Every active LAN
+binding must also be compared with its approved SQLite row. A fresh upgrade after a
 `rolled_back` journal needs a history-preserving retry generation or explicit
 operator recovery; fixed create-only paths currently refuse another operation.
+An older running hostd binary does not honor `gateway.lock`; migration must
+prove it is stopped before relying on the lock. On Linux, a malicious process
+with the same user identity can replace the lock path while a handle is held;
+Rig never unlinks it, and the open-time path identity and permission checks
+reject unsafe paths before work begins.

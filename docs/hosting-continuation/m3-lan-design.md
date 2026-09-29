@@ -110,14 +110,16 @@ retry generation or explicit operator recovery is designed.
 
 ### Exclusive gateway writer for runtime integration
 
-The next Manager wiring unit must hold one handle-based OS file lock for the
-whole gateway operation, including state reads, journal phase writes, Docker
+The current Manager holds a handle-based OS file lock for its v1 route switch,
+provision/recovery, route observation, and capacity operations. The v2 wiring
+unit must hold that same lock for the whole gateway operation, including
+state reads, journal phase writes, Docker
 inspection and mutation, probes, compensation, and final reread. The lock
 file lives beside the protected bundles, is never removed, and is separate
 from the purpose-bound files. Acquire the existing Manager mutex first, then
-the OS lock; release them in reverse order. `Switch`, `Provision`, `Recover`,
-the v1-to-v2 cutover, future access changes, and `WithObservation` must all
-use this boundary before v2 mutation is enabled. Internal locked helpers may
+the OS lock; release them in reverse order. The v1-to-v2 cutover and future
+access changes must use this existing boundary before v2 mutation is enabled.
+Internal locked helpers may
 not reacquire it. Operations that also use SQLite follow lock-before-database
 order and recheck approved heads before finalizing. Do not hold a SQLite write
 transaction across Docker calls or use an expiring lease as the Docker mutex.
