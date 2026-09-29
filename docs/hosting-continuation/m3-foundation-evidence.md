@@ -8,6 +8,8 @@ unpublished. It does not enable a LAN listener or report a LAN URL.
 - Base: M2 draft PR #84 head `1063c3c15fcb612fd3e75156596337f5d6422fb1`.
 - SQLite allocator: `5fb39921c9dd29fef8c916ecc6f5144fb9418eb3`.
 - Pure Caddy v2 config builder: `accf5fb4b755547f55f61de4bed34d21e0c63b09`.
+- Protected v1-to-v2 gateway journal: `9b0f3ae`, implemented in
+  `internal/generatedingress/upgrade_state.go` and its focused tests.
 
 The allocator stores approved desired gateway and per-app access revisions,
 action digests, compare-and-swap heads, and unique durable port ownership. It
@@ -17,6 +19,23 @@ approval races. The config builder preserves the v1 `.rig.localhost` server,
 creates one bounded Caddy server per LAN port, requires the approved private
 IPv4 Host for assigned routes, and gives wrong Hosts and unassigned ports a
 generic 404. Its output is data only; no gateway is created or reloaded.
+
+The gateway journal unit writes a separate protected v2 state and migration
+journal while retaining the v1 bundle. Its initial v2 state deep-copies the
+v1 routes with zero LAN assignments. The journal binds the exact v1 and v2
+state digests, profile revision, selected interface and address, fixed v2
+resource identity, explicit upgrade action digest, and approving actor ID.
+Protected create-only artifacts accept exact replay when an identical file
+already exists; a reported write durability failure stops the operation even
+if immediate readback sees the new bytes. Changed replay payloads fail. The
+phase table permits startup to roll back an
+incomplete staging attempt or mark it uncertain, never to resume publishing
+LAN ports without a new controlled action. A committed journal retains the
+initial target digest while allowing later valid app-route changes under the
+same protected network plan. The pure validators reject a network subnet that
+contains the selected LAN address and rejects duplicate allocation or access
+revision identities across apps. These functions are not called by the live
+manager or controller yet.
 
 ## Executed verification
 
@@ -31,6 +50,9 @@ generic 404. Its output is data only; no gateway is created or reloaded.
 | `pnpm --dir docs build` | Passed in normal Windows context. |
 | `pnpm --dir docs check:workflow` and `check:accessibility` | Passed, with accessibility run after build. |
 | Mirrored `025_lan_access.sql` SHA-256 | Both copies: `35B2FC694317AAE0F2EAD64FB919AE6B1280108C4A2862D45FDD2F43CF9006C5`. |
+| `go test ./internal/generatedingress` and `go vet ./internal/generatedingress` | Passed for the journal unit. |
+| `go test -count=1 ./...` after the journal unit | Passed with normal local Windows permissions. |
+| `go vet ./...` after the journal unit | Passed. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -38,6 +60,10 @@ passed on a full rerun. The first docs accessibility invocation ran in
 parallel with the docs build and failed because `dist/index.html` was not yet
 present; the ordered rerun passed. A sandboxed docs build could not traverse
 pnpm's Windows junction; the same build passed in normal Windows context.
+The first full Go rerun after the journal unit was sandboxed and failed in
+unchanged workspace/Docker fixture tests with `Access is denied` and dependent
+`invalid_workspace` results. The same exact command passed with normal local
+Windows permissions. The focused ingress tests passed in the sandbox.
 
 The Windows Go toolchain has CGO disabled, so `go test -race` was not run. The
 storage tests instead exercise separate SQLite handles and repeated contention.
@@ -58,3 +84,13 @@ its port or allowing application archive. Hosted Linux/Docker and Windows
 Docker Desktop checks, plus a physical second-device journey using an
 application-owned external database, remain open. No managed database or Neon
 provisioning belongs to this milestone.
+The runtime network planner must reject overlap with all relevant host routes
+and interfaces, beyond the pure selected-address check. The journal's actor
+field records provenance; it does not authenticate or authorize the actor.
+The protected journal phase update checks the expected phase before replacing
+the file, but it is not an atomic compare-and-swap across processes. Gateway
+integration must provide one exclusive writer across controller processes or
+a transactional CAS before any Docker mutation. Every active LAN binding must
+also be compared with its approved SQLite row. A fresh upgrade after a
+`rolled_back` journal needs a history-preserving retry generation or explicit
+operator recovery; fixed create-only paths currently refuse another operation.

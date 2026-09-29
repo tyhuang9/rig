@@ -68,6 +68,46 @@ gateway `/data` volume should be introduced with the v2 identity so later
 certificate work does not require another data-layout migration; M3 must not
 publish public 80/443 or issue certificates.
 
+## Gateway migration decision
+
+The existing protected `routes.bundle`, v1 container, and exact one-loopback-
+binding attestation remain intact. A separate protected v2 route bundle holds
+the approved network/profile and app routes; it begins with no LAN assignments.
+A second protected journal binds the exact v1 and v2 state digests, Docker
+identity, profile revision, operation ID, and a distinct administrator upgrade
+approval for target format 2. Profile approval alone never starts an upgrade.
+
+The intended journal phases are `prepared`, `stage_intent`, `staged`,
+`transfer_intent`, `v2_serving`, and `committed`. Compensation passes through
+`rollback_intent` to `rolled_back`. Any unprovable state is `uncertain` and
+blocks automatic mutation and URL reporting. A stage container binds only the
+LAN pool with empty 404 routes while v1 keeps loopback service. After exact
+bind and route proof, a durable transfer intent precedes stopping v1 and
+starting the final v2 container. The final v2 identity owns loopback and LAN
+bindings; v1 state and its stopped container remain available for an attested
+rollback. Startup selects the recovery path by the protected journal version;
+it never treats a v2 gateway as acceptable drift on v1.
+
+The planned v2 resources are `rig-generated-caddy-v2`,
+`rig-generated-caddy-config-v2`, `rig-generated-caddy-data-v2`, and
+`rig-generated-caddy-ingress-v2`. A stage container adds its exact operation
+UUID to its name. Stage and final containers use the same v2 network and
+volumes sequentially, with `stage.json` and `active.json` config files. Exact
+image digest,
+ownership labels, mount permissions, bindings, network attachments, restart
+policy, capabilities, and live Caddy config must be attested. An old binary is
+not a supported downgrade path after v2 commitment; it may fail closed on the
+port collision. This migration design requires hosted Docker bind/rollback
+proof before the gateway is enabled.
+
+The current pure journal unit does not perform Docker operations. Its
+expected-phase check is not a cross-process CAS; the runtime must add one
+exclusive writer or transactional CAS before using a phase to authorize a
+mutation. A failed write durability sync stops the operation even when
+immediate readback sees the intended bytes. After `rolled_back`, the fixed
+create-only bundle paths prevent a fresh operation until a history-preserving
+retry generation or explicit operator recovery is designed.
+
 ## Verification plan
 
 - **Fast inner loop:** migrated SQLite repository tests, Caddy config unit
