@@ -113,6 +113,7 @@ func extractArchiveWithLimit(ctx context.Context, archivePath, destination strin
 	}
 	var root string
 	rootHeader := false
+	globalHeader := false
 	seen := map[string]struct{}{}
 	caseFolded := map[string]string{}
 	var entries int
@@ -121,6 +122,7 @@ func extractArchiveWithLimit(ctx context.Context, archivePath, destination strin
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		beforeHeader := limited.remaining
 		h, err := tr.Next()
 		if err == io.EOF {
 			break
@@ -134,6 +136,15 @@ func extractArchiveWithLimit(ctx context.Context, archivePath, destination strin
 		entries++
 		if entries > MaxArchiveEntries {
 			return errTooLarge
+		}
+		// GitHub emits one PAX global comment containing the commit SHA before
+		// the repository root. Other global records can alter later tar entries.
+		if h.Typeflag == tar.TypeXGlobalHeader {
+			if globalHeader || root != "" || h.Name != "pax_global_header" || beforeHeader-limited.remaining > 2048 || len(h.PAXRecords) != 1 || !validArchiveComment(h.PAXRecords["comment"]) {
+				return errors.New("unsupported archive entry")
+			}
+			globalHeader = true
+			continue
 		}
 		if h.Typeflag != tar.TypeDir && h.Typeflag != tar.TypeReg && h.Typeflag != tar.TypeRegA {
 			return errors.New("unsupported archive entry")
@@ -231,19 +242,51 @@ func extractArchiveWithLimit(ctx context.Context, archivePath, destination strin
 	if root == "" || !rootHeader {
 		return errors.New("rootless archive")
 	}
-	// gzip's EOF check validates checksum. A single immutable stream is
-	// required so trailing members and raw bytes cannot be smuggled in.
-	if extra, err := io.Copy(io.Discard, limited); err != nil {
-		return errors.New("invalid gzip")
-	} else if limited.overflow {
+	// GitHub pads the final tar record with zero blocks. Bound and verify
+	// those bytes while draining gzip to validate its checksum. Any nonzero
+	// content after tar EOF remains invalid.
+	const maxTarPaddingBytes = 10 << 10
+	var padding [4096]byte
+	var paddingBytes int
+	for {
+		n, readErr := limited.Read(padding[:])
+		paddingBytes += n
+		if paddingBytes > maxTarPaddingBytes {
+			return errors.New("invalid tar")
+		}
+		for _, value := range padding[:n] {
+			if value != 0 {
+				return errors.New("invalid tar")
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return errors.New("invalid gzip")
+		}
+	}
+	if limited.overflow {
 		return errTooLarge
-	} else if extra != 0 {
-		return errors.New("invalid tar")
 	}
 	if _, err := buffered.ReadByte(); err != io.EOF {
 		return errors.New("trailing archive data")
 	}
 	return nil
+}
+
+func validArchiveComment(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			if character < 'a' || character > 'f' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func copyTarToFile(ctx context.Context, file *os.File, reader io.Reader) (int64, error) {

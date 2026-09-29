@@ -132,6 +132,18 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 		return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "internal_error")
 	}
 	if runtimeDeployment.Phase == generatedruntimestate.PhaseSucceeded {
+		// A controller can stop after committing runtime success but before
+		// completing its deployment and job rows. Only finish the same pinned
+		// deployment while its durable active head still names this candidate.
+		head, headErr := e.state.Active(ctx, deployment.AppID)
+		if headErr != nil || head.DeploymentID != deployment.ID || head.ReleaseID != deployment.ReleaseID || head.Slot != runtimeDeployment.CandidateSlot {
+			return waitingFor(jobs.PauseRouteReconciliationRequired), nil
+		}
+		if deployment.Status != deployments.Succeeded {
+			if _, err := e.deployments.Transition(ctx, deployment.AppID, deployment.ID, deployments.Succeeded, ""); err != nil {
+				return jobs.ExecutionResult{}, executionError("internal_error")
+			}
+		}
 		return jobs.ExecutionResult{CompletionCode: "deployment_completed"}, nil
 	}
 	if runtimeDeployment.Phase == generatedruntimestate.PhaseFailed || runtimeDeployment.Phase == generatedruntimestate.PhaseCancelled {
@@ -300,6 +312,9 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 					return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 				}
 				_ = e.cleanupCandidates(ctx, candidates)
+				if generatedruntime.RouteGatewayReadinessFailed(switchErr) {
+					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "gateway_readiness_failed", generatedruntimestate.DiagnosticRouteSwitchFailed)
+				}
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "apply_failed", generatedruntimestate.DiagnosticRouteSwitchFailed)
 			}
 			runtimeDeployment = advanced

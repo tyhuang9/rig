@@ -170,7 +170,7 @@ func (service *Service) PollDefault(ctx context.Context, owner, connectionID, au
 	if staged, readErr := service.credentials.ReadBundle(attempt.ID); readErr == nil {
 		return service.finishDefaultBundle(ctx, owner, connection, attempt, staged)
 	} else if !credentialMissing(readErr) {
-		return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "credential_invalid")
+		return AuthorizationStatus{}, internalError()
 	}
 	now := service.now().UTC()
 	exchange, exchangeErr := service.credentials.ReadExchange(attempt.ID)
@@ -181,7 +181,7 @@ func (service *Service) PollDefault(ctx context.Context, owner, connectionID, au
 		return service.finalizeDefaultExchange(ctx, owner, connection, attempt, exchange)
 	}
 	if !credentialMissing(exchangeErr) {
-		return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "credential_invalid")
+		return AuthorizationStatus{}, internalError()
 	}
 	if !now.Before(attempt.PendingExpiresAt) {
 		return AuthorizationStatus{}, service.endAuthorization(ctx, owner, attempt, "expired", "authorization_expired")
@@ -191,6 +191,9 @@ func (service *Service) PollDefault(ctx context.Context, owner, connectionID, au
 	}
 	deviceCode, err := service.credentials.ReadDevice(attempt.ID)
 	if err != nil {
+		if !credentialMissing(err) {
+			return AuthorizationStatus{}, internalError()
+		}
 		return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "device_credential_missing")
 	}
 	tokens, err := service.provider.PollDevice(ctx, deviceCode)
@@ -262,6 +265,11 @@ func (service *Service) finishDefaultBundle(ctx context.Context, owner string, c
 		return AuthorizationStatus{}, service.failAuthorization(ctx, owner, attempt, "authorization_identity_mismatch")
 	}
 	previous, previousErr := service.credentials.ReadBundle(connection.ID)
+	if previousErr != nil && !credentialMissing(previousErr) {
+		// Do not replace an existing bundle that this process cannot read.
+		// The pending authorization remains available for a later retry.
+		return AuthorizationStatus{}, internalError()
+	}
 	if previousErr == nil && connection.CredentialGeneration == bundle.Generation && attempt.CredentialGeneration+1 == bundle.Generation && tokenBundlesEqual(previous, bundle) {
 		if err := service.repository.ReconcilePromotedAuthorization(ctx, owner, attempt, bundle, service.now().UTC()); err != nil {
 			if errors.Is(err, ErrIdentityMismatch) {
@@ -442,7 +450,7 @@ func (service *Service) Poll(ctx context.Context, owner, id string) (Connection,
 		}
 		return service.repository.Get(ctx, owner, id)
 	} else if !credentialMissing(readErr) {
-		return Connection{}, service.loseAccess(ctx, owner, id, "credential_invalid")
+		return Connection{}, internalError()
 	}
 	now := service.now().UTC()
 	exchange, exchangeErr := service.credentials.ReadExchange(id)
@@ -453,7 +461,7 @@ func (service *Service) Poll(ctx context.Context, owner, id string) (Connection,
 		return service.finalizeExchange(ctx, owner, connection, exchange)
 	}
 	if !credentialMissing(exchangeErr) {
-		return Connection{}, service.loseAccess(ctx, owner, id, "credential_invalid")
+		return Connection{}, internalError()
 	}
 	if connection.PendingExpiresAt == nil || !now.Before(*connection.PendingExpiresAt) {
 		return Connection{}, service.purgeAndMark(ctx, owner, id, StatusExpired, "authorization_expired")
@@ -466,6 +474,9 @@ func (service *Service) Poll(ctx context.Context, owner, id string) (Connection,
 	}
 	deviceCode, err := service.credentials.ReadDevice(id)
 	if err != nil {
+		if !credentialMissing(err) {
+			return Connection{}, internalError()
+		}
 		return Connection{}, service.loseAccess(ctx, owner, id, "device_credential_missing")
 	}
 	tokens, err := service.provider.PollDevice(ctx, deviceCode)
@@ -986,7 +997,13 @@ func (service *Service) finishBundle(ctx context.Context, owner, id string, bund
 func (service *Service) loadBundle(ctx context.Context, owner string, connection Connection) (TokenBundle, error) {
 	bundle, err := service.credentials.ReadBundle(connection.ID)
 	if err != nil {
-		return TokenBundle{}, service.loseAccess(ctx, owner, connection.ID, "credential_missing")
+		if credentialMissing(err) {
+			return TokenBundle{}, service.loseAccess(ctx, owner, connection.ID, "credential_missing")
+		}
+		// A read can fail because the protected store is temporarily unavailable
+		// (for example, a Windows DPAPI user context mismatch). Do not destroy
+		// an existing credential or change the connection's authorization state.
+		return TokenBundle{}, internalError()
 	}
 	if bundle.Generation < connection.CredentialGeneration || bundle.ProviderUserID != connection.ProviderUserID {
 		return TokenBundle{}, service.loseAccess(ctx, owner, connection.ID, "credential_generation_invalid")

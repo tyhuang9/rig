@@ -56,6 +56,69 @@ func testArchive(t *testing.T, entries ...archiveEntry) string {
 	return p
 }
 
+func testGitHubArchive(t *testing.T, records map[string]string, padding []byte) string {
+	t.Helper()
+	var content bytes.Buffer
+	gz := gzip.NewWriter(&content)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "pax_global_header", Typeflag: tar.TypeXGlobalHeader, PAXRecords: records}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "repo/", Typeflag: tar.TypeDir, Mode: 0o700}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "repo/file", Typeflag: tar.TypeReg, Mode: 0o600, Size: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gz.Write(padding); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(t.TempDir(), "github.tar.gz")
+	if err := os.WriteFile(archive, content.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return archive
+}
+
+func TestExtractArchiveAcceptsOnlyBoundedGitHubGlobalCommentAndZeroPadding(t *testing.T) {
+	validComment := strings.Repeat("a", 40)
+	valid := testGitHubArchive(t, map[string]string{"comment": validComment}, make([]byte, 9728))
+	destination := filepath.Join(t.TempDir(), "valid")
+	if err := extractArchive(context.Background(), valid, destination); err != nil {
+		t.Fatalf("GitHub archive rejected: %v", err)
+	}
+	if content, err := os.ReadFile(filepath.Join(destination, "file")); err != nil || string(content) != "x" {
+		t.Fatalf("extracted file = %q, %v", content, err)
+	}
+	for _, item := range []struct {
+		name    string
+		records map[string]string
+		padding []byte
+	}{
+		{"non-SHA comment", map[string]string{"comment": "not-a-sha"}, nil},
+		{"path override", map[string]string{"comment": validComment, "path": "escape"}, nil},
+		{"oversized global metadata", map[string]string{"comment": validComment, "extra": strings.Repeat("x", 2048)}, nil},
+		{"nonzero padding", map[string]string{"comment": validComment}, []byte{1}},
+		{"excess padding", map[string]string{"comment": validComment}, make([]byte, 11<<10)},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			archive := testGitHubArchive(t, item.records, item.padding)
+			if err := extractArchive(context.Background(), archive, filepath.Join(t.TempDir(), "rejected")); err == nil {
+				t.Fatal("unsafe GitHub archive accepted")
+			}
+		})
+	}
+}
+
 func TestExtractArchiveRequiresOneSafeRootAndTrueEOF(t *testing.T) {
 	valid := testArchive(t, archiveEntry{"repo/", "", tar.TypeDir}, archiveEntry{"repo/compose.yaml", "services: {}\n", 0})
 	dest := filepath.Join(t.TempDir(), "workspace")

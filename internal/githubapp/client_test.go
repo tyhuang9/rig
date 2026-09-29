@@ -170,6 +170,48 @@ func TestArchiveFollowsOnlyCanonicalCodeloadWithoutAuthorization(t *testing.T) {
 	}
 }
 
+func TestArchiveAcceptsOnlyCanonicalSignedPrivateCodeloadRedirect(t *testing.T) {
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const signed = "https://codeload.github.com/octo/repo/legacy.tar.gz/" + sha + "?token=signed-by-github"
+	calls := 0
+	client := testClient(t, func(request *http.Request) *http.Response {
+		calls++
+		if calls == 1 {
+			if request.Header.Get("Authorization") != "Bearer access" {
+				t.Fatal("initial archive request lacks authorization")
+			}
+			return &http.Response{StatusCode: http.StatusFound, Header: http.Header{"Location": {signed}}, Body: io.NopCloser(strings.NewReader(""))}
+		}
+		if request.URL.Host != "codeload.github.com" || request.URL.Path != "/octo/repo/legacy.tar.gz/"+sha || request.URL.Query().Get("token") != "signed-by-github" || request.Header.Get("Authorization") != "" {
+			t.Fatal("signed codeload request changed identity or forwarded bearer authorization")
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("archive"))}
+	})
+	body, err := client.Archive(context.Background(), "access", "octo", "repo", sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if got, err := io.ReadAll(body); err != nil || string(got) != "archive" || calls != 2 {
+		t.Fatalf("signed archive calls=%d err=%v", calls, err)
+	}
+	for _, location := range []string{
+		"https://codeload.github.com/octo/repo/legacy.tar.gz/" + sha + "?token=",
+		"https://codeload.github.com/octo/repo/legacy.tar.gz/" + sha + "?token=one&token=two",
+		"https://codeload.github.com/octo/repo/legacy.tar.gz/" + sha + "?token=one&next=evil",
+		"https://codeload.github.com/octo/repo/legacy.tar.gz/" + sha + "?token=one;next=evil",
+		"https://codeload.github.com/octo/repo/legacy.tar.gz/" + sha + "?token=%0A",
+		"https://codeload.github.com/octo/repo/legacy.tar.gz/" + sha + "?token=x#fragment",
+		"https://codeload.github.com/other/repo/legacy.tar.gz/" + sha + "?token=x",
+		"https://codeload.github.com/octo/repo/other.tar.gz/" + sha + "?token=x",
+		"https://codeload.github.com/octo/repo/legacy.tar.gz/" + sha + "?token=" + strings.Repeat("x", 8193),
+	} {
+		if _, err := validArchiveRedirect(location, "octo", "repo", sha); err == nil {
+			t.Fatal("unsafe signed archive redirect accepted")
+		}
+	}
+}
+
 func TestNewRejectsUnsafeClientIDs(t *testing.T) {
 	for _, value := range []string{"", "with space", "line\nbreak", strings.Repeat("x", 256)} {
 		if _, err := New(value); err == nil {

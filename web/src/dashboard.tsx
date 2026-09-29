@@ -155,7 +155,7 @@ function Login({ setup, onAuthenticated }: { setup: boolean; onAuthenticated: (u
     <section aria-labelledby="auth-title">
       <div className="auth-brand"><b aria-hidden="true">h&gt;</b><span>hostd</span></div>
       <h1 id="auth-title">{bootstrapMode ? "Set up hostd" : "Welcome back"}</h1>
-      <p>{bootstrapMode ? "Create the first administrator using the one-time token from hostd's protected local console." : "Sign in to your local deployment manager."}</p>
+      <p>{bootstrapMode ? <>Run <code>hostd bootstrap-token</code> in a terminal on this computer, then paste the one-time token here.</> : "Sign in to your local deployment manager."}</p>
       {(serverError || Object.keys(errors).length > 0) && <div className="error-summary" ref={errorSummary} tabIndex={-1} role="alert">{serverError || "Check the highlighted fields."}</div>}
       <form onSubmit={handleSubmit(submit, invalid)} noValidate>
         {bootstrapMode && <FormField label="Bootstrap token" id="token" error={tokenError} required><input id="token" required aria-invalid={Boolean(tokenError)} aria-describedby={tokenError ? "token-error" : undefined} autoComplete="off" {...register("token")}/></FormField>}

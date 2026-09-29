@@ -52,21 +52,21 @@ Open `http://127.0.0.1:7345`. Rig intentionally rejects wildcard, LAN, hostname,
 
 ## Create the administrator
 
-On first start, the controller prints a protected bootstrap-file path. It does not print the bootstrap token. In another terminal, read the token explicitly:
+On first start, the controller keeps the token in a protected file. In another terminal, reveal it explicitly without locating that file:
 
 ::: code-group
 
 ```powershell [PowerShell]
-go run ./cmd/hostctl bootstrap-token --file (Join-Path $dataRoot "bootstrap-token.secret")
+go run ./cmd/hostd bootstrap-token
 ```
 
 ```sh [POSIX shell]
-go run ./cmd/hostctl bootstrap-token --file "$data_root/bootstrap-token.secret"
+go run ./cmd/hostd bootstrap-token
 ```
 
 :::
 
-Paste the token into the dashboard and create the first administrator. The bootstrap file is removed after successful use, expiry, or a clean controller shutdown.
+If `hostd` is installed on your command path, run `hostd bootstrap-token` from any directory. Paste the token into the dashboard and create the first administrator. The token and its locator are removed after successful use, expiry, or a clean controller shutdown. Restart the controller if the 15-minute token has expired. If multiple controllers are awaiting setup, use the protected file path printed by the intended controller with `hostctl bootstrap-token --file <protected-file>`.
 
 ## Add a local application
 

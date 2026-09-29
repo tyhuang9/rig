@@ -44,6 +44,13 @@ type ingressRunner struct {
 	failRollbackReload       bool
 	failAdminRead            bool
 	truncateAdminRead        bool
+	gatewayProbeOutput       []byte
+	gatewayProbeOutputs      [][]byte
+	gatewayProbeErr          error
+	gatewayProbeTruncated    bool
+	gatewayProbeMutate       func(*ingressRunner)
+	gatewayProbeCalls        int
+	caddyMemory              int64
 	bindIP                   string
 	bindPort                 string
 }
@@ -210,6 +217,20 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 		}
 		return runtimeprocess.CommandResult{Stdout: append([]byte(nil), r.liveConfig...), StdoutTruncated: r.truncateAdminRead}, nil
 	}
+	if len(args) >= 4 && args[0] == "container" && args[1] == "exec" && args[3] == "curl" {
+		output := r.gatewayProbeOutput
+		if r.gatewayProbeCalls < len(r.gatewayProbeOutputs) {
+			output = r.gatewayProbeOutputs[r.gatewayProbeCalls]
+		}
+		r.gatewayProbeCalls++
+		if output == nil {
+			output = []byte("200")
+		}
+		if r.gatewayProbeMutate != nil {
+			r.gatewayProbeMutate(r)
+		}
+		return runtimeprocess.CommandResult{Stdout: append([]byte(nil), output...), StdoutTruncated: r.gatewayProbeTruncated}, r.gatewayProbeErr
+	}
 	if len(args) >= 4 && args[0] == "container" && args[1] == "exec" {
 		return runtimeprocess.CommandResult{}, nil
 	}
@@ -225,12 +246,16 @@ func (r *ingressRunner) caddyInspection() caddyInspection {
 	if bindPort == "" {
 		bindPort = "8080"
 	}
+	memory := r.caddyMemory
+	if memory == 0 {
+		memory = 268435456
+	}
 	return caddyInspection{
 		ID: "sha256:" + strings.Repeat("d", 64), Name: "/" + caddyContainerName, Image: "sha256:" + strings.Repeat("a", 64),
 		Labels: map[string]string{"io.rig.managed": "generated-ingress", "io.rig.identity-version": "v1", "io.rig.listener-isolation": "v1"}, Hostname: caddyContainerName, User: "1000:1000", Env: []string{"XDG_CONFIG_HOME=/config", "XDG_DATA_HOME=/data"},
 		Entrypoint: []string{caddyExecutable}, Cmd: []string{"run", "--config", "/config/active.json"}, ReadOnly: true, CapDrop: []string{"ALL"}, CapAdd: []string{caddyCapability}, SecurityOpt: []string{"no-new-privileges"},
 		Mounts: []mountInspection{{Type: "volume", Name: caddyVolumeName, Destination: "/config", RW: true}}, Tmpfs: map[string]string{"/data": "rw,noexec,nosuid,nodev,size=67108864"},
-		Memory: 268435456, MemorySwap: 268435456, NanoCPUs: 1_000_000_000, PIDsLimit: 128, LogType: "local", LogConfig: map[string]string{"max-size": "10m", "max-file": "3"}, Restart: "unless-stopped", Running: !r.stopped, Restarting: r.restarting,
+		Memory: memory, MemorySwap: 268435456, NanoCPUs: 1_000_000_000, PIDsLimit: 128, LogType: "local", LogConfig: map[string]string{"max-size": "10m", "max-file": "3"}, Restart: "unless-stopped", Running: !r.stopped, Restarting: r.restarting,
 		NetworkMode: caddyNetworkName, Ulimits: []ulimitInspection{{Name: "nofile", Hard: 1024, Soft: 1024}}, PortBindings: map[string][]map[string]string{"8080/tcp": {{"HostIp": bindIP, "HostPort": bindPort}}}, Networks: r.caddyNetworks,
 	}
 }
@@ -253,6 +278,180 @@ func TestSwitchPersistsAcceptedRouteAfterValidatedReload(t *testing.T) {
 	}
 	if _, ok := runner.files[caddyContainerName+":/config/proposed.json"]; !ok {
 		t.Fatal("proposed aggregate config was not copied to Caddy")
+	}
+}
+
+func TestSwitchProbesCandidateFromAttestedCaddyBeforeProposedRoute(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+		t.Fatal(err)
+	}
+	probeIndex, proposedCopyIndex := -1, -1
+	for index, command := range runner.commands {
+		if isGatewayProbeCommand(command) {
+			probeIndex = index
+			want := []string{
+				"container", "exec", "sha256:" + strings.Repeat("d", 64),
+				"curl", "--disable", "--silent", "--head", "--output", "/dev/null", "--write-out", "%{http_code}",
+				"--http1.1", "--proto", "=http", "--noproxy", "*", "--connect-timeout", "1", "--max-time", "2",
+				"http://web-blue.rig-app-network:3000/",
+			}
+			if !reflect.DeepEqual(command, want) {
+				t.Fatalf("gateway probe = %#v\nwant %#v", command, want)
+			}
+		}
+		if len(command) == 4 && command[0] == "container" && command[1] == "cp" && strings.HasSuffix(command[3], ":/config/proposed.json") {
+			proposedCopyIndex = index
+		}
+	}
+	if probeIndex < 0 || proposedCopyIndex < 0 || probeIndex >= proposedCopyIndex {
+		t.Fatalf("gateway probe=%d proposed copy=%d commands=%v", probeIndex, proposedCopyIndex, runner.commands)
+	}
+}
+
+func TestGatewayReadinessRequiresExactReachableStatusAndRollsBack(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		output    []byte
+		err       error
+		truncated bool
+	}{
+		{name: "connection refused", err: errors.New("connection refused")},
+		{name: "probe deadline", err: context.DeadlineExceeded},
+		{name: "malformed status", output: []byte("200\n")},
+		{name: "zero status", output: []byte("000")},
+		{name: "truncated status", output: []byte("200"), truncated: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, runner := newManagerFixture(t, false)
+			previous := routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+				endpoint("web", "server", runner.network, "web-green", 3000, 'c'),
+			}}
+			if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{runner.appID: previous}}); err != nil {
+				t.Fatal(err)
+			}
+			runner.gatewayProbeOutput = test.output
+			runner.gatewayProbeErr = test.err
+			runner.gatewayProbeTruncated = test.truncated
+			request := switchRequest(runner)
+			request.FromSlot = generatedruntime.SlotGreen
+			err := manager.Switch(context.Background(), request)
+			if !IsCode(err, DiagnosticGatewayReadinessFailed) || generatedruntime.RouteCandidateMayBeLive(err) || !generatedruntime.RouteGatewayReadinessFailed(err) {
+				t.Fatalf("error=%v mayBeLive=%t readiness=%t", err, generatedruntime.RouteCandidateMayBeLive(err), generatedruntime.RouteGatewayReadinessFailed(err))
+			}
+			state, loadErr := manager.store.load()
+			if loadErr != nil || state.Pending != nil || !sameRoute(state.Active[runner.appID], previous) {
+				t.Fatalf("state=%#v error=%v", state, loadErr)
+			}
+			if _, copied := runner.files[caddyContainerName+":/config/proposed.json"]; copied {
+				t.Fatal("gateway failure copied a candidate route")
+			}
+			if !bytes.Equal(runner.liveConfig, expectedConfig(t, runner, map[string]routeRecord{runner.appID: previous})) {
+				t.Fatal("gateway failure did not preserve the committed serving route")
+			}
+		})
+	}
+}
+
+func TestGatewayReadinessAllowsTransportStatusAndChecksEveryEndpoint(t *testing.T) {
+	for _, status := range [][]byte{[]byte("200"), []byte("404"), []byte("405"), []byte("599")} {
+		t.Run(string(status), func(t *testing.T) {
+			manager, runner := newManagerFixture(t, false)
+			runner.caddyNetworks[runner.network] = &networkAttachment{}
+			runner.gatewayProbeOutput = status
+			if err := manager.verifyGatewayReadiness(context.Background(), routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{runner.endpoint}}); err != nil {
+				t.Fatalf("status %s: %v", status, err)
+			}
+		})
+	}
+	manager, runner := newManagerFixture(t, false)
+	runner.caddyNetworks[runner.network] = &networkAttachment{}
+	runner.gatewayProbeOutputs = [][]byte{[]byte("200"), []byte("000")}
+	route := routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		runner.endpoint,
+		endpoint("api", "static", runner.network, "api-blue", 3001, 'e'),
+	}}
+	if err := manager.verifyGatewayReadiness(context.Background(), route); !IsCode(err, DiagnosticGatewayReadinessFailed) || runner.gatewayProbeCalls != 2 {
+		t.Fatalf("error=%v probe calls=%d", err, runner.gatewayProbeCalls)
+	}
+}
+
+func TestGatewayReadinessCancellationCompensatesTemporaryNetworkAttachment(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	runner.gatewayProbeErr = context.Canceled
+	err := manager.Switch(context.Background(), switchRequest(runner))
+	if !IsCode(err, DiagnosticCancelled) || generatedruntime.RouteCandidateMayBeLive(err) {
+		t.Fatalf("error=%v mayBeLive=%t", err, generatedruntime.RouteCandidateMayBeLive(err))
+	}
+	state, loadErr := manager.store.load()
+	if loadErr != nil || state.Pending != nil || len(state.Active) != 0 {
+		t.Fatalf("state=%#v error=%v", state, loadErr)
+	}
+	if _, attached := runner.caddyNetworks[runner.network]; attached {
+		t.Fatal("cancelled readiness probe left its temporary application network attached")
+	}
+	if _, copied := runner.files[caddyContainerName+":/config/proposed.json"]; copied {
+		t.Fatal("cancelled readiness probe copied a candidate route")
+	}
+}
+
+func TestGatewayReadinessTerminationUncertaintyAndRollbackUncertaintyRemainSafe(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	runner.gatewayProbeErr = runtimeprocess.ErrTerminationFailed
+	err := manager.Switch(context.Background(), switchRequest(runner))
+	if !IsCode(err, DiagnosticIngressUnavailable) || generatedruntime.RouteGatewayReadinessFailed(err) {
+		t.Fatalf("termination error=%v readiness=%t", err, generatedruntime.RouteGatewayReadinessFailed(err))
+	}
+
+	manager, runner = newManagerFixture(t, false)
+	runner.gatewayProbeOutput = []byte("000")
+	runner.failRollbackReload = true
+	err = manager.Switch(context.Background(), switchRequest(runner))
+	if !IsCode(err, DiagnosticRouteUnresolved) || !generatedruntime.RouteCandidateMayBeLive(err) {
+		t.Fatalf("uncertain compensation error=%v mayBeLive=%t", err, generatedruntime.RouteCandidateMayBeLive(err))
+	}
+	state, loadErr := manager.store.load()
+	if loadErr != nil || state.Pending == nil || len(state.Active) != 0 {
+		t.Fatalf("uncertain compensation state=%#v error=%v", state, loadErr)
+	}
+	if _, copied := runner.files[caddyContainerName+":/config/proposed.json"]; copied {
+		t.Fatal("uncertain compensation copied a candidate route")
+	}
+}
+
+func TestGatewayReadinessPostProbeAttestationWithholdsCandidateRoute(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*ingressRunner)
+	}{
+		{name: "hardening drift", mutate: func(r *ingressRunner) { r.caddyMemory = 1 }},
+		{name: "stopped", mutate: func(r *ingressRunner) { r.stopped = true }},
+		{name: "restarting", mutate: func(r *ingressRunner) { r.restarting = true }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, runner := newManagerFixture(t, false)
+			runner.gatewayProbeMutate = test.mutate
+			err := manager.Switch(context.Background(), switchRequest(runner))
+			if err == nil {
+				t.Fatal("post-probe ingress drift was accepted")
+			}
+			if _, copied := runner.files[caddyContainerName+":/config/proposed.json"]; copied {
+				t.Fatalf("post-probe %s copied a candidate route", test.name)
+			}
+		})
+	}
+}
+
+func TestGatewayReadinessFailureOnCommittedRouteMarksCandidateMayBeLive(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	request := switchRequest(runner)
+	if err := manager.Switch(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	runner.gatewayProbeOutput = []byte("000")
+	err := manager.Switch(context.Background(), request)
+	if !IsCode(err, DiagnosticGatewayReadinessFailed) || !generatedruntime.RouteCandidateMayBeLive(err) || !generatedruntime.RouteGatewayReadinessFailed(err) {
+		t.Fatalf("error=%v mayBeLive=%t readiness=%t", err, generatedruntime.RouteCandidateMayBeLive(err), generatedruntime.RouteGatewayReadinessFailed(err))
 	}
 }
 
@@ -560,6 +759,9 @@ func TestObserveWithholdsURLOnUncertainOrDriftedIngress(t *testing.T) {
 		{"endpoint role differs", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
 			runner.endpointRoleLabel = "static"
 		}, DiagnosticIngressDrift},
+		{"gateway cannot reach endpoint", func(_ *testing.T, _ *Manager, runner *ingressRunner) {
+			runner.gatewayProbeOutput = []byte("000")
+		}, DiagnosticGatewayReadinessFailed},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1616,6 +1818,10 @@ func hasCommandArguments(commands [][]string, expected ...string) bool {
 		}
 	}
 	return false
+}
+
+func isGatewayProbeCommand(command []string) bool {
+	return len(command) >= 11 && command[0] == "container" && command[1] == "exec" && command[3] == "curl" && containsArgument(command, "%{http_code}")
 }
 
 func clonePortBindings(values map[string][]map[string]string) map[string][]map[string]string {
