@@ -1,6 +1,7 @@
 package sourceconnections
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -168,6 +169,10 @@ type testClock struct {
 type faultCredentialStore struct {
 	CredentialStore
 	failBundleWrite    bool
+	failBundleRead     error
+	failBundleReadFor  string
+	failExchangeRead   error
+	failDeviceRead     error
 	failDeviceRemove   int
 	failExchangeRemove int
 }
@@ -202,6 +207,27 @@ func (store *faultCredentialStore) WriteBundle(id string, bundle TokenBundle) er
 		return errors.New("injected bundle write failure")
 	}
 	return store.CredentialStore.WriteBundle(id, bundle)
+}
+
+func (store *faultCredentialStore) ReadBundle(id string) (TokenBundle, error) {
+	if store.failBundleRead != nil && (store.failBundleReadFor == "" || store.failBundleReadFor == id) {
+		return TokenBundle{}, store.failBundleRead
+	}
+	return store.CredentialStore.ReadBundle(id)
+}
+
+func (store *faultCredentialStore) ReadExchange(id string) (TokenExchange, error) {
+	if store.failExchangeRead != nil {
+		return TokenExchange{}, store.failExchangeRead
+	}
+	return store.CredentialStore.ReadExchange(id)
+}
+
+func (store *faultCredentialStore) ReadDevice(id string) (string, error) {
+	if store.failDeviceRead != nil {
+		return "", store.failDeviceRead
+	}
+	return store.CredentialStore.ReadDevice(id)
 }
 
 func (store *faultCredentialStore) RemoveDevice(id string) error {
@@ -330,6 +356,171 @@ func TestMissingCredentialsFailClosedAndDisconnectIsOwnerScopedIdempotent(t *tes
 	}
 	if err := service.Disconnect(context.Background(), "owner", connection.ID); err != nil {
 		t.Fatalf("idempotent disconnect: %v", err)
+	}
+}
+
+func TestProtectedCredentialReadFailurePreservesConnectedStateAndBundle(t *testing.T) {
+	service, provider, clock, _, store := testService(t)
+	connection := connectService(t, service, clock)
+	before, err := os.ReadFile(store.bundlePath(connection.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fault := &faultCredentialStore{CredentialStore: store, failBundleRead: fmt.Errorf("unprotect: %w", os.ErrPermission)}
+	service.credentials = fault
+	if _, err := service.Installations(context.Background(), "owner", connection.ID, 1, 30); !IsCode(err, "internal_error") {
+		t.Fatalf("protected read error = %v", err)
+	}
+	if provider.installationCalls != 0 {
+		t.Fatalf("provider called after protected read failure: %d", provider.installationCalls)
+	}
+	after, err := os.ReadFile(store.bundlePath(connection.ID))
+	if err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("protected bundle changed after read failure: %v", err)
+	}
+	got, err := service.repository.Get(context.Background(), "owner", connection.ID)
+	if err != nil || got.Status != StatusConnected || got.LastErrorCode != connection.LastErrorCode || got.CredentialGeneration != connection.CredentialGeneration {
+		t.Fatalf("connection changed after read failure: %#v, %v", got, err)
+	}
+	fault.failBundleRead = nil
+	if _, err := service.Poll(context.Background(), "owner", connection.ID); err != nil {
+		t.Fatalf("protected bundle could not be read after recovery: %v", err)
+	}
+}
+
+func TestPendingDeviceReadFailurePreservesAuthorizationForRetry(t *testing.T) {
+	for _, useDefault := range []bool{false, true} {
+		t.Run(fmt.Sprint("default=", useDefault), func(t *testing.T) {
+			service, _, clock, _, store := testService(t)
+			var connectionID, authorizationID string
+			if useDefault {
+				started, err := service.StartDefault(context.Background(), "owner")
+				if err != nil {
+					t.Fatal(err)
+				}
+				connectionID, authorizationID = started.ConnectionID, started.AuthorizationID
+			} else {
+				started, err := service.Start(context.Background(), "owner")
+				if err != nil {
+					t.Fatal(err)
+				}
+				connectionID, authorizationID = started.ConnectionID, started.ConnectionID
+			}
+			before, err := os.ReadFile(store.devicePath(authorizationID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			clock.Advance(5 * time.Second)
+			fault := &faultCredentialStore{CredentialStore: store, failDeviceRead: fmt.Errorf("unprotect: %w", os.ErrPermission)}
+			service.credentials = fault
+			if useDefault {
+				_, err = service.PollDefault(context.Background(), "owner", connectionID, authorizationID)
+			} else {
+				_, err = service.Poll(context.Background(), "owner", connectionID)
+			}
+			if !IsCode(err, "internal_error") {
+				t.Fatalf("protected device read = %v", err)
+			}
+			after, err := os.ReadFile(store.devicePath(authorizationID))
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("device credential changed: %v", err)
+			}
+			connection, err := service.repository.Get(context.Background(), "owner", connectionID)
+			wantStatus := StatusPending
+			if useDefault {
+				wantStatus = StatusDisconnected
+				attempt, attemptErr := service.repository.Authorization(context.Background(), "owner", connectionID, authorizationID)
+				if attemptErr != nil || attempt.Status != "pending" {
+					t.Fatalf("authorization after read failure = %#v, %v", attempt, attemptErr)
+				}
+			}
+			if err != nil || connection.Status != wantStatus {
+				t.Fatalf("connection after read failure = %#v, %v", connection, err)
+			}
+			fault.failDeviceRead = nil
+			if useDefault {
+				_, err = service.PollDefault(context.Background(), "owner", connectionID, authorizationID)
+			} else {
+				_, err = service.Poll(context.Background(), "owner", connectionID)
+			}
+			if err != nil {
+				t.Fatalf("authorization did not recover: %v", err)
+			}
+		})
+	}
+}
+
+func TestPendingExchangeReadFailurePreservesIssuedTokensForRetry(t *testing.T) {
+	for _, useDefault := range []bool{false, true} {
+		t.Run(fmt.Sprint("default=", useDefault), func(t *testing.T) {
+			service, provider, clock, _, store := testService(t)
+			var connectionID, authorizationID string
+			if useDefault {
+				started, err := service.StartDefault(context.Background(), "owner")
+				if err != nil {
+					t.Fatal(err)
+				}
+				connectionID, authorizationID = started.ConnectionID, started.AuthorizationID
+			} else {
+				started, err := service.Start(context.Background(), "owner")
+				if err != nil {
+					t.Fatal(err)
+				}
+				connectionID, authorizationID = started.ConnectionID, started.ConnectionID
+			}
+			clock.Advance(5 * time.Second)
+			provider.userError = &githubapp.Error{Code: "provider_unavailable"}
+			var err error
+			if useDefault {
+				_, err = service.PollDefault(context.Background(), "owner", connectionID, authorizationID)
+			} else {
+				_, err = service.Poll(context.Background(), "owner", connectionID)
+			}
+			if !IsCode(err, "provider_unavailable") {
+				t.Fatalf("exchange setup = %v", err)
+			}
+			before, err := os.ReadFile(store.exchangePath(authorizationID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			clock.Advance(5 * time.Second)
+			fault := &faultCredentialStore{CredentialStore: store, failExchangeRead: fmt.Errorf("unprotect: %w", os.ErrPermission)}
+			service.credentials = fault
+			if useDefault {
+				_, err = service.PollDefault(context.Background(), "owner", connectionID, authorizationID)
+			} else {
+				_, err = service.Poll(context.Background(), "owner", connectionID)
+			}
+			if !IsCode(err, "internal_error") {
+				t.Fatalf("protected exchange read = %v", err)
+			}
+			after, err := os.ReadFile(store.exchangePath(authorizationID))
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("exchange credential changed: %v", err)
+			}
+			connection, err := service.repository.Get(context.Background(), "owner", connectionID)
+			wantStatus := StatusPending
+			if useDefault {
+				wantStatus = StatusDisconnected
+				attempt, attemptErr := service.repository.Authorization(context.Background(), "owner", connectionID, authorizationID)
+				if attemptErr != nil || attempt.Status != "pending" {
+					t.Fatalf("authorization after exchange read failure = %#v, %v", attempt, attemptErr)
+				}
+			}
+			if err != nil || connection.Status != wantStatus {
+				t.Fatalf("connection after exchange read failure = %#v, %v", connection, err)
+			}
+			fault.failExchangeRead = nil
+			provider.userError = nil
+			if useDefault {
+				_, err = service.PollDefault(context.Background(), "owner", connectionID, authorizationID)
+			} else {
+				_, err = service.Poll(context.Background(), "owner", connectionID)
+			}
+			if err != nil {
+				t.Fatalf("issued tokens did not recover: %v", err)
+			}
+		})
 	}
 }
 
@@ -799,6 +990,45 @@ func TestDefaultReconnectMismatchAndTransientFailuresPreserveCredentials(t *test
 		t.Fatalf("bundle after mismatch = %v err=%v", retained, err)
 	}
 	assertSQLiteHasNoSentinels(t, db, "device-sensitive", "ghu_sensitive", "ghr_sensitive", "other-octo")
+}
+
+func TestDefaultReconnectReadFailureDoesNotReplaceActiveBundle(t *testing.T) {
+	service, _, clock, _, store := testService(t)
+	connection := connectDefaultService(t, service, clock)
+	before, err := os.ReadFile(store.bundlePath(connection.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := service.StartDefault(context.Background(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(5 * time.Second)
+	fault := &faultCredentialStore{CredentialStore: store, failBundleRead: fmt.Errorf("unprotect: %w", os.ErrPermission), failBundleReadFor: connection.ID}
+	service.credentials = fault
+	if _, err := service.PollDefault(context.Background(), "owner", connection.ID, started.AuthorizationID); !IsCode(err, "internal_error") {
+		t.Fatalf("reconnect protected read error = %v", err)
+	}
+	after, err := os.ReadFile(store.bundlePath(connection.ID))
+	if err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("active bundle changed after reconnect read failure: %v", err)
+	}
+	current, err := service.repository.Get(context.Background(), "owner", connection.ID)
+	if err != nil || current.Status != StatusConnected || current.CredentialGeneration != connection.CredentialGeneration || current.LastErrorCode != connection.LastErrorCode {
+		t.Fatalf("connection changed after reconnect read failure: %#v, %v", current, err)
+	}
+	fault.failBundleReadFor = started.AuthorizationID
+	if _, err := service.PollDefault(context.Background(), "owner", connection.ID, started.AuthorizationID); !IsCode(err, "internal_error") {
+		t.Fatalf("staged bundle read failure = %v", err)
+	}
+	if _, err := store.ReadBundle(started.AuthorizationID); err != nil {
+		t.Fatalf("staged bundle was lost after read failure: %v", err)
+	}
+	fault.failBundleRead = nil
+	result, err := service.PollDefault(context.Background(), "owner", connection.ID, started.AuthorizationID)
+	if err != nil || result.Connection.CredentialGeneration != connection.CredentialGeneration+1 {
+		t.Fatalf("reconnect did not recover after read failure: %#v, %v", result, err)
+	}
 }
 
 func TestDefaultAuthorizationSupersessionAndOwnerIsolation(t *testing.T) {
