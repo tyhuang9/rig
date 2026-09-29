@@ -108,6 +108,32 @@ immediate readback sees the intended bytes. After `rolled_back`, the fixed
 create-only bundle paths prevent a fresh operation until a history-preserving
 retry generation or explicit operator recovery is designed.
 
+### Exclusive gateway writer for runtime integration
+
+The next Manager wiring unit must hold one handle-based OS file lock for the
+whole gateway operation, including state reads, journal phase writes, Docker
+inspection and mutation, probes, compensation, and final reread. The lock
+file lives beside the protected bundles, is never removed, and is separate
+from the purpose-bound files. Acquire the existing Manager mutex first, then
+the OS lock; release them in reverse order. `Switch`, `Provision`, `Recover`,
+the v1-to-v2 cutover, future access changes, and `WithObservation` must all
+use this boundary before v2 mutation is enabled. Internal locked helpers may
+not reacquire it. Operations that also use SQLite follow lock-before-database
+order and recheck approved heads before finalizing. Do not hold a SQLite write
+transaction across Docker calls or use an expiring lease as the Docker mutex.
+
+On Linux, open a regular owner-only lock file with no-follow flags and hold
+`flock` through the callback. On Windows, open a non-reparse disk file without
+delete sharing and hold `LockFileEx` through the callback. Verify the lock
+file and protected directory identities after acquisition and before
+mutation. A second process must do no journal write or Docker work while the
+first holds the lock; process exit releases the lock for attested recovery.
+Tests must cover two independent Manager instances, a helper process that
+exits while holding the lock, cancellation, path replacement/reparse cases,
+and lock retention through failed transfer and rollback. The lock protects
+cooperating Rig processes on one local host; an older binary that ignores the
+lock cannot participate in a live v2 migration.
+
 ## Verification plan
 
 - **Fast inner loop:** migrated SQLite repository tests, Caddy config unit
