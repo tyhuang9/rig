@@ -172,6 +172,19 @@ test("database TLS verifier rejects a mismatched IPv6 certificate", async () => 
   }
 });
 
+test("idle database disconnect is handled without exposing connection details", async () => {
+  const warnings = [];
+  const pool = createDatabase({
+    DATABASE_URL: "postgresql://fixture:secret-do-not-disclose@postgres.fixture.test/notes?sslmode=verify-full"
+  }, { warn: (message) => warnings.push(message) });
+  try {
+    assert.equal(pool.emit("error", new Error("postgresql://fixture:secret-do-not-disclose@postgres.fixture.test failed")), true);
+    assert.deepEqual(warnings, ["hosting-notes idle database connection lost"]);
+  } finally {
+    await pool.end();
+  }
+});
+
 test("HTTPS probe sends scoped credentials through verified, bounded TLS options", async () => {
   let options;
   let timeout;
