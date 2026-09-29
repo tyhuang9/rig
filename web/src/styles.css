@@ -565,8 +565,13 @@ button:disabled { cursor: wait; opacity: .62; }
 .connector-heading p { max-width: 60ch; }
 .github-connection-card .connection-status { display: flex; flex-direction: column; align-items: flex-start; gap: .65rem; margin: 1rem 0; }
 .github-connection-card .connection-actions { display: flex; gap: .65rem; flex-wrap: wrap; }
+.device-authorization { display: grid; width: min(100%, 28rem); gap: .35rem; }
+.device-authorization label { color: #4e5561; font-size: 12px; font-weight: 650; }
+.device-authorization-control { display: flex; min-width: 0; gap: .5rem; }
+.device-authorization-control input { flex: 1; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #737d8d; border-radius: 8px; background: #fff; color: #17191d; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; letter-spacing: .04em; }
+.device-authorization > span { color: #4e5561; font-size: 12px; }
 .github-repository-picker { width: 100%; min-width: 0; }
 .repository-search > div { display: flex; gap: .5rem; }
 .repository-search input { flex: 1; min-width: 0; }
 .relay-source-grid > .github-repository-picker { grid-column: 1 / -1; }
-@media (max-width: 540px) { .repository-search > div { flex-wrap: wrap; } .repository-search input { width: 100%; flex-basis: 100%; } }
+@media (max-width: 540px) { .repository-search > div, .device-authorization-control { flex-wrap: wrap; } .repository-search input, .device-authorization-control input { width: 100%; flex-basis: 100%; } }
