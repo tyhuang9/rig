@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -181,9 +180,21 @@ func (c *Client) archiveRequest(client *http.Client, request *http.Request, init
 
 func validArchiveRedirect(value, owner, repository, sha string) (*url.URL, error) {
 	u, err := url.Parse(value)
-	expectedPrefix := "/" + owner + "/" + repository + "/"
-	if err != nil || !validRepositoryOwner(owner) || !validRepositoryName(repository) || !validSHA(sha) || u.Scheme != "https" || u.Host != "codeload.github.com" || u.User != nil || u.Port() != "" || u.RawQuery != "" || u.Fragment != "" || !strings.HasPrefix(u.Path, expectedPrefix) || path.Clean(u.Path) != u.Path || !strings.HasSuffix(u.Path, "/"+sha) {
+	if err != nil || !validRepositoryOwner(owner) || !validRepositoryName(repository) || !validSHA(sha) || u.Scheme != "https" || u.Host != "codeload.github.com" || u.User != nil || u.Port() != "" || u.Fragment != "" || u.RawPath != "" || u.ForceQuery {
 		return nil, errors.New("unsafe archive redirect")
+	}
+	expectedPrefix := "/" + owner + "/" + repository + "/"
+	if u.Path != expectedPrefix+"tar.gz/"+sha && u.Path != expectedPrefix+"legacy.tar.gz/"+sha {
+		return nil, errors.New("unsafe archive redirect")
+	}
+	if u.RawQuery != "" {
+		if len(u.RawQuery) > 8192 {
+			return nil, errors.New("unsafe archive redirect")
+		}
+		query, err := url.ParseQuery(u.RawQuery)
+		if err != nil || len(query) != 1 || len(query["token"]) != 1 || !validSecret(query.Get("token")) {
+			return nil, errors.New("unsafe archive redirect")
+		}
 	}
 	return u, nil
 }
