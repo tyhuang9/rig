@@ -47,6 +47,13 @@ post-switch release failure preserves the executor's
 `CandidateMayBeLive` signal so it does not clean a potentially serving
 container. The lock adds no v2 gateway mutation or LAN listener.
 
+The new `internal/hostnetwork` helper enumerates currently assigned RFC 1918
+IPv4 addresses on active, non-loopback host interfaces. An approved interface
+index/name and exact address must still match; duplicate address ownership,
+an unavailable interface, a changed DHCP address, and wildcard/public
+addresses fail closed. This is an interface-ownership prerequisite only. It
+does not yet inspect the complete host route table or authorize a bind.
+
 ## Executed verification
 
 | Check | Result |
@@ -66,6 +73,7 @@ container. The lock adds no v2 gateway mutation or LAN listener.
 | `go test -count=1 ./...` and `go vet ./...` after the Manager lock | Passed with normal local Windows permissions. |
 | Gateway lock contention and process-exit tests | Passed on Windows; independent Manager contention and injected release-failure tests passed. |
 | Linux amd64 ingress test package cross-compilation | Passed; Linux runtime tests remain unrun locally. |
+| `go test -count=1 ./internal/hostnetwork` and `go vet ./internal/hostnetwork` | Passed for the interface-selection helper. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
