@@ -1276,7 +1276,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	gatewayDeadline := time.Now().Add(8 * time.Minute)
 	var gatewayJob jobs.Job
 	for {
-		gatewayJob, err = restarted.jobs.Get(gatewayMutation.Job.ID)
+		gatewayJob, err = capacityRestart.jobs.Get(gatewayMutation.Job.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
