@@ -436,7 +436,7 @@ func controllerProcessKillMatrix(
 		controllerKillBeforeBuild, controllerKillBeforeStart, controllerKillAfterRoute,
 		controllerKillBeforeDrain, controllerKillAfterSuccess, controllerKillAfterMain,
 	} {
-		t.Run(string(boundary), func(t *testing.T) {
+		if !t.Run(string(boundary), func(t *testing.T) {
 			if index > 0 {
 				// The previous controller was killed after convergence. Reopen
 				// the authenticated API only to accept the next immutable job;
@@ -639,7 +639,9 @@ func controllerProcessKillMatrix(
 			controllerJourneyRoutedRequest(t, ctx, appID, http.MethodGet, "/api/version", "", http.StatusOK, candidateMarker)
 			previousMarker = candidateMarker
 			t.Logf("controller SIGKILL recovery boundary=%s job=%s deployment=%s release=%s prior=%s active=%s", boundary, mutation.Job.ID, pinned.DeploymentID, pinned.ReleaseID, previous.DeploymentID, finalHead.DeploymentID)
-		})
+		}) {
+			return
+		}
 	}
 }
 
@@ -687,8 +689,16 @@ func controllerProcessKillAssertRunningContainer(t *testing.T, ctx context.Conte
 func controllerProcessKillAssertRoute(t *testing.T, ctx context.Context, ingress *generatedingress.Manager, appID string, expected generatedruntimestate.Deployment) {
 	t.Helper()
 	observed, err := ingress.Observe(ctx, appID)
-	if err != nil || observed.Slot != generatedruntime.Slot(expected.CandidateSlot) || len(observed.Endpoints) != len(expected.Components) {
-		t.Fatal("live Caddy route does not attest the expected immutable serving slot")
+	if err != nil {
+		var diagnostic *generatedingress.Error
+		if errors.As(err, &diagnostic) {
+			t.Fatalf("live Caddy route attestation failed: code=%s", diagnostic.Code)
+		}
+		t.Fatal("live Caddy route attestation failed: code=unknown")
+	}
+	if observed.Slot != generatedruntime.Slot(expected.CandidateSlot) || len(observed.Endpoints) != len(expected.Components) {
+		t.Fatalf("live Caddy route differs from expected serving slot: observed_slot=%s expected_slot=%s observed_endpoints=%d expected_components=%d",
+			observed.Slot, expected.CandidateSlot, len(observed.Endpoints), len(expected.Components))
 	}
 	identities := make(map[string]string, len(expected.Components))
 	for _, component := range expected.Components {
