@@ -170,6 +170,65 @@ func TestMigrateFreshUpgradePreservesDataAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestLANAccessMigrationUpgradePreservesDataAndBackfillsHeads(t *testing.T) {
+	db := openMemoryDatabase(t)
+	legacy := fstest.MapFS{}
+	entries, err := fs.ReadDir(migrations, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() == "025_lan_access.sql" {
+			continue
+		}
+		body, err := migrations.ReadFile("migrations/" + entry.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		legacy["migrations/"+entry.Name()] = &fstest.MapFile{Data: body}
+	}
+	if err := migrateFS(db, legacy); err != nil {
+		t.Fatalf("legacy migration set: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,role,created_at,updated_at) VALUES('lan-owner','lan-owner','hash','administrator',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,description,status,created_at,updated_at) VALUES('lan-legacy-app','lan-legacy-app','LAN Legacy','preserve me','draft',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO audit_events(actor_id,action,resource_type,resource_id,metadata_json,created_at) VALUES('lan-owner','legacy.action','application','lan-legacy-app','{"preserved":true}',datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	for pass := 1; pass <= 2; pass++ {
+		if err := Migrate(db); err != nil {
+			t.Fatalf("LAN migration pass %d: %v", pass, err)
+		}
+	}
+	var description string
+	if err := db.QueryRow(`SELECT description FROM applications WHERE id='lan-legacy-app'`).Scan(&description); err != nil || description != "preserve me" {
+		t.Fatalf("preserved application description=%q error=%v", description, err)
+	}
+	var accessNumber, gatewayNumber, auditRows int
+	if err := db.QueryRow(`SELECT revision_number FROM lan_app_access_heads WHERE app_id='lan-legacy-app'`).Scan(&accessNumber); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT revision_number FROM lan_gateway_profile_heads WHERE singleton=1`).Scan(&gatewayNumber); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE actor_id='lan-owner' AND action='legacy.action'`).Scan(&auditRows); err != nil {
+		t.Fatal(err)
+	}
+	if accessNumber != 0 || gatewayNumber != 0 || auditRows != 1 {
+		t.Fatalf("backfilled access=%d gateway=%d preserved audit=%d", accessNumber, gatewayNumber, auditRows)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES('lan-future-app','lan-future-app','LAN Future','draft',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT revision_number FROM lan_app_access_heads WHERE app_id='lan-future-app'`).Scan(&accessNumber); err != nil || accessNumber != 0 {
+		t.Fatalf("future app access head=%d error=%v", accessNumber, err)
+	}
+}
+
 func TestReleaseSnapshotMigrationPreservesLegacyReleasesAndPreventsReadyDuplicates(t *testing.T) {
 	db := openMemoryDatabase(t)
 	if err := Migrate(db); err != nil {
