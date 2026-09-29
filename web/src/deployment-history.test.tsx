@@ -424,11 +424,11 @@ describe("DeploymentHistoryPanel", () => {
     ).toBe(true);
   });
 
-  it("uses a white focus outline for rail controls on dark rail surfaces", () => {
+  it("uses a blue focus outline for rail controls on white rail surfaces", () => {
     expect(
       readFileSync("src/styles.css", "utf8"),
     ).toContain(
-      ".rail a:focus-visible, .rail-link:focus-visible { outline-color: #fff; }",
+      ".rail a:focus-visible, .rail-link:focus-visible { outline-color: #0866ff; }",
     );
   });
 
