@@ -15,7 +15,7 @@ async function tick(ms = 0) { await act(async () => { await vi.advanceTimersByTi
 async function beginAuthorization() {
   renderCard(); await tick();
   fireEvent.click(screen.getByRole("button", { name: "Connect GitHub" })); await tick();
-  expect(screen.getByText("ABCD-EFGH")).toBeTruthy();
+  expect(screen.getByDisplayValue("ABCD-EFGH")).toBeTruthy();
 }
 
 beforeEach(() => {
@@ -69,11 +69,53 @@ describe("GitHubConnectionCard", () => {
     expect(document.activeElement).toBe(screen.getByRole("link", { name: /Manage repository access/ }));
     expect(sessionStorage.getItem("rig-github-authorization")).toBeNull();
   });
+  it("copies the authorization code and leaves it selected for manual keyboard copy", async () => {
+    vi.useFakeTimers();
+    vi.mocked(api.defaultSourceConnection).mockResolvedValue({ configured: false });
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    await beginAuthorization();
+    const code = screen.getByLabelText("GitHub authorization code") as HTMLInputElement;
+    expect(code.readOnly).toBe(true);
+    fireEvent.focus(code);
+    expect(code.selectionStart).toBe(0);
+    expect(code.selectionEnd).toBe("ABCD-EFGH".length);
+    fireEvent.click(screen.getByRole("button", { name: "Copy code" }));
+    await act(async () => {});
+    expect(writeText).toHaveBeenCalledWith("ABCD-EFGH");
+    expect(screen.getByText("Code copied.")).toBeTruthy();
+    expect(code.getAttribute("aria-describedby")).toContain("copy-status");
+  });
+  it.each([
+    ["unavailable", undefined, "Copy is unavailable. Select the code and copy it manually."],
+    ["denied", { writeText: vi.fn().mockRejectedValue(new Error("denied")) }, "Code could not be copied. Select the code and copy it manually."],
+  ])("keeps a manual copy fallback when clipboard access is %s", async (_state, clipboard, feedback) => {
+    vi.useFakeTimers();
+    vi.mocked(api.defaultSourceConnection).mockResolvedValue({ configured: false });
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: clipboard });
+    await beginAuthorization();
+    fireEvent.click(screen.getByRole("button", { name: "Copy code" }));
+    await act(async () => {});
+    expect(screen.getByText(feedback)).toBeTruthy();
+    expect((screen.getByLabelText("GitHub authorization code") as HTMLInputElement).readOnly).toBe(true);
+  });
+  it("discards a pending copy result when the authorization attempt ends", async () => {
+    vi.useFakeTimers();
+    vi.mocked(api.defaultSourceConnection).mockResolvedValue({ configured: false });
+    const copied = deferred<void>();
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: vi.fn().mockReturnValue(copied.promise) } });
+    await beginAuthorization();
+    fireEvent.click(screen.getByRole("button", { name: "Copy code" }));
+    await tick(5000);
+    expect(screen.queryByRole("button", { name: "Copy code" })).toBeNull();
+    await act(async () => copied.resolve());
+    expect(screen.queryByText("Code copied.")).toBeNull();
+  });
   it("resumes a saved per-tab attempt after remount without starting a second grant", async () => {
     vi.useFakeTimers();
     sessionStorage.setItem("rig-github-authorization", JSON.stringify(authorization()));
     renderCard(); await tick();
-    expect(screen.getByText("ABCD-EFGH")).toBeTruthy();
+    expect(screen.getByDisplayValue("ABCD-EFGH")).toBeTruthy();
     expect(api.startDefaultGitHubConnection).not.toHaveBeenCalled();
     await tick(5000);
     expect(api.pollDefaultGitHubConnection).toHaveBeenCalledTimes(1);
@@ -81,7 +123,7 @@ describe("GitHubConnectionCard", () => {
   it("does not restore another account's attempt and clears authorization metadata on logout", async () => {
     sessionStorage.setItem("rig-github-authorization", JSON.stringify({ ...authorization(), connectionId: "c".repeat(32) }));
     renderCard(); await screen.findByText("Connected as @octocat");
-    expect(screen.queryByText("ABCD-EFGH")).toBeNull();
+    expect(screen.queryByDisplayValue("ABCD-EFGH")).toBeNull();
     expect(api.pollDefaultGitHubConnection).not.toHaveBeenCalled();
     sessionStorage.setItem("rig-github-authorization", JSON.stringify(authorization()));
     clearCSRF(); expect(sessionStorage.getItem("rig-github-authorization")).toBeNull();
@@ -91,7 +133,7 @@ describe("GitHubConnectionCard", () => {
     sessionStorage.setItem("rig-github-authorization", JSON.stringify(authorization()));
     vi.mocked(api.pollDefaultGitHubConnection).mockResolvedValue({ authorizationId: "b".repeat(32), status: "pending", connection });
     renderCard(); await tick(); await tick(5000);
-    expect(screen.getByText("ABCD-EFGH")).toBeTruthy();
+    expect(screen.getByDisplayValue("ABCD-EFGH")).toBeTruthy();
     expect(api.pollDefaultGitHubConnection).toHaveBeenCalledTimes(1);
     await tick(5000); expect(api.pollDefaultGitHubConnection).toHaveBeenCalledTimes(2);
   });
@@ -122,7 +164,7 @@ describe("GitHubConnectionCard", () => {
     vi.mocked(api.pollDefaultGitHubConnection).mockResolvedValue({ authorizationId: "b".repeat(32), status, connection });
     renderCard(); await tick(); await tick(5000); await tick(20000);
     expect(api.pollDefaultGitHubConnection).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("ABCD-EFGH")).toBeNull();
+    expect(screen.queryByDisplayValue("ABCD-EFGH")).toBeNull();
     expect(screen.getByText("Connected as @octocat")).toBeTruthy();
     expect(screen.getByRole("alert")).toBeTruthy();
   });
@@ -193,7 +235,7 @@ describe("GitHubConnectionCard", () => {
     renderCard(); await tick(); await tick(5000);
     const retry = screen.getByRole("button", { name: "Retry authorization check" });
     retry.focus(); fireEvent.click(retry); await tick();
-    const status = screen.getByText("ABCD-EFGH").closest("[role='status']");
+    const status = screen.getByDisplayValue("ABCD-EFGH").closest("[role='status']");
     expect(document.activeElement).toBe(status);
     await act(async () => polled.resolve({ authorizationId: "b".repeat(32), status: "connected", connection }));
     await tick();

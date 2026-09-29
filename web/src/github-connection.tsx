@@ -41,12 +41,15 @@ export function GitHubConnectionCard() {
   const [busy, setBusy] = useState(false);
   const [paused, setPaused] = useState(false);
   const [error, setError] = useState("");
+  const [copyMessage, setCopyMessage] = useState("");
   const [disconnectOpen, setDisconnectOpen] = useState(false);
   const [connectedNow, setConnectedNow] = useState(false);
   const [nextPollAt, setNextPollAt] = useState(0);
   const epoch = useRef(0);
   const mounted = useRef(true);
   const inFlight = useRef(false);
+  const copyRequest = useRef(0);
+  const authorizationRef = useRef<string | null>(null);
   const startButton = useRef<HTMLButtonElement>(null);
   const retryConnectionButton = useRef<HTMLButtonElement>(null);
   const verificationLink = useRef<HTMLAnchorElement>(null);
@@ -60,7 +63,14 @@ export function GitHubConnectionCard() {
   const installURL = githubURL(current?.installUrl ?? authorization?.installUrl, "install");
   const verificationURL = githubURL(authorization?.verificationUri, "device");
 
-  useEffect(() => { mounted.current = true; return () => { mounted.current = false; epoch.current += 1; }; }, []);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; epoch.current += 1; copyRequest.current += 1; }; }, []);
+  useEffect(() => {
+    const authorizationId = authorization?.authorizationId ?? null;
+    if (authorizationRef.current === authorizationId) return;
+    authorizationRef.current = authorizationId;
+    copyRequest.current += 1;
+    setCopyMessage("");
+  }, [authorization?.authorizationId]);
   useEffect(() => {
     if (restored.current || !connection.data) return;
     restored.current = true;
@@ -88,11 +98,34 @@ export function GitHubConnectionCard() {
     await queryClient.invalidateQueries({ queryKey: githubConnectionKey });
     await queryClient.invalidateQueries({ queryKey: githubRepositoriesKey });
   };
+  const clearCopyFeedback = () => {
+    copyRequest.current += 1;
+    setCopyMessage("");
+  };
+  const copyCode = async () => {
+    const currentAuthorization = authorization;
+    if (!currentAuthorization) return;
+    const request = ++copyRequest.current;
+    const manualCopyMessage = "Select the code and copy it manually.";
+    const clipboard = navigator.clipboard;
+    if (!clipboard?.writeText) {
+      setCopyMessage(`Copy is unavailable. ${manualCopyMessage}`);
+      return;
+    }
+    try {
+      await clipboard.writeText(currentAuthorization.userCode);
+      if (!mounted.current || request !== copyRequest.current || authorizationRef.current !== currentAuthorization.authorizationId) return;
+      setCopyMessage("Code copied.");
+    } catch {
+      if (!mounted.current || request !== copyRequest.current || authorizationRef.current !== currentAuthorization.authorizationId) return;
+      setCopyMessage(`Code could not be copied. ${manualCopyMessage}`);
+    }
+  };
   const begin = async () => {
     if (inFlight.current) return;
     inFlight.current = true;
     const generation = ++epoch.current;
-    setBusy(true); setError(""); setPaused(false); setConnectedNow(false); setAuthorization(null);
+    setBusy(true); setError(""); setPaused(false); setConnectedNow(false); clearCopyFeedback(); setAuthorization(null);
     window.sessionStorage.removeItem(authorizationStorageKey);
     try {
       const started = await api.startDefaultGitHubConnection();
@@ -125,7 +158,7 @@ export function GitHubConnectionCard() {
           const ownsFocus = document.activeElement === verificationLink.current || statusRef.current?.contains(document.activeElement);
           queryClient.setQueryData(githubConnectionKey, { configured: true, connection: result.connection });
           window.sessionStorage.removeItem(authorizationStorageKey);
-          setConnectedNow(true); setAuthorization(null); setError("");
+          setConnectedNow(true); clearCopyFeedback(); setAuthorization(null); setError("");
           if (ownsFocus) focusNext.current = "manage";
           await invalidate();
         } else if (result.status === "pending" && Date.now() < expiresAt) {
@@ -134,7 +167,7 @@ export function GitHubConnectionCard() {
         } else {
           if (statusRef.current?.contains(document.activeElement)) focusNext.current = "start";
           window.sessionStorage.removeItem(authorizationStorageKey);
-          setAuthorization(null); setError(result.status === "denied" ? "GitHub authorization was denied. Connect again when you are ready." : result.status === "superseded" ? "Another GitHub authorization replaced this attempt. Reconnect to begin again." : result.status === "failed" ? "GitHub authorization could not be completed. Reconnect to try again." : "GitHub authorization expired. Connect again to receive a new code.");
+          clearCopyFeedback(); setAuthorization(null); setError(result.status === "denied" ? "GitHub authorization was denied. Connect again when you are ready." : result.status === "superseded" ? "Another GitHub authorization replaced this attempt. Reconnect to begin again." : result.status === "failed" ? "GitHub authorization could not be completed. Reconnect to try again." : "GitHub authorization expired. Connect again to receive a new code.");
           await invalidate();
         }
       } catch (failure) {
@@ -144,7 +177,7 @@ export function GitHubConnectionCard() {
         } else if (failure instanceof APIError && ["authorization_expired", "authorization_denied", "authorization_identity_mismatch", "authorization_superseded", "authorization_failed"].includes(failure.code)) {
           if (statusRef.current?.contains(document.activeElement)) focusNext.current = "start";
           window.sessionStorage.removeItem(authorizationStorageKey);
-          setAuthorization(null); setError(message(failure, "GitHub authorization could not be completed."));
+          clearCopyFeedback(); setAuthorization(null); setError(message(failure, "GitHub authorization could not be completed."));
           await invalidate();
         } else {
           setPaused(true); setError(message(failure, "Could not check GitHub authorization. Retry to continue this authorization."));
@@ -158,7 +191,7 @@ export function GitHubConnectionCard() {
     if (inFlight.current || !current) return;
     inFlight.current = true;
     const generation = ++epoch.current;
-    setBusy(true); setError(""); setAuthorization(null);
+    setBusy(true); setError(""); clearCopyFeedback(); setAuthorization(null);
     window.sessionStorage.removeItem(authorizationStorageKey);
     try {
       await api.disconnectSourceConnection(current.id);
@@ -176,7 +209,7 @@ export function GitHubConnectionCard() {
   return <section className="github-connection-card" aria-labelledby={`${id}-title`}>
     <div className="connector-heading"><div><h3 id={`${id}-title`}>GitHub</h3><p>Connect once to reuse your repositories across applications on this controller.</p></div>{current?.providerLogin && <strong>@{current.providerLogin}</strong>}</div>
     <div ref={statusRef} tabIndex={-1} className="wizard-status connection-status" role="status" aria-live="polite" aria-atomic="true">
-      {connection.isLoading ? "Loading GitHub connection…" : connection.isError ? "GitHub connection could not be loaded." : authorization ? <><strong>Step 1 of 2: Authorize GitHub</strong><span>Enter <code>{authorization.userCode}</code> at GitHub. Rig will check when authorization is complete.</span>{verificationURL && <a ref={verificationLink} className="button primary" href={verificationURL} target="_blank" rel="noopener noreferrer">Authorize GitHub (opens in a new tab)</a>}</> : connected ? <><strong>Connected{current?.providerLogin ? ` as @${current.providerLogin}` : " to GitHub"}</strong>{connectedNow && <span>Step 2 of 2: Choose repository access. Grant Rig access to the personal or organization repositories you want to deploy.</span>}</> : <><strong>{current?.status === "access_lost" ? "Reconnect GitHub" : "GitHub is not connected"}</strong><span>{current?.status === "access_lost" ? "Renew permission for this account to restore its existing applications." : "Authorize your GitHub account, then choose which repositories Rig can access."}</span></>}
+      {connection.isLoading ? "Loading GitHub connection…" : connection.isError ? "GitHub connection could not be loaded." : authorization ? <><strong>Step 1 of 2: Authorize GitHub</strong><div className="device-authorization"><label htmlFor={`${id}-user-code`}>GitHub authorization code</label><div className="device-authorization-control"><input id={`${id}-user-code`} type="text" value={authorization.userCode} readOnly spellCheck={false} autoComplete="off" aria-describedby={`${id}-user-code-help ${id}-copy-status`} onFocus={(event) => event.currentTarget.select()} onClick={(event) => event.currentTarget.select()} /><button className="button" type="button" onClick={() => void copyCode()}>Copy code</button></div><span id={`${id}-user-code-help`}>Copy this code, then enter it at GitHub.</span><span id={`${id}-copy-status`}>{copyMessage}</span></div><span>Rig will check when authorization is complete.</span>{verificationURL && <a ref={verificationLink} className="button primary" href={verificationURL} target="_blank" rel="noopener noreferrer">Authorize GitHub (opens in a new tab)</a>}</> : connected ? <><strong>Connected{current?.providerLogin ? ` as @${current.providerLogin}` : " to GitHub"}</strong>{connectedNow && <span>Step 2 of 2: Choose repository access. Grant Rig access to the personal or organization repositories you want to deploy.</span>}</> : <><strong>{current?.status === "access_lost" ? "Reconnect GitHub" : "GitHub is not connected"}</strong><span>{current?.status === "access_lost" ? "Renew permission for this account to restore its existing applications." : "Authorize your GitHub account, then choose which repositories Rig can access."}</span></>}
     </div>
     {error && !disconnectOpen && <div className="callout danger" role="alert">{error}</div>}
     {capability.isError && <div className="callout danger" role="alert"><span>Could not check whether GitHub connections are enabled.</span><button className="button small" type="button" onClick={() => void capability.refetch()}>Retry capability check</button></div>}
