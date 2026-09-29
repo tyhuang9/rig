@@ -63,15 +63,16 @@ const (
 // observe a separately executed go-test child without passing command output
 // (which could carry a runtime secret) across the boundary.
 type controllerProcessKillBarrier struct {
-	boundary     controllerProcessKillBoundary
-	marker       string
-	state        *generatedruntimestate.Repository
-	db           *sql.DB
-	appID        string
-	jobID        string
-	mu           sync.Mutex
-	deploymentID string
-	once         sync.Once
+	boundary               controllerProcessKillBoundary
+	marker                 string
+	state                  *generatedruntimestate.Repository
+	db                     *sql.DB
+	appID                  string
+	jobID                  string
+	mu                     sync.Mutex
+	deploymentID           string
+	candidateRouteReloaded bool
+	once                   sync.Once
 }
 
 func (b *controllerProcessKillBarrier) wait(ctx context.Context, want generatedruntimestate.Phase, predicate func(generatedruntimestate.Deployment) bool) error {
@@ -121,6 +122,16 @@ func (b *controllerProcessKillBarrier) resolveDeploymentID(ctx context.Context) 
 	return b.deploymentID
 }
 
+func (b *controllerProcessKillBarrier) candidateRouteCommitted(request runtimeprocess.CommandRequest) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if controllerProcessKillRouteReload(request) {
+		b.candidateRouteReloaded = controllerProcessKillCandidateRouteReload(request)
+		return false
+	}
+	return b.candidateRouteReloaded && controllerProcessKillRouteCommit(request)
+}
+
 // controllerProcessKillRunner pauses at command boundaries after checking the
 // state which was durably written by the production executor.
 type controllerProcessKillRunner struct {
@@ -150,9 +161,11 @@ func (r controllerProcessKillRunner) Run(ctx context.Context, request runtimepro
 		}
 	}
 	result, err := r.delegate.Run(ctx, request)
-	if err == nil && r.barrier != nil && r.barrier.boundary == controllerKillAfterRoute && controllerProcessKillRouteCommit(request) && r.barrier.ready(ctx, generatedruntimestate.PhaseSwitchingRoute) {
-		if waitErr := r.barrier.wait(ctx, generatedruntimestate.PhaseSwitchingRoute, func(d generatedruntimestate.Deployment) bool { return d.PreviousActiveDeploymentID != "" }); waitErr != nil {
-			return result, waitErr
+	if err == nil && r.barrier != nil && r.barrier.boundary == controllerKillAfterRoute {
+		if r.barrier.candidateRouteCommitted(request) && r.barrier.ready(ctx, generatedruntimestate.PhaseSwitchingRoute) {
+			if waitErr := r.barrier.wait(ctx, generatedruntimestate.PhaseSwitchingRoute, func(d generatedruntimestate.Deployment) bool { return d.PreviousActiveDeploymentID != "" }); waitErr != nil {
+				return result, waitErr
+			}
 		}
 	}
 	return result, err
@@ -167,8 +180,16 @@ func controllerProcessKillStart(r runtimeprocess.CommandRequest) bool {
 func controllerProcessKillDrain(r runtimeprocess.CommandRequest) bool {
 	return len(r.Args) >= 2 && r.Args[0] == "container" && r.Args[1] == "stop"
 }
+func controllerProcessKillRouteReload(r runtimeprocess.CommandRequest) bool {
+	return len(r.Args) == 7 && r.Args[0] == "container" && r.Args[1] == "exec" && r.Args[2] == "rig-generated-caddy-v1" &&
+		r.Args[3] == "caddy" && r.Args[4] == "reload" && r.Args[5] == "--config" && strings.HasPrefix(r.Args[6], "/config/")
+}
+func controllerProcessKillCandidateRouteReload(r runtimeprocess.CommandRequest) bool {
+	return controllerProcessKillRouteReload(r) && r.Args[6] == "/config/proposed.json"
+}
 func controllerProcessKillRouteCommit(r runtimeprocess.CommandRequest) bool {
-	return len(r.Args) >= 5 && r.Args[0] == "container" && r.Args[1] == "exec" && strings.Contains(strings.Join(r.Args[2:], " "), "mv /config/active.next.json /config/active.json")
+	return len(r.Args) == 8 && r.Args[0] == "container" && r.Args[1] == "exec" && r.Args[2] == "--user" && r.Args[3] == "0:0" &&
+		r.Args[4] == "rig-generated-caddy-v1" && r.Args[5] == "mv" && r.Args[6] == "/config/active.next.json" && r.Args[7] == "/config/active.json"
 }
 
 func controllerProcessKillHasDurableCandidate(d generatedruntimestate.Deployment) bool {
@@ -193,14 +214,27 @@ func TestControllerProcessKillBoundaryControls(t *testing.T) {
 		{"unrelated create", []string{"container", "create", "candidate"}, controllerProcessKillStart, false},
 		{"previous drain", []string{"container", "stop", "--time", "0", "previous"}, controllerProcessKillDrain, true},
 		{"unrelated remove", []string{"container", "rm", "previous"}, controllerProcessKillDrain, false},
+		{"candidate route reload", []string{"container", "exec", "rig-generated-caddy-v1", "caddy", "reload", "--config", "/config/proposed.json"}, controllerProcessKillCandidateRouteReload, true},
+		{"recovery route reload", []string{"container", "exec", "rig-generated-caddy-v1", "caddy", "reload", "--config", "/config/recovery.json"}, controllerProcessKillCandidateRouteReload, false},
 		{"route commit", []string{"container", "exec", "--user", "0:0", "rig-generated-caddy-v1", "mv", "/config/active.next.json", "/config/active.json"}, controllerProcessKillRouteCommit, true},
-		{"route reload", []string{"container", "exec", "rig-generated-caddy-v1", "caddy", "reload"}, controllerProcessKillRouteCommit, false},
+		{"route reload is not commit", []string{"container", "exec", "rig-generated-caddy-v1", "caddy", "reload", "--config", "/config/proposed.json"}, controllerProcessKillRouteCommit, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := test.match(runtimeprocess.CommandRequest{Args: test.args}); got != test.want {
 				t.Fatalf("command boundary match=%t want=%t", got, test.want)
 			}
 		})
+	}
+	barrier := &controllerProcessKillBarrier{}
+	routeCommit := runtimeprocess.CommandRequest{Args: []string{"container", "exec", "--user", "0:0", "rig-generated-caddy-v1", "mv", "/config/active.next.json", "/config/active.json"}}
+	candidateReload := runtimeprocess.CommandRequest{Args: []string{"container", "exec", "rig-generated-caddy-v1", "caddy", "reload", "--config", "/config/proposed.json"}}
+	recoveryReload := runtimeprocess.CommandRequest{Args: []string{"container", "exec", "rig-generated-caddy-v1", "caddy", "reload", "--config", "/config/recovery.json"}}
+	if barrier.candidateRouteCommitted(routeCommit) || barrier.candidateRouteCommitted(candidateReload) || !barrier.candidateRouteCommitted(routeCommit) {
+		t.Fatal("route boundary did not distinguish old-route recovery from the committed candidate route")
+	}
+	barrier = &controllerProcessKillBarrier{}
+	if barrier.candidateRouteCommitted(candidateReload) || barrier.candidateRouteCommitted(recoveryReload) || barrier.candidateRouteCommitted(routeCommit) {
+		t.Fatal("route boundary treated recovery after a proposed reload as a committed candidate route")
 	}
 	marker := filepath.Join(t.TempDir(), "ready")
 	if err := controllerProcessKillMarker(marker, controllerKillAfterRoute); err != nil {
