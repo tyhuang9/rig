@@ -82,6 +82,33 @@ func TestClassifyGatewayV2RecoveryTopologyExactIntermediateStates(t *testing.T) 
 	}
 }
 
+func TestClassifyGatewayV2StoppedStageForCompensationRequiresBoundStoppedIdentity(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Phase = gatewayPhaseStageIntent
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Resources.FinalContainerID = ""
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1WithStage)
+	stopGatewayV2TestContainer(&observation.StageContainer, &observation.StageRuntime, &observation.StageConfig, state, observation.IngressNetworkID, nil)
+	observation.IngressNetwork.Containers = map[string]caddyNetworkContainerInspection{}
+	observation.StageRestartConfig = nil // Crash before the stopped config was copied.
+	if !classifyGatewayV2StoppedStageForCompensation(source, state, journal, observation) {
+		t.Fatal("exact bound stopped stage could not be compensated")
+	}
+	if got := classifyGatewayV2RecoveryTopology(source, state, journal, observation); got != gatewayV2RecoveryUnknown {
+		t.Fatalf("missing config was accepted for start: %q", got)
+	}
+	drift := observation
+	drift.StageContainer.ID = "sha256:" + strings.Repeat("9", 64)
+	if classifyGatewayV2StoppedStageForCompensation(source, state, journal, drift) {
+		t.Fatal("drifted stage was accepted for compensation")
+	}
+	drift = observation
+	drift.StageRuntime.EffectivePortBindings = gatewayV2IdentityTestPortBindingsCopy(observation.StageContainer.PortBindings)
+	if classifyGatewayV2StoppedStageForCompensation(source, state, journal, drift) {
+		t.Fatal("active host binding was accepted for compensation")
+	}
+}
+
 func TestClassifyGatewayV2RecoveryTopologyRejectsUnboundAndDriftedResources(t *testing.T) {
 	source, state, baseJournal := gatewayV2IdentityTestState(t)
 

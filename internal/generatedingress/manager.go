@@ -77,6 +77,9 @@ type Manager struct {
 	gatewayCandidateObserver func(context.Context, gatewayV2RouteState, gatewayMigrationJournal, string, gatewayV2AppRoute) error
 	// gatewayMixedRestartObserver is replaceable only by package tests.
 	gatewayMixedRestartObserver func(context.Context, routeState, gatewayV2RouteState, gatewayV2RouteState, gatewayMigrationJournal) bool
+	// gatewayV2UpgradeDriver is replaceable only by package tests. Production
+	// uses the exact Docker and host-network adapter in gateway_v2_upgrade.go.
+	gatewayV2UpgradeDriver gatewayV2UpgradeDriver
 }
 
 // contextMutex lets a route observation abandon lock contention when its

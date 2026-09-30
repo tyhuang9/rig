@@ -262,6 +262,13 @@ func (m *Manager) observeGatewayV2MixedRestart(ctx context.Context, source route
 }
 
 func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal) (gatewayV2DockerObservation, error) {
+	return m.inspectGatewayV2DockerWithStageConfig(ctx, source, state, journal, true)
+}
+
+// The compensation-only path may inspect a stopped, ID-bound stage whose
+// restart config was never copied before a crash. It must never use this
+// observation to start a listener or attest serving topology.
+func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, requireStoppedStageConfig bool) (gatewayV2DockerObservation, error) {
 	var observation gatewayV2DockerObservation
 	var err error
 	observation.Image, observation.ImageFound, err = m.inspectImage(ctx)
@@ -361,9 +368,11 @@ func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState,
 				return observation, err
 			}
 		}
-		observation.StageRestartConfig, err = m.inspectStoppedCaddyRestartConfig(ctx, observation.StageContainer.ID, state.Identity.StageConfigFilename)
-		if err != nil {
-			return observation, err
+		if requireStoppedStageConfig || observation.StageContainer.Running || observation.StageContainer.Restarting {
+			observation.StageRestartConfig, err = m.inspectStoppedCaddyRestartConfig(ctx, observation.StageContainer.ID, state.Identity.StageConfigFilename)
+			if err != nil {
+				return observation, err
+			}
 		}
 		if observation.StageContainer.Running && !observation.StageContainer.Restarting {
 			observation.Stage404Proven = m.proveGatewayV2Stage404(ctx, state, observation.StageContainer.ID)
@@ -448,12 +457,18 @@ func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState,
 				return observation, err
 			}
 		}
-		confirmedRestart, configErr := m.inspectStoppedCaddyRestartConfig(ctx, observation.StageContainer.ID, state.Identity.StageConfigFilename)
-		if configErr != nil {
-			clear(confirmedLive)
-			return observation, configErr
+		var confirmedRestart []byte
+		if requireStoppedStageConfig || observation.StageContainer.Running || observation.StageContainer.Restarting {
+			var configErr error
+			confirmedRestart, configErr = m.inspectStoppedCaddyRestartConfig(ctx, observation.StageContainer.ID, state.Identity.StageConfigFilename)
+			if configErr != nil {
+				clear(confirmedLive)
+				return observation, configErr
+			}
 		}
-		stageConfigStable = sameOptionalCaddyConfig(observation.StageConfig, confirmedLive) && sameCaddyConfig(observation.StageRestartConfig, confirmedRestart)
+		stageConfigStable = sameOptionalCaddyConfig(observation.StageConfig, confirmedLive) &&
+			(!requireStoppedStageConfig && !observation.StageContainer.Running && !observation.StageContainer.Restarting ||
+				sameCaddyConfig(observation.StageRestartConfig, confirmedRestart))
 		clear(confirmedLive)
 		clear(confirmedRestart)
 	}
