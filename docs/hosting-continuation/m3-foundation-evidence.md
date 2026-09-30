@@ -21,6 +21,9 @@ action or LAN URL is exposed.
 - Journaled v2 transfer and bounded rollback: `aff192f`.
 - Automatic private gateway network selection and recheck: `0d04d14`.
 - Authenticated desired LAN gateway profile API: `f2768bf`.
+- Single-snapshot upgrade authorization recheck: `c75eb51`.
+- Protected upgrade-generation history scanner: `759734b`.
+- Explicit journaled-rollback retirement: `ff8508c`.
 
 The allocator stores approved desired gateway and per-app access revisions,
 action digests, compare-and-swap heads, and unique durable port ownership. It
@@ -219,6 +222,26 @@ later fails; new writes still require a fresh interface check. It does
 not call the gateway upgrade Manager, bind a port, or claim that a listener
 serves traffic.
 
+The upgrade authorization repository now checks the exact operation claim,
+administrator role, action and request digests, complete claim-event history,
+canonical profile revision, and current profile head in one read-only SQLite
+snapshot. This is a building block for a future authenticated upgrade action;
+there is still no controller route that invokes the coordinator.
+
+The generated-ingress history scanner keeps the fixed v2 pair as generation
+zero, allocates create-only operation-scoped files for later generations, and
+rejects gaps, duplicates, partial or corrupt history, and unknown reserved
+artifacts. An exact retry can repair a state-only preparation crash after
+fresh v1 and no-v2-resource proof; ordinary v1 management stays fenced until
+a terminal rolled-back generation has a protected retirement receipt. The
+explicit rollback finalizer removes one exact idle v2 resource between full
+observations, then reads back that receipt only after proving the current v1
+gateway serves and no v2 resource remains. The coordinator reports
+`rolled_back` only after finalization and successful lock release. Protected
+artifact fingerprints detect changes that persist across scanner snapshots;
+same-user mutation confined to a separate protected read is outside the
+cooperating-writer model.
+
 ## Executed verification
 
 | Check | Result |
@@ -284,6 +307,10 @@ serves traffic.
 | `pnpm --dir web test` and `pnpm --dir web build` after generated API contract | Passed: 400 tests in 16 files; production build passed with the existing large-chunk warning. |
 | `pnpm --dir docs build`, `gofmt -l`, and `git diff --check` | Passed. Initial sandboxed pnpm commands could not traverse Windows junctions; normal Windows runs passed. |
 | Independent security and manual integration reviews of profile API and network planner | Profile API security review found no exploitable issue in this desired-state-only slice. Network security review found empty Docker IPAM could hide an allocated subnet; the planner now rejects it except for exact built-in `host`/`none` networks. Manual review found and verified fixes for exact replay after interface discovery failure, full selected-interface-prefix exclusion, and malformed proposal status mapping. CodeRabbit aggregate review was unavailable because its CLI is not authenticated; manual review found no remaining actionable blocker. |
+| `go test -count=10 -run '^TestAuthorizeGatewayProfileUpgrade' ./internal/appaccess`, `go test -count=1 ./internal/appaccess`, `go vet ./internal/appaccess` | Passed for the single-snapshot authorization read, including two-handle consistency, stale head, demoted actor, and corrupt history. |
+| `go test -count=1 ./internal/generatedingress` and `go vet ./internal/generatedingress` after history/retirement integration | Passed with normal Windows permissions. A restricted-sandbox run failed broadly in unchanged manager fixtures; the identical normal-permission command passed in 41.315s. |
+| `go test -count=1 -p 1 ./...`, `go vet ./...`, `go run ./cmd/openapi-gen -check` after commits `c75eb51`, `759734b`, `ff8508c` | Passed with normal Windows permissions; all Go packages completed. No API contract changed. |
+| Independent rollback-history review | Found and fixed an in-place artifact mutation detection gap by adding bounded content fingerprints. No false terminal outcome or lock-order defect remained in read-only review. Live Docker behavior remains unverified. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -332,9 +359,11 @@ the file, but it is not an atomic compare-and-swap across processes. The new
 staging and transfer operations hold the handle-based gateway lock across
 their complete mutation and attestation loops; journal methods alone do not
 enforce that boundary. Every active LAN binding must also be compared with its
-approved SQLite row. A fresh upgrade after a `rolled_back` journal needs a
-history-preserving retry generation or explicit
-operator recovery; fixed create-only paths currently refuse another operation.
+approved SQLite row. After an explicit journaled rollback retirement, a fresh
+operation can use a new protected generation while retaining all earlier
+state, journals, and receipts. A failure before any complete migration journal
+still needs a durable no-op abort receipt before its prepared SQLite claim can
+be released.
 The first live v2 marker writer must hold the same lock as the v1 compatibility
 fence. The lock and state paths must remain bound to one protected directory
 identity through the operation; a same-user parent-directory substitution is
@@ -371,15 +400,12 @@ private-directory boundary has unit and WSL evidence, but its behavior with a
 live Docker config copy and on a locked-down Windows service account remains
 unverified. Windows ancestors that allow traversal without `GENERIC_READ` fail
 closed until a narrower safe guard is implemented and tested.
-The claim repository allows a new profile after an attested rollback, but the
-protected v2 files still retain the original operation. A new upgrade attempt
-therefore needs an explicit history-preserving retry generation; it is not yet
-implemented. Recovery review recommends an explicit locked rollback
-finalization that freshly proves exact v1 service, retires only identified idle
-v2 resources, writes a create-only receipt, and then permits v1 management.
-Later attempts should use operation-scoped protected files while retaining
-each prior journal and receipt. Before a gateway upgrade controller action is
-enabled, it must persist and
-recheck a session-derived administrator claim, reconcile claim state with the
-protected journal and fresh topology, and release a rolled-back pin only on
-newly attested exact-v1 evidence.
+Before a gateway upgrade controller action is enabled, it must persist and
+recheck a session-derived administrator claim inside the gateway lock,
+reconcile claim state with protected history and fresh topology, and handle
+the pre-journal no-op abort boundary durably. Docker volume deletion remains
+name-based after immediate exact label, mountpoint, and creation-time
+reinspection because Docker exposes no immutable volume ID or conditional
+delete. A non-cooperating same-privilege actor replacing a volume in that
+window could cause deletion of the replacement; this path requires a live
+Docker gate and an explicit single-owner maintenance assumption.
