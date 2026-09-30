@@ -82,10 +82,11 @@ func (m *Manager) UpgradeGatewayV2(ctx context.Context, request GatewayV2Upgrade
 	}()
 	preparation.LocalHostPort = m.options.HostPort
 
-	store, err := newGatewayUpgradeStateStore(m.options.DataRoot)
-	if err != nil {
+	selection, err := m.resolveGatewayUpgradeGenerationLocked(request.OperationID)
+	if err != nil || selection.Store == nil {
 		return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
 	}
+	store := selection.Store
 	stageDriver := m.gatewayV2UpgradeDriver
 	if stageDriver == nil {
 		stageDriver = managerGatewayV2UpgradeDriver{manager: m}
@@ -95,8 +96,8 @@ func (m *Manager) UpgradeGatewayV2(ctx context.Context, request GatewayV2Upgrade
 		transferDriver = managerGatewayV2TransferDriver{manager: m}
 	}
 
-	state, journal, loadErr := store.loadBoundUpgrade(request.OperationID)
-	if loadErr != nil {
+	state, journal := selection.State, selection.Journal
+	if !selection.Existing {
 		source, sourceErr := m.store.load()
 		if sourceErr != nil {
 			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
@@ -105,9 +106,17 @@ func (m *Manager) UpgradeGatewayV2(ctx context.Context, request GatewayV2Upgrade
 		if coordinatorDriver == nil {
 			coordinatorDriver = managerGatewayV2CoordinatorDriver{manager: m}
 		}
-		preparation.Network, err = coordinatorDriver.selectNetworkPlan(ctx, preparation.Profile)
-		if err != nil {
-			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, err
+		if selection.PartialState {
+			// A protected state create may have installed before reporting a
+			// durability failure. Reuse its already-approved network plan; a new
+			// selection would make exact recovery impossible and could reinterpret
+			// the immutable partial artifact.
+			preparation.Network = selection.State.Network
+		} else {
+			preparation.Network, err = coordinatorDriver.selectNetworkPlan(ctx, preparation.Profile)
+			if err != nil {
+				return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, err
+			}
 		}
 		preparation.SourceIdentityDigest, err = coordinatorDriver.attestSourceV1(ctx, source, preparation)
 		if err != nil {
@@ -120,6 +129,9 @@ func (m *Manager) UpgradeGatewayV2(ctx context.Context, request GatewayV2Upgrade
 		if err != nil {
 			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
 		}
+		if selection.PartialState && !reflect.DeepEqual(state, selection.State) {
+			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
+		}
 		if err := prepareGatewayV2ProtectedState(store, state, journal); err != nil {
 			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
 		}
@@ -128,7 +140,7 @@ func (m *Manager) UpgradeGatewayV2(ctx context.Context, request GatewayV2Upgrade
 		return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
 	}
 	if journal.Phase == gatewayPhaseRolledBack {
-		if m.attestGatewayV2RolledBack(ctx, store, request.OperationID) {
+		if m.finalizeGatewayV2RollbackLocked(ctx, store, state, journal) == nil {
 			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeRolledBack}, gatewayV2CoordinatorError(ctx)
 		}
 		return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
@@ -226,31 +238,11 @@ func prepareGatewayV2ProtectedState(store *gatewayUpgradeStateStore, state gatew
 }
 
 func (m *Manager) gatewayV2CoordinatorFailureResult(ctx context.Context, store *gatewayUpgradeStateStore, operationID string) GatewayV2UpgradeResult {
-	if m.attestGatewayV2RolledBack(ctx, store, operationID) {
+	state, journal, err := store.loadHistoricalBoundUpgrade(operationID)
+	if err == nil && journal.Phase == gatewayPhaseRolledBack && m.finalizeGatewayV2RollbackLocked(ctx, store, state, journal) == nil {
 		return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeRolledBack}
 	}
 	return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}
-}
-
-// attestGatewayV2RolledBack releases no claim by itself. It proves that the
-// exact journal-bound v1 source is serving and restartable, stage and final
-// containers are absent, and any retained v2 infrastructure is the exact idle
-// operation-bound set. Missing or drifted evidence remains unresolved.
-func (m *Manager) attestGatewayV2RolledBack(ctx context.Context, store *gatewayUpgradeStateStore, operationID string) bool {
-	if m == nil || store == nil || ctx == nil {
-		return false
-	}
-	state, journal, err := store.loadBoundUpgrade(operationID)
-	if err != nil || journal.Phase != gatewayPhaseRolledBack {
-		return false
-	}
-	source, err := m.store.load()
-	if err != nil {
-		return false
-	}
-	attestCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), v2ObservationTimeout)
-	defer cancel()
-	return m.observeV2Topology(attestCtx, source, state, journal) == gatewayTopologyExactV1Only
 }
 
 func gatewayV2CoordinatorError(ctx context.Context) error {
@@ -287,10 +279,21 @@ func (d managerGatewayV2CoordinatorDriver) attestSourceV1(ctx context.Context, s
 		return "", gatewayV2CoordinatorError(ctx)
 	}
 	journal.Source.IdentityDigest = identityDigest
-	if !validGatewayMigrationJournal(journal) || classifyGatewayV2Topology(source, state, journal, observation) != gatewayTopologyExactV1Only {
+	if !validGatewayMigrationJournal(journal) || classifyGatewayV2Topology(source, state, journal, observation) != gatewayTopologyExactV1Only ||
+		!gatewayV2SourceAttestationHasNoV2Resources(observation) {
 		return "", gatewayV2CoordinatorError(ctx)
 	}
 	return identityDigest, nil
+}
+
+// gatewayV2SourceAttestationHasNoV2Resources distinguishes a truly fresh or
+// state-only preparation from a rolled-back topology that retained exact idle
+// infrastructure. Before the migration journal exists, no Docker side effect
+// is authorized, so even correctly labelled idle v2 resources fail closed.
+func gatewayV2SourceAttestationHasNoV2Resources(observation gatewayV2DockerObservation) bool {
+	return !observation.ConfigVolumeFound && !observation.DataVolumeFound && !observation.IngressFound &&
+		!observation.StageContainerFound && !observation.FinalContainerFound &&
+		len(observation.OwnedContainers) == 0 && len(observation.OwnedVolumes) == 0 && len(observation.OwnedNetworks) == 0
 }
 
 var _ gatewayV2CoordinatorDriver = managerGatewayV2CoordinatorDriver{}
