@@ -210,6 +210,9 @@ func (m *Manager) advanceGatewayV2Transfer(ctx context.Context, store *gatewayUp
 func reconcileGatewayV2TransferFailure(ctx context.Context, store *gatewayUpgradeStateStore, driver gatewayV2TransferDriver,
 	source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, original error,
 ) error {
+	if isGatewayV2UpgradeAuthorizationDenied(original) {
+		return original
+	}
 	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), v2ObservationTimeout)
 	defer cancel()
 	if topology := driver.observeTopology(reconcileCtx, source, state, journal); topology == gatewayTopologyExactFinalV2 {
@@ -224,6 +227,9 @@ func reconcileGatewayV2TransferFailure(ctx context.Context, store *gatewayUpgrad
 func rollbackGatewayV2Transfer(ctx context.Context, store *gatewayUpgradeStateStore, driver gatewayV2TransferDriver,
 	source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, original error,
 ) error {
+	if isGatewayV2UpgradeAuthorizationDenied(original) {
+		return original
+	}
 	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), v2ObservationTimeout)
 	defer cancel()
 	if journal.Phase != gatewayPhaseRollbackIntent {
@@ -247,11 +253,17 @@ func rollbackGatewayV2Transfer(ctx context.Context, store *gatewayUpgradeStateSt
 			return original
 		case gatewayTopologyExactV1WithStage:
 			if err := driver.stopStage(rollbackCtx, state, journal); err != nil {
+				if isGatewayV2UpgradeAuthorizationDenied(err) {
+					return err
+				}
 				return markGatewayV2TransferUncertain(store, journal)
 			}
 			continue
 		case gatewayTopologyExactFinalV2:
 			if err := driver.stopFinal(rollbackCtx, state, journal); err != nil {
+				if isGatewayV2UpgradeAuthorizationDenied(err) {
+					return err
+				}
 				return markGatewayV2TransferUncertain(store, journal)
 			}
 			continue
@@ -260,15 +272,24 @@ func rollbackGatewayV2Transfer(ctx context.Context, store *gatewayUpgradeStateSt
 		switch driver.observeRecovery(rollbackCtx, source, state, journal) {
 		case gatewayV2RecoveryTransferIntentV1ServingStoppedStage:
 			if err := driver.removeStage(rollbackCtx, state, journal); err != nil {
+				if isGatewayV2UpgradeAuthorizationDenied(err) {
+					return err
+				}
 				return markGatewayV2TransferUncertain(store, journal)
 			}
 		case gatewayV2RecoveryTransferIntentV1ServingStoppedFinal:
 			if err := driver.removeFinal(rollbackCtx, state, journal); err != nil {
+				if isGatewayV2UpgradeAuthorizationDenied(err) {
+					return err
+				}
 				return markGatewayV2TransferUncertain(store, journal)
 			}
 		case gatewayV2RecoveryTransferIntentStoppedV1, gatewayV2RecoveryTransferIntentV1StoppedStage,
 			gatewayV2RecoveryTransferIntentNoContainers, gatewayV2RecoveryTransferIntentStoppedFinal:
 			if err := driver.startV1(rollbackCtx, source, state, journal); err != nil {
+				if isGatewayV2UpgradeAuthorizationDenied(err) {
+					return err
+				}
 				return markGatewayV2TransferUncertain(store, journal)
 			}
 		case gatewayV2RecoveryTransferIntentV1ServingNoContainers:

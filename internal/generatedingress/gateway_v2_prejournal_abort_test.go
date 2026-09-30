@@ -239,7 +239,7 @@ func TestUpgradeGatewayV2DoesNotReportPreparationAbortWhenGatewayLockReleaseFail
 		}, nil
 	}
 
-	result, err := manager.UpgradeGatewayV2(context.Background(), request)
+	result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if !IsCode(err, DiagnosticRouteUnresolved) || result.Outcome != GatewayV2UpgradeUnresolved || *osLockHeld {
 		t.Fatalf("coordinator release failure result=%+v err=%v lockHeld=%t", result, err, *osLockHeld)
 	}
@@ -247,7 +247,7 @@ func TestUpgradeGatewayV2DoesNotReportPreparationAbortWhenGatewayLockReleaseFail
 		t.Fatalf("durable abort receipt missing after release failure: %v", err)
 	}
 	managerAcquireGatewayOSLock = successfulAcquire
-	result, err = manager.UpgradeGatewayV2(context.Background(), request)
+	result, err = manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err == nil || result.Outcome != GatewayV2UpgradeRolledBack {
 		t.Fatalf("fresh coordinator replay result=%+v err=%v", result, err)
 	}

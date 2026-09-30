@@ -63,6 +63,7 @@ var expectedOpenAPIProblemCatalog = map[string]openAPIProblemCode{
 	"lan_gateway_replay_conflict":     {Description: "The LAN gateway operation identifier was already used for a different request", Statuses: []int{409}},
 	"lan_gateway_approval_mismatch":   {Description: "The supplied confirmation digest does not approve the exact LAN gateway profile", Statuses: []int{409}},
 	"lan_gateway_unavailable":         {Description: "LAN gateway profile state or safe host interface discovery is unavailable", Statuses: []int{503}},
+	"capability_unavailable":          {Description: "The requested operation requires a runtime capability that is disabled", Statuses: []int{409}},
 }
 
 var expectedOpenAPIOperationProblemCodes = map[string][]string{
@@ -96,6 +97,8 @@ var expectedOpenAPIOperationProblemCodes = map[string][]string{
 	"resumeApplicationAutoDeploy":               {"source_access_lost"},
 	"getLANGatewayProfile":                      {"lan_gateway_forbidden", "invalid_lan_gateway_request", "lan_gateway_interface_changed", "lan_gateway_unavailable"},
 	"configureLANGatewayProfile":                {"lan_gateway_forbidden", "invalid_lan_gateway_request", "lan_gateway_interface_changed", "lan_gateway_conflict", "lan_gateway_replay_conflict", "lan_gateway_approval_mismatch", "lan_gateway_unavailable"},
+	"getLANGatewayUpgrade":                      {"lan_gateway_forbidden", "invalid_lan_gateway_request", "lan_gateway_unavailable", "capability_unavailable"},
+	"upgradeLANGateway":                         {"lan_gateway_forbidden", "invalid_lan_gateway_request", "lan_gateway_conflict", "lan_gateway_replay_conflict", "lan_gateway_approval_mismatch", "lan_gateway_unavailable", "capability_unavailable"},
 }
 
 func TestOpenAPIContractMatchesRegisteredRoutes(t *testing.T) {

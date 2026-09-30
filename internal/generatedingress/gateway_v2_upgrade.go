@@ -191,6 +191,9 @@ func (m *Manager) startAndAttestGatewayV2Stage(ctx context.Context, store *gatew
 		return rollbackGatewayV2Stage(ctx, store, driver, source, state, journal, gatewayV2StageError(ctx))
 	}
 	if err := driver.copyStageConfig(ctx, state, journal, append([]byte(nil), expected...)); err != nil {
+		if isGatewayV2UpgradeAuthorizationDenied(err) {
+			return err
+		}
 		return rollbackGatewayV2Stage(ctx, store, driver, source, state, journal, err)
 	}
 	restart, err := driver.readStageRestartConfig(ctx, state, journal)
@@ -206,6 +209,9 @@ func (m *Manager) startAndAttestGatewayV2Stage(ctx context.Context, store *gatew
 		return rollbackGatewayV2Stage(ctx, store, driver, source, state, journal, err)
 	}
 	startErr := driver.startStage(ctx, state, journal)
+	if isGatewayV2UpgradeAuthorizationDenied(startErr) {
+		return startErr
+	}
 	if driver.observeTopology(ctx, source, state, journal) == gatewayTopologyExactV1WithStage {
 		if _, err := store.transitionMigrationJournal(journal.OperationID, gatewayPhaseStageIntent, gatewayPhaseStaged); err != nil {
 			return gatewayV2StageError(ctx)
@@ -237,9 +243,15 @@ func rollbackGatewayV2Stage(ctx context.Context, store *gatewayUpgradeStateStore
 	}
 	if rollback.Resources.StageContainerID != "" {
 		if err := driver.stopStage(rollbackCtx, state, rollback); err != nil {
+			if isGatewayV2UpgradeAuthorizationDenied(err) {
+				return err
+			}
 			return markGatewayV2StageUncertain(store, rollback)
 		}
 		if err := driver.removeStage(rollbackCtx, state, rollback); err != nil {
+			if isGatewayV2UpgradeAuthorizationDenied(err) {
+				return err
+			}
 			return markGatewayV2StageUncertain(store, rollback)
 		}
 	}
@@ -255,6 +267,9 @@ func rollbackGatewayV2Stage(ctx context.Context, store *gatewayUpgradeStateStore
 func handleGatewayV2StageCreateFailure(ctx context.Context, store *gatewayUpgradeStateStore, driver gatewayV2UpgradeDriver,
 	source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, original error,
 ) error {
+	if isGatewayV2UpgradeAuthorizationDenied(original) {
+		return original
+	}
 	if ctx.Err() != nil {
 		return &Error{Code: DiagnosticCancelled}
 	}

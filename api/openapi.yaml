@@ -36,6 +36,7 @@ x-rig-problem-codes:
   lan_gateway_replay_conflict: {description: The LAN gateway operation identifier was already used for a different request, statuses: [409]}
   lan_gateway_approval_mismatch: {description: The supplied confirmation digest does not approve the exact LAN gateway profile, statuses: [409]}
   lan_gateway_unavailable: {description: LAN gateway profile state or safe host interface discovery is unavailable, statuses: [503]}
+  capability_unavailable: {description: The requested operation requires a runtime capability that is disabled, statuses: [409]}
 x-job-responses: &jobResponses
   '200': {description: Existing idempotent job, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
   '202': {description: Job accepted, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
@@ -461,6 +462,25 @@ paths:
         '200': {description: Existing exact idempotent desired profile revision, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayProfileMutation'}}}}
         '201': {description: New desired LAN gateway profile revision, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayProfileMutation'}}}}
         default: {$ref: '#/components/responses/Problem'}
+  /api/v1/system/lan-gateway-upgrade:
+    get:
+      operationId: getLANGatewayUpgrade
+      x-rig-problem-codes: [lan_gateway_forbidden, invalid_lan_gateway_request, lan_gateway_unavailable, capability_unavailable]
+      security: [{sessionCookie: []}]
+      description: Returns the current upgrade approval proposal, durable desired claim state, and a separately observed gateway availability. The proposal is not consent, observed state is freshly attested, and this response never contains a LAN URL.
+      responses:
+        '200': {description: Desired LAN gateway upgrade state and fresh observed availability, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayUpgradeRead'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      operationId: upgradeLANGateway
+      x-rig-problem-codes: [lan_gateway_forbidden, invalid_lan_gateway_request, lan_gateway_conflict, lan_gateway_replay_conflict, lan_gateway_approval_mismatch, lan_gateway_unavailable, capability_unavailable]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      description: Claims and executes the exact administrator-approved generated-runtime gateway upgrade. The actor is derived from the authenticated session. An unresolved result remains durably pinned for explicit retry and is never reported as rolled back without a protected receipt.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/UpgradeLANGatewayRequest'}}}}
+      responses:
+        '200': {description: Existing exact upgrade claim reached or retained a durable terminal state, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayUpgradeMutation'}}}}
+        '201': {description: New exact upgrade claim reached a durable terminal state, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayUpgradeMutation'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/relay/status:
     get:
       operationId: getRelayStatus
@@ -766,6 +786,56 @@ components:
       required: [profile, created]
       properties:
         profile: {$ref: '#/components/schemas/LANGatewayProfileRevision'}
+        created: {type: boolean}
+    UpgradeLANGatewayRequest:
+      type: object
+      additionalProperties: false
+      required: [operationId, profileRevisionId, profileRevisionNumber, actionDigest]
+      properties:
+        operationId: {type: string, format: uuid}
+        profileRevisionId: {type: string, format: uuid}
+        profileRevisionNumber: {type: integer, format: int64, minimum: 1}
+        actionDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANGatewayUpgradeProposal:
+      type: object
+      additionalProperties: false
+      required: [profileRevisionId, profileRevisionNumber, actionDigest]
+      properties:
+        profileRevisionId: {type: string, format: uuid}
+        profileRevisionNumber: {type: integer, format: int64, minimum: 1}
+        actionDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANGatewayUpgradeClaim:
+      type: object
+      additionalProperties: false
+      required: [operationId, profileRevisionId, profileRevisionNumber, profileSpecDigest, state, updatedAt]
+      properties:
+        operationId: {type: string, format: uuid}
+        profileRevisionId: {type: string, format: uuid}
+        profileRevisionNumber: {type: integer, format: int64, minimum: 1}
+        profileSpecDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        state: {type: string, enum: [prepared, serving, unresolved, committed, rolled_back]}
+        updatedAt: {type: string, format: date-time}
+    LANGatewayUpgradeObservation:
+      type: object
+      additionalProperties: false
+      required: [availability]
+      properties:
+        operationId: {type: string, format: uuid}
+        availability: {type: string, enum: [serving, unavailable, unknown]}
+    LANGatewayUpgradeRead:
+      type: object
+      additionalProperties: false
+      required: [observed]
+      properties:
+        proposal: {$ref: '#/components/schemas/LANGatewayUpgradeProposal', x-go-pointer: true}
+        desiredClaim: {$ref: '#/components/schemas/LANGatewayUpgradeClaim', x-go-pointer: true}
+        observed: {$ref: '#/components/schemas/LANGatewayUpgradeObservation'}
+    LANGatewayUpgradeMutation:
+      type: object
+      additionalProperties: false
+      required: [claim, created]
+      properties:
+        claim: {$ref: '#/components/schemas/LANGatewayUpgradeClaim'}
         created: {type: boolean}
     RelayStatus:
       type: object

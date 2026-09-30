@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "ffbe04ac912be7a49fb0a00a8791a553111c509886febf3b0eedb9554c0d93db"
+const SourceSHA256 = "2e628b7ec9ea5ea64d3e1ba99cac4329a6ed3f815c932fa2965e9e0911016eaa"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -30,6 +30,7 @@ var Operations = map[string]Operation{
 	"getDeploymentJobByIdempotency":         {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-jobs/by-idempotency"},
 	"getJob":                                {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
 	"getLANGatewayProfile":                  {Method: "GET", Path: "/api/v1/system/lan-gateway-profile"},
+	"getLANGatewayUpgrade":                  {Method: "GET", Path: "/api/v1/system/lan-gateway-upgrade"},
 	"getRelayStatus":                        {Method: "GET", Path: "/api/v1/relay/status"},
 	"grantRuntimeApproval":                  {Method: "POST", Path: "/api/v1/apps/{appId}/runtime-approvals"},
 	"inspectImport":                         {Method: "POST", Path: "/api/v1/apps/import/inspect"},
@@ -71,6 +72,7 @@ var Operations = map[string]Operation{
 	"streamLogs":                            {Method: "GET", Path: "/api/v1/apps/{appId}/logs/stream"},
 	"systemStatus":                          {Method: "GET", Path: "/api/v1/system/status"},
 	"updateApplicationAutoDeploy":           {Method: "PUT", Path: "/api/v1/apps/{appId}/auto-deploy"},
+	"upgradeLANGateway":                     {Method: "POST", Path: "/api/v1/system/lan-gateway-upgrade"},
 }
 
 type AcceptDeploymentPlanRequest struct {
@@ -662,6 +664,37 @@ type LANGatewayProfileSpec struct {
 	SelectedIpv4 string `json:"selectedIpv4"`
 }
 
+type LANGatewayUpgradeClaim struct {
+	OperationID           string `json:"operationId"`
+	ProfileRevisionID     string `json:"profileRevisionId"`
+	ProfileRevisionNumber int64  `json:"profileRevisionNumber"`
+	ProfileSpecDigest     string `json:"profileSpecDigest"`
+	State                 string `json:"state"`
+	UpdatedAt             string `json:"updatedAt"`
+}
+
+type LANGatewayUpgradeMutation struct {
+	Claim   LANGatewayUpgradeClaim `json:"claim"`
+	Created bool                   `json:"created"`
+}
+
+type LANGatewayUpgradeObservation struct {
+	Availability string `json:"availability"`
+	OperationID  string `json:"operationId,omitempty"`
+}
+
+type LANGatewayUpgradeProposal struct {
+	ActionDigest          string `json:"actionDigest"`
+	ProfileRevisionID     string `json:"profileRevisionId"`
+	ProfileRevisionNumber int64  `json:"profileRevisionNumber"`
+}
+
+type LANGatewayUpgradeRead struct {
+	DesiredClaim *LANGatewayUpgradeClaim      `json:"desiredClaim,omitempty"`
+	Observed     LANGatewayUpgradeObservation `json:"observed"`
+	Proposal     *LANGatewayUpgradeProposal   `json:"proposal,omitempty"`
+}
+
 type LocalRoute struct {
 	ConfigurationRevisionID     string `json:"configurationRevisionId,omitempty"`
 	ConfigurationRevisionNumber int64  `json:"configurationRevisionNumber,omitempty"`
@@ -959,6 +992,13 @@ type SystemStatus struct {
 type UpdateApplicationAutoDeployRequest struct {
 	Enabled          bool  `json:"enabled"`
 	ExpectedRevision int64 `json:"expectedRevision"`
+}
+
+type UpgradeLANGatewayRequest struct {
+	ActionDigest          string `json:"actionDigest"`
+	OperationID           string `json:"operationId"`
+	ProfileRevisionID     string `json:"profileRevisionId"`
+	ProfileRevisionNumber int64  `json:"profileRevisionNumber"`
 }
 
 type User struct {

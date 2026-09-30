@@ -9,10 +9,12 @@ import (
 	"github.com/hostd/hostd/internal/appaccess"
 )
 
+func allowGatewayV2Upgrade(context.Context, GatewayV2UpgradeRequest) error { return nil }
+
 func TestUpgradeGatewayV2CoordinatesFreshMigrationUnderOneLock(t *testing.T) {
 	manager, store, request, sourceDriver, stageDriver, transferDriver, osLockHeld := gatewayV2CoordinatorTestFixture(t)
 
-	result, err := manager.UpgradeGatewayV2(context.Background(), request)
+	result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err != nil || result.Outcome != GatewayV2UpgradeCommitted {
 		t.Fatalf("upgrade result = %+v, err=%v", result, err)
 	}
@@ -28,7 +30,7 @@ func TestUpgradeGatewayV2CoordinatesFreshMigrationUnderOneLock(t *testing.T) {
 		t.Fatalf("coordinator drivers: source=%+v stage=%+v transfer=%+v", sourceDriver, stageDriver, transferDriver)
 	}
 	stageCreates, finalCreates := stageDriver.createCalls, transferDriver.createCalls
-	result, err = manager.UpgradeGatewayV2(context.Background(), request)
+	result, err = manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err != nil || result.Outcome != GatewayV2UpgradeCommitted || sourceDriver.calls != 1 || sourceDriver.selectCalls != 1 ||
 		stageDriver.createCalls != stageCreates || transferDriver.createCalls != finalCreates {
 		t.Fatalf("committed replay: result=%+v err=%v source=%d stageCreates=%d finalCreates=%d", result, err, sourceDriver.calls, stageDriver.createCalls, transferDriver.createCalls)
@@ -51,12 +53,12 @@ func TestUpgradeGatewayV2RejectsEveryMismatchedResumeBinding(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			manager, _, request, _, stageDriver, transferDriver, _ := gatewayV2CoordinatorTestFixture(t)
-			if result, err := manager.UpgradeGatewayV2(context.Background(), request); err != nil || result.Outcome != GatewayV2UpgradeCommitted {
+			if result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade); err != nil || result.Outcome != GatewayV2UpgradeCommitted {
 				t.Fatalf("initial upgrade: result=%+v err=%v", result, err)
 			}
 			stageCreates, finalCreates := stageDriver.createCalls, transferDriver.createCalls
 			test.mutate(&request)
-			result, err := manager.UpgradeGatewayV2(context.Background(), request)
+			result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 			if err == nil || result.Outcome != GatewayV2UpgradeUnresolved || stageDriver.createCalls != stageCreates || transferDriver.createCalls != finalCreates {
 				t.Fatalf("mismatched resume: result=%+v err=%v stageCreates=%d finalCreates=%d", result, err, stageDriver.createCalls, transferDriver.createCalls)
 			}
@@ -68,7 +70,7 @@ func TestUpgradeGatewayV2FailedNetworkSelectionDurablyAbortsWithoutInventingPlan
 	manager, store, request, sourceDriver, stageDriver, transferDriver, _ := gatewayV2CoordinatorTestFixture(t)
 	sourceDriver.selectErr = errors.New("injected incomplete Docker inventory")
 
-	result, err := manager.UpgradeGatewayV2(context.Background(), request)
+	result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err == nil || result.Outcome != GatewayV2UpgradeRolledBack {
 		t.Fatalf("selection failure result=%+v err=%v", result, err)
 	}
@@ -89,7 +91,7 @@ func TestUpgradeGatewayV2FailedNetworkSelectionDurablyAbortsWithoutInventingPlan
 
 func TestUpgradeGatewayV2ReplayReusesJournalBoundNetworkWithoutReselection(t *testing.T) {
 	manager, store, request, sourceDriver, _, _, _ := gatewayV2CoordinatorTestFixture(t)
-	if result, err := manager.UpgradeGatewayV2(context.Background(), request); err != nil || result.Outcome != GatewayV2UpgradeCommitted {
+	if result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade); err != nil || result.Outcome != GatewayV2UpgradeCommitted {
 		t.Fatalf("initial upgrade: result=%+v err=%v", result, err)
 	}
 	state, _, err := store.loadBoundUpgrade(request.OperationID)
@@ -98,7 +100,7 @@ func TestUpgradeGatewayV2ReplayReusesJournalBoundNetworkWithoutReselection(t *te
 	}
 	sourceDriver.plan = gatewayV2NetworkPlan{Subnet: "10.241.0.0/28", GatewayIPv4: "10.241.0.1", ContainerIPv4: "10.241.0.2"}
 	sourceDriver.selectErr = errors.New("planner must not run during replay")
-	if result, err := manager.UpgradeGatewayV2(context.Background(), request); err != nil || result.Outcome != GatewayV2UpgradeCommitted {
+	if result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade); err != nil || result.Outcome != GatewayV2UpgradeCommitted {
 		t.Fatalf("replay result=%+v err=%v", result, err)
 	}
 	if sourceDriver.selectCalls != 1 {
@@ -138,7 +140,7 @@ func TestUpgradeGatewayV2ResumesExistingStagedGenerationAfterRestart(t *testing.
 		t.Fatalf("staged restart fixture: journal=%+v err=%v", staged, err)
 	}
 
-	result, err := manager.UpgradeGatewayV2(context.Background(), request)
+	result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err != nil || result.Outcome != GatewayV2UpgradeCommitted || sourceDriver.selectCalls != 0 || sourceDriver.calls != 0 || !transferDriver.finalRunning {
 		t.Fatalf("staged restart resume: result=%+v err=%v source=%+v transfer=%+v", result, err, sourceDriver, transferDriver)
 	}
@@ -148,7 +150,7 @@ func TestUpgradeGatewayV2NeverReplacesRolledBackOperation(t *testing.T) {
 	manager, store, request, sourceDriver, stageDriver, transferDriver, _ := gatewayV2CoordinatorTestFixture(t)
 	stageDriver.failAt = "selected_preflight"
 
-	result, err := manager.UpgradeGatewayV2(context.Background(), request)
+	result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err == nil || result.Outcome != GatewayV2UpgradeRolledBack {
 		t.Fatalf("rolled-back result = %+v, err=%v", result, err)
 	}
@@ -165,7 +167,7 @@ func TestUpgradeGatewayV2NeverReplacesRolledBackOperation(t *testing.T) {
 	}
 	stageDriver.failAt = ""
 	creates, sourceCalls := stageDriver.createCalls, sourceDriver.calls
-	result, err = manager.UpgradeGatewayV2(context.Background(), request)
+	result, err = manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err == nil || result.Outcome != GatewayV2UpgradeRolledBack || stageDriver.createCalls != creates || sourceDriver.calls != sourceCalls {
 		t.Fatalf("rolled-back replay: result=%+v err=%v creates=%d sourceCalls=%d", result, err, stageDriver.createCalls, sourceDriver.calls)
 	}
@@ -176,7 +178,7 @@ func TestUpgradeGatewayV2ReportsDriftedRolledBackTopologyAsUnresolved(t *testing
 	sourceDriver.rollbackTopology = gatewayTopologyUnknownOrDrift
 	stageDriver.failAt = "selected_preflight"
 
-	result, err := manager.UpgradeGatewayV2(context.Background(), request)
+	result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err == nil || result.Outcome != GatewayV2UpgradeUnresolved {
 		t.Fatalf("drifted rollback result = %+v, err=%v", result, err)
 	}
@@ -184,12 +186,12 @@ func TestUpgradeGatewayV2ReportsDriftedRolledBackTopologyAsUnresolved(t *testing
 	if loadErr != nil || journal.Phase != gatewayPhaseRolledBack || transferDriver.createCalls != 0 {
 		t.Fatalf("drifted rollback journal=%+v loadErr=%v transferCreates=%d", journal, loadErr, transferDriver.createCalls)
 	}
-	result, err = manager.UpgradeGatewayV2(context.Background(), request)
+	result, err = manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err == nil || result.Outcome != GatewayV2UpgradeUnresolved {
 		t.Fatalf("drifted rollback replay = %+v, err=%v", result, err)
 	}
 	sourceDriver.rollbackTopology = gatewayTopologyExactV1Only
-	result, err = manager.UpgradeGatewayV2(context.Background(), request)
+	result, err = manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err == nil || result.Outcome != GatewayV2UpgradeRolledBack {
 		t.Fatalf("reattested rollback replay = %+v, err=%v", result, err)
 	}
@@ -197,12 +199,12 @@ func TestUpgradeGatewayV2ReportsDriftedRolledBackTopologyAsUnresolved(t *testing
 
 func TestUpgradeGatewayV2RejectsChangedManagerHostPortOnResume(t *testing.T) {
 	manager, _, request, _, stageDriver, transferDriver, _ := gatewayV2CoordinatorTestFixture(t)
-	if result, err := manager.UpgradeGatewayV2(context.Background(), request); err != nil || result.Outcome != GatewayV2UpgradeCommitted {
+	if result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade); err != nil || result.Outcome != GatewayV2UpgradeCommitted {
 		t.Fatalf("initial upgrade: result=%+v err=%v", result, err)
 	}
 	stageCreates, finalCreates := stageDriver.createCalls, transferDriver.createCalls
 	manager.options.HostPort++
-	result, err := manager.UpgradeGatewayV2(context.Background(), request)
+	result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err == nil || result.Outcome != GatewayV2UpgradeUnresolved || stageDriver.createCalls != stageCreates || transferDriver.createCalls != finalCreates {
 		t.Fatalf("changed host port replay: result=%+v err=%v stageCreates=%d finalCreates=%d", result, err, stageDriver.createCalls, transferDriver.createCalls)
 	}
@@ -212,7 +214,7 @@ func TestUpgradeGatewayV2MarksUnknownStageTopologyUnresolved(t *testing.T) {
 	manager, store, request, _, stageDriver, transferDriver, _ := gatewayV2CoordinatorTestFixture(t)
 	stageDriver.identityDrift = true
 
-	result, err := manager.UpgradeGatewayV2(context.Background(), request)
+	result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if !IsCode(err, DiagnosticRouteUnresolved) || result.Outcome != GatewayV2UpgradeUnresolved {
 		t.Fatalf("unknown topology result = %+v, err=%v", result, err)
 	}
@@ -245,7 +247,7 @@ func TestUpgradeGatewayV2ResolvesProtectedPreparationFailureAtDurableBoundary(t 
 			}
 			t.Cleanup(restore)
 
-			result, err := manager.UpgradeGatewayV2(context.Background(), request)
+			result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 			wantOutcome := GatewayV2UpgradeRolledBack
 			if purpose == gatewayMigrationPurpose {
 				wantOutcome = GatewayV2UpgradeUnresolved
@@ -273,7 +275,7 @@ func TestUpgradeGatewayV2ResolvesProtectedPreparationFailureAtDurableBoundary(t 
 				}
 			}
 			restore()
-			result, err = manager.UpgradeGatewayV2(context.Background(), request)
+			result, err = manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 			if purpose == v2RouteStatePurpose {
 				if err == nil || result.Outcome != GatewayV2UpgradeRolledBack || sourceDriver.abortCalls != 2 {
 					t.Fatalf("state-only abort replay result=%+v err=%v driver=%+v", result, err, sourceDriver)
@@ -290,7 +292,7 @@ func TestUpgradeGatewayV2RequiresFreshSuccessAfterFinalAttestationFailure(t *tes
 	wrapper := &gatewayV2CoordinatorFinalProofDriver{fakeGatewayV2TransferDriver: transferDriver, failAt: 4}
 	manager.gatewayV2TransferDriver = wrapper
 
-	result, err := manager.UpgradeGatewayV2(context.Background(), request)
+	result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err == nil || result.Outcome != GatewayV2UpgradeUnresolved {
 		t.Fatalf("final proof failure result = %+v, err=%v", result, err)
 	}
@@ -298,7 +300,7 @@ func TestUpgradeGatewayV2RequiresFreshSuccessAfterFinalAttestationFailure(t *tes
 	if loadErr != nil || journal.Phase != gatewayPhaseCommitted {
 		t.Fatalf("post-proof journal = %+v, err=%v", journal, loadErr)
 	}
-	result, err = manager.UpgradeGatewayV2(context.Background(), request)
+	result, err = manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err != nil || result.Outcome != GatewayV2UpgradeCommitted {
 		t.Fatalf("final proof retry result = %+v, err=%v", result, err)
 	}
@@ -317,7 +319,7 @@ func TestUpgradeGatewayV2DoesNotReportCommittedWhenGatewayLockReleaseFails(t *te
 		}, nil
 	}
 
-	result, err := manager.UpgradeGatewayV2(context.Background(), request)
+	result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if !IsCode(err, DiagnosticRouteUnresolved) || result.Outcome != GatewayV2UpgradeUnresolved || *osLockHeld {
 		t.Fatalf("release failure result = %+v, err=%v lockHeld=%t", result, err, *osLockHeld)
 	}
@@ -330,7 +332,7 @@ func TestUpgradeGatewayV2DoesNotReportCommittedWhenGatewayLockReleaseFails(t *te
 func TestUpgradeGatewayV2DoesNotReportRolledBackWhenGatewayLockReleaseFails(t *testing.T) {
 	manager, store, request, _, stageDriver, _, osLockHeld := gatewayV2CoordinatorTestFixture(t)
 	stageDriver.failAt = "selected_preflight"
-	result, err := manager.UpgradeGatewayV2(context.Background(), request)
+	result, err := manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if err == nil || result.Outcome != GatewayV2UpgradeRolledBack {
 		t.Fatalf("initial rollback result=%+v error=%v", result, err)
 	}
@@ -344,7 +346,7 @@ func TestUpgradeGatewayV2DoesNotReportRolledBackWhenGatewayLockReleaseFails(t *t
 			return errors.New("injected gateway lock release failure")
 		}, nil
 	}
-	result, err = manager.UpgradeGatewayV2(context.Background(), request)
+	result, err = manager.UpgradeGatewayV2(context.Background(), request, allowGatewayV2Upgrade)
 	if !IsCode(err, DiagnosticRouteUnresolved) || result.Outcome != GatewayV2UpgradeUnresolved || *osLockHeld {
 		t.Fatalf("rollback release failure result=%+v error=%v lockHeld=%t", result, err, *osLockHeld)
 	}

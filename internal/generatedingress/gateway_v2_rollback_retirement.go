@@ -59,6 +59,12 @@ func (m *Manager) FinalizeGatewayV2Rollback(ctx context.Context, operationID str
 func (m *Manager) finalizeGatewayV2RollbackLocked(ctx context.Context, store *gatewayUpgradeStateStore,
 	state gatewayV2RouteState, journal gatewayMigrationJournal,
 ) error {
+	return m.finalizeGatewayV2RollbackAuthorizedLocked(ctx, store, state, journal, nil)
+}
+
+func (m *Manager) finalizeGatewayV2RollbackAuthorizedLocked(ctx context.Context, store *gatewayUpgradeStateStore,
+	state gatewayV2RouteState, journal gatewayMigrationJournal, mutationGate *gatewayV2MutationAuthorizationGate,
+) error {
 	if m == nil || ctx == nil || store == nil || journal.Phase != gatewayPhaseRolledBack ||
 		state.OperationID != journal.OperationID || !historicallyBoundGatewayUpgrade(state, journal) {
 		return gatewayV2RollbackRetirementError(ctx)
@@ -124,6 +130,11 @@ func (m *Manager) finalizeGatewayV2RollbackLocked(ctx context.Context, store *ga
 		}
 
 		var mutationErr error
+		if mutationGate != nil {
+			if err := mutationGate.beforeMutation(retireCtx); err != nil {
+				return err
+			}
+		}
 		switch {
 		case observation.IngressNetworkPresent:
 			mutationErr = driver.removeRollbackIngressNetwork(retireCtx, state, journal)

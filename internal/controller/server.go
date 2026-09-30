@@ -61,6 +61,8 @@ type Server struct {
 	RelayManagement       RelayManagementService
 	AutoDeploy            AutoDeployService
 	GatewayProfiles       GatewayProfileService
+	GatewayUpgrades       GatewayUpgradeService
+	GatewayUpgradeRuntime GatewayUpgradeRuntime
 	GatewayCandidates     func() ([]hostnetwork.Candidate, error)
 	AutoDeployAvailable   bool
 	RelayReconcile        func()
@@ -131,6 +133,8 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("doctor", s.require(s.doctor)),
 		contractRoute(operationGetLANGatewayProfile, noStore(s.requireOperation(operationGetLANGatewayProfile, s.getLANGatewayProfile))),
 		contractRoute(operationConfigureLANGatewayProfile, noStore(s.requireOperation(operationConfigureLANGatewayProfile, s.configureLANGatewayProfile))),
+		contractRoute(operationGetLANGatewayUpgrade, noStore(s.requireOperation(operationGetLANGatewayUpgrade, s.getLANGatewayUpgrade))),
+		contractRoute(operationUpgradeLANGateway, noStore(s.requireOperation(operationUpgradeLANGateway, s.upgradeLANGateway))),
 		contractRoute("listApplications", s.require(s.listApps)),
 		contractRoute("createApplication", s.require(s.createApp)),
 		contractRoute("inspectImport", noStore(s.require(s.inspectApp))),
