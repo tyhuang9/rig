@@ -2,10 +2,8 @@ package generatedingress
 
 import (
 	"context"
-	"errors"
 	"net"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strconv"
 	"time"
@@ -26,50 +24,11 @@ const (
 // A partial, corrupt, or non-committed pair is an unresolved migration and can
 // never fall through to legacy Docker mutation.
 func (m *Manager) committedV2Locked() (*gatewayUpgradeStateStore, gatewayV2RouteState, gatewayMigrationJournal, bool, error) {
-	if m == nil || m.store == nil {
-		return nil, gatewayV2RouteState{}, gatewayMigrationJournal{}, false, &Error{Code: DiagnosticRouteUnresolved}
-	}
-	before, err := m.store.directoryIdentity()
+	history, err := m.scanGatewayUpgradeHistoryLocked()
 	if err != nil {
 		return nil, gatewayV2RouteState{}, gatewayMigrationJournal{}, false, &Error{Code: DiagnosticRouteUnresolved}
 	}
-	present := make([]bool, 2)
-	for index, name := range []string{v2RouteStateFilename, gatewayMigrationFilename} {
-		path := filepath.Join(m.store.root, name)
-		info, statErr := os.Lstat(path)
-		switch {
-		case statErr == nil:
-			present[index] = true
-			if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(path) {
-				return nil, gatewayV2RouteState{}, gatewayMigrationJournal{}, false, &Error{Code: DiagnosticRouteUnresolved}
-			}
-		case errors.Is(statErr, os.ErrNotExist):
-		default:
-			return nil, gatewayV2RouteState{}, gatewayMigrationJournal{}, false, &Error{Code: DiagnosticRouteUnresolved}
-		}
-	}
-	if m.store.sameDirectory(before) != nil {
-		return nil, gatewayV2RouteState{}, gatewayMigrationJournal{}, false, &Error{Code: DiagnosticRouteUnresolved}
-	}
-	if !present[0] && !present[1] {
-		return nil, gatewayV2RouteState{}, gatewayMigrationJournal{}, false, nil
-	}
-	if !present[0] || !present[1] {
-		return nil, gatewayV2RouteState{}, gatewayMigrationJournal{}, false, &Error{Code: DiagnosticRouteUnresolved}
-	}
-	store, err := newGatewayUpgradeStateStore(m.options.DataRoot)
-	if err != nil {
-		return nil, gatewayV2RouteState{}, gatewayMigrationJournal{}, false, &Error{Code: DiagnosticRouteUnresolved}
-	}
-	journal, err := store.loadMigrationJournal()
-	if err != nil || journal.Phase != gatewayPhaseCommitted {
-		return nil, gatewayV2RouteState{}, gatewayMigrationJournal{}, false, &Error{Code: DiagnosticRouteUnresolved}
-	}
-	state, boundJournal, err := store.loadBoundUpgrade(journal.OperationID)
-	if err != nil || !reflect.DeepEqual(journal, boundJournal) {
-		return nil, gatewayV2RouteState{}, gatewayMigrationJournal{}, false, &Error{Code: DiagnosticRouteUnresolved}
-	}
-	return store, state, journal, true, nil
+	return history.store, history.state, history.journal, history.committed, nil
 }
 
 func (m *Manager) observeV2Topology(ctx context.Context, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal) gatewayObservedTopology {
