@@ -193,14 +193,29 @@ func (m *Manager) proveGatewayV2StartupPending(ctx context.Context, source route
 	selection gatewayUpgradeGenerationSelection,
 ) bool {
 	if selection.Store == nil || !selection.Existing || selection.Aborted ||
-		selection.Journal.Phase != gatewayPhaseCommitted || selection.State.Pending == nil ||
-		selection.State.Pending.Kind != gatewayV2PendingLANGrant {
+		selection.Journal.Phase != gatewayPhaseCommitted || selection.State.Pending == nil {
 		return false
 	}
-	committed := cloneGatewayV2RouteState(selection.State)
-	committed.Pending = nil
-	proposed := cloneGatewayV2RouteState(committed)
-	proposed.Apps[selection.State.Pending.AppID] = cloneGatewayV2AppRoute(selection.State.Pending.Proposed)
+	var committed, proposed gatewayV2RouteState
+	switch selection.State.Pending.Kind {
+	case gatewayV2PendingLANGrant:
+		committed = cloneGatewayV2RouteState(selection.State)
+		committed.Pending = nil
+		proposed = cloneGatewayV2RouteState(committed)
+		proposed.Apps[selection.State.Pending.AppID] = cloneGatewayV2AppRoute(selection.State.Pending.Proposed)
+	case gatewayV2PendingLANWithdrawal:
+		request, err := gatewayV2LANPendingRequest(*selection.State.Pending)
+		if err != nil {
+			return false
+		}
+		var pending bool
+		committed, proposed, pending, err = gatewayV2LANGrantStatesForRequest(selection.State, request)
+		if err != nil || !pending {
+			return false
+		}
+	default:
+		return false
+	}
 	switch m.observeCommittedV2PendingTopology(ctx, source, committed, proposed, selection.Journal) {
 	case gatewayV2PendingCommittedExact, gatewayV2PendingProposedExact, gatewayV2PendingReloadOnlyMixed:
 		return true

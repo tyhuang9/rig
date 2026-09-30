@@ -3,6 +3,8 @@ package generatedingress
 import (
 	"context"
 	"errors"
+	"net/http"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -17,7 +19,7 @@ func TestGatewayV2LANGrantCommitsExactApprovedBindingAndReplays(t *testing.T) {
 
 	result, err := manager.grantGatewayV2LAN(context.Background(), request, authorize)
 	if err != nil || result.Receipt.Request != request || result.Receipt.GatewayOperationID != state.OperationID ||
-		!validSHA256(result.Receipt.ProtectedStateDigest) {
+		!validSHA256(result.Receipt.ProtectedStateDigest) || result.Receipt.ObservedAt.IsZero() {
 		t.Fatalf("grant result=%#v err=%v events=%v", result, err, driver.events)
 	}
 	if _, exposesURL := reflect.TypeOf(result).FieldByName("URL"); exposesURL {
@@ -42,7 +44,7 @@ func TestGatewayV2LANGrantCommitsExactApprovedBindingAndReplays(t *testing.T) {
 	}
 	wantEvents := []string{
 		"prove_committed", "selected_preflight", "selected_preflight", "preflight_candidate", "apply:lan-grant.json",
-		"prove_granted", "selected_preflight",
+		"prove_granted", "selected_preflight", "prove_granted", "selected_preflight",
 	}
 	if !reflect.DeepEqual(driver.live, installed) || !reflect.DeepEqual(driver.events, wantEvents) {
 		t.Fatalf("driver live=%#v events=%v", driver.live, driver.events)
@@ -51,7 +53,10 @@ func TestGatewayV2LANGrantCommitsExactApprovedBindingAndReplays(t *testing.T) {
 	driver.events = nil
 	driver.selectedPreflightCalls = 0
 	replay, err := manager.grantGatewayV2LAN(context.Background(), request, authorize)
-	if err != nil || replay != result || len(*leases) != 2 || (*leases)[1].revalidateCalls != 1 ||
+	if err != nil || replay.Receipt.Request != result.Receipt.Request ||
+		replay.Receipt.GatewayOperationID != result.Receipt.GatewayOperationID ||
+		replay.Receipt.ProtectedStateDigest != result.Receipt.ProtectedStateDigest || replay.Receipt.ObservedAt.IsZero() ||
+		len(*leases) != 2 || (*leases)[1].revalidateCalls != 1 ||
 		(*leases)[1].activateCalls != 1 || (*leases)[1].releaseCalls != 1 ||
 		!reflect.DeepEqual(driver.events, []string{"selected_preflight", "prove_granted", "selected_preflight"}) {
 		t.Fatalf("replay=%#v err=%v leases=%#v events=%v", replay, err, *leases, driver.events)
@@ -72,7 +77,7 @@ func TestGatewayV2LANGrantReattestsCandidateImmediatelyBeforeReload(t *testing.T
 		(*leases)[0].activateCalls != 0 || (*leases)[0].releaseCalls != 1 {
 		t.Fatalf("result=%#v err=%v leases=%#v", result, err, *leases)
 	}
-	assertGatewayV2LANGrantUnchanged(t, store, journal, before, driver,
+	assertGatewayV2LANGrantPending(t, store, journal, before, request, driver,
 		[]string{"prove_committed", "selected_preflight", "selected_preflight", "preflight_candidate"})
 }
 
@@ -103,50 +108,53 @@ func TestGatewayV2LANGrantAuthorizationLeaseFencesProtectedAndDockerMutation(t *
 				(*leases)[0].releaseCalls != 1 || (*leases)[0].activateCalls != 0 {
 				t.Fatalf("result=%#v err=%v leases=%#v", result, err, *leases)
 			}
-			assertGatewayV2LANGrantUnchanged(t, store, journal, before, driver,
-				[]string{"prove_committed", "selected_preflight"})
+			if denyAt == 1 {
+				assertGatewayV2LANGrantUnchanged(t, store, journal, before, driver,
+					[]string{"prove_committed", "selected_preflight"})
+			} else {
+				assertGatewayV2LANGrantPending(t, store, journal, before, request, driver,
+					[]string{"prove_committed", "selected_preflight"})
+			}
 		})
 	}
 }
 
-func TestGatewayV2LANGrantLeaseExcludesConcurrentDisableUntilActivation(t *testing.T) {
-	manager, _, _, _, request, _ := gatewayV2LANGrantFixture(t)
-	var databaseFence sync.Mutex
-	leaseAcquired := make(chan struct{})
-	disableCommitted := make(chan struct{})
+func TestGatewayV2LANGrantLeaseUsesShortTransactionsAcrossDocker(t *testing.T) {
+	manager, _, _, _, request, driver := gatewayV2LANGrantFixture(t)
+	var databaseWrite sync.Mutex
+	dockerObservedUnlockedDB := false
+	driver.applyHook = func() {
+		if !databaseWrite.TryLock() {
+			t.Fatal("grant retained a database write lock across Docker mutation")
+		}
+		dockerObservedUnlockedDB = true
+		databaseWrite.Unlock()
+	}
 	authorize := func(_ context.Context, got gatewayV2LANGrantRequest) (gatewayV2LANGrantAuthorizationLease, error) {
 		if got != request {
 			t.Fatalf("authorization request=%#v want=%#v", got, request)
 		}
-		databaseFence.Lock()
-		lease := &fakeGatewayV2LANGrantLease{
-			t: t, manager: manager, request: request, fence: &databaseFence, fenceHeld: true,
+		databaseWrite.Lock()
+		databaseWrite.Unlock()
+		return &fakeGatewayV2LANGrantLease{
+			t: t, manager: manager, request: request,
 			activateHook: func() {
-				select {
-				case <-disableCommitted:
-					t.Fatal("disable committed before exact allocation activation")
-				default:
-				}
+				databaseWrite.Lock()
+				databaseWrite.Unlock()
 			},
-		}
-		close(leaseAcquired)
-		return lease, nil
+		}, nil
 	}
-	go func() {
-		<-leaseAcquired
-		databaseFence.Lock()
-		close(disableCommitted)
-		databaseFence.Unlock()
-	}()
 
 	if _, err := manager.grantGatewayV2LAN(context.Background(), request, authorize); err != nil {
 		t.Fatal(err)
 	}
-	<-disableCommitted
+	if !dockerObservedUnlockedDB {
+		t.Fatal("Docker mutation did not test the released database lock")
+	}
 }
 
 func TestGatewayV2LANGrantRejectsSelectedInterfaceDriftAtEveryBoundary(t *testing.T) {
-	for _, failAt := range []int{1, 2, 3} {
+	for _, failAt := range []int{1, 2, 3, 4} {
 		t.Run(string(rune('0'+failAt)), func(t *testing.T) {
 			manager, store, before, journal, request, driver := gatewayV2LANGrantFixture(t)
 			driver.failSelectedPreflightAt = failAt
@@ -158,12 +166,23 @@ func TestGatewayV2LANGrantRejectsSelectedInterfaceDriftAtEveryBoundary(t *testin
 			if failAt == 1 && len(*leases) != 0 {
 				t.Fatalf("authorization ran after initial interface drift: %#v", *leases)
 			}
-			if failAt > 1 && (len(*leases) != 1 || (*leases)[0].activateCalls != 0 || (*leases)[0].releaseCalls != 1) {
+			if failAt > 1 && failAt < 4 && (len(*leases) != 1 || (*leases)[0].activateCalls != 0 || (*leases)[0].releaseCalls != 1) {
 				t.Fatalf("lease=%#v", *leases)
 			}
-			after, _, loadErr := store.loadBoundUpgrade(journal.OperationID)
-			if loadErr != nil || !reflect.DeepEqual(after, before) || !reflect.DeepEqual(driver.live, before) {
-				t.Fatalf("state=%#v live=%#v loadErr=%v", after, driver.live, loadErr)
+			if failAt == 4 && (len(*leases) != 1 || (*leases)[0].activateCalls != 1 ||
+				!(*leases)[0].active || (*leases)[0].releaseCalls != 1) {
+				t.Fatalf("post-commit lease=%#v", *leases)
+			}
+			if failAt == 1 {
+				assertGatewayV2LANGrantUnchanged(t, store, journal, before, driver, driver.events)
+			} else if failAt < 4 {
+				assertGatewayV2LANGrantPending(t, store, journal, before, request, driver, driver.events)
+			} else {
+				after, _, loadErr := store.loadBoundUpgrade(journal.OperationID)
+				if loadErr != nil || after.Pending == nil || after.Pending.Kind != gatewayV2PendingLANWithdrawal ||
+					driver.live.Apps[request.AppID].LAN != nil {
+					t.Fatalf("post-commit state=%#v live=%#v err=%v", after, driver.live, loadErr)
+				}
 			}
 			if failAt == 3 && (!containsString(driver.events, "apply:lan-grant-rollback.json") ||
 				!containsString(driver.events, "prove_rolled_back")) {
@@ -194,6 +213,64 @@ func TestGatewayV2LANGrantRejectsSelectedInterfaceDriftAtEveryBoundary(t *testin
 	})
 }
 
+func TestGatewayV2LANGrantFinalProofFailureWithdrawsServingRoute(t *testing.T) {
+	manager, store, _, journal, request, driver := gatewayV2LANGrantFixture(t)
+	driver.failGrantProofAt = 2
+	authorize, leases := allowGatewayV2LANGrant(t, manager, request, nil)
+	result, err := manager.GrantGatewayV2LAN(context.Background(), request, authorize)
+	if !IsCode(err, DiagnosticRouteUnresolved) || result != (GatewayV2LANGrantResult{}) ||
+		len(*leases) != 1 || !(*leases)[0].active {
+		t.Fatalf("result=%#v err=%v leases=%#v", result, err, *leases)
+	}
+	retained, _, loadErr := store.loadBoundUpgrade(journal.OperationID)
+	if loadErr != nil || retained.Pending == nil || retained.Pending.Kind != gatewayV2PendingLANWithdrawal ||
+		driver.live.Apps[request.AppID].LAN != nil || driver.gatewayStopped {
+		t.Fatalf("retained=%#v live=%#v stopped=%t err=%v", retained, driver.live, driver.gatewayStopped, loadErr)
+	}
+}
+
+func TestGatewayV2LANCommitResolutionFailedInitialProofWithdrawsOrStops(t *testing.T) {
+	for _, stopFallback := range []bool{false, true} {
+		t.Run(map[bool]string{false: "withdraw", true: "stop fallback"}[stopFallback], func(t *testing.T) {
+			manager, store, _, journal, request, driver := gatewayV2LANGrantFixture(t)
+			authorize, _ := allowGatewayV2LANGrant(t, manager, request, nil)
+			if _, err := manager.GrantGatewayV2LAN(context.Background(), request, authorize); err != nil {
+				t.Fatal(err)
+			}
+			driver.failGrantProof = true
+			driver.failRollbackProof = stopFallback
+			callback := false
+			err := manager.WithGatewayV2LANCommitResolution(context.Background(), request,
+				func(context.Context, GatewayV2LANGrantReceipt) error { callback = true; return nil })
+			if !IsCode(err, DiagnosticRouteUnresolved) || callback {
+				t.Fatalf("err=%v callback=%t", err, callback)
+			}
+			retained, _, loadErr := store.loadBoundUpgrade(journal.OperationID)
+			if loadErr != nil || retained.Pending == nil || retained.Pending.Kind != gatewayV2PendingLANWithdrawal ||
+				driver.live.Apps[request.AppID].LAN != nil || driver.gatewayStopped != stopFallback {
+				t.Fatalf("retained=%#v live=%#v stopped=%t err=%v", retained, driver.live, driver.gatewayStopped, loadErr)
+			}
+		})
+	}
+}
+
+func TestGatewayV2LANCommitResolutionStopsOwnedGatewayWhenProtectedRouteUnreadable(t *testing.T) {
+	manager, store, _, _, request, driver := gatewayV2LANGrantFixture(t)
+	authorize, _ := allowGatewayV2LANGrant(t, manager, request, nil)
+	if _, err := manager.GrantGatewayV2LAN(context.Background(), request, authorize); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(store.v2Path); err != nil {
+		t.Fatal(err)
+	}
+	callback := false
+	err := manager.WithGatewayV2LANCommitResolution(context.Background(), request,
+		func(context.Context, GatewayV2LANGrantReceipt) error { callback = true; return nil })
+	if !IsCode(err, DiagnosticRouteUnresolved) || callback || !driver.gatewayStopped {
+		t.Fatalf("err=%v callback=%t stopped=%t", err, callback, driver.gatewayStopped)
+	}
+}
+
 func TestGatewayV2LANGrantRollsBackAndProvesIsolationOnFaults(t *testing.T) {
 	tests := []struct {
 		name              string
@@ -201,12 +278,11 @@ func TestGatewayV2LANGrantRollsBackAndProvesIsolationOnFaults(t *testing.T) {
 		mutateBeforeError bool
 		failGrantProof    bool
 		failRollbackProof bool
-		wantPending       bool
 	}{
 		{name: "reload failed before mutation", failApply: 1},
 		{name: "reload failed after mutation", failApply: 1, mutateBeforeError: true},
 		{name: "grant proof failed", failGrantProof: true},
-		{name: "rollback proof uncertain retains pending", failGrantProof: true, failRollbackProof: true, wantPending: true},
+		{name: "rollback proof uncertain retains pending", failGrantProof: true, failRollbackProof: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -221,17 +297,7 @@ func TestGatewayV2LANGrantRollsBackAndProvesIsolationOnFaults(t *testing.T) {
 				(*leases)[0].activateCalls != 0 || (*leases)[0].releaseCalls != 1 {
 				t.Fatalf("result=%#v err=%v leases=%#v", result, err, *leases)
 			}
-			after, _, loadErr := store.loadBoundUpgrade(journal.OperationID)
-			if loadErr != nil {
-				t.Fatal(loadErr)
-			}
-			if test.wantPending {
-				if after.Pending == nil || after.Pending.Kind != gatewayV2PendingLANGrant {
-					t.Fatalf("uncertain rollback did not retain pending grant: %#v", after.Pending)
-				}
-			} else if !reflect.DeepEqual(after, before) || !reflect.DeepEqual(driver.live, before) {
-				t.Fatalf("rollback state=%#v live=%#v want=%#v", after, driver.live, before)
-			}
+			assertGatewayV2LANGrantPending(t, store, journal, before, request, driver, driver.events)
 			if !containsString(driver.events, "apply:lan-grant-rollback.json") ||
 				!containsString(driver.events, "prove_rolled_back") {
 				t.Fatalf("rollback did not apply and prove isolation: %v", driver.events)
@@ -253,17 +319,21 @@ func TestGatewayV2LANGrantDurabilityOrReleaseUncertaintyReturnsNoReceipt(t *test
 			return originalWrite(path, purpose, body)
 		}
 		t.Cleanup(func() { upgradeProtectedWrite = originalWrite })
-		authorize, leases := allowGatewayV2LANGrant(t, manager, request, nil)
+		requestCtx, cancelRequest := context.WithCancel(context.Background())
+		defer cancelRequest()
+		authorize, leases := allowGatewayV2LANGrant(t, manager, request, func(lease *fakeGatewayV2LANGrantLease) {
+			lease.activateHook = cancelRequest
+		})
 
-		result, err := manager.grantGatewayV2LAN(context.Background(), request, authorize)
-		if !IsCode(err, DiagnosticRouteUnresolved) || result != (gatewayV2LANGrantResult{}) || len(*leases) != 1 ||
+		result, err := manager.grantGatewayV2LAN(requestCtx, request, authorize)
+		if !IsCode(err, DiagnosticCancelled) || result != (gatewayV2LANGrantResult{}) || len(*leases) != 1 ||
 			!(*leases)[0].active || (*leases)[0].releaseCalls != 1 {
 			t.Fatalf("result=%#v err=%v lease=%#v", result, err, *leases)
 		}
 		retained, _, loadErr := store.loadBoundUpgrade(journal.OperationID)
 		if loadErr != nil || retained.Pending == nil || retained.Pending.Kind != gatewayV2PendingLANGrant ||
 			!retained.Pending.ActivationUncertain ||
-			driver.live.Apps[request.AppID].LAN == nil {
+			driver.live.Apps[request.AppID].LAN != nil || driver.gatewayStopped {
 			t.Fatalf("retained=%#v live=%#v loadErr=%v", retained, driver.live, loadErr)
 		}
 	})
@@ -621,6 +691,400 @@ func TestGatewayV2LANPublicationProofBindsRevisionAppHostPortAndRollback404(t *t
 	}
 }
 
+func TestGatewayV2LANCommittedPublicationProofCoversEveryApp(t *testing.T) {
+	_, _, state, _, first, _ := gatewayV2LANGrantFixture(t)
+	second := gatewayV2LANSecondAppRequest(t, first)
+	firstBinding, _ := gatewayV2LANBindingForRequest(first)
+	secondBinding, _ := gatewayV2LANBindingForRequest(second)
+	firstApp := state.Apps[first.AppID]
+	firstApp.LAN = &firstBinding
+	state.Apps[first.AppID] = firstApp
+	secondApp := state.Apps[second.AppID]
+	secondApp.LAN = &secondBinding
+	state.Apps[second.AppID] = secondApp
+	base, err := gatewayV2HostChallenge(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := map[uint16]gatewayV2LANGrantRequest{first.Port: first, second.Port: second}
+	challenges := make(map[uint16]string, len(requests))
+	for port, request := range requests {
+		challenges[port] = gatewayV2LANAppChallenge(base, port, caddyV2LANAssignment{
+			AppID: request.AppID, AllocationID: request.AllocationID,
+			AccessRevisionID: request.AccessRevisionID, AccessRevisionNumber: request.AccessRevisionNumber,
+			AccessSpecDigest: request.AccessSpecDigest,
+		})
+	}
+	wrongHostFailurePort := uint16(0)
+	probe := func(_ context.Context, address string, port uint16, host, path string) gatewayV2HostProbeResult {
+		if address == "127.0.0.1" || address != state.Profile.SelectedIPv4 {
+			return gatewayV2HostProbeResult{}
+		}
+		if host == "wrong.invalid" {
+			status := http.StatusNotFound
+			if port == wrongHostFailurePort {
+				status = http.StatusOK
+			}
+			return gatewayV2HostProbeResult{Status: status, Connected: true, Responded: true}
+		}
+		challenge := challenges[port]
+		if host == state.Profile.SelectedIPv4 && path == gatewayV2ChallengePathPrefix+challenge {
+			return gatewayV2HostProbeResult{
+				Status: http.StatusNotFound, Body: gatewayV2ChallengeBodyPrefix + challenge,
+				Connected: true, Responded: true,
+			}
+		}
+		return gatewayV2HostProbeResult{Status: http.StatusNoContent, Connected: true, Responded: true}
+	}
+	caddyID := strings.Repeat("e", 64)
+	containerProbe := func(_ context.Context, gotID, address string, port uint16, host, challenge string) bool {
+		return gotID == caddyID && address == state.Network.ContainerIPv4 && host == state.Profile.SelectedIPv4 &&
+			challenges[port] == challenge
+	}
+	if !proveGatewayV2LANCommittedPublications(context.Background(), state, caddyID, probe, containerProbe) {
+		t.Fatal("exact publications for both apps were not proven")
+	}
+	wrongHostFailurePort = second.Port
+	if proveGatewayV2LANCommittedPublications(context.Background(), state, caddyID, probe, containerProbe) {
+		t.Fatal("first app proof masked second app wrong-Host exposure")
+	}
+}
+
+func TestGatewayV2LANObservationAndResolutionHoldGatewayLock(t *testing.T) {
+	manager, _, _, _, request, _ := gatewayV2LANGrantFixture(t)
+	authorize, _ := allowGatewayV2LANGrant(t, manager, request, nil)
+	grant, err := manager.GrantGatewayV2LAN(context.Background(), request, authorize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		run  func(context.Context, GatewayV2LANGrantRequest, func(context.Context, GatewayV2LANGrantObservation) error) error
+	}{
+		{name: "read only", run: manager.WithGatewayV2LANObservation},
+		{name: "terminal resolution", run: manager.WithGatewayV2LANResolution},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			err := test.run(context.Background(), request, func(_ context.Context, observation GatewayV2LANGrantObservation) error {
+				called = true
+				if manager.mu.TryLock() {
+					manager.mu.Unlock()
+					t.Fatal("observation callback ran without the gateway lock")
+				}
+				if observation.Request != request || observation.Disposition != GatewayV2LANGrantCommitted ||
+					observation.GatewayOperationID != grant.Receipt.GatewayOperationID ||
+					observation.ProtectedStateDigest != grant.Receipt.ProtectedStateDigest || observation.ObservedAt.IsZero() {
+					t.Fatalf("observation=%#v grant=%#v", observation, grant)
+				}
+				if _, exposesURL := reflect.TypeOf(observation).FieldByName("URL"); exposesURL {
+					t.Fatal("LAN observation exposed a URL")
+				}
+				return nil
+			})
+			if err != nil || !called {
+				t.Fatalf("called=%t err=%v", called, err)
+			}
+		})
+	}
+}
+
+func TestGatewayV2LANRecoveryWithdrawsUncertainGrantAndPreservesOtherApp(t *testing.T) {
+	manager, store, _, journal, request, driver := gatewayV2LANGrantFixture(t)
+	other := request
+	other.AttemptID = "15151515-1515-4515-8515-151515151515"
+	other.ClaimRequestDigest = strings.Repeat("2", 64)
+	other.AppID = upgradeTestAppB
+	other.AllocationID = "16161616-1616-4616-8616-161616161616"
+	other.OwnerOperationID = "17171717-1717-4717-8717-171717171717"
+	other.AccessRevisionID = "18181818-1818-4818-8818-181818181818"
+	other.AccessRevisionNumber = 4
+	other.ApprovedBy = "19191919-1919-4919-8919-191919191919"
+	other.Port = 8101
+	other.AccessSpecDigest = mustGatewayV2LANAccessDigest(t, other)
+	authorizeOther, _ := allowGatewayV2LANGrant(t, manager, other, nil)
+	if _, err := manager.GrantGatewayV2LAN(context.Background(), other, authorizeOther); err != nil {
+		t.Fatal(err)
+	}
+	committed, _, err := store.loadBoundUpgrade(journal.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := gatewayV2LANBindingForRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := cloneGatewayV2AppRoute(committed.Apps[request.AppID])
+	proposedApp := cloneGatewayV2AppRoute(previous)
+	proposedApp.LAN = &binding
+	pending := cloneGatewayV2RouteState(committed)
+	pending.Pending = &gatewayV2PendingRoute{
+		Kind: gatewayV2PendingLANGrant, AppID: request.AppID, Previous: &previous, Proposed: proposedApp,
+	}
+	if err := store.saveCommittedV2State(pending, journal); err != nil {
+		t.Fatal(err)
+	}
+	uncertain := cloneGatewayV2RouteState(pending)
+	uncertain.Pending.ActivationUncertain = true
+	if err := store.saveCommittedV2State(uncertain, journal); err != nil {
+		t.Fatal(err)
+	}
+	proposed := cloneGatewayV2RouteState(committed)
+	proposed.Apps[request.AppID] = proposedApp
+	driver.live = cloneGatewayV2RouteState(proposed)
+	driver.events = nil
+
+	observation, err := manager.ObserveGatewayV2LAN(context.Background(), request)
+	if err != nil || observation.Disposition != GatewayV2LANGrantPendingPublished ||
+		!observation.ActivationUncertain {
+		t.Fatalf("pre-recovery observation=%#v err=%v", observation, err)
+	}
+	recovery, err := manager.RecoverGatewayV2LAN(context.Background(), request)
+	if err != nil || recovery.Observation.Disposition != GatewayV2LANGrantWithdrawnPendingReconciliation ||
+		!recovery.Observation.ActivationUncertain || recovery.Observation.ObservedAt.IsZero() {
+		t.Fatalf("recovery=%#v err=%v events=%v", recovery, err, driver.events)
+	}
+	retained, _, err := store.loadBoundUpgrade(journal.OperationID)
+	if err != nil || !reflect.DeepEqual(retained, uncertain) || !reflect.DeepEqual(driver.live, committed) {
+		t.Fatalf("retained=%#v live=%#v err=%v", retained, driver.live, err)
+	}
+	if retained.Apps[other.AppID].LAN == nil ||
+		!reflect.DeepEqual(retained.Apps[other.AppID].LAN, committed.Apps[other.AppID].LAN) {
+		t.Fatal("recovery disturbed the other app binding")
+	}
+	if !containsString(driver.events, "apply:lan-grant-recovery.json") ||
+		!containsString(driver.events, "prove_rolled_back") {
+		t.Fatalf("recovery did not apply and prove exact 404: %v", driver.events)
+	}
+	withdrawn, err := manager.ObserveGatewayV2LAN(context.Background(), request)
+	if err != nil || withdrawn.Disposition != GatewayV2LANGrantWithdrawnPendingReconciliation ||
+		withdrawn.ProtectedStateDigest != recovery.Observation.ProtectedStateDigest {
+		t.Fatalf("withdrawn observation=%#v err=%v", withdrawn, err)
+	}
+}
+
+func TestGatewayV2LANRecoveryRejectsUnknownPendingTopology(t *testing.T) {
+	manager, store, committed, journal, request, driver := gatewayV2LANGrantFixture(t)
+	binding, _ := gatewayV2LANBindingForRequest(request)
+	previous := cloneGatewayV2AppRoute(committed.Apps[request.AppID])
+	proposed := cloneGatewayV2AppRoute(previous)
+	proposed.LAN = &binding
+	pending := cloneGatewayV2RouteState(committed)
+	pending.Pending = &gatewayV2PendingRoute{
+		Kind: gatewayV2PendingLANGrant, AppID: request.AppID, Previous: &previous, Proposed: proposed,
+	}
+	if err := store.saveCommittedV2State(pending, journal); err != nil {
+		t.Fatal(err)
+	}
+	driver.live = gatewayV2RouteState{}
+	driver.events = nil
+	if recovery, err := manager.RecoverGatewayV2LAN(context.Background(), request); !IsCode(err, DiagnosticRouteUnresolved) ||
+		!reflect.DeepEqual(recovery, GatewayV2LANGrantRecovery{}) {
+		t.Fatalf("recovery=%#v err=%v", recovery, err)
+	}
+	retained, _, err := store.loadBoundUpgrade(journal.OperationID)
+	if err != nil || !reflect.DeepEqual(retained, pending) || containsString(driver.events, "apply:lan-grant-recovery.json") {
+		t.Fatalf("retained=%#v events=%v err=%v", retained, driver.events, err)
+	}
+}
+
+func TestGatewayV2LANAbsenceResolutionProves404WithOrWithoutAppRoute(t *testing.T) {
+	for _, appID := range []string{upgradeTestAppA, "23232323-2323-4323-8323-232323232323"} {
+		t.Run(appID, func(t *testing.T) {
+			manager, _, _, _, request, _ := gatewayV2LANGrantFixture(t)
+			request.AppID = appID
+			request.AccessSpecDigest = mustGatewayV2LANAccessDigest(t, request)
+			called := false
+			err := manager.WithGatewayV2LANAbsenceResolution(context.Background(), request,
+				func(_ context.Context, observation GatewayV2LANGrantObservation) error {
+					called = true
+					if manager.mu.TryLock() {
+						manager.mu.Unlock()
+						t.Fatal("absence callback ran without gateway lock")
+					}
+					if observation.Request != request ||
+						observation.Disposition != GatewayV2LANGrantWithdrawnPendingReconciliation ||
+						observation.GatewayOperationID == "" || !validSHA256(observation.ProtectedStateDigest) ||
+						observation.ObservedAt.IsZero() {
+						t.Fatalf("observation=%#v", observation)
+					}
+					if appID != upgradeTestAppA && (observation.Slot != "" || len(observation.Endpoints) != 0) {
+						t.Fatalf("absent app synthesized route provenance: %#v", observation)
+					}
+					return nil
+				})
+			if err != nil || !called {
+				t.Fatalf("called=%t err=%v", called, err)
+			}
+		})
+	}
+}
+
+func TestGatewayV2LANAbsenceResolutionRejectsPortOwnedByAnotherApp(t *testing.T) {
+	manager, _, _, _, request, _ := gatewayV2LANGrantFixture(t)
+	other := gatewayV2LANSecondAppRequest(t, request)
+	other.Port = request.Port
+	other.AccessSpecDigest = mustGatewayV2LANAccessDigest(t, other)
+	authorize, _ := allowGatewayV2LANGrant(t, manager, other, nil)
+	if _, err := manager.GrantGatewayV2LAN(context.Background(), other, authorize); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err := manager.WithGatewayV2LANAbsenceResolution(context.Background(), request,
+		func(context.Context, GatewayV2LANGrantObservation) error {
+			called = true
+			return nil
+		})
+	if !IsCode(err, DiagnosticRouteUnresolved) || called {
+		t.Fatalf("called=%t err=%v", called, err)
+	}
+}
+
+func TestGatewayV2LANRollbackResolutionClearsOnlyAfterDBCallback(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		manager, store, committed, pending, journal, request, driver := pendingGatewayV2LANGrantFixture(t, true)
+		called := false
+		err := manager.WithGatewayV2LANRollbackResolution(context.Background(), request,
+			func(_ context.Context, observation GatewayV2LANGrantObservation) error {
+				called = true
+				if observation.Disposition != GatewayV2LANGrantWithdrawnPendingReconciliation ||
+					!observation.ActivationUncertain || observation.ObservedAt.IsZero() {
+					t.Fatalf("observation=%#v", observation)
+				}
+				installed, _, err := store.loadBoundUpgrade(journal.OperationID)
+				if err != nil || !reflect.DeepEqual(installed, pending) {
+					t.Fatalf("pending marker cleared before DB callback: state=%#v err=%v", installed, err)
+				}
+				return nil
+			})
+		if err != nil || !called {
+			t.Fatalf("called=%t err=%v events=%v", called, err, driver.events)
+		}
+		cleared, _, err := store.loadBoundUpgrade(journal.OperationID)
+		if err != nil || !reflect.DeepEqual(cleared, committed) || !reflect.DeepEqual(driver.live, committed) {
+			t.Fatalf("cleared=%#v live=%#v err=%v", cleared, driver.live, err)
+		}
+	})
+
+	t.Run("callback failure retains pending", func(t *testing.T) {
+		manager, store, _, pending, journal, request, _ := pendingGatewayV2LANGrantFixture(t, false)
+		callbackErr := errors.New("injected DB rollback failure")
+		err := manager.WithGatewayV2LANRollbackResolution(context.Background(), request,
+			func(context.Context, GatewayV2LANGrantObservation) error { return callbackErr })
+		if !errors.Is(err, callbackErr) {
+			t.Fatalf("err=%v", err)
+		}
+		retained, _, err := store.loadBoundUpgrade(journal.OperationID)
+		if err != nil || !reflect.DeepEqual(retained, pending) {
+			t.Fatalf("retained=%#v err=%v", retained, err)
+		}
+	})
+
+	t.Run("ambiguous clear restores pending", func(t *testing.T) {
+		manager, store, _, pending, journal, request, _ := pendingGatewayV2LANGrantFixture(t, true)
+		originalWrite := upgradeProtectedWrite
+		writes := 0
+		upgradeProtectedWrite = func(path, purpose string, body []byte) error {
+			writes++
+			err := originalWrite(path, purpose, body)
+			if writes == 1 && err == nil {
+				return errors.New("injected post-install clear failure")
+			}
+			return err
+		}
+		t.Cleanup(func() { upgradeProtectedWrite = originalWrite })
+		err := manager.WithGatewayV2LANRollbackResolution(context.Background(), request,
+			func(context.Context, GatewayV2LANGrantObservation) error { return nil })
+		if !IsCode(err, DiagnosticRouteUnresolved) || writes < 2 {
+			t.Fatalf("err=%v writes=%d", err, writes)
+		}
+		retained, _, loadErr := store.loadBoundUpgrade(journal.OperationID)
+		if loadErr != nil || !reflect.DeepEqual(retained, pending) {
+			t.Fatalf("retained=%#v err=%v", retained, loadErr)
+		}
+	})
+}
+
+func TestGatewayV2LANCommitResolutionQuarantinesFailedOrAmbiguousDBCommit(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		committedBeforeErr bool
+	}{
+		{name: "callback failed before DB commit"},
+		{name: "callback ambiguous after DB commit", committedBeforeErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, store, _, journal, request, driver := gatewayV2LANGrantFixture(t)
+			authorize, _ := allowGatewayV2LANGrant(t, manager, request, nil)
+			if _, err := manager.GrantGatewayV2LAN(context.Background(), request, authorize); err != nil {
+				t.Fatal(err)
+			}
+			published, _, err := store.loadBoundUpgrade(journal.OperationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			driver.events = nil
+			dbCommitted := false
+			callbackErr := errors.New("injected terminal DB uncertainty")
+			err = manager.WithGatewayV2LANCommitResolution(context.Background(), request,
+				func(_ context.Context, receipt GatewayV2LANGrantReceipt) error {
+					if receipt.Request != request || receipt.GatewayOperationID != published.OperationID ||
+						!validSHA256(receipt.ProtectedStateDigest) || receipt.ObservedAt.IsZero() {
+						t.Fatalf("receipt=%#v", receipt)
+					}
+					dbCommitted = test.committedBeforeErr
+					return callbackErr
+				})
+			if !errors.Is(err, callbackErr) || dbCommitted != test.committedBeforeErr {
+				t.Fatalf("err=%v dbCommitted=%t", err, dbCommitted)
+			}
+			retained, _, loadErr := store.loadBoundUpgrade(journal.OperationID)
+			if loadErr != nil || retained.Pending == nil ||
+				retained.Pending.Kind != gatewayV2PendingLANWithdrawal ||
+				retained.Pending.Previous == nil || retained.Pending.Previous.LAN == nil ||
+				retained.Pending.Previous.LAN.GrantAttemptID != request.AttemptID ||
+				!retained.Pending.ActivationUncertain || driver.live.Apps[request.AppID].LAN != nil {
+				t.Fatalf("retained=%#v live=%#v err=%v", retained, driver.live, loadErr)
+			}
+			if !containsString(driver.events, "apply:lan-grant-quarantine.json") ||
+				!containsString(driver.events, "prove_rolled_back") {
+				t.Fatalf("events=%v", driver.events)
+			}
+		})
+	}
+}
+
+func TestGatewayV2LANCommitRecoveryRequiresDBProofBeforeRepublishing(t *testing.T) {
+	manager, store, _, journal, request, driver := gatewayV2LANGrantFixture(t)
+	authorize, _ := allowGatewayV2LANGrant(t, manager, request, nil)
+	if _, err := manager.GrantGatewayV2LAN(context.Background(), request, authorize); err != nil {
+		t.Fatal(err)
+	}
+	callbackErr := errors.New("ambiguous terminal DB commit")
+	if err := manager.WithGatewayV2LANCommitResolution(context.Background(), request,
+		func(context.Context, GatewayV2LANGrantReceipt) error { return callbackErr }); !errors.Is(err, callbackErr) {
+		t.Fatal(err)
+	}
+	driver.events = nil
+	validated := false
+	if err := manager.WithGatewayV2LANCommitRecovery(context.Background(), request,
+		func(_ context.Context, observation GatewayV2LANGrantObservation) error {
+			if observation.Disposition != GatewayV2LANGrantWithdrawnPendingReconciliation ||
+				!observation.ActivationUncertain || driver.live.Apps[request.AppID].LAN != nil {
+				t.Fatalf("observation=%#v live=%#v", observation, driver.live)
+			}
+			validated = true
+			return nil
+		}); err != nil || !validated {
+		t.Fatalf("recovery err=%v validated=%t events=%v", err, validated, driver.events)
+	}
+	installed, _, err := store.loadBoundUpgrade(journal.OperationID)
+	if err != nil || installed.Pending != nil || installed.Apps[request.AppID].LAN == nil ||
+		driver.live.Apps[request.AppID].LAN == nil {
+		t.Fatalf("installed=%#v live=%#v err=%v", installed, driver.live, err)
+	}
+}
+
 type fakeGatewayV2LANGrantDriver struct {
 	t                       *testing.T
 	manager                 *Manager
@@ -633,7 +1097,13 @@ type fakeGatewayV2LANGrantDriver struct {
 	failCandidatePreflight  bool
 	mutateBeforeError       bool
 	failGrantProof          bool
+	failGrantProofAt        int
+	grantProofCalls         int
 	failRollbackProof       bool
+	pendingTopology         gatewayV2PendingLiveTopology
+	applyHook               func()
+	stopOwnedGatewayErr     error
+	gatewayStopped          bool
 }
 
 func (d *fakeGatewayV2LANGrantDriver) checkLocked() {
@@ -675,6 +1145,9 @@ func (d *fakeGatewayV2LANGrantDriver) preflightCandidate(_ context.Context, stat
 func (d *fakeGatewayV2LANGrantDriver) apply(_ context.Context, state gatewayV2RouteState, filename string) error {
 	d.checkLocked()
 	d.events = append(d.events, "apply:"+filename)
+	if d.applyHook != nil {
+		d.applyHook()
+	}
 	d.applyCalls++
 	if d.failApply == d.applyCalls {
 		if d.mutateBeforeError {
@@ -691,7 +1164,17 @@ func (d *fakeGatewayV2LANGrantDriver) proveGranted(_ context.Context, state gate
 ) bool {
 	d.checkLocked()
 	d.events = append(d.events, "prove_granted")
-	return !d.failGrantProof && reflect.DeepEqual(d.live, state) && state.Apps[request.AppID].LAN != nil
+	d.grantProofCalls++
+	return !d.failGrantProof && d.failGrantProofAt != d.grantProofCalls &&
+		reflect.DeepEqual(d.live, state) && state.Apps[request.AppID].LAN != nil
+}
+
+func (d *fakeGatewayV2LANGrantDriver) proveAllGranted(_ context.Context, state gatewayV2RouteState,
+	_ gatewayMigrationJournal,
+) bool {
+	d.checkLocked()
+	d.events = append(d.events, "prove_all_granted")
+	return !d.failGrantProof && reflect.DeepEqual(d.live, state)
 }
 
 func (d *fakeGatewayV2LANGrantDriver) proveRolledBack(_ context.Context, state gatewayV2RouteState,
@@ -700,6 +1183,33 @@ func (d *fakeGatewayV2LANGrantDriver) proveRolledBack(_ context.Context, state g
 	d.checkLocked()
 	d.events = append(d.events, "prove_rolled_back")
 	return !d.failRollbackProof && reflect.DeepEqual(d.live, state) && state.Apps[request.AppID].LAN == nil
+}
+
+func (d *fakeGatewayV2LANGrantDriver) observePending(_ context.Context, committed, proposed gatewayV2RouteState,
+	_ gatewayMigrationJournal,
+) gatewayV2PendingLiveTopology {
+	d.checkLocked()
+	d.events = append(d.events, "observe_pending")
+	if d.pendingTopology != "" {
+		return d.pendingTopology
+	}
+	if reflect.DeepEqual(d.live, committed) {
+		return gatewayV2PendingCommittedExact
+	}
+	if reflect.DeepEqual(d.live, proposed) {
+		return gatewayV2PendingProposedExact
+	}
+	return gatewayV2PendingUnknown
+}
+
+func (d *fakeGatewayV2LANGrantDriver) stopOwnedGateway(_ context.Context, _ gatewayMigrationJournal) error {
+	d.checkLocked()
+	d.events = append(d.events, "stop_owned_gateway")
+	if d.stopOwnedGatewayErr != nil {
+		return d.stopOwnedGatewayErr
+	}
+	d.gatewayStopped = true
+	return nil
 }
 
 type fakeGatewayV2LANGrantLease struct {
@@ -798,6 +1308,25 @@ func assertGatewayV2LANGrantUnchanged(t *testing.T, store *gatewayUpgradeStateSt
 	}
 }
 
+func assertGatewayV2LANGrantPending(t *testing.T, store *gatewayUpgradeStateStore,
+	journal gatewayMigrationJournal, before gatewayV2RouteState, request gatewayV2LANGrantRequest,
+	driver *fakeGatewayV2LANGrantDriver, wantEvents []string,
+) {
+	t.Helper()
+	after, _, err := store.loadBoundUpgrade(journal.OperationID)
+	if err != nil || after.Pending == nil || after.Pending.Kind != gatewayV2PendingLANGrant ||
+		after.Pending.AppID != request.AppID || after.Pending.Proposed.LAN == nil ||
+		after.Pending.Proposed.LAN.GrantAttemptID != request.AttemptID ||
+		!reflect.DeepEqual(driver.live, before) || !reflect.DeepEqual(driver.events, wantEvents) {
+		t.Fatalf("state=%#v live=%#v events=%v err=%v", after, driver.live, driver.events, err)
+	}
+	committed := cloneGatewayV2RouteState(after)
+	committed.Pending = nil
+	if !reflect.DeepEqual(committed, before) {
+		t.Fatalf("pending grant changed committed state: got=%#v want=%#v", committed, before)
+	}
+}
+
 func gatewayV2LANGrantFixture(t *testing.T) (*Manager, *gatewayUpgradeStateStore, gatewayV2RouteState,
 	gatewayMigrationJournal, gatewayV2LANGrantRequest, *fakeGatewayV2LANGrantDriver,
 ) {
@@ -818,11 +1347,47 @@ func gatewayV2LANGrantFixture(t *testing.T) (*Manager, *gatewayUpgradeStateStore
 	return manager, store, state, journal, request, driver
 }
 
+func pendingGatewayV2LANGrantFixture(t *testing.T, uncertain bool) (*Manager, *gatewayUpgradeStateStore,
+	gatewayV2RouteState, gatewayV2RouteState, gatewayMigrationJournal, gatewayV2LANGrantRequest,
+	*fakeGatewayV2LANGrantDriver,
+) {
+	t.Helper()
+	manager, store, committed, journal, request, driver := gatewayV2LANGrantFixture(t)
+	binding, err := gatewayV2LANBindingForRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := cloneGatewayV2AppRoute(committed.Apps[request.AppID])
+	proposed := cloneGatewayV2AppRoute(previous)
+	proposed.LAN = &binding
+	pending := cloneGatewayV2RouteState(committed)
+	pending.Pending = &gatewayV2PendingRoute{
+		Kind: gatewayV2PendingLANGrant, AppID: request.AppID, Previous: &previous, Proposed: proposed,
+	}
+	if err := store.saveCommittedV2State(pending, journal); err != nil {
+		t.Fatal(err)
+	}
+	if uncertain {
+		armed := cloneGatewayV2RouteState(pending)
+		armed.Pending.ActivationUncertain = true
+		if err := store.saveCommittedV2State(armed, journal); err != nil {
+			t.Fatal(err)
+		}
+		pending = armed
+	}
+	driver.live = cloneGatewayV2RouteState(committed)
+	driver.events = nil
+	return manager, store, committed, pending, journal, request, driver
+}
+
 func gatewayV2LANGrantRequestForState(t *testing.T, state gatewayV2RouteState) gatewayV2LANGrantRequest {
 	t.Helper()
 	request := gatewayV2LANGrantRequest{
+		AttemptID: "12121212-1212-4212-8212-121212121212", ClaimRequestDigest: strings.Repeat("1", 64),
 		AppID: upgradeTestAppA, AllocationID: "66666666-6666-4666-8666-666666666666", Port: 8100,
+		OwnerOperationID: "13131313-1313-4313-8313-131313131313",
 		AccessRevisionID: "77777777-7777-4777-8777-777777777777", AccessRevisionNumber: 3,
+		ApprovedBy:               "14141414-1414-4414-8414-141414141414",
 		GatewayProfileRevisionID: state.Profile.RevisionID, GatewayProfileRevisionNumber: state.Profile.RevisionNumber,
 		GatewayProfileSpecDigest: state.Profile.SpecDigest,
 	}

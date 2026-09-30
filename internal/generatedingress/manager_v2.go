@@ -200,6 +200,14 @@ func (m *Manager) rollbackCommittedV2PendingLocked(ctx context.Context, store *g
 	committed.Pending = nil
 	proposed := cloneGatewayV2RouteState(committed)
 	proposed.Apps[state.Pending.AppID] = cloneGatewayV2AppRoute(state.Pending.Proposed)
+	if state.Pending.Kind == gatewayV2PendingLANWithdrawal {
+		request, requestErr := gatewayV2LANPendingRequest(*state.Pending)
+		var pending bool
+		committed, proposed, pending, err = gatewayV2LANGrantStatesForRequest(state, request)
+		if requestErr != nil || err != nil || !pending {
+			return gatewayV2RouteState{}, &Error{Code: DiagnosticRouteUnresolved}
+		}
+	}
 
 	topology := m.observeCommittedV2PendingTopology(ctx, source, committed, proposed, journal)
 	if topology == gatewayV2PendingUnknown {
@@ -219,7 +227,8 @@ func (m *Manager) rollbackCommittedV2PendingLocked(ctx context.Context, store *g
 	// allocation transition. Recovery can make Caddy fail closed, but only a
 	// future controller/DB reconciliation can decide whether that allocation
 	// committed. Preserve the marker and block ordinary startup until then.
-	if state.Pending.Kind == gatewayV2PendingLANGrant && state.Pending.ActivationUncertain {
+	if (state.Pending.Kind == gatewayV2PendingLANGrant && state.Pending.ActivationUncertain) ||
+		state.Pending.Kind == gatewayV2PendingLANWithdrawal {
 		return state, &Error{Code: DiagnosticRouteUnresolved}
 	}
 	if err := store.saveCommittedV2State(committed, journal); err != nil {
