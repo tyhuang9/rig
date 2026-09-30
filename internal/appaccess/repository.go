@@ -26,6 +26,9 @@ type Repository struct {
 	afterReservationLock          func()
 	afterApprovalLock             func()
 	afterDisableIntentLock        func()
+	afterGrantClaimLock           func()
+	afterGrantStartupClaimsRead   func()
+	beforeGrantTransitionCommit   func()
 	beforeReservationCommit       func()
 }
 

@@ -40,80 +40,10 @@ func (r *Repository) GatewayUpgradeStartupSnapshot(ctx context.Context) (Gateway
 		return GatewayUpgradeStartupSnapshot{}, err
 	}
 	defer tx.Rollback()
-
-	current, err := readGatewayUpgradeStartupHead(ctx, tx)
+	result, err := r.readGatewayUpgradeStartupSnapshot(ctx, tx)
 	if err != nil {
 		return GatewayUpgradeStartupSnapshot{}, err
 	}
-	operationIDs, err := readGatewayUpgradeStartupOperationIDs(ctx, tx)
-	if err != nil {
-		return GatewayUpgradeStartupSnapshot{}, err
-	}
-	if r.afterUpgradeStartupClaimsRead != nil {
-		r.afterUpgradeStartupClaimsRead()
-	}
-
-	result := GatewayUpgradeStartupSnapshot{
-		CurrentProfile: current,
-		Claims:         make([]GatewayUpgradeStartupClaim, 0, len(operationIDs)),
-	}
-	activeClaims := 0
-	for _, operationID := range operationIDs {
-		claim, err := readGatewayProfileUpgradeClaim(ctx, tx, operationID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return GatewayUpgradeStartupSnapshot{}, ErrInvalidStoredState
-		}
-		if err != nil {
-			return GatewayUpgradeStartupSnapshot{}, err
-		}
-		if err := validateGatewayProfileUpgradeClaimHistory(ctx, tx, claim); err != nil {
-			return GatewayUpgradeStartupSnapshot{}, err
-		}
-
-		profile, requestDigest, err := readGatewayRevision(ctx, tx, claim.ProfileRevisionID, claim.ProfileRevisionNumber)
-		if errors.Is(err, sql.ErrNoRows) {
-			return GatewayUpgradeStartupSnapshot{}, ErrInvalidStoredState
-		}
-		if err != nil {
-			return GatewayUpgradeStartupSnapshot{}, err
-		}
-		if err := validateGatewayUpgradeStartupProfile(ctx, tx, profile, requestDigest); err != nil {
-			return GatewayUpgradeStartupSnapshot{}, err
-		}
-		if profile.ID != claim.ProfileRevisionID || profile.RevisionNumber != claim.ProfileRevisionNumber ||
-			profile.SpecDigest != claim.ProfileSpecDigest {
-			return GatewayUpgradeStartupSnapshot{}, ErrInvalidStoredState
-		}
-
-		actionDigest, err := GatewayProfileUpgradeSpecDigest(GatewayProfileUpgradeSpec{
-			ProfileRevisionID:     claim.ProfileRevisionID,
-			ProfileRevisionNumber: claim.ProfileRevisionNumber,
-			ProfileSpecDigest:     claim.ProfileSpecDigest,
-		})
-		if err != nil || !validDigest(actionDigest) {
-			return GatewayUpgradeStartupSnapshot{}, ErrInvalidStoredState
-		}
-		actorRole, err := gatewayUpgradeStartupActorRole(ctx, tx, claim.ApprovedBy)
-		if errors.Is(err, sql.ErrNoRows) {
-			return GatewayUpgradeStartupSnapshot{}, ErrInvalidStoredState
-		}
-		if err != nil {
-			return GatewayUpgradeStartupSnapshot{}, err
-		}
-
-		if claim.State != GatewayProfileUpgradeRolledBack {
-			activeClaims++
-			if activeClaims > 1 || current == nil || actorRole != "administrator" ||
-				current.ID != profile.ID || current.RevisionNumber != profile.RevisionNumber ||
-				current.SpecDigest != profile.SpecDigest {
-				return GatewayUpgradeStartupSnapshot{}, ErrInvalidStoredState
-			}
-		}
-		result.Claims = append(result.Claims, GatewayUpgradeStartupClaim{
-			Claim: claim, Profile: profile, ApprovedActionDigest: actionDigest,
-		})
-	}
-
 	if err := tx.Commit(); err != nil {
 		return GatewayUpgradeStartupSnapshot{}, err
 	}
