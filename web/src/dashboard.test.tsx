@@ -1,9 +1,10 @@
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { readFileSync } from "node:fs";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api, type Job } from "./api";
-import { ActivityRow, ConnectionsPage, MachinesPage } from "./dashboard";
+import { ActivityRow, ConnectionsPage, Layout, MachinesPage } from "./dashboard";
 import { DASHBOARD_CAUGHT_ERROR_MESSAGE, handleDashboardCaughtError } from "./root-errors";
 
 const unavailableRelayStatus = {
@@ -34,6 +35,17 @@ describe("ConnectionsPage", () => {
     expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Connections" }));
     expect(document.title).toBe("Connections · hostd");
     expect(start).not.toHaveBeenCalled();
+  });
+});
+
+describe("account role labels", () => {
+  afterEach(cleanup);
+
+  it("uses the authenticated role without showing administrator wording to viewers", () => {
+    render(<MemoryRouter><Layout user={{ id: "viewer-id", username: "reader", role: "viewer" }} onLogout={() => undefined}><div /></Layout></MemoryRouter>);
+
+    expect(screen.getByText("Viewer")).not.toBeNull();
+    expect(screen.queryByText("Administrator")).toBeNull();
   });
 });
 
