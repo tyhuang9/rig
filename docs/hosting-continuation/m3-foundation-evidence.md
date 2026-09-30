@@ -529,3 +529,34 @@ upgrading, stop and verify the old controller has exited; listener reservation
 detects the common same-address overlap but cannot detect an old process on
 another port. Cross-version overlap remains a rollout risk until this
 prerequisite is exercised in an actual upgrade.
+
+## Per-app LAN disable ledger: local evidence
+
+The next local M3 branch adds migration 027 without changing migration 025,
+historical allocations, or existing enable revisions. A new immutable disable
+intent binds an administrator approval to the exact current access revision,
+allocation owner, port, and gateway profile. While that intent is pending,
+allocation state changes are rejected and the port remains owned. Migration
+025's prohibition on releasing an owned allocation remains in force.
+
+This branch deliberately has no finalization or release API or table. A
+caller-supplied digest alone cannot prove that Caddy removed the route; the
+later ingress slice must produce and verify protected route-absence evidence
+before adding a release path. No disable route, LAN URL, UI action, or Docker
+mutation is claimed by this storage slice.
+
+Verification on the final intent-only candidate:
+
+- `go test -count=1 ./internal/database` — pass.
+- `go test -count=1 ./internal/appaccess` — pass.
+- `go test -count=1 -p 1 ./...` — pass across all Go packages.
+- `go vet ./...` — pass.
+- `git diff --check` — pass.
+
+The migration test runs 027 against a populated pre-027 database, checks that
+the original allocation table and five triggers retain their SQL, and checks
+that owned and released rows retain their values. The app access tests cover
+administrator and exact-owner validation, replay, stale requests, active and
+uncertain allocation freezes, direct SQL release denial, and two database
+handles contending for the same intent. Live Docker route removal, a physical
+second-device visit, and UI behavior remain unverified and outside this branch.
