@@ -11,6 +11,9 @@ unpublished. It does not enable a LAN listener or report a LAN URL.
 - Protected v1-to-v2 gateway journal: `9b0f3ae`, implemented in
   `internal/generatedingress/upgrade_state.go` and its focused tests.
 - Cross-process gateway lock on current Manager operations: `0695892`.
+- Immutable Docker resource bindings in the migration journal: `48152f9`.
+- Exact v2 resource creation arguments and host preflight: `0195695`.
+- ID-bound observer and read-only migration recovery: `50bc2f9`.
 
 The allocator stores approved desired gateway and per-app access revisions,
 action digests, compare-and-swap heads, and unique durable port ownership. It
@@ -110,6 +113,23 @@ gateway core identity remains pinned. Precommit rollback phases retain their
 strict v1 dependency. No live v2 gateway creator, LAN access action, or LAN URL
 is enabled by this serving-path slice.
 
+The migration journal now binds the pinned image, ingress network, both volume
+creation identities, and stage/final container IDs as each resource is made.
+Bindings are monotonic and phase-gated; a changed replay or a replacement
+resource fails closed. The observer compares found Docker resources with those
+protected bindings before accepting a serving topology. A separate read-only
+recovery classifier recognizes only specific `stage_intent` and
+`transfer_intent` crash windows with exact resource, config, network, and
+rollback evidence. It never authorizes mutation on unknown or drifting input.
+
+Pure argv builders define the exact v2 Docker network, volume, and hardened
+stage/final container creations. The stage publishes only the selected private
+IPv4 port pool; the final also publishes the v1 loopback port. Host preflight
+checks that the approved interface still owns the exact address and that the
+planned Docker subnet does not overlap current host routes or interface
+prefixes. These are unwired prerequisites: no Docker resource was created and
+no host port was opened by this slice.
+
 ## Executed verification
 
 | Check | Result |
@@ -141,6 +161,11 @@ is enabled by this serving-path slice.
 | Linux amd64 `go test -c` for `./internal/generatedingress` | Cross-compiled the test package; Linux runtime execution was not available locally. |
 | `git diff --check` after committed-v2 integration | Passed; Git reported only working-copy LF/CRLF conversion warnings. |
 | `pnpm --dir docs build` after the evidence update | Passed without render errors after escaping Vue template braces in the recorded Docker command. |
+| `go test -count=1 ./internal/generatedingress` and `go vet ./internal/generatedingress` after journal binding, creator/preflight, and recovery observer | Passed. |
+| `go test -count=1 ./...` after these M3 prerequisites | Passed with normal local Windows permissions. The sandboxed run failed in unchanged workspace/Docker fixture tests with `Access is denied` and Docker unavailable. |
+| `go vet ./...` after these M3 prerequisites | Passed with normal local Windows permissions. |
+| Linux amd64 `go test -c` for `./internal/generatedingress` after recovery observer | Cross-compiled; Linux runtime tests were not executed locally. |
+| Independent code and security reviews of the prerequisite diff | No confirmed blocker for a local commit. Both require live Docker verification before M3 acceptance. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -198,11 +223,15 @@ with the same user identity can replace the lock path while a handle is held;
 Rig never unlinks it, and the open-time path identity and permission checks
 reject unsafe paths before work begins.
 The live observer now implements immutable endpoint and unique-alias proof,
-host-side selected-address publication proof, and post-probe endpoint/config
-reinspection. These have unit evidence only and require real Docker and
-Desktop execution. The protected journal still does not bind immutable v2
-network, volume, and container IDs persistently. A physical second-device LAN
-journey remains a distinct acceptance gate.
+host-side selected-address publication proof, post-probe endpoint/config
+reinspection, and comparison with protected resource bindings. These have unit
+evidence only and require real Docker and Desktop execution. Docker's stopped
+container inspect shape for configured networks and effective ports remains
+unverified locally. Before the future writer starts either LAN-published
+container, it must prove the exact restart config in its writable volume,
+recheck the selected interface, retain the gateway lock, and reattest after
+start. A physical second-device LAN journey remains a distinct acceptance
+gate.
 The gateway-specific host challenge proves listener identity, but generic
 application probes accept any HTTP status. They do not prove that Caddy selected
 and forwarded the intended app route. A controlled live Docker route matrix
