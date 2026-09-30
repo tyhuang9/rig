@@ -32,7 +32,6 @@ const (
 	maxGatewayMigrationBytes = 12 << 10
 
 	gatewayUpgradeActionName = "upgrade_generated_ingress"
-	gatewayUpgradeDigestV1   = 1
 	gatewayTargetFormat      = 2
 	gatewayV1IdentityVersion = "v1"
 	gatewayV2IdentityVersion = "v2"
@@ -316,21 +315,16 @@ func prepareGatewayV2State(source routeState, input gatewayUpgradePreparation) (
 }
 
 func gatewayUpgradeActionDigest(profile gatewayProfileBinding, identityVersion string) (string, error) {
-	if !validGatewayProfileBinding(profile) || identityVersion != gatewayV2IdentityVersion {
+	if !validGatewayProfileBinding(profile) || identityVersion != gatewayV2IdentityVersion ||
+		gatewayUpgradeActionName != string(appaccess.ActionUpgradeGateway) ||
+		gatewayTargetFormat != appaccess.GatewayUpgradeTargetFormat ||
+		gatewayV2IdentityVersion != appaccess.GatewayUpgradeIdentityVersion {
 		return "", errors.New("invalid generated ingress upgrade action")
 	}
-	return canonicalDigest(struct {
-		Version               int    `json:"version"`
-		Action                string `json:"action"`
-		TargetFormat          int    `json:"targetFormat"`
-		ProfileRevisionID     string `json:"profileRevisionId"`
-		ProfileRevisionNumber int64  `json:"profileRevisionNumber"`
-		ProfileSpecDigest     string `json:"profileSpecDigest"`
-		IdentityVersion       string `json:"identityVersion"`
-	}{
-		Version: gatewayUpgradeDigestV1, Action: gatewayUpgradeActionName, TargetFormat: gatewayTargetFormat,
-		ProfileRevisionID: profile.RevisionID, ProfileRevisionNumber: profile.RevisionNumber,
-		ProfileSpecDigest: profile.SpecDigest, IdentityVersion: identityVersion,
+	return appaccess.GatewayProfileUpgradeSpecDigest(appaccess.GatewayProfileUpgradeSpec{
+		ProfileRevisionID:     profile.RevisionID,
+		ProfileRevisionNumber: profile.RevisionNumber,
+		ProfileSpecDigest:     profile.SpecDigest,
 	})
 }
 
