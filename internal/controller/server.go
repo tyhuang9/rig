@@ -63,8 +63,13 @@ type Server struct {
 	GatewayProfiles       GatewayProfileService
 	GatewayUpgrades       GatewayUpgradeService
 	GatewayUpgradeRuntime GatewayUpgradeRuntime
+	AppAccess             LANAppAccessService
+	AppGrants             LANAppGrantService
+	LANGrantRuntime       LANAppGrantRuntime
 	RecoveryOnly          bool
+	RecoveryKind          string
 	RecoveryOperationID   string
+	RecoveryAppID         string
 	GatewayCandidates     func() ([]hostnetwork.Candidate, error)
 	AutoDeployAvailable   bool
 	RelayReconcile        func()
@@ -144,6 +149,11 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("inspectImport", noStore(s.require(s.inspectApp))),
 		contractRoute("getApplication", s.require(s.getApp)),
 		contractRoute("getApplicationLocalRoute", noStore(s.require(s.getApplicationLocalRoute))),
+		contractRoute(operationGetApplicationLANAccess, noStore(s.requireOperation(operationGetApplicationLANAccess, s.getApplicationLANAccess))),
+		contractRoute(operationReserveApplicationLANAccess, noStore(s.requireOperation(operationReserveApplicationLANAccess, s.reserveApplicationLANAccess))),
+		contractRoute(operationApproveApplicationLANAccess, noStore(s.requireOperation(operationApproveApplicationLANAccess, s.approveApplicationLANAccess))),
+		contractRoute(operationGetApplicationLANGrant, noStore(s.requireOperation(operationGetApplicationLANGrant, s.getApplicationLANGrant))),
+		contractRoute(operationGrantApplicationLANAccess, noStore(s.requireOperation(operationGrantApplicationLANAccess, s.grantApplicationLANAccess))),
 		contractRoute("getApplicationDeploymentPlan", noStore(s.require(s.getApplicationDeploymentPlan))),
 		contractRoute("acceptApplicationDeploymentPlan", noStore(s.require(s.acceptApplicationDeploymentPlan))),
 		contractRoute("approveApplicationDeploymentPlanMigration", noStore(s.require(s.approveApplicationDeploymentPlanMigration))),
@@ -217,25 +227,44 @@ func (s *Server) routes() http.Handler {
 	return mux
 }
 
-// recoveryGate keeps a controller started for one unfinished gateway upgrade
-// limited to authentication and that exact upgrade. It stays active even after
-// a successful rollback; the next normal startup rechecks both stores.
+const (
+	RecoveryGatewayUpgrade = "gateway_upgrade"
+	RecoveryLANGrant       = "lan_grant"
+)
+
+// recoveryGate limits an unfinished gateway or LAN grant operation to
+// authentication and its exact reconciliation endpoint. It stays active after
+// a terminal result until the next startup rechecks both stores.
 func (s *Server) recoveryGate(next http.Handler) http.Handler {
 	if !s.RecoveryOnly {
 		return next
 	}
-	allowed := map[string]bool{}
+	allowed := http.NewServeMux()
 	for _, route := range s.apiRoutes() {
+		permit := false
 		switch route.operationID {
-		case "bootstrapStatus", "bootstrap", "login", "logout", "me", "rotateCSRF",
-			operationGetLANGatewayUpgrade, operationUpgradeLANGateway:
-			allowed[route.method+" "+route.path] = true
+		case "bootstrapStatus", "bootstrap", "login", "logout", "me", "rotateCSRF":
+			permit = true
+		case operationGetLANGatewayUpgrade, operationUpgradeLANGateway:
+			permit = s.RecoveryKind == "" || s.RecoveryKind == RecoveryGatewayUpgrade
+		case operationGetApplicationLANGrant, operationGrantApplicationLANAccess:
+			permit = s.RecoveryKind == RecoveryLANGrant
+		}
+		if permit {
+			allowed.HandleFunc(route.method+" "+route.path, func(w http.ResponseWriter, r *http.Request) {
+				next.ServeHTTP(w, r)
+			})
 		}
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") && !allowed[r.Method+" "+r.URL.Path] {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			_, pattern := allowed.Handler(r)
+			if pattern != "" {
+				allowed.ServeHTTP(w, r)
+				return
+			}
 			w.Header().Set("Cache-Control", "no-store")
-			problem(w, r, http.StatusServiceUnavailable, "gateway_reconciliation_required", "Gateway upgrade reconciliation is required before other operations are available", nil)
+			problem(w, r, http.StatusServiceUnavailable, "gateway_reconciliation_required", "LAN reconciliation is required before other operations are available", nil)
 			return
 		}
 		next.ServeHTTP(w, r)
