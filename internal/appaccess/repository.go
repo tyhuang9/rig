@@ -141,6 +141,36 @@ func (r *Repository) CurrentGatewayProfile(ctx context.Context) (GatewayProfileR
 	return value, err
 }
 
+// ReplayGatewayProfile reads an immutable operation before a controller
+// performs fresh host-interface validation. A committed exact retry remains
+// identifiable even when that interface has since disappeared. New writes
+// must still use ConfigureGatewayProfile after their own host preflight.
+func (r *Repository) ReplayGatewayProfile(ctx context.Context, input ConfigureGatewayInput) (GatewayProfileRevision, error) {
+	canonical, err := canonicalGatewaySpec(input.Spec)
+	if r == nil || r.db == nil || err != nil || !validUUID(input.OperationID) || input.ExpectedRevisionNumber < 0 {
+		return GatewayProfileRevision{}, ErrInvalidInput
+	}
+	specDigest, err := GatewayProfileSpecDigest(canonical)
+	if err != nil || !validApproval(input.Approval, ActionConfigureGateway, specDigest) {
+		return GatewayProfileRevision{}, ErrApprovalRequired
+	}
+	requestDigest, err := gatewayRequestDigest(input, canonical)
+	if err != nil {
+		return GatewayProfileRevision{}, err
+	}
+	existing, storedDigest, err := readGatewayByOperation(ctx, r.db, input.OperationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return GatewayProfileRevision{}, ErrNotFound
+	}
+	if err != nil {
+		return GatewayProfileRevision{}, err
+	}
+	if storedDigest != requestDigest {
+		return GatewayProfileRevision{}, ErrIdempotencyMismatch
+	}
+	return existing, nil
+}
+
 // ReserveAppAccess assigns the first available port in the current approved
 // profile. It performs no network action and does not advance the access head.
 func (r *Repository) ReserveAppAccess(ctx context.Context, input ReserveAppAccessInput) (Allocation, bool, error) {

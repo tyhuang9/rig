@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "37210c5040b37953aa1d46a9230ad379593a1d19887ab216db3f04d0b31772f2"
+const SourceSHA256 = "ffbe04ac912be7a49fb0a00a8791a553111c509886febf3b0eedb9554c0d93db"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -15,6 +15,7 @@ var Operations = map[string]Operation{
 	"bootstrap":                             {Method: "POST", Path: "/api/v1/auth/bootstrap"},
 	"bootstrapStatus":                       {Method: "GET", Path: "/api/v1/auth/bootstrap/status"},
 	"cancelJob":                             {Method: "POST", Path: "/api/v1/jobs/{jobId}/cancel"},
+	"configureLANGatewayProfile":            {Method: "POST", Path: "/api/v1/system/lan-gateway-profile"},
 	"createApplication":                     {Method: "POST", Path: "/api/v1/apps"},
 	"deployApplication":                     {Method: "POST", Path: "/api/v1/apps/{appId}/deployments"},
 	"deployRelease":                         {Method: "POST", Path: "/api/v1/apps/{appId}/releases/{releaseId}/deployments"},
@@ -28,6 +29,7 @@ var Operations = map[string]Operation{
 	"getDefaultSourceConnection":            {Method: "GET", Path: "/api/v1/source-connections/default"},
 	"getDeploymentJobByIdempotency":         {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-jobs/by-idempotency"},
 	"getJob":                                {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
+	"getLANGatewayProfile":                  {Method: "GET", Path: "/api/v1/system/lan-gateway-profile"},
 	"getRelayStatus":                        {Method: "GET", Path: "/api/v1/relay/status"},
 	"grantRuntimeApproval":                  {Method: "POST", Path: "/api/v1/apps/{appId}/runtime-approvals"},
 	"inspectImport":                         {Method: "POST", Path: "/api/v1/apps/import/inspect"},
@@ -247,6 +249,13 @@ type ConfigurationEntry struct {
 type ConfigurationValueInput struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+}
+
+type ConfigureLANGatewayProfileRequest struct {
+	ApprovalDigest         string                `json:"approvalDigest"`
+	ExpectedRevisionNumber int64                 `json:"expectedRevisionNumber"`
+	OperationID            string                `json:"operationId"`
+	Spec                   LANGatewayProfileSpec `json:"spec"`
 }
 
 type ConnectedGitHubRepository struct {
@@ -610,6 +619,47 @@ type JobMutationResponse struct {
 
 type JobResponse struct {
 	Job Job `json:"job"`
+}
+
+type LANGatewayCandidate struct {
+	InterfaceID  string `json:"interfaceId"`
+	Name         string `json:"name"`
+	Prefix       string `json:"prefix"`
+	SelectedIpv4 string `json:"selectedIpv4"`
+}
+
+type LANGatewayProfileMutation struct {
+	Created bool                      `json:"created"`
+	Profile LANGatewayProfileRevision `json:"profile"`
+}
+
+type LANGatewayProfileProposal struct {
+	ApprovalDigest string                `json:"approvalDigest"`
+	Spec           LANGatewayProfileSpec `json:"spec"`
+}
+
+type LANGatewayProfileRead struct {
+	Candidates             []LANGatewayCandidate      `json:"candidates"`
+	DesiredProfile         *LANGatewayProfileRevision `json:"desiredProfile,omitempty"`
+	ExpectedRevisionNumber int64                      `json:"expectedRevisionNumber"`
+	Proposal               *LANGatewayProfileProposal `json:"proposal,omitempty"`
+}
+
+type LANGatewayProfileRevision struct {
+	ApprovedAt     string                `json:"approvedAt"`
+	ApprovedBy     string                `json:"approvedBy"`
+	ID             string                `json:"id"`
+	OperationID    string                `json:"operationId"`
+	RevisionNumber int64                 `json:"revisionNumber"`
+	Spec           LANGatewayProfileSpec `json:"spec"`
+	SpecDigest     string                `json:"specDigest"`
+}
+
+type LANGatewayProfileSpec struct {
+	InterfaceID  string `json:"interfaceId"`
+	PortEnd      int    `json:"portEnd"`
+	PortStart    int    `json:"portStart"`
+	SelectedIpv4 string `json:"selectedIpv4"`
 }
 
 type LocalRoute struct {

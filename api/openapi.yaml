@@ -29,6 +29,13 @@ x-rig-problem-codes:
   migration_approval_conflict: {description: The migration approval changed while this request was being reviewed, statuses: [409]}
   deployment_plan_forbidden: {description: Administrator access is required to accept a deployment plan or approve its migration, statuses: [403]}
   relay_unavailable: {description: The configured controller relay is unavailable, statuses: [503]}
+  lan_gateway_forbidden: {description: Administrator access is required to inspect or configure the LAN gateway profile, statuses: [403]}
+  invalid_lan_gateway_request: {description: The LAN gateway profile request is invalid, statuses: [422]}
+  lan_gateway_interface_changed: {description: The selected host interface or private IPv4 address is no longer uniquely available, statuses: [409]}
+  lan_gateway_conflict: {description: The LAN gateway profile changed or is pinned by active LAN state, statuses: [409]}
+  lan_gateway_replay_conflict: {description: The LAN gateway operation identifier was already used for a different request, statuses: [409]}
+  lan_gateway_approval_mismatch: {description: The supplied confirmation digest does not approve the exact LAN gateway profile, statuses: [409]}
+  lan_gateway_unavailable: {description: LAN gateway profile state or safe host interface discovery is unavailable, statuses: [503]}
 x-job-responses: &jobResponses
   '200': {description: Existing idempotent job, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
   '202': {description: Job accepted, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
@@ -430,6 +437,30 @@ paths:
       responses:
         '200': {description: Live repository branches, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubBranchPage'}}}}
         default: {$ref: '#/components/responses/Problem'}
+  /api/v1/system/lan-gateway-profile:
+    get:
+      operationId: getLANGatewayProfile
+      x-rig-problem-codes: [lan_gateway_forbidden, invalid_lan_gateway_request, lan_gateway_interface_changed, lan_gateway_unavailable]
+      security: [{sessionCookie: []}]
+      description: Returns approved desired state and a fresh safe host-interface snapshot. Desired state is not proof of a running LAN listener. Supplying all four proposal query fields returns the server-canonical approval digest for that exact, currently selectable profile.
+      parameters:
+        - {name: interfaceId, in: query, required: false, schema: {type: string, minLength: 1, maxLength: 512}}
+        - {name: selectedIpv4, in: query, required: false, schema: {type: string, format: ipv4}}
+        - {name: portStart, in: query, required: false, schema: {type: integer, minimum: 8100, maximum: 8119}}
+        - {name: portEnd, in: query, required: false, schema: {type: integer, minimum: 8100, maximum: 8119}}
+      responses:
+        '200': {description: Desired LAN gateway profile, fresh candidates, and optional exact proposal confirmation, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayProfileRead'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      operationId: configureLANGatewayProfile
+      x-rig-problem-codes: [lan_gateway_forbidden, invalid_lan_gateway_request, lan_gateway_interface_changed, lan_gateway_conflict, lan_gateway_replay_conflict, lan_gateway_approval_mismatch, lan_gateway_unavailable]
+      description: Appends approved desired state after revalidating the selected host interface and address. This operation does not bind a port, change Docker, or report a LAN URL.
+      security: [{sessionCookie: [], csrfHeader: []}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ConfigureLANGatewayProfileRequest'}}}}
+      responses:
+        '200': {description: Existing exact idempotent desired profile revision, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayProfileMutation'}}}}
+        '201': {description: New desired LAN gateway profile revision, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayProfileMutation'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/relay/status:
     get:
       operationId: getRelayStatus
@@ -674,6 +705,68 @@ components:
     ConnectedGitHubRepositoryPage: {type: object, additionalProperties: false, required: [page, perPage, totalCount, truncated, items], properties: {page: {type: integer, minimum: 1}, perPage: {type: integer, minimum: 1, maximum: 100}, totalCount: {type: integer, minimum: 0}, truncated: {type: boolean}, items: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/ConnectedGitHubRepository'}}}}
     GitHubBranch: {type: object, required: [name, sha, protected], properties: {name: {type: string}, sha: {type: string}, protected: {type: boolean}}}
     GitHubBranchPage: {type: object, required: [page, perPage, items], properties: {page: {type: integer}, perPage: {type: integer}, items: {type: array, items: {$ref: '#/components/schemas/GitHubBranch'}}}}
+    LANGatewayProfileSpec:
+      type: object
+      additionalProperties: false
+      required: [selectedIpv4, interfaceId, portStart, portEnd]
+      properties:
+        selectedIpv4: {type: string, format: ipv4}
+        interfaceId: {type: string, minLength: 1, maxLength: 512}
+        portStart: {type: integer, minimum: 8100, maximum: 8119}
+        portEnd: {type: integer, minimum: 8100, maximum: 8119}
+    LANGatewayProfileRevision:
+      type: object
+      additionalProperties: false
+      required: [id, revisionNumber, operationId, spec, specDigest, approvedBy, approvedAt]
+      properties:
+        id: {type: string, format: uuid}
+        revisionNumber: {type: integer, format: int64, minimum: 1}
+        operationId: {type: string, format: uuid}
+        spec: {$ref: '#/components/schemas/LANGatewayProfileSpec'}
+        specDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        approvedBy: {type: string, format: uuid}
+        approvedAt: {type: string, format: date-time}
+    LANGatewayCandidate:
+      type: object
+      additionalProperties: false
+      required: [interfaceId, name, selectedIpv4, prefix]
+      properties:
+        interfaceId: {type: string, minLength: 1, maxLength: 512}
+        name: {type: string, minLength: 1, maxLength: 480}
+        selectedIpv4: {type: string, format: ipv4}
+        prefix: {type: string}
+    LANGatewayProfileProposal:
+      type: object
+      additionalProperties: false
+      required: [spec, approvalDigest]
+      properties:
+        spec: {$ref: '#/components/schemas/LANGatewayProfileSpec'}
+        approvalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANGatewayProfileRead:
+      type: object
+      additionalProperties: false
+      required: [expectedRevisionNumber, candidates]
+      properties:
+        expectedRevisionNumber: {type: integer, format: int64, minimum: 0}
+        desiredProfile: {$ref: '#/components/schemas/LANGatewayProfileRevision', x-go-pointer: true}
+        candidates: {type: array, items: {$ref: '#/components/schemas/LANGatewayCandidate'}}
+        proposal: {$ref: '#/components/schemas/LANGatewayProfileProposal', x-go-pointer: true}
+    ConfigureLANGatewayProfileRequest:
+      type: object
+      additionalProperties: false
+      required: [operationId, expectedRevisionNumber, spec, approvalDigest]
+      properties:
+        operationId: {type: string, format: uuid}
+        expectedRevisionNumber: {type: integer, format: int64, minimum: 0}
+        spec: {$ref: '#/components/schemas/LANGatewayProfileSpec'}
+        approvalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANGatewayProfileMutation:
+      type: object
+      additionalProperties: false
+      required: [profile, created]
+      properties:
+        profile: {$ref: '#/components/schemas/LANGatewayProfileRevision'}
+        created: {type: boolean}
     RelayStatus:
       type: object
       additionalProperties: false

@@ -279,7 +279,8 @@ func safeHandlerOperation(operation string) string {
 		operationRemoveRelayBinding, operationStartRelayKeyRotation,
 		operationGetApplicationAutoDeploy, operationUpdateApplicationAutoDeploy,
 		operationResumeApplicationAutoDeploy, operationAcceptDeploymentPlan,
-		operationApproveDeploymentMigration:
+		operationApproveDeploymentMigration, operationGetLANGatewayProfile,
+		operationConfigureLANGatewayProfile:
 		return operation
 	default:
 		return "unknown"
@@ -294,7 +295,10 @@ func safeHandlerProblemCode(code string) string {
 		"invalid_source", "authentication_required", "source_access_lost",
 		"invalid_auto_deploy_request", "auto_deploy_conflict", "auto_deploy_state_conflict",
 		"application_busy", "auto_deploy_forbidden", "auto_deploy_prerequisite_missing",
-		"app_not_found", "capability_unavailable", "deployment_plan_forbidden", "internal_error":
+		"app_not_found", "capability_unavailable", "deployment_plan_forbidden",
+		"lan_gateway_forbidden", "invalid_lan_gateway_request", "lan_gateway_interface_changed",
+		"lan_gateway_conflict", "lan_gateway_replay_conflict", "lan_gateway_approval_mismatch",
+		"lan_gateway_unavailable", "internal_error":
 		return code
 	default:
 		return "internal_error"

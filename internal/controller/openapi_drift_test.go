@@ -56,6 +56,13 @@ var expectedOpenAPIProblemCatalog = map[string]openAPIProblemCode{
 	"migration_approval_conflict":     {Description: "The migration approval changed while this request was being reviewed", Statuses: []int{409}},
 	"deployment_plan_forbidden":       {Description: "Administrator access is required to accept a deployment plan or approve its migration", Statuses: []int{403}},
 	"relay_unavailable":               {Description: "The configured controller relay is unavailable", Statuses: []int{503}},
+	"lan_gateway_forbidden":           {Description: "Administrator access is required to inspect or configure the LAN gateway profile", Statuses: []int{403}},
+	"invalid_lan_gateway_request":     {Description: "The LAN gateway profile request is invalid", Statuses: []int{422}},
+	"lan_gateway_interface_changed":   {Description: "The selected host interface or private IPv4 address is no longer uniquely available", Statuses: []int{409}},
+	"lan_gateway_conflict":            {Description: "The LAN gateway profile changed or is pinned by active LAN state", Statuses: []int{409}},
+	"lan_gateway_replay_conflict":     {Description: "The LAN gateway operation identifier was already used for a different request", Statuses: []int{409}},
+	"lan_gateway_approval_mismatch":   {Description: "The supplied confirmation digest does not approve the exact LAN gateway profile", Statuses: []int{409}},
+	"lan_gateway_unavailable":         {Description: "LAN gateway profile state or safe host interface discovery is unavailable", Statuses: []int{503}},
 }
 
 var expectedOpenAPIOperationProblemCodes = map[string][]string{
@@ -87,6 +94,8 @@ var expectedOpenAPIOperationProblemCodes = map[string][]string{
 	"startRelayKeyRotation":                     {"relay_unavailable"},
 	"updateApplicationAutoDeploy":               {"source_access_lost", "application_busy"},
 	"resumeApplicationAutoDeploy":               {"source_access_lost"},
+	"getLANGatewayProfile":                      {"lan_gateway_forbidden", "invalid_lan_gateway_request", "lan_gateway_interface_changed", "lan_gateway_unavailable"},
+	"configureLANGatewayProfile":                {"lan_gateway_forbidden", "invalid_lan_gateway_request", "lan_gateway_interface_changed", "lan_gateway_conflict", "lan_gateway_replay_conflict", "lan_gateway_approval_mismatch", "lan_gateway_unavailable"},
 }
 
 func TestOpenAPIContractMatchesRegisteredRoutes(t *testing.T) {
