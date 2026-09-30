@@ -87,6 +87,13 @@ func (m *Manager) UpgradeGatewayV2(ctx context.Context, request GatewayV2Upgrade
 		return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
 	}
 	store := selection.Store
+	if selection.Aborted {
+		failure := gatewayV2CoordinatorError(ctx)
+		if m.finalizeGatewayV2PreparationAbortLocked(ctx, request) == nil {
+			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeRolledBack}, failure
+		}
+		return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, failure
+	}
 	stageDriver := m.gatewayV2UpgradeDriver
 	if stageDriver == nil {
 		stageDriver = managerGatewayV2UpgradeDriver{manager: m}
@@ -100,7 +107,7 @@ func (m *Manager) UpgradeGatewayV2(ctx context.Context, request GatewayV2Upgrade
 	if !selection.Existing {
 		source, sourceErr := m.store.load()
 		if sourceErr != nil {
-			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
+			return m.gatewayV2PreparationFailureResult(ctx, request, gatewayV2CoordinatorError(ctx))
 		}
 		coordinatorDriver := m.gatewayV2CoordinatorDriver
 		if coordinatorDriver == nil {
@@ -115,25 +122,25 @@ func (m *Manager) UpgradeGatewayV2(ctx context.Context, request GatewayV2Upgrade
 		} else {
 			preparation.Network, err = coordinatorDriver.selectNetworkPlan(ctx, preparation.Profile)
 			if err != nil {
-				return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, err
+				return m.gatewayV2PreparationFailureResult(ctx, request, err)
 			}
 		}
 		preparation.SourceIdentityDigest, err = coordinatorDriver.attestSourceV1(ctx, source, preparation)
 		if err != nil {
-			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, err
+			return m.gatewayV2PreparationFailureResult(ctx, request, err)
 		}
 		if err := stageDriver.hostPreflight(ctx, preparation.Profile, preparation.Network); err != nil {
-			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, err
+			return m.gatewayV2PreparationFailureResult(ctx, request, err)
 		}
 		state, journal, err = prepareGatewayV2State(source, preparation)
 		if err != nil {
-			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
+			return m.gatewayV2PreparationFailureResult(ctx, request, gatewayV2CoordinatorError(ctx))
 		}
 		if selection.PartialState && !reflect.DeepEqual(state, selection.State) {
-			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
+			return m.gatewayV2PreparationFailureResult(ctx, request, gatewayV2CoordinatorError(ctx))
 		}
 		if err := prepareGatewayV2ProtectedState(store, state, journal); err != nil {
-			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
+			return m.gatewayV2PreparationFailureResult(ctx, request, gatewayV2CoordinatorError(ctx))
 		}
 	}
 	if !gatewayV2RequestMatchesState(request, state, journal) || journal.Source.LocalHostPort != m.options.HostPort {
@@ -167,6 +174,16 @@ func (m *Manager) UpgradeGatewayV2(ctx context.Context, request GatewayV2Upgrade
 		return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, gatewayV2CoordinatorError(ctx)
 	}
 	return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeCommitted}, nil
+}
+
+func (m *Manager) gatewayV2PreparationFailureResult(ctx context.Context, request GatewayV2UpgradeRequest, original error) (GatewayV2UpgradeResult, error) {
+	if original == nil {
+		original = gatewayV2CoordinatorError(ctx)
+	}
+	if m.finalizeGatewayV2PreparationAbortLocked(ctx, request) == nil {
+		return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeRolledBack}, original
+	}
+	return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, original
 }
 
 func gatewayV2UpgradePreparation(request GatewayV2UpgradeRequest) (gatewayUpgradePreparation, error) {

@@ -64,15 +64,16 @@ func TestUpgradeGatewayV2RejectsEveryMismatchedResumeBinding(t *testing.T) {
 	}
 }
 
-func TestUpgradeGatewayV2FailedNetworkSelectionWritesNoProtectedState(t *testing.T) {
+func TestUpgradeGatewayV2FailedNetworkSelectionDurablyAbortsWithoutInventingPlan(t *testing.T) {
 	manager, store, request, sourceDriver, stageDriver, transferDriver, _ := gatewayV2CoordinatorTestFixture(t)
 	sourceDriver.selectErr = errors.New("injected incomplete Docker inventory")
 
 	result, err := manager.UpgradeGatewayV2(context.Background(), request)
-	if err == nil || result.Outcome != GatewayV2UpgradeUnresolved {
+	if err == nil || result.Outcome != GatewayV2UpgradeRolledBack {
 		t.Fatalf("selection failure result=%+v err=%v", result, err)
 	}
-	if sourceDriver.selectCalls != 1 || sourceDriver.calls != 0 || stageDriver.createCalls != 0 || transferDriver.createCalls != 0 {
+	if sourceDriver.selectCalls != 1 || sourceDriver.calls != 0 || sourceDriver.abortCalls != 1 ||
+		stageDriver.createCalls != 0 || transferDriver.createCalls != 0 {
 		t.Fatalf("drivers after selection failure: source=%+v stage=%+v transfer=%+v", sourceDriver, stageDriver, transferDriver)
 	}
 	if _, stateErr := store.loadV2State(); stateErr == nil {
@@ -80,6 +81,9 @@ func TestUpgradeGatewayV2FailedNetworkSelectionWritesNoProtectedState(t *testing
 	}
 	if _, journalErr := store.loadMigrationJournal(); journalErr == nil {
 		t.Fatal("migration journal was written after failed network selection")
+	}
+	if receipt, abortErr := store.loadPreJournalAbortReceipt(); abortErr != nil || receipt.NetworkPlanDigest != "" {
+		t.Fatalf("network-selection abort receipt=%+v err=%v", receipt, abortErr)
 	}
 }
 
@@ -218,7 +222,7 @@ func TestUpgradeGatewayV2MarksUnknownStageTopologyUnresolved(t *testing.T) {
 	}
 }
 
-func TestUpgradeGatewayV2DoesNotMaskProtectedPreparationFailure(t *testing.T) {
+func TestUpgradeGatewayV2ResolvesProtectedPreparationFailureAtDurableBoundary(t *testing.T) {
 	for _, purpose := range []string{v2RouteStatePurpose, gatewayMigrationPurpose} {
 		t.Run(purpose, func(t *testing.T) {
 			manager, store, request, sourceDriver, _, _, _ := gatewayV2CoordinatorTestFixture(t)
@@ -242,27 +246,40 @@ func TestUpgradeGatewayV2DoesNotMaskProtectedPreparationFailure(t *testing.T) {
 			t.Cleanup(restore)
 
 			result, err := manager.UpgradeGatewayV2(context.Background(), request)
-			if err == nil || result.Outcome != GatewayV2UpgradeUnresolved {
-				t.Fatalf("post-install failure result = %+v, err=%v", result, err)
+			wantOutcome := GatewayV2UpgradeRolledBack
+			if purpose == gatewayMigrationPurpose {
+				wantOutcome = GatewayV2UpgradeUnresolved
+			}
+			if err == nil || result.Outcome != wantOutcome {
+				t.Fatalf("post-install failure result = %+v, err=%v, want %s", result, err, wantOutcome)
 			}
 			if _, stateErr := store.loadV2State(); stateErr != nil {
 				t.Fatalf("installed state missing after injected failure: %v", stateErr)
 			}
-			selectionsBeforeRetry := sourceDriver.selectCalls
+			if purpose == v2RouteStatePurpose {
+				if _, abortErr := store.loadPreJournalAbortReceipt(); abortErr != nil || sourceDriver.abortCalls != 1 {
+					t.Fatalf("state-only failure lacked abort receipt: err=%v driver=%+v", abortErr, sourceDriver)
+				}
+				if _, journalErr := store.loadMigrationJournal(); journalErr == nil {
+					t.Fatal("state-only abort unexpectedly installed journal")
+				}
+			} else {
+				_, journal, loadErr := store.loadBoundUpgrade(request.OperationID)
+				if loadErr != nil || journal.Phase != gatewayPhasePrepared || sourceDriver.abortCalls != 0 {
+					t.Fatalf("complete pair after reported create error: journal=%+v err=%v driver=%+v", journal, loadErr, sourceDriver)
+				}
+				if _, abortErr := store.loadPreJournalAbortReceipt(); abortErr == nil {
+					t.Fatal("complete pair was incorrectly converted to a pre-journal abort")
+				}
+			}
 			restore()
 			result, err = manager.UpgradeGatewayV2(context.Background(), request)
-			if err != nil || result.Outcome != GatewayV2UpgradeCommitted {
-				t.Fatalf("fresh retry result = %+v, err=%v", result, err)
-			}
-			wantSourceCalls := 1
 			if purpose == v2RouteStatePurpose {
-				wantSourceCalls = 2
-			}
-			if sourceDriver.calls != wantSourceCalls {
-				t.Fatalf("source attestations = %d, want %d", sourceDriver.calls, wantSourceCalls)
-			}
-			if purpose == v2RouteStatePurpose && sourceDriver.selectCalls != selectionsBeforeRetry {
-				t.Fatalf("state-only recovery reselected network: before=%d after=%d", selectionsBeforeRetry, sourceDriver.selectCalls)
+				if err == nil || result.Outcome != GatewayV2UpgradeRolledBack || sourceDriver.abortCalls != 2 {
+					t.Fatalf("state-only abort replay result=%+v err=%v driver=%+v", result, err, sourceDriver)
+				}
+			} else if err != nil || result.Outcome != GatewayV2UpgradeCommitted || sourceDriver.abortCalls != 0 {
+				t.Fatalf("complete-pair restart result=%+v err=%v driver=%+v", result, err, sourceDriver)
 			}
 		})
 	}
@@ -385,6 +402,9 @@ type fakeGatewayV2CoordinatorDriver struct {
 	osLockHeld  *bool
 	digest      string
 	calls       int
+	attestErr   error
+	abortCalls  int
+	abortErr    error
 	plan        gatewayV2NetworkPlan
 	selectErr   error
 	selectCalls int
@@ -426,7 +446,20 @@ func (d *fakeGatewayV2CoordinatorDriver) attestSourceV1(context.Context, routeSt
 	if d.osLockHeld == nil || !*d.osLockHeld {
 		d.t.Error("source attestation ran without OS lock")
 	}
-	return d.digest, nil
+	return d.digest, d.attestErr
+}
+
+func (d *fakeGatewayV2CoordinatorDriver) attestPreparationAbort(context.Context, routeState, gatewayUpgradePreparation) (string, error) {
+	d.t.Helper()
+	d.abortCalls++
+	if d.manager.mu.TryLock() {
+		d.manager.mu.Unlock()
+		d.t.Error("pre-journal abort attestation ran without Manager lock")
+	}
+	if d.osLockHeld == nil || !*d.osLockHeld {
+		d.t.Error("pre-journal abort attestation ran without OS lock")
+	}
+	return d.digest, d.abortErr
 }
 
 func (d *fakeGatewayV2CoordinatorDriver) checkRetirementLocked() {
@@ -570,5 +603,6 @@ func mustGatewayV2CoordinatorActionDigest(t *testing.T, profile GatewayV2Profile
 }
 
 var _ gatewayV2CoordinatorDriver = (*fakeGatewayV2CoordinatorDriver)(nil)
+var _ gatewayV2PreparationAbortDriver = (*fakeGatewayV2CoordinatorDriver)(nil)
 var _ gatewayV2RollbackRetirementDriver = (*fakeGatewayV2CoordinatorDriver)(nil)
 var _ gatewayV2TransferDriver = (*gatewayV2CoordinatorFinalProofDriver)(nil)
