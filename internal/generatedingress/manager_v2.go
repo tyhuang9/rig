@@ -84,7 +84,7 @@ func (m *Manager) switchCommittedV2Locked(ctx context.Context, store *gatewayUpg
 	}
 
 	pendingState := cloneGatewayV2RouteState(state)
-	pendingState.Pending = &gatewayV2PendingRoute{AppID: request.AppID, Proposed: cloneGatewayV2AppRoute(proposed)}
+	pendingState.Pending = &gatewayV2PendingRoute{Kind: gatewayV2PendingRouteSwitch, AppID: request.AppID, Proposed: cloneGatewayV2AppRoute(proposed)}
 	if hadPrevious {
 		copy := cloneGatewayV2AppRoute(previous)
 		pendingState.Pending.Previous = &copy
@@ -214,6 +214,13 @@ func (m *Manager) rollbackCommittedV2PendingLocked(ctx context.Context, store *g
 		if m.observeV2Topology(rollbackCtx, source, committed, journal) != gatewayTopologyExactFinalV2 {
 			return gatewayV2RouteState{}, candidateMayBeLiveError()
 		}
+	}
+	// An activation-uncertain LAN grant was durably armed before the external
+	// allocation transition. Recovery can make Caddy fail closed, but only a
+	// future controller/DB reconciliation can decide whether that allocation
+	// committed. Preserve the marker and block ordinary startup until then.
+	if state.Pending.Kind == gatewayV2PendingLANGrant && state.Pending.ActivationUncertain {
+		return state, &Error{Code: DiagnosticRouteUnresolved}
 	}
 	if err := store.saveCommittedV2State(committed, journal); err != nil {
 		return gatewayV2RouteState{}, candidateMayBeLiveError()

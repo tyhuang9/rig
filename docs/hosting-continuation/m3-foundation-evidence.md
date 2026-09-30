@@ -560,3 +560,43 @@ administrator and exact-owner validation, replay, stale requests, active and
 uncertain allocation freezes, direct SQL release denial, and two database
 handles contending for the same intent. Live Docker route removal, a physical
 second-device visit, and UI behavior remain unverified and outside this branch.
+
+## LAN grant gateway foundation: local evidence
+
+The next local M3 branch prepares a single-app LAN grant transaction inside
+generated ingress. Its primitive and authorization lease types are unexported
+and have no production caller. It adds an exact revision-bound assigned-port
+challenge, an explicit protected `lan_grant` pending kind, candidate network
+and endpoint rechecks before Caddy reload, selected-interface rechecks, and a
+receipt without a URL. Deployment route switches cannot create LAN bindings.
+
+A grant interrupted between live Caddy reload and restart-config installation
+can be classified as mixed only for an exact nil-to-binding transition and
+rolled back to the prior 404 route. Before SQLite activation, the protected
+pending state gains an `activationUncertain` marker. An ambiguous activation
+result can roll Caddy back to proven 404, but generic recovery retains that
+marker and blocks normal startup until future database reconciliation decides
+the allocation outcome. This is a fail-closed foundation, not a LAN access
+action.
+
+Verification on the final local candidate:
+
+- `go test -count=1 ./internal/generatedingress ./cmd/hostd` — pass.
+- `go test -count=1 -p 1 ./...` — pass across all Go packages.
+- `go vet ./...` — pass.
+- `git diff --check` — pass.
+- Manual security and aggregate code re-reviews — GO for a local foundation
+  commit, NO-GO for controller exposure or M3 acceptance. CodeRabbit was not
+  available in this environment.
+
+Focused tests cover exact binding/replay, lock contention, unauthorized and
+stale candidates, wrong-Host and 404 proofs, interface and endpoint drift,
+mixed restart topology, reload failure, ambiguous SQLite activation, and
+retention of the uncertainty marker through recovery. The tests use a fake
+authorization lease; no real SQLite cross-store lease or durable grant claim
+has been implemented. A future controller slice must reconcile SQLite
+reserved/active/uncertain ownership with protected gateway pending/committed
+state before this primitive is exposed or a URL is displayed. No live Docker,
+physical second-device, or browser-to-database LAN journey has run for this
+branch. A focused Go race run was unavailable because this Windows Go runtime
+has CGO disabled.

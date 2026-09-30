@@ -629,14 +629,22 @@ func validGatewayV2MixedRouteTransition(committed, proposed gatewayV2RouteState)
 	}
 	pendingState := cloneGatewayV2RouteState(committed)
 	var previous *gatewayV2AppRoute
+	pendingKind := gatewayV2PendingRouteSwitch
 	if committedApp, exists := committed.Apps[changedAppID]; exists {
-		if committedApp.Route.Slot == proposedApp.Route.Slot {
+		switch {
+		case committedApp.Route.Slot != proposedApp.Route.Slot:
+			pendingKind = gatewayV2PendingRouteSwitch
+		case reflect.DeepEqual(committedApp.Route, proposedApp.Route) && committedApp.LAN == nil && proposedApp.LAN != nil:
+			pendingKind = gatewayV2PendingLANGrant
+		default:
 			return false
 		}
 		cloned := cloneGatewayV2AppRoute(committedApp)
 		previous = &cloned
 	}
-	pendingState.Pending = &gatewayV2PendingRoute{AppID: changedAppID, Previous: previous, Proposed: cloneGatewayV2AppRoute(proposedApp)}
+	pendingState.Pending = &gatewayV2PendingRoute{
+		Kind: pendingKind, AppID: changedAppID, Previous: previous, Proposed: cloneGatewayV2AppRoute(proposedApp),
+	}
 	return validGatewayV2RouteState(pendingState)
 }
 
@@ -1229,13 +1237,17 @@ func buildGatewayV2StageConfig(state gatewayV2RouteState) ([]byte, error) {
 	return json.Marshal(caddyConfig{Admin: caddyAdmin{Listen: "localhost:2019"}, Apps: caddyApps{HTTP: caddyHTTP{Servers: servers}}})
 }
 
-func gatewayV2ConfigInputs(state gatewayV2RouteState) (map[string]routeRecord, map[uint16]string) {
+func gatewayV2ConfigInputs(state gatewayV2RouteState) (map[string]routeRecord, map[uint16]caddyV2LANAssignment) {
 	routes := make(map[string]routeRecord, len(state.Apps))
-	assignments := make(map[uint16]string)
+	assignments := make(map[uint16]caddyV2LANAssignment)
 	for appID, app := range state.Apps {
 		routes[appID] = app.Route
 		if app.LAN != nil {
-			assignments[app.LAN.Port] = appID
+			assignments[app.LAN.Port] = caddyV2LANAssignment{
+				AppID: appID, AllocationID: app.LAN.AllocationID,
+				AccessRevisionID: app.LAN.AccessRevisionID, AccessRevisionNumber: app.LAN.AccessRevisionNumber,
+				AccessSpecDigest: app.LAN.AccessSpecDigest,
+			}
 		}
 	}
 	return routes, assignments
@@ -1594,7 +1606,12 @@ func proveGatewayV2FinalHostPublication(ctx context.Context, state gatewayV2Rout
 		if ctx.Err() != nil || !result.Connected || !result.Responded {
 			return false
 		}
-		if _, assigned := assignments[port]; assigned {
+		if assignment, assigned := assignments[port]; assigned {
+			appChallenge := gatewayV2LANAppChallenge(challenge, port, assignment)
+			if !exactGatewayV2HostChallenge(ctx, probe, state.Profile.SelectedIPv4, port, state.Profile.SelectedIPv4, appChallenge) ||
+				!containerProbe(ctx, caddyID, state.Network.ContainerIPv4, port, state.Profile.SelectedIPv4, appChallenge) {
+				return false
+			}
 			if result.Status < 200 || result.Status > 599 {
 				return false
 			}

@@ -74,6 +74,7 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 	allHistoryTerminal := true
 	recoveryOperationID := ""
 	var committed *gatewayUpgradeGenerationSelection
+	var pendingCommitted *gatewayUpgradeGenerationSelection
 	for index := range history.generations {
 		selection := history.generations[index]
 		claim, ok := claimSet.byOperation[selection.operationID]
@@ -98,7 +99,12 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 			switch claim.State {
 			case appaccess.GatewayProfileUpgradeCommitted:
 				copy := selection
-				committed = &copy
+				if selection.State.Pending != nil {
+					pendingCommitted = &copy
+					recoveryOperationID = claim.Request.OperationID
+				} else {
+					committed = &copy
+				}
 			case appaccess.GatewayProfileUpgradePrepared,
 				appaccess.GatewayProfileUpgradeServing,
 				appaccess.GatewayProfileUpgradeUnresolved:
@@ -132,6 +138,9 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 
 	proofCtx, cancel := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancel()
+	if pendingCommitted != nil && !m.proveGatewayV2StartupPending(proofCtx, source, *pendingCommitted) {
+		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+	}
 	switch {
 	case committed != nil && recoveryOperationID == "":
 		if !m.proveGatewayV2StartupCommitted(proofCtx, source, *committed) {
@@ -178,6 +187,26 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
 	}
 	return inspection, nil
+}
+
+func (m *Manager) proveGatewayV2StartupPending(ctx context.Context, source routeState,
+	selection gatewayUpgradeGenerationSelection,
+) bool {
+	if selection.Store == nil || !selection.Existing || selection.Aborted ||
+		selection.Journal.Phase != gatewayPhaseCommitted || selection.State.Pending == nil ||
+		selection.State.Pending.Kind != gatewayV2PendingLANGrant {
+		return false
+	}
+	committed := cloneGatewayV2RouteState(selection.State)
+	committed.Pending = nil
+	proposed := cloneGatewayV2RouteState(committed)
+	proposed.Apps[selection.State.Pending.AppID] = cloneGatewayV2AppRoute(selection.State.Pending.Proposed)
+	switch m.observeCommittedV2PendingTopology(ctx, source, committed, proposed, selection.Journal) {
+	case gatewayV2PendingCommittedExact, gatewayV2PendingProposedExact, gatewayV2PendingReloadOnlyMixed:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateGatewayV2StartupClaims(claims []GatewayV2StartupClaim) (gatewayV2StartupClaimSet, error) {
