@@ -47,7 +47,7 @@ func TestPrepareGatewayV2StateBindsCanonicalPlanAndDeepCopiesV1(t *testing.T) {
 	}
 	if journal.Phase != gatewayPhasePrepared || journal.Source.Format != 1 || journal.Target.Format != 2 ||
 		journal.Source.StateDigest != state.SourceV1StateDigest || journal.Target.IdentityDigest != state.Identity.Digest ||
-		journal.UpgradeAction.ApprovedBy != upgradeTestActor {
+		journal.UpgradeAction.ApprovedBy != upgradeTestActor || journal.Resources != (gatewayV2ResourceBindings{}) {
 		t.Fatalf("journal = %#v", journal)
 	}
 	stateDigest, _ := canonicalDigest(state)
@@ -253,6 +253,7 @@ func TestGatewayMigrationTransitionsReplayAndStopOnAmbiguousWrite(t *testing.T) 
 	if _, err := store.transitionMigrationJournal(operationID, gatewayPhasePrepared, gatewayPhaseRollbackIntent); err == nil {
 		t.Fatal("stale expected phase was accepted")
 	}
+	bindUpgradeStageResources(t, store, operationID)
 
 	originalWrite := upgradeProtectedWrite
 	upgradeProtectedWrite = func(path, purpose string, plaintext []byte) error {
@@ -272,11 +273,12 @@ func TestGatewayMigrationTransitionsReplayAndStopOnAmbiguousWrite(t *testing.T) 
 		t.Fatalf("protected journal after ambiguous write = %#v err=%v", observed, err)
 	}
 
-	for _, transition := range [][2]gatewayMigrationPhase{
-		{gatewayPhaseStaged, gatewayPhaseTransferIntent},
-		{gatewayPhaseTransferIntent, gatewayPhaseV2Serving},
-		{gatewayPhaseV2Serving, gatewayPhaseCommitted},
-	} {
+	installed, err = store.transitionMigrationJournal(operationID, gatewayPhaseStaged, gatewayPhaseTransferIntent)
+	if err != nil || installed.Phase != gatewayPhaseTransferIntent {
+		t.Fatalf("transfer intent = %#v err=%v", installed, err)
+	}
+	bindUpgradeFinalResource(t, store, operationID)
+	for _, transition := range [][2]gatewayMigrationPhase{{gatewayPhaseTransferIntent, gatewayPhaseV2Serving}, {gatewayPhaseV2Serving, gatewayPhaseCommitted}} {
 		installed, err = store.transitionMigrationJournal(operationID, transition[0], transition[1])
 		if err != nil || installed.Phase != transition[1] {
 			t.Fatalf("transition %s -> %s = %#v err=%v", transition[0], transition[1], installed, err)
@@ -303,6 +305,153 @@ func TestGatewayMigrationTransitionsReplayAndStopOnAmbiguousWrite(t *testing.T) 
 	}
 	if _, err := uncertainStore.transitionMigrationJournal(uncertainJournal.OperationID, gatewayPhaseUncertain, gatewayPhaseRollbackIntent); err == nil {
 		t.Fatal("uncertain journal exited terminal phase")
+	}
+}
+
+func TestGatewayMigrationResourceBindingsAreMonotonicAndPhaseRequired(t *testing.T) {
+	store, _, journal, _ := persistedUpgradeFixture(t)
+	operationID := journal.OperationID
+	if _, err := store.bindMigrationDockerResource(operationID, gatewayPhasePrepared, gatewayV2ResourceImage, upgradeResourceID('a')); err == nil {
+		t.Fatal("resource was bound before stage intent")
+	}
+	if _, err := store.transitionMigrationJournal(operationID, gatewayPhasePrepared, gatewayPhaseStageIntent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.transitionMigrationJournal(operationID, gatewayPhaseStageIntent, gatewayPhaseStaged); err == nil {
+		t.Fatal("staged phase accepted incomplete resource identities")
+	}
+
+	bound, err := store.bindMigrationDockerResource(operationID, gatewayPhaseStageIntent, gatewayV2ResourceImage, "sha256:"+upgradeResourceID('a'))
+	if err != nil || bound.Resources.ImageID != upgradeResourceID('a') {
+		t.Fatalf("image binding = %#v err=%v", bound.Resources, err)
+	}
+	if replay, err := store.bindMigrationDockerResource(operationID, gatewayPhaseStageIntent, gatewayV2ResourceImage, upgradeResourceID('a')); err != nil || !reflect.DeepEqual(replay, bound) {
+		t.Fatalf("exact image replay = %#v err=%v", replay, err)
+	}
+	if _, err := store.bindMigrationDockerResource(operationID, gatewayPhaseStageIntent, gatewayV2ResourceImage, upgradeResourceID('f')); err == nil {
+		t.Fatal("image identity replacement was accepted")
+	}
+
+	configIdentity := upgradeConfigVolumeIdentity()
+	bound, err = store.bindMigrationVolumeResource(operationID, gatewayPhaseStageIntent, gatewayV2ResourceConfigVolume, configIdentity)
+	if err != nil || bound.Resources.ConfigVolume.IdentityDigest == "" || bound.Resources.ConfigVolume.Mountpoint != configIdentity.Mountpoint {
+		t.Fatalf("config volume binding = %#v err=%v", bound.Resources.ConfigVolume, err)
+	}
+	changedConfig := configIdentity
+	changedConfig.CreatedAt = "2026-09-29T12:00:01Z"
+	if _, err := store.bindMigrationVolumeResource(operationID, gatewayPhaseStageIntent, gatewayV2ResourceConfigVolume, changedConfig); err == nil {
+		t.Fatal("volume creation identity replacement was accepted")
+	}
+	bindUpgradeRemainingStageResources(t, store, operationID)
+	staged, err := store.transitionMigrationJournal(operationID, gatewayPhaseStageIntent, gatewayPhaseStaged)
+	if err != nil || staged.Phase != gatewayPhaseStaged {
+		t.Fatalf("staged journal = %#v err=%v", staged, err)
+	}
+	if _, err := store.bindMigrationDockerResource(operationID, gatewayPhaseStaged, gatewayV2ResourceFinalContainer, upgradeResourceID('e')); err == nil {
+		t.Fatal("final container was bound before transfer intent")
+	}
+	if _, err := store.transitionMigrationJournal(operationID, gatewayPhaseStaged, gatewayPhaseTransferIntent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.transitionMigrationJournal(operationID, gatewayPhaseTransferIntent, gatewayPhaseV2Serving); err == nil {
+		t.Fatal("v2 serving accepted a missing final container identity")
+	}
+	final := bindUpgradeFinalResource(t, store, operationID)
+	if replay, err := store.bindMigrationDockerResource(operationID, gatewayPhaseTransferIntent, gatewayV2ResourceFinalContainer, "sha256:"+upgradeResourceID('e')); err != nil || !reflect.DeepEqual(replay, final) {
+		t.Fatalf("exact final replay = %#v err=%v", replay, err)
+	}
+	if _, err := store.bindMigrationDockerResource(operationID, gatewayPhaseTransferIntent, gatewayV2ResourceFinalContainer, upgradeResourceID('f')); err == nil {
+		t.Fatal("final container identity replacement was accepted")
+	}
+	serving, err := store.transitionMigrationJournal(operationID, gatewayPhaseTransferIntent, gatewayPhaseV2Serving)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := store.transitionMigrationJournal(operationID, gatewayPhaseV2Serving, gatewayPhaseCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(serving.Resources, committed.Resources) || committed.Resources.FinalContainerID != upgradeResourceID('e') || committed.Resources.StageContainerID != upgradeResourceID('d') {
+		t.Fatalf("historical resource identities changed: serving=%#v committed=%#v", serving.Resources, committed.Resources)
+	}
+	if replay, err := store.bindMigrationDockerResource(operationID, gatewayPhaseCommitted, gatewayV2ResourceFinalContainer, upgradeResourceID('e')); err != nil || !reflect.DeepEqual(replay, committed) {
+		t.Fatalf("terminal exact resource replay = %#v err=%v", replay, err)
+	}
+	if _, err := store.bindMigrationDockerResource(operationID, gatewayPhaseCommitted, gatewayV2ResourceFinalContainer, upgradeResourceID('f')); err == nil {
+		t.Fatal("terminal resource identity replacement was accepted")
+	}
+}
+
+func TestGatewayMigrationResourceBindingAmbiguousWriteRequiresFreshRead(t *testing.T) {
+	store, _, journal, _ := persistedUpgradeFixture(t)
+	if _, err := store.transitionMigrationJournal(journal.OperationID, gatewayPhasePrepared, gatewayPhaseStageIntent); err != nil {
+		t.Fatal(err)
+	}
+	originalWrite := upgradeProtectedWrite
+	upgradeProtectedWrite = func(path, purpose string, plaintext []byte) error {
+		if err := originalWrite(path, purpose, plaintext); err != nil {
+			return err
+		}
+		return errors.New("injected post-install resource binding error")
+	}
+	t.Cleanup(func() { upgradeProtectedWrite = originalWrite })
+	if _, err := store.bindMigrationDockerResource(journal.OperationID, gatewayPhaseStageIntent, gatewayV2ResourceImage, upgradeResourceID('a')); err == nil {
+		t.Fatal("ambiguous resource write was treated as durable success")
+	}
+	upgradeProtectedWrite = originalWrite
+	observed, err := store.loadMigrationJournal()
+	if err != nil || observed.Resources.ImageID != upgradeResourceID('a') {
+		t.Fatalf("fresh journal after ambiguous binding = %#v err=%v", observed, err)
+	}
+	if replay, err := store.bindMigrationDockerResource(journal.OperationID, gatewayPhaseStageIntent, gatewayV2ResourceImage, upgradeResourceID('a')); err != nil || replay.Resources.ImageID != upgradeResourceID('a') {
+		t.Fatalf("fresh exact replay = %#v err=%v", replay, err)
+	}
+}
+
+func TestGatewayMigrationRollbackRetainsPartialResourceHistory(t *testing.T) {
+	store, _, journal, _ := persistedUpgradeFixture(t)
+	if _, err := store.transitionMigrationJournal(journal.OperationID, gatewayPhasePrepared, gatewayPhaseStageIntent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.bindMigrationDockerResource(journal.OperationID, gatewayPhaseStageIntent, gatewayV2ResourceImage, upgradeResourceID('a')); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.bindMigrationDockerResource(journal.OperationID, gatewayPhaseStageIntent, gatewayV2ResourceIngressNetwork, upgradeResourceID('b')); err != nil {
+		t.Fatal(err)
+	}
+	rollback, err := store.transitionMigrationJournal(journal.OperationID, gatewayPhaseStageIntent, gatewayPhaseRollbackIntent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rolledBack, err := store.transitionMigrationJournal(journal.OperationID, gatewayPhaseRollbackIntent, gatewayPhaseRolledBack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(rollback.Resources, rolledBack.Resources) || rolledBack.Resources.ImageID != upgradeResourceID('a') || rolledBack.Resources.IngressNetworkID != upgradeResourceID('b') {
+		t.Fatalf("rollback resource history changed: intent=%#v terminal=%#v", rollback.Resources, rolledBack.Resources)
+	}
+	if _, err := store.bindMigrationVolumeResource(journal.OperationID, gatewayPhaseRolledBack, gatewayV2ResourceConfigVolume, upgradeConfigVolumeIdentity()); err == nil {
+		t.Fatal("terminal rollback accepted a new resource identity")
+	}
+}
+
+func TestGatewayMigrationJournalRejectsInvalidResourceDependencies(t *testing.T) {
+	_, _, journal, _ := persistedUpgradeFixture(t)
+	journal.Phase = gatewayPhaseStageIntent
+	journal.Resources.StageContainerID = upgradeResourceID('d')
+	if validGatewayMigrationJournal(journal) {
+		t.Fatal("stage container without image/network/volumes was accepted")
+	}
+	journal.Resources = gatewayV2ResourceBindings{ImageID: upgradeResourceID('a')}
+	journal.Phase = gatewayPhaseStaged
+	if validGatewayMigrationJournal(journal) {
+		t.Fatal("staged phase with partial resources was accepted")
+	}
+	journal.Resources = gatewayV2ResourceBindings{}
+	journal.Phase = gatewayPhasePrepared
+	journal.Resources.ConfigVolume = gatewayV2VolumeResourceBinding{IdentityDigest: upgradeResourceID('a')}
+	if validGatewayMigrationJournal(journal) {
+		t.Fatal("partial volume creation identity was accepted")
 	}
 }
 
@@ -359,13 +508,17 @@ func TestGatewayV2StateValidatesLANBindingDigestsAndUniquePorts(t *testing.T) {
 
 func TestCommittedMigrationKeepsInitialDigestAsHistoryAndAllowsValidRouteEvolution(t *testing.T) {
 	store, state, journal, _ := persistedUpgradeFixture(t)
-	for _, transition := range [][2]gatewayMigrationPhase{
-		{gatewayPhasePrepared, gatewayPhaseStageIntent},
-		{gatewayPhaseStageIntent, gatewayPhaseStaged},
-		{gatewayPhaseStaged, gatewayPhaseTransferIntent},
-		{gatewayPhaseTransferIntent, gatewayPhaseV2Serving},
-		{gatewayPhaseV2Serving, gatewayPhaseCommitted},
-	} {
+	if _, err := store.transitionMigrationJournal(journal.OperationID, gatewayPhasePrepared, gatewayPhaseStageIntent); err != nil {
+		t.Fatal(err)
+	}
+	bindUpgradeStageResources(t, store, journal.OperationID)
+	for _, transition := range [][2]gatewayMigrationPhase{{gatewayPhaseStageIntent, gatewayPhaseStaged}, {gatewayPhaseStaged, gatewayPhaseTransferIntent}} {
+		if _, err := store.transitionMigrationJournal(journal.OperationID, transition[0], transition[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bindUpgradeFinalResource(t, store, journal.OperationID)
+	for _, transition := range [][2]gatewayMigrationPhase{{gatewayPhaseTransferIntent, gatewayPhaseV2Serving}, {gatewayPhaseV2Serving, gatewayPhaseCommitted}} {
 		if _, err := store.transitionMigrationJournal(journal.OperationID, transition[0], transition[1]); err != nil {
 			t.Fatal(err)
 		}
@@ -523,6 +676,53 @@ func bindLANForTest(t *testing.T, state *gatewayV2RouteState, appID string, port
 		ProfileRevisionNumber: state.Profile.RevisionNumber, ProfileSpecDigest: state.Profile.SpecDigest,
 	}
 	state.Apps[appID] = app
+}
+
+func bindUpgradeStageResources(t *testing.T, store *gatewayUpgradeStateStore, operationID string) gatewayMigrationJournal {
+	t.Helper()
+	if _, err := store.bindMigrationDockerResource(operationID, gatewayPhaseStageIntent, gatewayV2ResourceImage, upgradeResourceID('a')); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.bindMigrationVolumeResource(operationID, gatewayPhaseStageIntent, gatewayV2ResourceConfigVolume, upgradeConfigVolumeIdentity()); err != nil {
+		t.Fatal(err)
+	}
+	return bindUpgradeRemainingStageResources(t, store, operationID)
+}
+
+func bindUpgradeRemainingStageResources(t *testing.T, store *gatewayUpgradeStateStore, operationID string) gatewayMigrationJournal {
+	t.Helper()
+	if _, err := store.bindMigrationDockerResource(operationID, gatewayPhaseStageIntent, gatewayV2ResourceIngressNetwork, upgradeResourceID('b')); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.bindMigrationVolumeResource(operationID, gatewayPhaseStageIntent, gatewayV2ResourceDataVolume, gatewayV1VolumeIdentity{
+		Mountpoint: "C:\\ProgramData\\Docker\\volumes\\rig-generated-caddy-data-v2\\_data", CreatedAt: "2026-09-29T12:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := store.bindMigrationDockerResource(operationID, gatewayPhaseStageIntent, gatewayV2ResourceStageContainer, upgradeResourceID('d'))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return journal
+}
+
+func bindUpgradeFinalResource(t *testing.T, store *gatewayUpgradeStateStore, operationID string) gatewayMigrationJournal {
+	t.Helper()
+	journal, err := store.bindMigrationDockerResource(operationID, gatewayPhaseTransferIntent, gatewayV2ResourceFinalContainer, upgradeResourceID('e'))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return journal
+}
+
+func upgradeConfigVolumeIdentity() gatewayV1VolumeIdentity {
+	return gatewayV1VolumeIdentity{
+		Mountpoint: "C:\\ProgramData\\Docker\\volumes\\rig-generated-caddy-config-v2\\_data", CreatedAt: "2026-09-29T12:00:00Z",
+	}
+}
+
+func upgradeResourceID(character byte) string {
+	return strings.Repeat(string(character), 64)
 }
 
 func cloneRouteStateForTest(state routeState) routeState {

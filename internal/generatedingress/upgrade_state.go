@@ -156,6 +156,36 @@ type gatewayMigrationTargetRef struct {
 	PlanDigest      string `json:"planDigest"`
 }
 
+// gatewayV2ResourceBindings records immutable Docker identities as historical
+// migration evidence. Docker volumes do not expose an object ID, so their ID
+// is the canonical SHA-256 digest of the observed mountpoint and creation time.
+// Values are monotonic: once bound, they can only be replayed exactly.
+type gatewayV2ResourceBindings struct {
+	ImageID          string                         `json:"imageId,omitempty"`
+	IngressNetworkID string                         `json:"ingressNetworkId,omitempty"`
+	ConfigVolume     gatewayV2VolumeResourceBinding `json:"configVolume"`
+	DataVolume       gatewayV2VolumeResourceBinding `json:"dataVolume"`
+	StageContainerID string                         `json:"stageContainerId,omitempty"`
+	FinalContainerID string                         `json:"finalContainerId,omitempty"`
+}
+
+type gatewayV2VolumeResourceBinding struct {
+	IdentityDigest string `json:"identityDigest,omitempty"`
+	Mountpoint     string `json:"mountpoint,omitempty"`
+	CreatedAt      string `json:"createdAt,omitempty"`
+}
+
+type gatewayV2ResourceKind string
+
+const (
+	gatewayV2ResourceImage          gatewayV2ResourceKind = "image"
+	gatewayV2ResourceIngressNetwork gatewayV2ResourceKind = "ingress_network"
+	gatewayV2ResourceConfigVolume   gatewayV2ResourceKind = "config_volume"
+	gatewayV2ResourceDataVolume     gatewayV2ResourceKind = "data_volume"
+	gatewayV2ResourceStageContainer gatewayV2ResourceKind = "stage_container"
+	gatewayV2ResourceFinalContainer gatewayV2ResourceKind = "final_container"
+)
+
 type gatewayMigrationJournal struct {
 	Version       int                       `json:"version"`
 	OperationID   string                    `json:"operationId"`
@@ -164,6 +194,7 @@ type gatewayMigrationJournal struct {
 	Target        gatewayMigrationTargetRef `json:"target"`
 	Profile       gatewayProfileBinding     `json:"profile"`
 	UpgradeAction gatewayUpgradeActionRef   `json:"upgradeAction"`
+	Resources     gatewayV2ResourceBindings `json:"resources"`
 }
 
 type gatewayUpgradePreparation struct {
@@ -476,11 +507,73 @@ func validGatewayMigrationJournal(journal gatewayMigrationJournal) bool {
 		!validSHA256(journal.Source.IdentityDigest) || journal.Source.LocalHostPort == 0 ||
 		journal.Target.Format != gatewayTargetFormat || !validSHA256(journal.Target.StateDigest) || journal.Target.IdentityVersion != gatewayV2IdentityVersion ||
 		!validSHA256(journal.Target.IdentityDigest) || !validSHA256(journal.Target.PlanDigest) ||
-		!validGatewayProfileBinding(journal.Profile) || journal.UpgradeAction.Name != gatewayUpgradeActionName || !validCanonicalUUID(journal.UpgradeAction.ApprovedBy) {
+		!validGatewayProfileBinding(journal.Profile) || journal.UpgradeAction.Name != gatewayUpgradeActionName || !validCanonicalUUID(journal.UpgradeAction.ApprovedBy) ||
+		!validGatewayV2ResourceBindings(journal.Phase, journal.Resources) {
 		return false
 	}
 	actionDigest, err := gatewayUpgradeActionDigest(journal.Profile, journal.Target.IdentityVersion)
 	return err == nil && actionDigest == journal.UpgradeAction.Digest
+}
+
+func validGatewayV2ResourceBindings(phase gatewayMigrationPhase, bindings gatewayV2ResourceBindings) bool {
+	values := []string{bindings.ImageID, bindings.IngressNetworkID, bindings.StageContainerID, bindings.FinalContainerID}
+	for _, value := range values {
+		if value != "" && !validSHA256(value) {
+			return false
+		}
+	}
+	configVolumeValid, configVolumePresent := validGatewayV2VolumeResourceBinding(bindings.ConfigVolume)
+	dataVolumeValid, dataVolumePresent := validGatewayV2VolumeResourceBinding(bindings.DataVolume)
+	if !configVolumeValid || !dataVolumeValid {
+		return false
+	}
+	infraComplete := bindings.ImageID != "" && bindings.IngressNetworkID != "" && configVolumePresent && dataVolumePresent
+	infraAbsent := bindings.ImageID == "" && bindings.IngressNetworkID == "" && !configVolumePresent && !dataVolumePresent
+	if bindings.StageContainerID != "" && !infraComplete {
+		return false
+	}
+	if bindings.FinalContainerID != "" && (bindings.StageContainerID == "" || !infraComplete) {
+		return false
+	}
+	switch phase {
+	case gatewayPhasePrepared:
+		return infraAbsent && bindings.StageContainerID == "" && bindings.FinalContainerID == ""
+	case gatewayPhaseStageIntent:
+		return bindings.FinalContainerID == ""
+	case gatewayPhaseStaged:
+		return infraComplete && bindings.StageContainerID != "" && bindings.FinalContainerID == ""
+	case gatewayPhaseTransferIntent:
+		return infraComplete && bindings.StageContainerID != ""
+	case gatewayPhaseV2Serving, gatewayPhaseCommitted:
+		return infraComplete && bindings.StageContainerID != "" && bindings.FinalContainerID != ""
+	case gatewayPhaseRollbackIntent, gatewayPhaseRolledBack, gatewayPhaseUncertain:
+		return true
+	default:
+		return false
+	}
+}
+
+func newGatewayV2VolumeResourceBinding(identity gatewayV1VolumeIdentity) (gatewayV2VolumeResourceBinding, error) {
+	if identity.Mountpoint == "" || identity.CreatedAt == "" || strings.TrimSpace(identity.Mountpoint) != identity.Mountpoint || strings.TrimSpace(identity.CreatedAt) != identity.CreatedAt {
+		return gatewayV2VolumeResourceBinding{}, errors.New("invalid generated ingress volume identity")
+	}
+	digest, err := canonicalDigest(struct {
+		Version    int    `json:"version"`
+		Mountpoint string `json:"mountpoint"`
+		CreatedAt  string `json:"createdAt"`
+	}{Version: 1, Mountpoint: identity.Mountpoint, CreatedAt: identity.CreatedAt})
+	if err != nil {
+		return gatewayV2VolumeResourceBinding{}, err
+	}
+	return gatewayV2VolumeResourceBinding{IdentityDigest: digest, Mountpoint: identity.Mountpoint, CreatedAt: identity.CreatedAt}, nil
+}
+
+func validGatewayV2VolumeResourceBinding(binding gatewayV2VolumeResourceBinding) (valid, present bool) {
+	if binding == (gatewayV2VolumeResourceBinding{}) {
+		return true, false
+	}
+	expected, err := newGatewayV2VolumeResourceBinding(gatewayV1VolumeIdentity{Mountpoint: binding.Mountpoint, CreatedAt: binding.CreatedAt})
+	return err == nil && reflect.DeepEqual(binding, expected), true
 }
 
 func validGatewayMigrationPhase(phase gatewayMigrationPhase) bool {
@@ -694,6 +787,111 @@ func (s *gatewayUpgradeStateStore) transitionMigrationJournal(operationID string
 		return gatewayMigrationJournal{}, errors.New("stale generated ingress migration phase")
 	}
 	journal.Phase = next
+	if !validGatewayMigrationJournal(journal) {
+		return gatewayMigrationJournal{}, errors.New("generated ingress migration resources are incomplete for phase")
+	}
+	return s.installMigrationJournal(journal)
+}
+
+// bindMigrationDockerResource records a normalized immutable Docker image,
+// network, or container ID. Creation-phase bindings are monotonic; later
+// phases permit exact replay only and reject replacement identities.
+func (s *gatewayUpgradeStateStore) bindMigrationDockerResource(operationID string, expected gatewayMigrationPhase, kind gatewayV2ResourceKind, dockerID string) (gatewayMigrationJournal, error) {
+	id := normalizeID(dockerID)
+	if !validCanonicalUUID(operationID) || !validGatewayMigrationPhase(expected) || !validSHA256(id) {
+		return gatewayMigrationJournal{}, errors.New("invalid generated ingress resource binding")
+	}
+	_, journal, err := s.loadBoundUpgrade(operationID)
+	if err != nil {
+		return gatewayMigrationJournal{}, err
+	}
+	if journal.Phase != expected {
+		return gatewayMigrationJournal{}, errors.New("stale generated ingress migration phase")
+	}
+	var installed *string
+	switch kind {
+	case gatewayV2ResourceImage:
+		installed = &journal.Resources.ImageID
+	case gatewayV2ResourceIngressNetwork:
+		installed = &journal.Resources.IngressNetworkID
+	case gatewayV2ResourceStageContainer:
+		installed = &journal.Resources.StageContainerID
+	case gatewayV2ResourceFinalContainer:
+		installed = &journal.Resources.FinalContainerID
+	default:
+		return gatewayMigrationJournal{}, errors.New("invalid generated ingress Docker resource kind")
+	}
+	if *installed != "" {
+		if *installed == id {
+			return journal, nil
+		}
+		return gatewayMigrationJournal{}, errors.New("generated ingress resource identity mismatch")
+	}
+	if !gatewayV2ResourceMayFirstBind(expected, kind) {
+		return gatewayMigrationJournal{}, errors.New("generated ingress resource binding is out of phase")
+	}
+	*installed = id
+	if !validGatewayMigrationJournal(journal) {
+		return gatewayMigrationJournal{}, errors.New("generated ingress resource binding violates phase invariants")
+	}
+	return s.installMigrationJournal(journal)
+}
+
+// bindMigrationVolumeResource records Docker's stable volume creation
+// identity. Docker has no volume object ID, so the protected binding retains
+// both creation fields and their canonical digest.
+func (s *gatewayUpgradeStateStore) bindMigrationVolumeResource(operationID string, expected gatewayMigrationPhase, kind gatewayV2ResourceKind, identity gatewayV1VolumeIdentity) (gatewayMigrationJournal, error) {
+	binding, err := newGatewayV2VolumeResourceBinding(identity)
+	if err != nil || !validCanonicalUUID(operationID) || !validGatewayMigrationPhase(expected) {
+		return gatewayMigrationJournal{}, errors.New("invalid generated ingress volume binding")
+	}
+	_, journal, err := s.loadBoundUpgrade(operationID)
+	if err != nil {
+		return gatewayMigrationJournal{}, err
+	}
+	if journal.Phase != expected {
+		return gatewayMigrationJournal{}, errors.New("stale generated ingress migration phase")
+	}
+	var installed *gatewayV2VolumeResourceBinding
+	switch kind {
+	case gatewayV2ResourceConfigVolume:
+		installed = &journal.Resources.ConfigVolume
+	case gatewayV2ResourceDataVolume:
+		installed = &journal.Resources.DataVolume
+	default:
+		return gatewayMigrationJournal{}, errors.New("invalid generated ingress volume resource kind")
+	}
+	if *installed != (gatewayV2VolumeResourceBinding{}) {
+		if reflect.DeepEqual(*installed, binding) {
+			return journal, nil
+		}
+		return gatewayMigrationJournal{}, errors.New("generated ingress volume identity mismatch")
+	}
+	if !gatewayV2ResourceMayFirstBind(expected, kind) {
+		return gatewayMigrationJournal{}, errors.New("generated ingress volume binding is out of phase")
+	}
+	*installed = binding
+	if !validGatewayMigrationJournal(journal) {
+		return gatewayMigrationJournal{}, errors.New("generated ingress volume binding violates phase invariants")
+	}
+	return s.installMigrationJournal(journal)
+}
+
+func gatewayV2ResourceMayFirstBind(phase gatewayMigrationPhase, kind gatewayV2ResourceKind) bool {
+	switch kind {
+	case gatewayV2ResourceImage, gatewayV2ResourceIngressNetwork, gatewayV2ResourceConfigVolume, gatewayV2ResourceDataVolume, gatewayV2ResourceStageContainer:
+		return phase == gatewayPhaseStageIntent
+	case gatewayV2ResourceFinalContainer:
+		return phase == gatewayPhaseTransferIntent
+	default:
+		return false
+	}
+}
+
+func (s *gatewayUpgradeStateStore) installMigrationJournal(journal gatewayMigrationJournal) (gatewayMigrationJournal, error) {
+	if !validGatewayMigrationJournal(journal) {
+		return gatewayMigrationJournal{}, errors.New("invalid generated ingress migration journal update")
+	}
 	if err := s.writeExact(s.journalPath, gatewayMigrationPurpose, journal, false, maxGatewayMigrationBytes); err != nil {
 		return gatewayMigrationJournal{}, err
 	}

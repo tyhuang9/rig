@@ -221,6 +221,12 @@ func installCommittedV2Pair(t *testing.T, manager *Manager) {
 		gatewayPhaseV2Serving,
 		gatewayPhaseCommitted,
 	} {
+		if next == gatewayPhaseStaged {
+			bindUpgradeStageResources(t, store, input.OperationID)
+		}
+		if next == gatewayPhaseV2Serving {
+			bindUpgradeFinalResource(t, store, input.OperationID)
+		}
 		if _, err := store.transitionMigrationJournal(input.OperationID, phase, next); err != nil {
 			t.Fatal(err)
 		}
