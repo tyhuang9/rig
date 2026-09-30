@@ -600,3 +600,64 @@ state before this primitive is exposed or a URL is displayed. No live Docker,
 physical second-device, or browser-to-database LAN journey has run for this
 branch. A focused Go race run was unavailable because this Windows Go runtime
 has CGO disabled.
+
+## LAN grant controller and recovery journey: local evidence
+
+The next local branch starts from `34a98a3` and connects the grant foundation
+to SQLite, the authenticated controller, and `hostd` startup. Migration 028
+retains an immutable claim/event history for each grant attempt, binds the
+approving administrator and current access/profile heads to the exact port
+owner, and serializes unresolved attempts across apps. A grant advances through
+prepared, applying, database-active, and terminal states. Allocation state
+changes occur in the same SQLite transaction as the claim transition. Direct
+head deletion, owner changes, and competing disable intent are fenced.
+
+Generated ingress records the exact grant attempt and approval identity in
+its protected binding. The controller rechecks the session, CSRF token,
+administrator role, and durable approval before gateway mutation; it returns
+no LAN URL from a claim alone. A failed or ambiguous terminal SQLite write
+enters a protected withdrawal path and requires a proven 404 before recovery.
+Failed final publication proofs, ambiguous protected writes, and failed
+withdrawals attempt an exact journal-owned gateway stop if a 404 cannot be
+proved. Mandatory reconciliation continues on a bounded detached context
+after client disconnect. Republish during recovery rechecks the current
+actor's session, role, and CSRF token immediately before the gateway action;
+audit events record that executing actor separately from the earlier approver.
+At startup, `hostd` compares one database snapshot with protected gateway
+history, withdraws an unfinished or stale grant before a restricted recovery
+controller starts, and pins that controller to one app and attempt. On selected
+early startup reconciliation failures it attempts to stop the exact
+journal-owned gateway container. It refuses startup if ownership or closure
+cannot be proved.
+
+| Local check for the integrated grant branch | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions | Passed across all Go packages, including `internal/generatedingress`, `internal/appaccess`, `internal/controller`, and `cmd/hostd`. |
+| Previously failing isolated v1 switch and grant restart recovery tests with normal Windows permissions | Both passed. Their restricted-sandbox failures did not reproduce outside that sandbox. |
+| Focused LAN grant fault and startup tests | Passed for post-publication proof failure, interface drift, canceled request plus ambiguous protected write, journal-owned stop on unreadable route state, fresh-Manager withdrawal classification, disconnected-client terminal reconciliation, revoked recovery session, and executing-admin audit attribution. |
+| `go vet ./...` | Passed. |
+| `go run ./cmd/openapi-gen -check` | Passed. |
+| `pnpm --dir web typecheck` | Passed. |
+| `pnpm --dir web test` | Passed, 401 tests in 16 files. |
+| `pnpm --dir web build` | Passed; Vite reported a large-chunk advisory. |
+| `git diff --check` | Passed with only LF/CRLF conversion notices. |
+
+The restricted Windows sandbox failed unchanged Compose fixtures with
+`Access is denied` and produced misleading ingress drift failures. The full
+Go suite and the two isolated ingress tests passed when run with normal local
+permissions. CodeRabbit aggregate review was unavailable because the WSL CLI
+was not authenticated; this is not counted as review evidence. Independent
+security and final-integration reviews found startup-classifier,
+post-publication cleanup, cancellation, actor-attribution, and recovery
+authorization gaps; these were fixed before the final local checkpoint review.
+
+This branch is a local integration checkpoint, not the M3 exit gate. Docker
+Desktop's Linux daemon was unavailable, so live gateway publication,
+forced-process-exit behavior from a second device, host bind conflict,
+stopped/unready app 404 behavior, two-app isolation, and the browser-to-external-
+database note journey remain unverified. The user-facing LAN sharing UI and
+disable finalization are separate remaining M3 work. An incomplete but already
+approved grant can stay externally reachable between a hostd crash after
+Caddy publication and startup quarantine; an unavailable Docker daemon or
+corrupt ownership journal can prevent emergency closure proof. These need
+live failure injection and an operational response before production use.
