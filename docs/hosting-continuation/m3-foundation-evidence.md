@@ -165,6 +165,15 @@ cover interrupted and reported-failed protected writes at transfer intent,
 final ID binding, v2 serving, and rollback intent without replacing immutable
 history. This operation still has no authenticated controller caller or LAN URL.
 
+Temporary Caddy configs remain readable by the non-root container user after
+copy. The host-side working directory must therefore be private before Manager
+initialization and each config copy. Existing controller directories are now
+validated instead of accepted by path alone. Unix requires a current-user
+0700 leaf and trusted, non-replaceable ancestry (including sticky-parent
+semantics). Windows requires a protected current-user-only DACL and holds
+rename-blocking handles on every ancestor until the temporary file is removed.
+Any failed validation blocks the copy before creating a host config file.
+
 ## Executed verification
 
 | Check | Result |
@@ -212,6 +221,11 @@ history. This operation still has no authenticated controller caller or LAN URL.
 | `gofmt -d` and `git diff --cached --check` for transfer | Passed. |
 | `pnpm --dir docs build` after the design update | Passed without render errors. |
 | Transfer code and security reviews | The name-only v1 stop/start flaw was corrected with fresh identity attestation and ID-bound commands. Durability-window tests requested by review were added. Security review noted temporary host-config visibility when the working directory is traversable. `docker.PrepareControllerDirectories` creates a private directory when absent but does not verify the mode or ACL of an existing one. Docker behavior remains unverified live. |
+| `go test -count=1 ./...` and `go vet ./...` after private-directory guards | Passed serially with normal local Windows permissions. |
+| `pnpm --dir web test` during the private-directory work | Passed, 400/400 tests, serially. The final guard edit changed only Go code; web tests were not rerun afterward. |
+| Windows working-directory and ancestry-guard tests | Passed, including blocked leaf, parent, and higher-ancestor renames while a guard is held and allowed rename after close. |
+| Linux amd64 securetemp test binary run under WSL | Passed the private-directory tests, including a 0700 leaf beneath a sticky writable parent, a readable ancestor, and rejection of a writable nonsticky ancestor and symlink. The first sticky-parent test fixture used numeric `01777`, which Go's FileMode did not interpret as `ModeSticky`; the corrected fixture passed. |
+| `git diff --cached --check` and independent security re-review | Passed. Review found the earlier writable-ancestor exposure closed for unprivileged local users. Windows traversal-only ancestor ACLs may be rejected by the fail-closed `GENERIC_READ` guard. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -293,11 +307,8 @@ The local cutover implementation now handles those journal phases and
 compensation paths, but hosted Docker must prove the real network, bind,
 config-read, route, and rollback behavior before this slice is accepted.
 Authenticated action-specific consent, LAN access activation and disable, UI
-diagnostics, and the physical second-device journey remain open. The transfer
-copy follows the existing 0644 config-copy pattern so the non-root Caddy user
-can read the Docker destination. Hostd's directory helper creates private
-controller directories when absent, but accepts an existing directory without
-verifying its mode or Windows ACL. A traversable working directory, including
-one supplied to an embedded Manager, can expose private app route names in the
-temporary config. Enforce and verify a private-directory invariant before LAN
-exposure is enabled.
+diagnostics, and the physical second-device journey remain open. The host-side
+private-directory boundary has unit and WSL evidence, but its behavior with a
+live Docker config copy and on a locked-down Windows service account remains
+unverified. Windows ancestors that allow traversal without `GENERIC_READ` fail
+closed until a narrower safe guard is implemented and tested.
