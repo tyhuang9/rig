@@ -366,9 +366,14 @@ func (d managerGatewayV2UpgradeDriver) copyStageConfig(ctx context.Context, stat
 	if err != nil || !found || normalizeID(container.ID) != journal.Resources.StageContainerID || container.Running || container.Restarting {
 		return gatewayV2StageError(ctx)
 	}
-	if len(contents) == 0 || len(contents) > gatewayV2MaxConfigBytes || !d.manager.validWorkingDirectory() {
+	if len(contents) == 0 || len(contents) > gatewayV2MaxConfigBytes {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
+	workingDirectoryGuard, ok := d.manager.acquireWorkingDirectoryGuard()
+	if !ok {
+		return &Error{Code: DiagnosticRouteInvalid}
+	}
+	defer workingDirectoryGuard.Close()
 	file, err := os.CreateTemp(d.manager.options.WorkingDirectory, ".rig-caddy-v2-stage-*.json")
 	if err != nil {
 		return gatewayV2StageError(ctx)

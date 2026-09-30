@@ -17,6 +17,7 @@ import (
 
 	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/runtime/securetemp"
 )
 
 const (
@@ -139,6 +140,9 @@ func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error)
 	}
 	if !validOptions(options) {
 		return nil, errors.New("generated ingress options are invalid")
+	}
+	if err := securetemp.ValidatePrivateDirectory(options.WorkingDirectory); err != nil {
+		return nil, fmt.Errorf("generated ingress working directory is unsafe: %w", err)
 	}
 	store, err := newStateStore(options.DataRoot)
 	if err != nil {
@@ -570,9 +574,11 @@ func (m *Manager) copyConfig(ctx context.Context, contents []byte, filename stri
 	if len(contents) == 0 || !validConfigFilename(filename) {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
-	if !m.validWorkingDirectory() {
+	workingDirectoryGuard, ok := m.acquireWorkingDirectoryGuard()
+	if !ok {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
+	defer workingDirectoryGuard.Close()
 	file, err := os.CreateTemp(m.options.WorkingDirectory, ".rig-caddy-*.json")
 	if err != nil {
 		return &Error{Code: DiagnosticIngressUnavailable}
@@ -1228,11 +1234,25 @@ func validAbsoluteDirectory(value string) bool {
 }
 
 func (m *Manager) validWorkingDirectory() bool {
-	if m == nil || m.workingDirectoryIdentity == nil || !validAbsoluteDirectory(m.options.WorkingDirectory) {
+	if m == nil || m.workingDirectoryIdentity == nil || securetemp.ValidatePrivateDirectory(m.options.WorkingDirectory) != nil {
 		return false
 	}
 	current, err := os.Lstat(m.options.WorkingDirectory)
 	return err == nil && os.SameFile(m.workingDirectoryIdentity, current)
+}
+
+func (m *Manager) acquireWorkingDirectoryGuard() (*securetemp.PrivateDirectoryGuard, bool) {
+	if !m.validWorkingDirectory() {
+		return nil, false
+	}
+	guard, err := securetemp.AcquirePrivateDirectoryGuard(m.options.WorkingDirectory)
+	if err != nil || !m.validWorkingDirectory() {
+		if guard != nil {
+			_ = guard.Close()
+		}
+		return nil, false
+	}
+	return guard, true
 }
 
 func dockerEnvironment(endpoint, config string) ([]string, error) {

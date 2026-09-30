@@ -116,3 +116,17 @@ func TestPrepareControllerDirectoriesKeepsRecoveryBoundariesSeparate(t *testing.
 		}
 	}
 }
+
+func TestPrepareControllerDirectoriesRejectsPermissiveExistingWorkingDirectory(t *testing.T) {
+	root := t.TempDir()
+	directory, err := securetemp.NewGeneratedBuilderDirectory(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	working := filepath.Join(directory.Root(), "controller-working")
+	createPermissiveDirectoryForTest(t, working)
+
+	if _, err := PrepareControllerDirectories(root); err == nil {
+		t.Fatal("permissive preexisting working directory was accepted")
+	}
+}

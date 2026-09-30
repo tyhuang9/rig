@@ -347,9 +347,14 @@ func (m *Manager) copyGatewayV2Config(ctx context.Context, container string, con
 	if container != gatewayV2ContainerName {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
-	if len(contents) == 0 || len(contents) > gatewayV2MaxConfigBytes || !validConfigFilename(filename) || !m.validWorkingDirectory() {
+	if len(contents) == 0 || len(contents) > gatewayV2MaxConfigBytes || !validConfigFilename(filename) {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
+	workingDirectoryGuard, ok := m.acquireWorkingDirectoryGuard()
+	if !ok {
+		return &Error{Code: DiagnosticRouteInvalid}
+	}
+	defer workingDirectoryGuard.Close()
 	file, err := os.CreateTemp(m.options.WorkingDirectory, ".rig-caddy-v2-*.json")
 	if err != nil {
 		return &Error{Code: DiagnosticIngressUnavailable}

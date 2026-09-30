@@ -365,9 +365,14 @@ func (d managerGatewayV2TransferDriver) readFinalConfigFromStage(ctx context.Con
 }
 
 func (d managerGatewayV2TransferDriver) copyConfig(ctx context.Context, containerID, filename string, contents []byte) error {
-	if !validContainerID(containerID) || !validConfigFilename(filename) || len(contents) == 0 || len(contents) > gatewayV2MaxConfigBytes || !d.manager.validWorkingDirectory() {
+	if !validContainerID(containerID) || !validConfigFilename(filename) || len(contents) == 0 || len(contents) > gatewayV2MaxConfigBytes {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
+	workingDirectoryGuard, ok := d.manager.acquireWorkingDirectoryGuard()
+	if !ok {
+		return &Error{Code: DiagnosticRouteInvalid}
+	}
+	defer workingDirectoryGuard.Close()
 	file, err := os.CreateTemp(d.manager.options.WorkingDirectory, ".rig-caddy-v2-transfer-*.json")
 	if err != nil {
 		return gatewayV2TransferError(ctx)
