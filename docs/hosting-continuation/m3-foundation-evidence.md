@@ -36,16 +36,18 @@ initial target digest while allowing later valid app-route changes under the
 same protected network plan. The pure validators reject a network subnet that
 contains the selected LAN address and rejects duplicate allocation or access
 revision identities across apps. These functions are not called by the live
-manager or controller yet.
+gateway upgrade action or controller yet; committed-state validation is used
+by Manager dispatch.
 
-The current Manager now holds a persistent handle-based gateway lock across
+The Manager holds a persistent handle-based gateway lock across
 route switching, startup provision/recovery, route observation callbacks, and
 capacity observations. Two independent Manager instances targeting one data
 root cannot issue competing Docker commands while one holds the lock. A
 process-exit test proves the next instance can acquire the lock; an injected
 post-switch release failure preserves the executor's
 `CandidateMayBeLive` signal so it does not clean a potentially serving
-container. The lock adds no v2 gateway mutation or LAN listener.
+container. The lock also serializes committed-v2 route changes; no live gateway
+upgrade or LAN listener is enabled yet.
 
 The new `internal/hostnetwork` helper enumerates currently assigned RFC 1918
 IPv4 addresses on active, non-loopback host interfaces. An approved interface
@@ -67,20 +69,46 @@ The read-only v2 gateway observer checks pinned Docker identity, protected v1
 source identity, live and restart Caddy configuration, explicit bindings,
 owned resource inventories, application-network attachments, and route/404
 probes. It rechecks resource inventories and container process generations
-after probing. Its pure classifier tests exact hypothetical v1, stage, and
-final snapshots. The live observer deliberately withholds every exact
-classification until immutable application-endpoint and alias ownership are
-proved. Stage/final also require host-side publication and reachability.
-No Manager or controller path calls this observer yet, so it cannot upgrade
-the gateway or expose a LAN URL.
+after probing. The committed-v2 Manager calls it under the gateway lock to
+attest serving and recovery state. Stage/final require host-side publication
+and reachability. The controller has no LAN URL or upgrade action yet.
 
 The v1 compatibility fence now checks for either protected v2 state or
 migration-journal marker while holding the gateway lock. A marker blocks
 legacy route switching, provisioning/recovery, observation, and capacity
 reads before v1 state or Docker access. It preserves the route candidate when
 Switch is blocked. The fence treats orphaned, malformed, rolled-back, and
-committed markers alike; this interim binary cannot operate a v2 data root
-until version-aware recovery and route dispatch replace the fence.
+committed markers alike on legacy paths. The Manager now dispatches an exact
+committed v2 marker pair to a separate serving path; partial, corrupt, and
+noncommitted pairs still fail closed before v1 Docker work.
+
+The committed-v2 Manager path uses a protected pending route record before a
+Caddy reload. It preserves the last committed app routes and LAN bindings,
+requires exact final-v2 topology and candidate endpoint/network preflight,
+then reloads, reattests, and commits. Restart recovery distinguishes an exact
+committed config from an exact proposed config and rolls the latter back. It
+also recognizes the narrowly attested crash window where the live config is
+proposed but the restart config is still committed, then restores and reattests
+the committed config. Any other mixed or unknown topology remains unresolved
+without automatic mutation. New
+application networks are rejected before the pending write because v2 does not
+yet have a journaled gateway network-attachment transaction. Existing attached
+application networks can be switched after immutable endpoint, health, alias,
+network, and transport checks. Provision/recovery, local route observation, and
+capacity use the committed-v2 owner rather than falling through to v1. The v1
+observation bound remains 15 seconds; committed-v2 observation gets a bounded
+three-minute post-lock budget while respecting shorter caller deadlines.
+
+The read-only v2 observer can now classify exact v1, stage, and final states
+when its Docker evidence is complete. It proves immutable endpoint ownership,
+health, and unique alias membership before and after probes. Stage/final host
+publication must return a distinct port-specific Caddy challenge body on every
+selected-IP pool port, both through the host and directly through the attested
+container; generic 404 listeners and loopback publication fail. After commit,
+historical v1 app networks and endpoint health may change while the stopped v1
+gateway core identity remains pinned. Precommit rollback phases retain their
+strict v1 dependency. No live v2 gateway creator, LAN access action, or LAN URL
+is enabled by this serving-path slice.
 
 ## Executed verification
 
@@ -109,6 +137,10 @@ until version-aware recovery and route dispatch replace the fence.
 | `go test -count=1 ./...` and `go vet ./...` after the observer corrective pass | Passed with normal Windows permissions. |
 | `go test ./internal/generatedingress -run 'TestLegacyV1Fence' -count=5` | Passed for the v1 compatibility fence, including lock contention. |
 | `go test -count=1 ./...` and `go vet ./...` after the v1 compatibility fence | Passed with normal Windows permissions. |
+| `go test -count=1 ./...` and `go vet ./...` after committed-v2 Manager and observer integration | Passed with normal Windows permissions. |
+| Linux amd64 `go test -c` for `./internal/generatedingress` | Cross-compiled the test package; Linux runtime execution was not available locally. |
+| `git diff --check` after committed-v2 integration | Passed; Git reported only working-copy LF/CRLF conversion warnings. |
+| `pnpm --dir docs build` after the evidence update | Passed without render errors after escaping Vue template braces in the recorded Docker command. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -128,7 +160,7 @@ request, or database-backed LAN journey has run on this branch. Those are
 future M3 gates, not inferred from the local unit tests.
 The installed Docker CLI currently cannot reach the Docker Desktop Linux
 daemon: `C:\Program Files\Docker\Docker\resources\bin\docker.exe version
---format '{{json .Server}}'` failed because
+--format '&#123;&#123;json .Server&#125;&#125;'` failed because
 `//./pipe/dockerDesktopLinuxEngine` does not exist. No live gateway acceptance
 claim follows from the read-only observer's unit tests.
 
@@ -165,8 +197,14 @@ prove it is stopped before relying on the lock. On Linux, a malicious process
 with the same user identity can replace the lock path while a handle is held;
 Rig never unlinks it, and the open-time path identity and permission checks
 reject unsafe paths before work begins.
-The live observer still needs immutable endpoint and unique-alias proof,
-host-side selected-address publication proof, post-probe endpoint/config
-reinspection, and protected binding to immutable v2 network, volume, and
-container IDs before it may authorize a cutover. A
-physical second-device LAN journey remains a distinct acceptance gate.
+The live observer now implements immutable endpoint and unique-alias proof,
+host-side selected-address publication proof, and post-probe endpoint/config
+reinspection. These have unit evidence only and require real Docker and
+Desktop execution. The protected journal still does not bind immutable v2
+network, volume, and container IDs persistently. A physical second-device LAN
+journey remains a distinct acceptance gate.
+The gateway-specific host challenge proves listener identity, but generic
+application probes accept any HTTP status. They do not prove that Caddy selected
+and forwarded the intended app route. A controlled live Docker route matrix
+with distinct backend response markers, wrong-Host and cross-app requests is
+required before claiming LAN routing acceptance.
