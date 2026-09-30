@@ -24,6 +24,8 @@ action or LAN URL is exposed.
 - Single-snapshot upgrade authorization recheck: `c75eb51`.
 - Protected upgrade-generation history scanner: `759734b`.
 - Explicit journaled-rollback retirement: `ff8508c`.
+- Protected pre-journal abort history: `99a965e`.
+- Fresh-proof pre-journal abort coordinator: `da93a12`.
 
 The allocator stores approved desired gateway and per-app access revisions,
 action digests, compare-and-swap heads, and unique durable port ownership. It
@@ -242,6 +244,17 @@ artifact fingerprints detect changes that persist across scanner snapshots;
 same-user mutation confined to a separate protected read is outside the
 cooperating-writer model.
 
+The pre-journal abort unit records an operation-scoped, create-only receipt
+only when no migration journal exists. It supports an empty generation or an
+exact state-only preparation crash and rejects a journal, competing operation,
+or contradictory artifact. The coordinator freshly proves that the current
+v1 gateway serves with restart configuration and stable endpoints, and that
+the deterministic and label-owned v2 Docker resources are absent. Abort and
+receipt replay do not select or persist a network plan. A complete journal
+installed despite a reported write failure stays unresolved for a later exact
+retry. An abort result becomes terminal only after receipt readback, a final
+history scan, and successful gateway-lock release.
+
 ## Executed verification
 
 | Check | Result |
@@ -311,6 +324,10 @@ cooperating-writer model.
 | `go test -count=1 ./internal/generatedingress` and `go vet ./internal/generatedingress` after history/retirement integration | Passed with normal Windows permissions. A restricted-sandbox run failed broadly in unchanged manager fixtures; the identical normal-permission command passed in 41.315s. |
 | `go test -count=1 -p 1 ./...`, `go vet ./...`, `go run ./cmd/openapi-gen -check` after commits `c75eb51`, `759734b`, `ff8508c` | Passed with normal Windows permissions; all Go packages completed. No API contract changed. |
 | Independent rollback-history review | Found and fixed an in-place artifact mutation detection gap by adding bounded content fingerprints. No false terminal outcome or lock-order defect remained in read-only review. Live Docker behavior remains unverified. |
+| Focused pre-journal abort and history tests | Passed for empty/state-only receipts, network-selection failure, exact replay, stale v1 and Docker topology, wrong operation, receipt write ambiguity, complete-journal ambiguity, later generation, and lock-release failure. |
+| `go test -count=1 ./internal/generatedingress` for pre-journal abort | Passed with normal Windows permissions. |
+| `go test -count=1 -p 1 ./...`, `go vet ./...`, `go run ./cmd/openapi-gen -check`, `gofmt -l`, and `git diff --check` after pre-journal abort integration | Passed with normal Windows permissions. No API contract changed. |
+| Independent pre-journal abort review | Found no confirmed defect in the protected receipt or live-proof result boundary. Controller claim sequencing and live Docker execution remain required. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -359,11 +376,11 @@ the file, but it is not an atomic compare-and-swap across processes. The new
 staging and transfer operations hold the handle-based gateway lock across
 their complete mutation and attestation loops; journal methods alone do not
 enforce that boundary. Every active LAN binding must also be compared with its
-approved SQLite row. After an explicit journaled rollback retirement, a fresh
-operation can use a new protected generation while retaining all earlier
-state, journals, and receipts. A failure before any complete migration journal
-still needs a durable no-op abort receipt before its prepared SQLite claim can
-be released.
+approved SQLite row. After an explicit journaled rollback retirement or
+pre-journal abort, a fresh operation can use a new protected generation while
+retaining all earlier state, journals, and receipts. The authenticated
+controller must still prove the exact receipt or journal outcome before it
+releases a prepared SQLite claim.
 The first live v2 marker writer must hold the same lock as the v1 compatibility
 fence. The lock and state paths must remain bound to one protected directory
 identity through the operation; a same-user parent-directory substitution is
@@ -402,8 +419,9 @@ unverified. Windows ancestors that allow traversal without `GENERIC_READ` fail
 closed until a narrower safe guard is implemented and tested.
 Before a gateway upgrade controller action is enabled, it must persist and
 recheck a session-derived administrator claim inside the gateway lock,
-reconcile claim state with protected history and fresh topology, and handle
-the pre-journal no-op abort boundary durably. Docker volume deletion remains
+reconcile claim state with protected history and fresh topology, and accept a
+pre-journal no-op abort only after its locked result survives lock release.
+Docker volume deletion remains
 name-based after immediate exact label, mountpoint, and creation-time
 reinspection because Docker exposes no immutable volume ID or conditional
 delete. A non-cooperating same-privilege actor replacing a volume in that
