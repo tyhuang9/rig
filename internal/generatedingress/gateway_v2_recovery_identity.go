@@ -17,6 +17,8 @@ const (
 	gatewayV2RecoveryStageIntentPartialInfrastructure    gatewayV2RecoveryTopology = "exact_stage_intent_v1_serving_partial_v2_infrastructure_no_containers"
 	gatewayV2RecoveryStageIntentStoppedStage             gatewayV2RecoveryTopology = "exact_stage_intent_v1_serving_stopped_stage_final_absent"
 	gatewayV2RecoveryTransferIntentV1ServingStoppedStage gatewayV2RecoveryTopology = "exact_transfer_intent_v1_serving_stopped_stage_final_absent"
+	gatewayV2RecoveryTransferIntentV1ServingNoContainers gatewayV2RecoveryTopology = "exact_transfer_intent_v1_serving_stage_and_final_absent"
+	gatewayV2RecoveryTransferIntentV1ServingStoppedFinal gatewayV2RecoveryTopology = "exact_transfer_intent_v1_serving_stage_absent_stopped_final"
 	gatewayV2RecoveryTransferIntentStoppedV1             gatewayV2RecoveryTopology = "exact_transfer_intent_v1_stopped_running_stage_final_absent"
 	gatewayV2RecoveryTransferIntentV1StoppedStage        gatewayV2RecoveryTopology = "exact_transfer_intent_v1_stopped_stopped_stage_final_absent"
 	gatewayV2RecoveryTransferIntentNoContainers          gatewayV2RecoveryTopology = "exact_transfer_intent_v1_stopped_stage_and_final_absent"
@@ -67,7 +69,7 @@ func classifyGatewayV2StoppedStageForCompensation(source routeState, state gatew
 }
 
 func classifyGatewayV2RecoveryTopology(source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) gatewayV2RecoveryTopology {
-	if (journal.Phase != gatewayPhaseStageIntent && journal.Phase != gatewayPhaseTransferIntent) ||
+	if (journal.Phase != gatewayPhaseStageIntent && journal.Phase != gatewayPhaseTransferIntent && journal.Phase != gatewayPhaseRollbackIntent) ||
 		!validGatewayTopologyInputs(source, state, journal) ||
 		!validGatewayPinnedImage(observation.Image, observation.ImageFound) ||
 		!gatewayV2ObservedResourcesMatchJournal(journal, observation) ||
@@ -91,9 +93,15 @@ func classifyGatewayV2RecoveryTopology(source routeState, state gatewayV2RouteSt
 		if validGatewayV2StoppedStage(state, journal, observation) {
 			return gatewayV2RecoveryStageIntentStoppedStage
 		}
-	case gatewayPhaseTransferIntent:
+	case gatewayPhaseTransferIntent, gatewayPhaseRollbackIntent:
 		if v1Serving && validGatewayV2StoppedStage(state, journal, observation) {
 			return gatewayV2RecoveryTransferIntentV1ServingStoppedStage
+		}
+		if v1Serving && validGatewayV2TransferInfrastructureNoContainers(state, journal, observation) {
+			return gatewayV2RecoveryTransferIntentV1ServingNoContainers
+		}
+		if v1Serving && validGatewayV2StoppedFinalForTransfer(state, journal, observation) {
+			return gatewayV2RecoveryTransferIntentV1ServingStoppedFinal
 		}
 		if !v1Stopped {
 			return gatewayV2RecoveryUnknown

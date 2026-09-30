@@ -60,7 +60,7 @@ func gatewayV2ContainerCreateArgs(state gatewayV2RouteState, journal gatewayMigr
 	}
 	args := []string{
 		"container", "create", "--name", name, "--hostname", name,
-		"--network", "name=" + state.Identity.IngressNetwork + ",gw-priority=1", "--ip", state.Network.ContainerIPv4,
+		"--network", "name=" + state.Identity.IngressNetwork + ",ip=" + state.Network.ContainerIPv4 + ",gw-priority=1",
 		"--mount", "type=volume,src=" + state.Identity.ConfigVolume + ",dst=/config",
 		"--mount", "type=volume,src=" + state.Identity.DataVolume + ",dst=/data",
 		"--user", "1000:1000", "--entrypoint", caddyExecutable, "--read-only",
@@ -69,6 +69,23 @@ func gatewayV2ContainerCreateArgs(state gatewayV2RouteState, journal gatewayMigr
 		"--ulimit", "nofile=1024:1024", "--restart", restart,
 		"--log-driver", "local", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
 		"--env", "XDG_CONFIG_HOME=/config", "--env", "XDG_DATA_HOME=/data",
+	}
+	if role == gatewayV2FinalContainerRole {
+		owners, valid := gatewayV2ApplicationNetworkOwners(state)
+		if !valid {
+			return nil, &Error{Code: DiagnosticValidationFailed}
+		}
+		networks := make([]string, 0, len(owners))
+		for network := range owners {
+			if network == state.Identity.IngressNetwork {
+				return nil, &Error{Code: DiagnosticValidationFailed}
+			}
+			networks = append(networks, network)
+		}
+		sort.Strings(networks)
+		for _, network := range networks {
+			args = append(args, "--network", "name="+network)
+		}
 	}
 	for port := state.Profile.PortStart; ; port++ {
 		value := strconv.FormatUint(uint64(port), 10)

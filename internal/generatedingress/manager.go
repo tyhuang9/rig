@@ -80,6 +80,9 @@ type Manager struct {
 	// gatewayV2UpgradeDriver is replaceable only by package tests. Production
 	// uses the exact Docker and host-network adapter in gateway_v2_upgrade.go.
 	gatewayV2UpgradeDriver gatewayV2UpgradeDriver
+	// gatewayV2TransferDriver is replaceable only by package tests. Production
+	// uses the journaled staged-to-committed adapter in gateway_v2_transfer.go.
+	gatewayV2TransferDriver gatewayV2TransferDriver
 }
 
 // contextMutex lets a route observation abandon lock contention when its
