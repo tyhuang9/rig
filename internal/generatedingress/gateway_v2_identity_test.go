@@ -27,20 +27,32 @@ func TestClassifyGatewayV2TopologyExactStates(t *testing.T) {
 	if got := classifyGatewayV2Topology(source, state, journal, v1Only); got != gatewayTopologyExactV1Only {
 		t.Fatalf("v1-only topology = %q", got)
 	}
+	unboundStage := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1WithStage)
+	if got := classifyGatewayV2Topology(source, state, journal, unboundStage); got != gatewayTopologyUnknownOrDrift {
+		t.Fatalf("unbound stage topology = %q", got)
+	}
 
-	staged := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1WithStage)
-	if got := classifyGatewayV2Topology(source, state, journal, staged); got != gatewayTopologyExactV1WithStage {
+	stagedJournal := journal
+	stagedJournal.Resources = gatewayV2IdentityTestBoundResources(t)
+	stagedJournal.Resources.FinalContainerID = ""
+	stagedJournal.Phase = gatewayPhaseStaged
+	staged := gatewayV2IdentityTestObservation(t, source, state, stagedJournal, gatewayTopologyExactV1WithStage)
+	if got := classifyGatewayV2Topology(source, state, stagedJournal, staged); got != gatewayTopologyExactV1WithStage {
 		t.Fatalf("staged topology = %q", got)
 	}
 
-	final := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
-	if got := classifyGatewayV2Topology(source, state, journal, final); got != gatewayTopologyExactFinalV2 {
+	finalJournal := journal
+	finalJournal.Resources = gatewayV2IdentityTestBoundResources(t)
+	finalJournal.Phase = gatewayPhaseV2Serving
+	final := gatewayV2IdentityTestObservation(t, source, state, finalJournal, gatewayTopologyExactFinalV2)
+	if got := classifyGatewayV2Topology(source, state, finalJournal, final); got != gatewayTopologyExactFinalV2 {
 		t.Fatalf("final topology = %q", got)
 	}
 }
 
 func TestClassifyCommittedFinalV2DoesNotDependOnHistoricalV1AppTopology(t *testing.T) {
 	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
 	journal.Phase = gatewayPhaseCommitted
 	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
 	observation.V1EndpointIdentityProven = false
@@ -63,6 +75,7 @@ func TestClassifyCommittedFinalV2DoesNotDependOnHistoricalV1AppTopology(t *testi
 
 func TestClassifyGatewayV2MixedRestartRequiresProposedLiveAndCommittedRestartConfig(t *testing.T) {
 	source, committed, journal := gatewayV2IdentityTestState(t)
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
 	journal.Phase = gatewayPhaseCommitted
 	proposed := cloneGatewayV2RouteState(committed)
 	app := proposed.Apps[upgradeTestAppA]
@@ -124,6 +137,8 @@ func TestClassifyGatewayV2MixedRestartRequiresProposedLiveAndCommittedRestartCon
 
 func TestClassifyGatewayV2TopologyRejectsDurablePendingRoute(t *testing.T) {
 	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Phase = gatewayPhaseCommitted
 	previous := cloneGatewayV2AppRoute(state.Apps[upgradeTestAppA])
 	proposed := gatewayV2AppRoute{Route: routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
 		endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'd'),
@@ -150,6 +165,9 @@ func TestClassifyGatewayV2TopologyFailsClosedOnDrift(t *testing.T) {
 		{"v1 endpoint identity unproven", func(value *gatewayV2DockerObservation) { value.V1EndpointIdentityProven = false }},
 		{"final endpoint identity unproven", func(value *gatewayV2DockerObservation) { value.FinalEndpointIdentityProven = false }},
 		{"v2 resources changed after probes", func(value *gatewayV2DockerObservation) { value.V2ResourcesStable = false }},
+		{"bound ingress network ID changed", func(value *gatewayV2DockerObservation) { value.IngressNetworkID = "sha256:" + strings.Repeat("9", 64) }},
+		{"bound config volume replaced", func(value *gatewayV2DockerObservation) { value.ConfigVolumeIdentity.CreatedAt = "2026-09-29T00:03:00Z" }},
+		{"bound final container ID changed", func(value *gatewayV2DockerObservation) { value.FinalContainer.ID = "sha256:" + strings.Repeat("9", 64) }},
 		{"owned inventories changed after probes", func(value *gatewayV2DockerObservation) { value.OwnedInventoriesStable = false }},
 		{"extra owned container", func(value *gatewayV2DockerObservation) {
 			value.OwnedContainers = append(value.OwnedContainers, "extra")
@@ -228,7 +246,12 @@ func TestClassifyGatewayV2TopologyFailsClosedOnDrift(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			source, state, journal := gatewayV2IdentityTestState(t)
+			journal.Resources = gatewayV2IdentityTestBoundResources(t)
+			journal.Phase = gatewayPhaseV2Serving
 			value := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
+			if got := classifyGatewayV2Topology(source, state, journal, value); got != gatewayTopologyExactFinalV2 {
+				t.Fatalf("unmodified final topology = %q", got)
+			}
 			test.mutate(&value)
 			if got := classifyGatewayV2Topology(source, state, journal, value); got != gatewayTopologyUnknownOrDrift {
 				t.Fatalf("topology = %q", got)
@@ -251,10 +274,17 @@ func TestClassifyGatewayV2StageFailsClosedWithoutRestartAndPublicationProof(t *t
 		{"host publication is unproven", func(value *gatewayV2DockerObservation) { value.StageHostPublicationProven = false }},
 		{"stage paused", func(value *gatewayV2DockerObservation) { value.StageRuntime.Paused = true }},
 		{"stage restarted", func(value *gatewayV2DockerObservation) { value.StageRuntime.RestartCount = 1 }},
+		{"bound stage ID changed", func(value *gatewayV2DockerObservation) { value.StageContainer.ID = "sha256:" + strings.Repeat("9", 64) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			source, state, journal := gatewayV2IdentityTestState(t)
+			journal.Resources = gatewayV2IdentityTestBoundResources(t)
+			journal.Resources.FinalContainerID = ""
+			journal.Phase = gatewayPhaseStaged
 			value := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1WithStage)
+			if got := classifyGatewayV2Topology(source, state, journal, value); got != gatewayTopologyExactV1WithStage {
+				t.Fatalf("unmodified stage topology = %q", got)
+			}
 			test.mutate(&value)
 			if got := classifyGatewayV2Topology(source, state, journal, value); got != gatewayTopologyUnknownOrDrift {
 				t.Fatalf("topology = %q", got)
@@ -658,6 +688,27 @@ func gatewayV2IdentityTestState(t *testing.T) (routeState, gatewayV2RouteState, 
 
 func gatewayV2IdentityTestImage() imageInspection {
 	return imageInspection{ID: "sha256:" + strings.Repeat("a", 64), OS: "linux", RepoDigests: []string{"caddy@" + gatewayV2CaddyImageDigest}}
+}
+
+func gatewayV2IdentityTestBoundResources(t *testing.T) gatewayV2ResourceBindings {
+	t.Helper()
+	config, err := newGatewayV2VolumeResourceBinding(gatewayV1VolumeIdentity{
+		Mountpoint: "/var/lib/docker/volumes/rig-generated-caddy-config-v2/_data", CreatedAt: "2026-09-29T00:01:00Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := newGatewayV2VolumeResourceBinding(gatewayV1VolumeIdentity{
+		Mountpoint: "/var/lib/docker/volumes/rig-generated-caddy-data-v2/_data", CreatedAt: "2026-09-29T00:02:00Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gatewayV2ResourceBindings{
+		ImageID: strings.Repeat("a", 64), IngressNetworkID: strings.Repeat("6", 64),
+		ConfigVolume: config, DataVolume: data,
+		StageContainerID: strings.Repeat("c", 64), FinalContainerID: strings.Repeat("d", 64),
+	}
 }
 
 func gatewayV2IdentityTestObservation(t *testing.T, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, topology gatewayObservedTopology) gatewayV2DockerObservation {

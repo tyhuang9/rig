@@ -50,7 +50,7 @@ const (
 )
 
 var gatewayContainerInspectFormat = strings.TrimSuffix(caddyInspectFormat, "}") +
-	`,"paused":{{json .State.Paused}},"dead":{{json .State.Dead}},"restartCount":{{json .RestartCount}},"effectivePortBindings":{{json .NetworkSettings.Ports}}}`
+	`,"paused":{{json .State.Paused}},"dead":{{json .State.Dead}},"restartCount":{{json .RestartCount}},"effectivePortBindings":{{json .NetworkSettings.Ports}},"configuredNetworks":{{json .NetworkSettings.Networks}}}`
 
 // gatewayV2DockerObservation is a read-only snapshot. Its classifier is pure:
 // all Docker reads and live policy probes happen before this value is passed to
@@ -124,10 +124,25 @@ type gatewayV2DockerObservation struct {
 }
 
 type gatewayContainerRuntime struct {
-	Paused                bool                           `json:"paused"`
-	Dead                  bool                           `json:"dead"`
-	RestartCount          int                            `json:"restartCount"`
-	EffectivePortBindings map[string][]map[string]string `json:"effectivePortBindings"`
+	Paused                bool                                  `json:"paused"`
+	Dead                  bool                                  `json:"dead"`
+	RestartCount          int                                   `json:"restartCount"`
+	EffectivePortBindings map[string][]map[string]string        `json:"effectivePortBindings"`
+	ConfiguredNetworks    map[string]gatewayV2ConfiguredNetwork `json:"configuredNetworks"`
+}
+
+type gatewayV2ConfiguredNetwork struct {
+	IPAMConfig  *gatewayV2ConfiguredIPAM `json:"IPAMConfig"`
+	NetworkID   string                   `json:"NetworkID"`
+	EndpointID  string                   `json:"EndpointID"`
+	IPAddress   string                   `json:"IPAddress"`
+	GwPriority  int                      `json:"GwPriority"`
+	IPv6Gateway string                   `json:"IPv6Gateway"`
+}
+
+type gatewayV2ConfiguredIPAM struct {
+	IPv4Address string `json:"IPv4Address"`
+	IPv6Address string `json:"IPv6Address"`
 }
 
 type gatewayContainerInspection struct {
@@ -339,28 +354,36 @@ func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState,
 			return observation, err
 		}
 	}
-	if observation.StageContainerFound && observation.StageContainer.Running && !observation.StageContainer.Restarting {
-		observation.StageConfig, err = m.inspectLiveCaddyConfig(ctx, observation.StageContainer.ID)
-		if err != nil {
-			return observation, err
+	if observation.StageContainerFound {
+		if observation.StageContainer.Running && !observation.StageContainer.Restarting {
+			observation.StageConfig, err = m.inspectLiveCaddyConfig(ctx, observation.StageContainer.ID)
+			if err != nil {
+				return observation, err
+			}
 		}
 		observation.StageRestartConfig, err = m.inspectStoppedCaddyRestartConfig(ctx, observation.StageContainer.ID, state.Identity.StageConfigFilename)
 		if err != nil {
 			return observation, err
 		}
-		observation.Stage404Proven = m.proveGatewayV2Stage404(ctx, state, observation.StageContainer.ID)
-		observation.StageHostPublicationProven = proveGatewayV2StageHostPublication(ctx, state, observation.StageContainer.ID, probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
+		if observation.StageContainer.Running && !observation.StageContainer.Restarting {
+			observation.Stage404Proven = m.proveGatewayV2Stage404(ctx, state, observation.StageContainer.ID)
+			observation.StageHostPublicationProven = proveGatewayV2StageHostPublication(ctx, state, observation.StageContainer.ID, probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
+		}
 	}
-	if observation.FinalContainerFound && observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
-		observation.FinalConfig, err = m.inspectLiveCaddyConfig(ctx, observation.FinalContainer.ID)
-		if err != nil {
-			return observation, err
+	if observation.FinalContainerFound {
+		if observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
+			observation.FinalConfig, err = m.inspectLiveCaddyConfig(ctx, observation.FinalContainer.ID)
+			if err != nil {
+				return observation, err
+			}
 		}
 		observation.FinalRestartConfig, err = m.inspectStoppedCaddyRestartConfig(ctx, observation.FinalContainer.ID, state.Identity.ActiveConfigFilename)
 		if err != nil {
 			return observation, err
 		}
-		observation.Final404Proven = m.proveGatewayV2Final404(ctx, state, observation.FinalContainer.ID)
+		if observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
+			observation.Final404Proven = m.proveGatewayV2Final404(ctx, state, observation.FinalContainer.ID)
+		}
 	}
 
 	if observation.FinalContainerFound {
@@ -380,11 +403,13 @@ func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState,
 		}
 	}
 	var finalEndpointIdentityBefore string
-	if observation.FinalContainerFound && observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
+	if observation.FinalContainerFound {
 		finalEndpointIdentityBefore, err = m.inspectGatewayEndpointIdentitySnapshot(ctx, gatewayV2RouteRecords(state), observation.ApplicationNetworks)
 		if err != nil {
 			return observation, err
 		}
+	}
+	if observation.FinalContainerFound && observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
 		observation.FinalRoutesProven = m.proveGatewayV2FinalRoutes(ctx, state, observation.FinalContainer.ID)
 		observation.FinalHostPublicationProven = proveGatewayV2FinalHostPublication(ctx, state, observation.FinalContainer.ID, probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
 	}
@@ -415,17 +440,20 @@ func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState,
 	observation.V1ResourcesStable = m.confirmGatewayV1Resources(ctx, observation)
 	observation.V2ResourcesStable = m.confirmGatewayV2Resources(ctx, state, observation)
 	stageConfigStable := true
-	if observation.StageContainerFound && observation.StageContainer.Running && !observation.StageContainer.Restarting {
-		confirmedLive, configErr := m.inspectLiveCaddyConfig(ctx, observation.StageContainer.ID)
-		if configErr != nil {
-			return observation, configErr
+	if observation.StageContainerFound {
+		var confirmedLive []byte
+		if observation.StageContainer.Running && !observation.StageContainer.Restarting {
+			confirmedLive, err = m.inspectLiveCaddyConfig(ctx, observation.StageContainer.ID)
+			if err != nil {
+				return observation, err
+			}
 		}
 		confirmedRestart, configErr := m.inspectStoppedCaddyRestartConfig(ctx, observation.StageContainer.ID, state.Identity.StageConfigFilename)
 		if configErr != nil {
 			clear(confirmedLive)
 			return observation, configErr
 		}
-		stageConfigStable = sameCaddyConfig(observation.StageConfig, confirmedLive) && sameCaddyConfig(observation.StageRestartConfig, confirmedRestart)
+		stageConfigStable = sameOptionalCaddyConfig(observation.StageConfig, confirmedLive) && sameCaddyConfig(observation.StageRestartConfig, confirmedRestart)
 		clear(confirmedLive)
 		clear(confirmedRestart)
 	}
@@ -436,17 +464,20 @@ func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState,
 	observation.StageStable = stageConfigStable && observation.StageContainerFound == confirmedStageFound && (!confirmedStageFound ||
 		(reflect.DeepEqual(observation.StageContainer, confirmedStage) && reflect.DeepEqual(observation.StageRuntime, confirmedStageRuntime)))
 	finalConfigStable := true
-	if observation.FinalContainerFound && observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
-		confirmedLive, configErr := m.inspectLiveCaddyConfig(ctx, observation.FinalContainer.ID)
-		if configErr != nil {
-			return observation, configErr
+	if observation.FinalContainerFound {
+		var confirmedLive []byte
+		if observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
+			confirmedLive, err = m.inspectLiveCaddyConfig(ctx, observation.FinalContainer.ID)
+			if err != nil {
+				return observation, err
+			}
 		}
 		confirmedRestart, configErr := m.inspectStoppedCaddyRestartConfig(ctx, observation.FinalContainer.ID, state.Identity.ActiveConfigFilename)
 		if configErr != nil {
 			clear(confirmedLive)
 			return observation, configErr
 		}
-		finalConfigStable = sameCaddyConfig(observation.FinalConfig, confirmedLive) && sameCaddyConfig(observation.FinalRestartConfig, confirmedRestart)
+		finalConfigStable = sameOptionalCaddyConfig(observation.FinalConfig, confirmedLive) && sameCaddyConfig(observation.FinalRestartConfig, confirmedRestart)
 		clear(confirmedLive)
 		clear(confirmedRestart)
 	}
@@ -485,6 +516,7 @@ func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState,
 func classifyGatewayV2Topology(source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) gatewayObservedTopology {
 	requireV1RollbackTopology := journal.Phase != gatewayPhaseCommitted
 	if !validGatewayTopologyInputs(source, state, journal) || !validGatewayPinnedImage(observation.Image, observation.ImageFound) ||
+		!gatewayV2ObservedResourcesMatchJournal(journal, observation) ||
 		!validGatewayV1Base(source, journal, observation, requireV1RollbackTopology) || !observation.StageStable || !observation.FinalStable || !observation.OwnedInventoriesStable {
 		return gatewayTopologyUnknownOrDrift
 	}
@@ -522,6 +554,7 @@ func classifyGatewayV2Topology(source routeState, state gatewayV2RouteState, jou
 
 func classifyGatewayV2MixedRestart(source routeState, committed, proposed gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) bool {
 	if !validGatewayV2MixedRestartInputs(source, committed, proposed, journal) || !validGatewayPinnedImage(observation.Image, observation.ImageFound) ||
+		!gatewayV2ObservedResourcesMatchJournal(journal, observation) ||
 		!validGatewayV1Base(source, journal, observation, false) || !observation.StageStable || !observation.FinalStable || !observation.OwnedInventoriesStable {
 		return false
 	}
@@ -716,11 +749,19 @@ func validGatewayV2IngressNetwork(state gatewayV2RouteState, journal gatewayMigr
 }
 
 func validGatewayV2Container(state gatewayV2RouteState, journal gatewayMigrationJournal, value caddyInspection, runtime gatewayContainerRuntime, found bool, role, imageID string) bool {
+	return validGatewayV2ContainerState(state, journal, value, runtime, found, role, imageID, true)
+}
+
+func validGatewayV2StoppedContainer(state gatewayV2RouteState, journal gatewayMigrationJournal, value caddyInspection, runtime gatewayContainerRuntime, found bool, role, imageID string) bool {
+	return validGatewayV2ContainerState(state, journal, value, runtime, found, role, imageID, false)
+}
+
+func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigrationJournal, value caddyInspection, runtime gatewayContainerRuntime, found bool, role, imageID string, running bool) bool {
 	name, configFilename, restart := state.Identity.StageContainer, state.Identity.StageConfigFilename, gatewayV2StageRestartPolicy
 	if role == gatewayV2FinalContainerRole {
 		name, configFilename, restart = state.Identity.FinalContainer, state.Identity.ActiveConfigFilename, gatewayV2FinalRestartPolicy
 	}
-	if !found || !value.Running || value.Restarting || !validGatewayContainerRuntime(runtime, false) || !validContainerID(value.ID) || normalizeID(value.Image) != normalizeID(imageID) ||
+	if !found || value.Running != running || value.Restarting || !validGatewayContainerRuntime(runtime, false) || !validContainerID(value.ID) || normalizeID(value.Image) != normalizeID(imageID) ||
 		strings.TrimPrefix(value.Name, "/") != name || value.Hostname != name || value.User != "1000:1000" || value.NetworkMode != state.Identity.IngressNetwork ||
 		!exactGatewayV2Environment(value.Env) || !value.ReadOnly || value.Privileged || !onlyCaddyCapability(value.CapAdd) || !exactFoldSet(value.CapDrop, "ALL") ||
 		!onlyNoNewPrivileges(value.SecurityOpt) || len(value.Binds) != 0 || len(value.Tmpfs) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 ||
@@ -730,11 +771,18 @@ func validGatewayV2Container(state gatewayV2RouteState, journal gatewayMigration
 		value.Cmd[2] != "/config/"+configFilename || len(value.Ulimits) != 1 || value.Ulimits[0] != (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}) ||
 		!reflect.DeepEqual(value.Labels, gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true)) ||
 		!validGatewayV2Mounts(value.Mounts, state.Identity) || !validGatewayV2PortBindings(value.PortBindings, state, journal, role) ||
-		!reflect.DeepEqual(runtime.EffectivePortBindings, value.PortBindings) {
+		(running && !reflect.DeepEqual(runtime.EffectivePortBindings, value.PortBindings)) ||
+		(!running && gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings)) {
 		return false
 	}
 	expectedNetworks, valid := gatewayV2ExpectedContainerNetworks(state, role)
-	if !valid || len(value.Networks) != len(expectedNetworks) {
+	if !valid {
+		return false
+	}
+	if !running {
+		return validGatewayV2StoppedContainerNetworks(state, role, expectedNetworks, runtime.ConfiguredNetworks)
+	}
+	if len(value.Networks) != len(expectedNetworks) {
 		return false
 	}
 	for name := range expectedNetworks {
@@ -751,6 +799,39 @@ func validGatewayV2Container(state gatewayV2RouteState, journal gatewayMigration
 		}
 	}
 	return true
+}
+
+func validGatewayV2StoppedContainerNetworks(state gatewayV2RouteState, role string, expected map[string]struct{}, actual map[string]gatewayV2ConfiguredNetwork) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for name := range expected {
+		attachment, exists := actual[name]
+		if !exists || !validContainerID(attachment.NetworkID) || attachment.EndpointID != "" || attachment.IPAddress != "" || attachment.IPv6Gateway != "" {
+			return false
+		}
+		if name == state.Identity.IngressNetwork {
+			if attachment.GwPriority != caddyGatewayPriority || attachment.IPAMConfig == nil ||
+				attachment.IPAMConfig.IPv4Address != state.Network.ContainerIPv4 || attachment.IPAMConfig.IPv6Address != "" {
+				return false
+			}
+			continue
+		}
+		if role != gatewayV2FinalContainerRole || attachment.GwPriority != 0 ||
+			(attachment.IPAMConfig != nil && *attachment.IPAMConfig != (gatewayV2ConfiguredIPAM{})) {
+			return false
+		}
+	}
+	return true
+}
+
+func gatewayV2HasEffectivePortBinding(values map[string][]map[string]string) bool {
+	for _, bindings := range values {
+		if len(bindings) != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func exactGatewayV2Environment(values []string) bool {
@@ -1629,6 +1710,9 @@ func clearGatewayV2DockerObservation(value *gatewayV2DockerObservation) {
 	if value == nil {
 		return
 	}
+	clear(value.V1Runtime.ConfiguredNetworks)
+	clear(value.StageRuntime.ConfiguredNetworks)
+	clear(value.FinalRuntime.ConfiguredNetworks)
 	clear(value.V1Config)
 	clear(value.V1RestartConfig)
 	clear(value.StageConfig)
