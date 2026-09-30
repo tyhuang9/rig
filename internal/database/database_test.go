@@ -178,7 +178,7 @@ func TestLANAccessMigrationUpgradePreservesDataAndBackfillsHeads(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() == "025_lan_access.sql" {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() >= "025_" {
 			continue
 		}
 		body, err := migrations.ReadFile("migrations/" + entry.Name())
