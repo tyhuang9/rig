@@ -63,6 +63,17 @@ empty snapshot. Linux reads the current network namespace. The route and
 interface reads are sequential, and the future cutover must revalidate them
 immediately around binding. This helper is still unwired to Docker mutation.
 
+The read-only v2 gateway observer checks pinned Docker identity, protected v1
+source identity, live and restart Caddy configuration, explicit bindings,
+owned resource inventories, application-network attachments, and route/404
+probes. It rechecks resource inventories and container process generations
+after probing. Its pure classifier tests exact hypothetical v1, stage, and
+final snapshots. The live observer deliberately withholds every exact
+classification until immutable application-endpoint and alias ownership are
+proved. Stage/final also require host-side publication and reachability.
+No Manager or controller path calls this observer yet, so it cannot upgrade
+the gateway or expose a LAN URL.
+
 ## Executed verification
 
 | Check | Result |
@@ -86,6 +97,8 @@ immediately around binding. This helper is still unwired to Docker mutation.
 | `go test -count=1 ./internal/hostnetwork` after the route snapshot | Passed on Windows, including a native route-read smoke test. |
 | Linux route tests under WSL and Windows/Linux test cross-compilation | Passed as reported by the host-route implementation agent; WSL reads the current network namespace. |
 | `go test -count=1 ./...` and `go vet ./...` with normal Windows permissions after both read-only slices | Passed. |
+| `go test -count=1 ./internal/generatedingress` and `go vet ./internal/generatedingress` after observer review fixes | Passed. |
+| `go test -count=1 ./...` and `go vet ./...` after the observer corrective pass | Passed with normal Windows permissions. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -104,7 +117,8 @@ No live Caddy config validation, Docker port bind, rollback, second-device LAN
 request, or database-backed LAN journey has run on this branch. Those are
 future M3 gates, not inferred from the local unit tests.
 The installed Docker CLI currently cannot reach the Docker Desktop Linux
-daemon: `docker version --format '{{json .Server}}'` failed because
+daemon: `C:\Program Files\Docker\Docker\resources\bin\docker.exe version
+--format '{{json .Server}}'` failed because
 `//./pipe/dockerDesktopLinuxEngine` does not exist. No live gateway acceptance
 claim follows from the read-only observer's unit tests.
 
@@ -122,7 +136,8 @@ Docker Desktop checks, plus a physical second-device journey using an
 application-owned external database, remain open. No managed database or Neon
 provisioning belongs to this milestone.
 The runtime network planner must reject overlap with all relevant host routes
-and interfaces, beyond the pure selected-address check. The journal's actor
+and interfaces using the new hostnetwork helper immediately before and after
+mutation; the helper is not wired yet. The journal's actor
 field records provenance; it does not authenticate or authorize the actor.
 The protected journal phase update checks the expected phase before replacing
 the file, but it is not an atomic compare-and-swap across processes. Gateway
@@ -136,3 +151,8 @@ prove it is stopped before relying on the lock. On Linux, a malicious process
 with the same user identity can replace the lock path while a handle is held;
 Rig never unlinks it, and the open-time path identity and permission checks
 reject unsafe paths before work begins.
+The live observer still needs immutable endpoint and unique-alias proof,
+host-side selected-address publication proof, post-probe endpoint/config
+reinspection, and protected binding to immutable v2 network, volume, and
+container IDs before it may authorize a cutover. A
+physical second-device LAN journey remains a distinct acceptance gate.
