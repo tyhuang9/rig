@@ -26,6 +26,8 @@ implemented and locally tested, but no LAN URL is exposed.
 - Explicit journaled-rollback retirement: `ff8508c`.
 - Protected pre-journal abort history: `99a965e`.
 - Fresh-proof pre-journal abort coordinator: `da93a12`.
+- Authenticated gateway upgrade action: `9fdf586`.
+- Recovery-only startup and pinned controller operation: `5a63430`.
 
 The allocator stores approved desired gateway and per-app access revisions,
 action digests, compare-and-swap heads, and unique durable port ownership. It
@@ -46,8 +48,8 @@ already exists; a reported write durability failure stops the operation even
 if immediate readback sees the new bytes. Changed replay payloads fail. The
 phase table defines recovery transitions for an incomplete staging attempt,
 including rollback or an uncertain state; it never authorizes publishing LAN
-ports without a new controlled action. Current normal startup does not serve
-the authenticated recovery action for unfinished history. A committed journal
+ports without a new controlled action. Startup now selects a restricted
+controller for an unfinished approved operation. A committed journal
 retains the initial target digest while allowing later valid app-route changes
 under the same protected network plan. The pure validators reject a network
 subnet that contains the selected LAN address and rejects duplicate allocation
