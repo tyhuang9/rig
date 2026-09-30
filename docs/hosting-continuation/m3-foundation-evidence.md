@@ -422,11 +422,11 @@ private-directory boundary has unit and WSL evidence, but its behavior with a
 live Docker config copy and on a locked-down Windows service account remains
 unverified. Windows ancestors that allow traversal without `GENERIC_READ` fail
 closed until a narrower safe guard is implemented and tested.
-The authenticated gateway upgrade action is locally tested. Restart recovery
-must still make its endpoint reachable when a matching claim or protected
-history needs reconciliation; normal startup currently exits before serving
-that endpoint for an unfinished protected migration. Live Docker and
-second-device checks are also required before M3 acceptance.
+The authenticated gateway upgrade action is locally tested. The new startup
+classifier and restricted controller path are also locally tested, but their
+actual restart behavior with live Docker remains unverified. A recovered
+operation stays restricted until a later process restart proves normal mode.
+Live Docker and second-device checks are also required before M3 acceptance.
 Docker volume deletion remains
 name-based after immediate exact label, mountpoint, and creation-time
 reinspection because Docker exposes no immutable volume ID or conditional
@@ -457,9 +457,10 @@ rolled-back replay re-enters the Manager to reattest protected history and
 current topology. The read path rechecks the claim after observation to avoid
 mixing different claim epochs. `unknown` is used when live availability is not
 proved. The API has no app-level LAN consent or public route activation yet.
-Because `CurrentGatewayProfileUpgradeClaim` excludes rolled-back claims, a
-refresh after rollback does not yet display that historical outcome; the M3
-operator read model must add it before UI acceptance.
+Normal `GET` excludes rolled-back claims. Recovery-only `GET` reads the exact
+operation selected at startup, so its historical rolled-back outcome remains
+visible while the restricted process is running. The M3 operator UI still
+needs a complete recovery experience before acceptance.
 
 | Check after the action diff | Result |
 | --- | --- |
@@ -477,8 +478,52 @@ The restricted Windows sandbox failed in unchanged workspace-policy fixtures
 and could not access the usual Go cache. The full Go suite above passed with
 normal Windows permissions. The Docker Desktop Linux daemon is unavailable on
 this host, so no live container migration, LAN route, rollback, or physical
-second-device behavior is verified by this action unit. The next narrow M3
-change must provide a fail-closed recovery-only startup mode for exact
-claim/history combinations, including a prepared claim with no protected
-artifact after a crash before Manager entry. Other controller work must remain
-disabled in that mode until a fresh restart proves terminal agreement.
+second-device behavior is verified by this action unit.
+
+## Recovery-only startup: local evidence
+
+The controller reserves its loopback listener before runtime setup, then
+acquires one process-lifetime, protected owner lock for its DataRoot before
+opening SQLite. For generated runtime it reads the current
+gateway profile and every retained upgrade claim in one validated SQLite
+transaction, then classifies the protected ingress history under the gateway
+locks using read-only topology checks. Invalid or mismatched history fails
+startup. An unfinished approved operation starts a controller limited to
+bootstrap/session management and `GET`/`POST`
+`/api/v1/system/lan-gateway-upgrade`. It does not create the runtime executor,
+recover deployments, start workers, auto-deploy, or start the relay. The POST
+path rejects any operation ID other than the one selected at startup before
+creating a claim. The restricted mode remains latched after rollback until a
+new process start repeats the cross-store and live topology proof. Normal mode
+performs ingress recovery and a second snapshot/history inspection before
+starting background work.
+
+| Check for the recovery-only startup diff | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions | Passed across all Go packages, including appaccess, generatedingress, controller, hostd, and controllerowner. |
+| `go test ./internal/generatedingress -run '^TestGatewayV2Startup' -count=1` | Passed for fresh v1, committed v2, unfinished claims, retained retirement receipts, mismatches, and failed proofs. |
+| `go test ./internal/appaccess -count=1` and repeated snapshot tests | Passed for full claim history validation and one-transaction consistency. |
+| `go test -count=1 ./internal/controller` | Passed, including exact operation pin, blocked APIs, historical read after rollback, and latched mode. |
+| `go test -count=1 ./internal/controllerowner` | Passed for contention, process crash release, and unsafe paths on Windows. The Unix implementation cross-compiled. |
+| `go test -count=1 ./cmd/hostd` after early listener reservation | Passed, including an occupied-listener check that proves no controller working directory was created first. |
+| Live Docker restart, Linux owner-lock execution, and physical second-device journey | Not run; Docker Desktop Linux daemon and a second device are unavailable locally. |
+
+An independent final-integration rerun of the full Go suite after the listener
+change stopped when an unchanged deployments SQLite fixture reported
+`database or disk is full (13)` with less than 400 MB free. The earlier full
+suite passed; the post-listener hostd suite and `go vet ./...` also passed.
+This disk-capacity failure is not counted as a passing rerun or as a code
+regression. The temporary Go build cache was cleared and disk space recovered.
+
+The startup tests use controlled fixtures and command runners. They do not
+prove a real Docker daemon's topology response or an operator's browser
+experience after a process crash. When generated runtime is disabled, startup
+rejects any retained SQLite upgrade claim or protected v2 history artifact;
+this configuration cannot bypass the recovery gate by starting a different
+runtime mode on the same DataRoot.
+
+An older running `hostd` binary does not acquire the new owner lock. Before
+upgrading, stop and verify the old controller has exited; listener reservation
+detects the common same-address overlap but cannot detect an old process on
+another port. Cross-version overlap remains a rollout risk until this
+prerequisite is exercised in an actual upgrade.

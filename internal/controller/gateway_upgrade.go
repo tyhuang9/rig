@@ -31,6 +31,7 @@ type GatewayUpgradeService interface {
 	AuthorizeGatewayProfileUpgrade(context.Context, appaccess.GatewayProfileUpgradeAuthorizationInput) (appaccess.GatewayProfileUpgradeAuthorization, error)
 	AdvanceGatewayProfileUpgradeClaim(context.Context, appaccess.GatewayProfileUpgradeClaimOwner, appaccess.GatewayProfileUpgradeState, appaccess.GatewayProfileUpgradeState) (appaccess.GatewayProfileUpgradeClaim, bool, error)
 	CurrentGatewayProfileUpgradeClaim(context.Context) (appaccess.GatewayProfileUpgradeClaim, error)
+	GatewayProfileUpgradeClaim(context.Context, string) (appaccess.GatewayProfileUpgradeClaim, error)
 }
 
 // GatewayUpgradeRuntime is available only with the generated runtime. The
@@ -74,7 +75,7 @@ func (s *Server) getLANGatewayUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	claim, err := s.GatewayUpgrades.CurrentGatewayProfileUpgradeClaim(r.Context())
+	claim, err := s.gatewayUpgradeClaim(r.Context())
 	if errors.Is(err, appaccess.ErrNotFound) {
 		writeJSON(w, http.StatusOK, result)
 		return
@@ -93,7 +94,7 @@ func (s *Server) getLANGatewayUpgrade(w http.ResponseWriter, r *http.Request) {
 	} else {
 		result.Observed.Availability = string(generatedingress.GatewayV2OperationUnknown)
 	}
-	confirmedClaim, confirmErr := s.GatewayUpgrades.CurrentGatewayProfileUpgradeClaim(r.Context())
+	confirmedClaim, confirmErr := s.gatewayUpgradeClaim(r.Context())
 	if confirmErr != nil || confirmedClaim != claim {
 		s.gatewayUpgradeProblem(w, r, operationGetLANGatewayUpgrade, errors.New("gateway upgrade observation changed"))
 		return
@@ -126,6 +127,11 @@ func (s *Server) upgradeLANGateway(w http.ResponseWriter, r *http.Request) {
 	if err != nil || !validCanonicalUUID(body.OperationID) || !validCanonicalUUID(body.ProfileRevisionID) ||
 		body.ProfileRevisionNumber <= 0 || !validLowerHex(body.ActionDigest, 64) {
 		s.gatewayUpgradeProblem(w, r, operationUpgradeLANGateway, appaccess.ErrInvalidInput)
+		return
+	}
+	if s.RecoveryOnly && (s.RecoveryOperationID == "" || body.OperationID != s.RecoveryOperationID) {
+		w.Header().Set("Cache-Control", "no-store")
+		problem(w, r, http.StatusServiceUnavailable, "gateway_reconciliation_required", "Only the startup gateway upgrade can be reconciled", nil)
 		return
 	}
 	profile, err := s.GatewayUpgrades.CurrentGatewayProfile(r.Context())
@@ -188,6 +194,16 @@ func (s *Server) upgradeLANGateway(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 	}
 	writeJSON(w, status, apicontract.LANGatewayUpgradeMutation{Claim: contractLANGatewayUpgradeClaim(claim), Created: created})
+}
+
+func (s *Server) gatewayUpgradeClaim(ctx context.Context) (appaccess.GatewayProfileUpgradeClaim, error) {
+	if s.RecoveryOnly {
+		if s.RecoveryOperationID == "" {
+			return appaccess.GatewayProfileUpgradeClaim{}, appaccess.ErrInvalidStoredState
+		}
+		return s.GatewayUpgrades.GatewayProfileUpgradeClaim(ctx, s.RecoveryOperationID)
+	}
+	return s.GatewayUpgrades.CurrentGatewayProfileUpgradeClaim(ctx)
 }
 
 func gatewayUpgradeInvocationUnresolved(result generatedingress.GatewayV2UpgradeResult, resultErr error) bool {

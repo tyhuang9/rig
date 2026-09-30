@@ -42,6 +42,7 @@ type runtimeCompositionOptions struct {
 	runner                 runtimeprocess.CommandRunner
 	beforeStep             func(string) error
 	recoverIngress         func(context.Context, *generatedingress.Manager) error
+	preinspectedIngress    *generatedingress.Manager
 	capacitySourceFactory  func(generatedruntime.CapacitySource) generatedruntime.CapacitySource
 	migrationRunnerFactory func(generatedruntime.MigrationRunner) generatedruntime.MigrationRunner
 }
@@ -207,13 +208,16 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err := step("ingress_create"); err != nil {
 			return runtimeComposition{}, err
 		}
-		ingress, err := generatedingress.New(options.runner, generatedingress.Options{
-			DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
-			DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
-			DataRoot: configuration.DataRoot,
-		})
-		if err != nil {
-			return runtimeComposition{}, fmt.Errorf("generated ingress setup: %w", err)
+		ingress := options.preinspectedIngress
+		if ingress == nil {
+			ingress, err = generatedingress.New(options.runner, generatedingress.Options{
+				DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
+				DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
+				DataRoot: configuration.DataRoot,
+			})
+			if err != nil {
+				return runtimeComposition{}, fmt.Errorf("generated ingress setup: %w", err)
+			}
 		}
 		result.ingress = ingress
 		if err := step("ingress_recover"); err != nil {

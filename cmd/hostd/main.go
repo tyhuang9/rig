@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"syscall"
 	"time"
@@ -22,9 +24,11 @@ import (
 	"github.com/hostd/hostd/internal/bootstraplocator"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
+	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
@@ -47,6 +51,27 @@ func runServer(args []string) int {
 		return 1
 	}
 	logger := newStructuredLogger(os.Stderr, cfg.LogLevel)
+	listener, err := net.Listen("tcp", cfg.ListenAddress)
+	if err != nil {
+		logger.Error("controller listener reservation failed", "error", err)
+		return 1
+	}
+	defer listener.Close()
+	ownerDirectories, err := docker.PrepareControllerDirectories(cfg.DataRoot)
+	if err != nil {
+		logger.Error("controller owner directory setup failed", "error", err)
+		return 1
+	}
+	ownerLease, err := controllerowner.Acquire(context.Background(), ownerDirectories.WorkingDirectory)
+	if err != nil {
+		logger.Error("controller data root ownership failed", "error", err)
+		return 1
+	}
+	defer func() {
+		if err := ownerLease.Close(); err != nil {
+			logger.Error("controller data root ownership release failed", "error", err)
+		}
+	}()
 	dockerExecutable, err := resolveRuntimeDockerExecutable(cfg, docker.ResolveExecutable)
 	if err != nil {
 		logger.Error("Docker executable resolution failed", "error", err)
@@ -58,6 +83,11 @@ func runServer(args []string) int {
 		return 1
 	}
 	defer db.Close()
+	gate, err := inspectGatewayStartup(context.Background(), cfg, db, dockerExecutable, ownerDirectories)
+	if err != nil {
+		logger.Error("gateway startup inspection failed", "error", err)
+		return 1
+	}
 	a := auth.New(db)
 	token, err := a.EnsureBootstrapToken()
 	if err != nil {
@@ -86,6 +116,10 @@ func runServer(args []string) int {
 		}
 	}
 	defer bootstrapCompleted()
+	if gate.inspection.Disposition == generatedingress.GatewayV2StartupRecoveryOnly {
+		logger.Warn("controller entering gateway recovery mode", "operation_id", gate.inspection.OperationID)
+		return runRecoveryOnlyController(cfg, logger, listener, a, appaccess.New(db), gate.ingress, gate.inspection.OperationID, bootstrapCompleted)
+	}
 	m := machines.New(db)
 	if _, err := m.EnsureLocal(); err != nil {
 		logger.Error("local machine setup failed", "error", err)
@@ -144,10 +178,22 @@ func runServer(args []string) int {
 	runtime, err := prepareRuntimeComposition(context.Background(), cfg, runtimeCompositionDependencies{
 		db: db, applications: applications, snapshots: snapshots, configuration: applicationConfiguration,
 		deployments: deploymentRepository, plans: planStore,
-	}, runtimeCompositionOptions{dockerExecutable: dockerExecutable})
+	}, runtimeCompositionOptions{dockerExecutable: dockerExecutable, preinspectedIngress: gate.ingress})
 	if err != nil {
 		logger.Error("runtime composition failed", "error", err)
 		return 1
+	}
+	if cfg.GeneratedRuntime {
+		confirmedSnapshot, snapshotErr := appaccess.New(db).GatewayUpgradeStartupSnapshot(context.Background())
+		if snapshotErr != nil || !reflect.DeepEqual(gate.snapshot, confirmedSnapshot) {
+			logger.Error("gateway startup claim snapshot changed", "error", snapshotErr)
+			return 1
+		}
+		confirmedInspection, inspectErr := runtime.ingress.InspectGatewayV2Startup(context.Background(), gatewayStartupClaims(confirmedSnapshot))
+		if inspectErr != nil || confirmedInspection != gate.inspection {
+			logger.Error("gateway startup inspection changed after recovery", "error", inspectErr)
+			return 1
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -193,7 +239,7 @@ func runServer(args []string) int {
 		_ = s.Shutdown(shutdown)
 	}()
 	logger.Info("hostd listening", "address", cfg.ListenAddress, "fake_runtime", capabilities.fake, "compose_runtime", capabilities.compose, "generated_runtime", capabilities.generated)
-	serveErr := s.ListenAndServe()
+	serveErr := s.Serve(listener)
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		logger.Error("server stopped", "error", serveErr)
 	}
@@ -204,6 +250,36 @@ func runServer(args []string) int {
 	_ = waitForControllerRelay(relayDone, controllerRelayShutdownTimeout, logger)
 	_ = waitForAutoDeploy(autoDeployDone, autoDeployShutdownTimeout, logger)
 	if serveErr != nil && serveErr != http.ErrServerClosed {
+		return 1
+	}
+	return 0
+}
+
+func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener net.Listener, authentication *auth.Service,
+	upgrades *appaccess.Repository, ingress *generatedingress.Manager, operationID string, bootstrapCompleted func(),
+) int {
+	if operationID == "" || ingress == nil || upgrades == nil || listener == nil {
+		logger.Error("gateway recovery controller is missing its pinned operation")
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	server := &controller.Server{
+		Auth: authentication, GatewayUpgrades: upgrades, GatewayUpgradeRuntime: ingress,
+		GeneratedRuntime: true, RecoveryOnly: true, RecoveryOperationID: operationID,
+		Logger: logger, BootstrapCompleted: bootstrapCompleted,
+	}
+	httpServer := &http.Server{Addr: cfg.ListenAddress, Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdown)
+	}()
+	logger.Info("hostd recovery controller listening", "address", cfg.ListenAddress, "operation_id", operationID)
+	err := httpServer.Serve(listener)
+	if err != nil && err != http.ErrServerClosed {
+		logger.Error("recovery controller stopped", "error", err)
 		return 1
 	}
 	return 0
