@@ -1,7 +1,8 @@
 # M3 LAN foundation: local evidence
 
 Status: partial M3 implementation, 2026-09-29. This branch remains local and
-unpublished. It does not enable a LAN listener or report a LAN URL.
+unpublished. No LAN listener has been started on this local host, and no
+controller action or LAN URL is exposed.
 
 ## Exact revisions and scope
 
@@ -14,6 +15,7 @@ unpublished. It does not enable a LAN listener or report a LAN URL.
 - Immutable Docker resource bindings in the migration journal: `48152f9`.
 - Exact v2 resource creation arguments and host preflight: `0195695`.
 - ID-bound observer and read-only migration recovery: `50bc2f9`.
+- Journaled v2 gateway staging: `1a6eb3e`.
 
 The allocator stores approved desired gateway and per-app access revisions,
 action digests, compare-and-swap heads, and unique durable port ownership. It
@@ -49,8 +51,8 @@ root cannot issue competing Docker commands while one holds the lock. A
 process-exit test proves the next instance can acquire the lock; an injected
 post-switch release failure preserves the executor's
 `CandidateMayBeLive` signal so it does not clean a potentially serving
-container. The lock also serializes committed-v2 route changes; no live gateway
-upgrade or LAN listener is enabled yet.
+container. The lock also serializes committed-v2 route changes; the new staging
+operation has not been invoked against live Docker.
 
 The new `internal/hostnetwork` helper enumerates currently assigned RFC 1918
 IPv4 addresses on active, non-loopback host interfaces. An approved interface
@@ -65,8 +67,9 @@ rejects a proposed private Docker subnet when it overlaps any more-specific
 host route or interface prefix; only the default route is ignored. Snapshot
 completion is private to the package, so a caller cannot fabricate a usable
 empty snapshot. Linux reads the current network namespace. The route and
-interface reads are sequential, and the future cutover must revalidate them
-immediately around binding. This helper is still unwired to Docker mutation.
+interface reads are sequential. The stage operation calls the preflight before
+creating the ingress network and checks the selected interface before stage
+start; final cutover must revalidate again around its own Docker mutation.
 
 The read-only v2 gateway observer checks pinned Docker identity, protected v1
 source identity, live and restart Caddy configuration, explicit bindings,
@@ -110,8 +113,8 @@ selected-IP pool port, both through the host and directly through the attested
 container; generic 404 listeners and loopback publication fail. After commit,
 historical v1 app networks and endpoint health may change while the stopped v1
 gateway core identity remains pinned. Precommit rollback phases retain their
-strict v1 dependency. No live v2 gateway creator, LAN access action, or LAN URL
-is enabled by this serving-path slice.
+strict v1 dependency. No app-serving final gateway, LAN access action, or LAN
+URL is enabled by this serving-path slice.
 
 The migration journal now binds the pinned image, ingress network, both volume
 creation identities, and stage/final container IDs as each resource is made.
@@ -127,8 +130,22 @@ stage/final container creations. The stage publishes only the selected private
 IPv4 port pool; the final also publishes the v1 loopback port. Host preflight
 checks that the approved interface still owns the exact address and that the
 planned Docker subnet does not overlap current host routes or interface
-prefixes. These are unwired prerequisites: no Docker resource was created and
-no host port was opened by this slice.
+prefixes.
+
+`Manager.StageGatewayV2` is an explicit local operation over an already
+prepared, protected migration. It holds the Manager and cross-process gateway
+locks through the phase loop. It proves v1, writes `stage_intent`, creates and
+durably binds the pinned image, ingress network, two volumes, and stopped stage
+container, then copies and rereads the exact 404-only Caddy restart config.
+After stopped-stage identity proof and a final selected-interface check, it
+starts the stage and requires exact live identity, listener challenge, and 404
+proof before writing `staged`. It never stops v1 or enters transfer. A crash
+after binding a stopped stage but before config copy is compensated only after
+exact bound-resource, stopped/no-host-binding, and v1-serving proof; that proof
+cannot start a listener. Create-before-bind ambiguity, drift, or incomplete
+cleanup records unresolved state rather than a false rollback. This method has
+no controller action or URL display caller yet. Its Docker behavior is tested
+with a deterministic driver, not a live daemon.
 
 ## Executed verification
 
@@ -166,6 +183,11 @@ no host port was opened by this slice.
 | `go vet ./...` after these M3 prerequisites | Passed with normal local Windows permissions. |
 | Linux amd64 `go test -c` for `./internal/generatedingress` after recovery observer | Cross-compiled; Linux runtime tests were not executed locally. |
 | Independent code and security reviews of the prerequisite diff | No confirmed blocker for a local commit. Both require live Docker verification before M3 acceptance. |
+| `go test -count=1 ./internal/generatedingress` after staging review fixes | Passed with normal local Windows permissions. |
+| `go test -count=1 ./...` and `go vet ./...` after staging review fixes | Passed with normal local Windows permissions. |
+| Linux amd64 `go test -c` for `./internal/generatedingress` after staging review fixes | Cross-compiled; Linux runtime tests were not executed locally. |
+| `gofmt -d` and `git diff --cached --check` for the staging slice | Passed. |
+| Staging code and security reviews | A Docker container-ID command defect and a bound-stage pre-config crash gap were corrected before commit. Security review found no confirmed exploitable finding for this local 404-only slice. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -181,8 +203,9 @@ Windows permissions. The focused ingress tests passed in the sandbox.
 The Windows Go toolchain has CGO disabled, so `go test -race` was not run. The
 storage tests instead exercise separate SQLite handles and repeated contention.
 No live Caddy config validation, Docker port bind, rollback, second-device LAN
-request, or database-backed LAN journey has run on this branch. Those are
-future M3 gates, not inferred from the local unit tests.
+request, or database-backed LAN journey has run on this branch. The journaled
+staging tests use a fake driver; they do not establish Docker's actual stopped
+inspect shape or host listener behavior. Those are future M3 gates.
 The installed Docker CLI currently cannot reach the Docker Desktop Linux
 daemon: `C:\Program Files\Docker\Docker\resources\bin\docker.exe version
 --format '&#123;&#123;json .Server&#125;&#125;'` failed because
@@ -237,3 +260,11 @@ application probes accept any HTTP status. They do not prove that Caddy selected
 and forwarded the intended app route. A controlled live Docker route matrix
 with distinct backend response markers, wrong-Host and cross-app requests is
 required before claiming LAN routing acceptance.
+
+The next cutover unit must move `staged` through `transfer_intent`, stop stage
+before v1, remove only the bound stage, create and attest the final container,
+and commit only after loopback and LAN proof. Its compensation must restart and
+reattest v1 without rewriting immutable history. Before any app-serving final
+cutover, recheck selected-interface ownership after Docker start as well as
+before it. Authenticated action-specific consent, LAN access activation and
+disable, UI diagnostics, and the physical second-device journey remain open.
