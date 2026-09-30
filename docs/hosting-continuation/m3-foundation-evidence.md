@@ -174,6 +174,26 @@ semantics). Windows requires a protected current-user-only DACL and holds
 rename-blocking handles on every ancestor until the temporary file is removed.
 Any failed validation blocks the copy before creating a host config file.
 
+Migration 026 now records an administrator-approved gateway upgrade claim
+bound to the exact current profile revision and one operation ID. Prepared,
+serving, unresolved, and committed claims pin the profile in SQLite; only a
+rolled-back claim releases the pin. Claim identity, transition events, and
+upgrade audit rows are retained. The initial prepared event, profile-head pin,
+and legal transitions have database triggers as well as repository checks.
+An unresolved claim can move only to committed or rolled back after the future
+controller obtains fresh topology evidence; an exact synchronous upgrade can
+move prepared to committed. The repository itself does not inspect Docker.
+
+`Manager.UpgradeGatewayV2` now holds one Manager and OS gateway lock across
+source-v1 attestation, host preflight, protected preparation, stage, transfer,
+and final attestation. It resumes only the same operation, profile, actor,
+digest, network, and host-port binding. Ambiguous writes or topology remain
+unresolved. A rolled-back outcome requires fresh exact-v1 proof, and a lock
+release failure downgrades either final outcome to unresolved. This method has
+no production controller caller or HTTP route. Its caller must derive the
+administrator from a session and verify the exact durable claim before any
+Docker side effect; a supplied actor and digest alone are not authorization.
+
 ## Executed verification
 
 | Check | Result |
@@ -226,6 +246,12 @@ Any failed validation blocks the copy before creating a host config file.
 | Windows working-directory and ancestry-guard tests | Passed, including blocked leaf, parent, and higher-ancestor renames while a guard is held and allowed rename after close. |
 | Linux amd64 securetemp test binary run under WSL | Passed the private-directory tests, including a 0700 leaf beneath a sticky writable parent, a readable ancestor, and rejection of a writable nonsticky ancestor and symlink. The first sticky-parent test fixture used numeric `01777`, which Go's FileMode did not interpret as `ModeSticky`; the corrected fixture passed. |
 | `git diff --cached --check` and independent security re-review | Passed. Review found the earlier writable-ancestor exposure closed for unprivileged local users. Windows traversal-only ancestor ACLs may be rejected by the fail-closed `GENERIC_READ` guard. |
+| Mirrored `026_lan_gateway_upgrade_claims.sql` SHA-256 | Both copies: `749870419020B7127EA4C002B1C66E143C0887AAB5756F86FDCE7D7271AF2824`. |
+| `go test -count=1 ./internal/appaccess ./internal/database ./internal/generatedingress` after review corrections | Passed with normal local Windows permissions. Includes two-handle claim contention and read snapshot tests, direct-SQL pin/history rejection, exact retry/recovery transitions, coordinator rollback drift and lock-release tests. |
+| `go test -count=1 ./...` and `go vet ./...` after review corrections | Passed serially with normal local Windows permissions. |
+| `pnpm --dir web test` during claim/coordinator work | Passed, 400/400 tests in 16 files. The later review corrections changed only Go and SQL; web tests were not rerun afterward. |
+| `go run ./cmd/openapi-gen -check` during claim/coordinator work | Passed; no API route or schema changed in these slices. |
+| Claim/coordinator code and security review | Five correctness findings were fixed and re-reviewed: recovery transitions, preinserted profile-head pin, one-snapshot claim read, initial prepared event, and rollback lock-release outcome. Security review found no reachable production caller; authenticated claim binding before an endpoint remains a hard gate. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -312,3 +338,10 @@ private-directory boundary has unit and WSL evidence, but its behavior with a
 live Docker config copy and on a locked-down Windows service account remains
 unverified. Windows ancestors that allow traversal without `GENERIC_READ` fail
 closed until a narrower safe guard is implemented and tested.
+The claim repository allows a new profile after an attested rollback, but the
+protected v2 files still retain the original operation. A new upgrade attempt
+therefore needs an explicit history-preserving retry generation; it is not yet
+implemented. Before any controller action is enabled, it must persist and
+recheck a session-derived administrator claim, reconcile claim state with the
+protected journal and fresh topology, and release a rolled-back pin only on
+newly attested exact-v1 evidence.
