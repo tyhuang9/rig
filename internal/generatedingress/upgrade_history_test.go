@@ -345,6 +345,224 @@ func TestGatewayHistoryInPlaceMutationDuringScanFailsClosed(t *testing.T) {
 	}
 }
 
+func TestGatewayHistoryPreJournalAbortReceiptOnlyIsTerminalAndReplayable(t *testing.T) {
+	manager, _ := newManagerFixture(t, false)
+	store, _, _, receipt := preparePreJournalAbortGeneration(t, manager, 0, "55555555-5555-4555-8555-555555555555", false)
+	installed, err := store.installPreJournalAbortReceipt(receipt)
+	if err != nil || !reflect.DeepEqual(installed, receipt) {
+		t.Fatalf("install receipt-only abort = %#v, err=%v", installed, err)
+	}
+
+	history, err := manager.scanGatewayUpgradeHistoryLocked()
+	if err != nil || history.committed || len(history.generations) != 1 || !history.generations[0].Aborted ||
+		!history.generations[0].Existing || !reflect.DeepEqual(history.generations[0].State, gatewayV2RouteState{}) {
+		t.Fatalf("receipt-only abort history = %#v, err=%v", history, err)
+	}
+	replay, err := manager.resolveGatewayUpgradeGenerationLocked(receipt.OperationID)
+	if err != nil || !replay.Aborted || !replay.Existing || replay.Generation != 0 {
+		t.Fatalf("receipt-only abort replay = %#v, err=%v", replay, err)
+	}
+	if _, err := manager.selectGatewayUpgradeGenerationLocked(receipt.OperationID); err == nil {
+		t.Fatal("pre-journal abort was selectable as rollback retirement")
+	}
+
+	// Historical abort verification is independent of the mutable current v1
+	// route file because the receipt binds the source that was attested then.
+	if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.scanGatewayUpgradeHistoryLocked(); err != nil {
+		t.Fatalf("v1 change invalidated historical abort: %v", err)
+	}
+	nextOperation := "77777777-7777-4777-8777-777777777777"
+	next, err := manager.resolveGatewayUpgradeGenerationLocked(nextOperation)
+	if err != nil || next.Existing || next.Aborted || next.Generation != 1 || next.Store == nil || next.Store.operationID != nextOperation {
+		t.Fatalf("next generation after abort = %#v, err=%v", next, err)
+	}
+}
+
+func TestGatewayHistoryPreJournalAbortBindsInstalledInitialState(t *testing.T) {
+	manager, _ := newManagerFixture(t, false)
+	store, state, _, receipt := preparePreJournalAbortGeneration(t, manager, 0, "55555555-5555-4555-8555-555555555555", true)
+	if _, err := store.installPreJournalAbortReceipt(receipt); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.loadPreJournalAbortReceipt()
+	if err != nil || !reflect.DeepEqual(loaded, receipt) {
+		t.Fatalf("load state-bound abort = %#v, err=%v", loaded, err)
+	}
+	history, err := manager.scanGatewayUpgradeHistoryLocked()
+	if err != nil || len(history.generations) != 1 || !history.generations[0].Aborted ||
+		!reflect.DeepEqual(history.generations[0].State, state) {
+		t.Fatalf("state-bound abort history = %#v, err=%v", history, err)
+	}
+	if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.scanGatewayUpgradeHistoryLocked(); err != nil {
+		t.Fatalf("v1 change invalidated state-bound historical abort: %v", err)
+	}
+}
+
+func TestGatewayHistoryPreJournalAbortCanPrecedeCommittedGeneration(t *testing.T) {
+	manager, _ := newManagerFixture(t, false)
+	store0, _, _, receipt0 := preparePreJournalAbortGeneration(t, manager, 0, "55555555-5555-4555-8555-555555555555", false)
+	if _, err := store0.installPreJournalAbortReceipt(receipt0); err != nil {
+		t.Fatal(err)
+	}
+	operation1 := "77777777-7777-4777-8777-777777777777"
+	next, err := manager.resolveGatewayUpgradeGenerationLocked(operation1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store1, _, journal1 := installCommittedGeneration(t, manager, next.Store, operation1)
+	history, err := manager.scanGatewayUpgradeHistoryLocked()
+	if err != nil || !history.committed || history.store.v2Path != store1.v2Path || history.journal.OperationID != journal1.OperationID ||
+		len(history.generations) != 2 || !history.generations[0].Aborted || history.generations[1].Aborted {
+		t.Fatalf("committed history after abort = %#v, err=%v", history, err)
+	}
+	if replay, err := manager.resolveGatewayUpgradeGenerationLocked(operation1); err != nil || !replay.Existing || replay.Aborted {
+		t.Fatalf("committed replay after abort = %#v, err=%v", replay, err)
+	}
+}
+
+func TestGatewayHistoryPreJournalAbortLaterGenerationAdvancesHistory(t *testing.T) {
+	manager, _ := newManagerFixture(t, false)
+	operation0 := "55555555-5555-4555-8555-555555555555"
+	store0, _, _, receipt0 := preparePreJournalAbortGeneration(t, manager, 0, operation0, false)
+	if _, err := store0.installPreJournalAbortReceipt(receipt0); err != nil {
+		t.Fatal(err)
+	}
+	operation1 := "77777777-7777-4777-8777-777777777777"
+	store1, state1, _, receipt1 := preparePreJournalAbortGeneration(t, manager, 1, operation1, true)
+	if _, err := store1.installPreJournalAbortReceipt(receipt1); err != nil {
+		t.Fatal(err)
+	}
+	history, err := manager.scanGatewayUpgradeHistoryLocked()
+	if err != nil || len(history.generations) != 2 || !history.generations[1].Aborted ||
+		!reflect.DeepEqual(history.generations[1].State, state1) {
+		t.Fatalf("later abort history = %#v, err=%v", history, err)
+	}
+	if _, err := manager.resolveGatewayUpgradeGenerationLocked(operation0); err == nil {
+		t.Fatal("historical aborted operation was reopened")
+	}
+	replay, err := manager.resolveGatewayUpgradeGenerationLocked(operation1)
+	if err != nil || !replay.Aborted || replay.Generation != 1 {
+		t.Fatalf("later abort replay = %#v, err=%v", replay, err)
+	}
+	operation2 := "88888888-8888-4888-8888-888888888888"
+	next, err := manager.resolveGatewayUpgradeGenerationLocked(operation2)
+	if err != nil || next.Existing || next.Generation != 2 || next.Store.operationID != operation2 {
+		t.Fatalf("generation after later abort = %#v, err=%v", next, err)
+	}
+}
+
+func TestGatewayHistoryPreJournalAbortInvalidCombinationsFailClosed(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*gatewayPreJournalAbortReceipt)
+	}{
+		{name: "wrong outcome", mutate: func(value *gatewayPreJournalAbortReceipt) { value.Outcome = GatewayV2UpgradeCommitted }},
+		{name: "wrong boundary", mutate: func(value *gatewayPreJournalAbortReceipt) { value.Boundary = "after_journal" }},
+		{name: "wrong generation", mutate: func(value *gatewayPreJournalAbortReceipt) { value.Generation++ }},
+		{name: "wrong deterministic identity", mutate: func(value *gatewayPreJournalAbortReceipt) { value.V2IdentityDigest = strings.Repeat("f", 64) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, _ := newManagerFixture(t, false)
+			store, _, _, receipt := preparePreJournalAbortGeneration(t, manager, 0, "55555555-5555-4555-8555-555555555555", false)
+			test.mutate(&receipt)
+			if _, err := store.installPreJournalAbortReceipt(receipt); err == nil {
+				t.Fatal("semantically invalid abort receipt was installed")
+			}
+		})
+	}
+
+	t.Run("receipt-only carries state digests", func(t *testing.T) {
+		manager, _ := newManagerFixture(t, false)
+		store, _, _, receipt := preparePreJournalAbortGeneration(t, manager, 0, "55555555-5555-4555-8555-555555555555", false)
+		receipt.InitialStateDigest = strings.Repeat("a", 64)
+		receipt.NetworkPlanDigest = strings.Repeat("b", 64)
+		if _, err := store.installPreJournalAbortReceipt(receipt); err == nil {
+			t.Fatal("receipt-only abort accepted state digests")
+		}
+	})
+
+	t.Run("state digest mismatch", func(t *testing.T) {
+		manager, _ := newManagerFixture(t, false)
+		store, _, _, receipt := preparePreJournalAbortGeneration(t, manager, 0, "55555555-5555-4555-8555-555555555555", true)
+		receipt.InitialStateDigest = strings.Repeat("a", 64)
+		if _, err := store.installPreJournalAbortReceipt(receipt); err == nil {
+			t.Fatal("abort accepted a mismatched initial-state digest")
+		}
+	})
+
+	t.Run("journal and abort", func(t *testing.T) {
+		manager, _ := newManagerFixture(t, false)
+		store, _, journal, receipt := preparePreJournalAbortGeneration(t, manager, 0, "55555555-5555-4555-8555-555555555555", true)
+		if _, err := store.installPreJournalAbortReceipt(receipt); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.createMigrationJournal(journal); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.scanGatewayUpgradeHistoryLocked(); err == nil {
+			t.Fatal("journal plus abort was accepted")
+		}
+	})
+
+	t.Run("rollback retirement and abort", func(t *testing.T) {
+		manager, _ := newManagerFixture(t, false)
+		store, _, _, receipt := preparePreJournalAbortGeneration(t, manager, 0, "55555555-5555-4555-8555-555555555555", false)
+		if _, err := store.installPreJournalAbortReceipt(receipt); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.writeExact(store.receiptPath, store.receiptPurpose, gatewayRollbackRetirementReceipt{Version: gatewayRollbackRetirementVersion}, true, maxGatewayRollbackReceiptBytes); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.scanGatewayUpgradeHistoryLocked(); err == nil {
+			t.Fatal("two terminal receipts were accepted")
+		}
+	})
+
+	t.Run("duplicate abort receipts for one generation", func(t *testing.T) {
+		manager, _ := newManagerFixture(t, false)
+		store0, _, _, receipt0 := preparePreJournalAbortGeneration(t, manager, 0, "55555555-5555-4555-8555-555555555555", false)
+		if _, err := store0.installPreJournalAbortReceipt(receipt0); err != nil {
+			t.Fatal(err)
+		}
+		store1, _, _, receipt1 := preparePreJournalAbortGeneration(t, manager, 1, "77777777-7777-4777-8777-777777777777", false)
+		if _, err := store1.installPreJournalAbortReceipt(receipt1); err != nil {
+			t.Fatal(err)
+		}
+		other1, _, _, otherReceipt1 := preparePreJournalAbortGeneration(t, manager, 1, "88888888-8888-4888-8888-888888888888", false)
+		if _, err := other1.installPreJournalAbortReceipt(otherReceipt1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.scanGatewayUpgradeHistoryLocked(); err == nil {
+			t.Fatal("duplicate abort receipts for one generation were accepted")
+		}
+	})
+
+	t.Run("tampered historical source", func(t *testing.T) {
+		manager, _ := newManagerFixture(t, false)
+		store, _, _, receipt := preparePreJournalAbortGeneration(t, manager, 0, "55555555-5555-4555-8555-555555555555", true)
+		if _, err := store.installPreJournalAbortReceipt(receipt); err != nil {
+			t.Fatal(err)
+		}
+		receipt.Source.StateDigest = strings.Repeat("f", 64)
+		body, err := json.Marshal(receipt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := upgradeProtectedWrite(store.abortPath, store.abortPurpose, body); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.scanGatewayUpgradeHistoryLocked(); err == nil {
+			t.Fatal("tampered abort receipt was accepted")
+		}
+	})
+}
+
 func TestGatewayHistoryLaterGenerationAndResolution(t *testing.T) {
 	manager, _ := newManagerFixture(t, false)
 	store0, state0, journal0 := installRolledBackGeneration(t, manager, 0, "55555555-5555-4555-8555-555555555555")
@@ -393,7 +611,7 @@ func TestGatewayHistoryPartialCorruptDuplicateAndGapFailClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{name: "unknown abort artifact", mutate: func(t *testing.T, manager *Manager) {
+		{name: "unprotected abort artifact", mutate: func(t *testing.T, manager *Manager) {
 			if err := os.WriteFile(filepath.Join(manager.store.root, "gateway-v1-to-v2-abort.bundle"), []byte("x"), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -439,6 +657,47 @@ func TestGatewayHistoryPartialCorruptDuplicateAndGapFailClosed(t *testing.T) {
 			}
 		})
 	}
+}
+
+func preparePreJournalAbortGeneration(t *testing.T, manager *Manager, generation uint64, operationID string, installState bool) (*gatewayUpgradeStateStore, gatewayV2RouteState, gatewayMigrationJournal, gatewayPreJournalAbortReceipt) {
+	t.Helper()
+	source, input := upgradeTestPreparation(t)
+	input.OperationID = operationID
+	if err := manager.store.save(source); err != nil {
+		t.Fatal(err)
+	}
+	state, journal, err := prepareGatewayV2State(source, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var store *gatewayUpgradeStateStore
+	if generation == 0 {
+		store, err = newGatewayUpgradeStateStore(manager.options.DataRoot)
+	} else {
+		store, err = newGatewayUpgradeGenerationStore(manager.options.DataRoot, generation, operationID)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := gatewayPreJournalAbortReceipt{
+		Version: gatewayPreJournalAbortVersion, Generation: generation, OperationID: operationID,
+		Outcome: GatewayV2UpgradeRolledBack, Boundary: gatewayPreJournalAbortBoundary,
+		Profile: state.Profile, Action: state.UpgradeAction, Source: journal.Source, V2IdentityDigest: state.Identity.Digest,
+	}
+	if installState {
+		if err := store.createV2State(state); err != nil {
+			t.Fatal(err)
+		}
+		receipt.InitialStateDigest, err = canonicalDigest(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt.NetworkPlanDigest, err = gatewayV2PlanDigest(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return store, state, journal, receipt
 }
 
 func installRolledBackGeneration(t *testing.T, manager *Manager, generation uint64, operationID string) (*gatewayUpgradeStateStore, gatewayV2RouteState, gatewayMigrationJournal) {

@@ -19,10 +19,17 @@ const (
 	gatewayRollbackRetirementVersion  = 1
 	maxGatewayRollbackReceiptBytes    = 4 << 10
 
+	gatewayPreJournalAbortPurpose  = "hostd/generated-ingress/migration/v1/pre-journal-abort"
+	gatewayPreJournalAbortFilename = "gateway-v1-to-v2-abort.bundle"
+	gatewayPreJournalAbortVersion  = 1
+	gatewayPreJournalAbortBoundary = "before_journal"
+	maxGatewayAbortReceiptBytes    = 8 << 10
+
 	gatewayV2GenerationDigits        = 20
 	gatewayV2GenerationStatePrefix   = "routes-v2.g"
 	gatewayV2GenerationJournalPrefix = "gateway-v1-to-v2.g"
 	gatewayV2GenerationReceiptPrefix = "gateway-v1-to-v2-retirement.g"
+	gatewayV2GenerationAbortPrefix   = "gateway-v1-to-v2-abort.g"
 
 	// Protected generated-ingress bundles are read by secretfile, whose
 	// persisted-format limit is 64 KiB. Keep snapshot reads bounded to the
@@ -45,12 +52,31 @@ type gatewayRollbackRetirementReceipt struct {
 	Source        gatewayMigrationSourceRef `json:"source"`
 }
 
+// gatewayPreJournalAbortReceipt is immutable evidence that an approved
+// operation terminated before a migration journal or any v2 side effect was
+// created. Optional state digests are present together only when the initial
+// protected route state had already been installed.
+type gatewayPreJournalAbortReceipt struct {
+	Version            int                       `json:"version"`
+	Generation         uint64                    `json:"generation"`
+	OperationID        string                    `json:"operationId"`
+	Outcome            GatewayV2UpgradeOutcome   `json:"outcome"`
+	Boundary           string                    `json:"boundary"`
+	Profile            gatewayProfileBinding     `json:"profile"`
+	Action             gatewayUpgradeActionRef   `json:"action"`
+	Source             gatewayMigrationSourceRef `json:"source"`
+	V2IdentityDigest   string                    `json:"v2IdentityDigest"`
+	InitialStateDigest string                    `json:"initialStateDigest,omitempty"`
+	NetworkPlanDigest  string                    `json:"networkPlanDigest,omitempty"`
+}
+
 type gatewayHistoryArtifactKind uint8
 
 const (
 	gatewayHistoryState gatewayHistoryArtifactKind = iota + 1
 	gatewayHistoryJournal
 	gatewayHistoryReceipt
+	gatewayHistoryAbort
 )
 
 type gatewayHistoryArtifact struct {
@@ -63,6 +89,7 @@ type gatewayHistoryGeneration struct {
 	state       gatewayHistoryArtifact
 	journal     gatewayHistoryArtifact
 	receipt     gatewayHistoryArtifact
+	abort       gatewayHistoryArtifact
 }
 
 type gatewayHistorySnapshot struct {
@@ -87,9 +114,9 @@ type gatewayUpgradeHistory struct {
 }
 
 // gatewayUpgradeGenerationSelection is the scanner's exact protected binding
-// for one immutable generation. Existing is false only when resolution has
-// allocated the next create-only paths; such a selection has zero state and
-// journal values.
+// for one immutable generation. Existing marks a complete journal-backed or
+// aborted generation. PartialState distinguishes the only accepted incomplete
+// artifact, while a zero-valued new selection owns unused create-only paths.
 type gatewayUpgradeGenerationSelection struct {
 	Store        *gatewayUpgradeStateStore
 	Generation   uint64
@@ -98,6 +125,8 @@ type gatewayUpgradeGenerationSelection struct {
 	Existing     bool
 	PartialState bool
 	Retired      bool
+	Aborted      bool
+	operationID  string
 }
 
 // newGatewayUpgradeGenerationStore returns the create-only paths for a later
@@ -111,7 +140,7 @@ func newGatewayUpgradeGenerationStore(dataRoot string, generation uint64, operat
 	if err != nil {
 		return nil, err
 	}
-	stateName, journalName, receiptName, statePurpose, journalPurpose, receiptPurpose := gatewayUpgradeGenerationNames(generation, operationID)
+	stateName, journalName, receiptName, abortName, statePurpose, journalPurpose, receiptPurpose, abortPurpose := gatewayUpgradeGenerationNames(generation, operationID)
 	return &gatewayUpgradeStateStore{
 		directory:      directory,
 		generation:     generation,
@@ -122,18 +151,22 @@ func newGatewayUpgradeGenerationStore(dataRoot string, generation uint64, operat
 		journalPurpose: journalPurpose,
 		receiptPath:    filepath.Join(directory.root, receiptName),
 		receiptPurpose: receiptPurpose,
+		abortPath:      filepath.Join(directory.root, abortName),
+		abortPurpose:   abortPurpose,
 	}, nil
 }
 
-func gatewayUpgradeGenerationNames(generation uint64, operationID string) (string, string, string, string, string, string) {
+func gatewayUpgradeGenerationNames(generation uint64, operationID string) (string, string, string, string, string, string, string, string) {
 	token := fmt.Sprintf("%0*d.%s", gatewayV2GenerationDigits, generation, operationID)
 	scope := fmt.Sprintf("generation/%0*d/%s", gatewayV2GenerationDigits, generation, operationID)
 	return gatewayV2GenerationStatePrefix + token + ".bundle",
 		gatewayV2GenerationJournalPrefix + token + ".bundle",
 		gatewayV2GenerationReceiptPrefix + token + ".bundle",
+		gatewayV2GenerationAbortPrefix + token + ".bundle",
 		v2RouteStatePurpose + "/" + scope,
 		gatewayMigrationPurpose + "/" + scope,
-		gatewayRollbackRetirementPurpose + "/" + scope
+		gatewayRollbackRetirementPurpose + "/" + scope,
+		gatewayPreJournalAbortPurpose + "/" + scope
 }
 
 // installRollbackRetirementReceipt only persists the caller's already-proved
@@ -197,6 +230,108 @@ func validGatewayRollbackRetirementReceipt(receipt gatewayRollbackRetirementRece
 	return stateErr == nil && journalErr == nil && receipt.StateDigest == stateDigest && receipt.JournalDigest == journalDigest
 }
 
+// installPreJournalAbortReceipt persists only an already-proved no-op abort.
+// The caller must hold the gateway writer lock and prove exact v1 service and
+// absence of v2 side effects. This store independently rejects a journal,
+// rollback receipt, or a state whose immutable preparation binding differs.
+func (s *gatewayUpgradeStateStore) installPreJournalAbortReceipt(receipt gatewayPreJournalAbortReceipt) (gatewayPreJournalAbortReceipt, error) {
+	if !s.validPreJournalAbortReceipt(receipt) {
+		return gatewayPreJournalAbortReceipt{}, errors.New("invalid generated ingress pre-journal abort receipt")
+	}
+	if err := s.writeExact(s.abortPath, s.abortPurpose, receipt, true, maxGatewayAbortReceiptBytes); err != nil {
+		return gatewayPreJournalAbortReceipt{}, err
+	}
+	loaded, err := s.loadPreJournalAbortReceipt()
+	if err != nil || !reflect.DeepEqual(loaded, receipt) {
+		return gatewayPreJournalAbortReceipt{}, errors.New("generated ingress pre-journal abort receipt was not installed")
+	}
+	return loaded, nil
+}
+
+func (s *gatewayUpgradeStateStore) loadPreJournalAbortReceipt() (gatewayPreJournalAbortReceipt, error) {
+	var receipt gatewayPreJournalAbortReceipt
+	if s == nil || s.directory == nil || s.abortPath == "" || s.abortPurpose == "" ||
+		s.readStrict(s.abortPath, s.abortPurpose, maxGatewayAbortReceiptBytes, &receipt) != nil ||
+		!s.validPreJournalAbortReceipt(receipt) {
+		return gatewayPreJournalAbortReceipt{}, errors.New("generated ingress pre-journal abort receipt is invalid")
+	}
+	return receipt, nil
+}
+
+func (s *gatewayUpgradeStateStore) validPreJournalAbortReceipt(receipt gatewayPreJournalAbortReceipt) bool {
+	if s == nil || s.directory == nil || receipt.Version != gatewayPreJournalAbortVersion || receipt.Generation != s.generation ||
+		!validCanonicalUUID(receipt.OperationID) || (s.operationID != "" && receipt.OperationID != s.operationID) ||
+		receipt.Outcome != GatewayV2UpgradeRolledBack || receipt.Boundary != gatewayPreJournalAbortBoundary ||
+		!validGatewayProfileBinding(receipt.Profile) || receipt.Action.Name != gatewayUpgradeActionName ||
+		!validCanonicalUUID(receipt.Action.ApprovedBy) || receipt.Source.Format != stateVersion ||
+		!validSHA256(receipt.Source.StateDigest) || receipt.Source.IdentityVersion != gatewayV1IdentityVersion ||
+		!validSHA256(receipt.Source.IdentityDigest) || receipt.Source.LocalHostPort == 0 {
+		return false
+	}
+	actionDigest, err := gatewayUpgradeActionDigest(receipt.Profile, gatewayV2IdentityVersion)
+	if err != nil || receipt.Action.Digest != actionDigest {
+		return false
+	}
+	identity, err := newGatewayV2Identity(receipt.OperationID)
+	if err != nil || receipt.V2IdentityDigest != identity.Digest {
+		return false
+	}
+	journalExists, err := gatewayUpgradeArtifactExists(s.journalPath)
+	if err != nil || journalExists {
+		return false
+	}
+	retirementExists, err := gatewayUpgradeArtifactExists(s.receiptPath)
+	if err != nil || retirementExists {
+		return false
+	}
+	stateExists, err := gatewayUpgradeArtifactExists(s.v2Path)
+	if err != nil {
+		return false
+	}
+	if !stateExists {
+		return receipt.InitialStateDigest == "" && receipt.NetworkPlanDigest == ""
+	}
+	if !validSHA256(receipt.InitialStateDigest) || !validSHA256(receipt.NetworkPlanDigest) {
+		return false
+	}
+	state, err := s.loadV2State()
+	if err != nil || !validPreJournalAbortInitialState(state) ||
+		state.OperationID != receipt.OperationID || state.SourceV1StateDigest != receipt.Source.StateDigest ||
+		!reflect.DeepEqual(state.Profile, receipt.Profile) || state.UpgradeAction != receipt.Action ||
+		!reflect.DeepEqual(state.Identity, identity) {
+		return false
+	}
+	stateDigest, stateErr := canonicalDigest(state)
+	planDigest, planErr := gatewayV2PlanDigest(state)
+	return stateErr == nil && planErr == nil && receipt.InitialStateDigest == stateDigest && receipt.NetworkPlanDigest == planDigest
+}
+
+func validPreJournalAbortInitialState(state gatewayV2RouteState) bool {
+	if !validGatewayV2RouteState(state) || state.Pending != nil {
+		return false
+	}
+	for _, app := range state.Apps {
+		if app.LAN != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func gatewayUpgradeArtifactExists(path string) (bool, error) {
+	if path == "" {
+		return false, errors.New("generated ingress upgrade artifact path is missing")
+	}
+	_, err := os.Lstat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
 // loadHistoricalBoundUpgrade validates an immutable generation without reading
 // the mutable current v1 route file. That omission is deliberate: after a
 // valid rollback retirement, normal v1 route switches must not invalidate old
@@ -235,7 +370,7 @@ func historicallyBoundGatewayUpgrade(state gatewayV2RouteState, journal gatewayM
 // holds the gateway writer lock. Every observed generation must be complete,
 // contiguous, uniquely numbered, purpose-bound, and terminal. Only a latest
 // committed generation owns v2; otherwise all generations must have valid
-// rollback-retirement receipts before v1 can resume.
+// rollback-retirement or pre-journal abort receipts before v1 can resume.
 func (m *Manager) scanGatewayUpgradeHistoryLocked() (gatewayUpgradeHistory, error) {
 	return m.scanGatewayUpgradeHistoryLockedMode(false, "")
 }
@@ -253,7 +388,7 @@ func (m *Manager) selectGatewayUpgradeGenerationLocked(operationID string) (gate
 		return gatewayUpgradeGenerationSelection{}, errors.New("generated ingress upgrade operation is not current")
 	}
 	latest := history.generations[len(history.generations)-1]
-	if latest.Journal.OperationID != operationID {
+	if latest.Aborted || latest.operationID != operationID {
 		return gatewayUpgradeGenerationSelection{}, errors.New("generated ingress upgrade operation is not current")
 	}
 	return latest, nil
@@ -276,18 +411,16 @@ func (m *Manager) resolveGatewayUpgradeGenerationLocked(operationID string) (gat
 		return gatewayUpgradeGenerationSelection{Store: store, Generation: 0}, storeErr
 	}
 	latest := history.generations[len(history.generations)-1]
-	if latest.PartialState {
-		return latest, nil
-	}
-	if latest.Journal.OperationID == operationID {
+	if latest.operationID == operationID {
 		return latest, nil
 	}
 	for _, generation := range history.generations[:len(history.generations)-1] {
-		if generation.Journal.OperationID == operationID {
+		if generation.operationID == operationID {
 			return gatewayUpgradeGenerationSelection{}, errors.New("generated ingress upgrade operation belongs to historical generation")
 		}
 	}
-	if !latest.Retired || latest.Journal.Phase != gatewayPhaseRolledBack || latest.Generation == ^uint64(0) {
+	terminal := latest.Aborted || (latest.Retired && latest.Journal.Phase == gatewayPhaseRolledBack)
+	if !terminal || latest.Generation == ^uint64(0) {
 		return gatewayUpgradeGenerationSelection{}, errors.New("generated ingress upgrade history does not permit a new generation")
 	}
 	next := latest.Generation + 1
@@ -321,9 +454,6 @@ func (m *Manager) scanGatewayUpgradeHistoryLockedMode(allowCurrentTail bool, par
 	seenOperations := make(map[string]struct{}, len(generations))
 	for index, generation := range generations {
 		artifacts := before.generations[generation]
-		if artifacts.state.path == "" {
-			return gatewayUpgradeHistory{}, errors.New("generated ingress upgrade history is partial")
-		}
 		var store *gatewayUpgradeStateStore
 		if generation == 0 {
 			store, err = newGatewayUpgradeStateStore(m.options.DataRoot)
@@ -333,10 +463,38 @@ func (m *Manager) scanGatewayUpgradeHistoryLockedMode(allowCurrentTail bool, par
 			}
 			store, err = newGatewayUpgradeGenerationStore(m.options.DataRoot, generation, artifacts.operationID)
 		}
-		if err != nil || store.v2Path != artifacts.state.path ||
+		if err != nil || (artifacts.state.path != "" && store.v2Path != artifacts.state.path) ||
 			(artifacts.journal.path != "" && store.journalPath != artifacts.journal.path) ||
-			(artifacts.receipt.path != "" && store.receiptPath != artifacts.receipt.path) {
+			(artifacts.receipt.path != "" && store.receiptPath != artifacts.receipt.path) ||
+			(artifacts.abort.path != "" && store.abortPath != artifacts.abort.path) {
 			return gatewayUpgradeHistory{}, errors.New("generated ingress upgrade history path is invalid")
+		}
+		if artifacts.abort.path != "" {
+			if artifacts.journal.path != "" || artifacts.receipt.path != "" {
+				return gatewayUpgradeHistory{}, errors.New("generated ingress pre-journal abort conflicts with migration history")
+			}
+			receipt, loadErr := store.loadPreJournalAbortReceipt()
+			if loadErr != nil || (artifacts.operationID != "" && receipt.OperationID != artifacts.operationID) {
+				return gatewayUpgradeHistory{}, errors.New("generated ingress pre-journal abort receipt is invalid")
+			}
+			var state gatewayV2RouteState
+			if artifacts.state.path != "" {
+				state, loadErr = store.loadV2State()
+				if loadErr != nil {
+					return gatewayUpgradeHistory{}, loadErr
+				}
+			}
+			if _, duplicate := seenOperations[receipt.OperationID]; duplicate {
+				return gatewayUpgradeHistory{}, errors.New("generated ingress upgrade operation is duplicated across generations")
+			}
+			seenOperations[receipt.OperationID] = struct{}{}
+			result.generations = append(result.generations, gatewayUpgradeGenerationSelection{
+				Store: store, Generation: generation, State: state, Existing: true, Aborted: true, operationID: receipt.OperationID,
+			})
+			continue
+		}
+		if artifacts.state.path == "" {
+			return gatewayUpgradeHistory{}, errors.New("generated ingress upgrade history is partial")
 		}
 		if artifacts.journal.path == "" {
 			if partialOperationID == "" || index != len(generations)-1 || artifacts.receipt.path != "" {
@@ -356,7 +514,7 @@ func (m *Manager) scanGatewayUpgradeHistoryLockedMode(allowCurrentTail bool, par
 			}
 			seenOperations[state.OperationID] = struct{}{}
 			result.generations = append(result.generations, gatewayUpgradeGenerationSelection{
-				Store: store, Generation: generation, State: state, PartialState: true,
+				Store: store, Generation: generation, State: state, PartialState: true, operationID: state.OperationID,
 			})
 			continue
 		}
@@ -385,14 +543,14 @@ func (m *Manager) scanGatewayUpgradeHistoryLockedMode(allowCurrentTail bool, par
 				return gatewayUpgradeHistory{}, errors.New("generated ingress committed generation source is stale")
 			}
 			selection := gatewayUpgradeGenerationSelection{
-				Store: store, Generation: generation, State: state, Journal: journal, Existing: true,
+				Store: store, Generation: generation, State: state, Journal: journal, Existing: true, operationID: journal.OperationID,
 			}
 			result.store, result.state, result.journal, result.committed = store, state, journal, true
 			result.generations = append(result.generations, selection)
 			continue
 		}
 		selection := gatewayUpgradeGenerationSelection{
-			Store: store, Generation: generation, State: state, Journal: journal, Existing: true,
+			Store: store, Generation: generation, State: state, Journal: journal, Existing: true, operationID: journal.OperationID,
 		}
 		if journal.Phase != gatewayPhaseRolledBack {
 			if artifacts.receipt.path != "" || !allowCurrentTail || index != len(generations)-1 {
@@ -482,6 +640,11 @@ func readGatewayHistorySnapshot(store *stateStore) (gatewayHistorySnapshot, erro
 				return gatewayHistorySnapshot{}, errors.New("generated ingress upgrade generation has duplicate receipt")
 			}
 			artifacts.receipt = artifact
+		case gatewayHistoryAbort:
+			if artifacts.abort.path != "" {
+				return gatewayHistorySnapshot{}, errors.New("generated ingress upgrade generation has duplicate abort receipt")
+			}
+			artifacts.abort = artifact
 		default:
 			return gatewayHistorySnapshot{}, errors.New("generated ingress upgrade history artifact kind is invalid")
 		}
@@ -558,6 +721,8 @@ func parseGatewayHistoryArtifactName(name string) (uint64, string, gatewayHistor
 		return 0, "", gatewayHistoryJournal, true, nil
 	case gatewayRollbackRetirementFilename:
 		return 0, "", gatewayHistoryReceipt, true, nil
+	case gatewayPreJournalAbortFilename:
+		return 0, "", gatewayHistoryAbort, true, nil
 	}
 	prefixes := []struct {
 		prefix string
@@ -566,6 +731,7 @@ func parseGatewayHistoryArtifactName(name string) (uint64, string, gatewayHistor
 		{gatewayV2GenerationStatePrefix, gatewayHistoryState},
 		{gatewayV2GenerationJournalPrefix, gatewayHistoryJournal},
 		{gatewayV2GenerationReceiptPrefix, gatewayHistoryReceipt},
+		{gatewayV2GenerationAbortPrefix, gatewayHistoryAbort},
 	}
 	for _, candidate := range prefixes {
 		if !strings.HasPrefix(name, candidate.prefix) {
@@ -582,9 +748,9 @@ func parseGatewayHistoryArtifactName(name string) (uint64, string, gatewayHistor
 		}
 		return generation, parts[1], candidate.kind, true, nil
 	}
-	// Reserve the whole upgrade-history namespace. A future abort record must
-	// be explicitly taught to this scanner before its presence can affect
-	// ownership; an unknown abort-like artifact therefore fails closed today.
+	// Reserve the whole upgrade-history namespace. New terminal record types
+	// must be explicitly taught to this scanner before they can affect
+	// ownership, so unknown artifacts fail closed.
 	if strings.HasPrefix(name, "routes-v2") || strings.HasPrefix(name, "gateway-v1-to-v2") {
 		return 0, "", 0, true, errors.New("generated ingress upgrade history filename is invalid")
 	}

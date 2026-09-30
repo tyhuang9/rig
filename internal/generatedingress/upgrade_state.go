@@ -242,6 +242,8 @@ type gatewayUpgradeStateStore struct {
 	journalPurpose string
 	receiptPath    string
 	receiptPurpose string
+	abortPath      string
+	abortPurpose   string
 }
 
 func newGatewayUpgradeStateStore(dataRoot string) (*gatewayUpgradeStateStore, error) {
@@ -257,6 +259,8 @@ func newGatewayUpgradeStateStore(dataRoot string) (*gatewayUpgradeStateStore, er
 		journalPurpose: gatewayMigrationPurpose,
 		receiptPath:    filepath.Join(directory.root, gatewayRollbackRetirementFilename),
 		receiptPurpose: gatewayRollbackRetirementPurpose,
+		abortPath:      filepath.Join(directory.root, gatewayPreJournalAbortFilename),
+		abortPurpose:   gatewayPreJournalAbortPurpose,
 	}, nil
 }
 
