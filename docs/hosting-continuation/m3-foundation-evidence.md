@@ -52,7 +52,16 @@ IPv4 addresses on active, non-loopback host interfaces. An approved interface
 index/name and exact address must still match; duplicate address ownership,
 an unavailable interface, a changed DHCP address, and wildcard/public
 addresses fail closed. This is an interface-ownership prerequisite only. It
-does not yet inspect the complete host route table or authorize a bind.
+does not by itself inspect host routes or authorize a bind.
+
+The separate host-route snapshot reads Windows' IPv4 forwarding table or a
+Linux netlink route dump plus all assigned interface prefixes. A pure check
+rejects a proposed private Docker subnet when it overlaps any more-specific
+host route or interface prefix; only the default route is ignored. Snapshot
+completion is private to the package, so a caller cannot fabricate a usable
+empty snapshot. Linux reads the current network namespace. The route and
+interface reads are sequential, and the future cutover must revalidate them
+immediately around binding. This helper is still unwired to Docker mutation.
 
 ## Executed verification
 
@@ -74,6 +83,9 @@ does not yet inspect the complete host route table or authorize a bind.
 | Gateway lock contention and process-exit tests | Passed on Windows; independent Manager contention and injected release-failure tests passed. |
 | Linux amd64 ingress test package cross-compilation | Passed; Linux runtime tests remain unrun locally. |
 | `go test -count=1 ./internal/hostnetwork` and `go vet ./internal/hostnetwork` | Passed for the interface-selection helper. |
+| `go test -count=1 ./internal/hostnetwork` after the route snapshot | Passed on Windows, including a native route-read smoke test. |
+| Linux route tests under WSL and Windows/Linux test cross-compilation | Passed as reported by the host-route implementation agent; WSL reads the current network namespace. |
+| `go test -count=1 ./...` and `go vet ./...` with normal Windows permissions after both read-only slices | Passed. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -91,6 +103,10 @@ storage tests instead exercise separate SQLite handles and repeated contention.
 No live Caddy config validation, Docker port bind, rollback, second-device LAN
 request, or database-backed LAN journey has run on this branch. Those are
 future M3 gates, not inferred from the local unit tests.
+The installed Docker CLI currently cannot reach the Docker Desktop Linux
+daemon: `docker version --format '{{json .Server}}'` failed because
+`//./pipe/dockerDesktopLinuxEngine` does not exist. No live gateway acceptance
+claim follows from the read-only observer's unit tests.
 
 ## Remaining publication gates
 
