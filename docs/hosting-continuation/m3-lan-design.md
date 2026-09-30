@@ -58,6 +58,36 @@ the server only through scoped runtime secrets.
    deliberate rebind guidance, and copyable address. No secret values enter
    the browser read model.
 
+## Operator UX contract
+
+Place host-wide LAN gateway controls on Machines and per-application access
+beside the existing controller-host route on Application detail. Enumerate
+interface/address pairs instead of requiring an identifier to be typed. A
+review dialog must show the exact interface, private IPv4, bounded port pool,
+profile revision, and action digest before profile approval. A separate
+review confirms the v1-to-v2 gateway upgrade. Profile approval alone never
+starts Docker work; progress reflects protected and observed phases, not a
+timer.
+
+Application detail defaults to Local only. Share on LAN requires its own
+app-specific review and approval; selecting the choice alone never publishes
+a route. Show Open and Copy address only while fresh attestation binds the
+active access revision, gateway listener and route, and serving deployment.
+Describe the URL as HTTP reachable from devices that can reach the selected
+address. If proof expires or drifts, withhold the actionable URL and offer a
+new check. Disable keeps the port reserved until 404 removal is attested;
+uncertain removal keeps it unavailable for reuse.
+
+Viewer pages may show authorized status and an attested URL but no profile,
+upgrade, sharing, or disable controls. Render the actual account role rather
+than a hardcoded Administrator label. Distinguish unconfigured, approved,
+in-progress, committed, rolled-back, and uncertain states; preserve the state
+after refresh. Pair every error with a recovery action, and return stale
+reviews to a refreshed summary instead of silently resubmitting. Dialogs
+focus their heading, restore the trigger on close, and announce progress and
+errors without relying on color. Verify keyboard flow and 375 px, 768 px,
+and desktop layouts before M3 acceptance.
+
 The v2 container must retain the pinned image, user, capabilities, read-only
 root, resource limits, owned network, and exact-port drift checks. Its Caddy
 config uses a separate server per LAN port so a forged `Host` cannot select a
