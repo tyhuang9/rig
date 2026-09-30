@@ -21,25 +21,17 @@ type GatewayV2ProfileBinding struct {
 	PortEnd        uint16
 }
 
-// GatewayV2NetworkPlan is the controller-selected private Docker network for
-// the v2 gateway. It must not contain the selected LAN address.
-type GatewayV2NetworkPlan struct {
-	Subnet        string
-	GatewayIPv4   string
-	ContainerIPv4 string
-}
-
 // GatewayV2UpgradeRequest is the complete authorization and topology binding
 // for one generated-ingress v1-to-v2 migration. The controller must construct
-// it only from a freshly loaded durable appaccess upgrade claim, the exact
-// claimed profile revision, and its server-selected network plan. None of its
+// it only from a freshly loaded durable appaccess upgrade claim and the exact
+// claimed profile revision. The Manager selects the Docker network under its
+// gateway locks; no network value is accepted from this request. None of the
 // fields, including ApprovedBy, may be bound directly from an HTTP payload.
 type GatewayV2UpgradeRequest struct {
 	OperationID          string
 	Profile              GatewayV2ProfileBinding
 	ApprovedBy           string
 	ApprovedActionDigest string
-	Network              GatewayV2NetworkPlan
 }
 
 // GatewayV2UpgradeOutcome reports only outcomes safe for an authenticated
@@ -61,6 +53,7 @@ type GatewayV2UpgradeResult struct {
 // gatewayV2CoordinatorDriver isolates the read-only source-v1 identity proof.
 // The stage and transfer machines retain their own narrower mutation drivers.
 type gatewayV2CoordinatorDriver interface {
+	selectNetworkPlan(context.Context, gatewayProfileBinding) (gatewayV2NetworkPlan, error)
 	attestSourceV1(context.Context, routeState, gatewayUpgradePreparation) (string, error)
 }
 
@@ -112,11 +105,15 @@ func (m *Manager) UpgradeGatewayV2(ctx context.Context, request GatewayV2Upgrade
 		if coordinatorDriver == nil {
 			coordinatorDriver = managerGatewayV2CoordinatorDriver{manager: m}
 		}
+		preparation.Network, err = coordinatorDriver.selectNetworkPlan(ctx, preparation.Profile)
+		if err != nil {
+			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, err
+		}
 		preparation.SourceIdentityDigest, err = coordinatorDriver.attestSourceV1(ctx, source, preparation)
 		if err != nil {
 			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, err
 		}
-		if err := stageDriver.hostPreflight(preparation.Profile, preparation.Network); err != nil {
+		if err := stageDriver.hostPreflight(ctx, preparation.Profile, preparation.Network); err != nil {
 			return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, err
 		}
 		state, journal, err = prepareGatewayV2State(source, preparation)
@@ -166,11 +163,8 @@ func gatewayV2UpgradePreparation(request GatewayV2UpgradeRequest) (gatewayUpgrad
 		SpecDigest: request.Profile.SpecDigest, SelectedIPv4: request.Profile.SelectedIPv4,
 		InterfaceID: request.Profile.InterfaceID, PortStart: request.Profile.PortStart, PortEnd: request.Profile.PortEnd,
 	}
-	network := gatewayV2NetworkPlan{
-		Subnet: request.Network.Subnet, GatewayIPv4: request.Network.GatewayIPv4, ContainerIPv4: request.Network.ContainerIPv4,
-	}
 	if !validCanonicalUUID(request.OperationID) || !validCanonicalUUID(request.ApprovedBy) ||
-		!validGatewayProfileBinding(profile) || !validGatewayV2NetworkPlan(network) || !gatewayV2NetworkExcludesSelectedLAN(profile, network) {
+		!validGatewayProfileBinding(profile) {
 		return gatewayUpgradePreparation{}, errors.New("invalid generated ingress v2 upgrade request")
 	}
 	profileDigest, err := appaccess.GatewayProfileSpecDigest(appaccess.GatewayProfileSpec{
@@ -184,7 +178,7 @@ func gatewayV2UpgradePreparation(request GatewayV2UpgradeRequest) (gatewayUpgrad
 		return gatewayUpgradePreparation{}, errors.New("invalid generated ingress v2 upgrade approval")
 	}
 	return gatewayUpgradePreparation{
-		OperationID: request.OperationID, Profile: profile, Network: network,
+		OperationID: request.OperationID, Profile: profile,
 		LocalHostPort: mappableLocalHostPortPlaceholder, ApprovedActionDigest: request.ApprovedActionDigest, ApprovedBy: request.ApprovedBy,
 	}, nil
 }
@@ -199,7 +193,7 @@ func gatewayV2RequestMatchesState(request GatewayV2UpgradeRequest, state gateway
 		return false
 	}
 	return state.OperationID == request.OperationID && journal.OperationID == request.OperationID &&
-		state.Profile == preparation.Profile && journal.Profile == preparation.Profile && state.Network == preparation.Network &&
+		state.Profile == preparation.Profile && journal.Profile == preparation.Profile &&
 		state.UpgradeAction == (gatewayUpgradeActionRef{Name: gatewayUpgradeActionName, Digest: request.ApprovedActionDigest, ApprovedBy: request.ApprovedBy}) &&
 		journal.UpgradeAction == state.UpgradeAction
 }
@@ -267,6 +261,10 @@ func gatewayV2CoordinatorError(ctx context.Context) error {
 }
 
 type managerGatewayV2CoordinatorDriver struct{ manager *Manager }
+
+func (d managerGatewayV2CoordinatorDriver) selectNetworkPlan(ctx context.Context, profile gatewayProfileBinding) (gatewayV2NetworkPlan, error) {
+	return gatewayV2SelectNetworkPlan(ctx, d.manager, profile)
+}
 
 func (d managerGatewayV2CoordinatorDriver) attestSourceV1(ctx context.Context, source routeState, input gatewayUpgradePreparation) (string, error) {
 	if d.manager == nil || ctx == nil {

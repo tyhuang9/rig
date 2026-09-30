@@ -349,7 +349,7 @@ func (d *fakeGatewayV2UpgradeDriver) observeRecovery(_ context.Context, _ routeS
 	return gatewayV2RecoveryUnknown
 }
 
-func (d *fakeGatewayV2UpgradeDriver) hostPreflight(gatewayProfileBinding, gatewayV2NetworkPlan) error {
+func (d *fakeGatewayV2UpgradeDriver) hostPreflight(_ context.Context, _ gatewayProfileBinding, _ gatewayV2NetworkPlan) error {
 	d.checkLocked()
 	d.hostPreflightCalls++
 	if d.shouldFail("host_preflight") {

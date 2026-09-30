@@ -107,7 +107,7 @@ func TestPrepareGatewayV2StateRejectsStaleBindingsAndPendingV1(t *testing.T) {
 		{name: "missing approving actor", mutate: func(_ *routeState, input *gatewayUpgradePreparation) { input.ApprovedBy = "" }},
 		{name: "wrong image-independent source identity", mutate: func(_ *routeState, input *gatewayUpgradePreparation) { input.SourceIdentityDigest = "not-a-digest" }},
 		{name: "v2 subnet contains selected LAN address", mutate: func(_ *routeState, input *gatewayUpgradePreparation) {
-			input.Network = gatewayV2NetworkPlan{Subnet: "192.168.50.0/24", GatewayIPv4: "192.168.50.1", ContainerIPv4: "192.168.50.2"}
+			input.Network = gatewayV2NetworkPlan{Subnet: "192.168.50.16/28", GatewayIPv4: "192.168.50.17", ContainerIPv4: "192.168.50.18"}
 		}},
 		{name: "pending v1 route", mutate: func(source *routeState, _ *gatewayUpgradePreparation) {
 			proposed := source.Active[upgradeTestAppA]
@@ -185,7 +185,7 @@ func TestGatewayUpgradeStoreRetainsV1AndRejectsMissingOrTamperedState(t *testing
 
 	t.Run("target digest tamper", func(t *testing.T) {
 		store, state, journal, _ := persistedUpgradeFixture(t)
-		state.Network.ContainerIPv4 = "10.240.0.3"
+		state.Network = gatewayV2NetworkPlan{Subnet: "10.240.0.16/28", GatewayIPv4: "10.240.0.17", ContainerIPv4: "10.240.0.18"}
 		if !validGatewayV2RouteState(state) {
 			t.Fatal("test state should remain structurally valid")
 		}

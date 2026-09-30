@@ -23,13 +23,13 @@ func TestUpgradeGatewayV2CoordinatesFreshMigrationUnderOneLock(t *testing.T) {
 	if err != nil || journal.Phase != gatewayPhaseCommitted {
 		t.Fatalf("committed journal = %+v, err=%v", journal, err)
 	}
-	if sourceDriver.calls != 1 || stageDriver.hostPreflightCalls != 3 || !transferDriver.v1ServingAtFinalCreate ||
+	if sourceDriver.calls != 1 || sourceDriver.selectCalls != 1 || stageDriver.hostPreflightCalls != 3 || !transferDriver.v1ServingAtFinalCreate ||
 		transferDriver.v1Running || !transferDriver.finalRunning {
 		t.Fatalf("coordinator drivers: source=%+v stage=%+v transfer=%+v", sourceDriver, stageDriver, transferDriver)
 	}
 	stageCreates, finalCreates := stageDriver.createCalls, transferDriver.createCalls
 	result, err = manager.UpgradeGatewayV2(context.Background(), request)
-	if err != nil || result.Outcome != GatewayV2UpgradeCommitted || sourceDriver.calls != 1 ||
+	if err != nil || result.Outcome != GatewayV2UpgradeCommitted || sourceDriver.calls != 1 || sourceDriver.selectCalls != 1 ||
 		stageDriver.createCalls != stageCreates || transferDriver.createCalls != finalCreates {
 		t.Fatalf("committed replay: result=%+v err=%v source=%d stageCreates=%d finalCreates=%d", result, err, sourceDriver.calls, stageDriver.createCalls, transferDriver.createCalls)
 	}
@@ -42,9 +42,6 @@ func TestUpgradeGatewayV2RejectsEveryMismatchedResumeBinding(t *testing.T) {
 	}{
 		{name: "operation", mutate: func(value *GatewayV2UpgradeRequest) { value.OperationID = "66666666-6666-4666-8666-666666666666" }},
 		{name: "actor", mutate: func(value *GatewayV2UpgradeRequest) { value.ApprovedBy = "77777777-7777-4777-8777-777777777777" }},
-		{name: "network", mutate: func(value *GatewayV2UpgradeRequest) {
-			value.Network = GatewayV2NetworkPlan{Subnet: "10.241.0.0/28", GatewayIPv4: "10.241.0.1", ContainerIPv4: "10.241.0.2"}
-		}},
 		{name: "profile revision", mutate: func(value *GatewayV2UpgradeRequest) {
 			value.Profile.RevisionNumber++
 			value.ApprovedActionDigest = mustGatewayV2CoordinatorActionDigest(t, value.Profile)
@@ -64,6 +61,48 @@ func TestUpgradeGatewayV2RejectsEveryMismatchedResumeBinding(t *testing.T) {
 				t.Fatalf("mismatched resume: result=%+v err=%v stageCreates=%d finalCreates=%d", result, err, stageDriver.createCalls, transferDriver.createCalls)
 			}
 		})
+	}
+}
+
+func TestUpgradeGatewayV2FailedNetworkSelectionWritesNoProtectedState(t *testing.T) {
+	manager, store, request, sourceDriver, stageDriver, transferDriver, _ := gatewayV2CoordinatorTestFixture(t)
+	sourceDriver.selectErr = errors.New("injected incomplete Docker inventory")
+
+	result, err := manager.UpgradeGatewayV2(context.Background(), request)
+	if err == nil || result.Outcome != GatewayV2UpgradeUnresolved {
+		t.Fatalf("selection failure result=%+v err=%v", result, err)
+	}
+	if sourceDriver.selectCalls != 1 || sourceDriver.calls != 0 || stageDriver.createCalls != 0 || transferDriver.createCalls != 0 {
+		t.Fatalf("drivers after selection failure: source=%+v stage=%+v transfer=%+v", sourceDriver, stageDriver, transferDriver)
+	}
+	if _, stateErr := store.loadV2State(); stateErr == nil {
+		t.Fatal("v2 state was written after failed network selection")
+	}
+	if _, journalErr := store.loadMigrationJournal(); journalErr == nil {
+		t.Fatal("migration journal was written after failed network selection")
+	}
+}
+
+func TestUpgradeGatewayV2ReplayReusesJournalBoundNetworkWithoutReselection(t *testing.T) {
+	manager, store, request, sourceDriver, _, _, _ := gatewayV2CoordinatorTestFixture(t)
+	if result, err := manager.UpgradeGatewayV2(context.Background(), request); err != nil || result.Outcome != GatewayV2UpgradeCommitted {
+		t.Fatalf("initial upgrade: result=%+v err=%v", result, err)
+	}
+	state, _, err := store.loadBoundUpgrade(request.OperationID)
+	if err != nil || state.Network != sourceDriver.plan {
+		t.Fatalf("bound network=%+v err=%v, want %+v", state.Network, err, sourceDriver.plan)
+	}
+	sourceDriver.plan = gatewayV2NetworkPlan{Subnet: "10.241.0.0/28", GatewayIPv4: "10.241.0.1", ContainerIPv4: "10.241.0.2"}
+	sourceDriver.selectErr = errors.New("planner must not run during replay")
+	if result, err := manager.UpgradeGatewayV2(context.Background(), request); err != nil || result.Outcome != GatewayV2UpgradeCommitted {
+		t.Fatalf("replay result=%+v err=%v", result, err)
+	}
+	if sourceDriver.selectCalls != 1 {
+		t.Fatalf("network selections=%d, want 1", sourceDriver.selectCalls)
+	}
+	replayed, _, err := store.loadBoundUpgrade(request.OperationID)
+	if err != nil || replayed.Network != state.Network {
+		t.Fatalf("replayed network=%+v err=%v, want %+v", replayed.Network, err, state.Network)
 	}
 }
 
@@ -268,13 +307,29 @@ func TestGatewayUpgradeActionDigestUsesAppAccessCanonicalContract(t *testing.T) 
 }
 
 type fakeGatewayV2CoordinatorDriver struct {
-	t          *testing.T
-	manager    *Manager
-	osLockHeld *bool
-	digest     string
-	calls      int
+	t           *testing.T
+	manager     *Manager
+	osLockHeld  *bool
+	digest      string
+	calls       int
+	plan        gatewayV2NetworkPlan
+	selectErr   error
+	selectCalls int
 
 	rollbackTopology gatewayObservedTopology
+}
+
+func (d *fakeGatewayV2CoordinatorDriver) selectNetworkPlan(context.Context, gatewayProfileBinding) (gatewayV2NetworkPlan, error) {
+	d.t.Helper()
+	d.selectCalls++
+	if d.manager.mu.TryLock() {
+		d.manager.mu.Unlock()
+		d.t.Error("network selection ran without Manager lock")
+	}
+	if d.osLockHeld == nil || !*d.osLockHeld {
+		d.t.Error("network selection ran without OS lock")
+	}
+	return d.plan, d.selectErr
 }
 
 func (d *fakeGatewayV2CoordinatorDriver) attestSourceV1(context.Context, routeState, gatewayUpgradePreparation) (string, error) {
@@ -320,9 +375,6 @@ func gatewayV2CoordinatorTestFixture(t *testing.T) (*Manager, *gatewayUpgradeSta
 			InterfaceID: preparation.Profile.InterfaceID, PortStart: preparation.Profile.PortStart, PortEnd: preparation.Profile.PortEnd,
 		},
 		ApprovedBy: preparation.ApprovedBy, ApprovedActionDigest: preparation.ApprovedActionDigest,
-		Network: GatewayV2NetworkPlan{
-			Subnet: preparation.Network.Subnet, GatewayIPv4: preparation.Network.GatewayIPv4, ContainerIPv4: preparation.Network.ContainerIPv4,
-		},
 	}
 	store, err := newGatewayUpgradeStateStore(manager.options.DataRoot)
 	if err != nil {
@@ -340,6 +392,7 @@ func gatewayV2CoordinatorTestFixture(t *testing.T) (*Manager, *gatewayUpgradeSta
 	t.Cleanup(func() { managerAcquireGatewayOSLock = originalAcquire })
 	sourceDriver := &fakeGatewayV2CoordinatorDriver{
 		t: t, manager: manager, osLockHeld: &osLockHeld, digest: preparation.SourceIdentityDigest,
+		plan:             preparation.Network,
 		rollbackTopology: gatewayTopologyExactV1Only,
 	}
 	stageDriver := &fakeGatewayV2UpgradeDriver{t: t, manager: manager, osLockHeld: &osLockHeld, v1Running: true}

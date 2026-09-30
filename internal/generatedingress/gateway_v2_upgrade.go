@@ -13,7 +13,7 @@ const gatewayV2StageMaximumSteps = 24
 type gatewayV2UpgradeDriver interface {
 	observeTopology(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayObservedTopology
 	observeRecovery(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayV2RecoveryTopology
-	hostPreflight(gatewayProfileBinding, gatewayV2NetworkPlan) error
+	hostPreflight(context.Context, gatewayProfileBinding, gatewayV2NetworkPlan) error
 	selectedInterfacePreflight(gatewayProfileBinding) error
 	pinnedImage(context.Context) (string, error)
 	createIngressNetwork(context.Context, gatewayV2RouteState, gatewayMigrationJournal) (string, error)
@@ -72,7 +72,7 @@ func (m *Manager) stageGatewayV2Locked(ctx context.Context, store *gatewayUpgrad
 			if driver.observeTopology(ctx, source, state, journal) != gatewayTopologyExactV1Only {
 				return markGatewayV2StageUncertain(store, journal)
 			}
-			if err := driver.hostPreflight(state.Profile, state.Network); err != nil {
+			if err := driver.hostPreflight(ctx, state.Profile, state.Network); err != nil {
 				return err
 			}
 			if _, err := store.transitionMigrationJournal(operationID, gatewayPhasePrepared, gatewayPhaseStageIntent); err != nil {
@@ -135,7 +135,7 @@ func (m *Manager) advanceGatewayV2StageResources(ctx context.Context, store *gat
 		return nil
 	}
 	if journal.Resources.IngressNetworkID == "" {
-		if err := driver.hostPreflight(state.Profile, state.Network); err != nil {
+		if err := driver.hostPreflight(ctx, state.Profile, state.Network); err != nil {
 			return err
 		}
 		id, err := driver.createIngressNetwork(ctx, state, journal)
@@ -288,8 +288,8 @@ func (d managerGatewayV2UpgradeDriver) observeRecovery(ctx context.Context, sour
 	return d.manager.observeGatewayV2RecoveryTopology(ctx, source, state, journal)
 }
 
-func (managerGatewayV2UpgradeDriver) hostPreflight(profile gatewayProfileBinding, plan gatewayV2NetworkPlan) error {
-	return gatewayV2HostPreflight(profile, plan)
+func (d managerGatewayV2UpgradeDriver) hostPreflight(ctx context.Context, profile gatewayProfileBinding, plan gatewayV2NetworkPlan) error {
+	return gatewayV2HostPreflight(ctx, d.manager, profile, plan)
 }
 
 func (managerGatewayV2UpgradeDriver) selectedInterfacePreflight(profile gatewayProfileBinding) error {
