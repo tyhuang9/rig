@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"sort"
 	"strconv"
@@ -33,6 +36,106 @@ func TestClassifyGatewayV2TopologyExactStates(t *testing.T) {
 	final := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
 	if got := classifyGatewayV2Topology(source, state, journal, final); got != gatewayTopologyExactFinalV2 {
 		t.Fatalf("final topology = %q", got)
+	}
+}
+
+func TestClassifyCommittedFinalV2DoesNotDependOnHistoricalV1AppTopology(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Phase = gatewayPhaseCommitted
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
+	observation.V1EndpointIdentityProven = false
+	observation.V1ApplicationNetworks = map[string]caddyNetworkInspection{}
+	observation.V1ApplicationNetworkIDs = map[string]string{}
+	for name := range observation.V1Container.Networks {
+		if name != caddyNetworkName {
+			delete(observation.V1Container.Networks, name)
+		}
+	}
+	if got := classifyGatewayV2Topology(source, state, journal, observation); got != gatewayTopologyExactFinalV2 {
+		t.Fatalf("committed final topology = %q", got)
+	}
+
+	journal.Phase = gatewayPhaseV2Serving
+	if got := classifyGatewayV2Topology(source, state, journal, observation); got != gatewayTopologyUnknownOrDrift {
+		t.Fatalf("rollback-capable final topology without v1 endpoint proof = %q", got)
+	}
+}
+
+func TestClassifyGatewayV2MixedRestartRequiresProposedLiveAndCommittedRestartConfig(t *testing.T) {
+	source, committed, journal := gatewayV2IdentityTestState(t)
+	journal.Phase = gatewayPhaseCommitted
+	proposed := cloneGatewayV2RouteState(committed)
+	app := proposed.Apps[upgradeTestAppA]
+	app.Route = routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+		endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'd'),
+		endpoint("api", "server", "net-a", "api-green", 3000, 'e'),
+	}}
+	proposed.Apps[upgradeTestAppA] = app
+	if !validGatewayV2MixedRestartInputs(source, committed, proposed, journal) {
+		t.Fatal("mixed restart fixture inputs are invalid")
+	}
+	multiple := cloneGatewayV2RouteState(proposed)
+	other := multiple.Apps[upgradeTestAppB]
+	other.Route = routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		endpoint("web", "server", "net-b", "web-blue", 3000, 'f'),
+	}}
+	multiple.Apps[upgradeTestAppB] = other
+	if validGatewayV2MixedRestartInputs(source, committed, multiple, journal) {
+		t.Fatal("multiple app route changes were accepted as one pending transition")
+	}
+	sameSlot := cloneGatewayV2RouteState(committed)
+	sameSlotApp := sameSlot.Apps[upgradeTestAppA]
+	sameSlotApp.Route.Endpoints[0].NetworkAlias = "frontend-blue-replaced"
+	sameSlot.Apps[upgradeTestAppA] = sameSlotApp
+	if validGatewayV2MixedRestartInputs(source, committed, sameSlot, journal) {
+		t.Fatal("same-slot endpoint change was accepted as a route transition")
+	}
+	observation := gatewayV2IdentityTestObservation(t, source, proposed, journal, gatewayTopologyExactFinalV2)
+	committedConfig, err := expectedGatewayV2FinalConfig(committed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation.FinalRestartConfig = committedConfig
+	if !classifyGatewayV2MixedRestart(source, committed, proposed, journal, observation) {
+		t.Fatal("exact proposed-live/committed-restart topology was rejected")
+	}
+
+	wrongLive := observation
+	wrongLive.FinalConfig = append([]byte(nil), committedConfig...)
+	if classifyGatewayV2MixedRestart(source, committed, proposed, journal, wrongLive) {
+		t.Fatal("committed live config was accepted as the mixed restart window")
+	}
+	unknown := observation
+	unknown.FinalHostPublicationProven = false
+	if classifyGatewayV2MixedRestart(source, committed, proposed, journal, unknown) {
+		t.Fatal("unproven host publication was accepted as the mixed restart window")
+	}
+	if classifyGatewayV2MixedRestart(source, committed, committed, journal, observation) {
+		t.Fatal("identical committed and proposed states were accepted as mixed")
+	}
+
+	manager := &Manager{runner: failingGatewayV2Runner{}, options: Options{
+		DockerExecutable: "docker", WorkingDirectory: t.TempDir(), CommandTimeout: defaultTimeout, OutputLimit: defaultOutputLimit,
+	}}
+	if manager.observeGatewayV2MixedRestart(context.Background(), source, committed, proposed, journal) {
+		t.Fatal("inspection failure was accepted as the mixed restart window")
+	}
+}
+
+func TestClassifyGatewayV2TopologyRejectsDurablePendingRoute(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	previous := cloneGatewayV2AppRoute(state.Apps[upgradeTestAppA])
+	proposed := gatewayV2AppRoute{Route: routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+		endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'd'),
+		endpoint("api", "server", "net-a", "api-green", 3000, 'e'),
+	}}}
+	state.Pending = &gatewayV2PendingRoute{AppID: upgradeTestAppA, Previous: &previous, Proposed: proposed}
+	if !validGatewayV2RouteState(state) {
+		t.Fatal("pending route fixture is invalid")
+	}
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
+	if got := classifyGatewayV2Topology(source, state, journal, observation); got != gatewayTopologyUnknownOrDrift {
+		t.Fatalf("topology with durable pending route = %q", got)
 	}
 }
 
@@ -162,6 +265,10 @@ func TestClassifyGatewayV2StageFailsClosedWithoutRestartAndPublicationProof(t *t
 
 func TestGatewayV2StageConfigContainsOnlyBounded404Listeners(t *testing.T) {
 	_, state, _ := gatewayV2IdentityTestState(t)
+	challenge, err := gatewayV2HostChallenge(state)
+	if err != nil {
+		t.Fatal(err)
+	}
 	body, err := buildGatewayV2StageConfig(state)
 	if err != nil {
 		t.Fatal(err)
@@ -180,7 +287,8 @@ func TestGatewayV2StageConfigContainsOnlyBounded404Listeners(t *testing.T) {
 	for port := state.Profile.PortStart; ; port++ {
 		server, exists := servers["lan_"+strconvForGatewayTest(port)]
 		if !exists || len(server.Listen) != 1 || server.Listen[0] != state.Network.ContainerIPv4+":"+strconvForGatewayTest(port) ||
-			len(server.Routes) != 1 || !reflect.DeepEqual(server.Routes[0], notFoundRoute()) {
+			len(server.Routes) != 2 || !reflect.DeepEqual(server.Routes[0], gatewayV2ProbeRoute(state.Profile.SelectedIPv4, gatewayV2PortChallenge(challenge, port))) ||
+			!reflect.DeepEqual(server.Routes[1], notFoundRoute()) {
 			t.Fatalf("stage server %d = %#v", port, server)
 		}
 		if port == state.Profile.PortEnd {
@@ -297,6 +405,237 @@ func TestObserveGatewayMigrationTopologyMapsInspectionFailureToUnknown(t *testin
 	}
 }
 
+func TestInspectGatewayEndpointIdentitySnapshotProvesUniqueAliasAndStableIdentity(t *testing.T) {
+	routes, networks, inspections := gatewayV2EndpointIdentityFixture()
+	runner := &gatewayV2EndpointIdentityRunner{inspections: inspections}
+	manager := &Manager{runner: runner, options: Options{
+		DockerExecutable: "docker", WorkingDirectory: t.TempDir(), CommandTimeout: defaultTimeout, OutputLimit: defaultOutputLimit,
+	}}
+	first, err := manager.inspectGatewayEndpointIdentitySnapshot(context.Background(), routes, networks)
+	if err != nil || first == "" {
+		t.Fatalf("snapshot = %q, err = %v", first, err)
+	}
+	second, err := manager.inspectGatewayEndpointIdentitySnapshot(context.Background(), routes, networks)
+	if err != nil || second != first {
+		t.Fatalf("stable snapshot = %q, err = %v, want %q", second, err, first)
+	}
+	if len(runner.requests) != 4 {
+		t.Fatalf("container inspections = %d, want each of two immutable members twice", len(runner.requests))
+	}
+
+	otherID := "sha256:" + strings.Repeat("2", 64)
+	other := runner.inspections[normalizeID(otherID)]
+	other.Networks["net-a"].Aliases = []string{"other", "frontend-blue"}
+	runner.inspections[normalizeID(otherID)] = other
+	if _, err := manager.inspectGatewayEndpointIdentitySnapshot(context.Background(), routes, networks); err == nil {
+		t.Fatal("duplicate endpoint alias was accepted")
+	}
+}
+
+func TestInspectGatewayEndpointIdentitySnapshotFailsClosedOnEndpointDrift(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]endpointInspection)
+	}{
+		{"unhealthy endpoint", func(values map[string]endpointInspection) {
+			endpoint := values[strings.Repeat("1", 64)]
+			endpoint.Health = "unhealthy"
+			values[strings.Repeat("1", 64)] = endpoint
+		}},
+		{"ownership label drift", func(values map[string]endpointInspection) {
+			endpoint := values[strings.Repeat("1", 64)]
+			endpoint.Labels["io.rig.application"] = "33333333-3333-4333-8333-333333333333"
+			values[strings.Repeat("1", 64)] = endpoint
+		}},
+		{"immutable identity replaced", func(values map[string]endpointInspection) {
+			endpoint := values[strings.Repeat("1", 64)]
+			endpoint.ID = "sha256:" + strings.Repeat("3", 64)
+			values[strings.Repeat("1", 64)] = endpoint
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			routes, networks, inspections := gatewayV2EndpointIdentityFixture()
+			test.mutate(inspections)
+			manager := &Manager{runner: &gatewayV2EndpointIdentityRunner{inspections: inspections}, options: Options{
+				DockerExecutable: "docker", WorkingDirectory: t.TempDir(), CommandTimeout: defaultTimeout, OutputLimit: defaultOutputLimit,
+			}}
+			if _, err := manager.inspectGatewayEndpointIdentitySnapshot(context.Background(), routes, networks); err == nil {
+				t.Fatal("endpoint drift was accepted")
+			}
+		})
+	}
+}
+
+func TestGatewayV2HostPublicationProofUsesSelectedAddressAndRejectsLoopback(t *testing.T) {
+	_, state, _ := gatewayV2IdentityTestState(t)
+	challenge, err := gatewayV2HostChallenge(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caddyID := "sha256:" + strings.Repeat("d", 64)
+	var calls int
+	probe := func(_ context.Context, address string, port uint16, host, path string) gatewayV2HostProbeResult {
+		calls++
+		if port < state.Profile.PortStart || port > state.Profile.PortEnd {
+			t.Fatalf("port = %d", port)
+		}
+		if address == "127.0.0.1" {
+			return gatewayV2HostProbeResult{}
+		}
+		if address != state.Profile.SelectedIPv4 || (host != state.Profile.SelectedIPv4 && host != "wrong.invalid") {
+			t.Fatalf("probe = %s:%d Host %q", address, port, host)
+		}
+		result := gatewayV2HostProbeResult{Status: http.StatusNotFound, Connected: true, Responded: true}
+		portChallenge := gatewayV2PortChallenge(challenge, port)
+		if path == gatewayV2ChallengePathPrefix+portChallenge {
+			result.Body = gatewayV2ChallengeBodyPrefix + portChallenge
+		} else if path != "/" {
+			t.Fatalf("path = %q", path)
+		}
+		return result
+	}
+	containerCalls := 0
+	containerProbe := func(_ context.Context, gotID, address string, port uint16, host, token string) bool {
+		containerCalls++
+		return gotID == caddyID && address == state.Network.ContainerIPv4 && port >= state.Profile.PortStart && port <= state.Profile.PortEnd &&
+			host == state.Profile.SelectedIPv4 && token == gatewayV2PortChallenge(challenge, port)
+	}
+	if !proveGatewayV2StageHostPublication(context.Background(), state, caddyID, probe, containerProbe) {
+		t.Fatal("exact stage host publication was rejected")
+	}
+	stageCalls := calls
+	stageContainerCalls := containerCalls
+	if !proveGatewayV2FinalHostPublication(context.Background(), state, caddyID, probe, containerProbe) {
+		t.Fatal("exact final host publication was rejected")
+	}
+	wantPorts := int(state.Profile.PortEnd-state.Profile.PortStart) + 1
+	wantPerProof := 4 * wantPorts
+	if stageCalls != wantPerProof || calls-stageCalls != wantPerProof {
+		t.Fatalf("stage calls = %d, final calls = %d, want %d each", stageCalls, calls-stageCalls, wantPerProof)
+	}
+	if stageContainerCalls != wantPorts || containerCalls-stageContainerCalls != wantPorts {
+		t.Fatalf("stage container calls = %d, final container calls = %d, want %d each", stageContainerCalls, containerCalls-stageContainerCalls, wantPorts)
+	}
+
+	broadProbe := func(_ context.Context, _ string, _ uint16, _ string, path string) gatewayV2HostProbeResult {
+		result := gatewayV2HostProbeResult{Status: http.StatusNotFound, Connected: true, Responded: true}
+		if token := strings.TrimPrefix(path, gatewayV2ChallengePathPrefix); path == gatewayV2ChallengePathPrefix+token && validSHA256(token) {
+			result.Body = gatewayV2ChallengeBodyPrefix + token
+		}
+		return result
+	}
+	if proveGatewayV2StageHostPublication(context.Background(), state, caddyID, broadProbe, containerProbe) {
+		t.Fatal("stage publication reachable through loopback was accepted")
+	}
+	if proveGatewayV2FinalHostPublication(context.Background(), state, caddyID, broadProbe, containerProbe) {
+		t.Fatal("final publication reachable through loopback was accepted")
+	}
+	connectedWithoutHTTP := func(_ context.Context, address string, _ uint16, _ string, path string) gatewayV2HostProbeResult {
+		if address == "127.0.0.1" {
+			return gatewayV2HostProbeResult{Connected: true}
+		}
+		result := gatewayV2HostProbeResult{Status: http.StatusNotFound, Connected: true, Responded: true}
+		if token := strings.TrimPrefix(path, gatewayV2ChallengePathPrefix); path == gatewayV2ChallengePathPrefix+token && validSHA256(token) {
+			result.Body = gatewayV2ChallengeBodyPrefix + token
+		}
+		return result
+	}
+	if proveGatewayV2StageHostPublication(context.Background(), state, caddyID, connectedWithoutHTTP, containerProbe) {
+		t.Fatal("stage publication with a raw loopback listener was accepted")
+	}
+	generic404 := func(_ context.Context, _ string, _ uint16, _ string, _ string) gatewayV2HostProbeResult {
+		return gatewayV2HostProbeResult{Status: http.StatusNotFound, Connected: true, Responded: true}
+	}
+	if proveGatewayV2StageHostPublication(context.Background(), state, caddyID, generic404, containerProbe) {
+		t.Fatal("unrelated generic 404 listener was accepted as the stage gateway")
+	}
+	swappedPortProbe := func(_ context.Context, _ string, port uint16, _ string, path string) gatewayV2HostProbeResult {
+		otherPort := port + 1
+		if port == state.Profile.PortEnd {
+			otherPort = state.Profile.PortStart
+		}
+		otherChallenge := gatewayV2PortChallenge(challenge, otherPort)
+		return gatewayV2HostProbeResult{
+			Status: http.StatusNotFound, Body: gatewayV2ChallengeBodyPrefix + otherChallenge,
+			Connected: true, Responded: strings.HasPrefix(path, gatewayV2ChallengePathPrefix),
+		}
+	}
+	if proveGatewayV2StageHostPublication(context.Background(), state, caddyID, swappedPortProbe, containerProbe) {
+		t.Fatal("challenge response from a different LAN port was accepted")
+	}
+}
+
+func TestProbeGatewayV2HostStatusOriginatesDirectHTTP(t *testing.T) {
+	challenge := strings.Repeat("a", 64)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Host != "wrong.invalid" {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if request.URL.Path == gatewayV2ChallengePathPrefix+challenge {
+			writer.WriteHeader(http.StatusNotFound)
+			_, _ = writer.Write([]byte(gatewayV2ChallengeBodyPrefix + challenge))
+			return
+		}
+		if request.URL.Path != "/" {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		writer.WriteHeader(http.StatusNotFound)
+	}))
+	server.Start()
+	address, portText, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	portValue, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := probeGatewayV2HostStatus(context.Background(), address, uint16(portValue), "wrong.invalid", "/")
+	if !result.Connected || !result.Responded || result.Status != http.StatusNotFound {
+		t.Fatalf("result = %#v", result)
+	}
+	challengeResult := probeGatewayV2HostStatus(context.Background(), address, uint16(portValue), "wrong.invalid", gatewayV2ChallengePathPrefix+challenge)
+	if !challengeResult.Connected || !challengeResult.Responded || challengeResult.Status != http.StatusNotFound || challengeResult.Body != gatewayV2ChallengeBodyPrefix+challenge {
+		t.Fatalf("challenge result = %#v", challengeResult)
+	}
+	server.Close()
+	if result := probeGatewayV2HostStatus(context.Background(), address, uint16(portValue), "wrong.invalid", "/"); result.Connected || result.Responded {
+		t.Fatalf("closed host listener result = %#v", result)
+	}
+}
+
+func TestProbeGatewayV2ContainerChallengeRequiresExactAttestedResponse(t *testing.T) {
+	_, state, _ := gatewayV2IdentityTestState(t)
+	challenge, err := gatewayV2HostChallenge(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caddyID := "sha256:" + strings.Repeat("d", 64)
+	runner := &gatewayV2ChallengeRunner{stdout: []byte(gatewayV2ChallengeBodyPrefix + challenge + "\n404")}
+	manager := &Manager{runner: runner, options: Options{
+		DockerExecutable: "docker", WorkingDirectory: t.TempDir(), CommandTimeout: defaultTimeout, OutputLimit: defaultOutputLimit,
+	}}
+	if !manager.probeGatewayV2ContainerChallenge(context.Background(), caddyID, state.Network.ContainerIPv4, state.Profile.PortStart, state.Profile.SelectedIPv4, challenge) {
+		t.Fatal("exact immutable-container challenge response was rejected")
+	}
+	if len(runner.requests) != 1 {
+		t.Fatalf("requests = %d", len(runner.requests))
+	}
+	request := runner.requests[0]
+	if request.Args[0] != "container" || request.Args[1] != "exec" || request.Args[2] != caddyID ||
+		!containsString(request.Args, "Host: "+state.Profile.SelectedIPv4) ||
+		request.Args[len(request.Args)-1] != "http://"+state.Network.ContainerIPv4+":"+strconvForGatewayTest(state.Profile.PortStart)+gatewayV2ChallengePathPrefix+challenge {
+		t.Fatalf("challenge request = %#v", request.Args)
+	}
+	runner.stdout = []byte("\n404")
+	if manager.probeGatewayV2ContainerChallenge(context.Background(), caddyID, state.Network.ContainerIPv4, state.Profile.PortStart, state.Profile.SelectedIPv4, challenge) {
+		t.Fatal("generic container 404 was accepted as the gateway challenge")
+	}
+}
+
 func gatewayV2IdentityTestState(t *testing.T) (routeState, gatewayV2RouteState, gatewayMigrationJournal) {
 	t.Helper()
 	source, preparation := upgradeTestPreparation(t)
@@ -406,8 +745,13 @@ func gatewayV2IdentityTestObservation(t *testing.T, source routeState, state gat
 	observation.ApplicationNetworks = gatewayV2IdentityTestApplicationNetworksV2(state, observation.FinalContainer)
 	observation.ApplicationNetworkIDs = gatewayV2IdentityTestApplicationNetworkIDsV2(state)
 	routes, assignments := gatewayV2ConfigInputs(state)
+	challenge, err := gatewayV2HostChallenge(state)
+	if err != nil {
+		t.Fatal(err)
+	}
 	observation.FinalConfig, err = buildCaddyConfigV2(routes, state.Network.ContainerIPv4+":8080", caddyV2Profile{
 		SelectedIPv4: state.Profile.SelectedIPv4, PortStart: state.Profile.PortStart, PortEnd: state.Profile.PortEnd,
+		ProbeToken: challenge,
 	}, assignments)
 	if err != nil {
 		t.Fatal(err)
@@ -525,6 +869,68 @@ func gatewayV2IdentityTestApplicationNetworkIDsV2(state gatewayV2RouteState) map
 }
 
 func strconvForGatewayTest(value uint16) string { return strconv.Itoa(int(value)) }
+
+func gatewayV2EndpointIdentityFixture() (map[string]routeRecord, map[string]caddyNetworkInspection, map[string]endpointInspection) {
+	const appID = "11111111-1111-4111-8111-111111111111"
+	endpointID := "sha256:" + strings.Repeat("1", 64)
+	otherID := "sha256:" + strings.Repeat("2", 64)
+	routes := map[string]routeRecord{appID: {
+		Slot: generatedruntime.SlotBlue,
+		Endpoints: []generatedruntime.RouteEndpoint{{
+			Component: "frontend", Role: "static", ContainerID: endpointID, NetworkName: "net-a", NetworkAlias: "frontend-blue", InternalPort: 4173,
+		}},
+	}}
+	networks := map[string]caddyNetworkInspection{"net-a": {
+		Name: "net-a",
+		Containers: map[string]caddyNetworkContainerInspection{
+			endpointID: {Name: "frontend", IPv4Address: "172.30.0.2/24"},
+			otherID:    {Name: "other", IPv4Address: "172.30.0.3/24"},
+		},
+	}}
+	inspections := map[string]endpointInspection{
+		normalizeID(endpointID): {
+			ID: endpointID, Running: true, Health: "healthy",
+			Labels: map[string]string{
+				"io.rig.managed": "generated-runtime", "io.rig.application": appID, "io.rig.component": "frontend",
+				"io.rig.slot": string(generatedruntime.SlotBlue), "io.rig.role": "static",
+			},
+			Networks: map[string]*networkAttachment{"net-a": {Aliases: []string{"frontend-blue"}, IPAddress: "172.30.0.2"}},
+		},
+		normalizeID(otherID): {
+			ID: otherID, Running: true, Health: "healthy", Labels: map[string]string{},
+			Networks: map[string]*networkAttachment{"net-a": {Aliases: []string{"other"}, IPAddress: "172.30.0.3"}},
+		},
+	}
+	return routes, networks, inspections
+}
+
+type gatewayV2EndpointIdentityRunner struct {
+	inspections map[string]endpointInspection
+	requests    []runtimeprocess.CommandRequest
+}
+
+type gatewayV2ChallengeRunner struct {
+	stdout   []byte
+	requests []runtimeprocess.CommandRequest
+}
+
+func (r *gatewayV2ChallengeRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	r.requests = append(r.requests, request)
+	return runtimeprocess.CommandResult{Stdout: append([]byte(nil), r.stdout...)}, nil
+}
+
+func (r *gatewayV2EndpointIdentityRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	r.requests = append(r.requests, request)
+	if len(request.Args) != 5 || request.Args[0] != "container" || request.Args[1] != "inspect" || request.Args[2] != "--format" || request.Args[3] != endpointInspectFormat {
+		return runtimeprocess.CommandResult{}, errors.New("unexpected endpoint identity request")
+	}
+	value, exists := r.inspections[normalizeID(request.Args[4])]
+	if !exists {
+		return runtimeprocess.CommandResult{}, errors.New("endpoint is unavailable")
+	}
+	body, err := json.Marshal(value)
+	return runtimeprocess.CommandResult{Stdout: body}, err
+}
 
 type gatewayV2TarRunner struct {
 	body     []byte

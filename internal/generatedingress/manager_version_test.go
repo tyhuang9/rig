@@ -226,6 +226,12 @@ func installCommittedV2Pair(t *testing.T, manager *Manager) {
 		}
 		phase = next
 	}
+	// Tests that specifically assert the legacy fence use an unresolved v2
+	// topology and therefore must not reach Docker. Committed-v2 manager tests
+	// replace this observer with an exact topology.
+	manager.gatewayTopologyObserver = func(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayObservedTopology {
+		return gatewayTopologyUnknownOrDrift
+	}
 }
 
 func pendingV1State(runner *ingressRunner) routeState {

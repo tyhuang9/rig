@@ -31,6 +31,14 @@ func (m *Manager) Snapshot(ctx context.Context) (snapshot generatedruntime.Capac
 			snapshot = generatedruntime.CapacitySnapshot{}
 		}
 	}()
+	if _, state, journal, committed, err := m.committedV2Locked(); err != nil {
+		return generatedruntime.CapacitySnapshot{}, err
+	} else if committed {
+		if err := m.attestCommittedV2Locked(ctx, state, journal); err != nil {
+			return generatedruntime.CapacitySnapshot{}, err
+		}
+		return m.snapshotFromContainer(ctx, state.Identity.FinalContainer)
+	}
 	if err := m.fenceLegacyV1Locked(); err != nil {
 		return generatedruntime.CapacitySnapshot{}, err
 	}
@@ -38,7 +46,11 @@ func (m *Manager) Snapshot(ctx context.Context) (snapshot generatedruntime.Capac
 	if err != nil || !found || !inspection.Running || inspection.Labels["io.rig.managed"] != "generated-ingress" || inspection.Labels["io.rig.identity-version"] != "v1" {
 		return generatedruntime.CapacitySnapshot{}, errors.New("generated ingress capacity probe is unavailable")
 	}
-	result, err := m.run(ctx, m.options.CommandTimeout, "container", "exec", caddyContainerName, "sh", "-c", capacityProbeCommand)
+	return m.snapshotFromContainer(ctx, caddyContainerName)
+}
+
+func (m *Manager) snapshotFromContainer(ctx context.Context, container string) (generatedruntime.CapacitySnapshot, error) {
+	result, err := m.run(ctx, m.options.CommandTimeout, "container", "exec", container, "sh", "-c", capacityProbeCommand)
 	if err != nil {
 		return generatedruntime.CapacitySnapshot{}, errors.New("generated ingress capacity probe failed")
 	}

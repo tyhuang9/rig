@@ -10,6 +10,37 @@ import (
 	"github.com/hostd/hostd/internal/generatedruntime"
 )
 
+func TestBuildCaddyConfigV2HostProbeIsBoundToApprovedHost(t *testing.T) {
+	token := strings.Repeat("a", 64)
+	profile := caddyV2Profile{SelectedIPv4: "192.168.50.20", PortStart: 8100, PortEnd: 8101, ProbeToken: token}
+	body, err := buildCaddyConfigV2(map[string]routeRecord{}, "10.203.0.2:8080", profile, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config caddyConfig
+	if err := json.Unmarshal(body, &config); err != nil {
+		t.Fatal(err)
+	}
+	server := config.Apps.HTTP.Servers["lan-8100"]
+	portToken := gatewayV2PortChallenge(token, 8100)
+	if len(server.Routes) != 2 || !reflect.DeepEqual(server.Routes[0], gatewayV2ProbeRoute(profile.SelectedIPv4, portToken)) ||
+		len(server.Routes[1].Match) != 0 || server.Routes[1].Handle[0].StatusCode != 404 || server.Routes[1].Handle[0].Body != "" {
+		t.Fatalf("LAN probe and fallback routes = %#v", server.Routes)
+	}
+	if server.Routes[0].Handle[0].Body != "rig-gateway-v2:"+portToken || server.Routes[0].Handle[0].StatusCode != 404 {
+		t.Fatalf("LAN probe body = %#v", server.Routes[0].Handle)
+	}
+	other := config.Apps.HTTP.Servers["lan-8101"]
+	if len(other.Routes) != 2 || !reflect.DeepEqual(other.Routes[0], gatewayV2ProbeRoute(profile.SelectedIPv4, gatewayV2PortChallenge(token, 8101))) ||
+		other.Routes[0].Handle[0].Body == server.Routes[0].Handle[0].Body {
+		t.Fatalf("LAN port challenge was not bound to its port: %#v", other.Routes)
+	}
+	profile.ProbeToken = "invalid"
+	if _, err := buildCaddyConfigV2(map[string]routeRecord{}, "10.203.0.2:8080", profile, nil); err == nil {
+		t.Fatal("invalid probe token was accepted")
+	}
+}
+
 func TestBuildCaddyConfigV2KeepsLocalRoutesAndIsolatesLANPorts(t *testing.T) {
 	appA := "11111111-1111-4111-8111-111111111111"
 	appB := "22222222-2222-4222-8222-222222222222"

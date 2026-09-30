@@ -38,8 +38,12 @@ const (
 	// A route read must not hold the switch mutex for the sum of many Docker
 	// command timeouts when the daemon is slow or unresponsive.
 	observationTimeout = 15 * time.Second
-	defaultPullTimeout = 5 * time.Minute
-	maximumDrain       = 30 * time.Second
+	// A committed v2 observation may probe every port in the bounded LAN pool
+	// plus the local route matrix. Lock acquisition remains capped by
+	// observationTimeout; this budget begins after v2 ownership is selected.
+	v2ObservationTimeout = 3 * time.Minute
+	defaultPullTimeout   = 5 * time.Minute
+	maximumDrain         = 30 * time.Second
 	// Gateway probes run inside the already-attested Caddy container. Their
 	// output contains only the final three-digit HTTP status and remains too
 	// small to carry application response data across this boundary.
@@ -66,6 +70,13 @@ type Manager struct {
 	dockerEnv                []string
 	workingDirectoryIdentity os.FileInfo
 	mu                       contextMutex
+	// gatewayTopologyObserver is replaceable only by package tests. Production
+	// always uses the full read-only Docker attestation.
+	gatewayTopologyObserver func(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayObservedTopology
+	// gatewayCandidateObserver is replaceable only by package tests.
+	gatewayCandidateObserver func(context.Context, gatewayV2RouteState, gatewayMigrationJournal, string, gatewayV2AppRoute) error
+	// gatewayMixedRestartObserver is replaceable only by package tests.
+	gatewayMixedRestartObserver func(context.Context, routeState, gatewayV2RouteState, gatewayV2RouteState, gatewayMigrationJournal) bool
 }
 
 // contextMutex lets a route observation abandon lock contention when its
@@ -151,6 +162,11 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 		return err
 	}
 	defer releaseGatewaySwitchLock(release, &resultErr)
+	if store, state, journal, committed, err := m.committedV2Locked(); err != nil {
+		return markCandidateMayBeLive(err)
+	} else if committed {
+		return m.switchCommittedV2Locked(ctx, store, state, journal, request)
+	}
 	if err := m.fenceLegacyV1Locked(); err != nil {
 		return markCandidateMayBeLive(err)
 	}
@@ -254,6 +270,11 @@ func (m *Manager) Provision(ctx context.Context) (resultErr error) {
 		return err
 	}
 	defer releaseGatewayLock(release, &resultErr)
+	if store, state, journal, committed, err := m.committedV2Locked(); err != nil {
+		return err
+	} else if committed {
+		return m.recoverCommittedV2Locked(ctx, store, state, journal)
+	}
 	if err := m.fenceLegacyV1Locked(); err != nil {
 		return err
 	}
@@ -1345,33 +1366,57 @@ func (m *Manager) WithObservation(ctx context.Context, appID string, fn func(con
 	if m == nil || ctx == nil || !validAppID(appID) || fn == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
-	bounded, cancel := context.WithTimeout(ctx, observationTimeout)
-	defer cancel()
-	release, err := m.lockGateway(bounded)
+	lockContext, cancelLock := context.WithTimeout(ctx, observationTimeout)
+	defer cancelLock()
+	release, err := m.lockGateway(lockContext)
 	if err != nil {
 		return err
 	}
 	defer releaseGatewayLock(release, &resultErr)
-	if bounded.Err() != nil {
-		return &Error{Code: DiagnosticCancelled}
-	}
-	observation, err := m.observeLocked(bounded, appID)
+
+	_, state, journal, committed, err := m.committedV2Locked()
 	if err != nil {
 		return err
 	}
-	if bounded.Err() != nil {
+	observationContext := lockContext
+	cancelObservation := func() {}
+	if committed {
+		if ctx.Err() != nil {
+			return &Error{Code: DiagnosticCancelled}
+		}
+		observationContext, cancelObservation = context.WithTimeout(ctx, v2ObservationTimeout)
+	} else if lockContext.Err() != nil {
 		return &Error{Code: DiagnosticCancelled}
 	}
-	if err := fn(bounded, observation); err != nil {
+	defer cancelObservation()
+
+	var observation Observation
+	if committed {
+		observation, err = m.observeCommittedV2Locked(observationContext, state, journal, appID)
+	} else {
+		observation, err = m.observeLocked(observationContext, appID)
+	}
+	if err != nil {
 		return err
 	}
-	if bounded.Err() != nil {
+	if observationContext.Err() != nil {
+		return &Error{Code: DiagnosticCancelled}
+	}
+	if err := fn(observationContext, observation); err != nil {
+		return err
+	}
+	if observationContext.Err() != nil {
 		return &Error{Code: DiagnosticCancelled}
 	}
 	return nil
 }
 
 func (m *Manager) observeLocked(ctx context.Context, appID string) (Observation, error) {
+	if _, state, journal, committed, err := m.committedV2Locked(); err != nil {
+		return Observation{}, err
+	} else if committed {
+		return m.observeCommittedV2Locked(ctx, state, journal, appID)
+	}
 	if err := m.fenceLegacyV1Locked(); err != nil {
 		return Observation{}, err
 	}

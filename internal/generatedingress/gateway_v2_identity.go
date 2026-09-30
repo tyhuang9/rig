@@ -8,11 +8,14 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -36,6 +39,9 @@ const (
 	gatewayV2ContainerPort            = uint16(8080)
 	gatewayV2StageRestartPolicy       = "no"
 	gatewayV2FinalRestartPolicy       = "unless-stopped"
+	gatewayV2ChallengePathPrefix      = "/.well-known/rig-gateway/"
+	gatewayV2ChallengeBodyPrefix      = "rig-gateway-v2:"
+	gatewayV2ChallengeContext         = "rig-gateway-v2-host-proof"
 	// A protected v1 state is capped at 48 KiB. Generated Caddy config omits
 	// several endpoint fields and the v2 LAN matrix adds less than 12 KiB.
 	// Keeping the body at 60 KiB leaves room for docker-cp tar framing inside
@@ -69,9 +75,10 @@ type gatewayV2DockerObservation struct {
 	V1ApplicationNetworkIDs map[string]string
 	V1Stable                bool
 	V1ResourcesStable       bool
-	// EndpointIdentityProven requires immutable endpoint IDs, labels, health,
-	// and unique aliases. The live observer leaves it false until that proof is
-	// implemented; a healthy Caddy container alone cannot prove app isolation.
+	// EndpointIdentityProven requires stable immutable endpoint IDs, ownership
+	// labels, health, and network-wide unique aliases. Committed v2 operation
+	// no longer depends on historical v1 endpoint liveness; migration phases do
+	// require this proof while v1 remains the rollback target.
 	V1EndpointIdentityProven bool
 
 	ConfigVolume         volumeInspection
@@ -92,9 +99,9 @@ type gatewayV2DockerObservation struct {
 	StageRestartConfig  []byte
 	Stage404Proven      bool
 	// HostPublicationProven is deliberately separate from the in-container
-	// route probes. Docker's desired and effective port maps alone do not prove
-	// that the selected host address is reachable. The first read-only slice
-	// leaves this false until a host-side probe surface is added.
+	// route probes. It requires a state-bound challenge through both the exact
+	// selected host address and the immutable Caddy container, plus loopback
+	// non-exposure; Docker's port maps alone are insufficient.
 	StageHostPublicationProven  bool
 	StageStable                 bool
 	FinalContainer              caddyInspection
@@ -155,6 +162,35 @@ type gatewayNetworkIdentityInspection struct {
 	Containers map[string]caddyNetworkContainerInspection `json:"Containers"`
 }
 
+type gatewayEndpointIdentityRecord struct {
+	ApplicationID string   `json:"applicationId"`
+	ContainerID   string   `json:"containerId"`
+	Component     string   `json:"component"`
+	Role          string   `json:"role"`
+	Slot          string   `json:"slot"`
+	NetworkName   string   `json:"networkName"`
+	NetworkAlias  string   `json:"networkAlias"`
+	IPAddress     string   `json:"ipAddress"`
+	Aliases       []string `json:"aliases"`
+}
+
+type gatewayNetworkAliasRecord struct {
+	NetworkName string   `json:"networkName"`
+	ContainerID string   `json:"containerId"`
+	IPAddress   string   `json:"ipAddress"`
+	Aliases     []string `json:"aliases"`
+}
+
+type gatewayV2HostProbeResult struct {
+	Status    int
+	Body      string
+	Connected bool
+	Responded bool
+}
+
+type gatewayV2HostStatusProbe func(context.Context, string, uint16, string, string) gatewayV2HostProbeResult
+type gatewayV2ContainerChallengeProbe func(context.Context, string, string, uint16, string, string) bool
+
 func (value gatewayNetworkIdentityInspection) caddy() caddyNetworkInspection {
 	return caddyNetworkInspection{
 		Name: value.Name, Driver: value.Driver, Scope: value.Scope, Internal: value.Internal,
@@ -176,6 +212,38 @@ func (m *Manager) observeGatewayMigrationTopology(ctx context.Context, source ro
 	}
 	defer clearGatewayV2DockerObservation(&observation)
 	return classifyGatewayV2Topology(source, state, journal, observation)
+}
+
+// observeGatewayV2MixedRestart recognizes only the committed-v2 crash window
+// where Caddy applied the proposed live config but the durable restart config
+// still contains the last committed routes. The caller supplies Pending=nil
+// derived states and must hold the gateway writer lock before using this proof
+// to authorize a rollback mutation.
+func (m *Manager) observeGatewayV2MixedRestart(ctx context.Context, source routeState, committed, proposed gatewayV2RouteState, journal gatewayMigrationJournal) bool {
+	if m == nil || ctx == nil || !validGatewayV2MixedRestartInputs(source, committed, proposed, journal) {
+		return false
+	}
+	committedEndpointsBefore, err := m.inspectGatewayRouteEndpointProof(ctx, gatewayV2RouteRecords(committed))
+	if err != nil {
+		return false
+	}
+	candidate, _, found, err := m.inspectNamedGatewayContainer(ctx, proposed.Identity.FinalContainer)
+	if err != nil || !found || !validContainerID(candidate.ID) ||
+		!m.proveGatewayRouteEndpointTransports(ctx, candidate.ID, gatewayV2RouteRecords(committed)) {
+		return false
+	}
+	committedEndpointsAfter, err := m.inspectGatewayRouteEndpointProof(ctx, gatewayV2RouteRecords(committed))
+	if err != nil || committedEndpointsBefore != committedEndpointsAfter {
+		return false
+	}
+	observation, err := m.inspectGatewayV2Docker(ctx, source, proposed, journal)
+	if err != nil {
+		clearGatewayV2DockerObservation(&observation)
+		return false
+	}
+	defer clearGatewayV2DockerObservation(&observation)
+	return normalizeID(candidate.ID) == normalizeID(observation.FinalContainer.ID) &&
+		classifyGatewayV2MixedRestart(source, committed, proposed, journal, observation)
 }
 
 func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal) (gatewayV2DockerObservation, error) {
@@ -244,19 +312,32 @@ func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState,
 			return observation, err
 		}
 	}
+	requireV1RollbackTopology := journal.Phase != gatewayPhaseCommitted
 	v1Owners, valid := gatewayRouteNetworkOwners(source.Active)
 	if !valid {
 		return observation, errors.New("invalid generated ingress v1 application networks")
 	}
-	observation.V1ApplicationNetworks = make(map[string]caddyNetworkInspection, len(v1Owners))
-	observation.V1ApplicationNetworkIDs = make(map[string]string, len(v1Owners))
-	for name := range v1Owners {
-		full, id, found, inspectErr := m.inspectNamedGatewayNetwork(ctx, name)
-		if inspectErr != nil || !found {
-			return observation, errors.New("generated ingress v1 application network is unavailable")
+	observation.V1ApplicationNetworks = make(map[string]caddyNetworkInspection)
+	observation.V1ApplicationNetworkIDs = make(map[string]string)
+	if requireV1RollbackTopology {
+		observation.V1ApplicationNetworks = make(map[string]caddyNetworkInspection, len(v1Owners))
+		observation.V1ApplicationNetworkIDs = make(map[string]string, len(v1Owners))
+		for name := range v1Owners {
+			full, id, found, inspectErr := m.inspectNamedGatewayNetwork(ctx, name)
+			if inspectErr != nil || !found {
+				return observation, errors.New("generated ingress v1 application network is unavailable")
+			}
+			observation.V1ApplicationNetworks[name] = full
+			observation.V1ApplicationNetworkIDs[name] = id
 		}
-		observation.V1ApplicationNetworks[name] = full
-		observation.V1ApplicationNetworkIDs[name] = id
+	}
+	requireV1EndpointIdentity := requireV1RollbackTopology
+	var v1EndpointIdentityBefore string
+	if requireV1EndpointIdentity {
+		v1EndpointIdentityBefore, err = m.inspectGatewayEndpointIdentitySnapshot(ctx, source.Active, observation.V1ApplicationNetworks)
+		if err != nil {
+			return observation, err
+		}
 	}
 	if observation.StageContainerFound && observation.StageContainer.Running && !observation.StageContainer.Restarting {
 		observation.StageConfig, err = m.inspectLiveCaddyConfig(ctx, observation.StageContainer.ID)
@@ -268,6 +349,7 @@ func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState,
 			return observation, err
 		}
 		observation.Stage404Proven = m.proveGatewayV2Stage404(ctx, state, observation.StageContainer.ID)
+		observation.StageHostPublicationProven = proveGatewayV2StageHostPublication(ctx, state, observation.StageContainer.ID, probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
 	}
 	if observation.FinalContainerFound && observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
 		observation.FinalConfig, err = m.inspectLiveCaddyConfig(ctx, observation.FinalContainer.ID)
@@ -279,7 +361,6 @@ func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState,
 			return observation, err
 		}
 		observation.Final404Proven = m.proveGatewayV2Final404(ctx, state, observation.FinalContainer.ID)
-		observation.FinalRoutesProven = m.proveGatewayV2FinalRoutes(ctx, state, observation.FinalContainer.ID)
 	}
 
 	if observation.FinalContainerFound {
@@ -298,33 +379,113 @@ func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState,
 			observation.ApplicationNetworkIDs[name] = id
 		}
 	}
+	var finalEndpointIdentityBefore string
+	if observation.FinalContainerFound && observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
+		finalEndpointIdentityBefore, err = m.inspectGatewayEndpointIdentitySnapshot(ctx, gatewayV2RouteRecords(state), observation.ApplicationNetworks)
+		if err != nil {
+			return observation, err
+		}
+		observation.FinalRoutesProven = m.proveGatewayV2FinalRoutes(ctx, state, observation.FinalContainer.ID)
+		observation.FinalHostPublicationProven = proveGatewayV2FinalHostPublication(ctx, state, observation.FinalContainer.ID, probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
+	}
+
+	v1ConfigStable := true
+	if observation.V1ContainerFound {
+		var confirmedLive []byte
+		if observation.V1Container.Running && !observation.V1Container.Restarting {
+			confirmedLive, err = m.inspectLiveCaddyConfig(ctx, observation.V1Container.ID)
+			if err != nil {
+				return observation, err
+			}
+		}
+		confirmedRestart, inspectErr := m.inspectStoppedCaddyRestartConfig(ctx, observation.V1Container.ID, gatewayV2ActiveConfigFile)
+		if inspectErr != nil {
+			return observation, inspectErr
+		}
+		v1ConfigStable = sameOptionalCaddyConfig(observation.V1Config, confirmedLive) && sameOptionalCaddyConfig(observation.V1RestartConfig, confirmedRestart)
+		clear(confirmedLive)
+		clear(confirmedRestart)
+	}
 	confirmedV1, confirmedV1Runtime, confirmedV1Found, confirmErr := m.inspectNamedGatewayContainer(ctx, caddyContainerName)
 	if confirmErr != nil {
 		return observation, confirmErr
 	}
-	observation.V1Stable = observation.V1ContainerFound == confirmedV1Found && (!confirmedV1Found ||
+	observation.V1Stable = v1ConfigStable && observation.V1ContainerFound == confirmedV1Found && (!confirmedV1Found ||
 		(reflect.DeepEqual(observation.V1Container, confirmedV1) && reflect.DeepEqual(observation.V1Runtime, confirmedV1Runtime)))
 	observation.V1ResourcesStable = m.confirmGatewayV1Resources(ctx, observation)
 	observation.V2ResourcesStable = m.confirmGatewayV2Resources(ctx, state, observation)
+	stageConfigStable := true
+	if observation.StageContainerFound && observation.StageContainer.Running && !observation.StageContainer.Restarting {
+		confirmedLive, configErr := m.inspectLiveCaddyConfig(ctx, observation.StageContainer.ID)
+		if configErr != nil {
+			return observation, configErr
+		}
+		confirmedRestart, configErr := m.inspectStoppedCaddyRestartConfig(ctx, observation.StageContainer.ID, state.Identity.StageConfigFilename)
+		if configErr != nil {
+			clear(confirmedLive)
+			return observation, configErr
+		}
+		stageConfigStable = sameCaddyConfig(observation.StageConfig, confirmedLive) && sameCaddyConfig(observation.StageRestartConfig, confirmedRestart)
+		clear(confirmedLive)
+		clear(confirmedRestart)
+	}
 	confirmedStage, confirmedStageRuntime, confirmedStageFound, inspectErr := m.inspectNamedGatewayContainer(ctx, state.Identity.StageContainer)
 	if inspectErr != nil {
 		return observation, inspectErr
 	}
-	observation.StageStable = observation.StageContainerFound == confirmedStageFound && (!confirmedStageFound ||
+	observation.StageStable = stageConfigStable && observation.StageContainerFound == confirmedStageFound && (!confirmedStageFound ||
 		(reflect.DeepEqual(observation.StageContainer, confirmedStage) && reflect.DeepEqual(observation.StageRuntime, confirmedStageRuntime)))
+	finalConfigStable := true
+	if observation.FinalContainerFound && observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
+		confirmedLive, configErr := m.inspectLiveCaddyConfig(ctx, observation.FinalContainer.ID)
+		if configErr != nil {
+			return observation, configErr
+		}
+		confirmedRestart, configErr := m.inspectStoppedCaddyRestartConfig(ctx, observation.FinalContainer.ID, state.Identity.ActiveConfigFilename)
+		if configErr != nil {
+			clear(confirmedLive)
+			return observation, configErr
+		}
+		finalConfigStable = sameCaddyConfig(observation.FinalConfig, confirmedLive) && sameCaddyConfig(observation.FinalRestartConfig, confirmedRestart)
+		clear(confirmedLive)
+		clear(confirmedRestart)
+	}
 	confirmedFinal, confirmedFinalRuntime, confirmedFinalFound, inspectErr := m.inspectNamedGatewayContainer(ctx, state.Identity.FinalContainer)
 	if inspectErr != nil {
 		return observation, inspectErr
 	}
-	observation.FinalStable = observation.FinalContainerFound == confirmedFinalFound && (!confirmedFinalFound ||
+	observation.FinalStable = finalConfigStable && observation.FinalContainerFound == confirmedFinalFound && (!confirmedFinalFound ||
 		(reflect.DeepEqual(observation.FinalContainer, confirmedFinal) && reflect.DeepEqual(observation.FinalRuntime, confirmedFinalRuntime)))
 	observation.OwnedInventoriesStable = m.confirmGatewayV2OwnedInventories(ctx, observation)
+	if requireV1EndpointIdentity {
+		confirmedV1ApplicationNetworks, confirmErr := m.reinspectGatewayApplicationNetworks(ctx, observation.V1ApplicationNetworks, observation.V1ApplicationNetworkIDs)
+		if confirmErr != nil {
+			return observation, confirmErr
+		}
+		v1EndpointIdentityAfter, inspectErr := m.inspectGatewayEndpointIdentitySnapshot(ctx, source.Active, confirmedV1ApplicationNetworks)
+		if inspectErr != nil {
+			return observation, inspectErr
+		}
+		observation.V1EndpointIdentityProven = v1EndpointIdentityBefore == v1EndpointIdentityAfter
+	}
+	if finalEndpointIdentityBefore != "" {
+		confirmedApplicationNetworks, inspectErr := m.reinspectGatewayApplicationNetworks(ctx, observation.ApplicationNetworks, observation.ApplicationNetworkIDs)
+		if inspectErr != nil {
+			return observation, inspectErr
+		}
+		finalEndpointIdentityAfter, inspectErr := m.inspectGatewayEndpointIdentitySnapshot(ctx, gatewayV2RouteRecords(state), confirmedApplicationNetworks)
+		if inspectErr != nil {
+			return observation, inspectErr
+		}
+		observation.FinalEndpointIdentityProven = finalEndpointIdentityBefore == finalEndpointIdentityAfter
+	}
 	return observation, nil
 }
 
 func classifyGatewayV2Topology(source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) gatewayObservedTopology {
+	requireV1RollbackTopology := journal.Phase != gatewayPhaseCommitted
 	if !validGatewayTopologyInputs(source, state, journal) || !validGatewayPinnedImage(observation.Image, observation.ImageFound) ||
-		!validGatewayV1Base(source, journal, observation) || !observation.StageStable || !observation.FinalStable || !observation.OwnedInventoriesStable {
+		!validGatewayV1Base(source, journal, observation, requireV1RollbackTopology) || !observation.StageStable || !observation.FinalStable || !observation.OwnedInventoriesStable {
 		return gatewayTopologyUnknownOrDrift
 	}
 
@@ -335,8 +496,9 @@ func classifyGatewayV2Topology(source routeState, state gatewayV2RouteState, jou
 
 	v1Serving := observation.V1Stable && observation.V1ResourcesStable && observation.V1EndpointIdentityProven &&
 		observation.V1Container.Running && !observation.V1Container.Restarting
-	v1StoppedRestartable := observation.V1Stable && observation.V1ResourcesStable && observation.V1EndpointIdentityProven &&
+	v1StoppedRestartable := observation.V1Stable && observation.V1ResourcesStable &&
 		!observation.V1Container.Running && !observation.V1Container.Restarting
+	v1RollbackReady := v1StoppedRestartable && observation.V1EndpointIdentityProven
 	stageAbsent := !observation.StageContainerFound
 	finalAbsent := !observation.FinalContainerFound
 
@@ -351,20 +513,87 @@ func classifyGatewayV2Topology(source routeState, state gatewayV2RouteState, jou
 		observation.StageHostPublicationProven && observation.StageStable {
 		return gatewayTopologyExactV1WithStage
 	}
-	if v1StoppedRestartable && observation.V2ResourcesStable && stageAbsent && validOwnedNameSet(observation.OwnedContainers, state.Identity.FinalContainer) &&
-		validContainerID(observation.IngressNetworkID) && validGatewayV2Volumes(state, journal, observation) &&
-		validGatewayV2Container(state, journal, observation.FinalContainer, observation.FinalRuntime, observation.FinalContainerFound, gatewayV2FinalContainerRole, observation.Image.ID) &&
-		validGatewayV2IngressNetwork(state, journal, observation.IngressNetwork, observation.IngressFound, observation.FinalContainer.ID, state.Identity.FinalContainer) &&
-		validGatewayV2ApplicationNetworks(state, observation.FinalContainer, observation.ApplicationNetworks, observation.ApplicationNetworkIDs) &&
-		validGatewayV2FinalConfig(state, observation.FinalConfig, observation.FinalRestartConfig) && observation.Final404Proven && observation.FinalRoutesProven &&
-		observation.FinalHostPublicationProven && observation.FinalEndpointIdentityProven && observation.FinalStable {
+	if validGatewayV2FinalTopology(state, journal, observation, v1StoppedRestartable, v1RollbackReady,
+		validGatewayV2FinalConfig(state, observation.FinalConfig, observation.FinalRestartConfig)) {
 		return gatewayTopologyExactFinalV2
 	}
 	return gatewayTopologyUnknownOrDrift
 }
 
+func classifyGatewayV2MixedRestart(source routeState, committed, proposed gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) bool {
+	if !validGatewayV2MixedRestartInputs(source, committed, proposed, journal) || !validGatewayPinnedImage(observation.Image, observation.ImageFound) ||
+		!validGatewayV1Base(source, journal, observation, false) || !observation.StageStable || !observation.FinalStable || !observation.OwnedInventoriesStable {
+		return false
+	}
+	v1StoppedRestartable := observation.V1Stable && observation.V1ResourcesStable &&
+		!observation.V1Container.Running && !observation.V1Container.Restarting
+	return validGatewayV2FinalTopology(proposed, journal, observation, v1StoppedRestartable, false,
+		validGatewayV2MixedFinalConfig(committed, proposed, observation.FinalConfig, observation.FinalRestartConfig))
+}
+
+func validGatewayV2FinalTopology(state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation,
+	v1StoppedRestartable, v1RollbackReady, configProven bool,
+) bool {
+	return v1StoppedRestartable && (journal.Phase == gatewayPhaseCommitted || v1RollbackReady) && observation.V2ResourcesStable &&
+		!observation.StageContainerFound && validOwnedNameSet(observation.OwnedContainers, state.Identity.FinalContainer) &&
+		validContainerID(observation.IngressNetworkID) && validGatewayV2Volumes(state, journal, observation) &&
+		validGatewayV2Container(state, journal, observation.FinalContainer, observation.FinalRuntime, observation.FinalContainerFound, gatewayV2FinalContainerRole, observation.Image.ID) &&
+		validGatewayV2IngressNetwork(state, journal, observation.IngressNetwork, observation.IngressFound, observation.FinalContainer.ID, state.Identity.FinalContainer) &&
+		validGatewayV2ApplicationNetworks(state, observation.FinalContainer, observation.ApplicationNetworks, observation.ApplicationNetworkIDs) &&
+		configProven && observation.Final404Proven && observation.FinalRoutesProven && observation.FinalHostPublicationProven &&
+		observation.FinalEndpointIdentityProven && observation.FinalStable
+}
+
+func validGatewayV2MixedRestartInputs(source routeState, committed, proposed gatewayV2RouteState, journal gatewayMigrationJournal) bool {
+	return journal.Phase == gatewayPhaseCommitted && validGatewayTopologyInputs(source, committed, journal) && validGatewayTopologyInputs(source, proposed, journal) &&
+		committed.OperationID == proposed.OperationID && committed.SourceV1StateDigest == proposed.SourceV1StateDigest &&
+		committed.Profile == proposed.Profile && committed.UpgradeAction == proposed.UpgradeAction && committed.Identity == proposed.Identity &&
+		committed.Network == proposed.Network && validGatewayV2MixedRouteTransition(committed, proposed)
+}
+
+func validGatewayV2MixedRouteTransition(committed, proposed gatewayV2RouteState) bool {
+	changedAppID := ""
+	for appID, committedApp := range committed.Apps {
+		proposedApp, exists := proposed.Apps[appID]
+		if exists && reflect.DeepEqual(committedApp, proposedApp) {
+			continue
+		}
+		if changedAppID != "" || !exists {
+			return false
+		}
+		changedAppID = appID
+	}
+	for appID := range proposed.Apps {
+		if _, exists := committed.Apps[appID]; exists {
+			continue
+		}
+		if changedAppID != "" {
+			return false
+		}
+		changedAppID = appID
+	}
+	if changedAppID == "" {
+		return false
+	}
+	proposedApp, exists := proposed.Apps[changedAppID]
+	if !exists {
+		return false
+	}
+	pendingState := cloneGatewayV2RouteState(committed)
+	var previous *gatewayV2AppRoute
+	if committedApp, exists := committed.Apps[changedAppID]; exists {
+		if committedApp.Route.Slot == proposedApp.Route.Slot {
+			return false
+		}
+		cloned := cloneGatewayV2AppRoute(committedApp)
+		previous = &cloned
+	}
+	pendingState.Pending = &gatewayV2PendingRoute{AppID: changedAppID, Previous: previous, Proposed: cloneGatewayV2AppRoute(proposedApp)}
+	return validGatewayV2RouteState(pendingState)
+}
+
 func validGatewayTopologyInputs(source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal) bool {
-	if !validRouteState(source) || source.Pending != nil || !validGatewayV2RouteState(state) || !validGatewayMigrationJournal(journal) {
+	if !validRouteState(source) || source.Pending != nil || !validGatewayV2RouteState(state) || state.Pending != nil || !validGatewayMigrationJournal(journal) {
 		return false
 	}
 	sourceDigest, err := canonicalDigest(source)
@@ -382,7 +611,7 @@ func validGatewayPinnedImage(value imageInspection, found bool) bool {
 	return found && value.OS == "linux" && validContainerID(value.ID) && containsDigest(value.RepoDigests, gatewayV2CaddyImageDigest)
 }
 
-func validGatewayV1Base(source routeState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) bool {
+func validGatewayV1Base(source routeState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation, requireRollbackTopology bool) bool {
 	if !observation.V1ContainerFound || !observation.V1VolumeFound || !observation.V1NetworkFound ||
 		!validGatewayContainerRuntime(observation.V1Runtime, true) ||
 		!reflect.DeepEqual(observation.V1Runtime.EffectivePortBindings, observation.V1Container.PortBindings) ||
@@ -403,6 +632,10 @@ func validGatewayV1Base(source routeState, journal gatewayMigrationJournal, obse
 		return false
 	}
 	owners, valid := gatewayRouteNetworkOwners(source.Active)
+	if !requireRollbackTopology {
+		identityDigest, err := gatewayV1ObservedIdentityDigest(observation)
+		return valid && err == nil && identityDigest == journal.Source.IdentityDigest
+	}
 	if !valid || len(observation.V1ApplicationNetworks) != len(owners) || len(observation.V1ApplicationNetworkIDs) != len(owners) ||
 		len(observation.V1Container.Networks) != len(owners)+1 {
 		return false
@@ -637,6 +870,206 @@ func gatewayRouteNetworkOwners(routes map[string]routeRecord) (map[string]string
 	return result, true
 }
 
+func gatewayV2RouteRecords(state gatewayV2RouteState) map[string]routeRecord {
+	routes := make(map[string]routeRecord, len(state.Apps))
+	for appID, app := range state.Apps {
+		routes[appID] = app.Route
+	}
+	return routes
+}
+
+func (m *Manager) inspectGatewayRouteEndpointProof(ctx context.Context, routes map[string]routeRecord) (string, error) {
+	owners, valid := gatewayRouteNetworkOwners(routes)
+	if m == nil || ctx == nil || !valid {
+		return "", errors.New("invalid generated ingress route endpoint proof input")
+	}
+	networks := make(map[string]caddyNetworkInspection, len(owners))
+	type networkIdentity struct {
+		Name string `json:"name"`
+		ID   string `json:"id"`
+	}
+	identities := make([]networkIdentity, 0, len(owners))
+	for name, appID := range owners {
+		network, id, found, err := m.inspectNamedGatewayNetwork(ctx, name)
+		if err != nil || !found || !validContainerID(id) || !validApplicationNetwork(network.identity(), appID) {
+			return "", errors.New("generated ingress route endpoint network is unavailable")
+		}
+		networks[name] = network
+		identities = append(identities, networkIdentity{Name: name, ID: normalizeID(id)})
+	}
+	sort.Slice(identities, func(left, right int) bool { return identities[left].Name < identities[right].Name })
+	endpointDigest, err := m.inspectGatewayEndpointIdentitySnapshot(ctx, routes, networks)
+	if err != nil {
+		return "", err
+	}
+	return canonicalDigest(struct {
+		Version         int               `json:"version"`
+		NetworkIdentity []networkIdentity `json:"networkIdentity"`
+		EndpointDigest  string            `json:"endpointDigest"`
+	}{Version: 1, NetworkIdentity: identities, EndpointDigest: endpointDigest})
+}
+
+func (m *Manager) proveGatewayRouteEndpointTransports(ctx context.Context, caddyID string, routes map[string]routeRecord) bool {
+	if m == nil || ctx == nil || !validContainerID(caddyID) {
+		return false
+	}
+	for _, route := range routes {
+		if validateRoute(route) != nil {
+			return false
+		}
+		for _, endpoint := range route.Endpoints {
+			if m.probeGatewayEndpoint(ctx, caddyID, endpoint) != nil {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// inspectGatewayEndpointIdentitySnapshot attests each endpoint by immutable
+// container ID and proves that every requested network alias has exactly one
+// owner across the complete Docker network membership. The returned digest is
+// suitable for a before/after comparison around transport and route probes.
+func (m *Manager) inspectGatewayEndpointIdentitySnapshot(ctx context.Context, routes map[string]routeRecord, networks map[string]caddyNetworkInspection) (string, error) {
+	owners, valid := gatewayRouteNetworkOwners(routes)
+	if m == nil || ctx == nil || !valid || len(networks) != len(owners) {
+		return "", errors.New("invalid generated ingress endpoint identity input")
+	}
+	type expectedAlias struct {
+		applicationID string
+		containerID   string
+		component     string
+		role          string
+		slot          string
+	}
+	expected := make(map[string]expectedAlias)
+	for appID, route := range routes {
+		for _, endpoint := range route.Endpoints {
+			key := endpoint.NetworkName + "\x00" + endpoint.NetworkAlias
+			want := expectedAlias{applicationID: appID, containerID: normalizeID(endpoint.ContainerID), component: endpoint.Component, role: endpoint.Role, slot: string(route.Slot)}
+			if previous, exists := expected[key]; exists && previous != want {
+				return "", errors.New("generated ingress endpoint alias ownership is ambiguous")
+			}
+			expected[key] = want
+		}
+	}
+
+	inspected := make(map[string]endpointInspection)
+	aliasOwners := make(map[string]string)
+	aliasRecords := make([]gatewayNetworkAliasRecord, 0)
+	networkNames := make([]string, 0, len(networks))
+	for name := range networks {
+		networkNames = append(networkNames, name)
+	}
+	sort.Strings(networkNames)
+	for _, networkName := range networkNames {
+		network, exists := networks[networkName]
+		if !exists || network.Name != networkName || owners[networkName] == "" {
+			return "", errors.New("generated ingress endpoint network identity is invalid")
+		}
+		seenMembers := make(map[string]struct{}, len(network.Containers))
+		memberIDs := make([]string, 0, len(network.Containers))
+		for id := range network.Containers {
+			if !validContainerID(id) {
+				return "", errors.New("generated ingress endpoint network member identity is invalid")
+			}
+			normalized := normalizeID(id)
+			if _, duplicate := seenMembers[normalized]; duplicate {
+				return "", errors.New("generated ingress endpoint network member identity is duplicated")
+			}
+			seenMembers[normalized] = struct{}{}
+			memberIDs = append(memberIDs, id)
+		}
+		sort.Slice(memberIDs, func(left, right int) bool { return normalizeID(memberIDs[left]) < normalizeID(memberIDs[right]) })
+		for _, memberID := range memberIDs {
+			normalized := normalizeID(memberID)
+			inspection, exists := inspected[normalized]
+			if !exists {
+				var err error
+				inspection, err = m.inspectGatewayEndpointIdentity(ctx, memberID)
+				if err != nil {
+					return "", err
+				}
+				inspected[normalized] = inspection
+			}
+			attachment := inspection.Networks[networkName]
+			member := network.Containers[memberID]
+			memberPrefix, memberErr := netip.ParsePrefix(member.IPv4Address)
+			if normalizeID(inspection.ID) != normalized || attachment == nil || attachment.IPAddress == "" || memberErr != nil ||
+				!memberPrefix.Addr().Is4() || memberPrefix.Addr().String() != attachment.IPAddress {
+				return "", errors.New("generated ingress endpoint network attachment is invalid")
+			}
+			aliases := append([]string(nil), attachment.Aliases...)
+			sort.Strings(aliases)
+			for index, alias := range aliases {
+				if !validName(alias, 96) || (index > 0 && aliases[index-1] == alias) {
+					return "", errors.New("generated ingress endpoint network aliases are invalid")
+				}
+				key := networkName + "\x00" + alias
+				if prior, duplicate := aliasOwners[key]; duplicate && prior != normalized {
+					aliasOwners[key] = ""
+				} else if !duplicate {
+					aliasOwners[key] = normalized
+				}
+			}
+			aliasRecords = append(aliasRecords, gatewayNetworkAliasRecord{NetworkName: networkName, ContainerID: normalized, IPAddress: attachment.IPAddress, Aliases: aliases})
+		}
+	}
+
+	endpointRecords := make([]gatewayEndpointIdentityRecord, 0, len(expected))
+	for key, want := range expected {
+		separator := strings.IndexByte(key, 0)
+		if separator <= 0 || separator == len(key)-1 || aliasOwners[key] != want.containerID {
+			return "", errors.New("generated ingress endpoint alias is not uniquely owned")
+		}
+		networkName, networkAlias := key[:separator], key[separator+1:]
+		inspection, exists := inspected[want.containerID]
+		if !exists || !inspection.Running || inspection.Health != "healthy" ||
+			inspection.Labels["io.rig.managed"] != "generated-runtime" || inspection.Labels["io.rig.application"] != want.applicationID ||
+			inspection.Labels["io.rig.component"] != want.component || inspection.Labels["io.rig.slot"] != want.slot || inspection.Labels["io.rig.role"] != want.role {
+			return "", errors.New("generated ingress endpoint identity is invalid")
+		}
+		attachment := inspection.Networks[networkName]
+		if attachment == nil {
+			return "", errors.New("generated ingress endpoint attachment is unavailable")
+		}
+		aliases := append([]string(nil), attachment.Aliases...)
+		sort.Strings(aliases)
+		endpointRecords = append(endpointRecords, gatewayEndpointIdentityRecord{
+			ApplicationID: want.applicationID, ContainerID: want.containerID, Component: want.component, Role: want.role, Slot: want.slot,
+			NetworkName: networkName, NetworkAlias: networkAlias, IPAddress: attachment.IPAddress, Aliases: aliases,
+		})
+	}
+	sort.Slice(endpointRecords, func(left, right int) bool {
+		leftKey := endpointRecords[left].ApplicationID + "\x00" + endpointRecords[left].NetworkName + "\x00" + endpointRecords[left].NetworkAlias
+		rightKey := endpointRecords[right].ApplicationID + "\x00" + endpointRecords[right].NetworkName + "\x00" + endpointRecords[right].NetworkAlias
+		return leftKey < rightKey
+	})
+	sort.Slice(aliasRecords, func(left, right int) bool {
+		leftKey := aliasRecords[left].NetworkName + "\x00" + aliasRecords[left].ContainerID
+		rightKey := aliasRecords[right].NetworkName + "\x00" + aliasRecords[right].ContainerID
+		return leftKey < rightKey
+	})
+	digest, err := canonicalDigest(struct {
+		Version   int                             `json:"version"`
+		Endpoints []gatewayEndpointIdentityRecord `json:"endpoints"`
+		Members   []gatewayNetworkAliasRecord     `json:"members"`
+	}{Version: 1, Endpoints: endpointRecords, Members: aliasRecords})
+	if err != nil {
+		return "", errors.New("generated ingress endpoint identity digest failed")
+	}
+	return digest, nil
+}
+
+func (m *Manager) inspectGatewayEndpointIdentity(ctx context.Context, containerID string) (endpointInspection, error) {
+	var value endpointInspection
+	found, err := m.inspectJSON(ctx, &value, "container", "inspect", "--format", endpointInspectFormat, containerID)
+	if err != nil || !found || !validContainerID(value.ID) || normalizeID(value.ID) != normalizeID(containerID) {
+		return endpointInspection{}, errors.New("generated ingress endpoint inspection failed")
+	}
+	return value, nil
+}
+
 func gatewayV2ExpectedContainerNetworks(state gatewayV2RouteState, role string) (map[string]struct{}, bool) {
 	result := map[string]struct{}{state.Identity.IngressNetwork: {}}
 	if role == gatewayV2StageContainerRole {
@@ -658,21 +1091,40 @@ func validGatewayV2StageConfig(state gatewayV2RouteState, live, restart []byte) 
 }
 
 func validGatewayV2FinalConfig(state gatewayV2RouteState, live, restart []byte) bool {
-	routes, assignments := gatewayV2ConfigInputs(state)
-	expected, err := buildCaddyConfigV2(routes, net.JoinHostPort(state.Network.ContainerIPv4, strconv.FormatUint(uint64(gatewayV2ContainerPort), 10)),
-		caddyV2Profile{SelectedIPv4: state.Profile.SelectedIPv4, PortStart: state.Profile.PortStart, PortEnd: state.Profile.PortEnd}, assignments)
+	expected, err := expectedGatewayV2FinalConfig(state)
 	return err == nil && sameCaddyConfig(expected, live) && sameCaddyConfig(expected, restart)
+}
+
+func validGatewayV2MixedFinalConfig(committed, proposed gatewayV2RouteState, live, restart []byte) bool {
+	committedExpected, committedErr := expectedGatewayV2FinalConfig(committed)
+	proposedExpected, proposedErr := expectedGatewayV2FinalConfig(proposed)
+	return committedErr == nil && proposedErr == nil && !sameCaddyConfig(committedExpected, proposedExpected) &&
+		sameCaddyConfig(proposedExpected, live) && sameCaddyConfig(committedExpected, restart)
+}
+
+func expectedGatewayV2FinalConfig(state gatewayV2RouteState) ([]byte, error) {
+	routes, assignments := gatewayV2ConfigInputs(state)
+	challenge, challengeErr := gatewayV2HostChallenge(state)
+	if challengeErr != nil {
+		return nil, challengeErr
+	}
+	return buildCaddyConfigV2(routes, net.JoinHostPort(state.Network.ContainerIPv4, strconv.FormatUint(uint64(gatewayV2ContainerPort), 10)),
+		caddyV2Profile{SelectedIPv4: state.Profile.SelectedIPv4, PortStart: state.Profile.PortStart, PortEnd: state.Profile.PortEnd, ProbeToken: challenge}, assignments)
 }
 
 func buildGatewayV2StageConfig(state gatewayV2RouteState) ([]byte, error) {
 	if !validGatewayV2RouteState(state) {
 		return nil, errors.New("invalid generated ingress v2 stage state")
 	}
+	challenge, err := gatewayV2HostChallenge(state)
+	if err != nil {
+		return nil, err
+	}
 	servers := make(map[string]caddyServer, int(state.Profile.PortEnd-state.Profile.PortStart)+1)
 	for port := state.Profile.PortStart; ; port++ {
 		servers["lan_"+strconv.FormatUint(uint64(port), 10)] = caddyServer{
 			Listen:         []string{net.JoinHostPort(state.Network.ContainerIPv4, strconv.FormatUint(uint64(port), 10))},
-			AutomaticHTTPS: caddyAutomaticHTTPS{Disable: true}, Routes: []caddyRoute{notFoundRoute()},
+			AutomaticHTTPS: caddyAutomaticHTTPS{Disable: true}, Routes: []caddyRoute{gatewayV2ProbeRoute(state.Profile.SelectedIPv4, gatewayV2PortChallenge(challenge, port)), notFoundRoute()},
 		}
 		if port == state.Profile.PortEnd {
 			break
@@ -693,12 +1145,35 @@ func gatewayV2ConfigInputs(state gatewayV2RouteState) (map[string]routeRecord, m
 	return routes, assignments
 }
 
+func gatewayV2HostChallenge(state gatewayV2RouteState) (string, error) {
+	planDigest, err := gatewayV2PlanDigest(state)
+	if err != nil || !validCanonicalUUID(state.OperationID) || !validSHA256(state.Identity.Digest) {
+		return "", errors.New("invalid generated ingress v2 host challenge input")
+	}
+	return canonicalDigest(struct {
+		Context        string `json:"context"`
+		OperationID    string `json:"operationId"`
+		IdentityDigest string `json:"identityDigest"`
+		PlanDigest     string `json:"planDigest"`
+	}{
+		Context: gatewayV2ChallengeContext, OperationID: state.OperationID,
+		IdentityDigest: state.Identity.Digest, PlanDigest: planDigest,
+	})
+}
+
 func sameCaddyConfig(expected, actual []byte) bool {
 	if len(expected) == 0 || len(actual) == 0 {
 		return false
 	}
 	var expectedJSON, actualJSON any
 	return json.Unmarshal(expected, &expectedJSON) == nil && json.Unmarshal(actual, &actualJSON) == nil && reflect.DeepEqual(expectedJSON, actualJSON)
+}
+
+func sameOptionalCaddyConfig(expected, actual []byte) bool {
+	if len(expected) == 0 || len(actual) == 0 {
+		return len(expected) == 0 && len(actual) == 0
+	}
+	return sameCaddyConfig(expected, actual)
 }
 
 func gatewayV2ResourceLabels(state gatewayV2RouteState, journal gatewayMigrationJournal, managed, role string, listener bool) map[string]string {
@@ -840,6 +1315,21 @@ func (m *Manager) confirmGatewayApplicationNetworks(ctx context.Context, inspect
 	return true
 }
 
+func (m *Manager) reinspectGatewayApplicationNetworks(ctx context.Context, inspections map[string]caddyNetworkInspection, ids map[string]string) (map[string]caddyNetworkInspection, error) {
+	if len(inspections) != len(ids) {
+		return nil, errors.New("generated ingress application network identity set changed")
+	}
+	confirmed := make(map[string]caddyNetworkInspection, len(inspections))
+	for name, expected := range inspections {
+		observed, id, found, err := m.inspectNamedGatewayNetwork(ctx, name)
+		if err != nil || !found || id != ids[name] || !reflect.DeepEqual(observed, expected) {
+			return nil, errors.New("generated ingress application network identity changed")
+		}
+		confirmed[name] = observed
+	}
+	return confirmed, nil
+}
+
 func (m *Manager) inspectGatewayV2OwnedNames(ctx context.Context, args ...string) ([]string, error) {
 	format := "{{.Name}}"
 	if len(args) > 0 && args[0] == "container" {
@@ -964,6 +1454,157 @@ func (m *Manager) proveGatewayV2FinalRoutes(ctx context.Context, state gatewayV2
 		}
 	}
 	return true
+}
+
+func proveGatewayV2StageHostPublication(ctx context.Context, state gatewayV2RouteState, caddyID string, probe gatewayV2HostStatusProbe, containerProbe gatewayV2ContainerChallengeProbe) bool {
+	challenge, err := gatewayV2HostChallenge(state)
+	if !validGatewayV2RouteState(state) || !validContainerID(caddyID) || err != nil || probe == nil || containerProbe == nil {
+		return false
+	}
+	for port := state.Profile.PortStart; ; port++ {
+		portChallenge := gatewayV2PortChallenge(challenge, port)
+		if !exactGatewayV2HostChallenge(ctx, probe, state.Profile.SelectedIPv4, port, state.Profile.SelectedIPv4, portChallenge) ||
+			!containerProbe(ctx, caddyID, state.Network.ContainerIPv4, port, state.Profile.SelectedIPv4, portChallenge) {
+			return false
+		}
+		if !exactGatewayV2HostStatus(ctx, probe, state.Profile.SelectedIPv4, port, state.Profile.SelectedIPv4, http.StatusNotFound) ||
+			!exactGatewayV2HostStatus(ctx, probe, state.Profile.SelectedIPv4, port, "wrong.invalid", http.StatusNotFound) ||
+			gatewayV2LoopbackPublished(ctx, probe, port, state.Profile.SelectedIPv4) {
+			return false
+		}
+		if port == state.Profile.PortEnd {
+			return true
+		}
+	}
+}
+
+func proveGatewayV2FinalHostPublication(ctx context.Context, state gatewayV2RouteState, caddyID string, probe gatewayV2HostStatusProbe, containerProbe gatewayV2ContainerChallengeProbe) bool {
+	challenge, err := gatewayV2HostChallenge(state)
+	if !validGatewayV2RouteState(state) || !validContainerID(caddyID) || err != nil || probe == nil || containerProbe == nil {
+		return false
+	}
+	_, assignments := gatewayV2ConfigInputs(state)
+	for port := state.Profile.PortStart; ; port++ {
+		portChallenge := gatewayV2PortChallenge(challenge, port)
+		if !exactGatewayV2HostChallenge(ctx, probe, state.Profile.SelectedIPv4, port, state.Profile.SelectedIPv4, portChallenge) ||
+			!containerProbe(ctx, caddyID, state.Network.ContainerIPv4, port, state.Profile.SelectedIPv4, portChallenge) {
+			return false
+		}
+		if !exactGatewayV2HostStatus(ctx, probe, state.Profile.SelectedIPv4, port, "wrong.invalid", http.StatusNotFound) ||
+			gatewayV2LoopbackPublished(ctx, probe, port, state.Profile.SelectedIPv4) {
+			return false
+		}
+		result := probe(ctx, state.Profile.SelectedIPv4, port, state.Profile.SelectedIPv4, "/")
+		if ctx.Err() != nil || !result.Connected || !result.Responded {
+			return false
+		}
+		if _, assigned := assignments[port]; assigned {
+			if result.Status < 200 || result.Status > 599 {
+				return false
+			}
+		} else if result.Status != http.StatusNotFound {
+			return false
+		}
+		if port == state.Profile.PortEnd {
+			return true
+		}
+	}
+}
+
+func exactGatewayV2HostStatus(ctx context.Context, probe gatewayV2HostStatusProbe, address string, port uint16, host string, expected int) bool {
+	result := probe(ctx, address, port, host, "/")
+	return ctx.Err() == nil && result.Connected && result.Responded && result.Status == expected
+}
+
+func exactGatewayV2HostChallenge(ctx context.Context, probe gatewayV2HostStatusProbe, address string, port uint16, host, challenge string) bool {
+	if !validSHA256(challenge) {
+		return false
+	}
+	result := probe(ctx, address, port, host, gatewayV2ChallengePathPrefix+challenge)
+	return ctx.Err() == nil && result.Connected && result.Responded && result.Status == http.StatusNotFound &&
+		result.Body == gatewayV2ChallengeBodyPrefix+challenge
+}
+
+func gatewayV2LoopbackPublished(ctx context.Context, probe gatewayV2HostStatusProbe, port uint16, host string) bool {
+	result := probe(ctx, "127.0.0.1", port, host, "/")
+	return ctx.Err() != nil || result.Connected
+}
+
+func (m *Manager) probeGatewayV2ContainerChallenge(ctx context.Context, caddyID, address string, port uint16, host, challenge string) bool {
+	parsed, err := netip.ParseAddr(address)
+	hostAddress, hostErr := netip.ParseAddr(host)
+	if m == nil || ctx == nil || !validContainerID(caddyID) || err != nil || !parsed.Is4() || hostErr != nil || !hostAddress.Is4() || !hostAddress.IsPrivate() ||
+		hostAddress.String() != host || port == 0 || !validSHA256(challenge) {
+		return false
+	}
+	result, runErr := m.run(ctx, gatewayProbeProcessTimeout, "container", "exec", caddyID,
+		"curl", "--disable", "--silent", "--show-error", "--output", "-", "--write-out", "\n%{http_code}",
+		"--http1.1", "--proto", "=http", "--noproxy", "*", "--connect-timeout", "1", "--max-time", "2",
+		"--header", "Host: "+host,
+		"http://"+net.JoinHostPort(parsed.String(), strconv.FormatUint(uint64(port), 10))+gatewayV2ChallengePathPrefix+challenge)
+	defer clearResult(&result)
+	want := gatewayV2ChallengeBodyPrefix + challenge + "\n404"
+	return runErr == nil && string(result.Stdout) == want
+}
+
+// probeGatewayV2HostStatus originates the request on the host. This is
+// intentionally distinct from the in-container Caddy probes: Docker Desktop
+// can report a desired port binding without establishing the expected host
+// listener. Proxy environment variables and redirects are disabled so the
+// result describes only the selected local address.
+func probeGatewayV2HostStatus(ctx context.Context, address string, port uint16, host, path string) gatewayV2HostProbeResult {
+	parsed, err := netip.ParseAddr(address)
+	challengePath := strings.HasPrefix(path, gatewayV2ChallengePathPrefix) && validSHA256(strings.TrimPrefix(path, gatewayV2ChallengePathPrefix))
+	if ctx == nil || err != nil || !parsed.Is4() || port == 0 || (!validName(host, 253) && host != parsed.String()) || (path != "/" && !challengePath) {
+		return gatewayV2HostProbeResult{}
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	var connected atomic.Bool
+	dialer := &net.Dialer{Timeout: time.Second}
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DisableCompression:    true,
+		DisableKeepAlives:     true,
+		ResponseHeaderTimeout: 2 * time.Second,
+		DialContext: func(dialContext context.Context, network, target string) (net.Conn, error) {
+			connection, dialErr := dialer.DialContext(dialContext, network, target)
+			if dialErr == nil {
+				connected.Store(true)
+			}
+			return connection, dialErr
+		},
+	}
+	defer transport.CloseIdleConnections()
+	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet,
+		"http://"+net.JoinHostPort(parsed.String(), strconv.FormatUint(uint64(port), 10))+path, nil)
+	if err != nil {
+		return gatewayV2HostProbeResult{}
+	}
+	request.Host = host
+	request.Header.Set("Connection", "close")
+	client := &http.Client{
+		Transport:     transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return gatewayV2HostProbeResult{Connected: connected.Load()}
+	}
+	status := response.StatusCode
+	body := ""
+	if challengePath {
+		bodyBytes, readErr := io.ReadAll(io.LimitReader(response.Body, 256))
+		if readErr != nil || len(bodyBytes) >= 256 {
+			_ = response.Body.Close()
+			clear(bodyBytes)
+			return gatewayV2HostProbeResult{Status: status, Connected: connected.Load()}
+		}
+		body = string(bodyBytes)
+		clear(bodyBytes)
+	}
+	_ = response.Body.Close()
+	return gatewayV2HostProbeResult{Status: status, Body: body, Connected: connected.Load(), Responded: status >= 100 && status <= 599}
 }
 
 func (m *Manager) probeGatewayV2AnyStatus(ctx context.Context, container, address string, port uint16, host string) bool {

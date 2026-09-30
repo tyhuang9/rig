@@ -105,6 +105,15 @@ type gatewayV2AppRoute struct {
 	LAN   *gatewayV2LANBinding `json:"lan,omitempty"`
 }
 
+// gatewayV2PendingRoute is the durable write-ahead record for a committed-v2
+// route reload. Apps always remains the last committed route set while this
+// record is present, so restart recovery has an unambiguous rollback target.
+type gatewayV2PendingRoute struct {
+	AppID    string             `json:"appId"`
+	Previous *gatewayV2AppRoute `json:"previous,omitempty"`
+	Proposed gatewayV2AppRoute  `json:"proposed"`
+}
+
 type gatewayV2RouteState struct {
 	Version             int                          `json:"version"`
 	OperationID         string                       `json:"operationId"`
@@ -114,6 +123,7 @@ type gatewayV2RouteState struct {
 	Identity            gatewayV2Identity            `json:"identity"`
 	Network             gatewayV2NetworkPlan         `json:"network"`
 	Apps                map[string]gatewayV2AppRoute `json:"apps"`
+	Pending             *gatewayV2PendingRoute       `json:"pending,omitempty"`
 }
 
 type gatewayMigrationPhase string
@@ -395,39 +405,69 @@ func validGatewayV2RouteState(state gatewayV2RouteState) bool {
 	allocations := make(map[string]struct{})
 	revisions := make(map[string]struct{})
 	for appID, app := range state.Apps {
-		if !validAppID(appID) || validateRoute(app.Route) != nil {
+		if !validAppID(appID) || !validGatewayV2AppRoute(appID, state.Profile, app, ports, allocations, revisions) {
 			return false
 		}
-		if app.LAN == nil {
-			continue
-		}
-		binding := app.LAN
-		if !validCanonicalUUID(binding.AccessRevisionID) || binding.AccessRevisionNumber <= 0 || !validSHA256(binding.AccessSpecDigest) ||
-			!validCanonicalUUID(binding.AllocationID) || binding.Port < state.Profile.PortStart || binding.Port > state.Profile.PortEnd ||
-			binding.ProfileRevisionID != state.Profile.RevisionID || binding.ProfileRevisionNumber != state.Profile.RevisionNumber || binding.ProfileSpecDigest != state.Profile.SpecDigest {
-			return false
-		}
-		accessDigest, err := appaccess.AppAccessSpecDigest(appaccess.AppAccessSpec{
-			AppID: appID, AllocationID: binding.AllocationID, Port: binding.Port,
-			GatewayProfileRevisionID: binding.ProfileRevisionID, GatewayProfileRevisionNumber: binding.ProfileRevisionNumber,
-		})
-		if err != nil || accessDigest != binding.AccessSpecDigest {
-			return false
-		}
-		if _, duplicate := ports[binding.Port]; duplicate {
-			return false
-		}
-		if _, duplicate := allocations[binding.AllocationID]; duplicate {
-			return false
-		}
-		if _, duplicate := revisions[binding.AccessRevisionID]; duplicate {
-			return false
-		}
-		ports[binding.Port] = appID
-		allocations[binding.AllocationID] = struct{}{}
-		revisions[binding.AccessRevisionID] = struct{}{}
 	}
+	return validGatewayV2PendingRoute(state)
+}
+
+func validGatewayV2AppRoute(appID string, profile gatewayProfileBinding, app gatewayV2AppRoute, ports map[uint16]string, allocations, revisions map[string]struct{}) bool {
+	if validateRoute(app.Route) != nil {
+		return false
+	}
+	if app.LAN == nil {
+		return true
+	}
+	binding := app.LAN
+	if !validCanonicalUUID(binding.AccessRevisionID) || binding.AccessRevisionNumber <= 0 || !validSHA256(binding.AccessSpecDigest) ||
+		!validCanonicalUUID(binding.AllocationID) || binding.Port < profile.PortStart || binding.Port > profile.PortEnd ||
+		binding.ProfileRevisionID != profile.RevisionID || binding.ProfileRevisionNumber != profile.RevisionNumber || binding.ProfileSpecDigest != profile.SpecDigest {
+		return false
+	}
+	accessDigest, err := appaccess.AppAccessSpecDigest(appaccess.AppAccessSpec{
+		AppID: appID, AllocationID: binding.AllocationID, Port: binding.Port,
+		GatewayProfileRevisionID: binding.ProfileRevisionID, GatewayProfileRevisionNumber: binding.ProfileRevisionNumber,
+	})
+	if err != nil || accessDigest != binding.AccessSpecDigest {
+		return false
+	}
+	if _, duplicate := ports[binding.Port]; duplicate {
+		return false
+	}
+	if _, duplicate := allocations[binding.AllocationID]; duplicate {
+		return false
+	}
+	if _, duplicate := revisions[binding.AccessRevisionID]; duplicate {
+		return false
+	}
+	ports[binding.Port] = appID
+	allocations[binding.AllocationID] = struct{}{}
+	revisions[binding.AccessRevisionID] = struct{}{}
 	return true
+}
+
+func validGatewayV2PendingRoute(state gatewayV2RouteState) bool {
+	if state.Pending == nil {
+		return true
+	}
+	pending := state.Pending
+	if !validAppID(pending.AppID) || validateRoute(pending.Proposed.Route) != nil {
+		return false
+	}
+	committed, exists := state.Apps[pending.AppID]
+	if exists != (pending.Previous != nil) {
+		return false
+	}
+	if pending.Previous != nil && !reflect.DeepEqual(committed, *pending.Previous) {
+		return false
+	}
+	// Route switches may not grant, move, or revoke LAN access. That belongs to
+	// the separately approved app-access transaction.
+	if pending.Previous == nil {
+		return pending.Proposed.LAN == nil
+	}
+	return pending.Previous.Route.Slot != pending.Proposed.Route.Slot && reflect.DeepEqual(pending.Previous.LAN, pending.Proposed.LAN)
 }
 
 func validGatewayMigrationJournal(journal gatewayMigrationJournal) bool {
@@ -664,6 +704,48 @@ func (s *gatewayUpgradeStateStore) transitionMigrationJournal(operationID string
 	return installed, nil
 }
 
+func (s *gatewayUpgradeStateStore) saveCommittedV2State(state gatewayV2RouteState, journal gatewayMigrationJournal) error {
+	if journal.Phase != gatewayPhaseCommitted || !validGatewayV2RouteState(state) || !journalMatchesV2Plan(journal, state) {
+		return errors.New("invalid committed generated ingress v2 state")
+	}
+	current, currentJournal, err := s.loadBoundUpgrade(journal.OperationID)
+	if err != nil || currentJournal.Phase != gatewayPhaseCommitted || current.OperationID != state.OperationID {
+		return errors.New("generated ingress v2 state is not committed")
+	}
+	if !validCommittedV2StateTransition(current, state) {
+		return errors.New("invalid committed generated ingress v2 state transition")
+	}
+	if err := s.writeExact(s.v2Path, v2RouteStatePurpose, state, false, maxV2RouteStateBytes); err != nil {
+		return err
+	}
+	installed, installedJournal, err := s.loadBoundUpgrade(journal.OperationID)
+	if err != nil || installedJournal.Phase != gatewayPhaseCommitted || !reflect.DeepEqual(installed, state) {
+		return errors.New("committed generated ingress v2 state was not installed")
+	}
+	return nil
+}
+
+func validCommittedV2StateTransition(current, next gatewayV2RouteState) bool {
+	if reflect.DeepEqual(current, next) {
+		return true
+	}
+	if current.Pending == nil && next.Pending != nil {
+		current.Pending = next.Pending
+		return reflect.DeepEqual(current, next)
+	}
+	if current.Pending == nil || next.Pending != nil {
+		return false
+	}
+	rolledBack := cloneGatewayV2RouteState(current)
+	rolledBack.Pending = nil
+	if reflect.DeepEqual(rolledBack, next) {
+		return true
+	}
+	committed := cloneGatewayV2RouteState(rolledBack)
+	committed.Apps[current.Pending.AppID] = cloneGatewayV2AppRoute(current.Pending.Proposed)
+	return reflect.DeepEqual(committed, next)
+}
+
 func journalMatchesInitialV2State(journal gatewayMigrationJournal, state gatewayV2RouteState) bool {
 	stateDigest, stateErr := canonicalDigest(state)
 	return stateErr == nil && journal.Target.StateDigest == stateDigest && journalMatchesV2Plan(journal, state)
@@ -745,7 +827,25 @@ func cloneGatewayV2RouteState(state gatewayV2RouteState) gatewayV2RouteState {
 		}
 		result.Apps[appID] = app
 	}
+	if state.Pending != nil {
+		pending := *state.Pending
+		pending.Proposed = cloneGatewayV2AppRoute(pending.Proposed)
+		if pending.Previous != nil {
+			previous := cloneGatewayV2AppRoute(*pending.Previous)
+			pending.Previous = &previous
+		}
+		result.Pending = &pending
+	}
 	return result
+}
+
+func cloneGatewayV2AppRoute(app gatewayV2AppRoute) gatewayV2AppRoute {
+	app.Route.Endpoints = append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...)
+	if app.LAN != nil {
+		binding := *app.LAN
+		app.LAN = &binding
+	}
+	return app
 }
 
 func canonicalDigest(value any) (string, error) {
