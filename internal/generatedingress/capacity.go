@@ -31,6 +31,9 @@ func (m *Manager) Snapshot(ctx context.Context) (snapshot generatedruntime.Capac
 			snapshot = generatedruntime.CapacitySnapshot{}
 		}
 	}()
+	if err := m.fenceLegacyV1Locked(); err != nil {
+		return generatedruntime.CapacitySnapshot{}, err
+	}
 	inspection, found, err := m.inspectCaddy(ctx)
 	if err != nil || !found || !inspection.Running || inspection.Labels["io.rig.managed"] != "generated-ingress" || inspection.Labels["io.rig.identity-version"] != "v1" {
 		return generatedruntime.CapacitySnapshot{}, errors.New("generated ingress capacity probe is unavailable")

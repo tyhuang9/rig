@@ -151,6 +151,9 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 		return err
 	}
 	defer releaseGatewaySwitchLock(release, &resultErr)
+	if err := m.fenceLegacyV1Locked(); err != nil {
+		return markCandidateMayBeLive(err)
+	}
 
 	state, err := m.store.load()
 	if err != nil {
@@ -251,6 +254,9 @@ func (m *Manager) Provision(ctx context.Context) (resultErr error) {
 		return err
 	}
 	defer releaseGatewayLock(release, &resultErr)
+	if err := m.fenceLegacyV1Locked(); err != nil {
+		return err
+	}
 	state, err := m.store.load()
 	if err != nil {
 		return &Error{Code: DiagnosticRouteStateFailed}
@@ -1366,6 +1372,9 @@ func (m *Manager) WithObservation(ctx context.Context, appID string, fn func(con
 }
 
 func (m *Manager) observeLocked(ctx context.Context, appID string) (Observation, error) {
+	if err := m.fenceLegacyV1Locked(); err != nil {
+		return Observation{}, err
+	}
 	state, err := m.store.load()
 	if err != nil {
 		return Observation{}, &Error{Code: DiagnosticRouteStateFailed}

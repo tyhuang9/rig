@@ -74,6 +74,14 @@ proved. Stage/final also require host-side publication and reachability.
 No Manager or controller path calls this observer yet, so it cannot upgrade
 the gateway or expose a LAN URL.
 
+The v1 compatibility fence now checks for either protected v2 state or
+migration-journal marker while holding the gateway lock. A marker blocks
+legacy route switching, provisioning/recovery, observation, and capacity
+reads before v1 state or Docker access. It preserves the route candidate when
+Switch is blocked. The fence treats orphaned, malformed, rolled-back, and
+committed markers alike; this interim binary cannot operate a v2 data root
+until version-aware recovery and route dispatch replace the fence.
+
 ## Executed verification
 
 | Check | Result |
@@ -99,6 +107,8 @@ the gateway or expose a LAN URL.
 | `go test -count=1 ./...` and `go vet ./...` with normal Windows permissions after both read-only slices | Passed. |
 | `go test -count=1 ./internal/generatedingress` and `go vet ./internal/generatedingress` after observer review fixes | Passed. |
 | `go test -count=1 ./...` and `go vet ./...` after the observer corrective pass | Passed with normal Windows permissions. |
+| `go test ./internal/generatedingress -run 'TestLegacyV1Fence' -count=5` | Passed for the v1 compatibility fence, including lock contention. |
+| `go test -count=1 ./...` and `go vet ./...` after the v1 compatibility fence | Passed with normal Windows permissions. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -146,6 +156,10 @@ unwired journal methods alone do not enforce that boundary. Every active LAN
 binding must also be compared with its approved SQLite row. A fresh upgrade after a
 `rolled_back` journal needs a history-preserving retry generation or explicit
 operator recovery; fixed create-only paths currently refuse another operation.
+The first live v2 marker writer must hold the same lock as the v1 compatibility
+fence. The lock and state paths must remain bound to one protected directory
+identity through the operation; a same-user parent-directory substitution is
+still a conditional filesystem threat.
 An older running hostd binary does not honor `gateway.lock`; migration must
 prove it is stopped before relying on the lock. On Linux, a malicious process
 with the same user identity can replace the lock path while a handle is held;
