@@ -851,3 +851,61 @@ live/restart-config observer. Hosted process-crash and multi-port timing,
 controller startup dispatch, per-item terminal resolution and batch clearing,
 operator UI, and physical second-device/database acceptance remain open. No
 LAN exposure is enabled by these commits, and no M3 acceptance claim is made.
+
+## Sequential recovery startup and head finalization: local evidence
+
+The next local checkpoints add read-only startup recognition of an installed
+protected batch (`c3aee61`) and strict one-head-at-a-time state transitions
+(`cd98b88`). Commits `102a8ae`, `f524686`, and `a8124e8` wire exact
+per-head finalization, hostd's pre-listener quarantine, and recovery-only
+controller actions. Ingress owns the
+gateway lock while it proves every batch port returns 404, resolves the
+pinned database claim, clears only its protected binding, advances one head,
+and rechecks the whole gateway. A completed batch retires only after a fresh
+terminal SQLite census and gateway proof. The controller stays pinned to its
+original head until a restart; it does not serve the next operation in the
+same process.
+
+Review found a reachable migration-028/029 history with a prepared grant and
+prepared disable for the same app, allocation, and port. The exact immutable
+lineage now admits only that paired shape: it rolls back the grant before
+committing the disable and deduplicates the shared 404 port. Unrelated
+same-app or same-port collisions, a committed stale grant in a rollback-only
+batch, forged lineage, and an out-of-order disable still fail closed. Tests
+cover both a previously live protected grant and the migration fixture's
+unapplied shape with no protected or live LAN binding. Commit `22438fd` adds
+mirrored migration 032 without changing earlier migrations. Its narrow
+rollback exception retains an active allocation for the exact paired grant
+until the disable commit makes the sole terminal release. A real SQLite test
+migrates the active prepared pair from 028 through 032, rolls the grant back,
+commits the disable, and reads startup snapshots before and after the separate
+protected-clear acknowledgment. It also rejects forged lineage and an
+unproved release. No single test has yet driven that migrated snapshot through
+the gateway quarantine and controller endpoints together.
+
+Commit `eb357c7` replaces quadratic terminal per-port topology reattestation
+with one bulk all-port proof after retirement. The prior bulk proof already
+checks exact effective topology, every immutable batch port's 404 response,
+and retained grants before retirement. A counting-driver regression confirms
+one bulk all-port call per terminal phase and rejects a missing 404 proof.
+
+| Local check for the combined recovery branch | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions and a task-local `GOCACHE` | Passed across all Go packages after migration 032 and the snapshot repair. The later bulk-proof change passed the full generated-ingress package separately. |
+| `go test -count=1 -p 1 ./internal/generatedingress` after `eb357c7` | Passed in 73.750 seconds, including terminal bulk-proof regression. |
+| `go vet ./...` and `go run ./cmd/openapi-gen -check` after `eb357c7` | Passed. |
+| Focused legacy-pair, migrated SQLite, batch, startup, controller, and protected-state tests | Passed for exact admission/order, 404 quarantine, processed-head replay, terminal callback crash, active pair rollback and release, restart before/after clear acknowledgment, stale or forged identities, unrelated committed-route preservation, and final retirement. |
+| Mirrored migration 032 SHA-256 | Both copies match `465D18C8FAFCF96FC03CC4D9CBC3B686E4C0AA11F3E0164C79840A66916850F6`. |
+| `git diff --check` | Passed with only LF/CRLF conversion notices. |
+
+These are local contract and simulator results. Live Docker timing, a real
+process-crash restart, second-device 404/reachability, and the browser-to-
+application-owned external database journey remain unverified M3 acceptance
+gates. A batch holds at most 64 items across the 20-port LAN pool. Five
+whole-batch proofs still share one three-minute disable-finalization context;
+a slow healthy host could time out after a database commit and require replay.
+The bulk change removes the terminal quadratic path, but live 20-port timing
+must be measured before claiming production readiness. The separate operator
+UI branch at `504e7e8` has no durable reservation/grant identity after refresh
+and no safe disable review API yet.
+This recovery branch has not been published, merged, or deployed.
