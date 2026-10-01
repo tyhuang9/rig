@@ -24,10 +24,26 @@ type gatewayStartup struct {
 	inspection       generatedingress.GatewayV2StartupInspection
 	grantInspection  generatedingress.GatewayV2LANStartupInspection
 	accessInspection generatedingress.GatewayV2LANAccessStartupInspection
+	recoveryBatch    bool
 	recoveryKind     string
 	recoveryID       string
 	recoveryAppID    string
 }
+
+type gatewayStartupBatchIngress interface {
+	HasGatewayV2LANRecoveryBatch(context.Context) (bool, error)
+	QuarantineGatewayV2LANAccessRecoveryBatch(context.Context, []generatedingress.GatewayV2LANStartupClaim,
+		[]generatedingress.GatewayV2LANDisableStartupClaim) error
+	ObserveGatewayV2LANRecoveryHead(context.Context, []generatedingress.GatewayV2LANStartupClaim,
+		[]generatedingress.GatewayV2LANDisableStartupClaim) (generatedingress.GatewayV2LANRecoveryHead, bool, error)
+	RetireGatewayV2LANRecoveryBatch(context.Context, []generatedingress.GatewayV2LANStartupClaim,
+		[]generatedingress.GatewayV2LANDisableStartupClaim) error
+	InspectGatewayV2Startup(context.Context, []generatedingress.GatewayV2StartupClaim) (generatedingress.GatewayV2StartupInspection, error)
+	InspectGatewayV2LANAccessStartup(context.Context, []generatedingress.GatewayV2LANStartupClaim,
+		[]generatedingress.GatewayV2LANDisableStartupClaim) (generatedingress.GatewayV2LANAccessStartupInspection, error)
+}
+
+type gatewayStartupSnapshotReader func(context.Context) (appaccess.HostingGatewayStartupSnapshot, error)
 
 func inspectGatewayStartup(ctx context.Context, cfg config.Config, db *sql.DB,
 	dockerExecutable string, directories docker.ControllerDirectories,
@@ -78,6 +94,14 @@ func inspectGatewayStartup(ctx context.Context, cfg config.Config, db *sql.DB,
 		inspection.Disposition != generatedingress.GatewayV2StartupRecoveryOnly {
 		return gatewayStartup{}, errors.New("unknown gateway startup disposition")
 	}
+	batchPresent, err := ingress.HasGatewayV2LANRecoveryBatch(ctx)
+	if err != nil {
+		return gatewayStartup{}, fmt.Errorf("inspect protected LAN recovery batch: %w", err)
+	}
+	if batchPresent {
+		result.recoveryBatch = true
+		return result, nil
+	}
 	snapshot, err = attestHistoricalLANDisableSuccessors(ctx, repository, ingress, snapshot)
 	if err != nil {
 		return gatewayStartup{}, fmt.Errorf("attest historical LAN disable successor: %w", err)
@@ -89,7 +113,8 @@ func inspectGatewayStartup(ctx context.Context, cfg config.Config, db *sql.DB,
 		return gatewayStartup{}, fmt.Errorf("inspect LAN access startup: %w", err)
 	}
 	result.accessInspection = accessInspection
-	result.recoveryKind, result.recoveryID, result.recoveryAppID, err = selectLANAccessStartupRecovery(snapshot, inspection, accessInspection)
+	result.recoveryKind, result.recoveryID, result.recoveryAppID, result.recoveryBatch, err =
+		selectLANAccessStartupRecovery(snapshot, inspection, accessInspection)
 	if err != nil {
 		return gatewayStartup{}, err
 	}
@@ -129,8 +154,17 @@ func stopOwnedGatewayOnStartupFailure(ctx context.Context, cfg config.Config, do
 // repeats both cross-store inspections against the same immutable census.
 // A failed withdrawal or changed snapshot prevents controller startup.
 func quarantineLANRecoveryStartup(ctx context.Context, db *sql.DB, gate gatewayStartup) (gatewayStartup, error) {
-	if ctx == nil || db == nil || gate.ingress == nil ||
-		(gate.recoveryKind != controller.RecoveryLANGrant && gate.recoveryKind != controller.RecoveryLANDisable) ||
+	if ctx == nil || db == nil || gate.ingress == nil {
+		return gatewayStartup{}, errors.New("invalid LAN access recovery startup")
+	}
+	if gate.recoveryBatch {
+		if gate.recoveryKind != "" || gate.recoveryID != "" || gate.recoveryAppID != "" {
+			return gatewayStartup{}, errors.New("invalid LAN recovery batch startup")
+		}
+		return quarantineLANRecoveryBatchStartup(ctx, gate, gate.ingress,
+			appaccess.New(db).HostingGatewayStartupSnapshot)
+	}
+	if (gate.recoveryKind != controller.RecoveryLANGrant && gate.recoveryKind != controller.RecoveryLANDisable) ||
 		gate.recoveryID == "" || gate.recoveryAppID == "" {
 		return gatewayStartup{}, errors.New("invalid LAN access recovery startup")
 	}
@@ -154,11 +188,12 @@ func quarantineLANRecoveryStartup(ctx context.Context, db *sql.DB, gate gatewayS
 	if err != nil {
 		return gatewayStartup{}, fmt.Errorf("reinspect LAN access after quarantine: %w", err)
 	}
-	kind, operationID, appID, err := selectLANAccessStartupRecovery(confirmedSnapshot, upgradeInspection, accessInspection)
+	kind, operationID, appID, recoveryBatch, err := selectLANAccessStartupRecovery(
+		confirmedSnapshot, upgradeInspection, accessInspection)
 	if err != nil {
 		return gatewayStartup{}, fmt.Errorf("LAN grant quarantine changed pinned recovery identity: %w", err)
 	}
-	if kind != gate.recoveryKind || operationID != gate.recoveryID || appID != gate.recoveryAppID {
+	if recoveryBatch || kind != gate.recoveryKind || operationID != gate.recoveryID || appID != gate.recoveryAppID {
 		return gatewayStartup{}, errors.New("LAN grant quarantine changed pinned recovery identity")
 	}
 	gate.inspection = upgradeInspection
@@ -166,43 +201,202 @@ func quarantineLANRecoveryStartup(ctx context.Context, db *sql.DB, gate gatewayS
 	return gate, nil
 }
 
+// quarantineLANRecoveryBatchStartup installs or resumes the immutable batch,
+// then pins only the protected head. A completed batch is retired only after
+// the ingress implementation has repeated its terminal and cross-store proof.
+func quarantineLANRecoveryBatchStartup(ctx context.Context, gate gatewayStartup,
+	ingress gatewayStartupBatchIngress, readSnapshot gatewayStartupSnapshotReader,
+) (gatewayStartup, error) {
+	if ctx == nil || ingress == nil || readSnapshot == nil || !gate.recoveryBatch ||
+		gate.recoveryKind != "" || gate.recoveryID != "" || gate.recoveryAppID != "" {
+		return gatewayStartup{}, errors.New("invalid LAN recovery batch startup")
+	}
+	grants := lanGrantStartupClaims(gate.snapshot.Grants)
+	disables := lanDisableStartupClaims(gate.snapshot.Disables)
+	if err := ingress.QuarantineGatewayV2LANAccessRecoveryBatch(ctx, grants, disables); err != nil {
+		return gatewayStartup{}, fmt.Errorf("quarantine LAN recovery batch before recovery listener: %w", err)
+	}
+	confirmedSnapshot, err := readSnapshot(ctx)
+	if err != nil {
+		return gatewayStartup{}, fmt.Errorf("LAN recovery batch startup claim snapshot changed during quarantine: %w", err)
+	}
+	if !reflect.DeepEqual(confirmedSnapshot, gate.snapshot) {
+		return gatewayStartup{}, errors.New("LAN recovery batch startup claim snapshot changed during quarantine")
+	}
+	upgradeInspection, err := ingress.InspectGatewayV2Startup(ctx, gatewayStartupClaims(confirmedSnapshot.Upgrades))
+	if err != nil {
+		return gatewayStartup{}, fmt.Errorf("reinspect gateway after LAN recovery batch quarantine: %w", err)
+	}
+	if !gatewayInspectionMatchesQuarantinedLANBatch(gate.inspection, upgradeInspection) {
+		return gatewayStartup{}, errors.New("gateway startup inspection did not enter the LAN recovery batch fence")
+	}
+	head, present, err := ingress.ObserveGatewayV2LANRecoveryHead(ctx, grants, disables)
+	if err != nil {
+		return gatewayStartup{}, fmt.Errorf("observe protected LAN recovery batch head: %w", err)
+	}
+	if !present {
+		return gatewayStartup{}, errors.New("protected LAN recovery batch disappeared during quarantine")
+	}
+	kind, operationID, appID, completed, err := selectLANRecoveryBatchHead(confirmedSnapshot, upgradeInspection, head)
+	if err != nil {
+		return gatewayStartup{}, err
+	}
+	if !completed {
+		gate.inspection = upgradeInspection
+		gate.recoveryKind = kind
+		gate.recoveryID = operationID
+		gate.recoveryAppID = appID
+		return gate, nil
+	}
+	if err := ingress.RetireGatewayV2LANRecoveryBatch(ctx, grants, disables); err != nil {
+		return gatewayStartup{}, fmt.Errorf("retire completed LAN recovery batch: %w", err)
+	}
+	retiredSnapshot, err := readSnapshot(ctx)
+	if err != nil {
+		return gatewayStartup{}, fmt.Errorf("LAN recovery batch startup claim snapshot changed during retirement: %w", err)
+	}
+	if !reflect.DeepEqual(retiredSnapshot, confirmedSnapshot) {
+		return gatewayStartup{}, errors.New("LAN recovery batch startup claim snapshot changed during retirement")
+	}
+	retiredUpgradeInspection, err := ingress.InspectGatewayV2Startup(ctx, gatewayStartupClaims(retiredSnapshot.Upgrades))
+	if err != nil {
+		return gatewayStartup{}, fmt.Errorf("reinspect gateway after LAN recovery batch retirement: %w", err)
+	}
+	if !gatewayInspectionMatchesRetiredLANBatch(upgradeInspection, retiredUpgradeInspection) {
+		return gatewayStartup{}, errors.New("gateway startup inspection did not leave the LAN recovery batch fence")
+	}
+	retiredGrants := lanGrantStartupClaims(retiredSnapshot.Grants)
+	retiredDisables := lanDisableStartupClaims(retiredSnapshot.Disables)
+	retiredAccessInspection, err := ingress.InspectGatewayV2LANAccessStartup(ctx, retiredGrants, retiredDisables)
+	if err != nil {
+		return gatewayStartup{}, fmt.Errorf("reinspect LAN access after recovery batch retirement: %w", err)
+	}
+	kind, operationID, appID, recoveryBatch, err := selectLANAccessStartupRecovery(
+		retiredSnapshot, retiredUpgradeInspection, retiredAccessInspection)
+	if err != nil {
+		return gatewayStartup{}, fmt.Errorf("completed LAN recovery batch did not return to normal startup: %w", err)
+	}
+	if kind != "" || operationID != "" || appID != "" || recoveryBatch {
+		return gatewayStartup{}, errors.New("completed LAN recovery batch did not return to normal startup")
+	}
+	batchPresent, err := ingress.HasGatewayV2LANRecoveryBatch(ctx)
+	if err != nil {
+		return gatewayStartup{}, fmt.Errorf("reinspect protected LAN recovery batch retirement: %w", err)
+	}
+	if batchPresent {
+		return gatewayStartup{}, errors.New("completed LAN recovery batch remains installed after retirement")
+	}
+	gate.snapshot = retiredSnapshot
+	gate.inspection = retiredUpgradeInspection
+	gate.accessInspection = retiredAccessInspection
+	gate.recoveryBatch = false
+	return gate, nil
+}
+
 func selectLANAccessStartupRecovery(snapshot appaccess.HostingGatewayStartupSnapshot,
 	inspection generatedingress.GatewayV2StartupInspection,
 	access generatedingress.GatewayV2LANAccessStartupInspection,
-) (kind, operationID, appID string, err error) {
+) (kind, operationID, appID string, recoveryBatch bool, err error) {
 	if inspection.Disposition != generatedingress.GatewayV2StartupNormalV2 &&
 		inspection.Disposition != generatedingress.GatewayV2StartupRecoveryOnly {
-		return "", "", "", errors.New("LAN access startup requires a v2 gateway")
+		return "", "", "", false, errors.New("LAN access startup requires a v2 gateway")
 	}
 	if !committedGatewayStartupOperation(snapshot.Upgrades, inspection.OperationID) {
-		return "", "", "", errors.New("LAN access startup requires a committed v2 gateway")
+		return "", "", "", false, errors.New("LAN access startup requires a committed v2 gateway")
 	}
 	switch access.Disposition {
 	case generatedingress.GatewayV2LANStartupNormal:
 		if inspection.Disposition != generatedingress.GatewayV2StartupNormalV2 ||
-			access.RecoveryKind != "" || access.OperationID != "" || access.AppID != "" {
-			return "", "", "", errors.New("gateway and LAN access startup inspections disagree")
+			access.RecoveryKind != "" || access.OperationID != "" || access.AppID != "" || len(access.Recoveries) != 0 {
+			return "", "", "", false, errors.New("gateway and LAN access startup inspections disagree")
 		}
-		return "", "", "", nil
+		return "", "", "", false, nil
 	case generatedingress.GatewayV2LANStartupRecoveryOnly:
-		switch access.RecoveryKind {
-		case controller.RecoveryLANGrant:
-			selectedAppID, ok := grantStartupAppID(snapshot.Grants, access.OperationID)
-			if !ok || selectedAppID != access.AppID {
-				return "", "", "", errors.New("LAN grant recovery identity is not in the startup snapshot")
+		if len(access.Recoveries) != 0 {
+			if len(access.Recoveries) < 2 || access.RecoveryKind != "" || access.OperationID != "" || access.AppID != "" {
+				return "", "", "", false, errors.New("invalid LAN access recovery census")
 			}
-		case controller.RecoveryLANDisable:
-			selectedAppID, ok := disableStartupAppID(snapshot.Disables, access.OperationID)
-			if !ok || selectedAppID != access.AppID {
-				return "", "", "", errors.New("LAN disable recovery identity is not in the startup snapshot")
+			seen := make(map[string]struct{}, len(access.Recoveries))
+			for _, recovery := range access.Recoveries {
+				if err := validateLANAccessStartupRecoveryIdentity(snapshot, recovery.Kind,
+					recovery.OperationID, recovery.AppID); err != nil {
+					return "", "", "", false, err
+				}
+				key := recovery.Kind + "\x00" + recovery.OperationID
+				if _, duplicate := seen[key]; duplicate {
+					return "", "", "", false, errors.New("duplicate LAN access recovery census identity")
+				}
+				seen[key] = struct{}{}
 			}
-		default:
-			return "", "", "", errors.New("unknown LAN access recovery kind")
+			return "", "", "", true, nil
 		}
-		return access.RecoveryKind, access.OperationID, access.AppID, nil
+		if err := validateLANAccessStartupRecoveryIdentity(snapshot, access.RecoveryKind,
+			access.OperationID, access.AppID); err != nil {
+			return "", "", "", false, err
+		}
+		return access.RecoveryKind, access.OperationID, access.AppID, false, nil
 	default:
-		return "", "", "", errors.New("unknown LAN access startup disposition")
+		return "", "", "", false, errors.New("unknown LAN access startup disposition")
 	}
+}
+
+func selectLANRecoveryBatchHead(snapshot appaccess.HostingGatewayStartupSnapshot,
+	inspection generatedingress.GatewayV2StartupInspection,
+	head generatedingress.GatewayV2LANRecoveryHead,
+) (kind, operationID, appID string, completed bool, err error) {
+	if inspection.Disposition != generatedingress.GatewayV2StartupNormalV2 &&
+		inspection.Disposition != generatedingress.GatewayV2StartupRecoveryOnly {
+		return "", "", "", false, errors.New("LAN recovery batch requires a v2 gateway")
+	}
+	if !committedGatewayStartupOperation(snapshot.Upgrades, inspection.OperationID) {
+		return "", "", "", false, errors.New("LAN recovery batch requires a committed v2 gateway")
+	}
+	if head.Count <= 0 || head.Head < 0 || head.Head > head.Count {
+		return "", "", "", false, errors.New("invalid protected LAN recovery batch head")
+	}
+	if head.Head == head.Count {
+		if head.Kind != "" || head.OperationID != "" || head.AppID != "" {
+			return "", "", "", false, errors.New("completed protected LAN recovery batch has an operation identity")
+		}
+		return "", "", "", true, nil
+	}
+	if err := validateLANAccessStartupRecoveryIdentity(snapshot, head.Kind, head.OperationID, head.AppID); err != nil {
+		return "", "", "", false, err
+	}
+	return head.Kind, head.OperationID, head.AppID, false, nil
+}
+
+func gatewayInspectionMatchesQuarantinedLANBatch(initial, quarantined generatedingress.GatewayV2StartupInspection) bool {
+	return (initial.Disposition == generatedingress.GatewayV2StartupNormalV2 ||
+		initial.Disposition == generatedingress.GatewayV2StartupRecoveryOnly) &&
+		initial.OperationID != "" && quarantined.Disposition == generatedingress.GatewayV2StartupRecoveryOnly &&
+		quarantined.OperationID == initial.OperationID
+}
+
+func gatewayInspectionMatchesRetiredLANBatch(quarantined, retired generatedingress.GatewayV2StartupInspection) bool {
+	return quarantined.Disposition == generatedingress.GatewayV2StartupRecoveryOnly &&
+		quarantined.OperationID != "" && retired.Disposition == generatedingress.GatewayV2StartupNormalV2 &&
+		retired.OperationID == quarantined.OperationID
+}
+
+func validateLANAccessStartupRecoveryIdentity(snapshot appaccess.HostingGatewayStartupSnapshot,
+	kind, operationID, appID string,
+) error {
+	switch kind {
+	case controller.RecoveryLANGrant:
+		selectedAppID, ok := grantStartupAppID(snapshot.Grants, operationID)
+		if !ok || selectedAppID != appID {
+			return errors.New("LAN grant recovery identity is not in the startup snapshot")
+		}
+	case controller.RecoveryLANDisable:
+		selectedAppID, ok := disableStartupAppID(snapshot.Disables, operationID)
+		if !ok || selectedAppID != appID {
+			return errors.New("LAN disable recovery identity is not in the startup snapshot")
+		}
+	default:
+		return errors.New("unknown LAN access recovery kind")
+	}
+	return nil
 }
 
 func selectLANStartupRecovery(snapshot appaccess.HostingGatewayStartupSnapshot,
