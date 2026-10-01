@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "d817cf5e52696baae010c2423f9184d7249642f22ddf8118d00263792f87e02b"
+const SourceSHA256 = "61b9f877d5932bfc745365e940ff15dcae1ae32a80f5cbce8f683e4bb309cb6c"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -20,6 +20,7 @@ var Operations = map[string]Operation{
 	"createApplication":                         {Method: "POST", Path: "/api/v1/apps"},
 	"deployApplication":                         {Method: "POST", Path: "/api/v1/apps/{appId}/deployments"},
 	"deployRelease":                             {Method: "POST", Path: "/api/v1/apps/{appId}/releases/{releaseId}/deployments"},
+	"disableApplicationLANAccess":               {Method: "POST", Path: "/api/v1/apps/{appId}/lan-access/disables"},
 	"disconnectSourceConnection":                {Method: "DELETE", Path: "/api/v1/source-connections/{connectionId}"},
 	"doctor":                                    {Method: "GET", Path: "/api/v1/system/doctor"},
 	"getApplication":                            {Method: "GET", Path: "/api/v1/apps/{appId}"},
@@ -27,6 +28,7 @@ var Operations = map[string]Operation{
 	"getApplicationConfiguration":               {Method: "GET", Path: "/api/v1/apps/{appId}/configuration"},
 	"getApplicationDeploymentPlan":              {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-plan"},
 	"getApplicationLANAccess":                   {Method: "GET", Path: "/api/v1/apps/{appId}/lan-access"},
+	"getApplicationLANDisable":                  {Method: "GET", Path: "/api/v1/apps/{appId}/lan-access/disables/{operationId}"},
 	"getApplicationLANGrant":                    {Method: "GET", Path: "/api/v1/apps/{appId}/lan-access/grants/{attemptId}"},
 	"getApplicationLocalRoute":                  {Method: "GET", Path: "/api/v1/apps/{appId}/local-route"},
 	"getDefaultSourceConnection":                {Method: "GET", Path: "/api/v1/source-connections/default"},
@@ -471,6 +473,14 @@ type Diagnostics struct {
 	StartupLimitation string        `json:"startupLimitation"`
 }
 
+type DisableLANAppAccessRequest struct {
+	AccessRevisionID     string `json:"accessRevisionId"`
+	AccessRevisionNumber int64  `json:"accessRevisionNumber"`
+	AllocationID         string `json:"allocationId"`
+	ApprovalDigest       string `json:"approvalDigest"`
+	OperationID          string `json:"operationId"`
+}
+
 type DoctorCheck struct {
 	Detail string `json:"detail"`
 	Name   string `json:"name"`
@@ -670,6 +680,33 @@ type LANAppAccessRevision struct {
 	OperationID    string            `json:"operationId"`
 	RevisionNumber int64             `json:"revisionNumber"`
 	SpecDigest     string            `json:"specDigest"`
+}
+
+type LANAppDisableClaim struct {
+	AccessRevisionID     string `json:"accessRevisionId"`
+	AccessRevisionNumber int64  `json:"accessRevisionNumber"`
+	AllocationID         string `json:"allocationId"`
+	AppID                string `json:"appId"`
+	OperationID          string `json:"operationId"`
+	Port                 int    `json:"port"`
+	ReleasedAt           string `json:"releasedAt,omitempty"`
+	State                string `json:"state"`
+	UpdatedAt            string `json:"updatedAt"`
+}
+
+type LANAppDisableMutation struct {
+	Claim   LANAppDisableClaim `json:"claim"`
+	Created bool               `json:"created"`
+}
+
+type LANAppDisableObservation struct {
+	Availability string `json:"availability"`
+	ObservedAt   string `json:"observedAt,omitempty"`
+}
+
+type LANAppDisableRead struct {
+	Claim    LANAppDisableClaim       `json:"claim"`
+	Observed LANAppDisableObservation `json:"observed"`
 }
 
 type LANAppGrantClaim struct {

@@ -66,6 +66,8 @@ type Server struct {
 	AppAccess             LANAppAccessService
 	AppGrants             LANAppGrantService
 	LANGrantRuntime       LANAppGrantRuntime
+	AppDisables           LANAppDisableService
+	LANDisableRuntime     LANAppDisableRuntime
 	RecoveryOnly          bool
 	RecoveryKind          string
 	RecoveryOperationID   string
@@ -154,6 +156,8 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute(operationApproveApplicationLANAccess, noStore(s.requireOperation(operationApproveApplicationLANAccess, s.approveApplicationLANAccess))),
 		contractRoute(operationGetApplicationLANGrant, noStore(s.requireOperation(operationGetApplicationLANGrant, s.getApplicationLANGrant))),
 		contractRoute(operationGrantApplicationLANAccess, noStore(s.requireOperation(operationGrantApplicationLANAccess, s.grantApplicationLANAccess))),
+		contractRoute(operationGetApplicationLANDisable, noStore(s.requireOperation(operationGetApplicationLANDisable, s.getApplicationLANDisable))),
+		contractRoute(operationDisableApplicationLANAccess, noStore(s.requireOperation(operationDisableApplicationLANAccess, s.disableApplicationLANAccess))),
 		contractRoute("getApplicationDeploymentPlan", noStore(s.require(s.getApplicationDeploymentPlan))),
 		contractRoute("acceptApplicationDeploymentPlan", noStore(s.require(s.acceptApplicationDeploymentPlan))),
 		contractRoute("approveApplicationDeploymentPlanMigration", noStore(s.require(s.approveApplicationDeploymentPlanMigration))),
@@ -230,6 +234,7 @@ func (s *Server) routes() http.Handler {
 const (
 	RecoveryGatewayUpgrade = "gateway_upgrade"
 	RecoveryLANGrant       = "lan_grant"
+	RecoveryLANDisable     = "lan_disable"
 )
 
 // recoveryGate limits an unfinished gateway or LAN grant operation to
@@ -249,6 +254,8 @@ func (s *Server) recoveryGate(next http.Handler) http.Handler {
 			permit = s.RecoveryKind == "" || s.RecoveryKind == RecoveryGatewayUpgrade
 		case operationGetApplicationLANGrant, operationGrantApplicationLANAccess:
 			permit = s.RecoveryKind == RecoveryLANGrant
+		case operationGetApplicationLANDisable, operationDisableApplicationLANAccess:
+			permit = s.RecoveryKind == RecoveryLANDisable
 		}
 		if permit {
 			allowed.HandleFunc(route.method+" "+route.path, func(w http.ResponseWriter, r *http.Request) {

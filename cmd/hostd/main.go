@@ -99,7 +99,7 @@ func runServer(args []string) int {
 		emergencyStop()
 		return 1
 	}
-	if gate.recoveryKind == controller.RecoveryLANGrant {
+	if gate.recoveryKind == controller.RecoveryLANGrant || gate.recoveryKind == controller.RecoveryLANDisable {
 		gate, err = quarantineLANRecoveryStartup(context.Background(), db, gate)
 		if err != nil {
 			logger.Error("LAN grant startup quarantine failed", "error", err)
@@ -217,9 +217,10 @@ func runServer(args []string) int {
 			return 1
 		}
 		if gate.inspection.Disposition == generatedingress.GatewayV2StartupNormalV2 {
-			confirmedGrantInspection, grantErr := runtime.ingress.InspectGatewayV2LANStartup(context.Background(), lanGrantStartupClaims(confirmedSnapshot.Grants))
-			if grantErr != nil || confirmedGrantInspection != gate.grantInspection {
-				logger.Error("LAN grant startup inspection changed after recovery", "error", grantErr)
+			confirmedAccessInspection, accessErr := runtime.ingress.InspectGatewayV2LANAccessStartup(context.Background(),
+				lanGrantStartupClaims(confirmedSnapshot.Grants), lanDisableStartupClaims(confirmedSnapshot.Disables))
+			if accessErr != nil || confirmedAccessInspection != gate.accessInspection {
+				logger.Error("LAN access startup inspection changed after recovery", "error", accessErr)
 				emergencyStop()
 				return 1
 			}
@@ -256,10 +257,11 @@ func runServer(args []string) int {
 	})
 	effectiveAutoDeploy := (cfg.ComposeRuntime || cfg.GeneratedRuntime) && cfg.GitHubConnectionsEnabled() && sources.ProviderEnabled()
 	appAccessRepository := appaccess.New(db)
-	controllerServer := &controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, DeploymentPlans: planStore, GeneratedIngress: runtime.ingress, GeneratedRuntimeState: runtime.state, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, GatewayProfiles: appAccessRepository, GatewayUpgrades: appAccessRepository, AppAccess: appAccessRepository, AppGrants: appAccessRepository, AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}
+	controllerServer := &controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, DeploymentPlans: planStore, GeneratedIngress: runtime.ingress, GeneratedRuntimeState: runtime.state, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, GatewayProfiles: appAccessRepository, GatewayUpgrades: appAccessRepository, AppAccess: appAccessRepository, AppGrants: appAccessRepository, AppDisables: appAccessRepository, AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}
 	if runtime.ingress != nil {
 		controllerServer.GatewayUpgradeRuntime = runtime.ingress
 		controllerServer.LANGrantRuntime = runtime.ingress
+		controllerServer.LANDisableRuntime = runtime.ingress
 	}
 	applyRuntimeCapabilities(controllerServer, capabilities)
 	s := &http.Server{Addr: cfg.ListenAddress, Handler: controllerServer.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
@@ -291,8 +293,8 @@ func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener 
 	bootstrapCompleted func(),
 ) int {
 	if operationID == "" || ingress == nil || upgrades == nil || listener == nil ||
-		(kind != controller.RecoveryGatewayUpgrade && kind != controller.RecoveryLANGrant) ||
-		(kind == controller.RecoveryLANGrant && appID == "") {
+		(kind != controller.RecoveryGatewayUpgrade && kind != controller.RecoveryLANGrant && kind != controller.RecoveryLANDisable) ||
+		((kind == controller.RecoveryLANGrant || kind == controller.RecoveryLANDisable) && appID == "") {
 		logger.Error("gateway recovery controller is missing its pinned operation")
 		return 1
 	}
@@ -301,6 +303,7 @@ func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener 
 	server := &controller.Server{
 		Auth: authentication, GatewayUpgrades: upgrades, GatewayUpgradeRuntime: ingress,
 		AppAccess: upgrades, AppGrants: upgrades, LANGrantRuntime: ingress,
+		AppDisables: upgrades, LANDisableRuntime: ingress,
 		GeneratedRuntime: true, RecoveryOnly: true, RecoveryKind: kind,
 		RecoveryOperationID: operationID, RecoveryAppID: appID,
 		Logger: logger, BootstrapCompleted: bootstrapCompleted,
