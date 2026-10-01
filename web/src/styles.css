@@ -405,6 +405,32 @@ button:disabled { cursor: wait; opacity: .62; }
 .machine p, .machine-meta { margin: 6px 0 0; color: #5f6672; font-size: 11px; overflow-wrap: anywhere; }
 .machine-meta { grid-column: 1 / -1; padding-top: 12px; border-top: 1px solid #e3e6ea; }
 
+.lan-gateway-panel, .lan-access-panel { margin-top: 28px; padding: 20px; border: 1px solid #e3e6ea; border-radius: 10px; background: #fff; }
+.lan-heading, .lan-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.lan-heading h2, .lan-section-heading h3 { margin: 0; font-size: 16px; }
+.lan-heading p, .lan-section-heading p, .lan-muted, .lan-message { margin: 5px 0 0; color: #5f6672; font-size: 12px; line-height: 1.5; }
+.lan-message { color: #195e47; }
+.lan-details, .lan-review-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 10px 14px; margin: 16px 0 0; }
+.lan-details > div, .lan-review-details > div { display: grid; min-width: 0; gap: 4px; }
+.lan-details dt, .lan-review-details dt { color: #616975; font-size: 10px; }
+.lan-details dd, .lan-review-details dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 12px; }
+.lan-profile-form { display: grid; max-width: 620px; gap: 14px; margin-top: 18px; }
+.lan-profile-form .field { max-width: none; margin: 0; }
+.lan-profile-form small { display: block; margin-top: 4px; color: #626a76; font-size: 11px; line-height: 1.45; }
+.lan-port-pool { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.lan-port-pool .field { max-width: none; }
+.lan-upgrade { margin-top: 22px; padding-top: 20px; border-top: 1px solid #e3e6ea; }
+.lan-upgrade > .button { margin-top: 16px; }
+.lan-address { display: grid; justify-items: start; gap: 8px; }
+.lan-address code { max-width: 100%; overflow-wrap: anywhere; color: #1f2937; font-size: 12px; }
+.lan-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.lan-pending { margin-top: 16px; padding: 14px; border: 1px solid #e3e6ea; border-radius: 9px; background: #fbfcfd; }
+.lan-pending h3 { margin: 0; font-size: 14px; }
+.lan-pending > p { margin: 5px 0 0; color: #4e5561; font-size: 12px; line-height: 1.5; }
+.lan-pending > .button { margin-top: 14px; }
+.lan-access-panel > .callout, .lan-access-panel > .lan-details, .lan-access-panel > .lan-pending { margin-top: 16px; }
+.lan-review-details { margin: 16px 0; padding: 12px; border: 1px solid #e3e6ea; border-radius: 8px; background: #fbfcfd; }
+
 .relay-panel { margin-top: 28px; padding: 20px; border: 1px solid #e3e6ea; border-radius: 10px; background: #fff; }
 .relay-heading, .relay-section-heading, .relay-binding-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .relay-heading h2, .relay-section-heading h3 { margin: 0; font-size: 16px; }
@@ -438,6 +464,7 @@ button:disabled { cursor: wait; opacity: .62; }
 .relay-rotation { margin-bottom: 14px; }
 .relay-confirmation { margin: 16px 0; padding: 12px; border: 1px solid #e3e6ea; border-radius: 8px; background: #fbfcfd; }
 .deployment-dialog:focus-visible, .callout[tabindex="-1"]:focus-visible { outline: 3px solid #274ec9; outline-offset: 2px; }
+.callout[tabindex="-1"]:focus { outline: 3px solid #274ec9; outline-offset: 2px; }
 
 @media (pointer: coarse), (max-width: 560px) {
   .relay-enrollment-status a { display: inline-flex; align-items: center; min-height: 44px; }
@@ -568,6 +595,11 @@ button:disabled { cursor: wait; opacity: .62; }
   .release-actions { flex-wrap: wrap; justify-content: space-between; }
   .deployment-dialog-actions { flex-direction: column; }
   .relay-panel { padding: 16px 14px; overflow: hidden; }
+  .lan-gateway-panel, .lan-access-panel { padding: 16px 14px; overflow: hidden; }
+  .lan-heading, .lan-section-heading { align-items: stretch; flex-direction: column; }
+  .lan-heading .button, .lan-upgrade > .button, .lan-pending > .button, .lan-actions .button { width: 100%; }
+  .lan-port-pool, .lan-details, .lan-review-details { grid-template-columns: minmax(0, 1fr); }
+  .lan-actions { display: grid; width: 100%; }
   .relay-heading, .relay-section-heading, .relay-binding-heading { align-items: stretch; flex-direction: column; }
   .relay-heading .button, .relay-binding > .button, .relay-section > .button, .relay-enrollment-actions .button { width: 100%; }
   .relay-source-grid { grid-template-columns: minmax(0, 1fr); }

@@ -6,15 +6,18 @@ export function Dialog({
   description,
   close,
   pending = false,
+  focusTitle = false,
   children,
 }: {
   title: string;
   description?: string;
   close: () => void;
   pending?: boolean;
+  focusTitle?: boolean;
   children: React.ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const titleRef = useRef<HTMLHeadingElement>(null);
   const titleId = useId();
   const descriptionId = useId();
   const restore = useRef<HTMLElement | null>(
@@ -48,7 +51,7 @@ export function Dialog({
       ) ?? []),
     ].filter(visiblyFocusable);
 
-    (focusable()[0] ?? element)?.focus();
+    (focusTitle ? titleRef.current : focusable()[0] ?? element)?.focus();
     const keydown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !pendingRef.current) {
         event.preventDefault();
@@ -86,7 +89,7 @@ export function Dialog({
       }
       restore.current?.focus();
     };
-  }, []);
+  }, [focusTitle]);
 
   return createPortal(
     <div className="deployment-dialog-backdrop" role="presentation">
@@ -99,7 +102,7 @@ export function Dialog({
         aria-describedby={description ? descriptionId : undefined}
         tabIndex={-1}
       >
-        <h2 id={titleId}>{title}</h2>
+        <h2 ref={titleRef} id={titleId} tabIndex={focusTitle ? -1 : undefined}>{title}</h2>
         {description && <p id={descriptionId} className="deployment-dialog-description">{description}</p>}
         <div className="deployment-dialog-content">{children}</div>
       </div>

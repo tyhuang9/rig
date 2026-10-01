@@ -72,6 +72,14 @@ describe("Dialog", () => {
     expect(document.activeElement).toBe(launcher);
   });
 
+  it("can focus the review title before exact details and actions", () => {
+    render(<Dialog title="Exact review" focusTitle close={() => undefined}><dl><dt>Digest</dt><dd>approved</dd></dl><button type="button">Confirm</button></Dialog>);
+    const title = screen.getByRole("heading", { name: "Exact review" });
+    expect(document.activeElement).toBe(title);
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Confirm" }));
+  });
+
   it("restores background attributes and removes keyboard handling when unmounted", () => {
     const root = rootContainer();
     root.setAttribute("aria-hidden", "background-state");
