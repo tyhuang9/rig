@@ -56,6 +56,77 @@ func TestGatewayV2LANRecoveryBatchQuarantinesMixedGrantAndDisable(t *testing.T) 
 	}
 }
 
+func TestGatewayV2LANRecoveryBatchQuarantinesExactLegacyPairOnce(t *testing.T) {
+	manager, store, journal, driver, request, disable, grants, disables := gatewayV2LANRecoveryLegacyPairFixture(t)
+	recording := &recordingGatewayV2LANRecoveryPortDriver{fakeGatewayV2LANGrantDriver: driver}
+	manager.gatewayV2LANGrantDriver = recording
+	if err := manager.QuarantineGatewayV2LANAccessRecoveryBatch(context.Background(), grants, disables); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := store.loadBoundUpgrade(journal.OperationID)
+	if err != nil || state.LANRecovery == nil || len(state.LANRecovery.Items) != 2 ||
+		state.LANRecovery.Items[0].Kind != gatewayV2PendingLANGrant ||
+		state.LANRecovery.Items[1].Kind != gatewayV2PendingLANDisable ||
+		state.LANRecovery.Items[0].AppID != request.AppID ||
+		state.LANRecovery.Items[1].Disable.OperationID != disable.OperationID ||
+		driver.live.Apps[request.AppID].LAN != nil {
+		t.Fatalf("state=%#v live=%#v err=%v", state.LANRecovery, driver.live, err)
+	}
+	if !reflect.DeepEqual(recording.probedPorts, []uint16{request.Port}) {
+		t.Fatalf("legacy pair 404 probes=%v", recording.probedPorts)
+	}
+}
+
+func TestGatewayV2LANRecoveryBatchQuarantinesUnappliedLegacyPair(t *testing.T) {
+	manager, store, _, journal, request, driver := gatewayV2LANGrantFixture(t)
+	disable := disableRequestForGrant(t, request)
+	disable.SourceGrant = nil
+	grant := gatewayV2LANStartupClaim(request, appaccess.AppAccessGrantPrepared, 1)
+	grant.DisableIntentOperationID = disable.OperationID
+	grants := []GatewayV2LANStartupClaim{grant}
+	disables := []GatewayV2LANDisableStartupClaim{{
+		Request: disable, State: appaccess.AppAccessDisablePrepared, StateSequence: 1,
+	}}
+	before, _, err := store.loadBoundUpgrade(journal.OperationID)
+	if err != nil || before.Apps[request.AppID].LAN != nil || driver.live.Apps[request.AppID].LAN != nil {
+		t.Fatalf("unapplied fixture has LAN binding: protected=%#v live=%#v err=%v",
+			before.Apps[request.AppID].LAN, driver.live.Apps[request.AppID].LAN, err)
+	}
+	if err := manager.QuarantineGatewayV2LANAccessRecoveryBatch(context.Background(), grants, disables); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := store.loadBoundUpgrade(journal.OperationID)
+	if err != nil || state.LANRecovery == nil || len(state.LANRecovery.Items) != 2 ||
+		state.LANRecovery.Items[0].Kind != gatewayV2PendingLANGrant ||
+		state.LANRecovery.Items[1].Kind != gatewayV2PendingLANDisable ||
+		state.Apps[request.AppID].LAN != nil || driver.live.Apps[request.AppID].LAN != nil {
+		t.Fatalf("unapplied legacy pair quarantine: state=%#v live=%#v err=%v",
+			state.LANRecovery, driver.live.Apps[request.AppID].LAN, err)
+	}
+}
+
+func TestGatewayV2LANRecoveryBatchRejectsCommittedStaleGrantBeforeIntent(t *testing.T) {
+	_, _, _, _, first, _ := gatewayV2LANGrantFixture(t)
+	second := gatewayV2LANSecondAppRequest(t, first)
+	claims, err := validateGatewayV2LANAccessStartupClaims([]GatewayV2LANStartupClaim{
+		gatewayV2LANStartupClaim(first, appaccess.AppAccessGrantCommitted, 4),
+		gatewayV2LANStartupClaim(second, appaccess.AppAccessGrantPrepared, 1),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection := GatewayV2LANAccessStartupInspection{
+		Disposition: GatewayV2LANStartupRecoveryOnly,
+		Recoveries: []GatewayV2LANAccessStartupRecovery{
+			{Kind: GatewayV2LANRecoveryGrant, OperationID: first.AttemptID, AppID: first.AppID},
+			{Kind: GatewayV2LANRecoveryGrant, OperationID: second.AttemptID, AppID: second.AppID},
+		},
+	}
+	if items, err := gatewayV2LANRecoveryItems(inspection, claims); err == nil || len(items) != 0 {
+		t.Fatalf("committed stale grant entered rollback-only batch: items=%#v err=%v", items, err)
+	}
+}
+
 func TestGatewayV2LANRecoveryBatchPreservesLegacyPendingEvidence(t *testing.T) {
 	manager, store, _, journal, first, driver := gatewayV2LANGrantFixture(t)
 	second := gatewayV2LANSecondAppRequest(t, first)
@@ -226,6 +297,42 @@ func TestGatewayV2LANRecoveryBatchProvesEveryUnsafePort(t *testing.T) {
 	}
 }
 
+func TestGatewayV2LANRecoveryBatchReplayProvesProcessedAndUnfinishedPorts(t *testing.T) {
+	manager, store, journal, driver, grants, disables := gatewayV2LANRecoveryTwoDisableFixture(t)
+	recording := &recordingGatewayV2LANRecoveryPortDriver{fakeGatewayV2LANGrantDriver: driver}
+	manager.gatewayV2LANGrantDriver = recording
+	if err := manager.QuarantineGatewayV2LANAccessRecoveryBatch(context.Background(), grants, disables); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := store.loadBoundUpgrade(journal.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []uint16{disables[0].Request.Port, disables[1].Request.Port}
+	sort.Slice(want, func(i, j int) bool { return want[i] < want[j] })
+	for index := range disables {
+		disables[index].State = appaccess.AppAccessDisableCommitted
+		disables[index].StateSequence = 3
+		disables[index].ClearAcknowledged = true
+		cleared, clearErr := gatewayV2LANRecoveryClearedHeadState(state)
+		if clearErr != nil || store.saveCommittedV2State(cleared, journal) != nil {
+			t.Fatalf("clear head %d: %v", index, clearErr)
+		}
+		state, err = gatewayV2LANRecoveryAdvanceHeadState(cleared)
+		if err != nil || store.saveCommittedV2State(state, journal) != nil {
+			t.Fatalf("advance head %d: %v", index, err)
+		}
+		recording.probedPorts = nil
+		if err := manager.QuarantineGatewayV2LANAccessRecoveryBatch(context.Background(), grants, disables); err != nil {
+			t.Fatalf("replay at head %d: %v", state.LANRecovery.Head, err)
+		}
+		if driver.gatewayStopped || !reflect.DeepEqual(recording.probedPorts, want) {
+			t.Fatalf("head=%d stopped=%t 404 probes=%v want=%v",
+				state.LANRecovery.Head, driver.gatewayStopped, recording.probedPorts, want)
+		}
+	}
+}
+
 func TestGatewayV2LANRecoveryBatchPreservesUnrelatedCommittedRoute(t *testing.T) {
 	manager, store, _, journal, first, driver := gatewayV2LANGrantFixture(t)
 	second := gatewayV2LANSecondAppRequest(t, first)
@@ -270,6 +377,31 @@ func gatewayV2LANRecoveryTwoDisableFixture(t *testing.T) (*Manager, *gatewayUpgr
 	}
 	driver.events = nil
 	return manager, store, journal, driver, grants, disables
+}
+
+func gatewayV2LANRecoveryLegacyPairFixture(t *testing.T) (*Manager, *gatewayUpgradeStateStore,
+	gatewayMigrationJournal, *fakeGatewayV2LANGrantDriver, GatewayV2LANGrantRequest,
+	GatewayV2LANDisableRequest, []GatewayV2LANStartupClaim, []GatewayV2LANDisableStartupClaim,
+) {
+	t.Helper()
+	manager, store, _, journal, request, driver := gatewayV2LANGrantFixture(t)
+	authorize, _ := allowGatewayV2LANGrant(t, manager, request, nil)
+	if _, err := manager.GrantGatewayV2LAN(context.Background(), request, authorize); err != nil {
+		t.Fatal(err)
+	}
+	disable := disableRequestForGrant(t, request)
+	disable.SourceGrant = nil
+	if !validGatewayV2LANDisableRequest(disable) {
+		t.Fatal("legacy nil-source disable fixture is invalid")
+	}
+	grantClaim := gatewayV2LANStartupClaim(request, appaccess.AppAccessGrantPrepared, 1)
+	grantClaim.DisableIntentOperationID = disable.OperationID
+	disableClaim := GatewayV2LANDisableStartupClaim{
+		Request: disable, State: appaccess.AppAccessDisablePrepared, StateSequence: 1,
+	}
+	driver.events = nil
+	return manager, store, journal, driver, request, disable,
+		[]GatewayV2LANStartupClaim{grantClaim}, []GatewayV2LANDisableStartupClaim{disableClaim}
 }
 
 func persistGatewayV2LANRecoveryBatchIntent(t *testing.T, manager *Manager, store *gatewayUpgradeStateStore,

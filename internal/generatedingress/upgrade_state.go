@@ -613,6 +613,7 @@ func validGatewayV2LANRecoveryBatch(state gatewayV2RouteState) bool {
 		return false
 	}
 	operations := make(map[string]struct{}, len(batch.Items))
+	apps := make(map[string]int, len(batch.Items))
 	identities := make(map[struct {
 		appID       string
 		kind        gatewayV2PendingKind
@@ -620,8 +621,22 @@ func validGatewayV2LANRecoveryBatch(state gatewayV2RouteState) bool {
 		operationID string
 	}]struct{}, len(batch.Items))
 	for index, item := range batch.Items {
-		if !validGatewayV2LANRecoveryItem(state, item) {
+		validItem := validGatewayV2LANRecoveryItem(state, item)
+		if !validItem && index > 0 && batch.Head == 0 &&
+			gatewayV2LANRecoveryItemsAreLegacyPair(batch.Items[index-1], item) {
+			app := state.Apps[item.AppID]
+			validItem = gatewayV2LANBindingMatchesRequest(app.LAN,
+				gatewayV2LANGrantRequestForBinding(item.AppID, *batch.Items[index-1].Grant))
+		}
+		if !validItem {
 			return false
+		}
+		if previous, duplicate := apps[item.AppID]; duplicate {
+			if previous != index-1 || !gatewayV2LANRecoveryItemsAreLegacyPair(batch.Items[previous], item) {
+				return false
+			}
+		} else {
+			apps[item.AppID] = index
 		}
 		if index < batch.Head {
 			app, exists := state.Apps[item.AppID]
@@ -728,9 +743,33 @@ func gatewayV2LANRecoveryItemLess(left, right gatewayV2LANRecoveryItem) bool {
 		return leftPort < rightPort
 	}
 	if left.Kind != right.Kind {
-		return left.Kind < right.Kind
+		return gatewayV2LANRecoveryKindOrder(left.Kind) < gatewayV2LANRecoveryKindOrder(right.Kind)
 	}
 	return leftOperation < rightOperation
+}
+
+func gatewayV2LANRecoveryKindOrder(kind gatewayV2PendingKind) int {
+	switch kind {
+	case gatewayV2PendingLANGrant:
+		return 0
+	case gatewayV2PendingLANDisable:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// The sole repeated-app queue shape is the migration-028 prepared grant and
+// its migration-029 backfilled disable. SourceGrant is nil because the grant
+// had not committed; every other immutable allocation field must still match.
+func gatewayV2LANRecoveryItemsAreLegacyPair(grant, disable gatewayV2LANRecoveryItem) bool {
+	if grant.Kind != gatewayV2PendingLANGrant || grant.Grant == nil || grant.Disable != nil ||
+		disable.Kind != gatewayV2PendingLANDisable || disable.Disable == nil || disable.Grant != nil ||
+		grant.AppID != disable.AppID || disable.Disable.SourceGrant != nil {
+		return false
+	}
+	request := gatewayV2LANGrantRequestForBinding(grant.AppID, *grant.Grant)
+	return gatewayV2LANDisableMatchesGrantIdentity(*disable.Disable, request)
 }
 
 func gatewayV2LANRecoveryPendingMatchesItem(pending gatewayV2PendingRoute, item gatewayV2LANRecoveryItem) bool {

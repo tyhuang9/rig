@@ -5,6 +5,8 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+
+	"github.com/hostd/hostd/internal/appaccess"
 )
 
 type gatewayV2LANRecoveryBatchTopology string
@@ -62,7 +64,7 @@ func (m *Manager) QuarantineGatewayV2LANAccessRecoveryBatch(ctx context.Context,
 
 	batchInstalled := state.LANRecovery != nil
 	if batchInstalled {
-		if !gatewayV2LANRecoveryBatchMatchesCensus(workCtx, state, journal, claims, driver) {
+		if !gatewayV2LANRecoveryCensusMatchesHead(state, claims) {
 			return emergencyGatewayV2LANDisableStop(ctx, m, journal, driver)
 		}
 	} else {
@@ -91,7 +93,11 @@ func (m *Manager) QuarantineGatewayV2LANAccessRecoveryBatch(ctx context.Context,
 		return gatewayV2StartupInspectionError(workCtx)
 	}
 
-	effective, unsafePorts, err := gatewayV2LANRecoveryEffectiveProjection(state)
+	effective, _, err := gatewayV2LANRecoveryEffectiveProjection(state)
+	if err != nil {
+		return emergencyGatewayV2LANDisableStop(ctx, m, journal, driver)
+	}
+	unsafePorts, err := gatewayV2LANRecoveryAllPorts(state)
 	if err != nil {
 		return emergencyGatewayV2LANDisableStop(ctx, m, journal, driver)
 	}
@@ -128,14 +134,14 @@ func gatewayV2LANRecoveryItems(inspection GatewayV2LANAccessStartupInspection,
 		return nil, errors.New("invalid generated ingress LAN recovery census")
 	}
 	items := make([]gatewayV2LANRecoveryItem, 0, len(recoveries))
-	ports := make(map[uint16]struct{}, len(recoveries))
 	for _, recovery := range recoveries {
 		item := gatewayV2LANRecoveryItem{AppID: recovery.AppID}
 		switch recovery.Kind {
 		case GatewayV2LANRecoveryGrant:
 			claim, exists := claims.grants.byAttempt[recovery.OperationID]
 			binding, err := gatewayV2LANBindingForRequest(claim.Request)
-			if !exists || err != nil || claim.Request.AppID != recovery.AppID {
+			if !exists || err != nil || claim.Request.AppID != recovery.AppID ||
+				claim.State == appaccess.AppAccessGrantCommitted {
 				return nil, errors.New("invalid generated ingress LAN grant recovery census")
 			}
 			item.Kind = gatewayV2PendingLANGrant
@@ -155,57 +161,65 @@ func gatewayV2LANRecoveryItems(inspection GatewayV2LANAccessStartupInspection,
 		default:
 			return nil, errors.New("invalid generated ingress LAN recovery kind")
 		}
-		port, _ := gatewayV2LANRecoveryItemIdentity(item)
-		if _, duplicate := ports[port]; duplicate {
-			return nil, errors.New("ambiguous generated ingress LAN recovery port")
-		}
-		ports[port] = struct{}{}
 		items = append(items, item)
 	}
 	sort.Slice(items, func(i, j int) bool { return gatewayV2LANRecoveryItemLess(items[i], items[j]) })
+	apps := make(map[string]int, len(items))
+	ports := make(map[uint16]int, len(items))
+	for index, item := range items {
+		port, _ := gatewayV2LANRecoveryItemIdentity(item)
+		if previous, duplicate := apps[item.AppID]; duplicate {
+			if previous != index-1 || !gatewayV2LANRecoveryItemsAreLegacyPreparedPair(items[previous], item, claims) {
+				return nil, errors.New("ambiguous generated ingress LAN recovery app")
+			}
+		} else {
+			apps[item.AppID] = index
+		}
+		if previous, duplicate := ports[port]; duplicate {
+			if previous != index-1 || !gatewayV2LANRecoveryItemsAreLegacyPreparedPair(items[previous], item, claims) {
+				return nil, errors.New("ambiguous generated ingress LAN recovery port")
+			}
+		} else {
+			ports[port] = index
+		}
+	}
 	return items, nil
 }
 
-func gatewayV2LANRecoveryBatchMatchesCensus(ctx context.Context, state gatewayV2RouteState,
-	journal gatewayMigrationJournal, claims gatewayV2LANAccessStartupClaims, driver gatewayV2LANGrantDriver,
+func gatewayV2LANRecoveryItemsAreLegacyPreparedPair(grant, disable gatewayV2LANRecoveryItem,
+	claims gatewayV2LANAccessStartupClaims,
 ) bool {
-	if ctx == nil || state.LANRecovery == nil || !validGatewayV2RouteState(state) {
+	if !gatewayV2LANRecoveryItemsAreLegacyPair(grant, disable) {
 		return false
 	}
-	// Replay the database census against the already-quarantined projection.
-	// This remains valid if a disable advanced to committed before a crash: the
-	// old protected binding is retained as immutable batch evidence, while the
-	// projection truthfully records that it may no longer serve.
-	quarantined, _, err := gatewayV2LANRecoveryEffectiveProjection(state)
-	if err != nil {
-		return false
-	}
-	censusDriver := gatewayV2LANRecoveryCensusDriver{gatewayV2LANGrantDriver: driver}
-	inspection, err := inspectGatewayV2LANAccessStartupLocked(ctx, quarantined, journal, claims, censusDriver)
-	if err != nil {
-		return false
-	}
-	items, err := gatewayV2LANRecoveryItems(inspection, claims)
-	return err == nil && reflect.DeepEqual(items, state.LANRecovery.Items)
+	_, grantOperationID := gatewayV2LANRecoveryItemIdentity(grant)
+	_, disableOperationID := gatewayV2LANRecoveryItemIdentity(disable)
+	grantClaim, grantExists := claims.grants.byAttempt[grantOperationID]
+	disableClaim, disableExists := claims.disables[disableOperationID]
+	return grantExists && disableExists && gatewayV2LANRecoveryLegacyPreparedPair(grantClaim, disableClaim)
 }
 
-type gatewayV2LANRecoveryCensusDriver struct{ gatewayV2LANGrantDriver }
-
-func (gatewayV2LANRecoveryCensusDriver) proveCommitted(context.Context, gatewayV2RouteState, gatewayMigrationJournal) bool {
-	return true
-}
-func (gatewayV2LANRecoveryCensusDriver) proveAllGranted(context.Context, gatewayV2RouteState, gatewayMigrationJournal) bool {
-	return true
-}
-func (gatewayV2LANRecoveryCensusDriver) proveRolledBack(context.Context, gatewayV2RouteState,
-	gatewayMigrationJournal, gatewayV2LANGrantRequest,
-) bool {
-	return true
-}
-func (gatewayV2LANRecoveryCensusDriver) observePending(context.Context, gatewayV2RouteState,
-	gatewayV2RouteState, gatewayMigrationJournal,
-) gatewayV2PendingLiveTopology {
-	return gatewayV2PendingCommittedExact
+// Every item port remains absent while a recovery batch is installed,
+// including items already traversed by Head. The completed batch retains its
+// immutable port identities until a separate terminal retirement proof.
+func gatewayV2LANRecoveryAllPorts(state gatewayV2RouteState) ([]uint16, error) {
+	if !validGatewayV2RouteState(state) || state.LANRecovery == nil {
+		return nil, errors.New("invalid generated ingress LAN recovery batch")
+	}
+	seen := make(map[uint16]struct{}, len(state.LANRecovery.Items))
+	ports := make([]uint16, 0, len(state.LANRecovery.Items))
+	for _, item := range state.LANRecovery.Items {
+		port, _ := gatewayV2LANRecoveryItemIdentity(item)
+		if port == 0 {
+			return nil, errors.New("invalid generated ingress LAN recovery port")
+		}
+		if _, duplicate := seen[port]; !duplicate {
+			seen[port] = struct{}{}
+			ports = append(ports, port)
+		}
+	}
+	sort.Slice(ports, func(i, j int) bool { return ports[i] < ports[j] })
+	return ports, nil
 }
 
 func gatewayV2LANRecoveryCommittedProjection(state gatewayV2RouteState) gatewayV2RouteState {
@@ -222,18 +236,21 @@ func gatewayV2LANRecoveryEffectiveProjection(state gatewayV2RouteState) (gateway
 	effective := gatewayV2LANRecoveryCommittedProjection(state)
 	unfinished := state.LANRecovery.Items[state.LANRecovery.Head:]
 	ports := make([]uint16, 0, len(unfinished))
-	seen := make(map[uint16]struct{}, len(unfinished))
+	seen := make(map[uint16]gatewayV2LANRecoveryItem, len(unfinished))
 	for _, item := range unfinished {
 		app, exists := effective.Apps[item.AppID]
 		port, _ := gatewayV2LANRecoveryItemIdentity(item)
 		if !exists || port == 0 {
 			return gatewayV2RouteState{}, nil, errors.New("invalid generated ingress LAN recovery item")
 		}
-		if _, duplicate := seen[port]; duplicate {
-			return gatewayV2RouteState{}, nil, errors.New("ambiguous generated ingress LAN recovery port")
+		if previous, duplicate := seen[port]; duplicate {
+			if !gatewayV2LANRecoveryItemsAreLegacyPair(previous, item) {
+				return gatewayV2RouteState{}, nil, errors.New("ambiguous generated ingress LAN recovery port")
+			}
+		} else {
+			seen[port] = item
+			ports = append(ports, port)
 		}
-		seen[port] = struct{}{}
-		ports = append(ports, port)
 		app.LAN = nil
 		effective.Apps[item.AppID] = app
 	}

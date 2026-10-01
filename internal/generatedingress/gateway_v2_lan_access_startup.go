@@ -80,7 +80,9 @@ func validateGatewayV2LANAccessStartupClaims(grants []GatewayV2LANStartupClaim,
 		}
 		if claim.Request.SourceGrant != nil {
 			grant, exists := grantSet.byAttempt[claim.Request.SourceGrant.AttemptID]
-			if !exists || grant.Request != *claim.Request.SourceGrant || grant.DisableIntentOperationID != claim.Request.OperationID {
+			if !exists || grant.Request != *claim.Request.SourceGrant ||
+				grant.State != appaccess.AppAccessGrantCommitted ||
+				grant.DisableIntentOperationID != claim.Request.OperationID {
 				return gatewayV2LANAccessStartupClaims{}, gatewayV2StartupInspectionError(nil)
 			}
 		}
@@ -143,8 +145,6 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 	}
 	recoveryCandidates := make(map[string]gatewayV2LANAccessStartupRecoveryCandidate)
-	byApp := make(map[string]gatewayV2LANAccessStartupRecoveryCandidate)
-	byPort := make(map[uint16]gatewayV2LANAccessStartupRecoveryCandidate)
 	addRecovery := func(kind, operationID, appID string, port uint16) bool {
 		if (kind != GatewayV2LANRecoveryGrant && kind != GatewayV2LANRecoveryDisable) ||
 			!validCanonicalUUID(operationID) || !validAppID(appID) ||
@@ -161,15 +161,7 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 		if existing, exists := recoveryCandidates[key]; exists {
 			return existing.port == candidate.port
 		}
-		if existing, exists := byApp[appID]; exists && existing != candidate {
-			return false
-		}
-		if existing, exists := byPort[port]; exists && existing != candidate {
-			return false
-		}
 		recoveryCandidates[key] = candidate
-		byApp[appID] = candidate
-		byPort[port] = candidate
 		return true
 	}
 	protected := make(map[string]struct{})
@@ -184,10 +176,12 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 		}
 		protected[request.AttemptID] = struct{}{}
 		if disable, exists := claims.byAllocation[request.AllocationID]; exists {
+			legacyPair := gatewayV2LANRecoveryLegacyPreparedPair(grant, disable)
 			if (disable.State == appaccess.AppAccessDisableCommitted &&
 				(state.Pending == nil || state.Pending.Kind != gatewayV2PendingLANDisable ||
 					state.Pending.Disable == nil || state.Pending.Disable.OperationID != disable.Request.OperationID)) ||
-				disable.Request.SourceGrant == nil || *disable.Request.SourceGrant != request ||
+				(!legacyPair && (disable.Request.SourceGrant == nil || *disable.Request.SourceGrant != request)) ||
+				(legacyPair && !addRecovery(GatewayV2LANRecoveryGrant, request.AttemptID, request.AppID, request.Port)) ||
 				!addRecovery(GatewayV2LANRecoveryDisable, disable.Request.OperationID, disable.Request.AppID, disable.Request.Port) {
 				return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 			}
@@ -273,7 +267,10 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 			}
 			continue
 		}
-		if !gatewayV2LANDisableStateMatches(state, disable.Request) {
+		legacyGrant, legacyPair := gatewayV2LANRecoveryLegacyGrantForDisable(claims, disable)
+		if !gatewayV2LANDisableStateMatches(state, disable.Request) &&
+			(!legacyPair || state.Apps[disable.Request.AppID].LAN == nil ||
+				!gatewayV2LANBindingMatchesRequest(state.Apps[disable.Request.AppID].LAN, legacyGrant.Request)) {
 			return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 		}
 		if disable.State != appaccess.AppAccessDisableCommitted || disable.RequiresRecovery {
@@ -281,7 +278,8 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 				return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 			}
 		}
-		if state.Pending == nil && !gatewayV2LANDisableSourceBinding(disable.Request, state.Apps[disable.Request.AppID]) {
+		if state.Pending == nil && !legacyPair &&
+			!gatewayV2LANDisableSourceBinding(disable.Request, state.Apps[disable.Request.AppID]) {
 			if !proveGatewayV2LANDisabled(ctx, driver, state, journal, disable.Request) {
 				return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 			}
@@ -292,6 +290,9 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 	}
 	if len(recoveryCandidates) == 0 {
 		return GatewayV2LANAccessStartupInspection{Disposition: GatewayV2LANStartupNormal}, nil
+	}
+	if !gatewayV2LANRecoveryCandidatesCompatible(recoveryCandidates, claims) {
+		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 	}
 	ordered := make([]gatewayV2LANAccessStartupRecoveryCandidate, 0, len(recoveryCandidates))
 	for _, candidate := range recoveryCandidates {
@@ -305,7 +306,8 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 			return ordered[left].port < ordered[right].port
 		}
 		if ordered[left].Kind != ordered[right].Kind {
-			return ordered[left].Kind < ordered[right].Kind
+			return gatewayV2LANRecoveryKindOrder(gatewayV2PendingKind(ordered[left].Kind)) <
+				gatewayV2LANRecoveryKindOrder(gatewayV2PendingKind(ordered[right].Kind))
 		}
 		return ordered[left].OperationID < ordered[right].OperationID
 	})
@@ -325,6 +327,103 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 		Disposition: GatewayV2LANStartupRecoveryOnly,
 		Recoveries:  recoveries,
 	}, nil
+}
+
+// Migration 029 could backfill a prepared disable beside the exact prepared
+// migration-028 grant it froze. That is the sole recovery collision allowed:
+// the grant must roll back before the disable can commit the same immutable
+// allocation lineage. New writes are fenced from creating this shape.
+func gatewayV2LANRecoveryLegacyPreparedPair(grant GatewayV2LANStartupClaim,
+	disable GatewayV2LANDisableStartupClaim,
+) bool {
+	return grant.State == appaccess.AppAccessGrantPrepared && grant.StateSequence == 1 &&
+		grant.DisableIntentOperationID == disable.Request.OperationID &&
+		disable.State == appaccess.AppAccessDisablePrepared && disable.StateSequence == 1 &&
+		!disable.ClearAcknowledged && disable.Request.SourceGrant == nil &&
+		gatewayV2LANDisableMatchesGrantIdentity(disable.Request, grant.Request)
+}
+
+func gatewayV2LANDisableMatchesGrantIdentity(disable GatewayV2LANDisableRequest,
+	grant GatewayV2LANGrantRequest,
+) bool {
+	return disable.AppID == grant.AppID && disable.AllocationID == grant.AllocationID &&
+		disable.OwnerOperationID == grant.OwnerOperationID && disable.Port == grant.Port &&
+		disable.AccessRevisionID == grant.AccessRevisionID &&
+		disable.AccessRevisionNumber == grant.AccessRevisionNumber &&
+		disable.AccessSpecDigest == grant.AccessSpecDigest &&
+		disable.GatewayProfileRevisionID == grant.GatewayProfileRevisionID &&
+		disable.GatewayProfileRevisionNumber == grant.GatewayProfileRevisionNumber &&
+		disable.GatewayProfileSpecDigest == grant.GatewayProfileSpecDigest
+}
+
+func gatewayV2LANBindingMatchesRequest(binding *gatewayV2LANBinding, request GatewayV2LANGrantRequest) bool {
+	if binding == nil {
+		return false
+	}
+	want, err := gatewayV2LANBindingForRequest(request)
+	return err == nil && reflect.DeepEqual(*binding, want)
+}
+
+func gatewayV2LANRecoveryLegacyGrantForDisable(claims gatewayV2LANAccessStartupClaims,
+	disable GatewayV2LANDisableStartupClaim,
+) (GatewayV2LANStartupClaim, bool) {
+	if disable.Request.SourceGrant != nil {
+		return GatewayV2LANStartupClaim{}, false
+	}
+	for _, grant := range claims.grants.byAttempt {
+		if gatewayV2LANRecoveryLegacyPreparedPair(grant, disable) {
+			return grant, true
+		}
+	}
+	return GatewayV2LANStartupClaim{}, false
+}
+
+func gatewayV2LANRecoveryCandidatesCompatible(
+	candidates map[string]gatewayV2LANAccessStartupRecoveryCandidate,
+	claims gatewayV2LANAccessStartupClaims,
+) bool {
+	byApp := make(map[string][]gatewayV2LANAccessStartupRecoveryCandidate)
+	byPort := make(map[uint16][]gatewayV2LANAccessStartupRecoveryCandidate)
+	for _, candidate := range candidates {
+		byApp[candidate.AppID] = append(byApp[candidate.AppID], candidate)
+		byPort[candidate.port] = append(byPort[candidate.port], candidate)
+	}
+	for _, collisions := range byApp {
+		if len(collisions) > 1 && !gatewayV2LANRecoveryCandidatesAreLegacyPair(collisions, claims) {
+			return false
+		}
+	}
+	for _, collisions := range byPort {
+		if len(collisions) > 1 && !gatewayV2LANRecoveryCandidatesAreLegacyPair(collisions, claims) {
+			return false
+		}
+	}
+	return true
+}
+
+func gatewayV2LANRecoveryCandidatesAreLegacyPair(
+	candidates []gatewayV2LANAccessStartupRecoveryCandidate,
+	claims gatewayV2LANAccessStartupClaims,
+) bool {
+	if len(candidates) != 2 || candidates[0].AppID != candidates[1].AppID ||
+		candidates[0].port != candidates[1].port {
+		return false
+	}
+	var grantCandidate, disableCandidate *gatewayV2LANAccessStartupRecoveryCandidate
+	for index := range candidates {
+		switch candidates[index].Kind {
+		case GatewayV2LANRecoveryGrant:
+			grantCandidate = &candidates[index]
+		case GatewayV2LANRecoveryDisable:
+			disableCandidate = &candidates[index]
+		}
+	}
+	if grantCandidate == nil || disableCandidate == nil {
+		return false
+	}
+	grant, grantExists := claims.grants.byAttempt[grantCandidate.OperationID]
+	disable, disableExists := claims.disables[disableCandidate.OperationID]
+	return grantExists && disableExists && gatewayV2LANRecoveryLegacyPreparedPair(grant, disable)
 }
 
 func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,

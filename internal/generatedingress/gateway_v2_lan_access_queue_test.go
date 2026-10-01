@@ -80,6 +80,34 @@ func TestGatewayV2LANAccessStartupClassifiesMixedGrantAndDisableQueue(t *testing
 	assertGatewayV2LANAccessQueueQuarantineRemainsFailClosed(t, manager, store, journal, driver, grants, disables)
 }
 
+func TestGatewayV2LANAccessStartupClassifiesExactLegacyPreparedGrantDisablePair(t *testing.T) {
+	manager, _, _, _, request, disable, grants, disables := gatewayV2LANRecoveryLegacyPairFixture(t)
+	want := GatewayV2LANAccessStartupInspection{
+		Disposition: GatewayV2LANStartupRecoveryOnly,
+		Recoveries: []GatewayV2LANAccessStartupRecovery{
+			{Kind: GatewayV2LANRecoveryGrant, OperationID: request.AttemptID, AppID: request.AppID},
+			{Kind: GatewayV2LANRecoveryDisable, OperationID: disable.OperationID, AppID: request.AppID},
+		},
+	}
+	inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), grants, disables)
+	if err != nil || !reflect.DeepEqual(inspection, want) {
+		t.Fatalf("inspection=%#v err=%v want=%#v", inspection, err, want)
+	}
+
+	forged := append([]GatewayV2LANStartupClaim(nil), grants...)
+	forged[0].DisableIntentOperationID = "41414141-4141-4141-8141-414141414141"
+	if inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), forged, disables); err == nil ||
+		!reflect.DeepEqual(inspection, GatewayV2LANAccessStartupInspection{}) {
+		t.Fatalf("forged lineage inspection=%#v err=%v", inspection, err)
+	}
+	forgedDisable := append([]GatewayV2LANDisableStartupClaim(nil), disables...)
+	forgedDisable[0].Request.SourceGrant = &request
+	if inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), grants, forgedDisable); err == nil ||
+		!reflect.DeepEqual(inspection, GatewayV2LANAccessStartupInspection{}) {
+		t.Fatalf("prepared source-grant inspection=%#v err=%v", inspection, err)
+	}
+}
+
 func TestGatewayV2LANAccessStartupRejectsDuplicateAndForgedQueueIdentities(t *testing.T) {
 	t.Run("duplicate grant attempt", func(t *testing.T) {
 		manager, _, _, _, request, _ := gatewayV2LANGrantFixture(t)

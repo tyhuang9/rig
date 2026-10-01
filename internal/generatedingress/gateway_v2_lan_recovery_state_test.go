@@ -199,6 +199,52 @@ func TestGatewayV2LANRecoveryStateAcceptsDBOnlyDisableWithoutLiveBinding(t *test
 	}
 }
 
+func TestGatewayV2LANRecoveryStateAdvancesExactLegacyGrantDisablePair(t *testing.T) {
+	state := gatewayV2LANRecoveryTestState(t)
+	grant := gatewayV2LANRecoveryGrantItem(t, state, upgradeTestAppA, 8100)
+	app := state.Apps[grant.AppID]
+	app.LAN = cloneGatewayV2LANBinding(grant.Grant)
+	state.Apps[grant.AppID] = app
+	grantRequest := gatewayV2LANGrantRequestForBinding(grant.AppID, *grant.Grant)
+	disableRequest := disableRequestForGrant(t, grantRequest)
+	disableRequest.SourceGrant = nil
+	disable := gatewayV2LANRecoveryItem{
+		Kind: gatewayV2PendingLANDisable, AppID: grant.AppID, Disable: &disableRequest,
+	}
+	state.LANRecovery = &gatewayV2LANRecoveryBatch{Items: []gatewayV2LANRecoveryItem{grant, disable}}
+	if !validGatewayV2RouteState(state) {
+		t.Fatal("exact legacy pair state was rejected")
+	}
+
+	clearedGrant, err := gatewayV2LANRecoveryClearedHeadState(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterGrant, err := gatewayV2LANRecoveryAdvanceHeadState(clearedGrant)
+	if err != nil || afterGrant.LANRecovery.Head != 1 || !validCommittedV2StateTransition(clearedGrant, afterGrant) {
+		t.Fatalf("grant advance state=%#v err=%v", afterGrant.LANRecovery, err)
+	}
+	clearedDisable, err := gatewayV2LANRecoveryClearedHeadState(afterGrant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := gatewayV2LANRecoveryAdvanceHeadState(clearedDisable)
+	if err != nil || completed.LANRecovery.Head != 2 || !validCommittedV2StateTransition(clearedDisable, completed) {
+		t.Fatalf("disable advance state=%#v err=%v", completed.LANRecovery, err)
+	}
+	retired := cloneGatewayV2RouteState(completed)
+	retired.LANRecovery = nil
+	if !validCommittedV2StateTransition(completed, retired) {
+		t.Fatal("completed exact legacy pair could not retire")
+	}
+
+	forged := cloneGatewayV2RouteState(state)
+	forged.LANRecovery.Items[1].Disable.SourceGrant = &grantRequest
+	if validGatewayV2RouteState(forged) {
+		t.Fatal("ordinary same-app same-port collision was accepted as the legacy pair")
+	}
+}
+
 func TestGatewayV2InitialStateRejectsRecoveryBatch(t *testing.T) {
 	source, input := upgradeTestPreparation(t)
 	state, _, err := prepareGatewayV2State(source, input)
