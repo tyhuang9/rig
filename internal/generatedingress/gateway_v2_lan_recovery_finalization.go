@@ -322,10 +322,10 @@ func proveGatewayV2LANRecoveryProtected(ctx context.Context, state gatewayV2Rout
 		!proveGatewayV2LANRecoveryBatch(ctx, driver, effective, journal, allPorts) {
 		return false
 	}
-	if state.LANRecovery.Head == len(state.LANRecovery.Items) &&
-		!proveGatewayV2LANRecoveryRetired(ctx, state, effective, journal, driver) {
-		return false
-	}
+	// The bulk proof above already attests every immutable batch port and each
+	// retained grant, including when the final head has advanced. Repeating a
+	// per-port retirement proof here would reattest the whole Docker topology
+	// once for every port without observing an intervening mutation.
 	return driver.selectedInterfacePreflight(state.Profile) == nil && ctx.Err() == nil
 }
 
@@ -335,25 +335,21 @@ func proveGatewayV2LANRecoveryRetired(ctx context.Context, protected, effective 
 	if ctx == nil || driver == nil || protected.LANRecovery == nil ||
 		protected.LANRecovery.Head != len(protected.LANRecovery.Items) ||
 		!validGatewayV2RouteState(protected) || !validGatewayV2RouteState(effective) || effective.LANRecovery != nil ||
-		driver.selectedInterfacePreflight(effective.Profile) != nil ||
-		!driver.proveCommitted(ctx, effective, journal) || !driver.proveAllGranted(ctx, effective, journal) {
+		driver.selectedInterfacePreflight(effective.Profile) != nil {
 		return false
 	}
-	seen := make(map[uint16]struct{}, len(protected.LANRecovery.Items))
-	for _, item := range protected.LANRecovery.Items {
-		port, _ := gatewayV2LANRecoveryItemIdentity(item)
-		if port == 0 {
-			return false
-		}
-		if _, duplicate := seen[port]; duplicate {
-			continue
-		}
-		seen[port] = struct{}{}
-		if !driver.proveRolledBack(ctx, effective, journal, gatewayV2LANGrantRequest{AppID: item.AppID, Port: port}) {
-			return false
-		}
+	ports, err := gatewayV2LANRecoveryAllPorts(protected)
+	if err != nil {
+		return false
 	}
-	return driver.selectedInterfacePreflight(effective.Profile) == nil && ctx.Err() == nil
+	// The production batch driver attests the committed Docker topology once,
+	// then proves every retired port is 404 and all unrelated grants remain.
+	// Generic test drivers retain the separate committed-state proof.
+	if _, bulk := driver.(gatewayV2LANRecoveryBatchProof); !bulk &&
+		!driver.proveCommitted(ctx, effective, journal) {
+		return false
+	}
+	return proveGatewayV2LANRecoveryBatch(ctx, driver, effective, journal, ports) && ctx.Err() == nil
 }
 
 func gatewayV2LANRecoveryCensusMatchesHead(state gatewayV2RouteState,

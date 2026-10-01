@@ -83,6 +83,80 @@ func TestGatewayV2LANRecoveryFinalizesTwoDisablesSequentiallyAndRetires(t *testi
 	}
 }
 
+type countingGatewayV2LANRecoveryBulkProof struct {
+	*fakeGatewayV2LANGrantDriver
+	calls    int
+	ports    [][]uint16
+	failPort uint16
+}
+
+func (d *countingGatewayV2LANRecoveryBulkProof) proveLANRecoveryBatch(_ context.Context,
+	effective gatewayV2RouteState, _ gatewayMigrationJournal, ports []uint16,
+) bool {
+	d.checkLocked()
+	d.calls++
+	d.ports = append(d.ports, append([]uint16(nil), ports...))
+	if !reflect.DeepEqual(d.live, effective) || len(ports) == 0 {
+		return false
+	}
+	for _, port := range ports {
+		if port == d.failPort {
+			return false
+		}
+		for _, app := range effective.Apps {
+			if app.LAN != nil && app.LAN.Port == port {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func TestGatewayV2LANRecoveryTerminalProofUsesOneBulkPortCheckPerPhase(t *testing.T) {
+	manager, store, journal, driver, grants, disables := gatewayV2LANRecoveryTwoDisableFixture(t)
+	if err := manager.QuarantineGatewayV2LANAccessRecoveryBatch(context.Background(), grants, disables); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := store.loadBoundUpgrade(journal.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for state.LANRecovery.Head < len(state.LANRecovery.Items) {
+		state, err = gatewayV2LANRecoveryClearedHeadState(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state, err = gatewayV2LANRecoveryAdvanceHeadState(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	ports, err := gatewayV2LANRecoveryAllPorts(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bulk := &countingGatewayV2LANRecoveryBulkProof{fakeGatewayV2LANGrantDriver: driver}
+	retired := cloneGatewayV2RouteState(state)
+	retired.LANRecovery = nil
+	manager.mu.Lock()
+	protectedOK := proveGatewayV2LANRecoveryProtected(context.Background(), state, journal, bulk)
+	retiredOK := proveGatewayV2LANRecoveryRetired(context.Background(), state, retired, journal, bulk)
+	manager.mu.Unlock()
+	if !protectedOK || !retiredOK || bulk.calls != 2 ||
+		!reflect.DeepEqual(bulk.ports, [][]uint16{ports, ports}) {
+		t.Fatalf("terminal proof protected=%t retired=%t bulk calls=%d ports=%v want=%v",
+			protectedOK, retiredOK, bulk.calls, bulk.ports, ports)
+	}
+	bulk.failPort = ports[0]
+	manager.mu.Lock()
+	protectedOK = proveGatewayV2LANRecoveryProtected(context.Background(), state, journal, bulk)
+	retiredOK = proveGatewayV2LANRecoveryRetired(context.Background(), state, retired, journal, bulk)
+	manager.mu.Unlock()
+	if protectedOK || retiredOK {
+		t.Fatal("terminal proof accepted a missing 404 port")
+	}
+}
+
 func TestGatewayV2LANRecoveryFinalizesMixedGrantDisableWithoutChangingUnrelatedRoute(t *testing.T) {
 	manager, store, _, journal, first, driver := gatewayV2LANGrantFixture(t)
 	second := gatewayV2LANSecondAppRequest(t, first)
