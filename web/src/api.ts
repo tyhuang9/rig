@@ -7,9 +7,11 @@ import {
   type ApplicationConfiguration,
   type ApplicationList,
   type ApproveDeploymentPlanMigrationRequest,
+  type ApproveLANAppAccessRequest,
   type BootstrapRequest,
   type BootstrapStatus,
   type CreateApplicationRequest,
+  type ConfigureLANGatewayProfileRequest,
   type CSRFResponse,
   type Deployment,
   type DeploymentList,
@@ -31,6 +33,16 @@ import {
   type JobList,
   type JobMutationResponse,
   type JobResponse,
+  type LANAppAccessApprovalMutation,
+  type LANAppAccessRead,
+  type LANAppAccessReservationMutation,
+  type LANAppGrantMutation,
+  type LANAppGrantRead,
+  type LANGatewayProfileMutation,
+  type LANGatewayProfileRead,
+  type LANGatewayProfileSpec,
+  type LANGatewayUpgradeMutation,
+  type LANGatewayUpgradeRead,
   type LoginRequest,
   type LocalRoute,
   type MachineList,
@@ -43,17 +55,20 @@ import {
   type RelayEnrollmentStatus,
   type RelayKeyRotationStatus,
   type ResumeApplicationAutoDeployRequest,
+  type ReserveLANAppAccessRequest,
   type ReleaseList,
   type RuntimeApprovalList,
   type RuntimeApprovalMutationResponse,
   type RuntimeApprovalResponse,
   type GrantRuntimeApprovalRequest,
+  type GrantLANAppAccessRequest,
   type SessionResponse,
   type SourceConnection,
   type SourceConnectionList,
   type SystemStatus,
   type StartRelayEnrollmentRequest,
   type UpdateApplicationAutoDeployRequest,
+  type UpgradeLANGatewayRequest,
 } from "./generated/api-contract";
 
 export type {
@@ -62,7 +77,9 @@ export type {
   ApplicationAutoDeployStatus,
   ApplicationConfiguration,
   ApproveDeploymentPlanMigrationRequest,
+  ApproveLANAppAccessRequest,
   CreateApplicationRequest,
+  ConfigureLANGatewayProfileRequest,
   GitHubBranch,
   GitHubDeviceAuthorization,
   GitHubConnectionAuthorization,
@@ -76,6 +93,20 @@ export type {
   InspectResponse,
   Job,
   LocalRoute,
+  LANAppAccessApprovalMutation,
+  LANAppAccessRead,
+  LANAppAccessRevision,
+  LANAppAccessReservationMutation,
+  LANAppGrantClaim,
+  LANAppGrantMutation,
+  LANAppGrantRead,
+  LANGatewayCandidate,
+  LANGatewayProfileMutation,
+  LANGatewayProfileRead,
+  LANGatewayProfileSpec,
+  LANGatewayUpgradeMutation,
+  LANGatewayUpgradeProposal,
+  LANGatewayUpgradeRead,
   Machine,
   SourceConnection,
   SystemStatus,
@@ -92,13 +123,16 @@ export type {
   AnalysisFinding,
   Release,
   RuntimeApproval,
+  GrantLANAppAccessRequest,
   RelayStatus,
   RelayBindingStatus,
   RelayEnrollmentStart,
   RelayEnrollmentStatus,
   RelayKeyRotationStatus,
   ResumeApplicationAutoDeployRequest,
+  ReserveLANAppAccessRequest,
   UpdateApplicationAutoDeployRequest,
+  UpgradeLANGatewayRequest,
   StartRelayEnrollmentRequest,
 } from "./generated/api-contract";
 
@@ -134,12 +168,44 @@ export type DeployExpectedRevisions = {
 };
 
 export const LOCAL_ROUTE_MAX_AGE_MS = 60_000;
+export const LAN_ACCESS_MAX_AGE_MS = 60_000;
 
 export function localRouteObservationFresh(route: Pick<LocalRoute, "observedAt"> | undefined, nowMs = Date.now()): boolean {
   if (typeof route?.observedAt !== "string") return false;
   const observedMs = Date.parse(route.observedAt);
   const ageMs = nowMs - observedMs;
   return Number.isFinite(observedMs) && ageMs >= -5_000 && ageMs < LOCAL_ROUTE_MAX_AGE_MS;
+}
+
+export function lanAccessObservationFresh(access: Pick<LANAppAccessRead, "observedAt"> | undefined, nowMs = Date.now()): boolean {
+  if (typeof access?.observedAt !== "string") return false;
+  const observedMs = Date.parse(access.observedAt);
+  const ageMs = nowMs - observedMs;
+  return Number.isFinite(observedMs) && ageMs >= -5_000 && ageMs < LAN_ACCESS_MAX_AGE_MS;
+}
+
+function validPrivateIPv4(hostname: string): boolean {
+  const octets = hostname.split(".");
+  if (octets.length !== 4) return false;
+  const parsed = octets.map((part) => /^\d{1,3}$/.test(part) ? Number(part) : Number.NaN);
+  if (parsed.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  return parsed[0] === 10 || (parsed[0] === 172 && parsed[1] >= 16 && parsed[1] <= 31) || (parsed[0] === 192 && parsed[1] === 168);
+}
+
+// The controller alone attests a LAN endpoint. This extra guard prevents stale
+// or malformed cached data from becoming a clickable or copyable address.
+export function verifiedLANAccessURL(access: LANAppAccessRead | undefined, nowMs = Date.now()): string | null {
+  const desired = access?.desiredAccess;
+  if (!access || access.availability !== "verified" || !desired || desired.allocation.state !== "active" ||
+      typeof access.url !== "string" || !lanAccessObservationFresh(access, nowMs)) return null;
+  try {
+    const parsed = new URL(access.url);
+    return parsed.protocol === "http:" && validPrivateIPv4(parsed.hostname) &&
+      parsed.port === String(desired.allocation.port) && parsed.pathname === "/" && !parsed.search && !parsed.hash &&
+      !parsed.username && !parsed.password ? parsed.href : null;
+  } catch {
+    return null;
+  }
 }
 
 // A route is usable in the UI only when the controller's observation agrees with
@@ -237,6 +303,17 @@ function operationPath(path: string, values: Record<string, string | number>) {
 function pagedPath(path: string, values: Record<string, string | number>, page: number, perPage: number) {
   const query = new URLSearchParams({ page: String(page), perPage: String(perPage) });
   return `${operationPath(path, values)}?${query.toString()}`;
+}
+
+function lanGatewayProfilePath(spec?: LANGatewayProfileSpec) {
+  if (!spec) return operations.getLANGatewayProfile.path;
+  const query = new URLSearchParams({
+    interfaceId: spec.interfaceId,
+    selectedIpv4: spec.selectedIpv4,
+    portStart: String(spec.portStart),
+    portEnd: String(spec.portEnd),
+  });
+  return `${operations.getLANGatewayProfile.path}?${query.toString()}`;
 }
 
 function inspectionCollection<T>(value: unknown): T[] {
@@ -364,6 +441,19 @@ export const api = {
   csrf: rotateCSRF,
   logout: () => request<void>(operations.logout.path, { method: "DELETE" }),
   status: () => request<SystemStatus>(operations.systemStatus.path),
+  lanGatewayProfile: (spec?: LANGatewayProfileSpec) =>
+    request<LANGatewayProfileRead>(lanGatewayProfilePath(spec), { cache: "no-store" }),
+  configureLANGatewayProfile: (data: ConfigureLANGatewayProfileRequest) =>
+    request<LANGatewayProfileMutation>(operations.configureLANGatewayProfile.path, {
+      method: operations.configureLANGatewayProfile.method,
+      body: JSON.stringify(data),
+    }),
+  lanGatewayUpgrade: () => request<LANGatewayUpgradeRead>(operations.getLANGatewayUpgrade.path, { cache: "no-store" }),
+  upgradeLANGateway: (data: UpgradeLANGatewayRequest) =>
+    request<LANGatewayUpgradeMutation>(operations.upgradeLANGateway.path, {
+      method: operations.upgradeLANGateway.method,
+      body: JSON.stringify(data),
+    }),
   apps: () => request<ApplicationList>(operations.listApplications.path),
   app: (id: string) => request<Application>(operationPath(operations.getApplication.path, { appId: id })),
   getApplicationAutoDeploy: (id: string) =>
@@ -476,6 +566,25 @@ export const api = {
     request<LocalRoute>(operationPath(operations.getApplicationLocalRoute.path, { appId }), {
       cache: "no-store",
     }),
+  lanAccess: (appId: string) =>
+    request<LANAppAccessRead>(operationPath(operations.getApplicationLANAccess.path, { appId }), { cache: "no-store" }),
+  reserveLANAccess: (appId: string, data: ReserveLANAppAccessRequest) =>
+    request<LANAppAccessReservationMutation>(operationPath(operations.reserveApplicationLANAccess.path, { appId }), {
+      method: operations.reserveApplicationLANAccess.method,
+      body: JSON.stringify(data),
+    }),
+  approveLANAccess: (appId: string, data: ApproveLANAppAccessRequest) =>
+    request<LANAppAccessApprovalMutation>(operationPath(operations.approveApplicationLANAccess.path, { appId }), {
+      method: operations.approveApplicationLANAccess.method,
+      body: JSON.stringify(data),
+    }),
+  grantLANAccess: (appId: string, data: GrantLANAppAccessRequest) =>
+    request<LANAppGrantMutation>(operationPath(operations.grantApplicationLANAccess.path, { appId }), {
+      method: operations.grantApplicationLANAccess.method,
+      body: JSON.stringify(data),
+    }),
+  lanGrant: (appId: string, attemptId: string) =>
+    request<LANAppGrantRead>(operationPath(operations.getApplicationLANGrant.path, { appId, attemptId }), { cache: "no-store" }),
   releases: (appId: string) =>
     request<ReleaseList>(operationPath(operations.listReleases.path, { appId })),
   runtimeApprovals: (appId: string) =>
