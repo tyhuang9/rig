@@ -41,6 +41,7 @@ import {
   type DisableLANAppAccessRequest,
   type LANAppGrantMutation,
   type LANAppGrantRead,
+  type LANRecoveryHead,
   type LANGatewayProfileMutation,
   type LANGatewayProfileRead,
   type LANGatewayProfileSpec,
@@ -108,6 +109,7 @@ export type {
   LANAppGrantClaim,
   LANAppGrantMutation,
   LANAppGrantRead,
+  LANRecoveryHead,
   LANGatewayCandidate,
   LANGatewayProfileMutation,
   LANGatewayProfileRead,
@@ -165,6 +167,28 @@ export class APIError extends Error {
     this.detail = detail;
     this.errors = errors;
     this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+type GatewayReconciliationListener = (error: APIError) => void;
+const gatewayReconciliationListeners = new Set<GatewayReconciliationListener>();
+
+export function isGatewayReconciliationRequired(error: unknown): error is APIError {
+  return error instanceof APIError && error.status === 503 && error.code === "gateway_reconciliation_required";
+}
+
+export function subscribeGatewayReconciliationRequired(listener: GatewayReconciliationListener) {
+  gatewayReconciliationListeners.add(listener);
+  return () => { gatewayReconciliationListeners.delete(listener); };
+}
+
+function publishGatewayReconciliationRequired(error: APIError) {
+  for (const listener of gatewayReconciliationListeners) {
+    try {
+      listener(error);
+    } catch {
+      // A UI subscriber cannot replace or swallow the original API failure.
+    }
   }
 }
 
@@ -266,7 +290,20 @@ async function rotateCSRF(): Promise<string> {
     credentials: "same-origin",
     headers: { Accept: "application/json" },
   });
-  if (!response.ok) throw new Error("Authentication required");
+  if (!response.ok) {
+    const parsed = await response.json().catch(() => null);
+    const problem = parsed !== null && typeof parsed === "object" ? parsed : {};
+    const error = new APIError({
+      status: response.status,
+      code: typeof problem.code === "string" ? problem.code : "request_failed",
+      detail: typeof problem.detail === "string" ? problem.detail : "Request failed",
+    });
+    if (isGatewayReconciliationRequired(error)) {
+      publishGatewayReconciliationRequired(error);
+      throw error;
+    }
+    throw new Error("Authentication required");
+  }
   const body = (await response.json()) as CSRFResponse;
   setCSRF(body.csrfToken);
   return body.csrfToken;
@@ -291,7 +328,7 @@ async function request<T>(path: string, init: RequestInit = {}, retryCSRF = true
     }
     const retryAfter = response.headers.get("Retry-After");
     const retryAfterSeconds = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) : undefined;
-    throw new APIError({
+    const error = new APIError({
       status: response.status,
       code: typeof body.code === "string" ? body.code : "request_failed",
       detail: typeof body.detail === "string" ? body.detail : "Request failed",
@@ -300,6 +337,8 @@ async function request<T>(path: string, init: RequestInit = {}, retryCSRF = true
         : {},
       retryAfterSeconds,
     });
+    if (isGatewayReconciliationRequired(error)) publishGatewayReconciliationRequired(error);
+    throw error;
   }
   return response.status === 204 ? (undefined as T) : response.json();
 }
@@ -448,7 +487,8 @@ export const api = {
   me: () => request<MeResponse>(operations.me.path),
   csrf: rotateCSRF,
   logout: () => request<void>(operations.logout.path, { method: "DELETE" }),
-  status: () => request<SystemStatus>(operations.systemStatus.path),
+  status: () => request<SystemStatus>(operations.systemStatus.path, { cache: "no-store" }),
+  lanRecoveryHead: () => request<LANRecoveryHead>(operations.getLANRecoveryHead.path, { cache: "no-store" }),
   lanGatewayProfile: (spec?: LANGatewayProfileSpec) =>
     request<LANGatewayProfileRead>(lanGatewayProfilePath(spec), { cache: "no-store" }),
   configureLANGatewayProfile: (data: ConfigureLANGatewayProfileRequest) =>
