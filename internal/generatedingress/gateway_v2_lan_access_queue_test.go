@@ -105,7 +105,7 @@ func TestGatewayV2LANAccessStartupRejectsDuplicateAndForgedQueueIdentities(t *te
 			t.Fatalf("inspection=%#v err=%v", inspection, err)
 		}
 	})
-	t.Run("ambiguous app and port", func(t *testing.T) {
+	t.Run("same app different ports", func(t *testing.T) {
 		manager, _, _, _, request, _ := gatewayV2LANGrantFixture(t)
 		conflict := request
 		conflict.AttemptID = "36363636-3636-4636-8636-363636363636"
@@ -115,6 +115,7 @@ func TestGatewayV2LANAccessStartupRejectsDuplicateAndForgedQueueIdentities(t *te
 		conflict.AccessRevisionID = "39393939-3939-4939-8939-393939393939"
 		conflict.AccessRevisionNumber++
 		conflict.ApprovedBy = "40404040-4040-4040-8040-404040404040"
+		conflict.Port++
 		conflict.AccessSpecDigest = mustGatewayV2LANAccessDigest(t, conflict)
 		inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), []GatewayV2LANStartupClaim{
 			gatewayV2LANStartupClaim(request, appaccess.AppAccessGrantPrepared, 1),
@@ -122,6 +123,22 @@ func TestGatewayV2LANAccessStartupRejectsDuplicateAndForgedQueueIdentities(t *te
 		}, nil)
 		if !IsCode(err, DiagnosticRouteUnresolved) || !reflect.DeepEqual(inspection, GatewayV2LANAccessStartupInspection{}) {
 			t.Fatalf("inspection=%#v err=%v", inspection, err)
+		}
+	})
+	t.Run("same port different apps", func(t *testing.T) {
+		manager, _, _, _, request, _ := gatewayV2LANGrantFixture(t)
+		second := gatewayV2LANSecondAppRequest(t, request)
+		second.Port = request.Port
+		second.AccessSpecDigest = mustGatewayV2LANAccessDigest(t, second)
+		claims := []GatewayV2LANStartupClaim{
+			gatewayV2LANStartupClaim(request, appaccess.AppAccessGrantPrepared, 1),
+			gatewayV2LANStartupClaim(second, appaccess.AppAccessGrantPrepared, 1),
+		}
+		for _, ordered := range [][]GatewayV2LANStartupClaim{claims, {claims[1], claims[0]}} {
+			inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), ordered, nil)
+			if !IsCode(err, DiagnosticRouteUnresolved) || !reflect.DeepEqual(inspection, GatewayV2LANAccessStartupInspection{}) {
+				t.Fatalf("same-port inspection=%#v err=%v", inspection, err)
+			}
 		}
 	})
 }

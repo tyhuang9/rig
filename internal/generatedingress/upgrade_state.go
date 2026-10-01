@@ -21,10 +21,11 @@ import (
 )
 
 const (
-	v2RouteStatePurpose  = "hostd/generated-ingress/routes/v2"
-	v2RouteStateFilename = "routes-v2.bundle"
-	v2RouteStateVersion  = 2
-	maxV2RouteStateBytes = 192 << 10
+	v2RouteStatePurpose     = "hostd/generated-ingress/routes/v2"
+	v2RouteStateFilename    = "routes-v2.bundle"
+	v2RouteStateVersion     = 2
+	maxV2RouteStateBytes    = 192 << 10
+	maxV2ProtectedFileBytes = 256 << 10
 
 	gatewayMigrationPurpose  = "hostd/generated-ingress/migration/v1"
 	gatewayMigrationFilename = "gateway-v1-to-v2.bundle"
@@ -48,7 +49,12 @@ const (
 )
 
 var (
-	upgradeProtectedRead     = secretfile.Read
+	upgradeProtectedRead = func(path, purpose string) ([]byte, error) {
+		if purpose == v2RouteStatePurpose || strings.HasPrefix(purpose, v2RouteStatePurpose+"/") {
+			return secretfile.ReadBounded(path, purpose, maxV2ProtectedFileBytes)
+		}
+		return secretfile.Read(path, purpose)
+	}
 	upgradeProtectedWrite    = secretfile.Write
 	upgradeProtectedWriteNew = secretfile.WriteNew
 )

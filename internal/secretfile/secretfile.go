@@ -8,7 +8,10 @@ import (
 	"path/filepath"
 )
 
-const maxSecretFileBytes = 64 << 10
+const (
+	maxSecretFileBytes        = 64 << 10
+	maxBoundedSecretFileBytes = 256 << 10
+)
 
 var syncParentDirectory = syncDirectory
 
@@ -95,8 +98,19 @@ func write(path, purpose string, plaintext []byte, createOnly bool) error {
 // Read loads and decrypts a purpose-bound secret. It rejects symlinks,
 // non-regular files, unsafe POSIX permissions, and unsupported formats.
 func Read(path, purpose string) ([]byte, error) {
+	return ReadBounded(path, purpose, maxSecretFileBytes)
+}
+
+// ReadBounded permits a caller with its own strict plaintext limit to read a
+// larger protected artifact. maximum bounds persisted bytes, including the
+// protection envelope; callers must separately bound decoded plaintext.
+// Ordinary secrets retain Read's 64 KiB persisted-byte limit.
+func ReadBounded(path, purpose string, maximum int) ([]byte, error) {
 	if path == "" || purpose == "" {
 		return nil, errors.New("secret path and purpose are required")
+	}
+	if maximum <= 0 || maximum > maxBoundedSecretFileBytes {
+		return nil, errors.New("secret file size limit is invalid")
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -113,12 +127,12 @@ func Read(path, purpose string) ([]byte, error) {
 		return nil, fmt.Errorf("open secret file: %w", err)
 	}
 	defer file.Close()
-	persisted, err := io.ReadAll(io.LimitReader(file, maxSecretFileBytes+1))
+	persisted, err := io.ReadAll(io.LimitReader(file, int64(maximum)+1))
 	if err != nil {
 		return nil, fmt.Errorf("read secret file: %w", err)
 	}
 	defer clear(persisted)
-	if len(persisted) > maxSecretFileBytes {
+	if len(persisted) > maximum {
 		return nil, errors.New("secret file is too large")
 	}
 	plaintext, err := unprotect(purpose, persisted)

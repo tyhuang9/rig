@@ -144,6 +144,50 @@ func TestGatewayV2LANRecoveryStatePreservesLegacyPendingAndCreationBoundary(t *t
 	}
 }
 
+func TestGatewayV2LANRecoveryStatePreservesLegacyWithdrawalAndDisable(t *testing.T) {
+	for _, kind := range []gatewayV2PendingKind{gatewayV2PendingLANWithdrawal, gatewayV2PendingLANDisable} {
+		t.Run(string(kind), func(t *testing.T) {
+			current := gatewayV2LANRecoveryTestState(t)
+			bindLANForTest(t, &current, upgradeTestAppA, 8100)
+			previous := cloneGatewayV2AppRoute(current.Apps[upgradeTestAppA])
+			proposed := cloneGatewayV2AppRoute(previous)
+			proposed.LAN = nil
+			pending := &gatewayV2PendingRoute{
+				Kind: kind, AppID: upgradeTestAppA, Previous: &previous,
+				Proposed: proposed, ActivationUncertain: true,
+			}
+			item := gatewayV2LANRecoveryItem{AppID: upgradeTestAppA}
+			if kind == gatewayV2PendingLANDisable {
+				request := disableRequestForGrant(t, gatewayV2LANGrantRequestForBinding(upgradeTestAppA, *previous.LAN))
+				pending.Disable = &request
+				item.Kind = gatewayV2PendingLANDisable
+				item.Disable = &request
+			} else {
+				item.Kind = gatewayV2PendingLANGrant
+				binding := *previous.LAN
+				item.Grant = &binding
+			}
+			current.Pending = pending
+			if !validGatewayV2RouteState(current) {
+				t.Fatal("legacy pending fixture is invalid")
+			}
+			next := cloneGatewayV2RouteState(current)
+			next.Pending = nil
+			next.LANRecovery = &gatewayV2LANRecoveryBatch{
+				Items: []gatewayV2LANRecoveryItem{item}, LegacyPending: cloneGatewayV2PendingRoute(current.Pending),
+			}
+			if !validGatewayV2RouteState(next) || !validCommittedV2StateTransition(current, next) {
+				t.Fatal("exact pending evidence was not preserved")
+			}
+			altered := cloneGatewayV2RouteState(next)
+			altered.LANRecovery.LegacyPending.AppID = upgradeTestAppB
+			if validCommittedV2StateTransition(current, altered) {
+				t.Fatal("altered legacy pending identity was accepted")
+			}
+		})
+	}
+}
+
 func TestGatewayV2LANRecoveryStateAcceptsDBOnlyDisableWithoutLiveBinding(t *testing.T) {
 	state := gatewayV2LANRecoveryTestState(t)
 	grant := gatewayV2LANRecoveryGrantItem(t, state, upgradeTestAppA, 8100)
@@ -177,6 +221,7 @@ func TestGatewayV2LANRecoveryMaximumStateFitsProtectedArtifactLimit(t *testing.T
 	template := cloneGatewayV2AppRoute(state.Apps[upgradeTestAppA])
 	state.Apps = make(map[string]gatewayV2AppRoute, maxStateApps)
 	items := make([]gatewayV2LANRecoveryItem, 0, maxStateApps)
+	var legacyPending *gatewayV2PendingRoute
 	for index := 0; index < maxStateApps; index++ {
 		appID := gatewayV2LANRecoveryTestUUID(0x1000 + index)
 		allocationID := gatewayV2LANRecoveryTestUUID(0x2000 + index)
@@ -199,13 +244,28 @@ func TestGatewayV2LANRecoveryMaximumStateFitsProtectedArtifactLimit(t *testing.T
 		disable := disableRequestForGrant(t, grant)
 		disable.OperationID = gatewayV2LANRecoveryTestUUID(0x6000 + index)
 		disable.RequestDigest = strings.Repeat("b", 64)
-		state.Apps[appID] = cloneGatewayV2AppRoute(template)
+		app := cloneGatewayV2AppRoute(template)
+		if index == 0 {
+			binding, err := gatewayV2LANBindingForRequest(grant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			app.LAN = &binding
+			previous := cloneGatewayV2AppRoute(app)
+			proposed := cloneGatewayV2AppRoute(app)
+			proposed.LAN = nil
+			legacyPending = &gatewayV2PendingRoute{
+				Kind: gatewayV2PendingLANDisable, AppID: appID, Previous: &previous,
+				Proposed: proposed, ActivationUncertain: true, Disable: &disable,
+			}
+		}
+		state.Apps[appID] = app
 		items = append(items, gatewayV2LANRecoveryItem{
 			Kind: gatewayV2PendingLANDisable, AppID: appID, Disable: &disable,
 		})
 	}
 	sort.Slice(items, func(i, j int) bool { return gatewayV2LANRecoveryItemLess(items[i], items[j]) })
-	state.LANRecovery = &gatewayV2LANRecoveryBatch{Items: items}
+	state.LANRecovery = &gatewayV2LANRecoveryBatch{Items: items, LegacyPending: legacyPending}
 	if !validGatewayV2RouteState(state) {
 		t.Fatal("maximum deterministic recovery state is structurally invalid")
 	}
@@ -215,6 +275,18 @@ func TestGatewayV2LANRecoveryMaximumStateFitsProtectedArtifactLimit(t *testing.T
 	}
 	if len(body) > maxV2RouteStateBytes {
 		t.Fatalf("maximum recovery state uses %d bytes, protected cap is %d", len(body), maxV2RouteStateBytes)
+	}
+	source, _ := upgradeTestPreparation(t)
+	store := newUpgradeStoreWithV1(t, source)
+	if err := store.writeExact(store.v2Path, store.v2Purpose, state, true, maxV2RouteStateBytes); err != nil {
+		t.Fatalf("protected maximum recovery state write: %v", err)
+	}
+	loaded, err := store.loadV2State()
+	if err != nil || !reflect.DeepEqual(loaded, state) {
+		var decoded gatewayV2RouteState
+		readErr := store.readStrict(store.v2Path, store.v2Purpose, maxV2RouteStateBytes, &decoded)
+		t.Fatalf("protected maximum recovery state readback: %v (strict=%v valid=%t equal=%t)",
+			err, readErr, validGatewayV2RouteState(decoded), reflect.DeepEqual(decoded, state))
 	}
 	t.Logf("maximum recovery state uses %d of %d protected bytes", len(body), maxV2RouteStateBytes)
 }

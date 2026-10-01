@@ -219,7 +219,7 @@ func runServer(args []string) int {
 		if gate.inspection.Disposition == generatedingress.GatewayV2StartupNormalV2 {
 			confirmedAccessInspection, accessErr := runtime.ingress.InspectGatewayV2LANAccessStartup(context.Background(),
 				lanGrantStartupClaims(confirmedSnapshot.Grants), lanDisableStartupClaims(confirmedSnapshot.Disables))
-			if accessErr != nil || confirmedAccessInspection != gate.accessInspection {
+			if accessErr != nil || !reflect.DeepEqual(confirmedAccessInspection, gate.accessInspection) {
 				logger.Error("LAN access startup inspection changed after recovery", "error", accessErr)
 				emergencyStop()
 				return 1
