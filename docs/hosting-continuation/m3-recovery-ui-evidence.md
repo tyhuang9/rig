@@ -69,3 +69,10 @@ widths remain unverified. CodeRabbit review was unavailable because its WSL
 CLI reported `not_authenticated`; the separate security review identified
 the stale-tab issue and confirmed the bounded fix in static follow-up. This
 branch has not been published, merged, or deployed. M3 acceptance remains open.
+
+After this code checkpoint, a live Docker run was attempted on Windows with
+Docker Desktop 4.93.0. `docker version` could not connect to the Linux engine.
+Starting Docker Desktop did not create its engine pipe; the backend log reported
+a Secrets Engine socket rename failure during startup and shut down all local
+engines. No M3 Docker fixture was run and no Docker or credential state was
+reset. Live Docker acceptance remains blocked by that local engine failure.
