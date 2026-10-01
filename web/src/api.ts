@@ -36,6 +36,9 @@ import {
   type LANAppAccessApprovalMutation,
   type LANAppAccessRead,
   type LANAppAccessReservationMutation,
+  type LANAppDisableMutation,
+  type LANAppDisableRead,
+  type DisableLANAppAccessRequest,
   type LANAppGrantMutation,
   type LANAppGrantRead,
   type LANGatewayProfileMutation,
@@ -97,6 +100,11 @@ export type {
   LANAppAccessRead,
   LANAppAccessRevision,
   LANAppAccessReservationMutation,
+  LANAppDisableClaim,
+  LANAppDisableMutation,
+  LANAppDisableRead,
+  LANAppDisableReview,
+  DisableLANAppAccessRequest,
   LANAppGrantClaim,
   LANAppGrantMutation,
   LANAppGrantRead,
@@ -196,7 +204,7 @@ function validPrivateIPv4(hostname: string): boolean {
 // or malformed cached data from becoming a clickable or copyable address.
 export function verifiedLANAccessURL(access: LANAppAccessRead | undefined, nowMs = Date.now()): string | null {
   const desired = access?.desiredAccess;
-  if (!access || access.availability !== "verified" || !desired || desired.allocation.state !== "active" ||
+  if (!access || access.availability !== "verified" || access.disableClaim || !desired || desired.allocation.state !== "active" ||
       typeof access.url !== "string" || !lanAccessObservationFresh(access, nowMs)) return null;
   try {
     const parsed = new URL(access.url);
@@ -249,7 +257,7 @@ export function clearCSRF() {
   window.sessionStorage.removeItem("hostd-csrf");
   window.sessionStorage.removeItem("rig-github-authorization");
   for (const key of Object.keys(window.sessionStorage)) {
-    if (key.startsWith("rig-setup-deployment:")) window.sessionStorage.removeItem(key);
+    if (key.startsWith("rig-setup-deployment:") || key.startsWith("rig-lan-access-")) window.sessionStorage.removeItem(key);
   }
 }
 
@@ -585,6 +593,13 @@ export const api = {
     }),
   lanGrant: (appId: string, attemptId: string) =>
     request<LANAppGrantRead>(operationPath(operations.getApplicationLANGrant.path, { appId, attemptId }), { cache: "no-store" }),
+  disableLANAccess: (appId: string, data: DisableLANAppAccessRequest) =>
+    request<LANAppDisableMutation>(operationPath(operations.disableApplicationLANAccess.path, { appId }), {
+      method: operations.disableApplicationLANAccess.method,
+      body: JSON.stringify(data),
+    }),
+  lanDisable: (appId: string, operationId: string) =>
+    request<LANAppDisableRead>(operationPath(operations.getApplicationLANDisable.path, { appId, operationId }), { cache: "no-store" }),
   releases: (appId: string) =>
     request<ReleaseList>(operationPath(operations.listReleases.path, { appId })),
   runtimeApprovals: (appId: string) =>

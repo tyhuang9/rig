@@ -270,14 +270,16 @@ describe("API client", () => {
     }));
   });
 
-  it("reads an exact durable job and clears setup attempts on sign out", async () => {
+  it("reads an exact durable job and clears session-scoped attempts on sign out", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: "job-1", status: "succeeded" }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
     window.sessionStorage.setItem("rig-setup-deployment:app-1", JSON.stringify({ signature: "plan:1:config:1", key: "key" }));
+    window.sessionStorage.setItem("rig-lan-access-grant:app-1", JSON.stringify({ attemptId: "claim" }));
     await expect(api.job("job/one")).resolves.toMatchObject({ id: "job-1", status: "succeeded" });
     expect(fetchMock).toHaveBeenCalledWith("/api/v1/jobs/job%2Fone", expect.objectContaining({ credentials: "same-origin" }));
     clearCSRF();
     expect(window.sessionStorage.getItem("rig-setup-deployment:app-1")).toBeNull();
+    expect(window.sessionStorage.getItem("rig-lan-access-grant:app-1")).toBeNull();
   });
 
   it("uses generated auto-deploy paths with exact CAS request bodies and CSRF", async () => {
@@ -349,7 +351,9 @@ describe("LAN API client", () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({ allocation: { id: "allocation" }, approvalDigest: "a".repeat(64), created: true }), { status: 201 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ revision: { id: "access" }, created: true }), { status: 201 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ claim, created: true }), { status: 201 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ claim, observed: { availability: "committed" } }), { status: 200 }));
+      .mockResolvedValueOnce(new Response(JSON.stringify({ claim, observed: { availability: "committed" } }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ claim: { operationId: "disable" }, created: true }), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ claim: { operationId: "disable" }, observed: { availability: "disabled" } }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
     const profileRequest = { operationId: "11111111-1111-4111-8111-111111111111", expectedRevisionNumber: 2, spec: profileSpec, approvalDigest: "b".repeat(64) };
@@ -357,6 +361,7 @@ describe("LAN API client", () => {
     const reserveRequest = { operationId: "44444444-4444-4444-8444-444444444444", expectedRevisionNumber: 0, gatewayProfileRevisionId: "profile", gatewayProfileRevisionNumber: 3 };
     const approveRequest = { operationId: reserveRequest.operationId, allocationId: "allocation", expectedRevisionNumber: 0, approvalDigest: "a".repeat(64) };
     const grantRequest = { attemptId: claim.attemptId, accessRevisionId: "access", accessRevisionNumber: 1, approvalDigest: "d".repeat(64) };
+    const disableRequest = { operationId: "55555555-5555-4555-8555-555555555555", accessRevisionId: "access", accessRevisionNumber: 1, allocationId: "allocation", approvalDigest: "e".repeat(64) };
 
     await api.lanGatewayProfile();
     await api.lanGatewayProfile(profileSpec);
@@ -368,6 +373,8 @@ describe("LAN API client", () => {
     await api.approveLANAccess("app/one", approveRequest);
     await api.grantLANAccess("app/one", grantRequest);
     await api.lanGrant("app/one", claim.attemptId);
+    await api.disableLANAccess("app/one", disableRequest);
+    await api.lanDisable("app/one", disableRequest.operationId);
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/system/lan-gateway-profile", expect.objectContaining({ cache: "no-store" }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/system/lan-gateway-profile?interfaceId=ethernet%2Fone&selectedIpv4=192.168.50.4&portStart=8100&portEnd=8103", expect.objectContaining({ cache: "no-store" }));
@@ -378,6 +385,8 @@ describe("LAN API client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(8, "/api/v1/apps/app%2Fone/lan-access/approval", expect.objectContaining({ method: "POST", body: JSON.stringify(approveRequest), headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(9, "/api/v1/apps/app%2Fone/lan-access/grants", expect.objectContaining({ method: "POST", body: JSON.stringify(grantRequest), headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
     expect(fetchMock).toHaveBeenNthCalledWith(10, `/api/v1/apps/app%2Fone/lan-access/grants/${claim.attemptId}`, expect.objectContaining({ cache: "no-store" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(11, "/api/v1/apps/app%2Fone/lan-access/disables", expect.objectContaining({ method: "POST", body: JSON.stringify(disableRequest), headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(12, `/api/v1/apps/app%2Fone/lan-access/disables/${disableRequest.operationId}`, expect.objectContaining({ cache: "no-store" }));
   });
 });
 
@@ -404,6 +413,7 @@ describe("verified LAN access link guard", () => {
     ["path", { url: "http://192.168.50.4:8101/admin" }],
     ["query", { url: "http://192.168.50.4:8101/?token=x" }],
     ["inactive allocation", { desiredAccess: { allocation: { port: 8101, state: "uncertain" } } }],
+    ["disable claim", { disableClaim: { operationId: "disable", state: "prepared" } }],
     ["expired observation", { observedAt: "2026-09-30T23:58:59Z" }],
   ] as const)("rejects %s", (_name, change) => {
     expect(verifiedLANAccessURL({ ...access, ...change } as LANAppAccessRead, now)).toBeNull();

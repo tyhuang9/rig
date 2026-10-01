@@ -27,13 +27,13 @@ const verifiedRoute = {
 
 function DetailNavigator({ role }: { role: string }) {
   const navigate = useNavigate();
-  return <><button type="button" onClick={() => navigate("/apps/app-2")}>Open application B</button><ApplicationDetailPage role={role}/></>;
+  return <><button type="button" onClick={() => navigate("/apps/app-2")}>Open application B</button><ApplicationDetailPage role={role} userId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"/></>;
 }
 
 function renderDetail({ role, navigable = false }: { role?: string; navigable?: boolean } = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/apps/app-1"]}>
-    <Routes><Route path="/apps/:id" element={navigable ? <DetailNavigator role={role ?? "viewer"}/> : <ApplicationDetailPage role={role}/>} /></Routes>
+    <Routes><Route path="/apps/:id" element={navigable ? <DetailNavigator role={role ?? "viewer"}/> : <ApplicationDetailPage role={role} userId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"/>} /></Routes>
   </MemoryRouter></QueryClientProvider>);
   return { client, view };
 }
@@ -131,13 +131,22 @@ describe("application controller-host route", () => {
       desiredProfile: { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", revisionNumber: 1, spec: { interfaceId: "nic-1", selectedIpv4: "192.168.50.4", portStart: 8100, portEnd: 8119 } },
     };
     vi.spyOn(api, "app").mockImplementation(async (appId) => ({ id: appId, name: appId === "app-1" ? "Application A" : "Application B", slug: appId, status: "ready", source: { type: "github" } }) as never);
-    vi.spyOn(api, "lanAccess").mockResolvedValue({ expectedRevisionNumber: 0, availability: "local_only" } as never);
-    vi.spyOn(api, "lanGatewayProfile").mockResolvedValue(gatewayProfile as never);
-    vi.spyOn(api, "reserveLANAccess").mockImplementation(async (appId, request) => ({
-      created: true,
-      approvalDigest: "a".repeat(64),
-      allocation: { id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", appId, port: 8100, ownerOperationId: request.operationId, gatewayProfileRevisionId: gatewayProfile.desiredProfile.id, gatewayProfileRevisionNumber: 1, state: "reserved" },
+    let pendingReservation: Record<string, unknown> | undefined;
+    vi.spyOn(api, "lanAccess").mockImplementation(async (appId) => ({
+      expectedRevisionNumber: 0,
+      availability: "local_only",
+      pendingReservation: appId === "app-1" ? pendingReservation : undefined,
     }) as never);
+    vi.spyOn(api, "lanGatewayProfile").mockResolvedValue(gatewayProfile as never);
+    vi.spyOn(api, "reserveLANAccess").mockImplementation(async (appId, request) => {
+      const result = {
+        created: true,
+        approvalDigest: "a".repeat(64),
+        allocation: { id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", appId, port: 8100, ownerOperationId: request.operationId, gatewayProfileRevisionId: gatewayProfile.desiredProfile.id, gatewayProfileRevisionNumber: 1, state: "reserved" },
+      };
+      pendingReservation = { allocation: result.allocation, approvalDigest: result.approvalDigest, expectedRevisionNumber: 0 };
+      return result as never;
+    });
 
     renderDetail({ role: "administrator", navigable: true });
     fireEvent.click(await screen.findByRole("button", { name: "Reserve LAN port for review" }));

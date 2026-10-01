@@ -114,6 +114,8 @@ export function LANGatewayPanel({ role }: { role: string }) {
   const portValidationId = useId();
   const gatewayUpgradeHeading = useRef<HTMLHeadingElement>(null);
   const gatewayUpgradeGuidanceTarget = useRef<HTMLDivElement>(null);
+  const profileApprovalErrorTarget = useRef<HTMLDivElement>(null);
+  const gatewayUpgradeErrorTarget = useRef<HTMLDivElement>(null);
 
   const candidates = profile.data?.candidates ?? [];
   const desired = profile.data?.desiredProfile;
@@ -186,12 +188,6 @@ export function LANGatewayPanel({ role }: { role: string }) {
       : "LAN gateway state refreshed.");
   };
 
-  if (!canManage) {
-    return <section className="lan-gateway-panel" aria-labelledby="lan-gateway-title">
-      <div className="lan-heading"><div><h2 id="lan-gateway-title">LAN gateway</h2><p>LAN gateway details and controls require an administrator.</p></div></div>
-    </section>;
-  }
-
   const profileBusy = requestProfileReview.isPending || configureProfile.isPending;
   const upgradeBusy = upgradeGateway.isPending;
   const configuredProfile = profile.data?.desiredProfile;
@@ -228,6 +224,20 @@ export function LANGatewayPanel({ role }: { role: string }) {
     return () => window.clearTimeout(timer);
   }, [focusAfterUpgrade, upgrade.data?.desiredClaim?.state, upgrade.isFetching]);
 
+  useEffect(() => {
+    if (configureProfile.isError && profileReview) profileApprovalErrorTarget.current?.focus();
+  }, [configureProfile.isError, profileReview]);
+
+  useEffect(() => {
+    if (upgradeReview && (upgradeGateway.isError || !canConfirmUpgrade)) gatewayUpgradeErrorTarget.current?.focus();
+  }, [upgradeGateway.isError, upgradeReview, canConfirmUpgrade]);
+
+  if (!canManage) {
+    return <section className="lan-gateway-panel" aria-labelledby="lan-gateway-title">
+      <div className="lan-heading"><div><h2 id="lan-gateway-title">LAN gateway</h2><p>LAN gateway details and controls require an administrator.</p></div></div>
+    </section>;
+  }
+
   return <section className="lan-gateway-panel" aria-labelledby="lan-gateway-title">
     <div className="lan-heading"><div><h2 id="lan-gateway-title">LAN gateway</h2><p>Choose the controller interface and HTTP port pool for explicit LAN sharing.</p></div><button className="button small" type="button" disabled={profile.isFetching || upgrade.isFetching || profileBusy || upgradeBusy} onClick={() => void refresh()}>Check gateway state</button></div>
     <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{profileBusy ? "Reviewing LAN gateway profile." : upgradeBusy ? "Applying LAN gateway upgrade." : message}</span>
@@ -249,13 +259,13 @@ export function LANGatewayPanel({ role }: { role: string }) {
         {upgradeGuidance ? <div ref={gatewayUpgradeGuidanceTarget} className="callout warning" role="status" tabIndex={-1}><strong>{upgradeGuidance.title}</strong><span>{upgradeGuidance.body}</span></div> : !configuredProfile ? <p className="lan-muted">Approve a LAN gateway profile before reviewing the gateway upgrade.</p> : !canReviewUpgrade ? <div className="callout warning" role="status"><strong>Gateway confirmation is unavailable.</strong><span>{readsChecking ? "Rig is checking the current gateway profile and observation. Wait for that check to finish before reviewing an upgrade." : proposal && !proposalMatchesCurrentProfile ? "The available gateway proposal does not match the current desired profile. Refresh the gateway state before reviewing an upgrade." : "Refresh the gateway state to obtain an exact action digest. Rig will not start an upgrade without it."}</span></div> : <button className="button" type="button" disabled={upgradeBusy} onClick={openUpgradeReview}>Review gateway upgrade</button>}
       </>}
     </section>
-    {profileReview && <Dialog title="Review LAN gateway profile" description="Confirm the exact controller interface, address, pool, and approval digest. This saves desired state only." pending={configureProfile.isPending} close={() => setProfileReview(null)}>
+    {profileReview && <Dialog title="Review LAN gateway profile" description="Confirm the exact controller interface, address, pool, and approval digest. This saves desired state only." pending={configureProfile.isPending} focusTitle close={() => setProfileReview(null)}>
       <dl className="lan-review-details"><div><dt>Profile revision</dt><dd>New revision {profileReview.response.expectedRevisionNumber + 1}</dd></div><div><dt>Interface</dt><dd>{profileReview.spec.interfaceId}</dd></div><div><dt>Private IPv4</dt><dd>{profileReview.spec.selectedIpv4}</dd></div><div><dt>Port pool</dt><dd>{poolText(profileReview.spec)}</dd></div><div><dt>Approval digest</dt><dd className="mono">{profileReview.response.proposal?.approvalDigest}</dd></div></dl>
-      {configureProfile.isError ? <div className="callout danger" role="alert"><strong>Profile approval was not completed.</strong><span>{configureProfile.error.message}</span><button className="button small" type="button" onClick={() => { setProfileReview(null); void refresh(); }}>Refresh profile summary</button></div> : <div className="deployment-dialog-actions"><button className="button" type="button" disabled={configureProfile.isPending} onClick={() => setProfileReview(null)}>Cancel</button><button className="button primary" type="button" disabled={configureProfile.isPending} onClick={() => configureProfile.mutate(profileReview)}>{configureProfile.isPending ? "Approving…" : "Approve desired profile"}</button></div>}
+      {configureProfile.isError ? <div ref={profileApprovalErrorTarget} className="callout danger" role="alert" tabIndex={-1}><strong>Profile approval was not completed.</strong><span>{configureProfile.error.message}</span><button className="button small" type="button" onClick={() => { setProfileReview(null); void refresh(); }}>Refresh profile summary</button></div> : <div className="deployment-dialog-actions"><button className="button" type="button" disabled={configureProfile.isPending} onClick={() => setProfileReview(null)}>Cancel</button><button className="button primary" type="button" disabled={configureProfile.isPending} onClick={() => configureProfile.mutate(profileReview)}>{configureProfile.isPending ? "Approving…" : "Approve desired profile"}</button></div>}
     </Dialog>}
-    {upgradeReview && <Dialog title="Review LAN gateway upgrade" description="Confirm this exact gateway action. It can change the attested gateway, but does not itself share an application." pending={upgradeGateway.isPending} close={() => setUpgradeReview(null)}>
+    {upgradeReview && <Dialog title="Review LAN gateway upgrade" description="Confirm this exact gateway action. It can change the attested gateway, but does not itself share an application." pending={upgradeGateway.isPending} focusTitle close={() => setUpgradeReview(null)}>
       <dl className="lan-review-details"><div><dt>Profile revision</dt><dd>{upgradeReview.profileRevisionNumber}</dd></div><div><dt>Profile identifier</dt><dd className="mono">{upgradeReview.profileRevisionId}</dd></div><div><dt>Action digest</dt><dd className="mono">{upgradeReview.actionDigest}</dd></div></dl>
-      {upgradeGateway.isError ? <div className="callout danger" role="alert"><strong>Gateway upgrade was not completed.</strong><span>{upgradeGateway.error.message}</span><button className="button small" type="button" onClick={() => { setUpgradeReview(null); void refresh(); }}>Refresh gateway state</button></div> : !canConfirmUpgrade ? <div className="callout warning" role="alert"><strong>Gateway review expired</strong><span>The current profile or gateway proposal no longer matches this review. Refresh the gateway state before opening another review.</span><button className="button small" type="button" onClick={() => { setUpgradeReview(null); void refresh(); }}>Refresh gateway state</button></div> : <div className="deployment-dialog-actions"><button className="button" type="button" disabled={upgradeGateway.isPending} onClick={() => setUpgradeReview(null)}>Cancel</button><button className="button primary" type="button" disabled={upgradeGateway.isPending} onClick={confirmUpgradeReview}>{upgradeGateway.isPending ? "Upgrading…" : "Approve gateway upgrade"}</button></div>}
+      {upgradeGateway.isError ? <div ref={gatewayUpgradeErrorTarget} className="callout danger" role="alert" tabIndex={-1}><strong>Gateway upgrade was not completed.</strong><span>{upgradeGateway.error.message}</span><button className="button small" type="button" onClick={() => { setUpgradeReview(null); void refresh(); }}>Refresh gateway state</button></div> : !canConfirmUpgrade ? <div ref={gatewayUpgradeErrorTarget} className="callout warning" role="alert" tabIndex={-1}><strong>Gateway review expired</strong><span>The current profile or gateway proposal no longer matches this review. Refresh the gateway state before opening another review.</span><button className="button small" type="button" onClick={() => { setUpgradeReview(null); void refresh(); }}>Refresh gateway state</button></div> : <div className="deployment-dialog-actions"><button className="button" type="button" disabled={upgradeGateway.isPending} onClick={() => setUpgradeReview(null)}>Cancel</button><button className="button primary" type="button" disabled={upgradeGateway.isPending} onClick={confirmUpgradeReview}>{upgradeGateway.isPending ? "Upgrading…" : "Approve gateway upgrade"}</button></div>}
     </Dialog>}
   </section>;
 }

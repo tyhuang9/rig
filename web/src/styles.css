@@ -464,6 +464,7 @@ button:disabled { cursor: wait; opacity: .62; }
 .relay-rotation { margin-bottom: 14px; }
 .relay-confirmation { margin: 16px 0; padding: 12px; border: 1px solid #e3e6ea; border-radius: 8px; background: #fbfcfd; }
 .deployment-dialog:focus-visible, .callout[tabindex="-1"]:focus-visible { outline: 3px solid #274ec9; outline-offset: 2px; }
+.callout[tabindex="-1"]:focus { outline: 3px solid #274ec9; outline-offset: 2px; }
 
 @media (pointer: coarse), (max-width: 560px) {
   .relay-enrollment-status a { display: inline-flex; align-items: center; min-height: 44px; }

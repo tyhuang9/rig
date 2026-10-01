@@ -48,6 +48,21 @@ describe("LANGatewayPanel", () => {
     expect(profileRead).toHaveBeenNthCalledWith(2, { interfaceId: "nic-1", selectedIpv4: "192.168.50.4", portStart: 8100, portEnd: 8119 });
   });
 
+  it("focuses a failed profile approval inside its exact review dialog", async () => {
+    const spec = { interfaceId: candidate.interfaceId, selectedIpv4: candidate.selectedIpv4, portStart: 8100, portEnd: 8119 };
+    vi.spyOn(api, "lanGatewayProfile").mockResolvedValueOnce(profile as never).mockResolvedValue({ ...profile, proposal: { spec, approvalDigest: "a".repeat(64) } } as never);
+    vi.spyOn(api, "lanGatewayUpgrade").mockResolvedValue(upgrade as never);
+    vi.spyOn(api, "configureLANGatewayProfile").mockRejectedValue(new Error("profile changed"));
+
+    renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Review LAN gateway profile" }));
+    await screen.findByRole("dialog", { name: "Review LAN gateway profile" });
+    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Review LAN gateway profile" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve desired profile" }));
+    const error = await screen.findByRole("alert");
+    await waitFor(() => expect(document.activeElement).toBe(error));
+  });
+
   it("does not issue administrator-only reads for viewers", () => {
     const profileRead = vi.spyOn(api, "lanGatewayProfile");
     const upgradeRead = vi.spyOn(api, "lanGatewayUpgrade");
@@ -151,8 +166,25 @@ describe("LANGatewayPanel", () => {
     }));
 
     expect(await screen.findByText("Gateway review expired")).not.toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("alert")));
     expect(screen.queryByRole("button", { name: "Approve gateway upgrade" })).toBeNull();
     expect(upgrade).not.toHaveBeenCalled();
+  });
+
+  it("focuses a failed gateway upgrade inside its exact review dialog", async () => {
+    const configured = { ...profile, desiredProfile: { id: "11111111-1111-4111-8111-111111111111", revisionNumber: 4, spec: { interfaceId: candidate.interfaceId, selectedIpv4: candidate.selectedIpv4, portStart: 8100, portEnd: 8119 } } };
+    const proposal = { profileRevisionId: configured.desiredProfile.id, profileRevisionNumber: 4, actionDigest: "a".repeat(64) };
+    vi.spyOn(api, "lanGatewayProfile").mockResolvedValue(configured as never);
+    vi.spyOn(api, "lanGatewayUpgrade").mockResolvedValue({ observed: { availability: "unknown" }, proposal } as never);
+    vi.spyOn(api, "upgradeLANGateway").mockRejectedValue(new Error("gateway unavailable"));
+
+    renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Review gateway upgrade" }));
+    await screen.findByRole("dialog", { name: "Review LAN gateway upgrade" });
+    expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Review LAN gateway upgrade" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve gateway upgrade" }));
+    const error = await screen.findByRole("alert");
+    await waitFor(() => expect(document.activeElement).toBe(error));
   });
 
   it("moves focus to the resulting gateway guidance after a successful upgrade", async () => {
