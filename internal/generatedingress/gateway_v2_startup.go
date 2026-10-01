@@ -213,6 +213,15 @@ func (m *Manager) proveGatewayV2StartupPending(ctx context.Context, source route
 		if err != nil || !pending {
 			return false
 		}
+	case gatewayV2PendingLANDisable:
+		if selection.State.Pending.Disable == nil {
+			return false
+		}
+		var pendingErr error
+		committed, proposed, pendingErr = gatewayV2LANDisablePendingStates(selection.State, *selection.State.Pending.Disable)
+		if pendingErr != nil {
+			return false
+		}
 	default:
 		return false
 	}
