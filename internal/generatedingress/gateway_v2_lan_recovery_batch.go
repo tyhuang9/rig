@@ -216,13 +216,14 @@ func gatewayV2LANRecoveryCommittedProjection(state gatewayV2RouteState) gatewayV
 }
 
 func gatewayV2LANRecoveryEffectiveProjection(state gatewayV2RouteState) (gatewayV2RouteState, []uint16, error) {
-	if !validGatewayV2RouteState(state) || state.LANRecovery == nil || state.LANRecovery.Head != 0 {
+	if !validGatewayV2RouteState(state) || state.LANRecovery == nil {
 		return gatewayV2RouteState{}, nil, errors.New("invalid generated ingress LAN recovery batch")
 	}
 	effective := gatewayV2LANRecoveryCommittedProjection(state)
-	ports := make([]uint16, 0, len(state.LANRecovery.Items))
-	seen := make(map[uint16]struct{}, len(state.LANRecovery.Items))
-	for _, item := range state.LANRecovery.Items {
+	unfinished := state.LANRecovery.Items[state.LANRecovery.Head:]
+	ports := make([]uint16, 0, len(unfinished))
+	seen := make(map[uint16]struct{}, len(unfinished))
+	for _, item := range unfinished {
 		app, exists := effective.Apps[item.AppID]
 		port, _ := gatewayV2LANRecoveryItemIdentity(item)
 		if !exists || port == 0 {

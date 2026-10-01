@@ -141,7 +141,8 @@ type gatewayV2PendingRoute struct {
 
 // gatewayV2LANRecoveryBatch is a restart-stable, immutable recovery queue.
 // Apps remains the last committed route-state baseline. Creation requires a
-// zero Head; terminal code must define any later Head and Apps transition.
+// zero Head; each item then clears only its exact binding before Head advances.
+// Batch retirement is a separate, explicitly attested transition.
 // LegacyPending retains the exact single-operation marker that existed before
 // the queue was installed; it is evidence, not an independently active marker.
 type gatewayV2LANRecoveryBatch struct {
@@ -621,6 +622,12 @@ func validGatewayV2LANRecoveryBatch(state gatewayV2RouteState) bool {
 	for index, item := range batch.Items {
 		if !validGatewayV2LANRecoveryItem(state, item) {
 			return false
+		}
+		if index < batch.Head {
+			app, exists := state.Apps[item.AppID]
+			if !exists || app.LAN != nil {
+				return false
+			}
 		}
 		port, operationID := gatewayV2LANRecoveryItemIdentity(item)
 		if _, duplicate := operations[operationID]; duplicate {
@@ -1190,6 +1197,26 @@ func validCommittedV2StateTransition(current, next gatewayV2RouteState) bool {
 			installed.LANRecovery = cloneGatewayV2LANRecoveryBatch(next.LANRecovery)
 			return reflect.DeepEqual(installed, next)
 		}
+		if current.LANRecovery != nil && next.LANRecovery == nil &&
+			current.LANRecovery.Head == len(current.LANRecovery.Items) {
+			for _, item := range current.LANRecovery.Items {
+				app, exists := current.Apps[item.AppID]
+				if !exists || app.LAN != nil {
+					return false
+				}
+			}
+			retired := cloneGatewayV2RouteState(current)
+			retired.LANRecovery = nil
+			return reflect.DeepEqual(retired, next)
+		}
+		if current.LANRecovery != nil && next.LANRecovery != nil {
+			cleared, clearErr := gatewayV2LANRecoveryClearedHeadState(current)
+			if clearErr == nil && reflect.DeepEqual(cleared, next) {
+				return true
+			}
+			advanced, advanceErr := gatewayV2LANRecoveryAdvanceHeadState(current)
+			return advanceErr == nil && reflect.DeepEqual(advanced, next)
+		}
 		return false
 	}
 	// An ambiguous protected clear of a quarantined grant is repaired by
@@ -1223,6 +1250,60 @@ func validCommittedV2StateTransition(current, next gatewayV2RouteState) bool {
 	committed := cloneGatewayV2RouteState(rolledBack)
 	committed.Apps[current.Pending.AppID] = cloneGatewayV2AppRoute(current.Pending.Proposed)
 	return reflect.DeepEqual(committed, next)
+}
+
+// gatewayV2LANRecoveryClearedHeadState removes only the exact protected LAN
+// binding named by the current recovery item. An already absent binding is an
+// idempotent clear; the immutable queue and its Head remain unchanged.
+func gatewayV2LANRecoveryClearedHeadState(state gatewayV2RouteState) (gatewayV2RouteState, error) {
+	if !validGatewayV2RouteState(state) || state.LANRecovery == nil ||
+		state.LANRecovery.Head >= len(state.LANRecovery.Items) {
+		return gatewayV2RouteState{}, errors.New("invalid generated ingress LAN recovery head")
+	}
+	item := state.LANRecovery.Items[state.LANRecovery.Head]
+	app, exists := state.Apps[item.AppID]
+	if !exists {
+		return gatewayV2RouteState{}, errors.New("invalid generated ingress LAN recovery app")
+	}
+	if app.LAN != nil {
+		exact := item.Kind == gatewayV2PendingLANGrant && item.Grant != nil &&
+			reflect.DeepEqual(*app.LAN, *item.Grant)
+		if item.Kind == gatewayV2PendingLANDisable && item.Disable != nil {
+			exact = gatewayV2LANDisableSourceBinding(*item.Disable, app)
+		}
+		if !exact {
+			return gatewayV2RouteState{}, errors.New("generated ingress LAN recovery binding does not match head")
+		}
+	}
+	cleared := cloneGatewayV2RouteState(state)
+	app = cleared.Apps[item.AppID]
+	app.LAN = nil
+	cleared.Apps[item.AppID] = app
+	if !validGatewayV2RouteState(cleared) || !reflect.DeepEqual(cleared.LANRecovery, state.LANRecovery) {
+		return gatewayV2RouteState{}, errors.New("invalid generated ingress LAN recovery clear")
+	}
+	return cleared, nil
+}
+
+// gatewayV2LANRecoveryAdvanceHeadState advances exactly one item after its
+// protected LAN binding is absent. It deliberately leaves a final Head in
+// place; the caller must separately attest the exact retirement transition.
+func gatewayV2LANRecoveryAdvanceHeadState(state gatewayV2RouteState) (gatewayV2RouteState, error) {
+	if !validGatewayV2RouteState(state) || state.LANRecovery == nil ||
+		state.LANRecovery.Head >= len(state.LANRecovery.Items) {
+		return gatewayV2RouteState{}, errors.New("invalid generated ingress LAN recovery head")
+	}
+	item := state.LANRecovery.Items[state.LANRecovery.Head]
+	app, exists := state.Apps[item.AppID]
+	if !exists || app.LAN != nil {
+		return gatewayV2RouteState{}, errors.New("generated ingress LAN recovery head binding is not cleared")
+	}
+	advanced := cloneGatewayV2RouteState(state)
+	advanced.LANRecovery.Head++
+	if !validGatewayV2RouteState(advanced) {
+		return gatewayV2RouteState{}, errors.New("invalid generated ingress LAN recovery advance")
+	}
+	return advanced, nil
 }
 
 func journalMatchesInitialV2State(journal gatewayMigrationJournal, state gatewayV2RouteState) bool {

@@ -132,15 +132,14 @@ func TestGatewayV2LANRecoveryStatePreservesLegacyPendingAndCreationBoundary(t *t
 	if !validGatewayV2RouteState(changedApps) || validCommittedV2StateTransition(current, changedApps) {
 		t.Fatal("creation accepted a changed committed Apps baseline")
 	}
-	advanced := cloneGatewayV2RouteState(next)
-	advanced.LANRecovery.Head++
-	if !validGatewayV2RouteState(advanced) || validCommittedV2StateTransition(next, advanced) {
-		t.Fatal("schema foundation prematurely authorized head advancement")
+	advanced, err := gatewayV2LANRecoveryAdvanceHeadState(next)
+	if err != nil || !validGatewayV2RouteState(advanced) || !validCommittedV2StateTransition(next, advanced) {
+		t.Fatalf("exact cleared head advancement was rejected: %v", err)
 	}
-	cleared := cloneGatewayV2RouteState(next)
+	cleared := cloneGatewayV2RouteState(advanced)
 	cleared.LANRecovery = nil
-	if validCommittedV2StateTransition(next, cleared) {
-		t.Fatal("schema foundation prematurely authorized recovery finalization")
+	if !validCommittedV2StateTransition(advanced, cleared) {
+		t.Fatal("exact completed recovery batch retirement was rejected")
 	}
 }
 
