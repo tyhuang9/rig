@@ -973,3 +973,46 @@ behavior.
 No production code, schema, protected state, branch history, or hosted runtime
 was changed by this branch. M3 live Docker and second-device acceptance remain
 open.
+
+## Gateway-v2 hosted Docker gate: local preparation evidence
+
+The test-only `feature/hosting-m3-v2-docker-gate` branch adds an opt-in Linux
+Docker gate around the production `Manager.UpgradeGatewayV2` coordinator. The
+successful case first installs a real v1 Caddy route to a real generated
+application container, upgrades a single currently free port on one uniquely
+selectable private host interface, and requires the original local marker
+route to keep serving. It checks the exact journal-bound final container and
+host-port map, the state-bound Caddy challenge, 404 responses for the selected
+address and a wrong host, no loopback publication, a committed protected
+journal, and a fresh manager's `serving` operation observation.
+
+The separate failure case starts a narrowly labeled Caddy fixture on that
+exact private-address port before invoking the same production coordinator.
+The real Docker bind conflict must return `rolled_back`, keep the v1 marker
+route unchanged, leave the conflict fixture as the only responder on the
+approved port, remove every gateway-v2 container/network/volume, install the
+rollback-retirement receipt, and read as `unavailable` through a fresh
+manager. The authorization callback accepts only the exact fixture request.
+Test cleanup reinspects the operation, identity, plan, role and version labels
+and compares container/network IDs and volume creation identities to the
+protected journal before removal. An unbound or contradictory resource is
+retained so the test and the workflow cleanup gate fail visibly.
+
+| Local check | Observed result |
+| --- | --- |
+| `go test -count=1 ./internal/generatedingress` | Passed in 76.064 seconds, including all existing deterministic gateway state, identity, rollback, restart and recovery coverage. The two new live cases stayed behind their opt-in guard. |
+| `go test -count=1 ./internal/generatedingress -run '^(TestUpgradeGatewayV2CoordinatesFreshMigrationUnderOneLock\|TestGatewayV2ProductionStageStartUsesPlainBoundContainerID)$'` | Passed. This compiled the new live test with representative deterministic coordinator and production-adapter tests. |
+| `go test -count=1 -v ./internal/generatedingress -run '^(TestLiveGatewayV2UpgradeCommitAndRestart\|TestLiveGatewayV2BindConflictRollsBack)$'` with `RIG_RUN_LIVE_GATEWAY_V2` unset | Compiled and passed the package while both live tests reported their explicit opt-in skips. The hosted workflow requires exact per-test `pass` events and rejects any `skip` event. |
+| `go vet ./internal/generatedingress` | Passed. |
+| `go test -count=1 -p 1 ./...`, `go vet ./...`, and `go run ./cmd/openapi-gen -check` with normal host permissions | Passed. The first sandboxed full test run was inconclusive because of Go-cache ACL and environment failures; the separate normal-permission run passed across all packages. This does not claim that either opt-in live Docker test ran. |
+| `gofmt` and `git diff --check` | Passed. |
+
+The live flag was not enabled locally: this Windows host currently has no
+available Docker engine, and the test intentionally requires Linux with the
+default local Unix Docker context. The new workflow has not run until this
+branch is explicitly published. Therefore the real committed cutover,
+restart proof, bind-conflict rollback, and cleanup results remain unverified
+acceptance evidence rather than claimed successes. This gate does not cover a
+physical second device or the browser-to-application-owned external database
+journey, so those M3 acceptance items remain open. No managed database or Neon
+provisioning is introduced.
