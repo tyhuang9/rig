@@ -89,6 +89,9 @@ type gatewayV2Identity struct {
 }
 
 type gatewayV2LANBinding struct {
+	GrantAttemptID        string `json:"grantAttemptId"`
+	GrantRequestDigest    string `json:"grantRequestDigest"`
+	OwnerOperationID      string `json:"ownerOperationId"`
 	AccessRevisionID      string `json:"accessRevisionId"`
 	AccessRevisionNumber  int64  `json:"accessRevisionNumber"`
 	AccessSpecDigest      string `json:"accessSpecDigest"`
@@ -97,6 +100,7 @@ type gatewayV2LANBinding struct {
 	ProfileRevisionID     string `json:"profileRevisionId"`
 	ProfileRevisionNumber int64  `json:"profileRevisionNumber"`
 	ProfileSpecDigest     string `json:"profileSpecDigest"`
+	ApprovedBy            string `json:"approvedBy"`
 }
 
 type gatewayV2AppRoute struct {
@@ -104,13 +108,27 @@ type gatewayV2AppRoute struct {
 	LAN   *gatewayV2LANBinding `json:"lan,omitempty"`
 }
 
+type gatewayV2PendingKind string
+
+const (
+	gatewayV2PendingRouteSwitch gatewayV2PendingKind = "route_switch"
+	gatewayV2PendingLANGrant    gatewayV2PendingKind = "lan_grant"
+	// gatewayV2PendingLANWithdrawal is a fail-closed write-ahead record. Apps
+	// retains the exact last committed binding while Proposed removes only that
+	// binding. This lets restart recovery distinguish a withdrawn, unresolved
+	// grant from an ordinary disabled route without erasing its AttemptID.
+	gatewayV2PendingLANWithdrawal gatewayV2PendingKind = "lan_grant_withdrawal"
+)
+
 // gatewayV2PendingRoute is the durable write-ahead record for a committed-v2
 // route reload. Apps always remains the last committed route set while this
 // record is present, so restart recovery has an unambiguous rollback target.
 type gatewayV2PendingRoute struct {
-	AppID    string             `json:"appId"`
-	Previous *gatewayV2AppRoute `json:"previous,omitempty"`
-	Proposed gatewayV2AppRoute  `json:"proposed"`
+	Kind                gatewayV2PendingKind `json:"kind,omitempty"`
+	AppID               string               `json:"appId"`
+	Previous            *gatewayV2AppRoute   `json:"previous,omitempty"`
+	Proposed            gatewayV2AppRoute    `json:"proposed"`
+	ActivationUncertain bool                 `json:"activationUncertain,omitempty"`
 }
 
 type gatewayV2RouteState struct {
@@ -442,15 +460,16 @@ func validGatewayV2RouteState(state gatewayV2RouteState) bool {
 	ports := make(map[uint16]string)
 	allocations := make(map[string]struct{})
 	revisions := make(map[string]struct{})
+	attempts := make(map[string]struct{})
 	for appID, app := range state.Apps {
-		if !validAppID(appID) || !validGatewayV2AppRoute(appID, state.Profile, app, ports, allocations, revisions) {
+		if !validAppID(appID) || !validGatewayV2AppRoute(appID, state.Profile, app, ports, allocations, revisions, attempts) {
 			return false
 		}
 	}
 	return validGatewayV2PendingRoute(state)
 }
 
-func validGatewayV2AppRoute(appID string, profile gatewayProfileBinding, app gatewayV2AppRoute, ports map[uint16]string, allocations, revisions map[string]struct{}) bool {
+func validGatewayV2AppRoute(appID string, profile gatewayProfileBinding, app gatewayV2AppRoute, ports map[uint16]string, allocations, revisions, attempts map[string]struct{}) bool {
 	if validateRoute(app.Route) != nil {
 		return false
 	}
@@ -458,9 +477,12 @@ func validGatewayV2AppRoute(appID string, profile gatewayProfileBinding, app gat
 		return true
 	}
 	binding := app.LAN
-	if !validCanonicalUUID(binding.AccessRevisionID) || binding.AccessRevisionNumber <= 0 || !validSHA256(binding.AccessSpecDigest) ||
+	if !validCanonicalUUID(binding.GrantAttemptID) || !validSHA256(binding.GrantRequestDigest) ||
+		!validCanonicalUUID(binding.OwnerOperationID) || !validCanonicalUUID(binding.AccessRevisionID) ||
+		binding.AccessRevisionNumber <= 0 || !validSHA256(binding.AccessSpecDigest) ||
 		!validCanonicalUUID(binding.AllocationID) || binding.Port < profile.PortStart || binding.Port > profile.PortEnd ||
-		binding.ProfileRevisionID != profile.RevisionID || binding.ProfileRevisionNumber != profile.RevisionNumber || binding.ProfileSpecDigest != profile.SpecDigest {
+		binding.ProfileRevisionID != profile.RevisionID || binding.ProfileRevisionNumber != profile.RevisionNumber ||
+		binding.ProfileSpecDigest != profile.SpecDigest || !validCanonicalUUID(binding.ApprovedBy) {
 		return false
 	}
 	accessDigest, err := appaccess.AppAccessSpecDigest(appaccess.AppAccessSpec{
@@ -479,9 +501,13 @@ func validGatewayV2AppRoute(appID string, profile gatewayProfileBinding, app gat
 	if _, duplicate := revisions[binding.AccessRevisionID]; duplicate {
 		return false
 	}
+	if _, duplicate := attempts[binding.GrantAttemptID]; duplicate {
+		return false
+	}
 	ports[binding.Port] = appID
 	allocations[binding.AllocationID] = struct{}{}
 	revisions[binding.AccessRevisionID] = struct{}{}
+	attempts[binding.GrantAttemptID] = struct{}{}
 	return true
 }
 
@@ -500,12 +526,42 @@ func validGatewayV2PendingRoute(state gatewayV2RouteState) bool {
 	if pending.Previous != nil && !reflect.DeepEqual(committed, *pending.Previous) {
 		return false
 	}
-	// Route switches may not grant, move, or revoke LAN access. That belongs to
-	// the separately approved app-access transaction.
-	if pending.Previous == nil {
-		return pending.Proposed.LAN == nil
+	switch pending.Kind {
+	case "", gatewayV2PendingRouteSwitch:
+		// Empty is the backward-compatible spelling written by the first v2
+		// route-switch implementation. Route switches may never grant, move,
+		// or revoke LAN access.
+		if pending.ActivationUncertain {
+			return false
+		}
+		if pending.Previous == nil {
+			return pending.Proposed.LAN == nil
+		}
+		return pending.Previous.Route.Slot != pending.Proposed.Route.Slot &&
+			reflect.DeepEqual(pending.Previous.LAN, pending.Proposed.LAN)
+	case gatewayV2PendingLANGrant:
+		if pending.Previous == nil || pending.Previous.LAN != nil || pending.Proposed.LAN == nil ||
+			!reflect.DeepEqual(pending.Previous.Route, pending.Proposed.Route) {
+			return false
+		}
+		// Apps contains the last committed nil binding. Rebuild the uniqueness
+		// sets from it, then validate the proposed allocation as the one addition.
+		ports := make(map[uint16]string)
+		allocations := make(map[string]struct{})
+		revisions := make(map[string]struct{})
+		attempts := make(map[string]struct{})
+		for appID, app := range state.Apps {
+			if !validGatewayV2AppRoute(appID, state.Profile, app, ports, allocations, revisions, attempts) {
+				return false
+			}
+		}
+		return validGatewayV2AppRoute(pending.AppID, state.Profile, pending.Proposed, ports, allocations, revisions, attempts)
+	case gatewayV2PendingLANWithdrawal:
+		return pending.ActivationUncertain && pending.Previous != nil && pending.Previous.LAN != nil &&
+			pending.Proposed.LAN == nil && reflect.DeepEqual(pending.Previous.Route, pending.Proposed.Route)
+	default:
+		return false
 	}
-	return pending.Previous.Route.Slot != pending.Proposed.Route.Slot && reflect.DeepEqual(pending.Previous.LAN, pending.Proposed.LAN)
 }
 
 func validGatewayMigrationJournal(journal gatewayMigrationJournal) bool {
@@ -945,8 +1001,23 @@ func validCommittedV2StateTransition(current, next gatewayV2RouteState) bool {
 	if reflect.DeepEqual(current, next) {
 		return true
 	}
+	// An ambiguous protected clear of a quarantined grant is repaired by
+	// restoring the exact protected withdrawal record while Caddy remains at
+	// the already-proved 404 configuration.
+	if current.Pending == nil && next.Pending != nil && next.Pending.Kind == gatewayV2PendingLANWithdrawal {
+		restored := cloneGatewayV2RouteState(current)
+		restored.Apps[next.Pending.AppID] = cloneGatewayV2AppRoute(*next.Pending.Previous)
+		restored.Pending = next.Pending
+		return reflect.DeepEqual(restored, next)
+	}
 	if current.Pending == nil && next.Pending != nil {
 		current.Pending = next.Pending
+		return reflect.DeepEqual(current, next)
+	}
+	if current.Pending != nil && next.Pending != nil &&
+		current.Pending.Kind == gatewayV2PendingLANGrant && !current.Pending.ActivationUncertain &&
+		next.Pending.Kind == gatewayV2PendingLANGrant && next.Pending.ActivationUncertain {
+		current.Pending.ActivationUncertain = true
 		return reflect.DeepEqual(current, next)
 	}
 	if current.Pending == nil || next.Pending != nil {

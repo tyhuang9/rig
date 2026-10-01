@@ -671,9 +671,12 @@ func bindLANForTest(t *testing.T, state *gatewayV2RouteState, appID string, port
 	}
 	app := state.Apps[appID]
 	app.LAN = &gatewayV2LANBinding{
+		GrantAttemptID:     uuid.NewString(),
+		GrantRequestDigest: strings.Repeat("1", 64), OwnerOperationID: "13131313-1313-4313-8313-131313131313",
 		AccessRevisionID: accessRevisionID, AccessRevisionNumber: 1, AccessSpecDigest: digest,
 		AllocationID: allocationID, Port: port, ProfileRevisionID: state.Profile.RevisionID,
 		ProfileRevisionNumber: state.Profile.RevisionNumber, ProfileSpecDigest: state.Profile.SpecDigest,
+		ApprovedBy: "14141414-1414-4414-8414-141414141414",
 	}
 	state.Apps[appID] = app
 }

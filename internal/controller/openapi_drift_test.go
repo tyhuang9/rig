@@ -63,6 +63,13 @@ var expectedOpenAPIProblemCatalog = map[string]openAPIProblemCode{
 	"lan_gateway_replay_conflict":     {Description: "The LAN gateway operation identifier was already used for a different request", Statuses: []int{409}},
 	"lan_gateway_approval_mismatch":   {Description: "The supplied confirmation digest does not approve the exact LAN gateway profile", Statuses: []int{409}},
 	"lan_gateway_unavailable":         {Description: "LAN gateway profile state or safe host interface discovery is unavailable", Statuses: []int{503}},
+	"lan_access_forbidden":            {Description: "Administrator access is required to manage or inspect application LAN access", Statuses: []int{403}},
+	"invalid_lan_access_request":      {Description: "The application LAN access request is invalid", Statuses: []int{422}},
+	"lan_access_conflict":             {Description: "The application LAN access state or reservation changed", Statuses: []int{409}},
+	"lan_access_replay_conflict":      {Description: "The application LAN operation identifier was reused with different input", Statuses: []int{409}},
+	"lan_access_approval_mismatch":    {Description: "Confirmation does not approve the exact application LAN access", Statuses: []int{409}},
+	"lan_access_pool_exhausted":       {Description: "No LAN gateway port is available", Statuses: []int{409}},
+	"lan_access_unavailable":          {Description: "Application LAN access state is unavailable", Statuses: []int{503}},
 	"capability_unavailable":          {Description: "The requested operation requires a runtime capability that is disabled", Statuses: []int{409}},
 }
 
@@ -99,6 +106,11 @@ var expectedOpenAPIOperationProblemCodes = map[string][]string{
 	"configureLANGatewayProfile":                {"lan_gateway_forbidden", "invalid_lan_gateway_request", "lan_gateway_interface_changed", "lan_gateway_conflict", "lan_gateway_replay_conflict", "lan_gateway_approval_mismatch", "lan_gateway_unavailable"},
 	"getLANGatewayUpgrade":                      {"lan_gateway_forbidden", "invalid_lan_gateway_request", "lan_gateway_unavailable", "capability_unavailable"},
 	"upgradeLANGateway":                         {"lan_gateway_forbidden", "invalid_lan_gateway_request", "lan_gateway_conflict", "lan_gateway_replay_conflict", "lan_gateway_approval_mismatch", "lan_gateway_unavailable", "capability_unavailable"},
+	"getApplicationLANAccess":                   {"lan_access_forbidden", "invalid_lan_access_request", "lan_access_unavailable", "capability_unavailable"},
+	"reserveApplicationLANAccess":               {"lan_access_forbidden", "invalid_lan_access_request", "lan_access_conflict", "lan_access_replay_conflict", "lan_access_pool_exhausted", "lan_access_unavailable", "capability_unavailable"},
+	"approveApplicationLANAccess":               {"lan_access_forbidden", "invalid_lan_access_request", "lan_access_conflict", "lan_access_replay_conflict", "lan_access_approval_mismatch", "lan_access_unavailable", "capability_unavailable"},
+	"grantApplicationLANAccess":                 {"lan_access_forbidden", "invalid_lan_access_request", "lan_access_conflict", "lan_access_replay_conflict", "lan_access_approval_mismatch", "lan_access_unavailable", "capability_unavailable"},
+	"getApplicationLANGrant":                    {"lan_access_forbidden", "invalid_lan_access_request", "lan_access_conflict", "lan_access_unavailable", "capability_unavailable"},
 }
 
 func TestOpenAPIContractMatchesRegisteredRoutes(t *testing.T) {

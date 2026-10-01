@@ -65,6 +65,42 @@ func TestBuildCaddyConfigV2AddsStateBoundLocalAppProbesBeforeProxyRoutes(t *test
 	}
 }
 
+func TestBuildCaddyConfigV2AddsAssignedLANAppProofBeforeProxyAndKeepsUnassigned404(t *testing.T) {
+	appID := "11111111-1111-4111-8111-111111111111"
+	token := strings.Repeat("b", 64)
+	profile := caddyV2Profile{SelectedIPv4: "192.168.50.20", PortStart: 8100, PortEnd: 8101, ProbeToken: token}
+	routes := map[string]routeRecord{appID: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		endpoint("web", "server", "net-a", "web-blue", 3000, 'a'),
+	}}}
+	assignment := caddyV2TestAssignment(appID, false)
+	body, err := buildCaddyConfigV2(routes, "10.203.0.2:8080", profile, map[uint16]caddyV2LANAssignment{8100: assignment})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config caddyConfig
+	if err := json.Unmarshal(body, &config); err != nil {
+		t.Fatal(err)
+	}
+	assigned := config.Apps.HTTP.Servers["lan-8100"]
+	if len(assigned.Routes) != 4 ||
+		!reflect.DeepEqual(assigned.Routes[0], gatewayV2ProbeRoute(profile.SelectedIPv4, gatewayV2PortChallenge(token, 8100))) ||
+		!reflect.DeepEqual(assigned.Routes[1], gatewayV2ProbeRoute(profile.SelectedIPv4, gatewayV2LANAppChallenge(token, 8100, assignment))) ||
+		assigned.Routes[2].Handle[0].Handler != "reverse_proxy" || assigned.Routes[3].Handle[0].StatusCode != 404 {
+		t.Fatalf("assigned LAN proof/proxy ordering = %#v", assigned.Routes)
+	}
+	unassigned := config.Apps.HTTP.Servers["lan-8101"]
+	if len(unassigned.Routes) != 2 || unassigned.Routes[1].Handle[0].StatusCode != 404 ||
+		len(unassigned.Routes[1].Match) != 0 {
+		t.Fatalf("unassigned LAN listener = %#v", unassigned.Routes)
+	}
+	stale := assignment
+	stale.AccessRevisionID = "88888888-8888-4888-8888-888888888888"
+	stale.AccessRevisionNumber++
+	if gatewayV2LANAppChallenge(token, 8100, stale) == gatewayV2LANAppChallenge(token, 8100, assignment) {
+		t.Fatal("assigned LAN challenge did not change with the access revision")
+	}
+}
+
 func TestBuildCaddyConfigV2KeepsLocalRoutesAndIsolatesLANPorts(t *testing.T) {
 	appA := "11111111-1111-4111-8111-111111111111"
 	appB := "22222222-2222-4222-8222-222222222222"
@@ -79,9 +115,9 @@ func TestBuildCaddyConfigV2KeepsLocalRoutesAndIsolatesLANPorts(t *testing.T) {
 		}},
 	}
 	localListen := "10.203.0.2:8080"
-	body, err := buildCaddyConfigV2(routes, localListen, caddyV2Profile{SelectedIPv4: selectedIPv4, PortStart: 8100, PortEnd: 8102}, map[uint16]string{
-		8101: appB,
-		8100: appA,
+	body, err := buildCaddyConfigV2(routes, localListen, caddyV2Profile{SelectedIPv4: selectedIPv4, PortStart: 8100, PortEnd: 8102}, map[uint16]caddyV2LANAssignment{
+		8101: caddyV2TestAssignment(appB, true),
+		8100: caddyV2TestAssignment(appA, false),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -204,7 +240,7 @@ func TestBuildCaddyConfigV2IsDeterministic(t *testing.T) {
 		map[string]routeRecord{appB: routeB, appA: routeA},
 		"10.203.0.2:8080",
 		profile,
-		map[uint16]string{8119: appB, 8100: appA},
+		map[uint16]caddyV2LANAssignment{8119: caddyV2TestAssignment(appB, true), 8100: caddyV2TestAssignment(appA, false)},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -213,7 +249,7 @@ func TestBuildCaddyConfigV2IsDeterministic(t *testing.T) {
 		map[string]routeRecord{appA: routeA, appB: routeB},
 		"10.203.0.2:8080",
 		profile,
-		map[uint16]string{8100: appA, 8119: appB},
+		map[uint16]caddyV2LANAssignment{8100: caddyV2TestAssignment(appA, false), 8119: caddyV2TestAssignment(appB, true)},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -237,7 +273,7 @@ func TestBuildCaddyConfigV2RejectsInvalidOrConflictingInput(t *testing.T) {
 		routes      map[string]routeRecord
 		listen      string
 		profile     caddyV2Profile
-		assignments map[uint16]string
+		assignments map[uint16]caddyV2LANAssignment
 	}{
 		{name: "nil routes", listen: "10.203.0.2:8080", profile: validProfile},
 		{name: "wrong local port", routes: validRoutes, listen: "10.203.0.2:8100", profile: validProfile},
@@ -259,11 +295,12 @@ func TestBuildCaddyConfigV2RejectsInvalidOrConflictingInput(t *testing.T) {
 		{name: "profile below pool", routes: validRoutes, listen: "10.203.0.2:8080", profile: caddyV2Profile{SelectedIPv4: validProfile.SelectedIPv4, PortStart: 8099, PortEnd: 8100}},
 		{name: "profile above pool", routes: validRoutes, listen: "10.203.0.2:8080", profile: caddyV2Profile{SelectedIPv4: validProfile.SelectedIPv4, PortStart: 8119, PortEnd: 8120}},
 		{name: "profile reversed", routes: validRoutes, listen: "10.203.0.2:8080", profile: caddyV2Profile{SelectedIPv4: validProfile.SelectedIPv4, PortStart: 8101, PortEnd: 8100}},
-		{name: "assignment below profile", routes: validRoutes, listen: "10.203.0.2:8080", profile: caddyV2Profile{SelectedIPv4: validProfile.SelectedIPv4, PortStart: 8101, PortEnd: 8119}, assignments: map[uint16]string{8100: appID}},
-		{name: "assignment above profile", routes: validRoutes, listen: "10.203.0.2:8080", profile: caddyV2Profile{SelectedIPv4: validProfile.SelectedIPv4, PortStart: 8100, PortEnd: 8118}, assignments: map[uint16]string{8119: appID}},
-		{name: "unknown app", routes: validRoutes, listen: "10.203.0.2:8080", profile: validProfile, assignments: map[uint16]string{8100: otherAppID}},
-		{name: "invalid app id", routes: validRoutes, listen: "10.203.0.2:8080", profile: validProfile, assignments: map[uint16]string{8100: "not-an-app"}},
-		{name: "same app on two ports", routes: validRoutes, listen: "10.203.0.2:8080", profile: validProfile, assignments: map[uint16]string{8100: appID, 8101: appID}},
+		{name: "assignment below profile", routes: validRoutes, listen: "10.203.0.2:8080", profile: caddyV2Profile{SelectedIPv4: validProfile.SelectedIPv4, PortStart: 8101, PortEnd: 8119}, assignments: map[uint16]caddyV2LANAssignment{8100: caddyV2TestAssignment(appID, false)}},
+		{name: "assignment above profile", routes: validRoutes, listen: "10.203.0.2:8080", profile: caddyV2Profile{SelectedIPv4: validProfile.SelectedIPv4, PortStart: 8100, PortEnd: 8118}, assignments: map[uint16]caddyV2LANAssignment{8119: caddyV2TestAssignment(appID, false)}},
+		{name: "unknown app", routes: validRoutes, listen: "10.203.0.2:8080", profile: validProfile, assignments: map[uint16]caddyV2LANAssignment{8100: caddyV2TestAssignment(otherAppID, false)}},
+		{name: "invalid app id", routes: validRoutes, listen: "10.203.0.2:8080", profile: validProfile, assignments: map[uint16]caddyV2LANAssignment{8100: caddyV2TestAssignment("not-an-app", false)}},
+		{name: "missing assignment identity without probe token", routes: validRoutes, listen: "10.203.0.2:8080", profile: validProfile, assignments: map[uint16]caddyV2LANAssignment{8100: {AppID: appID}}},
+		{name: "same app on two ports", routes: validRoutes, listen: "10.203.0.2:8080", profile: validProfile, assignments: map[uint16]caddyV2LANAssignment{8100: caddyV2TestAssignment(appID, false), 8101: caddyV2TestAssignment(appID, false)}},
 		{name: "invalid active route", routes: map[string]routeRecord{appID: {Slot: generatedruntime.SlotBlue}}, listen: "10.203.0.2:8080", profile: validProfile},
 	}
 	for _, test := range tests {
@@ -273,6 +310,21 @@ func TestBuildCaddyConfigV2RejectsInvalidOrConflictingInput(t *testing.T) {
 			}
 		})
 	}
+}
+
+func caddyV2TestAssignment(appID string, alternate bool) caddyV2LANAssignment {
+	assignment := caddyV2LANAssignment{
+		AppID: appID, AllocationID: "66666666-6666-4666-8666-666666666666",
+		AccessRevisionID: "77777777-7777-4777-8777-777777777777", AccessRevisionNumber: 3,
+		AccessSpecDigest: strings.Repeat("c", 64),
+	}
+	if alternate {
+		assignment.AllocationID = "88888888-8888-4888-8888-888888888888"
+		assignment.AccessRevisionID = "99999999-9999-4999-8999-999999999999"
+		assignment.AccessRevisionNumber = 4
+		assignment.AccessSpecDigest = strings.Repeat("d", 64)
+	}
+	return assignment
 }
 
 func assertLANServerHostPolicy(t *testing.T, server caddyServer, selectedIPv4 string, proxyRoutes int) {
