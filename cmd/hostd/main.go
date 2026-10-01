@@ -137,8 +137,7 @@ func runServer(args []string) int {
 	defer bootstrapCompleted()
 	if gate.recoveryKind != "" {
 		logger.Warn("controller entering gateway recovery mode", "kind", gate.recoveryKind, "operation_id", gate.recoveryID)
-		return runRecoveryOnlyController(cfg, logger, listener, a, appaccess.New(db), gate.ingress,
-			gate.recoveryKind, gate.recoveryID, gate.recoveryAppID, gate.recoveryBatch, bootstrapCompleted)
+		return runRecoveryOnlyController(cfg, logger, listener, a, appaccess.New(db), gate, bootstrapCompleted)
 	}
 	m := machines.New(db)
 	if _, err := m.EnsureLocal(); err != nil {
@@ -289,27 +288,36 @@ func runServer(args []string) int {
 }
 
 func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener net.Listener, authentication *auth.Service,
-	upgrades *appaccess.Repository, ingress *generatedingress.Manager, kind, operationID, appID string,
-	recoveryLANBatch bool,
+	upgrades *appaccess.Repository, gate gatewayStartup,
 	bootstrapCompleted func(),
 ) int {
-	if operationID == "" || ingress == nil || upgrades == nil || listener == nil ||
-		(kind != controller.RecoveryGatewayUpgrade && kind != controller.RecoveryLANGrant && kind != controller.RecoveryLANDisable) ||
-		((kind == controller.RecoveryLANGrant || kind == controller.RecoveryLANDisable) && appID == "") ||
-		(recoveryLANBatch && kind != controller.RecoveryLANGrant && kind != controller.RecoveryLANDisable) {
+	if gate.recoveryID == "" || gate.ingress == nil || upgrades == nil || listener == nil ||
+		(gate.recoveryKind != controller.RecoveryGatewayUpgrade && gate.recoveryKind != controller.RecoveryLANGrant && gate.recoveryKind != controller.RecoveryLANDisable) ||
+		((gate.recoveryKind == controller.RecoveryLANGrant || gate.recoveryKind == controller.RecoveryLANDisable) && gate.recoveryAppID == "") ||
+		(gate.recoveryBatch && gate.recoveryKind != controller.RecoveryLANGrant && gate.recoveryKind != controller.RecoveryLANDisable) {
 		logger.Error("gateway recovery controller is missing its pinned operation")
 		return 1
+	}
+	var recoveryHeads controller.LANRecoveryHeadService
+	if gate.recoveryKind == controller.RecoveryLANGrant || gate.recoveryKind == controller.RecoveryLANDisable {
+		reader, err := newLANRecoveryHeadReader(upgrades, gate.ingress, gate)
+		if err != nil {
+			logger.Error("LAN recovery reader is missing its pinned operation", "error", err)
+			return 1
+		}
+		recoveryHeads = reader
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	server := &controller.Server{
-		Auth: authentication, GatewayUpgrades: upgrades, GatewayUpgradeRuntime: ingress,
-		AppAccess: upgrades, AppGrants: upgrades, LANGrantRuntime: ingress,
-		AppDisables: upgrades, LANDisableRuntime: ingress,
-		GeneratedRuntime: true, RecoveryOnly: true, RecoveryKind: kind,
-		RecoveryOperationID: operationID, RecoveryAppID: appID,
-		RecoveryLANBatch: recoveryLANBatch,
-		Logger:           logger, BootstrapCompleted: bootstrapCompleted,
+		Auth: authentication, GatewayUpgrades: upgrades, GatewayUpgradeRuntime: gate.ingress,
+		AppAccess: upgrades, AppGrants: upgrades, LANGrantRuntime: gate.ingress,
+		AppDisables: upgrades, LANDisableRuntime: gate.ingress, LANRecoveryHeads: recoveryHeads,
+		GeneratedRuntime: true, RecoveryOnly: true, RecoveryKind: gate.recoveryKind,
+		RecoveryOperationID: gate.recoveryID, RecoveryAppID: gate.recoveryAppID,
+		RecoveryLANBatch: gate.recoveryBatch, RecoveryBatchHead: gate.recoveryBatchHead,
+		RecoveryBatchCount: gate.recoveryBatchCount,
+		Logger:             logger, BootstrapCompleted: bootstrapCompleted,
 	}
 	httpServer := &http.Server{Addr: cfg.ListenAddress, Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
@@ -318,7 +326,7 @@ func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener 
 		defer cancel()
 		_ = httpServer.Shutdown(shutdown)
 	}()
-	logger.Info("hostd recovery controller listening", "address", cfg.ListenAddress, "operation_id", operationID)
+	logger.Info("hostd recovery controller listening", "address", cfg.ListenAddress, "operation_id", gate.recoveryID)
 	err := httpServer.Serve(listener)
 	if err != nil && err != http.ErrServerClosed {
 		logger.Error("recovery controller stopped", "error", err)

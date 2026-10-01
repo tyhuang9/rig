@@ -68,8 +68,11 @@ type Server struct {
 	LANGrantRuntime       LANAppGrantRuntime
 	AppDisables           LANAppDisableService
 	LANDisableRuntime     LANAppDisableRuntime
+	LANRecoveryHeads      LANRecoveryHeadService
 	RecoveryOnly          bool
 	RecoveryLANBatch      bool
+	RecoveryBatchHead     int
+	RecoveryBatchCount    int
 	RecoveryKind          string
 	RecoveryOperationID   string
 	RecoveryAppID         string
@@ -147,6 +150,7 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute(operationConfigureLANGatewayProfile, noStore(s.requireOperation(operationConfigureLANGatewayProfile, s.configureLANGatewayProfile))),
 		contractRoute(operationGetLANGatewayUpgrade, noStore(s.requireOperation(operationGetLANGatewayUpgrade, s.getLANGatewayUpgrade))),
 		contractRoute(operationUpgradeLANGateway, noStore(s.requireOperation(operationUpgradeLANGateway, s.upgradeLANGateway))),
+		contractRoute(operationGetLANRecoveryHead, noStore(s.requireOperation(operationGetLANRecoveryHead, s.getLANRecoveryHead))),
 		contractRoute("listApplications", s.require(s.listApps)),
 		contractRoute("createApplication", s.require(s.createApp)),
 		contractRoute("inspectImport", noStore(s.require(s.inspectApp))),
@@ -257,6 +261,8 @@ func (s *Server) recoveryGate(next http.Handler) http.Handler {
 			permit = s.RecoveryKind == RecoveryLANGrant
 		case operationGetApplicationLANDisable, operationDisableApplicationLANAccess:
 			permit = s.RecoveryKind == RecoveryLANDisable
+		case operationGetLANRecoveryHead:
+			permit = s.RecoveryKind == RecoveryLANGrant || s.RecoveryKind == RecoveryLANDisable
 		}
 		if permit {
 			allowed.HandleFunc(route.method+" "+route.path, func(w http.ResponseWriter, r *http.Request) {
