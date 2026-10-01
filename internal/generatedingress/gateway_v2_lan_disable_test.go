@@ -174,6 +174,59 @@ func TestGatewayV2LANDisableFailedResolutionRetains404AndRecoversAfterRestart(t 
 	}
 }
 
+func TestGatewayV2LANDisableClearAckFailureKeepsRouteAbsentForRetry(t *testing.T) {
+	manager, store, journal, grant, driver := grantedLANForDisable(t)
+	request := disableRequestForGrant(t, grant)
+	authorize, _ := allowGatewayV2LANDisable(t, manager, request)
+	if _, err := manager.DisableGatewayV2LAN(context.Background(), request, authorize); err != nil {
+		t.Fatal(err)
+	}
+	ackFailure := errors.New("injected acknowledgment failure")
+	resolveCalls, ackCalls := 0, 0
+	err := manager.WithGatewayV2LANDisableFinalization(context.Background(), request,
+		permitGatewayV2LANDisableResolution,
+		func(_ context.Context, observed GatewayV2LANDisableObservation) error {
+			resolveCalls++
+			if observed.Disposition != GatewayV2LANDisableWithdrawnPending || manager.mu.TryLock() {
+				t.Fatal("terminal resolution lacked lock or pending proof")
+			}
+			return nil
+		},
+		func(_ context.Context, observed GatewayV2LANDisableObservation) error {
+			ackCalls++
+			if observed.Disposition != GatewayV2LANDisableDisabled || observed.ObservedAt.IsZero() ||
+				manager.mu.TryLock() || driver.live.Apps[grant.AppID].LAN != nil {
+				t.Fatal("clear acknowledgment lacked lock or final 404 proof")
+			}
+			return ackFailure
+		})
+	if !errors.Is(err, ackFailure) || resolveCalls != 1 || ackCalls != 1 {
+		t.Fatalf("first finalization resolve=%d ack=%d err=%v", resolveCalls, ackCalls, err)
+	}
+	cleared, _, err := store.loadBoundUpgrade(journal.OperationID)
+	if err != nil || cleared.Pending != nil || cleared.Apps[grant.AppID].LAN != nil {
+		t.Fatalf("ack failure republished route: state=%#v err=%v", cleared, err)
+	}
+	if err := manager.WithGatewayV2LANDisableFinalization(context.Background(), request,
+		permitGatewayV2LANDisableResolution,
+		func(_ context.Context, observed GatewayV2LANDisableObservation) error {
+			resolveCalls++
+			if observed.Disposition != GatewayV2LANDisableDisabled {
+				t.Fatal("retry did not prove final disabled state")
+			}
+			return nil
+		},
+		func(_ context.Context, observed GatewayV2LANDisableObservation) error {
+			ackCalls++
+			if observed.Disposition != GatewayV2LANDisableDisabled || manager.mu.TryLock() {
+				t.Fatal("retry acknowledgment lacked lock or final proof")
+			}
+			return nil
+		}); err != nil || resolveCalls != 2 || ackCalls != 2 {
+		t.Fatalf("retry finalization resolve=%d ack=%d err=%v", resolveCalls, ackCalls, err)
+	}
+}
+
 func TestGatewayV2LANDisableAmbiguousWithdrawalFailureStopsOwnedGateway(t *testing.T) {
 	manager, store, journal, grant, driver := grantedLANForDisable(t)
 	request := disableRequestForGrant(t, grant)
@@ -267,13 +320,25 @@ func TestGatewayV2LANDisableStartupClassifiesAndQuarantinesBeforeWorkers(t *test
 		inspection.RecoveryKind != GatewayV2LANRecoveryDisable {
 		t.Fatalf("terminal-before-clear inspection=%#v err=%v", inspection, err)
 	}
+	disables[0].ClearAcknowledged = true
+	if inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), grants, disables); err == nil ||
+		!reflect.DeepEqual(inspection, GatewayV2LANAccessStartupInspection{}) {
+		t.Fatalf("acknowledgment with retained pending marker accepted: %#v err=%v", inspection, err)
+	}
+	disables[0].ClearAcknowledged = false
 	if err := manager.WithGatewayV2LANDisableResolution(context.Background(), request, permitGatewayV2LANDisableResolution,
 		func(context.Context, GatewayV2LANDisableObservation) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	inspection, err = manager.InspectGatewayV2LANAccessStartup(context.Background(), grants, disables)
+	if err != nil || inspection.Disposition != GatewayV2LANStartupRecoveryOnly ||
+		inspection.RecoveryKind != GatewayV2LANRecoveryDisable {
+		t.Fatalf("unacknowledged terminal startup=%#v err=%v", inspection, err)
+	}
+	disables[0].ClearAcknowledged = true
+	inspection, err = manager.InspectGatewayV2LANAccessStartup(context.Background(), grants, disables)
 	if err != nil || inspection.Disposition != GatewayV2LANStartupNormal {
-		t.Fatalf("terminal startup=%#v err=%v", inspection, err)
+		t.Fatalf("acknowledged terminal startup=%#v err=%v", inspection, err)
 	}
 }
 
@@ -305,7 +370,15 @@ func TestGatewayV2LANDisableHistoricalCommitAllowsSamePortReenable(t *testing.T)
 			DisableIntentOperationID: request.OperationID},
 		{Request: newGrant, State: appaccess.AppAccessGrantCommitted, StateSequence: 4},
 	}
-	disables := []GatewayV2LANDisableStartupClaim{{Request: request, State: appaccess.AppAccessDisableCommitted, StateSequence: 3}}
+	disables := []GatewayV2LANDisableStartupClaim{{Request: request, State: appaccess.AppAccessDisableCommitted, StateSequence: 3, ClearAcknowledged: true}}
+	// A pre-migration grant that reused the port before the old clear was
+	// acknowledged cannot be used to manufacture that missing proof.
+	disables[0].ClearAcknowledged = false
+	if inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), grants, disables); err == nil ||
+		!reflect.DeepEqual(inspection, GatewayV2LANAccessStartupInspection{}) {
+		t.Fatalf("unacknowledged reused port accepted: inspection=%#v err=%v", inspection, err)
+	}
+	disables[0].ClearAcknowledged = true
 	inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), grants, disables)
 	if err != nil || inspection.Disposition != GatewayV2LANStartupNormal {
 		t.Fatalf("same-port startup=%#v err=%v", inspection, err)
@@ -367,9 +440,10 @@ func TestGatewayV2LANDisableStartupRejectsCompetingUnresolvedGrant(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), grants, disables); err == nil ||
-		inspection != (GatewayV2LANAccessStartupInspection{}) {
-		t.Fatalf("competing inspection=%#v err=%v", inspection, err)
+	if inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), grants, disables); err != nil ||
+		inspection.Disposition != GatewayV2LANStartupRecoveryOnly || len(inspection.Recoveries) != 2 ||
+		inspection.RecoveryKind != "" || inspection.OperationID != "" {
+		t.Fatalf("competing recovery census=%#v err=%v", inspection, err)
 	}
 	if err := manager.QuarantineGatewayV2LANAccessStartup(context.Background(), grants, disables); err == nil {
 		t.Fatal("competing recovery work allowed startup quarantine mutation")
@@ -388,7 +462,7 @@ func TestGatewayV2LANDisableStartupRejectsMultiplePendingRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstDisable := disableRequestForGrant(t, first)
-	secondDisable := disableRequestForGrant(t, second)
+	secondDisable := distinctGatewayV2LANDisableRequest(t, disableRequestForGrant(t, second))
 	grants := []GatewayV2LANStartupClaim{
 		{Request: first, State: appaccess.AppAccessGrantCommitted, StateSequence: 4,
 			DisableIntentOperationID: firstDisable.OperationID},
@@ -403,9 +477,10 @@ func TestGatewayV2LANDisableStartupRejectsMultiplePendingRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), grants, disables); err == nil ||
-		inspection != (GatewayV2LANAccessStartupInspection{}) {
-		t.Fatalf("multiple-route inspection=%#v err=%v", inspection, err)
+	if inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), grants, disables); err != nil ||
+		inspection.Disposition != GatewayV2LANStartupRecoveryOnly || len(inspection.Recoveries) != 2 ||
+		inspection.RecoveryKind != "" || inspection.OperationID != "" {
+		t.Fatalf("multiple-route recovery census=%#v err=%v", inspection, err)
 	}
 	if err := manager.QuarantineGatewayV2LANAccessStartup(context.Background(), grants, disables); err == nil {
 		t.Fatal("single-route quarantine was allowed with two pending disables")

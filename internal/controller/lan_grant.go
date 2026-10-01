@@ -37,6 +37,11 @@ type LANAppGrantRuntime interface {
 	WithGatewayV2LANRollbackResolution(context.Context, generatedingress.GatewayV2LANGrantRequest, func(context.Context, generatedingress.GatewayV2LANGrantObservation) error) error
 }
 
+type lanBatchGrantRuntime interface {
+	WithGatewayV2LANRecoveryGrantFinalization(context.Context, generatedingress.GatewayV2LANGrantRequest,
+		func(context.Context, generatedingress.GatewayV2LANGrantObservation) error) error
+}
+
 type lanGrantClaimRead struct {
 	AttemptID            string                        `json:"attemptId"`
 	AppID                string                        `json:"appId"`
@@ -231,10 +236,24 @@ func (s *Server) grantApplicationLANAccess(w http.ResponseWriter, r *http.Reques
 	// client cannot cancel the mandatory terminal commit or 404 withdrawal.
 	reconcileCtx, cancelReconcile := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
 	defer cancelReconcile()
-	resolved, err := s.reconcileLANGrant(reconcileCtx, claim, request, grantSucceeded, actor,
-		sessionCookie.Value, r.Header.Get("X-CSRF-Token"))
+	var resolved appaccess.AppAccessGrantClaim
+	if s.RecoveryOnly && s.RecoveryLANBatch {
+		resolved, err = s.reconcileLANBatchGrant(reconcileCtx, claim, request, actor,
+			sessionCookie.Value, r.Header.Get("X-CSRF-Token"))
+	} else {
+		resolved, err = s.reconcileLANGrant(reconcileCtx, claim, request, grantSucceeded, actor,
+			sessionCookie.Value, r.Header.Get("X-CSRF-Token"))
+	}
 	if err != nil {
 		s.lanAccessProblem(w, r, operationGrantApplicationLANAccess, err)
+		return
+	}
+	if s.RecoveryOnly && s.RecoveryLANBatch {
+		if resolved.State != appaccess.AppAccessGrantRolledBack {
+			s.lanAccessProblem(w, r, operationGrantApplicationLANAccess, appaccess.ErrConflict)
+			return
+		}
+		writeJSON(w, http.StatusOK, lanGrantMutation{Claim: contractLANGrantClaim(resolved), Created: false})
 		return
 	}
 	if resolved.State != appaccess.AppAccessGrantCommitted {
@@ -253,6 +272,86 @@ func (s *Server) grantApplicationLANAccess(w http.ResponseWriter, r *http.Reques
 		status = http.StatusCreated
 	}
 	writeJSON(w, status, lanGrantMutation{Claim: contractLANGrantClaim(resolved), Created: created})
+}
+
+// The batch gateway has already withdrawn every unsafe port before this
+// endpoint can serve. A grant head is terminal only after the exact 404 proof
+// and a durable, read-back rollback under the gateway lock. The controller
+// remains pinned to this operation; the next head requires a restart.
+func (s *Server) reconcileLANBatchGrant(ctx context.Context, claim appaccess.AppAccessGrantClaim,
+	request generatedingress.GatewayV2LANGrantRequest, actorID, sessionToken, csrf string,
+) (appaccess.AppAccessGrantClaim, error) {
+	runtime, ok := s.LANGrantRuntime.(lanBatchGrantRuntime)
+	if !ok || !s.RecoveryOnly || !s.RecoveryLANBatch || !s.pinnedLANGrant(claim.Spec.AppID, claim.AttemptID) {
+		return appaccess.AppAccessGrantClaim{}, appaccess.ErrInvalidStoredState
+	}
+	var resolved appaccess.AppAccessGrantClaim
+	err := runtime.WithGatewayV2LANRecoveryGrantFinalization(ctx, request,
+		func(lockCtx context.Context, observation generatedingress.GatewayV2LANGrantObservation) error {
+			if observation.Request != request ||
+				observation.Disposition != generatedingress.GatewayV2LANGrantWithdrawnPendingReconciliation ||
+				observation.ObservedAt.IsZero() || observation.GatewayOperationID == "" ||
+				observation.ProtectedStateDigest == "" {
+				return appaccess.ErrInvalidStoredState
+			}
+			if !s.lanGrantActorCurrent(actorID, sessionToken, csrf) {
+				return appaccess.ErrApprovalRequired
+			}
+			current, readErr := s.AppGrants.AppAccessGrantClaim(lockCtx, claim.AttemptID)
+			if readErr != nil || current.RequestDigest != claim.RequestDigest || current.Spec != claim.Spec ||
+				lanGrantRequestForClaim(current) != request {
+				return firstGatewayUpgradeError(readErr, appaccess.ErrInvalidStoredState)
+			}
+			if current.State == appaccess.AppAccessGrantCommitted {
+				return appaccess.ErrInvalidStoredState
+			}
+			if current.State == appaccess.AppAccessGrantRolledBack {
+				if current.Proof == nil || current.Proof.GatewayOperationID != observation.GatewayOperationID ||
+					current.Proof.ProtectedStateDigest == "" {
+					return appaccess.ErrInvalidStoredState
+				}
+				resolved = current
+				return nil
+			}
+			owner := appaccess.AppAccessGrantClaimOwnerFor(current)
+			owner.ActorID = actorID
+			if current.State == appaccess.AppAccessGrantDBActive {
+				current, _, readErr = s.AppGrants.AdvanceAppAccessGrantClaim(lockCtx, owner,
+					appaccess.AppAccessGrantDBActive, appaccess.AppAccessGrantUncertain)
+				if readErr != nil {
+					return readErr
+				}
+			}
+			if current.State != appaccess.AppAccessGrantPrepared &&
+				current.State != appaccess.AppAccessGrantApplying &&
+				current.State != appaccess.AppAccessGrantUncertain {
+				return appaccess.ErrInvalidStoredState
+			}
+			if !s.lanGrantActorCurrent(actorID, sessionToken, csrf) {
+				return appaccess.ErrApprovalRequired
+			}
+			resolved, _, readErr = s.AppGrants.ResolveAppAccessGrantClaim(lockCtx, owner, current.State,
+				appaccess.AppAccessGrantRolledBack, appaccess.AppAccessGrantProof{
+					GatewayOperationID: observation.GatewayOperationID,
+					ProtectedStateDigest: observation.ProtectedStateDigest,
+				})
+			if readErr != nil {
+				return readErr
+			}
+			confirmed, readErr := s.AppGrants.AppAccessGrantClaim(lockCtx, claim.AttemptID)
+			if readErr != nil || confirmed.RequestDigest != claim.RequestDigest ||
+				confirmed.State != appaccess.AppAccessGrantRolledBack ||
+				confirmed.StateSequence != resolved.StateSequence || confirmed.Proof == nil ||
+				confirmed.Proof.GatewayOperationID != observation.GatewayOperationID {
+				return firstGatewayUpgradeError(readErr, appaccess.ErrInvalidStoredState)
+			}
+			resolved = confirmed
+			return nil
+		})
+	if err != nil {
+		return appaccess.AppAccessGrantClaim{}, err
+	}
+	return resolved, nil
 }
 
 func (s *Server) reconcileLANGrant(ctx context.Context, claim appaccess.AppAccessGrantClaim,

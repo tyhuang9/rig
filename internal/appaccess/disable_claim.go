@@ -140,15 +140,17 @@ func (r *Repository) ClaimAppAccessDisable(ctx context.Context, input ApproveApp
 	}
 	var unresolved int
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM lan_app_access_disable_claims
-		WHERE state IN ('prepared','withdrawing','uncertain')
-		UNION ALL
 		SELECT 1 FROM lan_app_access_grant_claims
 		WHERE state IN ('prepared','applying','db_active','uncertain') AND retired_at IS NULL
 	)`).Scan(&unresolved); err != nil {
 		return AppAccessDisableClaim{}, false, err
 	}
 	if unresolved != 0 {
+		return AppAccessDisableClaim{}, false, ErrConflict
+	}
+	if blocked, err := unresolvedAppAccessDisableClearExists(ctx, tx); err != nil {
+		return AppAccessDisableClaim{}, false, err
+	} else if blocked {
 		return AppAccessDisableClaim{}, false, ErrConflict
 	}
 	var sourceGrant sql.NullString

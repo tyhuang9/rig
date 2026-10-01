@@ -28,12 +28,19 @@ type LANAppDisableService interface {
 	AuthorizeAppAccessDisable(context.Context, appaccess.AppAccessDisableAuthorizationInput) (appaccess.AppAccessDisableAuthorization, error)
 	AdvanceAppAccessDisableClaim(context.Context, appaccess.AppAccessDisableClaimOwner, appaccess.AppAccessDisableState, appaccess.AppAccessDisableState) (appaccess.AppAccessDisableClaim, bool, error)
 	ResolveAppAccessDisableClaim(context.Context, appaccess.AppAccessDisableClaimOwner, appaccess.AppAccessDisableState, appaccess.AppAccessDisableState, appaccess.AppAccessDisableProof) (appaccess.AppAccessDisableClaim, bool, error)
+	AcknowledgeAppAccessDisableProtectedClear(context.Context, string, string, string, time.Time) (appaccess.AppAccessDisableProtectedClearAck, bool, error)
 }
 
 type LANAppDisableRuntime interface {
 	DisableGatewayV2LAN(context.Context, generatedingress.GatewayV2LANDisableRequest, generatedingress.GatewayV2LANDisableAuthorizer) (generatedingress.GatewayV2LANDisableResult, error)
 	ObserveGatewayV2LANDisable(context.Context, generatedingress.GatewayV2LANDisableRequest) (generatedingress.GatewayV2LANDisableObservation, error)
-	WithGatewayV2LANDisableResolution(context.Context, generatedingress.GatewayV2LANDisableRequest, generatedingress.GatewayV2LANDisableResolutionAuthorizer, func(context.Context, generatedingress.GatewayV2LANDisableObservation) error) error
+	WithGatewayV2LANDisableFinalization(context.Context, generatedingress.GatewayV2LANDisableRequest, generatedingress.GatewayV2LANDisableResolutionAuthorizer, func(context.Context, generatedingress.GatewayV2LANDisableObservation) error, func(context.Context, generatedingress.GatewayV2LANDisableObservation) error) error
+}
+
+type lanBatchDisableRuntime interface {
+	WithGatewayV2LANRecoveryDisableFinalization(context.Context, generatedingress.GatewayV2LANDisableRequest,
+		func(context.Context, generatedingress.GatewayV2LANDisableObservation) error,
+		func(context.Context, generatedingress.GatewayV2LANDisableObservation) error) error
 }
 
 type lanDisableClaimRead struct {
@@ -244,20 +251,7 @@ func (s *Server) lanDisableRequest(ctx context.Context, claim appaccess.AppAcces
 	if err != nil || authorized.Claim.OperationID != claim.OperationID || authorized.Claim.RequestDigest != claim.RequestDigest {
 		return generatedingress.GatewayV2LANDisableRequest{}, firstGatewayUpgradeError(err, appaccess.ErrConflict)
 	}
-	request := generatedingress.GatewayV2LANDisableRequest{
-		OperationID: claim.OperationID, RequestDigest: claim.RequestDigest, SpecDigest: claim.SpecDigest,
-		AppID: claim.Spec.AppID, AllocationID: claim.Spec.AllocationID, OwnerOperationID: claim.Spec.OwnerOperationID,
-		Port: claim.Spec.Port, AccessRevisionID: claim.Spec.AccessRevisionID,
-		AccessRevisionNumber: claim.Spec.AccessRevisionNumber, AccessSpecDigest: authorized.Revision.SpecDigest,
-		ApprovedBy: claim.ApprovedBy, GatewayProfileRevisionID: claim.Spec.GatewayProfileRevisionID,
-		GatewayProfileRevisionNumber: claim.Spec.GatewayProfileRevisionNumber,
-		GatewayProfileSpecDigest:     authorized.Profile.SpecDigest,
-	}
-	if authorized.SourceGrant != nil {
-		grant := lanGrantRequestForClaim(*authorized.SourceGrant)
-		request.SourceGrant = &grant
-	}
-	return request, nil
+	return lanDisableRequestForAuthorization(claim, authorized), nil
 }
 
 func (s *Server) reconcileLANDisable(ctx context.Context, claim appaccess.AppAccessDisableClaim,
@@ -266,6 +260,9 @@ func (s *Server) reconcileLANDisable(ctx context.Context, claim appaccess.AppAcc
 	request, err := s.lanDisableRequest(ctx, claim, actorID)
 	if err != nil {
 		return appaccess.AppAccessDisableClaim{}, err
+	}
+	if s.RecoveryOnly && s.RecoveryLANBatch {
+		return s.reconcileLANBatchDisable(ctx, claim, request, actorID, sessionToken, csrf)
 	}
 	owner := appaccess.AppAccessDisableClaimOwnerFor(claim)
 	owner.ActorID = actorID
@@ -284,7 +281,7 @@ func (s *Server) reconcileLANDisable(ctx context.Context, claim appaccess.AppAcc
 			})
 	}
 	var resolved appaccess.AppAccessDisableClaim
-	err = s.LANDisableRuntime.WithGatewayV2LANDisableResolution(ctx, request,
+	err = s.LANDisableRuntime.WithGatewayV2LANDisableFinalization(ctx, request,
 		func(lockCtx context.Context, candidate generatedingress.GatewayV2LANDisableRequest) error {
 			if !s.lanGrantActorCurrent(actorID, sessionToken, csrf) || !reflect.DeepEqual(candidate, request) {
 				return appaccess.ErrApprovalRequired
@@ -358,11 +355,175 @@ func (s *Server) reconcileLANDisable(ctx context.Context, claim appaccess.AppAcc
 					ObservedAt:           observation.ObservedAt,
 				})
 			return authErr
+		},
+		func(lockCtx context.Context, observation generatedingress.GatewayV2LANDisableObservation) error {
+			if !reflect.DeepEqual(observation.Request, request) ||
+				observation.Disposition != generatedingress.GatewayV2LANDisableDisabled ||
+				observation.ObservedAt.IsZero() || observation.GatewayOperationID == "" ||
+				observation.ProtectedStateDigest == "" {
+				return appaccess.ErrInvalidStoredState
+			}
+			if !s.lanGrantActorCurrent(actorID, sessionToken, csrf) {
+				return appaccess.ErrApprovalRequired
+			}
+			current, readErr := s.AppDisables.AppAccessDisableClaim(lockCtx, claim.OperationID)
+			if readErr != nil || current.State != appaccess.AppAccessDisableCommitted ||
+				current.Proof == nil || current.Proof.GatewayOperationID != observation.GatewayOperationID ||
+				current.RequestDigest != claim.RequestDigest || current.Spec != claim.Spec {
+				return firstGatewayUpgradeError(readErr, appaccess.ErrInvalidStoredState)
+			}
+			_, _, ackErr := s.AppDisables.AcknowledgeAppAccessDisableProtectedClear(lockCtx,
+				claim.OperationID, observation.GatewayOperationID,
+				observation.ProtectedStateDigest, observation.ObservedAt)
+			return ackErr
 		})
 	if err != nil {
 		return appaccess.AppAccessDisableClaim{}, firstGatewayUpgradeError(withdrawalErr, err)
 	}
 	return resolved, nil
+}
+
+// The batch gateway has already quarantined every unsafe LAN route before
+// this endpoint can serve. Only the exact pinned disable head may commit and
+// acknowledge its protected clear; advancing the batch remains ingress-owned.
+func (s *Server) reconcileLANBatchDisable(ctx context.Context, claim appaccess.AppAccessDisableClaim,
+	request generatedingress.GatewayV2LANDisableRequest, actorID, sessionToken, csrf string,
+) (appaccess.AppAccessDisableClaim, error) {
+	runtime, ok := s.LANDisableRuntime.(lanBatchDisableRuntime)
+	if !ok || !s.RecoveryOnly || !s.RecoveryLANBatch ||
+		!s.pinnedLANDisable(claim.Spec.AppID, claim.OperationID) {
+		return appaccess.AppAccessDisableClaim{}, appaccess.ErrInvalidStoredState
+	}
+	var resolved appaccess.AppAccessDisableClaim
+	resolve := func(lockCtx context.Context, observation generatedingress.GatewayV2LANDisableObservation) error {
+		if !reflect.DeepEqual(observation.Request, request) ||
+			observation.Disposition != generatedingress.GatewayV2LANDisableWithdrawnPending ||
+			observation.ObservedAt.IsZero() || observation.GatewayOperationID == "" ||
+			observation.ProtectedStateDigest == "" {
+			return appaccess.ErrInvalidStoredState
+		}
+		if !s.lanGrantActorCurrent(actorID, sessionToken, csrf) {
+			return appaccess.ErrApprovalRequired
+		}
+		current, readErr := s.AppDisables.AppAccessDisableClaim(lockCtx, claim.OperationID)
+		if readErr != nil || current.RequestDigest != claim.RequestDigest || current.Spec != claim.Spec {
+			return firstGatewayUpgradeError(readErr, appaccess.ErrInvalidStoredState)
+		}
+		actual, authErr := s.lanDisableRequest(lockCtx, current, actorID)
+		if authErr != nil || !reflect.DeepEqual(actual, request) {
+			return firstGatewayUpgradeError(authErr, appaccess.ErrInvalidStoredState)
+		}
+		if current.State == appaccess.AppAccessDisableCommitted {
+			if current.Proof == nil || current.Proof.GatewayOperationID != observation.GatewayOperationID ||
+				current.Proof.ProtectedStateDigest == "" {
+				return appaccess.ErrInvalidStoredState
+			}
+			resolved = current
+			return nil
+		}
+		owner := appaccess.AppAccessDisableClaimOwnerFor(current)
+		owner.ActorID = actorID
+		if current.State == appaccess.AppAccessDisablePrepared {
+			current, _, readErr = s.AppDisables.AdvanceAppAccessDisableClaim(lockCtx, owner,
+				appaccess.AppAccessDisablePrepared, appaccess.AppAccessDisableWithdrawing)
+			if readErr != nil {
+				return readErr
+			}
+		}
+		if current.State != appaccess.AppAccessDisableWithdrawing &&
+			current.State != appaccess.AppAccessDisableUncertain {
+			return appaccess.ErrInvalidStoredState
+		}
+		authorized, authErr := s.AppDisables.AuthorizeAppAccessDisable(lockCtx, appaccess.AppAccessDisableAuthorizationInput{
+			Owner: owner, PermittedStates: []appaccess.AppAccessDisableState{current.State},
+		})
+		if authErr != nil || authorized.Claim.RequestDigest != claim.RequestDigest ||
+			authorized.Claim.Spec != claim.Spec ||
+			!reflect.DeepEqual(lanDisableRequestForAuthorization(authorized.Claim, authorized), request) {
+			return firstGatewayUpgradeError(authErr, appaccess.ErrInvalidStoredState)
+		}
+		if !s.lanGrantActorCurrent(actorID, sessionToken, csrf) {
+			return appaccess.ErrApprovalRequired
+		}
+		resolved, _, readErr = s.AppDisables.ResolveAppAccessDisableClaim(lockCtx, owner, current.State,
+			appaccess.AppAccessDisableCommitted, appaccess.AppAccessDisableProof{
+				GatewayOperationID:   observation.GatewayOperationID,
+				ProtectedStateDigest: observation.ProtectedStateDigest,
+				ObservedAt:           observation.ObservedAt,
+			})
+		if readErr != nil {
+			return readErr
+		}
+		confirmed, readErr := s.AppDisables.AppAccessDisableClaim(lockCtx, claim.OperationID)
+		if readErr != nil || confirmed.RequestDigest != claim.RequestDigest || confirmed.Spec != claim.Spec ||
+			confirmed.State != appaccess.AppAccessDisableCommitted ||
+			confirmed.StateSequence != resolved.StateSequence || confirmed.Proof == nil ||
+			confirmed.Proof.GatewayOperationID != observation.GatewayOperationID ||
+			confirmed.Proof.ProtectedStateDigest != observation.ProtectedStateDigest {
+			return firstGatewayUpgradeError(readErr, appaccess.ErrInvalidStoredState)
+		}
+		resolved = confirmed
+		return nil
+	}
+	acknowledge := func(lockCtx context.Context, observation generatedingress.GatewayV2LANDisableObservation) error {
+		if !reflect.DeepEqual(observation.Request, request) ||
+			observation.Disposition != generatedingress.GatewayV2LANDisableDisabled ||
+			observation.ObservedAt.IsZero() || observation.GatewayOperationID == "" ||
+			observation.ProtectedStateDigest == "" {
+			return appaccess.ErrInvalidStoredState
+		}
+		if !s.lanGrantActorCurrent(actorID, sessionToken, csrf) {
+			return appaccess.ErrApprovalRequired
+		}
+		current, readErr := s.AppDisables.AppAccessDisableClaim(lockCtx, claim.OperationID)
+		if readErr != nil || current.RequestDigest != claim.RequestDigest || current.Spec != claim.Spec ||
+			current.State != appaccess.AppAccessDisableCommitted || current.Proof == nil ||
+			current.Proof.GatewayOperationID != observation.GatewayOperationID {
+			return firstGatewayUpgradeError(readErr, appaccess.ErrInvalidStoredState)
+		}
+		actual, authErr := s.lanDisableRequest(lockCtx, current, actorID)
+		if authErr != nil || !reflect.DeepEqual(actual, request) {
+			return firstGatewayUpgradeError(authErr, appaccess.ErrInvalidStoredState)
+		}
+		if !s.lanGrantActorCurrent(actorID, sessionToken, csrf) {
+			return appaccess.ErrApprovalRequired
+		}
+		ack, _, ackErr := s.AppDisables.AcknowledgeAppAccessDisableProtectedClear(lockCtx,
+			claim.OperationID, observation.GatewayOperationID,
+			observation.ProtectedStateDigest, observation.ObservedAt)
+		if ackErr != nil {
+			return ackErr
+		}
+		if ack.OperationID != claim.OperationID || ack.GatewayOperationID != observation.GatewayOperationID ||
+			ack.FinalProtectedStateDigest != observation.ProtectedStateDigest || ack.ObservedAt.IsZero() ||
+			ack.AcknowledgedAt.Before(ack.ObservedAt) {
+			return appaccess.ErrInvalidStoredState
+		}
+		return nil
+	}
+	if err := runtime.WithGatewayV2LANRecoveryDisableFinalization(ctx, request, resolve, acknowledge); err != nil {
+		return appaccess.AppAccessDisableClaim{}, err
+	}
+	return resolved, nil
+}
+
+func lanDisableRequestForAuthorization(claim appaccess.AppAccessDisableClaim,
+	authorized appaccess.AppAccessDisableAuthorization,
+) generatedingress.GatewayV2LANDisableRequest {
+	request := generatedingress.GatewayV2LANDisableRequest{
+		OperationID: claim.OperationID, RequestDigest: claim.RequestDigest, SpecDigest: claim.SpecDigest,
+		AppID: claim.Spec.AppID, AllocationID: claim.Spec.AllocationID, OwnerOperationID: claim.Spec.OwnerOperationID,
+		Port: claim.Spec.Port, AccessRevisionID: claim.Spec.AccessRevisionID,
+		AccessRevisionNumber: claim.Spec.AccessRevisionNumber, AccessSpecDigest: authorized.Revision.SpecDigest,
+		ApprovedBy: claim.ApprovedBy, GatewayProfileRevisionID: claim.Spec.GatewayProfileRevisionID,
+		GatewayProfileRevisionNumber: claim.Spec.GatewayProfileRevisionNumber,
+		GatewayProfileSpecDigest:     authorized.Profile.SpecDigest,
+	}
+	if authorized.SourceGrant != nil {
+		grant := lanGrantRequestForClaim(*authorized.SourceGrant)
+		request.SourceGrant = &grant
+	}
+	return request
 }
 
 type lanDisableAuthorizationLease struct {

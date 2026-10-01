@@ -740,3 +740,172 @@ gap before production use.
 A same-process retry after a new access head is approved can return the
 historical completed claim without clearing that pending marker; restart
 selects the pinned recovery-only path and must clear it before normal work.
+
+## Disable protected-clear fence: local evidence
+
+The next local change starts from `eab0f3d` and separates the database's
+terminal disable commit from a second durable fact: the protected ingress
+pending marker has been cleared and the exact old route is still absent. A
+committed disable without this acknowledgment blocks new LAN reservations,
+grant claims, grant application, access approvals from preexisting
+reservations, allocation activation, and disable intents. Migration 030 retains
+the `exact_404` acknowledgment as an immutable row and does not invent rows for upgraded
+databases. The controller records it only after the gateway lock has covered
+the database resolution, pending-marker clear, protected-state reread, and
+fresh 404 proof. A failure after the terminal database commit leaves the new
+work fence in place and can be retried with the same operation. Startup keeps
+an unacknowledged committed disable in recovery-only mode; if a newer route
+already reuses its old port, inspection rejects the unprovable history.
+
+| Local check for the protected-clear change | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions | Passed across all Go packages. The restricted sandbox run failed unrelated ingress/Compose fixtures; those failures did not reproduce with normal permissions. |
+| `go vet ./...` | Passed. |
+| `go run ./cmd/openapi-gen -check` | Passed. |
+| Focused disable ingress, controller, app-access, and migration tests | Passed for an acknowledgment failure and replay, post-commit admission fence including preexisting reservation approval/activation, forged/mismatched acknowledgment, no synthetic migration acknowledgment, and startup rejection of an unacknowledged same-port reuse or a claimed acknowledgment with a retained pending marker. |
+| `git diff --check` and mirrored migration 030 SHA-256 | Passed; both migration copies have hash `9A0128E6971811229CACA7AF9DFC5E65EC439E0220CE9A64B2F3269A01345203`. |
+
+This is a local database and simulator checkpoint. The repository validates
+identity and durable database facts but trusts the gateway-lock caller for
+the external 404 proof. No live Docker or second-device withdrawal has run.
+Several legacy unfinished disable routes, or a legacy prepared grant paired
+with a disable, still cause fail-closed startup rather than a usable recovery
+queue. The batch quarantine and sequential recovery path remain separate M3
+work; the operator UI and live acceptance also remain open.
+Security review identified a legitimate migration-029 history that this
+intermediate branch cannot yet start: an old disable committed, then a later
+grant deliberately reused that app or port before migration 030. The old
+disable has no synthetic acknowledgment, and the newer live route cannot
+honestly supply an old-port 404. Startup fails closed rather than withdrawing
+the newer route. A separate attested historical-successor proof and recovery
+path must be implemented and tested before this branch can be published for
+upgrade use.
+
+## Historical LAN disable successor: local evidence
+
+The local successor branch starts from the protected-clear checkpoint
+`70f3ef7`. Migration 031 adds a separate, immutable successor acknowledgment;
+it does not rewrite the old disable or its `exact_404` acknowledgment. The
+repository requires a grant claimed and committed after the disable with a distinct
+active allocation, current access and gateway profile heads, and the exact
+retired old allocation and source grant when one existed. An acknowledgment
+can describe the same app on a new port, or a new grant for the same or a
+different app that now owns the old port. The two acknowledgment kinds are mutually exclusive. Either kind
+releases the disable admission fence only after its evidence is retained.
+
+Before the controller listener or workers start, hostd selects an exact
+successor from the immutable startup census. Generated ingress holds the
+cross-process gateway lock while it rejects a pending marker or surviving old
+binding, checks every live grant, proves the successor route and isolation,
+and rereads protected state before the durable acknowledgment. A same-app
+grant on a new port also requires a fresh 404 proof at the retired port. Under that same lock, hostd rereads the
+SQLite census, inserts the conditional acknowledgment, and confirms that the
+only database change was that row. This path does not change any route. A
+failed proof or changed census prevents normal startup.
+
+| Local check for the historical successor branch | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions and a task-local Go cache | Passed across all Go packages, including app-access migration, generated ingress, and hostd. |
+| `go test -count=1 -p 1 ./internal/appaccess -run TestDisableSuccessorAck -v` | Passed for migration 029 to 031, same-app new-port, same-app reused-port, different-app reused-port, no source grant, retired successor, exact-404 conflict, replay, and retained row. |
+| `go test -count=1 ./internal/generatedingress -run TestGatewayV2LANDisableSuccessor` | Passed for all three route shapes, stale or live old bindings, pending state, failed final proofs before acknowledgment, callback failure, and cross-process lock contention. |
+| `go test -count=1 -p 1 ./cmd/hostd -run 'TestHistoricalLANDisableSuccessorSelectionPrefersReusedPort|TestAttestHistoricalLANDisableSuccessor' -v` | Passed for reused-port priority, stale candidate rejection, exact callback inputs and ordering, pre-ack census drift, acknowledgment failure, post-ack snapshot drift, and confirmation that only the expected row changed. |
+| `go vet ./...` and `go run ./cmd/openapi-gen -check` with a task-local Go cache | Passed. |
+| `git diff --check` and mirrored migration 031 SHA-256 | Passed; both migration copies have hash `1DD391CF1311AA4E67468768F876506F0CF669A5BCAD8581BEAEEC955D587278`. |
+
+The repository upgrade fixture uses real migration files through 029 and then
+the production migrator, but it does not run a Docker gateway. The ingress
+tests use a protected-state and probe simulator; hostd's callback/snapshot
+tests use a fake repository and attester. No live Docker, second-device
+port-reuse, process-crash restart, or browser-to-external-database journey has
+run. M3 acceptance remains open. Multiple unfinished historical operations
+still need a sequential recovery queue, and the operator UI remains pending.
+Gateway profile rotation after a committed v2 upgrade is not supported by
+current database rules; accepting cross-profile successors would need a
+separate gateway retirement and lineage proof.
+
+## Sequential legacy recovery foundation: local evidence
+
+The local branch `feature/hosting-m3-sequential-lan-recovery` starts from
+`8298616`. Commit `e03b970` adds a deterministic, complete recovery census
+for multiple legacy grant and disable claims, plus a bounded protected batch
+format. The old single-operation quarantine still rejects a multi-operation
+census before mutation. Commit `fbfd20c` adds a separate batch quarantine
+engine: it saves the exact census before changing Caddy, withdraws all unsafe
+LAN bindings under the gateway lock, proves each port absent and unrelated
+grants retained, and stops the journal-owned gateway when replay, interface,
+topology, write, or proof checks fail. It has no startup caller yet.
+
+| Local check | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions and task-local `GOCACHE` on the exact `fbfd20c` tree | Passed across all Go packages, including hostd, generated ingress, app access, and secretfile. The restricted sandbox had produced unrelated ingress fixture access failures. |
+| `go vet ./...` and `go run ./cmd/openapi-gen -check` | Passed. |
+| `git diff --cached --check` before the second commit | Passed. Worktree clean after commit. |
+| Protected state boundary | A 64-item recovery state with a live source binding and retained legacy pending marker serialized to 138,498 of the 196,608 permitted plaintext bytes and passed protected write/readback. The purpose-scoped reader permits up to 256 KiB of persisted protected bytes; ordinary secrets retain their 64 KiB read limit. |
+| Fail-closed simulator checks | Passed for two prepared disables, mixed grant/disable claims, original pending marker, crash after protected intent or simulated reload, invalid replay census, selected-interface drift, partial live topology, failed 404 proof, exact per-port probes, and unrelated committed route retention. |
+
+Independent review found two post-intent gateway-stop gaps: selected-interface
+preflight failure and invalid claim validation before loading the protected
+batch. Both were fixed with regression tests before `fbfd20c`. The local fake
+models a reload-only mixed result but does not exercise the production Docker
+live/restart-config observer. Hosted process-crash and multi-port timing,
+controller startup dispatch, per-item terminal resolution and batch clearing,
+operator UI, and physical second-device/database acceptance remain open. No
+LAN exposure is enabled by these commits, and no M3 acceptance claim is made.
+
+## Sequential recovery startup and head finalization: local evidence
+
+The next local checkpoints add read-only startup recognition of an installed
+protected batch (`c3aee61`) and strict one-head-at-a-time state transitions
+(`cd98b88`). Commits `102a8ae`, `f524686`, and `a8124e8` wire exact
+per-head finalization, hostd's pre-listener quarantine, and recovery-only
+controller actions. Ingress owns the
+gateway lock while it proves every batch port returns 404, resolves the
+pinned database claim, clears only its protected binding, advances one head,
+and rechecks the whole gateway. A completed batch retires only after a fresh
+terminal SQLite census and gateway proof. The controller stays pinned to its
+original head until a restart; it does not serve the next operation in the
+same process.
+
+Review found a reachable migration-028/029 history with a prepared grant and
+prepared disable for the same app, allocation, and port. The exact immutable
+lineage now admits only that paired shape: it rolls back the grant before
+committing the disable and deduplicates the shared 404 port. Unrelated
+same-app or same-port collisions, a committed stale grant in a rollback-only
+batch, forged lineage, and an out-of-order disable still fail closed. Tests
+cover both a previously live protected grant and the migration fixture's
+unapplied shape with no protected or live LAN binding. Commit `22438fd` adds
+mirrored migration 032 without changing earlier migrations. Its narrow
+rollback exception retains an active allocation for the exact paired grant
+until the disable commit makes the sole terminal release. A real SQLite test
+migrates the active prepared pair from 028 through 032, rolls the grant back,
+commits the disable, and reads startup snapshots before and after the separate
+protected-clear acknowledgment. It also rejects forged lineage and an
+unproved release. No single test has yet driven that migrated snapshot through
+the gateway quarantine and controller endpoints together.
+
+Commit `eb357c7` replaces quadratic terminal per-port topology reattestation
+with one bulk all-port proof after retirement. The prior bulk proof already
+checks exact effective topology, every immutable batch port's 404 response,
+and retained grants before retirement. A counting-driver regression confirms
+one bulk all-port call per terminal phase and rejects a missing 404 proof.
+
+| Local check for the combined recovery branch | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions and a task-local `GOCACHE` | Passed across all Go packages after migration 032 and the snapshot repair. The later bulk-proof change passed the full generated-ingress package separately. |
+| `go test -count=1 -p 1 ./internal/generatedingress` after `eb357c7` | Passed in 73.750 seconds, including terminal bulk-proof regression. |
+| `go vet ./...` and `go run ./cmd/openapi-gen -check` after `eb357c7` | Passed. |
+| Focused legacy-pair, migrated SQLite, batch, startup, controller, and protected-state tests | Passed for exact admission/order, 404 quarantine, processed-head replay, terminal callback crash, active pair rollback and release, restart before/after clear acknowledgment, stale or forged identities, unrelated committed-route preservation, and final retirement. |
+| Mirrored migration 032 SHA-256 | Both copies match `465D18C8FAFCF96FC03CC4D9CBC3B686E4C0AA11F3E0164C79840A66916850F6`. |
+| `git diff --check` | Passed with only LF/CRLF conversion notices. |
+
+These are local contract and simulator results. Live Docker timing, a real
+process-crash restart, second-device 404/reachability, and the browser-to-
+application-owned external database journey remain unverified M3 acceptance
+gates. A batch holds at most 64 items across the 20-port LAN pool. Five
+whole-batch proofs still share one three-minute disable-finalization context;
+a slow healthy host could time out after a database commit and require replay.
+The bulk change removes the terminal quadratic path, but live 20-port timing
+must be measured before claiming production readiness. The separate operator
+UI branch at `504e7e8` has no durable reservation/grant identity after refresh
+and no safe disable review API yet.
+This recovery branch has not been published, merged, or deployed.

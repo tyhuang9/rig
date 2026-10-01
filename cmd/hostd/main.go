@@ -99,10 +99,10 @@ func runServer(args []string) int {
 		emergencyStop()
 		return 1
 	}
-	if gate.recoveryKind == controller.RecoveryLANGrant || gate.recoveryKind == controller.RecoveryLANDisable {
+	if gate.recoveryBatch || gate.recoveryKind == controller.RecoveryLANGrant || gate.recoveryKind == controller.RecoveryLANDisable {
 		gate, err = quarantineLANRecoveryStartup(context.Background(), db, gate)
 		if err != nil {
-			logger.Error("LAN grant startup quarantine failed", "error", err)
+			logger.Error("LAN access startup quarantine failed", "error", err)
 			emergencyStop()
 			return 1
 		}
@@ -138,7 +138,7 @@ func runServer(args []string) int {
 	if gate.recoveryKind != "" {
 		logger.Warn("controller entering gateway recovery mode", "kind", gate.recoveryKind, "operation_id", gate.recoveryID)
 		return runRecoveryOnlyController(cfg, logger, listener, a, appaccess.New(db), gate.ingress,
-			gate.recoveryKind, gate.recoveryID, gate.recoveryAppID, bootstrapCompleted)
+			gate.recoveryKind, gate.recoveryID, gate.recoveryAppID, gate.recoveryBatch, bootstrapCompleted)
 	}
 	m := machines.New(db)
 	if _, err := m.EnsureLocal(); err != nil {
@@ -219,7 +219,7 @@ func runServer(args []string) int {
 		if gate.inspection.Disposition == generatedingress.GatewayV2StartupNormalV2 {
 			confirmedAccessInspection, accessErr := runtime.ingress.InspectGatewayV2LANAccessStartup(context.Background(),
 				lanGrantStartupClaims(confirmedSnapshot.Grants), lanDisableStartupClaims(confirmedSnapshot.Disables))
-			if accessErr != nil || confirmedAccessInspection != gate.accessInspection {
+			if accessErr != nil || !reflect.DeepEqual(confirmedAccessInspection, gate.accessInspection) {
 				logger.Error("LAN access startup inspection changed after recovery", "error", accessErr)
 				emergencyStop()
 				return 1
@@ -290,11 +290,13 @@ func runServer(args []string) int {
 
 func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener net.Listener, authentication *auth.Service,
 	upgrades *appaccess.Repository, ingress *generatedingress.Manager, kind, operationID, appID string,
+	recoveryLANBatch bool,
 	bootstrapCompleted func(),
 ) int {
 	if operationID == "" || ingress == nil || upgrades == nil || listener == nil ||
 		(kind != controller.RecoveryGatewayUpgrade && kind != controller.RecoveryLANGrant && kind != controller.RecoveryLANDisable) ||
-		((kind == controller.RecoveryLANGrant || kind == controller.RecoveryLANDisable) && appID == "") {
+		((kind == controller.RecoveryLANGrant || kind == controller.RecoveryLANDisable) && appID == "") ||
+		(recoveryLANBatch && kind != controller.RecoveryLANGrant && kind != controller.RecoveryLANDisable) {
 		logger.Error("gateway recovery controller is missing its pinned operation")
 		return 1
 	}
@@ -306,7 +308,8 @@ func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener 
 		AppDisables: upgrades, LANDisableRuntime: ingress,
 		GeneratedRuntime: true, RecoveryOnly: true, RecoveryKind: kind,
 		RecoveryOperationID: operationID, RecoveryAppID: appID,
-		Logger: logger, BootstrapCompleted: bootstrapCompleted,
+		RecoveryLANBatch: recoveryLANBatch,
+		Logger:           logger, BootstrapCompleted: bootstrapCompleted,
 	}
 	httpServer := &http.Server{Addr: cfg.ListenAddress, Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {

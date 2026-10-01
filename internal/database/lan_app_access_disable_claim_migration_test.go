@@ -115,8 +115,20 @@ func TestLANAppAccessDisableClaimMigrationBackfillsImmutableIntent(t *testing.T)
 			t.Fatalf("seed statement %d: %v", index+1, err)
 		}
 	}
+	through029 := fstest.MapFS{}
+	for name, file := range legacy {
+		through029[name] = file
+	}
+	latest029, err := migrations.ReadFile("migrations/029_lan_app_access_disable_claims.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	through029["migrations/029_lan_app_access_disable_claims.sql"] = &fstest.MapFile{Data: latest029}
+	if err := migrateFS(db, through029); err != nil {
+		t.Fatalf("migrate through 029: %v", err)
+	}
 	if err := Migrate(db); err != nil {
-		t.Fatalf("migrate 029: %v", err)
+		t.Fatalf("migrate 029 to 030: %v", err)
 	}
 	var state, createdAt string
 	var sequence int64
@@ -136,6 +148,14 @@ func TestLANAppAccessDisableClaimMigrationBackfillsImmutableIntent(t *testing.T)
 	if err := db.QueryRow(`SELECT COUNT(*) FROM lan_app_access_disable_claims
 		WHERE state='prepared'`).Scan(&events); err != nil || events != 2 {
 		t.Fatalf("backfilled prepared claims=%d error=%v", events, err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM lan_app_access_disable_clear_acks`).Scan(&events); err != nil || events != 0 {
+		t.Fatalf("migration invented clear acknowledgments=%d error=%v", events, err)
+	}
+	if _, err := db.Exec(`UPDATE lan_app_access_grant_claims
+		SET state='applying',state_sequence=2,updated_at=? WHERE attempt_id=?`, stamp, grantAttempt); err == nil ||
+		!strings.Contains(err.Error(), "disable clear is unresolved") {
+		t.Fatalf("legacy prepared grant crossed disable fence: %v", err)
 	}
 	if _, err := db.Exec(`UPDATE lan_app_access_disable_claim_events SET state='uncertain'
 		WHERE operation_id=? AND sequence=1`, disableOp); err == nil {

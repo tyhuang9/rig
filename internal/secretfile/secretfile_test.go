@@ -53,3 +53,30 @@ func TestWriteNewReportsInstalledDurabilityFailure(t *testing.T) {
 		t.Fatalf("installed destination missing: %v", statErr)
 	}
 }
+
+func TestReadBoundedKeepsOrdinarySecretLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large-protected-artifact.secret")
+	value := bytes.Repeat([]byte("x"), 70<<10)
+	if err := WriteNew(path, "large-artifact", value); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Read(path, "large-artifact"); err == nil {
+		t.Fatal("ordinary secret read accepted an oversized artifact")
+	}
+	loaded, err := ReadBounded(path, "large-artifact", 128<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(loaded)
+	if !bytes.Equal(loaded, value) {
+		t.Fatal("bounded protected read changed the artifact")
+	}
+	if _, err := ReadBounded(path, "wrong-purpose", 128<<10); err == nil {
+		t.Fatal("bounded read accepted the wrong purpose")
+	}
+	for _, maximum := range []int{0, maxBoundedSecretFileBytes + 1} {
+		if _, err := ReadBounded(path, "large-artifact", maximum); err == nil {
+			t.Fatalf("invalid bounded read limit %d was accepted", maximum)
+		}
+	}
+}

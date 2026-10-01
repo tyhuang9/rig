@@ -224,9 +224,31 @@ func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID s
 		!appAccessGrantAllocationStateMatches(claim.State, revision.Allocation.State) {
 		return AppAccessGrantStartupClaim{}, ErrInvalidStoredState
 	}
+	var disableIntent *AppAccessDisableIntent
+	var disableOperationID string
+	err = tx.QueryRowContext(ctx, `SELECT operation_id FROM lan_app_access_disable_intents
+		WHERE allocation_id=?`, claim.Spec.AllocationID).Scan(&disableOperationID)
+	if err == nil {
+		intent, readErr := readAppAccessDisableIntent(ctx, tx, disableOperationID)
+		if readErr != nil || intent.Spec != AppAccessDisableSpecFor(revision) {
+			if readErr != nil {
+				return AppAccessGrantStartupClaim{}, readErr
+			}
+			return AppAccessGrantStartupClaim{}, ErrInvalidStoredState
+		}
+		disableIntent = &intent
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return AppAccessGrantStartupClaim{}, err
+	}
 	if claim.RetiredAt == nil {
 		if revision.Allocation.ReleasedAt != nil {
-			return AppAccessGrantStartupClaim{}, ErrInvalidStoredState
+			matches, matchErr := releasedRolledBackGrantMatchesDisable(ctx, tx, claim, revision, disableIntent)
+			if matchErr != nil {
+				return AppAccessGrantStartupClaim{}, matchErr
+			}
+			if !matches {
+				return AppAccessGrantStartupClaim{}, ErrInvalidStoredState
+			}
 		}
 	} else if claim.State != AppAccessGrantCommitted || revision.Allocation.ReleasedAt == nil ||
 		!revision.Allocation.ReleasedAt.Equal(*claim.RetiredAt) {
@@ -235,6 +257,7 @@ func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID s
 
 	value := AppAccessGrantStartupClaim{
 		Claim: claim, Revision: revision, Allocation: revision.Allocation, Profile: profile,
+		DisableIntent: disableIntent,
 	}
 	var archived sql.NullString
 	if err := tx.QueryRowContext(ctx, `SELECT archived_at FROM applications WHERE id=?`, claim.Spec.AppID).Scan(&archived); errors.Is(err, sql.ErrNoRows) {
@@ -264,22 +287,45 @@ func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID s
 	}
 	value.ApproverIsAdministrator = administrator
 
-	var disableOperationID string
-	err = tx.QueryRowContext(ctx, `SELECT operation_id FROM lan_app_access_disable_intents
-		WHERE allocation_id=?`, claim.Spec.AllocationID).Scan(&disableOperationID)
-	if err == nil {
-		intent, readErr := readAppAccessDisableIntent(ctx, tx, disableOperationID)
-		if readErr != nil || intent.Spec.AppID != claim.Spec.AppID ||
-			intent.Spec.OwnerOperationID != claim.Spec.OwnerOperationID ||
-			intent.Spec.AccessRevisionID != claim.Spec.AccessRevisionID {
-			if readErr != nil {
-				return AppAccessGrantStartupClaim{}, readErr
-			}
-			return AppAccessGrantStartupClaim{}, ErrInvalidStoredState
-		}
-		value.DisableIntent = &intent
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return AppAccessGrantStartupClaim{}, err
-	}
 	return value, nil
+}
+
+// A migration-028 prepared grant can legitimately coexist with a migration-027
+// disable intent. If recovery proves the grant rolled back and then commits the
+// exact backfilled disable, migration 029 releases the allocation without
+// retiring the rolled-back claim. Accept that retained history only when the
+// immutable disable claim and its terminal proof explain the exact release.
+func releasedRolledBackGrantMatchesDisable(ctx context.Context, tx *sql.Tx,
+	claim AppAccessGrantClaim, revision AppAccessRevision, intent *AppAccessDisableIntent,
+) (bool, error) {
+	if claim.State != AppAccessGrantRolledBack || claim.RetiredAt != nil ||
+		revision.Allocation.ReleasedAt == nil || intent == nil {
+		return false, nil
+	}
+	disable, err := readAppAccessDisableClaim(ctx, tx, intent.OperationID)
+	if err != nil {
+		return false, err
+	}
+	if disable.State != AppAccessDisableCommitted || disable.Proof == nil ||
+		disable.Spec != AppAccessDisableSpecFor(revision) ||
+		!revision.Allocation.ReleasedAt.Equal(disable.Proof.ObservedAt) {
+		return false, nil
+	}
+	if disable.SourceGrantAttemptID == "" {
+		return true, nil
+	}
+	if disable.SourceGrantAttemptID == claim.AttemptID {
+		return false, nil
+	}
+	source, err := readAppAccessGrantClaim(ctx, tx, disable.SourceGrantAttemptID)
+	if err != nil {
+		return false, err
+	}
+	return source.State == AppAccessGrantCommitted &&
+		source.Spec.AppID == disable.Spec.AppID &&
+		source.Spec.AllocationID == disable.Spec.AllocationID &&
+		source.Spec.OwnerOperationID == disable.Spec.OwnerOperationID &&
+		source.Spec.AccessRevisionID == disable.Spec.AccessRevisionID &&
+		source.RetiredAt != nil && source.RetiredAt.Equal(disable.Proof.ObservedAt) &&
+		source.RetiredByDisableOperationID == disable.OperationID, nil
 }
