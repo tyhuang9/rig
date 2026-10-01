@@ -39,7 +39,7 @@ func (m *Manager) observeV2Topology(ctx context.Context, source routeState, stat
 }
 
 func (m *Manager) attestCommittedV2Locked(ctx context.Context, state gatewayV2RouteState, journal gatewayMigrationJournal) error {
-	if state.Pending != nil {
+	if state.Pending != nil || state.LANRecovery != nil {
 		return &Error{Code: DiagnosticRouteUnresolved}
 	}
 	source, err := m.store.load()
@@ -310,7 +310,7 @@ func (m *Manager) observeCommittedV2Locked(ctx context.Context, state gatewayV2R
 }
 
 func (m *Manager) applyCommittedV2Routes(ctx context.Context, state gatewayV2RouteState, filename string) error {
-	if state.Pending != nil || !validConfigFilename(filename) {
+	if state.Pending != nil || state.LANRecovery != nil || !validConfigFilename(filename) {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
 	probeToken, err := gatewayV2HostChallenge(state)

@@ -3,6 +3,7 @@ package generatedingress
 import (
 	"context"
 	"reflect"
+	"sort"
 
 	"github.com/hostd/hostd/internal/appaccess"
 )
@@ -27,6 +28,26 @@ type GatewayV2LANAccessStartupInspection struct {
 	RecoveryKind string
 	OperationID  string
 	AppID        string
+	// Recoveries is the complete deterministic recovery census when more than
+	// one operation requires recovery. The legacy singular fields above remain
+	// populated for the one-operation case, so existing startup consumers retain
+	// their contract. A caller must not select an arbitrary item when this list
+	// is populated.
+	Recoveries []GatewayV2LANAccessStartupRecovery
+}
+
+// GatewayV2LANAccessStartupRecovery identifies one exact durable recovery
+// operation. OperationID is a grant AttemptID for lan_grant and a disable
+// OperationID for lan_disable.
+type GatewayV2LANAccessStartupRecovery struct {
+	Kind        string
+	OperationID string
+	AppID       string
+}
+
+type gatewayV2LANAccessStartupRecoveryCandidate struct {
+	GatewayV2LANAccessStartupRecovery
+	port uint16
 }
 
 type gatewayV2LANAccessStartupClaims struct {
@@ -118,17 +139,37 @@ func (m *Manager) InspectGatewayV2LANAccessStartup(ctx context.Context,
 func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2RouteState,
 	journal gatewayMigrationJournal, claims gatewayV2LANAccessStartupClaims, driver gatewayV2LANGrantDriver,
 ) (GatewayV2LANAccessStartupInspection, error) {
-	if ctx == nil || driver == nil || driver.selectedInterfacePreflight(state.Profile) != nil {
+	if ctx == nil || driver == nil || state.LANRecovery != nil || driver.selectedInterfacePreflight(state.Profile) != nil {
 		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 	}
-	recovery := GatewayV2LANAccessStartupInspection{Disposition: GatewayV2LANStartupNormal}
-	setRecovery := func(kind, operationID, appID string) bool {
-		if recovery.RecoveryKind != "" && (recovery.RecoveryKind != kind || recovery.OperationID != operationID || recovery.AppID != appID) {
+	recoveryCandidates := make(map[string]gatewayV2LANAccessStartupRecoveryCandidate)
+	byApp := make(map[string]gatewayV2LANAccessStartupRecoveryCandidate)
+	byPort := make(map[uint16]gatewayV2LANAccessStartupRecoveryCandidate)
+	addRecovery := func(kind, operationID, appID string, port uint16) bool {
+		if (kind != GatewayV2LANRecoveryGrant && kind != GatewayV2LANRecoveryDisable) ||
+			!validCanonicalUUID(operationID) || !validAppID(appID) ||
+			port < state.Profile.PortStart || port > state.Profile.PortEnd {
 			return false
 		}
-		recovery = GatewayV2LANAccessStartupInspection{
-			Disposition: GatewayV2LANStartupRecoveryOnly, RecoveryKind: kind, OperationID: operationID, AppID: appID,
+		candidate := gatewayV2LANAccessStartupRecoveryCandidate{
+			GatewayV2LANAccessStartupRecovery: GatewayV2LANAccessStartupRecovery{
+				Kind: kind, OperationID: operationID, AppID: appID,
+			},
+			port: port,
 		}
+		key := kind + "\x00" + operationID + "\x00" + appID
+		if existing, exists := recoveryCandidates[key]; exists {
+			return existing.port == candidate.port
+		}
+		if existing, exists := byApp[appID]; exists && existing != candidate {
+			return false
+		}
+		if existing, exists := byPort[port]; exists && existing != candidate {
+			return false
+		}
+		recoveryCandidates[key] = candidate
+		byApp[appID] = candidate
+		byPort[port] = candidate
 		return true
 	}
 	protected := make(map[string]struct{})
@@ -147,11 +188,11 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 				(state.Pending == nil || state.Pending.Kind != gatewayV2PendingLANDisable ||
 					state.Pending.Disable == nil || state.Pending.Disable.OperationID != disable.Request.OperationID)) ||
 				disable.Request.SourceGrant == nil || *disable.Request.SourceGrant != request ||
-				!setRecovery(GatewayV2LANRecoveryDisable, disable.Request.OperationID, disable.Request.AppID) {
+				!addRecovery(GatewayV2LANRecoveryDisable, disable.Request.OperationID, disable.Request.AppID, disable.Request.Port) {
 				return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 			}
 		} else if grant.State != appaccess.AppAccessGrantCommitted || grant.RequiresRecovery || grant.DisableIntentOperationID != "" {
-			if !setRecovery(GatewayV2LANRecoveryGrant, request.AttemptID, request.AppID) {
+			if !addRecovery(GatewayV2LANRecoveryGrant, request.AttemptID, request.AppID, request.Port) {
 				return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 			}
 		}
@@ -166,7 +207,7 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 			claim, exists := claims.disables[request.OperationID]
 			original, withdrawn, pendingErr := gatewayV2LANDisablePendingStates(state, request)
 			if !exists || claim.ClearAcknowledged || !reflect.DeepEqual(claim.Request, request) || pendingErr != nil ||
-				!setRecovery(GatewayV2LANRecoveryDisable, request.OperationID, request.AppID) {
+				!addRecovery(GatewayV2LANRecoveryDisable, request.OperationID, request.AppID, request.Port) {
 				return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 			}
 			switch driver.observePending(ctx, original, withdrawn, journal) {
@@ -179,7 +220,7 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 			grant, exists := claims.grants.byAttempt[request.AttemptID]
 			original, proposed, pending, statesErr := gatewayV2LANGrantStatesForRequest(state, request)
 			if pendingErr != nil || !exists || grant.Request != request || statesErr != nil || !pending ||
-				!setRecovery(GatewayV2LANRecoveryGrant, request.AttemptID, request.AppID) {
+				!addRecovery(GatewayV2LANRecoveryGrant, request.AttemptID, request.AppID, request.Port) {
 				return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 			}
 			switch driver.observePending(ctx, original, proposed, journal) {
@@ -206,7 +247,7 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 			continue
 		}
 		if grant.State != appaccess.AppAccessGrantRolledBack &&
-			!setRecovery(GatewayV2LANRecoveryGrant, attemptID, grant.Request.AppID) {
+			!addRecovery(GatewayV2LANRecoveryGrant, attemptID, grant.Request.AppID, grant.Request.Port) {
 			return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 		}
 	}
@@ -226,7 +267,7 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 			if !disable.ClearAcknowledged {
 				if !gatewayV2LANDisableStateMatches(state, disable.Request) ||
 					!proveGatewayV2LANDisabled(ctx, driver, state, journal, disable.Request) ||
-					!setRecovery(GatewayV2LANRecoveryDisable, disable.Request.OperationID, disable.Request.AppID) {
+					!addRecovery(GatewayV2LANRecoveryDisable, disable.Request.OperationID, disable.Request.AppID, disable.Request.Port) {
 					return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 				}
 			}
@@ -236,7 +277,7 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 			return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 		}
 		if disable.State != appaccess.AppAccessDisableCommitted || disable.RequiresRecovery {
-			if !setRecovery(GatewayV2LANRecoveryDisable, disable.Request.OperationID, disable.Request.AppID) {
+			if !addRecovery(GatewayV2LANRecoveryDisable, disable.Request.OperationID, disable.Request.AppID, disable.Request.Port) {
 				return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 			}
 		}
@@ -249,7 +290,41 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 	if driver.selectedInterfacePreflight(state.Profile) != nil || ctx.Err() != nil {
 		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 	}
-	return recovery, nil
+	if len(recoveryCandidates) == 0 {
+		return GatewayV2LANAccessStartupInspection{Disposition: GatewayV2LANStartupNormal}, nil
+	}
+	ordered := make([]gatewayV2LANAccessStartupRecoveryCandidate, 0, len(recoveryCandidates))
+	for _, candidate := range recoveryCandidates {
+		ordered = append(ordered, candidate)
+	}
+	sort.Slice(ordered, func(left, right int) bool {
+		if ordered[left].AppID != ordered[right].AppID {
+			return ordered[left].AppID < ordered[right].AppID
+		}
+		if ordered[left].port != ordered[right].port {
+			return ordered[left].port < ordered[right].port
+		}
+		if ordered[left].Kind != ordered[right].Kind {
+			return ordered[left].Kind < ordered[right].Kind
+		}
+		return ordered[left].OperationID < ordered[right].OperationID
+	})
+	if len(ordered) == 1 {
+		return GatewayV2LANAccessStartupInspection{
+			Disposition:  GatewayV2LANStartupRecoveryOnly,
+			RecoveryKind: ordered[0].Kind,
+			OperationID:  ordered[0].OperationID,
+			AppID:        ordered[0].AppID,
+		}, nil
+	}
+	recoveries := make([]GatewayV2LANAccessStartupRecovery, 0, len(ordered))
+	for _, candidate := range ordered {
+		recoveries = append(recoveries, candidate.GatewayV2LANAccessStartupRecovery)
+	}
+	return GatewayV2LANAccessStartupInspection{
+		Disposition: GatewayV2LANStartupRecoveryOnly,
+		Recoveries:  recoveries,
+	}, nil
 }
 
 func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
@@ -258,6 +333,12 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 	inspection, err := m.InspectGatewayV2LANAccessStartup(ctx, grants, disables)
 	if err != nil || inspection.Disposition == GatewayV2LANStartupNormal {
 		return err
+	}
+	if len(inspection.Recoveries) > 1 {
+		// A legacy one-operation protected marker cannot represent a batch
+		// without erasing uncertainty. The batch quarantine path must install
+		// its immutable record before any recovery listener can be exposed.
+		return gatewayV2StartupInspectionError(ctx)
 	}
 	if inspection.RecoveryKind == GatewayV2LANRecoveryGrant {
 		filtered := make([]GatewayV2LANStartupClaim, 0, len(grants))
@@ -296,7 +377,7 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 		return gatewayV2StartupInspectionError(workCtx)
 	}
 	confirmed, err := inspectGatewayV2LANAccessStartupLocked(workCtx, state, journal, claims, m.gatewayV2LANDisableDriver())
-	if err != nil || confirmed != inspection {
+	if err != nil || !reflect.DeepEqual(confirmed, inspection) {
 		return gatewayV2StartupInspectionError(workCtx)
 	}
 	driver := m.gatewayV2LANDisableDriver()

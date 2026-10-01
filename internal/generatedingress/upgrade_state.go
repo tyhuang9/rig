@@ -24,7 +24,7 @@ const (
 	v2RouteStatePurpose  = "hostd/generated-ingress/routes/v2"
 	v2RouteStateFilename = "routes-v2.bundle"
 	v2RouteStateVersion  = 2
-	maxV2RouteStateBytes = 56 << 10
+	maxV2RouteStateBytes = 192 << 10
 
 	gatewayMigrationPurpose  = "hostd/generated-ingress/migration/v1"
 	gatewayMigrationFilename = "gateway-v1-to-v2.bundle"
@@ -133,6 +133,24 @@ type gatewayV2PendingRoute struct {
 	Disable             *GatewayV2LANDisableRequest `json:"disable,omitempty"`
 }
 
+// gatewayV2LANRecoveryBatch is a restart-stable, immutable recovery queue.
+// Apps remains the last committed route-state baseline. Creation requires a
+// zero Head; terminal code must define any later Head and Apps transition.
+// LegacyPending retains the exact single-operation marker that existed before
+// the queue was installed; it is evidence, not an independently active marker.
+type gatewayV2LANRecoveryBatch struct {
+	Head          int                        `json:"head"`
+	Items         []gatewayV2LANRecoveryItem `json:"items"`
+	LegacyPending *gatewayV2PendingRoute     `json:"legacyPending,omitempty"`
+}
+
+type gatewayV2LANRecoveryItem struct {
+	Kind    gatewayV2PendingKind        `json:"kind"`
+	AppID   string                      `json:"appId"`
+	Grant   *gatewayV2LANBinding        `json:"grant,omitempty"`
+	Disable *GatewayV2LANDisableRequest `json:"disable,omitempty"`
+}
+
 type gatewayV2RouteState struct {
 	Version             int                          `json:"version"`
 	OperationID         string                       `json:"operationId"`
@@ -143,6 +161,7 @@ type gatewayV2RouteState struct {
 	Network             gatewayV2NetworkPlan         `json:"network"`
 	Apps                map[string]gatewayV2AppRoute `json:"apps"`
 	Pending             *gatewayV2PendingRoute       `json:"pending,omitempty"`
+	LANRecovery         *gatewayV2LANRecoveryBatch   `json:"lanRecovery,omitempty"`
 }
 
 type gatewayMigrationPhase string
@@ -468,6 +487,12 @@ func validGatewayV2RouteState(state gatewayV2RouteState) bool {
 			return false
 		}
 	}
+	if state.Pending != nil && state.LANRecovery != nil {
+		return false
+	}
+	if state.LANRecovery != nil {
+		return validGatewayV2LANRecoveryBatch(state)
+	}
 	return validGatewayV2PendingRoute(state)
 }
 
@@ -569,6 +594,142 @@ func validGatewayV2PendingRoute(state gatewayV2RouteState) bool {
 			pending.Proposed.LAN == nil && reflect.DeepEqual(pending.Previous.Route, pending.Proposed.Route)
 	case gatewayV2PendingLANDisable:
 		return validGatewayV2LANDisablePending(state, *pending)
+	default:
+		return false
+	}
+}
+
+func validGatewayV2LANRecoveryBatch(state gatewayV2RouteState) bool {
+	batch := state.LANRecovery
+	if batch == nil || state.Pending != nil || len(batch.Items) == 0 || len(batch.Items) > maxStateApps ||
+		batch.Head < 0 || batch.Head > len(batch.Items) {
+		return false
+	}
+	operations := make(map[string]struct{}, len(batch.Items))
+	identities := make(map[struct {
+		appID       string
+		kind        gatewayV2PendingKind
+		port        uint16
+		operationID string
+	}]struct{}, len(batch.Items))
+	for index, item := range batch.Items {
+		if !validGatewayV2LANRecoveryItem(state, item) {
+			return false
+		}
+		port, operationID := gatewayV2LANRecoveryItemIdentity(item)
+		if _, duplicate := operations[operationID]; duplicate {
+			return false
+		}
+		identity := struct {
+			appID       string
+			kind        gatewayV2PendingKind
+			port        uint16
+			operationID string
+		}{item.AppID, item.Kind, port, operationID}
+		if _, duplicate := identities[identity]; duplicate {
+			return false
+		}
+		operations[operationID] = struct{}{}
+		identities[identity] = struct{}{}
+		if index > 0 && !gatewayV2LANRecoveryItemLess(batch.Items[index-1], item) {
+			return false
+		}
+	}
+	if batch.LegacyPending == nil {
+		return true
+	}
+	legacy := cloneGatewayV2RouteState(state)
+	legacy.LANRecovery = nil
+	legacy.Pending = cloneGatewayV2PendingRoute(batch.LegacyPending)
+	if batch.LegacyPending.Previous == nil {
+		delete(legacy.Apps, batch.LegacyPending.AppID)
+	} else {
+		legacy.Apps[batch.LegacyPending.AppID] = cloneGatewayV2AppRoute(*batch.LegacyPending.Previous)
+	}
+	if !validGatewayV2PendingRoute(legacy) {
+		return false
+	}
+	for _, item := range batch.Items {
+		if gatewayV2LANRecoveryPendingMatchesItem(*batch.LegacyPending, item) {
+			return true
+		}
+	}
+	return false
+}
+
+func validGatewayV2LANRecoveryItem(state gatewayV2RouteState, item gatewayV2LANRecoveryItem) bool {
+	if !validAppID(item.AppID) {
+		return false
+	}
+	app, exists := state.Apps[item.AppID]
+	if !exists {
+		return false
+	}
+	switch item.Kind {
+	case gatewayV2PendingLANGrant:
+		if item.Grant == nil || item.Disable != nil {
+			return false
+		}
+		request := gatewayV2LANGrantRequestForBinding(item.AppID, *item.Grant)
+		binding, err := gatewayV2LANBindingForRequest(request)
+		if err != nil || !reflect.DeepEqual(binding, *item.Grant) ||
+			binding.ProfileRevisionID != state.Profile.RevisionID ||
+			binding.ProfileRevisionNumber != state.Profile.RevisionNumber ||
+			binding.ProfileSpecDigest != state.Profile.SpecDigest ||
+			binding.Port < state.Profile.PortStart || binding.Port > state.Profile.PortEnd {
+			return false
+		}
+		return app.LAN == nil || reflect.DeepEqual(*app.LAN, binding)
+	case gatewayV2PendingLANDisable:
+		if item.Grant != nil || item.Disable == nil || !validGatewayV2LANDisableRequest(*item.Disable) ||
+			item.Disable.AppID != item.AppID ||
+			item.Disable.GatewayProfileRevisionID != state.Profile.RevisionID ||
+			item.Disable.GatewayProfileRevisionNumber != state.Profile.RevisionNumber ||
+			item.Disable.GatewayProfileSpecDigest != state.Profile.SpecDigest ||
+			item.Disable.Port < state.Profile.PortStart || item.Disable.Port > state.Profile.PortEnd {
+			return false
+		}
+		return app.LAN == nil || gatewayV2LANDisableSourceBinding(*item.Disable, app)
+	default:
+		return false
+	}
+}
+
+func gatewayV2LANRecoveryItemIdentity(item gatewayV2LANRecoveryItem) (uint16, string) {
+	if item.Kind == gatewayV2PendingLANGrant && item.Grant != nil {
+		return item.Grant.Port, item.Grant.GrantAttemptID
+	}
+	if item.Kind == gatewayV2PendingLANDisable && item.Disable != nil {
+		return item.Disable.Port, item.Disable.OperationID
+	}
+	return 0, ""
+}
+
+func gatewayV2LANRecoveryItemLess(left, right gatewayV2LANRecoveryItem) bool {
+	leftPort, leftOperation := gatewayV2LANRecoveryItemIdentity(left)
+	rightPort, rightOperation := gatewayV2LANRecoveryItemIdentity(right)
+	if left.AppID != right.AppID {
+		return left.AppID < right.AppID
+	}
+	if leftPort != rightPort {
+		return leftPort < rightPort
+	}
+	if left.Kind != right.Kind {
+		return left.Kind < right.Kind
+	}
+	return leftOperation < rightOperation
+}
+
+func gatewayV2LANRecoveryPendingMatchesItem(pending gatewayV2PendingRoute, item gatewayV2LANRecoveryItem) bool {
+	switch pending.Kind {
+	case gatewayV2PendingLANGrant, gatewayV2PendingLANWithdrawal:
+		request, err := gatewayV2LANPendingRequest(pending)
+		binding, bindingErr := gatewayV2LANBindingForRequest(request)
+		return err == nil && bindingErr == nil && item.Kind == gatewayV2PendingLANGrant &&
+			item.AppID == pending.AppID && item.Grant != nil && reflect.DeepEqual(*item.Grant, binding)
+	case gatewayV2PendingLANDisable:
+		return pending.Disable != nil && item.Kind == gatewayV2PendingLANDisable && item.Disable != nil &&
+			item.AppID == pending.AppID && reflect.DeepEqual(*item.Disable, *pending.Disable)
 	default:
 		return false
 	}
@@ -763,7 +924,8 @@ func (s *gatewayUpgradeStateStore) createV2State(state gatewayV2RouteState) erro
 }
 
 func gatewayV2InitialStateMatchesSource(state gatewayV2RouteState, source routeState) bool {
-	if !validGatewayV2RouteState(state) || !validRouteState(source) || source.Pending != nil || state.Pending != nil || len(state.Apps) != len(source.Active) {
+	if !validGatewayV2RouteState(state) || !validRouteState(source) || source.Pending != nil || state.Pending != nil ||
+		state.LANRecovery != nil || len(state.Apps) != len(source.Active) {
 		return false
 	}
 	digest, err := canonicalDigest(source)
@@ -1011,6 +1173,19 @@ func validCommittedV2StateTransition(current, next gatewayV2RouteState) bool {
 	if reflect.DeepEqual(current, next) {
 		return true
 	}
+	if !validGatewayV2RouteState(current) || !validGatewayV2RouteState(next) {
+		return false
+	}
+	if current.LANRecovery != nil || next.LANRecovery != nil {
+		if current.LANRecovery == nil && next.LANRecovery != nil && next.LANRecovery.Head == 0 &&
+			reflect.DeepEqual(current.Pending, next.LANRecovery.LegacyPending) {
+			installed := cloneGatewayV2RouteState(current)
+			installed.Pending = nil
+			installed.LANRecovery = cloneGatewayV2LANRecoveryBatch(next.LANRecovery)
+			return reflect.DeepEqual(installed, next)
+		}
+		return false
+	}
 	// An ambiguous protected clear of a quarantined grant is repaired by
 	// restoring the exact protected withdrawal record while Caddy remains at
 	// the already-proved 404 configuration.
@@ -1125,24 +1300,54 @@ func cloneGatewayV2RouteState(state gatewayV2RouteState) gatewayV2RouteState {
 		}
 		result.Apps[appID] = app
 	}
-	if state.Pending != nil {
-		pending := *state.Pending
-		pending.Proposed = cloneGatewayV2AppRoute(pending.Proposed)
-		if pending.Previous != nil {
-			previous := cloneGatewayV2AppRoute(*pending.Previous)
-			pending.Previous = &previous
-		}
-		if pending.Disable != nil {
-			identity := *pending.Disable
-			if identity.SourceGrant != nil {
-				source := *identity.SourceGrant
-				identity.SourceGrant = &source
-			}
-			pending.Disable = &identity
-		}
-		result.Pending = &pending
-	}
+	result.Pending = cloneGatewayV2PendingRoute(state.Pending)
+	result.LANRecovery = cloneGatewayV2LANRecoveryBatch(state.LANRecovery)
 	return result
+}
+
+func cloneGatewayV2PendingRoute(value *gatewayV2PendingRoute) *gatewayV2PendingRoute {
+	if value == nil {
+		return nil
+	}
+	pending := *value
+	pending.Proposed = cloneGatewayV2AppRoute(pending.Proposed)
+	if pending.Previous != nil {
+		previous := cloneGatewayV2AppRoute(*pending.Previous)
+		pending.Previous = &previous
+	}
+	if pending.Disable != nil {
+		identity := *pending.Disable
+		if identity.SourceGrant != nil {
+			source := *identity.SourceGrant
+			identity.SourceGrant = &source
+		}
+		pending.Disable = &identity
+	}
+	return &pending
+}
+
+func cloneGatewayV2LANRecoveryBatch(value *gatewayV2LANRecoveryBatch) *gatewayV2LANRecoveryBatch {
+	if value == nil {
+		return nil
+	}
+	batch := *value
+	batch.Items = append([]gatewayV2LANRecoveryItem(nil), value.Items...)
+	for index := range batch.Items {
+		if batch.Items[index].Grant != nil {
+			grant := *batch.Items[index].Grant
+			batch.Items[index].Grant = &grant
+		}
+		if batch.Items[index].Disable != nil {
+			disable := *batch.Items[index].Disable
+			if disable.SourceGrant != nil {
+				source := *disable.SourceGrant
+				disable.SourceGrant = &source
+			}
+			batch.Items[index].Disable = &disable
+		}
+	}
+	batch.LegacyPending = cloneGatewayV2PendingRoute(value.LegacyPending)
+	return &batch
 }
 
 func cloneGatewayV2AppRoute(app gatewayV2AppRoute) gatewayV2AppRoute {
