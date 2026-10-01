@@ -468,37 +468,15 @@ func TestIndependentDatabaseHandlesSerializeGrantAndDisable(t *testing.T) {
 		}
 	})
 
-	t.Run("disable wins", func(t *testing.T) {
-		first, second, revision, _, input := twoHandleGrantFixture(t)
+	t.Run("prepared grant fences disable", func(t *testing.T) {
+		first, _, revision, _, input := twoHandleGrantFixture(t)
 		claim, _, err := first.ClaimAppAccessGrant(context.Background(), input)
 		if err != nil {
 			t.Fatal(err)
 		}
-		owner := AppAccessGrantClaimOwnerFor(claim)
-		locked := make(chan struct{})
-		release := make(chan struct{})
-		first.afterDisableIntentLock = func() {
-			close(locked)
-			<-release
-		}
-		disableResult := make(chan error, 1)
-		go func() {
-			_, _, err := first.ApproveAppAccessDisable(context.Background(), approvedDisableInput(t, revision))
-			disableResult <- err
-		}()
-		waitForSignal(t, locked, "disable intent lock")
-		transitionResult := make(chan error, 1)
-		go func() {
-			_, _, err := second.AdvanceAppAccessGrantClaim(context.Background(), owner,
-				AppAccessGrantPrepared, AppAccessGrantApplying)
-			transitionResult <- err
-		}()
-		close(release)
-		if err := waitForResult(t, disableResult, "disable intent"); err != nil {
-			t.Fatal(err)
-		}
-		if err := waitForResult(t, transitionResult, "blocked applying transition"); err == nil {
-			t.Fatal("applying won after disable held the write lock")
+		if _, _, err := first.ApproveAppAccessDisable(context.Background(),
+			approvedDisableInput(t, revision)); !errors.Is(err, ErrConflict) {
+			t.Fatalf("prepared grant disable error=%v", err)
 		}
 		retained, err := first.AppAccessGrantClaim(context.Background(), claim.AttemptID)
 		if err != nil || retained.State != AppAccessGrantPrepared {

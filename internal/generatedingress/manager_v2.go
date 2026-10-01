@@ -192,6 +192,32 @@ func (m *Manager) rollbackCommittedV2PendingLocked(ctx context.Context, store *g
 	if state.Pending == nil {
 		return state, nil
 	}
+	if state.Pending.Kind == gatewayV2PendingLANDisable {
+		if state.Pending.Disable == nil {
+			return gatewayV2RouteState{}, &Error{Code: DiagnosticRouteUnresolved}
+		}
+		request := *state.Pending.Disable
+		original, withdrawn, err := gatewayV2LANDisablePendingStates(state, request)
+		if err != nil {
+			return gatewayV2RouteState{}, &Error{Code: DiagnosticRouteUnresolved}
+		}
+		driver := m.gatewayV2LANDisableDriver()
+		proofCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), v2ObservationTimeout)
+		defer cancel()
+		switch driver.observePending(proofCtx, original, withdrawn, journal) {
+		case gatewayV2PendingCommittedExact, gatewayV2PendingReloadOnlyMixed:
+			if driver.apply(proofCtx, withdrawn, "lan-disable-startup.json") != nil {
+				return gatewayV2RouteState{}, candidateMayBeLiveError()
+			}
+		case gatewayV2PendingProposedExact:
+		default:
+			return gatewayV2RouteState{}, candidateMayBeLiveError()
+		}
+		if !proveGatewayV2LANDisabled(proofCtx, driver, withdrawn, journal, request) {
+			return gatewayV2RouteState{}, candidateMayBeLiveError()
+		}
+		return state, &Error{Code: DiagnosticRouteUnresolved}
+	}
 	source, err := m.store.load()
 	if err != nil {
 		return gatewayV2RouteState{}, &Error{Code: DiagnosticRouteStateFailed}

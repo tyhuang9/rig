@@ -283,7 +283,8 @@ func safeHandlerOperation(operation string) string {
 		operationConfigureLANGatewayProfile, operationGetLANGatewayUpgrade,
 		operationUpgradeLANGateway, operationGetApplicationLANAccess,
 		operationReserveApplicationLANAccess, operationApproveApplicationLANAccess,
-		operationGetApplicationLANGrant, operationGrantApplicationLANAccess:
+		operationGetApplicationLANGrant, operationGrantApplicationLANAccess,
+		operationGetApplicationLANDisable, operationDisableApplicationLANAccess:
 		return operation
 	default:
 		return "unknown"
@@ -305,7 +306,9 @@ func safeHandlerProblemCode(code string) string {
 		return code
 	case "lan_access_forbidden", "invalid_lan_access_request", "lan_access_conflict",
 		"lan_access_replay_conflict", "lan_access_approval_mismatch",
-		"lan_access_pool_exhausted", "lan_access_unavailable":
+		"lan_access_pool_exhausted", "lan_access_unavailable",
+		"lan_disable_conflict", "lan_disable_replay_conflict", "lan_disable_approval_mismatch",
+		"lan_disable_unavailable":
 		return code
 	default:
 		return "internal_error"

@@ -118,17 +118,19 @@ const (
 	// binding. This lets restart recovery distinguish a withdrawn, unresolved
 	// grant from an ordinary disabled route without erasing its AttemptID.
 	gatewayV2PendingLANWithdrawal gatewayV2PendingKind = "lan_grant_withdrawal"
+	gatewayV2PendingLANDisable    gatewayV2PendingKind = "lan_disable"
 )
 
 // gatewayV2PendingRoute is the durable write-ahead record for a committed-v2
 // route reload. Apps always remains the last committed route set while this
 // record is present, so restart recovery has an unambiguous rollback target.
 type gatewayV2PendingRoute struct {
-	Kind                gatewayV2PendingKind `json:"kind,omitempty"`
-	AppID               string               `json:"appId"`
-	Previous            *gatewayV2AppRoute   `json:"previous,omitempty"`
-	Proposed            gatewayV2AppRoute    `json:"proposed"`
-	ActivationUncertain bool                 `json:"activationUncertain,omitempty"`
+	Kind                gatewayV2PendingKind        `json:"kind,omitempty"`
+	AppID               string                      `json:"appId"`
+	Previous            *gatewayV2AppRoute          `json:"previous,omitempty"`
+	Proposed            gatewayV2AppRoute           `json:"proposed"`
+	ActivationUncertain bool                        `json:"activationUncertain,omitempty"`
+	Disable             *GatewayV2LANDisableRequest `json:"disable,omitempty"`
 }
 
 type gatewayV2RouteState struct {
@@ -517,6 +519,12 @@ func validGatewayV2PendingRoute(state gatewayV2RouteState) bool {
 	}
 	pending := state.Pending
 	if !validAppID(pending.AppID) || validateRoute(pending.Proposed.Route) != nil {
+		if pending.Kind != gatewayV2PendingLANDisable || !validAppID(pending.AppID) || pending.Previous == nil ||
+			!reflect.DeepEqual(pending.Proposed, gatewayV2AppRoute{}) {
+			return false
+		}
+	}
+	if pending.Kind != gatewayV2PendingLANDisable && pending.Disable != nil {
 		return false
 	}
 	committed, exists := state.Apps[pending.AppID]
@@ -559,6 +567,8 @@ func validGatewayV2PendingRoute(state gatewayV2RouteState) bool {
 	case gatewayV2PendingLANWithdrawal:
 		return pending.ActivationUncertain && pending.Previous != nil && pending.Previous.LAN != nil &&
 			pending.Proposed.LAN == nil && reflect.DeepEqual(pending.Previous.Route, pending.Proposed.Route)
+	case gatewayV2PendingLANDisable:
+		return validGatewayV2LANDisablePending(state, *pending)
 	default:
 		return false
 	}
@@ -1004,7 +1014,8 @@ func validCommittedV2StateTransition(current, next gatewayV2RouteState) bool {
 	// An ambiguous protected clear of a quarantined grant is repaired by
 	// restoring the exact protected withdrawal record while Caddy remains at
 	// the already-proved 404 configuration.
-	if current.Pending == nil && next.Pending != nil && next.Pending.Kind == gatewayV2PendingLANWithdrawal {
+	if current.Pending == nil && next.Pending != nil &&
+		(next.Pending.Kind == gatewayV2PendingLANWithdrawal || next.Pending.Kind == gatewayV2PendingLANDisable) {
 		restored := cloneGatewayV2RouteState(current)
 		restored.Apps[next.Pending.AppID] = cloneGatewayV2AppRoute(*next.Pending.Previous)
 		restored.Pending = next.Pending
@@ -1120,6 +1131,14 @@ func cloneGatewayV2RouteState(state gatewayV2RouteState) gatewayV2RouteState {
 		if pending.Previous != nil {
 			previous := cloneGatewayV2AppRoute(*pending.Previous)
 			pending.Previous = &previous
+		}
+		if pending.Disable != nil {
+			identity := *pending.Disable
+			if identity.SourceGrant != nil {
+				source := *identity.SourceGrant
+				identity.SourceGrant = &source
+			}
+			pending.Disable = &identity
 		}
 		result.Pending = &pending
 	}

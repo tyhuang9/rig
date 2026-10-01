@@ -26,6 +26,7 @@ const (
 // are evidence of a live gateway route or a reachable LAN address.
 type LANAppAccessService interface {
 	CurrentAppAccess(context.Context, string) (appaccess.AppAccessRevision, error)
+	AppAccessHead(context.Context, string) (appaccess.AppAccessRevision, error)
 	ReserveAppAccess(context.Context, appaccess.ReserveAppAccessInput) (appaccess.Allocation, bool, error)
 	ApproveAppAccess(context.Context, appaccess.ApproveAppAccessInput) (appaccess.AppAccessRevision, bool, error)
 }
@@ -109,6 +110,13 @@ func (s *Server) getApplicationLANAccess(w http.ResponseWriter, r *http.Request)
 	switch {
 	case errors.Is(err, appaccess.ErrNotFound):
 		result.Availability = "local_only"
+		head, headErr := s.AppAccess.AppAccessHead(r.Context(), r.PathValue("appId"))
+		if headErr == nil {
+			result.ExpectedRevisionNumber = head.RevisionNumber
+		} else if !errors.Is(headErr, appaccess.ErrNotFound) {
+			s.lanAccessProblem(w, r, operationGetApplicationLANAccess, headErr)
+			return
+		}
 	case err != nil:
 		s.lanAccessProblem(w, r, operationGetApplicationLANAccess, err)
 		return

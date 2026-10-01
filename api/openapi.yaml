@@ -43,6 +43,10 @@ x-rig-problem-codes:
   lan_access_approval_mismatch: {description: Confirmation does not approve the exact application LAN access, statuses: [409]}
   lan_access_pool_exhausted: {description: No LAN gateway port is available, statuses: [409]}
   lan_access_unavailable: {description: Application LAN access state is unavailable, statuses: [503]}
+  lan_disable_conflict: {description: The approved LAN disable or its exact route ownership changed, statuses: [409]}
+  lan_disable_replay_conflict: {description: The LAN disable operation identifier was reused with different input, statuses: [409]}
+  lan_disable_approval_mismatch: {description: Confirmation does not approve the exact application LAN disable, statuses: [409]}
+  lan_disable_unavailable: {description: The LAN disable could not be safely reconciled, statuses: [503]}
   capability_unavailable: {description: The requested operation requires a runtime capability that is disabled, statuses: [409]}
 x-job-responses: &jobResponses
   '200': {description: Existing idempotent job, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
@@ -451,7 +455,7 @@ paths:
       operationId: getApplicationLANAccess
       x-rig-problem-codes: [lan_access_forbidden, invalid_lan_access_request, lan_access_unavailable, capability_unavailable]
       security: [{sessionCookie: []}]
-      description: Returns approved desired application access and allocation state. It never treats the database as proof of a live LAN route and does not return a URL.
+      description: Returns approved desired application access and allocation state. A URL is present only after an exact live gateway, claim, allocation, and deployment proof.
       responses:
         '200': {description: Desired application LAN access and an exact live-attested availability result, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppAccessRead'}}}}
         default: {$ref: '#/components/responses/Problem'}
@@ -500,6 +504,28 @@ paths:
       description: Returns one exact durable grant attempt and its separately observed gateway disposition without publishing a URL.
       responses:
         '200': {description: Exact grant state and observed disposition, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppGrantRead'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/lan-access/disables:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    post:
+      operationId: disableApplicationLANAccess
+      x-rig-problem-codes: [lan_access_forbidden, invalid_lan_access_request, lan_disable_conflict, lan_disable_replay_conflict, lan_disable_approval_mismatch, lan_disable_unavailable, capability_unavailable]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      description: Records exact administrator consent and withdraws this app's LAN binding. A port is released only after a protected exact 404 proof and durable terminal reconciliation. The local route and application data remain.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/DisableLANAppAccessRequest'}}}}
+      responses:
+        '200': {description: Exact retained disable claim, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppDisableMutation'}}}}
+        '201': {description: New disable claim reconciled, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppDisableMutation'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/lan-access/disables/{operationId}:
+    parameters: [{$ref: '#/components/parameters/AppId'}, {name: operationId, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: getApplicationLANDisable
+      x-rig-problem-codes: [lan_access_forbidden, invalid_lan_access_request, lan_disable_conflict, lan_disable_unavailable, capability_unavailable]
+      security: [{sessionCookie: []}]
+      description: Returns the exact retained disable claim and separately observed gateway disposition. It never returns a LAN URL.
+      responses:
+        '200': {description: Exact disable state, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppDisableRead'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /api/v1/system/lan-gateway-profile:
     get:
@@ -900,6 +926,51 @@ components:
       required: [claim, created]
       properties:
         claim: {$ref: '#/components/schemas/LANAppGrantClaim'}
+        created: {type: boolean}
+    DisableLANAppAccessRequest:
+      type: object
+      additionalProperties: false
+      required: [operationId, accessRevisionId, accessRevisionNumber, allocationId, approvalDigest]
+      properties:
+        operationId: {type: string, format: uuid}
+        accessRevisionId: {type: string, format: uuid}
+        accessRevisionNumber: {type: integer, format: int64, minimum: 1}
+        allocationId: {type: string, format: uuid}
+        approvalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANAppDisableClaim:
+      type: object
+      additionalProperties: false
+      required: [operationId, appId, allocationId, accessRevisionId, accessRevisionNumber, port, state, updatedAt]
+      properties:
+        operationId: {type: string, format: uuid}
+        appId: {type: string, format: uuid}
+        allocationId: {type: string, format: uuid}
+        accessRevisionId: {type: string, format: uuid}
+        accessRevisionNumber: {type: integer, format: int64, minimum: 1}
+        port: {type: integer, minimum: 8100, maximum: 8119}
+        state: {type: string, enum: [prepared, withdrawing, uncertain, committed]}
+        updatedAt: {type: string, format: date-time}
+        releasedAt: {type: string, format: date-time}
+    LANAppDisableObservation:
+      type: object
+      additionalProperties: false
+      required: [availability]
+      properties:
+        availability: {type: string, enum: [unknown, pending_published, withdrawn_pending_resolution, disabled]}
+        observedAt: {type: string, format: date-time}
+    LANAppDisableRead:
+      type: object
+      additionalProperties: false
+      required: [claim, observed]
+      properties:
+        claim: {$ref: '#/components/schemas/LANAppDisableClaim'}
+        observed: {$ref: '#/components/schemas/LANAppDisableObservation'}
+    LANAppDisableMutation:
+      type: object
+      additionalProperties: false
+      required: [claim, created]
+      properties:
+        claim: {$ref: '#/components/schemas/LANAppDisableClaim'}
         created: {type: boolean}
     LANGatewayProfileSpec:
       type: object
