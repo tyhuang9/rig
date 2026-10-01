@@ -178,13 +178,9 @@ func (r *Repository) ClaimAppAccessGrant(ctx context.Context, input ClaimAppAcce
 	if blocking != 0 {
 		return AppAccessGrantClaim{}, false, ErrConflict
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM lan_app_access_disable_claims
-		WHERE state IN ('prepared','withdrawing','uncertain')
-	)`).Scan(&blocking); err != nil {
+	if blocked, err := unresolvedAppAccessDisableClearExists(ctx, tx); err != nil {
 		return AppAccessGrantClaim{}, false, err
-	}
-	if blocking != 0 {
+	} else if blocked {
 		return AppAccessGrantClaim{}, false, ErrConflict
 	}
 
@@ -306,6 +302,13 @@ func (r *Repository) transitionAppAccessGrantClaim(ctx context.Context, owner Ap
 	}
 	if value.State != expected {
 		return AppAccessGrantClaim{}, false, ErrConflict
+	}
+	if expected == AppAccessGrantPrepared && target == AppAccessGrantApplying {
+		if blocked, err := unresolvedAppAccessDisableClearExists(ctx, tx); err != nil {
+			return AppAccessGrantClaim{}, false, err
+		} else if blocked {
+			return AppAccessGrantClaim{}, false, ErrConflict
+		}
 	}
 	now := r.now().UTC()
 	if proof != nil {

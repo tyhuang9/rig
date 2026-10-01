@@ -419,6 +419,29 @@ func (m *Manager) WithGatewayV2LANDisableResolution(ctx context.Context, request
 	authorize GatewayV2LANDisableResolutionAuthorizer,
 	resolve func(context.Context, GatewayV2LANDisableObservation) error,
 ) (resultErr error) {
+	return m.withGatewayV2LANDisableResolution(ctx, request, authorize, resolve, nil)
+}
+
+// WithGatewayV2LANDisableFinalization keeps the gateway lock through the
+// terminal database commit, protected pending clear, fresh absence proof, and
+// durable database acknowledgment. A failed acknowledgment leaves the route
+// absent and the database admission fence in place for restart recovery.
+func (m *Manager) WithGatewayV2LANDisableFinalization(ctx context.Context, request GatewayV2LANDisableRequest,
+	authorize GatewayV2LANDisableResolutionAuthorizer,
+	resolve func(context.Context, GatewayV2LANDisableObservation) error,
+	acknowledge func(context.Context, GatewayV2LANDisableObservation) error,
+) error {
+	if acknowledge == nil {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
+	return m.withGatewayV2LANDisableResolution(ctx, request, authorize, resolve, acknowledge)
+}
+
+func (m *Manager) withGatewayV2LANDisableResolution(ctx context.Context, request GatewayV2LANDisableRequest,
+	authorize GatewayV2LANDisableResolutionAuthorizer,
+	resolve func(context.Context, GatewayV2LANDisableObservation) error,
+	acknowledge func(context.Context, GatewayV2LANDisableObservation) error,
+) (resultErr error) {
 	if m == nil || ctx == nil || !validGatewayV2LANDisableRequest(request) || authorize == nil || resolve == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
@@ -461,6 +484,11 @@ func (m *Manager) WithGatewayV2LANDisableResolution(ctx context.Context, request
 			confirmed, confirmedJournal, err := store.loadBoundUpgrade(journal.OperationID)
 			if err != nil || !reflect.DeepEqual(confirmed, state) || !reflect.DeepEqual(confirmedJournal, journal) {
 				return gatewayV2LANDisableError(workCtx)
+			}
+			if acknowledge != nil {
+				if err := acknowledge(workCtx, observation); err != nil {
+					return err
+				}
 			}
 			return nil
 		}
@@ -521,6 +549,15 @@ func (m *Manager) WithGatewayV2LANDisableResolution(ctx context.Context, request
 	if err != nil || !reflect.DeepEqual(cleared, withdrawn) || !reflect.DeepEqual(clearedJournal, journal) {
 		_ = restoreGatewayV2LANPending(store, state, withdrawn, journal)
 		return emergencyGatewayV2LANDisableStop(ctx, m, journal, driver)
+	}
+	if acknowledge != nil {
+		clearObservation, err := gatewayV2LANDisableObservation(cleared, request, GatewayV2LANDisableDisabled)
+		if err != nil {
+			return err
+		}
+		if err := acknowledge(workCtx, clearObservation); err != nil {
+			return err
+		}
 	}
 	return nil
 }

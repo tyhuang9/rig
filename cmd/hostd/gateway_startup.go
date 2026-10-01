@@ -284,6 +284,7 @@ func lanDisableStartupClaims(snapshot appaccess.AppAccessDisableStartupSnapshot)
 		}
 		claims = append(claims, generatedingress.GatewayV2LANDisableStartupClaim{
 			Request: request, State: entry.Claim.State, StateSequence: entry.Claim.StateSequence,
+			ClearAcknowledged: entry.ProtectedClearAck != nil,
 			RequiresRecovery: entry.Claim.State != appaccess.AppAccessDisableCommitted &&
 				(entry.AppArchived || !entry.AccessHeadCurrent || !entry.ProfileHeadCurrent ||
 					!entry.ApproverIsAdministrator),

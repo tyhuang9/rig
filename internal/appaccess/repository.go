@@ -213,6 +213,11 @@ func (r *Repository) ReserveAppAccess(ctx context.Context, input ReserveAppAcces
 	} else if !errors.Is(lookupErr, sql.ErrNoRows) {
 		return Allocation{}, false, lookupErr
 	}
+	if blocking, err := unresolvedAppAccessDisableClearExists(ctx, tx); err != nil {
+		return Allocation{}, false, err
+	} else if blocking {
+		return Allocation{}, false, ErrConflict
+	}
 	var currentAccess int64
 	if err := tx.QueryRowContext(ctx, `SELECT h.revision_number FROM lan_app_access_heads h JOIN applications a ON a.id=h.app_id AND a.archived_at IS NULL WHERE h.app_id=?`, input.AppID).Scan(&currentAccess); errors.Is(err, sql.ErrNoRows) {
 		return Allocation{}, false, ErrNotFound
@@ -302,6 +307,11 @@ func (r *Repository) ApproveAppAccess(ctx context.Context, input ApproveAppAcces
 		return existing, false, nil
 	} else if !errors.Is(lookupErr, sql.ErrNoRows) {
 		return AppAccessRevision{}, false, lookupErr
+	}
+	if blocked, err := unresolvedAppAccessDisableClearExists(ctx, tx); err != nil {
+		return AppAccessRevision{}, false, err
+	} else if blocked {
+		return AppAccessRevision{}, false, ErrConflict
 	}
 	allocation, err := readAllocationByID(ctx, tx, input.AllocationID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -538,6 +548,13 @@ func (r *Repository) transitionAllocation(ctx context.Context, owner AllocationO
 			return Allocation{}, err
 		}
 		return value, nil
+	}
+	if target == AllocationActive {
+		if blocked, err := unresolvedAppAccessDisableClearExists(ctx, tx); err != nil {
+			return Allocation{}, err
+		} else if blocked {
+			return Allocation{}, ErrConflict
+		}
 	}
 	valid := value.State == AllocationReserved || (value.State == AllocationActive && target == AllocationUncertain) || (value.State == AllocationUncertain && target == AllocationActive)
 	if !valid {

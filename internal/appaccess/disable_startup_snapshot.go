@@ -16,6 +16,7 @@ type AppAccessDisableStartupClaim struct {
 	AccessHeadCurrent       bool
 	ProfileHeadCurrent      bool
 	ApproverIsAdministrator bool
+	ProtectedClearAck       *AppAccessDisableProtectedClearAck
 }
 
 type AppAccessDisableStartupSnapshot struct {
@@ -126,6 +127,18 @@ func readAppAccessDisableStartupClaim(ctx context.Context, tx *sql.Tx, operation
 	} else if claim.Proof != nil || revision.Allocation.ReleasedAt != nil ||
 		(value.SourceGrant != nil && value.SourceGrant.RetiredAt != nil) {
 		return AppAccessDisableStartupClaim{}, ErrInvalidStoredState
+	}
+	ack, err := readAppAccessDisableProtectedClearAck(ctx, tx, operationID)
+	if err == nil {
+		if claim.State != AppAccessDisableCommitted || claim.Proof == nil ||
+			ack.GatewayOperationID != claim.Proof.GatewayOperationID ||
+			ack.ObservedAt.Before(claim.Proof.ObservedAt) ||
+			ack.AcknowledgedAt.Before(ack.ObservedAt) {
+			return AppAccessDisableStartupClaim{}, ErrInvalidStoredState
+		}
+		value.ProtectedClearAck = &ack
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return AppAccessDisableStartupClaim{}, err
 	}
 	var archived sql.NullString
 	if err := tx.QueryRowContext(ctx, `SELECT archived_at FROM applications WHERE id=?`, claim.Spec.AppID).Scan(&archived); errors.Is(err, sql.ErrNoRows) {

@@ -20,6 +20,7 @@ type lanDisableRuntimeFake struct {
 	operationID string
 	withdrawals int
 	failProof   bool
+	failAck     bool
 	resolved    bool
 }
 
@@ -61,10 +62,11 @@ func (f *lanDisableRuntimeFake) ObserveGatewayV2LANDisable(_ context.Context,
 	return f.observation(request, generatedingress.GatewayV2LANDisableDisabled), nil
 }
 
-func (f *lanDisableRuntimeFake) WithGatewayV2LANDisableResolution(ctx context.Context,
+func (f *lanDisableRuntimeFake) WithGatewayV2LANDisableFinalization(ctx context.Context,
 	request generatedingress.GatewayV2LANDisableRequest,
 	authorize generatedingress.GatewayV2LANDisableResolutionAuthorizer,
-	fn func(context.Context, generatedingress.GatewayV2LANDisableObservation) error,
+	resolve func(context.Context, generatedingress.GatewayV2LANDisableObservation) error,
+	acknowledge func(context.Context, generatedingress.GatewayV2LANDisableObservation) error,
 ) error {
 	if err := authorize(ctx, request); err != nil {
 		return err
@@ -76,11 +78,14 @@ func (f *lanDisableRuntimeFake) WithGatewayV2LANDisableResolution(ctx context.Co
 	if f.resolved {
 		disposition = generatedingress.GatewayV2LANDisableDisabled
 	}
-	if err := fn(ctx, f.observation(request, disposition)); err != nil {
+	if err := resolve(ctx, f.observation(request, disposition)); err != nil {
 		return err
 	}
 	f.resolved = true
-	return nil
+	if f.failAck {
+		return errors.New("injected protected clear acknowledgment failure")
+	}
+	return acknowledge(ctx, f.observation(request, generatedingress.GatewayV2LANDisableDisabled))
 }
 
 func (f *lanAccessFixture) disableHandler(runtime *lanDisableRuntimeFake, recoveryOnly bool, operationID string) http.Handler {
@@ -185,6 +190,44 @@ func TestLANDisableReleasesOnlyAfterProofAndReplayRetainsHistory(t *testing.T) {
 		!strings.Contains(historicalReplay.Body.String(), `"state":"committed"`) {
 		t.Fatalf("old disable replay after new access=%d withdrawals=%d %s",
 			historicalReplay.Code, runtime.withdrawals, historicalReplay.Body.String())
+	}
+}
+
+func TestLANDisableCommittedWithoutClearAckStaysFencedUntilReplay(t *testing.T) {
+	f := newLANAccessFixture(t)
+	revision := f.approveForGrant(t)
+	operationID := uuid.NewString()
+	path := "/api/v1/apps/" + f.appID + "/lan-access/disables"
+	runtime := &lanDisableRuntimeFake{operationID: uuid.NewString(), failAck: true}
+	handler := f.disableHandler(runtime, false, "")
+	body := disableBody(t, revision, operationID)
+	first := relayAuthenticatedRequest(handler, http.MethodPost, path, body)
+	if first.Code != http.StatusServiceUnavailable {
+		t.Fatalf("missing clear acknowledgment response=%d %s", first.Code, first.Body.String())
+	}
+	claim, err := f.repository.AppAccessDisableClaim(context.Background(), operationID)
+	if err != nil || claim.State != appaccess.AppAccessDisableCommitted {
+		t.Fatalf("terminal claim after ack failure=%#v err=%v", claim, err)
+	}
+	if _, _, err := f.repository.ReserveAppAccess(context.Background(), appaccess.ReserveAppAccessInput{
+		AppID: f.appID, OperationID: uuid.NewString(), ExpectedRevisionNumber: 1,
+		GatewayProfileRevisionID:     revision.Allocation.GatewayProfileRevisionID,
+		GatewayProfileRevisionNumber: revision.Allocation.GatewayProfileRevisionNumber,
+	}); !errors.Is(err, appaccess.ErrConflict) {
+		t.Fatalf("unacknowledged disable admitted new allocation: %v", err)
+	}
+	runtime.failAck = false
+	retry := relayAuthenticatedRequest(handler, http.MethodPost, path, body)
+	if retry.Code != http.StatusOK || runtime.withdrawals != 1 ||
+		!strings.Contains(retry.Body.String(), `"state":"committed"`) {
+		t.Fatalf("ack retry=%d withdrawals=%d %s", retry.Code, runtime.withdrawals, retry.Body.String())
+	}
+	if _, _, err := f.repository.ReserveAppAccess(context.Background(), appaccess.ReserveAppAccessInput{
+		AppID: f.appID, OperationID: uuid.NewString(), ExpectedRevisionNumber: 1,
+		GatewayProfileRevisionID:     revision.Allocation.GatewayProfileRevisionID,
+		GatewayProfileRevisionNumber: revision.Allocation.GatewayProfileRevisionNumber,
+	}); err != nil {
+		t.Fatalf("acknowledged disable kept reservation fenced: %v", err)
 	}
 }
 

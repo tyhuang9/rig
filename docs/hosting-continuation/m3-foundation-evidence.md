@@ -740,3 +740,43 @@ gap before production use.
 A same-process retry after a new access head is approved can return the
 historical completed claim without clearing that pending marker; restart
 selects the pinned recovery-only path and must clear it before normal work.
+
+## Disable protected-clear fence: local evidence
+
+The next local change starts from `eab0f3d` and separates the database's
+terminal disable commit from a second durable fact: the protected ingress
+pending marker has been cleared and the exact old route is still absent. A
+committed disable without this acknowledgment blocks new LAN reservations,
+grant claims, grant application, access approvals from preexisting
+reservations, allocation activation, and disable intents. Migration 030 retains
+the `exact_404` acknowledgment as an immutable row and does not invent rows for upgraded
+databases. The controller records it only after the gateway lock has covered
+the database resolution, pending-marker clear, protected-state reread, and
+fresh 404 proof. A failure after the terminal database commit leaves the new
+work fence in place and can be retried with the same operation. Startup keeps
+an unacknowledged committed disable in recovery-only mode; if a newer route
+already reuses its old port, inspection rejects the unprovable history.
+
+| Local check for the protected-clear change | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions | Passed across all Go packages. The restricted sandbox run failed unrelated ingress/Compose fixtures; those failures did not reproduce with normal permissions. |
+| `go vet ./...` | Passed. |
+| `go run ./cmd/openapi-gen -check` | Passed. |
+| Focused disable ingress, controller, app-access, and migration tests | Passed for an acknowledgment failure and replay, post-commit admission fence including preexisting reservation approval/activation, forged/mismatched acknowledgment, no synthetic migration acknowledgment, and startup rejection of an unacknowledged same-port reuse or a claimed acknowledgment with a retained pending marker. |
+| `git diff --check` and mirrored migration 030 SHA-256 | Passed; both migration copies have hash `9A0128E6971811229CACA7AF9DFC5E65EC439E0220CE9A64B2F3269A01345203`. |
+
+This is a local database and simulator checkpoint. The repository validates
+identity and durable database facts but trusts the gateway-lock caller for
+the external 404 proof. No live Docker or second-device withdrawal has run.
+Several legacy unfinished disable routes, or a legacy prepared grant paired
+with a disable, still cause fail-closed startup rather than a usable recovery
+queue. The batch quarantine and sequential recovery path remain separate M3
+work; the operator UI and live acceptance also remain open.
+Security review identified a legitimate migration-029 history that this
+intermediate branch cannot yet start: an old disable committed, then a later
+grant deliberately reused that app or port before migration 030. The old
+disable has no synthetic acknowledgment, and the newer live route cannot
+honestly supply an old-port 404. Startup fails closed rather than withdrawing
+the newer route. A separate attested historical-successor proof and recovery
+path must be implemented and tested before this branch can be published for
+upgrade use.

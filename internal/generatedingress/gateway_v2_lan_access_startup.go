@@ -15,10 +15,11 @@ const (
 // GatewayV2LANDisableStartupClaim is built from one validated, single-read
 // database snapshot. No mutable HTTP state participates in startup selection.
 type GatewayV2LANDisableStartupClaim struct {
-	Request          GatewayV2LANDisableRequest
-	State            appaccess.AppAccessDisableState
-	StateSequence    int64
-	RequiresRecovery bool
+	Request           GatewayV2LANDisableRequest
+	State             appaccess.AppAccessDisableState
+	StateSequence     int64
+	RequiresRecovery  bool
+	ClearAcknowledged bool
 }
 
 type GatewayV2LANAccessStartupInspection struct {
@@ -46,7 +47,8 @@ func validateGatewayV2LANAccessStartupClaims(grants []GatewayV2LANStartupClaim,
 		byAllocation: make(map[string]GatewayV2LANDisableStartupClaim, len(disables)),
 	}
 	for _, claim := range disables {
-		if !validGatewayV2LANDisableRequest(claim.Request) || !validGatewayV2LANDisableStartupSequence(claim.State, claim.StateSequence) {
+		if !validGatewayV2LANDisableRequest(claim.Request) || !validGatewayV2LANDisableStartupSequence(claim.State, claim.StateSequence) ||
+			(claim.ClearAcknowledged && claim.State != appaccess.AppAccessDisableCommitted) {
 			return gatewayV2LANAccessStartupClaims{}, gatewayV2StartupInspectionError(nil)
 		}
 		if _, duplicate := result.disables[claim.Request.OperationID]; duplicate {
@@ -163,7 +165,7 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 			request := *state.Pending.Disable
 			claim, exists := claims.disables[request.OperationID]
 			original, withdrawn, pendingErr := gatewayV2LANDisablePendingStates(state, request)
-			if !exists || !reflect.DeepEqual(claim.Request, request) || pendingErr != nil ||
+			if !exists || claim.ClearAcknowledged || !reflect.DeepEqual(claim.Request, request) || pendingErr != nil ||
 				!setRecovery(GatewayV2LANRecoveryDisable, request.OperationID, request.AppID) {
 				return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 			}
@@ -218,6 +220,13 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 				state.Pending.Disable == nil || state.Pending.Disable.OperationID != disable.Request.OperationID) {
 			if disable.Request.SourceGrant != nil {
 				if _, live := protected[disable.Request.SourceGrant.AttemptID]; live {
+					return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
+				}
+			}
+			if !disable.ClearAcknowledged {
+				if !gatewayV2LANDisableStateMatches(state, disable.Request) ||
+					!proveGatewayV2LANDisabled(ctx, driver, state, journal, disable.Request) ||
+					!setRecovery(GatewayV2LANRecoveryDisable, disable.Request.OperationID, disable.Request.AppID) {
 					return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 				}
 			}
