@@ -69,6 +69,7 @@ type Server struct {
 	AppDisables           LANAppDisableService
 	LANDisableRuntime     LANAppDisableRuntime
 	RecoveryOnly          bool
+	RecoveryLANBatch      bool
 	RecoveryKind          string
 	RecoveryOperationID   string
 	RecoveryAppID         string

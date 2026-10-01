@@ -19,6 +19,7 @@ import (
 type lanDisableRuntimeFake struct {
 	operationID string
 	withdrawals int
+	finalizes   int
 	failProof   bool
 	failAck     bool
 	resolved    bool
@@ -68,6 +69,7 @@ func (f *lanDisableRuntimeFake) WithGatewayV2LANDisableFinalization(ctx context.
 	resolve func(context.Context, generatedingress.GatewayV2LANDisableObservation) error,
 	acknowledge func(context.Context, generatedingress.GatewayV2LANDisableObservation) error,
 ) error {
+	f.finalizes++
 	if err := authorize(ctx, request); err != nil {
 		return err
 	}
@@ -88,12 +90,87 @@ func (f *lanDisableRuntimeFake) WithGatewayV2LANDisableFinalization(ctx context.
 	return acknowledge(ctx, f.observation(request, generatedingress.GatewayV2LANDisableDisabled))
 }
 
-func (f *lanAccessFixture) disableHandler(runtime *lanDisableRuntimeFake, recoveryOnly bool, operationID string) http.Handler {
+type lanDisableBatchRuntimeFake struct {
+	lanDisableRuntimeFake
+	batchCalls       int
+	headAdvanced     bool
+	protectedCleared bool
+	beforeResolve    func()
+}
+
+func (f *lanDisableBatchRuntimeFake) WithGatewayV2LANRecoveryDisableFinalization(ctx context.Context,
+	request generatedingress.GatewayV2LANDisableRequest,
+	resolve func(context.Context, generatedingress.GatewayV2LANDisableObservation) error,
+	acknowledge func(context.Context, generatedingress.GatewayV2LANDisableObservation) error,
+) error {
+	f.batchCalls++
+	if f.headAdvanced {
+		return errors.New("injected batch head already advanced")
+	}
+	if f.beforeResolve != nil {
+		f.beforeResolve()
+	}
+	resolveObservation := f.observation(request, generatedingress.GatewayV2LANDisableWithdrawnPending)
+	if f.protectedCleared {
+		resolveObservation.ProtectedStateDigest = strings.Repeat("c", 64)
+	}
+	if err := resolve(ctx, resolveObservation); err != nil {
+		return err
+	}
+	f.protectedCleared = true
+	if err := acknowledge(ctx, f.observation(request, generatedingress.GatewayV2LANDisableDisabled)); err != nil {
+		return err
+	}
+	f.headAdvanced = true
+	return nil
+}
+
+type lanDisableServiceFake struct {
+	LANAppDisableService
+	claimReads      int
+	staleClaimRead  int
+	failAckAttempts int
+}
+
+func (f *lanDisableServiceFake) AppAccessDisableClaim(ctx context.Context,
+	operationID string,
+) (appaccess.AppAccessDisableClaim, error) {
+	claim, err := f.LANAppDisableService.AppAccessDisableClaim(ctx, operationID)
+	if err != nil {
+		return claim, err
+	}
+	f.claimReads++
+	if f.staleClaimRead > 0 && f.claimReads >= f.staleClaimRead {
+		claim.RequestDigest = strings.Repeat("d", 64)
+	}
+	return claim, nil
+}
+
+func (f *lanDisableServiceFake) AcknowledgeAppAccessDisableProtectedClear(ctx context.Context,
+	operationID, gatewayOperationID, protectedStateDigest string, observedAt time.Time,
+) (appaccess.AppAccessDisableProtectedClearAck, bool, error) {
+	if f.failAckAttempts > 0 {
+		f.failAckAttempts--
+		return appaccess.AppAccessDisableProtectedClearAck{}, false,
+			errors.New("injected protected clear acknowledgment failure")
+	}
+	return f.LANAppDisableService.AcknowledgeAppAccessDisableProtectedClear(ctx,
+		operationID, gatewayOperationID, protectedStateDigest, observedAt)
+}
+
+func (f *lanAccessFixture) disableHandler(runtime LANAppDisableRuntime, recoveryOnly bool, operationID string) http.Handler {
+	return f.disableHandlerWith(runtime, f.repository, controllerAuthFake{
+		user: auth.User{ID: f.actorID, Role: "administrator"}}, recoveryOnly, false, operationID)
+}
+
+func (f *lanAccessFixture) disableHandlerWith(runtime LANAppDisableRuntime, service LANAppDisableService,
+	authService authenticationService, recoveryOnly, recoveryBatch bool, operationID string,
+) http.Handler {
 	return (&Server{
-		Auth: controllerAuthFake{user: auth.User{ID: f.actorID, Role: "administrator"}},
-		Apps: f.applications, AppAccess: f.repository, AppDisables: f.repository,
+		Auth: authService,
+		Apps: f.applications, AppAccess: f.repository, AppDisables: service,
 		LANDisableRuntime: runtime, GeneratedRuntime: true, Logger: relayTestLogger(),
-		RecoveryOnly: recoveryOnly, RecoveryKind: RecoveryLANDisable,
+		RecoveryOnly: recoveryOnly, RecoveryLANBatch: recoveryBatch, RecoveryKind: RecoveryLANDisable,
 		RecoveryOperationID: operationID, RecoveryAppID: f.appID,
 	}).Handler()
 }
@@ -106,6 +183,171 @@ func disableBody(t *testing.T, revision appaccess.AppAccessRevision, operationID
 	}
 	return fmt.Sprintf(`{"operationId":%q,"accessRevisionId":%q,"accessRevisionNumber":%d,"allocationId":%q,"approvalDigest":%q}`,
 		operationID, revision.ID, revision.RevisionNumber, revision.Allocation.ID, digest)
+}
+
+func (f *lanAccessFixture) prepareLANDisableClaim(t *testing.T, revision appaccess.AppAccessRevision,
+	operationID string,
+) appaccess.AppAccessDisableClaim {
+	t.Helper()
+	digest, err := appaccess.AppAccessDisableSpecDigest(appaccess.AppAccessDisableSpecFor(revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, _, err := f.repository.ClaimAppAccessDisable(context.Background(),
+		appaccess.ApproveAppAccessDisableInput{
+			OperationID: operationID, ExpectedRevisionNumber: revision.RevisionNumber,
+			Owner: appaccess.AllocationOwner{AllocationID: revision.Allocation.ID,
+				AppID: f.appID, OperationID: revision.OperationID, AccessRevisionID: revision.ID},
+			Approval: appaccess.Approval{Action: appaccess.ActionDisableAppAccess,
+				SpecDigest: digest, ActorID: f.actorID},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return claim
+}
+
+type revocableLANDisableAuth struct {
+	controllerAuthFake
+	revoked *bool
+}
+
+func (f revocableLANDisableAuth) Authenticate(token string) (auth.User, string, error) {
+	if *f.revoked {
+		return auth.User{}, "", errors.New("session revoked")
+	}
+	return f.controllerAuthFake.Authenticate(token)
+}
+
+func TestLANDisableBatchRecoveryFinalizesExactPinnedHeadWithoutSingularDispatch(t *testing.T) {
+	f := newLANAccessFixture(t)
+	revision := f.approveForGrant(t)
+	operationID := uuid.NewString()
+	f.prepareLANDisableClaim(t, revision, operationID)
+	runtime := &lanDisableBatchRuntimeFake{lanDisableRuntimeFake: lanDisableRuntimeFake{operationID: uuid.NewString()}}
+	handler := f.disableHandlerWith(runtime, f.repository, controllerAuthFake{
+		user: auth.User{ID: f.actorID, Role: "administrator"}}, true, true, operationID)
+
+	response := relayAuthenticatedRequest(handler, http.MethodPost,
+		"/api/v1/apps/"+f.appID+"/lan-access/disables", disableBody(t, revision, operationID))
+	if response.Code != http.StatusOK || strings.Contains(strings.ToLower(response.Body.String()), "url") {
+		t.Fatalf("batch disable=%d %s", response.Code, response.Body.String())
+	}
+	claim, err := f.repository.AppAccessDisableClaim(context.Background(), operationID)
+	snapshot, snapshotErr := f.repository.AppAccessDisableStartupSnapshot(context.Background())
+	if err != nil || snapshotErr != nil || claim.State != appaccess.AppAccessDisableCommitted ||
+		claim.Proof == nil || len(snapshot.Claims) != 1 || snapshot.Claims[0].ProtectedClearAck == nil ||
+		snapshot.Claims[0].ProtectedClearAck.GatewayOperationID != runtime.operationID {
+		t.Fatalf("claim=%#v snapshot=%#v err=%v snapshotErr=%v", claim, snapshot, err, snapshotErr)
+	}
+	if runtime.batchCalls != 1 || !runtime.headAdvanced || runtime.withdrawals != 0 || runtime.finalizes != 0 {
+		t.Fatalf("batch=%d advanced=%t withdrawals=%d singular=%d",
+			runtime.batchCalls, runtime.headAdvanced, runtime.withdrawals, runtime.finalizes)
+	}
+}
+
+func TestLANDisableBatchRecoveryRevokedAuthorizationRetainsHeadAndBlocksNextOperation(t *testing.T) {
+	f := newLANAccessFixture(t)
+	revision := f.approveForGrant(t)
+	operationID := uuid.NewString()
+	f.prepareLANDisableClaim(t, revision, operationID)
+	revoked := false
+	runtime := &lanDisableBatchRuntimeFake{lanDisableRuntimeFake: lanDisableRuntimeFake{operationID: uuid.NewString()}}
+	runtime.beforeResolve = func() { revoked = true }
+	handler := f.disableHandlerWith(runtime, f.repository, revocableLANDisableAuth{
+		controllerAuthFake: controllerAuthFake{user: auth.User{ID: f.actorID, Role: "administrator"}},
+		revoked:            &revoked,
+	}, true, true, operationID)
+	path := "/api/v1/apps/" + f.appID + "/lan-access/disables"
+
+	response := relayAuthenticatedRequest(handler, http.MethodPost, path, disableBody(t, revision, operationID))
+	if response.Code != http.StatusConflict || runtime.protectedCleared || runtime.headAdvanced {
+		t.Fatalf("revoked batch disable=%d cleared=%t advanced=%t %s",
+			response.Code, runtime.protectedCleared, runtime.headAdvanced, response.Body.String())
+	}
+	claim, err := f.repository.AppAccessDisableClaim(context.Background(), operationID)
+	if err != nil || claim.State != appaccess.AppAccessDisablePrepared {
+		t.Fatalf("revoked claim=%#v err=%v", claim, err)
+	}
+	revoked = false
+	runtime.beforeResolve = nil
+	blocked := relayAuthenticatedRequest(handler, http.MethodPost, path,
+		disableBody(t, revision, uuid.NewString()))
+	if blocked.Code != http.StatusServiceUnavailable || runtime.batchCalls != 1 || runtime.headAdvanced ||
+		!strings.Contains(blocked.Body.String(), "gateway_reconciliation_required") {
+		t.Fatalf("next operation=%d calls=%d advanced=%t %s",
+			blocked.Code, runtime.batchCalls, runtime.headAdvanced, blocked.Body.String())
+	}
+}
+
+func TestLANDisableBatchRecoveryRejectsStaleClaimIdentityBeforeProtectedClear(t *testing.T) {
+	f := newLANAccessFixture(t)
+	revision := f.approveForGrant(t)
+	operationID := uuid.NewString()
+	f.prepareLANDisableClaim(t, revision, operationID)
+	service := &lanDisableServiceFake{LANAppDisableService: f.repository, staleClaimRead: 2}
+	runtime := &lanDisableBatchRuntimeFake{lanDisableRuntimeFake: lanDisableRuntimeFake{operationID: uuid.NewString()}}
+	handler := f.disableHandlerWith(runtime, service, controllerAuthFake{
+		user: auth.User{ID: f.actorID, Role: "administrator"}}, true, true, operationID)
+
+	response := relayAuthenticatedRequest(handler, http.MethodPost,
+		"/api/v1/apps/"+f.appID+"/lan-access/disables", disableBody(t, revision, operationID))
+	claim, err := f.repository.AppAccessDisableClaim(context.Background(), operationID)
+	if response.Code != http.StatusServiceUnavailable || err != nil ||
+		claim.State != appaccess.AppAccessDisablePrepared || runtime.protectedCleared || runtime.headAdvanced ||
+		runtime.withdrawals != 0 || runtime.finalizes != 0 {
+		t.Fatalf("stale response=%d claim=%#v err=%v cleared=%t advanced=%t withdrawals=%d singular=%d body=%s",
+			response.Code, claim, err, runtime.protectedCleared, runtime.headAdvanced,
+			runtime.withdrawals, runtime.finalizes, response.Body.String())
+	}
+}
+
+func TestLANDisableBatchRecoveryUncertainCallbackFailureReplaysCommittedCurrentHead(t *testing.T) {
+	f := newLANAccessFixture(t)
+	revision := f.approveForGrant(t)
+	operationID := uuid.NewString()
+	claim := f.prepareLANDisableClaim(t, revision, operationID)
+	owner := appaccess.AppAccessDisableClaimOwnerFor(claim)
+	withdrawing, _, err := f.repository.AdvanceAppAccessDisableClaim(context.Background(), owner,
+		appaccess.AppAccessDisablePrepared, appaccess.AppAccessDisableWithdrawing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.repository.AdvanceAppAccessDisableClaim(context.Background(), owner,
+		withdrawing.State, appaccess.AppAccessDisableUncertain); err != nil {
+		t.Fatal(err)
+	}
+	service := &lanDisableServiceFake{LANAppDisableService: f.repository, failAckAttempts: 1}
+	runtime := &lanDisableBatchRuntimeFake{lanDisableRuntimeFake: lanDisableRuntimeFake{operationID: uuid.NewString()}}
+	handler := f.disableHandlerWith(runtime, service, controllerAuthFake{
+		user: auth.User{ID: f.actorID, Role: "administrator"}}, true, true, operationID)
+	path := "/api/v1/apps/" + f.appID + "/lan-access/disables"
+	body := disableBody(t, revision, operationID)
+
+	failed := relayAuthenticatedRequest(handler, http.MethodPost, path, body)
+	committed, err := f.repository.AppAccessDisableClaim(context.Background(), operationID)
+	snapshot, snapshotErr := f.repository.AppAccessDisableStartupSnapshot(context.Background())
+	if failed.Code != http.StatusServiceUnavailable || err != nil || snapshotErr != nil ||
+		committed.State != appaccess.AppAccessDisableCommitted || committed.Proof == nil ||
+		len(snapshot.Claims) != 1 || snapshot.Claims[0].ProtectedClearAck != nil ||
+		!runtime.protectedCleared || runtime.headAdvanced {
+		t.Fatalf("failed=%d claim=%#v snapshot=%#v err=%v snapshotErr=%v cleared=%t advanced=%t body=%s",
+			failed.Code, committed, snapshot, err, snapshotErr,
+			runtime.protectedCleared, runtime.headAdvanced, failed.Body.String())
+	}
+	sequence := committed.StateSequence
+
+	replayed := relayAuthenticatedRequest(handler, http.MethodPost, path, body)
+	confirmed, confirmErr := f.repository.AppAccessDisableClaim(context.Background(), operationID)
+	snapshot, snapshotErr = f.repository.AppAccessDisableStartupSnapshot(context.Background())
+	if replayed.Code != http.StatusOK || strings.Contains(strings.ToLower(replayed.Body.String()), "url") ||
+		confirmErr != nil || snapshotErr != nil || confirmed.StateSequence != sequence ||
+		len(snapshot.Claims) != 1 || snapshot.Claims[0].ProtectedClearAck == nil ||
+		!runtime.headAdvanced || runtime.batchCalls != 2 || runtime.withdrawals != 0 || runtime.finalizes != 0 {
+		t.Fatalf("replay=%d claim=%#v snapshot=%#v confirmErr=%v snapshotErr=%v advanced=%t calls=%d withdrawals=%d singular=%d body=%s",
+			replayed.Code, confirmed, snapshot, confirmErr, snapshotErr, runtime.headAdvanced,
+			runtime.batchCalls, runtime.withdrawals, runtime.finalizes, replayed.Body.String())
+	}
 }
 
 func TestLANDisableReleasesOnlyAfterProofAndReplayRetainsHistory(t *testing.T) {
