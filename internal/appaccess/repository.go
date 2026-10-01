@@ -29,6 +29,7 @@ type Repository struct {
 	afterDisableStartupClaimsRead func()
 	afterGrantClaimLock           func()
 	afterGrantStartupClaimsRead   func()
+	afterOperatorSnapshotHeadRead func()
 	beforeGrantTransitionCommit   func()
 	beforeReservationCommit       func()
 }

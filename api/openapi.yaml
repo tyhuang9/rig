@@ -455,7 +455,7 @@ paths:
       operationId: getApplicationLANAccess
       x-rig-problem-codes: [lan_access_forbidden, invalid_lan_access_request, lan_access_unavailable, capability_unavailable]
       security: [{sessionCookie: []}]
-      description: Returns approved desired application access and allocation state. A URL is present only after an exact live gateway, claim, allocation, and deployment proof.
+      description: Returns an administrator-only, read-only snapshot of the current access head, exact pending reservation and claims, and the current disable review. Review digests are consent data, not a promise that a conflicting operation can start or proof of a gateway route. A URL is present only after an exact live gateway, claim, allocation, and deployment proof.
       responses:
         '200': {description: Desired application LAN access and an exact live-attested availability result, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppAccessRead'}}}}
         default: {$ref: '#/components/responses/Problem'}
@@ -847,9 +847,21 @@ components:
       properties:
         expectedRevisionNumber: {type: integer, format: int64, minimum: 0}
         desiredAccess: {$ref: '#/components/schemas/LANAppAccessRevision', x-go-pointer: true}
+        pendingReservation: {$ref: '#/components/schemas/LANAppAccessReservationReview', x-go-pointer: true}
+        grantClaim: {$ref: '#/components/schemas/LANAppGrantClaim', x-go-pointer: true}
+        disableClaim: {$ref: '#/components/schemas/LANAppDisableClaim', x-go-pointer: true}
+        disableReview: {$ref: '#/components/schemas/LANAppDisableReview', x-go-pointer: true}
         availability: {type: string, enum: [local_only, unverified, verified]}
         observedAt: {type: string, format: date-time}
         url: {type: string, format: uri}
+    LANAppAccessReservationReview:
+      type: object
+      additionalProperties: false
+      required: [allocation, expectedRevisionNumber, approvalDigest]
+      properties:
+        allocation: {$ref: '#/components/schemas/LANPortAllocation'}
+        expectedRevisionNumber: {type: integer, format: int64, minimum: 0}
+        approvalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
     ReserveLANAppAccessRequest:
       type: object
       additionalProperties: false
@@ -940,7 +952,7 @@ components:
     LANAppDisableClaim:
       type: object
       additionalProperties: false
-      required: [operationId, appId, allocationId, accessRevisionId, accessRevisionNumber, port, state, updatedAt]
+      required: [operationId, appId, allocationId, accessRevisionId, accessRevisionNumber, port, approvalDigest, state, updatedAt]
       properties:
         operationId: {type: string, format: uuid}
         appId: {type: string, format: uuid}
@@ -948,9 +960,24 @@ components:
         accessRevisionId: {type: string, format: uuid}
         accessRevisionNumber: {type: integer, format: int64, minimum: 1}
         port: {type: integer, minimum: 8100, maximum: 8119}
+        approvalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
         state: {type: string, enum: [prepared, withdrawing, uncertain, committed]}
         updatedAt: {type: string, format: date-time}
         releasedAt: {type: string, format: date-time}
+    LANAppDisableReview:
+      type: object
+      additionalProperties: false
+      required: [appId, accessRevisionId, accessRevisionNumber, allocationId, ownerOperationId, port, gatewayProfileRevisionId, gatewayProfileRevisionNumber, approvalDigest]
+      properties:
+        appId: {type: string, format: uuid}
+        accessRevisionId: {type: string, format: uuid}
+        accessRevisionNumber: {type: integer, format: int64, minimum: 1}
+        allocationId: {type: string, format: uuid}
+        ownerOperationId: {type: string, format: uuid}
+        port: {type: integer, minimum: 8100, maximum: 8119}
+        gatewayProfileRevisionId: {type: string, format: uuid}
+        gatewayProfileRevisionNumber: {type: integer, format: int64, minimum: 1}
+        approvalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
     LANAppDisableObservation:
       type: object
       additionalProperties: false

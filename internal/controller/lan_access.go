@@ -25,8 +25,7 @@ const (
 // LANAppAccessService stores desired access and allocations. None of its reads
 // are evidence of a live gateway route or a reachable LAN address.
 type LANAppAccessService interface {
-	CurrentAppAccess(context.Context, string) (appaccess.AppAccessRevision, error)
-	AppAccessHead(context.Context, string) (appaccess.AppAccessRevision, error)
+	ReadAppAccessOperatorSnapshot(context.Context, string) (appaccess.AppAccessOperatorSnapshot, error)
 	ReserveAppAccess(context.Context, appaccess.ReserveAppAccessInput) (appaccess.Allocation, bool, error)
 	ApproveAppAccess(context.Context, appaccess.ApproveAppAccessInput) (appaccess.AppAccessRevision, bool, error)
 }
@@ -56,9 +55,31 @@ type lanAccessRevisionRead struct {
 type lanAccessRead struct {
 	ExpectedRevisionNumber int64                  `json:"expectedRevisionNumber"`
 	DesiredAccess          *lanAccessRevisionRead `json:"desiredAccess,omitempty"`
+	PendingReservation     *lanReservationReview  `json:"pendingReservation,omitempty"`
+	GrantClaim             *lanGrantClaimRead     `json:"grantClaim,omitempty"`
+	DisableClaim           *lanDisableClaimRead   `json:"disableClaim,omitempty"`
+	DisableReview          *lanDisableReview      `json:"disableReview,omitempty"`
 	Availability           string                 `json:"availability"`
 	ObservedAt             *time.Time             `json:"observedAt,omitempty"`
 	URL                    string                 `json:"url,omitempty"`
+}
+
+type lanReservationReview struct {
+	Allocation             lanAllocationRead `json:"allocation"`
+	ExpectedRevisionNumber int64             `json:"expectedRevisionNumber"`
+	ApprovalDigest         string            `json:"approvalDigest"`
+}
+
+type lanDisableReview struct {
+	AppID                        string `json:"appId"`
+	AccessRevisionID             string `json:"accessRevisionId"`
+	AccessRevisionNumber         int64  `json:"accessRevisionNumber"`
+	AllocationID                 string `json:"allocationId"`
+	OwnerOperationID             string `json:"ownerOperationId"`
+	Port                         uint16 `json:"port"`
+	GatewayProfileRevisionID     string `json:"gatewayProfileRevisionId"`
+	GatewayProfileRevisionNumber int64  `json:"gatewayProfileRevisionNumber"`
+	ApprovalDigest               string `json:"approvalDigest"`
 }
 
 type lanReservationMutation struct {
@@ -105,26 +126,45 @@ func (s *Server) getApplicationLANAccess(w http.ResponseWriter, r *http.Request)
 		s.lanAccessUnavailable(w, r, operationGetApplicationLANAccess)
 		return
 	}
-	result := lanAccessRead{Availability: "unverified"}
-	revision, err := s.AppAccess.CurrentAppAccess(r.Context(), r.PathValue("appId"))
-	switch {
-	case errors.Is(err, appaccess.ErrNotFound):
-		result.Availability = "local_only"
-		head, headErr := s.AppAccess.AppAccessHead(r.Context(), r.PathValue("appId"))
-		if headErr == nil {
-			result.ExpectedRevisionNumber = head.RevisionNumber
-		} else if !errors.Is(headErr, appaccess.ErrNotFound) {
-			s.lanAccessProblem(w, r, operationGetApplicationLANAccess, headErr)
-			return
-		}
-	case err != nil:
+	snapshot, err := s.AppAccess.ReadAppAccessOperatorSnapshot(r.Context(), r.PathValue("appId"))
+	if err != nil {
 		s.lanAccessProblem(w, r, operationGetApplicationLANAccess, err)
 		return
-	default:
-		result.ExpectedRevisionNumber = revision.RevisionNumber
-		value := contractLANAccessRevision(revision)
+	}
+	result := lanAccessRead{ExpectedRevisionNumber: snapshot.ExpectedRevisionNumber, Availability: "local_only"}
+	if snapshot.PendingReservation != nil {
+		result.PendingReservation = &lanReservationReview{
+			Allocation:             contractLANAllocation(snapshot.PendingReservation.Allocation),
+			ExpectedRevisionNumber: snapshot.PendingReservation.ExpectedRevisionNumber,
+			ApprovalDigest:         snapshot.PendingReservation.ApprovalDigest,
+		}
+	}
+	if snapshot.GrantClaim != nil {
+		claim := contractLANGrantClaim(*snapshot.GrantClaim)
+		result.GrantClaim = &claim
+	}
+	if snapshot.DisableClaim != nil {
+		claim := contractLANDisableClaim(*snapshot.DisableClaim)
+		result.DisableClaim = &claim
+	}
+	if snapshot.DisableReview != nil {
+		spec := snapshot.DisableReview.Spec
+		result.DisableReview = &lanDisableReview{
+			AppID: spec.AppID, AccessRevisionID: spec.AccessRevisionID,
+			AccessRevisionNumber: spec.AccessRevisionNumber, AllocationID: spec.AllocationID,
+			OwnerOperationID: spec.OwnerOperationID, Port: spec.Port,
+			GatewayProfileRevisionID:     spec.GatewayProfileRevisionID,
+			GatewayProfileRevisionNumber: spec.GatewayProfileRevisionNumber,
+			ApprovalDigest:               snapshot.DisableReview.ApprovalDigest,
+		}
+	}
+	if snapshot.DesiredAccess != nil {
+		value := contractLANAccessRevision(*snapshot.DesiredAccess)
 		result.DesiredAccess = &value
-		s.attestApplicationLANAccess(r.Context(), revision, &result)
+		result.Availability = "unverified"
+		if snapshot.DisableClaim == nil {
+			s.attestApplicationLANAccess(r.Context(), *snapshot.DesiredAccess, &result)
+		}
 	}
 	writeJSON(w, http.StatusOK, result)
 }

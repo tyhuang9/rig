@@ -50,6 +50,7 @@ type lanDisableClaimRead struct {
 	AccessRevisionID     string                          `json:"accessRevisionId"`
 	AccessRevisionNumber int64                           `json:"accessRevisionNumber"`
 	Port                 uint16                          `json:"port"`
+	ApprovalDigest       string                          `json:"approvalDigest"`
 	State                appaccess.AppAccessDisableState `json:"state"`
 	UpdatedAt            time.Time                       `json:"updatedAt"`
 	ReleasedAt           *time.Time                      `json:"releasedAt,omitempty"`
@@ -75,7 +76,8 @@ func contractLANDisableClaim(claim appaccess.AppAccessDisableClaim) lanDisableCl
 		OperationID: claim.OperationID, AppID: claim.Spec.AppID,
 		AllocationID: claim.Spec.AllocationID, AccessRevisionID: claim.Spec.AccessRevisionID,
 		AccessRevisionNumber: claim.Spec.AccessRevisionNumber, Port: claim.Spec.Port,
-		State: claim.State, UpdatedAt: claim.UpdatedAt,
+		ApprovalDigest: claim.SpecDigest,
+		State:          claim.State, UpdatedAt: claim.UpdatedAt,
 	}
 	if claim.State == appaccess.AppAccessDisableCommitted && claim.Proof != nil {
 		at := claim.Proof.ObservedAt.UTC()
