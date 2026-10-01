@@ -822,3 +822,32 @@ still need a sequential recovery queue, and the operator UI remains pending.
 Gateway profile rotation after a committed v2 upgrade is not supported by
 current database rules; accepting cross-profile successors would need a
 separate gateway retirement and lineage proof.
+
+## Sequential legacy recovery foundation: local evidence
+
+The local branch `feature/hosting-m3-sequential-lan-recovery` starts from
+`8298616`. Commit `e03b970` adds a deterministic, complete recovery census
+for multiple legacy grant and disable claims, plus a bounded protected batch
+format. The old single-operation quarantine still rejects a multi-operation
+census before mutation. Commit `fbfd20c` adds a separate batch quarantine
+engine: it saves the exact census before changing Caddy, withdraws all unsafe
+LAN bindings under the gateway lock, proves each port absent and unrelated
+grants retained, and stops the journal-owned gateway when replay, interface,
+topology, write, or proof checks fail. It has no startup caller yet.
+
+| Local check | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions and task-local `GOCACHE` on the exact `fbfd20c` tree | Passed across all Go packages, including hostd, generated ingress, app access, and secretfile. The restricted sandbox had produced unrelated ingress fixture access failures. |
+| `go vet ./...` and `go run ./cmd/openapi-gen -check` | Passed. |
+| `git diff --cached --check` before the second commit | Passed. Worktree clean after commit. |
+| Protected state boundary | A 64-item recovery state with a live source binding and retained legacy pending marker serialized to 138,498 of the 196,608 permitted plaintext bytes and passed protected write/readback. The purpose-scoped reader permits up to 256 KiB of persisted protected bytes; ordinary secrets retain their 64 KiB read limit. |
+| Fail-closed simulator checks | Passed for two prepared disables, mixed grant/disable claims, original pending marker, crash after protected intent or simulated reload, invalid replay census, selected-interface drift, partial live topology, failed 404 proof, exact per-port probes, and unrelated committed route retention. |
+
+Independent review found two post-intent gateway-stop gaps: selected-interface
+preflight failure and invalid claim validation before loading the protected
+batch. Both were fixed with regression tests before `fbfd20c`. The local fake
+models a reload-only mixed result but does not exercise the production Docker
+live/restart-config observer. Hosted process-crash and multi-port timing,
+controller startup dispatch, per-item terminal resolution and batch clearing,
+operator UI, and physical second-device/database acceptance remain open. No
+LAN exposure is enabled by these commits, and no M3 acceptance claim is made.
