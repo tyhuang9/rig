@@ -78,6 +78,11 @@ func inspectGatewayStartup(ctx context.Context, cfg config.Config, db *sql.DB,
 		inspection.Disposition != generatedingress.GatewayV2StartupRecoveryOnly {
 		return gatewayStartup{}, errors.New("unknown gateway startup disposition")
 	}
+	snapshot, err = attestHistoricalLANDisableSuccessors(ctx, repository, ingress, snapshot)
+	if err != nil {
+		return gatewayStartup{}, fmt.Errorf("attest historical LAN disable successor: %w", err)
+	}
+	result.snapshot = snapshot
 	accessInspection, err := ingress.InspectGatewayV2LANAccessStartup(ctx,
 		lanGrantStartupClaims(snapshot.Grants), lanDisableStartupClaims(snapshot.Disables))
 	if err != nil {
@@ -284,7 +289,7 @@ func lanDisableStartupClaims(snapshot appaccess.AppAccessDisableStartupSnapshot)
 		}
 		claims = append(claims, generatedingress.GatewayV2LANDisableStartupClaim{
 			Request: request, State: entry.Claim.State, StateSequence: entry.Claim.StateSequence,
-			ClearAcknowledged: entry.ProtectedClearAck != nil,
+			ClearAcknowledged: entry.ProtectedClearAck != nil || entry.SuccessorAck != nil,
 			RequiresRecovery: entry.Claim.State != appaccess.AppAccessDisableCommitted &&
 				(entry.AppArchived || !entry.AccessHeadCurrent || !entry.ProfileHeadCurrent ||
 					!entry.ApproverIsAdministrator),

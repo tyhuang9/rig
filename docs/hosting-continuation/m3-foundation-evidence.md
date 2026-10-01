@@ -780,3 +780,45 @@ honestly supply an old-port 404. Startup fails closed rather than withdrawing
 the newer route. A separate attested historical-successor proof and recovery
 path must be implemented and tested before this branch can be published for
 upgrade use.
+
+## Historical LAN disable successor: local evidence
+
+The local successor branch starts from the protected-clear checkpoint
+`70f3ef7`. Migration 031 adds a separate, immutable successor acknowledgment;
+it does not rewrite the old disable or its `exact_404` acknowledgment. The
+repository requires a grant claimed and committed after the disable with a distinct
+active allocation, current access and gateway profile heads, and the exact
+retired old allocation and source grant when one existed. An acknowledgment
+can describe the same app on a new port, or a new grant for the same or a
+different app that now owns the old port. The two acknowledgment kinds are mutually exclusive. Either kind
+releases the disable admission fence only after its evidence is retained.
+
+Before the controller listener or workers start, hostd selects an exact
+successor from the immutable startup census. Generated ingress holds the
+cross-process gateway lock while it rejects a pending marker or surviving old
+binding, checks every live grant, proves the successor route and isolation,
+and rereads protected state before the durable acknowledgment. A same-app
+grant on a new port also requires a fresh 404 proof at the retired port. Under that same lock, hostd rereads the
+SQLite census, inserts the conditional acknowledgment, and confirms that the
+only database change was that row. This path does not change any route. A
+failed proof or changed census prevents normal startup.
+
+| Local check for the historical successor branch | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions and a task-local Go cache | Passed across all Go packages, including app-access migration, generated ingress, and hostd. |
+| `go test -count=1 -p 1 ./internal/appaccess -run TestDisableSuccessorAck -v` | Passed for migration 029 to 031, same-app new-port, same-app reused-port, different-app reused-port, no source grant, retired successor, exact-404 conflict, replay, and retained row. |
+| `go test -count=1 ./internal/generatedingress -run TestGatewayV2LANDisableSuccessor` | Passed for all three route shapes, stale or live old bindings, pending state, failed final proofs before acknowledgment, callback failure, and cross-process lock contention. |
+| `go test -count=1 -p 1 ./cmd/hostd -run 'TestHistoricalLANDisableSuccessorSelectionPrefersReusedPort|TestAttestHistoricalLANDisableSuccessor' -v` | Passed for reused-port priority, stale candidate rejection, exact callback inputs and ordering, pre-ack census drift, acknowledgment failure, post-ack snapshot drift, and confirmation that only the expected row changed. |
+| `go vet ./...` and `go run ./cmd/openapi-gen -check` with a task-local Go cache | Passed. |
+| `git diff --check` and mirrored migration 031 SHA-256 | Passed; both migration copies have hash `1DD391CF1311AA4E67468768F876506F0CF669A5BCAD8581BEAEEC955D587278`. |
+
+The repository upgrade fixture uses real migration files through 029 and then
+the production migrator, but it does not run a Docker gateway. The ingress
+tests use a protected-state and probe simulator; hostd's callback/snapshot
+tests use a fake repository and attester. No live Docker, second-device
+port-reuse, process-crash restart, or browser-to-external-database journey has
+run. M3 acceptance remains open. Multiple unfinished historical operations
+still need a sequential recovery queue, and the operator UI remains pending.
+Gateway profile rotation after a committed v2 upgrade is not supported by
+current database rules; accepting cross-profile successors would need a
+separate gateway retirement and lineage proof.

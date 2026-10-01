@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/config"
@@ -107,6 +108,58 @@ func TestLANDisableStartupRecoveryRequiresExactCommittedGatewayAndOperation(t *t
 				t.Fatal("accepted mismatched LAN disable startup recovery")
 			}
 		})
+	}
+}
+
+func TestHistoricalLANDisableSuccessorSelectionPrefersReusedPort(t *testing.T) {
+	resolvedAt := time.Now().UTC().Add(-time.Minute)
+	disable := appaccess.AppAccessDisableStartupClaim{Claim: appaccess.AppAccessDisableClaim{
+		OperationID: "old-disable", State: appaccess.AppAccessDisableCommitted,
+		Spec: appaccess.AppAccessDisableSpec{AppID: "old-app", AllocationID: "old-allocation",
+			OwnerOperationID: "old-owner", AccessRevisionID: "old-revision", AccessRevisionNumber: 1,
+			GatewayProfileRevisionID: "profile", GatewayProfileRevisionNumber: 1, Port: 8100},
+		Proof: &appaccess.AppAccessDisableProof{ObservedAt: resolvedAt},
+	}}
+	grant := func(attemptID, appID, allocationID string, port uint16) appaccess.AppAccessGrantStartupClaim {
+		return appaccess.AppAccessGrantStartupClaim{
+			Claim: appaccess.AppAccessGrantClaim{AttemptID: attemptID,
+				State: appaccess.AppAccessGrantCommitted, ApprovedAt: resolvedAt.Add(time.Second), CreatedAt: resolvedAt.Add(time.Second),
+				Spec: appaccess.AppAccessGrantSpec{AppID: appID, AllocationID: allocationID,
+					OwnerOperationID: attemptID, AccessRevisionID: attemptID + "-revision", AccessRevisionNumber: 2,
+					GatewayProfileRevisionID: "profile", GatewayProfileRevisionNumber: 1, Port: port}},
+			Allocation:        appaccess.Allocation{State: appaccess.AllocationActive},
+			AccessHeadCurrent: true, ProfileHeadCurrent: true, ApproverIsAdministrator: true,
+		}
+	}
+	snapshot := appaccess.HostingGatewayStartupSnapshot{
+		Disables: appaccess.AppAccessDisableStartupSnapshot{Claims: []appaccess.AppAccessDisableStartupClaim{disable}},
+		Grants: appaccess.AppAccessGrantStartupSnapshot{Claims: []appaccess.AppAccessGrantStartupClaim{
+			grant("new-app-grant", "old-app", "new-allocation", 8101),
+			grant("reused-port-grant", "other-app", "other-allocation", 8100),
+		}},
+	}
+	index, successor, relation, found := nextHistoricalLANDisableSuccessor(snapshot)
+	if !found || index != 0 || successor.Claim.AttemptID != "reused-port-grant" ||
+		relation != generatedingress.GatewayV2LANSuccessorSamePort {
+		t.Fatalf("reused-port successor: index=%d grant=%q relation=%q found=%t", index, successor.Claim.AttemptID, relation, found)
+	}
+	snapshot.Grants.Claims[1].Claim.RetiredAt = &resolvedAt
+	_, successor, relation, found = nextHistoricalLANDisableSuccessor(snapshot)
+	if !found || successor.Claim.AttemptID != "new-app-grant" ||
+		relation != generatedingress.GatewayV2LANSuccessorSameAppNewPort404 {
+		t.Fatalf("same-app new-port successor: grant=%q relation=%q found=%t", successor.Claim.AttemptID, relation, found)
+	}
+	snapshot.Grants.Claims[0].AccessHeadCurrent = false
+	if _, _, _, found := nextHistoricalLANDisableSuccessor(snapshot); found {
+		t.Fatal("stale successor selected")
+	}
+	snapshot.Grants.Claims[0].AccessHeadCurrent = true
+	snapshot.Grants.Claims[1].Claim.RetiredAt = nil
+	snapshot.Grants.Claims[1].Claim.ApprovedAt = resolvedAt.Add(-time.Second)
+	_, successor, relation, found = nextHistoricalLANDisableSuccessor(snapshot)
+	if !found || successor.Claim.AttemptID != "reused-port-grant" ||
+		relation != generatedingress.GatewayV2LANSuccessorSamePort {
+		t.Fatal("later grant for another app rejected because its access approval predates the disable")
 	}
 }
 
