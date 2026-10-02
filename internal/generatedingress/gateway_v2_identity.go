@@ -792,7 +792,7 @@ func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigr
 		value.LogConfig["max-size"] != "10m" || value.LogConfig["max-file"] != "3" || value.Restart != restart ||
 		len(value.Entrypoint) != 1 || value.Entrypoint[0] != caddyExecutable || len(value.Cmd) != 3 || value.Cmd[0] != "run" || value.Cmd[1] != "--config" ||
 		value.Cmd[2] != "/config/"+configFilename || len(value.Ulimits) != 1 || value.Ulimits[0] != (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}) ||
-		!reflect.DeepEqual(value.Labels, gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true)) ||
+		!validGatewayV2ContainerLabels(value.Labels, gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true)) ||
 		!validGatewayV2Mounts(value.Mounts, state.Identity) || !validGatewayV2PortBindings(value.PortBindings, state, journal, role) ||
 		(running && !gatewayV2EffectivePortBindingsMatchConfigured(runtime.EffectivePortBindings, value.PortBindings)) ||
 		(!running && gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings)) {
@@ -819,6 +819,28 @@ func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigr
 		}
 		if name == state.Identity.IngressNetwork && attachment.IPAddress != state.Network.ContainerIPv4 {
 			return false
+		}
+	}
+	return true
+}
+
+// Docker combines labels declared by the pinned image with labels supplied at
+// container creation. Treat only Rig's namespace as authoritative container
+// identity: every expected Rig label must match exactly and no additional Rig
+// label may be present. Foreign image metadata does not participate in
+// ownership or mutation authorization.
+func validGatewayV2ContainerLabels(actual, expected map[string]string) bool {
+	for key, expectedValue := range expected {
+		actualValue, exists := actual[key]
+		if !exists || actualValue != expectedValue {
+			return false
+		}
+	}
+	for key := range actual {
+		if strings.HasPrefix(key, "io.rig.") {
+			if _, expectedKey := expected[key]; !expectedKey {
+				return false
+			}
 		}
 	}
 	return true

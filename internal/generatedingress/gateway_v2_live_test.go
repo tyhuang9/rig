@@ -654,7 +654,8 @@ const (
 	liveGatewayV2TraceCreateLabelsExtraForeign        liveGatewayV2TraceOutcome = "labels_extra_non_rig_key"
 	liveGatewayV2TraceCreateNetworksMissing           liveGatewayV2TraceOutcome = "stopped_networks_missing_expected_key"
 	liveGatewayV2TraceCreateNetworksExtra             liveGatewayV2TraceOutcome = "stopped_networks_extra_key"
-	liveGatewayV2TraceCreateNetworksInvalidID         liveGatewayV2TraceOutcome = "stopped_networks_invalid_network_id"
+	liveGatewayV2TraceCreateNetworksIDAbsent          liveGatewayV2TraceOutcome = "stopped_networks_network_id_absent"
+	liveGatewayV2TraceCreateNetworksIDMalformed       liveGatewayV2TraceOutcome = "stopped_networks_network_id_malformed_nonempty"
 	liveGatewayV2TraceCreateNetworksEndpointPresent   liveGatewayV2TraceOutcome = "stopped_networks_endpoint_id_present"
 	liveGatewayV2TraceCreateNetworksAddressPresent    liveGatewayV2TraceOutcome = "stopped_networks_ip_address_present"
 	liveGatewayV2TraceCreateNetworksIPv6Present       liveGatewayV2TraceOutcome = "stopped_networks_ipv6_gateway_present"
@@ -955,7 +956,7 @@ func liveGatewayV2StoppedContainerFailureOutcomes(state gatewayV2RouteState, jou
 	add(liveGatewayV2TraceCreatePredicateUlimit,
 		len(value.Ulimits) == 1 && value.Ulimits[0] == (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}))
 	expectedLabels := gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true)
-	labelsValid := reflect.DeepEqual(value.Labels, expectedLabels)
+	labelsValid := validGatewayV2ContainerLabels(value.Labels, expectedLabels)
 	add(liveGatewayV2TraceCreatePredicateLabels, labelsValid)
 	if !labelsValid {
 		failures = append(failures, liveGatewayV2LabelFailureOutcomes(value.Labels, expectedLabels)...)
@@ -1004,7 +1005,7 @@ func liveGatewayV2StoppedNetworkFailureOutcomes(state gatewayV2RouteState, role 
 	actual map[string]gatewayV2ConfiguredNetwork,
 ) []liveGatewayV2TraceOutcome {
 	missing, extra := false, false
-	invalidID, endpointPresent, addressPresent, ipv6Present := false, false, false, false
+	idAbsent, idMalformed, endpointPresent, addressPresent, ipv6Present := false, false, false, false, false
 	priorityMismatch, ipamMissing, ipv4Mismatch, ipamIPv6Present, unexpectedIPAM := false, false, false, false, false
 	for name := range expected {
 		attachment, exists := actual[name]
@@ -1012,7 +1013,8 @@ func liveGatewayV2StoppedNetworkFailureOutcomes(state gatewayV2RouteState, role 
 			missing = true
 			continue
 		}
-		invalidID = invalidID || !validContainerID(attachment.NetworkID)
+		idAbsent = idAbsent || attachment.NetworkID == ""
+		idMalformed = idMalformed || attachment.NetworkID != "" && !validContainerID(attachment.NetworkID)
 		endpointPresent = endpointPresent || attachment.EndpointID != ""
 		addressPresent = addressPresent || attachment.IPAddress != ""
 		ipv6Present = ipv6Present || attachment.IPv6Gateway != ""
@@ -1036,7 +1038,8 @@ func liveGatewayV2StoppedNetworkFailureOutcomes(state gatewayV2RouteState, role 
 	return liveGatewayV2SelectedTraceOutcomes(
 		liveGatewayV2TraceSelection{missing, liveGatewayV2TraceCreateNetworksMissing},
 		liveGatewayV2TraceSelection{extra, liveGatewayV2TraceCreateNetworksExtra},
-		liveGatewayV2TraceSelection{invalidID, liveGatewayV2TraceCreateNetworksInvalidID},
+		liveGatewayV2TraceSelection{idAbsent, liveGatewayV2TraceCreateNetworksIDAbsent},
+		liveGatewayV2TraceSelection{idMalformed, liveGatewayV2TraceCreateNetworksIDMalformed},
 		liveGatewayV2TraceSelection{endpointPresent, liveGatewayV2TraceCreateNetworksEndpointPresent},
 		liveGatewayV2TraceSelection{addressPresent, liveGatewayV2TraceCreateNetworksAddressPresent},
 		liveGatewayV2TraceSelection{ipv6Present, liveGatewayV2TraceCreateNetworksIPv6Present},
@@ -1307,9 +1310,16 @@ func TestGatewayV2StoppedContainerDiagnosticMatchesValidator(t *testing.T) {
 	ingress.IPAMConfig = nil
 	networks[state.Identity.IngressNetwork] = ingress
 	if failures := liveGatewayV2StoppedNetworkFailureOutcomes(state, gatewayV2StageContainerRole, expectedNetworks, networks); !reflect.DeepEqual(failures, []liveGatewayV2TraceOutcome{
-		liveGatewayV2TraceCreateNetworksInvalidID, liveGatewayV2TraceCreateNetworksIPAMMissing,
+		liveGatewayV2TraceCreateNetworksIDAbsent, liveGatewayV2TraceCreateNetworksIPAMMissing,
 	}) {
 		t.Fatalf("stopped network diagnostic failures=%v", failures)
+	}
+	ingress.IPAMConfig = &gatewayV2ConfiguredIPAM{IPv4Address: state.Network.ContainerIPv4}
+	ingress.NetworkID = "malformed"
+	networks[state.Identity.IngressNetwork] = ingress
+	if failures := liveGatewayV2StoppedNetworkFailureOutcomes(state, gatewayV2StageContainerRole, expectedNetworks, networks); !reflect.DeepEqual(failures,
+		[]liveGatewayV2TraceOutcome{liveGatewayV2TraceCreateNetworksIDMalformed}) {
+		t.Fatalf("malformed stopped network ID diagnostic failures=%v", failures)
 	}
 }
 

@@ -70,6 +70,53 @@ func TestClassifyGatewayV2TopologyAcceptsUnboundExposedPorts(t *testing.T) {
 	}
 }
 
+func TestValidGatewayV2ContainerLabelsAllowsOnlyForeignImageMetadata(t *testing.T) {
+	_, state, journal := gatewayV2IdentityTestState(t)
+	expected := gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, gatewayV2FinalContainerRole, true)
+	clone := func() map[string]string {
+		labels := make(map[string]string, len(expected)+1)
+		for key, value := range expected {
+			labels[key] = value
+		}
+		return labels
+	}
+
+	if !validGatewayV2ContainerLabels(clone(), expected) {
+		t.Fatal("exact Rig container labels were rejected")
+	}
+	foreign := clone()
+	foreign["org.opencontainers.image.title"] = "Caddy"
+	if !validGatewayV2ContainerLabels(foreign, expected) {
+		t.Fatal("foreign pinned-image metadata label was rejected")
+	}
+	missing := clone()
+	delete(missing, gatewayV2OperationLabelKey)
+	if validGatewayV2ContainerLabels(missing, expected) {
+		t.Fatal("missing required Rig label was accepted")
+	}
+	mismatch := clone()
+	mismatch[gatewayV2OperationLabelKey] = "33333333-3333-4333-8333-333333333333"
+	if validGatewayV2ContainerLabels(mismatch, expected) {
+		t.Fatal("mismatched required Rig label was accepted")
+	}
+	extraRig := clone()
+	extraRig["io.rig.unexpected"] = "metadata"
+	if validGatewayV2ContainerLabels(extraRig, expected) {
+		t.Fatal("additional Rig namespace label was accepted")
+	}
+}
+
+func TestClassifyGatewayV2TopologyAcceptsForeignPinnedImageMetadataLabel(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Phase = gatewayPhaseV2Serving
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
+	observation.FinalContainer.Labels["org.opencontainers.image.title"] = "Caddy"
+	if got := classifyGatewayV2Topology(source, state, journal, observation); got != gatewayTopologyExactFinalV2 {
+		t.Fatalf("topology with foreign pinned-image metadata label = %q", got)
+	}
+}
+
 func TestClassifyCommittedFinalV2DoesNotDependOnHistoricalV1AppTopology(t *testing.T) {
 	source, state, journal := gatewayV2IdentityTestState(t)
 	journal.Resources = gatewayV2IdentityTestBoundResources(t)
