@@ -51,6 +51,25 @@ func TestClassifyGatewayV2TopologyExactStates(t *testing.T) {
 	}
 }
 
+func TestClassifyGatewayV2TopologyAcceptsUnboundExposedPorts(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Phase = gatewayPhaseV2Serving
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
+	for _, effective := range []map[string][]map[string]string{
+		observation.V1Runtime.EffectivePortBindings,
+		observation.FinalRuntime.EffectivePortBindings,
+	} {
+		effective["80/tcp"] = nil
+		effective["443/tcp"] = []map[string]string{}
+		effective["443/udp"] = nil
+		effective["2019/tcp"] = nil
+	}
+	if got := classifyGatewayV2Topology(source, state, journal, observation); got != gatewayTopologyExactFinalV2 {
+		t.Fatalf("topology with unbound image-exposed ports = %q", got)
+	}
+}
+
 func TestClassifyCommittedFinalV2DoesNotDependOnHistoricalV1AppTopology(t *testing.T) {
 	source, state, journal := gatewayV2IdentityTestState(t)
 	journal.Resources = gatewayV2IdentityTestBoundResources(t)
@@ -237,6 +256,9 @@ func TestClassifyGatewayV2TopologyFailsClosedOnDrift(t *testing.T) {
 		{"effective final binding drift", func(value *gatewayV2DockerObservation) {
 			value.FinalRuntime.EffectivePortBindings = map[string][]map[string]string{}
 		}},
+		{"unexpected effective final binding", func(value *gatewayV2DockerObservation) {
+			value.FinalRuntime.EffectivePortBindings["9999/tcp"] = []map[string]string{{"HostIp": "127.0.0.1", "HostPort": "9999"}}
+		}},
 		{"final paused", func(value *gatewayV2DockerObservation) { value.FinalRuntime.Paused = true }},
 		{"final dead", func(value *gatewayV2DockerObservation) { value.FinalRuntime.Dead = true }},
 		{"final restarted", func(value *gatewayV2DockerObservation) { value.FinalRuntime.RestartCount = 1 }},
@@ -306,6 +328,79 @@ func TestClassifyGatewayV2TopologyFailsClosedOnDrift(t *testing.T) {
 			test.mutate(&value)
 			if got := classifyGatewayV2Topology(source, state, journal, value); got != gatewayTopologyUnknownOrDrift {
 				t.Fatalf("topology = %q", got)
+			}
+		})
+	}
+}
+
+func TestGatewayV2EffectivePortBindingsMatchConfigured(t *testing.T) {
+	configured := map[string][]map[string]string{
+		"8080/tcp": {{"HostIp": "192.168.1.20", "HostPort": "20481"}},
+	}
+	tests := []struct {
+		name      string
+		effective map[string][]map[string]string
+		want      bool
+	}{
+		{
+			name:      "exact configured publication",
+			effective: gatewayV2IdentityTestPortBindingsCopy(configured),
+			want:      true,
+		},
+		{
+			name: "additional exposed ports without host bindings",
+			effective: map[string][]map[string]string{
+				"80/tcp":   nil,
+				"443/tcp":  {},
+				"443/udp":  nil,
+				"2019/tcp": nil,
+				"8080/tcp": {{"HostIp": "192.168.1.20", "HostPort": "20481"}},
+			},
+			want: true,
+		},
+		{
+			name:      "configured publication absent",
+			effective: map[string][]map[string]string{"80/tcp": nil},
+			want:      false,
+		},
+		{
+			name: "configured host address changed",
+			effective: map[string][]map[string]string{
+				"8080/tcp": {{"HostIp": "0.0.0.0", "HostPort": "20481"}},
+			},
+			want: false,
+		},
+		{
+			name: "configured host port changed",
+			effective: map[string][]map[string]string{
+				"8080/tcp": {{"HostIp": "192.168.1.20", "HostPort": "20482"}},
+			},
+			want: false,
+		},
+		{
+			name: "configured publication duplicated",
+			effective: map[string][]map[string]string{
+				"8080/tcp": {
+					{"HostIp": "192.168.1.20", "HostPort": "20481"},
+					{"HostIp": "192.168.1.20", "HostPort": "20481"},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "unexpected effective publication",
+			effective: map[string][]map[string]string{
+				"8080/tcp": {{"HostIp": "192.168.1.20", "HostPort": "20481"}},
+				"9999/tcp": {{"HostIp": "127.0.0.1", "HostPort": "9999"}},
+			},
+			want: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := gatewayV2EffectivePortBindingsMatchConfigured(test.effective, configured); got != test.want {
+				t.Fatalf("gatewayV2EffectivePortBindingsMatchConfigured() = %t, want %t", got, test.want)
 			}
 		})
 	}
