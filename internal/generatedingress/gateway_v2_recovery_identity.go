@@ -150,7 +150,8 @@ func validGatewayV2PartialInfrastructure(state gatewayV2RouteState, journal gate
 		expectedVolumes = append(expectedVolumes, state.Identity.DataVolume)
 	}
 	sort.Strings(expectedVolumes)
-	if !validOwnedNameSet(observation.OwnedVolumes, expectedVolumes...) {
+	if (len(expectedVolumes) == 0 && len(observation.OwnedVolumes) != 0) ||
+		(len(expectedVolumes) != 0 && !validOwnedNameSet(observation.OwnedVolumes, expectedVolumes...)) {
 		return false
 	}
 	if observation.IngressFound {

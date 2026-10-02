@@ -8,6 +8,16 @@ import (
 
 func TestClassifyGatewayV2RecoveryTopologyExactIntermediateStates(t *testing.T) {
 	source, state, baseJournal := gatewayV2IdentityTestState(t)
+	freshJournal := baseJournal
+	freshJournal.Phase = gatewayPhaseStageIntent
+	fresh := gatewayV2IdentityTestObservation(t, source, state, freshJournal, gatewayTopologyExactV1Only)
+	if got := classifyGatewayV2RecoveryTopology(source, state, freshJournal, fresh); got != gatewayV2RecoveryStageIntentPartialInfrastructure {
+		t.Fatalf("fresh stage-intent topology = %q", got)
+	}
+	fresh.OwnedVolumes = []string{"unexpected"}
+	if got := classifyGatewayV2RecoveryTopology(source, state, freshJournal, fresh); got != gatewayV2RecoveryUnknown {
+		t.Fatalf("fresh stage-intent topology accepted an extra owned volume: %q", got)
+	}
 
 	partialJournal := baseJournal
 	partialJournal.Phase = gatewayPhaseStageIntent
