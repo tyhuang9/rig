@@ -587,6 +587,7 @@ func validGatewayV2FinalTopology(state gatewayV2RouteState, journal gatewayMigra
 		validContainerID(observation.IngressNetworkID) && validGatewayV2Volumes(state, journal, observation) &&
 		validGatewayV2Container(state, journal, observation.FinalContainer, observation.FinalRuntime, observation.FinalContainerFound, gatewayV2FinalContainerRole, observation.Image.ID) &&
 		validGatewayV2IngressNetwork(state, journal, observation.IngressNetwork, observation.IngressFound, observation.FinalContainer.ID, state.Identity.FinalContainer) &&
+		validGatewayV2RunningApplicationNetworkIDs(state, observation.FinalRuntime, observation.ApplicationNetworkIDs) &&
 		validGatewayV2ApplicationNetworks(state, observation.FinalContainer, observation.ApplicationNetworks, observation.ApplicationNetworkIDs) &&
 		configProven && observation.Final404Proven && observation.FinalRoutesProven && observation.FinalHostPublicationProven &&
 		observation.FinalEndpointIdentityProven && observation.FinalStable
@@ -989,6 +990,25 @@ func validGatewayV2ApplicationNetworks(state gatewayV2RouteState, container cadd
 		inspection, exists := inspections[name]
 		if !exists || !validContainerID(ids[name]) || name == state.Identity.IngressNetwork || !validApplicationNetwork(inspection.identity(), appID) ||
 			!validGatewayApplicationNetworkMembership(inspection, container, name) {
+			return false
+		}
+	}
+	return true
+}
+
+func validGatewayV2RunningApplicationNetworkIDs(state gatewayV2RouteState, runtime gatewayContainerRuntime,
+	inspectedIDs map[string]string,
+) bool {
+	expected, valid := gatewayV2ApplicationNetworkOwners(state)
+	if !valid || len(inspectedIDs) != len(expected) {
+		return false
+	}
+	for name := range expected {
+		inspectedID, inspected := inspectedIDs[name]
+		configured, attached := runtime.ConfiguredNetworks[name]
+		if !inspected || !attached || name == state.Identity.IngressNetwork ||
+			!validContainerID(inspectedID) || !validContainerID(configured.NetworkID) ||
+			normalizeID(configured.NetworkID) != normalizeID(inspectedID) {
 			return false
 		}
 	}

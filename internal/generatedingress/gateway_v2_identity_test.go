@@ -326,6 +326,14 @@ func TestClassifyGatewayV2TopologyFailsClosedOnDrift(t *testing.T) {
 				break
 			}
 		}},
+		{"configured application network identity replaced", func(value *gatewayV2DockerObservation) {
+			for name := range value.ApplicationNetworkIDs {
+				attachment := value.FinalRuntime.ConfiguredNetworks[name]
+				attachment.NetworkID = "sha256:" + strings.Repeat("9", 64)
+				value.FinalRuntime.ConfiguredNetworks[name] = attachment
+				break
+			}
+		}},
 		{"application network gateway membership missing", func(value *gatewayV2DockerObservation) {
 			for name, network := range value.ApplicationNetworks {
 				delete(network.Containers, value.FinalContainer.ID)
