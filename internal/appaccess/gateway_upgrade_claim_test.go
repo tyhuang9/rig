@@ -302,8 +302,6 @@ func TestGatewayProfileUpgradeClaimPinsPreviouslyInsertedProfileRevision(t *test
 }
 
 func TestCurrentGatewayProfileUpgradeClaimUsesOneReadSnapshot(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	dataRoot := t.TempDir()
 	firstDB, err := database.Open(dataRoot)
 	if err != nil {
@@ -318,15 +316,17 @@ func TestCurrentGatewayProfileUpgradeClaimUsesOneReadSnapshot(t *testing.T) {
 	addUsers(t, firstDB)
 	reader := testRepository(firstDB)
 	writer := testRepository(secondDB)
-	profile, _, err := reader.ConfigureGatewayProfile(ctx, approvedGatewayInput(t,
+	profile, _, err := reader.ConfigureGatewayProfile(context.Background(), approvedGatewayInput(t,
 		GatewayProfileSpec{SelectedIPv4: "192.168.52.8", InterfaceID: "snapshot-adapter", PortStart: 8100, PortEnd: 8119}, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	claim, _, err := reader.ClaimGatewayProfileUpgrade(ctx, approvedGatewayUpgradeClaimInput(t, profile))
+	claim, _, err := reader.ClaimGatewayProfileUpgrade(context.Background(), approvedGatewayUpgradeClaimInput(t, profile))
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	lookedUp := make(chan struct{})
 	resume := make(chan struct{})
 	reader.afterCurrentClaimLookup = func() {
