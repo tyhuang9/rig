@@ -1,7 +1,8 @@
 # M3 LAN foundation: local evidence
 
 Status: partial M3 implementation, 2026-09-29. This branch remains local and
-unpublished. It does not enable a LAN listener or report a LAN URL.
+unpublished. No LAN listener has been started on this local host, and no
+controller action or LAN URL is exposed.
 
 ## Exact revisions and scope
 
@@ -14,6 +15,9 @@ unpublished. It does not enable a LAN listener or report a LAN URL.
 - Immutable Docker resource bindings in the migration journal: `48152f9`.
 - Exact v2 resource creation arguments and host preflight: `0195695`.
 - ID-bound observer and read-only migration recovery: `50bc2f9`.
+- Journaled v2 gateway staging: `1a6eb3e`.
+- Staging acceptance record: `0ba9751`.
+- Journaled v2 transfer and bounded rollback: `aff192f`.
 
 The allocator stores approved desired gateway and per-app access revisions,
 action digests, compare-and-swap heads, and unique durable port ownership. It
@@ -49,8 +53,8 @@ root cannot issue competing Docker commands while one holds the lock. A
 process-exit test proves the next instance can acquire the lock; an injected
 post-switch release failure preserves the executor's
 `CandidateMayBeLive` signal so it does not clean a potentially serving
-container. The lock also serializes committed-v2 route changes; no live gateway
-upgrade or LAN listener is enabled yet.
+container. The lock also serializes committed-v2 route changes; the new staging
+operation has not been invoked against live Docker.
 
 The new `internal/hostnetwork` helper enumerates currently assigned RFC 1918
 IPv4 addresses on active, non-loopback host interfaces. An approved interface
@@ -65,8 +69,9 @@ rejects a proposed private Docker subnet when it overlaps any more-specific
 host route or interface prefix; only the default route is ignored. Snapshot
 completion is private to the package, so a caller cannot fabricate a usable
 empty snapshot. Linux reads the current network namespace. The route and
-interface reads are sequential, and the future cutover must revalidate them
-immediately around binding. This helper is still unwired to Docker mutation.
+interface reads are sequential. The stage operation calls the preflight before
+creating the ingress network and checks the selected interface before stage
+start; final cutover must revalidate again around its own Docker mutation.
 
 The read-only v2 gateway observer checks pinned Docker identity, protected v1
 source identity, live and restart Caddy configuration, explicit bindings,
@@ -110,8 +115,8 @@ selected-IP pool port, both through the host and directly through the attested
 container; generic 404 listeners and loopback publication fail. After commit,
 historical v1 app networks and endpoint health may change while the stopped v1
 gateway core identity remains pinned. Precommit rollback phases retain their
-strict v1 dependency. No live v2 gateway creator, LAN access action, or LAN URL
-is enabled by this serving-path slice.
+strict v1 dependency. No app-serving final gateway, LAN access action, or LAN
+URL is enabled by this serving-path slice.
 
 The migration journal now binds the pinned image, ingress network, both volume
 creation identities, and stage/final container IDs as each resource is made.
@@ -127,8 +132,47 @@ stage/final container creations. The stage publishes only the selected private
 IPv4 port pool; the final also publishes the v1 loopback port. Host preflight
 checks that the approved interface still owns the exact address and that the
 planned Docker subnet does not overlap current host routes or interface
-prefixes. These are unwired prerequisites: no Docker resource was created and
-no host port was opened by this slice.
+prefixes.
+
+`Manager.StageGatewayV2` is an explicit local operation over an already
+prepared, protected migration. It holds the Manager and cross-process gateway
+locks through the phase loop. It proves v1, writes `stage_intent`, creates and
+durably binds the pinned image, ingress network, two volumes, and stopped stage
+container, then copies and rereads the exact 404-only Caddy restart config.
+After stopped-stage identity proof and a final selected-interface check, it
+starts the stage and requires exact live identity, listener challenge, and 404
+proof before writing `staged`. It never stops v1 or enters transfer. A crash
+after binding a stopped stage but before config copy is compensated only after
+exact bound-resource, stopped/no-host-binding, and v1-serving proof; that proof
+cannot start a listener. Create-before-bind ambiguity, drift, or incomplete
+cleanup records unresolved state rather than a false rollback. This method has
+no controller action or URL display caller yet. Its Docker behavior is tested
+with a deterministic driver, not a live daemon.
+
+`Manager.TransferGatewayV2` now advances an exact staged migration through
+`transfer_intent`, `v2_serving`, and `committed` under the same Manager and OS
+gateway locks. It copies and rereads the final config through the still-running
+stage, then stops and removes only the bound stage while v1 serves. It creates
+the final container stopped with the ingress and all existing app networks in
+one deterministic Docker create command, binds its immutable ID, and requires
+stopped-container proof before stopping v1. Immediately before v1 stop/start,
+the production driver reattests the journal-bound v1 identity and issues the
+Docker command by immutable container ID. After final start it checks exact
+topology, state-bound per-app loopback challenges, the LAN challenge/404
+proof, and selected-interface ownership before commit. Known failures restore
+and reattest v1; unknown or unbound Docker outcomes remain unresolved. Tests
+cover interrupted and reported-failed protected writes at transfer intent,
+final ID binding, v2 serving, and rollback intent without replacing immutable
+history. This operation still has no authenticated controller caller or LAN URL.
+
+Temporary Caddy configs remain readable by the non-root container user after
+copy. The host-side working directory must therefore be private before Manager
+initialization and each config copy. Existing controller directories are now
+validated instead of accepted by path alone. Unix requires a current-user
+0700 leaf and trusted, non-replaceable ancestry (including sticky-parent
+semantics). Windows requires a protected current-user-only DACL and holds
+rename-blocking handles on every ancestor until the temporary file is removed.
+Any failed validation blocks the copy before creating a host config file.
 
 ## Executed verification
 
@@ -166,6 +210,22 @@ no host port was opened by this slice.
 | `go vet ./...` after these M3 prerequisites | Passed with normal local Windows permissions. |
 | Linux amd64 `go test -c` for `./internal/generatedingress` after recovery observer | Cross-compiled; Linux runtime tests were not executed locally. |
 | Independent code and security reviews of the prerequisite diff | No confirmed blocker for a local commit. Both require live Docker verification before M3 acceptance. |
+| `go test -count=1 ./internal/generatedingress` after staging review fixes | Passed with normal local Windows permissions. |
+| `go test -count=1 ./...` and `go vet ./...` after staging review fixes | Passed with normal local Windows permissions. |
+| Linux amd64 `go test -c` for `./internal/generatedingress` after staging review fixes | Cross-compiled; Linux runtime tests were not executed locally. |
+| `gofmt -d` and `git diff --cached --check` for the staging slice | Passed. |
+| Staging code and security reviews | A Docker container-ID command defect and a bound-stage pre-config crash gap were corrected before commit. Security review found no confirmed exploitable finding for this local 404-only slice. |
+| `go test -count=1 ./...` after transfer | Passed with normal local Windows permissions; all Go packages completed. |
+| `go vet ./...` after transfer | Passed with normal local Windows permissions. |
+| Linux amd64 `go test -c` for `./internal/generatedingress` after transfer | Cross-compiled; Linux runtime tests were not executed locally. The exact local output artifact was removed after compilation. |
+| `gofmt -d` and `git diff --cached --check` for transfer | Passed. |
+| `pnpm --dir docs build` after the design update | Passed without render errors. |
+| Transfer code and security reviews | The name-only v1 stop/start flaw was corrected with fresh identity attestation and ID-bound commands. Durability-window tests requested by review were added. Security review noted temporary host-config visibility when the working directory is traversable. `docker.PrepareControllerDirectories` creates a private directory when absent but does not verify the mode or ACL of an existing one. Docker behavior remains unverified live. |
+| `go test -count=1 ./...` and `go vet ./...` after private-directory guards | Passed serially with normal local Windows permissions. |
+| `pnpm --dir web test` during the private-directory work | Passed, 400/400 tests, serially. The final guard edit changed only Go code; web tests were not rerun afterward. |
+| Windows working-directory and ancestry-guard tests | Passed, including blocked leaf, parent, and higher-ancestor renames while a guard is held and allowed rename after close. |
+| Linux amd64 securetemp test binary run under WSL | Passed the private-directory tests, including a 0700 leaf beneath a sticky writable parent, a readable ancestor, and rejection of a writable nonsticky ancestor and symlink. The first sticky-parent test fixture used numeric `01777`, which Go's FileMode did not interpret as `ModeSticky`; the corrected fixture passed. |
+| `git diff --cached --check` and independent security re-review | Passed. Review found the earlier writable-ancestor exposure closed for unprivileged local users. Windows traversal-only ancestor ACLs may be rejected by the fail-closed `GENERIC_READ` guard. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -180,9 +240,11 @@ Windows permissions. The focused ingress tests passed in the sandbox.
 
 The Windows Go toolchain has CGO disabled, so `go test -race` was not run. The
 storage tests instead exercise separate SQLite handles and repeated contention.
-No live Caddy config validation, Docker port bind, rollback, second-device LAN
-request, or database-backed LAN journey has run on this branch. Those are
-future M3 gates, not inferred from the local unit tests.
+No live Caddy config validation, Docker port bind, cutover/rollback,
+second-device LAN request, or database-backed LAN journey has run on this
+branch. The journaled staging and transfer tests use fake drivers; they do not
+establish Docker's actual stopped inspect shape or host listener behavior.
+Those are future M3 gates.
 The installed Docker CLI currently cannot reach the Docker Desktop Linux
 daemon: `C:\Program Files\Docker\Docker\resources\bin\docker.exe version
 --format '&#123;&#123;json .Server&#125;&#125;'` failed because
@@ -207,11 +269,12 @@ and interfaces using the new hostnetwork helper immediately before and after
 mutation; the helper is not wired yet. The journal's actor
 field records provenance; it does not authenticate or authorize the actor.
 The protected journal phase update checks the expected phase before replacing
-the file, but it is not an atomic compare-and-swap across processes. Gateway
-cutover must use the new handle-held lock across its entire operation; the
-unwired journal methods alone do not enforce that boundary. Every active LAN
-binding must also be compared with its approved SQLite row. A fresh upgrade after a
-`rolled_back` journal needs a history-preserving retry generation or explicit
+the file, but it is not an atomic compare-and-swap across processes. The new
+staging and transfer operations hold the handle-based gateway lock across
+their complete mutation and attestation loops; journal methods alone do not
+enforce that boundary. Every active LAN binding must also be compared with its
+approved SQLite row. A fresh upgrade after a `rolled_back` journal needs a
+history-preserving retry generation or explicit
 operator recovery; fixed create-only paths currently refuse another operation.
 The first live v2 marker writer must hold the same lock as the v1 compatibility
 fence. The lock and state paths must remain bound to one protected directory
@@ -227,13 +290,25 @@ host-side selected-address publication proof, post-probe endpoint/config
 reinspection, and comparison with protected resource bindings. These have unit
 evidence only and require real Docker and Desktop execution. Docker's stopped
 container inspect shape for configured networks and effective ports remains
-unverified locally. Before the future writer starts either LAN-published
-container, it must prove the exact restart config in its writable volume,
-recheck the selected interface, retain the gateway lock, and reattest after
-start. A physical second-device LAN journey remains a distinct acceptance
-gate.
+unverified locally. The staging and transfer writers perform config,
+selected-interface, gateway-lock, and post-start checks in unit tests. Real
+Docker must still confirm that the stopped final container retains all
+configured network and port bindings, that manual v1 stop/start preserves the
+attested Docker restart count, and that the final Caddy process can read its
+copied config. A physical second-device LAN journey remains a distinct
+acceptance gate.
 The gateway-specific host challenge proves listener identity, but generic
 application probes accept any HTTP status. They do not prove that Caddy selected
 and forwarded the intended app route. A controlled live Docker route matrix
 with distinct backend response markers, wrong-Host and cross-app requests is
 required before claiming LAN routing acceptance.
+
+The local cutover implementation now handles those journal phases and
+compensation paths, but hosted Docker must prove the real network, bind,
+config-read, route, and rollback behavior before this slice is accepted.
+Authenticated action-specific consent, LAN access activation and disable, UI
+diagnostics, and the physical second-device journey remain open. The host-side
+private-directory boundary has unit and WSL evidence, but its behavior with a
+live Docker config copy and on a locked-down Windows service account remains
+unverified. Windows ancestors that allow traversal without `GENERIC_READ` fail
+closed until a narrower safe guard is implemented and tested.

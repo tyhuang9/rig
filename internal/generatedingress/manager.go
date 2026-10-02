@@ -17,6 +17,7 @@ import (
 
 	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/runtime/securetemp"
 )
 
 const (
@@ -77,6 +78,12 @@ type Manager struct {
 	gatewayCandidateObserver func(context.Context, gatewayV2RouteState, gatewayMigrationJournal, string, gatewayV2AppRoute) error
 	// gatewayMixedRestartObserver is replaceable only by package tests.
 	gatewayMixedRestartObserver func(context.Context, routeState, gatewayV2RouteState, gatewayV2RouteState, gatewayMigrationJournal) bool
+	// gatewayV2UpgradeDriver is replaceable only by package tests. Production
+	// uses the exact Docker and host-network adapter in gateway_v2_upgrade.go.
+	gatewayV2UpgradeDriver gatewayV2UpgradeDriver
+	// gatewayV2TransferDriver is replaceable only by package tests. Production
+	// uses the journaled staged-to-committed adapter in gateway_v2_transfer.go.
+	gatewayV2TransferDriver gatewayV2TransferDriver
 }
 
 // contextMutex lets a route observation abandon lock contention when its
@@ -133,6 +140,9 @@ func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error)
 	}
 	if !validOptions(options) {
 		return nil, errors.New("generated ingress options are invalid")
+	}
+	if err := securetemp.ValidatePrivateDirectory(options.WorkingDirectory); err != nil {
+		return nil, fmt.Errorf("generated ingress working directory is unsafe: %w", err)
 	}
 	store, err := newStateStore(options.DataRoot)
 	if err != nil {
@@ -564,9 +574,11 @@ func (m *Manager) copyConfig(ctx context.Context, contents []byte, filename stri
 	if len(contents) == 0 || !validConfigFilename(filename) {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
-	if !m.validWorkingDirectory() {
+	workingDirectoryGuard, ok := m.acquireWorkingDirectoryGuard()
+	if !ok {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
+	defer workingDirectoryGuard.Close()
 	file, err := os.CreateTemp(m.options.WorkingDirectory, ".rig-caddy-*.json")
 	if err != nil {
 		return &Error{Code: DiagnosticIngressUnavailable}
@@ -1222,11 +1234,25 @@ func validAbsoluteDirectory(value string) bool {
 }
 
 func (m *Manager) validWorkingDirectory() bool {
-	if m == nil || m.workingDirectoryIdentity == nil || !validAbsoluteDirectory(m.options.WorkingDirectory) {
+	if m == nil || m.workingDirectoryIdentity == nil || securetemp.ValidatePrivateDirectory(m.options.WorkingDirectory) != nil {
 		return false
 	}
 	current, err := os.Lstat(m.options.WorkingDirectory)
 	return err == nil && os.SameFile(m.workingDirectoryIdentity, current)
+}
+
+func (m *Manager) acquireWorkingDirectoryGuard() (*securetemp.PrivateDirectoryGuard, bool) {
+	if !m.validWorkingDirectory() {
+		return nil, false
+	}
+	guard, err := securetemp.AcquirePrivateDirectoryGuard(m.options.WorkingDirectory)
+	if err != nil || !m.validWorkingDirectory() {
+		if guard != nil {
+			_ = guard.Close()
+		}
+		return nil, false
+	}
+	return guard, true
 }
 
 func dockerEnvironment(endpoint, config string) ([]string, error) {

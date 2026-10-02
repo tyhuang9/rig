@@ -100,13 +100,14 @@ not a supported downgrade path after v2 commitment; it may fail closed on the
 port collision. This migration design requires hosted Docker bind/rollback
 proof before the gateway is enabled.
 
-The current pure journal unit does not perform Docker operations. Its
-expected-phase check is not a cross-process CAS; the runtime must add one
-exclusive writer or transactional CAS before using a phase to authorize a
-mutation. A failed write durability sync stops the operation even when
-immediate readback sees the intended bytes. After `rolled_back`, the fixed
-create-only bundle paths prevent a fresh operation until a history-preserving
-retry generation or explicit operator recovery is designed.
+The journal's expected-phase check is not a cross-process CAS by itself.
+`Manager.StageGatewayV2` and `Manager.TransferGatewayV2` hold the exclusive
+gateway writer lock across their state reads, phase writes, Docker operations,
+and attestation. Neither has a controller action caller yet. A failed write
+durability sync stops the operation even when immediate readback sees the
+intended bytes. After `rolled_back`, the fixed create-only bundle paths prevent
+a fresh operation until a history-preserving retry generation or explicit
+operator recovery is designed.
 
 ### Exclusive gateway writer for runtime integration
 

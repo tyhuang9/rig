@@ -58,6 +58,20 @@ func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string
 	if err := validateCaddyV2Assignments(routes, profile, assignments); err != nil {
 		return nil, err
 	}
+	if profile.ProbeToken != "" {
+		appIDs := make([]string, 0, len(routes))
+		for appID := range routes {
+			appIDs = append(appIDs, appID)
+		}
+		sort.Strings(appIDs)
+		local := result.Apps.HTTP.Servers["generated"]
+		probes := make([]caddyRoute, 0, len(appIDs)+len(local.Routes))
+		for _, appID := range appIDs {
+			probes = append(probes, gatewayV2ProbeRoute(appID+".rig.localhost", gatewayV2AppChallenge(profile.ProbeToken, appID)))
+		}
+		local.Routes = append(probes, local.Routes...)
+		result.Apps.HTTP.Servers["generated"] = local
+	}
 
 	for port := profile.PortStart; ; port++ {
 		server := caddyServer{
@@ -86,6 +100,11 @@ func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string
 // wrong Caddy listener even when both ports belong to the same gateway.
 func gatewayV2PortChallenge(base string, port uint16) string {
 	sum := sha256.Sum256([]byte("rig-gateway-v2-port\x00" + base + "\x00" + strconv.FormatUint(uint64(port), 10)))
+	return hex.EncodeToString(sum[:])
+}
+
+func gatewayV2AppChallenge(base, appID string) string {
+	sum := sha256.Sum256([]byte("rig-gateway-v2-app\x00" + base + "\x00" + appID))
 	return hex.EncodeToString(sum[:])
 }
 

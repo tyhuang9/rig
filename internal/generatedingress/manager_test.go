@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/generatedruntime"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -278,6 +279,48 @@ func TestSwitchPersistsAcceptedRouteAfterValidatedReload(t *testing.T) {
 	}
 	if _, ok := runner.files[caddyContainerName+":/config/proposed.json"]; !ok {
 		t.Fatal("proposed aggregate config was not copied to Caddy")
+	}
+}
+
+func TestNewRejectsPermissiveWorkingDirectoryBeforeStateWrites(t *testing.T) {
+	root := t.TempDir()
+	directories, err := runtimedocker.PrepareControllerDirectories(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relaxWorkingDirectoryPermissionsForTest(t, directories.WorkingDirectory)
+	stateRoot := filepath.Join(root, "unwritten-state")
+	_, err = New(&ingressRunner{}, Options{
+		DockerExecutable:      filepath.Join(root, "docker.exe"),
+		DockerConfigDirectory: directories.DockerConfigDirectory,
+		WorkingDirectory:      directories.WorkingDirectory,
+		DataRoot:              stateRoot,
+	})
+	if err == nil {
+		t.Fatal("permissive working directory was accepted")
+	}
+	if _, statErr := os.Stat(stateRoot); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("state was written before working-directory validation: %v", statErr)
+	}
+}
+
+func TestCopyConfigRejectsWorkingDirectoryPermissionRelaxation(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	relaxWorkingDirectoryPermissionsForTest(t, manager.options.WorkingDirectory)
+
+	err := manager.copyConfig(context.Background(), []byte(`{"admin":{"listen":"localhost:2019"}}`), "proposed.json")
+	if !IsCode(err, DiagnosticIngressDrift) {
+		t.Fatalf("error = %v", err)
+	}
+	if len(runner.commands) != 0 {
+		t.Fatalf("permission drift reached Docker: %v", runner.commands)
+	}
+	entries, readErr := os.ReadDir(manager.options.WorkingDirectory)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("permission drift left temporary files: %v", entries)
 	}
 }
 
@@ -1593,8 +1636,8 @@ func TestConfigPromotionRunsAsRootWhileCaddyCommandsRemainNonRoot(t *testing.T) 
 func newManagerFixture(t *testing.T, failReload bool) (*Manager, *ingressRunner) {
 	t.Helper()
 	root := t.TempDir()
-	dockerConfig := filepath.Join(root, "docker-config")
-	if err := os.Mkdir(dockerConfig, 0o700); err != nil {
+	directories, err := runtimedocker.PrepareControllerDirectories(root)
+	if err != nil {
 		t.Fatal(err)
 	}
 	appID := "11111111-1111-4111-8111-111111111111"
@@ -1606,7 +1649,10 @@ func newManagerFixture(t *testing.T, failReload bool) (*Manager, *ingressRunner)
 		ingressContainers: map[string]caddyNetworkContainerInspection{strings.Repeat("d", 64): {Name: caddyContainerName, IPv4Address: ingressIP + "/28"}},
 		files:             map[string][]byte{}, failProposedReload: failReload,
 	}
-	manager, err := New(runner, Options{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: dockerConfig, WorkingDirectory: root, DataRoot: root})
+	manager, err := New(runner, Options{
+		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
+		WorkingDirectory: directories.WorkingDirectory, DataRoot: root,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

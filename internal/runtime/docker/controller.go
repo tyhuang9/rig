@@ -57,6 +57,9 @@ func PrepareControllerDirectories(dataRoot string) (ControllerDirectories, error
 	if err != nil {
 		return ControllerDirectories{}, err
 	}
+	if err := securetemp.ValidatePrivateDirectory(working); err != nil {
+		return ControllerDirectories{}, err
+	}
 	return ControllerDirectories{
 		DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 	}, nil

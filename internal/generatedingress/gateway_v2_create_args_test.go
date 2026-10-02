@@ -41,6 +41,7 @@ func TestGatewayV2CreateArgsBindExactResourcesAndPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(gatewayV2ArgValues(stage, "--publish"), gatewayV2ExpectedLANPublishArgs(state)) ||
+		!reflect.DeepEqual(gatewayV2ArgValues(stage, "--network"), []string{"name=" + state.Identity.IngressNetwork + ",ip=" + state.Network.ContainerIPv4 + ",gw-priority=1"}) ||
 		!reflect.DeepEqual(gatewayV2ArgValues(stage, "--restart"), []string{"no"}) ||
 		!reflect.DeepEqual(stage[len(stage)-4:], []string{imageID, "run", "--config", "/config/stage.json"}) {
 		t.Fatalf("stage container args = %v", stage)
@@ -54,10 +55,19 @@ func TestGatewayV2CreateArgsBindExactResourcesAndPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantPorts := append(gatewayV2ExpectedLANPublishArgs(state), "127.0.0.1:8080:8080/tcp")
+	wantNetworks := []string{
+		"name=" + state.Identity.IngressNetwork + ",ip=" + state.Network.ContainerIPv4 + ",gw-priority=1",
+		"name=net-a",
+		"name=net-b",
+	}
 	if !reflect.DeepEqual(gatewayV2ArgValues(final, "--publish"), wantPorts) ||
+		!reflect.DeepEqual(gatewayV2ArgValues(final, "--network"), wantNetworks) ||
 		!reflect.DeepEqual(gatewayV2ArgValues(final, "--restart"), []string{"unless-stopped"}) ||
 		!reflect.DeepEqual(final[len(final)-4:], []string{imageID, "run", "--config", "/config/active.json"}) {
 		t.Fatalf("final container args = %v", final)
+	}
+	if len(gatewayV2ArgValues(final, "--ip")) != 0 {
+		t.Fatalf("global --ip unexpectedly present: %v", final)
 	}
 	assertGatewayV2CreateHardening(t, final)
 }

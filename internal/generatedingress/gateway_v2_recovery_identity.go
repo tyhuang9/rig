@@ -17,6 +17,8 @@ const (
 	gatewayV2RecoveryStageIntentPartialInfrastructure    gatewayV2RecoveryTopology = "exact_stage_intent_v1_serving_partial_v2_infrastructure_no_containers"
 	gatewayV2RecoveryStageIntentStoppedStage             gatewayV2RecoveryTopology = "exact_stage_intent_v1_serving_stopped_stage_final_absent"
 	gatewayV2RecoveryTransferIntentV1ServingStoppedStage gatewayV2RecoveryTopology = "exact_transfer_intent_v1_serving_stopped_stage_final_absent"
+	gatewayV2RecoveryTransferIntentV1ServingNoContainers gatewayV2RecoveryTopology = "exact_transfer_intent_v1_serving_stage_and_final_absent"
+	gatewayV2RecoveryTransferIntentV1ServingStoppedFinal gatewayV2RecoveryTopology = "exact_transfer_intent_v1_serving_stage_absent_stopped_final"
 	gatewayV2RecoveryTransferIntentStoppedV1             gatewayV2RecoveryTopology = "exact_transfer_intent_v1_stopped_running_stage_final_absent"
 	gatewayV2RecoveryTransferIntentV1StoppedStage        gatewayV2RecoveryTopology = "exact_transfer_intent_v1_stopped_stopped_stage_final_absent"
 	gatewayV2RecoveryTransferIntentNoContainers          gatewayV2RecoveryTopology = "exact_transfer_intent_v1_stopped_stage_and_final_absent"
@@ -39,8 +41,35 @@ func (m *Manager) observeGatewayV2RecoveryTopology(ctx context.Context, source r
 	return classifyGatewayV2RecoveryTopology(source, state, journal, observation)
 }
 
+// This proof authorizes compensation only. A stopped stage may have no config
+// when the process dies after binding its Docker ID and before copying the
+// config. Skipping that one file read must never authorize container start.
+func (m *Manager) observeGatewayV2StoppedStageForCompensation(ctx context.Context, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal) bool {
+	if m == nil || ctx == nil || journal.Phase != gatewayPhaseStageIntent || !validGatewayTopologyInputs(source, state, journal) {
+		return false
+	}
+	observation, err := m.inspectGatewayV2DockerWithStageConfig(ctx, source, state, journal, false)
+	if err != nil {
+		clearGatewayV2DockerObservation(&observation)
+		return false
+	}
+	defer clearGatewayV2DockerObservation(&observation)
+	return classifyGatewayV2StoppedStageForCompensation(source, state, journal, observation)
+}
+
+func classifyGatewayV2StoppedStageForCompensation(source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) bool {
+	return journal.Phase == gatewayPhaseStageIntent && validGatewayTopologyInputs(source, state, journal) &&
+		validGatewayPinnedImage(observation.Image, observation.ImageFound) &&
+		gatewayV2ObservedResourcesMatchJournal(journal, observation) &&
+		validGatewayV1Base(source, journal, observation, true) && observation.V1Container.Running && !observation.V1Container.Restarting &&
+		observation.V1Stable && observation.V1ResourcesStable && observation.V1EndpointIdentityProven &&
+		observation.V2ResourcesStable && observation.StageStable && observation.FinalStable && observation.OwnedInventoriesStable &&
+		validGatewayV2StoppedStageInfrastructure(state, journal, observation) && len(observation.StageConfig) == 0 &&
+		len(observation.ApplicationNetworks) == 0 && len(observation.ApplicationNetworkIDs) == 0
+}
+
 func classifyGatewayV2RecoveryTopology(source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) gatewayV2RecoveryTopology {
-	if (journal.Phase != gatewayPhaseStageIntent && journal.Phase != gatewayPhaseTransferIntent) ||
+	if (journal.Phase != gatewayPhaseStageIntent && journal.Phase != gatewayPhaseTransferIntent && journal.Phase != gatewayPhaseRollbackIntent) ||
 		!validGatewayTopologyInputs(source, state, journal) ||
 		!validGatewayPinnedImage(observation.Image, observation.ImageFound) ||
 		!gatewayV2ObservedResourcesMatchJournal(journal, observation) ||
@@ -64,9 +93,15 @@ func classifyGatewayV2RecoveryTopology(source routeState, state gatewayV2RouteSt
 		if validGatewayV2StoppedStage(state, journal, observation) {
 			return gatewayV2RecoveryStageIntentStoppedStage
 		}
-	case gatewayPhaseTransferIntent:
+	case gatewayPhaseTransferIntent, gatewayPhaseRollbackIntent:
 		if v1Serving && validGatewayV2StoppedStage(state, journal, observation) {
 			return gatewayV2RecoveryTransferIntentV1ServingStoppedStage
+		}
+		if v1Serving && validGatewayV2TransferInfrastructureNoContainers(state, journal, observation) {
+			return gatewayV2RecoveryTransferIntentV1ServingNoContainers
+		}
+		if v1Serving && validGatewayV2StoppedFinalForTransfer(state, journal, observation) {
+			return gatewayV2RecoveryTransferIntentV1ServingStoppedFinal
 		}
 		if !v1Stopped {
 			return gatewayV2RecoveryUnknown
@@ -127,15 +162,19 @@ func validGatewayV2PartialInfrastructure(state gatewayV2RouteState, journal gate
 
 func validGatewayV2StoppedStage(state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) bool {
 	expected, err := buildGatewayV2StageConfig(state)
-	return err == nil && journal.Resources.FinalContainerID == "" && !observation.FinalContainerFound &&
+	return err == nil && validGatewayV2StoppedStageInfrastructure(state, journal, observation) &&
+		len(observation.StageConfig) == 0 && sameCaddyConfig(expected, observation.StageRestartConfig) &&
+		len(observation.ApplicationNetworks) == 0 && len(observation.ApplicationNetworkIDs) == 0
+}
+
+func validGatewayV2StoppedStageInfrastructure(state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) bool {
+	return journal.Resources.StageContainerID != "" && journal.Resources.FinalContainerID == "" && !observation.FinalContainerFound &&
 		validOwnedNameSet(observation.OwnedContainers, state.Identity.StageContainer) &&
 		validOwnedNameSet(observation.OwnedVolumes, state.Identity.ConfigVolume, state.Identity.DataVolume) &&
 		validOwnedNameSet(observation.OwnedNetworks, state.Identity.IngressNetwork) &&
 		validGatewayV2Volumes(state, journal, observation) &&
 		validGatewayV2StoppedContainer(state, journal, observation.StageContainer, observation.StageRuntime, observation.StageContainerFound, gatewayV2StageContainerRole, observation.Image.ID) &&
-		validGatewayV2StoppedIngressNetwork(state, journal, observation.IngressNetwork, observation.IngressNetworkID, observation.IngressFound, observation.StageRuntime) &&
-		len(observation.StageConfig) == 0 && sameCaddyConfig(expected, observation.StageRestartConfig) &&
-		len(observation.ApplicationNetworks) == 0 && len(observation.ApplicationNetworkIDs) == 0
+		validGatewayV2StoppedIngressNetwork(state, journal, observation.IngressNetwork, observation.IngressNetworkID, observation.IngressFound, observation.StageRuntime)
 }
 
 func validGatewayV2RunningStageForTransfer(state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) bool {

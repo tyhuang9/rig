@@ -41,6 +41,30 @@ func TestBuildCaddyConfigV2HostProbeIsBoundToApprovedHost(t *testing.T) {
 	}
 }
 
+func TestBuildCaddyConfigV2AddsStateBoundLocalAppProbesBeforeProxyRoutes(t *testing.T) {
+	appID := "11111111-1111-4111-8111-111111111111"
+	token := strings.Repeat("a", 64)
+	routes := map[string]routeRecord{appID: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		endpoint("web", "server", "net-a", "web-blue", 3000, 'a'),
+	}}}
+	body, err := buildCaddyConfigV2(routes, "10.203.0.2:8080", caddyV2Profile{
+		SelectedIPv4: "192.168.50.20", PortStart: 8100, PortEnd: 8100, ProbeToken: token,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config caddyConfig
+	if err := json.Unmarshal(body, &config); err != nil {
+		t.Fatal(err)
+	}
+	local := config.Apps.HTTP.Servers["generated"]
+	challenge := gatewayV2AppChallenge(token, appID)
+	if len(local.Routes) != 2 || !reflect.DeepEqual(local.Routes[0], gatewayV2ProbeRoute(appID+".rig.localhost", challenge)) ||
+		local.Routes[1].Handle[0].Handler != "reverse_proxy" {
+		t.Fatalf("local app challenge ordering = %#v", local.Routes)
+	}
+}
+
 func TestBuildCaddyConfigV2KeepsLocalRoutesAndIsolatesLANPorts(t *testing.T) {
 	appA := "11111111-1111-4111-8111-111111111111"
 	appB := "22222222-2222-4222-8222-222222222222"
