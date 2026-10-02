@@ -585,6 +585,7 @@ const (
 	liveGatewayV2TraceStageAttestStopped             liveGatewayV2TraceStep = "stage_attest_stopped"
 	liveGatewayV2TraceStageAttestStoppedCompensation liveGatewayV2TraceStep = "stage_attest_stopped_compensation"
 	liveGatewayV2TraceStageStart                     liveGatewayV2TraceStep = "stage_start"
+	liveGatewayV2TraceStageStartDetail               liveGatewayV2TraceStep = "stage_start_detail"
 	liveGatewayV2TraceStageStop                      liveGatewayV2TraceStep = "stage_stop"
 	liveGatewayV2TraceStageRemove                    liveGatewayV2TraceStep = "stage_remove"
 	liveGatewayV2TraceTransferObserveTopology        liveGatewayV2TraceStep = "transfer_observe_topology"
@@ -665,6 +666,21 @@ const (
 	liveGatewayV2TraceCreateNetworksIPv4Mismatch      liveGatewayV2TraceOutcome = "stopped_networks_requested_ipv4_mismatch"
 	liveGatewayV2TraceCreateNetworksIPAMIPv6Present   liveGatewayV2TraceOutcome = "stopped_networks_ipam_ipv6_present"
 	liveGatewayV2TraceCreateNetworksUnexpectedIPAM    liveGatewayV2TraceOutcome = "stopped_networks_unexpected_application_ipam"
+	liveGatewayV2TraceStartCommandSucceeded           liveGatewayV2TraceOutcome = "start_command_succeeded"
+	liveGatewayV2TraceStartValidationRejected         liveGatewayV2TraceOutcome = "start_validation_rejected"
+	liveGatewayV2TraceStartRunnerUnavailable          liveGatewayV2TraceOutcome = "start_runner_unavailable"
+	liveGatewayV2TraceStartUnexpectedCommand          liveGatewayV2TraceOutcome = "start_unexpected_command"
+	liveGatewayV2TraceStartOutputTruncated            liveGatewayV2TraceOutcome = "start_output_truncated"
+	liveGatewayV2TraceStartCancelled                  liveGatewayV2TraceOutcome = "start_cancelled_or_timed_out"
+	liveGatewayV2TraceStartTerminationFailed          liveGatewayV2TraceOutcome = "start_termination_failed"
+	liveGatewayV2TraceStartHostPortConflict           liveGatewayV2TraceOutcome = "start_host_port_conflict"
+	liveGatewayV2TraceStartSelectedAddressUnavailable liveGatewayV2TraceOutcome = "start_selected_address_unavailable"
+	liveGatewayV2TraceStartNetworkUnavailable         liveGatewayV2TraceOutcome = "start_network_unavailable"
+	liveGatewayV2TraceStartContainerMissing           liveGatewayV2TraceOutcome = "start_container_missing"
+	liveGatewayV2TraceStartPermissionDenied           liveGatewayV2TraceOutcome = "start_permission_denied"
+	liveGatewayV2TraceStartRuntimeCreateFailed        liveGatewayV2TraceOutcome = "start_runtime_create_failed"
+	liveGatewayV2TraceStartExternalConnectivityFailed liveGatewayV2TraceOutcome = "start_external_connectivity_failed"
+	liveGatewayV2TraceStartCommandFailedOther         liveGatewayV2TraceOutcome = "start_command_failed_other"
 )
 
 type liveGatewayV2TraceEvent struct {
@@ -1116,9 +1132,85 @@ func (d liveGatewayV2TracingUpgradeDriver) attestStoppedStageForCompensation(ctx
 func (d liveGatewayV2TracingUpgradeDriver) startStage(ctx context.Context, state gatewayV2RouteState,
 	journal gatewayMigrationJournal,
 ) error {
-	err := d.gatewayV2UpgradeDriver.startStage(ctx, state, journal)
+	if d.manager == nil || d.manager.runner == nil {
+		d.trace.recordAt(liveGatewayV2TraceStageStartDetail, journal.Phase, liveGatewayV2TraceStartRunnerUnavailable)
+		err := d.gatewayV2UpgradeDriver.startStage(ctx, state, journal)
+		d.trace.recordAt(liveGatewayV2TraceStageStart, journal.Phase, liveGatewayV2ErrorOutcome(err))
+		return err
+	}
+	capture := &liveGatewayV2StartCaptureRunner{inner: d.manager.runner}
+	d.manager.runner = capture
+	var err error
+	func() {
+		defer func() { d.manager.runner = capture.inner }()
+		err = d.gatewayV2UpgradeDriver.startStage(ctx, state, journal)
+	}()
+	outcome := capture.outcome
+	if !capture.called {
+		if !validGatewayV2RouteState(state) || journal.Phase != gatewayPhaseStageIntent || !validSHA256(journal.Resources.StageContainerID) {
+			outcome = liveGatewayV2TraceStartValidationRejected
+		} else {
+			outcome = liveGatewayV2TraceStartCommandFailedOther
+		}
+	}
+	d.trace.recordAt(liveGatewayV2TraceStageStartDetail, journal.Phase, outcome)
 	d.trace.recordAt(liveGatewayV2TraceStageStart, journal.Phase, liveGatewayV2ErrorOutcome(err))
 	return err
+}
+
+type liveGatewayV2StartCaptureRunner struct {
+	inner   runtimeprocess.CommandRunner
+	called  bool
+	outcome liveGatewayV2TraceOutcome
+}
+
+func (r *liveGatewayV2StartCaptureRunner) Run(ctx context.Context,
+	request runtimeprocess.CommandRequest,
+) (runtimeprocess.CommandResult, error) {
+	result, err := r.inner.Run(ctx, request)
+	r.called = true
+	if len(request.Args) != 3 || request.Args[0] != "container" || request.Args[1] != "start" {
+		r.outcome = liveGatewayV2TraceStartUnexpectedCommand
+	} else {
+		r.outcome = liveGatewayV2StartCommandOutcome(result, err)
+	}
+	return result, err
+}
+
+func liveGatewayV2StartCommandOutcome(result runtimeprocess.CommandResult, err error) liveGatewayV2TraceOutcome {
+	if result.StdoutTruncated || result.StderrTruncated {
+		return liveGatewayV2TraceStartOutputTruncated
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return liveGatewayV2TraceStartCancelled
+	}
+	if errors.Is(err, runtimeprocess.ErrTerminationFailed) {
+		return liveGatewayV2TraceStartTerminationFailed
+	}
+	if err == nil {
+		return liveGatewayV2TraceStartCommandSucceeded
+	}
+	message := strings.ToLower(string(result.Stdout) + "\n" + string(result.Stderr))
+	switch {
+	case strings.Contains(message, "port is already allocated"), strings.Contains(message, "address already in use"):
+		return liveGatewayV2TraceStartHostPortConflict
+	case strings.Contains(message, "cannot assign requested address"), strings.Contains(message, "requested address is not valid in its context"):
+		return liveGatewayV2TraceStartSelectedAddressUnavailable
+	case strings.Contains(message, "no such network"),
+		strings.Contains(message, "network") && strings.Contains(message, "not found"):
+		return liveGatewayV2TraceStartNetworkUnavailable
+	case strings.Contains(message, "no such container"):
+		return liveGatewayV2TraceStartContainerMissing
+	case strings.Contains(message, "permission denied"), strings.Contains(message, "access is denied"):
+		return liveGatewayV2TraceStartPermissionDenied
+	case strings.Contains(message, "oci runtime"), strings.Contains(message, "failed to create task"),
+		strings.Contains(message, "failed to start shim"), strings.Contains(message, "container init"):
+		return liveGatewayV2TraceStartRuntimeCreateFailed
+	case strings.Contains(message, "failed programming external connectivity"), strings.Contains(message, "failed to create endpoint"):
+		return liveGatewayV2TraceStartExternalConnectivityFailed
+	default:
+		return liveGatewayV2TraceStartCommandFailedOther
+	}
 }
 
 func (d liveGatewayV2TracingUpgradeDriver) stopStage(ctx context.Context, state gatewayV2RouteState,
@@ -1347,6 +1439,52 @@ func TestGatewayV2OperationTraceClosesAndBoundsValues(t *testing.T) {
 	}
 	if events[0].phase != liveGatewayV2TracePhaseUnknown || events[0].outcome != liveGatewayV2TraceTopologyUnknown {
 		t.Fatalf("trace did not map unknown values to closed enums: %+v", events[0])
+	}
+}
+
+func TestLiveGatewayV2StartCommandOutcomeClosesDaemonErrors(t *testing.T) {
+	commandError := errors.New("command failed")
+	tests := []struct {
+		name   string
+		result runtimeprocess.CommandResult
+		err    error
+		want   liveGatewayV2TraceOutcome
+	}{
+		{name: "success", want: liveGatewayV2TraceStartCommandSucceeded},
+		{name: "truncated", result: runtimeprocess.CommandResult{StderrTruncated: true}, want: liveGatewayV2TraceStartOutputTruncated},
+		{name: "cancelled", err: context.Canceled, want: liveGatewayV2TraceStartCancelled},
+		{name: "termination failed", err: runtimeprocess.ErrTerminationFailed, want: liveGatewayV2TraceStartTerminationFailed},
+		{name: "host port conflict", result: runtimeprocess.CommandResult{Stderr: []byte("port is already allocated")}, err: commandError, want: liveGatewayV2TraceStartHostPortConflict},
+		{name: "selected address unavailable", result: runtimeprocess.CommandResult{Stderr: []byte("cannot assign requested address")}, err: commandError, want: liveGatewayV2TraceStartSelectedAddressUnavailable},
+		{name: "network unavailable", result: runtimeprocess.CommandResult{Stderr: []byte("no such network")}, err: commandError, want: liveGatewayV2TraceStartNetworkUnavailable},
+		{name: "container missing", result: runtimeprocess.CommandResult{Stderr: []byte("no such container")}, err: commandError, want: liveGatewayV2TraceStartContainerMissing},
+		{name: "permission denied", result: runtimeprocess.CommandResult{Stderr: []byte("permission denied")}, err: commandError, want: liveGatewayV2TraceStartPermissionDenied},
+		{name: "runtime create failed", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed")}, err: commandError, want: liveGatewayV2TraceStartRuntimeCreateFailed},
+		{name: "external connectivity", result: runtimeprocess.CommandResult{Stderr: []byte("failed programming external connectivity")}, err: commandError, want: liveGatewayV2TraceStartExternalConnectivityFailed},
+		{name: "other does not escape", result: runtimeprocess.CommandResult{Stderr: []byte("sensitive unexpected daemon output")}, err: commandError, want: liveGatewayV2TraceStartCommandFailedOther},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := liveGatewayV2StartCommandOutcome(test.result, test.err); got != test.want {
+				t.Fatalf("outcome = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLiveGatewayV2CleanupAuthorizesOnlyTerminalCertainPhases(t *testing.T) {
+	for _, phase := range []gatewayMigrationPhase{gatewayPhaseCommitted, gatewayPhaseRolledBack} {
+		if !liveGatewayV2CleanupAuthorizedPhase(phase) {
+			t.Fatalf("terminal certain phase %q was rejected", phase)
+		}
+	}
+	for _, phase := range []gatewayMigrationPhase{
+		gatewayPhasePrepared, gatewayPhaseStageIntent, gatewayPhaseStaged, gatewayPhaseTransferIntent,
+		gatewayPhaseV2Serving, gatewayPhaseRollbackIntent, gatewayPhaseUncertain,
+	} {
+		if liveGatewayV2CleanupAuthorizedPhase(phase) {
+			t.Fatalf("nonterminal or uncertain phase %q was authorized", phase)
+		}
 	}
 }
 
@@ -1620,7 +1758,7 @@ func liveGatewayV2Cleanup(t *testing.T, fixture *liveGatewayV2Fixture) {
 	if storeErr == nil {
 		state, journal, storeErr = store.loadBoundUpgrade(fixture.spec.operationID)
 	}
-	cleanupAuthorized := storeErr == nil && journal.Phase == gatewayPhaseCommitted
+	cleanupAuthorized := storeErr == nil && liveGatewayV2CleanupAuthorizedPhase(journal.Phase)
 	for _, resource := range []struct{ name, role string }{
 		{gatewayV2StageContainerBase + fixture.spec.operationID, gatewayV2StageContainerRole},
 		{gatewayV2ContainerName, gatewayV2FinalContainerRole},
@@ -1702,6 +1840,10 @@ func liveGatewayV2Cleanup(t *testing.T, fixture *liveGatewayV2Fixture) {
 			t.Errorf("remove exact gateway-v2 cleanup volume %s", resource.name)
 		}
 	}
+}
+
+func liveGatewayV2CleanupAuthorizedPhase(phase gatewayMigrationPhase) bool {
+	return phase == gatewayPhaseCommitted || phase == gatewayPhaseRolledBack
 }
 
 func liveGatewayV2RemoveConflictContainer(t *testing.T, fixture *liveGatewayV2Fixture, expectedID string) {
