@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "./api";
 import { ApplicationDetailPage } from "./dashboard";
@@ -25,10 +25,15 @@ const verifiedRoute = {
   observedAt: new Date().toISOString(),
 };
 
-function renderDetail() {
+function DetailNavigator({ role }: { role: string }) {
+  const navigate = useNavigate();
+  return <><button type="button" onClick={() => navigate("/apps/app-2")}>Open application B</button><ApplicationDetailPage role={role} userId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"/></>;
+}
+
+function renderDetail({ role, navigable = false }: { role?: string; navigable?: boolean } = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/apps/app-1"]}>
-    <Routes><Route path="/apps/:id" element={<ApplicationDetailPage/>}/></Routes>
+    <Routes><Route path="/apps/:id" element={navigable ? <DetailNavigator role={role ?? "viewer"}/> : <ApplicationDetailPage role={role} userId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"/>} /></Routes>
   </MemoryRouter></QueryClientProvider>);
   return { client, view };
 }
@@ -117,5 +122,43 @@ describe("application controller-host route", () => {
     await act(async () => changedRoute.resolve({ ...verifiedRoute, deploymentId: "another-deployment" } as never));
     await waitFor(() => expect(screen.getByText(/no verified local route matches a successful deployment/i)).toBeTruthy());
     expect(link.hasAttribute("href")).toBe(false);
+  });
+
+  it("does not carry an app A reservation review into app B", async () => {
+    const gatewayProfile = {
+      expectedRevisionNumber: 1,
+      candidates: [],
+      desiredProfile: { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", revisionNumber: 1, spec: { interfaceId: "nic-1", selectedIpv4: "192.168.50.4", portStart: 8100, portEnd: 8119 } },
+    };
+    vi.spyOn(api, "app").mockImplementation(async (appId) => ({ id: appId, name: appId === "app-1" ? "Application A" : "Application B", slug: appId, status: "ready", source: { type: "github" } }) as never);
+    let pendingReservation: Record<string, unknown> | undefined;
+    vi.spyOn(api, "lanAccess").mockImplementation(async (appId) => ({
+      expectedRevisionNumber: 0,
+      availability: "local_only",
+      pendingReservation: appId === "app-1" ? pendingReservation : undefined,
+    }) as never);
+    vi.spyOn(api, "lanGatewayProfile").mockResolvedValue(gatewayProfile as never);
+    vi.spyOn(api, "reserveLANAccess").mockImplementation(async (appId, request) => {
+      const result = {
+        created: true,
+        approvalDigest: "a".repeat(64),
+        allocation: { id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", appId, port: 8100, ownerOperationId: request.operationId, gatewayProfileRevisionId: gatewayProfile.desiredProfile.id, gatewayProfileRevisionNumber: 1, state: "reserved" },
+      };
+      pendingReservation = { allocation: result.allocation, approvalDigest: result.approvalDigest, expectedRevisionNumber: 0 };
+      return result as never;
+    });
+
+    renderDetail({ role: "administrator", navigable: true });
+    fireEvent.click(await screen.findByRole("button", { name: "Reserve LAN port for review" }));
+    await screen.findByRole("dialog", { name: "Review LAN application access" });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByText("Reserved port awaiting approval")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open application B" }));
+
+    expect(await screen.findByRole("heading", { name: "Application B" })).not.toBeNull();
+    expect(await screen.findByText("Local only")).not.toBeNull();
+    expect(screen.queryByText("Reserved port awaiting approval")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review reserved port" })).toBeNull();
   });
 });

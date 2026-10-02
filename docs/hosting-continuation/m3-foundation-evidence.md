@@ -905,7 +905,35 @@ gates. A batch holds at most 64 items across the 20-port LAN pool. Five
 whole-batch proofs still share one three-minute disable-finalization context;
 a slow healthy host could time out after a database commit and require replay.
 The bulk change removes the terminal quadratic path, but live 20-port timing
-must be measured before claiming production readiness. The separate operator
-UI branch at `504e7e8` has no durable reservation/grant identity after refresh
-and no safe disable review API yet.
+must be measured before claiming production readiness. At this recovery
+checkpoint, the separate operator UI branch at `504e7e8` has no durable
+reservation/grant identity after refresh and no safe disable review API yet.
 This recovery branch has not been published, merged, or deployed.
+
+## Operator refresh read contract: local evidence
+
+The separate local branch `feature/hosting-m3-operator-read-contract` extends
+the administrator-only, `no-store` LAN access read. One SQLite read snapshot
+returns the exact current head, pending reservation and its approval digest,
+current-owner grant claim, current-head disable claim, and a disable review
+digest only when no disable claim exists. A committed disable remains readable
+after release, including while a new reservation is pending on the released
+head. The retained disable claim read now includes its original approval
+digest so an interrupted operation can be resumed by its exact ID. This read
+does not change gateway state or report a URL from durable state. The existing
+fresh gateway, grant, allocation, and deployment proof still controls URL
+publication; a pending disable suppresses attestation entirely.
+
+| Local check | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with task-local `GOCACHE` and full Windows workspace permissions | Passed across all Go packages on the operator read branch. A restricted-sandbox run failed an unrelated controller `invalid_workspace` fixture; the full-permission rerun passed. |
+| `go test -count=1 -p 1 ./internal/controller -run 'TestLANAppAccess|TestLANAppGrant|TestLANAppDisable'` | Passed, including the refresh read HTTP tests. |
+| `go test -count=1 -p 1 ./internal/controller -run TestLANDisableReleasesOnlyAfterProofAndReplayRetainsHistory` | Passed, including committed disable plus successor reservation HTTP response fields and URL withholding. |
+| `go test -count=5 -run 'TestReadAppAccessOperatorSnapshot' ./internal/appaccess` | Passed. Covers current reservation, grant, pending and committed disable, released head/new reservation, corrupt or ambiguous rows, and a concurrent writer against one read snapshot. |
+| `go vet ./...`, `go run ./cmd/openapi-gen -check`, `git diff --check` | Passed. |
+| `pnpm --dir web typecheck` | Not run to completion in this fresh worktree: package installation tried to fetch locked packages from a registry blocked by this environment. The generated TypeScript contract has not yet been typechecked here. |
+
+This contract still needs integration with the separate UI branch, a browser
+refresh journey, and live Docker/LAN acceptance. The recovery-only controller
+still needs a safe pinned-head discovery read. None of these local checks
+prove external database connectivity or second-device reachability.

@@ -23,6 +23,8 @@ import { AutoDeployPanel } from "./auto-deploy";
 import { useLocalRouteExpiry } from "./use-local-route-expiry";
 import { DeploymentHistoryPanel, deploymentPlanOrLegacy } from "./deployment-history";
 import { UnsavedChangesGuard, useConfirmDiscard } from "./unsaved-changes";
+import { LANGatewayPanel } from "./lan-gateway";
+import { LANApplicationAccessPanel } from "./lan-application-access";
 
 type RelayPanelProps = { role: string };
 type RelayPanelLoader = () => Promise<{ default: ComponentType<RelayPanelProps> }>;
@@ -146,6 +148,7 @@ function Login({ setup, onAuthenticated }: { setup: boolean; onAuthenticated: (u
       const response = bootstrapMode
         ? await api.bootstrap(values)
         : await api.login({ username: values.username, passphrase: values.passphrase });
+      clearCSRF();
       setCSRF(response.csrfToken);
       onAuthenticated(response.user);
     } catch (error) {
@@ -227,7 +230,7 @@ function ApplicationSetupPage() {
   return <><PageHeader title={`Set up ${appQuery.data.name}`} subtitle="Configure and deploy the saved application." action={<NavLink className="button" to={`/apps/${id}`}>Open application</NavLink>}/><ApplicationDeploymentSetup app={appQuery.data}/></>;
 }
 
-export function ApplicationDetailPage() {
+export function ApplicationDetailPage({ role = "viewer", userId = "" }: { role?: string; userId?: string }) {
   const { id = "" } = useParams();
   const appQuery = useQuery({ queryKey: ["app", id], queryFn: () => api.app(id) });
   const statusQuery = useQuery({ queryKey: ["system-status"], queryFn: api.status });
@@ -286,6 +289,7 @@ export function ApplicationDetailPage() {
         onKeyDown={(event) => { if (!servingURL && (event.key === "Enter" || event.key === " ")) event.preventDefault(); }}>Open verified local site</a>
       <button className="button small" type="button" aria-disabled={checkingRoute} onClick={() => void checkLocalRoute()}>Check route again</button>
     </section>}
+    <LANApplicationAccessPanel key={`${id}:${userId}`} appId={id} role={role} userId={userId} enabled={routeEnabled}/>
     {fakeRuntime ? <div className="callout warning"><strong>Development capability</strong><span>The fake runtime persists job progress but executes no workload.</span></div> : !composeRuntime && !generatedRuntime && <div className="callout info"><strong>Runtime actions unavailable</strong><span>Configure a runtime to deploy this application.</span></div>}
     <ApplicationPlanPanel app={app}/>
     <AutoDeployPanel appId={id} composeRuntime={composeRuntime} generatedRuntime={generatedRuntime} githubConnections={statusQuery.data.capabilities.githubConnections}/>
@@ -297,7 +301,7 @@ export function ApplicationDetailPage() {
 export function MachinesPage({ role, relayPanelLoader = defaultRelayPanelLoader }: { role: string; relayPanelLoader?: RelayPanelLoader }) {
   const query = useQuery({ queryKey: ["machines"], queryFn: api.machines });
   const items = query.data?.items ?? [];
-  return <><PageHeader title="Machines" subtitle="Hosts registered with this local controller."/>{query.isLoading ? <LoadingState/> : query.isError ? <QueryError message={query.error.message}/> : <div className="machine-list">{items.map((machine) => <article className="machine" key={machine.id}><div><h2>{machine.name}</h2><p>{machine.os} · {machine.architecture} · {machine.hostname}</p></div><StatusText value={machine.status}/><div className="machine-meta">Local controller · independent runtime diagnostics</div></article>)}</div>}<RelayPanelSlot role={role} loader={relayPanelLoader}/></>;
+  return <><PageHeader title="Machines" subtitle="Hosts registered with this local controller."/>{query.isLoading ? <LoadingState/> : query.isError ? <QueryError message={query.error.message}/> : <div className="machine-list">{items.map((machine) => <article className="machine" key={machine.id}><div><h2>{machine.name}</h2><p>{machine.os} · {machine.architecture} · {machine.hostname}</p></div><StatusText value={machine.status}/><div className="machine-meta">Local controller · independent runtime diagnostics</div></article>)}</div>}<LANGatewayPanel role={role}/><RelayPanelSlot role={role} loader={relayPanelLoader}/></>;
 }
 
 function ActivityPage() {
@@ -360,5 +364,5 @@ export function App() {
   if (bootstrapRequired === null) return <main className="auth"><LoadingState/></main>;
   if (!user) return <Login setup={bootstrapRequired} onAuthenticated={(nextUser) => { setUser(nextUser); setBootstrapRequired(false); navigate("/apps"); }}/>;
   const logout = async () => { try { await api.logout(); } finally { clearCSRF(); queryClient.clear(); setUser(null); navigate("/login"); } };
-  return <UnsavedChangesGuard><Layout user={user} onLogout={logout}><Routes><Route path="/" element={<ApplicationsPage/>}/><Route path="/apps" element={<ApplicationsPage/>}/><Route path="/apps/new" element={<AddApplicationPage/>}/><Route path="/apps/:id/setup" element={<ApplicationSetupPage/>}/><Route path="/apps/:id" element={<ApplicationDetailPage/>}/><Route path="/connections" element={<ConnectionsPage/>}/><Route path="/machines" element={<MachinesPage role={user.role}/>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="*" element={<ApplicationsPage/>}/></Routes></Layout></UnsavedChangesGuard>;
+  return <UnsavedChangesGuard><Layout user={user} onLogout={logout}><Routes><Route path="/" element={<ApplicationsPage/>}/><Route path="/apps" element={<ApplicationsPage/>}/><Route path="/apps/new" element={<AddApplicationPage/>}/><Route path="/apps/:id/setup" element={<ApplicationSetupPage/>}/><Route path="/apps/:id" element={<ApplicationDetailPage role={user.role} userId={user.id}/>}/><Route path="/connections" element={<ConnectionsPage/>}/><Route path="/machines" element={<MachinesPage role={user.role}/>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="*" element={<ApplicationsPage/>}/></Routes></Layout></UnsavedChangesGuard>;
 }

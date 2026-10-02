@@ -416,6 +416,21 @@ func TestLANDisableReleasesOnlyAfterProofAndReplayRetainsHistory(t *testing.T) {
 	if err := json.Unmarshal(newReservation.Body.Bytes(), &reservation); err != nil {
 		t.Fatal(err)
 	}
+	resume := relayAuthenticatedRequest(handler, http.MethodGet, "/api/v1/apps/"+f.appID+"/lan-access", "")
+	var resumed lanAccessRead
+	if err := json.Unmarshal(resume.Body.Bytes(), &resumed); err != nil {
+		t.Fatal(err)
+	}
+	if resume.Code != http.StatusOK || resume.Header().Get("Cache-Control") != "no-store" ||
+		resumed.ExpectedRevisionNumber != 1 || resumed.DesiredAccess != nil ||
+		resumed.DisableClaim == nil || resumed.DisableClaim.OperationID != operationID ||
+		resumed.DisableClaim.State != appaccess.AppAccessDisableCommitted ||
+		resumed.DisableClaim.ApprovalDigest != mutation.Claim.ApprovalDigest || resumed.DisableReview != nil ||
+		resumed.PendingReservation == nil || resumed.PendingReservation.Allocation.ID != reservation.Allocation.ID ||
+		resumed.PendingReservation.ApprovalDigest != reservation.ApprovalDigest ||
+		resumed.Availability != "local_only" || strings.Contains(strings.ToLower(resume.Body.String()), "url") {
+		t.Fatalf("successor reservation resume=%d %#v body=%s", resume.Code, resumed, resume.Body.String())
+	}
 	newApproval := relayAuthenticatedRequest(handler, http.MethodPost,
 		"/api/v1/apps/"+f.appID+"/lan-access/approval",
 		f.approvalBody(newOperation, reservation.Allocation.ID, 1, reservation.ApprovalDigest))

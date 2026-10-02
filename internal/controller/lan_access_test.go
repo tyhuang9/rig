@@ -312,6 +312,18 @@ func TestLANAppAccessReserveReviewApproveAndStatusWithholdURL(t *testing.T) {
 	if strings.Contains(strings.ToLower(reserved.Body.String()), "url") {
 		t.Fatalf("reservation exposed URL: %s", reserved.Body.String())
 	}
+	resume := relayAuthenticatedRequest(f.handler, http.MethodGet, path, "")
+	var reservedRead lanAccessRead
+	if err := json.Unmarshal(resume.Body.Bytes(), &reservedRead); err != nil {
+		t.Fatal(err)
+	}
+	if resume.Code != http.StatusOK || resume.Header().Get("Cache-Control") != "no-store" ||
+		reservedRead.PendingReservation == nil || reservedRead.PendingReservation.Allocation.ID != reservation.Allocation.ID ||
+		reservedRead.PendingReservation.ExpectedRevisionNumber != 0 || reservedRead.PendingReservation.ApprovalDigest != wantDigest ||
+		reservedRead.GrantClaim != nil || reservedRead.DisableClaim != nil || reservedRead.DisableReview != nil ||
+		reservedRead.Availability != "local_only" || strings.Contains(strings.ToLower(resume.Body.String()), "url") {
+		t.Fatalf("reservation resume=%d %#v body=%s", resume.Code, reservedRead, resume.Body.String())
+	}
 	replayed := relayAuthenticatedRequest(f.handler, http.MethodPost, path+"/reservations", f.reserveBody(operationID, 0))
 	var replay lanReservationMutation
 	if err := json.Unmarshal(replayed.Body.Bytes(), &replay); err != nil {
@@ -340,8 +352,19 @@ func TestLANAppAccessReserveReviewApproveAndStatusWithholdURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	if status.Code != http.StatusOK || read.ExpectedRevisionNumber != 1 || read.DesiredAccess == nil || read.Availability != "unverified" ||
+		read.PendingReservation != nil || read.DisableReview == nil || read.DisableReview.ApprovalDigest == "" ||
+		read.DisableReview.AccessRevisionID != approval.Revision.ID || read.DisableReview.AllocationID != reservation.Allocation.ID ||
+		read.DisableReview.Port != reservation.Allocation.Port ||
 		strings.Contains(strings.ToLower(status.Body.String()), "url") {
 		t.Fatalf("status=%d %#v body=%s", status.Code, read, status.Body.String())
+	}
+	current, err := f.repository.CurrentAppAccess(context.Background(), f.appID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDisableDigest, err := appaccess.AppAccessDisableSpecDigest(appaccess.AppAccessDisableSpecFor(current))
+	if err != nil || read.DisableReview.ApprovalDigest != wantDisableDigest {
+		t.Fatalf("disable review digest=%q want=%q err=%v", read.DisableReview.ApprovalDigest, wantDisableDigest, err)
 	}
 	approvedReplay := relayAuthenticatedRequest(f.handler, http.MethodPost, path+"/approval", f.approvalBody(operationID, reservation.Allocation.ID, 0, wantDigest))
 	if approvedReplay.Code != http.StatusOK || !strings.Contains(approvedReplay.Body.String(), `"created":false`) {
@@ -391,6 +414,37 @@ func TestLANAppAccessRejectsUnauthorizedMalformedAndStaleActions(t *testing.T) {
 	status := relayAuthenticatedRequest(f.handler, http.MethodGet, path, "")
 	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"availability":"local_only"`) {
 		t.Fatalf("rejected actions changed approved head: %d %s", status.Code, status.Body.String())
+	}
+}
+
+func TestLANAppAccessReadResumesExactDisableClaimWithoutURL(t *testing.T) {
+	f := newLANAccessFixture(t)
+	revision := f.approveForGrant(t)
+	digest, err := appaccess.AppAccessDisableSpecDigest(appaccess.AppAccessDisableSpecFor(revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationID := uuid.NewString()
+	claim, created, err := f.repository.ClaimAppAccessDisable(context.Background(), appaccess.ApproveAppAccessDisableInput{
+		OperationID: operationID, ExpectedRevisionNumber: revision.RevisionNumber,
+		Owner: appaccess.AllocationOwner{AllocationID: revision.Allocation.ID, AppID: f.appID,
+			OperationID: revision.OperationID, AccessRevisionID: revision.ID},
+		Approval: appaccess.Approval{Action: appaccess.ActionDisableAppAccess, SpecDigest: digest, ActorID: f.actorID},
+	})
+	if err != nil || !created {
+		t.Fatalf("disable claim=%#v created=%t err=%v", claim, created, err)
+	}
+	response := relayAuthenticatedRequest(f.handler, http.MethodGet, "/api/v1/apps/"+f.appID+"/lan-access", "")
+	var read lanAccessRead
+	if err := json.Unmarshal(response.Body.Bytes(), &read); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" ||
+		read.DisableClaim == nil || read.DisableClaim.OperationID != operationID ||
+		read.DisableClaim.AllocationID != revision.Allocation.ID || read.DisableClaim.ApprovalDigest != digest ||
+		read.DisableReview != nil || read.Availability != "unverified" ||
+		strings.Contains(strings.ToLower(response.Body.String()), "url") {
+		t.Fatalf("disable resume=%d %#v body=%s", response.Code, read, response.Body.String())
 	}
 }
 
@@ -461,8 +515,13 @@ func TestLANAppGrantCommitReplayAndWithholdUnprovenURL(t *testing.T) {
 		t.Fatalf("replay=%d grants=%d %s", replay.Code, runtime.grants, replay.Body.String())
 	}
 	status := relayAuthenticatedRequest(handler, http.MethodGet, "/api/v1/apps/"+f.appID+"/lan-access", "")
+	var read lanAccessRead
+	if err := json.Unmarshal(status.Body.Bytes(), &read); err != nil {
+		t.Fatal(err)
+	}
 	if status.Code != http.StatusOK || strings.Contains(strings.ToLower(status.Body.String()), "url") ||
-		!strings.Contains(status.Body.String(), `"availability":"unverified"`) {
+		read.GrantClaim == nil || read.GrantClaim.AttemptID != attemptID ||
+		read.GrantClaim.State != appaccess.AppAccessGrantCommitted || read.Availability != "unverified" {
 		t.Fatalf("unproven URL status=%d %s", status.Code, status.Body.String())
 	}
 }

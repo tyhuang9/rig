@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "61b9f877d5932bfc745365e940ff15dcae1ae32a80f5cbce8f683e4bb309cb6c"
+const SourceSHA256 = "7cf151c90b2f5ac0c9274851de02d44c2420cc431b41c455a7883c1f0be992fc"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -658,17 +658,27 @@ type LANAppAccessApprovalMutation struct {
 }
 
 type LANAppAccessRead struct {
-	Availability           string                `json:"availability"`
-	DesiredAccess          *LANAppAccessRevision `json:"desiredAccess,omitempty"`
-	ExpectedRevisionNumber int64                 `json:"expectedRevisionNumber"`
-	ObservedAt             string                `json:"observedAt,omitempty"`
-	Url                    string                `json:"url,omitempty"`
+	Availability           string                         `json:"availability"`
+	DesiredAccess          *LANAppAccessRevision          `json:"desiredAccess,omitempty"`
+	DisableClaim           *LANAppDisableClaim            `json:"disableClaim,omitempty"`
+	DisableReview          *LANAppDisableReview           `json:"disableReview,omitempty"`
+	ExpectedRevisionNumber int64                          `json:"expectedRevisionNumber"`
+	GrantClaim             *LANAppGrantClaim              `json:"grantClaim,omitempty"`
+	ObservedAt             string                         `json:"observedAt,omitempty"`
+	PendingReservation     *LANAppAccessReservationReview `json:"pendingReservation,omitempty"`
+	Url                    string                         `json:"url,omitempty"`
 }
 
 type LANAppAccessReservationMutation struct {
 	Allocation     LANPortAllocation `json:"allocation"`
 	ApprovalDigest string            `json:"approvalDigest"`
 	Created        bool              `json:"created"`
+}
+
+type LANAppAccessReservationReview struct {
+	Allocation             LANPortAllocation `json:"allocation"`
+	ApprovalDigest         string            `json:"approvalDigest"`
+	ExpectedRevisionNumber int64             `json:"expectedRevisionNumber"`
 }
 
 type LANAppAccessRevision struct {
@@ -687,6 +697,7 @@ type LANAppDisableClaim struct {
 	AccessRevisionNumber int64  `json:"accessRevisionNumber"`
 	AllocationID         string `json:"allocationId"`
 	AppID                string `json:"appId"`
+	ApprovalDigest       string `json:"approvalDigest"`
 	OperationID          string `json:"operationId"`
 	Port                 int    `json:"port"`
 	ReleasedAt           string `json:"releasedAt,omitempty"`
@@ -707,6 +718,18 @@ type LANAppDisableObservation struct {
 type LANAppDisableRead struct {
 	Claim    LANAppDisableClaim       `json:"claim"`
 	Observed LANAppDisableObservation `json:"observed"`
+}
+
+type LANAppDisableReview struct {
+	AccessRevisionID             string `json:"accessRevisionId"`
+	AccessRevisionNumber         int64  `json:"accessRevisionNumber"`
+	AllocationID                 string `json:"allocationId"`
+	AppID                        string `json:"appId"`
+	ApprovalDigest               string `json:"approvalDigest"`
+	GatewayProfileRevisionID     string `json:"gatewayProfileRevisionId"`
+	GatewayProfileRevisionNumber int64  `json:"gatewayProfileRevisionNumber"`
+	OwnerOperationID             string `json:"ownerOperationId"`
+	Port                         int    `json:"port"`
 }
 
 type LANAppGrantClaim struct {
