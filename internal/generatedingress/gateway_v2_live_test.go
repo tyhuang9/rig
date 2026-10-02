@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -67,9 +68,11 @@ func TestLiveGatewayV2UpgradeCommitAndRestart(t *testing.T) {
 		imageTag:         "rig-generated-gateway-v2-live:commit",
 		applicationReply: "gateway-v2-commit",
 	})
+	trace := liveGatewayV2InstallOperationTrace(fixture)
 
 	result, err := fixture.ingress.UpgradeGatewayV2(fixture.ctx, fixture.request, liveGatewayV2Authorizer(t, fixture.request))
 	if err != nil || result.Outcome != GatewayV2UpgradeCommitted {
+		trace.log(t)
 		liveGatewayV2LogOperationDiagnostic(t, fixture)
 		failLiveIngress(t, "commit gateway-v2 upgrade", err)
 	}
@@ -119,6 +122,7 @@ func TestLiveGatewayV2BindConflictRollsBack(t *testing.T) {
 		imageTag:         "rig-generated-gateway-v2-live:conflict",
 		applicationReply: "gateway-v2-conflict",
 	})
+	trace := liveGatewayV2InstallOperationTrace(fixture)
 
 	var conflictID string
 	t.Cleanup(func() {
@@ -130,6 +134,7 @@ func TestLiveGatewayV2BindConflictRollsBack(t *testing.T) {
 
 	result, err := fixture.ingress.UpgradeGatewayV2(fixture.ctx, fixture.request, liveGatewayV2Authorizer(t, fixture.request))
 	if err == nil || result.Outcome != GatewayV2UpgradeRolledBack {
+		trace.log(t)
 		liveGatewayV2LogOperationDiagnostic(t, fixture)
 		t.Fatalf("bind-conflict upgrade = %+v, err=%v", result, err)
 	}
@@ -549,6 +554,499 @@ func TestGatewayV2OperationProofDiagnosticDistinguishesStageAndFinal(t *testing.
 	finalProof := liveGatewayV2OperationProofs(request, source, state, finalJournal, final)
 	if finalProof.topology != gatewayTopologyExactFinalV2 || !finalProof.finalTopologyExact || finalProof.stageRunningExact {
 		t.Fatal("transfer diagnostic did not distinguish exact final topology")
+	}
+}
+
+const liveGatewayV2TraceMaximumEvents = 256
+
+type liveGatewayV2TracePhase string
+
+const (
+	liveGatewayV2TracePhasePreparation liveGatewayV2TracePhase = "preparation"
+	liveGatewayV2TracePhaseUnknown     liveGatewayV2TracePhase = "unknown"
+)
+
+type liveGatewayV2TraceStep string
+
+const (
+	liveGatewayV2TraceStageObserveTopology           liveGatewayV2TraceStep = "stage_observe_topology"
+	liveGatewayV2TraceStageObserveRecovery           liveGatewayV2TraceStep = "stage_observe_recovery"
+	liveGatewayV2TraceStageHostPreflight             liveGatewayV2TraceStep = "stage_host_preflight"
+	liveGatewayV2TraceStageSelectedInterface         liveGatewayV2TraceStep = "stage_selected_interface"
+	liveGatewayV2TraceStagePinnedImage               liveGatewayV2TraceStep = "stage_pinned_image"
+	liveGatewayV2TraceStageCreateIngressNetwork      liveGatewayV2TraceStep = "stage_create_ingress_network"
+	liveGatewayV2TraceStageCreateConfigVolume        liveGatewayV2TraceStep = "stage_create_config_volume"
+	liveGatewayV2TraceStageCreateDataVolume          liveGatewayV2TraceStep = "stage_create_data_volume"
+	liveGatewayV2TraceStageCreateUnknownVolume       liveGatewayV2TraceStep = "stage_create_unknown_volume"
+	liveGatewayV2TraceStageCreateContainer           liveGatewayV2TraceStep = "stage_create_container"
+	liveGatewayV2TraceStageCopyConfig                liveGatewayV2TraceStep = "stage_copy_config"
+	liveGatewayV2TraceStageReadRestartConfig         liveGatewayV2TraceStep = "stage_read_restart_config"
+	liveGatewayV2TraceStageAttestStopped             liveGatewayV2TraceStep = "stage_attest_stopped"
+	liveGatewayV2TraceStageAttestStoppedCompensation liveGatewayV2TraceStep = "stage_attest_stopped_compensation"
+	liveGatewayV2TraceStageStart                     liveGatewayV2TraceStep = "stage_start"
+	liveGatewayV2TraceStageStop                      liveGatewayV2TraceStep = "stage_stop"
+	liveGatewayV2TraceStageRemove                    liveGatewayV2TraceStep = "stage_remove"
+	liveGatewayV2TraceTransferObserveTopology        liveGatewayV2TraceStep = "transfer_observe_topology"
+	liveGatewayV2TraceTransferObserveRecovery        liveGatewayV2TraceStep = "transfer_observe_recovery"
+	liveGatewayV2TraceTransferProveFinalRoutes       liveGatewayV2TraceStep = "transfer_prove_final_routes"
+	liveGatewayV2TraceTransferSelectedInterface      liveGatewayV2TraceStep = "transfer_selected_interface"
+	liveGatewayV2TraceTransferCopyFinalConfig        liveGatewayV2TraceStep = "transfer_copy_final_config"
+	liveGatewayV2TraceTransferReadFinalConfig        liveGatewayV2TraceStep = "transfer_read_final_config"
+	liveGatewayV2TraceTransferStopStage              liveGatewayV2TraceStep = "transfer_stop_stage"
+	liveGatewayV2TraceTransferRemoveStage            liveGatewayV2TraceStep = "transfer_remove_stage"
+	liveGatewayV2TraceTransferCreateFinal            liveGatewayV2TraceStep = "transfer_create_final"
+	liveGatewayV2TraceTransferStopV1                 liveGatewayV2TraceStep = "transfer_stop_v1"
+	liveGatewayV2TraceTransferStartV1                liveGatewayV2TraceStep = "transfer_start_v1"
+	liveGatewayV2TraceTransferStartFinal             liveGatewayV2TraceStep = "transfer_start_final"
+	liveGatewayV2TraceTransferStopFinal              liveGatewayV2TraceStep = "transfer_stop_final"
+	liveGatewayV2TraceTransferRemoveFinal            liveGatewayV2TraceStep = "transfer_remove_final"
+)
+
+type liveGatewayV2TraceOutcome string
+
+const (
+	liveGatewayV2TraceOK                             liveGatewayV2TraceOutcome = "ok"
+	liveGatewayV2TraceError                          liveGatewayV2TraceOutcome = "error"
+	liveGatewayV2TraceTrue                           liveGatewayV2TraceOutcome = "true"
+	liveGatewayV2TraceFalse                          liveGatewayV2TraceOutcome = "false"
+	liveGatewayV2TraceConfigMatch                    liveGatewayV2TraceOutcome = "config_match"
+	liveGatewayV2TraceConfigMismatch                 liveGatewayV2TraceOutcome = "config_mismatch"
+	liveGatewayV2TraceTopologyUnknown                liveGatewayV2TraceOutcome = "topology_unknown_or_identity_drift"
+	liveGatewayV2TraceTopologyExactV1                liveGatewayV2TraceOutcome = "topology_exact_v1"
+	liveGatewayV2TraceTopologyExactV1WithStage       liveGatewayV2TraceOutcome = "topology_exact_v1_with_stage"
+	liveGatewayV2TraceTopologyExactFinalV2           liveGatewayV2TraceOutcome = "topology_exact_final_v2"
+	liveGatewayV2TraceRecoveryUnknown                liveGatewayV2TraceOutcome = "recovery_unknown_or_identity_drift"
+	liveGatewayV2TraceRecoveryStagePartial           liveGatewayV2TraceOutcome = "recovery_stage_partial_infrastructure"
+	liveGatewayV2TraceRecoveryStageStopped           liveGatewayV2TraceOutcome = "recovery_stage_stopped"
+	liveGatewayV2TraceRecoveryTransferV1StageStopped liveGatewayV2TraceOutcome = "recovery_transfer_v1_serving_stage_stopped"
+	liveGatewayV2TraceRecoveryTransferV1NoContainers liveGatewayV2TraceOutcome = "recovery_transfer_v1_serving_no_containers"
+	liveGatewayV2TraceRecoveryTransferV1FinalStopped liveGatewayV2TraceOutcome = "recovery_transfer_v1_serving_final_stopped"
+	liveGatewayV2TraceRecoveryTransferV1Stopped      liveGatewayV2TraceOutcome = "recovery_transfer_v1_stopped_stage_running"
+	liveGatewayV2TraceRecoveryTransferBothStopped    liveGatewayV2TraceOutcome = "recovery_transfer_v1_and_stage_stopped"
+	liveGatewayV2TraceRecoveryTransferNoContainers   liveGatewayV2TraceOutcome = "recovery_transfer_v1_stopped_no_containers"
+	liveGatewayV2TraceRecoveryTransferStoppedFinal   liveGatewayV2TraceOutcome = "recovery_transfer_v1_stopped_final_stopped"
+)
+
+type liveGatewayV2TraceEvent struct {
+	phase   liveGatewayV2TracePhase
+	step    liveGatewayV2TraceStep
+	outcome liveGatewayV2TraceOutcome
+}
+
+type liveGatewayV2OperationTrace struct {
+	mu        sync.Mutex
+	phase     liveGatewayV2TracePhase
+	events    []liveGatewayV2TraceEvent
+	truncated bool
+}
+
+func liveGatewayV2InstallOperationTrace(fixture *liveGatewayV2Fixture) *liveGatewayV2OperationTrace {
+	trace := &liveGatewayV2OperationTrace{phase: liveGatewayV2TracePhasePreparation}
+	if fixture == nil || fixture.ingress == nil {
+		return trace
+	}
+	fixture.ingress.gatewayV2UpgradeDriver = liveGatewayV2TracingUpgradeDriver{
+		gatewayV2UpgradeDriver: managerGatewayV2UpgradeDriver{manager: fixture.ingress}, trace: trace,
+	}
+	fixture.ingress.gatewayV2TransferDriver = liveGatewayV2TracingTransferDriver{
+		gatewayV2TransferDriver: managerGatewayV2TransferDriver{manager: fixture.ingress}, trace: trace,
+	}
+	return trace
+}
+
+func (r *liveGatewayV2OperationTrace) recordAt(step liveGatewayV2TraceStep, phase gatewayMigrationPhase,
+	outcome liveGatewayV2TraceOutcome,
+) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.phase = liveGatewayV2ClosedTracePhase(phase)
+	r.appendLocked(liveGatewayV2TraceEvent{phase: r.phase, step: step, outcome: outcome})
+}
+
+func (r *liveGatewayV2OperationTrace) recordCurrent(step liveGatewayV2TraceStep, outcome liveGatewayV2TraceOutcome) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.appendLocked(liveGatewayV2TraceEvent{phase: r.phase, step: step, outcome: outcome})
+}
+
+func (r *liveGatewayV2OperationTrace) appendLocked(event liveGatewayV2TraceEvent) {
+	if len(r.events) == liveGatewayV2TraceMaximumEvents {
+		r.truncated = true
+		return
+	}
+	r.events = append(r.events, event)
+}
+
+func (r *liveGatewayV2OperationTrace) snapshot() ([]liveGatewayV2TraceEvent, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]liveGatewayV2TraceEvent(nil), r.events...), r.truncated
+}
+
+func (r *liveGatewayV2OperationTrace) log(t *testing.T) {
+	t.Helper()
+	events, truncated := r.snapshot()
+	if len(events) == 0 {
+		t.Log("gateway-v2 protected operation trace: events_available=false")
+		return
+	}
+	for index, event := range events {
+		t.Logf("gateway-v2 protected operation trace: sequence=%d phase=%s step=%s outcome=%s",
+			index+1, event.phase, event.step, event.outcome)
+	}
+	if truncated {
+		t.Log("gateway-v2 protected operation trace: truncated=true")
+	}
+}
+
+func liveGatewayV2ClosedTracePhase(phase gatewayMigrationPhase) liveGatewayV2TracePhase {
+	switch phase {
+	case gatewayPhasePrepared, gatewayPhaseStageIntent, gatewayPhaseStaged, gatewayPhaseTransferIntent,
+		gatewayPhaseV2Serving, gatewayPhaseCommitted, gatewayPhaseRollbackIntent, gatewayPhaseRolledBack,
+		gatewayPhaseUncertain:
+		return liveGatewayV2TracePhase(phase)
+	default:
+		return liveGatewayV2TracePhaseUnknown
+	}
+}
+
+func liveGatewayV2ErrorOutcome(err error) liveGatewayV2TraceOutcome {
+	if err != nil {
+		return liveGatewayV2TraceError
+	}
+	return liveGatewayV2TraceOK
+}
+
+func liveGatewayV2BoolOutcome(value bool) liveGatewayV2TraceOutcome {
+	if value {
+		return liveGatewayV2TraceTrue
+	}
+	return liveGatewayV2TraceFalse
+}
+
+func liveGatewayV2TopologyOutcome(topology gatewayObservedTopology) liveGatewayV2TraceOutcome {
+	switch topology {
+	case gatewayTopologyExactV1Only:
+		return liveGatewayV2TraceTopologyExactV1
+	case gatewayTopologyExactV1WithStage:
+		return liveGatewayV2TraceTopologyExactV1WithStage
+	case gatewayTopologyExactFinalV2:
+		return liveGatewayV2TraceTopologyExactFinalV2
+	default:
+		return liveGatewayV2TraceTopologyUnknown
+	}
+}
+
+func liveGatewayV2RecoveryOutcome(recovery gatewayV2RecoveryTopology) liveGatewayV2TraceOutcome {
+	switch recovery {
+	case gatewayV2RecoveryStageIntentPartialInfrastructure:
+		return liveGatewayV2TraceRecoveryStagePartial
+	case gatewayV2RecoveryStageIntentStoppedStage:
+		return liveGatewayV2TraceRecoveryStageStopped
+	case gatewayV2RecoveryTransferIntentV1ServingStoppedStage:
+		return liveGatewayV2TraceRecoveryTransferV1StageStopped
+	case gatewayV2RecoveryTransferIntentV1ServingNoContainers:
+		return liveGatewayV2TraceRecoveryTransferV1NoContainers
+	case gatewayV2RecoveryTransferIntentV1ServingStoppedFinal:
+		return liveGatewayV2TraceRecoveryTransferV1FinalStopped
+	case gatewayV2RecoveryTransferIntentStoppedV1:
+		return liveGatewayV2TraceRecoveryTransferV1Stopped
+	case gatewayV2RecoveryTransferIntentV1StoppedStage:
+		return liveGatewayV2TraceRecoveryTransferBothStopped
+	case gatewayV2RecoveryTransferIntentNoContainers:
+		return liveGatewayV2TraceRecoveryTransferNoContainers
+	case gatewayV2RecoveryTransferIntentStoppedFinal:
+		return liveGatewayV2TraceRecoveryTransferStoppedFinal
+	default:
+		return liveGatewayV2TraceRecoveryUnknown
+	}
+}
+
+type liveGatewayV2TracingUpgradeDriver struct {
+	gatewayV2UpgradeDriver
+	trace *liveGatewayV2OperationTrace
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) observeTopology(ctx context.Context, source routeState, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) gatewayObservedTopology {
+	result := d.gatewayV2UpgradeDriver.observeTopology(ctx, source, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceStageObserveTopology, journal.Phase, liveGatewayV2TopologyOutcome(result))
+	return result
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) observeRecovery(ctx context.Context, source routeState, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) gatewayV2RecoveryTopology {
+	result := d.gatewayV2UpgradeDriver.observeRecovery(ctx, source, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceStageObserveRecovery, journal.Phase, liveGatewayV2RecoveryOutcome(result))
+	return result
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) hostPreflight(ctx context.Context, profile gatewayProfileBinding,
+	plan gatewayV2NetworkPlan,
+) error {
+	err := d.gatewayV2UpgradeDriver.hostPreflight(ctx, profile, plan)
+	d.trace.recordCurrent(liveGatewayV2TraceStageHostPreflight, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) selectedInterfacePreflight(profile gatewayProfileBinding) error {
+	err := d.gatewayV2UpgradeDriver.selectedInterfacePreflight(profile)
+	d.trace.recordCurrent(liveGatewayV2TraceStageSelectedInterface, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) pinnedImage(ctx context.Context) (string, error) {
+	id, err := d.gatewayV2UpgradeDriver.pinnedImage(ctx)
+	d.trace.recordCurrent(liveGatewayV2TraceStagePinnedImage, liveGatewayV2ErrorOutcome(err))
+	return id, err
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) createIngressNetwork(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) (string, error) {
+	id, err := d.gatewayV2UpgradeDriver.createIngressNetwork(ctx, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceStageCreateIngressNetwork, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return id, err
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) createVolume(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal, role string,
+) (gatewayV1VolumeIdentity, error) {
+	step := liveGatewayV2TraceStageCreateUnknownVolume
+	switch role {
+	case gatewayV2ConfigVolumeRole:
+		step = liveGatewayV2TraceStageCreateConfigVolume
+	case gatewayV2DataVolumeRole:
+		step = liveGatewayV2TraceStageCreateDataVolume
+	}
+	identity, err := d.gatewayV2UpgradeDriver.createVolume(ctx, state, journal, role)
+	d.trace.recordAt(step, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return identity, err
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) createStageContainer(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) (string, error) {
+	id, err := d.gatewayV2UpgradeDriver.createStageContainer(ctx, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceStageCreateContainer, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return id, err
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) copyStageConfig(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal, contents []byte,
+) error {
+	err := d.gatewayV2UpgradeDriver.copyStageConfig(ctx, state, journal, contents)
+	d.trace.recordAt(liveGatewayV2TraceStageCopyConfig, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) readStageRestartConfig(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) ([]byte, error) {
+	contents, err := d.gatewayV2UpgradeDriver.readStageRestartConfig(ctx, state, journal)
+	outcome := liveGatewayV2ErrorOutcome(err)
+	if err == nil {
+		expected, expectedErr := buildGatewayV2StageConfig(state)
+		if expectedErr == nil && sameCaddyConfig(expected, contents) {
+			outcome = liveGatewayV2TraceConfigMatch
+		} else {
+			outcome = liveGatewayV2TraceConfigMismatch
+		}
+		clear(expected)
+	}
+	d.trace.recordAt(liveGatewayV2TraceStageReadRestartConfig, journal.Phase, outcome)
+	return contents, err
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) attestStoppedStage(ctx context.Context, source routeState,
+	state gatewayV2RouteState, journal gatewayMigrationJournal,
+) bool {
+	result := d.gatewayV2UpgradeDriver.attestStoppedStage(ctx, source, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceStageAttestStopped, journal.Phase, liveGatewayV2BoolOutcome(result))
+	return result
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) attestStoppedStageForCompensation(ctx context.Context, source routeState,
+	state gatewayV2RouteState, journal gatewayMigrationJournal,
+) bool {
+	result := d.gatewayV2UpgradeDriver.attestStoppedStageForCompensation(ctx, source, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceStageAttestStoppedCompensation, journal.Phase, liveGatewayV2BoolOutcome(result))
+	return result
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) startStage(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) error {
+	err := d.gatewayV2UpgradeDriver.startStage(ctx, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceStageStart, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) stopStage(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) error {
+	err := d.gatewayV2UpgradeDriver.stopStage(ctx, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceStageStop, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingUpgradeDriver) removeStage(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) error {
+	err := d.gatewayV2UpgradeDriver.removeStage(ctx, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceStageRemove, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+type liveGatewayV2TracingTransferDriver struct {
+	gatewayV2TransferDriver
+	trace *liveGatewayV2OperationTrace
+}
+
+func (d liveGatewayV2TracingTransferDriver) observeTopology(ctx context.Context, source routeState, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) gatewayObservedTopology {
+	result := d.gatewayV2TransferDriver.observeTopology(ctx, source, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceTransferObserveTopology, journal.Phase, liveGatewayV2TopologyOutcome(result))
+	return result
+}
+
+func (d liveGatewayV2TracingTransferDriver) observeRecovery(ctx context.Context, source routeState, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) gatewayV2RecoveryTopology {
+	result := d.gatewayV2TransferDriver.observeRecovery(ctx, source, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceTransferObserveRecovery, journal.Phase, liveGatewayV2RecoveryOutcome(result))
+	return result
+}
+
+func (d liveGatewayV2TracingTransferDriver) proveFinalHostRoutes(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) bool {
+	result := d.gatewayV2TransferDriver.proveFinalHostRoutes(ctx, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceTransferProveFinalRoutes, journal.Phase, liveGatewayV2BoolOutcome(result))
+	return result
+}
+
+func (d liveGatewayV2TracingTransferDriver) selectedInterfacePreflight(profile gatewayProfileBinding) error {
+	err := d.gatewayV2TransferDriver.selectedInterfacePreflight(profile)
+	d.trace.recordCurrent(liveGatewayV2TraceTransferSelectedInterface, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingTransferDriver) copyFinalConfigToStage(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal, contents []byte,
+) error {
+	err := d.gatewayV2TransferDriver.copyFinalConfigToStage(ctx, state, journal, contents)
+	d.trace.recordAt(liveGatewayV2TraceTransferCopyFinalConfig, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingTransferDriver) readFinalConfigFromStage(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) ([]byte, error) {
+	contents, err := d.gatewayV2TransferDriver.readFinalConfigFromStage(ctx, state, journal)
+	outcome := liveGatewayV2ErrorOutcome(err)
+	if err == nil {
+		expected, expectedErr := expectedGatewayV2FinalConfig(state)
+		if expectedErr == nil && sameCaddyConfig(expected, contents) {
+			outcome = liveGatewayV2TraceConfigMatch
+		} else {
+			outcome = liveGatewayV2TraceConfigMismatch
+		}
+		clear(expected)
+	}
+	d.trace.recordAt(liveGatewayV2TraceTransferReadFinalConfig, journal.Phase, outcome)
+	return contents, err
+}
+
+func (d liveGatewayV2TracingTransferDriver) stopStage(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) error {
+	err := d.gatewayV2TransferDriver.stopStage(ctx, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceTransferStopStage, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingTransferDriver) removeStage(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) error {
+	err := d.gatewayV2TransferDriver.removeStage(ctx, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceTransferRemoveStage, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingTransferDriver) createFinal(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) (string, error) {
+	id, err := d.gatewayV2TransferDriver.createFinal(ctx, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceTransferCreateFinal, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return id, err
+}
+
+func (d liveGatewayV2TracingTransferDriver) stopV1(ctx context.Context, source routeState, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) error {
+	err := d.gatewayV2TransferDriver.stopV1(ctx, source, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceTransferStopV1, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingTransferDriver) startV1(ctx context.Context, source routeState, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) error {
+	err := d.gatewayV2TransferDriver.startV1(ctx, source, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceTransferStartV1, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingTransferDriver) startFinal(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) error {
+	err := d.gatewayV2TransferDriver.startFinal(ctx, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceTransferStartFinal, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingTransferDriver) stopFinal(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) error {
+	err := d.gatewayV2TransferDriver.stopFinal(ctx, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceTransferStopFinal, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingTransferDriver) removeFinal(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) error {
+	err := d.gatewayV2TransferDriver.removeFinal(ctx, state, journal)
+	d.trace.recordAt(liveGatewayV2TraceTransferRemoveFinal, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func TestGatewayV2OperationTraceClosesAndBoundsValues(t *testing.T) {
+	trace := &liveGatewayV2OperationTrace{phase: liveGatewayV2TracePhasePreparation}
+	trace.recordAt(liveGatewayV2TraceStageObserveTopology, gatewayMigrationPhase("untrusted-phase"),
+		liveGatewayV2TopologyOutcome(gatewayObservedTopology("untrusted-topology")))
+	for index := 0; index < liveGatewayV2TraceMaximumEvents; index++ {
+		trace.recordCurrent(liveGatewayV2TraceStageHostPreflight, liveGatewayV2TraceOK)
+	}
+	events, truncated := trace.snapshot()
+	if len(events) != liveGatewayV2TraceMaximumEvents || !truncated {
+		t.Fatalf("trace bounds = events %d, truncated %t", len(events), truncated)
+	}
+	if events[0].phase != liveGatewayV2TracePhaseUnknown || events[0].outcome != liveGatewayV2TraceTopologyUnknown {
+		t.Fatalf("trace did not map unknown values to closed enums: %+v", events[0])
 	}
 }
 
