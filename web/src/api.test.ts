@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { APIError, api, clearCSRF, lanAccessObservationFresh, localRouteObservationFresh, setCSRF, verifiedLANAccessURL, verifiedLocalRouteURL, type Deployment, type LANAppAccessRead, type LocalRoute } from "./api";
+import { APIError, api, clearCSRF, lanAccessObservationFresh, localRouteObservationFresh, setCSRF, subscribeGatewayReconciliationRequired, verifiedLANAccessURL, verifiedLocalRouteURL, type Deployment, type LANAppAccessRead, type LocalRoute } from "./api";
 
 describe("API client", () => {
   beforeEach(() => {
@@ -334,6 +334,65 @@ describe("LAN API client", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     setCSRF("csrf-token");
+  });
+
+  it("publishes only the exact recovery response and preserves the original API error", async () => {
+    const throwingListener = subscribeGatewayReconciliationRequired(() => { throw new Error("listener failed"); });
+    const listener = vi.fn();
+    const unsubscribe = subscribeGatewayReconciliationRequired(listener);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "gateway_reconciliation_required", detail: "Recovery required" }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "service_unavailable", detail: "Unavailable" }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "gateway_reconciliation_required", detail: "Wrong status" }), { status: 500 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const exact = await api.apps().catch((error: unknown) => error);
+      expect(exact).toEqual(expect.objectContaining<Partial<APIError>>({ status: 503, code: "gateway_reconciliation_required" }));
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener).toHaveBeenCalledWith(exact);
+
+      await expect(api.apps()).rejects.toEqual(expect.objectContaining<Partial<APIError>>({ status: 503, code: "service_unavailable" }));
+      await expect(api.apps()).rejects.toEqual(expect.objectContaining<Partial<APIError>>({ status: 500, code: "gateway_reconciliation_required" }));
+      expect(listener).toHaveBeenCalledTimes(1);
+    } finally {
+      unsubscribe();
+      throwingListener();
+    }
+  });
+
+  it("publishes an exact recovery response received during CSRF rotation", async () => {
+    clearCSRF();
+    const listener = vi.fn();
+    const unsubscribe = subscribeGatewayReconciliationRequired(listener);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "csrf_failed", detail: "CSRF validation failed" }), { status: 403 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "gateway_reconciliation_required", detail: "Recovery required" }), { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await expect(api.logout()).rejects.toEqual(expect.objectContaining<Partial<APIError>>({ status: 503, code: "gateway_reconciliation_required" }));
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/auth/csrf", expect.objectContaining({ credentials: "same-origin", headers: expect.objectContaining({ Accept: "application/json" }) }));
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("keeps the generic CSRF rotation error for a null error body", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("null", { status: 401 })));
+    await expect(api.csrf()).rejects.toThrow("Authentication required");
+  });
+
+  it("probes status and the recovery head without cache or query parameters", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ daemon: "ready", capabilities: {}, diagnostics: {} }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ kind: "lan_grant" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.status();
+    await api.lanRecoveryHead();
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/system/status", expect.objectContaining({ cache: "no-store", credentials: "same-origin" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/lan/recovery", expect.objectContaining({ cache: "no-store", credentials: "same-origin" }));
   });
 
   it("uses generated LAN endpoints with exact review bodies and CSRF", async () => {

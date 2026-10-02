@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "7cf151c90b2f5ac0c9274851de02d44c2420cc431b41c455a7883c1f0be992fc"
+const SourceSHA256 = "167e0f26ffc22636aaeb72948d6ebf31d7cb7f749ff6074a822a132e9f6b0dfd"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -36,6 +36,7 @@ var Operations = map[string]Operation{
 	"getJob":                                    {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
 	"getLANGatewayProfile":                      {Method: "GET", Path: "/api/v1/system/lan-gateway-profile"},
 	"getLANGatewayUpgrade":                      {Method: "GET", Path: "/api/v1/system/lan-gateway-upgrade"},
+	"getLANRecoveryHead":                        {Method: "GET", Path: "/api/v1/lan/recovery"},
 	"getRelayStatus":                            {Method: "GET", Path: "/api/v1/relay/status"},
 	"grantApplicationLANAccess":                 {Method: "POST", Path: "/api/v1/apps/{appId}/lan-access/grants"},
 	"grantRuntimeApproval":                      {Method: "POST", Path: "/api/v1/apps/{appId}/runtime-approvals"},
@@ -840,6 +841,22 @@ type LANPortAllocation struct {
 	Port                         int    `json:"port"`
 	ReleasedAt                   string `json:"releasedAt,omitempty"`
 	State                        string `json:"state"`
+}
+
+type LANRecoveryHead struct {
+	AccessRevisionID     string `json:"accessRevisionId"`
+	AccessRevisionNumber int64  `json:"accessRevisionNumber"`
+	AllocationID         string `json:"allocationId"`
+	AppID                string `json:"appId"`
+	ApprovalDigest       string `json:"approvalDigest"`
+	Batch                bool   `json:"batch"`
+	BatchCount           int    `json:"batchCount"`
+	BatchPosition        int    `json:"batchPosition"`
+	ClaimState           string `json:"claimState"`
+	Kind                 string `json:"kind"`
+	OperationID          string `json:"operationId"`
+	OwnerOperationID     string `json:"ownerOperationId"`
+	Port                 int    `json:"port"`
 }
 
 type LocalRoute struct {

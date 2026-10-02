@@ -25,6 +25,7 @@ import { DeploymentHistoryPanel, deploymentPlanOrLegacy } from "./deployment-his
 import { UnsavedChangesGuard, useConfirmDiscard } from "./unsaved-changes";
 import { LANGatewayPanel } from "./lan-gateway";
 import { LANApplicationAccessPanel } from "./lan-application-access";
+import { AuthenticatedOperatorGate } from "./lan-recovery";
 
 type RelayPanelProps = { role: string };
 type RelayPanelLoader = () => Promise<{ default: ComponentType<RelayPanelProps> }>;
@@ -105,7 +106,7 @@ export function Layout({ user, onLogout, children }: { user: User; onLogout: () 
       <div className="account"><b aria-hidden="true">{user.username.slice(0, 1).toUpperCase()}</b><span>{user.username}<small>{accountRoleLabel(user.role)}</small></span></div>
     </aside>
     <span className="sr-only" role="status" aria-live="polite">{routeName} page</span>
-    <main id="main" className="content">{children}</main>
+    <main id="main" className="content" tabIndex={-1}>{children}</main>
   </div>;
 }
 
@@ -364,5 +365,5 @@ export function App() {
   if (bootstrapRequired === null) return <main className="auth"><LoadingState/></main>;
   if (!user) return <Login setup={bootstrapRequired} onAuthenticated={(nextUser) => { setUser(nextUser); setBootstrapRequired(false); navigate("/apps"); }}/>;
   const logout = async () => { try { await api.logout(); } finally { clearCSRF(); queryClient.clear(); setUser(null); navigate("/login"); } };
-  return <UnsavedChangesGuard><Layout user={user} onLogout={logout}><Routes><Route path="/" element={<ApplicationsPage/>}/><Route path="/apps" element={<ApplicationsPage/>}/><Route path="/apps/new" element={<AddApplicationPage/>}/><Route path="/apps/:id/setup" element={<ApplicationSetupPage/>}/><Route path="/apps/:id" element={<ApplicationDetailPage role={user.role} userId={user.id}/>}/><Route path="/connections" element={<ConnectionsPage/>}/><Route path="/machines" element={<MachinesPage role={user.role}/>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="*" element={<ApplicationsPage/>}/></Routes></Layout></UnsavedChangesGuard>;
+  return <AuthenticatedOperatorGate key={user.id} onSignOut={logout}><UnsavedChangesGuard><Layout user={user} onLogout={logout}><Routes><Route path="/" element={<ApplicationsPage/>}/><Route path="/apps" element={<ApplicationsPage/>}/><Route path="/apps/new" element={<AddApplicationPage/>}/><Route path="/apps/:id/setup" element={<ApplicationSetupPage/>}/><Route path="/apps/:id" element={<ApplicationDetailPage role={user.role} userId={user.id}/>}/><Route path="/connections" element={<ConnectionsPage/>}/><Route path="/machines" element={<MachinesPage role={user.role}/>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="*" element={<ApplicationsPage/>}/></Routes></Layout></UnsavedChangesGuard></AuthenticatedOperatorGate>;
 }

@@ -449,6 +449,15 @@ paths:
       responses:
         '200': {description: Live repository branches, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubBranchPage'}}}}
         default: {$ref: '#/components/responses/Problem'}
+  /api/v1/lan/recovery:
+    get:
+      operationId: getLANRecoveryHead
+      x-rig-problem-codes: [lan_access_forbidden, lan_access_unavailable]
+      security: [{sessionCookie: []}]
+      description: Returns the exact LAN recovery operation pinned before the recovery-only listener started, but only after a fresh complete SQLite census and protected gateway proof agree with that static pin. It never returns a URL and performs no recovery transition.
+      responses:
+        '200': {description: Exact freshly proved recovery head, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANRecoveryHead'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/apps/{appId}/lan-access:
     parameters: [{$ref: '#/components/parameters/AppId'}]
     get:
@@ -814,6 +823,24 @@ components:
     ConnectedGitHubRepositoryPage: {type: object, additionalProperties: false, required: [page, perPage, totalCount, truncated, items], properties: {page: {type: integer, minimum: 1}, perPage: {type: integer, minimum: 1, maximum: 100}, totalCount: {type: integer, minimum: 0}, truncated: {type: boolean}, items: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/ConnectedGitHubRepository'}}}}
     GitHubBranch: {type: object, required: [name, sha, protected], properties: {name: {type: string}, sha: {type: string}, protected: {type: boolean}}}
     GitHubBranchPage: {type: object, required: [page, perPage, items], properties: {page: {type: integer}, perPage: {type: integer}, items: {type: array, items: {$ref: '#/components/schemas/GitHubBranch'}}}}
+    LANRecoveryHead:
+      type: object
+      additionalProperties: false
+      required: [kind, appId, operationId, batch, batchPosition, batchCount, claimState, accessRevisionId, accessRevisionNumber, allocationId, ownerOperationId, port, approvalDigest]
+      properties:
+        kind: {type: string, enum: [lan_grant, lan_disable]}
+        appId: {type: string, format: uuid}
+        operationId: {type: string, format: uuid}
+        batch: {type: boolean}
+        batchPosition: {type: integer, minimum: 1, maximum: 64}
+        batchCount: {type: integer, minimum: 1, maximum: 64}
+        claimState: {type: string, enum: [prepared, applying, db_active, uncertain, committed, rolled_back, withdrawing]}
+        accessRevisionId: {type: string, format: uuid}
+        accessRevisionNumber: {type: integer, format: int64, minimum: 1}
+        allocationId: {type: string, format: uuid}
+        ownerOperationId: {type: string, format: uuid}
+        port: {type: integer, minimum: 8100, maximum: 8119}
+        approvalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
     LANPortAllocation:
       type: object
       additionalProperties: false

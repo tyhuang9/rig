@@ -19,15 +19,17 @@ import (
 )
 
 type gatewayStartup struct {
-	ingress          *generatedingress.Manager
-	snapshot         appaccess.HostingGatewayStartupSnapshot
-	inspection       generatedingress.GatewayV2StartupInspection
-	grantInspection  generatedingress.GatewayV2LANStartupInspection
-	accessInspection generatedingress.GatewayV2LANAccessStartupInspection
-	recoveryBatch    bool
-	recoveryKind     string
-	recoveryID       string
-	recoveryAppID    string
+	ingress            *generatedingress.Manager
+	snapshot           appaccess.HostingGatewayStartupSnapshot
+	inspection         generatedingress.GatewayV2StartupInspection
+	grantInspection    generatedingress.GatewayV2LANStartupInspection
+	accessInspection   generatedingress.GatewayV2LANAccessStartupInspection
+	recoveryBatch      bool
+	recoveryBatchHead  int
+	recoveryBatchCount int
+	recoveryKind       string
+	recoveryID         string
+	recoveryAppID      string
 }
 
 type gatewayStartupBatchIngress interface {
@@ -243,6 +245,8 @@ func quarantineLANRecoveryBatchStartup(ctx context.Context, gate gatewayStartup,
 	}
 	if !completed {
 		gate.inspection = upgradeInspection
+		gate.recoveryBatchHead = head.Head
+		gate.recoveryBatchCount = head.Count
 		gate.recoveryKind = kind
 		gate.recoveryID = operationID
 		gate.recoveryAppID = appID

@@ -31,12 +31,16 @@ type fakeGatewayStartupBatchIngress struct {
 	batchPresent  bool
 	batchErr      error
 
-	quarantineCalls int
-	observeCalls    int
-	retireCalls     int
-	upgradeCalls    int
-	accessCalls     int
-	hasCalls        int
+	quarantineCalls  int
+	observeCalls     int
+	retireCalls      int
+	upgradeCalls     int
+	accessCalls      int
+	hasCalls         int
+	observedGrants   int
+	observedDisables int
+	accessGrants     int
+	accessDisables   int
 }
 
 func (f *fakeGatewayStartupBatchIngress) HasGatewayV2LANRecoveryBatch(context.Context) (bool, error) {
@@ -51,10 +55,12 @@ func (f *fakeGatewayStartupBatchIngress) QuarantineGatewayV2LANAccessRecoveryBat
 	return f.quarantineErr
 }
 
-func (f *fakeGatewayStartupBatchIngress) ObserveGatewayV2LANRecoveryHead(context.Context,
-	[]generatedingress.GatewayV2LANStartupClaim, []generatedingress.GatewayV2LANDisableStartupClaim,
+func (f *fakeGatewayStartupBatchIngress) ObserveGatewayV2LANRecoveryHead(_ context.Context,
+	grants []generatedingress.GatewayV2LANStartupClaim, disables []generatedingress.GatewayV2LANDisableStartupClaim,
 ) (generatedingress.GatewayV2LANRecoveryHead, bool, error) {
 	f.observeCalls++
+	f.observedGrants = len(grants)
+	f.observedDisables = len(disables)
 	return f.head, f.headPresent, f.headErr
 }
 
@@ -75,10 +81,12 @@ func (f *fakeGatewayStartupBatchIngress) InspectGatewayV2Startup(context.Context
 	return f.upgrade, f.upgradeErr
 }
 
-func (f *fakeGatewayStartupBatchIngress) InspectGatewayV2LANAccessStartup(context.Context,
-	[]generatedingress.GatewayV2LANStartupClaim, []generatedingress.GatewayV2LANDisableStartupClaim,
+func (f *fakeGatewayStartupBatchIngress) InspectGatewayV2LANAccessStartup(_ context.Context,
+	grants []generatedingress.GatewayV2LANStartupClaim, disables []generatedingress.GatewayV2LANDisableStartupClaim,
 ) (generatedingress.GatewayV2LANAccessStartupInspection, error) {
 	f.accessCalls++
+	f.accessGrants = len(grants)
+	f.accessDisables = len(disables)
 	return f.access, f.accessErr
 }
 
@@ -291,7 +299,8 @@ func TestLANRecoveryBatchPinsOnlyObservedHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !got.recoveryBatch || got.recoveryKind != controller.RecoveryLANDisable ||
-		got.recoveryID != "disable-two" || got.recoveryAppID != "disable-app-two" {
+		got.recoveryID != "disable-two" || got.recoveryAppID != "disable-app-two" ||
+		got.recoveryBatchHead != 1 || got.recoveryBatchCount != 2 {
 		t.Fatalf("pinned gate: %+v", got)
 	}
 	if ingress.quarantineCalls != 1 || ingress.observeCalls != 1 || ingress.retireCalls != 0 || ingress.accessCalls != 0 {
