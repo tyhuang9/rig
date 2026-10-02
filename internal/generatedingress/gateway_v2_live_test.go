@@ -632,6 +632,7 @@ const (
 	liveGatewayV2TraceCreateNotFound                  liveGatewayV2TraceOutcome = "container_not_found"
 	liveGatewayV2TraceCreateValidationFailed          liveGatewayV2TraceOutcome = "stopped_container_validation_failed"
 	liveGatewayV2TraceCreateValidationPassed          liveGatewayV2TraceOutcome = "stopped_container_validation_passed"
+	liveGatewayV2TraceCreateValidationUnclassified    liveGatewayV2TraceOutcome = "unclassified_validation_failure"
 	liveGatewayV2TraceCreatePredicateRuntimeState     liveGatewayV2TraceOutcome = "failed_predicate_runtime_state"
 	liveGatewayV2TraceCreatePredicateIdentity         liveGatewayV2TraceOutcome = "failed_predicate_identity"
 	liveGatewayV2TraceCreatePredicateExecution        liveGatewayV2TraceOutcome = "failed_predicate_execution"
@@ -890,10 +891,14 @@ func (d liveGatewayV2TracingUpgradeDriver) createStageContainer(ctx context.Cont
 		d.trace.recordAt(liveGatewayV2TraceStageCreateContainer, journal.Phase, liveGatewayV2TraceError)
 		return "", gatewayV2StageError(ctx)
 	}
-	failures := liveGatewayV2StoppedContainerFailureOutcomes(state, journal, container, runtime, gatewayV2StageContainerRole,
-		"sha256:"+journal.Resources.ImageID)
-	if len(failures) != 0 {
+	imageID := "sha256:" + journal.Resources.ImageID
+	if !validGatewayV2StoppedContainer(state, journal, container, runtime, true, gatewayV2StageContainerRole, imageID) {
 		d.trace.recordAt(liveGatewayV2TraceStageCreateContainerDetail, journal.Phase, liveGatewayV2TraceCreateValidationFailed)
+		failures := liveGatewayV2StoppedContainerFailureOutcomes(state, journal, container, runtime,
+			gatewayV2StageContainerRole, imageID)
+		if len(failures) == 0 {
+			failures = append(failures, liveGatewayV2TraceCreateValidationUnclassified)
+		}
 		for _, failure := range failures {
 			d.trace.recordAt(liveGatewayV2TraceStageCreateContainerDetail, journal.Phase, failure)
 		}
@@ -1156,6 +1161,10 @@ func TestGatewayV2StoppedContainerDiagnosticMatchesValidator(t *testing.T) {
 
 	drift := observation.StageContainer
 	drift.LogConfig = map[string]string{"max-size": "10m", "max-file": "4"}
+	if validGatewayV2StoppedContainer(state, journal, drift, observation.StageRuntime, true,
+		gatewayV2StageContainerRole, observation.Image.ID) {
+		t.Fatal("production stopped-container validator accepted logging drift")
+	}
 	failures := liveGatewayV2StoppedContainerFailureOutcomes(state, journal, drift, observation.StageRuntime,
 		gatewayV2StageContainerRole, observation.Image.ID)
 	if !reflect.DeepEqual(failures, []liveGatewayV2TraceOutcome{liveGatewayV2TraceCreatePredicateLogging}) {
