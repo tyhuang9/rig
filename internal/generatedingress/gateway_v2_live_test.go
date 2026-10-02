@@ -70,6 +70,7 @@ func TestLiveGatewayV2UpgradeCommitAndRestart(t *testing.T) {
 
 	result, err := fixture.ingress.UpgradeGatewayV2(fixture.ctx, fixture.request, liveGatewayV2Authorizer(t, fixture.request))
 	if err != nil || result.Outcome != GatewayV2UpgradeCommitted {
+		liveGatewayV2LogOperationDiagnostic(t, fixture)
 		failLiveIngress(t, "commit gateway-v2 upgrade", err)
 	}
 	liveGatewayV2AssertSourceUnchanged(t, fixture)
@@ -129,6 +130,7 @@ func TestLiveGatewayV2BindConflictRollsBack(t *testing.T) {
 
 	result, err := fixture.ingress.UpgradeGatewayV2(fixture.ctx, fixture.request, liveGatewayV2Authorizer(t, fixture.request))
 	if err == nil || result.Outcome != GatewayV2UpgradeRolledBack {
+		liveGatewayV2LogOperationDiagnostic(t, fixture)
 		t.Fatalf("bind-conflict upgrade = %+v, err=%v", result, err)
 	}
 	liveGatewayV2AssertSourceUnchanged(t, fixture)
@@ -393,6 +395,172 @@ func TestGatewayV2SourceAttestationDiagnosticNamesRejectingPredicates(t *testing
 	if got, want := strings.Join(liveGatewayV2SourceAttestationFailures(source, preparation, journal, observation, nil), ","),
 		"v1_effective_port_bindings,v1_endpoint_identity"; got != want {
 		t.Fatalf("source diagnostic failures=%q, want %q", got, want)
+	}
+}
+
+type liveGatewayV2OperationProofDiagnostic struct {
+	topology                  gatewayObservedTopology
+	recovery                  gatewayV2RecoveryTopology
+	requestBound              bool
+	topologyInputs            bool
+	pinnedImage               bool
+	resourcesBound            bool
+	v1Base                    bool
+	v1Stable                  bool
+	v1ResourcesStable         bool
+	v1EndpointIdentity        bool
+	v2ResourcesStable         bool
+	stageStable               bool
+	finalStable               bool
+	ownedInventoryStable      bool
+	stageRunningExact         bool
+	stageStoppedExact         bool
+	stageConfigExact          bool
+	stage404                  bool
+	stageHostPublication      bool
+	transferRunningStageExact bool
+	transferNoContainersExact bool
+	transferStoppedFinalExact bool
+	v1StoppedRestartable      bool
+	v1RollbackReady           bool
+	finalContainerExact       bool
+	finalIngressNetworkExact  bool
+	finalApplicationNetworks  bool
+	finalConfigExact          bool
+	final404                  bool
+	finalRoutes               bool
+	finalHostPublication      bool
+	finalEndpointIdentity     bool
+	finalTopologyExact        bool
+}
+
+func liveGatewayV2OperationProofs(request GatewayV2UpgradeRequest, source routeState, state gatewayV2RouteState,
+	journal gatewayMigrationJournal, observation gatewayV2DockerObservation,
+) liveGatewayV2OperationProofDiagnostic {
+	v1StoppedRestartable := observation.V1Stable && observation.V1ResourcesStable &&
+		!observation.V1Container.Running && !observation.V1Container.Restarting
+	v1RollbackReady := v1StoppedRestartable && observation.V1EndpointIdentityProven
+	stageRunningExact := classifyGatewayV2Topology(source, state, journal, observation) == gatewayTopologyExactV1WithStage
+	return liveGatewayV2OperationProofDiagnostic{
+		topology:                  classifyGatewayV2Topology(source, state, journal, observation),
+		recovery:                  classifyGatewayV2RecoveryTopology(source, state, journal, observation),
+		requestBound:              gatewayV2RequestMatchesState(request, state, journal),
+		topologyInputs:            validGatewayTopologyInputs(source, state, journal),
+		pinnedImage:               validGatewayPinnedImage(observation.Image, observation.ImageFound),
+		resourcesBound:            gatewayV2ObservedResourcesMatchJournal(journal, observation),
+		v1Base:                    validGatewayV1Base(source, journal, observation, journal.Phase != gatewayPhaseCommitted),
+		v1Stable:                  observation.V1Stable,
+		v1ResourcesStable:         observation.V1ResourcesStable,
+		v1EndpointIdentity:        observation.V1EndpointIdentityProven,
+		v2ResourcesStable:         observation.V2ResourcesStable,
+		stageStable:               observation.StageStable,
+		finalStable:               observation.FinalStable,
+		ownedInventoryStable:      observation.OwnedInventoriesStable,
+		stageRunningExact:         stageRunningExact,
+		stageStoppedExact:         validGatewayV2StoppedStage(state, journal, observation),
+		stageConfigExact:          validGatewayV2StageConfig(state, observation.StageConfig, observation.StageRestartConfig),
+		stage404:                  observation.Stage404Proven,
+		stageHostPublication:      observation.StageHostPublicationProven,
+		transferRunningStageExact: validGatewayV2RunningStageForTransfer(state, journal, observation),
+		transferNoContainersExact: validGatewayV2TransferInfrastructureNoContainers(state, journal, observation),
+		transferStoppedFinalExact: validGatewayV2StoppedFinalForTransfer(state, journal, observation),
+		v1StoppedRestartable:      v1StoppedRestartable,
+		v1RollbackReady:           v1RollbackReady,
+		finalContainerExact: validGatewayV2Container(state, journal, observation.FinalContainer, observation.FinalRuntime,
+			observation.FinalContainerFound, gatewayV2FinalContainerRole, observation.Image.ID),
+		finalIngressNetworkExact: validGatewayV2IngressNetwork(state, journal, observation.IngressNetwork,
+			observation.IngressFound, observation.FinalContainer.ID, state.Identity.FinalContainer),
+		finalApplicationNetworks: validGatewayV2ApplicationNetworks(state, observation.FinalContainer,
+			observation.ApplicationNetworks, observation.ApplicationNetworkIDs),
+		finalConfigExact:      validGatewayV2FinalConfig(state, observation.FinalConfig, observation.FinalRestartConfig),
+		final404:              observation.Final404Proven,
+		finalRoutes:           observation.FinalRoutesProven,
+		finalHostPublication:  observation.FinalHostPublicationProven,
+		finalEndpointIdentity: observation.FinalEndpointIdentityProven,
+		finalTopologyExact: validGatewayV2FinalTopology(state, journal, observation, v1StoppedRestartable,
+			v1RollbackReady, validGatewayV2FinalConfig(state, observation.FinalConfig, observation.FinalRestartConfig)),
+	}
+}
+
+func liveGatewayV2LogOperationDiagnostic(t *testing.T, fixture *liveGatewayV2Fixture) {
+	t.Helper()
+	store, err := newGatewayUpgradeStateStore(fixture.stateRoot)
+	if err != nil {
+		t.Log("gateway-v2 protected diagnostic: phase_available=false")
+		return
+	}
+	state, journal, err := store.loadBoundUpgrade(fixture.spec.operationID)
+	if err != nil {
+		t.Log("gateway-v2 protected diagnostic: phase_available=false")
+		return
+	}
+	observation, err := fixture.ingress.inspectGatewayV2Docker(fixture.ctx, fixture.source, state, journal)
+	if err != nil {
+		clearGatewayV2DockerObservation(&observation)
+		t.Logf("gateway-v2 protected diagnostic: phase=%s snapshot_available=false", journal.Phase)
+		return
+	}
+	defer clearGatewayV2DockerObservation(&observation)
+	proof := liveGatewayV2OperationProofs(fixture.request, fixture.source, state, journal, observation)
+	selectedInterface := gatewayV2SelectedInterfacePreflight(state.Profile) == nil
+	finalLoopbackRoutes := false
+	if observation.FinalContainerFound && observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
+		finalLoopbackRoutes = proveGatewayV2FinalLoopbackRoutes(fixture.ctx, state, journal, probeGatewayV2HostStatus)
+	}
+	t.Logf("gateway-v2 protected diagnostic: phase=%s snapshot_available=true topology=%s recovery=%s "+
+		"request_bound=%t topology_inputs=%t pinned_image=%t resources_bound=%t "+
+		"v1_base=%t v1_stable=%t v1_resources_stable=%t v1_endpoint_identity=%t "+
+		"v2_resources_stable=%t stage_stable=%t final_stable=%t owned_inventory_stable=%t "+
+		"stage_running_exact=%t stage_stopped_exact=%t stage_config_exact=%t stage_404=%t stage_host_publication=%t "+
+		"transfer_running_stage_exact=%t transfer_no_containers_exact=%t transfer_stopped_final_exact=%t "+
+		"v1_stopped_restartable=%t v1_rollback_ready=%t final_container_exact=%t final_ingress_network_exact=%t "+
+		"final_application_networks=%t final_config_exact=%t final_404=%t final_routes=%t final_host_publication=%t "+
+		"final_endpoint_identity=%t final_topology_exact=%t final_loopback_routes=%t selected_interface=%t",
+		journal.Phase, proof.topology, proof.recovery,
+		proof.requestBound, proof.topologyInputs, proof.pinnedImage, proof.resourcesBound,
+		proof.v1Base, proof.v1Stable, proof.v1ResourcesStable, proof.v1EndpointIdentity,
+		proof.v2ResourcesStable, proof.stageStable, proof.finalStable, proof.ownedInventoryStable,
+		proof.stageRunningExact, proof.stageStoppedExact, proof.stageConfigExact, proof.stage404, proof.stageHostPublication,
+		proof.transferRunningStageExact, proof.transferNoContainersExact, proof.transferStoppedFinalExact,
+		proof.v1StoppedRestartable, proof.v1RollbackReady, proof.finalContainerExact, proof.finalIngressNetworkExact,
+		proof.finalApplicationNetworks, proof.finalConfigExact, proof.final404, proof.finalRoutes, proof.finalHostPublication,
+		proof.finalEndpointIdentity, proof.finalTopologyExact, finalLoopbackRoutes, selectedInterface)
+}
+
+func TestGatewayV2OperationProofDiagnosticDistinguishesStageAndFinal(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	request := gatewayV2UpgradeRequestFromStateForTest(state)
+
+	stagedJournal := journal
+	stagedJournal.Resources = gatewayV2IdentityTestBoundResources(t)
+	stagedJournal.Resources.FinalContainerID = ""
+	stagedJournal.Phase = gatewayPhaseStaged
+	staged := gatewayV2IdentityTestObservation(t, source, state, stagedJournal, gatewayTopologyExactV1WithStage)
+	stagedProof := liveGatewayV2OperationProofs(request, source, state, stagedJournal, staged)
+	if stagedProof.topology != gatewayTopologyExactV1WithStage || !stagedProof.stageRunningExact || stagedProof.finalTopologyExact {
+		t.Fatal("stage diagnostic did not distinguish exact staged topology")
+	}
+
+	finalJournal := journal
+	finalJournal.Resources = gatewayV2IdentityTestBoundResources(t)
+	finalJournal.Resources.StageContainerID = strings.Repeat("c", 64)
+	finalJournal.Phase = gatewayPhaseV2Serving
+	final := gatewayV2IdentityTestObservation(t, source, state, finalJournal, gatewayTopologyExactFinalV2)
+	finalProof := liveGatewayV2OperationProofs(request, source, state, finalJournal, final)
+	if finalProof.topology != gatewayTopologyExactFinalV2 || !finalProof.finalTopologyExact || finalProof.stageRunningExact {
+		t.Fatal("transfer diagnostic did not distinguish exact final topology")
+	}
+}
+
+func gatewayV2UpgradeRequestFromStateForTest(state gatewayV2RouteState) GatewayV2UpgradeRequest {
+	return GatewayV2UpgradeRequest{
+		OperationID: state.OperationID,
+		Profile: GatewayV2ProfileBinding{
+			RevisionID: state.Profile.RevisionID, RevisionNumber: state.Profile.RevisionNumber,
+			SpecDigest: state.Profile.SpecDigest, SelectedIPv4: state.Profile.SelectedIPv4,
+			InterfaceID: state.Profile.InterfaceID, PortStart: state.Profile.PortStart, PortEnd: state.Profile.PortEnd,
+		},
+		ApprovedBy: state.UpgradeAction.ApprovedBy, ApprovedActionDigest: state.UpgradeAction.Digest,
 	}
 }
 
