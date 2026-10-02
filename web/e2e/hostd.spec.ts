@@ -102,7 +102,9 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
     target.on("console", (message) => {
       if (message.type() !== "error") return;
       const expectedLegacyPlanMiss = message.text().includes("status of 404") && /\/api\/v1\/apps\/[^/]+\/deployment-plan$/.test(message.location().url);
-      if (!expectedLegacyPlanMiss) browserErrors.push(message.text());
+      const expectedUnavailableLANGateway = message.text().includes("status of 409") &&
+        /\/api\/v1\/system\/lan-gateway-upgrade$/.test(message.location().url);
+      if (!expectedLegacyPlanMiss && !expectedUnavailableLANGateway) browserErrors.push(message.text());
     });
     target.on("pageerror", (error) => browserErrors.push(error.message));
   };
@@ -275,7 +277,13 @@ test("bootstraps, restores a fresh tab, cancels work, and stays responsive", asy
   await expect(cancellationStatus).toHaveAttribute("aria-atomic", "true");
   await expect(activity.getByText("cancelled", { exact: true })).toBeVisible();
   await expect(activity.locator("button")).toHaveCount(0);
+  const unavailableGatewayRead = restoredPage.waitForResponse((response) =>
+    response.request().method() === "GET" && new URL(response.url()).pathname === "/api/v1/system/lan-gateway-upgrade",
+  );
   await restoredPage.getByRole("link", { name: "Machines" }).click();
+  const gatewayRead = await unavailableGatewayRead;
+  expect(gatewayRead.status()).toBe(409);
+  expect((await gatewayRead.json()).code).toBe("capability_unavailable");
   await expect(restoredPage.getByRole("heading", { name: "Machines" })).toBeVisible();
   await expect(restoredPage.getByText("Local controller · independent runtime diagnostics", { exact: true })).toBeVisible();
   await restoredPage.getByRole("link", { name: "Applications" }).click();
