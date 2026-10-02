@@ -656,8 +656,87 @@ Desktop's Linux daemon was unavailable, so live gateway publication,
 forced-process-exit behavior from a second device, host bind conflict,
 stopped/unready app 404 behavior, two-app isolation, and the browser-to-external-
 database note journey remain unverified. The user-facing LAN sharing UI and
-disable finalization are separate remaining M3 work. An incomplete but already
+disable finalization were separate remaining M3 work at this checkpoint. An incomplete but already
 approved grant can stay externally reachable between a hostd crash after
 Caddy publication and startup quarantine; an unavailable Docker daemon or
 corrupt ownership journal can prevent emergency closure proof. These need
 live failure injection and an operational response before production use.
+
+## LAN disable controller and withdrawal journey: local evidence
+
+The next local branch starts from `e681f30` and completes the storage,
+generated-ingress, controller, and startup paths for an exact LAN disable.
+The storage/migration checkpoint is `039d6a0`; the protected-ingress checkpoint
+is `1a8c6f8`. The controller and startup integration follows in this branch.
+Migration 029 retains the approved intent and app access revision, adds a
+monotonic disable claim/event history, and marks the allocation released only
+in the same SQLite transaction that commits a gateway withdrawal proof. The
+previous grant, if any, is retired in that transaction. A later deliberate
+reserve and approval can create a new access revision; the old revision,
+allocation, grant, and disable history remain available for audit.
+
+The controller requires an administrator session and CSRF token, binds the
+operation to the current access revision, allocation and gateway profile, and
+rechecks authorization before gateway mutation and terminal resolution. A
+client disconnect does not cancel the bounded reconciliation attempt. The
+original approver remains in immutable history; a different current
+administrator can finish a pending withdrawal after the approver is demoted.
+Resolution rechecks that executing administrator under the gateway lock before
+writing protected state or changing the route. An exact replay of a completed
+disable returns the retained claim even after a later access revision is
+approved, without touching the new route. A new grant claim is fenced while
+any disable claim remains prepared, withdrawing, or uncertain. The
+gateway writes an exact disable pending record, removes only the selected
+app's LAN binding, and probes the selected port for 404 while checking other
+grants. The database release follows that proof while the gateway lock is
+held. An ambiguous or failed withdrawal retains the ownership and pending
+history or stops the exact journal-owned gateway when safe closure cannot be
+proved. Startup compares the full grant and disable census with protected
+gateway history, quarantines an unfinished route before serving a restricted
+controller, and pins recovery to one app and operation.
+
+| Local check for the integrated disable branch | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions | Passed across all Go packages, including storage, ingress, controller, and hostd. |
+| `go vet ./...` | Passed. |
+| `go run ./cmd/openapi-gen -check` | Passed after regenerating Go and TypeScript contracts. |
+| TypeScript build check, Vitest, and Vite production build using the installed local Node runtime | Passed; Vitest ran 401 tests in 16 files. Vite emitted its existing large-chunk advisory. |
+| `git diff --check` | Passed with only LF/CRLF conversion notices. |
+| Focused disable and startup tests | Passed for exact replays, rejected stale or mismatched operations, authorization rechecks, crash windows, protected pending recovery, committed history, same-port reenable, and fail-closed rejection of two pending live routes. |
+| Migration 029 legacy backfill regression | Passed with two distinct approved disable intents and one unfinished grant claim from migration 028; both intents retain prepared claims and initial events. A direct SQL claim that omits an existing committed source grant is rejected. |
+
+The restricted Windows sandbox could not run all unchanged workspace-policy
+fixtures reliably; the full Go suite passed with normal Windows permissions.
+The package-manager wrapper attempted a dependency reinstall and could not
+reach its registry in the sandbox, so the web checks used the already installed
+local Node dependencies directly. These results are local simulator and
+contract evidence. The Docker Desktop daemon is unavailable here, so no live
+container withdrawal, process-crash restart, second-device 404 proof, port
+reuse, or browser-to-external-database journey has run. The operator UI for
+the disable approval and recovery flow is still pending. M3 acceptance remains
+open, and this local branch has not been published or deployed.
+
+Multiple pre-029 disable intents now migrate without losing their immutable
+history. The current protected gateway journal can reconcile only one disable
+operation at a time. If several such intents coexist with routes that need
+withdrawal, startup inspection fails closed and `hostd` attempts to stop its
+exact owned gateway. It cannot yet quarantine all those routes and present a
+usable sequential recovery controller. A batch withdrawal record and
+one-at-a-time terminal reconciliation are required before this upgrade path
+can be considered production ready. An emergency stop is attempted, not
+assumed successful when Docker is unavailable or its ownership proof fails.
+An older prepared grant for the same app can also coexist with a disable
+intent in the migration-028 database. Its grant recovery and disable recovery
+both require control of the one protected pending slot; the current combined
+startup inspector rejects that conflict and attempts the same owned-gateway
+stop. This case also needs a sequential recovery policy before publication.
+There is also a narrow crash window after the disable claim commits in SQLite
+and before its protected ingress pending marker clears. Another app's new
+grant claim can start in that interval because the database sees the disable
+as terminal. If the process crashes then, startup rejects the two recovery
+identities and attempts an owned-gateway stop. A durable ingress-clear
+acknowledgment or queued-grant recovery is needed to close this availability
+gap before production use.
+A same-process retry after a new access head is approved can return the
+historical completed claim without clearing that pending marker; restart
+selects the pinned recovery-only path and must clear it before normal work.

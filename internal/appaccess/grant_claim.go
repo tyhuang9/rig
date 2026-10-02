@@ -74,15 +74,17 @@ type AppAccessGrantProof struct {
 }
 
 type AppAccessGrantClaim struct {
-	AttemptID     string
-	RequestDigest string
-	Spec          AppAccessGrantSpec
-	ApprovedAt    time.Time
-	CreatedAt     time.Time
-	State         AppAccessGrantState
-	StateSequence int64
-	UpdatedAt     time.Time
-	Proof         *AppAccessGrantProof
+	AttemptID                   string
+	RequestDigest               string
+	Spec                        AppAccessGrantSpec
+	ApprovedAt                  time.Time
+	CreatedAt                   time.Time
+	State                       AppAccessGrantState
+	StateSequence               int64
+	UpdatedAt                   time.Time
+	Proof                       *AppAccessGrantProof
+	RetiredAt                   *time.Time
+	RetiredByDisableOperationID string
 }
 
 // AppAccessGrantSpecFor derives the execution binding from immutable approved
@@ -160,6 +162,7 @@ func (r *Repository) ClaimAppAccessGrant(ctx context.Context, input ClaimAppAcce
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM lan_app_access_grant_claims
 		WHERE allocation_id=? AND state IN ('prepared','applying','db_active','uncertain','committed')
+		  AND retired_at IS NULL
 	)`, input.Spec.AllocationID).Scan(&blocking); err != nil {
 		return AppAccessGrantClaim{}, false, err
 	}
@@ -169,6 +172,15 @@ func (r *Repository) ClaimAppAccessGrant(ctx context.Context, input ClaimAppAcce
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM lan_app_access_grant_claims
 		WHERE state IN ('prepared','applying','db_active','uncertain')
+	)`).Scan(&blocking); err != nil {
+		return AppAccessGrantClaim{}, false, err
+	}
+	if blocking != 0 {
+		return AppAccessGrantClaim{}, false, ErrConflict
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM lan_app_access_disable_claims
+		WHERE state IN ('prepared','withdrawing','uncertain')
 	)`).Scan(&blocking); err != nil {
 		return AppAccessGrantClaim{}, false, err
 	}
@@ -398,7 +410,8 @@ func (r *Repository) CurrentAppAccessGrantClaim(ctx context.Context, owner Alloc
 	err = tx.QueryRowContext(ctx, `SELECT attempt_id FROM lan_app_access_grant_claims
 		WHERE allocation_id=? AND app_id=? AND allocation_owner_operation_id=?
 		  AND access_revision_id=?
-		  AND state IN ('prepared','applying','db_active','uncertain','committed')`,
+		  AND state IN ('prepared','applying','db_active','uncertain','committed')
+		  AND retired_at IS NULL`,
 		owner.AllocationID, owner.AppID, owner.OperationID, owner.AccessRevisionID).Scan(&attemptID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AppAccessGrantClaim{}, ErrNotFound
@@ -425,13 +438,15 @@ func readAppAccessGrantClaim(ctx context.Context, query appAccessGrantQuerier, a
 	var value AppAccessGrantClaim
 	var action, approvedAt, createdAt, updatedAt string
 	var outcome, gatewayOperationID, protectedStateDigest, resolvedAt sql.NullString
+	var retiredAt, retiredByDisableOperationID sql.NullString
 	value.AttemptID = attemptID
 	err := query.QueryRowContext(ctx, `SELECT request_digest,approval_action,app_id,allocation_id,
 		allocation_owner_operation_id,access_revision_id,access_revision_number,
 		access_spec_digest,allocated_port,gateway_profile_revision_id,
 		gateway_profile_revision_number,gateway_profile_spec_digest,approved_by,
 		approved_at,created_at,state,state_sequence,updated_at,resolution_outcome,
-		gateway_operation_id,protected_state_digest,resolved_at
+		gateway_operation_id,protected_state_digest,resolved_at,retired_at,
+		retired_by_disable_operation_id
 		FROM lan_app_access_grant_claims WHERE attempt_id=?`, attemptID).Scan(
 		&value.RequestDigest, &action, &value.Spec.AppID, &value.Spec.AllocationID,
 		&value.Spec.OwnerOperationID, &value.Spec.AccessRevisionID,
@@ -439,7 +454,8 @@ func readAppAccessGrantClaim(ctx context.Context, query appAccessGrantQuerier, a
 		&value.Spec.GatewayProfileRevisionID, &value.Spec.GatewayProfileRevisionNumber,
 		&value.Spec.GatewayProfileSpecDigest, &value.Spec.ApprovedBy, &approvedAt,
 		&createdAt, &value.State, &value.StateSequence, &updatedAt, &outcome,
-		&gatewayOperationID, &protectedStateDigest, &resolvedAt)
+		&gatewayOperationID, &protectedStateDigest, &resolvedAt, &retiredAt,
+		&retiredByDisableOperationID)
 	if err != nil {
 		return AppAccessGrantClaim{}, err
 	}
@@ -474,6 +490,18 @@ func readAppAccessGrantClaim(ctx context.Context, query appAccessGrantQuerier, a
 		}
 	} else if outcome.Valid || gatewayOperationID.Valid || protectedStateDigest.Valid || resolvedAt.Valid {
 		return AppAccessGrantClaim{}, ErrInvalidStoredState
+	}
+	if retiredAt.Valid != retiredByDisableOperationID.Valid {
+		return AppAccessGrantClaim{}, ErrInvalidStoredState
+	}
+	if retiredAt.Valid {
+		stamp, parseErr := parseTime(retiredAt.String)
+		if parseErr != nil || value.State != AppAccessGrantCommitted ||
+			!validUUID(retiredByDisableOperationID.String) || stamp.Before(value.UpdatedAt) {
+			return AppAccessGrantClaim{}, ErrInvalidStoredState
+		}
+		value.RetiredAt = &stamp
+		value.RetiredByDisableOperationID = retiredByDisableOperationID.String
 	}
 	requestDigest, digestErr := appAccessGrantRequestDigest(ClaimAppAccessGrantInput{
 		AttemptID: value.AttemptID, Spec: value.Spec,

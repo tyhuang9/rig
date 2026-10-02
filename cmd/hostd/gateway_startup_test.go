@@ -63,6 +63,53 @@ func TestLANGrantStartupRecoveryRequiresExactCommittedGatewayAndAttempt(t *testi
 	}
 }
 
+func TestLANDisableStartupRecoveryRequiresExactCommittedGatewayAndOperation(t *testing.T) {
+	const gatewayID = "gateway-operation"
+	const operationID = "disable-operation"
+	const appID = "application"
+	base := appaccess.HostingGatewayStartupSnapshot{
+		Upgrades: appaccess.GatewayUpgradeStartupSnapshot{Claims: []appaccess.GatewayUpgradeStartupClaim{{
+			Claim: appaccess.GatewayProfileUpgradeClaim{OperationID: gatewayID, State: appaccess.GatewayProfileUpgradeCommitted},
+		}}},
+		Disables: appaccess.AppAccessDisableStartupSnapshot{Claims: []appaccess.AppAccessDisableStartupClaim{{
+			Claim: appaccess.AppAccessDisableClaim{OperationID: operationID, Spec: appaccess.AppAccessDisableSpec{AppID: appID}},
+		}}},
+	}
+	upgrade := generatedingress.GatewayV2StartupInspection{
+		Disposition: generatedingress.GatewayV2StartupNormalV2, OperationID: gatewayID,
+	}
+	disable := generatedingress.GatewayV2LANAccessStartupInspection{
+		Disposition:  generatedingress.GatewayV2LANStartupRecoveryOnly,
+		RecoveryKind: controller.RecoveryLANDisable, OperationID: operationID, AppID: appID,
+	}
+	if kind, gotOperation, gotApp, err := selectLANAccessStartupRecovery(base, upgrade, disable); err != nil ||
+		kind != controller.RecoveryLANDisable || gotOperation != operationID || gotApp != appID {
+		t.Fatalf("exact disable selection kind=%q operation=%q app=%q err=%v", kind, gotOperation, gotApp, err)
+	}
+	for _, test := range []struct {
+		name      string
+		operation string
+		app       string
+		gatewayOK bool
+	}{
+		{name: "different operation", operation: "other", app: appID, gatewayOK: true},
+		{name: "different app", operation: operationID, app: "other", gatewayOK: true},
+		{name: "uncommitted gateway", operation: operationID, app: appID},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := disable
+			candidate.OperationID, candidate.AppID = test.operation, test.app
+			snapshot := base
+			if !test.gatewayOK {
+				snapshot.Upgrades.Claims[0].Claim.State = appaccess.GatewayProfileUpgradePrepared
+			}
+			if _, _, _, err := selectLANAccessStartupRecovery(snapshot, upgrade, candidate); err == nil {
+				t.Fatal("accepted mismatched LAN disable startup recovery")
+			}
+		})
+	}
+}
+
 func TestProtectedGatewayUpgradeHistoryDetector(t *testing.T) {
 	root := t.TempDir()
 	if present, err := hasProtectedGatewayUpgradeHistory(root); err != nil || present {

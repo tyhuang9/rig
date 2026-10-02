@@ -93,8 +93,13 @@ func TestLANAppAccessGrantMigrationPreservesHistoryAndFencesSQLBypass(t *testing
 		}
 		before[name] = statement
 	}
+	grantMigration, err := migrations.ReadFile("migrations/028_lan_app_access_grant_claims.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy["migrations/028_lan_app_access_grant_claims.sql"] = &fstest.MapFile{Data: grantMigration}
 	for pass := 1; pass <= 2; pass++ {
-		if err := Migrate(db); err != nil {
+		if err := migrateFS(db, legacy); err != nil {
 			t.Fatalf("migration pass %d: %v", pass, err)
 		}
 	}

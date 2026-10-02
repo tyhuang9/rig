@@ -70,6 +70,10 @@ var expectedOpenAPIProblemCatalog = map[string]openAPIProblemCode{
 	"lan_access_approval_mismatch":    {Description: "Confirmation does not approve the exact application LAN access", Statuses: []int{409}},
 	"lan_access_pool_exhausted":       {Description: "No LAN gateway port is available", Statuses: []int{409}},
 	"lan_access_unavailable":          {Description: "Application LAN access state is unavailable", Statuses: []int{503}},
+	"lan_disable_conflict":            {Description: "The approved LAN disable or its exact route ownership changed", Statuses: []int{409}},
+	"lan_disable_replay_conflict":     {Description: "The LAN disable operation identifier was reused with different input", Statuses: []int{409}},
+	"lan_disable_approval_mismatch":   {Description: "Confirmation does not approve the exact application LAN disable", Statuses: []int{409}},
+	"lan_disable_unavailable":         {Description: "The LAN disable could not be safely reconciled", Statuses: []int{503}},
 	"capability_unavailable":          {Description: "The requested operation requires a runtime capability that is disabled", Statuses: []int{409}},
 }
 
@@ -111,6 +115,8 @@ var expectedOpenAPIOperationProblemCodes = map[string][]string{
 	"approveApplicationLANAccess":               {"lan_access_forbidden", "invalid_lan_access_request", "lan_access_conflict", "lan_access_replay_conflict", "lan_access_approval_mismatch", "lan_access_unavailable", "capability_unavailable"},
 	"grantApplicationLANAccess":                 {"lan_access_forbidden", "invalid_lan_access_request", "lan_access_conflict", "lan_access_replay_conflict", "lan_access_approval_mismatch", "lan_access_unavailable", "capability_unavailable"},
 	"getApplicationLANGrant":                    {"lan_access_forbidden", "invalid_lan_access_request", "lan_access_conflict", "lan_access_unavailable", "capability_unavailable"},
+	"disableApplicationLANAccess":               {"lan_access_forbidden", "invalid_lan_access_request", "lan_disable_conflict", "lan_disable_replay_conflict", "lan_disable_approval_mismatch", "lan_disable_unavailable", "capability_unavailable"},
+	"getApplicationLANDisable":                  {"lan_access_forbidden", "invalid_lan_access_request", "lan_disable_conflict", "lan_disable_unavailable", "capability_unavailable"},
 }
 
 func TestOpenAPIContractMatchesRegisteredRoutes(t *testing.T) {
@@ -135,6 +141,9 @@ func TestOpenAPIContractMatchesRegisteredRoutes(t *testing.T) {
 	}
 	if !strings.Contains(string(content), "pauseDisposition: {type: string, enum: [approval_required, migration_approval_required, insufficient_replacement_capacity, route_reconciliation_required]}") {
 		t.Error("job pause dispositions must remain an explicit stable enum")
+	}
+	if !strings.Contains(string(content), "availability: {type: string, enum: [unknown, pending_published, withdrawn_pending_resolution, disabled]}") {
+		t.Error("LAN disable observation dispositions must match gateway results")
 	}
 	if _, ok := document.Components.Responses["Problem"]; !ok {
 		t.Error("missing reusable problem response")

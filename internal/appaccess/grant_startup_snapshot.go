@@ -32,6 +32,7 @@ type AppAccessGrantStartupSnapshot struct {
 type HostingGatewayStartupSnapshot struct {
 	Upgrades GatewayUpgradeStartupSnapshot
 	Grants   AppAccessGrantStartupSnapshot
+	Disables AppAccessDisableStartupSnapshot
 }
 
 // AppAccessGrantStartupSnapshot reads every retained attempt, immutable event
@@ -79,10 +80,14 @@ func (r *Repository) HostingGatewayStartupSnapshot(ctx context.Context) (Hosting
 	if err != nil {
 		return HostingGatewayStartupSnapshot{}, err
 	}
+	disables, err := r.readAppAccessDisableStartupSnapshot(ctx, tx)
+	if err != nil {
+		return HostingGatewayStartupSnapshot{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return HostingGatewayStartupSnapshot{}, err
 	}
-	return HostingGatewayStartupSnapshot{Upgrades: gateway, Grants: grants}, nil
+	return HostingGatewayStartupSnapshot{Upgrades: gateway, Grants: grants, Disables: disables}, nil
 }
 
 func (r *Repository) readAppAccessGrantStartupSnapshot(ctx context.Context, tx *sql.Tx) (AppAccessGrantStartupSnapshot, error) {
@@ -212,11 +217,19 @@ func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID s
 		revision.SpecDigest != claim.Spec.AccessSpecDigest ||
 		revision.ApprovedBy != claim.Spec.ApprovedBy ||
 		revision.Allocation.ID != claim.Spec.AllocationID ||
-		revision.Allocation.Port != claim.Spec.Port || revision.Allocation.ReleasedAt != nil ||
+		revision.Allocation.Port != claim.Spec.Port ||
 		revision.Allocation.GatewayProfileRevisionID != claim.Spec.GatewayProfileRevisionID ||
 		revision.Allocation.GatewayProfileRevisionNumber != claim.Spec.GatewayProfileRevisionNumber ||
 		profile.SpecDigest != claim.Spec.GatewayProfileSpecDigest ||
 		!appAccessGrantAllocationStateMatches(claim.State, revision.Allocation.State) {
+		return AppAccessGrantStartupClaim{}, ErrInvalidStoredState
+	}
+	if claim.RetiredAt == nil {
+		if revision.Allocation.ReleasedAt != nil {
+			return AppAccessGrantStartupClaim{}, ErrInvalidStoredState
+		}
+	} else if claim.State != AppAccessGrantCommitted || revision.Allocation.ReleasedAt == nil ||
+		!revision.Allocation.ReleasedAt.Equal(*claim.RetiredAt) {
 		return AppAccessGrantStartupClaim{}, ErrInvalidStoredState
 	}
 

@@ -85,8 +85,13 @@ func TestLANAppAccessDisableMigrationPreservesOwnedAndReleasedAllocations(t *tes
 		triggerSQLBefore[name] = statement
 	}
 
+	disableMigration, err := migrations.ReadFile("migrations/027_lan_app_access_disable_ledger.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy["migrations/027_lan_app_access_disable_ledger.sql"] = &fstest.MapFile{Data: disableMigration}
 	for pass := 1; pass <= 2; pass++ {
-		if err := Migrate(db); err != nil {
+		if err := migrateFS(db, legacy); err != nil {
 			t.Fatalf("migration pass %d: %v", pass, err)
 		}
 	}

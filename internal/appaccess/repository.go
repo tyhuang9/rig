@@ -26,6 +26,7 @@ type Repository struct {
 	afterReservationLock          func()
 	afterApprovalLock             func()
 	afterDisableIntentLock        func()
+	afterDisableStartupClaimsRead func()
 	afterGrantClaimLock           func()
 	afterGrantStartupClaimsRead   func()
 	beforeGrantTransitionCommit   func()
@@ -91,7 +92,7 @@ func (r *Repository) ConfigureGatewayProfile(ctx context.Context, input Configur
 	}
 	if current > 0 {
 		var liveAllocations int
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM lan_port_allocations WHERE released_at IS NULL)`).Scan(&liveAllocations); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM lan_port_allocations WHERE released_at IS NULL AND disabled_at IS NULL)`).Scan(&liveAllocations); err != nil {
 			return GatewayProfileRevision{}, false, err
 		}
 		if liveAllocations != 0 {
@@ -228,7 +229,7 @@ func (r *Repository) ReserveAppAccess(ctx context.Context, input ReserveAppAcces
 		return Allocation{}, false, err
 	}
 	var liveApp int
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM lan_port_allocations WHERE app_id=? AND released_at IS NULL)`, input.AppID).Scan(&liveApp); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM lan_port_allocations WHERE app_id=? AND released_at IS NULL AND disabled_at IS NULL)`, input.AppID).Scan(&liveApp); err != nil {
 		return Allocation{}, false, err
 	}
 	if liveApp != 0 {
@@ -238,7 +239,7 @@ func (r *Repository) ReserveAppAccess(ctx context.Context, input ReserveAppAcces
 	var availablePort uint16
 	for port := profileStart; port <= profileEnd; port++ {
 		var occupied int
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM lan_port_allocations WHERE port=? AND released_at IS NULL)`, port).Scan(&occupied); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM lan_port_allocations WHERE port=? AND released_at IS NULL AND disabled_at IS NULL)`, port).Scan(&occupied); err != nil {
 			return Allocation{}, false, err
 		}
 		if occupied == 0 {
@@ -378,7 +379,7 @@ func (r *Repository) ApproveAppAccess(ctx context.Context, input ApproveAppAcces
 	if changed, rowsErr := result.RowsAffected(); rowsErr != nil || changed != 1 {
 		return AppAccessRevision{}, false, ErrConflict
 	}
-	result, err = tx.ExecContext(ctx, `UPDATE lan_port_allocations SET owner_revision_id=? WHERE id=? AND app_id=? AND owner_operation_id=? AND owner_revision_id IS NULL AND state='reserved' AND released_at IS NULL`, value.ID, allocation.ID, value.AppID, value.OperationID)
+	result, err = tx.ExecContext(ctx, `UPDATE lan_port_allocations SET owner_revision_id=? WHERE id=? AND app_id=? AND owner_operation_id=? AND owner_revision_id IS NULL AND state='reserved' AND released_at IS NULL AND disabled_at IS NULL`, value.ID, allocation.ID, value.AppID, value.OperationID)
 	if err != nil {
 		return AppAccessRevision{}, false, err
 	}
@@ -397,6 +398,20 @@ func (r *Repository) ApproveAppAccess(ctx context.Context, input ApproveAppAcces
 }
 
 func (r *Repository) CurrentAppAccess(ctx context.Context, appID string) (AppAccessRevision, error) {
+	value, err := r.AppAccessHead(ctx, appID)
+	if err != nil {
+		return AppAccessRevision{}, err
+	}
+	if value.Allocation.ReleasedAt != nil {
+		return AppAccessRevision{}, ErrNotFound
+	}
+	return value, nil
+}
+
+// AppAccessHead returns the retained approved head even after its exact
+// allocation was released by a committed disable. Callers use its revision
+// number for the next compare-and-swap while treating ReleasedAt as local-only.
+func (r *Repository) AppAccessHead(ctx context.Context, appID string) (AppAccessRevision, error) {
 	if r == nil || r.db == nil || !validUUID(appID) {
 		return AppAccessRevision{}, ErrInvalidInput
 	}
@@ -444,7 +459,7 @@ func (r *Repository) CleanupReserved(ctx context.Context, owner AllocationOwner)
 	if value.State != AllocationReserved || value.OwnerRevisionID != "" {
 		return false, ErrInvalidTransition
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE lan_port_allocations SET released_at=? WHERE id=? AND app_id=? AND owner_operation_id=? AND owner_revision_id IS NULL AND state='reserved' AND released_at IS NULL`, formatTime(r.now().UTC()), owner.AllocationID, owner.AppID, owner.OperationID)
+	result, err := tx.ExecContext(ctx, `UPDATE lan_port_allocations SET released_at=? WHERE id=? AND app_id=? AND owner_operation_id=? AND owner_revision_id IS NULL AND state='reserved' AND released_at IS NULL AND disabled_at IS NULL`, formatTime(r.now().UTC()), owner.AllocationID, owner.AppID, owner.OperationID)
 	if err != nil {
 		return false, err
 	}
@@ -528,7 +543,7 @@ func (r *Repository) transitionAllocation(ctx context.Context, owner AllocationO
 	if !valid {
 		return Allocation{}, ErrInvalidTransition
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE lan_port_allocations SET state=? WHERE id=? AND app_id=? AND owner_operation_id=? AND owner_revision_id=? AND state=? AND released_at IS NULL`, target, owner.AllocationID, owner.AppID, owner.OperationID, owner.AccessRevisionID, value.State)
+	result, err := tx.ExecContext(ctx, `UPDATE lan_port_allocations SET state=? WHERE id=? AND app_id=? AND owner_operation_id=? AND owner_revision_id=? AND state=? AND released_at IS NULL AND disabled_at IS NULL`, target, owner.AllocationID, owner.AppID, owner.OperationID, owner.AccessRevisionID, value.State)
 	if err != nil {
 		return Allocation{}, err
 	}
@@ -593,11 +608,12 @@ func readAllocationByOperation(ctx context.Context, query rowQuerier, operationI
 
 func readAllocationByID(ctx context.Context, query rowQuerier, id string) (Allocation, error) {
 	var value Allocation
-	var ownerRevision, released sql.NullString
+	var ownerRevision, released, disabled sql.NullString
 	var reserved string
 	value.ID = id
-	err := query.QueryRowContext(ctx, `SELECT app_id,port,owner_operation_id,owner_revision_id,reservation_digest,gateway_profile_revision_id,gateway_profile_revision_number,state,reserved_at,released_at FROM lan_port_allocations WHERE id=?`, id).Scan(
+	err := query.QueryRowContext(ctx, `SELECT app_id,port,owner_operation_id,owner_revision_id,reservation_digest,gateway_profile_revision_id,gateway_profile_revision_number,state,reserved_at,released_at,disabled_at FROM lan_port_allocations WHERE id=?`, id).Scan(
 		&value.AppID, &value.Port, &value.OwnerOperationID, &ownerRevision, &value.ReservationDigest, &value.GatewayProfileRevisionID, &value.GatewayProfileRevisionNumber, &value.State, &reserved, &released,
+		&disabled,
 	)
 	if err != nil {
 		return Allocation{}, err
@@ -608,14 +624,21 @@ func readAllocationByID(ctx context.Context, query rowQuerier, id string) (Alloc
 		return Allocation{}, ErrInvalidStoredState
 	}
 	value.ReservedAt = reservedAt
-	if released.Valid {
-		parsed, err := parseTime(released.String)
+	if released.Valid && disabled.Valid {
+		return Allocation{}, ErrInvalidStoredState
+	}
+	releaseStamp := released
+	if disabled.Valid {
+		releaseStamp = disabled
+	}
+	if releaseStamp.Valid {
+		parsed, err := parseTime(releaseStamp.String)
 		if err != nil {
 			return Allocation{}, ErrInvalidStoredState
 		}
 		value.ReleasedAt = &parsed
 	}
-	if !validUUID(value.ID) || !validUUID(value.AppID) || !validUUID(value.OwnerOperationID) || (value.OwnerRevisionID != "" && !validUUID(value.OwnerRevisionID)) || !validUUID(value.GatewayProfileRevisionID) || value.GatewayProfileRevisionNumber <= 0 || !validDigest(value.ReservationDigest) || value.Port < GatewayPortStart || value.Port > GatewayPortEnd || (value.State != AllocationReserved && value.State != AllocationActive && value.State != AllocationUncertain) || (value.ReleasedAt != nil && (value.State != AllocationReserved || value.OwnerRevisionID != "")) {
+	if !validUUID(value.ID) || !validUUID(value.AppID) || !validUUID(value.OwnerOperationID) || (value.OwnerRevisionID != "" && !validUUID(value.OwnerRevisionID)) || !validUUID(value.GatewayProfileRevisionID) || value.GatewayProfileRevisionNumber <= 0 || !validDigest(value.ReservationDigest) || value.Port < GatewayPortStart || value.Port > GatewayPortEnd || (value.State != AllocationReserved && value.State != AllocationActive && value.State != AllocationUncertain) || (released.Valid && (value.State != AllocationReserved || value.OwnerRevisionID != "")) || (disabled.Valid && value.OwnerRevisionID == "") {
 		return Allocation{}, ErrInvalidStoredState
 	}
 	return value, nil
