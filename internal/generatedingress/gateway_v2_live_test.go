@@ -124,6 +124,7 @@ func TestLiveGatewayV2BindConflictRollsBack(t *testing.T) {
 		liveGatewayV2RemoveConflictContainer(t, fixture, conflictID)
 	})
 	conflictID = liveGatewayV2StartConflictContainer(t, fixture)
+	liveGatewayV2AssertConflictBinding(t, fixture, conflictID)
 	liveGatewayV2AwaitConflict(t, fixture, "bind-conflict fixture did not own the approved listener")
 
 	result, err := fixture.ingress.UpgradeGatewayV2(fixture.ctx, fixture.request, liveGatewayV2Authorizer(t, fixture.request))
@@ -412,7 +413,6 @@ func liveGatewayV2StartConflictContainer(t *testing.T, fixture *liveGatewayV2Fix
 		t.Fatal("bind-conflict container returned an invalid identity")
 	}
 	id = normalizeID(id)
-	liveGatewayV2AssertConflictBinding(t, fixture, id)
 	return id
 }
 
@@ -426,7 +426,8 @@ func liveGatewayV2AssertConflictBinding(t *testing.T, fixture *liveGatewayV2Fixt
 		strings.TrimPrefix(container.Name, "/") != liveGatewayV2ConflictContainer || !container.Running || container.Restarting ||
 		container.Labels[gatewayV2ManagedLabelKey] != liveGatewayV2ConflictManaged ||
 		container.Labels[gatewayV2OperationLabelKey] != fixture.spec.operationID ||
-		!reflect.DeepEqual(container.PortBindings, wantBinding) || !reflect.DeepEqual(containerRuntime.EffectivePortBindings, wantBinding) {
+		!reflect.DeepEqual(container.PortBindings, wantBinding) ||
+		!gatewayV2EffectivePortBindingsMatchConfigured(containerRuntime.EffectivePortBindings, wantBinding) {
 		t.Fatal("bind-conflict container identity or exact selected-address binding was not proven")
 	}
 }

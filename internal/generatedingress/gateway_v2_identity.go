@@ -670,7 +670,7 @@ func validGatewayPinnedImage(value imageInspection, found bool) bool {
 func validGatewayV1Base(source routeState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation, requireRollbackTopology bool) bool {
 	if !observation.V1ContainerFound || !observation.V1VolumeFound || !observation.V1NetworkFound ||
 		!validGatewayContainerRuntime(observation.V1Runtime, true) ||
-		!reflect.DeepEqual(observation.V1Runtime.EffectivePortBindings, observation.V1Container.PortBindings) ||
+		!gatewayV2EffectivePortBindingsMatchConfigured(observation.V1Runtime.EffectivePortBindings, observation.V1Container.PortBindings) ||
 		!validCaddyInspection(observation.V1Container, observation.Image.ID, journal.Source.LocalHostPort) ||
 		observation.V1Volume.Name != caddyVolumeName || observation.V1Volume.Driver != "local" || observation.V1Volume.Scope != "local" ||
 		len(observation.V1Volume.Options) != 0 || observation.V1Volume.Labels[gatewayV2ManagedLabelKey] != gatewayV2ManagedContainerLabel ||
@@ -794,7 +794,7 @@ func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigr
 		value.Cmd[2] != "/config/"+configFilename || len(value.Ulimits) != 1 || value.Ulimits[0] != (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}) ||
 		!reflect.DeepEqual(value.Labels, gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true)) ||
 		!validGatewayV2Mounts(value.Mounts, state.Identity) || !validGatewayV2PortBindings(value.PortBindings, state, journal, role) ||
-		(running && !reflect.DeepEqual(runtime.EffectivePortBindings, value.PortBindings)) ||
+		(running && !gatewayV2EffectivePortBindingsMatchConfigured(runtime.EffectivePortBindings, value.PortBindings)) ||
 		(!running && gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings)) {
 		return false
 	}
@@ -855,6 +855,25 @@ func gatewayV2HasEffectivePortBinding(values map[string][]map[string]string) boo
 		}
 	}
 	return false
+}
+
+// Docker's NetworkSettings.Ports includes empty entries for ports exposed by
+// the image even when HostConfig.PortBindings contains only the ports Rig
+// published. Preserve exact equality for every configured publication while
+// accepting only those additional keys that have no effective host binding.
+func gatewayV2EffectivePortBindingsMatchConfigured(effective, configured map[string][]map[string]string) bool {
+	for port, expected := range configured {
+		actual, exists := effective[port]
+		if !exists || !reflect.DeepEqual(actual, expected) {
+			return false
+		}
+	}
+	for port, bindings := range effective {
+		if _, expected := configured[port]; !expected && len(bindings) != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func exactGatewayV2Environment(values []string) bool {
