@@ -46,6 +46,7 @@ type caddyHandle struct {
 	Handler    string          `json:"handler"`
 	Upstreams  []caddyUpstream `json:"upstreams,omitempty"`
 	StatusCode int             `json:"status_code,omitempty"`
+	Body       string          `json:"body,omitempty"`
 }
 type caddyUpstream struct {
 	Dial string `json:"dial"`

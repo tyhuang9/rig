@@ -11,6 +11,9 @@ unpublished. It does not enable a LAN listener or report a LAN URL.
 - Protected v1-to-v2 gateway journal: `9b0f3ae`, implemented in
   `internal/generatedingress/upgrade_state.go` and its focused tests.
 - Cross-process gateway lock on current Manager operations: `0695892`.
+- Immutable Docker resource bindings in the migration journal: `48152f9`.
+- Exact v2 resource creation arguments and host preflight: `0195695`.
+- ID-bound observer and read-only migration recovery: `50bc2f9`.
 
 The allocator stores approved desired gateway and per-app access revisions,
 action digests, compare-and-swap heads, and unique durable port ownership. It
@@ -36,16 +39,96 @@ initial target digest while allowing later valid app-route changes under the
 same protected network plan. The pure validators reject a network subnet that
 contains the selected LAN address and rejects duplicate allocation or access
 revision identities across apps. These functions are not called by the live
-manager or controller yet.
+gateway upgrade action or controller yet; committed-state validation is used
+by Manager dispatch.
 
-The current Manager now holds a persistent handle-based gateway lock across
+The Manager holds a persistent handle-based gateway lock across
 route switching, startup provision/recovery, route observation callbacks, and
 capacity observations. Two independent Manager instances targeting one data
 root cannot issue competing Docker commands while one holds the lock. A
 process-exit test proves the next instance can acquire the lock; an injected
 post-switch release failure preserves the executor's
 `CandidateMayBeLive` signal so it does not clean a potentially serving
-container. The lock adds no v2 gateway mutation or LAN listener.
+container. The lock also serializes committed-v2 route changes; no live gateway
+upgrade or LAN listener is enabled yet.
+
+The new `internal/hostnetwork` helper enumerates currently assigned RFC 1918
+IPv4 addresses on active, non-loopback host interfaces. An approved interface
+index/name and exact address must still match; duplicate address ownership,
+an unavailable interface, a changed DHCP address, and wildcard/public
+addresses fail closed. This is an interface-ownership prerequisite only. It
+does not by itself inspect host routes or authorize a bind.
+
+The separate host-route snapshot reads Windows' IPv4 forwarding table or a
+Linux netlink route dump plus all assigned interface prefixes. A pure check
+rejects a proposed private Docker subnet when it overlaps any more-specific
+host route or interface prefix; only the default route is ignored. Snapshot
+completion is private to the package, so a caller cannot fabricate a usable
+empty snapshot. Linux reads the current network namespace. The route and
+interface reads are sequential, and the future cutover must revalidate them
+immediately around binding. This helper is still unwired to Docker mutation.
+
+The read-only v2 gateway observer checks pinned Docker identity, protected v1
+source identity, live and restart Caddy configuration, explicit bindings,
+owned resource inventories, application-network attachments, and route/404
+probes. It rechecks resource inventories and container process generations
+after probing. The committed-v2 Manager calls it under the gateway lock to
+attest serving and recovery state. Stage/final require host-side publication
+and reachability. The controller has no LAN URL or upgrade action yet.
+
+The v1 compatibility fence now checks for either protected v2 state or
+migration-journal marker while holding the gateway lock. A marker blocks
+legacy route switching, provisioning/recovery, observation, and capacity
+reads before v1 state or Docker access. It preserves the route candidate when
+Switch is blocked. The fence treats orphaned, malformed, rolled-back, and
+committed markers alike on legacy paths. The Manager now dispatches an exact
+committed v2 marker pair to a separate serving path; partial, corrupt, and
+noncommitted pairs still fail closed before v1 Docker work.
+
+The committed-v2 Manager path uses a protected pending route record before a
+Caddy reload. It preserves the last committed app routes and LAN bindings,
+requires exact final-v2 topology and candidate endpoint/network preflight,
+then reloads, reattests, and commits. Restart recovery distinguishes an exact
+committed config from an exact proposed config and rolls the latter back. It
+also recognizes the narrowly attested crash window where the live config is
+proposed but the restart config is still committed, then restores and reattests
+the committed config. Any other mixed or unknown topology remains unresolved
+without automatic mutation. New
+application networks are rejected before the pending write because v2 does not
+yet have a journaled gateway network-attachment transaction. Existing attached
+application networks can be switched after immutable endpoint, health, alias,
+network, and transport checks. Provision/recovery, local route observation, and
+capacity use the committed-v2 owner rather than falling through to v1. The v1
+observation bound remains 15 seconds; committed-v2 observation gets a bounded
+three-minute post-lock budget while respecting shorter caller deadlines.
+
+The read-only v2 observer can now classify exact v1, stage, and final states
+when its Docker evidence is complete. It proves immutable endpoint ownership,
+health, and unique alias membership before and after probes. Stage/final host
+publication must return a distinct port-specific Caddy challenge body on every
+selected-IP pool port, both through the host and directly through the attested
+container; generic 404 listeners and loopback publication fail. After commit,
+historical v1 app networks and endpoint health may change while the stopped v1
+gateway core identity remains pinned. Precommit rollback phases retain their
+strict v1 dependency. No live v2 gateway creator, LAN access action, or LAN URL
+is enabled by this serving-path slice.
+
+The migration journal now binds the pinned image, ingress network, both volume
+creation identities, and stage/final container IDs as each resource is made.
+Bindings are monotonic and phase-gated; a changed replay or a replacement
+resource fails closed. The observer compares found Docker resources with those
+protected bindings before accepting a serving topology. A separate read-only
+recovery classifier recognizes only specific `stage_intent` and
+`transfer_intent` crash windows with exact resource, config, network, and
+rollback evidence. It never authorizes mutation on unknown or drifting input.
+
+Pure argv builders define the exact v2 Docker network, volume, and hardened
+stage/final container creations. The stage publishes only the selected private
+IPv4 port pool; the final also publishes the v1 loopback port. Host preflight
+checks that the approved interface still owns the exact address and that the
+planned Docker subnet does not overlap current host routes or interface
+prefixes. These are unwired prerequisites: no Docker resource was created and
+no host port was opened by this slice.
 
 ## Executed verification
 
@@ -66,6 +149,23 @@ container. The lock adds no v2 gateway mutation or LAN listener.
 | `go test -count=1 ./...` and `go vet ./...` after the Manager lock | Passed with normal local Windows permissions. |
 | Gateway lock contention and process-exit tests | Passed on Windows; independent Manager contention and injected release-failure tests passed. |
 | Linux amd64 ingress test package cross-compilation | Passed; Linux runtime tests remain unrun locally. |
+| `go test -count=1 ./internal/hostnetwork` and `go vet ./internal/hostnetwork` | Passed for the interface-selection helper. |
+| `go test -count=1 ./internal/hostnetwork` after the route snapshot | Passed on Windows, including a native route-read smoke test. |
+| Linux route tests under WSL and Windows/Linux test cross-compilation | Passed as reported by the host-route implementation agent; WSL reads the current network namespace. |
+| `go test -count=1 ./...` and `go vet ./...` with normal Windows permissions after both read-only slices | Passed. |
+| `go test -count=1 ./internal/generatedingress` and `go vet ./internal/generatedingress` after observer review fixes | Passed. |
+| `go test -count=1 ./...` and `go vet ./...` after the observer corrective pass | Passed with normal Windows permissions. |
+| `go test ./internal/generatedingress -run 'TestLegacyV1Fence' -count=5` | Passed for the v1 compatibility fence, including lock contention. |
+| `go test -count=1 ./...` and `go vet ./...` after the v1 compatibility fence | Passed with normal Windows permissions. |
+| `go test -count=1 ./...` and `go vet ./...` after committed-v2 Manager and observer integration | Passed with normal Windows permissions. |
+| Linux amd64 `go test -c` for `./internal/generatedingress` | Cross-compiled the test package; Linux runtime execution was not available locally. |
+| `git diff --check` after committed-v2 integration | Passed; Git reported only working-copy LF/CRLF conversion warnings. |
+| `pnpm --dir docs build` after the evidence update | Passed without render errors after escaping Vue template braces in the recorded Docker command. |
+| `go test -count=1 ./internal/generatedingress` and `go vet ./internal/generatedingress` after journal binding, creator/preflight, and recovery observer | Passed. |
+| `go test -count=1 ./...` after these M3 prerequisites | Passed with normal local Windows permissions. The sandboxed run failed in unchanged workspace/Docker fixture tests with `Access is denied` and Docker unavailable. |
+| `go vet ./...` after these M3 prerequisites | Passed with normal local Windows permissions. |
+| Linux amd64 `go test -c` for `./internal/generatedingress` after recovery observer | Cross-compiled; Linux runtime tests were not executed locally. |
+| Independent code and security reviews of the prerequisite diff | No confirmed blocker for a local commit. Both require live Docker verification before M3 acceptance. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -83,6 +183,11 @@ storage tests instead exercise separate SQLite handles and repeated contention.
 No live Caddy config validation, Docker port bind, rollback, second-device LAN
 request, or database-backed LAN journey has run on this branch. Those are
 future M3 gates, not inferred from the local unit tests.
+The installed Docker CLI currently cannot reach the Docker Desktop Linux
+daemon: `C:\Program Files\Docker\Docker\resources\bin\docker.exe version
+--format '&#123;&#123;json .Server&#125;&#125;'` failed because
+`//./pipe/dockerDesktopLinuxEngine` does not exist. No live gateway acceptance
+claim follows from the read-only observer's unit tests.
 
 ## Remaining publication gates
 
@@ -98,7 +203,8 @@ Docker Desktop checks, plus a physical second-device journey using an
 application-owned external database, remain open. No managed database or Neon
 provisioning belongs to this milestone.
 The runtime network planner must reject overlap with all relevant host routes
-and interfaces, beyond the pure selected-address check. The journal's actor
+and interfaces using the new hostnetwork helper immediately before and after
+mutation; the helper is not wired yet. The journal's actor
 field records provenance; it does not authenticate or authorize the actor.
 The protected journal phase update checks the expected phase before replacing
 the file, but it is not an atomic compare-and-swap across processes. Gateway
@@ -107,8 +213,27 @@ unwired journal methods alone do not enforce that boundary. Every active LAN
 binding must also be compared with its approved SQLite row. A fresh upgrade after a
 `rolled_back` journal needs a history-preserving retry generation or explicit
 operator recovery; fixed create-only paths currently refuse another operation.
+The first live v2 marker writer must hold the same lock as the v1 compatibility
+fence. The lock and state paths must remain bound to one protected directory
+identity through the operation; a same-user parent-directory substitution is
+still a conditional filesystem threat.
 An older running hostd binary does not honor `gateway.lock`; migration must
 prove it is stopped before relying on the lock. On Linux, a malicious process
 with the same user identity can replace the lock path while a handle is held;
 Rig never unlinks it, and the open-time path identity and permission checks
 reject unsafe paths before work begins.
+The live observer now implements immutable endpoint and unique-alias proof,
+host-side selected-address publication proof, post-probe endpoint/config
+reinspection, and comparison with protected resource bindings. These have unit
+evidence only and require real Docker and Desktop execution. Docker's stopped
+container inspect shape for configured networks and effective ports remains
+unverified locally. Before the future writer starts either LAN-published
+container, it must prove the exact restart config in its writable volume,
+recheck the selected interface, retain the gateway lock, and reattest after
+start. A physical second-device LAN journey remains a distinct acceptance
+gate.
+The gateway-specific host challenge proves listener identity, but generic
+application probes accept any HTTP status. They do not prove that Caddy selected
+and forwarded the intended app route. A controlled live Docker route matrix
+with distinct backend response markers, wrong-Host and cross-app requests is
+required before claiming LAN routing acceptance.

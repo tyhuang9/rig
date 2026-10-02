@@ -1,6 +1,8 @@
 package generatedingress
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net"
@@ -21,6 +23,7 @@ type caddyV2Profile struct {
 	SelectedIPv4 string
 	PortStart    uint16
 	PortEnd      uint16
+	ProbeToken   string
 }
 
 // buildCaddyConfigV2 preserves the v1 .rig.localhost server and adds one
@@ -61,11 +64,14 @@ func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string
 			Listen:         []string{net.JoinHostPort(listenHost, strconv.FormatUint(uint64(port), 10))},
 			AutomaticHTTPS: caddyAutomaticHTTPS{Disable: true},
 		}
+		if profile.ProbeToken != "" {
+			server.Routes = append(server.Routes, gatewayV2ProbeRoute(profile.SelectedIPv4, gatewayV2PortChallenge(profile.ProbeToken, port)))
+		}
 		appID, assigned := assignments[port]
 		if assigned {
-			server.Routes = hostRestrictedRoutes(routes[appID], profile.SelectedIPv4)
+			server.Routes = append(server.Routes, hostRestrictedRoutes(routes[appID], profile.SelectedIPv4)...)
 		} else {
-			server.Routes = []caddyRoute{notFoundRoute()}
+			server.Routes = append(server.Routes, notFoundRoute())
 		}
 		result.Apps.HTTP.Servers[lanServerName(port)] = server
 		if port == profile.PortEnd {
@@ -76,10 +82,28 @@ func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string
 	return json.Marshal(result)
 }
 
+// A distinct response per published port detects host-side forwarding to the
+// wrong Caddy listener even when both ports belong to the same gateway.
+func gatewayV2PortChallenge(base string, port uint16) string {
+	sum := sha256.Sum256([]byte("rig-gateway-v2-port\x00" + base + "\x00" + strconv.FormatUint(uint64(port), 10)))
+	return hex.EncodeToString(sum[:])
+}
+
 func validCaddyV2Profile(profile caddyV2Profile) bool {
 	address, err := netip.ParseAddr(profile.SelectedIPv4)
 	return err == nil && address.Is4() && address.IsPrivate() && address.String() == profile.SelectedIPv4 &&
-		profile.PortStart >= minimumLANPort && profile.PortStart <= profile.PortEnd && profile.PortEnd <= maximumLANPort
+		profile.PortStart >= minimumLANPort && profile.PortStart <= profile.PortEnd && profile.PortEnd <= maximumLANPort &&
+		(profile.ProbeToken == "" || validSHA256(profile.ProbeToken))
+}
+
+// A gateway-specific 404 body distinguishes an attested Caddy listener from
+// an unrelated host process that happens to return an ordinary 404. The Host
+// matcher prevents requests for another authority from reaching this route.
+func gatewayV2ProbeRoute(selectedIPv4, token string) caddyRoute {
+	return caddyRoute{
+		Match:  []caddyMatch{{Host: []string{selectedIPv4}, Path: []string{"/.well-known/rig-gateway/" + token}}},
+		Handle: []caddyHandle{{Handler: "static_response", StatusCode: 404, Body: "rig-gateway-v2:" + token}},
+	}
 }
 
 func validateCaddyV2Assignments(routes map[string]routeRecord, profile caddyV2Profile, assignments map[uint16]string) error {
