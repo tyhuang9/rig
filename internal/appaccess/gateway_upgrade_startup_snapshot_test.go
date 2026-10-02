@@ -256,8 +256,6 @@ func TestGatewayUpgradeStartupSnapshotRejectsMalformedSpecAndApprovalBindings(t 
 }
 
 func TestGatewayUpgradeStartupSnapshotUsesOneReadSnapshotAcrossHandles(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	dataRoot := t.TempDir()
 	readerDB, err := database.Open(dataRoot)
 	if err != nil {
@@ -272,15 +270,17 @@ func TestGatewayUpgradeStartupSnapshotUsesOneReadSnapshotAcrossHandles(t *testin
 	addUsers(t, readerDB)
 	reader := testRepository(readerDB)
 	writer := testRepository(writerDB)
-	profile, _, err := reader.ConfigureGatewayProfile(ctx, approvedGatewayInput(t,
+	profile, _, err := reader.ConfigureGatewayProfile(context.Background(), approvedGatewayInput(t,
 		GatewayProfileSpec{SelectedIPv4: "192.168.74.8", InterfaceID: "startup-snapshot-adapter", PortStart: 8100, PortEnd: 8119}, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	claim, _, err := reader.ClaimGatewayProfileUpgrade(ctx, approvedGatewayUpgradeClaimInput(t, profile))
+	claim, _, err := reader.ClaimGatewayProfileUpgrade(context.Background(), approvedGatewayUpgradeClaimInput(t, profile))
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
 	claimsRead := make(chan struct{})
 	resume := make(chan struct{})
