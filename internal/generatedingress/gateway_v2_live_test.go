@@ -579,6 +579,7 @@ const (
 	liveGatewayV2TraceStageCreateDataVolume          liveGatewayV2TraceStep = "stage_create_data_volume"
 	liveGatewayV2TraceStageCreateUnknownVolume       liveGatewayV2TraceStep = "stage_create_unknown_volume"
 	liveGatewayV2TraceStageCreateContainer           liveGatewayV2TraceStep = "stage_create_container"
+	liveGatewayV2TraceStageCreateContainerDetail     liveGatewayV2TraceStep = "stage_create_container_detail"
 	liveGatewayV2TraceStageCopyConfig                liveGatewayV2TraceStep = "stage_copy_config"
 	liveGatewayV2TraceStageReadRestartConfig         liveGatewayV2TraceStep = "stage_read_restart_config"
 	liveGatewayV2TraceStageAttestStopped             liveGatewayV2TraceStep = "stage_attest_stopped"
@@ -605,26 +606,47 @@ const (
 type liveGatewayV2TraceOutcome string
 
 const (
-	liveGatewayV2TraceOK                             liveGatewayV2TraceOutcome = "ok"
-	liveGatewayV2TraceError                          liveGatewayV2TraceOutcome = "error"
-	liveGatewayV2TraceTrue                           liveGatewayV2TraceOutcome = "true"
-	liveGatewayV2TraceFalse                          liveGatewayV2TraceOutcome = "false"
-	liveGatewayV2TraceConfigMatch                    liveGatewayV2TraceOutcome = "config_match"
-	liveGatewayV2TraceConfigMismatch                 liveGatewayV2TraceOutcome = "config_mismatch"
-	liveGatewayV2TraceTopologyUnknown                liveGatewayV2TraceOutcome = "topology_unknown_or_identity_drift"
-	liveGatewayV2TraceTopologyExactV1                liveGatewayV2TraceOutcome = "topology_exact_v1"
-	liveGatewayV2TraceTopologyExactV1WithStage       liveGatewayV2TraceOutcome = "topology_exact_v1_with_stage"
-	liveGatewayV2TraceTopologyExactFinalV2           liveGatewayV2TraceOutcome = "topology_exact_final_v2"
-	liveGatewayV2TraceRecoveryUnknown                liveGatewayV2TraceOutcome = "recovery_unknown_or_identity_drift"
-	liveGatewayV2TraceRecoveryStagePartial           liveGatewayV2TraceOutcome = "recovery_stage_partial_infrastructure"
-	liveGatewayV2TraceRecoveryStageStopped           liveGatewayV2TraceOutcome = "recovery_stage_stopped"
-	liveGatewayV2TraceRecoveryTransferV1StageStopped liveGatewayV2TraceOutcome = "recovery_transfer_v1_serving_stage_stopped"
-	liveGatewayV2TraceRecoveryTransferV1NoContainers liveGatewayV2TraceOutcome = "recovery_transfer_v1_serving_no_containers"
-	liveGatewayV2TraceRecoveryTransferV1FinalStopped liveGatewayV2TraceOutcome = "recovery_transfer_v1_serving_final_stopped"
-	liveGatewayV2TraceRecoveryTransferV1Stopped      liveGatewayV2TraceOutcome = "recovery_transfer_v1_stopped_stage_running"
-	liveGatewayV2TraceRecoveryTransferBothStopped    liveGatewayV2TraceOutcome = "recovery_transfer_v1_and_stage_stopped"
-	liveGatewayV2TraceRecoveryTransferNoContainers   liveGatewayV2TraceOutcome = "recovery_transfer_v1_stopped_no_containers"
-	liveGatewayV2TraceRecoveryTransferStoppedFinal   liveGatewayV2TraceOutcome = "recovery_transfer_v1_stopped_final_stopped"
+	liveGatewayV2TraceOK                              liveGatewayV2TraceOutcome = "ok"
+	liveGatewayV2TraceError                           liveGatewayV2TraceOutcome = "error"
+	liveGatewayV2TraceTrue                            liveGatewayV2TraceOutcome = "true"
+	liveGatewayV2TraceFalse                           liveGatewayV2TraceOutcome = "false"
+	liveGatewayV2TraceConfigMatch                     liveGatewayV2TraceOutcome = "config_match"
+	liveGatewayV2TraceConfigMismatch                  liveGatewayV2TraceOutcome = "config_mismatch"
+	liveGatewayV2TraceTopologyUnknown                 liveGatewayV2TraceOutcome = "topology_unknown_or_identity_drift"
+	liveGatewayV2TraceTopologyExactV1                 liveGatewayV2TraceOutcome = "topology_exact_v1"
+	liveGatewayV2TraceTopologyExactV1WithStage        liveGatewayV2TraceOutcome = "topology_exact_v1_with_stage"
+	liveGatewayV2TraceTopologyExactFinalV2            liveGatewayV2TraceOutcome = "topology_exact_final_v2"
+	liveGatewayV2TraceRecoveryUnknown                 liveGatewayV2TraceOutcome = "recovery_unknown_or_identity_drift"
+	liveGatewayV2TraceRecoveryStagePartial            liveGatewayV2TraceOutcome = "recovery_stage_partial_infrastructure"
+	liveGatewayV2TraceRecoveryStageStopped            liveGatewayV2TraceOutcome = "recovery_stage_stopped"
+	liveGatewayV2TraceRecoveryTransferV1StageStopped  liveGatewayV2TraceOutcome = "recovery_transfer_v1_serving_stage_stopped"
+	liveGatewayV2TraceRecoveryTransferV1NoContainers  liveGatewayV2TraceOutcome = "recovery_transfer_v1_serving_no_containers"
+	liveGatewayV2TraceRecoveryTransferV1FinalStopped  liveGatewayV2TraceOutcome = "recovery_transfer_v1_serving_final_stopped"
+	liveGatewayV2TraceRecoveryTransferV1Stopped       liveGatewayV2TraceOutcome = "recovery_transfer_v1_stopped_stage_running"
+	liveGatewayV2TraceRecoveryTransferBothStopped     liveGatewayV2TraceOutcome = "recovery_transfer_v1_and_stage_stopped"
+	liveGatewayV2TraceRecoveryTransferNoContainers    liveGatewayV2TraceOutcome = "recovery_transfer_v1_stopped_no_containers"
+	liveGatewayV2TraceRecoveryTransferStoppedFinal    liveGatewayV2TraceOutcome = "recovery_transfer_v1_stopped_final_stopped"
+	liveGatewayV2TraceCreateArgsRejected              liveGatewayV2TraceOutcome = "create_args_rejected"
+	liveGatewayV2TraceCreateDockerCommandFailed       liveGatewayV2TraceOutcome = "docker_command_failed"
+	liveGatewayV2TraceCreateInspectError              liveGatewayV2TraceOutcome = "inspect_error"
+	liveGatewayV2TraceCreateNotFound                  liveGatewayV2TraceOutcome = "container_not_found"
+	liveGatewayV2TraceCreateValidationFailed          liveGatewayV2TraceOutcome = "stopped_container_validation_failed"
+	liveGatewayV2TraceCreateValidationPassed          liveGatewayV2TraceOutcome = "stopped_container_validation_passed"
+	liveGatewayV2TraceCreatePredicateRuntimeState     liveGatewayV2TraceOutcome = "failed_predicate_runtime_state"
+	liveGatewayV2TraceCreatePredicateIdentity         liveGatewayV2TraceOutcome = "failed_predicate_identity"
+	liveGatewayV2TraceCreatePredicateExecution        liveGatewayV2TraceOutcome = "failed_predicate_execution"
+	liveGatewayV2TraceCreatePredicateIsolation        liveGatewayV2TraceOutcome = "failed_predicate_isolation"
+	liveGatewayV2TraceCreatePredicateLimits           liveGatewayV2TraceOutcome = "failed_predicate_limits"
+	liveGatewayV2TraceCreatePredicateLogging          liveGatewayV2TraceOutcome = "failed_predicate_logging"
+	liveGatewayV2TraceCreatePredicateRestart          liveGatewayV2TraceOutcome = "failed_predicate_restart_policy"
+	liveGatewayV2TraceCreatePredicateEntrypoint       liveGatewayV2TraceOutcome = "failed_predicate_entrypoint_and_command"
+	liveGatewayV2TraceCreatePredicateUlimit           liveGatewayV2TraceOutcome = "failed_predicate_ulimit"
+	liveGatewayV2TraceCreatePredicateLabels           liveGatewayV2TraceOutcome = "failed_predicate_labels"
+	liveGatewayV2TraceCreatePredicateMounts           liveGatewayV2TraceOutcome = "failed_predicate_mounts"
+	liveGatewayV2TraceCreatePredicateConfiguredPorts  liveGatewayV2TraceOutcome = "failed_predicate_configured_ports"
+	liveGatewayV2TraceCreatePredicateEffectivePorts   liveGatewayV2TraceOutcome = "failed_predicate_effective_ports_absent"
+	liveGatewayV2TraceCreatePredicateExpectedNetworks liveGatewayV2TraceOutcome = "failed_predicate_expected_networks"
+	liveGatewayV2TraceCreatePredicateStoppedNetworks  liveGatewayV2TraceOutcome = "failed_predicate_stopped_networks"
 )
 
 type liveGatewayV2TraceEvent struct {
@@ -646,7 +668,7 @@ func liveGatewayV2InstallOperationTrace(fixture *liveGatewayV2Fixture) *liveGate
 		return trace
 	}
 	fixture.ingress.gatewayV2UpgradeDriver = liveGatewayV2TracingUpgradeDriver{
-		gatewayV2UpgradeDriver: managerGatewayV2UpgradeDriver{manager: fixture.ingress}, trace: trace,
+		gatewayV2UpgradeDriver: managerGatewayV2UpgradeDriver{manager: fixture.ingress}, manager: fixture.ingress, trace: trace,
 	}
 	fixture.ingress.gatewayV2TransferDriver = liveGatewayV2TracingTransferDriver{
 		gatewayV2TransferDriver: managerGatewayV2TransferDriver{manager: fixture.ingress}, trace: trace,
@@ -773,7 +795,8 @@ func liveGatewayV2RecoveryOutcome(recovery gatewayV2RecoveryTopology) liveGatewa
 
 type liveGatewayV2TracingUpgradeDriver struct {
 	gatewayV2UpgradeDriver
-	trace *liveGatewayV2OperationTrace
+	manager *Manager
+	trace   *liveGatewayV2OperationTrace
 }
 
 func (d liveGatewayV2TracingUpgradeDriver) observeTopology(ctx context.Context, source routeState, state gatewayV2RouteState,
@@ -838,9 +861,89 @@ func (d liveGatewayV2TracingUpgradeDriver) createVolume(ctx context.Context, sta
 func (d liveGatewayV2TracingUpgradeDriver) createStageContainer(ctx context.Context, state gatewayV2RouteState,
 	journal gatewayMigrationJournal,
 ) (string, error) {
-	id, err := d.gatewayV2UpgradeDriver.createStageContainer(ctx, state, journal)
-	d.trace.recordAt(liveGatewayV2TraceStageCreateContainer, journal.Phase, liveGatewayV2ErrorOutcome(err))
-	return id, err
+	args, err := gatewayV2ContainerCreateArgs(state, journal, gatewayV2StageContainerRole, "sha256:"+journal.Resources.ImageID)
+	if err != nil {
+		d.trace.recordAt(liveGatewayV2TraceStageCreateContainerDetail, journal.Phase, liveGatewayV2TraceCreateArgsRejected)
+		d.trace.recordAt(liveGatewayV2TraceStageCreateContainer, journal.Phase, liveGatewayV2TraceError)
+		return "", err
+	}
+	if d.manager == nil {
+		d.trace.recordAt(liveGatewayV2TraceStageCreateContainerDetail, journal.Phase, liveGatewayV2TraceCreateInspectError)
+		d.trace.recordAt(liveGatewayV2TraceStageCreateContainer, journal.Phase, liveGatewayV2TraceError)
+		return "", gatewayV2StageError(ctx)
+	}
+	result, err := d.manager.run(ctx, d.manager.options.CommandTimeout, args...)
+	clearResult(&result)
+	if err != nil {
+		d.trace.recordAt(liveGatewayV2TraceStageCreateContainerDetail, journal.Phase, liveGatewayV2TraceCreateDockerCommandFailed)
+		d.trace.recordAt(liveGatewayV2TraceStageCreateContainer, journal.Phase, liveGatewayV2TraceError)
+		return "", err
+	}
+	container, runtime, found, err := d.manager.inspectNamedGatewayContainer(ctx, state.Identity.StageContainer)
+	if err != nil {
+		d.trace.recordAt(liveGatewayV2TraceStageCreateContainerDetail, journal.Phase, liveGatewayV2TraceCreateInspectError)
+		d.trace.recordAt(liveGatewayV2TraceStageCreateContainer, journal.Phase, liveGatewayV2TraceError)
+		return "", gatewayV2StageError(ctx)
+	}
+	if !found {
+		d.trace.recordAt(liveGatewayV2TraceStageCreateContainerDetail, journal.Phase, liveGatewayV2TraceCreateNotFound)
+		d.trace.recordAt(liveGatewayV2TraceStageCreateContainer, journal.Phase, liveGatewayV2TraceError)
+		return "", gatewayV2StageError(ctx)
+	}
+	failures := liveGatewayV2StoppedContainerFailureOutcomes(state, journal, container, runtime, gatewayV2StageContainerRole,
+		"sha256:"+journal.Resources.ImageID)
+	if len(failures) != 0 {
+		d.trace.recordAt(liveGatewayV2TraceStageCreateContainerDetail, journal.Phase, liveGatewayV2TraceCreateValidationFailed)
+		for _, failure := range failures {
+			d.trace.recordAt(liveGatewayV2TraceStageCreateContainerDetail, journal.Phase, failure)
+		}
+		d.trace.recordAt(liveGatewayV2TraceStageCreateContainer, journal.Phase, liveGatewayV2TraceError)
+		return "", gatewayV2StageError(ctx)
+	}
+	d.trace.recordAt(liveGatewayV2TraceStageCreateContainerDetail, journal.Phase, liveGatewayV2TraceCreateValidationPassed)
+	d.trace.recordAt(liveGatewayV2TraceStageCreateContainer, journal.Phase, liveGatewayV2TraceOK)
+	return container.ID, nil
+}
+
+func liveGatewayV2StoppedContainerFailureOutcomes(state gatewayV2RouteState, journal gatewayMigrationJournal,
+	value caddyInspection, runtime gatewayContainerRuntime, role, imageID string,
+) []liveGatewayV2TraceOutcome {
+	name, configFilename, restart := state.Identity.StageContainer, state.Identity.StageConfigFilename, gatewayV2StageRestartPolicy
+	if role == gatewayV2FinalContainerRole {
+		name, configFilename, restart = state.Identity.FinalContainer, state.Identity.ActiveConfigFilename, gatewayV2FinalRestartPolicy
+	}
+	failures := make([]liveGatewayV2TraceOutcome, 0, 16)
+	add := func(failure liveGatewayV2TraceOutcome, valid bool) {
+		if !valid {
+			failures = append(failures, failure)
+		}
+	}
+	add(liveGatewayV2TraceCreatePredicateRuntimeState, !value.Running && !value.Restarting &&
+		validGatewayContainerRuntime(runtime, false) && validContainerID(value.ID) && normalizeID(value.Image) == normalizeID(imageID))
+	add(liveGatewayV2TraceCreatePredicateIdentity,
+		strings.TrimPrefix(value.Name, "/") == name && value.Hostname == name && value.NetworkMode == state.Identity.IngressNetwork)
+	add(liveGatewayV2TraceCreatePredicateExecution, value.User == "1000:1000" && exactGatewayV2Environment(value.Env))
+	add(liveGatewayV2TraceCreatePredicateIsolation, value.ReadOnly && !value.Privileged && onlyCaddyCapability(value.CapAdd) &&
+		exactFoldSet(value.CapDrop, "ALL") && onlyNoNewPrivileges(value.SecurityOpt) && len(value.Binds) == 0 && len(value.Tmpfs) == 0)
+	add(liveGatewayV2TraceCreatePredicateLimits, value.Memory == 268435456 && value.MemorySwap == 268435456 &&
+		value.NanoCPUs == 1_000_000_000 && value.PIDsLimit == 128)
+	add(liveGatewayV2TraceCreatePredicateLogging, value.LogType == "local" && len(value.LogConfig) == 2 &&
+		value.LogConfig["max-size"] == "10m" && value.LogConfig["max-file"] == "3")
+	add(liveGatewayV2TraceCreatePredicateRestart, value.Restart == restart)
+	add(liveGatewayV2TraceCreatePredicateEntrypoint, len(value.Entrypoint) == 1 && value.Entrypoint[0] == caddyExecutable &&
+		len(value.Cmd) == 3 && value.Cmd[0] == "run" && value.Cmd[1] == "--config" && value.Cmd[2] == "/config/"+configFilename)
+	add(liveGatewayV2TraceCreatePredicateUlimit,
+		len(value.Ulimits) == 1 && value.Ulimits[0] == (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}))
+	add(liveGatewayV2TraceCreatePredicateLabels,
+		reflect.DeepEqual(value.Labels, gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true)))
+	add(liveGatewayV2TraceCreatePredicateMounts, validGatewayV2Mounts(value.Mounts, state.Identity))
+	add(liveGatewayV2TraceCreatePredicateConfiguredPorts, validGatewayV2PortBindings(value.PortBindings, state, journal, role))
+	add(liveGatewayV2TraceCreatePredicateEffectivePorts, !gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings))
+	expectedNetworks, validNetworks := gatewayV2ExpectedContainerNetworks(state, role)
+	add(liveGatewayV2TraceCreatePredicateExpectedNetworks, validNetworks)
+	add(liveGatewayV2TraceCreatePredicateStoppedNetworks,
+		validNetworks && validGatewayV2StoppedContainerNetworks(state, role, expectedNetworks, runtime.ConfiguredNetworks))
+	return failures
 }
 
 func (d liveGatewayV2TracingUpgradeDriver) copyStageConfig(ctx context.Context, state gatewayV2RouteState,
@@ -1032,6 +1135,32 @@ func (d liveGatewayV2TracingTransferDriver) removeFinal(ctx context.Context, sta
 	err := d.gatewayV2TransferDriver.removeFinal(ctx, state, journal)
 	d.trace.recordAt(liveGatewayV2TraceTransferRemoveFinal, journal.Phase, liveGatewayV2ErrorOutcome(err))
 	return err
+}
+
+func TestGatewayV2StoppedContainerDiagnosticMatchesValidator(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Phase = gatewayPhaseStageIntent
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Resources.FinalContainerID = ""
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1WithStage)
+	stopGatewayV2TestContainer(&observation.StageContainer, &observation.StageRuntime, &observation.StageConfig,
+		state, observation.IngressNetworkID, nil)
+	if !validGatewayV2StoppedContainer(state, journal, observation.StageContainer, observation.StageRuntime, true,
+		gatewayV2StageContainerRole, observation.Image.ID) {
+		t.Fatal("valid stopped-container diagnostic fixture was rejected")
+	}
+	if failures := liveGatewayV2StoppedContainerFailureOutcomes(state, journal, observation.StageContainer,
+		observation.StageRuntime, gatewayV2StageContainerRole, observation.Image.ID); len(failures) != 0 {
+		t.Fatalf("valid stopped-container diagnostic failures=%v", failures)
+	}
+
+	drift := observation.StageContainer
+	drift.LogConfig = map[string]string{"max-size": "10m", "max-file": "4"}
+	failures := liveGatewayV2StoppedContainerFailureOutcomes(state, journal, drift, observation.StageRuntime,
+		gatewayV2StageContainerRole, observation.Image.ID)
+	if !reflect.DeepEqual(failures, []liveGatewayV2TraceOutcome{liveGatewayV2TraceCreatePredicateLogging}) {
+		t.Fatalf("logging drift diagnostic failures=%v", failures)
+	}
 }
 
 func TestGatewayV2OperationTraceClosesAndBoundsValues(t *testing.T) {
