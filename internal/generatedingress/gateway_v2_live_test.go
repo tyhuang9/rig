@@ -254,7 +254,146 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 		t.Fatal("load gateway-v2 source state")
 	}
 	fixture.request = liveGatewayV2Request(t, spec, selected, port)
+	liveGatewayV2AssertSourceAttestation(t, fixture)
 	return fixture
+}
+
+// liveGatewayV2AssertSourceAttestation diagnoses only the read-only v1/no-v2
+// proof that must pass before UpgradeGatewayV2 may create protected state or a
+// Docker resource. Public CI output is limited to predicate names; it never
+// includes Docker inspect data, resource identities, addresses, paths, labels,
+// configuration contents, or command errors.
+func liveGatewayV2AssertSourceAttestation(t *testing.T, fixture *liveGatewayV2Fixture) {
+	t.Helper()
+	preparation, err := gatewayV2UpgradePreparation(fixture.request)
+	if err != nil {
+		t.Fatal("gateway-v2 source attestation rejected before mutation: fixture_request_valid")
+	}
+	preparation.LocalHostPort = fixture.ingress.options.HostPort
+	identity, err := newGatewayV2Identity(fixture.request.OperationID)
+	if err != nil {
+		t.Fatal("gateway-v2 source attestation rejected before mutation: fixture_identity_valid")
+	}
+	observation, err := fixture.ingress.inspectGatewayV2PreparationAbortDocker(fixture.ctx, fixture.source, identity)
+	if err != nil {
+		clearGatewayV2DockerObservation(&observation)
+		t.Fatal("gateway-v2 source attestation rejected before mutation: source_snapshot_available")
+	}
+	defer clearGatewayV2DockerObservation(&observation)
+
+	identityDigest, identityErr := gatewayV1ObservedIdentityDigest(observation)
+	journal := gatewayMigrationJournal{Source: gatewayMigrationSourceRef{
+		IdentityDigest: identityDigest,
+		LocalHostPort:  preparation.LocalHostPort,
+	}}
+	failures := liveGatewayV2SourceAttestationFailures(fixture.source, preparation, journal, observation, identityErr)
+	_, valid := classifyGatewayV2PreparationAbort(fixture.source, preparation, observation)
+	if valid && len(failures) == 0 {
+		return
+	}
+	if len(failures) == 0 {
+		failures = append(failures, "aggregate_source_classifier")
+	}
+	t.Fatalf("gateway-v2 source attestation rejected before mutation: failed predicates=%s", strings.Join(failures, ","))
+}
+
+func liveGatewayV2SourceAttestationFailures(source routeState, preparation gatewayUpgradePreparation,
+	journal gatewayMigrationJournal, observation gatewayV2DockerObservation, identityErr error,
+) []string {
+	failures := make([]string, 0, 16)
+	add := func(name string, valid bool) {
+		if !valid {
+			failures = append(failures, name)
+		}
+	}
+
+	add("source_and_request_inputs", validRouteState(source) && source.Pending == nil &&
+		validCanonicalUUID(preparation.OperationID) && validGatewayProfileBinding(preparation.Profile) && preparation.LocalHostPort != 0)
+	add("observed_v1_identity", identityErr == nil && validSHA256(journal.Source.IdentityDigest))
+	add("pinned_image", validGatewayPinnedImage(observation.Image, observation.ImageFound))
+
+	v1Presence := observation.V1ContainerFound && observation.V1VolumeFound && observation.V1NetworkFound
+	add("v1_resources_present", v1Presence)
+	v1RuntimeValid := validGatewayContainerRuntime(observation.V1Runtime, true)
+	add("v1_runtime", v1RuntimeValid)
+	v1EffectivePortsValid := gatewayV2EffectivePortBindingsMatchConfigured(
+		observation.V1Runtime.EffectivePortBindings, observation.V1Container.PortBindings)
+	add("v1_effective_port_bindings", v1EffectivePortsValid)
+	v1ContainerSpecValid := validCaddyInspection(observation.V1Container, observation.Image.ID, journal.Source.LocalHostPort)
+	add("v1_container_spec", v1ContainerSpecValid)
+	v1VolumeValid := observation.V1Volume.Name == caddyVolumeName && observation.V1Volume.Driver == "local" &&
+		observation.V1Volume.Scope == "local" && len(observation.V1Volume.Options) == 0 &&
+		observation.V1Volume.Labels[gatewayV2ManagedLabelKey] == gatewayV2ManagedContainerLabel &&
+		observation.V1Volume.Labels[gatewayV2IdentityLabelKey] == gatewayV1IdentityVersion
+	add("v1_config_volume", v1VolumeValid)
+
+	listenIP, ingressValid := caddyIngressAddress(observation.V1Network, observation.V1Container.ID)
+	add("v1_ingress_attachment", ingressValid)
+	expectedConfig, configErr := buildCaddyConfig(source.Active,
+		net.JoinHostPort(listenIP, strconv.FormatUint(uint64(gatewayV2ContainerPort), 10)))
+	v1ConfigValid := configErr == nil && sameCaddyConfig(expectedConfig, observation.V1RestartConfig) &&
+		(observation.V1Container.Running && sameCaddyConfig(expectedConfig, observation.V1Config) ||
+			!observation.V1Container.Running && len(observation.V1Config) == 0)
+	add("v1_config", v1ConfigValid)
+
+	owners, ownersValid := gatewayRouteNetworkOwners(source.Active)
+	networkShapeValid := ownersValid && len(observation.V1ApplicationNetworks) == len(owners) &&
+		len(observation.V1ApplicationNetworkIDs) == len(owners) && len(observation.V1Container.Networks) == len(owners)+1
+	add("v1_application_network_shape", networkShapeValid)
+	networkMembershipValid := networkShapeValid
+	if networkMembershipValid {
+		for name, appID := range owners {
+			inspection, exists := observation.V1ApplicationNetworks[name]
+			if !exists || !validContainerID(observation.V1ApplicationNetworkIDs[name]) ||
+				!validApplicationNetwork(inspection.identity(), appID) ||
+				!validGatewayApplicationNetworkMembership(inspection, observation.V1Container, name) {
+				networkMembershipValid = false
+				break
+			}
+		}
+	}
+	add("v1_application_network_membership", networkMembershipValid)
+	observedIdentity, observedIdentityErr := gatewayV1ObservedIdentityDigest(observation)
+	v1IdentityBindingValid := observedIdentityErr == nil && observedIdentity == journal.Source.IdentityDigest
+	add("v1_identity_binding", v1IdentityBindingValid)
+	if !validGatewayV1Base(source, journal, observation, true) && v1Presence &&
+		v1RuntimeValid && v1EffectivePortsValid && v1ContainerSpecValid && v1VolumeValid && ingressValid &&
+		v1ConfigValid && networkMembershipValid && v1IdentityBindingValid {
+		add("v1_base_aggregate", false)
+	}
+
+	add("v1_snapshot_stable", observation.V1Stable)
+	add("v1_resource_snapshot_stable", observation.V1ResourcesStable)
+	add("v1_endpoint_identity", observation.V1EndpointIdentityProven)
+	add("v1_serving", observation.V1Container.Running && !observation.V1Container.Restarting)
+	add("v2_resource_snapshot_stable", observation.V2ResourcesStable)
+	add("v2_stage_absence_stable", observation.StageStable)
+	add("v2_final_absence_stable", observation.FinalStable)
+	add("v2_owned_inventory_stable", observation.OwnedInventoriesStable)
+	add("v2_resources_absent", gatewayV2SourceAttestationHasNoV2Resources(observation))
+	return failures
+}
+
+func TestGatewayV2SourceAttestationDiagnosticNamesRejectingPredicates(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1Only)
+	preparation := gatewayUpgradePreparation{
+		OperationID:   state.OperationID,
+		Profile:       state.Profile,
+		LocalHostPort: journal.Source.LocalHostPort,
+	}
+	if failures := liveGatewayV2SourceAttestationFailures(source, preparation, journal, observation, nil); len(failures) != 0 {
+		t.Fatalf("valid source diagnostic failures=%s", strings.Join(failures, ","))
+	}
+
+	observation.V1Runtime.EffectivePortBindings["9999/tcp"] = []map[string]string{{
+		"HostIp": "127.0.0.1", "HostPort": "9999",
+	}}
+	observation.V1EndpointIdentityProven = false
+	if got, want := strings.Join(liveGatewayV2SourceAttestationFailures(source, preparation, journal, observation, nil), ","),
+		"v1_effective_port_bindings,v1_endpoint_identity"; got != want {
+		t.Fatalf("source diagnostic failures=%q, want %q", got, want)
+	}
 }
 
 func liveGatewayV2Request(t *testing.T, spec liveGatewayV2FixtureSpec, selected hostnetwork.Candidate, port uint16) GatewayV2UpgradeRequest {
