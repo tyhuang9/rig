@@ -972,6 +972,8 @@ func gatewayV2IdentityTestObservation(t *testing.T, source routeState, state gat
 		}
 		observation.StageRestartConfig = append([]byte(nil), observation.StageConfig...)
 		observation.StageRuntime.EffectivePortBindings = gatewayV2IdentityTestPortBindingsCopy(observation.StageContainer.PortBindings)
+		observation.StageRuntime.ConfiguredNetworks = gatewayV2IdentityTestConfiguredNetworks(state, observation.StageContainer,
+			observation.IngressNetworkID, nil)
 		observation.Stage404Proven = true
 		observation.StageHostPublicationProven = true
 		observation.StageStable = true
@@ -988,6 +990,8 @@ func gatewayV2IdentityTestObservation(t *testing.T, source routeState, state gat
 	observation.FinalRuntime.EffectivePortBindings = gatewayV2IdentityTestPortBindingsCopy(observation.FinalContainer.PortBindings)
 	observation.ApplicationNetworks = gatewayV2IdentityTestApplicationNetworksV2(state, observation.FinalContainer)
 	observation.ApplicationNetworkIDs = gatewayV2IdentityTestApplicationNetworkIDsV2(state)
+	observation.FinalRuntime.ConfiguredNetworks = gatewayV2IdentityTestConfiguredNetworks(state, observation.FinalContainer,
+		observation.IngressNetworkID, observation.ApplicationNetworkIDs)
 	routes, assignments := gatewayV2ConfigInputs(state)
 	challenge, err := gatewayV2HostChallenge(state)
 	if err != nil {
@@ -1047,6 +1051,24 @@ func gatewayV2IdentityTestV2Container(state gatewayV2RouteState, journal gateway
 		gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true), networks, bindings,
 		[]mountInspection{{Type: "volume", Name: state.Identity.ConfigVolume, Destination: "/config", RW: true},
 			{Type: "volume", Name: state.Identity.DataVolume, Destination: "/data", RW: true}}, restart, config)
+}
+
+func gatewayV2IdentityTestConfiguredNetworks(state gatewayV2RouteState, container caddyInspection, ingressNetworkID string,
+	applicationNetworkIDs map[string]string,
+) map[string]gatewayV2ConfiguredNetwork {
+	result := make(map[string]gatewayV2ConfiguredNetwork, len(container.Networks))
+	for name := range container.Networks {
+		networkID := applicationNetworkIDs[name]
+		var ipam *gatewayV2ConfiguredIPAM
+		priority := 0
+		if name == state.Identity.IngressNetwork {
+			networkID = ingressNetworkID
+			ipam = &gatewayV2ConfiguredIPAM{IPv4Address: state.Network.ContainerIPv4}
+			priority = caddyGatewayPriority
+		}
+		result[name] = gatewayV2ConfiguredNetwork{IPAMConfig: ipam, NetworkID: networkID, GwPriority: priority}
+	}
+	return result
 }
 
 func gatewayV2IdentityTestVolume(state gatewayV2RouteState, journal gatewayMigrationJournal, name, role string) volumeInspection {

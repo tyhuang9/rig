@@ -656,6 +656,7 @@ const (
 	liveGatewayV2TraceCreateNetworksExtra             liveGatewayV2TraceOutcome = "stopped_networks_extra_key"
 	liveGatewayV2TraceCreateNetworksIDAbsent          liveGatewayV2TraceOutcome = "stopped_networks_network_id_absent"
 	liveGatewayV2TraceCreateNetworksIDMalformed       liveGatewayV2TraceOutcome = "stopped_networks_network_id_malformed_nonempty"
+	liveGatewayV2TraceCreateNetworksIDMismatch        liveGatewayV2TraceOutcome = "stopped_networks_ingress_network_id_mismatch"
 	liveGatewayV2TraceCreateNetworksEndpointPresent   liveGatewayV2TraceOutcome = "stopped_networks_endpoint_id_present"
 	liveGatewayV2TraceCreateNetworksAddressPresent    liveGatewayV2TraceOutcome = "stopped_networks_ip_address_present"
 	liveGatewayV2TraceCreateNetworksIPv6Present       liveGatewayV2TraceOutcome = "stopped_networks_ipv6_gateway_present"
@@ -967,11 +968,11 @@ func liveGatewayV2StoppedContainerFailureOutcomes(state gatewayV2RouteState, jou
 	expectedNetworks, validNetworks := gatewayV2ExpectedContainerNetworks(state, role)
 	add(liveGatewayV2TraceCreatePredicateExpectedNetworks, validNetworks)
 	stoppedNetworksValid := validNetworks &&
-		validGatewayV2StoppedContainerNetworks(state, role, expectedNetworks, runtime.ConfiguredNetworks)
+		validGatewayV2StoppedContainerNetworks(state, journal, role, expectedNetworks, runtime.ConfiguredNetworks)
 	add(liveGatewayV2TraceCreatePredicateStoppedNetworks, stoppedNetworksValid)
 	if validNetworks && !stoppedNetworksValid {
 		failures = append(failures,
-			liveGatewayV2StoppedNetworkFailureOutcomes(state, role, expectedNetworks, runtime.ConfiguredNetworks)...)
+			liveGatewayV2StoppedNetworkFailureOutcomes(state, journal, role, expectedNetworks, runtime.ConfiguredNetworks)...)
 	}
 	return failures
 }
@@ -1001,11 +1002,12 @@ func liveGatewayV2LabelFailureOutcomes(actual, expected map[string]string) []liv
 	)
 }
 
-func liveGatewayV2StoppedNetworkFailureOutcomes(state gatewayV2RouteState, role string, expected map[string]struct{},
-	actual map[string]gatewayV2ConfiguredNetwork,
+func liveGatewayV2StoppedNetworkFailureOutcomes(state gatewayV2RouteState, journal gatewayMigrationJournal, role string,
+	expected map[string]struct{}, actual map[string]gatewayV2ConfiguredNetwork,
 ) []liveGatewayV2TraceOutcome {
 	missing, extra := false, false
 	idAbsent, idMalformed, endpointPresent, addressPresent, ipv6Present := false, false, false, false, false
+	idMismatch := false
 	priorityMismatch, ipamMissing, ipv4Mismatch, ipamIPv6Present, unexpectedIPAM := false, false, false, false, false
 	for name := range expected {
 		attachment, exists := actual[name]
@@ -1019,6 +1021,8 @@ func liveGatewayV2StoppedNetworkFailureOutcomes(state gatewayV2RouteState, role 
 		addressPresent = addressPresent || attachment.IPAddress != ""
 		ipv6Present = ipv6Present || attachment.IPv6Gateway != ""
 		if name == state.Identity.IngressNetwork {
+			idMismatch = idMismatch || attachment.NetworkID != "" && validContainerID(attachment.NetworkID) &&
+				normalizeID(attachment.NetworkID) != journal.Resources.IngressNetworkID
 			priorityMismatch = priorityMismatch || attachment.GwPriority != caddyGatewayPriority
 			ipamMissing = ipamMissing || attachment.IPAMConfig == nil
 			if attachment.IPAMConfig != nil {
@@ -1040,6 +1044,7 @@ func liveGatewayV2StoppedNetworkFailureOutcomes(state gatewayV2RouteState, role 
 		liveGatewayV2TraceSelection{extra, liveGatewayV2TraceCreateNetworksExtra},
 		liveGatewayV2TraceSelection{idAbsent, liveGatewayV2TraceCreateNetworksIDAbsent},
 		liveGatewayV2TraceSelection{idMalformed, liveGatewayV2TraceCreateNetworksIDMalformed},
+		liveGatewayV2TraceSelection{idMismatch, liveGatewayV2TraceCreateNetworksIDMismatch},
 		liveGatewayV2TraceSelection{endpointPresent, liveGatewayV2TraceCreateNetworksEndpointPresent},
 		liveGatewayV2TraceSelection{addressPresent, liveGatewayV2TraceCreateNetworksAddressPresent},
 		liveGatewayV2TraceSelection{ipv6Present, liveGatewayV2TraceCreateNetworksIPv6Present},
@@ -1309,7 +1314,7 @@ func TestGatewayV2StoppedContainerDiagnosticMatchesValidator(t *testing.T) {
 	ingress.NetworkID = ""
 	ingress.IPAMConfig = nil
 	networks[state.Identity.IngressNetwork] = ingress
-	if failures := liveGatewayV2StoppedNetworkFailureOutcomes(state, gatewayV2StageContainerRole, expectedNetworks, networks); !reflect.DeepEqual(failures, []liveGatewayV2TraceOutcome{
+	if failures := liveGatewayV2StoppedNetworkFailureOutcomes(state, journal, gatewayV2StageContainerRole, expectedNetworks, networks); !reflect.DeepEqual(failures, []liveGatewayV2TraceOutcome{
 		liveGatewayV2TraceCreateNetworksIDAbsent, liveGatewayV2TraceCreateNetworksIPAMMissing,
 	}) {
 		t.Fatalf("stopped network diagnostic failures=%v", failures)
@@ -1317,9 +1322,15 @@ func TestGatewayV2StoppedContainerDiagnosticMatchesValidator(t *testing.T) {
 	ingress.IPAMConfig = &gatewayV2ConfiguredIPAM{IPv4Address: state.Network.ContainerIPv4}
 	ingress.NetworkID = "malformed"
 	networks[state.Identity.IngressNetwork] = ingress
-	if failures := liveGatewayV2StoppedNetworkFailureOutcomes(state, gatewayV2StageContainerRole, expectedNetworks, networks); !reflect.DeepEqual(failures,
+	if failures := liveGatewayV2StoppedNetworkFailureOutcomes(state, journal, gatewayV2StageContainerRole, expectedNetworks, networks); !reflect.DeepEqual(failures,
 		[]liveGatewayV2TraceOutcome{liveGatewayV2TraceCreateNetworksIDMalformed}) {
 		t.Fatalf("malformed stopped network ID diagnostic failures=%v", failures)
+	}
+	ingress.NetworkID = "sha256:" + strings.Repeat("9", 64)
+	networks[state.Identity.IngressNetwork] = ingress
+	if failures := liveGatewayV2StoppedNetworkFailureOutcomes(state, journal, gatewayV2StageContainerRole, expectedNetworks, networks); !reflect.DeepEqual(failures,
+		[]liveGatewayV2TraceOutcome{liveGatewayV2TraceCreateNetworksIDMismatch}) {
+		t.Fatalf("mismatched stopped network ID diagnostic failures=%v", failures)
 	}
 }
 
@@ -1628,7 +1639,7 @@ func liveGatewayV2Cleanup(t *testing.T, fixture *liveGatewayV2Fixture) {
 		}
 		if !cleanupAuthorized || expectedID == "" || strings.TrimPrefix(container.Name, "/") != resource.name ||
 			!validContainerID(container.ID) || normalizeID(container.ID) != expectedID ||
-			!reflect.DeepEqual(container.Labels, gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, resource.role, true)) {
+			!validGatewayV2ContainerLabels(container.Labels, gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, resource.role, true)) {
 			t.Errorf("gateway-v2 cleanup container %s has uncertain ownership; retaining it", resource.name)
 			continue
 		}

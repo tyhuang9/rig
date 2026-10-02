@@ -217,7 +217,8 @@ func validGatewayV2StoppedFinalForTransfer(state gatewayV2RouteState, journal ga
 
 func validGatewayV2StoppedIngressNetwork(state gatewayV2RouteState, journal gatewayMigrationJournal, network caddyNetworkInspection, networkID string, found bool, runtime gatewayContainerRuntime) bool {
 	attachment, exists := runtime.ConfiguredNetworks[state.Identity.IngressNetwork]
-	return exists && validContainerID(networkID) && normalizeID(attachment.NetworkID) == normalizeID(networkID) &&
+	return exists && validContainerID(networkID) && normalizeID(networkID) == journal.Resources.IngressNetworkID &&
+		validGatewayV2StoppedNetworkReference(attachment.NetworkID, networkID) &&
 		validGatewayV2IngressNetwork(state, journal, network, found, "", "")
 }
 
@@ -233,7 +234,7 @@ func validGatewayV2StoppedApplicationNetworks(state gatewayV2RouteState, contain
 		inspection, exists := inspections[name]
 		id := ids[name]
 		attachment, attached := runtime.ConfiguredNetworks[name]
-		if !exists || !attached || !validContainerID(id) || normalizeID(attachment.NetworkID) != normalizeID(id) ||
+		if !exists || !attached || !validContainerID(id) || !validGatewayV2StoppedNetworkReference(attachment.NetworkID, id) ||
 			name == state.Identity.IngressNetwork || !validApplicationNetwork(inspection.identity(), appID) {
 			return false
 		}
@@ -244,4 +245,14 @@ func validGatewayV2StoppedApplicationNetworks(state gatewayV2RouteState, contain
 		}
 	}
 	return true
+}
+
+// Docker may omit NetworkID from NetworkSettings.Networks until a newly
+// created container is started. A nonempty value is evidence and must remain a
+// canonical exact match for the independently inspected network identity.
+func validGatewayV2StoppedNetworkReference(configuredID, inspectedID string) bool {
+	if !validContainerID(inspectedID) {
+		return false
+	}
+	return configuredID == "" || (validContainerID(configuredID) && normalizeID(configuredID) == normalizeID(inspectedID))
 }

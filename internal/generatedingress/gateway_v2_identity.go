@@ -803,7 +803,10 @@ func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigr
 		return false
 	}
 	if !running {
-		return validGatewayV2StoppedContainerNetworks(state, role, expectedNetworks, runtime.ConfiguredNetworks)
+		return validGatewayV2StoppedContainerNetworks(state, journal, role, expectedNetworks, runtime.ConfiguredNetworks)
+	}
+	if !validGatewayV2RunningContainerNetworks(state, journal, expectedNetworks, runtime.ConfiguredNetworks) {
+		return false
 	}
 	if len(value.Networks) != len(expectedNetworks) {
 		return false
@@ -846,16 +849,22 @@ func validGatewayV2ContainerLabels(actual, expected map[string]string) bool {
 	return true
 }
 
-func validGatewayV2StoppedContainerNetworks(state gatewayV2RouteState, role string, expected map[string]struct{}, actual map[string]gatewayV2ConfiguredNetwork) bool {
+func validGatewayV2StoppedContainerNetworks(state gatewayV2RouteState, journal gatewayMigrationJournal, role string,
+	expected map[string]struct{}, actual map[string]gatewayV2ConfiguredNetwork,
+) bool {
 	if len(actual) != len(expected) {
 		return false
 	}
 	for name := range expected {
 		attachment, exists := actual[name]
-		if !exists || !validContainerID(attachment.NetworkID) || attachment.EndpointID != "" || attachment.IPAddress != "" || attachment.IPv6Gateway != "" {
+		if !exists || (attachment.NetworkID != "" && !validContainerID(attachment.NetworkID)) ||
+			attachment.EndpointID != "" || attachment.IPAddress != "" || attachment.IPv6Gateway != "" {
 			return false
 		}
 		if name == state.Identity.IngressNetwork {
+			if attachment.NetworkID != "" && normalizeID(attachment.NetworkID) != journal.Resources.IngressNetworkID {
+				return false
+			}
 			if attachment.GwPriority != caddyGatewayPriority || attachment.IPAMConfig == nil ||
 				attachment.IPAMConfig.IPv4Address != state.Network.ContainerIPv4 || attachment.IPAMConfig.IPv6Address != "" {
 				return false
@@ -864,6 +873,24 @@ func validGatewayV2StoppedContainerNetworks(state gatewayV2RouteState, role stri
 		}
 		if role != gatewayV2FinalContainerRole || attachment.GwPriority != 0 ||
 			(attachment.IPAMConfig != nil && *attachment.IPAMConfig != (gatewayV2ConfiguredIPAM{})) {
+			return false
+		}
+	}
+	return true
+}
+
+func validGatewayV2RunningContainerNetworks(state gatewayV2RouteState, journal gatewayMigrationJournal,
+	expected map[string]struct{}, actual map[string]gatewayV2ConfiguredNetwork,
+) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for name := range expected {
+		attachment, exists := actual[name]
+		if !exists || !validContainerID(attachment.NetworkID) {
+			return false
+		}
+		if name == state.Identity.IngressNetwork && normalizeID(attachment.NetworkID) != journal.Resources.IngressNetworkID {
 			return false
 		}
 	}
