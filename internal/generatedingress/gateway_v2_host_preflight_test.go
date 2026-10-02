@@ -1,6 +1,7 @@
 package generatedingress
 
 import (
+	"context"
 	"errors"
 	"net/netip"
 	"testing"
@@ -10,71 +11,73 @@ import (
 
 func TestGatewayV2HostPreflightRequiresApprovedInterfaceAndNonoverlap(t *testing.T) {
 	_, input := upgradeTestPreparation(t)
-	approved := hostnetwork.Candidate{InterfaceID: input.Profile.InterfaceID, IPv4: input.Profile.SelectedIPv4}
-	checks := 0
-	reads := gatewayV2HostPreflightReads{
-		candidates: func() ([]hostnetwork.Candidate, error) {
-			return []hostnetwork.Candidate{approved}, nil
-		},
-		checkSubnet: func(prefix netip.Prefix) error {
-			checks++
-			if prefix.String() != input.Network.Subnet {
-				t.Fatalf("checked subnet = %s", prefix)
-			}
-			return nil
-		},
+	approved := gatewayV2TestCandidate(input.Profile)
+	reads := gatewayV2NetworkPlanReads{
+		candidates: func() ([]hostNetworkCandidate, error) { return []hostNetworkCandidate{approved}, nil },
+		host:       func() (gatewayV2HostNetworkSnapshot, error) { return gatewayV2HostNetworkSnapshot{}, nil },
+		docker:     func(context.Context) ([]netip.Prefix, error) { return nil, nil },
 	}
-	if err := checkGatewayV2HostPreflight(input.Profile, input.Network, reads); err != nil || checks != 1 {
-		t.Fatalf("approved host preflight: err=%v checks=%d", err, checks)
+	if err := validateGatewayV2NetworkPlanAgainstReads(context.Background(), input.Profile, input.Network, reads); err != nil {
+		t.Fatalf("approved host preflight: %v", err)
 	}
-	if err := checkGatewayV2SelectedInterface(input.Profile, reads.candidates); err != nil {
+	if err := checkGatewayV2SelectedInterface(input.Profile, func() ([]hostnetwork.Candidate, error) {
+		return []hostnetwork.Candidate{{InterfaceID: approved.InterfaceID, IPv4: approved.IPv4}}, nil
+	}); err != nil {
 		t.Fatalf("approved interface before port bind: %v", err)
 	}
 
-	reads.candidates = func() ([]hostnetwork.Candidate, error) {
-		return []hostnetwork.Candidate{{InterfaceID: "replacement", IPv4: input.Profile.SelectedIPv4}}, nil
+	reads.candidates = func() ([]hostNetworkCandidate, error) {
+		return []hostNetworkCandidate{{InterfaceID: "replacement", IPv4: input.Profile.SelectedIPv4, Prefix: approved.Prefix}}, nil
 	}
-	if err := checkGatewayV2HostPreflight(input.Profile, input.Network, reads); !IsCode(err, DiagnosticIngressDrift) || checks != 1 {
-		t.Fatalf("changed interface: err=%v checks=%d", err, checks)
-	}
-	if err := checkGatewayV2SelectedInterface(input.Profile, reads.candidates); !IsCode(err, DiagnosticIngressDrift) {
-		t.Fatalf("changed interface before port bind: %v", err)
+	if err := validateGatewayV2NetworkPlanAgainstReads(context.Background(), input.Profile, input.Network, reads); !IsCode(err, DiagnosticIngressDrift) {
+		t.Fatalf("changed interface: %v", err)
 	}
 
-	reads.candidates = func() ([]hostnetwork.Candidate, error) {
-		return []hostnetwork.Candidate{approved, {InterfaceID: "duplicate", IPv4: input.Profile.SelectedIPv4}}, nil
+	reads.candidates = func() ([]hostNetworkCandidate, error) {
+		return []hostNetworkCandidate{approved, {InterfaceID: "duplicate", IPv4: input.Profile.SelectedIPv4, Prefix: approved.Prefix}}, nil
 	}
-	if err := checkGatewayV2HostPreflight(input.Profile, input.Network, reads); !IsCode(err, DiagnosticIngressDrift) || checks != 1 {
-		t.Fatalf("ambiguous address: err=%v checks=%d", err, checks)
+	if err := validateGatewayV2NetworkPlanAgainstReads(context.Background(), input.Profile, input.Network, reads); !IsCode(err, DiagnosticIngressDrift) {
+		t.Fatalf("ambiguous address: %v", err)
 	}
 
-	reads.candidates = func() ([]hostnetwork.Candidate, error) { return []hostnetwork.Candidate{approved}, nil }
-	reads.checkSubnet = func(netip.Prefix) error { return hostnetwork.ErrIngressSubnetOverlap }
-	if err := checkGatewayV2HostPreflight(input.Profile, input.Network, reads); !IsCode(err, DiagnosticIngressDrift) {
-		t.Fatalf("overlapping host route: %v", err)
+	reads.candidates = func() ([]hostNetworkCandidate, error) { return []hostNetworkCandidate{approved}, nil }
+	reads.docker = func(context.Context) ([]netip.Prefix, error) {
+		return []netip.Prefix{netip.MustParsePrefix(input.Network.Subnet)}, nil
+	}
+	if err := validateGatewayV2NetworkPlanAgainstReads(context.Background(), input.Profile, input.Network, reads); !IsCode(err, DiagnosticIngressDrift) {
+		t.Fatalf("overlapping Docker network: %v", err)
 	}
 }
 
 func TestGatewayV2HostPreflightFailsClosedOnIncompleteReads(t *testing.T) {
 	_, input := upgradeTestPreparation(t)
-	reads := gatewayV2HostPreflightReads{
-		candidates:  func() ([]hostnetwork.Candidate, error) { return nil, errors.New("interface read failed") },
-		checkSubnet: func(netip.Prefix) error { t.Fatal("subnet checked after failed interface read"); return nil },
+	reads := gatewayV2NetworkPlanReads{
+		candidates: func() ([]hostNetworkCandidate, error) { return nil, errors.New("interface read failed") },
+		host: func() (gatewayV2HostNetworkSnapshot, error) {
+			t.Fatal("host snapshot read after failed interface read")
+			return gatewayV2HostNetworkSnapshot{}, nil
+		},
+		docker: func(context.Context) ([]netip.Prefix, error) {
+			t.Fatal("Docker snapshot read after failed interface read")
+			return nil, nil
+		},
 	}
-	if err := checkGatewayV2HostPreflight(input.Profile, input.Network, reads); !IsCode(err, DiagnosticIngressDrift) {
+	if err := validateGatewayV2NetworkPlanAgainstReads(context.Background(), input.Profile, input.Network, reads); !IsCode(err, DiagnosticIngressDrift) {
 		t.Fatalf("incomplete interface read: %v", err)
 	}
-	reads.candidates = func() ([]hostnetwork.Candidate, error) {
-		return []hostnetwork.Candidate{{InterfaceID: input.Profile.InterfaceID, IPv4: input.Profile.SelectedIPv4}}, nil
+	reads.candidates = func() ([]hostNetworkCandidate, error) {
+		return []hostNetworkCandidate{gatewayV2TestCandidate(input.Profile)}, nil
 	}
-	reads.checkSubnet = func(netip.Prefix) error { return hostnetwork.ErrIncompleteHostSnapshot }
-	if err := checkGatewayV2HostPreflight(input.Profile, input.Network, reads); !IsCode(err, DiagnosticIngressDrift) {
+	reads.host = func() (gatewayV2HostNetworkSnapshot, error) {
+		return gatewayV2HostNetworkSnapshot{}, errors.New("incomplete host snapshot")
+	}
+	if err := validateGatewayV2NetworkPlanAgainstReads(context.Background(), input.Profile, input.Network, reads); !IsCode(err, DiagnosticIngressDrift) {
 		t.Fatalf("incomplete route read: %v", err)
 	}
 
 	invalid := input.Network
 	invalid.ContainerIPv4 = invalid.GatewayIPv4
-	if err := checkGatewayV2HostPreflight(input.Profile, invalid, reads); !IsCode(err, DiagnosticValidationFailed) {
+	if err := validateGatewayV2NetworkPlanAgainstReads(context.Background(), input.Profile, invalid, reads); !IsCode(err, DiagnosticValidationFailed) {
 		t.Fatalf("invalid network plan: %v", err)
 	}
 }

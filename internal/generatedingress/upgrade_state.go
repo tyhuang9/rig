@@ -32,7 +32,6 @@ const (
 	maxGatewayMigrationBytes = 12 << 10
 
 	gatewayUpgradeActionName = "upgrade_generated_ingress"
-	gatewayUpgradeDigestV1   = 1
 	gatewayTargetFormat      = 2
 	gatewayV1IdentityVersion = "v1"
 	gatewayV2IdentityVersion = "v2"
@@ -316,21 +315,16 @@ func prepareGatewayV2State(source routeState, input gatewayUpgradePreparation) (
 }
 
 func gatewayUpgradeActionDigest(profile gatewayProfileBinding, identityVersion string) (string, error) {
-	if !validGatewayProfileBinding(profile) || identityVersion != gatewayV2IdentityVersion {
+	if !validGatewayProfileBinding(profile) || identityVersion != gatewayV2IdentityVersion ||
+		gatewayUpgradeActionName != string(appaccess.ActionUpgradeGateway) ||
+		gatewayTargetFormat != appaccess.GatewayUpgradeTargetFormat ||
+		gatewayV2IdentityVersion != appaccess.GatewayUpgradeIdentityVersion {
 		return "", errors.New("invalid generated ingress upgrade action")
 	}
-	return canonicalDigest(struct {
-		Version               int    `json:"version"`
-		Action                string `json:"action"`
-		TargetFormat          int    `json:"targetFormat"`
-		ProfileRevisionID     string `json:"profileRevisionId"`
-		ProfileRevisionNumber int64  `json:"profileRevisionNumber"`
-		ProfileSpecDigest     string `json:"profileSpecDigest"`
-		IdentityVersion       string `json:"identityVersion"`
-	}{
-		Version: gatewayUpgradeDigestV1, Action: gatewayUpgradeActionName, TargetFormat: gatewayTargetFormat,
-		ProfileRevisionID: profile.RevisionID, ProfileRevisionNumber: profile.RevisionNumber,
-		ProfileSpecDigest: profile.SpecDigest, IdentityVersion: identityVersion,
+	return appaccess.GatewayProfileUpgradeSpecDigest(appaccess.GatewayProfileUpgradeSpec{
+		ProfileRevisionID:     profile.RevisionID,
+		ProfileRevisionNumber: profile.RevisionNumber,
+		ProfileSpecDigest:     profile.SpecDigest,
 	})
 }
 
@@ -390,16 +384,15 @@ func validGatewayProfileBinding(profile gatewayProfileBinding) bool {
 
 func validGatewayV2NetworkPlan(plan gatewayV2NetworkPlan) bool {
 	prefix, err := netip.ParsePrefix(plan.Subnet)
-	if err != nil || !prefix.Addr().Is4() || !prefix.Addr().IsPrivate() || prefix != prefix.Masked() || prefix.Bits() < 8 || prefix.Bits() > 30 {
+	if err != nil || !prefix.Addr().Is4() || !prefix.Addr().IsPrivate() || prefix != prefix.Masked() || prefix.Bits() != gatewayV2NetworkPrefixBits {
 		return false
 	}
 	gateway, gatewayErr := netip.ParseAddr(plan.GatewayIPv4)
 	container, containerErr := netip.ParseAddr(plan.ContainerIPv4)
-	broadcast := lastIPv4Address(prefix)
+	base := ipv4ToUint32(prefix.Addr())
 	return gatewayErr == nil && containerErr == nil && gateway.Is4() && container.Is4() &&
 		gateway.IsPrivate() && container.IsPrivate() && gateway.String() == plan.GatewayIPv4 && container.String() == plan.ContainerIPv4 &&
-		prefix.Contains(gateway) && prefix.Contains(container) && gateway != prefix.Addr() && container != prefix.Addr() &&
-		gateway != broadcast && container != broadcast && gateway != container
+		gateway == uint32ToIPv4(base+1) && container == uint32ToIPv4(base+2)
 }
 
 func gatewayV2NetworkExcludesSelectedLAN(profile gatewayProfileBinding, plan gatewayV2NetworkPlan) bool {

@@ -30,7 +30,23 @@ type ApprovalAction string
 
 const (
 	ActionConfigureGateway ApprovalAction = "configure_lan_gateway"
+	ActionUpgradeGateway   ApprovalAction = "upgrade_generated_ingress"
 	ActionEnableAppAccess  ApprovalAction = "enable_lan_access"
+)
+
+const (
+	GatewayUpgradeTargetFormat    = 2
+	GatewayUpgradeIdentityVersion = "v2"
+)
+
+type GatewayProfileUpgradeState string
+
+const (
+	GatewayProfileUpgradePrepared   GatewayProfileUpgradeState = "prepared"
+	GatewayProfileUpgradeServing    GatewayProfileUpgradeState = "serving"
+	GatewayProfileUpgradeUnresolved GatewayProfileUpgradeState = "unresolved"
+	GatewayProfileUpgradeCommitted  GatewayProfileUpgradeState = "committed"
+	GatewayProfileUpgradeRolledBack GatewayProfileUpgradeState = "rolled_back"
 )
 
 type AllocationState string
@@ -87,6 +103,45 @@ type GatewayProfileRevision struct {
 	SpecDigest     string
 	ApprovedBy     string
 	ApprovedAt     time.Time
+}
+
+// GatewayProfileUpgradeSpec is the durable authorization boundary for the
+// one-way generated-ingress v1-to-v2 migration. TargetFormat and
+// IdentityVersion are intentionally fixed by GatewayProfileUpgradeSpecDigest;
+// callers cannot approve a future format through this action by accident.
+type GatewayProfileUpgradeSpec struct {
+	ProfileRevisionID     string `json:"profileRevisionId"`
+	ProfileRevisionNumber int64  `json:"profileRevisionNumber"`
+	ProfileSpecDigest     string `json:"profileSpecDigest"`
+}
+
+type ClaimGatewayProfileUpgradeInput struct {
+	OperationID string
+	Spec        GatewayProfileUpgradeSpec
+	Approval    Approval
+}
+
+type GatewayProfileUpgradeClaimOwner struct {
+	OperationID           string
+	ProfileRevisionID     string
+	ProfileRevisionNumber int64
+}
+
+// GatewayProfileUpgradeClaim binds one operation and administrator approval
+// to one exact profile revision. State changes are retained separately as an
+// append-only event history. Prepared, serving, unresolved, and committed
+// claims pin the profile; only an attested rolled-back claim releases it.
+type GatewayProfileUpgradeClaim struct {
+	OperationID           string
+	RequestDigest         string
+	ProfileRevisionID     string
+	ProfileRevisionNumber int64
+	ProfileSpecDigest     string
+	ApprovedBy            string
+	ApprovedAt            time.Time
+	State                 GatewayProfileUpgradeState
+	StateSequence         int64
+	UpdatedAt             time.Time
 }
 
 type ReserveAppAccessInput struct {
@@ -158,6 +213,53 @@ func GatewayProfileSpecDigest(spec GatewayProfileSpec) (string, error) {
 		Action  ApprovalAction     `json:"action"`
 		Spec    GatewayProfileSpec `json:"spec"`
 	}{Version: 1, Action: ActionConfigureGateway, Spec: canonical})
+}
+
+// GatewayProfileUpgradeSpecDigest is the single canonical digest shared by
+// the database approval and the generated-ingress protected journal.
+func GatewayProfileUpgradeSpecDigest(spec GatewayProfileUpgradeSpec) (string, error) {
+	if !validUUID(spec.ProfileRevisionID) || spec.ProfileRevisionNumber <= 0 || !validDigest(spec.ProfileSpecDigest) {
+		return "", ErrInvalidInput
+	}
+	return digestJSON(struct {
+		Version               int            `json:"version"`
+		Action                ApprovalAction `json:"action"`
+		TargetFormat          int            `json:"targetFormat"`
+		ProfileRevisionID     string         `json:"profileRevisionId"`
+		ProfileRevisionNumber int64          `json:"profileRevisionNumber"`
+		ProfileSpecDigest     string         `json:"profileSpecDigest"`
+		IdentityVersion       string         `json:"identityVersion"`
+	}{
+		Version:               1,
+		Action:                ActionUpgradeGateway,
+		TargetFormat:          GatewayUpgradeTargetFormat,
+		ProfileRevisionID:     spec.ProfileRevisionID,
+		ProfileRevisionNumber: spec.ProfileRevisionNumber,
+		ProfileSpecDigest:     spec.ProfileSpecDigest,
+		IdentityVersion:       GatewayUpgradeIdentityVersion,
+	})
+}
+
+func validGatewayProfileUpgradeState(value GatewayProfileUpgradeState) bool {
+	switch value {
+	case GatewayProfileUpgradePrepared, GatewayProfileUpgradeServing, GatewayProfileUpgradeUnresolved, GatewayProfileUpgradeCommitted, GatewayProfileUpgradeRolledBack:
+		return true
+	default:
+		return false
+	}
+}
+
+func validGatewayProfileUpgradeTransition(from, to GatewayProfileUpgradeState) bool {
+	switch from {
+	case GatewayProfileUpgradePrepared:
+		return to == GatewayProfileUpgradeServing || to == GatewayProfileUpgradeUnresolved || to == GatewayProfileUpgradeCommitted || to == GatewayProfileUpgradeRolledBack
+	case GatewayProfileUpgradeServing:
+		return to == GatewayProfileUpgradeCommitted || to == GatewayProfileUpgradeUnresolved || to == GatewayProfileUpgradeRolledBack
+	case GatewayProfileUpgradeUnresolved:
+		return to == GatewayProfileUpgradeCommitted || to == GatewayProfileUpgradeRolledBack
+	default:
+		return false
+	}
 }
 
 func AppAccessSpecFor(allocation Allocation) AppAccessSpec {

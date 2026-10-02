@@ -19,6 +19,8 @@ type Repository struct {
 	db                      *sql.DB
 	now                     func() time.Time
 	afterGatewayLock        func()
+	afterGatewayClaimLock   func()
+	afterCurrentClaimLookup func()
 	afterReservationLock    func()
 	afterApprovalLock       func()
 	beforeReservationCommit func()
@@ -30,7 +32,8 @@ func New(db *sql.DB) *Repository { return &Repository{db: db, now: time.Now} }
 // the singleton profile head with compare-and-swap. The head is not proof that
 // gateway v2 was applied. A later maintenance journal and fresh attestation
 // must gate both app activation and every reported URL. This method rejects a
-// new desired profile while any live allocation still pins the current one.
+// new desired profile while any live allocation or non-rolled-back gateway
+// upgrade claim still pins the current one.
 func (r *Repository) ConfigureGatewayProfile(ctx context.Context, input ConfigureGatewayInput) (GatewayProfileRevision, bool, error) {
 	canonical, err := canonicalGatewaySpec(input.Spec)
 	if r == nil || r.db == nil || err != nil || !validUUID(input.OperationID) || input.ExpectedRevisionNumber < 0 {
@@ -67,6 +70,11 @@ func (r *Repository) ConfigureGatewayProfile(ctx context.Context, input Configur
 		return GatewayProfileRevision{}, false, err
 	} else if !ok {
 		return GatewayProfileRevision{}, false, ErrApprovalRequired
+	}
+	if blocking, err := blockingGatewayProfileUpgradeClaimExists(ctx, tx); err != nil {
+		return GatewayProfileRevision{}, false, err
+	} else if blocking {
+		return GatewayProfileRevision{}, false, ErrConflict
 	}
 	var current int64
 	if err := tx.QueryRowContext(ctx, `SELECT revision_number FROM lan_gateway_profile_heads WHERE singleton=1`).Scan(&current); err != nil {
@@ -131,6 +139,36 @@ func (r *Repository) CurrentGatewayProfile(ctx context.Context) (GatewayProfileR
 	}
 	value, _, err := readGatewayRevision(ctx, r.db, id.String, number)
 	return value, err
+}
+
+// ReplayGatewayProfile reads an immutable operation before a controller
+// performs fresh host-interface validation. A committed exact retry remains
+// identifiable even when that interface has since disappeared. New writes
+// must still use ConfigureGatewayProfile after their own host preflight.
+func (r *Repository) ReplayGatewayProfile(ctx context.Context, input ConfigureGatewayInput) (GatewayProfileRevision, error) {
+	canonical, err := canonicalGatewaySpec(input.Spec)
+	if r == nil || r.db == nil || err != nil || !validUUID(input.OperationID) || input.ExpectedRevisionNumber < 0 {
+		return GatewayProfileRevision{}, ErrInvalidInput
+	}
+	specDigest, err := GatewayProfileSpecDigest(canonical)
+	if err != nil || !validApproval(input.Approval, ActionConfigureGateway, specDigest) {
+		return GatewayProfileRevision{}, ErrApprovalRequired
+	}
+	requestDigest, err := gatewayRequestDigest(input, canonical)
+	if err != nil {
+		return GatewayProfileRevision{}, err
+	}
+	existing, storedDigest, err := readGatewayByOperation(ctx, r.db, input.OperationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return GatewayProfileRevision{}, ErrNotFound
+	}
+	if err != nil {
+		return GatewayProfileRevision{}, err
+	}
+	if storedDigest != requestDigest {
+		return GatewayProfileRevision{}, ErrIdempotencyMismatch
+	}
+	return existing, nil
 }
 
 // ReserveAppAccess assigns the first available port in the current approved

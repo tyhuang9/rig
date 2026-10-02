@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/apicontract"
+	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
@@ -27,6 +28,7 @@ import (
 	"github.com/hostd/hostd/internal/controllerrelay"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/hostnetwork"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/runtime/docker"
@@ -58,6 +60,8 @@ type Server struct {
 	DeploymentPlans       *deploymentplans.Store
 	RelayManagement       RelayManagementService
 	AutoDeploy            AutoDeployService
+	GatewayProfiles       GatewayProfileService
+	GatewayCandidates     func() ([]hostnetwork.Candidate, error)
 	AutoDeployAvailable   bool
 	RelayReconcile        func()
 	AutoDeployReconcile   func()
@@ -80,6 +84,15 @@ type AutoDeployService interface {
 	Get(context.Context, string) (autodeploy.Status, error)
 	Configure(context.Context, autodeploy.ConfigureRequest, time.Time) (autodeploy.Status, error)
 	Resume(context.Context, string, string, uint64, time.Time) (autodeploy.Status, error)
+}
+
+// GatewayProfileService persists approved desired LAN gateway state. The
+// controller separately proves the selected host interface before calling it;
+// neither this boundary nor its response represents observed serving state.
+type GatewayProfileService interface {
+	CurrentGatewayProfile(context.Context) (appaccess.GatewayProfileRevision, error)
+	ReplayGatewayProfile(context.Context, appaccess.ConfigureGatewayInput) (appaccess.GatewayProfileRevision, error)
+	ConfigureGatewayProfile(context.Context, appaccess.ConfigureGatewayInput) (appaccess.GatewayProfileRevision, bool, error)
 }
 
 type authenticationService interface {
@@ -116,6 +129,8 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("rotateCSRF", s.require(s.rotateCSRF)),
 		contractRoute("systemStatus", s.require(s.status)),
 		contractRoute("doctor", s.require(s.doctor)),
+		contractRoute(operationGetLANGatewayProfile, noStore(s.requireOperation(operationGetLANGatewayProfile, s.getLANGatewayProfile))),
+		contractRoute(operationConfigureLANGatewayProfile, noStore(s.requireOperation(operationConfigureLANGatewayProfile, s.configureLANGatewayProfile))),
 		contractRoute("listApplications", s.require(s.listApps)),
 		contractRoute("createApplication", s.require(s.createApp)),
 		contractRoute("inspectImport", noStore(s.require(s.inspectApp))),
