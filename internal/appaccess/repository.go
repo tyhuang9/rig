@@ -25,6 +25,10 @@ type Repository struct {
 	afterUpgradeStartupClaimsRead func()
 	afterReservationLock          func()
 	afterApprovalLock             func()
+	afterDisableIntentLock        func()
+	afterGrantClaimLock           func()
+	afterGrantStartupClaimsRead   func()
+	beforeGrantTransitionCommit   func()
 	beforeReservationCommit       func()
 }
 
@@ -486,6 +490,13 @@ func (r *Repository) transitionAllocation(ctx context.Context, owner AllocationO
 	}
 	if value.ReleasedAt != nil {
 		return Allocation{}, ErrReservationReleased
+	}
+	var disableIntent int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM lan_app_access_disable_intents WHERE allocation_id=?)`, owner.AllocationID).Scan(&disableIntent); err != nil {
+		return Allocation{}, err
+	}
+	if disableIntent != 0 {
+		return Allocation{}, ErrInvalidTransition
 	}
 	if target == AllocationActive {
 		var current int

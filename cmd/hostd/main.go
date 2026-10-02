@@ -77,16 +77,35 @@ func runServer(args []string) int {
 		logger.Error("Docker executable resolution failed", "error", err)
 		return 1
 	}
+	emergencyStop := func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if stopErr := stopOwnedGatewayOnStartupFailure(stopCtx, cfg, dockerExecutable, ownerDirectories); stopErr != nil {
+			logger.Error("owned gateway emergency stop could not be verified", "error", stopErr)
+		} else {
+			logger.Warn("owned gateway stopped after startup reconciliation failure")
+		}
+	}
 	db, err := database.Open(cfg.DataRoot)
 	if err != nil {
 		logger.Error("database startup failed", "error", err)
+		emergencyStop()
 		return 1
 	}
 	defer db.Close()
 	gate, err := inspectGatewayStartup(context.Background(), cfg, db, dockerExecutable, ownerDirectories)
 	if err != nil {
 		logger.Error("gateway startup inspection failed", "error", err)
+		emergencyStop()
 		return 1
+	}
+	if gate.recoveryKind == controller.RecoveryLANGrant {
+		gate, err = quarantineLANRecoveryStartup(context.Background(), db, gate)
+		if err != nil {
+			logger.Error("LAN grant startup quarantine failed", "error", err)
+			emergencyStop()
+			return 1
+		}
 	}
 	a := auth.New(db)
 	token, err := a.EnsureBootstrapToken()
@@ -116,9 +135,10 @@ func runServer(args []string) int {
 		}
 	}
 	defer bootstrapCompleted()
-	if gate.inspection.Disposition == generatedingress.GatewayV2StartupRecoveryOnly {
-		logger.Warn("controller entering gateway recovery mode", "operation_id", gate.inspection.OperationID)
-		return runRecoveryOnlyController(cfg, logger, listener, a, appaccess.New(db), gate.ingress, gate.inspection.OperationID, bootstrapCompleted)
+	if gate.recoveryKind != "" {
+		logger.Warn("controller entering gateway recovery mode", "kind", gate.recoveryKind, "operation_id", gate.recoveryID)
+		return runRecoveryOnlyController(cfg, logger, listener, a, appaccess.New(db), gate.ingress,
+			gate.recoveryKind, gate.recoveryID, gate.recoveryAppID, bootstrapCompleted)
 	}
 	m := machines.New(db)
 	if _, err := m.EnsureLocal(); err != nil {
@@ -184,15 +204,25 @@ func runServer(args []string) int {
 		return 1
 	}
 	if cfg.GeneratedRuntime {
-		confirmedSnapshot, snapshotErr := appaccess.New(db).GatewayUpgradeStartupSnapshot(context.Background())
+		confirmedSnapshot, snapshotErr := appaccess.New(db).HostingGatewayStartupSnapshot(context.Background())
 		if snapshotErr != nil || !reflect.DeepEqual(gate.snapshot, confirmedSnapshot) {
-			logger.Error("gateway startup claim snapshot changed", "error", snapshotErr)
+			logger.Error("hosting gateway startup claim snapshot changed", "error", snapshotErr)
+			emergencyStop()
 			return 1
 		}
-		confirmedInspection, inspectErr := runtime.ingress.InspectGatewayV2Startup(context.Background(), gatewayStartupClaims(confirmedSnapshot))
+		confirmedInspection, inspectErr := runtime.ingress.InspectGatewayV2Startup(context.Background(), gatewayStartupClaims(confirmedSnapshot.Upgrades))
 		if inspectErr != nil || confirmedInspection != gate.inspection {
 			logger.Error("gateway startup inspection changed after recovery", "error", inspectErr)
+			emergencyStop()
 			return 1
+		}
+		if gate.inspection.Disposition == generatedingress.GatewayV2StartupNormalV2 {
+			confirmedGrantInspection, grantErr := runtime.ingress.InspectGatewayV2LANStartup(context.Background(), lanGrantStartupClaims(confirmedSnapshot.Grants))
+			if grantErr != nil || confirmedGrantInspection != gate.grantInspection {
+				logger.Error("LAN grant startup inspection changed after recovery", "error", grantErr)
+				emergencyStop()
+				return 1
+			}
 		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -226,9 +256,10 @@ func runServer(args []string) int {
 	})
 	effectiveAutoDeploy := (cfg.ComposeRuntime || cfg.GeneratedRuntime) && cfg.GitHubConnectionsEnabled() && sources.ProviderEnabled()
 	appAccessRepository := appaccess.New(db)
-	controllerServer := &controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, DeploymentPlans: planStore, GeneratedIngress: runtime.ingress, GeneratedRuntimeState: runtime.state, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, GatewayProfiles: appAccessRepository, GatewayUpgrades: appAccessRepository, AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}
+	controllerServer := &controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, DeploymentPlans: planStore, GeneratedIngress: runtime.ingress, GeneratedRuntimeState: runtime.state, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, GatewayProfiles: appAccessRepository, GatewayUpgrades: appAccessRepository, AppAccess: appAccessRepository, AppGrants: appAccessRepository, AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}
 	if runtime.ingress != nil {
 		controllerServer.GatewayUpgradeRuntime = runtime.ingress
+		controllerServer.LANGrantRuntime = runtime.ingress
 	}
 	applyRuntimeCapabilities(controllerServer, capabilities)
 	s := &http.Server{Addr: cfg.ListenAddress, Handler: controllerServer.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
@@ -256,9 +287,12 @@ func runServer(args []string) int {
 }
 
 func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener net.Listener, authentication *auth.Service,
-	upgrades *appaccess.Repository, ingress *generatedingress.Manager, operationID string, bootstrapCompleted func(),
+	upgrades *appaccess.Repository, ingress *generatedingress.Manager, kind, operationID, appID string,
+	bootstrapCompleted func(),
 ) int {
-	if operationID == "" || ingress == nil || upgrades == nil || listener == nil {
+	if operationID == "" || ingress == nil || upgrades == nil || listener == nil ||
+		(kind != controller.RecoveryGatewayUpgrade && kind != controller.RecoveryLANGrant) ||
+		(kind == controller.RecoveryLANGrant && appID == "") {
 		logger.Error("gateway recovery controller is missing its pinned operation")
 		return 1
 	}
@@ -266,7 +300,9 @@ func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener 
 	defer stop()
 	server := &controller.Server{
 		Auth: authentication, GatewayUpgrades: upgrades, GatewayUpgradeRuntime: ingress,
-		GeneratedRuntime: true, RecoveryOnly: true, RecoveryOperationID: operationID,
+		AppAccess: upgrades, AppGrants: upgrades, LANGrantRuntime: ingress,
+		GeneratedRuntime: true, RecoveryOnly: true, RecoveryKind: kind,
+		RecoveryOperationID: operationID, RecoveryAppID: appID,
 		Logger: logger, BootstrapCompleted: bootstrapCompleted,
 	}
 	httpServer := &http.Server{Addr: cfg.ListenAddress, Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}

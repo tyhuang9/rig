@@ -7,72 +7,77 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "2e628b7ec9ea5ea64d3e1ba99cac4329a6ed3f815c932fa2965e9e0911016eaa"
+const SourceSHA256 = "d817cf5e52696baae010c2423f9184d7249642f22ddf8118d00263792f87e02b"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
 	"approveApplicationDeploymentPlanMigration": {Method: "POST", Path: "/api/v1/apps/{appId}/deployment-plan/migration-approval"},
-	"bootstrap":                             {Method: "POST", Path: "/api/v1/auth/bootstrap"},
-	"bootstrapStatus":                       {Method: "GET", Path: "/api/v1/auth/bootstrap/status"},
-	"cancelJob":                             {Method: "POST", Path: "/api/v1/jobs/{jobId}/cancel"},
-	"configureLANGatewayProfile":            {Method: "POST", Path: "/api/v1/system/lan-gateway-profile"},
-	"createApplication":                     {Method: "POST", Path: "/api/v1/apps"},
-	"deployApplication":                     {Method: "POST", Path: "/api/v1/apps/{appId}/deployments"},
-	"deployRelease":                         {Method: "POST", Path: "/api/v1/apps/{appId}/releases/{releaseId}/deployments"},
-	"disconnectSourceConnection":            {Method: "DELETE", Path: "/api/v1/source-connections/{connectionId}"},
-	"doctor":                                {Method: "GET", Path: "/api/v1/system/doctor"},
-	"getApplication":                        {Method: "GET", Path: "/api/v1/apps/{appId}"},
-	"getApplicationAutoDeploy":              {Method: "GET", Path: "/api/v1/apps/{appId}/auto-deploy"},
-	"getApplicationConfiguration":           {Method: "GET", Path: "/api/v1/apps/{appId}/configuration"},
-	"getApplicationDeploymentPlan":          {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-plan"},
-	"getApplicationLocalRoute":              {Method: "GET", Path: "/api/v1/apps/{appId}/local-route"},
-	"getDefaultSourceConnection":            {Method: "GET", Path: "/api/v1/source-connections/default"},
-	"getDeploymentJobByIdempotency":         {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-jobs/by-idempotency"},
-	"getJob":                                {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
-	"getLANGatewayProfile":                  {Method: "GET", Path: "/api/v1/system/lan-gateway-profile"},
-	"getLANGatewayUpgrade":                  {Method: "GET", Path: "/api/v1/system/lan-gateway-upgrade"},
-	"getRelayStatus":                        {Method: "GET", Path: "/api/v1/relay/status"},
-	"grantRuntimeApproval":                  {Method: "POST", Path: "/api/v1/apps/{appId}/runtime-approvals"},
-	"inspectImport":                         {Method: "POST", Path: "/api/v1/apps/import/inspect"},
-	"listApplications":                      {Method: "GET", Path: "/api/v1/apps"},
-	"listDefaultGitHubRepositories":         {Method: "GET", Path: "/api/v1/source-connections/default/github/repositories"},
-	"listDeployments":                       {Method: "GET", Path: "/api/v1/apps/{appId}/deployments"},
-	"listGitHubBranches":                    {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories/{repositoryId}/branches"},
-	"listGitHubInstallations":               {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations"},
-	"listGitHubRepositories":                {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories"},
-	"listJobEvents":                         {Method: "GET", Path: "/api/v1/jobs/{jobId}/events"},
-	"listJobs":                              {Method: "GET", Path: "/api/v1/jobs"},
-	"listMachines":                          {Method: "GET", Path: "/api/v1/machines"},
-	"listReleases":                          {Method: "GET", Path: "/api/v1/apps/{appId}/releases"},
-	"listRuntimeApprovals":                  {Method: "GET", Path: "/api/v1/apps/{appId}/runtime-approvals"},
-	"listServices":                          {Method: "GET", Path: "/api/v1/apps/{appId}/services"},
-	"listSourceConnections":                 {Method: "GET", Path: "/api/v1/source-connections"},
-	"login":                                 {Method: "POST", Path: "/api/v1/auth/sessions"},
-	"logout":                                {Method: "DELETE", Path: "/api/v1/auth/sessions/current"},
-	"me":                                    {Method: "GET", Path: "/api/v1/auth/me"},
-	"pollDefaultGitHubDeviceConnection":     {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/{authorizationId}/poll"},
-	"pollGitHubDeviceConnection":            {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/poll"},
-	"pollRelayEnrollment":                   {Method: "POST", Path: "/api/v1/relay/enrollments/{enrollmentId}/poll"},
-	"refreshSourceConnection":               {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/refresh"},
-	"removeRelayBinding":                    {Method: "DELETE", Path: "/api/v1/relay/bindings/{bindingId}"},
-	"replaceApplicationConfiguration":       {Method: "PUT", Path: "/api/v1/apps/{appId}/configuration"},
-	"replaceScopedApplicationConfiguration": {Method: "PUT", Path: "/api/v1/apps/{appId}/scoped-configuration"},
-	"restartApplication":                    {Method: "POST", Path: "/api/v1/apps/{appId}/restart"},
-	"resumeApplicationAutoDeploy":           {Method: "POST", Path: "/api/v1/apps/{appId}/auto-deploy/resume"},
-	"resumeJob":                             {Method: "POST", Path: "/api/v1/jobs/{jobId}/resume"},
-	"revokeRuntimeApproval":                 {Method: "DELETE", Path: "/api/v1/apps/{appId}/runtime-approvals/{approvalId}"},
-	"rotateCSRF":                            {Method: "GET", Path: "/api/v1/auth/csrf"},
-	"startApplication":                      {Method: "POST", Path: "/api/v1/apps/{appId}/start"},
-	"startDefaultGitHubDeviceConnection":    {Method: "POST", Path: "/api/v1/source-connections/default/github/device"},
-	"startGitHubDeviceConnection":           {Method: "POST", Path: "/api/v1/source-connections/github/device"},
-	"startRelayEnrollment":                  {Method: "POST", Path: "/api/v1/relay/enrollments"},
-	"startRelayKeyRotation":                 {Method: "POST", Path: "/api/v1/relay/key-rotations"},
-	"stopApplication":                       {Method: "POST", Path: "/api/v1/apps/{appId}/stop"},
-	"streamJobEvents":                       {Method: "GET", Path: "/api/v1/jobs/{jobId}/events/stream"},
-	"streamLogs":                            {Method: "GET", Path: "/api/v1/apps/{appId}/logs/stream"},
-	"systemStatus":                          {Method: "GET", Path: "/api/v1/system/status"},
-	"updateApplicationAutoDeploy":           {Method: "PUT", Path: "/api/v1/apps/{appId}/auto-deploy"},
-	"upgradeLANGateway":                     {Method: "POST", Path: "/api/v1/system/lan-gateway-upgrade"},
+	"approveApplicationLANAccess":               {Method: "POST", Path: "/api/v1/apps/{appId}/lan-access/approval"},
+	"bootstrap":                                 {Method: "POST", Path: "/api/v1/auth/bootstrap"},
+	"bootstrapStatus":                           {Method: "GET", Path: "/api/v1/auth/bootstrap/status"},
+	"cancelJob":                                 {Method: "POST", Path: "/api/v1/jobs/{jobId}/cancel"},
+	"configureLANGatewayProfile":                {Method: "POST", Path: "/api/v1/system/lan-gateway-profile"},
+	"createApplication":                         {Method: "POST", Path: "/api/v1/apps"},
+	"deployApplication":                         {Method: "POST", Path: "/api/v1/apps/{appId}/deployments"},
+	"deployRelease":                             {Method: "POST", Path: "/api/v1/apps/{appId}/releases/{releaseId}/deployments"},
+	"disconnectSourceConnection":                {Method: "DELETE", Path: "/api/v1/source-connections/{connectionId}"},
+	"doctor":                                    {Method: "GET", Path: "/api/v1/system/doctor"},
+	"getApplication":                            {Method: "GET", Path: "/api/v1/apps/{appId}"},
+	"getApplicationAutoDeploy":                  {Method: "GET", Path: "/api/v1/apps/{appId}/auto-deploy"},
+	"getApplicationConfiguration":               {Method: "GET", Path: "/api/v1/apps/{appId}/configuration"},
+	"getApplicationDeploymentPlan":              {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-plan"},
+	"getApplicationLANAccess":                   {Method: "GET", Path: "/api/v1/apps/{appId}/lan-access"},
+	"getApplicationLANGrant":                    {Method: "GET", Path: "/api/v1/apps/{appId}/lan-access/grants/{attemptId}"},
+	"getApplicationLocalRoute":                  {Method: "GET", Path: "/api/v1/apps/{appId}/local-route"},
+	"getDefaultSourceConnection":                {Method: "GET", Path: "/api/v1/source-connections/default"},
+	"getDeploymentJobByIdempotency":             {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-jobs/by-idempotency"},
+	"getJob":                                    {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
+	"getLANGatewayProfile":                      {Method: "GET", Path: "/api/v1/system/lan-gateway-profile"},
+	"getLANGatewayUpgrade":                      {Method: "GET", Path: "/api/v1/system/lan-gateway-upgrade"},
+	"getRelayStatus":                            {Method: "GET", Path: "/api/v1/relay/status"},
+	"grantApplicationLANAccess":                 {Method: "POST", Path: "/api/v1/apps/{appId}/lan-access/grants"},
+	"grantRuntimeApproval":                      {Method: "POST", Path: "/api/v1/apps/{appId}/runtime-approvals"},
+	"inspectImport":                             {Method: "POST", Path: "/api/v1/apps/import/inspect"},
+	"listApplications":                          {Method: "GET", Path: "/api/v1/apps"},
+	"listDefaultGitHubRepositories":             {Method: "GET", Path: "/api/v1/source-connections/default/github/repositories"},
+	"listDeployments":                           {Method: "GET", Path: "/api/v1/apps/{appId}/deployments"},
+	"listGitHubBranches":                        {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories/{repositoryId}/branches"},
+	"listGitHubInstallations":                   {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations"},
+	"listGitHubRepositories":                    {Method: "GET", Path: "/api/v1/source-connections/{connectionId}/github/installations/{installationId}/repositories"},
+	"listJobEvents":                             {Method: "GET", Path: "/api/v1/jobs/{jobId}/events"},
+	"listJobs":                                  {Method: "GET", Path: "/api/v1/jobs"},
+	"listMachines":                              {Method: "GET", Path: "/api/v1/machines"},
+	"listReleases":                              {Method: "GET", Path: "/api/v1/apps/{appId}/releases"},
+	"listRuntimeApprovals":                      {Method: "GET", Path: "/api/v1/apps/{appId}/runtime-approvals"},
+	"listServices":                              {Method: "GET", Path: "/api/v1/apps/{appId}/services"},
+	"listSourceConnections":                     {Method: "GET", Path: "/api/v1/source-connections"},
+	"login":                                     {Method: "POST", Path: "/api/v1/auth/sessions"},
+	"logout":                                    {Method: "DELETE", Path: "/api/v1/auth/sessions/current"},
+	"me":                                        {Method: "GET", Path: "/api/v1/auth/me"},
+	"pollDefaultGitHubDeviceConnection":         {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/{authorizationId}/poll"},
+	"pollGitHubDeviceConnection":                {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/poll"},
+	"pollRelayEnrollment":                       {Method: "POST", Path: "/api/v1/relay/enrollments/{enrollmentId}/poll"},
+	"refreshSourceConnection":                   {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/refresh"},
+	"removeRelayBinding":                        {Method: "DELETE", Path: "/api/v1/relay/bindings/{bindingId}"},
+	"replaceApplicationConfiguration":           {Method: "PUT", Path: "/api/v1/apps/{appId}/configuration"},
+	"replaceScopedApplicationConfiguration":     {Method: "PUT", Path: "/api/v1/apps/{appId}/scoped-configuration"},
+	"reserveApplicationLANAccess":               {Method: "POST", Path: "/api/v1/apps/{appId}/lan-access/reservations"},
+	"restartApplication":                        {Method: "POST", Path: "/api/v1/apps/{appId}/restart"},
+	"resumeApplicationAutoDeploy":               {Method: "POST", Path: "/api/v1/apps/{appId}/auto-deploy/resume"},
+	"resumeJob":                                 {Method: "POST", Path: "/api/v1/jobs/{jobId}/resume"},
+	"revokeRuntimeApproval":                     {Method: "DELETE", Path: "/api/v1/apps/{appId}/runtime-approvals/{approvalId}"},
+	"rotateCSRF":                                {Method: "GET", Path: "/api/v1/auth/csrf"},
+	"startApplication":                          {Method: "POST", Path: "/api/v1/apps/{appId}/start"},
+	"startDefaultGitHubDeviceConnection":        {Method: "POST", Path: "/api/v1/source-connections/default/github/device"},
+	"startGitHubDeviceConnection":               {Method: "POST", Path: "/api/v1/source-connections/github/device"},
+	"startRelayEnrollment":                      {Method: "POST", Path: "/api/v1/relay/enrollments"},
+	"startRelayKeyRotation":                     {Method: "POST", Path: "/api/v1/relay/key-rotations"},
+	"stopApplication":                           {Method: "POST", Path: "/api/v1/apps/{appId}/stop"},
+	"streamJobEvents":                           {Method: "GET", Path: "/api/v1/jobs/{jobId}/events/stream"},
+	"streamLogs":                                {Method: "GET", Path: "/api/v1/apps/{appId}/logs/stream"},
+	"systemStatus":                              {Method: "GET", Path: "/api/v1/system/status"},
+	"updateApplicationAutoDeploy":               {Method: "PUT", Path: "/api/v1/apps/{appId}/auto-deploy"},
+	"upgradeLANGateway":                         {Method: "POST", Path: "/api/v1/system/lan-gateway-upgrade"},
 }
 
 type AcceptDeploymentPlanRequest struct {
@@ -217,6 +222,13 @@ type ApproveDeploymentPlanMigrationRequest struct {
 	ExpectedApprovalRevision int64  `json:"expectedApprovalRevision"`
 	RevisionID               string `json:"revisionId"`
 	RevisionNumber           int64  `json:"revisionNumber"`
+}
+
+type ApproveLANAppAccessRequest struct {
+	AllocationID           string `json:"allocationId"`
+	ApprovalDigest         string `json:"approvalDigest"`
+	ExpectedRevisionNumber int64  `json:"expectedRevisionNumber"`
+	OperationID            string `json:"operationId"`
 }
 
 type BootstrapRequest struct {
@@ -550,6 +562,13 @@ type GitHubSource struct {
 	RepositoryID   int64  `json:"repositoryId"`
 }
 
+type GrantLANAppAccessRequest struct {
+	AccessRevisionID     string `json:"accessRevisionId"`
+	AccessRevisionNumber int64  `json:"accessRevisionNumber"`
+	ApprovalDigest       string `json:"approvalDigest"`
+	AttemptID            string `json:"attemptId"`
+}
+
 type GrantRuntimeApprovalRequest struct {
 	Fingerprint string `json:"fingerprint"`
 }
@@ -623,6 +642,63 @@ type JobResponse struct {
 	Job Job `json:"job"`
 }
 
+type LANAppAccessApprovalMutation struct {
+	Created  bool                 `json:"created"`
+	Revision LANAppAccessRevision `json:"revision"`
+}
+
+type LANAppAccessRead struct {
+	Availability           string                `json:"availability"`
+	DesiredAccess          *LANAppAccessRevision `json:"desiredAccess,omitempty"`
+	ExpectedRevisionNumber int64                 `json:"expectedRevisionNumber"`
+	ObservedAt             string                `json:"observedAt,omitempty"`
+	Url                    string                `json:"url,omitempty"`
+}
+
+type LANAppAccessReservationMutation struct {
+	Allocation     LANPortAllocation `json:"allocation"`
+	ApprovalDigest string            `json:"approvalDigest"`
+	Created        bool              `json:"created"`
+}
+
+type LANAppAccessRevision struct {
+	Allocation     LANPortAllocation `json:"allocation"`
+	AppID          string            `json:"appId"`
+	ApprovedAt     string            `json:"approvedAt"`
+	ApprovedBy     string            `json:"approvedBy"`
+	ID             string            `json:"id"`
+	OperationID    string            `json:"operationId"`
+	RevisionNumber int64             `json:"revisionNumber"`
+	SpecDigest     string            `json:"specDigest"`
+}
+
+type LANAppGrantClaim struct {
+	AccessRevisionID     string `json:"accessRevisionId"`
+	AccessRevisionNumber int64  `json:"accessRevisionNumber"`
+	AllocationID         string `json:"allocationId"`
+	AppID                string `json:"appId"`
+	AttemptID            string `json:"attemptId"`
+	OwnerOperationID     string `json:"ownerOperationId"`
+	Port                 int    `json:"port"`
+	State                string `json:"state"`
+	UpdatedAt            string `json:"updatedAt"`
+}
+
+type LANAppGrantMutation struct {
+	Claim   LANAppGrantClaim `json:"claim"`
+	Created bool             `json:"created"`
+}
+
+type LANAppGrantObservation struct {
+	Availability string `json:"availability"`
+	ObservedAt   string `json:"observedAt,omitempty"`
+}
+
+type LANAppGrantRead struct {
+	Claim    LANAppGrantClaim       `json:"claim"`
+	Observed LANAppGrantObservation `json:"observed"`
+}
+
 type LANGatewayCandidate struct {
 	InterfaceID  string `json:"interfaceId"`
 	Name         string `json:"name"`
@@ -693,6 +769,17 @@ type LANGatewayUpgradeRead struct {
 	DesiredClaim *LANGatewayUpgradeClaim      `json:"desiredClaim,omitempty"`
 	Observed     LANGatewayUpgradeObservation `json:"observed"`
 	Proposal     *LANGatewayUpgradeProposal   `json:"proposal,omitempty"`
+}
+
+type LANPortAllocation struct {
+	AppID                        string `json:"appId"`
+	GatewayProfileRevisionID     string `json:"gatewayProfileRevisionId"`
+	GatewayProfileRevisionNumber int64  `json:"gatewayProfileRevisionNumber"`
+	ID                           string `json:"id"`
+	OwnerOperationID             string `json:"ownerOperationId"`
+	Port                         int    `json:"port"`
+	ReleasedAt                   string `json:"releasedAt,omitempty"`
+	State                        string `json:"state"`
 }
 
 type LocalRoute struct {
@@ -856,6 +943,13 @@ type ReplaceScopedApplicationConfigurationRequest struct {
 	PlanRevisionNumber                int64                           `json:"planRevisionNumber"`
 	PublicBuildDisclosureAcknowledged bool                            `json:"publicBuildDisclosureAcknowledged"`
 	Remove                            []ScopedConfigurationKey        `json:"remove"`
+}
+
+type ReserveLANAppAccessRequest struct {
+	ExpectedRevisionNumber       int64  `json:"expectedRevisionNumber"`
+	GatewayProfileRevisionID     string `json:"gatewayProfileRevisionId"`
+	GatewayProfileRevisionNumber int64  `json:"gatewayProfileRevisionNumber"`
+	OperationID                  string `json:"operationId"`
 }
 
 type ResumeApplicationAutoDeployRequest struct {

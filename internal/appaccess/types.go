@@ -32,6 +32,7 @@ const (
 	ActionConfigureGateway ApprovalAction = "configure_lan_gateway"
 	ActionUpgradeGateway   ApprovalAction = "upgrade_generated_ingress"
 	ActionEnableAppAccess  ApprovalAction = "enable_lan_access"
+	ActionDisableAppAccess ApprovalAction = "disable_lan_access"
 )
 
 const (
@@ -58,15 +59,15 @@ const (
 )
 
 var (
-	ErrInvalidInput        = errors.New("invalid LAN access input")
-	ErrNotFound            = errors.New("LAN access record not found")
-	ErrConflict            = errors.New("LAN access revision conflict")
-	ErrIdempotencyMismatch = errors.New("LAN access idempotency payload mismatch")
-	ErrApprovalRequired    = errors.New("LAN access administrator approval required")
-	ErrPoolExhausted       = errors.New("LAN access port pool exhausted")
-	ErrReservationReleased = errors.New("LAN access reservation was released")
-	ErrInvalidTransition   = errors.New("invalid LAN allocation transition")
-	ErrInvalidStoredState  = errors.New("invalid stored LAN access state")
+	ErrInvalidInput         = errors.New("invalid LAN access input")
+	ErrNotFound             = errors.New("LAN access record not found")
+	ErrConflict             = errors.New("LAN access revision conflict")
+	ErrIdempotencyMismatch  = errors.New("LAN access idempotency payload mismatch")
+	ErrApprovalRequired     = errors.New("LAN access administrator approval required")
+	ErrPoolExhausted        = errors.New("LAN access port pool exhausted")
+	ErrReservationReleased  = errors.New("LAN access reservation was released")
+	ErrInvalidTransition    = errors.New("invalid LAN allocation transition")
+	ErrInvalidStoredState   = errors.New("invalid stored LAN access state")
 )
 
 // Approval binds an authenticated administrator to one canonical action
@@ -203,6 +204,36 @@ type AllocationOwner struct {
 	AccessRevisionID string
 }
 
+// AppAccessDisableSpec binds a disable approval to the complete immutable
+// allocation owner and the access revision that currently heads the app. A
+// port or allocation ID by itself is intentionally insufficient.
+type AppAccessDisableSpec struct {
+	AppID                        string `json:"appId"`
+	AllocationID                 string `json:"allocationId"`
+	OwnerOperationID             string `json:"ownerOperationId"`
+	AccessRevisionID             string `json:"accessRevisionId"`
+	AccessRevisionNumber         int64  `json:"accessRevisionNumber"`
+	Port                         uint16 `json:"port"`
+	GatewayProfileRevisionID     string `json:"gatewayProfileRevisionId"`
+	GatewayProfileRevisionNumber int64  `json:"gatewayProfileRevisionNumber"`
+}
+
+type ApproveAppAccessDisableInput struct {
+	OperationID            string
+	ExpectedRevisionNumber int64
+	Owner                  AllocationOwner
+	Approval               Approval
+}
+
+type AppAccessDisableIntent struct {
+	OperationID   string
+	RequestDigest string
+	Spec          AppAccessDisableSpec
+	SpecDigest    string
+	ApprovedBy    string
+	ApprovedAt    time.Time
+}
+
 func GatewayProfileSpecDigest(spec GatewayProfileSpec) (string, error) {
 	canonical, err := canonicalGatewaySpec(spec)
 	if err != nil {
@@ -281,6 +312,37 @@ func AppAccessSpecDigest(spec AppAccessSpec) (string, error) {
 		Action  ApprovalAction `json:"action"`
 		Spec    AppAccessSpec  `json:"spec"`
 	}{Version: 1, Action: ActionEnableAppAccess, Spec: spec})
+}
+
+func AppAccessDisableSpecFor(revision AppAccessRevision) AppAccessDisableSpec {
+	return AppAccessDisableSpec{
+		AppID:                        revision.AppID,
+		AllocationID:                 revision.Allocation.ID,
+		OwnerOperationID:             revision.Allocation.OwnerOperationID,
+		AccessRevisionID:             revision.ID,
+		AccessRevisionNumber:         revision.RevisionNumber,
+		Port:                         revision.Allocation.Port,
+		GatewayProfileRevisionID:     revision.Allocation.GatewayProfileRevisionID,
+		GatewayProfileRevisionNumber: revision.Allocation.GatewayProfileRevisionNumber,
+	}
+}
+
+func AppAccessDisableSpecDigest(spec AppAccessDisableSpec) (string, error) {
+	if !validAppAccessDisableSpec(spec) {
+		return "", ErrInvalidInput
+	}
+	return digestJSON(struct {
+		Version int                  `json:"version"`
+		Action  ApprovalAction       `json:"action"`
+		Spec    AppAccessDisableSpec `json:"spec"`
+	}{Version: 1, Action: ActionDisableAppAccess, Spec: spec})
+}
+
+func validAppAccessDisableSpec(spec AppAccessDisableSpec) bool {
+	return validUUID(spec.AppID) && validUUID(spec.AllocationID) && validUUID(spec.OwnerOperationID) &&
+		validUUID(spec.AccessRevisionID) && spec.AccessRevisionNumber > 0 &&
+		spec.Port >= GatewayPortStart && spec.Port <= GatewayPortEnd &&
+		validUUID(spec.GatewayProfileRevisionID) && spec.GatewayProfileRevisionNumber > 0
 }
 
 func canonicalGatewaySpec(spec GatewayProfileSpec) (GatewayProfileSpec, error) {

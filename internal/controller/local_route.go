@@ -137,7 +137,14 @@ func localRouteProvenanceMatches(appID string, head generatedruntimestate.Active
 }
 
 func localRouteObservationMatches(appID string, head generatedruntimestate.ActiveHead, runtimeDeployment generatedruntimestate.Deployment, observation generatedingress.Observation) bool {
-	if observation.Slot != generatedruntime.Slot(head.Slot) || !validControllerLoopbackURL(appID, observation.URL) || len(observation.Endpoints) == 0 || len(observation.Endpoints) != len(runtimeDeployment.Components) {
+	return validControllerLoopbackURL(appID, observation.URL) &&
+		appRouteObservationMatches(appID, head, runtimeDeployment, observation.Slot, observation.Endpoints)
+}
+
+func appRouteObservationMatches(appID string, head generatedruntimestate.ActiveHead, runtimeDeployment generatedruntimestate.Deployment,
+	slot generatedruntime.Slot, endpoints []generatedruntime.RouteEndpoint,
+) bool {
+	if slot != generatedruntime.Slot(head.Slot) || len(endpoints) == 0 || len(endpoints) != len(runtimeDeployment.Components) {
 		return false
 	}
 	opposite, err := generatedruntime.InactiveSlot(generatedruntime.Slot(head.Slot))
@@ -155,8 +162,8 @@ func localRouteObservationMatches(appID string, head generatedruntimestate.Activ
 		}
 		components[component.Name] = component
 	}
-	seen := make(map[string]bool, len(observation.Endpoints))
-	for _, endpoint := range observation.Endpoints {
+	seen := make(map[string]bool, len(endpoints))
+	for _, endpoint := range endpoints {
 		component, ok := components[endpoint.Component]
 		description, err := generatedruntime.DescribeInactiveCandidate(appID, endpoint.Component, opposite)
 		if err != nil || !ok || seen[endpoint.Component] || component.ContainerID != endpoint.ContainerID || endpoint.NetworkName != description.NetworkName || endpoint.NetworkAlias != description.NetworkAlias || endpoint.InternalPort == 0 || (endpoint.Role != generatedruntime.RoleServer && endpoint.Role != generatedruntime.RoleStatic) {

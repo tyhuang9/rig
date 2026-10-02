@@ -36,6 +36,13 @@ x-rig-problem-codes:
   lan_gateway_replay_conflict: {description: The LAN gateway operation identifier was already used for a different request, statuses: [409]}
   lan_gateway_approval_mismatch: {description: The supplied confirmation digest does not approve the exact LAN gateway profile, statuses: [409]}
   lan_gateway_unavailable: {description: LAN gateway profile state or safe host interface discovery is unavailable, statuses: [503]}
+  lan_access_forbidden: {description: Administrator access is required to manage or inspect application LAN access, statuses: [403]}
+  invalid_lan_access_request: {description: The application LAN access request is invalid, statuses: [422]}
+  lan_access_conflict: {description: The application LAN access state or reservation changed, statuses: [409]}
+  lan_access_replay_conflict: {description: The application LAN operation identifier was reused with different input, statuses: [409]}
+  lan_access_approval_mismatch: {description: Confirmation does not approve the exact application LAN access, statuses: [409]}
+  lan_access_pool_exhausted: {description: No LAN gateway port is available, statuses: [409]}
+  lan_access_unavailable: {description: Application LAN access state is unavailable, statuses: [503]}
   capability_unavailable: {description: The requested operation requires a runtime capability that is disabled, statuses: [409]}
 x-job-responses: &jobResponses
   '200': {description: Existing idempotent job, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
@@ -438,6 +445,62 @@ paths:
       responses:
         '200': {description: Live repository branches, content: {application/json: {schema: {$ref: '#/components/schemas/GitHubBranchPage'}}}}
         default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/lan-access:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    get:
+      operationId: getApplicationLANAccess
+      x-rig-problem-codes: [lan_access_forbidden, invalid_lan_access_request, lan_access_unavailable, capability_unavailable]
+      security: [{sessionCookie: []}]
+      description: Returns approved desired application access and allocation state. It never treats the database as proof of a live LAN route and does not return a URL.
+      responses:
+        '200': {description: Desired application LAN access and an exact live-attested availability result, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppAccessRead'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/lan-access/reservations:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    post:
+      operationId: reserveApplicationLANAccess
+      x-rig-problem-codes: [lan_access_forbidden, invalid_lan_access_request, lan_access_conflict, lan_access_replay_conflict, lan_access_pool_exhausted, lan_access_unavailable, capability_unavailable]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      description: Reserves the first free port for one operation. The returned exact port and digest must be reviewed before a separate administrator approval. No gateway route is changed.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ReserveLANAppAccessRequest'}}}}
+      responses:
+        '200': {description: Exact idempotent reservation, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppAccessReservationMutation'}}}}
+        '201': {description: New reservation for review, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppAccessReservationMutation'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/lan-access/approval:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    post:
+      operationId: approveApplicationLANAccess
+      x-rig-problem-codes: [lan_access_forbidden, invalid_lan_access_request, lan_access_conflict, lan_access_replay_conflict, lan_access_approval_mismatch, lan_access_unavailable, capability_unavailable]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      description: Appends immutable administrator approval for the exact reviewed application, profile, allocation, and port. A separate grant action must attest the live gateway route before any URL is available.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ApproveLANAppAccessRequest'}}}}
+      responses:
+        '200': {description: Existing exact approved revision, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppAccessApprovalMutation'}}}}
+        '201': {description: New immutable approved revision, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppAccessApprovalMutation'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/lan-access/grants:
+    parameters: [{$ref: '#/components/parameters/AppId'}]
+    post:
+      operationId: grantApplicationLANAccess
+      x-rig-problem-codes: [lan_access_forbidden, invalid_lan_access_request, lan_access_conflict, lan_access_replay_conflict, lan_access_approval_mismatch, lan_access_unavailable, capability_unavailable]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      description: Reconciles one exact administrator-approved access revision and durable grant attempt against gateway v2. A response is not a LAN URL; only a separately attested read may expose one.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/GrantLANAppAccessRequest'}}}}
+      responses:
+        '200': {description: Exact retained grant attempt, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppGrantMutation'}}}}
+        '201': {description: New grant attempt, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppGrantMutation'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /api/v1/apps/{appId}/lan-access/grants/{attemptId}:
+    parameters: [{$ref: '#/components/parameters/AppId'}, {name: attemptId, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: getApplicationLANGrant
+      x-rig-problem-codes: [lan_access_forbidden, invalid_lan_access_request, lan_access_conflict, lan_access_unavailable, capability_unavailable]
+      security: [{sessionCookie: []}]
+      description: Returns one exact durable grant attempt and its separately observed gateway disposition without publishing a URL.
+      responses:
+        '200': {description: Exact grant state and observed disposition, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANAppGrantRead'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/system/lan-gateway-profile:
     get:
       operationId: getLANGatewayProfile
@@ -725,6 +788,119 @@ components:
     ConnectedGitHubRepositoryPage: {type: object, additionalProperties: false, required: [page, perPage, totalCount, truncated, items], properties: {page: {type: integer, minimum: 1}, perPage: {type: integer, minimum: 1, maximum: 100}, totalCount: {type: integer, minimum: 0}, truncated: {type: boolean}, items: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/ConnectedGitHubRepository'}}}}
     GitHubBranch: {type: object, required: [name, sha, protected], properties: {name: {type: string}, sha: {type: string}, protected: {type: boolean}}}
     GitHubBranchPage: {type: object, required: [page, perPage, items], properties: {page: {type: integer}, perPage: {type: integer}, items: {type: array, items: {$ref: '#/components/schemas/GitHubBranch'}}}}
+    LANPortAllocation:
+      type: object
+      additionalProperties: false
+      required: [id, appId, port, ownerOperationId, gatewayProfileRevisionId, gatewayProfileRevisionNumber, state]
+      properties:
+        id: {type: string, format: uuid}
+        appId: {type: string, format: uuid}
+        port: {type: integer, minimum: 8100, maximum: 8119}
+        ownerOperationId: {type: string, format: uuid}
+        gatewayProfileRevisionId: {type: string, format: uuid}
+        gatewayProfileRevisionNumber: {type: integer, format: int64, minimum: 1}
+        state: {type: string, enum: [reserved, active, uncertain]}
+        releasedAt: {type: string, format: date-time}
+    LANAppAccessRevision:
+      type: object
+      additionalProperties: false
+      required: [id, appId, revisionNumber, operationId, specDigest, approvedBy, approvedAt, allocation]
+      properties:
+        id: {type: string, format: uuid}
+        appId: {type: string, format: uuid}
+        revisionNumber: {type: integer, format: int64, minimum: 1}
+        operationId: {type: string, format: uuid}
+        specDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        approvedBy: {type: string, format: uuid}
+        approvedAt: {type: string, format: date-time}
+        allocation: {$ref: '#/components/schemas/LANPortAllocation'}
+    LANAppAccessRead:
+      type: object
+      additionalProperties: false
+      required: [expectedRevisionNumber, availability]
+      properties:
+        expectedRevisionNumber: {type: integer, format: int64, minimum: 0}
+        desiredAccess: {$ref: '#/components/schemas/LANAppAccessRevision', x-go-pointer: true}
+        availability: {type: string, enum: [local_only, unverified, verified]}
+        observedAt: {type: string, format: date-time}
+        url: {type: string, format: uri}
+    ReserveLANAppAccessRequest:
+      type: object
+      additionalProperties: false
+      required: [operationId, expectedRevisionNumber, gatewayProfileRevisionId, gatewayProfileRevisionNumber]
+      properties:
+        operationId: {type: string, format: uuid}
+        expectedRevisionNumber: {type: integer, format: int64, minimum: 0}
+        gatewayProfileRevisionId: {type: string, format: uuid}
+        gatewayProfileRevisionNumber: {type: integer, format: int64, minimum: 1}
+    LANAppAccessReservationMutation:
+      type: object
+      additionalProperties: false
+      required: [allocation, approvalDigest, created]
+      properties:
+        allocation: {$ref: '#/components/schemas/LANPortAllocation'}
+        approvalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        created: {type: boolean}
+    ApproveLANAppAccessRequest:
+      type: object
+      additionalProperties: false
+      required: [operationId, allocationId, expectedRevisionNumber, approvalDigest]
+      properties:
+        operationId: {type: string, format: uuid}
+        allocationId: {type: string, format: uuid}
+        expectedRevisionNumber: {type: integer, format: int64, minimum: 0}
+        approvalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANAppAccessApprovalMutation:
+      type: object
+      additionalProperties: false
+      required: [revision, created]
+      properties:
+        revision: {$ref: '#/components/schemas/LANAppAccessRevision'}
+        created: {type: boolean}
+    GrantLANAppAccessRequest:
+      type: object
+      additionalProperties: false
+      required: [attemptId, accessRevisionId, accessRevisionNumber, approvalDigest]
+      properties:
+        attemptId: {type: string, format: uuid}
+        accessRevisionId: {type: string, format: uuid}
+        accessRevisionNumber: {type: integer, format: int64, minimum: 1}
+        approvalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANAppGrantClaim:
+      type: object
+      additionalProperties: false
+      required: [attemptId, appId, allocationId, ownerOperationId, accessRevisionId, accessRevisionNumber, port, state, updatedAt]
+      properties:
+        attemptId: {type: string, format: uuid}
+        appId: {type: string, format: uuid}
+        allocationId: {type: string, format: uuid}
+        ownerOperationId: {type: string, format: uuid}
+        accessRevisionId: {type: string, format: uuid}
+        accessRevisionNumber: {type: integer, format: int64, minimum: 1}
+        port: {type: integer, minimum: 8100, maximum: 8119}
+        state: {type: string, enum: [prepared, applying, db_active, uncertain, committed, rolled_back]}
+        updatedAt: {type: string, format: date-time}
+    LANAppGrantObservation:
+      type: object
+      additionalProperties: false
+      required: [availability]
+      properties:
+        availability: {type: string, enum: [unknown, committed, pending_published, pending_reload_only, withdrawn_pending_reconciliation]}
+        observedAt: {type: string, format: date-time}
+    LANAppGrantRead:
+      type: object
+      additionalProperties: false
+      required: [claim, observed]
+      properties:
+        claim: {$ref: '#/components/schemas/LANAppGrantClaim'}
+        observed: {$ref: '#/components/schemas/LANAppGrantObservation'}
+    LANAppGrantMutation:
+      type: object
+      additionalProperties: false
+      required: [claim, created]
+      properties:
+        claim: {$ref: '#/components/schemas/LANAppGrantClaim'}
+        created: {type: boolean}
     LANGatewayProfileSpec:
       type: object
       additionalProperties: false

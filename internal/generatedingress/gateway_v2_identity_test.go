@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -132,6 +133,56 @@ func TestClassifyGatewayV2MixedRestartRequiresProposedLiveAndCommittedRestartCon
 	}}
 	if manager.observeGatewayV2MixedRestart(context.Background(), source, committed, proposed, journal) {
 		t.Fatal("inspection failure was accepted as the mixed restart window")
+	}
+}
+
+func TestClassifyGatewayV2MixedRestartAcceptsOnlyExactLANGrantTransition(t *testing.T) {
+	source, committed, journal := gatewayV2IdentityTestState(t)
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Phase = gatewayPhaseCommitted
+	proposed := cloneGatewayV2RouteState(committed)
+	bindLANForTest(t, &proposed, upgradeTestAppA, 8100)
+	if !validGatewayV2MixedRestartInputs(source, committed, proposed, journal) {
+		t.Fatal("exact same-route nil-to-binding LAN transition was rejected")
+	}
+
+	observation := gatewayV2IdentityTestObservation(t, source, proposed, journal, gatewayTopologyExactFinalV2)
+	committedConfig, err := expectedGatewayV2FinalConfig(committed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation.FinalRestartConfig = committedConfig
+	if !classifyGatewayV2MixedRestart(source, committed, proposed, journal, observation) {
+		t.Fatal("exact live LAN grant with committed restart config was not classified as recoverable mixed topology")
+	}
+
+	changedRoute := cloneGatewayV2RouteState(proposed)
+	app := changedRoute.Apps[upgradeTestAppA]
+	app.Route.Slot = generatedruntime.SlotGreen
+	changedRoute.Apps[upgradeTestAppA] = app
+	if validGatewayV2MixedRestartInputs(source, committed, changedRoute, journal) {
+		t.Fatal("combined route switch and LAN grant was accepted")
+	}
+	movedBinding := cloneGatewayV2RouteState(proposed)
+	app = movedBinding.Apps[upgradeTestAppA]
+	app.LAN.Port = 8101
+	digest, err := appaccess.AppAccessSpecDigest(appaccess.AppAccessSpec{
+		AppID: upgradeTestAppA, AllocationID: app.LAN.AllocationID, Port: app.LAN.Port,
+		GatewayProfileRevisionID:     app.LAN.ProfileRevisionID,
+		GatewayProfileRevisionNumber: app.LAN.ProfileRevisionNumber,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.LAN.AccessSpecDigest = digest
+	movedBinding.Apps[upgradeTestAppA] = app
+	if !validGatewayV2MixedRestartInputs(source, committed, movedBinding, journal) {
+		t.Fatal("a valid first grant at another pool port should remain recoverable")
+	}
+	wrongLive := observation
+	wrongLive.FinalConfig = committedConfig
+	if classifyGatewayV2MixedRestart(source, committed, proposed, journal, wrongLive) {
+		t.Fatal("committed live 404 config was accepted as an applied LAN grant")
 	}
 }
 

@@ -7,10 +7,61 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/config"
+	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/runtime/docker"
 )
+
+func TestLANGrantStartupRecoveryRequiresExactCommittedGatewayAndAttempt(t *testing.T) {
+	const gatewayID = "gateway-operation"
+	const attemptID = "grant-attempt"
+	const appID = "application"
+	base := appaccess.HostingGatewayStartupSnapshot{
+		Upgrades: appaccess.GatewayUpgradeStartupSnapshot{Claims: []appaccess.GatewayUpgradeStartupClaim{{
+			Claim: appaccess.GatewayProfileUpgradeClaim{OperationID: gatewayID, State: appaccess.GatewayProfileUpgradeCommitted},
+		}}},
+		Grants: appaccess.AppAccessGrantStartupSnapshot{Claims: []appaccess.AppAccessGrantStartupClaim{{
+			Claim: appaccess.AppAccessGrantClaim{AttemptID: attemptID, Spec: appaccess.AppAccessGrantSpec{AppID: appID}},
+		}}},
+	}
+	grantRecovery := generatedingress.GatewayV2LANStartupInspection{
+		Disposition: generatedingress.GatewayV2LANStartupRecoveryOnly, AttemptID: attemptID,
+	}
+	for _, gatewayDisposition := range []generatedingress.GatewayV2StartupDisposition{
+		generatedingress.GatewayV2StartupNormalV2, generatedingress.GatewayV2StartupRecoveryOnly,
+	} {
+		kind, operationID, selectedAppID, err := selectLANStartupRecovery(base,
+			generatedingress.GatewayV2StartupInspection{Disposition: gatewayDisposition, OperationID: gatewayID}, grantRecovery)
+		if err != nil || kind != controller.RecoveryLANGrant || operationID != attemptID || selectedAppID != appID {
+			t.Fatalf("disposition %q: kind=%q operation=%q app=%q err=%v", gatewayDisposition, kind, operationID, selectedAppID, err)
+		}
+	}
+	blocked := []struct {
+		name     string
+		snapshot appaccess.HostingGatewayStartupSnapshot
+		gateway  generatedingress.GatewayV2StartupInspection
+		grant    generatedingress.GatewayV2LANStartupInspection
+	}{
+		{"missing attempt", base, generatedingress.GatewayV2StartupInspection{Disposition: generatedingress.GatewayV2StartupNormalV2, OperationID: gatewayID}, generatedingress.GatewayV2LANStartupInspection{Disposition: generatedingress.GatewayV2LANStartupRecoveryOnly, AttemptID: "other"}},
+		{"wrong gateway", base, generatedingress.GatewayV2StartupInspection{Disposition: generatedingress.GatewayV2StartupNormalV2, OperationID: "other"}, grantRecovery},
+		{"recovery mismatch", base, generatedingress.GatewayV2StartupInspection{Disposition: generatedingress.GatewayV2StartupRecoveryOnly, OperationID: gatewayID}, generatedingress.GatewayV2LANStartupInspection{Disposition: generatedingress.GatewayV2LANStartupNormal}},
+	}
+	for _, test := range blocked {
+		t.Run(test.name, func(t *testing.T) {
+			if kind, operationID, selectedAppID, err := selectLANStartupRecovery(test.snapshot, test.gateway, test.grant); err == nil {
+				t.Fatalf("accepted inconsistent startup: kind=%q operation=%q app=%q", kind, operationID, selectedAppID)
+			}
+		})
+	}
+	base.Upgrades.Claims[0].Claim.State = appaccess.GatewayProfileUpgradePrepared
+	if _, _, _, err := selectLANStartupRecovery(base,
+		generatedingress.GatewayV2StartupInspection{Disposition: generatedingress.GatewayV2StartupRecoveryOnly, OperationID: gatewayID}, grantRecovery); err == nil {
+		t.Fatal("accepted LAN grant recovery before the gateway upgrade committed")
+	}
+}
 
 func TestProtectedGatewayUpgradeHistoryDetector(t *testing.T) {
 	root := t.TempDir()

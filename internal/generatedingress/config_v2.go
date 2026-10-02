@@ -26,11 +26,19 @@ type caddyV2Profile struct {
 	ProbeToken   string
 }
 
+type caddyV2LANAssignment struct {
+	AppID                string
+	AllocationID         string
+	AccessRevisionID     string
+	AccessRevisionNumber int64
+	AccessSpecDigest     string
+}
+
 // buildCaddyConfigV2 preserves the v1 .rig.localhost server and adds one
 // dedicated server for every LAN pool port. A port can select at most one app,
 // and that app is served only for the approved IPv4 Host. All other requests
 // and all unassigned ports terminate with a generic 404.
-func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string, profile caddyV2Profile, assignments map[uint16]string) ([]byte, error) {
+func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string, profile caddyV2Profile, assignments map[uint16]caddyV2LANAssignment) ([]byte, error) {
 	if !validCaddyV2Profile(profile) {
 		return nil, errors.New("invalid generated ingress LAN profile")
 	}
@@ -53,7 +61,7 @@ func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string
 		return nil, errors.New("invalid generated ingress LAN listener")
 	}
 	if assignments == nil {
-		assignments = map[uint16]string{}
+		assignments = map[uint16]caddyV2LANAssignment{}
 	}
 	if err := validateCaddyV2Assignments(routes, profile, assignments); err != nil {
 		return nil, err
@@ -81,9 +89,12 @@ func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string
 		if profile.ProbeToken != "" {
 			server.Routes = append(server.Routes, gatewayV2ProbeRoute(profile.SelectedIPv4, gatewayV2PortChallenge(profile.ProbeToken, port)))
 		}
-		appID, assigned := assignments[port]
+		assignment, assigned := assignments[port]
 		if assigned {
-			server.Routes = append(server.Routes, hostRestrictedRoutes(routes[appID], profile.SelectedIPv4)...)
+			if profile.ProbeToken != "" {
+				server.Routes = append(server.Routes, gatewayV2ProbeRoute(profile.SelectedIPv4, gatewayV2LANAppChallenge(profile.ProbeToken, port, assignment)))
+			}
+			server.Routes = append(server.Routes, hostRestrictedRoutes(routes[assignment.AppID], profile.SelectedIPv4)...)
 		} else {
 			server.Routes = append(server.Routes, notFoundRoute())
 		}
@@ -108,6 +119,13 @@ func gatewayV2AppChallenge(base, appID string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func gatewayV2LANAppChallenge(base string, port uint16, assignment caddyV2LANAssignment) string {
+	sum := sha256.Sum256([]byte("rig-gateway-v2-lan-app\x00" + base + "\x00" + strconv.FormatUint(uint64(port), 10) + "\x00" +
+		assignment.AppID + "\x00" + assignment.AllocationID + "\x00" + assignment.AccessRevisionID + "\x00" +
+		strconv.FormatInt(assignment.AccessRevisionNumber, 10) + "\x00" + assignment.AccessSpecDigest))
+	return hex.EncodeToString(sum[:])
+}
+
 func validCaddyV2Profile(profile caddyV2Profile) bool {
 	address, err := netip.ParseAddr(profile.SelectedIPv4)
 	return err == nil && address.Is4() && address.IsPrivate() && address.String() == profile.SelectedIPv4 &&
@@ -125,7 +143,7 @@ func gatewayV2ProbeRoute(selectedIPv4, token string) caddyRoute {
 	}
 }
 
-func validateCaddyV2Assignments(routes map[string]routeRecord, profile caddyV2Profile, assignments map[uint16]string) error {
+func validateCaddyV2Assignments(routes map[string]routeRecord, profile caddyV2Profile, assignments map[uint16]caddyV2LANAssignment) error {
 	ports := make([]int, 0, len(assignments))
 	for port := range assignments {
 		ports = append(ports, int(port))
@@ -135,9 +153,15 @@ func validateCaddyV2Assignments(routes map[string]routeRecord, profile caddyV2Pr
 	seenApps := make(map[string]struct{}, len(assignments))
 	for _, rawPort := range ports {
 		port := uint16(rawPort)
-		appID := assignments[port]
+		assignment := assignments[port]
+		appID := assignment.AppID
 		if port < profile.PortStart || port > profile.PortEnd || !validAppID(appID) {
 			return errors.New("invalid generated ingress LAN assignment")
+		}
+		if !validCanonicalUUID(assignment.AllocationID) ||
+			!validCanonicalUUID(assignment.AccessRevisionID) || assignment.AccessRevisionNumber <= 0 ||
+			!validSHA256(assignment.AccessSpecDigest) {
+			return errors.New("invalid generated ingress LAN assignment proof")
 		}
 		if _, exists := routes[appID]; !exists {
 			return errors.New("generated ingress LAN assignment has no active route")

@@ -88,6 +88,10 @@ type Manager struct {
 	// Production uses the full read-only v1 identity attestation in
 	// gateway_v2_coordinator.go before any protected v2 state is created.
 	gatewayV2CoordinatorDriver gatewayV2CoordinatorDriver
+	// gatewayV2LANGrantDriver is replaceable only by package tests.
+	// Production uses the committed-v2 reload and publication proof adapter in
+	// gateway_v2_lan_grant.go.
+	gatewayV2LANGrantDriver gatewayV2LANGrantDriver
 }
 
 // contextMutex lets a route observation abandon lock contention when its
