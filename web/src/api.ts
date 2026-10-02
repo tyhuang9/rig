@@ -202,6 +202,21 @@ export type DeployExpectedRevisions = {
 export const LOCAL_ROUTE_MAX_AGE_MS = 60_000;
 export const LAN_ACCESS_MAX_AGE_MS = 60_000;
 
+export function validSystemStatus(value: unknown): value is SystemStatus {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const status = value as Record<string, unknown>;
+  return typeof status.daemon === "string" && Boolean(status.capabilities) && typeof status.capabilities === "object" &&
+    !Array.isArray(status.capabilities) && Boolean(status.diagnostics) && typeof status.diagnostics === "object" &&
+    !Array.isArray(status.diagnostics);
+}
+
+export function validNormalGeneratedRuntimeStatus(value: unknown): value is SystemStatus {
+  if (!validSystemStatus(value)) return false;
+  const capabilities = value.capabilities as unknown as Record<string, unknown>;
+  return value.daemon === "running" && capabilities.generatedRuntime === true && capabilities.fakeRuntime === false &&
+    typeof capabilities.composeRuntime === "boolean" && typeof capabilities.githubConnections === "boolean";
+}
+
 export function localRouteObservationFresh(route: Pick<LocalRoute, "observedAt"> | undefined, nowMs = Date.now()): boolean {
   if (typeof route?.observedAt !== "string") return false;
   const observedMs = Date.parse(route.observedAt);

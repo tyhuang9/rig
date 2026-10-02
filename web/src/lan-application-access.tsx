@@ -3,7 +3,10 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   APIError,
   api,
+  isGatewayReconciliationRequired,
   lanAccessObservationFresh,
+  subscribeGatewayReconciliationRequired,
+  validNormalGeneratedRuntimeStatus,
   verifiedLANAccessURL,
   type DisableLANAppAccessRequest,
   type LANAppAccessRead,
@@ -124,6 +127,104 @@ function sameRevision(left: LANAppAccessRevision, right: LANAppAccessRevision) {
     left.allocation.gatewayProfileRevisionNumber === right.allocation.gatewayProfileRevisionNumber;
 }
 
+function sameLANActionRevision(appId: string, left: LANAppAccessRevision | undefined, right: LANAppAccessRevision | undefined) {
+  return Boolean(left && right && left.appId === appId && right.appId === appId &&
+    left.allocation.appId === appId && right.allocation.appId === appId &&
+    left.id === right.id && left.revisionNumber === right.revisionNumber &&
+    left.operationId === right.operationId && left.specDigest === right.specDigest &&
+    left.approvedBy === right.approvedBy && left.approvedAt === right.approvedAt &&
+    left.allocation.id === right.allocation.id && left.allocation.ownerOperationId === right.allocation.ownerOperationId &&
+    left.allocation.port === right.allocation.port && left.allocation.state === right.allocation.state &&
+    left.allocation.gatewayProfileRevisionId === right.allocation.gatewayProfileRevisionId &&
+    left.allocation.gatewayProfileRevisionNumber === right.allocation.gatewayProfileRevisionNumber);
+}
+
+function exactLANActionURL(appId: string, displayed: LANAppAccessRead | undefined, fresh: LANAppAccessRead | undefined) {
+  const displayedURL = verifiedLANAccessURL(displayed);
+  const freshURL = verifiedLANAccessURL(fresh);
+  return displayed && fresh && displayedURL && freshURL && displayed.url === fresh.url && displayedURL === freshURL &&
+    displayed.expectedRevisionNumber === fresh.expectedRevisionNumber &&
+    sameLANActionRevision(appId, displayed.desiredAccess, fresh.desiredAccess) ? freshURL : null;
+}
+
+type LANAddressAction = "open" | "copy";
+export const LAN_ADDRESS_ACTION_DEADLINE_MS = 10_000;
+type PendingLANWindow = {
+  popup: Window;
+  document: Document;
+  origin: string;
+};
+type LANAddressActionState =
+  | { phase: "idle" }
+  | { phase: "checking"; action: LANAddressAction }
+  | { phase: "success"; action: LANAddressAction; message: string }
+  | { phase: "failure"; action: LANAddressAction; message: string };
+
+function lanAddressActionFailure(error: unknown) {
+  if (isGatewayReconciliationRequired(error)) {
+    return "Rig entered LAN recovery before it could prove this address. Complete recovery before trying again.";
+  }
+  if (error instanceof Error && error.message === "lan_address_changed") {
+    return "The LAN address or its exact access revision changed during the check. Check LAN access before trying again.";
+  }
+  if (error instanceof Error && error.message === "popup_closed") {
+    return "The new window closed before Rig finished checking the LAN address. Try again when you are ready.";
+  }
+  if (error instanceof Error && error.message === "popup_changed") {
+    return "The new window changed before Rig finished checking the LAN address. Rig closed it without opening the LAN address.";
+  }
+  if (error instanceof Error && error.message === "clipboard_failed") {
+    return "The freshly proved LAN address could not be copied. Check clipboard permission before trying again.";
+  }
+  if (error instanceof Error && error.message === "lan_action_authority_changed") {
+    return "The LAN address action stopped because operator access changed. Check LAN access after signing in with administrator access.";
+  }
+  if (error instanceof Error && error.message === "lan_action_timed_out") {
+    return "Rig could not prove the LAN address within 10 seconds. Check LAN access before trying again.";
+  }
+  return "Rig could not prove that this LAN address is safe to use. Check LAN access before trying again.";
+}
+
+function closeLANWindow(popup: Window | null) {
+  if (!popup || popup.closed) return;
+  try {
+    popup.close();
+  } catch {
+    // The browser may already have torn down an isolated popup.
+  }
+}
+
+function preparePendingLANWindow(popup: Window): PendingLANWindow | null {
+  try {
+    if (popup.closed || popup.location.href !== "about:blank") return null;
+    const popupDocument = popup.document;
+    popupDocument.title = "Checking LAN address — Rig";
+    popupDocument.documentElement.lang = "en";
+    const main = popupDocument.createElement("main");
+    const heading = popupDocument.createElement("h1");
+    const status = popupDocument.createElement("p");
+    heading.textContent = "Checking LAN address";
+    status.textContent = "Rig is proving the current LAN address before opening it.";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.setAttribute("aria-atomic", "true");
+    main.append(heading, status);
+    popupDocument.body.replaceChildren(main);
+    return { popup, document: popupDocument, origin: popup.location.origin };
+  } catch {
+    return null;
+  }
+}
+
+function pendingLANWindowUnchanged(pending: PendingLANWindow): boolean {
+  try {
+    return !pending.popup.closed && pending.popup.document === pending.document &&
+      pending.popup.location.href === "about:blank" && pending.popup.location.origin === pending.origin;
+  } catch {
+    return false;
+  }
+}
+
 function reservationFromSnapshot(appId: string, value: LANAppAccessRead["pendingReservation"]): ReservationReview | null {
   if (!value || value.allocation.appId !== appId || !validIdentifier(value.allocation.ownerOperationId) ||
       !validRevision(value.expectedRevisionNumber, 0) || !validDigest(value.approvalDigest) ||
@@ -199,6 +300,7 @@ function staleDisableError(error: unknown) {
 
 export function LANApplicationAccessPanel({ appId, role, userId, enabled }: { appId: string; role: string; userId: string; enabled: boolean }) {
   const canManage = administrator(role) && validIdentifier(userId);
+  const lanAddressAuthorityKey = enabled && canManage ? `${appId}\u0000${role.trim().toLowerCase()}\u0000${userId}` : null;
   const access = useQuery({
     queryKey: ["lan-app-access", appId],
     queryFn: () => api.lanAccess(appId),
@@ -225,6 +327,7 @@ export function LANApplicationAccessPanel({ appId, role, userId, enabled }: { ap
   const [focusAfterApproval, setFocusAfterApproval] = useState(false);
   const [focusAfterGrant, setFocusAfterGrant] = useState(false);
   const [focusAfterDisable, setFocusAfterDisable] = useState(false);
+  const [lanAddressAction, setLANAddressAction] = useState<LANAddressActionState>({ phase: "idle" });
   const reservationReviewButton = useRef<HTMLButtonElement>(null);
   const activationReviewButton = useRef<HTMLButtonElement>(null);
   const disableReviewButton = useRef<HTMLButtonElement>(null);
@@ -234,6 +337,19 @@ export function LANApplicationAccessPanel({ appId, role, userId, enabled }: { ap
   const reservationRecoveryHeading = useRef<HTMLHeadingElement>(null);
   const grantRecoveryHeading = useRef<HTMLHeadingElement>(null);
   const approvalErrorTarget = useRef<HTMLDivElement>(null);
+  const lanAddressActionStatus = useRef<HTMLDivElement>(null);
+  const openLANAddressButton = useRef<HTMLButtonElement>(null);
+  const copyLANAddressButton = useRef<HTMLButtonElement>(null);
+  const mounted = useRef(true);
+  const lanAddressActionInFlight = useRef(false);
+  const lanAddressActionSequence = useRef(0);
+  const lanAddressActionDeadline = useRef<number | null>(null);
+  const currentLANAddressAction = useRef<LANAddressAction>("open");
+  const pendingLANWindow = useRef<Window | null>(null);
+  const actionAppId = useRef(appId);
+  const currentLANAddressAuthority = useRef<string | null>(lanAddressAuthorityKey);
+  const observedLANAddressAuthority = useRef<string | null>(lanAddressAuthorityKey);
+  currentLANAddressAuthority.current = lanAddressAuthorityKey;
 
   const currentRevision = access.data?.desiredAccess;
   const pendingReservation = reservationFromSnapshot(appId, access.data?.pendingReservation);
@@ -243,7 +359,30 @@ export function LANApplicationAccessPanel({ appId, role, userId, enabled }: { ap
   const accessReady = access.isSuccess && !access.isFetching && Boolean(access.data);
   const accessRefreshWithheld = access.isFetching && access.data?.availability === "verified";
   const routeExpired = !access.isFetching && access.isSuccess && access.data?.availability === "verified" && !lanAccessObservationFresh(access.data);
+  const latestAccess = useRef<LANAppAccessRead | undefined>(access.data);
+  latestAccess.current = access.data;
   useLocalRouteExpiry(access.data?.observedAt);
+
+  const clearLANAddressActionDeadline = (deadline = lanAddressActionDeadline.current) => {
+    if (deadline === null || lanAddressActionDeadline.current !== deadline) return;
+    window.clearTimeout(deadline);
+    lanAddressActionDeadline.current = null;
+  };
+
+  const startLANAddressActionDeadline = (sequence: number, action: LANAddressAction, popup: Window | null) => {
+    clearLANAddressActionDeadline();
+    const deadline = window.setTimeout(() => {
+      if (!mounted.current || sequence !== lanAddressActionSequence.current) return;
+      lanAddressActionDeadline.current = null;
+      lanAddressActionSequence.current += 1;
+      lanAddressActionInFlight.current = false;
+      closeLANWindow(popup);
+      if (pendingLANWindow.current === popup) pendingLANWindow.current = null;
+      setLANAddressAction({ phase: "failure", action, message: lanAddressActionFailure(new Error("lan_action_timed_out")) });
+    }, LAN_ADDRESS_ACTION_DEADLINE_MS);
+    lanAddressActionDeadline.current = deadline;
+    return deadline;
+  };
 
   const grantState = useQuery({
     queryKey: ["lan-app-grant", appId, grantClaim?.attemptId],
@@ -262,6 +401,156 @@ export function LANApplicationAccessPanel({ appId, role, userId, enabled }: { ap
   const refreshAccess = async () => {
     const result = await access.refetch();
     return result.isError ? undefined : result.data;
+  };
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      lanAddressActionSequence.current += 1;
+      lanAddressActionInFlight.current = false;
+      clearLANAddressActionDeadline();
+      closeLANWindow(pendingLANWindow.current);
+      pendingLANWindow.current = null;
+    };
+  }, []);
+
+  useEffect(() => subscribeGatewayReconciliationRequired(() => {
+    lanAddressActionSequence.current += 1;
+    lanAddressActionInFlight.current = false;
+    clearLANAddressActionDeadline();
+    closeLANWindow(pendingLANWindow.current);
+    pendingLANWindow.current = null;
+    if (mounted.current) {
+      setLANAddressAction({
+        phase: "failure",
+        action: currentLANAddressAction.current,
+        message: "Rig entered LAN recovery before it could prove this address. Complete recovery before trying again.",
+      });
+    }
+  }), []);
+
+  useEffect(() => {
+    if (actionAppId.current === appId) return;
+    actionAppId.current = appId;
+    lanAddressActionSequence.current += 1;
+    lanAddressActionInFlight.current = false;
+    clearLANAddressActionDeadline();
+    closeLANWindow(pendingLANWindow.current);
+    pendingLANWindow.current = null;
+    setLANAddressAction({ phase: "idle" });
+  }, [appId]);
+
+  useEffect(() => {
+    if (observedLANAddressAuthority.current === lanAddressAuthorityKey) return;
+    observedLANAddressAuthority.current = lanAddressAuthorityKey;
+    lanAddressActionSequence.current += 1;
+    lanAddressActionInFlight.current = false;
+    clearLANAddressActionDeadline();
+    closeLANWindow(pendingLANWindow.current);
+    pendingLANWindow.current = null;
+    setLANAddressAction(lanAddressAuthorityKey
+      ? { phase: "failure", action: currentLANAddressAction.current, message: lanAddressActionFailure(new Error("lan_action_authority_changed")) }
+      : { phase: "idle" });
+  }, [lanAddressAuthorityKey]);
+
+  const proveLANAddress = async (displayed: LANAppAccessRead | undefined, sequence: number, authorityKey: string) => {
+    const before = await api.status();
+    if (!mounted.current || sequence !== lanAddressActionSequence.current) throw new Error("action_cancelled");
+    if (currentLANAddressAuthority.current !== authorityKey) throw new Error("lan_action_authority_changed");
+    if (!validNormalGeneratedRuntimeStatus(before)) throw new Error("invalid_system_status");
+    const fresh = await api.lanAccess(appId);
+    if (!mounted.current || sequence !== lanAddressActionSequence.current) throw new Error("action_cancelled");
+    if (currentLANAddressAuthority.current !== authorityKey) throw new Error("lan_action_authority_changed");
+    const after = await api.status();
+    if (!mounted.current || sequence !== lanAddressActionSequence.current) throw new Error("action_cancelled");
+    if (currentLANAddressAuthority.current !== authorityKey) throw new Error("lan_action_authority_changed");
+    if (!validNormalGeneratedRuntimeStatus(after)) throw new Error("invalid_system_status");
+    const freshURL = exactLANActionURL(appId, displayed, fresh);
+    if (!freshURL || exactLANActionURL(appId, displayed, latestAccess.current) !== freshURL) {
+      throw new Error("lan_address_changed");
+    }
+    return freshURL;
+  };
+
+  const finishLANAddressAction = async (action: LANAddressAction, displayed: LANAppAccessRead | undefined, sequence: number, authorityKey: string, pendingWindow: PendingLANWindow | null, deadline: number) => {
+    const popup = pendingWindow?.popup ?? null;
+    try {
+      const freshURL = await proveLANAddress(displayed, sequence, authorityKey);
+      if (!mounted.current || sequence !== lanAddressActionSequence.current || currentLANAddressAuthority.current !== authorityKey ||
+          exactLANActionURL(appId, displayed, latestAccess.current) !== freshURL) {
+        closeLANWindow(popup);
+        return;
+      }
+      if (action === "open") {
+        if (!pendingWindow) throw new Error("popup_closed");
+        if (!pendingLANWindowUnchanged(pendingWindow)) throw new Error(pendingWindow.popup.closed ? "popup_closed" : "popup_changed");
+        pendingWindow.popup.location.replace(freshURL);
+        pendingLANWindow.current = null;
+      } else {
+        if (currentLANAddressAuthority.current !== authorityKey) throw new Error("lan_action_authority_changed");
+        if (!navigator.clipboard) throw new Error("clipboard_failed");
+        try {
+          await navigator.clipboard.writeText(freshURL);
+        } catch {
+          throw new Error("clipboard_failed");
+        }
+        if (!mounted.current || sequence !== lanAddressActionSequence.current || currentLANAddressAuthority.current !== authorityKey) return;
+      }
+      if (mounted.current && sequence === lanAddressActionSequence.current) {
+        setLANAddressAction({
+          phase: "success",
+          action,
+          message: action === "open" ? "The freshly proved LAN address opened in a new window." : "The freshly proved LAN address was copied.",
+        });
+      }
+    } catch (error) {
+      closeLANWindow(popup);
+      if (pendingLANWindow.current === popup) pendingLANWindow.current = null;
+      if (mounted.current && sequence === lanAddressActionSequence.current) {
+        setLANAddressAction({ phase: "failure", action, message: lanAddressActionFailure(error) });
+      }
+    } finally {
+      clearLANAddressActionDeadline(deadline);
+      if (sequence === lanAddressActionSequence.current) lanAddressActionInFlight.current = false;
+    }
+  };
+
+  const openLANAddress = (displayed: LANAppAccessRead | undefined) => {
+    const authorityKey = currentLANAddressAuthority.current;
+    if (lanAddressActionInFlight.current || !authorityKey) return;
+    lanAddressActionInFlight.current = true;
+    currentLANAddressAction.current = "open";
+    const sequence = ++lanAddressActionSequence.current;
+    let popup: Window | null = null;
+    let pendingWindow: PendingLANWindow | null = null;
+    try {
+      popup = window.open("about:blank", "_blank");
+      if (!popup) throw new Error("popup_blocked");
+      popup.opener = null;
+      pendingWindow = preparePendingLANWindow(popup);
+      if (!pendingWindow) throw new Error("popup_changed");
+    } catch {
+      closeLANWindow(popup);
+      lanAddressActionInFlight.current = false;
+      setLANAddressAction({ phase: "failure", action: "open", message: "The browser blocked an isolated new window. Allow pop-ups for Rig before trying again." });
+      return;
+    }
+    pendingLANWindow.current = popup;
+    setLANAddressAction({ phase: "checking", action: "open" });
+    const deadline = startLANAddressActionDeadline(sequence, "open", popup);
+    void finishLANAddressAction("open", displayed, sequence, authorityKey, pendingWindow, deadline);
+  };
+
+  const copyLANAddress = (displayed: LANAppAccessRead | undefined) => {
+    const authorityKey = currentLANAddressAuthority.current;
+    if (lanAddressActionInFlight.current || !authorityKey) return;
+    lanAddressActionInFlight.current = true;
+    currentLANAddressAction.current = "copy";
+    const sequence = ++lanAddressActionSequence.current;
+    setLANAddressAction({ phase: "checking", action: "copy" });
+    const deadline = startLANAddressActionDeadline(sequence, "copy", null);
+    void finishLANAddressAction("copy", displayed, sequence, authorityKey, null, deadline);
   };
 
   const reserve = useMutation({
@@ -397,7 +686,8 @@ export function LANApplicationAccessPanel({ appId, role, userId, enabled }: { ap
     },
   });
 
-  const lanURL = access.isFetching || disable.isPending || Boolean(disableClaim) || Boolean(unresolvedDisableRequest)
+  const lanAddressWithheld = lanAddressAction.phase === "checking" || lanAddressAction.phase === "failure";
+  const lanURL = access.isFetching || disable.isPending || Boolean(disableClaim) || Boolean(unresolvedDisableRequest) || lanAddressWithheld
     ? null : verifiedLANAccessURL(access.data);
 
   useEffect(() => {
@@ -476,6 +766,20 @@ export function LANApplicationAccessPanel({ appId, role, userId, enabled }: { ap
   }, [disableClaim, focusAfterDisable, unresolvedDisableRequest]);
 
   useEffect(() => {
+    if (lanAddressAction.phase === "checking" || lanAddressAction.phase === "failure") {
+      const timer = window.setTimeout(() => lanAddressActionStatus.current?.focus(), 0);
+      return () => window.clearTimeout(timer);
+    }
+    if (lanAddressAction.phase === "success") {
+      const timer = window.setTimeout(() => {
+        const target = lanAddressAction.action === "open" ? openLANAddressButton.current : copyLANAddressButton.current;
+        target?.focus();
+      }, 0);
+      return () => window.clearTimeout(timer);
+    }
+  }, [lanAddressAction]);
+
+  useEffect(() => {
     if (access.isFetching || access.isError || !access.data) return;
     if (lanURL) setMessage(`LAN route verified at ${access.data.observedAt}.`);
     else if (routeExpired) setMessage("LAN route verification expired. Check LAN access again before opening or copying an address.");
@@ -489,7 +793,9 @@ export function LANApplicationAccessPanel({ appId, role, userId, enabled }: { ap
       grantClaim ? grantState.refetch() : Promise.resolve(undefined),
       disableClaim ? disableState.refetch() : Promise.resolve(undefined),
     ]);
-    setMessage(checks.some((check) => check?.isError)
+    const failed = checks.some((check) => check?.isError);
+    if (!failed) setLANAddressAction({ phase: "idle" });
+    setMessage(failed
       ? "Rig could not refresh the complete LAN access observation. Review the reported error before using an address."
       : "LAN access observation refreshed.");
   };
@@ -510,11 +816,12 @@ export function LANApplicationAccessPanel({ appId, role, userId, enabled }: { ap
 
   const accessBusy = access.isFetching || profile.isFetching;
   return <section className="lan-access-panel" aria-labelledby="lan-access-title">
-    <div className="lan-heading"><div><h2 id="lan-access-title">LAN access</h2><p>Keep this application local until an administrator approves and attests a separate LAN route.</p></div><button className="button small" type="button" disabled={accessBusy || reserve.isPending || approve.isPending || grant.isPending || disable.isPending} onClick={() => void refresh()}>Check LAN access</button></div>
-    <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{reserve.isPending ? "Reserving a LAN port for review." : approve.isPending ? "Approving LAN access." : grant.isPending ? "Applying the LAN route." : disable.isPending ? "Removing LAN sharing." : accessBusy ? "Checking the latest LAN access observation." : message}</span>
+    <div className="lan-heading"><div><h2 id="lan-access-title">LAN access</h2><p>Keep this application local until an administrator approves and attests a separate LAN route.</p></div><button className="button small" type="button" disabled={accessBusy || lanAddressAction.phase === "checking" || reserve.isPending || approve.isPending || grant.isPending || disable.isPending} onClick={() => void refresh()}>Check LAN access</button></div>
+    <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{lanAddressAction.phase === "checking" ? `Checking the LAN address before ${lanAddressAction.action === "open" ? "opening" : "copying"}.` : lanAddressAction.phase === "success" ? lanAddressAction.message : reserve.isPending ? "Reserving a LAN port for review." : approve.isPending ? "Approving LAN access." : grant.isPending ? "Applying the LAN route." : disable.isPending ? "Removing LAN sharing." : accessBusy ? "Checking the latest LAN access observation." : message}</span>
     {message && <p className="lan-message">{message}</p>}
+    {lanAddressAction.phase === "success" && <p className="lan-message">{lanAddressAction.message}</p>}
     {access.isLoading ? <p role="status">Loading LAN access state…</p> : access.isError ? <div className="callout danger" role="alert"><strong>LAN access state could not be loaded.</strong><span>{access.error.message}</span><button className="button small" type="button" onClick={() => void access.refetch()}>Retry LAN access check</button></div> : <>
-      {access.data?.availability === "local_only" && !disableClaim ? <div className="callout info"><strong>Local only</strong><span>No approved LAN access exists for this application.</span></div> : accessRefreshWithheld ? <div className="callout info" role="status"><strong>Checking LAN route</strong><span>The previous LAN address is hidden until this controller returns a fresh attestation.</span></div> : lanURL ? <div className="callout info lan-address"><strong>LAN route verified</strong><span>HTTP is reachable from devices that can reach this controller address. Verified at {access.data?.observedAt}.</span><code>{lanURL}</code><div className="lan-actions"><a className="button small" href={lanURL} target="_blank" rel="noopener noreferrer">Open LAN address</a><button className="button small" type="button" onClick={() => { if (!navigator.clipboard) { setMessage("LAN address could not be copied."); return; } void navigator.clipboard.writeText(lanURL).then(() => setMessage("LAN address copied."), () => setMessage("LAN address could not be copied.")); }}>Copy address</button></div></div> : <div className="callout warning"><strong>{disableClaim?.state === "committed" ? "LAN sharing removed" : disableClaim ? "LAN sharing is being removed" : routeExpired ? "LAN route verification expired" : access.data?.availability === "verified" ? "LAN address withheld" : "LAN route is not verified"}</strong><span>{disableClaim?.state === "committed" ? "The controller withdrew the LAN route and recorded release proof. No LAN address is available." : disableClaim ? "The controller is releasing this LAN route. Its address stays hidden until the removal claim resolves." : routeExpired ? "The LAN route observation is too old to open or copy an address. Check LAN access again." : access.data?.availability === "verified" ? "The controller did not return a current safe LAN address. Check LAN access again before opening or copying an address." : "An approved profile or port allocation is not proof that the gateway is serving this application. No LAN address is shown."}</span></div>}
+      {lanAddressAction.phase === "checking" ? <div ref={lanAddressActionStatus} className="callout info" role="status" tabIndex={-1}><strong>Checking LAN address</strong><span>Rig is proving current system state and a fresh exact LAN access observation before using the address.</span></div> : lanAddressAction.phase === "failure" ? <div ref={lanAddressActionStatus} className="callout danger" role="alert" tabIndex={-1}><strong>LAN address action stopped</strong><span>{lanAddressAction.message}</span></div> : access.data?.availability === "local_only" && !disableClaim ? <div className="callout info"><strong>Local only</strong><span>No approved LAN access exists for this application.</span></div> : accessRefreshWithheld ? <div className="callout info" role="status"><strong>Checking LAN route</strong><span>The previous LAN address is hidden until this controller returns a fresh attestation.</span></div> : lanURL ? <div className="callout info lan-address"><strong>LAN route verified</strong><span>HTTP is reachable from devices that can reach this controller address. Verified at {access.data?.observedAt}.</span><code>{lanURL}</code><div className="lan-actions"><button ref={openLANAddressButton} className="button small" type="button" onClick={() => openLANAddress(access.data)}>Open LAN address</button><button ref={copyLANAddressButton} className="button small" type="button" onClick={() => copyLANAddress(access.data)}>Copy address</button></div></div> : <div className="callout warning"><strong>{disableClaim?.state === "committed" ? "LAN sharing removed" : disableClaim ? "LAN sharing is being removed" : routeExpired ? "LAN route verification expired" : access.data?.availability === "verified" ? "LAN address withheld" : "LAN route is not verified"}</strong><span>{disableClaim?.state === "committed" ? "The controller withdrew the LAN route and recorded release proof. No LAN address is available." : disableClaim ? "The controller is releasing this LAN route. Its address stays hidden until the removal claim resolves." : routeExpired ? "The LAN route observation is too old to open or copy an address. Check LAN access again." : access.data?.availability === "verified" ? "The controller did not return a current safe LAN address. Check LAN access again before opening or copying an address." : "An approved profile or port allocation is not proof that the gateway is serving this application. No LAN address is shown."}</span></div>}
       {currentRevision && <dl className="lan-details"><div><dt>Approved access revision</dt><dd>{currentRevision.revisionNumber}</dd></div><div><dt>Allocated port</dt><dd>{currentRevision.allocation.port}</dd></div><div><dt>Allocation state</dt><dd>{shortState(currentRevision.allocation.state)}</dd></div><div><dt>Approval digest</dt><dd className="mono">{currentRevision.specDigest}</dd></div></dl>}
       {pendingReservation && <aside className="lan-pending" aria-labelledby="lan-reservation-title"><h3 id="lan-reservation-title">Reserved port awaiting approval</h3><p>Port {pendingReservation.reservation.allocation.port} is reserved for this exact review. No address is available.</p><dl className="lan-details"><div><dt>Allocation identifier</dt><dd className="mono">{pendingReservation.reservation.allocation.id}</dd></div><div><dt>Operation identifier</dt><dd className="mono">{pendingReservation.operationId}</dd></div></dl><button ref={reservationReviewButton} className="button small" type="button" onClick={() => setReservationReview(pendingReservation)}>Review reserved port</button></aside>}
       {grantClaim && <aside className="lan-pending" aria-labelledby="lan-claim-title"><h3 ref={grantHeading} id="lan-claim-title" tabIndex={-1}>Activation claim</h3><p>Claim <span className="mono">{grantClaim.attemptId}</span> is {shortState(grantClaim.state)}.</p>{grantState.isError ? <div className="callout danger" role="alert"><strong>Claim observation could not be loaded.</strong><span>{grantState.error.message}</span><button className="button small" type="button" onClick={() => void grantState.refetch()}>Retry claim check</button></div> : observedGrantMatchesSnapshot && grantState.data && <dl className="lan-details"><div><dt>Durable state</dt><dd>{shortState(grantState.data.claim.state)}</dd></div><div><dt>Gateway observation</dt><dd>{shortState(grantState.data.observed.availability)}</dd></div>{grantState.data.observed.observedAt && <div><dt>Observed at</dt><dd>{grantState.data.observed.observedAt}</dd></div>}</dl>}</aside>}
@@ -523,9 +830,9 @@ export function LANApplicationAccessPanel({ appId, role, userId, enabled }: { ap
       {unresolvedGrantRequest && !grantMatchesRequest(grantClaim, currentRevision, unresolvedGrantRequest) && <aside className="lan-pending" aria-labelledby="lan-grant-recovery-title"><h3 ref={grantRecoveryHeading} id="lan-grant-recovery-title" tabIndex={-1}>Activation result needs reconciliation</h3><p>Rig retained the exact activation claim and will not create a replacement request while it is unresolved.</p><dl className="lan-details"><div><dt>Claim identifier</dt><dd className="mono">{unresolvedGrantRequest.attemptId}</dd></div><div><dt>Access revision</dt><dd>{unresolvedGrantRequest.accessRevisionNumber}</dd></div></dl><div className="lan-actions"><button className="button small" type="button" disabled={!accessReady || grant.isPending} onClick={() => grant.mutate(unresolvedGrantRequest)}>Replay exact activation</button><button className="button small" type="button" disabled={accessBusy || grant.isPending} onClick={() => void refresh()}>Check current access state</button></div></aside>}
       {unresolvedDisableRequest && !disableMatchesRequest(disableClaim, unresolvedDisableRequest) && <aside className="lan-pending" aria-labelledby="lan-disable-recovery-title"><h3 ref={recoveryHeading} id="lan-disable-recovery-title" tabIndex={-1}>LAN sharing removal needs reconciliation</h3><p>Rig retained the exact removal operation. The port remains held until the controller records a release proof, and Rig will not create a replacement operation.</p><dl className="lan-details"><div><dt>Removal operation</dt><dd className="mono">{unresolvedDisableRequest.operationId}</dd></div><div><dt>Access revision</dt><dd>{unresolvedDisableRequest.accessRevisionNumber}</dd></div><div><dt>Allocation identifier</dt><dd className="mono">{unresolvedDisableRequest.allocationId}</dd></div></dl><div className="lan-actions"><button className="button small" type="button" disabled={!accessReady || disable.isPending} onClick={() => disable.mutate(unresolvedDisableRequest)}>Replay exact removal</button><button className="button small" type="button" disabled={accessBusy || disable.isPending} onClick={() => void refresh()}>Check current access state</button></div></aside>}
       {!currentRevision && !pendingReservation && !unresolvedReservation && !unresolvedGrantRequest && !unresolvedDisableRequest && <>{profile.isLoading ? <p role="status">Checking the approved gateway profile…</p> : profile.isError ? <div className="callout danger" role="alert"><strong>Gateway profile could not be checked.</strong><span>{profile.error.message}</span><button className="button small" type="button" onClick={() => void profile.refetch()}>Retry profile check</button></div> : !currentProfile ? <div className="callout warning"><strong>LAN gateway profile required</strong><span>Approve a desired LAN gateway profile from Machines before reserving a port for this application.</span></div> : <button className="button" type="button" disabled={!canReserve} onClick={() => { setMessage(""); reserve.mutate({ operationId: crypto.randomUUID(), expectedRevisionNumber: access.data!.expectedRevisionNumber, profileRevisionId: currentProfile.id, profileRevisionNumber: currentProfile.revisionNumber }); }}>{reserve.isPending ? "Reserving port…" : "Reserve LAN port for review"}</button>}</>}
-      {currentRevision && !lanURL && !grantClaim && !unresolvedGrantRequest && !disableClaim && !unresolvedDisableRequest && <button ref={activationReviewButton} className="button" type="button" disabled={!accessReady || grant.isPending} onClick={() => setGrantReview(currentRevision)}>Review LAN activation</button>}
+      {currentRevision && !lanURL && !lanAddressWithheld && !grantClaim && !unresolvedGrantRequest && !disableClaim && !unresolvedDisableRequest && <button ref={activationReviewButton} className="button" type="button" disabled={!accessReady || grant.isPending} onClick={() => setGrantReview(currentRevision)}>Review LAN activation</button>}
       {currentRevision && !lanURL && grantUnresolved(grantClaim) && <div className="callout warning"><strong>LAN activation is still resolving.</strong><span>Rig will not offer LAN sharing removal until the current activation claim reaches a terminal state.</span></div>}
-      {currentRevision && disableAllowed && <button ref={disableReviewButton} className="button danger" type="button" disabled={disable.isPending} onClick={() => setDisableReview(currentDisableReview)}>Review LAN sharing removal</button>}
+      {currentRevision && disableAllowed && <button ref={disableReviewButton} className="button danger" type="button" disabled={disable.isPending || lanAddressAction.phase === "checking"} onClick={() => setDisableReview(currentDisableReview)}>Review LAN sharing removal</button>}
       {currentRevision && accessReady && access.data?.disableReview && !currentDisableReview && <div className="callout warning"><strong>LAN sharing removal review is stale.</strong><span>The controller’s removal consent no longer matches the active access revision. Refresh LAN access before taking action.</span></div>}
       {reserve.isError && !unresolvedReservation && <div className="callout danger" role="alert"><strong>Port reservation was not completed.</strong><span>{reserve.error.message}</span><button className="button small" type="button" onClick={() => void refresh()}>Refresh access summary</button></div>}
     </>}

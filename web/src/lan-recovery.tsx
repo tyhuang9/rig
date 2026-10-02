@@ -5,12 +5,12 @@ import {
   api,
   isGatewayReconciliationRequired,
   subscribeGatewayReconciliationRequired,
+  validSystemStatus,
   type LANAppDisableClaim,
   type LANAppDisableRead,
   type LANAppGrantClaim,
   type LANAppGrantRead,
   type LANRecoveryHead,
-  type SystemStatus,
 } from "./api";
 
 type SignOut = () => void | Promise<void>;
@@ -67,12 +67,6 @@ const disableAvailabilities = new Set(["unknown", "pending_published", "withdraw
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
-}
-
-function validSystemStatus(value: unknown): value is SystemStatus {
-  const status = record(value);
-  return Boolean(status && typeof status.daemon === "string" &&
-    record(status.capabilities) && record(status.diagnostics));
 }
 
 function requiredString(value: unknown) {

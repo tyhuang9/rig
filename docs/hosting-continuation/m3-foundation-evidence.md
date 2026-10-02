@@ -937,3 +937,39 @@ This contract still needs integration with the separate UI branch, a browser
 refresh journey, and live Docker/LAN acceptance. The recovery-only controller
 still needs a safe pinned-head discovery read. None of these local checks
 prove external database connectivity or second-device reachability.
+
+## Migrated legacy pair composition: local evidence
+
+The test-only `feature/hosting-m3-legacy-pair-composition` branch starts from
+the locally verified operator recovery UI and fresh LAN actions at `eb7afd9`.
+`TestMigratedLegacyPairRecoveryComposition` seeds a real SQLite database
+through migration 028 with an active prepared grant and paired prepared disable,
+plus committed gateway-upgrade history, then applies migration 032 and all
+later migrations. It checks the exact converted grant and disable claims
+passed from the repository census into hostd startup quarantine, including
+the historical disable intent and absent source grant. The fake ingress
+returns a protected head only after those inputs match. Hostd pins the grant
+first; after an exact repository rollback, migration 032 keeps the allocation
+active and owned until the prepared disable can be exposed by a fresh startup
+and re-pin. Recovery-only controller GET returns every expected head field,
+while normal system status and both pinned and unrelated application reads
+return `503 gateway_reconciliation_required` with `no-store` and no LAN URL.
+Changed census, missing protected head, and quarantine error fail before
+normal controller operation.
+
+The test does not perform a controller recovery POST. It uses the real SQLite
+repository and hostd/controller read boundaries with a simulated ingress
+head. Separate generated-ingress tests exercise protected 404 quarantine;
+this composition test does not prove live Docker, gateway, or physical LAN
+behavior.
+
+| Check | Observed result |
+| --- | --- |
+| `go test -count=1 ./cmd/hostd -run '^TestMigratedLegacyPairRecoveryComposition$' -v` | Passed after the final exact-head, claim-conversion, digest, and allocation assertions. |
+| `go test -count=1 -p 1 ./internal/appaccess ./internal/database ./internal/generatedingress ./internal/controller ./cmd/hostd` | Passed with normal Windows workspace permissions. A more restricted worker run failed unchanged controller and generated-ingress fixtures; no files in those packages changed. |
+| `go test -count=1 -p 1 ./...` | First run failed only the unchanged `internal/releasesnapshot` compressed-limit taxonomy case (`internal_error` instead of `source_too_large`). That isolated case passed on both the parent and test branches; a second full run passed every package. The first failure remains recorded as an intermittent baseline concern. |
+| `go vet ./...` and `go run ./cmd/openapi-gen -check` | Passed. |
+
+No production code, schema, protected state, branch history, or hosted runtime
+was changed by this branch. M3 live Docker and second-device acceptance remain
+open.
