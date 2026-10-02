@@ -648,6 +648,21 @@ const (
 	liveGatewayV2TraceCreatePredicateEffectivePorts   liveGatewayV2TraceOutcome = "failed_predicate_effective_ports_absent"
 	liveGatewayV2TraceCreatePredicateExpectedNetworks liveGatewayV2TraceOutcome = "failed_predicate_expected_networks"
 	liveGatewayV2TraceCreatePredicateStoppedNetworks  liveGatewayV2TraceOutcome = "failed_predicate_stopped_networks"
+	liveGatewayV2TraceCreateLabelsMissingRequired     liveGatewayV2TraceOutcome = "labels_missing_required_key"
+	liveGatewayV2TraceCreateLabelsRequiredMismatch    liveGatewayV2TraceOutcome = "labels_required_value_mismatch"
+	liveGatewayV2TraceCreateLabelsExtraRig            liveGatewayV2TraceOutcome = "labels_extra_rig_key"
+	liveGatewayV2TraceCreateLabelsExtraForeign        liveGatewayV2TraceOutcome = "labels_extra_non_rig_key"
+	liveGatewayV2TraceCreateNetworksMissing           liveGatewayV2TraceOutcome = "stopped_networks_missing_expected_key"
+	liveGatewayV2TraceCreateNetworksExtra             liveGatewayV2TraceOutcome = "stopped_networks_extra_key"
+	liveGatewayV2TraceCreateNetworksInvalidID         liveGatewayV2TraceOutcome = "stopped_networks_invalid_network_id"
+	liveGatewayV2TraceCreateNetworksEndpointPresent   liveGatewayV2TraceOutcome = "stopped_networks_endpoint_id_present"
+	liveGatewayV2TraceCreateNetworksAddressPresent    liveGatewayV2TraceOutcome = "stopped_networks_ip_address_present"
+	liveGatewayV2TraceCreateNetworksIPv6Present       liveGatewayV2TraceOutcome = "stopped_networks_ipv6_gateway_present"
+	liveGatewayV2TraceCreateNetworksPriorityMismatch  liveGatewayV2TraceOutcome = "stopped_networks_gateway_priority_mismatch"
+	liveGatewayV2TraceCreateNetworksIPAMMissing       liveGatewayV2TraceOutcome = "stopped_networks_ipam_missing"
+	liveGatewayV2TraceCreateNetworksIPv4Mismatch      liveGatewayV2TraceOutcome = "stopped_networks_requested_ipv4_mismatch"
+	liveGatewayV2TraceCreateNetworksIPAMIPv6Present   liveGatewayV2TraceOutcome = "stopped_networks_ipam_ipv6_present"
+	liveGatewayV2TraceCreateNetworksUnexpectedIPAM    liveGatewayV2TraceOutcome = "stopped_networks_unexpected_application_ipam"
 )
 
 type liveGatewayV2TraceEvent struct {
@@ -939,16 +954,113 @@ func liveGatewayV2StoppedContainerFailureOutcomes(state gatewayV2RouteState, jou
 		len(value.Cmd) == 3 && value.Cmd[0] == "run" && value.Cmd[1] == "--config" && value.Cmd[2] == "/config/"+configFilename)
 	add(liveGatewayV2TraceCreatePredicateUlimit,
 		len(value.Ulimits) == 1 && value.Ulimits[0] == (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}))
-	add(liveGatewayV2TraceCreatePredicateLabels,
-		reflect.DeepEqual(value.Labels, gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true)))
+	expectedLabels := gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true)
+	labelsValid := reflect.DeepEqual(value.Labels, expectedLabels)
+	add(liveGatewayV2TraceCreatePredicateLabels, labelsValid)
+	if !labelsValid {
+		failures = append(failures, liveGatewayV2LabelFailureOutcomes(value.Labels, expectedLabels)...)
+	}
 	add(liveGatewayV2TraceCreatePredicateMounts, validGatewayV2Mounts(value.Mounts, state.Identity))
 	add(liveGatewayV2TraceCreatePredicateConfiguredPorts, validGatewayV2PortBindings(value.PortBindings, state, journal, role))
 	add(liveGatewayV2TraceCreatePredicateEffectivePorts, !gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings))
 	expectedNetworks, validNetworks := gatewayV2ExpectedContainerNetworks(state, role)
 	add(liveGatewayV2TraceCreatePredicateExpectedNetworks, validNetworks)
-	add(liveGatewayV2TraceCreatePredicateStoppedNetworks,
-		validNetworks && validGatewayV2StoppedContainerNetworks(state, role, expectedNetworks, runtime.ConfiguredNetworks))
+	stoppedNetworksValid := validNetworks &&
+		validGatewayV2StoppedContainerNetworks(state, role, expectedNetworks, runtime.ConfiguredNetworks)
+	add(liveGatewayV2TraceCreatePredicateStoppedNetworks, stoppedNetworksValid)
+	if validNetworks && !stoppedNetworksValid {
+		failures = append(failures,
+			liveGatewayV2StoppedNetworkFailureOutcomes(state, role, expectedNetworks, runtime.ConfiguredNetworks)...)
+	}
 	return failures
+}
+
+func liveGatewayV2LabelFailureOutcomes(actual, expected map[string]string) []liveGatewayV2TraceOutcome {
+	missingRequired, requiredMismatch, extraRig, extraForeign := false, false, false, false
+	for key, expectedValue := range expected {
+		actualValue, exists := actual[key]
+		missingRequired = missingRequired || !exists
+		requiredMismatch = requiredMismatch || exists && actualValue != expectedValue
+	}
+	for key := range actual {
+		if _, exists := expected[key]; exists {
+			continue
+		}
+		if strings.HasPrefix(key, "io.rig.") {
+			extraRig = true
+		} else {
+			extraForeign = true
+		}
+	}
+	return liveGatewayV2SelectedTraceOutcomes(
+		liveGatewayV2TraceSelection{missingRequired, liveGatewayV2TraceCreateLabelsMissingRequired},
+		liveGatewayV2TraceSelection{requiredMismatch, liveGatewayV2TraceCreateLabelsRequiredMismatch},
+		liveGatewayV2TraceSelection{extraRig, liveGatewayV2TraceCreateLabelsExtraRig},
+		liveGatewayV2TraceSelection{extraForeign, liveGatewayV2TraceCreateLabelsExtraForeign},
+	)
+}
+
+func liveGatewayV2StoppedNetworkFailureOutcomes(state gatewayV2RouteState, role string, expected map[string]struct{},
+	actual map[string]gatewayV2ConfiguredNetwork,
+) []liveGatewayV2TraceOutcome {
+	missing, extra := false, false
+	invalidID, endpointPresent, addressPresent, ipv6Present := false, false, false, false
+	priorityMismatch, ipamMissing, ipv4Mismatch, ipamIPv6Present, unexpectedIPAM := false, false, false, false, false
+	for name := range expected {
+		attachment, exists := actual[name]
+		if !exists {
+			missing = true
+			continue
+		}
+		invalidID = invalidID || !validContainerID(attachment.NetworkID)
+		endpointPresent = endpointPresent || attachment.EndpointID != ""
+		addressPresent = addressPresent || attachment.IPAddress != ""
+		ipv6Present = ipv6Present || attachment.IPv6Gateway != ""
+		if name == state.Identity.IngressNetwork {
+			priorityMismatch = priorityMismatch || attachment.GwPriority != caddyGatewayPriority
+			ipamMissing = ipamMissing || attachment.IPAMConfig == nil
+			if attachment.IPAMConfig != nil {
+				ipv4Mismatch = ipv4Mismatch || attachment.IPAMConfig.IPv4Address != state.Network.ContainerIPv4
+				ipamIPv6Present = ipamIPv6Present || attachment.IPAMConfig.IPv6Address != ""
+			}
+		} else {
+			priorityMismatch = priorityMismatch || role != gatewayV2FinalContainerRole || attachment.GwPriority != 0
+			unexpectedIPAM = unexpectedIPAM || attachment.IPAMConfig != nil && *attachment.IPAMConfig != (gatewayV2ConfiguredIPAM{})
+		}
+	}
+	for name := range actual {
+		if _, exists := expected[name]; !exists {
+			extra = true
+		}
+	}
+	return liveGatewayV2SelectedTraceOutcomes(
+		liveGatewayV2TraceSelection{missing, liveGatewayV2TraceCreateNetworksMissing},
+		liveGatewayV2TraceSelection{extra, liveGatewayV2TraceCreateNetworksExtra},
+		liveGatewayV2TraceSelection{invalidID, liveGatewayV2TraceCreateNetworksInvalidID},
+		liveGatewayV2TraceSelection{endpointPresent, liveGatewayV2TraceCreateNetworksEndpointPresent},
+		liveGatewayV2TraceSelection{addressPresent, liveGatewayV2TraceCreateNetworksAddressPresent},
+		liveGatewayV2TraceSelection{ipv6Present, liveGatewayV2TraceCreateNetworksIPv6Present},
+		liveGatewayV2TraceSelection{priorityMismatch, liveGatewayV2TraceCreateNetworksPriorityMismatch},
+		liveGatewayV2TraceSelection{ipamMissing, liveGatewayV2TraceCreateNetworksIPAMMissing},
+		liveGatewayV2TraceSelection{ipv4Mismatch, liveGatewayV2TraceCreateNetworksIPv4Mismatch},
+		liveGatewayV2TraceSelection{ipamIPv6Present, liveGatewayV2TraceCreateNetworksIPAMIPv6Present},
+		liveGatewayV2TraceSelection{unexpectedIPAM, liveGatewayV2TraceCreateNetworksUnexpectedIPAM},
+	)
+}
+
+type liveGatewayV2TraceSelection struct {
+	selected bool
+	outcome  liveGatewayV2TraceOutcome
+}
+
+func liveGatewayV2SelectedTraceOutcomes(values ...liveGatewayV2TraceSelection) []liveGatewayV2TraceOutcome {
+	outcomes := make([]liveGatewayV2TraceOutcome, 0, len(values))
+	for _, value := range values {
+		if value.selected {
+			outcomes = append(outcomes, value.outcome)
+		}
+	}
+	return outcomes
 }
 
 func (d liveGatewayV2TracingUpgradeDriver) copyStageConfig(ctx context.Context, state gatewayV2RouteState,
@@ -1169,6 +1281,35 @@ func TestGatewayV2StoppedContainerDiagnosticMatchesValidator(t *testing.T) {
 		gatewayV2StageContainerRole, observation.Image.ID)
 	if !reflect.DeepEqual(failures, []liveGatewayV2TraceOutcome{liveGatewayV2TraceCreatePredicateLogging}) {
 		t.Fatalf("logging drift diagnostic failures=%v", failures)
+	}
+
+	expectedLabels := gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, gatewayV2StageContainerRole, true)
+	labelsWithImageMetadata := make(map[string]string, len(expectedLabels)+1)
+	for key, value := range expectedLabels {
+		labelsWithImageMetadata[key] = value
+	}
+	labelsWithImageMetadata["org.opencontainers.image.title"] = "metadata"
+	if failures := liveGatewayV2LabelFailureOutcomes(labelsWithImageMetadata, expectedLabels); !reflect.DeepEqual(failures,
+		[]liveGatewayV2TraceOutcome{liveGatewayV2TraceCreateLabelsExtraForeign}) {
+		t.Fatalf("foreign label diagnostic failures=%v", failures)
+	}
+
+	expectedNetworks, valid := gatewayV2ExpectedContainerNetworks(state, gatewayV2StageContainerRole)
+	if !valid {
+		t.Fatal("valid stage network plan was rejected")
+	}
+	networks := make(map[string]gatewayV2ConfiguredNetwork, len(observation.StageRuntime.ConfiguredNetworks))
+	for name, network := range observation.StageRuntime.ConfiguredNetworks {
+		networks[name] = network
+	}
+	ingress := networks[state.Identity.IngressNetwork]
+	ingress.NetworkID = ""
+	ingress.IPAMConfig = nil
+	networks[state.Identity.IngressNetwork] = ingress
+	if failures := liveGatewayV2StoppedNetworkFailureOutcomes(state, gatewayV2StageContainerRole, expectedNetworks, networks); !reflect.DeepEqual(failures, []liveGatewayV2TraceOutcome{
+		liveGatewayV2TraceCreateNetworksInvalidID, liveGatewayV2TraceCreateNetworksIPAMMissing,
+	}) {
+		t.Fatalf("stopped network diagnostic failures=%v", failures)
 	}
 }
 
