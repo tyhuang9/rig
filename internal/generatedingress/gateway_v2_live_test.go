@@ -583,6 +583,7 @@ const (
 	liveGatewayV2TraceStageCopyConfig                liveGatewayV2TraceStep = "stage_copy_config"
 	liveGatewayV2TraceStageReadRestartConfig         liveGatewayV2TraceStep = "stage_read_restart_config"
 	liveGatewayV2TraceStageAttestStopped             liveGatewayV2TraceStep = "stage_attest_stopped"
+	liveGatewayV2TraceStageAttestStoppedDetail       liveGatewayV2TraceStep = "stage_attest_stopped_detail"
 	liveGatewayV2TraceStageAttestStoppedCompensation liveGatewayV2TraceStep = "stage_attest_stopped_compensation"
 	liveGatewayV2TraceStageStart                     liveGatewayV2TraceStep = "stage_start"
 	liveGatewayV2TraceStageStartDetail               liveGatewayV2TraceStep = "stage_start_detail"
@@ -681,6 +682,42 @@ const (
 	liveGatewayV2TraceStartRuntimeCreateFailed        liveGatewayV2TraceOutcome = "start_runtime_create_failed"
 	liveGatewayV2TraceStartExternalConnectivityFailed liveGatewayV2TraceOutcome = "start_external_connectivity_failed"
 	liveGatewayV2TraceStartCommandFailedOther         liveGatewayV2TraceOutcome = "start_command_failed_other"
+)
+
+const (
+	liveGatewayV2TraceAttestInspectError               liveGatewayV2TraceOutcome = "attest_inspect_error"
+	liveGatewayV2TraceAttestUnclassified               liveGatewayV2TraceOutcome = "attest_unclassified_failure"
+	liveGatewayV2TraceAttestPhase                      liveGatewayV2TraceOutcome = "failed_predicate_attest_phase"
+	liveGatewayV2TraceAttestTopologyInputs             liveGatewayV2TraceOutcome = "failed_predicate_attest_topology_inputs"
+	liveGatewayV2TraceAttestPinnedImage                liveGatewayV2TraceOutcome = "failed_predicate_attest_pinned_image"
+	liveGatewayV2TraceAttestResourceJournalBinding     liveGatewayV2TraceOutcome = "failed_predicate_attest_resource_journal_binding"
+	liveGatewayV2TraceAttestV1Base                     liveGatewayV2TraceOutcome = "failed_predicate_attest_v1_base"
+	liveGatewayV2TraceAttestV1Serving                  liveGatewayV2TraceOutcome = "failed_predicate_attest_v1_serving"
+	liveGatewayV2TraceAttestV1Stability                liveGatewayV2TraceOutcome = "failed_predicate_attest_v1_stability"
+	liveGatewayV2TraceAttestV1ResourceStability        liveGatewayV2TraceOutcome = "failed_predicate_attest_v1_resource_stability"
+	liveGatewayV2TraceAttestV1EndpointIdentity         liveGatewayV2TraceOutcome = "failed_predicate_attest_v1_endpoint_identity"
+	liveGatewayV2TraceAttestV2ResourceStability        liveGatewayV2TraceOutcome = "failed_predicate_attest_v2_resource_stability"
+	liveGatewayV2TraceAttestStageStability             liveGatewayV2TraceOutcome = "failed_predicate_attest_stage_stability"
+	liveGatewayV2TraceAttestFinalStability             liveGatewayV2TraceOutcome = "failed_predicate_attest_final_stability"
+	liveGatewayV2TraceAttestOwnedInventoryStability    liveGatewayV2TraceOutcome = "failed_predicate_attest_owned_inventory_stability"
+	liveGatewayV2TraceAttestStageConfigBuild           liveGatewayV2TraceOutcome = "failed_predicate_attest_stage_config_build"
+	liveGatewayV2TraceAttestStageInfrastructure        liveGatewayV2TraceOutcome = "failed_predicate_attest_stage_infrastructure"
+	liveGatewayV2TraceAttestStageBinding               liveGatewayV2TraceOutcome = "failed_predicate_attest_stage_binding"
+	liveGatewayV2TraceAttestFinalAbsent                liveGatewayV2TraceOutcome = "failed_predicate_attest_final_absent"
+	liveGatewayV2TraceAttestOwnedContainers            liveGatewayV2TraceOutcome = "failed_predicate_attest_owned_containers"
+	liveGatewayV2TraceAttestOwnedVolumes               liveGatewayV2TraceOutcome = "failed_predicate_attest_owned_volumes"
+	liveGatewayV2TraceAttestOwnedNetworks              liveGatewayV2TraceOutcome = "failed_predicate_attest_owned_networks"
+	liveGatewayV2TraceAttestVolumes                    liveGatewayV2TraceOutcome = "failed_predicate_attest_volumes"
+	liveGatewayV2TraceAttestStoppedContainer           liveGatewayV2TraceOutcome = "failed_predicate_attest_stopped_container"
+	liveGatewayV2TraceAttestStoppedIngressNetwork      liveGatewayV2TraceOutcome = "failed_predicate_attest_stopped_ingress_network"
+	liveGatewayV2TraceAttestIngressConfigured          liveGatewayV2TraceOutcome = "failed_predicate_attest_ingress_configured"
+	liveGatewayV2TraceAttestIngressInspectedID         liveGatewayV2TraceOutcome = "failed_predicate_attest_ingress_inspected_id"
+	liveGatewayV2TraceAttestIngressJournalID           liveGatewayV2TraceOutcome = "failed_predicate_attest_ingress_journal_id"
+	liveGatewayV2TraceAttestIngressConfiguredReference liveGatewayV2TraceOutcome = "failed_predicate_attest_ingress_configured_reference"
+	liveGatewayV2TraceAttestIngressResourceIdentity    liveGatewayV2TraceOutcome = "failed_predicate_attest_ingress_resource_identity"
+	liveGatewayV2TraceAttestStageLiveConfigAbsent      liveGatewayV2TraceOutcome = "failed_predicate_attest_stage_live_config_absent"
+	liveGatewayV2TraceAttestStageRestartConfig         liveGatewayV2TraceOutcome = "failed_predicate_attest_stage_restart_config"
+	liveGatewayV2TraceAttestApplicationNetworksAbsent  liveGatewayV2TraceOutcome = "failed_predicate_attest_application_networks_absent"
 )
 
 type liveGatewayV2TraceEvent struct {
@@ -1116,9 +1153,104 @@ func (d liveGatewayV2TracingUpgradeDriver) readStageRestartConfig(ctx context.Co
 func (d liveGatewayV2TracingUpgradeDriver) attestStoppedStage(ctx context.Context, source routeState,
 	state gatewayV2RouteState, journal gatewayMigrationJournal,
 ) bool {
-	result := d.gatewayV2UpgradeDriver.attestStoppedStage(ctx, source, state, journal)
+	if d.manager == nil || ctx == nil || !validGatewayTopologyInputs(source, state, journal) {
+		d.trace.recordAt(liveGatewayV2TraceStageAttestStoppedDetail, journal.Phase, liveGatewayV2TraceAttestInspectError)
+		d.trace.recordAt(liveGatewayV2TraceStageAttestStopped, journal.Phase, liveGatewayV2TraceFalse)
+		return false
+	}
+	observation, err := d.manager.inspectGatewayV2Docker(ctx, source, state, journal)
+	if err != nil {
+		clearGatewayV2DockerObservation(&observation)
+		d.trace.recordAt(liveGatewayV2TraceStageAttestStoppedDetail, journal.Phase, liveGatewayV2TraceAttestInspectError)
+		d.trace.recordAt(liveGatewayV2TraceStageAttestStopped, journal.Phase, liveGatewayV2TraceFalse)
+		return false
+	}
+	defer clearGatewayV2DockerObservation(&observation)
+	result := classifyGatewayV2RecoveryTopology(source, state, journal, observation) == gatewayV2RecoveryStageIntentStoppedStage
+	if !result {
+		failures := liveGatewayV2StoppedStageFailureOutcomes(source, state, journal, observation)
+		if len(failures) == 0 {
+			failures = append(failures, liveGatewayV2TraceAttestUnclassified)
+		}
+		for _, failure := range failures {
+			d.trace.recordAt(liveGatewayV2TraceStageAttestStoppedDetail, journal.Phase, failure)
+		}
+	}
 	d.trace.recordAt(liveGatewayV2TraceStageAttestStopped, journal.Phase, liveGatewayV2BoolOutcome(result))
 	return result
+}
+
+func liveGatewayV2StoppedStageFailureOutcomes(source routeState, state gatewayV2RouteState,
+	journal gatewayMigrationJournal, observation gatewayV2DockerObservation,
+) []liveGatewayV2TraceOutcome {
+	failures := make([]liveGatewayV2TraceOutcome, 0, 32)
+	add := func(failure liveGatewayV2TraceOutcome, valid bool) {
+		if !valid {
+			failures = append(failures, failure)
+		}
+	}
+
+	add(liveGatewayV2TraceAttestPhase, journal.Phase == gatewayPhaseStageIntent)
+	add(liveGatewayV2TraceAttestTopologyInputs, validGatewayTopologyInputs(source, state, journal))
+	add(liveGatewayV2TraceAttestPinnedImage, validGatewayPinnedImage(observation.Image, observation.ImageFound))
+	add(liveGatewayV2TraceAttestResourceJournalBinding, gatewayV2ObservedResourcesMatchJournal(journal, observation))
+	add(liveGatewayV2TraceAttestV1Base, validGatewayV1Base(source, journal, observation, true))
+	add(liveGatewayV2TraceAttestV1Serving, observation.V1Container.Running && !observation.V1Container.Restarting)
+	add(liveGatewayV2TraceAttestV1Stability, observation.V1Stable)
+	add(liveGatewayV2TraceAttestV1ResourceStability, observation.V1ResourcesStable)
+	add(liveGatewayV2TraceAttestV1EndpointIdentity, observation.V1EndpointIdentityProven)
+	add(liveGatewayV2TraceAttestV2ResourceStability, observation.V2ResourcesStable)
+	add(liveGatewayV2TraceAttestStageStability, observation.StageStable)
+	add(liveGatewayV2TraceAttestFinalStability, observation.FinalStable)
+	add(liveGatewayV2TraceAttestOwnedInventoryStability, observation.OwnedInventoriesStable)
+
+	infrastructureValid := validGatewayV2StoppedStageInfrastructure(state, journal, observation)
+	add(liveGatewayV2TraceAttestStageInfrastructure, infrastructureValid)
+	add(liveGatewayV2TraceAttestStageBinding, journal.Resources.StageContainerID != "")
+	add(liveGatewayV2TraceAttestFinalAbsent,
+		journal.Resources.FinalContainerID == "" && !observation.FinalContainerFound)
+	add(liveGatewayV2TraceAttestOwnedContainers,
+		validOwnedNameSet(observation.OwnedContainers, state.Identity.StageContainer))
+	add(liveGatewayV2TraceAttestOwnedVolumes,
+		validOwnedNameSet(observation.OwnedVolumes, state.Identity.ConfigVolume, state.Identity.DataVolume))
+	add(liveGatewayV2TraceAttestOwnedNetworks,
+		validOwnedNameSet(observation.OwnedNetworks, state.Identity.IngressNetwork))
+	add(liveGatewayV2TraceAttestVolumes, validGatewayV2Volumes(state, journal, observation))
+
+	stoppedContainerValid := validGatewayV2StoppedContainer(state, journal, observation.StageContainer,
+		observation.StageRuntime, observation.StageContainerFound, gatewayV2StageContainerRole, observation.Image.ID)
+	add(liveGatewayV2TraceAttestStoppedContainer, stoppedContainerValid)
+	if !stoppedContainerValid {
+		failures = append(failures, liveGatewayV2StoppedContainerFailureOutcomes(state, journal,
+			observation.StageContainer, observation.StageRuntime, gatewayV2StageContainerRole, observation.Image.ID)...)
+	}
+
+	stoppedIngressValid := validGatewayV2StoppedIngressNetwork(state, journal, observation.IngressNetwork,
+		observation.IngressNetworkID, observation.IngressFound, observation.StageRuntime)
+	add(liveGatewayV2TraceAttestStoppedIngressNetwork, stoppedIngressValid)
+	if !stoppedIngressValid {
+		attachment, configured := observation.StageRuntime.ConfiguredNetworks[state.Identity.IngressNetwork]
+		inspectedIDValid := validContainerID(observation.IngressNetworkID)
+		add(liveGatewayV2TraceAttestIngressConfigured, configured)
+		add(liveGatewayV2TraceAttestIngressInspectedID, inspectedIDValid)
+		add(liveGatewayV2TraceAttestIngressJournalID,
+			inspectedIDValid && normalizeID(observation.IngressNetworkID) == journal.Resources.IngressNetworkID)
+		add(liveGatewayV2TraceAttestIngressConfiguredReference,
+			configured && validGatewayV2StoppedNetworkReference(attachment.NetworkID, observation.IngressNetworkID))
+		add(liveGatewayV2TraceAttestIngressResourceIdentity,
+			validGatewayV2IngressNetwork(state, journal, observation.IngressNetwork, observation.IngressFound, "", ""))
+	}
+
+	expected, err := buildGatewayV2StageConfig(state)
+	add(liveGatewayV2TraceAttestStageConfigBuild, err == nil)
+	add(liveGatewayV2TraceAttestStageLiveConfigAbsent, len(observation.StageConfig) == 0)
+	if err == nil {
+		add(liveGatewayV2TraceAttestStageRestartConfig, sameCaddyConfig(expected, observation.StageRestartConfig))
+	}
+	clear(expected)
+	add(liveGatewayV2TraceAttestApplicationNetworksAbsent,
+		len(observation.ApplicationNetworks) == 0 && len(observation.ApplicationNetworkIDs) == 0)
+	return failures
 }
 
 func (d liveGatewayV2TracingUpgradeDriver) attestStoppedStageForCompensation(ctx context.Context, source routeState,
@@ -1192,7 +1324,10 @@ func liveGatewayV2StartCommandOutcome(result runtimeprocess.CommandResult, err e
 	}
 	message := strings.ToLower(string(result.Stdout) + "\n" + string(result.Stderr))
 	switch {
-	case strings.Contains(message, "port is already allocated"), strings.Contains(message, "address already in use"):
+	case strings.Contains(message, "port is already allocated"), strings.Contains(message, "port is already in use"),
+		strings.Contains(message, "address already in use"), strings.Contains(message, "failed to bind host port"),
+		strings.Contains(message, "port binding failed"),
+		strings.Contains(message, "bind") && strings.Contains(message, "port"):
 		return liveGatewayV2TraceStartHostPortConflict
 	case strings.Contains(message, "cannot assign requested address"), strings.Contains(message, "requested address is not valid in its context"):
 		return liveGatewayV2TraceStartSelectedAddressUnavailable
@@ -1426,6 +1561,58 @@ func TestGatewayV2StoppedContainerDiagnosticMatchesValidator(t *testing.T) {
 	}
 }
 
+func TestLiveGatewayV2StoppedStageDiagnosticMatchesClassifier(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Phase = gatewayPhaseStageIntent
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Resources.FinalContainerID = ""
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1WithStage)
+	stopGatewayV2TestContainer(&observation.StageContainer, &observation.StageRuntime, &observation.StageConfig,
+		state, observation.IngressNetworkID, nil)
+	observation.IngressNetwork.Containers = map[string]caddyNetworkContainerInspection{}
+	observation.Stage404Proven = false
+	observation.StageHostPublicationProven = false
+	if got := classifyGatewayV2RecoveryTopology(source, state, journal, observation); got != gatewayV2RecoveryStageIntentStoppedStage {
+		t.Fatalf("valid stopped-stage fixture topology = %q", got)
+	}
+	if failures := liveGatewayV2StoppedStageFailureOutcomes(source, state, journal, observation); len(failures) != 0 {
+		t.Fatalf("valid stopped-stage diagnostic failures=%v", failures)
+	}
+
+	stageUnstable := observation
+	stageUnstable.StageStable = false
+	if got := liveGatewayV2StoppedStageFailureOutcomes(source, state, journal, stageUnstable); !reflect.DeepEqual(got,
+		[]liveGatewayV2TraceOutcome{liveGatewayV2TraceAttestStageStability}) {
+		t.Fatalf("stage stability diagnostic failures=%v", got)
+	}
+
+	ownedNetworkMissing := observation
+	ownedNetworkMissing.OwnedNetworks = nil
+	if got := liveGatewayV2StoppedStageFailureOutcomes(source, state, journal, ownedNetworkMissing); !reflect.DeepEqual(got,
+		[]liveGatewayV2TraceOutcome{liveGatewayV2TraceAttestStageInfrastructure, liveGatewayV2TraceAttestOwnedNetworks}) {
+		t.Fatalf("owned-network diagnostic failures=%v", got)
+	}
+
+	ingressMembershipDrift := observation
+	ingressMembershipDrift.IngressNetwork = gatewayV2IdentityTestNetwork(state, journal,
+		ingressMembershipDrift.StageContainer.ID, state.Identity.StageContainer)
+	if got := liveGatewayV2StoppedStageFailureOutcomes(source, state, journal, ingressMembershipDrift); !reflect.DeepEqual(got,
+		[]liveGatewayV2TraceOutcome{
+			liveGatewayV2TraceAttestStageInfrastructure,
+			liveGatewayV2TraceAttestStoppedIngressNetwork,
+			liveGatewayV2TraceAttestIngressResourceIdentity,
+		}) {
+		t.Fatalf("ingress membership diagnostic failures=%v", got)
+	}
+
+	restartConfigDrift := observation
+	restartConfigDrift.StageRestartConfig = []byte(`{"admin":{"listen":"localhost:2019"}}`)
+	if got := liveGatewayV2StoppedStageFailureOutcomes(source, state, journal, restartConfigDrift); !reflect.DeepEqual(got,
+		[]liveGatewayV2TraceOutcome{liveGatewayV2TraceAttestStageRestartConfig}) {
+		t.Fatalf("restart-config diagnostic failures=%v", got)
+	}
+}
+
 func TestGatewayV2OperationTraceClosesAndBoundsValues(t *testing.T) {
 	trace := &liveGatewayV2OperationTrace{phase: liveGatewayV2TracePhasePreparation}
 	trace.recordAt(liveGatewayV2TraceStageObserveTopology, gatewayMigrationPhase("untrusted-phase"),
@@ -1455,6 +1642,7 @@ func TestLiveGatewayV2StartCommandOutcomeClosesDaemonErrors(t *testing.T) {
 		{name: "cancelled", err: context.Canceled, want: liveGatewayV2TraceStartCancelled},
 		{name: "termination failed", err: runtimeprocess.ErrTerminationFailed, want: liveGatewayV2TraceStartTerminationFailed},
 		{name: "host port conflict", result: runtimeprocess.CommandResult{Stderr: []byte("port is already allocated")}, err: commandError, want: liveGatewayV2TraceStartHostPortConflict},
+		{name: "wrapped host port conflict", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: failed to bind host port")}, err: commandError, want: liveGatewayV2TraceStartHostPortConflict},
 		{name: "selected address unavailable", result: runtimeprocess.CommandResult{Stderr: []byte("cannot assign requested address")}, err: commandError, want: liveGatewayV2TraceStartSelectedAddressUnavailable},
 		{name: "network unavailable", result: runtimeprocess.CommandResult{Stderr: []byte("no such network")}, err: commandError, want: liveGatewayV2TraceStartNetworkUnavailable},
 		{name: "container missing", result: runtimeprocess.CommandResult{Stderr: []byte("no such container")}, err: commandError, want: liveGatewayV2TraceStartContainerMissing},
