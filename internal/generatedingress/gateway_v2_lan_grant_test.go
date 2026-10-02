@@ -2,6 +2,7 @@ package generatedingress
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/hostd/hostd/internal/appaccess"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
 func TestGatewayV2LANGrantCommitsExactApprovedBindingAndReplays(t *testing.T) {
@@ -519,7 +521,7 @@ func TestGatewayV2LANGrantRestartRecoveryRollsBackProposedAndMixedTo404State(t *
 	for _, topology := range []string{"proposed", "mixed"} {
 		t.Run(topology, func(t *testing.T) {
 			manager, store, state, journal, request, _ := gatewayV2LANGrantFixture(t)
-			runner := &committedV2Runner{files: make(map[string][]byte)}
+			runner := newCommittedV2Runner()
 			manager.runner = runner
 			binding, _ := gatewayV2LANBindingForRequest(request)
 			previous := cloneGatewayV2AppRoute(state.Apps[request.AppID])
@@ -533,7 +535,7 @@ func TestGatewayV2LANGrantRestartRecoveryRollsBackProposedAndMixedTo404State(t *
 				t.Fatal(err)
 			}
 			manager.gatewayTopologyObserver = func(_ context.Context, _ routeState, candidate gatewayV2RouteState, _ gatewayMigrationJournal) gatewayObservedTopology {
-				_, rollbackInstalled := runner.files[gatewayV2ContainerName+":"+"/config/rollback.json"]
+				_, rollbackInstalled := runner.files[journal.Resources.FinalContainerID+":"+"/config/rollback.json"]
 				if rollbackInstalled && candidate.Apps[request.AppID].LAN == nil {
 					return gatewayTopologyExactFinalV2
 				}
@@ -552,7 +554,7 @@ func TestGatewayV2LANGrantRestartRecoveryRollsBackProposedAndMixedTo404State(t *
 			if err != nil || !reflect.DeepEqual(recovered, state) {
 				t.Fatalf("recovered state=%#v err=%v", recovered, err)
 			}
-			if _, ok := runner.files[gatewayV2ContainerName+":"+"/config/rollback.json"]; !ok {
+			if _, ok := runner.files[journal.Resources.FinalContainerID+":"+"/config/rollback.json"]; !ok {
 				t.Fatal("restart recovery did not reinstall and attest the committed 404 config")
 			}
 		})
@@ -1082,6 +1084,77 @@ func TestGatewayV2LANCommitRecoveryRequiresDBProofBeforeRepublishing(t *testing.
 	if err != nil || installed.Pending != nil || installed.Apps[request.AppID].LAN == nil ||
 		driver.live.Apps[request.AppID].LAN == nil {
 		t.Fatalf("installed=%#v live=%#v err=%v", installed, driver.live, err)
+	}
+}
+
+type gatewayV2EmergencyStopRunner struct {
+	inspection gatewayContainerInspection
+	stopTarget string
+}
+
+func (r *gatewayV2EmergencyStopRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	args := request.Args
+	if len(args) == 5 && args[0] == "container" && args[1] == "inspect" && args[2] == "--format" &&
+		args[4] == gatewayV2ContainerName {
+		body, err := json.Marshal(r.inspection)
+		return runtimeprocess.CommandResult{Stdout: body}, err
+	}
+	if len(args) == 5 && args[0] == "container" && args[1] == "stop" && args[2] == "--time" && args[3] == "10" {
+		if normalizeID(args[4]) != normalizeID(r.inspection.ID) {
+			return runtimeprocess.CommandResult{}, errors.New("emergency stop targeted a replacement container")
+		}
+		r.stopTarget = args[4]
+		r.inspection.Running = false
+		r.inspection.Restarting = false
+		r.inspection.EffectivePortBindings = map[string][]map[string]string{}
+		return runtimeprocess.CommandResult{}, nil
+	}
+	return runtimeprocess.CommandResult{}, errors.New("unexpected emergency stop Docker command")
+}
+
+func TestGatewayV2ProductionEmergencyStopUsesBoundIdentityWithForeignImageLabels(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*gatewayContainerInspection)
+		valid  bool
+	}{
+		{name: "foreign image metadata", valid: true},
+		{name: "additional Rig label", mutate: func(value *gatewayContainerInspection) {
+			value.Labels["io.rig.unexpected"] = "metadata"
+		}},
+		{name: "replacement container ID", mutate: func(value *gatewayContainerInspection) {
+			value.ID = "sha256:" + strings.Repeat("9", 64)
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager, _, state, journal, _, _ := gatewayV2LANGrantFixture(t)
+			labels := gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, gatewayV2FinalContainerRole, true)
+			labels["org.opencontainers.image.title"] = "Caddy"
+			runner := &gatewayV2EmergencyStopRunner{inspection: gatewayContainerInspection{
+				caddyInspection: caddyInspection{
+					ID: "sha256:" + journal.Resources.FinalContainerID, Name: "/" + gatewayV2ContainerName,
+					Labels: labels, Running: true,
+				},
+				gatewayContainerRuntime: gatewayContainerRuntime{},
+			}}
+			if test.mutate != nil {
+				test.mutate(&runner.inspection)
+			}
+			manager.runner = runner
+
+			err := (managerGatewayV2LANGrantDriver{manager: manager}).stopOwnedGateway(context.Background(), journal)
+			if test.valid {
+				if err != nil || normalizeID(runner.stopTarget) != journal.Resources.FinalContainerID || runner.inspection.Running {
+					t.Fatalf("bound emergency stop err=%v target=%q running=%t", err, runner.stopTarget, runner.inspection.Running)
+				}
+				return
+			}
+			if err == nil || runner.stopTarget != "" {
+				t.Fatalf("identity drift emergency stop err=%v target=%q", err, runner.stopTarget)
+			}
+		})
 	}
 }
 

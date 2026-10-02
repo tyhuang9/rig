@@ -103,7 +103,7 @@ func (m *Manager) switchCommittedV2Locked(ctx context.Context, store *gatewayUpg
 
 	proposedState := cloneGatewayV2RouteState(state)
 	proposedState.Apps[request.AppID] = cloneGatewayV2AppRoute(proposed)
-	if err := m.applyCommittedV2Routes(ctx, proposedState, "proposed.json"); err != nil {
+	if err := m.applyCommittedV2Routes(ctx, proposedState, journal.Resources.FinalContainerID, "proposed.json"); err != nil {
 		return m.rollbackCommittedV2AfterFailure(store, state, journal, err)
 	}
 	if err := m.attestCommittedV2Locked(ctx, proposedState, journal); err != nil {
@@ -154,7 +154,7 @@ func (m *Manager) preflightCommittedV2Candidate(ctx context.Context, state gatew
 		return &Error{Code: DiagnosticIngressDrift}
 	}
 	final, runtime, found, err := m.inspectNamedGatewayContainer(ctx, state.Identity.FinalContainer)
-	if err != nil || !validGatewayV2Container(state, journal, final, runtime, found, gatewayV2FinalContainerRole, image.ID) || !final.Running || final.Restarting {
+	if err != nil || !validCommittedV2FinalContainer(state, journal, final, runtime, found, image.ID) {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
 	for _, endpoint := range proposed.Route.Endpoints {
@@ -171,10 +171,19 @@ func (m *Manager) preflightCommittedV2Candidate(ctx context.Context, state gatew
 		return &Error{Code: DiagnosticIngressDrift}
 	}
 	confirmedFinal, confirmedRuntime, confirmedFound, err := m.inspectNamedGatewayContainer(ctx, state.Identity.FinalContainer)
-	if err != nil || !confirmedFound || !reflect.DeepEqual(final, confirmedFinal) || !reflect.DeepEqual(runtime, confirmedRuntime) {
+	if err != nil || !validCommittedV2FinalContainer(state, journal, confirmedFinal, confirmedRuntime, confirmedFound, image.ID) ||
+		!reflect.DeepEqual(final, confirmedFinal) || !reflect.DeepEqual(runtime, confirmedRuntime) {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
 	return nil
+}
+
+func validCommittedV2FinalContainer(state gatewayV2RouteState, journal gatewayMigrationJournal, value caddyInspection,
+	runtime gatewayContainerRuntime, found bool, imageID string,
+) bool {
+	return validSHA256(journal.Resources.FinalContainerID) && normalizeID(value.ID) == journal.Resources.FinalContainerID &&
+		validGatewayV2Container(state, journal, value, runtime, found, gatewayV2FinalContainerRole, imageID) &&
+		value.Running && !value.Restarting
 }
 
 func (m *Manager) recoverCommittedV2Locked(ctx context.Context, store *gatewayUpgradeStateStore, state gatewayV2RouteState, journal gatewayMigrationJournal) error {
@@ -242,7 +251,7 @@ func (m *Manager) rollbackCommittedV2PendingLocked(ctx context.Context, store *g
 	if topology == gatewayV2PendingProposedExact || topology == gatewayV2PendingReloadOnlyMixed {
 		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.options.CommandTimeout*3)
 		defer cancel()
-		if err := m.applyCommittedV2Routes(rollbackCtx, committed, "rollback.json"); err != nil {
+		if err := m.applyCommittedV2Routes(rollbackCtx, committed, journal.Resources.FinalContainerID, "rollback.json"); err != nil {
 			return gatewayV2RouteState{}, candidateMayBeLiveError()
 		}
 		if m.observeV2Topology(rollbackCtx, source, committed, journal) != gatewayTopologyExactFinalV2 {
@@ -285,7 +294,7 @@ func (m *Manager) observeCommittedV2PendingTopology(ctx context.Context, source 
 func (m *Manager) rollbackCommittedV2AfterFailure(store *gatewayUpgradeStateStore, committed gatewayV2RouteState, journal gatewayMigrationJournal, original error) error {
 	rollbackCtx, cancel := context.WithTimeout(context.Background(), m.options.CommandTimeout*3)
 	defer cancel()
-	if err := m.applyCommittedV2Routes(rollbackCtx, committed, "rollback.json"); err != nil {
+	if err := m.applyCommittedV2Routes(rollbackCtx, committed, journal.Resources.FinalContainerID, "rollback.json"); err != nil {
 		return candidateMayBeLiveError()
 	}
 	if err := m.attestCommittedV2Locked(rollbackCtx, committed, journal); err != nil {
@@ -309,8 +318,9 @@ func (m *Manager) observeCommittedV2Locked(ctx context.Context, state gatewayV2R
 	return Observation{URL: url, Slot: app.Route.Slot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...), ObservedAt: time.Now().UTC()}, nil
 }
 
-func (m *Manager) applyCommittedV2Routes(ctx context.Context, state gatewayV2RouteState, filename string) error {
-	if state.Pending != nil || state.LANRecovery != nil || !validConfigFilename(filename) {
+func (m *Manager) applyCommittedV2Routes(ctx context.Context, state gatewayV2RouteState, finalContainerID, filename string) error {
+	if !validGatewayV2RouteState(state) || state.Pending != nil || state.LANRecovery != nil ||
+		!validSHA256(finalContainerID) || !validConfigFilename(filename) {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
 	probeToken, err := gatewayV2HostChallenge(state)
@@ -324,28 +334,28 @@ func (m *Manager) applyCommittedV2Routes(ctx context.Context, state gatewayV2Rou
 	if err != nil {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
-	if err := m.copyGatewayV2Config(ctx, state.Identity.FinalContainer, config, filename); err != nil {
+	if err := m.copyGatewayV2Config(ctx, finalContainerID, config, filename); err != nil {
 		return err
 	}
 	containerPath := "/config/" + filename
-	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", state.Identity.FinalContainer, "caddy", "validate", "--config", containerPath); err != nil {
+	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", finalContainerID, "caddy", "validate", "--config", containerPath); err != nil {
 		return &Error{Code: DiagnosticRouteValidateFailed}
 	}
-	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", state.Identity.FinalContainer, "caddy", "reload", "--config", containerPath); err != nil {
+	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", finalContainerID, "caddy", "reload", "--config", containerPath); err != nil {
 		return &Error{Code: DiagnosticRouteReloadFailed}
 	}
-	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", "--user", "0:0", state.Identity.FinalContainer, "cp", containerPath, "/config/active.next.json"); err != nil {
+	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", "--user", "0:0", finalContainerID, "cp", containerPath, "/config/active.next.json"); err != nil {
 		return &Error{Code: DiagnosticRouteReloadFailed}
 	}
-	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", "--user", "0:0", state.Identity.FinalContainer, "mv", "/config/active.next.json", "/config/"+state.Identity.ActiveConfigFilename); err != nil {
+	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", "--user", "0:0", finalContainerID, "mv", "/config/active.next.json", "/config/"+state.Identity.ActiveConfigFilename); err != nil {
 		return &Error{Code: DiagnosticRouteReloadFailed}
 	}
 	return nil
 }
 
-func (m *Manager) copyGatewayV2Config(ctx context.Context, container string, contents []byte, filename string) error {
+func (m *Manager) copyGatewayV2Config(ctx context.Context, containerID string, contents []byte, filename string) error {
 	defer clear(contents)
-	if container != gatewayV2ContainerName {
+	if !validSHA256(containerID) {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
 	if len(contents) == 0 || len(contents) > gatewayV2MaxConfigBytes || !validConfigFilename(filename) {
@@ -379,7 +389,7 @@ func (m *Manager) copyGatewayV2Config(ctx context.Context, container string, con
 	if err != nil || !installed.Mode().IsRegular() || installed.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(path) || !os.SameFile(created, installed) || !m.validWorkingDirectory() {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
-	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "cp", path, container+":/config/"+filename); err != nil {
+	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "cp", path, containerID+":/config/"+filename); err != nil {
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
 	return nil
