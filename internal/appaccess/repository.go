@@ -16,14 +16,16 @@ import (
 const timestampLayout = "2006-01-02T15:04:05.000000000Z"
 
 type Repository struct {
-	db                      *sql.DB
-	now                     func() time.Time
-	afterGatewayLock        func()
-	afterGatewayClaimLock   func()
-	afterCurrentClaimLookup func()
-	afterReservationLock    func()
-	afterApprovalLock       func()
-	beforeReservationCommit func()
+	db                            *sql.DB
+	now                           func() time.Time
+	afterGatewayLock              func()
+	afterGatewayClaimLock         func()
+	afterCurrentClaimLookup       func()
+	afterUpgradeAuthClaimRead     func()
+	afterUpgradeStartupClaimsRead func()
+	afterReservationLock          func()
+	afterApprovalLock             func()
+	beforeReservationCommit       func()
 }
 
 func New(db *sql.DB) *Repository { return &Repository{db: db, now: time.Now} }

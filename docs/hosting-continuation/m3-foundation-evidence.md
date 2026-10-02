@@ -1,9 +1,9 @@
 # M3 LAN foundation: local evidence
 
-Status: partial M3 implementation, 2026-09-30. This branch remains local and
-unpublished. No LAN listener has been started on this local host. The
-administrator profile API records desired state only; no gateway upgrade
-action or LAN URL is exposed.
+Status: partial M3 implementation, 2026-09-30. These M3 branches remain local
+and unpublished. No LAN listener has been started on this local host. The
+administrator profile API records desired state; the new upgrade action is
+implemented and locally tested, but no LAN URL is exposed.
 
 ## Exact revisions and scope
 
@@ -21,6 +21,13 @@ action or LAN URL is exposed.
 - Journaled v2 transfer and bounded rollback: `aff192f`.
 - Automatic private gateway network selection and recheck: `0d04d14`.
 - Authenticated desired LAN gateway profile API: `f2768bf`.
+- Single-snapshot upgrade authorization recheck: `c75eb51`.
+- Protected upgrade-generation history scanner: `759734b`.
+- Explicit journaled-rollback retirement: `ff8508c`.
+- Protected pre-journal abort history: `99a965e`.
+- Fresh-proof pre-journal abort coordinator: `da93a12`.
+- Authenticated gateway upgrade action: `9fdf586`.
+- Recovery-only startup and pinned controller operation: `5a63430`.
 
 The allocator stores approved desired gateway and per-app access revisions,
 action digests, compare-and-swap heads, and unique durable port ownership. It
@@ -39,15 +46,15 @@ resource identity, explicit upgrade action digest, and approving actor ID.
 Protected create-only artifacts accept exact replay when an identical file
 already exists; a reported write durability failure stops the operation even
 if immediate readback sees the new bytes. Changed replay payloads fail. The
-phase table permits startup to roll back an
-incomplete staging attempt or mark it uncertain, never to resume publishing
-LAN ports without a new controlled action. A committed journal retains the
-initial target digest while allowing later valid app-route changes under the
-same protected network plan. The pure validators reject a network subnet that
-contains the selected LAN address and rejects duplicate allocation or access
-revision identities across apps. These functions are not called by the live
-gateway upgrade action or controller yet; committed-state validation is used
-by Manager dispatch.
+phase table defines recovery transitions for an incomplete staging attempt,
+including rollback or an uncertain state; it never authorizes publishing LAN
+ports without a new controlled action. Startup now selects a restricted
+controller for an unfinished approved operation. A committed journal
+retains the initial target digest while allowing later valid app-route changes
+under the same protected network plan. The pure validators reject a network
+subnet that contains the selected LAN address and rejects duplicate allocation
+or access revision identities across apps. Preparation and Manager dispatch use
+these validators; their real Docker behavior remains unverified on this host.
 
 The Manager holds a persistent handle-based gateway lock across
 route switching, startup provision/recovery, route observation callbacks, and
@@ -82,7 +89,8 @@ owned resource inventories, application-network attachments, and route/404
 probes. It rechecks resource inventories and container process generations
 after probing. The committed-v2 Manager calls it under the gateway lock to
 attest serving and recovery state. Stage/final require host-side publication
-and reachability. The controller has no LAN URL or upgrade action yet.
+and reachability. The controller has an authenticated upgrade action but no
+LAN URL.
 
 The v1 compatibility fence now checks for either protected v2 state or
 migration-journal marker while holding the gateway lock. A marker blocks
@@ -148,9 +156,10 @@ proof before writing `staged`. It never stops v1 or enters transfer. A crash
 after binding a stopped stage but before config copy is compensated only after
 exact bound-resource, stopped/no-host-binding, and v1-serving proof; that proof
 cannot start a listener. Create-before-bind ambiguity, drift, or incomplete
-cleanup records unresolved state rather than a false rollback. This method has
-no controller action or URL display caller yet. Its Docker behavior is tested
-with a deterministic driver, not a live daemon.
+cleanup records unresolved state rather than a false rollback. The
+authenticated controller reaches staging through the upgrade coordinator; it
+does not display a LAN URL. Docker behavior is tested with a deterministic
+driver, not a live daemon.
 
 `Manager.TransferGatewayV2` now advances an exact staged migration through
 `transfer_intent`, `v2_serving`, and `committed` under the same Manager and OS
@@ -166,7 +175,8 @@ proof, and selected-interface ownership before commit. Known failures restore
 and reattest v1; unknown or unbound Docker outcomes remain unresolved. Tests
 cover interrupted and reported-failed protected writes at transfer intent,
 final ID binding, v2 serving, and rollback intent without replacing immutable
-history. This operation still has no authenticated controller caller or LAN URL.
+history. The authenticated controller reaches transfer through the upgrade
+coordinator, but still exposes no LAN URL.
 
 Temporary Caddy configs remain readable by the non-root container user after
 copy. The host-side working directory must therefore be private before Manager
@@ -183,7 +193,7 @@ serving, unresolved, and committed claims pin the profile in SQLite; only a
 rolled-back claim releases the pin. Claim identity, transition events, and
 upgrade audit rows are retained. The initial prepared event, profile-head pin,
 and legal transitions have database triggers as well as repository checks.
-An unresolved claim can move only to committed or rolled back after the future
+An unresolved claim can move only to committed or rolled back after the
 controller obtains fresh topology evidence; an exact synchronous upgrade can
 move prepared to committed. The repository itself does not inspect Docker.
 
@@ -192,10 +202,11 @@ source-v1 attestation, host preflight, protected preparation, stage, transfer,
 and final attestation. It resumes only the same operation, profile, actor,
 digest, network, and host-port binding. Ambiguous writes or topology remain
 unresolved. A rolled-back outcome requires fresh exact-v1 proof, and a lock
-release failure downgrades either final outcome to unresolved. This method has
-no production controller caller or HTTP route. Its caller must derive the
-administrator from a session and verify the exact durable claim before any
-Docker side effect; a supplied actor and digest alone are not authorization.
+release failure downgrades either final outcome to unresolved. The authenticated
+controller action now calls this method. It derives the administrator from a
+session and verifies the exact durable claim inside the Manager lock before
+protected history or Docker work; a supplied actor and digest alone are not
+authorization.
 
 The gateway network planner now selects the first available RFC 1918 `/28`
 under the Manager and OS gateway lock before the first protected journal
@@ -218,6 +229,38 @@ committed request replays from immutable history even if interface discovery
 later fails; new writes still require a fresh interface check. It does
 not call the gateway upgrade Manager, bind a port, or claim that a listener
 serves traffic.
+
+The upgrade authorization repository checks the exact operation claim,
+administrator role, action and request digests, complete claim-event history,
+canonical profile revision, and current profile head in one read-only SQLite
+snapshot. The authenticated upgrade route now invokes this check from inside
+the gateway lock before protected history or Docker work and again before the
+first Docker mutation.
+
+The generated-ingress history scanner keeps the fixed v2 pair as generation
+zero, allocates create-only operation-scoped files for later generations, and
+rejects gaps, duplicates, partial or corrupt history, and unknown reserved
+artifacts. An exact retry can repair a state-only preparation crash after
+fresh v1 and no-v2-resource proof; ordinary v1 management stays fenced until
+a terminal rolled-back generation has a protected retirement receipt. The
+explicit rollback finalizer removes one exact idle v2 resource between full
+observations, then reads back that receipt only after proving the current v1
+gateway serves and no v2 resource remains. The coordinator reports
+`rolled_back` only after finalization and successful lock release. Protected
+artifact fingerprints detect changes that persist across scanner snapshots;
+same-user mutation confined to a separate protected read is outside the
+cooperating-writer model.
+
+The pre-journal abort unit records an operation-scoped, create-only receipt
+only when no migration journal exists. It supports an empty generation or an
+exact state-only preparation crash and rejects a journal, competing operation,
+or contradictory artifact. The coordinator freshly proves that the current
+v1 gateway serves with restart configuration and stable endpoints, and that
+the deterministic and label-owned v2 Docker resources are absent. Abort and
+receipt replay do not select or persist a network plan. A complete journal
+installed despite a reported write failure stays unresolved for a later exact
+retry. An abort result becomes terminal only after receipt readback, a final
+history scan, and successful gateway-lock release.
 
 ## Executed verification
 
@@ -284,6 +327,14 @@ serves traffic.
 | `pnpm --dir web test` and `pnpm --dir web build` after generated API contract | Passed: 400 tests in 16 files; production build passed with the existing large-chunk warning. |
 | `pnpm --dir docs build`, `gofmt -l`, and `git diff --check` | Passed. Initial sandboxed pnpm commands could not traverse Windows junctions; normal Windows runs passed. |
 | Independent security and manual integration reviews of profile API and network planner | Profile API security review found no exploitable issue in this desired-state-only slice. Network security review found empty Docker IPAM could hide an allocated subnet; the planner now rejects it except for exact built-in `host`/`none` networks. Manual review found and verified fixes for exact replay after interface discovery failure, full selected-interface-prefix exclusion, and malformed proposal status mapping. CodeRabbit aggregate review was unavailable because its CLI is not authenticated; manual review found no remaining actionable blocker. |
+| `go test -count=10 -run '^TestAuthorizeGatewayProfileUpgrade' ./internal/appaccess`, `go test -count=1 ./internal/appaccess`, `go vet ./internal/appaccess` | Passed for the single-snapshot authorization read, including two-handle consistency, stale head, demoted actor, and corrupt history. |
+| `go test -count=1 ./internal/generatedingress` and `go vet ./internal/generatedingress` after history/retirement integration | Passed with normal Windows permissions. A restricted-sandbox run failed broadly in unchanged manager fixtures; the identical normal-permission command passed in 41.315s. |
+| `go test -count=1 -p 1 ./...`, `go vet ./...`, `go run ./cmd/openapi-gen -check` after commits `c75eb51`, `759734b`, `ff8508c` | Passed with normal Windows permissions; all Go packages completed. No API contract changed. |
+| Independent rollback-history review | Found and fixed an in-place artifact mutation detection gap by adding bounded content fingerprints. No false terminal outcome or lock-order defect remained in read-only review. Live Docker behavior remains unverified. |
+| Focused pre-journal abort and history tests | Passed for empty/state-only receipts, network-selection failure, exact replay, stale v1 and Docker topology, wrong operation, receipt write ambiguity, complete-journal ambiguity, later generation, and lock-release failure. |
+| `go test -count=1 ./internal/generatedingress` for pre-journal abort | Passed with normal Windows permissions. |
+| `go test -count=1 -p 1 ./...`, `go vet ./...`, `go run ./cmd/openapi-gen -check`, `gofmt -l`, and `git diff --check` after pre-journal abort integration | Passed with normal Windows permissions. No API contract changed. |
+| Independent pre-journal abort review | Found no confirmed defect in the protected receipt or live-proof result boundary. Controller claim sequencing and live Docker execution remain required. |
 
 The first full web test run had one focus assertion failure in the unchanged
 `application-setup.test.tsx`; that exact case passed alone and all 400 tests
@@ -332,9 +383,11 @@ the file, but it is not an atomic compare-and-swap across processes. The new
 staging and transfer operations hold the handle-based gateway lock across
 their complete mutation and attestation loops; journal methods alone do not
 enforce that boundary. Every active LAN binding must also be compared with its
-approved SQLite row. A fresh upgrade after a `rolled_back` journal needs a
-history-preserving retry generation or explicit
-operator recovery; fixed create-only paths currently refuse another operation.
+approved SQLite row. After an explicit journaled rollback retirement or
+pre-journal abort, a fresh operation can use a new protected generation while
+retaining all earlier state, journals, and receipts. The authenticated
+controller must still prove the exact receipt or journal outcome before it
+releases a prepared SQLite claim.
 The first live v2 marker writer must hold the same lock as the v1 compatibility
 fence. The lock and state paths must remain bound to one protected directory
 identity through the operation; a same-user parent-directory substitution is
@@ -365,21 +418,114 @@ required before claiming LAN routing acceptance.
 The local cutover implementation now handles those journal phases and
 compensation paths, but hosted Docker must prove the real network, bind,
 config-read, route, and rollback behavior before this slice is accepted.
-Authenticated gateway-upgrade and per-app consent, LAN access activation and disable, UI
-diagnostics, and the physical second-device journey remain open. The host-side
+Per-app consent, LAN access activation and disable, UI diagnostics, and the
+physical second-device journey remain open. The host-side
 private-directory boundary has unit and WSL evidence, but its behavior with a
 live Docker config copy and on a locked-down Windows service account remains
 unverified. Windows ancestors that allow traversal without `GENERIC_READ` fail
 closed until a narrower safe guard is implemented and tested.
-The claim repository allows a new profile after an attested rollback, but the
-protected v2 files still retain the original operation. A new upgrade attempt
-therefore needs an explicit history-preserving retry generation; it is not yet
-implemented. Recovery review recommends an explicit locked rollback
-finalization that freshly proves exact v1 service, retires only identified idle
-v2 resources, writes a create-only receipt, and then permits v1 management.
-Later attempts should use operation-scoped protected files while retaining
-each prior journal and receipt. Before a gateway upgrade controller action is
-enabled, it must persist and
-recheck a session-derived administrator claim, reconcile claim state with the
-protected journal and fresh topology, and release a rolled-back pin only on
-newly attested exact-v1 evidence.
+The authenticated gateway upgrade action is locally tested. The new startup
+classifier and restricted controller path are also locally tested, but their
+actual restart behavior with live Docker remains unverified. A recovered
+operation stays restricted until a later process restart proves normal mode.
+Live Docker and second-device checks are also required before M3 acceptance.
+Docker volume deletion remains
+name-based after immediate exact label, mountpoint, and creation-time
+reinspection because Docker exposes no immutable volume ID or conditional
+delete. A non-cooperating same-privilege actor replacing a volume in that
+window could cause deletion of the replacement; this path requires a live
+Docker gate and an explicit single-owner maintenance assumption.
+
+## Authenticated gateway upgrade action: local evidence
+
+The generated-runtime-only `GET` and `POST`
+`/api/v1/system/lan-gateway-upgrade` require an administrator session; POST
+also requires CSRF. Responses are `no-store`. GET provides a server-computed
+approval digest for the current profile revision and separates the durable
+claim from a fresh, locked Manager observation. It exposes no LAN URL. POST
+accepts only a bounded operation ID, exact profile revision ID and number, and
+approval digest. It derives the actor from the session and creates the SQLite
+claim before invoking the Manager. The Manager callback reauthenticates that
+same session and CSRF token, then rechecks the exact claim and profile in one
+SQLite snapshot under the gateway lock. The callback runs before history or
+Docker work and again at the first Docker mutation boundary. A late denial
+leaves protected preparation unresolved without making a Docker change.
+
+After the Manager releases its lock, the controller records committed or
+receipt-backed rolled-back only when proven; otherwise it pins unresolved.
+An unresolved invocation
+returns 503 even if an earlier durable claim remains committed. Exact
+rolled-back replay re-enters the Manager to reattest protected history and
+current topology. The read path rechecks the claim after observation to avoid
+mixing different claim epochs. `unknown` is used when live availability is not
+proved. The API has no app-level LAN consent or public route activation yet.
+Normal `GET` excludes rolled-back claims. Recovery-only `GET` reads the exact
+operation selected at startup, so its historical rolled-back outcome remains
+visible while the restricted process is running. The M3 operator UI still
+needs a complete recovery experience before acceptance.
+
+| Check after the action diff | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions | Passed across all Go packages. The controller package and generated-ingress package passed within this run. |
+| `go vet ./...` | Passed. |
+| `go run ./cmd/openapi-gen -check` | Passed. |
+| `pnpm --dir web build` | Passed; Vite emitted its existing large-chunk warning. |
+| `pnpm --dir web test` | Passed, 401 tests in 16 files. |
+| `gofmt -l` for the new Go files and `git diff --check` | Passed; Git reported only LF/CRLF conversion notices. |
+| Focused action and observation tests | Passed for authorization denial, session revocation, CSRF rotation, exact replay, stale approval, malformed requests, claim/observation drift, lock release, and Docker mutation gating. |
+| Independent security review | Two findings were fixed and rechecked: rolled-back replay initially skipped live attestation, and an in-flight revoked session initially remained authorized before Docker mutation. No remaining concrete vulnerability was identified in the local diff. |
+| CodeRabbit aggregate review | Unavailable because the CLI is absent from WSL; no manual result is attributed to that tool. |
+
+The restricted Windows sandbox failed in unchanged workspace-policy fixtures
+and could not access the usual Go cache. The full Go suite above passed with
+normal Windows permissions. The Docker Desktop Linux daemon is unavailable on
+this host, so no live container migration, LAN route, rollback, or physical
+second-device behavior is verified by this action unit.
+
+## Recovery-only startup: local evidence
+
+The controller reserves its loopback listener before runtime setup, then
+acquires one process-lifetime, protected owner lock for its DataRoot before
+opening SQLite. For generated runtime it reads the current
+gateway profile and every retained upgrade claim in one validated SQLite
+transaction, then classifies the protected ingress history under the gateway
+locks using read-only topology checks. Invalid or mismatched history fails
+startup. An unfinished approved operation starts a controller limited to
+bootstrap/session management and `GET`/`POST`
+`/api/v1/system/lan-gateway-upgrade`. It does not create the runtime executor,
+recover deployments, start workers, auto-deploy, or start the relay. The POST
+path rejects any operation ID other than the one selected at startup before
+creating a claim. The restricted mode remains latched after rollback until a
+new process start repeats the cross-store and live topology proof. Normal mode
+performs ingress recovery and a second snapshot/history inspection before
+starting background work.
+
+| Check for the recovery-only startup diff | Result |
+| --- | --- |
+| `go test -count=1 -p 1 ./...` with normal Windows permissions | Passed across all Go packages, including appaccess, generatedingress, controller, hostd, and controllerowner. |
+| `go test ./internal/generatedingress -run '^TestGatewayV2Startup' -count=1` | Passed for fresh v1, committed v2, unfinished claims, retained retirement receipts, mismatches, and failed proofs. |
+| `go test ./internal/appaccess -count=1` and repeated snapshot tests | Passed for full claim history validation and one-transaction consistency. |
+| `go test -count=1 ./internal/controller` | Passed, including exact operation pin, blocked APIs, historical read after rollback, and latched mode. |
+| `go test -count=1 ./internal/controllerowner` | Passed for contention, process crash release, and unsafe paths on Windows. The Unix implementation cross-compiled. |
+| `go test -count=1 ./cmd/hostd` after early listener reservation | Passed, including an occupied-listener check that proves no controller working directory was created first. |
+| Live Docker restart, Linux owner-lock execution, and physical second-device journey | Not run; Docker Desktop Linux daemon and a second device are unavailable locally. |
+
+An independent final-integration rerun of the full Go suite after the listener
+change stopped when an unchanged deployments SQLite fixture reported
+`database or disk is full (13)` with less than 400 MB free. The earlier full
+suite passed; the post-listener hostd suite and `go vet ./...` also passed.
+This disk-capacity failure is not counted as a passing rerun or as a code
+regression. The temporary Go build cache was cleared and disk space recovered.
+
+The startup tests use controlled fixtures and command runners. They do not
+prove a real Docker daemon's topology response or an operator's browser
+experience after a process crash. When generated runtime is disabled, startup
+rejects any retained SQLite upgrade claim or protected v2 history artifact;
+this configuration cannot bypass the recovery gate by starting a different
+runtime mode on the same DataRoot.
+
+An older running `hostd` binary does not acquire the new owner lock. Before
+upgrading, stop and verify the old controller has exited; listener reservation
+detects the common same-address overlap but cannot detect an old process on
+another port. Cross-version overlap remains a rollout risk until this
+prerequisite is exercised in an actual upgrade.

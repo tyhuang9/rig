@@ -233,9 +233,17 @@ const (
 )
 
 type gatewayUpgradeStateStore struct {
-	directory   *stateStore
-	v2Path      string
-	journalPath string
+	directory      *stateStore
+	generation     uint64
+	operationID    string
+	v2Path         string
+	v2Purpose      string
+	journalPath    string
+	journalPurpose string
+	receiptPath    string
+	receiptPurpose string
+	abortPath      string
+	abortPurpose   string
 }
 
 func newGatewayUpgradeStateStore(dataRoot string) (*gatewayUpgradeStateStore, error) {
@@ -244,9 +252,15 @@ func newGatewayUpgradeStateStore(dataRoot string) (*gatewayUpgradeStateStore, er
 		return nil, err
 	}
 	return &gatewayUpgradeStateStore{
-		directory:   directory,
-		v2Path:      filepath.Join(directory.root, v2RouteStateFilename),
-		journalPath: filepath.Join(directory.root, gatewayMigrationFilename),
+		directory:      directory,
+		v2Path:         filepath.Join(directory.root, v2RouteStateFilename),
+		v2Purpose:      v2RouteStatePurpose,
+		journalPath:    filepath.Join(directory.root, gatewayMigrationFilename),
+		journalPurpose: gatewayMigrationPurpose,
+		receiptPath:    filepath.Join(directory.root, gatewayRollbackRetirementFilename),
+		receiptPurpose: gatewayRollbackRetirementPurpose,
+		abortPath:      filepath.Join(directory.root, gatewayPreJournalAbortFilename),
+		abortPurpose:   gatewayPreJournalAbortPurpose,
 	}, nil
 }
 
@@ -672,25 +686,36 @@ func (s *gatewayUpgradeStateStore) createV2State(state gatewayV2RouteState) erro
 	if !validGatewayV2RouteState(state) {
 		return errors.New("invalid generated ingress v2 state")
 	}
-	for _, app := range state.Apps {
-		if app.LAN != nil {
-			return errors.New("initial generated ingress v2 state must not contain LAN bindings")
-		}
-	}
 	source, err := s.directory.load()
 	if err != nil {
 		return err
 	}
-	digest, err := canonicalDigest(source)
-	if err != nil || digest != state.SourceV1StateDigest {
+	if !gatewayV2InitialStateMatchesSource(state, source) {
 		return errors.New("generated ingress v1 source state changed")
 	}
-	return s.writeExact(s.v2Path, v2RouteStatePurpose, state, true, maxV2RouteStateBytes)
+	return s.writeExact(s.v2Path, s.v2Purpose, state, true, maxV2RouteStateBytes)
+}
+
+func gatewayV2InitialStateMatchesSource(state gatewayV2RouteState, source routeState) bool {
+	if !validGatewayV2RouteState(state) || !validRouteState(source) || source.Pending != nil || state.Pending != nil || len(state.Apps) != len(source.Active) {
+		return false
+	}
+	digest, err := canonicalDigest(source)
+	if err != nil || digest != state.SourceV1StateDigest {
+		return false
+	}
+	for appID, route := range source.Active {
+		app, exists := state.Apps[appID]
+		if !exists || app.LAN != nil || !reflect.DeepEqual(app.Route, route) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *gatewayUpgradeStateStore) loadV2State() (gatewayV2RouteState, error) {
 	var state gatewayV2RouteState
-	if err := s.readStrict(s.v2Path, v2RouteStatePurpose, maxV2RouteStateBytes, &state); err != nil || !validGatewayV2RouteState(state) {
+	if err := s.readStrict(s.v2Path, s.v2Purpose, maxV2RouteStateBytes, &state); err != nil || !validGatewayV2RouteState(state) {
 		return gatewayV2RouteState{}, errors.New("generated ingress v2 state is invalid")
 	}
 	return cloneGatewayV2RouteState(state), nil
@@ -721,19 +746,19 @@ func (s *gatewayUpgradeStateStore) createMigrationJournal(journal gatewayMigrati
 	if err != nil || digest != journal.Source.StateDigest {
 		return errors.New("generated ingress migration source is stale")
 	}
-	return s.writeExact(s.journalPath, gatewayMigrationPurpose, journal, true, maxGatewayMigrationBytes)
+	return s.writeExact(s.journalPath, s.journalPurpose, journal, true, maxGatewayMigrationBytes)
 }
 
 func (s *gatewayUpgradeStateStore) loadMigrationJournal() (gatewayMigrationJournal, error) {
 	var journal gatewayMigrationJournal
-	if err := s.readStrict(s.journalPath, gatewayMigrationPurpose, maxGatewayMigrationBytes, &journal); err != nil || !validGatewayMigrationJournal(journal) {
+	if err := s.readStrict(s.journalPath, s.journalPurpose, maxGatewayMigrationBytes, &journal); err != nil || !validGatewayMigrationJournal(journal) {
 		return gatewayMigrationJournal{}, errors.New("generated ingress migration journal is invalid")
 	}
 	return journal, nil
 }
 
 func (s *gatewayUpgradeStateStore) loadBoundUpgrade(operationID string) (gatewayV2RouteState, gatewayMigrationJournal, error) {
-	if !validCanonicalUUID(operationID) {
+	if !validCanonicalUUID(operationID) || (s.operationID != "" && s.operationID != operationID) {
 		return gatewayV2RouteState{}, gatewayMigrationJournal{}, errors.New("invalid generated ingress operation")
 	}
 	state, err := s.loadV2State()
@@ -885,7 +910,7 @@ func (s *gatewayUpgradeStateStore) installMigrationJournal(journal gatewayMigrat
 	if !validGatewayMigrationJournal(journal) {
 		return gatewayMigrationJournal{}, errors.New("invalid generated ingress migration journal update")
 	}
-	if err := s.writeExact(s.journalPath, gatewayMigrationPurpose, journal, false, maxGatewayMigrationBytes); err != nil {
+	if err := s.writeExact(s.journalPath, s.journalPurpose, journal, false, maxGatewayMigrationBytes); err != nil {
 		return gatewayMigrationJournal{}, err
 	}
 	installed, err := s.loadMigrationJournal()
@@ -906,7 +931,7 @@ func (s *gatewayUpgradeStateStore) saveCommittedV2State(state gatewayV2RouteStat
 	if !validCommittedV2StateTransition(current, state) {
 		return errors.New("invalid committed generated ingress v2 state transition")
 	}
-	if err := s.writeExact(s.v2Path, v2RouteStatePurpose, state, false, maxV2RouteStateBytes); err != nil {
+	if err := s.writeExact(s.v2Path, s.v2Purpose, state, false, maxV2RouteStateBytes); err != nil {
 		return err
 	}
 	installed, installedJournal, err := s.loadBoundUpgrade(journal.OperationID)

@@ -61,6 +61,10 @@ type Server struct {
 	RelayManagement       RelayManagementService
 	AutoDeploy            AutoDeployService
 	GatewayProfiles       GatewayProfileService
+	GatewayUpgrades       GatewayUpgradeService
+	GatewayUpgradeRuntime GatewayUpgradeRuntime
+	RecoveryOnly          bool
+	RecoveryOperationID   string
 	GatewayCandidates     func() ([]hostnetwork.Candidate, error)
 	AutoDeployAvailable   bool
 	RelayReconcile        func()
@@ -110,7 +114,9 @@ type principal struct {
 	csrfHash string
 }
 
-func (s *Server) Handler() http.Handler { return s.requestID(s.logRequests(s.routes())) }
+func (s *Server) Handler() http.Handler {
+	return s.requestID(s.logRequests(s.recoveryGate(s.routes())))
+}
 
 type apiRoute struct {
 	method      string
@@ -131,6 +137,8 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("doctor", s.require(s.doctor)),
 		contractRoute(operationGetLANGatewayProfile, noStore(s.requireOperation(operationGetLANGatewayProfile, s.getLANGatewayProfile))),
 		contractRoute(operationConfigureLANGatewayProfile, noStore(s.requireOperation(operationConfigureLANGatewayProfile, s.configureLANGatewayProfile))),
+		contractRoute(operationGetLANGatewayUpgrade, noStore(s.requireOperation(operationGetLANGatewayUpgrade, s.getLANGatewayUpgrade))),
+		contractRoute(operationUpgradeLANGateway, noStore(s.requireOperation(operationUpgradeLANGateway, s.upgradeLANGateway))),
 		contractRoute("listApplications", s.require(s.listApps)),
 		contractRoute("createApplication", s.require(s.createApp)),
 		contractRoute("inspectImport", noStore(s.require(s.inspectApp))),
@@ -207,6 +215,31 @@ func (s *Server) routes() http.Handler {
 	}
 	mux.HandleFunc("/", s.spa)
 	return mux
+}
+
+// recoveryGate keeps a controller started for one unfinished gateway upgrade
+// limited to authentication and that exact upgrade. It stays active even after
+// a successful rollback; the next normal startup rechecks both stores.
+func (s *Server) recoveryGate(next http.Handler) http.Handler {
+	if !s.RecoveryOnly {
+		return next
+	}
+	allowed := map[string]bool{}
+	for _, route := range s.apiRoutes() {
+		switch route.operationID {
+		case "bootstrapStatus", "bootstrap", "login", "logout", "me", "rotateCSRF",
+			operationGetLANGatewayUpgrade, operationUpgradeLANGateway:
+			allowed[route.method+" "+route.path] = true
+		}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") && !allowed[r.Method+" "+r.URL.Path] {
+			w.Header().Set("Cache-Control", "no-store")
+			problem(w, r, http.StatusServiceUnavailable, "gateway_reconciliation_required", "Gateway upgrade reconciliation is required before other operations are available", nil)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 func (s *Server) requestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

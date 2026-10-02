@@ -75,11 +75,15 @@ function Icon({ name }: { name: IconName }) {
   return <svg className="nav-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
+function accountRoleLabel(role: string) {
+  return role.trim().replace(/[_-]+/g, " ").replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
 function StatusText({ value }: { value: string }) {
   return <span className={`status ${value.toLowerCase().replaceAll(" ", "-")}`}><i aria-hidden="true"/><span>{value}</span></span>;
 }
 
-function Layout({ user, onLogout, children }: { user: User; onLogout: () => void; children: React.ReactNode }) {
+export function Layout({ user, onLogout, children }: { user: User; onLogout: () => void; children: React.ReactNode }) {
   const location = useLocation();
   const confirmDiscard = useConfirmDiscard();
   const routeName = location.pathname.startsWith("/connections") ? "Connections" : location.pathname.startsWith("/machines") ? "Machines" : location.pathname.startsWith("/activity") ? "Activity" : location.pathname.startsWith("/apps/new") ? "Add application" : location.pathname.endsWith("/setup") ? "Deployment setup" : "Applications";
@@ -96,7 +100,7 @@ function Layout({ user, onLogout, children }: { user: User; onLogout: () => void
       </nav>
       <div className="rail-fill"/>
       <button className="rail-link" aria-label="Sign out" onClick={() => { if (confirmDiscard()) onLogout(); }}><Icon name="logout"/><span>Sign out</span></button>
-      <div className="account"><b aria-hidden="true">{user.username.slice(0, 1).toUpperCase()}</b><span>{user.username}<small>Administrator</small></span></div>
+      <div className="account"><b aria-hidden="true">{user.username.slice(0, 1).toUpperCase()}</b><span>{user.username}<small>{accountRoleLabel(user.role)}</small></span></div>
     </aside>
     <span className="sr-only" role="status" aria-live="polite">{routeName} page</span>
     <main id="main" className="content">{children}</main>
