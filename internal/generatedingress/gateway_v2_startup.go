@@ -75,6 +75,7 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 	recoveryOperationID := ""
 	var committed *gatewayUpgradeGenerationSelection
 	var pendingCommitted *gatewayUpgradeGenerationSelection
+	var lanRecoveryCommitted *gatewayUpgradeGenerationSelection
 	for index := range history.generations {
 		selection := history.generations[index]
 		claim, ok := claimSet.byOperation[selection.operationID]
@@ -96,6 +97,10 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 			}
 		case selection.Existing && !selection.Aborted && selection.Journal.Phase == gatewayPhaseCommitted:
 			allHistoryTerminal = false
+			if selection.State.LANRecovery != nil {
+				copy := selection
+				lanRecoveryCommitted = &copy
+			}
 			switch claim.State {
 			case appaccess.GatewayProfileUpgradeCommitted:
 				copy := selection
@@ -141,14 +146,24 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 	if pendingCommitted != nil && !m.proveGatewayV2StartupPending(proofCtx, source, *pendingCommitted) {
 		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
 	}
+	if lanRecoveryCommitted != nil && !m.proveGatewayV2StartupLANRecovery(proofCtx, *lanRecoveryCommitted) {
+		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+	}
 	switch {
 	case committed != nil && recoveryOperationID == "":
-		if !m.proveGatewayV2StartupCommitted(proofCtx, source, *committed) {
-			return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
-		}
-		inspection = GatewayV2StartupInspection{
-			Disposition: GatewayV2StartupNormalV2,
-			OperationID: committed.operationID,
+		if committed.State.LANRecovery != nil {
+			inspection = GatewayV2StartupInspection{
+				Disposition: GatewayV2StartupRecoveryOnly,
+				OperationID: committed.operationID,
+			}
+		} else {
+			if !m.proveGatewayV2StartupCommitted(proofCtx, source, *committed) {
+				return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+			}
+			inspection = GatewayV2StartupInspection{
+				Disposition: GatewayV2StartupNormalV2,
+				OperationID: committed.operationID,
+			}
 		}
 	case allHistoryTerminal:
 		for _, selection := range history.generations {
@@ -365,6 +380,36 @@ func (m *Manager) proveGatewayV2StartupCommitted(ctx context.Context, source rou
 	return driver.observeTopology(ctx, source, selection.State, selection.Journal) == gatewayTopologyExactFinalV2 &&
 		driver.proveFinalHostRoutes(ctx, selection.State, selection.Journal) &&
 		driver.selectedInterfacePreflight(selection.State.Profile) == nil
+}
+
+// A durable LAN recovery batch is itself a startup fence. Inspection proves
+// only that the journal-bound gateway is at one of the batch engine's exact,
+// restart-safe topologies; it never reloads Caddy or advances the batch. The
+// caller must remain on the recovery-only surface until the batch is resolved.
+func (m *Manager) proveGatewayV2StartupLANRecovery(ctx context.Context,
+	selection gatewayUpgradeGenerationSelection,
+) bool {
+	if m == nil || ctx == nil || selection.Store == nil || !selection.Existing || selection.Aborted ||
+		selection.Journal.Phase != gatewayPhaseCommitted || selection.State.LANRecovery == nil ||
+		!validGatewayV2RouteState(selection.State) {
+		return false
+	}
+	driver, ok := m.gatewayV2LANDisableDriver().(gatewayV2LANRecoveryBatchDriver)
+	if !ok || driver.selectedInterfacePreflight(selection.State.Profile) != nil {
+		return false
+	}
+	effective, _, err := gatewayV2LANRecoveryEffectiveProjection(selection.State)
+	if err != nil {
+		return false
+	}
+	switch driver.observeLANRecoveryBatch(ctx, selection.State, effective, selection.Journal) {
+	case gatewayV2LANRecoveryBatchBeforeExact,
+		gatewayV2LANRecoveryBatchEffectiveExact,
+		gatewayV2LANRecoveryBatchReloadMixed:
+	default:
+		return false
+	}
+	return driver.selectedInterfacePreflight(selection.State.Profile) == nil && ctx.Err() == nil
 }
 
 func sameGatewayV2StartupHistory(left, right gatewayUpgradeHistory) bool {
