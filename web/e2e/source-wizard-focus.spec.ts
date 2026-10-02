@@ -187,7 +187,9 @@ test("reuses the account connector across navigation and reload without another 
     if (url.pathname === "/api/v1/auth/bootstrap/status") return route.fulfill({ json: { bootstrapRequired: false } });
     if (url.pathname === "/api/v1/auth/me") return route.fulfill({ json: { user: { id: "user-1", username: "browser-admin", role: "administrator" } } });
     if (url.pathname === "/api/v1/auth/csrf") return route.fulfill({ json: { csrfToken: "browser-csrf" } });
-    if (url.pathname === "/api/v1/system/status") return route.fulfill({ json: { capabilities: { githubConnections: true } } });
+    if (url.pathname === "/api/v1/system/status") return route.fulfill({
+      json: { daemon: "browser-test", capabilities: { githubConnections: true }, diagnostics: {} },
+    });
     if (url.pathname === "/api/v1/apps") return route.fulfill({ json: { items: [] } });
     if (url.pathname === "/api/v1/source-connections/default") return route.fulfill({ json: { configured: true, connection } });
     if (url.pathname === "/api/v1/source-connections/default/github/repositories") return route.fulfill({ json: { page: 1, perPage: 30, totalCount: 1, truncated: false, items: [{ connectionId, installationId: 7, id: 10, accountLogin: "octo-org", owner: "octo-org", name: "web", defaultBranch: "main", private: false, archived: false, disabled: false }] } });
