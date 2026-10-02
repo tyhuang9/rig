@@ -142,12 +142,15 @@ func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error)
 // new active route, and installs it as Caddy's restart configuration. It never
 // stops application containers or waits for connection draining; the
 // deployment coordinator owns those post-commit operations.
-func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwitchRequest) error {
+func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwitchRequest) (resultErr error) {
 	if m == nil || ctx == nil || !validSwitchRequest(request) {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	release, err := m.lockGateway(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseGatewaySwitchLock(release, &resultErr)
 
 	state, err := m.store.load()
 	if err != nil {
@@ -239,12 +242,15 @@ func (m *Manager) Recover(ctx context.Context) error {
 // Provision creates or verifies the pinned Caddy boundary and reapplies its
 // committed routes. Startup calls it before generated deployment workers so
 // capacity checks can query the Docker VM through this exact container.
-func (m *Manager) Provision(ctx context.Context) error {
+func (m *Manager) Provision(ctx context.Context) (resultErr error) {
 	if m == nil || ctx == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	release, err := m.lockGateway(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseGatewayLock(release, &resultErr)
 	state, err := m.store.load()
 	if err != nil {
 		return &Error{Code: DiagnosticRouteStateFailed}
@@ -1325,20 +1331,21 @@ func (m *Manager) Observe(ctx context.Context, appID string) (Observation, error
 	return observation, nil
 }
 
-// WithObservation holds the route switch mutex through the caller's read-only
-// cross-store check. A Switch cannot change Caddy between live attestation and
-// validation of the durable active deployment head. The callback must not call
-// Manager methods or perform writes.
-func (m *Manager) WithObservation(ctx context.Context, appID string, fn func(context.Context, Observation) error) error {
+// WithObservation holds the local and cross-process gateway locks through the
+// caller's read-only cross-store check. A Switch cannot change Caddy between
+// live attestation and validation of the durable active deployment head. The
+// callback must not call Manager methods or perform writes.
+func (m *Manager) WithObservation(ctx context.Context, appID string, fn func(context.Context, Observation) error) (resultErr error) {
 	if m == nil || ctx == nil || !validAppID(appID) || fn == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
 	bounded, cancel := context.WithTimeout(ctx, observationTimeout)
 	defer cancel()
-	if err := m.mu.LockContext(bounded); err != nil {
-		return &Error{Code: DiagnosticCancelled}
+	release, err := m.lockGateway(bounded)
+	if err != nil {
+		return err
 	}
-	defer m.mu.Unlock()
+	defer releaseGatewayLock(release, &resultErr)
 	if bounded.Err() != nil {
 		return &Error{Code: DiagnosticCancelled}
 	}

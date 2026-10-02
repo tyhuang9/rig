@@ -35,16 +35,17 @@ type caddyAutomaticHTTPS struct {
 	Disable bool `json:"disable"`
 }
 type caddyRoute struct {
-	Match  []caddyMatch  `json:"match"`
+	Match  []caddyMatch  `json:"match,omitempty"`
 	Handle []caddyHandle `json:"handle"`
 }
 type caddyMatch struct {
-	Host []string `json:"host"`
+	Host []string `json:"host,omitempty"`
 	Path []string `json:"path,omitempty"`
 }
 type caddyHandle struct {
-	Handler   string          `json:"handler"`
-	Upstreams []caddyUpstream `json:"upstreams"`
+	Handler    string          `json:"handler"`
+	Upstreams  []caddyUpstream `json:"upstreams,omitempty"`
+	StatusCode int             `json:"status_code,omitempty"`
 }
 type caddyUpstream struct {
 	Dial string `json:"dial"`

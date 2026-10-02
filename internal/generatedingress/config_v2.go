@@ -1,0 +1,144 @@
+package generatedingress
+
+import (
+	"encoding/json"
+	"errors"
+	"net"
+	"net/netip"
+	"sort"
+	"strconv"
+)
+
+const (
+	minimumLANPort = uint16(8100)
+	maximumLANPort = uint16(8119)
+)
+
+// caddyV2Profile is the bounded set of container ports that the gateway
+// manager may publish after it separately proves the approved host binding.
+// This builder only creates Caddy JSON; it does not publish host ports.
+type caddyV2Profile struct {
+	SelectedIPv4 string
+	PortStart    uint16
+	PortEnd      uint16
+}
+
+// buildCaddyConfigV2 preserves the v1 .rig.localhost server and adds one
+// dedicated server for every LAN pool port. A port can select at most one app,
+// and that app is served only for the approved IPv4 Host. All other requests
+// and all unassigned ports terminate with a generic 404.
+func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string, profile caddyV2Profile, assignments map[uint16]string) ([]byte, error) {
+	if !validCaddyV2Profile(profile) {
+		return nil, errors.New("invalid generated ingress LAN profile")
+	}
+
+	// Building the local server first deliberately reuses every v1 validation
+	// and routing rule. The resulting server is copied without modification.
+	localBody, err := buildCaddyConfig(routes, localListenAddress)
+	if err != nil {
+		return nil, err
+	}
+	var result caddyConfig
+	if err := json.Unmarshal(localBody, &result); err != nil {
+		return nil, errors.New("invalid generated ingress local configuration")
+	}
+
+	listenHost, _, err := net.SplitHostPort(localListenAddress)
+	listenIP, parseErr := netip.ParseAddr(listenHost)
+	if err != nil || parseErr != nil || !listenIP.Is4() || !listenIP.IsGlobalUnicast() ||
+		listenIP.IsLinkLocalUnicast() || listenIP.String() != listenHost {
+		return nil, errors.New("invalid generated ingress LAN listener")
+	}
+	if assignments == nil {
+		assignments = map[uint16]string{}
+	}
+	if err := validateCaddyV2Assignments(routes, profile, assignments); err != nil {
+		return nil, err
+	}
+
+	for port := profile.PortStart; ; port++ {
+		server := caddyServer{
+			Listen:         []string{net.JoinHostPort(listenHost, strconv.FormatUint(uint64(port), 10))},
+			AutomaticHTTPS: caddyAutomaticHTTPS{Disable: true},
+		}
+		appID, assigned := assignments[port]
+		if assigned {
+			server.Routes = hostRestrictedRoutes(routes[appID], profile.SelectedIPv4)
+		} else {
+			server.Routes = []caddyRoute{notFoundRoute()}
+		}
+		result.Apps.HTTP.Servers[lanServerName(port)] = server
+		if port == profile.PortEnd {
+			break
+		}
+	}
+
+	return json.Marshal(result)
+}
+
+func validCaddyV2Profile(profile caddyV2Profile) bool {
+	address, err := netip.ParseAddr(profile.SelectedIPv4)
+	return err == nil && address.Is4() && address.IsPrivate() && address.String() == profile.SelectedIPv4 &&
+		profile.PortStart >= minimumLANPort && profile.PortStart <= profile.PortEnd && profile.PortEnd <= maximumLANPort
+}
+
+func validateCaddyV2Assignments(routes map[string]routeRecord, profile caddyV2Profile, assignments map[uint16]string) error {
+	ports := make([]int, 0, len(assignments))
+	for port := range assignments {
+		ports = append(ports, int(port))
+	}
+	sort.Ints(ports)
+
+	seenApps := make(map[string]struct{}, len(assignments))
+	for _, rawPort := range ports {
+		port := uint16(rawPort)
+		appID := assignments[port]
+		if port < profile.PortStart || port > profile.PortEnd || !validAppID(appID) {
+			return errors.New("invalid generated ingress LAN assignment")
+		}
+		if _, exists := routes[appID]; !exists {
+			return errors.New("generated ingress LAN assignment has no active route")
+		}
+		if _, duplicate := seenApps[appID]; duplicate {
+			return errors.New("generated ingress app has conflicting LAN assignments")
+		}
+		seenApps[appID] = struct{}{}
+	}
+	return nil
+}
+
+func hostRestrictedRoutes(route routeRecord, selectedIPv4 string) []caddyRoute {
+	// Caddy's modules/caddyhttp.MatchHost.MatchWithError removes an optional
+	// request port before comparison. Store only the approved canonical IPv4
+	// in each matcher. The final unconditional 404 ensures every other Host
+	// terminates without app content;
+	// a live Caddy request matrix remains part of the gateway integration gate.
+	if len(route.Endpoints) == 1 {
+		return []caddyRoute{
+			proxyRoute(selectedIPv4, nil, route.Endpoints[0]),
+			notFoundRoute(),
+		}
+	}
+
+	var apiIndex, staticIndex int
+	for index, endpoint := range route.Endpoints {
+		if endpoint.Role == "server" {
+			apiIndex = index
+		} else {
+			staticIndex = index
+		}
+	}
+	return []caddyRoute{
+		proxyRoute(selectedIPv4, []string{"/api", "/api/*"}, route.Endpoints[apiIndex]),
+		proxyRoute(selectedIPv4, nil, route.Endpoints[staticIndex]),
+		notFoundRoute(),
+	}
+}
+
+func lanServerName(port uint16) string {
+	return "lan-" + strconv.FormatUint(uint64(port), 10)
+}
+
+func notFoundRoute() caddyRoute {
+	return caddyRoute{Handle: []caddyHandle{{Handler: "static_response", StatusCode: 404}}}
+}
