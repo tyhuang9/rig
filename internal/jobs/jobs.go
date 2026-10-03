@@ -853,6 +853,26 @@ func normalizeCheckpoint(checkpoint string) (string, error) {
 
 // RunWorker returns only infrastructure failures; executor failures are persisted.
 func (s *Service) RunWorker(ctx context.Context, executor Executor) error {
+	return s.runWorker(ctx, executor, nil)
+}
+
+// RunWorkerWithAdmission holds one external effects lease from before job
+// assignment through executor cleanup and any resulting job-state persistence.
+// Owner shutdown can leave an assigned or running job for startup recovery;
+// lease release alone does not prove that all jobs are terminal. The admission
+// callback must fail closed before returning a release function.
+func (s *Service) RunWorkerWithAdmission(ctx context.Context, executor Executor,
+	acquire func(context.Context) (func() error, error),
+) error {
+	if acquire == nil {
+		return errors.New("deployment effects admission is required")
+	}
+	return s.runWorker(ctx, executor, acquire)
+}
+
+func (s *Service) runWorker(ctx context.Context, executor Executor,
+	acquire func(context.Context) (func() error, error),
+) error {
 	if executor == nil {
 		return errors.New("job executor is required")
 	}
@@ -871,10 +891,46 @@ func (s *Service) RunWorker(ctx context.Context, executor Executor) error {
 		if s.beforeClaim != nil {
 			s.beforeClaim()
 		}
+		if acquire != nil {
+			queued, err := s.hasQueuedJob(ctx)
+			if err != nil {
+				return normalizeWorkerError(ctx, err)
+			}
+			if !queued {
+				continue
+			}
+			release, err := acquire(ctx)
+			if err != nil {
+				return normalizeWorkerError(ctx, err)
+			}
+			if release == nil {
+				return errors.New("deployment effects admission returned no release")
+			}
+			if ctx.Err() != nil {
+				if err := release(); err != nil {
+					return fmt.Errorf("release deployment effects admission: %w", err)
+				}
+				return nil
+			}
+			runErr := s.runOne(ctx, executor)
+			if releaseErr := release(); releaseErr != nil {
+				return fmt.Errorf("release deployment effects admission: %w", errors.Join(runErr, releaseErr))
+			}
+			if runErr != nil {
+				return normalizeWorkerError(ctx, runErr)
+			}
+			continue
+		}
 		if err := s.runOne(ctx, executor); err != nil {
 			return normalizeWorkerError(ctx, err)
 		}
 	}
+}
+
+func (s *Service) hasQueuedJob(ctx context.Context) (bool, error) {
+	var queued bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM jobs WHERE status='queued')`).Scan(&queued)
+	return queued, err
 }
 
 // normalizeWorkerError makes owner shutdown authoritative over infrastructure
