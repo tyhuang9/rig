@@ -8,6 +8,32 @@ var managerAcquireGatewayOSLock = acquireGatewayOSLock
 // instances sharing one data root. The local mutex is acquired first so a
 // single Manager cannot race its own callbacks while waiting for the OS lock.
 func (m *Manager) lockGateway(ctx context.Context) (func() error, error) {
+	release, err := m.lockGatewayRaw(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if m.options.RebindFenceCheck == nil {
+		_ = release()
+		return nil, &Error{Code: DiagnosticRouteUnresolved}
+	}
+	if err := m.options.RebindFenceCheck(ctx); err != nil {
+		_ = release()
+		if ctx.Err() != nil {
+			return nil, &Error{Code: DiagnosticCancelled}
+		}
+		return nil, &Error{Code: DiagnosticRouteUnresolved}
+	}
+	if ctx.Err() != nil {
+		_ = release()
+		return nil, &Error{Code: DiagnosticCancelled}
+	}
+	return release, nil
+}
+
+// lockGatewayRaw is reserved for the journal-bound emergency-stop path. All
+// ordinary observation and mutation must call lockGateway so SQLite can fence
+// an in-progress LAN gateway rebind before any Docker inspection or effect.
+func (m *Manager) lockGatewayRaw(ctx context.Context) (func() error, error) {
 	if err := m.mu.LockContext(ctx); err != nil {
 		return nil, &Error{Code: DiagnosticCancelled}
 	}

@@ -111,7 +111,8 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	ingress, err := New(runner, Options{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		DataRoot: state, HostPort: hostPort, CommandTimeout: 45 * time.Second, PullTimeout: 5 * time.Minute,
-		OutputLimit: liveDockerOutputLimit,
+		OutputLimit:      liveDockerOutputLimit,
+		RebindFenceCheck: func(context.Context) error { return nil },
 	})
 	if err != nil {
 		t.Fatal("create generated ingress")

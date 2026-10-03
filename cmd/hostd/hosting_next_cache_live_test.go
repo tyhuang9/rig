@@ -92,6 +92,7 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 	ingress, err := generatedingress.New(runner, generatedingress.Options{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		DataRoot: ingressState, HostPort: port, CommandTimeout: 45 * time.Second, PullTimeout: 5 * time.Minute,
+		RebindFenceCheck: func(context.Context) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)

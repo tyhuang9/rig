@@ -231,6 +231,7 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		DataRoot: stateRoot, HostPort: freeLoopbackPort(t), CommandTimeout: 45 * time.Second,
 		PullTimeout: 5 * time.Minute, OutputLimit: liveDockerOutputLimit,
+		RebindFenceCheck: func(context.Context) error { return nil },
 	})
 	if err != nil {
 		t.Fatal("create live gateway-v2 ingress")

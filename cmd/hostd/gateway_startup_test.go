@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -41,6 +42,70 @@ type fakeGatewayStartupBatchIngress struct {
 	observedDisables int
 	accessGrants     int
 	accessDisables   int
+}
+
+func TestGatewayStartupRebindFenceAllowsFreshDatabase(t *testing.T) {
+	root := t.TempDir()
+	db, err := database.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	gate, err := inspectGatewayStartup(context.Background(), config.Config{DataRoot: root}, db, "", docker.ControllerDirectories{})
+	if err != nil || gate.ingress != nil || len(gate.snapshot.Upgrades.Claims) != 0 {
+		t.Fatalf("gate=%#v err=%v", gate, err)
+	}
+}
+
+func TestGatewayStartupRebindFenceBlocksGeneratedRuntimeOnAndOffBeforeIngressInspection(t *testing.T) {
+	for _, generated := range []bool{false, true} {
+		t.Run(fmt.Sprintf("generated=%t", generated), func(t *testing.T) {
+			root := t.TempDir()
+			db, err := database.Open(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			calls := 0
+			gate, err := inspectGatewayStartupWithFence(context.Background(), config.Config{
+				DataRoot: root, GeneratedRuntime: generated,
+			}, db, "invalid-before-ingress", docker.ControllerDirectories{}, func(context.Context) error {
+				calls++
+				return errGatewayRebindFenceActive
+			})
+			if !errors.Is(err, errGatewayRebindFenceActive) || calls != 1 || gate.ingress != nil {
+				t.Fatalf("gate=%#v calls=%d err=%v", gate, calls, err)
+			}
+		})
+	}
+}
+
+func TestGatewayStartupRebindFenceRejectsCorruptAndUnreadableDatabaseWithRuntimeOnAndOff(t *testing.T) {
+	for _, generated := range []bool{false, true} {
+		for _, failure := range []string{"corrupt", "unreadable"} {
+			t.Run(fmt.Sprintf("generated=%t/%s", generated, failure), func(t *testing.T) {
+				root := t.TempDir()
+				db, err := database.Open(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if failure == "corrupt" {
+					if _, err := db.Exec(`DROP TABLE lan_gateway_rebind_claims`); err != nil {
+						t.Fatal(err)
+					}
+					defer db.Close()
+				} else if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				gate, err := inspectGatewayStartup(context.Background(), config.Config{
+					DataRoot: root, GeneratedRuntime: generated,
+				}, db, "invalid-before-ingress", docker.ControllerDirectories{})
+				if err == nil || gate.ingress != nil {
+					t.Fatalf("gate=%#v err=%v", gate, err)
+				}
+			})
+		}
+	}
 }
 
 func (f *fakeGatewayStartupBatchIngress) HasGatewayV2LANRecoveryBatch(context.Context) (bool, error) {

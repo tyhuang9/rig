@@ -109,6 +109,11 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 	if options.runner == nil {
 		options.runner = runtimeprocess.ExecRunner{}
 	}
+	recoveryContext := context.WithoutCancel(ctx)
+	fenceCheck := rebindFenceCheck(dependencies.db)
+	if err := fenceCheck(recoveryContext); err != nil {
+		return runtimeComposition{}, fmt.Errorf("inspect LAN gateway rebind fence before runtime recovery: %w", err)
+	}
 	step := func(name string) error {
 		if options.beforeStep == nil {
 			return nil
@@ -118,8 +123,6 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		}
 		return nil
 	}
-	recoveryContext := context.WithoutCancel(ctx)
-
 	if err := step("compose_temp_create"); err != nil {
 		return runtimeComposition{}, err
 	}
@@ -213,7 +216,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 			ingress, err = generatedingress.New(options.runner, generatedingress.Options{
 				DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
 				DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
-				DataRoot: configuration.DataRoot,
+				DataRoot: configuration.DataRoot, RebindFenceCheck: fenceCheck,
 			})
 			if err != nil {
 				return runtimeComposition{}, fmt.Errorf("generated ingress setup: %w", err)
@@ -314,7 +317,8 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err := step("runtime_router_create"); err != nil {
 			return runtimeComposition{}, err
 		}
-		result.executor, err = runtimeexecutor.New(dependencies.deployments, dependencies.plans, dependencies.snapshots, result.compose, result.generated)
+		result.executor, err = runtimeexecutor.New(dependencies.deployments, dependencies.plans, dependencies.snapshots,
+			result.compose, result.generated, fenceCheck)
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("runtime strategy router setup: %w", err)
 		}
