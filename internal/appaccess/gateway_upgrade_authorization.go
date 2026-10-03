@@ -155,7 +155,7 @@ func validateGatewayProfileUpgradeAuthorizationInput(input GatewayProfileUpgrade
 	return spec, permitted, nil
 }
 
-func validateGatewayProfileUpgradeClaimHistory(ctx context.Context, tx *sql.Tx, claim GatewayProfileUpgradeClaim) error {
+func validateGatewayProfileUpgradeClaimHistory(ctx context.Context, tx gatewayRebindQuiescenceQuerier, claim GatewayProfileUpgradeClaim) error {
 	rows, err := tx.QueryContext(ctx, `SELECT sequence,state,created_at
 		FROM lan_gateway_upgrade_claim_events WHERE operation_id=? ORDER BY sequence`, claim.OperationID)
 	if err != nil {
