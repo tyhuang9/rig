@@ -282,8 +282,18 @@ record and reads it back; it never edits an earlier record. Resource identity
 fields are monotonic: an empty field may become the one observed identity in
 the next record, and a non-empty field may only replay exactly. History
 discovery must reject missing sequence numbers, duplicate sequences, multiple
-terminal receipts, unknown files, purpose mismatches, or any changed retained
-artifact.
+terminal receipts, unknown files in the reserved history namespace, purpose
+mismatches, or any changed retained artifact.
+
+The private protected-history format currently defines only the two pre-effect
+records, `successor_intent` and `stage_intent`, with purpose-bound, sequenced
+create-only bundles. The latter stores the approved image content digest and
+the separately observed Docker image ID. Its storage validator binds the
+approved digest, successor identity, and selected network plan to the
+installed intent; it checks the observed image ID and topology digest only
+for syntax. It cannot authenticate Docker or host topology. A guarded writer
+must repeat those observations under its own locks before any resource effect.
+No terminal phase or receipt is installed by this format.
 
 The implementation may reuse the existing generation filename conventions
 only if the scanner can distinguish an ordinary v1-to-v2 upgrade from a
@@ -633,9 +643,9 @@ cutover writer are approved:
 
 - the exact SQL tables and trigger mechanism for purpose-bound writer
   authorization and append-only allocation/profile transfers;
-- the successor protected artifact filenames, purpose strings, version, and
-  whether existing history scanning is extended or a rebind-specific scanner
-  is introduced;
+- the protected artifact filenames, purpose strings, and versions for phases
+  after the two defined pre-effect records, plus their terminal receipt and
+  recovery semantics;
 - the canonical local topology/config observation digest and whether a future
   optional remote-device verification status should be receipt-bound; such a
   status is not part of the runtime commit or fence-release contract;

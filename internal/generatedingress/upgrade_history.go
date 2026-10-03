@@ -78,6 +78,7 @@ const (
 	gatewayHistoryReceipt
 	gatewayHistoryAbort
 	gatewayHistoryRebindIntent
+	gatewayHistoryRebindProgress
 )
 
 type gatewayHistoryArtifact struct {
@@ -97,6 +98,7 @@ type gatewayRebindHistoryGeneration struct {
 	generation  uint64
 	operationID string
 	intent      gatewayHistoryArtifact
+	progress    map[uint64]gatewayHistoryArtifact
 }
 
 type gatewayHistorySnapshot struct {
@@ -638,14 +640,14 @@ func readGatewayHistorySnapshotMode(store *stateStore, allowRebind bool) (gatewa
 		files:         make(map[string]gatewayHistoryFileFingerprint),
 	}
 	for _, entry := range entries {
-		generation, operationID, kind, relevant, parseErr := parseGatewayHistoryArtifactName(entry.Name())
+		generation, operationID, sequence, kind, relevant, parseErr := parseGatewayHistoryArtifactName(entry.Name())
 		if parseErr != nil {
 			return gatewayHistorySnapshot{}, parseErr
 		}
 		if !relevant {
 			continue
 		}
-		if kind == gatewayHistoryRebindIntent && !allowRebind {
+		if (kind == gatewayHistoryRebindIntent || kind == gatewayHistoryRebindProgress) && !allowRebind {
 			return gatewayHistorySnapshot{}, errors.New("generated ingress rebind history requires a rebind-aware scanner")
 		}
 		path := filepath.Join(store.root, entry.Name())
@@ -657,13 +659,24 @@ func readGatewayHistorySnapshotMode(store *stateStore, allowRebind bool) (gatewa
 			return gatewayHistorySnapshot{}, readErr
 		}
 		artifact := gatewayHistoryArtifact{path: path}
-		if kind == gatewayHistoryRebindIntent {
+		if kind == gatewayHistoryRebindIntent || kind == gatewayHistoryRebindProgress {
 			artifacts := snapshot.rebindIntents[generation]
-			if artifacts.intent.path != "" ||
-				(artifacts.operationID != "" && artifacts.operationID != operationID) {
+			if (artifacts.operationID != "" && artifacts.operationID != operationID) ||
+				(kind == gatewayHistoryRebindIntent && artifacts.intent.path != "") {
 				return gatewayHistorySnapshot{}, errors.New("generated ingress rebind generation has duplicate intents")
 			}
-			artifacts.generation, artifacts.operationID, artifacts.intent = generation, operationID, artifact
+			artifacts.generation, artifacts.operationID = generation, operationID
+			if kind == gatewayHistoryRebindIntent {
+				artifacts.intent = artifact
+			} else {
+				if artifacts.progress == nil {
+					artifacts.progress = make(map[uint64]gatewayHistoryArtifact)
+				}
+				if _, duplicate := artifacts.progress[sequence]; duplicate {
+					return gatewayHistorySnapshot{}, errors.New("generated ingress rebind generation has duplicate progress")
+				}
+				artifacts.progress[sequence] = artifact
+			}
 			snapshot.rebindIntents[generation] = artifacts
 			snapshot.files[entry.Name()] = fingerprint
 			continue
@@ -765,17 +778,17 @@ func sameGatewayHistoryFileMetadata(left, right os.FileInfo) bool {
 		left.Size() == right.Size() && left.Mode() == right.Mode() && left.ModTime().Equal(right.ModTime())
 }
 
-func parseGatewayHistoryArtifactName(name string) (uint64, string, gatewayHistoryArtifactKind, bool, error) {
+func parseGatewayHistoryArtifactName(name string) (uint64, string, uint64, gatewayHistoryArtifactKind, bool, error) {
 	lowerName := strings.ToLower(name)
 	switch name {
 	case v2RouteStateFilename:
-		return 0, "", gatewayHistoryState, true, nil
+		return 0, "", 0, gatewayHistoryState, true, nil
 	case gatewayMigrationFilename:
-		return 0, "", gatewayHistoryJournal, true, nil
+		return 0, "", 0, gatewayHistoryJournal, true, nil
 	case gatewayRollbackRetirementFilename:
-		return 0, "", gatewayHistoryReceipt, true, nil
+		return 0, "", 0, gatewayHistoryReceipt, true, nil
 	case gatewayPreJournalAbortFilename:
-		return 0, "", gatewayHistoryAbort, true, nil
+		return 0, "", 0, gatewayHistoryAbort, true, nil
 	}
 	prefixes := []struct {
 		prefix string
@@ -793,38 +806,59 @@ func parseGatewayHistoryArtifactName(name string) (uint64, string, gatewayHistor
 		tail := strings.TrimSuffix(strings.TrimPrefix(name, candidate.prefix), ".bundle")
 		parts := strings.Split(tail, ".")
 		if !strings.HasSuffix(name, ".bundle") || len(parts) != 2 || len(parts[0]) != gatewayV2GenerationDigits || !validCanonicalUUID(parts[1]) {
-			return 0, "", 0, true, errors.New("generated ingress upgrade history filename is invalid")
+			return 0, "", 0, 0, true, errors.New("generated ingress upgrade history filename is invalid")
 		}
 		generation, err := strconv.ParseUint(parts[0], 10, 64)
 		if err != nil || generation == 0 || fmt.Sprintf("%0*d", gatewayV2GenerationDigits, generation) != parts[0] {
-			return 0, "", 0, true, errors.New("generated ingress upgrade history generation is invalid")
+			return 0, "", 0, 0, true, errors.New("generated ingress upgrade history generation is invalid")
 		}
-		return generation, parts[1], candidate.kind, true, nil
+		return generation, parts[1], 0, candidate.kind, true, nil
 	}
 	if strings.HasPrefix(lowerName, gatewayRebindProtectedIntentFilenamePrefix) {
 		if !strings.HasPrefix(name, gatewayRebindProtectedIntentFilenamePrefix) {
-			return 0, "", 0, true, errors.New("generated ingress rebind history filename is invalid")
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind history filename is invalid")
 		}
 		tail := strings.TrimSuffix(strings.TrimPrefix(name, gatewayRebindProtectedIntentFilenamePrefix), ".bundle")
 		parts := strings.Split(tail, ".")
 		if !strings.HasSuffix(name, ".bundle") || len(parts) != 2 ||
 			len(parts[0]) != gatewayV2GenerationDigits || !validCanonicalUUID(parts[1]) {
-			return 0, "", 0, true, errors.New("generated ingress rebind history filename is invalid")
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind history filename is invalid")
 		}
 		generation, err := strconv.ParseUint(parts[0], 10, 64)
 		if err != nil || generation == 0 || fmt.Sprintf("%0*d", gatewayV2GenerationDigits, generation) != parts[0] {
-			return 0, "", 0, true, errors.New("generated ingress rebind history generation is invalid")
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind history generation is invalid")
 		}
-		return generation, parts[1], gatewayHistoryRebindIntent, true, nil
+		return generation, parts[1], 0, gatewayHistoryRebindIntent, true, nil
+	}
+	if strings.HasPrefix(lowerName, gatewayRebindProgressFilenamePrefix) {
+		if !strings.HasPrefix(name, gatewayRebindProgressFilenamePrefix) {
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind history filename is invalid")
+		}
+		tail := strings.TrimSuffix(strings.TrimPrefix(name, gatewayRebindProgressFilenamePrefix), ".bundle")
+		parts := strings.Split(tail, ".")
+		if !strings.HasSuffix(name, ".bundle") || len(parts) != 3 ||
+			len(parts[0]) != gatewayV2GenerationDigits || !validCanonicalUUID(parts[1]) ||
+			len(parts[2]) != gatewayRebindProgressSequenceDigits+1 || !strings.HasPrefix(parts[2], "s") {
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind history filename is invalid")
+		}
+		generation, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil || generation == 0 || fmt.Sprintf("%0*d", gatewayV2GenerationDigits, generation) != parts[0] {
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind history generation is invalid")
+		}
+		sequence, err := strconv.ParseUint(parts[2][1:], 10, 64)
+		if err != nil || sequence == 0 || fmt.Sprintf("s%0*d", gatewayRebindProgressSequenceDigits, sequence) != parts[2] {
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind history sequence is invalid")
+		}
+		return generation, parts[1], sequence, gatewayHistoryRebindProgress, true, nil
 	}
 	// Reserve the whole upgrade-history namespace. New terminal record types
 	// must be explicitly taught to this scanner before they can affect
 	// ownership, so unknown artifacts fail closed.
 	if strings.HasPrefix(lowerName, "routes-v2") || strings.HasPrefix(lowerName, "gateway-v1-to-v2") ||
 		strings.HasPrefix(lowerName, "gateway-rebind") {
-		return 0, "", 0, true, errors.New("generated ingress upgrade history filename is invalid")
+		return 0, "", 0, 0, true, errors.New("generated ingress upgrade history filename is invalid")
 	}
-	return 0, "", 0, false, nil
+	return 0, "", 0, 0, false, nil
 }
 
 func sameGatewayHistorySnapshot(left, right gatewayHistorySnapshot) bool {

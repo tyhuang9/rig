@@ -83,6 +83,7 @@ type gatewayRebindProtectedIntentSelection struct {
 type gatewayRebindProtectedIntentHistory struct {
 	Predecessor gatewayUpgradeGenerationSelection
 	Intents     []gatewayRebindProtectedIntentSelection
+	Progress    []gatewayRebindProgressSelection
 }
 
 func newGatewayRebindProtectedIntent(snapshot appaccess.GatewayRebindStartupSnapshot,
@@ -480,9 +481,14 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLocked(checkpoint func(
 		if loadErr != nil || !gatewayRebindProtectedIntentMatchesPredecessor(intent, predecessor) {
 			return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind intent history is invalid")
 		}
+		progress, progressErr := scanGatewayRebindProgressForIntent(m.options.DataRoot, intent, artifact)
+		if progressErr != nil {
+			return gatewayRebindProtectedIntentHistory{}, progressErr
+		}
 		result.Intents = append(result.Intents, gatewayRebindProtectedIntentSelection{
 			Store: store, Generation: generation, Intent: intent, Existing: true,
 		})
+		result.Progress = append(result.Progress, progress...)
 	}
 	// Multiple intents cannot yet be justified because terminal rebind receipt
 	// semantics are intentionally absent from this slice.
