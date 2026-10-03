@@ -708,6 +708,14 @@ const (
 	liveGatewayV2TraceStartShapeExec          liveGatewayV2TraceOutcome = "start_shape_exec_or_executable"
 	liveGatewayV2TraceStartShapeMount         liveGatewayV2TraceOutcome = "start_shape_mount_or_rootfs"
 	liveGatewayV2TraceStartShapePermission    liveGatewayV2TraceOutcome = "start_shape_permission"
+	liveGatewayV2TraceStartShapeProcSys       liveGatewayV2TraceOutcome = "start_shape_proc_sys"
+	liveGatewayV2TraceStartShapePortSysctl    liveGatewayV2TraceOutcome = "start_shape_unprivileged_port_sysctl"
+	liveGatewayV2TraceStartShapeSysctl        liveGatewayV2TraceOutcome = "start_shape_sysctl"
+	liveGatewayV2TraceStartShapeRlimit        liveGatewayV2TraceOutcome = "start_shape_rlimit"
+	liveGatewayV2TraceStartShapePivotRoot     liveGatewayV2TraceOutcome = "start_shape_pivot_root"
+	liveGatewayV2TraceStartShapeHostname      liveGatewayV2TraceOutcome = "start_shape_hostname"
+	liveGatewayV2TraceStartShapeCapability    liveGatewayV2TraceOutcome = "start_shape_capability"
+	liveGatewayV2TraceStartShapeCgroup        liveGatewayV2TraceOutcome = "start_shape_cgroup"
 	liveGatewayV2TraceStartShapeNoKnownDetail liveGatewayV2TraceOutcome = "start_shape_no_known_detail"
 )
 
@@ -1592,6 +1600,14 @@ func liveGatewayV2StartFailureShapeOutcomes(result runtimeprocess.CommandResult,
 		liveGatewayV2TraceSelection{contains("exec", "executable"), liveGatewayV2TraceStartShapeExec},
 		liveGatewayV2TraceSelection{contains("mount", "rootfs"), liveGatewayV2TraceStartShapeMount},
 		liveGatewayV2TraceSelection{contains("permission denied", "operation not permitted"), liveGatewayV2TraceStartShapePermission},
+		liveGatewayV2TraceSelection{contains("/proc/sys/"), liveGatewayV2TraceStartShapeProcSys},
+		liveGatewayV2TraceSelection{contains("ip_unprivileged_port_start"), liveGatewayV2TraceStartShapePortSysctl},
+		liveGatewayV2TraceSelection{contains("sysctl"), liveGatewayV2TraceStartShapeSysctl},
+		liveGatewayV2TraceSelection{contains("rlimit"), liveGatewayV2TraceStartShapeRlimit},
+		liveGatewayV2TraceSelection{contains("pivot_root"), liveGatewayV2TraceStartShapePivotRoot},
+		liveGatewayV2TraceSelection{contains("hostname"), liveGatewayV2TraceStartShapeHostname},
+		liveGatewayV2TraceSelection{contains("capability", "capabilities"), liveGatewayV2TraceStartShapeCapability},
+		liveGatewayV2TraceSelection{contains("cgroup"), liveGatewayV2TraceStartShapeCgroup},
 	)
 	if len(details) == 0 {
 		return []liveGatewayV2TraceOutcome{liveGatewayV2TraceStartShapeNoKnownDetail}
@@ -2111,6 +2127,18 @@ func TestLiveGatewayV2StartFailureShapeDoesNotExposeDaemonOutput(t *testing.T) {
 	}
 	if got := liveGatewayV2StartFailureShapeOutcomes(runtimeprocess.CommandResult{StderrTruncated: true}, errors.New("command failed")); len(got) != 0 {
 		t.Fatalf("truncated output produced failure shape %v", got)
+	}
+	sysctl := runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: error during container init: open /proc/sys/net/ipv4/ip_unprivileged_port_start: invalid argument")}
+	wantSysctl := []liveGatewayV2TraceOutcome{
+		liveGatewayV2TraceStartShapeOCI,
+		liveGatewayV2TraceStartShapeProcessInit,
+		liveGatewayV2TraceStartShapeInvalidArg,
+		liveGatewayV2TraceStartShapePort,
+		liveGatewayV2TraceStartShapeProcSys,
+		liveGatewayV2TraceStartShapePortSysctl,
+	}
+	if got := liveGatewayV2StartFailureShapeOutcomes(sysctl, errors.New("command failed")); !reflect.DeepEqual(got, wantSysctl) {
+		t.Fatalf("sysctl failure shape = %v, want %v", got, wantSysctl)
 	}
 }
 
