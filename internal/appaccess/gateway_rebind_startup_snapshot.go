@@ -13,6 +13,20 @@ type GatewayRebindStartupClaim struct {
 	PredecessorProfile GatewayProfileRevision
 	PredecessorUpgrade GatewayProfileUpgradeClaim
 	Roster             []GatewayRebindRosterEntry
+	// GrantBindings is in the same order as Roster; each element is validated
+	// with its corresponding roster entry in the same SQLite read transaction.
+	GrantBindings []GatewayRebindStartupGrantBinding
+}
+
+// GatewayRebindStartupGrantBinding projects the controller inputs retained by
+// the committed grant for the corresponding roster entry. The projection is
+// read and validated from the same SQLite snapshot as the dormant rebind claim.
+type GatewayRebindStartupGrantBinding struct {
+	AppID              string
+	AttemptID          string
+	RequestDigest      string
+	ApprovedBy         string
+	GatewayOperationID string
 }
 
 type GatewayRebindStartupSnapshot struct {
@@ -143,10 +157,13 @@ func readGatewayRebindStartupClaim(ctx context.Context, tx *sql.Tx, operationID 
 	if err != nil || rosterDigest != claim.Spec.RosterDigest {
 		return GatewayRebindStartupClaim{}, ErrInvalidStoredState
 	}
+	grantBindings := make([]GatewayRebindStartupGrantBinding, 0, len(roster))
 	for _, entry := range roster {
-		if err := validateGatewayRebindRosterEntry(ctx, tx, claim, entry); err != nil {
+		binding, err := validateGatewayRebindRosterEntry(ctx, tx, claim, entry)
+		if err != nil {
 			return GatewayRebindStartupClaim{}, err
 		}
+		grantBindings = append(grantBindings, binding)
 	}
 	var liveCount int64
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lan_port_allocations
@@ -157,7 +174,8 @@ func readGatewayRebindStartupClaim(ctx context.Context, tx *sql.Tx, operationID 
 		return GatewayRebindStartupClaim{}, ErrInvalidStoredState
 	}
 	return GatewayRebindStartupClaim{
-		Claim: claim, PredecessorProfile: predecessor, PredecessorUpgrade: upgrade, Roster: roster,
+		Claim: claim, PredecessorProfile: predecessor, PredecessorUpgrade: upgrade,
+		Roster: roster, GrantBindings: grantBindings,
 	}, nil
 }
 
@@ -296,29 +314,31 @@ func readGatewayRebindRoster(ctx context.Context, tx *sql.Tx, operationID string
 	return result, rows.Err()
 }
 
-func validateGatewayRebindRosterEntry(ctx context.Context, tx *sql.Tx, claim GatewayRebindClaim, entry GatewayRebindRosterEntry) error {
+func validateGatewayRebindRosterEntry(ctx context.Context, tx *sql.Tx, claim GatewayRebindClaim,
+	entry GatewayRebindRosterEntry,
+) (GatewayRebindStartupGrantBinding, error) {
 	entryDigest, err := GatewayRebindRosterEntryDigest(entry)
 	if err != nil || entryDigest != entry.EntryDigest || entry.Port < claim.Spec.SuccessorProfile.PortStart ||
 		entry.Port > claim.Spec.SuccessorProfile.PortEnd {
-		return ErrInvalidStoredState
+		return GatewayRebindStartupGrantBinding{}, ErrInvalidStoredState
 	}
 	revision, requestDigest, err := readAccessRevision(ctx, tx, entry.AppID, entry.AccessRevisionID, entry.AccessRevisionNumber)
 	if err != nil {
-		return invalidRebindStoredState(err)
+		return GatewayRebindStartupGrantBinding{}, invalidRebindStoredState(err)
 	}
 	if revision.OperationID != entry.AllocationOwnerOperationID ||
 		revision.SpecDigest != entry.AccessSpecDigest || revision.Allocation.ID != entry.AllocationID ||
 		revision.Allocation.Port != entry.Port || revision.Allocation.State != AllocationActive ||
 		revision.Allocation.GatewayProfileRevisionID != claim.Spec.PredecessorProfileRevisionID ||
 		revision.Allocation.GatewayProfileRevisionNumber != claim.Spec.PredecessorProfileRevisionNumber {
-		return ErrInvalidStoredState
+		return GatewayRebindStartupGrantBinding{}, ErrInvalidStoredState
 	}
 	if err := validateOperatorCurrentAccessRevision(revision, requestDigest); err != nil {
-		return err
+		return GatewayRebindStartupGrantBinding{}, err
 	}
 	grant, err := readAppAccessGrantClaim(ctx, tx, entry.GrantAttemptID)
 	if err != nil {
-		return invalidRebindStoredState(err)
+		return GatewayRebindStartupGrantBinding{}, invalidRebindStoredState(err)
 	}
 	if grant.State != AppAccessGrantCommitted || grant.Proof == nil || grant.RetiredAt != nil ||
 		grant.StateSequence != entry.GrantStateSequence ||
@@ -329,8 +349,10 @@ func validateGatewayRebindRosterEntry(ctx context.Context, tx *sql.Tx, claim Gat
 		grant.Spec.AccessRevisionNumber != entry.AccessRevisionNumber ||
 		grant.Spec.AccessSpecDigest != entry.AccessSpecDigest || grant.Spec.Port != entry.Port ||
 		grant.Spec.GatewayProfileRevisionID != claim.Spec.PredecessorProfileRevisionID ||
-		grant.Spec.GatewayProfileRevisionNumber != claim.Spec.PredecessorProfileRevisionNumber {
-		return ErrInvalidStoredState
+		grant.Spec.GatewayProfileRevisionNumber != claim.Spec.PredecessorProfileRevisionNumber ||
+		grant.Spec.GatewayProfileSpecDigest != claim.Spec.PredecessorProfileSpecDigest ||
+		grant.Proof.GatewayOperationID != claim.Spec.PredecessorUpgradeOperationID {
+		return GatewayRebindStartupGrantBinding{}, ErrInvalidStoredState
 	}
 	var matches int
 	err = tx.QueryRowContext(ctx, `SELECT EXISTS(
@@ -361,12 +383,15 @@ func validateGatewayRebindRosterEntry(ctx context.Context, tx *sql.Tx, claim Gat
 		entry.AccessSpecDigest, entry.GrantStateSequence, entry.GrantProtectedStateDigest,
 		entry.ServingDeploymentID, entry.ServingReleaseID, entry.ServingSlot, entry.RouteGeneration).Scan(&matches)
 	if err != nil {
-		return err
+		return GatewayRebindStartupGrantBinding{}, err
 	}
 	if matches != 1 {
-		return ErrInvalidStoredState
+		return GatewayRebindStartupGrantBinding{}, ErrInvalidStoredState
 	}
-	return nil
+	return GatewayRebindStartupGrantBinding{
+		AppID: grant.Spec.AppID, AttemptID: grant.AttemptID, RequestDigest: grant.RequestDigest,
+		ApprovedBy: grant.Spec.ApprovedBy, GatewayOperationID: grant.Proof.GatewayOperationID,
+	}, nil
 }
 
 func invalidRebindStoredState(err error) error {
