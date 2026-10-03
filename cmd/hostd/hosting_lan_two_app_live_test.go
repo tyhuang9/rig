@@ -360,6 +360,29 @@ type lanTwoAppGrantTrace struct {
 	events []string
 }
 
+type lanTwoAppGrantLeaseTrace struct {
+	generatedingress.GatewayV2LANGrantAuthorizationLease
+	trace *lanTwoAppGrantTrace
+}
+
+func (lease lanTwoAppGrantLeaseTrace) Revalidate(ctx context.Context, request generatedingress.GatewayV2LANGrantRequest) error {
+	err := lease.GatewayV2LANGrantAuthorizationLease.Revalidate(ctx, request)
+	lease.trace.record("revalidate", err, "")
+	return err
+}
+
+func (lease lanTwoAppGrantLeaseTrace) Activate(ctx context.Context, request generatedingress.GatewayV2LANGrantRequest) error {
+	err := lease.GatewayV2LANGrantAuthorizationLease.Activate(ctx, request)
+	lease.trace.record("activate", err, "")
+	return err
+}
+
+func (lease lanTwoAppGrantLeaseTrace) Release() error {
+	err := lease.GatewayV2LANGrantAuthorizationLease.Release()
+	lease.trace.record("release", err, "")
+	return err
+}
+
 func (trace *lanTwoAppGrantTrace) record(stage string, err error, disposition generatedingress.GatewayV2LANGrantDisposition) {
 	outcome := "ok"
 	if err != nil {
@@ -401,7 +424,18 @@ func (trace *lanTwoAppGrantTrace) logFailure(t *testing.T) {
 func (trace *lanTwoAppGrantTrace) GrantGatewayV2LAN(ctx context.Context, request generatedingress.GatewayV2LANGrantRequest,
 	authorize generatedingress.GatewayV2LANGrantAuthorizer,
 ) (generatedingress.GatewayV2LANGrantResult, error) {
-	result, err := trace.Manager.GrantGatewayV2LAN(ctx, request, authorize)
+	tracedAuthorize := authorize
+	if authorize != nil {
+		tracedAuthorize = func(authorizeCtx context.Context, candidate generatedingress.GatewayV2LANGrantRequest) (generatedingress.GatewayV2LANGrantAuthorizationLease, error) {
+			lease, err := authorize(authorizeCtx, candidate)
+			trace.record("authorize", err, "")
+			if err != nil || lease == nil {
+				return lease, err
+			}
+			return lanTwoAppGrantLeaseTrace{GatewayV2LANGrantAuthorizationLease: lease, trace: trace}, nil
+		}
+	}
+	result, err := trace.Manager.GrantGatewayV2LAN(ctx, request, tracedAuthorize)
 	trace.record("grant", err, "")
 	return result, err
 }
