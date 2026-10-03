@@ -477,7 +477,7 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 		return observation, inspectErr
 	}
 	observation.StageStable = stageConfigStable && observation.StageContainerFound == confirmedStageFound && (!confirmedStageFound ||
-		stableGatewayV2StageContainer(observation.StageContainer, confirmedStage, observation.StageRuntime, confirmedStageRuntime, state.Identity))
+		stableGatewayV2ContainerMounts(observation.StageContainer, confirmedStage, observation.StageRuntime, confirmedStageRuntime, state.Identity))
 	finalConfigStable := true
 	if observation.FinalContainerFound {
 		var confirmedLive []byte
@@ -501,7 +501,7 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 		return observation, inspectErr
 	}
 	observation.FinalStable = finalConfigStable && observation.FinalContainerFound == confirmedFinalFound && (!confirmedFinalFound ||
-		(reflect.DeepEqual(observation.FinalContainer, confirmedFinal) && reflect.DeepEqual(observation.FinalRuntime, confirmedFinalRuntime)))
+		stableGatewayV2ContainerMounts(observation.FinalContainer, confirmedFinal, observation.FinalRuntime, confirmedFinalRuntime, state.Identity))
 	observation.OwnedInventoriesStable = m.confirmGatewayV2OwnedInventories(ctx, observation)
 	if requireV1EndpointIdentity {
 		confirmedV1ApplicationNetworks, confirmErr := m.reinspectGatewayApplicationNetworks(ctx, observation.V1ApplicationNetworks, observation.V1ApplicationNetworkIDs)
@@ -528,10 +528,11 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 	return observation, nil
 }
 
-// Docker may return the same two volume mounts in either order across inspect
-// reads. Each read must still prove the exact journal-bound mounts; all other
-// container fields and the entire runtime snapshot must remain unchanged.
-func stableGatewayV2StageContainer(first, confirmed caddyInspection, firstRuntime, confirmedRuntime gatewayContainerRuntime,
+// Docker may return the same two volume mounts in either order across stage
+// or final-container inspect reads. Each read must still prove the exact
+// journal-bound mounts; all other container fields and the entire runtime
+// snapshot must remain unchanged.
+func stableGatewayV2ContainerMounts(first, confirmed caddyInspection, firstRuntime, confirmedRuntime gatewayContainerRuntime,
 	identity gatewayV2Identity,
 ) bool {
 	if !reflect.DeepEqual(firstRuntime, confirmedRuntime) ||
