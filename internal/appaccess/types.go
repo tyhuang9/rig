@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/netip"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -31,6 +32,7 @@ type ApprovalAction string
 const (
 	ActionConfigureGateway ApprovalAction = "configure_lan_gateway"
 	ActionUpgradeGateway   ApprovalAction = "upgrade_generated_ingress"
+	ActionRebindGateway    ApprovalAction = "rebind_lan_gateway"
 	ActionEnableAppAccess  ApprovalAction = "enable_lan_access"
 	ActionDisableAppAccess ApprovalAction = "disable_lan_access"
 )
@@ -42,6 +44,8 @@ const (
 
 type GatewayProfileUpgradeState string
 
+type GatewayRebindState string
+
 const (
 	GatewayProfileUpgradePrepared   GatewayProfileUpgradeState = "prepared"
 	GatewayProfileUpgradeServing    GatewayProfileUpgradeState = "serving"
@@ -49,6 +53,8 @@ const (
 	GatewayProfileUpgradeCommitted  GatewayProfileUpgradeState = "committed"
 	GatewayProfileUpgradeRolledBack GatewayProfileUpgradeState = "rolled_back"
 )
+
+const GatewayRebindPrepared GatewayRebindState = "prepared"
 
 type AllocationState string
 
@@ -59,15 +65,15 @@ const (
 )
 
 var (
-	ErrInvalidInput         = errors.New("invalid LAN access input")
-	ErrNotFound             = errors.New("LAN access record not found")
-	ErrConflict             = errors.New("LAN access revision conflict")
-	ErrIdempotencyMismatch  = errors.New("LAN access idempotency payload mismatch")
-	ErrApprovalRequired     = errors.New("LAN access administrator approval required")
-	ErrPoolExhausted        = errors.New("LAN access port pool exhausted")
-	ErrReservationReleased  = errors.New("LAN access reservation was released")
-	ErrInvalidTransition    = errors.New("invalid LAN allocation transition")
-	ErrInvalidStoredState   = errors.New("invalid stored LAN access state")
+	ErrInvalidInput        = errors.New("invalid LAN access input")
+	ErrNotFound            = errors.New("LAN access record not found")
+	ErrConflict            = errors.New("LAN access revision conflict")
+	ErrIdempotencyMismatch = errors.New("LAN access idempotency payload mismatch")
+	ErrApprovalRequired    = errors.New("LAN access administrator approval required")
+	ErrPoolExhausted       = errors.New("LAN access port pool exhausted")
+	ErrReservationReleased = errors.New("LAN access reservation was released")
+	ErrInvalidTransition   = errors.New("invalid LAN allocation transition")
+	ErrInvalidStoredState  = errors.New("invalid stored LAN access state")
 )
 
 // Approval binds an authenticated administrator to one canonical action
@@ -143,6 +149,67 @@ type GatewayProfileUpgradeClaim struct {
 	State                 GatewayProfileUpgradeState
 	StateSequence         int64
 	UpdatedAt             time.Time
+}
+
+// GatewayRebindSpec is the immutable authorization boundary for a future
+// deliberate gateway-profile successor. Migration 033 can only retain and
+// validate this intent: it cannot create the successor profile, move the
+// profile head, alter Docker state, or release the resulting SQL fence.
+type GatewayRebindSpec struct {
+	OperationID                        string             `json:"operationId"`
+	PredecessorProfileRevisionID       string             `json:"predecessorProfileRevisionId"`
+	PredecessorProfileRevisionNumber   int64              `json:"predecessorProfileRevisionNumber"`
+	PredecessorProfileSpecDigest       string             `json:"predecessorProfileSpecDigest"`
+	PredecessorUpgradeOperationID      string             `json:"predecessorUpgradeOperationId"`
+	PredecessorProtectedIdentityDigest string             `json:"predecessorProtectedIdentityDigest"`
+	SuccessorProfileRevisionID         string             `json:"successorProfileRevisionId"`
+	SuccessorProfileRevisionNumber     int64              `json:"successorProfileRevisionNumber"`
+	SuccessorProfileOperationID        string             `json:"successorProfileOperationId"`
+	SuccessorProfile                   GatewayProfileSpec `json:"successorProfile"`
+	RosterDigest                       string             `json:"rosterDigest"`
+	RosterCount                        int64              `json:"rosterCount"`
+}
+
+// GatewayRebindClaim preserves two separate action-bound administrator
+// approvals. RebindApproval covers the predecessor, protected identity,
+// successor identity, and roster. ConfigureApproval independently covers the
+// successor GatewayProfileSpec and is never inferred from RebindApproval.
+type GatewayRebindClaim struct {
+	Spec                          GatewayRebindSpec
+	RequestDigest                 string
+	RebindApproval                Approval
+	RebindApprovedAt              time.Time
+	ConfigureApproval             Approval
+	ConfigureApprovedAt           time.Time
+	SuccessorProfileRequestDigest string
+	State                         GatewayRebindState
+	StateSequence                 int64
+	CreatedAt                     time.Time
+	UpdatedAt                     time.Time
+}
+
+// GatewayRebindRosterEntry captures the exact current database heads that a
+// future cutover would need to recheck under its process and SQLite fences.
+// RouteGeneration is generated_runtime_active_heads.generation.
+type GatewayRebindRosterEntry struct {
+	OperationID                string          `json:"operationId"`
+	Ordinal                    int64           `json:"ordinal"`
+	AppID                      string          `json:"appId"`
+	AllocationID               string          `json:"allocationId"`
+	Port                       uint16          `json:"port"`
+	AllocationOwnerOperationID string          `json:"allocationOwnerOperationId"`
+	AllocationState            AllocationState `json:"allocationState"`
+	AccessRevisionID           string          `json:"accessRevisionId"`
+	AccessRevisionNumber       int64           `json:"accessRevisionNumber"`
+	AccessSpecDigest           string          `json:"accessSpecDigest"`
+	GrantAttemptID             string          `json:"grantAttemptId"`
+	GrantStateSequence         int64           `json:"grantStateSequence"`
+	GrantProtectedStateDigest  string          `json:"grantProtectedStateDigest"`
+	ServingDeploymentID        string          `json:"servingDeploymentId"`
+	ServingReleaseID           string          `json:"servingReleaseId"`
+	ServingSlot                string          `json:"servingSlot"`
+	RouteGeneration            int64           `json:"routeGeneration"`
+	EntryDigest                string          `json:"-"`
 }
 
 type ReserveAppAccessInput struct {
@@ -269,6 +336,86 @@ func GatewayProfileUpgradeSpecDigest(spec GatewayProfileUpgradeSpec) (string, er
 		ProfileSpecDigest:     spec.ProfileSpecDigest,
 		IdentityVersion:       GatewayUpgradeIdentityVersion,
 	})
+}
+
+func GatewayRebindSpecDigest(spec GatewayRebindSpec) (string, error) {
+	canonicalSuccessor, err := canonicalGatewaySpec(spec.SuccessorProfile)
+	if err != nil || !validUUID(spec.OperationID) ||
+		!validUUID(spec.PredecessorProfileRevisionID) || spec.PredecessorProfileRevisionNumber <= 0 ||
+		!validDigest(spec.PredecessorProfileSpecDigest) || !validUUID(spec.PredecessorUpgradeOperationID) ||
+		!validDigest(spec.PredecessorProtectedIdentityDigest) ||
+		!validUUID(spec.SuccessorProfileRevisionID) ||
+		spec.SuccessorProfileRevisionNumber != spec.PredecessorProfileRevisionNumber+1 ||
+		!validUUID(spec.SuccessorProfileOperationID) ||
+		spec.SuccessorProfileRevisionID == spec.PredecessorProfileRevisionID ||
+		spec.SuccessorProfileOperationID == spec.OperationID ||
+		!validDigest(spec.RosterDigest) || spec.RosterCount < 0 {
+		return "", ErrInvalidInput
+	}
+	spec.SuccessorProfile = canonicalSuccessor
+	return digestJSON(struct {
+		Version int               `json:"version"`
+		Action  ApprovalAction    `json:"action"`
+		Spec    GatewayRebindSpec `json:"spec"`
+	}{Version: 1, Action: ActionRebindGateway, Spec: spec})
+}
+
+func GatewayRebindRosterEntryDigest(entry GatewayRebindRosterEntry) (string, error) {
+	entry.EntryDigest = ""
+	if !validUUID(entry.OperationID) || entry.Ordinal <= 0 || !validUUID(entry.AppID) ||
+		!validUUID(entry.AllocationID) || entry.Port < GatewayPortStart || entry.Port > GatewayPortEnd ||
+		!validUUID(entry.AllocationOwnerOperationID) || entry.AllocationState != AllocationActive ||
+		!validUUID(entry.AccessRevisionID) || entry.AccessRevisionNumber <= 0 ||
+		!validDigest(entry.AccessSpecDigest) || !validUUID(entry.GrantAttemptID) ||
+		entry.GrantStateSequence <= 0 || !validDigest(entry.GrantProtectedStateDigest) ||
+		!validUUID(entry.ServingDeploymentID) || !validUUID(entry.ServingReleaseID) ||
+		(entry.ServingSlot != "blue" && entry.ServingSlot != "green") || entry.RouteGeneration <= 0 {
+		return "", ErrInvalidInput
+	}
+	return digestJSON(struct {
+		Version int                      `json:"version"`
+		Action  ApprovalAction           `json:"action"`
+		Entry   GatewayRebindRosterEntry `json:"entry"`
+	}{Version: 1, Action: ActionRebindGateway, Entry: entry})
+}
+
+func GatewayRebindRosterDigest(entries []GatewayRebindRosterEntry) (string, error) {
+	ordered := append([]GatewayRebindRosterEntry(nil), entries...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Ordinal < ordered[j].Ordinal })
+	seenApps := make(map[string]struct{}, len(ordered))
+	seenAllocations := make(map[string]struct{}, len(ordered))
+	seenPorts := make(map[uint16]struct{}, len(ordered))
+	operationID := ""
+	if len(ordered) > 0 {
+		operationID = ordered[0].OperationID
+	}
+	for index := range ordered {
+		if ordered[index].Ordinal != int64(index+1) || ordered[index].OperationID != operationID {
+			return "", ErrInvalidInput
+		}
+		digest, err := GatewayRebindRosterEntryDigest(ordered[index])
+		if err != nil || (ordered[index].EntryDigest != "" && ordered[index].EntryDigest != digest) {
+			return "", ErrInvalidInput
+		}
+		if _, duplicate := seenApps[ordered[index].AppID]; duplicate {
+			return "", ErrInvalidInput
+		}
+		if _, duplicate := seenAllocations[ordered[index].AllocationID]; duplicate {
+			return "", ErrInvalidInput
+		}
+		if _, duplicate := seenPorts[ordered[index].Port]; duplicate {
+			return "", ErrInvalidInput
+		}
+		seenApps[ordered[index].AppID] = struct{}{}
+		seenAllocations[ordered[index].AllocationID] = struct{}{}
+		seenPorts[ordered[index].Port] = struct{}{}
+		ordered[index].EntryDigest = digest
+	}
+	return digestJSON(struct {
+		Version int                        `json:"version"`
+		Action  ApprovalAction             `json:"action"`
+		Entries []GatewayRebindRosterEntry `json:"entries"`
+	}{Version: 1, Action: ActionRebindGateway, Entries: ordered})
 }
 
 func validGatewayProfileUpgradeState(value GatewayProfileUpgradeState) bool {
