@@ -534,6 +534,14 @@ func liveGatewayV2LogOperationDiagnostic(t *testing.T, fixture *liveGatewayV2Fix
 		proof.v1StoppedRestartable, proof.v1RollbackReady, proof.finalContainerExact, proof.finalIngressNetworkExact,
 		proof.finalApplicationNetworks, proof.finalConfigExact, proof.final404, proof.finalRoutes, proof.finalHostPublication,
 		proof.finalEndpointIdentity, proof.finalTopologyExact, finalLoopbackRoutes, selectedInterface)
+	if !proof.v1Base {
+		_, identityErr := gatewayV1ObservedIdentityDigest(observation)
+		preparation := gatewayUpgradePreparation{
+			OperationID: state.OperationID, Profile: state.Profile, LocalHostPort: journal.Source.LocalHostPort,
+		}
+		failures := liveGatewayV2SourceAttestationFailures(fixture.source, preparation, journal, observation, identityErr)
+		t.Logf("gateway-v2 v1 base diagnostic: failed_predicates=%s", strings.Join(failures, ","))
+	}
 	if journal.Phase == gatewayPhaseRolledBack {
 		liveGatewayV2LogRetirementDiagnostic(t, fixture, store, state, journal)
 	}
