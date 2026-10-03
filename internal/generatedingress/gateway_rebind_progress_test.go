@@ -2,6 +2,7 @@ package generatedingress
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
@@ -13,6 +14,30 @@ import (
 
 	"github.com/google/uuid"
 )
+
+type legacyGatewayRebindStageIntentV1 struct {
+	Identity                 gatewayRebindSuccessorIdentity      `json:"identity"`
+	ApprovedCaddyImageDigest string                              `json:"approvedCaddyImageDigest"`
+	ObservedDockerImageID    string                              `json:"observedDockerImageId"`
+	NetworkPlan              gatewayRebindSuccessorIntentNetwork `json:"networkPlan"`
+	NetworkPlanDigest        string                              `json:"networkPlanDigest"`
+	NetworkTopologyDigest    string                              `json:"networkTopologyDigest"`
+	Network                  *gatewayRebindStageNetworkBinding   `json:"network,omitempty"`
+}
+
+type legacyGatewayRebindProgressRecordV1 struct {
+	Version               int                               `json:"version"`
+	Purpose               string                            `json:"purpose"`
+	Generation            uint64                            `json:"generation"`
+	OperationID           string                            `json:"operationId"`
+	Sequence              uint64                            `json:"sequence"`
+	Phase                 gatewayRebindProgressPhase        `json:"phase"`
+	OccurredAt            string                            `json:"occurredAt"`
+	ProtectedIntentDigest string                            `json:"protectedIntentDigest"`
+	PreviousDigest        string                            `json:"previousDigest,omitempty"`
+	Stage                 *legacyGatewayRebindStageIntentV1 `json:"stage,omitempty"`
+	Digest                string                            `json:"digest"`
+}
 
 func gatewayRebindProgressFixture(t *testing.T) (gatewayRebindPredecessorFixture, gatewayRebindProtectedIntent) {
 	t.Helper()
@@ -42,6 +67,114 @@ func gatewayRebindProgressStageObservation(intent gatewayRebindProtectedIntent,
 		OccurredAt:            gatewayRebindProgressTimestamp(sequence),
 		ObservedDockerImageID: strings.Repeat("b", 64),
 		NetworkTopologyDigest: intent.NetworkObservationDigest,
+	}
+}
+
+func legacyGatewayRebindProgressRecord(value gatewayRebindProgressRecord) legacyGatewayRebindProgressRecordV1 {
+	legacy := legacyGatewayRebindProgressRecordV1{
+		Version: value.Version, Purpose: value.Purpose, Generation: value.Generation,
+		OperationID: value.OperationID, Sequence: value.Sequence, Phase: value.Phase,
+		OccurredAt: value.OccurredAt, ProtectedIntentDigest: value.ProtectedIntentDigest,
+		PreviousDigest: value.PreviousDigest, Digest: value.Digest,
+	}
+	if value.Stage != nil {
+		legacy.Stage = &legacyGatewayRebindStageIntentV1{
+			Identity: value.Stage.Identity, ApprovedCaddyImageDigest: value.Stage.ApprovedCaddyImageDigest,
+			ObservedDockerImageID: value.Stage.ObservedDockerImageID, NetworkPlan: value.Stage.NetworkPlan,
+			NetworkPlanDigest: value.Stage.NetworkPlanDigest, NetworkTopologyDigest: value.Stage.NetworkTopologyDigest,
+			Network: value.Stage.Network,
+		}
+	}
+	return legacy
+}
+
+func TestGatewayRebindProgressSequenceFourBindsExactConfigVolume(t *testing.T) {
+	fixture, intent := gatewayRebindProgressFixture(t)
+	first, err := newGatewayRebindSuccessorIntentProgress(intent, gatewayRebindProgressTimestamp(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newGatewayRebindStageIntentProgress(intent, first,
+		gatewayRebindProgressStageObservation(intent, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	networkOwnership, err := gatewayRebindStageNetworkOwnershipDigest(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := newGatewayRebindStageNetworkProgress(intent, second, strings.Repeat("a", 64),
+		networkOwnership, gatewayRebindProgressTimestamp(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	volumeOwnership, err := gatewayRebindStageConfigVolumeOwnershipDigest(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := gatewayRebindStageConfigVolumeBinding{
+		Name:       intent.Intent.Identity.ConfigVolume,
+		Mountpoint: "/var/lib/docker/volumes/" + intent.Intent.Identity.ConfigVolume + "/_data",
+		CreatedAt:  "2026-10-03T12:00:03Z", OwnershipDigest: volumeOwnership,
+	}
+	fourth, err := newGatewayRebindStageConfigVolumeProgress(intent, third, binding,
+		gatewayRebindProgressTimestamp(4))
+	if err != nil || !validGatewayRebindProgressRecord(fourth) || fourth.Stage == nil ||
+		fourth.Stage.ConfigVolume == nil || *fourth.Stage.ConfigVolume != binding {
+		t.Fatalf("sequence four=%#v error=%v", fourth, err)
+	}
+	stageWithoutConfig := *fourth.Stage
+	stageWithoutConfig.ConfigVolume = nil
+	if !reflect.DeepEqual(stageWithoutConfig, *third.Stage) {
+		t.Fatal("sequence four changed a sequence-three stage field")
+	}
+	for _, record := range []gatewayRebindProgressRecord{first, second, third, fourth} {
+		store, storeErr := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+			intent.Generation, intent.OperationID, record.Sequence)
+		if storeErr != nil || store.installExact(context.Background(), record) != nil {
+			t.Fatalf("install sequence %d: %v", record.Sequence, storeErr)
+		}
+	}
+	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.Progress) != 4 || !reflect.DeepEqual(history.Progress[3].Record, fourth) {
+		t.Fatalf("sequence-four history=%#v error=%v", history.Progress, err)
+	}
+}
+
+func TestGatewayRebindProgressOptionalConfigVolumePreservesSequenceOneThroughThreeBytesAndDigests(t *testing.T) {
+	_, intent := gatewayRebindProgressFixture(t)
+	first, err := newGatewayRebindSuccessorIntentProgress(intent, gatewayRebindProgressTimestamp(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newGatewayRebindStageIntentProgress(intent, first,
+		gatewayRebindProgressStageObservation(intent, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownership, err := gatewayRebindStageNetworkOwnershipDigest(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := newGatewayRebindStageNetworkProgress(intent, second, strings.Repeat("a", 64),
+		ownership, gatewayRebindProgressTimestamp(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []gatewayRebindProgressRecord{first, second, third} {
+		actualBytes, marshalErr := json.Marshal(record)
+		legacy := legacyGatewayRebindProgressRecord(record)
+		legacyBytes, legacyErr := json.Marshal(legacy)
+		if marshalErr != nil || legacyErr != nil || !reflect.DeepEqual(actualBytes, legacyBytes) {
+			t.Fatalf("sequence %d bytes changed: actual=%s legacy=%s errors=%v/%v",
+				record.Sequence, actualBytes, legacyBytes, marshalErr, legacyErr)
+		}
+		legacy.Digest = ""
+		legacyDigest, digestErr := canonicalDigest(legacy)
+		if digestErr != nil || legacyDigest != record.Digest {
+			t.Fatalf("sequence %d digest changed: actual=%s legacy=%s error=%v",
+				record.Sequence, record.Digest, legacyDigest, digestErr)
+		}
 	}
 }
 
