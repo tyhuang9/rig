@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -533,6 +534,88 @@ func liveGatewayV2LogOperationDiagnostic(t *testing.T, fixture *liveGatewayV2Fix
 		proof.v1StoppedRestartable, proof.v1RollbackReady, proof.finalContainerExact, proof.finalIngressNetworkExact,
 		proof.finalApplicationNetworks, proof.finalConfigExact, proof.final404, proof.finalRoutes, proof.finalHostPublication,
 		proof.finalEndpointIdentity, proof.finalTopologyExact, finalLoopbackRoutes, selectedInterface)
+	if journal.Phase == gatewayPhaseRolledBack {
+		liveGatewayV2LogRetirementDiagnostic(t, fixture, store, state, journal)
+	}
+}
+
+func liveGatewayV2LogRetirementDiagnostic(t *testing.T, fixture *liveGatewayV2Fixture, store *gatewayUpgradeStateStore,
+	state gatewayV2RouteState, journal gatewayMigrationJournal,
+) {
+	t.Helper()
+	_, receiptErr := store.loadRollbackRetirementReceipt(state, journal)
+	receiptInstalled := receiptErr == nil
+	selectionMatches := fixture.ingress.gatewayV2RollbackRetirementSelectionMatches(store, state, journal, receiptInstalled)
+	source, err := fixture.ingress.store.load()
+	if err != nil {
+		t.Logf("gateway-v2 retirement diagnostic: source_available=false receipt_installed=%t selection_matches=%t",
+			receiptInstalled, selectionMatches)
+		return
+	}
+	proofState, proofJournal, err := gatewayV2CurrentV1RetirementBindings(source, state, journal)
+	if err != nil {
+		t.Logf("gateway-v2 retirement diagnostic: bindings_valid=false receipt_installed=%t selection_matches=%t",
+			receiptInstalled, selectionMatches)
+		return
+	}
+	observed, err := fixture.ingress.inspectGatewayV2Docker(fixture.ctx, source, proofState, proofJournal)
+	if err != nil {
+		clearGatewayV2DockerObservation(&observed)
+		t.Logf("gateway-v2 retirement diagnostic: snapshot_available=false receipt_installed=%t selection_matches=%t",
+			receiptInstalled, selectionMatches)
+		return
+	}
+	defer clearGatewayV2DockerObservation(&observed)
+	identityDigest, identityErr := gatewayV1ObservedIdentityDigest(observed)
+	proofJournal.Source.IdentityDigest = identityDigest
+	_, accepted := classifyGatewayV2RollbackRetirement(source, proofState, proofJournal, observed)
+	failures := make([]string, 0, 16)
+	add := func(name string, valid bool) {
+		if !valid {
+			failures = append(failures, name)
+		}
+	}
+	add("v1_identity", identityErr == nil)
+	add("topology_inputs", validGatewayTopologyInputs(source, proofState, proofJournal))
+	add("pinned_image", validGatewayPinnedImage(observed.Image, observed.ImageFound))
+	add("journal_resources", gatewayV2ObservedResourcesMatchJournal(proofJournal, observed))
+	add("v1_base", validGatewayV1Base(source, proofJournal, observed, true))
+	add("v1_stability", observed.V1Stable && observed.V1ResourcesStable && observed.V1EndpointIdentityProven &&
+		observed.V1Container.Running && !observed.V1Container.Restarting)
+	add("v2_stability", observed.V2ResourcesStable && observed.StageStable && observed.FinalStable && observed.OwnedInventoriesStable)
+	add("v2_container_absence", !observed.StageContainerFound && !observed.FinalContainerFound && len(observed.OwnedContainers) == 0)
+	add("application_network_absence", len(observed.ApplicationNetworks) == 0 && len(observed.ApplicationNetworkIDs) == 0)
+	if observed.IngressFound {
+		add("idle_ingress_identity", validContainerID(observed.IngressNetworkID) &&
+			normalizeID(observed.IngressNetworkID) == proofJournal.Resources.IngressNetworkID &&
+			validGatewayV2IngressNetwork(proofState, proofJournal, observed.IngressNetwork, true, "", ""))
+	}
+	if observed.ConfigVolumeFound {
+		add("config_volume_identity", validGatewayV2RetirementVolume(proofState, proofJournal,
+			observed.ConfigVolume, observed.ConfigVolumeIdentity, gatewayV2ConfigVolumeRole))
+	}
+	if observed.DataVolumeFound {
+		add("data_volume_identity", validGatewayV2RetirementVolume(proofState, proofJournal,
+			observed.DataVolume, observed.DataVolumeIdentity, gatewayV2DataVolumeRole))
+	}
+	wantNetworks := []string{}
+	if observed.IngressFound {
+		wantNetworks = append(wantNetworks, proofState.Identity.IngressNetwork)
+	}
+	add("owned_network_inventory", validOwnedNameSet(observed.OwnedNetworks, wantNetworks...))
+	wantVolumes := []string{}
+	if observed.ConfigVolumeFound {
+		wantVolumes = append(wantVolumes, proofState.Identity.ConfigVolume)
+	}
+	if observed.DataVolumeFound {
+		wantVolumes = append(wantVolumes, proofState.Identity.DataVolume)
+	}
+	add("owned_volume_inventory", validOwnedNameSet(observed.OwnedVolumes, wantVolumes...))
+	if !accepted && len(failures) == 0 {
+		failures = append(failures, "aggregate_classifier")
+	}
+	t.Logf("gateway-v2 retirement diagnostic: receipt_installed=%t selection_matches=%t classifier_accepted=%t failed_predicates=%s",
+		receiptInstalled, selectionMatches, accepted, strings.Join(failures, ","))
 }
 
 func TestGatewayV2OperationProofDiagnosticDistinguishesStageAndFinal(t *testing.T) {
@@ -826,9 +909,52 @@ func liveGatewayV2InstallOperationTrace(fixture *liveGatewayV2Fixture) *liveGate
 		gatewayV2UpgradeDriver: managerGatewayV2UpgradeDriver{manager: fixture.ingress}, manager: fixture.ingress, trace: trace,
 	}
 	fixture.ingress.gatewayV2TransferDriver = liveGatewayV2TracingTransferDriver{
-		gatewayV2TransferDriver: managerGatewayV2TransferDriver{manager: fixture.ingress}, trace: trace,
+		gatewayV2TransferDriver: managerGatewayV2TransferDriver{manager: fixture.ingress}, manager: fixture.ingress, trace: trace,
+	}
+	fixture.ingress.gatewayV2CoordinatorDriver = liveGatewayV2TracingCoordinatorDriver{
+		managerGatewayV2CoordinatorDriver: managerGatewayV2CoordinatorDriver{manager: fixture.ingress}, trace: trace,
 	}
 	return trace
+}
+
+type liveGatewayV2TracingCoordinatorDriver struct {
+	managerGatewayV2CoordinatorDriver
+	trace *liveGatewayV2OperationTrace
+}
+
+func (d liveGatewayV2TracingCoordinatorDriver) observeRollbackRetirement(ctx context.Context, source routeState,
+	state gatewayV2RouteState, journal gatewayMigrationJournal,
+) (gatewayV2RollbackRetirementObservation, error) {
+	observed, err := d.managerGatewayV2CoordinatorDriver.observeRollbackRetirement(ctx, source, state, journal)
+	outcome := liveGatewayV2TraceOutcome("observation_error")
+	if err == nil {
+		outcome = liveGatewayV2TraceOutcome(fmt.Sprintf("network_%t_config_%t_data_%t",
+			observed.IngressNetworkPresent, observed.ConfigVolumePresent, observed.DataVolumePresent))
+	}
+	d.trace.recordAt("retirement_observe", journal.Phase, outcome)
+	return observed, err
+}
+
+func (d liveGatewayV2TracingCoordinatorDriver) removeRollbackIngressNetwork(ctx context.Context,
+	state gatewayV2RouteState, journal gatewayMigrationJournal,
+) error {
+	err := d.managerGatewayV2CoordinatorDriver.removeRollbackIngressNetwork(ctx, state, journal)
+	d.trace.recordAt("retirement_remove_network", journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
+}
+
+func (d liveGatewayV2TracingCoordinatorDriver) removeRollbackVolume(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal, role string,
+) error {
+	err := d.managerGatewayV2CoordinatorDriver.removeRollbackVolume(ctx, state, journal, role)
+	step := liveGatewayV2TraceStep("retirement_remove_unknown_volume")
+	if role == gatewayV2ConfigVolumeRole {
+		step = "retirement_remove_config_volume"
+	} else if role == gatewayV2DataVolumeRole {
+		step = "retirement_remove_data_volume"
+	}
+	d.trace.recordAt(step, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	return err
 }
 
 func (r *liveGatewayV2OperationTrace) recordAt(step liveGatewayV2TraceStep, phase gatewayMigrationPhase,
@@ -1772,7 +1898,8 @@ func (d liveGatewayV2TracingUpgradeDriver) removeStage(ctx context.Context, stat
 
 type liveGatewayV2TracingTransferDriver struct {
 	gatewayV2TransferDriver
-	trace *liveGatewayV2OperationTrace
+	manager *Manager
+	trace   *liveGatewayV2OperationTrace
 }
 
 func (d liveGatewayV2TracingTransferDriver) observeTopology(ctx context.Context, source routeState, state gatewayV2RouteState,
@@ -1858,8 +1985,34 @@ func (d liveGatewayV2TracingTransferDriver) createFinal(ctx context.Context, sta
 func (d liveGatewayV2TracingTransferDriver) stopV1(ctx context.Context, source routeState, state gatewayV2RouteState,
 	journal gatewayMigrationJournal,
 ) error {
+	if d.manager != nil {
+		_, recovery, inspectErr := (managerGatewayV2TransferDriver{manager: d.manager}).attestV1Mutation(ctx, source, state, journal)
+		outcome := liveGatewayV2ErrorOutcome(inspectErr)
+		if inspectErr == nil {
+			outcome = liveGatewayV2RecoveryOutcome(recovery)
+		}
+		d.trace.recordAt("transfer_stop_v1_preflight", journal.Phase, outcome)
+	}
 	err := d.gatewayV2TransferDriver.stopV1(ctx, source, state, journal)
 	d.trace.recordAt(liveGatewayV2TraceTransferStopV1, journal.Phase, liveGatewayV2ErrorOutcome(err))
+	if err != nil && d.manager != nil {
+		var ingressErr *Error
+		if errors.As(err, &ingressErr) {
+			d.trace.recordAt("transfer_stop_v1_error_code", journal.Phase, liveGatewayV2TraceOutcome(ingressErr.Code))
+		}
+		container, _, found, inspectErr := d.manager.inspectNamedGatewayContainer(ctx, caddyContainerName)
+		outcome := liveGatewayV2ErrorOutcome(inspectErr)
+		if inspectErr == nil && !found {
+			outcome = "v1_missing"
+		} else if inspectErr == nil && container.Restarting {
+			outcome = "v1_restarting"
+		} else if inspectErr == nil && container.Running {
+			outcome = "v1_running"
+		} else if inspectErr == nil {
+			outcome = "v1_stopped"
+		}
+		d.trace.recordAt("transfer_stop_v1_after", journal.Phase, outcome)
+	}
 	return err
 }
 
