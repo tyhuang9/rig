@@ -1016,3 +1016,59 @@ acceptance evidence rather than claimed successes. This gate does not cover a
 physical second device or the browser-to-application-owned external database
 journey, so those M3 acceptance items remain open. No managed database or Neon
 provisioning is introduced.
+
+## Two-app private-interface LAN gate: local test-only evidence
+
+The next test-only branch adds `TestLiveControllerTwoAppLANJourney` and a
+dedicated Ubuntu Docker pull-request workflow. On a disposable Linux runner it
+uses the production controller handler and generated runtime with real
+application, deployment, ingress and `appaccess` SQLite stores. It creates two
+applications from one controlled immutable source archive, saves distinct
+runtime and public build markers, deploys both through authenticated controller
+jobs, then approves the selected private interface and gateway v2 upgrade
+through the administrator API. It reserves, approves and grants one durable LAN
+allocation per app through that API; it does not manufacture a grant lease.
+
+The live assertions require distinct assigned ports, correct Host routing for
+each marker and built SPA asset, a third unassigned port and wrong Hosts to
+return 404, and an independent Docker client on its own bridge to reach the two
+LAN ports while failing to reach the controller's loopback-only admin listener.
+The test changes A's configuration and redeploys A, then requires B's original
+container IDs, marker and note to remain stable. Both administrator LAN reads
+must bind verified URLs to committed claims. A newly composed production
+manager, separately opened SQLite handle, and controller must reattest the
+gateway and both app access reads.
+Preflight rejects preexisting managed Docker resources. Cleanup inspects exact
+application, operation, role and identity labels before deleting; uncertain
+resources are retained and fail the test. The workflow separately rejects a
+missing, skipped or failed live test event and checks for leaked Docker
+resources.
+
+The staged HTTP API is a deliberately small in-memory fixture so the committed
+frontend can render and save a note. This gate does not use the external
+PostgreSQL/HTTPS fixture from the M2 journey, and does not prove a browser,
+WebSocket, upload, real second device, interface drift, or process restart.
+Those remain separate acceptance work. The real hosted Docker test has not run
+on this Windows workstation; the workflow remains unpublished in this local
+branch. No LAN listener was started here.
+
+| Local check | Observed result |
+| --- | --- |
+| `go test -tags=live_docker -count=1 ./cmd/hostd -run '^TestControllerJourneyStageSource$'` | Passed; compiles the new live test and runs the existing staged-source check. The live flag was not set. |
+| `go test -count=1 -p 1 ./...` | Passed across all Go packages with normal host permissions. Untagged suites exclude the new live test. |
+| `go vet ./...` and `go vet -tags=live_docker ./cmd/hostd` | Passed. |
+| `go run ./cmd/openapi-gen -check` | Passed. |
+| `node --check` on both JavaScript strings extracted from the new Go test | Passed. |
+| `gofmt` and `git diff --check` | Passed. |
+
+The first sandboxed Go invocation could not write the default Go cache; the
+tagged compile was rerun with a task-local cache and the full checks used the
+normal host cache. These successful local commands are compile and deterministic
+test evidence only. CI must still run the real Docker gate before the two-app
+LAN routing and cleanup assertions can be claimed as observed.
+
+The independent namespace client also requires selected-interface port 8080
+to deny both applications' controller-local Hosts, requires those Hosts to
+return 404 on both assigned LAN ports, and requires the controller's LAN
+gateway profile path to return 404 on both app ports. The workflow checks for
+leftover v2 stage containers by name even if their labels are missing.

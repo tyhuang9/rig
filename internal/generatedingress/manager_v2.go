@@ -172,7 +172,7 @@ func (m *Manager) preflightCommittedV2Candidate(ctx context.Context, state gatew
 	}
 	confirmedFinal, confirmedRuntime, confirmedFound, err := m.inspectNamedGatewayContainer(ctx, state.Identity.FinalContainer)
 	if err != nil || !validCommittedV2FinalContainer(state, journal, confirmedFinal, confirmedRuntime, confirmedFound, image.ID) ||
-		!reflect.DeepEqual(final, confirmedFinal) || !reflect.DeepEqual(runtime, confirmedRuntime) {
+		!stableGatewayV2ContainerMounts(final, confirmedFinal, runtime, confirmedRuntime, state.Identity) {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
 	return nil
@@ -320,7 +320,7 @@ func (m *Manager) observeCommittedV2Locked(ctx context.Context, state gatewayV2R
 
 func (m *Manager) applyCommittedV2Routes(ctx context.Context, state gatewayV2RouteState, finalContainerID, filename string) error {
 	if !validGatewayV2RouteState(state) || state.Pending != nil || state.LANRecovery != nil ||
-		!validSHA256(finalContainerID) || !validConfigFilename(filename) {
+		!validSHA256(finalContainerID) || !validGatewayV2ConfigFilename(filename) {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
 	probeToken, err := gatewayV2HostChallenge(state)
@@ -358,7 +358,7 @@ func (m *Manager) copyGatewayV2Config(ctx context.Context, containerID string, c
 	if !validSHA256(containerID) {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
-	if len(contents) == 0 || len(contents) > gatewayV2MaxConfigBytes || !validConfigFilename(filename) {
+	if len(contents) == 0 || len(contents) > gatewayV2MaxConfigBytes || !validGatewayV2ConfigFilename(filename) {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
 	workingDirectoryGuard, ok := m.acquireWorkingDirectoryGuard()
@@ -393,4 +393,22 @@ func (m *Manager) copyGatewayV2Config(ctx context.Context, containerID string, c
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
 	return nil
+}
+
+// LAN grant, disable, and recovery operations use distinct fixed names so a
+// copied candidate cannot be confused with the active or another operation's
+// config. Keep the older config-copy allowlist unchanged for v1 callers.
+func validGatewayV2ConfigFilename(filename string) bool {
+	if validConfigFilename(filename) {
+		return true
+	}
+	switch filename {
+	case "lan-grant.json", "lan-grant-rollback.json", "lan-grant-recovery.json",
+		"lan-grant-commit-recovery.json", "lan-grant-quarantine.json",
+		"lan-disable.json", "lan-disable-recovery.json", "lan-disable-startup.json",
+		"lan-recovery-batch.json":
+		return true
+	default:
+		return false
+	}
 }

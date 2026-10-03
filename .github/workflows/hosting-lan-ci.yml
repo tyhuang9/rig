@@ -1,0 +1,87 @@
+name: Hosted two-app LAN CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+  GOFLAGS: -mod=readonly
+  GOTOOLCHAIN: local
+
+jobs:
+  two-app-lan:
+    name: Authenticated two-app LAN routing and redeploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    steps:
+      - name: Check out source
+        timeout-minutes: 2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        timeout-minutes: 3
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Record hosted Docker versions
+        timeout-minutes: 1
+        run: |
+          docker version --format 'Docker CLI={{.Client.Version}} Engine={{.Server.Version}} API={{.Server.APIVersion}}'
+          docker buildx version
+
+      - name: Exercise two deployed apps through private-interface LAN ports
+        timeout-minutes: 72
+        shell: bash
+        env:
+          RIG_RUN_LIVE_TWO_APP_LAN: "1"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          test_name='TestLiveControllerTwoAppLANJourney'
+          package_name='github.com/hostd/hostd/cmd/hostd'
+          go test -tags=live_docker -json -v -count=1 -timeout=66m ./cmd/hostd -run "^${test_name}$" | tee "$output"
+          jq -se --arg package_name "$package_name" --arg test_name "$test_name" '
+            [.[] | select(.Package == $package_name and .Test == $test_name)] |
+            ([.[] | select(.Action == "pass")] | length) == 1 and
+            ([.[] | select(.Action == "fail" or .Action == "skip")] | length) == 0
+          ' "$output" > /dev/null
+
+      - name: Require complete Docker cleanup
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          containers="$(docker ps --all --filter label=io.rig.managed --format '{{.ID}} {{.Names}} {{.Status}}')"
+          networks="$(docker network ls --filter label=io.rig.managed --format '{{.ID}} {{.Name}}')"
+          volumes="$(docker volume ls --filter label=io.rig.managed --format '{{.Name}}')"
+          images="$(docker image ls --filter label=io.rig.managed=generated-image --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
+          builders="$(docker ps --all --filter label=rig.controller=generated-builder --format '{{.ID}} {{.Names}}')"
+          builder_networks="$(docker network ls --filter label=rig.controller=generated-builder --format '{{.ID}} {{.Name}}')"
+          stage_containers="$(docker ps --all --filter name=rig-generated-caddy-v2-stage- --format '{{.ID}} {{.Names}} {{.Status}}')"
+          exact_resources=''
+          for container in rig-generated-caddy-v1 rig-generated-caddy-v2; do
+            if docker container inspect "$container" >/dev/null 2>&1; then exact_resources+=" container:$container"; fi
+          done
+          for network in rig-generated-caddy-ingress-v1 rig-generated-caddy-ingress-v2 rig-lan-two-app-test-client; do
+            if docker network inspect "$network" >/dev/null 2>&1; then exact_resources+=" network:$network"; fi
+          done
+          for volume in rig-generated-caddy-config-v1 rig-generated-caddy-config-v2 rig-generated-caddy-data-v2; do
+            if docker volume inspect "$volume" >/dev/null 2>&1; then exact_resources+=" volume:$volume"; fi
+          done
+          if [[ -n "$containers" || -n "$networks" || -n "$volumes" || -n "$images" || -n "$builders" || -n "$builder_networks" || -n "$stage_containers" || -n "$exact_resources" ]]; then
+            printf 'Two-app LAN gate left Docker resources behind.\n' >&2
+            exit 1
+          fi

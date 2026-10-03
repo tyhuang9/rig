@@ -23,6 +23,52 @@ func newCommittedV2Runner() *committedV2Runner {
 	return &committedV2Runner{containerID: upgradeResourceID('e'), files: make(map[string][]byte)}
 }
 
+func TestCommittedV2LANConfigFilenamesReachExactContainer(t *testing.T) {
+	manager, _ := newManagerFixture(t, false)
+	installCommittedV2Pair(t, manager)
+	runner := newCommittedV2Runner()
+	manager.runner = runner
+	store, err := newGatewayUpgradeStateStore(manager.options.DataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := store.loadBoundUpgrade("55555555-5555-4555-8555-555555555555")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, filename := range []string{
+		"lan-grant.json", "lan-grant-rollback.json", "lan-grant-recovery.json",
+		"lan-grant-commit-recovery.json", "lan-grant-quarantine.json",
+		"lan-disable.json", "lan-disable-recovery.json", "lan-disable-startup.json",
+		"lan-recovery-batch.json",
+	} {
+		t.Run(filename, func(t *testing.T) {
+			if err := manager.applyCommittedV2Routes(context.Background(), state, runner.containerID, filename); err != nil {
+				t.Fatalf("fixed LAN config name was rejected: %v", err)
+			}
+			if _, ok := runner.files[runner.containerID+":/config/"+filename]; !ok {
+				t.Fatal("exact bound container did not receive the candidate config")
+			}
+			if _, ok := runner.files[runner.containerID+":/config/"+state.Identity.ActiveConfigFilename]; !ok {
+				t.Fatal("exact bound container did not receive the active config")
+			}
+		})
+	}
+	if validConfigFilename("lan-grant.json") {
+		t.Fatal("v1 config copy accepted a LAN-only filename")
+	}
+	for _, filename := range []string{"", "custom.json", "../active.json", "lan-grant.json/.."} {
+		before := len(runner.commands)
+		if err := manager.applyCommittedV2Routes(context.Background(), state, runner.containerID, filename); !IsCode(err, DiagnosticRouteInvalid) {
+			t.Fatalf("unlisted config filename %q: %v", filename, err)
+		}
+		if len(runner.commands) != before {
+			t.Fatalf("unlisted config filename %q reached Docker", filename)
+		}
+	}
+}
+
 func (r *committedV2Runner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
 	args := append([]string(nil), request.Args...)
 	r.commands = append(r.commands, args)
