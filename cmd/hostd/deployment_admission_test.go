@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -48,6 +49,48 @@ func TestDeploymentEffectsAdmissionReleasesLockWhenFenceReadFails(t *testing.T) 
 		t.Fatalf("failed fence retained deployment effects lock: %v", err)
 	}
 	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeploymentEffectsAdmissionContentionAndRelease(t *testing.T) {
+	root := t.TempDir()
+	directories, err := docker.PrepareControllerDirectories(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := database.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	admit, err := deploymentEffectsAdmission(db, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := admit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = release() })
+
+	blockedContext, cancelBlocked := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	blockedRelease, blockedErr := admit(blockedContext)
+	cancelBlocked()
+	if !errors.Is(blockedErr, context.DeadlineExceeded) || blockedRelease != nil {
+		t.Fatalf("contended admission release=%t error=%v", blockedRelease != nil, blockedErr)
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+
+	reacquireContext, cancelReacquire := context.WithTimeout(context.Background(), time.Second)
+	reacquiredRelease, err := admit(reacquireContext)
+	cancelReacquire()
+	if err != nil {
+		t.Fatalf("admission remained locked after release: %v", err)
+	}
+	if err := reacquiredRelease(); err != nil {
 		t.Fatal(err)
 	}
 }
