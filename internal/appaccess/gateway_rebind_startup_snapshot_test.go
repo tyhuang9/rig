@@ -288,6 +288,10 @@ func newGatewayRebindFixture(t *testing.T, insertRoster bool) gatewayRebindFixtu
 }
 
 func newGatewayRebindFixtureOnDB(t *testing.T, db *sql.DB, insertRoster bool) gatewayRebindFixture {
+	return newGatewayRebindFixtureOnDBWithClaim(t, db, insertRoster, true)
+}
+
+func newGatewayRebindFixtureOnDBWithClaim(t *testing.T, db *sql.DB, insertRoster, insertClaim bool) gatewayRebindFixture {
 	t.Helper()
 	ctx := context.Background()
 	repository := testRepository(db)
@@ -410,8 +414,10 @@ func newGatewayRebindFixtureOnDB(t *testing.T, db *sql.DB, insertRoster bool) ga
 		SuccessorProfileRequestDigest: successorRequestDigest, State: GatewayRebindPrepared,
 		StateSequence: 1, CreatedAt: claimTime, UpdatedAt: claimTime,
 	}
-	insertGatewayRebindClaim(t, db, claim)
-	if insertRoster {
+	if insertClaim {
+		insertGatewayRebindClaim(t, db, claim)
+	}
+	if insertClaim && insertRoster {
 		insertGatewayRebindRosterEntry(t, db, entry)
 	}
 	return gatewayRebindFixture{

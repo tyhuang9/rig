@@ -30,6 +30,7 @@ type gatewayRebindPredecessorFixture struct {
 	runner     *ingressRunner
 	state      gatewayV2RouteState
 	journal    gatewayMigrationJournal
+	proposal   appaccess.GatewayRebindPreclaimProposal
 }
 
 func TestInspectGatewayRebindPredecessorAcceptsExactReadOnlyPair(t *testing.T) {
@@ -251,6 +252,10 @@ func cloneGatewayRebindStartupSnapshot(value appaccess.GatewayRebindStartupSnaps
 }
 
 func newGatewayRebindPredecessorFixture(t *testing.T) gatewayRebindPredecessorFixture {
+	return newGatewayRebindPredecessorFixtureWithClaim(t, true)
+}
+
+func newGatewayRebindPredecessorFixtureWithClaim(t *testing.T, insertClaim bool) gatewayRebindPredecessorFixture {
 	t.Helper()
 	manager, runner := newManagerFixture(t, false)
 	db, err := database.Open(manager.options.DataRoot)
@@ -503,8 +508,10 @@ func newGatewayRebindPredecessorFixture(t *testing.T) gatewayRebindPredecessorFi
 		Rebind    appaccess.Approval          `json:"rebindApproval"`
 		Configure appaccess.Approval          `json:"configureApproval"`
 	}{rebindSpec, rebindApproval, configureApproval})
-	insertGatewayRebindPredecessorClaim(t, db, claim)
-	insertGatewayRebindPredecessorRoster(t, db, entry)
+	if insertClaim {
+		insertGatewayRebindPredecessorClaim(t, db, claim)
+		insertGatewayRebindPredecessorRoster(t, db, entry)
+	}
 
 	loadedState, loadedJournal, err := store.loadBoundUpgrade(upgrade.OperationID)
 	if err != nil {
@@ -513,6 +520,10 @@ func newGatewayRebindPredecessorFixture(t *testing.T) gatewayRebindPredecessorFi
 	return gatewayRebindPredecessorFixture{
 		manager: manager, store: store, repository: repository, db: db, runner: runner,
 		state: loadedState, journal: loadedJournal,
+		proposal: appaccess.GatewayRebindPreclaimProposal{
+			Spec: rebindSpec, RebindApproval: rebindApproval,
+			ConfigureApproval: configureApproval, Roster: []appaccess.GatewayRebindRosterEntry{entry},
+		},
 	}
 }
 
