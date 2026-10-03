@@ -1,7 +1,8 @@
 package generatedingress
 
 // validGatewayRebindPredecessorDocker proves ownership of the committed v2
-// predecessor without claiming its historical host address is reachable. A
+// predecessor's static ownership and configuration without claiming its
+// historical host address or application routes are reachable. A
 // Docker restart may leave the exact final container stopped when its old bind
 // address has disappeared; that state remains identifiable for a guarded
 // stop-by-ID cutover. Neither state authorizes a successor effect on its own.
@@ -34,5 +35,5 @@ func validGatewayRebindPredecessorDocker(source routeState, state gatewayV2Route
 		validGatewayV2RunningApplicationNetworkIDs(state, observation.FinalRuntime, observation.ApplicationNetworkIDs) &&
 		validGatewayV2ApplicationNetworks(state, observation.FinalContainer, observation.ApplicationNetworks, observation.ApplicationNetworkIDs) &&
 		validGatewayV2FinalConfig(state, observation.FinalConfig, observation.FinalRestartConfig) &&
-		observation.Final404Proven && observation.FinalRoutesProven && observation.FinalEndpointIdentityProven
+		observation.FinalEndpointIdentityProven
 }

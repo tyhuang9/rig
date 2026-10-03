@@ -16,6 +16,8 @@ func gatewayRebindDockerTestObservation(t *testing.T) (routeState, gatewayV2Rout
 	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
 	// The old LAN address is deliberately unverified during rebind admission.
 	observation.FinalHostPublicationProven = false
+	observation.Final404Proven = false
+	observation.FinalRoutesProven = false
 	return source, state, journal, observation
 }
 
@@ -96,8 +98,8 @@ func TestGatewayRebindDockerRejectsOwnershipAndInventoryDrift(t *testing.T) {
 				}
 			}
 		}},
-		{"route proof failed", func(_ *gatewayMigrationJournal, value *gatewayV2DockerObservation) {
-			value.FinalRoutesProven = false
+		{"route config changed", func(_ *gatewayMigrationJournal, value *gatewayV2DockerObservation) {
+			value.FinalConfig = []byte("wrong route config")
 		}},
 		{"running restart count", func(_ *gatewayMigrationJournal, value *gatewayV2DockerObservation) {
 			value.FinalRuntime.RestartCount = 1
@@ -151,6 +153,8 @@ func gatewayRebindFixtureDockerObservation(t *testing.T, fixture gatewayRebindPr
 		CreatedAt:  "2026-09-29T12:00:00Z",
 	}
 	observation.FinalHostPublicationProven = false
+	observation.Final404Proven = false
+	observation.FinalRoutesProven = false
 	if !validGatewayRebindPredecessorDocker(source, fixture.state, fixture.journal, observation) {
 		t.Fatal("Docker fixture does not match protected predecessor")
 	}

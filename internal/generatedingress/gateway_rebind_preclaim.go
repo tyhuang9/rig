@@ -30,8 +30,9 @@ type gatewayRebindDockerInspector func(context.Context, routeState, gatewayV2Rou
 // InspectGatewayRebindPreclaimDockerPredecessor adds exact, journal-bound Docker
 // ownership to the zero-claim protected/SQLite proof. It deliberately skips
 // host publication probes: the predecessor LAN address may no longer exist.
-// This read-only result is advisory until repeated under the writer's effects
-// lease and claim-insert transaction.
+// It inspects static Docker/configuration identity without forwarding HTTP
+// requests to hosted apps. This advisory result must be repeated under the
+// writer's effects lease and claim-insert transaction.
 func (m *Manager) InspectGatewayRebindPreclaimDockerPredecessor(ctx context.Context,
 	repository *appaccess.Repository, proposal appaccess.GatewayRebindPreclaimProposal,
 ) error {
@@ -41,7 +42,17 @@ func (m *Manager) InspectGatewayRebindPreclaimDockerPredecessor(ctx context.Cont
 func (m *Manager) inspectGatewayRebindDocker(ctx context.Context, source routeState,
 	state gatewayV2RouteState, journal gatewayMigrationJournal,
 ) (gatewayV2DockerObservation, error) {
-	return m.inspectGatewayV2DockerWithStageConfig(ctx, source, state, journal, true, false)
+	return inspectGatewayRebindDockerWith(ctx, source, state, journal, m.inspectGatewayV2DockerWithStageConfig)
+}
+
+func inspectGatewayRebindDockerWith(ctx context.Context, source routeState, state gatewayV2RouteState,
+	journal gatewayMigrationJournal, inspect func(context.Context, routeState, gatewayV2RouteState,
+		gatewayMigrationJournal, bool, gatewayV2DockerProbePolicy) (gatewayV2DockerObservation, error),
+) (gatewayV2DockerObservation, error) {
+	if inspect == nil {
+		return gatewayV2DockerObservation{}, &Error{Code: DiagnosticValidationFailed}
+	}
+	return inspect(ctx, source, state, journal, true, gatewayV2DockerProbePassiveRebind)
 }
 
 func (m *Manager) inspectGatewayRebindPreclaimWithDocker(ctx context.Context,
