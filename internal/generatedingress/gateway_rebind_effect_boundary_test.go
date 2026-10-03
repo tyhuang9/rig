@@ -98,7 +98,7 @@ func installGatewayRebindEffectBoundaryProgress(t *testing.T, fixture gatewayReb
 	}
 	if count == 2 {
 		second, err := newGatewayRebindStageIntentProgress(fixture.intent, records[0],
-			gatewayRebindProgressStageObservation(2))
+			gatewayRebindProgressStageObservation(fixture.intent, 2))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -30,10 +30,12 @@ func (m *Manager) lockGateway(ctx context.Context) (func() error, error) {
 	return release, nil
 }
 
-// lockGatewayRaw is reserved for the journal-bound emergency-stop path and the
-// read-only rebind attestors. All ordinary observation and mutation
-// must call lockGateway so SQLite can fence an in-progress LAN gateway rebind
-// before any Docker inspection or effect.
+// lockGatewayRaw is reserved for the journal-bound emergency-stop path,
+// read-only rebind attestors, and the private prepared-claim rebind network
+// stage that holds the deployment-effects lease and freshly proves the SQL
+// fence under this lock. All ordinary observation and mutation must call
+// lockGateway so SQLite can fence an in-progress LAN gateway rebind before any
+// Docker inspection or effect.
 func (m *Manager) lockGatewayRaw(ctx context.Context) (func() error, error) {
 	if err := m.mu.LockContext(ctx); err != nil {
 		return nil, &Error{Code: DiagnosticCancelled}

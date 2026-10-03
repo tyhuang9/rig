@@ -35,11 +35,13 @@ func gatewayRebindProgressTimestamp(sequence uint64) time.Time {
 	return time.Date(2026, time.October, 3, 12, 0, int(sequence), 0, time.UTC)
 }
 
-func gatewayRebindProgressStageObservation(sequence uint64) gatewayRebindStageIntentObservation {
+func gatewayRebindProgressStageObservation(intent gatewayRebindProtectedIntent,
+	sequence uint64,
+) gatewayRebindStageIntentObservation {
 	return gatewayRebindStageIntentObservation{
 		OccurredAt:            gatewayRebindProgressTimestamp(sequence),
 		ObservedDockerImageID: strings.Repeat("b", 64),
-		NetworkTopologyDigest: strings.Repeat("c", 64),
+		NetworkTopologyDigest: intent.NetworkObservationDigest,
 	}
 }
 
@@ -70,7 +72,7 @@ func TestGatewayRebindProgressInstallsScansAndReplaysExactPreEffectRecords(t *te
 		t.Fatalf("first readback=%#v err=%v", loadedFirst, err)
 	}
 
-	second, err := newGatewayRebindStageIntentProgress(intent, first, gatewayRebindProgressStageObservation(2))
+	second, err := newGatewayRebindStageIntentProgress(intent, first, gatewayRebindProgressStageObservation(intent, 2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +138,7 @@ func TestGatewayRebindProgressRejectsMissingIntentInvalidOrderingAndCancellation
 		if err != nil {
 			t.Fatal(err)
 		}
-		second, err := newGatewayRebindStageIntentProgress(intent, first, gatewayRebindProgressStageObservation(2))
+		second, err := newGatewayRebindStageIntentProgress(intent, first, gatewayRebindProgressStageObservation(intent, 2))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -200,7 +202,7 @@ func TestGatewayRebindProgressRejectsInvalidStageObservation(t *testing.T) {
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			observation := gatewayRebindProgressStageObservation(2)
+			observation := gatewayRebindProgressStageObservation(intent, 2)
 			test.mutate(&observation)
 			value, err := newGatewayRebindStageIntentProgress(intent, first, observation)
 			if err == nil || !reflect.DeepEqual(value, gatewayRebindProgressRecord{}) {
@@ -269,7 +271,7 @@ func TestGatewayRebindProgressRejectsForgedBindingsBeforeAndDuringHistoryScan(t 
 		}, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			second, makeErr := newGatewayRebindStageIntentProgress(intent, first, gatewayRebindProgressStageObservation(2))
+			second, makeErr := newGatewayRebindStageIntentProgress(intent, first, gatewayRebindProgressStageObservation(intent, 2))
 			if makeErr != nil {
 				t.Fatal(makeErr)
 			}
@@ -302,6 +304,68 @@ func TestGatewayRebindProgressRejectsForgedBindingsBeforeAndDuringHistoryScan(t 
 }
 
 func TestGatewayRebindProgressHistoryRejectsNamespaceTamperingAndChanges(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*gatewayRebindStageIntent)
+	}{
+		{name: "sequence three image substitution", mutate: func(stage *gatewayRebindStageIntent) {
+			stage.ObservedDockerImageID = strings.Repeat("d", 64)
+		}},
+		{name: "sequence three topology substitution", mutate: func(stage *gatewayRebindStageIntent) {
+			stage.NetworkTopologyDigest = strings.Repeat("d", 64)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, intent := gatewayRebindProgressFixture(t)
+			first, err := newGatewayRebindSuccessorIntentProgress(intent, gatewayRebindProgressTimestamp(1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			firstStore, err := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+				intent.Generation, intent.OperationID, 1)
+			if err != nil || firstStore.installExact(context.Background(), first) != nil {
+				t.Fatalf("install sequence one: %v", err)
+			}
+			second, err := newGatewayRebindStageIntentProgress(intent, first,
+				gatewayRebindProgressStageObservation(intent, 2))
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondStore, err := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+				intent.Generation, intent.OperationID, 2)
+			if err != nil || secondStore.installExact(context.Background(), second) != nil {
+				t.Fatalf("install sequence two: %v", err)
+			}
+			ownership, err := gatewayRebindStageNetworkOwnershipDigest(intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			third, err := newGatewayRebindStageNetworkProgress(intent, second,
+				strings.Repeat("a", 64), ownership, gatewayRebindProgressTimestamp(3))
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(third.Stage)
+			third.Digest, err = gatewayRebindProgressDigest(third)
+			if err != nil || !validGatewayRebindProgressRecord(third) {
+				t.Fatalf("forged sequence three is not structurally valid: %v", err)
+			}
+			thirdStore, err := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+				intent.Generation, intent.OperationID, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := gatewayUpgradeStateStore{directory: thirdStore.directory}
+			if err := state.writeExact(thirdStore.path, thirdStore.purpose, third, false,
+				maxGatewayRebindProgressBytes); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil); err == nil {
+				t.Fatal("scanner accepted sequence three with a substituted sequence two stage field")
+			}
+		})
+	}
+
 	t.Run("persisted stage without successor sequence", func(t *testing.T) {
 		fixture, intent := gatewayRebindProgressFixture(t)
 		name, _ := gatewayRebindProgressName(intent.Generation, intent.OperationID, 2)
@@ -327,7 +391,7 @@ func TestGatewayRebindProgressHistoryRejectsNamespaceTamperingAndChanges(t *test
 		if err := firstStore.installExact(context.Background(), first); err != nil {
 			t.Fatal(err)
 		}
-		second, err := newGatewayRebindStageIntentProgress(intent, first, gatewayRebindProgressStageObservation(2))
+		second, err := newGatewayRebindStageIntentProgress(intent, first, gatewayRebindProgressStageObservation(intent, 2))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -338,13 +402,13 @@ func TestGatewayRebindProgressHistoryRejectsNamespaceTamperingAndChanges(t *test
 		if err := secondStore.installExact(context.Background(), second); err != nil {
 			t.Fatal(err)
 		}
-		name, _ := gatewayRebindProgressName(intent.Generation, intent.OperationID, 3)
+		name, _ := gatewayRebindProgressName(intent.Generation, intent.OperationID, 4)
 		if err := os.WriteFile(filepath.Join(fixture.manager.store.root, name), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil); err == nil ||
 			!strings.Contains(err.Error(), "sequence gap") {
-			t.Fatalf("unsupported third progress sequence was accepted: %v", err)
+			t.Fatalf("unsupported fourth progress sequence was accepted: %v", err)
 		}
 	})
 
@@ -376,7 +440,7 @@ func TestGatewayRebindProgressHistoryRejectsNamespaceTamperingAndChanges(t *test
 		if err := firstStore.installExact(context.Background(), first); err != nil {
 			t.Fatal(err)
 		}
-		second, err := newGatewayRebindStageIntentProgress(intent, first, gatewayRebindProgressStageObservation(2))
+		second, err := newGatewayRebindStageIntentProgress(intent, first, gatewayRebindProgressStageObservation(intent, 2))
 		if err != nil {
 			t.Fatal(err)
 		}
