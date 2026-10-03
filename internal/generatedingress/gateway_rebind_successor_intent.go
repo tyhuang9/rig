@@ -87,10 +87,26 @@ func newGatewayRebindInitialSuccessorIntent(snapshot appaccess.GatewayRebindStar
 	predecessor gatewayUpgradeGenerationSelection,
 	preflight GatewayRebindSuccessorPreflight,
 ) (gatewayRebindSuccessorIntent, error) {
+	if predecessor.Generation == math.MaxUint64 {
+		return gatewayRebindSuccessorIntent{}, errors.New("invalid initial gateway rebind successor intent input")
+	}
+	return newGatewayRebindInitialSuccessorIntentAtGeneration(snapshot, predecessor, preflight, predecessor.Generation+1)
+}
+
+// newGatewayRebindInitialSuccessorIntentAtGeneration retains the committed
+// fixed-name predecessor while allowing a strict history scanner to reserve a
+// later, globally unused successor generation. The protected writer must
+// supply that reservation; this constructor does not discover history.
+func newGatewayRebindInitialSuccessorIntentAtGeneration(snapshot appaccess.GatewayRebindStartupSnapshot,
+	predecessor gatewayUpgradeGenerationSelection,
+	preflight GatewayRebindSuccessorPreflight,
+	successorGeneration uint64,
+) (gatewayRebindSuccessorIntent, error) {
 	invalid := errors.New("invalid initial gateway rebind successor intent input")
 	state, journal := predecessor.State, predecessor.Journal
 	if predecessor.Store == nil || !predecessor.Existing || predecessor.PartialState ||
-		predecessor.Retired || predecessor.Aborted || predecessor.Generation == math.MaxUint64 ||
+		predecessor.Retired || predecessor.Aborted || successorGeneration == 0 ||
+		successorGeneration <= predecessor.Generation ||
 		predecessor.Store.generation != predecessor.Generation ||
 		predecessor.operationID != state.OperationID ||
 		(predecessor.Store.operationID != "" && predecessor.Store.operationID != state.OperationID) ||
@@ -188,7 +204,7 @@ func newGatewayRebindInitialSuccessorIntent(snapshot appaccess.GatewayRebindStar
 	if err != nil {
 		return gatewayRebindSuccessorIntent{}, invalid
 	}
-	identity, err := newGatewayRebindSuccessorIdentity(predecessor.Generation+1, spec.OperationID, profile)
+	identity, err := newGatewayRebindSuccessorIdentity(successorGeneration, spec.OperationID, profile)
 	if err != nil {
 		return gatewayRebindSuccessorIntent{}, invalid
 	}
@@ -229,6 +245,19 @@ func validGatewayRebindInitialSuccessorIntent(snapshot appaccess.GatewayRebindSt
 	predecessor gatewayUpgradeGenerationSelection,
 	preflight GatewayRebindSuccessorPreflight, candidate gatewayRebindSuccessorIntent,
 ) bool {
-	expected, err := newGatewayRebindInitialSuccessorIntent(snapshot, predecessor, preflight)
+	if predecessor.Generation == math.MaxUint64 {
+		return false
+	}
+	return validGatewayRebindInitialSuccessorIntentAtGeneration(
+		snapshot, predecessor, preflight, predecessor.Generation+1, candidate,
+	)
+}
+
+func validGatewayRebindInitialSuccessorIntentAtGeneration(snapshot appaccess.GatewayRebindStartupSnapshot,
+	predecessor gatewayUpgradeGenerationSelection,
+	preflight GatewayRebindSuccessorPreflight, successorGeneration uint64,
+	candidate gatewayRebindSuccessorIntent,
+) bool {
+	expected, err := newGatewayRebindInitialSuccessorIntentAtGeneration(snapshot, predecessor, preflight, successorGeneration)
 	return err == nil && reflect.DeepEqual(candidate, expected)
 }
