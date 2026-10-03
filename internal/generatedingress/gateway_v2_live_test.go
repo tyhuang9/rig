@@ -591,6 +591,7 @@ const (
 	liveGatewayV2TraceStageAttestStoppedCompensation liveGatewayV2TraceStep = "stage_attest_stopped_compensation"
 	liveGatewayV2TraceStageStart                     liveGatewayV2TraceStep = "stage_start"
 	liveGatewayV2TraceStageStartDetail               liveGatewayV2TraceStep = "stage_start_detail"
+	liveGatewayV2TraceStageStartFailureShape         liveGatewayV2TraceStep = "stage_start_failure_shape"
 	liveGatewayV2TraceStageStop                      liveGatewayV2TraceStep = "stage_stop"
 	liveGatewayV2TraceStageRemove                    liveGatewayV2TraceStep = "stage_remove"
 	liveGatewayV2TraceTransferObserveTopology        liveGatewayV2TraceStep = "transfer_observe_topology"
@@ -694,6 +695,23 @@ const (
 )
 
 const (
+	liveGatewayV2TraceStartShapeOCI           liveGatewayV2TraceOutcome = "start_shape_oci_runtime"
+	liveGatewayV2TraceStartShapeRunc          liveGatewayV2TraceOutcome = "start_shape_runc_create"
+	liveGatewayV2TraceStartShapeProcessInit   liveGatewayV2TraceOutcome = "start_shape_process_init"
+	liveGatewayV2TraceStartShapeMissingPath   liveGatewayV2TraceOutcome = "start_shape_missing_path"
+	liveGatewayV2TraceStartShapeNotDirectory  liveGatewayV2TraceOutcome = "start_shape_not_directory"
+	liveGatewayV2TraceStartShapeInvalidArg    liveGatewayV2TraceOutcome = "start_shape_invalid_argument"
+	liveGatewayV2TraceStartShapeReadOnly      liveGatewayV2TraceOutcome = "start_shape_read_only_filesystem"
+	liveGatewayV2TraceStartShapeResourceBusy  liveGatewayV2TraceOutcome = "start_shape_resource_unavailable"
+	liveGatewayV2TraceStartShapeNetwork       liveGatewayV2TraceOutcome = "start_shape_network_or_endpoint"
+	liveGatewayV2TraceStartShapePort          liveGatewayV2TraceOutcome = "start_shape_port_or_address"
+	liveGatewayV2TraceStartShapeExec          liveGatewayV2TraceOutcome = "start_shape_exec_or_executable"
+	liveGatewayV2TraceStartShapeMount         liveGatewayV2TraceOutcome = "start_shape_mount_or_rootfs"
+	liveGatewayV2TraceStartShapePermission    liveGatewayV2TraceOutcome = "start_shape_permission"
+	liveGatewayV2TraceStartShapeNoKnownDetail liveGatewayV2TraceOutcome = "start_shape_no_known_detail"
+)
+
+const (
 	liveGatewayV2TraceAttestInspectError               liveGatewayV2TraceOutcome = "attest_inspect_error"
 	liveGatewayV2TraceAttestUnclassified               liveGatewayV2TraceOutcome = "attest_unclassified_failure"
 	liveGatewayV2TraceAttestPhase                      liveGatewayV2TraceOutcome = "failed_predicate_attest_phase"
@@ -738,6 +756,8 @@ const (
 	liveGatewayV2TraceStabilityContainerIsolation       liveGatewayV2TraceOutcome = "stage_stability_container_isolation_changed"
 	liveGatewayV2TraceStabilityContainerResources       liveGatewayV2TraceOutcome = "stage_stability_container_resources_changed"
 	liveGatewayV2TraceStabilityContainerMounts          liveGatewayV2TraceOutcome = "stage_stability_container_mounts_changed"
+	liveGatewayV2TraceStabilityContainerMountOrderOnly  liveGatewayV2TraceOutcome = "stage_stability_container_mount_order_only"
+	liveGatewayV2TraceStabilityContainerMountContent    liveGatewayV2TraceOutcome = "stage_stability_container_mount_content_changed"
 	liveGatewayV2TraceStabilityContainerMemory          liveGatewayV2TraceOutcome = "stage_stability_container_memory_changed"
 	liveGatewayV2TraceStabilityContainerMemorySwap      liveGatewayV2TraceOutcome = "stage_stability_container_memory_swap_changed"
 	liveGatewayV2TraceStabilityContainerNanoCPUs        liveGatewayV2TraceOutcome = "stage_stability_container_nano_cpus_changed"
@@ -1285,6 +1305,10 @@ func liveGatewayV2StageInspectionChangeOutcomes(first, confirmed gatewayContaine
 			first.PIDsLimit == confirmed.PIDsLimit, reflect.DeepEqual(first.Ulimits, confirmed.Ulimits)),
 			liveGatewayV2TraceStabilityContainerResources},
 		liveGatewayV2TraceSelection{!reflect.DeepEqual(first.Mounts, confirmed.Mounts), liveGatewayV2TraceStabilityContainerMounts},
+		liveGatewayV2TraceSelection{!reflect.DeepEqual(first.Mounts, confirmed.Mounts) && len(first.Mounts) > 0 &&
+			liveGatewayV2SameMountMultiset(first.Mounts, confirmed.Mounts), liveGatewayV2TraceStabilityContainerMountOrderOnly},
+		liveGatewayV2TraceSelection{!reflect.DeepEqual(first.Mounts, confirmed.Mounts) &&
+			!liveGatewayV2SameMountMultiset(first.Mounts, confirmed.Mounts), liveGatewayV2TraceStabilityContainerMountContent},
 		liveGatewayV2TraceSelection{first.Memory != confirmed.Memory, liveGatewayV2TraceStabilityContainerMemory},
 		liveGatewayV2TraceSelection{first.MemorySwap != confirmed.MemorySwap, liveGatewayV2TraceStabilityContainerMemorySwap},
 		liveGatewayV2TraceSelection{first.NanoCPUs != confirmed.NanoCPUs, liveGatewayV2TraceStabilityContainerNanoCPUs},
@@ -1306,6 +1330,23 @@ func liveGatewayV2StageInspectionChangeOutcomes(first, confirmed gatewayContaine
 		liveGatewayV2TraceSelection{!reflect.DeepEqual(first.ConfiguredNetworks, confirmed.ConfiguredNetworks),
 			liveGatewayV2TraceStabilityRuntimeNetworks},
 	)
+}
+
+func liveGatewayV2SameMountMultiset(first, confirmed []mountInspection) bool {
+	if len(first) != len(confirmed) {
+		return false
+	}
+	counts := make(map[mountInspection]int, len(first))
+	for _, mount := range first {
+		counts[mount]++
+	}
+	for _, mount := range confirmed {
+		counts[mount]--
+		if counts[mount] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func liveGatewayV2RestartConfigFromArchive(value []byte, filename string) ([]byte, bool) {
@@ -1496,6 +1537,9 @@ func (d liveGatewayV2TracingUpgradeDriver) startStage(ctx context.Context, state
 		}
 	}
 	d.trace.recordAt(liveGatewayV2TraceStageStartDetail, journal.Phase, outcome)
+	for _, detail := range capture.details {
+		d.trace.recordAt(liveGatewayV2TraceStageStartFailureShape, journal.Phase, detail)
+	}
 	d.trace.recordAt(liveGatewayV2TraceStageStart, journal.Phase, liveGatewayV2ErrorOutcome(err))
 	return err
 }
@@ -1504,6 +1548,7 @@ type liveGatewayV2StartCaptureRunner struct {
 	inner   runtimeprocess.CommandRunner
 	called  bool
 	outcome liveGatewayV2TraceOutcome
+	details []liveGatewayV2TraceOutcome
 }
 
 func (r *liveGatewayV2StartCaptureRunner) Run(ctx context.Context,
@@ -1515,8 +1560,43 @@ func (r *liveGatewayV2StartCaptureRunner) Run(ctx context.Context,
 		r.outcome = liveGatewayV2TraceStartUnexpectedCommand
 	} else {
 		r.outcome = liveGatewayV2StartCommandOutcome(result, err)
+		r.details = liveGatewayV2StartFailureShapeOutcomes(result, err)
 	}
 	return result, err
+}
+
+func liveGatewayV2StartFailureShapeOutcomes(result runtimeprocess.CommandResult, err error) []liveGatewayV2TraceOutcome {
+	if err == nil || result.StdoutTruncated || result.StderrTruncated {
+		return nil
+	}
+	message := strings.ToLower(string(result.Stdout) + "\n" + string(result.Stderr))
+	contains := func(parts ...string) bool {
+		for _, part := range parts {
+			if strings.Contains(message, part) {
+				return true
+			}
+		}
+		return false
+	}
+	details := liveGatewayV2SelectedTraceOutcomes(
+		liveGatewayV2TraceSelection{contains("oci runtime"), liveGatewayV2TraceStartShapeOCI},
+		liveGatewayV2TraceSelection{contains("runc create"), liveGatewayV2TraceStartShapeRunc},
+		liveGatewayV2TraceSelection{contains("unable to start container process", "during container init"), liveGatewayV2TraceStartShapeProcessInit},
+		liveGatewayV2TraceSelection{contains("no such file or directory"), liveGatewayV2TraceStartShapeMissingPath},
+		liveGatewayV2TraceSelection{contains("not a directory"), liveGatewayV2TraceStartShapeNotDirectory},
+		liveGatewayV2TraceSelection{contains("invalid argument"), liveGatewayV2TraceStartShapeInvalidArg},
+		liveGatewayV2TraceSelection{contains("read-only file system"), liveGatewayV2TraceStartShapeReadOnly},
+		liveGatewayV2TraceSelection{contains("resource temporarily unavailable"), liveGatewayV2TraceStartShapeResourceBusy},
+		liveGatewayV2TraceSelection{contains("network", "endpoint"), liveGatewayV2TraceStartShapeNetwork},
+		liveGatewayV2TraceSelection{contains("port", "address"), liveGatewayV2TraceStartShapePort},
+		liveGatewayV2TraceSelection{contains("exec", "executable"), liveGatewayV2TraceStartShapeExec},
+		liveGatewayV2TraceSelection{contains("mount", "rootfs"), liveGatewayV2TraceStartShapeMount},
+		liveGatewayV2TraceSelection{contains("permission denied", "operation not permitted"), liveGatewayV2TraceStartShapePermission},
+	)
+	if len(details) == 0 {
+		return []liveGatewayV2TraceOutcome{liveGatewayV2TraceStartShapeNoKnownDetail}
+	}
+	return details
 }
 
 func liveGatewayV2StartCommandOutcome(result runtimeprocess.CommandResult, err error) liveGatewayV2TraceOutcome {
@@ -1930,6 +2010,35 @@ func liveGatewayV2RestartConfigArchiveForTest(t *testing.T, filename string, con
 	return append([]byte(nil), buffer.Bytes()...)
 }
 
+func TestLiveGatewayV2StageMountDiagnosticDistinguishesOrderAndContent(t *testing.T) {
+	first := gatewayContainerInspection{caddyInspection: caddyInspection{Mounts: []mountInspection{
+		{Type: "volume", Name: "config", Destination: "/config", RW: true},
+		{Type: "volume", Name: "data", Destination: "/data", RW: true},
+	}}}
+	reordered := gatewayContainerInspection{caddyInspection: caddyInspection{Mounts: []mountInspection{
+		first.Mounts[1], first.Mounts[0],
+	}}}
+	wantOrder := []liveGatewayV2TraceOutcome{
+		liveGatewayV2TraceStabilityContainerResources,
+		liveGatewayV2TraceStabilityContainerMounts,
+		liveGatewayV2TraceStabilityContainerMountOrderOnly,
+	}
+	if got := liveGatewayV2StageInspectionChangeOutcomes(first, reordered); !reflect.DeepEqual(got, wantOrder) {
+		t.Fatalf("reordered mounts = %v, want %v", got, wantOrder)
+	}
+	changed := reordered
+	changed.Mounts = append([]mountInspection(nil), reordered.Mounts...)
+	changed.Mounts[0].RW = false
+	wantContent := []liveGatewayV2TraceOutcome{
+		liveGatewayV2TraceStabilityContainerResources,
+		liveGatewayV2TraceStabilityContainerMounts,
+		liveGatewayV2TraceStabilityContainerMountContent,
+	}
+	if got := liveGatewayV2StageInspectionChangeOutcomes(first, changed); !reflect.DeepEqual(got, wantContent) {
+		t.Fatalf("changed mounts = %v, want %v", got, wantContent)
+	}
+}
+
 func TestGatewayV2OperationTraceClosesAndBoundsValues(t *testing.T) {
 	trace := &liveGatewayV2OperationTrace{phase: liveGatewayV2TracePhasePreparation}
 	trace.recordAt(liveGatewayV2TraceStageObserveTopology, gatewayMigrationPhase("untrusted-phase"),
@@ -1980,6 +2089,28 @@ func TestLiveGatewayV2StartCommandOutcomeClosesDaemonErrors(t *testing.T) {
 				t.Fatalf("outcome = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestLiveGatewayV2StartFailureShapeDoesNotExposeDaemonOutput(t *testing.T) {
+	result := runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: runc create failed: unable to start container process: no such file or directory: sensitive-value")}
+	got := liveGatewayV2StartFailureShapeOutcomes(result, errors.New("command failed"))
+	want := []liveGatewayV2TraceOutcome{
+		liveGatewayV2TraceStartShapeOCI,
+		liveGatewayV2TraceStartShapeRunc,
+		liveGatewayV2TraceStartShapeProcessInit,
+		liveGatewayV2TraceStartShapeMissingPath,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("failure shape = %v, want %v", got, want)
+	}
+	for _, outcome := range got {
+		if strings.Contains(string(outcome), "sensitive-value") {
+			t.Fatal("daemon output escaped into trace")
+		}
+	}
+	if got := liveGatewayV2StartFailureShapeOutcomes(runtimeprocess.CommandResult{StderrTruncated: true}, errors.New("command failed")); len(got) != 0 {
+		t.Fatalf("truncated output produced failure shape %v", got)
 	}
 }
 
