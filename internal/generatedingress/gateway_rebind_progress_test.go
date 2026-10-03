@@ -39,6 +39,31 @@ type legacyGatewayRebindProgressRecordV1 struct {
 	Digest                string                            `json:"digest"`
 }
 
+type preDataGatewayRebindStageIntent struct {
+	Identity                 gatewayRebindSuccessorIdentity         `json:"identity"`
+	ApprovedCaddyImageDigest string                                 `json:"approvedCaddyImageDigest"`
+	ObservedDockerImageID    string                                 `json:"observedDockerImageId"`
+	NetworkPlan              gatewayRebindSuccessorIntentNetwork    `json:"networkPlan"`
+	NetworkPlanDigest        string                                 `json:"networkPlanDigest"`
+	NetworkTopologyDigest    string                                 `json:"networkTopologyDigest"`
+	Network                  *gatewayRebindStageNetworkBinding      `json:"network,omitempty"`
+	ConfigVolume             *gatewayRebindStageConfigVolumeBinding `json:"configVolume,omitempty"`
+}
+
+type preDataGatewayRebindProgressRecord struct {
+	Version               int                              `json:"version"`
+	Purpose               string                           `json:"purpose"`
+	Generation            uint64                           `json:"generation"`
+	OperationID           string                           `json:"operationId"`
+	Sequence              uint64                           `json:"sequence"`
+	Phase                 gatewayRebindProgressPhase       `json:"phase"`
+	OccurredAt            string                           `json:"occurredAt"`
+	ProtectedIntentDigest string                           `json:"protectedIntentDigest"`
+	PreviousDigest        string                           `json:"previousDigest,omitempty"`
+	Stage                 *preDataGatewayRebindStageIntent `json:"stage,omitempty"`
+	Digest                string                           `json:"digest"`
+}
+
 func gatewayRebindProgressFixture(t *testing.T) (gatewayRebindPredecessorFixture, gatewayRebindProtectedIntent) {
 	t.Helper()
 	fixture, snapshot, predecessor, observation := gatewayRebindProtectedIntentFixture(t)
@@ -86,6 +111,63 @@ func legacyGatewayRebindProgressRecord(value gatewayRebindProgressRecord) legacy
 		}
 	}
 	return legacy
+}
+
+func preDataGatewayRebindProgress(value gatewayRebindProgressRecord) preDataGatewayRebindProgressRecord {
+	legacy := preDataGatewayRebindProgressRecord{
+		Version: value.Version, Purpose: value.Purpose, Generation: value.Generation,
+		OperationID: value.OperationID, Sequence: value.Sequence, Phase: value.Phase,
+		OccurredAt: value.OccurredAt, ProtectedIntentDigest: value.ProtectedIntentDigest,
+		PreviousDigest: value.PreviousDigest, Digest: value.Digest,
+	}
+	if value.Stage != nil {
+		legacy.Stage = &preDataGatewayRebindStageIntent{
+			Identity: value.Stage.Identity, ApprovedCaddyImageDigest: value.Stage.ApprovedCaddyImageDigest,
+			ObservedDockerImageID: value.Stage.ObservedDockerImageID, NetworkPlan: value.Stage.NetworkPlan,
+			NetworkPlanDigest: value.Stage.NetworkPlanDigest, NetworkTopologyDigest: value.Stage.NetworkTopologyDigest,
+			Network: value.Stage.Network, ConfigVolume: value.Stage.ConfigVolume,
+		}
+	}
+	return legacy
+}
+
+func gatewayRebindProgressThroughConfig(t *testing.T) (gatewayRebindPredecessorFixture,
+	gatewayRebindProtectedIntent, []gatewayRebindProgressRecord,
+) {
+	t.Helper()
+	fixture, intent := gatewayRebindProgressFixture(t)
+	first, err := newGatewayRebindSuccessorIntentProgress(intent, gatewayRebindProgressTimestamp(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newGatewayRebindStageIntentProgress(intent, first,
+		gatewayRebindProgressStageObservation(intent, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	networkOwnership, err := gatewayRebindStageNetworkOwnershipDigest(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := newGatewayRebindStageNetworkProgress(intent, second, strings.Repeat("a", 64),
+		networkOwnership, gatewayRebindProgressTimestamp(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configOwnership, err := gatewayRebindStageConfigVolumeOwnershipDigest(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fourth, err := newGatewayRebindStageConfigVolumeProgress(intent, third,
+		gatewayRebindStageConfigVolumeBinding{
+			Name:       intent.Intent.Identity.ConfigVolume,
+			Mountpoint: "/var/lib/docker/volumes/" + intent.Intent.Identity.ConfigVolume + "/_data",
+			CreatedAt:  "2026-10-03T12:00:03Z", OwnershipDigest: configOwnership,
+		}, gatewayRebindProgressTimestamp(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fixture, intent, []gatewayRebindProgressRecord{first, second, third, fourth}
 }
 
 func TestGatewayRebindProgressSequenceFourBindsExactConfigVolume(t *testing.T) {
@@ -138,6 +220,163 @@ func TestGatewayRebindProgressSequenceFourBindsExactConfigVolume(t *testing.T) {
 	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	if err != nil || len(history.Progress) != 4 || !reflect.DeepEqual(history.Progress[3].Record, fourth) {
 		t.Fatalf("sequence-four history=%#v error=%v", history.Progress, err)
+	}
+}
+
+func TestGatewayRebindProgressSequenceFiveBindsExactDataVolume(t *testing.T) {
+	fixture, intent, records := gatewayRebindProgressThroughConfig(t)
+	dataOwnership, err := gatewayRebindStageDataVolumeOwnershipDigest(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := gatewayRebindStageDataVolumeBinding{
+		Name:       intent.Intent.Identity.DataVolume,
+		Mountpoint: "/var/lib/docker/volumes/" + intent.Intent.Identity.DataVolume + "/_data",
+		CreatedAt:  "2026-10-03T12:00:04Z", OwnershipDigest: dataOwnership,
+	}
+	fifth, err := newGatewayRebindStageDataVolumeProgress(intent, records[3], binding,
+		gatewayRebindProgressTimestamp(5))
+	if err != nil || !validGatewayRebindProgressRecord(fifth) || fifth.Stage == nil ||
+		fifth.Stage.DataVolume == nil || *fifth.Stage.DataVolume != binding {
+		t.Fatalf("sequence five=%#v error=%v", fifth, err)
+	}
+	stageWithoutData := *fifth.Stage
+	stageWithoutData.DataVolume = nil
+	if !reflect.DeepEqual(stageWithoutData, *records[3].Stage) {
+		t.Fatal("sequence five changed a sequence-four stage field")
+	}
+	records = append(records, fifth)
+	for _, record := range records {
+		store, storeErr := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+			intent.Generation, intent.OperationID, record.Sequence)
+		if storeErr != nil || store.installExact(context.Background(), record) != nil {
+			t.Fatalf("install sequence %d: %v", record.Sequence, storeErr)
+		}
+	}
+	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.Progress) != 5 || !reflect.DeepEqual(history.Progress[4].Record, fifth) {
+		t.Fatalf("sequence-five history=%#v error=%v", history.Progress, err)
+	}
+}
+
+func TestGatewayRebindProgressHistoryRejectsForgedSequenceFive(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*gatewayRebindStageIntent)
+	}{
+		{name: "inherited image substitution", mutate: func(stage *gatewayRebindStageIntent) {
+			stage.ObservedDockerImageID = strings.Repeat("d", 64)
+		}},
+		{name: "data volume identity substitution", mutate: func(stage *gatewayRebindStageIntent) {
+			stage.DataVolume.Name += "-foreign"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, intent, records := gatewayRebindProgressThroughConfig(t)
+			ownership, err := gatewayRebindStageDataVolumeOwnershipDigest(intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fifth, err := newGatewayRebindStageDataVolumeProgress(intent, records[3],
+				gatewayRebindStageDataVolumeBinding{
+					Name:       intent.Intent.Identity.DataVolume,
+					Mountpoint: "/var/lib/docker/volumes/" + intent.Intent.Identity.DataVolume + "/_data",
+					CreatedAt:  "2026-10-03T12:00:04Z", OwnershipDigest: ownership,
+				}, gatewayRebindProgressTimestamp(5))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, record := range records {
+				store, storeErr := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+					intent.Generation, intent.OperationID, record.Sequence)
+				if storeErr != nil {
+					t.Fatal(storeErr)
+				}
+				if err := store.installExact(context.Background(), record); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stage := *fifth.Stage
+			binding := *stage.DataVolume
+			stage.DataVolume = &binding
+			fifth.Stage = &stage
+			test.mutate(fifth.Stage)
+			fifth.Digest, err = gatewayRebindProgressDigest(fifth)
+			if err != nil || !validGatewayRebindProgressRecord(fifth) {
+				t.Fatalf("forged sequence five is not structurally valid: %v", err)
+			}
+			store, err := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+				intent.Generation, intent.OperationID, 5)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := gatewayUpgradeStateStore{directory: store.directory}
+			if err := state.writeExact(store.path, store.purpose, fifth, false,
+				maxGatewayRebindProgressBytes); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil); err == nil {
+				t.Fatal("scanner accepted forged sequence-five progress")
+			}
+		})
+	}
+}
+
+func TestGatewayRebindProgressOptionalDataVolumePreservesSequenceOneThroughFourBytesAndDigests(t *testing.T) {
+	_, _, records := gatewayRebindProgressThroughConfig(t)
+	for _, record := range records {
+		actualBytes, marshalErr := json.Marshal(record)
+		legacy := preDataGatewayRebindProgress(record)
+		legacyBytes, legacyErr := json.Marshal(legacy)
+		if marshalErr != nil || legacyErr != nil || !reflect.DeepEqual(actualBytes, legacyBytes) {
+			t.Fatalf("sequence %d bytes changed: actual=%s legacy=%s errors=%v/%v",
+				record.Sequence, actualBytes, legacyBytes, marshalErr, legacyErr)
+		}
+		legacy.Digest = ""
+		legacyDigest, digestErr := canonicalDigest(legacy)
+		if digestErr != nil || legacyDigest != record.Digest {
+			t.Fatalf("sequence %d digest changed: actual=%s legacy=%s error=%v",
+				record.Sequence, record.Digest, legacyDigest, digestErr)
+		}
+	}
+}
+
+func TestGatewayRebindProgressSequenceFiveRejectsInvalidOrStaleInputs(t *testing.T) {
+	_, intent, records := gatewayRebindProgressThroughConfig(t)
+	ownership, err := gatewayRebindStageDataVolumeOwnershipDigest(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := gatewayRebindStageDataVolumeBinding{
+		Name:       intent.Intent.Identity.DataVolume,
+		Mountpoint: "/var/lib/docker/volumes/" + intent.Intent.Identity.DataVolume + "/_data",
+		CreatedAt:  "2026-10-03T12:00:04Z", OwnershipDigest: ownership,
+	}
+	for _, test := range []struct {
+		name     string
+		previous func() gatewayRebindProgressRecord
+		binding  func() gatewayRebindStageDataVolumeBinding
+		at       time.Time
+	}{
+		{name: "sequence three predecessor", previous: func() gatewayRebindProgressRecord { return records[2] }, binding: func() gatewayRebindStageDataVolumeBinding { return valid }, at: gatewayRebindProgressTimestamp(5)},
+		{name: "equal timestamp", previous: func() gatewayRebindProgressRecord { return records[3] }, binding: func() gatewayRebindStageDataVolumeBinding { return valid }, at: gatewayRebindProgressTimestamp(4)},
+		{name: "wrong name", previous: func() gatewayRebindProgressRecord { return records[3] }, binding: func() gatewayRebindStageDataVolumeBinding {
+			value := valid
+			value.Name = intent.Intent.Identity.ConfigVolume
+			return value
+		}, at: gatewayRebindProgressTimestamp(5)},
+		{name: "wrong ownership", previous: func() gatewayRebindProgressRecord { return records[3] }, binding: func() gatewayRebindStageDataVolumeBinding {
+			value := valid
+			value.OwnershipDigest = strings.Repeat("f", 64)
+			return value
+		}, at: gatewayRebindProgressTimestamp(5)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value, makeErr := newGatewayRebindStageDataVolumeProgress(intent, test.previous(), test.binding(), test.at)
+			if makeErr == nil || !reflect.DeepEqual(value, gatewayRebindProgressRecord{}) {
+				t.Fatalf("invalid sequence-five input accepted: %#v error=%v", value, makeErr)
+			}
+		})
 	}
 }
 
@@ -535,13 +774,13 @@ func TestGatewayRebindProgressHistoryRejectsNamespaceTamperingAndChanges(t *test
 		if err := secondStore.installExact(context.Background(), second); err != nil {
 			t.Fatal(err)
 		}
-		name, _ := gatewayRebindProgressName(intent.Generation, intent.OperationID, 4)
+		name, _ := gatewayRebindProgressName(intent.Generation, intent.OperationID, 6)
 		if err := os.WriteFile(filepath.Join(fixture.manager.store.root, name), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil); err == nil ||
 			!strings.Contains(err.Error(), "sequence gap") {
-			t.Fatalf("unsupported fourth progress sequence was accepted: %v", err)
+			t.Fatalf("unsupported sixth progress sequence was accepted: %v", err)
 		}
 	})
 
