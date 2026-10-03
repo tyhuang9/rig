@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +35,7 @@ import (
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/hostnetwork"
 	"github.com/hostd/hostd/internal/jobs"
@@ -133,13 +136,15 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 		t.Fatal("compose production runtime:", err)
 	}
 	access := appaccess.New(db)
+	grantTrace := &lanTwoAppGrantTrace{Manager: composition.ingress}
+	t.Cleanup(func() { grantTrace.logFailure(t) })
 	api := httptest.NewServer((&controller.Server{
 		Auth: authService, Apps: appStore, Jobs: jobStore, Machines: machineStore, Sources: sources,
 		Configuration: configuration, Deployments: deploymentStore, DeploymentPlans: plans,
 		GeneratedIngress: composition.ingress, GeneratedRuntimeState: composition.state,
 		GeneratedRuntime: true, Caddy: true, DataRoot: dataRoot,
 		GatewayProfiles: access, GatewayUpgrades: access, GatewayUpgradeRuntime: composition.ingress,
-		AppAccess: access, AppGrants: access, LANGrantRuntime: composition.ingress,
+		AppAccess: access, AppGrants: access, LANGrantRuntime: grantTrace,
 		AppDisables: access, LANDisableRuntime: composition.ingress,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}).Handler())
@@ -345,6 +350,102 @@ type lanTwoAppAPI struct {
 	session string
 	csrf    string
 	client  *http.Client
+}
+
+// The live gate prints only fixed operation names and closed outcomes after a
+// failure. It never logs grant requests, Docker output, addresses, or secrets.
+type lanTwoAppGrantTrace struct {
+	*generatedingress.Manager
+	mu     sync.Mutex
+	events []string
+}
+
+func (trace *lanTwoAppGrantTrace) record(stage string, err error, disposition generatedingress.GatewayV2LANGrantDisposition) {
+	outcome := "ok"
+	if err != nil {
+		outcome = "other_error"
+		var diagnostic *generatedingress.Error
+		if errors.As(err, &diagnostic) {
+			switch diagnostic.Code {
+			case generatedingress.DiagnosticValidationFailed, generatedingress.DiagnosticIngressUnavailable,
+				generatedingress.DiagnosticIngressDrift, generatedingress.DiagnosticRouteInvalid,
+				generatedingress.DiagnosticRouteValidateFailed, generatedingress.DiagnosticRouteReloadFailed,
+				generatedingress.DiagnosticRouteStateFailed, generatedingress.DiagnosticRouteUnresolved,
+				generatedingress.DiagnosticGatewayReadinessFailed, generatedingress.DiagnosticCancelled:
+				outcome = string(diagnostic.Code)
+			}
+		}
+	} else {
+		switch disposition {
+		case generatedingress.GatewayV2LANGrantCommitted, generatedingress.GatewayV2LANGrantPendingPublished,
+			generatedingress.GatewayV2LANGrantWithdrawnPendingReconciliation:
+			outcome = string(disposition)
+		}
+	}
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	if len(trace.events) < 24 {
+		trace.events = append(trace.events, stage+":"+outcome)
+	}
+}
+
+func (trace *lanTwoAppGrantTrace) logFailure(t *testing.T) {
+	if !t.Failed() {
+		return
+	}
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	t.Logf("LAN grant closed trace: %s", strings.Join(trace.events, ","))
+}
+
+func (trace *lanTwoAppGrantTrace) GrantGatewayV2LAN(ctx context.Context, request generatedingress.GatewayV2LANGrantRequest,
+	authorize generatedingress.GatewayV2LANGrantAuthorizer,
+) (generatedingress.GatewayV2LANGrantResult, error) {
+	result, err := trace.Manager.GrantGatewayV2LAN(ctx, request, authorize)
+	trace.record("grant", err, "")
+	return result, err
+}
+
+func (trace *lanTwoAppGrantTrace) ObserveGatewayV2LAN(ctx context.Context, request generatedingress.GatewayV2LANGrantRequest) (generatedingress.GatewayV2LANGrantObservation, error) {
+	observation, err := trace.Manager.ObserveGatewayV2LAN(ctx, request)
+	trace.record("observe", err, observation.Disposition)
+	return observation, err
+}
+
+func (trace *lanTwoAppGrantTrace) WithGatewayV2LANCommitResolution(ctx context.Context, request generatedingress.GatewayV2LANGrantRequest,
+	resolve func(context.Context, generatedingress.GatewayV2LANGrantReceipt) error,
+) error {
+	err := trace.Manager.WithGatewayV2LANCommitResolution(ctx, request, func(callbackCtx context.Context, receipt generatedingress.GatewayV2LANGrantReceipt) error {
+		callbackErr := resolve(callbackCtx, receipt)
+		trace.record("commit_callback", callbackErr, "")
+		return callbackErr
+	})
+	trace.record("commit_resolution", err, "")
+	return err
+}
+
+func (trace *lanTwoAppGrantTrace) WithGatewayV2LANAbsenceResolution(ctx context.Context, request generatedingress.GatewayV2LANGrantRequest,
+	resolve func(context.Context, generatedingress.GatewayV2LANGrantObservation) error,
+) error {
+	err := trace.Manager.WithGatewayV2LANAbsenceResolution(ctx, request, func(callbackCtx context.Context, observation generatedingress.GatewayV2LANGrantObservation) error {
+		callbackErr := resolve(callbackCtx, observation)
+		trace.record("absence_callback", callbackErr, observation.Disposition)
+		return callbackErr
+	})
+	trace.record("absence_resolution", err, "")
+	return err
+}
+
+func (trace *lanTwoAppGrantTrace) WithGatewayV2LANRollbackResolution(ctx context.Context, request generatedingress.GatewayV2LANGrantRequest,
+	resolve func(context.Context, generatedingress.GatewayV2LANGrantObservation) error,
+) error {
+	err := trace.Manager.WithGatewayV2LANRollbackResolution(ctx, request, func(callbackCtx context.Context, observation generatedingress.GatewayV2LANGrantObservation) error {
+		callbackErr := resolve(callbackCtx, observation)
+		trace.record("rollback_callback", callbackErr, observation.Disposition)
+		return callbackErr
+	})
+	trace.record("rollback_resolution", err, "")
+	return err
 }
 
 func (a *lanTwoAppAPI) do(method, path string, input any, want int, output any) {
