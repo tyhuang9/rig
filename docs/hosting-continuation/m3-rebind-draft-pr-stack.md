@@ -4,9 +4,9 @@ Status: local, unpublished plan as of 2026-10-03. The published base is draft
 PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each row's
 branch descends from the preceding row's branch, with one review scope per
 draft. Each draft would target the preceding row's branch. Row 15 includes the
-initial version of this plan after its scope commit; rows 25, 27, and 28 update it.
+initial version of this plan after its scope commit; rows 25, 27, 28, and 29 update it.
 None of these rows authorizes publication, merge, or deployment. Publication
-approval for rows 1–25 is pending separately; rows 26–28 require their own
+approval for rows 1–25 is pending separately; rows 26–29 require their own
 approval after the prerequisite hosted network gate passes.
 
 | Order | Branch | Scope commit | Review scope |
@@ -39,6 +39,7 @@ approval after the prerequisite hosted network gate passes.
 | 26 | `feature/hosting-m3-rebind-config-volume-stage` | `307c8f3` | Private successor config-volume Docker effect and protected sequence-four binding |
 | 27 | `feature/hosting-m3-rebind-config-volume-docker-gate` | `742124d` | Required hosted Docker test of the exact config-volume effect and replay |
 | 28 | `feature/hosting-m3-rebind-data-volume-stage` | `9ccf6a9` | Private successor Caddy `/data` volume effect and protected sequence-five binding |
+| 29 | `feature/hosting-m3-rebind-data-volume-docker-gate` | `fcc7b72` | Required hosted Docker test of the exact data-volume effect and fresh-Manager replay |
 
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
@@ -48,9 +49,11 @@ the final-source Go suite, vet, web tests and build, and Docker-tagged compile;
 its live Docker test only compiled and skipped locally. Rows 26 and 27 passed
 their final-source Go suites, vet, builds, and relevant focused checks; row 27's
 live test also only compiled and skipped locally. Row 28 passed its final-source
-Go suite, vet, build, and Docker-tagged compile. PR #97's hosted checks passed
-at its published head. The Docker gates in rows 14, 16, 25, and 27 require
-publication and hosted execution before they can count as acceptance evidence.
+Go suite, vet, build, and Docker-tagged compile. Row 29 passed its final-source
+Go suite, vet, build, and Docker-tagged compile; its live test only compiled
+and skipped locally. PR #97's hosted checks passed at its published head. The
+Docker gates in rows 14, 16, 25, 27, and 29 require publication and hosted
+execution before they can count as acceptance evidence.
 
 These branches do not add a public rebind controller caller, terminal protected
 receipt, successor cutover, transfer-aware readers, recovery, or fence release.
