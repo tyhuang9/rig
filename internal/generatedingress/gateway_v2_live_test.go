@@ -737,6 +737,12 @@ const (
 	liveGatewayV2TraceStabilityContainerExecution       liveGatewayV2TraceOutcome = "stage_stability_container_execution_changed"
 	liveGatewayV2TraceStabilityContainerIsolation       liveGatewayV2TraceOutcome = "stage_stability_container_isolation_changed"
 	liveGatewayV2TraceStabilityContainerResources       liveGatewayV2TraceOutcome = "stage_stability_container_resources_changed"
+	liveGatewayV2TraceStabilityContainerMounts          liveGatewayV2TraceOutcome = "stage_stability_container_mounts_changed"
+	liveGatewayV2TraceStabilityContainerMemory          liveGatewayV2TraceOutcome = "stage_stability_container_memory_changed"
+	liveGatewayV2TraceStabilityContainerMemorySwap      liveGatewayV2TraceOutcome = "stage_stability_container_memory_swap_changed"
+	liveGatewayV2TraceStabilityContainerNanoCPUs        liveGatewayV2TraceOutcome = "stage_stability_container_nano_cpus_changed"
+	liveGatewayV2TraceStabilityContainerPIDsLimit       liveGatewayV2TraceOutcome = "stage_stability_container_pids_limit_changed"
+	liveGatewayV2TraceStabilityContainerUlimits         liveGatewayV2TraceOutcome = "stage_stability_container_ulimits_changed"
 	liveGatewayV2TraceStabilityContainerLogging         liveGatewayV2TraceOutcome = "stage_stability_container_logging_changed"
 	liveGatewayV2TraceStabilityContainerLabels          liveGatewayV2TraceOutcome = "stage_stability_container_labels_changed"
 	liveGatewayV2TraceStabilityContainerPorts           liveGatewayV2TraceOutcome = "stage_stability_container_ports_changed"
@@ -1278,6 +1284,12 @@ func liveGatewayV2StageInspectionChangeOutcomes(first, confirmed gatewayContaine
 			first.MemorySwap == confirmed.MemorySwap, first.NanoCPUs == confirmed.NanoCPUs,
 			first.PIDsLimit == confirmed.PIDsLimit, reflect.DeepEqual(first.Ulimits, confirmed.Ulimits)),
 			liveGatewayV2TraceStabilityContainerResources},
+		liveGatewayV2TraceSelection{!reflect.DeepEqual(first.Mounts, confirmed.Mounts), liveGatewayV2TraceStabilityContainerMounts},
+		liveGatewayV2TraceSelection{first.Memory != confirmed.Memory, liveGatewayV2TraceStabilityContainerMemory},
+		liveGatewayV2TraceSelection{first.MemorySwap != confirmed.MemorySwap, liveGatewayV2TraceStabilityContainerMemorySwap},
+		liveGatewayV2TraceSelection{first.NanoCPUs != confirmed.NanoCPUs, liveGatewayV2TraceStabilityContainerNanoCPUs},
+		liveGatewayV2TraceSelection{first.PIDsLimit != confirmed.PIDsLimit, liveGatewayV2TraceStabilityContainerPIDsLimit},
+		liveGatewayV2TraceSelection{!reflect.DeepEqual(first.Ulimits, confirmed.Ulimits), liveGatewayV2TraceStabilityContainerUlimits},
 		liveGatewayV2TraceSelection{changed(first.LogType == confirmed.LogType,
 			reflect.DeepEqual(first.LogConfig, confirmed.LogConfig), first.Restart == confirmed.Restart),
 			liveGatewayV2TraceStabilityContainerLogging},
