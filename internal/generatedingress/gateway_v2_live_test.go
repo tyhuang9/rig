@@ -688,6 +688,7 @@ const (
 	liveGatewayV2TraceStageRemove                    liveGatewayV2TraceStep = "stage_remove"
 	liveGatewayV2TraceTransferObserveTopology        liveGatewayV2TraceStep = "transfer_observe_topology"
 	liveGatewayV2TraceTransferObserveRecovery        liveGatewayV2TraceStep = "transfer_observe_recovery"
+	liveGatewayV2TraceTransferFinalStabilityDetail   liveGatewayV2TraceStep = "transfer_final_stability_detail"
 	liveGatewayV2TraceTransferProveFinalRoutes       liveGatewayV2TraceStep = "transfer_prove_final_routes"
 	liveGatewayV2TraceTransferSelectedInterface      liveGatewayV2TraceStep = "transfer_selected_interface"
 	liveGatewayV2TraceTransferCopyFinalConfig        liveGatewayV2TraceStep = "transfer_copy_final_config"
@@ -1921,9 +1922,42 @@ func (d liveGatewayV2TracingTransferDriver) observeTopology(ctx context.Context,
 func (d liveGatewayV2TracingTransferDriver) observeRecovery(ctx context.Context, source routeState, state gatewayV2RouteState,
 	journal gatewayMigrationJournal,
 ) gatewayV2RecoveryTopology {
-	result := d.gatewayV2TransferDriver.observeRecovery(ctx, source, state, journal)
+	// Capture only the two Docker reads used by the authoritative recovery
+	// observation. Keep the captured bytes in memory and report closed drift
+	// categories; never emit the container inspection or restart config.
+	if journal.Resources.FinalContainerID == "" || d.manager == nil || d.manager.runner == nil {
+		result := d.gatewayV2TransferDriver.observeRecovery(ctx, source, state, journal)
+		d.trace.recordAt(liveGatewayV2TraceTransferObserveRecovery, journal.Phase, liveGatewayV2RecoveryOutcome(result))
+		return result
+	}
+	capture := &liveGatewayV2StageStabilityCaptureRunner{
+		inner: d.manager.runner, stageName: state.Identity.FinalContainer,
+		stageID: journal.Resources.FinalContainerID, configFilename: state.Identity.ActiveConfigFilename,
+	}
+	d.manager.runner = capture
+	var result gatewayV2RecoveryTopology
+	func() {
+		defer func() { d.manager.runner = capture.inner }()
+		result = d.gatewayV2TransferDriver.observeRecovery(ctx, source, state, journal)
+	}()
 	d.trace.recordAt(liveGatewayV2TraceTransferObserveRecovery, journal.Phase, liveGatewayV2RecoveryOutcome(result))
+	if result == gatewayV2RecoveryUnknown {
+		failures := capture.failureOutcomes()
+		if len(failures) == 0 {
+			failures = append(failures, liveGatewayV2TraceStabilityUnclassified)
+		}
+		for _, failure := range failures {
+			d.trace.recordAt(liveGatewayV2TraceTransferFinalStabilityDetail, journal.Phase,
+				liveGatewayV2FinalStabilityOutcome(failure))
+		}
+	}
+	capture.clear()
 	return result
+}
+
+func liveGatewayV2FinalStabilityOutcome(outcome liveGatewayV2TraceOutcome) liveGatewayV2TraceOutcome {
+	// failureOutcomes returns only the closed stage-stability categories.
+	return liveGatewayV2TraceOutcome(strings.Replace(string(outcome), "stage_stability_", "final_stability_", 1))
 }
 
 func (d liveGatewayV2TracingTransferDriver) proveFinalHostRoutes(ctx context.Context, state gatewayV2RouteState,
