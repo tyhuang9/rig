@@ -51,6 +51,96 @@ func TestClassifyGatewayV2TopologyExactStates(t *testing.T) {
 	}
 }
 
+func TestGatewayV2RunningV1StillRequiresLivePublicationAndMembership(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1Only)
+	if !validGatewayV1Base(source, journal, observation, true) {
+		t.Fatal("exact running-v1 source was rejected")
+	}
+	observation.V1Runtime.EffectivePortBindings = map[string][]map[string]string{"8080/tcp": nil}
+	if validGatewayV1Base(source, journal, observation, true) {
+		t.Fatal("running v1 without effective host publication was accepted")
+	}
+	observation = gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1Only)
+	observation.V1Network.Containers = map[string]caddyNetworkContainerInspection{}
+	if validGatewayV1Base(source, journal, observation, true) {
+		t.Fatal("running v1 without live ingress membership was accepted")
+	}
+	observation = gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1Only)
+	network := observation.V1ApplicationNetworks["net-a"]
+	delete(network.Containers, observation.V1Container.ID)
+	observation.V1ApplicationNetworks["net-a"] = network
+	if validGatewayV1Base(source, journal, observation, true) {
+		t.Fatal("running v1 without live application-network membership was accepted")
+	}
+}
+
+func TestClassifyGatewayV2TopologyAcceptsUnboundExposedPorts(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Phase = gatewayPhaseV2Serving
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
+	for _, effective := range []map[string][]map[string]string{
+		observation.V1Runtime.EffectivePortBindings,
+		observation.FinalRuntime.EffectivePortBindings,
+	} {
+		effective["80/tcp"] = nil
+		effective["443/tcp"] = []map[string]string{}
+		effective["443/udp"] = nil
+		effective["2019/tcp"] = nil
+	}
+	if got := classifyGatewayV2Topology(source, state, journal, observation); got != gatewayTopologyExactFinalV2 {
+		t.Fatalf("topology with unbound image-exposed ports = %q", got)
+	}
+}
+
+func TestValidGatewayV2ContainerLabelsAllowsOnlyForeignImageMetadata(t *testing.T) {
+	_, state, journal := gatewayV2IdentityTestState(t)
+	expected := gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, gatewayV2FinalContainerRole, true)
+	clone := func() map[string]string {
+		labels := make(map[string]string, len(expected)+1)
+		for key, value := range expected {
+			labels[key] = value
+		}
+		return labels
+	}
+
+	if !validGatewayV2ContainerLabels(clone(), expected) {
+		t.Fatal("exact Rig container labels were rejected")
+	}
+	foreign := clone()
+	foreign["org.opencontainers.image.title"] = "Caddy"
+	if !validGatewayV2ContainerLabels(foreign, expected) {
+		t.Fatal("foreign pinned-image metadata label was rejected")
+	}
+	missing := clone()
+	delete(missing, gatewayV2OperationLabelKey)
+	if validGatewayV2ContainerLabels(missing, expected) {
+		t.Fatal("missing required Rig label was accepted")
+	}
+	mismatch := clone()
+	mismatch[gatewayV2OperationLabelKey] = "33333333-3333-4333-8333-333333333333"
+	if validGatewayV2ContainerLabels(mismatch, expected) {
+		t.Fatal("mismatched required Rig label was accepted")
+	}
+	extraRig := clone()
+	extraRig["io.rig.unexpected"] = "metadata"
+	if validGatewayV2ContainerLabels(extraRig, expected) {
+		t.Fatal("additional Rig namespace label was accepted")
+	}
+}
+
+func TestClassifyGatewayV2TopologyAcceptsForeignPinnedImageMetadataLabel(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Phase = gatewayPhaseV2Serving
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
+	observation.FinalContainer.Labels["org.opencontainers.image.title"] = "Caddy"
+	if got := classifyGatewayV2Topology(source, state, journal, observation); got != gatewayTopologyExactFinalV2 {
+		t.Fatalf("topology with foreign pinned-image metadata label = %q", got)
+	}
+}
+
 func TestClassifyCommittedFinalV2DoesNotDependOnHistoricalV1AppTopology(t *testing.T) {
 	source, state, journal := gatewayV2IdentityTestState(t)
 	journal.Resources = gatewayV2IdentityTestBoundResources(t)
@@ -62,6 +152,7 @@ func TestClassifyCommittedFinalV2DoesNotDependOnHistoricalV1AppTopology(t *testi
 	for name := range observation.V1Container.Networks {
 		if name != caddyNetworkName {
 			delete(observation.V1Container.Networks, name)
+			delete(observation.V1Runtime.ConfiguredNetworks, name)
 		}
 	}
 	if got := classifyGatewayV2Topology(source, state, journal, observation); got != gatewayTopologyExactFinalV2 {
@@ -237,6 +328,9 @@ func TestClassifyGatewayV2TopologyFailsClosedOnDrift(t *testing.T) {
 		{"effective final binding drift", func(value *gatewayV2DockerObservation) {
 			value.FinalRuntime.EffectivePortBindings = map[string][]map[string]string{}
 		}},
+		{"unexpected effective final binding", func(value *gatewayV2DockerObservation) {
+			value.FinalRuntime.EffectivePortBindings["9999/tcp"] = []map[string]string{{"HostIp": "127.0.0.1", "HostPort": "9999"}}
+		}},
 		{"final paused", func(value *gatewayV2DockerObservation) { value.FinalRuntime.Paused = true }},
 		{"final dead", func(value *gatewayV2DockerObservation) { value.FinalRuntime.Dead = true }},
 		{"final restarted", func(value *gatewayV2DockerObservation) { value.FinalRuntime.RestartCount = 1 }},
@@ -254,6 +348,14 @@ func TestClassifyGatewayV2TopologyFailsClosedOnDrift(t *testing.T) {
 		{"application network identity missing", func(value *gatewayV2DockerObservation) {
 			for name := range value.ApplicationNetworkIDs {
 				delete(value.ApplicationNetworkIDs, name)
+				break
+			}
+		}},
+		{"configured application network identity replaced", func(value *gatewayV2DockerObservation) {
+			for name := range value.ApplicationNetworkIDs {
+				attachment := value.FinalRuntime.ConfiguredNetworks[name]
+				attachment.NetworkID = "sha256:" + strings.Repeat("9", 64)
+				value.FinalRuntime.ConfiguredNetworks[name] = attachment
 				break
 			}
 		}},
@@ -311,6 +413,79 @@ func TestClassifyGatewayV2TopologyFailsClosedOnDrift(t *testing.T) {
 	}
 }
 
+func TestGatewayV2EffectivePortBindingsMatchConfigured(t *testing.T) {
+	configured := map[string][]map[string]string{
+		"8080/tcp": {{"HostIp": "192.168.1.20", "HostPort": "20481"}},
+	}
+	tests := []struct {
+		name      string
+		effective map[string][]map[string]string
+		want      bool
+	}{
+		{
+			name:      "exact configured publication",
+			effective: gatewayV2IdentityTestPortBindingsCopy(configured),
+			want:      true,
+		},
+		{
+			name: "additional exposed ports without host bindings",
+			effective: map[string][]map[string]string{
+				"80/tcp":   nil,
+				"443/tcp":  {},
+				"443/udp":  nil,
+				"2019/tcp": nil,
+				"8080/tcp": {{"HostIp": "192.168.1.20", "HostPort": "20481"}},
+			},
+			want: true,
+		},
+		{
+			name:      "configured publication absent",
+			effective: map[string][]map[string]string{"80/tcp": nil},
+			want:      false,
+		},
+		{
+			name: "configured host address changed",
+			effective: map[string][]map[string]string{
+				"8080/tcp": {{"HostIp": "0.0.0.0", "HostPort": "20481"}},
+			},
+			want: false,
+		},
+		{
+			name: "configured host port changed",
+			effective: map[string][]map[string]string{
+				"8080/tcp": {{"HostIp": "192.168.1.20", "HostPort": "20482"}},
+			},
+			want: false,
+		},
+		{
+			name: "configured publication duplicated",
+			effective: map[string][]map[string]string{
+				"8080/tcp": {
+					{"HostIp": "192.168.1.20", "HostPort": "20481"},
+					{"HostIp": "192.168.1.20", "HostPort": "20481"},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "unexpected effective publication",
+			effective: map[string][]map[string]string{
+				"8080/tcp": {{"HostIp": "192.168.1.20", "HostPort": "20481"}},
+				"9999/tcp": {{"HostIp": "127.0.0.1", "HostPort": "9999"}},
+			},
+			want: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := gatewayV2EffectivePortBindingsMatchConfigured(test.effective, configured); got != test.want {
+				t.Fatalf("gatewayV2EffectivePortBindingsMatchConfigured() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestClassifyGatewayV2StageFailsClosedWithoutRestartAndPublicationProof(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -326,6 +501,9 @@ func TestClassifyGatewayV2StageFailsClosedWithoutRestartAndPublicationProof(t *t
 		{"stage paused", func(value *gatewayV2DockerObservation) { value.StageRuntime.Paused = true }},
 		{"stage restarted", func(value *gatewayV2DockerObservation) { value.StageRuntime.RestartCount = 1 }},
 		{"bound stage ID changed", func(value *gatewayV2DockerObservation) { value.StageContainer.ID = "sha256:" + strings.Repeat("9", 64) }},
+		{"stage hostname changed to overlong container name", func(value *gatewayV2DockerObservation) {
+			value.StageContainer.Hostname = strings.TrimPrefix(value.StageContainer.Name, "/")
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			source, state, journal := gatewayV2IdentityTestState(t)
@@ -341,6 +519,59 @@ func TestClassifyGatewayV2StageFailsClosedWithoutRestartAndPublicationProof(t *t
 				t.Fatalf("topology = %q", got)
 			}
 		})
+	}
+}
+
+func TestStableGatewayV2ContainerMountsAcceptsOnlyExactMountOrderChange(t *testing.T) {
+	identity := gatewayV2Identity{ConfigVolume: "config-volume", DataVolume: "data-volume"}
+	first := caddyInspection{ID: "stage-id", Hostname: "stage-host", Running: false, Mounts: []mountInspection{
+		{Type: "volume", Name: identity.ConfigVolume, Destination: "/config", RW: true},
+		{Type: "volume", Name: identity.DataVolume, Destination: "/data", RW: true},
+	}}
+	runtime := gatewayContainerRuntime{EffectivePortBindings: map[string][]map[string]string{}}
+	copyStage := func() caddyInspection {
+		value := first
+		value.Mounts = append([]mountInspection(nil), first.Mounts...)
+		return value
+	}
+	if !stableGatewayV2ContainerMounts(first, copyStage(), runtime, runtime, identity) {
+		t.Fatal("identical stage reads were rejected")
+	}
+	reordered := copyStage()
+	reordered.Mounts[0], reordered.Mounts[1] = reordered.Mounts[1], reordered.Mounts[0]
+	if !stableGatewayV2ContainerMounts(first, reordered, runtime, runtime, identity) {
+		t.Fatal("exact mounts in reverse Docker order were rejected")
+	}
+	if first.Mounts[0].Destination != "/config" || reordered.Mounts[0].Destination != "/data" {
+		t.Fatal("comparison mutated either observed mount slice")
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*caddyInspection)
+	}{
+		{"mount write mode", func(value *caddyInspection) { value.Mounts[0].RW = false }},
+		{"mount identity", func(value *caddyInspection) { value.Mounts[0].Name = "replaced" }},
+		{"mount type", func(value *caddyInspection) { value.Mounts[0].Type = "bind" }},
+		{"mount destination", func(value *caddyInspection) { value.Mounts[0].Destination = "/elsewhere" }},
+		{"missing mount", func(value *caddyInspection) { value.Mounts = value.Mounts[:1] }},
+		{"extra mount", func(value *caddyInspection) { value.Mounts = append(value.Mounts, value.Mounts[0]) }},
+		{"container ID", func(value *caddyInspection) { value.ID = "replaced" }},
+		{"hostname", func(value *caddyInspection) { value.Hostname = "replaced" }},
+		{"running state", func(value *caddyInspection) { value.Running = true }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			confirmed := copyStage()
+			test.mutate(&confirmed)
+			if stableGatewayV2ContainerMounts(first, confirmed, runtime, runtime, identity) {
+				t.Fatal("changed stage read was accepted")
+			}
+		})
+	}
+	changedRuntime := gatewayContainerRuntime{EffectivePortBindings: map[string][]map[string]string{
+		"8080/tcp": {{"HostIp": "127.0.0.1", "HostPort": "8080"}},
+	}}
+	if stableGatewayV2ContainerMounts(first, reordered, runtime, changedRuntime, identity) {
+		t.Fatal("changed runtime ports were accepted")
 	}
 }
 
@@ -830,14 +1061,15 @@ func gatewayV2IdentityTestObservation(t *testing.T, source routeState, state gat
 		}
 		observation.StageRestartConfig = append([]byte(nil), observation.StageConfig...)
 		observation.StageRuntime.EffectivePortBindings = gatewayV2IdentityTestPortBindingsCopy(observation.StageContainer.PortBindings)
+		observation.StageRuntime.ConfiguredNetworks = gatewayV2IdentityTestConfiguredNetworks(state, observation.StageContainer,
+			observation.IngressNetworkID, nil)
 		observation.Stage404Proven = true
 		observation.StageHostPublicationProven = true
 		observation.StageStable = true
 		return observation
 	}
 
-	observation.V1Container.Running = false
-	observation.V1Config = nil
+	stopGatewayV1IdentityTestContainer(&observation)
 	observation.FinalContainer = gatewayV2IdentityTestV2Container(state, journal, gatewayV2FinalContainerRole, finalID, imageID)
 	observation.FinalContainerFound = true
 	observation.OwnedContainers = []string{state.Identity.FinalContainer}
@@ -846,6 +1078,8 @@ func gatewayV2IdentityTestObservation(t *testing.T, source routeState, state gat
 	observation.FinalRuntime.EffectivePortBindings = gatewayV2IdentityTestPortBindingsCopy(observation.FinalContainer.PortBindings)
 	observation.ApplicationNetworks = gatewayV2IdentityTestApplicationNetworksV2(state, observation.FinalContainer)
 	observation.ApplicationNetworkIDs = gatewayV2IdentityTestApplicationNetworkIDsV2(state)
+	observation.FinalRuntime.ConfiguredNetworks = gatewayV2IdentityTestConfiguredNetworks(state, observation.FinalContainer,
+		observation.IngressNetworkID, observation.ApplicationNetworkIDs)
 	routes, assignments := gatewayV2ConfigInputs(state)
 	challenge, err := gatewayV2HostChallenge(state)
 	if err != nil {
@@ -901,10 +1135,30 @@ func gatewayV2IdentityTestV2Container(state gatewayV2RouteState, journal gateway
 	if role == gatewayV2FinalContainerRole {
 		bindings["8080/tcp"] = []map[string]string{{"HostIp": "127.0.0.1", "HostPort": strconvForGatewayTest(journal.Source.LocalHostPort)}}
 	}
-	return gatewayV2IdentityTestContainer(name, id, imageID, state.Identity.IngressNetwork,
+	container := gatewayV2IdentityTestContainer(name, id, imageID, state.Identity.IngressNetwork,
 		gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true), networks, bindings,
 		[]mountInspection{{Type: "volume", Name: state.Identity.ConfigVolume, Destination: "/config", RW: true},
 			{Type: "volume", Name: state.Identity.DataVolume, Destination: "/data", RW: true}}, restart, config)
+	container.Hostname = gatewayV2ExpectedHostname(state, role)
+	return container
+}
+
+func gatewayV2IdentityTestConfiguredNetworks(state gatewayV2RouteState, container caddyInspection, ingressNetworkID string,
+	applicationNetworkIDs map[string]string,
+) map[string]gatewayV2ConfiguredNetwork {
+	result := make(map[string]gatewayV2ConfiguredNetwork, len(container.Networks))
+	for name := range container.Networks {
+		networkID := applicationNetworkIDs[name]
+		var ipam *gatewayV2ConfiguredIPAM
+		priority := 0
+		if name == state.Identity.IngressNetwork {
+			networkID = ingressNetworkID
+			ipam = &gatewayV2ConfiguredIPAM{IPv4Address: state.Network.ContainerIPv4}
+			priority = caddyGatewayPriority
+		}
+		result[name] = gatewayV2ConfiguredNetwork{IPAMConfig: ipam, NetworkID: networkID, GwPriority: priority}
+	}
+	return result
 }
 
 func gatewayV2IdentityTestVolume(state gatewayV2RouteState, journal gatewayMigrationJournal, name, role string) volumeInspection {
@@ -952,6 +1206,33 @@ func gatewayV2IdentityTestPortBindingsCopy(values map[string][]map[string]string
 		}
 	}
 	return result
+}
+
+func stopGatewayV1IdentityTestContainer(observation *gatewayV2DockerObservation) {
+	observation.V1Container.Running = false
+	observation.V1Config = nil
+	observation.V1Runtime.EffectivePortBindings = map[string][]map[string]string{"8080/tcp": nil}
+	configured := make(map[string]gatewayV2ConfiguredNetwork, len(observation.V1Container.Networks))
+	for name, attachment := range observation.V1Container.Networks {
+		stopped := *attachment
+		stopped.IPAddress = ""
+		observation.V1Container.Networks[name] = &stopped
+		if name == caddyNetworkName {
+			address, _ := ingressNetworkIdentity(observation.V1Network.identity())
+			configured[name] = gatewayV2ConfiguredNetwork{
+				IPAMConfig: &gatewayV2ConfiguredIPAM{IPv4Address: address},
+				NetworkID:  observation.V1NetworkID, GwPriority: caddyGatewayPriority,
+			}
+			continue
+		}
+		configured[name] = gatewayV2ConfiguredNetwork{NetworkID: observation.V1ApplicationNetworkIDs[name]}
+	}
+	observation.V1Runtime.ConfiguredNetworks = configured
+	observation.V1Network.Containers = map[string]caddyNetworkContainerInspection{}
+	for name, network := range observation.V1ApplicationNetworks {
+		delete(network.Containers, observation.V1Container.ID)
+		observation.V1ApplicationNetworks[name] = network
+	}
 }
 
 func gatewayV2IdentityTestApplicationNetworkIDs(routes map[string]routeRecord) map[string]string {

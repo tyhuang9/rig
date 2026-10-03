@@ -477,7 +477,7 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 		return observation, inspectErr
 	}
 	observation.StageStable = stageConfigStable && observation.StageContainerFound == confirmedStageFound && (!confirmedStageFound ||
-		(reflect.DeepEqual(observation.StageContainer, confirmedStage) && reflect.DeepEqual(observation.StageRuntime, confirmedStageRuntime)))
+		stableGatewayV2ContainerMounts(observation.StageContainer, confirmedStage, observation.StageRuntime, confirmedStageRuntime, state.Identity))
 	finalConfigStable := true
 	if observation.FinalContainerFound {
 		var confirmedLive []byte
@@ -501,7 +501,7 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 		return observation, inspectErr
 	}
 	observation.FinalStable = finalConfigStable && observation.FinalContainerFound == confirmedFinalFound && (!confirmedFinalFound ||
-		(reflect.DeepEqual(observation.FinalContainer, confirmedFinal) && reflect.DeepEqual(observation.FinalRuntime, confirmedFinalRuntime)))
+		stableGatewayV2ContainerMounts(observation.FinalContainer, confirmedFinal, observation.FinalRuntime, confirmedFinalRuntime, state.Identity))
 	observation.OwnedInventoriesStable = m.confirmGatewayV2OwnedInventories(ctx, observation)
 	if requireV1EndpointIdentity {
 		confirmedV1ApplicationNetworks, confirmErr := m.reinspectGatewayApplicationNetworks(ctx, observation.V1ApplicationNetworks, observation.V1ApplicationNetworkIDs)
@@ -526,6 +526,22 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 		observation.FinalEndpointIdentityProven = finalEndpointIdentityBefore == finalEndpointIdentityAfter
 	}
 	return observation, nil
+}
+
+// Docker may return the same two volume mounts in either order across stage
+// or final-container inspect reads. Each read must still prove the exact
+// journal-bound mounts; all other container fields and the entire runtime
+// snapshot must remain unchanged.
+func stableGatewayV2ContainerMounts(first, confirmed caddyInspection, firstRuntime, confirmedRuntime gatewayContainerRuntime,
+	identity gatewayV2Identity,
+) bool {
+	if !reflect.DeepEqual(firstRuntime, confirmedRuntime) ||
+		!validGatewayV2Mounts(first.Mounts, identity) || !validGatewayV2Mounts(confirmed.Mounts, identity) {
+		return false
+	}
+	first.Mounts = nil
+	confirmed.Mounts = nil
+	return reflect.DeepEqual(first, confirmed)
 }
 
 func classifyGatewayV2Topology(source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) gatewayObservedTopology {
@@ -587,6 +603,7 @@ func validGatewayV2FinalTopology(state gatewayV2RouteState, journal gatewayMigra
 		validContainerID(observation.IngressNetworkID) && validGatewayV2Volumes(state, journal, observation) &&
 		validGatewayV2Container(state, journal, observation.FinalContainer, observation.FinalRuntime, observation.FinalContainerFound, gatewayV2FinalContainerRole, observation.Image.ID) &&
 		validGatewayV2IngressNetwork(state, journal, observation.IngressNetwork, observation.IngressFound, observation.FinalContainer.ID, state.Identity.FinalContainer) &&
+		validGatewayV2RunningApplicationNetworkIDs(state, observation.FinalRuntime, observation.ApplicationNetworkIDs) &&
 		validGatewayV2ApplicationNetworks(state, observation.FinalContainer, observation.ApplicationNetworks, observation.ApplicationNetworkIDs) &&
 		configProven && observation.Final404Proven && observation.FinalRoutesProven && observation.FinalHostPublicationProven &&
 		observation.FinalEndpointIdentityProven && observation.FinalStable
@@ -668,9 +685,16 @@ func validGatewayPinnedImage(value imageInspection, found bool) bool {
 }
 
 func validGatewayV1Base(source routeState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation, requireRollbackTopology bool) bool {
+	if !observation.V1Container.Running {
+		if observation.V1Container.Restarting || (journal.Phase != gatewayPhaseTransferIntent && journal.Phase != gatewayPhaseRollbackIntent &&
+			journal.Phase != gatewayPhaseV2Serving && journal.Phase != gatewayPhaseCommitted) {
+			return false
+		}
+		return validStoppedGatewayV1Base(source, journal, observation, requireRollbackTopology)
+	}
 	if !observation.V1ContainerFound || !observation.V1VolumeFound || !observation.V1NetworkFound ||
 		!validGatewayContainerRuntime(observation.V1Runtime, true) ||
-		!reflect.DeepEqual(observation.V1Runtime.EffectivePortBindings, observation.V1Container.PortBindings) ||
+		!gatewayV2EffectivePortBindingsMatchConfigured(observation.V1Runtime.EffectivePortBindings, observation.V1Container.PortBindings) ||
 		!validCaddyInspection(observation.V1Container, observation.Image.ID, journal.Source.LocalHostPort) ||
 		observation.V1Volume.Name != caddyVolumeName || observation.V1Volume.Driver != "local" || observation.V1Volume.Scope != "local" ||
 		len(observation.V1Volume.Options) != 0 || observation.V1Volume.Labels[gatewayV2ManagedLabelKey] != gatewayV2ManagedContainerLabel ||
@@ -700,6 +724,90 @@ func validGatewayV1Base(source routeState, journal gatewayMigrationJournal, obse
 		inspection, exists := observation.V1ApplicationNetworks[name]
 		if !exists || !validContainerID(observation.V1ApplicationNetworkIDs[name]) || !validApplicationNetwork(inspection.identity(), appID) ||
 			!validGatewayApplicationNetworkMembership(inspection, observation.V1Container, name) {
+			return false
+		}
+	}
+	identityDigest, err := gatewayV1ObservedIdentityDigest(observation)
+	return err == nil && identityDigest == journal.Source.IdentityDigest
+}
+
+// Docker retains HostConfig and configured network keys after stop but clears
+// effective host publications and live network endpoints. This proof uses the
+// independently inspected network identities before authorizing recovery.
+func validStoppedGatewayV1Base(source routeState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation, requireRollbackTopology bool) bool {
+	container, runtime := observation.V1Container, observation.V1Runtime
+	if !observation.V1ContainerFound || !observation.V1VolumeFound || !observation.V1NetworkFound ||
+		container.Running || container.Restarting || !validGatewayContainerRuntime(runtime, true) ||
+		gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings) ||
+		!validCaddyInspection(container, observation.Image.ID, journal.Source.LocalHostPort) ||
+		observation.V1Volume.Name != caddyVolumeName || observation.V1Volume.Driver != "local" || observation.V1Volume.Scope != "local" ||
+		len(observation.V1Volume.Options) != 0 || observation.V1Volume.Labels[gatewayV2ManagedLabelKey] != gatewayV2ManagedContainerLabel ||
+		observation.V1Volume.Labels[gatewayV2IdentityLabelKey] != gatewayV1IdentityVersion ||
+		len(observation.V1Network.Containers) != 0 || len(observation.V1Config) != 0 {
+		return false
+	}
+	listenIP, valid := ingressNetworkIdentity(observation.V1Network.identity())
+	if !valid {
+		return false
+	}
+	expectedConfig, err := buildCaddyConfig(source.Active, net.JoinHostPort(listenIP, strconv.FormatUint(uint64(gatewayV2ContainerPort), 10)))
+	if err != nil || !sameCaddyConfig(expectedConfig, observation.V1RestartConfig) {
+		return false
+	}
+	owners, valid := gatewayRouteNetworkOwners(source.Active)
+	if !valid || len(container.Networks) != len(runtime.ConfiguredNetworks) ||
+		(requireRollbackTopology && len(container.Networks) != len(owners)+1) {
+		return false
+	}
+	for name := range container.Networks {
+		if name != caddyNetworkName && owners[name] == "" {
+			return false
+		}
+	}
+	validStoppedAttachment := func(name, inspectedID string, gatewayPriority int, staticIPv4 string) bool {
+		live, exists := container.Networks[name]
+		configured, configuredExists := runtime.ConfiguredNetworks[name]
+		if !exists || live == nil || !configuredExists || live.IPAddress != "" || live.IPv6Gateway != "" ||
+			live.GwPriority != gatewayPriority || configured.EndpointID != "" || configured.IPAddress != "" ||
+			configured.IPv6Gateway != "" || configured.GwPriority != gatewayPriority ||
+			!(inspectedID == "" && configured.NetworkID == "" ||
+				inspectedID != "" && validGatewayV2StoppedNetworkReference(configured.NetworkID, inspectedID)) {
+			return false
+		}
+		if staticIPv4 != "" {
+			return configured.IPAMConfig != nil && *configured.IPAMConfig == (gatewayV2ConfiguredIPAM{IPv4Address: staticIPv4})
+		}
+		return configured.IPAMConfig == nil || *configured.IPAMConfig == (gatewayV2ConfiguredIPAM{})
+	}
+	if !validStoppedAttachment(caddyNetworkName, observation.V1NetworkID, caddyGatewayPriority, listenIP) {
+		return false
+	}
+	if requireRollbackTopology && (len(observation.V1ApplicationNetworks) != len(owners) || len(observation.V1ApplicationNetworkIDs) != len(owners)) {
+		return false
+	}
+	containerName := strings.TrimPrefix(container.Name, "/")
+	for name, appID := range owners {
+		if !requireRollbackTopology {
+			_, containerHasNetwork := container.Networks[name]
+			_, runtimeHasNetwork := runtime.ConfiguredNetworks[name]
+			if !containerHasNetwork && !runtimeHasNetwork {
+				continue
+			}
+		}
+		inspectedID := runtime.ConfiguredNetworks[name].NetworkID
+		if requireRollbackTopology {
+			inspection, exists := observation.V1ApplicationNetworks[name]
+			inspectedID = observation.V1ApplicationNetworkIDs[name]
+			if !exists || !validContainerID(inspectedID) || !validApplicationNetwork(inspection.identity(), appID) {
+				return false
+			}
+			for memberID, member := range inspection.Containers {
+				if normalizeID(memberID) == normalizeID(container.ID) || member.Name == containerName {
+					return false
+				}
+			}
+		}
+		if !validStoppedAttachment(name, inspectedID, 0, "") {
 			return false
 		}
 	}
@@ -779,22 +887,35 @@ func validGatewayV2StoppedContainer(state gatewayV2RouteState, journal gatewayMi
 	return validGatewayV2ContainerState(state, journal, value, runtime, found, role, imageID, false)
 }
 
+// The stage Docker name is 65 bytes with a UUID, exceeding Linux HOST_NAME_MAX.
+// Keep the full operation ID in a shorter hostname while retaining the Docker name.
+func gatewayV2ExpectedHostname(state gatewayV2RouteState, role string) string {
+	switch role {
+	case gatewayV2StageContainerRole:
+		return gatewayV2StageHostnameBase + state.OperationID
+	case gatewayV2FinalContainerRole:
+		return state.Identity.FinalContainer
+	default:
+		return ""
+	}
+}
+
 func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigrationJournal, value caddyInspection, runtime gatewayContainerRuntime, found bool, role, imageID string, running bool) bool {
 	name, configFilename, restart := state.Identity.StageContainer, state.Identity.StageConfigFilename, gatewayV2StageRestartPolicy
 	if role == gatewayV2FinalContainerRole {
 		name, configFilename, restart = state.Identity.FinalContainer, state.Identity.ActiveConfigFilename, gatewayV2FinalRestartPolicy
 	}
 	if !found || value.Running != running || value.Restarting || !validGatewayContainerRuntime(runtime, false) || !validContainerID(value.ID) || normalizeID(value.Image) != normalizeID(imageID) ||
-		strings.TrimPrefix(value.Name, "/") != name || value.Hostname != name || value.User != "1000:1000" || value.NetworkMode != state.Identity.IngressNetwork ||
+		strings.TrimPrefix(value.Name, "/") != name || value.Hostname != gatewayV2ExpectedHostname(state, role) || value.User != "1000:1000" || value.NetworkMode != state.Identity.IngressNetwork ||
 		!exactGatewayV2Environment(value.Env) || !value.ReadOnly || value.Privileged || !onlyCaddyCapability(value.CapAdd) || !exactFoldSet(value.CapDrop, "ALL") ||
 		!onlyNoNewPrivileges(value.SecurityOpt) || len(value.Binds) != 0 || len(value.Tmpfs) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 ||
 		value.NanoCPUs != 1_000_000_000 || value.PIDsLimit != 128 || value.LogType != "local" || len(value.LogConfig) != 2 ||
 		value.LogConfig["max-size"] != "10m" || value.LogConfig["max-file"] != "3" || value.Restart != restart ||
 		len(value.Entrypoint) != 1 || value.Entrypoint[0] != caddyExecutable || len(value.Cmd) != 3 || value.Cmd[0] != "run" || value.Cmd[1] != "--config" ||
 		value.Cmd[2] != "/config/"+configFilename || len(value.Ulimits) != 1 || value.Ulimits[0] != (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}) ||
-		!reflect.DeepEqual(value.Labels, gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true)) ||
+		!validGatewayV2ContainerLabels(value.Labels, gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true)) ||
 		!validGatewayV2Mounts(value.Mounts, state.Identity) || !validGatewayV2PortBindings(value.PortBindings, state, journal, role) ||
-		(running && !reflect.DeepEqual(runtime.EffectivePortBindings, value.PortBindings)) ||
+		(running && !gatewayV2EffectivePortBindingsMatchConfigured(runtime.EffectivePortBindings, value.PortBindings)) ||
 		(!running && gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings)) {
 		return false
 	}
@@ -803,7 +924,10 @@ func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigr
 		return false
 	}
 	if !running {
-		return validGatewayV2StoppedContainerNetworks(state, role, expectedNetworks, runtime.ConfiguredNetworks)
+		return validGatewayV2StoppedContainerNetworks(state, journal, role, expectedNetworks, runtime.ConfiguredNetworks)
+	}
+	if !validGatewayV2RunningContainerNetworks(state, journal, expectedNetworks, runtime.ConfiguredNetworks) {
+		return false
 	}
 	if len(value.Networks) != len(expectedNetworks) {
 		return false
@@ -824,16 +948,44 @@ func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigr
 	return true
 }
 
-func validGatewayV2StoppedContainerNetworks(state gatewayV2RouteState, role string, expected map[string]struct{}, actual map[string]gatewayV2ConfiguredNetwork) bool {
+// Docker combines labels declared by the pinned image with labels supplied at
+// container creation. Treat only Rig's namespace as authoritative container
+// identity: every expected Rig label must match exactly and no additional Rig
+// label may be present. Foreign image metadata does not participate in
+// ownership or mutation authorization.
+func validGatewayV2ContainerLabels(actual, expected map[string]string) bool {
+	for key, expectedValue := range expected {
+		actualValue, exists := actual[key]
+		if !exists || actualValue != expectedValue {
+			return false
+		}
+	}
+	for key := range actual {
+		if strings.HasPrefix(key, "io.rig.") {
+			if _, expectedKey := expected[key]; !expectedKey {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validGatewayV2StoppedContainerNetworks(state gatewayV2RouteState, journal gatewayMigrationJournal, role string,
+	expected map[string]struct{}, actual map[string]gatewayV2ConfiguredNetwork,
+) bool {
 	if len(actual) != len(expected) {
 		return false
 	}
 	for name := range expected {
 		attachment, exists := actual[name]
-		if !exists || !validContainerID(attachment.NetworkID) || attachment.EndpointID != "" || attachment.IPAddress != "" || attachment.IPv6Gateway != "" {
+		if !exists || (attachment.NetworkID != "" && !validContainerID(attachment.NetworkID)) ||
+			attachment.EndpointID != "" || attachment.IPAddress != "" || attachment.IPv6Gateway != "" {
 			return false
 		}
 		if name == state.Identity.IngressNetwork {
+			if attachment.NetworkID != "" && normalizeID(attachment.NetworkID) != journal.Resources.IngressNetworkID {
+				return false
+			}
 			if attachment.GwPriority != caddyGatewayPriority || attachment.IPAMConfig == nil ||
 				attachment.IPAMConfig.IPv4Address != state.Network.ContainerIPv4 || attachment.IPAMConfig.IPv6Address != "" {
 				return false
@@ -848,6 +1000,24 @@ func validGatewayV2StoppedContainerNetworks(state gatewayV2RouteState, role stri
 	return true
 }
 
+func validGatewayV2RunningContainerNetworks(state gatewayV2RouteState, journal gatewayMigrationJournal,
+	expected map[string]struct{}, actual map[string]gatewayV2ConfiguredNetwork,
+) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for name := range expected {
+		attachment, exists := actual[name]
+		if !exists || !validContainerID(attachment.NetworkID) {
+			return false
+		}
+		if name == state.Identity.IngressNetwork && normalizeID(attachment.NetworkID) != journal.Resources.IngressNetworkID {
+			return false
+		}
+	}
+	return true
+}
+
 func gatewayV2HasEffectivePortBinding(values map[string][]map[string]string) bool {
 	for _, bindings := range values {
 		if len(bindings) != 0 {
@@ -855,6 +1025,25 @@ func gatewayV2HasEffectivePortBinding(values map[string][]map[string]string) boo
 		}
 	}
 	return false
+}
+
+// Docker's NetworkSettings.Ports includes empty entries for ports exposed by
+// the image even when HostConfig.PortBindings contains only the ports Rig
+// published. Preserve exact equality for every configured publication while
+// accepting only those additional keys that have no effective host binding.
+func gatewayV2EffectivePortBindingsMatchConfigured(effective, configured map[string][]map[string]string) bool {
+	for port, expected := range configured {
+		actual, exists := effective[port]
+		if !exists || !reflect.DeepEqual(actual, expected) {
+			return false
+		}
+	}
+	for port, bindings := range effective {
+		if _, expected := configured[port]; !expected && len(bindings) != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func exactGatewayV2Environment(values []string) bool {
@@ -921,6 +1110,25 @@ func validGatewayV2ApplicationNetworks(state gatewayV2RouteState, container cadd
 		inspection, exists := inspections[name]
 		if !exists || !validContainerID(ids[name]) || name == state.Identity.IngressNetwork || !validApplicationNetwork(inspection.identity(), appID) ||
 			!validGatewayApplicationNetworkMembership(inspection, container, name) {
+			return false
+		}
+	}
+	return true
+}
+
+func validGatewayV2RunningApplicationNetworkIDs(state gatewayV2RouteState, runtime gatewayContainerRuntime,
+	inspectedIDs map[string]string,
+) bool {
+	expected, valid := gatewayV2ApplicationNetworkOwners(state)
+	if !valid || len(inspectedIDs) != len(expected) {
+		return false
+	}
+	for name := range expected {
+		inspectedID, inspected := inspectedIDs[name]
+		configured, attached := runtime.ConfiguredNetworks[name]
+		if !inspected || !attached || name == state.Identity.IngressNetwork ||
+			!validContainerID(inspectedID) || !validContainerID(configured.NetworkID) ||
+			normalizeID(configured.NetworkID) != normalizeID(inspectedID) {
 			return false
 		}
 	}
@@ -1302,7 +1510,15 @@ func gatewayV2ResourceLabels(state gatewayV2RouteState, journal gatewayMigration
 func validOwnedNameSet(actual []string, expected ...string) bool {
 	wanted := append([]string(nil), expected...)
 	sort.Strings(wanted)
-	return reflect.DeepEqual(actual, wanted)
+	if len(actual) != len(wanted) {
+		return false
+	}
+	for index := range wanted {
+		if actual[index] != wanted[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func mustGatewayV2PrefixBits(subnet string) int {

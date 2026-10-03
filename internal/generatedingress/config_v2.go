@@ -34,17 +34,18 @@ type caddyV2LANAssignment struct {
 	AccessSpecDigest     string
 }
 
-// buildCaddyConfigV2 preserves the v1 .rig.localhost server and adds one
-// dedicated server for every LAN pool port. A port can select at most one app,
-// and that app is served only for the approved IPv4 Host. All other requests
-// and all unassigned ports terminate with a generic 404.
+// buildCaddyConfigV2 preserves the v1 .rig.localhost app routes, adds an
+// explicit wrong-Host 404 fallback, and adds one dedicated server for every
+// LAN pool port. A port can select at most one app, and that app is served
+// only for the approved IPv4 Host. All other requests and all unassigned
+// ports terminate with a generic 404.
 func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string, profile caddyV2Profile, assignments map[uint16]caddyV2LANAssignment) ([]byte, error) {
 	if !validCaddyV2Profile(profile) {
 		return nil, errors.New("invalid generated ingress LAN profile")
 	}
 
 	// Building the local server first deliberately reuses every v1 validation
-	// and routing rule. The resulting server is copied without modification.
+	// and app routing rule. The v2 server adds only an unmatched-Host fallback.
 	localBody, err := buildCaddyConfig(routes, localListenAddress)
 	if err != nil {
 		return nil, err
@@ -66,20 +67,21 @@ func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string
 	if err := validateCaddyV2Assignments(routes, profile, assignments); err != nil {
 		return nil, err
 	}
+	local := result.Apps.HTTP.Servers["generated"]
 	if profile.ProbeToken != "" {
 		appIDs := make([]string, 0, len(routes))
 		for appID := range routes {
 			appIDs = append(appIDs, appID)
 		}
 		sort.Strings(appIDs)
-		local := result.Apps.HTTP.Servers["generated"]
 		probes := make([]caddyRoute, 0, len(appIDs)+len(local.Routes))
 		for _, appID := range appIDs {
 			probes = append(probes, gatewayV2ProbeRoute(appID+".rig.localhost", gatewayV2AppChallenge(profile.ProbeToken, appID)))
 		}
 		local.Routes = append(probes, local.Routes...)
-		result.Apps.HTTP.Servers["generated"] = local
 	}
+	local.Routes = append(local.Routes, notFoundRoute())
+	result.Apps.HTTP.Servers["generated"] = local
 
 	for port := profile.PortStart; ; port++ {
 		server := caddyServer{

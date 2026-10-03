@@ -59,8 +59,8 @@ func TestBuildCaddyConfigV2AddsStateBoundLocalAppProbesBeforeProxyRoutes(t *test
 	}
 	local := config.Apps.HTTP.Servers["generated"]
 	challenge := gatewayV2AppChallenge(token, appID)
-	if len(local.Routes) != 2 || !reflect.DeepEqual(local.Routes[0], gatewayV2ProbeRoute(appID+".rig.localhost", challenge)) ||
-		local.Routes[1].Handle[0].Handler != "reverse_proxy" {
+	if len(local.Routes) != 3 || !reflect.DeepEqual(local.Routes[0], gatewayV2ProbeRoute(appID+".rig.localhost", challenge)) ||
+		local.Routes[1].Handle[0].Handler != "reverse_proxy" || !reflect.DeepEqual(local.Routes[2], notFoundRoute()) {
 		t.Fatalf("local app challenge ordering = %#v", local.Routes)
 	}
 }
@@ -142,8 +142,10 @@ func TestBuildCaddyConfigV2KeepsLocalRoutesAndIsolatesLANPorts(t *testing.T) {
 	if err := json.Unmarshal(v1Body, &v1); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(config.Apps.HTTP.Servers["generated"], v1.Apps.HTTP.Servers["generated"]) {
-		t.Fatal("v2 changed the existing .rig.localhost server")
+	v1Local := v1.Apps.HTTP.Servers["generated"]
+	v1Local.Routes = append(v1Local.Routes, notFoundRoute())
+	if !reflect.DeepEqual(config.Apps.HTTP.Servers["generated"], v1Local) {
+		t.Fatal("v2 changed a local app route or omitted the wrong-Host 404 fallback")
 	}
 
 	for name, server := range config.Apps.HTTP.Servers {
