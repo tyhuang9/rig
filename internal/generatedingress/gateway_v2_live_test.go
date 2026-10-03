@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -690,6 +691,7 @@ const (
 	liveGatewayV2TraceTransferObserveRecovery        liveGatewayV2TraceStep = "transfer_observe_recovery"
 	liveGatewayV2TraceTransferFinalStabilityDetail   liveGatewayV2TraceStep = "transfer_final_stability_detail"
 	liveGatewayV2TraceTransferProveFinalRoutes       liveGatewayV2TraceStep = "transfer_prove_final_routes"
+	liveGatewayV2TraceTransferFinalRouteDetail       liveGatewayV2TraceStep = "transfer_final_route_detail"
 	liveGatewayV2TraceTransferSelectedInterface      liveGatewayV2TraceStep = "transfer_selected_interface"
 	liveGatewayV2TraceTransferCopyFinalConfig        liveGatewayV2TraceStep = "transfer_copy_final_config"
 	liveGatewayV2TraceTransferReadFinalConfig        liveGatewayV2TraceStep = "transfer_read_final_config"
@@ -1965,7 +1967,75 @@ func (d liveGatewayV2TracingTransferDriver) proveFinalHostRoutes(ctx context.Con
 ) bool {
 	result := d.gatewayV2TransferDriver.proveFinalHostRoutes(ctx, state, journal)
 	d.trace.recordAt(liveGatewayV2TraceTransferProveFinalRoutes, journal.Phase, liveGatewayV2BoolOutcome(result))
+	if !result {
+		// A second read-only probe distinguishes unavailable host publication
+		// from an incorrect response without changing the production decision.
+		for _, outcome := range liveGatewayV2FinalRouteFailureOutcomes(ctx, state, journal, probeGatewayV2HostStatus) {
+			d.trace.recordAt(liveGatewayV2TraceTransferFinalRouteDetail, journal.Phase, outcome)
+		}
+	}
 	return result
+}
+
+const (
+	liveGatewayV2TraceFinalRouteInvalidInputs        liveGatewayV2TraceOutcome = "final_route_invalid_inputs"
+	liveGatewayV2TraceFinalRouteWrongHostUnreachable liveGatewayV2TraceOutcome = "final_route_wrong_host_unreachable"
+	liveGatewayV2TraceFinalRouteWrongHostNot404      liveGatewayV2TraceOutcome = "final_route_wrong_host_not_404"
+	liveGatewayV2TraceFinalRouteChallengeBuild       liveGatewayV2TraceOutcome = "final_route_challenge_build_failed"
+	liveGatewayV2TraceFinalRouteChallengeUnreachable liveGatewayV2TraceOutcome = "final_route_app_challenge_unreachable"
+	liveGatewayV2TraceFinalRouteChallengeNot404      liveGatewayV2TraceOutcome = "final_route_app_challenge_not_404"
+	liveGatewayV2TraceFinalRouteChallengeBody        liveGatewayV2TraceOutcome = "final_route_app_challenge_body_mismatch"
+	liveGatewayV2TraceFinalRouteRootUnreachable      liveGatewayV2TraceOutcome = "final_route_app_root_unreachable"
+	liveGatewayV2TraceFinalRouteRootStatus           liveGatewayV2TraceOutcome = "final_route_app_root_invalid_status"
+	liveGatewayV2TraceFinalRouteRecheckPassed        liveGatewayV2TraceOutcome = "final_route_recheck_passed"
+)
+
+func liveGatewayV2FinalRouteFailureOutcomes(ctx context.Context, state gatewayV2RouteState,
+	journal gatewayMigrationJournal, probe gatewayV2HostStatusProbe,
+) []liveGatewayV2TraceOutcome {
+	if ctx == nil || probe == nil || !validGatewayV2RouteState(state) || !validGatewayMigrationJournal(journal) ||
+		journal.OperationID != state.OperationID || journal.Source.LocalHostPort == 0 {
+		return []liveGatewayV2TraceOutcome{liveGatewayV2TraceFinalRouteInvalidInputs}
+	}
+	failures := make([]liveGatewayV2TraceOutcome, 0, len(state.Apps)*2+1)
+	result := probe(ctx, "127.0.0.1", journal.Source.LocalHostPort, "wrong.invalid", "/")
+	if ctx.Err() != nil || !result.Connected || !result.Responded {
+		failures = append(failures, liveGatewayV2TraceFinalRouteWrongHostUnreachable)
+	} else if result.Status != http.StatusNotFound {
+		failures = append(failures, liveGatewayV2TraceFinalRouteWrongHostNot404)
+	}
+	challenge, err := gatewayV2HostChallenge(state)
+	if err != nil {
+		return append(failures, liveGatewayV2TraceFinalRouteChallengeBuild)
+	}
+	appIDs := make([]string, 0, len(state.Apps))
+	for appID := range state.Apps {
+		appIDs = append(appIDs, appID)
+	}
+	sort.Strings(appIDs)
+	for _, appID := range appIDs {
+		appChallenge := gatewayV2AppChallenge(challenge, appID)
+		host := appID + ".rig.localhost"
+		result := probe(ctx, "127.0.0.1", journal.Source.LocalHostPort, host, gatewayV2ChallengePathPrefix+appChallenge)
+		switch {
+		case ctx.Err() != nil || !result.Connected || !result.Responded:
+			failures = append(failures, liveGatewayV2TraceFinalRouteChallengeUnreachable)
+		case result.Status != http.StatusNotFound:
+			failures = append(failures, liveGatewayV2TraceFinalRouteChallengeNot404)
+		case result.Body != gatewayV2ChallengeBodyPrefix+appChallenge:
+			failures = append(failures, liveGatewayV2TraceFinalRouteChallengeBody)
+		}
+		result = probe(ctx, "127.0.0.1", journal.Source.LocalHostPort, host, "/")
+		if ctx.Err() != nil || !result.Connected || !result.Responded {
+			failures = append(failures, liveGatewayV2TraceFinalRouteRootUnreachable)
+		} else if result.Status < 200 || result.Status > 599 {
+			failures = append(failures, liveGatewayV2TraceFinalRouteRootStatus)
+		}
+	}
+	if len(failures) == 0 {
+		return []liveGatewayV2TraceOutcome{liveGatewayV2TraceFinalRouteRecheckPassed}
+	}
+	return failures
 }
 
 func (d liveGatewayV2TracingTransferDriver) selectedInterfacePreflight(profile gatewayProfileBinding) error {
