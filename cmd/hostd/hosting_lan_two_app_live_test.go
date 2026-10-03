@@ -137,6 +137,7 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	}
 	access := appaccess.New(db)
 	grantTrace := &lanTwoAppGrantTrace{Manager: composition.ingress}
+	composition.ingress.TraceGatewayV2LANGrantForLiveDocker(grantTrace.recordDriver)
 	t.Cleanup(func() { grantTrace.logFailure(t) })
 	api := httptest.NewServer((&controller.Server{
 		Auth: authService, Apps: appStore, Jobs: jobStore, Machines: machineStore, Sources: sources,
@@ -407,7 +408,19 @@ func (trace *lanTwoAppGrantTrace) record(stage string, err error, disposition ge
 	}
 	trace.mu.Lock()
 	defer trace.mu.Unlock()
-	if len(trace.events) < 24 {
+	if len(trace.events) < 64 {
+		trace.events = append(trace.events, stage+":"+outcome)
+	}
+}
+
+func (trace *lanTwoAppGrantTrace) recordDriver(stage string, ok bool) {
+	outcome := "failed"
+	if ok {
+		outcome = "ok"
+	}
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	if len(trace.events) < 64 {
 		trace.events = append(trace.events, stage+":"+outcome)
 	}
 }
