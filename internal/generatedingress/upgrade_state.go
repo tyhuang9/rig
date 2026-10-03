@@ -43,6 +43,7 @@ const (
 	gatewayV2DataVolumeName      = "rig-generated-caddy-data-v2"
 	gatewayV2NetworkName         = "rig-generated-caddy-ingress-v2"
 	gatewayV2StageContainerBase  = "rig-generated-caddy-v2-stage-"
+	gatewayV2StageHostnameBase   = "rig-caddy-v2-stage-"
 	gatewayV2StageConfigFilename = "stage.json"
 	gatewayV2ActiveConfigFile    = "active.json"
 	gatewayV2CaddyImageDigest    = "sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"

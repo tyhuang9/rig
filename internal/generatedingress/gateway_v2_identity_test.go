@@ -476,6 +476,9 @@ func TestClassifyGatewayV2StageFailsClosedWithoutRestartAndPublicationProof(t *t
 		{"stage paused", func(value *gatewayV2DockerObservation) { value.StageRuntime.Paused = true }},
 		{"stage restarted", func(value *gatewayV2DockerObservation) { value.StageRuntime.RestartCount = 1 }},
 		{"bound stage ID changed", func(value *gatewayV2DockerObservation) { value.StageContainer.ID = "sha256:" + strings.Repeat("9", 64) }},
+		{"stage hostname changed to overlong container name", func(value *gatewayV2DockerObservation) {
+			value.StageContainer.Hostname = strings.TrimPrefix(value.StageContainer.Name, "/")
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			source, state, journal := gatewayV2IdentityTestState(t)
@@ -1055,10 +1058,12 @@ func gatewayV2IdentityTestV2Container(state gatewayV2RouteState, journal gateway
 	if role == gatewayV2FinalContainerRole {
 		bindings["8080/tcp"] = []map[string]string{{"HostIp": "127.0.0.1", "HostPort": strconvForGatewayTest(journal.Source.LocalHostPort)}}
 	}
-	return gatewayV2IdentityTestContainer(name, id, imageID, state.Identity.IngressNetwork,
+	container := gatewayV2IdentityTestContainer(name, id, imageID, state.Identity.IngressNetwork,
 		gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true), networks, bindings,
 		[]mountInspection{{Type: "volume", Name: state.Identity.ConfigVolume, Destination: "/config", RW: true},
 			{Type: "volume", Name: state.Identity.DataVolume, Destination: "/data", RW: true}}, restart, config)
+	container.Hostname = gatewayV2ExpectedHostname(state, role)
+	return container
 }
 
 func gatewayV2IdentityTestConfiguredNetworks(state gatewayV2RouteState, container caddyInspection, ingressNetworkID string,

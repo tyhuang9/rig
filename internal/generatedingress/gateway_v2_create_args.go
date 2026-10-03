@@ -59,7 +59,7 @@ func gatewayV2ContainerCreateArgs(state gatewayV2RouteState, journal gatewayMigr
 		return nil, &Error{Code: DiagnosticValidationFailed}
 	}
 	args := []string{
-		"container", "create", "--name", name, "--hostname", name,
+		"container", "create", "--name", name, "--hostname", gatewayV2ExpectedHostname(state, role),
 		"--network", "name=" + state.Identity.IngressNetwork + ",ip=" + state.Network.ContainerIPv4 + ",gw-priority=1",
 		"--mount", "type=volume,src=" + state.Identity.ConfigVolume + ",dst=/config",
 		"--mount", "type=volume,src=" + state.Identity.DataVolume + ",dst=/data",

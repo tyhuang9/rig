@@ -1058,7 +1058,7 @@ func liveGatewayV2StoppedContainerFailureOutcomes(state gatewayV2RouteState, jou
 	add(liveGatewayV2TraceCreatePredicateRuntimeState, !value.Running && !value.Restarting &&
 		validGatewayContainerRuntime(runtime, false) && validContainerID(value.ID) && normalizeID(value.Image) == normalizeID(imageID))
 	add(liveGatewayV2TraceCreatePredicateIdentity,
-		strings.TrimPrefix(value.Name, "/") == name && value.Hostname == name && value.NetworkMode == state.Identity.IngressNetwork)
+		strings.TrimPrefix(value.Name, "/") == name && value.Hostname == gatewayV2ExpectedHostname(state, role) && value.NetworkMode == state.Identity.IngressNetwork)
 	add(liveGatewayV2TraceCreatePredicateExecution, value.User == "1000:1000" && exactGatewayV2Environment(value.Env))
 	add(liveGatewayV2TraceCreatePredicateIsolation, value.ReadOnly && !value.Privileged && onlyCaddyCapability(value.CapAdd) &&
 		exactFoldSet(value.CapDrop, "ALL") && onlyNoNewPrivileges(value.SecurityOpt) && len(value.Binds) == 0 && len(value.Tmpfs) == 0)

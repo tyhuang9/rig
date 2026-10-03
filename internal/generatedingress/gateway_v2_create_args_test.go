@@ -41,10 +41,15 @@ func TestGatewayV2CreateArgsBindExactResourcesAndPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(gatewayV2ArgValues(stage, "--publish"), gatewayV2ExpectedLANPublishArgs(state)) ||
+		!reflect.DeepEqual(gatewayV2ArgValues(stage, "--name"), []string{state.Identity.StageContainer}) ||
+		!reflect.DeepEqual(gatewayV2ArgValues(stage, "--hostname"), []string{gatewayV2StageHostnameBase + state.OperationID}) ||
 		!reflect.DeepEqual(gatewayV2ArgValues(stage, "--network"), []string{"name=" + state.Identity.IngressNetwork + ",ip=" + state.Network.ContainerIPv4 + ",gw-priority=1"}) ||
 		!reflect.DeepEqual(gatewayV2ArgValues(stage, "--restart"), []string{"no"}) ||
 		!reflect.DeepEqual(stage[len(stage)-4:], []string{imageID, "run", "--config", "/config/stage.json"}) {
 		t.Fatalf("stage container args = %v", stage)
+	}
+	if len(gatewayV2ExpectedHostname(state, gatewayV2StageContainerRole)) > 63 || len(state.Identity.StageContainer) <= 64 {
+		t.Fatal("stage hostname must fit a DNS label while retaining the full operation ID")
 	}
 	assertGatewayV2CreateHardening(t, stage)
 
@@ -61,6 +66,7 @@ func TestGatewayV2CreateArgsBindExactResourcesAndPorts(t *testing.T) {
 		"name=net-b",
 	}
 	if !reflect.DeepEqual(gatewayV2ArgValues(final, "--publish"), wantPorts) ||
+		!reflect.DeepEqual(gatewayV2ArgValues(final, "--hostname"), []string{state.Identity.FinalContainer}) ||
 		!reflect.DeepEqual(gatewayV2ArgValues(final, "--network"), wantNetworks) ||
 		!reflect.DeepEqual(gatewayV2ArgValues(final, "--restart"), []string{"unless-stopped"}) ||
 		!reflect.DeepEqual(final[len(final)-4:], []string{imageID, "run", "--config", "/config/active.json"}) {

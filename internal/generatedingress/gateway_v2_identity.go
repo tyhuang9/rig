@@ -780,13 +780,26 @@ func validGatewayV2StoppedContainer(state gatewayV2RouteState, journal gatewayMi
 	return validGatewayV2ContainerState(state, journal, value, runtime, found, role, imageID, false)
 }
 
+// The stage Docker name is 65 bytes with a UUID, exceeding Linux HOST_NAME_MAX.
+// Keep the full operation ID in a shorter hostname while retaining the Docker name.
+func gatewayV2ExpectedHostname(state gatewayV2RouteState, role string) string {
+	switch role {
+	case gatewayV2StageContainerRole:
+		return gatewayV2StageHostnameBase + state.OperationID
+	case gatewayV2FinalContainerRole:
+		return state.Identity.FinalContainer
+	default:
+		return ""
+	}
+}
+
 func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigrationJournal, value caddyInspection, runtime gatewayContainerRuntime, found bool, role, imageID string, running bool) bool {
 	name, configFilename, restart := state.Identity.StageContainer, state.Identity.StageConfigFilename, gatewayV2StageRestartPolicy
 	if role == gatewayV2FinalContainerRole {
 		name, configFilename, restart = state.Identity.FinalContainer, state.Identity.ActiveConfigFilename, gatewayV2FinalRestartPolicy
 	}
 	if !found || value.Running != running || value.Restarting || !validGatewayContainerRuntime(runtime, false) || !validContainerID(value.ID) || normalizeID(value.Image) != normalizeID(imageID) ||
-		strings.TrimPrefix(value.Name, "/") != name || value.Hostname != name || value.User != "1000:1000" || value.NetworkMode != state.Identity.IngressNetwork ||
+		strings.TrimPrefix(value.Name, "/") != name || value.Hostname != gatewayV2ExpectedHostname(state, role) || value.User != "1000:1000" || value.NetworkMode != state.Identity.IngressNetwork ||
 		!exactGatewayV2Environment(value.Env) || !value.ReadOnly || value.Privileged || !onlyCaddyCapability(value.CapAdd) || !exactFoldSet(value.CapDrop, "ALL") ||
 		!onlyNoNewPrivileges(value.SecurityOpt) || len(value.Binds) != 0 || len(value.Tmpfs) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 ||
 		value.NanoCPUs != 1_000_000_000 || value.PIDsLimit != 128 || value.LogType != "local" || len(value.LogConfig) != 2 ||
