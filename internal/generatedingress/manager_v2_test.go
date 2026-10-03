@@ -14,14 +14,23 @@ import (
 )
 
 type committedV2Runner struct {
-	files    map[string][]byte
-	commands [][]string
+	containerID string
+	files       map[string][]byte
+	commands    [][]string
+}
+
+func newCommittedV2Runner() *committedV2Runner {
+	return &committedV2Runner{containerID: upgradeResourceID('e'), files: make(map[string][]byte)}
 }
 
 func (r *committedV2Runner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
 	args := append([]string(nil), request.Args...)
 	r.commands = append(r.commands, args)
 	if len(args) == 4 && args[0] == "container" && args[1] == "cp" && args[3] != "-" {
+		target := strings.SplitN(args[3], ":", 2)
+		if len(target) != 2 || target[0] != r.containerID {
+			return runtimeprocess.CommandResult{}, errors.New("v2 config targeted a replacement container")
+		}
 		body, err := os.ReadFile(args[2])
 		if err != nil {
 			return runtimeprocess.CommandResult{}, err
@@ -29,15 +38,15 @@ func (r *committedV2Runner) Run(_ context.Context, request runtimeprocess.Comman
 		r.files[args[3]] = append([]byte(nil), body...)
 		return runtimeprocess.CommandResult{}, nil
 	}
-	if len(args) >= 7 && args[0] == "container" && args[1] == "exec" && args[2] == gatewayV2ContainerName && args[3] == "caddy" {
-		if _, ok := r.files[gatewayV2ContainerName+":"+args[6]]; !ok {
+	if len(args) >= 7 && args[0] == "container" && args[1] == "exec" && args[2] == r.containerID && args[3] == "caddy" {
+		if _, ok := r.files[r.containerID+":"+args[6]]; !ok {
 			return runtimeprocess.CommandResult{}, errors.New("missing v2 config")
 		}
 		return runtimeprocess.CommandResult{}, nil
 	}
-	if len(args) == 8 && args[0] == "container" && args[1] == "exec" && args[2] == "--user" && args[3] == "0:0" && args[4] == gatewayV2ContainerName {
-		source := gatewayV2ContainerName + ":" + args[6]
-		destination := gatewayV2ContainerName + ":" + args[7]
+	if len(args) == 8 && args[0] == "container" && args[1] == "exec" && args[2] == "--user" && args[3] == "0:0" && args[4] == r.containerID {
+		source := r.containerID + ":" + args[6]
+		destination := r.containerID + ":" + args[7]
 		body, ok := r.files[source]
 		if !ok {
 			return runtimeprocess.CommandResult{}, errors.New("missing v2 restart config")
@@ -54,10 +63,29 @@ func (r *committedV2Runner) Run(_ context.Context, request runtimeprocess.Comman
 	return runtimeprocess.CommandResult{}, errors.New("unexpected committed v2 Docker command")
 }
 
+func TestCommittedV2FinalContainerRequiresJournalBoundIdentity(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Phase = gatewayPhaseCommitted
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
+	observation.FinalContainer.Labels["org.opencontainers.image.title"] = "Caddy"
+
+	if !validCommittedV2FinalContainer(state, journal, observation.FinalContainer, observation.FinalRuntime,
+		observation.FinalContainerFound, observation.Image.ID) {
+		t.Fatal("journal-bound final container with pinned-image metadata was rejected")
+	}
+	replacement := observation.FinalContainer
+	replacement.ID = "sha256:" + strings.Repeat("9", 64)
+	if validCommittedV2FinalContainer(state, journal, replacement, observation.FinalRuntime,
+		observation.FinalContainerFound, observation.Image.ID) {
+		t.Fatal("replacement final container outside the journal binding was accepted")
+	}
+}
+
 func TestCommittedV2ManagerSwitchObserveRecoverAndSnapshot(t *testing.T) {
 	manager, _ := newManagerFixture(t, false)
 	installCommittedV2Pair(t, manager)
-	runner := &committedV2Runner{files: make(map[string][]byte)}
+	runner := newCommittedV2Runner()
 	manager.runner = runner
 	manager.gatewayTopologyObserver = func(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayObservedTopology {
 		return gatewayTopologyExactFinalV2
@@ -92,7 +120,7 @@ func TestCommittedV2ManagerSwitchObserveRecoverAndSnapshot(t *testing.T) {
 	if after.Pending != nil || after.Apps[upgradeTestAppA].Route.Slot != generatedruntime.SlotGreen || afterJournal.Phase != gatewayPhaseCommitted {
 		t.Fatalf("committed v2 state = %#v journal = %#v", after, afterJournal)
 	}
-	if _, ok := runner.files[gatewayV2ContainerName+":"+"/config/active.json"]; !ok {
+	if _, ok := runner.files[journal.Resources.FinalContainerID+":"+"/config/active.json"]; !ok {
 		t.Fatal("v2 restart config was not installed")
 	}
 
@@ -125,7 +153,7 @@ func TestCommittedV2ManagerSwitchObserveRecoverAndSnapshot(t *testing.T) {
 func TestCommittedV2UnknownTopologyStopsBeforeDockerMutation(t *testing.T) {
 	manager, _ := newManagerFixture(t, false)
 	installCommittedV2Pair(t, manager)
-	runner := &committedV2Runner{files: make(map[string][]byte)}
+	runner := newCommittedV2Runner()
 	manager.runner = runner
 	manager.gatewayTopologyObserver = func(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayObservedTopology {
 		return gatewayTopologyUnknownOrDrift
@@ -161,7 +189,7 @@ func TestCommittedV2UnknownTopologyStopsBeforeDockerMutation(t *testing.T) {
 func TestCommittedV2RecoveryRollsBackDurableProposedRoute(t *testing.T) {
 	manager, _ := newManagerFixture(t, false)
 	installCommittedV2Pair(t, manager)
-	runner := &committedV2Runner{files: make(map[string][]byte)}
+	runner := newCommittedV2Runner()
 	manager.runner = runner
 	store, err := newGatewayUpgradeStateStore(manager.options.DataRoot)
 	if err != nil {
@@ -212,7 +240,7 @@ func TestCommittedV2RecoveryRollsBackDurableProposedRoute(t *testing.T) {
 	if recovered.Pending != nil || !reflect.DeepEqual(recovered.Apps[upgradeTestAppA], previous) {
 		t.Fatalf("recovered state = %#v", recovered)
 	}
-	if _, ok := runner.files[gatewayV2ContainerName+":"+"/config/rollback.json"]; !ok {
+	if _, ok := runner.files[journal.Resources.FinalContainerID+":"+"/config/rollback.json"]; !ok {
 		t.Fatal("recovery did not install the committed rollback config")
 	}
 }
@@ -220,7 +248,7 @@ func TestCommittedV2RecoveryRollsBackDurableProposedRoute(t *testing.T) {
 func TestCommittedV2RecoveryRepairsReloadOnlyCrashWindow(t *testing.T) {
 	manager, _ := newManagerFixture(t, false)
 	installCommittedV2Pair(t, manager)
-	runner := &committedV2Runner{files: make(map[string][]byte)}
+	runner := newCommittedV2Runner()
 	manager.runner = runner
 	store, err := newGatewayUpgradeStateStore(manager.options.DataRoot)
 	if err != nil {
@@ -250,7 +278,7 @@ func TestCommittedV2RecoveryRepairsReloadOnlyCrashWindow(t *testing.T) {
 		return true
 	}
 	manager.gatewayTopologyObserver = func(_ context.Context, _ routeState, candidate gatewayV2RouteState, _ gatewayMigrationJournal) gatewayObservedTopology {
-		_, rollbackInstalled := runner.files[gatewayV2ContainerName+":"+"/config/rollback.json"]
+		_, rollbackInstalled := runner.files[journal.Resources.FinalContainerID+":"+"/config/rollback.json"]
 		if rollbackInstalled && candidate.Apps[upgradeTestAppA].Route.Slot == generatedruntime.SlotBlue {
 			return gatewayTopologyExactFinalV2
 		}
@@ -269,7 +297,7 @@ func TestCommittedV2RecoveryRepairsReloadOnlyCrashWindow(t *testing.T) {
 	if recovered.Pending != nil || !reflect.DeepEqual(recovered.Apps[upgradeTestAppA], previous) {
 		t.Fatalf("recovered state = %#v", recovered)
 	}
-	if _, ok := runner.files[gatewayV2ContainerName+":"+"/config/rollback.json"]; !ok {
+	if _, ok := runner.files[journal.Resources.FinalContainerID+":"+"/config/rollback.json"]; !ok {
 		t.Fatal("mixed crash recovery did not reload the committed config")
 	}
 }
@@ -277,7 +305,7 @@ func TestCommittedV2RecoveryRepairsReloadOnlyCrashWindow(t *testing.T) {
 func TestCommittedV2RejectsRogueCandidateBeforePendingOrReload(t *testing.T) {
 	manager, _ := newManagerFixture(t, false)
 	installCommittedV2Pair(t, manager)
-	runner := &committedV2Runner{files: make(map[string][]byte)}
+	runner := newCommittedV2Runner()
 	manager.runner = runner
 	manager.gatewayTopologyObserver = func(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayObservedTopology {
 		return gatewayTopologyExactFinalV2
@@ -324,7 +352,7 @@ func TestCommittedV2RejectsRogueCandidateBeforePendingOrReload(t *testing.T) {
 func TestCommittedV2RejectsUnattachedApplicationNetworkBeforePendingOrReload(t *testing.T) {
 	manager, _ := newManagerFixture(t, false)
 	installCommittedV2Pair(t, manager)
-	runner := &committedV2Runner{files: make(map[string][]byte)}
+	runner := newCommittedV2Runner()
 	manager.runner = runner
 	manager.gatewayTopologyObserver = func(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayObservedTopology {
 		return gatewayTopologyExactFinalV2

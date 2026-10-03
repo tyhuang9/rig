@@ -19,7 +19,7 @@ func TestClassifyGatewayV2RollbackRetirementAcceptsOnlyExactPartialCleanup(t *te
 	observation.IngressFound = false
 	observation.IngressNetwork = caddyNetworkInspection{}
 	observation.IngressNetworkID = ""
-	observation.OwnedNetworks = nil
+	observation.OwnedNetworks = []string{}
 	got, ok = classifyGatewayV2RollbackRetirement(source, state, journal, observation)
 	if !ok || got != (gatewayV2RollbackRetirementObservation{ConfigVolumePresent: true, DataVolumePresent: true}) {
 		t.Fatalf("network-removed partial cleanup = %+v, ok=%t", got, ok)
@@ -37,10 +37,24 @@ func TestClassifyGatewayV2RollbackRetirementAcceptsOnlyExactPartialCleanup(t *te
 	observation.DataVolumeFound = false
 	observation.DataVolume = volumeInspection{}
 	observation.DataVolumeIdentity = gatewayV1VolumeIdentity{}
-	observation.OwnedVolumes = nil
+	observation.OwnedVolumes = []string{}
 	got, ok = classifyGatewayV2RollbackRetirement(source, state, journal, observation)
 	if !ok || !got.complete() {
 		t.Fatalf("complete cleanup = %+v, ok=%t", got, ok)
+	}
+}
+
+func TestValidOwnedNameSetAcceptsEmptyDockerInventoryWithoutAcceptingExtras(t *testing.T) {
+	if !validOwnedNameSet(nil) || !validOwnedNameSet([]string{}) {
+		t.Fatal("empty Docker inventory was rejected")
+	}
+	if validOwnedNameSet([]string{"unexpected"}) || validOwnedNameSet([]string{}, "expected") {
+		t.Fatal("incorrect Docker inventory was accepted")
+	}
+	if !validOwnedNameSet([]string{"alpha", "beta"}, "beta", "alpha") ||
+		validOwnedNameSet([]string{"beta", "alpha"}, "beta", "alpha") ||
+		validOwnedNameSet([]string{"alpha", "alpha"}, "beta", "alpha") {
+		t.Fatal("owned inventory did not require the exact sorted names")
 	}
 }
 

@@ -1047,7 +1047,16 @@ func (d managerGatewayV2LANGrantDriver) preflightCandidate(ctx context.Context, 
 }
 
 func (d managerGatewayV2LANGrantDriver) apply(ctx context.Context, state gatewayV2RouteState, filename string) error {
-	return d.manager.applyCommittedV2Routes(ctx, state, filename)
+	if d.manager == nil {
+		return gatewayV2LANGrantError(ctx)
+	}
+	_, durableState, journal, committed, err := d.manager.committedV2Locked()
+	if err != nil || !committed || durableState.OperationID != state.OperationID ||
+		journal.OperationID != state.OperationID || journal.Target.IdentityDigest != state.Identity.Digest ||
+		!validSHA256(journal.Resources.FinalContainerID) {
+		return gatewayV2LANGrantError(ctx)
+	}
+	return d.manager.applyCommittedV2Routes(ctx, state, journal.Resources.FinalContainerID, filename)
 }
 
 func (d managerGatewayV2LANGrantDriver) proveGranted(ctx context.Context, state gatewayV2RouteState,
@@ -1117,7 +1126,7 @@ func (d managerGatewayV2LANGrantDriver) stopOwnedGateway(ctx context.Context, jo
 	if err != nil || !found || !validContainerID(container.ID) ||
 		normalizeID(container.ID) != journal.Resources.FinalContainerID || container.Restarting ||
 		strings.TrimPrefix(container.Name, "/") != gatewayV2ContainerName ||
-		!reflect.DeepEqual(container.Labels, wantLabels) {
+		!validGatewayV2ContainerLabels(container.Labels, wantLabels) {
 		return gatewayV2LANGrantError(ctx)
 	}
 	if container.Running {
@@ -1128,7 +1137,7 @@ func (d managerGatewayV2LANGrantDriver) stopOwnedGateway(ctx context.Context, jo
 	}
 	confirmed, confirmedRuntime, confirmedFound, err := d.manager.inspectNamedGatewayContainer(context.WithoutCancel(ctx), gatewayV2ContainerName)
 	if err != nil || !confirmedFound || normalizeID(confirmed.ID) != journal.Resources.FinalContainerID ||
-		confirmed.Running || confirmed.Restarting || !reflect.DeepEqual(confirmed.Labels, wantLabels) ||
+		confirmed.Running || confirmed.Restarting || !validGatewayV2ContainerLabels(confirmed.Labels, wantLabels) ||
 		gatewayV2HasEffectivePortBinding(confirmedRuntime.EffectivePortBindings) {
 		return gatewayV2LANGrantError(ctx)
 	}

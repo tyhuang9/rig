@@ -53,15 +53,13 @@ func TestClassifyGatewayV2RecoveryTopologyExactIntermediateStates(t *testing.T) 
 		t.Fatalf("transfer v1-serving stopped-stage topology = %q", got)
 	}
 	stoppedV1 := gatewayV2IdentityTestObservation(t, source, state, stoppedV1Journal, gatewayTopologyExactV1WithStage)
-	stoppedV1.V1Container.Running = false
-	stoppedV1.V1Config = nil
+	stopGatewayV1IdentityTestContainer(&stoppedV1)
 	if got := classifyGatewayV2RecoveryTopology(source, state, stoppedV1Journal, stoppedV1); got != gatewayV2RecoveryTransferIntentStoppedV1 {
 		t.Fatalf("stopped v1 topology = %q", got)
 	}
 
 	transferStoppedStage := gatewayV2IdentityTestObservation(t, source, state, stoppedV1Journal, gatewayTopologyExactV1WithStage)
-	transferStoppedStage.V1Container.Running = false
-	transferStoppedStage.V1Config = nil
+	stopGatewayV1IdentityTestContainer(&transferStoppedStage)
 	stopGatewayV2TestContainer(&transferStoppedStage.StageContainer, &transferStoppedStage.StageRuntime, &transferStoppedStage.StageConfig, state, transferStoppedStage.IngressNetworkID, nil)
 	transferStoppedStage.IngressNetwork.Containers = map[string]caddyNetworkContainerInspection{}
 	if got := classifyGatewayV2RecoveryTopology(source, state, stoppedV1Journal, transferStoppedStage); got != gatewayV2RecoveryTransferIntentV1StoppedStage {
@@ -92,6 +90,143 @@ func TestClassifyGatewayV2RecoveryTopologyExactIntermediateStates(t *testing.T) 
 	}
 }
 
+func TestGatewayV2StoppedV1RequiresBoundDocker28Shape(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Phase = gatewayPhaseTransferIntent
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Resources.FinalContainerID = ""
+	fixture := func() gatewayV2DockerObservation {
+		observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1WithStage)
+		stopGatewayV1IdentityTestContainer(&observation)
+		return observation
+	}
+	if got := classifyGatewayV2RecoveryTopology(source, state, journal, fixture()); got != gatewayV2RecoveryTransferIntentStoppedV1 {
+		t.Fatalf("exact stopped-v1 topology = %q", got)
+	}
+	withOmittedIDs := fixture()
+	for name, attachment := range withOmittedIDs.V1Runtime.ConfiguredNetworks {
+		attachment.NetworkID = ""
+		withOmittedIDs.V1Runtime.ConfiguredNetworks[name] = attachment
+	}
+	if got := classifyGatewayV2RecoveryTopology(source, state, journal, withOmittedIDs); got != gatewayV2RecoveryTransferIntentStoppedV1 {
+		t.Fatalf("stopped-v1 with Docker-omitted configured network IDs = %q", got)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*gatewayV2DockerObservation)
+	}{
+		{"effective host publication", func(value *gatewayV2DockerObservation) {
+			value.V1Runtime.EffectivePortBindings = gatewayV2IdentityTestPortBindingsCopy(value.V1Container.PortBindings)
+		}},
+		{"configured host publication drift", func(value *gatewayV2DockerObservation) {
+			value.V1Container.PortBindings["8080/tcp"][0]["HostPort"] = "9999"
+		}},
+		{"container security drift", func(value *gatewayV2DockerObservation) { value.V1Container.ReadOnly = false }},
+		{"live ingress member", func(value *gatewayV2DockerObservation) {
+			value.V1Network.Containers[value.V1Container.ID] = caddyNetworkContainerInspection{Name: caddyContainerName}
+		}},
+		{"live ingress IP", func(value *gatewayV2DockerObservation) {
+			value.V1Container.Networks[caddyNetworkName].IPAddress = "10.203.0.2"
+		}},
+		{"missing ingress configuration", func(value *gatewayV2DockerObservation) {
+			delete(value.V1Runtime.ConfiguredNetworks, caddyNetworkName)
+		}},
+		{"extra configured network", func(value *gatewayV2DockerObservation) {
+			value.V1Runtime.ConfiguredNetworks["foreign"] = gatewayV2ConfiguredNetwork{}
+		}},
+		{"ingress network replacement", func(value *gatewayV2DockerObservation) {
+			attachment := value.V1Runtime.ConfiguredNetworks[caddyNetworkName]
+			attachment.NetworkID = "sha256:" + strings.Repeat("9", 64)
+			value.V1Runtime.ConfiguredNetworks[caddyNetworkName] = attachment
+		}},
+		{"independently inspected ingress network replacement", func(value *gatewayV2DockerObservation) {
+			value.V1NetworkID = "sha256:" + strings.Repeat("9", 64)
+		}},
+		{"ingress static address drift", func(value *gatewayV2DockerObservation) {
+			attachment := value.V1Runtime.ConfiguredNetworks[caddyNetworkName]
+			attachment.IPAMConfig.IPv4Address = "10.203.0.3"
+			value.V1Runtime.ConfiguredNetworks[caddyNetworkName] = attachment
+		}},
+		{"ingress endpoint still active", func(value *gatewayV2DockerObservation) {
+			attachment := value.V1Runtime.ConfiguredNetworks[caddyNetworkName]
+			attachment.EndpointID = "sha256:" + strings.Repeat("9", 64)
+			value.V1Runtime.ConfiguredNetworks[caddyNetworkName] = attachment
+		}},
+		{"application network owner drift", func(value *gatewayV2DockerObservation) {
+			network := value.V1ApplicationNetworks["net-a"]
+			network.Labels["io.rig.application"] = "33333333-3333-4333-8333-333333333333"
+			value.V1ApplicationNetworks["net-a"] = network
+		}},
+		{"application network replacement", func(value *gatewayV2DockerObservation) {
+			attachment := value.V1Runtime.ConfiguredNetworks["net-a"]
+			attachment.NetworkID = "sha256:" + strings.Repeat("9", 64)
+			value.V1Runtime.ConfiguredNetworks["net-a"] = attachment
+		}},
+		{"application member by immutable ID", func(value *gatewayV2DockerObservation) {
+			network := value.V1ApplicationNetworks["net-a"]
+			network.Containers[value.V1Container.ID] = caddyNetworkContainerInspection{Name: "unexpected"}
+			value.V1ApplicationNetworks["net-a"] = network
+		}},
+		{"application member by name", func(value *gatewayV2DockerObservation) {
+			network := value.V1ApplicationNetworks["net-a"]
+			network.Containers["sha256:"+strings.Repeat("9", 64)] = caddyNetworkContainerInspection{Name: caddyContainerName}
+			value.V1ApplicationNetworks["net-a"] = network
+		}},
+		{"application endpoint still active", func(value *gatewayV2DockerObservation) {
+			attachment := value.V1Runtime.ConfiguredNetworks["net-a"]
+			attachment.IPAddress = "172.30.0.2"
+			value.V1Runtime.ConfiguredNetworks["net-a"] = attachment
+		}},
+		{"restart config drift", func(value *gatewayV2DockerObservation) {
+			value.V1RestartConfig = []byte(`{"admin":{"listen":"localhost:2019"}}`)
+		}},
+		{"live config present", func(value *gatewayV2DockerObservation) { value.V1Config = []byte(`{}`) }},
+		{"source identity replacement", func(value *gatewayV2DockerObservation) {
+			value.V1Container.ID = "sha256:" + strings.Repeat("9", 64)
+		}},
+		{"source config volume identity drift", func(value *gatewayV2DockerObservation) {
+			value.V1VolumeIdentity.CreatedAt = "2026-09-29T00:09:00Z"
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := fixture()
+			test.mutate(&value)
+			if got := classifyGatewayV2RecoveryTopology(source, state, journal, value); got != gatewayV2RecoveryUnknown {
+				t.Fatalf("drifted stopped-v1 topology = %q", got)
+			}
+		})
+	}
+
+	phase := journal
+	phase.Phase = gatewayPhaseStageIntent
+	if validGatewayV1Base(source, phase, fixture(), true) {
+		t.Fatal("stage intent accepted stopped v1")
+	}
+}
+
+func TestGatewayV2CommittedStoppedV1PreservesSourceIdentity(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Phase = gatewayPhaseCommitted
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
+	observation.V1ApplicationNetworks = nil
+	observation.V1ApplicationNetworkIDs = nil
+	if !validGatewayV1Base(source, journal, observation, false) {
+		t.Fatal("committed stopped-v1 source identity was rejected without historical app-network inspections")
+	}
+	observation.V1Container.ID = "sha256:" + strings.Repeat("9", 64)
+	if validGatewayV1Base(source, journal, observation, false) {
+		t.Fatal("committed stopped-v1 replacement identity was accepted")
+	}
+	observation.V1Container.ID = "sha256:" + strings.Repeat("b", 64)
+	observation.V1Runtime.EffectivePortBindings = gatewayV2IdentityTestPortBindingsCopy(observation.V1Container.PortBindings)
+	if validGatewayV1Base(source, journal, observation, false) {
+		t.Fatal("committed stopped-v1 effective host publication was accepted")
+	}
+}
+
 func TestClassifyGatewayV2StoppedStageForCompensationRequiresBoundStoppedIdentity(t *testing.T) {
 	source, state, journal := gatewayV2IdentityTestState(t)
 	journal.Phase = gatewayPhaseStageIntent
@@ -116,6 +251,82 @@ func TestClassifyGatewayV2StoppedStageForCompensationRequiresBoundStoppedIdentit
 	drift.StageRuntime.EffectivePortBindings = gatewayV2IdentityTestPortBindingsCopy(observation.StageContainer.PortBindings)
 	if classifyGatewayV2StoppedStageForCompensation(source, state, journal, drift) {
 		t.Fatal("active host binding was accepted for compensation")
+	}
+}
+
+func TestGatewayV2StoppedNetworkIdentityAllowsOnlyDockerOmission(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Phase = gatewayPhaseStageIntent
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Resources.FinalContainerID = ""
+	stopped := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1WithStage)
+	stopGatewayV2TestContainer(&stopped.StageContainer, &stopped.StageRuntime, &stopped.StageConfig,
+		state, stopped.IngressNetworkID, nil)
+	stopped.IngressNetwork.Containers = map[string]caddyNetworkContainerInspection{}
+	ingress := stopped.StageRuntime.ConfiguredNetworks[state.Identity.IngressNetwork]
+	ingress.NetworkID = ""
+	stopped.StageRuntime.ConfiguredNetworks[state.Identity.IngressNetwork] = ingress
+	if got := classifyGatewayV2RecoveryTopology(source, state, journal, stopped); got != gatewayV2RecoveryStageIntentStoppedStage {
+		t.Fatalf("stopped stage with Docker-omitted network ID = %q", got)
+	}
+
+	malformed := stopped
+	malformed.StageRuntime.ConfiguredNetworks = gatewayV2IdentityTestConfiguredNetworks(state, malformed.StageContainer,
+		malformed.IngressNetworkID, nil)
+	ingress = malformed.StageRuntime.ConfiguredNetworks[state.Identity.IngressNetwork]
+	ingress.NetworkID = "malformed"
+	malformed.StageRuntime.ConfiguredNetworks[state.Identity.IngressNetwork] = ingress
+	if got := classifyGatewayV2RecoveryTopology(source, state, journal, malformed); got != gatewayV2RecoveryUnknown {
+		t.Fatalf("stopped stage with malformed network ID = %q", got)
+	}
+
+	mismatch := stopped
+	mismatch.StageRuntime.ConfiguredNetworks = gatewayV2IdentityTestConfiguredNetworks(state, mismatch.StageContainer,
+		mismatch.IngressNetworkID, nil)
+	ingress = mismatch.StageRuntime.ConfiguredNetworks[state.Identity.IngressNetwork]
+	ingress.NetworkID = "sha256:" + strings.Repeat("9", 64)
+	mismatch.StageRuntime.ConfiguredNetworks[state.Identity.IngressNetwork] = ingress
+	if got := classifyGatewayV2RecoveryTopology(source, state, journal, mismatch); got != gatewayV2RecoveryUnknown {
+		t.Fatalf("stopped stage with mismatched network ID = %q", got)
+	}
+
+	runningJournal := journal
+	runningJournal.Phase = gatewayPhaseStaged
+	running := gatewayV2IdentityTestObservation(t, source, state, runningJournal, gatewayTopologyExactV1WithStage)
+	ingress = running.StageRuntime.ConfiguredNetworks[state.Identity.IngressNetwork]
+	ingress.NetworkID = ""
+	running.StageRuntime.ConfiguredNetworks[state.Identity.IngressNetwork] = ingress
+	if got := classifyGatewayV2Topology(source, state, runningJournal, running); got != gatewayTopologyUnknownOrDrift {
+		t.Fatalf("running stage with empty network ID = %q", got)
+	}
+}
+
+func TestGatewayV2StoppedFinalAllowsOnlyOmittedApplicationNetworkIDs(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Phase = gatewayPhaseTransferIntent
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	stopped := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
+	stopGatewayV2TestContainer(&stopped.FinalContainer, &stopped.FinalRuntime, &stopped.FinalConfig,
+		state, stopped.IngressNetworkID, stopped.ApplicationNetworkIDs)
+	disconnectStoppedGatewayV2TestContainer(&stopped, stopped.FinalContainer.ID, state.Identity.FinalContainer)
+	for name, attachment := range stopped.FinalRuntime.ConfiguredNetworks {
+		attachment.NetworkID = ""
+		stopped.FinalRuntime.ConfiguredNetworks[name] = attachment
+	}
+	if got := classifyGatewayV2RecoveryTopology(source, state, journal, stopped); got != gatewayV2RecoveryTransferIntentStoppedFinal {
+		t.Fatalf("stopped final with Docker-omitted network IDs = %q", got)
+	}
+	for name := range stopped.ApplicationNetworkIDs {
+		drift := stopped
+		drift.FinalRuntime.ConfiguredNetworks = gatewayV2IdentityTestConfiguredNetworks(state, drift.FinalContainer,
+			drift.IngressNetworkID, drift.ApplicationNetworkIDs)
+		attachment := drift.FinalRuntime.ConfiguredNetworks[name]
+		attachment.NetworkID = "sha256:" + strings.Repeat("9", 64)
+		drift.FinalRuntime.ConfiguredNetworks[name] = attachment
+		if got := classifyGatewayV2RecoveryTopology(source, state, journal, drift); got != gatewayV2RecoveryUnknown {
+			t.Fatalf("stopped final with mismatched application network ID = %q", got)
+		}
+		break
 	}
 }
 
@@ -210,18 +421,7 @@ func stopGatewayV2TestContainer(container *caddyInspection, runtime *gatewayCont
 ) {
 	container.Running = false
 	runtime.EffectivePortBindings = nil
-	runtime.ConfiguredNetworks = make(map[string]gatewayV2ConfiguredNetwork, len(container.Networks))
-	for name := range container.Networks {
-		networkID := applicationNetworkIDs[name]
-		var ipam *gatewayV2ConfiguredIPAM
-		priority := 0
-		if name == state.Identity.IngressNetwork {
-			networkID = ingressNetworkID
-			ipam = &gatewayV2ConfiguredIPAM{IPv4Address: state.Network.ContainerIPv4}
-			priority = caddyGatewayPriority
-		}
-		runtime.ConfiguredNetworks[name] = gatewayV2ConfiguredNetwork{IPAMConfig: ipam, NetworkID: networkID, GwPriority: priority}
-	}
+	runtime.ConfiguredNetworks = gatewayV2IdentityTestConfiguredNetworks(state, *container, ingressNetworkID, applicationNetworkIDs)
 	*liveConfig = nil
 }
 

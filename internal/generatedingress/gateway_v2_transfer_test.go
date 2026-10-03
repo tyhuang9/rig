@@ -259,8 +259,12 @@ func TestClassifyGatewayV2TransferRecoveryAllowsExactV1ServingWindows(t *testing
 
 	journal.Resources.FinalContainerID = strings.Repeat("d", 64)
 	stoppedFinal := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactFinalV2)
-	stoppedFinal.V1Container.Running = true
-	stoppedFinal.V1Config = append([]byte(nil), stoppedFinal.V1RestartConfig...)
+	runningV1 := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1Only)
+	stoppedFinal.V1Container = runningV1.V1Container
+	stoppedFinal.V1Runtime = runningV1.V1Runtime
+	stoppedFinal.V1Network = runningV1.V1Network
+	stoppedFinal.V1Config = runningV1.V1Config
+	stoppedFinal.V1ApplicationNetworks = runningV1.V1ApplicationNetworks
 	stopGatewayV2TestContainer(&stoppedFinal.FinalContainer, &stoppedFinal.FinalRuntime, &stoppedFinal.FinalConfig, state, stoppedFinal.IngressNetworkID, stoppedFinal.ApplicationNetworkIDs)
 	disconnectStoppedGatewayV2TestContainer(&stoppedFinal, stoppedFinal.FinalContainer.ID, state.Identity.FinalContainer)
 	stoppedFinal.Final404Proven = false
