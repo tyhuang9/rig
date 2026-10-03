@@ -48,7 +48,7 @@ func (m *Manager) observeGatewayV2StoppedStageForCompensation(ctx context.Contex
 	if m == nil || ctx == nil || journal.Phase != gatewayPhaseStageIntent || !validGatewayTopologyInputs(source, state, journal) {
 		return false
 	}
-	observation, err := m.inspectGatewayV2DockerWithStageConfig(ctx, source, state, journal, false)
+	observation, err := m.inspectGatewayV2DockerWithStageConfig(ctx, source, state, journal, false, true)
 	if err != nil {
 		clearGatewayV2DockerObservation(&observation)
 		return false
@@ -202,13 +202,21 @@ func validGatewayV2TransferInfrastructureNoContainers(state gatewayV2RouteState,
 }
 
 func validGatewayV2StoppedFinalForTransfer(state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) bool {
+	return validGatewayV2StoppedFinal(state, journal, observation, false)
+}
+
+func validGatewayV2StoppedFinal(state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation, allowRestarts bool) bool {
 	expected, err := expectedGatewayV2FinalConfig(state)
+	validContainer := validGatewayV2StoppedContainer
+	if allowRestarts {
+		validContainer = validGatewayV2RebindStoppedContainer
+	}
 	return err == nil && journal.Resources.FinalContainerID != "" && !observation.StageContainerFound &&
 		validOwnedNameSet(observation.OwnedContainers, state.Identity.FinalContainer) &&
 		validOwnedNameSet(observation.OwnedVolumes, state.Identity.ConfigVolume, state.Identity.DataVolume) &&
 		validOwnedNameSet(observation.OwnedNetworks, state.Identity.IngressNetwork) &&
 		validGatewayV2Volumes(state, journal, observation) &&
-		validGatewayV2StoppedContainer(state, journal, observation.FinalContainer, observation.FinalRuntime, observation.FinalContainerFound, gatewayV2FinalContainerRole, observation.Image.ID) &&
+		validContainer(state, journal, observation.FinalContainer, observation.FinalRuntime, observation.FinalContainerFound, gatewayV2FinalContainerRole, observation.Image.ID) &&
 		validGatewayV2StoppedIngressNetwork(state, journal, observation.IngressNetwork, observation.IngressNetworkID, observation.IngressFound, observation.FinalRuntime) &&
 		validGatewayV2StoppedApplicationNetworks(state, observation.FinalContainer, observation.FinalRuntime, observation.ApplicationNetworks, observation.ApplicationNetworkIDs) &&
 		len(observation.FinalConfig) == 0 && sameCaddyConfig(expected, observation.FinalRestartConfig) &&

@@ -382,10 +382,22 @@ func newGatewayRebindPredecessorFixtureWithClaim(t *testing.T, insertClaim bool)
 		SelectedIPv4: profile.Spec.SelectedIPv4, InterfaceID: profile.Spec.InterfaceID,
 		PortStart: profile.Spec.PortStart, PortEnd: profile.Spec.PortEnd,
 	}
+	sourceIdentityDigest, err := gatewayV1ObservedIdentityDigest(gatewayV2DockerObservation{
+		Image:       gatewayV2IdentityTestImage(),
+		V1Container: caddyInspection{ID: "sha256:" + strings.Repeat("b", 64)},
+		V1NetworkID: "sha256:" + strings.Repeat("e", 64),
+		V1VolumeIdentity: gatewayV1VolumeIdentity{
+			Mountpoint: "/var/lib/docker/volumes/rig-generated-caddy-config-v1/_data",
+			CreatedAt:  "2026-09-29T00:00:00Z",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	preparation := gatewayUpgradePreparation{
 		OperationID: upgrade.OperationID, Profile: profileBinding,
 		Network:              gatewayV2NetworkPlan{Subnet: "10.241.0.0/28", GatewayIPv4: "10.241.0.1", ContainerIPv4: "10.241.0.2"},
-		SourceIdentityDigest: strings.Repeat("b", 64), LocalHostPort: manager.options.HostPort,
+		SourceIdentityDigest: sourceIdentityDigest, LocalHostPort: manager.options.HostPort,
 		ApprovedBy: upgrade.ApprovedBy, ApprovedActionDigest: upgradeDigest,
 	}
 	state, journal, err := prepareGatewayV2State(source, preparation)

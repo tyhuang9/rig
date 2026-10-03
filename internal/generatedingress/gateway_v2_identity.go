@@ -262,13 +262,13 @@ func (m *Manager) observeGatewayV2MixedRestart(ctx context.Context, source route
 }
 
 func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal) (gatewayV2DockerObservation, error) {
-	return m.inspectGatewayV2DockerWithStageConfig(ctx, source, state, journal, true)
+	return m.inspectGatewayV2DockerWithStageConfig(ctx, source, state, journal, true, true)
 }
 
 // The compensation-only path may inspect a stopped, ID-bound stage whose
 // restart config was never copied before a crash. It must never use this
 // observation to start a listener or attest serving topology.
-func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, requireStoppedStageConfig bool) (gatewayV2DockerObservation, error) {
+func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, requireStoppedStageConfig, probeHostPublication bool) (gatewayV2DockerObservation, error) {
 	var observation gatewayV2DockerObservation
 	var err error
 	observation.Image, observation.ImageFound, err = m.inspectImage(ctx)
@@ -376,7 +376,9 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 		}
 		if observation.StageContainer.Running && !observation.StageContainer.Restarting {
 			observation.Stage404Proven = m.proveGatewayV2Stage404(ctx, state, observation.StageContainer.ID)
-			observation.StageHostPublicationProven = proveGatewayV2StageHostPublication(ctx, state, observation.StageContainer.ID, probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
+			if probeHostPublication {
+				observation.StageHostPublicationProven = proveGatewayV2StageHostPublication(ctx, state, observation.StageContainer.ID, probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
+			}
 		}
 	}
 	if observation.FinalContainerFound {
@@ -420,7 +422,9 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 	}
 	if observation.FinalContainerFound && observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
 		observation.FinalRoutesProven = m.proveGatewayV2FinalRoutes(ctx, state, observation.FinalContainer.ID)
-		observation.FinalHostPublicationProven = proveGatewayV2FinalHostPublication(ctx, state, observation.FinalContainer.ID, probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
+		if probeHostPublication {
+			observation.FinalHostPublicationProven = proveGatewayV2FinalHostPublication(ctx, state, observation.FinalContainer.ID, probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
+		}
 	}
 
 	v1ConfigStable := true
@@ -880,11 +884,15 @@ func validGatewayV2IngressNetwork(state gatewayV2RouteState, journal gatewayMigr
 }
 
 func validGatewayV2Container(state gatewayV2RouteState, journal gatewayMigrationJournal, value caddyInspection, runtime gatewayContainerRuntime, found bool, role, imageID string) bool {
-	return validGatewayV2ContainerState(state, journal, value, runtime, found, role, imageID, true)
+	return validGatewayV2ContainerState(state, journal, value, runtime, found, role, imageID, true, false)
 }
 
 func validGatewayV2StoppedContainer(state gatewayV2RouteState, journal gatewayMigrationJournal, value caddyInspection, runtime gatewayContainerRuntime, found bool, role, imageID string) bool {
-	return validGatewayV2ContainerState(state, journal, value, runtime, found, role, imageID, false)
+	return validGatewayV2ContainerState(state, journal, value, runtime, found, role, imageID, false, false)
+}
+
+func validGatewayV2RebindStoppedContainer(state gatewayV2RouteState, journal gatewayMigrationJournal, value caddyInspection, runtime gatewayContainerRuntime, found bool, role, imageID string) bool {
+	return validGatewayV2ContainerState(state, journal, value, runtime, found, role, imageID, false, true)
 }
 
 // The stage Docker name is 65 bytes with a UUID, exceeding Linux HOST_NAME_MAX.
@@ -900,12 +908,12 @@ func gatewayV2ExpectedHostname(state gatewayV2RouteState, role string) string {
 	}
 }
 
-func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigrationJournal, value caddyInspection, runtime gatewayContainerRuntime, found bool, role, imageID string, running bool) bool {
+func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigrationJournal, value caddyInspection, runtime gatewayContainerRuntime, found bool, role, imageID string, running, allowStoppedRestarts bool) bool {
 	name, configFilename, restart := state.Identity.StageContainer, state.Identity.StageConfigFilename, gatewayV2StageRestartPolicy
 	if role == gatewayV2FinalContainerRole {
 		name, configFilename, restart = state.Identity.FinalContainer, state.Identity.ActiveConfigFilename, gatewayV2FinalRestartPolicy
 	}
-	if !found || value.Running != running || value.Restarting || !validGatewayContainerRuntime(runtime, false) || !validContainerID(value.ID) || normalizeID(value.Image) != normalizeID(imageID) ||
+	if !found || value.Running != running || value.Restarting || !validGatewayContainerRuntime(runtime, !running && allowStoppedRestarts) || !validContainerID(value.ID) || normalizeID(value.Image) != normalizeID(imageID) ||
 		strings.TrimPrefix(value.Name, "/") != name || value.Hostname != gatewayV2ExpectedHostname(state, role) || value.User != "1000:1000" || value.NetworkMode != state.Identity.IngressNetwork ||
 		!exactGatewayV2Environment(value.Env) || !value.ReadOnly || value.Privileged || !onlyCaddyCapability(value.CapAdd) || !exactFoldSet(value.CapDrop, "ALL") ||
 		!onlyNoNewPrivileges(value.SecurityOpt) || len(value.Binds) != 0 || len(value.Tmpfs) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 ||
