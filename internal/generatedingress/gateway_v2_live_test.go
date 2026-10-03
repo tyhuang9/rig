@@ -592,6 +592,7 @@ const (
 	liveGatewayV2TraceStageStart                     liveGatewayV2TraceStep = "stage_start"
 	liveGatewayV2TraceStageStartDetail               liveGatewayV2TraceStep = "stage_start_detail"
 	liveGatewayV2TraceStageStartFailureShape         liveGatewayV2TraceStep = "stage_start_failure_shape"
+	liveGatewayV2TraceStagePostStartObservation      liveGatewayV2TraceStep = "stage_post_start_observation"
 	liveGatewayV2TraceStageStop                      liveGatewayV2TraceStep = "stage_stop"
 	liveGatewayV2TraceStageRemove                    liveGatewayV2TraceStep = "stage_remove"
 	liveGatewayV2TraceTransferObserveTopology        liveGatewayV2TraceStep = "transfer_observe_topology"
@@ -782,6 +783,27 @@ const (
 	liveGatewayV2TraceStabilityUnclassified             liveGatewayV2TraceOutcome = "stage_stability_unclassified"
 )
 
+const (
+	liveGatewayV2TracePostStartContainerInspectError liveGatewayV2TraceOutcome = "post_start_container_inspect_error"
+	liveGatewayV2TracePostStartContainerMissing      liveGatewayV2TraceOutcome = "post_start_container_missing"
+	liveGatewayV2TracePostStartContainerStopped      liveGatewayV2TraceOutcome = "post_start_container_stopped"
+	liveGatewayV2TracePostStartContainerRestarting   liveGatewayV2TraceOutcome = "post_start_container_restarting"
+	liveGatewayV2TracePostStartContainerRunning      liveGatewayV2TraceOutcome = "post_start_container_running"
+	liveGatewayV2TracePostStartSnapshotError         liveGatewayV2TraceOutcome = "post_start_snapshot_error"
+	liveGatewayV2TracePostStartSnapshotExact         liveGatewayV2TraceOutcome = "post_start_snapshot_exact"
+	liveGatewayV2TracePostStartV1Base                liveGatewayV2TraceOutcome = "post_start_failed_v1_base"
+	liveGatewayV2TracePostStartV1Stability           liveGatewayV2TraceOutcome = "post_start_failed_v1_stability"
+	liveGatewayV2TracePostStartV2Resources           liveGatewayV2TraceOutcome = "post_start_failed_v2_resources"
+	liveGatewayV2TracePostStartOwnedInventory        liveGatewayV2TraceOutcome = "post_start_failed_owned_inventory"
+	liveGatewayV2TracePostStartStageStability        liveGatewayV2TraceOutcome = "post_start_failed_stage_stability"
+	liveGatewayV2TracePostStartStageContainer        liveGatewayV2TraceOutcome = "post_start_failed_stage_container"
+	liveGatewayV2TracePostStartIngressNetwork        liveGatewayV2TraceOutcome = "post_start_failed_ingress_network"
+	liveGatewayV2TracePostStartStageConfig           liveGatewayV2TraceOutcome = "post_start_failed_stage_config"
+	liveGatewayV2TracePostStartStage404              liveGatewayV2TraceOutcome = "post_start_failed_stage_404"
+	liveGatewayV2TracePostStartHostPublication       liveGatewayV2TraceOutcome = "post_start_failed_host_publication"
+	liveGatewayV2TracePostStartUnclassified          liveGatewayV2TraceOutcome = "post_start_unclassified"
+)
+
 type liveGatewayV2TraceEvent struct {
 	phase   liveGatewayV2TracePhase
 	step    liveGatewayV2TraceStep
@@ -937,7 +959,74 @@ func (d liveGatewayV2TracingUpgradeDriver) observeTopology(ctx context.Context, 
 ) gatewayObservedTopology {
 	result := d.gatewayV2UpgradeDriver.observeTopology(ctx, source, state, journal)
 	d.trace.recordAt(liveGatewayV2TraceStageObserveTopology, journal.Phase, liveGatewayV2TopologyOutcome(result))
+	if journal.Phase == gatewayPhaseStageIntent && journal.Resources.StageContainerID != "" &&
+		result != gatewayTopologyExactV1WithStage && d.manager != nil {
+		d.tracePostStartObservation(ctx, source, state, journal)
+	}
 	return result
+}
+
+// This is a separate read-only diagnostic after the authoritative observation.
+// It does not change the result used by the upgrade state machine.
+func (d liveGatewayV2TracingUpgradeDriver) tracePostStartObservation(ctx context.Context, source routeState,
+	state gatewayV2RouteState, journal gatewayMigrationJournal,
+) {
+	container, _, found, err := d.manager.inspectNamedGatewayContainer(ctx, state.Identity.StageContainer)
+	switch {
+	case err != nil:
+		d.trace.recordAt(liveGatewayV2TraceStagePostStartObservation, journal.Phase, liveGatewayV2TracePostStartContainerInspectError)
+		return
+	case !found:
+		d.trace.recordAt(liveGatewayV2TraceStagePostStartObservation, journal.Phase, liveGatewayV2TracePostStartContainerMissing)
+		return
+	case container.Restarting:
+		d.trace.recordAt(liveGatewayV2TraceStagePostStartObservation, journal.Phase, liveGatewayV2TracePostStartContainerRestarting)
+	case !container.Running:
+		d.trace.recordAt(liveGatewayV2TraceStagePostStartObservation, journal.Phase, liveGatewayV2TracePostStartContainerStopped)
+	default:
+		d.trace.recordAt(liveGatewayV2TraceStagePostStartObservation, journal.Phase, liveGatewayV2TracePostStartContainerRunning)
+	}
+	observation, err := d.manager.inspectGatewayV2Docker(ctx, source, state, journal)
+	if err != nil {
+		clearGatewayV2DockerObservation(&observation)
+		d.trace.recordAt(liveGatewayV2TraceStagePostStartObservation, journal.Phase, liveGatewayV2TracePostStartSnapshotError)
+		return
+	}
+	defer clearGatewayV2DockerObservation(&observation)
+	if classifyGatewayV2Topology(source, state, journal, observation) == gatewayTopologyExactV1WithStage {
+		d.trace.recordAt(liveGatewayV2TraceStagePostStartObservation, journal.Phase, liveGatewayV2TracePostStartSnapshotExact)
+		return
+	}
+	failures := liveGatewayV2PostStartFailureOutcomes(source, state, journal, observation)
+	if len(failures) == 0 {
+		failures = append(failures, liveGatewayV2TracePostStartUnclassified)
+	}
+	for _, failure := range failures {
+		d.trace.recordAt(liveGatewayV2TraceStagePostStartObservation, journal.Phase, failure)
+	}
+}
+
+func liveGatewayV2PostStartFailureOutcomes(source routeState, state gatewayV2RouteState,
+	journal gatewayMigrationJournal, observation gatewayV2DockerObservation,
+) []liveGatewayV2TraceOutcome {
+	return liveGatewayV2SelectedTraceOutcomes(
+		liveGatewayV2TraceSelection{!validGatewayV1Base(source, journal, observation, true), liveGatewayV2TracePostStartV1Base},
+		liveGatewayV2TraceSelection{!observation.V1Stable || !observation.V1ResourcesStable || !observation.V1EndpointIdentityProven,
+			liveGatewayV2TracePostStartV1Stability},
+		liveGatewayV2TraceSelection{!observation.V2ResourcesStable || !gatewayV2ObservedResourcesMatchJournal(journal, observation) ||
+			!validGatewayV2Volumes(state, journal, observation), liveGatewayV2TracePostStartV2Resources},
+		liveGatewayV2TraceSelection{!observation.OwnedInventoriesStable ||
+			!validOwnedNameSet(observation.OwnedContainers, state.Identity.StageContainer), liveGatewayV2TracePostStartOwnedInventory},
+		liveGatewayV2TraceSelection{!observation.StageStable, liveGatewayV2TracePostStartStageStability},
+		liveGatewayV2TraceSelection{!validGatewayV2Container(state, journal, observation.StageContainer, observation.StageRuntime,
+			observation.StageContainerFound, gatewayV2StageContainerRole, observation.Image.ID), liveGatewayV2TracePostStartStageContainer},
+		liveGatewayV2TraceSelection{!validGatewayV2IngressNetwork(state, journal, observation.IngressNetwork,
+			observation.IngressFound, observation.StageContainer.ID, state.Identity.StageContainer), liveGatewayV2TracePostStartIngressNetwork},
+		liveGatewayV2TraceSelection{!validGatewayV2StageConfig(state, observation.StageConfig, observation.StageRestartConfig),
+			liveGatewayV2TracePostStartStageConfig},
+		liveGatewayV2TraceSelection{!observation.Stage404Proven, liveGatewayV2TracePostStartStage404},
+		liveGatewayV2TraceSelection{!observation.StageHostPublicationProven, liveGatewayV2TracePostStartHostPublication},
+	)
 }
 
 func (d liveGatewayV2TracingUpgradeDriver) observeRecovery(ctx context.Context, source routeState, state gatewayV2RouteState,
@@ -2052,6 +2141,23 @@ func TestLiveGatewayV2StageMountDiagnosticDistinguishesOrderAndContent(t *testin
 	}
 	if got := liveGatewayV2StageInspectionChangeOutcomes(first, changed); !reflect.DeepEqual(got, wantContent) {
 		t.Fatalf("changed mounts = %v, want %v", got, wantContent)
+	}
+}
+
+func TestLiveGatewayV2PostStartDiagnosticClosesReadinessFailures(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Resources.FinalContainerID = ""
+	journal.Phase = gatewayPhaseStageIntent
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1WithStage)
+	if failures := liveGatewayV2PostStartFailureOutcomes(source, state, journal, observation); len(failures) != 0 {
+		t.Fatalf("exact stage diagnostic failures=%v", failures)
+	}
+	observation.Stage404Proven = false
+	observation.StageHostPublicationProven = false
+	want := []liveGatewayV2TraceOutcome{liveGatewayV2TracePostStartStage404, liveGatewayV2TracePostStartHostPublication}
+	if got := liveGatewayV2PostStartFailureOutcomes(source, state, journal, observation); !reflect.DeepEqual(got, want) {
+		t.Fatalf("readiness failures=%v, want %v", got, want)
 	}
 }
 
