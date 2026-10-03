@@ -1,9 +1,12 @@
 package generatedingress
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -584,6 +587,7 @@ const (
 	liveGatewayV2TraceStageReadRestartConfig         liveGatewayV2TraceStep = "stage_read_restart_config"
 	liveGatewayV2TraceStageAttestStopped             liveGatewayV2TraceStep = "stage_attest_stopped"
 	liveGatewayV2TraceStageAttestStoppedDetail       liveGatewayV2TraceStep = "stage_attest_stopped_detail"
+	liveGatewayV2TraceStageStabilityDetail           liveGatewayV2TraceStep = "stage_stability_detail"
 	liveGatewayV2TraceStageAttestStoppedCompensation liveGatewayV2TraceStep = "stage_attest_stopped_compensation"
 	liveGatewayV2TraceStageStart                     liveGatewayV2TraceStep = "stage_start"
 	liveGatewayV2TraceStageStartDetail               liveGatewayV2TraceStep = "stage_start_detail"
@@ -679,6 +683,11 @@ const (
 	liveGatewayV2TraceStartNetworkUnavailable         liveGatewayV2TraceOutcome = "start_network_unavailable"
 	liveGatewayV2TraceStartContainerMissing           liveGatewayV2TraceOutcome = "start_container_missing"
 	liveGatewayV2TraceStartPermissionDenied           liveGatewayV2TraceOutcome = "start_permission_denied"
+	liveGatewayV2TraceStartRuntimeMountFailed         liveGatewayV2TraceOutcome = "start_runtime_mount_failed"
+	liveGatewayV2TraceStartRuntimeExecFailed          liveGatewayV2TraceOutcome = "start_runtime_exec_failed"
+	liveGatewayV2TraceStartRuntimeSecurityFailed      liveGatewayV2TraceOutcome = "start_runtime_security_failed"
+	liveGatewayV2TraceStartRuntimeCgroupFailed        liveGatewayV2TraceOutcome = "start_runtime_cgroup_failed"
+	liveGatewayV2TraceStartRuntimeNamespaceFailed     liveGatewayV2TraceOutcome = "start_runtime_namespace_failed"
 	liveGatewayV2TraceStartRuntimeCreateFailed        liveGatewayV2TraceOutcome = "start_runtime_create_failed"
 	liveGatewayV2TraceStartExternalConnectivityFailed liveGatewayV2TraceOutcome = "start_external_connectivity_failed"
 	liveGatewayV2TraceStartCommandFailedOther         liveGatewayV2TraceOutcome = "start_command_failed_other"
@@ -718,6 +727,25 @@ const (
 	liveGatewayV2TraceAttestStageLiveConfigAbsent      liveGatewayV2TraceOutcome = "failed_predicate_attest_stage_live_config_absent"
 	liveGatewayV2TraceAttestStageRestartConfig         liveGatewayV2TraceOutcome = "failed_predicate_attest_stage_restart_config"
 	liveGatewayV2TraceAttestApplicationNetworksAbsent  liveGatewayV2TraceOutcome = "failed_predicate_attest_application_networks_absent"
+)
+
+const (
+	liveGatewayV2TraceStabilityInspectCaptureIncomplete liveGatewayV2TraceOutcome = "stage_stability_inspect_capture_incomplete"
+	liveGatewayV2TraceStabilityConfigCaptureIncomplete  liveGatewayV2TraceOutcome = "stage_stability_restart_config_capture_incomplete"
+	liveGatewayV2TraceStabilityContainerIdentity        liveGatewayV2TraceOutcome = "stage_stability_container_identity_changed"
+	liveGatewayV2TraceStabilityContainerState           liveGatewayV2TraceOutcome = "stage_stability_container_state_changed"
+	liveGatewayV2TraceStabilityContainerExecution       liveGatewayV2TraceOutcome = "stage_stability_container_execution_changed"
+	liveGatewayV2TraceStabilityContainerIsolation       liveGatewayV2TraceOutcome = "stage_stability_container_isolation_changed"
+	liveGatewayV2TraceStabilityContainerResources       liveGatewayV2TraceOutcome = "stage_stability_container_resources_changed"
+	liveGatewayV2TraceStabilityContainerLogging         liveGatewayV2TraceOutcome = "stage_stability_container_logging_changed"
+	liveGatewayV2TraceStabilityContainerLabels          liveGatewayV2TraceOutcome = "stage_stability_container_labels_changed"
+	liveGatewayV2TraceStabilityContainerPorts           liveGatewayV2TraceOutcome = "stage_stability_container_ports_changed"
+	liveGatewayV2TraceStabilityContainerNetworks        liveGatewayV2TraceOutcome = "stage_stability_container_networks_changed"
+	liveGatewayV2TraceStabilityRuntimeState             liveGatewayV2TraceOutcome = "stage_stability_runtime_state_changed"
+	liveGatewayV2TraceStabilityRuntimePorts             liveGatewayV2TraceOutcome = "stage_stability_runtime_ports_changed"
+	liveGatewayV2TraceStabilityRuntimeNetworks          liveGatewayV2TraceOutcome = "stage_stability_runtime_networks_changed"
+	liveGatewayV2TraceStabilityRestartConfig            liveGatewayV2TraceOutcome = "stage_stability_restart_config_changed"
+	liveGatewayV2TraceStabilityUnclassified             liveGatewayV2TraceOutcome = "stage_stability_unclassified"
 )
 
 type liveGatewayV2TraceEvent struct {
@@ -1150,15 +1178,177 @@ func (d liveGatewayV2TracingUpgradeDriver) readStageRestartConfig(ctx context.Co
 	return contents, err
 }
 
+type liveGatewayV2StageStabilityCaptureRunner struct {
+	inner                 runtimeprocess.CommandRunner
+	stageName             string
+	stageID               string
+	configFilename        string
+	inspectAttempts       int
+	restartConfigAttempts int
+	inspectOutputs        [][]byte
+	restartConfigOutputs  [][]byte
+}
+
+func (r *liveGatewayV2StageStabilityCaptureRunner) Run(ctx context.Context,
+	request runtimeprocess.CommandRequest,
+) (runtimeprocess.CommandResult, error) {
+	result, err := r.inner.Run(ctx, request)
+	if r.isStageInspect(request.Args) {
+		r.inspectAttempts++
+		if err == nil && !result.StdoutTruncated && !result.StderrTruncated && len(r.inspectOutputs) < 2 {
+			r.inspectOutputs = append(r.inspectOutputs, append([]byte(nil), result.Stdout...))
+		}
+	}
+	if r.isStageRestartConfigRead(request.Args) {
+		r.restartConfigAttempts++
+		if err == nil && !result.StdoutTruncated && !result.StderrTruncated && len(r.restartConfigOutputs) < 2 {
+			r.restartConfigOutputs = append(r.restartConfigOutputs, append([]byte(nil), result.Stdout...))
+		}
+	}
+	return result, err
+}
+
+func (r *liveGatewayV2StageStabilityCaptureRunner) isStageInspect(args []string) bool {
+	return len(args) == 5 && args[0] == "container" && args[1] == "inspect" && args[2] == "--format" &&
+		args[3] == gatewayContainerInspectFormat && args[4] == r.stageName
+}
+
+func (r *liveGatewayV2StageStabilityCaptureRunner) isStageRestartConfigRead(args []string) bool {
+	if len(args) != 4 || args[0] != "container" || args[1] != "cp" || args[3] != "-" {
+		return false
+	}
+	suffix := ":/config/" + r.configFilename
+	container := strings.TrimSuffix(args[2], suffix)
+	return container != args[2] && validContainerID(container) && normalizeID(container) == normalizeID(r.stageID)
+}
+
+func (r *liveGatewayV2StageStabilityCaptureRunner) failureOutcomes() []liveGatewayV2TraceOutcome {
+	failures := make([]liveGatewayV2TraceOutcome, 0, 16)
+	if r.inspectAttempts != 2 || len(r.inspectOutputs) != 2 {
+		failures = append(failures, liveGatewayV2TraceStabilityInspectCaptureIncomplete)
+	} else {
+		var first, confirmed gatewayContainerInspection
+		if json.Unmarshal(r.inspectOutputs[0], &first) != nil || json.Unmarshal(r.inspectOutputs[1], &confirmed) != nil {
+			failures = append(failures, liveGatewayV2TraceStabilityInspectCaptureIncomplete)
+		} else {
+			failures = append(failures, liveGatewayV2StageInspectionChangeOutcomes(first, confirmed)...)
+		}
+		first = gatewayContainerInspection{}
+		confirmed = gatewayContainerInspection{}
+	}
+	if r.restartConfigAttempts != 2 || len(r.restartConfigOutputs) != 2 {
+		failures = append(failures, liveGatewayV2TraceStabilityConfigCaptureIncomplete)
+	} else {
+		first, firstValid := liveGatewayV2RestartConfigFromArchive(r.restartConfigOutputs[0], r.configFilename)
+		confirmed, confirmedValid := liveGatewayV2RestartConfigFromArchive(r.restartConfigOutputs[1], r.configFilename)
+		if !firstValid || !confirmedValid {
+			failures = append(failures, liveGatewayV2TraceStabilityConfigCaptureIncomplete)
+		} else if !sameCaddyConfig(first, confirmed) {
+			failures = append(failures, liveGatewayV2TraceStabilityRestartConfig)
+		}
+		clear(first)
+		clear(confirmed)
+	}
+	return failures
+}
+
+func liveGatewayV2StageInspectionChangeOutcomes(first, confirmed gatewayContainerInspection) []liveGatewayV2TraceOutcome {
+	changed := func(values ...bool) bool {
+		for _, same := range values {
+			if !same {
+				return true
+			}
+		}
+		return false
+	}
+	return liveGatewayV2SelectedTraceOutcomes(
+		liveGatewayV2TraceSelection{changed(first.ID == confirmed.ID, first.Name == confirmed.Name,
+			first.Image == confirmed.Image, first.Hostname == confirmed.Hostname, first.User == confirmed.User,
+			first.NetworkMode == confirmed.NetworkMode), liveGatewayV2TraceStabilityContainerIdentity},
+		liveGatewayV2TraceSelection{changed(first.Running == confirmed.Running,
+			first.Restarting == confirmed.Restarting), liveGatewayV2TraceStabilityContainerState},
+		liveGatewayV2TraceSelection{changed(reflect.DeepEqual(first.Env, confirmed.Env),
+			reflect.DeepEqual(first.Entrypoint, confirmed.Entrypoint), reflect.DeepEqual(first.Cmd, confirmed.Cmd)),
+			liveGatewayV2TraceStabilityContainerExecution},
+		liveGatewayV2TraceSelection{changed(first.ReadOnly == confirmed.ReadOnly, first.Privileged == confirmed.Privileged,
+			reflect.DeepEqual(first.CapAdd, confirmed.CapAdd), reflect.DeepEqual(first.CapDrop, confirmed.CapDrop),
+			reflect.DeepEqual(first.SecurityOpt, confirmed.SecurityOpt), reflect.DeepEqual(first.Binds, confirmed.Binds),
+			reflect.DeepEqual(first.Tmpfs, confirmed.Tmpfs)), liveGatewayV2TraceStabilityContainerIsolation},
+		liveGatewayV2TraceSelection{changed(reflect.DeepEqual(first.Mounts, confirmed.Mounts), first.Memory == confirmed.Memory,
+			first.MemorySwap == confirmed.MemorySwap, first.NanoCPUs == confirmed.NanoCPUs,
+			first.PIDsLimit == confirmed.PIDsLimit, reflect.DeepEqual(first.Ulimits, confirmed.Ulimits)),
+			liveGatewayV2TraceStabilityContainerResources},
+		liveGatewayV2TraceSelection{changed(first.LogType == confirmed.LogType,
+			reflect.DeepEqual(first.LogConfig, confirmed.LogConfig), first.Restart == confirmed.Restart),
+			liveGatewayV2TraceStabilityContainerLogging},
+		liveGatewayV2TraceSelection{!reflect.DeepEqual(first.Labels, confirmed.Labels),
+			liveGatewayV2TraceStabilityContainerLabels},
+		liveGatewayV2TraceSelection{!reflect.DeepEqual(first.PortBindings, confirmed.PortBindings),
+			liveGatewayV2TraceStabilityContainerPorts},
+		liveGatewayV2TraceSelection{!reflect.DeepEqual(first.Networks, confirmed.Networks),
+			liveGatewayV2TraceStabilityContainerNetworks},
+		liveGatewayV2TraceSelection{changed(first.Paused == confirmed.Paused, first.Dead == confirmed.Dead,
+			first.RestartCount == confirmed.RestartCount), liveGatewayV2TraceStabilityRuntimeState},
+		liveGatewayV2TraceSelection{!reflect.DeepEqual(first.EffectivePortBindings, confirmed.EffectivePortBindings),
+			liveGatewayV2TraceStabilityRuntimePorts},
+		liveGatewayV2TraceSelection{!reflect.DeepEqual(first.ConfiguredNetworks, confirmed.ConfiguredNetworks),
+			liveGatewayV2TraceStabilityRuntimeNetworks},
+	)
+}
+
+func liveGatewayV2RestartConfigFromArchive(value []byte, filename string) ([]byte, bool) {
+	reader := tar.NewReader(bytes.NewReader(value))
+	header, err := reader.Next()
+	if err != nil || header == nil || header.Typeflag != tar.TypeReg || header.Size <= 0 || header.Size > gatewayV2MaxConfigBytes ||
+		strings.TrimPrefix(header.Name, "./") != filename {
+		return nil, false
+	}
+	body, err := io.ReadAll(io.LimitReader(reader, gatewayV2MaxConfigBytes+1))
+	if err != nil || int64(len(body)) != header.Size || !json.Valid(body) {
+		clear(body)
+		return nil, false
+	}
+	if _, err := reader.Next(); err != io.EOF {
+		clear(body)
+		return nil, false
+	}
+	return body, true
+}
+
+func (r *liveGatewayV2StageStabilityCaptureRunner) clear() {
+	for _, output := range r.inspectOutputs {
+		clear(output)
+	}
+	for _, output := range r.restartConfigOutputs {
+		clear(output)
+	}
+	clear(r.inspectOutputs)
+	clear(r.restartConfigOutputs)
+	r.inspectOutputs = nil
+	r.restartConfigOutputs = nil
+}
+
 func (d liveGatewayV2TracingUpgradeDriver) attestStoppedStage(ctx context.Context, source routeState,
 	state gatewayV2RouteState, journal gatewayMigrationJournal,
 ) bool {
-	if d.manager == nil || ctx == nil || !validGatewayTopologyInputs(source, state, journal) {
+	if d.manager == nil || d.manager.runner == nil || ctx == nil || !validGatewayTopologyInputs(source, state, journal) {
 		d.trace.recordAt(liveGatewayV2TraceStageAttestStoppedDetail, journal.Phase, liveGatewayV2TraceAttestInspectError)
 		d.trace.recordAt(liveGatewayV2TraceStageAttestStopped, journal.Phase, liveGatewayV2TraceFalse)
 		return false
 	}
-	observation, err := d.manager.inspectGatewayV2Docker(ctx, source, state, journal)
+	capture := &liveGatewayV2StageStabilityCaptureRunner{
+		inner: d.manager.runner, stageName: state.Identity.StageContainer,
+		stageID: journal.Resources.StageContainerID, configFilename: state.Identity.StageConfigFilename,
+	}
+	d.manager.runner = capture
+	var observation gatewayV2DockerObservation
+	var err error
+	func() {
+		defer func() { d.manager.runner = capture.inner }()
+		observation, err = d.manager.inspectGatewayV2Docker(ctx, source, state, journal)
+	}()
+	stabilityFailures := capture.failureOutcomes()
+	capture.clear()
 	if err != nil {
 		clearGatewayV2DockerObservation(&observation)
 		d.trace.recordAt(liveGatewayV2TraceStageAttestStoppedDetail, journal.Phase, liveGatewayV2TraceAttestInspectError)
@@ -1174,6 +1364,14 @@ func (d liveGatewayV2TracingUpgradeDriver) attestStoppedStage(ctx context.Contex
 		}
 		for _, failure := range failures {
 			d.trace.recordAt(liveGatewayV2TraceStageAttestStoppedDetail, journal.Phase, failure)
+		}
+		if !observation.StageStable {
+			if len(stabilityFailures) == 0 {
+				stabilityFailures = append(stabilityFailures, liveGatewayV2TraceStabilityUnclassified)
+			}
+			for _, failure := range stabilityFailures {
+				d.trace.recordAt(liveGatewayV2TraceStageStabilityDetail, journal.Phase, failure)
+			}
 		}
 	}
 	d.trace.recordAt(liveGatewayV2TraceStageAttestStopped, journal.Phase, liveGatewayV2BoolOutcome(result))
@@ -1338,11 +1536,22 @@ func liveGatewayV2StartCommandOutcome(result runtimeprocess.CommandResult, err e
 		return liveGatewayV2TraceStartContainerMissing
 	case strings.Contains(message, "permission denied"), strings.Contains(message, "access is denied"):
 		return liveGatewayV2TraceStartPermissionDenied
+	case strings.Contains(message, "failed programming external connectivity"), strings.Contains(message, "failed to create endpoint"):
+		return liveGatewayV2TraceStartExternalConnectivityFailed
+	case strings.Contains(message, "oci runtime") && (strings.Contains(message, "mount") || strings.Contains(message, "rootfs")):
+		return liveGatewayV2TraceStartRuntimeMountFailed
+	case strings.Contains(message, "oci runtime") && (strings.Contains(message, "exec") || strings.Contains(message, "executable")):
+		return liveGatewayV2TraceStartRuntimeExecFailed
+	case strings.Contains(message, "oci runtime") && (strings.Contains(message, "seccomp") || strings.Contains(message, "apparmor") ||
+		strings.Contains(message, "capability") || strings.Contains(message, "operation not permitted")):
+		return liveGatewayV2TraceStartRuntimeSecurityFailed
+	case strings.Contains(message, "oci runtime") && strings.Contains(message, "cgroup"):
+		return liveGatewayV2TraceStartRuntimeCgroupFailed
+	case strings.Contains(message, "oci runtime") && strings.Contains(message, "namespace"):
+		return liveGatewayV2TraceStartRuntimeNamespaceFailed
 	case strings.Contains(message, "oci runtime"), strings.Contains(message, "failed to create task"),
 		strings.Contains(message, "failed to start shim"), strings.Contains(message, "container init"):
 		return liveGatewayV2TraceStartRuntimeCreateFailed
-	case strings.Contains(message, "failed programming external connectivity"), strings.Contains(message, "failed to create endpoint"):
-		return liveGatewayV2TraceStartExternalConnectivityFailed
 	default:
 		return liveGatewayV2TraceStartCommandFailedOther
 	}
@@ -1613,6 +1822,102 @@ func TestLiveGatewayV2StoppedStageDiagnosticMatchesClassifier(t *testing.T) {
 	}
 }
 
+func TestLiveGatewayV2StageStabilityCaptureClosesFieldChanges(t *testing.T) {
+	source, state, journal := gatewayV2IdentityTestState(t)
+	journal.Phase = gatewayPhaseStageIntent
+	journal.Resources = gatewayV2IdentityTestBoundResources(t)
+	journal.Resources.FinalContainerID = ""
+	observation := gatewayV2IdentityTestObservation(t, source, state, journal, gatewayTopologyExactV1WithStage)
+	stopGatewayV2TestContainer(&observation.StageContainer, &observation.StageRuntime, &observation.StageConfig,
+		state, observation.IngressNetworkID, nil)
+
+	first := gatewayContainerInspection{caddyInspection: observation.StageContainer,
+		gatewayContainerRuntime: observation.StageRuntime}
+	confirmed := liveGatewayV2CloneContainerInspection(t, first)
+	config, err := buildGatewayV2StageConfig(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(config)
+
+	newCapture := func(confirmed gatewayContainerInspection, confirmedConfig []byte) *liveGatewayV2StageStabilityCaptureRunner {
+		firstJSON, err := json.Marshal(first)
+		if err != nil {
+			t.Fatal(err)
+		}
+		confirmedJSON, err := json.Marshal(confirmed)
+		if err != nil {
+			clear(firstJSON)
+			t.Fatal(err)
+		}
+		return &liveGatewayV2StageStabilityCaptureRunner{
+			inspectAttempts: 2, restartConfigAttempts: 2, configFilename: state.Identity.StageConfigFilename,
+			inspectOutputs: [][]byte{firstJSON, confirmedJSON},
+			restartConfigOutputs: [][]byte{
+				liveGatewayV2RestartConfigArchiveForTest(t, state.Identity.StageConfigFilename, config),
+				liveGatewayV2RestartConfigArchiveForTest(t, state.Identity.StageConfigFilename, confirmedConfig),
+			},
+		}
+	}
+
+	stable := newCapture(confirmed, config)
+	if failures := stable.failureOutcomes(); len(failures) != 0 {
+		stable.clear()
+		t.Fatalf("stable capture failures=%v", failures)
+	}
+	stable.clear()
+
+	networkNormalized := liveGatewayV2CloneContainerInspection(t, confirmed)
+	ingress := networkNormalized.ConfiguredNetworks[state.Identity.IngressNetwork]
+	ingress.NetworkID = ""
+	networkNormalized.ConfiguredNetworks[state.Identity.IngressNetwork] = ingress
+	networkCapture := newCapture(networkNormalized, config)
+	if failures := networkCapture.failureOutcomes(); !reflect.DeepEqual(failures,
+		[]liveGatewayV2TraceOutcome{liveGatewayV2TraceStabilityRuntimeNetworks}) {
+		networkCapture.clear()
+		t.Fatalf("runtime-network capture failures=%v", failures)
+	}
+	networkCapture.clear()
+
+	configCapture := newCapture(confirmed, []byte(`{"admin":{"listen":"localhost:2019"}}`))
+	if failures := configCapture.failureOutcomes(); !reflect.DeepEqual(failures,
+		[]liveGatewayV2TraceOutcome{liveGatewayV2TraceStabilityRestartConfig}) {
+		configCapture.clear()
+		t.Fatalf("restart-config capture failures=%v", failures)
+	}
+	configCapture.clear()
+}
+
+func liveGatewayV2CloneContainerInspection(t *testing.T, value gatewayContainerInspection) gatewayContainerInspection {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(encoded)
+	var cloned gatewayContainerInspection
+	if err := json.Unmarshal(encoded, &cloned); err != nil {
+		t.Fatal(err)
+	}
+	return cloned
+}
+
+func liveGatewayV2RestartConfigArchiveForTest(t *testing.T, filename string, contents []byte) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	writer := tar.NewWriter(&buffer)
+	if err := writer.WriteHeader(&tar.Header{Name: filename, Mode: 0o600, Size: int64(len(contents))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(contents); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return append([]byte(nil), buffer.Bytes()...)
+}
+
 func TestGatewayV2OperationTraceClosesAndBoundsValues(t *testing.T) {
 	trace := &liveGatewayV2OperationTrace{phase: liveGatewayV2TracePhasePreparation}
 	trace.recordAt(liveGatewayV2TraceStageObserveTopology, gatewayMigrationPhase("untrusted-phase"),
@@ -1647,8 +1952,14 @@ func TestLiveGatewayV2StartCommandOutcomeClosesDaemonErrors(t *testing.T) {
 		{name: "network unavailable", result: runtimeprocess.CommandResult{Stderr: []byte("no such network")}, err: commandError, want: liveGatewayV2TraceStartNetworkUnavailable},
 		{name: "container missing", result: runtimeprocess.CommandResult{Stderr: []byte("no such container")}, err: commandError, want: liveGatewayV2TraceStartContainerMissing},
 		{name: "permission denied", result: runtimeprocess.CommandResult{Stderr: []byte("permission denied")}, err: commandError, want: liveGatewayV2TraceStartPermissionDenied},
+		{name: "runtime mount failed", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: mount setup failed")}, err: commandError, want: liveGatewayV2TraceStartRuntimeMountFailed},
+		{name: "runtime exec failed", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: exec failed")}, err: commandError, want: liveGatewayV2TraceStartRuntimeExecFailed},
+		{name: "runtime security failed", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: seccomp setup failed")}, err: commandError, want: liveGatewayV2TraceStartRuntimeSecurityFailed},
+		{name: "runtime cgroup failed", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: cgroup setup failed")}, err: commandError, want: liveGatewayV2TraceStartRuntimeCgroupFailed},
+		{name: "runtime namespace failed", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed: namespace setup failed")}, err: commandError, want: liveGatewayV2TraceStartRuntimeNamespaceFailed},
 		{name: "runtime create failed", result: runtimeprocess.CommandResult{Stderr: []byte("OCI runtime create failed")}, err: commandError, want: liveGatewayV2TraceStartRuntimeCreateFailed},
 		{name: "external connectivity", result: runtimeprocess.CommandResult{Stderr: []byte("failed programming external connectivity")}, err: commandError, want: liveGatewayV2TraceStartExternalConnectivityFailed},
+		{name: "wrapped external connectivity", result: runtimeprocess.CommandResult{Stderr: []byte("failed to create task: failed programming external connectivity")}, err: commandError, want: liveGatewayV2TraceStartExternalConnectivityFailed},
 		{name: "other does not escape", result: runtimeprocess.CommandResult{Stderr: []byte("sensitive unexpected daemon output")}, err: commandError, want: liveGatewayV2TraceStartCommandFailedOther},
 	}
 	for _, test := range tests {
