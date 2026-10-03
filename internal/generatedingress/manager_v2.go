@@ -172,7 +172,7 @@ func (m *Manager) preflightCommittedV2Candidate(ctx context.Context, state gatew
 	}
 	confirmedFinal, confirmedRuntime, confirmedFound, err := m.inspectNamedGatewayContainer(ctx, state.Identity.FinalContainer)
 	if err != nil || !validCommittedV2FinalContainer(state, journal, confirmedFinal, confirmedRuntime, confirmedFound, image.ID) ||
-		!reflect.DeepEqual(final, confirmedFinal) || !reflect.DeepEqual(runtime, confirmedRuntime) {
+		!stableGatewayV2ContainerMounts(final, confirmedFinal, runtime, confirmedRuntime, state.Identity) {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
 	return nil
