@@ -1510,7 +1510,15 @@ func gatewayV2ResourceLabels(state gatewayV2RouteState, journal gatewayMigration
 func validOwnedNameSet(actual []string, expected ...string) bool {
 	wanted := append([]string(nil), expected...)
 	sort.Strings(wanted)
-	return reflect.DeepEqual(actual, wanted)
+	if len(actual) != len(wanted) {
+		return false
+	}
+	for index := range wanted {
+		if actual[index] != wanted[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func mustGatewayV2PrefixBits(subnet string) int {
