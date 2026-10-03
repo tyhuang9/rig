@@ -196,6 +196,12 @@ type liveGatewayImage struct {
 
 func buildLiveGatewayImage(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, root, dockerConfig, tag string, spec generatedruntime.CandidateSpec, version, bindAddress string) string {
 	t.Helper()
+	server := fmt.Sprintf("import { createServer } from 'node:http';\nconst port=Number(process.env.RIG_RUNTIME_INTERNAL_PORT);\nconst version=%q;\ncreateServer((request,response)=>{ response.writeHead(200,{ 'content-type':'text/plain' }); response.end(version); }).listen(port,%q);\n", version, bindAddress)
+	return buildLiveGatewayImageWithServer(t, ctx, runner, docker, root, dockerConfig, tag, spec, version, server)
+}
+
+func buildLiveGatewayImageWithServer(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, root, dockerConfig, tag string, spec generatedruntime.CandidateSpec, version, server string) string {
+	t.Helper()
 	// Buildx persists state below DOCKER_CONFIG. Keep fixture build state out of
 	// the intentionally empty runtime Docker configuration used by the engine.
 	buildConfig := t.TempDir()
@@ -205,7 +211,6 @@ func buildLiveGatewayImage(t *testing.T, ctx context.Context, runner runtimeproc
 	}
 	containerfile := fmt.Sprintf("FROM %s\nWORKDIR /workspace\nCOPY --chmod=0555 rig-entrypoint /usr/local/bin/rig-entrypoint\nCOPY --chown=node:node server.mjs /workspace/server.mjs\nUSER node\nENTRYPOINT [\"/usr/local/bin/rig-entrypoint\"]\n", liveNodeImage)
 	entrypoint := "#!/bin/sh\nset -eu\nexec \"$@\"\n"
-	server := fmt.Sprintf("import { createServer } from 'node:http';\nconst port=Number(process.env.RIG_RUNTIME_INTERNAL_PORT);\nconst version=%q;\ncreateServer((request,response)=>{ response.writeHead(200,{ 'content-type':'text/plain' }); response.end(version); }).listen(port,%q);\n", version, bindAddress)
 	for name, contents := range map[string]string{"Dockerfile": containerfile, "rig-entrypoint": entrypoint, "server.mjs": server} {
 		if err := os.WriteFile(filepath.Join(contextRoot, name), []byte(contents), 0o600); err != nil {
 			t.Fatal("write gateway image fixture")
