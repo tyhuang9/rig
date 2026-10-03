@@ -684,6 +684,13 @@ func validGatewayPinnedImage(value imageInspection, found bool) bool {
 }
 
 func validGatewayV1Base(source routeState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation, requireRollbackTopology bool) bool {
+	if !observation.V1Container.Running {
+		if observation.V1Container.Restarting || (journal.Phase != gatewayPhaseTransferIntent && journal.Phase != gatewayPhaseRollbackIntent &&
+			journal.Phase != gatewayPhaseV2Serving && journal.Phase != gatewayPhaseCommitted) {
+			return false
+		}
+		return validStoppedGatewayV1Base(source, journal, observation, requireRollbackTopology)
+	}
 	if !observation.V1ContainerFound || !observation.V1VolumeFound || !observation.V1NetworkFound ||
 		!validGatewayContainerRuntime(observation.V1Runtime, true) ||
 		!gatewayV2EffectivePortBindingsMatchConfigured(observation.V1Runtime.EffectivePortBindings, observation.V1Container.PortBindings) ||
@@ -716,6 +723,90 @@ func validGatewayV1Base(source routeState, journal gatewayMigrationJournal, obse
 		inspection, exists := observation.V1ApplicationNetworks[name]
 		if !exists || !validContainerID(observation.V1ApplicationNetworkIDs[name]) || !validApplicationNetwork(inspection.identity(), appID) ||
 			!validGatewayApplicationNetworkMembership(inspection, observation.V1Container, name) {
+			return false
+		}
+	}
+	identityDigest, err := gatewayV1ObservedIdentityDigest(observation)
+	return err == nil && identityDigest == journal.Source.IdentityDigest
+}
+
+// Docker retains HostConfig and configured network keys after stop but clears
+// effective host publications and live network endpoints. This proof uses the
+// independently inspected network identities before authorizing recovery.
+func validStoppedGatewayV1Base(source routeState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation, requireRollbackTopology bool) bool {
+	container, runtime := observation.V1Container, observation.V1Runtime
+	if !observation.V1ContainerFound || !observation.V1VolumeFound || !observation.V1NetworkFound ||
+		container.Running || container.Restarting || !validGatewayContainerRuntime(runtime, true) ||
+		gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings) ||
+		!validCaddyInspection(container, observation.Image.ID, journal.Source.LocalHostPort) ||
+		observation.V1Volume.Name != caddyVolumeName || observation.V1Volume.Driver != "local" || observation.V1Volume.Scope != "local" ||
+		len(observation.V1Volume.Options) != 0 || observation.V1Volume.Labels[gatewayV2ManagedLabelKey] != gatewayV2ManagedContainerLabel ||
+		observation.V1Volume.Labels[gatewayV2IdentityLabelKey] != gatewayV1IdentityVersion ||
+		len(observation.V1Network.Containers) != 0 || len(observation.V1Config) != 0 {
+		return false
+	}
+	listenIP, valid := ingressNetworkIdentity(observation.V1Network.identity())
+	if !valid {
+		return false
+	}
+	expectedConfig, err := buildCaddyConfig(source.Active, net.JoinHostPort(listenIP, strconv.FormatUint(uint64(gatewayV2ContainerPort), 10)))
+	if err != nil || !sameCaddyConfig(expectedConfig, observation.V1RestartConfig) {
+		return false
+	}
+	owners, valid := gatewayRouteNetworkOwners(source.Active)
+	if !valid || len(container.Networks) != len(runtime.ConfiguredNetworks) ||
+		(requireRollbackTopology && len(container.Networks) != len(owners)+1) {
+		return false
+	}
+	for name := range container.Networks {
+		if name != caddyNetworkName && owners[name] == "" {
+			return false
+		}
+	}
+	validStoppedAttachment := func(name, inspectedID string, gatewayPriority int, staticIPv4 string) bool {
+		live, exists := container.Networks[name]
+		configured, configuredExists := runtime.ConfiguredNetworks[name]
+		if !exists || live == nil || !configuredExists || live.IPAddress != "" || live.IPv6Gateway != "" ||
+			live.GwPriority != gatewayPriority || configured.EndpointID != "" || configured.IPAddress != "" ||
+			configured.IPv6Gateway != "" || configured.GwPriority != gatewayPriority ||
+			!(inspectedID == "" && configured.NetworkID == "" ||
+				inspectedID != "" && validGatewayV2StoppedNetworkReference(configured.NetworkID, inspectedID)) {
+			return false
+		}
+		if staticIPv4 != "" {
+			return configured.IPAMConfig != nil && *configured.IPAMConfig == (gatewayV2ConfiguredIPAM{IPv4Address: staticIPv4})
+		}
+		return configured.IPAMConfig == nil || *configured.IPAMConfig == (gatewayV2ConfiguredIPAM{})
+	}
+	if !validStoppedAttachment(caddyNetworkName, observation.V1NetworkID, caddyGatewayPriority, listenIP) {
+		return false
+	}
+	if requireRollbackTopology && (len(observation.V1ApplicationNetworks) != len(owners) || len(observation.V1ApplicationNetworkIDs) != len(owners)) {
+		return false
+	}
+	containerName := strings.TrimPrefix(container.Name, "/")
+	for name, appID := range owners {
+		if !requireRollbackTopology {
+			_, containerHasNetwork := container.Networks[name]
+			_, runtimeHasNetwork := runtime.ConfiguredNetworks[name]
+			if !containerHasNetwork && !runtimeHasNetwork {
+				continue
+			}
+		}
+		inspectedID := runtime.ConfiguredNetworks[name].NetworkID
+		if requireRollbackTopology {
+			inspection, exists := observation.V1ApplicationNetworks[name]
+			inspectedID = observation.V1ApplicationNetworkIDs[name]
+			if !exists || !validContainerID(inspectedID) || !validApplicationNetwork(inspection.identity(), appID) {
+				return false
+			}
+			for memberID, member := range inspection.Containers {
+				if normalizeID(memberID) == normalizeID(container.ID) || member.Name == containerName {
+					return false
+				}
+			}
+		}
+		if !validStoppedAttachment(name, inspectedID, 0, "") {
 			return false
 		}
 	}
