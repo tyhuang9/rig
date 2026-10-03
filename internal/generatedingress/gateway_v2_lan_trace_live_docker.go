@@ -48,7 +48,26 @@ func (d liveDockerLANGrantTraceDriver) preflightCandidate(ctx context.Context, s
 
 func (d liveDockerLANGrantTraceDriver) apply(ctx context.Context, state gatewayV2RouteState, filename string) error {
 	err := d.managerGatewayV2LANGrantDriver.apply(ctx, state, filename)
-	d.record("apply", err == nil)
+	stage := "apply"
+	if err != nil {
+		switch {
+		case IsCode(err, DiagnosticRouteInvalid):
+			stage = "apply_route_invalid"
+		case IsCode(err, DiagnosticIngressUnavailable):
+			stage = "apply_ingress_unavailable"
+		case IsCode(err, DiagnosticIngressDrift):
+			stage = "apply_ingress_drift"
+		case IsCode(err, DiagnosticRouteValidateFailed):
+			stage = "apply_validate_failed"
+		case IsCode(err, DiagnosticRouteReloadFailed):
+			stage = "apply_reload_failed"
+		case IsCode(err, DiagnosticRouteUnresolved):
+			stage = "apply_unresolved"
+		default:
+			stage = "apply_other"
+		}
+	}
+	d.record(stage, err == nil)
 	return err
 }
 
