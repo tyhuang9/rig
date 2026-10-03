@@ -497,6 +497,59 @@ func TestClassifyGatewayV2StageFailsClosedWithoutRestartAndPublicationProof(t *t
 	}
 }
 
+func TestStableGatewayV2StageContainerAcceptsOnlyExactMountOrderChange(t *testing.T) {
+	identity := gatewayV2Identity{ConfigVolume: "config-volume", DataVolume: "data-volume"}
+	first := caddyInspection{ID: "stage-id", Hostname: "stage-host", Running: false, Mounts: []mountInspection{
+		{Type: "volume", Name: identity.ConfigVolume, Destination: "/config", RW: true},
+		{Type: "volume", Name: identity.DataVolume, Destination: "/data", RW: true},
+	}}
+	runtime := gatewayContainerRuntime{EffectivePortBindings: map[string][]map[string]string{}}
+	copyStage := func() caddyInspection {
+		value := first
+		value.Mounts = append([]mountInspection(nil), first.Mounts...)
+		return value
+	}
+	if !stableGatewayV2StageContainer(first, copyStage(), runtime, runtime, identity) {
+		t.Fatal("identical stage reads were rejected")
+	}
+	reordered := copyStage()
+	reordered.Mounts[0], reordered.Mounts[1] = reordered.Mounts[1], reordered.Mounts[0]
+	if !stableGatewayV2StageContainer(first, reordered, runtime, runtime, identity) {
+		t.Fatal("exact mounts in reverse Docker order were rejected")
+	}
+	if first.Mounts[0].Destination != "/config" || reordered.Mounts[0].Destination != "/data" {
+		t.Fatal("comparison mutated either observed mount slice")
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*caddyInspection)
+	}{
+		{"mount write mode", func(value *caddyInspection) { value.Mounts[0].RW = false }},
+		{"mount identity", func(value *caddyInspection) { value.Mounts[0].Name = "replaced" }},
+		{"mount type", func(value *caddyInspection) { value.Mounts[0].Type = "bind" }},
+		{"mount destination", func(value *caddyInspection) { value.Mounts[0].Destination = "/elsewhere" }},
+		{"missing mount", func(value *caddyInspection) { value.Mounts = value.Mounts[:1] }},
+		{"extra mount", func(value *caddyInspection) { value.Mounts = append(value.Mounts, value.Mounts[0]) }},
+		{"container ID", func(value *caddyInspection) { value.ID = "replaced" }},
+		{"hostname", func(value *caddyInspection) { value.Hostname = "replaced" }},
+		{"running state", func(value *caddyInspection) { value.Running = true }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			confirmed := copyStage()
+			test.mutate(&confirmed)
+			if stableGatewayV2StageContainer(first, confirmed, runtime, runtime, identity) {
+				t.Fatal("changed stage read was accepted")
+			}
+		})
+	}
+	changedRuntime := gatewayContainerRuntime{EffectivePortBindings: map[string][]map[string]string{
+		"8080/tcp": {{"HostIp": "127.0.0.1", "HostPort": "8080"}},
+	}}
+	if stableGatewayV2StageContainer(first, reordered, runtime, changedRuntime, identity) {
+		t.Fatal("changed runtime ports were accepted")
+	}
+}
+
 func TestGatewayV2StageConfigContainsOnlyBounded404Listeners(t *testing.T) {
 	_, state, _ := gatewayV2IdentityTestState(t)
 	challenge, err := gatewayV2HostChallenge(state)

@@ -477,7 +477,7 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 		return observation, inspectErr
 	}
 	observation.StageStable = stageConfigStable && observation.StageContainerFound == confirmedStageFound && (!confirmedStageFound ||
-		(reflect.DeepEqual(observation.StageContainer, confirmedStage) && reflect.DeepEqual(observation.StageRuntime, confirmedStageRuntime)))
+		stableGatewayV2StageContainer(observation.StageContainer, confirmedStage, observation.StageRuntime, confirmedStageRuntime, state.Identity))
 	finalConfigStable := true
 	if observation.FinalContainerFound {
 		var confirmedLive []byte
@@ -526,6 +526,21 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 		observation.FinalEndpointIdentityProven = finalEndpointIdentityBefore == finalEndpointIdentityAfter
 	}
 	return observation, nil
+}
+
+// Docker may return the same two volume mounts in either order across inspect
+// reads. Each read must still prove the exact journal-bound mounts; all other
+// container fields and the entire runtime snapshot must remain unchanged.
+func stableGatewayV2StageContainer(first, confirmed caddyInspection, firstRuntime, confirmedRuntime gatewayContainerRuntime,
+	identity gatewayV2Identity,
+) bool {
+	if !reflect.DeepEqual(firstRuntime, confirmedRuntime) ||
+		!validGatewayV2Mounts(first.Mounts, identity) || !validGatewayV2Mounts(confirmed.Mounts, identity) {
+		return false
+	}
+	first.Mounts = nil
+	confirmed.Mounts = nil
+	return reflect.DeepEqual(first, confirmed)
 }
 
 func classifyGatewayV2Topology(source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, observation gatewayV2DockerObservation) gatewayObservedTopology {
