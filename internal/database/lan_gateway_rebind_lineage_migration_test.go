@@ -72,7 +72,16 @@ func TestLANGatewayRebindLineageMigrationAddsDormantUnreleasableFence(t *testing
 			t.Fatalf("seed 032 statement %d: %v", index+1, err)
 		}
 	}
-	if err := Migrate(db); err != nil {
+	through033 := fstest.MapFS{}
+	for name, file := range through032 {
+		through033[name] = file
+	}
+	rebindMigration, err := migrations.ReadFile("migrations/033_lan_gateway_rebind_lineage.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	through033["migrations/033_lan_gateway_rebind_lineage.sql"] = &fstest.MapFile{Data: rebindMigration}
+	if err := migrateFS(db, through033); err != nil {
 		t.Fatalf("apply 033: %v", err)
 	}
 
