@@ -374,10 +374,10 @@ func liveGatewayRebindStoppedStageCleanupLineage(t *testing.T, fixture *liveGate
 ) (gatewayRebindStageIntent, bool) {
 	t.Helper()
 	history, err := fixture.ingress.scanGatewayRebindProtectedIntentHistoryLocked(nil)
-	if err != nil || len(history.Intents) != 1 || len(history.Progress) != 6 ||
+	if err != nil || len(history.Intents) != 1 || (len(history.Progress) != 6 && len(history.Progress) != 8) ||
 		!reflect.DeepEqual(history.Intents[0].Intent, intent) || !validContainerID(networkID) ||
 		config == nil || data == nil || container == nil {
-		t.Error("live stopped-container cleanup has no exact protected sequence-six lineage; retaining resources")
+		t.Error("live stopped-container cleanup has no exact protected sequence-six or sequence-eight lineage; retaining resources")
 		return gatewayRebindStageIntent{}, false
 	}
 	fifth := history.Progress[4].Record.Stage
@@ -395,6 +395,33 @@ func liveGatewayRebindStoppedStageCleanupLineage(t *testing.T, fixture *liveGate
 		t.Error("live stopped-container cleanup found a sequence-six stage that changed prior receipts; retaining resources")
 		return gatewayRebindStageIntent{}, false
 	}
+	if len(history.Progress) == 8 {
+		seventh := history.Progress[6].Record
+		eighth := history.Progress[7].Record
+		sixthRecord := history.Progress[5].Record
+		intentBinding, intentErr := gatewayRebindStageConfigIntentBindingFor(intent, sixthRecord)
+		copyBinding, copyErr := gatewayRebindStageConfigCopyBindingFor(intent, seventh)
+		if intentErr != nil || copyErr != nil || seventh.PreviousDigest != sixthRecord.Digest ||
+			seventh.Stage == nil || seventh.Stage.StageConfigIntent == nil ||
+			*seventh.Stage.StageConfigIntent != intentBinding ||
+			eighth.PreviousDigest != seventh.Digest || eighth.Stage == nil ||
+			eighth.Stage.StageConfigCopy == nil || *eighth.Stage.StageConfigCopy != copyBinding {
+			t.Error("live stopped-container cleanup has no exact protected sequence-seven and sequence-eight receipts; retaining resources")
+			return gatewayRebindStageIntent{}, false
+		}
+		withoutIntent := *seventh.Stage
+		withoutIntent.StageConfigIntent = nil
+		if !reflect.DeepEqual(withoutIntent, *sixth) {
+			t.Error("live stopped-container cleanup found a sequence-seven stage that changed prior receipts; retaining resources")
+			return gatewayRebindStageIntent{}, false
+		}
+		withoutCopy := *eighth.Stage
+		withoutCopy.StageConfigCopy = nil
+		if !reflect.DeepEqual(withoutCopy, *seventh.Stage) {
+			t.Error("live stopped-container cleanup found a sequence-eight stage that changed prior receipts; retaining resources")
+			return gatewayRebindStageIntent{}, false
+		}
+	}
 	return *sixth, true
 }
 
@@ -409,6 +436,27 @@ func cleanupLiveGatewayRebindStoppedStageContainer(t *testing.T, fixture *liveGa
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	history, err := fixture.ingress.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil {
+		t.Error("live stopped-container cleanup cannot reread protected lineage; retaining resources")
+		return false
+	}
+	if len(history.Progress) == 8 {
+		expected, expectedErr := gatewayRebindStageConfigBytes(intent)
+		if expectedErr != nil || history.Progress[7].Record.Stage == nil {
+			clear(expected)
+			t.Error("live stopped-container cleanup cannot regenerate exact protected stage config; retaining resources")
+			return false
+		}
+		defer clear(expected)
+		copyDriver := managerGatewayRebindStageConfigCopyDriver{manager: fixture.ingress}
+		inventory, inventoryErr := copyDriver.configVolumeInventory(ctx, intent,
+			*history.Progress[7].Record.Stage, expected)
+		if inventoryErr != nil || inventory != gatewayRebindStageConfigInventoryExact {
+			t.Error("live stopped-container cleanup cannot prove the exact sequence-eight config file; retaining resources")
+			return false
+		}
+	}
 	driver := managerGatewayRebindStageContainerDriver{manager: fixture.ingress}
 	observed, err := driver.inspect(ctx, intent)
 	if err != nil || !validGatewayRebindStageContainerObservation(intent, stage, observed, binding) ||
