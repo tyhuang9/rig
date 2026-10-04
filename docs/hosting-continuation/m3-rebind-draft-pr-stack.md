@@ -1,13 +1,13 @@
 # M3 rebind draft PR stack
 
-Status: local, unpublished plan as of 2026-10-03. The published base is draft
+Status: local, unpublished plan as of 2026-10-04. The published base is draft
 PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each row's
 branch descends from the preceding row's branch, with one review scope per
 draft. Each draft would target the preceding row's branch. Row 15 includes the
 initial version of this plan after its scope commit; rows 25, 27, 28, 29,
-30, and 31 update it.
+30, 31, and 34 update it.
 None of these rows authorizes publication, merge, or deployment. Publication
-approval for rows 1–25 is pending separately; rows 26–31 require their own
+approval for rows 1–25 is pending separately; rows 26–34 require their own
 approval after the prerequisite hosted network gate passes.
 
 | Order | Branch | Scope commit | Review scope |
@@ -43,6 +43,9 @@ approval after the prerequisite hosted network gate passes.
 | 29 | `feature/hosting-m3-rebind-data-volume-docker-gate` | `fcc7b72` | Required hosted Docker test of the exact data-volume effect and fresh-Manager replay |
 | 30 | `feature/hosting-m3-rebind-stopped-stage-container` | `1dd5112` | Private stopped successor stage-container create and protected sequence-six binding |
 | 31 | `feature/hosting-m3-rebind-stopped-stage-container-docker-gate` | `c156e66` | Required hosted Docker test of the exact stopped container and fresh-Manager replay |
+| 32 | `feature/hosting-m3-rebind-stage-config-intent` | `57a80f8` | Protected sequence-seven fixed config intent and strict empty config inventory |
+| 33 | `feature/hosting-m3-rebind-stage-config-copy` | `0143b51` | Guarded sequence-eight exact config copy and protected readback receipt |
+| 34 | `feature/hosting-m3-rebind-stage-config-docker-gate` | `1ba86c0` | Required hosted Docker direct-copy and lost-acknowledgment adoption gates |
 
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
@@ -59,8 +62,17 @@ Row 30 passed its final-source Go suite, vet, build, Docker-tagged compile,
 focused progress and stage-container tests, formatting, and diff checks. Row
 31 passed its final-source Go suite, vet, build, Docker-tagged compile,
 formatting, and diff checks; its live test only compiled and skipped locally.
-The Docker gates in rows 14, 16, 25, 27, 29, and 31 require publication and hosted
-execution before they can count as acceptance evidence.
+Row 32 passed its final-source Go suite, vet, build, Docker-tagged compile,
+focused intent tests, formatting, and diff checks. Row 33 passed its
+final-source Go suite, vet, build, Docker-tagged compile, focused copy tests,
+formatting, and diff checks. Row 34 passed the full Go suite with packages
+serialized, vet, build, Docker-tagged compile, focused copy tests, formatting,
+and diff checks; its two live tests only compiled and skipped locally. Two
+parallel full-suite runs of row 34 failed in an unchanged Windows relay TCP
+test, which passed in isolation and in the serialized full suite. Row 34's
+evidence file records the exact results.
+The Docker gates in rows 14, 16, 25, 27, 29, 31, and 34 require publication
+and hosted execution before they can count as acceptance evidence.
 
 These branches do not add a public rebind controller caller, terminal protected
 receipt, successor cutover, transfer-aware readers, recovery, or fence release.
@@ -68,4 +80,5 @@ Migrations 033 and 034 remain dormant and unreleasable. Publication, merging,
 deployment, Linux race, and physical second-device LAN acceptance are separate
 gates. The create-before-bind crash windows after the row-24 network,
 row-26 config-volume, row-28 data-volume, and row-30 stopped-container effects
-remain unresolved and fenced.
+remain unresolved and fenced. Rows 32–34 leave the successor stopped and the
+active route and SQLite claim unchanged.
