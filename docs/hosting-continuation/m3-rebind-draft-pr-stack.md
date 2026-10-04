@@ -5,9 +5,9 @@ PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each row's
 branch descends from the preceding row's branch, with one review scope per
 draft. Each draft would target the preceding row's branch. Row 15 includes the
 initial version of this plan after its scope commit; rows 25, 27, 28, 29,
-and 30 update it.
+30, and 31 update it.
 None of these rows authorizes publication, merge, or deployment. Publication
-approval for rows 1–25 is pending separately; rows 26–30 require their own
+approval for rows 1–25 is pending separately; rows 26–31 require their own
 approval after the prerequisite hosted network gate passes.
 
 | Order | Branch | Scope commit | Review scope |
@@ -42,6 +42,7 @@ approval after the prerequisite hosted network gate passes.
 | 28 | `feature/hosting-m3-rebind-data-volume-stage` | `9ccf6a9` | Private successor Caddy `/data` volume effect and protected sequence-five binding |
 | 29 | `feature/hosting-m3-rebind-data-volume-docker-gate` | `fcc7b72` | Required hosted Docker test of the exact data-volume effect and fresh-Manager replay |
 | 30 | `feature/hosting-m3-rebind-stopped-stage-container` | `1dd5112` | Private stopped successor stage-container create and protected sequence-six binding |
+| 31 | `feature/hosting-m3-rebind-stopped-stage-container-docker-gate` | `c156e66` | Required hosted Docker test of the exact stopped container and fresh-Manager replay |
 
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
@@ -55,9 +56,10 @@ Go suite, vet, build, and Docker-tagged compile. Row 29 passed its final-source
 Go suite, vet, build, and Docker-tagged compile; its live test only compiled
 and skipped locally. PR #97's hosted checks passed at its published head.
 Row 30 passed its final-source Go suite, vet, build, Docker-tagged compile,
-focused progress and stage-container tests, formatting, and diff checks. Its
-stopped-container Docker gate is planned as a separate follow-up. The
-Docker gates in rows 14, 16, 25, 27, and 29 require publication and hosted
+focused progress and stage-container tests, formatting, and diff checks. Row
+31 passed its final-source Go suite, vet, build, Docker-tagged compile,
+formatting, and diff checks; its live test only compiled and skipped locally.
+The Docker gates in rows 14, 16, 25, 27, 29, and 31 require publication and hosted
 execution before they can count as acceptance evidence.
 
 These branches do not add a public rebind controller caller, terminal protected
