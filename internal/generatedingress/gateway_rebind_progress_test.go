@@ -235,6 +235,147 @@ func gatewayRebindProgressThroughData(t *testing.T) (gatewayRebindPredecessorFix
 	return fixture, intent, append(records, fifth)
 }
 
+func gatewayRebindProgressThroughContainer(t *testing.T) (gatewayRebindPredecessorFixture,
+	gatewayRebindProtectedIntent, []gatewayRebindProgressRecord,
+) {
+	t.Helper()
+	fixture, intent, records := gatewayRebindProgressThroughData(t)
+	stage := *records[4].Stage
+	ownership, err := gatewayRebindStageContainerOwnershipDigest(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := gatewayRebindStageContainerConfigurationDigest(intent, stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sixth, err := newGatewayRebindStageContainerProgress(intent, records[4], gatewayRebindStageContainerBinding{
+		ID: strings.Repeat("c", 64), OwnershipDigest: ownership, ConfigurationDigest: configuration,
+	}, gatewayRebindProgressTimestamp(6))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fixture, intent, append(records, sixth)
+}
+
+func TestGatewayRebindProgressSequenceSevenBindsExactStageConfigIntent(t *testing.T) {
+	fixture, intent, records := gatewayRebindProgressThroughContainer(t)
+	binding, err := gatewayRebindStageConfigIntentBindingFor(intent, records[5])
+	if err != nil {
+		t.Fatal(err)
+	}
+	seventh, err := newGatewayRebindStageConfigIntentProgress(intent, records[5], binding,
+		gatewayRebindProgressTimestamp(7))
+	if err != nil || !validGatewayRebindProgressRecord(seventh) ||
+		seventh.Phase != gatewayRebindProgressStageConfigIntent || seventh.Stage == nil ||
+		seventh.Stage.StageConfigIntent == nil || *seventh.Stage.StageConfigIntent != binding {
+		t.Fatalf("sequence seven=%#v error=%v", seventh, err)
+	}
+	withoutConfigIntent := *seventh.Stage
+	withoutConfigIntent.StageConfigIntent = nil
+	if !reflect.DeepEqual(withoutConfigIntent, *records[5].Stage) {
+		t.Fatal("sequence seven changed a sequence-six stage field")
+	}
+	for _, record := range append(records, seventh) {
+		store, storeErr := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+			intent.Generation, intent.OperationID, record.Sequence)
+		if storeErr != nil || store.installExact(context.Background(), record) != nil {
+			t.Fatalf("install sequence %d: %v", record.Sequence, storeErr)
+		}
+	}
+	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.Progress) != 7 || !reflect.DeepEqual(history.Progress[6].Record, seventh) {
+		t.Fatalf("sequence-seven history=%#v error=%v", history.Progress, err)
+	}
+}
+
+func TestGatewayRebindProgressHistoryRejectsForgedSequenceSeven(t *testing.T) {
+	fixture, intent, records := gatewayRebindProgressThroughContainer(t)
+	for _, record := range records {
+		store, err := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+			intent.Generation, intent.OperationID, record.Sequence)
+		if err != nil || store.installExact(context.Background(), record) != nil {
+			t.Fatalf("install sequence %d: %v", record.Sequence, err)
+		}
+	}
+	binding, err := gatewayRebindStageConfigIntentBindingFor(intent, records[5])
+	if err != nil {
+		t.Fatal(err)
+	}
+	seventh, err := newGatewayRebindStageConfigIntentProgress(intent, records[5], binding,
+		gatewayRebindProgressTimestamp(7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgedStage := *seventh.Stage
+	forgedBinding := *forgedStage.StageConfigIntent
+	forgedBinding.ContentDigest = strings.Repeat("f", 64)
+	forgedStage.StageConfigIntent = &forgedBinding
+	seventh.Stage = &forgedStage
+	seventh.Digest, err = gatewayRebindProgressDigest(seventh)
+	if err != nil || !validGatewayRebindProgressRecord(seventh) {
+		t.Fatalf("forged sequence seven is not structurally valid: %v", err)
+	}
+	store, err := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+		intent.Generation, intent.OperationID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := gatewayUpgradeStateStore{directory: store.directory}
+	if err := state.writeExact(store.path, store.purpose, seventh, false, maxGatewayRebindProgressBytes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil); err == nil {
+		t.Fatal("scanner accepted forged sequence-seven progress")
+	}
+}
+
+func TestGatewayRebindProgressSequenceSevenRejectsInvalidOrStaleInputs(t *testing.T) {
+	_, intent, records := gatewayRebindProgressThroughContainer(t)
+	binding, err := gatewayRebindStageConfigIntentBindingFor(intent, records[5])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name     string
+		previous gatewayRebindProgressRecord
+		binding  gatewayRebindStageConfigIntentBinding
+		at       time.Time
+	}{
+		{name: "exact", previous: records[5], binding: binding, at: gatewayRebindProgressTimestamp(7)},
+		{name: "stale predecessor", previous: records[4], binding: binding, at: gatewayRebindProgressTimestamp(7)},
+		{name: "same time", previous: records[5], binding: binding, at: gatewayRebindProgressTimestamp(6)},
+		{name: "wrong destination", previous: records[5], binding: func() gatewayRebindStageConfigIntentBinding {
+			value := binding
+			value.Destination = "/config/active.json"
+			return value
+		}(), at: gatewayRebindProgressTimestamp(7)},
+		{name: "wrong prior progress digest", previous: records[5], binding: func() gatewayRebindStageConfigIntentBinding {
+			value := binding
+			value.PriorProgressDigest = strings.Repeat("f", 64)
+			return value
+		}(), at: gatewayRebindProgressTimestamp(7)},
+		{name: "wrong protected predecessor digest", previous: records[5], binding: func() gatewayRebindStageConfigIntentBinding {
+			value := binding
+			value.ProtectedPredecessorDigest = strings.Repeat("f", 64)
+			return value
+		}(), at: gatewayRebindProgressTimestamp(7)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value, err := newGatewayRebindStageConfigIntentProgress(intent, test.previous, test.binding, test.at)
+			if test.name == "exact" {
+				if err != nil || !validGatewayRebindProgressRecord(value) {
+					t.Fatalf("exact sequence seven rejected: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("invalid sequence seven accepted: %#v", value)
+			}
+		})
+	}
+}
+
 func TestGatewayRebindProgressSequenceSixBindsExactStoppedStageContainer(t *testing.T) {
 	fixture, intent, records := gatewayRebindProgressThroughData(t)
 	stage := *records[4].Stage
