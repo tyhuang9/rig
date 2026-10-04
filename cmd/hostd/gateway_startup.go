@@ -53,6 +53,18 @@ func inspectGatewayStartup(ctx context.Context, cfg config.Config, db *sql.DB,
 	if ctx == nil || db == nil {
 		return gatewayStartup{}, errors.New("gateway startup dependencies are required")
 	}
+	return inspectGatewayStartupWithFence(ctx, cfg, db, dockerExecutable, directories, rebindFenceCheck(db))
+}
+
+func inspectGatewayStartupWithFence(ctx context.Context, cfg config.Config, db *sql.DB,
+	dockerExecutable string, directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
+) (gatewayStartup, error) {
+	if fenceCheck == nil {
+		return gatewayStartup{}, errors.New("gateway rebind fence check is required")
+	}
+	if err := fenceCheck(ctx); err != nil {
+		return gatewayStartup{}, fmt.Errorf("inspect gateway rebind fence: %w", err)
+	}
 	repository := appaccess.New(db)
 	snapshot, err := repository.HostingGatewayStartupSnapshot(ctx)
 	if err != nil {
@@ -68,7 +80,7 @@ func inspectGatewayStartup(ctx context.Context, cfg config.Config, db *sql.DB,
 		}
 		return gatewayStartup{snapshot: snapshot}, nil
 	}
-	ingress, err := newGatewayStartupIngress(cfg, dockerExecutable, directories)
+	ingress, err := newGatewayStartupIngress(cfg, dockerExecutable, directories, fenceCheck)
 	if err != nil {
 		return gatewayStartup{}, err
 	}
@@ -124,12 +136,12 @@ func inspectGatewayStartup(ctx context.Context, cfg config.Config, db *sql.DB,
 }
 
 func newGatewayStartupIngress(cfg config.Config, dockerExecutable string,
-	directories docker.ControllerDirectories,
+	directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
 ) (*generatedingress.Manager, error) {
 	ingress, err := generatedingress.New(runtimeprocess.ExecRunner{}, generatedingress.Options{
 		DockerExecutable: dockerExecutable, DockerEndpoint: cfg.DockerEndpoint,
 		DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
-		DataRoot: cfg.DataRoot,
+		DataRoot: cfg.DataRoot, RebindFenceCheck: fenceCheck,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create gateway startup inspector: %w", err)
@@ -144,11 +156,11 @@ func newGatewayStartupIngress(cfg config.Config, dockerExecutable string,
 func stopOwnedGatewayOnStartupFailure(ctx context.Context, cfg config.Config, dockerExecutable string,
 	directories docker.ControllerDirectories,
 ) error {
-	ingress, err := newGatewayStartupIngress(cfg, dockerExecutable, directories)
-	if err != nil {
-		return err
-	}
-	return ingress.StopOwnedGatewayV2OnStartupFailure(ctx)
+	return generatedingress.StopOwnedGatewayV2OnStartupFailure(ctx, runtimeprocess.ExecRunner{}, generatedingress.Options{
+		DockerExecutable: dockerExecutable, DockerEndpoint: cfg.DockerEndpoint,
+		DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
+		DataRoot: cfg.DataRoot,
+	})
 }
 
 // quarantineLANRecoveryStartup withdraws any observed unfinished LAN grant or

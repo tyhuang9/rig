@@ -26,6 +26,13 @@ func (r routerDeployments) GetOrCreateByJob(context.Context, string, string, str
 	return r.deployment, false, nil
 }
 
+type countedRouterDeployments struct{ calls int }
+
+func (r *countedRouterDeployments) GetOrCreateByJob(context.Context, string, string, string) (deployments.Deployment, bool, error) {
+	r.calls++
+	return deployments.Deployment{}, false, nil
+}
+
 type routerPlans struct {
 	head     deploymentplans.DeploymentPlanRevision
 	revision deploymentplans.DeploymentPlanRevision
@@ -59,9 +66,85 @@ type noopReporter struct{}
 
 func (noopReporter) Report(jobs.ProgressUpdate) error { return nil }
 
+func clearRebindFence(context.Context) error { return nil }
+
+func newRouter(deployments deploymentReader, plans planReader, releases releaseReader, compose, generated jobs.Executor) (*Router, error) {
+	return New(deployments, plans, releases, compose, generated, clearRebindFence)
+}
+
+func TestRouterRequiresRebindFenceCheck(t *testing.T) {
+	router, err := New(routerDeployments{}, routerPlans{}, routerReleases{}, &recordingExecutor{}, nil, nil)
+	if err == nil || router != nil {
+		t.Fatalf("missing rebind fence router=%v error=%v", router, err)
+	}
+}
+
+func TestRouterRebindFenceBlocksBeforeDeploymentAndRuntimeEffects(t *testing.T) {
+	for _, strategy := range []string{"compose", "generated"} {
+		for _, failure := range []string{"prepared claim", "snapshot read failure"} {
+			t.Run(strategy+"/"+failure, func(t *testing.T) {
+				deployments := &countedRouterDeployments{}
+				compose, generated := &recordingExecutor{}, &recordingExecutor{}
+				checks := 0
+				fence := func(context.Context) error {
+					checks++
+					return errors.New(failure)
+				}
+				plans := routerPlans{head: deploymentplans.DeploymentPlanRevision{AppID: routerAppID}}
+				if strategy == "generated" {
+					plans.head = generatedPlan()
+				}
+				router, err := New(deployments, plans, routerReleases{}, compose, generated, fence)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = router.Execute(context.Background(), routerJob(""), noopReporter{})
+				var executionErr *jobs.ExecutionError
+				if !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" ||
+					checks != 1 || deployments.calls != 0 || compose.calls != 0 || generated.calls != 0 {
+					t.Fatalf("blocked result err=%v checks=%d deployments=%d compose=%d generated=%d",
+						err, checks, deployments.calls, compose.calls, generated.calls)
+				}
+			})
+		}
+	}
+}
+
+func TestRouterCancelledBeforeRebindFenceAndDeployment(t *testing.T) {
+	deployments := &countedRouterDeployments{}
+	checks := 0
+	router, err := New(deployments, routerPlans{}, routerReleases{}, &recordingExecutor{}, nil,
+		func(context.Context) error { checks++; return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := router.Execute(ctx, routerJob(""), noopReporter{}); !errors.Is(err, context.Canceled) ||
+		checks != 0 || deployments.calls != 0 {
+		t.Fatalf("canceled result err=%v checks=%d deployments=%d", err, checks, deployments.calls)
+	}
+}
+
+func TestRouterCancellationDuringRebindFencePreservesCancellation(t *testing.T) {
+	deployments := &countedRouterDeployments{}
+	ctx, cancel := context.WithCancel(context.Background())
+	router, err := New(deployments, routerPlans{}, routerReleases{}, &recordingExecutor{}, nil,
+		func(context.Context) error {
+			cancel()
+			return context.Canceled
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := router.Execute(ctx, routerJob(""), noopReporter{}); !errors.Is(err, context.Canceled) || deployments.calls != 0 {
+		t.Fatalf("canceled during fence err=%v deployments=%d", err, deployments.calls)
+	}
+}
+
 func TestRouterPreservesLegacyComposeAndUsesAcceptedGeneratedHead(t *testing.T) {
 	compose, generated := &recordingExecutor{}, &recordingExecutor{}
-	router, err := New(routerDeployments{}, routerPlans{head: generatedPlan()}, routerReleases{}, compose, generated)
+	router, err := newRouter(routerDeployments{}, routerPlans{head: generatedPlan()}, routerReleases{}, compose, generated)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +156,7 @@ func TestRouterPreservesLegacyComposeAndUsesAcceptedGeneratedHead(t *testing.T) 
 	}
 
 	compose, generated = &recordingExecutor{}, &recordingExecutor{}
-	router, _ = New(routerDeployments{}, routerPlans{head: deploymentplans.DeploymentPlanRevision{AppID: routerAppID}}, routerReleases{}, compose, generated)
+	router, _ = newRouter(routerDeployments{}, routerPlans{head: deploymentplans.DeploymentPlanRevision{AppID: routerAppID}}, routerReleases{}, compose, generated)
 	if _, err := router.Execute(context.Background(), routerJob(""), noopReporter{}); err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +168,7 @@ func TestRouterPreservesLegacyComposeAndUsesAcceptedGeneratedHead(t *testing.T) 
 func TestRouterNeverSendsReviewedGeneratedJobToComposeAfterHeadDrift(t *testing.T) {
 	compose, generated := &recordingExecutor{}, &recordingExecutor{}
 	composeHead := deploymentplans.DeploymentPlanRevision{ID: routerPlanID, AppID: routerAppID, RevisionNumber: 2, Plan: deploymentplans.Plan{Strategy: deploymentplans.StrategyCompose}}
-	router, err := New(routerDeployments{}, routerPlans{head: composeHead}, routerReleases{}, compose, generated)
+	router, err := newRouter(routerDeployments{}, routerPlans{head: composeHead}, routerReleases{}, compose, generated)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +182,7 @@ func TestRouterNeverSendsReviewedGeneratedJobToComposeAfterHeadDrift(t *testing.
 	}
 
 	compose, generated = &recordingExecutor{}, &recordingExecutor{}
-	router, _ = New(routerDeployments{deployment: deployments.Deployment{ProvenanceInitialized: true, RuntimeStrategy: deployments.RuntimeCompose}}, routerPlans{head: composeHead}, routerReleases{}, compose, generated)
+	router, _ = newRouter(routerDeployments{deployment: deployments.Deployment{ProvenanceInitialized: true, RuntimeStrategy: deployments.RuntimeCompose}}, routerPlans{head: composeHead}, routerReleases{}, compose, generated)
 	_, err = router.Execute(context.Background(), job, noopReporter{})
 	var executionErr *jobs.ExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "invalid_source" || compose.calls != 0 || generated.calls != 0 {
@@ -110,7 +193,7 @@ func TestRouterNeverSendsReviewedGeneratedJobToComposeAfterHeadDrift(t *testing.
 func TestRouterPinsPriorReleaseAndExistingDeploymentStrategy(t *testing.T) {
 	compose, generated := &recordingExecutor{}, &recordingExecutor{}
 	release := releasesnapshot.Release{ID: routerReleaseID, AppID: routerAppID, DeploymentPlanRevisionID: routerPlanID, DeploymentPlanRevisionNumber: 1}
-	router, _ := New(routerDeployments{}, routerPlans{revision: generatedPlan()}, routerReleases{release: release}, compose, generated)
+	router, _ := newRouter(routerDeployments{}, routerPlans{revision: generatedPlan()}, routerReleases{release: release}, compose, generated)
 	if _, err := router.Execute(context.Background(), routerJob(routerReleaseID), noopReporter{}); err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +203,7 @@ func TestRouterPinsPriorReleaseAndExistingDeploymentStrategy(t *testing.T) {
 
 	compose, generated = &recordingExecutor{}, &recordingExecutor{}
 	initialized := deployments.Deployment{RuntimeStrategy: deployments.RuntimeCompose, ProvenanceInitialized: true}
-	router, _ = New(routerDeployments{deployment: initialized}, routerPlans{err: errors.New("must not read current plan")}, routerReleases{err: errors.New("must not read release")}, compose, generated)
+	router, _ = newRouter(routerDeployments{deployment: initialized}, routerPlans{err: errors.New("must not read current plan")}, routerReleases{err: errors.New("must not read release")}, compose, generated)
 	if _, err := router.Execute(context.Background(), routerJob(""), noopReporter{}); err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +215,7 @@ func TestRouterPinsPriorReleaseAndExistingDeploymentStrategy(t *testing.T) {
 func TestRouterDoesNotFallBackWhenPinnedGeneratedRuntimeIsUnavailable(t *testing.T) {
 	compose := &recordingExecutor{}
 	release := releasesnapshot.Release{ID: routerReleaseID, AppID: routerAppID, DeploymentPlanRevisionID: routerPlanID, DeploymentPlanRevisionNumber: 1}
-	router, _ := New(routerDeployments{}, routerPlans{revision: generatedPlan()}, routerReleases{release: release}, compose, nil)
+	router, _ := newRouter(routerDeployments{}, routerPlans{revision: generatedPlan()}, routerReleases{release: release}, compose, nil)
 	_, err := router.Execute(context.Background(), routerJob(routerReleaseID), noopReporter{})
 	var executionErr *jobs.ExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" || compose.calls != 0 {
@@ -181,7 +264,7 @@ func TestRouterDistinguishesRepositoryAndStrategyValidationFailures(t *testing.T
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			compose, generated := &recordingExecutor{}, &recordingExecutor{}
-			router, err := New(routerDeployments{}, test.plans, test.releases, compose, generated)
+			router, err := newRouter(routerDeployments{}, test.plans, test.releases, compose, generated)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -318,6 +318,35 @@ func TestGeneratedCompositionRejectsInvalidDockerPathBeforeRecovery(t *testing.T
 	}
 }
 
+func TestRuntimeCompositionRebindFenceFailsBeforeRecovery(t *testing.T) {
+	for _, mode := range []string{"compose", "generated"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture := newRuntimeCompositionFixture(t)
+			fixture.configuration.ComposeRuntime = mode == "compose"
+			fixture.configuration.GeneratedRuntime = mode == "generated"
+			if _, err := fixture.db.Exec(`DROP TABLE lan_gateway_rebind_claims`); err != nil {
+				t.Fatal(err)
+			}
+			steps := 0
+			recovered := false
+			_, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+				dockerExecutable: fixture.dockerExecutable,
+				beforeStep: func(string) error {
+					steps++
+					return nil
+				},
+				recoverIngress: func(context.Context, *generatedingress.Manager) error {
+					recovered = true
+					return nil
+				},
+			})
+			if err == nil || steps != 0 || recovered {
+				t.Fatalf("composition error=%v steps=%d recovered=%t", err, steps, recovered)
+			}
+		})
+	}
+}
+
 func TestGeneratedCompositionFailureStopsAtExactStep(t *testing.T) {
 	for _, failAt := range []string{
 		"compose_temp_create", "compose_temp_recover", "generated_build_temp_create", "generated_build_temp_recover",

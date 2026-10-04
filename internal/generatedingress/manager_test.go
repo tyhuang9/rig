@@ -295,6 +295,7 @@ func TestNewRejectsPermissiveWorkingDirectoryBeforeStateWrites(t *testing.T) {
 		DockerConfigDirectory: directories.DockerConfigDirectory,
 		WorkingDirectory:      directories.WorkingDirectory,
 		DataRoot:              stateRoot,
+		RebindFenceCheck:      func(context.Context) error { return nil },
 	})
 	if err == nil {
 		t.Fatal("permissive working directory was accepted")
@@ -1652,6 +1653,7 @@ func newManagerFixture(t *testing.T, failReload bool) (*Manager, *ingressRunner)
 	manager, err := New(runner, Options{
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
 		WorkingDirectory: directories.WorkingDirectory, DataRoot: root,
+		RebindFenceCheck: func(context.Context) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)

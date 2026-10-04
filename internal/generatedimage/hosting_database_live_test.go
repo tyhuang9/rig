@@ -247,6 +247,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 		DockerExecutable: docker, DockerConfigDirectory: runtimeDockerConfig,
 		WorkingDirectory: filepath.Join(root, "working"), DataRoot: filepath.Join(root, "ingress-state"),
 		HostPort: port, CommandTimeout: 45 * time.Second, PullTimeout: 5 * time.Minute,
+		RebindFenceCheck: func(context.Context) error { return nil },
 	})
 	if err != nil {
 		t.Fatal("prepare generated ingress")

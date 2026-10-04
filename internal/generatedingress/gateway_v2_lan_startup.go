@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/hostd/hostd/internal/appaccess"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
 // GatewayV2LANStartupDisposition controls whether normal controller workers
@@ -273,13 +274,25 @@ func (m *Manager) QuarantineGatewayV2LANStartup(ctx context.Context, claims []Ga
 // container whose ID and complete ownership-label set match that journal.
 // Stopping the gateway also interrupts local routes; callers must refuse
 // normal startup and require explicit recovery.
-func (m *Manager) StopOwnedGatewayV2OnStartupFailure(ctx context.Context) (resultErr error) {
+// It intentionally constructs no generally usable Manager: the only operation
+// available through this entry point is the journal-bound exact-owned stop.
+func StopOwnedGatewayV2OnStartupFailure(ctx context.Context, runner runtimeprocess.CommandRunner,
+	options Options,
+) error {
+	manager, err := newManager(runner, options)
+	if err != nil {
+		return err
+	}
+	return manager.stopOwnedGatewayV2OnStartupFailure(ctx)
+}
+
+func (m *Manager) stopOwnedGatewayV2OnStartupFailure(ctx context.Context) (resultErr error) {
 	if m == nil || ctx == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
-	release, err := m.lockGateway(lockCtx)
+	release, err := m.lockGatewayRaw(lockCtx)
 	if err != nil {
 		return err
 	}

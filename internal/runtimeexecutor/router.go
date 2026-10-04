@@ -33,20 +33,36 @@ type Router struct {
 	releases    releaseReader
 	compose     jobs.Executor
 	generated   jobs.Executor
+	rebindFence func(context.Context) error
 }
 
 var errInvalidSource = errors.New("runtime strategy provenance is invalid")
 
-func New(deploymentRepository deploymentReader, plans planReader, releases releaseReader, compose, generated jobs.Executor) (*Router, error) {
-	if deploymentRepository == nil || plans == nil || releases == nil || (compose == nil && generated == nil) {
+func New(deploymentRepository deploymentReader, plans planReader, releases releaseReader, compose, generated jobs.Executor,
+	rebindFence func(context.Context) error,
+) (*Router, error) {
+	if deploymentRepository == nil || plans == nil || releases == nil || (compose == nil && generated == nil) || rebindFence == nil {
 		return nil, errors.New("runtime strategy router dependencies are required")
 	}
-	return &Router{deployments: deploymentRepository, plans: plans, releases: releases, compose: compose, generated: generated}, nil
+	return &Router{deployments: deploymentRepository, plans: plans, releases: releases, compose: compose, generated: generated, rebindFence: rebindFence}, nil
 }
 
 func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
-	if r == nil || ctx == nil || reporter == nil || job.Type != "deploy" || job.ResourceType != "application" || uuid.Validate(job.ResourceID) != nil || uuid.Validate(job.ID) != nil {
+	if r == nil || r.rebindFence == nil || ctx == nil || reporter == nil || job.Type != "deploy" || job.ResourceType != "application" || uuid.Validate(job.ResourceID) != nil || uuid.Validate(job.ID) != nil {
 		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "validation_failed"}
+	}
+	if err := ctx.Err(); err != nil {
+		return jobs.ExecutionResult{}, err
+	}
+	// The deployment executor can create networks, containers, and migrations
+	// before ingress Switch. Check the durable rebind fence before any job state
+	// or workspace operation; a future claim writer must also drain in-flight
+	// executors before it can activate a claim.
+	if err := r.rebindFence(ctx); err != nil {
+		if canceled := ctx.Err(); canceled != nil {
+			return jobs.ExecutionResult{}, canceled
+		}
+		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "runtime_unavailable"}
 	}
 	input, err := jobs.DeploymentInputFor(job)
 	if err != nil {

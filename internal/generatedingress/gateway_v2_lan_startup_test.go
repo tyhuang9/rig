@@ -320,10 +320,13 @@ func TestGatewayV2LANStartupQuarantineRejectsMultipleUnresolvedExposuresBeforeMu
 
 func TestGatewayV2LANStartupFailureStopsOnlyJournalBoundGatewayWithoutReadingRouteState(t *testing.T) {
 	manager, store, _, _, _, driver := gatewayV2LANGrantFixture(t)
+	manager.options.RebindFenceCheck = func(context.Context) error {
+		return errors.New("database unavailable during emergency stop")
+	}
 	if err := upgradeProtectedWrite(store.v2Path, store.v2Purpose, []byte("{")); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.StopOwnedGatewayV2OnStartupFailure(context.Background()); err != nil ||
+	if err := manager.stopOwnedGatewayV2OnStartupFailure(context.Background()); err != nil ||
 		!driver.gatewayStopped || !reflect.DeepEqual(driver.events, []string{"stop_owned_gateway"}) {
 		t.Fatalf("err=%v stopped=%t events=%v", err, driver.gatewayStopped, driver.events)
 	}
@@ -331,7 +334,7 @@ func TestGatewayV2LANStartupFailureStopsOnlyJournalBoundGatewayWithoutReadingRou
 	driver.events = nil
 	driver.gatewayStopped = false
 	driver.stopOwnedGatewayErr = errors.New("injected Docker stop failure")
-	if err := manager.StopOwnedGatewayV2OnStartupFailure(context.Background()); !IsCode(err, DiagnosticRouteUnresolved) || driver.gatewayStopped {
+	if err := manager.stopOwnedGatewayV2OnStartupFailure(context.Background()); !IsCode(err, DiagnosticRouteUnresolved) || driver.gatewayStopped {
 		t.Fatalf("err=%v stopped=%t events=%v", err, driver.gatewayStopped, driver.events)
 	}
 }

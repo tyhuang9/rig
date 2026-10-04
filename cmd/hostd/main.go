@@ -93,6 +93,7 @@ func runServer(args []string) int {
 		return 1
 	}
 	defer db.Close()
+	rebindCheck := rebindFenceCheck(db)
 	gate, err := inspectGatewayStartup(context.Background(), cfg, db, dockerExecutable, ownerDirectories)
 	if err != nil {
 		logger.Error("gateway startup inspection failed", "error", err)
@@ -135,6 +136,11 @@ func runServer(args []string) int {
 		}
 	}
 	defer bootstrapCompleted()
+	if err := rebindCheck(context.Background()); err != nil {
+		logger.Error("LAN gateway rebind fence changed before controller startup", "error", err)
+		emergencyStop()
+		return 1
+	}
 	if gate.recoveryKind != "" {
 		logger.Warn("controller entering gateway recovery mode", "kind", gate.recoveryKind, "operation_id", gate.recoveryID)
 		return runRecoveryOnlyController(cfg, logger, listener, a, appaccess.New(db), gate, bootstrapCompleted)
@@ -224,6 +230,11 @@ func runServer(args []string) int {
 				return 1
 			}
 		}
+	}
+	if err := rebindCheck(context.Background()); err != nil {
+		logger.Error("LAN gateway rebind fence changed before worker start", "error", err)
+		emergencyStop()
+		return 1
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

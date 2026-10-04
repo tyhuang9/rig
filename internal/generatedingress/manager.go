@@ -62,6 +62,10 @@ type Options struct {
 	CommandTimeout        time.Duration
 	PullTimeout           time.Duration
 	OutputLimit           int
+	// RebindFenceCheck is evaluated while the process-local and cross-process
+	// gateway locks are both held, before any protected gateway observation or
+	// mutation. Production callers must provide a fresh database-backed check.
+	RebindFenceCheck func(context.Context) error
 }
 
 type Manager struct {
@@ -131,6 +135,13 @@ func (m *contextMutex) LockContext(ctx context.Context) error {
 }
 
 func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error) {
+	if options.RebindFenceCheck == nil {
+		return nil, errors.New("generated ingress rebind fence check is required")
+	}
+	return newManager(runner, options)
+}
+
+func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager, error) {
 	if runner == nil {
 		return nil, errors.New("generated ingress runner is required")
 	}

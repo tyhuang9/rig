@@ -1158,6 +1158,25 @@ func TestGatewayV2ProductionEmergencyStopUsesBoundIdentityWithForeignImageLabels
 	}
 }
 
+func TestGatewayV2EmergencyStopConstructionBypassesUnavailableDatabaseFenceOnlyForExactOwnedStop(t *testing.T) {
+	manager, _, state, journal, _, _ := gatewayV2LANGrantFixture(t)
+	labels := gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, gatewayV2FinalContainerRole, true)
+	runner := &gatewayV2EmergencyStopRunner{inspection: gatewayContainerInspection{
+		caddyInspection: caddyInspection{
+			ID: "sha256:" + journal.Resources.FinalContainerID, Name: "/" + gatewayV2ContainerName,
+			Labels: labels, Running: true,
+		},
+		gatewayContainerRuntime: gatewayContainerRuntime{},
+	}}
+	manager.options.RebindFenceCheck = func(context.Context) error {
+		return errors.New("database unavailable during emergency stop")
+	}
+	if err := StopOwnedGatewayV2OnStartupFailure(context.Background(), runner, manager.options); err != nil ||
+		normalizeID(runner.stopTarget) != journal.Resources.FinalContainerID || runner.inspection.Running {
+		t.Fatalf("err=%v target=%q running=%t", err, runner.stopTarget, runner.inspection.Running)
+	}
+}
+
 type fakeGatewayV2LANGrantDriver struct {
 	t                       *testing.T
 	manager                 *Manager
