@@ -23,6 +23,7 @@ type Repository struct {
 	afterCurrentClaimLookup       func()
 	afterUpgradeAuthClaimRead     func()
 	afterUpgradeStartupClaimsRead func()
+	afterRebindStartupClaimsRead  func()
 	afterReservationLock          func()
 	afterApprovalLock             func()
 	afterDisableIntentLock        func()
