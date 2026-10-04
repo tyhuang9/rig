@@ -330,6 +330,167 @@ func TestGatewayRebindProgressHistoryRejectsForgedSequenceSeven(t *testing.T) {
 	}
 }
 
+func TestGatewayRebindProgressSequenceEightBindsExactStageConfigCopy(t *testing.T) {
+	fixture, intent, records := gatewayRebindProgressThroughContainer(t)
+	intentBinding, err := gatewayRebindStageConfigIntentBindingFor(intent, records[5])
+	if err != nil {
+		t.Fatal(err)
+	}
+	seventh, err := newGatewayRebindStageConfigIntentProgress(intent, records[5], intentBinding,
+		gatewayRebindProgressTimestamp(7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyBinding, err := gatewayRebindStageConfigCopyBindingFor(intent, seventh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eighth, err := newGatewayRebindStageConfigCopyProgress(intent, seventh, copyBinding,
+		gatewayRebindProgressTimestamp(8))
+	if err != nil || !validGatewayRebindProgressRecord(eighth) ||
+		eighth.Phase != gatewayRebindProgressStageConfigCopied || eighth.Stage == nil ||
+		eighth.Stage.StageConfigCopy == nil || *eighth.Stage.StageConfigCopy != copyBinding {
+		t.Fatalf("sequence eight=%#v error=%v", eighth, err)
+	}
+	withoutCopy := *eighth.Stage
+	withoutCopy.StageConfigCopy = nil
+	if !reflect.DeepEqual(withoutCopy, *seventh.Stage) {
+		t.Fatal("sequence eight changed a sequence-seven stage field")
+	}
+	all := append(append(records, seventh), eighth)
+	for _, record := range all {
+		store, storeErr := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+			intent.Generation, intent.OperationID, record.Sequence)
+		if storeErr != nil || store.installExact(context.Background(), record) != nil {
+			t.Fatalf("install sequence %d: %v", record.Sequence, storeErr)
+		}
+	}
+	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.Progress) != 8 || !reflect.DeepEqual(history.Progress[7].Record, eighth) {
+		t.Fatalf("sequence-eight history=%#v error=%v", history.Progress, err)
+	}
+}
+
+func TestGatewayRebindProgressSequenceEightRejectsInvalidStaleAndWrongIntentInputs(t *testing.T) {
+	_, intent, records := gatewayRebindProgressThroughContainer(t)
+	intentBinding, err := gatewayRebindStageConfigIntentBindingFor(intent, records[5])
+	if err != nil {
+		t.Fatal(err)
+	}
+	seventh, err := newGatewayRebindStageConfigIntentProgress(intent, records[5], intentBinding,
+		gatewayRebindProgressTimestamp(7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyBinding, err := gatewayRebindStageConfigCopyBindingFor(intent, seventh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidBinding := copyBinding
+	invalidBinding.PriorProgressDigest = strings.Repeat("f", 64)
+	_, wrongIntent, _ := gatewayRebindProgressThroughContainer(t)
+	for _, test := range []struct {
+		name    string
+		intent  gatewayRebindProtectedIntent
+		binding gatewayRebindStageConfigCopyBinding
+		at      time.Time
+		valid   bool
+	}{
+		{name: "exact", intent: intent, binding: copyBinding, at: gatewayRebindProgressTimestamp(8), valid: true},
+		{name: "invalid receipt", intent: intent, binding: invalidBinding, at: gatewayRebindProgressTimestamp(8)},
+		{name: "equal time", intent: intent, binding: copyBinding, at: gatewayRebindProgressTimestamp(7)},
+		{name: "earlier time", intent: intent, binding: copyBinding, at: gatewayRebindProgressTimestamp(6)},
+		{name: "wrong intent", intent: wrongIntent, binding: copyBinding, at: gatewayRebindProgressTimestamp(8)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value, err := newGatewayRebindStageConfigCopyProgress(test.intent, seventh, test.binding, test.at)
+			if test.valid {
+				if err != nil || !validGatewayRebindProgressRecord(value) {
+					t.Fatalf("exact sequence eight rejected: %#v error=%v", value, err)
+				}
+				return
+			}
+			if err == nil || !reflect.DeepEqual(value, gatewayRebindProgressRecord{}) {
+				t.Fatalf("invalid sequence eight accepted: %#v", value)
+			}
+		})
+	}
+}
+
+func TestGatewayRebindProgressHistoryRejectsForgedSequenceEight(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*gatewayRebindProgressRecord)
+	}{
+		{name: "copy receipt", mutate: func(value *gatewayRebindProgressRecord) {
+			stage := *value.Stage
+			binding := *stage.StageConfigCopy
+			binding.PriorProgressDigest = strings.Repeat("f", 64)
+			stage.StageConfigCopy = &binding
+			value.Stage = &stage
+		}},
+		{name: "phase", mutate: func(value *gatewayRebindProgressRecord) {
+			value.Phase = gatewayRebindProgressStageConfigIntent
+		}},
+		{name: "previous digest", mutate: func(value *gatewayRebindProgressRecord) {
+			value.PreviousDigest = strings.Repeat("f", 64)
+		}},
+		{name: "preserved stage", mutate: func(value *gatewayRebindProgressRecord) {
+			stage := *value.Stage
+			volume := *stage.ConfigVolume
+			volume.Mountpoint += "-replacement"
+			stage.ConfigVolume = &volume
+			value.Stage = &stage
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, intent, records := gatewayRebindProgressThroughContainer(t)
+			intentBinding, err := gatewayRebindStageConfigIntentBindingFor(intent, records[5])
+			if err != nil {
+				t.Fatal(err)
+			}
+			seventh, err := newGatewayRebindStageConfigIntentProgress(intent, records[5], intentBinding,
+				gatewayRebindProgressTimestamp(7))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, record := range append(records, seventh) {
+				store, storeErr := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+					intent.Generation, intent.OperationID, record.Sequence)
+				if storeErr != nil || store.installExact(context.Background(), record) != nil {
+					t.Fatalf("install sequence %d: %v", record.Sequence, storeErr)
+				}
+			}
+			copyBinding, err := gatewayRebindStageConfigCopyBindingFor(intent, seventh)
+			if err != nil {
+				t.Fatal(err)
+			}
+			eighth, err := newGatewayRebindStageConfigCopyProgress(intent, seventh, copyBinding,
+				gatewayRebindProgressTimestamp(8))
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(&eighth)
+			eighth.Digest, err = gatewayRebindProgressDigest(eighth)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err := newGatewayRebindProgressStore(fixture.manager.options.DataRoot,
+				intent.Generation, intent.OperationID, 8)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state := gatewayUpgradeStateStore{directory: store.directory}
+			if err := state.writeExact(store.path, store.purpose, eighth, false, maxGatewayRebindProgressBytes); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil); err == nil {
+				t.Fatal("scanner accepted forged sequence-eight progress")
+			}
+		})
+	}
+}
+
 func TestGatewayRebindProgressSequenceSevenRejectsInvalidOrStaleInputs(t *testing.T) {
 	_, intent, records := gatewayRebindProgressThroughContainer(t)
 	binding, err := gatewayRebindStageConfigIntentBindingFor(intent, records[5])

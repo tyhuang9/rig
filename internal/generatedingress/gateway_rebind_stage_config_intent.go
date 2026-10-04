@@ -1,13 +1,10 @@
 package generatedingress
 
 import (
-	"archive/tar"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"io"
 	"net"
 	"reflect"
 	"strconv"
@@ -64,27 +61,9 @@ func (d managerGatewayRebindStageConfigIntentDriver) configVolumeEmpty(ctx conte
 // metadata entries, malformed archives, and truncated command output all fail
 // closed before sequence seven can authorize a later copy.
 func gatewayRebindExactEmptyConfigVolumeArchive(value []byte) error {
-	const tarBlockSize = 512
-	// An empty archive must contain the root directory header followed by the
-	// two complete zero blocks required by the TAR end marker. More zero record
-	// padding is permitted, but every byte after the root header must be zero.
-	if len(value) < 3*tarBlockSize || len(value) > defaultOutputLimit || len(value)%tarBlockSize != 0 {
-		return errors.New("generated ingress rebind config volume archive is invalid")
-	}
-	source := bytes.NewReader(value)
-	reader := tar.NewReader(source)
-	header, err := reader.Next()
-	if err != nil || header == nil || header.Typeflag != tar.TypeDir || header.Size != 0 || header.Linkname != "" ||
-		(header.Name != "." && header.Name != "./") {
+	inventory, err := gatewayRebindExactStageConfigVolumeArchive(value, nil)
+	if err != nil || inventory != gatewayRebindStageConfigInventoryEmpty {
 		return errors.New("generated ingress rebind config volume archive is not empty")
-	}
-	if _, err := reader.Next(); err != io.EOF {
-		return errors.New("generated ingress rebind config volume archive has unexpected entries")
-	}
-	for _, value := range value[tarBlockSize:] {
-		if value != 0 {
-			return errors.New("generated ingress rebind config volume archive has trailing data")
-		}
 	}
 	return nil
 }

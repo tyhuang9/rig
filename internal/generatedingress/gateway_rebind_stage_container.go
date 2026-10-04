@@ -163,6 +163,7 @@ func gatewayRebindStageContainerConfigurationDigest(intent gatewayRebindProtecte
 ) (string, error) {
 	stage.StageContainer = nil
 	stage.StageConfigIntent = nil
+	stage.StageConfigCopy = nil
 	args, err := gatewayRebindStageContainerCreateArgs(intent, stage)
 	if err != nil {
 		return "", errors.New("invalid generated ingress rebind stage container configuration input")

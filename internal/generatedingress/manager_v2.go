@@ -403,7 +403,8 @@ func validGatewayV2ConfigFilename(filename string) bool {
 		return true
 	}
 	switch filename {
-	case "lan-grant.json", "lan-grant-rollback.json", "lan-grant-recovery.json",
+	case gatewayV2StageConfigFilename,
+		"lan-grant.json", "lan-grant-rollback.json", "lan-grant-recovery.json",
 		"lan-grant-commit-recovery.json", "lan-grant-quarantine.json",
 		"lan-disable.json", "lan-disable-recovery.json", "lan-disable-startup.json",
 		"lan-recovery-batch.json":
