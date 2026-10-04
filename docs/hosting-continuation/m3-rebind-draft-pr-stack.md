@@ -4,9 +4,10 @@ Status: local, unpublished plan as of 2026-10-03. The published base is draft
 PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each row's
 branch descends from the preceding row's branch, with one review scope per
 draft. Each draft would target the preceding row's branch. Row 15 includes the
-initial version of this plan after its scope commit; rows 25, 27, 28, and 29 update it.
+initial version of this plan after its scope commit; rows 25, 27, 28, 29,
+and 30 update it.
 None of these rows authorizes publication, merge, or deployment. Publication
-approval for rows 1–25 is pending separately; rows 26–29 require their own
+approval for rows 1–25 is pending separately; rows 26–30 require their own
 approval after the prerequisite hosted network gate passes.
 
 | Order | Branch | Scope commit | Review scope |
@@ -40,6 +41,7 @@ approval after the prerequisite hosted network gate passes.
 | 27 | `feature/hosting-m3-rebind-config-volume-docker-gate` | `742124d` | Required hosted Docker test of the exact config-volume effect and replay |
 | 28 | `feature/hosting-m3-rebind-data-volume-stage` | `9ccf6a9` | Private successor Caddy `/data` volume effect and protected sequence-five binding |
 | 29 | `feature/hosting-m3-rebind-data-volume-docker-gate` | `fcc7b72` | Required hosted Docker test of the exact data-volume effect and fresh-Manager replay |
+| 30 | `feature/hosting-m3-rebind-stopped-stage-container` | `1dd5112` | Private stopped successor stage-container create and protected sequence-six binding |
 
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
@@ -51,7 +53,10 @@ their final-source Go suites, vet, builds, and relevant focused checks; row 27's
 live test also only compiled and skipped locally. Row 28 passed its final-source
 Go suite, vet, build, and Docker-tagged compile. Row 29 passed its final-source
 Go suite, vet, build, and Docker-tagged compile; its live test only compiled
-and skipped locally. PR #97's hosted checks passed at its published head. The
+and skipped locally. PR #97's hosted checks passed at its published head.
+Row 30 passed its final-source Go suite, vet, build, Docker-tagged compile,
+focused progress and stage-container tests, formatting, and diff checks. Its
+stopped-container Docker gate is planned as a separate follow-up. The
 Docker gates in rows 14, 16, 25, 27, and 29 require publication and hosted
 execution before they can count as acceptance evidence.
 
@@ -60,5 +65,5 @@ receipt, successor cutover, transfer-aware readers, recovery, or fence release.
 Migrations 033 and 034 remain dormant and unreleasable. Publication, merging,
 deployment, Linux race, and physical second-device LAN acceptance are separate
 gates. The create-before-bind crash windows after the row-24 network,
-row-26 config-volume, and row-28 data-volume effects remain unresolved and
-fenced.
+row-26 config-volume, row-28 data-volume, and row-30 stopped-container effects
+remain unresolved and fenced.
