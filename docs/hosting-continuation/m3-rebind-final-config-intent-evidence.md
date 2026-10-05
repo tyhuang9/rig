@@ -171,3 +171,30 @@ Actual Docker TAR headers and corrected hosted acceptance remain pending.
 The local Docker engine is unavailable. No full-suite, Linux race or physical
 Docker pass is claimed for this correction. Updating these authorized drafts
 does not authorize merging or deployment.
+
+## Started-stage autosave integration (2026-10-05)
+
+The existing PR #132 correction `8801a091a0a5b7d9f23b7c72bf5731efb8bc9226`
+is integrated additively through PRs #133–135. This branch's tested source is
+`f2566479743cf9026d61b0d8cbeea2fee53e287a`. The
+[stage-start evidence](./m3-rebind-stage-start-intent-evidence.md#pinned-caddy-autosave-compatibility-correction-2026-10-05)
+records the pinned Caddy source, strict archive policy, durable sequence-nine
+admission, red/green regression and independent review.
+
+On this downstream source, all 41 explicitly discovered top-level tests passed
+in 307.338s, with zero failures or skips:
+
+```text
+go test -mod=readonly -p=1 -json -count=1 -timeout=15m -run '^TestGatewayRebind(StageAutosave|StartedStageArchive|StageStart|FinalConfig|Exact(Empty|Stage)ConfigVolumeArchive)' ./internal/generatedingress
+```
+
+This verifies the existing stage-start and final-intent paths with the new
+post-intent reader. It does not change generated config, protected bytes,
+prior digests, SQLite state or generic Docker command output limits. The
+separate, unpublished sequence-twelve and handover changes require their own
+phase-aware inventory policy and acceptance evidence.
+
+Hosted stage-copy and stage-start jobs at the previously published `bd347cab`
+head were still queued when this evidence was recorded. Physical Docker,
+Linux race and second-device acceptance remain unverified for this correction.
+No full-suite result is claimed for these edits.
