@@ -173,6 +173,31 @@ passed both required named tests; the live migration journey took 144.11s
 and its owned-resource cleanup passed. Rebind gates remain separate and
 pending at this checkpoint.
 
+## Additive archive/autosave correction receipt (2026-10-05)
+
+Existing authorized drafts #129–135 received the reviewed pinned-image
+directory correction. Drafts #132–135 then received the strict post-start
+Caddy autosave correction. Each remote head, original base and open draft
+status was verified after publication; no source history was rewritten.
+
+| Draft | Verified published head |
+| --- | --- |
+| #129 | `f2614d73e8a6592f0c5196c2daab3e8591a6ad5f` |
+| #130 | `496e3d64977a8decac949fc1ba00f5286751c941` |
+| #131 | `b8b50eee2b72b4fda5fe966ef45a80e8de895a46` |
+| #132 | `8801a091a0a5b7d9f23b7c72bf5731efb8bc9226` |
+| #133 | `b236cda27c78e5fcf5dca3cba3bd3f99f0bff272` |
+| #134 | `5d497101cfb1206ea603a8100b73ed7a5e4f21d6` |
+| #135 | `e46185ff61b3fa519304e5fa0ce8ab9c1a788acb` |
+
+The [final-intent evidence](./m3-rebind-final-config-intent-evidence.md)
+records 41 downstream tests passing in 307.338s with zero failures/skips and
+the still-pending hosted gates. The separate, unpublished final-config-copy
+candidate now has [76 passing regressions](./m3-rebind-final-config-copy-evidence.md#pinned-image-and-autosave-correction-2026-10-05)
+at corrected source `60fa60d`. Its older `39b217f` publication request was put
+on hold; publication of the corrected candidate needs a replacement request.
+The private handover is also unpublished. No merge or deployment occurred.
+
 ## Acceptance and remaining work
 
 Each branch has a scoped evidence file in this directory. Local verification
