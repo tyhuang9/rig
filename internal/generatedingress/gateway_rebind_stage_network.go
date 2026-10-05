@@ -3,6 +3,7 @@ package generatedingress
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"reflect"
 	"sort"
 	"strconv"
@@ -538,8 +539,8 @@ func validGatewayRebindStageNetworkHostDelta(intent gatewayRebindProtectedIntent
 	candidates []gatewayRebindSuccessorNetworkCandidate, routes, interfaces []string,
 ) bool {
 	if !validGatewayRebindProtectedIntent(intent) ||
-		!gatewayRebindPrefixesMatchBaselineOrPlan(routes, intent.NetworkObservation.HostRoutes,
-			intent.Intent.Network.Subnet) ||
+		!gatewayRebindStageNetworkRoutesMatch(routes, intent.NetworkObservation.HostRoutes,
+			intent.Intent.Network.Subnet, intent.Intent.Network.GatewayIPv4) ||
 		!gatewayRebindPrefixesMatchBaselineOrPlan(interfaces, intent.NetworkObservation.HostInterfaces,
 			intent.Intent.Network.Subnet) {
 		return false
@@ -580,6 +581,33 @@ func gatewayRebindPrefixesMatchBaselineOrPlan(values, baseline []string, plan st
 	}
 	expected := append([]string{}, baseline...)
 	expected = append(expected, plan)
+	sort.Strings(expected)
+	return equalStrings(values, expected)
+}
+
+// Docker's Linux bridge adds a connected subnet route and exact local gateway
+// and broadcast routes. The route snapshot includes all route tables, so
+// accept that complete three-prefix delta in addition to the existing exact
+// baseline and connected-subnet shapes. Unrelated, missing, or duplicate
+// routes remain drift.
+func gatewayRebindStageNetworkRoutesMatch(values, baseline []string, plan, gateway string) bool {
+	if gatewayRebindPrefixesMatchBaselineOrPlan(values, baseline, plan) {
+		return true
+	}
+	prefix, prefixErr := netip.ParsePrefix(plan)
+	gatewayAddress, gatewayErr := netip.ParseAddr(gateway)
+	if prefixErr != nil || gatewayErr != nil || !prefix.Addr().Is4() || !gatewayAddress.Is4() ||
+		prefix != prefix.Masked() || prefix.String() != plan || !prefix.Contains(gatewayAddress) {
+		return false
+	}
+	broadcast := lastIPv4Address(prefix)
+	if gatewayAddress == prefix.Addr() || gatewayAddress == broadcast {
+		return false
+	}
+	expected := append([]string{}, baseline...)
+	expected = append(expected, plan,
+		netip.PrefixFrom(gatewayAddress, 32).String(),
+		netip.PrefixFrom(broadcast, 32).String())
 	sort.Strings(expected)
 	return equalStrings(values, expected)
 }
