@@ -486,6 +486,9 @@ func (m *Manager) readGatewayRebindStageServingAttestation(ctx context.Context,
 	intent gatewayRebindProtectedIntent, stage gatewayRebindStageIntent,
 	expected *gatewayRebindStageServingBinding, progressCount uint64,
 ) (gatewayRebindStageServingAttestation, error) {
+	if progressCount != 9 && progressCount != 10 && progressCount != 11 {
+		return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
+	}
 	return m.readGatewayRebindStageServingAttestationWithConfigProof(ctx, repository, reads, inspectDocker,
 		driver, intent, stage, expected, progressCount, false)
 }

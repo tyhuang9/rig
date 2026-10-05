@@ -356,6 +356,16 @@ func TestGatewayRebindFinalConfigCopyReceiptTamperAndOldPhaseReplayFailClosed(t 
 		gatewayRebindProgressTimestamp(13), nil); err == nil {
 		t.Fatal("sequence-ten coordinator accepted sequence-twelve history")
 	}
+	// Even if the active file disappears, the old stage-only proof must not
+	// accept a history that has already advanced to the final-copy phase.
+	fake.inventory = gatewayRebindFinalConfigInventoryStageOnly
+	latestStage := *history.Progress[11].Record.Stage
+	if _, err := restarted.readGatewayRebindStageServingAttestation(context.Background(),
+		fixture.predecessor.repository, reads, gatewayRebindStageNetworkInspect(t, fixture), fake,
+		fixture.intent, latestStage, latestStage.StageServing, 12); err == nil {
+		t.Fatal("legacy stage-serving proof accepted sequence-twelve history")
+	}
+	fake.inventory = gatewayRebindFinalConfigInventoryExactPair
 	forged := history.Progress[11].Record
 	stage := *forged.Stage
 	receipt := *stage.FinalConfigCopy
