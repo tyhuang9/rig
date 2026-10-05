@@ -75,6 +75,7 @@ func newGatewayRebindProtectedIntentV2(claim appaccess.GatewayRebindClaimV2,
 	}{claim.Spec.Predecessor.Lineage.ProfileRevisionNumber, claim.Spec.SuccessorProfile, claim.ConfigureApproval})
 	if err != nil || profileErr != nil || requestErr != nil || profileRequestErr != nil ||
 		claim.Spec.OperationID != checkpoint.OperationID || checkpoint.Generation == 0 ||
+		claim.Spec.SuccessorProtectedGeneration != checkpoint.Generation ||
 		claim.State != appaccess.GatewayRebindPrepared || claim.StateSequence != 1 ||
 		claim.RequestDigest != requestDigest || claim.SuccessorProfileRequestDigest != profileRequestDigest ||
 		claim.RebindApproval.Action != appaccess.ActionRebindGateway || claim.RebindApproval.SpecDigest != specDigest ||
@@ -151,7 +152,8 @@ func gatewayRebindProtectedIntentV2Digest(value gatewayRebindProtectedIntentV2) 
 
 func validGatewayRebindProtectedIntentV2(value gatewayRebindProtectedIntentV2) bool {
 	if value.Version != gatewayRebindProtectedIntentVersionV2 || value.Purpose != gatewayRebindProtectedIntentPurposeV2 ||
-		value.Generation == 0 || value.Generation <= value.Predecessor.Lineage.ProtectedGeneration ||
+		value.Generation == 0 || value.Generation != value.Claim.Spec.SuccessorProtectedGeneration ||
+		value.Generation <= value.Predecessor.Lineage.ProtectedGeneration ||
 		value.OperationID != value.Claim.Spec.OperationID || value.Claim.Spec.Predecessor != value.Predecessor ||
 		value.Claim.State != appaccess.GatewayRebindPrepared || value.Claim.StateSequence != 1 ||
 		len(value.Roster) != len(value.RosterEntryDigests) || int64(len(value.Roster)) != value.Claim.Spec.RosterCount ||

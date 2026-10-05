@@ -3,6 +3,7 @@ package generatedingress
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -197,6 +198,14 @@ func TestGatewayRebindProtectedIntentV2KeepsTypedPriorRebindSource(t *testing.T)
 	if err != nil || checkpoint.Digest != inspection.PredecessorCheckpointDigest {
 		t.Fatalf("rebuild inspected checkpoint: %v", err)
 	}
+	checkpointStore, err := newGatewayRebindPredecessorCheckpointStore(fixture.dataRoot,
+		checkpoint.Generation, checkpoint.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpointStore.installExact(checkpoint); err != nil {
+		t.Fatalf("install inspected checkpoint: %v", err)
+	}
 	network := fixture.intent.NetworkObservation
 	network.OperationID = input.OperationID
 	network.ClaimRequestDigest = claim.RequestDigest
@@ -233,11 +242,56 @@ func TestGatewayRebindProtectedIntentV2KeepsTypedPriorRebindSource(t *testing.T)
 	if err != nil || !reflect.DeepEqual(loaded, intent) {
 		t.Fatalf("load typed intent: %v", err)
 	}
+	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.IntentsV2) != 1 || !reflect.DeepEqual(history.IntentsV2[0].Intent, intent) {
+		t.Fatalf("scan typed intent history: intents=%d error=%v", len(history.IntentsV2), err)
+	}
+	progress, err := newGatewayRebindSuccessorIntentProgressV2(intent, time.Unix(4, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressStore, err := newGatewayRebindProgressStore(fixture.dataRoot, intent.Generation, intent.OperationID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := progressStore.installExact(context.Background(), progress); err != nil {
+		t.Fatalf("install typed intent progress: %v", err)
+	}
+	history, err = fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.Progress) == 0 ||
+		history.Progress[len(history.Progress)-1].Record.Digest != progress.Digest {
+		t.Fatalf("scan typed intent progress: records=%d error=%v", len(history.Progress), err)
+	}
 	generation, operationID, _, kind, relevant, err := parseGatewayHistoryArtifactName(filepathBase(store.path))
 	if err != nil || !relevant || kind != gatewayHistoryRebindIntent || generation != intent.Generation ||
 		operationID != intent.OperationID {
 		t.Fatalf("parse typed intent path: generation=%d operation=%s kind=%d relevant=%v error=%v",
 			generation, operationID, kind, relevant, err)
+	}
+}
+
+func TestGatewayRebindNextGenerationRetainsSQLOnlyAttempt(t *testing.T) {
+	predecessorOperation := uuid.NewString()
+	history := gatewayRebindProtectedIntentHistory{Predecessor: gatewayUpgradeGenerationSelection{
+		Generation: 3, operationID: predecessorOperation,
+	}}
+	retainedOperation := uuid.NewString()
+	snapshot := appaccess.GatewayRebindRecoverySnapshot{History: []appaccess.GatewayRebindHistoryEntry{{
+		Claim: appaccess.GatewayRebindClaimRecord{SpecVersion: appaccess.GatewayRebindSpecVersionV2,
+			V2: &appaccess.GatewayRebindClaimV2{Spec: appaccess.GatewayRebindSpecV2{
+				OperationID: retainedOperation, SuccessorProtectedGeneration: 7,
+			}}},
+	}}}
+	generation, err := gatewayRebindNextGeneration(history, snapshot, uuid.NewString())
+	if err != nil || generation != 8 {
+		t.Fatalf("next generation=%d error=%v", generation, err)
+	}
+	if _, err := gatewayRebindNextGeneration(history, snapshot, retainedOperation); err == nil {
+		t.Fatal("retained SQL-only operation ID was reusable")
+	}
+	snapshot.History[0].Claim.V2.Spec.SuccessorProtectedGeneration = uint64(math.MaxInt64)
+	if _, err := gatewayRebindNextGeneration(history, snapshot, uuid.NewString()); err == nil {
+		t.Fatal("SQL-storable protected generation overflow was accepted")
 	}
 }
 

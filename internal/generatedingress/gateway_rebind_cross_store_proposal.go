@@ -97,7 +97,7 @@ func (m *Manager) inspectGatewayRebindProposalLocked(ctx context.Context, reposi
 	if err != nil {
 		return GatewayRebindProposalInspection{}, gatewayRebindProposalError(ctx)
 	}
-	generation, err := gatewayRebindNextGeneration(history, input.OperationID)
+	generation, err := gatewayRebindNextGeneration(history, firstSnapshot, input.OperationID)
 	if err != nil || generation <= selection.Lineage.ProtectedGeneration {
 		return GatewayRebindProposalInspection{}, gatewayRebindProposalError(ctx)
 	}
@@ -123,7 +123,8 @@ func (m *Manager) inspectGatewayRebindProposalLocked(ctx context.Context, reposi
 	}
 	spec := appaccess.GatewayRebindSpecV2{
 		Version: appaccess.GatewayRebindSpecVersionV2, OperationID: input.OperationID,
-		Predecessor: checkpoint.sourceRef(), SuccessorProfileRevisionID: input.SuccessorProfileRevisionID,
+		Predecessor: checkpoint.sourceRef(), SuccessorProtectedGeneration: generation,
+		SuccessorProfileRevisionID:     input.SuccessorProfileRevisionID,
 		SuccessorProfileRevisionNumber: input.SuccessorProfileRevisionNumber,
 		SuccessorProfileOperationID:    input.SuccessorProfileOperationID, SuccessorProfile: input.SuccessorProfile,
 		RosterVersion: appaccess.GatewayRebindRosterVersionV2, RosterDigest: rosterDigest, RosterCount: int64(len(roster)),
@@ -161,7 +162,9 @@ func (m *Manager) inspectGatewayRebindProposalLocked(ctx context.Context, reposi
 	return result, nil
 }
 
-func gatewayRebindNextGeneration(history gatewayRebindProtectedIntentHistory, operationID string) (uint64, error) {
+func gatewayRebindNextGeneration(history gatewayRebindProtectedIntentHistory,
+	snapshot appaccess.GatewayRebindRecoverySnapshot, operationID string,
+) (uint64, error) {
 	latest := history.Predecessor.Generation
 	seen := map[string]struct{}{history.Predecessor.operationID: {}}
 	for _, value := range history.Intents {
@@ -176,7 +179,22 @@ func gatewayRebindNextGeneration(history gatewayRebindProtectedIntentHistory, op
 		}
 		seen[value.Checkpoint.OperationID] = struct{}{}
 	}
-	if _, duplicate := seen[operationID]; duplicate || latest == math.MaxUint64 {
+	// A prepared SQL claim is durable before its protected checkpoint is
+	// installed. Retain that generation in the allocator even after rollback or
+	// an interrupted admission so no later attempt can reuse its identity.
+	for _, entry := range snapshot.History {
+		switch {
+		case entry.Claim.SpecVersion == appaccess.GatewayRebindSpecVersionV2 && entry.Claim.V2 != nil:
+			claim := entry.Claim.V2
+			seen[claim.Spec.OperationID] = struct{}{}
+			if claim.Spec.SuccessorProtectedGeneration > latest {
+				latest = claim.Spec.SuccessorProtectedGeneration
+			}
+		case entry.Claim.Legacy != nil:
+			seen[entry.Claim.Legacy.Spec.OperationID] = struct{}{}
+		}
+	}
+	if _, duplicate := seen[operationID]; duplicate || latest >= uint64(math.MaxInt64) {
 		return 0, errors.New("generated ingress rebind generation is unavailable")
 	}
 	return latest + 1, nil

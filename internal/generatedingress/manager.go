@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
@@ -79,6 +80,12 @@ type Manager struct {
 	// gatewayRebindFailStop points at the process-wide latch in production.
 	// Tests may replace it with a private latch to avoid cross-test state.
 	gatewayRebindFailStop *atomic.Bool
+	// gatewayRebindV2NetworkObserver is replaceable only by package tests.
+	// Production performs two complete host and Docker inventory reads.
+	gatewayRebindV2NetworkObserver func(context.Context, appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error)
+	// gatewayRebindAfterClaim is a package-test crash boundary after the SQL
+	// prepared commit and before any protected checkpoint write.
+	gatewayRebindAfterClaim func(context.Context, appaccess.GatewayRebindClaimV2) error
 	// gatewayTopologyObserver is replaceable only by package tests. Production
 	// always uses the full read-only Docker attestation.
 	gatewayTopologyObserver func(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayObservedTopology
