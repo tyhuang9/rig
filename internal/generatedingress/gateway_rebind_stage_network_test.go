@@ -168,6 +168,60 @@ func TestGatewayRebindStageNetworkCreatesBindsAndReplays(t *testing.T) {
 	}
 }
 
+func TestGatewayRebindStageNetworkAttestationAllowsOnlyExactFinalMountReordering(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mutate  func(*gatewayV2DockerObservation)
+		wantErr bool
+	}{
+		{name: "exact mount reordering", mutate: func(value *gatewayV2DockerObservation) {
+			value.FinalContainer.Mounts[0], value.FinalContainer.Mounts[1] =
+				value.FinalContainer.Mounts[1], value.FinalContainer.Mounts[0]
+		}},
+		{name: "wrong mount", mutate: func(value *gatewayV2DockerObservation) {
+			value.FinalContainer.Mounts[0].Name = "different-volume"
+		}, wantErr: true},
+		{name: "non-mount drift", mutate: func(value *gatewayV2DockerObservation) {
+			value.Final404Proven = !value.Final404Proven
+		}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGatewayRebindEffectBoundaryFixture(t)
+			installGatewayRebindEffectBoundaryProgress(t, fixture, 2)
+			fake, reads := gatewayRebindStageNetworkTestDriver(fixture)
+			if err := fixture.predecessor.manager.stageGatewayRebindSuccessorNetworkWithDriver(
+				context.Background(), fixture.predecessor.repository, reads,
+				gatewayRebindStageNetworkInspect(t, fixture), fake,
+				gatewayRebindProgressTimestamp(3), nil); err != nil {
+				t.Fatalf("bind stage network fixture: %v", err)
+			}
+
+			dockerReads := 0
+			inspect := func(_ context.Context, _ routeState, _ gatewayV2RouteState,
+				_ gatewayMigrationJournal,
+			) (gatewayV2DockerObservation, error) {
+				dockerReads++
+				observation := gatewayRebindFixtureDockerObservation(t, fixture.predecessor)
+				if dockerReads == 2 {
+					test.mutate(&observation)
+				}
+				return observation, nil
+			}
+			err := fixture.predecessor.manager.stageGatewayRebindSuccessorNetworkWithDriver(
+				context.Background(), fixture.predecessor.repository, reads, inspect, fake,
+				gatewayRebindProgressTimestamp(4), nil)
+			if (err != nil) != test.wantErr || dockerReads != 2 {
+				t.Fatalf("stage network replay error=%v reads=%d want_error=%t", err, dockerReads, test.wantErr)
+			}
+			history, scanErr := fixture.predecessor.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+			if scanErr != nil || len(history.Progress) != 3 || fake.createCalls != 1 {
+				t.Fatalf("attestation replay mutated state: progress=%d create=%d scan_error=%v",
+					len(history.Progress), fake.createCalls, scanErr)
+			}
+		})
+	}
+}
+
 func TestGatewayRebindStageNetworkAcceptsExactDockerBridgeHostDeltaOnly(t *testing.T) {
 	fixture := newGatewayRebindEffectBoundaryFixture(t)
 	installGatewayRebindEffectBoundaryProgress(t, fixture, 2)
