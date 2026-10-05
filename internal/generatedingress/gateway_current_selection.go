@@ -85,7 +85,8 @@ func gatewayCurrentRebindSelection(dataRoot string, history gatewayRebindProtect
 	snapshot appaccess.GatewayRebindRecoverySnapshot,
 ) (gatewayCurrentSelection, error) {
 	if snapshot.CurrentSource == nil || snapshot.CurrentSource.Kind != appaccess.GatewayRebindSourceGatewayRebind ||
-		!gatewayCurrentAuthorityHasDatabaseCommit(snapshot.History, *snapshot.CurrentSource) ||
+		!gatewayCurrentAuthorityHasDatabaseCommit(snapshot.History, snapshot.CurrentDatabaseCommittedEvent,
+			*snapshot.CurrentSource) ||
 		!gatewayCurrentProfileMatchesAuthority(snapshot.CurrentProfile, *snapshot.CurrentSource) {
 		return gatewayCurrentSelection{}, errors.New("generated ingress SQL current rebind authority is invalid")
 	}
@@ -130,8 +131,13 @@ func gatewayCurrentRebindSelection(dataRoot string, history gatewayRebindProtect
 // during a second prepared rebind they must not be mistaken for proof of the
 // previously committed current operation.
 func gatewayCurrentAuthorityHasDatabaseCommit(history []appaccess.GatewayRebindHistoryEntry,
+	currentEvent *appaccess.GatewayRebindEvent,
 	authority appaccess.GatewayCurrentAuthorityRef,
 ) bool {
+	if currentEvent == nil || currentEvent.OperationID != authority.OperationID ||
+		currentEvent.State != appaccess.GatewayRebindDatabaseCommitted || currentEvent.Sequence <= 0 {
+		return false
+	}
 	found := false
 	for _, entry := range history {
 		operationID := ""
@@ -153,6 +159,9 @@ func gatewayCurrentAuthorityHasDatabaseCommit(history []appaccess.GatewayRebindH
 		events := 0
 		for _, event := range entry.Events {
 			if event.OperationID == authority.OperationID && event.State == appaccess.GatewayRebindDatabaseCommitted {
+				if !reflect.DeepEqual(event, *currentEvent) {
+					return false
+				}
 				events++
 			}
 		}

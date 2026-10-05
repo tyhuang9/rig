@@ -301,6 +301,7 @@ func TestGatewayCurrentSelectionUsesCommittedHistoryWhileNextRebindIsPrepared(t 
 			Sequence: 4, State: appaccess.GatewayRebindDatabaseCommitted}},
 		Transfers: append([]appaccess.GatewayRebindAllocationTransfer(nil), fixture.transfers...),
 	}
+	currentEvent := committed.Events[0]
 	activeOperationID := uuid.NewString()
 	active := appaccess.GatewayRebindHistoryEntry{Claim: appaccess.GatewayRebindClaimRecord{
 		SpecVersion: appaccess.GatewayRebindSpecVersionV2,
@@ -309,13 +310,20 @@ func TestGatewayCurrentSelectionUsesCommittedHistoryWhileNextRebindIsPrepared(t 
 	snapshot := appaccess.GatewayRebindRecoverySnapshot{
 		History: []appaccess.GatewayRebindHistoryEntry{committed}, Active: &active,
 		CurrentProfile: &profile, CurrentSource: &authority,
-		CurrentTransfers: append([]appaccess.GatewayRebindAllocationTransfer(nil), fixture.transfers...),
-		Phase:            appaccess.GatewayRebindPrepared, DatabaseCommitObserved: false,
+		CurrentDatabaseCommittedEvent: &currentEvent,
+		CurrentTransfers:              append([]appaccess.GatewayRebindAllocationTransfer(nil), fixture.transfers...),
+		Phase:                         appaccess.GatewayRebindPrepared, DatabaseCommitObserved: false,
 	}
 	selection, err := fixture.manager.selectGatewayCurrentLocked(context.Background(), snapshot)
 	if err != nil || selection.Kind != gatewayCurrentSelectionRebind || selection.State == nil ||
 		selection.Lineage.OperationID != fixture.receipt.OperationID {
 		t.Fatalf("select committed A while B prepared: kind=%s error=%v", selection.Kind, err)
+	}
+	staleEvent := currentEvent
+	staleEvent.Sequence++
+	snapshot.CurrentDatabaseCommittedEvent = &staleEvent
+	if _, err := fixture.manager.selectGatewayCurrentLocked(context.Background(), snapshot); err == nil {
+		t.Fatal("stale explicit current database-committed event selected the successor")
 	}
 }
 
