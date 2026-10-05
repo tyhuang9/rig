@@ -74,6 +74,12 @@ func inspectStateStoreReadOnly(dataRoot string) (*stateStore, bool, map[string]o
 			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(current) {
 				return nil, false, nil, errors.New("generated ingress data directory is unsafe")
 			}
+			// On Windows Lstat defers resolving the volume and file index until
+			// SameFile. Resolve it while this path still names the inspected
+			// directory so a later replacement cannot rewrite the old identity.
+			if !os.SameFile(info, info) {
+				return nil, false, nil, errors.New("generated ingress data directory identity is unavailable")
+			}
 			identities[current] = info
 			if current == root {
 				present = true
@@ -179,6 +185,9 @@ func (s *stateStore) directoryIdentity() (os.FileInfo, error) {
 		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(s.root) {
 			return nil, errors.New("generated ingress state directory is unsafe")
 		}
+		if !os.SameFile(info, info) {
+			return nil, errors.New("generated ingress state directory identity is unavailable")
+		}
 		return info, nil
 	}
 	var rootInfo os.FileInfo
@@ -186,6 +195,9 @@ func (s *stateStore) directoryIdentity() (os.FileInfo, error) {
 		info, err := os.Lstat(current)
 		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(current) {
 			return nil, errors.New("generated ingress state directory is unsafe")
+		}
+		if !os.SameFile(info, info) {
+			return nil, errors.New("generated ingress state directory identity is unavailable")
 		}
 		if current == s.root {
 			rootInfo = info
