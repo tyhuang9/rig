@@ -47,7 +47,8 @@ SQLite, cut over a route, provision a database, merge, or deploy.
 | Generated-ingress package tests | Passed: `go test -p=1 -count=1 -timeout=20m ./internal/generatedingress` (`648.529s`). This run began before a small assertion was added to the live test, which skips locally; final-source live-tag compilation and named-test discovery passed afterward. |
 | Vet and build | Passed: `go build -buildvcs=false ./...`; `go vet ./...` passed again after the QA correction. |
 | Documentation build | Passed after the parent documentation fix was merged: `pnpm --dir docs build`. |
-| Full Go suite, formatting, diff | Full serialized suite running from before the QA correction; record result as pre-fix. Changed Go files have no `gofmt -l` output, and staged fix passed `git diff --cached --check`; final aggregate diff check pending. |
+| Full Go suite | Passed before the QA correction: `go test -p=1 -count=1 -timeout=20m ./...` (`internal/generatedingress` 687.642s). The correction changed only a live test that skips locally; final-source full-suite verification remains pending. |
+| Formatting and diff | Changed Go files have no `gofmt -l` output; `git diff --check feature/hosting-m3-rebind-stage-start..HEAD` passed. |
 
 ## Remaining gates and rollback
 
