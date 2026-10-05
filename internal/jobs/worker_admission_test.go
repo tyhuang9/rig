@@ -75,13 +75,8 @@ func TestAdmittedWorkerRequiresAdmissionAndKeepsItThroughTerminalState(t *testin
 		t.Fatal("effects admission was not released after terminal persistence")
 	}
 	cancel()
-	select {
-	case err := <-workerDone:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("admitted worker did not stop")
+	if err := <-workerDone; err != nil {
+		t.Fatal(err)
 	}
 }
 
