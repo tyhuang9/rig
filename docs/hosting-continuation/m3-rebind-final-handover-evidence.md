@@ -143,13 +143,13 @@ durable direction, including when invoked through the forward entrypoint.
 
 | Check | Evidence required | Current result |
 | --- | --- | --- |
-| Inherited baseline | Verified prior source and focused sequence-twelve replay | Prior full Go checkpoint at `7d83b583`, final 68-test group plus vet/build/tagged compilation at `0aa8d785`; base documentation commit `39b217f` retains that Go/workflow tree. New-worktree sequence-twelve copy/replay baseline passed in 15.082s, reported by the parent coordinator. |
+| Inherited baseline | Verified prior source and focused sequence-twelve replay | Initial checkpoints and the 15.082s worktree baseline are retained below. Current prerequisite PR #136 at `bdbb697` includes corrected source `60fa60d`: all 76 discovered regressions passed in 537.126s, followed by repository-wide vet/build and tagged compilation. |
 | Final container validator | Exact bound identity or provisional stopped readback; hardening, mounts, LAN/loopback publications and stopped/running network proof | Two required top-level tests discovered and passed locally in 26.181s; production Docker inspection remains pending. |
-| Builders and physical observer | Exact IDs/labels/image/config/mounts/binds/networks; malformed and foreign substitutions; bounded reads | Plan tests passed in 28.019s; four resource/withdrawal/projection tests passed in 27.655s; two direct host/application-proof tests passed in 13.343s. Full driver journey remains pending. |
-| Coordinator and history | Every transition/effect/write boundary; unchanged SQL/source bytes; stale heads; forged/gapped/conflicting records; cancellation and release errors | 45 existing protected-history top-level tests passed in 51.263s; one symlink subtest skipped for unavailable Windows privilege. New coordinator fault tests remain in progress. |
-| Restart and compensation | Fresh Manager and actual subprocess exit after predecessor stop; lost acknowledgments; unbound creation retained; both terminal outcomes | Pending |
+| Builders and physical observer | Exact IDs/labels/image/config/mounts/binds/networks; malformed and foreign substitutions; bounded reads | Plan tests passed in 28.019s; four resource/withdrawal/projection tests passed in 27.655s; two direct host/application-proof tests passed in 13.343s. They passed again in the frozen full suite. The incremental autosave production-read policy passed in 14.48s. Actual Docker observation remains pending. |
+| Coordinator and history | Every transition/effect/write boundary; unchanged SQL/source bytes; stale heads; forged/gapped/conflicting records; cancellation and release errors | All 25 required deterministic handover tests passed in the frozen `c2d3daf` full suite. The later real rollback-origin matrix passed in 228.04s. Earlier 45 protected-history checks passed in 51.263s, with one Windows symlink subtest skipped. Exact failures and correction checks remain below. |
+| Restart and compensation | Fresh Manager and actual subprocess exit after predecessor stop; lost acknowledgments; unbound creation retained; both terminal outcomes | The real subprocess regression passed in 30.878s and in the frozen full suite; six rollback lost-acknowledgment cases passed in 276.723s and in that full suite. Incremental durable-origin tests passed. Physical Docker process recovery remains a hosted gate. |
 | Hosted Docker | Two real test-owned host addresses; at least two applications including loopback-only; full LAN/loopback routes, expected 404 behavior, old-bind absence, rollback restoration and exact cleanup | Pending |
-| Final integration | Full relevant Go checks, formatter/diff checks, docs, Linux race and independent security/integration review | Pending |
+| Final integration | Full relevant Go checks, formatter/diff checks, docs, Linux race and independent security/integration review | Frozen full suite: 48 packages, 2,048 top-level passes, zero failures. Later autosave/parser/coordinator checks, repository-wide vet/build, tagged compilation, formatting/diff checks and docs build passed. Independent final source review found no code blocker. Final docs summary was corrected after review; hosted Docker and Linux race remain pending. |
 
 The initial contract/evidence documentation passed the following checks:
 
@@ -310,8 +310,9 @@ At committed source `c2d3daf`, all-package `go vet -mod=readonly ./...` and
 `go test -mod=readonly -p=1 -tags live_docker -run '^$' ./cmd/hostd
 ./internal/generatedingress` passed in 0.718s and 0.725s respectively.
 Formatting and aggregate diff checks passed before the source commit. Required
-discovery found 25 deterministic handover top-level tests; the full Go run is
-pending, using a larger local timeout for Windows protected-file fixture costs.
+discovery found 25 deterministic handover top-level tests; the full Go run was
+pending at this checkpoint, using a larger local timeout for Windows protected-file
+fixture costs. Its completed result is recorded below.
 
 The two hosted jobs use separate disposable Linux runners, reject overlap with
 both assigned prefixes and non-default host routes before creating their exact
@@ -343,9 +344,9 @@ its active snapshot when present. Unknown paths, bytes, metadata, owners and
 permissions remain invalid. Archive limits must accommodate the additional
 bounded file without increasing generic Docker output limits.
 
-The running full suite remains evidence for frozen `c2d3daf`, and cannot prove
-this pending correction. The prior conditional source-review verdict is
-superseded for publication readiness until this issue is fixed and reviewed.
+The then-running full suite remained evidence for frozen `c2d3daf`, and could
+not prove that pending correction. The prior conditional source-review verdict
+was superseded until the correction and review recorded below completed.
 
 At `c2d3daf`, `pnpm --dir web install --frozen-lockfile --offline` reused all
 172 packages. `pnpm --dir web test` passed all 502 tests in 19 files (11.41s),
