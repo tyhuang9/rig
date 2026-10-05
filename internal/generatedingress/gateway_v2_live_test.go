@@ -42,6 +42,7 @@ type liveGatewayV2FixtureSpec struct {
 	approvedBy       string
 	imageTag         string
 	applicationReply string
+	countRequests    bool
 }
 
 type liveGatewayV2Fixture struct {
@@ -250,7 +251,11 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	})
 
 	appSpec := liveCandidateSpec("blue", spec.appID, spec.planID)
-	appSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, image.tag, appSpec, spec.applicationReply, "0.0.0.0")
+	if spec.countRequests {
+		appSpec.ImageContentID = buildLiveGatewayCountedImage(t, ctx, runner, docker, root, dockerConfig, image.tag, appSpec, spec.applicationReply)
+	} else {
+		appSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, image.tag, appSpec, spec.applicationReply, "0.0.0.0")
+	}
 	candidate := startLiveCandidate(t, ctx, engine, appSpec)
 	fixture.candidates = append(fixture.candidates, candidate)
 	route := generatedruntime.RouteSwitchRequest{
