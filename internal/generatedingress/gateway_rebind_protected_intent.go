@@ -83,9 +83,17 @@ type gatewayRebindProtectedIntentSelection struct {
 type gatewayRebindProtectedIntentHistory struct {
 	Predecessor gatewayUpgradeGenerationSelection
 	Source      routeState
+	Checkpoints []gatewayRebindPredecessorCheckpointSelection
 	Intents     []gatewayRebindProtectedIntentSelection
 	Progress    []gatewayRebindProgressSelection
 	Terminals   []gatewayRebindFinalHandoverTerminalSelection
+}
+
+type gatewayRebindPredecessorCheckpointSelection struct {
+	Store      *gatewayRebindPredecessorCheckpointStore
+	Generation uint64
+	Checkpoint gatewayRebindPredecessorCheckpoint
+	Existing   bool
 }
 
 func newGatewayRebindProtectedIntent(snapshot appaccess.GatewayRebindStartupSnapshot,
@@ -479,15 +487,41 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLocked(checkpoint func(
 			return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind operation is duplicated across generations")
 		}
 		seenOperations[artifact.operationID] = struct{}{}
+		artifactPredecessor := predecessor
+		if artifact.checkpoint.path != "" {
+			checkpointStore, checkpointStoreErr := newGatewayRebindPredecessorCheckpointStore(
+				m.options.DataRoot, generation, artifact.operationID)
+			if checkpointStoreErr != nil || checkpointStore.path != artifact.checkpoint.path {
+				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor checkpoint path is invalid")
+			}
+			checkpoint, checkpointErr := checkpointStore.load()
+			if checkpointErr != nil || !gatewayRebindCheckpointMatchesUpgradePredecessor(checkpoint, predecessor) {
+				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor checkpoint history is invalid")
+			}
+			// The checkpoint freezes the exact admission source. Later ordinary
+			// route writes may mutate the live upgrade state without changing its
+			// stable origin, so all retained intent/progress/terminal evidence is
+			// checked against these frozen bytes rather than today's route bytes.
+			artifactPredecessor.State = cloneGatewayV2RouteState(*checkpoint.UpgradeState)
+			result.Checkpoints = append(result.Checkpoints, gatewayRebindPredecessorCheckpointSelection{
+				Store: checkpointStore, Generation: generation, Checkpoint: checkpoint, Existing: true,
+			})
+		}
+		if artifact.intent.path == "" {
+			if artifact.checkpoint.path == "" || index != len(generations)-1 || len(artifact.progress) != 0 || artifact.terminal.path != "" {
+				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor checkpoint is incomplete")
+			}
+			continue
+		}
 		store, storeErr := newGatewayRebindProtectedIntentStore(m.options.DataRoot, generation, artifact.operationID)
 		if storeErr != nil || store.path != artifact.intent.path {
 			return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind intent history path is invalid")
 		}
 		intent, loadErr := store.load()
-		if loadErr != nil || !gatewayRebindProtectedIntentMatchesPredecessor(intent, predecessor) {
+		if loadErr != nil || !gatewayRebindProtectedIntentMatchesPredecessor(intent, artifactPredecessor) {
 			return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind intent history is invalid")
 		}
-		progress, progressErr := scanGatewayRebindProgressForIntent(m.options.DataRoot, intent, predecessor, artifact)
+		progress, progressErr := scanGatewayRebindProgressForIntent(m.options.DataRoot, intent, artifactPredecessor, artifact)
 		if progressErr != nil {
 			return gatewayRebindProtectedIntentHistory{}, progressErr
 		}
@@ -499,7 +533,7 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLocked(checkpoint func(
 					return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind handover history is invalid")
 				}
 				handoverContext := gatewayRebindFinalHandoverContext{
-					Intent: intent, SequenceTwelve: sequenceTwelve, Predecessor: predecessor, Source: source,
+					Intent: intent, SequenceTwelve: sequenceTwelve, Predecessor: artifactPredecessor, Source: source,
 					Phase: record.Phase, Plan: record.Handover.Plan, Final: record.Handover.Final,
 				}
 				if !validGatewayRebindFinalHandoverProgressContext(handoverContext, record) {
@@ -518,7 +552,9 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLocked(checkpoint func(
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind terminal history path is invalid")
 			}
 			receipt, receiptErr := terminalStore.load()
-			if receiptErr != nil || !gatewayRebindFinalHandoverTerminalInstallPermitted(result, receipt) {
+			terminalHistory := result
+			terminalHistory.Predecessor = artifactPredecessor
+			if receiptErr != nil || !gatewayRebindFinalHandoverTerminalInstallPermitted(terminalHistory, receipt) {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind terminal history is invalid")
 			}
 			result.Terminals = append(result.Terminals, gatewayRebindFinalHandoverTerminalSelection{
@@ -544,6 +580,23 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLocked(checkpoint func(
 		return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor source changed during inspection")
 	}
 	return result, nil
+}
+
+func gatewayRebindCheckpointMatchesUpgradePredecessor(checkpoint gatewayRebindPredecessorCheckpoint,
+	predecessor gatewayUpgradeGenerationSelection,
+) bool {
+	if checkpoint.UpgradeState == nil || checkpoint.CurrentState != nil || predecessor.Store == nil ||
+		!predecessor.Existing || predecessor.PartialState || predecessor.Retired || predecessor.Aborted ||
+		checkpoint.Lineage.Kind != appaccess.GatewayRebindSourceGatewayUpgrade ||
+		checkpoint.Lineage.ProtectedGeneration != predecessor.Generation ||
+		checkpoint.Lineage.OperationID != predecessor.operationID {
+		return false
+	}
+	// Only the immutable origin must still match the live upgrade selection.
+	// The checkpoint's source state is self-validating and intentionally
+	// remains historical after grants, disables, or redeploys change routes.
+	lineage, err := gatewayUpgradeCurrentLineage(predecessor)
+	return err == nil && checkpoint.Lineage == lineage
 }
 
 func gatewayRebindProtectedIntentMatchesPredecessor(intent gatewayRebindProtectedIntent,

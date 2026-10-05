@@ -1,0 +1,265 @@
+package generatedingress
+
+import (
+	"context"
+	"errors"
+	"reflect"
+
+	"github.com/hostd/hostd/internal/appaccess"
+)
+
+type gatewayCurrentSelectionKind string
+
+const (
+	gatewayCurrentSelectionUpgrade gatewayCurrentSelectionKind = "gateway_upgrade"
+	gatewayCurrentSelectionRebind  gatewayCurrentSelectionKind = "gateway_rebind"
+)
+
+type gatewayCurrentSelection struct {
+	Kind    gatewayCurrentSelectionKind
+	Lineage appaccess.GatewayCurrentLineageRef
+	Upgrade *gatewayUpgradeGenerationSelection
+	Receipt *gatewayRebindFinalHandoverTerminalReceipt
+	Store   *gatewayCurrentRouteStateStore
+	State   *gatewayCurrentRouteState
+}
+
+// MatchesResolution compares the full protected proof with the honest SQL
+// authority projection and effective transfer chain. Legacy SQL has no
+// protected generation, identity or journal columns, so those remain an
+// independent protected validation rather than invented SQL evidence.
+func (proof GatewayV2LANEffectiveBindingProof) MatchesResolution(value appaccess.GatewayBindingResolution) bool {
+	if !validGatewayCurrentLineage(proof.ProtectedLineage) ||
+		gatewayCurrentAuthority(proof.ProtectedLineage) != value.CurrentGatewaySource ||
+		proof.TerminalReceiptDigest != value.TerminalReceiptDigest ||
+		proof.TerminalReceiptDigest != proof.ProtectedLineage.TerminalReceiptDigest ||
+		proof.TransferChainTipDigest != value.TransferChainTipDigest ||
+		proof.EffectiveProfile.RevisionID != value.EffectiveProfile.ID ||
+		proof.EffectiveProfile.RevisionNumber != value.EffectiveProfile.RevisionNumber ||
+		proof.EffectiveProfile.SpecDigest != value.EffectiveProfile.SpecDigest ||
+		proof.EffectiveProfile.SelectedIPv4 != value.EffectiveProfile.Spec.SelectedIPv4 ||
+		proof.EffectiveProfile.InterfaceID != value.EffectiveProfile.Spec.InterfaceID ||
+		proof.EffectiveProfile.PortStart != value.EffectiveProfile.Spec.PortStart ||
+		proof.EffectiveProfile.PortEnd != value.EffectiveProfile.Spec.PortEnd {
+		return false
+	}
+	if len(value.TransferChain) == 0 {
+		return proof.TransferChainTipDigest == ""
+	}
+	previous := ""
+	for index, transfer := range value.TransferChain {
+		digest, err := appaccess.GatewayRebindAllocationTransferDigest(transfer)
+		if err != nil || transfer.TransferDigest != digest ||
+			(index == 0 && transfer.PredecessorTransferDigest != nil) ||
+			(index > 0 && (transfer.PredecessorTransferDigest == nil || *transfer.PredecessorTransferDigest != previous)) {
+			return false
+		}
+		previous = digest
+	}
+	return previous == proof.TransferChainTipDigest
+}
+
+func gatewayCurrentProfileMatchesAuthority(profile *appaccess.GatewayProfileRevision,
+	authority appaccess.GatewayCurrentAuthorityRef,
+) bool {
+	return profile != nil && profile.ID == authority.ProfileRevisionID &&
+		profile.RevisionNumber == authority.ProfileRevisionNumber && profile.SpecDigest == authority.ProfileSpecDigest
+}
+
+func gatewayCurrentUpgradeSelection(history gatewayRebindProtectedIntentHistory,
+	snapshot appaccess.GatewayRebindRecoverySnapshot,
+) (gatewayCurrentSelection, error) {
+	if snapshot.CurrentSource == nil || snapshot.CurrentSource.Kind != appaccess.GatewayRebindSourceGatewayUpgrade ||
+		!gatewayCurrentProfileMatchesAuthority(snapshot.CurrentProfile, *snapshot.CurrentSource) {
+		return gatewayCurrentSelection{}, errors.New("generated ingress SQL current upgrade authority is invalid")
+	}
+	lineage, err := gatewayUpgradeCurrentLineage(history.Predecessor)
+	if err != nil || gatewayCurrentAuthority(lineage) != *snapshot.CurrentSource {
+		return gatewayCurrentSelection{}, errors.New("generated ingress current upgrade authority disagrees with protected state")
+	}
+	selection := history.Predecessor
+	return gatewayCurrentSelection{Kind: gatewayCurrentSelectionUpgrade, Lineage: lineage, Upgrade: &selection}, nil
+}
+
+func gatewayCurrentRebindSelection(dataRoot string, history gatewayRebindProtectedIntentHistory,
+	snapshot appaccess.GatewayRebindRecoverySnapshot,
+) (gatewayCurrentSelection, error) {
+	if snapshot.CurrentSource == nil || snapshot.CurrentSource.Kind != appaccess.GatewayRebindSourceGatewayRebind ||
+		!gatewayCurrentAuthorityHasDatabaseCommit(snapshot.History, *snapshot.CurrentSource) ||
+		!gatewayCurrentProfileMatchesAuthority(snapshot.CurrentProfile, *snapshot.CurrentSource) {
+		return gatewayCurrentSelection{}, errors.New("generated ingress SQL current rebind authority is invalid")
+	}
+	var receipt *gatewayRebindFinalHandoverTerminalReceipt
+	for index := range history.Terminals {
+		candidate := history.Terminals[index].Receipt
+		if candidate.OperationID != snapshot.CurrentSource.OperationID {
+			continue
+		}
+		if receipt != nil || candidate.Disposition != gatewayRebindFinalHandoverTerminalCommit {
+			return gatewayCurrentSelection{}, errors.New("generated ingress protected current rebind receipt is ambiguous")
+		}
+		copy := candidate
+		receipt = &copy
+	}
+	if receipt == nil {
+		return gatewayCurrentSelection{}, errors.New("generated ingress protected current rebind receipt is missing")
+	}
+	lineage, err := gatewayRebindCurrentLineage(*receipt)
+	if err != nil || gatewayCurrentAuthority(lineage) != *snapshot.CurrentSource {
+		return gatewayCurrentSelection{}, errors.New("generated ingress current rebind authority disagrees with protected state")
+	}
+	store, err := newGatewayCurrentRouteStateStore(dataRoot, lineage)
+	if err != nil {
+		return gatewayCurrentSelection{}, err
+	}
+	state, err := store.load()
+	if err != nil || state.Lineage != lineage {
+		return gatewayCurrentSelection{}, errors.New("generated ingress current rebind operational state is invalid")
+	}
+	manifestDigest, err := appaccess.GatewayRebindTransferManifestDigest(snapshot.CurrentTransfers)
+	if err != nil || manifestDigest != state.TransferManifestDigest || !gatewayCurrentTransfersMatchState(snapshot.CurrentTransfers, state) {
+		return gatewayCurrentSelection{}, errors.New("generated ingress current rebind transfers disagree with protected state")
+	}
+	return gatewayCurrentSelection{Kind: gatewayCurrentSelectionRebind, Lineage: lineage,
+		Receipt: receipt, Store: store, State: &state}, nil
+}
+
+// gatewayCurrentAuthorityHasDatabaseCommit deliberately inspects retained
+// history for the SQL-selected current operation. Snapshot phase and its
+// database-commit fields describe the independently active recovery attempt;
+// during a second prepared rebind they must not be mistaken for proof of the
+// previously committed current operation.
+func gatewayCurrentAuthorityHasDatabaseCommit(history []appaccess.GatewayRebindHistoryEntry,
+	authority appaccess.GatewayCurrentAuthorityRef,
+) bool {
+	found := false
+	for _, entry := range history {
+		operationID := ""
+		switch {
+		case entry.Claim.SpecVersion == 1 && entry.Claim.Legacy != nil && entry.Claim.V2 == nil:
+			operationID = entry.Claim.Legacy.Spec.OperationID
+		case entry.Claim.SpecVersion == appaccess.GatewayRebindSpecVersionV2 && entry.Claim.Legacy == nil && entry.Claim.V2 != nil:
+			operationID = entry.Claim.V2.Spec.OperationID
+		default:
+			return false
+		}
+		if operationID != authority.OperationID {
+			continue
+		}
+		if found {
+			return false
+		}
+		found = true
+		events := 0
+		for _, event := range entry.Events {
+			if event.OperationID == authority.OperationID && event.State == appaccess.GatewayRebindDatabaseCommitted {
+				events++
+			}
+		}
+		if events != 1 {
+			return false
+		}
+	}
+	return found
+}
+
+func gatewayCurrentTransfersMatchState(transfers []appaccess.GatewayRebindAllocationTransfer,
+	state gatewayCurrentRouteState,
+) bool {
+	byApp := make(map[string]appaccess.GatewayRebindAllocationTransfer, len(transfers))
+	for _, transfer := range transfers {
+		digest, err := appaccess.GatewayRebindAllocationTransferDigest(transfer)
+		if err != nil || transfer.TransferDigest != digest || transfer.OperationID != state.Lineage.OperationID ||
+			transfer.TerminalReceiptDigest != state.Lineage.TerminalReceiptDigest {
+			return false
+		}
+		if _, duplicate := byApp[transfer.AppID]; duplicate {
+			return false
+		}
+		byApp[transfer.AppID] = transfer
+	}
+	for appID, app := range state.Apps {
+		if app.LAN == nil || app.LAN.Transfer == nil {
+			continue
+		}
+		transfer, ok := byApp[appID]
+		if !ok || !reflect.DeepEqual(transfer, *app.LAN.Transfer) {
+			return false
+		}
+	}
+	// Transfers are immutable historical authorization. A later disable or
+	// native regrant may remove an active transferred binding while SQL retains
+	// the complete baseline manifest. The manifest digest above proves that
+	// history; each active transfer-bearing route must still select its exact
+	// retained row, but every retained row need not remain active.
+	return true
+}
+
+// selectGatewayCurrentLocked uses SQL current authority to select one already
+// validated protected lineage. A protected terminal receipt alone never moves
+// the current gateway. The caller must hold Manager and OS gateway locks.
+func (m *Manager) selectGatewayCurrentLocked(ctx context.Context,
+	snapshot appaccess.GatewayRebindRecoverySnapshot,
+) (gatewayCurrentSelection, error) {
+	if m == nil || ctx == nil || ctx.Err() != nil || snapshot.CurrentSource == nil {
+		return gatewayCurrentSelection{}, errors.New("generated ingress current gateway selection input is invalid")
+	}
+	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil {
+		return gatewayCurrentSelection{}, err
+	}
+	var selection gatewayCurrentSelection
+	switch snapshot.CurrentSource.Kind {
+	case appaccess.GatewayRebindSourceGatewayUpgrade:
+		selection, err = gatewayCurrentUpgradeSelection(history, snapshot)
+	case appaccess.GatewayRebindSourceGatewayRebind:
+		selection, err = gatewayCurrentRebindSelection(m.options.DataRoot, history, snapshot)
+	default:
+		err = errors.New("generated ingress SQL current gateway kind is invalid")
+	}
+	if err != nil || ctx.Err() != nil {
+		return gatewayCurrentSelection{}, errors.New("generated ingress current gateway selection failed")
+	}
+	// Repeat the complete protected scan and selected current read. This keeps
+	// external protected-file replacement from crossing the SQL-led decision.
+	confirmedHistory, scanErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if scanErr != nil || !sameGatewayRebindCurrentHistory(history, confirmedHistory) {
+		return gatewayCurrentSelection{}, errors.New("generated ingress current protected history changed during selection")
+	}
+	if selection.Store != nil {
+		confirmed, loadErr := selection.Store.load()
+		if loadErr != nil || selection.State == nil || !reflect.DeepEqual(confirmed, *selection.State) {
+			return gatewayCurrentSelection{}, errors.New("generated ingress current route state changed during selection")
+		}
+	}
+	return selection, nil
+}
+
+func sameGatewayRebindCurrentHistory(left, right gatewayRebindProtectedIntentHistory) bool {
+	if len(left.Checkpoints) != len(right.Checkpoints) || len(left.Intents) != len(right.Intents) || len(left.Progress) != len(right.Progress) ||
+		len(left.Terminals) != len(right.Terminals) ||
+		!sameObservedGatewayV2Selection(left.Predecessor, right.Predecessor) {
+		return false
+	}
+	for index := range left.Checkpoints {
+		if !reflect.DeepEqual(left.Checkpoints[index].Checkpoint, right.Checkpoints[index].Checkpoint) {
+			return false
+		}
+	}
+	for index := range left.Intents {
+		if !reflect.DeepEqual(left.Intents[index].Intent, right.Intents[index].Intent) {
+			return false
+		}
+	}
+	for index := range left.Progress {
+		if !reflect.DeepEqual(left.Progress[index].Record, right.Progress[index].Record) {
+			return false
+		}
+	}
+	for index := range left.Terminals {
+		if !reflect.DeepEqual(left.Terminals[index].Receipt, right.Terminals[index].Receipt) {
+			return false
+		}
+	}
+	return true
+}
