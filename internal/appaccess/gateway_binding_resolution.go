@@ -3,6 +3,7 @@ package appaccess
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"sort"
 )
 
@@ -43,6 +44,17 @@ func validGatewayBindingRef(ref GatewayBindingRef) bool {
 func resolveGatewayBinding(ctx context.Context, query gatewayBindingQuerier,
 	ref GatewayBindingRef,
 ) (GatewayBindingResolution, error) {
+	currentProfile, currentSource, err := readGatewayCurrentAuthority(ctx, query)
+	if err != nil {
+		return GatewayBindingResolution{}, err
+	}
+	return resolveGatewayBindingToAuthority(ctx, query, ref, currentProfile, currentSource)
+}
+
+func resolveGatewayBindingToAuthority(ctx context.Context, query gatewayBindingQuerier,
+	ref GatewayBindingRef, effectiveProfile GatewayProfileRevision,
+	effectiveSource GatewayCurrentAuthorityRef,
+) (GatewayBindingResolution, error) {
 	allocation, err := readAllocationByID(ctx, query, ref.AllocationID)
 	if err != nil {
 		return GatewayBindingResolution{}, invalidRebindStoredState(err)
@@ -78,10 +90,6 @@ func resolveGatewayBinding(ctx context.Context, query gatewayBindingQuerier,
 	if err != nil || rawProfile.SpecDigest != grant.Spec.GatewayProfileSpecDigest {
 		return GatewayBindingResolution{}, invalidRebindStoredState(err)
 	}
-	currentProfile, currentSource, err := readGatewayCurrentAuthority(ctx, query)
-	if err != nil {
-		return GatewayBindingResolution{}, err
-	}
 	transferRecords, err := readGatewayBindingTransfers(ctx, query, ref)
 	if err != nil {
 		return GatewayBindingResolution{}, err
@@ -91,7 +99,7 @@ func resolveGatewayBinding(ctx context.Context, query gatewayBindingQuerier,
 	profileID, profileNumber, profileDigest := rawProfile.ID, rawProfile.RevisionNumber, rawProfile.SpecDigest
 	var predecessor *string
 	used := make(map[int]struct{}, len(transferRecords))
-	for profileID != currentProfile.ID || profileNumber != currentProfile.RevisionNumber || profileDigest != currentProfile.SpecDigest {
+	for profileID != effectiveProfile.ID || profileNumber != effectiveProfile.RevisionNumber || profileDigest != effectiveProfile.SpecDigest {
 		matched := -1
 		for index := range transferRecords {
 			if _, exists := used[index]; exists {
@@ -127,19 +135,64 @@ func resolveGatewayBinding(ctx context.Context, query gatewayBindingQuerier,
 	if len(used) != len(transferRecords) {
 		return GatewayBindingResolution{}, ErrInvalidStoredState
 	}
-	if len(chain) == 0 && (rawProfile.ID != currentProfile.ID ||
-		rawProfile.RevisionNumber != currentProfile.RevisionNumber || rawProfile.SpecDigest != currentProfile.SpecDigest) {
+	if len(chain) == 0 && (rawProfile.ID != effectiveProfile.ID ||
+		rawProfile.RevisionNumber != effectiveProfile.RevisionNumber || rawProfile.SpecDigest != effectiveProfile.SpecDigest) {
 		return GatewayBindingResolution{}, ErrInvalidStoredState
 	}
 	value := GatewayBindingResolution{
 		RawAllocation: allocation, RawAccessRevision: revision, RawGrant: grant,
-		RawProfile: rawProfile, EffectiveProfile: currentProfile, CurrentGatewaySource: currentSource,
-		TransferChain: chain, TerminalReceiptDigest: currentSource.TerminalReceiptDigest,
+		RawProfile: rawProfile, EffectiveProfile: effectiveProfile, CurrentGatewaySource: effectiveSource,
+		TransferChain: chain, TerminalReceiptDigest: effectiveSource.TerminalReceiptDigest,
 	}
 	if len(chain) > 0 {
 		value.TransferChainTipDigest = chain[len(chain)-1].TransferDigest
 	}
 	return value, nil
+}
+
+// resolveGatewayBindingForRetiredGrant validates a released binding against
+// the SQL gateway authority captured by its terminal disable proof. Later
+// rebinds may legitimately omit the released allocation from their rosters.
+func resolveGatewayBindingForRetiredGrant(ctx context.Context, query gatewayBindingQuerier,
+	ref GatewayBindingRef, rawProfile GatewayProfileRevision, gatewayOperationID string,
+) (GatewayBindingResolution, error) {
+	if !validUUID(gatewayOperationID) {
+		return GatewayBindingResolution{}, ErrInvalidStoredState
+	}
+	profile, source, err := readGatewayAuthorityByOperation(ctx, query, gatewayOperationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Claims created before SQL gateway lineage existed carried a protected
+		// operation ID that cannot be joined locally. They remain readable only
+		// while the raw profile is still the current head with no SQL authority.
+		return resolveGatewayBindingForConsumer(ctx, query, ref, rawProfile)
+	}
+	if err != nil {
+		return GatewayBindingResolution{}, err
+	}
+	return resolveGatewayBindingToAuthority(ctx, query, ref, profile, source)
+}
+
+func resolveGatewayBindingForStoredGrant(ctx context.Context, query gatewayBindingQuerier,
+	ref GatewayBindingRef, rawProfile GatewayProfileRevision, grant AppAccessGrantClaim,
+) (GatewayBindingResolution, error) {
+	if grant.RetiredAt == nil {
+		return resolveGatewayBindingForConsumer(ctx, query, ref, rawProfile)
+	}
+	if !validUUID(grant.RetiredByDisableOperationID) {
+		return GatewayBindingResolution{}, ErrInvalidStoredState
+	}
+	disable, err := readAppAccessDisableClaim(ctx, query, grant.RetiredByDisableOperationID)
+	if err != nil || disable.State != AppAccessDisableCommitted || disable.Proof == nil ||
+		disable.SourceGrantAttemptID != grant.AttemptID ||
+		disable.Spec.AppID != grant.Spec.AppID ||
+		disable.Spec.AllocationID != grant.Spec.AllocationID ||
+		disable.Spec.OwnerOperationID != grant.Spec.OwnerOperationID ||
+		disable.Spec.AccessRevisionID != grant.Spec.AccessRevisionID ||
+		!grant.RetiredAt.Equal(disable.Proof.ObservedAt) {
+		return GatewayBindingResolution{}, invalidRebindStoredState(err)
+	}
+	return resolveGatewayBindingForRetiredGrant(ctx, query, ref, rawProfile,
+		disable.Proof.GatewayOperationID)
 }
 
 // resolveGatewayBindingForConsumer preserves pre-upgrade native histories that
@@ -304,6 +357,83 @@ func readGatewayCurrentAuthority(ctx context.Context, query gatewayBindingQuerie
 		Kind: GatewayRebindSourceGatewayUpgrade, OperationID: operationID,
 		ProfileRevisionID: profile.ID, ProfileRevisionNumber: profile.RevisionNumber,
 		ProfileSpecDigest: profile.SpecDigest,
+	}, nil
+}
+
+func readGatewayAuthorityByOperation(ctx context.Context, query gatewayBindingQuerier,
+	operationID string,
+) (GatewayProfileRevision, GatewayCurrentAuthorityRef, error) {
+	if !validUUID(operationID) {
+		return GatewayProfileRevision{}, GatewayCurrentAuthorityRef{}, ErrInvalidStoredState
+	}
+	var upgradeCount, rebindCount int
+	if err := query.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM lan_gateway_upgrade_claims WHERE operation_id=?),
+		(SELECT COUNT(*) FROM lan_gateway_rebind_claims WHERE operation_id=?)`,
+		operationID, operationID).Scan(&upgradeCount, &rebindCount); err != nil {
+		return GatewayProfileRevision{}, GatewayCurrentAuthorityRef{}, err
+	}
+	if upgradeCount+rebindCount == 0 {
+		return GatewayProfileRevision{}, GatewayCurrentAuthorityRef{}, sql.ErrNoRows
+	}
+	if upgradeCount != 0 && rebindCount != 0 || upgradeCount > 1 || rebindCount > 1 {
+		return GatewayProfileRevision{}, GatewayCurrentAuthorityRef{}, ErrInvalidStoredState
+	}
+	if upgradeCount == 1 {
+		claim, err := readGatewayProfileUpgradeClaim(ctx, query, operationID)
+		if err != nil || claim.State != GatewayProfileUpgradeCommitted ||
+			validateGatewayProfileUpgradeClaimHistory(ctx, query, claim) != nil {
+			return GatewayProfileRevision{}, GatewayCurrentAuthorityRef{}, invalidRebindStoredState(err)
+		}
+		profile, _, err := readGatewayRevision(ctx, query, claim.ProfileRevisionID,
+			claim.ProfileRevisionNumber)
+		if err != nil || profile.SpecDigest != claim.ProfileSpecDigest {
+			return GatewayProfileRevision{}, GatewayCurrentAuthorityRef{}, invalidRebindStoredState(err)
+		}
+		return profile, GatewayCurrentAuthorityRef{
+			Kind: GatewayRebindSourceGatewayUpgrade, OperationID: operationID,
+			ProfileRevisionID: profile.ID, ProfileRevisionNumber: profile.RevisionNumber,
+			ProfileSpecDigest: profile.SpecDigest,
+		}, nil
+	}
+
+	rows, err := query.QueryContext(ctx, `SELECT
+		c.successor_profile_revision_id,c.successor_profile_revision_number,
+		c.successor_profile_spec_digest,cmd.terminal_receipt_digest
+		FROM lan_gateway_rebind_claims c
+		JOIN lan_gateway_rebind_claim_events e ON e.operation_id=c.operation_id
+		 AND e.state='database_committed'
+		JOIN lan_gateway_rebind_transition_commands cmd ON cmd.operation_id=e.operation_id
+		 AND cmd.sequence=e.sequence AND cmd.next_state='database_committed'
+		WHERE c.operation_id=? AND c.state IN ('database_committed','unresolved','committed')`,
+		operationID)
+	if err != nil {
+		return GatewayProfileRevision{}, GatewayCurrentAuthorityRef{}, err
+	}
+	defer rows.Close()
+	var profileID, profileDigest, receipt string
+	var profileNumber int64
+	count := 0
+	for rows.Next() {
+		if err := rows.Scan(&profileID, &profileNumber, &profileDigest, &receipt); err != nil {
+			return GatewayProfileRevision{}, GatewayCurrentAuthorityRef{}, err
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return GatewayProfileRevision{}, GatewayCurrentAuthorityRef{}, err
+	}
+	if count != 1 || !validDigest(receipt) {
+		return GatewayProfileRevision{}, GatewayCurrentAuthorityRef{}, ErrInvalidStoredState
+	}
+	profile, _, err := readGatewayRevision(ctx, query, profileID, profileNumber)
+	if err != nil || profile.SpecDigest != profileDigest {
+		return GatewayProfileRevision{}, GatewayCurrentAuthorityRef{}, invalidRebindStoredState(err)
+	}
+	return profile, GatewayCurrentAuthorityRef{
+		Kind: GatewayRebindSourceGatewayRebind, OperationID: operationID,
+		ProfileRevisionID: profile.ID, ProfileRevisionNumber: profile.RevisionNumber,
+		ProfileSpecDigest: profile.SpecDigest, TerminalReceiptDigest: receipt,
 	}, nil
 }
 

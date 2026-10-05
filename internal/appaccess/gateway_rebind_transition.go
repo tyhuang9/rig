@@ -19,7 +19,13 @@ import (
 func (r *Repository) ApplyGatewayRebindTransition(ctx context.Context,
 	proof GatewayRebindTransitionProof,
 ) (command GatewayRebindTransitionCommand, resultErr error) {
-	if r == nil || r.db == nil || ctx == nil || validateGatewayRebindTransitionProof(proof) != nil {
+	if r == nil || r.db == nil || ctx == nil {
+		return GatewayRebindTransitionCommand{}, ErrInvalidInput
+	}
+	if proof.NextState == GatewayRebindDatabaseCommitted && proof.Transfers == nil {
+		proof.Transfers = []GatewayRebindAllocationTransfer{}
+	}
+	if validateGatewayRebindTransitionProof(proof) != nil {
 		return GatewayRebindTransitionCommand{}, ErrInvalidInput
 	}
 	payload, err := json.Marshal(proof)
