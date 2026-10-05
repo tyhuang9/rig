@@ -1,8 +1,9 @@
 # M3 LAN gateway rebind cutover contract
 
 Status: design contract only. This document defines the minimum safe contract
-for LAN-08. It does not describe an implemented rebind writer, migration 034,
-Docker cutover, recovery endpoint, URL publication, or fence release.
+for LAN-08. Migration 034 is a dormant ledger foundation; it does not provide
+a rebind writer, Docker cutover, recovery endpoint, URL publication, or fence
+release. The guarded cutover migration is reserved for migration 035 or later.
 
 ## Existing boundary
 
@@ -57,7 +58,7 @@ The contract extends the following behavior without weakening it:
   names belong to the initial v2 predecessor and cannot identify a retained
   predecessor and a rebind successor at the same time.
 
-These are invariants, not conveniences. Migration 034 and the cutover writer
+These are invariants, not conveniences. The guarded migration and cutover writer
 must fail closed if any of them cannot be re-established from durable state.
 
 ## Required lock and transaction order
@@ -140,10 +141,10 @@ The immediate transaction serializes concurrent SQLite writers: a job or
 deployment row committed first is included in the census, while a writer that
 starts afterward observes the committed rebind fence before it can dispatch an
 effect. The effects lease separately prevents an already-admitted worker or
-startup recovery from crossing the census/claim boundary. Migration 034 and
-the production admission tests must prove that combined invariant for every
-path that can start a deployment effect; this document does not assume every
-job enqueue itself already acquires the lease.
+startup recovery from crossing the census/claim boundary. The guarded
+migration and production admission tests must prove that combined invariant
+for every path that can start a deployment effect; this document does not
+assume every job enqueue itself already acquires the lease.
 
 ### Old interface and address rule
 
@@ -314,15 +315,16 @@ Migration 033 also declares `UNIQUE(operation_id, state)` on events. Recovery
 can revisit `successor_ready` or `database_committed`, so migration 034 must
 replace that uniqueness with sequence-keyed append-only events while retaining
 `(operation_id, sequence)` uniqueness and immutable update/delete guards.
-It must reject a replay with the wrong preceding state or sequence.
+The later guarded transition writer must reject a replay with the wrong
+preceding state or sequence.
 
 Immutable event history, rather than only the current claim row, controls the
 rollback boundary. If any event for the operation has state
 `database_committed`, no later `unresolved` row may transition to
-`rolled_back`, `prepared`, or `successor_ready`. Migration 034 must enforce
-that rule in SQL with an exact `NOT EXISTS` predicate over retained events for
-every rollback transition and with a positive prior-event predicate for every
-roll-forward replay. Application code cannot override it.
+`rolled_back`, `prepared`, or `successor_ready`. The guarded migration must
+enforce that rule in SQL with an exact `NOT EXISTS` predicate over retained
+events for every rollback transition and with a positive prior-event predicate
+for every roll-forward replay. Application code cannot override it.
 
 The protected phases under `prepared` are, in order:
 
@@ -380,27 +382,33 @@ absent again. This prevents an unavailable old endpoint from silently reviving
 after a NIC or Docker restart while keeping unrelated containers outside the
 mutation scope.
 
-## SQLite commit and migration 034
+## SQLite ledger foundation and guarded commit
 
-Migration 034 must replace migration 033's dormant `state = 'prepared'` and
-`EXISTS(any claim)` fences with the state machine above. It must retain all 033
-claim, event, and roster rows. It must also preserve migration 026's committed
+Migration 034 broadens the claim and event schema for retained terminal
+history and creates inert command and transfer ledgers. It retains all 033
+claim, event, and roster rows, while preserving migration 026's committed
 upgrade claim, events, audit history, predecessor profile revision, and
-predecessor protected generation unchanged.
+predecessor protected generation unchanged. It keeps prepared-only insertion,
+immutable claim state, all `EXISTS(any claim)` fences, and the existing profile
+pins. No 034 ledger row can authorize a transition or effect. A later guarded
+migration must replace those restrictions with the state machine above only
+after receipt-bound writers and transfer-aware readers are ready.
 
 Migration 026's active `lan_gateway_profile_upgrade_claim_pin_insert` and
 `lan_gateway_profile_upgrade_claim_pin_head` triggers still reject a new
-profile and head advance while its committed upgrade claim exists. Migration
-034 must replace those pins only with exact, purpose-bound rebind exceptions
-for the approved successor profile and one receipt-bound head transition;
-normal profile mutations remain pinned. The immutable migration-026 claim,
+profile and head advance while its committed upgrade claim exists. The
+guarded migration must replace those pins only with exact, purpose-bound
+rebind exceptions for the approved successor profile and one receipt-bound
+head transition; normal profile mutations remain pinned. The immutable
+migration-026 claim,
 events, and audit rows are retained without reinterpretation.
 
 Migration 033's unconditional singleton is a dormant safety device, not the
-long-term history model. Migration 034 must permit multiple retained terminal
-claims while enforcing at most one nonterminal claim across `prepared`,
-`successor_ready`, `database_committed`, and `unresolved`. After a committed
-rebind, its successor profile and protected generation become the exact
+long-term history model. Migration 034 must make its schema capable of
+retaining multiple terminal claims while enforcing at most one nonterminal
+claim across `prepared`, `successor_ready`, `database_committed`, and
+`unresolved`. After a committed rebind, its successor profile and protected
+generation become the exact
 predecessor of the next deliberate rebind. A rolled-back claim leaves its
 predecessor current but remains retained history.
 
@@ -409,12 +417,13 @@ by a committed migration-026 upgrade from one established by a prior committed
 rebind. It must reference the real source claim and receipt in either case. It
 must not manufacture a `lan_gateway_upgrade_claims` row for a rebind-created
 profile or reinterpret `upgrade_generated_ingress` approval as rebind approval.
-The exact SQL representation of this predecessor-lineage variant is unresolved
-and is required in the migration 034 design.
+Migration 034 must represent this predecessor-lineage variant without making
+the prior-rebind path writable until a genuine committed receipt exists.
 
-The migration-034 snapshot reader must therefore be phase-aware. The current
-`GatewayRebindStartupSnapshot` accepts zero claims and, when a migration-033
-claim exists, validates its current predecessor, absent successor, approvals,
+The later guarded migration's snapshot reader must therefore be phase-aware.
+The current `GatewayRebindStartupSnapshot` accepts zero claims and, when a
+migration-033 claim exists, validates its current predecessor, absent
+successor, approvals,
 and complete roster through the read path. `InspectGatewayRebindPredecessor`
 then requires exactly one prepared claim. Neither can be reused unchanged after
 the successor profile exists or when retained terminal claims accumulate. The
@@ -422,7 +431,7 @@ new reader must validate every retained terminal lineage, select at most one
 active claim, and apply the expected profile-head/receipt/transfer predicates
 for that active claim's exact state.
 
-The migration needs narrow, purpose-bound exceptions for the guarded writer:
+The guarded migration needs narrow, purpose-bound exceptions for its writer:
 
 - insert exactly the claim's already-approved successor profile revision;
 - advance the singleton profile head exactly once from the recorded
@@ -445,15 +454,13 @@ The rollback transition predicate must also prove that the immutable event
 table contains no `database_committed` event for the operation. A roll-forward
 replay from `unresolved` after database commit must prove that such an event
 does exist and that its sequence precedes the current event. This predicate is
-part of the migration trigger, not only repository validation.
+part of the guarded migration trigger, not only repository validation.
 
 Existing allocations, access revisions, grants, upgrade claims, and profile
-revisions remain immutable. Migration 034 must add append-only transfer
-evidence that maps each predecessor allocation/grant binding to the successor
-profile; it must not rewrite those historical rows. The exact physical schema
-for that transfer ledger and the mechanism by which SQL recognizes the
-purpose-bound writer are unresolved implementation choices and require a
-separate migration review.
+revisions remain immutable. Migration 034 adds an inert append-only transfer
+ledger shaped to map each predecessor allocation/grant binding to the successor
+profile; it must not rewrite historical rows or permit planted transfer rows.
+The guarded writer and its SQL authorization mechanism require separate review.
 
 ## Commit receipt, read-back, and fence release
 
@@ -621,8 +628,8 @@ must retain the claim, profile, roster, phase, and receipt history.
 
 ## Unresolved implementation choices
 
-The following choices must be resolved before code or migration 034 is
-approved:
+The following choices must be resolved before the guarded migration and
+cutover writer are approved:
 
 - the exact SQL tables and trigger mechanism for purpose-bound writer
   authorization and append-only allocation/profile transfers;
@@ -639,6 +646,6 @@ approved:
 - the supported mechanism for distinguishing a truly external second device
   from loopback, controller-host, proxy, or replayed proof traffic.
 
-Until those decisions and acceptance gates are complete, migration 033 must
-remain dormant and unreleasable, and no production rebind claim writer may be
-wired into the controller.
+Until those decisions and acceptance gates are complete, the 033/034 schema
+must remain dormant and unreleasable, and no production rebind claim writer may
+be wired into the controller.
