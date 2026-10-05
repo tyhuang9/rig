@@ -387,6 +387,7 @@ BEGIN
               AND c.predecessor_source_state_version=NEW.source_state_version
               AND c.predecessor_source_state_revision=NEW.source_state_revision
               AND c.predecessor_source_state_digest=NEW.source_state_digest
+              AND c.successor_protected_generation=NEW.protected_generation
             ))
       )
       OR NOT (
