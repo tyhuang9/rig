@@ -62,6 +62,15 @@ func readGatewayRebindRecoverySnapshot(ctx context.Context, tx *sql.Tx,
 	}
 
 	result := GatewayRebindRecoverySnapshot{History: make([]GatewayRebindHistoryEntry, 0, len(keys))}
+	if len(keys) == 0 {
+		profile, source, err := readGatewayRebindNoHistoryCurrent(ctx, tx)
+		if err != nil {
+			return GatewayRebindRecoverySnapshot{}, err
+		}
+		result.CurrentProfile = profile
+		result.CurrentSource = source
+		return result, nil
+	}
 	for _, key := range keys {
 		history, err := readGatewayRebindHistory(ctx, tx, key.operationID, key.version)
 		if err != nil {
@@ -128,6 +137,44 @@ func readGatewayRebindRecoverySnapshot(ctx context.Context, tx *sql.Tx,
 		}
 	}
 	return result, nil
+}
+
+func readGatewayRebindNoHistoryCurrent(ctx context.Context, tx *sql.Tx,
+) (*GatewayProfileRevision, *GatewayCurrentAuthorityRef, error) {
+	var profileID sql.NullString
+	var profileNumber int64
+	if err := tx.QueryRowContext(ctx, `SELECT revision_id,revision_number
+		FROM lan_gateway_profile_heads WHERE singleton=1`).Scan(&profileID, &profileNumber); err != nil {
+		return nil, nil, err
+	}
+	if !profileID.Valid {
+		var claims int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lan_gateway_upgrade_claims`).Scan(&claims); err != nil {
+			return nil, nil, err
+		}
+		if claims != 0 {
+			return nil, nil, ErrInvalidStoredState
+		}
+		return nil, nil, nil
+	}
+	profile, _, err := readGatewayRevision(ctx, tx, profileID.String, profileNumber)
+	if err != nil {
+		return nil, nil, invalidRebindStoredState(err)
+	}
+	var committed int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lan_gateway_upgrade_claims
+		WHERE state='committed'`).Scan(&committed); err != nil {
+		return nil, nil, err
+	}
+	if committed == 0 {
+		return &profile, nil, nil
+	}
+	current, source, err := readGatewayCurrentAuthority(ctx, tx)
+	if err != nil || current.ID != profile.ID || current.RevisionNumber != profile.RevisionNumber ||
+		current.SpecDigest != profile.SpecDigest || source.Kind != GatewayRebindSourceGatewayUpgrade {
+		return nil, nil, invalidRebindStoredState(err)
+	}
+	return &current, &source, nil
 }
 
 func readGatewayRebindHistory(ctx context.Context, tx *sql.Tx, operationID string,
