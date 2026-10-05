@@ -201,7 +201,7 @@ with normal Windows access (VitePress 4.72s). The initial sandboxed build could
 not resolve an existing pnpm dependency link; rerunning with normal access
 passed without installing or changing dependencies.
 
-## Observed hosted prerequisite evidence
+## Implementation and acceptance checkpoints
 
 ### Local contract and controller integration checkpoint
 
@@ -233,6 +233,19 @@ the callback's fresh SQL authority against the runtime's independent protected
 observation is still required. Atomic SQL commit, complete transfer resolution,
 runtime recovery and final fence release remain under implementation.
 
+At frozen source `ee3950219111373c6c573bccb31e07c35ab23fef`, the complete related
+package suites then passed:
+
+```text
+go test -mod=readonly -p=1 -json -count=1 -timeout=12m ./internal/appaccess ./internal/controller
+```
+
+All 206 top-level tests passed, with zero failures or skips. The package pass
+events reported app-access 58.213s and controller 59.318s. This checks existing
+grant, disable, startup and controller behavior alongside the new format and
+projection tests; it does not cover the still-unimplemented cross-store writer
+or runtime recovery.
+
 ### Published prerequisite jobs
 
 At PR #135 head `e46185ff61b3fa519304e5fa0ce8ab9c1a788acb`, the
@@ -259,6 +272,28 @@ The same head also passed the
 Its log records exactly one pass for
 `TestLiveGatewayRebindSuccessorStoppedStageContainer` in 73.67s, with no named
 test failure or skip. The required complete stopped-container cleanup passed.
+
+At that same PR #135 head, the
+[stage-config-copy job](https://github.com/tyhuang9/rig/actions/runs/37373345314/job/111975694377)
+subsequently passed both actual Docker journeys:
+
+- `TestLiveGatewayRebindSuccessorStageConfigCopy`: 100.08s.
+- `TestLiveGatewayRebindSuccessorStageConfigCopyLostAcknowledgmentAdopts`: 87.79s.
+
+Both named tests passed exactly once with no failure or skip, and required
+stage-config-copy cleanup passed. This closes the earlier observed empty-volume
+rejection for this corrected stage-copy source, including lost-acknowledgment
+adoption.
+
+At PR #136 head `bdbb697f767da4e71664da1434a75e6daec4b732`, the
+[network-staging job](https://github.com/tyhuang9/rig/actions/runs/37374324911/job/111978936326)
+passed `TestLiveGatewayRebindSuccessorNetworkStage` exactly once in 45.76s with
+no failure or skip. Required network cleanup passed. These are prerequisite
+results; the two final-config-copy jobs remained queued at the latest check.
+
+PR #136's CodeRabbit status was successful, but its actual comment says draft
+review was skipped, and there were no reviews or inline findings. That status
+is not source-review evidence.
 
 The containing workflow was still running, so the completed job's metadata and
 logs were read directly. This proves those named inherited journeys only.
