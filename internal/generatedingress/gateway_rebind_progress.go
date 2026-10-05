@@ -19,20 +19,27 @@ const (
 	gatewayRebindProgressSequenceDigits      = 2
 	maxGatewayRebindProgressBytes            = 32 << 10
 	maxGatewayRebindFinalConfigProgressBytes = 256 << 10
-	gatewayRebindProgressMaximumSequence     = 12
+	gatewayRebindProgressMaximumSequence     = 18
 )
 
 type gatewayRebindProgressPhase string
 
 const (
-	gatewayRebindProgressSuccessorIntent   gatewayRebindProgressPhase = "successor_intent"
-	gatewayRebindProgressStageIntent       gatewayRebindProgressPhase = "stage_intent"
-	gatewayRebindProgressStageConfigIntent gatewayRebindProgressPhase = "stage_config_intent"
-	gatewayRebindProgressStageConfigCopied gatewayRebindProgressPhase = "stage_config_copied"
-	gatewayRebindProgressStageStartIntent  gatewayRebindProgressPhase = "stage_start_intent"
-	gatewayRebindProgressStageServing      gatewayRebindProgressPhase = "stage_serving"
-	gatewayRebindProgressFinalConfigIntent gatewayRebindProgressPhase = "final_config_intent"
-	gatewayRebindProgressFinalConfigCopied gatewayRebindProgressPhase = "final_config_copied"
+	gatewayRebindProgressSuccessorIntent     gatewayRebindProgressPhase = "successor_intent"
+	gatewayRebindProgressStageIntent         gatewayRebindProgressPhase = "stage_intent"
+	gatewayRebindProgressStageConfigIntent   gatewayRebindProgressPhase = "stage_config_intent"
+	gatewayRebindProgressStageConfigCopied   gatewayRebindProgressPhase = "stage_config_copied"
+	gatewayRebindProgressStageStartIntent    gatewayRebindProgressPhase = "stage_start_intent"
+	gatewayRebindProgressStageServing        gatewayRebindProgressPhase = "stage_serving"
+	gatewayRebindProgressFinalConfigIntent   gatewayRebindProgressPhase = "final_config_intent"
+	gatewayRebindProgressFinalConfigCopied   gatewayRebindProgressPhase = "final_config_copied"
+	gatewayRebindProgressFinalHandoverIntent gatewayRebindProgressPhase = "final_handover_intent"
+	gatewayRebindProgressFinalContainerBound gatewayRebindProgressPhase = "final_container_bound"
+	gatewayRebindProgressCutoverIntent       gatewayRebindProgressPhase = "cutover_intent"
+	gatewayRebindProgressSuccessorServing    gatewayRebindProgressPhase = "successor_serving"
+	gatewayRebindProgressHandoverCommitted   gatewayRebindProgressPhase = "handover_committed"
+	gatewayRebindProgressRollbackIntent      gatewayRebindProgressPhase = "rollback_intent"
+	gatewayRebindProgressHandoverRolledBack  gatewayRebindProgressPhase = "handover_rolled_back"
 )
 
 // gatewayRebindProgressRecord is immutable history for the initial rebind.
@@ -53,6 +60,10 @@ type gatewayRebindProgressRecord struct {
 	PreviousDigest        string                     `json:"previousDigest,omitempty"`
 	Stage                 *gatewayRebindStageIntent  `json:"stage,omitempty"`
 	Digest                string                     `json:"digest"`
+	// Handover is appended after Digest so records one through twelve retain
+	// their exact canonical JSON bytes and digests. It is populated only by the
+	// private final-handover state machine.
+	Handover *gatewayRebindFinalHandoverProgress `json:"handover,omitempty"`
 }
 
 // gatewayRebindStageIntent keeps the approved Caddy content digest distinct
@@ -636,7 +647,8 @@ func gatewayRebindProgressDigest(value gatewayRebindProgressRecord) (string, err
 func validGatewayRebindProgressRecord(value gatewayRebindProgressRecord) bool {
 	if value.Version != gatewayRebindProgressVersion || value.Generation == 0 || value.Generation == math.MaxUint64 ||
 		!validCanonicalUUID(value.OperationID) || value.Sequence == 0 || value.Sequence > gatewayRebindProgressMaximumSequence ||
-		!validSHA256(value.ProtectedIntentDigest) || !validSHA256(value.Digest) {
+		!validSHA256(value.ProtectedIntentDigest) || !validSHA256(value.Digest) ||
+		(value.Sequence <= 12 && value.Handover != nil) {
 		return false
 	}
 	_, expectedPurpose := gatewayRebindProgressName(value.Generation, value.OperationID, value.Sequence)
@@ -684,6 +696,16 @@ func validGatewayRebindProgressRecord(value gatewayRebindProgressRecord) bool {
 	case gatewayRebindProgressFinalConfigCopied:
 		if value.Sequence != 12 || !validSHA256(value.PreviousDigest) || value.Stage == nil ||
 			!validGatewayRebindStageIntent(*value.Stage) {
+			return false
+		}
+	case gatewayRebindProgressFinalHandoverIntent, gatewayRebindProgressFinalContainerBound,
+		gatewayRebindProgressCutoverIntent, gatewayRebindProgressSuccessorServing,
+		gatewayRebindProgressHandoverCommitted, gatewayRebindProgressRollbackIntent,
+		gatewayRebindProgressHandoverRolledBack:
+		if value.Sequence < 13 || value.Sequence > gatewayRebindProgressMaximumSequence ||
+			!validSHA256(value.PreviousDigest) || value.Stage == nil ||
+			!validGatewayRebindStageIntent(*value.Stage) || value.Handover == nil ||
+			!validGatewayRebindFinalHandoverProgressValue(*value.Handover) {
 			return false
 		}
 	default:
@@ -858,7 +880,8 @@ func gatewayRebindProgressInstallPermitted(history gatewayRebindProtectedIntentH
 		}
 		if existing.Sequence == value.Sequence {
 			if !gatewayRebindProgressMatchesIntent(value, history.Intents[0].Intent, previous) ||
-				!gatewayRebindProgressMatchesPredecessor(history, value) {
+				!gatewayRebindProgressMatchesPredecessor(history, value) ||
+				!gatewayRebindProgressMatchesHandoverContext(history, value) {
 				return false
 			}
 			return reflect.DeepEqual(existing.Record, value)
@@ -869,13 +892,32 @@ func gatewayRebindProgressInstallPermitted(history gatewayRebindProtectedIntentH
 	}
 	return value.Sequence == uint64(len(history.Progress)+1) &&
 		gatewayRebindProgressMatchesIntent(value, history.Intents[0].Intent, previous) &&
-		gatewayRebindProgressMatchesPredecessor(history, value)
+		gatewayRebindProgressMatchesPredecessor(history, value) &&
+		gatewayRebindProgressMatchesHandoverContext(history, value)
+}
+
+func gatewayRebindProgressMatchesHandoverContext(history gatewayRebindProtectedIntentHistory,
+	value gatewayRebindProgressRecord,
+) bool {
+	if value.Sequence <= 12 {
+		return true
+	}
+	if len(history.Intents) != 1 || len(history.Progress) < 12 ||
+		history.Progress[11].Record.Sequence != 12 || value.Handover == nil || value.Handover.Plan == nil {
+		return false
+	}
+	contextValue := gatewayRebindFinalHandoverContext{
+		Intent: history.Intents[0].Intent, SequenceTwelve: history.Progress[11].Record,
+		Predecessor: history.Predecessor, Source: history.Source, Phase: value.Phase,
+		Plan: value.Handover.Plan, Final: value.Handover.Final,
+	}
+	return validGatewayRebindFinalHandoverProgressContext(contextValue, value)
 }
 
 func gatewayRebindProgressMatchesPredecessor(history gatewayRebindProtectedIntentHistory,
 	value gatewayRebindProgressRecord,
 ) bool {
-	if value.Sequence != 11 && value.Sequence != 12 {
+	if value.Sequence < 11 {
 		return true
 	}
 	return value.Stage != nil && value.Stage.FinalConfigIntent != nil &&
@@ -917,7 +959,7 @@ func scanGatewayRebindProgressForIntent(dataRoot string, intent gatewayRebindPro
 		}
 		value, err := store.load()
 		if err != nil || !gatewayRebindProgressMatchesIntent(value, intent, result) ||
-			((value.Sequence == 11 || value.Sequence == 12) && (value.Stage == nil || value.Stage.FinalConfigIntent == nil ||
+			(value.Sequence >= 11 && (value.Stage == nil || value.Stage.FinalConfigIntent == nil ||
 				!gatewayRebindFinalConfigRoutePlanMatchesPredecessor(intent, predecessor,
 					value.Stage.FinalConfigIntent.RoutePlan))) {
 			return nil, errors.New("generated ingress rebind progress history is invalid")
@@ -1144,12 +1186,13 @@ func gatewayRebindProgressMatchesIntent(value gatewayRebindProgressRecord, inten
 		currentAt, currentErr := parseGatewayRebindProgressTime(value.OccurredAt)
 		return err == nil && currentErr == nil && currentAt.After(previousAt)
 	default:
-		return false
+		return value.Sequence >= 13 &&
+			gatewayRebindFinalHandoverProgressMatchesIntent(value, intent, previous)
 	}
 }
 
 func gatewayRebindProgressMaxBytes(sequence uint64) int {
-	if sequence == 11 || sequence == 12 {
+	if sequence >= 11 && sequence <= gatewayRebindProgressMaximumSequence {
 		return maxGatewayRebindFinalConfigProgressBytes
 	}
 	return maxGatewayRebindProgressBytes

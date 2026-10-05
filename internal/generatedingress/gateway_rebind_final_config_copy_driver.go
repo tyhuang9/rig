@@ -148,6 +148,7 @@ func gatewayRebindFinalConfigDriverContentsMatch(intent gatewayRebindProtectedIn
 
 // Require the complete bounded /config inventory. The raw offsets around Next
 // reject metadata records that archive/tar otherwise consumes transparently.
+// Permit at most one exact empty caddy/ directory from the pinned image.
 // The existing stage-only parser remains unchanged and rejects active.json.
 func gatewayRebindExactFinalConfigVolumeArchive(value, expectedStage, expectedActive []byte) (gatewayRebindFinalConfigInventory, error) {
 	const blockSize = 512
@@ -165,7 +166,7 @@ func gatewayRebindExactFinalConfigVolumeArchive(value, expectedStage, expectedAc
 		return 0, invalid
 	}
 	offset := blockSize
-	seenStage, seenActive := false, false
+	seenStage, seenActive, seenSeed := false, false, false
 	for {
 		entry, err := reader.Next()
 		if err == io.EOF {
@@ -177,8 +178,18 @@ func gatewayRebindExactFinalConfigVolumeArchive(value, expectedStage, expectedAc
 			}
 			return gatewayRebindFinalConfigInventoryStageOnly, nil
 		}
-		if err != nil || entry == nil || len(value)-source.Len() != offset+blockSize ||
-			entry.Typeflag != tar.TypeReg || entry.Linkname != "" {
+		if err != nil || entry == nil || len(value)-source.Len() != offset+blockSize {
+			return 0, invalid
+		}
+		if validGatewayRebindPinnedImageConfigDirectory(entry) {
+			if seenSeed {
+				return 0, invalid
+			}
+			seenSeed = true
+			offset += blockSize
+			continue
+		}
+		if entry.Typeflag != tar.TypeReg || entry.Linkname != "" {
 			return 0, invalid
 		}
 		var expected []byte

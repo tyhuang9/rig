@@ -16,6 +16,84 @@ env:
   GOTOOLCHAIN: local
 
 jobs:
+  rebind-final-handover-live:
+    name: Rebind private final handover (${{ matrix.test }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - TestLiveGatewayRebindFinalHandoverCommitAndRestart
+          - TestLiveGatewayRebindFinalHandoverRollbackAndRestart
+    steps:
+      - name: Check out source
+        timeout-minutes: 2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        timeout-minutes: 3
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Record local Docker and disposable host-network prerequisites
+        timeout-minutes: 1
+        run: |
+          docker version --format 'Docker CLI={{.Client.Version}} Engine={{.Server.Version}} API={{.Server.APIVersion}}'
+          ip -Version
+          sudo -n true
+
+      - name: Prove two-address handover and actual controller process recovery
+        timeout-minutes: 36
+        shell: bash
+        env:
+          RIG_RUN_LIVE_GATEWAY_V2: "1"
+          RIG_RUN_LIVE_GATEWAY_REBIND_HANDOVER: "1"
+          TEST_NAME: ${{ matrix.test }}
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          package_name='github.com/hostd/hostd/internal/generatedingress'
+          go test -json -v -count=1 -timeout=35m ./internal/generatedingress -run "^${TEST_NAME}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$TEST_NAME" \
+            'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' \
+            "$output" > /dev/null
+          if jq -e --arg package_name "$package_name" --arg test_name "$TEST_NAME" \
+            'select(.Action == "skip" and .Package == $package_name and .Test == $test_name)' \
+            "$output" > /dev/null; then
+            printf 'Required live Docker test skipped: %s\n' "$TEST_NAME" >&2
+            exit 1
+          fi
+
+      - name: Require complete handover fixture cleanup
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          containers="$(docker ps --all --filter label=io.rig.managed --format '{{.ID}} {{.Names}} {{.Status}}')"
+          networks="$(docker network ls --filter label=io.rig.managed --format '{{.ID}} {{.Name}}')"
+          volumes="$(docker volume ls --filter label=io.rig.managed --format '{{.Name}}')"
+          images="$(docker image ls --filter label=io.rig.managed=generated-image --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
+          named_networks="$(docker network ls --filter name=rig-generated-caddy-ingress-v2-g --format '{{.ID}} {{.Name}}')"
+          named_config_volumes="$(docker volume ls --filter name=rig-generated-caddy-config-v2-g --format '{{.Name}}')"
+          named_data_volumes="$(docker volume ls --filter name=rig-generated-caddy-data-v2-g --format '{{.Name}}')"
+          named_containers="$(docker ps --all --filter name=rig-generated-caddy-v2- --format '{{.ID}} {{.Names}} {{.Status}}')"
+          builders="$(docker ps --all --filter name=rig-gateway-v2-live-builder- --format '{{.ID}} {{.Names}} {{.Status}}')"
+          builder_networks="$(docker network ls --filter name=rig-gateway-v2-live-builder- --format '{{.ID}} {{.Name}}')"
+          adapters="$(ip -json -details link show | jq -r '.[] | select((.ifname | startswith("righ")) or ((.ifalias // "") | startswith("rig-final-handover:"))) | .ifname')"
+          if [[ -n "$containers" || -n "$networks" || -n "$volumes" || -n "$images" || -n "$named_networks" || -n "$named_config_volumes" || -n "$named_data_volumes" || -n "$named_containers" || -n "$builders" || -n "$builder_networks" || -n "$adapters" ]]; then
+            printf 'Private handover live-test resources were not cleaned up.\n' >&2
+            printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+              "$containers" "$networks" "$volumes" "$images" "$named_networks" "$named_config_volumes" "$named_data_volumes" "$named_containers" "$builders" "$builder_networks" "$adapters" >&2
+            exit 1
+          fi
+
   gateway-v2-live:
     name: Gateway v2 upgrade, restart, and bind-conflict rollback
     runs-on: ubuntu-24.04

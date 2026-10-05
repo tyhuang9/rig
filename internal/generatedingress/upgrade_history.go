@@ -79,6 +79,7 @@ const (
 	gatewayHistoryAbort
 	gatewayHistoryRebindIntent
 	gatewayHistoryRebindProgress
+	gatewayHistoryRebindTerminal
 )
 
 type gatewayHistoryArtifact struct {
@@ -99,6 +100,7 @@ type gatewayRebindHistoryGeneration struct {
 	operationID string
 	intent      gatewayHistoryArtifact
 	progress    map[uint64]gatewayHistoryArtifact
+	terminal    gatewayHistoryArtifact
 }
 
 type gatewayHistorySnapshot struct {
@@ -647,7 +649,8 @@ func readGatewayHistorySnapshotMode(store *stateStore, allowRebind bool) (gatewa
 		if !relevant {
 			continue
 		}
-		if (kind == gatewayHistoryRebindIntent || kind == gatewayHistoryRebindProgress) && !allowRebind {
+		if (kind == gatewayHistoryRebindIntent || kind == gatewayHistoryRebindProgress ||
+			kind == gatewayHistoryRebindTerminal) && !allowRebind {
 			return gatewayHistorySnapshot{}, errors.New("generated ingress rebind history requires a rebind-aware scanner")
 		}
 		path := filepath.Join(store.root, entry.Name())
@@ -659,15 +662,19 @@ func readGatewayHistorySnapshotMode(store *stateStore, allowRebind bool) (gatewa
 			return gatewayHistorySnapshot{}, readErr
 		}
 		artifact := gatewayHistoryArtifact{path: path}
-		if kind == gatewayHistoryRebindIntent || kind == gatewayHistoryRebindProgress {
+		if kind == gatewayHistoryRebindIntent || kind == gatewayHistoryRebindProgress ||
+			kind == gatewayHistoryRebindTerminal {
 			artifacts := snapshot.rebindIntents[generation]
 			if (artifacts.operationID != "" && artifacts.operationID != operationID) ||
-				(kind == gatewayHistoryRebindIntent && artifacts.intent.path != "") {
-				return gatewayHistorySnapshot{}, errors.New("generated ingress rebind generation has duplicate intents")
+				(kind == gatewayHistoryRebindIntent && artifacts.intent.path != "") ||
+				(kind == gatewayHistoryRebindTerminal && artifacts.terminal.path != "") {
+				return gatewayHistorySnapshot{}, errors.New("generated ingress rebind generation has conflicting artifacts")
 			}
 			artifacts.generation, artifacts.operationID = generation, operationID
 			if kind == gatewayHistoryRebindIntent {
 				artifacts.intent = artifact
+			} else if kind == gatewayHistoryRebindTerminal {
+				artifacts.terminal = artifact
 			} else {
 				if artifacts.progress == nil {
 					artifacts.progress = make(map[uint64]gatewayHistoryArtifact)
@@ -850,6 +857,22 @@ func parseGatewayHistoryArtifactName(name string) (uint64, string, uint64, gatew
 			return 0, "", 0, 0, true, errors.New("generated ingress rebind history sequence is invalid")
 		}
 		return generation, parts[1], sequence, gatewayHistoryRebindProgress, true, nil
+	}
+	if strings.HasPrefix(lowerName, gatewayRebindFinalHandoverTerminalFilenamePrefix) {
+		if !strings.HasPrefix(name, gatewayRebindFinalHandoverTerminalFilenamePrefix) {
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind terminal filename is invalid")
+		}
+		tail := strings.TrimSuffix(strings.TrimPrefix(name, gatewayRebindFinalHandoverTerminalFilenamePrefix), ".bundle")
+		parts := strings.Split(tail, ".")
+		if !strings.HasSuffix(name, ".bundle") || len(parts) != 2 ||
+			len(parts[0]) != gatewayV2GenerationDigits || !validCanonicalUUID(parts[1]) {
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind terminal filename is invalid")
+		}
+		generation, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil || generation == 0 || fmt.Sprintf("%0*d", gatewayV2GenerationDigits, generation) != parts[0] {
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind terminal generation is invalid")
+		}
+		return generation, parts[1], 0, gatewayHistoryRebindTerminal, true, nil
 	}
 	// Reserve the whole upgrade-history namespace. New terminal record types
 	// must be explicitly taught to this scanner before they can affect

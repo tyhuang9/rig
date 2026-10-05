@@ -382,17 +382,43 @@ The protected phases under `prepared` are, in order:
    no successor resource identity is claimed;
 2. `stage_intent`: intent to create or reuse only the exact bound successor
    infrastructure;
-3. `staged`: exact stage container serves the successor config while the
-   predecessor is not mutated;
-4. `cutover_intent`: durable authorization to start/promote the exact successor
-   final container and then stop only the receipt-bound exact predecessor final
-   container;
-5. `successor_serving`: exact successor final container and every roster route
+3. `staged`: the exact stage container proves the selected successor
+   publication with its challenge-and-404 configuration while the predecessor
+   is not mutated. The complete application configuration is separately pinned
+   and copied as an inactive file; this is not yet live application-route proof;
+4. `final_handover_intent`: durable authorization to stop and remove only the
+   bound stage, then create the exact stopped final container. Stage and final
+   share the successor ingress address, so the stage must be withdrawn before
+   final creation. The predecessor remains untouched;
+5. `final_container_bound`: the stopped final container's returned ID,
+   ownership, configuration and application-network identities have been
+   freshly proved and durably bound. A creation result whose ID was not
+   durably bound cannot be adopted through a later name or label lookup;
+6. `cutover_intent`: durable authorization to stop only the receipt-bound exact
+   predecessor final container, prove its withdrawal, then start the exact
+   successor final container. The final container takes over the predecessor's
+   loopback publication as well as serving the successor LAN address, so the
+   predecessor stop must precede final start;
+7. `successor_serving`: exact successor final container and every roster route
    are proved on the approved successor address; the exact predecessor final
    container is proved stopped and stable inventory shows no effective old Rig
    bind for the predecessor address/port range;
-6. `committed`: exact resource identities and topology are terminal and a
+8. `committed`: exact resource identities and topology are terminal and a
    create-only commit receipt may be installed.
+
+The final-handover implementation keeps these protected phases separate from
+SQLite state. Its terminal commit or abort receipt leaves SQLite `prepared`,
+the existing fence active, and the original protected predecessor current.
+Receipt discovery must not synthesize a migration-026 journal, advance the
+predecessor selection, or permit another rebind intent. The later cross-store
+writer and resolver require the real immutable `database_committed` event
+before selecting the successor as current.
+
+After a protected terminal commit phase, this unit permits only exact receipt
+installation or reattestation; it does not choose rollback or install a
+conflicting abort receipt. Before that phase, a durable rollback intent fixes
+the recovery direction. Each rollback effect requires fresh exact ownership
+and physical proof, and a terminal abort requires complete successor absence.
 
 Before `cutover_intent`, compensation removes only exact-owned successor
 resources and leaves the predecessor untouched. After `cutover_intent`, an
