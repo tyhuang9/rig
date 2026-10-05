@@ -50,15 +50,34 @@ SQLite, cut over a route, provision a database, merge, or deploy.
 | Focused stage-start unit tests | Passed after the QA correction: `go test -p=1 -count=1 -timeout=10m -run '^TestGatewayRebindStageStart' ./internal/generatedingress` (`205.641s`). |
 | Workflow YAML | Passed with a temporary checker using the repository's `gopkg.in/yaml.v3` dependency; the `rebind-stage-start-live` job parsed and was present. Temporary checker removed. |
 | Physical Docker journeys | Not run locally. Docker CLI is installed, but the Windows host has no running Docker Engine. Hosted Linux Docker acceptance has not run. |
-| Prerequisite network-stage hosted gate | PASS at corrected code head `fd68ab8`: [named Docker test and always-run residue job 111619317032](https://github.com/tyhuang9/rig/actions/runs/37264835255/job/111619317032). The later row-25 evidence head `f1707e9` also passed its [named test without a skip and cleanup job 111620115206](https://github.com/tyhuang9/rig/actions/runs/37265095730/job/111620115206) in 46.06s. The current CI-budget head `6023a0f` is rerunning hosted checks. These jobs establish only the private network effect, not this stage-start gate. |
+| Prerequisite network-stage hosted gate | PASS at corrected code head `fd68ab8`: [named Docker test and always-run residue job 111619317032](https://github.com/tyhuang9/rig/actions/runs/37264835255/job/111619317032). The later row-25 evidence head `f1707e9` also passed its [named test without a skip and cleanup job 111620115206](https://github.com/tyhuang9/rig/actions/runs/37265095730/job/111620115206) in 46.06s. The later `6023a0f` named network test and cleanup also passed. These jobs establish only the private network effect, not this stage-start gate. |
 | Generated-ingress package tests | Passed: `go test -p=1 -count=1 -timeout=20m ./internal/generatedingress` (`648.529s`). This run began before a small assertion was added to the live test, which skips locally; final-source live-tag compilation and named-test discovery passed afterward. |
 | Vet and build | Passed on post-route-integration head `6305bdc`: `go vet ./...` and `go build -buildvcs=false ./...`. |
 | Documentation build | Passed on post-route-integration source: `pnpm --dir docs build` with normal Windows filesystem access. The restricted sandbox attempt on the earlier source could not read an installed Vite package; the lockfile install itself was unchanged. |
 | Earlier full Go suite | Passed on pre-route-correction head `6c24322`: `go test -p=1 -count=1 -timeout=20m ./...` (`internal/generatedingress` 630.723s). The first restricted-sandbox attempt failed on local Go-cache/private-directory access before it established a code result. This earlier pass does not verify the newly integrated Linux route matcher. |
 | Post-route-integration full Go suite | PASS on code head `6305bdc` with the corrected row-25 ancestor: `go test -p=1 -count=1 -timeout=20m ./...` passed every package; `internal/generatedingress` completed in 629.512s. This is local fake/passive and unit evidence, not the three physical Docker journeys. |
 | Later integrated row-25 correction | After the additive merges through `f1707e9`, the focused exact-mount comparator tests, Docker-tagged compilation, and docs build passed locally. The late parity source also passed the full Go suite in row 25 (`internal/generatedingress` 192.522s). The row-37 full suite was not repeated for this live-test-only and documentation correction. |
-| Inherited race-budget correction | Row 25's generated-runtime race package hit the 24-minute Go limit at `f1707e9` without a race report; row 24's repository-wide Linux race job was cancelled at its 60-minute job ceiling. Head `6023a0f` expands only the measured Go, step, and job limits while retaining the same race tests and assertions. Hosted reruns are pending; this local row-37 gate has no Linux race pass of its own. |
+| Inherited race-budget correction | Row 25's generated-runtime race package hit the 24-minute Go limit at `f1707e9` without a race report; row 24's repository-wide Linux race job was cancelled at its 60-minute job ceiling. Head `6023a0f` expands only the measured Go, step, and job limits while retaining the same race tests and assertions. At `6023a0f`, repository-wide Linux race passed while the dedicated ingress race job hit its 32-minute limit; this local row-37 gate has no Linux race pass of its own. See the inherited partition correction below. |
 | Formatting and diff | The original row-37 changed Go files had no `gofmt -l` output. On the post-route-integration branch, `git diff --check 1e2bcd6..HEAD` and the final working-tree `git diff --check` passed. The route-correction Go files were gofmt-checked in row 25 before integration. |
+
+## Inherited CI partition correction
+
+Rows 26–37 contain row 25's additive `9ad7f78` correction. At the prior
+`6023a0f` head, the network-stage Docker test and cleanup passed, and the
+repository-wide Linux race job passed; the dedicated ingress race package
+still hit its 32-minute timeout. The dedicated job now partitions ingress
+tests with complementary `^TestGatewayV2` run/skip filters and runs the other
+eight packages unfiltered. Its stable aggregate check requires all three
+matrix batches to succeed. No tests or production checks were removed.
+
+Row 25 locally verified all 453 discovered ingress tests ran exactly once
+across its two partitions (445 passed, eight existing environment-gated tests
+skipped). The other eight packages, all 502 frontend tests, frontend build,
+workflow parsing/Bash syntax, and docs build passed. These are row-25 local
+results; this longer row-37 test set and its physical Docker journeys still
+require hosted acceptance after publication. The new hosted checks at
+`9ad7f78` are running. The local stack remains unpublished pending separate
+authorization.
 
 ## Remaining gates and rollback
 

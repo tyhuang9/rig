@@ -75,8 +75,16 @@ The [evidence-head job](https://github.com/tyhuang9/rig/actions/runs/37265095730
 also passed both in 46.06 seconds at `f1707e9`. The race package passed at
 `a5b4d10` in 1116.225 seconds, then timed out at the 24-minute Go limit on
 `f1707e9` without a race report. The parent repository-wide race job was
-cancelled at its 60-minute job ceiling. CI budgets are now expanded without
-changing test coverage; hosted race verification at `6023a0f` remains open.
+cancelled at its 60-minute job ceiling. At `6023a0f`, the named network-stage
+test and cleanup passed, and repository-wide Linux race verification passed;
+the dedicated ingress race package still hit its 32-minute timeout. Rows
+26–37 now contain the additive correction from `9ad7f78`: an exhaustive
+three-batch race matrix with a stable aggregate check, and a bounded wait for
+the frontend status-focus effect. Row 25 locally passed all 502 frontend
+tests, its production build, both ingress partitions (453 tests discovered
+and run exactly once), the other eight runtime packages, and docs build.
+The hosted checks on `9ad7f78` are running. These local branches remain
+unpublished pending separate authorization.
 Rows 26 and 27 passed their final-source Go suites,
 vet, builds, and relevant focused checks before this network-route correction
 was integrated. Row 28 passed its original final-source Go suite, vet, build,
