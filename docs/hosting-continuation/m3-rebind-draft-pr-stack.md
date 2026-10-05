@@ -50,37 +50,28 @@ is claimed. No draft publication authorizes merge or deployment.
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
 502 web tests, web production build, and hostd build. Later rows record their
-own exact local checks and limitations in their evidence files. Row 25 passed
-the final-source Go suite, vet, web tests and build, and Docker-tagged compile;
-its live Docker test only compiled and skipped locally. Rows 26 and 27 passed
-their final-source Go suites, vet, builds, and relevant focused checks; row 27's
-live test also only compiled and skipped locally. Row 28 passed its final-source
-Go suite, vet, build, and Docker-tagged compile. Row 29 passed its final-source
-Go suite, vet, build, and Docker-tagged compile; its live test only compiled
-and skipped locally. PR #97's hosted checks passed at its published head.
-Row 30 passed its final-source Go suite, vet, build, Docker-tagged compile,
-focused progress and stage-container tests, formatting, and diff checks. Row
-31 passed its final-source Go suite, vet, build, Docker-tagged compile,
-formatting, and diff checks; its live test only compiled and skipped locally.
-Row 32 passed its final-source Go suite, vet, build, Docker-tagged compile,
-focused intent tests, formatting, and diff checks. Row 33 passed its
-final-source Go suite, vet, build, Docker-tagged compile, focused copy tests,
-formatting, and diff checks. Row 34 passed the full Go suite with packages
-serialized, vet, build, Docker-tagged compile, focused copy tests, formatting,
-and diff checks; its two live tests only compiled and skipped locally. Two
-parallel full-suite runs of row 34 failed in an unchanged Windows relay TCP
-test, which passed in isolation and in the serialized full suite. Row 34's
-evidence file records the exact results. Row 35 passed its focused sequence-nine
-tests, final-source serialized full Go suite, vet, build, Docker-tagged compile,
-formatting, and diff checks. Its evidence file records the exact results and
-the absent hosted physical proof. Row 36 adds guarded sequence-ten serving
-proof with direct-start, lost-acknowledgment, replay, drift, and compensation
-tests; its scoped evidence file records local checks and the absent hosted
-Docker acceptance. It remains local and unpublished.
-The Docker gates in rows 14, 16, and 25 have published drafts, but acceptance
-requires passing hosted execution at the relevant head. The Docker gates in
-rows 27, 29, 31, and 34 remain local and require separate publication approval
-and hosted execution before they can count as acceptance evidence.
+own exact local checks and limitations in their evidence files. The table's
+commit column identifies each original branch slice; subsequent corrective
+commits remain in the same branches. Row 25's integrated route correction
+passed the serialized full Go suite, vet, build, Docker-tagged compilation,
+and docs build. Earlier web typecheck, 502 tests, and production build passed
+before the Go-only correction. PR #97's hosted checks passed at its published
+head. The first four hosted row-25 Docker attempts failed and remain in the
+row-25 evidence file. The [fifth hosted network-stage job](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391)
+passed the required named live test at code head `ad8d3e2` in 54.89 seconds,
+and its always-run residue step passed. This establishes the private network
+stage on that hosted runner. Rows 26 and 27 passed their final-source Go suites,
+vet, builds, and relevant focused checks before this network-route correction
+was integrated. Row 28 passed its original final-source Go suite, vet, build,
+and Docker-tagged compile. Row 27's live test compiled and skipped locally;
+its hosted Docker acceptance remains open. Row 29 passed its original
+final-source Go suite, vet, build, and Docker-tagged compile; its live test
+compiled and skipped locally. Its hosted Docker acceptance remains open.
+Row 30 passed its original final-source Go suite, vet, build, Docker-tagged compile, focused progress and stage-container tests, formatting, and diff checks. Its hosted stopped-container Docker gate remains open.
+Row 31 passed its original final-source Go suite, vet, build, Docker-tagged compile, formatting, and diff checks. Its live test compiled and skipped locally; hosted Docker acceptance remains open.
+Row 34 passed its original serialized full Go suite, vet, build, Docker-tagged compile, and focused copy tests. Its two live tests compiled and skipped locally; hosted Docker acceptance remains open.
+Row 35 passed its original focused intent tests, serialized full Go suite, vet, build, and Docker-tagged compile. It records start intent without starting Docker or publishing a listener.
+Row 36 adds guarded sequence-ten serving proof with direct-start, lost-acknowledgment, replay, drift, and compensation tests. Its scoped evidence records local checks; hosted Docker acceptance remains open.
 
 These branches do not add a public rebind controller caller, terminal protected
 receipt, successor cutover, transfer-aware readers, recovery, or fence release.
