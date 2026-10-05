@@ -3,7 +3,7 @@
 Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
 draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
 row's branch descends from the preceding row's branch and targets it with one
-review scope. Rows 26–28 remain local and require separate publication
+review scope. Rows 26–29 remain local and require separate publication
 approval. The first two hosted row-25 network Docker attempts failed; the
 corrected head's required job is queued, so no hosted network-stage acceptance
 is claimed. No draft publication authorizes merge or deployment.
@@ -38,6 +38,7 @@ is claimed. No draft publication authorizes merge or deployment.
 | 26 | `feature/hosting-m3-rebind-config-volume-stage` | `307c8f3` | Private successor config-volume Docker effect and protected sequence-four binding |
 | 27 | `feature/hosting-m3-rebind-config-volume-docker-gate` | `742124d` | Required hosted Docker test of the exact config-volume effect and replay |
 | 28 | `feature/hosting-m3-rebind-data-volume-stage` | `9ccf6a9` | Private successor Caddy `/data` volume effect and protected sequence-five binding |
+| 29 | `feature/hosting-m3-rebind-data-volume-docker-gate` | `fcc7b72` | Required hosted Docker test of the exact data-volume effect and fresh-Manager replay |
 
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
@@ -56,7 +57,9 @@ stage on that hosted runner. Rows 26 and 27 passed their final-source Go suites,
 vet, builds, and relevant focused checks before this network-route correction
 was integrated. Row 28 passed its original final-source Go suite, vet, build,
 and Docker-tagged compile. Row 27's live test compiled and skipped locally;
-its hosted Docker acceptance remains open.
+its hosted Docker acceptance remains open. Row 29 passed its original
+final-source Go suite, vet, build, and Docker-tagged compile; its live test
+compiled and skipped locally. Its hosted Docker acceptance remains open.
 
 These branches do not add a public rebind controller caller, terminal protected
 receipt, successor cutover, transfer-aware readers, recovery, or fence release.

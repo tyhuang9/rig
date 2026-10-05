@@ -293,3 +293,68 @@ jobs:
               "$containers" "$networks" "$volumes" "$images" "$named_networks" "$named_volumes" >&2
             exit 1
           fi
+
+  rebind-data-volume-stage-live:
+    name: Rebind successor data volume stage in Docker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        timeout-minutes: 2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        timeout-minutes: 3
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Record hosted Docker versions
+        timeout-minutes: 1
+        run: |
+          docker version --format 'Docker CLI={{.Client.Version}} Engine={{.Server.Version}} API={{.Server.APIVersion}}'
+
+      - name: Stage exact successor data volume and prove replay
+        timeout-minutes: 26
+        shell: bash
+        env:
+          RIG_RUN_LIVE_GATEWAY_V2: "1"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          package_name='github.com/hostd/hostd/internal/generatedingress'
+          test_name='TestLiveGatewayRebindSuccessorDataVolumeStage'
+          go test -json -v -count=1 -timeout=25m ./internal/generatedingress -run "^${test_name}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" \
+            'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' \
+            "$output" > /dev/null
+          if jq -e --arg package_name "$package_name" --arg test_name "$test_name" \
+            'select(.Action == "skip" and .Package == $package_name and .Test == $test_name)' \
+            "$output" > /dev/null; then
+            printf 'Required live Docker test skipped: %s\n' "$test_name" >&2
+            exit 1
+          fi
+
+      - name: Require complete rebind data-volume cleanup
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          containers="$(docker ps --all --filter label=io.rig.managed --format '{{.ID}} {{.Names}} {{.Status}}')"
+          networks="$(docker network ls --filter label=io.rig.managed --format '{{.ID}} {{.Name}}')"
+          volumes="$(docker volume ls --filter label=io.rig.managed --format '{{.Name}}')"
+          images="$(docker image ls --filter label=io.rig.managed=generated-image --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
+          named_networks="$(docker network ls --filter name=rig-generated-caddy-ingress-v2-g --format '{{.ID}} {{.Name}}')"
+          named_config_volumes="$(docker volume ls --filter name=rig-generated-caddy-config-v2-g --format '{{.Name}}')"
+          named_data_volumes="$(docker volume ls --filter name=rig-generated-caddy-data-v2-g --format '{{.Name}}')"
+          if [[ -n "$containers" || -n "$networks" || -n "$volumes" || -n "$images" || -n "$named_networks" || -n "$named_config_volumes" || -n "$named_data_volumes" ]]; then
+            printf 'Rebind data-volume live-test resources were not cleaned up.\n' >&2
+            printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+              "$containers" "$networks" "$volumes" "$images" "$named_networks" "$named_config_volumes" "$named_data_volumes" >&2
+            exit 1
+          fi
