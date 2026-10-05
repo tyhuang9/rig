@@ -49,7 +49,7 @@ test and any remaining managed Docker resources or successor network name.
 | `go build -buildvcs=false ./...` | PASS on the integrated source. Plain `go build ./...` could not obtain VCS status from this local worktree (exit 128), before compilation. |
 | `go test -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress` | PASS compilation on the integrated source; no physical Docker test executed. |
 | `pnpm --dir docs build`, `gofmt`, and `git diff --check` | PASS on the integrated source; no format or whitespace defects. |
-| Hosted Linux Docker live test and cleanup gate | FAILED on four hosted runs; see the attempts below. The local Docker daemon is unavailable. |
+| Hosted Linux Docker live test and cleanup gate | PASS at code head `ad8d3e2`: the named test emitted a pass event in 54.89s and the always-run residue step succeeded in [job 111606812391](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391). Four earlier attempts failed; see below. The local Docker daemon is unavailable. |
 | Physical second-device LAN/address-change proof | Not run; outside this gate. |
 
 The focused fake stage suite failed inside the restricted Windows sandbox
@@ -119,8 +119,25 @@ duplicate, and unrelated route changes, including failure before protected
 binding. The integrated source passed the serialized full Go suite, vet, Go
 build, Docker-tagged compilation, and docs build. Security, QA, and final
 integration review found no new binding or cleanup bypass. Hosted acceptance
-on the corrected pair remains pending; the required named live test and
-always-run residue step must both pass at the published head.
+on the corrected pair was established by the fifth hosted run below. This
+proves the tested network-stage and replay path on that runner, not later
+successor effects or physical LAN cutover.
+
+## Fifth hosted attempt: network-stage acceptance, 2026-10-05 UTC
+
+At immutable code head `ad8d3e2`, [hosted run 37260595415 and network-stage
+job 111606812391](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391)
+completed successfully. The required `TestLiveGatewayRebindSuccessorNetworkStage`
+emitted a JSON test `pass` event, with no skip, after 54.89 seconds. The
+workflow's always-run `Require complete rebind network cleanup` step also
+passed, finding no managed containers, networks, volumes, generated images, or
+named successor network residue. The prerequisite gateway-v2 Docker job passed
+in the same workflow. The test's production-reader assertions cover exact
+Docker network identity and bridge/IPAM, exact Linux host-route delta,
+protected sequence-three binding, unchanged predecessor state and SQLite
+claim, and replay without another create. This is acceptance evidence for the
+private successor-network stage only. The four earlier failed jobs remain
+recorded above as immutable failure history.
 
 ## Remaining work
 
