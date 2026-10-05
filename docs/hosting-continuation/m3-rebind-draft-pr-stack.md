@@ -4,11 +4,12 @@ Status: rows 1–25 were published as stacked draft PRs #98–#122 on 2026-10-04
 with the user's explicit approval. The published base is draft PR #97,
 `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each row's branch
 descends from the preceding row's branch and targets it with one review scope.
-Rows 26–35 remain local and unpublished. Row 15 includes the initial version
-of this plan after its scope commit; rows 25, 27, 28, 29, 30, 31, 34, and 35
-update it. The hosted row-25 network Docker gate was still queued at the last
-check, so no hosted acceptance is claimed for it. Rows 26–35 require separate
-publication approval after that gate passes. No draft publication authorizes
+Rows 26–36 remain local and unpublished. Row 15 includes the initial version
+of this plan after its scope commit; rows 25, 27, 28, 29, 30, 31, 34, 35,
+and 36 update it. The first hosted row-25 network Docker gate failed after
+network creation; its diagnostic rerun is queued, so no hosted acceptance is
+claimed for it. Rows 26–36 require separate publication approval after the
+prerequisite gate and local review. No draft publication authorizes
 merge or deployment.
 
 | Order | Branch | Scope commit | Review scope |
@@ -48,6 +49,7 @@ merge or deployment.
 | 33 | `feature/hosting-m3-rebind-stage-config-copy` | `0143b51` | Guarded sequence-eight exact config copy and protected readback receipt |
 | 34 | `feature/hosting-m3-rebind-stage-config-docker-gate` | `1ba86c0` | Required hosted Docker direct-copy and lost-acknowledgment adoption gates |
 | 35 | `feature/hosting-m3-rebind-stage-start-intent` | `3dfee6b` | Protected sequence-nine exact start intent; no Docker start or listener effect |
+| 36 | `feature/hosting-m3-rebind-stage-start` | `b455d42` | Guarded exact successor start and protected sequence-ten serving proof; local only |
 
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
@@ -75,8 +77,13 @@ test, which passed in isolation and in the serialized full suite. Row 34's
 evidence file records the exact results. Row 35 passed its focused sequence-nine
 tests, final-source serialized full Go suite, vet, build, Docker-tagged compile,
 formatting, and diff checks. Its evidence file records the exact results and
-the absent hosted physical proof.
-The Docker gates in rows 14, 16, 25, 27, 29, 31, and 34 require publication
+the absent hosted physical proof. Row 36 adds guarded sequence-ten serving
+proof with direct-start, lost-acknowledgment, replay, drift, and compensation
+tests; its scoped evidence file records local checks and the absent hosted
+Docker acceptance. It remains local and unpublished.
+The Docker gates in rows 14, 16, and 25 have published drafts, but acceptance
+requires passing hosted execution at the relevant head. The Docker gates in
+rows 27, 29, 31, and 34 remain local and require separate publication approval
 and hosted execution before they can count as acceptance evidence.
 
 These branches do not add a public rebind controller caller, terminal protected
