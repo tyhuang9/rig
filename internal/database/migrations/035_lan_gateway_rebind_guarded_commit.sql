@@ -125,6 +125,7 @@ DROP TRIGGER lan_gateway_rebind_allocation_transfer_insert_blocked;
 DROP TRIGGER lan_gateway_profile_upgrade_claim_pin_insert;
 DROP TRIGGER lan_gateway_profile_upgrade_claim_pin_head;
 DROP TRIGGER lan_gateway_profile_head_grant_fence;
+DROP TRIGGER lan_app_access_disable_claim_exact_owner_transition;
 
 DROP TRIGGER lan_gateway_rebind_fence_allocation_insert;
 DROP TRIGGER lan_gateway_rebind_fence_allocation_update;
@@ -144,6 +145,74 @@ DROP TRIGGER lan_gateway_rebind_fence_profile_head_delete;
 DROP TRIGGER lan_gateway_rebind_fence_runtime_head_update;
 DROP TRIGGER lan_gateway_rebind_fence_runtime_head_insert;
 DROP TRIGGER lan_gateway_rebind_fence_runtime_head_delete;
+
+-- Migration 029 compared the immutable raw grant profile directly with the
+-- current gateway head. A committed rebind deliberately advances that head
+-- while the allocation and grant keep their raw profile identity. Preserve
+-- the complete owner check and accept the current head only through a guarded,
+-- receipt-bound transfer for the exact source grant.
+CREATE TRIGGER lan_app_access_disable_claim_exact_owner_transition
+BEFORE UPDATE OF state ON lan_app_access_disable_claims
+WHEN NEW.state IN ('withdrawing','uncertain','committed') AND NOT EXISTS (
+    SELECT 1
+    FROM applications app
+    JOIN lan_app_access_heads ah ON ah.app_id=app.id
+    JOIN lan_app_access_revisions ar
+      ON ar.app_id=ah.app_id AND ar.id=ah.revision_id AND ar.revision_number=ah.revision_number
+    JOIN lan_port_allocations a ON a.id=ar.allocation_id AND a.app_id=ar.app_id
+    JOIN lan_gateway_profile_heads gh ON gh.singleton=1
+    JOIN lan_gateway_profile_revisions gr
+      ON gr.id=gh.revision_id AND gr.revision_number=gh.revision_number
+    WHERE app.id=NEW.app_id AND app.archived_at IS NULL
+      AND ar.id=NEW.access_revision_id AND ar.revision_number=NEW.access_revision_number
+      AND ar.operation_id=NEW.allocation_owner_operation_id
+      AND ar.allocation_id=NEW.allocation_id AND ar.allocated_port=NEW.allocated_port
+      AND a.owner_operation_id=NEW.allocation_owner_operation_id
+      AND a.owner_revision_id=NEW.access_revision_id AND a.port=NEW.allocated_port
+      AND a.gateway_profile_revision_id=NEW.gateway_profile_revision_id
+      AND a.gateway_profile_revision_number=NEW.gateway_profile_revision_number
+      AND a.released_at IS NULL AND a.disabled_at IS NULL
+      AND (
+        (gr.id=NEW.gateway_profile_revision_id
+         AND gr.revision_number=NEW.gateway_profile_revision_number)
+        OR EXISTS (
+          SELECT 1
+          FROM lan_gateway_rebind_allocation_transfers t
+          JOIN lan_gateway_rebind_claims c ON c.operation_id=t.operation_id
+          JOIN lan_gateway_rebind_claim_events e ON e.operation_id=c.operation_id
+            AND e.state='database_committed'
+          JOIN lan_gateway_rebind_transition_commands cmd ON cmd.operation_id=e.operation_id
+            AND cmd.sequence=e.sequence AND cmd.next_state='database_committed'
+          WHERE NEW.source_grant_attempt_id IS NOT NULL
+            AND t.app_id=NEW.app_id AND t.allocation_id=NEW.allocation_id
+            AND t.grant_attempt_id=NEW.source_grant_attempt_id
+            AND t.source_profile_revision_id=NEW.gateway_profile_revision_id
+            AND t.source_profile_revision_number=NEW.gateway_profile_revision_number
+            AND t.successor_profile_revision_id=gr.id
+            AND t.successor_profile_revision_number=gr.revision_number
+            AND t.successor_profile_spec_digest=gr.spec_digest
+            AND t.terminal_receipt_digest=cmd.terminal_receipt_digest
+            AND c.state IN ('database_committed','unresolved','committed')
+        )
+      )
+      AND (
+          (NEW.source_grant_attempt_id IS NULL AND NOT EXISTS (
+              SELECT 1 FROM lan_app_access_grant_claims g
+              WHERE g.app_id=NEW.app_id AND g.allocation_id=NEW.allocation_id
+                AND g.allocation_owner_operation_id=NEW.allocation_owner_operation_id
+                AND g.access_revision_id=NEW.access_revision_id
+                AND g.state='committed' AND g.retired_at IS NULL
+          )) OR EXISTS (
+              SELECT 1 FROM lan_app_access_grant_claims g
+              WHERE g.attempt_id=NEW.source_grant_attempt_id AND g.app_id=NEW.app_id
+                AND g.allocation_id=NEW.allocation_id
+                AND g.allocation_owner_operation_id=NEW.allocation_owner_operation_id
+                AND g.access_revision_id=NEW.access_revision_id
+                AND g.state='committed' AND g.retired_at IS NULL
+          )
+      )
+)
+BEGIN SELECT RAISE(ABORT, 'LAN application access disable owner changed before withdrawal'); END;
 
 CREATE TRIGGER lan_gateway_rebind_claim_v2_source_insert
 BEFORE INSERT ON lan_gateway_rebind_claims

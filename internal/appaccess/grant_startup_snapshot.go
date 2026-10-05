@@ -11,20 +11,25 @@ import (
 // with protected gateway state. Historical rolled-back attempts are included
 // so a protected binding can be matched by AttemptID and rejected precisely.
 type AppAccessGrantStartupClaim struct {
-	Claim                   AppAccessGrantClaim
-	Revision                AppAccessRevision
-	Allocation              Allocation
-	Profile                 GatewayProfileRevision
-	EffectiveProfile        GatewayProfileRevision
-	CurrentGatewaySource    GatewayCurrentAuthorityRef
-	TransferChain           []GatewayRebindAllocationTransfer
-	TransferChainTipDigest  string
-	TerminalReceiptDigest   string
-	AppArchived             bool
-	AccessHeadCurrent       bool
-	ProfileHeadCurrent      bool
-	ApproverIsAdministrator bool
-	DisableIntent           *AppAccessDisableIntent
+	Claim                          AppAccessGrantClaim
+	Revision                       AppAccessRevision
+	Allocation                     Allocation
+	Profile                        GatewayProfileRevision
+	EffectiveProfile               GatewayProfileRevision
+	CurrentGatewaySource           GatewayCurrentAuthorityRef
+	TransferChain                  []GatewayRebindAllocationTransfer
+	TransferChainTipDigest         string
+	TerminalReceiptDigest          string
+	RetainedEffectiveProfile       GatewayProfileRevision
+	RetainedGatewaySource          GatewayCurrentAuthorityRef
+	RetainedTransferChain          []GatewayRebindAllocationTransfer
+	RetainedTransferChainTipDigest string
+	RetainedTerminalReceiptDigest  string
+	AppArchived                    bool
+	AccessHeadCurrent              bool
+	ProfileHeadCurrent             bool
+	ApproverIsAdministrator        bool
+	DisableIntent                  *AppAccessDisableIntent
 }
 
 type AppAccessGrantStartupSnapshot struct {
@@ -188,7 +193,8 @@ func (r *Repository) readGatewayUpgradeStartupSnapshot(ctx context.Context, tx *
 		if err != nil {
 			return GatewayUpgradeStartupSnapshot{}, err
 		}
-		if claim.State != GatewayProfileUpgradeRolledBack {
+		if claim.State == GatewayProfileUpgradePrepared || claim.State == GatewayProfileUpgradeServing ||
+			claim.State == GatewayProfileUpgradeUnresolved {
 			activeClaims++
 			if activeClaims > 1 || current == nil || actorRole != "administrator" ||
 				current.ID != profile.ID || current.RevisionNumber != profile.RevisionNumber ||
@@ -266,20 +272,29 @@ func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID s
 		DisableIntent: disableIntent,
 	}
 	if claim.State == AppAccessGrantCommitted {
-		resolution, resolveErr := resolveGatewayBindingForConsumer(ctx, tx, GatewayBindingRef{
+		resolution, resolveErr := resolveGatewayBindingForStoredGrant(ctx, tx, GatewayBindingRef{
 			AppID: claim.Spec.AppID, AllocationID: claim.Spec.AllocationID,
 			AccessRevisionID: claim.Spec.AccessRevisionID, GrantAttemptID: claim.AttemptID,
-		}, profile)
+		}, profile, claim)
 		if resolveErr != nil || resolution.RawProfile.ID != profile.ID ||
 			resolution.RawProfile.RevisionNumber != profile.RevisionNumber ||
 			resolution.RawProfile.SpecDigest != profile.SpecDigest {
 			return AppAccessGrantStartupClaim{}, invalidRebindStoredState(resolveErr)
 		}
-		value.EffectiveProfile = resolution.EffectiveProfile
-		value.CurrentGatewaySource = resolution.CurrentGatewaySource
-		value.TransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
-		value.TransferChainTipDigest = resolution.TransferChainTipDigest
-		value.TerminalReceiptDigest = resolution.TerminalReceiptDigest
+		if claim.RetiredAt != nil && resolution.CurrentGatewaySource.Kind != "" {
+			value.EffectiveProfile = GatewayProfileRevision{}
+			value.RetainedEffectiveProfile = resolution.EffectiveProfile
+			value.RetainedGatewaySource = resolution.CurrentGatewaySource
+			value.RetainedTransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
+			value.RetainedTransferChainTipDigest = resolution.TransferChainTipDigest
+			value.RetainedTerminalReceiptDigest = resolution.TerminalReceiptDigest
+		} else if claim.RetiredAt == nil {
+			value.EffectiveProfile = resolution.EffectiveProfile
+			value.CurrentGatewaySource = resolution.CurrentGatewaySource
+			value.TransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
+			value.TransferChainTipDigest = resolution.TransferChainTipDigest
+			value.TerminalReceiptDigest = resolution.TerminalReceiptDigest
+		}
 	}
 	var archived sql.NullString
 	if err := tx.QueryRowContext(ctx, `SELECT archived_at FROM applications WHERE id=?`, claim.Spec.AppID).Scan(&archived); errors.Is(err, sql.ErrNoRows) {

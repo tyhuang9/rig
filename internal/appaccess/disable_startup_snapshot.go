@@ -7,22 +7,27 @@ import (
 )
 
 type AppAccessDisableStartupClaim struct {
-	Claim                   AppAccessDisableClaim
-	Revision                AppAccessRevision
-	Allocation              Allocation
-	Profile                 GatewayProfileRevision
-	EffectiveProfile        GatewayProfileRevision
-	CurrentGatewaySource    GatewayCurrentAuthorityRef
-	TransferChain           []GatewayRebindAllocationTransfer
-	TransferChainTipDigest  string
-	TerminalReceiptDigest   string
-	SourceGrant             *AppAccessGrantClaim
-	AppArchived             bool
-	AccessHeadCurrent       bool
-	ProfileHeadCurrent      bool
-	ApproverIsAdministrator bool
-	ProtectedClearAck       *AppAccessDisableProtectedClearAck
-	SuccessorAck            *AppAccessDisableSuccessorAck
+	Claim                          AppAccessDisableClaim
+	Revision                       AppAccessRevision
+	Allocation                     Allocation
+	Profile                        GatewayProfileRevision
+	EffectiveProfile               GatewayProfileRevision
+	CurrentGatewaySource           GatewayCurrentAuthorityRef
+	TransferChain                  []GatewayRebindAllocationTransfer
+	TransferChainTipDigest         string
+	TerminalReceiptDigest          string
+	RetainedEffectiveProfile       GatewayProfileRevision
+	RetainedGatewaySource          GatewayCurrentAuthorityRef
+	RetainedTransferChain          []GatewayRebindAllocationTransfer
+	RetainedTransferChainTipDigest string
+	RetainedTerminalReceiptDigest  string
+	SourceGrant                    *AppAccessGrantClaim
+	AppArchived                    bool
+	AccessHeadCurrent              bool
+	ProfileHeadCurrent             bool
+	ApproverIsAdministrator        bool
+	ProtectedClearAck              *AppAccessDisableProtectedClearAck
+	SuccessorAck                   *AppAccessDisableSuccessorAck
 }
 
 type AppAccessDisableStartupSnapshot struct {
@@ -119,20 +124,29 @@ func readAppAccessDisableStartupClaim(ctx context.Context, tx *sql.Tx, operation
 			return AppAccessDisableStartupClaim{}, ErrInvalidStoredState
 		}
 		value.SourceGrant = &grant
-		resolution, resolveErr := resolveGatewayBindingForConsumer(ctx, tx, GatewayBindingRef{
+		resolution, resolveErr := resolveGatewayBindingForStoredGrant(ctx, tx, GatewayBindingRef{
 			AppID: claim.Spec.AppID, AllocationID: claim.Spec.AllocationID,
 			AccessRevisionID: claim.Spec.AccessRevisionID, GrantAttemptID: grant.AttemptID,
-		}, profile)
+		}, profile, grant)
 		if resolveErr != nil || resolution.RawProfile.ID != profile.ID ||
 			resolution.RawProfile.RevisionNumber != profile.RevisionNumber ||
 			resolution.RawProfile.SpecDigest != profile.SpecDigest {
 			return AppAccessDisableStartupClaim{}, invalidRebindStoredState(resolveErr)
 		}
-		value.EffectiveProfile = resolution.EffectiveProfile
-		value.CurrentGatewaySource = resolution.CurrentGatewaySource
-		value.TransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
-		value.TransferChainTipDigest = resolution.TransferChainTipDigest
-		value.TerminalReceiptDigest = resolution.TerminalReceiptDigest
+		if grant.RetiredAt != nil && resolution.CurrentGatewaySource.Kind != "" {
+			value.EffectiveProfile = GatewayProfileRevision{}
+			value.RetainedEffectiveProfile = resolution.EffectiveProfile
+			value.RetainedGatewaySource = resolution.CurrentGatewaySource
+			value.RetainedTransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
+			value.RetainedTransferChainTipDigest = resolution.TransferChainTipDigest
+			value.RetainedTerminalReceiptDigest = resolution.TerminalReceiptDigest
+		} else if grant.RetiredAt == nil {
+			value.EffectiveProfile = resolution.EffectiveProfile
+			value.CurrentGatewaySource = resolution.CurrentGatewaySource
+			value.TransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
+			value.TransferChainTipDigest = resolution.TransferChainTipDigest
+			value.TerminalReceiptDigest = resolution.TerminalReceiptDigest
+		}
 	}
 	if claim.State == AppAccessDisableCommitted {
 		if claim.Proof == nil || revision.Allocation.ReleasedAt == nil ||

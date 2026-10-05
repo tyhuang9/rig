@@ -2,6 +2,8 @@ package appaccess
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -239,6 +241,163 @@ func TestResolveGatewayBindingWalksRepeatedRebindAcrossRuntimeAdvance(t *testing
 		snapshot.CurrentDatabaseCommittedEvent.OperationID != claim.Spec.OperationID ||
 		len(snapshot.CurrentTransfers) != 1 || snapshot.CurrentTransfers[0].TransferDigest != transfer.TransferDigest {
 		t.Fatalf("committed second rebind snapshot=%#v", snapshot)
+	}
+	startup, err := fixture.repository.HostingGatewayStartupSnapshot(context.Background())
+	if err != nil || len(startup.Upgrades.Claims) != 1 || len(startup.Grants.Claims) != 1 ||
+		startup.Grants.Claims[0].EffectiveProfile.ID != claim.Spec.SuccessorProfileRevisionID ||
+		!startup.Grants.Claims[0].ProfileHeadCurrent {
+		t.Fatalf("startup after repeated rebind=%#v error=%v", startup, err)
+	}
+
+	if _, err := fixture.db.Exec(`DROP TRIGGER lan_gateway_rebind_allocation_transfer_retain`); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := fixture.db.Exec(`DELETE FROM lan_gateway_rebind_allocation_transfers
+		WHERE operation_id=? AND allocation_id=?`, fixture.claim.Spec.OperationID, fixture.entry.AllocationID); err != nil {
+		t.Fatal(err)
+	} else if affected, _ := result.RowsAffected(); affected != 1 {
+		t.Fatalf("deleted intermediate transfer rows=%d", affected)
+	}
+	if _, err := fixture.repository.ResolveGatewayBinding(context.Background(), GatewayBindingRef{
+		AppID: fixture.entry.AppID, AllocationID: fixture.entry.AllocationID,
+		AccessRevisionID: fixture.entry.AccessRevisionID, GrantAttemptID: fixture.entry.GrantAttemptID,
+	}); !errors.Is(err, ErrInvalidStoredState) {
+		t.Fatalf("resolver accepted stored transfer gap: %v", err)
+	}
+	if _, err := fixture.repository.AuthorizeAppAccessGrant(context.Background(),
+		AppAccessGrantAuthorizationInput{Owner: AppAccessGrantClaimOwnerFor(fixture.grant),
+			PermittedStates: []AppAccessGrantState{AppAccessGrantCommitted}}); !errors.Is(err, ErrInvalidStoredState) {
+		t.Fatalf("authorization accepted stored transfer gap: %v", err)
+	}
+	rawAllocation, err := readAllocationByID(context.Background(), fixture.db, fixture.entry.AllocationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawGrant, err := readAppAccessGrantClaim(context.Background(), fixture.db, fixture.grant.AttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawProfile, _, err := readGatewayRevision(context.Background(), fixture.db,
+		first.RawProfile.ID, first.RawProfile.RevisionNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(rawAllocation, first.RawAllocation) ||
+		!reflect.DeepEqual(rawGrant, first.RawGrant) || !reflect.DeepEqual(rawProfile, first.RawProfile) {
+		t.Fatalf("transfer-gap refusal mutated raw facts: allocation=%#v grant=%#v profile=%#v",
+			rawAllocation, rawGrant, rawProfile)
+	}
+}
+
+func TestRetiredGatewayBindingRemainsHistoricalAfterLaterRebind(t *testing.T) {
+	fixture := newGatewayRebindFixture(t, true)
+	firstReceipt := strings.Repeat("7", 64)
+	commitGatewayRebindFixture(t, fixture, firstReceipt)
+	ref := GatewayBindingRef{
+		AppID: fixture.entry.AppID, AllocationID: fixture.entry.AllocationID,
+		AccessRevisionID: fixture.entry.AccessRevisionID, GrantAttemptID: fixture.entry.GrantAttemptID,
+	}
+	first, err := fixture.repository.ResolveGatewayBinding(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	disableInput := approvedDisableInput(t, first.RawAccessRevision)
+	disable, created, err := fixture.repository.ClaimAppAccessDisable(context.Background(), disableInput)
+	if err != nil || !created {
+		t.Fatalf("claim disable=%#v created=%t error=%v", disable, created, err)
+	}
+	disableOwner := AppAccessDisableClaimOwnerFor(disable)
+	if _, _, err := fixture.repository.AdvanceAppAccessDisableClaim(context.Background(), disableOwner,
+		AppAccessDisablePrepared, AppAccessDisableWithdrawing); err != nil {
+		t.Fatal(err)
+	}
+	disable, changed, err := fixture.repository.ResolveAppAccessDisableClaim(context.Background(), disableOwner,
+		AppAccessDisableWithdrawing, AppAccessDisableCommitted, AppAccessDisableProof{
+			GatewayOperationID: fixture.claim.Spec.OperationID, ProtectedStateDigest: strings.Repeat("6", 64),
+		})
+	if err != nil || !changed || disable.Proof == nil {
+		t.Fatalf("commit disable=%#v changed=%t error=%v", disable, changed, err)
+	}
+
+	previousHead, err := generatedruntimestate.New(fixture.db).Active(context.Background(), fixture.entry.AppID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advancedHead := redeployRuntimeHeadForRebindTest(t, fixture.db, previousHead)
+	finishGatewayRebindFixtureWork(t, fixture.db)
+	proposal := gatewayRebindV2ProposalForCommittedFixture(t, fixture, first, advancedHead)
+	proposal.Roster = nil
+	proposal.Spec.RosterCount = 0
+	proposal.Spec.RosterDigest, err = GatewayRebindRosterV2Digest(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal.RebindApproval.SpecDigest, err = GatewayRebindSpecV2Digest(proposal.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, created, err := fixture.repository.ClaimGatewayRebindV2(context.Background(), proposal)
+	if err != nil || !created {
+		t.Fatalf("second claim=%#v created=%t error=%v", claim, created, err)
+	}
+	secondReceipt := strings.Repeat("9", 64)
+	if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(),
+		gatewayRebindProofForClaimV2(t, claim, GatewayRebindPrepared, 1,
+			GatewayRebindSuccessorReady, secondReceipt, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(),
+		gatewayRebindProofForClaimV2(t, claim, GatewayRebindSuccessorReady, 2,
+			GatewayRebindDatabaseCommitted, secondReceipt, nil)); err != nil {
+		t.Fatal(err)
+	}
+	committed := gatewayRebindProofForClaimV2(t, claim, GatewayRebindDatabaseCommitted, 3,
+		GatewayRebindCommitted, secondReceipt, nil)
+	committed.LocalAttestationDigest = strings.Repeat("8", 64)
+	if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(), committed); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fixture.repository.ResolveGatewayBinding(context.Background(), ref); !errors.Is(err, ErrInvalidStoredState) {
+		t.Fatalf("released binding unexpectedly resolved to selected successor: %v", err)
+	}
+	startup, err := fixture.repository.HostingGatewayStartupSnapshot(context.Background())
+	if err != nil || len(startup.Upgrades.Claims) != 1 || len(startup.Grants.Claims) != 1 ||
+		len(startup.Disables.Claims) != 1 {
+		t.Fatalf("historical startup=%#v error=%v", startup, err)
+	}
+	grantHistory := startup.Grants.Claims[0]
+	disableHistory := startup.Disables.Claims[0]
+	if grantHistory.Claim.AttemptID != fixture.grant.AttemptID || grantHistory.EffectiveProfile.ID != "" ||
+		grantHistory.CurrentGatewaySource.OperationID != "" || grantHistory.ProfileHeadCurrent ||
+		grantHistory.RetainedEffectiveProfile.ID != first.EffectiveProfile.ID ||
+		grantHistory.RetainedGatewaySource.OperationID != fixture.claim.Spec.OperationID ||
+		len(grantHistory.RetainedTransferChain) != 1 ||
+		grantHistory.RetainedTransferChainTipDigest != first.TransferChainTipDigest ||
+		grantHistory.RetainedTerminalReceiptDigest != firstReceipt {
+		t.Fatalf("retired grant history=%#v", grantHistory)
+	}
+	if disableHistory.Claim.OperationID != disable.OperationID || disableHistory.EffectiveProfile.ID != "" ||
+		disableHistory.CurrentGatewaySource.OperationID != "" || disableHistory.ProfileHeadCurrent ||
+		disableHistory.RetainedEffectiveProfile.ID != first.EffectiveProfile.ID ||
+		disableHistory.RetainedGatewaySource.OperationID != fixture.claim.Spec.OperationID ||
+		len(disableHistory.RetainedTransferChain) != 1 ||
+		disableHistory.RetainedTransferChainTipDigest != first.TransferChainTipDigest ||
+		disableHistory.RetainedTerminalReceiptDigest != firstReceipt {
+		t.Fatalf("retired disable history=%#v", disableHistory)
+	}
+	authorized, err := fixture.repository.AuthorizeAppAccessDisable(context.Background(),
+		AppAccessDisableAuthorizationInput{Owner: disableOwner,
+			PermittedStates: []AppAccessDisableState{AppAccessDisableCommitted}})
+	if err != nil || authorized.EffectiveProfile.ID != "" ||
+		authorized.CurrentGatewaySource.OperationID != "" ||
+		authorized.RetainedGatewaySource.OperationID != fixture.claim.Spec.OperationID ||
+		authorized.RetainedEffectiveProfile.ID != first.EffectiveProfile.ID ||
+		len(authorized.RetainedTransferChain) != 1 ||
+		authorized.RetainedTransferChainTipDigest != first.TransferChainTipDigest ||
+		authorized.RetainedTerminalReceiptDigest != firstReceipt {
+		t.Fatalf("historical disable authorization=%#v error=%v", authorized, err)
 	}
 }
 
