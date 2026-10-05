@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -17,7 +18,7 @@ const (
 	gatewayRebindProgressFilenamePrefix  = "gateway-rebind-progress.v1.g"
 	gatewayRebindProgressSequenceDigits  = 2
 	maxGatewayRebindProgressBytes        = 32 << 10
-	gatewayRebindProgressMaximumSequence = 3
+	gatewayRebindProgressMaximumSequence = 4
 )
 
 type gatewayRebindProgressPhase string
@@ -62,10 +63,21 @@ type gatewayRebindStageIntent struct {
 	// been observed under the effect locks. Sequence two must keep it empty;
 	// sequence three may bind it once and every replay must be exact.
 	Network *gatewayRebindStageNetworkBinding `json:"network,omitempty"`
+	// ConfigVolume is populated only after sequence three has bound and
+	// reattested the successor network. Sequence four binds the exact Docker
+	// volume identity once; it does not authorize a container or route effect.
+	ConfigVolume *gatewayRebindStageConfigVolumeBinding `json:"configVolume,omitempty"`
 }
 
 type gatewayRebindStageNetworkBinding struct {
 	ID              string `json:"id"`
+	OwnershipDigest string `json:"ownershipDigest"`
+}
+
+type gatewayRebindStageConfigVolumeBinding struct {
+	Name            string `json:"name"`
+	Mountpoint      string `json:"mountpoint"`
+	CreatedAt       string `json:"createdAt"`
 	OwnershipDigest string `json:"ownershipDigest"`
 }
 
@@ -194,6 +206,38 @@ func newGatewayRebindStageNetworkProgress(intent gatewayRebindProtectedIntent,
 	return value, nil
 }
 
+func newGatewayRebindStageConfigVolumeProgress(intent gatewayRebindProtectedIntent,
+	previous gatewayRebindProgressRecord, binding gatewayRebindStageConfigVolumeBinding, occurredAt time.Time,
+) (gatewayRebindProgressRecord, error) {
+	if !validGatewayRebindProtectedIntent(intent) || !validGatewayRebindProgressRecord(previous) ||
+		previous.Generation != intent.Generation || previous.OperationID != intent.OperationID ||
+		previous.Sequence != 3 || previous.Phase != gatewayRebindProgressStageIntent ||
+		previous.ProtectedIntentDigest != intent.Digest || previous.Stage == nil || previous.Stage.Network == nil ||
+		previous.Stage.ConfigVolume != nil || !gatewayRebindStageIntentMatchesProtectedIntent(previous, intent) ||
+		!validGatewayRebindStageConfigVolumeBinding(intent, binding) || !validGatewayRebindProgressTime(occurredAt) {
+		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress rebind stage config volume progress input")
+	}
+	previousAt, err := parseGatewayRebindProgressTime(previous.OccurredAt)
+	if err != nil || !occurredAt.After(previousAt) {
+		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress rebind stage config volume progress input")
+	}
+	stage := *previous.Stage
+	stage.ConfigVolume = &binding
+	value := gatewayRebindProgressRecord{
+		Version: gatewayRebindProgressVersion, Generation: intent.Generation, OperationID: intent.OperationID,
+		Sequence: 4, Phase: gatewayRebindProgressStageIntent,
+		OccurredAt: occurredAt.UTC().Format(time.RFC3339Nano), ProtectedIntentDigest: intent.Digest,
+		PreviousDigest: previous.Digest, Stage: &stage,
+	}
+	_, value.Purpose = gatewayRebindProgressName(value.Generation, value.OperationID, value.Sequence)
+	value.Digest, err = gatewayRebindProgressDigest(value)
+	if err != nil || !validGatewayRebindProgressRecord(value) ||
+		!gatewayRebindStageIntentMatchesProtectedIntent(value, intent) {
+		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress rebind stage config volume progress input")
+	}
+	return value, nil
+}
+
 func gatewayRebindProgressDigest(value gatewayRebindProgressRecord) (string, error) {
 	value.Digest = ""
 	return canonicalDigest(value)
@@ -218,7 +262,7 @@ func validGatewayRebindProgressRecord(value gatewayRebindProgressRecord) bool {
 			return false
 		}
 	case gatewayRebindProgressStageIntent:
-		if (value.Sequence != 2 && value.Sequence != 3) || !validSHA256(value.PreviousDigest) || value.Stage == nil ||
+		if (value.Sequence != 2 && value.Sequence != 3 && value.Sequence != 4) || !validSHA256(value.PreviousDigest) || value.Stage == nil ||
 			!validGatewayRebindStageIntent(*value.Stage) {
 			return false
 		}
@@ -237,7 +281,18 @@ func validGatewayRebindStageIntent(value gatewayRebindStageIntent) bool {
 		validSHA256(value.ObservedDockerImageID) && validGatewayV2NetworkPlan(gatewayV2NetworkPlan(value.NetworkPlan)) &&
 		validSHA256(value.NetworkPlanDigest) && validSHA256(value.NetworkTopologyDigest) &&
 		(value.Network == nil || (validContainerID(value.Network.ID) && normalizeID(value.Network.ID) == value.Network.ID &&
-			validSHA256(value.Network.OwnershipDigest)))
+			validSHA256(value.Network.OwnershipDigest))) &&
+		(value.ConfigVolume == nil || (value.Network != nil && validGatewayRebindStageConfigVolumeBindingValue(*value.ConfigVolume)))
+}
+
+func validGatewayRebindStageConfigVolumeBindingValue(value gatewayRebindStageConfigVolumeBinding) bool {
+	if value.Name == "" || strings.TrimSpace(value.Name) != value.Name || value.Mountpoint == "" ||
+		strings.TrimSpace(value.Mountpoint) != value.Mountpoint || value.CreatedAt == "" ||
+		strings.TrimSpace(value.CreatedAt) != value.CreatedAt || !validSHA256(value.OwnershipDigest) {
+		return false
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, value.CreatedAt)
+	return err == nil && !createdAt.IsZero()
 }
 
 func gatewayRebindStageIntentMatchesProtectedIntent(value gatewayRebindProgressRecord,
@@ -436,6 +491,23 @@ func gatewayRebindProgressMatchesIntent(value gatewayRebindProgressRecord, inten
 			return false
 		}
 		previousAt, err := parseGatewayRebindProgressTime(previous[1].Record.OccurredAt)
+		currentAt, currentErr := parseGatewayRebindProgressTime(value.OccurredAt)
+		return err == nil && currentErr == nil && currentAt.After(previousAt)
+	case 4:
+		if value.Phase != gatewayRebindProgressStageIntent || len(previous) != 3 ||
+			value.PreviousDigest != previous[2].Record.Digest || value.Stage == nil || value.Stage.Network == nil ||
+			value.Stage.ConfigVolume == nil || !gatewayRebindStageIntentMatchesProtectedIntent(value, intent) ||
+			previous[2].Record.Stage == nil || previous[2].Record.Stage.Network == nil ||
+			previous[2].Record.Stage.ConfigVolume != nil ||
+			!validGatewayRebindStageConfigVolumeBinding(intent, *value.Stage.ConfigVolume) {
+			return false
+		}
+		stageWithoutConfigVolume := *value.Stage
+		stageWithoutConfigVolume.ConfigVolume = nil
+		if !reflect.DeepEqual(stageWithoutConfigVolume, *previous[2].Record.Stage) {
+			return false
+		}
+		previousAt, err := parseGatewayRebindProgressTime(previous[2].Record.OccurredAt)
 		currentAt, currentErr := parseGatewayRebindProgressTime(value.OccurredAt)
 		return err == nil && currentErr == nil && currentAt.After(previousAt)
 	default:
