@@ -4,9 +4,11 @@ Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
 draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
 row's branch descends from the preceding row's branch and targets it with one
 review scope. Rows 26–37 remain local and require separate publication
-approval. The first two hosted row-25 network Docker attempts failed; the
-corrected head's required job is queued, so no hosted network-stage acceptance
-is claimed. No draft publication authorizes merge or deployment.
+approval. The first three hosted row-25 network Docker attempts failed; the
+third identified a host-route delta mismatch after exact network creation.
+PR #122's failure-only route diagnostic is queued. Rows 26–37 have not yet
+inherited that diagnostic update, and no hosted network-stage acceptance is
+claimed. No draft publication authorizes merge or deployment.
 
 | Order | Branch | Scope commit | Review scope |
 | --- | --- | --- | --- |

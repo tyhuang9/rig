@@ -2,7 +2,7 @@
 
 Date: 2026-10-04
 
-Base: `feature/hosting-m3-rebind-stage-start` at `b455d42` when implementation began; current parent head `4ae53f2` was merged additively before final verification.
+Base: `feature/hosting-m3-rebind-stage-start` at `b455d42` when implementation began; current parent head `0133e28`, including the corrected row-25 ancestor, was merged additively before integrated verification.
 
 Branch: `feature/hosting-m3-rebind-stage-start-docker-gate` (local and unpublished)
 
@@ -39,15 +39,15 @@ SQLite, cut over a route, provision a database, merge, or deploy.
 
 | Check | Result |
 | --- | --- |
-| Live-tag compile | Passed after the QA correction: `go test -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress`. |
+| Live-tag compile | Passed on integrated head `6c24322`: `go test -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress`. |
 | Named test discovery | Passed: `go test -count=1 -run '^TestLiveGatewayRebindSuccessorStageStart(LostAcknowledgmentAdopts|ProofFailureWithdraws)?$' -v ./internal/generatedingress`; all three were discovered and explicitly skipped without the Docker opt-in. This is not physical acceptance. |
 | Focused stage-start unit tests | Passed after the QA correction: `go test -p=1 -count=1 -timeout=10m -run '^TestGatewayRebindStageStart' ./internal/generatedingress` (`205.641s`). |
 | Workflow YAML | Passed with a temporary checker using the repository's `gopkg.in/yaml.v3` dependency; the `rebind-stage-start-live` job parsed and was present. Temporary checker removed. |
 | Physical Docker journeys | Not run locally. Docker CLI is installed, but the Windows host has no running Docker Engine. Hosted Linux Docker acceptance has not run. |
 | Generated-ingress package tests | Passed: `go test -p=1 -count=1 -timeout=20m ./internal/generatedingress` (`648.529s`). This run began before a small assertion was added to the live test, which skips locally; final-source live-tag compilation and named-test discovery passed afterward. |
-| Vet and build | Passed: `go build -buildvcs=false ./...`; `go vet ./...` passed again after the QA correction. |
-| Documentation build | Passed after the parent documentation fix was merged: `pnpm --dir docs build`. |
-| Full Go suite | Passed on the final local source after the QA correction: `go test -p=1 -count=1 -timeout=20m ./...` (`internal/generatedingress` 622.613s). This does not exercise the three physical Docker journeys. |
+| Vet and build | Passed on integrated head `6c24322`: `go vet ./...` and `go build -buildvcs=false ./...`. |
+| Documentation build | Passed on integrated head `6c24322`: `pnpm --dir docs build` with normal Windows filesystem access. The restricted sandbox attempt could not read an installed Vite package; the lockfile install itself was unchanged. |
+| Full Go suite | Passed on integrated head `6c24322` after the row-25 correction and QA change: `go test -p=1 -count=1 -timeout=20m ./...` (`internal/generatedingress` 630.723s). The first restricted-sandbox attempt failed on local Go-cache/private-directory access before it established a code result. This does not exercise the three physical Docker journeys. |
 | Formatting and diff | Changed Go files have no `gofmt -l` output; `git diff --check feature/hosting-m3-rebind-stage-start..HEAD` passed. |
 
 ## Remaining gates and rollback
