@@ -1,13 +1,12 @@
 # M3 rebind draft PR stack
 
-Status: local, unpublished plan as of 2026-10-03. The published base is draft
-PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each row's
-branch descends from the preceding row's branch, with one review scope per
-draft. Each draft would target the preceding row's branch. Row 15 includes the
-initial version of this plan after its scope commit; rows 25 and 27 update it.
-None of these rows authorizes publication, merge, or deployment. Publication
-approval for rows 1–25 is pending separately; rows 26–27 require their own
-approval after the prerequisite hosted network gate passes.
+Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
+draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
+row's branch descends from the preceding row's branch and targets it with one
+review scope. Rows 26–27 remain local and require separate publication
+approval. The first two hosted row-25 network Docker attempts failed; the
+corrected head's required job is queued, so no hosted network-stage acceptance
+is claimed. No draft publication authorizes merge or deployment.
 
 | Order | Branch | Scope commit | Review scope |
 | --- | --- | --- | --- |
@@ -47,8 +46,9 @@ the final-source Go suite, vet, web tests and build, and Docker-tagged compile;
 its live Docker test only compiled and skipped locally. Rows 26 and 27 passed
 their final-source Go suites, vet, builds, and relevant focused checks; row 27's
 live test also only compiled and skipped locally. PR #97's hosted checks passed
-at its published head. The Docker gates in rows 14, 16, 25, and 27 require
-publication and hosted execution before they can count as acceptance evidence.
+at its published head. The Docker gates in rows 14, 16, and 25 count as
+acceptance only after successful required hosted tests at the relevant head;
+row 27 remains local and has no hosted Docker acceptance.
 
 These branches do not add a public rebind controller caller, terminal protected
 receipt, successor cutover, transfer-aware readers, recovery, or fence release.
