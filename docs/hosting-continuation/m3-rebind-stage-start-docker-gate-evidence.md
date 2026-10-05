@@ -10,7 +10,8 @@ evidence through `f1707e9`, were also merged additively through rows 26–37.
 The measured CI timeout correction at row-25 head `6023a0f` was then merged
 through the same local chain.
 
-Branch: `feature/hosting-m3-rebind-stage-start-docker-gate` (local and unpublished)
+Branch: `feature/hosting-m3-rebind-stage-start-docker-gate`, published as
+[draft PR #134](https://github.com/tyhuang9/rig/pull/134).
 
 ## Scope
 
@@ -41,7 +42,83 @@ an individual JSON pass event and rejects a skip for each named test.
 This gate does not change production runtime code, release a fence, transition
 SQLite, cut over a route, provision a database, merge, or deploy.
 
-## Verification
+## 2026-10-05: distinct owned addresses for real stage start
+
+The inherited gate at PR #135 head
+`e46185ff61b3fa519304e5fa0ce8ab9c1a788acb`
+[failed all three journeys and cleanup](https://github.com/tyhuang9/rig/actions/runs/37373345314/job/111975694535).
+The direct test failed in 98.89s, lost-acknowledgment in 85.00s, and compensation
+in 92.86s. Docker reported all three retained stage containers as `Created`.
+The original fixture assigned the successor the same IPv4 and port still held
+by the running predecessor. That occupied bind prevents the intended successful
+start and also makes the listener-withdrawal assertion false. The original log
+did not retain Docker's stderr; a new hosted run must establish the correction.
+
+The fixture now uses two distinct private addresses on a disposable dummy
+adapter. Its helper is extracted from the already reviewed handover fixture:
+it selects a nonoverlapping prefix, checks exact index/name/alias/dummy kind and
+owned addresses before deletion, and retains anything uncertain. Existing host
+interfaces are not modified. The predecessor remains live throughout staging,
+and all prior protected-state, SQL, request-count and withdrawal checks remain.
+
+The new job-scoped `RIG_RUN_LIVE_GATEWAY_REBIND_STAGE_START_NETWORK=1` is required
+alongside the existing Docker opt-in. CI checks `iproute2` and noninteractive
+sudo, and its always-run residue check now includes owned dummy adapters.
+No production source or runtime safeguard changes in this correction.
+
+Local verification:
+
+- `go test -mod=readonly -tags=integration -run '^$' ./internal/generatedingress ./cmd/hostd`
+  compiled both packages (1.051s and 0.967s); it intentionally ran no tests.
+- All three named live tests were discovered and explicitly skipped without
+  the Docker/network opt-ins, with no failures. This verifies opt-in behavior,
+  not Docker acceptance.
+- The repository's existing `gopkg.in/yaml.v3` parser accepted the workflow;
+  explicit permission and all three required test names were present. All 28
+  embedded shell scripts passed Git Bash `-n` syntax checks.
+- Independent source review found no blocking address-ownership, cleanup-order
+  or workflow regression. Actual Docker start and cleanup remain unverified on
+  this Windows host, which has no running Docker daemon.
+- `go vet -mod=readonly ./internal/generatedingress`, changed-file `gofmt`
+  checks, the docs workflow check, and the docs build passed (VitePress 4.68s).
+
+The correction updates the already authorized draft. It does not authorize a
+merge, deployment or a new branch publication.
+
+## 2026-10-05: cleanup after a proved stage start
+
+The distinct-address correction ran at PR #135 head
+`f2b7815c9b15f47d328cd4f38f6e32b905307cd2`. Its
+[stage-start job](https://github.com/tyhuang9/rig/actions/runs/37381953709/job/112005904184)
+reported a cleanup failure in all three named tests (94.52s direct, 89.42s
+lost acknowledgment, 91.59s compensation), followed by the residue failure.
+Each reported test error was the stopped-container helper rejecting the
+sequence-eight configuration inventory. A stage that has actually started
+retains Caddy's exact autosave even after a proved stop.
+
+The cleanup helper now calls the existing production inventory reader with
+the exact retained sequence-nine start intent. That reader verifies unchanged
+protected history before allowing only the approved stage file and its exact,
+bounded optional autosave. A never-started sequence-eight fixture continues
+to use the strict pre-start inventory. Container ownership, stop proof,
+listener withdrawal, immutable history and residue checks remain required.
+Only test cleanup changes; production parsers and runtime behavior are unchanged.
+
+Local verification:
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./internal/generatedingress -run '^(TestGatewayRebindStageStartInventoryAcceptsExactAutosaveAfterDurableIntent|TestGatewayRebindStageAutosaveCanonicalConfigMatchesPinnedCaddy|TestGatewayRebindStartedStageArchiveRequiresExactOptionalSnapshot|TestGatewayRebindStartedStageArchiveBoundsTwoMaximumConfigs|TestGatewayRebindStageStartInventoryRequiresDurableUnchangedIntent)$'
+go vet -mod=readonly ./internal/generatedingress
+go test -mod=readonly -p=1 -tags=integration -run '^$' ./internal/generatedingress ./cmd/hostd
+```
+
+All five named autosave regressions passed in 9.056s with no failures/skips.
+Static checks passed; integration-tag compilation passed (ingress 0.759s;
+hostd reused a cached compile). Captured regression events are in
+`$TEMP/m3-stage-cleanup-autosave-regressions.jsonl`. Hosted execution is still
+required to accept the complete corrected cleanup journey.
+
+## Earlier verification checkpoints
 
 | Check | Result |
 | --- | --- |
@@ -49,7 +126,7 @@ SQLite, cut over a route, provision a database, merge, or deploy.
 | Named test discovery | Passed: `go test -count=1 -run '^TestLiveGatewayRebindSuccessorStageStart(LostAcknowledgmentAdopts|ProofFailureWithdraws)?$' -v ./internal/generatedingress`; all three were discovered and explicitly skipped without the Docker opt-in. This is not physical acceptance. |
 | Focused stage-start unit tests | Passed after the QA correction: `go test -p=1 -count=1 -timeout=10m -run '^TestGatewayRebindStageStart' ./internal/generatedingress` (`205.641s`). |
 | Workflow YAML | Passed with a temporary checker using the repository's `gopkg.in/yaml.v3` dependency; the `rebind-stage-start-live` job parsed and was present. Temporary checker removed. |
-| Physical Docker journeys | Not run locally. Docker CLI is installed, but the Windows host has no running Docker Engine. Hosted Linux Docker acceptance has not run. |
+| Physical Docker journeys | Not run locally. The initial published stage-start gate failed as recorded above; the distinct-address correction still requires a new hosted result. |
 | Prerequisite network-stage hosted gate | PASS at corrected code head `fd68ab8`: [named Docker test and always-run residue job 111619317032](https://github.com/tyhuang9/rig/actions/runs/37264835255/job/111619317032). The later row-25 evidence head `f1707e9` also passed its [named test without a skip and cleanup job 111620115206](https://github.com/tyhuang9/rig/actions/runs/37265095730/job/111620115206) in 46.06s. The later `6023a0f` named network test and cleanup also passed. These jobs establish only the private network effect, not this stage-start gate. |
 | Generated-ingress package tests | Passed: `go test -p=1 -count=1 -timeout=20m ./internal/generatedingress` (`648.529s`). This run began before a small assertion was added to the live test, which skips locally; final-source live-tag compilation and named-test discovery passed afterward. |
 | Vet and build | Passed on post-route-integration head `6305bdc`: `go vet ./...` and `go build -buildvcs=false ./...`. |
@@ -76,8 +153,8 @@ skipped). The other eight packages, all 502 frontend tests, frontend build,
 workflow parsing/Bash syntax, and docs build passed. These are row-25 local
 results; this longer row-37 test set and its physical Docker journeys still
 require hosted acceptance after publication. The new hosted checks at
-`9ad7f78` are running. The local stack remains unpublished pending separate
-authorization.
+`9ad7f78` were running at this historical checkpoint. The stack was subsequently
+authorized and row 37 was published as draft PR #134.
 
 ## Remaining gates and rollback
 
