@@ -181,9 +181,9 @@ func TestResolveGatewayBindingWalksRepeatedRebindAcrossRuntimeAdvance(t *testing
 		Ordinal: 1, AppID: fixture.entry.AppID, AllocationID: fixture.entry.AllocationID,
 		GrantAttemptID: fixture.entry.GrantAttemptID, SourceBindingDigest: strings.Repeat("5", 64),
 		RosterEntryDigest:              proposal.Roster[0].EntryDigest,
-		SourceProfileRevisionID:        first.EffectiveProfile.ID,
-		SourceProfileRevisionNumber:    first.EffectiveProfile.RevisionNumber,
-		SourceProfileSpecDigest:        first.EffectiveProfile.SpecDigest,
+		SourceProfileRevisionID:        first.RawProfile.ID,
+		SourceProfileRevisionNumber:    first.RawProfile.RevisionNumber,
+		SourceProfileSpecDigest:        first.RawProfile.SpecDigest,
 		PredecessorTransferDigest:      &predecessor,
 		SuccessorProfileRevisionID:     claim.Spec.SuccessorProfileRevisionID,
 		SuccessorProfileRevisionNumber: claim.Spec.SuccessorProfileRevisionNumber,
@@ -209,6 +209,12 @@ func TestResolveGatewayBindingWalksRepeatedRebindAcrossRuntimeAdvance(t *testing
 	}
 	if len(databaseCommitted.TransferChain) != 2 ||
 		databaseCommitted.TransferChain[0].SourceBindingDigest == databaseCommitted.TransferChain[1].SourceBindingDigest ||
+		databaseCommitted.TransferChain[0].SourceProfileRevisionID != first.RawProfile.ID ||
+		databaseCommitted.TransferChain[1].SourceProfileRevisionID != first.RawProfile.ID ||
+		databaseCommitted.TransferChain[0].SourceProfileRevisionNumber != first.RawProfile.RevisionNumber ||
+		databaseCommitted.TransferChain[1].SourceProfileRevisionNumber != first.RawProfile.RevisionNumber ||
+		databaseCommitted.TransferChain[0].SourceProfileSpecDigest != first.RawProfile.SpecDigest ||
+		databaseCommitted.TransferChain[1].SourceProfileSpecDigest != first.RawProfile.SpecDigest ||
 		databaseCommitted.TransferChain[1].PredecessorTransferDigest == nil ||
 		*databaseCommitted.TransferChain[1].PredecessorTransferDigest != databaseCommitted.TransferChain[0].TransferDigest ||
 		databaseCommitted.TransferChainTipDigest != transfer.TransferDigest ||
@@ -250,9 +256,9 @@ func gatewayRebindV2ProposalForCommittedFixture(t *testing.T, fixture gatewayReb
 		AccessRevisionNumber: fixture.entry.AccessRevisionNumber, AccessSpecDigest: fixture.entry.AccessSpecDigest,
 		GrantAttemptID: fixture.entry.GrantAttemptID, GrantStateSequence: fixture.grant.StateSequence,
 		GrantProtectedStateDigest:   fixture.grant.Proof.ProtectedStateDigest,
-		SourceProfileRevisionID:     current.EffectiveProfile.ID,
-		SourceProfileRevisionNumber: current.EffectiveProfile.RevisionNumber,
-		SourceProfileSpecDigest:     current.EffectiveProfile.SpecDigest,
+		SourceProfileRevisionID:     current.RawProfile.ID,
+		SourceProfileRevisionNumber: current.RawProfile.RevisionNumber,
+		SourceProfileSpecDigest:     current.RawProfile.SpecDigest,
 		PredecessorTransferDigest:   &predecessor,
 		ServingDeploymentID:         head.DeploymentID, ServingReleaseID: head.ReleaseID,
 		ServingSlot: head.Slot, RouteGeneration: head.Generation,
@@ -286,6 +292,7 @@ func gatewayRebindV2ProposalForCommittedFixture(t *testing.T, fixture gatewayReb
 			SourceStateVersion: 1, SourceStateRevision: 2,
 			SourceStateDigest: strings.Repeat("c", 64), PredecessorCheckpointDigest: strings.Repeat("d", 64),
 		},
+		SuccessorProtectedGeneration:   2,
 		SuccessorProfileRevisionID:     uuid.NewString(),
 		SuccessorProfileRevisionNumber: current.EffectiveProfile.RevisionNumber + 1,
 		SuccessorProfileOperationID:    uuid.NewString(), SuccessorProfile: successor,
@@ -324,7 +331,7 @@ func gatewayRebindProofForClaimV2(t *testing.T, claim GatewayRebindClaimV2,
 		ClaimSpecDigest: claim.RebindApproval.SpecDigest,
 		ExpectedState:   previous, ExpectedSequence: sequence, NextState: next,
 		ExpectedHeadRevisionID: expectedID, ExpectedHeadRevisionNumber: expectedNumber,
-		ExpectedHeadSpecDigest: expectedDigest, ProtectedGeneration: expected.ProtectedGeneration + 1,
+		ExpectedHeadSpecDigest: expectedDigest, ProtectedGeneration: claim.Spec.SuccessorProtectedGeneration,
 		ProtectedPhase: string(next), ProtectedRecordSequence: uint64(sequence),
 		ProtectedRecordDigest: strings.Repeat("1", 64), TerminalReceiptDigest: receipt,
 		TerminalDisposition:         GatewayRebindDispositionCommit,

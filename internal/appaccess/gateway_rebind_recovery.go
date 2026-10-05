@@ -597,7 +597,7 @@ func proofMatchesVersionedClaimSource(proof GatewayRebindTransitionProof,
 		proof.SourceStateVersion == source.SourceStateVersion &&
 		proof.SourceStateRevision == source.SourceStateRevision &&
 		proof.SourceStateDigest == source.SourceStateDigest &&
-		proof.ProtectedGeneration == source.Lineage.ProtectedGeneration+1
+		proof.ProtectedGeneration == record.V2.Spec.SuccessorProtectedGeneration
 }
 
 func transferMatchesRetainedRoster(history GatewayRebindHistoryEntry, index int,

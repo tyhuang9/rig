@@ -82,25 +82,29 @@ func resolveGatewayBinding(ctx context.Context, query gatewayBindingQuerier,
 	if err != nil {
 		return GatewayBindingResolution{}, err
 	}
-	transfers, err := readGatewayBindingTransfers(ctx, query, ref)
+	transferRecords, err := readGatewayBindingTransfers(ctx, query, ref)
 	if err != nil {
 		return GatewayBindingResolution{}, err
 	}
 
-	chain := make([]GatewayRebindAllocationTransfer, 0, len(transfers))
+	chain := make([]GatewayRebindAllocationTransfer, 0, len(transferRecords))
 	profileID, profileNumber, profileDigest := rawProfile.ID, rawProfile.RevisionNumber, rawProfile.SpecDigest
 	var predecessor *string
-	used := make(map[int]struct{}, len(transfers))
+	used := make(map[int]struct{}, len(transferRecords))
 	for profileID != currentProfile.ID || profileNumber != currentProfile.RevisionNumber || profileDigest != currentProfile.SpecDigest {
 		matched := -1
-		for index := range transfers {
+		for index := range transferRecords {
 			if _, exists := used[index]; exists {
 				continue
 			}
-			transfer := transfers[index]
-			if transfer.SourceProfileRevisionID == profileID &&
-				transfer.SourceProfileRevisionNumber == profileNumber &&
-				transfer.SourceProfileSpecDigest == profileDigest &&
+			record := transferRecords[index]
+			transfer := record.Transfer
+			if record.PredecessorProfileRevisionID == profileID &&
+				record.PredecessorProfileRevisionNumber == profileNumber &&
+				record.PredecessorProfileSpecDigest == profileDigest &&
+				transfer.SourceProfileRevisionID == rawProfile.ID &&
+				transfer.SourceProfileRevisionNumber == rawProfile.RevisionNumber &&
+				transfer.SourceProfileSpecDigest == rawProfile.SpecDigest &&
 				optionalDigestEqual(transfer.PredecessorTransferDigest, predecessor) {
 				if matched != -1 {
 					return GatewayBindingResolution{}, ErrInvalidStoredState
@@ -112,7 +116,7 @@ func resolveGatewayBinding(ctx context.Context, query gatewayBindingQuerier,
 			return GatewayBindingResolution{}, ErrInvalidStoredState
 		}
 		used[matched] = struct{}{}
-		transfer := transfers[matched]
+		transfer := transferRecords[matched].Transfer
 		chain = append(chain, transfer)
 		profileID = transfer.SuccessorProfileRevisionID
 		profileNumber = transfer.SuccessorProfileRevisionNumber
@@ -120,7 +124,7 @@ func resolveGatewayBinding(ctx context.Context, query gatewayBindingQuerier,
 		digest := transfer.TransferDigest
 		predecessor = &digest
 	}
-	if len(used) != len(transfers) {
+	if len(used) != len(transferRecords) {
 		return GatewayBindingResolution{}, ErrInvalidStoredState
 	}
 	if len(chain) == 0 && (rawProfile.ID != currentProfile.ID ||
@@ -303,9 +307,16 @@ func readGatewayCurrentAuthority(ctx context.Context, query gatewayBindingQuerie
 	}, nil
 }
 
+type gatewayBindingTransferRecord struct {
+	Transfer                         GatewayRebindAllocationTransfer
+	PredecessorProfileRevisionID     string
+	PredecessorProfileRevisionNumber int64
+	PredecessorProfileSpecDigest     string
+}
+
 func readGatewayBindingTransfers(ctx context.Context, query gatewayBindingQuerier,
 	ref GatewayBindingRef,
-) ([]GatewayRebindAllocationTransfer, error) {
+) ([]gatewayBindingTransferRecord, error) {
 	rows, err := query.QueryContext(ctx, `SELECT
 		t.operation_id,t.ordinal,t.app_id,t.allocation_id,t.grant_attempt_id,
 		t.source_binding_digest,t.roster_entry_digest,t.source_profile_revision_id,
@@ -331,9 +342,10 @@ func readGatewayBindingTransfers(ctx context.Context, query gatewayBindingQuerie
 		return nil, err
 	}
 	defer rows.Close()
-	var transfers []GatewayRebindAllocationTransfer
+	var transfers []gatewayBindingTransferRecord
 	for rows.Next() {
-		var transfer GatewayRebindAllocationTransfer
+		var record gatewayBindingTransferRecord
+		transfer := &record.Transfer
 		var transferPredecessor, rosterSourceID, rosterSourceDigest, rosterPredecessor sql.NullString
 		var rosterSourceNumber sql.NullInt64
 		var claimState GatewayRebindState
@@ -358,7 +370,10 @@ func readGatewayBindingTransfers(ctx context.Context, query gatewayBindingQuerie
 		if transferPredecessor.Valid {
 			transfer.PredecessorTransferDigest = &transferPredecessor.String
 		}
-		computed, digestErr := GatewayRebindAllocationTransferDigest(transfer)
+		record.PredecessorProfileRevisionID = claimSourceID
+		record.PredecessorProfileRevisionNumber = claimSourceNumber
+		record.PredecessorProfileSpecDigest = claimSourceDigest
+		computed, digestErr := GatewayRebindAllocationTransferDigest(*transfer)
 		if digestErr != nil || computed != transfer.TransferDigest ||
 			(claimState != GatewayRebindDatabaseCommitted && claimState != GatewayRebindUnresolved &&
 				claimState != GatewayRebindCommitted) ||
@@ -388,13 +403,13 @@ func readGatewayBindingTransfers(ctx context.Context, query gatewayBindingQuerie
 		default:
 			return nil, ErrInvalidStoredState
 		}
-		transfers = append(transfers, transfer)
+		transfers = append(transfers, record)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	sort.Slice(transfers, func(i, j int) bool {
-		return transfers[i].SuccessorProfileRevisionNumber < transfers[j].SuccessorProfileRevisionNumber
+		return transfers[i].Transfer.SuccessorProfileRevisionNumber < transfers[j].Transfer.SuccessorProfileRevisionNumber
 	})
 	return transfers, nil
 }

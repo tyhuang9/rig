@@ -76,6 +76,7 @@ type GatewayRebindSpecV2 struct {
 	Version                        int                    `json:"version"`
 	OperationID                    string                 `json:"operationId"`
 	Predecessor                    GatewayRebindSourceRef `json:"predecessor"`
+	SuccessorProtectedGeneration   uint64                 `json:"successorProtectedGeneration"`
 	SuccessorProfileRevisionID     string                 `json:"successorProfileRevisionId"`
 	SuccessorProfileRevisionNumber int64                  `json:"successorProfileRevisionNumber"`
 	SuccessorProfileOperationID    string                 `json:"successorProfileOperationId"`
@@ -278,6 +279,8 @@ func GatewayRebindSpecV2Digest(spec GatewayRebindSpecV2) (string, error) {
 	canonicalSuccessor, err := canonicalGatewaySpec(spec.SuccessorProfile)
 	if err != nil || spec.Version != GatewayRebindSpecVersionV2 || !validUUID(spec.OperationID) ||
 		!validGatewayRebindSourceRef(spec.Predecessor) ||
+		spec.SuccessorProtectedGeneration <= spec.Predecessor.Lineage.ProtectedGeneration ||
+		spec.SuccessorProtectedGeneration > math.MaxInt64 ||
 		!validUUID(spec.SuccessorProfileRevisionID) ||
 		spec.SuccessorProfileRevisionNumber != spec.Predecessor.Lineage.ProfileRevisionNumber+1 ||
 		!validUUID(spec.SuccessorProfileOperationID) ||

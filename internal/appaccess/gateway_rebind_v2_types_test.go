@@ -88,7 +88,7 @@ func TestGatewayRebindV2CanonicalTypesBindTypedSourceAndTransferChain(t *testing
 	}
 	const wantEntry = "8f2301c26fca2c6cb0f0ec47a73f6e574ee1fb0dc9d28350b5134826a4c66455"
 	const wantRoster = "7aa081010a2340db2069c16b6614b567354ea312781f736d068e5f7a8b99a56b"
-	const wantSpec = "8ffdc06125394b75ffb53917ef672c129e7597134bee966620f854c634bf5bf4"
+	const wantSpec = "f5af2e3a43610ad6c1cfb3697d2c00749327864df4a666dcfb8da48553703d75"
 	const wantTransfer = "37e44731dc1ab634116a834e43f744b28e1570a0a2161f0f69a522390b742e13"
 	const wantManifest = "b5621d06785d826a517ea7367cfbbfad9f91cb98ab9bc33be119ef206025b0eb"
 	if entryDigest != wantEntry || rosterDigest != wantRoster || specDigest != wantSpec ||
@@ -146,12 +146,18 @@ func TestGatewayRebindV2CanonicalTypesRejectCrossVersionAndBrokenChains(t *testi
 	rebindSource.Predecessor.Lineage.ProtectedIntentDigest = strings.Repeat("8", 64)
 	rebindSource.Predecessor.Lineage.TerminalReceiptDigest = strings.Repeat("9", 64)
 	rebindSource.Predecessor.SourceStateVersion = 1
+	rebindSource.SuccessorProtectedGeneration = 2
 	if _, err := GatewayRebindSpecV2Digest(rebindSource); err == nil {
 		t.Fatal("rebind source revision zero was accepted")
 	}
 	rebindSource.Predecessor.SourceStateRevision = 1
 	if _, err := GatewayRebindSpecV2Digest(rebindSource); err != nil {
 		t.Fatalf("valid rebind source was rejected: %v", err)
+	}
+	reusedGeneration := rebindSource
+	reusedGeneration.SuccessorProtectedGeneration = reusedGeneration.Predecessor.Lineage.ProtectedGeneration
+	if _, err := GatewayRebindSpecV2Digest(reusedGeneration); err == nil {
+		t.Fatal("successor protected generation reuse was accepted")
 	}
 
 	first := gatewayRebindV2GoldenTransfer(nil, entry.EntryDigest)
@@ -217,7 +223,8 @@ func gatewayRebindV2GoldenSpec(rosterDigest string) GatewayRebindSpecV2 {
 			SourceStateVersion: 2, SourceStateRevision: 0, SourceStateDigest: strings.Repeat("6", 64),
 			PredecessorCheckpointDigest: strings.Repeat("7", 64),
 		},
-		SuccessorProfileRevisionID: rebindTypeTestProfileTwo, SuccessorProfileRevisionNumber: 2,
+		SuccessorProtectedGeneration: 1,
+		SuccessorProfileRevisionID:   rebindTypeTestProfileTwo, SuccessorProfileRevisionNumber: 2,
 		SuccessorProfileOperationID: rebindTypeTestConfigure,
 		SuccessorProfile: GatewayProfileSpec{
 			SelectedIPv4: "192.168.50.8", InterfaceID: "adapter-v2", PortStart: 8100, PortEnd: 8119,

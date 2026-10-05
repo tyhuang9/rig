@@ -49,6 +49,10 @@ func insertGatewayRebindSourceClaimForMigrationTest(fixture gatewayRebindFixture
 	if sourceKind == GatewayRebindSourceGatewayRebind {
 		predecessorUpgradeOperationID = nil
 	}
+	successorGeneration := int64(0)
+	if specVersion == GatewayRebindSpecVersionV2 {
+		successorGeneration = generation + 1
+	}
 	_, err := fixture.db.Exec(`INSERT INTO lan_gateway_rebind_claims(
 		operation_id,request_digest,approval_action,spec_digest,approved_by,approved_at,
 		predecessor_profile_revision_id,predecessor_profile_revision_number,
@@ -63,8 +67,9 @@ func insertGatewayRebindSourceClaimForMigrationTest(fixture gatewayRebindFixture
 		spec_format_version,roster_format_version,predecessor_protected_generation,
 		predecessor_protected_journal_digest,predecessor_protected_intent_digest,
 		predecessor_source_state_version,predecessor_source_state_revision,
-		predecessor_source_state_digest,predecessor_checkpoint_digest
-	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		predecessor_source_state_digest,predecessor_checkpoint_digest,
+		successor_protected_generation
+	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		claim.Spec.OperationID, claim.RequestDigest, claim.RebindApproval.Action,
 		claim.RebindApproval.SpecDigest, claim.RebindApproval.ActorID, formatTime(claim.RebindApprovedAt),
 		claim.Spec.PredecessorProfileRevisionID, claim.Spec.PredecessorProfileRevisionNumber,
@@ -80,7 +85,7 @@ func insertGatewayRebindSourceClaimForMigrationTest(fixture gatewayRebindFixture
 		claim.Spec.RosterDigest, claim.Spec.RosterCount, claim.State, claim.StateSequence,
 		formatTime(claim.CreatedAt), formatTime(claim.UpdatedAt), specVersion, rosterVersion,
 		generation, nullableStringForMigrationTest(journalDigest), nullableStringForMigrationTest(intentDigest),
-		2, 0, strings.Repeat("d", 64), strings.Repeat("e", 64))
+		2, 0, strings.Repeat("d", 64), strings.Repeat("e", 64), successorGeneration)
 	return err
 }
 

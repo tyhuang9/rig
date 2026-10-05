@@ -93,6 +93,14 @@ func (r *Repository) ClaimGatewayRebindV2(ctx context.Context,
 	if successorExists != 0 {
 		return GatewayRebindClaimV2{}, false, ErrConflict
 	}
+	var retainedGeneration sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(successor_protected_generation)
+		FROM lan_gateway_rebind_claims WHERE spec_format_version=2`).Scan(&retainedGeneration); err != nil {
+		return GatewayRebindClaimV2{}, false, err
+	}
+	if retainedGeneration.Valid && proposal.Spec.SuccessorProtectedGeneration <= uint64(retainedGeneration.Int64) {
+		return GatewayRebindClaimV2{}, false, ErrConflict
+	}
 	if err := validateGatewayRebindSettledRosterV2(ctx, tx, proposal.Spec, proposal.Roster); err != nil {
 		return GatewayRebindClaimV2{}, false, err
 	}
@@ -137,8 +145,9 @@ func (r *Repository) ClaimGatewayRebindV2(ctx context.Context,
 		spec_format_version,roster_format_version,predecessor_protected_generation,
 		predecessor_protected_journal_digest,predecessor_protected_intent_digest,
 		predecessor_source_state_version,predecessor_source_state_revision,
-		predecessor_source_state_digest,predecessor_checkpoint_digest
-	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		predecessor_source_state_digest,predecessor_checkpoint_digest,
+		successor_protected_generation
+	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		proposal.Spec.OperationID, requestDigest, ActionRebindGateway,
 		proposal.RebindApproval.SpecDigest, proposal.RebindApproval.ActorID, formatTime(now),
 		lineage.ProfileRevisionID, lineage.ProfileRevisionNumber, lineage.ProfileSpecDigest,
@@ -153,7 +162,8 @@ func (r *Repository) ClaimGatewayRebindV2(ctx context.Context,
 		int64(lineage.ProtectedGeneration), nullableText(lineage.ProtectedJournalDigest),
 		nullableText(lineage.ProtectedIntentDigest), int64(proposal.Spec.Predecessor.SourceStateVersion),
 		int64(proposal.Spec.Predecessor.SourceStateRevision), proposal.Spec.Predecessor.SourceStateDigest,
-		proposal.Spec.Predecessor.PredecessorCheckpointDigest); err != nil {
+		proposal.Spec.Predecessor.PredecessorCheckpointDigest,
+		int64(proposal.Spec.SuccessorProtectedGeneration)); err != nil {
 		return GatewayRebindClaimV2{}, false, classifyImmediateTransactionError(err)
 	}
 	for _, entry := range proposal.Roster {
@@ -264,9 +274,9 @@ func validateGatewayRebindSettledRosterV2(ctx context.Context, tx gatewayBinding
 			allocation.ReleasedAt != nil || revision.SpecDigest != entry.AccessSpecDigest ||
 			grant.State != AppAccessGrantCommitted || grant.StateSequence != entry.GrantStateSequence || grant.Proof == nil ||
 			grant.Proof.ProtectedStateDigest != entry.GrantProtectedStateDigest ||
-			resolution.EffectiveProfile.ID != entry.SourceProfileRevisionID ||
-			resolution.EffectiveProfile.RevisionNumber != entry.SourceProfileRevisionNumber ||
-			resolution.EffectiveProfile.SpecDigest != entry.SourceProfileSpecDigest ||
+			resolution.RawProfile.ID != entry.SourceProfileRevisionID ||
+			resolution.RawProfile.RevisionNumber != entry.SourceProfileRevisionNumber ||
+			resolution.RawProfile.SpecDigest != entry.SourceProfileSpecDigest ||
 			!optionalStringMatches(entry.PredecessorTransferDigest, resolution.TransferChainTipDigest) {
 			return invalidRebindStoredState(err)
 		}
@@ -324,7 +334,7 @@ func readGatewayRebindClaimV2(ctx context.Context, query rowQuerier,
 		predecessor_protected_generation,predecessor_protected_journal_digest,
 		predecessor_protected_intent_digest,predecessor_source_state_version,
 		predecessor_source_state_revision,predecessor_source_state_digest,
-		predecessor_checkpoint_digest
+		predecessor_checkpoint_digest,successor_protected_generation
 		FROM lan_gateway_rebind_claims WHERE operation_id=? AND spec_format_version=2
 		 AND roster_format_version=2`, operationID).Scan(&value.RequestDigest,
 		&value.RebindApproval.Action, &value.RebindApproval.SpecDigest,
@@ -343,7 +353,8 @@ func readGatewayRebindClaimV2(ctx context.Context, query rowQuerier,
 		&createdAt, &updatedAt, &value.Spec.Predecessor.Lineage.ProtectedGeneration,
 		&journalDigest, &intentDigest, &value.Spec.Predecessor.SourceStateVersion,
 		&value.Spec.Predecessor.SourceStateRevision, &value.Spec.Predecessor.SourceStateDigest,
-		&value.Spec.Predecessor.PredecessorCheckpointDigest)
+		&value.Spec.Predecessor.PredecessorCheckpointDigest,
+		&value.Spec.SuccessorProtectedGeneration)
 	if err != nil {
 		return GatewayRebindClaimV2{}, err
 	}
