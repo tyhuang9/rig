@@ -1,10 +1,11 @@
 # M3 guarded rebind successor-network stage evidence
 
-Date: 2026-10-03
+Date: 2026-10-03; route-delta correction verified 2026-10-04
 
 Base: `ad9471a`
 
-Branch: `feature/hosting-m3-rebind-guarded-nonterminal` (local and unpublished)
+Branch: `feature/hosting-m3-rebind-guarded-nonterminal`, published as draft
+[PR #121](https://github.com/tyhuang9/rig/pull/121).
 
 ## Scope and invariant
 
@@ -28,10 +29,13 @@ On a clean Docker create, the writer captures the canonical network ID returned
 by Docker. Exact post-create inspection must prove that same ID, deterministic
 name, complete label set, bridge/IPAM configuration, empty membership, and the
 complete expected successor census before append-only sequence-three progress
-can bind the ID and ownership digest. A host-visible Docker bridge may add only
-the planned subnet route and interface prefix and one gateway candidate bound
-to the exact derived bridge name; hosts that do not expose the daemon bridge
-must retain the exact baseline. Sequence three must preserve the entire
+can bind the ID and ownership digest. A host-visible Docker bridge may add the
+planned subnet route, or that route plus the exact local gateway and broadcast
+`/32` routes observed on hosted Linux Docker. The bridge may add only the
+planned interface prefix and one gateway candidate bound to the exact derived
+bridge name. The existing exact baseline and subnet-only route shapes remain
+supported. Partial Linux route deltas, duplicate routes, baseline removals, and
+unrelated routes are rejected. Sequence three must preserve the entire
 sequence-two stage payload byte-for-byte except for the new network binding.
 Every replay rechecks the bound ID, pinned image ID and approved digest,
 canonical network-topology digest, predecessor, claim, protected history, host
@@ -50,12 +54,13 @@ requires a separately reviewed pre-effect nonce or equivalent durable proof.
 
 | Check | Result |
 | --- | --- |
-| `go test -count=1 -timeout=8m -run '^TestGatewayRebindStageNetwork' ./internal/generatedingress` | PASS, 26.081s on the final source. |
-| Combined `TestGatewayRebindStageNetwork`, `TestGatewayRebindProgress`, and `TestGatewayRebindEffectBoundary` suites | PASS, 51.034s on the final source. |
-| `go test -count=1 -timeout=20m ./...` | PASS on the final source after review fixes; generated-ingress completed in 174.641s. |
-| `go vet ./internal/generatedingress` | PASS on the final source. |
+| `go test -p=1 -count=1 -timeout=5m -run '^TestGatewayRebindStageNetwork' ./internal/generatedingress` | PASS on the corrected final source, including the post-create no-binding regression (34.596s). |
+| Combined `TestGatewayRebindStageNetwork`, `TestGatewayRebindProgress`, and `TestGatewayRebindEffectBoundary` suites | PASS, 51.034s on the original source before the route correction. |
+| `go test -p=1 -count=1 -timeout=20m ./...` | PASS on the corrected final source, including the new post-create regression; generated-ingress completed in 189.069s. |
+| `go vet ./...` and `go build -buildvcs=false ./...` | PASS on the corrected final source. |
 | `go test -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress` | PASS compilation only; no live Docker test ran. |
-| Live Docker acceptance | NOT RUN: the local Docker named pipe `//./pipe/docker_engine` is unavailable. |
+| `pnpm --dir docs build` and `git diff --check` | PASS after the evidence update; no production deployment was attempted. |
+| Live Docker acceptance | NOT PASSED: the local Docker named pipe `//./pipe/docker_engine` is unavailable. Hosted [PR #122](https://github.com/tyhuang9/rig/pull/122) has a separate required Docker gate; its fourth diagnostic run failed before this route matcher correction. |
 
 Behavioral tests cover clean creation and exact replay, foreign deterministic
 names, exact and unexpected owned volumes, topology drift adjacent to create,
@@ -71,13 +76,21 @@ Checkpoint removal or self-consistent replacement of sequence-two history and
 a successor ID duplicated from the baseline Docker inventory fail before a
 protected binding. Success asserts the prepared SQLite snapshot is unchanged.
 Failure cases assert no unauthorized protected binding and no second Docker
-create.
+create. The fourth hosted PR #122 diagnostic measured 22 baseline routes and
+exactly three additions after network creation: the planned subnet, gateway
+`/32`, and broadcast `/32`. It found no removed, duplicate, or other routes.
+This correction adds only that complete route alternative to the preexisting
+baseline and subnet-only alternatives. A focused route table rejects partial,
+duplicate, extra-inside, extra-outside, and missing-baseline changes. Security
+review found no new ownership or unrelated-route bypass. The existing Linux
+route snapshot retains destination prefixes but not next hops or route tables;
+that preexisting semantic limit remains.
 
 ## Remaining gates
 
 The config and data volumes, stopped successor container, serving transition,
 route publication, terminal protected receipt, SQLite terminal transition,
 migration-035 fence release, public caller, hosted Linux race and live-Docker
-checks, physical second-device LAN proof, PR publication, merge, and deployment
+checks, physical second-device LAN proof, merge, and deployment
 remain open. The create-before-bind crash window requires deliberate recovery
 work before this path can be described as automatically crash recoverable.
