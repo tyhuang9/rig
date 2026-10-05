@@ -16,10 +16,14 @@ type AppAccessGrantAuthorizationInput struct {
 }
 
 type AppAccessGrantAuthorization struct {
-	Claim      AppAccessGrantClaim
-	Revision   AppAccessRevision
-	Allocation Allocation
-	Profile    GatewayProfileRevision
+	Claim                  AppAccessGrantClaim
+	Revision               AppAccessRevision
+	Allocation             Allocation
+	Profile                GatewayProfileRevision
+	EffectiveProfile       GatewayProfileRevision
+	CurrentGatewaySource   GatewayCurrentLineageRef
+	TransferChainTipDigest string
+	TerminalReceiptDigest  string
 }
 
 // AuthorizeAppAccessGrant validates the claim history, exact current heads,

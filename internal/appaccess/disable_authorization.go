@@ -12,11 +12,15 @@ type AppAccessDisableAuthorizationInput struct {
 }
 
 type AppAccessDisableAuthorization struct {
-	Claim       AppAccessDisableClaim
-	Revision    AppAccessRevision
-	Allocation  Allocation
-	Profile     GatewayProfileRevision
-	SourceGrant *AppAccessGrantClaim
+	Claim                  AppAccessDisableClaim
+	Revision               AppAccessRevision
+	Allocation             Allocation
+	Profile                GatewayProfileRevision
+	EffectiveProfile       GatewayProfileRevision
+	CurrentGatewaySource   GatewayCurrentLineageRef
+	TransferChainTipDigest string
+	TerminalReceiptDigest  string
+	SourceGrant            *AppAccessGrantClaim
 }
 
 // AuthorizeAppAccessDisable reconstructs the immutable request binding in one
