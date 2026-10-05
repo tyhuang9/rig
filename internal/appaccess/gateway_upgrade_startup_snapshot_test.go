@@ -55,6 +55,100 @@ func TestGatewayUpgradeStartupSnapshotPreparedClaim(t *testing.T) {
 	}
 }
 
+func TestGatewayUpgradeStartupSnapshotCommittedAuthorityRequiresCurrentNativeEvidence(t *testing.T) {
+	t.Run("native approver demoted", func(t *testing.T) {
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		if _, err := fixture.repository.GatewayUpgradeStartupSnapshot(context.Background()); err != nil {
+			t.Fatalf("native committed baseline: %v", err)
+		}
+		if _, err := fixture.db.Exec(`UPDATE users SET role='viewer' WHERE id=?`, testAdministrator); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.repository.GatewayUpgradeStartupSnapshot(context.Background()); !errors.Is(err, ErrInvalidStoredState) {
+			t.Fatalf("demoted native committed approver error = %v", err)
+		}
+	})
+
+	t.Run("unexplained profile head", func(t *testing.T) {
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		for _, trigger := range []string{
+			"lan_gateway_profile_upgrade_claim_pin_insert",
+			"lan_gateway_profile_upgrade_claim_pin_head",
+			"lan_gateway_profile_head_grant_fence",
+		} {
+			if _, err := fixture.db.Exec(`DROP TRIGGER ` + trigger); err != nil {
+				t.Fatal(err)
+			}
+		}
+		replacement := GatewayProfileSpec{SelectedIPv4: "192.168.79.8",
+			InterfaceID: "startup-unexplained-head", PortStart: 8100, PortEnd: 8119}
+		input := approvedGatewayInput(t, replacement, fixture.profile.RevisionNumber)
+		canonical, err := canonicalGatewaySpec(input.Spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		requestDigest, err := gatewayRequestDigest(input, canonical)
+		if err != nil {
+			t.Fatal(err)
+		}
+		profileID := uuid.NewString()
+		stamp := formatTime(testNow.Add(time.Minute))
+		if _, err := fixture.db.Exec(`INSERT INTO lan_gateway_profile_revisions(
+			id,revision_number,operation_id,request_digest,approval_action,selected_ipv4,interface_id,
+			port_start,port_end,spec_digest,approved_by,approved_at
+		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, profileID, fixture.profile.RevisionNumber+1, input.OperationID,
+			requestDigest, ActionConfigureGateway, canonical.SelectedIPv4, canonical.InterfaceID,
+			canonical.PortStart, canonical.PortEnd, input.Approval.SpecDigest, input.Approval.ActorID, stamp); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.Exec(`UPDATE lan_gateway_profile_heads
+			SET revision_id=?,revision_number=?,updated_at=? WHERE singleton=1`,
+			profileID, fixture.profile.RevisionNumber+1, stamp); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.repository.GatewayUpgradeStartupSnapshot(context.Background()); !errors.Is(err, ErrInvalidStoredState) {
+			t.Fatalf("unexplained committed head mismatch error = %v", err)
+		}
+	})
+
+	t.Run("validated rebind descendant", func(t *testing.T) {
+		fixture := newGatewayRebindFixture(t, true)
+		commitGatewayRebindFixture(t, fixture, strings.Repeat("7", 64))
+		if _, err := fixture.db.Exec(`UPDATE users SET role='viewer' WHERE id=?`, testAdministrator); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := fixture.repository.GatewayUpgradeStartupSnapshot(context.Background())
+		if err != nil || snapshot.CurrentProfile == nil ||
+			snapshot.CurrentProfile.ID != fixture.claim.Spec.SuccessorProfileRevisionID || len(snapshot.Claims) != 1 {
+			t.Fatalf("historical committed upgrade snapshot=%#v error=%v", snapshot, err)
+		}
+	})
+
+	t.Run("mixed current committed and prepared claims", func(t *testing.T) {
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		if _, err := fixture.db.Exec(`DROP INDEX lan_gateway_upgrade_claims_blocking_singleton`); err != nil {
+			t.Fatal(err)
+		}
+		input := approvedGatewayUpgradeClaimInput(t, fixture.profile)
+		requestDigest, err := gatewayUpgradeClaimRequestDigest(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stamp := formatTime(testNow.Add(time.Minute))
+		if _, err := fixture.db.Exec(`INSERT INTO lan_gateway_upgrade_claims(
+			operation_id,request_digest,approval_action,profile_revision_id,profile_revision_number,
+			profile_spec_digest,approved_by,approved_at,state,state_sequence,updated_at
+		) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, input.OperationID, requestDigest, ActionUpgradeGateway,
+			fixture.profile.ID, fixture.profile.RevisionNumber, fixture.profile.SpecDigest,
+			input.Approval.ActorID, stamp, GatewayProfileUpgradePrepared, 1, stamp); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.repository.GatewayUpgradeStartupSnapshot(context.Background()); !errors.Is(err, ErrInvalidStoredState) {
+			t.Fatalf("mixed committed and prepared claims error = %v", err)
+		}
+	})
+}
+
 func TestGatewayUpgradeStartupSnapshotRetainsRolledBackOlderProfileAndDemotedActor(t *testing.T) {
 	ctx := context.Background()
 	db := appAccessDB(t)
