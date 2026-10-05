@@ -50,6 +50,7 @@ merge or deployment.
 | 34 | `feature/hosting-m3-rebind-stage-config-docker-gate` | `1ba86c0` | Required hosted Docker direct-copy and lost-acknowledgment adoption gates |
 | 35 | `feature/hosting-m3-rebind-stage-start-intent` | `3dfee6b` | Protected sequence-nine exact start intent; no Docker start or listener effect |
 | 36 | `feature/hosting-m3-rebind-stage-start` | `b455d42` | Guarded exact successor start and protected sequence-ten serving proof; local only |
+| 37 | `feature/hosting-m3-rebind-stage-start-docker-gate` | `6a83056` | Required hosted Docker direct start, lost-acknowledgment adoption, compensation, and residue gates; local only |
 
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
@@ -81,9 +82,12 @@ the absent hosted physical proof. Row 36 adds guarded sequence-ten serving
 proof with direct-start, lost-acknowledgment, replay, drift, and compensation
 tests; its scoped evidence file records local checks and the absent hosted
 Docker acceptance. It remains local and unpublished.
+Row 37 adds three named hosted Docker tests and an always-run exact-resource
+residue scan. Its live tests only compiled and skipped on the local Windows
+host; physical Linux Docker acceptance is pending publication and execution.
 The Docker gates in rows 14, 16, and 25 have published drafts, but acceptance
 requires passing hosted execution at the relevant head. The Docker gates in
-rows 27, 29, 31, and 34 remain local and require separate publication approval
+rows 27, 29, 31, 34, and 37 remain local and require separate publication approval
 and hosted execution before they can count as acceptance evidence.
 
 These branches do not add a public rebind controller caller, terminal protected
