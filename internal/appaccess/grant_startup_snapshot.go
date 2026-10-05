@@ -15,6 +15,10 @@ type AppAccessGrantStartupClaim struct {
 	Revision                AppAccessRevision
 	Allocation              Allocation
 	Profile                 GatewayProfileRevision
+	EffectiveProfile        GatewayProfileRevision
+	CurrentGatewaySource    GatewayCurrentLineageRef
+	TransferChainTipDigest  string
+	TerminalReceiptDigest   string
 	AppArchived             bool
 	AccessHeadCurrent       bool
 	ProfileHeadCurrent      bool
