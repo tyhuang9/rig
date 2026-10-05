@@ -2,10 +2,15 @@ package appaccess
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	controldb "github.com/hostd/hostd/internal/database"
 )
 
 func TestGatewayRebindTransitionAppliesCompleteLifecycleAtomically(t *testing.T) {
@@ -115,6 +120,197 @@ func TestGatewayRebindTransitionRejectsExtraRosterTransferAtomically(t *testing.
 		t.Fatal("extra transfer committed")
 	}
 	assertGatewayRebindProjection(t, fixture, GatewayRebindSuccessorReady, 2, false, 0)
+}
+
+func TestGatewayRebindTransitionRetainsOneTerminalDecision(t *testing.T) {
+	t.Run("SQL rejects changed commit receipt", func(t *testing.T) {
+		fixture := newGatewayRebindFixture(t, true)
+		firstReceipt, secondReceipt := strings.Repeat("7", 64), strings.Repeat("9", 64)
+		if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(),
+			gatewayRebindProofForFixture(t, fixture, GatewayRebindPrepared, 1,
+				GatewayRebindSuccessorReady, firstReceipt, nil)); err != nil {
+			t.Fatal(err)
+		}
+		transfer := gatewayRebindTransferForFixture(t, fixture, secondReceipt)
+		conflict := gatewayRebindProofForFixture(t, fixture, GatewayRebindSuccessorReady, 2,
+			GatewayRebindDatabaseCommitted, secondReceipt, []GatewayRebindAllocationTransfer{transfer})
+		if err := insertGatewayRebindTransitionDirect(t, fixture, conflict); err == nil ||
+			!strings.Contains(err.Error(), "terminal decision is immutable") {
+			t.Fatalf("changed receipt direct SQL error=%v", err)
+		}
+		assertGatewayRebindProjection(t, fixture, GatewayRebindSuccessorReady, 2, false, 0)
+		assertGatewayRebindTerminalDecision(t, fixture, GatewayRebindDispositionCommit, firstReceipt, 1)
+	})
+
+	t.Run("commit forbids later abort before database commit", func(t *testing.T) {
+		fixture := newGatewayRebindFixture(t, true)
+		receipt := strings.Repeat("7", 64)
+		if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(),
+			gatewayRebindProofForFixture(t, fixture, GatewayRebindPrepared, 1,
+				GatewayRebindSuccessorReady, receipt, nil)); err != nil {
+			t.Fatal(err)
+		}
+		unresolved := gatewayRebindProofForFixture(t, fixture, GatewayRebindSuccessorReady, 2,
+			GatewayRebindUnresolved, receipt, nil)
+		if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(), unresolved); err != nil {
+			t.Fatal(err)
+		}
+		abort := gatewayRebindProofForFixture(t, fixture, GatewayRebindUnresolved, 3,
+			GatewayRebindRolledBack, strings.Repeat("9", 64), nil)
+		abort.TerminalDisposition = GatewayRebindDispositionAbort
+		abort.ExpectedHeadRevisionID = fixture.claim.Spec.PredecessorProfileRevisionID
+		abort.ExpectedHeadRevisionNumber = fixture.claim.Spec.PredecessorProfileRevisionNumber
+		abort.ExpectedHeadSpecDigest = fixture.claim.Spec.PredecessorProfileSpecDigest
+		if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(), abort); !errors.Is(err, ErrInvalidStoredState) {
+			t.Fatalf("abort after retained commit error=%v", err)
+		}
+		assertGatewayRebindProjection(t, fixture, GatewayRebindUnresolved, 3, false, 0)
+		assertGatewayRebindTerminalDecision(t, fixture, GatewayRebindDispositionCommit, receipt, 2)
+	})
+
+	t.Run("abort forbids later commit", func(t *testing.T) {
+		fixture := newGatewayRebindFixture(t, true)
+		abortReceipt := strings.Repeat("a", 64)
+		unresolved := gatewayRebindProofForFixture(t, fixture, GatewayRebindPrepared, 1,
+			GatewayRebindUnresolved, abortReceipt, nil)
+		unresolved.TerminalDisposition = GatewayRebindDispositionAbort
+		if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(), unresolved); err != nil {
+			t.Fatal(err)
+		}
+		commit := gatewayRebindProofForFixture(t, fixture, GatewayRebindUnresolved, 2,
+			GatewayRebindSuccessorReady, strings.Repeat("b", 64), nil)
+		commit.ExpectedHeadRevisionID = fixture.claim.Spec.PredecessorProfileRevisionID
+		commit.ExpectedHeadRevisionNumber = fixture.claim.Spec.PredecessorProfileRevisionNumber
+		commit.ExpectedHeadSpecDigest = fixture.claim.Spec.PredecessorProfileSpecDigest
+		if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(), commit); !errors.Is(err, ErrInvalidStoredState) {
+			t.Fatalf("commit after retained abort error=%v", err)
+		}
+		assertGatewayRebindProjection(t, fixture, GatewayRebindUnresolved, 2, false, 0)
+		assertGatewayRebindTerminalDecision(t, fixture, GatewayRebindDispositionAbort, abortReceipt, 1)
+	})
+
+	t.Run("undecided unresolved may later retain commit", func(t *testing.T) {
+		fixture := newGatewayRebindFixture(t, true)
+		unresolved := gatewayRebindProofForFixture(t, fixture, GatewayRebindPrepared, 1,
+			GatewayRebindUnresolved, "", nil)
+		unresolved.TerminalDisposition = GatewayRebindDispositionNone
+		if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(), unresolved); err != nil {
+			t.Fatal(err)
+		}
+		receipt := strings.Repeat("c", 64)
+		commit := gatewayRebindProofForFixture(t, fixture, GatewayRebindUnresolved, 2,
+			GatewayRebindSuccessorReady, receipt, nil)
+		commit.ExpectedHeadRevisionID = fixture.claim.Spec.PredecessorProfileRevisionID
+		commit.ExpectedHeadRevisionNumber = fixture.claim.Spec.PredecessorProfileRevisionNumber
+		commit.ExpectedHeadSpecDigest = fixture.claim.Spec.PredecessorProfileSpecDigest
+		if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(), commit); err != nil {
+			t.Fatalf("first retained terminal decision: %v", err)
+		}
+		assertGatewayRebindProjection(t, fixture, GatewayRebindSuccessorReady, 3, false, 0)
+		assertGatewayRebindTerminalDecision(t, fixture, GatewayRebindDispositionCommit, receipt, 1)
+	})
+}
+
+func TestGatewayRebindChainedTransferReadbackUsesDigestValue(t *testing.T) {
+	fixture := newGatewayRebindFixture(t, true)
+	left := gatewayRebindTransferForFixture(t, fixture, strings.Repeat("7", 64))
+	leftDigest := strings.Repeat("d", 64)
+	rightDigest := string([]byte(leftDigest))
+	left.PredecessorTransferDigest = &leftDigest
+	right := left
+	right.PredecessorTransferDigest = &rightDigest
+	if left.PredecessorTransferDigest == right.PredecessorTransferDigest {
+		t.Fatal("test requires distinct pointer identities")
+	}
+	if !sameGatewayRebindAllocationTransfer(left, right) {
+		t.Fatal("equal chained predecessor digest values failed readback comparison")
+	}
+	wrongDigest := strings.Repeat("e", 64)
+	right.PredecessorTransferDigest = &wrongDigest
+	if sameGatewayRebindAllocationTransfer(left, right) {
+		t.Fatal("different chained predecessor digest passed readback comparison")
+	}
+	right.PredecessorTransferDigest = nil
+	if sameGatewayRebindAllocationTransfer(left, right) {
+		t.Fatal("missing chained predecessor digest passed readback comparison")
+	}
+}
+
+func insertGatewayRebindTransitionDirect(t *testing.T, fixture gatewayRebindFixture,
+	proof GatewayRebindTransitionProof,
+) error {
+	t.Helper()
+	payload, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	commandDigest := hex.EncodeToString(sum[:])
+	guard := controldb.GatewayRebindTransitionGuard{
+		OperationID: proof.OperationID, Sequence: proof.ExpectedSequence + 1,
+		PreviousState: string(proof.ExpectedState), PreviousSequence: proof.ExpectedSequence,
+		NextState: string(proof.NextState), Purpose: proof.Purpose,
+		ProtectedRecordDigest:  proof.ProtectedRecordDigest,
+		TerminalReceiptDigest:  proof.TerminalReceiptDigest,
+		LocalAttestationDigest: proof.LocalAttestationDigest,
+		TerminalDisposition:    string(proof.TerminalDisposition), CommandDigest: commandDigest,
+		CanonicalPayload: string(payload),
+	}
+	nonce, revoke, err := controldb.ArmGatewayRebindTransitionGuard(guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer revoke()
+	_, err = fixture.db.Exec(`INSERT INTO lan_gateway_rebind_transition_commands(
+		operation_id,sequence,previous_state,previous_sequence,next_state,purpose,
+		protected_record_digest,terminal_receipt_digest,local_attestation_digest,
+		command_digest,created_at,proof_version,terminal_disposition,protected_generation,
+		protected_phase,protected_record_sequence,predecessor_checkpoint_digest,
+		source_state_version,source_state_revision,source_state_digest,
+		successor_operational_state_version,successor_operational_state_revision,
+		successor_operational_state_digest,transfer_manifest_digest,authorization_nonce,canonical_payload
+	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		proof.OperationID, proof.ExpectedSequence+1, proof.ExpectedState, proof.ExpectedSequence,
+		proof.NextState, proof.Purpose, proof.ProtectedRecordDigest,
+		nullableDigest(proof.TerminalReceiptDigest), nullableDigest(proof.LocalAttestationDigest),
+		commandDigest, formatTime(testNow), proof.Version, proof.TerminalDisposition,
+		int64(proof.ProtectedGeneration), proof.ProtectedPhase, int64(proof.ProtectedRecordSequence),
+		proof.PredecessorCheckpointDigest, int64(proof.SourceStateVersion), int64(proof.SourceStateRevision),
+		proof.SourceStateDigest, int64(proof.SuccessorOperationalStateVersion),
+		int64(proof.SuccessorOperationalStateRevision), nullableDigest(proof.SuccessorOperationalStateDigest),
+		nullableDigest(proof.TransferManifestDigest), nonce, string(payload))
+	return err
+}
+
+func assertGatewayRebindTerminalDecision(t *testing.T, fixture gatewayRebindFixture,
+	wantDisposition GatewayRebindTerminalDisposition, wantReceipt string, wantCount int,
+) {
+	t.Helper()
+	rows, err := fixture.db.Query(`SELECT terminal_disposition,terminal_receipt_digest
+		FROM lan_gateway_rebind_transition_commands
+		WHERE operation_id=? AND terminal_disposition<>'none' ORDER BY sequence`, fixture.claim.Spec.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var disposition GatewayRebindTerminalDisposition
+		var receipt string
+		if err := rows.Scan(&disposition, &receipt); err != nil {
+			t.Fatal(err)
+		}
+		if disposition != wantDisposition || receipt != wantReceipt {
+			t.Fatalf("retained decision=%s/%s want=%s/%s", disposition, receipt, wantDisposition, wantReceipt)
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if count != wantCount {
+		t.Fatalf("retained decision count=%d want=%d", count, wantCount)
+	}
 }
 
 func gatewayRebindTransferForFixture(t *testing.T, fixture gatewayRebindFixture,

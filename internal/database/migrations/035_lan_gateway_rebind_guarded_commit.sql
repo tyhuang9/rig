@@ -146,6 +146,9 @@ CREATE TRIGGER lan_gateway_rebind_claim_v2_source_insert
 BEFORE INSERT ON lan_gateway_rebind_claims
 WHEN NOT (
     (NEW.spec_format_version=1 AND NEW.roster_format_version=1
+     AND NEW.predecessor_source_kind='gateway_upgrade'
+     AND NEW.predecessor_rebind_operation_id IS NULL
+     AND NEW.predecessor_terminal_receipt_digest IS NULL
      AND NEW.predecessor_protected_generation=0
      AND NEW.predecessor_protected_journal_digest IS NULL
      AND NEW.predecessor_protected_intent_digest IS NULL
@@ -161,7 +164,6 @@ WHEN NOT (
      AND NEW.predecessor_checkpoint_digest IS NOT NULL
      AND (
       (NEW.predecessor_source_kind='gateway_upgrade'
-       AND NEW.predecessor_protected_generation=0
        AND NEW.predecessor_protected_journal_digest IS NOT NULL
        AND NEW.predecessor_protected_intent_digest IS NULL
        AND NEW.predecessor_terminal_receipt_digest IS NULL
@@ -383,7 +385,10 @@ BEGIN
            AND NEW.terminal_disposition='commit' AND NEW.terminal_receipt_digest IS NOT NULL)
           OR (NEW.next_state='rolled_back' AND NEW.terminal_disposition='abort'
               AND NEW.terminal_receipt_digest IS NOT NULL)
-          OR (NEW.next_state='unresolved' AND NEW.terminal_disposition IN ('none','commit','abort'))
+          OR (NEW.next_state='unresolved' AND (
+              (NEW.terminal_disposition='none' AND NEW.terminal_receipt_digest IS NULL)
+              OR (NEW.terminal_disposition IN ('commit','abort') AND NEW.terminal_receipt_digest IS NOT NULL)
+          ))
       )
       OR (NEW.next_state='committed' AND NEW.local_attestation_digest IS NULL)
       OR (NEW.next_state<>'committed' AND NEW.local_attestation_digest IS NOT NULL)
@@ -397,6 +402,14 @@ BEGIN
           )))
       OR (NEW.next_state<>'database_committed' AND json_array_length(NEW.canonical_payload,'$.transfers')<>0)
     THEN RAISE(ABORT, 'LAN gateway rebind transition proof is not exact') END;
+
+    SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM lan_gateway_rebind_transition_commands retained
+        WHERE retained.operation_id=NEW.operation_id
+          AND retained.terminal_disposition<>'none'
+          AND (retained.terminal_disposition IS NOT NEW.terminal_disposition
+               OR retained.terminal_receipt_digest IS NOT NEW.terminal_receipt_digest)
+    ) THEN RAISE(ABORT, 'LAN gateway rebind terminal decision is immutable') END;
 
     SELECT CASE WHEN EXISTS (
         SELECT 1 FROM lan_gateway_rebind_claim_events e

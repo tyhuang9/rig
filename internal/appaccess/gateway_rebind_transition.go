@@ -66,6 +66,19 @@ func (r *Repository) ApplyGatewayRebindTransition(ctx context.Context,
 			!sourceDigest.Valid || sourceDigest.String != proof.SourceStateDigest) {
 		return GatewayRebindTransitionCommand{}, ErrInvalidStoredState
 	}
+	var retainedDisposition, retainedReceipt sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT terminal_disposition,terminal_receipt_digest
+		FROM lan_gateway_rebind_transition_commands
+		WHERE operation_id=? AND terminal_disposition<>'none'
+		ORDER BY sequence LIMIT 1`, proof.OperationID).Scan(&retainedDisposition, &retainedReceipt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return GatewayRebindTransitionCommand{}, err
+	}
+	if err == nil && (!retainedDisposition.Valid || !retainedReceipt.Valid ||
+		retainedDisposition.String != string(proof.TerminalDisposition) ||
+		retainedReceipt.String != proof.TerminalReceiptDigest) {
+		return GatewayRebindTransitionCommand{}, ErrInvalidStoredState
+	}
 
 	stamp := r.now().UTC()
 	guard := controldb.GatewayRebindTransitionGuard{
@@ -147,7 +160,8 @@ func validateGatewayRebindTransitionProof(proof GatewayRebindTransitionProof) er
 			proof.TerminalDisposition != GatewayRebindDispositionAbort {
 			return ErrInvalidInput
 		}
-		if proof.TerminalReceiptDigest != "" && !validDigest(proof.TerminalReceiptDigest) {
+		if (proof.TerminalDisposition == GatewayRebindDispositionNone && proof.TerminalReceiptDigest != "") ||
+			(proof.TerminalDisposition != GatewayRebindDispositionNone && !validDigest(proof.TerminalReceiptDigest)) {
 			return ErrInvalidInput
 		}
 	default:
@@ -290,7 +304,7 @@ func readBackGatewayRebindTransition(ctx context.Context, tx *immediateTransacti
 				stored.PredecessorTransferDigest = &predecessor.String
 			}
 			expected := proof.Transfers[index]
-			if stored != expected {
+			if !sameGatewayRebindAllocationTransfer(stored, expected) {
 				return GatewayRebindTransitionCommand{}, ErrInvalidStoredState
 			}
 		}
@@ -312,6 +326,22 @@ func readBackGatewayRebindTransition(ctx context.Context, tx *immediateTransacti
 		TerminalDisposition:    proof.TerminalDisposition, CanonicalPayload: payload,
 		CommandDigest: commandDigest, CreatedAt: parsedAt,
 	}, nil
+}
+
+func sameGatewayRebindAllocationTransfer(left, right GatewayRebindAllocationTransfer) bool {
+	if (left.PredecessorTransferDigest == nil) != (right.PredecessorTransferDigest == nil) {
+		return false
+	}
+	leftPredecessor, rightPredecessor := "", ""
+	if left.PredecessorTransferDigest != nil {
+		leftPredecessor = *left.PredecessorTransferDigest
+	}
+	if right.PredecessorTransferDigest != nil {
+		rightPredecessor = *right.PredecessorTransferDigest
+	}
+	left.PredecessorTransferDigest = nil
+	right.PredecessorTransferDigest = nil
+	return left == right && leftPredecessor == rightPredecessor
 }
 
 func nullableDigest(value string) any {
