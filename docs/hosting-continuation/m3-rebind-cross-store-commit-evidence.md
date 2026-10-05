@@ -9,7 +9,7 @@ Base: `a888cac5f34c46aad74afd5c3a0392eec914c509`, the reviewed private handover
 candidate. That handover's draft-publication request is pending. Its prerequisite
 [draft PR #136](https://github.com/tyhuang9/rig/pull/136) was initially published at
 `bdbb697f767da4e71664da1434a75e6daec4b732`; its corrected current head is
-`46c8351c174f5c4ed788d04a733b61a5c72b1243`.
+`b46162ea4a97335976663770b17d2a44612cc3f9`.
 
 ## Purpose and required end state
 
@@ -387,6 +387,40 @@ job's required cleanup step passed:
 | #135 `f2b7815` | `TestLiveGatewayV2UpgradeCommitAndRestart` 40.12; `TestLiveGatewayV2BindConflictRollsBack` 21.94; `TestLiveGatewayRebindPassiveDockerSendsNoApplicationRequests` 32.60; `TestLiveGatewayRebindPublicPassivePredecessor` 40.82 | [Upgrade and passive proofs](https://github.com/tyhuang9/rig/actions/runs/37381953709/job/112005903979) |
 | #136 `46c8351` | `TestLiveGatewayV2UpgradeCommitAndRestart` 34.76; `TestLiveGatewayV2BindConflictRollsBack` 17.47; `TestLiveGatewayRebindPassiveDockerSendsNoApplicationRequests` 26.64; `TestLiveGatewayRebindPublicPassivePredecessor` 31.79 | [Upgrade and passive proofs](https://github.com/tyhuang9/rig/actions/runs/37381954436/job/112005925276) |
 | #136 `46c8351` | `TestLiveGatewayRebindSuccessorNetworkStage` 43.49 | [Network stage](https://github.com/tyhuang9/rig/actions/runs/37381954436/job/112005925497) |
+
+PR #136 at `46c8351` then passed both actual inactive-final-config Docker
+journeys, each exactly once with no failure/skip and successful complete cleanup:
+
+- [Direct copy](https://github.com/tyhuang9/rig/actions/runs/37381954436/job/112005925626):
+  `TestLiveGatewayRebindSuccessorFinalConfigCopy`, 106.94s.
+- [Lost acknowledgment](https://github.com/tyhuang9/rig/actions/runs/37381954436/job/112005925602):
+  `TestLiveGatewayRebindSuccessorFinalConfigCopyLostAcknowledgmentAdopts`, 125.82s.
+
+The corrected PR #135 stage-start run at `f2b7815` instead reported only a
+stopped-container cleanup error in each of its three tests, then failed the
+residue check. The exact sequence-eight reader used by cleanup rejected the
+Caddy autosave retained after a real start and stop. The focused test-only
+correction at `50c67b5` uses the existing production reader with the exact
+retained sequence-nine intent; no production parser or runtime behavior changed.
+All five autosave regressions passed in 9.056s, vet/integration-tag compilation
+passed, docs checks/build passed in 3.35s, and independent review approved the
+frozen change. Details and the failed job link are in the
+[stage-start evidence](./m3-rebind-stage-start-docker-gate-evidence.md#2026-10-05-cleanup-after-a-proved-stage-start).
+
+Normal atomic fast-forward updates published this fix to the already-authorized
+drafts. The exact open draft states and targets were rechecked:
+
+| Draft | Updated head |
+| --- | --- |
+| #134 | `50c67b58ef3dc3291c27f2c13f7cf8d525d0af68` |
+| #135 | `627beda512725d48c02dfb56b7dd4e984ec8426c` |
+| #136 | `b46162ea4a97335976663770b17d2a44612cc3f9` |
+
+The downstream #136 tree compiled after integration (ingress 0.755s, hostd
+cached), and the correction is integrated locally at `ef37d46`. The preceding
+final-config passes establish that source behavior; hosted CI must still verify
+stage cleanup and rerun the final-config journeys at the new head. Publication
+receipts are retained in `$TEMP/m3-stage-autosave-cleanup-20261005/`.
 
 ## Integrated cross-store checkpoints
 
