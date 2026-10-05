@@ -40,7 +40,7 @@ test and any remaining managed Docker resources or successor network name.
 | `go test -list '^TestLiveGatewayRebindSuccessorNetworkStage$' ./internal/generatedingress` | PASS; exact test discovered. |
 | `go test -run '^TestLiveGatewayRebindSuccessorNetworkStage$' -count=1 -v ./internal/generatedingress` | SKIP on Windows because `RIG_RUN_LIVE_GATEWAY_V2` is unset. The hosted job sets it and rejects a skip. |
 | `go test -count=1 -timeout=5m -run '^TestGatewayRebindStageNetwork' ./internal/generatedingress` | PASS, 25.812s on the original Docker-gate source. The corrected matcher and post-create no-binding regression passed in the row-24 focused run (34.596s) and in the final integrated full suite below. |
-| `go test -p=1 -count=1 -timeout=20m ./...` | PASS on the integrated route-correction and live-gate source; generated-ingress completed in 195.781s. |
+| `go test -p=1 -count=1 -timeout=20m ./...` | PASS on the corrected late-parity local source; generated-ingress completed in 192.522s. The earlier integrated source also passed in 195.781s. |
 | `go vet -tags live_docker ./internal/generatedingress` | PASS on the original Docker-gate source. |
 | `go vet ./...` | PASS on the integrated source. |
 | `pnpm --dir web install --frozen-lockfile --prefer-offline --fetch-retries=0` | PASS with the exact lockfile after the restricted-network attempt failed. |
@@ -49,7 +49,7 @@ test and any remaining managed Docker resources or successor network name.
 | `go build -buildvcs=false ./...` | PASS on the integrated source. Plain `go build ./...` could not obtain VCS status from this local worktree (exit 128), before compilation. |
 | `go test -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress` | PASS compilation on the integrated source; no physical Docker test executed. |
 | `pnpm --dir docs build`, `gofmt`, and `git diff --check` | PASS on the integrated source; no format or whitespace defects. |
-| Hosted Linux Docker live test and cleanup gate | PASS at code head `ad8d3e2`: the named test emitted a pass event in 54.89s and the always-run residue step succeeded in [job 111606812391](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391). Four earlier attempts failed; see below. The local Docker daemon is unavailable. |
+| Hosted Linux Docker live test and cleanup gate | PASS at code head `ad8d3e2`: the named test emitted a pass event in 54.89s and the always-run residue step succeeded in [job 111606812391](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391). The evidence-only head `f91140c` passed both steps in [job 111608189048](https://github.com/tyhuang9/rig/actions/runs/37261058988/job/111608189048). A later head `a5b4d10` failed a late predecessor-parity assertion, described below. The local Docker daemon is unavailable. |
 | Physical second-device LAN/address-change proof | Not run; outside this gate. |
 
 The focused fake stage suite failed inside the restricted Windows sandbox
@@ -146,6 +146,25 @@ The previous successful pre-correction generated-ingress race package had
 completed in 1074.037s, only 5.963s below that limit. The parent row-24 branch
 now raises the Go, step, and job budgets to 24, 26, and 35 minutes without
 removing test coverage. This correction has not yet passed hosted race CI.
+
+## Later hosted replay failure, 2026-10-05 UTC
+
+At head `a5b4d10`, [network-stage job 111614263763](https://github.com/tyhuang9/rig/actions/runs/37263115585/job/111614263763)
+reached the late predecessor-resource parity assertion after creating and
+replaying the successor network, then failed. That assertion combined a later
+Docker read, exact predecessor validation, and raw struct equality; the hosted
+log did not distinguish which predicate failed. The predecessor-mount
+validator already permits Docker to return the same two journal-bound mounts
+in either order, while raw equality treats a changed mount slice order as
+drift. Mount order is therefore a plausible explanation, not a proved cause
+of this run. The live assertion now uses the existing comparison that validates
+both exact mounts and ignores only their order; all other fields still compare.
+A new failure-only predicate reports whether the later Docker read and exact
+predecessor validation succeeded. The corrected-head hosted
+replay and cleanup gate remain pending. This failed run does not revoke the
+two immutable passing jobs, and it is not acceptance for the new head. The
+always-run residue step passed on this failed run, so no managed resource was
+left on that runner.
 
 ## Remaining work
 
