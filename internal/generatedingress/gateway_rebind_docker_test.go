@@ -197,6 +197,72 @@ func TestInspectGatewayRebindPreclaimWithDockerReadsTwiceWithoutEffects(t *testi
 	}
 }
 
+func TestGatewayRebindDockerTwoReadsAllowOnlyExactFinalMountReordering(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		prepared bool
+		stopped  bool
+	}{
+		{name: "preclaim"},
+		{name: "prepared running", prepared: true},
+		{name: "prepared stopped", prepared: true, stopped: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGatewayRebindPredecessorFixtureWithClaim(t, test.prepared)
+			reads := 0
+			inspect := func(_ context.Context, source routeState, state gatewayV2RouteState,
+				journal gatewayMigrationJournal,
+			) (gatewayV2DockerObservation, error) {
+				reads++
+				observation := gatewayRebindFixtureDockerObservation(t, fixture)
+				if test.stopped {
+					makeGatewayRebindPreparedStoppedObservation(&observation)
+				}
+				if len(observation.FinalContainer.Mounts) != 2 {
+					t.Fatal("final container fixture lacks two exact mounts")
+				}
+				if reads == 2 {
+					mounts := observation.FinalContainer.Mounts
+					mounts[0], mounts[1] = mounts[1], mounts[0]
+				}
+				if !validGatewayRebindPredecessorDocker(source, state, journal, observation) {
+					t.Fatal("valid predecessor rejected after only mount order changed")
+				}
+				return observation, nil
+			}
+			var err error
+			if test.prepared {
+				err = fixture.manager.inspectGatewayRebindPreparedDockerPredecessor(
+					context.Background(), fixture.repository, nil, inspect)
+			} else {
+				err = fixture.manager.inspectGatewayRebindPreclaimWithDocker(
+					context.Background(), fixture.repository, fixture.proposal, nil, inspect)
+			}
+			if err != nil || reads != 2 {
+				t.Fatalf("reordered final mounts rejected: err=%v reads=%d", err, reads)
+			}
+		})
+	}
+}
+
+func TestGatewayRebindDockerObservationComparisonRejectsMountAndOtherDrift(t *testing.T) {
+	fixture := newGatewayRebindPredecessorFixtureWithClaim(t, false)
+	first := gatewayRebindFixtureDockerObservation(t, fixture)
+	second := gatewayRebindFixtureDockerObservation(t, fixture)
+	if !sameGatewayRebindPredecessorDockerObservation(first, second, fixture.state.Identity) {
+		t.Fatal("identical Docker observations differ")
+	}
+	second.FinalContainer.Mounts[0].Name = "different-volume"
+	if sameGatewayRebindPredecessorDockerObservation(first, second, fixture.state.Identity) {
+		t.Fatal("different final volume accepted")
+	}
+	second = gatewayRebindFixtureDockerObservation(t, fixture)
+	second.FinalRuntime.RestartCount++
+	if sameGatewayRebindPredecessorDockerObservation(first, second, fixture.state.Identity) {
+		t.Fatal("different restart count accepted")
+	}
+}
+
 func TestInspectGatewayRebindPreclaimWithDockerRejectsValidInterReadDrift(t *testing.T) {
 	fixture := newGatewayRebindPredecessorFixtureWithClaim(t, false)
 	reads := 0
