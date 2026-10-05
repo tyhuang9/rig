@@ -246,6 +246,9 @@ WHEN NOT EXISTS (
       ON ar.app_id=ah.app_id AND ar.id=ah.revision_id AND ar.revision_number=ah.revision_number
     JOIN lan_app_access_grant_claims g
       ON g.attempt_id=NEW.grant_attempt_id AND g.allocation_id=a.id
+    JOIN lan_gateway_profile_revisions rawp
+      ON rawp.id=a.gateway_profile_revision_id
+     AND rawp.revision_number=a.gateway_profile_revision_number
     JOIN generated_runtime_active_heads rh ON rh.app_id=a.app_id
     WHERE c.operation_id=NEW.operation_id AND c.state='prepared'
       AND a.port=NEW.allocated_port AND app.archived_at IS NULL
@@ -261,6 +264,11 @@ WHEN NOT EXISTS (
       AND g.access_revision_id=ar.id
       AND g.access_revision_number=ar.revision_number
       AND g.allocation_owner_operation_id=a.owner_operation_id
+      AND ar.gateway_profile_revision_id=a.gateway_profile_revision_id
+      AND ar.gateway_profile_revision_number=a.gateway_profile_revision_number
+      AND g.gateway_profile_revision_id=a.gateway_profile_revision_id
+      AND g.gateway_profile_revision_number=a.gateway_profile_revision_number
+      AND g.gateway_profile_spec_digest=rawp.spec_digest
       AND g.state='committed' AND g.state_sequence=NEW.grant_state_sequence
       AND g.retired_at IS NULL
       AND g.protected_state_digest=NEW.grant_protected_state_digest
@@ -280,18 +288,14 @@ WHEN NOT EXISTS (
          AND NEW.source_profile_revision_id IS NOT NULL
          AND NEW.source_profile_revision_number IS NOT NULL
          AND NEW.source_profile_spec_digest IS NOT NULL
-         AND a.gateway_profile_revision_id=NEW.source_profile_revision_id
-         AND a.gateway_profile_revision_number=NEW.source_profile_revision_number
-         AND ar.gateway_profile_revision_id=NEW.source_profile_revision_id
-         AND ar.gateway_profile_revision_number=NEW.source_profile_revision_number
-         AND g.gateway_profile_revision_id=NEW.source_profile_revision_id
-         AND g.gateway_profile_revision_number=NEW.source_profile_revision_number
-         AND g.gateway_profile_spec_digest=NEW.source_profile_spec_digest
+         AND NEW.source_profile_revision_id=c.predecessor_profile_revision_id
+         AND NEW.source_profile_revision_number=c.predecessor_profile_revision_number
+         AND NEW.source_profile_spec_digest=c.predecessor_profile_spec_digest
          AND (
            (NEW.predecessor_transfer_digest IS NULL
-            AND NEW.source_profile_revision_id=c.predecessor_profile_revision_id
-            AND NEW.source_profile_revision_number=c.predecessor_profile_revision_number
-            AND NEW.source_profile_spec_digest=c.predecessor_profile_spec_digest)
+            AND a.gateway_profile_revision_id=NEW.source_profile_revision_id
+            AND a.gateway_profile_revision_number=NEW.source_profile_revision_number
+            AND rawp.spec_digest=NEW.source_profile_spec_digest)
            OR EXISTS (
              SELECT 1
              FROM lan_gateway_rebind_allocation_transfers t
@@ -306,12 +310,9 @@ WHEN NOT EXISTS (
              WHERE t.transfer_digest=NEW.predecessor_transfer_digest
                AND t.app_id=NEW.app_id AND t.allocation_id=NEW.allocation_id
                AND t.grant_attempt_id=NEW.grant_attempt_id
-               AND t.source_profile_revision_id=NEW.source_profile_revision_id
-               AND t.source_profile_revision_number=NEW.source_profile_revision_number
-               AND t.source_profile_spec_digest=NEW.source_profile_spec_digest
-               AND t.successor_profile_revision_id=c.predecessor_profile_revision_id
-               AND t.successor_profile_revision_number=c.predecessor_profile_revision_number
-               AND t.successor_profile_spec_digest=c.predecessor_profile_spec_digest
+               AND t.successor_profile_revision_id=NEW.source_profile_revision_id
+               AND t.successor_profile_revision_number=NEW.source_profile_revision_number
+               AND t.successor_profile_spec_digest=NEW.source_profile_spec_digest
                AND t.terminal_receipt_digest=c.predecessor_terminal_receipt_digest
                AND pcmd.terminal_receipt_digest=c.predecessor_terminal_receipt_digest
            )

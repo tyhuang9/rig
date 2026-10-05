@@ -121,9 +121,6 @@ func (r *Repository) readAppAccessOperatorSnapshot(ctx context.Context, tx *sql.
 		if live == nil || live.ID != current.Allocation.ID {
 			return AppAccessOperatorSnapshot{}, ErrInvalidStoredState
 		}
-		if err := validateOperatorCurrentProfile(ctx, tx, current.Allocation); err != nil {
-			return AppAccessOperatorSnapshot{}, err
-		}
 		value := *current
 		result.DesiredAccess = &value
 	} else if live != nil {
@@ -161,6 +158,24 @@ func (r *Repository) readAppAccessOperatorSnapshot(ctx context.Context, tx *sql.
 		}
 		if found {
 			result.GrantClaim = &grant
+			if grant.State == AppAccessGrantCommitted {
+				rawProfile, _, profileErr := readGatewayRevision(ctx, tx,
+					grant.Spec.GatewayProfileRevisionID, grant.Spec.GatewayProfileRevisionNumber)
+				if profileErr != nil || rawProfile.SpecDigest != grant.Spec.GatewayProfileSpecDigest {
+					return AppAccessOperatorSnapshot{}, operatorSnapshotStoredError(profileErr)
+				}
+				resolution, resolveErr := resolveGatewayBindingForConsumer(ctx, tx, GatewayBindingRef{
+					AppID: grant.Spec.AppID, AllocationID: grant.Spec.AllocationID,
+					AccessRevisionID: grant.Spec.AccessRevisionID, GrantAttemptID: grant.AttemptID,
+				}, rawProfile)
+				if resolveErr != nil || resolution.EffectiveProfile.ID == "" {
+					return AppAccessOperatorSnapshot{}, operatorSnapshotStoredError(resolveErr)
+				}
+			} else if err := validateOperatorCurrentProfile(ctx, tx, current.Allocation); err != nil {
+				return AppAccessOperatorSnapshot{}, err
+			}
+		} else if err := validateOperatorCurrentProfile(ctx, tx, current.Allocation); err != nil {
+			return AppAccessOperatorSnapshot{}, err
 		}
 	}
 	return result, nil

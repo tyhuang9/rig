@@ -134,6 +134,11 @@ func TestGatewayRebindV2CanonicalTypesRejectCrossVersionAndBrokenChains(t *testi
 	if _, err := GatewayRebindSpecV2Digest(storageOverflow); err == nil {
 		t.Fatal("source generation outside signed SQL storage was accepted")
 	}
+	noSuccessorGeneration := spec
+	noSuccessorGeneration.Predecessor.Lineage.ProtectedGeneration = math.MaxInt64
+	if _, err := GatewayRebindSpecV2Digest(noSuccessorGeneration); err == nil {
+		t.Fatal("source without a representable successor SQL generation was accepted")
+	}
 	rebindSource := spec
 	rebindSource.Predecessor.Lineage.Kind = GatewayRebindSourceGatewayRebind
 	rebindSource.Predecessor.Lineage.ProtectedGeneration = 1

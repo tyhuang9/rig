@@ -44,15 +44,16 @@ func (r *Repository) ApplyGatewayRebindTransition(ctx context.Context,
 		requestDigest, specDigest      string
 		state                          GatewayRebindState
 		sequence, specVersion          int64
+		updatedAt                      string
 		checkpointDigest, sourceDigest sql.NullString
 		sourceVersion, sourceRevision  sql.NullInt64
 	)
 	if err := tx.QueryRowContext(ctx, `SELECT request_digest,spec_digest,state,state_sequence,
 		spec_format_version,predecessor_checkpoint_digest,predecessor_source_state_version,
-		predecessor_source_state_revision,predecessor_source_state_digest
+		predecessor_source_state_revision,predecessor_source_state_digest,updated_at
 		FROM lan_gateway_rebind_claims WHERE operation_id=?`, proof.OperationID).Scan(
 		&requestDigest, &specDigest, &state, &sequence, &specVersion, &checkpointDigest,
-		&sourceVersion, &sourceRevision, &sourceDigest); err != nil {
+		&sourceVersion, &sourceRevision, &sourceDigest, &updatedAt); err != nil {
 		return GatewayRebindTransitionCommand{}, invalidRebindStoredState(err)
 	}
 	if requestDigest != proof.ClaimRequestDigest || specDigest != proof.ClaimSpecDigest ||
@@ -80,7 +81,14 @@ func (r *Repository) ApplyGatewayRebindTransition(ctx context.Context,
 		return GatewayRebindTransitionCommand{}, ErrInvalidStoredState
 	}
 
+	lastUpdate, err := parseTime(updatedAt)
+	if err != nil {
+		return GatewayRebindTransitionCommand{}, ErrInvalidStoredState
+	}
 	stamp := r.now().UTC()
+	if stamp.Before(lastUpdate) {
+		stamp = lastUpdate
+	}
 	guard := controldb.GatewayRebindTransitionGuard{
 		OperationID: proof.OperationID, Sequence: proof.ExpectedSequence + 1,
 		PreviousState: string(proof.ExpectedState), PreviousSequence: proof.ExpectedSequence,

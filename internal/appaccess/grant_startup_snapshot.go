@@ -17,6 +17,7 @@ type AppAccessGrantStartupClaim struct {
 	Profile                 GatewayProfileRevision
 	EffectiveProfile        GatewayProfileRevision
 	CurrentGatewaySource    GatewayCurrentAuthorityRef
+	TransferChain           []GatewayRebindAllocationTransfer
 	TransferChainTipDigest  string
 	TerminalReceiptDigest   string
 	AppArchived             bool
@@ -264,6 +265,22 @@ func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID s
 		Profile: profile, EffectiveProfile: profile,
 		DisableIntent: disableIntent,
 	}
+	if claim.State == AppAccessGrantCommitted {
+		resolution, resolveErr := resolveGatewayBindingForConsumer(ctx, tx, GatewayBindingRef{
+			AppID: claim.Spec.AppID, AllocationID: claim.Spec.AllocationID,
+			AccessRevisionID: claim.Spec.AccessRevisionID, GrantAttemptID: claim.AttemptID,
+		}, profile)
+		if resolveErr != nil || resolution.RawProfile.ID != profile.ID ||
+			resolution.RawProfile.RevisionNumber != profile.RevisionNumber ||
+			resolution.RawProfile.SpecDigest != profile.SpecDigest {
+			return AppAccessGrantStartupClaim{}, invalidRebindStoredState(resolveErr)
+		}
+		value.EffectiveProfile = resolution.EffectiveProfile
+		value.CurrentGatewaySource = resolution.CurrentGatewaySource
+		value.TransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
+		value.TransferChainTipDigest = resolution.TransferChainTipDigest
+		value.TerminalReceiptDigest = resolution.TerminalReceiptDigest
+	}
 	var archived sql.NullString
 	if err := tx.QueryRowContext(ctx, `SELECT archived_at FROM applications WHERE id=?`, claim.Spec.AppID).Scan(&archived); errors.Is(err, sql.ErrNoRows) {
 		return AppAccessGrantStartupClaim{}, ErrInvalidStoredState
@@ -282,7 +299,7 @@ func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID s
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM lan_gateway_profile_heads
 		WHERE singleton=1 AND revision_id=? AND revision_number=?
-	)`, claim.Spec.GatewayProfileRevisionID, claim.Spec.GatewayProfileRevisionNumber).Scan(&current); err != nil {
+	)`, value.EffectiveProfile.ID, value.EffectiveProfile.RevisionNumber).Scan(&current); err != nil {
 		return AppAccessGrantStartupClaim{}, err
 	}
 	value.ProfileHeadCurrent = current == 1

@@ -171,6 +171,13 @@ type GatewayRebindClaimV2 struct {
 	UpdatedAt                     time.Time
 }
 
+type GatewayRebindPreclaimProposalV2 struct {
+	Spec              GatewayRebindSpecV2
+	RebindApproval    Approval
+	ConfigureApproval Approval
+	Roster            []GatewayRebindRosterEntryV2
+}
+
 // GatewayRebindClaimRecord is an explicit stored-format union. Exactly one
 // claim pointer is set and SpecVersion selects its canonical validation path.
 type GatewayRebindClaimRecord struct {
@@ -417,7 +424,7 @@ func validGatewayCurrentLineageRef(value GatewayCurrentLineageRef) bool {
 }
 
 func validGatewayRebindSourceRef(value GatewayRebindSourceRef) bool {
-	if !validGatewayCurrentLineageRef(value.Lineage) || value.Lineage.ProtectedGeneration > math.MaxInt64 ||
+	if !validGatewayCurrentLineageRef(value.Lineage) || value.Lineage.ProtectedGeneration >= math.MaxInt64 ||
 		!validDigest(value.SourceStateDigest) || !validDigest(value.PredecessorCheckpointDigest) {
 		return false
 	}
