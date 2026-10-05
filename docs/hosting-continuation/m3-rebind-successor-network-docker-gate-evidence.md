@@ -144,7 +144,7 @@ gate. At evidence-only head `f91140c`, [job 111608365118](https://github.com/tyh
 timed out at the inherited 18-minute Go package limit, without a race report.
 The previous successful pre-correction generated-ingress race package had
 completed in 1074.037s, only 5.963s below that limit. The parent row-24 branch
-now raises the Go, step, and job budgets to 24, 26, and 30 minutes without
+now raises the Go, step, and job budgets to 24, 26, and 35 minutes without
 removing test coverage. This correction has not yet passed hosted race CI.
 
 ## Remaining work
