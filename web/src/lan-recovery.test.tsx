@@ -406,7 +406,7 @@ describe("LAN recovery review", () => {
     expect(grant).not.toHaveBeenCalled();
     expect(screen.queryByRole("button", { name: /Reconcile exact/ })).toBeNull();
     expect(screen.queryByRole("button", { name: "Load a fresh recovery review" })).toBeNull();
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Reconciliation blocked" }));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Reconciliation blocked" })));
   });
 
   it("fails closed when the freshly fetched observation does not match the head", async () => {
