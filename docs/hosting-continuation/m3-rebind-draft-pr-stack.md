@@ -4,13 +4,15 @@ Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
 draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
 published branch targets its preceding branch with one review scope. Rows
 26–37 remain local and require separate publication approval; they have
-inherited the corrected row-25 head `f91140c` through additive merges. The
-first four hosted row-25 network Docker attempts failed. The fifth and sixth
-passed the required live network-stage test and residue gate at code head
-`ad8d3e2` and current evidence-only head `f91140c`, respectively. This is
-network-stage acceptance on hosted Linux. The later volume, container, config,
-and start Docker gates remain unrun on hosted Linux. No draft publication
-authorizes merge or deployment.
+inherited the row-25 evidence head `f1707e9` through additive merges. The
+first four hosted row-25 network Docker attempts failed; the fifth and sixth
+passed the required live network-stage test and residue gate at `ad8d3e2` and
+`f91140c`. A later replay parity assertion failed at `a5b4d10`. The corrected
+hosted job passed the named test and residue gate at `fd68ab8`; its evidence
+was committed at `f1707e9`. This is network-stage acceptance on hosted Linux
+at the tested code head. The later volume, container, config, and start Docker
+gates remain unrun on hosted Linux. No draft publication authorizes merge or
+deployment.
 
 | Order | Branch | Scope commit | Review scope |
 | --- | --- | --- | --- |
@@ -65,7 +67,12 @@ head. The first four hosted row-25 Docker attempts failed and remain in the
 row-25 evidence file. The [fifth hosted network-stage job](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391)
 passed the required named live test at code head `ad8d3e2` in 54.89 seconds,
 and its always-run residue step passed. This establishes the private network
-stage on that hosted runner. Rows 26 and 27 passed their final-source Go suites,
+stage on that hosted runner.
+The [corrected hosted network-stage job](https://github.com/tyhuang9/rig/actions/runs/37264835255/job/111619317032)
+passed the named test in 51.70 seconds and its always-run cleanup at `fd68ab8`.
+The expanded-budget race package passed at `a5b4d10` in 1116.225 seconds;
+race verification at the corrected and evidence-only heads remains pending.
+Rows 26 and 27 passed their final-source Go suites,
 vet, builds, and relevant focused checks before this network-route correction
 was integrated. Row 28 passed its original final-source Go suite, vet, build,
 and Docker-tagged compile. Row 27's live test compiled and skipped locally;
