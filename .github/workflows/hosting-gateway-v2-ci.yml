@@ -19,7 +19,7 @@ jobs:
   gateway-v2-live:
     name: Gateway v2 upgrade, restart, and bind-conflict rollback
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Check out source
         timeout-minutes: 2
@@ -97,6 +97,29 @@ jobs:
           trap 'rm -f "$output"' EXIT
           package_name='github.com/hostd/hostd/internal/generatedingress'
           test_name='TestLiveGatewayRebindPassiveDockerSendsNoApplicationRequests'
+          go test -json -v -count=1 -timeout=25m ./internal/generatedingress -run "^${test_name}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" \
+            'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' \
+            "$output" > /dev/null
+          if jq -e --arg package_name "$package_name" --arg test_name "$test_name" \
+            'select(.Action == "skip" and .Package == $package_name and .Test == $test_name)' \
+            "$output" > /dev/null; then
+            printf 'Required live Docker test skipped: %s\n' "$test_name" >&2
+            exit 1
+          fi
+
+      - name: Prove public rebind attestors send no routed app requests
+        if: ${{ !cancelled() }}
+        timeout-minutes: 26
+        shell: bash
+        env:
+          RIG_RUN_LIVE_GATEWAY_V2: "1"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          package_name='github.com/hostd/hostd/internal/generatedingress'
+          test_name='TestLiveGatewayRebindPublicPassivePredecessor'
           go test -json -v -count=1 -timeout=25m ./internal/generatedingress -run "^${test_name}$" | tee "$output"
           jq -e --arg package_name "$package_name" --arg test_name "$test_name" \
             'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' \
