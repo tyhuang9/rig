@@ -202,8 +202,12 @@ func (liveGatewayRebindGrantLease) Release() error { return nil }
 
 func seedLiveGatewayRebindPublicPassiveLineage(t *testing.T, fixture *liveGatewayV2Fixture,
 	db *sql.DB, repository *appaccess.Repository, profile appaccess.GatewayProfileRevision,
+	successorOverride ...appaccess.GatewayProfileSpec,
 ) appaccess.GatewayRebindPreclaimProposal {
 	t.Helper()
+	if len(successorOverride) > 1 {
+		t.Fatal("live rebind lineage received multiple successor profiles")
+	}
 	ctx := fixture.ctx
 	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at)
 		VALUES(?,?,?,'draft',datetime('now'),datetime('now'))`, fixture.spec.appID,
@@ -303,6 +307,9 @@ func seedLiveGatewayRebindPublicPassiveLineage(t *testing.T, fixture *liveGatewa
 	successor := appaccess.GatewayProfileSpec{
 		SelectedIPv4: "192.168.97.8", InterfaceID: "rebind-live-successor",
 		PortStart: fixture.port, PortEnd: fixture.port,
+	}
+	if len(successorOverride) == 1 {
+		successor = successorOverride[0]
 	}
 	spec := appaccess.GatewayRebindSpec{
 		OperationID:                        rebindOperationID,

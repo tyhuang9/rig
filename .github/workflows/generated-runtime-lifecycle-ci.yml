@@ -218,9 +218,13 @@ jobs:
           fi
 
   generated-runtime-race:
-    name: Generated runtime race verification
+    name: Generated runtime race tests (${{ matrix.suite }})
     runs-on: ubuntu-24.04
     timeout-minutes: 42
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [runtime-packages, gateway-v2, ingress-remainder]
     steps:
       - name: Check out source
         timeout-minutes: 2
@@ -237,14 +241,52 @@ jobs:
 
       - name: Run generated-runtime race tests
         timeout-minutes: 34
-        run: >-
-          go test -race -count=1 -timeout=32m
-          ./internal/projectanalysis
-          ./internal/deploymentplans
-          ./internal/generatedimage
-          ./internal/generatedruntime
-          ./internal/generatedingress
-          ./internal/generatedexecutor
-          ./internal/generatedruntimestate
-          ./internal/generatedrecovery
-          ./internal/autodeploy
+        shell: bash
+        env:
+          RACE_SUITE: ${{ matrix.suite }}
+        run: |
+          set -euo pipefail
+          filter=()
+          # These complementary filters retain every ingress test and its full
+          # subtest tree. Keep the other packages unfiltered.
+          gateway_v2_pattern='^TestGatewayV2'
+          case "$RACE_SUITE" in
+            runtime-packages)
+              packages=(
+                ./internal/projectanalysis
+                ./internal/deploymentplans
+                ./internal/generatedimage
+                ./internal/generatedruntime
+                ./internal/generatedexecutor
+                ./internal/generatedruntimestate
+                ./internal/generatedrecovery
+                ./internal/autodeploy
+              )
+              ;;
+            gateway-v2)
+              packages=(./internal/generatedingress)
+              filter=(-run "$gateway_v2_pattern")
+              ;;
+            ingress-remainder)
+              packages=(./internal/generatedingress)
+              filter=(-skip "$gateway_v2_pattern")
+              ;;
+            *) exit 1 ;;
+          esac
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          go test -json -race -count=1 -timeout=32m "${filter[@]}" "${packages[@]}" | tee "$output"
+          # An empty selection must not satisfy a required race check.
+          jq -se 'any(.[]; .Action == "pass" and ((.Test // "") | test("^Test[^/]+$")))' "$output" > /dev/null
+
+  generated-runtime-race-gate:
+    name: Generated runtime race verification
+    if: ${{ always() }}
+    needs: generated-runtime-race
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every generated-runtime race batch
+        env:
+          RACE_RESULT: ${{ needs.generated-runtime-race.result }}
+        run: test "$RACE_RESULT" = success

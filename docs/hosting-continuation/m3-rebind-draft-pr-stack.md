@@ -1,11 +1,10 @@
 # M3 rebind draft PR stack
 
-Status: local, unpublished plan as of 2026-10-03. The published base is draft
-PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each scope
-commit is an immediate descendant of the previous row's scope commit. Each
-draft would target the previous row's branch; row 15 also includes this plan
-document after its scope commit. None of these rows authorizes a merge or
-deployment.
+Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
+draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
+row's branch descends from the preceding row's branch and targets it with one
+review scope. The branch sequence has been preserved with additive CI repair
+merges. Publication of these drafts does not authorize merge or deployment.
 
 | Order | Branch | Scope commit | Review scope |
 | --- | --- | --- | --- |
@@ -24,15 +23,35 @@ deployment.
 | 13 | `feature/hosting-m3-rebind-prepared-docker-attestation` | `b0bd439` | Prepared-claim Docker proof and zero app probes |
 | 14 | `feature/hosting-m3-passive-docker-live-gate` | `cdf00f5` | Required hosted Docker request-counter gate |
 | 15 | `feature/hosting-m3-rebind-preclaim-successor` | `112723a` | Zero-claim successor network preflight |
+| 16 | `feature/hosting-m3-rebind-public-passive-docker-gate` | `b6f9609` | Required hosted Docker gate for public passive rebind attestors |
+| 17 | `feature/hosting-m3-rebind-successor-identity` | `150623a` | Generation-scoped private successor resource identity |
+| 18 | `feature/hosting-m3-rebind-successor-intent` | `e9e5ace` | Protected successor intent shape and digest |
+| 19 | `feature/hosting-m3-rebind-protected-intent` | `9c2dae3` | Create-only successor protected intent history |
+| 20 | `feature/hosting-m3-rebind-sql-ledger` | `2eaf35d` | Dormant migration-034 rebind claim and fence |
+| 21 | `feature/hosting-m3-rebind-effect-boundary-attestor` | `58523f4` | Prepared rebind effect-boundary proof |
+| 22 | `feature/hosting-m3-rebind-progress-history` | `de25a22` | Append-only pre-effect rebind progress |
+| 23 | `feature/hosting-m3-rebind-progress-attestation` | `ad9471a` | Progress bound into the effect-boundary attestation |
+| 24 | `feature/hosting-m3-rebind-guarded-nonterminal` | `542ce48` | Private successor ingress-network Docker effect |
+| 25 | `feature/hosting-m3-rebind-network-docker-gate` | `f00f911` | Required hosted Docker test of the exact network effect and Linux bridge delta |
 
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
-502 web tests, web production build, and hostd build. Earlier rows record
-their exact local checks in their respective evidence files. PR #97's hosted
-checks passed at its published head. The Docker request-counter gate in row 14
-has only compiled and skipped locally; hosted execution is pending publication.
+502 web tests, web production build, and hostd build. Later rows record their
+own exact local checks and limitations in their evidence files. The table's
+commit column identifies each original branch slice; subsequent corrective
+commits remain in the same branches. Row 25's integrated route correction
+passed the serialized full Go suite, vet, build, Docker-tagged compilation,
+and docs build. Earlier web typecheck, 502 tests, and production build passed
+before the Go-only correction. PR #97's hosted checks passed at its published
+head. The first four hosted row-25 Docker attempts failed and remain in the
+row-25 evidence file. The [fifth hosted network-stage job](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391)
+passed the required named live test at code head `ad8d3e2` in 54.89 seconds,
+and its always-run residue step passed. This establishes the private network
+stage on that hosted runner; it does not establish later successor effects.
 
-These branches do not add a production rebind claim writer, migration 034,
-successor cutover, transfer-aware readers, recovery or fence release. Migration
-033 remains dormant and unreleasable. Publication, merging, deployment, Linux
-race, and physical second-device LAN acceptance are separate gates.
+These branches do not add a public rebind controller caller, terminal protected
+receipt, successor cutover, transfer-aware readers, recovery, or fence release.
+Migrations 033 and 034 remain dormant and unreleasable. Merging, deployment,
+Linux race, and physical second-device LAN acceptance are separate
+gates. The create-before-bind crash window after the row-24 network effect
+remains unresolved and fenced.

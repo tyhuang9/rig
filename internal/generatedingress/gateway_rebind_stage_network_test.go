@@ -169,6 +169,75 @@ func TestGatewayRebindStageNetworkCreatesBindsAndReplays(t *testing.T) {
 	}
 }
 
+func TestGatewayRebindStageNetworkCreatePathAllowsOnlyExactFinalMountReordering(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		mutate    func(int, *gatewayV2DockerObservation)
+		wantError bool
+		wantReads int
+	}{
+		{name: "alternating exact mount order", mutate: func(read int, value *gatewayV2DockerObservation) {
+			if read%2 == 0 {
+				value.FinalContainer.Mounts[0], value.FinalContainer.Mounts[1] =
+					value.FinalContainer.Mounts[1], value.FinalContainer.Mounts[0]
+			}
+		}, wantReads: 8},
+		{name: "wrong mount", mutate: func(read int, value *gatewayV2DockerObservation) {
+			if read == 2 {
+				value.FinalContainer.Mounts[0].Name = "different-volume"
+			}
+		}, wantError: true, wantReads: 2},
+		{name: "non-mount drift", mutate: func(read int, value *gatewayV2DockerObservation) {
+			if read == 2 {
+				value.Final404Proven = !value.Final404Proven
+			}
+		}, wantError: true, wantReads: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGatewayRebindEffectBoundaryFixture(t)
+			records := installGatewayRebindEffectBoundaryProgress(t, fixture, 2)
+			fake, reads := gatewayRebindStageNetworkTestDriver(fixture)
+			dockerReads := 0
+			inspect := func(_ context.Context, _ routeState, _ gatewayV2RouteState,
+				_ gatewayMigrationJournal,
+			) (gatewayV2DockerObservation, error) {
+				dockerReads++
+				observation := gatewayRebindFixtureDockerObservation(t, fixture.predecessor)
+				test.mutate(dockerReads, &observation)
+				return observation, nil
+			}
+
+			err := fixture.predecessor.manager.stageGatewayRebindSuccessorNetworkWithDriver(
+				context.Background(), fixture.predecessor.repository, reads, inspect, fake,
+				gatewayRebindProgressTimestamp(3), nil)
+			if (err != nil) != test.wantError || dockerReads != test.wantReads {
+				t.Fatalf("stage create error=%v reads=%d want_error=%t want_reads=%d",
+					err, dockerReads, test.wantError, test.wantReads)
+			}
+
+			history, scanErr := fixture.predecessor.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+			if test.wantError {
+				if scanErr != nil || len(history.Progress) != 2 || fake.createCalls != 0 {
+					t.Fatalf("rejected create path mutated state: progress=%d create=%d scan_error=%v",
+						len(history.Progress), fake.createCalls, scanErr)
+				}
+				return
+			}
+			if scanErr != nil || len(history.Progress) != 3 || fake.createCalls != 1 {
+				t.Fatalf("accepted create path state: progress=%d create=%d scan_error=%v",
+					len(history.Progress), fake.createCalls, scanErr)
+			}
+			bound := history.Progress[2].Record
+			ownership, digestErr := gatewayRebindStageNetworkOwnershipDigest(fixture.intent)
+			if digestErr != nil || bound.Sequence != 3 || bound.PreviousDigest != records[1].Digest ||
+				bound.Stage == nil || bound.Stage.Network == nil || bound.Stage.Network.ID != fake.id ||
+				bound.Stage.Network.OwnershipDigest != ownership {
+				t.Fatalf("invalid protected sequence-three network binding: %#v digest_error=%v", bound, digestErr)
+			}
+		})
+	}
+}
+
 func TestGatewayRebindStageNetworkAttestationAllowsOnlyExactFinalMountReordering(t *testing.T) {
 	for _, test := range []struct {
 		name    string
