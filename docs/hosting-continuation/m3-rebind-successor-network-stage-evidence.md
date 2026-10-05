@@ -60,7 +60,7 @@ requires a separately reviewed pre-effect nonce or equivalent durable proof.
 | `go vet ./...` and `go build -buildvcs=false ./...` | PASS on the corrected final source. |
 | `go test -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress` | PASS compilation only; no live Docker test ran. |
 | `pnpm --dir docs build` and `git diff --check` | PASS after the evidence update; no production deployment was attempted. |
-| Live Docker acceptance | NOT PASSED: the local Docker named pipe `//./pipe/docker_engine` is unavailable. Hosted [PR #122](https://github.com/tyhuang9/rig/pull/122) has a separate required Docker gate; its fourth diagnostic run failed before this route matcher correction. |
+| Live Docker acceptance | PASS for the private network stage on hosted Linux: [job 111606812391](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391) passed the named test and residue at code head `ad8d3e2`; [job 111608189048](https://github.com/tyhuang9/rig/actions/runs/37261058988/job/111608189048) passed both at the evidence-only head `f91140c`. The local Docker named pipe remains unavailable. |
 
 Behavioral tests cover clean creation and exact replay, foreign deterministic
 names, exact and unexpected owned volumes, topology drift adjacent to create,
@@ -86,11 +86,21 @@ review found no new ownership or unrelated-route bypass. The existing Linux
 route snapshot retains destination prefixes but not next hops or route tables;
 that preexisting semantic limit remains.
 
+The broader generated-runtime race job is a separate PR-readiness gate. Its
+last successful pre-correction run took 1074.037s for
+`internal/generatedingress` against an 18-minute (1080s) Go test timeout.
+After the added route regressions, [PR #121's race job](https://github.com/tyhuang9/rig/actions/runs/37260578548/job/111606761789)
+and [PR #122's race job](https://github.com/tyhuang9/rig/actions/runs/37261058991/job/111608365118)
+both timed out at 1080s without a race report. The generated-runtime race
+workflow now allows 24 minutes for Go tests, 26 minutes for the step, and 35
+minutes for the job; test coverage and assertions are unchanged. This is a
+CI time-budget correction, not a passing race result. A hosted rerun is required.
+
 ## Remaining gates
 
 The config and data volumes, stopped successor container, serving transition,
 route publication, terminal protected receipt, SQLite terminal transition,
-migration-035 fence release, public caller, hosted Linux race and live-Docker
-checks, physical second-device LAN proof, merge, and deployment
+migration-035 fence release, public caller, passing hosted Linux race and later
+Docker-effect checks, physical second-device LAN proof, merge, and deployment
 remain open. The create-before-bind crash window requires deliberate recovery
 work before this path can be described as automatically crash recoverable.
