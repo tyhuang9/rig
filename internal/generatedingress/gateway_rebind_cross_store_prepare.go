@@ -35,9 +35,9 @@ type gatewayRebindPreparedAttempt struct {
 // first progress record. A failure after that SQL commit deliberately leaves
 // the fence active for startup recovery.
 func (m *Manager) prepareGatewayRebindLocked(ctx context.Context, repository gatewayRebindAdmissionRepository,
-	input gatewayRebindCommitInput, occurredAt time.Time,
+	input gatewayRebindCommitInput,
 ) (gatewayRebindPreparedAttempt, error) {
-	if m == nil || ctx == nil || repository == nil || !validGatewayRebindProgressTime(occurredAt) {
+	if m == nil || ctx == nil || repository == nil {
 		return gatewayRebindPreparedAttempt{}, &Error{Code: DiagnosticValidationFailed}
 	}
 	observed, err := m.inspectGatewayRebindProposalLocked(ctx, repository, GatewayRebindProposalInput{
@@ -78,18 +78,16 @@ func (m *Manager) prepareGatewayRebindLocked(ctx context.Context, repository gat
 		}
 	}
 	return m.installGatewayRebindPreparedProtectedLocked(ctx, claim, input.Inspection.Roster,
-		checkpoint, occurredAt)
+		checkpoint, m.gatewayRebindProgressTime())
 }
 
 func (m *Manager) recoverGatewayRebindPreparedAdmissionLocked(ctx context.Context,
 	repository gatewayRebindProposalRepository, snapshot appaccess.GatewayRebindRecoverySnapshot,
-	occurredAt time.Time,
 ) (gatewayRebindPreparedAttempt, error) {
 	if m == nil || ctx == nil || repository == nil || snapshot.Active == nil ||
 		snapshot.Active.Claim.SpecVersion != appaccess.GatewayRebindSpecVersionV2 ||
 		snapshot.Active.Claim.V2 == nil || snapshot.Phase != appaccess.GatewayRebindPrepared ||
-		!snapshot.RollbackAllowed || snapshot.DatabaseCommitObserved || snapshot.DatabaseCommittedEvent != nil ||
-		!validGatewayRebindProgressTime(occurredAt) {
+		!snapshot.RollbackAllowed || snapshot.DatabaseCommitObserved || snapshot.DatabaseCommittedEvent != nil {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}
 	claim := *snapshot.Active.Claim.V2
@@ -107,7 +105,14 @@ func (m *Manager) recoverGatewayRebindPreparedAdmissionLocked(ctx context.Contex
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}
 	return m.installGatewayRebindPreparedProtectedLocked(ctx, claim, snapshot.Active.RosterV2,
-		checkpoint, occurredAt)
+		checkpoint, m.gatewayRebindProgressTime())
+}
+
+func (m *Manager) gatewayRebindProgressTime() time.Time {
+	if m != nil && m.gatewayRebindClock != nil {
+		return m.gatewayRebindClock().UTC()
+	}
+	return time.Now().UTC()
 }
 
 func (m *Manager) installGatewayRebindPreparedProtectedLocked(ctx context.Context,
@@ -122,6 +127,26 @@ func (m *Manager) installGatewayRebindPreparedProtectedLocked(ctx context.Contex
 	if err != nil || ensureGatewayRebindCheckpoint(checkpointStore, checkpoint) != nil {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}
+	intentStore, err := newGatewayRebindProtectedIntentV2Store(m.options.DataRoot,
+		checkpoint.Generation, checkpoint.OperationID)
+	if err == nil {
+		if installedIntent, loadErr := intentStore.load(); loadErr == nil {
+			if installedIntent.Claim.RequestDigest != claim.RequestDigest ||
+				installedIntent.Predecessor != checkpoint.sourceRef() ||
+				!reflect.DeepEqual(installedIntent.Roster, roster) {
+				return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+			}
+			progressStore, progressStoreErr := newGatewayRebindProgressStore(m.options.DataRoot,
+				installedIntent.Generation, installedIntent.OperationID, 1)
+			if progressStoreErr == nil {
+				if installedProgress, progressErr := progressStore.load(); progressErr == nil &&
+					gatewayRebindProgressMatchesIntentV2(installedProgress, installedIntent, nil) {
+					return gatewayRebindPreparedAttempt{Claim: claim, Checkpoint: checkpoint,
+						Intent: installedIntent, Progress: installedProgress}, nil
+				}
+			}
+		}
+	}
 	network, err := m.observeGatewayRebindV2SuccessorNetworkLocked(ctx, claim)
 	if err != nil {
 		return gatewayRebindPreparedAttempt{}, err
@@ -130,7 +155,7 @@ func (m *Manager) installGatewayRebindPreparedProtectedLocked(ctx context.Contex
 	if err != nil {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}
-	intentStore, err := newGatewayRebindProtectedIntentV2Store(m.options.DataRoot, intent.Generation, intent.OperationID)
+	intentStore, err = newGatewayRebindProtectedIntentV2Store(m.options.DataRoot, intent.Generation, intent.OperationID)
 	if err != nil || ensureGatewayRebindIntentV2(intentStore, intent) != nil {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}

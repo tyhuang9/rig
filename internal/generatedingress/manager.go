@@ -86,6 +86,9 @@ type Manager struct {
 	// gatewayRebindAfterClaim is a package-test crash boundary after the SQL
 	// prepared commit and before any protected checkpoint write.
 	gatewayRebindAfterClaim func(context.Context, appaccess.GatewayRebindClaimV2) error
+	// gatewayRebindClock is read only after a SQL transition returns. Tests
+	// replace it to pin protected record times.
+	gatewayRebindClock func() time.Time
 	// gatewayTopologyObserver is replaceable only by package tests. Production
 	// always uses the full read-only Docker attestation.
 	gatewayTopologyObserver func(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayObservedTopology

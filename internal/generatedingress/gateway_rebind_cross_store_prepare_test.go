@@ -93,12 +93,12 @@ func TestPrepareGatewayRebindLockedClaimsBeforeProtectedIntent(t *testing.T) {
 		value.ProfileSpecDigest = claim.ConfigureApproval.SpecDigest
 		return value, nil
 	}
+	fixture.manager.gatewayRebindClock = func() time.Time { return time.Unix(4, 0).UTC() }
 	release, err := fixture.manager.lockGatewayRaw(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	attempt, prepareErr := fixture.manager.prepareGatewayRebindLocked(context.Background(), repository,
-		input, time.Unix(4, 0).UTC())
+	attempt, prepareErr := fixture.manager.prepareGatewayRebindLocked(context.Background(), repository, input)
 	if releaseErr := release(); releaseErr != nil {
 		t.Fatal(releaseErr)
 	}
@@ -146,12 +146,12 @@ func TestRecoverGatewayRebindPreparedAdmissionUsesRetainedClaimGenerationAfterPr
 			SpecDigest: inspection.SuccessorProfileSpecDigest, ActorID: uuid.NewString()}}
 	crash := errors.New("injected crash after SQL prepared commit")
 	fixture.manager.gatewayRebindAfterClaim = func(context.Context, appaccess.GatewayRebindClaimV2) error { return crash }
+	fixture.manager.gatewayRebindClock = func() time.Time { return time.Unix(4, 0).UTC() }
 	release, err := fixture.manager.lockGatewayRaw(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, prepareErr := fixture.manager.prepareGatewayRebindLocked(context.Background(), repository,
-		input, time.Unix(4, 0).UTC())
+	_, prepareErr := fixture.manager.prepareGatewayRebindLocked(context.Background(), repository, input)
 	if releaseErr := release(); releaseErr != nil {
 		t.Fatal(releaseErr)
 	}
@@ -170,6 +170,7 @@ func TestRecoverGatewayRebindPreparedAdmissionUsesRetainedClaimGenerationAfterPr
 		}
 	}
 	fixture.manager.gatewayRebindAfterClaim = nil
+	fixture.manager.gatewayRebindClock = func() time.Time { return time.Unix(5, 0).UTC() }
 	fixture.manager.gatewayRebindV2NetworkObserver = func(_ context.Context,
 		claim appaccess.GatewayRebindClaimV2,
 	) (gatewayRebindSuccessorNetworkObservation, error) {
@@ -184,7 +185,7 @@ func TestRecoverGatewayRebindPreparedAdmissionUsesRetainedClaimGenerationAfterPr
 		t.Fatal(err)
 	}
 	recovered, recoverErr := fixture.manager.recoverGatewayRebindPreparedAdmissionLocked(context.Background(),
-		repository, repository.snapshot, time.Unix(5, 0).UTC())
+		repository, repository.snapshot)
 	if releaseErr := release(); releaseErr != nil {
 		t.Fatal(releaseErr)
 	}
