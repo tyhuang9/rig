@@ -48,6 +48,7 @@ merge or deployment.
 | 33 | `feature/hosting-m3-rebind-stage-config-copy` | `0143b51` | Guarded sequence-eight exact config copy and protected readback receipt |
 | 34 | `feature/hosting-m3-rebind-stage-config-docker-gate` | `1ba86c0` | Required hosted Docker direct-copy and lost-acknowledgment adoption gates |
 | 35 | `feature/hosting-m3-rebind-stage-start-intent` | `3dfee6b` | Protected sequence-nine exact start intent; no Docker start or listener effect |
+| 36 | `feature/hosting-m3-rebind-stage-start` | `b455d42` | Guarded exact successor start and protected sequence-ten serving proof; local only |
 
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
@@ -75,7 +76,10 @@ test, which passed in isolation and in the serialized full suite. Row 34's
 evidence file records the exact results. Row 35 passed its focused sequence-nine
 tests, final-source serialized full Go suite, vet, build, Docker-tagged compile,
 formatting, and diff checks. Its evidence file records the exact results and
-the absent hosted physical proof.
+the absent hosted physical proof. Row 36 adds guarded sequence-ten serving
+proof with direct-start, lost-acknowledgment, replay, drift, and compensation
+tests; its scoped evidence file records local checks and the absent hosted
+Docker acceptance. It remains local and unpublished.
 The Docker gates in rows 14, 16, 25, 27, 29, 31, and 34 require publication
 and hosted execution before they can count as acceptance evidence.
 
