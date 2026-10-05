@@ -79,8 +79,12 @@ post-effect predicate returned the error, so the network gate remains failed.
 The local unpublished row-21 and row-24 corrections normalize only the order
 of the independently validated exact predecessor Docker mounts in transient
 observation digests; they preserve all other drift checks and protected record
-bytes. Focused stage-network tests, the serialized uncached Go suite
-(`internal/generatedingress` 198.001s), `go vet ./...`, and
+bytes. Commit `cccbee3` covers the full pre-create path: alternating exact
+mount order across eight predecessor reads creates one network and binds
+sequence three, while wrong mounts and non-mount drift fail before create.
+The focused stage-network group passed in 39.386s. The final-source serialized
+uncached Go suite passed with every package (`internal/generatedingress`
+219.779s). `go vet ./...` and
 `go build -buildvcs=false ./...` passed at the local row-25 tip. Security
 review found no ownership or history bypass. These corrections have not yet
 run on hosted Docker and are not claimed as the cause or remedy of either
