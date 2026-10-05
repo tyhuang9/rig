@@ -1,15 +1,12 @@
 # M3 rebind draft PR stack
 
-Status: rows 1–25 were published as stacked draft PRs #98–#122 on 2026-10-04
-with the user's explicit approval. The published base is draft PR #97,
-`feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each row's branch
-descends from the preceding row's branch and targets it with one review scope.
-Rows 26–35 remain local and unpublished. Row 15 includes the initial version
-of this plan after its scope commit; rows 25, 27, 28, 29, 30, 31, 34, and 35
-update it. The hosted row-25 network Docker gate was still queued at the last
-check, so no hosted acceptance is claimed for it. Rows 26–35 require separate
-publication approval after that gate passes. No draft publication authorizes
-merge or deployment.
+Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
+draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
+row's branch descends from the preceding row's branch and targets it with one
+review scope. Rows 26–35 remain local and require separate publication
+approval. The first two hosted row-25 network Docker attempts failed; the
+corrected head's required job is queued, so no hosted network-stage acceptance
+is claimed. No draft publication authorizes merge or deployment.
 
 | Order | Branch | Scope commit | Review scope |
 | --- | --- | --- | --- |

@@ -130,6 +130,8 @@ func TestLiveGatewayRebindSuccessorNetworkStage(t *testing.T) {
 	stageTime := baseTime.Add(2 * time.Nanosecond)
 	if err := fixture.ingress.stageGatewayRebindSuccessorNetwork(fixture.ctx, repository, reads,
 		fixture.ingress.inspectGatewayRebindDocker, stageTime, nil); err != nil {
+		logLiveGatewayRebindStageNetworkFailure(t, fixture, repository, reads, intent,
+			beforeRoute, predecessorState, predecessorJournal)
 		clearGatewayV2DockerObservation(&beforeDocker)
 		failLiveIngress(t, "stage live rebind successor network", err)
 	}
@@ -222,6 +224,80 @@ func TestLiveGatewayRebindSuccessorNetworkStage(t *testing.T) {
 	if got := liveGatewayRebindReadRequestCount(t, fixture, fixture.candidates[0].ContainerID); got.Routed != baseline.Routed {
 		t.Fatal("successor network stage or replay forwarded an application request")
 	}
+}
+
+// Log only predicates and counts so a failed hosted run identifies which
+// post-create proof failed without printing Docker IDs or protected contents.
+func logLiveGatewayRebindStageNetworkFailure(t *testing.T, fixture *liveGatewayV2Fixture,
+	repository *appaccess.Repository, reads gatewayRebindSuccessorPreflightReads,
+	intent gatewayRebindProtectedIntent, source routeState, state gatewayV2RouteState,
+	journal gatewayMigrationJournal,
+) {
+	t.Helper()
+	ctx := fixture.ctx
+	history, historyErr := fixture.ingress.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	progressCount := -1
+	if historyErr == nil {
+		progressCount = len(history.Progress)
+	}
+	anchor, anchorErr := fixture.ingress.readGatewayRebindEffectBoundaryAnchor(ctx, repository)
+	t.Logf("rebind network failure: progress_scan_ok=%t progress_count=%d anchor_ok=%t anchor_progress_count=%d",
+		historyErr == nil, progressCount, anchorErr == nil, anchor.progressCount)
+
+	driver := managerGatewayRebindStageNetworkDriver{manager: fixture.ingress}
+	observed, observeErr := driver.inspect(ctx, intent)
+	exactNetwork := observeErr == nil && observed.Found &&
+		validGatewayRebindStageNetworkObservation(intent, observed, observed.ID)
+	t.Logf("rebind network failure: network_inspect_ok=%t network_found=%t network_exact=%t",
+		observeErr == nil, observed.Found, exactNetwork)
+
+	candidates, candidatesErr := reads.network.candidates()
+	host, hostErr := reads.network.host()
+	ids, idsErr := reads.dockerIDs(ctx)
+	prefixes, prefixesErr := reads.network.docker(ctx)
+	projected := gatewayRebindCandidateProjection(candidates)
+	candidatesExact := candidatesErr == nil && validGatewayRebindStageNetworkHostDelta(intent,
+		projected, intent.NetworkObservation.HostRoutes, intent.NetworkObservation.HostInterfaces)
+	routes, routeErr := canonicalGatewayRebindPrefixes(host.Routes)
+	interfaces, interfaceErr := canonicalGatewayRebindPrefixes(host.Interfaces)
+	routesExact := hostErr == nil && routeErr == nil && gatewayRebindPrefixesMatchBaselineOrPlan(
+		routes, intent.NetworkObservation.HostRoutes, intent.Intent.Network.Subnet)
+	interfacesExact := hostErr == nil && interfaceErr == nil && gatewayRebindPrefixesMatchBaselineOrPlan(
+		interfaces, intent.NetworkObservation.HostInterfaces, intent.Intent.Network.Subnet)
+	expectedIDs := append([]string{}, intent.NetworkObservation.DockerNetworkIDs...)
+	expectedIDs = append(expectedIDs, observed.ID)
+	sort.Strings(expectedIDs)
+	idsExact := idsErr == nil && validContainerID(observed.ID) &&
+		validGatewayRebindSuccessorDockerIDs(ids) &&
+		equalStrings(ids, expectedIDs)
+	dockerPrefixes, prefixErr := canonicalGatewayRebindPrefixes(prefixes)
+	expectedPrefixes := append([]string{}, intent.NetworkObservation.DockerPrefixes...)
+	expectedPrefixes = append(expectedPrefixes, intent.Intent.Network.Subnet)
+	sort.Strings(expectedPrefixes)
+	prefixesExact := prefixesErr == nil && prefixErr == nil && equalStrings(dockerPrefixes, expectedPrefixes)
+	physicalReadOK := false
+	if validContainerID(observed.ID) {
+		_, physicalErr := readGatewayRebindStageNetworkPhysicalObservation(ctx, reads, driver, intent, observed.ID)
+		physicalReadOK = physicalErr == nil
+	}
+	t.Logf("rebind network failure: candidates_read_ok=%t bridge_candidate_exact=%t host_read_ok=%t routes_exact=%t interfaces_exact=%t docker_ids_read_ok=%t docker_ids_exact=%t docker_prefixes_read_ok=%t docker_prefixes_exact=%t physical_read_ok=%t",
+		candidatesErr == nil, candidatesExact, hostErr == nil, routesExact, interfacesExact,
+		idsErr == nil, idsExact, prefixesErr == nil, prefixesExact, physicalReadOK)
+
+	first, firstErr := fixture.ingress.inspectGatewayRebindDocker(ctx, source, state, journal)
+	second, secondErr := fixture.ingress.inspectGatewayRebindDocker(ctx, source, state, journal)
+	firstValid := firstErr == nil && validGatewayRebindPredecessorDocker(source, state, journal, first)
+	secondValid := secondErr == nil && validGatewayRebindPredecessorDocker(source, state, journal, second)
+	semanticEqual := firstValid && secondValid && sameGatewayRebindPredecessorDockerObservation(
+		first, second, state.Identity)
+	firstDigest, firstDigestErr := canonicalDigest(first)
+	secondDigest, secondDigestErr := canonicalDigest(second)
+	rawDigestEqual := firstValid && secondValid && firstDigestErr == nil && secondDigestErr == nil &&
+		firstDigest == secondDigest
+	clearGatewayV2DockerObservation(&first)
+	clearGatewayV2DockerObservation(&second)
+	t.Logf("rebind network failure: predecessor_first_valid=%t predecessor_second_valid=%t predecessor_semantic_equal=%t predecessor_raw_digest_equal=%t",
+		firstValid, secondValid, semanticEqual, rawDigestEqual)
 }
 
 func prepareLiveGatewayRebindStagePredecessor(t *testing.T, fixture *liveGatewayV2Fixture,

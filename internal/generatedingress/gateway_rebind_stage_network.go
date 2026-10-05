@@ -453,7 +453,7 @@ func (m *Manager) readGatewayRebindStageNetworkAttestation(ctx context.Context,
 		anchor.predecessor.Journal, docker) {
 		return gatewayRebindStageNetworkAttestation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
-	dockerDigest, err := canonicalDigest(docker)
+	dockerDigest, err := gatewayRebindEffectBoundaryDockerDigest(docker, anchor.predecessor.State.Identity)
 	if err != nil {
 		return gatewayRebindStageNetworkAttestation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
