@@ -1,7 +1,8 @@
 # M3 inactive final configuration copy
 
-Status: implementation reviewed and local verification complete. Not published;
-physical hosted acceptance is pending.
+Status: published as [draft PR #136](https://github.com/tyhuang9/rig/pull/136).
+Implementation reviewed and local verification complete; physical hosted
+acceptance is pending. The original approved publication head was `bdbb697`.
 
 Base: draft PR
 [#135](https://github.com/tyhuang9/rig/pull/135).
@@ -12,6 +13,30 @@ additively for the hosted corrections below. Implementation commit
 `7d83b583a6d219fbf58043cef18cb108527434dc` includes the production volume
 corrections and migration-journey assertion fix. Later source checkpoints
 must retain their own verification results.
+
+## 2026-10-05 hosted fixture correction
+
+PR #135's inherited stage-start gate at `e46185f` failed before a stage could
+run: its fixture assigned the successor the same IPv4/port still held by the
+live predecessor. All three stage-start cases and cleanup failed; the actual
+job log retained three containers in `Created` state. See the exact
+[job evidence](https://github.com/tyhuang9/rig/actions/runs/37373345314/job/111975694535).
+
+The reviewed correction at `b938a7a` was merged additively through PR #135.
+It uses two distinct addresses on an explicitly enabled, owned dummy adapter
+and preserves all runtime and cleanup proofs. This branch's two final-copy
+matrix jobs use the same corrected stage fixture, so they also explicitly
+enable the new network fixture, verify its prerequisites, and reject owned
+adapter residue. No production source changed in this correction.
+
+Integration-tag compilation passed for generated-ingress (1.035s) and hostd
+(0.956s), intentionally without executing tests. Workflow YAML and all 32 shell
+scripts passed syntax checks using the repository's existing parser and Git
+Bash. Both named final-copy tests were discovered and explicitly skipped without
+the required opt-ins. The docs workflow and build passed (VitePress 4.85s), and
+independent review found no blocking issue in the downstream workflow change.
+These local checks do not prove real Docker behavior; new hosted results are
+required.
 
 ## Purpose and invariants
 
@@ -52,7 +77,7 @@ and prior resource identities; they do not replace future SQL transfer ledgers.
 | Driver and TAR inventory | Both orders, large pair over 64 KiB, strict types/paths/metadata/padding, bounded output, sanitized failures and cleared buffers, exact identity bindings | Six focused driver/parser tests passed in 1.777s after review exposed and corrected missing direct stage-to-intent topology comparisons. |
 | Coordinator and immutable receipt | Copy, no-copy replay/adoption, absent-effect retry, cancellation/readback errors, checkpoint drift, ambiguous write, forged history, unchanged sequences 1–11 | The final-config-copy group passed in 159.687s. A standalone predecessor-checkpoint regression passed in 11.545s. Old stage-copy success, sequence-eleven success, old-phase rejection and progress checks passed in 66.417s. |
 | Integrated verification | Full Go suite, vet/build, tagged compilation, formatting, diff checks, docs build and independent review | Full serialized Go suite, vet, build and tagged compilation passed at `7d83b583`; ingress took 1049.473s. At final source `0aa8d785`, all 68 focused tests passed once without skips in 443.511s, followed by repository-wide vet/build and tagged compilation. |
-| Real Docker acceptance | Direct copy and lost-acknowledgment journeys, fresh-Manager replay, unchanged live config/SQL/routes/predecessor and application-request count, exact cleanup | Two named tests and required hosted workflow gates added on this same branch. Both tests were discovered and skipped locally with the explicit disposable-Linux `RIG_RUN_LIVE_GATEWAY_V2` opt-in unset; hosted execution remains pending publication. Compilation and skip are not Docker acceptance. |
+| Real Docker acceptance | Direct copy and lost-acknowledgment journeys, fresh-Manager replay, unchanged live config/SQL/routes/predecessor and application-request count, exact cleanup | Two named tests and required hosted workflow gates added on this same branch. Both were discovered and skipped locally without explicit opt-in. The draft is published; hosted execution must verify the corrected distinct-address fixture. Compilation and skip are not Docker acceptance. |
 
 Baseline command:
 
