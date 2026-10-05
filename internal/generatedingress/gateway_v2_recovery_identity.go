@@ -48,7 +48,7 @@ func (m *Manager) observeGatewayV2StoppedStageForCompensation(ctx context.Contex
 	if m == nil || ctx == nil || journal.Phase != gatewayPhaseStageIntent || !validGatewayTopologyInputs(source, state, journal) {
 		return false
 	}
-	observation, err := m.inspectGatewayV2DockerWithStageConfig(ctx, source, state, journal, false, true)
+	observation, err := m.inspectGatewayV2DockerWithStageConfig(ctx, source, state, journal, false, gatewayV2DockerProbeServing)
 	if err != nil {
 		clearGatewayV2DockerObservation(&observation)
 		return false

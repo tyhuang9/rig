@@ -262,14 +262,66 @@ func (m *Manager) observeGatewayV2MixedRestart(ctx context.Context, source route
 }
 
 func (m *Manager) inspectGatewayV2Docker(ctx context.Context, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal) (gatewayV2DockerObservation, error) {
-	return m.inspectGatewayV2DockerWithStageConfig(ctx, source, state, journal, true, true)
+	return m.inspectGatewayV2DockerWithStageConfig(ctx, source, state, journal, true, gatewayV2DockerProbeServing)
+}
+
+type gatewayV2DockerProbePolicy uint8
+
+const (
+	// Serving topology checks may send requests through Caddy to hosted apps.
+	gatewayV2DockerProbeServing gatewayV2DockerProbePolicy = iota + 1
+	// Rebind admission proves static ownership and configuration only. The old
+	// LAN address may be absent, and app routes must not receive probe traffic.
+	gatewayV2DockerProbePassiveRebind
+)
+
+type gatewayV2ServingProbeCallbacks struct {
+	stage404    func() bool
+	stageHost   func() bool
+	final404    func() bool
+	finalRoutes func() bool
+	finalHost   func() bool
+}
+
+// Passive rebind inspection must never dispatch an app-forwarding route or
+// status probe: a routed GET could mutate an application-owned database.
+// The separate Caddy admin config read remains passive. Serving checks retain
+// their HTTP evidence for the normal v2 lifecycle.
+func observeGatewayV2ServingProbes(policy gatewayV2DockerProbePolicy, observation *gatewayV2DockerObservation,
+	probes gatewayV2ServingProbeCallbacks,
+) {
+	if policy != gatewayV2DockerProbeServing || observation == nil {
+		return
+	}
+	if observation.StageContainerFound && observation.StageContainer.Running && !observation.StageContainer.Restarting {
+		if probes.stage404 != nil {
+			observation.Stage404Proven = probes.stage404()
+		}
+		if probes.stageHost != nil {
+			observation.StageHostPublicationProven = probes.stageHost()
+		}
+	}
+	if observation.FinalContainerFound && observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
+		if probes.final404 != nil {
+			observation.Final404Proven = probes.final404()
+		}
+		if probes.finalRoutes != nil {
+			observation.FinalRoutesProven = probes.finalRoutes()
+		}
+		if probes.finalHost != nil {
+			observation.FinalHostPublicationProven = probes.finalHost()
+		}
+	}
 }
 
 // The compensation-only path may inspect a stopped, ID-bound stage whose
 // restart config was never copied before a crash. It must never use this
 // observation to start a listener or attest serving topology.
-func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, requireStoppedStageConfig, probeHostPublication bool) (gatewayV2DockerObservation, error) {
+func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal, requireStoppedStageConfig bool, probePolicy gatewayV2DockerProbePolicy) (gatewayV2DockerObservation, error) {
 	var observation gatewayV2DockerObservation
+	if probePolicy != gatewayV2DockerProbeServing && probePolicy != gatewayV2DockerProbePassiveRebind {
+		return observation, errors.New("invalid generated ingress Docker probe policy")
+	}
 	var err error
 	observation.Image, observation.ImageFound, err = m.inspectImage(ctx)
 	if err != nil {
@@ -374,12 +426,6 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 				return observation, err
 			}
 		}
-		if observation.StageContainer.Running && !observation.StageContainer.Restarting {
-			observation.Stage404Proven = m.proveGatewayV2Stage404(ctx, state, observation.StageContainer.ID)
-			if probeHostPublication {
-				observation.StageHostPublicationProven = proveGatewayV2StageHostPublication(ctx, state, observation.StageContainer.ID, probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
-			}
-		}
 	}
 	if observation.FinalContainerFound {
 		if observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
@@ -391,9 +437,6 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 		observation.FinalRestartConfig, err = m.inspectStoppedCaddyRestartConfig(ctx, observation.FinalContainer.ID, state.Identity.ActiveConfigFilename)
 		if err != nil {
 			return observation, err
-		}
-		if observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
-			observation.Final404Proven = m.proveGatewayV2Final404(ctx, state, observation.FinalContainer.ID)
 		}
 	}
 
@@ -420,12 +463,21 @@ func (m *Manager) inspectGatewayV2DockerWithStageConfig(ctx context.Context, sou
 			return observation, err
 		}
 	}
-	if observation.FinalContainerFound && observation.FinalContainer.Running && !observation.FinalContainer.Restarting {
-		observation.FinalRoutesProven = m.proveGatewayV2FinalRoutes(ctx, state, observation.FinalContainer.ID)
-		if probeHostPublication {
-			observation.FinalHostPublicationProven = proveGatewayV2FinalHostPublication(ctx, state, observation.FinalContainer.ID, probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
-		}
-	}
+	observeGatewayV2ServingProbes(probePolicy, &observation, gatewayV2ServingProbeCallbacks{
+		stage404: func() bool { return m.proveGatewayV2Stage404(ctx, state, observation.StageContainer.ID) },
+		stageHost: func() bool {
+			return proveGatewayV2StageHostPublication(ctx, state, observation.StageContainer.ID,
+				probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
+		},
+		final404: func() bool { return m.proveGatewayV2Final404(ctx, state, observation.FinalContainer.ID) },
+		finalRoutes: func() bool {
+			return m.proveGatewayV2FinalRoutes(ctx, state, observation.FinalContainer.ID)
+		},
+		finalHost: func() bool {
+			return proveGatewayV2FinalHostPublication(ctx, state, observation.FinalContainer.ID,
+				probeGatewayV2HostStatus, m.probeGatewayV2ContainerChallenge)
+		},
+	})
 
 	v1ConfigStable := true
 	if observation.V1ContainerFound {
