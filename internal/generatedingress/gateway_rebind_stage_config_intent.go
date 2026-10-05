@@ -60,33 +60,51 @@ func (d managerGatewayRebindStageConfigIntentDriver) configVolumeEmpty(ctx conte
 }
 
 // gatewayRebindExactEmptyConfigVolumeArchive accepts only the successful tar
-// shape produced for an empty /config directory. Unexpected files, links,
-// metadata entries, malformed archives, and truncated command output all fail
-// closed before sequence seven can authorize a later copy.
+// shape produced for /config without configuration files. Docker may seed one
+// exact empty caddy/ directory from the pinned image. Unexpected files, links,
+// metadata entries, malformed archives, and truncated command output fail closed.
 func gatewayRebindExactEmptyConfigVolumeArchive(value []byte) error {
 	const tarBlockSize = 512
-	// An empty archive must contain the root directory header followed by the
-	// two complete zero blocks required by the TAR end marker. More zero record
-	// padding is permitted, but every byte after the root header must be zero.
 	if len(value) < 3*tarBlockSize || len(value) > defaultOutputLimit || len(value)%tarBlockSize != 0 {
 		return errors.New("generated ingress rebind config volume archive is invalid")
 	}
 	source := bytes.NewReader(value)
 	reader := tar.NewReader(source)
 	header, err := reader.Next()
-	if err != nil || header == nil || header.Typeflag != tar.TypeDir || header.Size != 0 || header.Linkname != "" ||
+	if err != nil || header == nil || len(value)-source.Len() != tarBlockSize ||
+		header.Typeflag != tar.TypeDir || header.Size != 0 || header.Linkname != "" ||
 		(header.Name != "." && header.Name != "./") {
 		return errors.New("generated ingress rebind config volume archive is not empty")
 	}
-	if _, err := reader.Next(); err != io.EOF {
+	offset := tarBlockSize
+	header, err = reader.Next()
+	if err != io.EOF {
+		if err != nil || len(value)-source.Len() != 2*tarBlockSize || !validGatewayRebindPinnedImageConfigDirectory(header) {
+			return errors.New("generated ingress rebind config volume archive has unexpected entries")
+		}
+		offset += tarBlockSize
+		_, err = reader.Next()
+	}
+	if err != io.EOF {
 		return errors.New("generated ingress rebind config volume archive has unexpected entries")
 	}
-	for _, value := range value[tarBlockSize:] {
+	// Preserve two complete zero end blocks and reject hidden metadata records,
+	// incomplete trailers and all data after the explicitly permitted headers.
+	if len(value) < offset+2*tarBlockSize {
+		return errors.New("generated ingress rebind config volume archive is truncated")
+	}
+	for _, value := range value[offset:] {
 		if value != 0 {
 			return errors.New("generated ingress rebind config volume archive has trailing data")
 		}
 	}
 	return nil
+}
+
+func validGatewayRebindPinnedImageConfigDirectory(header *tar.Header) bool {
+	return header != nil && (header.Name == "caddy/" || header.Name == "./caddy/") &&
+		header.Typeflag == tar.TypeDir && header.Size == 0 && header.Linkname == "" &&
+		header.Uid == 0 && header.Gid == 0 && header.Mode == 0o1777
 }
 
 // gatewayRebindStageConfigBytes is the sequence-seven v1 byte format. Protected
