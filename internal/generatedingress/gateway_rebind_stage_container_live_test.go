@@ -488,11 +488,21 @@ func cleanupLiveGatewayRebindStoppedStageContainer(t *testing.T, fixture *liveGa
 			return false
 		}
 		defer clear(expected)
-		copyDriver := managerGatewayRebindStageConfigCopyDriver{manager: fixture.ingress}
-		inventory, inventoryErr := copyDriver.configVolumeInventory(ctx, intent,
-			*history.Progress[7].Record.Stage, expected)
+		inventoryStage := *history.Progress[7].Record.Stage
+		if len(history.Progress) >= 9 {
+			if history.Progress[8].Record.Stage == nil {
+				t.Error("live stopped-container cleanup lacks its protected start intent; retaining resources")
+				return false
+			}
+			// A proved stop can retain Caddy's exact autosave after a start.
+			// The production reader requires the unchanged durable start intent
+			// before allowing that snapshot alongside the approved stage file.
+			inventoryStage = *history.Progress[8].Record.Stage
+		}
+		copyDriver := managerGatewayRebindStageStartIntentDriver{manager: fixture.ingress}
+		inventory, inventoryErr := copyDriver.configVolumeInventory(ctx, intent, inventoryStage, expected)
 		if inventoryErr != nil || inventory != gatewayRebindStageConfigInventoryExact {
-			t.Error("live stopped-container cleanup cannot prove the exact sequence-eight config file; retaining resources")
+			t.Error("live stopped-container cleanup cannot prove the exact authorized stage configuration; retaining resources")
 			return false
 		}
 	}
