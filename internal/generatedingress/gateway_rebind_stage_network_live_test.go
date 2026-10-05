@@ -215,8 +215,15 @@ func TestLiveGatewayRebindSuccessorNetworkStage(t *testing.T) {
 	}
 	afterDocker, err := fixture.ingress.inspectGatewayRebindDocker(
 		fixture.ctx, afterRoute, afterState, afterJournal)
-	if err != nil || !validGatewayRebindPredecessorDocker(afterRoute, afterState, afterJournal, afterDocker) ||
-		!reflect.DeepEqual(beforeDocker, afterDocker) {
+	validAfterDocker := err == nil &&
+		validGatewayRebindPredecessorDocker(afterRoute, afterState, afterJournal, afterDocker)
+	// Each snapshot proves the exact two journal-bound mounts. Docker may return
+	// those mounts in a different order on a later inspect.
+	semanticEqual := validAfterDocker &&
+		sameGatewayRebindPredecessorDockerObservation(beforeDocker, afterDocker, predecessorState.Identity)
+	if !semanticEqual {
+		t.Logf("predecessor Docker parity: inspect_ok=%t valid_after=%t semantic_equal=%t raw_equal=%t",
+			err == nil, validAfterDocker, semanticEqual, reflect.DeepEqual(beforeDocker, afterDocker))
 		clearGatewayV2DockerObservation(&beforeDocker)
 		clearGatewayV2DockerObservation(&afterDocker)
 		t.Fatal("successor network stage changed the committed predecessor Docker resources")
