@@ -11,6 +11,11 @@ type AppAccessDisableStartupClaim struct {
 	Revision                AppAccessRevision
 	Allocation              Allocation
 	Profile                 GatewayProfileRevision
+	EffectiveProfile        GatewayProfileRevision
+	CurrentGatewaySource    GatewayCurrentAuthorityRef
+	TransferChain           []GatewayRebindAllocationTransfer
+	TransferChainTipDigest  string
+	TerminalReceiptDigest   string
 	SourceGrant             *AppAccessGrantClaim
 	AppArchived             bool
 	AccessHeadCurrent       bool
@@ -101,7 +106,7 @@ func readAppAccessDisableStartupClaim(ctx context.Context, tx *sql.Tx, operation
 		return AppAccessDisableStartupClaim{}, ErrInvalidStoredState
 	}
 	value := AppAccessDisableStartupClaim{Claim: claim, Revision: revision,
-		Allocation: revision.Allocation, Profile: profile}
+		Allocation: revision.Allocation, Profile: profile, EffectiveProfile: profile}
 	if claim.SourceGrantAttemptID != "" {
 		grant, err := readAppAccessGrantClaim(ctx, tx, claim.SourceGrantAttemptID)
 		if err != nil {
@@ -114,6 +119,20 @@ func readAppAccessDisableStartupClaim(ctx context.Context, tx *sql.Tx, operation
 			return AppAccessDisableStartupClaim{}, ErrInvalidStoredState
 		}
 		value.SourceGrant = &grant
+		resolution, resolveErr := resolveGatewayBindingForConsumer(ctx, tx, GatewayBindingRef{
+			AppID: claim.Spec.AppID, AllocationID: claim.Spec.AllocationID,
+			AccessRevisionID: claim.Spec.AccessRevisionID, GrantAttemptID: grant.AttemptID,
+		}, profile)
+		if resolveErr != nil || resolution.RawProfile.ID != profile.ID ||
+			resolution.RawProfile.RevisionNumber != profile.RevisionNumber ||
+			resolution.RawProfile.SpecDigest != profile.SpecDigest {
+			return AppAccessDisableStartupClaim{}, invalidRebindStoredState(resolveErr)
+		}
+		value.EffectiveProfile = resolution.EffectiveProfile
+		value.CurrentGatewaySource = resolution.CurrentGatewaySource
+		value.TransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
+		value.TransferChainTipDigest = resolution.TransferChainTipDigest
+		value.TerminalReceiptDigest = resolution.TerminalReceiptDigest
 	}
 	if claim.State == AppAccessDisableCommitted {
 		if claim.Proof == nil || revision.Allocation.ReleasedAt == nil ||
@@ -205,7 +224,7 @@ func readAppAccessDisableStartupClaim(ctx context.Context, tx *sql.Tx, operation
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM lan_gateway_profile_heads
 		WHERE singleton=1 AND revision_id=? AND revision_number=?
-	)`, claim.Spec.GatewayProfileRevisionID, claim.Spec.GatewayProfileRevisionNumber).Scan(&current); err != nil {
+	)`, value.EffectiveProfile.ID, value.EffectiveProfile.RevisionNumber).Scan(&current); err != nil {
 		return AppAccessDisableStartupClaim{}, err
 	}
 	value.ProfileHeadCurrent = current == 1

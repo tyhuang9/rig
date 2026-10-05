@@ -35,6 +35,9 @@ ALTER TABLE lan_gateway_rebind_claims
         predecessor_checkpoint_digest IS NULL OR
         (length(predecessor_checkpoint_digest)=64 AND predecessor_checkpoint_digest NOT GLOB '*[^0-9a-f]*')
     );
+ALTER TABLE lan_gateway_rebind_claims
+    ADD COLUMN successor_protected_generation INTEGER NOT NULL DEFAULT 0
+        CHECK (successor_protected_generation >= 0);
 
 ALTER TABLE lan_gateway_rebind_roster_entries
     ADD COLUMN roster_format_version INTEGER NOT NULL DEFAULT 1
@@ -155,13 +158,19 @@ WHEN NOT (
      AND NEW.predecessor_source_state_version IS NULL
      AND NEW.predecessor_source_state_revision IS NULL
      AND NEW.predecessor_source_state_digest IS NULL
-     AND NEW.predecessor_checkpoint_digest IS NULL)
+     AND NEW.predecessor_checkpoint_digest IS NULL
+     AND NEW.successor_protected_generation=0)
     OR
     (NEW.spec_format_version=2 AND NEW.roster_format_version=2
      AND NEW.predecessor_source_state_version IS NOT NULL
      AND NEW.predecessor_source_state_revision IS NOT NULL
      AND NEW.predecessor_source_state_digest IS NOT NULL
      AND NEW.predecessor_checkpoint_digest IS NOT NULL
+     AND NEW.successor_protected_generation>NEW.predecessor_protected_generation
+     AND NEW.successor_protected_generation>COALESCE((
+       SELECT MAX(c.successor_protected_generation)
+       FROM lan_gateway_rebind_claims c WHERE c.spec_format_version=2
+     ),-1)
      AND (
       (NEW.predecessor_source_kind='gateway_upgrade'
        AND NEW.predecessor_protected_journal_digest IS NOT NULL
@@ -198,7 +207,7 @@ BEFORE UPDATE OF operation_id,singleton,request_digest,approval_action,spec_dige
     predecessor_protected_generation,predecessor_protected_journal_digest,
     predecessor_protected_intent_digest,predecessor_source_state_version,
     predecessor_source_state_revision,predecessor_source_state_digest,
-    predecessor_checkpoint_digest
+    predecessor_checkpoint_digest,successor_protected_generation
 ON lan_gateway_rebind_claims
 BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind claim identity is immutable'); END;
 

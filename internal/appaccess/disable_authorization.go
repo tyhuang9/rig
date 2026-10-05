@@ -18,6 +18,7 @@ type AppAccessDisableAuthorization struct {
 	Profile                GatewayProfileRevision
 	EffectiveProfile       GatewayProfileRevision
 	CurrentGatewaySource   GatewayCurrentAuthorityRef
+	TransferChain          []GatewayRebindAllocationTransfer
 	TransferChainTipDigest string
 	TerminalReceiptDigest  string
 	SourceGrant            *AppAccessGrantClaim
@@ -101,18 +102,6 @@ func readAppAccessDisableAuthorization(ctx context.Context, query appAccessDisab
 		revision.Allocation.GatewayProfileRevisionNumber != claim.Spec.GatewayProfileRevisionNumber {
 		return AppAccessDisableAuthorization{}, ErrConflict
 	}
-	if claim.State != AppAccessDisableCommitted {
-		var profileID sql.NullString
-		var profileNumber int64
-		if err := query.QueryRowContext(ctx, `SELECT revision_id,revision_number
-			FROM lan_gateway_profile_heads WHERE singleton=1`).Scan(&profileID, &profileNumber); err != nil {
-			return AppAccessDisableAuthorization{}, err
-		}
-		if !profileID.Valid || profileID.String != claim.Spec.GatewayProfileRevisionID ||
-			profileNumber != claim.Spec.GatewayProfileRevisionNumber {
-			return AppAccessDisableAuthorization{}, ErrConflict
-		}
-	}
 	profile, _, err := readGatewayRevision(ctx, query, claim.Spec.GatewayProfileRevisionID,
 		claim.Spec.GatewayProfileRevisionNumber)
 	if err != nil {
@@ -132,6 +121,27 @@ func readAppAccessDisableAuthorization(ctx context.Context, query appAccessDisab
 			return AppAccessDisableAuthorization{}, ErrInvalidStoredState
 		}
 		value.SourceGrant = &grant
+		resolution, resolveErr := resolveGatewayBindingForConsumer(ctx, query, GatewayBindingRef{
+			AppID: claim.Spec.AppID, AllocationID: claim.Spec.AllocationID,
+			AccessRevisionID: claim.Spec.AccessRevisionID, GrantAttemptID: grant.AttemptID,
+		}, profile)
+		if resolveErr != nil || resolution.RawProfile.ID != profile.ID ||
+			resolution.RawProfile.RevisionNumber != profile.RevisionNumber ||
+			resolution.RawProfile.SpecDigest != profile.SpecDigest {
+			return AppAccessDisableAuthorization{}, invalidRebindStoredState(resolveErr)
+		}
+		value.EffectiveProfile = resolution.EffectiveProfile
+		value.CurrentGatewaySource = resolution.CurrentGatewaySource
+		value.TransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
+		value.TransferChainTipDigest = resolution.TransferChainTipDigest
+		value.TerminalReceiptDigest = resolution.TerminalReceiptDigest
+	} else if claim.State != AppAccessDisableCommitted {
+		source, resolveErr := readOptionalGatewayCurrentAuthority(ctx, query, profile)
+		if resolveErr != nil {
+			return AppAccessDisableAuthorization{}, invalidRebindStoredState(resolveErr)
+		}
+		value.CurrentGatewaySource = source
+		value.TerminalReceiptDigest = source.TerminalReceiptDigest
 	}
 	if claim.State == AppAccessDisableCommitted {
 		if claim.Proof == nil || revision.Allocation.ReleasedAt == nil ||
