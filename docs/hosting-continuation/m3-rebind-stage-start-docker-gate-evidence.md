@@ -85,6 +85,39 @@ Local verification:
 The correction updates the already authorized draft. It does not authorize a
 merge, deployment or a new branch publication.
 
+## 2026-10-05: cleanup after a proved stage start
+
+The distinct-address correction ran at PR #135 head
+`f2b7815c9b15f47d328cd4f38f6e32b905307cd2`. Its
+[stage-start job](https://github.com/tyhuang9/rig/actions/runs/37381953709/job/112005904184)
+reported a cleanup failure in all three named tests (94.52s direct, 89.42s
+lost acknowledgment, 91.59s compensation), followed by the residue failure.
+Each reported test error was the stopped-container helper rejecting the
+sequence-eight configuration inventory. A stage that has actually started
+retains Caddy's exact autosave even after a proved stop.
+
+The cleanup helper now calls the existing production inventory reader with
+the exact retained sequence-nine start intent. That reader verifies unchanged
+protected history before allowing only the approved stage file and its exact,
+bounded optional autosave. A never-started sequence-eight fixture continues
+to use the strict pre-start inventory. Container ownership, stop proof,
+listener withdrawal, immutable history and residue checks remain required.
+Only test cleanup changes; production parsers and runtime behavior are unchanged.
+
+Local verification:
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./internal/generatedingress -run '^(TestGatewayRebindStageStartInventoryAcceptsExactAutosaveAfterDurableIntent|TestGatewayRebindStageAutosaveCanonicalConfigMatchesPinnedCaddy|TestGatewayRebindStartedStageArchiveRequiresExactOptionalSnapshot|TestGatewayRebindStartedStageArchiveBoundsTwoMaximumConfigs|TestGatewayRebindStageStartInventoryRequiresDurableUnchangedIntent)$'
+go vet -mod=readonly ./internal/generatedingress
+go test -mod=readonly -p=1 -tags=integration -run '^$' ./internal/generatedingress ./cmd/hostd
+```
+
+All five named autosave regressions passed in 9.056s with no failures/skips.
+Static checks passed; integration-tag compilation passed (ingress 0.759s;
+hostd reused a cached compile). Captured regression events are in
+`$TEMP/m3-stage-cleanup-autosave-regressions.jsonl`. Hosted execution is still
+required to accept the complete corrected cleanup journey.
+
 ## Earlier verification checkpoints
 
 | Check | Result |
