@@ -364,7 +364,8 @@ func TestLANGatewayRebindSQLLedgerMigrationIsDormantAndMirrored(t *testing.T) {
 	}
 
 	db := openMemoryDatabase(t)
-	if err := Migrate(db); err != nil {
+	through034 := migrationSetBefore(t, "035_")
+	if err := migrateFS(db, through034); err != nil {
 		t.Fatalf("fresh migration: %v", err)
 	}
 	for _, table := range []string{

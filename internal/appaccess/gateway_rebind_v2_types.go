@@ -212,12 +212,15 @@ type GatewayRebindHistoryEntry struct {
 }
 
 type GatewayRebindRecoverySnapshot struct {
-	History                []GatewayRebindHistoryEntry
-	Active                 *GatewayRebindHistoryEntry
-	CurrentProfile         *GatewayProfileRevision
-	CurrentSource          *GatewayCurrentAuthorityRef
+	History                       []GatewayRebindHistoryEntry
+	Active                        *GatewayRebindHistoryEntry
+	CurrentProfile                *GatewayProfileRevision
+	CurrentSource                 *GatewayCurrentAuthorityRef
+	CurrentDatabaseCommittedEvent *GatewayRebindEvent
+	CurrentTransfers              []GatewayRebindAllocationTransfer
+	// The remaining fields describe recovery of Active only. They are zero
+	// when no claim is active and never inherit a prior current claim's phase.
 	DatabaseCommittedEvent *GatewayRebindEvent
-	CurrentTransfers       []GatewayRebindAllocationTransfer
 	Phase                  GatewayRebindState
 	DatabaseCommitObserved bool
 	RollbackAllowed        bool
@@ -414,7 +417,7 @@ func validGatewayCurrentLineageRef(value GatewayCurrentLineageRef) bool {
 }
 
 func validGatewayRebindSourceRef(value GatewayRebindSourceRef) bool {
-	if !validGatewayCurrentLineageRef(value.Lineage) || value.Lineage.ProtectedGeneration == math.MaxUint64 ||
+	if !validGatewayCurrentLineageRef(value.Lineage) || value.Lineage.ProtectedGeneration > math.MaxInt64 ||
 		!validDigest(value.SourceStateDigest) || !validDigest(value.PredecessorCheckpointDigest) {
 		return false
 	}
