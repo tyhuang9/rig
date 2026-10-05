@@ -58,7 +58,9 @@ func TestLiveGatewayRebindSuccessorStageStartProofFailureWithdraws(t *testing.T)
 	liveGatewayRebindSuccessorStageStart(t, "proof-failure")
 }
 
-func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string) {
+func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string,
+	afterServing ...func(*liveGatewayV2Fixture, *appaccess.Repository, gatewayRebindProtectedIntent, time.Time),
+) {
 	t.Helper()
 	spec := liveGatewayV2FixtureSpec{
 		appID:            "a1111111-1111-4111-8111-111111111111",
@@ -81,6 +83,11 @@ func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string) {
 			"c1111111-1111-4111-8111-111111111111", "c2222222-2222-4222-8222-222222222222",
 			"c3333333-3333-4333-8333-333333333333", "c4444444-4444-4444-8444-444444444444"
 		spec.imageTag += "-proof-failure"
+	case "final-copy", "final-copy-lost-ack":
+		spec.appID, spec.planID, spec.operationID, spec.profileRevision =
+			"d1111111-1111-4111-8111-111111111111", "d2222222-2222-4222-8222-222222222222",
+			"d3333333-3333-4333-8333-333333333333", "d4444444-4444-4444-8444-444444444444"
+		spec.imageTag += "-" + mode
 	}
 	fixture := newLiveGatewayV2Fixture(t, spec)
 	db, err := database.Open(fixture.stateRoot)
@@ -300,7 +307,7 @@ func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string) {
 		if startErr != nil {
 			failLiveIngress(t, "start or adopt exact live successor stage", startErr)
 		}
-		if (mode == "direct" && driver.startCalls != 1) ||
+		if (mode != "lost-ack" && driver.startCalls != 1) ||
 			(mode == "lost-ack" && (driver.startCalls != 1 || actingDriver.startCalls != 0)) ||
 			actingDriver.stopCalls != 0 {
 			t.Fatalf("unexpected Docker start/stop calls: original=%d adoption=%d stops=%d",
@@ -348,6 +355,9 @@ func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string) {
 			replayDriver.startCalls != 0 || replayDriver.stopCalls != 0 {
 			t.Fatal("fresh-Manager replay changed sequence ten or dispatched another Docker effect")
 		}
+		for _, checkpoint := range afterServing {
+			checkpoint(fixture, repository, intent, baseTime)
+		}
 	}
 	afterPrepared, err := repository.GatewayRebindStartupSnapshot(fixture.ctx)
 	if err != nil || !reflect.DeepEqual(prepared, afterPrepared) {
@@ -393,7 +403,7 @@ func cleanupLiveGatewayRebindStageStartChain(t *testing.T, fixture *liveGatewayV
 				config, data, container)
 			return
 		}
-		if err != nil || len(history.Progress) < 9 || len(history.Progress) > 10 ||
+		if err != nil || len(history.Progress) < 9 || len(history.Progress) > 12 ||
 			history.Progress[8].Record.Stage == nil ||
 			history.Progress[8].Record.Stage.StageStartIntent == nil {
 			t.Error("live stage-start cleanup lacks exact protected start intent; retaining resources")
@@ -405,6 +415,9 @@ func cleanupLiveGatewayRebindStageStartChain(t *testing.T, fixture *liveGatewayV
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
+		if len(history.Progress) >= 11 && !liveGatewayRebindFinalConfigCleanupInventory(t, fixture, ctx, intent, history) {
+			return
+		}
 		driver := managerGatewayRebindStageStartDriver{manager: fixture.ingress}
 		observed, inspectErr := driver.inspect(ctx, intent)
 		if inspectErr != nil {
@@ -412,7 +425,7 @@ func cleanupLiveGatewayRebindStageStartChain(t *testing.T, fixture *liveGatewayV
 			return
 		}
 		if gatewayRebindStageObservationMayBeLive(observed) {
-			if len(history.Progress) != 10 || history.Progress[9].Record.Stage == nil ||
+			if len(history.Progress) < 10 || history.Progress[9].Record.Stage == nil ||
 				!validGatewayRebindRunningStageContainerObservation(intent,
 					*history.Progress[9].Record.Stage, observed) ||
 				observed.StageRuntime.ConfiguredNetworks[intent.Intent.Identity.IngressNetwork].EndpointID !=

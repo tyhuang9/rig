@@ -375,7 +375,7 @@ func liveGatewayRebindStoppedStageCleanupLineage(t *testing.T, fixture *liveGate
 	t.Helper()
 	history, err := fixture.ingress.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	if err != nil || len(history.Intents) != 1 || (len(history.Progress) != 6 && len(history.Progress) != 8 &&
-		len(history.Progress) != 9 && len(history.Progress) != 10) ||
+		len(history.Progress) != 9 && len(history.Progress) != 10 && len(history.Progress) != 11 && len(history.Progress) != 12) ||
 		!reflect.DeepEqual(history.Intents[0].Intent, intent) || !validContainerID(networkID) ||
 		config == nil || data == nil || container == nil {
 		t.Error("live stopped-container cleanup has no exact protected stage lineage; retaining resources")
@@ -439,7 +439,7 @@ func liveGatewayRebindStoppedStageCleanupLineage(t *testing.T, fixture *liveGate
 			return gatewayRebindStageIntent{}, false
 		}
 	}
-	if len(history.Progress) == 10 {
+	if len(history.Progress) >= 10 {
 		ninth := history.Progress[8].Record
 		tenth := history.Progress[9].Record
 		if tenth.PreviousDigest != ninth.Digest || tenth.Stage == nil || tenth.Stage.StageServing == nil ||
@@ -452,6 +452,35 @@ func liveGatewayRebindStoppedStageCleanupLineage(t *testing.T, fixture *liveGate
 		if !reflect.DeepEqual(withoutServing, *ninth.Stage) {
 			t.Error("live stopped-container cleanup found a sequence-ten stage that changed prior receipts; retaining resources")
 			return gatewayRebindStageIntent{}, false
+		}
+	}
+	if len(history.Progress) >= 11 {
+		tenth := history.Progress[9].Record
+		eleventh := history.Progress[10].Record
+		if eleventh.Stage == nil || eleventh.Stage.FinalConfigIntent == nil ||
+			!validGatewayRebindFinalConfigIntentBinding(intent, tenth, *eleventh.Stage.FinalConfigIntent) {
+			t.Error("live cleanup lacks exact sequence-eleven final config intent; retaining resources")
+			return gatewayRebindStageIntent{}, false
+		}
+		withoutFinalIntent := *eleventh.Stage
+		withoutFinalIntent.FinalConfigIntent = nil
+		if !reflect.DeepEqual(withoutFinalIntent, *tenth.Stage) {
+			t.Error("live cleanup final config intent changed prior stage receipts; retaining resources")
+			return gatewayRebindStageIntent{}, false
+		}
+		if len(history.Progress) == 12 {
+			twelfth := history.Progress[11].Record
+			if twelfth.Stage == nil || twelfth.Stage.FinalConfigCopy == nil ||
+				!validGatewayRebindFinalConfigCopyBinding(intent, eleventh, *twelfth.Stage.FinalConfigCopy) {
+				t.Error("live cleanup lacks exact sequence-twelve copy receipt; retaining resources")
+				return gatewayRebindStageIntent{}, false
+			}
+			withoutFinalCopy := *twelfth.Stage
+			withoutFinalCopy.FinalConfigCopy = nil
+			if !reflect.DeepEqual(withoutFinalCopy, *eleventh.Stage) {
+				t.Error("live cleanup copy receipt changed prior stage receipts; retaining resources")
+				return gatewayRebindStageIntent{}, false
+			}
 		}
 	}
 	return *sixth, true
@@ -473,7 +502,11 @@ func cleanupLiveGatewayRebindStoppedStageContainer(t *testing.T, fixture *liveGa
 		t.Error("live stopped-container cleanup cannot reread protected lineage; retaining resources")
 		return false
 	}
-	if len(history.Progress) >= 8 {
+	if len(history.Progress) >= 11 {
+		if !liveGatewayRebindFinalConfigCleanupInventory(t, fixture, ctx, intent, history) {
+			return false
+		}
+	} else if len(history.Progress) >= 8 {
 		expected, expectedErr := gatewayRebindStageConfigBytes(intent)
 		if expectedErr != nil || history.Progress[7].Record.Stage == nil {
 			clear(expected)

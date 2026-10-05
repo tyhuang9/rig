@@ -19,7 +19,7 @@ const (
 	gatewayRebindProgressSequenceDigits      = 2
 	maxGatewayRebindProgressBytes            = 32 << 10
 	maxGatewayRebindFinalConfigProgressBytes = 256 << 10
-	gatewayRebindProgressMaximumSequence     = 11
+	gatewayRebindProgressMaximumSequence     = 12
 )
 
 type gatewayRebindProgressPhase string
@@ -32,6 +32,7 @@ const (
 	gatewayRebindProgressStageStartIntent  gatewayRebindProgressPhase = "stage_start_intent"
 	gatewayRebindProgressStageServing      gatewayRebindProgressPhase = "stage_serving"
 	gatewayRebindProgressFinalConfigIntent gatewayRebindProgressPhase = "final_config_intent"
+	gatewayRebindProgressFinalConfigCopied gatewayRebindProgressPhase = "final_config_copied"
 )
 
 // gatewayRebindProgressRecord is immutable history for the initial rebind.
@@ -104,8 +105,15 @@ type gatewayRebindStageIntent struct {
 	// FinalConfigIntent is populated only after sequence ten has freshly
 	// reattested the serving probe-and-404 stage. Sequence eleven pins the
 	// complete successor application configuration before any copy or reload.
-	// Keep this last so sequences one through ten retain their canonical bytes.
+	// Preserve this field position so sequences one through ten retain their
+	// canonical bytes.
 	FinalConfigIntent *gatewayRebindFinalConfigIntentBinding `json:"finalConfigIntent,omitempty"`
+	// FinalConfigCopy is populated only after sequence eleven has been freshly
+	// reattested and the exact final configuration has been observed alongside
+	// the still-live stage configuration. It is a copy receipt and authorizes no
+	// reload, route publication, application probe or database effect. Keep this
+	// last so sequences one through eleven retain their canonical bytes.
+	FinalConfigCopy *gatewayRebindFinalConfigCopyBinding `json:"finalConfigCopy,omitempty"`
 }
 
 type gatewayRebindStageNetworkBinding struct {
@@ -585,6 +593,41 @@ func newGatewayRebindFinalConfigIntentProgress(intent gatewayRebindProtectedInte
 	return value, nil
 }
 
+func newGatewayRebindFinalConfigCopyProgress(intent gatewayRebindProtectedIntent,
+	previous gatewayRebindProgressRecord, binding gatewayRebindFinalConfigCopyBinding, occurredAt time.Time,
+) (gatewayRebindProgressRecord, error) {
+	if !validGatewayRebindProtectedIntent(intent) || !validGatewayRebindProgressRecord(previous) ||
+		previous.Generation != intent.Generation || previous.OperationID != intent.OperationID ||
+		previous.Sequence != 11 || previous.Phase != gatewayRebindProgressFinalConfigIntent ||
+		previous.ProtectedIntentDigest != intent.Digest || previous.Stage == nil ||
+		previous.Stage.StageServing == nil || previous.Stage.FinalConfigIntent == nil ||
+		previous.Stage.FinalConfigCopy != nil ||
+		!gatewayRebindStageIntentMatchesProtectedIntent(previous, intent) ||
+		!validGatewayRebindFinalConfigCopyBinding(intent, previous, binding) ||
+		!validGatewayRebindProgressTime(occurredAt) {
+		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress rebind final config copy progress input")
+	}
+	previousAt, err := parseGatewayRebindProgressTime(previous.OccurredAt)
+	if err != nil || !occurredAt.After(previousAt) {
+		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress rebind final config copy progress input")
+	}
+	stage := *previous.Stage
+	stage.FinalConfigCopy = &binding
+	value := gatewayRebindProgressRecord{
+		Version: gatewayRebindProgressVersion, Generation: intent.Generation, OperationID: intent.OperationID,
+		Sequence: 12, Phase: gatewayRebindProgressFinalConfigCopied,
+		OccurredAt: occurredAt.UTC().Format(time.RFC3339Nano), ProtectedIntentDigest: intent.Digest,
+		PreviousDigest: previous.Digest, Stage: &stage,
+	}
+	_, value.Purpose = gatewayRebindProgressName(value.Generation, value.OperationID, value.Sequence)
+	value.Digest, err = gatewayRebindProgressDigest(value)
+	if err != nil || !validGatewayRebindProgressRecord(value) ||
+		!gatewayRebindStageIntentMatchesProtectedIntent(value, intent) {
+		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress rebind final config copy progress input")
+	}
+	return value, nil
+}
+
 func gatewayRebindProgressDigest(value gatewayRebindProgressRecord) (string, error) {
 	value.Digest = ""
 	return canonicalDigest(value)
@@ -638,6 +681,11 @@ func validGatewayRebindProgressRecord(value gatewayRebindProgressRecord) bool {
 			!validGatewayRebindStageIntent(*value.Stage) {
 			return false
 		}
+	case gatewayRebindProgressFinalConfigCopied:
+		if value.Sequence != 12 || !validSHA256(value.PreviousDigest) || value.Stage == nil ||
+			!validGatewayRebindStageIntent(*value.Stage) {
+			return false
+		}
 	default:
 		return false
 	}
@@ -661,7 +709,8 @@ func validGatewayRebindStageIntent(value gatewayRebindStageIntent) bool {
 		(value.StageConfigCopy == nil || (value.StageConfigIntent != nil && validGatewayRebindStageConfigCopyBindingValue(*value.StageConfigCopy))) &&
 		(value.StageStartIntent == nil || (value.StageConfigCopy != nil && validGatewayRebindStageStartIntentBindingValue(*value.StageStartIntent))) &&
 		(value.StageServing == nil || (value.StageStartIntent != nil && validGatewayRebindStageServingBindingValue(*value.StageServing))) &&
-		(value.FinalConfigIntent == nil || (value.StageServing != nil && validGatewayRebindFinalConfigIntentBindingValue(*value.FinalConfigIntent)))
+		(value.FinalConfigIntent == nil || (value.StageServing != nil && validGatewayRebindFinalConfigIntentBindingValue(*value.FinalConfigIntent))) &&
+		(value.FinalConfigCopy == nil || (value.FinalConfigIntent != nil && validGatewayRebindFinalConfigCopyBindingValue(*value.FinalConfigCopy)))
 }
 
 func validGatewayRebindStageConfigVolumeBindingValue(value gatewayRebindStageConfigVolumeBinding) bool {
@@ -826,7 +875,7 @@ func gatewayRebindProgressInstallPermitted(history gatewayRebindProtectedIntentH
 func gatewayRebindProgressMatchesPredecessor(history gatewayRebindProtectedIntentHistory,
 	value gatewayRebindProgressRecord,
 ) bool {
-	if value.Sequence != 11 {
+	if value.Sequence != 11 && value.Sequence != 12 {
 		return true
 	}
 	return value.Stage != nil && value.Stage.FinalConfigIntent != nil &&
@@ -868,7 +917,7 @@ func scanGatewayRebindProgressForIntent(dataRoot string, intent gatewayRebindPro
 		}
 		value, err := store.load()
 		if err != nil || !gatewayRebindProgressMatchesIntent(value, intent, result) ||
-			(value.Sequence == 11 && (value.Stage == nil || value.Stage.FinalConfigIntent == nil ||
+			((value.Sequence == 11 || value.Sequence == 12) && (value.Stage == nil || value.Stage.FinalConfigIntent == nil ||
 				!gatewayRebindFinalConfigRoutePlanMatchesPredecessor(intent, predecessor,
 					value.Stage.FinalConfigIntent.RoutePlan))) {
 			return nil, errors.New("generated ingress rebind progress history is invalid")
@@ -1074,13 +1123,33 @@ func gatewayRebindProgressMatchesIntent(value gatewayRebindProgressRecord, inten
 		previousAt, err := parseGatewayRebindProgressTime(previous[9].Record.OccurredAt)
 		currentAt, currentErr := parseGatewayRebindProgressTime(value.OccurredAt)
 		return err == nil && currentErr == nil && currentAt.After(previousAt)
+	case 12:
+		if value.Phase != gatewayRebindProgressFinalConfigCopied || len(previous) != 11 ||
+			value.PreviousDigest != previous[10].Record.Digest || value.Stage == nil ||
+			value.Stage.StageServing == nil || value.Stage.FinalConfigIntent == nil ||
+			value.Stage.FinalConfigCopy == nil ||
+			!gatewayRebindStageIntentMatchesProtectedIntent(value, intent) ||
+			previous[10].Record.Stage == nil || previous[10].Record.Stage.StageServing == nil ||
+			previous[10].Record.Stage.FinalConfigIntent == nil ||
+			previous[10].Record.Stage.FinalConfigCopy != nil ||
+			!validGatewayRebindFinalConfigCopyBinding(intent, previous[10].Record, *value.Stage.FinalConfigCopy) {
+			return false
+		}
+		stageWithoutFinalConfigCopy := *value.Stage
+		stageWithoutFinalConfigCopy.FinalConfigCopy = nil
+		if !reflect.DeepEqual(stageWithoutFinalConfigCopy, *previous[10].Record.Stage) {
+			return false
+		}
+		previousAt, err := parseGatewayRebindProgressTime(previous[10].Record.OccurredAt)
+		currentAt, currentErr := parseGatewayRebindProgressTime(value.OccurredAt)
+		return err == nil && currentErr == nil && currentAt.After(previousAt)
 	default:
 		return false
 	}
 }
 
 func gatewayRebindProgressMaxBytes(sequence uint64) int {
-	if sequence == 11 {
+	if sequence == 11 || sequence == 12 {
 		return maxGatewayRebindFinalConfigProgressBytes
 	}
 	return maxGatewayRebindProgressBytes
