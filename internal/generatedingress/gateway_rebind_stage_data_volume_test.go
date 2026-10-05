@@ -264,6 +264,98 @@ func TestGatewayRebindStageDataVolumeCreatesBindsAndReplays(t *testing.T) {
 	}
 }
 
+func TestGatewayRebindStageDataVolumeAllowsOnlyExactFinalMountReordering(t *testing.T) {
+	for _, replay := range []bool{false, true} {
+		phase := "create"
+		if replay {
+			phase = "replay"
+		}
+		for _, test := range []struct {
+			name      string
+			mutate    func(*gatewayV2DockerObservation)
+			wantError bool
+		}{
+			{name: "exact mount reordering", mutate: func(value *gatewayV2DockerObservation) {
+				value.FinalContainer.Mounts[0], value.FinalContainer.Mounts[1] =
+					value.FinalContainer.Mounts[1], value.FinalContainer.Mounts[0]
+			}},
+			{name: "wrong mount", mutate: func(value *gatewayV2DockerObservation) {
+				value.FinalContainer.Mounts[0].Name = "different-volume"
+			}, wantError: true},
+			{name: "non-mount drift", mutate: func(value *gatewayV2DockerObservation) {
+				value.Final404Proven = !value.Final404Proven
+			}, wantError: true},
+		} {
+			t.Run(phase+"/"+test.name, func(t *testing.T) {
+				fixture := newGatewayRebindEffectBoundaryFixture(t)
+				installGatewayRebindStageDataVolumeConfigProgress(t, fixture)
+				fake, reads := gatewayRebindStageDataVolumeTestDriver(fixture)
+				manager, repository := fixture.predecessor.manager, fixture.predecessor.repository
+				if replay {
+					if err := manager.stageGatewayRebindSuccessorDataVolumeWithDriver(context.Background(),
+						repository, reads, gatewayRebindStageNetworkInspect(t, fixture), fake,
+						gatewayRebindProgressTimestamp(5), nil); err != nil {
+						t.Fatalf("bind data volume before replay: %v", err)
+					}
+				}
+				before, err := manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeBytes := make([][]byte, len(before.Progress))
+				for index, entry := range before.Progress {
+					beforeBytes[index], err = os.ReadFile(entry.Store.path)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				beforeSQL, err := repository.GatewayRebindStartupSnapshot(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				dockerReads := 0
+				inspect := func(context.Context, routeState, gatewayV2RouteState,
+					gatewayMigrationJournal,
+				) (gatewayV2DockerObservation, error) {
+					dockerReads++
+					observation := gatewayRebindFixtureDockerObservation(t, fixture.predecessor)
+					if dockerReads%2 == 0 {
+						test.mutate(&observation)
+					}
+					return observation, nil
+				}
+				err = manager.stageGatewayRebindSuccessorDataVolumeWithDriver(context.Background(),
+					repository, reads, inspect, fake, gatewayRebindProgressTimestamp(6), nil)
+				wantReads, wantCreates, wantProgress := 8, 1, 5
+				if replay || test.wantError {
+					wantReads = 2
+				}
+				if test.wantError && !replay {
+					wantCreates, wantProgress = 0, 4
+				}
+				after, scanErr := manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+				if (err != nil) != test.wantError || dockerReads != wantReads || scanErr != nil ||
+					fake.createCalls != wantCreates || len(after.Progress) != wantProgress {
+					t.Fatalf("data volume error=%v reads=%d creates=%d progress=%d scan=%v; want_error=%t reads=%d creates=%d progress=%d",
+						err, dockerReads, fake.createCalls, len(after.Progress), scanErr,
+						test.wantError, wantReads, wantCreates, wantProgress)
+				}
+				for index, entry := range before.Progress {
+					body, readErr := os.ReadFile(entry.Store.path)
+					if readErr != nil || !reflect.DeepEqual(beforeBytes[index], body) ||
+						!reflect.DeepEqual(entry.Record, after.Progress[index].Record) {
+						t.Fatalf("changed protected progress at sequence %d: %v", index+1, readErr)
+					}
+				}
+				afterSQL, err := repository.GatewayRebindStartupSnapshot(context.Background())
+				if err != nil || !reflect.DeepEqual(beforeSQL, afterSQL) {
+					t.Fatalf("changed SQLite claim: %v", err)
+				}
+			})
+		}
+	}
+}
+
 func TestGatewayRebindStageDataVolumeRejectsUnboundAndInvalidEffects(t *testing.T) {
 	for _, test := range []struct {
 		name        string
