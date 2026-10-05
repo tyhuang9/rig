@@ -154,6 +154,7 @@ func (r *Repository) readGatewayUpgradeStartupSnapshot(ctx context.Context, tx *
 		Claims:         make([]GatewayUpgradeStartupClaim, 0, len(operationIDs)),
 	}
 	activeClaims := 0
+	var rebindRecovery *GatewayRebindRecoverySnapshot
 	for _, operationID := range operationIDs {
 		claim, err := readGatewayProfileUpgradeClaim(ctx, tx, operationID)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -201,12 +202,82 @@ func (r *Repository) readGatewayUpgradeStartupSnapshot(ctx context.Context, tx *
 				current.SpecDigest != profile.SpecDigest {
 				return GatewayUpgradeStartupSnapshot{}, ErrInvalidStoredState
 			}
+		} else if claim.State == GatewayProfileUpgradeCommitted {
+			currentMatches := current != nil && current.ID == profile.ID &&
+				current.RevisionNumber == profile.RevisionNumber && current.SpecDigest == profile.SpecDigest
+			if currentMatches {
+				activeClaims++
+				selectedProfile, selectedSource, readErr := readGatewayCurrentAuthority(ctx, tx)
+				if readErr != nil || activeClaims > 1 || actorRole != "administrator" || selectedProfile != profile ||
+					selectedSource.Kind != GatewayRebindSourceGatewayUpgrade ||
+					selectedSource.OperationID != claim.OperationID ||
+					selectedSource.ProfileRevisionID != profile.ID ||
+					selectedSource.ProfileRevisionNumber != profile.RevisionNumber ||
+					selectedSource.ProfileSpecDigest != profile.SpecDigest {
+					return GatewayUpgradeStartupSnapshot{}, invalidRebindStoredState(readErr)
+				}
+			} else {
+				if rebindRecovery == nil {
+					value, readErr := readGatewayRebindRecoverySnapshot(ctx, tx)
+					if readErr != nil {
+						return GatewayUpgradeStartupSnapshot{}, readErr
+					}
+					rebindRecovery = &value
+				}
+				if !gatewayRebindRecoveryDescendsFromUpgrade(*rebindRecovery, claim, profile) {
+					return GatewayUpgradeStartupSnapshot{}, ErrInvalidStoredState
+				}
+			}
 		}
 		result.Claims = append(result.Claims, GatewayUpgradeStartupClaim{
 			Claim: claim, Profile: profile, ApprovedActionDigest: actionDigest,
 		})
 	}
 	return result, nil
+}
+
+func gatewayRebindRecoveryDescendsFromUpgrade(snapshot GatewayRebindRecoverySnapshot,
+	claim GatewayProfileUpgradeClaim, profile GatewayProfileRevision,
+) bool {
+	if snapshot.CurrentProfile == nil || snapshot.CurrentSource == nil ||
+		snapshot.CurrentSource.Kind != GatewayRebindSourceGatewayRebind ||
+		snapshot.CurrentSource.ProfileRevisionID != snapshot.CurrentProfile.ID ||
+		snapshot.CurrentSource.ProfileRevisionNumber != snapshot.CurrentProfile.RevisionNumber ||
+		snapshot.CurrentSource.ProfileSpecDigest != snapshot.CurrentProfile.SpecDigest {
+		return false
+	}
+	authority := *snapshot.CurrentSource
+	seen := make(map[string]struct{}, len(snapshot.History))
+	for authority.Kind == GatewayRebindSourceGatewayRebind {
+		if _, duplicate := seen[authority.OperationID]; duplicate {
+			return false
+		}
+		seen[authority.OperationID] = struct{}{}
+		history := findGatewayRebindHistory(snapshot.History, authority.OperationID)
+		if history == nil || retainedGatewayRebindDisposition(history.Commands) != GatewayRebindDispositionCommit ||
+			!gatewayRebindHistoryHasDatabaseCommit(*history) {
+			return false
+		}
+		successorID, successorNumber, successorDigest := historyClaimSuccessorProfile(history.Claim)
+		if authority.ProfileRevisionID != successorID || authority.ProfileRevisionNumber != successorNumber ||
+			authority.ProfileSpecDigest != successorDigest ||
+			authority.TerminalReceiptDigest != retainedGatewayRebindReceipt(history.Commands) {
+			return false
+		}
+		authority = historyClaimPredecessorAuthority(history.Claim)
+	}
+	return authority.Kind == GatewayRebindSourceGatewayUpgrade && authority.OperationID == claim.OperationID &&
+		authority.ProfileRevisionID == profile.ID && authority.ProfileRevisionNumber == profile.RevisionNumber &&
+		authority.ProfileSpecDigest == profile.SpecDigest && authority.TerminalReceiptDigest == ""
+}
+
+func gatewayRebindHistoryHasDatabaseCommit(history GatewayRebindHistoryEntry) bool {
+	for _, event := range history.Events {
+		if event.State == GatewayRebindDatabaseCommitted {
+			return true
+		}
+	}
+	return false
 }
 
 func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID string) (AppAccessGrantStartupClaim, error) {

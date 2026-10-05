@@ -134,6 +134,23 @@ func TestResolveGatewayBindingSeparatesRawAndEffectiveProfiles(t *testing.T) {
 		nativeAuthorization.TerminalReceiptDigest != receipt {
 		t.Fatalf("native authorization=%#v", nativeAuthorization)
 	}
+	startup, err := fixture.repository.HostingGatewayStartupSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nativeStartup *AppAccessGrantStartupClaim
+	for index := range startup.Grants.Claims {
+		if startup.Grants.Claims[index].Claim.AttemptID == grant.AttemptID {
+			nativeStartup = &startup.Grants.Claims[index]
+			break
+		}
+	}
+	if nativeStartup == nil || nativeStartup.Profile != nativeStartup.EffectiveProfile ||
+		nativeStartup.CurrentGatewaySource != native.CurrentGatewaySource ||
+		len(nativeStartup.TransferChain) != 0 || nativeStartup.TransferChainTipDigest != "" ||
+		nativeStartup.TerminalReceiptDigest != receipt || !nativeStartup.ProfileHeadCurrent {
+		t.Fatalf("native startup=%#v", nativeStartup)
+	}
 }
 
 func TestResolveGatewayBindingWalksRepeatedRebindAcrossRuntimeAdvance(t *testing.T) {
@@ -147,13 +164,102 @@ func TestResolveGatewayBindingWalksRepeatedRebindAcrossRuntimeAdvance(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	claim, _ := commitNextGatewayRebindForTest(t, fixture, first)
+	startup, err := fixture.repository.HostingGatewayStartupSnapshot(context.Background())
+	if err != nil || len(startup.Upgrades.Claims) != 1 || len(startup.Grants.Claims) != 1 ||
+		startup.Grants.Claims[0].EffectiveProfile.ID != claim.Spec.SuccessorProfileRevisionID ||
+		!startup.Grants.Claims[0].ProfileHeadCurrent {
+		t.Fatalf("startup after repeated rebind=%#v error=%v", startup, err)
+	}
+
+	if _, err := fixture.db.Exec(`DROP TRIGGER lan_gateway_rebind_allocation_transfer_retain`); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := fixture.db.Exec(`DELETE FROM lan_gateway_rebind_allocation_transfers
+		WHERE operation_id=? AND allocation_id=?`, fixture.claim.Spec.OperationID, fixture.entry.AllocationID); err != nil {
+		t.Fatal(err)
+	} else if affected, _ := result.RowsAffected(); affected != 1 {
+		t.Fatalf("deleted intermediate transfer rows=%d", affected)
+	}
+	if _, err := fixture.repository.ResolveGatewayBinding(context.Background(), GatewayBindingRef{
+		AppID: fixture.entry.AppID, AllocationID: fixture.entry.AllocationID,
+		AccessRevisionID: fixture.entry.AccessRevisionID, GrantAttemptID: fixture.entry.GrantAttemptID,
+	}); !errors.Is(err, ErrInvalidStoredState) {
+		t.Fatalf("resolver accepted stored transfer gap: %v", err)
+	}
+	if _, err := fixture.repository.AuthorizeAppAccessGrant(context.Background(),
+		AppAccessGrantAuthorizationInput{Owner: AppAccessGrantClaimOwnerFor(fixture.grant),
+			PermittedStates: []AppAccessGrantState{AppAccessGrantCommitted}}); !errors.Is(err, ErrInvalidStoredState) {
+		t.Fatalf("authorization accepted stored transfer gap: %v", err)
+	}
+	rawAllocation, err := readAllocationByID(context.Background(), fixture.db, fixture.entry.AllocationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawGrant, err := readAppAccessGrantClaim(context.Background(), fixture.db, fixture.grant.AttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawProfile, _, err := readGatewayRevision(context.Background(), fixture.db,
+		first.RawProfile.ID, first.RawProfile.RevisionNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(rawAllocation, first.RawAllocation) ||
+		!reflect.DeepEqual(rawGrant, first.RawGrant) || !reflect.DeepEqual(rawProfile, first.RawProfile) {
+		t.Fatalf("transfer-gap refusal mutated raw facts: allocation=%#v grant=%#v profile=%#v",
+			rawAllocation, rawGrant, rawProfile)
+	}
+}
+
+func TestDisableAuthorizationAndStartupUseCompleteRepeatedRebindChain(t *testing.T) {
+	fixture := newGatewayRebindFixture(t, true)
+	commitGatewayRebindFixture(t, fixture, strings.Repeat("7", 64))
+	first, err := fixture.repository.ResolveGatewayBinding(context.Background(), GatewayBindingRef{
+		AppID: fixture.entry.AppID, AllocationID: fixture.entry.AllocationID,
+		AccessRevisionID: fixture.entry.AccessRevisionID, GrantAttemptID: fixture.entry.GrantAttemptID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, current := commitNextGatewayRebindForTest(t, fixture, first)
+	disable, created, err := fixture.repository.ClaimAppAccessDisable(context.Background(),
+		approvedDisableInput(t, current.RawAccessRevision))
+	if err != nil || !created {
+		t.Fatalf("disable=%#v created=%t error=%v", disable, created, err)
+	}
+	authorization, err := fixture.repository.AuthorizeAppAccessDisable(context.Background(),
+		AppAccessDisableAuthorizationInput{Owner: AppAccessDisableClaimOwnerFor(disable),
+			PermittedStates: []AppAccessDisableState{AppAccessDisablePrepared}})
+	if err != nil || authorization.EffectiveProfile.ID != current.EffectiveProfile.ID ||
+		authorization.CurrentGatewaySource != current.CurrentGatewaySource ||
+		len(authorization.TransferChain) != 2 ||
+		authorization.TransferChainTipDigest != current.TransferChainTipDigest ||
+		authorization.TerminalReceiptDigest != current.TerminalReceiptDigest {
+		t.Fatalf("repeated-chain disable authorization=%#v error=%v", authorization, err)
+	}
+	startup, err := fixture.repository.HostingGatewayStartupSnapshot(context.Background())
+	if err != nil || len(startup.Disables.Claims) != 1 ||
+		startup.Disables.Claims[0].EffectiveProfile.ID != current.EffectiveProfile.ID ||
+		startup.Disables.Claims[0].CurrentGatewaySource != current.CurrentGatewaySource ||
+		len(startup.Disables.Claims[0].TransferChain) != 2 ||
+		startup.Disables.Claims[0].TransferChainTipDigest != current.TransferChainTipDigest ||
+		startup.Disables.Claims[0].TerminalReceiptDigest != current.TerminalReceiptDigest ||
+		!startup.Disables.Claims[0].ProfileHeadCurrent {
+		t.Fatalf("repeated-chain disable startup=%#v error=%v", startup.Disables, err)
+	}
+}
+
+func commitNextGatewayRebindForTest(t *testing.T, fixture gatewayRebindFixture,
+	first GatewayBindingResolution,
+) (GatewayRebindClaimV2, GatewayBindingResolution) {
+	t.Helper()
 	previousHead, err := generatedruntimestate.New(fixture.db).Active(context.Background(), fixture.entry.AppID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	advancedHead := redeployRuntimeHeadForRebindTest(t, fixture.db, previousHead)
 	finishGatewayRebindFixtureWork(t, fixture.db)
-
 	proposal := gatewayRebindV2ProposalForCommittedFixture(t, fixture, first, advancedHead)
 	claim, created, err := fixture.repository.ClaimGatewayRebindV2(context.Background(), proposal)
 	if err != nil || !created {
@@ -201,30 +307,28 @@ func TestResolveGatewayBindingWalksRepeatedRebindAcrossRuntimeAdvance(t *testing
 			GatewayRebindDatabaseCommitted, secondReceipt, []GatewayRebindAllocationTransfer{transfer})); err != nil {
 		t.Fatal(err)
 	}
-
-	databaseCommitted, err := fixture.repository.ResolveGatewayBinding(context.Background(), GatewayBindingRef{
+	current, err := fixture.repository.ResolveGatewayBinding(context.Background(), GatewayBindingRef{
 		AppID: fixture.entry.AppID, AllocationID: fixture.entry.AllocationID,
 		AccessRevisionID: fixture.entry.AccessRevisionID, GrantAttemptID: fixture.entry.GrantAttemptID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(databaseCommitted.TransferChain) != 2 ||
-		databaseCommitted.TransferChain[0].SourceBindingDigest == databaseCommitted.TransferChain[1].SourceBindingDigest ||
-		databaseCommitted.TransferChain[0].SourceProfileRevisionID != first.RawProfile.ID ||
-		databaseCommitted.TransferChain[1].SourceProfileRevisionID != first.RawProfile.ID ||
-		databaseCommitted.TransferChain[0].SourceProfileRevisionNumber != first.RawProfile.RevisionNumber ||
-		databaseCommitted.TransferChain[1].SourceProfileRevisionNumber != first.RawProfile.RevisionNumber ||
-		databaseCommitted.TransferChain[0].SourceProfileSpecDigest != first.RawProfile.SpecDigest ||
-		databaseCommitted.TransferChain[1].SourceProfileSpecDigest != first.RawProfile.SpecDigest ||
-		databaseCommitted.TransferChain[1].PredecessorTransferDigest == nil ||
-		*databaseCommitted.TransferChain[1].PredecessorTransferDigest != databaseCommitted.TransferChain[0].TransferDigest ||
-		databaseCommitted.TransferChainTipDigest != transfer.TransferDigest ||
-		databaseCommitted.CurrentGatewaySource.OperationID != claim.Spec.OperationID ||
-		databaseCommitted.TerminalReceiptDigest != secondReceipt {
-		t.Fatalf("database committed resolution=%#v", databaseCommitted)
+	if len(current.TransferChain) != 2 ||
+		current.TransferChain[0].SourceBindingDigest == current.TransferChain[1].SourceBindingDigest ||
+		current.TransferChain[0].SourceProfileRevisionID != first.RawProfile.ID ||
+		current.TransferChain[1].SourceProfileRevisionID != first.RawProfile.ID ||
+		current.TransferChain[0].SourceProfileRevisionNumber != first.RawProfile.RevisionNumber ||
+		current.TransferChain[1].SourceProfileRevisionNumber != first.RawProfile.RevisionNumber ||
+		current.TransferChain[0].SourceProfileSpecDigest != first.RawProfile.SpecDigest ||
+		current.TransferChain[1].SourceProfileSpecDigest != first.RawProfile.SpecDigest ||
+		current.TransferChain[1].PredecessorTransferDigest == nil ||
+		*current.TransferChain[1].PredecessorTransferDigest != current.TransferChain[0].TransferDigest ||
+		current.TransferChainTipDigest != transfer.TransferDigest ||
+		current.CurrentGatewaySource.OperationID != claim.Spec.OperationID ||
+		current.TerminalReceiptDigest != secondReceipt {
+		t.Fatalf("database committed resolution=%#v", current)
 	}
-
 	committed := gatewayRebindProofForClaimV2(t, claim, GatewayRebindDatabaseCommitted, 3,
 		GatewayRebindCommitted, secondReceipt, nil)
 	committed.LocalAttestationDigest = strings.Repeat("8", 64)
@@ -242,51 +346,7 @@ func TestResolveGatewayBindingWalksRepeatedRebindAcrossRuntimeAdvance(t *testing
 		len(snapshot.CurrentTransfers) != 1 || snapshot.CurrentTransfers[0].TransferDigest != transfer.TransferDigest {
 		t.Fatalf("committed second rebind snapshot=%#v", snapshot)
 	}
-	startup, err := fixture.repository.HostingGatewayStartupSnapshot(context.Background())
-	if err != nil || len(startup.Upgrades.Claims) != 1 || len(startup.Grants.Claims) != 1 ||
-		startup.Grants.Claims[0].EffectiveProfile.ID != claim.Spec.SuccessorProfileRevisionID ||
-		!startup.Grants.Claims[0].ProfileHeadCurrent {
-		t.Fatalf("startup after repeated rebind=%#v error=%v", startup, err)
-	}
-
-	if _, err := fixture.db.Exec(`DROP TRIGGER lan_gateway_rebind_allocation_transfer_retain`); err != nil {
-		t.Fatal(err)
-	}
-	if result, err := fixture.db.Exec(`DELETE FROM lan_gateway_rebind_allocation_transfers
-		WHERE operation_id=? AND allocation_id=?`, fixture.claim.Spec.OperationID, fixture.entry.AllocationID); err != nil {
-		t.Fatal(err)
-	} else if affected, _ := result.RowsAffected(); affected != 1 {
-		t.Fatalf("deleted intermediate transfer rows=%d", affected)
-	}
-	if _, err := fixture.repository.ResolveGatewayBinding(context.Background(), GatewayBindingRef{
-		AppID: fixture.entry.AppID, AllocationID: fixture.entry.AllocationID,
-		AccessRevisionID: fixture.entry.AccessRevisionID, GrantAttemptID: fixture.entry.GrantAttemptID,
-	}); !errors.Is(err, ErrInvalidStoredState) {
-		t.Fatalf("resolver accepted stored transfer gap: %v", err)
-	}
-	if _, err := fixture.repository.AuthorizeAppAccessGrant(context.Background(),
-		AppAccessGrantAuthorizationInput{Owner: AppAccessGrantClaimOwnerFor(fixture.grant),
-			PermittedStates: []AppAccessGrantState{AppAccessGrantCommitted}}); !errors.Is(err, ErrInvalidStoredState) {
-		t.Fatalf("authorization accepted stored transfer gap: %v", err)
-	}
-	rawAllocation, err := readAllocationByID(context.Background(), fixture.db, fixture.entry.AllocationID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rawGrant, err := readAppAccessGrantClaim(context.Background(), fixture.db, fixture.grant.AttemptID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rawProfile, _, err := readGatewayRevision(context.Background(), fixture.db,
-		first.RawProfile.ID, first.RawProfile.RevisionNumber)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(rawAllocation, first.RawAllocation) ||
-		!reflect.DeepEqual(rawGrant, first.RawGrant) || !reflect.DeepEqual(rawProfile, first.RawProfile) {
-		t.Fatalf("transfer-gap refusal mutated raw facts: allocation=%#v grant=%#v profile=%#v",
-			rawAllocation, rawGrant, rawProfile)
-	}
+	return claim, current
 }
 
 func TestRetiredGatewayBindingRemainsHistoricalAfterLaterRebind(t *testing.T) {
