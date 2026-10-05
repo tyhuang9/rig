@@ -60,7 +60,7 @@ requires a separately reviewed pre-effect nonce or equivalent durable proof.
 | `go vet ./...` and `go build -buildvcs=false ./...` | PASS on the corrected final source. |
 | `go test -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress` | PASS compilation only; no live Docker test ran. |
 | `pnpm --dir docs build` and `git diff --check` | PASS after the evidence update; no production deployment was attempted. |
-| Live Docker acceptance | PASS for the private network stage on hosted Linux: [job 111606812391](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391) passed the named test and residue at code head `ad8d3e2`; [job 111608189048](https://github.com/tyhuang9/rig/actions/runs/37261058988/job/111608189048) passed both at the evidence-only head `f91140c`. The local Docker named pipe remains unavailable. |
+| Live Docker acceptance | PASS for the private network stage on hosted Linux: [job 111606812391](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391) passed the named test and residue at code head `ad8d3e2`; [job 111608189048](https://github.com/tyhuang9/rig/actions/runs/37261058988/job/111608189048) passed both at evidence-only head `f91140c`. After a late replay assertion correction, [job 111619317032](https://github.com/tyhuang9/rig/actions/runs/37264835255/job/111619317032) passed both at code head `fd68ab8`, and [job 111620115206](https://github.com/tyhuang9/rig/actions/runs/37265095730/job/111620115206) passed both at the current row-25 evidence head `f1707e9`. The local Docker named pipe remains unavailable. |
 
 Behavioral tests cover clean creation and exact replay, foreign deterministic
 names, exact and unexpected owned volumes, topology drift adjacent to create,
@@ -86,15 +86,26 @@ review found no new ownership or unrelated-route bypass. The existing Linux
 route snapshot retains destination prefixes but not next hops or route tables;
 that preexisting semantic limit remains.
 
-The broader generated-runtime race job is a separate PR-readiness gate. Its
-last successful pre-correction run took 1074.037s for
-`internal/generatedingress` against an 18-minute (1080s) Go test timeout.
-After the added route regressions, [PR #121's race job](https://github.com/tyhuang9/rig/actions/runs/37260578548/job/111606761789)
+The broader race jobs are separate PR-readiness gates. The last successful
+pre-correction generated-ingress race package took 1074.037s against the old
+18-minute (1080s) Go timeout. After the added route regressions, [PR #121's
+race job](https://github.com/tyhuang9/rig/actions/runs/37260578548/job/111606761789)
 and [PR #122's race job](https://github.com/tyhuang9/rig/actions/runs/37261058991/job/111608365118)
-both timed out at 1080s without a race report. The generated-runtime race
-workflow now allows 24 minutes for Go tests, 26 minutes for the step, and 35
-minutes for the job; test coverage and assertions are unchanged. This is a
-CI time-budget correction, not a passing race result. A hosted rerun is required.
+both timed out at 1080s without a race report. The expanded [PR #121 race job
+111614182088](https://github.com/tyhuang9/rig/actions/runs/37263087299/job/111614182088)
+then passed at head `24a087b`, with `internal/generatedingress` taking
+1431.390s, only 8.610s below its 24-minute limit. At row-25 evidence head
+`f1707e9`, [job 111620415517](https://github.com/tyhuang9/rig/actions/runs/37265095780/job/111620415517)
+hit that exact 24-minute Go timeout during a SQLite test fixture, without a
+race report. The row-24 [repository-wide Linux race job
+111614425404](https://github.com/tyhuang9/rig/actions/runs/37263087200/job/111614425404)
+was cancelled at its 60-minute job ceiling while `go test -race ./...` was
+still running. Its PostgreSQL integration and relay outage steps had passed.
+The workflows now allow 32 minutes for the generated-runtime Go command, 34
+for its step, and 42 for its job; the repository-wide job allows 40 minutes per
+Go package and 80 minutes overall. The package lists, race detection, test
+assertions, and required PostgreSQL steps are unchanged. The new budgets still
+require hosted proof; neither timeout is a passing race result.
 
 ## Remaining gates
 
