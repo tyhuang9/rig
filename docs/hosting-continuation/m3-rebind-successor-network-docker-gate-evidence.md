@@ -143,12 +143,18 @@ The broader generated-runtime race check is still a separate PR-readiness
 gate. At evidence-only head `f91140c`, [job 111608365118](https://github.com/tyhuang9/rig/actions/runs/37261058991/job/111608365118)
 timed out at the inherited 18-minute Go package limit, without a race report.
 The previous successful pre-correction generated-ingress race package had
-completed in 1074.037s, only 5.963s below that limit. The parent row-24 branch
-now raises the Go, step, and job budgets to 24, 26, and 35 minutes without
-removing test coverage. The [expanded-budget race job 111614264166](https://github.com/tyhuang9/rig/actions/runs/37263115647/job/111614264166)
-then passed at head `a5b4d10`; `internal/generatedingress` took 1116.225s.
-This proves the same suite completed beyond the old 1080s limit. The
-late-parity-corrected head `fd68ab8` still requires its own hosted race result.
+completed in 1074.037s, only 5.963s below that limit. The first parent row-24
+budget increase allowed 24 minutes for Go, 26 for the step, and 35 for the job.
+The [expanded-budget race job 111614264166](https://github.com/tyhuang9/rig/actions/runs/37263115647/job/111614264166)
+passed at head `a5b4d10`; `internal/generatedingress` took 1116.225s. At
+evidence head `f1707e9`, [job 111620415517](https://github.com/tyhuang9/rig/actions/runs/37265095780/job/111620415517)
+hit the exact 24-minute Go package limit during a SQLite test fixture, with no
+race report. The repository-wide Linux race job on parent row 24 was also
+cancelled at its 60-minute job ceiling while tests were running. The parent
+now allows 32 minutes for generated-runtime Go, 34 for its step, 42 for its
+job, and 40 minutes per package within an 80-minute repository-wide Linux job.
+The same race tests and assertions remain. This inherited budget correction
+still requires new-head hosted results; neither timed-out run is a pass.
 
 ## Later hosted replay failure, 2026-10-05 UTC
 
@@ -173,11 +179,16 @@ always-run residue step also passed, so no managed resource was left on that
 runner. The passing correction does not identify which combined predicate
 caused the earlier failure.
 
+The [row-25 evidence-only job 111620115206](https://github.com/tyhuang9/rig/actions/runs/37265095730/job/111620115206)
+also passed the named live test without a skip in 46.06s and passed the
+always-run cleanup at `f1707e9`. This reconfirms only the private network
+stage, not later successor effects.
+
 ## Remaining work
 
 The config and data volumes, successor container, serving transition, route
 publication, terminal protected receipt, SQLite terminal transition,
-migration-035 fence release, public caller, current-head hosted Linux race proof, physical
-second-device LAN proof, merge, and deployment remain open. The
+migration-035 fence release, public caller, current-head hosted Linux race
+proof, physical second-device LAN proof, merge, and deployment remain open. The
 create-before-bind crash window remains unresolved and fenced; this gate does
 not claim automatic recovery from that window.
