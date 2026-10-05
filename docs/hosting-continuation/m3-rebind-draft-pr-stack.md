@@ -4,11 +4,11 @@ Status: rows 1–25 were published as stacked draft PRs #98–#122 on 2026-10-04
 with the user's explicit approval. The published base is draft PR #97,
 `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each row's branch
 descends from the preceding row's branch and targets it with one review scope.
-Rows 26–36 remain local and unpublished. Row 15 includes the initial version
+Rows 26–37 remain local and unpublished. Row 15 includes the initial version
 of this plan after its scope commit; rows 25, 27, 28, 29, 30, 31, 34, 35,
-and 36 update it. The first hosted row-25 network Docker gate failed after
-network creation; its diagnostic rerun is queued, so no hosted acceptance is
-claimed for it. Rows 26–36 require separate publication approval after the
+36, and 37 update it. The first two hosted row-25 network Docker attempts
+failed; the corrected head's run is queued, so no hosted acceptance is
+claimed for it. Rows 26–37 require separate publication approval after the
 prerequisite gate and local review. No draft publication authorizes
 merge or deployment.
 
