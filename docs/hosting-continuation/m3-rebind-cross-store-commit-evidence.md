@@ -7,8 +7,9 @@ deployment is authorized for this branch.
 Branch: `feature/hosting-m3-rebind-cross-store-commit`.
 Base: `a888cac5f34c46aad74afd5c3a0392eec914c509`, the reviewed private handover
 candidate. That handover's draft-publication request is pending. Its prerequisite
-[draft PR #136](https://github.com/tyhuang9/rig/pull/136) is published at
-`bdbb697f767da4e71664da1434a75e6daec4b732`.
+[draft PR #136](https://github.com/tyhuang9/rig/pull/136) was initially published at
+`bdbb697f767da4e71664da1434a75e6daec4b732`; its corrected current head is
+`46c8351c174f5c4ed788d04a733b61a5c72b1243`.
 
 ## Purpose and required end state
 
@@ -362,6 +363,105 @@ logs were read directly. This proves those named inherited journeys only.
 PR #136's two final-config-copy Docker jobs remained queued at the latest check;
 private handover Docker acceptance is still pending publication and execution.
 No new SQL, Linux race, rebind cutover or second-device result is claimed.
+
+On the corrected PR #134 head `b938a7af629c1494193050ed505121bb5934394c`,
+two prerequisite jobs have now passed with their exact source revision and
+required cleanup steps verified:
+
+| Named Docker test | Result | Job |
+| --- | --- | --- |
+| `TestLiveGatewayRebindSuccessorStoppedStageContainer` | One pass, 72.19s | [Stopped container](https://github.com/tyhuang9/rig/actions/runs/37381954383/job/112005898965) |
+| `TestLiveGatewayRebindSuccessorNetworkStage` | One pass, 56.69s | [Network stage](https://github.com/tyhuang9/rig/actions/runs/37381954383/job/112005899139) |
+
+The corrected stage-start job and the two PR #136 final-config-copy jobs were
+still queued. These prerequisite results do not yet establish the changed
+two-address stage-start behavior.
+
+Additional exact-head prerequisite results were subsequently read from their
+completed job logs. Each named test passed once with no failure/skip, and every
+job's required cleanup step passed:
+
+| Source | Named tests and seconds | Job |
+| --- | --- | --- |
+| #135 `f2b7815` | `TestLiveGatewayRebindSuccessorStageConfigCopy` 79.25; `TestLiveGatewayRebindSuccessorStageConfigCopyLostAcknowledgmentAdopts` 71.94 | [Stage config copy](https://github.com/tyhuang9/rig/actions/runs/37381953709/job/112005903751) |
+| #135 `f2b7815` | `TestLiveGatewayV2UpgradeCommitAndRestart` 40.12; `TestLiveGatewayV2BindConflictRollsBack` 21.94; `TestLiveGatewayRebindPassiveDockerSendsNoApplicationRequests` 32.60; `TestLiveGatewayRebindPublicPassivePredecessor` 40.82 | [Upgrade and passive proofs](https://github.com/tyhuang9/rig/actions/runs/37381953709/job/112005903979) |
+| #136 `46c8351` | `TestLiveGatewayV2UpgradeCommitAndRestart` 34.76; `TestLiveGatewayV2BindConflictRollsBack` 17.47; `TestLiveGatewayRebindPassiveDockerSendsNoApplicationRequests` 26.64; `TestLiveGatewayRebindPublicPassivePredecessor` 31.79 | [Upgrade and passive proofs](https://github.com/tyhuang9/rig/actions/runs/37381954436/job/112005925276) |
+| #136 `46c8351` | `TestLiveGatewayRebindSuccessorNetworkStage` 43.49 | [Network stage](https://github.com/tyhuang9/rig/actions/runs/37381954436/job/112005925497) |
+
+## Integrated cross-store checkpoints
+
+### Integrated SQL checkpoint
+
+The independent security/code re-review accepted the bounded SQL checkpoint
+`5c2a349ef868265e5eef8d46a8efbc8f935fff14`. It confirmed capability consumption
+before row visibility, one immutable terminal decision and atomic
+profile/head/transfer changes. The reviewer used an exact detached source
+tree and executable regressions; no formal security-scan artifact is claimed.
+
+That checkpoint is integrated with the protected current-state work at local
+commit `fe2a6689a76c22bc244845a439863d0aec11b2ae`. The parent then ran exactly
+11 named database/app-access regressions with `go test -mod=readonly -p=1
+-json -count=1 -timeout=8m`: guarded migration/mirroring, one-use capability
+consumption/cancellation, atomic lifecycle, extra-roster refusal, retained
+terminal decision, chained digest readback, typed source union and the three
+canonical format tests. All 11 passed, with zero failures/skips; database
+0.833s and app-access 4.588s. Named events are captured in
+`$TEMP/m3-cross-store-fe2a668-sql-integration.jsonl`. The command was:
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=8m ./internal/database ./internal/appaccess -run '^(TestLANGatewayRebindGuardedCommitMigrationRetainsV1AndIsMirrored|TestGatewayRebindGuardConsumesExactCapabilityBeforeRowVisibility|TestGatewayRebindGuardCancellationAndTransactionRollbackNeverReviveCapability|TestGatewayRebindTransitionAppliesCompleteLifecycleAtomically|TestGatewayRebindTransitionRejectsExtraRosterTransferAtomically|TestGatewayRebindTransitionRetainsOneTerminalDecision|TestGatewayRebindChainedTransferReadbackUsesDigestValue|TestGatewayRebindV2SourceClaimAcceptsUpgradeGenerationAndRejectsCrossKindMixes|TestGatewayRebindV1CanonicalDigestsRemainStable|TestGatewayRebindV2CanonicalTypesBindTypedSourceAndTransferChain|TestGatewayRebindV2CanonicalTypesRejectCrossVersionAndBrokenChains)$'
+```
+
+This is SQL integration evidence, not runtime completion.
+
+The combined checkpoint also passed four exact generated-ingress regressions
+in 37.211s, with no failures/skips: native proof matching, SQL authority/transfer
+chain matching, proof population on native observation, and holding the gateway
+lock through observation/resolution. The command was:
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^(TestGatewayV2LANEffectiveBindingProofMatchesSQLAuthorityAndChain|TestGatewayV2LANEffectiveBindingProofMatchesNativeUpgradeAuthority|TestGatewayV2LANEffectiveBindingProofIsPresentOnNativeObservation|TestGatewayV2LANObservationAndResolutionHoldGatewayLock)$'
+```
+
+Captured events: `$TEMP/m3-cross-store-fe2a668-proof-integration.jsonl`.
+
+Startup source mapping found that `runServer` takes ordinary worker admission
+immediately after opening SQLite. That closure checks the rebind fence before
+`inspectGatewayStartup`, so recovery added only inside the latter would be
+unreachable for active rebinds. The runtime implementation must add dedicated
+startup recovery under the effects lease before ordinary admission/inspection;
+ordinary workers retain their strict fence. Recovery must also precede
+historical disable acknowledgment, LAN quarantine and normal ingress recovery.
+The coordinator owns effects-lease acquisition; startup must call it before
+taking ordinary startup admission, without nesting the same lease.
+
+### Pending controller comparison
+
+The independently reviewed protected current-state checkpoint
+`25fec6f573ac12c2174a7472aeaa4a6552ac4f0b` is integrated locally. Its native
+observation carries the effective profile and full protected lineage under the
+existing gateway lock. The controller must compare that proof with a fresh SQL
+authorization from inside the same callback, including the complete transfer
+chain. Neither empty SQL authority nor a raw-profile fallback is acceptable.
+
+Before adding this comparison, the new controller regression was run against
+the prior adapter:
+
+```text
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/controller -run '^TestLANAccessStatusWithholdsURLWhenEffectiveProofDisagrees$'
+```
+
+All 11 cases first established a verified native baseline, then failed because
+the response still exposed its URL after the protected proof was removed or
+changed. The package failed in 3.634s as expected. The captured log is
+`$TEMP/m3-cross-store-controller-effective-proof-red.jsonl`. This is evidence
+for the controller gap, not a passing acceptance result. The adapter changes
+and positive/refusal tests await integration with the reviewed SQL resolver
+and its full authorization DTO before a passing checkpoint can be recorded.
+
+The controller's two-transfer fixture explicitly simulates validated DTOs;
+it verifies projection and comparison only. Real SQL transfer, restart and
+Docker acceptance remain separate required gates.
 
 ## Recovery and rollback boundary
 
