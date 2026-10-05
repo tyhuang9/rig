@@ -2,7 +2,11 @@ package generatedingress
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"sort"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -114,6 +118,13 @@ func TestInspectGatewayRebindCurrentSeparatesSelectedAuthorityFromActivePhase(t 
 		inspection.Retained[0].Resources.FinalContainerID == "" {
 		t.Fatalf("unexpected current inspection: %#v", inspection)
 	}
+	fixture.manager.gatewayRebindFailStop = &atomic.Bool{}
+	fixture.manager.gatewayRebindFailStop.Store(true)
+	inspection, err = fixture.manager.InspectGatewayRebindCurrent(context.Background(), &repository)
+	if err != nil || inspection.FenceReleased {
+		t.Fatalf("process fail-stop reported a released fence: inspection=%#v error=%v", inspection, err)
+	}
+	fixture.manager.gatewayRebindFailStop.Store(false)
 
 	activeOperationID := uuid.NewString()
 	repository.snapshot.Active = &appaccess.GatewayRebindHistoryEntry{Claim: appaccess.GatewayRebindClaimRecord{
@@ -130,6 +141,103 @@ func TestInspectGatewayRebindCurrentSeparatesSelectedAuthorityFromActivePhase(t 
 		inspection.ActiveOperationID != activeOperationID || inspection.ActivePhase != appaccess.GatewayRebindPrepared ||
 		inspection.FenceReleased {
 		t.Fatalf("prepared B obscured committed A: inspection=%#v error=%v", inspection, err)
+	}
+}
+
+func TestGatewayRebindProtectedIntentV2KeepsTypedPriorRebindSource(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	fixture.manager.mu = newContextMutex()
+	fixture.manager.options.RebindFenceCheck = func(context.Context) error { return nil }
+	if err := fixture.store.installBaseline(fixture.baseline); err != nil {
+		t.Fatal(err)
+	}
+	repository := gatewayRebindProposalRepositoryForCurrentFixture(t, fixture)
+	input := GatewayRebindProposalInput{
+		OperationID: uuid.NewString(), SuccessorProfileRevisionID: uuid.NewString(),
+		SuccessorProfileRevisionNumber: fixture.baseline.Profile.RevisionNumber + 1,
+		SuccessorProfileOperationID:    uuid.NewString(),
+		SuccessorProfile: appaccess.GatewayProfileSpec{
+			SelectedIPv4: fixture.baseline.Profile.SelectedIPv4, InterfaceID: fixture.baseline.Profile.InterfaceID,
+			PortStart: fixture.baseline.Profile.PortStart, PortEnd: fixture.baseline.Profile.PortEnd,
+		},
+	}
+	inspection, err := fixture.manager.InspectGatewayRebindProposal(context.Background(), &repository, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebindActor, configureActor := uuid.NewString(), uuid.NewString()
+	claim := appaccess.GatewayRebindClaimV2{Spec: inspection.Spec,
+		RebindApproval: appaccess.Approval{Action: appaccess.ActionRebindGateway,
+			SpecDigest: inspection.SpecDigest, ActorID: rebindActor},
+		ConfigureApproval: appaccess.Approval{Action: appaccess.ActionConfigureGateway,
+			SpecDigest: inspection.SuccessorProfileSpecDigest, ActorID: configureActor},
+		State: appaccess.GatewayRebindPrepared, StateSequence: 1,
+	}
+	claim.RequestDigest, err = canonicalDigest(struct {
+		Spec      appaccess.GatewayRebindSpecV2 `json:"spec"`
+		Rebind    appaccess.Approval            `json:"rebindApproval"`
+		Configure appaccess.Approval            `json:"configureApproval"`
+	}{claim.Spec, claim.RebindApproval, claim.ConfigureApproval})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim.SuccessorProfileRequestDigest, err = canonicalDigest(struct {
+		Expected int64                        `json:"expectedRevisionNumber"`
+		Spec     appaccess.GatewayProfileSpec `json:"spec"`
+		Approval appaccess.Approval           `json:"approval"`
+	}{claim.Spec.Predecessor.Lineage.ProfileRevisionNumber, claim.Spec.SuccessorProfile, claim.ConfigureApproval})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim.RebindApprovedAt = time.Unix(1, 0).UTC()
+	claim.ConfigureApprovedAt = time.Unix(2, 0).UTC()
+	claim.CreatedAt, claim.UpdatedAt = time.Unix(3, 0).UTC(), time.Unix(3, 0).UTC()
+	checkpoint, err := newGatewayRebindPredecessorCheckpoint(inspection.ProtectedGeneration, input.OperationID,
+		fixture.baseline.Lineage, nil, &fixture.baseline)
+	if err != nil || checkpoint.Digest != inspection.PredecessorCheckpointDigest {
+		t.Fatalf("rebuild inspected checkpoint: %v", err)
+	}
+	network := fixture.intent.NetworkObservation
+	network.OperationID = input.OperationID
+	network.ClaimRequestDigest = claim.RequestDigest
+	network.ProfileSpecDigest = inspection.SuccessorProfileSpecDigest
+	intent, err := newGatewayRebindProtectedIntentV2(claim, inspection.Roster, checkpoint, network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.Predecessor.Lineage.Kind != appaccess.GatewayRebindSourceGatewayRebind ||
+		intent.Predecessor.Lineage.OperationID != fixture.receipt.OperationID ||
+		intent.Predecessor.Lineage.TerminalReceiptDigest != fixture.receipt.Digest ||
+		intent.Predecessor.Lineage.ProtectedJournalDigest != "" || !validGatewayRebindProtectedIntentV2(intent) {
+		t.Fatalf("typed prior rebind source was not preserved: %#v", intent.Predecessor)
+	}
+	forgedProfile := intent
+	forgedProfile.SuccessorProfile.ApprovedBy = uuid.NewString()
+	forgedProfile.Digest, err = gatewayRebindProtectedIntentV2Digest(forgedProfile)
+	if err != nil || validGatewayRebindProtectedIntentV2(forgedProfile) {
+		t.Fatalf("typed intent accepted a rehashed profile that disagrees with its signed claim: %v", err)
+	}
+	body, err := json.Marshal(intent)
+	if err != nil || strings.Contains(string(body), `"protectedJournalDigest"`) ||
+		!strings.Contains(string(body), `"terminalReceiptDigest":"`+fixture.receipt.Digest+`"`) {
+		t.Fatalf("typed intent serialized a fake journal or lost receipt: %s error=%v", body, err)
+	}
+	store, err := newGatewayRebindProtectedIntentV2Store(fixture.dataRoot, intent.Generation, intent.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.installExact(intent); err != nil {
+		t.Fatalf("install typed intent: %v", err)
+	}
+	loaded, err := store.load()
+	if err != nil || !reflect.DeepEqual(loaded, intent) {
+		t.Fatalf("load typed intent: %v", err)
+	}
+	generation, operationID, _, kind, relevant, err := parseGatewayHistoryArtifactName(filepathBase(store.path))
+	if err != nil || !relevant || kind != gatewayHistoryRebindIntent || generation != intent.Generation ||
+		operationID != intent.OperationID {
+		t.Fatalf("parse typed intent path: generation=%d operation=%s kind=%d relevant=%v error=%v",
+			generation, operationID, kind, relevant, err)
 	}
 }
 

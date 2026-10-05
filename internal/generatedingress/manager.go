@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hostd/hostd/internal/generatedruntime"
@@ -75,6 +76,9 @@ type Manager struct {
 	dockerEnv                []string
 	workingDirectoryIdentity os.FileInfo
 	mu                       contextMutex
+	// gatewayRebindFailStop points at the process-wide latch in production.
+	// Tests may replace it with a private latch to avoid cross-test state.
+	gatewayRebindFailStop *atomic.Bool
 	// gatewayTopologyObserver is replaceable only by package tests. Production
 	// always uses the full read-only Docker attestation.
 	gatewayTopologyObserver func(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayObservedTopology
@@ -175,7 +179,9 @@ func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager,
 	if err != nil {
 		return nil, err
 	}
-	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv, workingDirectoryIdentity: workingDirectoryIdentity, mu: newContextMutex()}, nil
+	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv,
+		workingDirectoryIdentity: workingDirectoryIdentity, mu: newContextMutex(),
+		gatewayRebindFailStop: &gatewayRebindProcessFailStop}, nil
 }
 
 // Switch atomically reloads the aggregate Caddy route set, durably records the
