@@ -154,7 +154,7 @@ func (r *Repository) ClaimAppAccessGrant(ctx context.Context, input ClaimAppAcce
 		return AppAccessGrantClaim{}, false, lookupErr
 	}
 
-	revision, profile, err := validateCurrentAppAccessGrantSpec(ctx, tx, input.Spec, true)
+	revision, profile, err := validateCurrentAppAccessGrantSpec(ctx, tx, input.Spec, true, true)
 	if err != nil {
 		return AppAccessGrantClaim{}, false, err
 	}
@@ -657,7 +657,7 @@ func appAccessGrantAllocationStateMatches(state AppAccessGrantState, allocation 
 }
 
 func validateCurrentAppAccessGrantSpec(ctx context.Context, query rowQuerier, spec AppAccessGrantSpec,
-	rejectDisable bool,
+	rejectDisable, requireRawProfileHead bool,
 ) (AppAccessRevision, GatewayProfileRevision, error) {
 	var headRevision sql.NullString
 	var headNumber int64
@@ -697,8 +697,8 @@ func validateCurrentAppAccessGrantSpec(ctx context.Context, query rowQuerier, sp
 		FROM lan_gateway_profile_heads WHERE singleton=1`).Scan(&profileHead, &profileNumber); err != nil {
 		return AppAccessRevision{}, GatewayProfileRevision{}, err
 	}
-	if !profileHead.Valid || profileHead.String != spec.GatewayProfileRevisionID ||
-		profileNumber != spec.GatewayProfileRevisionNumber {
+	if !profileHead.Valid || profileNumber <= 0 || (requireRawProfileHead &&
+		(profileHead.String != spec.GatewayProfileRevisionID || profileNumber != spec.GatewayProfileRevisionNumber)) {
 		return AppAccessRevision{}, GatewayProfileRevision{}, ErrConflict
 	}
 	profile, _, err := readGatewayRevision(ctx, query, spec.GatewayProfileRevisionID, spec.GatewayProfileRevisionNumber)

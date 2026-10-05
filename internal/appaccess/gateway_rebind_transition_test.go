@@ -240,6 +240,15 @@ func insertGatewayRebindTransitionDirect(t *testing.T, fixture gatewayRebindFixt
 	proof GatewayRebindTransitionProof,
 ) error {
 	t.Helper()
+	insert, revoke := armGatewayRebindTransitionDirect(t, fixture, proof)
+	defer revoke()
+	return insert()
+}
+
+func armGatewayRebindTransitionDirect(t *testing.T, fixture gatewayRebindFixture,
+	proof GatewayRebindTransitionProof,
+) (func() error, func()) {
+	t.Helper()
 	payload, err := json.Marshal(proof)
 	if err != nil {
 		t.Fatal(err)
@@ -260,8 +269,8 @@ func insertGatewayRebindTransitionDirect(t *testing.T, fixture gatewayRebindFixt
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer revoke()
-	_, err = fixture.db.Exec(`INSERT INTO lan_gateway_rebind_transition_commands(
+	insert := func() error {
+		_, err := fixture.db.Exec(`INSERT INTO lan_gateway_rebind_transition_commands(
 		operation_id,sequence,previous_state,previous_sequence,next_state,purpose,
 		protected_record_digest,terminal_receipt_digest,local_attestation_digest,
 		command_digest,created_at,proof_version,terminal_disposition,protected_generation,
@@ -270,16 +279,18 @@ func insertGatewayRebindTransitionDirect(t *testing.T, fixture gatewayRebindFixt
 		successor_operational_state_version,successor_operational_state_revision,
 		successor_operational_state_digest,transfer_manifest_digest,authorization_nonce,canonical_payload
 	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		proof.OperationID, proof.ExpectedSequence+1, proof.ExpectedState, proof.ExpectedSequence,
-		proof.NextState, proof.Purpose, proof.ProtectedRecordDigest,
-		nullableDigest(proof.TerminalReceiptDigest), nullableDigest(proof.LocalAttestationDigest),
-		commandDigest, formatTime(testNow), proof.Version, proof.TerminalDisposition,
-		int64(proof.ProtectedGeneration), proof.ProtectedPhase, int64(proof.ProtectedRecordSequence),
-		proof.PredecessorCheckpointDigest, int64(proof.SourceStateVersion), int64(proof.SourceStateRevision),
-		proof.SourceStateDigest, int64(proof.SuccessorOperationalStateVersion),
-		int64(proof.SuccessorOperationalStateRevision), nullableDigest(proof.SuccessorOperationalStateDigest),
-		nullableDigest(proof.TransferManifestDigest), nonce, string(payload))
-	return err
+			proof.OperationID, proof.ExpectedSequence+1, proof.ExpectedState, proof.ExpectedSequence,
+			proof.NextState, proof.Purpose, proof.ProtectedRecordDigest,
+			nullableDigest(proof.TerminalReceiptDigest), nullableDigest(proof.LocalAttestationDigest),
+			commandDigest, formatTime(testNow), proof.Version, proof.TerminalDisposition,
+			int64(proof.ProtectedGeneration), proof.ProtectedPhase, int64(proof.ProtectedRecordSequence),
+			proof.PredecessorCheckpointDigest, int64(proof.SourceStateVersion), int64(proof.SourceStateRevision),
+			proof.SourceStateDigest, int64(proof.SuccessorOperationalStateVersion),
+			int64(proof.SuccessorOperationalStateRevision), nullableDigest(proof.SuccessorOperationalStateDigest),
+			nullableDigest(proof.TransferManifestDigest), nonce, string(payload))
+		return err
+	}
+	return insert, revoke
 }
 
 func assertGatewayRebindTerminalDecision(t *testing.T, fixture gatewayRebindFixture,

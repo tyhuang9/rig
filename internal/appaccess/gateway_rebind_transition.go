@@ -44,15 +44,19 @@ func (r *Repository) ApplyGatewayRebindTransition(ctx context.Context,
 		requestDigest, specDigest      string
 		state                          GatewayRebindState
 		sequence, specVersion          int64
+		successorProtectedGeneration   int64
+		updatedAt                      string
 		checkpointDigest, sourceDigest sql.NullString
 		sourceVersion, sourceRevision  sql.NullInt64
 	)
 	if err := tx.QueryRowContext(ctx, `SELECT request_digest,spec_digest,state,state_sequence,
 		spec_format_version,predecessor_checkpoint_digest,predecessor_source_state_version,
-		predecessor_source_state_revision,predecessor_source_state_digest
+		predecessor_source_state_revision,predecessor_source_state_digest,updated_at,
+		successor_protected_generation
 		FROM lan_gateway_rebind_claims WHERE operation_id=?`, proof.OperationID).Scan(
 		&requestDigest, &specDigest, &state, &sequence, &specVersion, &checkpointDigest,
-		&sourceVersion, &sourceRevision, &sourceDigest); err != nil {
+		&sourceVersion, &sourceRevision, &sourceDigest, &updatedAt,
+		&successorProtectedGeneration); err != nil {
 		return GatewayRebindTransitionCommand{}, invalidRebindStoredState(err)
 	}
 	if requestDigest != proof.ClaimRequestDigest || specDigest != proof.ClaimSpecDigest ||
@@ -63,7 +67,8 @@ func (r *Repository) ApplyGatewayRebindTransition(ctx context.Context,
 		(!checkpointDigest.Valid || checkpointDigest.String != proof.PredecessorCheckpointDigest ||
 			!sourceVersion.Valid || uint64(sourceVersion.Int64) != proof.SourceStateVersion ||
 			!sourceRevision.Valid || uint64(sourceRevision.Int64) != proof.SourceStateRevision ||
-			!sourceDigest.Valid || sourceDigest.String != proof.SourceStateDigest) {
+			!sourceDigest.Valid || sourceDigest.String != proof.SourceStateDigest ||
+			successorProtectedGeneration < 1 || uint64(successorProtectedGeneration) != proof.ProtectedGeneration) {
 		return GatewayRebindTransitionCommand{}, ErrInvalidStoredState
 	}
 	var retainedDisposition, retainedReceipt sql.NullString
@@ -80,7 +85,14 @@ func (r *Repository) ApplyGatewayRebindTransition(ctx context.Context,
 		return GatewayRebindTransitionCommand{}, ErrInvalidStoredState
 	}
 
+	lastUpdate, err := parseTime(updatedAt)
+	if err != nil {
+		return GatewayRebindTransitionCommand{}, ErrInvalidStoredState
+	}
 	stamp := r.now().UTC()
+	if stamp.Before(lastUpdate) {
+		stamp = lastUpdate
+	}
 	guard := controldb.GatewayRebindTransitionGuard{
 		OperationID: proof.OperationID, Sequence: proof.ExpectedSequence + 1,
 		PreviousState: string(proof.ExpectedState), PreviousSequence: proof.ExpectedSequence,
