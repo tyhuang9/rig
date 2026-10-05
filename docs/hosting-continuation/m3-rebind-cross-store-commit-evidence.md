@@ -349,6 +349,14 @@ Docker results remain required; the earlier named passes do not prove this
 changed physical fixture. The original daemon stderr was not retained, so
 acceptance must come from the corrected Docker run.
 
+The correction is integrated additively into this local branch. Its handover
+fixture now reuses the same owned-address helper while preserving the original
+handover opt-in; adapter cleanup still runs after Docker and application cleanup.
+Integration-tag compilation passed after that reuse (generated-ingress 0.956s;
+hostd compile reused its cached result). The first refactor compile caught a
+still-needed child-process `runtime` import, which was restored before the
+passing recheck. No physical handover result is claimed.
+
 The containing workflow was still running, so the completed job's metadata and
 logs were read directly. This proves those named inherited journeys only.
 PR #136's two final-config-copy Docker jobs remained queued at the latest check;
