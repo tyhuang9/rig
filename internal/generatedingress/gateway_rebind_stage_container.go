@@ -165,6 +165,7 @@ func gatewayRebindStageContainerConfigurationDigest(intent gatewayRebindProtecte
 	stage.StageConfigIntent = nil
 	stage.StageConfigCopy = nil
 	stage.StageStartIntent = nil
+	stage.StageServing = nil
 	args, err := gatewayRebindStageContainerCreateArgs(intent, stage)
 	if err != nil {
 		return "", errors.New("invalid generated ingress rebind stage container configuration input")
@@ -522,7 +523,7 @@ func (m *Manager) readGatewayRebindStageContainerAttestation(ctx context.Context
 		anchor.predecessor.Journal, docker) {
 		return gatewayRebindStageContainerAttestation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
-	dockerDigest, err := canonicalDigest(docker)
+	dockerDigest, err := gatewayRebindPredecessorDockerDigest(docker, anchor.predecessor.State.Identity)
 	if err != nil {
 		return gatewayRebindStageContainerAttestation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
