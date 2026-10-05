@@ -254,6 +254,29 @@ func newGatewayRebindSuccessorIntentProgress(intent gatewayRebindProtectedIntent
 	return value, nil
 }
 
+func newGatewayRebindSuccessorIntentProgressV2(intent gatewayRebindProtectedIntentV2,
+	occurredAt time.Time,
+) (gatewayRebindProgressRecord, error) {
+	if !validGatewayRebindProtectedIntentV2(intent) || !validGatewayRebindProgressTime(occurredAt) {
+		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress typed rebind successor progress input")
+	}
+	value := gatewayRebindProgressRecord{
+		Version: gatewayRebindProgressVersion, Generation: intent.Generation, OperationID: intent.OperationID,
+		Sequence: 1, Phase: gatewayRebindProgressSuccessorIntent,
+		OccurredAt: occurredAt.UTC().Format(time.RFC3339Nano), ProtectedIntentDigest: intent.Digest,
+	}
+	_, value.Purpose = gatewayRebindProgressName(value.Generation, value.OperationID, value.Sequence)
+	digest, err := gatewayRebindProgressDigest(value)
+	if err != nil {
+		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress typed rebind successor progress input")
+	}
+	value.Digest = digest
+	if !gatewayRebindProgressMatchesIntentV2(value, intent, nil) {
+		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress typed rebind successor progress input")
+	}
+	return value, nil
+}
+
 func newGatewayRebindStageIntentProgress(intent gatewayRebindProtectedIntent,
 	previous gatewayRebindProgressRecord, observation gatewayRebindStageIntentObservation,
 ) (gatewayRebindProgressRecord, error) {
@@ -868,6 +891,27 @@ func (s *gatewayRebindProgressStore) installExact(ctx context.Context, value gat
 func gatewayRebindProgressInstallPermitted(history gatewayRebindProtectedIntentHistory,
 	value gatewayRebindProgressRecord,
 ) bool {
+	for _, selected := range history.IntentsV2 {
+		if selected.Generation != value.Generation || selected.Intent.OperationID != value.OperationID ||
+			selected.Intent.Digest != value.ProtectedIntentDigest {
+			continue
+		}
+		previous := make([]gatewayRebindProgressSelection, 0, value.Sequence-1)
+		for _, existing := range history.Progress {
+			if existing.Generation != value.Generation {
+				continue
+			}
+			if existing.Sequence == value.Sequence {
+				return gatewayRebindProgressMatchesIntentV2(value, selected.Intent, previous) &&
+					reflect.DeepEqual(existing.Record, value)
+			}
+			if existing.Sequence < value.Sequence {
+				previous = append(previous, existing)
+			}
+		}
+		return value.Sequence == uint64(len(previous)+1) &&
+			gatewayRebindProgressMatchesIntentV2(value, selected.Intent, previous)
+	}
 	if len(history.Intents) != 1 || history.Intents[0].Generation != value.Generation ||
 		history.Intents[0].Intent.OperationID != value.OperationID ||
 		history.Intents[0].Intent.Digest != value.ProtectedIntentDigest {
@@ -894,6 +938,46 @@ func gatewayRebindProgressInstallPermitted(history gatewayRebindProtectedIntentH
 		gatewayRebindProgressMatchesIntent(value, history.Intents[0].Intent, previous) &&
 		gatewayRebindProgressMatchesPredecessor(history, value) &&
 		gatewayRebindProgressMatchesHandoverContext(history, value)
+}
+
+func scanGatewayRebindProgressForIntentV2(dataRoot string, intent gatewayRebindProtectedIntentV2,
+	artifacts gatewayRebindHistoryGeneration,
+) ([]gatewayRebindProgressSelection, error) {
+	sequences := make([]uint64, 0, len(artifacts.progress))
+	for sequence := range artifacts.progress {
+		sequences = append(sequences, sequence)
+	}
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	result := make([]gatewayRebindProgressSelection, 0, len(sequences))
+	for index, sequence := range sequences {
+		if sequence != uint64(index+1) || sequence > gatewayRebindProgressMaximumSequence {
+			return nil, errors.New("generated ingress typed rebind progress history has a sequence gap")
+		}
+		artifact := artifacts.progress[sequence]
+		store, err := newGatewayRebindProgressStore(dataRoot, intent.Generation, intent.OperationID, sequence)
+		if err != nil || store.path != artifact.path {
+			return nil, errors.New("generated ingress typed rebind progress history path is invalid")
+		}
+		value, err := store.load()
+		if err != nil || !gatewayRebindProgressMatchesIntentV2(value, intent, result) {
+			return nil, errors.New("generated ingress typed rebind progress history is invalid")
+		}
+		result = append(result, gatewayRebindProgressSelection{Store: store, Generation: intent.Generation,
+			Sequence: sequence, Record: value, Existing: true})
+	}
+	return result, nil
+}
+
+func gatewayRebindProgressMatchesIntentV2(value gatewayRebindProgressRecord,
+	intent gatewayRebindProtectedIntentV2, previous []gatewayRebindProgressSelection,
+) bool {
+	if !validGatewayRebindProtectedIntentV2(intent) || !validGatewayRebindProgressRecord(value) ||
+		value.Generation != intent.Generation || value.OperationID != intent.OperationID ||
+		value.ProtectedIntentDigest != intent.Digest {
+		return false
+	}
+	return value.Sequence == 1 && value.Phase == gatewayRebindProgressSuccessorIntent &&
+		len(previous) == 0 && value.PreviousDigest == "" && value.Stage == nil && value.Handover == nil
 }
 
 func gatewayRebindProgressMatchesHandoverContext(history gatewayRebindProtectedIntentHistory,

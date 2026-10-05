@@ -739,11 +739,15 @@ func readGatewayHistorySnapshotMode(store *stateStore, allowRebind bool) (gatewa
 // and after the bounded read. The surrounding two-snapshot scan therefore
 // rejects replacements and content changes that persist across its reads.
 func fingerprintGatewayHistoryArtifact(path string) (gatewayHistoryFileFingerprint, error) {
+	return fingerprintGatewayHistoryArtifactBound(path, maxGatewayHistoryArtifactBytes)
+}
+
+func fingerprintGatewayHistoryArtifactBound(path string, maximum int64) (gatewayHistoryFileFingerprint, error) {
 	unsafe := func() (gatewayHistoryFileFingerprint, error) {
 		return gatewayHistoryFileFingerprint{}, errors.New("generated ingress upgrade history artifact is unsafe")
 	}
 	before, err := os.Lstat(path)
-	if err != nil || !safeGatewayHistoryArtifact(path, before) || before.Size() <= 0 || before.Size() > maxGatewayHistoryArtifactBytes {
+	if maximum <= 0 || err != nil || !safeGatewayHistoryArtifact(path, before) || before.Size() <= 0 || before.Size() > maximum {
 		return unsafe()
 	}
 	file, err := os.Open(path)
@@ -757,8 +761,8 @@ func fingerprintGatewayHistoryArtifact(path string) (gatewayHistoryFileFingerpri
 	}
 
 	hash := sha256.New()
-	read, err := io.Copy(hash, io.LimitReader(file, maxGatewayHistoryArtifactBytes+1))
-	if err != nil || read <= 0 || read > maxGatewayHistoryArtifactBytes || read != opened.Size() {
+	read, err := io.Copy(hash, io.LimitReader(file, maximum+1))
+	if err != nil || read <= 0 || read > maximum || read != opened.Size() {
 		return unsafe()
 	}
 	afterHandle, err := file.Stat()
@@ -826,11 +830,15 @@ func parseGatewayHistoryArtifactName(name string) (uint64, string, uint64, gatew
 		}
 		return generation, parts[1], 0, candidate.kind, true, nil
 	}
-	if strings.HasPrefix(lowerName, gatewayRebindProtectedIntentFilenamePrefix) {
-		if !strings.HasPrefix(name, gatewayRebindProtectedIntentFilenamePrefix) {
+	intentPrefixes := []string{gatewayRebindProtectedIntentFilenamePrefix, gatewayRebindProtectedIntentFilenamePrefixV2}
+	for _, intentPrefix := range intentPrefixes {
+		if !strings.HasPrefix(lowerName, strings.ToLower(intentPrefix)) {
+			continue
+		}
+		if !strings.HasPrefix(name, intentPrefix) {
 			return 0, "", 0, 0, true, errors.New("generated ingress rebind history filename is invalid")
 		}
-		tail := strings.TrimSuffix(strings.TrimPrefix(name, gatewayRebindProtectedIntentFilenamePrefix), ".bundle")
+		tail := strings.TrimSuffix(strings.TrimPrefix(name, intentPrefix), ".bundle")
 		parts := strings.Split(tail, ".")
 		if !strings.HasSuffix(name, ".bundle") || len(parts) != 2 ||
 			len(parts[0]) != gatewayV2GenerationDigits || !validCanonicalUUID(parts[1]) {

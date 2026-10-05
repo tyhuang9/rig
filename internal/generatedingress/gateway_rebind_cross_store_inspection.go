@@ -71,7 +71,7 @@ func (m *Manager) InspectGatewayRebindCurrent(ctx context.Context,
 	if m == nil || ctx == nil || repository == nil {
 		return GatewayRebindCurrentInspection{}, &Error{Code: DiagnosticValidationFailed}
 	}
-	release, err := m.lockGatewayRaw(ctx)
+	release, err := m.lockGatewayRawForInspection(ctx)
 	if err != nil {
 		return GatewayRebindCurrentInspection{}, err
 	}
@@ -124,7 +124,7 @@ func (m *Manager) inspectGatewayRebindCurrentLocked(ctx context.Context,
 	fenceErr := repository.CheckGatewayRebindFence(ctx)
 	switch {
 	case fenceErr == nil:
-		result.FenceReleased = true
+		result.FenceReleased = !m.gatewayRebindFailStopLatch().Load()
 	case errors.Is(fenceErr, appaccess.ErrGatewayRebindActive):
 		result.FenceReleased = false
 	default:

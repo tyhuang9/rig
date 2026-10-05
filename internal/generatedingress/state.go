@@ -40,8 +40,9 @@ type routeState struct {
 }
 
 type stateStore struct {
-	root string
-	path string
+	root     string
+	path     string
+	readOnly bool
 }
 
 func newStateStore(dataRoot string) (*stateStore, error) {
@@ -53,6 +54,49 @@ func newStateStore(dataRoot string) (*stateStore, error) {
 		return nil, err
 	}
 	return &stateStore{root: root, path: filepath.Join(root, stateFilename)}, nil
+}
+
+// inspectStateStoreReadOnly validates the existing path chain without creating
+// or chmodding the generated-ingress directory. Missing storage is a distinct
+// proved-absence result used before Docker-backed Manager construction.
+func inspectStateStoreReadOnly(dataRoot string) (*stateStore, bool, map[string]os.FileInfo, error) {
+	if dataRoot == "" || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot ||
+		pathsecurity.RejectWindowsNamespace(dataRoot) {
+		return nil, false, nil, errors.New("invalid generated ingress data root")
+	}
+	root := filepath.Join(dataRoot, "runtime", "generated-ingress")
+	present := false
+	identities := make(map[string]os.FileInfo)
+	for current := root; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		switch {
+		case err == nil:
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(current) {
+				return nil, false, nil, errors.New("generated ingress data directory is unsafe")
+			}
+			// On Windows Lstat defers resolving the volume and file index until
+			// SameFile. Resolve it while this path still names the inspected
+			// directory so a later replacement cannot rewrite the old identity.
+			if !os.SameFile(info, info) {
+				return nil, false, nil, errors.New("generated ingress data directory identity is unavailable")
+			}
+			identities[current] = info
+			if current == root {
+				present = true
+			}
+		case errors.Is(err, os.ErrNotExist):
+		default:
+			return nil, false, nil, errors.New("generated ingress data directory is unreadable")
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	if !present {
+		return nil, false, identities, nil
+	}
+	return &stateStore{root: root, path: filepath.Join(root, stateFilename), readOnly: true}, true, identities, nil
 }
 
 func secureDirectory(path string) error {
@@ -130,14 +174,40 @@ func (s *stateStore) save(state routeState) error {
 }
 
 func (s *stateStore) directoryIdentity() (os.FileInfo, error) {
-	if s == nil || s.root == "" || filepath.Dir(s.path) != s.root || secureDirectory(s.root) != nil {
+	if s == nil || s.root == "" || filepath.Dir(s.path) != s.root {
 		return nil, errors.New("generated ingress state directory is unsafe")
 	}
-	info, err := os.Lstat(s.root)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(s.root) {
-		return nil, errors.New("generated ingress state directory is unsafe")
+	if !s.readOnly {
+		if secureDirectory(s.root) != nil {
+			return nil, errors.New("generated ingress state directory is unsafe")
+		}
+		info, err := os.Lstat(s.root)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(s.root) {
+			return nil, errors.New("generated ingress state directory is unsafe")
+		}
+		if !os.SameFile(info, info) {
+			return nil, errors.New("generated ingress state directory identity is unavailable")
+		}
+		return info, nil
 	}
-	return info, nil
+	var rootInfo os.FileInfo
+	for current := s.root; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(current) {
+			return nil, errors.New("generated ingress state directory is unsafe")
+		}
+		if !os.SameFile(info, info) {
+			return nil, errors.New("generated ingress state directory identity is unavailable")
+		}
+		if current == s.root {
+			rootInfo = info
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	return rootInfo, nil
 }
 
 func (s *stateStore) sameDirectory(before os.FileInfo) error {
