@@ -158,17 +158,27 @@ func liveFinalHandoverAddresses(t *testing.T) (hostnetwork.Candidate, hostnetwor
 	return before, after
 }
 
-type liveFinalHandoverFixture struct {
+// liveGatewayRebindSourceFixture owns the original upgraded gateway and two
+// applications, before any rebind claim or successor resource exists. Each
+// journey must separately register cleanup for its exact successor identities.
+type liveGatewayRebindSourceFixture struct {
 	fixture                        *liveGatewayV2Fixture
+	db                             *sql.DB
 	repository                     *appaccess.Repository
-	intent                         gatewayRebindProtectedIntent
-	before                         gatewayRebindProtectedIntentHistory
-	prepared                       appaccess.GatewayRebindStartupSnapshot
+	profile                        appaccess.GatewayProfileRevision
+	proposal                       appaccess.GatewayRebindPreclaimProposal
 	loopbackID, loopbackReply      string
 	predecessorIPv4, successorIPv4 string
 }
 
-func newLiveFinalHandoverFixture(t *testing.T) liveFinalHandoverFixture {
+type liveFinalHandoverFixture struct {
+	liveGatewayRebindSourceFixture
+	intent   gatewayRebindProtectedIntent
+	before   gatewayRebindProtectedIntentHistory
+	prepared appaccess.GatewayRebindStartupSnapshot
+}
+
+func newLiveGatewayRebindSourceFixture(t *testing.T) liveGatewayRebindSourceFixture {
 	t.Helper()
 	before, after := liveFinalHandoverAddresses(t)
 	spec := liveGatewayV2FixtureSpec{appID: "e1111111-1111-4111-8111-111111111111", planID: "e2222222-2222-4222-8222-222222222222",
@@ -235,8 +245,17 @@ func newLiveFinalHandoverFixture(t *testing.T) liveFinalHandoverFixture {
 	seedLiveFinalHandoverLoopbackRuntime(t, db, &secondFixture)
 	proposal := seedLiveGatewayRebindPublicPassiveLineage(t, fixture, db, repository, profile, appaccess.GatewayProfileSpec{
 		SelectedIPv4: after.IPv4, InterfaceID: after.InterfaceID, PortStart: fixture.port, PortEnd: fixture.port})
+	return liveGatewayRebindSourceFixture{fixture: fixture, db: db, repository: repository,
+		profile: profile, proposal: proposal, loopbackID: loopbackID, loopbackReply: loopbackReply,
+		predecessorIPv4: before.IPv4, successorIPv4: after.IPv4}
+}
+
+func newLiveFinalHandoverFixture(t *testing.T) liveFinalHandoverFixture {
+	t.Helper()
+	source := newLiveGatewayRebindSourceFixture(t)
+	fixture, db, repository, proposal := source.fixture, source.db, source.repository, source.proposal
 	state, journal, store := liveGatewayV2LoadDurableOperation(t, fixture)
-	if len(state.Apps) != 2 || state.Apps[loopbackID].LAN != nil || state.Apps[spec.appID].LAN == nil {
+	if len(state.Apps) != 2 || state.Apps[source.loopbackID].LAN != nil || state.Apps[fixture.spec.appID].LAN == nil {
 		t.Fatal("predecessor does not bind LAN plus loopback-only routes")
 	}
 	preclaim, err := repository.GatewayRebindPreclaimSnapshot(fixture.ctx, proposal)
@@ -300,7 +319,7 @@ func newLiveFinalHandoverFixture(t *testing.T) liveFinalHandoverFixture {
 	if err != nil || len(history.Progress) != 12 || len(history.Progress[11].Record.Stage.FinalConfigIntent.RoutePlan.Routes) != 2 {
 		t.Fatal("handover requires exact two-app sequence twelve")
 	}
-	return liveFinalHandoverFixture{fixture: fixture, repository: repository, intent: intent, before: history, prepared: prepared, loopbackID: loopbackID, loopbackReply: loopbackReply, predecessorIPv4: before.IPv4, successorIPv4: after.IPv4}
+	return liveFinalHandoverFixture{liveGatewayRebindSourceFixture: source, intent: intent, before: history, prepared: prepared}
 }
 
 func TestLiveGatewayRebindFinalHandoverCommitAndRestart(t *testing.T) {

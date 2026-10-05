@@ -246,6 +246,26 @@ grant, disable, startup and controller behavior alongside the new format and
 projection tests; it does not cover the still-unimplemented cross-store writer
 or runtime recovery.
 
+The live handover test now extracts its existing pre-rebind two-application
+source into `newLiveGatewayRebindSourceFixture`. That helper creates the real
+original upgrade, LAN grant and loopback-only application; it creates no rebind
+claim or successor resource. The existing handover wrapper retains its original
+prepared-only claim, staging sequence and cleanup registration. Future
+cross-store journeys must register their own phase-aware, receipt-bound
+successor cleanup. This avoids reusing the old cleanup after its SQL/history
+assumptions stop being true.
+
+The extraction passed integration-tag compilation for generated-ingress
+(0.841s) and hostd (0.842s):
+
+```text
+go test -mod=readonly -tags=integration -run '^$' ./internal/generatedingress ./cmd/hostd
+```
+
+That command intentionally runs no tests and is compilation evidence only.
+The modified live helper has not run against Docker locally; the local daemon
+remains unavailable.
+
 ### Published prerequisite jobs
 
 At PR #135 head `e46185ff61b3fa519304e5fa0ce8ab9c1a788acb`, the
