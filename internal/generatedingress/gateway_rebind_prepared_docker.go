@@ -83,7 +83,7 @@ func (m *Manager) inspectGatewayRebindPreparedDockerPredecessor(ctx context.Cont
 	defer clearGatewayV2DockerObservation(&secondDocker)
 	if err != nil || ctx.Err() != nil ||
 		!validGatewayRebindPredecessorDocker(secondSource, secondState, secondJournal, secondDocker) ||
-		!reflect.DeepEqual(firstDocker, secondDocker) {
+		!sameGatewayRebindPredecessorDockerObservation(firstDocker, secondDocker, secondState.Identity) {
 		return gatewayRebindPredecessorInspectionError(ctx)
 	}
 

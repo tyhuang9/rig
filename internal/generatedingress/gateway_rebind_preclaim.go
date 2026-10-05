@@ -125,7 +125,7 @@ func (m *Manager) inspectGatewayRebindPreclaimWithDocker(ctx context.Context,
 		defer clearGatewayV2DockerObservation(&secondDocker)
 		if inspectErr != nil || ctx.Err() != nil ||
 			!validGatewayRebindPredecessorDocker(secondSource, secondState, secondJournal, secondDocker) ||
-			!reflect.DeepEqual(firstDocker, secondDocker) {
+			!sameGatewayRebindPredecessorDockerObservation(firstDocker, secondDocker, secondState.Identity) {
 			return gatewayRebindPredecessorInspectionError(ctx)
 		}
 		// A protected file or SQLite head may change while the second Docker
