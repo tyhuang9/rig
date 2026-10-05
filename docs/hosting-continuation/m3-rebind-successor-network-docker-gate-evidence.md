@@ -47,7 +47,7 @@ test and any remaining managed Docker resources or successor network name.
 | `pnpm --dir web build` | PASS; TypeScript and Vite production build. Vite reported its existing large-chunk advisory. |
 | `go build -buildvcs=false ./...` | PASS. Plain `go build ./...` could not obtain VCS status from this local worktree (exit 128), before compilation. |
 | `gofmt -l` on both touched Go tests and `git diff --check` | PASS; no format or whitespace defects. |
-| Hosted Linux Docker live test and cleanup gate | FAILED on three hosted runs; see the attempts below. The local Docker daemon is unavailable. |
+| Hosted Linux Docker live test and cleanup gate | FAILED on four hosted runs; see the attempts below. The local Docker daemon is unavailable. |
 | Physical second-device LAN/address-change proof | Not run; outside this gate. |
 
 The focused fake stage suite failed inside the restricted Windows sandbox
@@ -100,8 +100,21 @@ equal both semantically and by raw digest. The host read succeeded, but the
 route delta was not exact; interface, Docker-ID, and Docker-prefix deltas were
 exact, while the separate physical route read failed. The test retained the
 unbound network and the always-run residue gate failed as intended. The exact
-route discrepancy remains under investigation. This run is failed acceptance
-evidence, not a reason to relax the binding or cleanup checks.
+route discrepancy remained under investigation at that run. This is failed
+acceptance evidence, not a reason to relax the binding or cleanup checks.
+
+The [fourth hosted diagnostic job](https://github.com/tyhuang9/rig/actions/runs/37257206284/job/111596748764)
+failed before sequence-three binding and retained the unbound network. Its
+failure-only multiset comparison measured 22 baseline host routes and 25 after
+network creation: exactly one planned subnet route, one local gateway `/32`,
+and one broadcast `/32`. It found zero removed baseline routes, other routes,
+or duplicate additions. The residue gate failed as designed. This explains
+why the previous baseline-or-subnet-only matcher rejected the otherwise exact
+Docker bridge. The row-24 correction admits only the complete
+three-route Linux delta; the row-25 live assertion is updated to require that
+same exact physical shape. Focused local tests cover complete, missing,
+duplicate, and unrelated route changes, including failure before protected
+binding. Hosted acceptance on the corrected pair remains pending.
 
 ## Remaining work
 

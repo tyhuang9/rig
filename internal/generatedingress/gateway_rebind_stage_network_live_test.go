@@ -445,8 +445,15 @@ func validLiveGatewayRebindStagePhysicalDelta(intent gatewayRebindProtectedInten
 	if err != nil || observed.OwnershipDigest != ownershipDigest {
 		return false
 	}
+	plan, planErr := netip.ParsePrefix(intent.Intent.Network.Subnet)
+	gateway, gatewayErr := netip.ParseAddr(intent.Intent.Network.GatewayIPv4)
+	if planErr != nil || gatewayErr != nil || !plan.Addr().Is4() || !gateway.Is4() {
+		return false
+	}
 	expectedRoutes := append([]string{}, intent.NetworkObservation.HostRoutes...)
-	expectedRoutes = append(expectedRoutes, intent.Intent.Network.Subnet)
+	expectedRoutes = append(expectedRoutes, intent.Intent.Network.Subnet,
+		netip.PrefixFrom(gateway, 32).String(),
+		netip.PrefixFrom(lastIPv4Address(plan), 32).String())
 	sort.Strings(expectedRoutes)
 	expectedInterfaces := append([]string{}, intent.NetworkObservation.HostInterfaces...)
 	expectedInterfaces = append(expectedInterfaces, intent.Intent.Network.Subnet)
@@ -486,6 +493,62 @@ func validLiveGatewayRebindStagePhysicalDelta(intent gatewayRebindProtectedInten
 		withoutBridge = append(withoutBridge, candidate)
 	}
 	return foundBridge && reflect.DeepEqual(withoutBridge, intent.NetworkObservation.Candidates)
+}
+
+func TestLiveGatewayRebindStagePhysicalDeltaRequiresExactLinuxRoutes(t *testing.T) {
+	fixture := newGatewayRebindEffectBoundaryFixture(t)
+	intent := fixture.intent
+	const networkID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	ownershipDigest, err := gatewayRebindStageNetworkOwnershipDigest(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridgeName, err := gatewayRebindStageBridgeName(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := netip.MustParsePrefix(intent.Intent.Network.Subnet)
+	gateway := netip.MustParseAddr(intent.Intent.Network.GatewayIPv4)
+	routes := append([]string{}, intent.NetworkObservation.HostRoutes...)
+	routes = append(routes, plan.String(), netip.PrefixFrom(gateway, 32).String(),
+		netip.PrefixFrom(lastIPv4Address(plan), 32).String())
+	sort.Strings(routes)
+	interfaces := append([]string{}, intent.NetworkObservation.HostInterfaces...)
+	interfaces = append(interfaces, plan.String())
+	sort.Strings(interfaces)
+	dockerIDs := append([]string{}, intent.NetworkObservation.DockerNetworkIDs...)
+	dockerIDs = append(dockerIDs, networkID)
+	sort.Strings(dockerIDs)
+	dockerPrefixes := append([]string{}, intent.NetworkObservation.DockerPrefixes...)
+	dockerPrefixes = append(dockerPrefixes, plan.String())
+	sort.Strings(dockerPrefixes)
+	candidates := append([]gatewayRebindSuccessorNetworkCandidate{}, intent.NetworkObservation.Candidates...)
+	candidates = append(candidates, gatewayRebindSuccessorNetworkCandidate{
+		InterfaceID: "42/" + bridgeName, IPv4: gateway.String(), Prefix: plan.String(),
+	})
+	observed := gatewayRebindStageNetworkAttestation{
+		Candidates: candidates, HostRoutes: routes, HostInterfaces: interfaces,
+		DockerIDs: dockerIDs, DockerPrefixes: dockerPrefixes,
+		NetworkID: networkID, OwnershipDigest: ownershipDigest,
+	}
+	if !validLiveGatewayRebindStagePhysicalDelta(intent, observed, networkID) {
+		t.Fatal("exact hosted Linux bridge route delta was rejected")
+	}
+	observed.HostRoutes = make([]string, 0, len(routes)-1)
+	for _, route := range routes {
+		if route != netip.PrefixFrom(gateway, 32).String() {
+			observed.HostRoutes = append(observed.HostRoutes, route)
+		}
+	}
+	if validLiveGatewayRebindStagePhysicalDelta(intent, observed, networkID) {
+		t.Fatal("live physical gate accepted an incomplete route delta")
+	}
+	observed.HostRoutes = append([]string{}, routes...)
+	observed.HostRoutes = append(observed.HostRoutes, "10.241.0.0/16")
+	sort.Strings(observed.HostRoutes)
+	if validLiveGatewayRebindStagePhysicalDelta(intent, observed, networkID) {
+		t.Fatal("live physical gate accepted an unrelated route")
+	}
 }
 
 func cleanupLiveGatewayRebindStageNetwork(t *testing.T, fixture *liveGatewayV2Fixture,
