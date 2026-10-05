@@ -145,3 +145,90 @@ func TestPrepareRuntimeWorkerRecoveryFailurePreventsWorker(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepareRuntimeWorkerHoldsAdmissionThroughRecoveryBeforeWorker(t *testing.T) {
+	var calls []string
+	held := false
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done, err := prepareRuntimeWorker(ctx, runtimeRecovery{
+		admission: func(admissionContext context.Context) (func() error, error) {
+			if admissionContext.Err() != nil {
+				t.Fatalf("admission inherited cancelled startup context: %v", admissionContext.Err())
+			}
+			calls = append(calls, "acquire")
+			held = true
+			return func() error {
+				calls = append(calls, "release")
+				held = false
+				return nil
+			}, nil
+		},
+		deployments: func(context.Context) error {
+			if !held {
+				t.Fatal("deployment recovery ran without admission")
+			}
+			calls = append(calls, "deployments")
+			return nil
+		},
+		jobs: func() error {
+			if !held {
+				t.Fatal("job recovery ran without admission")
+			}
+			calls = append(calls, "jobs")
+			return nil
+		},
+	}, &startupTestExecutor{}, func(context.Context, jobs.Executor) error {
+		if held {
+			t.Error("worker started before recovery admission was released")
+		}
+		calls = append(calls, "worker")
+		return nil
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not finish")
+	}
+	if want := []string{"acquire", "deployments", "jobs", "release", "worker"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("recovery admission order = %v, want %v", calls, want)
+	}
+}
+
+func TestPrepareRuntimeWorkerAdmissionFailureBlocksRecoveryAndWorker(t *testing.T) {
+	admissionFailure := errors.New("injected admission failure")
+	called := false
+	done, err := prepareRuntimeWorker(context.Background(), runtimeRecovery{
+		admission: func(context.Context) (func() error, error) { return nil, admissionFailure },
+		deployments: func(context.Context) error {
+			called = true
+			return nil
+		},
+		jobs: func() error { called = true; return nil },
+	}, &startupTestExecutor{}, func(context.Context, jobs.Executor) error {
+		called = true
+		return nil
+	}, nil)
+	if !errors.Is(err, admissionFailure) || done != nil || called {
+		t.Fatalf("admission failure done=%v err=%v called=%t", done, err, called)
+	}
+}
+
+func TestPrepareRuntimeWorkerAdmissionReleaseFailureBlocksWorker(t *testing.T) {
+	releaseFailure := errors.New("injected release failure")
+	workerCalled := false
+	done, err := prepareRuntimeWorker(context.Background(), runtimeRecovery{
+		admission:   func(context.Context) (func() error, error) { return func() error { return releaseFailure }, nil },
+		deployments: func(context.Context) error { return nil },
+		jobs:        func() error { return nil },
+	}, &startupTestExecutor{}, func(context.Context, jobs.Executor) error {
+		workerCalled = true
+		return nil
+	}, nil)
+	if !errors.Is(err, releaseFailure) || done != nil || workerCalled {
+		t.Fatalf("release failure done=%v err=%v worker called=%t", done, err, workerCalled)
+	}
+}

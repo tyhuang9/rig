@@ -238,10 +238,23 @@ func runServer(args []string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	workerRun := j.RunWorker
+	var admission func(context.Context) (func() error, error)
+	if cfg.ComposeRuntime || cfg.GeneratedRuntime {
+		admission, err = deploymentEffectsAdmission(db, ownerDirectories.WorkingDirectory)
+		if err != nil {
+			logger.Error("deployment effects admission setup failed", "error", err)
+			return 1
+		}
+		workerRun = func(runContext context.Context, executor jobs.Executor) error {
+			return j.RunWorkerWithAdmission(runContext, executor, admission)
+		}
+	}
 	workerDone, err := prepareRuntimeWorker(ctx, runtimeRecovery{
 		deployments: deploymentRepository.Recover,
 		jobs:        j.RecoverInterrupted,
-	}, runtime.executor, j.RunWorker, func(err error) {
+		admission:   admission,
+	}, runtime.executor, workerRun, func(err error) {
 		logger.Error("job worker stopped", "error", err)
 		stop()
 	})
@@ -349,17 +362,39 @@ func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener 
 type runtimeRecovery struct {
 	deployments func(context.Context) error
 	jobs        func() error
+	admission   func(context.Context) (func() error, error)
 }
 
 func prepareRuntimeWorker(ctx context.Context, recovery runtimeRecovery, executor jobs.Executor, run func(context.Context, jobs.Executor) error, reportFailure func(error)) (<-chan struct{}, error) {
 	if recovery.deployments == nil || recovery.jobs == nil {
 		return nil, errors.New("runtime recovery dependencies are required")
 	}
-	if err := recovery.deployments(context.WithoutCancel(ctx)); err != nil {
-		return nil, fmt.Errorf("recover deployments: %w", err)
+	recoverState := func() error {
+		if err := recovery.deployments(context.WithoutCancel(ctx)); err != nil {
+			return fmt.Errorf("recover deployments: %w", err)
+		}
+		if err := recovery.jobs(); err != nil {
+			return fmt.Errorf("recover jobs: %w", err)
+		}
+		return nil
 	}
-	if err := recovery.jobs(); err != nil {
-		return nil, fmt.Errorf("recover jobs: %w", err)
+	if recovery.admission != nil {
+		admissionContext, cancelAdmission := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		release, err := recovery.admission(admissionContext)
+		cancelAdmission()
+		if err != nil {
+			return nil, fmt.Errorf("admit runtime recovery: %w", err)
+		}
+		if release == nil {
+			return nil, errors.New("runtime recovery admission returned no release")
+		}
+		recoverErr := recoverState()
+		releaseErr := release()
+		if recoverErr != nil || releaseErr != nil {
+			return nil, errors.Join(recoverErr, releaseErr)
+		}
+	} else if err := recoverState(); err != nil {
+		return nil, err
 	}
 	done := make(chan struct{})
 	if executor == nil {
