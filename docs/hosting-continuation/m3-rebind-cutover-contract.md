@@ -288,10 +288,10 @@ mismatches, or any changed retained artifact.
 The private protected-history format defines two pre-effect records,
 `successor_intent` and `stage_intent`, followed by create-only bindings for the
 successor ingress network at sequence three, config volume at sequence four,
-and data volume at sequence five. Each later record preserves the exact prior
-stage payload and adds only the observed identity of its own resource. The
-`stage_intent` record stores the approved image content digest and separately
-observed Docker image ID.
+data volume at sequence five, and stopped stage container at sequence six.
+Each later record preserves the exact prior stage payload and adds only the
+observed identity of its own resource. The `stage_intent` record stores the
+approved image content digest and separately observed Docker image ID.
 Its storage validator binds the approved digest, successor identity, and
 selected network plan to the installed intent; it checks the observed image
 ID and topology digest only for syntax. The guarded network writer compares
@@ -300,10 +300,14 @@ before creating a resource. Sequence three binds Docker's returned network ID
 and the exact ownership digest. Sequences four and five bind the respective
 Docker volume name, mountpoint, creation time, and ownership digest only after
 all previously bound resources and the full prepared claim have been
-reattested. An effect whose identity was not durably bound remains fenced for
-separately reviewed recovery; its resource name alone never permits adoption
-or cleanup.
-No container, terminal phase, or receipt is installed by this format.
+reattested. Sequence six binds only the exact stopped stage-container identity
+and immutable ownership/configuration digest after the same guarded proof of
+the network, both volumes, pinned image, host topology, Docker census, and
+prepared claim. It does not copy config, start the container, attach an
+effective host listener, change the route, or advance SQLite. An effect whose
+identity was not durably bound remains fenced for separately reviewed recovery;
+its resource name alone never permits adoption or cleanup.
+No serving container, terminal phase, or receipt is installed by this format.
 
 The implementation may reuse the existing generation filename conventions
 only if the scanner can distinguish an ordinary v1-to-v2 upgrade from a
