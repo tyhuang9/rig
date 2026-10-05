@@ -7,6 +7,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -231,6 +232,7 @@ func TestGatewayRebindStageNetworkAcceptsExactDockerBridgeHostDeltaOnly(t *testi
 		t.Fatal(err)
 	}
 	plan := netip.MustParsePrefix(fixture.intent.Intent.Network.Subnet)
+	gateway := netip.MustParseAddr(fixture.intent.Intent.Network.GatewayIPv4)
 	originalCandidates := reads.network.candidates
 	malformedBridge := false
 	reads.network.candidates = func() ([]hostNetworkCandidate, error) {
@@ -251,7 +253,8 @@ func TestGatewayRebindStageNetworkAcceptsExactDockerBridgeHostDeltaOnly(t *testi
 	reads.network.host = func() (gatewayV2HostNetworkSnapshot, error) {
 		value, readErr := originalHost()
 		if fake.found {
-			value.Routes = append(value.Routes, plan)
+			value.Routes = append(value.Routes, plan,
+				netip.PrefixFrom(gateway, 32), netip.PrefixFrom(lastIPv4Address(plan), 32))
 			value.Interfaces = append(value.Interfaces, plan)
 		}
 		if unrelated {
@@ -282,6 +285,95 @@ func TestGatewayRebindStageNetworkAcceptsExactDockerBridgeHostDeltaOnly(t *testi
 		gatewayRebindStageNetworkInspect(t, fixture), fake,
 		gatewayRebindProgressTimestamp(5), nil); err == nil {
 		t.Fatal("bound replay accepted a malformed Docker bridge candidate identity")
+	}
+}
+
+func TestGatewayRebindStageNetworkRouteDeltaRejectsPartialOrUnrelatedChanges(t *testing.T) {
+	baseline := []string{"0.0.0.0/0", "10.99.0.0/16"}
+	const plan, gateway = "10.240.0.0/28", "10.240.0.1"
+	routes := func(additions ...string) []string {
+		values := append([]string{}, baseline...)
+		values = append(values, additions...)
+		sort.Strings(values)
+		return values
+	}
+	for _, test := range []struct {
+		name   string
+		values []string
+		accept bool
+	}{
+		{name: "baseline", values: routes(), accept: true},
+		{name: "connected subnet", values: routes(plan), accept: true},
+		{name: "exact Linux bridge", values: routes(plan, "10.240.0.1/32", "10.240.0.15/32"), accept: true},
+		{name: "missing gateway", values: routes(plan, "10.240.0.15/32")},
+		{name: "missing broadcast", values: routes(plan, "10.240.0.1/32")},
+		{name: "duplicate subnet", values: routes(plan, plan, "10.240.0.1/32", "10.240.0.15/32")},
+		{name: "duplicate gateway", values: routes(plan, "10.240.0.1/32", "10.240.0.1/32", "10.240.0.15/32")},
+		{name: "extra inside subnet", values: routes(plan, "10.240.0.1/32", "10.240.0.15/32", "10.240.0.2/32")},
+		{name: "extra outside subnet", values: routes(plan, "10.240.0.1/32", "10.240.0.15/32", "10.241.0.0/16")},
+		{name: "removed baseline", values: []string{"0.0.0.0/0", plan, "10.240.0.1/32", "10.240.0.15/32"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := gatewayRebindStageNetworkRoutesMatch(test.values, baseline, plan, gateway); got != test.accept {
+				t.Fatalf("route delta accepted=%t, want %t", got, test.accept)
+			}
+		})
+	}
+}
+
+func TestGatewayRebindStageNetworkRejectsRouteDriftAfterCreateBeforeBinding(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		extra []netip.Prefix
+	}{
+		{name: "missing broadcast"},
+		{name: "unrelated route", extra: []netip.Prefix{
+			netip.MustParsePrefix("198.51.100.0/24"),
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGatewayRebindEffectBoundaryFixture(t)
+			installGatewayRebindEffectBoundaryProgress(t, fixture, 2)
+			fake, reads := gatewayRebindStageNetworkTestDriver(fixture)
+			plan := netip.MustParsePrefix(fixture.intent.Intent.Network.Subnet)
+			gateway := netip.MustParseAddr(fixture.intent.Intent.Network.GatewayIPv4)
+			bridgeName, err := gatewayRebindStageBridgeName(fixture.intent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			originalCandidates := reads.network.candidates
+			reads.network.candidates = func() ([]hostNetworkCandidate, error) {
+				values, readErr := originalCandidates()
+				if fake.found {
+					values = append(values, hostNetworkCandidate{
+						InterfaceID: "42/" + bridgeName, IPv4: gateway.String(), Prefix: plan,
+					})
+				}
+				return values, readErr
+			}
+			originalHost := reads.network.host
+			reads.network.host = func() (gatewayV2HostNetworkSnapshot, error) {
+				value, readErr := originalHost()
+				if fake.found {
+					value.Routes = append(value.Routes, plan, netip.PrefixFrom(gateway, 32))
+					if len(test.extra) > 0 {
+						value.Routes = append(value.Routes, netip.PrefixFrom(lastIPv4Address(plan), 32))
+						value.Routes = append(value.Routes, test.extra...)
+					}
+					value.Interfaces = append(value.Interfaces, plan)
+				}
+				return value, readErr
+			}
+			err = fixture.predecessor.manager.stageGatewayRebindSuccessorNetworkWithDriver(
+				context.Background(), fixture.predecessor.repository, reads,
+				gatewayRebindStageNetworkInspect(t, fixture), fake,
+				gatewayRebindProgressTimestamp(3), nil)
+			history, scanErr := fixture.predecessor.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+			if err == nil || scanErr != nil || len(history.Progress) != 2 || !fake.found || fake.createCalls != 1 {
+				t.Fatalf("post-create route drift bound an uncertain network: error=%v scan=%v progress=%d create=%d found=%t",
+					err, scanErr, len(history.Progress), fake.createCalls, fake.found)
+			}
+		})
 	}
 }
 
