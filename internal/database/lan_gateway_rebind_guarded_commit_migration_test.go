@@ -2,6 +2,7 @@ package database
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,5 +125,59 @@ func TestLANGatewayRebindGuardedCommitMigrationRetainsV1AndIsMirrored(t *testing
 	if !strings.Contains(triggerSQL, "rig_gateway_rebind_consume_v1") ||
 		!strings.Contains(triggerSQL, "NEW.canonical_payload") {
 		t.Fatalf("guard trigger is not payload-bound: %s", triggerSQL)
+	}
+	var commandBeforeTriggers int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger'
+		AND tbl_name='lan_gateway_rebind_transition_commands' AND sql LIKE '%BEFORE INSERT%'`).
+		Scan(&commandBeforeTriggers); err != nil || commandBeforeTriggers != 1 {
+		t.Fatalf("command BEFORE INSERT trigger count=%d error=%v", commandBeforeTriggers, err)
+	}
+
+	payloadBytes, err := json.Marshal(map[string]any{
+		"version": 1, "purpose": "lan_gateway_rebind_transition",
+		"operationId": rebindOp, "claimRequestDigest": digest("4"),
+		"claimSpecDigest": digest("5"), "expectedState": "prepared",
+		"expectedSequence": 1, "nextState": "successor_ready",
+		"expectedHeadRevisionId": profileID, "expectedHeadRevisionNumber": 1,
+		"expectedHeadSpecDigest": digest("2"), "protectedRecordDigest": digest("a"),
+		"terminalReceiptDigest": digest("b"), "terminalDisposition": "commit",
+		"transfers": []any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := GatewayRebindTransitionGuard{
+		OperationID: rebindOp, Sequence: 2, PreviousState: "prepared", PreviousSequence: 1,
+		NextState: "successor_ready", Purpose: "lan_gateway_rebind_transition",
+		ProtectedRecordDigest: digest("a"), TerminalReceiptDigest: digest("b"),
+		TerminalDisposition: "commit", CommandDigest: digest("c"), CanonicalPayload: string(payloadBytes),
+	}
+	nonce, revoke, err := ArmGatewayRebindTransitionGuard(guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer revoke()
+	insertGuarded := func(proofVersion int) error {
+		_, err := db.Exec(`INSERT INTO lan_gateway_rebind_transition_commands(
+			operation_id,sequence,previous_state,previous_sequence,next_state,purpose,
+			protected_record_digest,terminal_receipt_digest,command_digest,created_at,
+			proof_version,terminal_disposition,protected_generation,protected_phase,
+			protected_record_sequence,predecessor_checkpoint_digest,source_state_version,
+			source_state_revision,source_state_digest,successor_operational_state_version,
+			successor_operational_state_revision,authorization_nonce,canonical_payload
+		) VALUES(?,2,'prepared',1,'successor_ready','lan_gateway_rebind_transition',
+			?,?,?, ?,?,'commit',1,'successor_ready',1,?,2,0,?,0,0,?,?)`,
+			rebindOp, digest("a"), digest("b"), digest("c"), stamp, proofVersion,
+			digest("d"), digest("e"), nonce, string(payloadBytes))
+		return err
+	}
+	if err := insertGuarded(2); err == nil || !strings.Contains(err.Error(), "proof is not exact") {
+		t.Fatalf("later semantic rejection=%v", err)
+	}
+	// proofVersion is deliberately not part of the UDF tuple. This second
+	// attempt changes only that row column; the nonce, canonical payload, and
+	// every guard argument remain byte-for-byte identical to the consumed tuple.
+	if err := insertGuarded(1); err == nil || !strings.Contains(err.Error(), "invalid or spent") {
+		t.Fatalf("corrected retry with consumed nonce=%v", err)
 	}
 }

@@ -144,12 +144,22 @@ DROP TRIGGER lan_gateway_rebind_fence_runtime_head_delete;
 
 CREATE TRIGGER lan_gateway_rebind_claim_v2_source_insert
 BEFORE INSERT ON lan_gateway_rebind_claims
-WHEN NEW.spec_format_version <> 2 OR NEW.roster_format_version <> 2
-  OR NEW.predecessor_source_state_version IS NULL
-  OR NEW.predecessor_source_state_revision IS NULL
-  OR NEW.predecessor_source_state_digest IS NULL
-  OR NEW.predecessor_checkpoint_digest IS NULL
-  OR NOT (
+WHEN NOT (
+    (NEW.spec_format_version=1 AND NEW.roster_format_version=1
+     AND NEW.predecessor_protected_generation=0
+     AND NEW.predecessor_protected_journal_digest IS NULL
+     AND NEW.predecessor_protected_intent_digest IS NULL
+     AND NEW.predecessor_source_state_version IS NULL
+     AND NEW.predecessor_source_state_revision IS NULL
+     AND NEW.predecessor_source_state_digest IS NULL
+     AND NEW.predecessor_checkpoint_digest IS NULL)
+    OR
+    (NEW.spec_format_version=2 AND NEW.roster_format_version=2
+     AND NEW.predecessor_source_state_version IS NOT NULL
+     AND NEW.predecessor_source_state_revision IS NOT NULL
+     AND NEW.predecessor_source_state_digest IS NOT NULL
+     AND NEW.predecessor_checkpoint_digest IS NOT NULL
+     AND (
       (NEW.predecessor_source_kind='gateway_upgrade'
        AND NEW.predecessor_protected_generation=0
        AND NEW.predecessor_protected_journal_digest IS NOT NULL
@@ -165,10 +175,12 @@ WHEN NEW.spec_format_version <> 2 OR NEW.roster_format_version <> 2
        AND NEW.predecessor_terminal_receipt_digest IS NOT NULL
        AND NEW.predecessor_source_state_version=1
        AND NEW.predecessor_source_state_revision>0)
+     )
+    )
   )
 BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind v2 source is invalid'); END;
 
-CREATE TRIGGER lan_gateway_rebind_claim_identity_immutable
+CREATE TRIGGER lan_gateway_rebind_claim_immutable_update
 BEFORE UPDATE OF operation_id,singleton,request_digest,approval_action,spec_digest,
     approved_by,approved_at,predecessor_profile_revision_id,
     predecessor_profile_revision_number,predecessor_profile_spec_digest,
@@ -308,123 +320,128 @@ BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind roster entry is not exact'); END;
 
 CREATE TRIGGER lan_gateway_rebind_transition_guard
 BEFORE INSERT ON lan_gateway_rebind_transition_commands
-WHEN rig_gateway_rebind_consume_v1(
-    NEW.authorization_nonce,NEW.operation_id,NEW.sequence,NEW.previous_state,
-    NEW.previous_sequence,NEW.next_state,NEW.purpose,
-    NEW.protected_record_digest,COALESCE(NEW.terminal_receipt_digest,''),
-    COALESCE(NEW.local_attestation_digest,''),NEW.terminal_disposition,
-    NEW.command_digest,NEW.canonical_payload
-) <> 1
-BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind transition capability is invalid or spent'); END;
+BEGIN
+    SELECT CASE WHEN rig_gateway_rebind_consume_v1(
+        NEW.authorization_nonce,NEW.operation_id,NEW.sequence,NEW.previous_state,
+        NEW.previous_sequence,NEW.next_state,NEW.purpose,
+        NEW.protected_record_digest,COALESCE(NEW.terminal_receipt_digest,''),
+        COALESCE(NEW.local_attestation_digest,''),NEW.terminal_disposition,
+        NEW.command_digest,NEW.canonical_payload
+    ) <> 1 THEN RAISE(ABORT, 'LAN gateway rebind transition capability is invalid or spent') END;
 
-CREATE TRIGGER lan_gateway_rebind_transition_exact
-BEFORE INSERT ON lan_gateway_rebind_transition_commands
-WHEN NEW.proof_version<>1 OR NEW.purpose<>'lan_gateway_rebind_transition'
-  OR NEW.authorization_nonce IS NULL OR length(NEW.authorization_nonce)<>64
-  OR NEW.canonical_payload IS NULL OR json_valid(NEW.canonical_payload)<>1
-  OR NEW.terminal_disposition IS NULL
-  OR NEW.protected_generation IS NULL OR NEW.protected_phase IS NULL
-  OR NEW.protected_record_sequence IS NULL
-  OR NEW.predecessor_checkpoint_digest IS NULL
-  OR NEW.source_state_version IS NULL OR NEW.source_state_revision IS NULL
-  OR NEW.source_state_digest IS NULL
-  OR json_extract(NEW.canonical_payload,'$.version')<>NEW.proof_version
-  OR json_extract(NEW.canonical_payload,'$.purpose')<>NEW.purpose
-  OR json_extract(NEW.canonical_payload,'$.operationId')<>NEW.operation_id
-  OR json_extract(NEW.canonical_payload,'$.expectedState')<>NEW.previous_state
-  OR json_extract(NEW.canonical_payload,'$.expectedSequence')<>NEW.previous_sequence
-  OR json_extract(NEW.canonical_payload,'$.nextState')<>NEW.next_state
-  OR json_extract(NEW.canonical_payload,'$.protectedRecordDigest')<>NEW.protected_record_digest
-  OR COALESCE(json_extract(NEW.canonical_payload,'$.terminalReceiptDigest'),'')<>COALESCE(NEW.terminal_receipt_digest,'')
-  OR json_extract(NEW.canonical_payload,'$.terminalDisposition')<>NEW.terminal_disposition
-  OR COALESCE(json_extract(NEW.canonical_payload,'$.localAttestationDigest'),'')<>COALESCE(NEW.local_attestation_digest,'')
-  OR NOT EXISTS (
-      SELECT 1 FROM lan_gateway_rebind_claims c
-      JOIN lan_gateway_profile_heads h ON h.singleton=1
-      JOIN lan_gateway_profile_revisions p
-        ON p.id=h.revision_id AND p.revision_number=h.revision_number
-      WHERE c.operation_id=NEW.operation_id
-        AND c.request_digest=json_extract(NEW.canonical_payload,'$.claimRequestDigest')
-        AND c.spec_digest=json_extract(NEW.canonical_payload,'$.claimSpecDigest')
-        AND c.state=NEW.previous_state AND c.state_sequence=NEW.previous_sequence
-        AND h.revision_id=json_extract(NEW.canonical_payload,'$.expectedHeadRevisionId')
-        AND h.revision_number=json_extract(NEW.canonical_payload,'$.expectedHeadRevisionNumber')
-        AND p.spec_digest=json_extract(NEW.canonical_payload,'$.expectedHeadSpecDigest')
-        AND (c.spec_format_version=1 OR (
-          c.predecessor_checkpoint_digest=NEW.predecessor_checkpoint_digest
-          AND c.predecessor_source_state_version=NEW.source_state_version
-          AND c.predecessor_source_state_revision=NEW.source_state_revision
-          AND c.predecessor_source_state_digest=NEW.source_state_digest
-        ))
-  )
-  OR NOT (
-      (NEW.next_state IN ('successor_ready','database_committed','committed')
-       AND NEW.terminal_disposition='commit' AND NEW.terminal_receipt_digest IS NOT NULL)
-      OR (NEW.next_state='rolled_back' AND NEW.terminal_disposition='abort'
-          AND NEW.terminal_receipt_digest IS NOT NULL)
-      OR (NEW.next_state='unresolved' AND NEW.terminal_disposition IN ('none','commit','abort'))
-  )
-  OR (NEW.next_state='committed' AND NEW.local_attestation_digest IS NULL)
-  OR (NEW.next_state<>'committed' AND NEW.local_attestation_digest IS NOT NULL)
-  OR (NEW.next_state='database_committed' AND (
-      NEW.successor_operational_state_version<>1
-      OR NEW.successor_operational_state_revision<>1
-      OR NEW.successor_operational_state_digest IS NULL
-      OR NEW.transfer_manifest_digest IS NULL
-      OR json_array_length(NEW.canonical_payload,'$.transfers')<>(
-          SELECT roster_count FROM lan_gateway_rebind_claims WHERE operation_id=NEW.operation_id
-      )))
-  OR (NEW.next_state<>'database_committed' AND json_array_length(NEW.canonical_payload,'$.transfers')<>0)
-BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind transition proof is not exact'); END;
-
-CREATE TRIGGER lan_gateway_rebind_transition_rollback_barrier
-BEFORE INSERT ON lan_gateway_rebind_transition_commands
-WHEN EXISTS (
-    SELECT 1 FROM lan_gateway_rebind_claim_events e
-    WHERE e.operation_id=NEW.operation_id AND e.state='database_committed'
-) AND NEW.next_state IN ('successor_ready','rolled_back')
-BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind is roll-forward-only after database commit'); END;
-
-CREATE TRIGGER lan_gateway_rebind_transition_database_shape
-BEFORE INSERT ON lan_gateway_rebind_transition_commands
-WHEN NEW.next_state IN ('database_committed','committed') AND NOT (
-    (
-      NEW.next_state='database_committed'
-      AND NOT EXISTS (SELECT 1 FROM lan_gateway_rebind_claim_events e WHERE e.operation_id=NEW.operation_id AND e.state='database_committed')
-      AND EXISTS (
-        SELECT 1 FROM lan_gateway_rebind_claims c
-        JOIN lan_gateway_profile_heads h ON h.singleton=1
-        WHERE c.operation_id=NEW.operation_id
-          AND h.revision_id=c.predecessor_profile_revision_id
-          AND h.revision_number=c.predecessor_profile_revision_number
-          AND NOT EXISTS (SELECT 1 FROM lan_gateway_profile_revisions p WHERE p.id=c.successor_profile_revision_id)
-          AND NOT EXISTS (SELECT 1 FROM lan_gateway_rebind_allocation_transfers t WHERE t.operation_id=c.operation_id)
+    SELECT CASE WHEN NEW.proof_version<>1 OR NEW.purpose<>'lan_gateway_rebind_transition'
+      OR NEW.authorization_nonce IS NULL OR length(NEW.authorization_nonce)<>64
+      OR NEW.canonical_payload IS NULL OR json_valid(NEW.canonical_payload)<>1
+      OR NEW.terminal_disposition IS NULL
+      OR NEW.protected_generation IS NULL OR NEW.protected_phase IS NULL
+      OR NEW.protected_record_sequence IS NULL
+      OR NEW.predecessor_checkpoint_digest IS NULL
+      OR NEW.source_state_version IS NULL OR NEW.source_state_revision IS NULL
+      OR NEW.source_state_digest IS NULL
+      OR json_extract(NEW.canonical_payload,'$.version') IS NOT NEW.proof_version
+      OR json_extract(NEW.canonical_payload,'$.purpose') IS NOT NEW.purpose
+      OR json_extract(NEW.canonical_payload,'$.operationId') IS NOT NEW.operation_id
+      OR json_extract(NEW.canonical_payload,'$.expectedState') IS NOT NEW.previous_state
+      OR json_extract(NEW.canonical_payload,'$.expectedSequence') IS NOT NEW.previous_sequence
+      OR json_extract(NEW.canonical_payload,'$.nextState') IS NOT NEW.next_state
+      OR json_extract(NEW.canonical_payload,'$.protectedRecordDigest') IS NOT NEW.protected_record_digest
+      OR json_extract(NEW.canonical_payload,'$.protectedGeneration') IS NOT NEW.protected_generation
+      OR json_extract(NEW.canonical_payload,'$.protectedPhase') IS NOT NEW.protected_phase
+      OR json_extract(NEW.canonical_payload,'$.protectedRecordSequence') IS NOT NEW.protected_record_sequence
+      OR COALESCE(json_extract(NEW.canonical_payload,'$.terminalReceiptDigest'),'')<>COALESCE(NEW.terminal_receipt_digest,'')
+      OR json_extract(NEW.canonical_payload,'$.terminalDisposition') IS NOT NEW.terminal_disposition
+      OR json_extract(NEW.canonical_payload,'$.predecessorCheckpointDigest') IS NOT NEW.predecessor_checkpoint_digest
+      OR json_extract(NEW.canonical_payload,'$.sourceStateVersion') IS NOT NEW.source_state_version
+      OR json_extract(NEW.canonical_payload,'$.sourceStateRevision') IS NOT NEW.source_state_revision
+      OR json_extract(NEW.canonical_payload,'$.sourceStateDigest') IS NOT NEW.source_state_digest
+      OR json_extract(NEW.canonical_payload,'$.successorOperationalStateVersion') IS NOT NEW.successor_operational_state_version
+      OR json_extract(NEW.canonical_payload,'$.successorOperationalStateRevision') IS NOT NEW.successor_operational_state_revision
+      OR COALESCE(json_extract(NEW.canonical_payload,'$.successorOperationalStateDigest'),'')<>COALESCE(NEW.successor_operational_state_digest,'')
+      OR COALESCE(json_extract(NEW.canonical_payload,'$.transferManifestDigest'),'')<>COALESCE(NEW.transfer_manifest_digest,'')
+      OR COALESCE(json_extract(NEW.canonical_payload,'$.localAttestationDigest'),'')<>COALESCE(NEW.local_attestation_digest,'')
+      OR NOT EXISTS (
+          SELECT 1 FROM lan_gateway_rebind_claims c
+          JOIN lan_gateway_profile_heads h ON h.singleton=1
+          JOIN lan_gateway_profile_revisions p
+            ON p.id=h.revision_id AND p.revision_number=h.revision_number
+          WHERE c.operation_id=NEW.operation_id
+            AND c.request_digest=json_extract(NEW.canonical_payload,'$.claimRequestDigest')
+            AND c.spec_digest=json_extract(NEW.canonical_payload,'$.claimSpecDigest')
+            AND c.state=NEW.previous_state AND c.state_sequence=NEW.previous_sequence
+            AND h.revision_id=json_extract(NEW.canonical_payload,'$.expectedHeadRevisionId')
+            AND h.revision_number=json_extract(NEW.canonical_payload,'$.expectedHeadRevisionNumber')
+            AND p.spec_digest=json_extract(NEW.canonical_payload,'$.expectedHeadSpecDigest')
+            AND (c.spec_format_version=1 OR (
+              c.predecessor_checkpoint_digest=NEW.predecessor_checkpoint_digest
+              AND c.predecessor_source_state_version=NEW.source_state_version
+              AND c.predecessor_source_state_revision=NEW.source_state_revision
+              AND c.predecessor_source_state_digest=NEW.source_state_digest
+            ))
       )
-    ) OR (
-      EXISTS (SELECT 1 FROM lan_gateway_rebind_claim_events e WHERE e.operation_id=NEW.operation_id AND e.state='database_committed')
-      AND EXISTS (
-        SELECT 1 FROM lan_gateway_rebind_claims c
-        JOIN lan_gateway_profile_heads h ON h.singleton=1
-        JOIN lan_gateway_profile_revisions p
-          ON p.id=h.revision_id AND p.revision_number=h.revision_number
-        WHERE c.operation_id=NEW.operation_id
-          AND p.id=c.successor_profile_revision_id
-          AND p.revision_number=c.successor_profile_revision_number
-          AND p.spec_digest=c.successor_profile_spec_digest
-          AND (SELECT COUNT(*) FROM lan_gateway_rebind_allocation_transfers t WHERE t.operation_id=c.operation_id)=c.roster_count
-          AND NOT EXISTS (
-            SELECT 1 FROM lan_gateway_rebind_roster_entries r
-            WHERE r.operation_id=c.operation_id AND NOT EXISTS (
-              SELECT 1 FROM lan_gateway_rebind_allocation_transfers t
-              WHERE t.operation_id=r.operation_id AND t.allocation_id=r.allocation_id
-                AND t.roster_entry_digest=r.entry_digest
-                AND t.terminal_receipt_digest=NEW.terminal_receipt_digest
-            )
+      OR NOT (
+          (NEW.next_state IN ('successor_ready','database_committed','committed')
+           AND NEW.terminal_disposition='commit' AND NEW.terminal_receipt_digest IS NOT NULL)
+          OR (NEW.next_state='rolled_back' AND NEW.terminal_disposition='abort'
+              AND NEW.terminal_receipt_digest IS NOT NULL)
+          OR (NEW.next_state='unresolved' AND NEW.terminal_disposition IN ('none','commit','abort'))
+      )
+      OR (NEW.next_state='committed' AND NEW.local_attestation_digest IS NULL)
+      OR (NEW.next_state<>'committed' AND NEW.local_attestation_digest IS NOT NULL)
+      OR (NEW.next_state='database_committed' AND (
+          NEW.successor_operational_state_version<>1
+          OR NEW.successor_operational_state_revision<>1
+          OR NEW.successor_operational_state_digest IS NULL
+          OR NEW.transfer_manifest_digest IS NULL
+          OR json_array_length(NEW.canonical_payload,'$.transfers')<>(
+              SELECT roster_count FROM lan_gateway_rebind_claims WHERE operation_id=NEW.operation_id
+          )))
+      OR (NEW.next_state<>'database_committed' AND json_array_length(NEW.canonical_payload,'$.transfers')<>0)
+    THEN RAISE(ABORT, 'LAN gateway rebind transition proof is not exact') END;
+
+    SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM lan_gateway_rebind_claim_events e
+        WHERE e.operation_id=NEW.operation_id AND e.state='database_committed'
+    ) AND NEW.next_state IN ('successor_ready','rolled_back')
+    THEN RAISE(ABORT, 'LAN gateway rebind is roll-forward-only after database commit') END;
+
+    SELECT CASE WHEN NEW.next_state IN ('database_committed','committed') AND NOT (
+        (
+          NEW.next_state='database_committed'
+          AND NOT EXISTS (SELECT 1 FROM lan_gateway_rebind_claim_events e WHERE e.operation_id=NEW.operation_id AND e.state='database_committed')
+          AND EXISTS (
+            SELECT 1 FROM lan_gateway_rebind_claims c
+            JOIN lan_gateway_profile_heads h ON h.singleton=1
+            WHERE c.operation_id=NEW.operation_id
+              AND h.revision_id=c.predecessor_profile_revision_id
+              AND h.revision_number=c.predecessor_profile_revision_number
+              AND NOT EXISTS (SELECT 1 FROM lan_gateway_profile_revisions p WHERE p.id=c.successor_profile_revision_id)
+              AND NOT EXISTS (SELECT 1 FROM lan_gateway_rebind_allocation_transfers t WHERE t.operation_id=c.operation_id)
           )
-      )
-    )
-)
-BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind database projection is incomplete'); END;
+        ) OR (
+          EXISTS (SELECT 1 FROM lan_gateway_rebind_claim_events e WHERE e.operation_id=NEW.operation_id AND e.state='database_committed')
+          AND EXISTS (
+            SELECT 1 FROM lan_gateway_rebind_claims c
+            JOIN lan_gateway_profile_heads h ON h.singleton=1
+            JOIN lan_gateway_profile_revisions p
+              ON p.id=h.revision_id AND p.revision_number=h.revision_number
+            WHERE c.operation_id=NEW.operation_id
+              AND p.id=c.successor_profile_revision_id
+              AND p.revision_number=c.successor_profile_revision_number
+              AND p.spec_digest=c.successor_profile_spec_digest
+              AND (SELECT COUNT(*) FROM lan_gateway_rebind_allocation_transfers t WHERE t.operation_id=c.operation_id)=c.roster_count
+              AND NOT EXISTS (
+                SELECT 1 FROM lan_gateway_rebind_roster_entries r
+                WHERE r.operation_id=c.operation_id AND NOT EXISTS (
+                  SELECT 1 FROM lan_gateway_rebind_allocation_transfers t
+                  WHERE t.operation_id=r.operation_id AND t.allocation_id=r.allocation_id
+                    AND t.roster_entry_digest=r.entry_digest
+                    AND t.terminal_receipt_digest=NEW.terminal_receipt_digest
+                )
+              )
+          )
+        )
+    ) THEN RAISE(ABORT, 'LAN gateway rebind database projection is incomplete') END;
+END;
 
 CREATE TRIGGER lan_gateway_profile_upgrade_claim_pin_insert
 BEFORE INSERT ON lan_gateway_profile_revisions
@@ -523,10 +540,19 @@ WHEN NOT EXISTS (
       AND NEW.ordinal=r.ordinal AND NEW.app_id=r.app_id
       AND NEW.grant_attempt_id=r.grant_attempt_id
       AND NEW.roster_entry_digest=r.entry_digest
-      AND NEW.source_profile_revision_id=r.source_profile_revision_id
-      AND NEW.source_profile_revision_number=r.source_profile_revision_number
-      AND NEW.source_profile_spec_digest=r.source_profile_spec_digest
-      AND NEW.predecessor_transfer_digest IS r.predecessor_transfer_digest
+      AND (
+        (r.roster_format_version=2
+         AND NEW.source_profile_revision_id=r.source_profile_revision_id
+         AND NEW.source_profile_revision_number=r.source_profile_revision_number
+         AND NEW.source_profile_spec_digest=r.source_profile_spec_digest
+         AND NEW.predecessor_transfer_digest IS r.predecessor_transfer_digest)
+        OR
+        (r.roster_format_version=1
+         AND NEW.source_profile_revision_id=c.predecessor_profile_revision_id
+         AND NEW.source_profile_revision_number=c.predecessor_profile_revision_number
+         AND NEW.source_profile_spec_digest=c.predecessor_profile_spec_digest
+         AND NEW.predecessor_transfer_digest IS NULL)
+      )
       AND NEW.successor_profile_revision_id=c.successor_profile_revision_id
       AND NEW.successor_profile_revision_number=c.successor_profile_revision_number
       AND NEW.successor_profile_spec_digest=c.successor_profile_spec_digest
