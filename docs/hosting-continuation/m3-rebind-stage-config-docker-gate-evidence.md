@@ -71,3 +71,37 @@ test-and-workflow commit after diagnosis. No runtime data rollback is needed:
 the branch does not modify production behavior or persistent application data.
 Keep any uncertain Docker resource for investigation rather than forcing
 cleanup in a failed live run.
+
+## Hosted initial config archive failure and diagnostic correction
+
+The earlier local checkpoint above predates publication. The user subsequently
+authorized this draft stack. At integrated PR #135 head
+`f6966a1512bbfa40468567655bb1fd9a1b3197e7`, the
+[hosted stage-config-copy job](https://github.com/tyhuang9/rig/actions/runs/37359439273/job/111930044487)
+failed its direct-copy and lost-acknowledgment journeys in 71.67s and 66.43s.
+Both stopped before sequence seven because the initial config archive was not
+recognized as empty. The always-run residue check passed.
+
+Pinned-image inspection identified an empty image-owned `config/caddy/`
+directory. The strict parser compatibility correction is tracked in the
+prerequisite intent/copy branches. Actual Docker-copy header representation
+remains unverified until the corrected hosted run.
+
+This gate now logs bounded archive metadata only when that initial check
+fails. It first reattests the exact stopped container and volume/network
+bindings, then reads at most the existing output limit and reports at most
+eight entries. Output contains fixed name categories, header types, sizes,
+UID/GID/modes, link-presence and consumed offsets. Arbitrary names, link
+targets, Docker IDs, command stderr and config payloads are never printed.
+The check and cleanup assertions remain unchanged.
+
+```text
+go test -mod=readonly -p=1 -tags live_docker -run '^$' ./internal/generatedingress
+git diff --check
+```
+
+Tagged compilation passed in 0.762s; the separate diff check passed. A Git
+check appended to the elevated compile command could not recognize the
+sandbox-owned worktree without its per-command safe-directory setting; the
+ordinary-workspace diff check was then run successfully. No Docker test ran
+locally because the Linux daemon pipe is unavailable.
