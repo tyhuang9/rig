@@ -422,6 +422,44 @@ final-config passes establish that source behavior; hosted CI must still verify
 stage cleanup and rerun the final-config journeys at the new head. Publication
 receipts are retained in `$TEMP/m3-stage-autosave-cleanup-20261005/`.
 
+The corrected PR #134 head `50c67b58ef3dc3291c27f2c13f7cf8d525d0af68` has
+now passed its actual
+[stage-start Docker gate](https://github.com/tyhuang9/rig/actions/runs/37385339564/job/112017111886):
+
+| Named test | Exact result |
+| --- | --- |
+| `TestLiveGatewayRebindSuccessorStageStart` | One pass, 81.80s |
+| `TestLiveGatewayRebindSuccessorStageStartLostAcknowledgmentAdopts` | One pass, 64.36s |
+| `TestLiveGatewayRebindSuccessorStageStartProofFailureWithdraws` | One pass, 65.87s |
+
+No named failure or skip occurred. All steps, including complete stage-start
+resource and owned-adapter cleanup, succeeded. This supplies the missing
+physical acceptance for the distinct-address fixture and autosave cleanup;
+it does not claim that later handover/cross-store runtime work is accepted.
+The exact source SHA was checked in job metadata, with the log retained at
+`$TEMP/m3-pr134-50c67b5-stage-start.log`.
+
+The latest PR #136 head `b46162ea4a97335976663770b17d2a44612cc3f9`
+subsequently passed all nine jobs in its
+[M3 gateway v2 Docker workflow](https://github.com/tyhuang9/rig/actions/runs/37385339443).
+The changed final-copy and stage-start tests were checked individually in the
+completed job logs; each ran once, with no failure or skip:
+
+| Named test | Seconds | Job |
+| --- | --- | --- |
+| `TestLiveGatewayRebindSuccessorFinalConfigCopy` | 122.39 | [Direct final copy](https://github.com/tyhuang9/rig/actions/runs/37385339443/job/112017115825) |
+| `TestLiveGatewayRebindSuccessorFinalConfigCopyLostAcknowledgmentAdopts` | 91.63 | [Lost acknowledgment](https://github.com/tyhuang9/rig/actions/runs/37385339443/job/112017115651) |
+| `TestLiveGatewayRebindSuccessorStageStart` | 90.55 | [Stage start](https://github.com/tyhuang9/rig/actions/runs/37385339443/job/112017115741) |
+| `TestLiveGatewayRebindSuccessorStageStartLostAcknowledgmentAdopts` | 74.44 | Same stage-start job |
+| `TestLiveGatewayRebindSuccessorStageStartProofFailureWithdraws` | 75.92 | Same stage-start job |
+
+Each job reports the exact source SHA above and successful complete resource
+cleanup. Logs are retained as `$TEMP/m3-pr136-b46162e-<job-id>.log`.
+The PR remains open and draft, targeting `feature/hosting-m3-rebind-final-config-intent`.
+Other lifecycle/race/Windows checks were still running at this observation;
+this records the completed M3 Docker workflow, not overall PR readiness.
+No private handover or cross-store Docker result is inferred from these tests.
+
 ## Integrated cross-store checkpoints
 
 ### Integrated SQL checkpoint
