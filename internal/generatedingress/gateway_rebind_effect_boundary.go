@@ -12,6 +12,7 @@ import (
 const (
 	gatewayRebindEffectBoundaryEvidenceVersion = 1
 	gatewayRebindEffectBoundaryEvidencePurpose = "hostd/generated-ingress/rebind/effect-boundary-attestation/v1"
+	gatewayRebindEffectBoundaryProgressPurpose = "hostd/generated-ingress/rebind/effect-boundary-progress-chain/v1"
 )
 
 var gatewayRebindAcquireDeploymentEffects = deploymenteffects.Acquire
@@ -38,6 +39,8 @@ type gatewayRebindEffectBoundaryEvidence struct {
 	SourceDigest              string
 	DockerObservationDigest   string
 	NetworkObservationDigest  string
+	ProgressCount             uint64
+	ProgressDigest            string
 	Digest                    string
 }
 
@@ -51,6 +54,8 @@ type gatewayRebindEffectBoundaryObservation struct {
 	databaseDigest string
 	sourceDigest   string
 	dockerDigest   string
+	progressCount  uint64
+	progressDigest string
 }
 
 type gatewayRebindEffectBoundaryAnchor struct {
@@ -60,6 +65,25 @@ type gatewayRebindEffectBoundaryAnchor struct {
 	source         routeState
 	databaseDigest string
 	sourceDigest   string
+	progressCount  uint64
+	progressDigest string
+}
+
+type gatewayRebindEffectBoundaryProgressChain struct {
+	Version     int                                        `json:"version"`
+	Purpose     string                                     `json:"purpose"`
+	Generation  uint64                                     `json:"generation"`
+	OperationID string                                     `json:"operationId"`
+	Count       uint64                                     `json:"count"`
+	Records     []gatewayRebindEffectBoundaryProgressEntry `json:"records"`
+}
+
+type gatewayRebindEffectBoundaryProgressEntry struct {
+	Generation  uint64                     `json:"generation"`
+	OperationID string                     `json:"operationId"`
+	Sequence    uint64                     `json:"sequence"`
+	Phase       gatewayRebindProgressPhase `json:"phase"`
+	Digest      string                     `json:"digest"`
 }
 
 // attestGatewayRebindPreparedEffectBoundary is the private, read-only
@@ -162,6 +186,7 @@ func (m *Manager) readGatewayRebindEffectBoundaryObservation(ctx context.Context
 		database: anchor.database, predecessor: anchor.predecessor, intent: anchor.intent,
 		source: anchor.source, docker: docker, successor: successor,
 		databaseDigest: anchor.databaseDigest, sourceDigest: anchor.sourceDigest, dockerDigest: dockerDigest,
+		progressCount: anchor.progressCount, progressDigest: anchor.progressDigest,
 	}, nil
 }
 
@@ -191,6 +216,10 @@ func (m *Manager) readGatewayRebindEffectBoundaryAnchor(ctx context.Context,
 	if err != nil || databaseDigest != intent.DatabaseDigest {
 		return gatewayRebindEffectBoundaryAnchor{}, gatewayRebindEffectBoundaryError(ctx)
 	}
+	progressCount, progressDigest, err := gatewayRebindEffectBoundaryProgressDigest(intent, history.Progress)
+	if err != nil {
+		return gatewayRebindEffectBoundaryAnchor{}, gatewayRebindEffectBoundaryError(ctx)
+	}
 	source, err := m.store.load()
 	if err != nil || ctx.Err() != nil {
 		return gatewayRebindEffectBoundaryAnchor{}, gatewayRebindEffectBoundaryError(ctx)
@@ -202,7 +231,41 @@ func (m *Manager) readGatewayRebindEffectBoundaryAnchor(ctx context.Context,
 	return gatewayRebindEffectBoundaryAnchor{
 		database: database, predecessor: history.Predecessor, intent: intent, source: source,
 		databaseDigest: databaseDigest, sourceDigest: sourceDigest,
+		progressCount: progressCount, progressDigest: progressDigest,
 	}, nil
+}
+
+func gatewayRebindEffectBoundaryProgressDigest(intent gatewayRebindProtectedIntent,
+	progress []gatewayRebindProgressSelection,
+) (uint64, string, error) {
+	if !validGatewayRebindProtectedIntent(intent) || len(progress) > 2 {
+		return 0, "", errors.New("invalid generated ingress rebind effect-boundary progress")
+	}
+	chain := gatewayRebindEffectBoundaryProgressChain{
+		Version: 1, Purpose: gatewayRebindEffectBoundaryProgressPurpose,
+		Generation: intent.Generation, OperationID: intent.OperationID,
+		Count:   uint64(len(progress)),
+		Records: make([]gatewayRebindEffectBoundaryProgressEntry, 0, len(progress)),
+	}
+	previous := make([]gatewayRebindProgressSelection, 0, len(progress))
+	for index, selection := range progress {
+		record := selection.Record
+		if selection.Store == nil || !selection.Existing || selection.Generation != intent.Generation ||
+			selection.Sequence != uint64(index+1) || record.Generation != selection.Generation ||
+			record.Sequence != selection.Sequence || !gatewayRebindProgressMatchesIntent(record, intent, previous) {
+			return 0, "", errors.New("invalid generated ingress rebind effect-boundary progress")
+		}
+		chain.Records = append(chain.Records, gatewayRebindEffectBoundaryProgressEntry{
+			Generation: record.Generation, OperationID: record.OperationID,
+			Sequence: record.Sequence, Phase: record.Phase, Digest: record.Digest,
+		})
+		previous = append(previous, selection)
+	}
+	digest, err := canonicalDigest(chain)
+	if err != nil || !validSHA256(digest) {
+		return 0, "", errors.New("invalid generated ingress rebind effect-boundary progress")
+	}
+	return chain.Count, digest, nil
 }
 
 func gatewayRebindEffectBoundaryAnchorMatchesObservation(anchor gatewayRebindEffectBoundaryAnchor,
@@ -212,7 +275,8 @@ func gatewayRebindEffectBoundaryAnchorMatchesObservation(anchor gatewayRebindEff
 		gatewayRebindGenerationSelectionEqual(anchor.predecessor, observation.predecessor) &&
 		reflect.DeepEqual(anchor.intent, observation.intent) &&
 		reflect.DeepEqual(anchor.source, observation.source) &&
-		anchor.databaseDigest == observation.databaseDigest && anchor.sourceDigest == observation.sourceDigest
+		anchor.databaseDigest == observation.databaseDigest && anchor.sourceDigest == observation.sourceDigest &&
+		anchor.progressCount == observation.progressCount && anchor.progressDigest == observation.progressDigest
 }
 
 func gatewayRebindEffectBoundaryObservationsEqual(left, right gatewayRebindEffectBoundaryObservation) bool {
@@ -221,7 +285,8 @@ func gatewayRebindEffectBoundaryObservationsEqual(left, right gatewayRebindEffec
 		reflect.DeepEqual(left.intent, right.intent) && reflect.DeepEqual(left.source, right.source) &&
 		reflect.DeepEqual(left.successor, right.successor) &&
 		left.databaseDigest == right.databaseDigest && left.sourceDigest == right.sourceDigest &&
-		left.dockerDigest == right.dockerDigest
+		left.dockerDigest == right.dockerDigest && left.progressCount == right.progressCount &&
+		left.progressDigest == right.progressDigest
 }
 
 // Docker may return the exact two final-container mounts in either order.
@@ -259,6 +324,7 @@ func newGatewayRebindEffectBoundaryEvidence(observation gatewayRebindEffectBound
 		PredecessorIdentityDigest: observation.intent.Intent.Predecessor.IdentityDigest,
 		SourceDigest:              observation.sourceDigest, DockerObservationDigest: observation.dockerDigest,
 		NetworkObservationDigest: observation.intent.NetworkObservationDigest,
+		ProgressCount:            observation.progressCount, ProgressDigest: observation.progressDigest,
 	}
 	var err error
 	value.Digest, err = gatewayRebindEffectBoundaryEvidenceDigest(value)
@@ -281,7 +347,7 @@ func validGatewayRebindEffectBoundaryEvidence(value gatewayRebindEffectBoundaryE
 		!validSHA256(value.PredecessorStateDigest) || !validSHA256(value.PredecessorJournalDigest) ||
 		!validSHA256(value.PredecessorIdentityDigest) || !validSHA256(value.SourceDigest) ||
 		!validSHA256(value.DockerObservationDigest) || !validSHA256(value.NetworkObservationDigest) ||
-		!validSHA256(value.Digest) {
+		value.ProgressCount > 2 || !validSHA256(value.ProgressDigest) || !validSHA256(value.Digest) {
 		return false
 	}
 	digest, err := gatewayRebindEffectBoundaryEvidenceDigest(value)

@@ -73,6 +73,48 @@ func gatewayRebindEffectBoundaryReads(observation gatewayRebindSuccessorPrefligh
 	}
 }
 
+func installGatewayRebindEffectBoundaryProgress(t *testing.T, fixture gatewayRebindEffectBoundaryFixture,
+	count int,
+) []gatewayRebindProgressRecord {
+	t.Helper()
+	if count < 0 || count > 2 {
+		t.Fatalf("invalid progress count %d", count)
+	}
+	records := make([]gatewayRebindProgressRecord, 0, count)
+	if count >= 1 {
+		first, err := newGatewayRebindSuccessorIntentProgress(fixture.intent, gatewayRebindProgressTimestamp(1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := newGatewayRebindProgressStore(fixture.predecessor.manager.options.DataRoot,
+			fixture.intent.Generation, fixture.intent.OperationID, first.Sequence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.installExact(context.Background(), first); err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, first)
+	}
+	if count == 2 {
+		second, err := newGatewayRebindStageIntentProgress(fixture.intent, records[0],
+			gatewayRebindProgressStageObservation(2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := newGatewayRebindProgressStore(fixture.predecessor.manager.options.DataRoot,
+			fixture.intent.Generation, fixture.intent.OperationID, second.Sequence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.installExact(context.Background(), second); err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, second)
+	}
+	return records
+}
+
 func TestGatewayRebindEffectBoundaryAttestsStablePreparedInitialRebind(t *testing.T) {
 	fixture := newGatewayRebindEffectBoundaryFixture(t)
 	beforeCommands := len(fixture.predecessor.runner.commands)
@@ -109,7 +151,8 @@ func TestGatewayRebindEffectBoundaryAttestsStablePreparedInitialRebind(t *testin
 	if evidence.Generation != fixture.intent.Generation || evidence.OperationID != fixture.intent.OperationID ||
 		evidence.DatabaseDigest != fixture.intent.DatabaseDigest ||
 		evidence.ProtectedIntentDigest != fixture.intent.Digest ||
-		evidence.NetworkObservationDigest != fixture.intent.NetworkObservationDigest {
+		evidence.NetworkObservationDigest != fixture.intent.NetworkObservationDigest ||
+		evidence.ProgressCount != 0 || !validSHA256(evidence.ProgressDigest) {
 		t.Fatalf("evidence does not bind installed intent: %#v", evidence)
 	}
 	if len(fixture.predecessor.runner.commands) != beforeCommands {
@@ -133,6 +176,50 @@ func TestGatewayRebindEffectBoundaryAttestsStablePreparedInitialRebind(t *testin
 	}
 	if err := release(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGatewayRebindEffectBoundaryBindsZeroOneAndTwoProgressRecords(t *testing.T) {
+	digests := make(map[string]struct{}, 3)
+	for count := 0; count <= 2; count++ {
+		t.Run(fmt.Sprintf("count-%d", count), func(t *testing.T) {
+			fixture := newGatewayRebindEffectBoundaryFixture(t)
+			records := installGatewayRebindEffectBoundaryProgress(t, fixture, count)
+			beforeCommands := len(fixture.predecessor.runner.commands)
+			inspect := func(context.Context, routeState, gatewayV2RouteState,
+				gatewayMigrationJournal) (gatewayV2DockerObservation, error) {
+				return gatewayRebindFixtureDockerObservation(t, fixture.predecessor), nil
+			}
+			first, err := fixture.predecessor.manager.attestGatewayRebindPreparedEffectBoundary(
+				context.Background(), fixture.predecessor.repository, fixture.reads, inspect, nil)
+			if err != nil || !validGatewayRebindEffectBoundaryEvidence(first) ||
+				first.ProgressCount != uint64(count) || !validSHA256(first.ProgressDigest) {
+				t.Fatalf("count=%d evidence=%#v error=%v", count, first, err)
+			}
+			for _, record := range records {
+				store, storeErr := newGatewayRebindProgressStore(fixture.predecessor.manager.options.DataRoot,
+					record.Generation, record.OperationID, record.Sequence)
+				if storeErr != nil {
+					t.Fatal(storeErr)
+				}
+				if replayErr := store.installExact(context.Background(), record); replayErr != nil {
+					t.Fatalf("exact progress replay: %v", replayErr)
+				}
+			}
+			second, err := fixture.predecessor.manager.attestGatewayRebindPreparedEffectBoundary(
+				context.Background(), fixture.predecessor.repository, fixture.reads, inspect, nil)
+			if err != nil || second != first {
+				t.Fatalf("exact replay changed evidence: first=%#v second=%#v error=%v", first, second, err)
+			}
+			if len(fixture.predecessor.runner.commands) != beforeCommands {
+				t.Fatalf("progress-bound attestation executed Docker mutator commands: %d",
+					len(fixture.predecessor.runner.commands)-beforeCommands)
+			}
+			if _, duplicate := digests[first.ProgressDigest]; duplicate {
+				t.Fatalf("progress digest collided across record counts: %s", first.ProgressDigest)
+			}
+			digests[first.ProgressDigest] = struct{}{}
+		})
 	}
 }
 
@@ -602,6 +689,88 @@ func TestGatewayRebindEffectBoundaryRejectsProtectedSQLiteAndExternalDrift(t *te
 		}
 		assertGatewayRebindEffectBoundaryRejected(t, fixture, fixture.reads, inspect, nil)
 	})
+
+	t.Run("progress is appended between complete observations", func(t *testing.T) {
+		fixture := newGatewayRebindEffectBoundaryFixture(t)
+		checkpointCalls := 0
+		checkpoint := func() {
+			checkpointCalls++
+			installGatewayRebindEffectBoundaryProgress(t, fixture, 1)
+		}
+		assertGatewayRebindEffectBoundaryRejected(t, fixture, fixture.reads, fixture.inspect, checkpoint)
+		if checkpointCalls != 1 {
+			t.Fatalf("checkpoint calls=%d, want 1", checkpointCalls)
+		}
+	})
+
+	t.Run("valid same-count progress content changes between observations", func(t *testing.T) {
+		fixture := newGatewayRebindEffectBoundaryFixture(t)
+		original := installGatewayRebindEffectBoundaryProgress(t, fixture, 1)[0]
+		replacement, err := newGatewayRebindSuccessorIntentProgress(
+			fixture.intent, gatewayRebindProgressTimestamp(3))
+		if err != nil || replacement.Digest == original.Digest {
+			t.Fatalf("replacement progress is not distinct: error=%v", err)
+		}
+		store, err := newGatewayRebindProgressStore(fixture.predecessor.manager.options.DataRoot,
+			fixture.intent.Generation, fixture.intent.OperationID, original.Sequence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpointCalls := 0
+		checkpoint := func() {
+			checkpointCalls++
+			state := gatewayUpgradeStateStore{directory: store.directory}
+			if err := state.writeExact(store.path, store.purpose, replacement, false,
+				maxGatewayRebindProgressBytes); err != nil {
+				t.Fatal(err)
+			}
+			history, err := fixture.predecessor.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+			if err != nil || len(history.Progress) != 1 || history.Progress[0].Record != replacement {
+				t.Fatalf("replacement is not a valid one-record history: history=%#v error=%v", history.Progress, err)
+			}
+		}
+		assertGatewayRebindEffectBoundaryRejected(t, fixture, fixture.reads, fixture.inspect, checkpoint)
+		if checkpointCalls != 1 {
+			t.Fatalf("checkpoint calls=%d, want 1", checkpointCalls)
+		}
+	})
+
+	t.Run("progress is appended after second anchor before final anchor", func(t *testing.T) {
+		fixture := newGatewayRebindEffectBoundaryFixture(t)
+		calls := 0
+		originalInspect := fixture.inspect
+		inspect := func(ctx context.Context, source routeState, state gatewayV2RouteState,
+			journal gatewayMigrationJournal) (gatewayV2DockerObservation, error) {
+			calls++
+			if calls == 2 {
+				installGatewayRebindEffectBoundaryProgress(t, fixture, 1)
+			}
+			return originalInspect(ctx, source, state, journal)
+		}
+		assertGatewayRebindEffectBoundaryRejected(t, fixture, fixture.reads, inspect, nil)
+		if calls != 2 {
+			t.Fatalf("Docker observations=%d, want 2", calls)
+		}
+	})
+
+	t.Run("corrupt progress is rejected by strict history scan", func(t *testing.T) {
+		fixture := newGatewayRebindEffectBoundaryFixture(t)
+		first, err := newGatewayRebindSuccessorIntentProgress(fixture.intent, gatewayRebindProgressTimestamp(1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := newGatewayRebindProgressStore(fixture.predecessor.manager.options.DataRoot,
+			fixture.intent.Generation, fixture.intent.OperationID, first.Sequence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		first.Digest = strings.Repeat("f", 64)
+		state := gatewayUpgradeStateStore{directory: store.directory}
+		if err := state.writeExact(store.path, store.purpose, first, true, maxGatewayRebindProgressBytes); err != nil {
+			t.Fatal(err)
+		}
+		assertGatewayRebindEffectBoundaryRejected(t, fixture, fixture.reads, fixture.inspect, nil)
+	})
 }
 
 func TestGatewayRebindEffectBoundaryCancellationAndLockFailuresEraseEvidence(t *testing.T) {
@@ -668,6 +837,7 @@ func TestGatewayRebindEffectBoundaryCancellationAndLockFailuresEraseEvidence(t *
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newGatewayRebindEffectBoundaryFixture(t)
+			installGatewayRebindEffectBoundaryProgress(t, fixture, 2)
 			originalLease, originalGateway := gatewayRebindAcquireDeploymentEffects, managerAcquireGatewayOSLock
 			gatewayRebindAcquireDeploymentEffects = func(context.Context, string) (func() error, error) {
 				return func() error {
@@ -759,14 +929,32 @@ func assertGatewayRebindEffectBoundaryRejected(t *testing.T, fixture gatewayRebi
 
 func TestGatewayRebindEffectBoundaryEvidenceDigestRejectsMutation(t *testing.T) {
 	fixture := newGatewayRebindEffectBoundaryFixture(t)
+	installGatewayRebindEffectBoundaryProgress(t, fixture, 1)
 	evidence, err := fixture.predecessor.manager.attestGatewayRebindPreparedEffectBoundary(
 		context.Background(), fixture.predecessor.repository, fixture.reads, fixture.inspect, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mutated := evidence
-	mutated.OperationID = "11111111-1111-4111-8111-111111111111"
-	if reflect.DeepEqual(mutated, evidence) || validGatewayRebindEffectBoundaryEvidence(mutated) {
-		t.Fatal("mutated effect-boundary evidence was accepted")
+	for _, test := range []struct {
+		name   string
+		mutate func(*gatewayRebindEffectBoundaryEvidence)
+	}{
+		{"operation ID", func(value *gatewayRebindEffectBoundaryEvidence) {
+			value.OperationID = "11111111-1111-4111-8111-111111111111"
+		}},
+		{"progress count", func(value *gatewayRebindEffectBoundaryEvidence) {
+			value.ProgressCount = 2
+		}},
+		{"progress digest", func(value *gatewayRebindEffectBoundaryEvidence) {
+			value.ProgressDigest = strings.Repeat("9", 64)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mutated := evidence
+			test.mutate(&mutated)
+			if reflect.DeepEqual(mutated, evidence) || validGatewayRebindEffectBoundaryEvidence(mutated) {
+				t.Fatal("mutated effect-boundary evidence was accepted")
+			}
+		})
 	}
 }
