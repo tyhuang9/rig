@@ -1,6 +1,7 @@
 package appaccess
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -117,6 +118,30 @@ func TestGatewayRebindV2CanonicalTypesRejectCrossVersionAndBrokenChains(t *testi
 	wrongSourceVariant.Predecessor.Lineage.ProtectedIntentDigest = strings.Repeat("9", 64)
 	if _, err := GatewayRebindSpecV2Digest(wrongSourceVariant); err == nil {
 		t.Fatal("upgrade source carrying a rebind intent was accepted")
+	}
+	wrongUpgradeRevision := spec
+	wrongUpgradeRevision.Predecessor.SourceStateRevision = 1
+	if _, err := GatewayRebindSpecV2Digest(wrongUpgradeRevision); err == nil {
+		t.Fatal("legacy upgrade source with a mutable revision was accepted")
+	}
+	wrongGeneration := spec
+	wrongGeneration.Predecessor.Lineage.ProtectedGeneration = math.MaxUint64
+	if _, err := GatewayRebindSpecV2Digest(wrongGeneration); err == nil {
+		t.Fatal("source without a reservable successor generation was accepted")
+	}
+	rebindSource := spec
+	rebindSource.Predecessor.Lineage.Kind = GatewayRebindSourceGatewayRebind
+	rebindSource.Predecessor.Lineage.ProtectedGeneration = 1
+	rebindSource.Predecessor.Lineage.ProtectedJournalDigest = ""
+	rebindSource.Predecessor.Lineage.ProtectedIntentDigest = strings.Repeat("8", 64)
+	rebindSource.Predecessor.Lineage.TerminalReceiptDigest = strings.Repeat("9", 64)
+	rebindSource.Predecessor.SourceStateVersion = 1
+	if _, err := GatewayRebindSpecV2Digest(rebindSource); err == nil {
+		t.Fatal("rebind source revision zero was accepted")
+	}
+	rebindSource.Predecessor.SourceStateRevision = 1
+	if _, err := GatewayRebindSpecV2Digest(rebindSource); err != nil {
+		t.Fatalf("valid rebind source was rejected: %v", err)
 	}
 
 	first := gatewayRebindV2GoldenTransfer(nil, entry.EntryDigest)

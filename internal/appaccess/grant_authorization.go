@@ -69,7 +69,8 @@ func (r *Repository) AuthorizeAppAccessGrant(ctx context.Context,
 		return AppAccessGrantAuthorization{}, err
 	}
 	return AppAccessGrantAuthorization{
-		Claim: claim, Revision: revision, Allocation: revision.Allocation, Profile: profile,
+		Claim: claim, Revision: revision, Allocation: revision.Allocation,
+		Profile: profile, EffectiveProfile: profile,
 	}, nil
 }
 

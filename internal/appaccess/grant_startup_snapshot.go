@@ -260,7 +260,8 @@ func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID s
 	}
 
 	value := AppAccessGrantStartupClaim{
-		Claim: claim, Revision: revision, Allocation: revision.Allocation, Profile: profile,
+		Claim: claim, Revision: revision, Allocation: revision.Allocation,
+		Profile: profile, EffectiveProfile: profile,
 		DisableIntent: disableIntent,
 	}
 	var archived sql.NullString

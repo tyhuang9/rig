@@ -1,6 +1,7 @@
 package appaccess
 
 import (
+	"math"
 	"sort"
 	"time"
 )
@@ -400,8 +401,18 @@ func validGatewayCurrentLineageRef(value GatewayCurrentLineageRef) bool {
 }
 
 func validGatewayRebindSourceRef(value GatewayRebindSourceRef) bool {
-	return validGatewayCurrentLineageRef(value.Lineage) && value.SourceStateVersion > 0 &&
-		validDigest(value.SourceStateDigest) && validDigest(value.PredecessorCheckpointDigest)
+	if !validGatewayCurrentLineageRef(value.Lineage) || value.Lineage.ProtectedGeneration == math.MaxUint64 ||
+		!validDigest(value.SourceStateDigest) || !validDigest(value.PredecessorCheckpointDigest) {
+		return false
+	}
+	switch value.Lineage.Kind {
+	case GatewayRebindSourceGatewayUpgrade:
+		return value.SourceStateVersion == 2 && value.SourceStateRevision == 0
+	case GatewayRebindSourceGatewayRebind:
+		return value.SourceStateVersion == 1 && value.SourceStateRevision > 0
+	default:
+		return false
+	}
 }
 
 func validOptionalDigest(value *string) bool {

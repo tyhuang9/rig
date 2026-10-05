@@ -119,7 +119,7 @@ func readAppAccessDisableAuthorization(ctx context.Context, query appAccessDisab
 		return AppAccessDisableAuthorization{}, err
 	}
 	value := AppAccessDisableAuthorization{Claim: claim, Revision: revision,
-		Allocation: revision.Allocation, Profile: profile}
+		Allocation: revision.Allocation, Profile: profile, EffectiveProfile: profile}
 	if claim.SourceGrantAttemptID != "" {
 		grant, err := readAppAccessGrantClaim(ctx, query, claim.SourceGrantAttemptID)
 		if err != nil {
