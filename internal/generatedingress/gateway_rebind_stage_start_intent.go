@@ -41,6 +41,9 @@ func (d managerGatewayRebindStageStartIntentDriver) inspectImage(ctx context.Con
 func (d managerGatewayRebindStageStartIntentDriver) configVolumeInventory(ctx context.Context,
 	intent gatewayRebindProtectedIntent, stage gatewayRebindStageIntent, expected []byte,
 ) (gatewayRebindStageConfigInventory, error) {
+	if stage.StageStartIntent != nil {
+		return d.startedStageConfigVolumeInventory(ctx, intent, stage, expected)
+	}
 	return (managerGatewayRebindStageConfigCopyDriver{manager: d.manager}).configVolumeInventory(ctx, intent, stage, expected)
 }
 
