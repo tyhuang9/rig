@@ -2,10 +2,10 @@
 
 Status: private coordinator, protected terminal history, production Docker
 driver, fault/restart tests and standalone Docker journeys implemented.
-Source is frozen at `c2d3daf5c5d8810005fadacccbda8958b4a0f3a5`; aggregate
-verification is in progress. This branch is local and unpublished. Actual
-Docker acceptance is pending. A newly confirmed Caddy autosave compatibility
-gap is being corrected; this checkpoint is not publication-ready.
+The initial source checkpoint is `c2d3daf5c5d8810005fadacccbda8958b4a0f3a5`.
+The Caddy autosave correction is implemented and independently reviewed in
+`8b61552` and `d8017e5`; final integration verification remains in progress.
+This branch is local and unpublished. Actual Docker acceptance is pending.
 
 Branch: `feature/hosting-m3-rebind-final-handover`.
 Base: `39b217fb354232d563590b2fb0c5300a14527c25`, the reviewed local inactive
@@ -350,6 +350,44 @@ and `pnpm --dir web build` passed type checking and Vite production build
 (1.44s). Vite reported the existing over-500KiB bundle warning; no web source
 changed. Documentation workflow checks and build passed in 3.05s after the
 initial evidence update. Generated outputs and dependencies remained ignored.
+
+### Autosave correction verification (2026-10-05)
+
+The source-confirmed gap above is corrected without rewriting prior generated
+configs, protected records or digests. The PR #132 correction `8801a09` is
+integrated additively, followed by its PR #135 descendant `e46185f`.
+Existing drafts #132–135 were updated with their authorized correction;
+this handover branch remains unpublished.
+
+Final inventory is bounded to 192 KiB for two approved configs, one optional
+snapshot and TAR framing. Each config remains bounded to 60 KiB. The default
+sequence-eleven/twelve reader accepts only the exact canonical stage snapshot.
+Only the handover reader selects the phase-specific policy: stage before
+cutover, either stage or active for a stopped final under uncertain cutover,
+and active for a running final or a proved successor. The actual rollback
+coordinator passes its scanner-validated durable origin as invocation-local
+context; no new rollback field is persisted. All original files remain byte
+exact, and optional autosave requires the exact pinned directory, path,
+regular-file type, UID/GID 1000 and mode 0600. Unknown entries, duplicates,
+hidden metadata, changed bytes, invalid padding and trailing data are rejected.
+
+| Check | Actual result |
+| --- | --- |
+| Default final-reader red/green | The legitimate stage-autosave regression failed before correction in 0.792s. It passes after correction, including exact stage-only and stage-plus-active inventories in different archive orders. |
+| Parser, phase policy and production reader group | All six new top-level tests passed. The combined 12-test run failed in 243.334s only because one existing request assertion still expected 128 KiB; that assertion was corrected to 192 KiB. |
+| Corrected existing bounded-read regression | `go test -mod=readonly -count=1 -run '^TestGatewayRebindFinalConfigCopyDriverInventoryUsesBoundedPinnedReadAndClearsResults$' ./internal/generatedingress` passed all nine subcases in 0.951s. Generic command limits remain unchanged. |
+| Actual rollback-origin propagation | The new coordinator matrix passed in 228.04s across durable sequences 13, 14, 15 before/after uncertain start, and 16. It verifies origin on each rollback read, terminal replay and unchanged history/effects. |
+| Production handover config-read policy | The new matrix passed in 14.48s, including rejection before Docker dispatch for invalid authority, phase-specific snapshot bytes, pinned read arguments, bounded output and buffer clearing. |
+| Real progressed-history regression | `go test -mod=readonly -p=1 -count=1 -timeout=4m -run '^TestGatewayRebindFinalConfigAutosaveRetainsStartedStageProofAcrossProgress$' ./internal/generatedingress` passed in 17.775s. It uses real protected progress at sequences 10, 11 and 12, retaining the durable sequence-nine proof and requiring exact history readback. |
+| Static and tagged compilation | Repository-wide `go vet -mod=readonly ./...` and `go build -mod=readonly -buildvcs=false ./...` passed on the integrated correction. `go test -mod=readonly -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress` passed (1.176s and 0.854s); no live effects ran. |
+| Independent final source review | GO for local correctness after checking the completed parser/policy/coordinator tests, immutable formats, phase authority and pinned Caddy source. No source blocker remained. No CodeRabbit result is claimed. |
+
+The initial combined-test failure is retained above; the obsolete assertion's
+isolated rerun is not represented as a second full group pass. The concurrent
+full Go run on frozen `c2d3daf` is also separate from this correction. Actual
+Docker TAR headers, autosave timing, cutover and process-recovery effects still
+require the hosted jobs. These local results do not substitute for physical
+Docker or second-device LAN acceptance.
 
 ## Rollback and remaining gates
 
