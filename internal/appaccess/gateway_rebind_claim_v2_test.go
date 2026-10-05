@@ -68,6 +68,14 @@ func TestClaimGatewayRebindV2ReservesGenerationAcrossRollback(t *testing.T) {
 	if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(), wrongGeneration); !errors.Is(err, ErrInvalidStoredState) {
 		t.Fatalf("cross-spec proof generation error=%v", err)
 	}
+	directInsert, revoke := armGatewayRebindTransitionDirect(t, fixture, wrongGeneration)
+	defer revoke()
+	if err := directInsert(); err == nil || !strings.Contains(err.Error(), "proof is not exact") {
+		t.Fatalf("direct cross-spec proof generation error=%v", err)
+	}
+	if err := directInsert(); err == nil || !strings.Contains(err.Error(), "invalid or spent") {
+		t.Fatalf("direct cross-spec proof reused consumed capability error=%v", err)
+	}
 	var commands int
 	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM lan_gateway_rebind_transition_commands
 		WHERE operation_id=?`, second.Spec.OperationID).Scan(&commands); err != nil || commands != 0 {
