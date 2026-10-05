@@ -206,7 +206,7 @@ func TestGatewayRebindFinalConfigCopyDriverInventoryUsesBoundedPinnedReadAndClea
 			request := runner.requests[0]
 			if !reflect.DeepEqual(request.Args, []string{"container", "cp", stage.StageContainer.ID + ":/config/.", "-"}) ||
 				request.Executable != manager.options.DockerExecutable || request.Directory != manager.options.WorkingDirectory ||
-				!reflect.DeepEqual(request.Env, manager.dockerEnv) || request.Timeout != 7*time.Second || request.OutputLimit != 128<<10 ||
+				!reflect.DeepEqual(request.Env, manager.dockerEnv) || request.Timeout != 7*time.Second || request.OutputLimit != 192<<10 ||
 				manager.options.OutputLimit != 4096 {
 				t.Fatalf("unexpected bounded inventory request: %#v", request)
 			}

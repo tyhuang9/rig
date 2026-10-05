@@ -12,9 +12,18 @@ import (
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
-// Two bounded configurations plus TAR headers and padding. This limit applies
-// only to the exact /config inventory read, never to generic Docker commands.
-const gatewayRebindFinalConfigArchiveLimit = 128 << 10
+// Two bounded configurations, one bounded autosave, and TAR headers/padding.
+// This limit applies only to the exact /config inventory read, never to generic
+// Docker commands.
+const gatewayRebindFinalConfigArchiveLimit = 192 << 10
+
+type gatewayRebindFinalConfigAutosaveMode uint8
+
+const (
+	gatewayRebindFinalConfigStageAutosave gatewayRebindFinalConfigAutosaveMode = iota + 1
+	gatewayRebindFinalConfigActiveAutosave
+	gatewayRebindFinalConfigEitherAutosave
+)
 
 type gatewayRebindFinalConfigInventory uint8
 
@@ -148,14 +157,21 @@ func gatewayRebindFinalConfigDriverContentsMatch(intent gatewayRebindProtectedIn
 
 // Require the complete bounded /config inventory. The raw offsets around Next
 // reject metadata records that archive/tar otherwise consumes transparently.
-// Permit at most one exact empty caddy/ directory from the pinned image.
-// The existing stage-only parser remains unchanged and rejects active.json.
+// Permit at most one exact caddy/ directory from the pinned image and its exact
+// stage autosave. The pre-start parser still rejects autosave and active.json.
 func gatewayRebindExactFinalConfigVolumeArchive(value, expectedStage, expectedActive []byte) (gatewayRebindFinalConfigInventory, error) {
+	return gatewayRebindExactFinalConfigVolumeArchiveWithAutosave(value, expectedStage, expectedActive, gatewayRebindFinalConfigStageAutosave)
+}
+
+func gatewayRebindExactFinalConfigVolumeArchiveWithAutosave(value, expectedStage, expectedActive []byte,
+	mode gatewayRebindFinalConfigAutosaveMode,
+) (gatewayRebindFinalConfigInventory, error) {
 	const blockSize = 512
 	invalid := errors.New("generated ingress rebind final config archive is invalid")
 	if len(value) < 3*blockSize || len(value) > gatewayRebindFinalConfigArchiveLimit || len(value)%blockSize != 0 ||
 		len(expectedStage) == 0 || len(expectedStage) > gatewayV2MaxConfigBytes ||
-		len(expectedActive) == 0 || len(expectedActive) > gatewayV2MaxConfigBytes {
+		len(expectedActive) == 0 || len(expectedActive) > gatewayV2MaxConfigBytes ||
+		(mode != gatewayRebindFinalConfigStageAutosave && mode != gatewayRebindFinalConfigActiveAutosave && mode != gatewayRebindFinalConfigEitherAutosave) {
 		return 0, invalid
 	}
 	source := bytes.NewReader(value)
@@ -166,11 +182,13 @@ func gatewayRebindExactFinalConfigVolumeArchive(value, expectedStage, expectedAc
 		return 0, invalid
 	}
 	offset := blockSize
-	seenStage, seenActive, seenSeed := false, false, false
+	seenStage, seenActive, seenSeed, seenAutosave := false, false, false, false
 	for {
 		entry, err := reader.Next()
 		if err == io.EOF {
-			if !seenStage || len(value) < offset+2*blockSize || !allGatewayRebindTarZero(value[offset:]) {
+			if !seenStage || (seenAutosave && !seenSeed) ||
+				(mode != gatewayRebindFinalConfigStageAutosave && !seenActive) ||
+				len(value) < offset+2*blockSize || !allGatewayRebindTarZero(value[offset:]) {
 				return 0, invalid
 			}
 			if seenActive {
@@ -204,6 +222,33 @@ func gatewayRebindExactFinalConfigVolumeArchive(value, expectedStage, expectedAc
 				return 0, invalid
 			}
 			seenActive, expected = true, expectedActive
+		case "caddy/autosave.json", "./caddy/autosave.json":
+			if seenAutosave || entry.Size <= 0 || entry.Size > gatewayV2MaxConfigBytes ||
+				offset+blockSize+int(entry.Size) > len(value) {
+				return 0, invalid
+			}
+			candidates := [][]byte{expectedStage}
+			if mode == gatewayRebindFinalConfigActiveAutosave {
+				candidates = [][]byte{expectedActive}
+			} else if mode == gatewayRebindFinalConfigEitherAutosave {
+				candidates = append(candidates, expectedActive)
+			}
+			for _, candidate := range candidates {
+				canonical, err := gatewayRebindCanonicalAutosaveConfig(candidate)
+				if err != nil {
+					return 0, invalid
+				}
+				defer clear(canonical)
+				if validGatewayRebindConfigAutosaveHeader(entry, canonical) &&
+					bytes.Equal(value[offset+blockSize:offset+blockSize+int(entry.Size)], canonical) {
+					expected = canonical
+					break
+				}
+			}
+			if expected == nil {
+				return 0, invalid
+			}
+			seenAutosave = true
 		default:
 			return 0, invalid
 		}
