@@ -3,6 +3,7 @@ package generatedingress
 import (
 	"bytes"
 	"context"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -14,10 +15,11 @@ import (
 
 type liveGatewayRebindStageStartDriver struct {
 	managerGatewayRebindStageStartDriver
-	startCalls int
-	stopCalls  int
-	failProof  bool
-	failed     bool
+	startCalls    int
+	stopCalls     int
+	failProof     bool
+	failed        bool
+	injectedReady bool
 }
 
 func (d *liveGatewayRebindStageStartDriver) start(ctx context.Context, id string) error {
@@ -33,7 +35,11 @@ func (d *liveGatewayRebindStageStartDriver) stop(ctx context.Context, id string)
 func (d *liveGatewayRebindStageStartDriver) hostProbe(ctx context.Context, address string,
 	port uint16, host, path string,
 ) gatewayV2HostProbeResult {
-	if d.failProof && !d.failed && strings.HasPrefix(path, "/.well-known/rig-gateway/") {
+	if d.failProof && !d.failed && strings.HasPrefix(path, gatewayV2ChallengePathPrefix) {
+		actual := d.managerGatewayRebindStageStartDriver.hostProbe(ctx, address, port, host, path)
+		challenge := strings.TrimPrefix(path, gatewayV2ChallengePathPrefix)
+		d.injectedReady = validSHA256(challenge) && actual.Connected && actual.Responded &&
+			actual.Status == http.StatusNotFound && actual.Body == gatewayV2ChallengeBodyPrefix+challenge
 		d.failed = true
 		return gatewayV2HostProbeResult{}
 	}
@@ -275,10 +281,10 @@ func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string) {
 	startErr := acting.startGatewayRebindSuccessorStageWithDriver(fixture.ctx, repository, actingReads,
 		acting.inspectGatewayRebindDocker, actingDriver, baseTime.Add(9*time.Nanosecond), nil)
 	if mode == "proof-failure" {
-		if startErr == nil || !driver.failed || driver.startCalls != 1 || driver.stopCalls != 1 ||
+		if startErr == nil || !driver.failed || !driver.injectedReady || driver.startCalls != 1 || driver.stopCalls != 1 ||
 			candidateMayBeLive(startErr) {
-			t.Fatalf("failed real Docker proof was not safely compensated: error=%v proof=%t starts=%d stops=%d",
-				startErr, driver.failed, driver.startCalls, driver.stopCalls)
+			t.Fatalf("ready real Docker proof was not safely compensated: error=%v injected=%t ready=%t starts=%d stops=%d",
+				startErr, driver.failed, driver.injectedReady, driver.startCalls, driver.stopCalls)
 		}
 		afterFailure, scanErr := acting.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 		if scanErr != nil || !reflect.DeepEqual(beforeBytes, liveGatewayRebindProgressBytes(t, afterFailure)) {
@@ -320,6 +326,7 @@ func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string) {
 		physical, inspectErr := actingDriver.inspect(fixture.ctx, intent)
 		if inspectErr != nil || !validGatewayRebindRunningStageContainerObservation(intent,
 			*bound.Progress[9].Record.Stage, physical) ||
+			physical.StageRuntime.ConfiguredNetworks[intent.Intent.Identity.IngressNetwork].EndpointID != serving.EndpointID ||
 			!proveGatewayRebindStagePublication(fixture.ctx, startBinding, containerBinding.ID,
 				actingDriver.hostProbe, actingDriver.containerProbe) {
 			t.Fatal("real Docker stage did not retain exact runtime and selected-address publication")
@@ -407,7 +414,9 @@ func cleanupLiveGatewayRebindStageStartChain(t *testing.T, fixture *liveGatewayV
 		if gatewayRebindStageObservationMayBeLive(observed) {
 			if len(history.Progress) != 10 || history.Progress[9].Record.Stage == nil ||
 				!validGatewayRebindRunningStageContainerObservation(intent,
-					*history.Progress[9].Record.Stage, observed) {
+					*history.Progress[9].Record.Stage, observed) ||
+				observed.StageRuntime.ConfiguredNetworks[intent.Intent.Identity.IngressNetwork].EndpointID !=
+					history.Progress[9].Record.Stage.StageServing.EndpointID {
 				t.Error("live stage-start cleanup found an uncertain running stage; retaining resources")
 				return
 			}

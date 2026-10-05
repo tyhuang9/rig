@@ -378,7 +378,7 @@ func liveGatewayRebindStoppedStageCleanupLineage(t *testing.T, fixture *liveGate
 		len(history.Progress) != 9 && len(history.Progress) != 10) ||
 		!reflect.DeepEqual(history.Intents[0].Intent, intent) || !validContainerID(networkID) ||
 		config == nil || data == nil || container == nil {
-		t.Error("live stopped-container cleanup has no exact protected sequence-six or sequence-eight lineage; retaining resources")
+		t.Error("live stopped-container cleanup has no exact protected stage lineage; retaining resources")
 		return gatewayRebindStageIntent{}, false
 	}
 	fifth := history.Progress[4].Record.Stage
