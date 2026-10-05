@@ -41,14 +41,20 @@ is claimed. No draft publication authorizes merge or deployment.
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
 502 web tests, web production build, and hostd build. Later rows record their
-own exact local checks and limitations in their evidence files. Row 25 passed
-the final-source Go suite, vet, web tests and build, and Docker-tagged compile;
-its live Docker test only compiled and skipped locally. Rows 26 and 27 passed
-their final-source Go suites, vet, builds, and relevant focused checks; row 27's
-live test also only compiled and skipped locally. PR #97's hosted checks passed
-at its published head. The Docker gates in rows 14, 16, and 25 count as
-acceptance only after successful required hosted tests at the relevant head;
-row 27 remains local and has no hosted Docker acceptance.
+own exact local checks and limitations in their evidence files. The table's
+commit column identifies each original branch slice; subsequent corrective
+commits remain in the same branches. Row 25's integrated route correction
+passed the serialized full Go suite, vet, build, Docker-tagged compilation,
+and docs build. Earlier web typecheck, 502 tests, and production build passed
+before the Go-only correction. PR #97's hosted checks passed at its published
+head. The first four hosted row-25 Docker attempts failed and remain in the
+row-25 evidence file. The [fifth hosted network-stage job](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391)
+passed the required named live test at code head `ad8d3e2` in 54.89 seconds,
+and its always-run residue step passed. This establishes the private network
+stage on that hosted runner. Rows 26 and 27 passed their final-source Go suites,
+vet, builds, and relevant focused checks before this network-route correction
+was integrated. Row 27's live test compiled and skipped locally; its hosted
+Docker acceptance remains open.
 
 These branches do not add a public rebind controller caller, terminal protected
 receipt, successor cutover, transfer-aware readers, recovery, or fence release.
