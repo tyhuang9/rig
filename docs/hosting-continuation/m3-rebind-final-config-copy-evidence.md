@@ -24,17 +24,19 @@ needed by the later guarded cutover.
 - Retain the deployment-effects lease, Manager mutex and gateway OS lock order.
   Repeat complete predecessor, Docker ownership, image, endpoint, network,
   runtime-head and live-stage proof around the checkpoint and receipt.
-- Accept only an exact `stage.json` inventory or the exact authorized
-  `stage.json` and `active.json` pair. An empty, partial, foreign, duplicated,
-  linked, truncated or changed inventory fails without overwriting it.
+- Require exact `stage.json` bytes or the exact authorized `stage.json` and
+  `active.json` pair. Permit the pinned image's exact `caddy/` directory and
+  its optional byte-exact canonical stage autosave. An empty, partial, foreign,
+  duplicated, linked, truncated or changed inventory fails without overwriting it.
 - At sequence eleven, copy once when only the stage file exists. A new
   invocation can adopt an exact pair after an uncertain acknowledgment, using
   fresh proof. Copy failure never authorizes a receipt in that invocation.
 - Sequence-twelve replay requires the exact pair and performs no copy.
   Earlier stage-only replay remains strict. Preserve all prior protected
   bytes, immutable source grants/profiles and prepared-claim fences.
-- Bound the inventory TAR read to 128 KiB for this command alone. Keep both
-  individual configuration limits and generic command-output limits unchanged.
+- Bound the inventory TAR read to 192 KiB for this command alone, accommodating
+  both configs and one bounded autosave. Keep each individual configuration
+  limit and generic command-output limits unchanged.
 - Do not reload Caddy, change listeners, probe application responses, update
   routes or SQLite, release a fence, or expose a public rebind caller.
 
@@ -166,6 +168,68 @@ passed, the named migration approval/uncertainty journey passed in 144.11s,
 and the owned-resource cleanup step passed. This closes that observed
 migration-assertion failure on this head; it does not establish any new
 rebind or final-config-copy Docker result.
+
+## Pinned image and autosave correction (2026-10-05)
+
+The earlier publication request at `39b217f` was placed on hold after the
+upstream image-directory failure and source-confirmed Caddy autosave behavior
+were found. The corrected local source is
+`60fa60d384896ab67c3c8a5afff2bae080e44374`; additive merge `dba7439` also retains
+the latest PR #135 evidence at `e46185f`. The old requested revision must not
+be published as the ready candidate.
+
+This branch integrates the existing draft corrections from PRs #129–135 and
+admits the exact pinned `caddy/` directory. After durable stage start, Caddy
+can persist one canonical `caddy/autosave.json`. The sequence-eleven/twelve
+reader accepts only the approved stage snapshot, never an active snapshot,
+alongside exact original config bytes. Snapshot ownership is UID/GID 1000,
+mode `0600`; the root-owned directory remains mode `01777`. The 192 KiB
+archive limit covers both 60 KiB configs, a bounded snapshot and framing.
+No generic output limit, generated config, command, protected byte format,
+digest projection, SQL state or fence changes.
+
+The optional snapshot must be byte exact and its directory present. Its
+absence alone does not prove a failure, because Caddy can continue serving
+after a persistence error; independent live configuration proof remains
+mandatory. Unknown paths, duplicates, symlinks, hardlinks, PAX/GNU metadata,
+changed owners/modes/content, malformed padding and trailing bytes fail.
+Future handover code can select a separate explicit snapshot policy; this
+branch's production reader always uses the stage policy.
+
+Verification on the corrected source:
+
+```text
+go test -mod=readonly -p=1 -json -count=1 -timeout=20m -run '^(TestGatewayRebindFinalConfig|TestGatewayRebindExactFinalConfigVolumeArchive|TestGatewayRebindStageStart|TestGatewayRebindProgress)' ./internal/generatedingress
+go vet -mod=readonly ./...
+go build -mod=readonly -buildvcs=false ./...
+go test -mod=readonly -p=1 -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress
+```
+
+All 76 explicitly discovered top-level tests passed exactly once in 537.126s;
+JSON inspection found zero failures or skips. This includes strict seed and
+snapshot cases, archive bounds, real sequence-ten/eleven/twelve history
+progression, unchanged history, copy/replay/uncertainty, prior stage admission
+and phase guards. The seed fixture needed checkout-only CRLF normalization;
+its Git blob matches the independently reviewed fixture at `c2d3daf` exactly.
+Repository-wide vet/build passed. Tagged compilation passed in 0.762s and
+0.807s; no physical effects ran. The earlier full suite remains a historical
+checkpoint, not a full suite after this correction.
+
+The independent final source review covered the completed exact parser,
+bounded driver, tests, immutable formats and pinned Caddy source and found
+no remaining source blocker. No CodeRabbit result is claimed. The corresponding
+stage correction's 41 downstream tests passed in 307.338s; existing drafts
+#132–135 were updated under their prior publication authorization.
+The final evidence and receipt passed `pnpm --dir docs check:workflow` and
+`pnpm --dir docs build` (3.64s). Formatting and aggregate diff checks passed.
+
+At head `e46185ff61b3fa519304e5fa0ce8ab9c1a788acb`, PR #135's
+[stage-copy job](https://github.com/tyhuang9/rig/actions/runs/37373345314/job/111975694377)
+and [stage-start job](https://github.com/tyhuang9/rig/actions/runs/37373345314/job/111975694535)
+were still queued. Actual pinned Docker archive metadata and timing remain
+unverified until those jobs and this branch's two required Docker journeys
+pass. The local Docker engine is unavailable. No Linux race, physical Docker
+or second-device pass is claimed for this correction.
 
 ## Remaining work and rollback
 
