@@ -69,9 +69,12 @@ func InspectGatewayRebindStartupPresence(ctx context.Context, dataRoot string,
 	sqlPresent := len(snapshot.History) != 0
 	if !sqlPresent {
 		if snapshot.Active != nil || snapshot.Phase != "" || snapshot.DatabaseCommittedEvent != nil ||
-			snapshot.CurrentDatabaseCommittedEvent != nil || snapshot.CurrentSource != nil ||
+			snapshot.CurrentDatabaseCommittedEvent != nil ||
 			len(snapshot.CurrentTransfers) != 0 || snapshot.DatabaseCommitObserved || snapshot.RollbackAllowed ||
 			protectedPresent {
+			return GatewayRebindStartupPresence{}, &Error{Code: DiagnosticRouteUnresolved}
+		}
+		if snapshot.CurrentSource != nil && !validGatewayRebindNativeStartupAuthority(snapshot) {
 			return GatewayRebindStartupPresence{}, &Error{Code: DiagnosticRouteUnresolved}
 		}
 		return GatewayRebindStartupPresence{}, nil
@@ -93,6 +96,22 @@ func InspectGatewayRebindStartupPresence(ctx context.Context, dataRoot string,
 		return GatewayRebindStartupPresence{}, &Error{Code: DiagnosticRouteUnresolved}
 	}
 	return result, nil
+}
+
+func validGatewayRebindNativeStartupAuthority(snapshot appaccess.GatewayRebindRecoverySnapshot) bool {
+	if snapshot.CurrentSource == nil || snapshot.CurrentProfile == nil ||
+		snapshot.CurrentSource.Kind != appaccess.GatewayRebindSourceGatewayUpgrade ||
+		snapshot.CurrentSource.TerminalReceiptDigest != "" ||
+		!validCanonicalUUID(snapshot.CurrentSource.OperationID) ||
+		!gatewayCurrentProfileMatchesAuthority(snapshot.CurrentProfile, *snapshot.CurrentSource) {
+		return false
+	}
+	profile := snapshot.CurrentProfile
+	return validGatewayProfileBinding(gatewayProfileBinding{
+		RevisionID: profile.ID, RevisionNumber: profile.RevisionNumber, SpecDigest: profile.SpecDigest,
+		SelectedIPv4: profile.Spec.SelectedIPv4, InterfaceID: profile.Spec.InterfaceID,
+		PortStart: profile.Spec.PortStart, PortEnd: profile.Spec.PortEnd,
+	})
 }
 
 func readGatewayRebindProtectedPresenceReadOnly(dataRoot string) (gatewayRebindProtectedPresenceSnapshot, error) {
