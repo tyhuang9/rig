@@ -215,6 +215,99 @@ func TestGatewayRebindExactEmptyConfigVolumeArchive(t *testing.T) {
 	}
 }
 
+func TestGatewayRebindExactEmptyConfigVolumeArchivePinnedImageDirectory(t *testing.T) {
+	root := tar.Header{Name: ".", Typeflag: tar.TypeDir, Mode: 0o755}
+	seed := gatewayRebindPinnedImageConfigDirectoryTestHeader()
+	for _, name := range []string{"caddy/", "./caddy/"} {
+		header := seed
+		header.Name = name
+		if err := gatewayRebindExactEmptyConfigVolumeArchive(gatewayRebindTestTar(t, []tar.Header{root, header})); err != nil {
+			t.Errorf("exact empty pinned-image directory %q rejected: %v", name, err)
+		}
+	}
+	for name, mutate := range map[string]func(*tar.Header){
+		"different directory":   func(h *tar.Header) { h.Name = "foreign/" },
+		"nested directory":      func(h *tar.Header) { h.Name = "caddy/nested/" },
+		"absolute directory":    func(h *tar.Header) { h.Name = "/caddy/" },
+		"traversal directory":   func(h *tar.Header) { h.Name = "caddy/../" },
+		"wrong owner":           func(h *tar.Header) { h.Uid = 1000 },
+		"wrong group":           func(h *tar.Header) { h.Gid = 1000 },
+		"missing sticky bit":    func(h *tar.Header) { h.Mode = 0o777 },
+		"changed permissions":   func(h *tar.Header) { h.Mode = 0o755 },
+		"setuid mode":           func(h *tar.Header) { h.Mode |= 0o4000 },
+		"symbolic link":         func(h *tar.Header) { h.Typeflag = tar.TypeSymlink; h.Linkname = "elsewhere" },
+		"hard link":             func(h *tar.Header) { h.Typeflag = tar.TypeLink; h.Linkname = "elsewhere" },
+		"file":                  func(h *tar.Header) { h.Typeflag = tar.TypeReg; h.Name = "caddy"; h.Size = 1 },
+		"FIFO":                  func(h *tar.Header) { h.Typeflag = tar.TypeFifo; h.Name = "caddy" },
+		"directory link target": func(h *tar.Header) { h.Linkname = "elsewhere" },
+		"PAX metadata":          func(h *tar.Header) { h.PAXRecords = map[string]string{"comment": "unexpected"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			header := seed
+			mutate(&header)
+			if err := gatewayRebindExactEmptyConfigVolumeArchive(gatewayRebindTestTar(t, []tar.Header{root, header})); err == nil {
+				t.Fatal("foreign or malformed seed directory accepted")
+			}
+		})
+	}
+	for name, headers := range map[string][]tar.Header{
+		"duplicate seed":   {root, seed, seed},
+		"nested file":      {root, seed, {Name: "caddy/autosave.json", Typeflag: tar.TypeReg, Size: 1}},
+		"nested directory": {root, seed, {Name: "caddy/nested/", Typeflag: tar.TypeDir}},
+		"stage file":       {root, seed, {Name: "stage.json", Typeflag: tar.TypeReg, Size: 1}},
+		"root metadata":    {{Name: ".", Typeflag: tar.TypeDir, PAXRecords: map[string]string{"comment": "unexpected"}}, seed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := gatewayRebindExactEmptyConfigVolumeArchive(gatewayRebindTestTar(t, headers)); err == nil {
+				t.Fatal("unexpected inventory accepted as empty")
+			}
+		})
+	}
+	archive := gatewayRebindTestTar(t, []tar.Header{root, seed})
+	nonzeroDirectorySize := append([]byte(nil), archive...)
+	copy(nonzeroDirectorySize[512+124:512+136], "00000000001\x00")
+	for offset := 512 + 148; offset < 512+156; offset++ {
+		nonzeroDirectorySize[offset] = ' '
+	}
+	checksum := int64(0)
+	for _, octet := range nonzeroDirectorySize[512:1024] {
+		checksum += int64(octet)
+	}
+	encodedChecksum := strconv.FormatInt(checksum, 8)
+	copy(nonzeroDirectorySize[512+148:512+156], strings.Repeat("0", 6-len(encodedChecksum))+encodedChecksum+"\x00 ")
+	for name, invalid := range map[string][]byte{
+		"truncated seed":       append([]byte(nil), archive[:768]...),
+		"one terminator block": append([]byte(nil), archive[:1536]...),
+		"nonzero trailer":      append(append([]byte(nil), archive...), bytes.Repeat([]byte{1}, 512)...),
+		"GNU metadata":         gatewayRebindPinnedImageConfigGNUArchive(t, root, seed),
+		"directory payload":    nonzeroDirectorySize,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := gatewayRebindExactEmptyConfigVolumeArchive(invalid); err == nil {
+				t.Fatal("incomplete or metadata-bearing archive accepted")
+			}
+		})
+	}
+}
+
+func gatewayRebindPinnedImageConfigDirectoryTestHeader() tar.Header {
+	return tar.Header{Name: "caddy/", Typeflag: tar.TypeDir, Mode: 0o1777, Uid: 0, Gid: 0}
+}
+
+func gatewayRebindPinnedImageConfigGNUArchive(t *testing.T, root, seed tar.Header) []byte {
+	t.Helper()
+	seed.Name, seed.Format = strings.Repeat("a", 110)+"/", tar.FormatGNU
+	archive := gatewayRebindTestTar(t, []tar.Header{root, seed})
+	// GNU long-name metadata precedes the seed header. Make its resolved name
+	// valid so the regression specifically rejects the hidden metadata record.
+	if len(archive) < 5*512 || archive[512+156] != tar.TypeGNULongName {
+		t.Fatal("GNU metadata fixture was not encoded as expected")
+	}
+	clear(archive[1024:1536])
+	copy(archive[1024:], "caddy/\x00")
+	return archive
+}
+
 func TestGatewayRebindStageConfigIntentAppendsAndFreshManagerReplays(t *testing.T) {
 	fixture, fake, reads, records := installGatewayRebindStageConfigContainerProgress(t)
 	history, err := fixture.predecessor.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)

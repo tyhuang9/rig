@@ -132,3 +132,42 @@ must continue rejecting an unexpected active file. The bounded two-file TAR
 reader must accommodate both configuration files and framing without raising
 generic command-output limits. No reload, listener change, application
 request, SQL transition or fence release belongs in that copy slice.
+
+## Prerequisite archive integration (2026-10-05)
+
+The stage-config Docker job on this draft's previous head
+`f6966a1512bbfa40468567655bb1fd9a1b3197e7` failed before configuration copy:
+[hosted job 111930044487](https://github.com/tyhuang9/rig/actions/runs/37359439273/job/111930044487).
+The always-run cleanup passed. Immutable pinned-image inspection established
+an empty root-owned `caddy/` directory with mode `01777` in `/config`.
+The [stage intent evidence](./m3-rebind-stage-config-intent-evidence.md#pinned-image-directory-correction-2026-10-05)
+records the image digests and strict compatibility correction.
+
+PRs #129 through #135 now retain the original histories and additively integrate
+that correction. This branch's tested source is
+`9fd7cdbf4439f369613e6191153b281bbe32bee2`. PR #131 also adds bounded archive-header
+diagnostics on failure; it prints fixed categories and numeric metadata, never
+configuration bytes or arbitrary paths. The parser accepts at most one exact
+empty image directory. Other entries, ownership changes, nested content,
+metadata, duplicates, malformed framing and unexpected configuration remain
+rejected. No Docker ownership, permissions, protected bytes or effects changed.
+
+Verification used normal Windows access and the shared workspace Go cache:
+
+```text
+go test -mod=readonly -p=1 -json -count=1 -timeout=15m -run '^TestGatewayRebind(Exact(Empty|Stage)ConfigVolumeArchive|StageStart|FinalConfig)' ./internal/generatedingress
+go vet -mod=readonly ./internal/generatedingress
+go build -mod=readonly -buildvcs=false ./...
+go test -mod=readonly -p=1 -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress
+```
+
+All 36 explicitly discovered top-level regression tests passed in 285.669s;
+JSON inspection found no failures or skips. Vet, build and tagged compilation
+passed. PR #130's guarded intent/copy/history tests also passed in 183.118s,
+with archive tests in 0.796s and documentation checks/build passing.
+The parent reviewed the aggregate diff and preserved each draft's base.
+
+Actual Docker TAR headers and corrected hosted acceptance remain pending.
+The local Docker engine is unavailable. No full-suite, Linux race or physical
+Docker pass is claimed for this correction. Updating these authorized drafts
+does not authorize merging or deployment.

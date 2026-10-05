@@ -91,13 +91,25 @@ func (d managerGatewayRebindStageConfigCopyDriver) copyStageConfig(ctx context.C
 
 // gatewayRebindExactStageConfigVolumeArchive accepts the complete bounded TAR
 // inventory for /config only when it contains the root directory and either no
-// file or one regular stage.json whose bytes exactly match expected. Fixed
-// header offsets reject PAX/GNU metadata records that archive/tar would
-// otherwise consume transparently.
+// file or one regular stage.json whose bytes exactly match expected, plus at
+// most one empty caddy/ directory seeded by the pinned image. Exact consumed
+// offsets reject PAX/GNU metadata that archive/tar otherwise hides.
 func gatewayRebindExactStageConfigVolumeArchive(value, expected []byte) (gatewayRebindStageConfigInventory, error) {
+	return gatewayRebindStageConfigVolumeArchive(value, expected, false)
+}
+
+func gatewayRebindExactStartedStageConfigVolumeArchive(value, expected []byte) (gatewayRebindStageConfigInventory, error) {
+	return gatewayRebindStageConfigVolumeArchive(value, expected, true)
+}
+
+func gatewayRebindStageConfigVolumeArchive(value, expected []byte, allowAutosave bool) (gatewayRebindStageConfigInventory, error) {
 	const tarBlockSize = 512
-	if len(value) < 3*tarBlockSize || len(value) > defaultOutputLimit || len(value)%tarBlockSize != 0 ||
-		len(expected) > gatewayV2MaxConfigBytes {
+	limit := defaultOutputLimit
+	if allowAutosave {
+		limit = gatewayRebindStartedStageConfigArchiveLimit
+	}
+	if len(value) < 3*tarBlockSize || len(value) > limit || len(value)%tarBlockSize != 0 ||
+		len(expected) > gatewayV2MaxConfigBytes || (allowAutosave && len(expected) == 0) {
 		return 0, errors.New("generated ingress rebind config volume archive is invalid")
 	}
 	source := bytes.NewReader(value)
@@ -108,37 +120,68 @@ func gatewayRebindExactStageConfigVolumeArchive(value, expected []byte) (gateway
 		(root.Name != "." && root.Name != "./") {
 		return 0, errors.New("generated ingress rebind config volume archive root is invalid")
 	}
-	entry, err := reader.Next()
-	if err == io.EOF {
-		if !allGatewayRebindTarZero(value[tarBlockSize:]) {
-			return 0, errors.New("generated ingress rebind config volume archive has trailing data")
+	offset := tarBlockSize
+	seedSeen, autosaveSeen := false, false
+	inventory := gatewayRebindStageConfigInventoryEmpty
+	for {
+		entry, err := reader.Next()
+		if err == io.EOF {
+			if len(value) < offset+2*tarBlockSize || !allGatewayRebindTarZero(value[offset:]) {
+				return 0, errors.New("generated ingress rebind config volume archive is truncated or has trailing data")
+			}
+			if autosaveSeen && (!seedSeen || inventory != gatewayRebindStageConfigInventoryExact) {
+				return 0, errors.New("generated ingress rebind autosave lacks exact stage inventory")
+			}
+			return inventory, nil
 		}
-		return gatewayRebindStageConfigInventoryEmpty, nil
+		if err != nil || entry == nil || len(value)-source.Len() != offset+tarBlockSize {
+			return 0, errors.New("generated ingress rebind config volume archive entry is invalid")
+		}
+		if validGatewayRebindPinnedImageConfigDirectory(entry) {
+			if seedSeen {
+				return 0, errors.New("generated ingress rebind config volume archive repeats the image directory")
+			}
+			seedSeen = true
+			offset += tarBlockSize
+			continue
+		}
+		isAutosave := entry.Name == "caddy/autosave.json" || entry.Name == "./caddy/autosave.json"
+		entryExpected := expected
+		if isAutosave {
+			if !allowAutosave || autosaveSeen {
+				return 0, errors.New("generated ingress rebind config volume archive has unexpected autosave")
+			}
+			entryExpected, err = gatewayRebindCanonicalAutosaveConfig(expected)
+			if err != nil || !validGatewayRebindConfigAutosaveHeader(entry, entryExpected) {
+				clear(entryExpected)
+				return 0, errors.New("generated ingress rebind autosave header is invalid")
+			}
+			defer clear(entryExpected)
+			autosaveSeen = true
+		} else if inventory != gatewayRebindStageConfigInventoryEmpty || len(expected) == 0 ||
+			entry.Typeflag != tar.TypeReg || entry.Linkname != "" || entry.Size != int64(len(expected)) ||
+			(entry.Name != gatewayV2StageConfigFilename && entry.Name != "./"+gatewayV2StageConfigFilename) {
+			return 0, errors.New("generated ingress rebind config volume archive entry is invalid")
+		}
+		body := make([]byte, len(entryExpected))
+		defer clear(body)
+		if _, err := io.ReadFull(reader, body); err != nil || !bytes.Equal(body, entryExpected) {
+			return 0, errors.New("generated ingress rebind stage config content mismatch")
+		}
+		var extra [1]byte
+		if count, err := reader.Read(extra[:]); count != 0 || err != io.EOF {
+			return 0, errors.New("generated ingress rebind stage config entry is malformed")
+		}
+		dataStart := offset + tarBlockSize
+		payloadEnd := dataStart + ((len(entryExpected)+tarBlockSize-1)/tarBlockSize)*tarBlockSize
+		if payloadEnd > len(value) || !allGatewayRebindTarZero(value[dataStart+len(entryExpected):payloadEnd]) {
+			return 0, errors.New("generated ingress rebind stage config padding is invalid")
+		}
+		offset = payloadEnd
+		if !isAutosave {
+			inventory = gatewayRebindStageConfigInventoryExact
+		}
 	}
-	if err != nil || entry == nil || len(value)-source.Len() != 2*tarBlockSize || len(expected) == 0 ||
-		entry.Typeflag != tar.TypeReg || entry.Linkname != "" || entry.Size != int64(len(expected)) ||
-		(entry.Name != gatewayV2StageConfigFilename && entry.Name != "./"+gatewayV2StageConfigFilename) {
-		return 0, errors.New("generated ingress rebind config volume archive entry is invalid")
-	}
-	body := make([]byte, len(expected))
-	defer clear(body)
-	if _, err := io.ReadFull(reader, body); err != nil || !bytes.Equal(body, expected) {
-		return 0, errors.New("generated ingress rebind stage config content mismatch")
-	}
-	var extra [1]byte
-	if count, err := reader.Read(extra[:]); count != 0 || err != io.EOF {
-		return 0, errors.New("generated ingress rebind stage config entry is malformed")
-	}
-	if _, err := reader.Next(); err != io.EOF {
-		return 0, errors.New("generated ingress rebind config volume archive has unexpected entries")
-	}
-	payloadEnd := 2*tarBlockSize + ((len(expected)+tarBlockSize-1)/tarBlockSize)*tarBlockSize
-	if len(value) < payloadEnd+2*tarBlockSize ||
-		!allGatewayRebindTarZero(value[2*tarBlockSize+len(expected):payloadEnd]) ||
-		!allGatewayRebindTarZero(value[payloadEnd:]) {
-		return 0, errors.New("generated ingress rebind config volume archive is truncated or has trailing data")
-	}
-	return gatewayRebindStageConfigInventoryExact, nil
 }
 
 func allGatewayRebindTarZero(value []byte) bool {
