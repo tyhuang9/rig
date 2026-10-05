@@ -513,3 +513,126 @@ jobs:
               "$containers" "$networks" "$volumes" "$images" "$named_networks" "$named_config_volumes" "$named_data_volumes" "$stage_containers" >&2
             exit 1
           fi
+
+  rebind-stage-start-live:
+    name: Rebind guarded successor stage start in Docker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 105
+    env:
+      RIG_RUN_LIVE_GATEWAY_REBIND_STAGE_START_NETWORK: "1"
+    steps:
+      - name: Check out source
+        timeout-minutes: 2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        timeout-minutes: 3
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Record hosted Docker versions
+        timeout-minutes: 1
+        run: |
+          docker version --format 'Docker CLI={{.Client.Version}} Engine={{.Server.Version}} API={{.Server.APIVersion}}'
+
+      - name: Verify disposable host-network prerequisites
+        timeout-minutes: 1
+        run: |
+          ip -Version
+          sudo -n true
+
+      - name: Start exact successor stage and replay from a fresh Manager
+        timeout-minutes: 31
+        shell: bash
+        env:
+          RIG_RUN_LIVE_GATEWAY_V2: "1"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          package_name='github.com/hostd/hostd/internal/generatedingress'
+          test_name='TestLiveGatewayRebindSuccessorStageStart'
+          go test -json -v -count=1 -timeout=30m ./internal/generatedingress -run "^${test_name}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" \
+            'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' \
+            "$output" > /dev/null
+          if jq -e --arg package_name "$package_name" --arg test_name "$test_name" \
+            'select(.Action == "skip" and .Package == $package_name and .Test == $test_name)' \
+            "$output" > /dev/null; then
+            printf 'Required live Docker test skipped: %s\n' "$test_name" >&2
+            exit 1
+          fi
+
+      - name: Adopt real Docker start after lost acknowledgment without another start
+        if: ${{ !cancelled() }}
+        timeout-minutes: 31
+        shell: bash
+        env:
+          RIG_RUN_LIVE_GATEWAY_V2: "1"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          package_name='github.com/hostd/hostd/internal/generatedingress'
+          test_name='TestLiveGatewayRebindSuccessorStageStartLostAcknowledgmentAdopts'
+          go test -json -v -count=1 -timeout=30m ./internal/generatedingress -run "^${test_name}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" \
+            'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' \
+            "$output" > /dev/null
+          if jq -e --arg package_name "$package_name" --arg test_name "$test_name" \
+            'select(.Action == "skip" and .Package == $package_name and .Test == $test_name)' \
+            "$output" > /dev/null; then
+            printf 'Required live Docker test skipped: %s\n' "$test_name" >&2
+            exit 1
+          fi
+
+      - name: Compensate failed post-start proof and withdraw listeners
+        if: ${{ !cancelled() }}
+        timeout-minutes: 31
+        shell: bash
+        env:
+          RIG_RUN_LIVE_GATEWAY_V2: "1"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          package_name='github.com/hostd/hostd/internal/generatedingress'
+          test_name='TestLiveGatewayRebindSuccessorStageStartProofFailureWithdraws'
+          go test -json -v -count=1 -timeout=30m ./internal/generatedingress -run "^${test_name}$" | tee "$output"
+          jq -e --arg package_name "$package_name" --arg test_name "$test_name" \
+            'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' \
+            "$output" > /dev/null
+          if jq -e --arg package_name "$package_name" --arg test_name "$test_name" \
+            'select(.Action == "skip" and .Package == $package_name and .Test == $test_name)' \
+            "$output" > /dev/null; then
+            printf 'Required live Docker test skipped: %s\n' "$test_name" >&2
+            exit 1
+          fi
+
+      - name: Require complete stage-start rebind cleanup
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          containers="$(docker ps --all --filter label=io.rig.managed --format '{{.ID}} {{.Names}} {{.Status}}')"
+          networks="$(docker network ls --filter label=io.rig.managed --format '{{.ID}} {{.Name}}')"
+          volumes="$(docker volume ls --filter label=io.rig.managed --format '{{.Name}}')"
+          images="$(docker image ls --filter label=io.rig.managed=generated-image --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
+          named_networks="$(docker network ls --filter name=rig-generated-caddy-ingress-v2-g --format '{{.ID}} {{.Name}}')"
+          named_config_volumes="$(docker volume ls --filter name=rig-generated-caddy-config-v2-g --format '{{.Name}}')"
+          named_data_volumes="$(docker volume ls --filter name=rig-generated-caddy-data-v2-g --format '{{.Name}}')"
+          stage_containers="$(docker ps --all --filter name=rig-generated-caddy-v2-stage- --format '{{.ID}} {{.Names}} {{.Status}}')"
+          builders="$(docker ps --all --filter name=rig-gateway-v2-live-builder- --format '{{.ID}} {{.Names}} {{.Status}}')"
+          builder_networks="$(docker network ls --filter name=rig-gateway-v2-live-builder- --format '{{.ID}} {{.Name}}')"
+          adapters="$(ip -json -details link show | jq -r '.[] | select((.ifname | startswith("righ")) or ((.ifalias // "") | startswith("rig-rebind-host-network:"))) | .ifname')"
+          if [[ -n "$containers" || -n "$networks" || -n "$volumes" || -n "$images" || -n "$named_networks" || -n "$named_config_volumes" || -n "$named_data_volumes" || -n "$stage_containers" || -n "$builders" || -n "$builder_networks" || -n "$adapters" ]]; then
+            printf 'Rebind stage-start live-test resources were not cleaned up.\n' >&2
+            printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+              "$containers" "$networks" "$volumes" "$images" "$named_networks" "$named_config_volumes" "$named_data_volumes" "$stage_containers" "$builders" "$builder_networks" "$adapters" >&2
+            exit 1
+          fi

@@ -381,10 +381,11 @@ func liveGatewayRebindStoppedStageCleanupLineage(t *testing.T, fixture *liveGate
 ) (gatewayRebindStageIntent, bool) {
 	t.Helper()
 	history, err := fixture.ingress.scanGatewayRebindProtectedIntentHistoryLocked(nil)
-	if err != nil || len(history.Intents) != 1 || (len(history.Progress) != 6 && len(history.Progress) != 8) ||
+	if err != nil || len(history.Intents) != 1 || (len(history.Progress) != 6 && len(history.Progress) != 8 &&
+		len(history.Progress) != 9 && len(history.Progress) != 10) ||
 		!reflect.DeepEqual(history.Intents[0].Intent, intent) || !validContainerID(networkID) ||
 		config == nil || data == nil || container == nil {
-		t.Error("live stopped-container cleanup has no exact protected sequence-six or sequence-eight lineage; retaining resources")
+		t.Error("live stopped-container cleanup has no exact protected stage lineage; retaining resources")
 		return gatewayRebindStageIntent{}, false
 	}
 	fifth := history.Progress[4].Record.Stage
@@ -402,7 +403,7 @@ func liveGatewayRebindStoppedStageCleanupLineage(t *testing.T, fixture *liveGate
 		t.Error("live stopped-container cleanup found a sequence-six stage that changed prior receipts; retaining resources")
 		return gatewayRebindStageIntent{}, false
 	}
-	if len(history.Progress) == 8 {
+	if len(history.Progress) >= 8 {
 		seventh := history.Progress[6].Record
 		eighth := history.Progress[7].Record
 		sixthRecord := history.Progress[5].Record
@@ -429,6 +430,37 @@ func liveGatewayRebindStoppedStageCleanupLineage(t *testing.T, fixture *liveGate
 			return gatewayRebindStageIntent{}, false
 		}
 	}
+	if len(history.Progress) >= 9 {
+		eighth := history.Progress[7].Record
+		ninth := history.Progress[8].Record
+		binding, bindingErr := gatewayRebindStageStartIntentBindingFor(intent, eighth)
+		if bindingErr != nil || ninth.PreviousDigest != eighth.Digest || ninth.Stage == nil ||
+			ninth.Stage.StageStartIntent == nil || *ninth.Stage.StageStartIntent != binding {
+			t.Error("live stopped-container cleanup has no exact protected sequence-nine start intent; retaining resources")
+			return gatewayRebindStageIntent{}, false
+		}
+		withoutStart := *ninth.Stage
+		withoutStart.StageStartIntent = nil
+		if !reflect.DeepEqual(withoutStart, *eighth.Stage) {
+			t.Error("live stopped-container cleanup found a sequence-nine stage that changed prior receipts; retaining resources")
+			return gatewayRebindStageIntent{}, false
+		}
+	}
+	if len(history.Progress) == 10 {
+		ninth := history.Progress[8].Record
+		tenth := history.Progress[9].Record
+		if tenth.PreviousDigest != ninth.Digest || tenth.Stage == nil || tenth.Stage.StageServing == nil ||
+			!validGatewayRebindStageServingBinding(intent, ninth, *tenth.Stage.StageServing) {
+			t.Error("live stopped-container cleanup has no exact protected sequence-ten serving receipt; retaining resources")
+			return gatewayRebindStageIntent{}, false
+		}
+		withoutServing := *tenth.Stage
+		withoutServing.StageServing = nil
+		if !reflect.DeepEqual(withoutServing, *ninth.Stage) {
+			t.Error("live stopped-container cleanup found a sequence-ten stage that changed prior receipts; retaining resources")
+			return gatewayRebindStageIntent{}, false
+		}
+	}
 	return *sixth, true
 }
 
@@ -448,7 +480,7 @@ func cleanupLiveGatewayRebindStoppedStageContainer(t *testing.T, fixture *liveGa
 		t.Error("live stopped-container cleanup cannot reread protected lineage; retaining resources")
 		return false
 	}
-	if len(history.Progress) == 8 {
+	if len(history.Progress) >= 8 {
 		expected, expectedErr := gatewayRebindStageConfigBytes(intent)
 		if expectedErr != nil || history.Progress[7].Record.Stage == nil {
 			clear(expected)
@@ -456,11 +488,21 @@ func cleanupLiveGatewayRebindStoppedStageContainer(t *testing.T, fixture *liveGa
 			return false
 		}
 		defer clear(expected)
-		copyDriver := managerGatewayRebindStageConfigCopyDriver{manager: fixture.ingress}
-		inventory, inventoryErr := copyDriver.configVolumeInventory(ctx, intent,
-			*history.Progress[7].Record.Stage, expected)
+		inventoryStage := *history.Progress[7].Record.Stage
+		if len(history.Progress) >= 9 {
+			if history.Progress[8].Record.Stage == nil {
+				t.Error("live stopped-container cleanup lacks its protected start intent; retaining resources")
+				return false
+			}
+			// A proved stop can retain Caddy's exact autosave after a start.
+			// The production reader requires the unchanged durable start intent
+			// before allowing that snapshot alongside the approved stage file.
+			inventoryStage = *history.Progress[8].Record.Stage
+		}
+		copyDriver := managerGatewayRebindStageStartIntentDriver{manager: fixture.ingress}
+		inventory, inventoryErr := copyDriver.configVolumeInventory(ctx, intent, inventoryStage, expected)
 		if inventoryErr != nil || inventory != gatewayRebindStageConfigInventoryExact {
-			t.Error("live stopped-container cleanup cannot prove the exact sequence-eight config file; retaining resources")
+			t.Error("live stopped-container cleanup cannot prove the exact authorized stage configuration; retaining resources")
 			return false
 		}
 	}
