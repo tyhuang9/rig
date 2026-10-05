@@ -572,8 +572,14 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	migrationRunner.SetExitWorkerAfterSuccess(workerExited)
 	var v3Resumed apicontract.JobResponse
 	request(http.MethodPost, "/api/v1/jobs/"+v3Mutation.Job.ID+"/resume", nil, http.StatusOK, &v3Resumed)
-	if v3Resumed.Job.ID != v3Mutation.Job.ID || v3Resumed.Job.Status != string(jobs.Queued) {
-		t.Fatalf("v3 approval resume did not requeue the accepted job: %#v", v3Resumed)
+	// Resume signals the live worker before reading the response job. A valid
+	// second attempt can already be assigned or running when that read occurs.
+	// The checks below still require the exact interrupted attempt and migration
+	// counter; accepting an in-flight response does not accept early completion.
+	if v3Resumed.Job.ID != v3Mutation.Job.ID ||
+		(v3Resumed.Job.Status != string(jobs.Queued) && v3Resumed.Job.Status != string(jobs.Assigned) &&
+			v3Resumed.Job.Status != string(jobs.Running)) {
+		t.Fatalf("v3 approval resume did not resume the accepted job: %#v", v3Resumed)
 	}
 	select {
 	case <-workerExited:

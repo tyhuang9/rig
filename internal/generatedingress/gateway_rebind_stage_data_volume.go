@@ -402,7 +402,7 @@ func (m *Manager) readGatewayRebindStageDataVolumeAttestation(ctx context.Contex
 		anchor.predecessor.Journal, docker) {
 		return gatewayRebindStageDataVolumeAttestation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
-	dockerDigest, err := canonicalDigest(docker)
+	dockerDigest, err := gatewayRebindEffectBoundaryDockerDigest(docker, anchor.predecessor.State.Identity)
 	if err != nil {
 		return gatewayRebindStageDataVolumeAttestation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
