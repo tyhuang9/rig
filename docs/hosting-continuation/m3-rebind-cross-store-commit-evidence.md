@@ -1,7 +1,7 @@
 # M3 cross-store commit and recovery
 
 Status: implementation plan accepted after source and security review; clean
-baseline verified. Runtime implementation is next. No publication, merge or
+baseline verified. Database and runtime implementation is underway. No publication, merge or
 deployment is authorized for this branch.
 
 Branch: `feature/hosting-m3-rebind-cross-store-commit`.
@@ -20,7 +20,7 @@ administrator API/UI remains a separate product unit. This document does not
 claim that a database-committed-only foundation completes that end state.
 
 The authoritative [cutover contract](./m3-rebind-cutover-contract.md) remains
-in force. The detailed implementation plan is under source-based review before
+in force. Source review established the implementation contract before
 source changes. In particular, migration 034 requires the intermediate
 `successor_ready` event before `database_committed`; both must be retained.
 
@@ -81,7 +81,8 @@ work use separate worktrees and disjoint write areas.
 
    | Shared type | Contract |
    | --- | --- |
-   | `GatewayRebindSourceRef` | Exact source kind/operation, profile identity, protected generation/identity; real prior terminal receipt for a rebind source |
+   | `GatewayCurrentLineageRef` | Stable source kind/operation, profile identity, protected generation/identity; real prior terminal receipt for a rebind source |
+   | `GatewayRebindSourceRef` | Stable lineage plus the exact frozen operational-state version, revision, digest and create-only admission checkpoint |
    | `GatewayRebindSpecV2` | Typed predecessor, successor/configure identity and versioned complete roster digest/count; v1 type and digests remain unchanged |
    | `GatewayRebindRosterEntryV2` | Immutable allocation/access/grant/runtime fields and nullable preceding transfer digest |
    | `GatewayRebindAllocationTransfer` | Ordered source binding and roster evidence, predecessor transfer, successor profile and receipt, canonical transfer digest |
@@ -119,6 +120,14 @@ after fresh protected/physical observation and independently validates all SQL
 bindings. Shared types carry identities/digests/manifests, with no
 `appaccess` import of `generatedingress`. Historical terminal validation must
 not require every retained operation's old runtime heads to be current today.
+
+Normal route changes must not invalidate an earlier terminal receipt. The
+protected operational state is generation/operation scoped: its route revision,
+applications and pending recovery state can change while its origin, profile,
+network and lineage identity remain fixed. A new admission retains a create-only
+checkpoint of that exact current state after its prepared SQL claim commits,
+before protected intent or physical effects. Historical claims retain their own
+checkpoints. Original v1 protected bytes remain unchanged.
 
 ### Required invariants and tests
 
@@ -171,6 +180,27 @@ in 8.956s and app-access in 39.636s. No source files had changed during this run
 The locked offline docs install reused 129 cached packages in 2s using the
 declared pnpm 11.22.0 toolchain; no dependency or lockfile changed.
 
+The new controller regression fixture then established the existing status
+contract before the effective-profile adapter changes. The selected command was:
+
+```text
+go test -mod=readonly -json -count=1 -timeout=5m -run '^TestLANAccess(VerifiedStatus|StatusWithholdsURL)' ./internal/controller
+```
+
+All three explicitly discovered top-level tests and nine failure subcases
+passed, with zero failures or skips; the package reported 4.324s. These tests
+cover a verified native LAN URL with unchanged raw grant request, withholding
+the URL for five missing/changed serving-evidence conditions, and withholding it
+for four changed authorization conditions. Test-fixture construction initially
+needed the existing action constant and a logger; those errors were corrected
+before this recorded passing run. No production regression or completed
+cross-store behavior is claimed by this fixture-only checkpoint.
+
+After these additions, the docs workflow contract and production build passed
+with normal Windows access (VitePress 4.72s). The initial sandboxed build could
+not resolve an existing pnpm dependency link; rerunning with normal access
+passed without installing or changing dependencies.
+
 ## Observed hosted prerequisite evidence
 
 At PR #135 head `e46185ff61b3fa519304e5fa0ce8ab9c1a788acb`, the
@@ -191,6 +221,12 @@ skip for that named test. The required complete config-volume cleanup passed.
 This closes the earlier observed mount-order/readback failure for this named
 journey on the corrected head; it does not prove the later config-copy/start
 or private handover journeys.
+
+The same head also passed the
+[stopped-successor container job](https://github.com/tyhuang9/rig/actions/runs/37373345314/job/111975694390).
+Its log records exactly one pass for
+`TestLiveGatewayRebindSuccessorStoppedStageContainer` in 73.67s, with no named
+test failure or skip. The required complete stopped-container cleanup passed.
 
 The containing workflow was still running, so the completed job's metadata and
 logs were read directly. This proves those named inherited journeys only.
