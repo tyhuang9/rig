@@ -123,6 +123,74 @@ func TestGatewayRebindExactStageConfigVolumeArchive(t *testing.T) {
 	}
 }
 
+func TestGatewayRebindExactStageConfigVolumeArchivePinnedImageDirectory(t *testing.T) {
+	expected := []byte(`{"admin":{"listen":"localhost:2019"}}`)
+	root := tar.Header{Name: ".", Typeflag: tar.TypeDir, Mode: 0o755}
+	seed := gatewayRebindPinnedImageConfigDirectoryTestHeader()
+	stage := tar.Header{Name: gatewayV2StageConfigFilename, Typeflag: tar.TypeReg, Size: int64(len(expected)), Mode: 0o600}
+	for name, headers := range map[string][]tar.Header{
+		"seed only":         {root, seed},
+		"seed before stage": {root, seed, stage},
+		"seed after stage":  {root, stage, seed},
+		"absent seed":       {root, stage},
+		"dot slash names": {root, {Name: "./caddy/", Typeflag: tar.TypeDir, Mode: 0o1777},
+			{Name: "./stage.json", Typeflag: tar.TypeReg, Size: int64(len(expected))}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			want := gatewayRebindStageConfigInventoryExact
+			if name == "seed only" {
+				want = gatewayRebindStageConfigInventoryEmpty
+			}
+			inventory, err := gatewayRebindExactStageConfigVolumeArchive(gatewayRebindStageConfigCopyHeadersTar(t, headers, expected), expected)
+			if err != nil || inventory != want {
+				t.Fatalf("inventory=%d want=%d error=%v", inventory, want, err)
+			}
+		})
+	}
+	for name, headers := range map[string][]tar.Header{
+		"duplicate seed":     {root, seed, stage, seed},
+		"nested file":        {root, seed, stage, {Name: "caddy/autosave.json", Typeflag: tar.TypeReg, Size: 1}},
+		"nested directory":   {root, seed, stage, {Name: "caddy/child/", Typeflag: tar.TypeDir}},
+		"foreign directory":  {root, stage, {Name: "foreign/", Typeflag: tar.TypeDir, Mode: 0o1777}},
+		"changed owner":      {root, stage, {Name: "caddy/", Typeflag: tar.TypeDir, Mode: 0o1777, Uid: 1000}},
+		"changed mode":       {root, stage, {Name: "caddy/", Typeflag: tar.TypeDir, Mode: 0o777}},
+		"symlink":            {root, stage, {Name: "caddy/", Typeflag: tar.TypeSymlink, Linkname: "elsewhere"}},
+		"hardlink":           {root, stage, {Name: "caddy/", Typeflag: tar.TypeLink, Linkname: "elsewhere"}},
+		"directory metadata": {root, stage, {Name: "caddy/", Typeflag: tar.TypeDir, Mode: 0o1777, PAXRecords: map[string]string{"comment": "unexpected"}}},
+		"file metadata":      {root, seed, {Name: "stage.json", Typeflag: tar.TypeReg, Size: int64(len(expected)), PAXRecords: map[string]string{"comment": "unexpected"}}},
+		"duplicate stage":    {root, seed, stage, stage},
+		"unexpected active":  {root, seed, stage, {Name: "active.json", Typeflag: tar.TypeReg, Size: 1}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := append(append(append([]byte(nil), expected...), expected...), 'x')
+			if _, err := gatewayRebindExactStageConfigVolumeArchive(gatewayRebindStageConfigCopyHeadersTar(t, headers, body), expected); err == nil {
+				t.Fatal("foreign or malformed entry accepted alongside exact stage config")
+			}
+		})
+	}
+	archive := gatewayRebindStageConfigCopyHeadersTar(t, []tar.Header{root, seed, stage}, expected)
+	nonzeroPadding := append([]byte(nil), archive...)
+	nonzeroPadding[3*512+len(expected)] = 1
+	gnu := gatewayRebindPinnedImageConfigGNUArchive(t, root, seed)
+	fileArchive := gatewayRebindStageConfigCopyHeadersTar(t, []tar.Header{root, stage}, expected)
+	gnuWithStage := append(append([]byte(nil), gnu[:len(gnu)-1024]...), fileArchive[512:]...)
+	for name, malformed := range map[string][]byte{
+		"truncated trailer": archive[:len(archive)-512],
+		"nonzero padding":   nonzeroPadding,
+		"trailing data":     append(append([]byte(nil), archive...), bytes.Repeat([]byte{1}, 512)...),
+		"GNU metadata":      gnuWithStage,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := gatewayRebindExactStageConfigVolumeArchive(malformed, expected); err == nil {
+				t.Fatal("malformed seeded stage archive accepted")
+			}
+		})
+	}
+	if _, err := gatewayRebindExactStageConfigVolumeArchive(archive, []byte("different")); err == nil {
+		t.Fatal("seed directory concealed mismatched stage config")
+	}
+}
+
 func TestGatewayRebindStageConfigCopyDriverUsesPinnedContainerAndRejectsCommandUncertainty(t *testing.T) {
 	_, intent, records := gatewayRebindProgressThroughContainer(t)
 	intentBinding, err := gatewayRebindStageConfigIntentBindingFor(intent, records[5])

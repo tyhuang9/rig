@@ -1,6 +1,7 @@
 package generatedingress
 
 import (
+	"archive/tar"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -57,15 +58,21 @@ func (d managerGatewayRebindStageConfigIntentDriver) configVolumeEmpty(ctx conte
 }
 
 // gatewayRebindExactEmptyConfigVolumeArchive accepts only the successful tar
-// shape produced for an empty /config directory. Unexpected files, links,
-// metadata entries, malformed archives, and truncated command output all fail
-// closed before sequence seven can authorize a later copy.
+// shape produced for /config without configuration files. Docker may seed one
+// exact empty caddy/ directory from the pinned image. Unexpected files, links,
+// metadata entries, malformed archives, and truncated command output fail closed.
 func gatewayRebindExactEmptyConfigVolumeArchive(value []byte) error {
 	inventory, err := gatewayRebindExactStageConfigVolumeArchive(value, nil)
 	if err != nil || inventory != gatewayRebindStageConfigInventoryEmpty {
 		return errors.New("generated ingress rebind config volume archive is not empty")
 	}
 	return nil
+}
+
+func validGatewayRebindPinnedImageConfigDirectory(header *tar.Header) bool {
+	return header != nil && (header.Name == "caddy/" || header.Name == "./caddy/") &&
+		header.Typeflag == tar.TypeDir && header.Size == 0 && header.Linkname == "" &&
+		header.Uid == 0 && header.Gid == 0 && header.Mode == 0o1777
 }
 
 // gatewayRebindStageConfigBytes is the sequence-seven v1 byte format. Protected

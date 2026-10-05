@@ -225,6 +225,7 @@ func liveGatewayRebindSuccessorStageConfigCopy(t *testing.T, lostAcknowledgment 
 	configIntentDriver := managerGatewayRebindStageConfigIntentDriver{manager: fixture.ingress}
 	empty, err := configIntentDriver.configVolumeEmpty(fixture.ctx, intent, *beforeIntent.Progress[5].Record.Stage)
 	if err != nil || !empty {
+		logLiveGatewayRebindInitialConfigArchive(t, fixture, intent, *beforeIntent.Progress[5].Record.Stage)
 		t.Fatal("live sequence-six config mount was not a strictly empty Docker archive")
 	}
 
