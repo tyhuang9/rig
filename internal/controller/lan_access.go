@@ -201,6 +201,14 @@ func (s *Server) attestApplicationLANAccess(ctx context.Context, revision appacc
 			revision.Allocation.Port < effective.Spec.PortStart || revision.Allocation.Port > effective.Spec.PortEnd {
 			return appaccess.ErrInvalidStoredState
 		}
+		if !observation.EffectiveBinding.MatchesResolution(appaccess.GatewayBindingResolution{
+			RawAllocation: authorized.Allocation, RawAccessRevision: authorized.Revision,
+			RawGrant: authorized.Claim, RawProfile: authorized.Profile, EffectiveProfile: effective,
+			CurrentGatewaySource: authorized.CurrentGatewaySource, TransferChain: authorized.TransferChain,
+			TransferChainTipDigest: authorized.TransferChainTipDigest, TerminalReceiptDigest: authorized.TerminalReceiptDigest,
+		}) {
+			return appaccess.ErrInvalidStoredState
+		}
 		head, err := s.GeneratedRuntimeState.Active(observationCtx, revision.AppID)
 		if err != nil || head.DeploymentID == "" {
 			return appaccess.ErrInvalidStoredState

@@ -181,6 +181,15 @@ func newVerifiedLANStatusFixture(t *testing.T) *lanStatusFixture {
 	}
 	runtime := &statusLANObservation{observation: generatedingress.GatewayV2LANGrantObservation{
 		Disposition: generatedingress.GatewayV2LANGrantCommitted, GatewayOperationID: gatewayOperation,
+		EffectiveBinding: generatedingress.GatewayV2LANEffectiveBindingProof{
+			EffectiveProfile: generatedingress.GatewayV2ProfileBinding{RevisionID: profile.ID, RevisionNumber: profile.RevisionNumber,
+				SpecDigest: profile.SpecDigest, SelectedIPv4: profile.Spec.SelectedIPv4, InterfaceID: profile.Spec.InterfaceID,
+				PortStart: profile.Spec.PortStart, PortEnd: profile.Spec.PortEnd},
+			ProtectedLineage: appaccess.GatewayCurrentLineageRef{Kind: appaccess.GatewayRebindSourceGatewayUpgrade,
+				OperationID: gatewayOperation, ProfileRevisionID: profile.ID, ProfileRevisionNumber: profile.RevisionNumber,
+				ProfileSpecDigest: profile.SpecDigest, ProtectedIdentityDigest: strings.Repeat("c", 64),
+				ProtectedJournalDigest: strings.Repeat("d", 64)},
+		},
 		ProtectedStateDigest: strings.Repeat("b", 64), ObservedAt: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC), Slot: generatedruntime.SlotBlue,
 		Endpoints: []generatedruntime.RouteEndpoint{{Component: "web", Role: generatedruntime.RoleServer, ContainerID: containerID,
 			NetworkName: description.NetworkName, NetworkAlias: description.NetworkAlias, InternalPort: 3000}},
@@ -218,25 +227,68 @@ func TestLANAccessVerifiedStatusUsesAuthorizedProfileAndRetainsRawGrant(t *testi
 	}
 }
 
+// These DTOs simulate the repository/runtime boundary for controller adapter
+// coverage. They do not establish real SQL transfer or physical Docker proof.
+func (f *lanStatusFixture) simulatedReboundProfile(t *testing.T, count int) appaccess.GatewayProfileRevision {
+	t.Helper()
+	effective := f.profile
+	var chain []appaccess.GatewayRebindAllocationTransfer
+	var predecessor *string
+	var lineage appaccess.GatewayCurrentLineageRef
+	for index := 0; index < count; index++ {
+		effective.ID = uuid.NewString()
+		effective.RevisionNumber++
+		effective.OperationID = uuid.NewString()
+		effective.Spec.SelectedIPv4 = "192.168.60." + strconv.Itoa(20+index)
+		effective.Spec.InterfaceID = strconv.Itoa(8+index) + "/Successor LAN"
+		var err error
+		effective.SpecDigest, err = appaccess.GatewayProfileSpecDigest(effective.Spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lineage = appaccess.GatewayCurrentLineageRef{Kind: appaccess.GatewayRebindSourceGatewayRebind,
+			OperationID: uuid.NewString(), ProfileRevisionID: effective.ID, ProfileRevisionNumber: effective.RevisionNumber,
+			ProfileSpecDigest: effective.SpecDigest, ProtectedGeneration: uint64(index + 1),
+			ProtectedIdentityDigest: strings.Repeat("c", 64), ProtectedIntentDigest: strings.Repeat("d", 64),
+			TerminalReceiptDigest: strings.Repeat(strconv.Itoa(index+1), 64)}
+		transfer := appaccess.GatewayRebindAllocationTransfer{Version: appaccess.GatewayRebindTransferVersionV1,
+			OperationID: lineage.OperationID, Ordinal: 1, AppID: f.api.app.ID, AllocationID: f.claim.Spec.AllocationID,
+			GrantAttemptID: f.claim.AttemptID, SourceBindingDigest: strings.Repeat("a", 64), RosterEntryDigest: strings.Repeat("b", 64),
+			SourceProfileRevisionID: f.profile.ID, SourceProfileRevisionNumber: f.profile.RevisionNumber, SourceProfileSpecDigest: f.profile.SpecDigest,
+			PredecessorTransferDigest: predecessor, SuccessorProfileRevisionID: effective.ID,
+			SuccessorProfileRevisionNumber: effective.RevisionNumber, SuccessorProfileSpecDigest: effective.SpecDigest,
+			TerminalReceiptDigest: lineage.TerminalReceiptDigest}
+		transfer.TransferDigest, err = appaccess.GatewayRebindAllocationTransferDigest(transfer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chain = append(chain, transfer)
+		tip := transfer.TransferDigest
+		predecessor = &tip
+	}
+	f.runtime.observation.EffectiveBinding = generatedingress.GatewayV2LANEffectiveBindingProof{
+		EffectiveProfile: generatedingress.GatewayV2ProfileBinding{RevisionID: effective.ID, RevisionNumber: effective.RevisionNumber,
+			SpecDigest: effective.SpecDigest, SelectedIPv4: effective.Spec.SelectedIPv4, InterfaceID: effective.Spec.InterfaceID,
+			PortStart: effective.Spec.PortStart, PortEnd: effective.Spec.PortEnd},
+		ProtectedLineage: lineage, TransferChainTipDigest: *predecessor, TerminalReceiptDigest: lineage.TerminalReceiptDigest,
+	}
+	f.server.AppGrants = statusLANAuthorization{LANAppGrantService: f.repository,
+		alter: func(value *appaccess.AppAccessGrantAuthorization) {
+			value.EffectiveProfile = effective
+			value.CurrentGatewaySource = appaccess.GatewayCurrentAuthorityRef{Kind: lineage.Kind, OperationID: lineage.OperationID,
+				ProfileRevisionID: lineage.ProfileRevisionID, ProfileRevisionNumber: lineage.ProfileRevisionNumber,
+				ProfileSpecDigest: lineage.ProfileSpecDigest, TerminalReceiptDigest: lineage.TerminalReceiptDigest}
+			value.TransferChain = append([]appaccess.GatewayRebindAllocationTransfer(nil), chain...)
+			value.TransferChainTipDigest = *predecessor
+			value.TerminalReceiptDigest = lineage.TerminalReceiptDigest
+		},
+	}
+	return effective
+}
+
 func TestLANAccessVerifiedStatusUsesEffectiveProfileWithoutRewritingRawGrant(t *testing.T) {
 	f := newVerifiedLANStatusFixture(t)
-	effective := f.profile
-	effective.ID = uuid.NewString()
-	effective.RevisionNumber++
-	effective.OperationID = uuid.NewString()
-	effective.Spec.SelectedIPv4 = "192.168.60.20"
-	effective.Spec.InterfaceID = "8/Successor LAN"
-	var err error
-	effective.SpecDigest, err = appaccess.GatewayProfileSpecDigest(effective.Spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Transfer-chain authorization belongs to the repository's tests. This
-	// adapter test only replaces that validated output while
-	// retaining the real immutable native grant and its fresh serving evidence.
-	f.server.AppGrants = statusLANAuthorization{LANAppGrantService: f.repository,
-		alter: func(value *appaccess.AppAccessGrantAuthorization) { value.EffectiveProfile = effective },
-	}
+	effective := f.simulatedReboundProfile(t, 2)
 	value := f.read(t)
 	want := "http://" + effective.Spec.SelectedIPv4 + ":" + strconv.Itoa(int(f.claim.Spec.Port)) + "/"
 	if value["availability"] != "verified" || value["url"] != want {
@@ -250,6 +302,40 @@ func TestLANAccessVerifiedStatusUsesEffectiveProfileWithoutRewritingRawGrant(t *
 	allocation := desired["allocation"].(map[string]any)
 	if allocation["gatewayProfileRevisionId"] != f.profile.ID || allocation["gatewayProfileRevisionNumber"] != float64(f.profile.RevisionNumber) {
 		t.Fatal("effective URL projection rewrote the desired allocation's immutable profile")
+	}
+}
+
+func TestLANAccessStatusWithholdsURLWhenTransferProofDisagrees(t *testing.T) {
+	for _, name := range []string{"missing chain", "broken chain", "changed transfer", "different tip", "different receipt", "different current source"} {
+		t.Run(name, func(t *testing.T) {
+			f := newVerifiedLANStatusFixture(t)
+			f.simulatedReboundProfile(t, 2)
+			if value := f.read(t); value["availability"] != "verified" {
+				t.Fatalf("simulated transferred proof baseline must be verified: %#v", value)
+			}
+			f.server.AppGrants = statusLANAuthorization{LANAppGrantService: f.server.AppGrants,
+				alter: func(value *appaccess.AppAccessGrantAuthorization) {
+					switch name {
+					case "missing chain":
+						value.TransferChain = nil
+					case "broken chain":
+						value.TransferChain[1].PredecessorTransferDigest = nil
+					case "changed transfer":
+						value.TransferChain[0].RosterEntryDigest = strings.Repeat("f", 64)
+					case "different tip":
+						value.TransferChainTipDigest = strings.Repeat("e", 64)
+					case "different receipt":
+						value.TerminalReceiptDigest = strings.Repeat("f", 64)
+					case "different current source":
+						value.CurrentGatewaySource.OperationID = uuid.NewString()
+					}
+				},
+			}
+			value := f.read(t)
+			if value["availability"] != "unverified" || value["url"] != nil || value["observedAt"] != nil {
+				t.Fatalf("transfer proof mismatch exposed a URL or timestamp: %#v", value)
+			}
+		})
 	}
 }
 
@@ -274,6 +360,47 @@ func TestLANAccessStatusWithholdsURLWhenServingEvidenceChanges(t *testing.T) {
 			value := f.read(t)
 			if value["availability"] != "unverified" || value["url"] != nil || value["observedAt"] != nil {
 				t.Fatalf("unproved route exposed a URL or timestamp: %#v", value)
+			}
+		})
+	}
+}
+
+func TestLANAccessStatusWithholdsURLWhenEffectiveProofDisagrees(t *testing.T) {
+	for _, name := range []string{"missing proof", "different operation", "different authority profile", "different effective profile",
+		"different address", "different interface", "different port pool", "invalid identity", "invalid journal", "unexpected receipt", "unexpected transfer tip"} {
+		t.Run(name, func(t *testing.T) {
+			f := newVerifiedLANStatusFixture(t)
+			if value := f.read(t); value["availability"] != "verified" {
+				t.Fatalf("native proof baseline must be verified: %#v", value)
+			}
+			proof := &f.runtime.observation.EffectiveBinding
+			switch name {
+			case "missing proof":
+				*proof = generatedingress.GatewayV2LANEffectiveBindingProof{}
+			case "different operation":
+				proof.ProtectedLineage.OperationID = uuid.NewString()
+			case "different authority profile":
+				proof.ProtectedLineage.ProfileRevisionID = uuid.NewString()
+			case "different effective profile":
+				proof.EffectiveProfile.RevisionID = uuid.NewString()
+			case "different address":
+				proof.EffectiveProfile.SelectedIPv4 = "192.168.60.20"
+			case "different interface":
+				proof.EffectiveProfile.InterfaceID = "8/Successor LAN"
+			case "different port pool":
+				proof.EffectiveProfile.PortEnd++
+			case "invalid identity":
+				proof.ProtectedLineage.ProtectedIdentityDigest = ""
+			case "invalid journal":
+				proof.ProtectedLineage.ProtectedJournalDigest = ""
+			case "unexpected receipt":
+				proof.TerminalReceiptDigest = strings.Repeat("e", 64)
+			case "unexpected transfer tip":
+				proof.TransferChainTipDigest = strings.Repeat("f", 64)
+			}
+			value := f.read(t)
+			if value["availability"] != "unverified" || value["url"] != nil || value["observedAt"] != nil {
+				t.Fatalf("protected proof mismatch exposed a URL or timestamp: %#v", value)
 			}
 		})
 	}

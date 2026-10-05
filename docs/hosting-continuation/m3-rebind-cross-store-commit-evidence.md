@@ -84,7 +84,7 @@ work use separate worktrees and disjoint write areas.
    | --- | --- |
    | `GatewayCurrentLineageRef` | Stable source kind/operation, profile identity, protected generation/identity; real prior terminal receipt for a rebind source |
    | `GatewayRebindSourceRef` | Stable lineage plus the exact frozen operational-state version, revision, digest and create-only admission checkpoint |
-   | `GatewayRebindSpecV2` | Typed predecessor, successor/configure identity and versioned complete roster digest/count; v1 type and digests remain unchanged |
+   | `GatewayRebindSpecV2` | Typed predecessor, explicit successor protected generation, successor/configure identity and versioned complete roster digest/count; v1 type and digests remain unchanged |
    | `GatewayRebindRosterEntryV2` | Immutable allocation/access/grant/runtime fields and nullable preceding transfer digest |
    | `GatewayRebindAllocationTransfer` | Ordered source binding and roster evidence, predecessor transfer, successor profile and receipt, canonical transfer digest |
    | `GatewayBindingResolution` | Separate raw source proof and effective current profile/source/chain-tip/receipt |
@@ -507,7 +507,55 @@ historical disable acknowledgment, LAN quarantine and normal ingress recovery.
 The coordinator owns effects-lease acquisition; startup must call it before
 taking ordinary startup admission, without nesting the same lease.
 
-### Pending controller comparison
+### Integrated proposal inspection
+
+The bounded independent review accepted the runtime proposal/current inspection
+checkpoint `5c8f982913a2f7b2258b2a2f253effe3009fbc6f`. It validates SQL/protected
+source agreement under the gateway lock, builds the roster from raw grant
+provenance plus validated effective transfers, repeats its observations, and
+keeps the selected current source separate from any active operation. Its
+cleanup projection exposes only identities from validated terminal receipts;
+preterminal resources still require retention and phase-specific recovery.
+That checkpoint and the focused cleanup correction are integrated locally at
+`17e1aeecbc01e63cb108db1d63fa13771fbad252`.
+
+Review of the next resolver checkpoint found two required corrections before
+integration. Every transfer must retain the original raw source profile across
+A-to-B-to-C changes. Also, the next protected generation cannot be computed as
+the selected source generation plus one: rollback or a crash after SQL admission
+can consume an attempt generation without changing the current source.
+The unpublished v2 spec therefore binds `SuccessorProtectedGeneration`, selected
+above retained SQL claims and protected history, with exact equality required
+in transition proofs and the SQL guard. V1 canonical bytes and historical
+migrations 026, 033 and 034 remain unchanged.
+
+The corrected resolver/admission checkpoint and final SQL generation equality
+guard passed bounded independent review at
+`01621f68bc5cd4286e01de59ec5ce35635398b7a` and are integrated at
+`0e08be73f09f078dd97716f83dd56f2917f90ec3`. The independent guard regression
+and mirrored migration tests each passed (app-access 0.750s, database 0.978s),
+with zero failure/skip. Historical disabled/released startup readers and the
+post-rebind upgrade-head rule still require completion; this is not full-unit
+approval.
+
+The parent has a pending real-boundary proposal test and a dedicated CI job.
+The test uses actual native SQL/protected/Docker state, compares repeated and
+fresh-manager proposals, and checks unchanged authority, raw access, runtime
+heads, resource ownership and routed-request counts. The CI guard requires the
+named test to pass exactly once with no failure or skip, and checks complete
+resource and owned-adapter cleanup. The repository's existing YAML parser,
+Go syntax parser and `bash -n` accepted these pending files. After resolver
+integration, `go test -mod=readonly -p=1 -tags=integration -run '^$'
+./internal/generatedingress ./cmd/hostd` passed type checking (ingress 0.772s,
+hostd 0.765s). A separate named discovery check with the common Docker opt-in
+disabled found exactly the new proposal test and both existing handover tests,
+all three skipped as required (package 0.834s). The log is
+`$TEMP/m3-cross-store-live-opt-in-discovery.jsonl`. These skips are not physical
+acceptance. The runtime proposal's generation adaptation and actual Docker run
+remain pending; this is not commit/recovery acceptance. Documentation workflow
+checks and the VitePress build also passed (3.66s).
+
+### Verified controller comparison
 
 The independently reviewed protected current-state checkpoint
 `25fec6f573ac12c2174a7472aeaa4a6552ac4f0b` is integrated locally. Its native
@@ -528,8 +576,25 @@ the response still exposed its URL after the protected proof was removed or
 changed. The package failed in 3.634s as expected. The captured log is
 `$TEMP/m3-cross-store-controller-effective-proof-red.jsonl`. This is evidence
 for the controller gap, not a passing acceptance result. The adapter changes
-and positive/refusal tests await integration with the reviewed SQL resolver
-and its full authorization DTO before a passing checkpoint can be recorded.
+and positive/refusal tests were subsequently integrated with the reviewed SQL
+resolver and its full authorization DTO.
+
+The corrected adapter compares the effective binding proof with fresh SQL
+authorization inside the gateway-locked callback, before serving-head evidence
+and URL assignment. Bounded independent code/security review accepted these
+eight production lines and the corresponding tests with no blocking finding.
+The focused check passed all seven named top-level tests and 32 refusal cases,
+with zero failure or skip, in 22.955s:
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./internal/controller -run '^TestLANAccess(VerifiedStatus|StatusWithholdsURL)'
+go vet -mod=readonly ./internal/controller
+```
+
+Vet, gofmt and diff checks passed. Green test events are retained at
+`$TEMP/m3-cross-store-controller-effective-proof-green.jsonl`. Both newly added
+negative suites first establish a verified positive baseline, then require URL
+and timestamp withholding after native-proof or transfer-proof disagreement.
 
 The controller's two-transfer fixture explicitly simulates validated DTOs;
 it verifies projection and comparison only. Real SQL transfer, restart and
