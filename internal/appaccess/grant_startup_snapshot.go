@@ -11,20 +11,25 @@ import (
 // with protected gateway state. Historical rolled-back attempts are included
 // so a protected binding can be matched by AttemptID and rejected precisely.
 type AppAccessGrantStartupClaim struct {
-	Claim                   AppAccessGrantClaim
-	Revision                AppAccessRevision
-	Allocation              Allocation
-	Profile                 GatewayProfileRevision
-	EffectiveProfile        GatewayProfileRevision
-	CurrentGatewaySource    GatewayCurrentAuthorityRef
-	TransferChain           []GatewayRebindAllocationTransfer
-	TransferChainTipDigest  string
-	TerminalReceiptDigest   string
-	AppArchived             bool
-	AccessHeadCurrent       bool
-	ProfileHeadCurrent      bool
-	ApproverIsAdministrator bool
-	DisableIntent           *AppAccessDisableIntent
+	Claim                          AppAccessGrantClaim
+	Revision                       AppAccessRevision
+	Allocation                     Allocation
+	Profile                        GatewayProfileRevision
+	EffectiveProfile               GatewayProfileRevision
+	CurrentGatewaySource           GatewayCurrentAuthorityRef
+	TransferChain                  []GatewayRebindAllocationTransfer
+	TransferChainTipDigest         string
+	TerminalReceiptDigest          string
+	RetainedEffectiveProfile       GatewayProfileRevision
+	RetainedGatewaySource          GatewayCurrentAuthorityRef
+	RetainedTransferChain          []GatewayRebindAllocationTransfer
+	RetainedTransferChainTipDigest string
+	RetainedTerminalReceiptDigest  string
+	AppArchived                    bool
+	AccessHeadCurrent              bool
+	ProfileHeadCurrent             bool
+	ApproverIsAdministrator        bool
+	DisableIntent                  *AppAccessDisableIntent
 }
 
 type AppAccessGrantStartupSnapshot struct {
@@ -149,6 +154,7 @@ func (r *Repository) readGatewayUpgradeStartupSnapshot(ctx context.Context, tx *
 		Claims:         make([]GatewayUpgradeStartupClaim, 0, len(operationIDs)),
 	}
 	activeClaims := 0
+	var rebindRecovery *GatewayRebindRecoverySnapshot
 	for _, operationID := range operationIDs {
 		claim, err := readGatewayProfileUpgradeClaim(ctx, tx, operationID)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -188,12 +194,39 @@ func (r *Repository) readGatewayUpgradeStartupSnapshot(ctx context.Context, tx *
 		if err != nil {
 			return GatewayUpgradeStartupSnapshot{}, err
 		}
-		if claim.State != GatewayProfileUpgradeRolledBack {
+		if claim.State == GatewayProfileUpgradePrepared || claim.State == GatewayProfileUpgradeServing ||
+			claim.State == GatewayProfileUpgradeUnresolved {
 			activeClaims++
 			if activeClaims > 1 || current == nil || actorRole != "administrator" ||
 				current.ID != profile.ID || current.RevisionNumber != profile.RevisionNumber ||
 				current.SpecDigest != profile.SpecDigest {
 				return GatewayUpgradeStartupSnapshot{}, ErrInvalidStoredState
+			}
+		} else if claim.State == GatewayProfileUpgradeCommitted {
+			currentMatches := current != nil && current.ID == profile.ID &&
+				current.RevisionNumber == profile.RevisionNumber && current.SpecDigest == profile.SpecDigest
+			if currentMatches {
+				activeClaims++
+				selectedProfile, selectedSource, readErr := readGatewayCurrentAuthority(ctx, tx)
+				if readErr != nil || activeClaims > 1 || actorRole != "administrator" || selectedProfile != profile ||
+					selectedSource.Kind != GatewayRebindSourceGatewayUpgrade ||
+					selectedSource.OperationID != claim.OperationID ||
+					selectedSource.ProfileRevisionID != profile.ID ||
+					selectedSource.ProfileRevisionNumber != profile.RevisionNumber ||
+					selectedSource.ProfileSpecDigest != profile.SpecDigest {
+					return GatewayUpgradeStartupSnapshot{}, invalidRebindStoredState(readErr)
+				}
+			} else {
+				if rebindRecovery == nil {
+					value, readErr := readGatewayRebindRecoverySnapshot(ctx, tx)
+					if readErr != nil {
+						return GatewayUpgradeStartupSnapshot{}, readErr
+					}
+					rebindRecovery = &value
+				}
+				if !gatewayRebindRecoveryDescendsFromUpgrade(*rebindRecovery, claim, profile) {
+					return GatewayUpgradeStartupSnapshot{}, ErrInvalidStoredState
+				}
 			}
 		}
 		result.Claims = append(result.Claims, GatewayUpgradeStartupClaim{
@@ -201,6 +234,50 @@ func (r *Repository) readGatewayUpgradeStartupSnapshot(ctx context.Context, tx *
 		})
 	}
 	return result, nil
+}
+
+func gatewayRebindRecoveryDescendsFromUpgrade(snapshot GatewayRebindRecoverySnapshot,
+	claim GatewayProfileUpgradeClaim, profile GatewayProfileRevision,
+) bool {
+	if snapshot.CurrentProfile == nil || snapshot.CurrentSource == nil ||
+		snapshot.CurrentSource.Kind != GatewayRebindSourceGatewayRebind ||
+		snapshot.CurrentSource.ProfileRevisionID != snapshot.CurrentProfile.ID ||
+		snapshot.CurrentSource.ProfileRevisionNumber != snapshot.CurrentProfile.RevisionNumber ||
+		snapshot.CurrentSource.ProfileSpecDigest != snapshot.CurrentProfile.SpecDigest {
+		return false
+	}
+	authority := *snapshot.CurrentSource
+	seen := make(map[string]struct{}, len(snapshot.History))
+	for authority.Kind == GatewayRebindSourceGatewayRebind {
+		if _, duplicate := seen[authority.OperationID]; duplicate {
+			return false
+		}
+		seen[authority.OperationID] = struct{}{}
+		history := findGatewayRebindHistory(snapshot.History, authority.OperationID)
+		if history == nil || retainedGatewayRebindDisposition(history.Commands) != GatewayRebindDispositionCommit ||
+			!gatewayRebindHistoryHasDatabaseCommit(*history) {
+			return false
+		}
+		successorID, successorNumber, successorDigest := historyClaimSuccessorProfile(history.Claim)
+		if authority.ProfileRevisionID != successorID || authority.ProfileRevisionNumber != successorNumber ||
+			authority.ProfileSpecDigest != successorDigest ||
+			authority.TerminalReceiptDigest != retainedGatewayRebindReceipt(history.Commands) {
+			return false
+		}
+		authority = historyClaimPredecessorAuthority(history.Claim)
+	}
+	return authority.Kind == GatewayRebindSourceGatewayUpgrade && authority.OperationID == claim.OperationID &&
+		authority.ProfileRevisionID == profile.ID && authority.ProfileRevisionNumber == profile.RevisionNumber &&
+		authority.ProfileSpecDigest == profile.SpecDigest && authority.TerminalReceiptDigest == ""
+}
+
+func gatewayRebindHistoryHasDatabaseCommit(history GatewayRebindHistoryEntry) bool {
+	for _, event := range history.Events {
+		if event.State == GatewayRebindDatabaseCommitted {
+			return true
+		}
+	}
+	return false
 }
 
 func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID string) (AppAccessGrantStartupClaim, error) {
@@ -266,20 +343,29 @@ func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID s
 		DisableIntent: disableIntent,
 	}
 	if claim.State == AppAccessGrantCommitted {
-		resolution, resolveErr := resolveGatewayBindingForConsumer(ctx, tx, GatewayBindingRef{
+		resolution, resolveErr := resolveGatewayBindingForStoredGrant(ctx, tx, GatewayBindingRef{
 			AppID: claim.Spec.AppID, AllocationID: claim.Spec.AllocationID,
 			AccessRevisionID: claim.Spec.AccessRevisionID, GrantAttemptID: claim.AttemptID,
-		}, profile)
+		}, profile, claim)
 		if resolveErr != nil || resolution.RawProfile.ID != profile.ID ||
 			resolution.RawProfile.RevisionNumber != profile.RevisionNumber ||
 			resolution.RawProfile.SpecDigest != profile.SpecDigest {
 			return AppAccessGrantStartupClaim{}, invalidRebindStoredState(resolveErr)
 		}
-		value.EffectiveProfile = resolution.EffectiveProfile
-		value.CurrentGatewaySource = resolution.CurrentGatewaySource
-		value.TransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
-		value.TransferChainTipDigest = resolution.TransferChainTipDigest
-		value.TerminalReceiptDigest = resolution.TerminalReceiptDigest
+		if claim.RetiredAt != nil && resolution.CurrentGatewaySource.Kind != "" {
+			value.EffectiveProfile = GatewayProfileRevision{}
+			value.RetainedEffectiveProfile = resolution.EffectiveProfile
+			value.RetainedGatewaySource = resolution.CurrentGatewaySource
+			value.RetainedTransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
+			value.RetainedTransferChainTipDigest = resolution.TransferChainTipDigest
+			value.RetainedTerminalReceiptDigest = resolution.TerminalReceiptDigest
+		} else if claim.RetiredAt == nil {
+			value.EffectiveProfile = resolution.EffectiveProfile
+			value.CurrentGatewaySource = resolution.CurrentGatewaySource
+			value.TransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
+			value.TransferChainTipDigest = resolution.TransferChainTipDigest
+			value.TerminalReceiptDigest = resolution.TerminalReceiptDigest
+		}
 	}
 	var archived sql.NullString
 	if err := tx.QueryRowContext(ctx, `SELECT archived_at FROM applications WHERE id=?`, claim.Spec.AppID).Scan(&archived); errors.Is(err, sql.ErrNoRows) {
