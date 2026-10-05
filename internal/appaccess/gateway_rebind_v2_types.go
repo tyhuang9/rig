@@ -56,6 +56,19 @@ type GatewayRebindSourceRef struct {
 	PredecessorCheckpointDigest string                   `json:"predecessorCheckpointDigest"`
 }
 
+// GatewayCurrentAuthorityRef is the exact lineage projection SQL can prove
+// without inventing protected metadata that legacy upgrade claims never
+// stored. A protected observer validates the full lineage separately and
+// compares its authority projection with this value.
+type GatewayCurrentAuthorityRef struct {
+	Kind                  GatewayRebindSourceKind
+	OperationID           string
+	ProfileRevisionID     string
+	ProfileRevisionNumber int64
+	ProfileSpecDigest     string
+	TerminalReceiptDigest string
+}
+
 // GatewayRebindSpecV2 is a new canonical approval format. The legacy
 // GatewayRebindSpec remains unchanged so existing protected bytes can still be
 // regenerated and validated exactly.
@@ -120,7 +133,7 @@ type GatewayRebindAllocationTransfer struct {
 	SuccessorProfileRevisionNumber int64   `json:"successorProfileRevisionNumber"`
 	SuccessorProfileSpecDigest     string  `json:"successorProfileSpecDigest"`
 	TerminalReceiptDigest          string  `json:"terminalReceiptDigest"`
-	TransferDigest                 string  `json:"-"`
+	TransferDigest                 string  `json:"transferDigest,omitempty"`
 }
 
 type GatewayBindingRef struct {
@@ -138,7 +151,7 @@ type GatewayBindingResolution struct {
 	RawGrant               AppAccessGrantClaim
 	RawProfile             GatewayProfileRevision
 	EffectiveProfile       GatewayProfileRevision
-	CurrentGatewaySource   GatewayCurrentLineageRef
+	CurrentGatewaySource   GatewayCurrentAuthorityRef
 	TransferChain          []GatewayRebindAllocationTransfer
 	TransferChainTipDigest string
 	TerminalReceiptDigest  string
@@ -202,7 +215,7 @@ type GatewayRebindRecoverySnapshot struct {
 	History                []GatewayRebindHistoryEntry
 	Active                 *GatewayRebindHistoryEntry
 	CurrentProfile         *GatewayProfileRevision
-	CurrentSource          *GatewayCurrentLineageRef
+	CurrentSource          *GatewayCurrentAuthorityRef
 	DatabaseCommittedEvent *GatewayRebindEvent
 	CurrentTransfers       []GatewayRebindAllocationTransfer
 	Phase                  GatewayRebindState

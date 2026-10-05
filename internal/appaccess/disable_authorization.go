@@ -17,7 +17,7 @@ type AppAccessDisableAuthorization struct {
 	Allocation             Allocation
 	Profile                GatewayProfileRevision
 	EffectiveProfile       GatewayProfileRevision
-	CurrentGatewaySource   GatewayCurrentLineageRef
+	CurrentGatewaySource   GatewayCurrentAuthorityRef
 	TransferChainTipDigest string
 	TerminalReceiptDigest  string
 	SourceGrant            *AppAccessGrantClaim
