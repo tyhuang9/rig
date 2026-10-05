@@ -3,8 +3,10 @@
 Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
 draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
 row's branch descends from the preceding row's branch and targets it with one
-review scope. The branch sequence has been preserved with additive CI repair
-merges. Publication of these drafts does not authorize merge or deployment.
+review scope. Rows 26–27 remain local and require separate publication
+approval. The first two hosted row-25 network Docker attempts failed; the
+corrected head's required job is queued, so no hosted network-stage acceptance
+is claimed. No draft publication authorizes merge or deployment.
 
 | Order | Branch | Scope commit | Review scope |
 | --- | --- | --- | --- |
@@ -33,6 +35,8 @@ merges. Publication of these drafts does not authorize merge or deployment.
 | 23 | `feature/hosting-m3-rebind-progress-attestation` | `ad9471a` | Progress bound into the effect-boundary attestation |
 | 24 | `feature/hosting-m3-rebind-guarded-nonterminal` | `542ce48` | Private successor ingress-network Docker effect |
 | 25 | `feature/hosting-m3-rebind-network-docker-gate` | `f00f911` | Required hosted Docker test of the exact network effect and Linux bridge delta |
+| 26 | `feature/hosting-m3-rebind-config-volume-stage` | `307c8f3` | Private successor config-volume Docker effect and protected sequence-four binding |
+| 27 | `feature/hosting-m3-rebind-config-volume-docker-gate` | `742124d` | Required hosted Docker test of the exact config-volume effect and replay |
 
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
@@ -47,11 +51,14 @@ head. The first four hosted row-25 Docker attempts failed and remain in the
 row-25 evidence file. The [fifth hosted network-stage job](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391)
 passed the required named live test at code head `ad8d3e2` in 54.89 seconds,
 and its always-run residue step passed. This establishes the private network
-stage on that hosted runner; it does not establish later successor effects.
+stage on that hosted runner. Rows 26 and 27 passed their final-source Go suites,
+vet, builds, and relevant focused checks before this network-route correction
+was integrated. Row 27's live test compiled and skipped locally; its hosted
+Docker acceptance remains open.
 
 These branches do not add a public rebind controller caller, terminal protected
 receipt, successor cutover, transfer-aware readers, recovery, or fence release.
-Migrations 033 and 034 remain dormant and unreleasable. Merging, deployment,
-Linux race, and physical second-device LAN acceptance are separate
-gates. The create-before-bind crash window after the row-24 network effect
-remains unresolved and fenced.
+Migrations 033 and 034 remain dormant and unreleasable. Publication, merging,
+deployment, Linux race, and physical second-device LAN acceptance are separate
+gates. The create-before-bind crash windows after the row-24 network and
+row-26 config-volume effects remain unresolved and fenced.
