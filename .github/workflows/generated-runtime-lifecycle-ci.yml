@@ -220,7 +220,7 @@ jobs:
   generated-runtime-race:
     name: Generated runtime race verification
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - name: Check out source
         timeout-minutes: 2

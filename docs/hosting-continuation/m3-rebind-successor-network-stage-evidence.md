@@ -92,7 +92,7 @@ last successful pre-correction run took 1074.037s for
 After the added route regressions, [PR #121's race job](https://github.com/tyhuang9/rig/actions/runs/37260578548/job/111606761789)
 and [PR #122's race job](https://github.com/tyhuang9/rig/actions/runs/37261058991/job/111608365118)
 both timed out at 1080s without a race report. The generated-runtime race
-workflow now allows 24 minutes for Go tests, 26 minutes for the step, and 30
+workflow now allows 24 minutes for Go tests, 26 minutes for the step, and 35
 minutes for the job; test coverage and assertions are unchanged. This is a
 CI time-budget correction, not a passing race result. A hosted rerun is required.
 
