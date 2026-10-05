@@ -50,7 +50,7 @@ func (r *Repository) GatewayUpgradeStartupSnapshot(ctx context.Context) (Gateway
 	return result, nil
 }
 
-func readGatewayUpgradeStartupHead(ctx context.Context, tx *sql.Tx) (*GatewayProfileRevision, error) {
+func readGatewayUpgradeStartupHead(ctx context.Context, tx rowQuerier) (*GatewayProfileRevision, error) {
 	var revisionID, updatedAt sql.NullString
 	var revisionNumber int64
 	if err := tx.QueryRowContext(ctx, `SELECT revision_id,revision_number,updated_at
@@ -109,7 +109,7 @@ func readGatewayUpgradeStartupOperationIDs(ctx context.Context, tx *sql.Tx) ([]s
 	return operationIDs, nil
 }
 
-func validateGatewayUpgradeStartupProfile(ctx context.Context, tx *sql.Tx, profile GatewayProfileRevision, storedRequestDigest string) error {
+func validateGatewayUpgradeStartupProfile(ctx context.Context, tx rowQuerier, profile GatewayProfileRevision, storedRequestDigest string) error {
 	if profile.RevisionNumber <= 0 || !validUUID(profile.ID) || !validUUID(profile.OperationID) ||
 		!validUUID(profile.ApprovedBy) || !validDigest(profile.SpecDigest) || !validDigest(storedRequestDigest) {
 		return ErrInvalidStoredState

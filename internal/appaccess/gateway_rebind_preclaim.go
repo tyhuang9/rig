@@ -25,6 +25,11 @@ type GatewayRebindPreclaimSnapshot struct {
 	GrantBindings    []GatewayRebindStartupGrantBinding
 }
 
+type gatewayRebindReadQuery interface {
+	rowQuerier
+	gatewayRebindQuiescenceQuerier
+}
+
 func (r *Repository) GatewayRebindPreclaimSnapshot(ctx context.Context,
 	proposal GatewayRebindPreclaimProposal,
 ) (GatewayRebindPreclaimSnapshot, error) {
@@ -79,7 +84,7 @@ func validateGatewayRebindPreclaimProposal(proposal GatewayRebindPreclaimProposa
 	return nil
 }
 
-func (r *Repository) readGatewayRebindPreclaimSnapshot(ctx context.Context, tx *sql.Tx,
+func (r *Repository) readGatewayRebindPreclaimSnapshot(ctx context.Context, tx gatewayRebindReadQuery,
 	proposal GatewayRebindPreclaimProposal,
 ) (GatewayRebindPreclaimSnapshot, error) {
 	proposal.Roster = append([]GatewayRebindRosterEntry(nil), proposal.Roster...)
@@ -175,7 +180,7 @@ func (r *Repository) readGatewayRebindPreclaimSnapshot(ctx context.Context, tx *
 	}, nil
 }
 
-func validateGatewayRebindPreclaimSettledRoster(ctx context.Context, tx *sql.Tx,
+func validateGatewayRebindPreclaimSettledRoster(ctx context.Context, tx rowQuerier,
 	spec GatewayRebindSpec, roster []GatewayRebindRosterEntry,
 ) error {
 	var liveCount, unsettled, pendingGrants, pendingDisables int64

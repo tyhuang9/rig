@@ -56,7 +56,7 @@ func (r *Repository) GatewayRebindStartupSnapshot(ctx context.Context) (GatewayR
 	return snapshot, nil
 }
 
-func (r *Repository) readGatewayRebindStartupSnapshot(ctx context.Context, tx *sql.Tx) (GatewayRebindStartupSnapshot, error) {
+func (r *Repository) readGatewayRebindStartupSnapshot(ctx context.Context, tx gatewayRebindReadQuery) (GatewayRebindStartupSnapshot, error) {
 	current, err := readGatewayUpgradeStartupHead(ctx, tx)
 	if err != nil {
 		return GatewayRebindStartupSnapshot{}, err
@@ -98,7 +98,7 @@ func (r *Repository) readGatewayRebindStartupSnapshot(ctx context.Context, tx *s
 	return result, nil
 }
 
-func readGatewayRebindStartupClaim(ctx context.Context, tx *sql.Tx, operationID string, current *GatewayProfileRevision) (GatewayRebindStartupClaim, error) {
+func readGatewayRebindStartupClaim(ctx context.Context, tx gatewayRebindReadQuery, operationID string, current *GatewayProfileRevision) (GatewayRebindStartupClaim, error) {
 	claim, err := readGatewayRebindClaim(ctx, tx, operationID)
 	if err != nil {
 		return GatewayRebindStartupClaim{}, err
@@ -289,7 +289,7 @@ func gatewayRebindClaimRequestDigest(spec GatewayRebindSpec, rebind, configure A
 	}{Spec: spec, Rebind: rebind, Configure: configure})
 }
 
-func readGatewayRebindRoster(ctx context.Context, tx *sql.Tx, operationID string) ([]GatewayRebindRosterEntry, error) {
+func readGatewayRebindRoster(ctx context.Context, tx gatewayRebindQuiescenceQuerier, operationID string) ([]GatewayRebindRosterEntry, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT ordinal,app_id,allocation_id,allocated_port,
 		allocation_owner_operation_id,allocation_state,access_revision_id,access_revision_number,
 		access_spec_digest,grant_attempt_id,grant_state_sequence,grant_protected_state_digest,
@@ -314,7 +314,7 @@ func readGatewayRebindRoster(ctx context.Context, tx *sql.Tx, operationID string
 	return result, rows.Err()
 }
 
-func validateGatewayRebindRosterEntry(ctx context.Context, tx *sql.Tx, claim GatewayRebindClaim,
+func validateGatewayRebindRosterEntry(ctx context.Context, tx gatewayRebindReadQuery, claim GatewayRebindClaim,
 	entry GatewayRebindRosterEntry,
 ) (GatewayRebindStartupGrantBinding, error) {
 	entryDigest, err := GatewayRebindRosterEntryDigest(entry)
