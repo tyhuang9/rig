@@ -32,9 +32,13 @@ type gatewayRebindStageContainerObservation struct {
 }
 
 type gatewayRebindStageContainerDriver interface {
+	gatewayRebindStageContainerAttestor
+	create(context.Context, gatewayRebindProtectedIntent, gatewayRebindStageIntent) (string, error)
+}
+
+type gatewayRebindStageContainerAttestor interface {
 	inspect(context.Context, gatewayRebindProtectedIntent) (gatewayRebindStageContainerObservation, error)
 	inspectImage(context.Context) (imageInspection, bool, error)
-	create(context.Context, gatewayRebindProtectedIntent, gatewayRebindStageIntent) (string, error)
 }
 
 type managerGatewayRebindStageContainerDriver struct{ manager *Manager }
@@ -158,6 +162,7 @@ func gatewayRebindStageContainerConfigurationDigest(intent gatewayRebindProtecte
 	stage gatewayRebindStageIntent,
 ) (string, error) {
 	stage.StageContainer = nil
+	stage.StageConfigIntent = nil
 	args, err := gatewayRebindStageContainerCreateArgs(intent, stage)
 	if err != nil {
 		return "", errors.New("invalid generated ingress rebind stage container configuration input")
@@ -463,7 +468,7 @@ func (m *Manager) stageGatewayRebindSuccessorContainerWithDriver(ctx context.Con
 
 func (m *Manager) attestGatewayRebindStageContainerLocked(ctx context.Context,
 	repository *appaccess.Repository, reads gatewayRebindSuccessorPreflightReads,
-	inspectDocker gatewayRebindDockerInspector, driver gatewayRebindStageContainerDriver,
+	inspectDocker gatewayRebindDockerInspector, driver gatewayRebindStageContainerAttestor,
 	intent gatewayRebindProtectedIntent, stage gatewayRebindStageIntent,
 	binding *gatewayRebindStageContainerBinding, progressCount uint64,
 ) error {
@@ -490,7 +495,7 @@ func (m *Manager) attestGatewayRebindStageContainerLocked(ctx context.Context,
 
 func (m *Manager) readGatewayRebindStageContainerAttestation(ctx context.Context,
 	repository *appaccess.Repository, reads gatewayRebindSuccessorPreflightReads,
-	inspectDocker gatewayRebindDockerInspector, driver gatewayRebindStageContainerDriver,
+	inspectDocker gatewayRebindDockerInspector, driver gatewayRebindStageContainerAttestor,
 	intent gatewayRebindProtectedIntent, stage gatewayRebindStageIntent,
 	binding *gatewayRebindStageContainerBinding, progressCount uint64,
 ) (gatewayRebindStageContainerAttestation, error) {
@@ -537,7 +542,7 @@ func (m *Manager) readGatewayRebindStageContainerAttestation(ctx context.Context
 }
 
 func attestGatewayRebindStageContainerImageOnce(ctx context.Context,
-	driver gatewayRebindStageContainerDriver, intent gatewayRebindProtectedIntent,
+	driver gatewayRebindStageContainerAttestor, intent gatewayRebindProtectedIntent,
 	stage gatewayRebindStageIntent,
 ) error {
 	if ctx.Err() != nil || stage.NetworkTopologyDigest != intent.NetworkObservationDigest ||
@@ -553,7 +558,7 @@ func attestGatewayRebindStageContainerImageOnce(ctx context.Context,
 }
 
 func readGatewayRebindStageContainerPhysicalObservation(ctx context.Context,
-	reads gatewayRebindSuccessorPreflightReads, driver gatewayRebindStageContainerDriver,
+	reads gatewayRebindSuccessorPreflightReads, driver gatewayRebindStageContainerAttestor,
 	intent gatewayRebindProtectedIntent, stage gatewayRebindStageIntent,
 	binding *gatewayRebindStageContainerBinding,
 ) (gatewayRebindStageContainerAttestation, error) {

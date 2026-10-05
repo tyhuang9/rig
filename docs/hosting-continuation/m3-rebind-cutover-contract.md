@@ -309,6 +309,21 @@ identity was not durably bound remains fenced for separately reviewed recovery;
 its resource name alone never permits adoption or cleanup.
 No serving container, terminal phase, or receipt is installed by this format.
 
+The next protected record, sequence seven, is a create-only stage-config
+intent. It must pin deterministic probe-and-404-only successor Caddy bytes by
+raw content digest and length, the exact `/config/stage.json` destination, the
+sequence-six stopped container and config-volume bindings, and the prepared
+claim's protected predecessor. A guarded writer must reattest the exact
+sequence-six physical state and prove the stopped container's config directory
+empty from a complete, bounded Docker archive before recording this intent.
+An unreadable or ambiguous directory is not evidence of emptiness. Sequence
+seven authorizes no Docker copy, container start, public listener, route
+change, or SQLite write;
+the subsequent copy and its readback require a separate guarded effect and
+receipt. The sequence-seven config bytes and probe token are an immutable v1
+format. A future format change must preserve v1 regeneration for existing
+history and introduce an explicit version before writing new records.
+
 The implementation may reuse the existing generation filename conventions
 only if the scanner can distinguish an ordinary v1-to-v2 upgrade from a
 rebind-successor generation and validate the predecessor link. Treating a
