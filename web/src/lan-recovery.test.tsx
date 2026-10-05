@@ -162,7 +162,7 @@ describe("authenticated operator mode gate", () => {
     render(<QueryClientProvider client={client}><AuthenticatedOperatorGate onSignOut={onSignOut}><div>Normal operator routes</div></AuthenticatedOperatorGate></QueryClientProvider>);
 
     const heading = await screen.findByRole("heading", { name: "System status unavailable" });
-    expect(document.activeElement).toBe(heading);
+    await waitFor(() => expect(document.activeElement).toBe(heading));
     expect(screen.queryByText("Normal operator routes")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(await screen.findByText("Normal operator routes")).not.toBeNull();
