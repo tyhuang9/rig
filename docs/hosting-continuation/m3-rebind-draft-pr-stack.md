@@ -4,15 +4,16 @@ Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
 draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
 published branch targets its preceding branch with one review scope. Rows
 26–37 remain local and require separate publication approval; they have
-inherited the row-25 evidence head `f1707e9` through additive merges. The
+inherited the row-25 CI-budget head `6023a0f` through additive merges. The
 first four hosted row-25 network Docker attempts failed; the fifth and sixth
 passed the required live network-stage test and residue gate at `ad8d3e2` and
 `f91140c`. A later replay parity assertion failed at `a5b4d10`. The corrected
-hosted job passed the named test and residue gate at `fd68ab8`; its evidence
-was committed at `f1707e9`. This is network-stage acceptance on hosted Linux
-at the tested code head. The later volume, container, config, and start Docker
-gates remain unrun on hosted Linux. No draft publication authorizes merge or
-deployment.
+hosted job passed the named test and residue gate at `fd68ab8`; the same gate
+also passed at evidence head `f1707e9`. This is network-stage acceptance on
+hosted Linux at those tested heads. Head `6023a0f` changes only CI budgets and
+evidence; its hosted reruns remain pending. The later volume, container,
+config, and start Docker gates remain unrun on hosted Linux. No draft
+publication authorizes merge or deployment.
 
 | Order | Branch | Scope commit | Review scope |
 | --- | --- | --- | --- |
@@ -70,8 +71,12 @@ and its always-run residue step passed. This establishes the private network
 stage on that hosted runner.
 The [corrected hosted network-stage job](https://github.com/tyhuang9/rig/actions/runs/37264835255/job/111619317032)
 passed the named test in 51.70 seconds and its always-run cleanup at `fd68ab8`.
-The expanded-budget race package passed at `a5b4d10` in 1116.225 seconds;
-race verification at the corrected and evidence-only heads remains pending.
+The [evidence-head job](https://github.com/tyhuang9/rig/actions/runs/37265095730/job/111620115206)
+also passed both in 46.06 seconds at `f1707e9`. The race package passed at
+`a5b4d10` in 1116.225 seconds, then timed out at the 24-minute Go limit on
+`f1707e9` without a race report. The parent repository-wide race job was
+cancelled at its 60-minute job ceiling. CI budgets are now expanded without
+changing test coverage; hosted race verification at `6023a0f` remains open.
 Rows 26 and 27 passed their final-source Go suites,
 vet, builds, and relevant focused checks before this network-route correction
 was integrated. Row 28 passed its original final-source Go suite, vet, build,
