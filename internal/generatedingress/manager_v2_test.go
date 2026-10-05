@@ -69,6 +69,17 @@ func TestCommittedV2LANConfigFilenamesReachExactContainer(t *testing.T) {
 	}
 }
 
+func TestGatewayV2StageConfigFilenameUsesGuardedV2CopyAllowlist(t *testing.T) {
+	if !validGatewayV2ConfigFilename(gatewayV2StageConfigFilename) {
+		t.Fatal("fixed stage config filename was rejected by the guarded v2 copy path")
+	}
+	for _, filename := range []string{"stage-2.json", "./stage.json", "stage.json/.."} {
+		if validGatewayV2ConfigFilename(filename) {
+			t.Fatalf("unlisted stage config filename %q was accepted", filename)
+		}
+	}
+}
+
 func (r *committedV2Runner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
 	args := append([]string(nil), request.Args...)
 	r.commands = append(r.commands, args)

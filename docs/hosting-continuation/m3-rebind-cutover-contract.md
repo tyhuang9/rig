@@ -324,6 +324,17 @@ receipt. The sequence-seven config bytes and probe token are an immutable v1
 format. A future format change must preserve v1 regeneration for existing
 history and introduce an explicit version before writing new records.
 
+The subsequent sequence-eight protected receipt may bind the exact observed
+stage-config file only after a guarded Docker copy and byte-for-byte readback,
+or after a fresh read-only observation proves that the file already matches
+the sequence-seven intent following an uncertain prior copy. The writer must
+prove the stopped container and all pinned physical and protected state under
+the deployment-effects lease and gateway lock before and after the effect.
+Only a strictly empty `/config` permits the copy. Any other content, unreadable
+archive, uncertain copy, or failed readback leaves the sequence-seven history
+and the gateway fences in place; no mismatched file is overwritten. Sequence
+eight does not start the container, publish a route, or transition SQLite.
+
 The implementation may reuse the existing generation filename conventions
 only if the scanner can distinguish an ordinary v1-to-v2 upgrade from a
 rebind-successor generation and validate the predecessor link. Treating a

@@ -2,12 +2,10 @@ package generatedingress
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"io"
 	"net"
 	"reflect"
 	"strconv"
@@ -64,39 +62,9 @@ func (d managerGatewayRebindStageConfigIntentDriver) configVolumeEmpty(ctx conte
 // exact empty caddy/ directory from the pinned image. Unexpected files, links,
 // metadata entries, malformed archives, and truncated command output fail closed.
 func gatewayRebindExactEmptyConfigVolumeArchive(value []byte) error {
-	const tarBlockSize = 512
-	if len(value) < 3*tarBlockSize || len(value) > defaultOutputLimit || len(value)%tarBlockSize != 0 {
-		return errors.New("generated ingress rebind config volume archive is invalid")
-	}
-	source := bytes.NewReader(value)
-	reader := tar.NewReader(source)
-	header, err := reader.Next()
-	if err != nil || header == nil || len(value)-source.Len() != tarBlockSize ||
-		header.Typeflag != tar.TypeDir || header.Size != 0 || header.Linkname != "" ||
-		(header.Name != "." && header.Name != "./") {
+	inventory, err := gatewayRebindExactStageConfigVolumeArchive(value, nil)
+	if err != nil || inventory != gatewayRebindStageConfigInventoryEmpty {
 		return errors.New("generated ingress rebind config volume archive is not empty")
-	}
-	offset := tarBlockSize
-	header, err = reader.Next()
-	if err != io.EOF {
-		if err != nil || len(value)-source.Len() != 2*tarBlockSize || !validGatewayRebindPinnedImageConfigDirectory(header) {
-			return errors.New("generated ingress rebind config volume archive has unexpected entries")
-		}
-		offset += tarBlockSize
-		_, err = reader.Next()
-	}
-	if err != io.EOF {
-		return errors.New("generated ingress rebind config volume archive has unexpected entries")
-	}
-	// Preserve two complete zero end blocks and reject hidden metadata records,
-	// incomplete trailers and all data after the explicitly permitted headers.
-	if len(value) < offset+2*tarBlockSize {
-		return errors.New("generated ingress rebind config volume archive is truncated")
-	}
-	for _, value := range value[offset:] {
-		if value != 0 {
-			return errors.New("generated ingress rebind config volume archive has trailing data")
-		}
 	}
 	return nil
 }
