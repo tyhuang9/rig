@@ -2,7 +2,9 @@
 
 Date: 2026-10-04
 
-Base: `feature/hosting-m3-rebind-stage-start` at `b455d42` when implementation began; current parent head `0133e28`, including the corrected row-25 ancestor, was merged additively before integrated verification.
+Base: `feature/hosting-m3-rebind-stage-start` at `b455d42` when implementation
+began. The row-25 Linux route correction and passing network-gate evidence
+were merged additively through rows 26–36, then into this branch at `6305bdc`.
 
 Branch: `feature/hosting-m3-rebind-stage-start-docker-gate` (local and unpublished)
 
@@ -39,16 +41,18 @@ SQLite, cut over a route, provision a database, merge, or deploy.
 
 | Check | Result |
 | --- | --- |
-| Live-tag compile | Passed on integrated head `6c24322`: `go test -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress`. |
+| Live-tag compile | Passed on post-route-integration head `6305bdc`: `go test -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress`; the physical tests did not run. |
 | Named test discovery | Passed: `go test -count=1 -run '^TestLiveGatewayRebindSuccessorStageStart(LostAcknowledgmentAdopts|ProofFailureWithdraws)?$' -v ./internal/generatedingress`; all three were discovered and explicitly skipped without the Docker opt-in. This is not physical acceptance. |
 | Focused stage-start unit tests | Passed after the QA correction: `go test -p=1 -count=1 -timeout=10m -run '^TestGatewayRebindStageStart' ./internal/generatedingress` (`205.641s`). |
 | Workflow YAML | Passed with a temporary checker using the repository's `gopkg.in/yaml.v3` dependency; the `rebind-stage-start-live` job parsed and was present. Temporary checker removed. |
 | Physical Docker journeys | Not run locally. Docker CLI is installed, but the Windows host has no running Docker Engine. Hosted Linux Docker acceptance has not run. |
+| Prerequisite network-stage hosted gate | PASS at code head `ad8d3e2`: [required Docker test and residue job 111606812391](https://github.com/tyhuang9/rig/actions/runs/37260595415/job/111606812391). The current PR #122 evidence-only head `f91140c` also passed its [required Docker test and residue job 111608189048](https://github.com/tyhuang9/rig/actions/runs/37261058988/job/111608189048). These jobs establish only the private network effect, not this stage-start gate. |
 | Generated-ingress package tests | Passed: `go test -p=1 -count=1 -timeout=20m ./internal/generatedingress` (`648.529s`). This run began before a small assertion was added to the live test, which skips locally; final-source live-tag compilation and named-test discovery passed afterward. |
-| Vet and build | Passed on integrated head `6c24322`: `go vet ./...` and `go build -buildvcs=false ./...`. |
-| Documentation build | Passed on integrated head `6c24322`: `pnpm --dir docs build` with normal Windows filesystem access. The restricted sandbox attempt could not read an installed Vite package; the lockfile install itself was unchanged. |
-| Full Go suite | Passed on integrated head `6c24322` after the row-25 correction and QA change: `go test -p=1 -count=1 -timeout=20m ./...` (`internal/generatedingress` 630.723s). The first restricted-sandbox attempt failed on local Go-cache/private-directory access before it established a code result. This does not exercise the three physical Docker journeys. |
-| Formatting and diff | Changed Go files have no `gofmt -l` output; `git diff --check feature/hosting-m3-rebind-stage-start..HEAD` passed. |
+| Vet and build | Passed on post-route-integration head `6305bdc`: `go vet ./...` and `go build -buildvcs=false ./...`. |
+| Documentation build | Passed on post-route-integration source: `pnpm --dir docs build` with normal Windows filesystem access. The restricted sandbox attempt on the earlier source could not read an installed Vite package; the lockfile install itself was unchanged. |
+| Earlier full Go suite | Passed on pre-route-correction head `6c24322`: `go test -p=1 -count=1 -timeout=20m ./...` (`internal/generatedingress` 630.723s). The first restricted-sandbox attempt failed on local Go-cache/private-directory access before it established a code result. This earlier pass does not verify the newly integrated Linux route matcher. |
+| Post-route-integration full Go suite | PASS on code head `6305bdc` with the corrected row-25 ancestor: `go test -p=1 -count=1 -timeout=20m ./...` passed every package; `internal/generatedingress` completed in 629.512s. This is local fake/passive and unit evidence, not the three physical Docker journeys. |
+| Formatting and diff | The original row-37 changed Go files had no `gofmt -l` output. On the post-route-integration branch, `git diff --check 1e2bcd6..HEAD` and the final working-tree `git diff --check` passed. The route-correction Go files were gofmt-checked in row 25 before integration. |
 
 ## Remaining gates and rollback
 

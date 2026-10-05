@@ -2,13 +2,15 @@
 
 Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
 draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
-row's branch descends from the preceding row's branch and targets it with one
-review scope. Rows 26–37 remain local and require separate publication
-approval. The first three hosted row-25 network Docker attempts failed; the
-third identified a host-route delta mismatch after exact network creation.
-PR #122's failure-only route diagnostic is queued. Rows 26–37 have not yet
-inherited that diagnostic update, and no hosted network-stage acceptance is
-claimed. No draft publication authorizes merge or deployment.
+published branch targets its preceding branch with one review scope. Rows
+26–37 remain local and require separate publication approval; they have
+inherited the corrected row-25 head `f91140c` through additive merges. The
+first four hosted row-25 network Docker attempts failed. The fifth and sixth
+passed the required live network-stage test and residue gate at code head
+`ad8d3e2` and current evidence-only head `f91140c`, respectively. This is
+network-stage acceptance on hosted Linux. The later volume, container, config,
+and start Docker gates remain unrun on hosted Linux. No draft publication
+authorizes merge or deployment.
 
 | Order | Branch | Scope commit | Review scope |
 | --- | --- | --- | --- |
@@ -70,12 +72,23 @@ and Docker-tagged compile. Row 27's live test compiled and skipped locally;
 its hosted Docker acceptance remains open. Row 29 passed its original
 final-source Go suite, vet, build, and Docker-tagged compile; its live test
 compiled and skipped locally. Its hosted Docker acceptance remains open.
-Row 30 passed its original final-source Go suite, vet, build, Docker-tagged compile, focused progress and stage-container tests, formatting, and diff checks. Its hosted stopped-container Docker gate remains open.
-Row 31 passed its original final-source Go suite, vet, build, Docker-tagged compile, formatting, and diff checks. Its live test compiled and skipped locally; hosted Docker acceptance remains open.
-Row 34 passed its original serialized full Go suite, vet, build, Docker-tagged compile, and focused copy tests. Its two live tests compiled and skipped locally; hosted Docker acceptance remains open.
-Row 35 passed its original focused intent tests, serialized full Go suite, vet, build, and Docker-tagged compile. It records start intent without starting Docker or publishing a listener.
-Row 36 adds guarded sequence-ten serving proof with direct-start, lost-acknowledgment, replay, drift, and compensation tests. Its scoped evidence records local checks; hosted Docker acceptance remains open.
-Row 37 adds three named hosted Docker tests and an always-run exact-resource residue scan. Its live tests compiled and skipped locally; physical Linux Docker acceptance remains pending publication.
+Row 30 passed its original final-source Go suite, vet, build, Docker-tagged
+compile, focused progress and stage-container tests, formatting, and diff
+checks. Row 31 passed its original final-source Go suite, vet, build,
+Docker-tagged compile, formatting, and diff checks; its live test compiled and
+skipped locally. The stopped-container hosted gate remains open. Rows 32 and
+33 passed their original final-source Go suites, vet, build, Docker-tagged
+compile, and focused intent/copy tests. Row 34 passed its original serialized
+full Go suite, vet, build, Docker-tagged compile, and focused copy tests. Its
+two live tests compiled and skipped locally; hosted Docker acceptance remains
+open. Row 35 passed its original focused intent tests, serialized full Go
+suite, vet, build, and Docker-tagged compile. It records start intent without
+starting Docker or publishing a listener. Row 36 adds guarded sequence-ten
+serving proof with direct-start, lost-acknowledgment, replay, drift, and
+compensation tests; its scoped evidence records local checks. Row 37 adds
+three named hosted Docker tests and an always-run exact-resource residue scan.
+Its live tests compiled and skipped locally; physical Linux Docker acceptance
+remains pending publication.
 
 These branches do not add a public rebind controller caller, terminal protected
 receipt, successor cutover, transfer-aware readers, recovery, or fence release.
