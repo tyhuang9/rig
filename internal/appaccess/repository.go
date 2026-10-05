@@ -3,6 +3,7 @@ package appaccess
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -787,13 +788,30 @@ func (tx *immediateTransaction) Rollback() error {
 	if tx == nil || tx.Conn == nil || tx.done {
 		return nil
 	}
-	_, rollbackErr := tx.ExecContext(context.Background(), `ROLLBACK`)
+	return tx.rollbackWith(tx.ExecContext)
+}
+
+func (tx *immediateTransaction) rollbackWith(exec func(context.Context, string, ...any) (sql.Result, error)) error {
+	if tx == nil || tx.Conn == nil || tx.done {
+		return nil
+	}
+	_, rollbackErr := exec(context.Background(), `ROLLBACK`)
 	tx.done = true
-	closeErr := tx.Conn.Close()
 	if rollbackErr != nil {
+		// A failed SQL ROLLBACK leaves the manually managed transaction in an
+		// unknown state. Raw's ErrBadConn path discards the driver connection
+		// instead of returning it to the pool. If discarding itself fails, keep
+		// the connection pinned rather than risk handing it to another caller.
+		discardErr := tx.Conn.Raw(func(any) error { return driver.ErrBadConn })
+		if !errors.Is(discardErr, driver.ErrBadConn) && !errors.Is(discardErr, sql.ErrConnDone) {
+			if discardErr == nil {
+				discardErr = errors.New("bad-connection signal was not returned")
+			}
+			return errors.Join(rollbackErr, fmt.Errorf("discard failed immediate-transaction connection: %w", discardErr))
+		}
 		return rollbackErr
 	}
-	return closeErr
+	return tx.Conn.Close()
 }
 
 func classifyImmediateTransactionError(err error) error {
