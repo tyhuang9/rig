@@ -70,9 +70,10 @@ this slice does not include a claim writer.
 The Windows host has CGO disabled, so no local race run is available. Linux
 lock code was cross-compiled but not run on Linux.
 Live Docker and physical second-device acceptance have not run for this
-branch. `docker info --format '{{.ServerVersion}}'` failed because the local
-Docker daemon pipe was absent; sandbox access to the local Docker config was
-also denied. Hosted CI has not run because this branch is unpublished. A separate
+branch. The local `docker info --format` server-version check failed because
+the Docker daemon pipe was absent; sandbox access to the local Docker config
+was also denied. The branch was later published as draft PR #100; no hosted
+Docker acceptance is claimed here. A separate
 same-user process with write access to the private working directory could
 replace a Unix advisory-lock pathname; the current trust boundary assumes
 private controller directory ownership and no hostile process under that user.
