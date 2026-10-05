@@ -22,6 +22,7 @@ import (
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	"github.com/hostd/hostd/internal/runtime/docker"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 	"github.com/hostd/hostd/internal/runtimeexecutor"
 	"github.com/hostd/hostd/internal/sourceconnections"
@@ -103,6 +104,32 @@ func TestRuntimeCompositionEnablementAndRouterSelection(t *testing.T) {
 func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) {
 	fixture := newRuntimeCompositionFixture(t)
 	fixture.configuration.GeneratedRuntime = true
+	directories, err := docker.PrepareControllerDirectories(fixture.configuration.DataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admit, err := deploymentEffectsAdmission(fixture.db, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseStartupAdmission, err := admit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = releaseStartupAdmission() })
+	assertStartupAdmissionHeld := func(stage string) {
+		t.Helper()
+		probeContext, cancelProbe := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		probeRelease, probeErr := admit(probeContext)
+		cancelProbe()
+		if probeRelease != nil {
+			_ = probeRelease()
+			t.Fatalf("%s acquired a nested deployment effects lease", stage)
+		}
+		if !errors.Is(probeErr, context.DeadlineExceeded) {
+			t.Fatalf("%s deployment effects lease probe error = %v", stage, probeErr)
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var calls []string
@@ -116,6 +143,7 @@ func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) 
 			if recoveryContext.Err() != nil {
 				t.Fatalf("ingress recovery inherited cancellation: %v", recoveryContext.Err())
 			}
+			assertStartupAdmissionHeld("ingress recovery")
 			return nil
 		},
 	})
@@ -127,16 +155,30 @@ func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) 
 			if recoveryContext.Err() != nil {
 				t.Fatalf("deployment recovery inherited cancellation: %v", recoveryContext.Err())
 			}
+			assertStartupAdmissionHeld("deployment recovery")
 			calls = append(calls, "deployments_recover")
 			return nil
 		},
 		jobs: func() error {
+			assertStartupAdmissionHeld("job recovery")
 			calls = append(calls, "jobs_recover")
 			return nil
 		},
+		releaseAdmission: releaseStartupAdmission,
 	}, composition.executor, func(workerContext context.Context, _ jobs.Executor) error {
 		if workerContext != ctx {
 			t.Fatal("worker did not receive original context")
+		}
+		workerAdmissionContext, cancelWorkerAdmission := context.WithTimeout(context.Background(), time.Second)
+		workerRelease, workerAdmissionErr := admit(workerAdmissionContext)
+		cancelWorkerAdmission()
+		if workerAdmissionErr != nil {
+			t.Errorf("worker could not acquire released startup admission: %v", workerAdmissionErr)
+			return nil
+		}
+		if err := workerRelease(); err != nil {
+			t.Errorf("worker admission release failed: %v", err)
+			return nil
 		}
 		calls = append(calls, "worker")
 		return nil

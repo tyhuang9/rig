@@ -1018,8 +1018,14 @@ func TestUnknownExecutorFailureIsRedacted(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, stop := context.WithCancel(context.Background())
-	defer stop()
-	go func() { _ = service.RunWorker(ctx, unsafeFailureExecutor{}) }()
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- service.RunWorker(ctx, unsafeFailureExecutor{}) }()
+	defer func() {
+		stop()
+		if err := <-workerDone; err != nil {
+			t.Errorf("worker failed: %v", err)
+		}
+	}()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		persisted, err := service.Get(job.ID)

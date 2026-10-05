@@ -93,6 +93,39 @@ func runServer(args []string) int {
 		return 1
 	}
 	defer db.Close()
+	var workerAdmission func(context.Context) (func() error, error)
+	var startupAdmission *deploymentEffectsStartupLease
+	if cfg.ComposeRuntime || cfg.GeneratedRuntime {
+		workerAdmission, err = deploymentEffectsAdmission(db, ownerDirectories.WorkingDirectory)
+		if err != nil {
+			logger.Error("deployment effects admission setup failed", "error", err)
+			emergencyStop()
+			return 1
+		}
+		admissionContext, cancelAdmission := context.WithTimeout(context.Background(), 30*time.Second)
+		releaseStartupAdmission, err := workerAdmission(admissionContext)
+		cancelAdmission()
+		if err != nil {
+			logger.Error("deployment effects startup admission failed", "error", err)
+			emergencyStop()
+			return 1
+		}
+		if releaseStartupAdmission == nil {
+			logger.Error("deployment effects startup admission returned no release")
+			emergencyStop()
+			return 1
+		}
+		startupAdmission = &deploymentEffectsStartupLease{release: releaseStartupAdmission}
+		defer func() {
+			if startupAdmission == nil || !startupAdmission.pending() {
+				return
+			}
+			if err := startupAdmission.Release(); err != nil {
+				logger.Error("deployment effects startup admission release failed", "error", err)
+				emergencyStop()
+			}
+		}()
+	}
 	rebindCheck := rebindFenceCheck(db)
 	gate, err := inspectGatewayStartup(context.Background(), cfg, db, dockerExecutable, ownerDirectories)
 	if err != nil {
@@ -142,6 +175,14 @@ func runServer(args []string) int {
 		return 1
 	}
 	if gate.recoveryKind != "" {
+		if startupAdmission != nil {
+			if err := startupAdmission.Release(); err != nil {
+				logger.Error("deployment effects startup admission release failed before recovery controller", "error", err)
+				emergencyStop()
+				return 1
+			}
+			startupAdmission = nil
+		}
 		logger.Warn("controller entering gateway recovery mode", "kind", gate.recoveryKind, "operation_id", gate.recoveryID)
 		return runRecoveryOnlyController(cfg, logger, listener, a, appaccess.New(db), gate, bootstrapCompleted)
 	}
@@ -239,29 +280,29 @@ func runServer(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	workerRun := j.RunWorker
-	var admission func(context.Context) (func() error, error)
-	if cfg.ComposeRuntime || cfg.GeneratedRuntime {
-		admission, err = deploymentEffectsAdmission(db, ownerDirectories.WorkingDirectory)
-		if err != nil {
-			logger.Error("deployment effects admission setup failed", "error", err)
-			return 1
-		}
+	if workerAdmission != nil {
 		workerRun = func(runContext context.Context, executor jobs.Executor) error {
-			return j.RunWorkerWithAdmission(runContext, executor, admission)
+			return j.RunWorkerWithAdmission(runContext, executor, workerAdmission)
 		}
 	}
+	var releaseStartupAdmission func() error
+	if startupAdmission != nil {
+		releaseStartupAdmission = startupAdmission.Release
+	}
 	workerDone, err := prepareRuntimeWorker(ctx, runtimeRecovery{
-		deployments: deploymentRepository.Recover,
-		jobs:        j.RecoverInterrupted,
-		admission:   admission,
+		deployments:      deploymentRepository.Recover,
+		jobs:             j.RecoverInterrupted,
+		releaseAdmission: releaseStartupAdmission,
 	}, runtime.executor, workerRun, func(err error) {
 		logger.Error("job worker stopped", "error", err)
 		stop()
 	})
 	if err != nil {
 		logger.Error("runtime recovery failed", "error", err)
+		emergencyStop()
 		return 1
 	}
+	startupAdmission = nil
 	autoDeployRepository := autodeploy.NewRepository(db)
 	var autoDeployPreflight autodeploy.DispatchPreflight
 	if cfg.GeneratedRuntime {
@@ -360,14 +401,44 @@ func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener 
 }
 
 type runtimeRecovery struct {
-	deployments func(context.Context) error
-	jobs        func() error
-	admission   func(context.Context) (func() error, error)
+	deployments      func(context.Context) error
+	jobs             func() error
+	releaseAdmission func() error
+}
+
+type deploymentEffectsStartupLease struct {
+	release   func() error
+	attempted bool
+	result    error
+}
+
+func (l *deploymentEffectsStartupLease) pending() bool {
+	return l != nil && l.release != nil && !l.attempted
+}
+
+func (l *deploymentEffectsStartupLease) Release() error {
+	if l == nil || l.release == nil {
+		return nil
+	}
+	if !l.attempted {
+		l.attempted = true
+		l.result = l.release()
+	}
+	return l.result
 }
 
 func prepareRuntimeWorker(ctx context.Context, recovery runtimeRecovery, executor jobs.Executor, run func(context.Context, jobs.Executor) error, reportFailure func(error)) (<-chan struct{}, error) {
-	if recovery.deployments == nil || recovery.jobs == nil {
-		return nil, errors.New("runtime recovery dependencies are required")
+	releaseAdmission := func() error {
+		if recovery.releaseAdmission == nil {
+			return nil
+		}
+		if err := recovery.releaseAdmission(); err != nil {
+			return fmt.Errorf("release runtime startup admission: %w", err)
+		}
+		return nil
+	}
+	if ctx == nil || recovery.deployments == nil || recovery.jobs == nil {
+		return nil, errors.Join(errors.New("runtime recovery dependencies are required"), releaseAdmission())
 	}
 	recoverState := func() error {
 		if err := recovery.deployments(context.WithoutCancel(ctx)); err != nil {
@@ -378,23 +449,10 @@ func prepareRuntimeWorker(ctx context.Context, recovery runtimeRecovery, executo
 		}
 		return nil
 	}
-	if recovery.admission != nil {
-		admissionContext, cancelAdmission := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		release, err := recovery.admission(admissionContext)
-		cancelAdmission()
-		if err != nil {
-			return nil, fmt.Errorf("admit runtime recovery: %w", err)
-		}
-		if release == nil {
-			return nil, errors.New("runtime recovery admission returned no release")
-		}
-		recoverErr := recoverState()
-		releaseErr := release()
-		if recoverErr != nil || releaseErr != nil {
-			return nil, errors.Join(recoverErr, releaseErr)
-		}
-	} else if err := recoverState(); err != nil {
-		return nil, err
+	recoverErr := recoverState()
+	releaseErr := releaseAdmission()
+	if recoverErr != nil || releaseErr != nil {
+		return nil, errors.Join(recoverErr, releaseErr)
 	}
 	done := make(chan struct{})
 	if executor == nil {
