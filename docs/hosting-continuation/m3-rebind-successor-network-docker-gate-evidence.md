@@ -145,7 +145,10 @@ timed out at the inherited 18-minute Go package limit, without a race report.
 The previous successful pre-correction generated-ingress race package had
 completed in 1074.037s, only 5.963s below that limit. The parent row-24 branch
 now raises the Go, step, and job budgets to 24, 26, and 35 minutes without
-removing test coverage. This correction has not yet passed hosted race CI.
+removing test coverage. The [expanded-budget race job 111614264166](https://github.com/tyhuang9/rig/actions/runs/37263115647/job/111614264166)
+then passed at head `a5b4d10`; `internal/generatedingress` took 1116.225s.
+This proves the same suite completed beyond the old 1080s limit. The
+late-parity-corrected head `fd68ab8` still requires its own hosted race result.
 
 ## Later hosted replay failure, 2026-10-05 UTC
 
@@ -160,17 +163,21 @@ drift. Mount order is therefore a plausible explanation, not a proved cause
 of this run. The live assertion now uses the existing comparison that validates
 both exact mounts and ignores only their order; all other fields still compare.
 A new failure-only predicate reports whether the later Docker read and exact
-predecessor validation succeeded. The corrected-head hosted
-replay and cleanup gate remain pending. This failed run does not revoke the
-two immutable passing jobs, and it is not acceptance for the new head. The
-always-run residue step passed on this failed run, so no managed resource was
-left on that runner.
+predecessor validation succeeded. The [corrected-head hosted network job
+111619317032](https://github.com/tyhuang9/rig/actions/runs/37264835255/job/111619317032)
+then passed at `fd68ab8`: `TestLiveGatewayRebindSuccessorNetworkStage` emitted
+a named pass event without a skip in 51.70s, and the always-run complete rebind
+network cleanup step passed. This establishes the exact private network stage
+at that head. The failed run remains immutable diagnostic evidence; its
+always-run residue step also passed, so no managed resource was left on that
+runner. The passing correction does not identify which combined predicate
+caused the earlier failure.
 
 ## Remaining work
 
 The config and data volumes, successor container, serving transition, route
 publication, terminal protected receipt, SQLite terminal transition,
-migration-035 fence release, public caller, hosted Linux race proof, physical
+migration-035 fence release, public caller, current-head hosted Linux race proof, physical
 second-device LAN proof, merge, and deployment remain open. The
 create-before-bind crash window remains unresolved and fenced; this gate does
 not claim automatic recovery from that window.
