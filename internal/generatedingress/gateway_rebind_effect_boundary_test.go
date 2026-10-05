@@ -238,6 +238,93 @@ func TestGatewayRebindEffectBoundaryAcceptsStoppedOwnedPredecessor(t *testing.T)
 	}
 }
 
+func TestGatewayRebindEffectBoundaryAcceptsAlternatingExactFinalMountOrder(t *testing.T) {
+	fixture := newGatewayRebindEffectBoundaryFixture(t)
+	reads := 0
+	inspect := func(_ context.Context, source routeState, state gatewayV2RouteState,
+		journal gatewayMigrationJournal,
+	) (gatewayV2DockerObservation, error) {
+		reads++
+		observation := gatewayRebindFixtureDockerObservation(t, fixture.predecessor)
+		if len(observation.FinalContainer.Mounts) != 2 {
+			t.Fatal("final container fixture lacks two exact mounts")
+		}
+		if reads%2 == 0 {
+			mounts := observation.FinalContainer.Mounts
+			mounts[0], mounts[1] = mounts[1], mounts[0]
+		}
+		if !validGatewayRebindPredecessorDocker(source, state, journal, observation) {
+			t.Fatalf("Docker observation %d is not individually valid", reads)
+		}
+		return observation, nil
+	}
+	evidence, err := fixture.predecessor.manager.attestGatewayRebindPreparedEffectBoundary(
+		context.Background(), fixture.predecessor.repository, fixture.reads, inspect, nil)
+	if err != nil || !validGatewayRebindEffectBoundaryEvidence(evidence) || reads != 2 {
+		t.Fatalf("alternating exact mount order evidence=%#v reads=%d error=%v", evidence, reads, err)
+	}
+}
+
+func TestGatewayRebindEffectBoundaryRejectsWrongMountAndOtherDockerDrift(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*gatewayV2DockerObservation)
+	}{
+		{name: "wrong mount", mutate: func(value *gatewayV2DockerObservation) {
+			value.FinalContainer.Mounts[0].Name = "different-volume"
+		}},
+		{name: "other observation field", mutate: func(value *gatewayV2DockerObservation) {
+			value.Final404Proven = !value.Final404Proven
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGatewayRebindEffectBoundaryFixture(t)
+			reads := 0
+			inspect := func(_ context.Context, _ routeState, _ gatewayV2RouteState,
+				_ gatewayMigrationJournal,
+			) (gatewayV2DockerObservation, error) {
+				reads++
+				observation := gatewayRebindFixtureDockerObservation(t, fixture.predecessor)
+				if reads == 2 {
+					test.mutate(&observation)
+				}
+				return observation, nil
+			}
+			assertGatewayRebindEffectBoundaryRejected(t, fixture, fixture.reads, inspect, nil)
+			if reads != 2 {
+				t.Fatalf("Docker reads=%d, want 2", reads)
+			}
+		})
+	}
+}
+
+func TestGatewayRebindEffectBoundaryDockerDigestRejectsUnvalidatedMountsAndPreservesOtherFields(t *testing.T) {
+	fixture := newGatewayRebindEffectBoundaryFixture(t)
+	first := gatewayRebindFixtureDockerObservation(t, fixture.predecessor)
+	second := gatewayRebindFixtureDockerObservation(t, fixture.predecessor)
+	identity := fixture.predecessor.state.Identity
+	second.FinalContainer.Mounts[0], second.FinalContainer.Mounts[1] =
+		second.FinalContainer.Mounts[1], second.FinalContainer.Mounts[0]
+	firstDigest, firstErr := gatewayRebindEffectBoundaryDockerDigest(first, identity)
+	secondDigest, secondErr := gatewayRebindEffectBoundaryDockerDigest(second, identity)
+	if firstErr != nil || secondErr != nil || firstDigest != secondDigest {
+		t.Fatalf("exact reordered mount digest: first=%q second=%q errors=(%v, %v)",
+			firstDigest, secondDigest, firstErr, secondErr)
+	}
+
+	second.Final404Proven = !second.Final404Proven
+	otherDigest, err := gatewayRebindEffectBoundaryDockerDigest(second, identity)
+	if err != nil || otherDigest == firstDigest {
+		t.Fatalf("non-mount drift digest=%q first=%q error=%v", otherDigest, firstDigest, err)
+	}
+
+	second = gatewayRebindFixtureDockerObservation(t, fixture.predecessor)
+	second.FinalContainer.Mounts[0].Name = "different-volume"
+	if digest, err := gatewayRebindEffectBoundaryDockerDigest(second, identity); err == nil || digest != "" {
+		t.Fatalf("wrong mount digest=%q error=%v", digest, err)
+	}
+}
+
 func TestGatewayRebindEffectBoundaryAttestsExactTwoAppRoster(t *testing.T) {
 	fixture := newGatewayRebindEffectBoundaryTwoAppFixture(t)
 	evidence, err := fixture.predecessor.manager.attestGatewayRebindPreparedEffectBoundary(

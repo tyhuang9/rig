@@ -177,7 +177,7 @@ func (m *Manager) readGatewayRebindEffectBoundaryObservation(ctx context.Context
 		clearGatewayV2DockerObservation(&docker)
 		return gatewayRebindEffectBoundaryObservation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
-	dockerDigest, err := canonicalDigest(docker)
+	dockerDigest, err := gatewayRebindEffectBoundaryDockerDigest(docker, anchor.predecessor.State.Identity)
 	if err != nil {
 		clearGatewayV2DockerObservation(&docker)
 		return gatewayRebindEffectBoundaryObservation{}, gatewayRebindEffectBoundaryError(ctx)
@@ -283,10 +283,24 @@ func gatewayRebindEffectBoundaryObservationsEqual(left, right gatewayRebindEffec
 	return reflect.DeepEqual(left.database, right.database) &&
 		gatewayRebindGenerationSelectionEqual(left.predecessor, right.predecessor) &&
 		reflect.DeepEqual(left.intent, right.intent) && reflect.DeepEqual(left.source, right.source) &&
-		reflect.DeepEqual(left.docker, right.docker) && reflect.DeepEqual(left.successor, right.successor) &&
+		reflect.DeepEqual(left.successor, right.successor) &&
 		left.databaseDigest == right.databaseDigest && left.sourceDigest == right.sourceDigest &&
 		left.dockerDigest == right.dockerDigest && left.progressCount == right.progressCount &&
 		left.progressDigest == right.progressDigest
+}
+
+// Docker may return the exact two final-container mounts in either order.
+// Independently validate that slice against the protected predecessor
+// identity before excluding only it from the digest used to compare the two
+// otherwise complete observations.
+func gatewayRebindEffectBoundaryDockerDigest(value gatewayV2DockerObservation,
+	identity gatewayV2Identity,
+) (string, error) {
+	if !validGatewayV2Mounts(value.FinalContainer.Mounts, identity) {
+		return "", errors.New("invalid generated ingress rebind predecessor Docker mounts")
+	}
+	value.FinalContainer.Mounts = nil
+	return canonicalDigest(value)
 }
 
 func gatewayRebindGenerationSelectionEqual(left, right gatewayUpgradeGenerationSelection) bool {
