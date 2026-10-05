@@ -13,10 +13,21 @@ also passed at evidence head `f1707e9`. This is network-stage acceptance on
 hosted Linux at those tested heads. At `6023a0f`, the network-stage Docker gate
 and repository-wide Linux race passed, but the dedicated ingress race job hit
 its 32-minute timeout. Head `9ad7f78` partitions that race job without removing
-tests. Its fast check, network-stage gate, and gateway-v2 race batch passed;
-the other race batches and aggregate are pending. The later volume, container,
+tests. Its fast check, network-stage gate, all three dedicated race batches
+and stable aggregate passed. The separate repository-wide race job also
+passed at 2026-10-05 17:34:51 UTC. The later volume, container,
 config, and start Docker gates remain unrun on hosted Linux. No draft
 publication authorizes merge or deployment.
+
+Rechecked on 2026-10-05: all 25 PRs remain open drafts, every PR after #98
+targets the preceding branch, and all 25 are attached to the implementation
+chat. No branch in this stack has been merged by this work.
+
+The additional local branch `feature/hosting-m3-rebind-final-config-intent`
+implements the complete successor application config plan and protected
+sequence-eleven intent on row 37 at `020196d`. Its focused checks, full Go
+suite, vet, build, Docker-tag compilation and source review passed. It requires separate publication
+approval and is not included in the pending rows 26–37 request.
 
 | Order | Branch | Scope commit | Review scope |
 | --- | --- | --- | --- |
@@ -57,6 +68,32 @@ publication authorizes merge or deployment.
 | 35 | `feature/hosting-m3-rebind-stage-start-intent` | `3dfee6b` | Protected sequence-nine exact start intent; no Docker start or listener effect |
 | 36 | `feature/hosting-m3-rebind-stage-start` | `b455d42` | Guarded exact successor start and protected sequence-ten serving proof; local only |
 | 37 | `feature/hosting-m3-rebind-stage-start-docker-gate` | `6a83056` | Required hosted Docker direct start, lost-acknowledgment adoption, compensation, and residue gates; local only |
+| 38 | `feature/hosting-m3-rebind-final-config-intent` | `020196d` | Complete successor application config plan and protected sequence-eleven intent; local only |
+
+## Verified local ancestry
+
+On 2026-10-05, `git merge-base --is-ancestor` passed for every consecutive
+pair from row 25 through row 38. The integrated local heads below include
+the additive ancestor corrections. Row 38's documentation may advance after
+its code verification; `020196d` identifies its implementation.
+
+| Row | Integrated local head |
+| --- | --- |
+| 26 | `dfa7f4d4018d7359e3d6c22a01af552381b9ba4c` |
+| 27 | `7cb3fd556cbdef8a72b4d1a85e90461bbd257260` |
+| 28 | `d3aef3d52cb7187e991f72ebcfc0b4ec0943956b` |
+| 29 | `d7ce0c6a2d78507cc4cefb92517616a225590f25` |
+| 30 | `89c031e3013beaffed72438cedbc631a095b7369` |
+| 31 | `a077cebefe1afe2809cecdaae4b7875d48b865c3` |
+| 32 | `67b1cd580cfbcbe196c757cdd10a5e675a1adca1` |
+| 33 | `1b9bdf64283838c9642a2b7160d2ccd931d3f928` |
+| 34 | `a0fb9b49f6bcd2a816faa5ad7c8e3d8485b88107` |
+| 35 | `eaaff4e71affa07867f61d7d5ec6b39f541180e5` |
+| 36 | `b144f02f184735c1df6c1f8ff151ed7a3a5e962f` |
+| 37 | `98a716dd5f158335cee8c2e9ca3a0907364c4b8e` |
+| 38 | `020196dc0d1250de315713a97f1206bfce7ba2ce` |
+
+## Acceptance and remaining work
 
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
@@ -86,7 +123,9 @@ three-batch race matrix with a stable aggregate check, and a bounded wait for
 the frontend status-focus effect. Row 25 locally passed all 502 frontend
 tests, its production build, both ingress partitions (453 tests discovered
 and run exactly once), the other eight runtime packages, and docs build.
-The hosted checks on `9ad7f78` are running. These local branches remain
+The dedicated race matrix, stable aggregate and network-stage Docker gate
+passed on `9ad7f78`; the separate repository-wide race job also passed.
+These local branches remain
 unpublished pending separate authorization.
 Rows 26 and 27 passed their final-source Go suites,
 vet, builds, and relevant focused checks before this network-route correction

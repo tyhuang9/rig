@@ -211,7 +211,8 @@ an actual top-level test pass. Matrix failures do not cancel other batches.
 The existing `Generated runtime race verification` check name is retained
 as an aggregate that requires every batch to succeed. The full repository
 race job remains a separate check. YAML parsing, extracted Bash syntax, and
-workflow review passed locally; the partitioned hosted run remains required.
+workflow review passed locally; the subsequently completed hosted result is
+recorded below.
 
 Local partition validation used Go 1.27.0 on Windows and normal filesystem
 access. `go test -json -p=1 -count=1 -timeout=15m -run '^TestGatewayV2'
@@ -226,14 +227,44 @@ The Windows filesystem sandbox caused protected-path tests to fail; the same
 focused recovery and config-file tests passed outside that sandbox, as did
 both complete partitions. No runtime validation was relaxed. The docs build
 also passed with normal filesystem access. Local Go has `CGO_ENABLED=0`, so
-these are non-race results; the pinned Go 1.26.7 Linux race matrix must still
-pass on the published candidate.
+these are non-race results. The pinned Go 1.26.7 Linux race matrix result is
+recorded separately below.
+
+## Partitioned hosted acceptance at `9ad7f78`, 2026-10-05 UTC
+
+The [dedicated generated-runtime race workflow](https://github.com/tyhuang9/rig/actions/runs/37340186590)
+completed successfully at `9ad7f78e4f8136d06d5b2c848119834607d71aa9`.
+Its JSON logs establish these actual Linux results:
+
+| Batch | Result |
+| --- | --- |
+| Gateway v2 | 136 tests ran and passed, zero skips; package time 16.731s. |
+| Ingress remainder | 319 tests ran: 312 passed, seven existing environment-gated skips, zero failures; package time 1521.359s. |
+| Other runtime packages | All eight packages passed with race detection and no selection filter. |
+| Stable aggregate | `Generated runtime race verification` passed after all three batches succeeded. |
+
+The [network-stage Docker job](https://github.com/tyhuang9/rig/actions/runs/37340186539/job/111865003029)
+passed `TestLiveGatewayRebindSuccessorNetworkStage` without a skip in 45.97s
+and passed its always-run complete cleanup. Fast verification, Windows
+controller verification and controller process restart checks also passed.
+The separate [repository-wide PostgreSQL/Linux race job](https://github.com/tyhuang9/rig/actions/runs/37340186647/job/111865003820)
+also passed at the same head, completing at 2026-10-05 17:34:51 UTC. Both
+PostgreSQL checks passed. The full repository race step ran from 16:23:02 to
+17:34:48 UTC; `internal/generatedingress` passed in 2291.490s. The complete
+job log contained no failed test/package or data-race report. All reported
+PR checks were successful or intentionally skipped when rechecked after
+completion.
+
+The source revision remains unchanged while results are recorded in the PR
+description and descendant documentation. This proves the tested private
+network effect and dedicated race matrix, not later volume/container/config
+stages or physical LAN cutover.
 
 ## Remaining work
 
 The config and data volumes, successor container, serving transition, route
 publication, terminal protected receipt, SQLite terminal transition,
-migration-035 fence release, public caller, current-head hosted Linux race
-proof, physical second-device LAN proof, merge, and deployment remain open. The
+migration-035 fence release, public caller, physical second-device LAN proof,
+merge, and deployment remain open. The
 create-before-bind crash window remains unresolved and fenced; this gate does
 not claim automatic recovery from that window.
