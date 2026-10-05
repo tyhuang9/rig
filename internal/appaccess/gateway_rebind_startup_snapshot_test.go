@@ -29,9 +29,16 @@ func TestGatewayRebindStartupSnapshotAcceptsFreshDatabase(t *testing.T) {
 func TestGatewayRebindStartupSnapshotValidatesCompleteDormantLineage(t *testing.T) {
 	fixture := newGatewayRebindFixture(t, true)
 	snapshot, err := fixture.repository.GatewayRebindStartupSnapshot(context.Background())
+	wantBinding := GatewayRebindStartupGrantBinding{
+		AppID: fixture.grant.Spec.AppID, AttemptID: fixture.grant.AttemptID,
+		RequestDigest: fixture.grant.RequestDigest, ApprovedBy: fixture.grant.Spec.ApprovedBy,
+		GatewayOperationID: fixture.grant.Proof.GatewayOperationID,
+	}
 	if err != nil || snapshot.CurrentProfile == nil || snapshot.CurrentProfile.ID != fixture.profile.ID ||
 		len(snapshot.Claims) != 1 || snapshot.Claims[0].Claim.RequestDigest != fixture.claim.RequestDigest ||
 		len(snapshot.Claims[0].Roster) != 1 || snapshot.Claims[0].Roster[0] != fixture.entry ||
+		len(snapshot.Claims[0].GrantBindings) != len(snapshot.Claims[0].Roster) ||
+		snapshot.Claims[0].GrantBindings[0] != wantBinding ||
 		snapshot.Claims[0].PredecessorUpgrade.State != GatewayProfileUpgradeCommitted {
 		t.Fatalf("validated snapshot = %#v error=%v", snapshot, err)
 	}
@@ -106,6 +113,61 @@ func TestGatewayRebindStartupSnapshotRejectsIncompleteStaleAndCorruptLineage(t *
 		}
 		if _, err := fixture.repository.GatewayRebindStartupSnapshot(context.Background()); !errors.Is(err, ErrInvalidStoredState) {
 			t.Fatalf("corrupt access revision request digest error = %v", err)
+		}
+	})
+
+	t.Run("grant profile spec digest does not match predecessor", func(t *testing.T) {
+		fixture := newGatewayRebindFixture(t, true)
+		corrupt := fixture.grant
+		corrupt.Spec.GatewayProfileSpecDigest = strings.Repeat("9", 64)
+		requestDigest, err := appAccessGrantRequestDigest(ClaimAppAccessGrantInput{
+			AttemptID: corrupt.AttemptID, Spec: corrupt.Spec,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, trigger := range []string{
+			"lan_gateway_rebind_fence_grant_update",
+			"lan_app_access_grant_identity_immutable",
+		} {
+			if _, err := fixture.db.Exec(`DROP TRIGGER ` + trigger); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := fixture.db.Exec(`UPDATE lan_app_access_grant_claims
+			SET gateway_profile_spec_digest=?,request_digest=? WHERE attempt_id=?`,
+			corrupt.Spec.GatewayProfileSpecDigest, requestDigest, corrupt.AttemptID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.repository.GatewayRebindStartupSnapshot(context.Background()); !errors.Is(err, ErrInvalidStoredState) {
+			t.Fatalf("grant profile mismatch error = %v", err)
+		}
+	})
+
+	t.Run("grant proof operation does not match predecessor upgrade", func(t *testing.T) {
+		fixture := newGatewayRebindFixture(t, true)
+		for _, trigger := range []string{
+			"lan_gateway_rebind_fence_grant_update",
+			"lan_app_access_grant_state_transition",
+			"lan_app_access_grant_transition_event",
+			"lan_app_access_grant_event_immutable_update",
+		} {
+			if _, err := fixture.db.Exec(`DROP TRIGGER ` + trigger); err != nil {
+				t.Fatal(err)
+			}
+		}
+		wrongOperationID := uuid.NewString()
+		if _, err := fixture.db.Exec(`UPDATE lan_app_access_grant_claims
+			SET gateway_operation_id=? WHERE attempt_id=?`, wrongOperationID, fixture.grant.AttemptID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.Exec(`UPDATE lan_app_access_grant_claim_events
+			SET gateway_operation_id=? WHERE attempt_id=? AND sequence=?`,
+			wrongOperationID, fixture.grant.AttemptID, fixture.grant.StateSequence); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.repository.GatewayRebindStartupSnapshot(context.Background()); !errors.Is(err, ErrInvalidStoredState) {
+			t.Fatalf("grant proof operation mismatch error = %v", err)
 		}
 	})
 
@@ -214,6 +276,7 @@ type gatewayRebindFixture struct {
 	db         *sql.DB
 	repository *Repository
 	profile    GatewayProfileRevision
+	grant      AppAccessGrantClaim
 	claim      GatewayRebindClaim
 	entry      GatewayRebindRosterEntry
 }
@@ -258,8 +321,9 @@ func newGatewayRebindFixtureOnDB(t *testing.T, db *sql.DB, insertRoster bool) ga
 	if _, _, err := repository.AdvanceAppAccessGrantClaim(ctx, grantOwner, AppAccessGrantApplying, AppAccessGrantDBActive); err != nil {
 		t.Fatal(err)
 	}
+	upgradeInput := approvedGatewayUpgradeClaimInput(t, profile)
 	grantProof := AppAccessGrantProof{
-		GatewayOperationID:   uuid.NewString(),
+		GatewayOperationID:   upgradeInput.OperationID,
 		ProtectedStateDigest: strings.Repeat("a", 64),
 		ObservedAt:           testNow.Add(time.Second),
 	}
@@ -270,7 +334,7 @@ func newGatewayRebindFixtureOnDB(t *testing.T, db *sql.DB, insertRoster bool) ga
 	}
 	active := seedGatewayRebindActiveRuntime(t, db, appID)
 
-	upgrade, _, err := repository.ClaimGatewayProfileUpgrade(ctx, approvedGatewayUpgradeClaimInput(t, profile))
+	upgrade, _, err := repository.ClaimGatewayProfileUpgrade(ctx, upgradeInput)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +414,9 @@ func newGatewayRebindFixtureOnDB(t *testing.T, db *sql.DB, insertRoster bool) ga
 	if insertRoster {
 		insertGatewayRebindRosterEntry(t, db, entry)
 	}
-	return gatewayRebindFixture{db: db, repository: repository, profile: profile, claim: claim, entry: entry}
+	return gatewayRebindFixture{
+		db: db, repository: repository, profile: profile, grant: grant, claim: claim, entry: entry,
+	}
 }
 
 func seedGatewayRebindActiveRuntime(t *testing.T, db *sql.DB, appID string) generatedruntimestate.ActiveHead {
