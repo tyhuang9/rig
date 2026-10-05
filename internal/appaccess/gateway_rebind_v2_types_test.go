@@ -1,6 +1,7 @@
 package appaccess
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -89,7 +90,7 @@ func TestGatewayRebindV2CanonicalTypesBindTypedSourceAndTransferChain(t *testing
 	const wantRoster = "7aa081010a2340db2069c16b6614b567354ea312781f736d068e5f7a8b99a56b"
 	const wantSpec = "8ffdc06125394b75ffb53917ef672c129e7597134bee966620f854c634bf5bf4"
 	const wantTransfer = "37e44731dc1ab634116a834e43f744b28e1570a0a2161f0f69a522390b742e13"
-	const wantManifest = "6d6c4300c89afd8f583f0ce3d59559c82ce1441859387db79fcbb4f26230b6b6"
+	const wantManifest = "b5621d06785d826a517ea7367cfbbfad9f91cb98ab9bc33be119ef206025b0eb"
 	if entryDigest != wantEntry || rosterDigest != wantRoster || specDigest != wantSpec ||
 		transferDigest != wantTransfer || manifestDigest != wantManifest {
 		t.Fatalf("v2 canonical digest mismatch: entry=%s roster=%s spec=%s transfer=%s manifest=%s",
@@ -117,6 +118,30 @@ func TestGatewayRebindV2CanonicalTypesRejectCrossVersionAndBrokenChains(t *testi
 	wrongSourceVariant.Predecessor.Lineage.ProtectedIntentDigest = strings.Repeat("9", 64)
 	if _, err := GatewayRebindSpecV2Digest(wrongSourceVariant); err == nil {
 		t.Fatal("upgrade source carrying a rebind intent was accepted")
+	}
+	wrongUpgradeRevision := spec
+	wrongUpgradeRevision.Predecessor.SourceStateRevision = 1
+	if _, err := GatewayRebindSpecV2Digest(wrongUpgradeRevision); err == nil {
+		t.Fatal("legacy upgrade source with a mutable revision was accepted")
+	}
+	wrongGeneration := spec
+	wrongGeneration.Predecessor.Lineage.ProtectedGeneration = math.MaxUint64
+	if _, err := GatewayRebindSpecV2Digest(wrongGeneration); err == nil {
+		t.Fatal("source without a reservable successor generation was accepted")
+	}
+	rebindSource := spec
+	rebindSource.Predecessor.Lineage.Kind = GatewayRebindSourceGatewayRebind
+	rebindSource.Predecessor.Lineage.ProtectedGeneration = 1
+	rebindSource.Predecessor.Lineage.ProtectedJournalDigest = ""
+	rebindSource.Predecessor.Lineage.ProtectedIntentDigest = strings.Repeat("8", 64)
+	rebindSource.Predecessor.Lineage.TerminalReceiptDigest = strings.Repeat("9", 64)
+	rebindSource.Predecessor.SourceStateVersion = 1
+	if _, err := GatewayRebindSpecV2Digest(rebindSource); err == nil {
+		t.Fatal("rebind source revision zero was accepted")
+	}
+	rebindSource.Predecessor.SourceStateRevision = 1
+	if _, err := GatewayRebindSpecV2Digest(rebindSource); err != nil {
+		t.Fatalf("valid rebind source was rejected: %v", err)
 	}
 
 	first := gatewayRebindV2GoldenTransfer(nil, entry.EntryDigest)

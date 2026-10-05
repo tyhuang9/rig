@@ -21,7 +21,7 @@ type AppAccessGrantAuthorization struct {
 	Allocation             Allocation
 	Profile                GatewayProfileRevision
 	EffectiveProfile       GatewayProfileRevision
-	CurrentGatewaySource   GatewayCurrentLineageRef
+	CurrentGatewaySource   GatewayCurrentAuthorityRef
 	TransferChainTipDigest string
 	TerminalReceiptDigest  string
 }
@@ -69,7 +69,8 @@ func (r *Repository) AuthorizeAppAccessGrant(ctx context.Context,
 		return AppAccessGrantAuthorization{}, err
 	}
 	return AppAccessGrantAuthorization{
-		Claim: claim, Revision: revision, Allocation: revision.Allocation, Profile: profile,
+		Claim: claim, Revision: revision, Allocation: revision.Allocation,
+		Profile: profile, EffectiveProfile: profile,
 	}, nil
 }
 

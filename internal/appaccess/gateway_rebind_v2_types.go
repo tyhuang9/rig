@@ -1,6 +1,7 @@
 package appaccess
 
 import (
+	"math"
 	"sort"
 	"time"
 )
@@ -53,6 +54,19 @@ type GatewayRebindSourceRef struct {
 	SourceStateRevision         uint64                   `json:"sourceStateRevision"`
 	SourceStateDigest           string                   `json:"sourceStateDigest"`
 	PredecessorCheckpointDigest string                   `json:"predecessorCheckpointDigest"`
+}
+
+// GatewayCurrentAuthorityRef is the exact lineage projection SQL can prove
+// without inventing protected metadata that legacy upgrade claims never
+// stored. A protected observer validates the full lineage separately and
+// compares its authority projection with this value.
+type GatewayCurrentAuthorityRef struct {
+	Kind                  GatewayRebindSourceKind
+	OperationID           string
+	ProfileRevisionID     string
+	ProfileRevisionNumber int64
+	ProfileSpecDigest     string
+	TerminalReceiptDigest string
 }
 
 // GatewayRebindSpecV2 is a new canonical approval format. The legacy
@@ -119,7 +133,7 @@ type GatewayRebindAllocationTransfer struct {
 	SuccessorProfileRevisionNumber int64   `json:"successorProfileRevisionNumber"`
 	SuccessorProfileSpecDigest     string  `json:"successorProfileSpecDigest"`
 	TerminalReceiptDigest          string  `json:"terminalReceiptDigest"`
-	TransferDigest                 string  `json:"-"`
+	TransferDigest                 string  `json:"transferDigest,omitempty"`
 }
 
 type GatewayBindingRef struct {
@@ -137,7 +151,7 @@ type GatewayBindingResolution struct {
 	RawGrant               AppAccessGrantClaim
 	RawProfile             GatewayProfileRevision
 	EffectiveProfile       GatewayProfileRevision
-	CurrentGatewaySource   GatewayCurrentLineageRef
+	CurrentGatewaySource   GatewayCurrentAuthorityRef
 	TransferChain          []GatewayRebindAllocationTransfer
 	TransferChainTipDigest string
 	TerminalReceiptDigest  string
@@ -201,7 +215,7 @@ type GatewayRebindRecoverySnapshot struct {
 	History                []GatewayRebindHistoryEntry
 	Active                 *GatewayRebindHistoryEntry
 	CurrentProfile         *GatewayProfileRevision
-	CurrentSource          *GatewayCurrentLineageRef
+	CurrentSource          *GatewayCurrentAuthorityRef
 	DatabaseCommittedEvent *GatewayRebindEvent
 	CurrentTransfers       []GatewayRebindAllocationTransfer
 	Phase                  GatewayRebindState
@@ -400,8 +414,18 @@ func validGatewayCurrentLineageRef(value GatewayCurrentLineageRef) bool {
 }
 
 func validGatewayRebindSourceRef(value GatewayRebindSourceRef) bool {
-	return validGatewayCurrentLineageRef(value.Lineage) && value.SourceStateVersion > 0 &&
-		validDigest(value.SourceStateDigest) && validDigest(value.PredecessorCheckpointDigest)
+	if !validGatewayCurrentLineageRef(value.Lineage) || value.Lineage.ProtectedGeneration == math.MaxUint64 ||
+		!validDigest(value.SourceStateDigest) || !validDigest(value.PredecessorCheckpointDigest) {
+		return false
+	}
+	switch value.Lineage.Kind {
+	case GatewayRebindSourceGatewayUpgrade:
+		return value.SourceStateVersion == 2 && value.SourceStateRevision == 0
+	case GatewayRebindSourceGatewayRebind:
+		return value.SourceStateVersion == 1 && value.SourceStateRevision > 0
+	default:
+		return false
+	}
 }
 
 func validOptionalDigest(value *string) bool {
