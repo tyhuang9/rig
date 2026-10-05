@@ -47,7 +47,7 @@ test and any remaining managed Docker resources or successor network name.
 | `pnpm --dir web build` | PASS; TypeScript and Vite production build. Vite reported its existing large-chunk advisory. |
 | `go build -buildvcs=false ./...` | PASS. Plain `go build ./...` could not obtain VCS status from this local worktree (exit 128), before compilation. |
 | `gofmt -l` on both touched Go tests and `git diff --check` | PASS; no format or whitespace defects. |
-| Hosted Linux Docker live test and cleanup gate | FAILED on the first hosted run; see the attempt below. The local Docker daemon is unavailable. |
+| Hosted Linux Docker live test and cleanup gate | FAILED on two hosted runs; see the attempts below. The local Docker daemon is unavailable. |
 | Physical second-device LAN/address-change proof | Not run; outside this gate. |
 
 The focused fake stage suite failed inside the restricted Windows sandbox
@@ -67,13 +67,27 @@ failed. This is a failed acceptance attempt, not evidence that the network
 stage works on hosted Docker.
 
 Commit `9fe6278` adds failure-only predicate diagnostics to the live test. It
-does not relax production checks or remove uncertain resources. A hosted rerun
-is required to identify the failed predicate and verify a correction. After
-the local CI repairs were merged forward, the serialized uncached Go suite,
-`go vet ./...`, `go build -buildvcs=false ./...`, Docker-tagged compilation,
-web typecheck, all 502 web tests, web production build, and docs build passed
-on the row-25 tip. Those local checks do not establish the hosted network
-effect.
+does not relax production checks or remove uncertain resources. The
+[diagnostic hosted job](https://github.com/tyhuang9/rig/actions/runs/37250455749/job/111576832137)
+also failed the named test with `route_reconciliation_required` at progress
+count two. At the failure snapshot the successor network was absent, while the
+protected anchor, host candidate/routes/interfaces and two predecessor Docker
+observations were valid and equal. The residue step found no remaining managed
+resources. This snapshot does not establish which earlier pre-effect or
+post-effect predicate returned the error, so the network gate remains failed.
+
+The local unpublished row-21 and row-24 corrections normalize only the order
+of the independently validated exact predecessor Docker mounts in transient
+observation digests; they preserve all other drift checks and protected record
+bytes. Focused stage-network tests, the serialized uncached Go suite
+(`internal/generatedingress` 198.001s), `go vet ./...`, and
+`go build -buildvcs=false ./...` passed at the local row-25 tip. Security
+review found no ownership or history bypass. These corrections have not yet
+run on hosted Docker and are not claimed as the cause or remedy of either
+hosted failure. Docker-tagged compilation, web typecheck, all 502 web tests,
+web production build, and docs build passed on the earlier row-25 source before
+the Go-only digest correction. Those local checks do not establish the hosted
+network effect.
 
 ## Remaining work
 
