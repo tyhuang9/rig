@@ -4,13 +4,16 @@ Status: private coordinator, protected terminal history, production Docker
 driver, fault/restart tests and standalone Docker journeys implemented.
 The initial source checkpoint is `c2d3daf5c5d8810005fadacccbda8958b4a0f3a5`.
 The Caddy autosave correction is implemented and independently reviewed in
-`8b61552` and `d8017e5`; final integration verification remains in progress.
-This branch is local and unpublished. Actual Docker acceptance is pending.
+`8b61552` and `d8017e5`. The frozen full suite and separately recorded correction
+checks passed. This branch is local and unpublished. Actual Docker acceptance
+is pending.
 
 Branch: `feature/hosting-m3-rebind-final-handover`.
-Base: `39b217fb354232d563590b2fb0c5300a14527c25`, the reviewed local inactive
-final-config-copy branch. Publication authorization for that prerequisite is
-pending. No publication, merge or deployment is authorized by this plan.
+Base: [draft PR #136](https://github.com/tyhuang9/rig/pull/136),
+`feature/hosting-m3-rebind-final-config-copy` at
+`bdbb697f767da4e71664da1434a75e6daec4b732`. That prerequisite was published
+with explicit authorization; this handover still requires its own publication
+approval. No merge or deployment is authorized.
 
 ## Purpose and boundaries
 
@@ -382,12 +385,47 @@ hidden metadata, changed bytes, invalid padding and trailing data are rejected.
 | Static and tagged compilation | Repository-wide `go vet -mod=readonly ./...` and `go build -mod=readonly -buildvcs=false ./...` passed on the integrated correction. `go test -mod=readonly -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress` passed (1.176s and 0.854s); no live effects ran. |
 | Independent final source review | GO for local correctness after checking the completed parser/policy/coordinator tests, immutable formats, phase authority and pinned Caddy source. No source blocker remained. No CodeRabbit result is claimed. |
 
+The corrected final-config-copy prerequisite was published as draft PR #136
+at `bdbb697` after separate explicit approval. Its head, base and open draft
+status were verified and it was attached to the task. Merge `6dafa34` retains
+that exact branch history in this candidate; comparison before/after the merge
+found only documentation differences and no Go, module or workflow change.
+The prerequisite's 76 explicitly discovered regression tests all passed in
+537.126s without failures/skips, including the shared final archive parser and
+the real sequence-ten/eleven/twelve history regression. This worktree's locked
+offline docs install, workflow check and build also passed (3.25s).
+
 The initial combined-test failure is retained above; the obsolete assertion's
 isolated rerun is not represented as a second full group pass. The concurrent
 full Go run on frozen `c2d3daf` is also separate from this correction. Actual
 Docker TAR headers, autosave timing, cutover and process-recovery effects still
 require the hosted jobs. These local results do not substitute for physical
 Docker or second-device LAN acceptance.
+
+### Completed frozen full-suite checkpoint
+
+At source `c2d3daf5c5d8810005fadacccbda8958b4a0f3a5`, the following command
+completed successfully using normal Windows protected-file access:
+
+```text
+go test -mod=readonly -p=1 -json -count=1 -timeout=60m ./...
+```
+
+JSON inspection confirmed 48 packages passed and 2,048 top-level tests passed,
+with zero failures. All 25 explicitly discovered deterministic handover tests
+passed exactly once. The ingress package took 2326.865s. The local timeout
+accommodates the measured Windows protected-file fixture cost; it does not
+alter hosted job limits. Two packages reported no test files. There were
+53 test/subtest skips for live-service opt-ins, platform-specific permission
+checks or unavailable Windows symlink privileges. These are not acceptance
+passes; in particular both new handover Docker journeys skipped locally.
+
+The full run stayed on its frozen source while the autosave correction was
+implemented in a separate worktree. Only after completion is the correction
+integrated into the handover branch. The current candidate's evidence is the
+frozen full-suite checkpoint plus the exact incremental correction checks
+above, not a claim that the full suite ran again after the correction. No Go,
+module or workflow change occurred during the final documentation-only merges.
 
 ## Rollback and remaining gates
 
