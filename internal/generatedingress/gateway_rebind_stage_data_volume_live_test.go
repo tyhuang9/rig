@@ -116,6 +116,10 @@ func TestLiveGatewayRebindSuccessorDataVolumeStage(t *testing.T) {
 		t.Fatal("inspect exact predecessor Docker state before data-volume stage")
 	}
 	defer clearGatewayV2DockerObservation(&beforeDocker)
+	beforeDockerDigest, err := gatewayRebindEffectBoundaryDockerDigest(beforeDocker, predecessorState.Identity)
+	if err != nil {
+		t.Fatal("digest exact predecessor Docker state before data-volume stage")
+	}
 	baseline := liveGatewayRebindReadRequestCount(t, fixture, fixture.candidates[0].ContainerID)
 	settled := liveGatewayRebindReadRequestCount(t, fixture, fixture.candidates[0].ContainerID)
 	if baseline.Routed == 0 || baseline.Routed != settled.Routed {
@@ -258,12 +262,15 @@ func TestLiveGatewayRebindSuccessorDataVolumeStage(t *testing.T) {
 	}
 	afterDocker, err := fixture.ingress.inspectGatewayRebindDocker(
 		fixture.ctx, afterRoute, afterState, afterJournal)
-	if err != nil || !validGatewayRebindPredecessorDocker(afterRoute, afterState, afterJournal, afterDocker) ||
-		!reflect.DeepEqual(beforeDocker, afterDocker) {
+	if err != nil || !validGatewayRebindPredecessorDocker(afterRoute, afterState, afterJournal, afterDocker) {
 		clearGatewayV2DockerObservation(&afterDocker)
 		t.Fatal("data-volume stage changed predecessor Docker resources")
 	}
+	afterDockerDigest, err := gatewayRebindEffectBoundaryDockerDigest(afterDocker, afterState.Identity)
 	clearGatewayV2DockerObservation(&afterDocker)
+	if err != nil || beforeDockerDigest != afterDockerDigest {
+		t.Fatal("data-volume stage changed predecessor Docker resources")
+	}
 	if got := liveGatewayRebindReadRequestCount(t, fixture, fixture.candidates[0].ContainerID); got.Routed != baseline.Routed {
 		t.Fatal("data-volume stage or replay forwarded an application request")
 	}
