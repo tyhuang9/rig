@@ -13,6 +13,8 @@ import (
 	"github.com/hostd/hostd/internal/database"
 )
 
+const liveGatewayRebindStageStartNetworkEnvironment = "RIG_RUN_LIVE_GATEWAY_REBIND_STAGE_START_NETWORK"
+
 type liveGatewayRebindStageStartDriver struct {
 	managerGatewayRebindStageStartDriver
 	startCalls    int
@@ -89,7 +91,10 @@ func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string,
 			"d3333333-3333-4333-8333-333333333333", "d4444444-4444-4444-8444-444444444444"
 		spec.imageTag += "-" + mode
 	}
+	predecessorAddress, successorAddress := liveGatewayRebindHostAddresses(t, liveGatewayRebindStageStartNetworkEnvironment)
 	fixture := newLiveGatewayV2Fixture(t, spec)
+	fixture.interfaceIP = predecessorAddress.IPv4
+	fixture.request = liveGatewayV2Request(t, spec, predecessorAddress, fixture.port)
 	db, err := database.Open(fixture.stateRoot)
 	if err != nil {
 		t.Fatal("open live stage-start SQLite fixture")
@@ -99,10 +104,13 @@ func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string,
 	profile := prepareLiveGatewayRebindStagePredecessor(t, fixture, db, repository)
 	proposal := seedLiveGatewayRebindPublicPassiveLineage(t, fixture, db, repository, profile,
 		appaccess.GatewayProfileSpec{
-			SelectedIPv4: fixture.request.Profile.SelectedIPv4,
-			InterfaceID:  fixture.request.Profile.InterfaceID,
+			SelectedIPv4: successorAddress.IPv4,
+			InterfaceID:  successorAddress.InterfaceID,
 			PortStart:    fixture.port, PortEnd: fixture.port,
 		})
+	if proposal.Spec.SuccessorProfile.SelectedIPv4 == fixture.request.Profile.SelectedIPv4 {
+		t.Fatal("stage start requires a distinct successor address while the predecessor remains live")
+	}
 	predecessorState, predecessorJournal, predecessorStore := liveGatewayV2LoadDurableOperation(t, fixture)
 	preclaim, err := repository.GatewayRebindPreclaimSnapshot(fixture.ctx, proposal)
 	if err != nil || !gatewayRebindPreclaimMatches(preclaim, predecessorState, predecessorJournal) {
