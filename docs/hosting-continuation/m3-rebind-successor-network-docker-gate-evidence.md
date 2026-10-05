@@ -184,6 +184,51 @@ also passed the named live test without a skip in 46.06s and passed the
 always-run cleanup at `f1707e9`. This reconfirms only the private network
 stage, not later successor effects.
 
+## Hosted checks at `6023a0f`, 2026-10-05 UTC
+
+The [network-stage Docker job 111628801073](https://github.com/tyhuang9/rig/actions/runs/37268002611/job/111628801073)
+passed the required named test without a skip in 51.33s and passed its
+always-run cleanup. The [repository-wide PostgreSQL and Linux race job
+111629109835](https://github.com/tyhuang9/rig/actions/runs/37268002686/job/111629109835)
+passed in 1h13m25s. These are results for this immutable head.
+
+The [dedicated generated-runtime race job 111628801749](https://github.com/tyhuang9/rig/actions/runs/37268002685/job/111628801749)
+failed at the 32-minute Go package timeout in `internal/generatedingress`,
+without a race report. The [fast-verification job 111629109734](https://github.com/tyhuang9/rig/actions/runs/37268002686/job/111629109734)
+passed its Go checks but failed one frontend assertion: the status heading was
+rendered before its separate focus effect completed. The assertion now waits
+for focus with the same bounded `waitFor` pattern used by neighboring tests.
+The focused test, all 502 frontend tests, and TypeScript/Vite production build
+passed locally after that correction. The test still requires focus to reach
+the heading; rendering alone cannot satisfy it.
+
+The dedicated race workflow now runs three matrix batches: the other eight
+runtime packages without filters, ingress tests matching `^TestGatewayV2`,
+and ingress tests excluding that same prefix. The complementary filters
+retain every ingress test and full subtest tree, including future tests.
+Every batch retains `-race -count=1`, the 32-minute Go timeout, and requires
+an actual top-level test pass. Matrix failures do not cancel other batches.
+The existing `Generated runtime race verification` check name is retained
+as an aggregate that requires every batch to succeed. The full repository
+race job remains a separate check. YAML parsing, extracted Bash syntax, and
+workflow review passed locally; the partitioned hosted run remains required.
+
+Local partition validation used Go 1.27.0 on Windows and normal filesystem
+access. `go test -json -p=1 -count=1 -timeout=15m -run '^TestGatewayV2'
+./internal/generatedingress` passed all 136 selected tests in 59.402s. The
+complementary command with `-skip '^TestGatewayV2'` ran 317 tests: 309 passed
+and the existing eight environment-gated tests skipped, in 164.888s. Comparing
+top-level JSON run events against `go test -list .` proved all 453 discovered
+tests ran exactly once across the two batches. The other eight workflow
+packages passed unfiltered with `go test -p=1 -count=1 -timeout=15m`.
+
+The Windows filesystem sandbox caused protected-path tests to fail; the same
+focused recovery and config-file tests passed outside that sandbox, as did
+both complete partitions. No runtime validation was relaxed. The docs build
+also passed with normal filesystem access. Local Go has `CGO_ENABLED=0`, so
+these are non-race results; the pinned Go 1.26.7 Linux race matrix must still
+pass on the published candidate.
+
 ## Remaining work
 
 The config and data volumes, successor container, serving transition, route
