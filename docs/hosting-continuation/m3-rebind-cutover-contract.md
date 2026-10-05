@@ -286,17 +286,24 @@ terminal receipts, unknown files in the reserved history namespace, purpose
 mismatches, or any changed retained artifact.
 
 The private protected-history format defines two pre-effect records,
-`successor_intent` and `stage_intent`, followed by a create-only sequence-three
-binding for the first successor ingress-network effect. `stage_intent` stores
-the approved image content digest and separately observed Docker image ID.
+`successor_intent` and `stage_intent`, followed by create-only bindings for the
+successor ingress network at sequence three, config volume at sequence four,
+and data volume at sequence five. Each later record preserves the exact prior
+stage payload and adds only the observed identity of its own resource. The
+`stage_intent` record stores the approved image content digest and separately
+observed Docker image ID.
 Its storage validator binds the approved digest, successor identity, and
 selected network plan to the installed intent; it checks the observed image
 ID and topology digest only for syntax. The guarded network writer compares
 both with fresh observations under the deployment lease and gateway locks
-before creating a resource. Sequence three preserves the entire prior stage
-payload and binds Docker's returned network ID and the exact ownership digest.
-An unbound network remains fenced for separately reviewed recovery. No
-terminal phase or receipt is installed by this format.
+before creating a resource. Sequence three binds Docker's returned network ID
+and the exact ownership digest. Sequences four and five bind the respective
+Docker volume name, mountpoint, creation time, and ownership digest only after
+all previously bound resources and the full prepared claim have been
+reattested. An effect whose identity was not durably bound remains fenced for
+separately reviewed recovery; its resource name alone never permits adoption
+or cleanup.
+No container, terminal phase, or receipt is installed by this format.
 
 The implementation may reuse the existing generation filename conventions
 only if the scanner can distinguish an ordinary v1-to-v2 upgrade from a

@@ -3,7 +3,7 @@
 Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
 draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
 row's branch descends from the preceding row's branch and targets it with one
-review scope. Rows 26–27 remain local and require separate publication
+review scope. Rows 26–28 remain local and require separate publication
 approval. The first two hosted row-25 network Docker attempts failed; the
 corrected head's required job is queued, so no hosted network-stage acceptance
 is claimed. No draft publication authorizes merge or deployment.
@@ -37,6 +37,7 @@ is claimed. No draft publication authorizes merge or deployment.
 | 25 | `feature/hosting-m3-rebind-network-docker-gate` | `f00f911` | Required hosted Docker test of the exact network effect and Linux bridge delta |
 | 26 | `feature/hosting-m3-rebind-config-volume-stage` | `307c8f3` | Private successor config-volume Docker effect and protected sequence-four binding |
 | 27 | `feature/hosting-m3-rebind-config-volume-docker-gate` | `742124d` | Required hosted Docker test of the exact config-volume effect and replay |
+| 28 | `feature/hosting-m3-rebind-data-volume-stage` | `9ccf6a9` | Private successor Caddy `/data` volume effect and protected sequence-five binding |
 
 Each branch has a scoped evidence file in this directory. Local verification
 for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
@@ -53,12 +54,14 @@ passed the required named live test at code head `ad8d3e2` in 54.89 seconds,
 and its always-run residue step passed. This establishes the private network
 stage on that hosted runner. Rows 26 and 27 passed their final-source Go suites,
 vet, builds, and relevant focused checks before this network-route correction
-was integrated. Row 27's live test compiled and skipped locally; its hosted
-Docker acceptance remains open.
+was integrated. Row 28 passed its original final-source Go suite, vet, build,
+and Docker-tagged compile. Row 27's live test compiled and skipped locally;
+its hosted Docker acceptance remains open.
 
 These branches do not add a public rebind controller caller, terminal protected
 receipt, successor cutover, transfer-aware readers, recovery, or fence release.
 Migrations 033 and 034 remain dormant and unreleasable. Publication, merging,
 deployment, Linux race, and physical second-device LAN acceptance are separate
-gates. The create-before-bind crash windows after the row-24 network and
-row-26 config-volume effects remain unresolved and fenced.
+gates. The create-before-bind crash windows after the row-24 network,
+row-26 config-volume, and row-28 data-volume effects remain unresolved and
+fenced.
