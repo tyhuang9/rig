@@ -4,14 +4,17 @@ Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
 draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
 published branch targets its preceding branch with one review scope. Rows
 26–37 remain local and require separate publication approval; they have
-inherited the row-25 CI-budget head `6023a0f` through additive merges. The
+inherited the row-25 race-partition head `9ad7f78` through additive merges. The
 first four hosted row-25 network Docker attempts failed; the fifth and sixth
 passed the required live network-stage test and residue gate at `ad8d3e2` and
 `f91140c`. A later replay parity assertion failed at `a5b4d10`. The corrected
 hosted job passed the named test and residue gate at `fd68ab8`; the same gate
 also passed at evidence head `f1707e9`. This is network-stage acceptance on
-hosted Linux at those tested heads. Head `6023a0f` changes only CI budgets and
-evidence; its hosted reruns remain pending. The later volume, container,
+hosted Linux at those tested heads. At `6023a0f`, the network-stage Docker gate
+and repository-wide Linux race passed, but the dedicated ingress race job hit
+its 32-minute timeout. Head `9ad7f78` partitions that race job without removing
+tests. Its fast check, network-stage gate, and gateway-v2 race batch passed;
+the other race batches and aggregate are pending. The later volume, container,
 config, and start Docker gates remain unrun on hosted Linux. No draft
 publication authorizes merge or deployment.
 
