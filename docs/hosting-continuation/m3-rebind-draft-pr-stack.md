@@ -1,11 +1,10 @@
 # M3 rebind draft PR stack
 
-Status: local, unpublished plan as of 2026-10-03. The published base is draft
-PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each row's
-branch descends from the preceding row's branch, with one review scope per
-draft. Each draft would target the preceding row's branch. Row 15 includes the
-initial version of this plan after its scope commit; row 25 includes its later
-update. None of these rows authorizes publication, merge, or deployment.
+Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
+draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
+row's branch descends from the preceding row's branch and targets it with one
+review scope. The branch sequence has been preserved with additive CI repair
+merges. Publication of these drafts does not authorize merge or deployment.
 
 | Order | Branch | Scope commit | Review scope |
 | --- | --- | --- | --- |
@@ -41,12 +40,15 @@ for row 15 passed the full uncached Go suite, vet, Docker-tagged compilation,
 own exact local checks and limitations in their evidence files. Row 25 passed
 the final-source Go suite, vet, web tests and build, and Docker-tagged compile;
 its live Docker test only compiled and skipped locally. PR #97's hosted checks
-passed at its published head. The Docker gates in rows 14, 16, and 25 require
-publication and hosted execution before they can count as acceptance evidence.
+passed at its published head. The first hosted row-25 Docker run failed after
+network creation but before the protected sequence-three binding; the unbound
+network was retained and the residue gate failed. The row-25 evidence file
+records the job and pending diagnostic rerun. The Docker gates in rows 14, 16,
+and 25 count as acceptance only after a successful required live test.
 
 These branches do not add a public rebind controller caller, terminal protected
 receipt, successor cutover, transfer-aware readers, recovery, or fence release.
-Migrations 033 and 034 remain dormant and unreleasable. Publication, merging,
-deployment, Linux race, and physical second-device LAN acceptance are separate
+Migrations 033 and 034 remain dormant and unreleasable. Merging, deployment,
+Linux race, and physical second-device LAN acceptance are separate
 gates. The create-before-bind crash window after the row-24 network effect
 remains unresolved and fenced.
