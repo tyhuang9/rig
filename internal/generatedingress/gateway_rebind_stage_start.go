@@ -15,13 +15,17 @@ import (
 
 const gatewayRebindStageServingVersion = 1
 
-type gatewayRebindStageStartDriver interface {
+type gatewayRebindStageServingAttestor interface {
 	gatewayRebindStageStartIntentDriver
-	start(context.Context, string) error
-	stop(context.Context, string) error
 	liveConfig(context.Context, string) ([]byte, error)
 	hostProbe(context.Context, string, uint16, string, string) gatewayV2HostProbeResult
 	containerProbe(context.Context, string, string, uint16, string, string) bool
+}
+
+type gatewayRebindStageStartDriver interface {
+	gatewayRebindStageServingAttestor
+	start(context.Context, string) error
+	stop(context.Context, string) error
 }
 
 type managerGatewayRebindStageStartDriver struct{ manager *Manager }
@@ -432,7 +436,7 @@ func (m *Manager) startGatewayRebindSuccessorStageWithDriver(ctx context.Context
 
 func (m *Manager) attestGatewayRebindStageServingCandidateLocked(ctx context.Context,
 	repository *appaccess.Repository, reads gatewayRebindSuccessorPreflightReads,
-	inspectDocker gatewayRebindDockerInspector, driver gatewayRebindStageStartDriver,
+	inspectDocker gatewayRebindDockerInspector, driver gatewayRebindStageServingAttestor,
 	intent gatewayRebindProtectedIntent, stage gatewayRebindStageIntent, progressCount uint64,
 ) (gatewayRebindStageServingAttestation, error) {
 	first, err := m.readGatewayRebindStageServingAttestation(ctx, repository, reads, inspectDocker,
@@ -450,7 +454,7 @@ func (m *Manager) attestGatewayRebindStageServingCandidateLocked(ctx context.Con
 
 func (m *Manager) attestGatewayRebindStageServingLocked(ctx context.Context,
 	repository *appaccess.Repository, reads gatewayRebindSuccessorPreflightReads,
-	inspectDocker gatewayRebindDockerInspector, driver gatewayRebindStageStartDriver,
+	inspectDocker gatewayRebindDockerInspector, driver gatewayRebindStageServingAttestor,
 	intent gatewayRebindProtectedIntent, stage gatewayRebindStageIntent,
 	binding gatewayRebindStageServingBinding, progressCount uint64,
 ) error {
@@ -478,18 +482,21 @@ func (m *Manager) attestGatewayRebindStageServingLocked(ctx context.Context,
 
 func (m *Manager) readGatewayRebindStageServingAttestation(ctx context.Context,
 	repository *appaccess.Repository, reads gatewayRebindSuccessorPreflightReads,
-	inspectDocker gatewayRebindDockerInspector, driver gatewayRebindStageStartDriver,
+	inspectDocker gatewayRebindDockerInspector, driver gatewayRebindStageServingAttestor,
 	intent gatewayRebindProtectedIntent, stage gatewayRebindStageIntent,
 	expected *gatewayRebindStageServingBinding, progressCount uint64,
 ) (gatewayRebindStageServingAttestation, error) {
-	if progressCount != 9 && progressCount != 10 {
+	if progressCount != 9 && progressCount != 10 && progressCount != 11 {
 		return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
 	anchor, err := m.readGatewayRebindEffectBoundaryAnchor(ctx, repository)
 	if err != nil || !reflect.DeepEqual(anchor.intent, intent) || anchor.progressCount != progressCount ||
 		stage.Network == nil || stage.StageContainer == nil || stage.StageConfigIntent == nil ||
 		stage.StageStartIntent == nil || (progressCount == 9 && stage.StageServing != nil) ||
-		(progressCount == 10 && (stage.StageServing == nil || expected == nil || *stage.StageServing != *expected)) {
+		((progressCount == 10 || progressCount == 11) &&
+			(stage.StageServing == nil || expected == nil || *stage.StageServing != *expected)) ||
+		(progressCount < 11 && stage.FinalConfigIntent != nil) ||
+		(progressCount == 11 && stage.FinalConfigIntent == nil) {
 		return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
 	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
@@ -497,6 +504,18 @@ func (m *Manager) readGatewayRebindStageServingAttestation(ctx context.Context,
 		history.Progress[len(history.Progress)-1].Record.Stage == nil ||
 		!reflect.DeepEqual(*history.Progress[len(history.Progress)-1].Record.Stage, stage) {
 		return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	if progressCount == 11 {
+		// Sequence eleven adds only a protected final-config intent. Reuse the
+		// exact sequence-ten physical serving contract without teaching the old
+		// stage validators or drivers about the later-phase field.
+		servingStage := stage
+		servingStage.FinalConfigIntent = nil
+		if len(history.Progress) < 10 || history.Progress[9].Record.Stage == nil ||
+			!reflect.DeepEqual(*history.Progress[9].Record.Stage, servingStage) {
+			return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
+		}
+		stage = servingStage
 	}
 	docker, err := inspectDocker(ctx, anchor.source, anchor.predecessor.State, anchor.predecessor.Journal)
 	defer clearGatewayV2DockerObservation(&docker)

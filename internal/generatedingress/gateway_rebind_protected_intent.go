@@ -481,7 +481,7 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLocked(checkpoint func(
 		if loadErr != nil || !gatewayRebindProtectedIntentMatchesPredecessor(intent, predecessor) {
 			return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind intent history is invalid")
 		}
-		progress, progressErr := scanGatewayRebindProgressForIntent(m.options.DataRoot, intent, artifact)
+		progress, progressErr := scanGatewayRebindProgressForIntent(m.options.DataRoot, intent, predecessor, artifact)
 		if progressErr != nil {
 			return gatewayRebindProtectedIntentHistory{}, progressErr
 		}
