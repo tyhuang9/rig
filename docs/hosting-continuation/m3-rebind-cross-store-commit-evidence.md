@@ -203,6 +203,38 @@ passed without installing or changing dependencies.
 
 ## Observed hosted prerequisite evidence
 
+### Local contract and controller integration checkpoint
+
+Shared contract commit `c04a98ea9f8e59144dcbc70707a61fb6a55091a6` was integrated
+additively. Its three named canonical-format tests passed independently in
+0.798s, with zero failures or skips. They cover unchanged v1 golden digests,
+versioned typed sources/transfers, and rejection of cross-version or broken
+chains. Migration files are unchanged at this checkpoint.
+
+The contract distinguishes full protected lineage from
+`GatewayCurrentAuthorityRef`, the kind/operation/profile/receipt projection SQL
+can actually prove. Legacy upgrade SQL never stored protected generation,
+identity or journal data, so those facts must come from protected observation.
+Native successful grant, disable and startup outputs now explicitly populate
+`EffectiveProfile` while retaining raw `Profile`.
+
+The controller URL adapter now requires a valid, digest-matching effective
+profile containing the allocation's port. It uses that profile's address while
+preserving raw desired-allocation and observation-request identities. A focused
+regression first failed because the existing adapter returned the original
+address despite an authorized successor projection; it passed after the adapter
+change. The complete selected controller run passed all five discovered
+top-level tests and 15 refusal subcases in 18.819s, with zero failures or skips.
+Its fixture now retains a real committed upgrade claim before granting access.
+
+This checkpoint proves presentation and format contracts, not an actual
+completed rebind. The successor projection is controlled test output. Matching
+the callback's fresh SQL authority against the runtime's independent protected
+observation is still required. Atomic SQL commit, complete transfer resolution,
+runtime recovery and final fence release remain under implementation.
+
+### Published prerequisite jobs
+
 At PR #135 head `e46185ff61b3fa519304e5fa0ce8ab9c1a788acb`, the
 [gateway v2 job](https://github.com/tyhuang9/rig/actions/runs/37373345314/job/111975694246)
 completed successfully. Its actual logs record:

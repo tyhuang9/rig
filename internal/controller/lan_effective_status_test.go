@@ -102,6 +102,29 @@ func newVerifiedLANStatusFixture(t *testing.T) *lanStatusFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	upgradeSpec := appaccess.GatewayProfileUpgradeSpec{ProfileRevisionID: profile.ID,
+		ProfileRevisionNumber: profile.RevisionNumber, ProfileSpecDigest: profile.SpecDigest}
+	upgradeDigest, err := appaccess.GatewayProfileUpgradeSpecDigest(upgradeSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgrade, _, err := repository.ClaimGatewayProfileUpgrade(ctx, appaccess.ClaimGatewayProfileUpgradeInput{
+		OperationID: uuid.NewString(), Spec: upgradeSpec,
+		Approval: appaccess.Approval{Action: appaccess.ActionUpgradeGateway, SpecDigest: upgradeDigest, ActorID: actor},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgradeOwner := appaccess.GatewayProfileUpgradeClaimOwner{OperationID: upgrade.OperationID,
+		ProfileRevisionID: profile.ID, ProfileRevisionNumber: profile.RevisionNumber}
+	for _, states := range [][2]appaccess.GatewayProfileUpgradeState{
+		{appaccess.GatewayProfileUpgradePrepared, appaccess.GatewayProfileUpgradeServing},
+		{appaccess.GatewayProfileUpgradeServing, appaccess.GatewayProfileUpgradeCommitted},
+	} {
+		if _, _, err := repository.AdvanceGatewayProfileUpgradeClaim(ctx, upgradeOwner, states[0], states[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
 	operation := uuid.NewString()
 	allocation, _, err := repository.ReserveAppAccess(ctx, appaccess.ReserveAppAccessInput{
 		AppID: f.app.ID, OperationID: operation, GatewayProfileRevisionID: profile.ID, GatewayProfileRevisionNumber: profile.RevisionNumber,
@@ -135,7 +158,7 @@ func newVerifiedLANStatusFixture(t *testing.T) *lanStatusFixture {
 			t.Fatal(err)
 		}
 	}
-	gatewayOperation := uuid.NewString()
+	gatewayOperation := upgrade.OperationID
 	claim, _, err = repository.ResolveAppAccessGrantClaim(ctx, owner, appaccess.AppAccessGrantDBActive, appaccess.AppAccessGrantCommitted,
 		appaccess.AppAccessGrantProof{GatewayOperationID: gatewayOperation, ProtectedStateDigest: strings.Repeat("b", 64)})
 	if err != nil {
@@ -195,6 +218,41 @@ func TestLANAccessVerifiedStatusUsesAuthorizedProfileAndRetainsRawGrant(t *testi
 	}
 }
 
+func TestLANAccessVerifiedStatusUsesEffectiveProfileWithoutRewritingRawGrant(t *testing.T) {
+	f := newVerifiedLANStatusFixture(t)
+	effective := f.profile
+	effective.ID = uuid.NewString()
+	effective.RevisionNumber++
+	effective.OperationID = uuid.NewString()
+	effective.Spec.SelectedIPv4 = "192.168.60.20"
+	effective.Spec.InterfaceID = "8/Successor LAN"
+	var err error
+	effective.SpecDigest, err = appaccess.GatewayProfileSpecDigest(effective.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Transfer-chain authorization belongs to the repository's tests. This
+	// adapter test only replaces that validated output while
+	// retaining the real immutable native grant and its fresh serving evidence.
+	f.server.AppGrants = statusLANAuthorization{LANAppGrantService: f.repository,
+		alter: func(value *appaccess.AppAccessGrantAuthorization) { value.EffectiveProfile = effective },
+	}
+	value := f.read(t)
+	want := "http://" + effective.Spec.SelectedIPv4 + ":" + strconv.Itoa(int(f.claim.Spec.Port)) + "/"
+	if value["availability"] != "verified" || value["url"] != want {
+		t.Fatalf("verified effective LAN projection: %#v", value)
+	}
+	if f.runtime.seen.GatewayProfileRevisionID != f.claim.Spec.GatewayProfileRevisionID ||
+		f.runtime.seen.GatewayProfileSpecDigest != f.claim.Spec.GatewayProfileSpecDigest || f.runtime.seen.ClaimRequestDigest != f.claim.RequestDigest {
+		t.Fatal("effective URL projection changed the immutable grant request")
+	}
+	desired := value["desiredAccess"].(map[string]any)
+	allocation := desired["allocation"].(map[string]any)
+	if allocation["gatewayProfileRevisionId"] != f.profile.ID || allocation["gatewayProfileRevisionNumber"] != float64(f.profile.RevisionNumber) {
+		t.Fatal("effective URL projection rewrote the desired allocation's immutable profile")
+	}
+}
+
 func TestLANAccessStatusWithholdsURLWhenServingEvidenceChanges(t *testing.T) {
 	for _, name := range []string{"runtime error", "uncertain activation", "wrong endpoint", "changed serving head", "missing timestamp"} {
 		t.Run(name, func(t *testing.T) {
@@ -244,6 +302,41 @@ func TestLANAccessStatusWithholdsURLWhenAuthorizationChanges(t *testing.T) {
 			value := f.read(t)
 			if value["availability"] != "unverified" || value["url"] != nil || value["observedAt"] != nil {
 				t.Fatalf("authorization mismatch exposed a URL or timestamp: %#v", value)
+			}
+		})
+	}
+}
+
+func TestLANAccessStatusWithholdsURLForInvalidEffectiveProfile(t *testing.T) {
+	for _, name := range []string{"missing profile", "invalid profile ID", "missing revision", "wrong digest", "unapproved address", "port outside profile"} {
+		t.Run(name, func(t *testing.T) {
+			f := newVerifiedLANStatusFixture(t)
+			effective := f.profile
+			switch name {
+			case "missing profile":
+				effective = appaccess.GatewayProfileRevision{}
+			case "invalid profile ID":
+				effective.ID = "invalid"
+			case "missing revision":
+				effective.RevisionNumber = 0
+			case "wrong digest":
+				effective.SpecDigest = strings.Repeat("f", 64)
+			case "unapproved address":
+				effective.Spec.SelectedIPv4 = "192.168.60.20"
+			case "port outside profile":
+				effective.Spec.PortStart = 8101
+				var err error
+				effective.SpecDigest, err = appaccess.GatewayProfileSpecDigest(effective.Spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.server.AppGrants = statusLANAuthorization{LANAppGrantService: f.repository,
+				alter: func(value *appaccess.AppAccessGrantAuthorization) { value.EffectiveProfile = effective },
+			}
+			value := f.read(t)
+			if value["availability"] != "unverified" || value["url"] != nil || value["observedAt"] != nil {
+				t.Fatalf("invalid effective profile exposed a URL or timestamp: %#v", value)
 			}
 		})
 	}
