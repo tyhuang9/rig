@@ -57,3 +57,32 @@ release, or a public caller. The Docker-socket actor remains within the host
 trust boundary and can race inspection or start the stopped container afterward.
 The stage and this test cannot count as hosted acceptance until the draft stack
 is authorized for publication and the named CI gate passes.
+
+## Hosted checkpoint and inherited migration assertion correction
+
+This branch was published as draft PR #128 at `a077ceb` under the user's
+rows 26–38 authorization. On 2026-10-05 the inherited
+[migration-uncertainty Docker job](https://github.com/tyhuang9/rig/actions/runs/37353748854/job/111910800922)
+failed after 129.13s: its resume response was the exact requested job already
+`assigned` at attempt two, while the test required `queued`.
+
+`jobs.Service.Resume` commits, signals the live worker and then reads the job.
+The response may therefore already be assigned or running. The test now
+accepts those three in-flight states for the exact job ID. It still requires
+worker interruption after the real migration, running attempt two, exactly two
+migration executions and ledger/counter values, unchanged pinned provenance,
+and restart recovery without replaying the migration. No production behavior
+or migration authorization was changed.
+
+Local verification with normal Windows filesystem access:
+
+```text
+go test -mod=readonly -p=1 -count=1 -timeout=10m ./internal/jobs -run '^(TestWaitingUserResumeStartsANewAttemptAndPausedCancelIsTerminal|TestResumeWaitsForConcurrentApprovalRevocationAndFailsClosed|TestComposeWorkerApprovalResumeRevocationRaceAndSingleDeployment)$'
+go test -mod=readonly -tags live_docker -run '^$' ./cmd/hostd
+```
+
+The three resume/approval tests passed in 1.156s; Docker-tagged compilation
+passed in 0.745s. Formatting and aggregate diff checks passed. Independent
+read-only QA review confirmed the worker race and retained assertions. The
+hosted migration test must pass at the corrected revision before acceptance;
+tagged compilation does not prove the real Docker journey.
