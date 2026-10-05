@@ -2,7 +2,8 @@
 
 Date: 2026-10-03
 
-Base: `542ce48` (`feature/hosting-m3-rebind-guarded-nonterminal`)
+Original base: `542ce48` (`feature/hosting-m3-rebind-guarded-nonterminal`).
+The current local gate also contains the additive row-24 route correction.
 
 Branch: `feature/hosting-m3-rebind-network-docker-gate`, published as draft
 [PR #122](https://github.com/tyhuang9/rig/pull/122).
@@ -15,7 +16,8 @@ Docker and host-network readers against a disposable local Docker daemon. It
 prepares an actual predecessor gateway and committed LAN grant, then stages a
 generation-scoped successor ingress network. It checks the exact Docker network
 ID and protected sequence-three binding, private bridge shape, one exact
-deterministic host bridge candidate, the planned route and interface prefix,
+deterministic host bridge candidate, the exact hosted Linux subnet, gateway
+`/32`, and broadcast `/32` route delta and planned interface prefix,
 and only the bound Docker network ID and planned Docker prefix. It also checks
 the unchanged prepared SQLite claim, predecessor resources and route, no extra
 application request, and exact replay without another create.
@@ -35,18 +37,18 @@ test and any remaining managed Docker resources or successor network name.
 
 | Check | Result |
 | --- | --- |
-| `go test -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress` | PASS; compile only, no live test executed. |
 | `go test -list '^TestLiveGatewayRebindSuccessorNetworkStage$' ./internal/generatedingress` | PASS; exact test discovered. |
 | `go test -run '^TestLiveGatewayRebindSuccessorNetworkStage$' -count=1 -v ./internal/generatedingress` | SKIP on Windows because `RIG_RUN_LIVE_GATEWAY_V2` is unset. The hosted job sets it and rejects a skip. |
-| `go test -count=1 -timeout=5m -run '^TestGatewayRebindStageNetwork' ./internal/generatedingress` | PASS, 25.812s with normal Windows filesystem access. |
-| `go test -count=1 -timeout=20m ./...` | PASS on the final source; generated-ingress completed in 173.797s. |
-| `go vet -tags live_docker ./internal/generatedingress` | PASS. |
-| `go vet ./...` | PASS. |
+| `go test -count=1 -timeout=5m -run '^TestGatewayRebindStageNetwork' ./internal/generatedingress` | PASS, 25.812s on the original Docker-gate source. The corrected matcher and post-create no-binding regression passed in the row-24 focused run (34.596s) and in the final integrated full suite below. |
+| `go test -p=1 -count=1 -timeout=20m ./...` | PASS on the integrated route-correction and live-gate source; generated-ingress completed in 195.781s. |
+| `go vet -tags live_docker ./internal/generatedingress` | PASS on the original Docker-gate source. |
+| `go vet ./...` | PASS on the integrated source. |
 | `pnpm --dir web install --frozen-lockfile --prefer-offline --fetch-retries=0` | PASS with the exact lockfile after the restricted-network attempt failed. |
 | `pnpm --dir web test` | PASS; 19 files and 502 tests. |
 | `pnpm --dir web build` | PASS; TypeScript and Vite production build. Vite reported its existing large-chunk advisory. |
-| `go build -buildvcs=false ./...` | PASS. Plain `go build ./...` could not obtain VCS status from this local worktree (exit 128), before compilation. |
-| `gofmt -l` on both touched Go tests and `git diff --check` | PASS; no format or whitespace defects. |
+| `go build -buildvcs=false ./...` | PASS on the integrated source. Plain `go build ./...` could not obtain VCS status from this local worktree (exit 128), before compilation. |
+| `go test -tags live_docker -run '^$' ./cmd/hostd ./internal/generatedingress` | PASS compilation on the integrated source; no physical Docker test executed. |
+| `pnpm --dir docs build`, `gofmt`, and `git diff --check` | PASS on the integrated source; no format or whitespace defects. |
 | Hosted Linux Docker live test and cleanup gate | FAILED on four hosted runs; see the attempts below. The local Docker daemon is unavailable. |
 | Physical second-device LAN/address-change proof | Not run; outside this gate. |
 
@@ -114,7 +116,11 @@ Docker bridge. The row-24 correction admits only the complete
 three-route Linux delta; the row-25 live assertion is updated to require that
 same exact physical shape. Focused local tests cover complete, missing,
 duplicate, and unrelated route changes, including failure before protected
-binding. Hosted acceptance on the corrected pair remains pending.
+binding. The integrated source passed the serialized full Go suite, vet, Go
+build, Docker-tagged compilation, and docs build. Security, QA, and final
+integration review found no new binding or cleanup bypass. Hosted acceptance
+on the corrected pair remains pending; the required named live test and
+always-run residue step must both pass at the published head.
 
 ## Remaining work
 

@@ -262,8 +262,9 @@ func logLiveGatewayRebindStageNetworkFailure(t *testing.T, fixture *liveGatewayV
 		projected, intent.NetworkObservation.HostRoutes, intent.NetworkObservation.HostInterfaces)
 	routes, routeErr := canonicalGatewayRebindPrefixes(host.Routes)
 	interfaces, interfaceErr := canonicalGatewayRebindPrefixes(host.Interfaces)
-	routesExact := hostErr == nil && routeErr == nil && gatewayRebindPrefixesMatchBaselineOrPlan(
-		routes, intent.NetworkObservation.HostRoutes, intent.Intent.Network.Subnet)
+	routesExact := hostErr == nil && routeErr == nil && gatewayRebindStageNetworkRoutesMatch(
+		routes, intent.NetworkObservation.HostRoutes, intent.Intent.Network.Subnet,
+		intent.Intent.Network.GatewayIPv4)
 	interfacesExact := hostErr == nil && interfaceErr == nil && gatewayRebindPrefixesMatchBaselineOrPlan(
 		interfaces, intent.NetworkObservation.HostInterfaces, intent.Intent.Network.Subnet)
 	expectedIDs := append([]string{}, intent.NetworkObservation.DockerNetworkIDs...)
