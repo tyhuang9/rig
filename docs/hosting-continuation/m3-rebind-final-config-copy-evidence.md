@@ -256,6 +256,54 @@ unverified until those jobs and this branch's two required Docker journeys
 pass. The local Docker engine is unavailable. No Linux race, physical Docker
 or second-device pass is claimed for this correction.
 
+## Hosted results and race partition correction (2026-10-05)
+
+At source `b46162ea4a97335976663770b17d2a44612cc3f9`, all nine jobs in
+[the M3 Docker workflow](https://github.com/tyhuang9/rig/actions/runs/37385339443)
+passed. The direct final-config-copy test passed once in 122.39s
+(job 112017115825), and lost-acknowledgment adoption passed once in 91.63s
+(job 112017115651). Their logs contain zero failed or skipped named tests,
+and both complete resource-cleanup steps succeeded. The inherited stage-start
+job 112017115741 passed its direct, lost-acknowledgment and withdrawal tests
+in 90.55s, 74.44s and 75.92s, with successful cleanup. These establish only
+the named physical boundaries; final handover and cross-store recovery remain
+separate acceptance requirements.
+
+Windows verification and the runtime-packages and gateway-v2 race batches
+also passed on that source. The
+[ingress-remainder race batch](https://github.com/tyhuang9/rig/actions/runs/37385339467/job/112021142430)
+failed at its 32-minute Go package timeout (1920.03s). The log contains no
+data-race report or failed test assertion before timeout. The active
+`TestGatewayRebindStageConfigVolumeReplayRejectsIdentityAndCensusSubstitution/foreign_labels`
+subtest had run for seven seconds; its stack was constructing the real SQL
+fixture. This is a failed check, not a race pass or proof that all tests finish.
+
+The correction partitions the growing rebind tests into history, config and
+resource batches. Gateway-v2 and all other ingress tests remain in their
+complementary batches; other runtime packages stay unfiltered. Every test's
+complete subtest tree, race instrumentation, timeout, nonempty-pass guard and
+required aggregate gate are retained. No application source or fixture changes.
+
+Local verification used the repository's existing YAML parser and the actual
+test census:
+
+```powershell
+go test -mod=readonly -list '^Test' ./internal/generatedingress
+go run -mod=readonly C:/Users/huang/Documents/Projects/Rig/temp/m3-pr136-race-partition-check.go $env:TEMP/m3-pr136-race-test-census.txt C:/Users/huang/Documents/Projects/Rig/temp/m3-pr136-race-partition.sh
+wsl -- bash -n /mnt/c/Users/huang/Documents/Projects/Rig/temp/m3-pr136-race-partition.sh
+```
+
+All 597 Windows-discovered top-level tests are selected exactly once:
+gateway-v2 137, rebind-history 88, rebind-config 55, rebind-resources 78,
+ingress-remainder 239. These selection and syntax checks do not run the Linux
+race detector; hosted execution must establish each new batch's result.
+YAML parsing, the extracted Bash syntax check, and `git diff --check` passed.
+`pnpm --dir docs check:workflow` passed, and `pnpm --dir docs build` completed
+successfully in 4.36s. The verification scripts and test census are temporary
+local evidence; no additional dependency is introduced.
+The PostgreSQL/repository-wide race job was still running when this correction
+was prepared. No success is inferred for it.
+
 ## Remaining work and rollback
 
 M3 still requires three cohesive delivery units, each combining implementation
