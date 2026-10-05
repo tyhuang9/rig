@@ -1006,8 +1006,15 @@ func gatewayV2IdentityTestObservation(t *testing.T, source routeState, state gat
 	}
 	v1Networks := map[string]*networkAttachment{
 		caddyNetworkName: {IPAddress: v1IP, GwPriority: caddyGatewayPriority},
-		"net-a":          {IPAddress: "172.30.0.2"},
-		"net-b":          {IPAddress: "172.31.0.2"},
+	}
+	v1Owners, _ := gatewayRouteNetworkOwners(source.Active)
+	v1Names := make([]string, 0, len(v1Owners))
+	for name := range v1Owners {
+		v1Names = append(v1Names, name)
+	}
+	sort.Strings(v1Names)
+	for index, name := range v1Names {
+		v1Networks[name] = &networkAttachment{IPAddress: "172." + strconv.Itoa(30+index) + ".0.2"}
 	}
 	observation := gatewayV2DockerObservation{
 		Image: gatewayV2IdentityTestImage(), ImageFound: true,
