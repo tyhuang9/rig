@@ -1,13 +1,12 @@
 # M3 rebind draft PR stack
 
-Status: local, unpublished plan as of 2026-10-03. The published base is draft
-PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each row's
-branch descends from the preceding row's branch, with one review scope per
-draft. Each draft would target the preceding row's branch. Row 15 includes the
-initial version of this plan after its scope commit; rows 25, 27, 28, and 29 update it.
-None of these rows authorizes publication, merge, or deployment. Publication
-approval for rows 1–25 is pending separately; rows 26–29 require their own
-approval after the prerequisite hosted network gate passes.
+Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
+draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
+row's branch descends from the preceding row's branch and targets it with one
+review scope. Rows 26–29 remain local and require separate publication
+approval. The first two hosted row-25 network Docker attempts failed; the
+corrected head's required job is queued, so no hosted network-stage acceptance
+is claimed. No draft publication authorizes merge or deployment.
 
 | Order | Branch | Scope commit | Review scope |
 | --- | --- | --- | --- |
@@ -52,8 +51,9 @@ live test also only compiled and skipped locally. Row 28 passed its final-source
 Go suite, vet, build, and Docker-tagged compile. Row 29 passed its final-source
 Go suite, vet, build, and Docker-tagged compile; its live test only compiled
 and skipped locally. PR #97's hosted checks passed at its published head. The
-Docker gates in rows 14, 16, 25, 27, and 29 require publication and hosted
-execution before they can count as acceptance evidence.
+Docker gates in rows 14, 16, 25, 27, and 29 count as acceptance only after
+successful required hosted tests at the relevant head; rows 27 and 29 remain
+local and have no hosted Docker acceptance.
 
 These branches do not add a public rebind controller caller, terminal protected
 receipt, successor cutover, transfer-aware readers, recovery, or fence release.

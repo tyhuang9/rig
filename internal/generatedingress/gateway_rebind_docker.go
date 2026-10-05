@@ -1,5 +1,7 @@
 package generatedingress
 
+import "reflect"
+
 // validGatewayRebindPredecessorDocker proves ownership of the committed v2
 // predecessor's static ownership and configuration without claiming its
 // historical host address or application routes are reachable. A
@@ -36,4 +38,19 @@ func validGatewayRebindPredecessorDocker(source routeState, state gatewayV2Route
 		validGatewayV2ApplicationNetworks(state, observation.FinalContainer, observation.ApplicationNetworks, observation.ApplicationNetworkIDs) &&
 		validGatewayV2FinalConfig(state, observation.FinalConfig, observation.FinalRestartConfig) &&
 		observation.FinalEndpointIdentityProven
+}
+
+// Docker may report the two exact final-container volume mounts in either
+// order. Each observation must independently prove both journal-bound mounts;
+// only their slice order is ignored when comparing the two full observations.
+func sameGatewayRebindPredecessorDockerObservation(first, second gatewayV2DockerObservation,
+	identity gatewayV2Identity,
+) bool {
+	if !validGatewayV2Mounts(first.FinalContainer.Mounts, identity) ||
+		!validGatewayV2Mounts(second.FinalContainer.Mounts, identity) {
+		return false
+	}
+	first.FinalContainer.Mounts = nil
+	second.FinalContainer.Mounts = nil
+	return reflect.DeepEqual(first, second)
 }
