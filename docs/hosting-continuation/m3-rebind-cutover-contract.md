@@ -285,15 +285,18 @@ discovery must reject missing sequence numbers, duplicate sequences, multiple
 terminal receipts, unknown files in the reserved history namespace, purpose
 mismatches, or any changed retained artifact.
 
-The private protected-history format currently defines only the two pre-effect
-records, `successor_intent` and `stage_intent`, with purpose-bound, sequenced
-create-only bundles. The latter stores the approved image content digest and
-the separately observed Docker image ID. Its storage validator binds the
-approved digest, successor identity, and selected network plan to the
-installed intent; it checks the observed image ID and topology digest only
-for syntax. It cannot authenticate Docker or host topology. A guarded writer
-must repeat those observations under its own locks before any resource effect.
-No terminal phase or receipt is installed by this format.
+The private protected-history format defines two pre-effect records,
+`successor_intent` and `stage_intent`, followed by a create-only sequence-three
+binding for the first successor ingress-network effect. `stage_intent` stores
+the approved image content digest and separately observed Docker image ID.
+Its storage validator binds the approved digest, successor identity, and
+selected network plan to the installed intent; it checks the observed image
+ID and topology digest only for syntax. The guarded network writer compares
+both with fresh observations under the deployment lease and gateway locks
+before creating a resource. Sequence three preserves the entire prior stage
+payload and binds Docker's returned network ID and the exact ownership digest.
+An unbound network remains fenced for separately reviewed recovery. No
+terminal phase or receipt is installed by this format.
 
 The implementation may reuse the existing generation filename conventions
 only if the scanner can distinguish an ordinary v1-to-v2 upgrade from a

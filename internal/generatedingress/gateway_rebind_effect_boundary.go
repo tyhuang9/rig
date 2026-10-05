@@ -125,11 +125,26 @@ func (m *Manager) attestGatewayRebindPreparedEffectBoundary(ctx context.Context,
 		}
 	}()
 
+	return m.attestGatewayRebindPreparedEffectBoundaryLocked(ctx, repository, reads, inspectDocker, checkpoint)
+}
+
+// attestGatewayRebindPreparedEffectBoundaryLocked performs the complete
+// pre-effect read sequence while its caller keeps the deployment-effects
+// lease, Manager mutex, and gateway OS lock. It is intentionally usable only
+// before the first successor resource exists: later recovery has a separate
+// phase-aware attestor for the one exact protected successor delta.
+func (m *Manager) attestGatewayRebindPreparedEffectBoundaryLocked(ctx context.Context,
+	repository *appaccess.Repository, reads gatewayRebindSuccessorPreflightReads,
+	inspectDocker gatewayRebindDockerInspector, checkpoint func(),
+) (gatewayRebindEffectBoundaryEvidence, error) {
 	first, err := m.readGatewayRebindEffectBoundaryObservation(ctx, repository, reads, inspectDocker)
 	if err != nil {
 		return gatewayRebindEffectBoundaryEvidence{}, err
 	}
 	defer clearGatewayV2DockerObservation(&first.docker)
+	if first.progressCount > 2 {
+		return gatewayRebindEffectBoundaryEvidence{}, gatewayRebindEffectBoundaryError(ctx)
+	}
 	if checkpoint != nil {
 		checkpoint()
 	}
@@ -238,7 +253,7 @@ func (m *Manager) readGatewayRebindEffectBoundaryAnchor(ctx context.Context,
 func gatewayRebindEffectBoundaryProgressDigest(intent gatewayRebindProtectedIntent,
 	progress []gatewayRebindProgressSelection,
 ) (uint64, string, error) {
-	if !validGatewayRebindProtectedIntent(intent) || len(progress) > 2 {
+	if !validGatewayRebindProtectedIntent(intent) || len(progress) > gatewayRebindProgressMaximumSequence {
 		return 0, "", errors.New("invalid generated ingress rebind effect-boundary progress")
 	}
 	chain := gatewayRebindEffectBoundaryProgressChain{
