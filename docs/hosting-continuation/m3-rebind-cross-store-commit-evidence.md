@@ -315,6 +315,40 @@ PR #136's CodeRabbit status was successful, but its actual comment says draft
 review was skipped, and there were no reviews or inline findings. That status
 is not source-review evidence.
 
+Further completed jobs were verified from their actual logs and exact job heads:
+
+| PR and source | Named Docker test | Result | Job |
+| --- | --- | --- | --- |
+| #135 `e46185f` | `TestLiveGatewayRebindSuccessorNetworkStage` | One pass, 54.49s | [Network stage](https://github.com/tyhuang9/rig/actions/runs/37373345314/job/111975694496) |
+| #135 `e46185f` | `TestLiveGatewayRebindSuccessorDataVolumeStage` | One pass, 66.17s | [Data volume](https://github.com/tyhuang9/rig/actions/runs/37373345314/job/111975694520) |
+| #136 `bdbb697` | `TestLiveGatewayRebindSuccessorStoppedStageContainer` | One pass, 57.97s | [Stopped container](https://github.com/tyhuang9/rig/actions/runs/37374324911/job/111978936464) |
+
+Each had no named test failure or skip and passed its required complete cleanup.
+The PR #135
+[guarded stage-start job](https://github.com/tyhuang9/rig/actions/runs/37373345314/job/111975694535)
+ultimately failed all three journeys and cleanup. The direct case failed in
+98.89s, lost-acknowledgment in 85.00s and compensation in 92.86s; all retained
+containers were `Created`. Source inspection found the fixture assigned the
+successor the same IPv4/port still occupied by the running predecessor.
+
+The reviewed test-only correction uses two distinct private addresses on a
+test-owned dummy adapter, requires explicit network opt-in, and adds adapter
+residue checks while retaining all runtime proofs. It was published as normal
+additive updates to the already authorized drafts:
+
+| Draft | Exact corrected head |
+| --- | --- |
+| [#134](https://github.com/tyhuang9/rig/pull/134) | `b938a7af629c1494193050ed505121bb5934394c` |
+| [#135](https://github.com/tyhuang9/rig/pull/135) | `f2b7815c9b15f47d328cd4f38f6e32b905307cd2` |
+| [#136](https://github.com/tyhuang9/rig/pull/136) | `46c8351c174f5c4ed788d04a733b61a5c72b1243` |
+
+Compilation, focused static checks, named opt-in refusal, workflow YAML/Bash
+syntax, documentation and independent source review passed for that correction.
+The exact remote heads, bases and open draft states were verified. New hosted
+Docker results remain required; the earlier named passes do not prove this
+changed physical fixture. The original daemon stderr was not retained, so
+acceptance must come from the corrected Docker run.
+
 The containing workflow was still running, so the completed job's metadata and
 logs were read directly. This proves those named inherited journeys only.
 PR #136's two final-config-copy Docker jobs remained queued at the latest check;
