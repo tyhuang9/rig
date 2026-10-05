@@ -1245,8 +1245,13 @@ func stopGatewayV1IdentityTestContainer(observation *gatewayV2DockerObservation)
 func gatewayV2IdentityTestApplicationNetworkIDs(routes map[string]routeRecord) map[string]string {
 	owners, _ := gatewayRouteNetworkOwners(routes)
 	result := make(map[string]string, len(owners))
-	index := 7
+	names := make([]string, 0, len(owners))
 	for name := range owners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	index := 7
+	for _, name := range names {
 		result[name] = "sha256:" + strings.Repeat(strconv.Itoa(index), 64)
 		index++
 	}
