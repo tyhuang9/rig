@@ -77,6 +77,7 @@ const (
 	gatewayHistoryJournal
 	gatewayHistoryReceipt
 	gatewayHistoryAbort
+	gatewayHistoryRebindIntent
 )
 
 type gatewayHistoryArtifact struct {
@@ -92,9 +93,16 @@ type gatewayHistoryGeneration struct {
 	abort       gatewayHistoryArtifact
 }
 
+type gatewayRebindHistoryGeneration struct {
+	generation  uint64
+	operationID string
+	intent      gatewayHistoryArtifact
+}
+
 type gatewayHistorySnapshot struct {
-	generations map[uint64]gatewayHistoryGeneration
-	files       map[string]gatewayHistoryFileFingerprint
+	generations   map[uint64]gatewayHistoryGeneration
+	rebindIntents map[uint64]gatewayRebindHistoryGeneration
+	files         map[string]gatewayHistoryFileFingerprint
 }
 
 type gatewayHistoryFileFingerprint struct {
@@ -432,13 +440,41 @@ func (m *Manager) resolveGatewayUpgradeGenerationLocked(operationID string) (gat
 }
 
 func (m *Manager) scanGatewayUpgradeHistoryLockedMode(allowCurrentTail bool, partialOperationID string) (gatewayUpgradeHistory, error) {
+	result, _, err := m.scanGatewayUpgradeHistoryLockedModeWithSnapshot(allowCurrentTail, partialOperationID, false)
+	return result, err
+}
+
+// scanGatewayUpgradeHistoryLockedModeRebindAware is available only to the
+// protected rebind history reader. Normal ownership and startup callers use
+// the legacy wrapper above and fail closed when any rebind artifact exists.
+func (m *Manager) scanGatewayUpgradeHistoryLockedModeRebindAware(allowCurrentTail bool, partialOperationID string) (gatewayUpgradeHistory, gatewayHistorySnapshot, error) {
+	return m.scanGatewayUpgradeHistoryLockedModeWithSnapshot(allowCurrentTail, partialOperationID, true)
+}
+
+func (m *Manager) scanGatewayUpgradeHistoryLockedModeWithSnapshot(allowCurrentTail bool, partialOperationID string,
+	allowRebind bool,
+) (gatewayUpgradeHistory, gatewayHistorySnapshot, error) {
 	if m == nil || m.store == nil {
-		return gatewayUpgradeHistory{}, errors.New("generated ingress history store is unavailable")
+		return gatewayUpgradeHistory{}, gatewayHistorySnapshot{}, errors.New("generated ingress history store is unavailable")
 	}
-	before, err := readGatewayHistorySnapshot(m.store)
+	before, err := readGatewayHistorySnapshotMode(m.store, allowRebind)
 	if err != nil {
-		return gatewayUpgradeHistory{}, err
+		return gatewayUpgradeHistory{}, gatewayHistorySnapshot{}, err
 	}
+	result, err := m.scanGatewayUpgradeHistorySnapshot(before, allowCurrentTail, partialOperationID)
+	if err != nil {
+		return gatewayUpgradeHistory{}, gatewayHistorySnapshot{}, err
+	}
+	after, err := readGatewayHistorySnapshotMode(m.store, allowRebind)
+	if err != nil || !sameGatewayHistorySnapshot(before, after) {
+		return gatewayUpgradeHistory{}, gatewayHistorySnapshot{}, errors.New("generated ingress upgrade history changed during inspection")
+	}
+	return result, before, nil
+}
+
+func (m *Manager) scanGatewayUpgradeHistorySnapshot(before gatewayHistorySnapshot,
+	allowCurrentTail bool, partialOperationID string,
+) (gatewayUpgradeHistory, error) {
 	generations := make([]uint64, 0, len(before.generations))
 	for generation := range before.generations {
 		generations = append(generations, generation)
@@ -451,6 +487,7 @@ func (m *Manager) scanGatewayUpgradeHistoryLockedMode(allowCurrentTail bool, par
 	}
 
 	var result gatewayUpgradeHistory
+	var err error
 	seenOperations := make(map[string]struct{}, len(generations))
 	for index, generation := range generations {
 		artifacts := before.generations[generation]
@@ -576,14 +613,14 @@ func (m *Manager) scanGatewayUpgradeHistoryLockedMode(allowCurrentTail bool, par
 		result.generations = append(result.generations, selection)
 	}
 
-	after, err := readGatewayHistorySnapshot(m.store)
-	if err != nil || !sameGatewayHistorySnapshot(before, after) {
-		return gatewayUpgradeHistory{}, errors.New("generated ingress upgrade history changed during inspection")
-	}
 	return result, nil
 }
 
 func readGatewayHistorySnapshot(store *stateStore) (gatewayHistorySnapshot, error) {
+	return readGatewayHistorySnapshotMode(store, false)
+}
+
+func readGatewayHistorySnapshotMode(store *stateStore, allowRebind bool) (gatewayHistorySnapshot, error) {
 	if store == nil {
 		return gatewayHistorySnapshot{}, errors.New("generated ingress history store is unavailable")
 	}
@@ -596,8 +633,9 @@ func readGatewayHistorySnapshot(store *stateStore) (gatewayHistorySnapshot, erro
 		return gatewayHistorySnapshot{}, err
 	}
 	snapshot := gatewayHistorySnapshot{
-		generations: make(map[uint64]gatewayHistoryGeneration),
-		files:       make(map[string]gatewayHistoryFileFingerprint),
+		generations:   make(map[uint64]gatewayHistoryGeneration),
+		rebindIntents: make(map[uint64]gatewayRebindHistoryGeneration),
+		files:         make(map[string]gatewayHistoryFileFingerprint),
 	}
 	for _, entry := range entries {
 		generation, operationID, kind, relevant, parseErr := parseGatewayHistoryArtifactName(entry.Name())
@@ -607,6 +645,9 @@ func readGatewayHistorySnapshot(store *stateStore) (gatewayHistorySnapshot, erro
 		if !relevant {
 			continue
 		}
+		if kind == gatewayHistoryRebindIntent && !allowRebind {
+			return gatewayHistorySnapshot{}, errors.New("generated ingress rebind history requires a rebind-aware scanner")
+		}
 		path := filepath.Join(store.root, entry.Name())
 		if filepath.Dir(path) != store.root || filepath.Clean(path) != path {
 			return gatewayHistorySnapshot{}, errors.New("generated ingress upgrade history path is invalid")
@@ -614,6 +655,18 @@ func readGatewayHistorySnapshot(store *stateStore) (gatewayHistorySnapshot, erro
 		fingerprint, readErr := fingerprintGatewayHistoryArtifact(path)
 		if readErr != nil {
 			return gatewayHistorySnapshot{}, readErr
+		}
+		artifact := gatewayHistoryArtifact{path: path}
+		if kind == gatewayHistoryRebindIntent {
+			artifacts := snapshot.rebindIntents[generation]
+			if artifacts.intent.path != "" ||
+				(artifacts.operationID != "" && artifacts.operationID != operationID) {
+				return gatewayHistorySnapshot{}, errors.New("generated ingress rebind generation has duplicate intents")
+			}
+			artifacts.generation, artifacts.operationID, artifacts.intent = generation, operationID, artifact
+			snapshot.rebindIntents[generation] = artifacts
+			snapshot.files[entry.Name()] = fingerprint
+			continue
 		}
 		artifacts := snapshot.generations[generation]
 		artifacts.generation = generation
@@ -623,7 +676,6 @@ func readGatewayHistorySnapshot(store *stateStore) (gatewayHistorySnapshot, erro
 		if operationID != "" {
 			artifacts.operationID = operationID
 		}
-		artifact := gatewayHistoryArtifact{path: path}
 		switch kind {
 		case gatewayHistoryState:
 			if artifacts.state.path != "" {
@@ -714,6 +766,7 @@ func sameGatewayHistoryFileMetadata(left, right os.FileInfo) bool {
 }
 
 func parseGatewayHistoryArtifactName(name string) (uint64, string, gatewayHistoryArtifactKind, bool, error) {
+	lowerName := strings.ToLower(name)
 	switch name {
 	case v2RouteStateFilename:
 		return 0, "", gatewayHistoryState, true, nil
@@ -748,10 +801,27 @@ func parseGatewayHistoryArtifactName(name string) (uint64, string, gatewayHistor
 		}
 		return generation, parts[1], candidate.kind, true, nil
 	}
+	if strings.HasPrefix(lowerName, gatewayRebindProtectedIntentFilenamePrefix) {
+		if !strings.HasPrefix(name, gatewayRebindProtectedIntentFilenamePrefix) {
+			return 0, "", 0, true, errors.New("generated ingress rebind history filename is invalid")
+		}
+		tail := strings.TrimSuffix(strings.TrimPrefix(name, gatewayRebindProtectedIntentFilenamePrefix), ".bundle")
+		parts := strings.Split(tail, ".")
+		if !strings.HasSuffix(name, ".bundle") || len(parts) != 2 ||
+			len(parts[0]) != gatewayV2GenerationDigits || !validCanonicalUUID(parts[1]) {
+			return 0, "", 0, true, errors.New("generated ingress rebind history filename is invalid")
+		}
+		generation, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil || generation == 0 || fmt.Sprintf("%0*d", gatewayV2GenerationDigits, generation) != parts[0] {
+			return 0, "", 0, true, errors.New("generated ingress rebind history generation is invalid")
+		}
+		return generation, parts[1], gatewayHistoryRebindIntent, true, nil
+	}
 	// Reserve the whole upgrade-history namespace. New terminal record types
 	// must be explicitly taught to this scanner before they can affect
 	// ownership, so unknown artifacts fail closed.
-	if strings.HasPrefix(name, "routes-v2") || strings.HasPrefix(name, "gateway-v1-to-v2") {
+	if strings.HasPrefix(lowerName, "routes-v2") || strings.HasPrefix(lowerName, "gateway-v1-to-v2") ||
+		strings.HasPrefix(lowerName, "gateway-rebind") {
 		return 0, "", 0, true, errors.New("generated ingress upgrade history filename is invalid")
 	}
 	return 0, "", 0, false, nil
