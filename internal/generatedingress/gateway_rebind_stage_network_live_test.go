@@ -3,6 +3,8 @@ package generatedingress
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
+	"net/netip"
 	"reflect"
 	"sort"
 	"strconv"
@@ -283,6 +285,63 @@ func logLiveGatewayRebindStageNetworkFailure(t *testing.T, fixture *liveGatewayV
 	t.Logf("rebind network failure: candidates_read_ok=%t bridge_candidate_exact=%t host_read_ok=%t routes_exact=%t interfaces_exact=%t docker_ids_read_ok=%t docker_ids_exact=%t docker_prefixes_read_ok=%t docker_prefixes_exact=%t physical_read_ok=%t",
 		candidatesErr == nil, candidatesExact, hostErr == nil, routesExact, interfacesExact,
 		idsErr == nil, idsExact, prefixesErr == nil, prefixesExact, physicalReadOK)
+	if hostErr == nil && routeErr == nil {
+		plan, planErr := netip.ParsePrefix(intent.Intent.Network.Subnet)
+		gateway, gatewayErr := netip.ParseAddr(intent.Intent.Network.GatewayIPv4)
+		if planErr == nil && plan.Addr().Is4() && gatewayErr == nil && gateway.Is4() {
+			lastOctets := plan.Masked().Addr().As4()
+			last := binary.BigEndian.Uint32(lastOctets[:]) |
+				uint32((uint64(1)<<uint(32-plan.Bits()))-1)
+			binary.BigEndian.PutUint32(lastOctets[:], last)
+			broadcast32 := netip.AddrFrom4(lastOctets).String() + "/32"
+			baseline := make(map[string]int, len(intent.NetworkObservation.HostRoutes))
+			for _, prefix := range intent.NetworkObservation.HostRoutes {
+				baseline[prefix]++
+			}
+			added := make(map[string]int)
+			addedPlan, addedGateway, addedBroadcast := 0, 0, 0
+			addedInside32, addedInsideOther, addedOutside := 0, 0, 0
+			for _, prefix := range routes {
+				if baseline[prefix] > 0 {
+					baseline[prefix]--
+					continue
+				}
+				added[prefix]++
+				switch {
+				case prefix == plan.String():
+					addedPlan++
+				case prefix == gateway.String()+"/32":
+					addedGateway++
+				case prefix == broadcast32:
+					addedBroadcast++
+				default:
+					parsed, parseErr := netip.ParsePrefix(prefix)
+					if parseErr == nil && parsed.Bits() >= plan.Bits() && plan.Contains(parsed.Addr()) {
+						if parsed.Bits() == 32 {
+							addedInside32++
+						} else {
+							addedInsideOther++
+						}
+					} else {
+						addedOutside++
+					}
+				}
+			}
+			removed, duplicateAdded := 0, 0
+			for _, count := range baseline {
+				removed += count
+			}
+			for _, count := range added {
+				if count > 1 {
+					duplicateAdded += count - 1
+				}
+			}
+			t.Logf("rebind network failure: route_delta baseline=%d observed=%d removed=%d added_plan=%d added_gateway32=%d added_broadcast32=%d added_other_inside32=%d added_other_inside_non32=%d added_outside=%d duplicate_added=%d",
+				len(intent.NetworkObservation.HostRoutes), len(routes), removed, addedPlan,
+				addedGateway, addedBroadcast, addedInside32, addedInsideOther,
+				addedOutside, duplicateAdded)
+		}
+	}
 
 	first, firstErr := fixture.ingress.inspectGatewayRebindDocker(ctx, source, state, journal)
 	second, secondErr := fixture.ingress.inspectGatewayRebindDocker(ctx, source, state, journal)
