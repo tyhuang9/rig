@@ -145,7 +145,10 @@ timed out at the inherited 18-minute Go package limit, without a race report.
 The previous successful pre-correction generated-ingress race package had
 completed in 1074.037s, only 5.963s below that limit. The parent row-24 branch
 now raises the Go, step, and job budgets to 24, 26, and 35 minutes without
-removing test coverage. This correction has not yet passed hosted race CI.
+removing test coverage. The [expanded-budget race job 111614264166](https://github.com/tyhuang9/rig/actions/runs/37263115647/job/111614264166)
+then passed at head `a5b4d10`; `internal/generatedingress` took 1116.225s.
+This proves the same suite completed beyond the old 1080s limit. The next
+late-parity-corrected head still requires its own hosted race result.
 
 ## Later hosted replay failure, 2026-10-05 UTC
 
