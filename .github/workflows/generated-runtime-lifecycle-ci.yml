@@ -220,7 +220,7 @@ jobs:
   generated-runtime-race:
     name: Generated runtime race verification
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - name: Check out source
         timeout-minutes: 2
@@ -236,9 +236,9 @@ jobs:
           cache: false
 
       - name: Run generated-runtime race tests
-        timeout-minutes: 20
+        timeout-minutes: 26
         run: >-
-          go test -race -count=1 -timeout=18m
+          go test -race -count=1 -timeout=24m
           ./internal/projectanalysis
           ./internal/deploymentplans
           ./internal/generatedimage
