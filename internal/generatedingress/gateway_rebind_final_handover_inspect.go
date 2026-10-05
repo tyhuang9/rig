@@ -116,7 +116,7 @@ func (d managerGatewayRebindFinalHandoverDriver) readHandover(ctx context.Contex
 		containerID = proof.FinalID
 	}
 	if containerID != "" {
-		if !d.handoverConfigPair(ctx, value, containerID) {
+		if !d.handoverConfigPair(ctx, value, containerID, proof.Final == gatewayRebindHandoverContainerRunning) {
 			return invalid()
 		}
 		proof.ConfigDigest = value.SequenceTwelve.Stage.FinalConfigIntent.ContentDigest
@@ -297,7 +297,41 @@ func (d managerGatewayRebindFinalHandoverDriver) handoverVolumeUsersExact(ctx co
 	return true
 }
 
-func (d managerGatewayRebindFinalHandoverDriver) handoverConfigPair(ctx context.Context, value gatewayRebindFinalHandoverContext, id string) bool {
+func gatewayRebindFinalHandoverAutosaveMode(phase, rollbackFrom gatewayRebindProgressPhase, final, running bool) gatewayRebindFinalConfigAutosaveMode {
+	if phase == gatewayRebindProgressRollbackIntent {
+		if !gatewayRebindFinalHandoverRollbackSourcePhase(rollbackFrom) {
+			return 0
+		}
+		phase = rollbackFrom
+	}
+	if !final {
+		if phase == gatewayRebindProgressFinalConfigCopied || phase == gatewayRebindProgressFinalHandoverIntent {
+			return gatewayRebindFinalConfigStageAutosave
+		}
+		return 0
+	}
+	switch phase {
+	case gatewayRebindProgressFinalHandoverIntent, gatewayRebindProgressFinalContainerBound:
+		if !running {
+			return gatewayRebindFinalConfigStageAutosave
+		}
+	case gatewayRebindProgressCutoverIntent:
+		if running {
+			return gatewayRebindFinalConfigActiveAutosave
+		}
+		return gatewayRebindFinalConfigEitherAutosave
+	case gatewayRebindProgressSuccessorServing, gatewayRebindProgressHandoverCommitted:
+		return gatewayRebindFinalConfigActiveAutosave
+	}
+	return 0
+}
+
+func (d managerGatewayRebindFinalHandoverDriver) handoverConfigPair(ctx context.Context, value gatewayRebindFinalHandoverContext, id string, finalRunning bool) bool {
+	mode := gatewayRebindFinalHandoverAutosaveMode(value.Phase, value.RollbackFromPhase,
+		id != value.SequenceTwelve.Stage.StageContainer.ID, finalRunning)
+	if mode == 0 {
+		return false
+	}
 	stage, err := gatewayRebindStageConfigBytes(value.Intent)
 	if err != nil {
 		return false
@@ -317,7 +351,7 @@ func (d managerGatewayRebindFinalHandoverDriver) handoverConfigPair(ctx context.
 	if err != nil || ctx.Err() != nil || result.StdoutTruncated || result.StderrTruncated || len(result.Stderr) != 0 {
 		return false
 	}
-	inventory, err := gatewayRebindExactFinalConfigVolumeArchive(result.Stdout, stage, active)
+	inventory, err := gatewayRebindExactFinalConfigVolumeArchiveWithAutosave(result.Stdout, stage, active, mode)
 	return err == nil && inventory == gatewayRebindFinalConfigInventoryExactPair
 }
 

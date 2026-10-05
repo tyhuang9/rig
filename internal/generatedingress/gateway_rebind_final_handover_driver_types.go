@@ -55,14 +55,15 @@ type gatewayRebindFinalContainerBinding struct {
 // back a successful create response before installing its immutable binding.
 // It never authorizes a mutation and must never be recovered by name or label.
 type gatewayRebindFinalHandoverContext struct {
-	Intent         gatewayRebindProtectedIntent
-	SequenceTwelve gatewayRebindProgressRecord
-	Predecessor    gatewayUpgradeGenerationSelection
-	Source         routeState
-	Phase          gatewayRebindProgressPhase
-	Plan           *gatewayRebindFinalHandoverPlan
-	Final          *gatewayRebindFinalContainerBinding
-	CreatedFinalID string
+	Intent            gatewayRebindProtectedIntent
+	SequenceTwelve    gatewayRebindProgressRecord
+	Predecessor       gatewayUpgradeGenerationSelection
+	Source            routeState
+	Phase             gatewayRebindProgressPhase
+	RollbackFromPhase gatewayRebindProgressPhase
+	Plan              *gatewayRebindFinalHandoverPlan
+	Final             *gatewayRebindFinalContainerBinding
+	CreatedFinalID    string
 }
 
 // Observation contains only independently validated, normalized evidence.

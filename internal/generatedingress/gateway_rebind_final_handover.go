@@ -557,6 +557,9 @@ func (r *gatewayRebindFinalHandoverRun) handoverContext(history gatewayRebindPro
 	if last.Handover != nil {
 		value.Plan = last.Handover.Plan
 		value.Final = last.Handover.Final
+		if last.Handover.Rollback != nil {
+			value.RollbackFromPhase = last.Handover.Rollback.FromPhase
+		}
 	}
 	return value
 }
