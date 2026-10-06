@@ -9,7 +9,7 @@ Base: `a888cac5f34c46aad74afd5c3a0392eec914c509`, the reviewed private handover
 candidate. That handover's draft-publication request is pending. Its prerequisite
 [draft PR #136](https://github.com/tyhuang9/rig/pull/136) was initially published at
 `bdbb697f767da4e71664da1434a75e6daec4b732`; its corrected current head is
-`7deefa45ffeaf8b3ffade482ababf5a92368c10c`.
+`9694b4ecf0086174a4002098a2aa203c96907d50`.
 
 ## Purpose and required end state
 
@@ -881,8 +881,17 @@ workflow concurrency after the update; its PostgreSQL-specific steps passed,
 but its repository-wide result is unverified. New race batches at `7deefa4`
 all passed, including the aggregate check (run `37391508420`). Windows passed
 at the same head (run `37391508875`). The repository-wide race step in run
-`37391508290` remains pending. The published correction is integrated locally
-at `3cf6bb8`.
+`37391508290` subsequently hit its 40-minute ingress package timeout, without a
+preceding race report or failed assertion. The original published correction is
+integrated locally at `3cf6bb8`. The reviewed follow-up `9694b4e` moves that
+workflow onto the same shared ingress partitions and retains all other 49
+packages, PostgreSQL checks, and the original required aggregate check. It is
+integrated locally at `e1c4d49`. New exact-head runs are
+[repository race](https://github.com/tyhuang9/rig/actions/runs/37399509007),
+[lifecycle race](https://github.com/tyhuang9/rig/actions/runs/37399508966), and
+[M3 Docker](https://github.com/tyhuang9/rig/actions/runs/37399509055). Their full
+results remain pending. The failed run and correction are recorded in the
+[final-copy evidence](./m3-rebind-final-config-copy-evidence.md).
 
 Keep the new runtime path unavailable until its complete invariants and gates
 are satisfied. Reverting source must not delete protected receipts, committed
@@ -994,3 +1003,70 @@ passed all three boundary/regression tests in 9.777s, with zero failure or
 skip (`Rig/temp/cross-store-review-7d-quarantine-green.jsonl`). This acceptance
 covers native startup/quarantine only; production rebound physical attestation,
 the coordinator and full runtime delivery acceptance remain pending.
+
+### Current physical contract and prepared-process fixture checkpoint
+
+Integrated the reviewed current physical-transition contract
+`4a191437c1dca2ecf71f78fd8a7e4896f2b07205` at `7e76ebe`, then the selected-current
+compensation contract `693ccd84f48def503f90ec5b10b091875390eb3b` at `f1729e4`.
+The former requires exact before/effective projections at the selected protected
+revision; a stopped outcome requires listener absence. It binds transferred
+withdrawals to their immutable raw grant and effective profile separately.
+Independent review first reproduced the unrelated-route acceptance defect at
+the earlier `eaaa3dd` checkpoint, then passed two top-level tests and three
+subtests in 34.120s after correction. Logs are
+`Rig/temp/cross-store-review-eaaa-physical-boundary-red.jsonl` and
+`Rig/temp/cross-store-review-4a-physical-boundary-green.jsonl`.
+
+The compensation contract restores the exact captured grant or stops only the
+selected current resources after an uncertain save. It does not change the
+distinct predecessor-retirement operation. Its two independent tests passed in
+33.570s with no failure or skip
+(`Rig/temp/cross-store-review-693-compensation.jsonl`). These are contract tests;
+the production physical adapter still refuses unavailable operations. They do
+not prove ordinary route/LAN mutation or complete rebind recovery.
+
+Added two disposable-Linux Docker gate cases to the local runtime branch:
+
+- Read-only proposal inspection against actual SQLite, protected history, and
+  two running application containers. Repeat/fresh-manager inspection must
+  retain SQL, raw grants, runtime heads, Docker identity and request counts.
+- An actual child-process exit immediately after the SQL claim commits, before
+  protected admission writes or deferred lock cleanup. Two separate recovery
+  processes must recover and replay the same typed prepared intent without
+  rewriting predecessor history or releasing the fence. The test verifies
+  unchanged runtime heads, raw grants, request counts, Docker identity, both
+  loopback routes, original LAN response, LAN rejection of the loopback-only
+  application, and absence of the successor listener.
+
+The shared live fixture now opens the real control database before its first
+route switch and supplies that repository to every source manager. It builds
+the counted image used by the new assertions. Review caught the initial
+uncounted-image mismatch before publication; that fixture would have failed
+its first request-counter read. No passing Docker result is claimed for it.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestLiveGatewayRebind(CrossStore|FinalHandover)'
+go vet -mod=readonly ./internal/generatedingress
+go build -mod=readonly -buildvcs=false ./...
+pnpm --dir docs install --frozen-lockfile --offline
+pnpm --dir docs check:workflow
+pnpm --dir docs build
+```
+
+The corrected live discovery run compiled in 0.778s. Both new journeys, their
+child helper, and both handover journeys skipped because live opt-ins were
+unset; the existing inert handover child returned normally. This is compilation
+and discovery evidence only (`$TEMP/m3-cross-store-live-corrected-discovery.jsonl`).
+Go vet and the repository build passed. YAML parsing confirmed both exact test
+names, opt-ins, one-pass/no-skip guards and always-run owned-resource cleanup;
+all three extracted Bash blocks passed `bash -n`. Diff and formatting checks
+passed. The offline frozen install succeeded; docs workflow/build passed
+(3.59s) outside the sandbox after its identity was denied access to an installed
+Vite manifest. The initial sandbox build failure is an environment limitation.
+
+Independent review accepted the corrected local fixture/CI diff, including the
+real DB cleanup lifetime and child-process boundary. Actual Docker execution,
+hostd startup dispatch, terminal SQL recovery, repeated rebind and final fence
+release remain unverified. This branch remains unpublished and is not ready
+for runtime delivery acceptance.
