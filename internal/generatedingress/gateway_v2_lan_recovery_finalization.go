@@ -120,7 +120,9 @@ func (m *Manager) WithGatewayV2LANRecoveryGrantFinalization(ctx context.Context,
 	if _, err := gatewayV2LANBindingForRequest(request); m == nil || ctx == nil || err != nil || resolve == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
-	return m.withGatewayV2LANRecoveryHead(ctx, gatewayV2PendingLANGrant, request.AttemptID, request.AppID,
+	return m.withGatewayV2LANRecoveryHead(ctx, func(workCtx context.Context) (bool, error) {
+		return m.withGatewayCurrentLANRecoveryGrantFinalizationLocked(workCtx, request, resolve)
+	}, gatewayV2PendingLANGrant, request.AttemptID, request.AppID,
 		func(item gatewayV2LANRecoveryItem) bool {
 			return item.Grant != nil &&
 				gatewayV2LANGrantRequestForBinding(item.AppID, *item.Grant) == request
@@ -149,7 +151,9 @@ func (m *Manager) WithGatewayV2LANRecoveryDisableFinalization(ctx context.Contex
 	if m == nil || ctx == nil || !validGatewayV2LANDisableRequest(request) || resolve == nil || acknowledge == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
-	return m.withGatewayV2LANRecoveryHead(ctx, gatewayV2PendingLANDisable, request.OperationID, request.AppID,
+	return m.withGatewayV2LANRecoveryHead(ctx, func(workCtx context.Context) (bool, error) {
+		return m.withGatewayCurrentLANRecoveryDisableFinalizationLocked(workCtx, request, resolve, acknowledge)
+	}, gatewayV2PendingLANDisable, request.OperationID, request.AppID,
 		func(item gatewayV2LANRecoveryItem) bool {
 			return item.Disable != nil && reflect.DeepEqual(*item.Disable, request)
 		},
@@ -168,7 +172,8 @@ func (m *Manager) WithGatewayV2LANRecoveryDisableFinalization(ctx context.Contex
 		})
 }
 
-func (m *Manager) withGatewayV2LANRecoveryHead(ctx context.Context, kind gatewayV2PendingKind,
+func (m *Manager) withGatewayV2LANRecoveryHead(ctx context.Context,
+	current func(context.Context) (bool, error), kind gatewayV2PendingKind,
 	operationID, appID string,
 	matches func(gatewayV2LANRecoveryItem) bool,
 	resolve func(context.Context, gatewayV2RouteState, gatewayV2LANRecoveryItem) error,
@@ -183,6 +188,9 @@ func (m *Manager) withGatewayV2LANRecoveryHead(ctx context.Context, kind gateway
 	defer releaseGatewayLock(release, &resultErr)
 	workCtx, cancelWork := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelWork()
+	if handled, currentErr := current(workCtx); currentErr != nil || handled {
+		return currentErr
+	}
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil || state.LANRecovery == nil ||
 		state.LANRecovery.Head >= len(state.LANRecovery.Items) {

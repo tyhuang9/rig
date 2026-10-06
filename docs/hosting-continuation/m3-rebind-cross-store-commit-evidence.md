@@ -1916,6 +1916,12 @@ and `git diff --check` also passed.
 
 ## Startup recovery coordinator integration
 
+Independent review also accepted quarantine `d14c0ae`: three top-level tests
+and five subcases passed in 108.951s, zero failures/skips
+(`Rig/temp/cross-store-review-d14-quarantine.jsonl`). The exact selection was
+`^TestGatewayCurrentLANRecoveryBatch(QuarantinesAllItems|StopsUnqueueableClaimsBeforeIntent|RetainsIntentAfterEffectUncertainty)$`.
+Source/security review found no blocker within this consumer's scope.
+
 Reviewed `99d7cc8` is integrated at `a1a54d3`. The public
 `RecoverGatewayRebindStartup` coordinator owns effects and gateway leases,
 recovers phase-bound SQL/protected intent, reproves no-effect abort receipts,
@@ -1941,3 +1947,48 @@ passed. These tests simulate physical effects. The production typed Docker
 adapter remains unavailable; startup dispatch must still be wired before
 ordinary admission with the protected emergency stop path. This is not
 evidence of actual Docker recovery or a completed M3 milestone.
+
+## Ordered current batch finalization
+
+The current-generation public finalization regression first failed at
+`9c61784`: its exact disable head never reached the SQL callback (one test,
+15.727s; `Rig/temp/m3-current-batch-finalization-red.jsonl`). Current finalization
+now uses the same locked public dispatch as native recovery. It accepts only
+the exact immutable head, proves every queued port withdrawn, invokes the
+authorized terminal callback, clears the protected binding, invokes the
+disable clear acknowledgment, then advances one head. The completed queue
+stays installed until the independent retirement census succeeds.
+
+Every proof/callback/write boundary reconfirms selected SQL rebind authority,
+protected state and retained history. SQL callbacks remain responsible for
+actor authorization, exact terminal state and durable readback. Callback
+errors preserve the current head for replay, including a lost acknowledgment
+after SQL success. Physical or protected uncertainty latches admission closed
+and attempts bounded exact-owned withdrawal, without requiring SQL. A grant
+that never published uses its immutable raw head and actual protected digest;
+it does not manufacture a serving binding or a revision-only clearance.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=7m ./internal/generatedingress -run '^TestGatewayCurrentLANRecovery(Finalizes|Finalization)'
+```
+
+The initial suite passed four top-level tests and four subcases in 144.177s,
+zero failures/skips (`Rig/temp/m3-current-batch-finalization-green.jsonl`). It
+covers sequential two-app disable completion through retirement, immutable
+history, refusal of later/old heads, callback failure and cleared replay,
+partial withdrawal, SQL loss, cancellation, protected drift, and an unpublished
+grant. These use real protected files, projected SQL claims and simulated
+physical proofs; they do not establish the controller/database/Docker journey.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayCurrentLANRecoveryFinalizationPreservesAmbiguousWrite|GatewayV2LANRecovery(FinalizesTwoDisablesSequentiallyAndRetires|FinalizesMixedGrantDisableWithoutChangingUnrelatedRoute|DisableAcknowledgmentReplayAdvancesOnce|RejectsCrossItemAndHeadSkip))$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The final additional suite passed five top-level tests and two subcases in
+40.584s, zero failures/skips
+(`Rig/temp/m3-current-batch-finalization-write-preservation.jsonl`). It injects
+an error after each actual protected clearance/head-advance write, checks exact
+installed evidence and owned-stop compensation, and preserves four native
+finalization paths. Vet, the full Go build, gofmt and `git diff --check` passed.
