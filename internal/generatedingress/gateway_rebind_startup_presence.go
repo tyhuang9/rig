@@ -122,6 +122,16 @@ func readGatewayRebindProtectedPresenceReadOnly(dataRoot string) (gatewayRebindP
 // trusting their JSON. Only an independently journal-bound native stop may
 // follow a complete absence of rebind ownership; serving reads stay strict.
 func readGatewayRebindProtectedPresenceMode(dataRoot string, validateNativeRoute bool) (gatewayRebindProtectedPresenceSnapshot, error) {
+	return readGatewayRebindProtectedPresenceInspection(dataRoot, validateNativeRoute, true)
+}
+
+// Only terminal-owned emergency withdrawal may fingerprint current route
+// bytes without decoding them. Normal presence and serving readers stay strict.
+func readGatewayRebindProtectedPresenceForTerminalWithdrawal(dataRoot string) (gatewayRebindProtectedPresenceSnapshot, error) {
+	return readGatewayRebindProtectedPresenceInspection(dataRoot, false, false)
+}
+
+func readGatewayRebindProtectedPresenceInspection(dataRoot string, validateNativeRoute, validateCurrentRoute bool) (gatewayRebindProtectedPresenceSnapshot, error) {
 	store, directoryPresent, pathIdentities, err := inspectStateStoreReadOnly(dataRoot)
 	result := gatewayRebindProtectedPresenceSnapshot{directoryPaths: pathIdentities,
 		files: make(map[string]gatewayHistoryFileFingerprint)}
@@ -181,16 +191,18 @@ func readGatewayRebindProtectedPresenceMode(dataRoot string, validateNativeRoute
 		if !isRebind && !currentRelevant {
 			continue
 		}
-		if currentRelevant {
+		if currentRelevant && validateCurrentRoute {
 			currentStore := &gatewayCurrentRouteStateStore{directory: store, dataRoot: dataRoot,
 				generation: currentGeneration, operationID: currentOperation, path: path}
 			_, currentStore.purpose = gatewayCurrentRouteStateName(currentGeneration, currentOperation)
 			if _, loadErr := currentStore.load(); loadErr != nil {
 				return gatewayRebindProtectedPresenceSnapshot{}, loadErr
 			}
-		} else if validateErr := validateGatewayRebindPresenceArtifact(store, path, entry.Name(), generation,
-			operationID, sequence, kind); validateErr != nil {
-			return gatewayRebindProtectedPresenceSnapshot{}, validateErr
+		} else if !currentRelevant {
+			if validateErr := validateGatewayRebindPresenceArtifact(store, path, entry.Name(), generation,
+				operationID, sequence, kind); validateErr != nil {
+				return gatewayRebindProtectedPresenceSnapshot{}, validateErr
+			}
 		}
 		result.present = true
 	}

@@ -18,11 +18,17 @@ func (m *Manager) gatewayCurrentOwnedStopHistoryLocked() (gatewayRebindProtected
 }
 
 func (m *Manager) scanGatewayCurrentTypedOwnedStopHistoryLocked() (gatewayRebindProtectedIntentHistory, error) {
+	return m.scanGatewayCurrentTypedWithdrawalHistoryLocked(func(dataRoot string) (gatewayRebindProtectedPresenceSnapshot, error) {
+		return readGatewayRebindProtectedPresenceMode(dataRoot, false)
+	})
+}
+
+func (m *Manager) scanGatewayCurrentTypedWithdrawalHistoryLocked(readPresence func(string) (gatewayRebindProtectedPresenceSnapshot, error)) (gatewayRebindProtectedIntentHistory, error) {
 	invalid := errors.New("generated ingress typed withdrawal history is incomplete")
 	if m == nil || m.store == nil {
 		return gatewayRebindProtectedIntentHistory{}, invalid
 	}
-	presence, err := readGatewayRebindProtectedPresenceMode(m.options.DataRoot, false)
+	presence, err := readPresence(m.options.DataRoot)
 	if err != nil || !presence.present {
 		return gatewayRebindProtectedIntentHistory{}, invalid
 	}
@@ -115,7 +121,7 @@ func (m *Manager) scanGatewayCurrentTypedOwnedStopHistoryLocked() (gatewayRebind
 	if err != nil || !sameGatewayHistorySnapshot(before, after) {
 		return gatewayRebindProtectedIntentHistory{}, invalid
 	}
-	confirmed, err := readGatewayRebindProtectedPresenceMode(m.options.DataRoot, false)
+	confirmed, err := readPresence(m.options.DataRoot)
 	if err != nil || !sameGatewayRebindProtectedPresence(presence, confirmed) {
 		return gatewayRebindProtectedIntentHistory{}, invalid
 	}

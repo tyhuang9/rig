@@ -2576,3 +2576,79 @@ guard is being repaired in the typed-runtime worker. Existing cross-store
 contracts close SQL transactions before Docker and revalidate afterward;
 revocation and component-failure reporting remain available. No additional SQL
 mutation-fence migration was introduced to suppress those safety operations.
+
+## Terminal-only emergency withdrawal for corrupt current routes (2026-10-06)
+
+Adds a separate typed-terminal stop capability with no current route state,
+current SQL selection, route reconstruction or serving proof. Its target binds
+the exact validated typed intent/terminal, successor identity, network plan and
+retained handover local port. A complete protected history scan establishes
+ownership; duplicate final IDs across retained terminals are refused. The
+emergency caller owns the effects lease and gateway locks and keeps its fail-stop
+latch set. A foreign commit barrier is preserved.
+
+Only this emergency presence reader may fingerprint current-route bytes without
+decoding their JSON. Ordinary presence and serving readers remain strict. Both
+the full immutable-history snapshot and complete protected presence fingerprints
+are compared before/after effects, including corrupt current-file replacement.
+If native and current routes are both corrupt, the previously validated typed
+immutable-history reader supplies ownership without recreating either file.
+
+The physical adapter exposes inspection and exact-ID stop only. It checks the
+retained pinned image, volume identity/mountpoints, ingress identity, absence of
+the stage container, complete operation/generation resource census, exact name
+and ID agreement, full immutable container configuration, volume users, and all
+configured LAN/loopback listener ports. Current application-network membership
+is mutable and is not frozen to the historical create roster. Shared metadata
+checks were extracted from the ordinary runtime into `gateway_final_ownership.go`;
+ordinary target validation and serving/config checks remain in their callers.
+Truncated resource inventories now fail closed.
+
+Lost stop acknowledgments require a fresh exact inventory and listener absence.
+A container already stopped or genuinely absent produces no effect. Corrupt or
+missing current routes still produce an incomplete startup result after a
+successful withdrawal, with verified/stopped counts retained. No SQL transition,
+route repair, history rewrite, start, copy, network mutation or resource deletion
+occurs. This path conservatively requires retained image/volume/network inventory
+even when the exact container is absent; separately removed or ambiguous retained
+resources remain unresolved. Mixed legacy rebind history under simultaneous
+native/current corruption retains the previously documented refusal.
+
+The first owner run exposed a reporting defect: strict current-bundle inspection
+returned an empty census even though terminal-only withdrawal stopped the exact
+container. The result now retains the independent terminal census. A negative
+fixture also accidentally reused the real final ID (`9` repeated 64 times); it
+now uses a distinct ID and resets each case's simulated inventory. This initial
+run failed in 92.134s (`Rig/temp/m3-terminal-only-emergency-first.jsonl`) and is not
+acceptance evidence.
+
+Corrected executable evidence uses actual SQLite typed commits/protected history
+and the concrete Docker command adapter with deterministic command/probe fixtures:
+
+- Corrupt, missing, simultaneous native/current corruption; lost acknowledgment;
+  stopped/absent idempotence; changed ID/image/labels/ports; extra owner; and late
+  terminal/current-file change: 3 tests/10 subcases passed in 170.409s,
+  `Rig/temp/m3-terminal-only-emergency-corrected.jsonl`.
+- Truncated ownership inventory, changed volume mountpoint and a remaining
+  listener: 1 test/3 subcases passed in 27.833s,
+  `Rig/temp/m3-terminal-only-emergency-proof-boundaries.jsonl`.
+- Shared immutable/dynamic-network metadata, ordinary exact-owned stop/absence,
+  foreign barrier, native corruption withdrawal, and active database-committed
+  restart: 5 tests/9 subcases passed in 168.437s,
+  `Rig/temp/m3-terminal-only-emergency-regression.jsonl`.
+
+All corrected runs had zero failures/skips. Exact commands:
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^TestGatewayCurrentTerminalEmergency' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^TestGatewayCurrentTerminalEmergencyRequiresCompleteInventoryAndListenerAbsence$' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^(TestManagedGatewayCurrentPhysicalRuntimeBindsImmutableContainerAndDynamicNetworks|TestManagedGatewayCurrentPhysicalRuntimeExecutorStopsOnlyExactOwnedIdentity|TestGatewayCurrentStartupEmergencyStopNeverClearsForeignCommitBarrier|TestGatewayCurrentTypedEmergencyWithdrawsWithCorruptNativeRoute|TestGatewayRebindCommittedServingRestoreKeepsActiveSQLFence)$' -count=1 -json
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Vet, full Go build, gofmt and diff whitespace checks passed. Frozen independent
+review is still required. Actual Docker and Linux race behavior remain for hosted
+CI. The typed runtime adapter, default activation and complete M3 acceptance are
+still unfinished. No publication, cross-branch integration or deployment was
+performed for this change.
