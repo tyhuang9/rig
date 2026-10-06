@@ -287,6 +287,9 @@ func (m *Manager) gatewayCurrentOwnedStopTargetsProtectedPartialLocked() (
 	}
 	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	if err != nil {
+		if m.proveGatewayCurrentNativeNoEffectAbortHistoryLocked(presence) == nil {
+			return nil, gatewayCurrentOwnedStopHistoryCensus{ProtectedRebindHistory: true}, nil
+		}
 		return nil, gatewayCurrentOwnedStopHistoryCensus{ProtectedRebindHistory: presence.present}, err
 	}
 	census, lineages := gatewayCurrentOwnedStopCensus(history, presence)

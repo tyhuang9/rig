@@ -13,14 +13,36 @@ import (
 )
 
 func TestGatewayCurrentNativeEmergencyFallbackRetainsAbortedRebindHistory(t *testing.T) {
-	ctx := context.Background()
-	f, input, physical := newGatewayRebindCoordinatorFixture(t)
-	f.manager.gatewayRebindV2NetworkObserver = func(context.Context, appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error) {
-		return gatewayRebindSuccessorNetworkObservation{}, errors.New("successor network unavailable")
+	checkGatewayCurrentNativeEmergencyRetainedAbort(t, "")
+}
+
+func TestGatewayCurrentNativeEmergencyRetainedAbortSurvivesCorruptNativeRoute(t *testing.T) {
+	for _, route := range []string{"source", "native v2"} {
+		t.Run(route, func(t *testing.T) {
+			checkGatewayCurrentNativeEmergencyRetainedAbort(t, route)
+		})
 	}
-	result, err := f.manager.commitGatewayRebindWithDriver(ctx, f.repository, input, physical)
-	if err != nil || result.FinalPhase != appaccess.GatewayRebindRolledBack || !result.FenceReleased {
-		t.Fatalf("real SQL/protected no-effect abort: result=%+v err=%v", result, err)
+}
+
+func checkGatewayCurrentNativeEmergencyRetainedAbort(t *testing.T, corruptRoute string) {
+	t.Helper()
+	ctx := context.Background()
+	f := gatewayCurrentNativeEmergencyAbortedFixture(t)
+	if corruptRoute != "" {
+		path, purpose := f.manager.store.path, statePurpose
+		if corruptRoute == "native v2" {
+			store, err := newGatewayUpgradeStateStore(f.manager.options.DataRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path, purpose = store.v2Path, store.v2Purpose
+		}
+		if err := upgradeProtectedWrite(path, purpose, []byte("{")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil); err == nil {
+			t.Fatal("normal serving history accepted native route corruption")
+		}
 	}
 	before, err := readGatewayHistorySnapshotMode(f.manager.store, true)
 	if err != nil {
@@ -44,6 +66,19 @@ func TestGatewayCurrentNativeEmergencyFallbackRetainsAbortedRebindHistory(t *tes
 	if err != nil || !sameGatewayHistorySnapshot(before, after) {
 		t.Fatal("native emergency fallback rewrote retained abort history")
 	}
+}
+
+func gatewayCurrentNativeEmergencyAbortedFixture(t *testing.T) gatewayRebindPredecessorFixture {
+	t.Helper()
+	f, input, physical := newGatewayRebindCoordinatorFixture(t)
+	f.manager.gatewayRebindV2NetworkObserver = func(context.Context, appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error) {
+		return gatewayRebindSuccessorNetworkObservation{}, errors.New("successor network unavailable")
+	}
+	result, err := f.manager.commitGatewayRebindWithDriver(context.Background(), f.repository, input, physical)
+	if err != nil || result.FinalPhase != appaccess.GatewayRebindRolledBack || !result.FenceReleased {
+		t.Fatalf("real SQL/protected no-effect abort: result=%+v err=%v", result, err)
+	}
+	return f
 }
 
 func TestGatewayCurrentNativeEmergencyRefusesTypedCommittedOwnership(t *testing.T) {

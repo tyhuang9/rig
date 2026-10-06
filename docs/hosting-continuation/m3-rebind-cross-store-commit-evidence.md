@@ -2358,3 +2358,57 @@ Both tests and all six subcases passed in 127.179s, zero failures/skips
 container identity, label and publication-boundary preservation. Vet, full build,
 gofmt and `git diff --check` passed. Independent review remains pending. No default
 factory activation, publication, deployment or hosted Docker acceptance is claimed.
+
+Independent source/security review accepted `59f68db`: the terminal union is
+validated before selecting its exact digest envelope; neither a fallback digest
+nor a rewritten receipt is accepted. Independent execution is recorded separately
+when available.
+
+## Emergency withdrawal with retained no-effect abort and corrupt native routes
+
+Combining the previously separate retained-abort and corrupt-native-route cases
+exposed a refusal: both source-route and native-v2 corruption caused incomplete
+ownership enumeration before shutdown (one test/two subcases, 34.638s;
+`Rig/temp/m3-native-emergency-retained-abort-corruption-red.jsonl`).
+
+The new withdrawal-only fallback applies only after the ordinary history scanner
+fails. It requires exactly the committed generation-zero native journal and
+state-file path, no native retirement/abort or additional native generation, and
+a contiguous sequence consisting entirely of typed no-intent/no-effect aborts.
+Every strict checkpoint must bind its frozen native state to the same journal,
+source digest and full lineage; every terminal must match that exact checkpoint.
+Operations must be unique, current-route bundles are forbidden, and both complete
+safe-file censuses are confirmed again before returning. It returns only a
+no-current/no-unresolved ownership result, never serving authority. The ordinary
+startup scanner remains unchanged and continues rejecting corrupt routes.
+
+Both corruption cases passed in 35.134s, zero failures/skips
+(`Rig/temp/m3-native-emergency-retained-abort-corruption-green.jsonl`). The expanded
+suite passed four tests/seven subcases in 93.062s, zero failures/skips:
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrentNative(AbortEmergencyRequiresCompleteBoundHistory|Emergency(FallbackRetainsAbortedRebindHistory|RetainedAbortSurvivesCorruptNativeRoute|RefusesTypedCommittedOwnership))$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayCurrentNativeAbortEmergencyRequiresCompleteBoundHistory$/^orphan_current_bundle$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The first command's log is
+`Rig/temp/m3-native-emergency-immutable-boundaries-green.jsonl`. It includes
+positive-first refusal of missing checkpoints/terminals, a structurally valid
+changed journal, a structurally valid changed checkpoint that disagrees with its
+terminal, an extra native generation, and post-stop unknown history. The added
+valid orphan-current-bundle subcase passed in 33.872s (one test/one subcase;
+`Rig/temp/m3-native-emergency-immutable-orphan-green.jsonl`). An initial test-only
+compile error used a nonexistent route-generation field; it was corrected to a
+valid endpoint-ID change before the successful boundary run. Vet and full build
+passed; gofmt and `git diff --check` passed.
+
+Review has accepted the bounded design and source; independent execution remains
+pending. Physical stop is injected, not live Docker. Corrupt native routes with
+committed rebind ownership, mixed legacy history or earlier native generations
+still return incomplete ownership and retain the startup latch. Those require
+separate immutable-history support. A corrupt current route bundle additionally
+requires a terminal-only exact-container withdrawal capability; no valid route
+state is fabricated from incomplete evidence. M3 and the production adapter remain
+incomplete.
