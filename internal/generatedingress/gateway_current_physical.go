@@ -81,6 +81,7 @@ type gatewayCurrentPhysicalOutcomeProjection struct {
 type gatewayCurrentPhysicalDriver interface {
 	applyGatewayCurrentPhysical(context.Context, gatewayCurrentPhysicalTransition) (gatewayCurrentPhysicalAttestation, error)
 	restoreGatewayCurrentPhysical(context.Context, gatewayCurrentPhysicalTransition) (gatewayCurrentPhysicalAttestation, error)
+	stopGatewayCurrentPhysical(context.Context, gatewayCurrentPhysicalTransition) (gatewayCurrentPhysicalAttestation, error)
 	attestGatewayCurrentPhysical(context.Context, gatewayCurrentSelection) (gatewayCurrentPhysicalAttestation, error)
 	stopGatewayCurrentOwnedPredecessor(context.Context, gatewayRebindAttemptTerminalView) error
 }
@@ -97,6 +98,12 @@ func (managerGatewayCurrentPhysicalDriver) restoreGatewayCurrentPhysical(context
 	gatewayCurrentPhysicalTransition,
 ) (gatewayCurrentPhysicalAttestation, error) {
 	return gatewayCurrentPhysicalAttestation{}, errors.New("generated ingress current physical restore is unavailable")
+}
+
+func (managerGatewayCurrentPhysicalDriver) stopGatewayCurrentPhysical(context.Context,
+	gatewayCurrentPhysicalTransition,
+) (gatewayCurrentPhysicalAttestation, error) {
+	return gatewayCurrentPhysicalAttestation{}, errors.New("generated ingress current physical stop is unavailable")
 }
 
 func (managerGatewayCurrentPhysicalDriver) attestGatewayCurrentPhysical(context.Context,
@@ -145,7 +152,8 @@ func (m *Manager) restoreGatewayCurrentPhysicalLocked(ctx context.Context,
 	transition gatewayCurrentPhysicalTransition,
 ) (gatewayCurrentPhysicalAttestation, error) {
 	if m == nil || ctx == nil || ctx.Err() != nil ||
-		transition.Kind != gatewayCurrentPhysicalLANWithdrawal || !validGatewayCurrentPhysicalTransition(transition) {
+		(transition.Kind != gatewayCurrentPhysicalLANGrant && transition.Kind != gatewayCurrentPhysicalLANWithdrawal) ||
+		!validGatewayCurrentPhysicalTransition(transition) {
 		return gatewayCurrentPhysicalAttestation{}, &Error{Code: DiagnosticRouteUnresolved}
 	}
 	value, err := m.currentPhysicalDriver().restoreGatewayCurrentPhysical(ctx, transition)
@@ -153,6 +161,28 @@ func (m *Manager) restoreGatewayCurrentPhysicalLocked(ctx context.Context,
 		value.Outcome != gatewayCurrentPhysicalRecoveryBefore ||
 		value.Lineage != transition.Before.Lineage ||
 		!reflect.DeepEqual(value.State, transition.Before) ||
+		!reflect.DeepEqual(value.Pending, transition.Pending.Pending) || value.LANRecovery != nil {
+		return gatewayCurrentPhysicalAttestation{}, &Error{Code: DiagnosticRouteUnresolved}
+	}
+	return value, nil
+}
+
+// stopGatewayCurrentPhysicalLocked is the fail-closed compensation for an
+// ambiguous protected save in an ordinary operation. It stops only the exact
+// selected generation and transition resources. It is deliberately distinct
+// from stopGatewayCurrentOwnedPredecessorLocked, which retires the old
+// generation after a rebind commit.
+func (m *Manager) stopGatewayCurrentPhysicalLocked(ctx context.Context,
+	transition gatewayCurrentPhysicalTransition,
+) (gatewayCurrentPhysicalAttestation, error) {
+	if m == nil || ctx == nil || ctx.Err() != nil || !validGatewayCurrentPhysicalTransition(transition) {
+		return gatewayCurrentPhysicalAttestation{}, &Error{Code: DiagnosticRouteUnresolved}
+	}
+	value, err := m.currentPhysicalDriver().stopGatewayCurrentPhysical(ctx, transition)
+	if err != nil || !validGatewayCurrentPhysicalAttestation(value) ||
+		value.Outcome != gatewayCurrentPhysicalRecoveryStopped ||
+		value.Lineage != transition.Before.Lineage ||
+		(!reflect.DeepEqual(value.State, transition.Before) && !reflect.DeepEqual(value.State, transition.Effective)) ||
 		!reflect.DeepEqual(value.Pending, transition.Pending.Pending) || value.LANRecovery != nil {
 		return gatewayCurrentPhysicalAttestation{}, &Error{Code: DiagnosticRouteUnresolved}
 	}
