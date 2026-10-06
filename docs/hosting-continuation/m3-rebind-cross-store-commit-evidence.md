@@ -2295,3 +2295,27 @@ before the withdrawal-only gateway lock, sticky fail-stop, foreign barrier
 preservation, no SQL serving authority and final protected ownership checks.
 This is a bounded emergency-path acceptance; the complete typed Docker adapter,
 serving driver activation and end-to-end hosted runtime gate remain incomplete.
+
+## Reviewed concrete restart driver candidate
+
+Worker commit `14c2913ad7709ff4e411a71c3424822455113700` adds the concrete current
+serving restore driver, its command-executor tests and a six-line final
+authorization/latch check in the existing stopped-container restart helper.
+The latter closes a reproduced late-inventory race where authority could change
+after the opening guard and before container start. No default factory is enabled.
+
+Owner overlay checks against frozen integration dependencies passed four tests
+and eight subcases in 186.077s; ordinary restart preservation passed one test and
+two subcases in 46.707s. Independent review used only the candidate files over
+exact integrated `7d60803`, verified both source/base identities and clean state,
+and passed two tests plus five subcases in 94.448s, zero failures/skips
+(`Rig/temp/cross-store-review-14c-restore.jsonl`). These cover completed-batch
+restart, lost acknowledgment, before-start refusal, post-start drift and the
+late-inventory no-effect regression. Overlay vet passed. Actual Docker remains
+unverified. The first independent attempt failed before tests because one Git
+identity lookup omitted its checkout directory; the corrected run is the recorded
+application evidence.
+
+The exact candidate is ready for local integration; a user approval request is
+pending. Its three-file delta is based on already integrated `d5ec8b9`. No remote
+publication, deployment or default driver activation is authorized by this review.
