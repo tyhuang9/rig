@@ -14,7 +14,7 @@ import (
 type managerGatewayRebindCrossStoreDriver struct{ manager *Manager }
 
 func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorLocked(context.Context,
-	gatewayRebindPreparedAttempt, gatewayRebindTypedProgressAppender,
+	gatewayRebindPhysicalReconcileRequest, gatewayRebindTypedProgressAppender,
 ) (gatewayRebindTypedPhysicalResult, error) {
 	return gatewayRebindTypedPhysicalResult{}, errors.New("generated ingress typed physical rebind is unavailable")
 }
