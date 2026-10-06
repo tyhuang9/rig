@@ -2086,3 +2086,61 @@ guard was weakened (`Rig/temp/m3-startup-runtime-census.jsonl`).
 
 This read projection is input to the pending guarded restart consumer, not
 permission to restart or evidence of Docker serving. Vet and the full build passed.
+
+The preservation run passed 32 appaccess tests plus 64 subcases in 34.628s,
+and 14 hostd tests plus 26 subcases in 3.167s, zero failures/skips
+(`Rig/temp/m3-startup-runtime-census-preservation.jsonl`). Independent review
+accepted `2789250`: three census tests plus seven subcases passed in 4.037s
+(`Rig/temp/cross-store-review-278925-runtime-census.jsonl`).
+
+## Guarded restoration of current serving state
+
+`RestoreGatewayCurrentServingStartup` takes the deployment effects lease and
+gateway locks before reading complete SQL authority. It accepts only a stable
+current generation or a fully completed LAN recovery batch. Every protected
+endpoint must match an active SQL component in the exact active deployment and
+slot, including loopback applications. The complete authority digest, selected
+protected state, terminal history, fence, retained LAN provenance and completed
+batch acknowledgments are reconfirmed at physical effect boundaries and after
+serving proof. A final selected-state read covers mutable bundles that are not
+included in the immutable-history fingerprint.
+
+Restoration does not write SQL, retire a recovery queue or rewrite history. A
+failure after selection latches admission and stops the exact protected owner
+using a bounded uncancelled context. Changed ownership or an unproved stop remains
+explicitly unresolved. Unfinished operations stay on their separate recovery path.
+The controller's existing LAN SQL conversion was moved into shared ingress
+functions without changing its claims or retained authority semantics.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=6m ./internal/generatedingress -run '^TestGatewayCurrentServing(Restore|RuntimeCensus)'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=5m ./internal/generatedingress -run '^TestGatewayCurrentServingRestore(StopsExactOwnerAfterLostProof|RefusesUnfinishedBatch)$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayCurrentServingRestoreRefusesLastReadProtectedReplacement$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./cmd/hostd -run 'Startup'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The first restart run failed because the older commit fixture deliberately used
+different SQL and protected container identities. The guard correctly refused it.
+Fixtures now perform an ordinary redeploy through the real runtime repository and
+public ingress switch before asserting restart; the ownership check was not weakened.
+Initial failure logs are `Rig/temp/m3-current-serving-restore-initial.jsonl` and
+`Rig/temp/m3-current-serving-restore-completed.jsonl`.
+
+The corrected initial suite passed five tests and 14 subcases in 180.646s
+(`Rig/temp/m3-current-serving-restore-green.jsonl`). Further compensation and
+unfinished-batch checks passed two tests and four subcases in 129.923s
+(`Rig/temp/m3-current-serving-restore-compensation.jsonl`). They cover lost SQL
+authority after the effect, cancellation, a self-consistent proof for the wrong
+revision, and a failed stop acknowledgment. The late protected replacement check
+passed one test in 28.671s (`Rig/temp/m3-current-serving-restore-final-selection.jsonl`).
+The initial regex ran before these last three tests were added; the logs do not
+claim a single aggregate run. Every recorded run has zero failures/skips.
+
+Shared projection preservation passed 14 hostd tests and 26 subcases in 3.169s
+(`Rig/temp/m3-shared-lan-projection.jsonl`). Vet, the full Go build, gofmt and
+`git diff --check` passed. These tests use actual SQLite/protected state with an
+injected physical driver; the fixture redeploy also simulates Docker. Concrete
+restore driver review, hostd startup wiring, actual Docker and Linux race gates
+remain required. The production physical factory remains closed.

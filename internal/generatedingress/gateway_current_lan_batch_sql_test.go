@@ -13,6 +13,11 @@ import (
 // batch installation and physical withdrawal are fixture setup; no Docker or
 // controller HTTP acceptance is inferred from this test.
 func TestGatewayCurrentLANRecoveryFinalizationCommitsRealSQLAfterRebind(t *testing.T) {
+	gatewayCurrentLANRecoveryCompletedSQLFixture(t)
+}
+
+func gatewayCurrentLANRecoveryCompletedSQLFixture(t *testing.T) gatewayRebindPredecessorFixture {
+	t.Helper()
 	ctx := context.Background()
 	f, input, physical := newGatewayRebindCoordinatorFixture(t)
 	committed, err := f.manager.commitGatewayRebindWithDriver(ctx, f.repository, input, physical)
@@ -28,6 +33,7 @@ func TestGatewayCurrentLANRecoveryFinalizationCommitsRealSQLAfterRebind(t *testi
 		t.Fatalf("select typed current: %v", err)
 	}
 	entry := input.Inspection.Roster[0]
+	selection = gatewayCurrentServingRestoreRedeployFixture(t, f, selection, entry)
 	resolution, err := f.repository.ResolveGatewayBinding(ctx, appaccess.GatewayBindingRef{
 		AppID: entry.AppID, AllocationID: entry.AllocationID,
 		AccessRevisionID: entry.AccessRevisionID, GrantAttemptID: entry.GrantAttemptID})
@@ -140,4 +146,5 @@ func TestGatewayCurrentLANRecoveryFinalizationCommitsRealSQLAfterRebind(t *testi
 		t.Fatal("disable rewrote rebind history/current authority or required compensation")
 	}
 	gatewayRebindSequenceRequireRetainedFiles(t, f.manager, files)
+	return f
 }
