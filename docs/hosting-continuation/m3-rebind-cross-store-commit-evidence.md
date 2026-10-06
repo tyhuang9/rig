@@ -1646,3 +1646,69 @@ Documentation workflow validation and its production build passed, the latter
 in 3.80s using the installed dependencies. Runnable batch withdrawal, exact
 emergency stop, early startup recovery and repeated/crash Docker acceptance
 remain unfinished. No local Docker or Windows race result is claimed.
+
+## Protected withdrawal ownership integration
+
+Reviewed runtime commit `748951292b548b24d42d584ce6afe332de622a95` was integrated
+locally as `1d8edbe`. It adds protected-only withdrawal targets containing the
+exact canonical terminal, generation-scoped state, final container identity,
+and (when present) the complete Before/Pending/Effective transition. A caller
+cannot expand the permitted state-digest set without that exact transition.
+Revalidation reloads the state and terminal at the effect boundary. Enumeration
+rejects missing/corrupt route bundles and ambiguous final-container ownership.
+These targets authorize ownership checks for withdrawal only; they do not
+select SQL current or authorize serving.
+
+Independent review initially reproduced two failures against `eabcd`: arbitrary
+permitted digests were accepted, and an unreadable route bundle was skipped.
+The unchanged two reproducers plus transition/missing-bundle checks passed
+against `7489512`: four top-level tests in 68.271s, with no failures or skips
+(`Rig/temp/cross-store-review-748-owned-stop-green.jsonl`). The original red
+run is retained in `Rig/temp/cross-store-review-eabcd-owned-stop-red.jsonl`.
+Independent code/security review accepted this helper boundary only.
+
+The integration does not add an executable physical stop or a hostd emergency
+API. A committed terminal without its baseline still requires phase recovery;
+refusal at that boundary is not evidence that traffic has stopped. No Docker,
+complete startup recovery, publication, or M3 completion is claimed.
+
+## Repeated commit and rollback sequence verification
+
+`gateway_rebind_cross_store_sequence_test.go` now exercises real SQLite and
+protected-file coordination across native → committed rebind → another
+committed rebind, plus both no-effect abort → commit and post-intent rollback →
+commit. The sequences verify exact prior-transfer links, original raw
+allocation/access revision/grant/profile equality, immutable prior SQL history,
+unchanged retained file identity/content/mode/time, generation advancement,
+current selection and fence release. The repeated path also reads the complete
+startup census and enumerates both generations' protected withdrawal targets.
+Simulated ingress networks, stage/final containers and volume paths are distinct
+per attempt; application-network identities remain those of the unchanged apps.
+
+The initial sequence run passed two top-level tests and two subcases in 95.510s,
+with no failures or skips (`Rig/temp/m3-cross-store-sequences-initial.jsonl`):
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayRebindCoordinator(CommitsRepeatedTransferChain|CommitsAfterRetainedRollback)$'
+go vet -mod=readonly ./internal/generatedingress
+```
+
+Vet also passed. Docker observations and effects remain explicitly simulated;
+these checks do not prove container changes, traffic withdrawal, or process
+restart. A follow-up variant gives the second successor a distinct address and
+interface. Its first run correctly rolled back because the synthetic host
+inventory still lacked that address (27.074s,
+`Rig/temp/m3-cross-store-sequences-distinct-profile.jsonl`); this was a fixture
+mismatch, not a production regression. The test inventory was then updated to
+describe the new candidate and interface prefix.
+
+The corrected distinct-address sequence passed in 39.497s, with no failures or
+skips (`Rig/temp/m3-cross-store-sequences-distinct-profile-green.jsonl`):
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayRebindCoordinatorCommitsRepeatedTransferChain$'
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The integrated full build passed. Remaining physical/startup/batch gates above
+are unchanged, and no new branch has been published.
