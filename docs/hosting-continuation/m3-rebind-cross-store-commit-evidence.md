@@ -2488,3 +2488,72 @@ status were verified before/after. The reviewer confirmed withdrawal-only
 callsites, empty source routes, exact immutable bindings and complete final
 snapshot checks. This acceptance retains the stated corrupt-current and mixed
 legacy limitations.
+
+## Active database-committed serving restoration (2026-10-06)
+
+Adds a private, already-locked recovery consumer and a distinct managed physical
+driver entry for the exact typed `database_committed` attempt. The caller holds
+the effects lease and both gateway locks before taking its commit-barrier latch.
+Both process admission latches must remain clear. The SQL fence remains active
+throughout; this operation neither transitions SQL nor writes protected state.
+
+Authorization pins the complete same-transaction `HostingGatewayStartupSnapshot`,
+active claim/roster/runtime heads, exact database-commit event, typed commit
+terminal and original baseline, every runtime component (including loopback
+routes), LAN grants/disables and retained provenance. Immutable protected files,
+exact selected current state and caller-supplied attempt authority are reread
+around physical effects and after proof. Prepared/rollback-capable requests,
+missing commit evidence, pending operations, recovery batches and changed
+pre-entry baselines are refused. Ordinary `selectExact` and lower-level
+`restartStopped` admission checks are unchanged; no generic fence exception or
+fabricated no-active snapshot is introduced.
+
+The runtime accepts exact serving state idempotently or restarts its exact owned
+stopped container. Lost acknowledgments require fresh exact observation under
+the same guards. Authority failure latches admission and stops only an unchanged
+exact protected owner. If protected state changes after start, compensation
+refuses to substitute that new state and reports `candidateMayBeLive`; the SQL
+fence and process latch remain. This retains the separately tracked need for a
+terminal-only emergency stop capability.
+
+Executable evidence uses actual SQLite transitions and protected history, with
+the concrete managed Docker command adapter and simulated Docker/probe boundary:
+
+- Initial active-fence/lost-ack/idempotent/latch test passed 1 test in 43.752s:
+  `Rig/temp/m3-active-committed-serving-first.jsonl`.
+- Runtime authority before/after start, protected state before start, and attempt
+  authority after start passed 1 test/4 subcases in 109.872s:
+  `Rig/temp/m3-active-committed-serving-boundaries.jsonl`.
+- Crossed SQL commit event before start and changed protected state after start
+  passed 1 test/2 subcases in 57.279s:
+  `Rig/temp/m3-active-committed-serving-extended.jsonl`.
+- Shared ordinary restart proof, final stopped-inventory guard, full runtime
+  component census and active-fence positive regression passed 4 tests/10
+  subcases in 143.776s:
+  `Rig/temp/m3-active-committed-serving-regression.jsonl`.
+- Final baseline refinement reran the active-fence test in 42.696s, including
+  exact typed baseline equality and refusal of a valid newer protected revision
+  already present before entry:
+  `Rig/temp/m3-active-committed-serving-exact-baseline.jsonl`.
+
+All listed runs had zero failures/skips. Commands (with the existing workspace
+Go cache):
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^TestGatewayRebindCommittedServingRestoreKeepsActiveSQLFence$' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^TestGatewayRebindCommittedServingRestoreRefusesBoundaryDrift$' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^TestGatewayRebindCommittedServingRestoreRefusesBoundaryDrift$/(SQL_event_before_start|protected_after_start)$' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^(TestGatewayRebindCommittedServingRestoreKeepsActiveSQLFence|TestManagedGatewayCurrentServingRestoreRequiresFullAndExactAuthorityAtProof|TestManagedGatewayCurrentServingRestoreRuntimeRechecksAuthorityAfterFinalStoppedInventory|TestGatewayCurrentServingRuntimeCensusRejectsIncompleteOrCrossedComponents)$' -count=1 -json
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Vet, full Go build, gofmt and diff whitespace checks passed. The predecessor
+fixture gained an initial endpoint parameter so SQL and protected runtime IDs
+agree before immutable journals are created; existing fixture defaults remain
+unchanged. No committed fixture identity is rewritten.
+
+This is an internal capability awaiting the coherent typed adapter and its
+independent integration review. Default adapter activation, live Docker, Linux
+race checks, hosted CI and full M3 acceptance remain outstanding. No branch was
+published, merged into another branch or deployed for this unit.

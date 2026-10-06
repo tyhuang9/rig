@@ -17,8 +17,7 @@ type gatewayCurrentServingPhysicalRuntime interface {
 func (d managedGatewayCurrentPhysicalDriver) restoreGatewayCurrentServing(ctx context.Context,
 	action gatewayCurrentServingRestoreAction, authorize func(context.Context) error,
 ) (gatewayCurrentPhysicalAttestation, error) {
-	physical, ok := d.runtime.(gatewayCurrentServingPhysicalRuntime)
-	if !ok || authorize == nil || !validGatewayCurrentServingRestoreAction(action) || ctx == nil || ctx.Err() != nil {
+	if authorize == nil || !validGatewayCurrentServingRestoreAction(action) || ctx == nil || ctx.Err() != nil {
 		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 	}
 	_, target, err := d.selectGatewayCurrentServingRestoreExact(ctx, action)
@@ -41,6 +40,18 @@ func (d managedGatewayCurrentPhysicalDriver) restoreGatewayCurrentServing(ctx co
 			return gatewayCurrentPhysicalDriverError(effectCtx)
 		}
 		return nil
+	}
+	return d.restoreGatewayCurrentServingAtTarget(ctx, target, expected, guard)
+}
+
+// Both serving consumers construct a purpose-specific exact-selection guard
+// before reaching this physical primitive. Neither may bypass admission.
+func (d managedGatewayCurrentPhysicalDriver) restoreGatewayCurrentServingAtTarget(ctx context.Context,
+	target gatewayCurrentPhysicalTarget, expected gatewayCurrentPhysicalOutcome, guard func(context.Context) error,
+) (gatewayCurrentPhysicalAttestation, error) {
+	physical, ok := d.runtime.(gatewayCurrentServingPhysicalRuntime)
+	if !ok || guard == nil {
+		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 	}
 	if err := guard(ctx); err != nil {
 		return gatewayCurrentPhysicalAttestation{}, err

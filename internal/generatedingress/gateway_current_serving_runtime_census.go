@@ -12,8 +12,16 @@ import (
 func gatewayCurrentServingRuntimeCensusMatches(target gatewayCurrentRouteState,
 	snapshot appaccess.HostingGatewayStartupSnapshot,
 ) bool {
+	return gatewayCurrentRouteMutationSnapshotReady(snapshot.Rebind) &&
+		gatewayCurrentServingRuntimeComponentsMatch(target, snapshot)
+}
+
+// This checks the complete component census, not rebind admission. Each caller
+// must separately prove its purpose-specific SQL phase before any effect.
+func gatewayCurrentServingRuntimeComponentsMatch(target gatewayCurrentRouteState,
+	snapshot appaccess.HostingGatewayStartupSnapshot,
+) bool {
 	if !validGatewayCurrentRouteState(target) || target.Pending != nil || target.LANRecovery != nil ||
-		!gatewayCurrentRouteMutationSnapshotReady(snapshot.Rebind) ||
 		!reflect.DeepEqual(snapshot.Upgrades.CurrentProfile, snapshot.Rebind.CurrentProfile) ||
 		len(target.Apps) != len(snapshot.RuntimeHeads) {
 		return false

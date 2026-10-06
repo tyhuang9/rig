@@ -256,6 +256,10 @@ func newGatewayRebindPredecessorFixture(t *testing.T) gatewayRebindPredecessorFi
 }
 
 func newGatewayRebindPredecessorFixtureWithClaim(t *testing.T, insertClaim bool) gatewayRebindPredecessorFixture {
+	return newGatewayRebindPredecessorFixtureWithEndpoint(t, insertClaim, '4')
+}
+
+func newGatewayRebindPredecessorFixtureWithEndpoint(t *testing.T, insertClaim bool, endpointID rune) gatewayRebindPredecessorFixture {
 	t.Helper()
 	manager, runner := newManagerFixture(t, false)
 	db, err := database.Open(manager.options.DataRoot)
@@ -370,7 +374,7 @@ func newGatewayRebindPredecessorFixtureWithClaim(t *testing.T, insertClaim bool)
 		appID: {
 			Slot: generatedruntime.Slot(active.Slot),
 			Endpoints: []generatedruntime.RouteEndpoint{
-				endpoint("api", "server", "rebind-app-network", "rebind-app-blue", 3000, '4'),
+				endpoint("api", "server", "rebind-app-network", "rebind-app-blue", 3000, endpointID),
 			},
 		},
 	}}
