@@ -173,6 +173,23 @@ func TestGatewayCurrentPhysicalTransitionSupportsNewAppAndChainedGrant(t *testin
 	if err != nil || !validGatewayCurrentPhysicalTransition(newApp) {
 		t.Fatalf("new-app Previous=nil transition rejected: %v", err)
 	}
+	terminal, err := newGatewayRebindAttemptTerminalViewLegacy(fixture.receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAppRestored := gatewayCurrentPhysicalAttestationFixture(t, before, terminal,
+		gatewayCurrentPhysicalRecoveryBefore)
+	newAppRestored.Pending = cloneGatewayCurrentPendingRoute(pendingNew.Pending)
+	newAppRestored.Digest, err = gatewayCurrentPhysicalAttestationDigest(newAppRestored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAppDriver := &gatewayCurrentPhysicalDriverFake{restore: newAppRestored}
+	fixture.manager.gatewayCurrentPhysicalDriver = newAppDriver
+	if _, err := fixture.manager.restoreGatewayCurrentPhysicalLocked(context.Background(), newApp); err != nil ||
+		newAppDriver.restoreCalls != 1 {
+		t.Fatalf("new-app route rollback mismatch: calls=%d error=%v", newAppDriver.restoreCalls, err)
+	}
 
 	grantBefore := cloneGatewayCurrentRouteState(before)
 	grantAppID := ""
@@ -230,10 +247,6 @@ func TestGatewayCurrentPhysicalTransitionSupportsNewAppAndChainedGrant(t *testin
 		Before: grantBefore, Pending: grantPending, Effective: grantEffective}
 	if err != nil || !validGatewayCurrentPhysicalTransition(chained) {
 		t.Fatalf("ActivationUncertain chained grant transition rejected: %v", err)
-	}
-	terminal, err := newGatewayRebindAttemptTerminalViewLegacy(fixture.receipt)
-	if err != nil {
-		t.Fatal(err)
 	}
 	restored := gatewayCurrentPhysicalAttestationFixture(t, grantBefore, terminal,
 		gatewayCurrentPhysicalRecoveryBefore)

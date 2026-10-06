@@ -142,17 +142,18 @@ func (m *Manager) applyGatewayCurrentPhysicalLocked(ctx context.Context,
 	return value, nil
 }
 
-// restoreGatewayCurrentPhysicalLocked republishes the exact grant captured by
-// a durable withdrawal marker after SQL proves that grant committed. The
-// marker remains installed while the physical effect runs. Returning the
-// original quiescent Before state keeps this distinct from clearing protected
-// recovery state, which the caller may do only after its database decision is
-// independently reconciled.
+// restoreGatewayCurrentPhysicalLocked returns an exact route or grant
+// transition to its original Before topology. RouteSwitch recovery preserves
+// the deployment head's rollback semantics. A pre-activation LANGrant removes
+// the uncommitted publication; a durable withdrawal republishes the exact
+// grant only after the caller proves SQL committed. The marker remains
+// installed during the effect, and clearing it is a separate reconciled step.
 func (m *Manager) restoreGatewayCurrentPhysicalLocked(ctx context.Context,
 	transition gatewayCurrentPhysicalTransition,
 ) (gatewayCurrentPhysicalAttestation, error) {
 	if m == nil || ctx == nil || ctx.Err() != nil ||
-		(transition.Kind != gatewayCurrentPhysicalLANGrant && transition.Kind != gatewayCurrentPhysicalLANWithdrawal) ||
+		(transition.Kind != gatewayCurrentPhysicalRouteSwitch && transition.Kind != gatewayCurrentPhysicalLANGrant &&
+			transition.Kind != gatewayCurrentPhysicalLANWithdrawal) ||
 		!validGatewayCurrentPhysicalTransition(transition) {
 		return gatewayCurrentPhysicalAttestation{}, &Error{Code: DiagnosticRouteUnresolved}
 	}
