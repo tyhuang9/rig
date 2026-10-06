@@ -3,6 +3,7 @@ package generatedingress
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
 	"sort"
@@ -11,7 +12,21 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
+
+type gatewayCurrentSelectionRepositoryFunc func(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error)
+
+func (f gatewayCurrentSelectionRepositoryFunc) GatewayRebindRecoverySnapshot(ctx context.Context) (appaccess.GatewayRebindRecoverySnapshot, error) {
+	return f(ctx)
+}
+
+type gatewayCurrentNoCommandRunner struct{ calls int }
+
+func (r *gatewayCurrentNoCommandRunner) Run(context.Context, runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	r.calls++
+	return runtimeprocess.CommandResult{}, errors.New("unexpected Docker command")
+}
 
 type gatewayCurrentStateFixture struct {
 	manager     *Manager
@@ -324,6 +339,137 @@ func TestGatewayCurrentSelectionUsesCommittedHistoryWhileNextRebindIsPrepared(t 
 	snapshot.CurrentDatabaseCommittedEvent = &staleEvent
 	if _, err := fixture.manager.selectGatewayCurrentLocked(context.Background(), snapshot); err == nil {
 		t.Fatal("stale explicit current database-committed event selected the successor")
+	}
+}
+
+func TestGatewayCurrentHistoryComparisonIncludesTypedIntents(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	left := fixture.history
+	left.IntentsV2 = []gatewayRebindProtectedIntentV2Selection{{
+		Generation: 2, Intent: gatewayRebindProtectedIntentV2{Version: gatewayRebindProtectedIntentVersionV2,
+			Purpose: gatewayRebindProtectedIntentPurposeV2, Generation: 2, OperationID: uuid.NewString()},
+	}}
+	right := left
+	right.IntentsV2 = append([]gatewayRebindProtectedIntentV2Selection(nil), left.IntentsV2...)
+	if !sameGatewayRebindCurrentHistory(left, right) {
+		t.Fatal("identical typed intent histories differ")
+	}
+	right.IntentsV2[0].Intent.DatabaseDigest = strings.Repeat("a", 64)
+	if sameGatewayRebindCurrentHistory(left, right) {
+		t.Fatal("changed typed intent was omitted from protected history comparison")
+	}
+	right.IntentsV2 = nil
+	if sameGatewayRebindCurrentHistory(left, right) {
+		t.Fatal("missing typed intent was omitted from protected history comparison")
+	}
+}
+
+func TestReadGatewayCurrentSelectionLockedRevalidatesSQLAroundProtectedRead(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	if err := fixture.store.installBaseline(fixture.baseline); err != nil {
+		t.Fatal(err)
+	}
+	profile := gatewayCurrentFixtureProfile(fixture.baseline.Lineage, fixture.baseline.Profile)
+	authority := gatewayCurrentAuthority(fixture.baseline.Lineage)
+	event := appaccess.GatewayRebindEvent{OperationID: fixture.receipt.OperationID,
+		Sequence: 4, State: appaccess.GatewayRebindDatabaseCommitted}
+	snapshot := appaccess.GatewayRebindRecoverySnapshot{
+		History: []appaccess.GatewayRebindHistoryEntry{{
+			Claim: appaccess.GatewayRebindClaimRecord{SpecVersion: 1, Legacy: &appaccess.GatewayRebindClaim{
+				Spec: appaccess.GatewayRebindSpec{OperationID: fixture.receipt.OperationID}}},
+			Events: []appaccess.GatewayRebindEvent{event}, Transfers: fixture.transfers,
+		}},
+		CurrentProfile: &profile, CurrentSource: &authority, CurrentDatabaseCommittedEvent: &event,
+		CurrentTransfers: fixture.transfers,
+	}
+	before, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeFiles, err := readGatewayHistorySnapshotMode(fixture.manager.store, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandRunner := &gatewayCurrentNoCommandRunner{}
+	fixture.manager.runner = commandRunner
+
+	t.Run("exact", func(t *testing.T) {
+		calls := 0
+		fixture.manager.options.RebindCurrentStateRepository = gatewayCurrentSelectionRepositoryFunc(func(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error) {
+			calls++
+			return snapshot, nil
+		})
+		selection, got, err := fixture.manager.readGatewayCurrentSelectionLocked(context.Background())
+		if err != nil || calls != 2 || selection.Lineage != fixture.baseline.Lineage || !reflect.DeepEqual(got, snapshot) {
+			t.Fatalf("read exact current selection: calls=%d error=%v", calls, err)
+		}
+	})
+
+	for _, test := range []struct {
+		name       string
+		repository gatewayCurrentSelectionRepositoryFunc
+	}{
+		{"first SQL error", func(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error) {
+			return appaccess.GatewayRebindRecoverySnapshot{}, errors.New("first")
+		}},
+		{"second SQL error", func() gatewayCurrentSelectionRepositoryFunc {
+			calls := 0
+			return func(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error) {
+				calls++
+				if calls == 2 {
+					return appaccess.GatewayRebindRecoverySnapshot{}, errors.New("second")
+				}
+				return snapshot, nil
+			}
+		}()},
+		{"changed second SQL", func() gatewayCurrentSelectionRepositoryFunc {
+			calls := 0
+			return func(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error) {
+				calls++
+				value := snapshot
+				if calls == 2 {
+					changed := authority
+					changed.OperationID = uuid.NewString()
+					value.CurrentSource = &changed
+				}
+				return value, nil
+			}
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture.manager.options.RebindCurrentStateRepository = test.repository
+			if _, _, err := fixture.manager.readGatewayCurrentSelectionLocked(context.Background()); err == nil {
+				t.Fatal("unstable SQL current selection was accepted")
+			}
+		})
+	}
+	t.Run("cancelled second SQL", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		calls := 0
+		fixture.manager.options.RebindCurrentStateRepository = gatewayCurrentSelectionRepositoryFunc(func(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error) {
+			calls++
+			if calls == 2 {
+				cancel()
+			}
+			return snapshot, nil
+		})
+		if _, _, err := fixture.manager.readGatewayCurrentSelectionLocked(ctx); err == nil || calls != 2 {
+			t.Fatalf("second-read cancellation was accepted or not reached: calls=%d error=%v", calls, err)
+		}
+	})
+	fixture.manager.options.RebindCurrentStateRepository = nil
+	if _, _, err := fixture.manager.readGatewayCurrentSelectionLocked(context.Background()); err == nil {
+		t.Fatal("missing repository was accepted")
+	}
+	after, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || !sameGatewayRebindCurrentHistory(before, after) {
+		t.Fatalf("read-only current selection changed protected history: %v", err)
+	}
+	afterFiles, err := readGatewayHistorySnapshotMode(fixture.manager.store, true)
+	if err != nil || !sameGatewayHistorySnapshot(beforeFiles, afterFiles) || commandRunner.calls != 0 {
+		t.Fatalf("current selection changed protected files or ran Docker: files=%t commands=%d error=%v",
+			sameGatewayHistorySnapshot(beforeFiles, afterFiles), commandRunner.calls, err)
 	}
 }
 
