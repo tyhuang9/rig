@@ -68,6 +68,19 @@ type Options struct {
 	// gateway locks are both held, before any protected gateway observation or
 	// mutation. Production callers must provide a fresh database-backed check.
 	RebindFenceCheck func(context.Context) error
+	// RebindCurrentStateRepository supplies a fresh SQL-selected current
+	// lineage for ordinary route, grant, disable, redeploy, and restart paths.
+	// It is optional for legacy-only callers; any path that observes a scoped
+	// rebind current-state bundle fails closed when this provider is absent.
+	RebindCurrentStateRepository GatewayRebindCurrentStateRepository
+}
+
+// GatewayRebindCurrentStateRepository is intentionally read-only. Ordinary
+// generated-ingress operations use it only to select and revalidate the
+// current protected generation; rebind claims and transitions remain private
+// coordinator operations with their own explicit repository contract.
+type GatewayRebindCurrentStateRepository interface {
+	GatewayRebindRecoverySnapshot(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error)
 }
 
 type Manager struct {
