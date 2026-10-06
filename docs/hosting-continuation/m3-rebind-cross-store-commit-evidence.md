@@ -1233,3 +1233,20 @@ PR #136's final hosted repository/PostgreSQL race workflow
 [`37399509007`](https://github.com/tyhuang9/rig/actions/runs/37399509007)
 completed successfully at its published head `9694b4e`. This evidence applies
 to the published final-config-copy draft, not this unpublished runtime branch.
+
+The LAN census checkpoint was frozen at `3186e9e`; documentation workflow and
+build passed (3.51s). The following batch-presence integration adds only a
+read-only current-generation path to `HasGatewayV2LANRecoveryBatch`, which the
+controller calls before LAN inspection. It reconfirms exact SQL and protected
+selection, preserving markers and refusing unavailable authority without any
+physical observation or mutation. Existing native selection remains covered.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^Test(GatewayCurrentLANRecoveryBatchPresenceBeforePhysicalWork|HasGatewayV2LANRecoveryBatchSelectsIntentBeforeReload)$'
+go vet -mod=readonly ./internal/generatedingress
+```
+
+Both named tests passed, with no failure or skip, in 20.240s. Vet and diff checks
+passed. Log: `Rig/temp/m3-current-lan-batch-presence.jsonl`. This proves only
+presence selection before effects; batch quarantine, physical proof, ordered
+head finalization and retirement still require the pending runtime integration.

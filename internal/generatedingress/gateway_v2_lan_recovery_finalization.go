@@ -17,8 +17,8 @@ type GatewayV2LANRecoveryHead struct {
 	Count       int
 }
 
-// HasGatewayV2LANRecoveryBatch reads only the exact journal-bound protected
-// state. It lets startup choose the quarantine resume path before any topology
+// HasGatewayV2LANRecoveryBatch reads only the SQL-selected current or exact
+// journal-bound protected state. It chooses quarantine before any topology
 // proof or listener work. Malformed or partial history is an error.
 func (m *Manager) HasGatewayV2LANRecoveryBatch(ctx context.Context) (present bool, resultErr error) {
 	if m == nil || ctx == nil {
@@ -31,6 +31,18 @@ func (m *Manager) HasGatewayV2LANRecoveryBatch(ctx context.Context) (present boo
 		return false, err
 	}
 	defer releaseGatewayLock(release, &resultErr)
+	current, snapshot, handled, currentErr := m.gatewayCurrentSelectedStateForRecoveryLocked(ctx)
+	if currentErr != nil {
+		return false, gatewayV2LANDisableError(ctx)
+	}
+	if handled {
+		confirmed, confirmedSQL, selected, err := m.readOptionalGatewayCurrentSelectionLocked(ctx)
+		if err != nil || !selected || !reflect.DeepEqual(snapshot, confirmedSQL) ||
+			!sameGatewayCurrentSelection(current, confirmed) || ctx.Err() != nil {
+			return false, gatewayV2LANDisableError(ctx)
+		}
+		return current.State.LANRecovery != nil, nil
+	}
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil {
 		return false, gatewayV2LANDisableError(ctx)
