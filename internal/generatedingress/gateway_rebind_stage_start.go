@@ -489,14 +489,49 @@ func (m *Manager) readGatewayRebindStageServingAttestation(ctx context.Context,
 	if progressCount != 9 && progressCount != 10 && progressCount != 11 {
 		return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
+	return m.readGatewayRebindStageServingAttestationWithConfigProof(ctx, repository, reads, inspectDocker,
+		driver, intent, stage, expected, progressCount, false)
+}
+
+// readGatewayRebindStageServingAttestationForFinalConfigCopy proves the same
+// live challenge-and-404 stage but leaves the /config inventory to the
+// sequence-twelve caller. That caller immediately requires the independently
+// bounded final-config parser to prove either the exact stage-only inventory or
+// the exact stage-and-active pair. Older phase callers retain the strict
+// one-file parser through readGatewayRebindStageServingAttestation.
+func (m *Manager) readGatewayRebindStageServingAttestationForFinalConfigCopy(ctx context.Context,
+	repository *appaccess.Repository, reads gatewayRebindSuccessorPreflightReads,
+	inspectDocker gatewayRebindDockerInspector, driver gatewayRebindStageServingAttestor,
+	intent gatewayRebindProtectedIntent, stage gatewayRebindStageIntent,
+	expected *gatewayRebindStageServingBinding, progressCount uint64,
+) (gatewayRebindStageServingAttestation, error) {
+	if progressCount != 11 && progressCount != 12 {
+		return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	return m.readGatewayRebindStageServingAttestationWithConfigProof(ctx, repository, reads, inspectDocker,
+		driver, intent, stage, expected, progressCount, true)
+}
+
+func (m *Manager) readGatewayRebindStageServingAttestationWithConfigProof(ctx context.Context,
+	repository *appaccess.Repository, reads gatewayRebindSuccessorPreflightReads,
+	inspectDocker gatewayRebindDockerInspector, driver gatewayRebindStageServingAttestor,
+	intent gatewayRebindProtectedIntent, stage gatewayRebindStageIntent,
+	expected *gatewayRebindStageServingBinding, progressCount uint64, finalConfigInventoryFollows bool,
+) (gatewayRebindStageServingAttestation, error) {
+	if progressCount != 9 && progressCount != 10 && progressCount != 11 && progressCount != 12 {
+		return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
+	}
 	anchor, err := m.readGatewayRebindEffectBoundaryAnchor(ctx, repository)
 	if err != nil || !reflect.DeepEqual(anchor.intent, intent) || anchor.progressCount != progressCount ||
+		!validGatewayRebindStageIntent(stage) ||
 		stage.Network == nil || stage.StageContainer == nil || stage.StageConfigIntent == nil ||
 		stage.StageStartIntent == nil || (progressCount == 9 && stage.StageServing != nil) ||
-		((progressCount == 10 || progressCount == 11) &&
+		(progressCount >= 10 &&
 			(stage.StageServing == nil || expected == nil || *stage.StageServing != *expected)) ||
 		(progressCount < 11 && stage.FinalConfigIntent != nil) ||
-		(progressCount == 11 && stage.FinalConfigIntent == nil) {
+		(progressCount >= 11 && stage.FinalConfigIntent == nil) ||
+		(progressCount < 12 && stage.FinalConfigCopy != nil) ||
+		(progressCount == 12 && stage.FinalConfigCopy == nil) {
 		return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
 	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
@@ -505,12 +540,14 @@ func (m *Manager) readGatewayRebindStageServingAttestation(ctx context.Context,
 		!reflect.DeepEqual(*history.Progress[len(history.Progress)-1].Record.Stage, stage) {
 		return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
-	if progressCount == 11 {
-		// Sequence eleven adds only a protected final-config intent. Reuse the
+	if progressCount >= 11 {
+		// Sequences eleven and twelve add only protected final-config intent and
+		// copy-receipt fields. Reuse the
 		// exact sequence-ten physical serving contract without teaching the old
 		// stage validators or drivers about the later-phase field.
 		servingStage := stage
 		servingStage.FinalConfigIntent = nil
+		servingStage.FinalConfigCopy = nil
 		if len(history.Progress) < 10 || history.Progress[9].Record.Stage == nil ||
 			!reflect.DeepEqual(*history.Progress[9].Record.Stage, servingStage) {
 			return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
@@ -557,9 +594,11 @@ func (m *Manager) readGatewayRebindStageServingAttestation(ctx context.Context,
 		return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
 	defer clear(body)
-	inventory, err := driver.configVolumeInventory(ctx, intent, stage, body)
-	if err != nil || inventory != gatewayRebindStageConfigInventoryExact {
-		return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
+	if !finalConfigInventoryFollows {
+		inventory, err := driver.configVolumeInventory(ctx, intent, stage, body)
+		if err != nil || inventory != gatewayRebindStageConfigInventoryExact {
+			return gatewayRebindStageServingAttestation{}, gatewayRebindEffectBoundaryError(ctx)
+		}
 	}
 	live, err := driver.liveConfig(ctx, stage.StageContainer.ID)
 	if err != nil || !sameCaddyConfig(body, live) {

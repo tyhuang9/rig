@@ -1,9 +1,9 @@
 # M3 rebind draft PR stack
 
-Status: rows 1–25 are published as stacked draft PRs #98–#122. Their base is
+Status: rows 1–38 are published as stacked draft PRs #98–#135. Their base is
 draft PR #97, `feature/hosting-m3-two-app-lan-journey` at `d949d2c`. Each
 published branch targets its preceding branch with one review scope. Rows
-26–37 remain local and require separate publication approval; they have
+26–38 were published after explicit user approval on 2026-10-05; they have
 inherited the row-25 race-partition head `9ad7f78` through additive merges. The
 first four hosted row-25 network Docker attempts failed; the fifth and sixth
 passed the required live network-stage test and residue gate at `ad8d3e2` and
@@ -16,18 +16,20 @@ its 32-minute timeout. Head `9ad7f78` partitions that race job without removing
 tests. Its fast check, network-stage gate, all three dedicated race batches
 and stable aggregate passed. The separate repository-wide race job also
 passed at 2026-10-05 17:34:51 UTC. The later volume, container,
-config, and start Docker gates remain unrun on hosted Linux. No draft
+config, and start Docker gates were running or queued at the publication
+checkpoint; their acceptance remains pending. No draft
 publication authorizes merge or deployment.
 
 Rechecked on 2026-10-05: all 25 PRs remain open drafts, every PR after #98
 targets the preceding branch, and all 25 are attached to the implementation
 chat. No branch in this stack has been merged by this work.
 
-The additional local branch `feature/hosting-m3-rebind-final-config-intent`
+The branch `feature/hosting-m3-rebind-final-config-intent`
 implements the complete successor application config plan and protected
 sequence-eleven intent on row 37 at `020196d`. Its focused checks, full Go
-suite, vet, build, Docker-tag compilation and source review passed. It requires separate publication
-approval and is not included in the pending rows 26–37 request.
+suite, vet, build, Docker-tag compilation and source review passed. It was
+published as draft PR #135 at documentation head `f555c05` under the user's
+explicit rows 26–38 authorization. See the publication receipt below.
 
 | Order | Branch | Scope commit | Review scope |
 | --- | --- | --- | --- |
@@ -66,9 +68,9 @@ approval and is not included in the pending rows 26–37 request.
 | 33 | `feature/hosting-m3-rebind-stage-config-copy` | `0143b51` | Guarded sequence-eight exact config copy and protected readback receipt |
 | 34 | `feature/hosting-m3-rebind-stage-config-docker-gate` | `1ba86c0` | Required hosted Docker direct-copy and lost-acknowledgment adoption gates |
 | 35 | `feature/hosting-m3-rebind-stage-start-intent` | `3dfee6b` | Protected sequence-nine exact start intent; no Docker start or listener effect |
-| 36 | `feature/hosting-m3-rebind-stage-start` | `b455d42` | Guarded exact successor start and protected sequence-ten serving proof; local only |
-| 37 | `feature/hosting-m3-rebind-stage-start-docker-gate` | `6a83056` | Required hosted Docker direct start, lost-acknowledgment adoption, compensation, and residue gates; local only |
-| 38 | `feature/hosting-m3-rebind-final-config-intent` | `020196d` | Complete successor application config plan and protected sequence-eleven intent; local only |
+| 36 | `feature/hosting-m3-rebind-stage-start` | `b455d42` | Guarded exact successor start and protected sequence-ten serving proof |
+| 37 | `feature/hosting-m3-rebind-stage-start-docker-gate` | `6a83056` | Required hosted Docker direct start, lost-acknowledgment adoption, compensation, and residue gates |
+| 38 | `feature/hosting-m3-rebind-final-config-intent` | `020196d` | Complete successor application config plan and protected sequence-eleven intent |
 
 ## Verified local ancestry
 
@@ -91,7 +93,110 @@ its code verification; `020196d` identifies its implementation.
 | 35 | `eaaff4e71affa07867f61d7d5ec6b39f541180e5` |
 | 36 | `b144f02f184735c1df6c1f8ff151ed7a3a5e962f` |
 | 37 | `98a716dd5f158335cee8c2e9ca3a0907364c4b8e` |
-| 38 | `020196dc0d1250de315713a97f1206bfce7ba2ce` |
+| 38 | `f555c05898e6b3104fa770958bcb51c8406e04d1` |
+
+## Rows 26–38 publication receipt
+
+On 2026-10-05 the user authorized these thirteen drafts. The exact integrated
+heads above were pushed atomically without rewriting history. GitHub and
+remote-ref reads then verified every head, base, open state and draft flag;
+all thirteen PRs were attached to the implementation chat. Row 26 targets
+row 25's branch from PR #122; every later PR targets its immediate predecessor.
+No merge or deployment was performed.
+
+| Row | Draft PR |
+| --- | --- |
+| 26 | [#123](https://github.com/tyhuang9/rig/pull/123) |
+| 27 | [#124](https://github.com/tyhuang9/rig/pull/124) |
+| 28 | [#125](https://github.com/tyhuang9/rig/pull/125) |
+| 29 | [#126](https://github.com/tyhuang9/rig/pull/126) |
+| 30 | [#127](https://github.com/tyhuang9/rig/pull/127) |
+| 31 | [#128](https://github.com/tyhuang9/rig/pull/128) |
+| 32 | [#129](https://github.com/tyhuang9/rig/pull/129) |
+| 33 | [#130](https://github.com/tyhuang9/rig/pull/130) |
+| 34 | [#131](https://github.com/tyhuang9/rig/pull/131) |
+| 35 | [#132](https://github.com/tyhuang9/rig/pull/132) |
+| 36 | [#133](https://github.com/tyhuang9/rig/pull/133) |
+| 37 | [#134](https://github.com/tyhuang9/rig/pull/134) |
+| 38 | [#135](https://github.com/tyhuang9/rig/pull/135) |
+
+CI was running or queued at this checkpoint, with no observed failure. That
+status does not establish new-head hosted acceptance. The full per-check
+publication snapshot is retained in the local publication receipt; the PR
+checks are authoritative for subsequent results.
+
+## Published CI corrections after rows 26–38
+
+The first hosted config-volume run failed at the production effect boundary;
+Docker can return the same exact mount set in a different order. Reviewed
+config/data-volume corrections `75bfa3d` and `0b44a7c` compare the existing
+validated predecessor digest, retaining exact mount and all other field
+checks. Their failing regressions became passing and both full focused groups
+passed. The inherited migration journey also exposed a worker scheduling race
+in its immediate resume-status assertion; test-only `5c7ba89` accepts queued,
+assigned or running while retaining subsequent exact-attempt, ledger and
+restart requirements. These corrections were propagated and published through
+the existing drafts without rewriting history.
+
+The next [data-volume Docker attempt](https://github.com/tyhuang9/rig/actions/runs/37357839673/job/111924676806)
+at row-37 head `2c8b8e2` failed after staging/replay in an unchanged-predecessor
+assertion that still compared mount slice order directly. Four reviewed
+test-only corrections now independently validate both complete observations
+and compare the validated digest. The integrated three-regression check
+(mount ordering, invalid mounts, and non-mount drift), including live-tag
+compilation, passed in 2.782s. Every published head, immediate base and draft
+state was verified. Hosted reruns remain pending, and the failed attempts are
+retained as failed evidence in the scoped final-config-copy evidence file.
+
+| Row / draft | Published correction head |
+| --- | --- |
+| 27 / #124 | `6cb5dcb392093e51a79403692de3c788b8ca715c` |
+| 28 / #125 | `d45998be35637d5d34f68a8562f9b4b82562aa17` |
+| 29 / #126 | `37c449bf7ee541e1ea1f055966d4575860efce18` |
+| 30 / #127 | `5ed939de8f909464fc1e3f55d50e0c841808fd21` |
+| 31 / #128 | `cffa0a055c07a86977ddd73e44d6335a8bc97e36` |
+| 32 / #129 | `7b95a75f93438b3b6ea3f72e974dd963462a8c51` |
+| 33 / #130 | `b3d8621831370b3f6bd9d807e7831b6a4123ab1e` |
+| 34 / #131 | `32e377a2752fadd46414a8dc77b241ebcd401264` |
+| 35 / #132 | `d47ba3ace473ab1237b28172d9d3891383b2d3c7` |
+| 36 / #133 | `094c9f1ffda54904d455e7019c0e990c0f4a1a02` |
+| 37 / #134 | `3f7669c9476ec37017ed0755f7191702202c8044` |
+| 38 / #135 | `f6966a1512bbfa40468567655bb1fd9a1b3197e7` |
+
+Row 26's original publication head is unchanged. No merge or deployment was
+performed. The next final-config-copy implementation is local and requires
+separate publication authorization.
+
+At row-38 head `f6966a1`, the corrected inherited
+[migration Docker job](https://github.com/tyhuang9/rig/actions/runs/37359439219/job/111930044124)
+passed both required named tests; the live migration journey took 144.11s
+and its owned-resource cleanup passed. Rebind gates remain separate and
+pending at this checkpoint.
+
+## Additive archive/autosave correction receipt (2026-10-05)
+
+Existing authorized drafts #129–135 received the reviewed pinned-image
+directory correction. Drafts #132–135 then received the strict post-start
+Caddy autosave correction. Each remote head, original base and open draft
+status was verified after publication; no source history was rewritten.
+
+| Draft | Verified published head |
+| --- | --- |
+| #129 | `f2614d73e8a6592f0c5196c2daab3e8591a6ad5f` |
+| #130 | `496e3d64977a8decac949fc1ba00f5286751c941` |
+| #131 | `b8b50eee2b72b4fda5fe966ef45a80e8de895a46` |
+| #132 | `8801a091a0a5b7d9f23b7c72bf5731efb8bc9226` |
+| #133 | `b236cda27c78e5fcf5dca3cba3bd3f99f0bff272` |
+| #134 | `5d497101cfb1206ea603a8100b73ed7a5e4f21d6` |
+| #135 | `e46185ff61b3fa519304e5fa0ce8ab9c1a788acb` |
+
+The [final-intent evidence](./m3-rebind-final-config-intent-evidence.md)
+records 41 downstream tests passing in 307.338s with zero failures/skips and
+the still-pending hosted gates. The separate, unpublished final-config-copy
+candidate now has [76 passing regressions](./m3-rebind-final-config-copy-evidence.md#pinned-image-and-autosave-correction-2026-10-05)
+at corrected source `60fa60d`. Its older `39b217f` publication request was put
+on hold; publication of the corrected candidate needs a replacement request.
+The private handover is also unpublished. No merge or deployment occurred.
 
 ## Acceptance and remaining work
 
@@ -125,8 +230,8 @@ tests, its production build, both ingress partitions (453 tests discovered
 and run exactly once), the other eight runtime packages, and docs build.
 The dedicated race matrix, stable aggregate and network-stage Docker gate
 passed on `9ad7f78`; the separate repository-wide race job also passed.
-These local branches remain
-unpublished pending separate authorization.
+These branches were subsequently published under the authorization and exact
+heads recorded above. The following paragraphs retain their local checkpoints.
 Rows 26 and 27 passed their final-source Go suites,
 vet, builds, and relevant focused checks before this network-route correction
 was integrated. Row 28 passed its original final-source Go suite, vet, build,
@@ -150,7 +255,7 @@ serving proof with direct-start, lost-acknowledgment, replay, drift, and
 compensation tests; its scoped evidence records local checks. Row 37 adds
 three named hosted Docker tests and an always-run exact-resource residue scan.
 Its live tests compiled and skipped locally; physical Linux Docker acceptance
-remains pending publication.
+remains pending completion of the published hosted checks.
 
 These branches do not add a public rebind controller caller, terminal protected
 receipt, successor cutover, transfer-aware readers, recovery, or fence release.
