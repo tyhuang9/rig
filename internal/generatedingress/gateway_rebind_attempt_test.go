@@ -74,6 +74,11 @@ func TestGatewayRebindAttemptViewUsesTypedCheckpointAndActualPriorReceipt(t *tes
 		view.Source.Lineage.ProtectedIntentDigest != fixture.receipt.ProtectedIntentDigest {
 		t.Fatalf("typed attempt source projection mismatch: %#v", view.Source)
 	}
+	forgedLineage := fixture.baseline.Lineage
+	forgedLineage.OperationID = uuid.NewString()
+	if gatewayRebindAttemptTerminalMatchesLineage(view.Source.Rebind.Terminal, forgedLineage) {
+		t.Fatal("validated terminal projection accepted a different self-consistent lineage identity")
+	}
 	for index, entry := range view.Roster {
 		want := intent.Roster[index]
 		if entry.SourceProfileRevisionID != want.SourceProfileRevisionID ||

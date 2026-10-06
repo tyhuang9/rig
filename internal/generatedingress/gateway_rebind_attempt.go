@@ -208,7 +208,7 @@ func newGatewayRebindAttemptViewV2(intent gatewayRebindProtectedIntentV2,
 			return gatewayRebindAttemptView{}, invalid
 		}
 		terminal, err := newGatewayRebindAttemptTerminalViewLegacy(*current.Receipt)
-		if err != nil || terminal.Digest != checkpoint.Lineage.TerminalReceiptDigest {
+		if err != nil || !gatewayRebindAttemptTerminalMatchesLineage(terminal, checkpoint.Lineage) {
 			return gatewayRebindAttemptView{}, invalid
 		}
 		source.Rebind = &gatewayRebindAttemptCommittedSource{
@@ -258,6 +258,22 @@ func newGatewayRebindAttemptViewV2(intent gatewayRebindProtectedIntentV2,
 		NetworkObservation: intent.NetworkObservation, NetworkObservationDigest: intent.NetworkObservationDigest,
 		Identity: intent.Identity, TypedIntent: &typed,
 	}, nil
+}
+
+func gatewayRebindAttemptTerminalMatchesLineage(terminal gatewayRebindAttemptTerminalView,
+	lineage appaccess.GatewayCurrentLineageRef,
+) bool {
+	if terminal.Format != gatewayRebindAttemptTerminalLegacyV1 || terminal.LegacyReceipt == nil ||
+		terminal.Digest != lineage.TerminalReceiptDigest {
+		return false
+	}
+	receiptLineage, err := gatewayRebindCurrentLineage(*terminal.LegacyReceipt)
+	return err == nil && receiptLineage == lineage && terminal.Generation == lineage.ProtectedGeneration &&
+		terminal.OperationID == lineage.OperationID && terminal.ProtectedIntentDigest == lineage.ProtectedIntentDigest &&
+		terminal.SuccessorIdentity.Digest == lineage.ProtectedIdentityDigest &&
+		terminal.SuccessorProfile.RevisionID == lineage.ProfileRevisionID &&
+		terminal.SuccessorProfile.RevisionNumber == lineage.ProfileRevisionNumber &&
+		terminal.SuccessorProfile.SpecDigest == lineage.ProfileSpecDigest
 }
 
 func gatewayRebindAttemptRosterMatchesSource(roster []appaccess.GatewayRebindRosterEntryV2,
