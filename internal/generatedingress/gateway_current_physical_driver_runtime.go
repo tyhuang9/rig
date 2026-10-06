@@ -627,7 +627,6 @@ func (d managerGatewayCurrentPhysicalRuntime) attestation(ctx context.Context,
 		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 	}
 	defer clear(expected)
-	activeDigest := sha256.Sum256(expected)
 	outcome := gatewayCurrentPhysicalStableServing
 	listenerAbsent := false
 	if !inventory.Final.Running {
@@ -654,6 +653,21 @@ func (d managerGatewayCurrentPhysicalRuntime) attestation(ctx context.Context,
 			return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 		}
 	}
+	return d.attestationProof(ctx, target, inventory, expected, outcome, listenerAbsent)
+}
+
+func (d managerGatewayCurrentPhysicalRuntime) attestationProof(ctx context.Context,
+	target gatewayCurrentPhysicalTarget, inventory gatewayCurrentPhysicalInventory, expected []byte,
+	outcome gatewayCurrentPhysicalOutcome, listenerAbsent bool,
+) (gatewayCurrentPhysicalAttestation, error) {
+	if !validGatewayCurrentPhysicalTarget(target) || len(expected) == 0 ||
+		(outcome != gatewayCurrentPhysicalStableServing && outcome != gatewayCurrentPhysicalRecoveryBefore &&
+			outcome != gatewayCurrentPhysicalRecoveryEffective && outcome != gatewayCurrentPhysicalRecoveryMixed &&
+			outcome != gatewayCurrentPhysicalRecoveryStopped) ||
+		listenerAbsent != (outcome == gatewayCurrentPhysicalRecoveryStopped) {
+		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+	}
+	activeDigest := sha256.Sum256(expected)
 	routeDigest, err := canonicalDigest(struct {
 		Context string                             `json:"context"`
 		Lineage appaccess.GatewayCurrentLineageRef `json:"lineage"`
