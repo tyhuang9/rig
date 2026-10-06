@@ -2,6 +2,7 @@ package generatedingress
 
 import (
 	"errors"
+	"os"
 	"reflect"
 	"sort"
 
@@ -26,6 +27,7 @@ type gatewayCurrentOwnedStopTarget struct {
 	State                 gatewayCurrentRouteState
 	PermittedStateDigests []string
 	Pending               *gatewayCurrentPendingRoute
+	Transition            *gatewayCurrentPhysicalTransition
 	FinalContainer        gatewayRebindFinalContainerBinding
 	Digest                string
 }
@@ -60,6 +62,22 @@ func validGatewayCurrentOwnedStopTarget(value gatewayCurrentOwnedStopTarget) boo
 	if !foundState || !sort.StringsAreSorted(value.PermittedStateDigests) {
 		return false
 	}
+	if value.Transition == nil {
+		if len(value.PermittedStateDigests) != 1 || value.PermittedStateDigests[0] != value.State.Digest ||
+			!reflect.DeepEqual(value.Pending, value.State.Pending) {
+			return false
+		}
+	} else {
+		transition := *value.Transition
+		if !validGatewayCurrentPhysicalTransition(transition) || transition.Before.Lineage != value.Lineage ||
+			!reflect.DeepEqual(value.Pending, transition.Pending.Pending) ||
+			!reflect.DeepEqual(value.PermittedStateDigests, canonicalGatewayCurrentOwnedStopDigests(
+				transition.Before.Digest, transition.Pending.Digest, transition.Effective.Digest)) ||
+			(!reflect.DeepEqual(value.State, transition.Before) && !reflect.DeepEqual(value.State, transition.Pending) &&
+				!reflect.DeepEqual(value.State, transition.Effective)) {
+			return false
+		}
+	}
 	digest, err := gatewayCurrentOwnedStopTargetDigest(value)
 	return err == nil && digest == value.Digest
 }
@@ -77,6 +95,8 @@ func (m *Manager) gatewayCurrentOwnedStopTargetForTransitionLocked(
 	target.PermittedStateDigests = canonicalGatewayCurrentOwnedStopDigests(
 		transition.Before.Digest, transition.Pending.Digest, transition.Effective.Digest)
 	target.Pending = cloneGatewayCurrentPendingRoute(transition.Pending.Pending)
+	copy := cloneGatewayCurrentPhysicalTransition(transition)
+	target.Transition = &copy
 	target.Digest, err = gatewayCurrentOwnedStopTargetDigest(target)
 	if err != nil || !validGatewayCurrentOwnedStopTarget(target) {
 		return gatewayCurrentOwnedStopTarget{}, errors.New("invalid current owned-stop transition target")
@@ -132,6 +152,10 @@ func (m *Manager) revalidateGatewayCurrentOwnedStopTargetLocked(
 	}
 	fresh.PermittedStateDigests = append([]string(nil), target.PermittedStateDigests...)
 	fresh.Pending = cloneGatewayCurrentPendingRoute(target.Pending)
+	if target.Transition != nil {
+		copy := cloneGatewayCurrentPhysicalTransition(*target.Transition)
+		fresh.Transition = &copy
+	}
 	fresh.Digest, err = gatewayCurrentOwnedStopTargetDigest(fresh)
 	if err != nil || !validGatewayCurrentOwnedStopTarget(fresh) {
 		return gatewayCurrentOwnedStopTarget{}, errors.New("invalid revalidated current owned-stop target")
@@ -177,12 +201,12 @@ func (m *Manager) gatewayCurrentOwnedStopTargetsProtectedLocked() ([]gatewayCurr
 		if storeErr != nil {
 			return nil, storeErr
 		}
+		if _, statErr := os.Lstat(store.path); statErr != nil {
+			return nil, errors.New("current owned-stop route bundle is missing or unreadable")
+		}
 		state, loadErr := store.load()
 		if loadErr != nil {
-			// A protected terminal may precede the SQL database commit and
-			// create-only operational baseline. It is not a current bundle and
-			// is left to the cross-store phase recovery path.
-			continue
+			return nil, errors.New("current owned-stop route bundle is corrupt")
 		}
 		target, targetErr := m.gatewayCurrentOwnedStopTargetForStateLocked(state)
 		if targetErr != nil {
@@ -195,6 +219,12 @@ func (m *Manager) gatewayCurrentOwnedStopTargetsProtectedLocked() ([]gatewayCurr
 		result = append(result, target)
 	}
 	return result, nil
+}
+
+func cloneGatewayCurrentPhysicalTransition(value gatewayCurrentPhysicalTransition) gatewayCurrentPhysicalTransition {
+	return gatewayCurrentPhysicalTransition{Kind: value.Kind, AppID: value.AppID,
+		Before: cloneGatewayCurrentRouteState(value.Before), Pending: cloneGatewayCurrentRouteState(value.Pending),
+		Effective: cloneGatewayCurrentRouteState(value.Effective)}
 }
 
 func (m *Manager) gatewayCurrentOwnedStopTerminalLocked(
