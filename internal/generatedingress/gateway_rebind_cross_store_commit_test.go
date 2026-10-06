@@ -85,7 +85,8 @@ func (d *gatewayRebindBoundedPhysicalDriver) reconcileSuccessorLocked(ctx contex
 	attempt gatewayRebindPreparedAttempt, appendProgress gatewayRebindTypedProgressAppender,
 ) (gatewayRebindTypedPhysicalResult, error) {
 	d.commitCalls++
-	records, resources, proof := gatewayRebindTypedCompleteProgressFixture(d.t, d.template, attempt.Intent, attempt.Progress)
+	records, resources, proof := gatewayRebindTypedCompleteProgressFixture(d.t, d.template,
+		attempt.Checkpoint, attempt.Intent, attempt.Progress)
 	if d.rollback {
 		forward := append([]gatewayRebindProgressRecord(nil), records[:13]...)
 		for _, record := range forward[1:] {

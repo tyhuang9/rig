@@ -210,7 +210,8 @@ func TestGatewayRebindProtectedIntentV2KeepsTypedPriorRebindSource(t *testing.T)
 	network.OperationID = input.OperationID
 	network.ClaimRequestDigest = claim.RequestDigest
 	network.ProfileSpecDigest = inspection.SuccessorProfileSpecDigest
-	intent, err := newGatewayRebindProtectedIntentV2(claim, inspection.Roster, checkpoint, network)
+	intent, err := newGatewayRebindProtectedIntentV2(claim, inspection.Roster, inspection.RuntimeHeads,
+		checkpoint, network)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,6 +29,7 @@ type gatewayRebindProtectedIntentV2 struct {
 	SuccessorProfile         gatewayRebindSuccessorIntentProfile      `json:"successorProfile"`
 	Roster                   []appaccess.GatewayRebindRosterEntryV2   `json:"roster"`
 	RosterEntryDigests       []string                                 `json:"rosterEntryDigests"`
+	RuntimeHeads             []appaccess.GatewayRebindRuntimeHead     `json:"runtimeHeads"`
 	Network                  gatewayRebindSuccessorIntentNetwork      `json:"network"`
 	NetworkDigest            string                                   `json:"networkDigest"`
 	NetworkObservation       gatewayRebindSuccessorNetworkObservation `json:"networkObservation"`
@@ -54,7 +55,8 @@ type gatewayRebindProtectedIntentV2Selection struct {
 }
 
 func newGatewayRebindProtectedIntentV2(claim appaccess.GatewayRebindClaimV2,
-	roster []appaccess.GatewayRebindRosterEntryV2, checkpoint gatewayRebindPredecessorCheckpoint,
+	roster []appaccess.GatewayRebindRosterEntryV2, runtimeHeads []appaccess.GatewayRebindRuntimeHead,
+	checkpoint gatewayRebindPredecessorCheckpoint,
 	network gatewayRebindSuccessorNetworkObservation,
 ) (gatewayRebindProtectedIntentV2, error) {
 	invalid := errors.New("invalid generated ingress typed rebind protected intent input")
@@ -99,6 +101,12 @@ func newGatewayRebindProtectedIntentV2(claim appaccess.GatewayRebindClaimV2,
 		}
 		entryDigests[index] = digest
 	}
+	runtimeHeadsCopy := append([]appaccess.GatewayRebindRuntimeHead(nil), runtimeHeads...)
+	runtimeHeadsDigest, err := appaccess.GatewayRebindRuntimeHeadsV2Digest(claim.Spec.OperationID, runtimeHeadsCopy)
+	if err != nil || claim.Spec.RuntimeHeadsVersion != appaccess.GatewayRebindRuntimeHeadsVersionV1 ||
+		runtimeHeadsDigest != claim.Spec.RuntimeHeadsDigest || int64(len(runtimeHeadsCopy)) != claim.Spec.RuntimeHeadsCount {
+		return gatewayRebindProtectedIntentV2{}, invalid
+	}
 	profile := gatewayRebindSuccessorIntentProfile{
 		RevisionID: claim.Spec.SuccessorProfileRevisionID, RevisionNumber: claim.Spec.SuccessorProfileRevisionNumber,
 		OperationID: claim.Spec.SuccessorProfileOperationID, RequestDigest: claim.SuccessorProfileRequestDigest,
@@ -126,9 +134,10 @@ func newGatewayRebindProtectedIntentV2(claim appaccess.GatewayRebindClaimV2,
 	identity, identityErr := newGatewayRebindSuccessorIdentity(checkpoint.Generation, claim.Spec.OperationID,
 		GatewayRebindSuccessorProfile(profile))
 	databaseDigest, databaseErr := canonicalDigest(struct {
-		Claim  appaccess.GatewayRebindClaimV2         `json:"claim"`
-		Roster []appaccess.GatewayRebindRosterEntryV2 `json:"roster"`
-	}{claim, rosterCopy})
+		Claim        appaccess.GatewayRebindClaimV2         `json:"claim"`
+		Roster       []appaccess.GatewayRebindRosterEntryV2 `json:"roster"`
+		RuntimeHeads []appaccess.GatewayRebindRuntimeHead   `json:"runtimeHeads"`
+	}{claim, rosterCopy, runtimeHeadsCopy})
 	if err != nil || observationErr != nil || identityErr != nil || databaseErr != nil {
 		return gatewayRebindProtectedIntentV2{}, invalid
 	}
@@ -137,6 +146,7 @@ func newGatewayRebindProtectedIntentV2(claim appaccess.GatewayRebindClaimV2,
 		Generation: checkpoint.Generation, OperationID: claim.Spec.OperationID, DatabaseDigest: databaseDigest,
 		Claim: claim, Predecessor: checkpoint.sourceRef(), SuccessorProfile: profile,
 		Roster: rosterCopy, RosterEntryDigests: entryDigests, Network: plan, NetworkDigest: networkDigest,
+		RuntimeHeads:       runtimeHeadsCopy,
 		NetworkObservation: network, NetworkObservationDigest: observationDigest, Identity: identity,
 	}
 	value.Digest, err = gatewayRebindProtectedIntentV2Digest(value)
@@ -158,6 +168,7 @@ func validGatewayRebindProtectedIntentV2(value gatewayRebindProtectedIntentV2) b
 		value.OperationID != value.Claim.Spec.OperationID || value.Claim.Spec.Predecessor != value.Predecessor ||
 		value.Claim.State != appaccess.GatewayRebindPrepared || value.Claim.StateSequence != 1 ||
 		len(value.Roster) != len(value.RosterEntryDigests) || int64(len(value.Roster)) != value.Claim.Spec.RosterCount ||
+		int64(len(value.RuntimeHeads)) != value.Claim.Spec.RuntimeHeadsCount ||
 		value.NetworkObservation.OperationID != value.OperationID ||
 		value.NetworkObservation.ClaimRequestDigest != value.Claim.RequestDigest ||
 		value.NetworkObservation.ProfileSpecDigest != value.SuccessorProfile.SpecDigest ||
@@ -228,6 +239,11 @@ func validGatewayRebindProtectedIntentV2(value gatewayRebindProtectedIntentV2) b
 			return false
 		}
 	}
+	runtimeHeadsDigest, err := appaccess.GatewayRebindRuntimeHeadsV2Digest(value.OperationID, value.RuntimeHeads)
+	if err != nil || value.Claim.Spec.RuntimeHeadsVersion != appaccess.GatewayRebindRuntimeHeadsVersionV1 ||
+		runtimeHeadsDigest != value.Claim.Spec.RuntimeHeadsDigest {
+		return false
+	}
 	networkDigest, err := canonicalDigest(struct {
 		Version int                                 `json:"version"`
 		Action  string                              `json:"action"`
@@ -237,9 +253,10 @@ func validGatewayRebindProtectedIntentV2(value gatewayRebindProtectedIntentV2) b
 	identity, identityErr := newGatewayRebindSuccessorIdentity(value.Generation, value.OperationID,
 		GatewayRebindSuccessorProfile(value.SuccessorProfile))
 	databaseDigest, databaseErr := canonicalDigest(struct {
-		Claim  appaccess.GatewayRebindClaimV2         `json:"claim"`
-		Roster []appaccess.GatewayRebindRosterEntryV2 `json:"roster"`
-	}{value.Claim, value.Roster})
+		Claim        appaccess.GatewayRebindClaimV2         `json:"claim"`
+		Roster       []appaccess.GatewayRebindRosterEntryV2 `json:"roster"`
+		RuntimeHeads []appaccess.GatewayRebindRuntimeHead   `json:"runtimeHeads"`
+	}{value.Claim, value.Roster, value.RuntimeHeads})
 	digest, digestErr := gatewayRebindProtectedIntentV2Digest(value)
 	return err == nil && observationErr == nil && identityErr == nil && databaseErr == nil && digestErr == nil &&
 		value.NetworkDigest == networkDigest && value.NetworkObservationDigest == observationDigest &&

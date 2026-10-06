@@ -68,6 +68,7 @@ func (m *Manager) prepareGatewayRebindLocked(ctx context.Context, repository gat
 	claim, _, err := repository.ClaimGatewayRebindV2(ctx, appaccess.GatewayRebindPreclaimProposalV2{
 		Spec: input.Inspection.Spec, RebindApproval: input.RebindApproval,
 		ConfigureApproval: input.ConfigureApproval, Roster: input.Inspection.Roster,
+		RuntimeHeads: input.Inspection.RuntimeHeads,
 	})
 	if err != nil {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
@@ -78,6 +79,7 @@ func (m *Manager) prepareGatewayRebindLocked(ctx context.Context, repository gat
 		}
 	}
 	return m.installGatewayRebindPreparedProtectedLocked(ctx, claim, input.Inspection.Roster,
+		input.Inspection.RuntimeHeads,
 		checkpoint, m.gatewayRebindProgressTime())
 }
 
@@ -105,6 +107,7 @@ func (m *Manager) recoverGatewayRebindPreparedAdmissionLocked(ctx context.Contex
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}
 	return m.installGatewayRebindPreparedProtectedLocked(ctx, claim, snapshot.Active.RosterV2,
+		snapshot.Active.RuntimeHeads,
 		checkpoint, m.gatewayRebindProgressTime())
 }
 
@@ -117,6 +120,7 @@ func (m *Manager) gatewayRebindProgressTime() time.Time {
 
 func (m *Manager) installGatewayRebindPreparedProtectedLocked(ctx context.Context,
 	claim appaccess.GatewayRebindClaimV2, roster []appaccess.GatewayRebindRosterEntryV2,
+	runtimeHeads []appaccess.GatewayRebindRuntimeHead,
 	checkpoint gatewayRebindPredecessorCheckpoint, occurredAt time.Time,
 ) (gatewayRebindPreparedAttempt, error) {
 	if !occurredAt.After(claim.CreatedAt) {
@@ -133,7 +137,8 @@ func (m *Manager) installGatewayRebindPreparedProtectedLocked(ctx context.Contex
 		if installedIntent, loadErr := intentStore.load(); loadErr == nil {
 			if installedIntent.Claim.RequestDigest != claim.RequestDigest ||
 				installedIntent.Predecessor != checkpoint.sourceRef() ||
-				!reflect.DeepEqual(installedIntent.Roster, roster) {
+				!reflect.DeepEqual(installedIntent.Roster, roster) ||
+				!reflect.DeepEqual(installedIntent.RuntimeHeads, runtimeHeads) {
 				return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 			}
 			progressStore, progressStoreErr := newGatewayRebindProgressStore(m.options.DataRoot,
@@ -151,7 +156,7 @@ func (m *Manager) installGatewayRebindPreparedProtectedLocked(ctx context.Contex
 	if err != nil {
 		return gatewayRebindPreparedAttempt{}, err
 	}
-	intent, err := newGatewayRebindProtectedIntentV2(claim, roster, checkpoint, network)
+	intent, err := newGatewayRebindProtectedIntentV2(claim, roster, runtimeHeads, checkpoint, network)
 	if err != nil {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}

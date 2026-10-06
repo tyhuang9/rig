@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appaccess"
 )
 
 type gatewayCurrentPhysicalDriverFake struct {
@@ -572,6 +573,116 @@ func TestGatewayCurrentWithdrawalRecoveryBatchBindsExactRawGrant(t *testing.T) {
 	if validGatewayCurrentRouteState(state) {
 		t.Fatal("recovery batch accepted a changed raw grant")
 	}
+}
+
+func TestGatewayCurrentLANRecoveryBatchReservesCompleteRawGrantCensus(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	state := cloneGatewayCurrentRouteState(fixture.baseline)
+	_, template := routeOperationTransferredApp(t, state)
+	for appID, app := range state.Apps {
+		app.LAN = nil
+		state.Apps[appID] = app
+	}
+	appIDs := []string{"56565656-5656-4565-8565-565656565656", "57575757-5757-4575-8575-575757575757"}
+	items := make([]gatewayCurrentLANRecoveryItem, 0, len(appIDs))
+	for _, appID := range appIDs {
+		app := cloneGatewayCurrentAppRoute(template)
+		app.LAN = nil
+		state.Apps[appID] = app
+		request := routeOperationNativeGrantRequest(t, state, appID)
+		raw, err := gatewayV2LANBindingForRequest(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		grant := gatewayCurrentLANBinding{Raw: raw}
+		items = append(items, gatewayCurrentLANRecoveryItem{Kind: gatewayV2PendingLANGrant,
+			AppID: appID, Grant: &grant})
+		app.LAN = &grant
+		state.Apps[appID] = app
+	}
+	for _, appID := range appIDs {
+		app := state.Apps[appID]
+		app.LAN = nil
+		state.Apps[appID] = app
+	}
+	state.LANRecovery = &gatewayCurrentLANRecoveryBatch{Items: items}
+	state.Revision++
+	var err error
+	state.Digest, err = gatewayCurrentRouteStateDigest(state)
+	if err != nil || !validGatewayCurrentRouteState(state) {
+		t.Fatalf("distinct unpublished grant census rejected: %v", err)
+	}
+	for _, collision := range []string{"port", "allocation", "grant attempt", "access revision"} {
+		t.Run(collision, func(t *testing.T) {
+			changed := cloneGatewayCurrentRouteState(state)
+			raw := &changed.LANRecovery.Items[1].Grant.Raw
+			first := items[0].Grant.Raw
+			switch collision {
+			case "port":
+				raw.Port = first.Port
+			case "allocation":
+				raw.AllocationID = first.AllocationID
+			case "grant attempt":
+				raw.GrantAttemptID = first.GrantAttemptID
+			case "access revision":
+				raw.AccessRevisionID = first.AccessRevisionID
+			}
+			if collision == "port" || collision == "allocation" {
+				raw.AccessSpecDigest, err = appaccess.AppAccessSpecDigest(appaccess.AppAccessSpec{
+					AppID: appIDs[1], AllocationID: raw.AllocationID, Port: raw.Port,
+					GatewayProfileRevisionID:     raw.ProfileRevisionID,
+					GatewayProfileRevisionNumber: raw.ProfileRevisionNumber,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			changed.Digest, err = gatewayCurrentRouteStateDigest(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if validGatewayCurrentRouteState(changed) {
+				t.Fatal("immutable batch reused another queued grant's " + collision)
+			}
+		})
+	}
+	t.Run("cleared disable source versus live app", func(t *testing.T) {
+		baseline := cloneGatewayCurrentRouteState(state)
+		baseline.LANRecovery = nil
+		liveApp := cloneGatewayCurrentAppRoute(baseline.Apps[appIDs[1]])
+		liveApp.LAN = cloneGatewayCurrentLANBindingPointer(items[1].Grant)
+		baseline.Apps[appIDs[1]] = liveApp
+		sourceGrant := gatewayV2LANGrantRequestForBinding(appIDs[0], items[0].Grant.Raw)
+		disable := disableRequestForGrant(t, sourceGrant)
+		baseline.LANRecovery = &gatewayCurrentLANRecoveryBatch{Items: []gatewayCurrentLANRecoveryItem{{
+			Kind: gatewayV2PendingLANDisable, AppID: appIDs[0], Disable: &disable,
+		}}}
+		baseline.Digest, err = gatewayCurrentRouteStateDigest(baseline)
+		if err != nil || !validGatewayCurrentRouteState(baseline) {
+			t.Fatalf("noncolliding cleared disable baseline rejected: %v", err)
+		}
+		changed := cloneGatewayCurrentRouteState(baseline)
+		liveRaw := changed.Apps[appIDs[1]].LAN.Raw
+		grant := *changed.LANRecovery.Items[0].Disable.SourceGrant
+		grant.Port = liveRaw.Port
+		grant.AccessSpecDigest, err = appaccess.AppAccessSpecDigest(appaccess.AppAccessSpec{
+			AppID: appIDs[0], AllocationID: grant.AllocationID, Port: grant.Port,
+			GatewayProfileRevisionID:     grant.GatewayProfileRevisionID,
+			GatewayProfileRevisionNumber: grant.GatewayProfileRevisionNumber,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		disable = disableRequestForGrant(t, grant)
+		changed.LANRecovery.Items[0].Disable = &disable
+		changed.Digest, err = gatewayCurrentRouteStateDigest(changed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if validGatewayCurrentRouteState(changed) {
+			t.Fatal("cleared disable source reused a live app port")
+		}
+	})
 }
 
 func TestGatewayCurrentTransferredDisablePreservesRawProfileAndBindsEffectiveProfile(t *testing.T) {

@@ -2,13 +2,45 @@ package generatedingress
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
 )
+
+func cloneGatewayRebindTypedProgressForTest(t *testing.T, value gatewayRebindProgressRecord) gatewayRebindProgressRecord {
+	t.Helper()
+	body, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result gatewayRebindProgressRecord
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func rehashGatewayRebindTypedProgressForTest(t *testing.T, value *gatewayRebindProgressRecord) {
+	t.Helper()
+	var err error
+	value.TypedEffect.Digest = ""
+	value.TypedEffect.Digest, err = gatewayRebindTypedEffectDigest(*value.TypedEffect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value.Digest = ""
+	value.Digest, err = gatewayRebindProgressDigest(*value)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 
 func installGatewayRebindTypedAttemptForTerminal(t *testing.T, fixture gatewayCurrentStateFixture,
 	checkpoint gatewayRebindPredecessorCheckpoint, intent gatewayRebindProtectedIntentV2,
@@ -31,7 +63,7 @@ func installGatewayRebindTypedAttemptForTerminal(t *testing.T, fixture gatewayCu
 	if err != nil || progressStore.installExact(context.Background(), progress) != nil {
 		t.Fatalf("install typed progress: %v", err)
 	}
-	records, finalResources, finalProof := gatewayRebindTypedCompleteProgressFixture(t, fixture, intent, progress)
+	records, finalResources, finalProof := gatewayRebindTypedCompleteProgressFixture(t, fixture, checkpoint, intent, progress)
 	if !reflect.DeepEqual(finalResources, resources) {
 		t.Fatal("typed resource fixture disagrees with requested resources")
 	}
@@ -47,17 +79,25 @@ func installGatewayRebindTypedAttemptForTerminal(t *testing.T, fixture gatewayCu
 }
 
 func gatewayRebindTypedCompleteProgressFixture(t *testing.T, fixture gatewayCurrentStateFixture,
-	intent gatewayRebindProtectedIntentV2, first gatewayRebindProgressRecord,
+	checkpoint gatewayRebindPredecessorCheckpoint, intent gatewayRebindProtectedIntentV2,
+	first gatewayRebindProgressRecord,
 ) ([]gatewayRebindProgressRecord, gatewayRebindFinalHandoverResourceBindings,
 	gatewayRebindFinalHandoverTerminalProof,
 ) {
 	t.Helper()
 	resources := fixture.receipt.Resources
-	resources.ConfigVolume.Name = intent.Identity.ConfigVolume
-	resources.DataVolume.Name = intent.Identity.DataVolume
-	resources.Digest = ""
 	var err error
-	resources.Digest, err = gatewayRebindFinalHandoverResourcesDigest(resources)
+	resources.IngressNetwork, err = gatewayRebindTypedStageNetworkBindingFor(intent, resources.IngressNetwork.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources.ConfigVolume, err = gatewayRebindTypedStageConfigVolumeBindingFor(intent,
+		resources.ConfigVolume.Mountpoint, resources.ConfigVolume.CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources.DataVolume, err = gatewayRebindTypedStageDataVolumeBindingFor(intent,
+		resources.DataVolume.Mountpoint, resources.DataVolume.CreatedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,6 +106,8 @@ func gatewayRebindTypedCompleteProgressFixture(t *testing.T, fixture gatewayCurr
 		t.Fatal(err)
 	}
 	effect := gatewayRebindTypedEffectProgress{ImageID: resources.ImageID, StagePlanDigest: stagePlanDigest}
+	heads := gatewayRebindTypedProgressFixtureHeads(t, checkpoint, intent)
+	terminalProof := fixture.receipt.PhysicalProof
 	records := []gatewayRebindProgressRecord{first}
 	firstAt, err := parseGatewayRebindProgressTime(first.OccurredAt)
 	if err != nil {
@@ -83,32 +125,103 @@ func gatewayRebindTypedCompleteProgressFixture(t *testing.T, fixture gatewayCurr
 			volume := resources.DataVolume
 			effect.DataVolume = &volume
 		case 6:
-			container := resources.StageContainer
+			container, buildErr := gatewayRebindTypedStageContainerBindingFor(intent, effect,
+				resources.StageContainer.ID)
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			resources.StageContainer = container
 			effect.StageContainer = &container
 		case 7:
-			effect.StageConfigIntentDigest = strings.Repeat("2", 64)
+			value, buildErr := gatewayRebindTypedStageConfigIntentFor(intent, records[len(records)-1], effect)
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			effect.StageConfigIntent = &value
 		case 8:
-			effect.StageConfigCopyDigest = strings.Repeat("3", 64)
+			value, buildErr := gatewayRebindTypedStageConfigCopyFor(intent, records[len(records)-1], effect)
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			effect.StageConfigCopy = &value
 		case 9:
-			effect.StageStartIntentDigest = strings.Repeat("4", 64)
+			value, buildErr := gatewayRebindTypedStageStartIntentFor(intent, records[len(records)-1], effect)
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			effect.StageStartIntent = &value
 		case 10:
-			effect.StageServingDigest = strings.Repeat("5", 64)
+			value, buildErr := gatewayRebindTypedStageServingFor(intent, records[len(records)-1], effect,
+				resources.StageContainer.ID)
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			effect.StageServing = &value
 		case 11:
-			effect.FinalConfigIntentDigest = strings.Repeat("6", 64)
+			value, buildErr := gatewayRebindTypedFinalConfigIntentFor(intent, checkpoint,
+				records[len(records)-1], effect, heads)
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			effect.FinalConfigIntent = &value
 		case 12:
-			effect.FinalConfigCopyDigest = strings.Repeat("7", 64)
+			value, buildErr := gatewayRebindTypedFinalConfigCopyFor(intent, records[len(records)-1], effect)
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			effect.FinalConfigCopy = &value
 		case 13:
-			effect.HandoverIntentDigest = strings.Repeat("8", 64)
+			resources.ApplicationNetworks = gatewayRebindTypedFixtureApplicationNetworks(t,
+				effect.FinalConfigIntent.RoutePlan, resources.ApplicationNetworks)
+			localHostPort := fixture.history.Progress[12].Record.Handover.Plan.LocalHostPort
+			value, buildErr := gatewayRebindTypedHandoverIntentFor(intent, records[len(records)-1], effect,
+				localHostPort, terminalProof.Observation.PredecessorObservationDigest, true,
+				resources.ApplicationNetworks)
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			effect.HandoverIntent = &value
 			effect.ApplicationNetworks = append([]gatewayRebindHandoverApplicationNetwork(nil), resources.ApplicationNetworks...)
 		case 14:
-			container := *resources.FinalContainer
+			container, buildErr := gatewayRebindTypedFinalContainerBindingFor(intent, effect,
+				effect.HandoverIntent.Plan, resources.FinalContainer.ID)
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			resources.FinalContainer = &container
 			effect.FinalContainer = &container
 		case 15:
-			effect.CutoverIntentDigest = strings.Repeat("9", 64)
+			value, buildErr := gatewayRebindTypedCutoverIntentFor(intent, records[len(records)-1], effect,
+				terminalProof.Observation.Digest)
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			effect.CutoverIntent = &value
 		case 16:
-			effect.SuccessorServingDigest = strings.Repeat("a", 64)
+			observation := terminalProof.Observation
+			observation.ConfigDigest = effect.HandoverIntent.Plan.FinalConfigDigest
+			observation.RoutesDigest = effect.HandoverIntent.Plan.RoutePlanDigest
+			observation.FinalID = effect.FinalContainer.ID
+			observation.ApplicationNetworks = append([]gatewayRebindHandoverApplicationNetwork(nil),
+				effect.HandoverIntent.Plan.ApplicationNetworks...)
+			observation.Digest = ""
+			observation.Digest, err = gatewayRebindFinalHandoverObservationDigest(observation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			terminalProof.Observation = observation
+			value, buildErr := gatewayRebindTypedSuccessorServingFor(records[len(records)-1], effect, observation)
+			if buildErr != nil {
+				t.Fatal(buildErr)
+			}
+			effect.SuccessorServing = &value
 		case 17:
-			proof := fixture.receipt.PhysicalProof
+			resources.Digest = ""
+			resources.Digest, err = gatewayRebindFinalHandoverResourcesDigest(resources)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := terminalProof
 			proof.PriorProgressDigest = records[len(records)-1].Digest
 			proof.Observation.FinalID = resources.FinalContainer.ID
 			proof.Observation.ApplicationNetworks = append([]gatewayRebindHandoverApplicationNetwork(nil), resources.ApplicationNetworks...)
@@ -120,14 +233,71 @@ func gatewayRebindTypedCompleteProgressFixture(t *testing.T, fixture gatewayCurr
 			resourcesCopy, proofCopy := resources, proof
 			effect.Resources, effect.PhysicalProof = &resourcesCopy, &proofCopy
 		}
-		record, recordErr := newGatewayRebindTypedEffectProgressV2(intent, records, effect,
+		record, recordErr := newGatewayRebindTypedEffectProgressV2(intent, checkpoint, records, effect,
 			firstAt.Add(time.Duration(sequence-1)*time.Nanosecond))
 		if recordErr != nil {
+			if sequence == 17 {
+				candidate := effect
+				candidate.Version, candidate.Purpose, candidate.Digest = gatewayRebindTypedEffectVersion,
+					gatewayRebindTypedEffectPurpose, ""
+				candidate.Digest, _ = gatewayRebindTypedEffectDigest(candidate)
+				t.Fatalf("build typed progress %d: %v shape=%t semantic=%t physical=%t resources=%t proof=%t appnets=%#v proofnets=%#v", sequence, recordErr,
+					validGatewayRebindTypedEffectProgress(candidate, sequence),
+					gatewayRebindTypedEffectSemanticMatch(candidate, intent, records[len(records)-1]),
+					gatewayRebindTypedPhysicalOutcomeMatches(intent.Identity, records[len(records)-1].Digest,
+						*candidate.Resources, *candidate.PhysicalProof),
+					validGatewayRebindFinalHandoverResourceBindingsValue(*candidate.Resources),
+					validGatewayRebindFinalHandoverOutcomeValue(*candidate.PhysicalProof),
+					candidate.Resources.ApplicationNetworks, candidate.PhysicalProof.Observation.ApplicationNetworks)
+			}
 			t.Fatalf("build typed progress %d: %v", sequence, recordErr)
 		}
 		records = append(records, record)
+		effect = *record.TypedEffect
 	}
 	return records, resources, *records[len(records)-1].TypedEffect.PhysicalProof
+}
+
+func gatewayRebindTypedFixtureApplicationNetworks(t *testing.T, plan gatewayRebindTypedFinalConfigRoutePlan,
+	available []gatewayRebindHandoverApplicationNetwork,
+) []gatewayRebindHandoverApplicationNetwork {
+	t.Helper()
+	routes := make(map[string]routeRecord, len(plan.Routes))
+	for _, binding := range plan.Routes {
+		routes[binding.AppID] = binding.Route
+	}
+	owners, valid := gatewayRouteNetworkOwners(routes)
+	if !valid {
+		t.Fatal("typed fixture route network ownership is invalid")
+	}
+	byName := make(map[string]string, len(available))
+	for _, network := range available {
+		byName[network.Name] = network.ID
+	}
+	names := make([]string, 0, len(owners))
+	for name := range owners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return nil
+	}
+	result := make([]gatewayRebindHandoverApplicationNetwork, 0, len(names))
+	for _, name := range names {
+		id, exists := byName[name]
+		if !exists {
+			t.Fatalf("typed fixture lacks application network %s", name)
+		}
+		result = append(result, gatewayRebindHandoverApplicationNetwork{Name: name, ID: id})
+	}
+	return result
+}
+
+func gatewayRebindTypedProgressFixtureHeads(t *testing.T, checkpoint gatewayRebindPredecessorCheckpoint,
+	intent gatewayRebindProtectedIntentV2,
+) []appaccess.GatewayRebindRuntimeHead {
+	t.Helper()
+	return append([]appaccess.GatewayRebindRuntimeHead(nil), intent.RuntimeHeads...)
 }
 
 func gatewayRebindTypedTerminalPhysicalFixture(t *testing.T, fixture gatewayCurrentStateFixture,
@@ -189,6 +359,247 @@ func gatewayRebindTypedRollbackProofFixture(t *testing.T, fixture gatewayCurrent
 	return proof
 }
 
+func TestGatewayRebindTypedProgressReplayRejectsRehashedSemanticMismatches(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	checkpoint, intent := gatewayRebindAttemptTypedFixture(t, fixture)
+	first, err := newGatewayRebindSuccessorIntentProgressV2(intent, time.Unix(4, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, _, _ := gatewayRebindTypedCompleteProgressFixture(t, fixture, checkpoint, intent, first)
+
+	check := func(t *testing.T, sequence uint64, mutate func(*gatewayRebindProgressRecord)) {
+		t.Helper()
+		changed := cloneGatewayRebindTypedProgressForTest(t, records[sequence-1])
+		mutate(&changed)
+		rehashGatewayRebindTypedProgressForTest(t, &changed)
+		previous := make([]gatewayRebindProgressSelection, sequence-1)
+		for index := range previous {
+			previous[index] = gatewayRebindProgressSelection{Generation: records[index].Generation,
+				Sequence: records[index].Sequence, Record: records[index], Existing: true}
+		}
+		if gatewayRebindProgressMatchesIntentV2(changed, intent, previous) {
+			t.Fatal("typed replay matcher accepted a rehashed semantic mismatch")
+		}
+	}
+
+	t.Run("cross-generation predecessor", func(t *testing.T) {
+		check(t, 11, func(record *gatewayRebindProgressRecord) {
+			binding := record.TypedEffect.FinalConfigIntent
+			binding.RoutePlan.Predecessor.Lineage.ProtectedGeneration++
+			binding.RoutePlan.Digest, _ = gatewayRebindTypedFinalConfigRoutePlanDigest(binding.RoutePlan)
+			binding.Digest, _ = gatewayRebindTypedFinalConfigIntentDigest(*binding)
+		})
+	})
+	t.Run("network ownership", func(t *testing.T) {
+		check(t, 3, func(record *gatewayRebindProgressRecord) {
+			record.TypedEffect.Network.OwnershipDigest = strings.Repeat("0", 64)
+			if record.TypedEffect.Network.OwnershipDigest == records[2].TypedEffect.Network.OwnershipDigest {
+				record.TypedEffect.Network.OwnershipDigest = strings.Repeat("f", 64)
+			}
+		})
+	})
+	t.Run("stage create command", func(t *testing.T) {
+		check(t, 6, func(record *gatewayRebindProgressRecord) {
+			record.TypedEffect.StageContainer.ConfigurationDigest = strings.Repeat("0", 64)
+			if record.TypedEffect.StageContainer.ConfigurationDigest == records[5].TypedEffect.StageContainer.ConfigurationDigest {
+				record.TypedEffect.StageContainer.ConfigurationDigest = strings.Repeat("f", 64)
+			}
+		})
+	})
+	t.Run("stage copy target", func(t *testing.T) {
+		check(t, 7, func(record *gatewayRebindProgressRecord) {
+			record.TypedEffect.StageConfigIntent.Destination = "/config/other.json"
+		})
+	})
+	t.Run("probe token", func(t *testing.T) {
+		check(t, 9, func(record *gatewayRebindProgressRecord) {
+			binding := record.TypedEffect.StageStartIntent
+			binding.ProbeToken = strings.Repeat("f", 64)
+			if binding.ProbeToken == records[8].TypedEffect.StageStartIntent.ProbeToken {
+				binding.ProbeToken = strings.Repeat("e", 64)
+			}
+			binding.StartEffectDigest, _ = gatewayRebindStageStartEffectDigest(*binding)
+		})
+	})
+	t.Run("route plan", func(t *testing.T) {
+		check(t, 11, func(record *gatewayRebindProgressRecord) {
+			binding := record.TypedEffect.FinalConfigIntent
+			binding.RoutePlan.Routes[0].Route.Endpoints[0].InternalPort++
+			route := &binding.RoutePlan.Routes[0]
+			route.SourceBindingDigest, _ = gatewayRebindTypedFinalConfigSourceBindingDigest(*route)
+			binding.RoutePlan.RouteMapDigest, _ = gatewayRebindTypedFinalConfigRouteMapDigest(binding.RoutePlan.Routes)
+			binding.RoutePlan.Digest, _ = gatewayRebindTypedFinalConfigRoutePlanDigest(binding.RoutePlan)
+			binding.Digest, _ = gatewayRebindTypedFinalConfigIntentDigest(*binding)
+		})
+	})
+	t.Run("final create command", func(t *testing.T) {
+		check(t, 13, func(record *gatewayRebindProgressRecord) {
+			binding := record.TypedEffect.HandoverIntent
+			binding.Plan.FinalConfigurationDigest = strings.Repeat("0", 64)
+			if binding.Plan.FinalConfigurationDigest == records[12].TypedEffect.HandoverIntent.Plan.FinalConfigurationDigest {
+				binding.Plan.FinalConfigurationDigest = strings.Repeat("f", 64)
+			}
+			binding.Plan.Digest, _ = gatewayRebindFinalHandoverPlanDigest(binding.Plan)
+			binding.Digest, _ = gatewayRebindTypedHandoverIntentDigest(*binding)
+		})
+	})
+	t.Run("application network census", func(t *testing.T) {
+		if len(records[12].TypedEffect.ApplicationNetworks) == 0 {
+			t.Fatal("typed fixture has no application network census")
+		}
+		check(t, 13, func(record *gatewayRebindProgressRecord) {
+			networks := append([]gatewayRebindHandoverApplicationNetwork(nil),
+				record.TypedEffect.ApplicationNetworks[:len(record.TypedEffect.ApplicationNetworks)-1]...)
+			record.TypedEffect.ApplicationNetworks = networks
+			binding := record.TypedEffect.HandoverIntent
+			binding.Plan.ApplicationNetworks = append([]gatewayRebindHandoverApplicationNetwork(nil), networks...)
+			binding.Plan.Digest, _ = gatewayRebindFinalHandoverPlanDigest(binding.Plan)
+			binding.Digest, _ = gatewayRebindTypedHandoverIntentDigest(*binding)
+		})
+	})
+	t.Run("self consistent route plan still disagrees with checkpoint", func(t *testing.T) {
+		changed := cloneGatewayRebindTypedProgressForTest(t, records[10])
+		binding := changed.TypedEffect.FinalConfigIntent
+		binding.RoutePlan.Routes[0].Route.Endpoints[0].InternalPort++
+		route := &binding.RoutePlan.Routes[0]
+		var err error
+		route.SourceBindingDigest, err = gatewayRebindTypedFinalConfigSourceBindingDigest(*route)
+		if err != nil {
+			t.Fatal(err)
+		}
+		binding.RoutePlan.RouteMapDigest, err = gatewayRebindTypedFinalConfigRouteMapDigest(binding.RoutePlan.Routes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		binding.RoutePlan.Digest, err = gatewayRebindTypedFinalConfigRoutePlanDigest(binding.RoutePlan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := gatewayRebindTypedFinalConfigBytesForPlan(intent, binding.RoutePlan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer clear(body)
+		digest := sha256.Sum256(body)
+		binding.ContentDigest = hex.EncodeToString(digest[:])
+		binding.ContentLength = int64(len(body))
+		binding.Digest, err = gatewayRebindTypedFinalConfigIntentDigest(*binding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rehashGatewayRebindTypedProgressForTest(t, &changed)
+		previous := make([]gatewayRebindProgressSelection, 10)
+		for index := range previous {
+			previous[index] = gatewayRebindProgressSelection{Generation: records[index].Generation,
+				Sequence: records[index].Sequence, Record: records[index], Existing: true}
+		}
+		if !gatewayRebindProgressMatchesIntentV2(changed, intent, previous) {
+			t.Fatal("self-consistent rehashed route plan did not reach the frozen-checkpoint validation boundary")
+		}
+		prefix := append([]gatewayRebindProgressRecord(nil), records[:10]...)
+		prefix = append(prefix, changed)
+		if gatewayRebindTypedProgressMatchesCheckpoint(intent, checkpoint, prefix) {
+			t.Fatal("frozen checkpoint accepted a self-consistent rehashed route plan")
+		}
+	})
+}
+
+func TestGatewayRebindTypedProgressAcceptsCanonicalZeroRuntimeHeads(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	state := fixture.baseline
+	state.Apps = map[string]gatewayCurrentAppRoute{}
+	state.Pending = nil
+	state.LANRecovery = nil
+	var err error
+	state.TransferManifestDigest, err = appaccess.GatewayRebindTransferManifestDigest(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Digest = ""
+	state.Digest, err = gatewayCurrentRouteStateDigest(state)
+	if err != nil || !validGatewayCurrentRouteState(state) {
+		t.Fatalf("zero-head current state: %v", err)
+	}
+	operationID := "11111111-1111-4111-8111-111111111111"
+	checkpoint, err := newGatewayRebindPredecessorCheckpoint(state.Lineage.ProtectedGeneration+1,
+		operationID, state.Lineage, nil, &state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileSpec := appaccess.GatewayProfileSpec{SelectedIPv4: state.Profile.SelectedIPv4,
+		InterfaceID: state.Profile.InterfaceID, PortStart: state.Profile.PortStart, PortEnd: state.Profile.PortEnd}
+	intent := gatewayRebindAttemptTypedIntentForCheckpoint(t, checkpoint, nil,
+		"22222222-2222-4222-8222-222222222222", state.Profile.RevisionNumber+1,
+		"33333333-3333-4333-8333-333333333333", profileSpec, fixture.intent.NetworkObservation)
+	if len(intent.RuntimeHeads) != 0 {
+		t.Fatalf("fixture did not retain canonical empty runtime heads: %#v", intent.RuntimeHeads)
+	}
+	plan, err := gatewayRebindTypedFinalConfigRoutePlanFor(intent, checkpoint, []appaccess.GatewayRebindRuntimeHead{})
+	if err != nil || len(plan.Routes) != 0 || plan.RuntimeHeadsDigest != intent.Claim.Spec.RuntimeHeadsDigest {
+		t.Fatalf("zero-head route plan: %#v error=%v", plan, err)
+	}
+	body, err := gatewayRebindTypedFinalConfigBytes(intent, checkpoint, plan)
+	if err != nil || len(body) == 0 {
+		t.Fatalf("zero-head final config: bytes=%d error=%v", len(body), err)
+	}
+	clear(body)
+	first, err := newGatewayRebindSuccessorIntentProgressV2(intent, time.Unix(4, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, _, _ := gatewayRebindTypedCompleteProgressFixture(t, fixture, checkpoint, intent, first)
+	if len(records) != 17 || records[10].TypedEffect == nil ||
+		records[10].TypedEffect.FinalConfigIntent == nil ||
+		len(records[10].TypedEffect.FinalConfigIntent.RoutePlan.Routes) != 0 ||
+		!gatewayRebindTypedProgressMatchesCheckpoint(intent, checkpoint, records) {
+		t.Fatal("zero-head typed progress was not retained as a complete canonical prefix")
+	}
+}
+
+func TestGatewayRebindTypedHandoverBindsRetainedPredecessorLocalPort(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	checkpoint, intent := gatewayRebindAttemptTypedFixture(t, fixture)
+	first, err := newGatewayRebindSuccessorIntentProgressV2(intent, time.Unix(4, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, _, _ := gatewayRebindTypedCompleteProgressFixture(t, fixture, checkpoint, intent, first)
+	selections := make([]gatewayRebindProgressSelection, 13)
+	for index := range selections {
+		selections[index] = gatewayRebindProgressSelection{Generation: records[index].Generation,
+			Sequence: records[index].Sequence, Record: records[index], Existing: true}
+	}
+	if !gatewayRebindTypedProgressMatchesPredecessorLocalPort(fixture.history, intent, selections) {
+		t.Fatal("exact retained predecessor local port was rejected")
+	}
+	prior := records[11]
+	effect := *prior.TypedEffect
+	port := records[12].TypedEffect.HandoverIntent.Plan.LocalHostPort + 1
+	if port == 0 {
+		port = records[12].TypedEffect.HandoverIntent.Plan.LocalHostPort - 1
+	}
+	binding, err := gatewayRebindTypedHandoverIntentFor(intent, prior, effect, port,
+		records[12].TypedEffect.HandoverIntent.Plan.PredecessorObservationDigest,
+		records[12].TypedEffect.HandoverIntent.Plan.PredecessorInitiallyRunning,
+		records[12].TypedEffect.HandoverIntent.Plan.ApplicationNetworks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effect.HandoverIntent = &binding
+	effect.ApplicationNetworks = append([]gatewayRebindHandoverApplicationNetwork(nil), binding.Plan.ApplicationNetworks...)
+	changed, err := newGatewayRebindTypedEffectProgressV2(intent, checkpoint, records[:12], effect,
+		time.Unix(16, 0).UTC())
+	if err != nil {
+		t.Fatalf("build self-consistent changed local-port progress: %v", err)
+	}
+	selections[12] = gatewayRebindProgressSelection{Generation: changed.Generation,
+		Sequence: changed.Sequence, Record: changed, Existing: true}
+	if gatewayRebindTypedProgressMatchesPredecessorLocalPort(fixture.history, intent, selections) {
+		t.Fatal("self-consistent handover accepted a local port from outside retained predecessor history")
+	}
+}
+
 func TestGatewayRebindTypedCommitTerminalScansAndSelectsActualLineage(t *testing.T) {
 	fixture := newGatewayCurrentStateFixture(t)
 	if err := fixture.store.installBaseline(fixture.baseline); err != nil {
@@ -213,7 +624,7 @@ func TestGatewayRebindTypedCommitTerminalScansAndSelectsActualLineage(t *testing
 	if err := firstStore.installExact(context.Background(), first); err != nil {
 		t.Fatal(err)
 	}
-	records, resources, proof := gatewayRebindTypedCompleteProgressFixture(t, fixture, intent, first)
+	records, resources, proof := gatewayRebindTypedCompleteProgressFixture(t, fixture, checkpoint, intent, first)
 	for _, record := range records[1:] {
 		progressStore, storeErr := newGatewayRebindProgressStore(fixture.dataRoot, record.Generation, record.OperationID, record.Sequence)
 		if storeErr != nil || progressStore.installExact(context.Background(), record) != nil {
@@ -445,7 +856,7 @@ func TestGatewayRebindTypedRollbackTerminalBindsAdoptedOwnedResource(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	records, resources, _ := gatewayRebindTypedCompleteProgressFixture(t, fixture, intent, first)
+	records, resources, _ := gatewayRebindTypedCompleteProgressFixture(t, fixture, checkpoint, intent, first)
 	// Retain the forward prefix through handover intent. The final create then
 	// succeeds without its sequence-fourteen acknowledgment, so rollback must
 	// first adopt the exact configured container under that retained intent.

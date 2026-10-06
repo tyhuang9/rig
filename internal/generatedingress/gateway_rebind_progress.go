@@ -76,28 +76,28 @@ type gatewayRebindProgressRecord struct {
 }
 
 type gatewayRebindTypedEffectProgress struct {
-	Version                 int                                         `json:"version"`
-	Purpose                 string                                      `json:"purpose"`
-	ImageID                 string                                      `json:"imageId"`
-	StagePlanDigest         string                                      `json:"stagePlanDigest"`
-	Network                 *gatewayRebindStageNetworkBinding           `json:"network,omitempty"`
-	ConfigVolume            *gatewayRebindStageConfigVolumeBinding      `json:"configVolume,omitempty"`
-	DataVolume              *gatewayRebindStageDataVolumeBinding        `json:"dataVolume,omitempty"`
-	StageContainer          *gatewayRebindStageContainerBinding         `json:"stageContainer,omitempty"`
-	StageConfigIntentDigest string                                      `json:"stageConfigIntentDigest,omitempty"`
-	StageConfigCopyDigest   string                                      `json:"stageConfigCopyDigest,omitempty"`
-	StageStartIntentDigest  string                                      `json:"stageStartIntentDigest,omitempty"`
-	StageServingDigest      string                                      `json:"stageServingDigest,omitempty"`
-	FinalConfigIntentDigest string                                      `json:"finalConfigIntentDigest,omitempty"`
-	FinalConfigCopyDigest   string                                      `json:"finalConfigCopyDigest,omitempty"`
-	HandoverIntentDigest    string                                      `json:"handoverIntentDigest,omitempty"`
-	ApplicationNetworks     []gatewayRebindHandoverApplicationNetwork   `json:"applicationNetworks,omitempty"`
-	FinalContainer          *gatewayRebindFinalContainerBinding         `json:"finalContainer,omitempty"`
-	CutoverIntentDigest     string                                      `json:"cutoverIntentDigest,omitempty"`
-	SuccessorServingDigest  string                                      `json:"successorServingDigest,omitempty"`
-	Resources               *gatewayRebindFinalHandoverResourceBindings `json:"resources,omitempty"`
-	PhysicalProof           *gatewayRebindFinalHandoverTerminalProof    `json:"physicalProof,omitempty"`
-	Digest                  string                                      `json:"digest"`
+	Version             int                                         `json:"version"`
+	Purpose             string                                      `json:"purpose"`
+	ImageID             string                                      `json:"imageId"`
+	StagePlanDigest     string                                      `json:"stagePlanDigest"`
+	Network             *gatewayRebindStageNetworkBinding           `json:"network,omitempty"`
+	ConfigVolume        *gatewayRebindStageConfigVolumeBinding      `json:"configVolume,omitempty"`
+	DataVolume          *gatewayRebindStageDataVolumeBinding        `json:"dataVolume,omitempty"`
+	StageContainer      *gatewayRebindStageContainerBinding         `json:"stageContainer,omitempty"`
+	StageConfigIntent   *gatewayRebindStageConfigIntentBinding      `json:"stageConfigIntent,omitempty"`
+	StageConfigCopy     *gatewayRebindStageConfigCopyBinding        `json:"stageConfigCopy,omitempty"`
+	StageStartIntent    *gatewayRebindStageStartIntentBinding       `json:"stageStartIntent,omitempty"`
+	StageServing        *gatewayRebindStageServingBinding           `json:"stageServing,omitempty"`
+	FinalConfigIntent   *gatewayRebindTypedFinalConfigIntentBinding `json:"finalConfigIntent,omitempty"`
+	FinalConfigCopy     *gatewayRebindFinalConfigCopyBinding        `json:"finalConfigCopy,omitempty"`
+	HandoverIntent      *gatewayRebindTypedHandoverIntent           `json:"handoverIntent,omitempty"`
+	ApplicationNetworks []gatewayRebindHandoverApplicationNetwork   `json:"applicationNetworks,omitempty"`
+	FinalContainer      *gatewayRebindFinalContainerBinding         `json:"finalContainer,omitempty"`
+	CutoverIntent       *gatewayRebindTypedCutoverIntent            `json:"cutoverIntent,omitempty"`
+	SuccessorServing    *gatewayRebindFinalHandoverServingProof     `json:"successorServing,omitempty"`
+	Resources           *gatewayRebindFinalHandoverResourceBindings `json:"resources,omitempty"`
+	PhysicalProof       *gatewayRebindFinalHandoverTerminalProof    `json:"physicalProof,omitempty"`
+	Digest              string                                      `json:"digest"`
 }
 
 type gatewayRebindTypedRollbackOwnedResources struct {
@@ -343,10 +343,12 @@ func newGatewayRebindSuccessorIntentProgressV2(intent gatewayRebindProtectedInte
 }
 
 func newGatewayRebindTypedEffectProgressV2(intent gatewayRebindProtectedIntentV2,
-	previous []gatewayRebindProgressRecord, effect gatewayRebindTypedEffectProgress, occurredAt time.Time,
+	checkpoint gatewayRebindPredecessorCheckpoint, previous []gatewayRebindProgressRecord,
+	effect gatewayRebindTypedEffectProgress, occurredAt time.Time,
 ) (gatewayRebindProgressRecord, error) {
 	invalid := errors.New("invalid generated ingress typed effect progress input")
-	if !validGatewayRebindProtectedIntentV2(intent) || len(previous) == 0 || len(previous) >= 17 ||
+	if !validGatewayRebindProtectedIntentV2(intent) || !validGatewayRebindPredecessorCheckpoint(checkpoint) ||
+		checkpoint.sourceRef() != intent.Predecessor || len(previous) == 0 || len(previous) >= 17 ||
 		!validGatewayRebindProgressTime(occurredAt) {
 		return gatewayRebindProgressRecord{}, invalid
 	}
@@ -377,7 +379,8 @@ func newGatewayRebindTypedEffectProgressV2(intent gatewayRebindProtectedIntentV2
 		selections[index] = gatewayRebindProgressSelection{Generation: previous[index].Generation,
 			Sequence: previous[index].Sequence, Record: previous[index], Existing: true}
 	}
-	if err != nil || !gatewayRebindProgressMatchesIntentV2(value, intent, selections) {
+	if err != nil || !gatewayRebindProgressMatchesIntentV2(value, intent, selections) ||
+		!gatewayRebindTypedProgressMatchesCheckpoint(intent, checkpoint, append(previous, value)) {
 		return gatewayRebindProgressRecord{}, invalid
 	}
 	return value, nil
@@ -1215,16 +1218,25 @@ func validGatewayRebindTypedEffectProgress(value gatewayRebindTypedEffectProgres
 	if (sequence >= 6) != (value.StageContainer != nil) || sequence >= 6 && !validGatewayRebindStageContainerBindingValue(*value.StageContainer) {
 		return false
 	}
-	digests := []struct {
-		sequence uint64
-		value    string
-	}{{7, value.StageConfigIntentDigest}, {8, value.StageConfigCopyDigest}, {9, value.StageStartIntentDigest},
-		{10, value.StageServingDigest}, {11, value.FinalConfigIntentDigest}, {12, value.FinalConfigCopyDigest},
-		{13, value.HandoverIntentDigest}, {15, value.CutoverIntentDigest}, {16, value.SuccessorServingDigest}}
-	for _, field := range digests {
-		if (sequence >= field.sequence) != validSHA256(field.value) {
-			return false
-		}
+	if (sequence >= 7) != (value.StageConfigIntent != nil) ||
+		sequence >= 7 && !validGatewayRebindStageConfigIntentBindingValue(*value.StageConfigIntent) ||
+		(sequence >= 8) != (value.StageConfigCopy != nil) ||
+		sequence >= 8 && !validGatewayRebindStageConfigCopyBindingValue(*value.StageConfigCopy) ||
+		(sequence >= 9) != (value.StageStartIntent != nil) ||
+		sequence >= 9 && !validGatewayRebindStageStartIntentBindingValue(*value.StageStartIntent) ||
+		(sequence >= 10) != (value.StageServing != nil) ||
+		sequence >= 10 && !validGatewayRebindStageServingBindingValue(*value.StageServing) ||
+		(sequence >= 11) != (value.FinalConfigIntent != nil) ||
+		sequence >= 11 && !validGatewayRebindTypedFinalConfigIntentBindingValue(*value.FinalConfigIntent) ||
+		(sequence >= 12) != (value.FinalConfigCopy != nil) ||
+		sequence >= 12 && !validGatewayRebindFinalConfigCopyBindingValue(*value.FinalConfigCopy) ||
+		(sequence >= 13) != (value.HandoverIntent != nil) ||
+		sequence >= 13 && !validGatewayRebindTypedHandoverIntentValue(*value.HandoverIntent) ||
+		(sequence >= 15) != (value.CutoverIntent != nil) ||
+		sequence >= 15 && !validGatewayRebindTypedCutoverIntentValue(*value.CutoverIntent) ||
+		(sequence >= 16) != (value.SuccessorServing != nil) ||
+		sequence >= 16 && !validGatewayRebindFinalHandoverServingValue(*value.SuccessorServing) {
+		return false
 	}
 	if sequence < 13 && len(value.ApplicationNetworks) != 0 ||
 		sequence >= 13 && !validGatewayRebindFinalHandoverApplicationNetworkValues(value.ApplicationNetworks) {
@@ -1418,14 +1430,16 @@ func gatewayRebindProgressInstallPermitted(history gatewayRebindProtectedIntentH
 			}
 			if existing.Sequence == value.Sequence {
 				return gatewayRebindProgressMatchesIntentV2(value, selected.Intent, previous) &&
-					reflect.DeepEqual(existing.Record, value)
+					reflect.DeepEqual(existing.Record, value) &&
+					gatewayRebindProgressMatchesCheckpointHistory(history, selected.Intent, previous, value)
 			}
 			if existing.Sequence < value.Sequence {
 				previous = append(previous, existing)
 			}
 		}
 		return value.Sequence == uint64(len(previous)+1) &&
-			gatewayRebindProgressMatchesIntentV2(value, selected.Intent, previous)
+			gatewayRebindProgressMatchesIntentV2(value, selected.Intent, previous) &&
+			gatewayRebindProgressMatchesCheckpointHistory(history, selected.Intent, previous, value)
 	}
 	if len(history.Intents) != 1 || history.Intents[0].Generation != value.Generation ||
 		history.Intents[0].Intent.OperationID != value.OperationID ||
@@ -1455,8 +1469,26 @@ func gatewayRebindProgressInstallPermitted(history gatewayRebindProtectedIntentH
 		gatewayRebindProgressMatchesHandoverContext(history, value)
 }
 
+func gatewayRebindProgressMatchesCheckpointHistory(history gatewayRebindProtectedIntentHistory,
+	intent gatewayRebindProtectedIntentV2, previous []gatewayRebindProgressSelection,
+	value gatewayRebindProgressRecord,
+) bool {
+	for _, selected := range history.Checkpoints {
+		if selected.Generation != intent.Generation || selected.Checkpoint.OperationID != intent.OperationID {
+			continue
+		}
+		records := make([]gatewayRebindProgressRecord, 0, len(previous)+1)
+		for _, prior := range previous {
+			records = append(records, prior.Record)
+		}
+		records = append(records, value)
+		return gatewayRebindTypedProgressMatchesCheckpoint(intent, selected.Checkpoint, records)
+	}
+	return false
+}
+
 func scanGatewayRebindProgressForIntentV2(dataRoot string, intent gatewayRebindProtectedIntentV2,
-	artifacts gatewayRebindHistoryGeneration,
+	checkpoint gatewayRebindPredecessorCheckpoint, artifacts gatewayRebindHistoryGeneration,
 ) ([]gatewayRebindProgressSelection, error) {
 	sequences := make([]uint64, 0, len(artifacts.progress))
 	for sequence := range artifacts.progress {
@@ -1479,6 +1511,13 @@ func scanGatewayRebindProgressForIntentV2(dataRoot string, intent gatewayRebindP
 		}
 		result = append(result, gatewayRebindProgressSelection{Store: store, Generation: intent.Generation,
 			Sequence: sequence, Record: value, Existing: true})
+	}
+	records := make([]gatewayRebindProgressRecord, len(result))
+	for index := range result {
+		records[index] = result[index].Record
+	}
+	if !gatewayRebindTypedProgressMatchesCheckpoint(intent, checkpoint, records) {
+		return nil, errors.New("generated ingress typed rebind progress disagrees with predecessor checkpoint")
 	}
 	return result, nil
 }
@@ -1575,7 +1614,8 @@ func gatewayRebindTypedEffectMatchesIntent(value gatewayRebindTypedEffectProgres
 	if planErr != nil || value.StagePlanDigest != planDigest ||
 		!validGatewayRebindTypedEffectProgress(value, prior.Sequence+1) ||
 		value.ConfigVolume != nil && value.ConfigVolume.Name != intent.Identity.ConfigVolume ||
-		value.DataVolume != nil && value.DataVolume.Name != intent.Identity.DataVolume {
+		value.DataVolume != nil && value.DataVolume.Name != intent.Identity.DataVolume ||
+		!gatewayRebindTypedEffectSemanticMatch(value, intent, prior) {
 		return false
 	}
 	if prior.Sequence+1 == 17 {
@@ -1597,25 +1637,25 @@ func gatewayRebindTypedEffectExtends(previous, current gatewayRebindTypedEffectP
 	case 6:
 		prefix.StageContainer = nil
 	case 7:
-		prefix.StageConfigIntentDigest = ""
+		prefix.StageConfigIntent = nil
 	case 8:
-		prefix.StageConfigCopyDigest = ""
+		prefix.StageConfigCopy = nil
 	case 9:
-		prefix.StageStartIntentDigest = ""
+		prefix.StageStartIntent = nil
 	case 10:
-		prefix.StageServingDigest = ""
+		prefix.StageServing = nil
 	case 11:
-		prefix.FinalConfigIntentDigest = ""
+		prefix.FinalConfigIntent = nil
 	case 12:
-		prefix.FinalConfigCopyDigest = ""
+		prefix.FinalConfigCopy = nil
 	case 13:
-		prefix.HandoverIntentDigest, prefix.ApplicationNetworks = "", nil
+		prefix.HandoverIntent, prefix.ApplicationNetworks = nil, nil
 	case 14:
 		prefix.FinalContainer = nil
 	case 15:
-		prefix.CutoverIntentDigest = ""
+		prefix.CutoverIntent = nil
 	case 16:
-		prefix.SuccessorServingDigest = ""
+		prefix.SuccessorServing = nil
 	case 17:
 		prefix.Resources, prefix.PhysicalProof = nil, nil
 	default:

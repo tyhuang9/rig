@@ -28,6 +28,7 @@ type GatewayRebindProposalInput struct {
 type GatewayRebindProposalInspection struct {
 	Spec                        appaccess.GatewayRebindSpecV2
 	Roster                      []appaccess.GatewayRebindRosterEntryV2
+	RuntimeHeads                []appaccess.GatewayRebindRuntimeHead
 	SpecDigest                  string
 	SuccessorProfileSpecDigest  string
 	ProtectedGeneration         uint64
@@ -121,6 +122,10 @@ func (m *Manager) inspectGatewayRebindProposalLocked(ctx context.Context, reposi
 	if err != nil {
 		return GatewayRebindProposalInspection{}, gatewayRebindProposalError(ctx)
 	}
+	runtimeHeadsDigest, err := appaccess.GatewayRebindRuntimeHeadsV2Digest(input.OperationID, heads)
+	if err != nil {
+		return GatewayRebindProposalInspection{}, gatewayRebindProposalError(ctx)
+	}
 	spec := appaccess.GatewayRebindSpecV2{
 		Version: appaccess.GatewayRebindSpecVersionV2, OperationID: input.OperationID,
 		Predecessor: checkpoint.sourceRef(), SuccessorProtectedGeneration: generation,
@@ -128,6 +133,8 @@ func (m *Manager) inspectGatewayRebindProposalLocked(ctx context.Context, reposi
 		SuccessorProfileRevisionNumber: input.SuccessorProfileRevisionNumber,
 		SuccessorProfileOperationID:    input.SuccessorProfileOperationID, SuccessorProfile: input.SuccessorProfile,
 		RosterVersion: appaccess.GatewayRebindRosterVersionV2, RosterDigest: rosterDigest, RosterCount: int64(len(roster)),
+		RuntimeHeadsVersion: appaccess.GatewayRebindRuntimeHeadsVersionV1,
+		RuntimeHeadsDigest:  runtimeHeadsDigest, RuntimeHeadsCount: int64(len(heads)),
 	}
 	specDigest, err := appaccess.GatewayRebindSpecV2Digest(spec)
 	if err != nil {
@@ -139,7 +146,8 @@ func (m *Manager) inspectGatewayRebindProposalLocked(ctx context.Context, reposi
 	}
 	result := GatewayRebindProposalInspection{
 		Spec: spec, Roster: append([]appaccess.GatewayRebindRosterEntryV2(nil), roster...),
-		SpecDigest: specDigest, SuccessorProfileSpecDigest: profileDigest,
+		RuntimeHeads: append([]appaccess.GatewayRebindRuntimeHead(nil), heads...),
+		SpecDigest:   specDigest, SuccessorProfileSpecDigest: profileDigest,
 		ProtectedGeneration: generation, PredecessorCheckpointDigest: checkpoint.Digest,
 		SourceStateVersion: checkpoint.SourceStateVersion, SourceStateRevision: checkpoint.SourceStateRevision,
 		SourceStateDigest: checkpoint.SourceStateDigest,
