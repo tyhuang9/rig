@@ -45,6 +45,9 @@ func (d gatewayRebindTypedStageRuntime) read(ctx context.Context,
 	if err != nil {
 		return gatewayRebindTypedStageObservation{}, err
 	}
+	if result.ImageFound {
+		result.Image.ID = normalizeID(result.Image.ID)
+	}
 	result.Network, result.NetworkID, result.NetworkFound, err =
 		d.manager.inspectNamedGatewayNetwork(ctx, intent.Identity.IngressNetwork)
 	if err != nil {
@@ -149,16 +152,20 @@ func gatewayRebindTypedStageNetworkMatches(intent gatewayRebindProtectedIntentV2
 
 func gatewayRebindTypedStageVolumeMatches(intent gatewayRebindProtectedIntentV2,
 	value volumeInspection, identity gatewayV1VolumeIdentity, found bool,
-	expectedName, role string, expectedDigest string,
+	expectedName, role string, expected *gatewayRebindStageConfigVolumeBinding,
 ) bool {
 	if !found {
-		return expectedDigest == "" && reflect.DeepEqual(value, volumeInspection{}) && identity == (gatewayV1VolumeIdentity{})
+		return expected == nil && reflect.DeepEqual(value, volumeInspection{}) && identity == (gatewayV1VolumeIdentity{})
+	}
+	if expected == nil {
+		return false
 	}
 	actualDigest, err := gatewayRebindTypedStageVolumeOwnershipDigest(intent, expectedName, role)
-	return expectedDigest != "" && err == nil && actualDigest == expectedDigest && value.Name == expectedName &&
+	return err == nil && actualDigest == expected.OwnershipDigest && value.Name == expectedName &&
 		value.Driver == "local" && value.Scope == "local" && len(value.Options) == 0 &&
 		reflect.DeepEqual(value.Labels, gatewayRebindTypedStageResourceLabels(intent,
-			gatewayV2ManagedContainerLabel, role)) && identity.Mountpoint != "" && identity.CreatedAt != ""
+			gatewayV2ManagedContainerLabel, role)) && identity.Mountpoint == expected.Mountpoint &&
+		identity.CreatedAt == expected.CreatedAt
 }
 
 func gatewayRebindTypedStagePrefixMatches(intent gatewayRebindProtectedIntentV2,
@@ -168,17 +175,21 @@ func gatewayRebindTypedStagePrefixMatches(intent gatewayRebindProtectedIntentV2,
 		value.FinalContainerFound || !gatewayRebindTypedStageNetworkMatches(intent, value, effect.Network) {
 		return false
 	}
-	configDigest, dataDigest := "", ""
+	var configBinding, dataBinding *gatewayRebindStageConfigVolumeBinding
 	if effect.ConfigVolume != nil {
-		configDigest = effect.ConfigVolume.OwnershipDigest
+		value := gatewayRebindStageConfigVolumeBinding(*effect.ConfigVolume)
+		configBinding = &value
 	}
 	if effect.DataVolume != nil {
-		dataDigest = effect.DataVolume.OwnershipDigest
+		value := gatewayRebindStageConfigVolumeBinding{Name: effect.DataVolume.Name,
+			Mountpoint: effect.DataVolume.Mountpoint, CreatedAt: effect.DataVolume.CreatedAt,
+			OwnershipDigest: effect.DataVolume.OwnershipDigest}
+		dataBinding = &value
 	}
 	if !gatewayRebindTypedStageVolumeMatches(intent, value.ConfigVolume, value.ConfigVolumeIdentity,
-		value.ConfigVolumeFound, intent.Identity.ConfigVolume, gatewayV2ConfigVolumeRole, configDigest) ||
+		value.ConfigVolumeFound, intent.Identity.ConfigVolume, gatewayV2ConfigVolumeRole, configBinding) ||
 		!gatewayRebindTypedStageVolumeMatches(intent, value.DataVolume, value.DataVolumeIdentity,
-			value.DataVolumeFound, intent.Identity.DataVolume, gatewayV2DataVolumeRole, dataDigest) {
+			value.DataVolumeFound, intent.Identity.DataVolume, gatewayV2DataVolumeRole, dataBinding) {
 		return false
 	}
 	expectedNetworks, expectedVolumes, expectedContainers := []string{}, []string{}, []string{}

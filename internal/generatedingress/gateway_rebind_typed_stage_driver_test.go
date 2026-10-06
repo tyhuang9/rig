@@ -2,8 +2,34 @@ package generatedingress
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
+
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
+
+type gatewayRebindTypedImageRunner struct{ image imageInspection }
+
+func (r gatewayRebindTypedImageRunner) Run(_ context.Context,
+	request runtimeprocess.CommandRequest,
+) (runtimeprocess.CommandResult, error) {
+	args := request.Args
+	if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
+		body, err := json.Marshal(r.image)
+		return runtimeprocess.CommandResult{Stdout: body}, err
+	}
+	if len(args) >= 2 && args[1] == "inspect" {
+		return runtimeprocess.CommandResult{Stderr: []byte("Error: No such " + args[0])}, errors.New("not found")
+	}
+	if len(args) >= 2 && args[1] == "ls" {
+		return runtimeprocess.CommandResult{}, nil
+	}
+	return runtimeprocess.CommandResult{}, errors.New("unexpected typed stage Docker command: " + strings.Join(args, " "))
+}
 
 type gatewayRebindTypedStageDriverFake struct {
 	t        *testing.T
@@ -110,5 +136,47 @@ func TestGatewayRebindTypedStageDriverPersistsCompleteStagePrefix(t *testing.T) 
 	snapshot, err := fixture.repository.GatewayRebindRecoverySnapshot(context.Background())
 	if err != nil || snapshot.Active == nil || snapshot.Phase != "prepared" || !snapshot.RollbackAllowed {
 		t.Fatalf("typed stage fence snapshot=%#v error=%v", snapshot, err)
+	}
+	intent := history.IntentsV2[0].Intent
+	effect := history.Progress[4].Record.TypedEffect
+	if effect == nil || effect.ConfigVolume == nil {
+		t.Fatal("typed config-volume binding is unavailable")
+	}
+	observed := volumeInspection{Name: intent.Identity.ConfigVolume, Driver: "local", Scope: "local",
+		Options: map[string]string{}, Labels: gatewayRebindTypedStageResourceLabels(intent,
+			gatewayV2ManagedContainerLabel, gatewayV2ConfigVolumeRole)}
+	identity := gatewayV1VolumeIdentity{Mountpoint: effect.ConfigVolume.Mountpoint,
+		CreatedAt: effect.ConfigVolume.CreatedAt}
+	if !gatewayRebindTypedStageVolumeMatches(intent, observed, identity, true, intent.Identity.ConfigVolume,
+		gatewayV2ConfigVolumeRole, effect.ConfigVolume) {
+		t.Fatal("exact retained config-volume identity was refused")
+	}
+	replaced := identity
+	replaced.Mountpoint += "-replacement"
+	if reflect.DeepEqual(replaced, identity) || gatewayRebindTypedStageVolumeMatches(intent, observed, replaced, true,
+		intent.Identity.ConfigVolume, gatewayV2ConfigVolumeRole, effect.ConfigVolume) {
+		t.Fatal("same-name replacement config volume was accepted")
+	}
+	actualManager := &Manager{runner: gatewayRebindTypedImageRunner{image: imageInspection{
+		ID: "sha256:" + bounded.template.receipt.Resources.ImageID, OS: "linux",
+		RepoDigests: []string{"caddy@" + gatewayV2CaddyImageDigest},
+	}}, options: Options{DockerExecutable: "docker", WorkingDirectory: t.TempDir(), CommandTimeout: time.Second}}
+	imageID, imageErr := (gatewayRebindTypedStageRuntime{manager: actualManager}).observeImage(
+		context.Background(), intent, func(context.Context) error { return nil })
+	if imageErr != nil || imageID != bounded.template.receipt.Resources.ImageID {
+		t.Fatalf("normalized typed image id=%q error=%v", imageID, imageErr)
+	}
+}
+
+func TestGatewayRebindTypedProductionDriverRemainsClosedUntilFinalAdapterExists(t *testing.T) {
+	fixture, input, _ := newGatewayRebindCoordinatorFixture(t)
+	driver := managerGatewayRebindCrossStoreDriver{manager: fixture.manager}
+	if _, err := fixture.manager.commitGatewayRebindWithDriver(context.Background(), fixture.repository,
+		input, driver); err == nil {
+		t.Fatal("partial typed physical adapter became production reachable")
+	}
+	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.Progress) != 1 || history.Progress[0].Record.Sequence != 1 {
+		t.Fatalf("closed adapter changed physical prefix: progress=%d error=%v", len(history.Progress), err)
 	}
 }

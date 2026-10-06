@@ -16,6 +16,10 @@ type gatewayRebindTypedAttemptBoundary struct {
 	Progress  []gatewayRebindProgressRecord
 }
 
+type gatewayRebindTypedRuntimeHeadsRepository interface {
+	GatewayRebindRuntimeHeads(context.Context) ([]appaccess.GatewayRebindRuntimeHead, error)
+}
+
 // readGatewayRebindTypedAttemptBoundaryLocked is the active-attempt authority
 // check used immediately before and after every typed physical effect. It is
 // deliberately separate from the ordinary current driver: an admitted
@@ -32,12 +36,22 @@ func (m *Manager) readGatewayRebindTypedAttemptBoundaryLocked(ctx context.Contex
 		m.options.RebindCurrentStateRepository == nil {
 		return invalid()
 	}
-	first, err := m.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(ctx)
+	repository := m.options.RebindCurrentStateRepository
+	headsRepository, ok := repository.(gatewayRebindTypedRuntimeHeadsRepository)
+	if !ok {
+		return invalid()
+	}
+	first, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || !gatewayRebindTypedSnapshotMatchesRequest(first, request) {
 		return invalid()
 	}
+	firstHeads, err := headsRepository.GatewayRebindRuntimeHeads(ctx)
+	if err != nil || !sameGatewayRebindRuntimeHeads(firstHeads, request.Attempt.Intent.RuntimeHeads) {
+		return invalid()
+	}
 	selection, err := m.selectGatewayCurrentLocked(ctx, first)
-	if err != nil || selection.Lineage != request.Attempt.Claim.Spec.Predecessor.Lineage {
+	expectedLineage, err := gatewayRebindTypedSelectedLineage(request)
+	if err != nil || selection.Lineage != expectedLineage {
 		return invalid()
 	}
 	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
@@ -48,8 +62,12 @@ func (m *Manager) readGatewayRebindTypedAttemptBoundaryLocked(ctx context.Contex
 	if err != nil {
 		return invalid()
 	}
-	second, err := m.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(ctx)
+	second, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || !reflect.DeepEqual(first, second) || ctx.Err() != nil {
+		return invalid()
+	}
+	secondHeads, err := headsRepository.GatewayRebindRuntimeHeads(ctx)
+	if err != nil || !sameGatewayRebindRuntimeHeads(firstHeads, secondHeads) {
 		return invalid()
 	}
 	confirmedSelection, err := m.selectGatewayCurrentLocked(ctx, second)
@@ -62,6 +80,16 @@ func (m *Manager) readGatewayRebindTypedAttemptBoundaryLocked(ctx context.Contex
 	}
 	return gatewayRebindTypedAttemptBoundary{Snapshot: first, Selection: selection,
 		History: history, Progress: progress}, nil
+}
+
+func gatewayRebindTypedSelectedLineage(request gatewayRebindPhysicalReconcileRequest) (appaccess.GatewayCurrentLineageRef, error) {
+	if !request.DatabaseCommitObserved {
+		return request.Attempt.Claim.Spec.Predecessor.Lineage, nil
+	}
+	if request.Terminal == nil {
+		return appaccess.GatewayCurrentLineageRef{}, errors.New("typed database commit lacks terminal receipt")
+	}
+	return gatewayRebindCurrentLineageV2(*request.Terminal)
 }
 
 func gatewayRebindTypedSnapshotMatchesRequest(snapshot appaccess.GatewayRebindRecoverySnapshot,
@@ -82,8 +110,9 @@ func gatewayRebindTypedSnapshotMatchesRequest(snapshot appaccess.GatewayRebindRe
 	} else if snapshot.DatabaseCommittedEvent != nil {
 		return false
 	}
-	return snapshot.CurrentSource != nil &&
-		*snapshot.CurrentSource == gatewayCurrentAuthority(request.Attempt.Claim.Spec.Predecessor.Lineage)
+	expectedLineage, err := gatewayRebindTypedSelectedLineage(request)
+	return err == nil && snapshot.CurrentSource != nil &&
+		*snapshot.CurrentSource == gatewayCurrentAuthority(expectedLineage)
 }
 
 func gatewayRebindTypedAttemptHistory(request gatewayRebindPhysicalReconcileRequest,

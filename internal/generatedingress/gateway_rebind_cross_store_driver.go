@@ -26,7 +26,7 @@ func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorLocked(ctx conte
 	}
 	stage := d.stage
 	if stage == nil {
-		stage = gatewayRebindTypedStageRuntime{manager: d.manager}
+		return gatewayRebindTypedPhysicalResult{}, errors.New("generated ingress typed physical rebind is unavailable")
 	}
 	boundary, err := d.manager.readGatewayRebindTypedAttemptBoundaryLocked(ctx, request)
 	if err != nil {
