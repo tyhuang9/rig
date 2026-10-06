@@ -7,11 +7,12 @@ import (
 )
 
 const (
-	GatewayRebindSpecVersionV2       = 2
-	GatewayRebindRosterVersionV2     = 2
-	GatewayRebindTransferVersionV1   = 1
-	GatewayRebindTransitionVersionV1 = 1
-	GatewayRebindTransitionPurpose   = "lan_gateway_rebind_transition"
+	GatewayRebindSpecVersionV2         = 2
+	GatewayRebindRosterVersionV2       = 2
+	GatewayRebindRuntimeHeadsVersionV1 = 1
+	GatewayRebindTransferVersionV1     = 1
+	GatewayRebindTransitionVersionV1   = 1
+	GatewayRebindTransitionPurpose     = "lan_gateway_rebind_transition"
 )
 
 const (
@@ -84,6 +85,9 @@ type GatewayRebindSpecV2 struct {
 	RosterVersion                  int                    `json:"rosterVersion"`
 	RosterDigest                   string                 `json:"rosterDigest"`
 	RosterCount                    int64                  `json:"rosterCount"`
+	RuntimeHeadsVersion            int                    `json:"runtimeHeadsVersion"`
+	RuntimeHeadsDigest             string                 `json:"runtimeHeadsDigest"`
+	RuntimeHeadsCount              int64                  `json:"runtimeHeadsCount"`
 }
 
 // GatewayRebindRosterEntryV2 preserves the immutable raw grant binding and,
@@ -177,6 +181,7 @@ type GatewayRebindPreclaimProposalV2 struct {
 	RebindApproval    Approval
 	ConfigureApproval Approval
 	Roster            []GatewayRebindRosterEntryV2
+	RuntimeHeads      []GatewayRebindRuntimeHead
 }
 
 // GatewayRebindClaimRecord is an explicit stored-format union. Exactly one
@@ -211,12 +216,13 @@ type GatewayRebindTransitionCommand struct {
 }
 
 type GatewayRebindHistoryEntry struct {
-	Claim     GatewayRebindClaimRecord
-	RosterV1  []GatewayRebindRosterEntry
-	RosterV2  []GatewayRebindRosterEntryV2
-	Events    []GatewayRebindEvent
-	Commands  []GatewayRebindTransitionCommand
-	Transfers []GatewayRebindAllocationTransfer
+	Claim        GatewayRebindClaimRecord
+	RosterV1     []GatewayRebindRosterEntry
+	RosterV2     []GatewayRebindRosterEntryV2
+	RuntimeHeads []GatewayRebindRuntimeHead
+	Events       []GatewayRebindEvent
+	Commands     []GatewayRebindTransitionCommand
+	Transfers    []GatewayRebindAllocationTransfer
 }
 
 type GatewayRebindRecoverySnapshot struct {
@@ -355,6 +361,51 @@ func GatewayRebindRosterV2Digest(entries []GatewayRebindRosterEntryV2) (string, 
 		Action  ApprovalAction               `json:"action"`
 		Entries []GatewayRebindRosterEntryV2 `json:"entries"`
 	}{Version: GatewayRebindRosterVersionV2, Action: ActionRebindGateway, Entries: ordered})
+}
+
+// GatewayRebindRuntimeHeadsV2Digest binds the complete generated-runtime
+// census used by a v2 rebind approval, including loopback-only applications.
+// Callers must provide the exact AppID-sorted census returned by
+// GatewayRebindRuntimeHeads; the digest canonicalizes timestamps to UTC.
+func GatewayRebindRuntimeHeadsV2Digest(operationID string,
+	heads []GatewayRebindRuntimeHead,
+) (string, error) {
+	type canonicalHead struct {
+		Ordinal      int64  `json:"ordinal"`
+		AppID        string `json:"appId"`
+		DeploymentID string `json:"deploymentId"`
+		ReleaseID    string `json:"releaseId"`
+		Slot         string `json:"slot"`
+		Generation   int64  `json:"generation"`
+		UpdatedAt    string `json:"updatedAt"`
+	}
+	if !validUUID(operationID) {
+		return "", ErrInvalidInput
+	}
+	canonical := make([]canonicalHead, 0, len(heads))
+	previousAppID := ""
+	for index, head := range heads {
+		if !validUUID(head.AppID) || !validUUID(head.DeploymentID) || !validUUID(head.ReleaseID) ||
+			(head.Slot != "blue" && head.Slot != "green") || head.Generation <= 0 || head.UpdatedAt.IsZero() ||
+			(index > 0 && previousAppID >= head.AppID) {
+			return "", ErrInvalidInput
+		}
+		canonical = append(canonical, canonicalHead{
+			Ordinal: int64(index + 1), AppID: head.AppID, DeploymentID: head.DeploymentID,
+			ReleaseID: head.ReleaseID, Slot: head.Slot, Generation: head.Generation,
+			UpdatedAt: head.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		})
+		previousAppID = head.AppID
+	}
+	return digestJSON(struct {
+		Version     int             `json:"version"`
+		Action      ApprovalAction  `json:"action"`
+		OperationID string          `json:"operationId"`
+		Heads       []canonicalHead `json:"heads"`
+	}{
+		Version: GatewayRebindRuntimeHeadsVersionV1, Action: ActionRebindGateway,
+		OperationID: operationID, Heads: canonical,
+	})
 }
 
 func GatewayRebindAllocationTransferDigest(transfer GatewayRebindAllocationTransfer) (string, error) {
