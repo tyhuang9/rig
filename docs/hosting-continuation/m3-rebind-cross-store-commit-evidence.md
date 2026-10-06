@@ -1461,3 +1461,53 @@ unwired pending the reviewed physical batch contract. A fresh GitHub read
 also confirmed draft PR #136 remains open at `9694b4e`, with 36 reported
 checks, none pending or failed; this hosted evidence applies only to that
 published branch, not these local recovery checkpoints.
+
+### Complete runtime-head authorization and live-gate assertions
+
+The reviewed shared DTO at `ae386ca` was integrated in `1a764c1`; reviewed
+enforcement at `d98457d` was integrated in `3475a0b`. Approval now binds the
+complete ordered application runtime-head census, including loopback-only
+applications, its version, count and digest. Admission compares that census
+inside the SQL writer transaction, retains immutable ordered rows, and checks
+it again during guarded transition. This closes the reproduced gap where a
+loopback-only application's runtime head could be added after approval and
+before claim admission. Existing post-claim mutation fences were already
+present; this evidence does not characterize them as bypassed.
+
+Independent verification of frozen `d98457d` passed five top-level tests and
+twelve subcases in 6.482s, with no failures or skips
+(`Rig/temp/cross-store-review-d984-runtime-head-guard.jsonl`). The unchanged
+earlier negative regression now passes: the unchanged census is admitted and
+a post-approval loopback-head addition is refused. Boundaries also cover
+deletion, redeployment, timestamp drift, zero-head nil/empty normalization,
+sealed retained history and changes before or during the commit guard.
+Independent security review found no concrete SQL/migration regression within
+the ordinary SQL threat boundary. The owner ran the complete database and
+appaccess packages in 19.885s and 107.473s. Both migration 035 mirrors have
+SHA-256 `7CEE20636C4416C8A42A792C824A0D47FB67C7816E4DB3B49FEBE308687EF33B`;
+previously published migrations 026, 033 and 034 are unchanged.
+
+The two existing live cross-store Docker gates now require the signed spec to
+cover both the LAN application and the loopback-only application. The process
+exit/recovery gate also requires the prepared active claim and retained SQL
+history to contain those exact heads. These assertions use the real two-app
+fixture already selected by `hosting-gateway-v2-ci.yml`.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 ./internal/appaccess -run '^TestGatewayRebind(V2CanonicalTypes|RuntimeHeadsV2Digest)'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 ./internal/generatedingress -run '^TestLiveGatewayRebindCrossStore'
+go vet -mod=readonly ./internal/appaccess ./internal/generatedingress ./internal/controller ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+At the shared DTO checkpoint, the contract tests passed three top-level tests
+and four subcases in 0.521s, with no failures or skips
+(`Rig/temp/m3-runtime-head-contract.jsonl`). The live package compiled in
+0.836s; all three entries explicitly skipped because this Windows environment
+lacks the disposable Linux Docker fixture and opt-in flags
+(`Rig/temp/m3-runtime-head-live-gate-opt-in.jsonl`). Vet and the full build
+passed after enforcement integration. These skips establish no Docker
+acceptance. The proposal producer and typed coordinator still require their
+separately owned update to pass and retain the complete census; strict
+enforcement intentionally refuses the previous incomplete constructors until
+that update lands. No full-unit readiness or hosted result is claimed.
