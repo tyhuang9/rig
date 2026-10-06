@@ -107,7 +107,7 @@ func TestGatewayCurrentRouteOperationsPreserveRawBindingsAndTransferManifest(t *
 	final := routeOperationLoad(t, fixture.store)
 	if final.Revision != fixture.baseline.Revision+5 || final.Apps[transferredAppID].LAN != nil ||
 		final.Apps[nativeAppID].LAN != nil || final.TransferManifestDigest != fixture.baseline.TransferManifestDigest ||
-		!gatewayCurrentTransfersMatchState(snapshot.CurrentTransfers, final) || repository.calls != 30 {
+		!gatewayCurrentTransfersMatchState(snapshot.CurrentTransfers, final) || repository.calls != 45 {
 		t.Fatalf("ordinary mutations lost immutable transfer history: revision=%d calls=%d state=%#v",
 			final.Revision, repository.calls, final)
 	}
@@ -145,7 +145,7 @@ func TestGatewayCurrentRouteOperationsRejectSQLSelectionDrift(t *testing.T) {
 		changed := current
 		changed.RollbackAllowed = !current.RollbackAllowed
 		repository := &routeOperationSnapshotRepository{snapshots: []appaccess.GatewayRebindRecoverySnapshot{
-			current, current, changed, changed,
+			current, current, current, changed, changed, changed,
 		}}
 		fixture.manager.options.RebindCurrentStateRepository = repository
 		appID, app := routeOperationTransferredApp(t, fixture.baseline)
@@ -155,7 +155,7 @@ func TestGatewayCurrentRouteOperationsRejectSQLSelectionDrift(t *testing.T) {
 			t.Fatalf("SQL drift before write was not refused: handled=%t error=%v", handled, err)
 		}
 		retained := routeOperationLoad(t, fixture.store)
-		if !reflect.DeepEqual(retained, fixture.baseline) || repository.calls != 4 {
+		if !reflect.DeepEqual(retained, fixture.baseline) || repository.calls != 6 {
 			t.Fatalf("pre-write drift advanced protected state: revision=%d calls=%d", retained.Revision, repository.calls)
 		}
 	})
@@ -169,7 +169,7 @@ func TestGatewayCurrentRouteOperationsRejectSQLSelectionDrift(t *testing.T) {
 		changed := current
 		changed.RollbackAllowed = !current.RollbackAllowed
 		repository := &routeOperationSnapshotRepository{snapshots: []appaccess.GatewayRebindRecoverySnapshot{
-			current, current, current, current, changed, changed,
+			current, current, current, current, current, current, changed, changed, changed,
 		}}
 		fixture.manager.options.RebindCurrentStateRepository = repository
 		appID, app := routeOperationTransferredApp(t, fixture.baseline)
@@ -179,10 +179,43 @@ func TestGatewayCurrentRouteOperationsRejectSQLSelectionDrift(t *testing.T) {
 			t.Fatalf("SQL drift after write was not reported fail closed: handled=%t error=%v", handled, err)
 		}
 		advanced := routeOperationLoad(t, fixture.store)
-		if advanced.Revision != fixture.baseline.Revision+1 || repository.calls != 6 {
+		if advanced.Revision != fixture.baseline.Revision+1 || repository.calls != 9 {
 			t.Fatalf("unexpected protected write/read sequence: revision=%d calls=%d", advanced.Revision, repository.calls)
 		}
 	})
+}
+
+func TestGatewayCurrentRouteOperationRejectsActiveRebind(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	if err := fixture.store.installBaseline(fixture.baseline); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := routeOperationCommittedSnapshot(fixture)
+	activeOperationID := uuid.NewString()
+	active := appaccess.GatewayRebindHistoryEntry{Claim: appaccess.GatewayRebindClaimRecord{
+		SpecVersion: appaccess.GatewayRebindSpecVersionV2,
+		V2: &appaccess.GatewayRebindClaimV2{Spec: appaccess.GatewayRebindSpecV2{
+			OperationID: activeOperationID,
+		}},
+	}}
+	snapshot.Active = &active
+	snapshot.Phase = appaccess.GatewayRebindPrepared
+	snapshot.RollbackAllowed = true
+	repository := &routeOperationSnapshotRepository{snapshots: []appaccess.GatewayRebindRecoverySnapshot{snapshot}}
+	fixture.manager.options.RebindCurrentStateRepository = repository
+	called := false
+	handled, err := fixture.manager.mutateGatewayCurrentLocked(context.Background(),
+		func(state gatewayCurrentRouteState) (gatewayCurrentRouteState, error) {
+			called = true
+			return state, nil
+		})
+	if !handled || !IsCode(err, DiagnosticRouteUnresolved) || called || repository.calls != 3 {
+		t.Fatalf("active rebind did not fence ordinary mutation: handled=%t called=%t reads=%d error=%v",
+			handled, called, repository.calls, err)
+	}
+	if got := routeOperationLoad(t, fixture.store); !reflect.DeepEqual(got, fixture.baseline) {
+		t.Fatal("active rebind advanced selected current state")
+	}
 }
 
 func TestGatewayCurrentRouteOperationRejectsStaleProtectedStateAndCallbackAuthority(t *testing.T) {
@@ -295,8 +328,37 @@ func TestGatewayCurrentRouteOperationProviderAbsenceIsFailClosed(t *testing.T) {
 		}
 	})
 
+	t.Run("fresh and configured preupgrade with provider", func(t *testing.T) {
+		profile := appaccess.GatewayProfileRevision{
+			ID: uuid.NewString(), RevisionNumber: 1,
+			Spec: appaccess.GatewayProfileSpec{SelectedIPv4: "192.168.40.5", InterfaceID: "test-lan", PortStart: 8100, PortEnd: 8119},
+		}
+		var err error
+		profile.SpecDigest, err = appaccess.GatewayProfileSpecDigest(profile.Spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, snapshot := range []appaccess.GatewayRebindRecoverySnapshot{
+			{}, {CurrentProfile: &profile},
+		} {
+			repository := &routeOperationSnapshotRepository{snapshots: []appaccess.GatewayRebindRecoverySnapshot{snapshot}}
+			manager := &Manager{options: Options{DataRoot: t.TempDir(), RebindCurrentStateRepository: repository}}
+			called := false
+			handled, mutateErr := manager.mutateGatewayCurrentLocked(context.Background(),
+				func(state gatewayCurrentRouteState) (gatewayCurrentRouteState, error) {
+					called = true
+					return state, nil
+				})
+			if mutateErr != nil || handled || called || repository.calls != 2 {
+				t.Fatalf("preupgrade absence did not preserve legacy path: handled=%t called=%t reads=%d error=%v",
+					handled, called, repository.calls, mutateErr)
+			}
+		}
+	})
+
 	t.Run("native upgrade without provider", func(t *testing.T) {
 		manager, _, _, _, _, _ := gatewayV2LANGrantFixture(t)
+		manager.options.RebindCurrentStateRepository = nil
 		handled, err := manager.mutateGatewayCurrentLocked(context.Background(),
 			func(state gatewayCurrentRouteState) (gatewayCurrentRouteState, error) { return state, nil })
 		if handled || !IsCode(err, DiagnosticRouteUnresolved) {

@@ -5,6 +5,7 @@ import (
 	"math"
 	"reflect"
 
+	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/generatedruntime"
 )
 
@@ -26,9 +27,19 @@ func (m *Manager) mutateGatewayCurrentLocked(ctx context.Context,
 		return false, gatewayCurrentRouteOperationError(ctx)
 	}
 
-	selection, beforeSnapshot, err := m.readGatewayCurrentSelectionLocked(ctx)
+	selection, beforeSnapshot, present, err := m.readOptionalGatewayCurrentSelectionLocked(ctx)
 	if err != nil {
 		return false, gatewayCurrentRouteOperationError(ctx)
+	}
+	if !present {
+		return false, nil
+	}
+	// Current selection deliberately permits a previously committed source
+	// while a later rebind is active so recovery can inspect both. Ordinary
+	// operations must not mutate either source until that active claim releases
+	// its fence, even if an outer caller accidentally omits the fence check.
+	if !gatewayCurrentRouteMutationSnapshotReady(beforeSnapshot) {
+		return true, gatewayCurrentRouteOperationError(ctx)
 	}
 	if selection.Kind == gatewayCurrentSelectionUpgrade {
 		return false, nil
@@ -63,8 +74,9 @@ func (m *Manager) mutateGatewayCurrentLocked(ctx context.Context,
 		// close as possible to the durable write. The outer effects lease is
 		// still responsible for excluding a SQL current-head change during the
 		// remaining file write window.
-		writeSelection, writeSnapshot, selectionErr := m.readGatewayCurrentSelectionLocked(ctx)
-		if selectionErr != nil || !reflect.DeepEqual(beforeSnapshot, writeSnapshot) ||
+		writeSelection, writeSnapshot, writePresent, selectionErr := m.readOptionalGatewayCurrentSelectionLocked(ctx)
+		if selectionErr != nil || !writePresent || !gatewayCurrentRouteMutationSnapshotReady(writeSnapshot) ||
+			!reflect.DeepEqual(beforeSnapshot, writeSnapshot) ||
 			!gatewayCurrentMutationSelectionMatches(selection, writeSelection, previous) {
 			return true, gatewayCurrentRouteOperationError(ctx)
 		}
@@ -85,8 +97,9 @@ func (m *Manager) mutateGatewayCurrentLocked(ctx context.Context,
 	// If this post-write read fails, the new protected revision remains
 	// installed and the caller receives an unresolved result. These helpers do
 	// not claim a Docker effect or silently roll back a possibly selected route.
-	confirmed, afterSnapshot, err := m.readGatewayCurrentSelectionLocked(ctx)
-	if err != nil || !reflect.DeepEqual(beforeSnapshot, afterSnapshot) ||
+	confirmed, afterSnapshot, confirmedPresent, err := m.readOptionalGatewayCurrentSelectionLocked(ctx)
+	if err != nil || !confirmedPresent || !gatewayCurrentRouteMutationSnapshotReady(afterSnapshot) ||
+		!reflect.DeepEqual(beforeSnapshot, afterSnapshot) ||
 		!gatewayCurrentMutationSelectionMatches(selection, confirmed, next) {
 		return true, gatewayCurrentRouteOperationError(ctx)
 	}
@@ -237,6 +250,11 @@ func gatewayCurrentMutationSelectionMatches(before, after gatewayCurrentSelectio
 	return after.Kind == gatewayCurrentSelectionRebind && after.Store != nil && after.State != nil &&
 		before.Store != nil && after.Lineage == before.Lineage && after.Store.path == before.Store.path &&
 		reflect.DeepEqual(*after.State, want)
+}
+
+func gatewayCurrentRouteMutationSnapshotReady(value appaccess.GatewayRebindRecoverySnapshot) bool {
+	return value.Active == nil && value.Phase == "" && value.DatabaseCommittedEvent == nil &&
+		!value.DatabaseCommitObserved && !value.RollbackAllowed
 }
 
 func cloneGatewayCurrentOperationPending(value gatewayCurrentPendingRoute) gatewayCurrentPendingRoute {
