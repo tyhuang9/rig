@@ -844,6 +844,34 @@ diff checks passed. Independent code review accepted the helper and constructor
 changes. Rebound startup consumers and recovery-before-admission dispatch are
 still pending; constructor injection alone does not satisfy those requirements.
 
+Native gateway startup now performs that strict optional selection before and
+after its existing physical proof. It rejects active rebind recovery, missing
+providers, changed SQL authority and changes to the protected selection. The
+exact native generation used for physical proof is compared with the
+SQL-selected observation, including the original route source. The added
+regression uses projected SQL and the existing fake physical driver; an injected
+valid protected-file replacement must refuse before the driver is invoked.
+The normal protected writer correctly rejected the initial replacement fixture,
+so the final test explicitly injects the external write through the test's
+protected-file writer. Production transition checks were not relaxed.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayV2(Startup|LANStartup|LANDisableStartup|LANAccess|LANRecovery)'
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayV2Startup'
+```
+
+The expanded existing startup/LAN/recovery set passed all 68 top-level tests
+(57.235s). After the final selected-generation comparison was added, all seven
+native startup tests passed again (10.898s). Both runs had zero failures or
+skips. The same 37 controller preservation tests also passed again (22.779s).
+Vet and diff checks passed. Logs are
+`$TEMP/m3-native-startup-current-preservation.jsonl`,
+`$TEMP/m3-native-startup-current-confirmed.jsonl`, and
+`$TEMP/m3-native-current-hostd-preservation.jsonl`. Bounded independent review
+accepted the final diff. This native inspection still refuses SQL-selected
+rebind authority until its separate typed-terminal/physical-attestation branch
+is implemented; it does not represent completed rebound startup.
+
 PR #136 received the separately reviewed CI partition correction at `7deefa4`.
 Its M3 Docker workflow passed again at that exact revision (run `37391508257`).
 The previous repository-wide race job at `b46162e` was cancelled by normal

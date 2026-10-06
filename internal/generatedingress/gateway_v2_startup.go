@@ -61,12 +61,21 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 		}
 	}()
 
+	current, currentSQL, currentPresent, err := m.readOptionalGatewayCurrentSelectionLocked(ctx)
+	if err != nil || currentSQL.Active != nil || currentSQL.Phase != "" || currentSQL.DatabaseCommittedEvent != nil ||
+		currentSQL.DatabaseCommitObserved || currentSQL.RollbackAllowed {
+		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+	}
 	history, err := m.scanGatewayUpgradeHistoryLockedMode(true, claimSet.activeID)
 	if err != nil {
 		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
 	}
 	source, err := m.store.load()
 	if err != nil {
+		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+	}
+	if currentPresent && (current.Kind != gatewayCurrentSelectionUpgrade || current.Upgrade == nil ||
+		current.UpgradeSource == nil || !reflect.DeepEqual(*current.UpgradeSource, source)) {
 		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
 	}
 
@@ -78,6 +87,10 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 	var lanRecoveryCommitted *gatewayUpgradeGenerationSelection
 	for index := range history.generations {
 		selection := history.generations[index]
+		if currentPresent && selection.operationID == current.Lineage.OperationID &&
+			!sameObservedGatewayV2Selection(selection, *current.Upgrade) {
+			return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		}
 		claim, ok := claimSet.byOperation[selection.operationID]
 		if !ok || !gatewayV2StartupClaimMatchesSelection(claim, selection, m.options.HostPort) {
 			return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
@@ -199,6 +212,15 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 	}
 	confirmedHistory, err := m.scanGatewayUpgradeHistoryLockedMode(true, claimSet.activeID)
 	if err != nil || !sameGatewayV2StartupHistory(history, confirmedHistory) {
+		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+	}
+	if currentPresent && (inspection.Disposition == GatewayV2StartupNormalV1 ||
+		inspection.OperationID != current.Lineage.OperationID) {
+		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+	}
+	confirmedCurrent, confirmedSQL, confirmedPresent, err := m.readOptionalGatewayCurrentSelectionLocked(ctx)
+	if err != nil || currentPresent != confirmedPresent || !reflect.DeepEqual(currentSQL, confirmedSQL) ||
+		!sameGatewayCurrentSelection(current, confirmedCurrent) || !reflect.DeepEqual(current.UpgradeSource, confirmedCurrent.UpgradeSource) {
 		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
 	}
 	return inspection, nil
