@@ -359,7 +359,8 @@ func (m *Manager) abortGatewayRebindPreparedWithoutIntentLocked(ctx context.Cont
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
 	}
-	receipt, err := newGatewayRebindNoEffectAbortTerminalV2(claim, snapshot.Active.RosterV2, *checkpoint,
+	receipt, err := newGatewayRebindNoEffectAbortTerminalV2(claim, snapshot.Active.RosterV2,
+		snapshot.Active.RuntimeHeads, *checkpoint,
 		proofValue, gatewayRebindTimeStrictlyAfter(m.gatewayRebindProgressTime(), proofValue.CreatedAt))
 	if err != nil {
 		return GatewayRebindCommitResult{}, err

@@ -186,7 +186,8 @@ func validGatewayRebindTerminalReceiptV2(value gatewayRebindTerminalReceiptV2) b
 }
 
 func newGatewayRebindNoEffectAbortTerminalV2(claim appaccess.GatewayRebindClaimV2,
-	roster []appaccess.GatewayRebindRosterEntryV2, checkpoint gatewayRebindPredecessorCheckpoint,
+	roster []appaccess.GatewayRebindRosterEntryV2, runtimeHeads []appaccess.GatewayRebindRuntimeHead,
+	checkpoint gatewayRebindPredecessorCheckpoint,
 	proof gatewayRebindNoEffectAbortProof, createdAt time.Time,
 ) (gatewayRebindTerminalReceiptV2, error) {
 	invalid := errors.New("invalid generated ingress no-effect rebind terminal")
@@ -217,6 +218,11 @@ func newGatewayRebindNoEffectAbortTerminalV2(claim appaccess.GatewayRebindClaimV
 	if err != nil || rosterDigest != claim.Spec.RosterDigest || int64(len(roster)) != claim.Spec.RosterCount {
 		return gatewayRebindTerminalReceiptV2{}, invalid
 	}
+	runtimeHeadsDigest, err := appaccess.GatewayRebindRuntimeHeadsV2Digest(claim.Spec.OperationID, runtimeHeads)
+	if err != nil || claim.Spec.RuntimeHeadsVersion != appaccess.GatewayRebindRuntimeHeadsVersionV1 ||
+		runtimeHeadsDigest != claim.Spec.RuntimeHeadsDigest || int64(len(runtimeHeads)) != claim.Spec.RuntimeHeadsCount {
+		return gatewayRebindTerminalReceiptV2{}, invalid
+	}
 	entryDigests := make([]string, len(roster))
 	for i := range roster {
 		entryDigests[i] = roster[i].EntryDigest
@@ -232,12 +238,14 @@ func newGatewayRebindNoEffectAbortTerminalV2(claim appaccess.GatewayRebindClaimV
 		RosterCount: int64(len(roster)), RosterEntryDigests: entryDigests, NoEffectProof: &proof,
 		CreatedAt: createdAt.UTC().Format(time.RFC3339Nano),
 	}
-	// PreparedDatabaseDigest binds the exact retained SQL claim+roster rather
-	// than inventing an intent. This is the same canonical shape used by V2 intent.
+	// PreparedDatabaseDigest binds the exact retained SQL claim, LAN roster,
+	// and complete runtime-head census rather than inventing an intent. This is
+	// the same canonical shape used by V2 intent.
 	value.PreparedDatabaseDigest, err = canonicalDigest(struct {
-		Claim  appaccess.GatewayRebindClaimV2         `json:"claim"`
-		Roster []appaccess.GatewayRebindRosterEntryV2 `json:"roster"`
-	}{claim, roster})
+		Claim        appaccess.GatewayRebindClaimV2         `json:"claim"`
+		Roster       []appaccess.GatewayRebindRosterEntryV2 `json:"roster"`
+		RuntimeHeads []appaccess.GatewayRebindRuntimeHead   `json:"runtimeHeads"`
+	}{claim, roster, runtimeHeads})
 	if err != nil {
 		return gatewayRebindTerminalReceiptV2{}, invalid
 	}
@@ -278,7 +286,7 @@ func newGatewayRebindCommitTerminalV2(intent gatewayRebindProtectedIntentV2,
 		ProtectedRecordSequence: last.Sequence, ProtectedRecordDigest: last.Digest,
 		SuccessorProfile: intent.SuccessorProfile, SuccessorIdentity: intent.Identity,
 		RosterDigest: intent.Claim.Spec.RosterDigest, RosterCount: intent.Claim.Spec.RosterCount,
-		RosterEntryDigests: append([]string(nil), intent.RosterEntryDigests...),
+		RosterEntryDigests: append([]string{}, intent.RosterEntryDigests...),
 		Resources:          &resources, PhysicalProof: &proof,
 		CreatedAt: createdAt.UTC().Format(time.RFC3339Nano),
 	}
@@ -324,7 +332,7 @@ func newGatewayRebindRollbackTerminalV2(intent gatewayRebindProtectedIntentV2,
 		return gatewayRebindTerminalReceiptV2{}, invalid
 	}
 	rollback := *last.TypedRollback
-	entryDigests := append([]string(nil), intent.RosterEntryDigests...)
+	entryDigests := append([]string{}, intent.RosterEntryDigests...)
 	value := gatewayRebindTerminalReceiptV2{
 		Version: gatewayRebindTerminalVersionV2, Purpose: gatewayRebindTerminalPurposeV2,
 		Generation: intent.Generation, OperationID: intent.OperationID,
@@ -357,7 +365,7 @@ func gatewayRebindTerminalV2MatchesIntentHistory(value gatewayRebindTerminalRece
 		value.Predecessor != checkpoint.sourceRef() || value.ProtectedIntentDigest != intent.Digest ||
 		value.SuccessorProfile != intent.SuccessorProfile || value.SuccessorIdentity != intent.Identity ||
 		value.RosterDigest != intent.Claim.Spec.RosterDigest || value.RosterCount != intent.Claim.Spec.RosterCount ||
-		!reflect.DeepEqual(value.RosterEntryDigests, intent.RosterEntryDigests) || len(progress) == 0 {
+		!sameGatewayRebindDigestList(value.RosterEntryDigests, intent.RosterEntryDigests) || len(progress) == 0 {
 		return false
 	}
 	last := progress[len(progress)-1].Record
@@ -382,6 +390,18 @@ func gatewayRebindTerminalV2MatchesIntentHistory(value gatewayRebindTerminalRece
 	default:
 		return false
 	}
+}
+
+func sameGatewayRebindDigestList(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func gatewayRebindTerminalCreatedAfterProgress(createdAt, progressAt string) bool {

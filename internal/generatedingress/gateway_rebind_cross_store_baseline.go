@@ -64,7 +64,8 @@ func newGatewayRebindTransfersV2(intent gatewayRebindProtectedIntentV2,
 	if !validGatewayRebindProtectedIntentV2(intent) || !validGatewayRebindTerminalReceiptV2(receipt) ||
 		receipt.Disposition != appaccess.GatewayRebindDispositionCommit || receipt.OperationID != intent.OperationID ||
 		receipt.ProtectedIntentDigest != intent.Digest || receipt.Predecessor != checkpoint.sourceRef() ||
-		receipt.RosterDigest != intent.Claim.Spec.RosterDigest || !reflect.DeepEqual(receipt.RosterEntryDigests, intent.RosterEntryDigests) {
+		receipt.RosterDigest != intent.Claim.Spec.RosterDigest ||
+		!sameGatewayRebindDigestList(receipt.RosterEntryDigests, intent.RosterEntryDigests) {
 		return nil, invalid
 	}
 	apps, err := gatewayRebindV2CheckpointApps(checkpoint)

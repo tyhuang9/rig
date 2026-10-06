@@ -548,12 +548,57 @@ func TestGatewayRebindTypedProgressAcceptsCanonicalZeroRuntimeHeads(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	records, _, _ := gatewayRebindTypedCompleteProgressFixture(t, fixture, checkpoint, intent, first)
+	records, resources, proof := gatewayRebindTypedCompleteProgressFixture(t, fixture, checkpoint, intent, first)
 	if len(records) != 17 || records[10].TypedEffect == nil ||
 		records[10].TypedEffect.FinalConfigIntent == nil ||
 		len(records[10].TypedEffect.FinalConfigIntent.RoutePlan.Routes) != 0 ||
 		!gatewayRebindTypedProgressMatchesCheckpoint(intent, checkpoint, records) {
 		t.Fatal("zero-head typed progress was not retained as a complete canonical prefix")
+	}
+	selections := make([]gatewayRebindProgressSelection, len(records))
+	for index := range records {
+		selections[index] = gatewayRebindProgressSelection{Generation: records[index].Generation,
+			Sequence: records[index].Sequence, Record: records[index], Existing: true}
+	}
+	commit, err := newGatewayRebindCommitTerminalV2(intent, records[len(records)-1], resources, proof,
+		time.Unix(21, 0).UTC())
+	if err != nil || !gatewayRebindTerminalV2MatchesIntentHistory(commit, intent, checkpoint, selections) ||
+		commit.RosterEntryDigests == nil {
+		t.Fatalf("zero-roster commit terminal: %#v error=%v", commit, err)
+	}
+	transfers, err := newGatewayRebindTransfersV2(intent, commit, checkpoint)
+	if err != nil || transfers == nil || len(transfers) != 0 {
+		t.Fatalf("zero-roster transfers: %#v error=%v", transfers, err)
+	}
+	baseline, err := newGatewayCurrentRouteBaselineFromV2Terminal(intent, commit, checkpoint, transfers)
+	if err != nil || len(baseline.Apps) != 0 || !validGatewayCurrentRouteState(baseline) {
+		t.Fatalf("zero-roster current baseline: %#v error=%v", baseline, err)
+	}
+	routesDigest, err := gatewayRebindTypedCheckpointRoutesDigest(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollbackIntent, err := newGatewayRebindTypedRollbackIntentV2(intent,
+		[]gatewayRebindProgressRecord{first}, gatewayRebindTypedRollbackOwnedResources{}, routesDigest, "",
+		time.Unix(5, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollbackProof := gatewayRebindTypedRollbackProofFixture(t, fixture, routesDigest, rollbackIntent.Digest)
+	rollbackComplete, err := newGatewayRebindTypedRollbackCompleteV2(intent,
+		[]gatewayRebindProgressRecord{first, rollbackIntent}, rollbackProof, time.Unix(6, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollback, err := newGatewayRebindRollbackTerminalV2(intent, rollbackComplete, checkpoint, time.Unix(7, 0).UTC())
+	rollbackSelections := []gatewayRebindProgressSelection{
+		{Generation: first.Generation, Sequence: first.Sequence, Record: first, Existing: true},
+		{Generation: rollbackIntent.Generation, Sequence: rollbackIntent.Sequence, Record: rollbackIntent, Existing: true},
+		{Generation: rollbackComplete.Generation, Sequence: rollbackComplete.Sequence, Record: rollbackComplete, Existing: true},
+	}
+	if err != nil || !gatewayRebindTerminalV2MatchesIntentHistory(rollback, intent, checkpoint, rollbackSelections) ||
+		rollback.RosterEntryDigests == nil {
+		t.Fatalf("zero-roster rollback terminal: %#v error=%v", rollback, err)
 	}
 }
 
@@ -762,7 +807,8 @@ func TestGatewayRebindTypedNoEffectAbortRequiresCheckpointWithoutIntent(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := newGatewayRebindNoEffectAbortTerminalV2(intent.Claim, intent.Roster, checkpoint, proof, time.Unix(5, 0).UTC())
+	receipt, err := newGatewayRebindNoEffectAbortTerminalV2(intent.Claim, intent.Roster, intent.RuntimeHeads,
+		checkpoint, proof, time.Unix(5, 0).UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -827,7 +873,7 @@ func TestGatewayRebindTypedNoEffectAbortRequiresCheckpointWithoutIntent(t *testi
 	conflictProof.SuccessorIdentityDigest = conflictIntent.Identity.Digest
 	conflictProof.Digest, _ = gatewayRebindNoEffectAbortProofDigest(conflictProof)
 	conflictReceipt, err := newGatewayRebindNoEffectAbortTerminalV2(conflictIntent.Claim, conflictIntent.Roster,
-		conflictCheckpoint, conflictProof, time.Unix(5, 0).UTC())
+		conflictIntent.RuntimeHeads, conflictCheckpoint, conflictProof, time.Unix(5, 0).UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
