@@ -1250,3 +1250,43 @@ Both named tests passed, with no failure or skip, in 20.240s. Vet and diff check
 passed. Log: `Rig/temp/m3-current-lan-batch-presence.jsonl`. This proves only
 presence selection before effects; batch quarantine, physical proof, ordered
 head finalization and retirement still require the pending runtime integration.
+
+Independent bounded review accepted `3186e9e` and `e621d37` with those delivery
+limitations. At frozen `e621d37`, all four selected tests and 34 subcases passed
+in 56.883s with zero failure or skip. Log:
+`Rig/temp/cross-store-review-e621-lan-startup.jsonl`.
+
+### Pure ordered batch transitions for the selected current gateway
+
+The next local change derives a batch from the complete validated startup
+census, then provides explicit clear, advance and retirement state transitions.
+It preserves immutable items and original pending evidence through every head;
+each changed transition advances the operational revision exactly once. An
+already-absent head returns an independent copy with identical bytes/revision.
+It never writes files, resolves SQL callbacks or performs Docker operations.
+The guarded runtime consumer must still prove physical withdrawal, bind the
+requested head to the freshly selected state, resolve terminal SQL and clear
+acknowledgment, then persist/reconfirm each exact transition.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayCurrentLANRecoveryBatchTransitionsPreserveQueue$'
+go vet -mod=readonly ./internal/generatedingress
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The final focused test passed in 17.910s with no failure or skip. It exercises
+an ordered two-application disable batch (transferred and native grants),
+preserved raw identities and loopback routes, pending evidence, deep-copy
+isolation, replay, invalid/completed head bounds, refusal to advance before
+clearance, separate retirement, revision exhaustion, and a prepared grant with
+no published binding. Vet, full build and diff checks passed. Log:
+`Rig/temp/m3-current-lan-batch-state-complete.jsonl`.
+
+Initial fixture failures are retained: the inherited fixture had only one
+LAN grant (18.111s, `m3-current-lan-batch-state.jsonl`); after adding a native
+grant, the single-disable helper reused one operation ID and was correctly
+rejected (17.837s, `m3-current-lan-batch-state-corrected.jsonl`). Distinct
+application/operation identities fixed the fixture. The first complete
+two-disable run passed in 17.958s (`m3-current-lan-batch-state-final.jsonl`),
+before adding prepared-grant coverage. These pure transformations are a
+prerequisite for the guarded batch consumer, not runtime or Docker acceptance.
