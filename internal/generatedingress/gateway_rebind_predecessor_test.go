@@ -256,6 +256,12 @@ func newGatewayRebindPredecessorFixture(t *testing.T) gatewayRebindPredecessorFi
 }
 
 func newGatewayRebindPredecessorFixtureWithClaim(t *testing.T, insertClaim bool) gatewayRebindPredecessorFixture {
+	return newGatewayRebindPredecessorFixtureWithLANApprover(t, insertClaim, "")
+}
+
+func newGatewayRebindPredecessorFixtureWithLANApprover(t *testing.T, insertClaim bool,
+	lanApproverID string,
+) gatewayRebindPredecessorFixture {
 	t.Helper()
 	manager, runner := newManagerFixture(t, false)
 	db, err := database.Open(manager.options.DataRoot)
@@ -266,6 +272,18 @@ func newGatewayRebindPredecessorFixtureWithClaim(t *testing.T, insertClaim bool)
 	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,role,created_at,updated_at)
 		VALUES(?,'rebind-admin','hash','administrator',datetime('now'),datetime('now'))`, gatewayRebindTestAdministrator); err != nil {
 		t.Fatal(err)
+	}
+	accessApproverID := gatewayRebindTestAdministrator
+	if lanApproverID != "" {
+		if !validCanonicalUUID(lanApproverID) || lanApproverID == gatewayRebindTestAdministrator {
+			t.Fatal("invalid distinct LAN approver fixture identity")
+		}
+		if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,role,created_at,updated_at)
+			VALUES(?,?,?,'administrator',datetime('now'),datetime('now'))`, lanApproverID,
+			"rebind-lan-"+lanApproverID, "hash"); err != nil {
+			t.Fatal(err)
+		}
+		accessApproverID = lanApproverID
 	}
 	repository := appaccess.New(db)
 	ctx := context.Background()
@@ -304,7 +322,7 @@ func newGatewayRebindPredecessorFixtureWithClaim(t *testing.T, insertClaim bool)
 	revision, _, err := repository.ApproveAppAccess(ctx, appaccess.ApproveAppAccessInput{
 		AppID: appID, OperationID: allocation.OwnerOperationID, AllocationID: allocation.ID,
 		Approval: appaccess.Approval{
-			Action: appaccess.ActionEnableAppAccess, SpecDigest: accessDigest, ActorID: gatewayRebindTestAdministrator,
+			Action: appaccess.ActionEnableAppAccess, SpecDigest: accessDigest, ActorID: accessApproverID,
 		},
 	})
 	if err != nil {

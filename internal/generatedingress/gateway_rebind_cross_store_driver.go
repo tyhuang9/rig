@@ -21,6 +21,93 @@ type managerGatewayRebindCrossStoreDriver struct {
 func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorLocked(ctx context.Context,
 	request gatewayRebindPhysicalReconcileRequest, appendProgress gatewayRebindTypedProgressAppender,
 ) (gatewayRebindTypedPhysicalResult, error) {
+	if d.manager == nil || ctx == nil || appendProgress == nil || !validGatewayRebindPhysicalReconcileRequest(request) {
+		return gatewayRebindTypedPhysicalResult{}, errors.New("generated ingress typed physical rebind is unavailable")
+	}
+	if request.Mode == gatewayRebindPhysicalReconcileRollbackOnly {
+		return d.reconcileRollbackLocked(ctx, request, appendProgress)
+	}
+	result, err := d.reconcileSuccessorForwardLocked(ctx, request, appendProgress)
+	if err == nil || request.Mode != gatewayRebindPhysicalReconcileUndecided || !request.RollbackAllowed {
+		return result, err
+	}
+	rolledBack, rollbackErr := d.reconcileRollbackLocked(ctx, request, appendProgress)
+	if rollbackErr != nil {
+		return gatewayRebindTypedPhysicalResult{}, errors.Join(err, rollbackErr)
+	}
+	return rolledBack, nil
+}
+
+func (d managerGatewayRebindCrossStoreDriver) reconcileRollbackLocked(ctx context.Context,
+	request gatewayRebindPhysicalReconcileRequest, appendProgress gatewayRebindTypedProgressAppender,
+) (gatewayRebindTypedPhysicalResult, error) {
+	rollback, ok := d.handover.(gatewayRebindTypedRollbackDriver)
+	if !ok || (request.Mode != gatewayRebindPhysicalReconcileUndecided &&
+		request.Mode != gatewayRebindPhysicalReconcileRollbackOnly) {
+		return gatewayRebindTypedPhysicalResult{}, errors.New("generated ingress typed physical rollback is unavailable")
+	}
+	boundary, err := d.manager.readGatewayRebindTypedAttemptBoundaryLocked(ctx, request)
+	if err != nil {
+		return gatewayRebindTypedPhysicalResult{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	progress := append([]gatewayRebindProgressRecord(nil), boundary.Progress...)
+	guard := func(guardCtx context.Context) error {
+		fresh, guardErr := d.manager.readGatewayRebindTypedAttemptBoundaryLocked(guardCtx, request)
+		if guardErr != nil || !reflect.DeepEqual(progress, fresh.Progress) {
+			return gatewayRebindEffectBoundaryError(guardCtx)
+		}
+		return nil
+	}
+	appendRecord := func(record gatewayRebindProgressRecord) error {
+		if guard(ctx) != nil || appendProgress(ctx, record) != nil {
+			return gatewayRebindEffectBoundaryError(ctx)
+		}
+		progress = append(progress, record)
+		return guard(ctx)
+	}
+	if result, found := gatewayRebindTypedPhysicalResultFromProgress(progress[len(progress)-1]); found {
+		if result.Disposition != appaccess.GatewayRebindDispositionAbort {
+			return gatewayRebindTypedPhysicalResult{}, gatewayRebindEffectBoundaryError(ctx)
+		}
+		return result, nil
+	}
+	last := progress[len(progress)-1]
+	if last.TypedRollback == nil {
+		preparation, prepareErr := rollback.prepareRollback(ctx, request.Attempt, boundary.Selection, progress, guard)
+		if prepareErr != nil {
+			return gatewayRebindTypedPhysicalResult{}, prepareErr
+		}
+		record, buildErr := newGatewayRebindTypedRollbackIntentV2(request.Attempt.Intent, progress,
+			preparation.Owned, preparation.PredecessorRoutesDigest, preparation.AdoptionProofDigest,
+			gatewayRebindTimeStrictlyAfter(d.manager.gatewayRebindProgressTime(), last.OccurredAt))
+		if buildErr != nil || appendRecord(record) != nil {
+			return gatewayRebindTypedPhysicalResult{}, gatewayRebindEffectBoundaryError(ctx)
+		}
+		last = record
+	}
+	if last.Phase != gatewayRebindProgressRollbackIntent || last.TypedRollback == nil ||
+		last.TypedRollback.PhysicalProof != nil {
+		return gatewayRebindTypedPhysicalResult{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	proof, rollbackErr := rollback.rollbackSuccessor(ctx, request.Attempt, boundary.Selection, last, guard)
+	if rollbackErr != nil {
+		return gatewayRebindTypedPhysicalResult{}, rollbackErr
+	}
+	complete, buildErr := newGatewayRebindTypedRollbackCompleteV2(request.Attempt.Intent, progress, proof,
+		gatewayRebindTimeStrictlyAfter(d.manager.gatewayRebindProgressTime(), last.OccurredAt))
+	if buildErr != nil || appendRecord(complete) != nil {
+		return gatewayRebindTypedPhysicalResult{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	result, found := gatewayRebindTypedPhysicalResultFromProgress(progress[len(progress)-1])
+	if !found || result.Disposition != appaccess.GatewayRebindDispositionAbort {
+		return gatewayRebindTypedPhysicalResult{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	return result, nil
+}
+
+func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorForwardLocked(ctx context.Context,
+	request gatewayRebindPhysicalReconcileRequest, appendProgress gatewayRebindTypedProgressAppender,
+) (gatewayRebindTypedPhysicalResult, error) {
 	if d.manager == nil || ctx == nil || appendProgress == nil || !validGatewayRebindPhysicalReconcileRequest(request) ||
 		request.Mode == gatewayRebindPhysicalReconcileRollbackOnly {
 		return gatewayRebindTypedPhysicalResult{}, errors.New("generated ingress typed physical rebind is unavailable")
@@ -235,13 +322,6 @@ func gatewayRebindTypedPhysicalResultFromProgress(last gatewayRebindProgressReco
 		return gatewayRebindTypedPhysicalResult{Disposition: appaccess.GatewayRebindDispositionAbort, Last: last}, true
 	}
 	return gatewayRebindTypedPhysicalResult{}, false
-}
-
-func (d managerGatewayRebindCrossStoreDriver) proveNoSuccessorEffectsLocked(context.Context,
-	appaccess.GatewayRebindClaimV2, []appaccess.GatewayRebindRosterEntryV2,
-	gatewayRebindPredecessorCheckpoint,
-) (gatewayRebindNoEffectAbortProof, error) {
-	return gatewayRebindNoEffectAbortProof{}, errors.New("generated ingress typed no-effect proof is unavailable")
 }
 
 func (d managerGatewayRebindCrossStoreDriver) attestCommittedCurrentLocked(ctx context.Context,
