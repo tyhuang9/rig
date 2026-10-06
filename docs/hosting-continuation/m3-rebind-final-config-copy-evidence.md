@@ -304,6 +304,56 @@ local evidence; no additional dependency is introduced.
 The PostgreSQL/repository-wide race job was still running when this correction
 was prepared. No success is inferred for it.
 
+## Hosted repository race timeout correction, 2026-10-05
+
+At `7deefa45ffeaf8b3ffade482ababf5a92368c10c`, all five ingress partitions
+and the runtime-package partition passed in lifecycle run `37391508420`.
+The M3 Docker workflow `37391508257` and Windows run `37391508875` also passed.
+The separate [repository-wide race job](https://github.com/tyhuang9/rig/actions/runs/37391508290/job/112037551786)
+then failed at the ingress package's 40-minute limit (2400.044s).
+The active `TestGatewayRebindStageConfigCopyReceiptReplayRejectsInventoryAndRuntimeDriftWithoutRecopy`
+test had run for 30 seconds; its `mismatched_stage_config` subtest for eight.
+The stack was executing SQLite migration in the fixture. The log contains no
+failed assertion or race report before the package timeout. This remains a
+failed check, not evidence of a repository-wide race pass.
+
+The repository workflow now runs ingress in the same five complementary
+partitions already established by lifecycle CI. Both workflows call
+`bash scripts/check-generated-runtime-race.sh "$RACE_SUITE"`; that shared command
+preserves the existing filters, complete subtest trees, 32-minute package
+limit, race instrumentation, pipefail and nonempty-test guard. All other
+packages are discovered with `go list ./...` and run without a test filter.
+Discovery must find exactly one ingress package and a nonempty remainder.
+The original `PostgreSQL and Linux race verification` check name is retained
+as an always-running aggregate requiring the PostgreSQL/repository job and
+every ingress partition. PostgreSQL integration/outage checks and the
+repository job's 40-minute package and 80-minute job limits are unchanged.
+
+Local verification parsed both YAML workflows, checked both aggregate gates
+and shared command references, and applied the actual filters to a fresh
+Go-discovered test census. All 597 Windows-discovered ingress top-level tests
+are assigned exactly once: gateway-v2 137, rebind-history 88, rebind-config 55,
+rebind-resources 78, ingress-remainder 239. The repository discovery contains
+50 packages; all 49 non-ingress packages remain in the unfiltered race command.
+
+```powershell
+go test -mod=readonly -buildvcs=false -list '^Test' ./internal/generatedingress
+go list -mod=readonly -buildvcs=false ./...
+go run -mod=readonly -buildvcs=false C:/Users/huang/Documents/Projects/Rig/temp/m3-pr136-shared-race-check.go $env:TEMP/m3-pr136-shared-race-census.txt $env:TEMP/m3-pr136-shared-race-packages.txt C:/Users/huang/Documents/Projects/Rig/temp/m3-pr136-repository-race-remainder.sh
+& 'C:/Program Files/Git/bin/bash.exe' -n scripts/check-generated-runtime-race.sh
+& 'C:/Program Files/Git/bin/bash.exe' -n C:/Users/huang/Documents/Projects/Rig/temp/m3-pr136-repository-race-remainder.sh
+```
+
+YAML, census, package coverage, Bash syntax and diff checks passed. The first
+elevated census attempt could not read VCS status; rerunning with local
+`-buildvcs=false` completed successfully. That flag is absent from CI commands.
+The terminal failure log is retained at
+`Rig/temp/pr136-7deefa4-repository-race-failure.log`. Local selection/syntax
+checks do not execute Linux race instrumentation; the corrected hosted jobs
+must establish the result. This correction changes CI and evidence only.
+`pnpm --dir docs check:workflow` passed and `pnpm --dir docs build` completed
+successfully in 3.40s.
+
 ## Remaining work and rollback
 
 M3 still requires three cohesive delivery units, each combining implementation
