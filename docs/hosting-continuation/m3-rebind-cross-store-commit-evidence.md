@@ -1712,3 +1712,18 @@ go build -mod=readonly -buildvcs=false ./...
 
 The integrated full build passed. Remaining physical/startup/batch gates above
 are unchanged, and no new branch has been published.
+
+Independent QA/code review accepted frozen `1682f09`. Its complete sequence run
+passed two top-level tests and two subcases in 100.075s, with no failures or
+skips (`Rig/temp/cross-store-review-1682-sequences.jsonl`). This run includes
+the distinct second address/interface and both rollback paths.
+
+Startup integration must respect the existing effects lease: `main.go` acquires
+ordinary worker admission before gateway inspection, and that admission already
+rejects an active rebind fence. The planned lease-owning rebind recovery API must
+therefore run immediately after opening the database, before ordinary admission.
+Ordinary admission must then reacquire its lease and read a fresh fence/census.
+Invoking recovery beneath the held startup lease would nest a nonreentrant lock.
+Emergency stop must likewise have an explicit lease policy for failures that
+occur while startup admission is still held. These integration requirements are
+confirmed with the runtime owner; the executable API is not yet available.
