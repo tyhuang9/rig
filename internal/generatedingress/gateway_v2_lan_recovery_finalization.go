@@ -80,6 +80,9 @@ func (m *Manager) ObserveGatewayV2LANRecoveryHead(ctx context.Context,
 	defer releaseGatewayLock(release, &resultErr)
 	proofCtx, cancelProof := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelProof()
+	if currentHead, currentPresent, handled, currentErr := m.observeGatewayCurrentLANRecoveryHeadLocked(proofCtx, claims); currentErr != nil || handled {
+		return currentHead, currentPresent, currentErr
+	}
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil {
 		return GatewayV2LANRecoveryHead{}, false, gatewayV2LANDisableError(proofCtx)
@@ -268,6 +271,9 @@ func (m *Manager) RetireGatewayV2LANRecoveryBatch(ctx context.Context,
 	defer releaseGatewayLock(release, &resultErr)
 	workCtx, cancelWork := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelWork()
+	if handled, currentErr := m.retireGatewayCurrentLANRecoveryBatchLocked(workCtx, claims); currentErr != nil || handled {
+		return currentErr
+	}
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil || state.LANRecovery == nil ||
 		state.LANRecovery.Head != len(state.LANRecovery.Items) ||
