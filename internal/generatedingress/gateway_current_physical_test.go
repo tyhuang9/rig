@@ -12,9 +12,18 @@ import (
 type gatewayCurrentPhysicalDriverFake struct {
 	apply        gatewayCurrentPhysicalAttestation
 	restore      gatewayCurrentPhysicalAttestation
+	stop         gatewayCurrentPhysicalAttestation
 	attest       gatewayCurrentPhysicalAttestation
 	applyCalls   int
 	restoreCalls int
+	stopCalls    int
+}
+
+func (f *gatewayCurrentPhysicalDriverFake) stopGatewayCurrentPhysical(context.Context,
+	gatewayCurrentPhysicalTransition,
+) (gatewayCurrentPhysicalAttestation, error) {
+	f.stopCalls++
+	return f.stop, nil
 }
 
 func (f *gatewayCurrentPhysicalDriverFake) restoreGatewayCurrentPhysical(context.Context,
@@ -222,6 +231,23 @@ func TestGatewayCurrentPhysicalTransitionSupportsNewAppAndChainedGrant(t *testin
 	if err != nil || !validGatewayCurrentPhysicalTransition(chained) {
 		t.Fatalf("ActivationUncertain chained grant transition rejected: %v", err)
 	}
+	terminal, err := newGatewayRebindAttemptTerminalViewLegacy(fixture.receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := gatewayCurrentPhysicalAttestationFixture(t, grantBefore, terminal,
+		gatewayCurrentPhysicalRecoveryBefore)
+	restored.Pending = cloneGatewayCurrentPendingRoute(grantPending.Pending)
+	restored.Digest, err = gatewayCurrentPhysicalAttestationDigest(restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver := &gatewayCurrentPhysicalDriverFake{restore: restored}
+	fixture.manager.gatewayCurrentPhysicalDriver = driver
+	if _, err := fixture.manager.restoreGatewayCurrentPhysicalLocked(context.Background(), chained); err != nil ||
+		driver.restoreCalls != 1 {
+		t.Fatalf("pre-activation grant restore mismatch: calls=%d error=%v", driver.restoreCalls, err)
+	}
 }
 
 func TestGatewayCurrentPhysicalWithdrawalQuarantinesAndRestoresExactGrant(t *testing.T) {
@@ -302,6 +328,47 @@ func TestGatewayCurrentPhysicalWithdrawalQuarantinesAndRestoresExactGrant(t *tes
 	if _, err := fixture.manager.restoreGatewayCurrentPhysicalLocked(context.Background(), transition); err != nil ||
 		driver.restoreCalls != 1 {
 		t.Fatalf("withdrawal restore mismatch: calls=%d error=%v", driver.restoreCalls, err)
+	}
+	stopped := gatewayCurrentPhysicalAttestationFixture(t, effective, terminal,
+		gatewayCurrentPhysicalRecoveryStopped)
+	stopped.Pending = cloneGatewayCurrentPendingRoute(pending.Pending)
+	stopped.Runtime.ListenerAbsent = true
+	stopped.Runtime.Digest, err = gatewayCurrentRuntimeProofDigest(stopped.Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped.Digest, err = gatewayCurrentPhysicalAttestationDigest(stopped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver.stop = stopped
+	if _, err := fixture.manager.stopGatewayCurrentPhysicalLocked(context.Background(), transition); err != nil ||
+		driver.stopCalls != 1 {
+		t.Fatalf("exact selected-current stop mismatch: calls=%d error=%v", driver.stopCalls, err)
+	}
+	foreign := stopped
+	foreign.Resources = stopped.Resources
+	foreign.Resources.FinalContainer = &gatewayRebindFinalContainerBinding{
+		ID: strings.Repeat("a", 64), OwnershipDigest: strings.Repeat("b", 64),
+		ConfigurationDigest: strings.Repeat("c", 64),
+	}
+	foreign.Resources.Digest, err = gatewayRebindFinalHandoverResourcesDigest(foreign.Resources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign.Runtime.ContainerID = foreign.Resources.FinalContainer.ID
+	foreign.Runtime.Digest, err = gatewayCurrentRuntimeProofDigest(foreign.Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign.Digest, err = gatewayCurrentPhysicalAttestationDigest(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver.stop = foreign
+	if _, err := fixture.manager.stopGatewayCurrentPhysicalLocked(context.Background(), transition); err == nil ||
+		driver.stopCalls != 2 {
+		t.Fatalf("foreign stop resources accepted: calls=%d error=%v", driver.stopCalls, err)
 	}
 
 	changed := transition
