@@ -770,12 +770,45 @@ The prepared SQL boundary still has no Docker effects or protected commit
 receipt. Full physical coordination, terminal recovery, transfer-aware normal
 operations and startup dispatch remain required for delivery.
 
+### Startup authority validation checkpoint
+
+SQL checkpoint `b91f55d6ef43c78cb3f83c1314bf5b00aaea143b` was independently
+reviewed and integrated at `ab38e9e`. In-flight grants and no-source disables
+carry optional SQL authority only when their raw profile is still exactly
+current. Four independent tests passed with no failure or skip (7.580s), and
+the implementation agent's full app-access suite passed (100.641s). Evidence:
+`temp/cross-store-review-b91-startup-authority.jsonl`.
+
+The startup grant/disable claim validators now check canonical effective
+profiles, typed source and receipt, immutable raw app/allocation/grant/profile
+identity, ordered digest-linked transfer history and its terminal tip. Current
+and retained evidence are mutually exclusive and must agree across the exact
+grant/disable pair. Native grants on a rebound profile and no-source in-flight
+disables have explicit no-transfer rules. The regression includes semantic
+mutations with recalculated transfer hashes and a projected two-transfer chain;
+it does not claim a physical repeated rebind.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./internal/generatedingress -run '^TestGatewayV2LAN(Startup|DisableStartup|Access)'
+go vet -mod=readonly ./internal/generatedingress
+```
+
+All 21 top-level tests passed, zero failures or skips (32.622s), including the
+existing native startup/quarantine and disable cases. Vet and diff checks
+passed. Events: `$TEMP/m3-startup-binding-consumers.jsonl`. Bounded independent
+review found no issue in this structural validation checkpoint. Selection of
+the protected current generation and physical attestation remain required;
+these validators alone do not authorize serving.
+
 PR #136 received the separately reviewed CI partition correction at `7deefa4`.
 Its M3 Docker workflow passed again at that exact revision (run `37391508257`).
 The previous repository-wide race job at `b46162e` was cancelled by normal
 workflow concurrency after the update; its PostgreSQL-specific steps passed,
 but its repository-wide result is unverified. New race batches at `7deefa4`
-remain pending. The published correction is integrated locally at `3cf6bb8`.
+all passed, including the aggregate check (run `37391508420`). Windows passed
+at the same head (run `37391508875`). The repository-wide race step in run
+`37391508290` remains pending. The published correction is integrated locally
+at `3cf6bb8`.
 
 Keep the new runtime path unavailable until its complete invariants and gates
 are satisfied. Reverting source must not delete protected receipts, committed

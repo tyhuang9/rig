@@ -71,6 +71,7 @@ func validateGatewayV2LANAccessStartupClaims(grants []GatewayV2LANStartupClaim,
 	}
 	for _, claim := range disables {
 		if !validGatewayV2LANDisableRequest(claim.Request) || !validGatewayV2LANDisableStartupSequence(claim.State, claim.StateSequence) ||
+			!validGatewayV2LANStartupDisableBindings(claim) ||
 			(claim.ClearAcknowledged && claim.State != appaccess.AppAccessDisableCommitted) {
 			return gatewayV2LANAccessStartupClaims{}, gatewayV2StartupInspectionError(nil)
 		}
@@ -84,7 +85,9 @@ func validateGatewayV2LANAccessStartupClaims(grants []GatewayV2LANStartupClaim,
 			grant, exists := grantSet.byAttempt[claim.Request.SourceGrant.AttemptID]
 			if !exists || grant.Request != *claim.Request.SourceGrant ||
 				grant.State != appaccess.AppAccessGrantCommitted ||
-				grant.DisableIntentOperationID != claim.Request.OperationID {
+				grant.DisableIntentOperationID != claim.Request.OperationID ||
+				!reflect.DeepEqual(grant.CurrentBinding, claim.CurrentBinding) ||
+				!reflect.DeepEqual(grant.RetainedBinding, claim.RetainedBinding) {
 				return gatewayV2LANAccessStartupClaims{}, gatewayV2StartupInspectionError(nil)
 			}
 		}
