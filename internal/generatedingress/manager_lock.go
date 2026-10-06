@@ -76,6 +76,14 @@ func (m *Manager) lockGatewayRawForInspection(ctx context.Context) (func() error
 	return m.lockGatewayRawMode(ctx, true)
 }
 
+// lockGatewayRawForOwnedStop is the only effect boundary that may cross an
+// existing process fail-stop. It authorizes no selection or publication; the
+// caller may only withdraw exact protected-owned resources after separately
+// acquiring the deployment-effects lease.
+func (m *Manager) lockGatewayRawForOwnedStop(ctx context.Context) (func() error, error) {
+	return m.lockGatewayRawMode(ctx, true)
+}
+
 func (m *Manager) lockGatewayRawMode(ctx context.Context, allowFailStop bool) (func() error, error) {
 	if !allowFailStop && m.gatewayRebindAdmissionBlocked() {
 		return nil, &Error{Code: DiagnosticRouteUnresolved}
