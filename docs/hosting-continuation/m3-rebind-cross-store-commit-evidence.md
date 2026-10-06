@@ -1159,3 +1159,27 @@ and both controller mapping tests. Its log is
 The checkpoint received bounded acceptance for census and read-only startup
 classification; the runtime limitations above still apply. Documentation checks
 and build also passed before freezing (3.92s).
+
+### Startup handoff to ordinary current-route recovery
+
+The reviewed route state machine `afd5718b69fbc6c1a887ce7c46e1716c83a05d90`
+was integrated at `febcb20`. Independent verification passed three top-level
+tests and three drift cases (80.600s), plus the existing native grant restart
+and two legacy switch/compensation tests (1.603s), with zero failure or skip.
+Logs: `Rig/temp/cross-store-review-afd-route.jsonl` and
+`Rig/temp/cross-store-review-afd-native-preservation.jsonl`.
+
+The combined startup/recovery test then passed one top-level test and both
+physical outcomes (before and effective), zero failure or skip, in 46.144s:
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayRebindCurrentStartupRouteRecoveryBeforeAdmission$'
+```
+
+It exercises public startup inspection followed by public `Manager.Recover`
+and another inspection. Inspection preserves the pending marker; recovery
+restores the exact committed application routes and raw LAN bindings, advances
+the operational revision, and preserves selected authority and immutable
+gateway history. The test uses protected storage and a fake physical adapter;
+it does not establish hostd process ordering or Docker acceptance. Log:
+`Rig/temp/m3-rebound-startup-route-admission.jsonl`.
