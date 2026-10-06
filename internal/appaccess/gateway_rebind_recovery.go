@@ -135,6 +135,15 @@ func readGatewayRebindRecoverySnapshot(ctx context.Context, tx *sql.Tx,
 			result.DatabaseCommitObserved); err != nil {
 			return GatewayRebindRecoverySnapshot{}, err
 		}
+		if result.Active.Claim.SpecVersion == GatewayRebindSpecVersionV2 {
+			liveRuntimeHeads, err := readGatewayRebindRuntimeHeads(ctx, tx)
+			if err != nil {
+				return GatewayRebindRecoverySnapshot{}, err
+			}
+			if !sameGatewayRebindRuntimeHeads(liveRuntimeHeads, result.Active.RuntimeHeads) {
+				return GatewayRebindRecoverySnapshot{}, ErrInvalidStoredState
+			}
+		}
 	}
 	return result, nil
 }
@@ -195,6 +204,11 @@ func readGatewayRebindHistory(ctx context.Context, tx *sql.Tx, operationID strin
 		if int64(len(value.RosterV1)) != claim.Spec.RosterCount {
 			return GatewayRebindHistoryEntry{}, ErrInvalidStoredState
 		}
+		var retainedRuntimeHeads int64
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lan_gateway_rebind_runtime_heads
+			WHERE operation_id=?`, operationID).Scan(&retainedRuntimeHeads); err != nil || retainedRuntimeHeads != 0 {
+			return GatewayRebindHistoryEntry{}, invalidRebindStoredState(err)
+		}
 		digest, err := GatewayRebindRosterDigest(value.RosterV1)
 		if err != nil || digest != claim.Spec.RosterDigest {
 			return GatewayRebindHistoryEntry{}, ErrInvalidStoredState
@@ -209,7 +223,12 @@ func readGatewayRebindHistory(ctx context.Context, tx *sql.Tx, operationID strin
 		if err != nil {
 			return GatewayRebindHistoryEntry{}, err
 		}
-		if err := validateStoredGatewayRebindClaimV2(claim, value.RosterV2); err != nil {
+		value.RuntimeHeads, err = readGatewayRebindRetainedRuntimeHeads(ctx, tx, operationID)
+		if err != nil {
+			return GatewayRebindHistoryEntry{}, err
+		}
+		if err := validateStoredGatewayRebindClaimV2(claim, value.RosterV2,
+			value.RuntimeHeads); err != nil {
 			return GatewayRebindHistoryEntry{}, err
 		}
 	default:
@@ -289,11 +308,11 @@ func readGatewayRebindClaimRetained(ctx context.Context, query rowQuerier,
 }
 
 func validateStoredGatewayRebindClaimV2(claim GatewayRebindClaimV2,
-	roster []GatewayRebindRosterEntryV2,
+	roster []GatewayRebindRosterEntryV2, runtimeHeads []GatewayRebindRuntimeHead,
 ) error {
 	proposal := GatewayRebindPreclaimProposalV2{
 		Spec: claim.Spec, RebindApproval: claim.RebindApproval,
-		ConfigureApproval: claim.ConfigureApproval, Roster: roster,
+		ConfigureApproval: claim.ConfigureApproval, Roster: roster, RuntimeHeads: runtimeHeads,
 	}
 	requestDigest, err := gatewayRebindClaimV2RequestDigest(claim.Spec,
 		claim.RebindApproval, claim.ConfigureApproval)

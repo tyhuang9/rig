@@ -292,7 +292,9 @@ func GatewayRebindSpecV2Digest(spec GatewayRebindSpecV2) (string, error) {
 		!validUUID(spec.SuccessorProfileOperationID) ||
 		spec.SuccessorProfileRevisionID == spec.Predecessor.Lineage.ProfileRevisionID ||
 		spec.SuccessorProfileOperationID == spec.OperationID ||
-		spec.RosterVersion != GatewayRebindRosterVersionV2 || !validDigest(spec.RosterDigest) || spec.RosterCount < 0 {
+		spec.RosterVersion != GatewayRebindRosterVersionV2 || !validDigest(spec.RosterDigest) || spec.RosterCount < 0 ||
+		spec.RuntimeHeadsVersion != GatewayRebindRuntimeHeadsVersionV1 ||
+		!validDigest(spec.RuntimeHeadsDigest) || spec.RuntimeHeadsCount < 0 {
 		return "", ErrInvalidInput
 	}
 	spec.SuccessorProfile = canonicalSuccessor
@@ -370,41 +372,71 @@ func GatewayRebindRosterV2Digest(entries []GatewayRebindRosterEntryV2) (string, 
 func GatewayRebindRuntimeHeadsV2Digest(operationID string,
 	heads []GatewayRebindRuntimeHead,
 ) (string, error) {
-	type canonicalHead struct {
-		Ordinal      int64  `json:"ordinal"`
-		AppID        string `json:"appId"`
-		DeploymentID string `json:"deploymentId"`
-		ReleaseID    string `json:"releaseId"`
-		Slot         string `json:"slot"`
-		Generation   int64  `json:"generation"`
-		UpdatedAt    string `json:"updatedAt"`
-	}
 	if !validUUID(operationID) {
 		return "", ErrInvalidInput
 	}
-	canonical := make([]canonicalHead, 0, len(heads))
+	canonical := make([]gatewayRebindCanonicalRuntimeHead, 0, len(heads))
 	previousAppID := ""
 	for index, head := range heads {
-		if !validUUID(head.AppID) || !validUUID(head.DeploymentID) || !validUUID(head.ReleaseID) ||
-			(head.Slot != "blue" && head.Slot != "green") || head.Generation <= 0 || head.UpdatedAt.IsZero() ||
+		value, err := canonicalGatewayRebindRuntimeHead(int64(index+1), head)
+		if err != nil ||
 			(index > 0 && previousAppID >= head.AppID) {
 			return "", ErrInvalidInput
 		}
-		canonical = append(canonical, canonicalHead{
-			Ordinal: int64(index + 1), AppID: head.AppID, DeploymentID: head.DeploymentID,
-			ReleaseID: head.ReleaseID, Slot: head.Slot, Generation: head.Generation,
-			UpdatedAt: head.UpdatedAt.UTC().Format(time.RFC3339Nano),
-		})
+		canonical = append(canonical, value)
 		previousAppID = head.AppID
 	}
 	return digestJSON(struct {
-		Version     int             `json:"version"`
-		Action      ApprovalAction  `json:"action"`
-		OperationID string          `json:"operationId"`
-		Heads       []canonicalHead `json:"heads"`
+		Version     int                                 `json:"version"`
+		Action      ApprovalAction                      `json:"action"`
+		OperationID string                              `json:"operationId"`
+		Heads       []gatewayRebindCanonicalRuntimeHead `json:"heads"`
 	}{
 		Version: GatewayRebindRuntimeHeadsVersionV1, Action: ActionRebindGateway,
 		OperationID: operationID, Heads: canonical,
+	})
+}
+
+type gatewayRebindCanonicalRuntimeHead struct {
+	Ordinal      int64  `json:"ordinal"`
+	AppID        string `json:"appId"`
+	DeploymentID string `json:"deploymentId"`
+	ReleaseID    string `json:"releaseId"`
+	Slot         string `json:"slot"`
+	Generation   int64  `json:"generation"`
+	UpdatedAt    string `json:"updatedAt"`
+}
+
+func canonicalGatewayRebindRuntimeHead(ordinal int64,
+	head GatewayRebindRuntimeHead,
+) (gatewayRebindCanonicalRuntimeHead, error) {
+	if ordinal <= 0 || !validUUID(head.AppID) || !validUUID(head.DeploymentID) ||
+		!validUUID(head.ReleaseID) || (head.Slot != "blue" && head.Slot != "green") ||
+		head.Generation <= 0 || head.UpdatedAt.IsZero() {
+		return gatewayRebindCanonicalRuntimeHead{}, ErrInvalidInput
+	}
+	return gatewayRebindCanonicalRuntimeHead{
+		Ordinal: ordinal, AppID: head.AppID, DeploymentID: head.DeploymentID,
+		ReleaseID: head.ReleaseID, Slot: head.Slot, Generation: head.Generation,
+		UpdatedAt: head.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	}, nil
+}
+
+func gatewayRebindRuntimeHeadV2Digest(operationID string, ordinal int64,
+	head GatewayRebindRuntimeHead,
+) (string, error) {
+	canonical, err := canonicalGatewayRebindRuntimeHead(ordinal, head)
+	if err != nil || !validUUID(operationID) {
+		return "", ErrInvalidInput
+	}
+	return digestJSON(struct {
+		Version     int                               `json:"version"`
+		Action      ApprovalAction                    `json:"action"`
+		OperationID string                            `json:"operationId"`
+		Head        gatewayRebindCanonicalRuntimeHead `json:"head"`
+	}{
+		Version: GatewayRebindRuntimeHeadsVersionV1, Action: ActionRebindGateway,
+		OperationID: operationID, Head: canonical,
 	})
 }
 
