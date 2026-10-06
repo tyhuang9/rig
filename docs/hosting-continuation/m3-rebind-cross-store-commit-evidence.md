@@ -747,6 +747,25 @@ and passed in 1.313s (named test 1.06s). Repository-wide
 VitePress build passed (3.72s). These are checkpoint checks, not the complete
 unit's final suite or a Docker result.
 
+The strengthened real-repository prepared-admission regression also passed
+bounded independent review. Both normal preparation and an injected return
+failure immediately after the real SQL claim commit recover through a fresh
+Manager, with the production effects/Manager/gateway locks held. Recovery
+preserves predecessor file identity and content, creates exactly one checkpoint,
+typed intent and first progress record, replays those exact records, and retains
+the SQL fence and original current authority. No Docker command is issued.
+The network inventory is simulated; the production network selector and
+observation canonicalizer are exercised. The return fault is not process-kill
+or physical Docker acceptance evidence.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayRebind(ProposalAndAdmission|PreparedAdmissionAndRecovery)UseRealRepository$'
+```
+
+Both named tests and both boundary subtests passed, with zero failures or skips
+(4.167s). Events: `$TEMP/m3-cross-store-real-prepare-green.jsonl`.
+Formatting and `git diff --check` passed.
+
 The prepared SQL boundary still has no Docker effects or protected commit
 receipt. Full physical coordination, terminal recovery, transfer-aware normal
 operations and startup dispatch remain required for delivery.
