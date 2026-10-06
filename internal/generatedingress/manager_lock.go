@@ -13,12 +13,24 @@ var managerAcquireGatewayOSLock = acquireGatewayOSLock
 // Only a fresh process may reacquire the OS resources and reattest current
 // state.
 var gatewayRebindProcessFailStop atomic.Bool
+var gatewayRebindProcessCommitBarrier atomic.Bool
 
 func (m *Manager) gatewayRebindFailStopLatch() *atomic.Bool {
 	if m != nil && m.gatewayRebindFailStop != nil {
 		return m.gatewayRebindFailStop
 	}
 	return &gatewayRebindProcessFailStop
+}
+
+func (m *Manager) gatewayRebindCommitBarrierLatch() *atomic.Bool {
+	if m != nil && m.gatewayRebindCommitBarrier != nil {
+		return m.gatewayRebindCommitBarrier
+	}
+	return &gatewayRebindProcessCommitBarrier
+}
+
+func (m *Manager) gatewayRebindAdmissionBlocked() bool {
+	return m.gatewayRebindFailStopLatch().Load() || m.gatewayRebindCommitBarrierLatch().Load()
 }
 
 // lockGateway serializes the entire observation or mutation across Manager
@@ -65,7 +77,7 @@ func (m *Manager) lockGatewayRawForInspection(ctx context.Context) (func() error
 }
 
 func (m *Manager) lockGatewayRawMode(ctx context.Context, allowFailStop bool) (func() error, error) {
-	if !allowFailStop && m.gatewayRebindFailStopLatch().Load() {
+	if !allowFailStop && m.gatewayRebindAdmissionBlocked() {
 		return nil, &Error{Code: DiagnosticRouteUnresolved}
 	}
 	if err := m.mu.LockContext(ctx); err != nil {
@@ -84,7 +96,7 @@ func (m *Manager) lockGatewayRawMode(ctx context.Context, allowFailStop bool) (f
 		m.mu.Unlock()
 		return nil, &Error{Code: DiagnosticCancelled}
 	}
-	if !allowFailStop && m.gatewayRebindFailStopLatch().Load() {
+	if !allowFailStop && m.gatewayRebindAdmissionBlocked() {
 		_ = releaseOS()
 		m.mu.Unlock()
 		return nil, &Error{Code: DiagnosticRouteUnresolved}

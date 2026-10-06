@@ -93,6 +93,10 @@ type Manager struct {
 	// gatewayRebindFailStop points at the process-wide latch in production.
 	// Tests may replace it with a private latch to avoid cross-test state.
 	gatewayRebindFailStop *atomic.Bool
+	// gatewayRebindCommitBarrier is process scoped in production. The final
+	// coordinator arms it before clearing the SQL fence and releases it only
+	// after every local lock and lease release succeeds.
+	gatewayRebindCommitBarrier *atomic.Bool
 	// gatewayRebindV2NetworkObserver is replaceable only by package tests.
 	// Production performs two complete host and Docker inventory reads.
 	gatewayRebindV2NetworkObserver func(context.Context, appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error)
@@ -204,7 +208,8 @@ func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager,
 	}
 	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv,
 		workingDirectoryIdentity: workingDirectoryIdentity, mu: newContextMutex(),
-		gatewayRebindFailStop: &gatewayRebindProcessFailStop}, nil
+		gatewayRebindFailStop:      &gatewayRebindProcessFailStop,
+		gatewayRebindCommitBarrier: &gatewayRebindProcessCommitBarrier}, nil
 }
 
 // Switch atomically reloads the aggregate Caddy route set, durably records the
