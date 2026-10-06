@@ -525,6 +525,9 @@ func (d managerGatewayCurrentPhysicalRuntime) read(ctx context.Context,
 	if err != nil {
 		return invalid(&value)
 	}
+	if !d.validIngressMembership(target, value.Ingress, value.Final) {
+		return invalid(&value)
+	}
 	value.ApplicationNetworks, err = d.applicationNetworkBindings(ctx, target.State, value.Final, true)
 	if err != nil || !d.validFinalNetworks(target, value.Final, value.FinalRuntime, value.IngressID,
 		value.ApplicationNetworks) {
@@ -1080,7 +1083,13 @@ func (d managerGatewayCurrentPhysicalRuntime) validFinalNetworks(target gatewayC
 func (d managerGatewayCurrentPhysicalRuntime) validIngressMembership(target gatewayCurrentPhysicalTarget,
 	network caddyNetworkInspection, container caddyInspection,
 ) bool {
-	if target.Identity.Rebind == nil || !container.Running || len(network.Containers) != 1 ||
+	if target.Identity.Rebind == nil {
+		return false
+	}
+	if !container.Running {
+		return len(network.Containers) == 0
+	}
+	if len(network.Containers) != 1 ||
 		!validGatewayApplicationNetworkMembership(network, container, target.Identity.Rebind.IngressNetwork) {
 		return false
 	}
