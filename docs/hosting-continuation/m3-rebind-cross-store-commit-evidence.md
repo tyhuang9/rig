@@ -1992,3 +1992,38 @@ The final additional suite passed five top-level tests and two subcases in
 an error after each actual protected clearance/head-advance write, checks exact
 installed evidence and owned-stop compensation, and preserves four native
 finalization paths. Vet, the full Go build, gofmt and `git diff --check` passed.
+
+## Reviewed Docker driver and recovery checks
+
+With explicit user authorization for these two local integrations, reviewed
+`273769b` (including `47272c9`) was merged at `9cdf800`, followed by reviewed
+`fab0fbd` at `ce56b9d`. No remote branch or PR was changed.
+
+The managed current driver now has concrete ordinary reconciliation and
+protected-only owned-stop implementations. Independent executor tests passed
+four top-level tests and five subcases in 146.155s. Review then reproduced an
+extra ingress network peer acceptance bug (14.053s); the corrected exact
+membership guard and owned-stop preservation passed three top-level tests
+and three subcases in 70.525s. Logs:
+`Rig/temp/cross-store-review-47272-current-physical-executor.jsonl`,
+`Rig/temp/cross-store-review-47272-ingress-peer.jsonl`, and
+`Rig/temp/cross-store-review-273769-ingress-green.jsonl`.
+
+The recovery follow-up reconfirms exact SQL, history, checkpoint and protected
+files after no-effect proof and before SQL rollback. Independent positive and
+snapshot-drift refusal tests passed two top-level tests in 32.742s, zero
+failures/skips (`Rig/temp/cross-store-review-fab0-noeffect-reconfirmation.jsonl`).
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayCurrentLANRecoveryFinalizesTwoDisablesInOrder|ManagedGatewayCurrentPhysicalRuntimeAttestationRequiresExactIngressMembership|RecoverGatewayRebindStartupRefusesFirstNoEffectAbortAfterSnapshotDrift)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Parent integration passed three top-level tests and three subcases in 67.259s,
+zero failures/skips (`Rig/temp/m3-current-batch-integrated-driver.jsonl`). Vet
+and the full Go build passed. Executor simulations are not actual Docker
+acceptance. The production factory remains closed pending the batch adapter,
+typed rebind recovery adapter, protected emergency startup path and guarded
+restart of stopped current state. Hosted Docker and Linux race gates remain
+unverified for this unit.
