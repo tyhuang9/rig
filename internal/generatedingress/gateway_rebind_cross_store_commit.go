@@ -428,12 +428,26 @@ func (m *Manager) abortGatewayRebindPreparedWithoutIntentLocked(ctx context.Cont
 	if checkpoint == nil || checkpoint.sourceRef() != claim.Spec.Predecessor {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
+	beforeFiles, err := readGatewayHistorySnapshotMode(m.store, true)
+	if err != nil {
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
 	proofValue, err := driver.proveNoSuccessorEffectsLocked(ctx, claim, snapshot.Active.RosterV2, *checkpoint)
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
 	}
-	receipt, err := newGatewayRebindNoEffectAbortTerminalV2(claim, snapshot.Active.RosterV2,
-		snapshot.Active.RuntimeHeads, *checkpoint,
+	freshSnapshot, snapshotErr := repository.GatewayRebindRecoverySnapshot(ctx)
+	freshHistory, historyErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	afterFiles, afterFilesErr := readGatewayHistorySnapshotMode(m.store, true)
+	freshCheckpoint, checkpointErr := gatewayRebindActiveCheckpoint(freshHistory, claim)
+	if snapshotErr != nil || !reflect.DeepEqual(snapshot, freshSnapshot) || historyErr != nil ||
+		!sameGatewayRebindCurrentHistory(history, freshHistory) || afterFilesErr != nil ||
+		!sameGatewayHistorySnapshot(beforeFiles, afterFiles) || checkpointErr != nil ||
+		!reflect.DeepEqual(*checkpoint, freshCheckpoint) || ctx.Err() != nil {
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	receipt, err := newGatewayRebindNoEffectAbortTerminalV2(claim, freshSnapshot.Active.RosterV2,
+		freshSnapshot.Active.RuntimeHeads, freshCheckpoint,
 		proofValue, gatewayRebindTimeStrictlyAfter(m.gatewayRebindProgressTime(), proofValue.CreatedAt))
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
@@ -442,10 +456,19 @@ func (m *Manager) abortGatewayRebindPreparedWithoutIntentLocked(ctx context.Cont
 	if err != nil || store.installExact(ctx, receipt) != nil {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
+	confirmedSnapshot, snapshotErr := repository.GatewayRebindRecoverySnapshot(ctx)
+	confirmedHistory, historyErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	confirmedReceipt, terminalErr := gatewayRebindActiveTerminalV2(confirmedHistory, claim)
+	confirmedCheckpoint, checkpointErr := gatewayRebindActiveCheckpoint(confirmedHistory, claim)
+	if snapshotErr != nil || !reflect.DeepEqual(freshSnapshot, confirmedSnapshot) || historyErr != nil ||
+		terminalErr != nil || confirmedReceipt == nil || !reflect.DeepEqual(receipt, *confirmedReceipt) ||
+		checkpointErr != nil || !reflect.DeepEqual(freshCheckpoint, confirmedCheckpoint) {
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
 	if !m.gatewayRebindCommitBarrierLatch().CompareAndSwap(false, true) {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
-	transition, err := gatewayRebindTransitionProofV2(snapshot, claim, receipt, appaccess.GatewayRebindRolledBack,
+	transition, err := gatewayRebindTransitionProofV2(confirmedSnapshot, claim, receipt, appaccess.GatewayRebindRolledBack,
 		gatewayCurrentRouteState{}, nil, "")
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
