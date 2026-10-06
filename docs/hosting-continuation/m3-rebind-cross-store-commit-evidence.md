@@ -2285,3 +2285,13 @@ the exported command-runner stop and corrupt native route-state withdrawal.
 Fixtures isolate intentional process latching so it cannot contaminate later
 tests. Vet, the full Go build, gofmt and `git diff --check` passed. Actual Docker
 and Linux race acceptance remain pending.
+
+Independent review accepted the combined controller/emergency scope at
+`325a63a`, including `c828fd5` and `eba4e29`. The three new lease, prelatched
+withdrawal and release-failure tests passed in 1.415s, zero failures/skips
+(`Rig/temp/cross-store-review-325-native-boundary.jsonl`), with frozen HEAD and
+clean status verified before/after. Source review confirmed effects admission
+before the withdrawal-only gateway lock, sticky fail-stop, foreign barrier
+preservation, no SQL serving authority and final protected ownership checks.
+This is a bounded emergency-path acceptance; the complete typed Docker adapter,
+serving driver activation and end-to-end hosted runtime gate remain incomplete.
