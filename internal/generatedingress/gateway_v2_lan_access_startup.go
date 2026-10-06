@@ -440,7 +440,7 @@ func gatewayV2LANRecoveryCandidatesAreLegacyPair(
 
 func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 	grants []GatewayV2LANStartupClaim, disables []GatewayV2LANDisableStartupClaim,
-) error {
+) (resultErr error) {
 	inspection, err := m.InspectGatewayV2LANAccessStartup(ctx, grants, disables)
 	if err != nil || inspection.Disposition == GatewayV2LANStartupNormal {
 		return err
@@ -480,7 +480,7 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	defer release()
+	defer releaseGatewayLock(release, &resultErr)
 	workCtx, cancelWork := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelWork()
 	store, state, journal, committed, err := m.committedV2Locked()
@@ -498,7 +498,7 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 	if err := m.confirmGatewayV2LANStartupAuthorityLocked(workCtx, authority, store, state, journal, claims.grants, claims.disables); err != nil {
 		return err
 	}
-	var driver gatewayV2LANGrantDriver = gatewayV2LANStartupMutationDriver{
+	var driver gatewayV2LANGrantDriver = &gatewayV2LANStartupMutationDriver{
 		gatewayV2LANGrantDriver: m.gatewayV2LANDisableDriver(), manager: m,
 		authority: authority, store: store, journal: journal, grants: claims.grants, disables: claims.disables,
 	}
@@ -537,6 +537,5 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 	if err != nil || !reflect.DeepEqual(retained, state) || !reflect.DeepEqual(retainedJournal, journal) {
 		return emergencyGatewayV2LANDisableStop(ctx, m, journal, driver)
 	}
-	_, err = m.confirmGatewayV2LANStartupMutationLocked(workCtx, authority, store, journal, claims.grants, claims.disables)
-	return err
+	return m.confirmGatewayV2LANStartupMutationResultLocked(workCtx, authority, store, state, journal, claims.grants, claims.disables)
 }

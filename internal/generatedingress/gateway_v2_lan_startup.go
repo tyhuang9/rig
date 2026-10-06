@@ -221,8 +221,9 @@ func (m *Manager) QuarantineGatewayV2LANStartup(ctx context.Context, claims []Ga
 	if driver == nil {
 		driver = managerGatewayV2LANGrantDriver{manager: m}
 	}
-	driver = gatewayV2LANStartupMutationDriver{gatewayV2LANGrantDriver: driver, manager: m,
+	mutationDriver := &gatewayV2LANStartupMutationDriver{gatewayV2LANGrantDriver: driver, manager: m,
 		authority: authority, store: store, journal: journal, grants: claimSet}
+	driver = mutationDriver
 	if driver.selectedInterfacePreflight(state.Profile) != nil {
 		return gatewayV2StartupInspectionError(recoveryCtx)
 	}
@@ -267,8 +268,7 @@ func (m *Manager) QuarantineGatewayV2LANStartup(ctx context.Context, claims []Ga
 		); err != nil {
 			return err
 		}
-		_, err = m.confirmGatewayV2LANStartupMutationLocked(recoveryCtx, authority, store, journal, claimSet, nil)
-		return err
+		return m.confirmGatewayV2LANStartupMutationResultLocked(recoveryCtx, authority, store, state, journal, claimSet, nil)
 	}
 	if len(unresolved) > 1 {
 		return gatewayV2StartupInspectionError(recoveryCtx)
@@ -282,8 +282,10 @@ func (m *Manager) QuarantineGatewayV2LANStartup(ctx context.Context, claims []Ga
 		); err != nil {
 			return err
 		}
-		_, err = m.confirmGatewayV2LANStartupMutationLocked(recoveryCtx, authority, store, journal, claimSet, nil)
-		return err
+		if mutationDriver.appliedPending == nil {
+			return gatewayV2StartupInspectionError(recoveryCtx)
+		}
+		return m.confirmGatewayV2LANStartupMutationResultLocked(recoveryCtx, authority, store, *mutationDriver.appliedPending, journal, claimSet, nil)
 	}
 	if !driver.proveCommitted(recoveryCtx, state, journal) ||
 		!driver.proveAllGranted(recoveryCtx, state, journal) ||

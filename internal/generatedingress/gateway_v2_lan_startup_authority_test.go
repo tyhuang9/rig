@@ -281,3 +281,78 @@ func TestGatewayV2LANStartupRetainedAuthorityCannotServeLiveGrant(t *testing.T) 
 		t.Fatalf("retained authority permitted serving: inspection=%+v err=%v", inspection, err)
 	}
 }
+
+func TestGatewayV2LANStartupQuarantineRejectsChangedMarkerAfterProof(t *testing.T) {
+	for _, kind := range []string{"grant", "disable"} {
+		t.Run(kind, func(t *testing.T) {
+			manager, store, journal, request, driver := grantedLANForDisable(t)
+			_, projection := installNativeStartupSQL(t, manager, journal.OperationID)
+			before, _, err := store.loadBoundUpgrade(journal.OperationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			grant := gatewayV2LANStartupClaim(request, appaccess.AppAccessGrantApplying, 2)
+			grant.CurrentBinding = &projection
+			disable := GatewayV2LANDisableStartupClaim{Request: disableRequestForGrant(t, request),
+				State: appaccess.AppAccessDisablePrepared, StateSequence: 1, CurrentBinding: &projection}
+			if kind == "disable" {
+				grant.State, grant.StateSequence = appaccess.AppAccessGrantCommitted, 4
+				grant.DisableIntentOperationID = disable.Request.OperationID
+			}
+			driver.events, driver.applyCalls = nil, 0
+			originalRead := upgradeProtectedRead
+			injected := false
+			upgradeProtectedRead = func(path, purpose string) ([]byte, error) {
+				body, readErr := originalRead(path, purpose)
+				if readErr == nil && !injected && path == store.v2Path && driver.applyCalls == 1 && containsString(driver.events, "prove_rolled_back") {
+					injected = true
+					// Return the core's exact pending readback while an external
+					// writer replaces it immediately afterward with valid old state.
+					gatewayV2LANRecoveryStartupOverwrite(t, store.v2Path, store.v2Purpose, before)
+				}
+				return body, readErr
+			}
+			t.Cleanup(func() { upgradeProtectedRead = originalRead })
+			if kind == "grant" {
+				err = manager.QuarantineGatewayV2LANStartup(context.Background(), []GatewayV2LANStartupClaim{grant})
+			} else {
+				err = manager.QuarantineGatewayV2LANAccessStartup(context.Background(), []GatewayV2LANStartupClaim{grant}, []GatewayV2LANDisableStartupClaim{disable})
+			}
+			if !injected || driver.applyCalls != 1 || err == nil {
+				t.Fatalf("changed post-proof marker accepted: injected=%v applyCalls=%d err=%v", injected, driver.applyCalls, err)
+			}
+		})
+	}
+}
+
+func TestGatewayV2LANDisableStartupQuarantineRejectsLockReleaseFailure(t *testing.T) {
+	manager, _, journal, request, driver := grantedLANForDisable(t)
+	_, projection := installNativeStartupSQL(t, manager, journal.OperationID)
+	grant := gatewayV2LANStartupClaim(request, appaccess.AppAccessGrantCommitted, 4)
+	grant.CurrentBinding = &projection
+	disable := GatewayV2LANDisableStartupClaim{Request: disableRequestForGrant(t, request),
+		State: appaccess.AppAccessDisablePrepared, StateSequence: 1, CurrentBinding: &projection}
+	grant.DisableIntentOperationID = disable.Request.OperationID
+	driver.events, driver.applyCalls = nil, 0
+	originalAcquire := managerAcquireGatewayOSLock
+	releases := 0
+	managerAcquireGatewayOSLock = func(ctx context.Context, store *stateStore) (func() error, error) {
+		release, err := originalAcquire(ctx, store)
+		if err != nil {
+			return nil, err
+		}
+		return func() error {
+			err := release()
+			releases++
+			if err == nil && releases == 2 {
+				return errors.New("injected mutation lock release failure")
+			}
+			return err
+		}, nil
+	}
+	t.Cleanup(func() { managerAcquireGatewayOSLock = originalAcquire })
+	err := manager.QuarantineGatewayV2LANAccessStartup(context.Background(), []GatewayV2LANStartupClaim{grant}, []GatewayV2LANDisableStartupClaim{disable})
+	if releases != 2 || driver.applyCalls != 1 || !IsCode(err, DiagnosticRouteUnresolved) {
+		t.Fatalf("mutation release failure accepted: releases=%d applies=%d err=%v", releases, driver.applyCalls, err)
+	}
+}

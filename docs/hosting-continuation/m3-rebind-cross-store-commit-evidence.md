@@ -963,3 +963,27 @@ non-elevated retry passed. No Git mutation was attempted by that failed check.
 
 These quarantine tests retain the same projected-SQL/fake-Docker limitation.
 They do not prove the pending typed-rebind or repeated-rebind runtime paths.
+
+Independent review of `3fc4e6b` required two corrections before acceptance:
+the final check must compare the exact pending state just proved, and the
+disable mutator must propagate gateway lock-release failure. Both findings
+were reproduced first: two top-level regressions failed in 2.733s at the
+reviewed revision (`$TEMP/m3-native-quarantine-review-red.jsonl`). The protected
+read seam deterministically returned the core's correct pending bytes while
+installing a different valid native state immediately afterward, without
+changing SQL, source or journal. Both grant and disable incorrectly succeeded.
+The second regression released the actual lock, then injected its release
+error; the disable mutation incorrectly returned success.
+
+The correction retains the exact apply-boundary marker for a new grant
+withdrawal and compares it again after the core proof. Existing pending and
+disable paths compare their already-known exact state. The disable method
+now uses the same named-result release guard as the grant method.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayV2(LANStartupQuarantine|LANDisableStartup|LANStartupRetainedAuthority)'
+```
+
+All 11 top-level tests passed in 14.002s with zero failure or skip
+(`$TEMP/m3-native-quarantine-review-green.jsonl`). Vet, full build and diff
+checks passed again. These changes preserve all prior failed-test evidence.

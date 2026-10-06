@@ -107,6 +107,17 @@ func (m *Manager) confirmGatewayV2LANStartupMutationLocked(ctx context.Context,
 	return state, nil
 }
 
+func (m *Manager) confirmGatewayV2LANStartupMutationResultLocked(ctx context.Context,
+	before gatewayV2LANStartupAuthority, store *gatewayUpgradeStateStore, expected gatewayV2RouteState,
+	journal gatewayMigrationJournal, grants gatewayV2LANStartupClaimSet, disables map[string]GatewayV2LANDisableStartupClaim,
+) error {
+	state, err := m.confirmGatewayV2LANStartupMutationLocked(ctx, before, store, journal, grants, disables)
+	if err != nil || !reflect.DeepEqual(state, expected) {
+		return gatewayV2StartupInspectionError(ctx)
+	}
+	return nil
+}
+
 // Recheck at the effect boundary, after the protected pending write and any
 // physical observation. Only the exact withdrawal derived from that retained
 // marker may be applied; failure preserves the marker for recovery.
@@ -118,9 +129,12 @@ type gatewayV2LANStartupMutationDriver struct {
 	journal   gatewayMigrationJournal
 	grants    gatewayV2LANStartupClaimSet
 	disables  map[string]GatewayV2LANDisableStartupClaim
+	// The exact durable marker read before the only apply, retained for the
+	// caller's final comparison after the core's physical proof/readback.
+	appliedPending *gatewayV2RouteState
 }
 
-func (d gatewayV2LANStartupMutationDriver) apply(ctx context.Context, proposed gatewayV2RouteState, name string) error {
+func (d *gatewayV2LANStartupMutationDriver) apply(ctx context.Context, proposed gatewayV2RouteState, name string) error {
 	state, err := d.manager.confirmGatewayV2LANStartupMutationLocked(ctx, d.authority, d.store, d.journal, d.grants, d.disables)
 	if err != nil || state.Pending == nil {
 		return gatewayV2StartupInspectionError(ctx)
@@ -151,5 +165,7 @@ func (d gatewayV2LANStartupMutationDriver) apply(ctx context.Context, proposed g
 	if err != nil || !reflect.DeepEqual(withdrawn, proposed) {
 		return gatewayV2StartupInspectionError(ctx)
 	}
+	pending := cloneGatewayV2RouteState(state)
+	d.appliedPending = &pending
 	return d.gatewayV2LANGrantDriver.apply(ctx, proposed, name)
 }
