@@ -1608,3 +1608,41 @@ tests and sixteen subcases in 111.591s, with no failures or skips
 ```powershell
 go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrentLANStartup(Quarantine|CensusBindsRawGrantAndRecovery|PublicReadRechecksAuthority)'
 ```
+
+Independent code/security review accepted frozen `ee88319`. Both new historical
+tests and all seven subcases passed independently in 56.353s with no failures
+or skips (`Rig/temp/cross-store-review-ee883-retained-history.jsonl`). This is
+provenance validation only; physical serving and historical clearance remain
+separate obligations.
+
+The copied-lock fixture correction `44f24397` was cherry-picked alone as
+`7f4828a`; its held emergency-stop ancestry was not imported. The corrected
+test constructs a new manager and mutex while retaining only the durable
+store and options. Its owner replay test passed one top-level test and two
+subcases in 38.420s. Integrated vet and full build now both pass:
+
+```powershell
+go vet -mod=readonly ./internal/generatedingress ./internal/appaccess ./internal/controller ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Focused compatibility checks after the shared batch/typed-format changes also
+passed, with no failures or skips:
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayCurrentLANRecovery(BatchTransitionsPreserveQueue|CensusBindsClearedHistoryAndOrderedHead)$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^Test(GatewayRebindAttemptViewPreservesLegacySourceWithoutChangingFormat|GatewayCurrentPreservesTerminalV1CanonicalShapeAndDigest|GatewayRebindProgressOptional.*PreservesSequence.*BytesAndDigests)$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 ./internal/appaccess -run '^TestGatewayRebindV1CanonicalDigestsRemainStable$'
+pnpm --dir docs check:workflow
+pnpm --dir docs build
+```
+
+The batch state/census run passed two top-level tests and one subcase in
+33.141s (`Rig/temp/m3-reviewed-batch-contract-preservation.jsonl`). Five
+protected-format tests passed in 20.601s
+(`Rig/temp/m3-typed-integration-v1-preservation.jsonl`), and the SQL v1 digest
+golden passed in 0.277s (`Rig/temp/m3-typed-integration-v1-sql-golden.jsonl`).
+Documentation workflow validation and its production build passed, the latter
+in 3.80s using the installed dependencies. Runnable batch withdrawal, exact
+emergency stop, early startup recovery and repeated/crash Docker acceptance
+remain unfinished. No local Docker or Windows race result is claimed.
