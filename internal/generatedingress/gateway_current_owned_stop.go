@@ -285,11 +285,8 @@ func (m *Manager) gatewayCurrentOwnedStopTargetsProtectedPartialLocked() (
 		// this is not serving authority or a native ownership proof.
 		return nil, gatewayCurrentOwnedStopHistoryCensus{}, nil
 	}
-	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	history, err := m.gatewayCurrentOwnedStopHistoryLocked()
 	if err != nil {
-		if m.proveGatewayCurrentNativeNoEffectAbortHistoryLocked(presence) == nil {
-			return nil, gatewayCurrentOwnedStopHistoryCensus{ProtectedRebindHistory: true}, nil
-		}
 		return nil, gatewayCurrentOwnedStopHistoryCensus{ProtectedRebindHistory: presence.present}, err
 	}
 	census, lineages := gatewayCurrentOwnedStopCensus(history, presence)
@@ -347,7 +344,7 @@ func cloneGatewayCurrentPhysicalTransition(value gatewayCurrentPhysicalTransitio
 func (m *Manager) gatewayCurrentOwnedStopTerminalLocked(
 	lineage appaccess.GatewayCurrentLineageRef,
 ) (gatewayRebindAttemptTerminalView, error) {
-	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	history, err := m.gatewayCurrentOwnedStopHistoryLocked()
 	if err != nil {
 		return gatewayRebindAttemptTerminalView{}, err
 	}

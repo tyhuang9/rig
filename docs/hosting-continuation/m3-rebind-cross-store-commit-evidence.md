@@ -2421,3 +2421,59 @@ source corruption (15.96s), and native-v2 corruption (16.46s). Evidence:
 verified exact HEAD and clean status before/after and reviewed all six boundary
 mutations plus late-history refusal. This is bounded acceptance of the recorded
 scope; the limitations above remain open, and default activation remains closed.
+
+## Immutable typed history for committed-current emergency withdrawal
+
+The next positive-first test reproduced the remaining committed-current refusal
+with corrupt source and native-v2 routes (one test/two subcases, 46.307s;
+`Rig/temp/m3-typed-emergency-native-corruption-red.jsonl`). The new withdrawal-only
+history reader replaces the narrower no-effect-abort fallback. It validates prior
+native aborts/retirements with their existing historical validators, binds the
+committed native journal to an exact frozen checkpoint, and walks every contiguous
+typed checkpoint, intent, progress record and terminal with the existing format,
+lineage, resource and predecessor-port validators. Duplicate operations, gaps,
+foreign formats, missing terminal evidence and crossed bindings remain errors.
+An active tail is retained as unresolved, never reported as all traffic absent.
+Complete history and safe-file presence snapshots must remain unchanged.
+
+Only owned-stop enumeration and its terminal revalidation use this reader. It
+returns no source-route bytes and cannot supply serving authority. Both initial
+target construction and before/after effect guards now use the same immutable
+terminal selection. Normal startup selection and its SQL checks remain strict.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayCurrentTypedEmergencyWithdrawsWithCorruptNativeRoute$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrentTypedEmergency(ValidatesPriorNativeGenerations|RetainsRepeatedCommitOwnership)$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrent(NativeAbortEmergencyRequiresCompleteBoundHistory|StartupEmergencyStop)'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The initial injected-driver integration passed two tests/four subcases in 80.390s
+(`Rig/temp/m3-typed-emergency-native-corruption-green.jsonl`). The strengthened
+test composes real SQLite/protected typed commit with the concrete managed stop
+adapter and command-runner simulation: both native corruption cases passed in
+48.752s, including lost stop acknowledgment, exact container ID, unchanged current
+state/history and sticky admission latch
+(`Rig/temp/m3-typed-emergency-concrete-stop.jsonl`). No SQL reader is available to
+the withdrawal path. Actual Docker remains unverified.
+
+Prior native retired/aborted generations, missing predecessor receipts, two real
+SQL/protected typed commits, distinct retained ownership and a structurally valid
+terminal with a crossed claim digest passed two tests/two subcases in 41.408s
+(`Rig/temp/m3-typed-emergency-retained-generations.jsonl`). Vet and full Go build
+passed. The preserved native-abort negative tests continue to cover missing
+checkpoints/terminals, valid changed native journal/checkpoint, extra incomplete
+native generation, orphan current bundle and late history drift.
+
+Existing emergency/API preservation passed nine tests/six subcases in 130.203s,
+zero failures/skips (`Rig/temp/m3-typed-emergency-owned-stop-preservation.jsonl`).
+Gofmt and `git diff --check` passed. Independent source review found no serving
+callsite or weakened normal selector; frozen executable review remains pending.
+
+This supersedes the earlier generation-zero-only and committed-typed/native-route
+corruption limitations. Mixed legacy rebind history under native corruption still
+refuses withdrawal, and corrupt current-route bundles still require a distinct
+terminal-only stop capability. No state is reconstructed from a hash. The active
+database-committed restart consumer, full typed runtime adapter, default activation
+and hosted gates remain incomplete.
