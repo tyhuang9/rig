@@ -124,12 +124,13 @@ func TestGatewayCurrentLANRecoveryPhysicalActionBindsOrderedHeadAndProjections(t
 		}
 	}
 	changed := action
-	changed.Head.AppID = "56565656-5656-4565-8565-565656565656"
+	changed.Head.AppID = "78787878-7878-4787-8787-787878787878"
 	changed.Digest, _ = gatewayCurrentLANRecoveryPhysicalActionDigest(changed)
 	if validGatewayCurrentLANRecoveryPhysicalAction(changed) {
 		t.Fatal("batch physical action accepted a changed ordered head")
 	}
 	changed = action
+	changed.Withdrawn = cloneGatewayCurrentRouteState(action.Withdrawn)
 	changed.Withdrawn.Apps[action.Head.AppID] = action.Before.Apps[action.Head.AppID]
 	changed.Withdrawn.Digest, _ = gatewayCurrentRouteStateDigest(changed.Withdrawn)
 	changed.Digest, _ = gatewayCurrentLANRecoveryPhysicalActionDigest(changed)
@@ -240,5 +241,89 @@ func TestGatewayCurrentLANRecoveryPhysicalActionTreatsUnpublishedGrantAsAbsent(t
 	present := gatewayCurrentLANRecoveryPhysicalResultFixture(t, action, false)
 	if validGatewayCurrentLANRecoveryPhysicalResult(action, present) {
 		t.Fatal("unpublished grant was reported as physically present")
+	}
+}
+
+func TestGatewayCurrentLANRecoveryPhysicalActionRejectsMissingUnpublishedGrantApp(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	state := cloneGatewayCurrentRouteState(fixture.baseline)
+	var appID string
+	for candidate, app := range state.Apps {
+		if app.LAN != nil {
+			appID = candidate
+			app.LAN = nil
+			state.Apps[candidate] = app
+			break
+		}
+	}
+	if appID == "" {
+		t.Fatal("current fixture has no LAN grant")
+	}
+	request := routeOperationNativeGrantRequest(t, state, appID)
+	raw, err := gatewayV2LANBindingForRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(state.Apps, appID)
+	state.Revision++
+	state.LANRecovery = &gatewayCurrentLANRecoveryBatch{Items: []gatewayCurrentLANRecoveryItem{{
+		Kind: gatewayV2PendingLANGrant, AppID: appID, Grant: &gatewayCurrentLANBinding{Raw: raw},
+	}}}
+	state.Digest, _ = gatewayCurrentRouteStateDigest(state)
+	if validGatewayCurrentRouteState(state) {
+		t.Fatal("batch accepted a prepared grant without an application route")
+	}
+	terminal, terminalErr := newGatewayRebindAttemptTerminalViewLegacy(fixture.receipt)
+	if terminalErr != nil {
+		t.Fatal(terminalErr)
+	}
+	selection := gatewayCurrentSelection{Kind: gatewayCurrentSelectionRebind, Lineage: state.Lineage,
+		Receipt: &fixture.receipt, Terminal: &terminal, State: &state}
+	if _, err := fixture.manager.gatewayCurrentLANRecoveryPhysicalActionForSelectionLocked(selection); err == nil {
+		t.Fatal("physical action accepted a prepared grant without an application route")
+	}
+}
+
+func TestGatewayCurrentLANRecoveryPhysicalActionAttestsCompletedQueueWithoutHeadAuthority(t *testing.T) {
+	fixture, selection := gatewayCurrentLANRecoveryPhysicalSelectionFixture(t)
+	state := cloneGatewayCurrentRouteState(*selection.State)
+	for _, item := range state.LANRecovery.Items {
+		app := state.Apps[item.AppID]
+		app.LAN = nil
+		state.Apps[item.AppID] = app
+	}
+	state.LANRecovery.Head = len(state.LANRecovery.Items)
+	state.Digest, _ = gatewayCurrentRouteStateDigest(state)
+	if !validGatewayCurrentRouteState(state) {
+		t.Fatal("completed queue state is invalid")
+	}
+	selection.State = &state
+	action, err := fixture.manager.gatewayCurrentLANRecoveryPhysicalActionForSelectionLocked(selection)
+	if err != nil || !action.Complete || !reflect.DeepEqual(action.Head, gatewayCurrentLANRecoveryItem{}) ||
+		!reflect.DeepEqual(action.Cleared, action.Selected) {
+		t.Fatalf("completed queue action=%#v error=%v", action, err)
+	}
+	result := gatewayCurrentLANRecoveryPhysicalResultFixture(t, action, true)
+	if !validGatewayCurrentLANRecoveryPhysicalResult(action, result) {
+		t.Fatal("completed queue final absence proof was rejected")
+	}
+	driver := &gatewayCurrentLANRecoveryPhysicalDriverFake{
+		gatewayCurrentPhysicalDriverFake: &gatewayCurrentPhysicalDriverFake{},
+		attestResult:                     result,
+		withdrawResult:                   result,
+	}
+	fixture.manager.gatewayCurrentPhysicalDriver = driver
+	observed, err := fixture.manager.attestGatewayCurrentLANRecoveryBatchLocked(context.Background(), selection)
+	if err != nil || !observed.BatchAbsent || !reflect.DeepEqual(driver.attestAction, action) {
+		t.Fatalf("completed queue final attestation=%#v error=%v", observed, err)
+	}
+	if _, err := fixture.manager.withdrawGatewayCurrentLANRecoveryBatchLocked(context.Background(), selection); err == nil {
+		t.Fatal("completed queue action authorized a second physical withdrawal")
+	}
+	changed := action
+	changed.Complete = false
+	changed.Digest, _ = gatewayCurrentLANRecoveryPhysicalActionDigest(changed)
+	if validGatewayCurrentLANRecoveryPhysicalAction(changed) {
+		t.Fatal("completed queue action accepted synthetic head authority")
 	}
 }

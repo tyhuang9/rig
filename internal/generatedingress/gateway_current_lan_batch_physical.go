@@ -23,6 +23,7 @@ const (
 type gatewayCurrentLANRecoveryPhysicalAction struct {
 	Version   int
 	Purpose   string
+	Complete  bool
 	Lineage   appaccess.GatewayCurrentLineageRef
 	Terminal  gatewayRebindAttemptTerminalView
 	Selected  gatewayCurrentRouteState
@@ -61,23 +62,30 @@ func (m *Manager) gatewayCurrentLANRecoveryPhysicalActionForSelectionLocked(
 		!gatewayRebindAttemptTerminalMatchesLineage(terminal, selection.Lineage) ||
 		selection.State.LANRecovery == nil || selection.State.Pending != nil ||
 		selection.State.LANRecovery.Head < 0 ||
-		selection.State.LANRecovery.Head >= len(selection.State.LANRecovery.Items) {
+		selection.State.LANRecovery.Head > len(selection.State.LANRecovery.Items) {
 		return gatewayCurrentLANRecoveryPhysicalAction{}, invalid
 	}
 	selected := cloneGatewayCurrentRouteState(*selection.State)
-	cleared, err := gatewayCurrentLANRecoveryClearedHeadState(selected)
-	if err != nil {
-		return gatewayCurrentLANRecoveryPhysicalAction{}, invalid
+	complete := selected.LANRecovery.Head == len(selected.LANRecovery.Items)
+	cleared := cloneGatewayCurrentRouteState(selected)
+	var head gatewayCurrentLANRecoveryItem
+	if !complete {
+		head = cloneGatewayCurrentLANRecoveryItem(selected.LANRecovery.Items[selected.LANRecovery.Head])
+		cleared, err = gatewayCurrentLANRecoveryClearedHeadState(selected)
+		if err != nil {
+			return gatewayCurrentLANRecoveryPhysicalAction{}, invalid
+		}
 	}
 	projection, err := gatewayCurrentPhysicalOutcomeProjectionForSelection(selected)
 	if err != nil || projection.Effective != nil || projection.Withdrawn == nil {
 		return gatewayCurrentLANRecoveryPhysicalAction{}, invalid
 	}
 	action := gatewayCurrentLANRecoveryPhysicalAction{
-		Version: gatewayCurrentLANRecoveryPhysicalActionVersion,
-		Purpose: gatewayCurrentLANRecoveryPhysicalActionPurpose,
-		Lineage: selection.Lineage, Terminal: terminal, Selected: selected,
-		Head:   cloneGatewayCurrentLANRecoveryItem(selected.LANRecovery.Items[selected.LANRecovery.Head]),
+		Version:  gatewayCurrentLANRecoveryPhysicalActionVersion,
+		Purpose:  gatewayCurrentLANRecoveryPhysicalActionPurpose,
+		Complete: complete,
+		Lineage:  selection.Lineage, Terminal: terminal, Selected: selected,
+		Head:   head,
 		Before: projection.Before, Withdrawn: *projection.Withdrawn, Cleared: cleared,
 	}
 	action.Digest, err = gatewayCurrentLANRecoveryPhysicalActionDigest(action)
@@ -113,7 +121,7 @@ func (m *Manager) withdrawGatewayCurrentLANRecoveryBatchLocked(ctx context.Conte
 	}
 	action, err := m.gatewayCurrentLANRecoveryPhysicalActionForSelectionLocked(selection)
 	driver, ok := m.currentPhysicalDriver().(gatewayCurrentLANRecoveryPhysicalDriver)
-	if err != nil || !ok {
+	if err != nil || action.Complete || !ok {
 		return gatewayCurrentLANRecoveryPhysicalResult{}, &Error{Code: DiagnosticRouteUnresolved}
 	}
 	result, err := driver.withdrawGatewayCurrentLANRecoveryBatch(ctx, action)
@@ -135,14 +143,24 @@ func validGatewayCurrentLANRecoveryPhysicalAction(value gatewayCurrentLANRecover
 		value.Selected.LANRecovery == nil || value.Selected.Lineage != value.Lineage ||
 		!gatewayRebindAttemptTerminalMatchesLineage(value.Terminal, value.Lineage) ||
 		value.Selected.LANRecovery.Head < 0 ||
-		value.Selected.LANRecovery.Head >= len(value.Selected.LANRecovery.Items) ||
-		!reflect.DeepEqual(value.Head,
-			value.Selected.LANRecovery.Items[value.Selected.LANRecovery.Head]) {
+		value.Selected.LANRecovery.Head > len(value.Selected.LANRecovery.Items) ||
+		value.Complete != (value.Selected.LANRecovery.Head == len(value.Selected.LANRecovery.Items)) {
 		return false
 	}
-	cleared, err := gatewayCurrentLANRecoveryClearedHeadState(value.Selected)
-	if err != nil || !reflect.DeepEqual(cleared, value.Cleared) {
-		return false
+	if value.Complete {
+		if !reflect.DeepEqual(value.Head, gatewayCurrentLANRecoveryItem{}) ||
+			!reflect.DeepEqual(value.Cleared, value.Selected) {
+			return false
+		}
+	} else {
+		if !reflect.DeepEqual(value.Head,
+			value.Selected.LANRecovery.Items[value.Selected.LANRecovery.Head]) {
+			return false
+		}
+		cleared, err := gatewayCurrentLANRecoveryClearedHeadState(value.Selected)
+		if err != nil || !reflect.DeepEqual(cleared, value.Cleared) {
+			return false
+		}
 	}
 	projection, err := gatewayCurrentPhysicalOutcomeProjectionForSelection(value.Selected)
 	if err != nil || projection.Effective != nil || projection.Withdrawn == nil ||
