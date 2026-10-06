@@ -987,3 +987,10 @@ go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingres
 All 11 top-level tests passed in 14.002s with zero failure or skip
 (`$TEMP/m3-native-quarantine-review-green.jsonl`). Vet, full build and diff
 checks passed again. These changes preserve all prior failed-test evidence.
+
+Independent review accepted the combined `3fc4e6b` and
+`7d3935ef7a1fca788ba5c54b42ee56d0d14232d6` checkpoint. Its separate frozen run
+passed all three boundary/regression tests in 9.777s, with zero failure or
+skip (`Rig/temp/cross-store-review-7d-quarantine-green.jsonl`). This acceptance
+covers native startup/quarantine only; production rebound physical attestation,
+the coordinator and full runtime delivery acceptance remain pending.
