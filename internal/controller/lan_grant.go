@@ -494,26 +494,32 @@ func (s *Server) reconcileLANGrant(ctx context.Context, claim appaccess.AppAcces
 func lanGrantRecoveryAuthorityMatches(authorized appaccess.AppAccessGrantAuthorization,
 	observed generatedingress.GatewayV2LANGrantObservation,
 ) bool {
+	resolution := appaccess.GatewayBindingResolution{
+		RawAllocation: authorized.Allocation, RawAccessRevision: authorized.Revision,
+		RawGrant: authorized.Claim, RawProfile: authorized.Profile, EffectiveProfile: authorized.EffectiveProfile,
+		CurrentGatewaySource: authorized.CurrentGatewaySource, TransferChain: authorized.TransferChain,
+		TransferChainTipDigest: authorized.TransferChainTipDigest, TerminalReceiptDigest: authorized.TerminalReceiptDigest,
+	}
 	if authorized.CurrentGatewaySource.Kind == appaccess.GatewayRebindSourceGatewayRebind {
 		return observed.GatewayOperationID == authorized.CurrentGatewaySource.OperationID &&
-			observed.EffectiveBinding.MatchesResolution(appaccess.GatewayBindingResolution{
-				RawAllocation: authorized.Allocation, RawAccessRevision: authorized.Revision,
-				RawGrant: authorized.Claim, RawProfile: authorized.Profile, EffectiveProfile: authorized.EffectiveProfile,
-				CurrentGatewaySource: authorized.CurrentGatewaySource, TransferChain: authorized.TransferChain,
-				TransferChainTipDigest: authorized.TransferChainTipDigest, TerminalReceiptDigest: authorized.TerminalReceiptDigest,
-			})
+			observed.EffectiveBinding.MatchesResolution(resolution)
 	}
 	// Native recovery predates effective-proof observations. It can only restore
 	// the unchanged raw profile under the original operation, with no transfers.
-	return (authorized.CurrentGatewaySource.Kind == "" ||
-		authorized.CurrentGatewaySource.Kind == appaccess.GatewayRebindSourceGatewayUpgrade) &&
+	return authorized.CurrentGatewaySource.Kind == appaccess.GatewayRebindSourceGatewayUpgrade &&
 		authorized.Claim.Proof != nil && observed.GatewayOperationID == authorized.Claim.Proof.GatewayOperationID &&
-		(authorized.CurrentGatewaySource.Kind == "" || observed.GatewayOperationID == authorized.CurrentGatewaySource.OperationID) &&
+		observed.GatewayOperationID == authorized.CurrentGatewaySource.OperationID &&
+		authorized.CurrentGatewaySource.ProfileRevisionID == authorized.Profile.ID &&
+		authorized.CurrentGatewaySource.ProfileRevisionNumber == authorized.Profile.RevisionNumber &&
+		authorized.CurrentGatewaySource.ProfileSpecDigest == authorized.Profile.SpecDigest &&
+		authorized.CurrentGatewaySource.TerminalReceiptDigest == "" &&
 		len(authorized.TransferChain) == 0 && authorized.TransferChainTipDigest == "" && authorized.TerminalReceiptDigest == "" &&
 		authorized.EffectiveProfile.ID == authorized.Profile.ID &&
 		authorized.EffectiveProfile.RevisionNumber == authorized.Profile.RevisionNumber &&
 		authorized.EffectiveProfile.SpecDigest == authorized.Profile.SpecDigest &&
-		authorized.EffectiveProfile.Spec == authorized.Profile.Spec
+		authorized.EffectiveProfile.Spec == authorized.Profile.Spec &&
+		(observed.EffectiveBinding == (generatedingress.GatewayV2LANEffectiveBindingProof{}) ||
+			observed.EffectiveBinding.MatchesResolution(resolution))
 }
 
 type lanGrantAuthorizationLease struct {

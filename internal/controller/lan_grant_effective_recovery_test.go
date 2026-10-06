@@ -49,11 +49,36 @@ func (s effectiveRecoveryAuthorization) AuthorizeAppAccessGrant(ctx context.Cont
 // The raw claim and authorization checks use SQLite. Successor DTOs model the
 // controller boundary; these tests do not establish SQL transfer or Docker proof.
 func TestLANGrantCommittedRecoveryUsesEffectiveAuthority(t *testing.T) {
-	for _, name := range []string{"two transfers", "native replay", "missing proof", "wrong source", "wrong observed operation", "wrong tip", "wrong receipt", "broken chain", "changed authorized claim", "raw operation substitution", "demoted approver"} {
+	for _, name := range []string{"two transfers", "native replay", "native full proof", "native wrong proof", "missing native authority", "missing proof", "wrong source", "wrong observed operation", "wrong tip", "wrong receipt", "broken chain", "changed authorized claim", "raw operation substitution", "demoted approver"} {
 		t.Run(name, func(t *testing.T) {
 			f := newLANAccessFixture(t)
+			originalOperation := uuid.NewString()
+			if strings.HasPrefix(name, "native ") {
+				spec := appaccess.GatewayProfileUpgradeSpec{ProfileRevisionID: f.profile.ID,
+					ProfileRevisionNumber: f.profile.RevisionNumber, ProfileSpecDigest: f.profile.SpecDigest}
+				digest, err := appaccess.GatewayProfileUpgradeSpecDigest(spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, _, err = f.repository.ClaimGatewayProfileUpgrade(context.Background(), appaccess.ClaimGatewayProfileUpgradeInput{
+					OperationID: originalOperation, Spec: spec,
+					Approval: appaccess.Approval{Action: appaccess.ActionUpgradeGateway, SpecDigest: digest, ActorID: f.actorID}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				owner := appaccess.GatewayProfileUpgradeClaimOwner{OperationID: originalOperation,
+					ProfileRevisionID: f.profile.ID, ProfileRevisionNumber: f.profile.RevisionNumber}
+				for _, step := range [][2]appaccess.GatewayProfileUpgradeState{
+					{appaccess.GatewayProfileUpgradePrepared, appaccess.GatewayProfileUpgradeServing},
+					{appaccess.GatewayProfileUpgradeServing, appaccess.GatewayProfileUpgradeCommitted},
+				} {
+					if _, _, err := f.repository.AdvanceGatewayProfileUpgradeClaim(context.Background(), owner, step[0], step[1]); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
 			revision := f.approveForGrant(t)
-			runtime := &effectiveRecoveryRuntime{lanGrantRuntimeFake: &lanGrantRuntimeFake{commit: true, operationID: uuid.NewString()}}
+			runtime := &effectiveRecoveryRuntime{lanGrantRuntimeFake: &lanGrantRuntimeFake{commit: true, operationID: originalOperation}}
 			attempt := uuid.NewString()
 			path := "/api/v1/apps/" + f.appID + "/lan-access/grants"
 			created := relayAuthenticatedRequest(f.grantHandler(runtime.lanGrantRuntimeFake, false, ""), http.MethodPost, path, grantBody(revision, attempt))
@@ -118,9 +143,22 @@ func TestLANGrantCommittedRecoveryUsesEffectiveAuthority(t *testing.T) {
 					}
 				}}
 			switch name {
-			case "native replay":
+			case "native replay", "missing native authority", "native full proof", "native wrong proof":
 				service = f.repository
 				runtime.operationID, runtime.proof = before.Proof.GatewayOperationID, generatedingress.GatewayV2LANEffectiveBindingProof{}
+				if name == "native full proof" || name == "native wrong proof" {
+					runtime.proof = generatedingress.GatewayV2LANEffectiveBindingProof{
+						EffectiveProfile: generatedingress.GatewayV2ProfileBinding{RevisionID: f.profile.ID, RevisionNumber: f.profile.RevisionNumber,
+							SpecDigest: f.profile.SpecDigest, SelectedIPv4: f.profile.Spec.SelectedIPv4, InterfaceID: f.profile.Spec.InterfaceID,
+							PortStart: f.profile.Spec.PortStart, PortEnd: f.profile.Spec.PortEnd},
+						ProtectedLineage: appaccess.GatewayCurrentLineageRef{Kind: appaccess.GatewayRebindSourceGatewayUpgrade,
+							OperationID: originalOperation, ProfileRevisionID: f.profile.ID, ProfileRevisionNumber: f.profile.RevisionNumber,
+							ProfileSpecDigest: f.profile.SpecDigest, ProtectedIdentityDigest: strings.Repeat("c", 64),
+							ProtectedJournalDigest: strings.Repeat("d", 64)}}
+					if name == "native wrong proof" {
+						runtime.proof.EffectiveProfile.SelectedIPv4 = "192.168.50.99"
+					}
+				}
 			case "missing proof":
 				runtime.proof = generatedingress.GatewayV2LANEffectiveBindingProof{}
 			case "wrong source":
@@ -145,7 +183,7 @@ func TestLANGrantCommittedRecoveryUsesEffectiveAuthority(t *testing.T) {
 				GeneratedRuntime: true, Logger: relayTestLogger(), RecoveryOnly: true, RecoveryKind: RecoveryLANGrant,
 				RecoveryOperationID: attempt, RecoveryAppID: f.appID}
 			response := relayAuthenticatedRequest(server.Handler(), http.MethodPost, path, grantBody(revision, attempt))
-			wantOK := name == "two transfers" || name == "native replay"
+			wantOK := name == "two transfers" || name == "native replay" || name == "native full proof"
 			if gotOK := response.Code == http.StatusOK; gotOK != wantOK || runtime.quarantined == wantOK {
 				t.Fatalf("recovery: status=%d quarantined=%t body=%s", response.Code, runtime.quarantined, response.Body.String())
 			}

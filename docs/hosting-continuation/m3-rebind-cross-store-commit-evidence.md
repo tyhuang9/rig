@@ -1341,3 +1341,13 @@ exact owned gateway stopped) with committed history retained and normal
 startup refused. A future explicit approved-disable continuation requires a
 separate recovery-specific authorization contract; automatic rollback of a
 committed grant is not permitted.
+
+Review tightened the native compatibility path after `48af0f0`: native SQL
+authority must explicitly select the exact upgrade operation/profile, and any
+nonzero physical proof must match the complete resolution. An empty SQL source
+is refused. Native positive tests now create a real committed upgrade first;
+missing authority and malformed nonzero proof are separate refusal cases.
+The focused recovery/replay/terminal-failure run passed five top-level tests
+and fourteen subcases in 8.685s with no failures or skips
+(`Rig/temp/m3-controller-effective-recovery-strict.jsonl`). This supersedes
+the initial native fallback in `48af0f0`.
