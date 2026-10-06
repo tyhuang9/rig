@@ -213,10 +213,16 @@ func (m *Manager) QuarantineGatewayV2LANStartup(ctx context.Context, claims []Ga
 	if err != nil || !committed || store == nil || !validGatewayV2RouteState(state) {
 		return gatewayV2StartupInspectionError(recoveryCtx)
 	}
+	authority, err := m.readGatewayV2LANStartupAuthorityLocked(recoveryCtx, store, state, journal, claimSet, nil)
+	if err != nil {
+		return err
+	}
 	driver := m.gatewayV2LANGrantDriver
 	if driver == nil {
 		driver = managerGatewayV2LANGrantDriver{manager: m}
 	}
+	driver = gatewayV2LANStartupMutationDriver{gatewayV2LANGrantDriver: driver, manager: m,
+		authority: authority, store: store, journal: journal, grants: claimSet}
 	if driver.selectedInterfacePreflight(state.Profile) != nil {
 		return gatewayV2StartupInspectionError(recoveryCtx)
 	}
@@ -253,27 +259,38 @@ func (m *Manager) QuarantineGatewayV2LANStartup(ctx context.Context, claims []Ga
 				return gatewayV2StartupInspectionError(recoveryCtx)
 			}
 		}
+		if err := m.confirmGatewayV2LANStartupAuthorityLocked(recoveryCtx, authority, store, state, journal, claimSet, nil); err != nil {
+			return err
+		}
 		if _, _, err := withdrawGatewayV2LANPendingLocked(
 			recoveryCtx, store, state, journal, request, driver,
 		); err != nil {
 			return err
 		}
-		return nil
+		_, err = m.confirmGatewayV2LANStartupMutationLocked(recoveryCtx, authority, store, journal, claimSet, nil)
+		return err
 	}
 	if len(unresolved) > 1 {
 		return gatewayV2StartupInspectionError(recoveryCtx)
 	}
 	if len(unresolved) == 1 {
-		return quarantineGatewayV2LANCommittedLocked(
+		if err := m.confirmGatewayV2LANStartupAuthorityLocked(recoveryCtx, authority, store, state, journal, claimSet, nil); err != nil {
+			return err
+		}
+		if err := quarantineGatewayV2LANCommittedLocked(
 			recoveryCtx, store, state, journal, unresolved[0], driver,
-		)
+		); err != nil {
+			return err
+		}
+		_, err = m.confirmGatewayV2LANStartupMutationLocked(recoveryCtx, authority, store, journal, claimSet, nil)
+		return err
 	}
 	if !driver.proveCommitted(recoveryCtx, state, journal) ||
 		!driver.proveAllGranted(recoveryCtx, state, journal) ||
 		driver.selectedInterfacePreflight(state.Profile) != nil {
 		return gatewayV2StartupInspectionError(recoveryCtx)
 	}
-	return nil
+	return m.confirmGatewayV2LANStartupAuthorityLocked(recoveryCtx, authority, store, state, journal, claimSet, nil)
 }
 
 // StopOwnedGatewayV2OnStartupFailure is the last-resort fail-closed path for a

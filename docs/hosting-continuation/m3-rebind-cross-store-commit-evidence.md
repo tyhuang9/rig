@@ -927,6 +927,39 @@ Its failed log is `$TEMP/m3-native-lan-authority-first.jsonl`.
 
 The tests use real protected storage and locks, projected SQL reader responses
 and bounded fake physical drivers. They cover SQL-selected native Pending and
-LANRecovery startup, but are not Docker acceptance. Quarantine mutation guards,
-rebound physical consumers, process recovery before ordinary admission and
-the complete cross-store coordinator acceptance remain outstanding.
+LANRecovery startup, but are not Docker acceptance. Independent review accepted
+this checkpoint at `6b9bbce` with no blocker. Rebound physical consumers, process
+recovery before ordinary admission and the complete cross-store coordinator
+acceptance remain outstanding.
+
+Native startup quarantine now revalidates authority before its protected
+mutation and at the physical apply boundary. At that boundary a fresh protected
+pending marker must derive the exact requested withdrawal; SQL authority,
+native journal and original route source must remain unchanged. The existing
+driver only receives that validated withdrawal. A final re-read is required
+before success, including paths that need no apply. Uncertainty preserves the
+pending record; no terminal receipt or SQL history is rewritten.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayV2(LANStartupQuarantine|LANDisableStartup)'
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayV2LANStartup(QuarantineRechecksSQLAtEffectBoundary|RetainedAuthorityCannotServeLiveGrant)$'
+go test -mod=readonly -p=1 -json -count=1 -timeout=4m ./cmd/hostd -run '^Test(GatewayStartupRebindFence|RuntimeCompositionRebindFence|GeneratedComposition|PrepareRuntimeWorker|DeploymentEffectsAdmission|LANStartupMapping|MigratedLegacyPairRecoveryComposition|LANGrantStartup|LANDisableStartup|LANAccessStartup|LANRecoveryBatch|AttestHistoricalLANDisableSuccessor|HistoricalLANDisableSuccessorSelection)'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The seven existing quarantine tests passed in 4.630s. Two new top-level tests
+passed in 7.411s, including ten grant/disable success and fault cases: forged
+projection, SQL drift before the pending write, after the pending write, and
+after apply. They assert exact retained raw routes/journal, pending marker
+retention, zero apply on unproved authority, and refusal after late SQL drift.
+The controller set passed all 37 tests in 22.426s. All runs had zero failure
+or skip; vet and full build passed. Logs are
+`$TEMP/m3-native-lan-quarantine-preservation.jsonl`,
+`$TEMP/m3-native-lan-quarantine-boundaries.jsonl`, and
+`$TEMP/m3-native-lan-quarantine-hostd.jsonl`. A Git diff check attempted from
+the elevated test identity could not recognize the worktree; its separate
+non-elevated retry passed. No Git mutation was attempted by that failed check.
+
+These quarantine tests retain the same projected-SQL/fake-Docker limitation.
+They do not prove the pending typed-rebind or repeated-rebind runtime paths.

@@ -191,3 +191,93 @@ func TestGatewayV2StartupSQLSelectedNativePending(t *testing.T) {
 		t.Fatalf("selected native pending inspection=%+v err=%v loadErr=%v observations=%d", inspection, err, loadErr, observations)
 	}
 }
+
+func TestGatewayV2LANStartupQuarantineRechecksSQLAtEffectBoundary(t *testing.T) {
+	for _, kind := range []string{"grant", "disable"} {
+		t.Run(kind, func(t *testing.T) {
+			for _, fault := range []string{"", "wrong projection", "SQL drift before pending", "SQL drift after pending", "SQL drift after apply"} {
+				t.Run(fault, func(t *testing.T) {
+					manager, store, journal, request, driver := grantedLANForDisable(t)
+					snapshot, projection := installNativeStartupSQL(t, manager, journal.OperationID)
+					before, _, err := store.loadBoundUpgrade(journal.OperationID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					grant := gatewayV2LANStartupClaim(request, appaccess.AppAccessGrantApplying, 2)
+					grant.CurrentBinding = &projection
+					disable := GatewayV2LANDisableStartupClaim{Request: disableRequestForGrant(t, request),
+						State: appaccess.AppAccessDisablePrepared, StateSequence: 1, CurrentBinding: &projection}
+					if kind == "disable" {
+						grant.State, grant.StateSequence = appaccess.AppAccessGrantCommitted, 4
+						grant.DisableIntentOperationID = disable.Request.OperationID
+					}
+					if fault == "wrong projection" {
+						projection.GatewaySource.OperationID = "41414141-4141-4141-8141-414141414141"
+					}
+					driver.events, driver.applyCalls = nil, 0
+					calls := 0
+					manager.options.RebindCurrentStateRepository = gatewayCurrentSelectionRepositoryFunc(func(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error) {
+						calls++
+						state, _, loadErr := store.loadBoundUpgrade(journal.OperationID)
+						if loadErr != nil {
+							return appaccess.GatewayRebindRecoverySnapshot{}, loadErr
+						}
+						result := snapshot
+						if (fault == "SQL drift before pending" && calls >= 4) ||
+							(fault == "SQL drift after pending" && state.Pending != nil) ||
+							(fault == "SQL drift after apply" && driver.applyCalls > 0) {
+							source := *snapshot.CurrentSource
+							source.OperationID = "41414141-4141-4141-8141-414141414141"
+							result.CurrentSource = &source
+						}
+						return result, nil
+					})
+					if kind == "grant" {
+						err = manager.QuarantineGatewayV2LANStartup(context.Background(), []GatewayV2LANStartupClaim{grant})
+					} else {
+						err = manager.QuarantineGatewayV2LANAccessStartup(context.Background(), []GatewayV2LANStartupClaim{grant}, []GatewayV2LANDisableStartupClaim{disable})
+					}
+					if (fault == "") != (err == nil) {
+						t.Fatalf("fault=%q unexpected result: %v", fault, err)
+					}
+					retained, retainedJournal, loadErr := store.loadBoundUpgrade(journal.OperationID)
+					if loadErr != nil || !reflect.DeepEqual(retainedJournal, journal) || !reflect.DeepEqual(retained.Apps, before.Apps) {
+						t.Fatalf("quarantine rewrote raw publication or journal: %v", loadErr)
+					}
+					beforeWrite := fault == "wrong projection" || fault == "SQL drift before pending"
+					if beforeWrite {
+						if !reflect.DeepEqual(retained, before) || driver.applyCalls != 0 {
+							t.Fatal("unproved authority reached protected write or physical apply")
+						}
+					} else if retained.Pending == nil {
+						t.Fatal("quarantine lost its retained pending recovery marker")
+					}
+					wantApplies := 0
+					if fault == "" || fault == "SQL drift after apply" {
+						wantApplies = 1
+					}
+					if driver.applyCalls != wantApplies {
+						t.Fatalf("physical apply count=%d want=%d", driver.applyCalls, wantApplies)
+					}
+					if wantApplies == 1 && driver.live.Apps[request.AppID].LAN != nil {
+						t.Fatal("quarantine re-published the binding")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestGatewayV2LANStartupRetainedAuthorityCannotServeLiveGrant(t *testing.T) {
+	manager, _, journal, request, driver := grantedLANForDisable(t)
+	_, projection := installNativeStartupSQL(t, manager, journal.OperationID)
+	grant := gatewayV2LANStartupClaim(request, appaccess.AppAccessGrantCommitted, 4)
+	disable := GatewayV2LANDisableStartupClaim{Request: disableRequestForGrant(t, request),
+		State: appaccess.AppAccessDisableCommitted, StateSequence: 3, ClearAcknowledged: true, RetainedBinding: &projection}
+	grant.DisableIntentOperationID, grant.RetainedBinding = disable.Request.OperationID, &projection
+	driver.applyCalls = 0
+	inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(), []GatewayV2LANStartupClaim{grant}, []GatewayV2LANDisableStartupClaim{disable})
+	if err == nil || inspection.Disposition != "" || driver.applyCalls != 0 {
+		t.Fatalf("retained authority permitted serving: inspection=%+v err=%v", inspection, err)
+	}
+}

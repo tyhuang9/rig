@@ -487,11 +487,21 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 	if err != nil || !committed || store == nil {
 		return gatewayV2StartupInspectionError(workCtx)
 	}
+	authority, err := m.readGatewayV2LANStartupAuthorityLocked(workCtx, store, state, journal, claims.grants, claims.disables)
+	if err != nil {
+		return err
+	}
 	confirmed, err := inspectGatewayV2LANAccessStartupLocked(workCtx, state, journal, claims, m.gatewayV2LANDisableDriver())
 	if err != nil || !reflect.DeepEqual(confirmed, inspection) {
 		return gatewayV2StartupInspectionError(workCtx)
 	}
-	driver := m.gatewayV2LANDisableDriver()
+	if err := m.confirmGatewayV2LANStartupAuthorityLocked(workCtx, authority, store, state, journal, claims.grants, claims.disables); err != nil {
+		return err
+	}
+	var driver gatewayV2LANGrantDriver = gatewayV2LANStartupMutationDriver{
+		gatewayV2LANGrantDriver: m.gatewayV2LANDisableDriver(), manager: m,
+		authority: authority, store: store, journal: journal, grants: claims.grants, disables: claims.disables,
+	}
 	request := claim.Request
 	if state.Pending == nil {
 		app, exists := state.Apps[request.AppID]
@@ -499,7 +509,7 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 			if !proveGatewayV2LANDisabled(workCtx, driver, state, journal, request) {
 				return emergencyGatewayV2LANDisableStop(ctx, m, journal, driver)
 			}
-			return nil
+			return m.confirmGatewayV2LANStartupAuthorityLocked(workCtx, authority, store, state, journal, claims.grants, claims.disables)
 		}
 		pending, _, pendingErr := gatewayV2LANDisablePendingState(state, request)
 		if pendingErr != nil || store.saveCommittedV2State(pending, journal) != nil {
@@ -527,5 +537,6 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 	if err != nil || !reflect.DeepEqual(retained, state) || !reflect.DeepEqual(retainedJournal, journal) {
 		return emergencyGatewayV2LANDisableStop(ctx, m, journal, driver)
 	}
-	return nil
+	_, err = m.confirmGatewayV2LANStartupMutationLocked(workCtx, authority, store, journal, claims.grants, claims.disables)
+	return err
 }

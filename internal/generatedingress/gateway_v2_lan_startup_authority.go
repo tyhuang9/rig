@@ -86,3 +86,70 @@ func (m *Manager) confirmGatewayV2LANStartupAuthorityLocked(ctx context.Context,
 	}
 	return nil
 }
+
+// A quarantine may durably add a Pending marker. Revalidate the new native
+// state against unchanged SQL and immutable authority without requiring the
+// operational state to equal its pre-write value.
+func (m *Manager) confirmGatewayV2LANStartupMutationLocked(ctx context.Context,
+	before gatewayV2LANStartupAuthority, store *gatewayUpgradeStateStore, journal gatewayMigrationJournal,
+	grants gatewayV2LANStartupClaimSet, disables map[string]GatewayV2LANDisableStartupClaim,
+) (gatewayV2RouteState, error) {
+	state, retainedJournal, err := store.loadBoundUpgrade(journal.OperationID)
+	if err != nil || !reflect.DeepEqual(retainedJournal, journal) {
+		return gatewayV2RouteState{}, gatewayV2StartupInspectionError(ctx)
+	}
+	after, err := m.readGatewayV2LANStartupAuthorityLocked(ctx, store, state, journal, grants, disables)
+	if err != nil || before.present != after.present || !reflect.DeepEqual(before.snapshot, after.snapshot) ||
+		before.selection.Kind != after.selection.Kind || before.selection.Lineage != after.selection.Lineage ||
+		!reflect.DeepEqual(before.selection.UpgradeSource, after.selection.UpgradeSource) || ctx.Err() != nil {
+		return gatewayV2RouteState{}, gatewayV2StartupInspectionError(ctx)
+	}
+	return state, nil
+}
+
+// Recheck at the effect boundary, after the protected pending write and any
+// physical observation. Only the exact withdrawal derived from that retained
+// marker may be applied; failure preserves the marker for recovery.
+type gatewayV2LANStartupMutationDriver struct {
+	gatewayV2LANGrantDriver
+	manager   *Manager
+	authority gatewayV2LANStartupAuthority
+	store     *gatewayUpgradeStateStore
+	journal   gatewayMigrationJournal
+	grants    gatewayV2LANStartupClaimSet
+	disables  map[string]GatewayV2LANDisableStartupClaim
+}
+
+func (d gatewayV2LANStartupMutationDriver) apply(ctx context.Context, proposed gatewayV2RouteState, name string) error {
+	state, err := d.manager.confirmGatewayV2LANStartupMutationLocked(ctx, d.authority, d.store, d.journal, d.grants, d.disables)
+	if err != nil || state.Pending == nil {
+		return gatewayV2StartupInspectionError(ctx)
+	}
+	var withdrawn gatewayV2RouteState
+	if state.Pending.Kind == gatewayV2PendingLANDisable {
+		if state.Pending.Disable == nil {
+			return gatewayV2StartupInspectionError(ctx)
+		}
+		request := *state.Pending.Disable
+		claim, exists := d.disables[request.OperationID]
+		if !exists || !reflect.DeepEqual(claim.Request, request) {
+			return gatewayV2StartupInspectionError(ctx)
+		}
+		_, withdrawn, err = gatewayV2LANDisablePendingStates(state, request)
+	} else {
+		request, requestErr := gatewayV2LANPendingRequest(*state.Pending)
+		claim, exists := d.grants.byAttempt[request.AttemptID]
+		if requestErr != nil || !exists || claim.Request != request {
+			return gatewayV2StartupInspectionError(ctx)
+		}
+		var pending bool
+		withdrawn, _, pending, err = gatewayV2LANGrantStatesForRequest(state, request)
+		if !pending {
+			return gatewayV2StartupInspectionError(ctx)
+		}
+	}
+	if err != nil || !reflect.DeepEqual(withdrawn, proposed) {
+		return gatewayV2StartupInspectionError(ctx)
+	}
+	return d.gatewayV2LANGrantDriver.apply(ctx, proposed, name)
+}
