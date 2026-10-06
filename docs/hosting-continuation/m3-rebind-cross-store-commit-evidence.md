@@ -2316,6 +2316,45 @@ unverified. The first independent attempt failed before tests because one Git
 identity lookup omitted its checkout directory; the corrected run is the recorded
 application evidence.
 
-The exact candidate is ready for local integration; a user approval request is
-pending. Its three-file delta is based on already integrated `d5ec8b9`. No remote
-publication, deployment or default driver activation is authorized by this review.
+The user explicitly approved local integration of `14c2913`; it was integrated
+as `37cd6787087929c58aaa947a5bbbca93c58af677`. Its three-file delta is based on
+already integrated `d5ec8b9`. The parent integration check passed three tests and
+two subcases in 75.756s, zero failures/skips
+(`Rig/temp/m3-current-serving-driver-integration.jsonl`):
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(ManagedGatewayCurrentServingRestoreRuntimeRechecksAuthorityAfterFinalStoppedInventory|GatewayCurrentServingRestoreKeepsCompletedBatchAndTerminalSQL|GatewayCurrentNativeEmergencyCrossesExistingFailStopOnlyToWithdraw)$'
+```
+
+Vet and the full Go build passed. This approval authorizes local integration only.
+
+## Typed SQL and concrete restart composition
+
+The combined real SQLite/protected typed commit, ordinary redeploy, startup
+authorization and concrete command-executor test initially refused both stable
+and completed-batch restoration before physical effects (70.831s;
+`Rig/temp/m3-current-serving-sql-executor.jsonl`). Focused diagnosis proved the
+network ownership checks valid, then identified a create-time configuration
+fingerprint mismatch (26.299s;
+`Rig/temp/m3-current-serving-sql-executor-final-base.jsonl`). The verifier had
+unconditionally used the legacy digest envelope `{version,args,networks}` while
+the retained typed constructor uses `{version,args}`.
+
+The verifier now selects exactly the envelope required by the validated terminal
+format. It does not try alternate formats or rewrite retained history. The new
+test covers both stable restart and completed SQL disable recovery followed by
+marker retirement and an idempotent stable restart. It checks lost start
+acknowledgments, unchanged SQL, preserved immutable files and retained recovery
+state until retirement. Docker commands and reachability are simulated.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayCurrentServingRestoreComposesSQLWithConcreteExecutor|ManagedGatewayCurrentPhysicalRuntimeBindsImmutableContainerAndDynamicNetworks)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Both tests and all six subcases passed in 127.179s, zero failures/skips
+(`Rig/temp/m3-current-serving-sql-executor-green.jsonl`), including existing legacy
+container identity, label and publication-boundary preservation. Vet, full build,
+gofmt and `git diff --check` passed. Independent review remains pending. No default
+factory activation, publication, deployment or hosted Docker acceptance is claimed.

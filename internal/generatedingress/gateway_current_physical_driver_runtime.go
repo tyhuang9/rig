@@ -1045,11 +1045,24 @@ func gatewayCurrentPhysicalInitialConfigurationDigest(target gatewayCurrentPhysi
 	args = appendGatewayV2Labels(args,
 		gatewayCurrentPhysicalLabels(target, gatewayV2ManagedContainerLabel, gatewayV2FinalContainerRole))
 	args = append(args, "sha256:"+target.Resources.ImageID, "run", "--config", "/config/"+identity.ActiveConfigFilename)
-	return canonicalDigest(struct {
-		Version  int                                       `json:"version"`
-		Args     []string                                  `json:"args"`
-		Networks []gatewayRebindHandoverApplicationNetwork `json:"networks"`
-	}{1, args, target.Resources.ApplicationNetworks})
+	// Retained terminal formats use distinct create-time digest envelopes.
+	// Select the exact validated format; accepting either digest would blur
+	// the immutable evidence contract between legacy and typed attempts.
+	switch target.Terminal.Format {
+	case gatewayRebindAttemptTerminalLegacyV1:
+		return canonicalDigest(struct {
+			Version  int                                       `json:"version"`
+			Args     []string                                  `json:"args"`
+			Networks []gatewayRebindHandoverApplicationNetwork `json:"networks"`
+		}{1, args, target.Resources.ApplicationNetworks})
+	case gatewayRebindAttemptTerminalTypedV2:
+		return canonicalDigest(struct {
+			Version int      `json:"version"`
+			Args    []string `json:"args"`
+		}{1, args})
+	default:
+		return "", errors.New("invalid generated ingress current terminal format")
+	}
 }
 
 func (d managerGatewayCurrentPhysicalRuntime) validFinalNetworks(target gatewayCurrentPhysicalTarget,
