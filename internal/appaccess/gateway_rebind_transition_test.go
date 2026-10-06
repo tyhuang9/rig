@@ -98,6 +98,42 @@ func TestGatewayRebindTransitionAppliesCompleteLifecycleAtomically(t *testing.T)
 	}
 }
 
+func TestGatewayRebindTransitionRejectsChangedRetainedRuntimeCensusBeforeAndInsideGuard(t *testing.T) {
+	fixture, proposal, claim := claimGatewayRebindV2ForFence(t)
+	retained := proposal.RuntimeHeads[0]
+	retained.Generation++
+	entryDigest, err := gatewayRebindRuntimeHeadV2Digest(claim.Spec.OperationID, 1, retained)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`DROP TRIGGER lan_gateway_rebind_runtime_head_immutable_update`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`UPDATE lan_gateway_rebind_runtime_heads
+		SET generation=?,entry_digest=? WHERE operation_id=? AND ordinal=1`,
+		retained.Generation, entryDigest, claim.Spec.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	proof := gatewayRebindProofForClaimV2(t, claim, GatewayRebindPrepared, 1,
+		GatewayRebindSuccessorReady, strings.Repeat("6", 64), nil)
+	if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(), proof); !errors.Is(err, ErrInvalidStoredState) {
+		t.Fatalf("repository transition with changed census=%v", err)
+	}
+	directInsert, revoke := armGatewayRebindTransitionDirect(t, fixture, proof)
+	defer revoke()
+	if err := directInsert(); err == nil || !strings.Contains(err.Error(), "proof is not exact") {
+		t.Fatalf("guarded transition with changed census=%v", err)
+	}
+	if err := directInsert(); err == nil || !strings.Contains(err.Error(), "invalid or spent") {
+		t.Fatalf("changed-census nonce reuse=%v", err)
+	}
+	var commands int
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM lan_gateway_rebind_transition_commands
+		WHERE operation_id=?`, claim.Spec.OperationID).Scan(&commands); err != nil || commands != 0 {
+		t.Fatalf("changed-census commands=%d error=%v", commands, err)
+	}
+}
+
 func TestGatewayRebindTransitionRejectsExtraRosterTransferAtomically(t *testing.T) {
 	fixture := newGatewayRebindFixture(t, true)
 	receipt := strings.Repeat("7", 64)

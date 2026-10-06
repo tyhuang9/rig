@@ -50,8 +50,12 @@ func insertGatewayRebindSourceClaimForMigrationTest(fixture gatewayRebindFixture
 		predecessorUpgradeOperationID = nil
 	}
 	successorGeneration := int64(0)
+	runtimeHeadsVersion, runtimeHeadsCount := int64(0), int64(0)
+	var runtimeHeadsDigest any
 	if specVersion == GatewayRebindSpecVersionV2 {
 		successorGeneration = generation + 1
+		runtimeHeadsVersion, runtimeHeadsCount = GatewayRebindRuntimeHeadsVersionV1, 1
+		runtimeHeadsDigest = strings.Repeat("f", 64)
 	}
 	_, err := fixture.db.Exec(`INSERT INTO lan_gateway_rebind_claims(
 		operation_id,request_digest,approval_action,spec_digest,approved_by,approved_at,
@@ -68,8 +72,9 @@ func insertGatewayRebindSourceClaimForMigrationTest(fixture gatewayRebindFixture
 		predecessor_protected_journal_digest,predecessor_protected_intent_digest,
 		predecessor_source_state_version,predecessor_source_state_revision,
 		predecessor_source_state_digest,predecessor_checkpoint_digest,
-		successor_protected_generation
-	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		successor_protected_generation,runtime_heads_format_version,
+		runtime_heads_digest,runtime_heads_count
+	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		claim.Spec.OperationID, claim.RequestDigest, claim.RebindApproval.Action,
 		claim.RebindApproval.SpecDigest, claim.RebindApproval.ActorID, formatTime(claim.RebindApprovedAt),
 		claim.Spec.PredecessorProfileRevisionID, claim.Spec.PredecessorProfileRevisionNumber,
@@ -85,7 +90,8 @@ func insertGatewayRebindSourceClaimForMigrationTest(fixture gatewayRebindFixture
 		claim.Spec.RosterDigest, claim.Spec.RosterCount, claim.State, claim.StateSequence,
 		formatTime(claim.CreatedAt), formatTime(claim.UpdatedAt), specVersion, rosterVersion,
 		generation, nullableStringForMigrationTest(journalDigest), nullableStringForMigrationTest(intentDigest),
-		2, 0, strings.Repeat("d", 64), strings.Repeat("e", 64), successorGeneration)
+		2, 0, strings.Repeat("d", 64), strings.Repeat("e", 64), successorGeneration,
+		runtimeHeadsVersion, runtimeHeadsDigest, runtimeHeadsCount)
 	return err
 }
 

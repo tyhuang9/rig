@@ -122,8 +122,11 @@ func TestGatewayRebindRuntimeHeadsV2DigestBindsCompleteCanonicalCensus(t *testin
 	}
 
 	for name, mutate := range map[string]func([]GatewayRebindRuntimeHead){
-		"unsorted":            func(values []GatewayRebindRuntimeHead) { values[0], values[1] = values[1], values[0] },
-		"duplicate app":       func(values []GatewayRebindRuntimeHead) { values[1].AppID = values[0].AppID },
+		"unsorted":      func(values []GatewayRebindRuntimeHead) { values[0], values[1] = values[1], values[0] },
+		"duplicate app": func(values []GatewayRebindRuntimeHead) { values[1].AppID = values[0].AppID },
+		"noncanonical deployment": func(values []GatewayRebindRuntimeHead) {
+			values[0].DeploymentID = strings.ToUpper(values[0].DeploymentID)
+		},
 		"inactive generation": func(values []GatewayRebindRuntimeHead) { values[0].Generation = 0 },
 		"missing timestamp":   func(values []GatewayRebindRuntimeHead) { values[0].UpdatedAt = time.Time{} },
 	} {
@@ -150,6 +153,16 @@ func TestGatewayRebindV2CanonicalTypesRejectCrossVersionAndBrokenChains(t *testi
 	wrongSpecVersion.Version = 1
 	if _, err := GatewayRebindSpecV2Digest(wrongSpecVersion); err == nil {
 		t.Fatal("v1 spec version was accepted as v2")
+	}
+	wrongRuntimeVersion := spec
+	wrongRuntimeVersion.RuntimeHeadsVersion = 0
+	if _, err := GatewayRebindSpecV2Digest(wrongRuntimeVersion); err == nil {
+		t.Fatal("absent runtime-head format was accepted as v2")
+	}
+	wrongRuntimeDigest := spec
+	wrongRuntimeDigest.RuntimeHeadsDigest = ""
+	if _, err := GatewayRebindSpecV2Digest(wrongRuntimeDigest); err == nil {
+		t.Fatal("missing runtime-head digest was accepted as v2")
 	}
 	wrongRosterVersion := entry
 	wrongRosterVersion.Version = 1

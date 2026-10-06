@@ -10,8 +10,9 @@ import (
 )
 
 // ClaimGatewayRebindV2 repeats the complete approval, current lineage,
-// roster, and quiescence checks while holding SQLite's writer reservation,
-// then persists one prepared claim and its complete versioned roster.
+// roster, runtime-head census, and quiescence checks while holding SQLite's
+// writer reservation, then persists one prepared claim and its retained
+// versioned evidence.
 func (r *Repository) ClaimGatewayRebindV2(ctx context.Context,
 	proposal GatewayRebindPreclaimProposalV2,
 ) (claim GatewayRebindClaimV2, created bool, resultErr error) {
@@ -19,6 +20,7 @@ func (r *Repository) ClaimGatewayRebindV2(ctx context.Context,
 		return GatewayRebindClaimV2{}, false, ErrInvalidInput
 	}
 	proposal.Roster = append([]GatewayRebindRosterEntryV2(nil), proposal.Roster...)
+	proposal.RuntimeHeads = append([]GatewayRebindRuntimeHead(nil), proposal.RuntimeHeads...)
 	tx, err := beginImmediateTransaction(ctx, r.db)
 	if err != nil {
 		return GatewayRebindClaimV2{}, false, err
@@ -40,14 +42,29 @@ func (r *Repository) ClaimGatewayRebindV2(ctx context.Context,
 		if rosterErr != nil {
 			return GatewayRebindClaimV2{}, false, rosterErr
 		}
+		storedRuntimeHeads, headsErr := readGatewayRebindRetainedRuntimeHeads(ctx, tx,
+			proposal.Spec.OperationID)
+		if headsErr != nil {
+			return GatewayRebindClaimV2{}, false, headsErr
+		}
 		if existing.RequestDigest != requestDigest || existing.Spec != proposal.Spec ||
 			existing.RebindApproval != proposal.RebindApproval ||
 			existing.ConfigureApproval != proposal.ConfigureApproval ||
-			!reflect.DeepEqual(storedRoster, proposal.Roster) {
+			!reflect.DeepEqual(storedRoster, proposal.Roster) ||
+			!sameGatewayRebindRuntimeHeads(storedRuntimeHeads, proposal.RuntimeHeads) {
 			return GatewayRebindClaimV2{}, false, ErrIdempotencyMismatch
 		}
-		if err := validateStoredGatewayRebindClaimV2(existing, storedRoster); err != nil {
+		if err := validateStoredGatewayRebindClaimV2(existing, storedRoster, storedRuntimeHeads); err != nil {
 			return GatewayRebindClaimV2{}, false, err
+		}
+		if isActiveGatewayRebindState(existing.State) {
+			liveRuntimeHeads, err := readGatewayRebindRuntimeHeads(ctx, tx)
+			if err != nil {
+				return GatewayRebindClaimV2{}, false, err
+			}
+			if !sameGatewayRebindRuntimeHeads(storedRuntimeHeads, liveRuntimeHeads) {
+				return GatewayRebindClaimV2{}, false, ErrInvalidStoredState
+			}
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return GatewayRebindClaimV2{}, false, err
@@ -104,6 +121,13 @@ func (r *Repository) ClaimGatewayRebindV2(ctx context.Context,
 	if err := validateGatewayRebindSettledRosterV2(ctx, tx, proposal.Spec, proposal.Roster); err != nil {
 		return GatewayRebindClaimV2{}, false, err
 	}
+	liveRuntimeHeads, err := readGatewayRebindRuntimeHeads(ctx, tx)
+	if err != nil {
+		return GatewayRebindClaimV2{}, false, err
+	}
+	if !sameGatewayRebindRuntimeHeads(liveRuntimeHeads, proposal.RuntimeHeads) {
+		return GatewayRebindClaimV2{}, false, ErrInvalidStoredState
+	}
 	if _, err := evaluateGatewayRebindQuiescence(ctx, tx, nil); err != nil {
 		return GatewayRebindClaimV2{}, false, err
 	}
@@ -146,8 +170,9 @@ func (r *Repository) ClaimGatewayRebindV2(ctx context.Context,
 		predecessor_protected_journal_digest,predecessor_protected_intent_digest,
 		predecessor_source_state_version,predecessor_source_state_revision,
 		predecessor_source_state_digest,predecessor_checkpoint_digest,
-		successor_protected_generation
-	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		successor_protected_generation,runtime_heads_format_version,
+		runtime_heads_digest,runtime_heads_count
+	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		proposal.Spec.OperationID, requestDigest, ActionRebindGateway,
 		proposal.RebindApproval.SpecDigest, proposal.RebindApproval.ActorID, formatTime(now),
 		lineage.ProfileRevisionID, lineage.ProfileRevisionNumber, lineage.ProfileSpecDigest,
@@ -163,7 +188,8 @@ func (r *Repository) ClaimGatewayRebindV2(ctx context.Context,
 		nullableText(lineage.ProtectedIntentDigest), int64(proposal.Spec.Predecessor.SourceStateVersion),
 		int64(proposal.Spec.Predecessor.SourceStateRevision), proposal.Spec.Predecessor.SourceStateDigest,
 		proposal.Spec.Predecessor.PredecessorCheckpointDigest,
-		int64(proposal.Spec.SuccessorProtectedGeneration)); err != nil {
+		int64(proposal.Spec.SuccessorProtectedGeneration), proposal.Spec.RuntimeHeadsVersion,
+		proposal.Spec.RuntimeHeadsDigest, proposal.Spec.RuntimeHeadsCount); err != nil {
 		return GatewayRebindClaimV2{}, false, classifyImmediateTransactionError(err)
 	}
 	for _, entry := range proposal.Roster {
@@ -187,14 +213,31 @@ func (r *Repository) ClaimGatewayRebindV2(ctx context.Context,
 			return GatewayRebindClaimV2{}, false, classifyImmediateTransactionError(err)
 		}
 	}
+	for index, head := range proposal.RuntimeHeads {
+		ordinal := int64(index + 1)
+		entryDigest, digestErr := gatewayRebindRuntimeHeadV2Digest(proposal.Spec.OperationID, ordinal, head)
+		if digestErr != nil {
+			return GatewayRebindClaimV2{}, false, ErrInvalidInput
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO lan_gateway_rebind_runtime_heads(
+			operation_id,ordinal,app_id,deployment_id,release_id,slot,generation,updated_at,entry_digest
+		) VALUES(?,?,?,?,?,?,?,?,?)`, proposal.Spec.OperationID, ordinal, head.AppID,
+			head.DeploymentID, head.ReleaseID, head.Slot, head.Generation,
+			formatTime(head.UpdatedAt), entryDigest); err != nil {
+			return GatewayRebindClaimV2{}, false, classifyImmediateTransactionError(err)
+		}
+	}
 	stored, err := readGatewayRebindClaimV2(ctx, tx, proposal.Spec.OperationID)
 	if err != nil {
 		return GatewayRebindClaimV2{}, false, err
 	}
 	storedRoster, err := readGatewayRebindRosterV2(ctx, tx, proposal.Spec.OperationID)
+	storedRuntimeHeads, headsErr := readGatewayRebindRetainedRuntimeHeads(ctx, tx,
+		proposal.Spec.OperationID)
 	if err != nil || stored.RequestDigest != claim.RequestDigest || stored.Spec != claim.Spec ||
-		!reflect.DeepEqual(storedRoster, proposal.Roster) {
-		return GatewayRebindClaimV2{}, false, invalidRebindStoredState(err)
+		headsErr != nil || !reflect.DeepEqual(storedRoster, proposal.Roster) ||
+		!sameGatewayRebindRuntimeHeads(storedRuntimeHeads, proposal.RuntimeHeads) {
+		return GatewayRebindClaimV2{}, false, invalidRebindStoredState(errors.Join(err, headsErr))
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return GatewayRebindClaimV2{}, false, err
@@ -211,7 +254,8 @@ func validateGatewayRebindProposalV2(proposal GatewayRebindPreclaimProposalV2) e
 	}
 	profileDigest, err := GatewayProfileSpecDigest(proposal.Spec.SuccessorProfile)
 	if err != nil || !validApproval(proposal.ConfigureApproval, ActionConfigureGateway, profileDigest) ||
-		proposal.Spec.RosterCount != int64(len(proposal.Roster)) {
+		proposal.Spec.RosterCount != int64(len(proposal.Roster)) ||
+		proposal.Spec.RuntimeHeadsCount != int64(len(proposal.RuntimeHeads)) {
 		return ErrInvalidInput
 	}
 	for index := range proposal.Roster {
@@ -225,6 +269,11 @@ func validateGatewayRebindProposalV2(proposal GatewayRebindPreclaimProposalV2) e
 	}
 	rosterDigest, err := GatewayRebindRosterV2Digest(proposal.Roster)
 	if err != nil || rosterDigest != proposal.Spec.RosterDigest {
+		return ErrInvalidInput
+	}
+	runtimeHeadsDigest, err := GatewayRebindRuntimeHeadsV2Digest(proposal.Spec.OperationID,
+		proposal.RuntimeHeads)
+	if err != nil || runtimeHeadsDigest != proposal.Spec.RuntimeHeadsDigest {
 		return ErrInvalidInput
 	}
 	return nil
@@ -334,7 +383,8 @@ func readGatewayRebindClaimV2(ctx context.Context, query rowQuerier,
 		predecessor_protected_generation,predecessor_protected_journal_digest,
 		predecessor_protected_intent_digest,predecessor_source_state_version,
 		predecessor_source_state_revision,predecessor_source_state_digest,
-		predecessor_checkpoint_digest,successor_protected_generation
+		predecessor_checkpoint_digest,successor_protected_generation,
+		runtime_heads_format_version,runtime_heads_digest,runtime_heads_count
 		FROM lan_gateway_rebind_claims WHERE operation_id=? AND spec_format_version=2
 		 AND roster_format_version=2`, operationID).Scan(&value.RequestDigest,
 		&value.RebindApproval.Action, &value.RebindApproval.SpecDigest,
@@ -354,7 +404,9 @@ func readGatewayRebindClaimV2(ctx context.Context, query rowQuerier,
 		&journalDigest, &intentDigest, &value.Spec.Predecessor.SourceStateVersion,
 		&value.Spec.Predecessor.SourceStateRevision, &value.Spec.Predecessor.SourceStateDigest,
 		&value.Spec.Predecessor.PredecessorCheckpointDigest,
-		&value.Spec.SuccessorProtectedGeneration)
+		&value.Spec.SuccessorProtectedGeneration, &value.Spec.RuntimeHeadsVersion,
+		&value.Spec.RuntimeHeadsDigest,
+		&value.Spec.RuntimeHeadsCount)
 	if err != nil {
 		return GatewayRebindClaimV2{}, err
 	}

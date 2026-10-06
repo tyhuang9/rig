@@ -745,6 +745,14 @@ func gatewayRebindV2ProposalForCommittedFixture(t *testing.T, fixture gatewayReb
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtimeHeads, err := fixture.repository.GatewayRebindRuntimeHeads(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeHeadsDigest, err := GatewayRebindRuntimeHeadsV2Digest(operationID, runtimeHeads)
+	if err != nil {
+		t.Fatal(err)
+	}
 	successor := GatewayProfileSpec{
 		SelectedIPv4: "192.168.98.8", InterfaceID: "rebind-second-successor",
 		PortStart: current.EffectiveProfile.Spec.PortStart, PortEnd: current.EffectiveProfile.Spec.PortEnd,
@@ -769,6 +777,8 @@ func gatewayRebindV2ProposalForCommittedFixture(t *testing.T, fixture gatewayReb
 		SuccessorProfileRevisionNumber: current.EffectiveProfile.RevisionNumber + 1,
 		SuccessorProfileOperationID:    uuid.NewString(), SuccessorProfile: successor,
 		RosterVersion: GatewayRebindRosterVersionV2, RosterDigest: rosterDigest, RosterCount: 1,
+		RuntimeHeadsVersion: GatewayRebindRuntimeHeadsVersionV1,
+		RuntimeHeadsDigest:  runtimeHeadsDigest, RuntimeHeadsCount: int64(len(runtimeHeads)),
 	}
 	profileDigest, err := GatewayProfileSpecDigest(successor)
 	if err != nil {
@@ -779,7 +789,7 @@ func gatewayRebindV2ProposalForCommittedFixture(t *testing.T, fixture gatewayReb
 		t.Fatal(err)
 	}
 	return GatewayRebindPreclaimProposalV2{
-		Spec: spec, Roster: roster,
+		Spec: spec, Roster: roster, RuntimeHeads: runtimeHeads,
 		RebindApproval:    Approval{Action: ActionRebindGateway, SpecDigest: specDigest, ActorID: testAdministrator},
 		ConfigureApproval: Approval{Action: ActionConfigureGateway, SpecDigest: profileDigest, ActorID: testAdministrator},
 	}

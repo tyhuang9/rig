@@ -77,6 +77,27 @@ func (r *Repository) ApplyGatewayRebindTransition(ctx context.Context,
 			successorProtectedGeneration < 1 || uint64(successorProtectedGeneration) != proof.ProtectedGeneration) {
 		return GatewayRebindTransitionCommand{}, ErrInvalidStoredState
 	}
+	if specVersion == GatewayRebindSpecVersionV2 {
+		claim, err := readGatewayRebindClaimV2(ctx, tx, proof.OperationID)
+		if err != nil {
+			return GatewayRebindTransitionCommand{}, invalidRebindStoredState(err)
+		}
+		roster, err := readGatewayRebindRosterV2(ctx, tx, proof.OperationID)
+		if err != nil {
+			return GatewayRebindTransitionCommand{}, invalidRebindStoredState(err)
+		}
+		retainedHeads, err := readGatewayRebindRetainedRuntimeHeads(ctx, tx, proof.OperationID)
+		if err != nil || validateStoredGatewayRebindClaimV2(claim, roster, retainedHeads) != nil {
+			return GatewayRebindTransitionCommand{}, invalidRebindStoredState(err)
+		}
+		liveHeads, err := readGatewayRebindRuntimeHeads(ctx, tx)
+		if err != nil {
+			return GatewayRebindTransitionCommand{}, err
+		}
+		if !sameGatewayRebindRuntimeHeads(retainedHeads, liveHeads) {
+			return GatewayRebindTransitionCommand{}, ErrInvalidStoredState
+		}
+	}
 	var retainedDisposition, retainedReceipt sql.NullString
 	err = tx.QueryRowContext(ctx, `SELECT terminal_disposition,terminal_receipt_digest
 		FROM lan_gateway_rebind_transition_commands
