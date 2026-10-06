@@ -49,7 +49,7 @@ func (s effectiveRecoveryAuthorization) AuthorizeAppAccessGrant(ctx context.Cont
 // The raw claim and authorization checks use SQLite. Successor DTOs model the
 // controller boundary; these tests do not establish SQL transfer or Docker proof.
 func TestLANGrantCommittedRecoveryUsesEffectiveAuthority(t *testing.T) {
-	for _, name := range []string{"two transfers", "native replay", "native full proof", "native wrong proof", "missing native authority", "missing proof", "wrong source", "wrong observed operation", "wrong tip", "wrong receipt", "broken chain", "changed authorized claim", "raw operation substitution", "demoted approver"} {
+	for _, name := range []string{"two transfers", "native replay", "native full proof", "native wrong proof", "native substituted raw profile", "missing native authority", "missing proof", "wrong source", "wrong observed operation", "wrong tip", "wrong receipt", "broken chain", "changed authorized claim", "raw operation substitution", "demoted approver"} {
 		t.Run(name, func(t *testing.T) {
 			f := newLANAccessFixture(t)
 			originalOperation := uuid.NewString()
@@ -143,7 +143,7 @@ func TestLANGrantCommittedRecoveryUsesEffectiveAuthority(t *testing.T) {
 					}
 				}}
 			switch name {
-			case "native replay", "missing native authority", "native full proof", "native wrong proof":
+			case "native replay", "missing native authority", "native full proof", "native wrong proof", "native substituted raw profile":
 				service = f.repository
 				runtime.operationID, runtime.proof = before.Proof.GatewayOperationID, generatedingress.GatewayV2LANEffectiveBindingProof{}
 				if name == "native full proof" || name == "native wrong proof" {
@@ -158,6 +158,16 @@ func TestLANGrantCommittedRecoveryUsesEffectiveAuthority(t *testing.T) {
 					if name == "native wrong proof" {
 						runtime.proof.EffectiveProfile.SelectedIPv4 = "192.168.50.99"
 					}
+				}
+				if name == "native substituted raw profile" {
+					service = effectiveRecoveryAuthorization{LANAppGrantService: f.repository,
+						alter: func(value *appaccess.AppAccessGrantAuthorization) {
+							value.Profile = profile
+							value.EffectiveProfile = profile
+							value.CurrentGatewaySource.ProfileRevisionID = profile.ID
+							value.CurrentGatewaySource.ProfileRevisionNumber = profile.RevisionNumber
+							value.CurrentGatewaySource.ProfileSpecDigest = profile.SpecDigest
+						}}
 				}
 			case "missing proof":
 				runtime.proof = generatedingress.GatewayV2LANEffectiveBindingProof{}

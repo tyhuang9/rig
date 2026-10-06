@@ -1351,3 +1351,11 @@ The focused recovery/replay/terminal-failure run passed five top-level tests
 and fourteen subcases in 8.685s with no failures or skips
 (`Rig/temp/m3-controller-effective-recovery-strict.jsonl`). This supersedes
 the initial native fallback in `48af0f0`.
+
+A second boundary review required the native authorization's raw profile to
+match the immutable claim, not just the effective profile/source summaries.
+Recovery now checks those exact raw identity fields and recomputes both profile
+digests. An internally consistent substituted native profile is rejected.
+The final focused adapter test passed one top-level test and fifteen subcases
+in 7.560s with no failures or skips
+(`Rig/temp/m3-controller-effective-recovery-raw-binding.jsonl`).

@@ -494,6 +494,15 @@ func (s *Server) reconcileLANGrant(ctx context.Context, claim appaccess.AppAcces
 func lanGrantRecoveryAuthorityMatches(authorized appaccess.AppAccessGrantAuthorization,
 	observed generatedingress.GatewayV2LANGrantObservation,
 ) bool {
+	rawDigest, rawErr := appaccess.GatewayProfileSpecDigest(authorized.Profile.Spec)
+	effectiveDigest, effectiveErr := appaccess.GatewayProfileSpecDigest(authorized.EffectiveProfile.Spec)
+	if rawErr != nil || effectiveErr != nil || rawDigest != authorized.Profile.SpecDigest ||
+		effectiveDigest != authorized.EffectiveProfile.SpecDigest ||
+		authorized.Profile.ID != authorized.Claim.Spec.GatewayProfileRevisionID ||
+		authorized.Profile.RevisionNumber != authorized.Claim.Spec.GatewayProfileRevisionNumber ||
+		authorized.Profile.SpecDigest != authorized.Claim.Spec.GatewayProfileSpecDigest {
+		return false
+	}
 	resolution := appaccess.GatewayBindingResolution{
 		RawAllocation: authorized.Allocation, RawAccessRevision: authorized.Revision,
 		RawGrant: authorized.Claim, RawProfile: authorized.Profile, EffectiveProfile: authorized.EffectiveProfile,
