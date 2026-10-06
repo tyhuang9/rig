@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
 )
 
@@ -573,6 +574,63 @@ func TestGatewayRebindTypedProgressAcceptsCanonicalZeroRuntimeHeads(t *testing.T
 	baseline, err := newGatewayCurrentRouteBaselineFromV2Terminal(intent, commit, checkpoint, transfers)
 	if err != nil || len(baseline.Apps) != 0 || !validGatewayCurrentRouteState(baseline) {
 		t.Fatalf("zero-roster current baseline: %#v error=%v", baseline, err)
+	}
+	checkpointStore, err := newGatewayRebindPredecessorCheckpointStore(fixture.dataRoot,
+		checkpoint.Generation, checkpoint.OperationID)
+	if err != nil || checkpointStore.installExact(checkpoint) != nil {
+		t.Fatalf("install zero-census checkpoint: %v", err)
+	}
+	intentStore, err := newGatewayRebindProtectedIntentV2Store(fixture.dataRoot, intent.Generation, intent.OperationID)
+	if err != nil || intentStore.installExact(intent) != nil {
+		t.Fatalf("install zero-census intent: %v", err)
+	}
+	for _, record := range records {
+		store, storeErr := newGatewayRebindProgressStore(fixture.dataRoot, record.Generation,
+			record.OperationID, record.Sequence)
+		if storeErr != nil || store.installExact(context.Background(), record) != nil {
+			t.Fatalf("install zero-census progress %d: %v", record.Sequence, storeErr)
+		}
+	}
+	terminalStore, err := newGatewayRebindTerminalStoreV2(fixture.dataRoot, commit.Generation, commit.OperationID)
+	if err != nil || terminalStore.installExact(context.Background(), commit) != nil {
+		t.Fatalf("install zero-census terminal: %v", err)
+	}
+	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.TerminalsV2) != 1 ||
+		!reflect.DeepEqual(history.TerminalsV2[0].Receipt, commit) {
+		t.Fatalf("scan zero-census terminal: terminals=%d error=%v", len(history.TerminalsV2), err)
+	}
+	currentStore, err := newGatewayCurrentRouteStateStore(fixture.dataRoot, baseline.Lineage)
+	if err != nil || currentStore.installBaseline(baseline) != nil {
+		t.Fatalf("install zero-census current baseline: %v", err)
+	}
+	loaded, err := currentStore.load()
+	if err != nil || !reflect.DeepEqual(loaded, baseline) {
+		t.Fatalf("read zero-census current baseline: %#v error=%v", loaded, err)
+	}
+	noEffectProof := gatewayRebindNoEffectAbortProof{
+		Version: gatewayRebindNoEffectProofVersion, Purpose: gatewayRebindNoEffectProofPurpose,
+		Generation: checkpoint.Generation, OperationID: checkpoint.OperationID,
+		ClaimRequestDigest: intent.Claim.RequestDigest, PredecessorCheckpointDigest: checkpoint.Digest,
+		SourceStateDigest: checkpoint.SourceStateDigest, SuccessorIdentityDigest: intent.Identity.Digest,
+		ObservationDigest: strings.Repeat("a", 64), CreatedAt: time.Unix(4, 0).UTC().Format(time.RFC3339Nano),
+	}
+	noEffectProof.Digest, err = gatewayRebindNoEffectAbortProofDigest(noEffectProof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noEffect, err := newGatewayRebindNoEffectAbortTerminalV2(intent.Claim,
+		[]appaccess.GatewayRebindRosterEntryV2{}, []appaccess.GatewayRebindRuntimeHead{}, checkpoint,
+		noEffectProof, time.Unix(5, 0).UTC())
+	if err != nil || noEffect.PreparedDatabaseDigest != intent.DatabaseDigest {
+		t.Fatalf("canonical empty no-effect database digest=%s want=%s error=%v",
+			noEffect.PreparedDatabaseDigest, intent.DatabaseDigest, err)
+	}
+	changedHeads := []appaccess.GatewayRebindRuntimeHead{{AppID: "loopback-only", DeploymentID: uuid.NewString(),
+		ReleaseID: uuid.NewString(), Slot: "blue", Generation: 1, UpdatedAt: time.Unix(1, 0).UTC()}}
+	if _, err := newGatewayRebindNoEffectAbortTerminalV2(intent.Claim, nil, changedHeads, checkpoint,
+		noEffectProof, time.Unix(5, 0).UTC()); err == nil {
+		t.Fatal("no-effect terminal accepted a runtime-head census outside the retained claim")
 	}
 	routesDigest, err := gatewayRebindTypedCheckpointRoutesDigest(checkpoint)
 	if err != nil {

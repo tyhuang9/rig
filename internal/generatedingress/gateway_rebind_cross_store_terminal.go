@@ -191,6 +191,8 @@ func newGatewayRebindNoEffectAbortTerminalV2(claim appaccess.GatewayRebindClaimV
 	proof gatewayRebindNoEffectAbortProof, createdAt time.Time,
 ) (gatewayRebindTerminalReceiptV2, error) {
 	invalid := errors.New("invalid generated ingress no-effect rebind terminal")
+	roster = append([]appaccess.GatewayRebindRosterEntryV2(nil), roster...)
+	runtimeHeads = append([]appaccess.GatewayRebindRuntimeHead(nil), runtimeHeads...)
 	if !validGatewayRebindPredecessorCheckpoint(checkpoint) || !validGatewayRebindNoEffectAbortProof(proof) ||
 		claim.Spec.OperationID != checkpoint.OperationID || claim.Spec.Predecessor != checkpoint.sourceRef() ||
 		claim.Spec.SuccessorProtectedGeneration != checkpoint.Generation || claim.RequestDigest != proof.ClaimRequestDigest ||
@@ -241,11 +243,7 @@ func newGatewayRebindNoEffectAbortTerminalV2(claim appaccess.GatewayRebindClaimV
 	// PreparedDatabaseDigest binds the exact retained SQL claim, LAN roster,
 	// and complete runtime-head census rather than inventing an intent. This is
 	// the same canonical shape used by V2 intent.
-	value.PreparedDatabaseDigest, err = canonicalDigest(struct {
-		Claim        appaccess.GatewayRebindClaimV2         `json:"claim"`
-		Roster       []appaccess.GatewayRebindRosterEntryV2 `json:"roster"`
-		RuntimeHeads []appaccess.GatewayRebindRuntimeHead   `json:"runtimeHeads"`
-	}{claim, roster, runtimeHeads})
+	value.PreparedDatabaseDigest, err = gatewayRebindPreparedDatabaseDigest(claim, roster, runtimeHeads)
 	if err != nil {
 		return gatewayRebindTerminalReceiptV2{}, invalid
 	}

@@ -133,11 +133,7 @@ func newGatewayRebindProtectedIntentV2(claim appaccess.GatewayRebindClaimV2,
 	observationDigest, observationErr := canonicalDigest(network)
 	identity, identityErr := newGatewayRebindSuccessorIdentity(checkpoint.Generation, claim.Spec.OperationID,
 		GatewayRebindSuccessorProfile(profile))
-	databaseDigest, databaseErr := canonicalDigest(struct {
-		Claim        appaccess.GatewayRebindClaimV2         `json:"claim"`
-		Roster       []appaccess.GatewayRebindRosterEntryV2 `json:"roster"`
-		RuntimeHeads []appaccess.GatewayRebindRuntimeHead   `json:"runtimeHeads"`
-	}{claim, rosterCopy, runtimeHeadsCopy})
+	databaseDigest, databaseErr := gatewayRebindPreparedDatabaseDigest(claim, rosterCopy, runtimeHeadsCopy)
 	if err != nil || observationErr != nil || identityErr != nil || databaseErr != nil {
 		return gatewayRebindProtectedIntentV2{}, invalid
 	}
@@ -252,15 +248,23 @@ func validGatewayRebindProtectedIntentV2(value gatewayRebindProtectedIntentV2) b
 	observationDigest, observationErr := canonicalDigest(value.NetworkObservation)
 	identity, identityErr := newGatewayRebindSuccessorIdentity(value.Generation, value.OperationID,
 		GatewayRebindSuccessorProfile(value.SuccessorProfile))
-	databaseDigest, databaseErr := canonicalDigest(struct {
-		Claim        appaccess.GatewayRebindClaimV2         `json:"claim"`
-		Roster       []appaccess.GatewayRebindRosterEntryV2 `json:"roster"`
-		RuntimeHeads []appaccess.GatewayRebindRuntimeHead   `json:"runtimeHeads"`
-	}{value.Claim, value.Roster, value.RuntimeHeads})
+	databaseDigest, databaseErr := gatewayRebindPreparedDatabaseDigest(value.Claim, value.Roster, value.RuntimeHeads)
 	digest, digestErr := gatewayRebindProtectedIntentV2Digest(value)
 	return err == nil && observationErr == nil && identityErr == nil && databaseErr == nil && digestErr == nil &&
 		value.NetworkDigest == networkDigest && value.NetworkObservationDigest == observationDigest &&
 		reflect.DeepEqual(value.Identity, identity) && value.DatabaseDigest == databaseDigest && value.Digest == digest
+}
+
+func gatewayRebindPreparedDatabaseDigest(claim appaccess.GatewayRebindClaimV2,
+	roster []appaccess.GatewayRebindRosterEntryV2, runtimeHeads []appaccess.GatewayRebindRuntimeHead,
+) (string, error) {
+	rosterCopy := append([]appaccess.GatewayRebindRosterEntryV2(nil), roster...)
+	runtimeHeadsCopy := append([]appaccess.GatewayRebindRuntimeHead(nil), runtimeHeads...)
+	return canonicalDigest(struct {
+		Claim        appaccess.GatewayRebindClaimV2         `json:"claim"`
+		Roster       []appaccess.GatewayRebindRosterEntryV2 `json:"roster"`
+		RuntimeHeads []appaccess.GatewayRebindRuntimeHead   `json:"runtimeHeads"`
+	}{claim, rosterCopy, runtimeHeadsCopy})
 }
 
 func newGatewayRebindProtectedIntentV2Store(dataRoot string, generation uint64,
