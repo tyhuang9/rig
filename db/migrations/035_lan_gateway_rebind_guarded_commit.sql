@@ -38,6 +38,35 @@ ALTER TABLE lan_gateway_rebind_claims
 ALTER TABLE lan_gateway_rebind_claims
     ADD COLUMN successor_protected_generation INTEGER NOT NULL DEFAULT 0
         CHECK (successor_protected_generation >= 0);
+ALTER TABLE lan_gateway_rebind_claims
+    ADD COLUMN runtime_heads_format_version INTEGER NOT NULL DEFAULT 0
+        CHECK (runtime_heads_format_version IN (0,1));
+ALTER TABLE lan_gateway_rebind_claims
+    ADD COLUMN runtime_heads_digest TEXT CHECK (
+        runtime_heads_digest IS NULL OR
+        (length(runtime_heads_digest)=64 AND runtime_heads_digest NOT GLOB '*[^0-9a-f]*')
+    );
+ALTER TABLE lan_gateway_rebind_claims
+    ADD COLUMN runtime_heads_count INTEGER NOT NULL DEFAULT 0
+        CHECK (runtime_heads_count >= 0);
+
+CREATE TABLE lan_gateway_rebind_runtime_heads (
+    operation_id TEXT NOT NULL REFERENCES lan_gateway_rebind_claims(operation_id),
+    ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+    app_id TEXT NOT NULL REFERENCES applications(id),
+    deployment_id TEXT NOT NULL,
+    release_id TEXT NOT NULL REFERENCES releases(id),
+    slot TEXT NOT NULL CHECK (slot IN ('blue','green')),
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    updated_at TEXT NOT NULL,
+    entry_digest TEXT NOT NULL CHECK (
+        length(entry_digest)=64 AND entry_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    PRIMARY KEY(operation_id, ordinal),
+    UNIQUE(operation_id, app_id),
+    FOREIGN KEY(app_id, deployment_id)
+        REFERENCES generated_runtime_deployments(app_id, deployment_id)
+);
 
 ALTER TABLE lan_gateway_rebind_roster_entries
     ADD COLUMN roster_format_version INTEGER NOT NULL DEFAULT 1
@@ -228,7 +257,10 @@ WHEN NOT (
      AND NEW.predecessor_source_state_revision IS NULL
      AND NEW.predecessor_source_state_digest IS NULL
      AND NEW.predecessor_checkpoint_digest IS NULL
-     AND NEW.successor_protected_generation=0)
+     AND NEW.successor_protected_generation=0
+     AND NEW.runtime_heads_format_version=0
+     AND NEW.runtime_heads_digest IS NULL
+     AND NEW.runtime_heads_count=0)
     OR
     (NEW.spec_format_version=2 AND NEW.roster_format_version=2
      AND NEW.predecessor_source_state_version IS NOT NULL
@@ -236,6 +268,13 @@ WHEN NOT (
      AND NEW.predecessor_source_state_digest IS NOT NULL
      AND NEW.predecessor_checkpoint_digest IS NOT NULL
      AND NEW.successor_protected_generation>NEW.predecessor_protected_generation
+     AND NEW.runtime_heads_format_version=1
+     AND NEW.runtime_heads_digest IS NOT NULL
+     AND (NEW.runtime_heads_count>0 OR NOT EXISTS (
+       SELECT 1 FROM generated_runtime_active_heads h
+       JOIN applications a ON a.id=h.app_id
+       WHERE h.generation>0 AND a.archived_at IS NULL
+     ))
      AND NEW.successor_protected_generation>COALESCE((
        SELECT MAX(c.successor_protected_generation)
        FROM lan_gateway_rebind_claims c WHERE c.spec_format_version=2
@@ -276,7 +315,8 @@ BEFORE UPDATE OF operation_id,singleton,request_digest,approval_action,spec_dige
     predecessor_protected_generation,predecessor_protected_journal_digest,
     predecessor_protected_intent_digest,predecessor_source_state_version,
     predecessor_source_state_revision,predecessor_source_state_digest,
-    predecessor_checkpoint_digest,successor_protected_generation
+    predecessor_checkpoint_digest,successor_protected_generation,
+    runtime_heads_format_version,runtime_heads_digest,runtime_heads_count
 ON lan_gateway_rebind_claims
 BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind claim identity is immutable'); END;
 
@@ -398,6 +438,75 @@ WHEN NOT EXISTS (
 )
 BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind roster entry is not exact'); END;
 
+CREATE TRIGGER lan_gateway_rebind_runtime_head_exact_insert
+BEFORE INSERT ON lan_gateway_rebind_runtime_heads
+WHEN NOT (
+    length(NEW.app_id)=36 AND substr(NEW.app_id,9,1)='-'
+      AND substr(NEW.app_id,14,1)='-' AND substr(NEW.app_id,19,1)='-'
+      AND substr(NEW.app_id,24,1)='-'
+      AND substr(NEW.app_id,1,8) NOT GLOB '*[^0-9a-f]*'
+      AND substr(NEW.app_id,10,4) NOT GLOB '*[^0-9a-f]*'
+      AND substr(NEW.app_id,15,4) NOT GLOB '*[^0-9a-f]*'
+      AND substr(NEW.app_id,20,4) NOT GLOB '*[^0-9a-f]*'
+      AND substr(NEW.app_id,25,12) NOT GLOB '*[^0-9a-f]*'
+    AND length(NEW.deployment_id)=36 AND substr(NEW.deployment_id,9,1)='-'
+      AND substr(NEW.deployment_id,14,1)='-' AND substr(NEW.deployment_id,19,1)='-'
+      AND substr(NEW.deployment_id,24,1)='-'
+      AND substr(NEW.deployment_id,1,8) NOT GLOB '*[^0-9a-f]*'
+      AND substr(NEW.deployment_id,10,4) NOT GLOB '*[^0-9a-f]*'
+      AND substr(NEW.deployment_id,15,4) NOT GLOB '*[^0-9a-f]*'
+      AND substr(NEW.deployment_id,20,4) NOT GLOB '*[^0-9a-f]*'
+      AND substr(NEW.deployment_id,25,12) NOT GLOB '*[^0-9a-f]*'
+    AND length(NEW.release_id)=36 AND substr(NEW.release_id,9,1)='-'
+      AND substr(NEW.release_id,14,1)='-' AND substr(NEW.release_id,19,1)='-'
+      AND substr(NEW.release_id,24,1)='-'
+      AND substr(NEW.release_id,1,8) NOT GLOB '*[^0-9a-f]*'
+      AND substr(NEW.release_id,10,4) NOT GLOB '*[^0-9a-f]*'
+      AND substr(NEW.release_id,15,4) NOT GLOB '*[^0-9a-f]*'
+      AND substr(NEW.release_id,20,4) NOT GLOB '*[^0-9a-f]*'
+      AND substr(NEW.release_id,25,12) NOT GLOB '*[^0-9a-f]*'
+    AND length(NEW.updated_at)=30 AND substr(NEW.updated_at,20,1)='.'
+    AND substr(NEW.updated_at,-1,1)='Z'
+    AND substr(NEW.updated_at,21,9) NOT GLOB '*[^0-9]*'
+    AND julianday(NEW.updated_at) IS NOT NULL
+    AND EXISTS (
+      SELECT 1
+      FROM lan_gateway_rebind_claims c
+      JOIN generated_runtime_active_heads h ON h.app_id=NEW.app_id
+      JOIN applications a ON a.id=h.app_id
+      JOIN generated_runtime_deployments d
+        ON d.app_id=h.app_id AND d.deployment_id=h.deployment_id
+       AND d.release_id=h.release_id AND d.candidate_slot=h.slot
+      JOIN releases r ON r.app_id=h.app_id AND r.id=h.release_id
+      WHERE c.operation_id=NEW.operation_id
+        AND c.spec_format_version=2 AND c.runtime_heads_format_version=1
+        AND c.state='prepared' AND c.state_sequence=1
+        AND NEW.ordinal=(SELECT COUNT(*)+1 FROM lan_gateway_rebind_runtime_heads prior
+                         WHERE prior.operation_id=NEW.operation_id)
+        AND NEW.ordinal<=c.runtime_heads_count
+        AND NEW.app_id>COALESCE((SELECT MAX(prior.app_id)
+                                 FROM lan_gateway_rebind_runtime_heads prior
+                                 WHERE prior.operation_id=NEW.operation_id),'')
+        AND h.deployment_id=NEW.deployment_id AND h.release_id=NEW.release_id
+        AND h.slot=NEW.slot AND h.generation=NEW.generation
+        AND NEW.updated_at=(substr(h.updated_at,1,19)||'.'||
+            CASE WHEN length(h.updated_at)=20 THEN '000000000'
+                 ELSE substr(substr(h.updated_at,21,length(h.updated_at)-21)||'000000000',1,9)
+            END||'Z')
+        AND h.generation>0
+        AND a.archived_at IS NULL
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind runtime head is not exact'); END;
+
+CREATE TRIGGER lan_gateway_rebind_runtime_head_immutable_update
+BEFORE UPDATE ON lan_gateway_rebind_runtime_heads
+BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind runtime head is immutable'); END;
+
+CREATE TRIGGER lan_gateway_rebind_runtime_head_retain
+BEFORE DELETE ON lan_gateway_rebind_runtime_heads
+BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind runtime head history is retained'); END;
+
 CREATE TRIGGER lan_gateway_rebind_transition_guard
 BEFORE INSERT ON lan_gateway_rebind_transition_commands
 BEGIN
@@ -457,6 +566,47 @@ BEGIN
               AND c.predecessor_source_state_revision=NEW.source_state_revision
               AND c.predecessor_source_state_digest=NEW.source_state_digest
               AND c.successor_protected_generation=NEW.protected_generation
+              AND c.runtime_heads_format_version=1
+              AND (SELECT COUNT(*) FROM lan_gateway_rebind_runtime_heads retained
+                   WHERE retained.operation_id=c.operation_id)=c.runtime_heads_count
+              AND COALESCE((SELECT MAX(retained.ordinal)
+                            FROM lan_gateway_rebind_runtime_heads retained
+                            WHERE retained.operation_id=c.operation_id),0)=c.runtime_heads_count
+              AND NOT EXISTS (
+                SELECT 1 FROM lan_gateway_rebind_runtime_heads retained
+                LEFT JOIN generated_runtime_active_heads live ON live.app_id=retained.app_id
+                LEFT JOIN applications app ON app.id=retained.app_id
+                WHERE retained.operation_id=c.operation_id AND (
+                  live.app_id IS NULL OR live.generation<=0 OR app.id IS NULL
+                  OR app.archived_at IS NOT NULL
+                  OR live.deployment_id IS NOT retained.deployment_id
+                  OR live.release_id IS NOT retained.release_id
+                  OR live.slot IS NOT retained.slot
+                  OR live.generation IS NOT retained.generation
+                  OR retained.updated_at IS NOT (substr(live.updated_at,1,19)||'.'||
+                     CASE WHEN length(live.updated_at)=20 THEN '000000000'
+                          ELSE substr(substr(live.updated_at,21,length(live.updated_at)-21)||'000000000',1,9)
+                     END||'Z')
+                )
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM generated_runtime_active_heads live
+                JOIN applications app ON app.id=live.app_id
+                WHERE live.generation>0 AND app.archived_at IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM lan_gateway_rebind_runtime_heads retained
+                    WHERE retained.operation_id=c.operation_id
+                      AND retained.app_id=live.app_id
+                      AND retained.deployment_id=live.deployment_id
+                      AND retained.release_id=live.release_id
+                      AND retained.slot=live.slot
+                      AND retained.generation=live.generation
+                      AND retained.updated_at=(substr(live.updated_at,1,19)||'.'||
+                          CASE WHEN length(live.updated_at)=20 THEN '000000000'
+                               ELSE substr(substr(live.updated_at,21,length(live.updated_at)-21)||'000000000',1,9)
+                          END||'Z')
+                  )
+              )
             ))
       )
       OR NOT (

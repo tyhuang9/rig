@@ -83,16 +83,30 @@ func TestLANGatewayRebindGuardedCommitMigrationRetainsV1AndIsMirrored(t *testing
 	if err := migrateFS(db, only035); err != nil {
 		t.Fatalf("apply 035: %v", err)
 	}
-	var specVersion, rosterVersion, generation int
+	var specVersion, rosterVersion, generation, runtimeHeadsVersion, runtimeHeadsCount int
+	var runtimeHeadsDigest any
 	var operationID, state string
 	if err := db.QueryRow(`SELECT operation_id,state,spec_format_version,roster_format_version,
-		predecessor_protected_generation FROM lan_gateway_rebind_claims WHERE operation_id=?`, rebindOp).
-		Scan(&operationID, &state, &specVersion, &rosterVersion, &generation); err != nil {
+		predecessor_protected_generation,runtime_heads_format_version,
+		runtime_heads_digest,runtime_heads_count
+		FROM lan_gateway_rebind_claims WHERE operation_id=?`, rebindOp).
+		Scan(&operationID, &state, &specVersion, &rosterVersion, &generation,
+			&runtimeHeadsVersion, &runtimeHeadsDigest, &runtimeHeadsCount); err != nil {
 		t.Fatal(err)
 	}
-	if operationID != rebindOp || state != "prepared" || specVersion != 1 || rosterVersion != 1 || generation != 0 {
-		t.Fatalf("retained v1 row changed: op=%q state=%q spec=%d roster=%d generation=%d",
-			operationID, state, specVersion, rosterVersion, generation)
+	if operationID != rebindOp || state != "prepared" || specVersion != 1 || rosterVersion != 1 || generation != 0 ||
+		runtimeHeadsVersion != 0 || runtimeHeadsDigest != nil || runtimeHeadsCount != 0 {
+		t.Fatalf("retained v1 row changed: op=%q state=%q spec=%d roster=%d generation=%d runtime=%d/%v/%d",
+			operationID, state, specVersion, rosterVersion, generation,
+			runtimeHeadsVersion, runtimeHeadsDigest, runtimeHeadsCount)
+	}
+	if _, err := db.Exec(`INSERT INTO lan_gateway_rebind_runtime_heads(
+		operation_id,ordinal,app_id,deployment_id,release_id,slot,generation,updated_at,entry_digest
+	) VALUES(?,1,'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+		'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+		'blue',1,?,?)`, rebindOp, stamp, digest("d")); err == nil ||
+		!strings.Contains(err.Error(), "runtime head is not exact") {
+		t.Fatalf("v1 runtime-head extension injection=%v", err)
 	}
 	var initialEvents int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM lan_gateway_rebind_claim_events
