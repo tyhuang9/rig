@@ -1,0 +1,246 @@
+package generatedingress
+
+import (
+	"errors"
+	"reflect"
+	"sort"
+
+	"github.com/hostd/hostd/internal/appaccess"
+)
+
+const (
+	gatewayCurrentOwnedStopTargetVersion = 1
+	gatewayCurrentOwnedStopTargetPurpose = "hostd/generated-ingress/routes/current-owned-stop/v1"
+)
+
+// gatewayCurrentOwnedStopTarget is protected withdrawal authority only. It
+// does not assert that Lineage is SQL current and cannot authorize serving,
+// publication, or any new effect. The physical adapter may inspect and stop
+// only FinalContainer.ID after proving its complete retained ownership and
+// configuration metadata still match this target.
+type gatewayCurrentOwnedStopTarget struct {
+	Version               int
+	Purpose               string
+	Lineage               appaccess.GatewayCurrentLineageRef
+	Terminal              gatewayRebindAttemptTerminalView
+	State                 gatewayCurrentRouteState
+	PermittedStateDigests []string
+	Pending               *gatewayCurrentPendingRoute
+	FinalContainer        gatewayRebindFinalContainerBinding
+	Digest                string
+}
+
+func gatewayCurrentOwnedStopTargetDigest(value gatewayCurrentOwnedStopTarget) (string, error) {
+	value.Digest = ""
+	return canonicalDigest(value)
+}
+
+func validGatewayCurrentOwnedStopTarget(value gatewayCurrentOwnedStopTarget) bool {
+	if value.Version != gatewayCurrentOwnedStopTargetVersion || value.Purpose != gatewayCurrentOwnedStopTargetPurpose ||
+		!validGatewayCurrentRouteState(value.State) || value.State.Lineage != value.Lineage ||
+		!gatewayRebindAttemptTerminalMatchesLineage(value.Terminal, value.Lineage) ||
+		value.Terminal.Resources.FinalContainer == nil ||
+		!reflect.DeepEqual(value.FinalContainer, *value.Terminal.Resources.FinalContainer) ||
+		!validSHA256(value.Digest) || len(value.PermittedStateDigests) == 0 ||
+		len(value.PermittedStateDigests) > 3 {
+		return false
+	}
+	foundState := false
+	seen := make(map[string]struct{}, len(value.PermittedStateDigests))
+	for _, digest := range value.PermittedStateDigests {
+		if !validSHA256(digest) {
+			return false
+		}
+		if _, duplicate := seen[digest]; duplicate {
+			return false
+		}
+		seen[digest] = struct{}{}
+		foundState = foundState || digest == value.State.Digest
+	}
+	if !foundState || !sort.StringsAreSorted(value.PermittedStateDigests) {
+		return false
+	}
+	digest, err := gatewayCurrentOwnedStopTargetDigest(value)
+	return err == nil && digest == value.Digest
+}
+
+func (m *Manager) gatewayCurrentOwnedStopTargetForTransitionLocked(
+	transition gatewayCurrentPhysicalTransition,
+) (gatewayCurrentOwnedStopTarget, error) {
+	if m == nil || !validGatewayCurrentPhysicalTransition(transition) {
+		return gatewayCurrentOwnedStopTarget{}, errors.New("invalid current owned-stop transition")
+	}
+	target, err := m.gatewayCurrentOwnedStopTargetForStateLocked(transition.Pending)
+	if err != nil {
+		return gatewayCurrentOwnedStopTarget{}, err
+	}
+	target.PermittedStateDigests = canonicalGatewayCurrentOwnedStopDigests(
+		transition.Before.Digest, transition.Pending.Digest, transition.Effective.Digest)
+	target.Pending = cloneGatewayCurrentPendingRoute(transition.Pending.Pending)
+	target.Digest, err = gatewayCurrentOwnedStopTargetDigest(target)
+	if err != nil || !validGatewayCurrentOwnedStopTarget(target) {
+		return gatewayCurrentOwnedStopTarget{}, errors.New("invalid current owned-stop transition target")
+	}
+	return target, nil
+}
+
+func (m *Manager) gatewayCurrentOwnedStopTargetForStateLocked(
+	state gatewayCurrentRouteState,
+) (gatewayCurrentOwnedStopTarget, error) {
+	if m == nil || !validGatewayCurrentRouteState(state) || state.Lineage.Kind != appaccess.GatewayRebindSourceGatewayRebind {
+		return gatewayCurrentOwnedStopTarget{}, errors.New("invalid current owned-stop state")
+	}
+	terminal, err := m.gatewayCurrentOwnedStopTerminalLocked(state.Lineage)
+	if err != nil || terminal.Resources.FinalContainer == nil {
+		return gatewayCurrentOwnedStopTarget{}, errors.New("current owned-stop terminal is unavailable")
+	}
+	target := gatewayCurrentOwnedStopTarget{
+		Version: gatewayCurrentOwnedStopTargetVersion, Purpose: gatewayCurrentOwnedStopTargetPurpose,
+		Lineage: state.Lineage, Terminal: terminal, State: cloneGatewayCurrentRouteState(state),
+		PermittedStateDigests: []string{state.Digest}, Pending: cloneGatewayCurrentPendingRoute(state.Pending),
+		FinalContainer: *terminal.Resources.FinalContainer,
+	}
+	target.Digest, err = gatewayCurrentOwnedStopTargetDigest(target)
+	if err != nil || !validGatewayCurrentOwnedStopTarget(target) {
+		return gatewayCurrentOwnedStopTarget{}, errors.New("invalid current owned-stop target")
+	}
+	return target, nil
+}
+
+// revalidateGatewayCurrentOwnedStopTargetLocked is the effect-boundary guard.
+// It reloads the generation-scoped state and canonical receipt without SQL,
+// permits only a state named by the captured transition, and returns a fresh
+// withdrawal target for that exact retained state.
+func (m *Manager) revalidateGatewayCurrentOwnedStopTargetLocked(
+	target gatewayCurrentOwnedStopTarget,
+) (gatewayCurrentOwnedStopTarget, error) {
+	if m == nil || !validGatewayCurrentOwnedStopTarget(target) {
+		return gatewayCurrentOwnedStopTarget{}, errors.New("invalid current owned-stop target")
+	}
+	store, err := newGatewayCurrentRouteStateStore(m.options.DataRoot, target.Lineage)
+	if err != nil {
+		return gatewayCurrentOwnedStopTarget{}, err
+	}
+	state, err := store.load()
+	if err != nil || state.Lineage != target.Lineage || !gatewayCurrentOwnedStopDigestPermitted(target, state.Digest) {
+		return gatewayCurrentOwnedStopTarget{}, errors.New("current owned-stop protected state changed")
+	}
+	fresh, err := m.gatewayCurrentOwnedStopTargetForStateLocked(state)
+	if err != nil || !reflect.DeepEqual(fresh.Terminal, target.Terminal) ||
+		!reflect.DeepEqual(fresh.FinalContainer, target.FinalContainer) {
+		return gatewayCurrentOwnedStopTarget{}, errors.New("current owned-stop ownership changed")
+	}
+	fresh.PermittedStateDigests = append([]string(nil), target.PermittedStateDigests...)
+	fresh.Pending = cloneGatewayCurrentPendingRoute(target.Pending)
+	fresh.Digest, err = gatewayCurrentOwnedStopTargetDigest(fresh)
+	if err != nil || !validGatewayCurrentOwnedStopTarget(fresh) {
+		return gatewayCurrentOwnedStopTarget{}, errors.New("invalid revalidated current owned-stop target")
+	}
+	return fresh, nil
+}
+
+// gatewayCurrentOwnedStopTargetsProtectedLocked enumerates withdrawal targets
+// only. It deliberately returns every exact committed-lineage route bundle,
+// rather than selecting SQL current from protected history. Missing/corrupt
+// bundles, duplicate final IDs, and conflicting ownership fail closed.
+func (m *Manager) gatewayCurrentOwnedStopTargetsProtectedLocked() ([]gatewayCurrentOwnedStopTarget, error) {
+	if m == nil {
+		return nil, errors.New("invalid current owned-stop manager")
+	}
+	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil {
+		return nil, err
+	}
+	lineages := make([]appaccess.GatewayCurrentLineageRef, 0, len(history.Terminals)+len(history.TerminalsV2))
+	for _, retained := range history.Terminals {
+		lineage, lineageErr := gatewayRebindCurrentLineage(retained.Receipt)
+		if lineageErr == nil {
+			lineages = append(lineages, lineage)
+		}
+	}
+	for _, retained := range history.TerminalsV2 {
+		lineage, lineageErr := gatewayRebindCurrentLineageV2(retained.Receipt)
+		if lineageErr == nil {
+			lineages = append(lineages, lineage)
+		}
+	}
+	sort.Slice(lineages, func(i, j int) bool {
+		if lineages[i].ProtectedGeneration != lineages[j].ProtectedGeneration {
+			return lineages[i].ProtectedGeneration < lineages[j].ProtectedGeneration
+		}
+		return lineages[i].OperationID < lineages[j].OperationID
+	})
+	result := make([]gatewayCurrentOwnedStopTarget, 0, len(lineages))
+	containers := make(map[string]struct{}, len(lineages))
+	for _, lineage := range lineages {
+		store, storeErr := newGatewayCurrentRouteStateStore(m.options.DataRoot, lineage)
+		if storeErr != nil {
+			return nil, storeErr
+		}
+		state, loadErr := store.load()
+		if loadErr != nil {
+			// A protected terminal may precede the SQL database commit and
+			// create-only operational baseline. It is not a current bundle and
+			// is left to the cross-store phase recovery path.
+			continue
+		}
+		target, targetErr := m.gatewayCurrentOwnedStopTargetForStateLocked(state)
+		if targetErr != nil {
+			return nil, targetErr
+		}
+		if _, duplicate := containers[target.FinalContainer.ID]; duplicate {
+			return nil, errors.New("current owned-stop container ownership is ambiguous")
+		}
+		containers[target.FinalContainer.ID] = struct{}{}
+		result = append(result, target)
+	}
+	return result, nil
+}
+
+func (m *Manager) gatewayCurrentOwnedStopTerminalLocked(
+	lineage appaccess.GatewayCurrentLineageRef,
+) (gatewayRebindAttemptTerminalView, error) {
+	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil {
+		return gatewayRebindAttemptTerminalView{}, err
+	}
+	var result *gatewayRebindAttemptTerminalView
+	matches := 0
+	accept := func(candidate gatewayRebindAttemptTerminalView, candidateErr error) {
+		if candidateErr != nil || !gatewayRebindAttemptTerminalMatchesLineage(candidate, lineage) {
+			return
+		}
+		matches++
+		copy := candidate
+		result = &copy
+	}
+	for _, retained := range history.Terminals {
+		accept(newGatewayRebindAttemptTerminalViewLegacy(retained.Receipt))
+	}
+	for _, retained := range history.TerminalsV2 {
+		accept(newGatewayRebindAttemptTerminalViewV2(retained.Receipt))
+	}
+	if result == nil || matches != 1 {
+		return gatewayRebindAttemptTerminalView{}, errors.New("current owned-stop terminal is missing or ambiguous")
+	}
+	return *result, nil
+}
+
+func canonicalGatewayCurrentOwnedStopDigests(values ...string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func gatewayCurrentOwnedStopDigestPermitted(target gatewayCurrentOwnedStopTarget, digest string) bool {
+	index := sort.SearchStrings(target.PermittedStateDigests, digest)
+	return index < len(target.PermittedStateDigests) && target.PermittedStateDigests[index] == digest
+}
