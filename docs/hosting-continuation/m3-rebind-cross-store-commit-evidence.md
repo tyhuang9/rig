@@ -1913,3 +1913,31 @@ Preservation passed four top-level tests with zero failures/skips in 21.286s
 (`Rig/temp/m3-current-batch-quarantine-preservation.jsonl`): the shared current
 observer fixture and three native quarantine success/refusal paths. Vet, gofmt
 and `git diff --check` also passed.
+
+## Startup recovery coordinator integration
+
+Reviewed `99d7cc8` is integrated at `a1a54d3`. The public
+`RecoverGatewayRebindStartup` coordinator owns effects and gateway leases,
+recovers phase-bound SQL/protected intent, reproves no-effect abort receipts,
+and reattests committed current authority before releasing the fence. A
+database-committed operation permits forward recovery only. Required lease
+release failures latch admission closed, including the no-history path.
+
+Independent execution passed six top-level tests and three subcases in
+203.837s, zero failures/skips
+(`Rig/temp/cross-store-review-99d7-startup-recovery.jsonl`). A separate
+checkpoint-removal overlay passed in 18.917s and preserved the prepared fence:
+the suspected first-receipt freshness gap did not reproduce and is not a
+validated vulnerability (`Rig/temp/cross-store-review-99d7-first-noeffect-freshness.jsonl`).
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^Test(RecoverGatewayRebindStartupNoHistoryOwnsAndReleasesAdmissionLocks|GatewayRebindCoordinatorPreservesTransferAcrossOrdinaryRedeploy)$'
+go build -mod=readonly -buildvcs=false ./...
+```
+
+After integration, both named tests passed in 37.168s, zero failures/skips
+(`Rig/temp/m3-current-batch-integrated-recovery.jsonl`), and the full Go build
+passed. These tests simulate physical effects. The production typed Docker
+adapter remains unavailable; startup dispatch must still be wired before
+ordinary admission with the protected emergency stop path. This is not
+evidence of actual Docker recovery or a completed M3 milestone.
