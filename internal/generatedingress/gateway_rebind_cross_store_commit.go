@@ -13,6 +13,11 @@ import (
 
 type gatewayRebindCrossStoreRepository interface {
 	gatewayRebindAdmissionRepository
+	gatewayRebindTransitionRepository
+}
+
+type gatewayRebindTransitionRepository interface {
+	gatewayRebindProposalRepository
 	ApplyGatewayRebindTransition(context.Context, appaccess.GatewayRebindTransitionProof) (appaccess.GatewayRebindTransitionCommand, error)
 }
 
@@ -25,11 +30,72 @@ type gatewayRebindTypedPhysicalResult struct {
 
 type gatewayRebindTypedProgressAppender func(context.Context, gatewayRebindProgressRecord) error
 
+type gatewayRebindPhysicalReconcileMode string
+
+const (
+	gatewayRebindPhysicalReconcileUndecided    gatewayRebindPhysicalReconcileMode = "undecided"
+	gatewayRebindPhysicalReconcileForwardOnly  gatewayRebindPhysicalReconcileMode = "forward_only"
+	gatewayRebindPhysicalReconcileRollbackOnly gatewayRebindPhysicalReconcileMode = "rollback_only"
+)
+
+// gatewayRebindPhysicalReconcileRequest makes the SQL recovery direction and
+// immutable protected decision available before any physical effect. A commit
+// receipt or database-committed SQL phase is always forward-only; a retained
+// abort receipt is rollback-only. Undecided is valid only for a prepared
+// attempt with no terminal receipt and permits the driver to choose a safely
+// proved commit or rollback outcome.
+type gatewayRebindPhysicalReconcileRequest struct {
+	Attempt                gatewayRebindPreparedAttempt
+	Mode                   gatewayRebindPhysicalReconcileMode
+	SQLPhase               appaccess.GatewayRebindState
+	RollbackAllowed        bool
+	DatabaseCommitObserved bool
+	Terminal               *gatewayRebindTerminalReceiptV2
+}
+
+func validGatewayRebindPhysicalReconcileRequest(value gatewayRebindPhysicalReconcileRequest) bool {
+	attempt := value.Attempt
+	if !validGatewayRebindPredecessorCheckpoint(attempt.Checkpoint) ||
+		!validGatewayRebindProtectedIntentV2(attempt.Intent) ||
+		!validGatewayRebindProgressRecord(attempt.Progress) ||
+		attempt.Claim.Spec.OperationID != attempt.Intent.OperationID ||
+		attempt.Claim.Spec.SuccessorProtectedGeneration != attempt.Intent.Generation ||
+		attempt.Checkpoint.sourceRef() != attempt.Claim.Spec.Predecessor ||
+		!reflect.DeepEqual(attempt.Intent.Claim, attempt.Claim) ||
+		!gatewayRebindProgressMatchesIntentV2(attempt.Progress, attempt.Intent, nil) {
+		return false
+	}
+	if value.Terminal != nil {
+		receipt := *value.Terminal
+		if !validGatewayRebindTerminalReceiptV2(receipt) || receipt.ProtectedIntentDigest != attempt.Intent.Digest ||
+			receipt.OperationID != attempt.Claim.Spec.OperationID || receipt.Generation != attempt.Intent.Generation ||
+			receipt.ClaimRequestDigest != attempt.Claim.RequestDigest || receipt.Predecessor != attempt.Claim.Spec.Predecessor {
+			return false
+		}
+	}
+	switch value.Mode {
+	case gatewayRebindPhysicalReconcileUndecided:
+		return value.SQLPhase == appaccess.GatewayRebindPrepared && value.RollbackAllowed &&
+			!value.DatabaseCommitObserved && value.Terminal == nil
+	case gatewayRebindPhysicalReconcileForwardOnly:
+		return value.Terminal != nil && value.Terminal.Disposition == appaccess.GatewayRebindDispositionCommit &&
+			(value.SQLPhase == appaccess.GatewayRebindPrepared ||
+				value.SQLPhase == appaccess.GatewayRebindSuccessorReady ||
+				(value.SQLPhase == appaccess.GatewayRebindDatabaseCommitted && value.DatabaseCommitObserved))
+	case gatewayRebindPhysicalReconcileRollbackOnly:
+		return value.Terminal != nil && value.Terminal.Disposition == appaccess.GatewayRebindDispositionAbort &&
+			value.RollbackAllowed && !value.DatabaseCommitObserved &&
+			(value.SQLPhase == appaccess.GatewayRebindPrepared || value.SQLPhase == appaccess.GatewayRebindSuccessorReady)
+	default:
+		return false
+	}
+}
+
 // gatewayRebindCrossStoreDriver is private and replaceable only by package
 // tests. Production uses the normalized physical adapter; every method runs
 // while the effects lease, Manager mutex and gateway OS lock are held.
 type gatewayRebindCrossStoreDriver interface {
-	reconcileSuccessorLocked(context.Context, gatewayRebindPreparedAttempt,
+	reconcileSuccessorLocked(context.Context, gatewayRebindPhysicalReconcileRequest,
 		gatewayRebindTypedProgressAppender) (gatewayRebindTypedPhysicalResult, error)
 	proveNoSuccessorEffectsLocked(context.Context, appaccess.GatewayRebindClaimV2,
 		[]appaccess.GatewayRebindRosterEntryV2, gatewayRebindPredecessorCheckpoint) (gatewayRebindNoEffectAbortProof, error)
@@ -121,7 +187,14 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 		}
 		return store.installExact(appendCtx, record)
 	}
-	physical, err := driver.reconcileSuccessorLocked(ctx, prepared, appendProgress)
+	request := gatewayRebindPhysicalReconcileRequest{
+		Attempt: prepared, Mode: gatewayRebindPhysicalReconcileUndecided,
+		SQLPhase: appaccess.GatewayRebindPrepared, RollbackAllowed: true,
+	}
+	if !validGatewayRebindPhysicalReconcileRequest(request) {
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	physical, err := driver.reconcileSuccessorLocked(ctx, request, appendProgress)
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
 	}
@@ -245,7 +318,7 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 }
 
 func (m *Manager) finishGatewayRebindRollbackAfterIntentLocked(ctx context.Context,
-	repository gatewayRebindCrossStoreRepository, prepared gatewayRebindPreparedAttempt,
+	repository gatewayRebindTransitionRepository, prepared gatewayRebindPreparedAttempt,
 	last gatewayRebindProgressRecord,
 ) (GatewayRebindCommitResult, error) {
 	if last.Phase != gatewayRebindProgressHandoverRolledBack || last.TypedRollback == nil ||
@@ -321,7 +394,7 @@ func (m *Manager) releaseGatewayRebindTerminalLocks(releaseEffects, releaseGatew
 }
 
 func (m *Manager) abortGatewayRebindPreparedWithoutIntentLocked(ctx context.Context,
-	repository gatewayRebindCrossStoreRepository, driver gatewayRebindCrossStoreDriver, operationID string,
+	repository gatewayRebindTransitionRepository, driver gatewayRebindCrossStoreDriver, operationID string,
 ) (GatewayRebindCommitResult, error) {
 	snapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || snapshot.Active == nil || snapshot.Active.Claim.V2 == nil ||
@@ -447,7 +520,7 @@ func gatewayRebindTransitionProofV2(snapshot appaccess.GatewayRebindRecoverySnap
 	return proof, nil
 }
 
-func applyGatewayRebindTransitionReconciled(ctx context.Context, repository gatewayRebindCrossStoreRepository,
+func applyGatewayRebindTransitionReconciled(ctx context.Context, repository gatewayRebindTransitionRepository,
 	proof appaccess.GatewayRebindTransitionProof,
 ) (appaccess.GatewayRebindTransitionCommand, error) {
 	if proof.NextState == appaccess.GatewayRebindDatabaseCommitted && proof.Transfers == nil {

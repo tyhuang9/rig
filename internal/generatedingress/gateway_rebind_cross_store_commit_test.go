@@ -20,6 +20,7 @@ type gatewayRebindBoundedPhysicalDriver struct {
 	abortCalls  int
 	attestCalls int
 	onAttest    func(gatewayCurrentSelection)
+	lastRequest gatewayRebindPhysicalReconcileRequest
 }
 
 type gatewayRebindLostAckRepository struct {
@@ -126,9 +127,17 @@ func (r *gatewayRebindLostAckRepository) GatewayRebindRecoverySnapshot(ctx conte
 }
 
 func (d *gatewayRebindBoundedPhysicalDriver) reconcileSuccessorLocked(ctx context.Context,
-	attempt gatewayRebindPreparedAttempt, appendProgress gatewayRebindTypedProgressAppender,
+	request gatewayRebindPhysicalReconcileRequest, appendProgress gatewayRebindTypedProgressAppender,
 ) (gatewayRebindTypedPhysicalResult, error) {
 	d.commitCalls++
+	d.lastRequest = request
+	attempt := request.Attempt
+	if request.Mode == gatewayRebindPhysicalReconcileForwardOnly && d.rollback {
+		return gatewayRebindTypedPhysicalResult{}, errors.New("bounded driver refused rollback under forward-only authority")
+	}
+	if request.Mode == gatewayRebindPhysicalReconcileRollbackOnly && !d.rollback {
+		return gatewayRebindTypedPhysicalResult{}, errors.New("bounded driver refused forward completion under rollback-only authority")
+	}
 	records, resources, proof := gatewayRebindTypedCompleteProgressFixture(d.t, d.template,
 		attempt.Checkpoint, attempt.Intent, attempt.Progress)
 	if d.rollback {
