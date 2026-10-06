@@ -124,7 +124,7 @@ func (m *Manager) inspectGatewayRebindCurrentLocked(ctx context.Context,
 	fenceErr := repository.CheckGatewayRebindFence(ctx)
 	switch {
 	case fenceErr == nil:
-		result.FenceReleased = !m.gatewayRebindFailStopLatch().Load()
+		result.FenceReleased = !m.gatewayRebindAdmissionBlocked()
 	case errors.Is(fenceErr, appaccess.ErrGatewayRebindActive):
 		result.FenceReleased = false
 	default:

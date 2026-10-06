@@ -68,6 +68,19 @@ type Options struct {
 	// gateway locks are both held, before any protected gateway observation or
 	// mutation. Production callers must provide a fresh database-backed check.
 	RebindFenceCheck func(context.Context) error
+	// RebindCurrentStateRepository supplies a fresh SQL-selected current
+	// lineage for ordinary route, grant, disable, redeploy, and restart paths.
+	// It is optional for legacy-only callers; any path that observes a scoped
+	// rebind current-state bundle fails closed when this provider is absent.
+	RebindCurrentStateRepository GatewayRebindCurrentStateRepository
+}
+
+// GatewayRebindCurrentStateRepository is intentionally read-only. Ordinary
+// generated-ingress operations use it only to select and revalidate the
+// current protected generation; rebind claims and transitions remain private
+// coordinator operations with their own explicit repository contract.
+type GatewayRebindCurrentStateRepository interface {
+	GatewayRebindRecoverySnapshot(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error)
 }
 
 type Manager struct {
@@ -80,6 +93,10 @@ type Manager struct {
 	// gatewayRebindFailStop points at the process-wide latch in production.
 	// Tests may replace it with a private latch to avoid cross-test state.
 	gatewayRebindFailStop *atomic.Bool
+	// gatewayRebindCommitBarrier is process scoped in production. The final
+	// coordinator arms it before clearing the SQL fence and releases it only
+	// after every local lock and lease release succeeds.
+	gatewayRebindCommitBarrier *atomic.Bool
 	// gatewayRebindV2NetworkObserver is replaceable only by package tests.
 	// Production performs two complete host and Docker inventory reads.
 	gatewayRebindV2NetworkObserver func(context.Context, appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error)
@@ -191,7 +208,8 @@ func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager,
 	}
 	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv,
 		workingDirectoryIdentity: workingDirectoryIdentity, mu: newContextMutex(),
-		gatewayRebindFailStop: &gatewayRebindProcessFailStop}, nil
+		gatewayRebindFailStop:      &gatewayRebindProcessFailStop,
+		gatewayRebindCommitBarrier: &gatewayRebindProcessCommitBarrier}, nil
 }
 
 // Switch atomically reloads the aggregate Caddy route set, durably records the

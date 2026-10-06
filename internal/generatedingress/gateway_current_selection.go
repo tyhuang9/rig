@@ -16,12 +16,13 @@ const (
 )
 
 type gatewayCurrentSelection struct {
-	Kind    gatewayCurrentSelectionKind
-	Lineage appaccess.GatewayCurrentLineageRef
-	Upgrade *gatewayUpgradeGenerationSelection
-	Receipt *gatewayRebindFinalHandoverTerminalReceipt
-	Store   *gatewayCurrentRouteStateStore
-	State   *gatewayCurrentRouteState
+	Kind          gatewayCurrentSelectionKind
+	Lineage       appaccess.GatewayCurrentLineageRef
+	Upgrade       *gatewayUpgradeGenerationSelection
+	UpgradeSource *routeState
+	Receipt       *gatewayRebindFinalHandoverTerminalReceipt
+	Store         *gatewayCurrentRouteStateStore
+	State         *gatewayCurrentRouteState
 }
 
 // MatchesResolution compares the full protected proof with the honest SQL
@@ -78,7 +79,9 @@ func gatewayCurrentUpgradeSelection(history gatewayRebindProtectedIntentHistory,
 		return gatewayCurrentSelection{}, errors.New("generated ingress current upgrade authority disagrees with protected state")
 	}
 	selection := history.Predecessor
-	return gatewayCurrentSelection{Kind: gatewayCurrentSelectionUpgrade, Lineage: lineage, Upgrade: &selection}, nil
+	source := cloneRouteState(history.Source)
+	return gatewayCurrentSelection{Kind: gatewayCurrentSelectionUpgrade, Lineage: lineage,
+		Upgrade: &selection, UpgradeSource: &source}, nil
 }
 
 func gatewayCurrentRebindSelection(dataRoot string, history gatewayRebindProtectedIntentHistory,
@@ -244,10 +247,40 @@ func (m *Manager) selectGatewayCurrentLocked(ctx context.Context,
 	return selection, nil
 }
 
+// readGatewayCurrentSelectionLocked gives normal-operation and startup
+// consumers one fresh SQL/protected selection while their caller holds the
+// Manager and gateway OS locks. The second SQL read prevents a current-head
+// change from crossing the protected selection. It performs no mutation and
+// never falls back to the highest protected receipt when SQL is unavailable.
+func (m *Manager) readGatewayCurrentSelectionLocked(ctx context.Context) (
+	gatewayCurrentSelection, appaccess.GatewayRebindRecoverySnapshot, error,
+) {
+	if m == nil || ctx == nil || ctx.Err() != nil || m.options.RebindCurrentStateRepository == nil {
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{},
+			errors.New("generated ingress current gateway repository is unavailable")
+	}
+	first, err := m.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || first.CurrentSource == nil {
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{},
+			errors.New("generated ingress current gateway SQL selection is unavailable")
+	}
+	selection, err := m.selectGatewayCurrentLocked(ctx, first)
+	if err != nil {
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, err
+	}
+	second, err := m.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || ctx.Err() != nil || !reflect.DeepEqual(first, second) {
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{},
+			errors.New("generated ingress current gateway SQL selection changed")
+	}
+	return selection, first, nil
+}
+
 func sameGatewayRebindCurrentHistory(left, right gatewayRebindProtectedIntentHistory) bool {
-	if len(left.Checkpoints) != len(right.Checkpoints) || len(left.Intents) != len(right.Intents) || len(left.Progress) != len(right.Progress) ||
+	if len(left.Checkpoints) != len(right.Checkpoints) || len(left.Intents) != len(right.Intents) ||
+		len(left.IntentsV2) != len(right.IntentsV2) || len(left.Progress) != len(right.Progress) ||
 		len(left.Terminals) != len(right.Terminals) ||
-		!sameObservedGatewayV2Selection(left.Predecessor, right.Predecessor) {
+		!sameObservedGatewayV2Selection(left.Predecessor, right.Predecessor) || !reflect.DeepEqual(left.Source, right.Source) {
 		return false
 	}
 	for index := range left.Checkpoints {
@@ -257,6 +290,11 @@ func sameGatewayRebindCurrentHistory(left, right gatewayRebindProtectedIntentHis
 	}
 	for index := range left.Intents {
 		if !reflect.DeepEqual(left.Intents[index].Intent, right.Intents[index].Intent) {
+			return false
+		}
+	}
+	for index := range left.IntentsV2 {
+		if !reflect.DeepEqual(left.IntentsV2[index].Intent, right.IntentsV2[index].Intent) {
 			return false
 		}
 	}
