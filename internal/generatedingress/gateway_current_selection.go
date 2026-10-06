@@ -247,6 +247,35 @@ func (m *Manager) selectGatewayCurrentLocked(ctx context.Context,
 	return selection, nil
 }
 
+// readGatewayCurrentSelectionLocked gives normal-operation and startup
+// consumers one fresh SQL/protected selection while their caller holds the
+// Manager and gateway OS locks. The second SQL read prevents a current-head
+// change from crossing the protected selection. It performs no mutation and
+// never falls back to the highest protected receipt when SQL is unavailable.
+func (m *Manager) readGatewayCurrentSelectionLocked(ctx context.Context) (
+	gatewayCurrentSelection, appaccess.GatewayRebindRecoverySnapshot, error,
+) {
+	if m == nil || ctx == nil || ctx.Err() != nil || m.options.RebindCurrentStateRepository == nil {
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{},
+			errors.New("generated ingress current gateway repository is unavailable")
+	}
+	first, err := m.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || first.CurrentSource == nil {
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{},
+			errors.New("generated ingress current gateway SQL selection is unavailable")
+	}
+	selection, err := m.selectGatewayCurrentLocked(ctx, first)
+	if err != nil {
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, err
+	}
+	second, err := m.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || ctx.Err() != nil || !reflect.DeepEqual(first, second) {
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{},
+			errors.New("generated ingress current gateway SQL selection changed")
+	}
+	return selection, first, nil
+}
+
 func sameGatewayRebindCurrentHistory(left, right gatewayRebindProtectedIntentHistory) bool {
 	if len(left.Checkpoints) != len(right.Checkpoints) || len(left.Intents) != len(right.Intents) || len(left.Progress) != len(right.Progress) ||
 		len(left.Terminals) != len(right.Terminals) ||
