@@ -4,6 +4,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -88,13 +89,54 @@ func TestGatewayRebindV2CanonicalTypesBindTypedSourceAndTransferChain(t *testing
 	}
 	const wantEntry = "8f2301c26fca2c6cb0f0ec47a73f6e574ee1fb0dc9d28350b5134826a4c66455"
 	const wantRoster = "7aa081010a2340db2069c16b6614b567354ea312781f736d068e5f7a8b99a56b"
-	const wantSpec = "f5af2e3a43610ad6c1cfb3697d2c00749327864df4a666dcfb8da48553703d75"
+	const wantSpec = "21a56b79e6f4215efec0403bb9b2da002382c42037043ca1a9a4d6298a5088f7"
 	const wantTransfer = "37e44731dc1ab634116a834e43f744b28e1570a0a2161f0f69a522390b742e13"
 	const wantManifest = "b5621d06785d826a517ea7367cfbbfad9f91cb98ab9bc33be119ef206025b0eb"
 	if entryDigest != wantEntry || rosterDigest != wantRoster || specDigest != wantSpec ||
 		transferDigest != wantTransfer || manifestDigest != wantManifest {
 		t.Fatalf("v2 canonical digest mismatch: entry=%s roster=%s spec=%s transfer=%s manifest=%s",
 			entryDigest, rosterDigest, specDigest, transferDigest, manifestDigest)
+	}
+}
+
+func TestGatewayRebindRuntimeHeadsV2DigestBindsCompleteCanonicalCensus(t *testing.T) {
+	heads := gatewayRebindV2GoldenRuntimeHeads()
+	digest, err := GatewayRebindRuntimeHeadsV2Digest(rebindTypeTestOperation, heads)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "1da2d4b9584b0905b8f8abfd139501c42f73ec074ad4b7ec8cbfd61c9a436e18"
+	if digest != want {
+		t.Fatalf("runtime-head digest changed: got %s want %s", digest, want)
+	}
+
+	sameInstant := append([]GatewayRebindRuntimeHead(nil), heads...)
+	sameInstant[0].UpdatedAt = sameInstant[0].UpdatedAt.In(time.FixedZone("test-offset", -6*60*60))
+	if got, err := GatewayRebindRuntimeHeadsV2Digest(rebindTypeTestOperation, sameInstant); err != nil || got != digest {
+		t.Fatalf("equivalent timestamp instant was not canonical: digest=%s error=%v", got, err)
+	}
+	changed := append([]GatewayRebindRuntimeHead(nil), heads...)
+	changed[1].UpdatedAt = changed[1].UpdatedAt.Add(time.Nanosecond)
+	if got, err := GatewayRebindRuntimeHeadsV2Digest(rebindTypeTestOperation, changed); err != nil || got == digest {
+		t.Fatalf("runtime-head update time was not bound: digest=%s error=%v", got, err)
+	}
+
+	for name, mutate := range map[string]func([]GatewayRebindRuntimeHead){
+		"unsorted":            func(values []GatewayRebindRuntimeHead) { values[0], values[1] = values[1], values[0] },
+		"duplicate app":       func(values []GatewayRebindRuntimeHead) { values[1].AppID = values[0].AppID },
+		"inactive generation": func(values []GatewayRebindRuntimeHead) { values[0].Generation = 0 },
+		"missing timestamp":   func(values []GatewayRebindRuntimeHead) { values[0].UpdatedAt = time.Time{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := append([]GatewayRebindRuntimeHead(nil), heads...)
+			mutate(invalid)
+			if _, err := GatewayRebindRuntimeHeadsV2Digest(rebindTypeTestOperation, invalid); err == nil {
+				t.Fatal("invalid runtime-head census was accepted")
+			}
+		})
+	}
+	if _, err := GatewayRebindRuntimeHeadsV2Digest("not-an-operation", heads); err == nil {
+		t.Fatal("invalid runtime-head operation was accepted")
 	}
 }
 
@@ -211,6 +253,8 @@ func gatewayRebindV2GoldenEntry(predecessor *string) GatewayRebindRosterEntryV2 
 }
 
 func gatewayRebindV2GoldenSpec(rosterDigest string) GatewayRebindSpecV2 {
+	runtimeHeads := gatewayRebindV2GoldenRuntimeHeads()
+	runtimeHeadsDigest, _ := GatewayRebindRuntimeHeadsV2Digest(rebindTypeTestOperation, runtimeHeads)
 	return GatewayRebindSpecV2{
 		Version: GatewayRebindSpecVersionV2, OperationID: rebindTypeTestOperation,
 		Predecessor: GatewayRebindSourceRef{
@@ -230,6 +274,20 @@ func gatewayRebindV2GoldenSpec(rosterDigest string) GatewayRebindSpecV2 {
 			SelectedIPv4: "192.168.50.8", InterfaceID: "adapter-v2", PortStart: 8100, PortEnd: 8119,
 		},
 		RosterVersion: GatewayRebindRosterVersionV2, RosterDigest: rosterDigest, RosterCount: 1,
+		RuntimeHeadsVersion: GatewayRebindRuntimeHeadsVersionV1,
+		RuntimeHeadsDigest:  runtimeHeadsDigest, RuntimeHeadsCount: int64(len(runtimeHeads)),
+	}
+}
+
+func gatewayRebindV2GoldenRuntimeHeads() []GatewayRebindRuntimeHead {
+	return []GatewayRebindRuntimeHead{
+		{AppID: rebindTypeTestApp, DeploymentID: rebindTypeTestDeployment,
+			ReleaseID: rebindTypeTestRelease, Slot: "blue", Generation: 7,
+			UpdatedAt: time.Date(2026, time.October, 5, 12, 34, 56, 123456789, time.UTC)},
+		{AppID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+			DeploymentID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+			ReleaseID:    "ffffffff-ffff-4fff-8fff-ffffffffffff", Slot: "green", Generation: 8,
+			UpdatedAt: time.Date(2026, time.October, 5, 12, 35, 57, 987654321, time.UTC)},
 	}
 }
 
