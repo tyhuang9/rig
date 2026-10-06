@@ -132,6 +132,10 @@ func (m *Manager) InspectGatewayV2LANAccessStartup(ctx context.Context,
 	if err != nil || !committed || store == nil || !validGatewayV2RouteState(state) {
 		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(proofCtx)
 	}
+	authority, err := m.readGatewayV2LANStartupAuthorityLocked(proofCtx, store, state, journal, claims.grants, claims.disables)
+	if err != nil {
+		return GatewayV2LANAccessStartupInspection{}, err
+	}
 	inspection, err = inspectGatewayV2LANAccessStartupLocked(proofCtx, state, journal, claims, m.gatewayV2LANDisableDriver())
 	if err != nil {
 		return GatewayV2LANAccessStartupInspection{}, err
@@ -139,6 +143,9 @@ func (m *Manager) InspectGatewayV2LANAccessStartup(ctx context.Context,
 	confirmed, confirmedJournal, err := store.loadBoundUpgrade(journal.OperationID)
 	if err != nil || !reflect.DeepEqual(confirmed, state) || !reflect.DeepEqual(confirmedJournal, journal) {
 		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(proofCtx)
+	}
+	if err := m.confirmGatewayV2LANStartupAuthorityLocked(proofCtx, authority, store, state, journal, claims.grants, claims.disables); err != nil {
+		return GatewayV2LANAccessStartupInspection{}, err
 	}
 	return inspection, nil
 }

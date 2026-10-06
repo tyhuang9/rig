@@ -9,7 +9,7 @@ Base: `a888cac5f34c46aad74afd5c3a0392eec914c509`, the reviewed private handover
 candidate. That handover's draft-publication request is pending. Its prerequisite
 [draft PR #136](https://github.com/tyhuang9/rig/pull/136) was initially published at
 `bdbb697f767da4e71664da1434a75e6daec4b732`; its corrected current head is
-`b46162ea4a97335976663770b17d2a44612cc3f9`.
+`7deefa45ffeaf8b3ffade482ababf5a92368c10c`.
 
 ## Purpose and required end state
 
@@ -61,7 +61,9 @@ a private one-use 256-bit nonce and a nondeterministic SQL guard function:
    uncertain commit never revives the nonce; recovery mints fresh authority
    only after new complete proof.
 
-This is a design decision awaiting implementation and adversarial tests.
+This was the initial design decision. The guarded SQL implementation and
+adversarial test evidence are recorded below; the complete runtime commit,
+recovery and physical acceptance work remains in progress.
 The control DB currently uses a plain file DSN with private cache. Bound nonce
 values must never be logged or traced. The ordinary-SQL threat boundary excludes
 process-memory access, counterfeit registered functions and arbitrary schema
@@ -889,3 +891,42 @@ only exact proved abort recovery can roll back. After a historical database
 commit, preserve successor state and recover forward. External databases remain
 application-owned through scoped runtime secrets; this work adds no managed
 database or Neon provisioning.
+
+### Native LAN startup authority checkpoint, 2026-10-05
+
+Integrated the independently reviewed current-route persistence checkpoint
+`4cfa69236546bee7d6d604ece38de27f064b4dd1` at `d2cfa74`. Its two independently
+executed tests passed in 39.354s, with zero failure or skip. That checkpoint
+covers quiescent persistence, immutable raw bindings/transfer manifest, and
+refusal while another rebind is active; the ordinary mutation state machines
+remain work in progress.
+
+Both read-only native LAN startup inspections now bind SQL current authority
+to the exact protected native store, journal and route state before physical
+observation and confirm the same authority afterward. Effective and retained
+projections must match the actual protected profile and operation. Retained
+history remains separate from serving authorization. Missing providers,
+missing required projections, forged source/interface, active rebind and SQL
+drift refuse startup. Explicit SQL absence preserves the legacy no-projection
+path; it cannot authorize a supplied current or retained projection.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./internal/generatedingress -run '^TestGatewayV2(Startup|LANStartup|LANDisableStartup|LANAccess|LANRecovery)'
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayV2(StartupSQLSelectedNative|LANStartup(BindsNative|RetainedNative|SelectedNative))'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+```
+
+The preservation run passed all 72 top-level tests in 60.878s; the final
+five-test run, including the added SQL-selected native Pending positive,
+passed in 4.876s. Both runs had zero failure or skip. Vet and diff checks
+passed. Logs are `$TEMP/m3-native-lan-authority-preservation.jsonl` and
+`$TEMP/m3-native-lan-authority-confirmed.jsonl`. The first focused run failed
+because its assertion included the fixture's initial grant apply count;
+the fixture counter was reset before inspection, with no production relaxation.
+Its failed log is `$TEMP/m3-native-lan-authority-first.jsonl`.
+
+The tests use real protected storage and locks, projected SQL reader responses
+and bounded fake physical drivers. They cover SQL-selected native Pending and
+LANRecovery startup, but are not Docker acceptance. Quarantine mutation guards,
+rebound physical consumers, process recovery before ordinary admission and
+the complete cross-store coordinator acceptance remain outstanding.

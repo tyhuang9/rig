@@ -76,6 +76,10 @@ func (m *Manager) InspectGatewayV2LANStartup(ctx context.Context, claims []Gatew
 	if err != nil || !committed || store == nil || !validGatewayV2RouteState(state) {
 		return GatewayV2LANStartupInspection{}, gatewayV2StartupInspectionError(proofCtx)
 	}
+	authority, err := m.readGatewayV2LANStartupAuthorityLocked(proofCtx, store, state, journal, claimSet, nil)
+	if err != nil {
+		return GatewayV2LANStartupInspection{}, err
+	}
 	driver := m.gatewayV2LANGrantDriver
 	if driver == nil {
 		driver = managerGatewayV2LANGrantDriver{manager: m}
@@ -164,6 +168,9 @@ func (m *Manager) InspectGatewayV2LANStartup(ctx context.Context, claims []Gatew
 	confirmed, confirmedJournal, err := store.loadBoundUpgrade(journal.OperationID)
 	if err != nil || !reflect.DeepEqual(confirmed, state) || !reflect.DeepEqual(confirmedJournal, journal) {
 		return GatewayV2LANStartupInspection{}, gatewayV2StartupInspectionError(proofCtx)
+	}
+	if err := m.confirmGatewayV2LANStartupAuthorityLocked(proofCtx, authority, store, state, journal, claimSet, nil); err != nil {
+		return GatewayV2LANStartupInspection{}, err
 	}
 
 	if len(recoveryAttempts) == 1 {
