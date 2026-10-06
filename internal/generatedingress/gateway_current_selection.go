@@ -16,12 +16,13 @@ const (
 )
 
 type gatewayCurrentSelection struct {
-	Kind    gatewayCurrentSelectionKind
-	Lineage appaccess.GatewayCurrentLineageRef
-	Upgrade *gatewayUpgradeGenerationSelection
-	Receipt *gatewayRebindFinalHandoverTerminalReceipt
-	Store   *gatewayCurrentRouteStateStore
-	State   *gatewayCurrentRouteState
+	Kind          gatewayCurrentSelectionKind
+	Lineage       appaccess.GatewayCurrentLineageRef
+	Upgrade       *gatewayUpgradeGenerationSelection
+	UpgradeSource *routeState
+	Receipt       *gatewayRebindFinalHandoverTerminalReceipt
+	Store         *gatewayCurrentRouteStateStore
+	State         *gatewayCurrentRouteState
 }
 
 // MatchesResolution compares the full protected proof with the honest SQL
@@ -78,7 +79,9 @@ func gatewayCurrentUpgradeSelection(history gatewayRebindProtectedIntentHistory,
 		return gatewayCurrentSelection{}, errors.New("generated ingress current upgrade authority disagrees with protected state")
 	}
 	selection := history.Predecessor
-	return gatewayCurrentSelection{Kind: gatewayCurrentSelectionUpgrade, Lineage: lineage, Upgrade: &selection}, nil
+	source := cloneRouteState(history.Source)
+	return gatewayCurrentSelection{Kind: gatewayCurrentSelectionUpgrade, Lineage: lineage,
+		Upgrade: &selection, UpgradeSource: &source}, nil
 }
 
 func gatewayCurrentRebindSelection(dataRoot string, history gatewayRebindProtectedIntentHistory,
@@ -247,7 +250,7 @@ func (m *Manager) selectGatewayCurrentLocked(ctx context.Context,
 func sameGatewayRebindCurrentHistory(left, right gatewayRebindProtectedIntentHistory) bool {
 	if len(left.Checkpoints) != len(right.Checkpoints) || len(left.Intents) != len(right.Intents) || len(left.Progress) != len(right.Progress) ||
 		len(left.Terminals) != len(right.Terminals) ||
-		!sameObservedGatewayV2Selection(left.Predecessor, right.Predecessor) {
+		!sameObservedGatewayV2Selection(left.Predecessor, right.Predecessor) || !reflect.DeepEqual(left.Source, right.Source) {
 		return false
 	}
 	for index := range left.Checkpoints {
