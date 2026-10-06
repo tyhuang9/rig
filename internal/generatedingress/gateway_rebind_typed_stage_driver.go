@@ -379,7 +379,7 @@ func (d gatewayRebindTypedStageRuntime) serveStage(ctx context.Context,
 		return "", gatewayRebindEffectBoundaryError(ctx)
 	}
 	inventory, err = d.stageConfigInventory(ctx, effect, body, true)
-	if err != nil || inventory != gatewayRebindStageConfigInventoryExact {
+	if err != nil || inventory != gatewayRebindStageConfigInventoryExact || guard(ctx) != nil {
 		return "", gatewayRebindEffectBoundaryError(ctx)
 	}
 	endpoint := final.StageRuntime.ConfiguredNetworks[intent.Identity.IngressNetwork].EndpointID

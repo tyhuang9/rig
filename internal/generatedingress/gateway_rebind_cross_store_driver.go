@@ -42,6 +42,9 @@ func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorLocked(ctx conte
 		return nil
 	}
 	appendEffect := func(effect gatewayRebindTypedEffectProgress) error {
+		if guard(ctx) != nil {
+			return gatewayRebindEffectBoundaryError(ctx)
+		}
 		record, buildErr := newGatewayRebindTypedEffectProgressV2(request.Attempt.Intent,
 			request.Attempt.Checkpoint, progress, effect,
 			gatewayRebindTimeStrictlyAfter(d.manager.gatewayRebindProgressTime(), progress[len(progress)-1].OccurredAt))

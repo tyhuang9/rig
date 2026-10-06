@@ -75,10 +75,11 @@ func (r gatewayRebindTypedImageRunner) Run(_ context.Context,
 }
 
 type gatewayRebindTypedStageDriverFake struct {
-	t        *testing.T
-	template gatewayCurrentStateFixture
-	guards   int
-	steps    []string
+	t          *testing.T
+	template   gatewayCurrentStateFixture
+	guards     int
+	steps      []string
+	afterServe func()
 }
 
 func (f *gatewayRebindTypedStageDriverFake) guard(ctx context.Context, value gatewayRebindTypedEffectGuard) {
@@ -145,6 +146,9 @@ func (f *gatewayRebindTypedStageDriverFake) serveStage(ctx context.Context, _ ga
 ) (string, error) {
 	f.guard(ctx, guard)
 	f.steps = append(f.steps, "stage-serving")
+	if f.afterServe != nil {
+		f.afterServe()
+	}
 	return f.template.receipt.Resources.StageContainer.ID, nil
 }
 
@@ -360,6 +364,21 @@ func TestGatewayRebindTypedProductionDriverRemainsClosedUntilFinalAdapterExists(
 	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	if err != nil || len(history.Progress) != 1 || history.Progress[0].Record.Sequence != 1 {
 		t.Fatalf("closed adapter changed physical prefix: progress=%d error=%v", len(history.Progress), err)
+	}
+}
+
+func TestGatewayRebindTypedDriverRechecksAuthorityBeforeStageServingRecord(t *testing.T) {
+	fixture, input, bounded := newGatewayRebindCoordinatorFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	fake := &gatewayRebindTypedStageDriverFake{t: t, template: bounded.template, afterServe: cancel}
+	driver := managerGatewayRebindCrossStoreDriver{manager: fixture.manager, stage: fake}
+	if _, err := fixture.manager.commitGatewayRebindWithDriver(ctx, fixture.repository, input, driver); err == nil {
+		t.Fatal("authority drift after final stage observation was accepted")
+	}
+	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.Progress) != 9 || history.Progress[8].Record.Sequence != 9 ||
+		history.Progress[8].Record.Phase != gatewayRebindProgressStageStartIntent {
+		t.Fatalf("stale stage serving was retained: progress=%d error=%v", len(history.Progress), err)
 	}
 }
 
