@@ -1148,3 +1148,14 @@ checkpoint and requested the valid protected-replacement negative, which now
 passes. Full physical rebind adapters, rebound LAN/batch consumers, early
 process recovery dispatch, repeated rebind and final release acceptance remain
 outstanding. This runtime branch remains unpublished.
+
+The frozen startup checkpoint is
+`38c9a360aac233165d5fa5d3de0d7875359aa13a`. Independent review from detached,
+clean source passed all five named top-level tests and 22 subtests, with zero
+failure or skip: app-access 0.787s, ingress 92.751s, and controller 0.753s.
+The anchored run included the real SQL census test, both rebound startup tests
+and both controller mapping tests. Its log is
+`Rig/temp/cross-store-review-38c-startup.jsonl`. The source remained clean.
+The checkpoint received bounded acceptance for census and read-only startup
+classification; the runtime limitations above still apply. Documentation checks
+and build also passed before freezing (3.92s).
