@@ -84,7 +84,7 @@ func TestLiveGatewayRebindCrossStoreProposalRetainsCurrentAuthority(t *testing.T
 	if err != nil {
 		failLiveIngress(t, "inspect real typed cross-store proposal", err)
 	}
-	assertLiveCrossStoreRuntimeHeads(t, inspection.Spec, beforeHeads, fixture.spec.appID, f.loopbackID)
+	assertLiveCrossStoreRuntimeHeads(t, inspection, beforeHeads, fixture.spec.appID, f.loopbackID)
 	digest, err := appaccess.GatewayRebindSpecV2Digest(inspection.Spec)
 	if err != nil || digest != inspection.SpecDigest || inspection.Spec.Version != appaccess.GatewayRebindSpecVersionV2 ||
 		inspection.Spec.OperationID != input.OperationID || inspection.Spec.SuccessorProfile != input.SuccessorProfile ||
@@ -193,7 +193,7 @@ func TestLiveGatewayRebindCrossStorePreparedClaimProcessRecovery(t *testing.T) {
 	if err != nil || len(beforeHeads) != 2 {
 		t.Fatal("read complete two-application runtime heads")
 	}
-	assertLiveCrossStoreRuntimeHeads(t, inspection.Spec, beforeHeads, fixture.spec.appID, f.loopbackID)
+	assertLiveCrossStoreRuntimeHeads(t, inspection, beforeHeads, fixture.spec.appID, f.loopbackID)
 	beforeAccess, err := f.repository.CurrentAppAccess(fixture.ctx, fixture.spec.appID)
 	if err != nil {
 		t.Fatal("read immutable raw grant")
@@ -303,13 +303,15 @@ func TestLiveGatewayRebindCrossStorePreparedClaimProcessRecovery(t *testing.T) {
 	}
 }
 
-func assertLiveCrossStoreRuntimeHeads(t *testing.T, spec appaccess.GatewayRebindSpecV2,
+func assertLiveCrossStoreRuntimeHeads(t *testing.T, inspection GatewayRebindProposalInspection,
 	heads []appaccess.GatewayRebindRuntimeHead, lanAppID, loopbackAppID string,
 ) {
 	t.Helper()
+	spec := inspection.Spec
 	digest, err := appaccess.GatewayRebindRuntimeHeadsV2Digest(spec.OperationID, heads)
 	if err != nil || len(heads) != 2 || spec.RuntimeHeadsVersion != appaccess.GatewayRebindRuntimeHeadsVersionV1 ||
-		spec.RuntimeHeadsCount != int64(len(heads)) || spec.RuntimeHeadsDigest != digest {
+		spec.RuntimeHeadsCount != int64(len(heads)) || spec.RuntimeHeadsDigest != digest ||
+		!reflect.DeepEqual(inspection.RuntimeHeads, heads) {
 		t.Fatal("approval does not bind the complete runtime-head census")
 	}
 	seen := make(map[string]bool, len(heads))

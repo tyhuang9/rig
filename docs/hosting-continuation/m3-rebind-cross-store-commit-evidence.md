@@ -1525,3 +1525,86 @@ at proposal construction, with no skips
 (`Rig/temp/m3-runtime-head-producer-integration-red.jsonl`). This is the
 known intermediate strict-spec/old-producer mismatch, not a passing integrated
 baseline. The unchanged test must pass after the producer update lands.
+
+### Reviewed typed history and coordinator integration
+
+Reviewed runtime checkpoint `007397af` was integrated locally in `ecd9ecd`.
+It retains the actual typed predecessor, structured effect evidence, terminal
+receipt and current-state baseline rather than converting them to native
+upgrade records. The canonical source union distinguishes native upgrades,
+legacy rebind receipts and typed rebind receipts. The private coordinator
+binds SQL transitions to retained protected evidence, exact current state and
+fresh terminal observation. The production physical adapters and early startup
+recovery are still separate unfinished delivery gates.
+
+Independent checks recorded by the integration reviewer:
+
+| Frozen checkpoint | Scope | Result |
+| --- | --- | --- |
+| `f6319bc` | Receipt-summary substitution, state drift before fence release and batch uniqueness regressions | 3 top-level tests, 2 subcases, 55.689s |
+| `f6319bc` | Typed semantic history, empty runtime-head progress, retained local port, commit/no-effect/rollback and strict proposal producer | 7 top-level tests, 9 subcases, 153.987s |
+| `1908fb6` | Fresh prepared replay with empty SQL slices and protected drift after successful terminal SQL commit | 2 top-level tests, 2 subcases, 59.592s |
+| `007397af` | Canonical empty envelope reproducer, 17-record progress, terminal store/scan and empty-transfer baseline install/read | 2 top-level tests, 38.811s |
+
+All listed runs had zero failures or skips. Logs are
+`Rig/temp/cross-store-review-f631-independent-boundaries.jsonl`,
+`Rig/temp/cross-store-review-f631-typed-history.jsonl`,
+`Rig/temp/cross-store-review-1908-recovery-boundaries.jsonl` and
+`Rig/temp/cross-store-review-0073-empty-terminal-green.jsonl`.
+The empty no-effect envelope was first reproduced failing on `331838a` in
+15.796s (`Rig/temp/cross-store-review-3318-noeffect-empty-red.jsonl`), then
+corrected by canonical normalization shared by the prepared evidence writers.
+This keeps empty SQL result sets and protected JSON representations equivalent
+without changing v1 bytes. SQL coordinator tests use real SQLite and simulated
+physical drivers; these results are not Docker acceptance.
+
+### Retained LAN provenance is checked before and after physical inspection
+
+Current-generation startup and singular quarantine now validate the complete
+retained transfer chain against the same SQL snapshot, then bind every link to
+its real protected source and immutable activation manifest. Native grants
+without transfers are tied to the actual native or rebound profile lineage.
+Historical sources are never installed as current authority, and old mutable
+application routes are not treated as evidence of past clearance. Startup
+requires retained authority for a committed grant-based disable after rebind;
+omitting the projection cannot select the old no-authority compatibility path.
+
+The first executable regression returned normal startup for four structurally
+valid but unproved histories: a rehashed false transfer, rehashed false receipt,
+unknown protected source and omitted complete chain. This RED run took 19.732s
+(`Rig/temp/m3-retained-history-red.jsonl`). It used an overlay that replaced only
+the new, then-unwired helper with an empty package so the unchanged public
+startup consumer could be tested before the typed-history dependency landed.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^Test(GatewayCurrentLANStartupRequiresRetainedHistoricalProof|GatewayCurrentLANRetainedHistoryUsesTypedTerminalAndRechecksOldOrigin|InspectGatewayRebindProposalBuildsTypedTransferAwareSource)$'
+go build -mod=readonly -buildvcs=false ./...
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 ./internal/generatedingress -run '^TestLiveGatewayRebindCrossStore'
+```
+
+The integrated run passed three top-level tests and seven subcases in 68.930s,
+with no failures or skips (`Rig/temp/m3-retained-history-and-producer.jsonl`).
+It adds missing-projection refusal, native historical positives under both
+original and rebound profiles, and a two-transfer chain through real protected
+legacy and typed terminal files. Replacing an older generation's protected
+manifest after current physical inspection is refused without overwriting the
+changed evidence or the current generation. The previously failing proposal
+test also passed unchanged. These historical tests use projected SQL snapshots
+and simulated physical attestations; they do not establish actual withdrawal,
+SQL disable mutation, or container restart behavior.
+
+The full build passed. The updated live tests additionally compare the proposal's
+retained runtime-head list with the real SQL census. Their integrated local run
+compiled in 0.766s and explicitly skipped all three opt-in entries
+(`Rig/temp/m3-runtime-head-live-gate-integrated-opt-in.jsonl`); actual Docker
+behavior remains unverified. Vet identified a copied manager lock in the new
+prepared-replay test fixture, which is being corrected separately. No complete
+M3 readiness or publication approval is claimed by this checkpoint.
+
+Existing current startup/quarantine preservation also passed four top-level
+tests and sixteen subcases in 111.591s, with no failures or skips
+(`Rig/temp/m3-retained-history-startup-preservation.jsonl`):
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrentLANStartup(Quarantine|CensusBindsRawGrantAndRecovery|PublicReadRechecksAuthority)'
+```

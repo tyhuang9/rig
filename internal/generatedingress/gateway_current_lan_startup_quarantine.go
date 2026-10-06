@@ -21,10 +21,13 @@ func (m *Manager) quarantineGatewayCurrentLANStartupLocked(ctx context.Context,
 	if err != nil || len(inspection.Recoveries) != 0 {
 		return true, gatewayV2StartupInspectionError(ctx)
 	}
+	if err := m.validateGatewayCurrentLANRetainedHistoryLocked(ctx, claims, snapshot); err != nil {
+		return true, err
+	}
 	if _, err := m.attestGatewayCurrentStateLocked(ctx, state); err != nil {
 		return true, err
 	}
-	if err := m.confirmGatewayCurrentLANStartupStateLocked(ctx, snapshot, state); err != nil {
+	if err := m.confirmGatewayCurrentLANStartupStateLocked(ctx, snapshot, state, claims); err != nil {
 		return true, err
 	}
 	if inspection.Disposition == GatewayV2LANStartupNormal {
@@ -88,12 +91,12 @@ func (m *Manager) quarantineGatewayCurrentLANStartupLocked(ctx context.Context,
 	}
 	if state.Pending == nil {
 		if err := m.persistGatewayCurrentExactLocked(workCtx, state, transition.Pending); err != nil {
-			if confirmErr := m.confirmGatewayCurrentLANStartupStateLocked(workCtx, snapshot, transition.Pending); confirmErr != nil {
+			if confirmErr := m.confirmGatewayCurrentLANStartupStateLocked(workCtx, snapshot, transition.Pending, claims); confirmErr != nil {
 				return stop()
 			}
 		}
 	}
-	if err := m.confirmGatewayCurrentLANStartupStateLocked(workCtx, snapshot, transition.Pending); err != nil {
+	if err := m.confirmGatewayCurrentLANStartupStateLocked(workCtx, snapshot, transition.Pending, claims); err != nil {
 		return stop()
 	}
 	if transition.Kind == gatewayCurrentPhysicalLANGrant {
@@ -104,7 +107,7 @@ func (m *Manager) quarantineGatewayCurrentLANStartupLocked(ctx context.Context,
 	if err != nil {
 		return stop()
 	}
-	if err := m.confirmGatewayCurrentLANStartupStateLocked(workCtx, snapshot, transition.Pending); err != nil {
+	if err := m.confirmGatewayCurrentLANStartupStateLocked(workCtx, snapshot, transition.Pending, claims); err != nil {
 		return stop()
 	}
 	return true, nil
@@ -112,11 +115,12 @@ func (m *Manager) quarantineGatewayCurrentLANStartupLocked(ctx context.Context,
 
 func (m *Manager) confirmGatewayCurrentLANStartupStateLocked(ctx context.Context,
 	snapshot appaccess.GatewayRebindRecoverySnapshot, state gatewayCurrentRouteState,
+	claims gatewayV2LANAccessStartupClaims,
 ) error {
 	selection, current, handled, err := m.gatewayCurrentSelectedStateForRecoveryLocked(ctx)
 	if err != nil || !handled || selection.State == nil || !reflect.DeepEqual(snapshot, current) ||
 		!reflect.DeepEqual(state, *selection.State) || ctx.Err() != nil {
 		return gatewayV2StartupInspectionError(ctx)
 	}
-	return nil
+	return m.validateGatewayCurrentLANRetainedHistoryLocked(ctx, claims, snapshot)
 }

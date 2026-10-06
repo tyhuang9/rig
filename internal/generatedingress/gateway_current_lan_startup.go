@@ -21,6 +21,9 @@ func (m *Manager) inspectGatewayCurrentLANStartupLocked(ctx context.Context,
 	if err != nil {
 		return GatewayV2LANAccessStartupInspection{}, true, err
 	}
+	if err := m.validateGatewayCurrentLANRetainedHistoryLocked(ctx, claims, snapshot); err != nil {
+		return GatewayV2LANAccessStartupInspection{}, true, err
+	}
 	physical, err := m.attestGatewayCurrentPhysicalLocked(ctx, selection)
 	if err != nil || (selection.State.Pending == nil && physical.Outcome != gatewayCurrentPhysicalStableServing) {
 		return GatewayV2LANAccessStartupInspection{}, true, gatewayV2StartupInspectionError(ctx)
@@ -29,6 +32,9 @@ func (m *Manager) inspectGatewayCurrentLANStartupLocked(ctx context.Context,
 	if err != nil || !present || !reflect.DeepEqual(snapshot, confirmedSQL) ||
 		!sameGatewayCurrentSelection(selection, confirmed) || ctx.Err() != nil {
 		return GatewayV2LANAccessStartupInspection{}, true, gatewayV2StartupInspectionError(ctx)
+	}
+	if err := m.validateGatewayCurrentLANRetainedHistoryLocked(ctx, claims, snapshot); err != nil {
+		return GatewayV2LANAccessStartupInspection{}, true, err
 	}
 	return inspection, true, nil
 }
