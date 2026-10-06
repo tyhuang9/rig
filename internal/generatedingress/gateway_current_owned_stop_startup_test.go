@@ -14,6 +14,7 @@ type gatewayCurrentStartupOwnedStopDriver struct {
 	gatewayCurrentPhysicalDriver
 	targets []gatewayCurrentOwnedStopTarget
 	err     error
+	onStop  func()
 }
 
 func prepareGatewayCurrentStartupEmergencyManager(t *testing.T, manager *Manager) {
@@ -33,6 +34,9 @@ func (d *gatewayCurrentStartupOwnedStopDriver) stopGatewayCurrentOwnedTarget(_ c
 		return errors.New("invalid test owned-stop target")
 	}
 	d.targets = append(d.targets, target)
+	if d.onStop != nil {
+		d.onStop()
+	}
 	return d.err
 }
 
@@ -203,6 +207,31 @@ func TestGatewayCurrentStartupEmergencyStopReportsMissingBundleWithoutStoppingBy
 		!result.Incomplete || len(driver.targets) != 0 || !fixture.manager.gatewayRebindFailStopLatch().Load() {
 		t.Fatalf("missing bundle result=%#v targets=%d blocked=%t error=%v",
 			result, len(driver.targets), fixture.manager.gatewayRebindFailStopLatch().Load(), err)
+	}
+}
+
+func TestGatewayCurrentStartupEmergencyStopRejectsWholeHistoryDriftAfterPhysicalStop(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	prepareGatewayCurrentStartupEmergencyManager(t, fixture.manager)
+	if err := fixture.store.installBaseline(fixture.baseline); err != nil {
+		t.Fatal(err)
+	}
+	fixture.manager.gatewayRebindFailStop = &atomic.Bool{}
+	fixture.manager.gatewayRebindCommitBarrier = &atomic.Bool{}
+	driver := &gatewayCurrentStartupOwnedStopDriver{onStop: func() {
+		if err := os.Remove(fixture.history.Terminals[0].Store.path); err != nil {
+			t.Fatalf("remove retained terminal during stop: %v", err)
+		}
+	}}
+	fixture.manager.gatewayCurrentPhysicalDriver = driver
+
+	result, err := fixture.manager.stopOwnedGatewayCurrentOnStartupFailure(context.Background())
+	if err == nil || !IsCode(err, DiagnosticRouteUnresolved) || !result.ProtectedRebindHistoryPresent ||
+		!result.RebindOwnershipPresent || !result.OwnershipIndeterminate || result.VerifiedTargets != 1 ||
+		result.StoppedOrAbsentTargets != 0 || !result.Incomplete || len(driver.targets) != 1 ||
+		!fixture.manager.gatewayRebindFailStopLatch().Load() {
+		t.Fatalf("post-stop history drift result=%#v targets=%d blocked=%t error=%v", result,
+			len(driver.targets), fixture.manager.gatewayRebindFailStopLatch().Load(), err)
 	}
 }
 

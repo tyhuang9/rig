@@ -3,6 +3,7 @@ package generatedingress
 import (
 	"context"
 	"errors"
+	"reflect"
 
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -73,12 +74,22 @@ func (m *Manager) stopOwnedGatewayCurrentOnStartupFailure(ctx context.Context) (
 	result.OwnershipIndeterminate = enumerateErr != nil
 	result.VerifiedTargets = len(targets)
 	if !census.ProtectedRebindHistory && enumerateErr == nil {
+		if confirmErr := m.confirmGatewayCurrentEmergencyCensusLocked(targets, census); confirmErr != nil {
+			m.gatewayRebindFailStopLatch().Store(true)
+			result.Incomplete, result.OwnershipIndeterminate = true, true
+			return result, &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
+		}
 		return result, nil
 	}
 	// Fully retained abort history names no current rebind ownership and no
 	// possible successor effect. Report it explicitly without latching so the
 	// caller may make its separate validated native-current withdrawal choice.
 	if !census.UnresolvedAttempt && !census.CommittedOwnership && enumerateErr == nil {
+		if confirmErr := m.confirmGatewayCurrentEmergencyCensusLocked(targets, census); confirmErr != nil {
+			m.gatewayRebindFailStopLatch().Store(true)
+			result.Incomplete, result.OwnershipIndeterminate = true, true
+			return result, &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
+		}
 		return result, nil
 	}
 	// Once committed rebind ownership or corrupt rebind history is observed,
@@ -93,13 +104,29 @@ func (m *Manager) stopOwnedGatewayCurrentOnStartupFailure(ctx context.Context) (
 		}
 		result.StoppedOrAbsentTargets++
 	}
+	confirmErr := m.confirmGatewayCurrentEmergencyCensusLocked(targets, census)
 	combined := errors.Join(append([]error{enumerateErr}, stopErrors...)...)
-	if combined != nil || census.UnresolvedAttempt || !census.CommittedOwnership || len(targets) == 0 ||
+	if combined != nil || confirmErr != nil || census.UnresolvedAttempt || !census.CommittedOwnership || len(targets) == 0 ||
 		result.StoppedOrAbsentTargets != len(targets) {
+		result.OwnershipIndeterminate = result.OwnershipIndeterminate || confirmErr != nil
 		result.Incomplete = true
 		return result, &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
 	}
 	return result, nil
+}
+
+// A per-target stop guard proves only that target. Re-read the complete
+// protected census before returning so a new active attempt or orphan current
+// bundle cannot cross either the native-fallback absence decision or the
+// all-owned-targets-stopped decision.
+func (m *Manager) confirmGatewayCurrentEmergencyCensusLocked(targets []gatewayCurrentOwnedStopTarget,
+	census gatewayCurrentOwnedStopHistoryCensus,
+) error {
+	confirmedTargets, confirmedCensus, err := m.gatewayCurrentOwnedStopTargetsProtectedPartialLocked()
+	if err != nil || !reflect.DeepEqual(census, confirmedCensus) || !reflect.DeepEqual(targets, confirmedTargets) {
+		return errors.New("current emergency protected ownership changed")
+	}
+	return nil
 }
 
 // Emergency withdrawal never owns the cross-store commit barrier. It latches
