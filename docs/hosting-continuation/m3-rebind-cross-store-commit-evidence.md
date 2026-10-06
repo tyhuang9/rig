@@ -1290,3 +1290,54 @@ application/operation identities fixed the fixture. The first complete
 two-disable run passed in 17.958s (`m3-current-lan-batch-state-final.jsonl`),
 before adding prepared-grant coverage. These pure transformations are a
 prerequisite for the guarded batch consumer, not runtime or Docker acceptance.
+
+Independent review accepted frozen `4147037`: the named batch transition test
+passed in 18.215s with no failure or skip
+(`Rig/temp/cross-store-review-414703-batch-state.jsonl`).
+
+### Ordinary LAN integration and transferred committed recovery
+
+Integrated independently reviewed ordinary current-generation LAN state
+machines at `2b514bc` through local merge `c567f9d`. The independent frozen
+boundary run passed three top-level tests and three subcases in 119.867s,
+with no failures or skips (`Rig/temp/cross-store-review-2b514-lan-boundaries.jsonl`).
+It covers exact request/persistence boundaries, cancellation and uncertain
+writes, proof drift before SQL resolution, and disable resolve/clear/ack retry
+ordering. Physical drivers and SQL callbacks in these tests are simulated.
+
+The controller's committed-grant recovery previously compared an immutable
+original gateway operation with the current rebound gateway operation. A
+two-transfer adapter regression reproduced the resulting refusal (0.703s,
+`Rig/temp/m3-controller-effective-recovery-red.jsonl`). Recovery now separately
+checks unchanged committed claim/proof and the fresh authorized effective
+profile, current source, complete transfer-chain digest and terminal receipt.
+Native recovery retains its original-operation rule and cannot accept a
+transferred profile through that compatibility path. No committed SQL history
+is rewritten and no new disable approval is synthesized.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/controller -run '^TestLAN(GrantCommittedRecoveryUsesEffectiveAuthority|AppGrantRecovery|AppGrantCommittedReplay)'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/controller -run '^TestLAN'
+go vet -mod=readonly ./internal/controller
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Focused tests passed in 6.635s: four top-level tests and eleven subcases, with
+no failures or skips. Cases cover native recovery, two transfers, missing or
+changed proof/source/operation/tip/receipt, broken chain, changed authorized
+claim, demoted approver, and existing session/disable-intent restrictions.
+All selected LAN controller tests passed in 45.077s with no failures or skips;
+vet and full build passed. Logs: `Rig/temp/m3-controller-effective-recovery.jsonl`
+and `Rig/temp/m3-controller-lan-preservation.jsonl`. The new test uses real SQL
+committed claims and projected successor authorization/runtime DTOs; it does
+not establish actual SQL rebind or Docker acceptance.
+
+Controller admission mapping confirms that recovery pinned to a committed
+grant currently supports republishing only after current authorization is
+restored. Normal disable creation/resumption requires an unarchived app and
+current access head, while grant-pinned recovery cannot create a new disable.
+Permanent stale authority must therefore remain physically withdrawn (or the
+exact owned gateway stopped) with committed history retained and normal
+startup refused. A future explicit approved-disable continuation requires a
+separate recovery-specific authorization contract; automatic rollback of a
+committed grant is not permitted.

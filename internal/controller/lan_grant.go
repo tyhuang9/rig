@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"net/http"
+	"reflect"
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
@@ -332,7 +333,7 @@ func (s *Server) reconcileLANBatchGrant(ctx context.Context, claim appaccess.App
 			}
 			resolved, _, readErr = s.AppGrants.ResolveAppAccessGrantClaim(lockCtx, owner, current.State,
 				appaccess.AppAccessGrantRolledBack, appaccess.AppAccessGrantProof{
-					GatewayOperationID: observation.GatewayOperationID,
+					GatewayOperationID:   observation.GatewayOperationID,
 					ProtectedStateDigest: observation.ProtectedStateDigest,
 				})
 			if readErr != nil {
@@ -449,20 +450,24 @@ func (s *Server) reconcileLANGrant(ctx context.Context, claim appaccess.AppAcces
 			if !s.lanGrantActorCurrent(actorID, sessionToken, csrf) {
 				return appaccess.ErrApprovalRequired
 			}
-			if observed.Request != request || observed.Disposition != generatedingress.GatewayV2LANGrantWithdrawnPendingReconciliation || observed.ObservedAt.IsZero() {
+			if observed.Request != request || observed.Disposition != generatedingress.GatewayV2LANGrantWithdrawnPendingReconciliation ||
+				observed.ObservedAt.IsZero() || !validCanonicalUUID(observed.GatewayOperationID) || !validLowerHex(observed.ProtectedStateDigest, 64) {
 				return appaccess.ErrInvalidStoredState
 			}
 			current, readErr := s.AppGrants.AppAccessGrantClaim(lockCtx, claim.AttemptID)
 			if readErr != nil || current.State != appaccess.AppAccessGrantCommitted || current.Proof == nil ||
-				current.RequestDigest != claim.RequestDigest || current.Proof.GatewayOperationID != observed.GatewayOperationID {
+				current.RequestDigest != claim.RequestDigest || current.Spec != claim.Spec {
 				return firstGatewayUpgradeError(readErr, appaccess.ErrInvalidStoredState)
 			}
 			authorized, authErr := s.AppGrants.AuthorizeAppAccessGrant(lockCtx, appaccess.AppAccessGrantAuthorizationInput{
 				Owner:           appaccess.AppAccessGrantClaimOwnerFor(current),
 				PermittedStates: []appaccess.AppAccessGrantState{appaccess.AppAccessGrantCommitted},
 			})
-			if authErr != nil || lanGrantRequestForClaim(authorized.Claim) != request {
+			if authErr != nil || !reflect.DeepEqual(authorized.Claim, current) || lanGrantRequestForClaim(authorized.Claim) != request {
 				return firstGatewayUpgradeError(authErr, appaccess.ErrConflict)
+			}
+			if !lanGrantRecoveryAuthorityMatches(authorized, observed) {
+				return appaccess.ErrInvalidStoredState
 			}
 			if !s.lanGrantActorCurrent(actorID, sessionToken, csrf) {
 				return appaccess.ErrApprovalRequired
@@ -481,6 +486,34 @@ func (s *Server) reconcileLANGrant(ctx context.Context, claim appaccess.AppAcces
 		return appaccess.AppAccessGrantClaim{}, err
 	}
 	return resolved, nil
+}
+
+// The original commit proof remains immutable across a rebind. Republishing
+// requires the current protected generation to match fresh SQL authorization;
+// its operation ID may differ from the grant's original proof.
+func lanGrantRecoveryAuthorityMatches(authorized appaccess.AppAccessGrantAuthorization,
+	observed generatedingress.GatewayV2LANGrantObservation,
+) bool {
+	if authorized.CurrentGatewaySource.Kind == appaccess.GatewayRebindSourceGatewayRebind {
+		return observed.GatewayOperationID == authorized.CurrentGatewaySource.OperationID &&
+			observed.EffectiveBinding.MatchesResolution(appaccess.GatewayBindingResolution{
+				RawAllocation: authorized.Allocation, RawAccessRevision: authorized.Revision,
+				RawGrant: authorized.Claim, RawProfile: authorized.Profile, EffectiveProfile: authorized.EffectiveProfile,
+				CurrentGatewaySource: authorized.CurrentGatewaySource, TransferChain: authorized.TransferChain,
+				TransferChainTipDigest: authorized.TransferChainTipDigest, TerminalReceiptDigest: authorized.TerminalReceiptDigest,
+			})
+	}
+	// Native recovery predates effective-proof observations. It can only restore
+	// the unchanged raw profile under the original operation, with no transfers.
+	return (authorized.CurrentGatewaySource.Kind == "" ||
+		authorized.CurrentGatewaySource.Kind == appaccess.GatewayRebindSourceGatewayUpgrade) &&
+		authorized.Claim.Proof != nil && observed.GatewayOperationID == authorized.Claim.Proof.GatewayOperationID &&
+		(authorized.CurrentGatewaySource.Kind == "" || observed.GatewayOperationID == authorized.CurrentGatewaySource.OperationID) &&
+		len(authorized.TransferChain) == 0 && authorized.TransferChainTipDigest == "" && authorized.TerminalReceiptDigest == "" &&
+		authorized.EffectiveProfile.ID == authorized.Profile.ID &&
+		authorized.EffectiveProfile.RevisionNumber == authorized.Profile.RevisionNumber &&
+		authorized.EffectiveProfile.SpecDigest == authorized.Profile.SpecDigest &&
+		authorized.EffectiveProfile.Spec == authorized.Profile.Spec
 }
 
 type lanGrantAuthorizationLease struct {
