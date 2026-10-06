@@ -11,8 +11,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hostd/hostd/internal/appaccess"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
+
+type gatewayRebindTypedStageAuthorityRepository struct {
+	*appaccess.Repository
+	failHeads bool
+}
+
+func (r *gatewayRebindTypedStageAuthorityRepository) GatewayRebindRuntimeHeads(ctx context.Context) (
+	[]appaccess.GatewayRebindRuntimeHead, error,
+) {
+	if r.failHeads {
+		return nil, errors.New("injected typed stage authority read failure")
+	}
+	return r.Repository.GatewayRebindRuntimeHeads(ctx)
+}
 
 type gatewayRebindTypedImageRunner struct{ image imageInspection }
 
@@ -369,10 +384,12 @@ func TestGatewayRebindTypedProductionDriverRemainsClosedUntilFinalAdapterExists(
 
 func TestGatewayRebindTypedDriverRechecksAuthorityBeforeStageServingRecord(t *testing.T) {
 	fixture, input, bounded := newGatewayRebindCoordinatorFixture(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	fake := &gatewayRebindTypedStageDriverFake{t: t, template: bounded.template, afterServe: cancel}
+	repository := &gatewayRebindTypedStageAuthorityRepository{Repository: fixture.repository}
+	fixture.manager.options.RebindCurrentStateRepository = repository
+	fake := &gatewayRebindTypedStageDriverFake{t: t, template: bounded.template,
+		afterServe: func() { repository.failHeads = true }}
 	driver := managerGatewayRebindCrossStoreDriver{manager: fixture.manager, stage: fake}
-	if _, err := fixture.manager.commitGatewayRebindWithDriver(ctx, fixture.repository, input, driver); err == nil {
+	if _, err := fixture.manager.commitGatewayRebindWithDriver(context.Background(), fixture.repository, input, driver); err == nil {
 		t.Fatal("authority drift after final stage observation was accepted")
 	}
 	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
