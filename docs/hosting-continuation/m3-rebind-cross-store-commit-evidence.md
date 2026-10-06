@@ -2557,3 +2557,22 @@ This is an internal capability awaiting the coherent typed adapter and its
 independent integration review. Default adapter activation, live Docker, Linux
 race checks, hosted CI and full M3 acceptance remain outstanding. No branch was
 published, merged into another branch or deployed for this unit.
+
+Independent executable/source/security review accepted frozen
+`c7fbd58ec43eb50e80582e23450c76590dfb70d0` for this bounded capability. Two tests/one
+selected subcase passed in 74.955s, zero failures/skips. The positive case
+(44.88s) covered lost acknowledgment, exact baseline refusal, idempotence and
+both latches; post-start runtime-authority loss (29.84s) proved exact-owner
+withdrawal. Log: `Rig/temp/cross-store-review-c7-active-serving.jsonl`.
+
+```text
+go test -mod=readonly -count=1 -json -timeout=4m -run '^TestGatewayRebindCommittedServingRestore(KeepsActiveSQLFence|RefusesBoundaryDrift)$/^(runtime_after_start)$' ./internal/generatedingress
+```
+
+The reviewer verified exact HEAD and clean status before/after and found no
+must-fix source/security issue. This is not acceptance of default activation or
+the full milestone. The separate initial-publication missing-Hosting-authority
+guard is being repaired in the typed-runtime worker. Existing cross-store
+contracts close SQL transactions before Docker and revalidate afterward;
+revocation and component-failure reporting remain available. No additional SQL
+mutation-fence migration was introduced to suppress those safety operations.
