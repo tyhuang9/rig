@@ -127,6 +127,10 @@ type Manager struct {
 	// Production uses the committed-v2 reload and publication proof adapter in
 	// gateway_v2_lan_grant.go.
 	gatewayV2LANGrantDriver gatewayV2LANGrantDriver
+	// gatewayCurrentPhysicalDriver is replaceable only by package tests. The
+	// production adapter proves and mutates the SQL-selected rebind generation
+	// without projecting it through a migration-026 journal.
+	gatewayCurrentPhysicalDriver gatewayCurrentPhysicalDriver
 }
 
 // contextMutex lets a route observation abandon lock contention when its

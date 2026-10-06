@@ -295,9 +295,13 @@ func validGatewayCurrentRouteState(value gatewayCurrentRouteState) bool {
 			return false
 		}
 	}
-	// Pending and recovery shapes are admitted by the normal-operation
-	// integration checkpoint. A baseline is always quiescent.
-	if value.Pending != nil || value.LANRecovery != nil {
+	if value.Pending != nil && value.LANRecovery != nil {
+		return false
+	}
+	if value.Pending != nil && !validGatewayCurrentPendingRoute(value) {
+		return false
+	}
+	if value.LANRecovery != nil && !validGatewayCurrentLANRecoveryBatch(value) {
 		return false
 	}
 	digest, err := gatewayCurrentRouteStateDigest(value)
@@ -449,22 +453,85 @@ func cloneGatewayCurrentRouteState(value gatewayCurrentRouteState) gatewayCurren
 	}
 	result.Apps = make(map[string]gatewayCurrentAppRoute, len(value.Apps))
 	for appID, app := range value.Apps {
-		app.Route.Endpoints = append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...)
-		if app.LAN != nil {
-			binding := *app.LAN
-			if app.LAN.Transfer != nil {
-				transfer := *app.LAN.Transfer
-				if transfer.PredecessorTransferDigest != nil {
-					predecessor := *transfer.PredecessorTransferDigest
-					transfer.PredecessorTransferDigest = &predecessor
-				}
-				binding.Transfer = &transfer
-			}
-			app.LAN = &binding
-		}
-		result.Apps[appID] = app
+		result.Apps[appID] = cloneGatewayCurrentAppRoute(app)
 	}
+	result.Pending = cloneGatewayCurrentPendingRoute(value.Pending)
+	result.LANRecovery = cloneGatewayCurrentLANRecoveryBatch(value.LANRecovery)
 	return result
+}
+
+func cloneGatewayCurrentAppRoute(app gatewayCurrentAppRoute) gatewayCurrentAppRoute {
+	app.Route.Endpoints = append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...)
+	if app.LAN != nil {
+		binding := *app.LAN
+		if app.LAN.Transfer != nil {
+			transfer := *app.LAN.Transfer
+			if transfer.PredecessorTransferDigest != nil {
+				predecessor := *transfer.PredecessorTransferDigest
+				transfer.PredecessorTransferDigest = &predecessor
+			}
+			binding.Transfer = &transfer
+		}
+		app.LAN = &binding
+	}
+	return app
+}
+
+func cloneGatewayCurrentPendingRoute(value *gatewayCurrentPendingRoute) *gatewayCurrentPendingRoute {
+	if value == nil {
+		return nil
+	}
+	pending := *value
+	pending.Proposed = cloneGatewayCurrentAppRoute(value.Proposed)
+	if value.Previous != nil {
+		previous := cloneGatewayCurrentAppRoute(*value.Previous)
+		pending.Previous = &previous
+	}
+	if value.Disable != nil {
+		disable := *value.Disable
+		if disable.SourceGrant != nil {
+			source := *disable.SourceGrant
+			disable.SourceGrant = &source
+		}
+		pending.Disable = &disable
+	}
+	return &pending
+}
+
+func cloneGatewayCurrentLANRecoveryBatch(value *gatewayCurrentLANRecoveryBatch) *gatewayCurrentLANRecoveryBatch {
+	if value == nil {
+		return nil
+	}
+	batch := *value
+	batch.Items = append([]gatewayCurrentLANRecoveryItem(nil), value.Items...)
+	for index := range batch.Items {
+		if batch.Items[index].Grant != nil {
+			grant := cloneGatewayCurrentLANBinding(*batch.Items[index].Grant)
+			batch.Items[index].Grant = &grant
+		}
+		if batch.Items[index].Disable != nil {
+			disable := *batch.Items[index].Disable
+			if disable.SourceGrant != nil {
+				source := *disable.SourceGrant
+				disable.SourceGrant = &source
+			}
+			batch.Items[index].Disable = &disable
+		}
+	}
+	batch.LegacyPending = cloneGatewayCurrentPendingRoute(value.LegacyPending)
+	return &batch
+}
+
+func cloneGatewayCurrentLANBinding(value gatewayCurrentLANBinding) gatewayCurrentLANBinding {
+	if value.Transfer != nil {
+		transfer := *value.Transfer
+		if transfer.PredecessorTransferDigest != nil {
+			predecessor := *transfer.PredecessorTransferDigest
+			transfer.PredecessorTransferDigest = &predecessor
+		}
+		value.Transfer = &transfer
+	}
+	return value
 }
 
 func newGatewayCurrentRouteStateStore(dataRoot string, lineage appaccess.GatewayCurrentLineageRef) (*gatewayCurrentRouteStateStore, error) {

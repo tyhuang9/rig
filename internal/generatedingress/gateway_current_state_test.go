@@ -473,6 +473,24 @@ func TestReadGatewayCurrentSelectionLockedRevalidatesSQLAroundProtectedRead(t *t
 	}
 }
 
+func TestSameGatewayCurrentSelectionIncludesRawUpgradeSource(t *testing.T) {
+	leftSource := routeState{Version: stateVersion, Active: map[string]routeRecord{
+		"app-a": {Slot: "blue"},
+	}}
+	rightSource := cloneRouteState(leftSource)
+	left := gatewayCurrentSelection{Kind: gatewayCurrentSelectionUpgrade, UpgradeSource: &leftSource}
+	right := gatewayCurrentSelection{Kind: gatewayCurrentSelectionUpgrade, UpgradeSource: &rightSource}
+	if !sameGatewayCurrentSelection(left, right) {
+		t.Fatal("identical raw upgrade sources differed")
+	}
+	changed := rightSource.Active["app-a"]
+	changed.Slot = "green"
+	rightSource.Active["app-a"] = changed
+	if sameGatewayCurrentSelection(left, right) {
+		t.Fatal("changed raw upgrade source was omitted from selection equality")
+	}
+}
+
 func TestGatewayCurrentTransferHistorySurvivesDisableAndRejectsMissingManifest(t *testing.T) {
 	fixture := newGatewayCurrentStateFixture(t)
 	disabled := cloneGatewayCurrentRouteState(fixture.baseline)
