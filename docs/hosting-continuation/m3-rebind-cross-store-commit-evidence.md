@@ -1453,3 +1453,11 @@ claim, and duplicate port/allocation cases. It passed the named test and its
 subcase in 17.320s with no failures or skips
 (`Rig/temp/m3-current-lan-batch-census-final.jsonl`). These pure comparisons do
 not prove SQL mutation, physical withdrawal, head advancement, or retirement.
+
+Independent review accepted frozen `86cd209`: the named census test and its
+subcase passed in 15.101s with no failures or skips
+(`Rig/temp/cross-store-review-86cd-batch-census.jsonl`). The helper remains
+unwired pending the reviewed physical batch contract. A fresh GitHub read
+also confirmed draft PR #136 remains open at `9694b4e`, with 36 reported
+checks, none pending or failed; this hosted evidence applies only to that
+published branch, not these local recovery checkpoints.
