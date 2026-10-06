@@ -89,6 +89,7 @@ type gatewayRebindProtectedIntentHistory struct {
 	IntentsV2   []gatewayRebindProtectedIntentV2Selection
 	Progress    []gatewayRebindProgressSelection
 	Terminals   []gatewayRebindFinalHandoverTerminalSelection
+	TerminalsV2 []gatewayRebindTerminalSelectionV2
 }
 
 type gatewayRebindPredecessorCheckpointSelection struct {
@@ -518,13 +519,33 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLocked(checkpoint func(
 			})
 		}
 		if artifact.intent.path == "" {
-			if artifact.checkpoint.path == "" || index != len(generations)-1 || len(artifact.progress) != 0 || artifact.terminal.path != "" {
+			if installedCheckpoint == nil || len(artifact.progress) != 0 {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor checkpoint is incomplete")
 			}
+			if artifact.terminal.path == "" {
+				if index != len(generations)-1 {
+					return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor checkpoint is incomplete")
+				}
+				continue
+			}
+			if !gatewayRebindTerminalArtifactV2(artifact.terminal.path) {
+				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind no-intent terminal format is invalid")
+			}
+			terminalStore, storeErr := newGatewayRebindTerminalStoreV2(m.options.DataRoot, generation, artifact.operationID)
+			if storeErr != nil || terminalStore.path != artifact.terminal.path {
+				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind terminal path is invalid")
+			}
+			receipt, receiptErr := terminalStore.load()
+			if receiptErr != nil || !gatewayRebindTerminalV2MatchesNoIntentHistory(receipt, *installedCheckpoint) {
+				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed no-effect terminal history is invalid")
+			}
+			result.TerminalsV2 = append(result.TerminalsV2, gatewayRebindTerminalSelectionV2{
+				Store: terminalStore, Generation: generation, Receipt: receipt, Existing: true,
+			})
 			continue
 		}
 		if strings.HasPrefix(filepath.Base(artifact.intent.path), gatewayRebindProtectedIntentFilenamePrefixV2) {
-			if installedCheckpoint == nil || artifact.terminal.path != "" {
+			if installedCheckpoint == nil {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind intent history is incomplete")
 			}
 			store, storeErr := newGatewayRebindProtectedIntentV2Store(m.options.DataRoot, generation, artifact.operationID)
@@ -539,12 +560,31 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLocked(checkpoint func(
 			result.IntentsV2 = append(result.IntentsV2, gatewayRebindProtectedIntentV2Selection{
 				Store: store, Generation: generation, Intent: intent, Existing: true,
 			})
-			progress, progressErr := scanGatewayRebindProgressForIntentV2(m.options.DataRoot, intent, artifact)
+			progress, progressErr := scanGatewayRebindProgressForIntentV2(m.options.DataRoot, intent,
+				*installedCheckpoint, artifact)
 			if progressErr != nil {
 				return gatewayRebindProtectedIntentHistory{}, progressErr
 			}
+			if !gatewayRebindTypedProgressMatchesPredecessorLocalPort(result, intent, progress) {
+				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed handover source port is invalid")
+			}
 			result.Progress = append(result.Progress, progress...)
-			if index != len(generations)-1 {
+			if artifact.terminal.path != "" {
+				if !gatewayRebindTerminalArtifactV2(artifact.terminal.path) {
+					return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind terminal format is invalid")
+				}
+				terminalStore, terminalStoreErr := newGatewayRebindTerminalStoreV2(m.options.DataRoot, generation, artifact.operationID)
+				if terminalStoreErr != nil || terminalStore.path != artifact.terminal.path {
+					return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind terminal path is invalid")
+				}
+				receipt, receiptErr := terminalStore.load()
+				if receiptErr != nil || !gatewayRebindTerminalV2MatchesIntentHistory(receipt, intent, *installedCheckpoint, progress) {
+					return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind terminal history is invalid")
+				}
+				result.TerminalsV2 = append(result.TerminalsV2, gatewayRebindTerminalSelectionV2{
+					Store: terminalStore, Generation: generation, Receipt: receipt, Existing: true,
+				})
+			} else if index != len(generations)-1 {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind intent history is unresolved")
 			}
 			continue
@@ -615,6 +655,66 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLocked(checkpoint func(
 	return result, nil
 }
 
+func gatewayRebindTypedProgressMatchesPredecessorLocalPort(history gatewayRebindProtectedIntentHistory,
+	intent gatewayRebindProtectedIntentV2, progress []gatewayRebindProgressSelection,
+) bool {
+	if len(progress) < 13 {
+		return true
+	}
+	handover := progress[12].Record.TypedEffect
+	if handover == nil || handover.HandoverIntent == nil {
+		return false
+	}
+	var expected uint16
+	switch intent.Predecessor.Lineage.Kind {
+	case appaccess.GatewayRebindSourceGatewayUpgrade:
+		lineage, err := gatewayUpgradeCurrentLineage(history.Predecessor)
+		if err != nil || lineage != intent.Predecessor.Lineage {
+			return false
+		}
+		expected = history.Predecessor.Journal.Source.LocalHostPort
+	case appaccess.GatewayRebindSourceGatewayRebind:
+		for _, terminal := range history.Terminals {
+			if terminal.Receipt.Digest == intent.Predecessor.Lineage.TerminalReceiptDigest {
+				expected = gatewayRebindRetainedHandoverLocalPort(history.Progress,
+					terminal.Receipt.Generation, terminal.Receipt.OperationID)
+				break
+			}
+		}
+		if expected == 0 {
+			for _, terminal := range history.TerminalsV2 {
+				if terminal.Receipt.Digest == intent.Predecessor.Lineage.TerminalReceiptDigest {
+					expected = gatewayRebindRetainedHandoverLocalPort(history.Progress,
+						terminal.Receipt.Generation, terminal.Receipt.OperationID)
+					break
+				}
+			}
+		}
+	default:
+		return false
+	}
+	return expected != 0 && handover.HandoverIntent.Plan.LocalHostPort == expected
+}
+
+func gatewayRebindRetainedHandoverLocalPort(progress []gatewayRebindProgressSelection,
+	generation uint64, operationID string,
+) uint16 {
+	for _, selection := range progress {
+		record := selection.Record
+		if record.Generation != generation || record.OperationID != operationID || record.Sequence != 13 {
+			continue
+		}
+		if record.TypedEffect != nil && record.TypedEffect.HandoverIntent != nil {
+			return record.TypedEffect.HandoverIntent.Plan.LocalHostPort
+		}
+		if record.Handover != nil && record.Handover.Plan != nil {
+			return record.Handover.Plan.LocalHostPort
+		}
+		return 0
+	}
+	return 0
+}
+
 func gatewayRebindCheckpointMatchesProtectedHistory(checkpoint gatewayRebindPredecessorCheckpoint,
 	predecessor gatewayUpgradeGenerationSelection, history gatewayRebindProtectedIntentHistory,
 ) bool {
@@ -631,6 +731,14 @@ func gatewayRebindCheckpointMatchesProtectedHistory(checkpoint gatewayRebindPred
 				continue
 			}
 			lineage, err := gatewayRebindCurrentLineage(terminal.Receipt)
+			return err == nil && lineage == checkpoint.Lineage
+		}
+		for _, terminal := range history.TerminalsV2 {
+			if terminal.Receipt.Digest != checkpoint.Lineage.TerminalReceiptDigest ||
+				terminal.Receipt.Disposition != appaccess.GatewayRebindDispositionCommit {
+				continue
+			}
+			lineage, err := gatewayRebindCurrentLineageV2(terminal.Receipt)
 			return err == nil && lineage == checkpoint.Lineage
 		}
 	}

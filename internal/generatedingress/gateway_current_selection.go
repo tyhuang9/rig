@@ -21,6 +21,7 @@ type gatewayCurrentSelection struct {
 	Upgrade       *gatewayUpgradeGenerationSelection
 	UpgradeSource *routeState
 	Receipt       *gatewayRebindFinalHandoverTerminalReceipt
+	Terminal      *gatewayRebindAttemptTerminalView
 	Store         *gatewayCurrentRouteStateStore
 	State         *gatewayCurrentRouteState
 }
@@ -94,21 +95,47 @@ func gatewayCurrentRebindSelection(dataRoot string, history gatewayRebindProtect
 		return gatewayCurrentSelection{}, errors.New("generated ingress SQL current rebind authority is invalid")
 	}
 	var receipt *gatewayRebindFinalHandoverTerminalReceipt
+	var terminal *gatewayRebindAttemptTerminalView
 	for index := range history.Terminals {
 		candidate := history.Terminals[index].Receipt
 		if candidate.OperationID != snapshot.CurrentSource.OperationID {
 			continue
 		}
-		if receipt != nil || candidate.Disposition != gatewayRebindFinalHandoverTerminalCommit {
+		if terminal != nil || candidate.Disposition != gatewayRebindFinalHandoverTerminalCommit {
 			return gatewayCurrentSelection{}, errors.New("generated ingress protected current rebind receipt is ambiguous")
 		}
 		copy := candidate
 		receipt = &copy
+		view, viewErr := newGatewayRebindAttemptTerminalViewLegacy(copy)
+		if viewErr != nil {
+			return gatewayCurrentSelection{}, errors.New("generated ingress protected current rebind receipt is invalid")
+		}
+		terminal = &view
 	}
-	if receipt == nil {
+	for index := range history.TerminalsV2 {
+		candidate := history.TerminalsV2[index].Receipt
+		if candidate.OperationID != snapshot.CurrentSource.OperationID {
+			continue
+		}
+		if terminal != nil || candidate.Disposition != appaccess.GatewayRebindDispositionCommit {
+			return gatewayCurrentSelection{}, errors.New("generated ingress protected current rebind receipt is ambiguous")
+		}
+		view, viewErr := newGatewayRebindAttemptTerminalViewV2(candidate)
+		if viewErr != nil {
+			return gatewayCurrentSelection{}, errors.New("generated ingress protected current rebind receipt is invalid")
+		}
+		terminal = &view
+	}
+	if terminal == nil {
 		return gatewayCurrentSelection{}, errors.New("generated ingress protected current rebind receipt is missing")
 	}
-	lineage, err := gatewayRebindCurrentLineage(*receipt)
+	var lineage appaccess.GatewayCurrentLineageRef
+	var err error
+	if terminal.Format == gatewayRebindAttemptTerminalLegacyV1 {
+		lineage, err = gatewayRebindCurrentLineage(*terminal.LegacyReceipt)
+	} else {
+		lineage, err = gatewayRebindCurrentLineageV2(*terminal.TypedReceipt)
+	}
 	if err != nil || gatewayCurrentAuthority(lineage) != *snapshot.CurrentSource {
 		return gatewayCurrentSelection{}, errors.New("generated ingress current rebind authority disagrees with protected state")
 	}
@@ -125,7 +152,7 @@ func gatewayCurrentRebindSelection(dataRoot string, history gatewayRebindProtect
 		return gatewayCurrentSelection{}, errors.New("generated ingress current rebind transfers disagree with protected state")
 	}
 	return gatewayCurrentSelection{Kind: gatewayCurrentSelectionRebind, Lineage: lineage,
-		Receipt: receipt, Store: store, State: &state}, nil
+		Receipt: receipt, Terminal: terminal, Store: store, State: &state}, nil
 }
 
 // gatewayCurrentAuthorityHasDatabaseCommit deliberately inspects retained
@@ -279,7 +306,7 @@ func (m *Manager) readGatewayCurrentSelectionLocked(ctx context.Context) (
 func sameGatewayRebindCurrentHistory(left, right gatewayRebindProtectedIntentHistory) bool {
 	if len(left.Checkpoints) != len(right.Checkpoints) || len(left.Intents) != len(right.Intents) ||
 		len(left.IntentsV2) != len(right.IntentsV2) || len(left.Progress) != len(right.Progress) ||
-		len(left.Terminals) != len(right.Terminals) ||
+		len(left.Terminals) != len(right.Terminals) || len(left.TerminalsV2) != len(right.TerminalsV2) ||
 		!sameObservedGatewayV2Selection(left.Predecessor, right.Predecessor) || !reflect.DeepEqual(left.Source, right.Source) {
 		return false
 	}
@@ -305,6 +332,11 @@ func sameGatewayRebindCurrentHistory(left, right gatewayRebindProtectedIntentHis
 	}
 	for index := range left.Terminals {
 		if !reflect.DeepEqual(left.Terminals[index].Receipt, right.Terminals[index].Receipt) {
+			return false
+		}
+	}
+	for index := range left.TerminalsV2 {
+		if !reflect.DeepEqual(left.TerminalsV2[index].Receipt, right.TerminalsV2[index].Receipt) {
 			return false
 		}
 	}

@@ -131,6 +131,9 @@ type Manager struct {
 	// production adapter proves and mutates the SQL-selected rebind generation
 	// without projecting it through a migration-026 journal.
 	gatewayCurrentPhysicalDriver gatewayCurrentPhysicalDriver
+	// gatewayRebindCrossStoreDriver is replaceable only by package tests. The
+	// production adapter performs the normalized typed-source physical flow.
+	gatewayRebindCrossStoreDriver gatewayRebindCrossStoreDriver
 }
 
 // contextMutex lets a route observation abandon lock contention when its

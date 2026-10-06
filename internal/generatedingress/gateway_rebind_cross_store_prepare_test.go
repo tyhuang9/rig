@@ -48,12 +48,102 @@ func (f *gatewayRebindAdmissionRepositoryFake) ClaimGatewayRebindV2(_ context.Co
 	}
 	retained := appaccess.GatewayRebindHistoryEntry{Claim: appaccess.GatewayRebindClaimRecord{
 		SpecVersion: appaccess.GatewayRebindSpecVersionV2, V2: &f.claim},
-		RosterV2: append([]appaccess.GatewayRebindRosterEntryV2(nil), proposal.Roster...)}
+		RosterV2:     append([]appaccess.GatewayRebindRosterEntryV2(nil), proposal.Roster...),
+		RuntimeHeads: append([]appaccess.GatewayRebindRuntimeHead(nil), proposal.RuntimeHeads...)}
 	f.snapshot.History = append(f.snapshot.History, retained)
 	f.snapshot.Active = &retained
 	f.snapshot.Phase = appaccess.GatewayRebindPrepared
 	f.snapshot.RollbackAllowed = true
 	return f.claim, true, nil
+}
+
+func TestRecoverGatewayRebindPreparedAdmissionTreatsEmptyCensusesCanonically(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		keepApps  bool
+		wantHeads bool
+	}{
+		{name: "zero-heads-and-zero-lan"},
+		{name: "zero-lan-with-runtime-heads", keepApps: true, wantHeads: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGatewayCurrentStateFixture(t)
+			fixture.manager.mu = newContextMutex()
+			fixture.manager.options.RebindFenceCheck = func(context.Context) error { return nil }
+			state := cloneGatewayCurrentRouteState(fixture.baseline)
+			state.Apps = make(map[string]gatewayCurrentAppRoute)
+			if test.keepApps {
+				for appID, app := range fixture.baseline.Apps {
+					app.LAN = nil
+					state.Apps[appID] = app
+				}
+			}
+			var err error
+			state.Digest, err = gatewayCurrentRouteStateDigest(state)
+			if err != nil || fixture.store.installBaseline(state) != nil {
+				t.Fatalf("install source state: %v", err)
+			}
+			fixture.baseline = state
+			repository := &gatewayRebindAdmissionRepositoryFake{
+				gatewayRebindProposalRepositoryFake: gatewayRebindProposalRepositoryForCurrentFixture(t, fixture),
+			}
+			proposal := GatewayRebindProposalInput{OperationID: uuid.NewString(),
+				SuccessorProfileRevisionID:     uuid.NewString(),
+				SuccessorProfileRevisionNumber: state.Profile.RevisionNumber + 1,
+				SuccessorProfileOperationID:    uuid.NewString(),
+				SuccessorProfile: appaccess.GatewayProfileSpec{SelectedIPv4: state.Profile.SelectedIPv4,
+					InterfaceID: state.Profile.InterfaceID, PortStart: state.Profile.PortStart, PortEnd: state.Profile.PortEnd}}
+			inspection, err := fixture.manager.InspectGatewayRebindProposal(context.Background(), repository, proposal)
+			if err != nil || len(inspection.Roster) != 0 || (len(inspection.RuntimeHeads) != 0) != test.wantHeads {
+				t.Fatalf("inspect empty censuses: roster=%d heads=%d error=%v",
+					len(inspection.Roster), len(inspection.RuntimeHeads), err)
+			}
+			input := gatewayRebindCommitInput{Inspection: inspection,
+				RebindApproval: appaccess.Approval{Action: appaccess.ActionRebindGateway,
+					SpecDigest: inspection.SpecDigest, ActorID: uuid.NewString()},
+				ConfigureApproval: appaccess.Approval{Action: appaccess.ActionConfigureGateway,
+					SpecDigest: inspection.SuccessorProfileSpecDigest, ActorID: uuid.NewString()}}
+			fixture.manager.gatewayRebindV2NetworkObserver = func(_ context.Context,
+				claim appaccess.GatewayRebindClaimV2,
+			) (gatewayRebindSuccessorNetworkObservation, error) {
+				value := fixture.intent.NetworkObservation
+				value.OperationID = claim.Spec.OperationID
+				value.ClaimRequestDigest = claim.RequestDigest
+				value.ProfileSpecDigest = claim.ConfigureApproval.SpecDigest
+				return value, nil
+			}
+			fixture.manager.gatewayRebindClock = func() time.Time { return time.Unix(4, 0).UTC() }
+			first, err := fixture.manager.prepareGatewayRebindLocked(context.Background(), repository, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A fresh SQL read materializes canonical empty result sets as
+			// nonnil empty slices. Protected JSON may retain the same censuses
+			// as nil; recovery compares their ordered values, not Go backing
+			// representation.
+			repository.snapshot.Active.RosterV2 = make([]appaccess.GatewayRebindRosterEntryV2, 0)
+			if len(repository.snapshot.Active.RuntimeHeads) == 0 {
+				repository.snapshot.Active.RuntimeHeads = make([]appaccess.GatewayRebindRuntimeHead, 0)
+			}
+			fresh := *fixture.manager
+			fresh.mu = newContextMutex()
+			observed := false
+			fresh.gatewayRebindV2NetworkObserver = func(context.Context,
+				appaccess.GatewayRebindClaimV2,
+			) (gatewayRebindSuccessorNetworkObservation, error) {
+				observed = true
+				return gatewayRebindSuccessorNetworkObservation{}, errors.New("unexpected network observation during exact replay")
+			}
+			fresh.gatewayRebindClock = func() time.Time { return time.Unix(5, 0).UTC() }
+			replayed, err := fresh.recoverGatewayRebindPreparedAdmissionLocked(context.Background(), repository,
+				repository.snapshot)
+			if err != nil || observed || replayed.Intent.Digest != first.Intent.Digest ||
+				replayed.Progress.Digest != first.Progress.Digest {
+				t.Fatalf("fresh prepared replay: intent=%s progress=%s observed=%t error=%v",
+					replayed.Intent.Digest, replayed.Progress.Digest, observed, err)
+			}
+		})
+	}
 }
 
 func TestPrepareGatewayRebindLockedClaimsBeforeProtectedIntent(t *testing.T) {

@@ -28,6 +28,7 @@ type GatewayRebindProposalInput struct {
 type GatewayRebindProposalInspection struct {
 	Spec                        appaccess.GatewayRebindSpecV2
 	Roster                      []appaccess.GatewayRebindRosterEntryV2
+	RuntimeHeads                []appaccess.GatewayRebindRuntimeHead
 	SpecDigest                  string
 	SuccessorProfileSpecDigest  string
 	ProtectedGeneration         uint64
@@ -121,6 +122,10 @@ func (m *Manager) inspectGatewayRebindProposalLocked(ctx context.Context, reposi
 	if err != nil {
 		return GatewayRebindProposalInspection{}, gatewayRebindProposalError(ctx)
 	}
+	runtimeHeadsDigest, err := appaccess.GatewayRebindRuntimeHeadsV2Digest(input.OperationID, heads)
+	if err != nil {
+		return GatewayRebindProposalInspection{}, gatewayRebindProposalError(ctx)
+	}
 	spec := appaccess.GatewayRebindSpecV2{
 		Version: appaccess.GatewayRebindSpecVersionV2, OperationID: input.OperationID,
 		Predecessor: checkpoint.sourceRef(), SuccessorProtectedGeneration: generation,
@@ -128,6 +133,8 @@ func (m *Manager) inspectGatewayRebindProposalLocked(ctx context.Context, reposi
 		SuccessorProfileRevisionNumber: input.SuccessorProfileRevisionNumber,
 		SuccessorProfileOperationID:    input.SuccessorProfileOperationID, SuccessorProfile: input.SuccessorProfile,
 		RosterVersion: appaccess.GatewayRebindRosterVersionV2, RosterDigest: rosterDigest, RosterCount: int64(len(roster)),
+		RuntimeHeadsVersion: appaccess.GatewayRebindRuntimeHeadsVersionV1,
+		RuntimeHeadsDigest:  runtimeHeadsDigest, RuntimeHeadsCount: int64(len(heads)),
 	}
 	specDigest, err := appaccess.GatewayRebindSpecV2Digest(spec)
 	if err != nil {
@@ -139,7 +146,8 @@ func (m *Manager) inspectGatewayRebindProposalLocked(ctx context.Context, reposi
 	}
 	result := GatewayRebindProposalInspection{
 		Spec: spec, Roster: append([]appaccess.GatewayRebindRosterEntryV2(nil), roster...),
-		SpecDigest: specDigest, SuccessorProfileSpecDigest: profileDigest,
+		RuntimeHeads: append([]appaccess.GatewayRebindRuntimeHead(nil), heads...),
+		SpecDigest:   specDigest, SuccessorProfileSpecDigest: profileDigest,
 		ProtectedGeneration: generation, PredecessorCheckpointDigest: checkpoint.Digest,
 		SourceStateVersion: checkpoint.SourceStateVersion, SourceStateRevision: checkpoint.SourceStateRevision,
 		SourceStateDigest: checkpoint.SourceStateDigest,
@@ -360,8 +368,17 @@ func gatewayRebindRawBindingMatchesResolution(appID string, raw gatewayV2LANBind
 
 func sameGatewayCurrentSelection(left, right gatewayCurrentSelection) bool {
 	return left.Kind == right.Kind && left.Lineage == right.Lineage &&
-		reflect.DeepEqual(left.Upgrade, right.Upgrade) && reflect.DeepEqual(left.Receipt, right.Receipt) &&
-		reflect.DeepEqual(left.State, right.State)
+		reflect.DeepEqual(left.Upgrade, right.Upgrade) && reflect.DeepEqual(left.UpgradeSource, right.UpgradeSource) &&
+		reflect.DeepEqual(left.Receipt, right.Receipt) && reflect.DeepEqual(left.Terminal, right.Terminal) &&
+		reflect.DeepEqual(left.State, right.State) && sameGatewayCurrentSelectionStore(left.Store, right.Store)
+}
+
+func sameGatewayCurrentSelectionStore(left, right *gatewayCurrentRouteStateStore) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.generation == right.generation && left.operationID == right.operationID &&
+		left.path == right.path && left.purpose == right.purpose
 }
 
 func gatewayRebindProposalError(ctx context.Context) error {

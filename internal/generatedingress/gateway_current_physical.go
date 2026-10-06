@@ -202,7 +202,7 @@ func (m *Manager) attestGatewayCurrentPhysicalLocked(ctx context.Context,
 	}
 	value, err := m.currentPhysicalDriver().attestGatewayCurrentPhysical(ctx, selection)
 	if err != nil || !validGatewayCurrentPhysicalAttestation(value) || value.Lineage != selection.Lineage ||
-		value.Terminal.Digest != terminal.Digest ||
+		!reflect.DeepEqual(value.Terminal, terminal) ||
 		!reflect.DeepEqual(value.Pending, selection.State.Pending) ||
 		!reflect.DeepEqual(value.LANRecovery, selection.State.LANRecovery) {
 		return gatewayCurrentPhysicalAttestation{}, &Error{Code: DiagnosticRouteUnresolved}
@@ -217,6 +217,13 @@ func (m *Manager) attestGatewayCurrentPhysicalLocked(ctx context.Context,
 // ordinary operations. The typed terminal checkpoint extends this selector
 // without changing the physical driver contract or legacy receipt bytes.
 func gatewayCurrentSelectionTerminalView(selection gatewayCurrentSelection) (gatewayRebindAttemptTerminalView, error) {
+	if selection.Terminal != nil {
+		terminal := *selection.Terminal
+		if !gatewayRebindAttemptTerminalMatchesLineage(terminal, selection.Lineage) {
+			return gatewayRebindAttemptTerminalView{}, errors.New("generated ingress current terminal is invalid")
+		}
+		return terminal, nil
+	}
 	if selection.Receipt == nil {
 		return gatewayRebindAttemptTerminalView{}, errors.New("generated ingress current terminal is unavailable")
 	}
@@ -474,9 +481,14 @@ func validGatewayCurrentLANRecoveryBatch(state gatewayCurrentRouteState) bool {
 	}
 	operations := make(map[string]struct{}, len(batch.Items))
 	apps := make(map[string]struct{}, len(batch.Items))
+	ports := make(map[uint16]struct{}, len(batch.Items))
+	allocations := make(map[string]struct{}, len(batch.Items))
+	attempts := make(map[string]struct{}, len(batch.Items))
+	accessRevisions := make(map[string]struct{}, len(batch.Items))
 	for index, item := range batch.Items {
 		operationID, ok := validGatewayCurrentLANRecoveryItem(state, item)
-		if !ok {
+		raw, rawOK := gatewayCurrentLANRecoveryItemRawBinding(item)
+		if !ok || !rawOK || !gatewayCurrentLANRecoveryRawDisjointFromLive(state, item.AppID, raw) {
 			return false
 		}
 		if _, duplicate := operations[operationID]; duplicate {
@@ -485,7 +497,21 @@ func validGatewayCurrentLANRecoveryBatch(state gatewayCurrentRouteState) bool {
 		if _, duplicate := apps[item.AppID]; duplicate {
 			return false
 		}
+		if _, duplicate := ports[raw.Port]; duplicate {
+			return false
+		}
+		if _, duplicate := allocations[raw.AllocationID]; duplicate {
+			return false
+		}
+		if _, duplicate := attempts[raw.GrantAttemptID]; duplicate {
+			return false
+		}
+		if _, duplicate := accessRevisions[raw.AccessRevisionID]; duplicate {
+			return false
+		}
 		operations[operationID], apps[item.AppID] = struct{}{}, struct{}{}
+		ports[raw.Port], allocations[raw.AllocationID] = struct{}{}, struct{}{}
+		attempts[raw.GrantAttemptID], accessRevisions[raw.AccessRevisionID] = struct{}{}, struct{}{}
 		if index > 0 && !gatewayCurrentLANRecoveryItemLess(batch.Items[index-1], item) {
 			return false
 		}
@@ -513,6 +539,43 @@ func validGatewayCurrentLANRecoveryBatch(state gatewayCurrentRouteState) bool {
 		}
 	}
 	return false
+}
+
+func gatewayCurrentLANRecoveryRawDisjointFromLive(state gatewayCurrentRouteState, itemAppID string,
+	raw gatewayV2LANBinding,
+) bool {
+	for appID, app := range state.Apps {
+		if app.LAN == nil {
+			continue
+		}
+		live := app.LAN.Raw
+		if appID == itemAppID && reflect.DeepEqual(live, raw) {
+			continue
+		}
+		if live.Port == raw.Port || live.AllocationID == raw.AllocationID ||
+			live.GrantAttemptID == raw.GrantAttemptID || live.AccessRevisionID == raw.AccessRevisionID {
+			return false
+		}
+	}
+	return true
+}
+
+func gatewayCurrentLANRecoveryItemRawBinding(item gatewayCurrentLANRecoveryItem) (gatewayV2LANBinding, bool) {
+	switch item.Kind {
+	case gatewayV2PendingLANGrant:
+		if item.Grant == nil {
+			return gatewayV2LANBinding{}, false
+		}
+		return item.Grant.Raw, true
+	case gatewayV2PendingLANDisable:
+		if item.Disable == nil || item.Disable.SourceGrant == nil {
+			return gatewayV2LANBinding{}, false
+		}
+		value, err := gatewayV2LANBindingForRequest(*item.Disable.SourceGrant)
+		return value, err == nil
+	default:
+		return gatewayV2LANBinding{}, false
+	}
 }
 
 func validGatewayCurrentLANRecoveryItem(state gatewayCurrentRouteState,

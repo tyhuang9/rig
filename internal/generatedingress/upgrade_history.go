@@ -887,11 +887,15 @@ func parseGatewayHistoryArtifactName(name string) (uint64, string, uint64, gatew
 		}
 		return generation, parts[1], sequence, gatewayHistoryRebindProgress, true, nil
 	}
-	if strings.HasPrefix(lowerName, gatewayRebindFinalHandoverTerminalFilenamePrefix) {
-		if !strings.HasPrefix(name, gatewayRebindFinalHandoverTerminalFilenamePrefix) {
+	terminalPrefixes := []string{gatewayRebindFinalHandoverTerminalFilenamePrefix, gatewayRebindTerminalFilenamePrefixV2}
+	for _, terminalPrefix := range terminalPrefixes {
+		if !strings.HasPrefix(lowerName, strings.ToLower(terminalPrefix)) {
+			continue
+		}
+		if !strings.HasPrefix(name, terminalPrefix) {
 			return 0, "", 0, 0, true, errors.New("generated ingress rebind terminal filename is invalid")
 		}
-		tail := strings.TrimSuffix(strings.TrimPrefix(name, gatewayRebindFinalHandoverTerminalFilenamePrefix), ".bundle")
+		tail := strings.TrimSuffix(strings.TrimPrefix(name, terminalPrefix), ".bundle")
 		parts := strings.Split(tail, ".")
 		if !strings.HasSuffix(name, ".bundle") || len(parts) != 2 ||
 			len(parts[0]) != gatewayV2GenerationDigits || !validCanonicalUUID(parts[1]) {

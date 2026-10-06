@@ -2,6 +2,7 @@ package generatedingress
 
 import (
 	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -226,7 +227,12 @@ func gatewayRebindAttemptTypedIntentForCheckpoint(t *testing.T, checkpoint gatew
 	network gatewayRebindSuccessorNetworkObservation,
 ) gatewayRebindProtectedIntentV2 {
 	t.Helper()
+	runtimeHeads := gatewayRebindAttemptRuntimeHeads(t, checkpoint, roster)
 	rosterDigest, err := appaccess.GatewayRebindRosterV2Digest(roster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeHeadsDigest, err := appaccess.GatewayRebindRuntimeHeadsV2Digest(checkpoint.OperationID, runtimeHeads)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,6 +243,8 @@ func gatewayRebindAttemptTypedIntentForCheckpoint(t *testing.T, checkpoint gatew
 		SuccessorProfileRevisionNumber: successorRevisionNumber,
 		SuccessorProfileOperationID:    successorOperationID, SuccessorProfile: profileSpec,
 		RosterVersion: appaccess.GatewayRebindRosterVersionV2, RosterDigest: rosterDigest, RosterCount: int64(len(roster)),
+		RuntimeHeadsVersion: appaccess.GatewayRebindRuntimeHeadsVersionV1,
+		RuntimeHeadsDigest:  runtimeHeadsDigest, RuntimeHeadsCount: int64(len(runtimeHeads)),
 	}, State: appaccess.GatewayRebindPrepared, StateSequence: 1}
 	claim.RebindApproval = appaccess.Approval{Action: appaccess.ActionRebindGateway, ActorID: uuid.NewString()}
 	claim.RebindApproval.SpecDigest, err = appaccess.GatewayRebindSpecV2Digest(claim.Spec)
@@ -270,9 +278,42 @@ func gatewayRebindAttemptTypedIntentForCheckpoint(t *testing.T, checkpoint gatew
 	network.OperationID = checkpoint.OperationID
 	network.ClaimRequestDigest = claim.RequestDigest
 	network.ProfileSpecDigest = claim.ConfigureApproval.SpecDigest
-	intent, err := newGatewayRebindProtectedIntentV2(claim, roster, checkpoint, network)
+	intent, err := newGatewayRebindProtectedIntentV2(claim, roster, runtimeHeads, checkpoint, network)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return intent
+}
+
+func gatewayRebindAttemptRuntimeHeads(t *testing.T, checkpoint gatewayRebindPredecessorCheckpoint,
+	roster []appaccess.GatewayRebindRosterEntryV2,
+) []appaccess.GatewayRebindRuntimeHead {
+	t.Helper()
+	apps, _, ok := gatewayRebindTypedCheckpointApps(checkpoint)
+	if !ok {
+		t.Fatal("typed fixture checkpoint has no apps")
+	}
+	entries := make(map[string]appaccess.GatewayRebindRosterEntryV2, len(roster))
+	for _, entry := range roster {
+		entries[entry.AppID] = entry
+	}
+	appIDs := make([]string, 0, len(apps))
+	for appID := range apps {
+		appIDs = append(appIDs, appID)
+	}
+	sort.Strings(appIDs)
+	heads := make([]appaccess.GatewayRebindRuntimeHead, 0, len(appIDs))
+	for index, appID := range appIDs {
+		app := apps[appID]
+		head := appaccess.GatewayRebindRuntimeHead{AppID: appID,
+			DeploymentID: uuid.NewSHA1(uuid.Nil, []byte("typed-head-deployment-"+appID)).String(),
+			ReleaseID:    uuid.NewSHA1(uuid.Nil, []byte("typed-head-release-"+appID)).String(),
+			Slot:         string(app.Route.Slot), Generation: int64(index + 1), UpdatedAt: time.Unix(int64(index+1), 0).UTC()}
+		if entry, exists := entries[appID]; exists {
+			head.DeploymentID, head.ReleaseID, head.Slot, head.Generation = entry.ServingDeploymentID,
+				entry.ServingReleaseID, entry.ServingSlot, entry.RouteGeneration
+		}
+		heads = append(heads, head)
+	}
+	return heads
 }

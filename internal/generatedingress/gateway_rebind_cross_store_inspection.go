@@ -134,7 +134,7 @@ func (m *Manager) inspectGatewayRebindCurrentLocked(ctx context.Context,
 	if err != nil {
 		return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
 	}
-	result.Retained = make([]GatewayRebindRetainedOperationInspection, 0, len(history.Terminals))
+	result.Retained = make([]GatewayRebindRetainedOperationInspection, 0, len(history.Terminals)+len(history.TerminalsV2))
 	for _, terminal := range history.Terminals {
 		value, err := gatewayRebindRetainedOperationInspection(terminal.Receipt)
 		if err != nil {
@@ -142,10 +142,87 @@ func (m *Manager) inspectGatewayRebindCurrentLocked(ctx context.Context,
 		}
 		result.Retained = append(result.Retained, value)
 	}
+	for _, terminal := range history.TerminalsV2 {
+		value, err := gatewayRebindRetainedOperationInspectionV2(terminal.Receipt)
+		if err != nil {
+			return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
+		}
+		result.Retained = append(result.Retained, value)
+	}
+	sort.Slice(result.Retained, func(i, j int) bool { return result.Retained[i].Generation < result.Retained[j].Generation })
 	confirmed, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || !reflect.DeepEqual(snapshot, confirmed) || ctx.Err() != nil {
 		return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
 	}
+	return result, nil
+}
+
+func gatewayRebindRetainedOperationInspectionV2(receipt gatewayRebindTerminalReceiptV2) (
+	GatewayRebindRetainedOperationInspection, error,
+) {
+	if !validGatewayRebindTerminalReceiptV2(receipt) {
+		return GatewayRebindRetainedOperationInspection{}, errors.New("typed retained receipt is invalid")
+	}
+	result := GatewayRebindRetainedOperationInspection{
+		Generation: receipt.Generation, OperationID: receipt.OperationID, Disposition: receipt.Disposition,
+		TerminalReceiptDigest: receipt.Digest, PredecessorOperationID: receipt.Predecessor.Lineage.OperationID,
+	}
+	if receipt.RollbackProof != nil {
+		owned := receipt.RollbackProof.Owned
+		result.Resources.ImageID = owned.ImageID
+		if owned.IngressNetwork != nil {
+			result.Resources.IngressNetworkName = receipt.SuccessorIdentity.IngressNetwork
+			result.Resources.IngressNetworkID = owned.IngressNetwork.ID
+			result.Resources.IngressNetworkOwnershipDigest = owned.IngressNetwork.OwnershipDigest
+		}
+		if owned.ConfigVolume != nil {
+			result.Resources.ConfigVolumeName = owned.ConfigVolume.Name
+			result.Resources.ConfigVolumeOwnershipDigest = owned.ConfigVolume.OwnershipDigest
+		}
+		if owned.DataVolume != nil {
+			result.Resources.DataVolumeName = owned.DataVolume.Name
+			result.Resources.DataVolumeOwnershipDigest = owned.DataVolume.OwnershipDigest
+		}
+		if owned.StageContainer != nil {
+			result.Resources.StageContainerID = owned.StageContainer.ID
+			result.Resources.StageContainerOwnershipDigest = owned.StageContainer.OwnershipDigest
+		}
+		if owned.FinalContainer != nil {
+			result.Resources.FinalContainerID = owned.FinalContainer.ID
+			result.Resources.FinalContainerOwnershipDigest = owned.FinalContainer.OwnershipDigest
+		}
+		for _, network := range owned.ApplicationNetworks {
+			result.Resources.ApplicationNetworks = append(result.Resources.ApplicationNetworks,
+				GatewayRebindApplicationNetworkInspection{Name: network.Name, ID: network.ID})
+		}
+		return result, nil
+	}
+	if receipt.Resources == nil {
+		return result, nil
+	}
+	resources := *receipt.Resources
+	result.Resources = GatewayRebindOwnedResourceInspection{
+		ImageID: resources.ImageID, IngressNetworkName: receipt.SuccessorIdentity.IngressNetwork,
+		IngressNetworkID:              resources.IngressNetwork.ID,
+		IngressNetworkOwnershipDigest: resources.IngressNetwork.OwnershipDigest,
+		ConfigVolumeName:              resources.ConfigVolume.Name, ConfigVolumeOwnershipDigest: resources.ConfigVolume.OwnershipDigest,
+		DataVolumeName: resources.DataVolume.Name, DataVolumeOwnershipDigest: resources.DataVolume.OwnershipDigest,
+		StageContainerID: resources.StageContainer.ID, StageContainerOwnershipDigest: resources.StageContainer.OwnershipDigest,
+	}
+	if resources.FinalContainer != nil {
+		result.Resources.FinalContainerID = resources.FinalContainer.ID
+		result.Resources.FinalContainerOwnershipDigest = resources.FinalContainer.OwnershipDigest
+	}
+	for _, network := range resources.ApplicationNetworks {
+		result.Resources.ApplicationNetworks = append(result.Resources.ApplicationNetworks,
+			GatewayRebindApplicationNetworkInspection{Name: network.Name, ID: network.ID})
+	}
+	sort.Slice(result.Resources.ApplicationNetworks, func(i, j int) bool {
+		if result.Resources.ApplicationNetworks[i].Name != result.Resources.ApplicationNetworks[j].Name {
+			return result.Resources.ApplicationNetworks[i].Name < result.Resources.ApplicationNetworks[j].Name
+		}
+		return result.Resources.ApplicationNetworks[i].ID < result.Resources.ApplicationNetworks[j].ID
+	})
 	return result, nil
 }
 
