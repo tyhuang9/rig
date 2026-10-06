@@ -303,6 +303,12 @@ func (d managerGatewayCurrentPhysicalRuntime) restartStopped(ctx context.Context
 		if err != nil || !stopped || (requireExactRestart && !exact) {
 			return gatewayCurrentPhysicalDriverError(effectCtx)
 		}
+		// The stopped inventory includes Docker, restart-config, network, and
+		// endpoint reads. Reconfirm authority after those reads so a change at
+		// the end of inventory cannot cross the following copy or start boundary.
+		if err := guard(effectCtx); err != nil || d.manager.gatewayRebindAdmissionBlocked() {
+			return gatewayCurrentPhysicalDriverError(effectCtx)
+		}
 		return nil
 	}
 	if err := stoppedGuard(ctx, false); err != nil {
