@@ -21,20 +21,12 @@ import (
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
-	"github.com/hostd/hostd/internal/hostnetwork"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
 const liveFinalHandoverEnvironment = "RIG_RUN_LIVE_GATEWAY_REBIND_HANDOVER"
 const liveFinalHandoverChildEnvironment = "RIG_TEST_LIVE_FINAL_HANDOVER_CHILD"
 const liveFinalHandoverModeEnvironment = "RIG_TEST_LIVE_FINAL_HANDOVER_MODE"
-
-// These tests require explicit permission to create a disposable dummy adapter.
-// Both approved addresses are on that adapter; no existing host NIC is changed.
-func liveFinalHandoverAddresses(t *testing.T) (hostnetwork.Candidate, hostnetwork.Candidate) {
-	t.Helper()
-	return liveGatewayRebindHostAddresses(t, liveFinalHandoverEnvironment)
-}
 
 // liveGatewayRebindSourceFixture owns the original upgraded gateway and two
 // applications, before any rebind claim or successor resource exists. Each
@@ -56,12 +48,12 @@ type liveFinalHandoverFixture struct {
 	prepared appaccess.GatewayRebindStartupSnapshot
 }
 
-func newLiveGatewayRebindSourceFixture(t *testing.T) liveGatewayRebindSourceFixture {
+func newLiveGatewayRebindSourceFixture(t *testing.T, permissionEnvironment string) liveGatewayRebindSourceFixture {
 	t.Helper()
-	before, after := liveFinalHandoverAddresses(t)
+	before, after := liveGatewayRebindHostAddresses(t, permissionEnvironment)
 	spec := liveGatewayV2FixtureSpec{appID: "e1111111-1111-4111-8111-111111111111", planID: "e2222222-2222-4222-8222-222222222222",
 		operationID: "e3333333-3333-4333-8333-333333333333", profileRevision: "e4444444-4444-4444-8444-444444444444",
-		approvedBy: gatewayRebindTestAdministrator, imageTag: "rig-generated-gateway-v2-live:final-handover", applicationReply: "final-handover-lan"}
+		approvedBy: gatewayRebindTestAdministrator, imageTag: "rig-generated-gateway-v2-live:final-handover", applicationReply: "final-handover-lan", countRequests: true}
 	fixture := newLiveGatewayV2Fixture(t, spec)
 	journeyContext, cancelJourney := context.WithTimeout(context.Background(), 30*time.Minute)
 	t.Cleanup(cancelJourney)
@@ -108,12 +100,7 @@ func newLiveGatewayRebindSourceFixture(t *testing.T) liveGatewayRebindSourceFixt
 	if err != nil || len(fixture.source.Active) != 2 {
 		t.Fatal("load complete two-application source")
 	}
-	db, err := database.Open(fixture.stateRoot)
-	if err != nil {
-		t.Fatal("open live handover SQLite")
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	repository := appaccess.New(db)
+	db, repository := fixture.db, fixture.repository
 	profile := prepareLiveGatewayRebindStagePredecessor(t, fixture, db, repository)
 	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'draft',datetime('now'),datetime('now'))`, loopbackID, "handover-loopback", "Loopback-only handover app"); err != nil {
 		t.Fatal(err)
@@ -130,7 +117,7 @@ func newLiveGatewayRebindSourceFixture(t *testing.T) liveGatewayRebindSourceFixt
 
 func newLiveFinalHandoverFixture(t *testing.T) liveFinalHandoverFixture {
 	t.Helper()
-	source := newLiveGatewayRebindSourceFixture(t)
+	source := newLiveGatewayRebindSourceFixture(t, liveFinalHandoverEnvironment)
 	fixture, db, repository, proposal := source.fixture, source.db, source.repository, source.proposal
 	state, journal, store := liveGatewayV2LoadDurableOperation(t, fixture)
 	if len(state.Apps) != 2 || state.Apps[source.loopbackID].LAN != nil || state.Apps[fixture.spec.appID].LAN == nil {

@@ -37,12 +37,13 @@ type AppAccessGrantStartupSnapshot struct {
 }
 
 // HostingGatewayStartupSnapshot is the single durable startup census used by
-// hostd before it starts normal workers. Gateway upgrade and per-app grant
-// facts are observed under the same SQLite read transaction.
+// hostd before it starts normal workers. Gateway upgrade, grant, disable and
+// current rebind facts are observed under the same SQLite read transaction.
 type HostingGatewayStartupSnapshot struct {
 	Upgrades GatewayUpgradeStartupSnapshot
 	Grants   AppAccessGrantStartupSnapshot
 	Disables AppAccessDisableStartupSnapshot
+	Rebind   GatewayRebindRecoverySnapshot
 }
 
 // AppAccessGrantStartupSnapshot reads every retained attempt, immutable event
@@ -69,9 +70,9 @@ func (r *Repository) AppAccessGrantStartupSnapshot(ctx context.Context) (AppAcce
 	return snapshot, nil
 }
 
-// HostingGatewayStartupSnapshot reads gateway upgrade claims and all LAN grant
-// attempts from one SQLite snapshot. Consumers must still compare these facts
-// with protected generated-ingress state before starting workers or exposing
+// HostingGatewayStartupSnapshot reads gateway upgrade claims, all LAN attempts
+// and complete current rebind authority from one SQLite snapshot. Consumers
+// must still compare these facts with protected state before starting workers or exposing
 // URLs; this method performs no external observation or recovery.
 func (r *Repository) HostingGatewayStartupSnapshot(ctx context.Context) (HostingGatewayStartupSnapshot, error) {
 	if r == nil || r.db == nil {
@@ -94,10 +95,14 @@ func (r *Repository) HostingGatewayStartupSnapshot(ctx context.Context) (Hosting
 	if err != nil {
 		return HostingGatewayStartupSnapshot{}, err
 	}
+	rebind, err := readGatewayRebindRecoverySnapshot(ctx, tx)
+	if err != nil {
+		return HostingGatewayStartupSnapshot{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return HostingGatewayStartupSnapshot{}, err
 	}
-	return HostingGatewayStartupSnapshot{Upgrades: gateway, Grants: grants, Disables: disables}, nil
+	return HostingGatewayStartupSnapshot{Upgrades: gateway, Grants: grants, Disables: disables, Rebind: rebind}, nil
 }
 
 func (r *Repository) readAppAccessGrantStartupSnapshot(ctx context.Context, tx *sql.Tx) (AppAccessGrantStartupSnapshot, error) {
