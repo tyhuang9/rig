@@ -2477,3 +2477,14 @@ refuses withdrawal, and corrupt current-route bundles still require a distinct
 terminal-only stop capability. No state is reconstructed from a hash. The active
 database-committed restart consumer, full typed runtime adapter, default activation
 and hosted gates remain incomplete.
+
+Independent executable/source/security review accepted frozen
+`22df0ae30ed73d43a8487bae32149b297ea385e3`. Two tests/three selected subcases passed
+in 25.689s, zero failures/skips: concrete managed stop with lost acknowledgment
+under native-source corruption (24.74s), and retained native retired/aborted
+generations (0.36s/0.34s). Log:
+`Rig/temp/cross-store-review-22df-typed-emergency.jsonl`. Exact HEAD and clean
+status were verified before/after. The reviewer confirmed withdrawal-only
+callsites, empty source routes, exact immutable bindings and complete final
+snapshot checks. This acceptance retains the stated corrupt-current and mixed
+legacy limitations.
