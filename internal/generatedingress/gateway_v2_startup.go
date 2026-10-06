@@ -33,6 +33,10 @@ type GatewayV2StartupClaim struct {
 type GatewayV2StartupInspection struct {
 	Disposition GatewayV2StartupDisposition
 	OperationID string
+	// CurrentGatewaySource identifies a SQL-selected rebound gateway. It never
+	// substitutes for the raw grant/disable identity of recovery work. Native
+	// upgrade inspections retain their existing OperationID-only representation.
+	CurrentGatewaySource appaccess.GatewayCurrentAuthorityRef
 }
 
 type gatewayV2StartupClaimSet struct {
@@ -65,6 +69,9 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 	if err != nil || currentSQL.Active != nil || currentSQL.Phase != "" || currentSQL.DatabaseCommittedEvent != nil ||
 		currentSQL.DatabaseCommitObserved || currentSQL.RollbackAllowed {
 		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+	}
+	if currentPresent && current.Kind == gatewayCurrentSelectionRebind {
+		return m.inspectGatewayRebindCurrentStartupLocked(ctx, claimSet, current, currentSQL)
 	}
 	history, err := m.scanGatewayUpgradeHistoryLockedMode(true, claimSet.activeID)
 	if err != nil {

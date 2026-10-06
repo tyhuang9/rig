@@ -1070,3 +1070,81 @@ real DB cleanup lifetime and child-process boundary. Actual Docker execution,
 hostd startup dispatch, terminal SQL recovery, repeated rebind and final fence
 release remain unverified. This branch remains unpublished and is not ready
 for runtime delivery acceptance.
+
+### SQL-selected rebound startup classification checkpoint
+
+The local prepared-process fixture was frozen at `e0c9bac`. The reviewed route
+restore extension `cdbf174283792d5f31e1608a0b3a7b2b964b320e` was integrated at
+`d52523a`; its worker-reported focused test passed in 17.509s and independent
+review accepted the two-file contract diff. That extension returns the exact
+pre-switch route while retaining the pending marker, including a new app whose
+previous route was absent. The real physical adapter remains unavailable.
+
+Startup now has a distinct read-only path for SQL-selected rebind authority.
+It validates the entire historical native upgrade claim census, consumes the
+shared current-generation physical attestation, and rechecks unchanged SQL,
+protected history and current state before returning. It does not manufacture
+an upgrade journal for a rebound generation. The inspection carries the current
+gateway source separately from the raw grant or disable recovery identity.
+
+An ordinary pending route continues through normal composition, whose existing
+`ingress.Recover` runs before deployment workers; its correctness depends on the
+reviewed ordinary recovery path restoring the committed route. LAN pending
+operations and batches select recovery-only startup. Their downstream rebound
+LAN consumers and quarantine are still outstanding; this checkpoint alone does
+not admit an operational rebound controller.
+
+The hosting startup census now reads complete rebind authority inside the same
+SQLite transaction as upgrade, grant and disable claims. Controller mapping
+requires an exact current profile/source and retained database-commit event
+under a released committed claim. It rereads the complete census before
+accepting a rebound inspection and retains raw per-app recovery identities.
+Quarantine/retirement comparisons also bind the current gateway source.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayRebindCurrentStartupBindsSQLAndPhysicalAuthority$'
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayRebindCurrentStartupDistinguishesRouteAndLANRecovery$'
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/appaccess ./cmd/hostd -run '^Test(HostingGatewayStartupRebindCensus|RebindStartupMapping)'
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./internal/generatedingress -run '^TestGatewayV2(Startup|LANStartup|LANDisableStartup|LANAccess|LANRecovery)'
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./cmd/hostd ./internal/appaccess -run '^Test(GatewayStartup|RuntimeCompositionRebindFence|GeneratedComposition|PrepareRuntimeWorker|DeploymentEffectsAdmission|LANStartupMapping|LANGrantStartup|LANDisableStartup|LANAccessStartup|LANRecoveryBatch|AttestHistoricalLANDisableSuccessor|HistoricalLANDisableSuccessorSelection|HostingGatewayStartup|GatewayUpgradeStartupSnapshot|AppAccessGrantStartupSnapshot)'
+go vet -mod=readonly ./internal/generatedingress ./internal/appaccess ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The final authority test passed in 22.037s, including seven refusal boundaries:
+missing/forged historical claim, unavailable SQL, active rebind, invalid physical
+proof, SQL drift during proof, and a valid protected current revision replaced
+during proof. Route, disable and batch cases passed in 57.190s and retain their
+pending evidence. These tests use genuine legacy protected receipts, real
+protected storage/locks, projected SQL and a fake physical adapter; they do not
+establish typed-v2 lineage or Docker behavior.
+
+The real two-handle SQLite concurrency test passed (package 0.703s): a terminal
+release commits between census reads, while the ongoing startup read retains
+its original database-committed snapshot; the next read sees the release without
+changing transfers. Two controller mapping tests and twelve cases passed
+(package 0.714s). Native preservation passed all 77 top-level tests in 76.195s;
+controller preservation passed 36 in 21.795s and app-access preservation passed
+12 in 8.815s. All final runs had zero failure or skip. Vet and full build passed.
+Logs are `$TEMP/m3-rebound-startup-stable-final.jsonl`,
+`$TEMP/m3-rebound-startup-recovery.jsonl`,
+`$TEMP/m3-rebound-startup-mapping-corrected.jsonl`,
+`$TEMP/m3-rebound-startup-native-preservation.jsonl`, and
+`$TEMP/m3-rebound-startup-preservation.jsonl`.
+
+Initial test-only setup failures are retained: the sandbox identity could not
+construct the protected legacy fixture (`m3-rebound-startup-first.jsonl`); a
+raw helper Manager had an uninitialized mutex and timed out at four minutes
+(`m3-rebound-startup-elevated-first.jsonl`); its replacement initially omitted
+required private Docker options (`m3-rebound-startup-corrected.jsonl`). The
+fixture now uses `New` with real private directories. The first concurrency test
+used one single-connection pool for a nested writer and timed out at three
+minutes (`m3-rebound-startup-mapping-first.jsonl`); the corrected test opens a
+second real database handle and bounds the operation context. Production
+timeouts and safeguards were not relaxed.
+
+Independent bounded source review found no blocker in the startup/census
+checkpoint and requested the valid protected-replacement negative, which now
+passes. Full physical rebind adapters, rebound LAN/batch consumers, early
+process recovery dispatch, repeated rebind and final release acceptance remain
+outstanding. This runtime branch remains unpublished.
