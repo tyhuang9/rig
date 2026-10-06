@@ -1995,6 +1995,14 @@ finalization paths. Vet, the full Go build, gofmt and `git diff --check` passed.
 
 ## Reviewed Docker driver and recovery checks
 
+Independent source/security review accepted finalization `232ee4d`. Public
+sequential completion, callback replay/head guard, and ambiguous clearance/head
+write cases passed three top-level tests and two subcases in 105.325s, zero
+failures/skips (`Rig/temp/cross-store-review-232ee-finalization.jsonl`), using
+`^TestGatewayCurrentLANRecovery(FinalizesTwoDisablesInOrder|FinalizationReplayAndHeadGuard|FinalizationPreservesAmbiguousWrite)$`.
+The review found no new blocker in this bounded consumer; complete startup
+census/pin and SQL callback authorization remain required.
+
 With explicit user authorization for these two local integrations, reviewed
 `273769b` (including `47272c9`) was merged at `9cdf800`, followed by reviewed
 `fab0fbd` at `ce56b9d`. No remote branch or PR was changed.
@@ -2027,3 +2035,22 @@ acceptance. The production factory remains closed pending the batch adapter,
 typed rebind recovery adapter, protected emergency startup path and guarded
 restart of stopped current state. Hosted Docker and Linux race gates remain
 unverified for this unit.
+
+## Real SQL disable after typed rebind
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayCurrentLANRecoveryFinalizationCommitsRealSQLAfterRebind$'
+```
+
+The integration test passed in 30.773s, one top-level test, zero failures/skips
+(`Rig/temp/m3-current-batch-finalization-sql.jsonl`). It commits a typed rebind
+through the actual SQLite/protected coordinator, approves and authorizes a
+disable of the transferred source grant, and runs public current finalization
+with real terminal SQL release/readback and durable protected-clear acknowledgment.
+It then verifies the completed protected head, released allocation, exact
+retained transfer chain, unchanged source approval/proof and unchanged rebind
+history/current authority. Vet, gofmt and `git diff --check` passed.
+
+Queue installation and physical withdrawal are fixture setup. This test does
+not claim controller HTTP authorization, startup conversion, or real Docker
+acceptance. Those remain part of the complete runtime integration gate.
