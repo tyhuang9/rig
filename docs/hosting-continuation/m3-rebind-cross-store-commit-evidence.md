@@ -1408,3 +1408,48 @@ could not resolve an existing Vite dependency junction; the same command
 with access to the installed dependencies passed in 3.23s. No dependency
 or lockfile change was needed. Commands: `pnpm --dir docs check:workflow`
 and `pnpm --dir docs build`.
+
+Independent frozen review accepted singular quarantine at `ee8f3b5`. The two
+top-level tests and two subcases passed in 77.894s with no failures or skips
+(`Rig/temp/cross-store-review-ee8-startup-quarantine.jsonl`). All physical and
+batch limitations above remain delivery gates.
+
+### Pure batch census binds cleared items to the retained manifest
+
+The current batch census compares exact immutable queue requests to validated
+SQL grant/disable claims, enforces head-aware terminal/clear-ack ordering, and
+requires the complete same-snapshot transfer manifest to match its protected
+digest. Once a transferred binding is cleared, its retained projection must
+still select the exact manifest row and linked chain tip. Native grants created
+under the current profile require no transfer row, but retain exact raw profile
+identity. Committed grants cannot become automatic rollback items. The helper
+is read-only and is not yet connected to the pending physical batch consumer.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayCurrentLANRecoveryCensusBindsClearedHistoryAndOrderedHead$'
+go vet -mod=readonly ./internal/generatedingress
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The first focused test and its subcase passed in 16.778s, with no failures or
+skips (`Rig/temp/m3-current-lan-batch-census.jsonl`). It covers two ordered
+disables, current terminal replay, clear/ack boundaries, completed head history,
+native and transferred bindings, missing/duplicate manifest rows, a fully
+rehashed false transfer tip after clearance, out-of-order rollback, and refusal
+to roll back committed grants. Vet and full build passed. Unrelated terminal
+history remains non-serving census data and still requires the separate
+protected historical-proof gate; this helper cannot replace that gate.
+
+An independent negative test at `ee8f3b5` also confirmed that the existing
+stored-batch structural validator accepts duplicate ports or allocations across
+two unpublished grant items (17.221s, no skips;
+`Rig/temp/cross-store-review-ee8-batch-uniqueness-red.jsonl`). The pure census
+rejects those collisions, but the structural validator must also be corrected
+before activating physical batch recovery. That correction is pending in its
+separate owner scope.
+
+The final census run added exact raw-identity mismatch, an omitted unresolved
+claim, and duplicate port/allocation cases. It passed the named test and its
+subcase in 17.320s with no failures or skips
+(`Rig/temp/m3-current-lan-batch-census-final.jsonl`). These pure comparisons do
+not prove SQL mutation, physical withdrawal, head advancement, or retirement.
