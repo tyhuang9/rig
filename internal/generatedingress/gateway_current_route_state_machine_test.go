@@ -17,6 +17,8 @@ type gatewayCurrentStateMachineDriver struct {
 	terminal             gatewayRebindAttemptTerminalView
 	failApply            bool
 	failAttest           bool
+	afterApply           func()
+	afterRestore         func()
 	pendingAttestOutcome gatewayCurrentPhysicalOutcome
 	afterAttest          func()
 	applyCalls           int
@@ -36,6 +38,10 @@ func (d *gatewayCurrentStateMachineDriver) applyGatewayCurrentPhysical(_ context
 		gatewayCurrentPhysicalRecoveryEffective)
 	value.Pending = cloneGatewayCurrentPendingRoute(transition.Pending.Pending)
 	value.Digest, _ = gatewayCurrentPhysicalAttestationDigest(value)
+	if d.afterApply != nil {
+		d.afterApply()
+		d.afterApply = nil
+	}
 	return value, nil
 }
 
@@ -47,6 +53,10 @@ func (d *gatewayCurrentStateMachineDriver) restoreGatewayCurrentPhysical(_ conte
 		gatewayCurrentPhysicalRecoveryBefore)
 	value.Pending = cloneGatewayCurrentPendingRoute(transition.Pending.Pending)
 	value.Digest, _ = gatewayCurrentPhysicalAttestationDigest(value)
+	if d.afterRestore != nil {
+		d.afterRestore()
+		d.afterRestore = nil
+	}
 	return value, nil
 }
 
@@ -288,5 +298,29 @@ func TestGatewayCurrentStateMachineFencesNativeFallbackDuringActiveRebind(t *tes
 	retained, retainedJournal, err := store.loadBoundUpgrade(journal.OperationID)
 	if err != nil || !reflect.DeepEqual(retained, state) || !reflect.DeepEqual(retainedJournal, journal) {
 		t.Fatalf("active rebind fence mutated native state: %v", err)
+	}
+}
+
+func TestPersistGatewayCurrentExactRejectsRevisionOnlyNoop(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	if err := fixture.store.installBaseline(fixture.baseline); err != nil {
+		t.Fatal(err)
+	}
+	fixture.manager.options.RebindCurrentStateRepository = &routeOperationSnapshotRepository{
+		snapshots: []appaccess.GatewayRebindRecoverySnapshot{routeOperationCommittedSnapshot(fixture)},
+	}
+	next := cloneGatewayCurrentOperationState(fixture.baseline)
+	next.Revision++
+	next.Digest = ""
+	var err error
+	next.Digest, err = gatewayCurrentRouteStateDigest(next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.persistGatewayCurrentExactLocked(context.Background(), fixture.baseline, next); err == nil {
+		t.Fatal("revision-only exact write was falsely reported as persisted")
+	}
+	if retained := routeOperationLoad(t, fixture.store); !reflect.DeepEqual(retained, fixture.baseline) {
+		t.Fatalf("revision-only exact write changed protected state: %#v", retained)
 	}
 }

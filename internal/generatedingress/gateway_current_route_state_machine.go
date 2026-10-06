@@ -219,6 +219,13 @@ func (m *Manager) persistGatewayCurrentExactLocked(ctx context.Context,
 	if err != nil || !handled {
 		return gatewayCurrentRouteOperationError(ctx)
 	}
+	// mutateGatewayCurrentLocked deliberately treats an unchanged mutable
+	// projection as an idempotent no-op. This exact helper promises that the
+	// caller's precomputed revision was durably installed, so a revision-only
+	// candidate must fail instead of being reported as a successful write.
+	if _, err := m.confirmGatewayCurrentStateLocked(ctx, next); err != nil {
+		return gatewayCurrentRouteOperationError(ctx)
+	}
 	return nil
 }
 
@@ -337,26 +344,6 @@ func (m *Manager) recoverGatewayCurrentStateMachineLocked(ctx context.Context) (
 		}
 		if err := m.persistGatewayCurrentExactLocked(ctx, state, cleared); err != nil {
 			return true, err
-		}
-		_, err = m.attestGatewayCurrentStateLocked(ctx, cleared)
-		return true, err
-	case gatewayV2PendingLANGrant:
-		if state.Pending.ActivationUncertain {
-			return true, gatewayCurrentRouteOperationError(ctx)
-		}
-		projection, projectionErr := gatewayCurrentPhysicalOutcomeProjectionForSelection(state)
-		attestation, attestErr := m.attestGatewayCurrentPhysicalLocked(ctx, selection)
-		if projectionErr != nil || attestErr != nil ||
-			attestation.Outcome != gatewayCurrentPhysicalRecoveryBefore ||
-			!reflect.DeepEqual(attestation.State, projection.Before) {
-			return true, gatewayCurrentRouteOperationError(ctx)
-		}
-		cleared, clearErr := gatewayCurrentNextState(state, func(next *gatewayCurrentRouteState) {
-			next.Pending = nil
-		})
-		if clearErr != nil || !reflect.DeepEqual(cleared.Apps, transition.Before.Apps) ||
-			m.persistGatewayCurrentExactLocked(ctx, state, cleared) != nil {
-			return true, gatewayCurrentRouteOperationError(ctx)
 		}
 		_, err = m.attestGatewayCurrentStateLocked(ctx, cleared)
 		return true, err
