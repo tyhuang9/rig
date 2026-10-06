@@ -76,6 +76,7 @@ type gatewayCurrentPhysicalAttestation struct {
 type gatewayCurrentPhysicalOutcomeProjection struct {
 	Before    gatewayCurrentRouteState
 	Effective *gatewayCurrentRouteState
+	Withdrawn *gatewayCurrentRouteState
 }
 
 type gatewayCurrentPhysicalDriver interface {
@@ -303,7 +304,9 @@ func gatewayCurrentPhysicalAttestationMatchesSelection(value gatewayCurrentPhysi
 	}
 	if selected.LANRecovery != nil {
 		return (value.Outcome == gatewayCurrentPhysicalRecoveryMixed ||
-			value.Outcome == gatewayCurrentPhysicalRecoveryStopped) && reflect.DeepEqual(value.State, projection.Before)
+			value.Outcome == gatewayCurrentPhysicalRecoveryStopped) &&
+			(reflect.DeepEqual(value.State, projection.Before) ||
+				(projection.Withdrawn != nil && reflect.DeepEqual(value.State, *projection.Withdrawn)))
 	}
 	switch value.Outcome {
 	case gatewayCurrentPhysicalRecoveryBefore:
@@ -330,6 +333,20 @@ func gatewayCurrentPhysicalOutcomeProjectionForSelection(selected gatewayCurrent
 		return gatewayCurrentPhysicalOutcomeProjection{}, errors.New("invalid current physical before projection")
 	}
 	result := gatewayCurrentPhysicalOutcomeProjection{Before: before}
+	if selected.LANRecovery != nil {
+		withdrawn := cloneGatewayCurrentRouteState(before)
+		for _, item := range selected.LANRecovery.Items {
+			app := withdrawn.Apps[item.AppID]
+			app.LAN = nil
+			withdrawn.Apps[item.AppID] = app
+		}
+		withdrawn.Digest, _ = gatewayCurrentRouteStateDigest(withdrawn)
+		if !validGatewayCurrentRouteState(withdrawn) {
+			return gatewayCurrentPhysicalOutcomeProjection{}, errors.New("invalid current physical withdrawn projection")
+		}
+		result.Withdrawn = &withdrawn
+		return result, nil
+	}
 	if selected.Pending == nil {
 		return result, nil
 	}
