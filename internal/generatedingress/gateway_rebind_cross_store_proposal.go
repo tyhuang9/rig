@@ -360,8 +360,17 @@ func gatewayRebindRawBindingMatchesResolution(appID string, raw gatewayV2LANBind
 
 func sameGatewayCurrentSelection(left, right gatewayCurrentSelection) bool {
 	return left.Kind == right.Kind && left.Lineage == right.Lineage &&
-		reflect.DeepEqual(left.Upgrade, right.Upgrade) && reflect.DeepEqual(left.Receipt, right.Receipt) &&
-		reflect.DeepEqual(left.State, right.State)
+		reflect.DeepEqual(left.Upgrade, right.Upgrade) && reflect.DeepEqual(left.UpgradeSource, right.UpgradeSource) &&
+		reflect.DeepEqual(left.Receipt, right.Receipt) && reflect.DeepEqual(left.Terminal, right.Terminal) &&
+		reflect.DeepEqual(left.State, right.State) && sameGatewayCurrentSelectionStore(left.Store, right.Store)
+}
+
+func sameGatewayCurrentSelectionStore(left, right *gatewayCurrentRouteStateStore) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.generation == right.generation && left.operationID == right.operationID &&
+		left.path == right.path && left.purpose == right.purpose
 }
 
 func gatewayRebindProposalError(ctx context.Context) error {

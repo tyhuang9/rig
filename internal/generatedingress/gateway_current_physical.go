@@ -217,6 +217,13 @@ func (m *Manager) attestGatewayCurrentPhysicalLocked(ctx context.Context,
 // ordinary operations. The typed terminal checkpoint extends this selector
 // without changing the physical driver contract or legacy receipt bytes.
 func gatewayCurrentSelectionTerminalView(selection gatewayCurrentSelection) (gatewayRebindAttemptTerminalView, error) {
+	if selection.Terminal != nil {
+		terminal := *selection.Terminal
+		if !gatewayRebindAttemptTerminalMatchesLineage(terminal, selection.Lineage) {
+			return gatewayRebindAttemptTerminalView{}, errors.New("generated ingress current terminal is invalid")
+		}
+		return terminal, nil
+	}
 	if selection.Receipt == nil {
 		return gatewayRebindAttemptTerminalView{}, errors.New("generated ingress current terminal is unavailable")
 	}

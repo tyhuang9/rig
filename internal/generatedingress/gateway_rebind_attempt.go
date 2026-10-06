@@ -86,6 +86,7 @@ type gatewayRebindAttemptTerminalView struct {
 	Resources             gatewayRebindFinalHandoverResourceBindings
 	Digest                string
 	LegacyReceipt         *gatewayRebindFinalHandoverTerminalReceipt
+	TypedReceipt          *gatewayRebindTerminalReceiptV2
 }
 
 type gatewayRebindAttemptRosterEntry struct {
@@ -202,13 +203,13 @@ func newGatewayRebindAttemptViewV2(intent gatewayRebindProtectedIntentV2,
 			Journal: current.Upgrade.Journal,
 		}
 	case appaccess.GatewayRebindSourceGatewayRebind:
-		if current.Kind != gatewayCurrentSelectionRebind || current.State == nil || current.Receipt == nil ||
+		if current.Kind != gatewayCurrentSelectionRebind || current.State == nil || current.Terminal == nil ||
 			checkpoint.UpgradeState != nil || checkpoint.CurrentState == nil ||
 			!reflect.DeepEqual(*checkpoint.CurrentState, *current.State) {
 			return gatewayRebindAttemptView{}, invalid
 		}
-		terminal, err := newGatewayRebindAttemptTerminalViewLegacy(*current.Receipt)
-		if err != nil || !gatewayRebindAttemptTerminalMatchesLineage(terminal, checkpoint.Lineage) {
+		terminal := *current.Terminal
+		if !gatewayRebindAttemptTerminalMatchesLineage(terminal, checkpoint.Lineage) {
 			return gatewayRebindAttemptView{}, invalid
 		}
 		source.Rebind = &gatewayRebindAttemptCommittedSource{
@@ -263,17 +264,46 @@ func newGatewayRebindAttemptViewV2(intent gatewayRebindProtectedIntentV2,
 func gatewayRebindAttemptTerminalMatchesLineage(terminal gatewayRebindAttemptTerminalView,
 	lineage appaccess.GatewayCurrentLineageRef,
 ) bool {
-	if terminal.Format != gatewayRebindAttemptTerminalLegacyV1 || terminal.LegacyReceipt == nil ||
-		terminal.Digest != lineage.TerminalReceiptDigest {
+	if terminal.Digest != lineage.TerminalReceiptDigest {
 		return false
 	}
-	receiptLineage, err := gatewayRebindCurrentLineage(*terminal.LegacyReceipt)
+	var receiptLineage appaccess.GatewayCurrentLineageRef
+	var err error
+	switch terminal.Format {
+	case gatewayRebindAttemptTerminalLegacyV1:
+		if terminal.LegacyReceipt == nil || terminal.TypedReceipt != nil {
+			return false
+		}
+		receiptLineage, err = gatewayRebindCurrentLineage(*terminal.LegacyReceipt)
+	case gatewayRebindAttemptTerminalTypedV2:
+		if terminal.TypedReceipt == nil || terminal.LegacyReceipt != nil {
+			return false
+		}
+		receiptLineage, err = gatewayRebindCurrentLineageV2(*terminal.TypedReceipt)
+	default:
+		return false
+	}
 	return err == nil && receiptLineage == lineage && terminal.Generation == lineage.ProtectedGeneration &&
 		terminal.OperationID == lineage.OperationID && terminal.ProtectedIntentDigest == lineage.ProtectedIntentDigest &&
 		terminal.SuccessorIdentity.Digest == lineage.ProtectedIdentityDigest &&
 		terminal.SuccessorProfile.RevisionID == lineage.ProfileRevisionID &&
 		terminal.SuccessorProfile.RevisionNumber == lineage.ProfileRevisionNumber &&
 		terminal.SuccessorProfile.SpecDigest == lineage.ProfileSpecDigest
+}
+
+func newGatewayRebindAttemptTerminalViewV2(receipt gatewayRebindTerminalReceiptV2) (gatewayRebindAttemptTerminalView, error) {
+	if !validGatewayRebindTerminalReceiptV2(receipt) || receipt.Disposition != appaccess.GatewayRebindDispositionCommit ||
+		receipt.Resources == nil {
+		return gatewayRebindAttemptTerminalView{}, errors.New("invalid typed rebind terminal")
+	}
+	typed := receipt
+	return gatewayRebindAttemptTerminalView{
+		Format: gatewayRebindAttemptTerminalTypedV2, Generation: receipt.Generation,
+		OperationID: receipt.OperationID, Disposition: gatewayRebindFinalHandoverTerminalCommit,
+		ProtectedIntentDigest: receipt.ProtectedIntentDigest, SuccessorProfile: receipt.SuccessorProfile,
+		SuccessorIdentity: receipt.SuccessorIdentity, Resources: *receipt.Resources, Digest: receipt.Digest,
+		TypedReceipt: &typed,
+	}, nil
 }
 
 func gatewayRebindAttemptRosterMatchesSource(roster []appaccess.GatewayRebindRosterEntryV2,
