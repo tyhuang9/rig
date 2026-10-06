@@ -2054,3 +2054,35 @@ history/current authority. Vet, gofmt and `git diff --check` passed.
 Queue installation and physical withdrawal are fixture setup. This test does
 not claim controller HTTP authorization, startup conversion, or real Docker
 acceptance. Those remain part of the complete runtime integration gate.
+
+Independent review accepted `fc463d8`; its exact real-SQL test passed again in
+30.714s, zero failures/skips
+(`Rig/temp/cross-store-review-fc463-real-finalization.jsonl`).
+
+## Consistent startup runtime census
+
+`HostingGatewayStartupSnapshot` now includes all active generated runtime heads
+and their exact component rows in the same read transaction as gateway/LAN/rebind
+authority. Loopback applications are included; archived/inactive applications
+are excluded. Failed component rows remain visible for refusal by serving
+authorization. Missing, malformed or crossed component identities return no
+partial snapshot. No schema or immutable history format changes are involved.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/appaccess -run '^TestHostingGatewayStartupRuntimeCensus'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=5m ./internal/appaccess ./cmd/hostd -run 'Startup|RuntimeHeads'
+go vet -mod=readonly ./internal/appaccess ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The new census tests passed three top-level tests and seven subcases in 4.145s,
+zero failures/skips (`Rig/temp/m3-startup-runtime-census-green.jsonl`). They
+exercise a concurrent redeploy through a separate SQLite handle, complete
+LAN/loopback enumeration, failed component visibility, read-only behavior and
+seven malformed/missing component cases. The first test run exposed an invalid
+test setup: SQL correctly refused draining an actively routed component. The
+fixture was corrected to the supported active-to-failed transition; no production
+guard was weakened (`Rig/temp/m3-startup-runtime-census.jsonl`).
+
+This read projection is input to the pending guarded restart consumer, not
+permission to restart or evidence of Docker serving. Vet and the full build passed.
