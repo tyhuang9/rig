@@ -2412,3 +2412,12 @@ separate immutable-history support. A corrupt current route bundle additionally
 requires a terminal-only exact-container withdrawal capability; no valid route
 state is fabricated from incomplete evidence. M3 and the production adapter remain
 incomplete.
+
+Independent review accepted frozen `769354f3d783ebbc3c18ad0a311f2b82c04c04e8`
+including `59f68db`. Two tests/three selected subcases passed in 73.075s, zero
+failures/skips: real-SQL/concrete stable restoration (40.40s), retained-abort
+source corruption (15.96s), and native-v2 corruption (16.46s). Evidence:
+`Rig/temp/cross-store-review-769-59-composition-emergency.jsonl`. The reviewer
+verified exact HEAD and clean status before/after and reviewed all six boundary
+mutations plus late-history refusal. This is bounded acceptance of the recorded
+scope; the limitations above remain open, and default activation remains closed.
