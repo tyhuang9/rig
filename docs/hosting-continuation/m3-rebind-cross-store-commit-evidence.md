@@ -1183,3 +1183,53 @@ the operational revision, and preserves selected authority and immutable
 gateway history. The test uses protected storage and a fake physical adapter;
 it does not establish hostd process ordering or Docker acceptance. Log:
 `Rig/temp/m3-rebound-startup-route-admission.jsonl`.
+
+### Selected-current LAN startup census
+
+Independent code review accepted the combined route/startup test `db49792`.
+The independently reviewed binding matchers `4039d634` were integrated at
+`1aa1f85`; their exact test passed in 17.568s, one top-level test, no failure or
+skip (`Rig/temp/cross-store-review-4039-lan-matchers.jsonl`).
+
+Both public LAN startup readers now select current rebind authority before
+using the native path. They compare immutable raw grants and effective SQL
+projections to actual current operational endpoints, preserve pending markers,
+attest through the shared physical contract and reconfirm exact SQL/protected
+authority after observation. Candidate ordering and collision rules are shared
+with native startup. Retained authority cannot authorize an unmarked live
+binding; an exact terminal-disable pending marker always selects recovery.
+
+The first focused run passed two top-level tests and twelve cases in 34.962s
+(`Rig/temp/m3-current-lan-startup.jsonl`). Expanded verification included native
+pending grant/withdrawal, grant-only startup, SQL drift and protected revision
+replacement after physical proof:
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayCurrentLANStartup|GatewayV2(LANStartup|LANDisableStartup|LANAccess|LANRecovery))'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayV2LANStartupBindsNativeProjectionBeforeAndAfterPhysicalProof$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The expanded run passed 66 top-level tests and 91 subtests, with no skips,
+but failed one existing test (99.909s). That fixture depended on exactly six
+SQL reads and injected drift on read four; the new selection adds reads and
+made the injection occur before physical proof. The corrected fixture now
+injects at the observed `prove_committed` event and asserts reads on both sides
+of that boundary. Its focused rerun passed the one test and all twenty subtests
+in 3.340s, with no failures or skips. No production validation was weakened.
+Logs: `Rig/temp/m3-current-lan-startup-preservation.jsonl` and
+`Rig/temp/m3-native-lan-startup-semantic-drift.jsonl`. Vet and full build passed.
+
+These are projected-SQL/fake-physical tests with real protected storage, not
+Docker acceptance. Rebound quarantine, ordered batch consumers and complete
+historical retained-receipt validation remain outstanding. In particular,
+cleared historical disables are not treated as serving authority, but their
+full protected typed-history proof must be integrated before delivery. Disable
+acknowledgment follows protected pending clearance and fresh withdrawal proof;
+an acknowledged disable with a remaining pending marker is inconsistent.
+
+PR #136's final hosted repository/PostgreSQL race workflow
+[`37399509007`](https://github.com/tyhuang9/rig/actions/runs/37399509007)
+completed successfully at its published head `9694b4e`. This evidence applies
+to the published final-config-copy draft, not this unpublished runtime branch.

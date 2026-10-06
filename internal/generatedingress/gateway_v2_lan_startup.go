@@ -71,6 +71,16 @@ func (m *Manager) InspectGatewayV2LANStartup(ctx context.Context, claims []Gatew
 	}
 	proofCtx, cancelProof := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelProof()
+	if current, handled, currentErr := m.inspectGatewayCurrentLANStartupLocked(proofCtx,
+		gatewayV2LANAccessStartupClaims{grants: claimSet}); currentErr != nil || handled {
+		if currentErr != nil {
+			return GatewayV2LANStartupInspection{}, currentErr
+		}
+		if len(current.Recoveries) != 0 || (current.RecoveryKind != "" && current.RecoveryKind != GatewayV2LANRecoveryGrant) {
+			return GatewayV2LANStartupInspection{}, gatewayV2StartupInspectionError(proofCtx)
+		}
+		return GatewayV2LANStartupInspection{Disposition: current.Disposition, AttemptID: current.OperationID}, nil
+	}
 
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil || !validGatewayV2RouteState(state) {

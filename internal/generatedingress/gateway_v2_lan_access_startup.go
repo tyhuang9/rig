@@ -128,6 +128,9 @@ func (m *Manager) InspectGatewayV2LANAccessStartup(ctx context.Context,
 	defer releaseGatewayLock(release, &resultErr)
 	proofCtx, cancelProof := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelProof()
+	if current, handled, currentErr := m.inspectGatewayCurrentLANStartupLocked(proofCtx, claims); currentErr != nil || handled {
+		return current, currentErr
+	}
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil || !validGatewayV2RouteState(state) {
 		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(proofCtx)
@@ -300,11 +303,17 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 	if driver.selectedInterfacePreflight(state.Profile) != nil || ctx.Err() != nil {
 		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 	}
+	return gatewayV2LANStartupInspectionForCandidates(recoveryCandidates, claims)
+}
+
+func gatewayV2LANStartupInspectionForCandidates(recoveryCandidates map[string]gatewayV2LANAccessStartupRecoveryCandidate,
+	claims gatewayV2LANAccessStartupClaims,
+) (GatewayV2LANAccessStartupInspection, error) {
 	if len(recoveryCandidates) == 0 {
 		return GatewayV2LANAccessStartupInspection{Disposition: GatewayV2LANStartupNormal}, nil
 	}
 	if !gatewayV2LANRecoveryCandidatesCompatible(recoveryCandidates, claims) {
-		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(nil)
 	}
 	ordered := make([]gatewayV2LANAccessStartupRecoveryCandidate, 0, len(recoveryCandidates))
 	for _, candidate := range recoveryCandidates {
