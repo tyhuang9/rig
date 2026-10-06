@@ -2647,8 +2647,75 @@ go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
 go build -mod=readonly -buildvcs=false ./...
 ```
 
-Vet, full Go build, gofmt and diff whitespace checks passed. Frozen independent
-review is still required. Actual Docker and Linux race behavior remain for hosted
+Vet, full Go build, gofmt and diff whitespace checks passed. Actual Docker and Linux race behavior remain for hosted
 CI. The typed runtime adapter, default activation and complete M3 acceptance are
 still unfinished. No publication, cross-branch integration or deployment was
 performed for this change.
+
+Independent executable/source/security review accepted frozen
+`f1e2c0787f012e231821c4460ae72033353dfa4a` for this bounded withdrawal capability.
+Two tests/three subcases passed in 63.863s, zero failures/skips, with exact HEAD
+and clean status verified before/after. The cases exercised simultaneous native
+and current-route corruption, lost stop acknowledgment and idempotence, changed
+volume identity refusal, and a listener that remains after stop. No must-fix
+source/security findings were reported. Log:
+`Rig/temp/cross-store-review-f1-terminal-withdrawal.jsonl`.
+
+```text
+go test -mod=readonly -count=1 -json -timeout=4m -run '^TestGatewayCurrentTerminalEmergency(StopsDespiteCorruptCurrentBundle|RequiresCompleteInventoryAndListenerAbsence)$/^(native_and_current_corrupt|changed_volume_identity|listener_remains)$' ./internal/generatedingress
+```
+
+## Current active rebind approval authority (2026-10-06)
+
+The full Hosting snapshot now projects the current administrator roles of both
+the active rebind approver and successor-profile configuration approver in its
+existing SQLite read transaction. These may be different users from each other
+and from the LAN/native gateway approvers. The projection binds the exact active
+operation, stored spec version, and both immutable approval actor IDs. Strict
+legacy/V2 union validation refuses missing, crossed or unsupported claim forms;
+an absent active claim requires an absent projection at the serving boundary.
+
+Role revocation is observable as false authority flags. It does not make the
+immutable recovery history unreadable or prevent ownership-based withdrawal.
+There is no new SQL mutation fence, migration, persisted approval rewrite or
+role-change restriction. The active database-committed restart checks the flags
+before selection and again on every fresh authority read, in addition to its
+existing full snapshot digest, protected history and runtime census checks.
+Normal serving restoration also rejects a stale active-approval projection.
+
+Tests use three distinct administrators for the LAN/native profile, rebind,
+and configure approvals. Real SQLite demotion of either active approver before
+restart prevents any start command. Demotion after the concrete Docker command
+adapter starts the exact owned container is detected by the following guard;
+the exact container is then stopped while the SQL fence and immutable history
+remain intact. The adapter tests use deterministic Docker command/probe fixtures,
+not a live Docker daemon. These boundary checks do not constitute continuous
+permission monitoring after startup returns.
+
+Owner verification:
+
+- Focused same-transaction projection, revocation/ownership and crossed-binding
+  cases: 3 tests/12 subcases passed in 1.964s. Log
+  `Rig/temp/m3-active-rebind-approvals-sql.jsonl`.
+- Entire appaccess package: 126 tests/175 subcases passed in 98.669s. Log
+  `Rig/temp/m3-active-rebind-approvals-appaccess.jsonl`.
+- Concrete active committed-serving adapter: 1 test/5 subcases passed in
+  134.901s. Log `Rig/temp/m3-active-rebind-approvals-runtime.jsonl`.
+- Existing ordinary startup, completed recovery batch and active SQL-fenced
+  restart regressions: 3 tests passed in 107.333s. Log
+  `Rig/temp/m3-active-rebind-approvals-regression.jsonl`.
+
+All runs above had zero failures/skips. Exact commands:
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 ./internal/appaccess -run '^TestHostingGatewayActiveRebindApprovals' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/appaccess -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^TestGatewayRebindCommittedServingRestoreRequiresCurrentApprovers$' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^(TestGatewayCurrentServingRestoreUsesRealCompleteSQLAuthority|TestGatewayCurrentServingRestoreKeepsCompletedBatchAndTerminalSQL|TestGatewayRebindCommittedServingRestoreKeepsActiveSQLFence)$' -count=1 -json
+go vet -mod=readonly ./internal/appaccess ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Vet, full Go build, gofmt and diff whitespace checks passed. Independent frozen review, actual Docker/Linux
+race checks, full typed-adapter integration and M3 acceptance remain outstanding.
+No publication, cross-branch integration or deployment was performed for this unit.

@@ -40,12 +40,13 @@ type AppAccessGrantStartupSnapshot struct {
 // hostd before it starts normal workers. Gateway upgrade, grant, disable and
 // current rebind facts are observed under the same SQLite read transaction.
 type HostingGatewayStartupSnapshot struct {
-	Upgrades          GatewayUpgradeStartupSnapshot
-	Grants            AppAccessGrantStartupSnapshot
-	Disables          AppAccessDisableStartupSnapshot
-	Rebind            GatewayRebindRecoverySnapshot
-	RuntimeHeads      []GatewayRebindRuntimeHead
-	RuntimeComponents []GatewayStartupRuntimeComponent
+	Upgrades                      GatewayUpgradeStartupSnapshot
+	Grants                        AppAccessGrantStartupSnapshot
+	Disables                      AppAccessDisableStartupSnapshot
+	Rebind                        GatewayRebindRecoverySnapshot
+	RuntimeHeads                  []GatewayRebindRuntimeHead
+	RuntimeComponents             []GatewayStartupRuntimeComponent
+	ActiveRebindApprovalAuthority *GatewayRebindActiveApprovalAuthority
 }
 
 // AppAccessGrantStartupSnapshot reads every retained attempt, immutable event
@@ -110,11 +111,15 @@ func (r *Repository) HostingGatewayStartupSnapshot(ctx context.Context) (Hosting
 	if err != nil {
 		return HostingGatewayStartupSnapshot{}, err
 	}
+	approvals, err := readGatewayRebindActiveApprovalAuthority(ctx, tx, rebind)
+	if err != nil {
+		return HostingGatewayStartupSnapshot{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return HostingGatewayStartupSnapshot{}, err
 	}
 	return HostingGatewayStartupSnapshot{Upgrades: gateway, Grants: grants, Disables: disables, Rebind: rebind,
-		RuntimeHeads: heads, RuntimeComponents: components}, nil
+		RuntimeHeads: heads, RuntimeComponents: components, ActiveRebindApprovalAuthority: approvals}, nil
 }
 
 func (r *Repository) readAppAccessGrantStartupSnapshot(ctx context.Context, tx *sql.Tx) (AppAccessGrantStartupSnapshot, error) {

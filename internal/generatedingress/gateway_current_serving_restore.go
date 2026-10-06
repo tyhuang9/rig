@@ -154,7 +154,7 @@ func (m *Manager) restoreGatewayCurrentServingLocked(ctx context.Context,
 		return true, gatewayCurrentRouteOperationError(ctx)
 	}
 	snapshot, err := repository.HostingGatewayStartupSnapshot(ctx)
-	if err != nil || !reflect.DeepEqual(snapshot.Rebind, selectedSQL) {
+	if err != nil || !snapshot.ActiveRebindApprovalsAuthorizeServing() || !reflect.DeepEqual(snapshot.Rebind, selectedSQL) {
 		return fail()
 	}
 	authorizationDigest, err := canonicalDigest(snapshot)

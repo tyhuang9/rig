@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
 )
 
@@ -15,6 +16,12 @@ import (
 func gatewayRebindCommittedServingFixture(t *testing.T) (gatewayRebindPredecessorFixture,
 	gatewayRebindPhysicalReconcileRequest, gatewayCurrentSelection, *gatewayCurrentPhysicalExecutor,
 ) {
+	return gatewayRebindCommittedServingFixtureWithApprovals(t, nil)
+}
+
+func gatewayRebindCommittedServingFixtureWithApprovals(t *testing.T,
+	prepare func(gatewayRebindPredecessorFixture, *gatewayRebindCommitInput),
+) (gatewayRebindPredecessorFixture, gatewayRebindPhysicalReconcileRequest, gatewayCurrentSelection, *gatewayCurrentPhysicalExecutor) {
 	t.Helper()
 	ctx := context.Background()
 	// Match the SQL component from initial fixture creation, before immutable
@@ -25,6 +32,9 @@ func gatewayRebindCommittedServingFixture(t *testing.T) (gatewayRebindPredecesso
 	f.manager.gatewayRebindFailStop = &atomic.Bool{}
 	f.manager.gatewayRebindCommitBarrier = &atomic.Bool{}
 	input := completeGatewayRebindCoordinatorFixture(t, f)
+	if prepare != nil {
+		prepare(f, &input)
+	}
 	template := newGatewayCurrentStateFixture(t)
 	f.manager.gatewayRebindV2NetworkObserver = func(_ context.Context, claim appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error) {
 		value := template.intent.NetworkObservation
@@ -85,6 +95,70 @@ func gatewayRebindCommittedServingFixture(t *testing.T) (gatewayRebindPredecesso
 		}
 	})
 	return f, request, selection, runner
+}
+
+func TestGatewayRebindCommittedServingRestoreRequiresCurrentApprovers(t *testing.T) {
+	for _, kind := range []string{"approved", "rebind before start", "configure before start", "rebind after start", "configure after start"} {
+		t.Run(kind, func(t *testing.T) {
+			f, request, _, runner := gatewayRebindCommittedServingFixtureWithApprovals(t,
+				func(f gatewayRebindPredecessorFixture, input *gatewayRebindCommitInput) {
+					for _, approval := range []*appaccess.Approval{&input.RebindApproval, &input.ConfigureApproval} {
+						approval.ActorID = uuid.NewString()
+						if _, err := f.db.Exec(`INSERT INTO users(id,username,passphrase_hash,role,created_at,updated_at)
+							VALUES(?,?,'hash','administrator',datetime('now'),datetime('now'))`, approval.ActorID, approval.ActorID); err != nil {
+							t.Fatal(err)
+						}
+					}
+				})
+			ctx := context.Background()
+			before, err := f.repository.HostingGatewayStartupSnapshot(ctx)
+			if err != nil || !before.ActiveRebindApprovalsAuthorizeServing() {
+				t.Fatalf("initial approval: %v", err)
+			}
+			files, err := readGatewayHistorySnapshotMode(f.manager.store, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actor := request.Attempt.Claim.RebindApproval.ActorID
+			if kind == "configure before start" || kind == "configure after start" {
+				actor = request.Attempt.Claim.ConfigureApproval.ActorID
+			}
+			demoted := false
+			demote := func() {
+				if _, err := f.db.Exec(`UPDATE users SET role='viewer' WHERE id=?`, actor); err != nil {
+					t.Fatal(err)
+				}
+				demoted = true
+			}
+			late := kind == "rebind after start" || kind == "configure after start"
+			if kind != "approved" && !late {
+				demote()
+			}
+			guard := func(context.Context) error {
+				if late && runner.container.Running && !demoted {
+					demote()
+				}
+				return nil
+			}
+			_, err = f.manager.restoreGatewayRebindCommittedServingLocked(ctx, f.repository, request, guard)
+			started := containsGatewayCurrentPhysicalEffect(runner.effects, []string{"container", "start", runner.target.Resources.FinalContainer.ID})
+			stopped := containsGatewayCurrentPhysicalEffect(runner.effects, []string{"container", "stop", "--time", "10", runner.target.Resources.FinalContainer.ID})
+			if kind == "approved" {
+				if err != nil || !started || stopped || !runner.container.Running {
+					t.Fatalf("distinct approvals refused: effects=%v err=%v", runner.effects, err)
+				}
+			} else if err == nil || !demoted || runner.container.Running || started != late || stopped != late ||
+				(late && !f.manager.gatewayRebindFailStop.Load()) {
+				t.Fatalf("revocation accepted or withdrawal missing: effects=%v demoted=%t err=%v", runner.effects, demoted, err)
+			}
+			after, readErr := f.repository.HostingGatewayStartupSnapshot(ctx)
+			if readErr != nil || !reflect.DeepEqual(before.Rebind, after.Rebind) ||
+				after.ActiveRebindApprovalsAuthorizeServing() != (kind == "approved") || f.repository.CheckGatewayRebindFence(ctx) == nil {
+				t.Fatalf("revocation lost ownership/history or fence: %v", readErr)
+			}
+			gatewayRebindSequenceRequireRetainedFiles(t, f.manager, files)
+		})
+	}
 }
 
 func TestGatewayRebindCommittedServingRestoreKeepsActiveSQLFence(t *testing.T) {

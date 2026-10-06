@@ -90,7 +90,8 @@ func (m *Manager) restoreGatewayRebindCommittedServingLocked(ctx context.Context
 		return invalid()
 	}
 	snapshot, err := repository.HostingGatewayStartupSnapshot(ctx)
-	if err != nil || !gatewayRebindCommittedServingSnapshotMatches(request, snapshot.Rebind) {
+	if err != nil || !snapshot.ActiveRebindApprovalsAuthorizeServing() ||
+		!gatewayRebindCommittedServingSnapshotMatches(request, snapshot.Rebind) {
 		return invalid()
 	}
 	selection, err := m.selectGatewayCurrentLocked(ctx, snapshot.Rebind)
@@ -131,6 +132,7 @@ func (m *Manager) restoreGatewayRebindCommittedServingLocked(ctx context.Context
 		fresh, readErr := repository.HostingGatewayStartupSnapshot(effectCtx)
 		digest, digestErr := canonicalDigest(fresh)
 		if readErr != nil || digestErr != nil || digest != action.AuthorizationDigest ||
+			!fresh.ActiveRebindApprovalsAuthorizeServing() ||
 			!gatewayRebindCommittedServingSnapshotMatches(request, fresh.Rebind) {
 			return fresh, gatewayCurrentRouteOperationError(effectCtx)
 		}
