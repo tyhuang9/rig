@@ -25,6 +25,8 @@ const (
 // approved disable freezes this exact grant.
 type GatewayV2LANStartupClaim struct {
 	Request                  GatewayV2LANGrantRequest
+	CurrentBinding           *GatewayV2LANStartupBindingProjection
+	RetainedBinding          *GatewayV2LANStartupBindingProjection
 	State                    appaccess.AppAccessGrantState
 	StateSequence            int64
 	DisableIntentOperationID string
