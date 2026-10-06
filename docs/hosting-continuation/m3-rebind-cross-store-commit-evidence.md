@@ -1868,3 +1868,48 @@ and the admission latch, unsupported capability refusal, stale/drifting ownershi
 and three native recovery regressions. Vet, full Go build, gofmt and
 `git diff --check` passed. These are protected-file tests with projected SQL and
 simulated physical evidence; they do not establish real Docker stop or restart.
+
+Independent review accepted frozen `df9689a`. The exact positive retirement,
+stopped-marker preservation and ownership-wrapper tests passed independently:
+three top-level tests and four subcases, zero failures/skips, 111.105s
+(`Rig/temp/cross-store-review-df968-retirement-guard.jsonl`). This bounded review
+does not close the documented fresh-process stopped/no-marker recovery case.
+
+## Current whole-batch quarantine
+
+The public current-generation quarantine regression first failed at `df9689a`
+with `route_reconciliation_required` (one test, 28.537s;
+`Rig/temp/m3-current-batch-quarantine-red.jsonl`). The current consumer now derives
+and persists one immutable queue from the complete validated claims before
+withdrawing every unsafe binding. Replay keeps the same revision and head;
+the completed queue is reattested without invoking a head effect. Existing
+ordinary pending evidence is carried in `LegacyPending`.
+
+Unqueueable claims, including a stale committed grant, stop the exact protected
+owner before recovery refusal; they never fabricate a rollback or disable.
+Failures after intent retain the queue and compensate through the protected
+state-only stop path even when SQL becomes unreadable. Once quarantine starts,
+a bounded independent context completes withdrawal or compensation despite
+client cancellation. Every physical proof/effect is followed by exact SQL,
+protected-state and retained-history confirmation. SQL claims are never resolved
+by this consumer; ordered explicit finalization remains separate work.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=6m ./internal/generatedingress -run '^TestGatewayCurrentLANRecoveryBatch(Quarantine|Quarantines|StopsUnqueueable|RetainsIntent)'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^Test(GatewayCurrentLANRecoveryHeadObservesWholeBatchAndCompletion|GatewayV2LANRecoveryBatch(QuarantinesTwoPreparedDisables|RejectsCommittedStaleGrantBeforeIntent|StopsOwnedGatewayOnInvalidReplayCensus))$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+```
+
+The new quarantine suite passed five top-level tests and five subcases in
+254.078s, zero failures/skips (`Rig/temp/m3-current-batch-quarantine-green.jsonl`).
+It verifies all-items withdrawal after durable installation, replay without a
+new revision/effect, pre-intent refusal with owned stop, lost withdrawal
+acknowledgement, SQL failure after withdrawal, bounded completion despite client
+cancellation, completed-queue preservation and retained pending evidence.
+The tests use real protected files with projected SQL and simulated physical
+effects. They do not verify the actual managed Docker adapter.
+
+Preservation passed four top-level tests with zero failures/skips in 21.286s
+(`Rig/temp/m3-current-batch-quarantine-preservation.jsonl`): the shared current
+observer fixture and three native quarantine success/refusal paths. Vet, gofmt
+and `git diff --check` also passed.
