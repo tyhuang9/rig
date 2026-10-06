@@ -19,20 +19,12 @@ func (d managerGatewayCurrentPhysicalRuntime) observeLANRecovery(ctx context.Con
 	if !validGatewayCurrentLANRecoveryPhysicalAction(action) || !gatewayCurrentLANRecoveryTargetMatches(action, target) {
 		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 	}
-	first, err := d.readLANRecovery(ctx, action, target)
+	value, err := d.stableLANRecoveryInventory(ctx, action, target)
 	if err != nil {
 		return gatewayCurrentPhysicalAttestation{}, err
 	}
-	defer clearGatewayCurrentLANRecoveryInventory(&first)
-	second, err := d.readLANRecovery(ctx, action, target)
-	if err != nil {
-		return gatewayCurrentPhysicalAttestation{}, err
-	}
-	defer clearGatewayCurrentLANRecoveryInventory(&second)
-	if !reflect.DeepEqual(first, second) || ctx.Err() != nil {
-		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
-	}
-	return d.gatewayCurrentLANRecoveryAttestation(ctx, action, target, second)
+	defer clearGatewayCurrentLANRecoveryInventory(&value)
+	return d.gatewayCurrentLANRecoveryAttestation(ctx, action, target, value)
 }
 
 func (d managerGatewayCurrentPhysicalRuntime) reconcileLANRecovery(ctx context.Context,
@@ -43,30 +35,45 @@ func (d managerGatewayCurrentPhysicalRuntime) reconcileLANRecovery(ctx context.C
 		!gatewayCurrentLANRecoveryTargetMatches(action, target) || ctx == nil || ctx.Err() != nil {
 		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 	}
-	initial, err := d.readLANRecovery(ctx, action, target)
+	initial, err := d.stableLANRecoveryInventory(ctx, action, target)
 	if err != nil {
 		return gatewayCurrentPhysicalAttestation{}, err
 	}
 	stopped := !initial.Final.Running
-	clearGatewayCurrentLANRecoveryInventory(&initial)
 	if stopped {
+		clearGatewayCurrentLANRecoveryInventory(&initial)
 		return d.reconcileStoppedLANRecovery(ctx, action, target, guard)
 	}
-	proof, err := d.observeLANRecovery(ctx, action, target)
-	if err != nil {
-		return gatewayCurrentPhysicalAttestation{}, err
+	if initial.LiveState == nil || !d.proveServing(ctx, *initial.LiveState, initial.Final.ID) {
+		clearGatewayCurrentLANRecoveryInventory(&initial)
+		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 	}
-	if absent, ok := gatewayCurrentLANRecoveryObservedProjection(action, proof.State); ok && absent {
-		return proof, nil
+	if reflect.DeepEqual(*initial.LiveState, initial.RestartState) {
+		proof, proofErr := d.gatewayCurrentLANRecoveryAttestation(ctx, action, target, initial)
+		if proofErr == nil {
+			if absent, ok := gatewayCurrentLANRecoveryObservedProjection(action, proof.State); ok && absent {
+				clearGatewayCurrentLANRecoveryInventory(&initial)
+				return proof, nil
+			}
+		}
 	}
+	clearGatewayCurrentLANRecoveryInventory(&initial)
 	withdrawnTarget := target
 	withdrawnTarget.State = cloneGatewayCurrentRouteState(action.Withdrawn)
 	effectGuard := func(effectCtx context.Context) error {
 		if err := guard(effectCtx); err != nil || d.manager == nil || d.manager.gatewayRebindAdmissionBlocked() {
 			return gatewayCurrentPhysicalDriverError(effectCtx)
 		}
-		_, err := d.observeLANRecovery(effectCtx, action, target)
-		return err
+		inventory, err := d.stableLANRecoveryInventory(effectCtx, action, target)
+		if err != nil {
+			return err
+		}
+		defer clearGatewayCurrentLANRecoveryInventory(&inventory)
+		if !inventory.Final.Running || inventory.LiveState == nil ||
+			!d.proveServing(effectCtx, *inventory.LiveState, inventory.Final.ID) {
+			return gatewayCurrentPhysicalDriverError(effectCtx)
+		}
+		return nil
 	}
 	if err := effectGuard(ctx); err != nil {
 		return gatewayCurrentPhysicalAttestation{}, err
@@ -92,7 +99,7 @@ func (d managerGatewayCurrentPhysicalRuntime) reconcileLANRecovery(ctx context.C
 	}
 	proofCtx, cancel := gatewayCurrentPhysicalProofContext(ctx, d.manager)
 	defer cancel()
-	proof, err = d.observeLANRecovery(proofCtx, action, target)
+	proof, err := d.observeLANRecovery(proofCtx, action, target)
 	if err != nil {
 		return gatewayCurrentPhysicalAttestation{}, err
 	}
@@ -205,6 +212,25 @@ func (d managerGatewayCurrentPhysicalRuntime) readLANRecovery(ctx context.Contex
 	return value, nil
 }
 
+func (d managerGatewayCurrentPhysicalRuntime) stableLANRecoveryInventory(ctx context.Context,
+	action gatewayCurrentLANRecoveryPhysicalAction, target gatewayCurrentPhysicalTarget,
+) (gatewayCurrentLANRecoveryInventory, error) {
+	first, err := d.readLANRecovery(ctx, action, target)
+	if err != nil {
+		return gatewayCurrentLANRecoveryInventory{}, err
+	}
+	defer clearGatewayCurrentLANRecoveryInventory(&first)
+	second, err := d.readLANRecovery(ctx, action, target)
+	if err != nil {
+		return gatewayCurrentLANRecoveryInventory{}, err
+	}
+	if !reflect.DeepEqual(first, second) || ctx.Err() != nil {
+		clearGatewayCurrentLANRecoveryInventory(&second)
+		return gatewayCurrentLANRecoveryInventory{}, gatewayCurrentPhysicalDriverError(ctx)
+	}
+	return second, nil
+}
+
 func (d managerGatewayCurrentPhysicalRuntime) gatewayCurrentLANRecoveryAttestation(ctx context.Context,
 	action gatewayCurrentLANRecoveryPhysicalAction, target gatewayCurrentPhysicalTarget,
 	inventory gatewayCurrentLANRecoveryInventory,
@@ -220,7 +246,8 @@ func (d managerGatewayCurrentPhysicalRuntime) gatewayCurrentLANRecoveryAttestati
 		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 	}
 	observed = *inventory.LiveState
-	if !d.proveServing(ctx, observed, inventory.Final.ID) {
+	if !reflect.DeepEqual(observed, inventory.RestartState) ||
+		!d.proveServing(ctx, observed, inventory.Final.ID) {
 		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 	}
 	if _, ok := gatewayCurrentLANRecoveryObservedProjection(action, observed); !ok {

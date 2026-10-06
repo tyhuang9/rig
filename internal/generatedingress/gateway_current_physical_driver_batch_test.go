@@ -188,13 +188,28 @@ func TestManagedGatewayCurrentLANRecoveryRuntimeWithdrawsWholeBatchAfterLostRelo
 	if err != nil || before.BatchAbsent || !reflect.DeepEqual(before.Attestation.State, action.Before) {
 		t.Fatalf("initial whole-batch attestation=%#v error=%v", before, err)
 	}
+	if withdrawn, err := driver.withdrawGatewayCurrentLANRecoveryBatch(context.Background(), action); err == nil ||
+		!reflect.DeepEqual(withdrawn, gatewayCurrentLANRecoveryPhysicalResult{}) ||
+		!sameCaddyConfig(runner.live, mustGatewayCurrentPhysicalConfig(t, action.Withdrawn)) ||
+		!sameCaddyConfig(runner.files[target.Identity.Rebind.ActiveConfigFilename],
+			mustGatewayCurrentPhysicalConfig(t, action.Before)) {
+		t.Fatalf("live-only lost acknowledgement was resolved: result=%#v effects=%v error=%v",
+			withdrawn, runner.effects, err)
+	}
+	retained, err := fixture.store.load()
+	if err != nil || !reflect.DeepEqual(retained, action.Selected) {
+		t.Fatalf("physical batch driver changed protected state after lost ack: state=%#v error=%v", retained, err)
+	}
 	withdrawn, err := driver.withdrawGatewayCurrentLANRecoveryBatch(context.Background(), action)
 	if err != nil || !withdrawn.BatchAbsent ||
 		!reflect.DeepEqual(withdrawn.Attestation.State, action.Withdrawn) ||
-		!reflect.DeepEqual(withdrawn.Attestation.LANRecovery, action.Selected.LANRecovery) {
-		t.Fatalf("lost-ack whole-batch withdrawal=%#v effects=%v error=%v", withdrawn, runner.effects, err)
+		!reflect.DeepEqual(withdrawn.Attestation.LANRecovery, action.Selected.LANRecovery) ||
+		!sameCaddyConfig(runner.live, mustGatewayCurrentPhysicalConfig(t, action.Withdrawn)) ||
+		!sameCaddyConfig(runner.files[target.Identity.Rebind.ActiveConfigFilename],
+			mustGatewayCurrentPhysicalConfig(t, action.Withdrawn)) {
+		t.Fatalf("retried whole-batch withdrawal=%#v effects=%v error=%v", withdrawn, runner.effects, err)
 	}
-	retained, err := fixture.store.load()
+	retained, err = fixture.store.load()
 	if err != nil || !reflect.DeepEqual(retained, action.Selected) {
 		t.Fatalf("physical batch driver changed protected state: state=%#v error=%v", retained, err)
 	}
