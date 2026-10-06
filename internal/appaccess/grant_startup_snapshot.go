@@ -366,6 +366,14 @@ func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID s
 			value.TransferChainTipDigest = resolution.TransferChainTipDigest
 			value.TerminalReceiptDigest = resolution.TerminalReceiptDigest
 		}
+	} else if claim.State == AppAccessGrantApplying || claim.State == AppAccessGrantDBActive ||
+		claim.State == AppAccessGrantUncertain {
+		source, resolveErr := readOptionalGatewayCurrentAuthority(ctx, tx, profile)
+		if resolveErr != nil {
+			return AppAccessGrantStartupClaim{}, invalidRebindStoredState(resolveErr)
+		}
+		value.CurrentGatewaySource = source
+		value.TerminalReceiptDigest = source.TerminalReceiptDigest
 	}
 	var archived sql.NullString
 	if err := tx.QueryRowContext(ctx, `SELECT archived_at FROM applications WHERE id=?`, claim.Spec.AppID).Scan(&archived); errors.Is(err, sql.ErrNoRows) {
