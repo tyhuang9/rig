@@ -80,6 +80,9 @@ func (m *Manager) ObserveGatewayV2LANRecoveryHead(ctx context.Context,
 	defer releaseGatewayLock(release, &resultErr)
 	proofCtx, cancelProof := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelProof()
+	if currentHead, currentPresent, handled, currentErr := m.observeGatewayCurrentLANRecoveryHeadLocked(proofCtx, claims); currentErr != nil || handled {
+		return currentHead, currentPresent, currentErr
+	}
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil {
 		return GatewayV2LANRecoveryHead{}, false, gatewayV2LANDisableError(proofCtx)

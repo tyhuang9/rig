@@ -1754,3 +1754,59 @@ The new test passed in 43.109s with no failures or skips
 (`Rig/temp/m3-cross-store-redeploy-sequence.jsonl`); vet and `git diff --check`
 also passed. This is local SQL/protected-state acceptance, not a real Docker
 redeploy, a process-restart result, or complete M3 acceptance.
+
+Independent QA/code review accepted frozen `a696eda`. The exact redeploy test
+passed independently in 42.755s with no failures or skips
+(`Rig/temp/cross-store-review-a696-redeploy-sequence.jsonl`). The scope remains
+real SQL/protected/ordinary-switch coordination with simulated Docker effects.
+
+## Whole-batch physical contract and current head observation
+
+Reviewed runtime commits `05810a7` and
+`b980f6bcce0dd4c31b267fa76f5f3c12db12d013` were integrated locally as `c8f3ba9`.
+The contract binds the complete selected queue, canonical terminal, before
+projection and all-items withdrawal projection. Partial physical withdrawal is
+represented explicitly with `BatchAbsent=false` and cannot authorize queue
+dispatch or SQL clearance. The completed queue has `Complete=true`, an empty
+head and unchanged logical clearance state; it can be attested but cannot
+invoke another withdrawal. No app route is manufactured for a missing app.
+
+Independent review reproduced the initial completed-queue failure at `05810a7`
+in 16.980s (`Rig/temp/cross-store-review-058-completed-batch-red.jsonl`). The
+unchanged regression plus five focused contract tests passed at `b980f6b`:
+six top-level tests, no failures/skips, 102.087s
+(`Rig/temp/cross-store-review-b980-batch-contract-green.jsonl`). This accepted
+the canonical contract, not the managed Docker adapter; its default factory
+remains closed.
+
+The public `ObserveGatewayV2LANRecoveryHead` now uses the selected rebind
+generation before considering a native owner. Its current path validates the
+complete supplied SQL census and retained historical sources, requires a whole
+batch absence proof, and rereads exact SQL authority and protected state after
+physical inspection. A completed queue returns `Head==Count` with no operation
+identity. The reader never clears a binding, advances a head, writes SQL, or
+performs withdrawal.
+
+The initial unsupported-current regression returned an unresolved error with
+`present=false` (17.375s, `Rig/temp/m3-current-batch-observer-red.jsonl`). With
+the current reader, a selected batch whose driver lacks batch proofs stays
+explicitly present and unresolved. New tests also cover sequential observation
+through completion, valid partial-withdrawal refusal, omitted unresolved claims
+before physical inspection, cancellation, SQL drift and protected-revision
+drift after proof. Deliberately changed evidence is retained on refusal.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayCurrentLANRecoveryHead'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayV2LANRecovery(FinalizesTwoDisablesSequentiallyAndRetires|InspectorReprovesProcessedPrefixPorts|InspectorRejectsCommittedStaleGrant)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The current observer suite passed three top-level tests and five subcases in
+56.227s (`Rig/temp/m3-current-batch-observer-green.jsonl`). Native preservation
+passed three top-level tests in 2.535s
+(`Rig/temp/m3-current-batch-observer-native-preservation.jsonl`). Both runs had
+zero failures/skips; vet, full build and `git diff --check` passed. The observer
+tests use protected files with projected SQL snapshots and simulated physical
+proofs. Actual whole-batch withdrawal, ordered callback/finalization writes,
+retirement, startup dispatch and Docker restart acceptance remain open.
