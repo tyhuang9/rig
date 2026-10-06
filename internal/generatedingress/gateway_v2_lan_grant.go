@@ -144,6 +144,9 @@ func (m *Manager) grantGatewayV2LAN(ctx context.Context, request gatewayV2LANGra
 			resultErr = gatewayV2LANGrantError(ctx)
 		}
 	}()
+	if currentResult, handled, err := m.grantGatewayCurrentLANStateMachineLocked(ctx, request, authorize); err != nil || handled {
+		return currentResult, err
+	}
 
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil || state.Pending != nil {
@@ -342,6 +345,9 @@ func (m *Manager) withGatewayV2LANCommitResolution(ctx context.Context, request 
 	}
 	proofCtx, cancelProof := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelProof()
+	if handled, err := m.withGatewayCurrentLANCommitResolutionLocked(proofCtx, request, resolve); err != nil || handled {
+		return err
+	}
 	driver := m.gatewayV2LANGrantDriver
 	if driver == nil {
 		driver = managerGatewayV2LANGrantDriver{manager: m}
@@ -463,6 +469,9 @@ func (m *Manager) WithGatewayV2LANAbsenceResolution(ctx context.Context, request
 	}
 	proofCtx, cancelProof := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelProof()
+	if handled, err := m.withGatewayCurrentLANAbsenceResolutionLocked(proofCtx, request, fn); err != nil || handled {
+		return err
+	}
 
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil || state.Pending != nil ||
@@ -530,6 +539,9 @@ func (m *Manager) withGatewayV2LANObservation(ctx context.Context, request Gatew
 	}
 	proofCtx, cancelProof := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelProof()
+	if handled, err := m.withGatewayCurrentLANObservationLocked(proofCtx, request, fn); err != nil || handled {
+		return err
+	}
 
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil {
@@ -584,6 +596,11 @@ func (m *Manager) WithGatewayV2LANCommitRecovery(ctx context.Context, request Ga
 	}
 	recoveryCtx, cancelRecovery := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelRecovery()
+	if handled, err := m.withGatewayCurrentLANCommitRecoveryLocked(
+		recoveryCtx, request, validateCommitted,
+	); err != nil || handled {
+		return err
+	}
 
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil || state.Pending == nil ||
@@ -652,6 +669,9 @@ func (m *Manager) WithGatewayV2LANRollbackResolution(ctx context.Context, reques
 	}
 	recoveryCtx, cancelRecovery := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelRecovery()
+	if handled, err := m.withGatewayCurrentLANRollbackResolutionLocked(recoveryCtx, request, fn); err != nil || handled {
+		return err
+	}
 
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil {
@@ -721,6 +741,11 @@ func (m *Manager) RecoverGatewayV2LAN(ctx context.Context, request GatewayV2LANG
 	}
 	recoveryCtx, cancelRecovery := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelRecovery()
+	if currentRecovery, handled, err := m.recoverGatewayCurrentLANLocked(
+		recoveryCtx, request,
+	); err != nil || handled {
+		return currentRecovery, err
+	}
 
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil {
