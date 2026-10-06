@@ -9,7 +9,7 @@ Base: `a888cac5f34c46aad74afd5c3a0392eec914c509`, the reviewed private handover
 candidate. That handover's draft-publication request is pending. Its prerequisite
 [draft PR #136](https://github.com/tyhuang9/rig/pull/136) was initially published at
 `bdbb697f767da4e71664da1434a75e6daec4b732`; its corrected current head is
-`b46162ea4a97335976663770b17d2a44612cc3f9`.
+`9694b4ecf0086174a4002098a2aa203c96907d50`.
 
 ## Purpose and required end state
 
@@ -61,7 +61,9 @@ a private one-use 256-bit nonce and a nondeterministic SQL guard function:
    uncertain commit never revives the nonce; recovery mints fresh authority
    only after new complete proof.
 
-This is a design decision awaiting implementation and adversarial tests.
+This was the initial design decision. The guarded SQL implementation and
+adversarial test evidence are recorded below; the complete runtime commit,
+recovery and physical acceptance work remains in progress.
 The control DB currently uses a plain file DSN with private cache. Bound nonce
 values must never be logged or traced. The ordinary-SQL threat boundary excludes
 process-memory access, counterfeit registered functions and arbitrary schema
@@ -747,16 +749,149 @@ and passed in 1.313s (named test 1.06s). Repository-wide
 VitePress build passed (3.72s). These are checkpoint checks, not the complete
 unit's final suite or a Docker result.
 
+The strengthened real-repository prepared-admission regression also passed
+bounded independent review. Both normal preparation and an injected return
+failure immediately after the real SQL claim commit recover through a fresh
+Manager, with the production effects/Manager/gateway locks held. Recovery
+preserves predecessor file identity and content, creates exactly one checkpoint,
+typed intent and first progress record, replays those exact records, and retains
+the SQL fence and original current authority. No Docker command is issued.
+The network inventory is simulated; the production network selector and
+observation canonicalizer are exercised. The return fault is not process-kill
+or physical Docker acceptance evidence.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayRebind(ProposalAndAdmission|PreparedAdmissionAndRecovery)UseRealRepository$'
+```
+
+Both named tests and both boundary subtests passed, with zero failures or skips
+(4.167s). Events: `$TEMP/m3-cross-store-real-prepare-green.jsonl`.
+Formatting and `git diff --check` passed.
+
 The prepared SQL boundary still has no Docker effects or protected commit
 receipt. Full physical coordination, terminal recovery, transfer-aware normal
 operations and startup dispatch remain required for delivery.
+
+### Startup authority validation checkpoint
+
+SQL checkpoint `b91f55d6ef43c78cb3f83c1314bf5b00aaea143b` was independently
+reviewed and integrated at `ab38e9e`. In-flight grants and no-source disables
+carry optional SQL authority only when their raw profile is still exactly
+current. Four independent tests passed with no failure or skip (7.580s), and
+the implementation agent's full app-access suite passed (100.641s). Evidence:
+`temp/cross-store-review-b91-startup-authority.jsonl`.
+
+The startup grant/disable claim validators now check canonical effective
+profiles, typed source and receipt, immutable raw app/allocation/grant/profile
+identity, ordered digest-linked transfer history and its terminal tip. Current
+and retained evidence are mutually exclusive and must agree across the exact
+grant/disable pair. Native grants on a rebound profile and no-source in-flight
+disables have explicit no-transfer rules. The regression includes semantic
+mutations with recalculated transfer hashes and a projected two-transfer chain;
+it does not claim a physical repeated rebind.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./internal/generatedingress -run '^TestGatewayV2LAN(Startup|DisableStartup|Access)'
+go vet -mod=readonly ./internal/generatedingress
+```
+
+All 21 top-level tests passed, zero failures or skips (32.622s), including the
+existing native startup/quarantine and disable cases. Vet and diff checks
+passed. Events: `$TEMP/m3-startup-binding-consumers.jsonl`. Bounded independent
+review found no issue in this structural validation checkpoint. Selection of
+the protected current generation and physical attestation remain required;
+these validators alone do not authorize serving.
+
+The reviewed runtime reader/attempt checkpoint
+`6f2018d349df9b39b7e0491df1c0904d7b663fe0` is integrated at `f2b1761`.
+Independent testing first reproduced the missing typed-intent comparison at
+`76160ae` (17.661s, one expected regression failure). The corrected checkpoint
+passed four independent reader/barrier tests without failure or skip (37.528s).
+The attempt adapter's separate three-test review passed (19.236s). Logs:
+`temp/cross-store-review-761-typed-history-red.jsonl`,
+`temp/cross-store-review-6f-reader-barrier-green.jsonl`, and
+`temp/cross-store-review-761-attempt.jsonl`.
+
+Both production controller constructors now inject the app-access current-state
+repository. The shared optional-selection helper requires that provider even
+for an absence decision. Fresh or configured/preupgrade SQL must contain no
+rebind history, active claim, transfer, phase or commit evidence, and two
+nonmutating protected scans must agree around the confirming SQL read. Existing
+authority uses the strict SQL-led selector. Empty SQL plus lost files cannot
+be inferred from a missing provider. The legacy unit fixture supplies explicit
+empty-history data; authority-specific fixtures must override it.
+
+Five helper test groups passed with zero failures or skips (18.606s), covering
+real fresh/native repositories, partial SQL, orphan files, changed SQL or paths,
+cancellation and terminal-history dispatch. The terminal case uses real
+protected fixtures with simulated SQL and does not establish physical serving.
+Its first run exposed two test-setup mistakes: an uninitialized fixture mutex
+and sample ports outside the supported range. The stalled process was stopped,
+both fixtures corrected, and the complete named group rerun successfully.
+Events: `$TEMP/m3-current-optional-selection-final.jsonl`; previous attempts are
+retained in `$TEMP/m3-current-optional-selection.jsonl` and
+`$TEMP/m3-current-optional-selection-green.jsonl` (the latter failed despite its
+filename).
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestOptionalGatewayCurrentSelection'
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./cmd/hostd -run '^Test(GatewayStartupRebindFence|RuntimeCompositionRebindFence|GeneratedComposition|PrepareRuntimeWorker|DeploymentEffectsAdmission|LANStartupMapping|MigratedLegacyPairRecoveryComposition|LANGrantStartup|LANDisableStartup|LANAccessStartup|LANRecoveryBatch|AttestHistoricalLANDisableSuccessor|HistoricalLANDisableSuccessorSelection)'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+All 37 controller composition/startup/effects tests passed (22.899s, zero failure
+or skip). Events: `$TEMP/m3-current-provider-composition.jsonl`. Vet, build and
+diff checks passed. Independent code review accepted the helper and constructor
+changes. Rebound startup consumers and recovery-before-admission dispatch are
+still pending; constructor injection alone does not satisfy those requirements.
+
+Native gateway startup now performs that strict optional selection before and
+after its existing physical proof. It rejects active rebind recovery, missing
+providers, changed SQL authority and changes to the protected selection. The
+exact native generation used for physical proof is compared with the
+SQL-selected observation, including the original route source. The added
+regression uses projected SQL and the existing fake physical driver; an injected
+valid protected-file replacement must refuse before the driver is invoked.
+The normal protected writer correctly rejected the initial replacement fixture,
+so the final test explicitly injects the external write through the test's
+protected-file writer. Production transition checks were not relaxed.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayV2(Startup|LANStartup|LANDisableStartup|LANAccess|LANRecovery)'
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayV2Startup'
+```
+
+The expanded existing startup/LAN/recovery set passed all 68 top-level tests
+(57.235s). After the final selected-generation comparison was added, all seven
+native startup tests passed again (10.898s). Both runs had zero failures or
+skips. The same 37 controller preservation tests also passed again (22.779s).
+Vet and diff checks passed. Logs are
+`$TEMP/m3-native-startup-current-preservation.jsonl`,
+`$TEMP/m3-native-startup-current-confirmed.jsonl`, and
+`$TEMP/m3-native-current-hostd-preservation.jsonl`. Bounded independent review
+accepted the final diff. This native inspection still refuses SQL-selected
+rebind authority until its separate typed-terminal/physical-attestation branch
+is implemented; it does not represent completed rebound startup.
 
 PR #136 received the separately reviewed CI partition correction at `7deefa4`.
 Its M3 Docker workflow passed again at that exact revision (run `37391508257`).
 The previous repository-wide race job at `b46162e` was cancelled by normal
 workflow concurrency after the update; its PostgreSQL-specific steps passed,
 but its repository-wide result is unverified. New race batches at `7deefa4`
-remain pending. The published correction is integrated locally at `3cf6bb8`.
+all passed, including the aggregate check (run `37391508420`). Windows passed
+at the same head (run `37391508875`). The repository-wide race step in run
+`37391508290` subsequently hit its 40-minute ingress package timeout, without a
+preceding race report or failed assertion. The original published correction is
+integrated locally at `3cf6bb8`. The reviewed follow-up `9694b4e` moves that
+workflow onto the same shared ingress partitions and retains all other 49
+packages, PostgreSQL checks, and the original required aggregate check. It is
+integrated locally at `e1c4d49`. New exact-head runs are
+[repository race](https://github.com/tyhuang9/rig/actions/runs/37399509007),
+[lifecycle race](https://github.com/tyhuang9/rig/actions/runs/37399508966), and
+[M3 Docker](https://github.com/tyhuang9/rig/actions/runs/37399509055). Their full
+results remain pending. The failed run and correction are recorded in the
+[final-copy evidence](./m3-rebind-final-config-copy-evidence.md).
 
 Keep the new runtime path unavailable until its complete invariants and gates
 are satisfied. Reverting source must not delete protected receipts, committed
@@ -765,3 +900,251 @@ only exact proved abort recovery can roll back. After a historical database
 commit, preserve successor state and recover forward. External databases remain
 application-owned through scoped runtime secrets; this work adds no managed
 database or Neon provisioning.
+
+### Native LAN startup authority checkpoint, 2026-10-05
+
+Integrated the independently reviewed current-route persistence checkpoint
+`4cfa69236546bee7d6d604ece38de27f064b4dd1` at `d2cfa74`. Its two independently
+executed tests passed in 39.354s, with zero failure or skip. That checkpoint
+covers quiescent persistence, immutable raw bindings/transfer manifest, and
+refusal while another rebind is active; the ordinary mutation state machines
+remain work in progress.
+
+Both read-only native LAN startup inspections now bind SQL current authority
+to the exact protected native store, journal and route state before physical
+observation and confirm the same authority afterward. Effective and retained
+projections must match the actual protected profile and operation. Retained
+history remains separate from serving authorization. Missing providers,
+missing required projections, forged source/interface, active rebind and SQL
+drift refuse startup. Explicit SQL absence preserves the legacy no-projection
+path; it cannot authorize a supplied current or retained projection.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./internal/generatedingress -run '^TestGatewayV2(Startup|LANStartup|LANDisableStartup|LANAccess|LANRecovery)'
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayV2(StartupSQLSelectedNative|LANStartup(BindsNative|RetainedNative|SelectedNative))'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+```
+
+The preservation run passed all 72 top-level tests in 60.878s; the final
+five-test run, including the added SQL-selected native Pending positive,
+passed in 4.876s. Both runs had zero failure or skip. Vet and diff checks
+passed. Logs are `$TEMP/m3-native-lan-authority-preservation.jsonl` and
+`$TEMP/m3-native-lan-authority-confirmed.jsonl`. The first focused run failed
+because its assertion included the fixture's initial grant apply count;
+the fixture counter was reset before inspection, with no production relaxation.
+Its failed log is `$TEMP/m3-native-lan-authority-first.jsonl`.
+
+The tests use real protected storage and locks, projected SQL reader responses
+and bounded fake physical drivers. They cover SQL-selected native Pending and
+LANRecovery startup, but are not Docker acceptance. Independent review accepted
+this checkpoint at `6b9bbce` with no blocker. Rebound physical consumers, process
+recovery before ordinary admission and the complete cross-store coordinator
+acceptance remain outstanding.
+
+Native startup quarantine now revalidates authority before its protected
+mutation and at the physical apply boundary. At that boundary a fresh protected
+pending marker must derive the exact requested withdrawal; SQL authority,
+native journal and original route source must remain unchanged. The existing
+driver only receives that validated withdrawal. A final re-read is required
+before success, including paths that need no apply. Uncertainty preserves the
+pending record; no terminal receipt or SQL history is rewritten.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayV2(LANStartupQuarantine|LANDisableStartup)'
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayV2LANStartup(QuarantineRechecksSQLAtEffectBoundary|RetainedAuthorityCannotServeLiveGrant)$'
+go test -mod=readonly -p=1 -json -count=1 -timeout=4m ./cmd/hostd -run '^Test(GatewayStartupRebindFence|RuntimeCompositionRebindFence|GeneratedComposition|PrepareRuntimeWorker|DeploymentEffectsAdmission|LANStartupMapping|MigratedLegacyPairRecoveryComposition|LANGrantStartup|LANDisableStartup|LANAccessStartup|LANRecoveryBatch|AttestHistoricalLANDisableSuccessor|HistoricalLANDisableSuccessorSelection)'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The seven existing quarantine tests passed in 4.630s. Two new top-level tests
+passed in 7.411s, including ten grant/disable success and fault cases: forged
+projection, SQL drift before the pending write, after the pending write, and
+after apply. They assert exact retained raw routes/journal, pending marker
+retention, zero apply on unproved authority, and refusal after late SQL drift.
+The controller set passed all 37 tests in 22.426s. All runs had zero failure
+or skip; vet and full build passed. Logs are
+`$TEMP/m3-native-lan-quarantine-preservation.jsonl`,
+`$TEMP/m3-native-lan-quarantine-boundaries.jsonl`, and
+`$TEMP/m3-native-lan-quarantine-hostd.jsonl`. A Git diff check attempted from
+the elevated test identity could not recognize the worktree; its separate
+non-elevated retry passed. No Git mutation was attempted by that failed check.
+
+These quarantine tests retain the same projected-SQL/fake-Docker limitation.
+They do not prove the pending typed-rebind or repeated-rebind runtime paths.
+
+Independent review of `3fc4e6b` required two corrections before acceptance:
+the final check must compare the exact pending state just proved, and the
+disable mutator must propagate gateway lock-release failure. Both findings
+were reproduced first: two top-level regressions failed in 2.733s at the
+reviewed revision (`$TEMP/m3-native-quarantine-review-red.jsonl`). The protected
+read seam deterministically returned the core's correct pending bytes while
+installing a different valid native state immediately afterward, without
+changing SQL, source or journal. Both grant and disable incorrectly succeeded.
+The second regression released the actual lock, then injected its release
+error; the disable mutation incorrectly returned success.
+
+The correction retains the exact apply-boundary marker for a new grant
+withdrawal and compares it again after the core proof. Existing pending and
+disable paths compare their already-known exact state. The disable method
+now uses the same named-result release guard as the grant method.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayV2(LANStartupQuarantine|LANDisableStartup|LANStartupRetainedAuthority)'
+```
+
+All 11 top-level tests passed in 14.002s with zero failure or skip
+(`$TEMP/m3-native-quarantine-review-green.jsonl`). Vet, full build and diff
+checks passed again. These changes preserve all prior failed-test evidence.
+
+Independent review accepted the combined `3fc4e6b` and
+`7d3935ef7a1fca788ba5c54b42ee56d0d14232d6` checkpoint. Its separate frozen run
+passed all three boundary/regression tests in 9.777s, with zero failure or
+skip (`Rig/temp/cross-store-review-7d-quarantine-green.jsonl`). This acceptance
+covers native startup/quarantine only; production rebound physical attestation,
+the coordinator and full runtime delivery acceptance remain pending.
+
+### Current physical contract and prepared-process fixture checkpoint
+
+Integrated the reviewed current physical-transition contract
+`4a191437c1dca2ecf71f78fd8a7e4896f2b07205` at `7e76ebe`, then the selected-current
+compensation contract `693ccd84f48def503f90ec5b10b091875390eb3b` at `f1729e4`.
+The former requires exact before/effective projections at the selected protected
+revision; a stopped outcome requires listener absence. It binds transferred
+withdrawals to their immutable raw grant and effective profile separately.
+Independent review first reproduced the unrelated-route acceptance defect at
+the earlier `eaaa3dd` checkpoint, then passed two top-level tests and three
+subtests in 34.120s after correction. Logs are
+`Rig/temp/cross-store-review-eaaa-physical-boundary-red.jsonl` and
+`Rig/temp/cross-store-review-4a-physical-boundary-green.jsonl`.
+
+The compensation contract restores the exact captured grant or stops only the
+selected current resources after an uncertain save. It does not change the
+distinct predecessor-retirement operation. Its two independent tests passed in
+33.570s with no failure or skip
+(`Rig/temp/cross-store-review-693-compensation.jsonl`). These are contract tests;
+the production physical adapter still refuses unavailable operations. They do
+not prove ordinary route/LAN mutation or complete rebind recovery.
+
+Added two disposable-Linux Docker gate cases to the local runtime branch:
+
+- Read-only proposal inspection against actual SQLite, protected history, and
+  two running application containers. Repeat/fresh-manager inspection must
+  retain SQL, raw grants, runtime heads, Docker identity and request counts.
+- An actual child-process exit immediately after the SQL claim commits, before
+  protected admission writes or deferred lock cleanup. Two separate recovery
+  processes must recover and replay the same typed prepared intent without
+  rewriting predecessor history or releasing the fence. The test verifies
+  unchanged runtime heads, raw grants, request counts, Docker identity, both
+  loopback routes, original LAN response, LAN rejection of the loopback-only
+  application, and absence of the successor listener.
+
+The shared live fixture now opens the real control database before its first
+route switch and supplies that repository to every source manager. It builds
+the counted image used by the new assertions. Review caught the initial
+uncounted-image mismatch before publication; that fixture would have failed
+its first request-counter read. No passing Docker result is claimed for it.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestLiveGatewayRebind(CrossStore|FinalHandover)'
+go vet -mod=readonly ./internal/generatedingress
+go build -mod=readonly -buildvcs=false ./...
+pnpm --dir docs install --frozen-lockfile --offline
+pnpm --dir docs check:workflow
+pnpm --dir docs build
+```
+
+The corrected live discovery run compiled in 0.778s. Both new journeys, their
+child helper, and both handover journeys skipped because live opt-ins were
+unset; the existing inert handover child returned normally. This is compilation
+and discovery evidence only (`$TEMP/m3-cross-store-live-corrected-discovery.jsonl`).
+Go vet and the repository build passed. YAML parsing confirmed both exact test
+names, opt-ins, one-pass/no-skip guards and always-run owned-resource cleanup;
+all three extracted Bash blocks passed `bash -n`. Diff and formatting checks
+passed. The offline frozen install succeeded; docs workflow/build passed
+(3.59s) outside the sandbox after its identity was denied access to an installed
+Vite manifest. The initial sandbox build failure is an environment limitation.
+
+Independent review accepted the corrected local fixture/CI diff, including the
+real DB cleanup lifetime and child-process boundary. Actual Docker execution,
+hostd startup dispatch, terminal SQL recovery, repeated rebind and final fence
+release remain unverified. This branch remains unpublished and is not ready
+for runtime delivery acceptance.
+
+### SQL-selected rebound startup classification checkpoint
+
+The local prepared-process fixture was frozen at `e0c9bac`. The reviewed route
+restore extension `cdbf174283792d5f31e1608a0b3a7b2b964b320e` was integrated at
+`d52523a`; its worker-reported focused test passed in 17.509s and independent
+review accepted the two-file contract diff. That extension returns the exact
+pre-switch route while retaining the pending marker, including a new app whose
+previous route was absent. The real physical adapter remains unavailable.
+
+Startup now has a distinct read-only path for SQL-selected rebind authority.
+It validates the entire historical native upgrade claim census, consumes the
+shared current-generation physical attestation, and rechecks unchanged SQL,
+protected history and current state before returning. It does not manufacture
+an upgrade journal for a rebound generation. The inspection carries the current
+gateway source separately from the raw grant or disable recovery identity.
+
+An ordinary pending route continues through normal composition, whose existing
+`ingress.Recover` runs before deployment workers; its correctness depends on the
+reviewed ordinary recovery path restoring the committed route. LAN pending
+operations and batches select recovery-only startup. Their downstream rebound
+LAN consumers and quarantine are still outstanding; this checkpoint alone does
+not admit an operational rebound controller.
+
+The hosting startup census now reads complete rebind authority inside the same
+SQLite transaction as upgrade, grant and disable claims. Controller mapping
+requires an exact current profile/source and retained database-commit event
+under a released committed claim. It rereads the complete census before
+accepting a rebound inspection and retains raw per-app recovery identities.
+Quarantine/retirement comparisons also bind the current gateway source.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayRebindCurrentStartupBindsSQLAndPhysicalAuthority$'
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayRebindCurrentStartupDistinguishesRouteAndLANRecovery$'
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/appaccess ./cmd/hostd -run '^Test(HostingGatewayStartupRebindCensus|RebindStartupMapping)'
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./internal/generatedingress -run '^TestGatewayV2(Startup|LANStartup|LANDisableStartup|LANAccess|LANRecovery)'
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./cmd/hostd ./internal/appaccess -run '^Test(GatewayStartup|RuntimeCompositionRebindFence|GeneratedComposition|PrepareRuntimeWorker|DeploymentEffectsAdmission|LANStartupMapping|LANGrantStartup|LANDisableStartup|LANAccessStartup|LANRecoveryBatch|AttestHistoricalLANDisableSuccessor|HistoricalLANDisableSuccessorSelection|HostingGatewayStartup|GatewayUpgradeStartupSnapshot|AppAccessGrantStartupSnapshot)'
+go vet -mod=readonly ./internal/generatedingress ./internal/appaccess ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The final authority test passed in 22.037s, including seven refusal boundaries:
+missing/forged historical claim, unavailable SQL, active rebind, invalid physical
+proof, SQL drift during proof, and a valid protected current revision replaced
+during proof. Route, disable and batch cases passed in 57.190s and retain their
+pending evidence. These tests use genuine legacy protected receipts, real
+protected storage/locks, projected SQL and a fake physical adapter; they do not
+establish typed-v2 lineage or Docker behavior.
+
+The real two-handle SQLite concurrency test passed (package 0.703s): a terminal
+release commits between census reads, while the ongoing startup read retains
+its original database-committed snapshot; the next read sees the release without
+changing transfers. Two controller mapping tests and twelve cases passed
+(package 0.714s). Native preservation passed all 77 top-level tests in 76.195s;
+controller preservation passed 36 in 21.795s and app-access preservation passed
+12 in 8.815s. All final runs had zero failure or skip. Vet and full build passed.
+Logs are `$TEMP/m3-rebound-startup-stable-final.jsonl`,
+`$TEMP/m3-rebound-startup-recovery.jsonl`,
+`$TEMP/m3-rebound-startup-mapping-corrected.jsonl`,
+`$TEMP/m3-rebound-startup-native-preservation.jsonl`, and
+`$TEMP/m3-rebound-startup-preservation.jsonl`.
+
+Initial test-only setup failures are retained: the sandbox identity could not
+construct the protected legacy fixture (`m3-rebound-startup-first.jsonl`); a
+raw helper Manager had an uninitialized mutex and timed out at four minutes
+(`m3-rebound-startup-elevated-first.jsonl`); its replacement initially omitted
+required private Docker options (`m3-rebound-startup-corrected.jsonl`). The
+fixture now uses `New` with real private directories. The first concurrency test
+used one single-connection pool for a nested writer and timed out at three
+minutes (`m3-rebound-startup-mapping-first.jsonl`); the corrected test opens a
+second real database handle and bounds the operation context. Production
+timeouts and safeguards were not relaxed.
+
+Independent bounded source review found no blocker in the startup/census
+checkpoint and requested the valid protected-replacement negative, which now
+passes. Full physical rebind adapters, rebound LAN/batch consumers, early
+process recovery dispatch, repeated rebind and final release acceptance remain
+outstanding. This runtime branch remains unpublished.

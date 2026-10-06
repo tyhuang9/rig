@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/composeruntime"
@@ -217,6 +218,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 				DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
 				DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
 				DataRoot: configuration.DataRoot, RebindFenceCheck: fenceCheck,
+				RebindCurrentStateRepository: appaccess.New(dependencies.db),
 			})
 			if err != nil {
 				return runtimeComposition{}, fmt.Errorf("generated ingress setup: %w", err)

@@ -147,6 +147,13 @@ func readAppAccessDisableStartupClaim(ctx context.Context, tx *sql.Tx, operation
 			value.TransferChainTipDigest = resolution.TransferChainTipDigest
 			value.TerminalReceiptDigest = resolution.TerminalReceiptDigest
 		}
+	} else if claim.State == AppAccessDisableWithdrawing || claim.State == AppAccessDisableUncertain {
+		source, resolveErr := readOptionalGatewayCurrentAuthority(ctx, tx, profile)
+		if resolveErr != nil {
+			return AppAccessDisableStartupClaim{}, invalidRebindStoredState(resolveErr)
+		}
+		value.CurrentGatewaySource = source
+		value.TerminalReceiptDigest = source.TerminalReceiptDigest
 	}
 	if claim.State == AppAccessDisableCommitted {
 		if claim.Proof == nil || revision.Allocation.ReleasedAt == nil ||
