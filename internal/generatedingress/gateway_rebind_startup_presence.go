@@ -115,6 +115,13 @@ func validGatewayRebindNativeStartupAuthority(snapshot appaccess.GatewayRebindRe
 }
 
 func readGatewayRebindProtectedPresenceReadOnly(dataRoot string) (gatewayRebindProtectedPresenceSnapshot, error) {
+	return readGatewayRebindProtectedPresenceMode(dataRoot, true)
+}
+
+// Emergency ownership enumeration fingerprints native route files without
+// trusting their JSON. Only an independently journal-bound native stop may
+// follow a complete absence of rebind ownership; serving reads stay strict.
+func readGatewayRebindProtectedPresenceMode(dataRoot string, validateNativeRoute bool) (gatewayRebindProtectedPresenceSnapshot, error) {
 	store, directoryPresent, pathIdentities, err := inspectStateStoreReadOnly(dataRoot)
 	result := gatewayRebindProtectedPresenceSnapshot{directoryPaths: pathIdentities,
 		files: make(map[string]gatewayHistoryFileFingerprint)}
@@ -146,8 +153,10 @@ func readGatewayRebindProtectedPresenceReadOnly(dataRoot string) (gatewayRebindP
 			if fingerprintErr != nil {
 				return gatewayRebindProtectedPresenceSnapshot{}, fingerprintErr
 			}
-			if _, loadErr := store.load(); loadErr != nil {
-				return gatewayRebindProtectedPresenceSnapshot{}, loadErr
+			if validateNativeRoute {
+				if _, loadErr := store.load(); loadErr != nil {
+					return gatewayRebindProtectedPresenceSnapshot{}, loadErr
+				}
 			}
 			result.files[entry.Name()] = fingerprint
 			continue
@@ -238,6 +247,13 @@ func validateGatewayRebindPresenceArtifact(directory *stateStore, path, name str
 		_, err := store.load()
 		return err
 	case gatewayHistoryRebindTerminal:
+		if strings.HasPrefix(name, gatewayRebindTerminalFilenamePrefixV2) {
+			store := &gatewayRebindTerminalStoreV2{directory: directory, generation: generation,
+				operationID: operationID, path: path}
+			_, store.purpose = gatewayRebindTerminalNameV2(generation, operationID)
+			_, err := store.load()
+			return err
+		}
 		store := &gatewayRebindFinalHandoverTerminalStore{directory: directory, generation: generation,
 			operationID: operationID, path: path}
 		_, store.purpose = gatewayRebindFinalHandoverTerminalName(generation, operationID)

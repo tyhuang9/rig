@@ -275,9 +275,15 @@ func (m *Manager) gatewayCurrentOwnedStopTargetsProtectedPartialLocked() (
 	if m == nil {
 		return nil, gatewayCurrentOwnedStopHistoryCensus{}, errors.New("invalid current owned-stop manager")
 	}
-	presence, err := readGatewayRebindProtectedPresenceReadOnly(m.options.DataRoot)
+	presence, err := readGatewayRebindProtectedPresenceMode(m.options.DataRoot, false)
 	if err != nil {
 		return nil, gatewayCurrentOwnedStopHistoryCensus{}, err
+	}
+	if !presence.present {
+		// Native route corruption must not prevent a separate exact journal-
+		// bound emergency withdrawal. No current rebind artifact is present;
+		// this is not serving authority or a native ownership proof.
+		return nil, gatewayCurrentOwnedStopHistoryCensus{}, nil
 	}
 	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	if err != nil {

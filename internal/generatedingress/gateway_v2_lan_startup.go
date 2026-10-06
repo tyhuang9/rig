@@ -356,6 +356,11 @@ func (m *Manager) stopOwnedGatewayV2OnStartupFailure(ctx context.Context) (resul
 	if err := driver.stopOwnedGateway(recoveryCtx, journal); err != nil {
 		return gatewayV2StartupInspectionError(recoveryCtx)
 	}
+	confirmed, err := m.latestGatewayV2JournalForEmergencyStop()
+	if err != nil || !reflect.DeepEqual(confirmed, journal) {
+		m.gatewayRebindFailStopLatch().Store(true)
+		return gatewayV2StartupInspectionError(recoveryCtx)
+	}
 	return nil
 }
 
@@ -363,7 +368,13 @@ func (m *Manager) latestGatewayV2JournalForEmergencyStop() (gatewayMigrationJour
 	if m == nil || m.store == nil {
 		return gatewayMigrationJournal{}, errors.New("generated ingress store is unavailable")
 	}
-	before, err := readGatewayHistorySnapshot(m.store)
+	targets, census, err := m.gatewayCurrentOwnedStopTargetsProtectedPartialLocked()
+	if err != nil || census.UnresolvedAttempt || census.CommittedOwnership || len(targets) != 0 {
+		return gatewayMigrationJournal{}, errors.New("generated ingress native emergency selection has unresolved rebind ownership")
+	}
+	// Retained terminal aborts are allowed only after their complete protected
+	// census proved that no successor/current ownership needs withdrawal.
+	before, err := readGatewayHistorySnapshotMode(m.store, census.ProtectedRebindHistory)
 	if err != nil || len(before.generations) == 0 {
 		return gatewayMigrationJournal{}, errors.New("generated ingress history is unavailable")
 	}
@@ -396,8 +407,9 @@ func (m *Manager) latestGatewayV2JournalForEmergencyStop() (gatewayMigrationJour
 		(artifacts.operationID != "" && artifacts.operationID != journal.OperationID) {
 		return gatewayMigrationJournal{}, errors.New("latest generated ingress journal is invalid")
 	}
-	after, err := readGatewayHistorySnapshot(m.store)
-	if err != nil || !sameGatewayHistorySnapshot(before, after) {
+	after, err := readGatewayHistorySnapshotMode(m.store, census.ProtectedRebindHistory)
+	if err != nil || !sameGatewayHistorySnapshot(before, after) ||
+		m.confirmGatewayCurrentEmergencyCensusLocked(targets, census) != nil {
 		return gatewayMigrationJournal{}, errors.New("generated ingress history changed during emergency selection")
 	}
 	return journal, nil

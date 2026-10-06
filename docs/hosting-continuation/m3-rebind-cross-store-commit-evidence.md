@@ -2205,3 +2205,56 @@ current/native dispatch cases, cancellation and native ownership failure. Vet,
 the full Go build, gofmt and `git diff --check` passed. These dispatcher tests
 inject stop callbacks. Actual emergency Docker behavior and default driver
 activation remain part of the pending complete runtime gate.
+
+Independent review accepted the guarded serving consumer at `8ca3ada`: four
+tests and two selected post-proof subcases passed in 158.053s, zero failures/skips
+(`Rig/temp/cross-store-review-8ca-serving-restore.jsonl`). Source/security and
+concrete-driver compatibility review found no further consumer defect. The
+concrete driver's actual per-effect guard calls still require its own evidence.
+
+## Typed history and native emergency fallback preservation
+
+A real SQLite/protected no-effect abort fixture exposed two distinct integration
+gaps. First, the presence parser recognized a typed terminal filename but loaded
+it with the legacy terminal purpose/type. The initial regression failed at the
+current ownership census in 18.141s
+(`Rig/temp/m3-native-emergency-retained-abort-red.jsonl`). After adding the typed
+terminal loader dispatch, the same test reached the native emergency path and
+failed because its old history scan rejected every retained rebind artifact,
+in 17.473s (`Rig/temp/m3-native-emergency-retained-abort-fallback-red.jsonl`).
+
+Native journal selection now permits retained rebind history only after complete
+protected enumeration proves no current ownership or unresolved attempt. That
+census is repeated before selection returns; the exact selected journal and
+absence of rebind ownership are verified again after stop. A changed history
+prevents successful completion and latches admission.
+
+The emergency presence mode preserves path safety, file fingerprints and strict
+validation of all rebind/current artifacts while allowing unreadable native route
+JSON when there are no rebind artifacts. This preserves the existing ability to
+stop an exact journal-bound native gateway after route-state corruption. It grants
+no serving authority, and the normal startup presence reader remains strict.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^Test(GatewayCurrentNativeEmergencyFallbackRetainsAbortedRebindHistory|GatewayV2LANStartupFailureStopsOnlyJournalBoundGatewayWithoutReadingRouteState)$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrentNativeEmergency(Refuses|Preserves)'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayRebindStartupPresence|GatewayV2ProductionEmergencyStop|GatewayV2EmergencyStopConstruction|GatewayV2LANCommitResolutionStopsOwnedGatewayWhenProtectedRouteUnreadable|GatewayV2LANDisableAmbiguousWithdrawalFailureStopsOwnedGateway)'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The corrected positive and original native-route corruption test passed two tests
+in 20.009s (`Rig/temp/m3-native-emergency-retained-abort-green.jsonl`). Additional
+typed committed ownership, both native route corruption forms, strict serving
+reader preservation and post-stop history drift checks passed three tests plus
+two subcases in 24.468s (`Rig/temp/m3-native-emergency-typed-and-corruption.jsonl`).
+Both runs have zero failures/skips. The new tests exercise actual protected history
+and the typed commit/abort SQL paths with injected physical stop drivers; they do
+not claim Docker process acceptance. Vet and the full Go build passed.
+
+Existing presence and native emergency preservation passed 14 tests and 18
+subcases in 20.673s, zero failures (`Rig/temp/m3-native-emergency-preservation.jsonl`).
+The Windows run skipped the POSIX directory-permission test and two symlink
+subcases; those remain required in the Linux gate. Gofmt and `git diff --check`
+passed. The native fallback now has real retained typed history acceptance,
+while its physical stop remains simulated.
