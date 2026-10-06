@@ -352,6 +352,13 @@ func (d gatewayRebindTypedStageRuntime) serveStage(ctx context.Context,
 	if err != nil || inventory != gatewayRebindStageConfigInventoryExact {
 		return "", gatewayRebindEffectBoundaryError(ctx)
 	}
+	// Reading the config archive crosses a physical boundary. Reattest the
+	// complete resource identity and ownership census after that read and before
+	// a stopped container may publish any listener.
+	value, err = d.stable(ctx, intent, guard)
+	if err != nil || !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, value) {
+		return "", gatewayRebindEffectBoundaryError(ctx)
+	}
 	if gatewayRebindTypedStoppedStageContainerMatches(intent, effect, value) {
 		if guard(ctx) != nil || d.manager.runDiscard(ctx, d.manager.options.CommandTimeout,
 			"container", "start", effect.StageContainer.ID) != nil || guard(ctx) != nil {
