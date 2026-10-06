@@ -2144,3 +2144,64 @@ Shared projection preservation passed 14 hostd tests and 26 subcases in 3.169s
 injected physical driver; the fixture redeploy also simulates Docker. Concrete
 restore driver review, hostd startup wiring, actual Docker and Linux race gates
 remain required. The production physical factory remains closed.
+
+## Approved local Docker batch and emergency integrations
+
+The user explicitly approved local integration of reviewed `d5ec8b9` and
+`1bcc5e1` into this branch, and of previously reviewed `273769b` into the runtime
+worker branch. Parent merges are `03d1127` and `7d60803`; the worker integration
+is `98bb3c2`. This approval does not authorize remote publication, GitHub PR
+merges or deployment. The worker's further typed adapter work remains separate.
+
+The batch adapter initially reported whole-batch absence after a lost reload
+acknowledgment while restart configuration still retained the withdrawn LAN
+bindings. Independent regression reproduced that failure in 18.204s
+(`Rig/temp/cross-store-review-cf709-batch-restart.jsonl`). Corrected `d5ec8b9`
+requires canonical live and restart configuration to agree before reporting
+complete absence. Five independent tests passed in 88.864s, zero failures/skips
+(`Rig/temp/cross-store-review-d5ec-batch-green.jsonl`).
+
+The emergency API initially missed an orphan scoped current bundle beside a
+valid committed generation. Independent regression reproduced the failure in
+17.266s (`Rig/temp/cross-store-review-5a786-emergency-orphan.jsonl`). Corrected
+`1bcc5e1` associates every bundle with its exact protected terminal and repeats
+the complete ownership census after physical withdrawal. Six checks passed in
+64.838s, followed by four final checks in 37.543s, zero failures/skips
+(`Rig/temp/cross-store-review-1bcc-emergency-final.jsonl`). Active typed attempts
+remain explicitly incomplete until their separate physical adapter can prove
+withdrawal; unknown ownership never authorizes serving or native fallback.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(ManagedGatewayCurrentLANRecoveryRuntimeWithdrawsWholeBatchAfterLostReloadAcknowledgement|GatewayCurrentStartupEmergencyStopRejectsWholeHistoryDriftAfterPhysicalStop|GatewayCurrentServingRestoreKeepsCompletedBatchAndTerminalSQL)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Parent integration passed three tests in 79.699s, zero failures/skips
+(`Rig/temp/m3-current-restart-emergency-integration.jsonl`). Vet and the full
+Go build passed. Command-executor simulations and injected physical proofs are
+not acceptance evidence for actual Docker.
+
+## Controller emergency startup dispatch
+
+The controller now releases any held startup effects admission before calling
+the emergency API with a fresh bounded context. It retains a release failure
+even if subsequent withdrawal succeeds. Protected current history is checked
+first without SQL. The native emergency path is permitted only after complete
+no-current-ownership evidence (including fully retained abort history). Current
+ownership, unknown history, incomplete stops, changed census and inconsistent
+counts cannot be converted into a native-only success.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./cmd/hostd -run 'Startup|RuntimeWorker'
+go vet -mod=readonly ./cmd/hostd ./internal/generatedingress
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The controller suite passed 24 tests and 42 subcases in 3.746s, zero failures/skips
+(`Rig/temp/m3-hostd-current-emergency-wiring.jsonl`). New cases verify admission
+release ordering, retained release/stop failures, fresh context lifetime, twelve
+current/native dispatch cases, cancellation and native ownership failure. Vet,
+the full Go build, gofmt and `git diff --check` passed. These dispatcher tests
+inject stop callbacks. Actual emergency Docker behavior and default driver
+activation remain part of the pending complete runtime gate.

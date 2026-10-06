@@ -156,20 +156,6 @@ func newGatewayStartupIngress(cfg config.Config, dockerExecutable string,
 	return ingress, nil
 }
 
-// stopOwnedGatewayOnStartupFailure is the emergency fallback when SQLite or
-// protected ingress state cannot be reconciled. It never chooses a container
-// by name alone: generated ingress must prove its purpose-bound journal and
-// the exact running container ownership before stopping it.
-func stopOwnedGatewayOnStartupFailure(ctx context.Context, cfg config.Config, dockerExecutable string,
-	directories docker.ControllerDirectories,
-) error {
-	return generatedingress.StopOwnedGatewayV2OnStartupFailure(ctx, runtimeprocess.ExecRunner{}, generatedingress.Options{
-		DockerExecutable: dockerExecutable, DockerEndpoint: cfg.DockerEndpoint,
-		DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
-		DataRoot: cfg.DataRoot,
-	})
-}
-
 // quarantineLANRecoveryStartup withdraws any observed unfinished LAN grant or
 // disable before the recovery-only controller serves its listener. It then
 // repeats both cross-store inspections against the same immutable census.
