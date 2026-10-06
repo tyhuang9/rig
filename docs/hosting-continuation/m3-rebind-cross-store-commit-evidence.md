@@ -1359,3 +1359,52 @@ digests. An internally consistent substituted native profile is rejected.
 The final focused adapter test passed one top-level test and fifteen subcases
 in 7.560s with no failures or skips
 (`Rig/temp/m3-controller-effective-recovery-raw-binding.jsonl`).
+
+Independent frozen review accepted `25fd1ca`: the adapter test and all fifteen
+subcases passed in 7.396s, with no failures or skips
+(`Rig/temp/cross-store-review-25fd-controller-recovery.jsonl`).
+
+### Singular current-generation startup quarantine
+
+Startup quarantine now selects the current generation for grant-only and
+combined disable recovery. It derives an exact withdrawal transition from the
+validated complete census, retains the raw grant and transfer evidence in the
+pending marker, and rechecks the complete rebind SQL snapshot and exact
+protected state before and after effects. It never resolves a SQL claim or
+clears a marker. Already-unpublished prepared grants remain unchanged. A
+request-bound pending grant is restored to its absent endpoint; committed
+grants and disables are withdrawn. Cancellation after withdrawal starts does
+not abandon that work. Failed or ambiguous effects attempt a separately
+bounded stop of the exact owned gateway, retain evidence, and refuse startup.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrentLANStartupQuarantine'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayCurrentLANStartupQuarantine|GatewayV2LANStartup|GatewayV2LANDisableStartup)'
+go vet -mod=readonly ./internal/generatedingress ./internal/controller ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The initial focused run passed two top-level tests and two subcases in 83.955s,
+with no failures or skips (`Rig/temp/m3-current-lan-startup-quarantine.jsonl`).
+It checks transferred committed history, cancellation after physical effects,
+replay without revision change, owned stop after apply failure, SQL drift and
+protected-state replacement after withdrawal, exact disable/grant markers,
+and immutable history readback. Vet and full build passed.
+
+These are real protected-storage tests using projected SQL and simulated
+physical attestations. Initial census/attestation failures can still refuse
+before withdrawal; their outer startup emergency stop needs the pending real
+current-generation driver integration. Refusal alone does not establish that
+traffic stopped. Multi-operation batches, full retained-history validation,
+and actual Docker/restart acceptance remain unfinished. No standalone PR
+readiness or production acceptance is claimed for this checkpoint.
+
+The final expanded run, including the already-unpublished prepared-grant
+case, passed 24 top-level tests and 66 subcases in 128.125s, with no failures
+or skips (`Rig/temp/m3-current-lan-startup-quarantine-preservation.jsonl`).
+It preserves native startup/grant/disable behavior alongside the new current
+path. Documentation workflow validation passed. The sandboxed docs build
+could not resolve an existing Vite dependency junction; the same command
+with access to the installed dependencies passed in 3.23s. No dependency
+or lockfile change was needed. Commands: `pnpm --dir docs check:workflow`
+and `pnpm --dir docs build`.

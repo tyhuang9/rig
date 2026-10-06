@@ -492,6 +492,9 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 	defer releaseGatewayLock(release, &resultErr)
 	workCtx, cancelWork := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelWork()
+	if handled, err := m.quarantineGatewayCurrentLANStartupLocked(workCtx, claims); err != nil || handled {
+		return err
+	}
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil {
 		return gatewayV2StartupInspectionError(workCtx)

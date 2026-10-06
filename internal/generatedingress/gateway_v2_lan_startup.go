@@ -219,6 +219,11 @@ func (m *Manager) QuarantineGatewayV2LANStartup(ctx context.Context, claims []Ga
 	recoveryCtx, cancelRecovery := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelRecovery()
 
+	if handled, err := m.quarantineGatewayCurrentLANStartupLocked(recoveryCtx, gatewayV2LANAccessStartupClaims{
+		grants: claimSet,
+	}); err != nil || handled {
+		return err
+	}
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil || !validGatewayV2RouteState(state) {
 		return gatewayV2StartupInspectionError(recoveryCtx)
