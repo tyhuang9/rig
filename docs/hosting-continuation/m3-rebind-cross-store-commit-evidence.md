@@ -1511,3 +1511,17 @@ acceptance. The proposal producer and typed coordinator still require their
 separately owned update to pass and retain the complete census; strict
 enforcement intentionally refuses the previous incomplete constructors until
 that update lands. No full-unit readiness or hosted result is claimed.
+
+Bounded independent source review accepted the live assertion delta at
+`577ee04`, including its surrounding nil and history-length guards. The
+integrated producer dependency was then reproduced directly:
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestInspectGatewayRebindProposalBuildsTypedTransferAwareSource$'
+```
+
+That existing test failed in 15.969s with `route_reconciliation_required`
+at proposal construction, with no skips
+(`Rig/temp/m3-runtime-head-producer-integration-red.jsonl`). This is the
+known intermediate strict-spec/old-producer mismatch, not a passing integrated
+baseline. The unchanged test must pass after the producer update lands.
