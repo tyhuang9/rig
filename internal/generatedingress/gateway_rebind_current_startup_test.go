@@ -206,3 +206,50 @@ func TestGatewayRebindCurrentStartupDistinguishesRouteAndLANRecovery(t *testing.
 		})
 	}
 }
+
+func TestGatewayRebindCurrentStartupRouteRecoveryBeforeAdmission(t *testing.T) {
+	for _, outcome := range []gatewayCurrentPhysicalOutcome{gatewayCurrentPhysicalRecoveryBefore, gatewayCurrentPhysicalRecoveryEffective} {
+		t.Run(string(outcome), func(t *testing.T) {
+			f, snapshot, claims, physical := gatewayRebindCurrentStartupFixture(t)
+			driver := &gatewayCurrentStateMachineDriver{t: t, terminal: physical.attest.Terminal, pendingAttestOutcome: outcome}
+			f.manager.gatewayCurrentPhysicalDriver = driver
+			appID, app := routeOperationTransferredApp(t, f.baseline)
+			transition, err := gatewayCurrentSwitchTransition(f.baseline, routeOperationSwitchRequest(t, appID, app.Route))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.store.saveNext(f.baseline, transition.Pending); err != nil {
+				t.Fatal(err)
+			}
+			before, err := readGatewayHistorySnapshotMode(f.manager.store, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			inspection, err := f.manager.InspectGatewayV2Startup(context.Background(), claims)
+			if err != nil || inspection.Disposition != GatewayV2StartupNormalV2 || inspection.CurrentGatewaySource != *snapshot.CurrentSource {
+				t.Fatalf("pending route did not select composition recovery: %+v %v", inspection, err)
+			}
+			if retained := routeOperationLoad(t, f.store); !reflect.DeepEqual(retained, transition.Pending) || driver.restoreCalls != 0 {
+				t.Fatal("read-only startup inspection changed pending route")
+			}
+			// Composition calls this public method before starting deployment workers.
+			if err := f.manager.Recover(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			recovered := routeOperationLoad(t, f.store)
+			if recovered.Pending != nil || recovered.LANRecovery != nil || recovered.Revision != transition.Pending.Revision+1 ||
+				!reflect.DeepEqual(recovered.Apps, f.baseline.Apps) || recovered.Lineage != f.baseline.Lineage ||
+				driver.restoreCalls != 1 || driver.applyCalls != 0 || driver.stopCalls != 0 {
+				t.Fatalf("startup recovery did not restore committed routes and raw LAN bindings: %+v", recovered)
+			}
+			afterInspection, err := f.manager.InspectGatewayV2Startup(context.Background(), claims)
+			if err != nil || afterInspection != inspection {
+				t.Fatalf("stable startup changed selected authority: %+v %v", afterInspection, err)
+			}
+			after, err := readGatewayHistorySnapshotMode(f.manager.store, true)
+			if err != nil || !sameGatewayHistorySnapshot(before, after) {
+				t.Fatal("operational recovery changed immutable gateway history")
+			}
+		})
+	}
+}

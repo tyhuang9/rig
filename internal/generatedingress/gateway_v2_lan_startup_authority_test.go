@@ -49,6 +49,7 @@ func TestGatewayV2LANStartupBindsNativeProjectionBeforeAndAfterPhysicalProof(t *
 			for _, failure := range []string{"", "missing projection", "wrong projected operation", "wrong projected interface", "missing provider", "SQL failure", "active rebind", "SQL drift after proof", "projection without SQL source"} {
 				t.Run(failure, func(t *testing.T) {
 					calls := 0
+					readBeforeProof, readAfterProof := false, false
 					driver.events = nil
 					claim := gatewayV2LANStartupClaim(request, appaccess.AppAccessGrantCommitted, 4)
 					value := projection
@@ -63,6 +64,9 @@ func TestGatewayV2LANStartupBindsNativeProjectionBeforeAndAfterPhysicalProof(t *
 					}
 					manager.options.RebindCurrentStateRepository = gatewayCurrentSelectionRepositoryFunc(func(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error) {
 						calls++
+						proved := containsString(driver.events, "prove_committed")
+						readBeforeProof = readBeforeProof || !proved
+						readAfterProof = readAfterProof || proved
 						if failure == "SQL failure" {
 							return appaccess.GatewayRebindRecoverySnapshot{}, errors.New("injected SQL failure")
 						}
@@ -74,7 +78,7 @@ func TestGatewayV2LANStartupBindsNativeProjectionBeforeAndAfterPhysicalProof(t *
 							result.Active = &appaccess.GatewayRebindHistoryEntry{}
 							result.Phase = appaccess.GatewayRebindPrepared
 						}
-						if failure == "SQL drift after proof" && calls >= 4 {
+						if failure == "SQL drift after proof" && proved {
 							source := *snapshot.CurrentSource
 							source.OperationID = "41414141-4141-4141-8141-414141414141"
 							result.CurrentSource = &source
@@ -93,7 +97,7 @@ func TestGatewayV2LANStartupBindsNativeProjectionBeforeAndAfterPhysicalProof(t *
 						disposition, err = inspection.Disposition, inspectErr
 					}
 					if failure == "" {
-						if err != nil || disposition != GatewayV2LANStartupNormal || calls != 6 {
+						if err != nil || disposition != GatewayV2LANStartupNormal || !readBeforeProof || !readAfterProof {
 							t.Fatalf("exact authority refused: disposition=%s calls=%d err=%v", disposition, calls, err)
 						}
 					} else if err == nil || disposition != "" {

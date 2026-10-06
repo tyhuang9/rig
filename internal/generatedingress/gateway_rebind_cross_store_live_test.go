@@ -84,6 +84,7 @@ func TestLiveGatewayRebindCrossStoreProposalRetainsCurrentAuthority(t *testing.T
 	if err != nil {
 		failLiveIngress(t, "inspect real typed cross-store proposal", err)
 	}
+	assertLiveCrossStoreRuntimeHeads(t, inspection, beforeHeads, fixture.spec.appID, f.loopbackID)
 	digest, err := appaccess.GatewayRebindSpecV2Digest(inspection.Spec)
 	if err != nil || digest != inspection.SpecDigest || inspection.Spec.Version != appaccess.GatewayRebindSpecVersionV2 ||
 		inspection.Spec.OperationID != input.OperationID || inspection.Spec.SuccessorProfile != input.SuccessorProfile ||
@@ -192,6 +193,7 @@ func TestLiveGatewayRebindCrossStorePreparedClaimProcessRecovery(t *testing.T) {
 	if err != nil || len(beforeHeads) != 2 {
 		t.Fatal("read complete two-application runtime heads")
 	}
+	assertLiveCrossStoreRuntimeHeads(t, inspection, beforeHeads, fixture.spec.appID, f.loopbackID)
 	beforeAccess, err := f.repository.CurrentAppAccess(fixture.ctx, fixture.spec.appID)
 	if err != nil {
 		t.Fatal("read immutable raw grant")
@@ -234,6 +236,7 @@ func TestLiveGatewayRebindCrossStorePreparedClaimProcessRecovery(t *testing.T) {
 		prepared.Phase != appaccess.GatewayRebindPrepared || !prepared.RollbackAllowed || prepared.DatabaseCommitObserved ||
 		!reflect.DeepEqual(prepared.CurrentSource, beforeSQL.CurrentSource) || !reflect.DeepEqual(prepared.CurrentProfile, beforeSQL.CurrentProfile) ||
 		!reflect.DeepEqual(prepared.Active.Claim.V2.Spec, inspection.Spec) ||
+		!reflect.DeepEqual(prepared.Active.RuntimeHeads, beforeHeads) || !reflect.DeepEqual(prepared.History[0].RuntimeHeads, beforeHeads) ||
 		!errors.Is(f.repository.CheckGatewayRebindFence(fixture.ctx), appaccess.ErrGatewayRebindActive) {
 		t.Fatal("abrupt exit did not retain the exact prepared SQL claim and fence")
 	}
@@ -297,6 +300,26 @@ func TestLiveGatewayRebindCrossStorePreparedClaimProcessRecovery(t *testing.T) {
 	if !wrongHost.Connected || !wrongHost.Responded || wrongHost.Status != 404 ||
 		!probeGatewayRebindHandoverListenerAbsent(fixture.ctx, f.successorIPv4, fixture.port) {
 		t.Fatal("prepared recovery published the successor or loopback-only app on LAN")
+	}
+}
+
+func assertLiveCrossStoreRuntimeHeads(t *testing.T, inspection GatewayRebindProposalInspection,
+	heads []appaccess.GatewayRebindRuntimeHead, lanAppID, loopbackAppID string,
+) {
+	t.Helper()
+	spec := inspection.Spec
+	digest, err := appaccess.GatewayRebindRuntimeHeadsV2Digest(spec.OperationID, heads)
+	if err != nil || len(heads) != 2 || spec.RuntimeHeadsVersion != appaccess.GatewayRebindRuntimeHeadsVersionV1 ||
+		spec.RuntimeHeadsCount != int64(len(heads)) || spec.RuntimeHeadsDigest != digest ||
+		!reflect.DeepEqual(inspection.RuntimeHeads, heads) {
+		t.Fatal("approval does not bind the complete runtime-head census")
+	}
+	seen := make(map[string]bool, len(heads))
+	for _, head := range heads {
+		seen[head.AppID] = true
+	}
+	if lanAppID == loopbackAppID || !seen[lanAppID] || !seen[loopbackAppID] {
+		t.Fatal("approved runtime heads omit the LAN or loopback-only application")
 	}
 }
 

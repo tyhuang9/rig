@@ -1148,3 +1148,463 @@ checkpoint and requested the valid protected-replacement negative, which now
 passes. Full physical rebind adapters, rebound LAN/batch consumers, early
 process recovery dispatch, repeated rebind and final release acceptance remain
 outstanding. This runtime branch remains unpublished.
+
+The frozen startup checkpoint is
+`38c9a360aac233165d5fa5d3de0d7875359aa13a`. Independent review from detached,
+clean source passed all five named top-level tests and 22 subtests, with zero
+failure or skip: app-access 0.787s, ingress 92.751s, and controller 0.753s.
+The anchored run included the real SQL census test, both rebound startup tests
+and both controller mapping tests. Its log is
+`Rig/temp/cross-store-review-38c-startup.jsonl`. The source remained clean.
+The checkpoint received bounded acceptance for census and read-only startup
+classification; the runtime limitations above still apply. Documentation checks
+and build also passed before freezing (3.92s).
+
+### Startup handoff to ordinary current-route recovery
+
+The reviewed route state machine `afd5718b69fbc6c1a887ce7c46e1716c83a05d90`
+was integrated at `febcb20`. Independent verification passed three top-level
+tests and three drift cases (80.600s), plus the existing native grant restart
+and two legacy switch/compensation tests (1.603s), with zero failure or skip.
+Logs: `Rig/temp/cross-store-review-afd-route.jsonl` and
+`Rig/temp/cross-store-review-afd-native-preservation.jsonl`.
+
+The combined startup/recovery test then passed one top-level test and both
+physical outcomes (before and effective), zero failure or skip, in 46.144s:
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayRebindCurrentStartupRouteRecoveryBeforeAdmission$'
+```
+
+It exercises public startup inspection followed by public `Manager.Recover`
+and another inspection. Inspection preserves the pending marker; recovery
+restores the exact committed application routes and raw LAN bindings, advances
+the operational revision, and preserves selected authority and immutable
+gateway history. The test uses protected storage and a fake physical adapter;
+it does not establish hostd process ordering or Docker acceptance. Log:
+`Rig/temp/m3-rebound-startup-route-admission.jsonl`.
+
+### Selected-current LAN startup census
+
+Independent code review accepted the combined route/startup test `db49792`.
+The independently reviewed binding matchers `4039d634` were integrated at
+`1aa1f85`; their exact test passed in 17.568s, one top-level test, no failure or
+skip (`Rig/temp/cross-store-review-4039-lan-matchers.jsonl`).
+
+Both public LAN startup readers now select current rebind authority before
+using the native path. They compare immutable raw grants and effective SQL
+projections to actual current operational endpoints, preserve pending markers,
+attest through the shared physical contract and reconfirm exact SQL/protected
+authority after observation. Candidate ordering and collision rules are shared
+with native startup. Retained authority cannot authorize an unmarked live
+binding; an exact terminal-disable pending marker always selects recovery.
+
+The first focused run passed two top-level tests and twelve cases in 34.962s
+(`Rig/temp/m3-current-lan-startup.jsonl`). Expanded verification included native
+pending grant/withdrawal, grant-only startup, SQL drift and protected revision
+replacement after physical proof:
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayCurrentLANStartup|GatewayV2(LANStartup|LANDisableStartup|LANAccess|LANRecovery))'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayV2LANStartupBindsNativeProjectionBeforeAndAfterPhysicalProof$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The expanded run passed 66 top-level tests and 91 subtests, with no skips,
+but failed one existing test (99.909s). That fixture depended on exactly six
+SQL reads and injected drift on read four; the new selection adds reads and
+made the injection occur before physical proof. The corrected fixture now
+injects at the observed `prove_committed` event and asserts reads on both sides
+of that boundary. Its focused rerun passed the one test and all twenty subtests
+in 3.340s, with no failures or skips. No production validation was weakened.
+Logs: `Rig/temp/m3-current-lan-startup-preservation.jsonl` and
+`Rig/temp/m3-native-lan-startup-semantic-drift.jsonl`. Vet and full build passed.
+
+These are projected-SQL/fake-physical tests with real protected storage, not
+Docker acceptance. Rebound quarantine, ordered batch consumers and complete
+historical retained-receipt validation remain outstanding. In particular,
+cleared historical disables are not treated as serving authority, but their
+full protected typed-history proof must be integrated before delivery. Disable
+acknowledgment follows protected pending clearance and fresh withdrawal proof;
+an acknowledged disable with a remaining pending marker is inconsistent.
+
+PR #136's final hosted repository/PostgreSQL race workflow
+[`37399509007`](https://github.com/tyhuang9/rig/actions/runs/37399509007)
+completed successfully at its published head `9694b4e`. This evidence applies
+to the published final-config-copy draft, not this unpublished runtime branch.
+
+The LAN census checkpoint was frozen at `3186e9e`; documentation workflow and
+build passed (3.51s). The following batch-presence integration adds only a
+read-only current-generation path to `HasGatewayV2LANRecoveryBatch`, which the
+controller calls before LAN inspection. It reconfirms exact SQL and protected
+selection, preserving markers and refusing unavailable authority without any
+physical observation or mutation. Existing native selection remains covered.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^Test(GatewayCurrentLANRecoveryBatchPresenceBeforePhysicalWork|HasGatewayV2LANRecoveryBatchSelectsIntentBeforeReload)$'
+go vet -mod=readonly ./internal/generatedingress
+```
+
+Both named tests passed, with no failure or skip, in 20.240s. Vet and diff checks
+passed. Log: `Rig/temp/m3-current-lan-batch-presence.jsonl`. This proves only
+presence selection before effects; batch quarantine, physical proof, ordered
+head finalization and retirement still require the pending runtime integration.
+
+Independent bounded review accepted `3186e9e` and `e621d37` with those delivery
+limitations. At frozen `e621d37`, all four selected tests and 34 subcases passed
+in 56.883s with zero failure or skip. Log:
+`Rig/temp/cross-store-review-e621-lan-startup.jsonl`.
+
+### Pure ordered batch transitions for the selected current gateway
+
+The next local change derives a batch from the complete validated startup
+census, then provides explicit clear, advance and retirement state transitions.
+It preserves immutable items and original pending evidence through every head;
+each changed transition advances the operational revision exactly once. An
+already-absent head returns an independent copy with identical bytes/revision.
+It never writes files, resolves SQL callbacks or performs Docker operations.
+The guarded runtime consumer must still prove physical withdrawal, bind the
+requested head to the freshly selected state, resolve terminal SQL and clear
+acknowledgment, then persist/reconfirm each exact transition.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayCurrentLANRecoveryBatchTransitionsPreserveQueue$'
+go vet -mod=readonly ./internal/generatedingress
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The final focused test passed in 17.910s with no failure or skip. It exercises
+an ordered two-application disable batch (transferred and native grants),
+preserved raw identities and loopback routes, pending evidence, deep-copy
+isolation, replay, invalid/completed head bounds, refusal to advance before
+clearance, separate retirement, revision exhaustion, and a prepared grant with
+no published binding. Vet, full build and diff checks passed. Log:
+`Rig/temp/m3-current-lan-batch-state-complete.jsonl`.
+
+Initial fixture failures are retained: the inherited fixture had only one
+LAN grant (18.111s, `m3-current-lan-batch-state.jsonl`); after adding a native
+grant, the single-disable helper reused one operation ID and was correctly
+rejected (17.837s, `m3-current-lan-batch-state-corrected.jsonl`). Distinct
+application/operation identities fixed the fixture. The first complete
+two-disable run passed in 17.958s (`m3-current-lan-batch-state-final.jsonl`),
+before adding prepared-grant coverage. These pure transformations are a
+prerequisite for the guarded batch consumer, not runtime or Docker acceptance.
+
+Independent review accepted frozen `4147037`: the named batch transition test
+passed in 18.215s with no failure or skip
+(`Rig/temp/cross-store-review-414703-batch-state.jsonl`).
+
+### Ordinary LAN integration and transferred committed recovery
+
+Integrated independently reviewed ordinary current-generation LAN state
+machines at `2b514bc` through local merge `c567f9d`. The independent frozen
+boundary run passed three top-level tests and three subcases in 119.867s,
+with no failures or skips (`Rig/temp/cross-store-review-2b514-lan-boundaries.jsonl`).
+It covers exact request/persistence boundaries, cancellation and uncertain
+writes, proof drift before SQL resolution, and disable resolve/clear/ack retry
+ordering. Physical drivers and SQL callbacks in these tests are simulated.
+
+The controller's committed-grant recovery previously compared an immutable
+original gateway operation with the current rebound gateway operation. A
+two-transfer adapter regression reproduced the resulting refusal (0.703s,
+`Rig/temp/m3-controller-effective-recovery-red.jsonl`). Recovery now separately
+checks unchanged committed claim/proof and the fresh authorized effective
+profile, current source, complete transfer-chain digest and terminal receipt.
+Native recovery retains its original-operation rule and cannot accept a
+transferred profile through that compatibility path. No committed SQL history
+is rewritten and no new disable approval is synthesized.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/controller -run '^TestLAN(GrantCommittedRecoveryUsesEffectiveAuthority|AppGrantRecovery|AppGrantCommittedReplay)'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/controller -run '^TestLAN'
+go vet -mod=readonly ./internal/controller
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Focused tests passed in 6.635s: four top-level tests and eleven subcases, with
+no failures or skips. Cases cover native recovery, two transfers, missing or
+changed proof/source/operation/tip/receipt, broken chain, changed authorized
+claim, demoted approver, and existing session/disable-intent restrictions.
+All selected LAN controller tests passed in 45.077s with no failures or skips;
+vet and full build passed. Logs: `Rig/temp/m3-controller-effective-recovery.jsonl`
+and `Rig/temp/m3-controller-lan-preservation.jsonl`. The new test uses real SQL
+committed claims and projected successor authorization/runtime DTOs; it does
+not establish actual SQL rebind or Docker acceptance.
+
+Controller admission mapping confirms that recovery pinned to a committed
+grant currently supports republishing only after current authorization is
+restored. Normal disable creation/resumption requires an unarchived app and
+current access head, while grant-pinned recovery cannot create a new disable.
+Permanent stale authority must therefore remain physically withdrawn (or the
+exact owned gateway stopped) with committed history retained and normal
+startup refused. A future explicit approved-disable continuation requires a
+separate recovery-specific authorization contract; automatic rollback of a
+committed grant is not permitted.
+
+Review tightened the native compatibility path after `48af0f0`: native SQL
+authority must explicitly select the exact upgrade operation/profile, and any
+nonzero physical proof must match the complete resolution. An empty SQL source
+is refused. Native positive tests now create a real committed upgrade first;
+missing authority and malformed nonzero proof are separate refusal cases.
+The focused recovery/replay/terminal-failure run passed five top-level tests
+and fourteen subcases in 8.685s with no failures or skips
+(`Rig/temp/m3-controller-effective-recovery-strict.jsonl`). This supersedes
+the initial native fallback in `48af0f0`.
+
+A second boundary review required the native authorization's raw profile to
+match the immutable claim, not just the effective profile/source summaries.
+Recovery now checks those exact raw identity fields and recomputes both profile
+digests. An internally consistent substituted native profile is rejected.
+The final focused adapter test passed one top-level test and fifteen subcases
+in 7.560s with no failures or skips
+(`Rig/temp/m3-controller-effective-recovery-raw-binding.jsonl`).
+
+Independent frozen review accepted `25fd1ca`: the adapter test and all fifteen
+subcases passed in 7.396s, with no failures or skips
+(`Rig/temp/cross-store-review-25fd-controller-recovery.jsonl`).
+
+### Singular current-generation startup quarantine
+
+Startup quarantine now selects the current generation for grant-only and
+combined disable recovery. It derives an exact withdrawal transition from the
+validated complete census, retains the raw grant and transfer evidence in the
+pending marker, and rechecks the complete rebind SQL snapshot and exact
+protected state before and after effects. It never resolves a SQL claim or
+clears a marker. Already-unpublished prepared grants remain unchanged. A
+request-bound pending grant is restored to its absent endpoint; committed
+grants and disables are withdrawn. Cancellation after withdrawal starts does
+not abandon that work. Failed or ambiguous effects attempt a separately
+bounded stop of the exact owned gateway, retain evidence, and refuse startup.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrentLANStartupQuarantine'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayCurrentLANStartupQuarantine|GatewayV2LANStartup|GatewayV2LANDisableStartup)'
+go vet -mod=readonly ./internal/generatedingress ./internal/controller ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The initial focused run passed two top-level tests and two subcases in 83.955s,
+with no failures or skips (`Rig/temp/m3-current-lan-startup-quarantine.jsonl`).
+It checks transferred committed history, cancellation after physical effects,
+replay without revision change, owned stop after apply failure, SQL drift and
+protected-state replacement after withdrawal, exact disable/grant markers,
+and immutable history readback. Vet and full build passed.
+
+These are real protected-storage tests using projected SQL and simulated
+physical attestations. Initial census/attestation failures can still refuse
+before withdrawal; their outer startup emergency stop needs the pending real
+current-generation driver integration. Refusal alone does not establish that
+traffic stopped. Multi-operation batches, full retained-history validation,
+and actual Docker/restart acceptance remain unfinished. No standalone PR
+readiness or production acceptance is claimed for this checkpoint.
+
+The final expanded run, including the already-unpublished prepared-grant
+case, passed 24 top-level tests and 66 subcases in 128.125s, with no failures
+or skips (`Rig/temp/m3-current-lan-startup-quarantine-preservation.jsonl`).
+It preserves native startup/grant/disable behavior alongside the new current
+path. Documentation workflow validation passed. The sandboxed docs build
+could not resolve an existing Vite dependency junction; the same command
+with access to the installed dependencies passed in 3.23s. No dependency
+or lockfile change was needed. Commands: `pnpm --dir docs check:workflow`
+and `pnpm --dir docs build`.
+
+Independent frozen review accepted singular quarantine at `ee8f3b5`. The two
+top-level tests and two subcases passed in 77.894s with no failures or skips
+(`Rig/temp/cross-store-review-ee8-startup-quarantine.jsonl`). All physical and
+batch limitations above remain delivery gates.
+
+### Pure batch census binds cleared items to the retained manifest
+
+The current batch census compares exact immutable queue requests to validated
+SQL grant/disable claims, enforces head-aware terminal/clear-ack ordering, and
+requires the complete same-snapshot transfer manifest to match its protected
+digest. Once a transferred binding is cleared, its retained projection must
+still select the exact manifest row and linked chain tip. Native grants created
+under the current profile require no transfer row, but retain exact raw profile
+identity. Committed grants cannot become automatic rollback items. The helper
+is read-only and is not yet connected to the pending physical batch consumer.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayCurrentLANRecoveryCensusBindsClearedHistoryAndOrderedHead$'
+go vet -mod=readonly ./internal/generatedingress
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The first focused test and its subcase passed in 16.778s, with no failures or
+skips (`Rig/temp/m3-current-lan-batch-census.jsonl`). It covers two ordered
+disables, current terminal replay, clear/ack boundaries, completed head history,
+native and transferred bindings, missing/duplicate manifest rows, a fully
+rehashed false transfer tip after clearance, out-of-order rollback, and refusal
+to roll back committed grants. Vet and full build passed. Unrelated terminal
+history remains non-serving census data and still requires the separate
+protected historical-proof gate; this helper cannot replace that gate.
+
+An independent negative test at `ee8f3b5` also confirmed that the existing
+stored-batch structural validator accepts duplicate ports or allocations across
+two unpublished grant items (17.221s, no skips;
+`Rig/temp/cross-store-review-ee8-batch-uniqueness-red.jsonl`). The pure census
+rejects those collisions, but the structural validator must also be corrected
+before activating physical batch recovery. That correction is pending in its
+separate owner scope.
+
+The final census run added exact raw-identity mismatch, an omitted unresolved
+claim, and duplicate port/allocation cases. It passed the named test and its
+subcase in 17.320s with no failures or skips
+(`Rig/temp/m3-current-lan-batch-census-final.jsonl`). These pure comparisons do
+not prove SQL mutation, physical withdrawal, head advancement, or retirement.
+
+Independent review accepted frozen `86cd209`: the named census test and its
+subcase passed in 15.101s with no failures or skips
+(`Rig/temp/cross-store-review-86cd-batch-census.jsonl`). The helper remains
+unwired pending the reviewed physical batch contract. A fresh GitHub read
+also confirmed draft PR #136 remains open at `9694b4e`, with 36 reported
+checks, none pending or failed; this hosted evidence applies only to that
+published branch, not these local recovery checkpoints.
+
+### Complete runtime-head authorization and live-gate assertions
+
+The reviewed shared DTO at `ae386ca` was integrated in `1a764c1`; reviewed
+enforcement at `d98457d` was integrated in `3475a0b`. Approval now binds the
+complete ordered application runtime-head census, including loopback-only
+applications, its version, count and digest. Admission compares that census
+inside the SQL writer transaction, retains immutable ordered rows, and checks
+it again during guarded transition. This closes the reproduced gap where a
+loopback-only application's runtime head could be added after approval and
+before claim admission. Existing post-claim mutation fences were already
+present; this evidence does not characterize them as bypassed.
+
+Independent verification of frozen `d98457d` passed five top-level tests and
+twelve subcases in 6.482s, with no failures or skips
+(`Rig/temp/cross-store-review-d984-runtime-head-guard.jsonl`). The unchanged
+earlier negative regression now passes: the unchanged census is admitted and
+a post-approval loopback-head addition is refused. Boundaries also cover
+deletion, redeployment, timestamp drift, zero-head nil/empty normalization,
+sealed retained history and changes before or during the commit guard.
+Independent security review found no concrete SQL/migration regression within
+the ordinary SQL threat boundary. The owner ran the complete database and
+appaccess packages in 19.885s and 107.473s. Both migration 035 mirrors have
+SHA-256 `7CEE20636C4416C8A42A792C824A0D47FB67C7816E4DB3B49FEBE308687EF33B`;
+previously published migrations 026, 033 and 034 are unchanged.
+
+The two existing live cross-store Docker gates now require the signed spec to
+cover both the LAN application and the loopback-only application. The process
+exit/recovery gate also requires the prepared active claim and retained SQL
+history to contain those exact heads. These assertions use the real two-app
+fixture already selected by `hosting-gateway-v2-ci.yml`.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 ./internal/appaccess -run '^TestGatewayRebind(V2CanonicalTypes|RuntimeHeadsV2Digest)'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 ./internal/generatedingress -run '^TestLiveGatewayRebindCrossStore'
+go vet -mod=readonly ./internal/appaccess ./internal/generatedingress ./internal/controller ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+At the shared DTO checkpoint, the contract tests passed three top-level tests
+and four subcases in 0.521s, with no failures or skips
+(`Rig/temp/m3-runtime-head-contract.jsonl`). The live package compiled in
+0.836s; all three entries explicitly skipped because this Windows environment
+lacks the disposable Linux Docker fixture and opt-in flags
+(`Rig/temp/m3-runtime-head-live-gate-opt-in.jsonl`). Vet and the full build
+passed after enforcement integration. These skips establish no Docker
+acceptance. The proposal producer and typed coordinator still require their
+separately owned update to pass and retain the complete census; strict
+enforcement intentionally refuses the previous incomplete constructors until
+that update lands. No full-unit readiness or hosted result is claimed.
+
+Bounded independent source review accepted the live assertion delta at
+`577ee04`, including its surrounding nil and history-length guards. The
+integrated producer dependency was then reproduced directly:
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestInspectGatewayRebindProposalBuildsTypedTransferAwareSource$'
+```
+
+That existing test failed in 15.969s with `route_reconciliation_required`
+at proposal construction, with no skips
+(`Rig/temp/m3-runtime-head-producer-integration-red.jsonl`). This is the
+known intermediate strict-spec/old-producer mismatch, not a passing integrated
+baseline. The unchanged test must pass after the producer update lands.
+
+### Reviewed typed history and coordinator integration
+
+Reviewed runtime checkpoint `007397af` was integrated locally in `ecd9ecd`.
+It retains the actual typed predecessor, structured effect evidence, terminal
+receipt and current-state baseline rather than converting them to native
+upgrade records. The canonical source union distinguishes native upgrades,
+legacy rebind receipts and typed rebind receipts. The private coordinator
+binds SQL transitions to retained protected evidence, exact current state and
+fresh terminal observation. The production physical adapters and early startup
+recovery are still separate unfinished delivery gates.
+
+Independent checks recorded by the integration reviewer:
+
+| Frozen checkpoint | Scope | Result |
+| --- | --- | --- |
+| `f6319bc` | Receipt-summary substitution, state drift before fence release and batch uniqueness regressions | 3 top-level tests, 2 subcases, 55.689s |
+| `f6319bc` | Typed semantic history, empty runtime-head progress, retained local port, commit/no-effect/rollback and strict proposal producer | 7 top-level tests, 9 subcases, 153.987s |
+| `1908fb6` | Fresh prepared replay with empty SQL slices and protected drift after successful terminal SQL commit | 2 top-level tests, 2 subcases, 59.592s |
+| `007397af` | Canonical empty envelope reproducer, 17-record progress, terminal store/scan and empty-transfer baseline install/read | 2 top-level tests, 38.811s |
+
+All listed runs had zero failures or skips. Logs are
+`Rig/temp/cross-store-review-f631-independent-boundaries.jsonl`,
+`Rig/temp/cross-store-review-f631-typed-history.jsonl`,
+`Rig/temp/cross-store-review-1908-recovery-boundaries.jsonl` and
+`Rig/temp/cross-store-review-0073-empty-terminal-green.jsonl`.
+The empty no-effect envelope was first reproduced failing on `331838a` in
+15.796s (`Rig/temp/cross-store-review-3318-noeffect-empty-red.jsonl`), then
+corrected by canonical normalization shared by the prepared evidence writers.
+This keeps empty SQL result sets and protected JSON representations equivalent
+without changing v1 bytes. SQL coordinator tests use real SQLite and simulated
+physical drivers; these results are not Docker acceptance.
+
+### Retained LAN provenance is checked before and after physical inspection
+
+Current-generation startup and singular quarantine now validate the complete
+retained transfer chain against the same SQL snapshot, then bind every link to
+its real protected source and immutable activation manifest. Native grants
+without transfers are tied to the actual native or rebound profile lineage.
+Historical sources are never installed as current authority, and old mutable
+application routes are not treated as evidence of past clearance. Startup
+requires retained authority for a committed grant-based disable after rebind;
+omitting the projection cannot select the old no-authority compatibility path.
+
+The first executable regression returned normal startup for four structurally
+valid but unproved histories: a rehashed false transfer, rehashed false receipt,
+unknown protected source and omitted complete chain. This RED run took 19.732s
+(`Rig/temp/m3-retained-history-red.jsonl`). It used an overlay that replaced only
+the new, then-unwired helper with an empty package so the unchanged public
+startup consumer could be tested before the typed-history dependency landed.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^Test(GatewayCurrentLANStartupRequiresRetainedHistoricalProof|GatewayCurrentLANRetainedHistoryUsesTypedTerminalAndRechecksOldOrigin|InspectGatewayRebindProposalBuildsTypedTransferAwareSource)$'
+go build -mod=readonly -buildvcs=false ./...
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 ./internal/generatedingress -run '^TestLiveGatewayRebindCrossStore'
+```
+
+The integrated run passed three top-level tests and seven subcases in 68.930s,
+with no failures or skips (`Rig/temp/m3-retained-history-and-producer.jsonl`).
+It adds missing-projection refusal, native historical positives under both
+original and rebound profiles, and a two-transfer chain through real protected
+legacy and typed terminal files. Replacing an older generation's protected
+manifest after current physical inspection is refused without overwriting the
+changed evidence or the current generation. The previously failing proposal
+test also passed unchanged. These historical tests use projected SQL snapshots
+and simulated physical attestations; they do not establish actual withdrawal,
+SQL disable mutation, or container restart behavior.
+
+The full build passed. The updated live tests additionally compare the proposal's
+retained runtime-head list with the real SQL census. Their integrated local run
+compiled in 0.766s and explicitly skipped all three opt-in entries
+(`Rig/temp/m3-runtime-head-live-gate-integrated-opt-in.jsonl`); actual Docker
+behavior remains unverified. Vet identified a copied manager lock in the new
+prepared-replay test fixture, which is being corrected separately. No complete
+M3 readiness or publication approval is claimed by this checkpoint.
+
+Existing current startup/quarantine preservation also passed four top-level
+tests and sixteen subcases in 111.591s, with no failures or skips
+(`Rig/temp/m3-retained-history-startup-preservation.jsonl`):
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrentLANStartup(Quarantine|CensusBindsRawGrantAndRecovery|PublicReadRechecksAuthority)'
+```
