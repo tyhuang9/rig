@@ -15,6 +15,11 @@ const (
 	gatewayCurrentPhysicalRouteSwitch gatewayCurrentPhysicalTransitionKind = "route_switch"
 	gatewayCurrentPhysicalLANGrant    gatewayCurrentPhysicalTransitionKind = "lan_grant"
 	gatewayCurrentPhysicalLANDisable  gatewayCurrentPhysicalTransitionKind = "lan_disable"
+	// gatewayCurrentPhysicalLANWithdrawal is the request-bound quarantine
+	// written after an otherwise effective grant cannot complete its terminal
+	// callback. It carries the exact prior grant in Pending.Previous and never
+	// fabricates a disable request or operation identity.
+	gatewayCurrentPhysicalLANWithdrawal gatewayCurrentPhysicalTransitionKind = "lan_grant_withdrawal"
 )
 
 type gatewayCurrentPhysicalOutcome string
@@ -63,8 +68,19 @@ type gatewayCurrentPhysicalAttestation struct {
 	Digest      string
 }
 
+// gatewayCurrentPhysicalOutcomeProjection is the only logical-state
+// normalization used by read/startup attestation. Both projections retain the
+// selected protected revision, clear recovery metadata, and recompute their
+// digest. Transition execution continues to use its separately retained
+// original Before revision.
+type gatewayCurrentPhysicalOutcomeProjection struct {
+	Before    gatewayCurrentRouteState
+	Effective *gatewayCurrentRouteState
+}
+
 type gatewayCurrentPhysicalDriver interface {
 	applyGatewayCurrentPhysical(context.Context, gatewayCurrentPhysicalTransition) (gatewayCurrentPhysicalAttestation, error)
+	restoreGatewayCurrentPhysical(context.Context, gatewayCurrentPhysicalTransition) (gatewayCurrentPhysicalAttestation, error)
 	attestGatewayCurrentPhysical(context.Context, gatewayCurrentSelection) (gatewayCurrentPhysicalAttestation, error)
 	stopGatewayCurrentOwnedPredecessor(context.Context, gatewayRebindAttemptTerminalView) error
 }
@@ -75,6 +91,12 @@ func (managerGatewayCurrentPhysicalDriver) applyGatewayCurrentPhysical(context.C
 	gatewayCurrentPhysicalTransition,
 ) (gatewayCurrentPhysicalAttestation, error) {
 	return gatewayCurrentPhysicalAttestation{}, errors.New("generated ingress current physical apply is unavailable")
+}
+
+func (managerGatewayCurrentPhysicalDriver) restoreGatewayCurrentPhysical(context.Context,
+	gatewayCurrentPhysicalTransition,
+) (gatewayCurrentPhysicalAttestation, error) {
+	return gatewayCurrentPhysicalAttestation{}, errors.New("generated ingress current physical restore is unavailable")
 }
 
 func (managerGatewayCurrentPhysicalDriver) attestGatewayCurrentPhysical(context.Context,
@@ -113,6 +135,30 @@ func (m *Manager) applyGatewayCurrentPhysicalLocked(ctx context.Context,
 	return value, nil
 }
 
+// restoreGatewayCurrentPhysicalLocked republishes the exact grant captured by
+// a durable withdrawal marker after SQL proves that grant committed. The
+// marker remains installed while the physical effect runs. Returning the
+// original quiescent Before state keeps this distinct from clearing protected
+// recovery state, which the caller may do only after its database decision is
+// independently reconciled.
+func (m *Manager) restoreGatewayCurrentPhysicalLocked(ctx context.Context,
+	transition gatewayCurrentPhysicalTransition,
+) (gatewayCurrentPhysicalAttestation, error) {
+	if m == nil || ctx == nil || ctx.Err() != nil ||
+		transition.Kind != gatewayCurrentPhysicalLANWithdrawal || !validGatewayCurrentPhysicalTransition(transition) {
+		return gatewayCurrentPhysicalAttestation{}, &Error{Code: DiagnosticRouteUnresolved}
+	}
+	value, err := m.currentPhysicalDriver().restoreGatewayCurrentPhysical(ctx, transition)
+	if err != nil || !validGatewayCurrentPhysicalAttestation(value) ||
+		value.Outcome != gatewayCurrentPhysicalRecoveryBefore ||
+		value.Lineage != transition.Before.Lineage ||
+		!reflect.DeepEqual(value.State, transition.Before) ||
+		!reflect.DeepEqual(value.Pending, transition.Pending.Pending) || value.LANRecovery != nil {
+		return gatewayCurrentPhysicalAttestation{}, &Error{Code: DiagnosticRouteUnresolved}
+	}
+	return value, nil
+}
+
 func (m *Manager) attestGatewayCurrentPhysicalLocked(ctx context.Context,
 	selection gatewayCurrentSelection,
 ) (gatewayCurrentPhysicalAttestation, error) {
@@ -130,8 +176,7 @@ func (m *Manager) attestGatewayCurrentPhysicalLocked(ctx context.Context,
 		!reflect.DeepEqual(value.LANRecovery, selection.State.LANRecovery) {
 		return gatewayCurrentPhysicalAttestation{}, &Error{Code: DiagnosticRouteUnresolved}
 	}
-	if selection.State.Pending == nil && selection.State.LANRecovery == nil &&
-		(value.Outcome != gatewayCurrentPhysicalStableServing || !reflect.DeepEqual(value.State, *selection.State)) {
+	if !gatewayCurrentPhysicalAttestationMatchesSelection(value, *selection.State) {
 		return gatewayCurrentPhysicalAttestation{}, &Error{Code: DiagnosticRouteUnresolved}
 	}
 	return value, nil
@@ -201,23 +246,75 @@ func validGatewayCurrentPhysicalAttestation(value gatewayCurrentPhysicalAttestat
 	if value.Outcome == gatewayCurrentPhysicalStableServing && (value.Pending != nil || value.LANRecovery != nil) {
 		return false
 	}
-	if (value.Outcome == gatewayCurrentPhysicalStableServing && value.Runtime.ListenerAbsent) ||
-		(value.Outcome == gatewayCurrentPhysicalRecoveryStopped && !value.Runtime.ListenerAbsent) {
+	if value.Runtime.ListenerAbsent != (value.Outcome == gatewayCurrentPhysicalRecoveryStopped) {
 		return false
 	}
 	digest, err := gatewayCurrentPhysicalAttestationDigest(value)
 	return err == nil && digest == value.Digest
 }
 
+func gatewayCurrentPhysicalAttestationMatchesSelection(value gatewayCurrentPhysicalAttestation,
+	selected gatewayCurrentRouteState,
+) bool {
+	if selected.Pending == nil && selected.LANRecovery == nil {
+		return value.Outcome == gatewayCurrentPhysicalStableServing && reflect.DeepEqual(value.State, selected)
+	}
+	projection, err := gatewayCurrentPhysicalOutcomeProjectionForSelection(selected)
+	if err != nil {
+		return false
+	}
+	if selected.LANRecovery != nil {
+		return (value.Outcome == gatewayCurrentPhysicalRecoveryMixed ||
+			value.Outcome == gatewayCurrentPhysicalRecoveryStopped) && reflect.DeepEqual(value.State, projection.Before)
+	}
+	switch value.Outcome {
+	case gatewayCurrentPhysicalRecoveryBefore:
+		return reflect.DeepEqual(value.State, projection.Before)
+	case gatewayCurrentPhysicalRecoveryEffective:
+		return projection.Effective != nil && reflect.DeepEqual(value.State, *projection.Effective)
+	case gatewayCurrentPhysicalRecoveryMixed, gatewayCurrentPhysicalRecoveryStopped:
+		return reflect.DeepEqual(value.State, projection.Before) ||
+			(projection.Effective != nil && reflect.DeepEqual(value.State, *projection.Effective))
+	default:
+		return false
+	}
+}
+
+func gatewayCurrentPhysicalOutcomeProjectionForSelection(selected gatewayCurrentRouteState,
+) (gatewayCurrentPhysicalOutcomeProjection, error) {
+	if !validGatewayCurrentRouteState(selected) || (selected.Pending == nil && selected.LANRecovery == nil) {
+		return gatewayCurrentPhysicalOutcomeProjection{}, errors.New("invalid current physical outcome projection")
+	}
+	before := cloneGatewayCurrentRouteState(selected)
+	before.Pending, before.LANRecovery = nil, nil
+	before.Digest, _ = gatewayCurrentRouteStateDigest(before)
+	if !validGatewayCurrentRouteState(before) {
+		return gatewayCurrentPhysicalOutcomeProjection{}, errors.New("invalid current physical before projection")
+	}
+	result := gatewayCurrentPhysicalOutcomeProjection{Before: before}
+	if selected.Pending == nil {
+		return result, nil
+	}
+	effective := cloneGatewayCurrentRouteState(before)
+	effective.Apps[selected.Pending.AppID] = cloneGatewayCurrentAppRoute(selected.Pending.Proposed)
+	effective.Digest, _ = gatewayCurrentRouteStateDigest(effective)
+	if !validGatewayCurrentRouteState(effective) {
+		return gatewayCurrentPhysicalOutcomeProjection{}, errors.New("invalid current physical effective projection")
+	}
+	result.Effective = &effective
+	return result, nil
+}
+
 func validGatewayCurrentPhysicalTransition(value gatewayCurrentPhysicalTransition) bool {
 	if !validAppID(value.AppID) || (value.Kind != gatewayCurrentPhysicalRouteSwitch &&
-		value.Kind != gatewayCurrentPhysicalLANGrant && value.Kind != gatewayCurrentPhysicalLANDisable) ||
+		value.Kind != gatewayCurrentPhysicalLANGrant && value.Kind != gatewayCurrentPhysicalLANDisable &&
+		value.Kind != gatewayCurrentPhysicalLANWithdrawal) ||
 		!validGatewayCurrentRouteState(value.Before) || value.Before.Pending != nil || value.Before.LANRecovery != nil ||
 		!validGatewayCurrentRouteState(value.Pending) || value.Pending.Pending == nil || value.Pending.LANRecovery != nil ||
 		!validGatewayCurrentRouteState(value.Effective) || value.Effective.Pending != nil || value.Effective.LANRecovery != nil ||
 		!sameGatewayCurrentRouteOrigin(value.Before, value.Pending) ||
 		!sameGatewayCurrentRouteOrigin(value.Before, value.Effective) ||
-		value.Pending.Revision <= value.Before.Revision || value.Effective.Revision != value.Pending.Revision+1 ||
+		!gatewayCurrentPhysicalPendingRevisionMatches(value) || value.Effective.Revision != value.Pending.Revision+1 ||
 		!reflect.DeepEqual(value.Before.Apps, value.Pending.Apps) || value.Pending.Pending.AppID != value.AppID {
 		return false
 	}
@@ -238,8 +335,25 @@ func validGatewayCurrentPhysicalTransition(value gatewayCurrentPhysicalTransitio
 		return value.Pending.Pending.Kind == gatewayV2PendingLANGrant
 	case gatewayCurrentPhysicalLANDisable:
 		return value.Pending.Pending.Kind == gatewayV2PendingLANDisable
+	case gatewayCurrentPhysicalLANWithdrawal:
+		return value.Pending.Pending.Kind == gatewayV2PendingLANWithdrawal
 	}
 	return false
+}
+
+func gatewayCurrentPhysicalPendingRevisionMatches(value gatewayCurrentPhysicalTransition) bool {
+	if value.Before.Revision == ^uint64(0) {
+		return false
+	}
+	want := value.Before.Revision + 1
+	if value.Kind == gatewayCurrentPhysicalLANGrant && value.Pending.Pending != nil &&
+		value.Pending.Pending.ActivationUncertain {
+		if want == ^uint64(0) {
+			return false
+		}
+		want++
+	}
+	return value.Pending.Revision == want
 }
 
 func validGatewayCurrentPendingRoute(state gatewayCurrentRouteState) bool {
@@ -305,7 +419,20 @@ func validGatewayCurrentLANDisablePending(state gatewayCurrentRouteState, pendin
 		return false
 	}
 	raw, err := gatewayV2LANBindingForRequest(*pending.Disable.SourceGrant)
-	return err == nil && reflect.DeepEqual(raw, pending.Previous.LAN.Raw)
+	if err != nil || !reflect.DeepEqual(raw, pending.Previous.LAN.Raw) ||
+		pending.Disable.GatewayProfileRevisionID != raw.ProfileRevisionID ||
+		pending.Disable.GatewayProfileRevisionNumber != raw.ProfileRevisionNumber ||
+		pending.Disable.GatewayProfileSpecDigest != raw.ProfileSpecDigest {
+		return false
+	}
+	if pending.Previous.LAN.Transfer == nil {
+		return raw.ProfileRevisionID == state.Profile.RevisionID &&
+			raw.ProfileRevisionNumber == state.Profile.RevisionNumber && raw.ProfileSpecDigest == state.Profile.SpecDigest
+	}
+	transfer := pending.Previous.LAN.Transfer
+	return transfer.SuccessorProfileRevisionID == state.Profile.RevisionID &&
+		transfer.SuccessorProfileRevisionNumber == state.Profile.RevisionNumber &&
+		transfer.SuccessorProfileSpecDigest == state.Profile.SpecDigest
 }
 
 func validGatewayCurrentLANRecoveryBatch(state gatewayCurrentRouteState) bool {
@@ -424,9 +551,12 @@ func gatewayCurrentPendingMatchesRecovery(pending gatewayCurrentPendingRoute,
 	if pending.AppID != item.AppID {
 		return false
 	}
-	if item.Kind == gatewayV2PendingLANGrant && item.Grant != nil && pending.Proposed.LAN != nil {
-		return (pending.Kind == gatewayV2PendingLANGrant || pending.Kind == gatewayV2PendingLANWithdrawal) &&
-			reflect.DeepEqual(*pending.Proposed.LAN, *item.Grant)
+	if item.Kind == gatewayV2PendingLANGrant && item.Grant != nil {
+		if pending.Kind == gatewayV2PendingLANGrant && pending.Proposed.LAN != nil {
+			return reflect.DeepEqual(*pending.Proposed.LAN, *item.Grant)
+		}
+		return pending.Kind == gatewayV2PendingLANWithdrawal && pending.Previous != nil &&
+			pending.Previous.LAN != nil && reflect.DeepEqual(*pending.Previous.LAN, *item.Grant)
 	}
 	return item.Kind == gatewayV2PendingLANDisable && item.Disable != nil && pending.Disable != nil &&
 		reflect.DeepEqual(*pending.Disable, *item.Disable)
