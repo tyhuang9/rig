@@ -88,6 +88,7 @@ type GatewayV2LANGrantObservation struct {
 	Endpoints            []generatedruntime.RouteEndpoint
 	GatewayOperationID   string
 	ProtectedStateDigest string
+	EffectiveBinding     GatewayV2LANEffectiveBindingProof
 	ObservedAt           time.Time
 }
 
@@ -530,8 +531,8 @@ func (m *Manager) withGatewayV2LANObservation(ctx context.Context, request Gatew
 	proofCtx, cancelProof := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelProof()
 
-	_, state, journal, committed, err := m.committedV2Locked()
-	if err != nil || !committed {
+	store, state, journal, committed, err := m.committedV2Locked()
+	if err != nil || !committed || store == nil {
 		return gatewayV2LANGrantError(proofCtx)
 	}
 	driver := m.gatewayV2LANGrantDriver
@@ -541,6 +542,12 @@ func (m *Manager) withGatewayV2LANObservation(ctx context.Context, request Gatew
 	observation, err := observeGatewayV2LANLocked(proofCtx, state, journal, request, driver)
 	if err != nil {
 		return err
+	}
+	selection := gatewayUpgradeGenerationSelection{Store: store, Generation: store.generation,
+		State: state, Journal: journal, Existing: true, operationID: state.OperationID}
+	observation.EffectiveBinding, err = gatewayUpgradeEffectiveProof(selection)
+	if err != nil {
+		return gatewayV2LANGrantError(proofCtx)
 	}
 	if proofCtx.Err() != nil {
 		return &Error{Code: DiagnosticCancelled}

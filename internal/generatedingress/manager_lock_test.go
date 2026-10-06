@@ -94,6 +94,25 @@ func TestGatewayLockReleasesWhenFenceCancelsContext(t *testing.T) {
 	manager.mu.Unlock()
 }
 
+func TestGatewayRebindProcessFailStopBlocksReconstructedManagers(t *testing.T) {
+	first, runner := newManagerFixture(t, false)
+	second, err := New(runner, first.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.gatewayRebindFailStopLatch() != second.gatewayRebindFailStopLatch() {
+		t.Fatal("production managers did not share the process fail-stop latch")
+	}
+	first.gatewayRebindFailStopLatch().Store(true)
+	t.Cleanup(func() { gatewayRebindProcessFailStop.Store(false) })
+	for name, manager := range map[string]*Manager{"existing": first, "reconstructed": second} {
+		if release, lockErr := manager.lockGateway(context.Background()); release != nil ||
+			!IsCode(lockErr, DiagnosticRouteUnresolved) {
+			t.Fatalf("%s manager bypassed process fail-stop: release=%t error=%v", name, release != nil, lockErr)
+		}
+	}
+}
+
 func TestRebindFenceBlocksNormalGatewayEffects(t *testing.T) {
 	fenceFailure := errors.New("injected active rebind claim")
 

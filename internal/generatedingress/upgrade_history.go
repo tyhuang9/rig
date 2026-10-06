@@ -80,6 +80,7 @@ const (
 	gatewayHistoryRebindIntent
 	gatewayHistoryRebindProgress
 	gatewayHistoryRebindTerminal
+	gatewayHistoryRebindPredecessorCheckpoint
 )
 
 type gatewayHistoryArtifact struct {
@@ -98,6 +99,7 @@ type gatewayHistoryGeneration struct {
 type gatewayRebindHistoryGeneration struct {
 	generation  uint64
 	operationID string
+	checkpoint  gatewayHistoryArtifact
 	intent      gatewayHistoryArtifact
 	progress    map[uint64]gatewayHistoryArtifact
 	terminal    gatewayHistoryArtifact
@@ -650,7 +652,7 @@ func readGatewayHistorySnapshotMode(store *stateStore, allowRebind bool) (gatewa
 			continue
 		}
 		if (kind == gatewayHistoryRebindIntent || kind == gatewayHistoryRebindProgress ||
-			kind == gatewayHistoryRebindTerminal) && !allowRebind {
+			kind == gatewayHistoryRebindTerminal || kind == gatewayHistoryRebindPredecessorCheckpoint) && !allowRebind {
 			return gatewayHistorySnapshot{}, errors.New("generated ingress rebind history requires a rebind-aware scanner")
 		}
 		path := filepath.Join(store.root, entry.Name())
@@ -663,15 +665,18 @@ func readGatewayHistorySnapshotMode(store *stateStore, allowRebind bool) (gatewa
 		}
 		artifact := gatewayHistoryArtifact{path: path}
 		if kind == gatewayHistoryRebindIntent || kind == gatewayHistoryRebindProgress ||
-			kind == gatewayHistoryRebindTerminal {
+			kind == gatewayHistoryRebindTerminal || kind == gatewayHistoryRebindPredecessorCheckpoint {
 			artifacts := snapshot.rebindIntents[generation]
 			if (artifacts.operationID != "" && artifacts.operationID != operationID) ||
+				(kind == gatewayHistoryRebindPredecessorCheckpoint && artifacts.checkpoint.path != "") ||
 				(kind == gatewayHistoryRebindIntent && artifacts.intent.path != "") ||
 				(kind == gatewayHistoryRebindTerminal && artifacts.terminal.path != "") {
 				return gatewayHistorySnapshot{}, errors.New("generated ingress rebind generation has conflicting artifacts")
 			}
 			artifacts.generation, artifacts.operationID = generation, operationID
-			if kind == gatewayHistoryRebindIntent {
+			if kind == gatewayHistoryRebindPredecessorCheckpoint {
+				artifacts.checkpoint = artifact
+			} else if kind == gatewayHistoryRebindIntent {
 				artifacts.intent = artifact
 			} else if kind == gatewayHistoryRebindTerminal {
 				artifacts.terminal = artifact
@@ -734,11 +739,15 @@ func readGatewayHistorySnapshotMode(store *stateStore, allowRebind bool) (gatewa
 // and after the bounded read. The surrounding two-snapshot scan therefore
 // rejects replacements and content changes that persist across its reads.
 func fingerprintGatewayHistoryArtifact(path string) (gatewayHistoryFileFingerprint, error) {
+	return fingerprintGatewayHistoryArtifactBound(path, maxGatewayHistoryArtifactBytes)
+}
+
+func fingerprintGatewayHistoryArtifactBound(path string, maximum int64) (gatewayHistoryFileFingerprint, error) {
 	unsafe := func() (gatewayHistoryFileFingerprint, error) {
 		return gatewayHistoryFileFingerprint{}, errors.New("generated ingress upgrade history artifact is unsafe")
 	}
 	before, err := os.Lstat(path)
-	if err != nil || !safeGatewayHistoryArtifact(path, before) || before.Size() <= 0 || before.Size() > maxGatewayHistoryArtifactBytes {
+	if maximum <= 0 || err != nil || !safeGatewayHistoryArtifact(path, before) || before.Size() <= 0 || before.Size() > maximum {
 		return unsafe()
 	}
 	file, err := os.Open(path)
@@ -752,8 +761,8 @@ func fingerprintGatewayHistoryArtifact(path string) (gatewayHistoryFileFingerpri
 	}
 
 	hash := sha256.New()
-	read, err := io.Copy(hash, io.LimitReader(file, maxGatewayHistoryArtifactBytes+1))
-	if err != nil || read <= 0 || read > maxGatewayHistoryArtifactBytes || read != opened.Size() {
+	read, err := io.Copy(hash, io.LimitReader(file, maximum+1))
+	if err != nil || read <= 0 || read > maximum || read != opened.Size() {
 		return unsafe()
 	}
 	afterHandle, err := file.Stat()
@@ -821,11 +830,15 @@ func parseGatewayHistoryArtifactName(name string) (uint64, string, uint64, gatew
 		}
 		return generation, parts[1], 0, candidate.kind, true, nil
 	}
-	if strings.HasPrefix(lowerName, gatewayRebindProtectedIntentFilenamePrefix) {
-		if !strings.HasPrefix(name, gatewayRebindProtectedIntentFilenamePrefix) {
+	intentPrefixes := []string{gatewayRebindProtectedIntentFilenamePrefix, gatewayRebindProtectedIntentFilenamePrefixV2}
+	for _, intentPrefix := range intentPrefixes {
+		if !strings.HasPrefix(lowerName, strings.ToLower(intentPrefix)) {
+			continue
+		}
+		if !strings.HasPrefix(name, intentPrefix) {
 			return 0, "", 0, 0, true, errors.New("generated ingress rebind history filename is invalid")
 		}
-		tail := strings.TrimSuffix(strings.TrimPrefix(name, gatewayRebindProtectedIntentFilenamePrefix), ".bundle")
+		tail := strings.TrimSuffix(strings.TrimPrefix(name, intentPrefix), ".bundle")
 		parts := strings.Split(tail, ".")
 		if !strings.HasSuffix(name, ".bundle") || len(parts) != 2 ||
 			len(parts[0]) != gatewayV2GenerationDigits || !validCanonicalUUID(parts[1]) {
@@ -836,6 +849,22 @@ func parseGatewayHistoryArtifactName(name string) (uint64, string, uint64, gatew
 			return 0, "", 0, 0, true, errors.New("generated ingress rebind history generation is invalid")
 		}
 		return generation, parts[1], 0, gatewayHistoryRebindIntent, true, nil
+	}
+	if strings.HasPrefix(lowerName, gatewayRebindPredecessorCheckpointFilenamePrefix) {
+		if !strings.HasPrefix(name, gatewayRebindPredecessorCheckpointFilenamePrefix) {
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind predecessor checkpoint filename is invalid")
+		}
+		tail := strings.TrimSuffix(strings.TrimPrefix(name, gatewayRebindPredecessorCheckpointFilenamePrefix), ".bundle")
+		parts := strings.Split(tail, ".")
+		if !strings.HasSuffix(name, ".bundle") || len(parts) != 2 ||
+			len(parts[0]) != gatewayV2GenerationDigits || !validCanonicalUUID(parts[1]) {
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind predecessor checkpoint filename is invalid")
+		}
+		generation, err := strconv.ParseUint(parts[0], 10, 64)
+		if err != nil || generation == 0 || fmt.Sprintf("%0*d", gatewayV2GenerationDigits, generation) != parts[0] {
+			return 0, "", 0, 0, true, errors.New("generated ingress rebind predecessor checkpoint generation is invalid")
+		}
+		return generation, parts[1], 0, gatewayHistoryRebindPredecessorCheckpoint, true, nil
 	}
 	if strings.HasPrefix(lowerName, gatewayRebindProgressFilenamePrefix) {
 		if !strings.HasPrefix(name, gatewayRebindProgressFilenamePrefix) {

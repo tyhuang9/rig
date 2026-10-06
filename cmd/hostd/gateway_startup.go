@@ -499,6 +499,10 @@ func lanDisableStartupClaims(snapshot appaccess.AppAccessDisableStartupSnapshot)
 		}
 		claims = append(claims, generatedingress.GatewayV2LANDisableStartupClaim{
 			Request: request, State: entry.Claim.State, StateSequence: entry.Claim.StateSequence,
+			CurrentBinding: gatewayLANStartupBinding(entry.EffectiveProfile, entry.CurrentGatewaySource,
+				entry.TransferChain, entry.TransferChainTipDigest, entry.TerminalReceiptDigest),
+			RetainedBinding: gatewayLANStartupBinding(entry.RetainedEffectiveProfile, entry.RetainedGatewaySource,
+				entry.RetainedTransferChain, entry.RetainedTransferChainTipDigest, entry.RetainedTerminalReceiptDigest),
 			ClearAcknowledged: entry.ProtectedClearAck != nil || entry.SuccessorAck != nil,
 			RequiresRecovery: entry.Claim.State != appaccess.AppAccessDisableCommitted &&
 				(entry.AppArchived || !entry.AccessHeadCurrent || !entry.ProfileHeadCurrent ||
@@ -515,6 +519,10 @@ func lanGrantStartupClaims(snapshot appaccess.AppAccessGrantStartupSnapshot) []g
 			Request:       gatewayLANGrantRequest(entry.Claim),
 			State:         entry.Claim.State,
 			StateSequence: entry.Claim.StateSequence,
+			CurrentBinding: gatewayLANStartupBinding(entry.EffectiveProfile, entry.CurrentGatewaySource,
+				entry.TransferChain, entry.TransferChainTipDigest, entry.TerminalReceiptDigest),
+			RetainedBinding: gatewayLANStartupBinding(entry.RetainedEffectiveProfile, entry.RetainedGatewaySource,
+				entry.RetainedTransferChain, entry.RetainedTransferChainTipDigest, entry.RetainedTerminalReceiptDigest),
 			RequiresRecovery: entry.AppArchived || !entry.AccessHeadCurrent ||
 				!entry.ProfileHeadCurrent || !entry.ApproverIsAdministrator,
 		}
@@ -524,6 +532,33 @@ func lanGrantStartupClaims(snapshot appaccess.AppAccessGrantStartupSnapshot) []g
 		claims = append(claims, claim)
 	}
 	return claims
+}
+
+func gatewayLANStartupBinding(profile appaccess.GatewayProfileRevision, source appaccess.GatewayCurrentAuthorityRef,
+	chain []appaccess.GatewayRebindAllocationTransfer, tip, receipt string,
+) *generatedingress.GatewayV2LANStartupBindingProjection {
+	// A raw profile on a precommit or legacy claim is not effective authority.
+	// Preserve partial authority evidence so runtime validation can reject it;
+	// never replace a missing source with the raw request's profile.
+	if source == (appaccess.GatewayCurrentAuthorityRef{}) && len(chain) == 0 && tip == "" && receipt == "" {
+		return nil
+	}
+	chainCopy := append([]appaccess.GatewayRebindAllocationTransfer(nil), chain...)
+	for index := range chainCopy {
+		if previous := chainCopy[index].PredecessorTransferDigest; previous != nil {
+			digest := *previous
+			chainCopy[index].PredecessorTransferDigest = &digest
+		}
+	}
+	return &generatedingress.GatewayV2LANStartupBindingProjection{
+		EffectiveProfile: generatedingress.GatewayV2ProfileBinding{
+			RevisionID: profile.ID, RevisionNumber: profile.RevisionNumber, SpecDigest: profile.SpecDigest,
+			SelectedIPv4: profile.Spec.SelectedIPv4, InterfaceID: profile.Spec.InterfaceID,
+			PortStart: profile.Spec.PortStart, PortEnd: profile.Spec.PortEnd,
+		},
+		GatewaySource: source, TransferChain: chainCopy,
+		TransferChainTipDigest: tip, TerminalReceiptDigest: receipt,
+	}
 }
 
 func gatewayLANGrantRequest(claim appaccess.AppAccessGrantClaim) generatedingress.GatewayV2LANGrantRequest {

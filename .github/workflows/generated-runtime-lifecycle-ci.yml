@@ -224,7 +224,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [runtime-packages, gateway-v2, ingress-remainder]
+        suite: [runtime-packages, gateway-v2, rebind-history, rebind-config, rebind-resources, ingress-remainder]
     steps:
       - name: Check out source
         timeout-minutes: 2
@@ -250,6 +250,9 @@ jobs:
           # These complementary filters retain every ingress test and its full
           # subtest tree. Keep the other packages unfiltered.
           gateway_v2_pattern='^TestGatewayV2'
+          rebind_pattern='^Test(GatewayRebind|InspectGatewayRebind)'
+          rebind_effects_pattern='^Test(GatewayRebind(Stage|Final|Successor)|InspectGatewayRebindSuccessor)'
+          rebind_config_pattern='^TestGatewayRebind(StageConfig|FinalConfig)'
           case "$RACE_SUITE" in
             runtime-packages)
               packages=(
@@ -267,9 +270,21 @@ jobs:
               packages=(./internal/generatedingress)
               filter=(-run "$gateway_v2_pattern")
               ;;
+            rebind-history)
+              packages=(./internal/generatedingress)
+              filter=(-run "$rebind_pattern" -skip "$rebind_effects_pattern")
+              ;;
+            rebind-config)
+              packages=(./internal/generatedingress)
+              filter=(-run "$rebind_config_pattern")
+              ;;
+            rebind-resources)
+              packages=(./internal/generatedingress)
+              filter=(-run "$rebind_effects_pattern" -skip "$rebind_config_pattern")
+              ;;
             ingress-remainder)
               packages=(./internal/generatedingress)
-              filter=(-skip "$gateway_v2_pattern")
+              filter=(-skip "$gateway_v2_pattern|$rebind_pattern")
               ;;
             *) exit 1 ;;
           esac

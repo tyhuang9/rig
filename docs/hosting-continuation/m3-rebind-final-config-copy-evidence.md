@@ -1,7 +1,8 @@
 # M3 inactive final configuration copy
 
-Status: implementation reviewed and local verification complete. Not published;
-physical hosted acceptance is pending.
+Status: published as [draft PR #136](https://github.com/tyhuang9/rig/pull/136).
+Implementation reviewed and local verification complete; physical hosted
+acceptance is pending. The original approved publication head was `bdbb697`.
 
 Base: draft PR
 [#135](https://github.com/tyhuang9/rig/pull/135).
@@ -12,6 +13,30 @@ additively for the hosted corrections below. Implementation commit
 `7d83b583a6d219fbf58043cef18cb108527434dc` includes the production volume
 corrections and migration-journey assertion fix. Later source checkpoints
 must retain their own verification results.
+
+## 2026-10-05 hosted fixture correction
+
+PR #135's inherited stage-start gate at `e46185f` failed before a stage could
+run: its fixture assigned the successor the same IPv4/port still held by the
+live predecessor. All three stage-start cases and cleanup failed; the actual
+job log retained three containers in `Created` state. See the exact
+[job evidence](https://github.com/tyhuang9/rig/actions/runs/37373345314/job/111975694535).
+
+The reviewed correction at `b938a7a` was merged additively through PR #135.
+It uses two distinct addresses on an explicitly enabled, owned dummy adapter
+and preserves all runtime and cleanup proofs. This branch's two final-copy
+matrix jobs use the same corrected stage fixture, so they also explicitly
+enable the new network fixture, verify its prerequisites, and reject owned
+adapter residue. No production source changed in this correction.
+
+Integration-tag compilation passed for generated-ingress (1.035s) and hostd
+(0.956s), intentionally without executing tests. Workflow YAML and all 32 shell
+scripts passed syntax checks using the repository's existing parser and Git
+Bash. Both named final-copy tests were discovered and explicitly skipped without
+the required opt-ins. The docs workflow and build passed (VitePress 4.85s), and
+independent review found no blocking issue in the downstream workflow change.
+These local checks do not prove real Docker behavior; new hosted results are
+required.
 
 ## Purpose and invariants
 
@@ -52,7 +77,7 @@ and prior resource identities; they do not replace future SQL transfer ledgers.
 | Driver and TAR inventory | Both orders, large pair over 64 KiB, strict types/paths/metadata/padding, bounded output, sanitized failures and cleared buffers, exact identity bindings | Six focused driver/parser tests passed in 1.777s after review exposed and corrected missing direct stage-to-intent topology comparisons. |
 | Coordinator and immutable receipt | Copy, no-copy replay/adoption, absent-effect retry, cancellation/readback errors, checkpoint drift, ambiguous write, forged history, unchanged sequences 1–11 | The final-config-copy group passed in 159.687s. A standalone predecessor-checkpoint regression passed in 11.545s. Old stage-copy success, sequence-eleven success, old-phase rejection and progress checks passed in 66.417s. |
 | Integrated verification | Full Go suite, vet/build, tagged compilation, formatting, diff checks, docs build and independent review | Full serialized Go suite, vet, build and tagged compilation passed at `7d83b583`; ingress took 1049.473s. At final source `0aa8d785`, all 68 focused tests passed once without skips in 443.511s, followed by repository-wide vet/build and tagged compilation. |
-| Real Docker acceptance | Direct copy and lost-acknowledgment journeys, fresh-Manager replay, unchanged live config/SQL/routes/predecessor and application-request count, exact cleanup | Two named tests and required hosted workflow gates added on this same branch. Both tests were discovered and skipped locally with the explicit disposable-Linux `RIG_RUN_LIVE_GATEWAY_V2` opt-in unset; hosted execution remains pending publication. Compilation and skip are not Docker acceptance. |
+| Real Docker acceptance | Direct copy and lost-acknowledgment journeys, fresh-Manager replay, unchanged live config/SQL/routes/predecessor and application-request count, exact cleanup | Two named tests and required hosted workflow gates added on this same branch. Both were discovered and skipped locally without explicit opt-in. The draft is published; hosted execution must verify the corrected distinct-address fixture. Compilation and skip are not Docker acceptance. |
 
 Baseline command:
 
@@ -230,6 +255,54 @@ were still queued. Actual pinned Docker archive metadata and timing remain
 unverified until those jobs and this branch's two required Docker journeys
 pass. The local Docker engine is unavailable. No Linux race, physical Docker
 or second-device pass is claimed for this correction.
+
+## Hosted results and race partition correction (2026-10-05)
+
+At source `b46162ea4a97335976663770b17d2a44612cc3f9`, all nine jobs in
+[the M3 Docker workflow](https://github.com/tyhuang9/rig/actions/runs/37385339443)
+passed. The direct final-config-copy test passed once in 122.39s
+(job 112017115825), and lost-acknowledgment adoption passed once in 91.63s
+(job 112017115651). Their logs contain zero failed or skipped named tests,
+and both complete resource-cleanup steps succeeded. The inherited stage-start
+job 112017115741 passed its direct, lost-acknowledgment and withdrawal tests
+in 90.55s, 74.44s and 75.92s, with successful cleanup. These establish only
+the named physical boundaries; final handover and cross-store recovery remain
+separate acceptance requirements.
+
+Windows verification and the runtime-packages and gateway-v2 race batches
+also passed on that source. The
+[ingress-remainder race batch](https://github.com/tyhuang9/rig/actions/runs/37385339467/job/112021142430)
+failed at its 32-minute Go package timeout (1920.03s). The log contains no
+data-race report or failed test assertion before timeout. The active
+`TestGatewayRebindStageConfigVolumeReplayRejectsIdentityAndCensusSubstitution/foreign_labels`
+subtest had run for seven seconds; its stack was constructing the real SQL
+fixture. This is a failed check, not a race pass or proof that all tests finish.
+
+The correction partitions the growing rebind tests into history, config and
+resource batches. Gateway-v2 and all other ingress tests remain in their
+complementary batches; other runtime packages stay unfiltered. Every test's
+complete subtest tree, race instrumentation, timeout, nonempty-pass guard and
+required aggregate gate are retained. No application source or fixture changes.
+
+Local verification used the repository's existing YAML parser and the actual
+test census:
+
+```powershell
+go test -mod=readonly -list '^Test' ./internal/generatedingress
+go run -mod=readonly C:/Users/huang/Documents/Projects/Rig/temp/m3-pr136-race-partition-check.go $env:TEMP/m3-pr136-race-test-census.txt C:/Users/huang/Documents/Projects/Rig/temp/m3-pr136-race-partition.sh
+wsl -- bash -n /mnt/c/Users/huang/Documents/Projects/Rig/temp/m3-pr136-race-partition.sh
+```
+
+All 597 Windows-discovered top-level tests are selected exactly once:
+gateway-v2 137, rebind-history 88, rebind-config 55, rebind-resources 78,
+ingress-remainder 239. These selection and syntax checks do not run the Linux
+race detector; hosted execution must establish each new batch's result.
+YAML parsing, the extracted Bash syntax check, and `git diff --check` passed.
+`pnpm --dir docs check:workflow` passed, and `pnpm --dir docs build` completed
+successfully in 4.36s. The verification scripts and test census are temporary
+local evidence; no additional dependency is introduced.
+The PostgreSQL/repository-wide race job was still running when this correction
+was prepared. No success is inferred for it.
 
 ## Remaining work and rollback
 

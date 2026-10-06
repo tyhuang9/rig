@@ -13,8 +13,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
@@ -66,6 +68,19 @@ type Options struct {
 	// gateway locks are both held, before any protected gateway observation or
 	// mutation. Production callers must provide a fresh database-backed check.
 	RebindFenceCheck func(context.Context) error
+	// RebindCurrentStateRepository supplies a fresh SQL-selected current
+	// lineage for ordinary route, grant, disable, redeploy, and restart paths.
+	// It is optional for legacy-only callers; any path that observes a scoped
+	// rebind current-state bundle fails closed when this provider is absent.
+	RebindCurrentStateRepository GatewayRebindCurrentStateRepository
+}
+
+// GatewayRebindCurrentStateRepository is intentionally read-only. Ordinary
+// generated-ingress operations use it only to select and revalidate the
+// current protected generation; rebind claims and transitions remain private
+// coordinator operations with their own explicit repository contract.
+type GatewayRebindCurrentStateRepository interface {
+	GatewayRebindRecoverySnapshot(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error)
 }
 
 type Manager struct {
@@ -75,6 +90,18 @@ type Manager struct {
 	dockerEnv                []string
 	workingDirectoryIdentity os.FileInfo
 	mu                       contextMutex
+	// gatewayRebindFailStop points at the process-wide latch in production.
+	// Tests may replace it with a private latch to avoid cross-test state.
+	gatewayRebindFailStop *atomic.Bool
+	// gatewayRebindV2NetworkObserver is replaceable only by package tests.
+	// Production performs two complete host and Docker inventory reads.
+	gatewayRebindV2NetworkObserver func(context.Context, appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error)
+	// gatewayRebindAfterClaim is a package-test crash boundary after the SQL
+	// prepared commit and before any protected checkpoint write.
+	gatewayRebindAfterClaim func(context.Context, appaccess.GatewayRebindClaimV2) error
+	// gatewayRebindClock is read only after a SQL transition returns. Tests
+	// replace it to pin protected record times.
+	gatewayRebindClock func() time.Time
 	// gatewayTopologyObserver is replaceable only by package tests. Production
 	// always uses the full read-only Docker attestation.
 	gatewayTopologyObserver func(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayObservedTopology
@@ -175,7 +202,9 @@ func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager,
 	if err != nil {
 		return nil, err
 	}
-	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv, workingDirectoryIdentity: workingDirectoryIdentity, mu: newContextMutex()}, nil
+	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv,
+		workingDirectoryIdentity: workingDirectoryIdentity, mu: newContextMutex(),
+		gatewayRebindFailStop: &gatewayRebindProcessFailStop}, nil
 }
 
 // Switch atomically reloads the aggregate Caddy route set, durably records the

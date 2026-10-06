@@ -195,6 +195,20 @@ func (s *Server) attestApplicationLANAccess(ctx context.Context, revision appacc
 			lanGrantRequestForClaim(authorized.Claim) != request {
 			return appaccess.ErrInvalidStoredState
 		}
+		effective := authorized.EffectiveProfile
+		effectiveDigest, err := appaccess.GatewayProfileSpecDigest(effective.Spec)
+		if err != nil || !validCanonicalUUID(effective.ID) || effective.RevisionNumber <= 0 || effective.SpecDigest != effectiveDigest ||
+			revision.Allocation.Port < effective.Spec.PortStart || revision.Allocation.Port > effective.Spec.PortEnd {
+			return appaccess.ErrInvalidStoredState
+		}
+		if !observation.EffectiveBinding.MatchesResolution(appaccess.GatewayBindingResolution{
+			RawAllocation: authorized.Allocation, RawAccessRevision: authorized.Revision,
+			RawGrant: authorized.Claim, RawProfile: authorized.Profile, EffectiveProfile: effective,
+			CurrentGatewaySource: authorized.CurrentGatewaySource, TransferChain: authorized.TransferChain,
+			TransferChainTipDigest: authorized.TransferChainTipDigest, TerminalReceiptDigest: authorized.TerminalReceiptDigest,
+		}) {
+			return appaccess.ErrInvalidStoredState
+		}
 		head, err := s.GeneratedRuntimeState.Active(observationCtx, revision.AppID)
 		if err != nil || head.DeploymentID == "" {
 			return appaccess.ErrInvalidStoredState
@@ -216,7 +230,7 @@ func (s *Server) attestApplicationLANAccess(ctx context.Context, revision appacc
 		at := observation.ObservedAt.UTC()
 		result.Availability = "verified"
 		result.ObservedAt = &at
-		result.URL = "http://" + net.JoinHostPort(authorized.Profile.Spec.SelectedIPv4, strconv.FormatUint(uint64(revision.Allocation.Port), 10)) + "/"
+		result.URL = "http://" + net.JoinHostPort(effective.Spec.SelectedIPv4, strconv.FormatUint(uint64(revision.Allocation.Port), 10)) + "/"
 		return nil
 	})
 	if err != nil || result.Availability != "verified" {

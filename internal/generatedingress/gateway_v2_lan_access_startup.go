@@ -17,6 +17,8 @@ const (
 // database snapshot. No mutable HTTP state participates in startup selection.
 type GatewayV2LANDisableStartupClaim struct {
 	Request           GatewayV2LANDisableRequest
+	CurrentBinding    *GatewayV2LANStartupBindingProjection
+	RetainedBinding   *GatewayV2LANStartupBindingProjection
 	State             appaccess.AppAccessDisableState
 	StateSequence     int64
 	RequiresRecovery  bool
