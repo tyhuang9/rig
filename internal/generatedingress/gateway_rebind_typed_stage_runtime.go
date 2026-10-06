@@ -10,7 +10,10 @@ import (
 	"strings"
 )
 
-type gatewayRebindTypedStageRuntime struct{ manager *Manager }
+type gatewayRebindTypedStageRuntime struct {
+	manager *Manager
+	reads   gatewayRebindSuccessorPreflightReads
+}
 
 type gatewayRebindTypedStageObservation struct {
 	Image                imageInspection
@@ -83,6 +86,113 @@ func (d gatewayRebindTypedStageRuntime) read(ctx context.Context,
 	}
 	result.OwnedNetworks, err = d.manager.inspectGatewayRebindTypedOwnedNames(ctx, intent, "network", "ls")
 	return result, err
+}
+
+func (d gatewayRebindTypedStageRuntime) networkTopologyMatches(ctx context.Context,
+	intent gatewayRebindProtectedIntentV2, observed gatewayRebindTypedStageObservation,
+) bool {
+	reads := d.reads
+	if ctx == nil || ctx.Err() != nil || reads.network.candidates == nil || reads.network.host == nil ||
+		reads.network.docker == nil || reads.dockerIDs == nil || !validGatewayRebindProtectedIntentV2(intent) {
+		return false
+	}
+	candidates, err := reads.network.candidates()
+	if err != nil {
+		return false
+	}
+	host, err := reads.network.host()
+	if err != nil {
+		return false
+	}
+	idsBefore, err := reads.dockerIDs(ctx)
+	if err != nil || !validGatewayRebindSuccessorDockerIDs(idsBefore) {
+		return false
+	}
+	prefixes, err := reads.network.docker(ctx)
+	if err != nil || ctx.Err() != nil {
+		return false
+	}
+	idsAfter, err := reads.dockerIDs(ctx)
+	if err != nil || !validGatewayRebindSuccessorDockerIDs(idsAfter) || !equalStrings(idsBefore, idsAfter) {
+		return false
+	}
+	routes, err := canonicalGatewayRebindPrefixes(host.Routes)
+	if err != nil {
+		return false
+	}
+	interfaces, err := canonicalGatewayRebindPrefixes(host.Interfaces)
+	if err != nil {
+		return false
+	}
+	dockerPrefixes, err := canonicalGatewayRebindPrefixes(prefixes)
+	if err != nil {
+		return false
+	}
+	projection := gatewayRebindCandidateProjection(candidates)
+	expectedIDs := append([]string(nil), intent.NetworkObservation.DockerNetworkIDs...)
+	expectedPrefixes := append([]string(nil), intent.NetworkObservation.DockerPrefixes...)
+	if observed.NetworkFound {
+		expectedIDs = append(expectedIDs, observed.NetworkID)
+		expectedPrefixes = append(expectedPrefixes, intent.Network.Subnet)
+		if !validGatewayRebindTypedStageNetworkHostDelta(intent, projection, routes, interfaces) {
+			return false
+		}
+	} else if !reflect.DeepEqual(projection, intent.NetworkObservation.Candidates) ||
+		!equalStrings(routes, intent.NetworkObservation.HostRoutes) ||
+		!equalStrings(interfaces, intent.NetworkObservation.HostInterfaces) {
+		return false
+	}
+	sort.Strings(expectedIDs)
+	sort.Strings(expectedPrefixes)
+	if !equalStrings(idsBefore, expectedIDs) || !equalStrings(dockerPrefixes, expectedPrefixes) {
+		return false
+	}
+	profile := gatewayProfileBinding{RevisionID: intent.SuccessorProfile.RevisionID,
+		RevisionNumber: intent.SuccessorProfile.RevisionNumber, SpecDigest: intent.SuccessorProfile.SpecDigest,
+		SelectedIPv4: intent.SuccessorProfile.SelectedIPv4, InterfaceID: intent.SuccessorProfile.InterfaceID,
+		PortStart: intent.SuccessorProfile.PortStart, PortEnd: intent.SuccessorProfile.PortEnd}
+	_, ok := selectGatewayV2Candidate(candidates, profile.InterfaceID, profile.SelectedIPv4)
+	return ok
+}
+
+func validGatewayRebindTypedStageNetworkHostDelta(intent gatewayRebindProtectedIntentV2,
+	candidates []gatewayRebindSuccessorNetworkCandidate, routes, interfaces []string,
+) bool {
+	if !validGatewayRebindProtectedIntentV2(intent) ||
+		!gatewayRebindStageNetworkRoutesMatch(routes, intent.NetworkObservation.HostRoutes,
+			intent.Network.Subnet, intent.Network.GatewayIPv4) ||
+		!gatewayRebindPrefixesMatchBaselineOrPlan(interfaces, intent.NetworkObservation.HostInterfaces,
+			intent.Network.Subnet) {
+		return false
+	}
+	if reflect.DeepEqual(candidates, intent.NetworkObservation.Candidates) {
+		return true
+	}
+	if len(candidates) != len(intent.NetworkObservation.Candidates)+1 {
+		return false
+	}
+	bridgeName, err := gatewayRebindTypedStageBridgeName(intent)
+	if err != nil {
+		return false
+	}
+	withoutBridge := make([]gatewayRebindSuccessorNetworkCandidate, 0, len(candidates)-1)
+	foundBridge := false
+	for _, candidate := range candidates {
+		index, name, ok := strings.Cut(candidate.InterfaceID, "/")
+		parsedIndex, parseErr := strconv.Atoi(index)
+		isBridge := ok && parseErr == nil && parsedIndex > 0 && strconv.Itoa(parsedIndex) == index &&
+			name == bridgeName && candidate.IPv4 == intent.Network.GatewayIPv4 &&
+			candidate.Prefix == intent.Network.Subnet
+		if isBridge {
+			if foundBridge {
+				return false
+			}
+			foundBridge = true
+			continue
+		}
+		withoutBridge = append(withoutBridge, candidate)
+	}
+	return foundBridge && reflect.DeepEqual(withoutBridge, intent.NetworkObservation.Candidates)
 }
 
 func (m *Manager) inspectGatewayRebindTypedOwnedNames(ctx context.Context,
@@ -171,6 +281,20 @@ func gatewayRebindTypedStageVolumeMatches(intent gatewayRebindProtectedIntentV2,
 func gatewayRebindTypedStagePrefixMatches(intent gatewayRebindProtectedIntentV2,
 	effect gatewayRebindTypedEffectProgress, value gatewayRebindTypedStageObservation,
 ) bool {
+	if !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, value) {
+		return false
+	}
+	if effect.StageContainer == nil {
+		return !value.StageContainerFound && reflect.DeepEqual(value.StageContainer, caddyInspection{}) &&
+			reflect.DeepEqual(value.StageRuntime, gatewayContainerRuntime{}) &&
+			(!value.NetworkFound || len(value.Network.Containers) == 0)
+	}
+	return gatewayRebindTypedStoppedStageContainerMatches(intent, effect, value)
+}
+
+func gatewayRebindTypedStageResourcePrefixMatches(intent gatewayRebindProtectedIntentV2,
+	effect gatewayRebindTypedEffectProgress, value gatewayRebindTypedStageObservation,
+) bool {
 	if !gatewayRebindTypedStageImageMatches(intent, value) || value.Image.ID != effect.ImageID ||
 		value.FinalContainerFound || !gatewayRebindTypedStageNetworkMatches(intent, value, effect.Network) {
 		return false
@@ -210,12 +334,7 @@ func gatewayRebindTypedStagePrefixMatches(intent gatewayRebindProtectedIntentV2,
 		!equalStrings(value.OwnedContainers, expectedContainers) {
 		return false
 	}
-	if effect.StageContainer == nil {
-		return !value.StageContainerFound && reflect.DeepEqual(value.StageContainer, caddyInspection{}) &&
-			reflect.DeepEqual(value.StageRuntime, gatewayContainerRuntime{}) &&
-			(!value.NetworkFound || len(value.Network.Containers) == 0)
-	}
-	return gatewayRebindTypedStoppedStageContainerMatches(intent, effect, value)
+	return true
 }
 
 func gatewayRebindTypedStoppedStageContainerMatches(intent gatewayRebindProtectedIntentV2,

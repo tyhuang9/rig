@@ -50,8 +50,11 @@ func (m *Manager) readGatewayRebindTypedAttemptBoundaryLocked(ctx context.Contex
 		return invalid()
 	}
 	selection, err := m.selectGatewayCurrentLocked(ctx, first)
-	expectedLineage, err := gatewayRebindTypedSelectedLineage(request)
-	if err != nil || selection.Lineage != expectedLineage {
+	if err != nil {
+		return invalid()
+	}
+	expectedLineage, lineageErr := gatewayRebindTypedSelectedLineage(request)
+	if lineageErr != nil || selection.Lineage != expectedLineage {
 		return invalid()
 	}
 	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)

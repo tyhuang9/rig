@@ -5,6 +5,8 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
 type gatewayRebindTypedEffectGuard func(context.Context) error
@@ -27,6 +29,28 @@ type gatewayRebindTypedStageDriver interface {
 		gatewayRebindTypedEffectProgress, gatewayRebindTypedEffectGuard) error
 }
 
+type gatewayRebindTypedHandoverPreparation struct {
+	LocalHostPort                uint16
+	PredecessorObservationDigest string
+	PredecessorInitiallyRunning  bool
+	ApplicationNetworks          []gatewayRebindHandoverApplicationNetwork
+}
+
+type gatewayRebindTypedHandoverDriver interface {
+	prepareHandover(context.Context, gatewayRebindPreparedAttempt, gatewayCurrentSelection,
+		gatewayRebindTypedEffectProgress, gatewayRebindTypedEffectGuard) (gatewayRebindTypedHandoverPreparation, error)
+	bindFinalContainer(context.Context, gatewayRebindProtectedIntentV2, gatewayRebindTypedEffectProgress,
+		gatewayRebindTypedEffectGuard) (gatewayRebindFinalContainerBinding, error)
+	prepareCutover(context.Context, gatewayRebindPreparedAttempt, gatewayCurrentSelection,
+		gatewayRebindTypedEffectProgress, gatewayRebindTypedEffectGuard) (gatewayRebindFinalHandoverObservation, error)
+	serveSuccessor(context.Context, gatewayRebindPreparedAttempt, gatewayCurrentSelection,
+		gatewayRebindTypedEffectProgress, gatewayRebindPhysicalReconcileMode,
+		gatewayRebindTypedEffectGuard) (gatewayRebindFinalHandoverObservation, error)
+	finalizeSuccessor(context.Context, gatewayRebindPreparedAttempt, gatewayCurrentSelection, gatewayRebindProgressRecord,
+		gatewayRebindTypedEffectProgress, gatewayRebindTypedEffectGuard) (
+		gatewayRebindFinalHandoverResourceBindings, gatewayRebindFinalHandoverTerminalProof, error)
+}
+
 func (d gatewayRebindTypedStageRuntime) stable(ctx context.Context,
 	intent gatewayRebindProtectedIntentV2, guard gatewayRebindTypedEffectGuard,
 ) (gatewayRebindTypedStageObservation, error) {
@@ -34,11 +58,12 @@ func (d gatewayRebindTypedStageRuntime) stable(ctx context.Context,
 		return gatewayRebindTypedStageObservation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
 	first, err := d.read(ctx, intent)
-	if err != nil {
+	if err != nil || !d.networkTopologyMatches(ctx, intent, first) {
 		return gatewayRebindTypedStageObservation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
 	second, err := d.read(ctx, intent)
-	if err != nil || !reflect.DeepEqual(first, second) || ctx.Err() != nil || guard(ctx) != nil {
+	if err != nil || !d.networkTopologyMatches(ctx, intent, second) || !reflect.DeepEqual(first, second) ||
+		ctx.Err() != nil || guard(ctx) != nil {
 		return gatewayRebindTypedStageObservation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
 	return second, nil
@@ -237,19 +262,33 @@ func (d gatewayRebindTypedStageRuntime) bindStageContainer(ctx context.Context,
 }
 
 func (d gatewayRebindTypedStageRuntime) stageConfigInventory(ctx context.Context,
-	effect gatewayRebindTypedEffectProgress, expected []byte,
+	effect gatewayRebindTypedEffectProgress, expected []byte, started bool,
 ) (gatewayRebindStageConfigInventory, error) {
-	if effect.StageContainer == nil {
+	if d.manager == nil || d.manager.runner == nil || effect.StageContainer == nil ||
+		(started && effect.StageStartIntent == nil) {
 		return 0, errors.New("typed stage container is missing")
 	}
-	result, err := d.manager.run(ctx, d.manager.options.CommandTimeout, "container", "cp",
-		effect.StageContainer.ID+":/config/.", "-")
+	limit := defaultOutputLimit
+	if started {
+		limit = gatewayRebindStartedStageConfigArchiveLimit
+	}
+	result, err := d.manager.runner.Run(ctx, runtimeprocess.CommandRequest{
+		Executable:  d.manager.options.DockerExecutable,
+		Args:        []string{"container", "cp", effect.StageContainer.ID + ":/config/.", "-"},
+		Directory:   d.manager.options.WorkingDirectory,
+		Env:         append([]string(nil), d.manager.dockerEnv...),
+		Timeout:     d.manager.options.CommandTimeout,
+		OutputLimit: limit,
+	})
 	if err != nil {
 		return 0, err
 	}
 	defer clearResult(&result)
 	if result.StdoutTruncated || result.StderrTruncated || len(result.Stderr) != 0 {
 		return 0, errors.New("typed stage config inventory is incomplete")
+	}
+	if started {
+		return gatewayRebindExactStartedStageConfigVolumeArchive(result.Stdout, expected)
 	}
 	return gatewayRebindExactStageConfigVolumeArchive(result.Stdout, expected)
 }
@@ -270,7 +309,7 @@ func (d gatewayRebindTypedStageRuntime) copyStageConfig(ctx context.Context,
 		return gatewayRebindEffectBoundaryError(ctx)
 	}
 	defer clear(body)
-	inventory, err := d.stageConfigInventory(ctx, effect, body)
+	inventory, err := d.stageConfigInventory(ctx, effect, body, false)
 	if err != nil {
 		return gatewayRebindEffectBoundaryError(ctx)
 	}
@@ -286,7 +325,7 @@ func (d gatewayRebindTypedStageRuntime) copyStageConfig(ctx context.Context,
 	if err != nil || !gatewayRebindTypedStagePrefixMatches(intent, effect, confirmed) {
 		return gatewayRebindEffectBoundaryError(ctx)
 	}
-	inventory, err = d.stageConfigInventory(ctx, effect, body)
+	inventory, err = d.stageConfigInventory(ctx, effect, body, false)
 	if err != nil || inventory != gatewayRebindStageConfigInventoryExact {
 		return gatewayRebindEffectBoundaryError(ctx)
 	}
@@ -301,8 +340,17 @@ func (d gatewayRebindTypedStageRuntime) serveStage(ctx context.Context,
 		return "", gatewayRebindEffectBoundaryError(ctx)
 	}
 	value, err := d.stable(ctx, intent, guard)
+	if err != nil || !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, value) {
+		return "", gatewayRebindEffectBoundaryError(ctx)
+	}
+	body, err := gatewayRebindTypedStageConfigBytes(intent)
 	if err != nil {
-		return "", err
+		return "", gatewayRebindEffectBoundaryError(ctx)
+	}
+	defer clear(body)
+	inventory, err := d.stageConfigInventory(ctx, effect, body, true)
+	if err != nil || inventory != gatewayRebindStageConfigInventoryExact {
+		return "", gatewayRebindEffectBoundaryError(ctx)
 	}
 	if gatewayRebindTypedStoppedStageContainerMatches(intent, effect, value) {
 		if guard(ctx) != nil || d.manager.runDiscard(ctx, d.manager.options.CommandTimeout,
@@ -313,23 +361,28 @@ func (d gatewayRebindTypedStageRuntime) serveStage(ctx context.Context,
 		return "", gatewayRebindEffectBoundaryError(ctx)
 	}
 	confirmed, err := d.stable(ctx, intent, guard)
-	if err != nil || !gatewayRebindTypedRunningStageMatches(intent, effect, confirmed) {
-		return "", gatewayRebindEffectBoundaryError(ctx)
-	}
-	body, err := gatewayRebindTypedStageConfigBytes(intent)
-	if err != nil {
+	if err != nil || !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, confirmed) ||
+		!gatewayRebindTypedRunningStageMatches(intent, effect, confirmed) {
 		return "", gatewayRebindEffectBoundaryError(ctx)
 	}
 	live, liveErr := d.manager.inspectLiveCaddyConfig(ctx, effect.StageContainer.ID)
 	validConfig := liveErr == nil && sameCaddyConfig(body, live)
-	clear(body)
 	clear(live)
 	if !validConfig || !proveGatewayRebindStagePublication(ctx, *effect.StageStartIntent,
 		effect.StageContainer.ID, probeGatewayV2HostStatus, d.manager.probeGatewayV2ContainerChallenge) ||
 		guard(ctx) != nil {
 		return "", gatewayRebindEffectBoundaryError(ctx)
 	}
-	endpoint := confirmed.StageRuntime.ConfiguredNetworks[intent.Identity.IngressNetwork].EndpointID
+	final, finalErr := d.stable(ctx, intent, guard)
+	if finalErr != nil || !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, final) ||
+		!gatewayRebindTypedRunningStageMatches(intent, effect, final) {
+		return "", gatewayRebindEffectBoundaryError(ctx)
+	}
+	inventory, err = d.stageConfigInventory(ctx, effect, body, true)
+	if err != nil || inventory != gatewayRebindStageConfigInventoryExact {
+		return "", gatewayRebindEffectBoundaryError(ctx)
+	}
+	endpoint := final.StageRuntime.ConfiguredNetworks[intent.Identity.IngressNetwork].EndpointID
 	if !validContainerID(endpoint) || normalizeID(endpoint) != endpoint {
 		return "", gatewayRebindEffectBoundaryError(ctx)
 	}
@@ -364,7 +417,8 @@ func (d gatewayRebindTypedStageRuntime) copyFinalConfig(ctx context.Context,
 		return gatewayRebindEffectBoundaryError(ctx)
 	}
 	value, err := d.stable(ctx, intent, guard)
-	if err != nil || !gatewayRebindTypedRunningStageMatches(intent, effect, value) {
+	if err != nil || !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, value) ||
+		!gatewayRebindTypedRunningStageMatches(intent, effect, value) {
 		return gatewayRebindEffectBoundaryError(ctx)
 	}
 	stageBody, err := gatewayRebindTypedStageConfigBytes(intent)
@@ -391,7 +445,8 @@ func (d gatewayRebindTypedStageRuntime) copyFinalConfig(ctx context.Context,
 		return gatewayRebindEffectBoundaryError(ctx)
 	}
 	confirmed, err := d.stable(ctx, intent, guard)
-	if err != nil || !gatewayRebindTypedRunningStageMatches(intent, effect, confirmed) {
+	if err != nil || !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, confirmed) ||
+		!gatewayRebindTypedRunningStageMatches(intent, effect, confirmed) {
 		return gatewayRebindEffectBoundaryError(ctx)
 	}
 	inventory, err = d.finalConfigInventory(ctx, effect, stageBody, activeBody)
