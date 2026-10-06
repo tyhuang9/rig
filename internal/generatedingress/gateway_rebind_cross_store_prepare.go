@@ -137,8 +137,8 @@ func (m *Manager) installGatewayRebindPreparedProtectedLocked(ctx context.Contex
 		if installedIntent, loadErr := intentStore.load(); loadErr == nil {
 			if installedIntent.Claim.RequestDigest != claim.RequestDigest ||
 				installedIntent.Predecessor != checkpoint.sourceRef() ||
-				!reflect.DeepEqual(installedIntent.Roster, roster) ||
-				!reflect.DeepEqual(installedIntent.RuntimeHeads, runtimeHeads) {
+				!sameGatewayRebindRosterV2(installedIntent.Roster, roster) ||
+				!sameGatewayRebindRuntimeHeads(installedIntent.RuntimeHeads, runtimeHeads) {
 				return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 			}
 			progressStore, progressStoreErr := newGatewayRebindProgressStore(m.options.DataRoot,
@@ -180,6 +180,18 @@ func (m *Manager) installGatewayRebindPreparedProtectedLocked(ctx context.Contex
 		}
 	}
 	return gatewayRebindPreparedAttempt{Claim: claim, Checkpoint: checkpoint, Intent: intent, Progress: progress}, nil
+}
+
+func sameGatewayRebindRosterV2(left, right []appaccess.GatewayRebindRosterEntryV2) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if !reflect.DeepEqual(left[index], right[index]) {
+			return false
+		}
+	}
+	return true
 }
 
 func ensureGatewayRebindCheckpoint(store *gatewayRebindPredecessorCheckpointStore,

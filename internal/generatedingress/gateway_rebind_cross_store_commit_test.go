@@ -33,6 +33,13 @@ type gatewayRebindRollbackReadbackRepository struct {
 	rolledBack bool
 }
 
+type gatewayRebindPostTerminalDriftRepository struct {
+	*appaccess.Repository
+	manager  *Manager
+	drifted  bool
+	driftErr error
+}
+
 func (r *gatewayRebindRollbackReadbackRepository) ApplyGatewayRebindTransition(ctx context.Context,
 	proof appaccess.GatewayRebindTransitionProof,
 ) (appaccess.GatewayRebindTransitionCommand, error) {
@@ -41,6 +48,43 @@ func (r *gatewayRebindRollbackReadbackRepository) ApplyGatewayRebindTransition(c
 		r.rolledBack = true
 	}
 	return command, err
+}
+
+func (r *gatewayRebindPostTerminalDriftRepository) ApplyGatewayRebindTransition(ctx context.Context,
+	proof appaccess.GatewayRebindTransitionProof,
+) (appaccess.GatewayRebindTransitionCommand, error) {
+	command, err := r.Repository.ApplyGatewayRebindTransition(ctx, proof)
+	if err != nil || proof.NextState != appaccess.GatewayRebindCommitted || r.drifted {
+		return command, err
+	}
+	// The SQL terminal transition has committed and released its fence. Inject
+	// an ordinary protected-state advance before the coordinator receives the
+	// successful acknowledgement. The post-release readback must detect that
+	// its local attestation no longer names the selected state and latch the
+	// process closed; SQL rollback is no longer possible at this boundary.
+	snapshot, snapshotErr := r.Repository.GatewayRebindRecoverySnapshot(ctx)
+	if snapshotErr != nil {
+		r.driftErr = snapshotErr
+		return command, nil
+	}
+	selection, selectErr := r.manager.selectGatewayCurrentLocked(ctx, snapshot)
+	if selectErr != nil || selection.State == nil || selection.Store == nil {
+		r.driftErr = selectErr
+		if r.driftErr == nil {
+			r.driftErr = errors.New("terminal drift selection is incomplete")
+		}
+		return command, nil
+	}
+	next := cloneGatewayCurrentRouteState(*selection.State)
+	next.Revision++
+	next.Digest, r.driftErr = gatewayCurrentRouteStateDigest(next)
+	if r.driftErr == nil {
+		r.driftErr = selection.Store.saveNext(*selection.State, next)
+	}
+	if r.driftErr == nil {
+		r.drifted = true
+	}
+	return command, nil
 }
 
 func (r *gatewayRebindRollbackReadbackRepository) GatewayRebindRecoverySnapshot(ctx context.Context,
@@ -291,6 +335,28 @@ func TestGatewayRebindCoordinatorRejectsCurrentStateDriftAfterAttestation(t *tes
 	}
 	if err := f.repository.CheckGatewayRebindFence(context.Background()); err == nil {
 		t.Fatal("state drift unexpectedly released SQL fence")
+	}
+}
+
+func TestGatewayRebindCoordinatorLatchesFailStopOnCurrentStateDriftAfterTerminalSQL(t *testing.T) {
+	f, input, driver := newGatewayRebindCoordinatorFixture(t)
+	repository := &gatewayRebindPostTerminalDriftRepository{Repository: f.repository, manager: f.manager}
+	result, err := f.manager.commitGatewayRebindWithDriver(context.Background(), repository, input, driver)
+	if err == nil || result != (GatewayRebindCommitResult{}) || !repository.drifted || repository.driftErr != nil {
+		t.Fatalf("post-terminal drift accepted: result=%#v drifted=%t driftErr=%v error=%v",
+			result, repository.drifted, repository.driftErr, err)
+	}
+	snapshot, snapshotErr := f.repository.GatewayRebindRecoverySnapshot(context.Background())
+	if snapshotErr != nil || snapshot.Active != nil || snapshot.CurrentSource == nil ||
+		snapshot.CurrentSource.OperationID != input.Inspection.Spec.OperationID {
+		t.Fatalf("terminal SQL transition did not commit before drift: snapshot=%#v error=%v", snapshot, snapshotErr)
+	}
+	if fenceErr := f.repository.CheckGatewayRebindFence(context.Background()); fenceErr != nil {
+		t.Fatalf("terminal SQL fence remained active after committed transition: %v", fenceErr)
+	}
+	if !f.manager.gatewayRebindFailStopLatch().Load() || !f.manager.gatewayRebindCommitBarrierLatch().Load() ||
+		!f.manager.gatewayRebindAdmissionBlocked() {
+		t.Fatal("post-terminal drift did not retain the process fail-stop and admission barrier")
 	}
 }
 
