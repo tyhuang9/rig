@@ -163,6 +163,25 @@ func TestGatewayCurrentStartupEmergencyStopRefusesOrphanCurrentBundle(t *testing
 	}
 }
 
+func TestGatewayCurrentStartupEmergencyCensusRejectsOrphanBesideCommittedBundle(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	committed, _ := gatewayCurrentRouteStateName(fixture.baseline.Lineage.ProtectedGeneration,
+		fixture.baseline.Lineage.OperationID)
+	orphan, _ := gatewayCurrentRouteStateName(fixture.baseline.Lineage.ProtectedGeneration+1,
+		fixture.baseline.Lineage.OperationID)
+	presence := gatewayRebindProtectedPresenceSnapshot{present: true,
+		files: map[string]gatewayHistoryFileFingerprint{
+			committed: {},
+			orphan:    {},
+		}}
+
+	census, lineages := gatewayCurrentOwnedStopCensus(fixture.history, presence)
+	if !census.ProtectedRebindHistory || !census.UnresolvedAttempt || !census.CommittedOwnership ||
+		len(lineages) != 1 || lineages[0] != fixture.baseline.Lineage {
+		t.Fatalf("orphan beside committed census=%#v lineages=%#v", census, lineages)
+	}
+}
+
 func TestGatewayCurrentStartupEmergencyStopReportsMissingBundleWithoutStoppingByName(t *testing.T) {
 	fixture := newGatewayCurrentStateFixture(t)
 	prepareGatewayCurrentStartupEmergencyManager(t, fixture.manager)

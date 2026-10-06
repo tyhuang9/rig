@@ -181,6 +181,89 @@ type gatewayCurrentOwnedStopHistoryCensus struct {
 	CommittedOwnership     bool
 }
 
+type gatewayCurrentOwnedStopAttemptKey struct {
+	generation  uint64
+	operationID string
+}
+
+func gatewayCurrentOwnedStopCensus(history gatewayRebindProtectedIntentHistory,
+	presence gatewayRebindProtectedPresenceSnapshot,
+) (gatewayCurrentOwnedStopHistoryCensus, []appaccess.GatewayCurrentLineageRef) {
+	census := gatewayCurrentOwnedStopHistoryCensus{ProtectedRebindHistory: presence.present}
+	attempts := make(map[gatewayCurrentOwnedStopAttemptKey]struct{})
+	terminals := make(map[gatewayCurrentOwnedStopAttemptKey]struct{})
+	addAttempt := func(generation uint64, operationID string) {
+		attempts[gatewayCurrentOwnedStopAttemptKey{generation: generation, operationID: operationID}] = struct{}{}
+	}
+	addTerminal := func(generation uint64, operationID string) {
+		key := gatewayCurrentOwnedStopAttemptKey{generation: generation, operationID: operationID}
+		attempts[key], terminals[key] = struct{}{}, struct{}{}
+	}
+	for _, selected := range history.Checkpoints {
+		addAttempt(selected.Generation, selected.Checkpoint.OperationID)
+	}
+	for _, selected := range history.Intents {
+		addAttempt(selected.Generation, selected.Intent.OperationID)
+	}
+	for _, selected := range history.IntentsV2 {
+		addAttempt(selected.Generation, selected.Intent.OperationID)
+	}
+	for _, selected := range history.Progress {
+		addAttempt(selected.Generation, selected.Record.OperationID)
+	}
+	for _, selected := range history.Terminals {
+		addTerminal(selected.Generation, selected.Receipt.OperationID)
+	}
+	for _, selected := range history.TerminalsV2 {
+		addTerminal(selected.Generation, selected.Receipt.OperationID)
+	}
+	for key := range attempts {
+		if _, terminal := terminals[key]; !terminal {
+			census.UnresolvedAttempt = true
+		}
+	}
+
+	lineages := make([]appaccess.GatewayCurrentLineageRef, 0, len(history.Terminals)+len(history.TerminalsV2))
+	committed := make(map[gatewayCurrentOwnedStopAttemptKey]struct{})
+	appendLineage := func(lineage appaccess.GatewayCurrentLineageRef, lineageErr error) {
+		if lineageErr != nil {
+			return
+		}
+		lineages = append(lineages, lineage)
+		committed[gatewayCurrentOwnedStopAttemptKey{generation: lineage.ProtectedGeneration,
+			operationID: lineage.OperationID}] = struct{}{}
+	}
+	for _, retained := range history.Terminals {
+		appendLineage(gatewayRebindCurrentLineage(retained.Receipt))
+	}
+	for _, retained := range history.TerminalsV2 {
+		appendLineage(gatewayRebindCurrentLineageV2(retained.Receipt))
+	}
+	// Every generation-scoped current bundle must be justified by its own
+	// committed terminal. Aggregate retained history is insufficient: an
+	// orphan bundle beside an unrelated complete generation still represents
+	// unresolved protected ownership and possible live traffic.
+	for name := range presence.files {
+		generation, operationID, relevant, err := parseGatewayCurrentRoutePresenceName(name)
+		if err != nil {
+			census.UnresolvedAttempt = true
+			continue
+		}
+		if !relevant {
+			continue
+		}
+		if _, ok := committed[gatewayCurrentOwnedStopAttemptKey{generation: generation,
+			operationID: operationID}]; !ok {
+			census.UnresolvedAttempt = true
+		}
+	}
+	if census.ProtectedRebindHistory && len(attempts) == 0 {
+		census.UnresolvedAttempt = true
+	}
+	census.CommittedOwnership = len(lineages) != 0
+	return census, lineages
+}
+
 // gatewayCurrentOwnedStopTargetsProtectedPartialLocked retains independently
 // proved targets when another committed generation has a missing, corrupt, or
 // ambiguous route bundle. Its caller may withdraw those exact IDs but must
@@ -200,55 +283,7 @@ func (m *Manager) gatewayCurrentOwnedStopTargetsProtectedPartialLocked() (
 	if err != nil {
 		return nil, gatewayCurrentOwnedStopHistoryCensus{ProtectedRebindHistory: presence.present}, err
 	}
-	census := gatewayCurrentOwnedStopHistoryCensus{ProtectedRebindHistory: presence.present}
-	attempts := make(map[uint64]struct{})
-	terminals := make(map[uint64]struct{})
-	for _, selected := range history.Checkpoints {
-		attempts[selected.Generation] = struct{}{}
-	}
-	for _, selected := range history.Intents {
-		attempts[selected.Generation] = struct{}{}
-	}
-	for _, selected := range history.IntentsV2 {
-		attempts[selected.Generation] = struct{}{}
-	}
-	for _, selected := range history.Progress {
-		attempts[selected.Generation] = struct{}{}
-	}
-	for _, selected := range history.Terminals {
-		attempts[selected.Generation] = struct{}{}
-		terminals[selected.Generation] = struct{}{}
-	}
-	for _, selected := range history.TerminalsV2 {
-		attempts[selected.Generation] = struct{}{}
-		terminals[selected.Generation] = struct{}{}
-	}
-	// A scoped current-route bundle with no retained attempt is itself
-	// unresolved protected rebind evidence. It can never authorize native-only
-	// fallback or name-based cleanup.
-	if census.ProtectedRebindHistory && len(attempts) == 0 {
-		census.UnresolvedAttempt = true
-	}
-	for generation := range attempts {
-		if _, terminal := terminals[generation]; !terminal {
-			census.UnresolvedAttempt = true
-			break
-		}
-	}
-	lineages := make([]appaccess.GatewayCurrentLineageRef, 0, len(history.Terminals)+len(history.TerminalsV2))
-	for _, retained := range history.Terminals {
-		lineage, lineageErr := gatewayRebindCurrentLineage(retained.Receipt)
-		if lineageErr == nil {
-			lineages = append(lineages, lineage)
-		}
-	}
-	for _, retained := range history.TerminalsV2 {
-		lineage, lineageErr := gatewayRebindCurrentLineageV2(retained.Receipt)
-		if lineageErr == nil {
-			lineages = append(lineages, lineage)
-		}
-	}
-	census.CommittedOwnership = len(lineages) != 0
+	census, lineages := gatewayCurrentOwnedStopCensus(history, presence)
 	sort.Slice(lineages, func(i, j int) bool {
 		if lineages[i].ProtectedGeneration != lineages[j].ProtectedGeneration {
 			return lineages[i].ProtectedGeneration < lineages[j].ProtectedGeneration
