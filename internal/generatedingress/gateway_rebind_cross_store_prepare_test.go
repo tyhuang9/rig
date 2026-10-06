@@ -125,8 +125,8 @@ func TestRecoverGatewayRebindPreparedAdmissionTreatsEmptyCensusesCanonically(t *
 			if len(repository.snapshot.Active.RuntimeHeads) == 0 {
 				repository.snapshot.Active.RuntimeHeads = make([]appaccess.GatewayRebindRuntimeHead, 0)
 			}
-			fresh := *fixture.manager
-			fresh.mu = newContextMutex()
+			fresh := &Manager{runner: &gatewayCurrentNoCommandRunner{}, store: fixture.manager.store,
+				options: fixture.manager.options, mu: newContextMutex()}
 			observed := false
 			fresh.gatewayRebindV2NetworkObserver = func(context.Context,
 				appaccess.GatewayRebindClaimV2,
