@@ -277,7 +277,8 @@ func (m *Manager) readGatewayCurrentSelectionLocked(ctx context.Context) (
 }
 
 func sameGatewayRebindCurrentHistory(left, right gatewayRebindProtectedIntentHistory) bool {
-	if len(left.Checkpoints) != len(right.Checkpoints) || len(left.Intents) != len(right.Intents) || len(left.Progress) != len(right.Progress) ||
+	if len(left.Checkpoints) != len(right.Checkpoints) || len(left.Intents) != len(right.Intents) ||
+		len(left.IntentsV2) != len(right.IntentsV2) || len(left.Progress) != len(right.Progress) ||
 		len(left.Terminals) != len(right.Terminals) ||
 		!sameObservedGatewayV2Selection(left.Predecessor, right.Predecessor) || !reflect.DeepEqual(left.Source, right.Source) {
 		return false
@@ -289,6 +290,11 @@ func sameGatewayRebindCurrentHistory(left, right gatewayRebindProtectedIntentHis
 	}
 	for index := range left.Intents {
 		if !reflect.DeepEqual(left.Intents[index].Intent, right.Intents[index].Intent) {
+			return false
+		}
+	}
+	for index := range left.IntentsV2 {
+		if !reflect.DeepEqual(left.IntentsV2[index].Intent, right.IntentsV2[index].Intent) {
 			return false
 		}
 	}

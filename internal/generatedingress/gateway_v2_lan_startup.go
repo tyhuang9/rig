@@ -367,6 +367,7 @@ func validateGatewayV2LANStartupClaims(claims []GatewayV2LANStartupClaim) (gatew
 	for _, claim := range claims {
 		if _, err := gatewayV2LANBindingForRequest(claim.Request); err != nil ||
 			!gatewayV2LANStartupClaimSequenceValid(claim.State, claim.StateSequence) ||
+			!validGatewayV2LANStartupGrantBindings(claim) ||
 			(claim.DisableIntentOperationID != "" && !validCanonicalUUID(claim.DisableIntentOperationID)) {
 			return gatewayV2LANStartupClaimSet{}, gatewayV2StartupInspectionError(nil)
 		}
