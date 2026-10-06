@@ -1810,3 +1810,61 @@ zero failures/skips; vet, full build and `git diff --check` passed. The observer
 tests use protected files with projected SQL snapshots and simulated physical
 proofs. Actual whole-batch withdrawal, ordered callback/finalization writes,
 retirement, startup dispatch and Docker restart acceptance remain open.
+
+Independent review accepted frozen `814e072`: the three observer tests and five
+subcases passed in 59.973s with zero failures/skips
+(`Rig/temp/cross-store-review-814-current-batch-observer.jsonl`). Source/security
+review found no issue in this read-only scope. Claim freshness still depends on
+the caller's existing complete Hosting snapshot and pin rechecks.
+
+## Completed current batch retirement
+
+The public retirement regression first failed at `814e072` with
+`route_reconciliation_required` (one test, 17.424s;
+`Rig/temp/m3-current-batch-retirement-red.jsonl`). The new current consumer
+requires the complete terminal/acknowledged census, retained history, and a
+fresh serving withdrawal proof before persisting a fence-free next revision.
+It then reattests the exact remaining topology and reconfirms SQL/protected
+authority. An already stopped gateway retains its completed batch for recovery;
+port absence alone does not authorize retiring that marker.
+
+Uncertain proof/write outcomes latch ordinary admission and attempt withdrawal
+using only an exact captured protected owner. The optional state-only stop
+driver has no SQL dependency, cannot manufacture an ordinary transition, and
+must prove the exact container and listeners stopped/absent. Its Manager wrapper
+revalidates the protected target before and after the physical stop. Concrete
+Docker execution is a separate implementation and remains subject to review.
+
+An explicit full-unit acceptance case remains: when failure happens after the
+retirement revision was durably written, compensation can leave a stopped
+gateway with no pending marker or batch. Fresh-process recovery must reauthorize
+and restore that exact remaining topology. A process-scoped latch alone does
+not establish restart recovery; the retirement unit must not be used to claim
+that result. It does not rewrite old history or synthesize a recovery marker
+while SQL is unreadable.
+
+Owner verification used these exact commands:
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrentLANRecovery(RetiresCompletedBatch|Retirement)'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayCurrentLANRecoveryRetirementStopsExactOwnerOnLostProof$/^stop_failure$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayCurrentLANRecovery(RetiresCompletedBatch|RetirementRetainsStoppedBatch)|GatewayCurrentOwnedStopDriverUsesProtectedAuthorityAndRejectsDrift|GatewayV2LANRecovery(FinalizesTwoDisablesSequentiallyAndRetires|InspectorReprovesProcessedPrefixPorts|InspectorRejectsCommittedStaleGrant))$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The initial combined run passed three top-level tests and five failure subcases,
+then timed out at its four-minute limit while constructing the final stop-failure
+fixture (240.386s, `Rig/temp/m3-current-batch-retirement-green.jsonl`; despite its
+filename, this is a timed-out run, not an overall pass). The exact uncompleted
+case passed separately in 38.036s, one top-level test and one subcase, zero
+failures/skips (`Rig/temp/m3-current-batch-retirement-stop-failure.jsonl`).
+
+After adding the stopped-before-retirement guard from review, the final-source
+run passed six top-level tests and four subcases in 101.451s, zero failures/skips
+(`Rig/temp/m3-current-batch-retirement-final-source.jsonl`). It covers successful
+retirement, retaining a stopped batch, protected-only stop through SQL failure
+and the admission latch, unsupported capability refusal, stale/drifting ownership,
+and three native recovery regressions. Vet, full Go build, gofmt and
+`git diff --check` passed. These are protected-file tests with projected SQL and
+simulated physical evidence; they do not establish real Docker stop or restart.
