@@ -1727,3 +1727,30 @@ Invoking recovery beneath the held startup lease would nest a nonreentrant lock.
 Emergency stop must likewise have an explicit lease policy for failures that
 occur while startup admission is still held. These integration requirements are
 confirmed with the runtime owner; the executable API is not yet available.
+
+## Ordinary redeploy between rebinds
+
+The additional `TestGatewayRebindCoordinatorPreservesTransferAcrossOrdinaryRedeploy`
+sequence commits a first rebind, redeploys the same immutable release through
+the real generated-runtime repository and public `Manager.Switch`, and commits
+a second rebind. The redeploy holds the effects lease, advances the ordinary
+runtime phases/components, publishes a protected green-slot route, and calls
+the real `SwitchActive` transaction before completing the job/deployment.
+Only the Docker start, health and publication observations are simulated.
+
+The second approval and SQL history must retain the exact new complete runtime
+heads and updated protected source digest. The second current must preserve the
+new app route while the original allocation/access revision/grant/profile and
+first transfer remain unchanged. Prior protected history and SQL rebind history
+are compared again after the second commit. This closes a sequence coverage gap
+between the previously separate ordinary-switch and repeated-rebind tests.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayRebindCoordinatorPreservesTransferAcrossOrdinaryRedeploy$'
+go vet -mod=readonly ./internal/generatedingress
+```
+
+The new test passed in 43.109s with no failures or skips
+(`Rig/temp/m3-cross-store-redeploy-sequence.jsonl`); vet and `git diff --check`
+also passed. This is local SQL/protected-state acceptance, not a real Docker
+redeploy, a process-restart result, or complete M3 acceptance.

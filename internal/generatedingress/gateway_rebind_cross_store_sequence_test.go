@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
 
 // These sequences use real SQLite transitions and protected records. Only
@@ -186,6 +190,174 @@ func TestGatewayRebindCoordinatorCommitsAfterRetainedRollback(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGatewayRebindCoordinatorPreservesTransferAcrossOrdinaryRedeploy(t *testing.T) {
+	ctx := context.Background()
+	f, input, template := newGatewayRebindCoordinatorFixture(t)
+	first, err := f.manager.commitGatewayRebindWithDriver(ctx, f.repository, input,
+		gatewayRebindSequencePhysicalDriver(t, template.template, 1))
+	if err != nil || first.FinalPhase != appaccess.GatewayRebindCommitted {
+		t.Fatalf("first commit: %+v error=%v", first, err)
+	}
+	before, err := f.repository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || len(before.CurrentTransfers) != 1 {
+		t.Fatalf("first transfer snapshot: %v", err)
+	}
+	selection, err := f.manager.selectGatewayCurrentLocked(ctx, before)
+	if err != nil || selection.State == nil || selection.Terminal == nil {
+		t.Fatalf("first selection: %v", err)
+	}
+	entry := input.Inspection.Roster[0]
+	ref := appaccess.GatewayBindingRef{AppID: entry.AppID, AllocationID: entry.AllocationID,
+		AccessRevisionID: entry.AccessRevisionID, GrantAttemptID: entry.GrantAttemptID}
+	original, err := f.repository.ResolveGatewayBinding(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical := &gatewayCurrentStateMachineDriver{t: t, terminal: *selection.Terminal}
+	f.manager.gatewayCurrentPhysicalDriver = physical
+	head := gatewayRebindSequenceRedeploy(t, f, *selection.State, entry)
+	redeployed, err := selection.Store.load()
+	if err != nil || redeployed.Revision != selection.State.Revision+2 || redeployed.Pending != nil ||
+		redeployed.Apps[entry.AppID].Route.Slot != generatedruntime.Slot(head.Slot) ||
+		!reflect.DeepEqual(redeployed.Apps[entry.AppID].LAN, selection.State.Apps[entry.AppID].LAN) ||
+		physical.applyCalls != 1 || physical.attestCalls != 1 || physical.restoreCalls+physical.stopCalls != 0 {
+		t.Fatalf("ordinary redeploy did not preserve transferred binding: %v", err)
+	}
+	files, err := readGatewayHistorySnapshotMode(f.manager.store, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := gatewayRebindSequenceNextInput(t, f, input.Inspection.Spec.SuccessorProfileRevisionNumber+1,
+		input.Inspection.Spec.SuccessorProfile)
+	heads, err := f.repository.GatewayRebindRuntimeHeads(ctx)
+	if err != nil || len(heads) != 1 || !reflect.DeepEqual(next.Inspection.RuntimeHeads, heads) ||
+		heads[0].DeploymentID != head.DeploymentID || heads[0].Generation != head.Generation ||
+		next.Inspection.Roster[0].ServingDeploymentID != head.DeploymentID ||
+		next.Inspection.Roster[0].RouteGeneration != entry.RouteGeneration+1 ||
+		next.Inspection.Spec.Predecessor.SourceStateDigest != redeployed.Digest {
+		t.Fatalf("second approval did not bind the advanced route and complete runtime heads: %v", err)
+	}
+	second, err := f.manager.commitGatewayRebindWithDriver(ctx, f.repository, next,
+		gatewayRebindSequencePhysicalDriver(t, template.template, 2))
+	if err != nil || second.FinalPhase != appaccess.GatewayRebindCommitted || !second.FenceReleased {
+		t.Fatalf("commit after ordinary redeploy: %+v error=%v", second, err)
+	}
+	after, err := f.repository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || len(after.History) != 2 || !reflect.DeepEqual(after.History[0], before.History[0]) ||
+		!reflect.DeepEqual(after.History[1].RuntimeHeads, heads) || after.Active != nil {
+		t.Fatalf("rebind changed old history or lost approved runtime heads: %v", err)
+	}
+	resolved, err := f.repository.ResolveGatewayBinding(ctx, ref)
+	if err != nil || len(resolved.TransferChain) != 2 ||
+		!reflect.DeepEqual(resolved.TransferChain[0], original.TransferChain[0]) ||
+		resolved.TransferChain[1].PredecessorTransferDigest == nil ||
+		*resolved.TransferChain[1].PredecessorTransferDigest != original.TransferChainTipDigest ||
+		!reflect.DeepEqual(resolved.RawGrant, original.RawGrant) ||
+		!reflect.DeepEqual(resolved.RawProfile, original.RawProfile) ||
+		!reflect.DeepEqual(resolved.RawAllocation, original.RawAllocation) ||
+		!reflect.DeepEqual(resolved.RawAccessRevision, original.RawAccessRevision) {
+		t.Fatalf("redeploy/rebind changed immutable source or transfer chain: %v", err)
+	}
+	current, err := f.manager.selectGatewayCurrentLocked(ctx, after)
+	if err != nil || current.State == nil ||
+		!reflect.DeepEqual(current.State.Apps[entry.AppID].Route, redeployed.Apps[entry.AppID].Route) {
+		t.Fatalf("new current lost the redeployed route: %v", err)
+	}
+	gatewayRebindSequenceRequireRetainedFiles(t, f.manager, files)
+}
+
+// Create the usual job/deployment envelope, then exercise the real runtime
+// repository and public ingress Switch path. Docker start/health/publication
+// are simulated by fixture data and the explicitly injected physical driver.
+func gatewayRebindSequenceRedeploy(t *testing.T, f gatewayRebindPredecessorFixture,
+	state gatewayCurrentRouteState, entry appaccess.GatewayRebindRosterEntryV2,
+) generatedruntimestate.ActiveHead {
+	t.Helper()
+	ctx := context.Background()
+	release, err := gatewayRebindAcquireDeploymentEffects(ctx, f.manager.options.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := release(); err != nil {
+			t.Error(err)
+		}
+	}()
+	runtime := generatedruntimestate.New(f.db)
+	previous, err := runtime.Get(ctx, entry.AppID, entry.ServingDeploymentID)
+	if err != nil || len(previous.Components) != 1 {
+		t.Fatalf("previous runtime: %v", err)
+	}
+	for _, next := range []generatedruntimestate.Phase{generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded} {
+		previous, err = runtime.Advance(ctx, entry.AppID, previous.DeploymentID, previous.Phase, next, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	jobID, deploymentID := "85858585-8585-4585-8585-858585858585", "86868686-8686-4686-8686-868686868686"
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := f.db.ExecContext(ctx, `INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,created_at,updated_at)
+		VALUES(?,'deploy','application',?,'running','running',?,?,?)`, jobID, entry.AppID,
+		gatewayRebindTestAdministrator, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ExecContext(ctx, `INSERT INTO deployments(id,app_id,release_id,job_id,status,configuration_mode,
+		provenance_initialized,runtime_strategy,deployment_plan_revision_id,deployment_plan_revision_number)
+		VALUES(?,?,?,?,'preparing','current',1,'generated_node',?,?)`, deploymentID, entry.AppID, previous.ReleaseID, jobID,
+		previous.DeploymentPlanRevisionID, previous.DeploymentPlanRevisionNumber); err != nil {
+		t.Fatal(err)
+	}
+	value, created, err := runtime.Begin(ctx, generatedruntimestate.BeginInput{AppID: entry.AppID, DeploymentID: deploymentID,
+		ReleaseID: previous.ReleaseID, DeploymentPlanRevisionID: previous.DeploymentPlanRevisionID,
+		DeploymentPlanRevisionNumber: previous.DeploymentPlanRevisionNumber, ComponentNames: []string{"api"}})
+	if err != nil || !created {
+		t.Fatalf("begin redeploy: created=%t error=%v", created, err)
+	}
+	if _, err := runtime.SetImageReady(ctx, entry.AppID, deploymentID, "api", previous.Components[0].ImageArtifactID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.SetContainerStarting(ctx, entry.AppID, deploymentID, "api", "rig-rebind-api-green"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.SetContainerRunning(ctx, entry.AppID, deploymentID, "api", strings.Repeat("5", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.AdvanceComponent(ctx, entry.AppID, deploymentID, "api",
+		generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
+		t.Fatal(err)
+	}
+	for _, next := range []generatedruntimestate.Phase{generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate,
+		generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute} {
+		value, err = runtime.Advance(ctx, entry.AppID, deploymentID, value.Phase, next, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := routeOperationSwitchRequest(t, entry.AppID, state.Apps[entry.AppID].Route)
+	request.Endpoints = []generatedruntime.RouteEndpoint{endpoint("api", "server", "rebind-app-network", "rebind-app-green", 3000, '5')}
+	if err := f.manager.Switch(ctx, request); err != nil {
+		t.Fatalf("ordinary ingress switch: %v", err)
+	}
+	head, changed, err := runtime.SwitchActive(ctx, entry.AppID, deploymentID, entry.RouteGeneration)
+	if err != nil || !changed || head.Generation != entry.RouteGeneration+1 || head.Slot != string(request.ToSlot) {
+		t.Fatalf("runtime head switch: changed=%t error=%v", changed, err)
+	}
+	for _, next := range []generatedruntimestate.Phase{generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded} {
+		value, err = runtime.Advance(ctx, entry.AppID, deploymentID, value.Phase, next, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.db.ExecContext(ctx, `UPDATE deployments SET status='succeeded',finished_at=? WHERE id=?`, stamp, deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ExecContext(ctx, `UPDATE jobs SET status='succeeded',phase='completed',updated_at=?,finished_at=? WHERE id=?`,
+		stamp, stamp, jobID); err != nil {
+		t.Fatal(err)
+	}
+	return head
 }
 
 func gatewayRebindSequenceNextInput(t *testing.T, f gatewayRebindPredecessorFixture,
