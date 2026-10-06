@@ -19,16 +19,32 @@ type gatewayRebindRecoveryRejectTransitionRepository struct {
 	*appaccess.Repository
 }
 
+type gatewayRebindRecoverySnapshotDriftRepository struct {
+	*appaccess.Repository
+	drift bool
+}
+
 type gatewayRebindRecoveryChangedNoEffectDriver struct {
 	*gatewayRebindBoundedPhysicalDriver
 	changeObservation bool
-	afterProof        func()
+	afterProof        func(appaccess.GatewayRebindClaimV2, gatewayRebindPredecessorCheckpoint)
 }
 
 func (r *gatewayRebindRecoveryRejectTransitionRepository) ApplyGatewayRebindTransition(context.Context,
 	appaccess.GatewayRebindTransitionProof,
 ) (appaccess.GatewayRebindTransitionCommand, error) {
 	return appaccess.GatewayRebindTransitionCommand{}, errors.New("injected interruption before rollback SQL")
+}
+
+func (r *gatewayRebindRecoverySnapshotDriftRepository) GatewayRebindRecoverySnapshot(ctx context.Context,
+) (appaccess.GatewayRebindRecoverySnapshot, error) {
+	snapshot, err := r.Repository.GatewayRebindRecoverySnapshot(ctx)
+	if err == nil && r.drift && snapshot.CurrentSource != nil {
+		changed := *snapshot.CurrentSource
+		changed.ProfileSpecDigest = strings.Repeat("f", 64)
+		snapshot.CurrentSource = &changed
+	}
+	return snapshot, err
 }
 
 func (d *gatewayRebindRecoveryChangedNoEffectDriver) proveNoSuccessorEffectsLocked(ctx context.Context,
@@ -40,13 +56,53 @@ func (d *gatewayRebindRecoveryChangedNoEffectDriver) proveNoSuccessorEffectsLock
 		return gatewayRebindNoEffectAbortProof{}, err
 	}
 	if d.afterProof != nil {
-		d.afterProof()
+		d.afterProof(claim, checkpoint)
 	}
 	if d.changeObservation {
 		proof.ObservationDigest = strings.Repeat("8", 64)
 		proof.Digest, err = gatewayRebindNoEffectAbortProofDigest(proof)
 	}
 	return proof, err
+}
+
+func TestRecoverGatewayRebindStartupRefusesFirstNoEffectAbortAfterSnapshotDrift(t *testing.T) {
+	fixture, input, driver := newGatewayRebindCoordinatorFixture(t)
+	fixture.manager.gatewayRebindAfterClaim = func(context.Context, appaccess.GatewayRebindClaimV2) error {
+		return errors.New("injected crash after SQL prepared claim")
+	}
+	if _, err := fixture.manager.commitGatewayRebindWithDriver(context.Background(), fixture.repository,
+		input, driver); err == nil {
+		t.Fatal("post-claim interruption unexpectedly completed")
+	}
+	fresh := freshGatewayRebindRecoveryManager(fixture.manager)
+	fresh.gatewayRebindFailStop = &atomic.Bool{}
+	fresh.gatewayRebindCommitBarrier = &atomic.Bool{}
+	fresh.gatewayRebindV2NetworkObserver = func(context.Context,
+		appaccess.GatewayRebindClaimV2,
+	) (gatewayRebindSuccessorNetworkObservation, error) {
+		return gatewayRebindSuccessorNetworkObservation{}, errors.New("successor network unavailable after restart")
+	}
+	drifting := &gatewayRebindRecoverySnapshotDriftRepository{Repository: fixture.repository}
+	driftDriver := &gatewayRebindRecoveryChangedNoEffectDriver{
+		gatewayRebindBoundedPhysicalDriver: &gatewayRebindBoundedPhysicalDriver{t: t, template: driver.template},
+		afterProof: func(appaccess.GatewayRebindClaimV2, gatewayRebindPredecessorCheckpoint) {
+			drifting.drift = true
+		},
+	}
+	if result, err := fresh.recoverGatewayRebindStartupWithDriver(context.Background(), drifting,
+		driftDriver); err == nil || result != (GatewayRebindStartupRecoveryResult{}) {
+		t.Fatalf("first no-effect snapshot drift result=%#v error=%v", result, err)
+	}
+	snapshot, err := fixture.repository.GatewayRebindRecoverySnapshot(context.Background())
+	if err != nil || snapshot.Active == nil || snapshot.Phase != appaccess.GatewayRebindPrepared ||
+		fixture.repository.CheckGatewayRebindFence(context.Background()) == nil {
+		t.Fatalf("first no-effect snapshot drift released fence: %#v error=%v", snapshot, err)
+	}
+	history, err := fresh.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.TerminalsV2) != 0 {
+		t.Fatalf("first no-effect snapshot drift created terminal: terminals=%d error=%v",
+			len(history.TerminalsV2), err)
+	}
 }
 
 func (d *gatewayRebindRecoveryFailAttestationDriver) attestCommittedCurrentLocked(context.Context,
@@ -201,7 +257,7 @@ func TestRecoverGatewayRebindStartupReprovesRetainedNoEffectReceiptBeforeSQLRoll
 		fresh.gatewayRebindCommitBarrier = &atomic.Bool{}
 		driver := &gatewayRebindRecoveryChangedNoEffectDriver{
 			gatewayRebindBoundedPhysicalDriver: &gatewayRebindBoundedPhysicalDriver{t: t, template: template},
-			afterProof: func() {
+			afterProof: func(appaccess.GatewayRebindClaimV2, gatewayRebindPredecessorCheckpoint) {
 				if removeErr := os.Remove(terminalPath); removeErr != nil {
 					t.Fatalf("remove retained no-effect terminal after proof: %v", removeErr)
 				}
