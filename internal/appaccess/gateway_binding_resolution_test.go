@@ -2,6 +2,7 @@ package appaccess
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"reflect"
 	"strings"
@@ -30,6 +31,258 @@ func TestResolveNativeGatewayBindingFromCommittedUpgradeAuthority(t *testing.T) 
 		resolution.CurrentGatewaySource.ProfileSpecDigest != fixture.profile.SpecDigest {
 		t.Fatalf("native upgrade resolution=%#v", resolution)
 	}
+}
+
+func TestGrantStartupProjectsAuthorityOnlyForInFlightCurrentProfile(t *testing.T) {
+	testCases := []struct {
+		name        string
+		rebound     bool
+		state       AppAccessGrantState
+		wantCurrent bool
+	}{
+		{name: "native upgrade applying", state: AppAccessGrantApplying, wantCurrent: true},
+		{name: "rebind applying", rebound: true, state: AppAccessGrantApplying, wantCurrent: true},
+		{name: "rebind database active", rebound: true, state: AppAccessGrantDBActive, wantCurrent: true},
+		{name: "rebind uncertain", rebound: true, state: AppAccessGrantUncertain, wantCurrent: true},
+		{name: "rebind prepared remains raw only", rebound: true, state: AppAccessGrantPrepared},
+		{name: "rebind rolled back remains raw only", rebound: true, state: AppAccessGrantRolledBack},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture, profile, source := gatewayStartupAuthorityFixture(t, testCase.rebound)
+			claim := nativeGatewayGrantForStartup(t, fixture.repository, fixture.db, profile, testCase.state)
+			snapshot, err := fixture.repository.AppAccessGrantStartupSnapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var found *AppAccessGrantStartupClaim
+			for index := range snapshot.Claims {
+				if snapshot.Claims[index].Claim.AttemptID == claim.AttemptID {
+					found = &snapshot.Claims[index]
+					break
+				}
+			}
+			if found == nil || found.Profile != profile || found.EffectiveProfile != profile ||
+				len(found.TransferChain) != 0 || found.TransferChainTipDigest != "" ||
+				found.RetainedEffectiveProfile.ID != "" || found.RetainedGatewaySource.Kind != "" ||
+				len(found.RetainedTransferChain) != 0 || found.RetainedTransferChainTipDigest != "" ||
+				found.RetainedTerminalReceiptDigest != "" {
+				t.Fatalf("startup claim=%#v", found)
+			}
+			if testCase.wantCurrent {
+				if found.CurrentGatewaySource != source ||
+					found.TerminalReceiptDigest != source.TerminalReceiptDigest || !found.ProfileHeadCurrent {
+					t.Fatalf("current startup claim=%#v want source=%#v", found, source)
+				}
+			} else if found.CurrentGatewaySource.Kind != "" || found.TerminalReceiptDigest != "" {
+				t.Fatalf("raw-only startup claim=%#v", found)
+			}
+		})
+	}
+}
+
+func TestNoSourceDisableStartupProjectsAuthorityOnlyWhileInFlight(t *testing.T) {
+	testCases := []struct {
+		name        string
+		rebound     bool
+		state       AppAccessDisableState
+		wantCurrent bool
+	}{
+		{name: "native upgrade withdrawing", state: AppAccessDisableWithdrawing, wantCurrent: true},
+		{name: "rebind withdrawing", rebound: true, state: AppAccessDisableWithdrawing, wantCurrent: true},
+		{name: "rebind uncertain", rebound: true, state: AppAccessDisableUncertain, wantCurrent: true},
+		{name: "rebind prepared remains raw only", rebound: true, state: AppAccessDisablePrepared},
+		{name: "rebind committed remains raw only", rebound: true, state: AppAccessDisableCommitted},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture, profile, source := gatewayStartupAuthorityFixture(t, testCase.rebound)
+			claim := noSourceGatewayDisableForStartup(t, fixture.repository, fixture.db, profile, testCase.state)
+			snapshot, err := fixture.repository.AppAccessDisableStartupSnapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var found *AppAccessDisableStartupClaim
+			for index := range snapshot.Claims {
+				if snapshot.Claims[index].Claim.OperationID == claim.OperationID {
+					found = &snapshot.Claims[index]
+					break
+				}
+			}
+			if found == nil || found.SourceGrant != nil || found.Profile != profile ||
+				found.EffectiveProfile != profile || len(found.TransferChain) != 0 ||
+				found.TransferChainTipDigest != "" || found.RetainedEffectiveProfile.ID != "" ||
+				found.RetainedGatewaySource.Kind != "" || len(found.RetainedTransferChain) != 0 ||
+				found.RetainedTransferChainTipDigest != "" || found.RetainedTerminalReceiptDigest != "" {
+				t.Fatalf("disable startup claim=%#v", found)
+			}
+			if testCase.wantCurrent {
+				if found.CurrentGatewaySource != source ||
+					found.TerminalReceiptDigest != source.TerminalReceiptDigest || !found.ProfileHeadCurrent {
+					t.Fatalf("current disable startup claim=%#v want source=%#v", found, source)
+				}
+			} else if found.CurrentGatewaySource.Kind != "" || found.TerminalReceiptDigest != "" {
+				t.Fatalf("raw-only disable startup claim=%#v", found)
+			}
+		})
+	}
+}
+
+func TestInFlightStartupDoesNotFabricateAuthorityFromConfiguredProfile(t *testing.T) {
+	t.Run("grant", func(t *testing.T) {
+		db := appAccessDB(t)
+		repository := testRepository(db)
+		profile, _, err := repository.ConfigureGatewayProfile(context.Background(), approvedGatewayInput(t,
+			GatewayProfileSpec{SelectedIPv4: "192.168.93.8", InterfaceID: "configured-only-grant",
+				PortStart: 8100, PortEnd: 8119}, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim := nativeGatewayGrantForStartup(t, repository, db, profile, AppAccessGrantApplying)
+		snapshot, err := repository.AppAccessGrantStartupSnapshot(context.Background())
+		if err != nil || len(snapshot.Claims) != 1 || snapshot.Claims[0].Claim.AttemptID != claim.AttemptID ||
+			snapshot.Claims[0].EffectiveProfile != profile || snapshot.Claims[0].CurrentGatewaySource.Kind != "" ||
+			snapshot.Claims[0].TerminalReceiptDigest != "" {
+			t.Fatalf("configured-only grant snapshot=%#v error=%v", snapshot, err)
+		}
+	})
+
+	t.Run("disable", func(t *testing.T) {
+		db := appAccessDB(t)
+		repository := testRepository(db)
+		profile, _, err := repository.ConfigureGatewayProfile(context.Background(), approvedGatewayInput(t,
+			GatewayProfileSpec{SelectedIPv4: "192.168.93.9", InterfaceID: "configured-only-disable",
+				PortStart: 8100, PortEnd: 8119}, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim := noSourceGatewayDisableForStartup(t, repository, db, profile, AppAccessDisableWithdrawing)
+		snapshot, err := repository.AppAccessDisableStartupSnapshot(context.Background())
+		if err != nil || len(snapshot.Claims) != 1 || snapshot.Claims[0].Claim.OperationID != claim.OperationID ||
+			snapshot.Claims[0].EffectiveProfile != profile || snapshot.Claims[0].CurrentGatewaySource.Kind != "" ||
+			snapshot.Claims[0].TerminalReceiptDigest != "" {
+			t.Fatalf("configured-only disable snapshot=%#v error=%v", snapshot, err)
+		}
+	})
+}
+
+func gatewayStartupAuthorityFixture(t *testing.T, rebound bool,
+) (gatewayRebindFixture, GatewayProfileRevision, GatewayCurrentAuthorityRef) {
+	t.Helper()
+	var fixture gatewayRebindFixture
+	if rebound {
+		fixture = newGatewayRebindFixture(t, true)
+		commitGatewayRebindFixture(t, fixture, strings.Repeat("7", 64))
+	} else {
+		fixture = newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+	}
+	snapshot, err := fixture.repository.GatewayRebindRecoverySnapshot(context.Background())
+	if err != nil || snapshot.CurrentProfile == nil || snapshot.CurrentSource == nil {
+		t.Fatalf("current snapshot=%#v error=%v", snapshot, err)
+	}
+	return fixture, *snapshot.CurrentProfile, *snapshot.CurrentSource
+}
+
+func nativeGatewayGrantForStartup(t *testing.T, repository *Repository, db *sql.DB,
+	profile GatewayProfileRevision, state AppAccessGrantState,
+) AppAccessGrantClaim {
+	t.Helper()
+	appID := addApps(t, db, 1)[0]
+	allocation, _, err := repository.ReserveAppAccess(context.Background(), ReserveAppAccessInput{
+		AppID: appID, OperationID: uuid.NewString(), ExpectedRevisionNumber: 0,
+		GatewayProfileRevisionID: profile.ID, GatewayProfileRevisionNumber: profile.RevisionNumber,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, _, err := repository.ApproveAppAccess(context.Background(), approvedAccessInput(t, allocation, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, _, err := repository.ClaimAppAccessGrant(context.Background(), ClaimAppAccessGrantInput{
+		AttemptID: uuid.NewString(), Spec: AppAccessGrantSpecFor(revision, profile), ActorID: testAdministrator,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := AppAccessGrantClaimOwnerFor(claim)
+	if state == AppAccessGrantPrepared {
+		return claim
+	}
+	if state == AppAccessGrantRolledBack {
+		claim, _, err = repository.ResolveAppAccessGrantClaim(context.Background(), owner,
+			AppAccessGrantPrepared, AppAccessGrantRolledBack, AppAccessGrantProof{
+				GatewayOperationID: uuid.NewString(), ProtectedStateDigest: strings.Repeat("a", 64),
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return claim
+	}
+	claim, _, err = repository.AdvanceAppAccessGrantClaim(context.Background(), owner,
+		AppAccessGrantPrepared, AppAccessGrantApplying)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == AppAccessGrantApplying {
+		return claim
+	}
+	claim, _, err = repository.AdvanceAppAccessGrantClaim(context.Background(), owner,
+		AppAccessGrantApplying, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return claim
+}
+
+func noSourceGatewayDisableForStartup(t *testing.T, repository *Repository, db *sql.DB,
+	profile GatewayProfileRevision, state AppAccessDisableState,
+) AppAccessDisableClaim {
+	t.Helper()
+	appID := addApps(t, db, 1)[0]
+	allocation, _, err := repository.ReserveAppAccess(context.Background(), ReserveAppAccessInput{
+		AppID: appID, OperationID: uuid.NewString(), ExpectedRevisionNumber: 0,
+		GatewayProfileRevisionID: profile.ID, GatewayProfileRevisionNumber: profile.RevisionNumber,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, _, err := repository.ApproveAppAccess(context.Background(), approvedAccessInput(t, allocation, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, _, err := repository.ClaimAppAccessDisable(context.Background(), approvedDisableInput(t, revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.SourceGrantAttemptID != "" {
+		t.Fatalf("disable unexpectedly linked source grant %s", claim.SourceGrantAttemptID)
+	}
+	if state == AppAccessDisablePrepared {
+		return claim
+	}
+	owner := AppAccessDisableClaimOwnerFor(claim)
+	claim, _, err = repository.AdvanceAppAccessDisableClaim(context.Background(), owner,
+		AppAccessDisablePrepared, AppAccessDisableWithdrawing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == AppAccessDisableWithdrawing {
+		return claim
+	}
+	if state == AppAccessDisableUncertain {
+		claim, _, err = repository.AdvanceAppAccessDisableClaim(context.Background(), owner,
+			AppAccessDisableWithdrawing, AppAccessDisableUncertain)
+	} else {
+		claim, _, err = repository.ResolveAppAccessDisableClaim(context.Background(), owner,
+			AppAccessDisableWithdrawing, AppAccessDisableCommitted, AppAccessDisableProof{
+				GatewayOperationID: uuid.NewString(), ProtectedStateDigest: strings.Repeat("b", 64),
+			})
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return claim
 }
 
 func TestResolveGatewayBindingSeparatesRawAndEffectiveProfiles(t *testing.T) {
