@@ -168,12 +168,72 @@ func (m *Manager) revalidateGatewayCurrentOwnedStopTargetLocked(
 // rather than selecting SQL current from protected history. Missing/corrupt
 // bundles, duplicate final IDs, and conflicting ownership fail closed.
 func (m *Manager) gatewayCurrentOwnedStopTargetsProtectedLocked() ([]gatewayCurrentOwnedStopTarget, error) {
+	targets, _, err := m.gatewayCurrentOwnedStopTargetsProtectedPartialLocked()
+	if err != nil {
+		return nil, err
+	}
+	return targets, nil
+}
+
+type gatewayCurrentOwnedStopHistoryCensus struct {
+	ProtectedRebindHistory bool
+	UnresolvedAttempt      bool
+	CommittedOwnership     bool
+}
+
+// gatewayCurrentOwnedStopTargetsProtectedPartialLocked retains independently
+// proved targets when another committed generation has a missing, corrupt, or
+// ambiguous route bundle. Its caller may withdraw those exact IDs but must
+// preserve the returned error and keep startup failed: partial withdrawal is
+// never evidence that all owned traffic is absent.
+func (m *Manager) gatewayCurrentOwnedStopTargetsProtectedPartialLocked() (
+	[]gatewayCurrentOwnedStopTarget, gatewayCurrentOwnedStopHistoryCensus, error,
+) {
 	if m == nil {
-		return nil, errors.New("invalid current owned-stop manager")
+		return nil, gatewayCurrentOwnedStopHistoryCensus{}, errors.New("invalid current owned-stop manager")
+	}
+	presence, err := readGatewayRebindProtectedPresenceReadOnly(m.options.DataRoot)
+	if err != nil {
+		return nil, gatewayCurrentOwnedStopHistoryCensus{}, err
 	}
 	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	if err != nil {
-		return nil, err
+		return nil, gatewayCurrentOwnedStopHistoryCensus{ProtectedRebindHistory: presence.present}, err
+	}
+	census := gatewayCurrentOwnedStopHistoryCensus{ProtectedRebindHistory: presence.present}
+	attempts := make(map[uint64]struct{})
+	terminals := make(map[uint64]struct{})
+	for _, selected := range history.Checkpoints {
+		attempts[selected.Generation] = struct{}{}
+	}
+	for _, selected := range history.Intents {
+		attempts[selected.Generation] = struct{}{}
+	}
+	for _, selected := range history.IntentsV2 {
+		attempts[selected.Generation] = struct{}{}
+	}
+	for _, selected := range history.Progress {
+		attempts[selected.Generation] = struct{}{}
+	}
+	for _, selected := range history.Terminals {
+		attempts[selected.Generation] = struct{}{}
+		terminals[selected.Generation] = struct{}{}
+	}
+	for _, selected := range history.TerminalsV2 {
+		attempts[selected.Generation] = struct{}{}
+		terminals[selected.Generation] = struct{}{}
+	}
+	// A scoped current-route bundle with no retained attempt is itself
+	// unresolved protected rebind evidence. It can never authorize native-only
+	// fallback or name-based cleanup.
+	if census.ProtectedRebindHistory && len(attempts) == 0 {
+		census.UnresolvedAttempt = true
+	}
+	for generation := range attempts {
+		if _, terminal := terminals[generation]; !terminal {
+			census.UnresolvedAttempt = true
+			break
+		}
 	}
 	lineages := make([]appaccess.GatewayCurrentLineageRef, 0, len(history.Terminals)+len(history.TerminalsV2))
 	for _, retained := range history.Terminals {
@@ -188,6 +248,7 @@ func (m *Manager) gatewayCurrentOwnedStopTargetsProtectedLocked() ([]gatewayCurr
 			lineages = append(lineages, lineage)
 		}
 	}
+	census.CommittedOwnership = len(lineages) != 0
 	sort.Slice(lineages, func(i, j int) bool {
 		if lineages[i].ProtectedGeneration != lineages[j].ProtectedGeneration {
 			return lineages[i].ProtectedGeneration < lineages[j].ProtectedGeneration
@@ -195,30 +256,42 @@ func (m *Manager) gatewayCurrentOwnedStopTargetsProtectedLocked() ([]gatewayCurr
 		return lineages[i].OperationID < lineages[j].OperationID
 	})
 	result := make([]gatewayCurrentOwnedStopTarget, 0, len(lineages))
-	containers := make(map[string]struct{}, len(lineages))
+	var failures []error
 	for _, lineage := range lineages {
 		store, storeErr := newGatewayCurrentRouteStateStore(m.options.DataRoot, lineage)
 		if storeErr != nil {
-			return nil, storeErr
+			failures = append(failures, storeErr)
+			continue
 		}
 		if _, statErr := os.Lstat(store.path); statErr != nil {
-			return nil, errors.New("current owned-stop route bundle is missing or unreadable")
+			failures = append(failures, errors.New("current owned-stop route bundle is missing or unreadable"))
+			continue
 		}
 		state, loadErr := store.load()
 		if loadErr != nil {
-			return nil, errors.New("current owned-stop route bundle is corrupt")
+			failures = append(failures, errors.New("current owned-stop route bundle is corrupt"))
+			continue
 		}
 		target, targetErr := m.gatewayCurrentOwnedStopTargetForStateLocked(state)
 		if targetErr != nil {
-			return nil, targetErr
+			failures = append(failures, targetErr)
+			continue
 		}
-		if _, duplicate := containers[target.FinalContainer.ID]; duplicate {
-			return nil, errors.New("current owned-stop container ownership is ambiguous")
-		}
-		containers[target.FinalContainer.ID] = struct{}{}
 		result = append(result, target)
 	}
-	return result, nil
+	counts := make(map[string]int, len(result))
+	for _, target := range result {
+		counts[target.FinalContainer.ID]++
+	}
+	unique := result[:0]
+	for _, target := range result {
+		if counts[target.FinalContainer.ID] != 1 {
+			failures = append(failures, errors.New("current owned-stop container ownership is ambiguous"))
+			continue
+		}
+		unique = append(unique, target)
+	}
+	return unique, census, errors.Join(failures...)
 }
 
 func cloneGatewayCurrentPhysicalTransition(value gatewayCurrentPhysicalTransition) gatewayCurrentPhysicalTransition {
