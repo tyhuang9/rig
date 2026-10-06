@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync/atomic"
 	"testing"
 
 	"github.com/hostd/hostd/internal/appaccess"
@@ -70,6 +71,7 @@ func TestGatewayCurrentNativeEmergencyPreservesCorruptRouteWithdrawal(t *testing
 	for _, route := range []string{"source", "native v2"} {
 		t.Run(route, func(t *testing.T) {
 			manager, store, _, _, _, driver := gatewayV2LANGrantFixture(t)
+			manager.gatewayRebindFailStop = &atomic.Bool{}
 			path, purpose := store.v2Path, store.v2Purpose
 			if route == "source" {
 				path, purpose = manager.store.path, statePurpose
@@ -106,6 +108,7 @@ func (d gatewayCurrentNativeEmergencyAfterStopDriver) stopOwnedGateway(ctx conte
 
 func TestGatewayCurrentNativeEmergencyRefusesHistoryChangeAfterStop(t *testing.T) {
 	manager, _, _, _, _, driver := gatewayV2LANGrantFixture(t)
+	manager.gatewayRebindFailStop = &atomic.Bool{}
 	manager.gatewayV2LANGrantDriver = gatewayCurrentNativeEmergencyAfterStopDriver{
 		fakeGatewayV2LANGrantDriver: driver, after: func() {
 			if err := os.WriteFile(filepath.Join(manager.store.root, "unexplained.bundle"), []byte("unknown"), 0600); err != nil {
@@ -115,5 +118,67 @@ func TestGatewayCurrentNativeEmergencyRefusesHistoryChangeAfterStop(t *testing.T
 	if err := manager.stopOwnedGatewayV2OnStartupFailure(context.Background()); err == nil || !driver.gatewayStopped ||
 		!manager.gatewayRebindAdmissionBlocked() {
 		t.Fatal("late unknown history accepted as complete native withdrawal")
+	}
+}
+
+func TestGatewayCurrentNativeEmergencyCrossesExistingFailStopOnlyToWithdraw(t *testing.T) {
+	manager, _, _, _, _, driver := gatewayV2LANGrantFixture(t)
+	manager.gatewayRebindFailStop = &atomic.Bool{}
+	manager.gatewayRebindCommitBarrier = &atomic.Bool{}
+	manager.gatewayRebindFailStop.Store(true)
+	manager.gatewayRebindCommitBarrier.Store(true)
+	if err := manager.stopOwnedGatewayV2OnStartupFailure(context.Background()); err != nil || !driver.gatewayStopped ||
+		!manager.gatewayRebindFailStop.Load() || !manager.gatewayRebindCommitBarrier.Load() {
+		t.Fatalf("existing latch blocked withdrawal or foreign barrier changed: stopped=%t err=%v", driver.gatewayStopped, err)
+	}
+	if release, err := manager.lockGateway(context.Background()); err == nil || release != nil {
+		t.Fatal("emergency withdrawal allowed ordinary admission to resume")
+	}
+}
+
+func TestGatewayCurrentNativeEmergencyWaitsForActualEffectsLease(t *testing.T) {
+	manager, _, _, _, _, driver := gatewayV2LANGrantFixture(t)
+	manager.gatewayRebindFailStop = &atomic.Bool{}
+	realAcquire := gatewayRebindAcquireDeploymentEffects
+	release, err := realAcquire(context.Background(), manager.options.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	attempted := make(chan struct{}, 1)
+	gatewayRebindAcquireDeploymentEffects = func(ctx context.Context, directory string) (func() error, error) {
+		attempted <- struct{}{}
+		return realAcquire(ctx, directory)
+	}
+	t.Cleanup(func() { gatewayRebindAcquireDeploymentEffects = realAcquire })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- manager.stopOwnedGatewayV2OnStartupFailure(ctx) }()
+	select {
+	case <-attempted:
+		cancel()
+		if err := <-done; err == nil || len(driver.events) != 0 {
+			t.Fatal("contended effects lease allowed native withdrawal")
+		}
+	case err := <-done:
+		t.Fatalf("native emergency bypassed the held deployment effects lease: err=%v", err)
+	}
+}
+
+func TestGatewayCurrentNativeEmergencyReleaseFailureRetainsAdmissionLatch(t *testing.T) {
+	manager, _, _, _, _, driver := gatewayV2LANGrantFixture(t)
+	manager.gatewayRebindFailStop = &atomic.Bool{}
+	manager.gatewayRebindCommitBarrier = &atomic.Bool{}
+	manager.gatewayRebindCommitBarrier.Store(true)
+	acquire := gatewayRebindAcquireDeploymentEffects
+	released := false
+	gatewayRebindAcquireDeploymentEffects = func(context.Context, string) (func() error, error) {
+		return func() error { released = true; return errors.New("release acknowledgment unavailable") }, nil
+	}
+	t.Cleanup(func() { gatewayRebindAcquireDeploymentEffects = acquire })
+	if err := manager.stopOwnedGatewayV2OnStartupFailure(context.Background()); err == nil || !driver.gatewayStopped ||
+		!released || !manager.gatewayRebindFailStop.Load() || !manager.gatewayRebindCommitBarrier.Load() {
+		t.Fatalf("native emergency release failure escaped: stopped=%t released=%t err=%v", driver.gatewayStopped, released, err)
 	}
 }

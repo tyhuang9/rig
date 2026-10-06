@@ -319,6 +319,9 @@ func (m *Manager) QuarantineGatewayV2LANStartup(ctx context.Context, claims []Ga
 // normal startup and require explicit recovery.
 // It intentionally constructs no generally usable Manager: the only operation
 // available through this entry point is the journal-bound exact-owned stop.
+// It owns deployment-effects admission and the gateway locks, may cross an
+// existing fail-stop only to withdraw, and retains admission failure afterwards.
+// The caller must release any held startup/worker effects lease first.
 func StopOwnedGatewayV2OnStartupFailure(ctx context.Context, runner runtimeprocess.CommandRunner,
 	options Options,
 ) error {
@@ -335,11 +338,20 @@ func (m *Manager) stopOwnedGatewayV2OnStartupFailure(ctx context.Context) (resul
 	}
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
-	release, err := m.lockGatewayRaw(lockCtx)
+	releaseEffects, err := gatewayRebindAcquireDeploymentEffects(lockCtx, m.options.WorkingDirectory)
 	if err != nil {
+		return gatewayRebindEffectBoundaryError(ctx)
+	}
+	releaseGateway, err := m.lockGatewayRawForOwnedStop(lockCtx)
+	if err != nil {
+		if releaseEffects() != nil {
+			m.gatewayRebindFailStopLatch().Store(true)
+		}
 		return err
 	}
-	defer releaseGatewayLock(release, &resultErr)
+	defer func() {
+		resultErr = m.releaseGatewayCurrentEmergencyLocks(releaseEffects, releaseGateway, resultErr)
+	}()
 	if ctx.Err() != nil {
 		return &Error{Code: DiagnosticCancelled}
 	}
@@ -353,6 +365,7 @@ func (m *Manager) stopOwnedGatewayV2OnStartupFailure(ctx context.Context) (resul
 	if driver == nil {
 		driver = managerGatewayV2LANGrantDriver{manager: m}
 	}
+	m.gatewayRebindFailStopLatch().Store(true)
 	if err := driver.stopOwnedGateway(recoveryCtx, journal); err != nil {
 		return gatewayV2StartupInspectionError(recoveryCtx)
 	}

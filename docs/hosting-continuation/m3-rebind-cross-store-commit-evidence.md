@@ -2258,3 +2258,30 @@ The Windows run skipped the POSIX directory-permission test and two symlink
 subcases; those remain required in the Linux gate. Gofmt and `git diff --check`
 passed. The native fallback now has real retained typed history acceptance,
 while its physical stop remains simulated.
+
+Independent review of `c828fd5` plus `eba4e29` passed seven tests and sixteen
+subcases, zero failures/skips (ingress 42.161s; hostd 0.753s;
+`Rig/temp/cross-store-review-eba-emergency.jsonl`). The typed/native selection
+behavior passed, but source review held completion for the native emergency
+effect boundary: it still lacked its own deployment effects lease and used a
+lock that rejects an existing process fail-stop.
+
+Two positive-first boundary tests reproduced both defects in 1.280s
+(`Rig/temp/m3-native-emergency-effects-boundary-red.jsonl`): a preexisting latch
+prevented withdrawal, and a native stop bypassed an actually held effects lease.
+The native emergency API now owns that lease before its gateway locks, uses the
+withdrawal-only lock path, latches ordinary admission before stop, and retains
+foreign commit barriers and all release errors. Callers must release their own
+startup effects admission first. Existing ordinary/serving locks remain strict.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^Test(GatewayCurrentNativeEmergency(CrossesExistingFailStopOnlyToWithdraw|WaitsForActualEffectsLease|ReleaseFailureRetainsAdmissionLatch)|GatewayV2EmergencyStopConstructionBypassesUnavailableDatabaseFenceOnlyForExactOwnedStop|GatewayV2LANStartupFailureStopsOnlyJournalBoundGatewayWithoutReadingRouteState)$'
+```
+
+All five tests passed in 1.974s, zero failures/skips
+(`Rig/temp/m3-native-emergency-effects-boundary-green.jsonl`), including actual
+lease contention, existing latch/foreign barrier preservation, release failure,
+the exported command-runner stop and corrupt native route-state withdrawal.
+Fixtures isolate intentional process latching so it cannot contaminate later
+tests. Vet, the full Go build, gofmt and `git diff --check` passed. Actual Docker
+and Linux race acceptance remain pending.
