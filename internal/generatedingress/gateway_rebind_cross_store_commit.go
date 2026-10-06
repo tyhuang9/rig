@@ -201,6 +201,18 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 	if err != nil || !validSHA256(attestation) {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
+	// Physical proof is only evidence for the exact state that was observed.
+	// Re-read both stores before releasing the SQL fence so an ordinary current
+	// route write cannot be acknowledged by a stale local attestation.
+	freshSnapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || !reflect.DeepEqual(snapshot, freshSnapshot) {
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	freshSelection, err := m.selectGatewayCurrentLocked(ctx, freshSnapshot)
+	if err != nil || !sameGatewayCurrentSelection(selection, freshSelection) {
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	snapshot = freshSnapshot
 	if !m.gatewayRebindCommitBarrierLatch().CompareAndSwap(false, true) {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
@@ -217,6 +229,11 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 	confirmed, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || confirmed.Active != nil || confirmed.CurrentSource == nil ||
 		*confirmed.CurrentSource != gatewayCurrentAuthority(baseline.Lineage) {
+		m.gatewayRebindFailStopLatch().Store(true)
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	confirmedSelection, selectErr := m.selectGatewayCurrentLocked(ctx, confirmed)
+	if selectErr != nil || !sameGatewayCurrentSelection(selection, confirmedSelection) {
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}

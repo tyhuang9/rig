@@ -472,6 +472,50 @@ func TestGatewayCurrentPhysicalAttestationBindsPendingOutcomeState(t *testing.T)
 	}
 }
 
+func TestGatewayCurrentPhysicalAttestationRejectsRehashedLegacyTerminalSummary(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	terminal, err := newGatewayRebindAttemptTerminalViewLegacy(fixture.receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical := gatewayCurrentPhysicalAttestationFixture(t, fixture.baseline, terminal,
+		gatewayCurrentPhysicalStableServing)
+	driver := &gatewayCurrentPhysicalDriverFake{attest: physical}
+	fixture.manager.gatewayCurrentPhysicalDriver = driver
+	selection := gatewayCurrentSelection{Kind: gatewayCurrentSelectionRebind, Lineage: fixture.baseline.Lineage,
+		Receipt: &fixture.receipt, State: &fixture.baseline}
+	if _, err := fixture.manager.attestGatewayCurrentPhysicalLocked(context.Background(), selection); err != nil {
+		t.Fatalf("exact terminal rejected: %v", err)
+	}
+	changed := terminal
+	changed.Resources = terminal.Resources
+	final := *terminal.Resources.FinalContainer
+	final.ID = strings.Repeat("a", 64)
+	if final.ID == terminal.Resources.FinalContainer.ID {
+		final.ID = strings.Repeat("b", 64)
+	}
+	changed.Resources.FinalContainer = &final
+	changed.Resources.Digest, err = gatewayRebindFinalHandoverResourcesDigest(changed.Resources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical.Terminal = changed
+	physical.Resources = changed.Resources
+	physical.Runtime.ContainerID = final.ID
+	physical.Runtime.Digest, err = gatewayCurrentRuntimeProofDigest(physical.Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical.Digest, err = gatewayCurrentPhysicalAttestationDigest(physical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver.attest = physical
+	if _, err := fixture.manager.attestGatewayCurrentPhysicalLocked(context.Background(), selection); err == nil {
+		t.Fatal("rehashed legacy terminal summary was accepted")
+	}
+}
+
 func TestGatewayCurrentWithdrawalRecoveryBatchBindsExactRawGrant(t *testing.T) {
 	fixture := newGatewayCurrentStateFixture(t)
 	state := cloneGatewayCurrentRouteState(fixture.baseline)

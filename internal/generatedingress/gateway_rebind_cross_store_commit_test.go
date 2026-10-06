@@ -19,6 +19,7 @@ type gatewayRebindBoundedPhysicalDriver struct {
 	commitCalls int
 	abortCalls  int
 	attestCalls int
+	onAttest    func(gatewayCurrentSelection)
 }
 
 type gatewayRebindLostAckRepository struct {
@@ -162,6 +163,9 @@ func (d *gatewayRebindBoundedPhysicalDriver) attestCommittedCurrentLocked(_ cont
 	if selection.State == nil || selection.Terminal == nil {
 		return "", errors.New("missing selected typed current")
 	}
+	if d.onAttest != nil {
+		d.onAttest(selection)
+	}
 	return canonicalDigest(struct {
 		Purpose string                   `json:"purpose"`
 		State   gatewayCurrentRouteState `json:"state"`
@@ -260,6 +264,32 @@ func TestGatewayRebindCoordinatorCommitsRealSQLAndProtectedBaseline(t *testing.T
 	if err != nil || selection.Terminal == nil || selection.Terminal.TypedReceipt == nil || selection.State == nil ||
 		selection.State.Revision != 1 || len(selection.State.Apps) < len(input.Inspection.Roster) {
 		t.Fatalf("committed typed current selection: %#v error=%v", selection, err)
+	}
+}
+
+func TestGatewayRebindCoordinatorRejectsCurrentStateDriftAfterAttestation(t *testing.T) {
+	f, input, driver := newGatewayRebindCoordinatorFixture(t)
+	driver.onAttest = func(selection gatewayCurrentSelection) {
+		if selection.State == nil || selection.Store == nil {
+			t.Fatal("attestation selection has no current state store")
+		}
+		next := cloneGatewayCurrentRouteState(*selection.State)
+		next.Revision++
+		var err error
+		next.Digest, err = gatewayCurrentRouteStateDigest(next)
+		if err != nil || selection.Store.saveNext(*selection.State, next) != nil {
+			t.Fatalf("advance current state after attestation: %v", err)
+		}
+	}
+	if result, err := f.manager.commitGatewayRebindWithDriver(context.Background(), f.repository, input, driver); err == nil {
+		t.Fatalf("current state drift released fence: %#v", result)
+	}
+	snapshot, err := f.repository.GatewayRebindRecoverySnapshot(context.Background())
+	if err != nil || snapshot.Active == nil || snapshot.Phase != appaccess.GatewayRebindDatabaseCommitted {
+		t.Fatalf("state drift did not retain database-committed fence: %#v error=%v", snapshot, err)
+	}
+	if err := f.repository.CheckGatewayRebindFence(context.Background()); err == nil {
+		t.Fatal("state drift unexpectedly released SQL fence")
 	}
 }
 

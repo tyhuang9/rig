@@ -39,6 +39,7 @@ type gatewayRebindProtectedIntentV2 struct {
 
 type gatewayRebindProtectedIntentV2Store struct {
 	directory   *stateStore
+	dataRoot    string
 	generation  uint64
 	operationID string
 	path        string
@@ -256,7 +257,7 @@ func newGatewayRebindProtectedIntentV2Store(dataRoot string, generation uint64,
 		return nil, err
 	}
 	name, purpose := gatewayRebindProtectedIntentV2Name(generation, operationID)
-	return &gatewayRebindProtectedIntentV2Store{directory: directory, generation: generation,
+	return &gatewayRebindProtectedIntentV2Store{directory: directory, dataRoot: dataRoot, generation: generation,
 		operationID: operationID, path: filepath.Join(directory.root, name), purpose: purpose}, nil
 }
 
@@ -272,6 +273,17 @@ func (s *gatewayRebindProtectedIntentV2Store) installExact(value gatewayRebindPr
 		!validGatewayRebindProtectedIntentV2(value) {
 		return errors.New("invalid generated ingress typed rebind protected intent install")
 	}
+	if installed, err := s.load(); err == nil {
+		if installed.Digest == value.Digest {
+			return nil
+		}
+		return errors.New("generated ingress typed rebind protected intent conflicts")
+	}
+	manager := &Manager{store: s.directory, options: Options{DataRoot: s.dataRoot}}
+	history, err := manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || gatewayRebindHistoryHasTerminalDecision(history, value.Generation, value.OperationID) {
+		return errors.New("generated ingress typed rebind protected intent follows a terminal decision")
+	}
 	state := gatewayUpgradeStateStore{directory: s.directory}
 	if err := state.writeExact(s.path, s.purpose, value, true, maxGatewayRebindProtectedIntentBytes); err != nil {
 		return err
@@ -285,6 +297,22 @@ func (s *gatewayRebindProtectedIntentV2Store) installExact(value gatewayRebindPr
 			err, installed.Digest, value.Digest)
 	}
 	return nil
+}
+
+func gatewayRebindHistoryHasTerminalDecision(history gatewayRebindProtectedIntentHistory,
+	generation uint64, operationID string,
+) bool {
+	for _, terminal := range history.Terminals {
+		if terminal.Generation == generation || terminal.Receipt.OperationID == operationID {
+			return true
+		}
+	}
+	for _, terminal := range history.TerminalsV2 {
+		if terminal.Generation == generation || terminal.Receipt.OperationID == operationID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *gatewayRebindProtectedIntentV2Store) load() (gatewayRebindProtectedIntentV2, error) {

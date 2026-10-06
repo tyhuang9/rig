@@ -268,15 +268,24 @@ func gatewayRebindAttemptTerminalMatchesLineage(terminal gatewayRebindAttemptTer
 		return false
 	}
 	var receiptLineage appaccess.GatewayCurrentLineageRef
+	var canonical gatewayRebindAttemptTerminalView
 	var err error
 	switch terminal.Format {
 	case gatewayRebindAttemptTerminalLegacyV1:
 		if terminal.LegacyReceipt == nil || terminal.TypedReceipt != nil {
 			return false
 		}
+		canonical, err = newGatewayRebindAttemptTerminalViewLegacy(*terminal.LegacyReceipt)
+		if err != nil || !reflect.DeepEqual(terminal, canonical) {
+			return false
+		}
 		receiptLineage, err = gatewayRebindCurrentLineage(*terminal.LegacyReceipt)
 	case gatewayRebindAttemptTerminalTypedV2:
 		if terminal.TypedReceipt == nil || terminal.LegacyReceipt != nil {
+			return false
+		}
+		canonical, err = newGatewayRebindAttemptTerminalViewV2(*terminal.TypedReceipt)
+		if err != nil || !reflect.DeepEqual(terminal, canonical) {
 			return false
 		}
 		receiptLineage, err = gatewayRebindCurrentLineageV2(*terminal.TypedReceipt)

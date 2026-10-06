@@ -202,7 +202,7 @@ func (m *Manager) attestGatewayCurrentPhysicalLocked(ctx context.Context,
 	}
 	value, err := m.currentPhysicalDriver().attestGatewayCurrentPhysical(ctx, selection)
 	if err != nil || !validGatewayCurrentPhysicalAttestation(value) || value.Lineage != selection.Lineage ||
-		value.Terminal.Digest != terminal.Digest ||
+		!reflect.DeepEqual(value.Terminal, terminal) ||
 		!reflect.DeepEqual(value.Pending, selection.State.Pending) ||
 		!reflect.DeepEqual(value.LANRecovery, selection.State.LANRecovery) {
 		return gatewayCurrentPhysicalAttestation{}, &Error{Code: DiagnosticRouteUnresolved}

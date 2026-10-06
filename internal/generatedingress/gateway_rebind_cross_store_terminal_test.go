@@ -292,6 +292,23 @@ func TestGatewayRebindTypedCommitTerminalScansAndSelectsActualLineage(t *testing
 	if err != nil || !gatewayRebindAttemptTerminalMatchesLineage(view, lineage) || view.LegacyReceipt != nil || view.TypedReceipt == nil {
 		t.Fatalf("typed terminal union mismatch: %#v error=%v", view, err)
 	}
+	changedView := view
+	changedView.Resources = view.Resources
+	changedFinal := *view.Resources.FinalContainer
+	changedFinal.ID = strings.Repeat("a", 64)
+	if changedFinal.ID == view.Resources.FinalContainer.ID {
+		changedFinal.ID = strings.Repeat("b", 64)
+	}
+	changedView.Resources.FinalContainer = &changedFinal
+	changedView.Resources.Digest, err = gatewayRebindFinalHandoverResourcesDigest(changedView.Resources)
+	if err != nil || gatewayRebindAttemptTerminalMatchesLineage(changedView, lineage) {
+		t.Fatalf("rehashed typed terminal summary accepted: %v", err)
+	}
+	mixedView := view
+	mixedView.LegacyReceipt = &fixture.receipt
+	if gatewayRebindAttemptTerminalMatchesLineage(mixedView, lineage) {
+		t.Fatal("mixed typed and legacy terminal summary accepted")
+	}
 	selectedView, err := gatewayCurrentSelectionTerminalView(gatewayCurrentSelection{
 		Kind: gatewayCurrentSelectionRebind, Lineage: lineage, Terminal: &view,
 	})
@@ -353,6 +370,16 @@ func TestGatewayRebindTypedNoEffectAbortRequiresCheckpointWithoutIntent(t *testi
 		history.TerminalsV2[0].Receipt.Disposition != appaccess.GatewayRebindDispositionAbort {
 		t.Fatalf("scan no-effect abort: intents=%d progress=%d terminals=%d error=%v",
 			len(history.IntentsV2), typedProgress, len(history.TerminalsV2), err)
+	}
+	intentStore, err := newGatewayRebindProtectedIntentV2Store(fixture.dataRoot, intent.Generation, intent.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := intentStore.installExact(intent); err == nil {
+		t.Fatal("typed intent was installed after an immutable no-effect abort")
+	}
+	if _, err := intentStore.load(); err == nil {
+		t.Fatal("typed intent file was created before terminal conflict refusal")
 	}
 	nonIncreasing := receipt
 	nonIncreasing.CreatedAt = proof.CreatedAt
