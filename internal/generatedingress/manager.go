@@ -229,6 +229,9 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 		return err
 	}
 	defer releaseGatewaySwitchLock(release, &resultErr)
+	if handled, err := m.switchGatewayCurrentStateMachineLocked(ctx, request); err != nil || handled {
+		return err
+	}
 	if store, state, journal, committed, err := m.committedV2Locked(); err != nil {
 		return markCandidateMayBeLive(err)
 	} else if committed {
@@ -322,6 +325,24 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 // Recover rolls back an uncertain pending switch to the last committed route,
 // then reapplies the committed aggregate config and restart file.
 func (m *Manager) Recover(ctx context.Context) error {
+	if m == nil || ctx == nil {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
+	release, err := m.lockGateway(ctx)
+	if err != nil {
+		return err
+	}
+	handled, recoveryErr := m.recoverGatewayCurrentStateMachineLocked(ctx)
+	releaseErr := release()
+	if recoveryErr != nil {
+		return recoveryErr
+	}
+	if releaseErr != nil {
+		return gatewayCurrentRouteOperationError(ctx)
+	}
+	if handled {
+		return nil
+	}
 	return m.Provision(ctx)
 }
 
