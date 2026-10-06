@@ -460,6 +460,16 @@ Other lifecycle/race/Windows checks were still running at this observation;
 this records the completed M3 Docker workflow, not overall PR readiness.
 No private handover or cross-store Docker result is inferred from these tests.
 
+Subsequent exact-head job metadata at `b46162e` confirms successful
+[Windows controller verification](https://github.com/tyhuang9/rig/actions/runs/37385339455/job/112017116036),
+including its full Go, vet/build, Windows protection, frontend and generated
+contract steps. The generated-runtime race groups for
+[runtime packages](https://github.com/tyhuang9/rig/actions/runs/37385339467/job/112021142485)
+and [gateway v2](https://github.com/tyhuang9/rig/actions/runs/37385339467/job/112021142568)
+also completed successfully. The ingress-remainder race group and combined
+PostgreSQL/Linux race job were still active. These are results for the published
+prerequisite head, not acceptance of this unpublished cross-store branch.
+
 ## Integrated cross-store checkpoints
 
 ### Integrated SQL checkpoint
@@ -596,11 +606,157 @@ Vet, gofmt and diff checks passed. Green test events are retained at
 negative suites first establish a verified positive baseline, then require URL
 and timestamp withholding after native-proof or transfer-proof disagreement.
 
+The adapter checkpoint is committed locally at `8f17a4c`. The full controller
+package then passed all 115 top-level tests with zero failure/skip in 89.404s,
+checking existing endpoints as well as the new proof requirement:
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=12m ./internal/controller
+```
+
+Full events: `$TEMP/m3-cross-store-8f17a4c-controller.jsonl`. PR #136's
+description was also updated with its exact `b46162e` Docker acceptance above;
+head, base and open-draft state were rechecked unchanged.
+
 The controller's two-transfer fixture explicitly simulates validated DTOs;
 it verifies projection and comparison only. Real SQL transfer, restart and
 Docker acceptance remain separate required gates.
 
 ## Recovery and rollback boundary
+
+### Pending startup and repository boundary checks
+
+The parent now owns `cmd/hostd` startup integration. Dedicated rebind recovery
+must precede ordinary effects admission, historical disable acknowledgment,
+quarantine and worker recovery. A fresh or runtime-disabled installation must
+first prove absence without constructing a Docker-backed Manager. The shared
+presence probe must read validated SQL and protected namespaces without creating
+directories, changing permissions, or treating orphan current-route files as
+absence. Retained terminal rebind history requires reattestation even when
+there is no active operation.
+
+The new real-repository proposal/admission regression initially failed at the
+proposal boundary on parent `8f17a4c` (package 1.099s):
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayRebindProposalAndAdmissionUseRealRepository$'
+```
+
+Captured events: `$TEMP/m3-cross-store-real-repository-red.jsonl`. The runtime
+proposal still needs the reviewed explicit-generation adaptation. The test uses
+real SQL and protected files with a simulated Docker runner; it will separately
+check approval refusal, exact admission/replay, unchanged current authority,
+the prepared fence and no protected/Docker effects. Its approval-error
+expectation follows the existing V2 API's `ErrInvalidInput` classification.
+
+Independent review held the later app-access candidate `ead9ece` after proving
+that its relaxed historical-upgrade rule incorrectly accepted a still-current
+native upgrade whose administrator was demoted. The positive baseline passed
+first; the demoted case then failed its required-refusal assertion. The exact
+overlay regression ran against a clean detached source tree and failed in
+0.712s, one named failure:
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m -overlay C:/Users/huang/Documents/Projects/Rig/temp/cross-store-review-native-admin-overlay.json -run '^TestCrossStoreReviewCommittedNativeUpgradeDemotionRefusesCombinedStartup$' ./internal/appaccess
+```
+
+Log: `C:/Users/huang/Documents/Projects/Rig/temp/cross-store-review-native-admin-red.jsonl`.
+That candidate is not integrated in the parent; the earlier `01621f6` guard
+remains in place while the current-versus-historical authorization fix is made.
+New presence regressions cover fresh real storage, prepared SQL, terminal
+history without an active claim, orphan/reserved artifacts, unsafe paths,
+permissions, cancellation and changes during confirmation. Their execution
+awaits the corrected repository and runtime presence implementation.
+
+The corrected app-access checkpoint
+`d25531e222a887fadbbd14d2e37dd66a995c9170` passed bounded independent review
+and is integrated locally at `dea357c448b70e0bfcfc0715cdbe7d5e7f7fee5e`.
+Its native-source path retains administrator, current-head and multiplicity
+checks. A historical committed upgrade is accepted only when validated rebind
+history proves its exact predecessor ancestry. Seven independently executed
+regressions, including the original demoted-administrator case, passed with
+zero failure or skip in 6.233s. The implementation agent's full app-access
+suite passed in 101.830s. Independent events are retained at
+`C:/Users/huang/Documents/Projects/Rig/temp/cross-store-review-d255-green.jsonl`.
+This clears the earlier held SQL checkpoint only, not the complete runtime unit.
+
+Independent execution of the pending startup presence tests against frozen
+runtime `8b4212dd85c694825d0e7465e1d84de704e1f0d9` exposed two production
+defects: valid native authority was mistaken for rebind history, and replacement
+of an empty protected directory was missed on Windows. Windows `os.FileInfo`
+can resolve identity lazily through its path; identity must be captured before
+the second SQL read. The first run also exposed an overly broad test comparison
+of opaque file metadata. The tests now use the existing domain snapshot
+comparison, retaining file identity, size, mode, modification time and content
+digest checks, with Docker-command counts asserted separately. The initial
+events are retained at `temp/cross-store-review-startup-presence-red.jsonl`.
+
+At the subsequent frozen runtime `281cd3e`, native and prepared presence tests
+passed independently in 0.69s and 0.70s. The actual repository test then reached
+admission and correctly refused its unfinished fixture deployment. The fixture
+now explicitly verifies that refusal leaves no claim or fence, finishes only
+its exact serving deployment and related job, and verifies the real terminal
+census before retrying admission. Complete presence and repository results
+still await the corrected runtime checkpoint and retest.
+
+### Integrated startup presence and adapter results
+
+Runtime checkpoint `17fbafb4cc990349a4390ca6eda41970fe097d6d` passed bounded
+independent review and was integrated at `bbfb647b8081405a014a74ad2c2b9f33a5f8a01b`.
+This includes the post-claim clock correction and eager directory identities.
+The parent then ran all 11 named startup-presence tests: ten passed, the POSIX
+permission-preservation test was explicitly skipped on Windows, and none
+failed (21.857s). Both symlink cases ran and passed. The passing test checkpoint
+is `ff08266`; events are `$TEMP/m3-cross-store-bbfb-presence.jsonl`.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./internal/generatedingress -run '^TestGatewayRebindStartupPresence'
+```
+
+The startup projection adapter at `639dadd2338a11adf51810b43089ad1914fee96d`
+passed bounded independent code/security review. It carries current and retained
+profile/source/transfer/receipt evidence separately, preserves immutable raw
+requests, and copies transfer slices and nested predecessor-digest pointers.
+Partial or mixed evidence remains visible for runtime rejection. A raw profile
+alone never manufactures effective authority. Existing `RequiresRecovery`
+decisions remain unchanged until runtime consumers validate the projection.
+
+Four new mapping tests and 14 existing startup/recovery tests passed with zero
+failures or skips (0.750s), including real migrated legacy-pair composition,
+historical-disable acknowledgment and batch selection. Vet and formatting
+checks passed. Events: `$TEMP/m3-startup-binding-preservation.jsonl`.
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./cmd/hostd -run '^Test(LANStartupMapping|MigratedLegacyPairRecoveryComposition|LANGrantStartup|LANDisableStartup|LANAccessStartup|LANRecoveryBatch|AttestHistoricalLANDisableSuccessor|HistoricalLANDisableSuccessorSelection)'
+go vet -mod=readonly ./cmd/hostd
+```
+
+The real repository test then exposed a production integration error: the fence
+reader used the legacy snapshot and rejected valid v2 prepared state as corrupt.
+The reviewed correction `1312fbe50ec5fa2bcd68803e08aac9cfac072f72` uses the
+version-aware recovery snapshot and preserves refusal of corrupt history.
+Three independent regressions passed in 3.832s; the implementation agent's full
+app-access suite passed in 93.190s. The parent integrated it at
+`dd2f6bb22b17706b532bde30fb3e57962fef64c3` and the real repository
+proposal/refusal/admission/replay test passed with no failure or skip.
+Events: `$TEMP/m3-cross-store-real-repository-green.jsonl`.
+The final rerun explicitly checked absence of both v1 and v2 protected intents
+and passed in 1.313s (named test 1.06s). Repository-wide
+`go build -mod=readonly -buildvcs=false ./...` and
+`go vet -mod=readonly ./...` passed. Documentation workflow checks and the
+VitePress build passed (3.72s). These are checkpoint checks, not the complete
+unit's final suite or a Docker result.
+
+The prepared SQL boundary still has no Docker effects or protected commit
+receipt. Full physical coordination, terminal recovery, transfer-aware normal
+operations and startup dispatch remain required for delivery.
+
+PR #136 received the separately reviewed CI partition correction at `7deefa4`.
+Its M3 Docker workflow passed again at that exact revision (run `37391508257`).
+The previous repository-wide race job at `b46162e` was cancelled by normal
+workflow concurrency after the update; its PostgreSQL-specific steps passed,
+but its repository-wide result is unverified. New race batches at `7deefa4`
+remain pending. The published correction is integrated locally at `3cf6bb8`.
 
 Keep the new runtime path unavailable until its complete invariants and gates
 are satisfied. Reverting source must not delete protected receipts, committed
