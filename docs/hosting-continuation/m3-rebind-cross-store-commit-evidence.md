@@ -800,6 +800,50 @@ review found no issue in this structural validation checkpoint. Selection of
 the protected current generation and physical attestation remain required;
 these validators alone do not authorize serving.
 
+The reviewed runtime reader/attempt checkpoint
+`6f2018d349df9b39b7e0491df1c0904d7b663fe0` is integrated at `f2b1761`.
+Independent testing first reproduced the missing typed-intent comparison at
+`76160ae` (17.661s, one expected regression failure). The corrected checkpoint
+passed four independent reader/barrier tests without failure or skip (37.528s).
+The attempt adapter's separate three-test review passed (19.236s). Logs:
+`temp/cross-store-review-761-typed-history-red.jsonl`,
+`temp/cross-store-review-6f-reader-barrier-green.jsonl`, and
+`temp/cross-store-review-761-attempt.jsonl`.
+
+Both production controller constructors now inject the app-access current-state
+repository. The shared optional-selection helper requires that provider even
+for an absence decision. Fresh or configured/preupgrade SQL must contain no
+rebind history, active claim, transfer, phase or commit evidence, and two
+nonmutating protected scans must agree around the confirming SQL read. Existing
+authority uses the strict SQL-led selector. Empty SQL plus lost files cannot
+be inferred from a missing provider. The legacy unit fixture supplies explicit
+empty-history data; authority-specific fixtures must override it.
+
+Five helper test groups passed with zero failures or skips (18.606s), covering
+real fresh/native repositories, partial SQL, orphan files, changed SQL or paths,
+cancellation and terminal-history dispatch. The terminal case uses real
+protected fixtures with simulated SQL and does not establish physical serving.
+Its first run exposed two test-setup mistakes: an uninitialized fixture mutex
+and sample ports outside the supported range. The stalled process was stopped,
+both fixtures corrected, and the complete named group rerun successfully.
+Events: `$TEMP/m3-current-optional-selection-final.jsonl`; previous attempts are
+retained in `$TEMP/m3-current-optional-selection.jsonl` and
+`$TEMP/m3-current-optional-selection-green.jsonl` (the latter failed despite its
+filename).
+
+```powershell
+go test -mod=readonly -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestOptionalGatewayCurrentSelection'
+go test -mod=readonly -p=1 -json -count=1 -timeout=5m ./cmd/hostd -run '^Test(GatewayStartupRebindFence|RuntimeCompositionRebindFence|GeneratedComposition|PrepareRuntimeWorker|DeploymentEffectsAdmission|LANStartupMapping|MigratedLegacyPairRecoveryComposition|LANGrantStartup|LANDisableStartup|LANAccessStartup|LANRecoveryBatch|AttestHistoricalLANDisableSuccessor|HistoricalLANDisableSuccessorSelection)'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+All 37 controller composition/startup/effects tests passed (22.899s, zero failure
+or skip). Events: `$TEMP/m3-current-provider-composition.jsonl`. Vet, build and
+diff checks passed. Independent code review accepted the helper and constructor
+changes. Rebound startup consumers and recovery-before-admission dispatch are
+still pending; constructor injection alone does not satisfy those requirements.
+
 PR #136 received the separately reviewed CI partition correction at `7deefa4`.
 Its M3 Docker workflow passed again at that exact revision (run `37391508257`).
 The previous repository-wide race job at `b46162e` was cancelled by normal

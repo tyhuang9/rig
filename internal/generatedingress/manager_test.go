@@ -1654,6 +1654,9 @@ func newManagerFixture(t *testing.T, failReload bool) (*Manager, *ingressRunner)
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
 		WorkingDirectory: directories.WorkingDirectory, DataRoot: root,
 		RebindFenceCheck: func(context.Context) error { return nil },
+		// This fixture models legacy SQL without a current authority. Tests
+		// for actual SQL lineage replace it with their real or exact reader.
+		RebindCurrentStateRepository: gatewayCurrentSelectionRepositoryFunc(emptyStartupPresenceRepository),
 	})
 	if err != nil {
 		t.Fatal(err)

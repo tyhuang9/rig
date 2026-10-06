@@ -80,7 +80,7 @@ func inspectGatewayStartupWithFence(ctx context.Context, cfg config.Config, db *
 		}
 		return gatewayStartup{snapshot: snapshot}, nil
 	}
-	ingress, err := newGatewayStartupIngress(cfg, dockerExecutable, directories, fenceCheck)
+	ingress, err := newGatewayStartupIngress(cfg, dockerExecutable, directories, fenceCheck, repository)
 	if err != nil {
 		return gatewayStartup{}, err
 	}
@@ -137,11 +137,12 @@ func inspectGatewayStartupWithFence(ctx context.Context, cfg config.Config, db *
 
 func newGatewayStartupIngress(cfg config.Config, dockerExecutable string,
 	directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
+	repository generatedingress.GatewayRebindCurrentStateRepository,
 ) (*generatedingress.Manager, error) {
 	ingress, err := generatedingress.New(runtimeprocess.ExecRunner{}, generatedingress.Options{
 		DockerExecutable: dockerExecutable, DockerEndpoint: cfg.DockerEndpoint,
 		DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
-		DataRoot: cfg.DataRoot, RebindFenceCheck: fenceCheck,
+		DataRoot: cfg.DataRoot, RebindFenceCheck: fenceCheck, RebindCurrentStateRepository: repository,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create gateway startup inspector: %w", err)
