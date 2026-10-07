@@ -9,11 +9,11 @@ import (
 
 // Retained ownership authorizes withdrawal. Serving additionally requires a
 // complete current Hosting census; revocation must never gate successor cleanup.
-func gatewayRebindTypedRollbackServingSnapshotMatches(attempt gatewayRebindPreparedAttempt,
+func gatewayRebindTypedPrecommitServingSnapshotMatches(attempt gatewayRebindPreparedAttempt,
 	snapshot appaccess.HostingGatewayStartupSnapshot,
 ) bool {
 	rebind := snapshot.Rebind
-	if rebind.Active == nil || rebind.Active.Claim.V2 == nil || !rebind.RollbackAllowed ||
+	if rebind.Active == nil || rebind.Active.Claim.V2 == nil ||
 		rebind.DatabaseCommitObserved || rebind.DatabaseCommittedEvent != nil ||
 		(rebind.Phase != appaccess.GatewayRebindPrepared && rebind.Phase != appaccess.GatewayRebindSuccessorReady) ||
 		!sameGatewayRebindClaimV2Admission(*rebind.Active.Claim.V2, attempt.Claim) ||
@@ -95,7 +95,7 @@ func (d gatewayRebindTypedHandoverRuntime) authorizedRollbackPredecessor(ctx con
 		return invalid()
 	}
 	first, err := repository.HostingGatewayStartupSnapshot(ctx)
-	if err != nil || !gatewayRebindTypedRollbackServingSnapshotMatches(attempt, first) {
+	if err != nil || !first.Rebind.RollbackAllowed || !gatewayRebindTypedPrecommitServingSnapshotMatches(attempt, first) {
 		return invalid()
 	}
 	ownedSQL, err := d.manager.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(ctx)

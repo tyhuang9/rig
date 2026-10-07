@@ -283,7 +283,10 @@ func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorForwardLocked(ct
 		}
 	}
 	if result, ok := gatewayRebindTypedPhysicalResultFromProgress(progress[len(progress)-1]); ok {
-		if err := d.confirmForwardServingLocked(ctx, request); err != nil {
+		if result.Disposition != appaccess.GatewayRebindDispositionCommit {
+			return gatewayRebindTypedPhysicalResult{}, gatewayRebindEffectBoundaryError(ctx)
+		}
+		if err := d.restoreCompletedServingLocked(ctx, request); err != nil {
 			return gatewayRebindTypedPhysicalResult{}, err
 		}
 		return result, nil

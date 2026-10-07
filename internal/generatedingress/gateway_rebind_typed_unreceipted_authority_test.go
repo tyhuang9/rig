@@ -148,9 +148,13 @@ func TestGatewayRebindTypedCompletedWithoutReceiptReplay(t *testing.T) {
 			} else {
 				result, err = driver.reconcileSuccessorLocked(ctx, used, fixture.appendProgress)
 			}
-			if kind == "approved" {
+			if kind == "approved" || kind == "approved stopped replay" {
+				wantEffects := [][]string(nil)
+				if kind == "approved stopped replay" {
+					wantEffects = [][]string{{"container", "start", fixture.runner.finalID}}
+				}
 				if err != nil || result.Disposition != appaccess.GatewayRebindDispositionCommit ||
-					!fixture.runner.final.Running || len(fixture.runner.effects) != 0 {
+					!fixture.runner.final.Running || !reflect.DeepEqual(fixture.runner.effects, wantEffects) {
 					t.Fatalf("approved cached completion failed: result=%s err=%v", result.Disposition, err)
 				}
 			} else {

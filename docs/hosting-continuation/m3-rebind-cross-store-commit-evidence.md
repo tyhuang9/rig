@@ -3152,3 +3152,114 @@ Disablement remains the closed production factory. Preserve immutable history
 and recovery state when reverting code. This unit adds no managed database or
 Neon provisioning, imports no unapproved branch history, and performs no remote
 publication, GitHub merge or deployment.
+
+## Authorized restoration of completed successors (2026-10-07)
+
+This unit continues locally from `dcec59c3edf6eb629f3be541f881c96d758ea58e`.
+The approved startup-authority and guarded-restart dependencies are already
+retained by local integration commit `b681cf9255a4f32d53d248be32841f895095920e`;
+this unit imports no additional branch history. The final source/test tree is
+`205da358b28a564237074d0d073f6a000f30b005`.
+
+### Behavior and failure boundaries
+
+Only replay of durable COMMIT sequence17 may restore its exact stopped
+successor. Before database commit, the typed runtime verifies current rebind,
+configure and LAN approvals, the complete healthy runtime census, exact LAN
+bindings, protected selection/history, retained resources/configuration and
+listener absence. The predecessor must already be stopped. The only permitted
+restart effect is `container start` with the retained immutable successor ID.
+Fresh physical and authority readback must resolve even a lost acknowledgment.
+
+After database commit, stopped recovery delegates to the existing guarded
+committed-serving driver. Already-running replay remains observational and
+requires the same full serving census, exact committed baseline and retained
+LAN history. Its successful observation does not require opening the default
+current driver factory. No path clears either process admission latch.
+
+The shared precommit serving census does not require rollback permission:
+SQL successor_ready retains COMMIT and already disallows rollback. The
+predecessor rollback caller explicitly retains its rollback-permission check.
+Forward recovery never reinterprets completed history as permission to roll back.
+Failed restoration returns through existing ownership-only successor withdrawal;
+ambiguous ownership remains potentially live. SQL, protected history, resources
+and the active fence remain retained. Ordinary SQL-transition confirmation
+continues to observe only and cannot restart a stopped successor.
+
+### Verification scope
+
+Tests use local SQLite and protected records with simulated Docker and network
+probes. The no-receipt and receipt-bound tests execute the actual typed handover
+through durable sequence17. The database-committed stopped case uses the existing
+bounded handover fixture and explicitly injected managed current physical
+executor; it proves dispatch/restart/replay, not a complete combined Docker
+journey. The running database-committed cases use the actual typed fixture and
+leave the default current factory closed.
+
+The original red test refused an authorized stopped successor with no effects.
+An initial implementation still refused because its cutover predicate expected
+the predecessor's original running state; completed recovery instead requires
+the exact stopped predecessor. The intermediate matrix then passed no-receipt
+restoration, committed restoration and 13 authorization cases, but failed the
+successor_ready case. That test retained a stale RollbackAllowed flag, and the
+reused census predicate also required rollback permission. The corrected test
+reads the actual SQL snapshot; the corrected predicate preserves the separate
+predecessor rollback gate. These failed runs are retained as evidence.
+
+Commands use `GOCACHE=Rig/.go-cache-m3`. Logs use prefix
+`Rig/temp/m3-completed-restore-20261007-`.
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=4m -json ./internal/generatedingress -run '^TestGatewayRebindTypedCompletedSuccessorRestoresWithoutReceipt$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=9m -json ./internal/generatedingress -run '^(TestGatewayRebindTypedCompletedSuccessorRestoresWithoutReceipt|TestGatewayRebindTypedCompletedRestartRequiresFreshAuthority|TestGatewayRebindTypedCompletedRestartUsesCommittedAuthority)$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=10m -json ./internal/generatedingress -run '^(TestGatewayRebindTypedCompletedRestartRequiresFreshAuthority|TestGatewayRebindTypedCompletedRestartUsesCommittedAuthority|TestGatewayRebindTypedCommittedRunningReplayRequiresCompleteCensus)$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=12m -json ./internal/generatedingress -run '^(TestGatewayRebindTypedCompletedWithoutReceiptReplay|TestGatewayRebindTypedForwardOnlyWithdrawsRevokedSuccessor|TestGatewayRebindCommittedServingRestoreKeepsActiveSQLFence|TestGatewayRebindTypedHandoverRuntimeReplaysRollbackAfterFinalRemoval|TestGatewayRebindTypedProductionDriverRemainsClosedUntilFinalAdapterExists)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd ./internal/appaccess
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The first command ran both the red baseline and initial implementation. The
+matrix ran on source/test tree `5eb25a1e39b3c6046b1a21874221363f9e1cab18`, before
+the final census/history guards and phase correction. Final authority and
+regression runs use the final source/test tree named above. Final-tree vet,
+full Go build, read-only formatting and whitespace checks pass. Independent
+source and physical security review accepted this bounded restoration unit.
+
+| Log suffix | Actual outcome | SHA256 |
+| --- | --- | --- |
+| `baseline.jsonl` | Expected failure on `dcec59c`: 1 test failed, 74.294s; authorized stopped successor remained stopped with no effects | `01F0DDD7E959D113C7CD61815D090BA592E55C7A145CF1D62829B0BD35430F4D` |
+| `first-fix.jsonl` | Initial implementation failed the same test, 81.010s; the original cutover predicate was unsuitable for completed recovery | `0853233DCA9254DD5975C0EF56978B2AC7ED559F5E10DFBD43B37F9FFD2A7EB6` |
+| `matrix.jsonl` | Mixed run: 2 tests and 13 subcases passed; successor_ready subcase and its parent failed; package failed, 359.742s | `7C3CBBE51AF2A95F8C26BE4D93264AF217571DB5B287ECA5E1CE231262C75E64` |
+| `final-authority.jsonl` | Final tree: 3 tests and 17 subcases passed, 389.316s; zero failures/skips, exit zero | `58928730BABC0FBAD1057B6F00347835BEAC70186399791F7C70B7C944AFDF51` |
+| `regressions.jsonl` | Final tree: 5 tests and 20 subcases passed, 474.611s; zero failures/skips, exit zero | `0F81DA5AF089A05859C7DCB1D805FF3F4B06A05E94F14ACCD974A3959F45AFBE` |
+
+The final authority run proves approved restart, lost start acknowledgment,
+revocation before/during/after restart, incomplete or unhealthy runtimes, changed
+LAN head/configuration, replacement identity, both admission latches, observational
+confirmation, and successor_ready recovery. It also proves database-committed
+restart/replay and running replay's full census. Every case checks its exact
+effects, unchanged SQL/protected history and retained fence/resources; predecessor
+restart is forbidden. The focused runs discover their selected tests explicitly.
+
+The regression run passes the existing 13 receipt-bound withdrawal cases,
+7 completed-without-receipt replay cases, committed-serving fence preservation,
+rollback replay after final removal, and the closed production factory. These
+checks cover the altered replay expectation and the shared census/rollback
+permission boundary. The two final runs total 8 tests with 37 subcases and no
+failures or skips. No final full repository suite or full original-matrix rerun
+is claimed; the affected cases were explicitly run on the final tree.
+
+### Remaining integration limits
+
+Active completed-successor restoration is now connected, but this does not
+complete M3. Current-state attestation must still handle both active database
+commit and terminal startup authority, including read-only terminal proof before
+the commit barrier is released. Complete coordinator/typed-adapter integration
+and actual Docker/process/hosted acceptance remain outstanding. Boundary checks
+do not prove transaction-atomic role revocation. The same-day Docker engine
+limitation above still applies; no live Docker, Linux race, frontend build or
+full repository suite is claimed.
+
+Disablement remains the closed production factories. Preserve immutable history
+and recovery state when reverting code. This unit provisions no database,
+publishes no branch, merges no GitHub PR and performs no deployment.

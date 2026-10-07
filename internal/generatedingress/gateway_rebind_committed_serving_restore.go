@@ -74,6 +74,29 @@ func gatewayRebindCommittedServingSnapshotMatches(request gatewayRebindPhysicalR
 		gatewayCurrentAuthorityHasDatabaseCommit(snapshot.History, snapshot.CurrentDatabaseCommittedEvent, *snapshot.CurrentSource)
 }
 
+func (m *Manager) gatewayRebindCommittedServingCensusMatchesLocked(ctx context.Context,
+	request gatewayRebindPhysicalReconcileRequest, state gatewayCurrentRouteState,
+	snapshot appaccess.HostingGatewayStartupSnapshot,
+) bool {
+	if !snapshot.ActiveRebindApprovalsAuthorizeServing() || !gatewayRebindCommittedServingSnapshotMatches(request, snapshot.Rebind) ||
+		!gatewayCurrentServingRuntimeComponentsMatch(state, snapshot) {
+		return false
+	}
+	transfers, err := newGatewayRebindTransfersV2(request.Attempt.Intent, *request.Terminal, request.Attempt.Checkpoint)
+	if err != nil {
+		return false
+	}
+	baseline, err := newGatewayCurrentRouteBaselineFromV2Terminal(request.Attempt.Intent, *request.Terminal, request.Attempt.Checkpoint, transfers)
+	if err != nil || !reflect.DeepEqual(baseline, state) {
+		return false
+	}
+	claims, claimsErr := validateGatewayV2LANAccessStartupClaims(GatewayLANGrantStartupClaims(snapshot.Grants),
+		GatewayLANDisableStartupClaims(snapshot.Disables))
+	inspection, inspectErr := gatewayCurrentLANStartupCensus(state, claims)
+	return claimsErr == nil && inspectErr == nil && inspection.Disposition == GatewayV2LANStartupNormal &&
+		m.validateGatewayCurrentLANRetainedHistoryLocked(ctx, claims, snapshot.Rebind) == nil
+}
+
 // Caller owns the effects lease and both gateway locks, before taking its
 // commit-barrier latch. SQL must still retain this exact database-committed
 // attempt. This restores physical serving only: it never clears the SQL fence,
@@ -151,11 +174,7 @@ func (m *Manager) restoreGatewayRebindCommittedServingLocked(ctx context.Context
 		if readErr != nil {
 			return readErr
 		}
-		claims, claimsErr := validateGatewayV2LANAccessStartupClaims(GatewayLANGrantStartupClaims(fresh.Grants),
-			GatewayLANDisableStartupClaims(fresh.Disables))
-		inspection, inspectErr := gatewayCurrentLANStartupCensus(state, claims)
-		if claimsErr != nil || inspectErr != nil || inspection.Disposition != GatewayV2LANStartupNormal ||
-			m.validateGatewayCurrentLANRetainedHistoryLocked(effectCtx, claims, fresh.Rebind) != nil {
+		if !m.gatewayRebindCommittedServingCensusMatchesLocked(effectCtx, request, state, fresh) {
 			return gatewayCurrentRouteOperationError(effectCtx)
 		}
 		after, scanErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
