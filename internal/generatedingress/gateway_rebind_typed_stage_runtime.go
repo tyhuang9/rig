@@ -11,8 +11,10 @@ import (
 )
 
 type gatewayRebindTypedStageRuntime struct {
-	manager *Manager
-	reads   gatewayRebindSuccessorPreflightReads
+	manager        *Manager
+	reads          gatewayRebindSuccessorPreflightReads
+	hostProbe      gatewayV2HostStatusProbe
+	containerProbe gatewayV2ContainerChallengeProbe
 }
 
 type gatewayRebindTypedStageObservation struct {

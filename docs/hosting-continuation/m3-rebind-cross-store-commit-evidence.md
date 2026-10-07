@@ -3383,3 +3383,104 @@ potentially live and admission stays latched.
 Rollback is code-only with the closed effect factories retained; preserve all
 immutable history, committed SQL and recovery state. This unit provisions no
 database, publishes no branch, merges no GitHub PR and performs no deployment.
+
+## Concrete runtime composition on one simulated Docker backend (2026-10-07)
+
+Purpose: compose the actual typed stage, handover and current-serving adapters
+through a complete local SQL commit and subsequent recovery, without opening
+the production effect factories. The approved dependency integration is already
+in runtime history at `b681cf9255a4f32d53d248be32841f895095920e`, including
+`14c2913ad7709ff4e411a71c3424822455113700`; this unit imports no additional branch.
+Base: `84a2410fb8964e4821039346974c1e83c6973aa5`. Final source/test tree:
+`a72e9c61f11a1cd0cc32c98cac5fdd7220036b4c` (before this evidence-only addition).
+
+### Implementation and verified invariants
+
+`newGatewayRebindRuntimeDrivers` constructs concrete stage/handover and managed
+current-serving drivers against the same Manager and Docker runner. It installs
+nothing and has no production caller. The stage publication probes now have
+private injection fields, with the same production probes as their defaults.
+No authority, ownership, inventory, config or publication check was relaxed.
+
+The new test begins from the existing admitted predecessor fixture. It creates
+no successor resources or progress prefix in advance. Actual typed methods
+dispatch network/volume/container creation, copy the actual stage/final config
+bytes, start and stop containers, and persist all 17 progress records. The
+simulated backend retains those same IDs, volumes, configuration, memberships
+and running state through receipt publication, real SQLite commit, concrete
+current attestation and two public recovery replays with fresh Managers.
+
+Docker network IDs/subnets and mounted-volume consumers are read from that
+shared backend. Network and volume properties come from dispatched command
+arguments. Container create commands are checked against their exact contracts.
+Host probes map actual effective port bindings to listeners in the copied Caddy
+JSON and evaluate Host/Path matches; container probes also bind exact container
+identity, address and port. Endpoint transport and the host interface/route
+snapshot remain simulated. Admission retains the existing predecessor fixture;
+this is not a test of real host discovery or a complete hostd process boot.
+
+After commit, the test proves that the predecessor is stopped, the stage is
+removed and only the retained successor serves. Two fresh public recovery calls
+perform no effects. It then simulates a stopped successor and calls public
+serving restoration before terminal recovery: exactly one start of the retained
+final ID occurs, and subsequent attestation has no additional effects. Finally,
+corrupting the copied active configuration causes terminal recovery to refuse
+and stop exactly that final ID. Resources remain present, the predecessor stays
+stopped, fail-stop blocks admission, and successful withdrawal reports no
+potentially-live uncertainty. SQL authority and protected history files remain
+unchanged across these replay, restoration and refusal paths.
+
+### Executable evidence
+
+Commands use Go 1.26.0 and `GOCACHE=Rig/.go-cache-m3`. All selected tests were
+discovered. Completed acceptance runs exited zero with no skipped tests.
+Logs use prefix `Rig/temp/m3-runtime-composition-20261007-`.
+
+| Log suffix | Actual outcome | SHA256 |
+| --- | --- | --- |
+| `journey.jsonl` | Fixture failure at network binding: reused predecessor census ID; 1 failed test, 19.174s | `AA95F22C2C1273403E37D2AFEB2CCD37E138D39630771966F6EC347BBF5FC170` |
+| `handover-diagnostic.jsonl` | Fixture failure at record 12: stage ID collided with retained legacy container ID; 1 failed test, 52.681s | `D84F0688908292F602428D6026274FBD449EB681016ABBF7EAE568E883087367` |
+| `current-diagnostic.jsonl` | All 17 records reached; current observer refused missing simulated volume-consumer query; 1 failed test, 103.847s | `E9EB4D158D504BE354AC40C0253538E61409AA2979B5B6CFCB8877C23A7E2354` |
+| `volume-census.jsonl` | First complete lifecycle pass: 1 test and 2 subcases, 151.268s | `BDB103959422820CEF815170CC70E576D220DE3A9DB0B87C3EDFD8B1B35418E9` |
+| `regressions.jsonl` | Existing stage safety/default-factory checks: 4 tests and 5 subcases, 141.047s | `421E4DEFA091AAF432FC66053618668B051B0C17B88E1549DA3473FF246CF74C` |
+| `final.jsonl` | Final source/test tree: 1 test and 2 subcases, 139.741s | `B303B216941538AE8BEAF4BB6961730F87E80387AC6322DEF16C0D8F26D81A2E` |
+
+These initial failures were fixture defects, not reproduced production bugs.
+Intermediate development also included two fixture compile errors (runner type
+and observation flag names) and diagnostic reruns. Acceptance is based on the
+completed final run after removal of all temporary diagnostic observations,
+plus the regression run against the unchanged production delta: five distinct
+tests and seven subcases. The first successful lifecycle was additionally
+repeated on the final source/test tree.
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=6m -json ./internal/generatedingress -run '^TestGatewayRebindConcreteCompositionCommitsAndReplaysSameDockerState$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=5m -json ./internal/generatedingress -run '^(TestGatewayRebindTypedStageRuntimeCommandsStartReplayAndCopyFinalConfig|TestGatewayRebindTypedStageRuntimeRejectsAlteredRestartAndLateBoundaryDrift|TestGatewayRebindTypedStageRuntimeRejectsAuthorityDriftAfterFinalArchive|TestGatewayRebindTypedProductionDriverRemainsClosedUntilFinalAdapterExists)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd ./internal/appaccess
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Final-source vet, read-only gofmt, and staged/unstaged whitespace checks passed.
+The full Go build passed against the same production changes. Independent
+orchestrator/integrator and security review accepted the exact staged source
+tree; final acceptance is backed by the completed executable results above.
+
+### Remaining M3 work and limits
+
+This establishes the simulated uninterrupted runtime lifecycle with terminal
+restart and corruption handling. Composed interruption recovery (before and
+after record 17), a second rebind from the resulting current generation, hostd
+startup ordering, and actual Docker/process/hosted acceptance remain open.
+There is no live Docker, Linux race, frontend or full test-suite pass in this
+unit. The earlier Docker Desktop Linux engine limitation remains unresolved.
+
+Startup recovery must run outside ordinary worker admission because both APIs
+acquire the effects lease themselves. Active rebinds need rebind recovery;
+stable terminal state needs serving restoration before attestation; pending
+route and LAN recovery retain their dedicated paths. Ordinary admission must
+then reacquire its lease and inspect fresh state. This ordering is a reviewed
+next step, not implemented hostd behavior in this unit.
+
+Rollback is code-only while the effect factories stay closed. Preserve SQL,
+immutable history and protected recovery state. No database provisioning,
+publication, GitHub merge, deployment or controller restart was performed.

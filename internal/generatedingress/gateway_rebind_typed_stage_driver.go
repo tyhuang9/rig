@@ -375,8 +375,15 @@ func (d gatewayRebindTypedStageRuntime) serveStage(ctx context.Context,
 	live, liveErr := d.manager.inspectLiveCaddyConfig(ctx, effect.StageContainer.ID)
 	validConfig := liveErr == nil && sameCaddyConfig(body, live)
 	clear(live)
+	hostProbe, containerProbe := d.hostProbe, d.containerProbe
+	if hostProbe == nil {
+		hostProbe = probeGatewayV2HostStatus
+	}
+	if containerProbe == nil {
+		containerProbe = d.manager.probeGatewayV2ContainerChallenge
+	}
 	if !validConfig || !proveGatewayRebindStagePublication(ctx, *effect.StageStartIntent,
-		effect.StageContainer.ID, probeGatewayV2HostStatus, d.manager.probeGatewayV2ContainerChallenge) ||
+		effect.StageContainer.ID, hostProbe, containerProbe) ||
 		guard(ctx) != nil {
 		return "", gatewayRebindEffectBoundaryError(ctx)
 	}
