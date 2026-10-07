@@ -319,6 +319,9 @@ func (m *Manager) QuarantineGatewayV2LANStartup(ctx context.Context, claims []Ga
 // normal startup and require explicit recovery.
 // It intentionally constructs no generally usable Manager: the only operation
 // available through this entry point is the journal-bound exact-owned stop.
+// It owns deployment-effects admission and the gateway locks, may cross an
+// existing fail-stop only to withdraw, and retains admission failure afterwards.
+// The caller must release any held startup/worker effects lease first.
 func StopOwnedGatewayV2OnStartupFailure(ctx context.Context, runner runtimeprocess.CommandRunner,
 	options Options,
 ) error {
@@ -335,11 +338,20 @@ func (m *Manager) stopOwnedGatewayV2OnStartupFailure(ctx context.Context) (resul
 	}
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
-	release, err := m.lockGatewayRaw(lockCtx)
+	releaseEffects, err := gatewayRebindAcquireDeploymentEffects(lockCtx, m.options.WorkingDirectory)
 	if err != nil {
+		return gatewayRebindEffectBoundaryError(ctx)
+	}
+	releaseGateway, err := m.lockGatewayRawForOwnedStop(lockCtx)
+	if err != nil {
+		if releaseEffects() != nil {
+			m.gatewayRebindFailStopLatch().Store(true)
+		}
 		return err
 	}
-	defer releaseGatewayLock(release, &resultErr)
+	defer func() {
+		resultErr = m.releaseGatewayCurrentEmergencyLocks(releaseEffects, releaseGateway, resultErr)
+	}()
 	if ctx.Err() != nil {
 		return &Error{Code: DiagnosticCancelled}
 	}
@@ -353,7 +365,13 @@ func (m *Manager) stopOwnedGatewayV2OnStartupFailure(ctx context.Context) (resul
 	if driver == nil {
 		driver = managerGatewayV2LANGrantDriver{manager: m}
 	}
+	m.gatewayRebindFailStopLatch().Store(true)
 	if err := driver.stopOwnedGateway(recoveryCtx, journal); err != nil {
+		return gatewayV2StartupInspectionError(recoveryCtx)
+	}
+	confirmed, err := m.latestGatewayV2JournalForEmergencyStop()
+	if err != nil || !reflect.DeepEqual(confirmed, journal) {
+		m.gatewayRebindFailStopLatch().Store(true)
 		return gatewayV2StartupInspectionError(recoveryCtx)
 	}
 	return nil
@@ -363,7 +381,13 @@ func (m *Manager) latestGatewayV2JournalForEmergencyStop() (gatewayMigrationJour
 	if m == nil || m.store == nil {
 		return gatewayMigrationJournal{}, errors.New("generated ingress store is unavailable")
 	}
-	before, err := readGatewayHistorySnapshot(m.store)
+	targets, census, err := m.gatewayCurrentOwnedStopTargetsProtectedPartialLocked()
+	if err != nil || census.UnresolvedAttempt || census.CommittedOwnership || len(targets) != 0 {
+		return gatewayMigrationJournal{}, errors.New("generated ingress native emergency selection has unresolved rebind ownership")
+	}
+	// Retained terminal aborts are allowed only after their complete protected
+	// census proved that no successor/current ownership needs withdrawal.
+	before, err := readGatewayHistorySnapshotMode(m.store, census.ProtectedRebindHistory)
 	if err != nil || len(before.generations) == 0 {
 		return gatewayMigrationJournal{}, errors.New("generated ingress history is unavailable")
 	}
@@ -396,8 +420,9 @@ func (m *Manager) latestGatewayV2JournalForEmergencyStop() (gatewayMigrationJour
 		(artifacts.operationID != "" && artifacts.operationID != journal.OperationID) {
 		return gatewayMigrationJournal{}, errors.New("latest generated ingress journal is invalid")
 	}
-	after, err := readGatewayHistorySnapshot(m.store)
-	if err != nil || !sameGatewayHistorySnapshot(before, after) {
+	after, err := readGatewayHistorySnapshotMode(m.store, census.ProtectedRebindHistory)
+	if err != nil || !sameGatewayHistorySnapshot(before, after) ||
+		m.confirmGatewayCurrentEmergencyCensusLocked(targets, census) != nil {
 		return gatewayMigrationJournal{}, errors.New("generated ingress history changed during emergency selection")
 	}
 	return journal, nil

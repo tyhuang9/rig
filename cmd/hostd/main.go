@@ -77,10 +77,12 @@ func runServer(args []string) int {
 		logger.Error("Docker executable resolution failed", "error", err)
 		return 1
 	}
+	var startupAdmission *deploymentEffectsStartupLease
 	emergencyStop := func() {
-		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if stopErr := stopOwnedGatewayOnStartupFailure(stopCtx, cfg, dockerExecutable, ownerDirectories); stopErr != nil {
+		stopErr := runGatewayStartupEmergencyStop(startupAdmission, func(stopCtx context.Context) error {
+			return stopOwnedGatewayOnStartupFailure(stopCtx, cfg, dockerExecutable, ownerDirectories)
+		})
+		if stopErr != nil {
 			logger.Error("owned gateway emergency stop could not be verified", "error", stopErr)
 		} else {
 			logger.Warn("owned gateway stopped after startup reconciliation failure")
@@ -94,7 +96,6 @@ func runServer(args []string) int {
 	}
 	defer db.Close()
 	var workerAdmission func(context.Context) (func() error, error)
-	var startupAdmission *deploymentEffectsStartupLease
 	if cfg.ComposeRuntime || cfg.GeneratedRuntime {
 		workerAdmission, err = deploymentEffectsAdmission(db, ownerDirectories.WorkingDirectory)
 		if err != nil {

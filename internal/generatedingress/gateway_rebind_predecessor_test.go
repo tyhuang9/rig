@@ -256,11 +256,21 @@ func newGatewayRebindPredecessorFixture(t *testing.T) gatewayRebindPredecessorFi
 }
 
 func newGatewayRebindPredecessorFixtureWithClaim(t *testing.T, insertClaim bool) gatewayRebindPredecessorFixture {
-	return newGatewayRebindPredecessorFixtureWithLANApprover(t, insertClaim, "")
+	return newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t, insertClaim, '4', "")
 }
 
 func newGatewayRebindPredecessorFixtureWithLANApprover(t *testing.T, insertClaim bool,
 	lanApproverID string,
+) gatewayRebindPredecessorFixture {
+	return newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t, insertClaim, '4', lanApproverID)
+}
+
+func newGatewayRebindPredecessorFixtureWithEndpoint(t *testing.T, insertClaim bool, endpointID rune) gatewayRebindPredecessorFixture {
+	return newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t, insertClaim, endpointID, "")
+}
+
+func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, insertClaim bool,
+	endpointID rune, lanApproverID string,
 ) gatewayRebindPredecessorFixture {
 	t.Helper()
 	manager, runner := newManagerFixture(t, false)
@@ -388,7 +398,7 @@ func newGatewayRebindPredecessorFixtureWithLANApprover(t *testing.T, insertClaim
 		appID: {
 			Slot: generatedruntime.Slot(active.Slot),
 			Endpoints: []generatedruntime.RouteEndpoint{
-				endpoint("api", "server", "rebind-app-network", "rebind-app-blue", 3000, '4'),
+				endpoint("api", "server", "rebind-app-network", "rebind-app-blue", 3000, endpointID),
 			},
 		},
 	}}

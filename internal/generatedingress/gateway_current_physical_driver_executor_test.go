@@ -355,6 +355,9 @@ func (r *gatewayCurrentPhysicalExecutor) inspect(args []string) (runtimeprocess.
 
 func (r *gatewayCurrentPhysicalExecutor) list(args []string) (runtimeprocess.CommandResult, error) {
 	if args[0] == "container" && containsArgumentPrefix(args, "volume=") {
+		if !r.containerPresent {
+			return runtimeprocess.CommandResult{}, nil
+		}
 		return runtimeprocess.CommandResult{Stdout: []byte(r.target.Resources.FinalContainer.ID + "\n")}, nil
 	}
 	var names []string

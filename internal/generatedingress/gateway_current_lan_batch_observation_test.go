@@ -59,6 +59,25 @@ func gatewayCurrentLANBatchObservationFixture(t *testing.T) (gatewayCurrentState
 	[]GatewayV2LANDisableStartupClaim, gatewayCurrentRouteState,
 ) {
 	t.Helper()
+	f, snapshot, grants, disables := gatewayCurrentLANBatchPendingClaimsFixture(t)
+	claims, err := validateGatewayV2LANAccessStartupClaims(grants, disables)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := gatewayCurrentLANRecoveryInstallState(f.baseline, claims)
+	if err != nil || !gatewayCurrentLANRecoveryCensusMatchesHead(batch, claims, snapshot.CurrentTransfers) {
+		t.Fatalf("batch census fixture: %v", err)
+	}
+	if err := f.store.saveNext(f.baseline, batch); err != nil {
+		t.Fatal(err)
+	}
+	return f, snapshot, grants, disables, batch
+}
+
+func gatewayCurrentLANBatchPendingClaimsFixture(t *testing.T) (gatewayCurrentStateFixture,
+	appaccess.GatewayRebindRecoverySnapshot, []GatewayV2LANStartupClaim, []GatewayV2LANDisableStartupClaim,
+) {
+	t.Helper()
 	f, snapshot, _, _ := gatewayRebindCurrentStartupFixture(t)
 	state := cloneGatewayCurrentRouteState(f.baseline)
 	_, seed := routeOperationTransferredApp(t, state)
@@ -86,18 +105,7 @@ func gatewayCurrentLANBatchObservationFixture(t *testing.T) (gatewayCurrentState
 		disables = append(disables, GatewayV2LANDisableStartupClaim{Request: request,
 			State: appaccess.AppAccessDisablePrepared, StateSequence: 1, CurrentBinding: grants[index].CurrentBinding})
 	}
-	claims, err := validateGatewayV2LANAccessStartupClaims(grants, disables)
-	if err != nil {
-		t.Fatal(err)
-	}
-	batch, err := gatewayCurrentLANRecoveryInstallState(f.baseline, claims)
-	if err != nil || !gatewayCurrentLANRecoveryCensusMatchesHead(batch, claims, snapshot.CurrentTransfers) {
-		t.Fatalf("batch census fixture: %v", err)
-	}
-	if err := f.store.saveNext(f.baseline, batch); err != nil {
-		t.Fatal(err)
-	}
-	return f, snapshot, grants, disables, batch
+	return f, snapshot, grants, disables
 }
 
 func TestGatewayCurrentLANRecoveryHeadRequiresCurrentBatchProof(t *testing.T) {

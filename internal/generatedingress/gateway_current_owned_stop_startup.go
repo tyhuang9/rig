@@ -104,6 +104,16 @@ func (m *Manager) stopOwnedGatewayCurrentOnStartupFailure(ctx context.Context) (
 		}
 		result.StoppedOrAbsentTargets++
 	}
+	if enumerateErr != nil {
+		// A corrupt current bundle remains a startup error. Independently bound
+		// typed terminal ownership can still withdraw its exact container.
+		verified, stopped, terminalCensus := m.stopGatewayCurrentTerminalFallbackLocked(stopCtx, targets)
+		result.VerifiedTargets += verified
+		result.StoppedOrAbsentTargets += stopped
+		result.ProtectedRebindHistoryPresent = result.ProtectedRebindHistoryPresent || terminalCensus.ProtectedRebindHistory
+		result.UnresolvedProtectedRebindHistory = result.UnresolvedProtectedRebindHistory || terminalCensus.UnresolvedAttempt
+		result.RebindOwnershipPresent = result.RebindOwnershipPresent || terminalCensus.CommittedOwnership
+	}
 	confirmErr := m.confirmGatewayCurrentEmergencyCensusLocked(targets, census)
 	combined := errors.Join(append([]error{enumerateErr}, stopErrors...)...)
 	if combined != nil || confirmErr != nil || census.UnresolvedAttempt || !census.CommittedOwnership || len(targets) == 0 ||

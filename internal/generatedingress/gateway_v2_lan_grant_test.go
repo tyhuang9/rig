@@ -1159,6 +1159,8 @@ func TestGatewayV2ProductionEmergencyStopUsesBoundIdentityWithForeignImageLabels
 }
 
 func TestGatewayV2EmergencyStopConstructionBypassesUnavailableDatabaseFenceOnlyForExactOwnedStop(t *testing.T) {
+	priorFailStop := gatewayRebindProcessFailStop.Load()
+	t.Cleanup(func() { gatewayRebindProcessFailStop.Store(priorFailStop) })
 	manager, _, state, journal, _, _ := gatewayV2LANGrantFixture(t)
 	labels := gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, gatewayV2FinalContainerRole, true)
 	runner := &gatewayV2EmergencyStopRunner{inspection: gatewayContainerInspection{

@@ -115,6 +115,23 @@ func validGatewayRebindNativeStartupAuthority(snapshot appaccess.GatewayRebindRe
 }
 
 func readGatewayRebindProtectedPresenceReadOnly(dataRoot string) (gatewayRebindProtectedPresenceSnapshot, error) {
+	return readGatewayRebindProtectedPresenceMode(dataRoot, true)
+}
+
+// Emergency ownership enumeration fingerprints native route files without
+// trusting their JSON. Only an independently journal-bound native stop may
+// follow a complete absence of rebind ownership; serving reads stay strict.
+func readGatewayRebindProtectedPresenceMode(dataRoot string, validateNativeRoute bool) (gatewayRebindProtectedPresenceSnapshot, error) {
+	return readGatewayRebindProtectedPresenceInspection(dataRoot, validateNativeRoute, true)
+}
+
+// Only terminal-owned emergency withdrawal may fingerprint current route
+// bytes without decoding them. Normal presence and serving readers stay strict.
+func readGatewayRebindProtectedPresenceForTerminalWithdrawal(dataRoot string) (gatewayRebindProtectedPresenceSnapshot, error) {
+	return readGatewayRebindProtectedPresenceInspection(dataRoot, false, false)
+}
+
+func readGatewayRebindProtectedPresenceInspection(dataRoot string, validateNativeRoute, validateCurrentRoute bool) (gatewayRebindProtectedPresenceSnapshot, error) {
 	store, directoryPresent, pathIdentities, err := inspectStateStoreReadOnly(dataRoot)
 	result := gatewayRebindProtectedPresenceSnapshot{directoryPaths: pathIdentities,
 		files: make(map[string]gatewayHistoryFileFingerprint)}
@@ -146,8 +163,10 @@ func readGatewayRebindProtectedPresenceReadOnly(dataRoot string) (gatewayRebindP
 			if fingerprintErr != nil {
 				return gatewayRebindProtectedPresenceSnapshot{}, fingerprintErr
 			}
-			if _, loadErr := store.load(); loadErr != nil {
-				return gatewayRebindProtectedPresenceSnapshot{}, loadErr
+			if validateNativeRoute {
+				if _, loadErr := store.load(); loadErr != nil {
+					return gatewayRebindProtectedPresenceSnapshot{}, loadErr
+				}
 			}
 			result.files[entry.Name()] = fingerprint
 			continue
@@ -172,16 +191,18 @@ func readGatewayRebindProtectedPresenceReadOnly(dataRoot string) (gatewayRebindP
 		if !isRebind && !currentRelevant {
 			continue
 		}
-		if currentRelevant {
+		if currentRelevant && validateCurrentRoute {
 			currentStore := &gatewayCurrentRouteStateStore{directory: store, dataRoot: dataRoot,
 				generation: currentGeneration, operationID: currentOperation, path: path}
 			_, currentStore.purpose = gatewayCurrentRouteStateName(currentGeneration, currentOperation)
 			if _, loadErr := currentStore.load(); loadErr != nil {
 				return gatewayRebindProtectedPresenceSnapshot{}, loadErr
 			}
-		} else if validateErr := validateGatewayRebindPresenceArtifact(store, path, entry.Name(), generation,
-			operationID, sequence, kind); validateErr != nil {
-			return gatewayRebindProtectedPresenceSnapshot{}, validateErr
+		} else if !currentRelevant {
+			if validateErr := validateGatewayRebindPresenceArtifact(store, path, entry.Name(), generation,
+				operationID, sequence, kind); validateErr != nil {
+				return gatewayRebindProtectedPresenceSnapshot{}, validateErr
+			}
 		}
 		result.present = true
 	}
@@ -238,6 +259,13 @@ func validateGatewayRebindPresenceArtifact(directory *stateStore, path, name str
 		_, err := store.load()
 		return err
 	case gatewayHistoryRebindTerminal:
+		if strings.HasPrefix(name, gatewayRebindTerminalFilenamePrefixV2) {
+			store := &gatewayRebindTerminalStoreV2{directory: directory, generation: generation,
+				operationID: operationID, path: path}
+			_, store.purpose = gatewayRebindTerminalNameV2(generation, operationID)
+			_, err := store.load()
+			return err
+		}
 		store := &gatewayRebindFinalHandoverTerminalStore{directory: directory, generation: generation,
 			operationID: operationID, path: path}
 		_, store.purpose = gatewayRebindFinalHandoverTerminalName(generation, operationID)

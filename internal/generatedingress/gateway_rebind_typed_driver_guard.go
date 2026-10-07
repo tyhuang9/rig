@@ -20,6 +20,70 @@ type gatewayRebindTypedRuntimeHeadsRepository interface {
 	GatewayRebindRuntimeHeads(context.Context) ([]appaccess.GatewayRebindRuntimeHead, error)
 }
 
+// Forward effects require current serving permission as well as retained
+// ownership. Keep this separate from the ownership boundary so revocation
+// cannot prevent stopping or removing an exactly owned resource.
+func (m *Manager) readGatewayRebindTypedForwardBoundaryLocked(ctx context.Context,
+	request gatewayRebindPhysicalReconcileRequest,
+) (gatewayRebindTypedAttemptBoundary, error) {
+	invalid := func() (gatewayRebindTypedAttemptBoundary, error) {
+		return gatewayRebindTypedAttemptBoundary{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	if m == nil || ctx == nil || ctx.Err() != nil || !validGatewayRebindPhysicalReconcileRequest(request) {
+		return invalid()
+	}
+	repository, ok := m.options.RebindCurrentStateRepository.(GatewayCurrentServingStartupRepository)
+	if !ok {
+		return invalid()
+	}
+	first, err := repository.HostingGatewayStartupSnapshot(ctx)
+	if err != nil || !first.ActiveRebindApprovalsAuthorizeServing() ||
+		!gatewayRebindTypedSnapshotMatchesRequest(first.Rebind, request) ||
+		!gatewayRebindTypedRosterApprovalsCurrent(request.Attempt, first.Grants) {
+		return invalid()
+	}
+	boundary, err := m.readGatewayRebindTypedAttemptBoundaryLocked(ctx, request)
+	if err != nil || !reflect.DeepEqual(first.Rebind, boundary.Snapshot) ||
+		!sameGatewayRebindRuntimeHeads(first.RuntimeHeads, request.Attempt.Intent.RuntimeHeads) {
+		return invalid()
+	}
+	second, err := repository.HostingGatewayStartupSnapshot(ctx)
+	if err != nil || ctx.Err() != nil || !reflect.DeepEqual(first, second) {
+		return invalid()
+	}
+	return boundary, nil
+}
+
+func gatewayRebindTypedRosterApprovalsCurrent(attempt gatewayRebindPreparedAttempt,
+	snapshot appaccess.AppAccessGrantStartupSnapshot,
+) bool {
+	grants := make(map[string]appaccess.AppAccessGrantStartupClaim, len(snapshot.Claims))
+	for _, grant := range snapshot.Claims {
+		if _, duplicate := grants[grant.Claim.AttemptID]; duplicate {
+			return false
+		}
+		grants[grant.Claim.AttemptID] = grant
+	}
+	for _, entry := range attempt.Intent.Roster {
+		grant, exists := grants[entry.GrantAttemptID]
+		if !exists || !grant.ApproverIsAdministrator {
+			return false
+		}
+		var raw *gatewayV2LANBinding
+		if attempt.Checkpoint.UpgradeState != nil {
+			raw = attempt.Checkpoint.UpgradeState.Apps[entry.AppID].LAN
+		} else if attempt.Checkpoint.CurrentState != nil {
+			if lan := attempt.Checkpoint.CurrentState.Apps[entry.AppID].LAN; lan != nil {
+				raw = &lan.Raw
+			}
+		}
+		if raw == nil || GatewayLANGrantRequest(grant.Claim) != gatewayV2LANGrantRequestForBinding(entry.AppID, *raw) {
+			return false
+		}
+	}
+	return true
+}
+
 // readGatewayRebindTypedAttemptBoundaryLocked is the active-attempt authority
 // check used immediately before and after every typed physical effect. It is
 // deliberately separate from the ordinary current driver: an admitted

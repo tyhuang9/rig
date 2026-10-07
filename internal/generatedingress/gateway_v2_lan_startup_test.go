@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/hostd/hostd/internal/appaccess"
@@ -320,6 +321,7 @@ func TestGatewayV2LANStartupQuarantineRejectsMultipleUnresolvedExposuresBeforeMu
 
 func TestGatewayV2LANStartupFailureStopsOnlyJournalBoundGatewayWithoutReadingRouteState(t *testing.T) {
 	manager, store, _, _, _, driver := gatewayV2LANGrantFixture(t)
+	manager.gatewayRebindFailStop = &atomic.Bool{}
 	manager.options.RebindFenceCheck = func(context.Context) error {
 		return errors.New("database unavailable during emergency stop")
 	}

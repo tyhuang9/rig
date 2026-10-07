@@ -48,6 +48,9 @@ func (m *Manager) QuarantineGatewayV2LANAccessRecoveryBatch(ctx context.Context,
 
 	workCtx, cancelWork := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelWork()
+	if handled, currentErr := m.quarantineGatewayCurrentLANRecoveryBatchLocked(workCtx, grants, disables); currentErr != nil || handled {
+		return currentErr
+	}
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil || !validGatewayV2RouteState(state) {
 		return gatewayV2StartupInspectionError(workCtx)

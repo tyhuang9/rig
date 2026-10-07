@@ -275,11 +275,17 @@ func (m *Manager) gatewayCurrentOwnedStopTargetsProtectedPartialLocked() (
 	if m == nil {
 		return nil, gatewayCurrentOwnedStopHistoryCensus{}, errors.New("invalid current owned-stop manager")
 	}
-	presence, err := readGatewayRebindProtectedPresenceReadOnly(m.options.DataRoot)
+	presence, err := readGatewayRebindProtectedPresenceMode(m.options.DataRoot, false)
 	if err != nil {
 		return nil, gatewayCurrentOwnedStopHistoryCensus{}, err
 	}
-	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if !presence.present {
+		// Native route corruption must not prevent a separate exact journal-
+		// bound emergency withdrawal. No current rebind artifact is present;
+		// this is not serving authority or a native ownership proof.
+		return nil, gatewayCurrentOwnedStopHistoryCensus{}, nil
+	}
+	history, err := m.gatewayCurrentOwnedStopHistoryLocked()
 	if err != nil {
 		return nil, gatewayCurrentOwnedStopHistoryCensus{ProtectedRebindHistory: presence.present}, err
 	}
@@ -338,7 +344,7 @@ func cloneGatewayCurrentPhysicalTransition(value gatewayCurrentPhysicalTransitio
 func (m *Manager) gatewayCurrentOwnedStopTerminalLocked(
 	lineage appaccess.GatewayCurrentLineageRef,
 ) (gatewayRebindAttemptTerminalView, error) {
-	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	history, err := m.gatewayCurrentOwnedStopHistoryLocked()
 	if err != nil {
 		return gatewayRebindAttemptTerminalView{}, err
 	}

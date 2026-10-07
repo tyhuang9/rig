@@ -1868,3 +1868,946 @@ and the admission latch, unsupported capability refusal, stale/drifting ownershi
 and three native recovery regressions. Vet, full Go build, gofmt and
 `git diff --check` passed. These are protected-file tests with projected SQL and
 simulated physical evidence; they do not establish real Docker stop or restart.
+
+Independent review accepted frozen `df9689a`. The exact positive retirement,
+stopped-marker preservation and ownership-wrapper tests passed independently:
+three top-level tests and four subcases, zero failures/skips, 111.105s
+(`Rig/temp/cross-store-review-df968-retirement-guard.jsonl`). This bounded review
+does not close the documented fresh-process stopped/no-marker recovery case.
+
+## Current whole-batch quarantine
+
+The public current-generation quarantine regression first failed at `df9689a`
+with `route_reconciliation_required` (one test, 28.537s;
+`Rig/temp/m3-current-batch-quarantine-red.jsonl`). The current consumer now derives
+and persists one immutable queue from the complete validated claims before
+withdrawing every unsafe binding. Replay keeps the same revision and head;
+the completed queue is reattested without invoking a head effect. Existing
+ordinary pending evidence is carried in `LegacyPending`.
+
+Unqueueable claims, including a stale committed grant, stop the exact protected
+owner before recovery refusal; they never fabricate a rollback or disable.
+Failures after intent retain the queue and compensate through the protected
+state-only stop path even when SQL becomes unreadable. Once quarantine starts,
+a bounded independent context completes withdrawal or compensation despite
+client cancellation. Every physical proof/effect is followed by exact SQL,
+protected-state and retained-history confirmation. SQL claims are never resolved
+by this consumer; ordered explicit finalization remains separate work.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=6m ./internal/generatedingress -run '^TestGatewayCurrentLANRecoveryBatch(Quarantine|Quarantines|StopsUnqueueable|RetainsIntent)'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^Test(GatewayCurrentLANRecoveryHeadObservesWholeBatchAndCompletion|GatewayV2LANRecoveryBatch(QuarantinesTwoPreparedDisables|RejectsCommittedStaleGrantBeforeIntent|StopsOwnedGatewayOnInvalidReplayCensus))$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+```
+
+The new quarantine suite passed five top-level tests and five subcases in
+254.078s, zero failures/skips (`Rig/temp/m3-current-batch-quarantine-green.jsonl`).
+It verifies all-items withdrawal after durable installation, replay without a
+new revision/effect, pre-intent refusal with owned stop, lost withdrawal
+acknowledgement, SQL failure after withdrawal, bounded completion despite client
+cancellation, completed-queue preservation and retained pending evidence.
+The tests use real protected files with projected SQL and simulated physical
+effects. They do not verify the actual managed Docker adapter.
+
+Preservation passed four top-level tests with zero failures/skips in 21.286s
+(`Rig/temp/m3-current-batch-quarantine-preservation.jsonl`): the shared current
+observer fixture and three native quarantine success/refusal paths. Vet, gofmt
+and `git diff --check` also passed.
+
+## Startup recovery coordinator integration
+
+Independent review also accepted quarantine `d14c0ae`: three top-level tests
+and five subcases passed in 108.951s, zero failures/skips
+(`Rig/temp/cross-store-review-d14-quarantine.jsonl`). The exact selection was
+`^TestGatewayCurrentLANRecoveryBatch(QuarantinesAllItems|StopsUnqueueableClaimsBeforeIntent|RetainsIntentAfterEffectUncertainty)$`.
+Source/security review found no blocker within this consumer's scope.
+
+Reviewed `99d7cc8` is integrated at `a1a54d3`. The public
+`RecoverGatewayRebindStartup` coordinator owns effects and gateway leases,
+recovers phase-bound SQL/protected intent, reproves no-effect abort receipts,
+and reattests committed current authority before releasing the fence. A
+database-committed operation permits forward recovery only. Required lease
+release failures latch admission closed, including the no-history path.
+
+Independent execution passed six top-level tests and three subcases in
+203.837s, zero failures/skips
+(`Rig/temp/cross-store-review-99d7-startup-recovery.jsonl`). A separate
+checkpoint-removal overlay passed in 18.917s and preserved the prepared fence:
+the suspected first-receipt freshness gap did not reproduce and is not a
+validated vulnerability (`Rig/temp/cross-store-review-99d7-first-noeffect-freshness.jsonl`).
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^Test(RecoverGatewayRebindStartupNoHistoryOwnsAndReleasesAdmissionLocks|GatewayRebindCoordinatorPreservesTransferAcrossOrdinaryRedeploy)$'
+go build -mod=readonly -buildvcs=false ./...
+```
+
+After integration, both named tests passed in 37.168s, zero failures/skips
+(`Rig/temp/m3-current-batch-integrated-recovery.jsonl`), and the full Go build
+passed. These tests simulate physical effects. The production typed Docker
+adapter remains unavailable; startup dispatch must still be wired before
+ordinary admission with the protected emergency stop path. This is not
+evidence of actual Docker recovery or a completed M3 milestone.
+
+## Ordered current batch finalization
+
+The current-generation public finalization regression first failed at
+`9c61784`: its exact disable head never reached the SQL callback (one test,
+15.727s; `Rig/temp/m3-current-batch-finalization-red.jsonl`). Current finalization
+now uses the same locked public dispatch as native recovery. It accepts only
+the exact immutable head, proves every queued port withdrawn, invokes the
+authorized terminal callback, clears the protected binding, invokes the
+disable clear acknowledgment, then advances one head. The completed queue
+stays installed until the independent retirement census succeeds.
+
+Every proof/callback/write boundary reconfirms selected SQL rebind authority,
+protected state and retained history. SQL callbacks remain responsible for
+actor authorization, exact terminal state and durable readback. Callback
+errors preserve the current head for replay, including a lost acknowledgment
+after SQL success. Physical or protected uncertainty latches admission closed
+and attempts bounded exact-owned withdrawal, without requiring SQL. A grant
+that never published uses its immutable raw head and actual protected digest;
+it does not manufacture a serving binding or a revision-only clearance.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=7m ./internal/generatedingress -run '^TestGatewayCurrentLANRecovery(Finalizes|Finalization)'
+```
+
+The initial suite passed four top-level tests and four subcases in 144.177s,
+zero failures/skips (`Rig/temp/m3-current-batch-finalization-green.jsonl`). It
+covers sequential two-app disable completion through retirement, immutable
+history, refusal of later/old heads, callback failure and cleared replay,
+partial withdrawal, SQL loss, cancellation, protected drift, and an unpublished
+grant. These use real protected files, projected SQL claims and simulated
+physical proofs; they do not establish the controller/database/Docker journey.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayCurrentLANRecoveryFinalizationPreservesAmbiguousWrite|GatewayV2LANRecovery(FinalizesTwoDisablesSequentiallyAndRetires|FinalizesMixedGrantDisableWithoutChangingUnrelatedRoute|DisableAcknowledgmentReplayAdvancesOnce|RejectsCrossItemAndHeadSkip))$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The final additional suite passed five top-level tests and two subcases in
+40.584s, zero failures/skips
+(`Rig/temp/m3-current-batch-finalization-write-preservation.jsonl`). It injects
+an error after each actual protected clearance/head-advance write, checks exact
+installed evidence and owned-stop compensation, and preserves four native
+finalization paths. Vet, the full Go build, gofmt and `git diff --check` passed.
+
+## Reviewed Docker driver and recovery checks
+
+Independent source/security review accepted finalization `232ee4d`. Public
+sequential completion, callback replay/head guard, and ambiguous clearance/head
+write cases passed three top-level tests and two subcases in 105.325s, zero
+failures/skips (`Rig/temp/cross-store-review-232ee-finalization.jsonl`), using
+`^TestGatewayCurrentLANRecovery(FinalizesTwoDisablesInOrder|FinalizationReplayAndHeadGuard|FinalizationPreservesAmbiguousWrite)$`.
+The review found no new blocker in this bounded consumer; complete startup
+census/pin and SQL callback authorization remain required.
+
+With explicit user authorization for these two local integrations, reviewed
+`273769b` (including `47272c9`) was merged at `9cdf800`, followed by reviewed
+`fab0fbd` at `ce56b9d`. No remote branch or PR was changed.
+
+The managed current driver now has concrete ordinary reconciliation and
+protected-only owned-stop implementations. Independent executor tests passed
+four top-level tests and five subcases in 146.155s. Review then reproduced an
+extra ingress network peer acceptance bug (14.053s); the corrected exact
+membership guard and owned-stop preservation passed three top-level tests
+and three subcases in 70.525s. Logs:
+`Rig/temp/cross-store-review-47272-current-physical-executor.jsonl`,
+`Rig/temp/cross-store-review-47272-ingress-peer.jsonl`, and
+`Rig/temp/cross-store-review-273769-ingress-green.jsonl`.
+
+The recovery follow-up reconfirms exact SQL, history, checkpoint and protected
+files after no-effect proof and before SQL rollback. Independent positive and
+snapshot-drift refusal tests passed two top-level tests in 32.742s, zero
+failures/skips (`Rig/temp/cross-store-review-fab0-noeffect-reconfirmation.jsonl`).
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayCurrentLANRecoveryFinalizesTwoDisablesInOrder|ManagedGatewayCurrentPhysicalRuntimeAttestationRequiresExactIngressMembership|RecoverGatewayRebindStartupRefusesFirstNoEffectAbortAfterSnapshotDrift)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Parent integration passed three top-level tests and three subcases in 67.259s,
+zero failures/skips (`Rig/temp/m3-current-batch-integrated-driver.jsonl`). Vet
+and the full Go build passed. Executor simulations are not actual Docker
+acceptance. The production factory remains closed pending the batch adapter,
+typed rebind recovery adapter, protected emergency startup path and guarded
+restart of stopped current state. Hosted Docker and Linux race gates remain
+unverified for this unit.
+
+## Real SQL disable after typed rebind
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayCurrentLANRecoveryFinalizationCommitsRealSQLAfterRebind$'
+```
+
+The integration test passed in 30.773s, one top-level test, zero failures/skips
+(`Rig/temp/m3-current-batch-finalization-sql.jsonl`). It commits a typed rebind
+through the actual SQLite/protected coordinator, approves and authorizes a
+disable of the transferred source grant, and runs public current finalization
+with real terminal SQL release/readback and durable protected-clear acknowledgment.
+It then verifies the completed protected head, released allocation, exact
+retained transfer chain, unchanged source approval/proof and unchanged rebind
+history/current authority. Vet, gofmt and `git diff --check` passed.
+
+Queue installation and physical withdrawal are fixture setup. This test does
+not claim controller HTTP authorization, startup conversion, or real Docker
+acceptance. Those remain part of the complete runtime integration gate.
+
+Independent review accepted `fc463d8`; its exact real-SQL test passed again in
+30.714s, zero failures/skips
+(`Rig/temp/cross-store-review-fc463-real-finalization.jsonl`).
+
+## Consistent startup runtime census
+
+`HostingGatewayStartupSnapshot` now includes all active generated runtime heads
+and their exact component rows in the same read transaction as gateway/LAN/rebind
+authority. Loopback applications are included; archived/inactive applications
+are excluded. Failed component rows remain visible for refusal by serving
+authorization. Missing, malformed or crossed component identities return no
+partial snapshot. No schema or immutable history format changes are involved.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/appaccess -run '^TestHostingGatewayStartupRuntimeCensus'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=5m ./internal/appaccess ./cmd/hostd -run 'Startup|RuntimeHeads'
+go vet -mod=readonly ./internal/appaccess ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The new census tests passed three top-level tests and seven subcases in 4.145s,
+zero failures/skips (`Rig/temp/m3-startup-runtime-census-green.jsonl`). They
+exercise a concurrent redeploy through a separate SQLite handle, complete
+LAN/loopback enumeration, failed component visibility, read-only behavior and
+seven malformed/missing component cases. The first test run exposed an invalid
+test setup: SQL correctly refused draining an actively routed component. The
+fixture was corrected to the supported active-to-failed transition; no production
+guard was weakened (`Rig/temp/m3-startup-runtime-census.jsonl`).
+
+This read projection is input to the pending guarded restart consumer, not
+permission to restart or evidence of Docker serving. Vet and the full build passed.
+
+The preservation run passed 32 appaccess tests plus 64 subcases in 34.628s,
+and 14 hostd tests plus 26 subcases in 3.167s, zero failures/skips
+(`Rig/temp/m3-startup-runtime-census-preservation.jsonl`). Independent review
+accepted `2789250`: three census tests plus seven subcases passed in 4.037s
+(`Rig/temp/cross-store-review-278925-runtime-census.jsonl`).
+
+## Guarded restoration of current serving state
+
+`RestoreGatewayCurrentServingStartup` takes the deployment effects lease and
+gateway locks before reading complete SQL authority. It accepts only a stable
+current generation or a fully completed LAN recovery batch. Every protected
+endpoint must match an active SQL component in the exact active deployment and
+slot, including loopback applications. The complete authority digest, selected
+protected state, terminal history, fence, retained LAN provenance and completed
+batch acknowledgments are reconfirmed at physical effect boundaries and after
+serving proof. A final selected-state read covers mutable bundles that are not
+included in the immutable-history fingerprint.
+
+Restoration does not write SQL, retire a recovery queue or rewrite history. A
+failure after selection latches admission and stops the exact protected owner
+using a bounded uncancelled context. Changed ownership or an unproved stop remains
+explicitly unresolved. Unfinished operations stay on their separate recovery path.
+The controller's existing LAN SQL conversion was moved into shared ingress
+functions without changing its claims or retained authority semantics.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=6m ./internal/generatedingress -run '^TestGatewayCurrentServing(Restore|RuntimeCensus)'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=5m ./internal/generatedingress -run '^TestGatewayCurrentServingRestore(StopsExactOwnerAfterLostProof|RefusesUnfinishedBatch)$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayCurrentServingRestoreRefusesLastReadProtectedReplacement$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./cmd/hostd -run 'Startup'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The first restart run failed because the older commit fixture deliberately used
+different SQL and protected container identities. The guard correctly refused it.
+Fixtures now perform an ordinary redeploy through the real runtime repository and
+public ingress switch before asserting restart; the ownership check was not weakened.
+Initial failure logs are `Rig/temp/m3-current-serving-restore-initial.jsonl` and
+`Rig/temp/m3-current-serving-restore-completed.jsonl`.
+
+The corrected initial suite passed five tests and 14 subcases in 180.646s
+(`Rig/temp/m3-current-serving-restore-green.jsonl`). Further compensation and
+unfinished-batch checks passed two tests and four subcases in 129.923s
+(`Rig/temp/m3-current-serving-restore-compensation.jsonl`). They cover lost SQL
+authority after the effect, cancellation, a self-consistent proof for the wrong
+revision, and a failed stop acknowledgment. The late protected replacement check
+passed one test in 28.671s (`Rig/temp/m3-current-serving-restore-final-selection.jsonl`).
+The initial regex ran before these last three tests were added; the logs do not
+claim a single aggregate run. Every recorded run has zero failures/skips.
+
+Shared projection preservation passed 14 hostd tests and 26 subcases in 3.169s
+(`Rig/temp/m3-shared-lan-projection.jsonl`). Vet, the full Go build, gofmt and
+`git diff --check` passed. These tests use actual SQLite/protected state with an
+injected physical driver; the fixture redeploy also simulates Docker. Concrete
+restore driver review, hostd startup wiring, actual Docker and Linux race gates
+remain required. The production physical factory remains closed.
+
+## Approved local Docker batch and emergency integrations
+
+The user explicitly approved local integration of reviewed `d5ec8b9` and
+`1bcc5e1` into this branch, and of previously reviewed `273769b` into the runtime
+worker branch. Parent merges are `03d1127` and `7d60803`; the worker integration
+is `98bb3c2`. This approval does not authorize remote publication, GitHub PR
+merges or deployment. The worker's further typed adapter work remains separate.
+
+The batch adapter initially reported whole-batch absence after a lost reload
+acknowledgment while restart configuration still retained the withdrawn LAN
+bindings. Independent regression reproduced that failure in 18.204s
+(`Rig/temp/cross-store-review-cf709-batch-restart.jsonl`). Corrected `d5ec8b9`
+requires canonical live and restart configuration to agree before reporting
+complete absence. Five independent tests passed in 88.864s, zero failures/skips
+(`Rig/temp/cross-store-review-d5ec-batch-green.jsonl`).
+
+The emergency API initially missed an orphan scoped current bundle beside a
+valid committed generation. Independent regression reproduced the failure in
+17.266s (`Rig/temp/cross-store-review-5a786-emergency-orphan.jsonl`). Corrected
+`1bcc5e1` associates every bundle with its exact protected terminal and repeats
+the complete ownership census after physical withdrawal. Six checks passed in
+64.838s, followed by four final checks in 37.543s, zero failures/skips
+(`Rig/temp/cross-store-review-1bcc-emergency-final.jsonl`). Active typed attempts
+remain explicitly incomplete until their separate physical adapter can prove
+withdrawal; unknown ownership never authorizes serving or native fallback.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(ManagedGatewayCurrentLANRecoveryRuntimeWithdrawsWholeBatchAfterLostReloadAcknowledgement|GatewayCurrentStartupEmergencyStopRejectsWholeHistoryDriftAfterPhysicalStop|GatewayCurrentServingRestoreKeepsCompletedBatchAndTerminalSQL)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Parent integration passed three tests in 79.699s, zero failures/skips
+(`Rig/temp/m3-current-restart-emergency-integration.jsonl`). Vet and the full
+Go build passed. Command-executor simulations and injected physical proofs are
+not acceptance evidence for actual Docker.
+
+## Controller emergency startup dispatch
+
+The controller now releases any held startup effects admission before calling
+the emergency API with a fresh bounded context. It retains a release failure
+even if subsequent withdrawal succeeds. Protected current history is checked
+first without SQL. The native emergency path is permitted only after complete
+no-current-ownership evidence (including fully retained abort history). Current
+ownership, unknown history, incomplete stops, changed census and inconsistent
+counts cannot be converted into a native-only success.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./cmd/hostd -run 'Startup|RuntimeWorker'
+go vet -mod=readonly ./cmd/hostd ./internal/generatedingress
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The controller suite passed 24 tests and 42 subcases in 3.746s, zero failures/skips
+(`Rig/temp/m3-hostd-current-emergency-wiring.jsonl`). New cases verify admission
+release ordering, retained release/stop failures, fresh context lifetime, twelve
+current/native dispatch cases, cancellation and native ownership failure. Vet,
+the full Go build, gofmt and `git diff --check` passed. These dispatcher tests
+inject stop callbacks. Actual emergency Docker behavior and default driver
+activation remain part of the pending complete runtime gate.
+
+Independent review accepted the guarded serving consumer at `8ca3ada`: four
+tests and two selected post-proof subcases passed in 158.053s, zero failures/skips
+(`Rig/temp/cross-store-review-8ca-serving-restore.jsonl`). Source/security and
+concrete-driver compatibility review found no further consumer defect. The
+concrete driver's actual per-effect guard calls still require its own evidence.
+
+## Typed history and native emergency fallback preservation
+
+A real SQLite/protected no-effect abort fixture exposed two distinct integration
+gaps. First, the presence parser recognized a typed terminal filename but loaded
+it with the legacy terminal purpose/type. The initial regression failed at the
+current ownership census in 18.141s
+(`Rig/temp/m3-native-emergency-retained-abort-red.jsonl`). After adding the typed
+terminal loader dispatch, the same test reached the native emergency path and
+failed because its old history scan rejected every retained rebind artifact,
+in 17.473s (`Rig/temp/m3-native-emergency-retained-abort-fallback-red.jsonl`).
+
+Native journal selection now permits retained rebind history only after complete
+protected enumeration proves no current ownership or unresolved attempt. That
+census is repeated before selection returns; the exact selected journal and
+absence of rebind ownership are verified again after stop. A changed history
+prevents successful completion and latches admission.
+
+The emergency presence mode preserves path safety, file fingerprints and strict
+validation of all rebind/current artifacts while allowing unreadable native route
+JSON when there are no rebind artifacts. This preserves the existing ability to
+stop an exact journal-bound native gateway after route-state corruption. It grants
+no serving authority, and the normal startup presence reader remains strict.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^Test(GatewayCurrentNativeEmergencyFallbackRetainsAbortedRebindHistory|GatewayV2LANStartupFailureStopsOnlyJournalBoundGatewayWithoutReadingRouteState)$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrentNativeEmergency(Refuses|Preserves)'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayRebindStartupPresence|GatewayV2ProductionEmergencyStop|GatewayV2EmergencyStopConstruction|GatewayV2LANCommitResolutionStopsOwnedGatewayWhenProtectedRouteUnreadable|GatewayV2LANDisableAmbiguousWithdrawalFailureStopsOwnedGateway)'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The corrected positive and original native-route corruption test passed two tests
+in 20.009s (`Rig/temp/m3-native-emergency-retained-abort-green.jsonl`). Additional
+typed committed ownership, both native route corruption forms, strict serving
+reader preservation and post-stop history drift checks passed three tests plus
+two subcases in 24.468s (`Rig/temp/m3-native-emergency-typed-and-corruption.jsonl`).
+Both runs have zero failures/skips. The new tests exercise actual protected history
+and the typed commit/abort SQL paths with injected physical stop drivers; they do
+not claim Docker process acceptance. Vet and the full Go build passed.
+
+Existing presence and native emergency preservation passed 14 tests and 18
+subcases in 20.673s, zero failures (`Rig/temp/m3-native-emergency-preservation.jsonl`).
+The Windows run skipped the POSIX directory-permission test and two symlink
+subcases; those remain required in the Linux gate. Gofmt and `git diff --check`
+passed. The native fallback now has real retained typed history acceptance,
+while its physical stop remains simulated.
+
+Independent review of `c828fd5` plus `eba4e29` passed seven tests and sixteen
+subcases, zero failures/skips (ingress 42.161s; hostd 0.753s;
+`Rig/temp/cross-store-review-eba-emergency.jsonl`). The typed/native selection
+behavior passed, but source review held completion for the native emergency
+effect boundary: it still lacked its own deployment effects lease and used a
+lock that rejects an existing process fail-stop.
+
+Two positive-first boundary tests reproduced both defects in 1.280s
+(`Rig/temp/m3-native-emergency-effects-boundary-red.jsonl`): a preexisting latch
+prevented withdrawal, and a native stop bypassed an actually held effects lease.
+The native emergency API now owns that lease before its gateway locks, uses the
+withdrawal-only lock path, latches ordinary admission before stop, and retains
+foreign commit barriers and all release errors. Callers must release their own
+startup effects admission first. Existing ordinary/serving locks remain strict.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^Test(GatewayCurrentNativeEmergency(CrossesExistingFailStopOnlyToWithdraw|WaitsForActualEffectsLease|ReleaseFailureRetainsAdmissionLatch)|GatewayV2EmergencyStopConstructionBypassesUnavailableDatabaseFenceOnlyForExactOwnedStop|GatewayV2LANStartupFailureStopsOnlyJournalBoundGatewayWithoutReadingRouteState)$'
+```
+
+All five tests passed in 1.974s, zero failures/skips
+(`Rig/temp/m3-native-emergency-effects-boundary-green.jsonl`), including actual
+lease contention, existing latch/foreign barrier preservation, release failure,
+the exported command-runner stop and corrupt native route-state withdrawal.
+Fixtures isolate intentional process latching so it cannot contaminate later
+tests. Vet, the full Go build, gofmt and `git diff --check` passed. Actual Docker
+and Linux race acceptance remain pending.
+
+Independent review accepted the combined controller/emergency scope at
+`325a63a`, including `c828fd5` and `eba4e29`. The three new lease, prelatched
+withdrawal and release-failure tests passed in 1.415s, zero failures/skips
+(`Rig/temp/cross-store-review-325-native-boundary.jsonl`), with frozen HEAD and
+clean status verified before/after. Source review confirmed effects admission
+before the withdrawal-only gateway lock, sticky fail-stop, foreign barrier
+preservation, no SQL serving authority and final protected ownership checks.
+This is a bounded emergency-path acceptance; the complete typed Docker adapter,
+serving driver activation and end-to-end hosted runtime gate remain incomplete.
+
+## Reviewed concrete restart driver candidate
+
+Worker commit `14c2913ad7709ff4e411a71c3424822455113700` adds the concrete current
+serving restore driver, its command-executor tests and a six-line final
+authorization/latch check in the existing stopped-container restart helper.
+The latter closes a reproduced late-inventory race where authority could change
+after the opening guard and before container start. No default factory is enabled.
+
+Owner overlay checks against frozen integration dependencies passed four tests
+and eight subcases in 186.077s; ordinary restart preservation passed one test and
+two subcases in 46.707s. Independent review used only the candidate files over
+exact integrated `7d60803`, verified both source/base identities and clean state,
+and passed two tests plus five subcases in 94.448s, zero failures/skips
+(`Rig/temp/cross-store-review-14c-restore.jsonl`). These cover completed-batch
+restart, lost acknowledgment, before-start refusal, post-start drift and the
+late-inventory no-effect regression. Overlay vet passed. Actual Docker remains
+unverified. The first independent attempt failed before tests because one Git
+identity lookup omitted its checkout directory; the corrected run is the recorded
+application evidence.
+
+The user explicitly approved local integration of `14c2913`; it was integrated
+as `37cd6787087929c58aaa947a5bbbca93c58af677`. Its three-file delta is based on
+already integrated `d5ec8b9`. The parent integration check passed three tests and
+two subcases in 75.756s, zero failures/skips
+(`Rig/temp/m3-current-serving-driver-integration.jsonl`):
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(ManagedGatewayCurrentServingRestoreRuntimeRechecksAuthorityAfterFinalStoppedInventory|GatewayCurrentServingRestoreKeepsCompletedBatchAndTerminalSQL|GatewayCurrentNativeEmergencyCrossesExistingFailStopOnlyToWithdraw)$'
+```
+
+Vet and the full Go build passed. This approval authorizes local integration only.
+
+## Typed SQL and concrete restart composition
+
+The combined real SQLite/protected typed commit, ordinary redeploy, startup
+authorization and concrete command-executor test initially refused both stable
+and completed-batch restoration before physical effects (70.831s;
+`Rig/temp/m3-current-serving-sql-executor.jsonl`). Focused diagnosis proved the
+network ownership checks valid, then identified a create-time configuration
+fingerprint mismatch (26.299s;
+`Rig/temp/m3-current-serving-sql-executor-final-base.jsonl`). The verifier had
+unconditionally used the legacy digest envelope `{version,args,networks}` while
+the retained typed constructor uses `{version,args}`.
+
+The verifier now selects exactly the envelope required by the validated terminal
+format. It does not try alternate formats or rewrite retained history. The new
+test covers both stable restart and completed SQL disable recovery followed by
+marker retirement and an idempotent stable restart. It checks lost start
+acknowledgments, unchanged SQL, preserved immutable files and retained recovery
+state until retirement. Docker commands and reachability are simulated.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^Test(GatewayCurrentServingRestoreComposesSQLWithConcreteExecutor|ManagedGatewayCurrentPhysicalRuntimeBindsImmutableContainerAndDynamicNetworks)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Both tests and all six subcases passed in 127.179s, zero failures/skips
+(`Rig/temp/m3-current-serving-sql-executor-green.jsonl`), including existing legacy
+container identity, label and publication-boundary preservation. Vet, full build,
+gofmt and `git diff --check` passed. Independent review remains pending. No default
+factory activation, publication, deployment or hosted Docker acceptance is claimed.
+
+Independent source/security review accepted `59f68db`: the terminal union is
+validated before selecting its exact digest envelope; neither a fallback digest
+nor a rewritten receipt is accepted. Independent execution is recorded separately
+when available.
+
+## Emergency withdrawal with retained no-effect abort and corrupt native routes
+
+Combining the previously separate retained-abort and corrupt-native-route cases
+exposed a refusal: both source-route and native-v2 corruption caused incomplete
+ownership enumeration before shutdown (one test/two subcases, 34.638s;
+`Rig/temp/m3-native-emergency-retained-abort-corruption-red.jsonl`).
+
+The new withdrawal-only fallback applies only after the ordinary history scanner
+fails. It requires exactly the committed generation-zero native journal and
+state-file path, no native retirement/abort or additional native generation, and
+a contiguous sequence consisting entirely of typed no-intent/no-effect aborts.
+Every strict checkpoint must bind its frozen native state to the same journal,
+source digest and full lineage; every terminal must match that exact checkpoint.
+Operations must be unique, current-route bundles are forbidden, and both complete
+safe-file censuses are confirmed again before returning. It returns only a
+no-current/no-unresolved ownership result, never serving authority. The ordinary
+startup scanner remains unchanged and continues rejecting corrupt routes.
+
+Both corruption cases passed in 35.134s, zero failures/skips
+(`Rig/temp/m3-native-emergency-retained-abort-corruption-green.jsonl`). The expanded
+suite passed four tests/seven subcases in 93.062s, zero failures/skips:
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrentNative(AbortEmergencyRequiresCompleteBoundHistory|Emergency(FallbackRetainsAbortedRebindHistory|RetainedAbortSurvivesCorruptNativeRoute|RefusesTypedCommittedOwnership))$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=2m ./internal/generatedingress -run '^TestGatewayCurrentNativeAbortEmergencyRequiresCompleteBoundHistory$/^orphan_current_bundle$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The first command's log is
+`Rig/temp/m3-native-emergency-immutable-boundaries-green.jsonl`. It includes
+positive-first refusal of missing checkpoints/terminals, a structurally valid
+changed journal, a structurally valid changed checkpoint that disagrees with its
+terminal, an extra native generation, and post-stop unknown history. The added
+valid orphan-current-bundle subcase passed in 33.872s (one test/one subcase;
+`Rig/temp/m3-native-emergency-immutable-orphan-green.jsonl`). An initial test-only
+compile error used a nonexistent route-generation field; it was corrected to a
+valid endpoint-ID change before the successful boundary run. Vet and full build
+passed; gofmt and `git diff --check` passed.
+
+Review has accepted the bounded design and source; independent execution remains
+pending. Physical stop is injected, not live Docker. Corrupt native routes with
+committed rebind ownership, mixed legacy history or earlier native generations
+still return incomplete ownership and retain the startup latch. Those require
+separate immutable-history support. A corrupt current route bundle additionally
+requires a terminal-only exact-container withdrawal capability; no valid route
+state is fabricated from incomplete evidence. M3 and the production adapter remain
+incomplete.
+
+Independent review accepted frozen `769354f3d783ebbc3c18ad0a311f2b82c04c04e8`
+including `59f68db`. Two tests/three selected subcases passed in 73.075s, zero
+failures/skips: real-SQL/concrete stable restoration (40.40s), retained-abort
+source corruption (15.96s), and native-v2 corruption (16.46s). Evidence:
+`Rig/temp/cross-store-review-769-59-composition-emergency.jsonl`. The reviewer
+verified exact HEAD and clean status before/after and reviewed all six boundary
+mutations plus late-history refusal. This is bounded acceptance of the recorded
+scope; the limitations above remain open, and default activation remains closed.
+
+## Immutable typed history for committed-current emergency withdrawal
+
+The next positive-first test reproduced the remaining committed-current refusal
+with corrupt source and native-v2 routes (one test/two subcases, 46.307s;
+`Rig/temp/m3-typed-emergency-native-corruption-red.jsonl`). The new withdrawal-only
+history reader replaces the narrower no-effect-abort fallback. It validates prior
+native aborts/retirements with their existing historical validators, binds the
+committed native journal to an exact frozen checkpoint, and walks every contiguous
+typed checkpoint, intent, progress record and terminal with the existing format,
+lineage, resource and predecessor-port validators. Duplicate operations, gaps,
+foreign formats, missing terminal evidence and crossed bindings remain errors.
+An active tail is retained as unresolved, never reported as all traffic absent.
+Complete history and safe-file presence snapshots must remain unchanged.
+
+Only owned-stop enumeration and its terminal revalidation use this reader. It
+returns no source-route bytes and cannot supply serving authority. Both initial
+target construction and before/after effect guards now use the same immutable
+terminal selection. Normal startup selection and its SQL checks remain strict.
+
+```powershell
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=3m ./internal/generatedingress -run '^TestGatewayCurrentTypedEmergencyWithdrawsWithCorruptNativeRoute$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrentTypedEmergency(ValidatesPriorNativeGenerations|RetainsRepeatedCommitOwnership)$'
+go test -mod=readonly -buildvcs=false -p=1 -json -count=1 -timeout=4m ./internal/generatedingress -run '^TestGatewayCurrent(NativeAbortEmergencyRequiresCompleteBoundHistory|StartupEmergencyStop)'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The initial injected-driver integration passed two tests/four subcases in 80.390s
+(`Rig/temp/m3-typed-emergency-native-corruption-green.jsonl`). The strengthened
+test composes real SQLite/protected typed commit with the concrete managed stop
+adapter and command-runner simulation: both native corruption cases passed in
+48.752s, including lost stop acknowledgment, exact container ID, unchanged current
+state/history and sticky admission latch
+(`Rig/temp/m3-typed-emergency-concrete-stop.jsonl`). No SQL reader is available to
+the withdrawal path. Actual Docker remains unverified.
+
+Prior native retired/aborted generations, missing predecessor receipts, two real
+SQL/protected typed commits, distinct retained ownership and a structurally valid
+terminal with a crossed claim digest passed two tests/two subcases in 41.408s
+(`Rig/temp/m3-typed-emergency-retained-generations.jsonl`). Vet and full Go build
+passed. The preserved native-abort negative tests continue to cover missing
+checkpoints/terminals, valid changed native journal/checkpoint, extra incomplete
+native generation, orphan current bundle and late history drift.
+
+Existing emergency/API preservation passed nine tests/six subcases in 130.203s,
+zero failures/skips (`Rig/temp/m3-typed-emergency-owned-stop-preservation.jsonl`).
+Gofmt and `git diff --check` passed. Independent source review found no serving
+callsite or weakened normal selector; frozen executable review remains pending.
+
+This supersedes the earlier generation-zero-only and committed-typed/native-route
+corruption limitations. Mixed legacy rebind history under native corruption still
+refuses withdrawal, and corrupt current-route bundles still require a distinct
+terminal-only stop capability. No state is reconstructed from a hash. The active
+database-committed restart consumer, full typed runtime adapter, default activation
+and hosted gates remain incomplete.
+
+Independent executable/source/security review accepted frozen
+`22df0ae30ed73d43a8487bae32149b297ea385e3`. Two tests/three selected subcases passed
+in 25.689s, zero failures/skips: concrete managed stop with lost acknowledgment
+under native-source corruption (24.74s), and retained native retired/aborted
+generations (0.36s/0.34s). Log:
+`Rig/temp/cross-store-review-22df-typed-emergency.jsonl`. Exact HEAD and clean
+status were verified before/after. The reviewer confirmed withdrawal-only
+callsites, empty source routes, exact immutable bindings and complete final
+snapshot checks. This acceptance retains the stated corrupt-current and mixed
+legacy limitations.
+
+## Active database-committed serving restoration (2026-10-06)
+
+Adds a private, already-locked recovery consumer and a distinct managed physical
+driver entry for the exact typed `database_committed` attempt. The caller holds
+the effects lease and both gateway locks before taking its commit-barrier latch.
+Both process admission latches must remain clear. The SQL fence remains active
+throughout; this operation neither transitions SQL nor writes protected state.
+
+Authorization pins the complete same-transaction `HostingGatewayStartupSnapshot`,
+active claim/roster/runtime heads, exact database-commit event, typed commit
+terminal and original baseline, every runtime component (including loopback
+routes), LAN grants/disables and retained provenance. Immutable protected files,
+exact selected current state and caller-supplied attempt authority are reread
+around physical effects and after proof. Prepared/rollback-capable requests,
+missing commit evidence, pending operations, recovery batches and changed
+pre-entry baselines are refused. Ordinary `selectExact` and lower-level
+`restartStopped` admission checks are unchanged; no generic fence exception or
+fabricated no-active snapshot is introduced.
+
+The runtime accepts exact serving state idempotently or restarts its exact owned
+stopped container. Lost acknowledgments require fresh exact observation under
+the same guards. Authority failure latches admission and stops only an unchanged
+exact protected owner. If protected state changes after start, compensation
+refuses to substitute that new state and reports `candidateMayBeLive`; the SQL
+fence and process latch remain. This retains the separately tracked need for a
+terminal-only emergency stop capability.
+
+Executable evidence uses actual SQLite transitions and protected history, with
+the concrete managed Docker command adapter and simulated Docker/probe boundary:
+
+- Initial active-fence/lost-ack/idempotent/latch test passed 1 test in 43.752s:
+  `Rig/temp/m3-active-committed-serving-first.jsonl`.
+- Runtime authority before/after start, protected state before start, and attempt
+  authority after start passed 1 test/4 subcases in 109.872s:
+  `Rig/temp/m3-active-committed-serving-boundaries.jsonl`.
+- Crossed SQL commit event before start and changed protected state after start
+  passed 1 test/2 subcases in 57.279s:
+  `Rig/temp/m3-active-committed-serving-extended.jsonl`.
+- Shared ordinary restart proof, final stopped-inventory guard, full runtime
+  component census and active-fence positive regression passed 4 tests/10
+  subcases in 143.776s:
+  `Rig/temp/m3-active-committed-serving-regression.jsonl`.
+- Final baseline refinement reran the active-fence test in 42.696s, including
+  exact typed baseline equality and refusal of a valid newer protected revision
+  already present before entry:
+  `Rig/temp/m3-active-committed-serving-exact-baseline.jsonl`.
+
+All listed runs had zero failures/skips. Commands (with the existing workspace
+Go cache):
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^TestGatewayRebindCommittedServingRestoreKeepsActiveSQLFence$' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^TestGatewayRebindCommittedServingRestoreRefusesBoundaryDrift$' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^TestGatewayRebindCommittedServingRestoreRefusesBoundaryDrift$/(SQL_event_before_start|protected_after_start)$' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^(TestGatewayRebindCommittedServingRestoreKeepsActiveSQLFence|TestManagedGatewayCurrentServingRestoreRequiresFullAndExactAuthorityAtProof|TestManagedGatewayCurrentServingRestoreRuntimeRechecksAuthorityAfterFinalStoppedInventory|TestGatewayCurrentServingRuntimeCensusRejectsIncompleteOrCrossedComponents)$' -count=1 -json
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Vet, full Go build, gofmt and diff whitespace checks passed. The predecessor
+fixture gained an initial endpoint parameter so SQL and protected runtime IDs
+agree before immutable journals are created; existing fixture defaults remain
+unchanged. No committed fixture identity is rewritten.
+
+This is an internal capability awaiting the coherent typed adapter and its
+independent integration review. Default adapter activation, live Docker, Linux
+race checks, hosted CI and full M3 acceptance remain outstanding. No branch was
+published, merged into another branch or deployed for this unit.
+
+Independent executable/source/security review accepted frozen
+`c7fbd58ec43eb50e80582e23450c76590dfb70d0` for this bounded capability. Two tests/one
+selected subcase passed in 74.955s, zero failures/skips. The positive case
+(44.88s) covered lost acknowledgment, exact baseline refusal, idempotence and
+both latches; post-start runtime-authority loss (29.84s) proved exact-owner
+withdrawal. Log: `Rig/temp/cross-store-review-c7-active-serving.jsonl`.
+
+```text
+go test -mod=readonly -count=1 -json -timeout=4m -run '^TestGatewayRebindCommittedServingRestore(KeepsActiveSQLFence|RefusesBoundaryDrift)$/^(runtime_after_start)$' ./internal/generatedingress
+```
+
+The reviewer verified exact HEAD and clean status before/after and found no
+must-fix source/security issue. This is not acceptance of default activation or
+the full milestone. The separate initial-publication missing-Hosting-authority
+guard is being repaired in the typed-runtime worker. Existing cross-store
+contracts close SQL transactions before Docker and revalidate afterward;
+revocation and component-failure reporting remain available. No additional SQL
+mutation-fence migration was introduced to suppress those safety operations.
+
+## Terminal-only emergency withdrawal for corrupt current routes (2026-10-06)
+
+Adds a separate typed-terminal stop capability with no current route state,
+current SQL selection, route reconstruction or serving proof. Its target binds
+the exact validated typed intent/terminal, successor identity, network plan and
+retained handover local port. A complete protected history scan establishes
+ownership; duplicate final IDs across retained terminals are refused. The
+emergency caller owns the effects lease and gateway locks and keeps its fail-stop
+latch set. A foreign commit barrier is preserved.
+
+Only this emergency presence reader may fingerprint current-route bytes without
+decoding their JSON. Ordinary presence and serving readers remain strict. Both
+the full immutable-history snapshot and complete protected presence fingerprints
+are compared before/after effects, including corrupt current-file replacement.
+If native and current routes are both corrupt, the previously validated typed
+immutable-history reader supplies ownership without recreating either file.
+
+The physical adapter exposes inspection and exact-ID stop only. It checks the
+retained pinned image, volume identity/mountpoints, ingress identity, absence of
+the stage container, complete operation/generation resource census, exact name
+and ID agreement, full immutable container configuration, volume users, and all
+configured LAN/loopback listener ports. Current application-network membership
+is mutable and is not frozen to the historical create roster. Shared metadata
+checks were extracted from the ordinary runtime into `gateway_final_ownership.go`;
+ordinary target validation and serving/config checks remain in their callers.
+Truncated resource inventories now fail closed.
+
+Lost stop acknowledgments require a fresh exact inventory and listener absence.
+A container already stopped or genuinely absent produces no effect. Corrupt or
+missing current routes still produce an incomplete startup result after a
+successful withdrawal, with verified/stopped counts retained. No SQL transition,
+route repair, history rewrite, start, copy, network mutation or resource deletion
+occurs. This path conservatively requires retained image/volume/network inventory
+even when the exact container is absent; separately removed or ambiguous retained
+resources remain unresolved. Mixed legacy rebind history under simultaneous
+native/current corruption retains the previously documented refusal.
+
+The first owner run exposed a reporting defect: strict current-bundle inspection
+returned an empty census even though terminal-only withdrawal stopped the exact
+container. The result now retains the independent terminal census. A negative
+fixture also accidentally reused the real final ID (`9` repeated 64 times); it
+now uses a distinct ID and resets each case's simulated inventory. This initial
+run failed in 92.134s (`Rig/temp/m3-terminal-only-emergency-first.jsonl`) and is not
+acceptance evidence.
+
+Corrected executable evidence uses actual SQLite typed commits/protected history
+and the concrete Docker command adapter with deterministic command/probe fixtures:
+
+- Corrupt, missing, simultaneous native/current corruption; lost acknowledgment;
+  stopped/absent idempotence; changed ID/image/labels/ports; extra owner; and late
+  terminal/current-file change: 3 tests/10 subcases passed in 170.409s,
+  `Rig/temp/m3-terminal-only-emergency-corrected.jsonl`.
+- Truncated ownership inventory, changed volume mountpoint and a remaining
+  listener: 1 test/3 subcases passed in 27.833s,
+  `Rig/temp/m3-terminal-only-emergency-proof-boundaries.jsonl`.
+- Shared immutable/dynamic-network metadata, ordinary exact-owned stop/absence,
+  foreign barrier, native corruption withdrawal, and active database-committed
+  restart: 5 tests/9 subcases passed in 168.437s,
+  `Rig/temp/m3-terminal-only-emergency-regression.jsonl`.
+
+All corrected runs had zero failures/skips. Exact commands:
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^TestGatewayCurrentTerminalEmergency' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^TestGatewayCurrentTerminalEmergencyRequiresCompleteInventoryAndListenerAbsence$' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^(TestManagedGatewayCurrentPhysicalRuntimeBindsImmutableContainerAndDynamicNetworks|TestManagedGatewayCurrentPhysicalRuntimeExecutorStopsOnlyExactOwnedIdentity|TestGatewayCurrentStartupEmergencyStopNeverClearsForeignCommitBarrier|TestGatewayCurrentTypedEmergencyWithdrawsWithCorruptNativeRoute|TestGatewayRebindCommittedServingRestoreKeepsActiveSQLFence)$' -count=1 -json
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Vet, full Go build, gofmt and diff whitespace checks passed. Actual Docker and Linux race behavior remain for hosted
+CI. The typed runtime adapter, default activation and complete M3 acceptance are
+still unfinished. No publication, cross-branch integration or deployment was
+performed for this change.
+
+Independent executable/source/security review accepted frozen
+`f1e2c0787f012e231821c4460ae72033353dfa4a` for this bounded withdrawal capability.
+Two tests/three subcases passed in 63.863s, zero failures/skips, with exact HEAD
+and clean status verified before/after. The cases exercised simultaneous native
+and current-route corruption, lost stop acknowledgment and idempotence, changed
+volume identity refusal, and a listener that remains after stop. No must-fix
+source/security findings were reported. Log:
+`Rig/temp/cross-store-review-f1-terminal-withdrawal.jsonl`.
+
+```text
+go test -mod=readonly -count=1 -json -timeout=4m -run '^TestGatewayCurrentTerminalEmergency(StopsDespiteCorruptCurrentBundle|RequiresCompleteInventoryAndListenerAbsence)$/^(native_and_current_corrupt|changed_volume_identity|listener_remains)$' ./internal/generatedingress
+```
+
+## Current active rebind approval authority (2026-10-06)
+
+The full Hosting snapshot now projects the current administrator roles of both
+the active rebind approver and successor-profile configuration approver in its
+existing SQLite read transaction. These may be different users from each other
+and from the LAN/native gateway approvers. The projection binds the exact active
+operation, stored spec version, and both immutable approval actor IDs. Strict
+legacy/V2 union validation refuses missing, crossed or unsupported claim forms;
+an absent active claim requires an absent projection at the serving boundary.
+
+Role revocation is observable as false authority flags. It does not make the
+immutable recovery history unreadable or prevent ownership-based withdrawal.
+There is no new SQL mutation fence, migration, persisted approval rewrite or
+role-change restriction. The active database-committed restart checks the flags
+before selection and again on every fresh authority read, in addition to its
+existing full snapshot digest, protected history and runtime census checks.
+Normal serving restoration also rejects a stale active-approval projection.
+
+Tests use three distinct administrators for the LAN/native profile, rebind,
+and configure approvals. Real SQLite demotion of either active approver before
+restart prevents any start command. Demotion after the concrete Docker command
+adapter starts the exact owned container is detected by the following guard;
+the exact container is then stopped while the SQL fence and immutable history
+remain intact. The adapter tests use deterministic Docker command/probe fixtures,
+not a live Docker daemon. These boundary checks do not constitute continuous
+permission monitoring after startup returns.
+
+Owner verification:
+
+- Focused same-transaction projection, revocation/ownership and crossed-binding
+  cases: 3 tests/12 subcases passed in 1.964s. Log
+  `Rig/temp/m3-active-rebind-approvals-sql.jsonl`.
+- Entire appaccess package: 126 tests/175 subcases passed in 98.669s. Log
+  `Rig/temp/m3-active-rebind-approvals-appaccess.jsonl`.
+- Concrete active committed-serving adapter: 1 test/5 subcases passed in
+  134.901s. Log `Rig/temp/m3-active-rebind-approvals-runtime.jsonl`.
+- Existing ordinary startup, completed recovery batch and active SQL-fenced
+  restart regressions: 3 tests passed in 107.333s. Log
+  `Rig/temp/m3-active-rebind-approvals-regression.jsonl`.
+
+All runs above had zero failures/skips. Exact commands:
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 ./internal/appaccess -run '^TestHostingGatewayActiveRebindApprovals' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/appaccess -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^TestGatewayRebindCommittedServingRestoreRequiresCurrentApprovers$' -count=1 -json
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^(TestGatewayCurrentServingRestoreUsesRealCompleteSQLAuthority|TestGatewayCurrentServingRestoreKeepsCompletedBatchAndTerminalSQL|TestGatewayRebindCommittedServingRestoreKeepsActiveSQLFence)$' -count=1 -json
+go vet -mod=readonly ./internal/appaccess ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+Vet, full Go build, gofmt and diff whitespace checks passed. Independent frozen review, actual Docker/Linux
+race checks, full typed-adapter integration and M3 acceptance remain outstanding.
+No publication, cross-branch integration or deployment was performed for this unit.
+
+## Approved integration into the typed runtime branch (2026-10-07)
+
+The user explicitly authorized local integration of history through
+`f4b2e63e16df6a52d1279697080e0c887e4f0c0c` into
+`feature/hosting-m3-rebind-cross-store-runtime`, whose previous head was
+`378021b6bf840d9d0551ce10372d1d802907bf9a`. The merge retains both parents.
+Later commits from the dependency branch are outside this integration.
+
+The actual merge required one manual conflict resolution, in the predecessor
+fixture. Its endpoint and distinct LAN-approver parameters are now initialized
+together before immutable journals are created. The current physical runtime
+driver and executor test merged automatically and exactly match incoming f4.
+The original untracked handover QA file remains unmodified and unstaged:
+`internal/generatedingress/gateway_rebind_typed_handover_runtime_test.go`, SHA256
+`D4F619FC3A2EA6D3551FE308AF21F8CA6304B874D461E4F12B28D43CE6843140`.
+An identical local backup is retained at
+`Rig/temp/m3-f4-integration-20261007-original-qa-D4F619.go`.
+
+### Integration defect and correction
+
+The initial combined tree `f9e659eebae58a30994d537d408ec404520c86eb`
+compiled, but its seven-test runtime selection failed the distinct LAN-approver
+demotion case: one physical action occurred where zero were required. Six other
+top-level tests and twelve subcases passed; one top-level test and one subcase
+failed, with zero skips, in 262.078s. This failed run is retained, not counted as
+acceptance. Log: `Rig/temp/m3-f4-integration-20261007-runtime.jsonl`, SHA256
+`DACD4E8CECA8E6432D89E885826556EA5145A87322EDAA716D9299531FF820E8`.
+
+Incoming recovery history deliberately remains readable after role revocation.
+The typed forward path had relied on the recovery reader to reject revoked
+permissions. Its new forward boundary brackets the existing ownership and
+protected-history check with two equal full Hosting snapshots. It requires
+current active rebind/configure approvals, exact raw roster grant requests
+(including the protected approver identity), current LAN administrator roles,
+and matching rebind/runtime-head projections. Missing, crossed, revoked or
+changing authority refuses the forward effect. The ownership reader and rollback
+guard remain separate so revoked serving permission does not prevent withdrawal.
+
+This is a compatibility correction for the approved dependency integration. It
+does not fix the separately reproduced rollback predecessor-serving defect or
+complete forward-only withdrawal and terminal/current attestation integration.
+Production typed factories remain closed.
+
+### Executable evidence
+
+The corrected source tree is `e9aee7314727e63801f8e3919f494bd52bebaa02`;
+the following evidence documentation is the only subsequent change.
+All successful runs below had zero failures/skips. Commands ran from the runtime
+checkout with `GOCACHE=Rig/.go-cache-m3`.
+
+| Check | Result | Local log suffix / SHA256 |
+| --- | --- | --- |
+| Initial appaccess approval projections | 3 tests, 12 subcases, 2.163s | `appaccess.jsonl` / `E8B30D216B76A9961A9B6E71C955D1B934D2E7D00B9B473B52F6FDF70BE51817` |
+| Initial hostd emergency dispatch | 3 tests, 14 subcases, 0.725s | `hostd.jsonl` / `F64A096831083429DD48692CB54073A054455CA412B224B92ACA1508B93AD375` |
+| Corrected authorization, rollback compatibility, active committed restart | 3 tests, 12 subcases, 100.127s | `authority-regression.jsonl` / `1D7AF1E0A8EEF211A5EEE76929DE4A91214367D82A5F7511CCF8CB5173BCD743` |
+| Complete authorized stage prefix | 1 test, 32.454s | `forward-prefix.jsonl` / `0984DF92A26263C1FCE1C7CCCFCB4EBEF52295D7EF57B35ACC12D5D2B8C4CE4A` |
+
+Log paths above share prefix `Rig/temp/m3-f4-integration-20261007-`.
+The corrected authorization test includes ten cases: authorized distinct actors;
+LAN, rebind and configure demotion before effects and between snapshot reads;
+and missing active approval, missing grant and crossed grant projections.
+Each SQL demotion verifies exactly one affected user. Refusal leaves the protected
+prefix intact and recovery history readable. The rollback regression verifies
+durable intent before simulated cleanup. These use real SQLite/protected state
+with simulated Docker effects; they do not prove live Docker withdrawal.
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress -run '^$' -count=1
+go test -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress ./cmd/hostd ./internal/appaccess -run '^$' -count=1
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=3m -json ./internal/appaccess -run '^TestHostingGatewayActiveRebindApprovals'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=3m -json ./cmd/hostd -run '^TestGatewayStartupEmergency'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=12m -json ./internal/generatedingress -run '^(TestGatewayRebindTypedDriverRechecksDistinctLANApproverBeforePhysicalEffect|TestGatewayRebindCommittedServingRestoreRequiresCurrentApprovers|TestGatewayRebindCommittedServingRestoreKeepsActiveSQLFence|TestManagedGatewayCurrentPhysicalRuntimeExecutorRestartsOnlyAuthorizedStoppedState|TestManagedGatewayCurrentPhysicalRuntimeBindsImmutableContainerAndDynamicNetworks|TestGatewayRebindTypedProductionDriverRemainsClosedUntilFinalAdapterExists|TestInspectGatewayRebindPredecessorAcceptsExactReadOnlyPair)$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=8m -json ./internal/generatedingress -run '^(TestGatewayRebindTypedDriverRechecksDistinctLANApproverBeforePhysicalEffect|TestGatewayRebindTypedDriverPersistsRollbackIntentBeforeEffects|TestGatewayRebindCommittedServingRestoreKeepsActiveSQLFence)$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=5m -json ./internal/generatedingress -run '^TestGatewayRebindTypedStageDriverPersistsCompleteStagePrefix$'
+go vet -mod=readonly ./internal/appaccess ./internal/generatedingress ./cmd/hostd
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The first two commands are compile-only: baseline 1.251s, then combined packages
+1.258s/1.637s/0.848s; neither executes behavioral tests. The seven-test command
+is the initial failed run described above. Vet, full Go build, gofmt and staged
+whitespace checks pass after the correction. Independent orchestration and
+security source reviews accepted the bounded correction, preserving withdrawal
+authority and the closed production factories.
+
+No full repository suite, frontend build, live Docker, Linux race or complete
+typed-adapter acceptance is claimed. Existing broader adapter defects remain
+open. No PR, push, GitHub merge or deployment is authorized by this local
+integration approval; none was performed. The next runtime work is serving
+authority during rollback and committed recovery, followed by hosted acceptance
+after separate publication approval.

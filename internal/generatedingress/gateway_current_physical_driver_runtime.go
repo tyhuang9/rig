@@ -303,6 +303,12 @@ func (d managerGatewayCurrentPhysicalRuntime) restartStopped(ctx context.Context
 		if err != nil || !stopped || (requireExactRestart && !exact) {
 			return gatewayCurrentPhysicalDriverError(effectCtx)
 		}
+		// The stopped inventory includes Docker, restart-config, network, and
+		// endpoint reads. Reconfirm authority after those reads so a change at
+		// the end of inventory cannot cross the following copy or start boundary.
+		if err := guard(effectCtx); err != nil || d.manager.gatewayRebindAdmissionBlocked() {
+			return gatewayCurrentPhysicalDriverError(effectCtx)
+		}
 		return nil
 	}
 	if err := stoppedGuard(ctx, false); err != nil {
@@ -627,7 +633,6 @@ func (d managerGatewayCurrentPhysicalRuntime) attestation(ctx context.Context,
 		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 	}
 	defer clear(expected)
-	activeDigest := sha256.Sum256(expected)
 	outcome := gatewayCurrentPhysicalStableServing
 	listenerAbsent := false
 	if !inventory.Final.Running {
@@ -654,6 +659,21 @@ func (d managerGatewayCurrentPhysicalRuntime) attestation(ctx context.Context,
 			return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 		}
 	}
+	return d.attestationProof(ctx, target, inventory, expected, outcome, listenerAbsent)
+}
+
+func (d managerGatewayCurrentPhysicalRuntime) attestationProof(ctx context.Context,
+	target gatewayCurrentPhysicalTarget, inventory gatewayCurrentPhysicalInventory, expected []byte,
+	outcome gatewayCurrentPhysicalOutcome, listenerAbsent bool,
+) (gatewayCurrentPhysicalAttestation, error) {
+	if !validGatewayCurrentPhysicalTarget(target) || len(expected) == 0 ||
+		(outcome != gatewayCurrentPhysicalStableServing && outcome != gatewayCurrentPhysicalRecoveryBefore &&
+			outcome != gatewayCurrentPhysicalRecoveryEffective && outcome != gatewayCurrentPhysicalRecoveryMixed &&
+			outcome != gatewayCurrentPhysicalRecoveryStopped) ||
+		listenerAbsent != (outcome == gatewayCurrentPhysicalRecoveryStopped) {
+		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+	}
+	activeDigest := sha256.Sum256(expected)
 	routeDigest, err := canonicalDigest(struct {
 		Context string                             `json:"context"`
 		Lineage appaccess.GatewayCurrentLineageRef `json:"lineage"`
@@ -839,12 +859,21 @@ func (d managerGatewayCurrentPhysicalRuntime) ownedNamesFor(ctx context.Context,
 	if d.manager == nil || !validGatewayCurrentPhysicalTarget(target) || len(args) < 2 {
 		return nil, errors.New("invalid generated ingress current ownership inventory input")
 	}
+	labels := gatewayCurrentPhysicalLabels(target, managed, "")
+	delete(labels, gatewayV2ResourceRoleLabelKey)
+	return d.ownedNamesWithLabels(ctx, labels, args...)
+}
+
+func (d managerGatewayCurrentPhysicalRuntime) ownedNamesWithLabels(ctx context.Context,
+	labels map[string]string, args ...string,
+) ([]string, error) {
+	if d.manager == nil || len(args) < 2 || len(labels) == 0 {
+		return nil, errors.New("invalid generated ingress ownership inventory input")
+	}
 	format := "{{.Name}}"
 	if args[0] == "container" {
 		format = "{{.Names}}"
 	}
-	labels := gatewayCurrentPhysicalLabels(target, managed, "")
-	delete(labels, gatewayV2ResourceRoleLabelKey)
 	keys := make([]string, 0, len(labels))
 	for key := range labels {
 		keys = append(keys, key)
@@ -855,8 +884,9 @@ func (d managerGatewayCurrentPhysicalRuntime) ownedNamesFor(ctx context.Context,
 	}
 	args = append(args, "--format", format)
 	result, err := d.manager.run(ctx, d.manager.options.CommandTimeout, args...)
-	if err != nil {
-		return nil, err
+	if err != nil || result.StdoutTruncated || result.StderrTruncated {
+		clearResult(&result)
+		return nil, errors.New("generated ingress ownership inventory unavailable")
 	}
 	defer clearResult(&result)
 	body := strings.TrimSpace(string(result.Stdout))
@@ -901,135 +931,31 @@ func (d managerGatewayCurrentPhysicalRuntime) volumeUsersExact(ctx context.Conte
 func (d managerGatewayCurrentPhysicalRuntime) validVolume(target gatewayCurrentPhysicalTarget,
 	volume volumeInspection, identity gatewayV1VolumeIdentity, binding any, role string,
 ) bool {
-	labels := gatewayCurrentPhysicalLabels(target, gatewayV2ManagedContainerLabel, role)
-	if volume.Driver != "local" || volume.Scope != "local" || len(volume.Options) != 0 ||
-		!reflect.DeepEqual(volume.Labels, labels) {
-		return false
-	}
-	var name, mountpoint, createdAt, ownership string
-	switch value := binding.(type) {
-	case gatewayRebindStageConfigVolumeBinding:
-		name, mountpoint, createdAt, ownership = value.Name, value.Mountpoint, value.CreatedAt, value.OwnershipDigest
-	case gatewayRebindStageDataVolumeBinding:
-		name, mountpoint, createdAt, ownership = value.Name, value.Mountpoint, value.CreatedAt, value.OwnershipDigest
-	default:
-		return false
-	}
-	digest, err := canonicalDigest(struct {
-		Version int               `json:"version"`
-		Name    string            `json:"name"`
-		Driver  string            `json:"driver"`
-		Scope   string            `json:"scope"`
-		Options map[string]string `json:"options"`
-		Labels  map[string]string `json:"labels"`
-	}{1, name, "local", "local", map[string]string{}, labels})
-	return err == nil && volume.Name == name && identity.Mountpoint == mountpoint &&
-		identity.CreatedAt == createdAt && digest == ownership
+	return gatewayFinalOwnershipVolumeMatches(gatewayCurrentFinalOwnershipFacts(target, 0), volume, identity, binding, role)
 }
 
 func (d managerGatewayCurrentPhysicalRuntime) validIngress(target gatewayCurrentPhysicalTarget,
 	network caddyNetworkInspection, id string,
 ) bool {
-	identity := target.Identity.Rebind
-	labels := gatewayCurrentPhysicalLabels(target, gatewayV2ManagedNetworkLabel, gatewayV2IngressNetworkRole)
-	bridge := "rig" + identity.Digest[:12]
-	digest, err := canonicalDigest(struct {
-		Version int                                 `json:"version"`
-		Name    string                              `json:"name"`
-		Bridge  string                              `json:"bridge"`
-		Plan    gatewayRebindSuccessorIntentNetwork `json:"plan"`
-		Labels  map[string]string                   `json:"labels"`
-	}{1, identity.IngressNetwork, bridge, gatewayRebindSuccessorIntentNetwork(target.State.Network), labels})
-	return err == nil && id == target.Resources.IngressNetwork.ID && digest == target.Resources.IngressNetwork.OwnershipDigest &&
-		network.Name == identity.IngressNetwork && network.Driver == "bridge" && network.Scope == "local" && !network.Internal &&
-		reflect.DeepEqual(network.Options, map[string]string{gatewayRebindBridgeNameOptionKey: bridge}) &&
-		len(network.IPAM.Config) == 1 && network.IPAM.Config[0] == (networkIPAM{Subnet: target.State.Network.Subnet,
-		Gateway: target.State.Network.GatewayIPv4}) && reflect.DeepEqual(network.Labels, labels)
+	return gatewayFinalOwnershipIngressMatches(gatewayCurrentFinalOwnershipFacts(target, 0), network, id)
 }
 
 func (d managerGatewayCurrentPhysicalRuntime) validFinalBase(target gatewayCurrentPhysicalTarget,
 	container caddyInspection, runtime gatewayContainerRuntime,
 ) bool {
-	if target.Resources.FinalContainer == nil || target.Identity.Rebind == nil {
-		return false
-	}
-	identity := target.Identity.Rebind
-	labels := gatewayCurrentPhysicalLabels(target, gatewayV2ManagedContainerLabel, gatewayV2FinalContainerRole)
-	ownership, err := canonicalDigest(struct {
-		Version int               `json:"version"`
-		Name    string            `json:"name"`
-		Labels  map[string]string `json:"labels"`
-	}{1, identity.FinalContainer, labels})
-	configuration, configurationErr := gatewayCurrentPhysicalInitialConfigurationDigest(target,
-		d.manager.options.HostPort)
-	if err != nil || configurationErr != nil || ownership != target.Resources.FinalContainer.OwnershipDigest ||
-		configuration != target.Resources.FinalContainer.ConfigurationDigest ||
-		normalizeID(container.ID) != target.Resources.FinalContainer.ID || normalizeID(container.Image) != target.Resources.ImageID ||
-		strings.TrimPrefix(container.Name, "/") != identity.FinalContainer || container.Hostname != identity.FinalHostname ||
-		container.User != "1000:1000" || container.NetworkMode != identity.IngressNetwork || !exactGatewayV2Environment(container.Env) ||
-		!container.ReadOnly || container.Privileged || !onlyCaddyCapability(container.CapAdd) || !exactFoldSet(container.CapDrop, "ALL") ||
-		!onlyNoNewPrivileges(container.SecurityOpt) || len(container.Binds) != 0 || len(container.Tmpfs) != 0 ||
-		container.Memory != 268435456 || container.MemorySwap != 268435456 || container.NanoCPUs != 1_000_000_000 ||
-		container.PIDsLimit != 128 || container.LogType != "local" || len(container.LogConfig) != 2 ||
-		container.LogConfig["max-size"] != "10m" || container.LogConfig["max-file"] != "3" ||
-		container.Restart != gatewayV2FinalRestartPolicy || container.Restarting || runtime.Paused || runtime.Dead ||
-		len(container.Entrypoint) != 1 || container.Entrypoint[0] != caddyExecutable || len(container.Cmd) != 3 ||
-		container.Cmd[0] != "run" || container.Cmd[1] != "--config" || container.Cmd[2] != "/config/"+identity.ActiveConfigFilename ||
-		len(container.Ulimits) != 1 || container.Ulimits[0] != (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}) ||
-		!reflect.DeepEqual(container.Labels, labels) || !validGatewayRebindStageContainerMounts(container.Mounts, *identity) ||
-		!gatewayCurrentPhysicalPortBindings(container.PortBindings, target.State.Profile, d.manager.options.HostPort) {
-		return false
-	}
-	if container.Running {
-		return gatewayV2EffectivePortBindingsMatchConfigured(runtime.EffectivePortBindings, container.PortBindings)
-	}
-	return !gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings)
+	return d.manager != nil && validGatewayCurrentPhysicalTarget(target) && gatewayFinalOwnershipContainerMatches(
+		gatewayCurrentFinalOwnershipFacts(target, d.manager.options.HostPort), container, runtime)
 }
 
 // gatewayCurrentPhysicalInitialConfigurationDigest rederives the immutable
 // create-time container configuration retained by the terminal. Its network
 // roster is historical create evidence only. Live application-network
 // membership is validated separately from the selected current State.Apps.
-func gatewayCurrentPhysicalInitialConfigurationDigest(target gatewayCurrentPhysicalTarget,
-	localHostPort uint16,
-) (string, error) {
-	if !validGatewayCurrentPhysicalTarget(target) || localHostPort == 0 || target.Identity.Rebind == nil {
+func gatewayCurrentPhysicalInitialConfigurationDigest(target gatewayCurrentPhysicalTarget, localHostPort uint16) (string, error) {
+	if !validGatewayCurrentPhysicalTarget(target) {
 		return "", errors.New("invalid generated ingress current initial configuration")
 	}
-	identity := target.Identity.Rebind
-	profile := target.Terminal.SuccessorProfile
-	args := []string{
-		"container", "create", "--name", identity.FinalContainer, "--hostname", identity.FinalHostname,
-		"--network", "name=" + identity.IngressNetwork + ",ip=" + target.State.Network.ContainerIPv4 + ",gw-priority=1",
-		"--mount", "type=volume,src=" + identity.ConfigVolume + ",dst=/config",
-		"--mount", "type=volume,src=" + identity.DataVolume + ",dst=/data",
-		"--user", "1000:1000", "--entrypoint", caddyExecutable, "--read-only",
-		"--cap-drop", "ALL", "--cap-add", caddyCapability, "--security-opt", "no-new-privileges",
-		"--memory", "268435456", "--memory-swap", "268435456", "--cpus", "1.000", "--pids-limit", "128",
-		"--ulimit", "nofile=1024:1024", "--restart", gatewayV2FinalRestartPolicy,
-		"--log-driver", "local", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
-		"--env", "XDG_CONFIG_HOME=/config", "--env", "XDG_DATA_HOME=/data",
-	}
-	for _, network := range target.Resources.ApplicationNetworks {
-		args = append(args, "--network", "name="+network.Name)
-	}
-	for port := profile.PortStart; ; port++ {
-		text := strconv.FormatUint(uint64(port), 10)
-		args = append(args, "--publish", profile.SelectedIPv4+":"+text+":"+text+"/tcp")
-		if port == profile.PortEnd {
-			break
-		}
-	}
-	args = append(args, "--publish", "127.0.0.1:"+strconv.FormatUint(uint64(localHostPort), 10)+":"+
-		strconv.FormatUint(uint64(gatewayV2ContainerPort), 10)+"/tcp")
-	args = appendGatewayV2Labels(args,
-		gatewayCurrentPhysicalLabels(target, gatewayV2ManagedContainerLabel, gatewayV2FinalContainerRole))
-	args = append(args, "sha256:"+target.Resources.ImageID, "run", "--config", "/config/"+identity.ActiveConfigFilename)
-	return canonicalDigest(struct {
-		Version  int                                       `json:"version"`
-		Args     []string                                  `json:"args"`
-		Networks []gatewayRebindHandoverApplicationNetwork `json:"networks"`
-	}{1, args, target.Resources.ApplicationNetworks})
+	return gatewayFinalOwnershipConfigurationDigest(gatewayCurrentFinalOwnershipFacts(target, localHostPort))
 }
 
 func (d managerGatewayCurrentPhysicalRuntime) validFinalNetworks(target gatewayCurrentPhysicalTarget,
@@ -1354,17 +1280,7 @@ func gatewayCurrentPhysicalAssignments(state gatewayCurrentRouteState) map[uint1
 }
 
 func gatewayCurrentPhysicalLabels(target gatewayCurrentPhysicalTarget, managed, role string) map[string]string {
-	networkDigest, _ := gatewayCurrentPhysicalNetworkDigest(target.State.Network)
-	return map[string]string{
-		gatewayV2ManagedLabelKey:          managed,
-		gatewayV2IdentityLabelKey:         gatewayRebindSuccessorIdentityVersion,
-		gatewayV2OperationLabelKey:        target.Lineage.OperationID,
-		gatewayV2IdentityDigestLabelKey:   target.Lineage.ProtectedIdentityDigest,
-		gatewayV2PlanDigestLabelKey:       networkDigest,
-		gatewayV2ResourceRoleLabelKey:     role,
-		gatewayRebindIntentDigestLabelKey: target.Lineage.ProtectedIntentDigest,
-		gatewayRebindGenerationLabelKey:   strconv.FormatUint(target.Lineage.ProtectedGeneration, 10),
-	}
+	return gatewayFinalOwnershipLabels(gatewayCurrentFinalOwnershipFacts(target, 0), managed, role)
 }
 
 func gatewayCurrentPhysicalPortBindings(actual map[string][]map[string]string,

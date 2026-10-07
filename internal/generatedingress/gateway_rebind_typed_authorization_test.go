@@ -23,6 +23,23 @@ type gatewayRebindTypedAuthorizationRepository struct {
 	recoveryCalls int
 	headCalls     int
 	resolveCalls  int
+	startupCalls  int
+	afterStartup  func(int)
+	mutateStartup func(*appaccess.HostingGatewayStartupSnapshot)
+}
+
+func (r *gatewayRebindTypedAuthorizationRepository) HostingGatewayStartupSnapshot(ctx context.Context) (
+	appaccess.HostingGatewayStartupSnapshot, error,
+) {
+	r.startupCalls++
+	snapshot, err := r.Repository.HostingGatewayStartupSnapshot(ctx)
+	if err == nil && r.mutateStartup != nil {
+		r.mutateStartup(&snapshot)
+	}
+	if err == nil && r.afterStartup != nil {
+		r.afterStartup(r.startupCalls)
+	}
+	return snapshot, err
 }
 
 func (r *gatewayRebindTypedAuthorizationRepository) GatewayRebindRecoverySnapshot(ctx context.Context) (
@@ -58,11 +75,21 @@ func (r *gatewayRebindTypedAuthorizationRepository) ClaimGatewayRebindV2(ctx con
 func TestGatewayRebindTypedDriverRechecksDistinctLANApproverBeforePhysicalEffect(t *testing.T) {
 	for _, test := range []struct {
 		name        string
-		demote      bool
+		demote      string
+		late        bool
+		projection  string
 		wantEffects int
 	}{
 		{name: "unchanged LAN approver reaches first authorized effect", wantEffects: 1},
-		{name: "demoted LAN approver is refused before first effect", demote: true, wantEffects: 0},
+		{name: "demoted LAN approver is refused before first effect", demote: "LAN"},
+		{name: "demoted rebind approver is refused before first effect", demote: "rebind"},
+		{name: "demoted configure approver is refused before first effect", demote: "configure"},
+		{name: "LAN demotion between authority reads", demote: "LAN", late: true},
+		{name: "rebind demotion between authority reads", demote: "rebind", late: true},
+		{name: "configure demotion between authority reads", demote: "configure", late: true},
+		{name: "missing active approval projection", projection: "missing approvals"},
+		{name: "crossed grant projection", projection: "crossed grant"},
+		{name: "missing grant projection", projection: "missing grant"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			originalEffects, originalGateway := gatewayRebindAcquireDeploymentEffects, managerAcquireGatewayOSLock
@@ -91,17 +118,59 @@ func TestGatewayRebindTypedDriverRechecksDistinctLANApproverBeforePhysicalEffect
 			fixture.manager.gatewayRebindFailStop = &atomic.Bool{}
 			fixture.manager.gatewayRebindCommitBarrier = &atomic.Bool{}
 			input := completeGatewayRebindCoordinatorFixture(t, fixture)
+			for _, approval := range []*appaccess.Approval{&input.RebindApproval, &input.ConfigureApproval} {
+				approval.ActorID = uuid.NewString()
+				if _, err := fixture.db.Exec(`INSERT INTO users(id,username,passphrase_hash,role,created_at,updated_at)
+					VALUES(?,?,'hash','administrator',datetime('now'),datetime('now'))`, approval.ActorID, approval.ActorID); err != nil {
+					t.Fatal(err)
+				}
+			}
 			fixture.manager.gatewayRebindV2NetworkObserver = func(_ context.Context,
 				claim appaccess.GatewayRebindClaimV2,
 			) (gatewayRebindSuccessorNetworkObservation, error) {
 				return gatewayRebindTypedAuthorizationNetworkObservation(t, claim)
 			}
-			if test.demote {
-				fixture.manager.gatewayRebindAfterClaim = func(ctx context.Context,
-					_ appaccess.GatewayRebindClaimV2,
-				) error {
-					_, err := fixture.db.ExecContext(ctx, `UPDATE users SET role='viewer' WHERE id=?`, lanApproverID)
+			demoted := false
+			demote := func(ctx context.Context) error {
+				actor := lanApproverID
+				if test.demote == "rebind" {
+					actor = input.RebindApproval.ActorID
+				} else if test.demote == "configure" {
+					actor = input.ConfigureApproval.ActorID
+				}
+				result, err := fixture.db.ExecContext(ctx, `UPDATE users SET role='viewer' WHERE id=?`, actor)
+				if err != nil {
 					return err
+				}
+				if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+					t.Fatalf("demotion affected %d users: %v", affected, err)
+				}
+				demoted = true
+				return nil
+			}
+			if test.demote != "" {
+				if test.late {
+					repository.afterStartup = func(call int) {
+						if call == 1 {
+							if err := demote(context.Background()); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+				} else {
+					fixture.manager.gatewayRebindAfterClaim = func(ctx context.Context, _ appaccess.GatewayRebindClaimV2) error {
+						return demote(ctx)
+					}
+				}
+			}
+			repository.mutateStartup = func(snapshot *appaccess.HostingGatewayStartupSnapshot) {
+				switch test.projection {
+				case "missing approvals":
+					snapshot.ActiveRebindApprovalAuthority = nil
+				case "crossed grant":
+					snapshot.Grants.Claims[0].Claim.Spec.ApprovedBy = uuid.NewString()
+				case "missing grant":
+					snapshot.Grants.Claims = nil
 				}
 			}
 			stage := &gatewayRebindTypedAuthorizationStageDriver{
@@ -112,6 +181,12 @@ func TestGatewayRebindTypedDriverRechecksDistinctLANApproverBeforePhysicalEffect
 				input, driver)
 			if commitErr == nil || result != (GatewayRebindCommitResult{}) {
 				t.Fatalf("bounded first-effect stop returned result=%#v error=%v", result, commitErr)
+			}
+			if test.demote != "" && !demoted || test.late && repository.startupCalls < 2 {
+				t.Fatalf("demotion boundary was not reached: demoted=%t startup reads=%d", demoted, repository.startupCalls)
+			}
+			if _, err := fixture.repository.GatewayRebindRecoverySnapshot(context.Background()); err != nil {
+				t.Fatalf("authorization refusal made ownership history unreadable: %v", err)
 			}
 			if stage.effects != test.wantEffects {
 				snapshot, snapshotErr := fixture.repository.GatewayRebindRecoverySnapshot(context.Background())

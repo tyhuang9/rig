@@ -116,13 +116,13 @@ func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorForwardLocked(ct
 	if stage == nil {
 		return gatewayRebindTypedPhysicalResult{}, errors.New("generated ingress typed physical rebind is unavailable")
 	}
-	boundary, err := d.manager.readGatewayRebindTypedAttemptBoundaryLocked(ctx, request)
+	boundary, err := d.manager.readGatewayRebindTypedForwardBoundaryLocked(ctx, request)
 	if err != nil {
 		return gatewayRebindTypedPhysicalResult{}, gatewayRebindEffectBoundaryError(ctx)
 	}
 	progress := append([]gatewayRebindProgressRecord(nil), boundary.Progress...)
 	guard := func(guardCtx context.Context) error {
-		fresh, guardErr := d.manager.readGatewayRebindTypedAttemptBoundaryLocked(guardCtx, request)
+		fresh, guardErr := d.manager.readGatewayRebindTypedForwardBoundaryLocked(guardCtx, request)
 		if guardErr != nil || !reflect.DeepEqual(progress, fresh.Progress) {
 			return gatewayRebindEffectBoundaryError(guardCtx)
 		}
