@@ -210,6 +210,15 @@ func (d *gatewayRebindBoundedPhysicalDriver) proveNoSuccessorEffectsLocked(_ con
 	return value, err
 }
 
+func (d *gatewayRebindBoundedPhysicalDriver) confirmRollbackServingLocked(ctx context.Context,
+	request gatewayRebindPhysicalReconcileRequest,
+) error {
+	if ctx.Err() != nil || !validGatewayRebindPhysicalReconcileRequest(request) || !request.RollbackAllowed {
+		return errors.New("invalid bounded rollback confirmation")
+	}
+	return nil
+}
+
 func (d *gatewayRebindBoundedPhysicalDriver) attestCommittedCurrentLocked(_ context.Context,
 	selection gatewayCurrentSelection,
 ) (string, error) {
@@ -268,6 +277,13 @@ func newGatewayRebindCoordinatorFixture(t *testing.T) (gatewayRebindPredecessorF
 	gatewayRebindCommitInput, *gatewayRebindBoundedPhysicalDriver) {
 	t.Helper()
 	f := newGatewayRebindPredecessorFixtureWithClaim(t, false)
+	return newGatewayRebindCoordinatorFixtureWithPredecessor(t, f)
+}
+
+func newGatewayRebindCoordinatorFixtureWithPredecessor(t *testing.T, f gatewayRebindPredecessorFixture) (
+	gatewayRebindPredecessorFixture, gatewayRebindCommitInput, *gatewayRebindBoundedPhysicalDriver,
+) {
+	t.Helper()
 	f.manager.options.RebindFenceCheck = f.repository.CheckGatewayRebindFence
 	f.manager.options.RebindCurrentStateRepository = f.repository
 	f.manager.gatewayRebindFailStop = &atomic.Bool{}

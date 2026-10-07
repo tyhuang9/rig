@@ -100,6 +100,7 @@ type gatewayRebindCrossStoreDriver interface {
 	proveNoSuccessorEffectsLocked(context.Context, appaccess.GatewayRebindClaimV2,
 		[]appaccess.GatewayRebindRosterEntryV2, gatewayRebindPredecessorCheckpoint) (gatewayRebindNoEffectAbortProof, error)
 	attestCommittedCurrentLocked(context.Context, gatewayCurrentSelection) (string, error)
+	confirmRollbackServingLocked(context.Context, gatewayRebindPhysicalReconcileRequest) error
 }
 
 type GatewayRebindCommitResult struct {
@@ -199,7 +200,7 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 		return GatewayRebindCommitResult{}, err
 	}
 	if physical.Disposition == appaccess.GatewayRebindDispositionAbort {
-		result, err = m.finishGatewayRebindRollbackAfterIntentLocked(ctx, repository, prepared, physical.Last)
+		result, err = m.finishGatewayRebindRollbackAfterIntentLocked(ctx, repository, driver, prepared, physical.Last)
 		terminalSQL = m.gatewayRebindCommitBarrierLatch().Load()
 		return result, err
 	}
@@ -318,7 +319,7 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 }
 
 func (m *Manager) finishGatewayRebindRollbackAfterIntentLocked(ctx context.Context,
-	repository gatewayRebindTransitionRepository, prepared gatewayRebindPreparedAttempt,
+	repository gatewayRebindTransitionRepository, driver gatewayRebindCrossStoreDriver, prepared gatewayRebindPreparedAttempt,
 	last gatewayRebindProgressRecord,
 ) (GatewayRebindCommitResult, error) {
 	if last.Phase != gatewayRebindProgressHandoverRolledBack || last.TypedRollback == nil ||
@@ -332,22 +333,42 @@ func (m *Manager) finishGatewayRebindRollbackAfterIntentLocked(ctx context.Conte
 		!snapshot.RollbackAllowed || snapshot.DatabaseCommitObserved || snapshot.DatabaseCommittedEvent != nil {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
+	request := gatewayRebindPhysicalReconcileRequest{Attempt: prepared, Mode: gatewayRebindPhysicalReconcileUndecided,
+		SQLPhase: snapshot.Phase, RollbackAllowed: true}
+	if err := driver.confirmRollbackServingLocked(ctx, request); err != nil {
+		return GatewayRebindCommitResult{}, err
+	}
 	receipt, err := newGatewayRebindRollbackTerminalV2(prepared.Intent, last, prepared.Checkpoint,
 		gatewayRebindTimeStrictlyAfter(m.gatewayRebindProgressTime(), last.OccurredAt))
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
 	}
 	store, err := newGatewayRebindTerminalStoreV2(m.options.DataRoot, receipt.Generation, receipt.OperationID)
-	if err != nil || store.installExact(ctx, receipt) != nil {
+	if err != nil {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
-	if !m.gatewayRebindCommitBarrierLatch().CompareAndSwap(false, true) {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	if installErr := store.installExact(ctx, receipt); installErr != nil {
+		// A failed acknowledgement may still have installed the exact immutable
+		// receipt. Select its actual form before rechecking serving authority.
+		if retained, readErr := store.load(); readErr == nil && reflect.DeepEqual(retained, receipt) {
+			request.Mode, request.Terminal = gatewayRebindPhysicalReconcileRollbackOnly, &retained
+		}
+		if confirmErr := driver.confirmRollbackServingLocked(ctx, request); confirmErr != nil {
+			return GatewayRebindCommitResult{}, confirmErr
+		}
+		return GatewayRebindCommitResult{}, installErr
 	}
 	transition, err := gatewayRebindTransitionProofV2(snapshot, prepared.Claim, receipt,
 		appaccess.GatewayRebindRolledBack, gatewayCurrentRouteState{}, nil, "")
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
+	}
+	request.Mode, request.Terminal = gatewayRebindPhysicalReconcileRollbackOnly, &receipt
+	if err := driver.confirmRollbackServingLocked(ctx, request); err != nil {
+		return GatewayRebindCommitResult{}, err
+	}
+	if !m.gatewayRebindCommitBarrierLatch().CompareAndSwap(false, true) {
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
 	command, err := applyGatewayRebindTransitionReconciled(ctx, repository, transition)
 	if err != nil {

@@ -41,6 +41,8 @@ type gatewayRebindTypedRollbackDriver interface {
 		[]gatewayRebindProgressRecord, gatewayRebindTypedEffectGuard) (gatewayRebindTypedRollbackPreparation, error)
 	rollbackSuccessor(context.Context, gatewayRebindPreparedAttempt, gatewayCurrentSelection,
 		gatewayRebindProgressRecord, gatewayRebindTypedEffectGuard) (gatewayRebindFinalHandoverTerminalProof, error)
+	confirmRollbackServing(context.Context, gatewayRebindPreparedAttempt, gatewayCurrentSelection,
+		gatewayRebindTypedEffectGuard) error
 }
 
 type gatewayRebindTypedPredecessorObservation struct {
@@ -522,7 +524,8 @@ func (d gatewayRebindTypedHandoverRuntime) configInventory(ctx context.Context,
 	}
 	sequence := uint64(0)
 	for candidate := uint64(2); candidate <= gatewayRebindProgressMaximumSequence; candidate++ {
-		if validGatewayRebindTypedEffectProgress(effect, candidate) {
+		if _, legal := gatewayRebindTypedEffectPhase(candidate); legal &&
+			validGatewayRebindTypedEffectProgress(effect, candidate) {
 			if sequence != 0 {
 				return false
 			}
@@ -1660,10 +1663,13 @@ func (d gatewayRebindTypedHandoverRuntime) rollbackSuccessor(ctx context.Context
 	guard gatewayRebindTypedEffectGuard,
 ) (gatewayRebindFinalHandoverTerminalProof, error) {
 	invalid := func() (gatewayRebindFinalHandoverTerminalProof, error) {
-		return gatewayRebindFinalHandoverTerminalProof{}, gatewayRebindEffectBoundaryError(ctx)
+		return gatewayRebindFinalHandoverTerminalProof{}, d.refuseRollbackServing(ctx, attempt, current, guard)
 	}
 	if d.manager == nil || guard == nil || rollbackRecord.Phase != gatewayRebindProgressRollbackIntent ||
-		rollbackRecord.TypedRollback == nil || rollbackRecord.TypedRollback.PhysicalProof != nil || guard(ctx) != nil {
+		rollbackRecord.TypedRollback == nil || rollbackRecord.TypedRollback.PhysicalProof != nil {
+		return gatewayRebindFinalHandoverTerminalProof{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	if guard(ctx) != nil {
 		return invalid()
 	}
 	history, err := d.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
@@ -1699,30 +1705,31 @@ func (d gatewayRebindTypedHandoverRuntime) rollbackSuccessor(ctx context.Context
 	if err == nil {
 		remaining, err = d.rollbackRemoveNetwork(ctx, attempt, effect, remaining, guard)
 	}
-	if err != nil || !reflect.DeepEqual(remaining, gatewayRebindTypedRollbackOwnedResources{}) {
+	if err != nil || remaining.ImageID != rollback.Owned.ImageID || remaining.IngressNetwork != nil ||
+		remaining.ConfigVolume != nil || remaining.DataVolume != nil || remaining.StageContainer != nil ||
+		remaining.FinalContainer != nil || len(remaining.ApplicationNetworks) != 0 {
 		return invalid()
 	}
-	predecessor, err = d.predecessor(ctx, attempt)
-	if err != nil || !gatewayRebindTypedSelectionAuthorizesAttempt(current, predecessor.Selection, attempt) ||
-		predecessor.Address != gatewayRebindPredecessorAddressPresent {
-		return invalid()
+	predecessor, err = d.authorizedRollbackPredecessor(ctx, attempt, current, guard)
+	if err != nil {
+		return gatewayRebindFinalHandoverTerminalProof{}, err
 	}
 	if !predecessor.Running {
-		if guard(ctx) != nil {
-			return invalid()
-		}
 		startErr := d.manager.runDiscard(ctx, d.manager.options.CommandTimeout,
 			"container", "start", predecessor.ContainerID)
-		predecessor, err = d.predecessor(ctx, attempt)
+		predecessor, err = d.authorizedRollbackPredecessor(ctx, attempt, current, guard)
 		if err != nil || !predecessor.Running || predecessor.Address != gatewayRebindPredecessorAddressPresent ||
 			!gatewayRebindTypedSelectionAuthorizesAttempt(current, predecessor.Selection, attempt) || guard(ctx) != nil {
 			_ = startErr
-			return invalid()
+			if err != nil {
+				return gatewayRebindFinalHandoverTerminalProof{}, err
+			}
+			return gatewayRebindFinalHandoverTerminalProof{}, d.refuseRollbackServing(ctx, attempt, current, guard)
 		}
 	}
 	routesDigest, routesErr := gatewayRebindTypedCheckpointRoutesDigest(attempt.Checkpoint)
 	if routesErr != nil || rollback.PredecessorRoutesDigest != routesDigest || !validSHA256(predecessor.Routes) {
-		return invalid()
+		return gatewayRebindFinalHandoverTerminalProof{}, d.refuseRollbackServing(ctx, attempt, current, guard)
 	}
 	emptyEffect := gatewayRebindTypedEffectProgress{ImageID: effect.ImageID, StagePlanDigest: effect.StagePlanDigest}
 	if effect.ImageID == "" {
@@ -1732,11 +1739,11 @@ func (d gatewayRebindTypedHandoverRuntime) rollbackSuccessor(ctx context.Context
 	if err != nil || !d.stage.networkTopologyMatches(ctx, attempt.Intent, stage) || stage.NetworkFound ||
 		stage.ConfigVolumeFound || stage.DataVolumeFound || stage.StageContainerFound || stage.FinalContainerFound ||
 		len(stage.OwnedContainers) != 0 || len(stage.OwnedVolumes) != 0 || len(stage.OwnedNetworks) != 0 || guard(ctx) != nil {
-		return invalid()
+		return gatewayRebindFinalHandoverTerminalProof{}, d.refuseRollbackServing(ctx, attempt, current, guard)
 	}
 	if emptyEffect.ImageID != "" && (!gatewayRebindTypedStageImageMatches(attempt.Intent, stage) ||
 		stage.Image.ID != emptyEffect.ImageID) {
-		return invalid()
+		return gatewayRebindFinalHandoverTerminalProof{}, d.refuseRollbackServing(ctx, attempt, current, guard)
 	}
 	observation := gatewayRebindFinalHandoverObservation{Stage: gatewayRebindHandoverContainerAbsent,
 		Final: gatewayRebindHandoverContainerAbsent, PredecessorRunning: true,
@@ -1775,7 +1782,10 @@ func (d gatewayRebindTypedHandoverRuntime) rollbackSuccessor(ctx context.Context
 	}
 	if err != nil || !validGatewayRebindTypedRollbackPhysicalProof(proof, rollback, rollbackRecord.Digest) ||
 		guard(ctx) != nil {
-		return invalid()
+		return gatewayRebindFinalHandoverTerminalProof{}, d.refuseRollbackServing(ctx, attempt, current, guard)
+	}
+	if err := d.confirmRollbackServing(ctx, attempt, current, guard); err != nil {
+		return gatewayRebindFinalHandoverTerminalProof{}, err
 	}
 	return proof, nil
 }

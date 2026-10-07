@@ -2811,3 +2811,130 @@ open. No PR, push, GitHub merge or deployment is authorized by this local
 integration approval; none was performed. The next runtime work is serving
 authority during rollback and committed recovery, followed by hosted acceptance
 after separate publication approval.
+
+## Typed rollback serving authority (2026-10-07)
+
+Purpose: retain ownership-based successor cleanup while requiring current serving
+authority before accepting or restarting the predecessor during typed rollback.
+This local unit follows approved integration commit
+`b681cf9255a4f32d53d248be32841f895095920e`; it imports no further branch history.
+The reviewed implementation/test tree is
+`5fffe5c8d82320334656e57203144619644b775b`, before this evidence update.
+
+### Invariants and implementation
+
+- Exact retained ownership authorizes cleanup and withdrawal even when an
+  approver loses their role. Serving requires equal complete Hosting snapshots,
+  the active rebind/configure approvals, exact current LAN grant approvals,
+  runtime heads and component census, and the selected protected predecessor.
+- Predecessor authority is checked before and after restart, before and after
+  appending physical rollback completion, on cached completion replay, before
+  terminal receipt installation, and immediately before SQL release. Failed or
+  uncertain appends reread the actual protected prefix/receipt.
+- Refusal stops only the exact immutable predecessor container when ownership
+  is proven, checks its stopped state after listener probes, and preserves the
+  SQL fence. Ambiguous listeners, ownership, readback, or retained successor
+  containers report potentially-live state. Rollback's diagnostic precedes the
+  earlier forward cause in the joined error so `errors.As` sees that status.
+- Completion records and receipts already written remain immutable after a
+  later denial. No terminal SQL transition is accepted on failed confirmation.
+- Successful rollback proves two equal absent successor inventories and network
+  topology around a freshly authorized serving predecessor observation.
+
+The shared component census is reused for native and rebound predecessors.
+Two prerequisite runtime corrections restrict config-phase matching to legal
+effect phases and preserve the pinned image identity when checking that mutable
+successor resources were removed. Production typed factories remain closed.
+
+The previously untracked handover QA file is deliberately promoted in this unit.
+Its simulator now restores original application-network addresses and ingress
+membership on predecessor restart; admission fixtures establish distinct actors
+and matching SQL endpoints before creating immutable records. The ambiguous
+probe test uses the concrete coordinator and durable final-container prefix.
+The original backup from the preceding integration still has SHA256
+`D4F619FC3A2EA6D3551FE308AF21F8CA6304B874D461E4F12B28D43CE6843140` at
+`Rig/temp/m3-f4-integration-20261007-original-qa-D4F619.go`.
+
+### Failures retained as evidence
+
+All logs below have prefix `Rig/temp/m3-rollback-authority-20261007-`.
+
+| Log suffix | Actual outcome | SHA256 |
+| --- | --- | --- |
+| `baseline.jsonl` | 1 failing test, 75.323s: demoted rebind approver still allowed predecessor serving and completion after cleanup | `425E7FB987C742AEFCCA942C49D0DDF4D4FAEAB9EFFF8D2E76756C61451104D1` |
+| `matrix.jsonl` | 5 subcases passed; 3 subcases and parent failed, 626.980s | `BC82091316E8D244CA4D1004D9C6BD9D1DC7B61B367A0D26BB7D7C44369F208D` |
+| `regressions.jsonl` | 9 tests/28 subcases passed; 1 test failed, 714.021s | `4FFDED14B34AF1180411B6EAF2B9490295BF334D90D164626D0B9B9BB86F0A66` |
+| `final-refusal.jsonl` | Readback test/2 subcases passed; retained-successor setup failed, 148.620s | `EC653C19E7C641F1548A12B59FBAEA44DC437CEE8C85452EADBC8431F6B95A8A` |
+| `ambiguous-probes.jsonl` | Corrected probe test passed; run intentionally stopped at 107.142s because its optional subtest regex selected the whole matrix | `4AB1BAC533C74CD1D3B70910F83D6A471C5BB36E2FEAA4F495C045A2DAA9E980` |
+
+The matrix's three failures were two restart fixtures that stopped the
+predecessor before reconciliation could reach the intended boundary, and a real
+diagnostic-ordering defect masking potentially-live rollback state. The corrected
+restart fixtures stop after exact successor-network removal and assert zero
+starts for pre-start revocation or exactly one start for post-start revocation.
+The regression failure used a direct final-create fixture without the durable
+phase required to reach the ambiguous listener probe; it now runs through the
+coordinator and asserts history ends at sequence 14 without cutover or starts.
+The retained-successor test now enters through the concrete forward handover,
+then injects exact stage-removal failure and checks rollback intent at sequence
+14. Its original direct-prefix-12 early refusal was not localized and is not
+counted as evidence of successful cleanup or a production fix.
+
+The five successful original matrix cases cover distinct rebind/configure/LAN
+approvers, completion-write refusal, and lost completion acknowledgment followed
+by cached replay. The successful regression cases cover the complete forward
+sequence, create-boundary drift, durable config phases, stage-gap rollback,
+final-removal replay, the component census, rollback intent before effects, and
+four commit/recovery receipt and SQL-release refusals. These earlier mixed runs
+are recorded as partial/intermediate evidence, not green package runs.
+
+### Corrected focused verification
+
+Commands ran from the runtime checkout with `GOCACHE=Rig/.go-cache-m3`. Tests use
+real SQLite and protected records with simulated Docker commands/probes.
+
+| Log suffix | Result | SHA256 |
+| --- | --- | --- |
+| `restart-boundaries.jsonl` | 1 test/2 subcases passed, 144.822s | `092B33BB04B4CAFAC955927EFC023DFAB73F70DA1D7BE7AEA905504A9D40208E` |
+| `retained-successor.jsonl` | 1 test passed, 58.640s | `34F5FB34EBFDD8847A549C274318AD377BBF18646BDB61F9CD94C93FC71B3F5C` |
+| `ambiguous-diagnostic.jsonl` | 1 test/1 subcase passed, 67.023s | `2E4904416E2D6878B7272228DDA89FAC6CE73AC0D3B6754F96534247B6DFF7D4` |
+| `final-boundaries.jsonl` | 3 tests/2 subcases passed, 155.096s | `F844AFE2188A041A48DDC0BB3FDF3E022A4F2CBD72C93476D2BB534BC4C8D143` |
+
+The restart run precedes only the subsequent diagnostic-ordering change and
+test-fixture corrections. Retained-successor, ambiguous-diagnostic and
+final-boundaries runs use the final implementation. The final boundary run
+checks durable cutover probe refusal, stopped-during-serving and
+restarted-during-withdrawal readbacks, and the closed production factory.
+Every completed focused run above has zero
+failures/skips and verifies that the selected tests were discovered.
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=18m -json ./internal/generatedingress -run '^TestGatewayRebindTypedRollbackWithdrawsAfterAuthorityLoss$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=18m -json ./internal/generatedingress -run '^(TestGatewayRebindTypedHandoverRuntime|TestGatewayRebindRollbackConfirmationFencesCommitAndRecovery|TestGatewayRebindTypedDriverPersistsRollbackIntentBeforeEffects|TestGatewayCurrentServingRuntimeCensusRejectsIncompleteOrCrossedComponents)'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=6m -json ./internal/generatedingress -run '^TestGatewayRebindTypedRollbackWithdrawsAfterAuthorityLoss$/(before_predecessor_start|after_predecessor_start)$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=4m -json ./internal/generatedingress -run '^TestGatewayRebindTypedRollbackReportsRetainedSuccessor$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=3m -json ./internal/generatedingress -run '^TestGatewayRebindTypedRollbackWithdrawsAfterAuthorityLoss$/^listener_absence_remains_ambiguous$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=5m -json ./internal/generatedingress -run '^(TestGatewayRebindTypedRollbackRequiresFinalPhysicalReadbacks|TestGatewayRebindTypedHandoverRuntimeRejectsAmbiguousWithdrawalProbe|TestGatewayRebindTypedProductionDriverRemainsClosedUntilFinalAdapterExists)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd ./internal/appaccess
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The first two commands are the mixed runs described above. Vet and the full Go
+build pass after the final production change. Formatting and whitespace checks
+pass. Independent orchestration/security source review accepted this bounded
+change; broader M3 and production acceptance remain open.
+
+### Limits and remaining work
+
+A fresh local `docker info --format '{{.OSType}} {{.ServerVersion}}'` failed
+because `npipe:////./pipe/dockerDesktopLinuxEngine` was unavailable. No live
+Docker, Linux race, frontend build, or full repository test-suite pass is claimed.
+Serving checks occur at coordinator/runtime boundaries; this does not claim
+transaction-atomic role revocation against concurrent SQL updates.
+
+Forward-only withdrawal after lost authority, active DB-committed recovery versus
+terminal current attestation, complete typed-adapter integration, and hosted
+Docker/process acceptance remain required before opening production factories
+or declaring M3 complete. Disablement remains the closed factory gate; rollback
+of this local code change must preserve all immutable protected history.
+No push, PR creation, GitHub merge or deployment was performed for this unit.

@@ -196,9 +196,26 @@ func (m *Manager) recoverGatewayRebindStartupWithDriver(ctx context.Context,
 	if err != nil {
 		return GatewayRebindStartupRecoveryResult{}, err
 	}
+	if physical.Disposition == appaccess.GatewayRebindDispositionAbort {
+		if err := driver.confirmRollbackServingLocked(ctx, request); err != nil {
+			return GatewayRebindStartupRecoveryResult{}, err
+		}
+	}
 	if receipt == nil {
 		value, valueErr := m.installGatewayRebindTerminalForPhysicalLocked(ctx, prepared, physical)
 		if valueErr != nil {
+			if physical.Disposition == appaccess.GatewayRebindDispositionAbort {
+				retained, scanErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+				if scanErr == nil {
+					terminal, terminalErr := gatewayRebindActiveTerminalV2(retained, prepared.Claim)
+					if terminalErr == nil && terminal != nil && terminal.Disposition == appaccess.GatewayRebindDispositionAbort {
+						request.Mode, request.Terminal = gatewayRebindPhysicalReconcileRollbackOnly, terminal
+					}
+				}
+				if confirmErr := driver.confirmRollbackServingLocked(ctx, request); confirmErr != nil {
+					return GatewayRebindStartupRecoveryResult{}, confirmErr
+				}
+			}
 			return GatewayRebindStartupRecoveryResult{}, valueErr
 		}
 		receipt = &value
@@ -206,6 +223,10 @@ func (m *Manager) recoverGatewayRebindStartupWithDriver(ctx context.Context,
 		return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
 	}
 	if receipt.Disposition == appaccess.GatewayRebindDispositionAbort {
+		request.Mode, request.Terminal = gatewayRebindPhysicalReconcileRollbackOnly, receipt
+		if err := driver.confirmRollbackServingLocked(ctx, request); err != nil {
+			return GatewayRebindStartupRecoveryResult{}, err
+		}
 		commitResult, applyErr := m.applyGatewayRebindRetainedRollbackLocked(ctx, repository, snapshot, *receipt)
 		if applyErr != nil {
 			return GatewayRebindStartupRecoveryResult{}, applyErr

@@ -22,8 +22,19 @@ func gatewayCurrentServingRuntimeComponentsMatch(target gatewayCurrentRouteState
 	snapshot appaccess.HostingGatewayStartupSnapshot,
 ) bool {
 	if !validGatewayCurrentRouteState(target) || target.Pending != nil || target.LANRecovery != nil ||
-		!reflect.DeepEqual(snapshot.Upgrades.CurrentProfile, snapshot.Rebind.CurrentProfile) ||
-		len(target.Apps) != len(snapshot.RuntimeHeads) {
+		!gatewayServingRuntimeComponentsMatch(target.Apps, snapshot) {
+		return false
+	}
+	return true
+}
+
+// Both native and rebound predecessors must match the same complete runtime
+// census. Callers validate their real protected state before normalizing apps.
+func gatewayServingRuntimeComponentsMatch(apps map[string]gatewayCurrentAppRoute,
+	snapshot appaccess.HostingGatewayStartupSnapshot,
+) bool {
+	if !reflect.DeepEqual(snapshot.Upgrades.CurrentProfile, snapshot.Rebind.CurrentProfile) ||
+		len(apps) != len(snapshot.RuntimeHeads) {
 		return false
 	}
 	for _, upgrade := range snapshot.Upgrades.Claims {
@@ -33,7 +44,7 @@ func gatewayCurrentServingRuntimeComponentsMatch(target gatewayCurrentRouteState
 	}
 	heads := make(map[string]appaccess.GatewayRebindRuntimeHead, len(snapshot.RuntimeHeads))
 	for i, head := range snapshot.RuntimeHeads {
-		app, exists := target.Apps[head.AppID]
+		app, exists := apps[head.AppID]
 		if !exists || !validCanonicalUUID(head.AppID) || !validCanonicalUUID(head.DeploymentID) ||
 			!validCanonicalUUID(head.ReleaseID) || head.Generation <= 0 || head.UpdatedAt.IsZero() ||
 			string(app.Route.Slot) != head.Slot || (i > 0 && snapshot.RuntimeHeads[i-1].AppID >= head.AppID) {
@@ -62,7 +73,7 @@ func gatewayCurrentServingRuntimeComponentsMatch(target gatewayCurrentRouteState
 		components[key], containers[component.ContainerID] = component, true
 	}
 	matched := 0
-	for appID, app := range target.Apps {
+	for appID, app := range apps {
 		for _, endpoint := range app.Route.Endpoints {
 			key := appID + "\x00" + endpoint.Component
 			component, found := components[key]

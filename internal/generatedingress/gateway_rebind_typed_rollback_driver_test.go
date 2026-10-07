@@ -17,6 +17,13 @@ type gatewayRebindTypedRollbackDriverFake struct {
 	rollbackIntentInstalled bool
 }
 
+func (f *gatewayRebindTypedRollbackDriverFake) confirmRollbackServing(ctx context.Context,
+	_ gatewayRebindPreparedAttempt, _ gatewayCurrentSelection, guard gatewayRebindTypedEffectGuard,
+) error {
+	f.guard(ctx, guard)
+	return nil
+}
+
 func (f *gatewayRebindTypedRollbackDriverFake) observeImage(ctx context.Context,
 	intent gatewayRebindProtectedIntentV2, guard gatewayRebindTypedEffectGuard,
 ) (string, error) {
