@@ -13,14 +13,15 @@ import (
 )
 
 type gatewayRebindBoundedPhysicalDriver struct {
-	t           *testing.T
-	template    gatewayCurrentStateFixture
-	rollback    bool
-	commitCalls int
-	abortCalls  int
-	attestCalls int
-	onAttest    func(gatewayCurrentSelection)
-	lastRequest gatewayRebindPhysicalReconcileRequest
+	t             *testing.T
+	template      gatewayCurrentStateFixture
+	rollback      bool
+	commitCalls   int
+	abortCalls    int
+	attestCalls   int
+	withdrawCalls int
+	onAttest      func(gatewayCurrentSelection)
+	lastRequest   gatewayRebindPhysicalReconcileRequest
 }
 
 type gatewayRebindLostAckRepository struct {
@@ -210,6 +211,26 @@ func (d *gatewayRebindBoundedPhysicalDriver) proveNoSuccessorEffectsLocked(_ con
 	return value, err
 }
 
+func (d *gatewayRebindBoundedPhysicalDriver) withdrawForwardSuccessorLocked(_ context.Context,
+	request gatewayRebindPhysicalReconcileRequest,
+) error {
+	if !validGatewayRebindPhysicalReconcileRequest(request) || request.Mode != gatewayRebindPhysicalReconcileForwardOnly {
+		return errors.New("invalid bounded forward withdrawal")
+	}
+	d.withdrawCalls++
+	return nil
+}
+
+func (d *gatewayRebindBoundedPhysicalDriver) confirmForwardServingLocked(ctx context.Context,
+	request gatewayRebindPhysicalReconcileRequest,
+) error {
+	if ctx.Err() != nil || !validGatewayRebindPhysicalReconcileRequest(request) ||
+		request.Mode == gatewayRebindPhysicalReconcileRollbackOnly {
+		return errors.New("invalid bounded forward confirmation")
+	}
+	return nil
+}
+
 func (d *gatewayRebindBoundedPhysicalDriver) confirmRollbackServingLocked(ctx context.Context,
 	request gatewayRebindPhysicalReconcileRequest,
 ) error {
@@ -314,7 +335,7 @@ func TestGatewayRebindCoordinatorCommitsRealSQLAndProtectedBaseline(t *testing.T
 	if result.OperationID != input.Inspection.Spec.OperationID || result.InitialPhase != appaccess.GatewayRebindPrepared ||
 		result.FinalPhase != appaccess.GatewayRebindCommitted || result.Disposition != appaccess.GatewayRebindDispositionCommit ||
 		!result.FenceReleased || !validSHA256(result.TerminalReceiptDigest) || driver.commitCalls != 1 ||
-		driver.attestCalls != 1 || driver.abortCalls != 0 || f.manager.gatewayRebindAdmissionBlocked() {
+		driver.attestCalls != 1 || driver.abortCalls != 0 || driver.withdrawCalls != 0 || f.manager.gatewayRebindAdmissionBlocked() {
 		t.Fatalf("unexpected coordinator result=%#v calls=%d/%d/%d", result, driver.commitCalls, driver.attestCalls, driver.abortCalls)
 	}
 	snapshot, err := f.repository.GatewayRebindRecoverySnapshot(context.Background())

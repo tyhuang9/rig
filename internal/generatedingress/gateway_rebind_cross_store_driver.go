@@ -28,6 +28,9 @@ func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorLocked(ctx conte
 		return d.reconcileRollbackLocked(ctx, request, appendProgress)
 	}
 	result, err := d.reconcileSuccessorForwardLocked(ctx, request, appendProgress)
+	if err != nil && request.Mode == gatewayRebindPhysicalReconcileForwardOnly {
+		return gatewayRebindTypedPhysicalResult{}, errors.Join(d.withdrawForwardSuccessorLocked(ctx, request), err)
+	}
 	if err == nil || request.Mode != gatewayRebindPhysicalReconcileUndecided || !request.RollbackAllowed {
 		return result, err
 	}
@@ -277,6 +280,9 @@ func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorForwardLocked(ct
 		}
 	}
 	if result, ok := gatewayRebindTypedPhysicalResultFromProgress(progress[len(progress)-1]); ok {
+		if err := d.confirmForwardServingLocked(ctx, request); err != nil {
+			return gatewayRebindTypedPhysicalResult{}, err
+		}
 		return result, nil
 	}
 	if d.handover == nil || request.Mode == gatewayRebindPhysicalReconcileRollbackOnly {
@@ -349,6 +355,9 @@ func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorForwardLocked(ct
 	result, ok := gatewayRebindTypedPhysicalResultFromProgress(progress[len(progress)-1])
 	if !ok || result.Disposition != appaccess.GatewayRebindDispositionCommit {
 		return gatewayRebindTypedPhysicalResult{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	if err := d.confirmForwardServingLocked(ctx, request); err != nil {
+		return gatewayRebindTypedPhysicalResult{}, err
 	}
 	return result, nil
 }

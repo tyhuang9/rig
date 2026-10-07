@@ -101,6 +101,8 @@ type gatewayRebindCrossStoreDriver interface {
 		[]appaccess.GatewayRebindRosterEntryV2, gatewayRebindPredecessorCheckpoint) (gatewayRebindNoEffectAbortProof, error)
 	attestCommittedCurrentLocked(context.Context, gatewayCurrentSelection) (string, error)
 	confirmRollbackServingLocked(context.Context, gatewayRebindPhysicalReconcileRequest) error
+	confirmForwardServingLocked(context.Context, gatewayRebindPhysicalReconcileRequest) error
+	withdrawForwardSuccessorLocked(context.Context, gatewayRebindPhysicalReconcileRequest) error
 }
 
 type GatewayRebindCommitResult struct {
@@ -220,8 +222,20 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 		return GatewayRebindCommitResult{}, err
 	}
 	terminalStore, err := newGatewayRebindTerminalStoreV2(m.options.DataRoot, receipt.Generation, receipt.OperationID)
-	if err != nil || terminalStore.installExact(ctx, receipt) != nil {
+	if err != nil {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	request.Mode, request.Terminal = gatewayRebindPhysicalReconcileForwardOnly, &receipt
+	// Keep the exact receipt/request until locks are released. Every failure
+	// after an attempted commit decision must reconcile owned withdrawal,
+	// including read failures and unknown final SQL acknowledgments.
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(driver.withdrawForwardSuccessorLocked(ctx, request), resultErr)
+		}
+	}()
+	if installErr := terminalStore.installExact(ctx, receipt); installErr != nil {
+		return GatewayRebindCommitResult{}, installErr
 	}
 
 	snapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
@@ -231,6 +245,10 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 	proof, err := gatewayRebindTransitionProofV2(snapshot, prepared.Claim, receipt, appaccess.GatewayRebindSuccessorReady,
 		gatewayCurrentRouteState{}, nil, "")
 	if err != nil {
+		return GatewayRebindCommitResult{}, err
+	}
+	request = gatewayRebindForwardConfirmationRequest(prepared, receipt, snapshot)
+	if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
 		return GatewayRebindCommitResult{}, err
 	}
 	if _, err = applyGatewayRebindTransitionReconciled(ctx, repository, proof); err != nil {
@@ -256,6 +274,10 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 	proof, err = gatewayRebindTransitionProofV2(snapshot, prepared.Claim, receipt,
 		appaccess.GatewayRebindDatabaseCommitted, baseline, transfers, "")
 	if err != nil {
+		return GatewayRebindCommitResult{}, err
+	}
+	request = gatewayRebindForwardConfirmationRequest(prepared, receipt, snapshot)
+	if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
 		return GatewayRebindCommitResult{}, err
 	}
 	if _, err = applyGatewayRebindTransitionReconciled(ctx, repository, proof); err != nil {
@@ -287,6 +309,10 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
 	snapshot = freshSnapshot
+	request = gatewayRebindForwardConfirmationRequest(prepared, receipt, snapshot)
+	if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
+		return GatewayRebindCommitResult{}, err
+	}
 	if !m.gatewayRebindCommitBarrierLatch().CompareAndSwap(false, true) {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}

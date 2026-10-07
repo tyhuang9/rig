@@ -264,6 +264,18 @@ func (f *gatewayRebindTypedStageDriverFake) finalizeSuccessor(ctx context.Contex
 	return resources, proof, err
 }
 
+func (f *gatewayRebindTypedStageDriverFake) confirmForwardServing(ctx context.Context,
+	_ gatewayRebindPreparedAttempt, _ gatewayRebindTypedEffectProgress, guard gatewayRebindTypedEffectGuard,
+) error {
+	return guard(ctx)
+}
+
+func (f *gatewayRebindTypedStageDriverFake) withdrawForwardSuccessor(ctx context.Context,
+	_ gatewayRebindPreparedAttempt, _ gatewayRebindTypedEffectProgress, guard gatewayRebindTypedEffectGuard,
+) error {
+	return guard(ctx)
+}
+
 func TestGatewayRebindTypedStageDriverPersistsCompleteStagePrefix(t *testing.T) {
 	fixture, input, bounded := newGatewayRebindCoordinatorFixture(t)
 	fake := &gatewayRebindTypedStageDriverFake{t: t, template: bounded.template}

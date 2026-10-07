@@ -2938,3 +2938,107 @@ Docker/process acceptance remain required before opening production factories
 or declaring M3 complete. Disablement remains the closed factory gate; rollback
 of this local code change must preserve all immutable protected history.
 No push, PR creation, GitHub merge or deployment was performed for this unit.
+
+## Receipt-bound forward serving authority (2026-10-07)
+
+This local unit continues from `ae0176031a251777bd657e4977f8706ff310bffe`
+on `feature/hosting-m3-rebind-cross-store-runtime`. The approved dependency
+integration remains `b681cf9255a4f32d53d248be32841f895095920e`; the guarded
+restart driver `14c2913` is an ancestor. No additional branch history was
+imported. The reviewed, staged source/test tree before this documentation is
+`a1781a8c8861fb06b4c32bf11b3d856d94bf52bf` (eight Go files).
+
+### Purpose and invariants
+
+A protected COMMIT receipt makes recovery forward-only even before the SQL
+database-committed transition. Cached physical completion now requires fresh
+serving authority and physical/configuration/publication proof. Commit and
+recovery confirm that proof before each subsequent SQL transition.
+
+Receipt-bound failures attempt ownership-only withdrawal under the held
+coordinator locks. Cleanup uses an independent bounded context, refreshes actual
+SQL phase after uncertain acknowledgments, and pins the original claim, receipt,
+progress and immutable final container ID. It stops only that successor and
+proves stopped readback plus absence of successor, predecessor and loopback
+listeners. Lost stop acknowledgments require exact readback. Ambiguous ownership
+or cleanup retains the fail-stop latch and reports that the candidate may be live.
+
+Withdrawal neither starts the predecessor nor removes resources, rewrites
+configuration/history, or reverses SQL. Current serving roles authorize continued
+serving; ownership authorizes cleanup after those roles are revoked. Failure
+defers cover post-receipt early returns and final SQL refusal even after the
+commit barrier was set. Successful commits request zero withdrawals.
+
+### Executable evidence
+
+Commands ran from the runtime checkout with `GOCACHE=Rig/.go-cache-m3`.
+Logs have prefix `Rig/temp/m3-forward-authority-20261007-`.
+
+| Log suffix | Actual outcome | SHA256 |
+| --- | --- | --- |
+| `baseline.jsonl` | Expected failure on prior implementation: 1 test failed, 64.069s; revoked rebind approver left the successor running with no withdrawal | `AC8F204C5ADC6F865A79E0314916424AFC30B50EDC5122EA72352450F0921DFD` |
+| `first-fix.jsonl` | Intermediate fix: 1 test passed, 75.185s | `979B8E4F801DB436C729CF1410D8C1E871916C33D9E39E73353F77C2C919CF79` |
+| `matrix.jsonl` | Intermediate coordinator implementation: 1 test/12 subcases passed, 163.687s | `CF1C3C7E50375037255482017E67C71D43E4DEF5CC599100F578138BB254A6AB` |
+| `coordinator.jsonl` | Before final failure defers: 3 tests/6 subcases passed, 187.410s | `07259A04BD6F8FAC7A06C36486F340618A51453D3360C8DF3F2394B87F865045` |
+| `final-sql-failure.jsonl` | Final source tree: 1 test/1 subcase passed, 84.122s | `7CD2C79BEC6D316563C8207CB06DABF154A55F99643CA4D4DC2BBCF0B7F407FF` |
+| `final-coordinator.jsonl` | Final source tree: 2 tests/6 subcases passed, 168.841s | `4FA9289218EE4DB530C07B2C318EBA6DCEE619F47533AD554C1A6C0632C7C1E3` |
+
+Every green run terminated with exit zero, discovered its expected tests and
+reported zero failures/skips. The baseline terminated with exit one. The matrix
+covers distinct rebind/configure/LAN approvers, revocation during probes, stale
+SQL phase after acknowledgment, stopped cached completion, lost stop acknowledgment,
+ambiguous listeners, replacement IDs, caller cancellation, and restart during
+absence probes. It asserts retained resources, unchanged SQL/history, active
+fence and no predecessor start. Its runtime stop/readback logic is unchanged in
+the final source; cleanup ownership subsequently moved to coordinator failure
+defers. The final 13-case matrix was not rerun as one command.
+
+The final SQL case uses a real completed typed handover, protected COMMIT receipt,
+SQLite transitions through database-committed, and simulated Docker. It revokes
+the rebind approver and refuses the final SQL write after the barrier is set,
+then proves exactly one owned stop with SQL, history, fence and resources retained.
+Only committed-current attestation during the active database-committed phase
+is bounded in that fixture; forward confirmation and withdrawal use the concrete
+typed runtime. The six final
+coordinator refusal cases use real SQLite and a bounded physical driver, asserting
+one withdrawal per refusal at prepared, successor-ready and database-committed
+for both commit and recovery. The successful coordinator case asserts zero.
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=4m -json ./internal/generatedingress -run '^TestGatewayRebindTypedForwardOnlyWithdrawsRevokedSuccessor$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=5m -json ./internal/generatedingress -run '^TestGatewayRebindTypedForwardOnlyWithdrawsRevokedSuccessor$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=8m -json ./internal/generatedingress -run '^TestGatewayRebindTypedForwardOnlyWithdrawsRevokedSuccessor$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=7m -json ./internal/generatedingress -run '^(TestGatewayRebindForwardConfirmationFencesCommitAndRecovery|TestGatewayRebindCoordinatorCommitsRealSQLAndProtectedBaseline|TestGatewayRebindTypedProductionDriverRemainsClosedUntilFinalAdapterExists)$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=4m -json ./internal/generatedingress -run '^TestGatewayRebindTypedForwardOnlyWithdrawsRevokedSuccessor$/^database_committed$/^final_SQL_failure$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=7m -json ./internal/generatedingress -run '^(TestGatewayRebindForwardConfirmationFencesCommitAndRecovery|TestGatewayRebindCoordinatorCommitsRealSQLAndProtectedBaseline)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd ./internal/appaccess
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The commands correspond to the log table in order. Vet, the full Go build,
+read-only formatting and staged whitespace checks pass on the final source.
+A test-fixture type-name compilation error was corrected before the final SQL
+run; it is not counted as an executed behavioral test. Independent orchestration
+and security source review accepted the frozen tree for this bounded scope.
+
+### Limits and next work
+
+The production typed factories remain closed. This evidence does not establish
+complete M3 or production readiness. The next required adapter work includes:
+
+- Pre-receipt sequence-17 failure: fresh confirmation can fail after physical
+  completion while the request remains undecided. Receipt-bound withdrawal
+  cannot authorize that case, and the existing rollback cannot consume that
+  completed prefix. This remains a separate unresolved failure path.
+- Authorized restoration of stopped serving during an active database-committed
+  attempt, plus integration with terminal current-state attestation.
+- Terminal-current failures after SQL releases the active fence; this unit's
+  active-attempt withdrawal does not cover those or promise a retained fence.
+- Transaction-atomic role revocation is not established by boundary checks.
+- Actual Docker/process and hosted CI acceptance remain pending. The same-day
+  Docker probe failed because the Docker Desktop Linux engine pipe was absent.
+  No Linux race, frontend build or full repository test-suite pass is claimed.
+
+Disablement remains the closed production factory. Any code rollback must retain
+immutable protected history and active recovery state. No database provisioning,
+remote publication, GitHub merge or deployment is part of this local unit.

@@ -204,6 +204,17 @@ func (m *Manager) recoverGatewayRebindStartupWithDriver(ctx context.Context,
 	if receipt == nil {
 		value, valueErr := m.installGatewayRebindTerminalForPhysicalLocked(ctx, prepared, physical)
 		if valueErr != nil {
+			if physical.Disposition == appaccess.GatewayRebindDispositionCommit {
+				// An installation error can still leave the exact commit receipt.
+				retained, scanErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+				if scanErr == nil {
+					terminal, terminalErr := gatewayRebindActiveTerminalV2(retained, prepared.Claim)
+					if terminalErr == nil && terminal != nil && terminal.Disposition == appaccess.GatewayRebindDispositionCommit {
+						request.Mode, request.Terminal = gatewayRebindPhysicalReconcileForwardOnly, terminal
+						return GatewayRebindStartupRecoveryResult{}, errors.Join(driver.withdrawForwardSuccessorLocked(ctx, request), valueErr)
+					}
+				}
+			}
 			if physical.Disposition == appaccess.GatewayRebindDispositionAbort {
 				retained, scanErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 				if scanErr == nil {
@@ -465,7 +476,14 @@ func (m *Manager) applyGatewayRebindRetainedRollbackLocked(ctx context.Context,
 func (m *Manager) recoverGatewayRebindCommitTerminalLocked(ctx context.Context,
 	repository GatewayRebindStartupRecoveryRepository, driver gatewayRebindCrossStoreDriver,
 	prepared gatewayRebindPreparedAttempt, receipt gatewayRebindTerminalReceiptV2,
-) (GatewayRebindCommitResult, error) {
+) (result GatewayRebindCommitResult, resultErr error) {
+	request := gatewayRebindPhysicalReconcileRequest{Attempt: prepared, Terminal: &receipt,
+		Mode: gatewayRebindPhysicalReconcileForwardOnly, SQLPhase: appaccess.GatewayRebindPrepared, RollbackAllowed: true}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(driver.withdrawForwardSuccessorLocked(ctx, request), resultErr)
+		}
+	}()
 	transfers, err := newGatewayRebindTransfersV2(prepared.Intent, receipt, prepared.Checkpoint)
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
@@ -485,12 +503,16 @@ func (m *Manager) recoverGatewayRebindCommitTerminalLocked(ctx context.Context,
 		if initial == "" {
 			initial = snapshot.Phase
 		}
+		request = gatewayRebindForwardConfirmationRequest(prepared, receipt, snapshot)
 		switch snapshot.Phase {
 		case appaccess.GatewayRebindPrepared:
 			proof, proofErr := gatewayRebindTransitionProofV2(snapshot, prepared.Claim, receipt,
 				appaccess.GatewayRebindSuccessorReady, gatewayCurrentRouteState{}, nil, "")
 			if proofErr != nil {
 				return GatewayRebindCommitResult{}, proofErr
+			}
+			if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
+				return GatewayRebindCommitResult{}, err
 			}
 			if _, applyErr := applyGatewayRebindTransitionReconciled(ctx, repository, proof); applyErr != nil {
 				return GatewayRebindCommitResult{}, applyErr
@@ -504,6 +526,9 @@ func (m *Manager) recoverGatewayRebindCommitTerminalLocked(ctx context.Context,
 				appaccess.GatewayRebindDatabaseCommitted, baseline, transfers, "")
 			if proofErr != nil {
 				return GatewayRebindCommitResult{}, proofErr
+			}
+			if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
+				return GatewayRebindCommitResult{}, err
 			}
 			if _, applyErr := applyGatewayRebindTransitionReconciled(ctx, repository, proof); applyErr != nil {
 				return GatewayRebindCommitResult{}, applyErr
@@ -542,6 +567,10 @@ func (m *Manager) recoverGatewayRebindDatabaseCommittedLocked(ctx context.Contex
 	freshSelection, err := m.selectGatewayCurrentLocked(ctx, fresh)
 	if err != nil || !sameGatewayCurrentSelection(selection, freshSelection) {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	request := gatewayRebindForwardConfirmationRequest(prepared, receipt, fresh)
+	if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
+		return GatewayRebindCommitResult{}, err
 	}
 	if !m.gatewayRebindCommitBarrierLatch().CompareAndSwap(false, true) {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
