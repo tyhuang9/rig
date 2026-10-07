@@ -209,6 +209,14 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 	if physical.Disposition != appaccess.GatewayRebindDispositionCommit {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
+	// Completed physical history is a direction fence before receipt creation.
+	// Keep ownership-only withdrawal armed through all later failures, while
+	// retaining the exact intended receipt across uncertain publication.
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(driver.withdrawForwardSuccessorLocked(ctx, request), resultErr)
+		}
+	}()
 	if physical.Last.Sequence != 17 || physical.Last.Phase != gatewayRebindProgressHandoverCommitted ||
 		physical.Last.TypedEffect == nil || physical.Last.TypedEffect.Resources == nil ||
 		physical.Last.TypedEffect.PhysicalProof == nil ||
@@ -226,14 +234,6 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
 	request.Mode, request.Terminal = gatewayRebindPhysicalReconcileForwardOnly, &receipt
-	// Keep the exact receipt/request until locks are released. Every failure
-	// after an attempted commit decision must reconcile owned withdrawal,
-	// including read failures and unknown final SQL acknowledgments.
-	defer func() {
-		if resultErr != nil {
-			resultErr = errors.Join(driver.withdrawForwardSuccessorLocked(ctx, request), resultErr)
-		}
-	}()
 	if installErr := terminalStore.installExact(ctx, receipt); installErr != nil {
 		return GatewayRebindCommitResult{}, installErr
 	}

@@ -53,40 +53,86 @@ func (d managerGatewayRebindCrossStoreDriver) confirmForwardServingLocked(ctx co
 	return nil
 }
 
-// A COMMIT receipt forbids rollback even before SQL commits. Refresh SQL phase
-// after uncertain acknowledgments, while pinning the original claim and receipt.
-// Serving permission must never authorize this ownership-only withdrawal.
+// Completed physical history forbids rollback even before a COMMIT receipt is
+// installed. Serving permission must never authorize ownership-only withdrawal.
 func (d managerGatewayRebindCrossStoreDriver) withdrawForwardSuccessorLocked(ctx context.Context,
 	request gatewayRebindPhysicalReconcileRequest,
 ) error {
-	unresolved := &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
-	if d.manager == nil || ctx == nil || request.Mode != gatewayRebindPhysicalReconcileForwardOnly ||
-		!validGatewayRebindPhysicalReconcileRequest(request) {
-		return unresolved
+	handled, err := d.withdrawCompletedSuccessorLocked(ctx, request)
+	if !handled {
+		if d.manager != nil {
+			d.manager.gatewayRebindFailStopLatch().Store(true)
+		}
+		return &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
 	}
-	d.manager.gatewayRebindFailStopLatch().Store(true)
+	return err
+}
+
+// A false result proves an incomplete, undecided prefix for ordinary rollback.
+// Uncertain history must never be mistaken for permission to roll back.
+func (d managerGatewayRebindCrossStoreDriver) withdrawCompletedSuccessorLocked(ctx context.Context,
+	request gatewayRebindPhysicalReconcileRequest,
+) (bool, error) {
+	unresolved := &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
+	fail := func() (bool, error) {
+		if d.manager != nil {
+			d.manager.gatewayRebindFailStopLatch().Store(true)
+		}
+		return true, unresolved
+	}
+	if d.manager == nil || ctx == nil || request.Mode == gatewayRebindPhysicalReconcileRollbackOnly ||
+		!validGatewayRebindPhysicalReconcileRequest(request) {
+		return fail()
+	}
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), v2ObservationTimeout)
 	defer cancel()
-	runtime, ok := d.handover.(gatewayRebindTypedForwardServingDriver)
-	if !ok || d.manager.options.RebindCurrentStateRepository == nil {
-		return unresolved
+	if d.manager.options.RebindCurrentStateRepository == nil {
+		return fail()
 	}
 	snapshot, err := d.manager.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(stopCtx)
 	if err != nil || snapshot.Active == nil || snapshot.Active.Claim.V2 == nil ||
-		!sameGatewayRebindClaimV2Admission(*snapshot.Active.Claim.V2, request.Attempt.Claim) ||
-		!gatewayRebindTerminalMatchesActiveSnapshot(*request.Terminal, snapshot) {
-		return unresolved
+		!sameGatewayRebindClaimV2Admission(*snapshot.Active.Claim.V2, request.Attempt.Claim) {
+		return fail()
+	}
+	expectedTerminal := request.Terminal
+	if expectedTerminal != nil {
+		history, scanErr := d.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		if scanErr != nil {
+			return fail()
+		}
+		retained, terminalErr := gatewayRebindActiveTerminalV2(history, request.Attempt.Claim)
+		if terminalErr != nil {
+			return fail()
+		}
+		if retained == nil {
+			// A failed install may have written nothing. Require the complete
+			// pre-receipt ownership boundary, still pinned to the intended result.
+			request.Mode, request.Terminal = gatewayRebindPhysicalReconcileUndecided, nil
+		} else if !reflect.DeepEqual(*retained, *expectedTerminal) ||
+			!gatewayRebindTerminalMatchesActiveSnapshot(*retained, snapshot) {
+			return fail()
+		}
 	}
 	request.SQLPhase = snapshot.Phase
 	request.RollbackAllowed, request.DatabaseCommitObserved = snapshot.RollbackAllowed, snapshot.DatabaseCommitObserved
 	boundary, err := d.manager.readGatewayRebindTypedAttemptBoundaryLocked(stopCtx, request)
 	if err != nil {
-		return unresolved
+		return fail()
 	}
 	last := boundary.Progress[len(boundary.Progress)-1]
 	result, found := gatewayRebindTypedPhysicalResultFromProgress(last)
-	if !found || !gatewayRebindPhysicalMatchesTerminal(result, *request.Terminal) || last.TypedEffect == nil {
-		return unresolved
+	if expectedTerminal == nil && request.Mode == gatewayRebindPhysicalReconcileUndecided &&
+		last.Phase != gatewayRebindProgressHandoverCommitted {
+		return false, nil
+	}
+	if !found || result.Disposition != appaccess.GatewayRebindDispositionCommit || last.TypedEffect == nil ||
+		(expectedTerminal != nil && !gatewayRebindPhysicalMatchesTerminal(result, *expectedTerminal)) {
+		return fail()
+	}
+	d.manager.gatewayRebindFailStopLatch().Store(true)
+	runtime, ok := d.handover.(gatewayRebindTypedForwardServingDriver)
+	if !ok {
+		return fail()
 	}
 	guard := func(effectCtx context.Context) error {
 		fresh, err := d.manager.readGatewayRebindTypedAttemptBoundaryLocked(effectCtx, request)
@@ -96,9 +142,9 @@ func (d managerGatewayRebindCrossStoreDriver) withdrawForwardSuccessorLocked(ctx
 		return nil
 	}
 	if runtime.withdrawForwardSuccessor(stopCtx, request.Attempt, *last.TypedEffect, guard) != nil {
-		return unresolved
+		return fail()
 	}
-	return gatewayRebindEffectBoundaryError(ctx)
+	return true, gatewayRebindEffectBoundaryError(ctx)
 }
 
 func (d gatewayRebindTypedHandoverRuntime) confirmForwardServing(ctx context.Context,

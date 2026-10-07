@@ -3042,3 +3042,113 @@ complete M3 or production readiness. The next required adapter work includes:
 Disablement remains the closed production factory. Any code rollback must retain
 immutable protected history and active recovery state. No database provisioning,
 remote publication, GitHub merge or deployment is part of this local unit.
+
+## Completed physical handover before receipt publication (2026-10-07)
+
+This unit continues locally from `2da28b6138f2ff21d5f5d4887f6bb5c5c8ccc74d`.
+It closes the preceding section's pre-receipt sequence-17 withdrawal gap.
+The source/test tree reviewed initially was
+`94cf43fa9cc23210beeb33fb4f968e1c68b9cc1d`; the final source/test tree is
+`66430c45ae3f34f0cdc7960516df99ef11f6a1e3`. The latter changes only the new
+test file, correcting simulator progress and adding the unwritten-completion
+boundary case. No branch history is imported.
+
+### Behavior and failure boundaries
+
+Before an undecided attempt falls back to rollback, a bounded independent
+context re-reads exact ownership, SQL selection, protected progress and terminal
+absence. A valid prefix without physical handover completion retains the existing
+rollback path, including replay of rollback records numbered 17 or later. Durable
+physical completion permits only exact successor withdrawal. Unprovable ownership
+returns a potentially-live diagnostic and latches the process; it never implies
+permission to roll back.
+
+Withdrawal retains the active SQL fence, resources and immutable history. It
+does not invent a receipt, advance SQL, restart the predecessor, or remove the
+successor. The existing physical primitive proves exact stopped readbacks and
+listener absence. A canceled caller does not cancel the bounded cleanup context.
+
+The commit failure defer is armed as soon as a physical commit result is returned,
+before validating that result or building its receipt. Recovery installation
+failure also invokes cleanup when no receipt exists. If an intended receipt was
+not installed, cleanup requires the actual undecided/prepared/no-database-commit
+boundary and a physical result matching that intended receipt. An exactly retained
+receipt uses its receipt-bound path. Conflicting or unreadable receipts remain
+uncertain; continuing ownership guards enforce the proven history throughout.
+
+### Executable evidence
+
+Commands ran in the runtime checkout with `GOCACHE=Rig/.go-cache-m3`. Logs use
+prefix `Rig/temp/m3-unreceipted-authority-20261007-`.
+
+| Log suffix | Actual outcome | SHA256 |
+| --- | --- | --- |
+| `baseline.jsonl` | Expected failure on `2da28b6`: 1 test failed, 63.497s; role revoked after durable17, successor still running, no cleanup effects | `71ACFDA2E2052F86659B35A4799337A02534B79BD7D855A309C1FE353EFDC062` |
+| `first-fix.jsonl` | Initial one-case regression passed, 73.315s | `827F139662D3E4CB610D6BAA02511A701592D5EFDE2AF5D58687CA4754D1E0AD` |
+| `matrix.jsonl` | Mixed run: 2 tests/9 subcases passed; startup receipt fixture panicked; package failed, 298.819s | `19A4A7F02338DFC90069C6A46B4A9AA3D02532ED32F33C736D97349BFF71931B` |
+| `regressions.jsonl` | 5 tests/15 subcases passed, 365.806s; zero failures/skips | `1E6AF0202D3C10AF25B0FC2EB92264153AC143ED42F3D25D62FCBE6B0DE5C428` |
+| `final-boundaries.jsonl` | Final test tree: 3 tests/2 subcases passed, 288.128s; zero failures/skips | `6BE2A203D596C34047C4DF1F6E3A9AC77A58F7B3AA1CC57E73F1070A11BE7E7C` |
+
+The mixed run's completed tests prove revocation after durable completion,
+cancellation with a lost completion acknowledgment, authorized cached completion,
+revoked/stopped replay, intended-but-absent receipt, exact retained receipt, and
+conflicting receipt. Each asserts only the permitted exact stop (or no effect),
+unchanged SQL/history, retained resources/fence and no predecessor start.
+
+Its failure was in the existing simulated Docker runner's `createFinal`: the
+new coordinator fixture passed the coordinator's appender, which did not update
+the simulator's `effect` field as the existing fixture appender does. The fix
+updates only simulator state after the real append succeeds. The first absent-
+receipt subcase and its parent failed; panic prevented the durable-receipt and
+pre-construction cases from running. This is retained as partial evidence, not a
+green suite or a production failure. The corrected boundaries are run separately.
+
+The final run proves both receipt installation failures through the actual startup
+coordinator: a canceled caller with no receipt, and an exactly retained receipt
+followed by cancellation/lost acknowledgment. Each performs one owned successor
+stop, leaves the predecessor stopped, and preserves exact SQL, history and
+resources. The pre-construction test verifies the coordinator invokes withdrawal
+before refusing a mismatched returned physical proof. The unwritten-completion
+test reaches durable sequence16 with the successor serving, refuses the sequence17
+write, then proves rollback intent17/completion18, removed successor resources,
+exactly one predecessor start and the retained SQL fence. Completed records are
+never reinterpreted as this unwritten case.
+
+The regression run covers the previous 13 receipt-bound cases, rollback after
+final removal, two rollback-intent persistence cases, successful commit, and the
+closed production factory. Production code is unchanged between these completed
+runs and the final test tree. All tests use local SQLite/protected records and
+simulated Docker; the commit pre-construction fixture bounds the physical driver.
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=4m -json ./internal/generatedingress -run '^TestGatewayRebindTypedCompletedWithoutReceiptWithdrawsSuccessor$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=12m -json ./internal/generatedingress -run '^(TestGatewayRebindTypedCompletedWithoutReceiptWithdrawsSuccessor|TestGatewayRebindTypedCompletedWithoutReceiptReplay|TestGatewayRebindTypedRecoveryWithdrawsFailedReceiptInstallation|TestGatewayRebindCommitWithdrawsBeforeReceiptConstruction)$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=12m -json ./internal/generatedingress -run '^(TestGatewayRebindTypedForwardOnlyWithdrawsRevokedSuccessor|TestGatewayRebindTypedHandoverRuntimeReplaysRollbackAfterFinalRemoval|TestGatewayRebindTypedDriverPersistsRollbackIntentBeforeEffects|TestGatewayRebindCoordinatorCommitsRealSQLAndProtectedBaseline|TestGatewayRebindTypedProductionDriverRemainsClosedUntilFinalAdapterExists)$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=8m -json ./internal/generatedingress -run '^(TestGatewayRebindTypedRecoveryWithdrawsFailedReceiptInstallation|TestGatewayRebindCommitWithdrawsBeforeReceiptConstruction|TestGatewayRebindTypedUndurableCompletionStillRollsBack)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd ./internal/appaccess
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The first command ran both the red baseline and initial fix. Final-tree vet, full
+Go build, read-only formatting and whitespace checks pass. Independent source,
+security and test-delta reviews accept this bounded unit. The final boundary and
+regression commands terminated with exit zero and discovered every selected test;
+the original matrix terminated with exit one as recorded above. No full green
+matrix rerun is claimed: its two completed tests are unaffected by the subsequent
+test-only correction, and its affected/missing cases passed in the final run.
+
+### Remaining integration limits
+
+Withdrawal deliberately leaves completed history with a stopped successor and
+active fence. Fresh confirmation refuses that stopped state even if roles are
+restored; authorized restoration still needs integration before the production
+factory can open. Active database-committed restoration, terminal-current
+attestation, complete typed-adapter integration and actual Docker/process/hosted
+acceptance remain outstanding. Boundary checks do not prove transaction-atomic
+role revocation. The same-day Docker engine limitation above still applies;
+no live Docker, Linux race, frontend build or full repository suite is claimed.
+
+Disablement remains the closed production factory. Preserve immutable history
+and recovery state when reverting code. This unit adds no managed database or
+Neon provisioning, imports no unapproved branch history, and performs no remote
+publication, GitHub merge or deployment.

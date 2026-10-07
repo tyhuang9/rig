@@ -34,6 +34,9 @@ func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorLocked(ctx conte
 	if err == nil || request.Mode != gatewayRebindPhysicalReconcileUndecided || !request.RollbackAllowed {
 		return result, err
 	}
+	if handled, withdrawErr := d.withdrawCompletedSuccessorLocked(ctx, request); handled {
+		return gatewayRebindTypedPhysicalResult{}, errors.Join(withdrawErr, err)
+	}
 	rolledBack, rollbackErr := d.reconcileRollbackLocked(ctx, request, appendProgress)
 	if rollbackErr != nil {
 		// The rollback diagnostic reflects the final physical observation.

@@ -205,15 +205,16 @@ func (m *Manager) recoverGatewayRebindStartupWithDriver(ctx context.Context,
 		value, valueErr := m.installGatewayRebindTerminalForPhysicalLocked(ctx, prepared, physical)
 		if valueErr != nil {
 			if physical.Disposition == appaccess.GatewayRebindDispositionCommit {
-				// An installation error can still leave the exact commit receipt.
+				// An installation error may leave a receipt or only completed
+				// physical history. Both require exact ownership withdrawal.
 				retained, scanErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 				if scanErr == nil {
 					terminal, terminalErr := gatewayRebindActiveTerminalV2(retained, prepared.Claim)
 					if terminalErr == nil && terminal != nil && terminal.Disposition == appaccess.GatewayRebindDispositionCommit {
 						request.Mode, request.Terminal = gatewayRebindPhysicalReconcileForwardOnly, terminal
-						return GatewayRebindStartupRecoveryResult{}, errors.Join(driver.withdrawForwardSuccessorLocked(ctx, request), valueErr)
 					}
 				}
+				return GatewayRebindStartupRecoveryResult{}, errors.Join(driver.withdrawForwardSuccessorLocked(ctx, request), valueErr)
 			}
 			if physical.Disposition == appaccess.GatewayRebindDispositionAbort {
 				retained, scanErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)

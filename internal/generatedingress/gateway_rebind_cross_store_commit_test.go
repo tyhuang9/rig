@@ -214,7 +214,7 @@ func (d *gatewayRebindBoundedPhysicalDriver) proveNoSuccessorEffectsLocked(_ con
 func (d *gatewayRebindBoundedPhysicalDriver) withdrawForwardSuccessorLocked(_ context.Context,
 	request gatewayRebindPhysicalReconcileRequest,
 ) error {
-	if !validGatewayRebindPhysicalReconcileRequest(request) || request.Mode != gatewayRebindPhysicalReconcileForwardOnly {
+	if !validGatewayRebindPhysicalReconcileRequest(request) || request.Mode == gatewayRebindPhysicalReconcileRollbackOnly {
 		return errors.New("invalid bounded forward withdrawal")
 	}
 	d.withdrawCalls++
