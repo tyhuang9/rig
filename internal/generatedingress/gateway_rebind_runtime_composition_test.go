@@ -32,8 +32,10 @@ type gatewayRebindCompositionRunner struct {
 
 type gatewayRebindCompositionDriver struct {
 	managerGatewayRebindCrossStoreDriver
-	t      *testing.T
-	runner *gatewayRebindCompositionRunner
+	t              *testing.T
+	runner         *gatewayRebindCompositionRunner
+	beforeProgress func(gatewayRebindProgressRecord) error
+	afterProgress  func(gatewayRebindProgressRecord) error
 }
 
 func (d *gatewayRebindCompositionDriver) reconcileSuccessorLocked(ctx context.Context,
@@ -44,12 +46,20 @@ func (d *gatewayRebindCompositionDriver) reconcileSuccessorLocked(ctx context.Co
 	}
 	return d.managerGatewayRebindCrossStoreDriver.reconcileSuccessorLocked(ctx, request,
 		func(ctx context.Context, record gatewayRebindProgressRecord) error {
+			if d.beforeProgress != nil {
+				if err := d.beforeProgress(record); err != nil {
+					return err
+				}
+			}
 			if err := appendProgress(ctx, record); err != nil {
 				return err
 			}
 			if record.TypedEffect != nil {
 				d.runner.effect = *record.TypedEffect
 				d.runner.stage.effect = *record.TypedEffect
+			}
+			if d.afterProgress != nil {
+				return d.afterProgress(record)
 			}
 			return nil
 		})

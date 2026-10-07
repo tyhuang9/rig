@@ -3484,3 +3484,91 @@ next step, not implemented hostd behavior in this unit.
 Rollback is code-only while the effect factories stay closed. Preserve SQL,
 immutable history and protected recovery state. No database provisioning,
 publication, GitHub merge, deployment or controller restart was performed.
+
+## Composed recovery after durable-write and SQL failures (2026-10-07)
+
+This local unit extends the shared simulated Docker backend from `ea9a6fe`.
+The reviewed source/test tree is
+`864f0b1e44046d60f4c7fde0498968b280e7d6a1`.
+It changes tests only; the private runtime factories and hostd startup wiring
+retain their prior state.
+
+### Scope and invariants
+
+The coordinator performs every real protected append and SQLite transition.
+Test-only callbacks inject errors before an append, after its durable write,
+or before a selected SQL transition. After-write injection runs only after
+the simulated inventory has been synchronized to the actual durable record.
+Normal rollback/withdrawal cleanup remains enabled. These cases exercise
+recovery after reported I/O failures, not abrupt process death.
+
+| Injected boundary | Required retained state | Required public startup recovery |
+| --- | --- | --- |
+| Lost acknowledgment after completed record 17 | Prepared SQL, 17 records, no receipt; exact successor stopped | Start that successor once, commit forward, release fence |
+| Refused `DATABASE_COMMITTED` | SuccessorReady SQL, COMMIT receipt and baseline; exact successor stopped | Start that successor once, finish the transfer and commit |
+| Refused `COMMITTED` | DatabaseCommitted SQL, receipt, transfers and baseline; fail-stop/barrier retained | Restore the same successor, attest current state, release fence |
+| Refused handover completion, then refused rollback completion | Actual rollback intent at 17; predecessor restored, successor resources removed | Append rollback completion and ABORT; no duplicate removal or start |
+
+A new Manager and driver share the existing backend, SQL, files and options,
+but receive new process latch objects. The failed Manager's latch values are
+checked after recovery and never cleared. Forward cleanup must be exactly
+one stop of the owned successor. Forward recovery must be exactly one start
+of that same immutable container ID. Rollback checks the full ordered removal
+plan and predecessor restart, then requires no physical effects during recovery.
+
+All pre-existing protected file fingerprints and SQL claim admission fields,
+rosters, runtime heads, event/command/transfer prefixes must survive. Only
+claim state, state sequence and update time are treated as mutable projections.
+A second public startup recovery must leave the complete SQL snapshot and
+protected file set unchanged and issue no Docker effects.
+
+### Verification record
+
+The initial development run failed an empty-versus-nil SQL command-prefix
+assertion after successful physical recovery. It was stopped during the next
+case after review identified assertion corrections; it is not acceptance.
+Its log, `C:/Users/huang/Documents/Projects/Rig/temp/m3-runtime-recovery-20261007-initial.jsonl`, has SHA-256
+`09C4A924FDEA05D81521DD5CBCEBC7C9F0CEBF7EB9FA01B536B251EB2D7E983D`.
+Review also corrected the SuccessorReady rollback flag, volume-removal order,
+mutable claim projection comparison, and transfer pointer-value comparison,
+and strengthened exact cleanup and immutable-prefix assertions.
+
+The final run passed three top-level tests and five subtests with zero failures
+or skips, in 882.639s. Both test processes were reaped before committing.
+The complete final log is
+`C:/Users/huang/Documents/Projects/Rig/temp/m3-runtime-recovery-20261007-reviewed.jsonl`,
+SHA-256 `3118FD137065CCA0D9119675AF23199BA0E9BA3E0C5C90E3BD80E1C946DB4756`.
+
+| Final test | Result | Elapsed |
+| --- | --- | --- |
+| `TestGatewayRebindConcreteCompositionCommitsAndReplaysSameDockerState` | Pass, including terminal restoration and corruption withdrawal | 155.42s |
+| `TestGatewayRebindConcreteCompositionRecoversForwardAfterDurableFailures` | Pass, all three retained forward boundaries and subsequent replays | 537.79s |
+| `TestGatewayRebindConcreteCompositionRecoversRetainedRollback` | Pass, actual cleanup followed by recovery and replay without additional effects | 188.98s |
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=30m -json ./internal/generatedingress -run '^TestGatewayRebindConcreteComposition'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd ./internal/appaccess
+gofmt -l internal/generatedingress/gateway_rebind_runtime_composition_test.go internal/generatedingress/gateway_rebind_runtime_recovery_test.go
+git diff --cached --check
+git diff --check
+```
+
+Read-only gofmt, whitespace checks and
+`go vet -mod=readonly ./internal/generatedingress ./cmd/hostd ./internal/appaccess`
+passed on the reviewed source. Independent source/security review accepted
+that exact tree after the assertion corrections.
+
+### Limits and next work
+
+This is a simulated Docker command/config backend with real local protected
+files and SQLite. It does not establish abrupt process termination, actual
+Docker networking or HTTP transport, Linux race behavior, frontend behavior,
+or full repository test-suite acceptance. Production code is unchanged by
+this unit, so no new production-build result is claimed.
+
+Next are a second concrete rebind from the committed current generation,
+phase-aware hostd startup outside ordinary effects admission, and real
+Docker/process acceptance. Preserve per-generation resource objects and
+immutable IDs when extending the simulator; do not replace current-source
+authority with a synthetic native predecessor. No publication, GitHub merge,
+deployment, controller restart or database provisioning is part of this unit.
