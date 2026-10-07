@@ -384,44 +384,5 @@ func gatewayRebindTypedPhysicalResultFromProgress(last gatewayRebindProgressReco
 func (d managerGatewayRebindCrossStoreDriver) attestCommittedCurrentLocked(ctx context.Context,
 	selection gatewayCurrentSelection,
 ) (string, error) {
-	if d.manager == nil || ctx == nil || ctx.Err() != nil || selection.Kind != gatewayCurrentSelectionRebind ||
-		selection.State == nil || d.manager.options.RebindCurrentStateRepository == nil {
-		return "", errors.New("generated ingress typed current attestation is unavailable")
-	}
-	target, err := gatewayCurrentPhysicalTargetFor(selection, *selection.State, nil, nil)
-	if err != nil {
-		return "", gatewayRebindEffectBoundaryError(ctx)
-	}
-	runtime := managerGatewayCurrentPhysicalRuntime{manager: d.manager, hostProbe: probeGatewayV2HostStatus,
-		containerProbe: func(probeCtx context.Context, id, address string, port uint16, host, challenge string) bool {
-			return d.manager.probeGatewayV2ContainerChallenge(probeCtx, id, address, port, host, challenge)
-		}}
-	firstSnapshot, err := d.manager.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(ctx)
-	if err != nil || firstSnapshot.Active == nil || firstSnapshot.Phase != appaccess.GatewayRebindDatabaseCommitted ||
-		!firstSnapshot.DatabaseCommitObserved {
-		return "", gatewayRebindEffectBoundaryError(ctx)
-	}
-	first, err := runtime.observe(ctx, target)
-	if err != nil || first.Outcome != gatewayCurrentPhysicalStableServing || first.Runtime.ListenerAbsent {
-		return "", gatewayRebindEffectBoundaryError(ctx)
-	}
-	secondSnapshot, err := d.manager.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(ctx)
-	if err != nil || !reflect.DeepEqual(firstSnapshot, secondSnapshot) {
-		return "", gatewayRebindEffectBoundaryError(ctx)
-	}
-	confirmed, err := d.manager.selectGatewayCurrentLocked(ctx, secondSnapshot)
-	if err != nil || !sameGatewayCurrentSelection(selection, confirmed) {
-		return "", gatewayRebindEffectBoundaryError(ctx)
-	}
-	second, err := runtime.observe(ctx, target)
-	if err != nil || !reflect.DeepEqual(first, second) {
-		return "", gatewayRebindEffectBoundaryError(ctx)
-	}
-	return canonicalDigest(struct {
-		Purpose     string                             `json:"purpose"`
-		Lineage     appaccess.GatewayCurrentLineageRef `json:"lineage"`
-		StateDigest string                             `json:"stateDigest"`
-		Physical    gatewayCurrentPhysicalAttestation  `json:"physical"`
-	}{"hostd/generated-ingress/rebind/committed-current-attestation/v1", selection.Lineage,
-		selection.State.Digest, second})
+	return d.manager.attestGatewayRebindCurrentLocked(ctx, selection)
 }

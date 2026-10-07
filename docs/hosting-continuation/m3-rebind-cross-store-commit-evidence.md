@@ -3263,3 +3263,123 @@ full repository suite is claimed.
 Disablement remains the closed production factories. Preserve immutable history
 and recovery state when reverting code. This unit provisions no database,
 publishes no branch, merges no GitHub PR and performs no deployment.
+
+## Active and terminal current-serving attestation (2026-10-07)
+
+This local unit continues from `9748f78e18a70ff79a2a8dae4c3de8dcbfc4a210`.
+The attestation source/test tree is
+`54392cd212f7d4556307b67b35abfd3fe7c035c3`; the final source/test tree is
+`82e1f73daf10c8d818a768d53369579ed98b85f7`. The final delta adds only prior-first
+error preservation in the two lock-release failure branches and its direct
+three-case regression test. No additional branch history is imported.
+
+### Authority and effect boundaries
+
+The rebind coordinator's current-serving attestation now handles two phases.
+Active database-committed recovery reconstructs the exact retained attempt and
+receipt, validates the typed forward boundary, and requires the original commit
+baseline with its complete current serving census. Terminal startup requires
+no active rebind, a clear SQL fence, the exact selected current revision, healthy
+runtime components, normal LAN claims and validated retained LAN history. A
+legitimate newer route revision is not mistaken for the original baseline.
+
+Both paths pin the complete Hosting snapshot, protected selection, immutable
+rebind history, route-history files and latch state across two matching physical
+observations. Exact stable-serving proofs retain the existing attestation digest
+format. Neither observation can start a stopped container, repair configuration,
+change SQL/history or clear a latch. Active attestation requires a clear commit
+barrier; terminal observation permits an unchanged held barrier because the
+same recovery invocation has not yet released its locks. Fail-stop still refuses
+both paths. The production observer is constructed locally through an interface
+that exposes observation only; the closed current/rebind effect factories are
+unchanged.
+
+Terminal recovery now owns a failure defer after selecting its exact protected
+state. It covers attestation refusal and later SQL/selection rechecks. Cleanup
+sets fail-stop and uses a bounded context independent of caller cancellation.
+Only the retained state, terminal receipt and immutable final-container identity
+can authorize stopping. Changed ownership yields a potentially-live refusal;
+there is no fallback to a different target. No terminal failure reverses SQL
+commit or recreates its released fence. Active commit failures retain their
+existing ownership-withdrawal defer.
+
+The lock-release helper previously replaced an existing cleanup diagnostic on
+release failure. It now joins a generic release diagnostic after the prior error,
+preserving potentially-live uncertainty, both release attempts, release order,
+fail-stop and the retained commit barrier.
+
+### Executable evidence
+
+All tests below use local SQLite/protected records with simulated Docker and
+network probes. The terminal positive fixture performs a real ordinary redeploy
+before checking its newer current revision and then repeats startup with a fresh
+Manager. The active-to-terminal test uses real SQL transitions and the concrete
+managed observer for both attestations while the commit barrier remains held;
+its existing handover/forward-confirmation fixture is explicitly bounded. It is
+not evidence of a complete combined typed-handover/Docker journey.
+
+The active seven-case test covers success, incomplete runtime census, approval
+revocation projected after observation, two different valid physical proofs,
+stopped serving and both latches. It verifies observation has no physical or
+durable effects, preserves the SQL fence and never clears latches. Authority
+projection fault injection does not alter the underlying user-role table.
+
+The terminal seven-case test covers incomplete census, late LAN approval loss,
+cancellation, stopped serving, replacement container identity, a changed SQL
+projection after attestation returns, and a changed protected current revision.
+It proves the exact stop or no effect, zero success result, truthful potentially-
+live diagnostics, retained fail-stop, unchanged committed SQL/history and no
+resource removal. The protected-revision case deliberately saves a valid newer
+revision; cleanup must preserve it and refuse stale ownership.
+
+Commands use `GOCACHE=Rig/.go-cache-m3`. Logs use prefix
+`Rig/temp/m3-current-attestation-20261007-`.
+
+| Log suffix | Actual outcome | SHA256 |
+| --- | --- | --- |
+| `baseline.jsonl` | Expected failure on `9748f78`: terminal startup refused an exact serving successor; 1 failed test, 23.918s | `88C5F87D91C1B0D939EE3F825F9CF013522924D53EFAD030135DD867BD7C06C3` |
+| `first-fix.jsonl` | Initial terminal attestation/replay passed: 1 test, 31.872s | `CCEBB2808D6F220B5A0A731041FBE5834B9137C8ACA20DEF5CFCA352182D4A7C` |
+| `matrix.jsonl` | 4 tests and 14 subcases passed, 165.014s; zero failures/skips | `12AA72FE0B11E7DC2478044444E8932462C1F33E48C88EEE96B18F9E233A176D` |
+| `regressions.jsonl` | 5 tests and 6 subcases passed, 203.676s; zero failures/skips | `571950AFEE625A2AC27A9328162BE3D17B3026F0AC336CA1E6666F619D7B1621` |
+| `release-baseline.jsonl` | Expected failure before diagnostic fix: 1 test and 3 subcases failed, 1.238s | `250C5265980D00AAD1B615E3B66CE5E32703B9DE70F7A8DF12D10D627806396E` |
+| `release-fix.jsonl` | Final tree: 2 tests and 3 subcases passed, 1.012s; zero failures/skips | `ED3BBF23F548136146EE75C159ED10ECBBC7F7DD9D9BDFC8A6F252200E2A3F96` |
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=4m -json ./internal/generatedingress -run '^TestGatewayRebindTypedTerminalAttestationPreservesCommittedHistory$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=10m -json ./internal/generatedingress -run '^(TestGatewayRebindTypedTerminalAttestationPreservesCommittedHistory|TestGatewayRebindCurrentAttestationCrossesSQLCommitBarrier|TestGatewayRebindCurrentAttestationRefusesActiveAuthorityDrift|TestGatewayRebindTerminalAttestationWithdrawsOnlyRetainedOwner)$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=8m -json ./internal/generatedingress -run '^(TestRecoverGatewayRebindStartupCompletesDatabaseCommittedAttemptAndReattestsCurrent|TestRecoverGatewayRebindStartupDatabaseCommitIsForwardOnlyBeforePhysicalEffects|TestRecoverGatewayRebindStartupReleaseFailureLatchesEveryManager|TestGatewayRebindForwardConfirmationFencesCommitAndRecovery|TestGatewayRebindTypedProductionDriverRemainsClosedUntilFinalAdapterExists)$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=1m -json ./internal/generatedingress -run '^TestGatewayRebindReleaseFailurePreservesWithdrawalUncertainty$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=2m -json ./internal/generatedingress -run '^(TestGatewayRebindReleaseFailurePreservesWithdrawalUncertainty|TestRecoverGatewayRebindStartupReleaseFailureLatchesEveryManager)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd ./internal/appaccess
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The first command produced the red baseline and first-fix logs. The matrix and
+existing regressions ran on `54392cd`; the release-fix run verified the only
+subsequent production change on `82e1f73`. The regression run covers six existing
+commit/recovery confirmation refusals, startup completion/reattest, forward-only
+database commit, release-failure admission and the closed production factory.
+Together these completed runs cover 10 distinct tests and 23 subcases; the
+release-failure admission test passed twice. Selected tests were discovered,
+and every completed passing run exited zero. No full matrix rerun after the
+two-line release fix is claimed.
+
+Final-source vet, full Go build, read-only formatting and whitespace checks pass.
+Independent source/security review accepted the attestation tree and the final
+diagnostic-preservation delta. The evidence retains both reproduced failures.
+
+### Remaining integration limits
+
+This closes the current-attestation phase mismatch; it does not complete M3.
+Complete typed stage/handover/current-driver composition, production startup
+ordering (including restoration before terminal attestation of stopped serving),
+and actual Docker/process/hosted acceptance remain outstanding. The same-day
+Docker Desktop Linux engine limitation above still applies. No live Docker,
+Linux race, frontend build or full repository test-suite pass is claimed.
+Boundary checks do not prove transaction-atomic role revocation. When the closed
+current effect factory cannot perform withdrawal, failure remains explicitly
+potentially live and admission stays latched.
+
+Rollback is code-only with the closed effect factories retained; preserve all
+immutable history, committed SQL and recovery state. This unit provisions no
+database, publishes no branch, merges no GitHub PR and performs no deployment.

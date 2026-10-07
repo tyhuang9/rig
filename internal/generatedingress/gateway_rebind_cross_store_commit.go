@@ -424,13 +424,13 @@ func (m *Manager) releaseGatewayRebindTerminalLocks(releaseEffects, releaseGatew
 	failed := prior
 	if releaseEffects != nil {
 		if err := releaseEffects(); err != nil {
-			failed = &Error{Code: DiagnosticRouteUnresolved}
+			failed = errors.Join(failed, &Error{Code: DiagnosticRouteUnresolved})
 			m.gatewayRebindFailStopLatch().Store(true)
 		}
 	}
 	if releaseGateway != nil {
 		if err := releaseGateway(); err != nil {
-			failed = &Error{Code: DiagnosticRouteUnresolved}
+			failed = errors.Join(failed, &Error{Code: DiagnosticRouteUnresolved})
 			m.gatewayRebindFailStopLatch().Store(true)
 		}
 	}

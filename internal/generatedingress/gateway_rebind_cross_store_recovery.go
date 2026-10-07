@@ -606,14 +606,20 @@ func (m *Manager) recoverGatewayRebindDatabaseCommittedLocked(ctx context.Contex
 func (m *Manager) recoverGatewayRebindCommittedCurrentLocked(ctx context.Context,
 	repository GatewayRebindStartupRecoveryRepository, driver gatewayRebindCrossStoreDriver,
 	snapshot appaccess.GatewayRebindRecoverySnapshot, result GatewayRebindStartupRecoveryResult,
-) (GatewayRebindStartupRecoveryResult, error) {
-	if snapshot.CurrentSource == nil {
+) (recovered GatewayRebindStartupRecoveryResult, resultErr error) {
+	if snapshot.CurrentSource == nil || snapshot.Active != nil {
 		return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
 	}
 	selection, err := m.selectGatewayCurrentLocked(ctx, snapshot)
 	if err != nil {
 		return GatewayRebindStartupRecoveryResult{}, err
 	}
+	defer func() {
+		if resultErr != nil && selection.Kind == gatewayCurrentSelectionRebind {
+			resultErr = errors.Join(m.withdrawGatewayRebindTerminalCurrentLocked(ctx, selection), resultErr)
+			recovered = GatewayRebindStartupRecoveryResult{}
+		}
+	}()
 	var attestation string
 	if selection.Kind == gatewayCurrentSelectionRebind {
 		attestation, err = driver.attestCommittedCurrentLocked(ctx, selection)
