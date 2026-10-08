@@ -276,9 +276,9 @@ func liveGatewayRebindRuntimeJourney(t *testing.T, rollback bool) {
 	if err != nil {
 		t.Fatal("read source LAN access")
 	}
-	beforeLoopback, err := repository.CurrentAppAccess(ctx, f.loopbackID)
+	beforeLoopback, err := liveGatewayRebindRuntimeLoopbackSnapshot(ctx, repository, f.loopbackID)
 	if err != nil {
-		t.Fatal("read source loopback access")
+		t.Fatal("read source loopback state")
 	}
 	beforeProfile, err := repository.CurrentGatewayProfile(ctx)
 	if err != nil || beforeProfile != f.profile {
@@ -342,7 +342,7 @@ func liveGatewayRebindRuntimeJourney(t *testing.T, rollback bool) {
 		t.Fatal("terminal SQL authority or fence is wrong")
 	}
 	afterAccess, accessErr := repository.CurrentAppAccess(ctx, fixture.spec.appID)
-	afterLoopback, loopErr := repository.CurrentAppAccess(ctx, f.loopbackID)
+	afterLoopback, loopErr := liveGatewayRebindRuntimeLoopbackSnapshot(ctx, repository, f.loopbackID)
 	afterProfile, profileErr := repository.CurrentGatewayProfile(ctx)
 	afterHeads, headsErr := repository.GatewayRebindRuntimeHeads(ctx)
 	afterBinding, bindingErr := repository.ResolveGatewayBinding(ctx, bindingRef)
@@ -458,6 +458,19 @@ func liveGatewayRebindRuntimeLANBody(parent context.Context, address string, por
 	matches := response.StatusCode == http.StatusOK && string(body) == expected
 	clear(body)
 	return matches
+}
+
+func liveGatewayRebindRuntimeLoopbackSnapshot(ctx context.Context, repository *appaccess.Repository,
+	appID string,
+) (appaccess.AppAccessOperatorSnapshot, error) {
+	snapshot, err := repository.ReadAppAccessOperatorSnapshot(ctx, appID)
+	if err != nil {
+		return appaccess.AppAccessOperatorSnapshot{}, err
+	}
+	if !reflect.DeepEqual(snapshot, appaccess.AppAccessOperatorSnapshot{}) {
+		return appaccess.AppAccessOperatorSnapshot{}, errors.New("loopback-only application has LAN access state")
+	}
+	return snapshot, nil
 }
 
 func (f liveGatewayRebindRuntimeFixture) String() string {
