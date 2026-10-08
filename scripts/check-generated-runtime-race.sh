@@ -17,11 +17,14 @@ case "$mode" in
 esac
 filter=()
 # These complementary filters retain every ingress test and its full subtest
-# tree. Both workflows use this command so their partitions cannot drift.
+# tree. All three workflows use this command so their partitions cannot drift.
 gateway_v2_pattern='^TestGatewayV2'
 rebind_pattern='^Test(GatewayRebind|InspectGatewayRebind)'
 rebind_effects_pattern='^Test(GatewayRebind(Stage|Final|Successor)|InspectGatewayRebindSuccessor)'
 rebind_config_pattern='^TestGatewayRebind(StageConfig|FinalConfig)'
+rebind_current_pattern='^Test(GatewayRebind(Committed|Current)|InspectGatewayRebindCurrent)'
+rebind_handover_pattern='^TestGatewayRebindFinalHandover'
+rebind_handover_rollback_pattern='^TestGatewayRebindFinalHandoverRollback'
 # Keep the concrete lifecycle and retained-current cases out of the older
 # history/remainder batches. Each fallback excludes the complete family so new
 # cases remain selected exactly once without extending this list of names.
@@ -33,6 +36,8 @@ rebind_second_generation_pattern='^TestGatewayRebindConcreteCompositionSecondGen
 rebind_legacy_source_pattern='^TestGatewayRebindConcreteCompositionLegacySource'
 current_pattern='^Test(ManagedGatewayCurrent|GatewayCurrent|InspectGatewayCurrent)'
 current_lan_pattern='^Test(ManagedGatewayCurrentLAN|GatewayCurrentLAN)'
+current_lan_recovery_pattern='^Test(ManagedGatewayCurrentLANRecovery|GatewayCurrentLANRecovery)'
+current_runtime_pattern='^Test(ManagedGatewayCurrent|GatewayCurrent)(Physical|Serving)'
 case "$suite" in
   runtime-packages)
     packages=(
@@ -52,7 +57,11 @@ case "$suite" in
     ;;
   rebind-history)
     packages=(./internal/generatedingress)
-    filter=(-run "$rebind_pattern" -skip "$rebind_effects_pattern|$rebind_typed_pattern|$rebind_composition_pattern")
+    filter=(-run "$rebind_pattern" -skip "$rebind_effects_pattern|$rebind_typed_pattern|$rebind_composition_pattern|$rebind_current_pattern")
+    ;;
+  rebind-current)
+    packages=(./internal/generatedingress)
+    filter=(-run "$rebind_current_pattern")
     ;;
   rebind-config)
     packages=(./internal/generatedingress)
@@ -60,7 +69,15 @@ case "$suite" in
     ;;
   rebind-resources)
     packages=(./internal/generatedingress)
-    filter=(-run "$rebind_effects_pattern" -skip "$rebind_config_pattern")
+    filter=(-run "$rebind_effects_pattern" -skip "$rebind_config_pattern|$rebind_handover_pattern")
+    ;;
+  rebind-handover)
+    packages=(./internal/generatedingress)
+    filter=(-run "$rebind_handover_pattern" -skip "$rebind_handover_rollback_pattern")
+    ;;
+  rebind-handover-rollback)
+    packages=(./internal/generatedingress)
+    filter=(-run "$rebind_handover_rollback_pattern")
     ;;
   rebind-typed-withdrawal)
     packages=(./internal/generatedingress)
@@ -88,11 +105,19 @@ case "$suite" in
     ;;
   current-lan)
     packages=(./internal/generatedingress)
-    filter=(-run "$current_lan_pattern")
+    filter=(-run "$current_lan_pattern" -skip "$current_lan_recovery_pattern")
+    ;;
+  current-lan-recovery)
+    packages=(./internal/generatedingress)
+    filter=(-run "$current_lan_recovery_pattern")
+    ;;
+  current-runtime)
+    packages=(./internal/generatedingress)
+    filter=(-run "$current_runtime_pattern")
     ;;
   current-serving)
     packages=(./internal/generatedingress)
-    filter=(-run "$current_pattern" -skip "$current_lan_pattern")
+    filter=(-run "$current_pattern" -skip "$current_lan_pattern|$current_runtime_pattern")
     ;;
   ingress-remainder)
     packages=(./internal/generatedingress)
