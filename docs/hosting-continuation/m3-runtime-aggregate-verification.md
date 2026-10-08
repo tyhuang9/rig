@@ -105,3 +105,37 @@ acceptance is established by this record. No production factory, managed databas
 or Neon provisioning is enabled. CI rollback reverts the shared runner and both
 changed workflows together, retaining tests, SQL and protected history. No branch
 publication, GitHub merge, deployment or controller restart occurred.
+
+## Admission fixture correction after the authority repair
+
+Preparing an independent process-admission gate on 2026-10-07 exposed an
+existing test failure at `603c38f`. The direct proposal in
+`TestGatewayRebindProposalAndAdmissionUseRealRepository` omitted the inspected
+`RuntimeHeads`, so the writer correctly returned `ErrInvalidInput` before its
+transaction. The test expected `ErrGatewayRebindNotQuiescent`. Production
+`prepareGatewayRebindLocked` already supplies that census.
+
+The fixture now validates the inspected census count/digest and includes it in
+the direct proposal. Precise busy refusal, successful admission, exact replay,
+and no-effect/history assertions remain intact. No production code, schema,
+authorization rule, or historical record changed.
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=5m -json ./internal/generatedingress -run '^(TestGatewayRebindProposalAndAdmissionUseRealRepository|TestGatewayRebindPreparedAdmissionAndRecoveryUseRealRepository|TestGatewayRebindEffectBoundaryHoldsDeploymentEffectsLeaseAgainstAnotherProcess|TestGatewayOSLockReleasedWhenProcessExits)$'
+```
+
+The unchanged baseline failed: 3 tests/2 subcases passed, the named proposal
+test failed, exit 1, 6.787s. After correction, all 4 tests/2 subcases passed,
+exit 0, 6.786s. Both runs discovered exactly those four tests; their package
+outcomes and saved exits were checked and processes reaped. Logs under the
+same `Rig/temp/` directory:
+
+| Prefix | JSON SHA-256 |
+| --- | --- |
+| `m3-admission-process-baseline-20261007` | `22C2B0CC2F6E5705FA93D3CA543B21F711F6F7D52BB7F8836C1AE1C62BA6FACC` |
+| `m3-admission-census-fixture-corrected-20261007` | `BDD22FA833005FEDDEC29BE48DACAFB75BC66EC660C202A7F56CBEC2AFC06239` |
+
+Source review confirmed the missing census and validation order. The corrected
+test reaches the later assertions that the malformed input previously prevented
+from executing. Formatting and diff checks passed. These results do not expand
+the earlier aggregate into a full ingress or hosted pass.
