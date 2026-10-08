@@ -104,6 +104,11 @@ func TestGatewayRebindConcreteCompositionRecoversForwardAfterDurableFailures(t *
 			}
 			effects := len(r.effects)
 			fresh := newGatewayRebindCompositionRecoveryProcess(t, f.manager, r)
+			prepared, err := fresh.InspectGatewayRebindCurrent(ctx, f.repository)
+			if err != nil || prepared.ActiveOperationID != input.Inspection.Spec.OperationID ||
+				prepared.ActiveSpecVersion != appaccess.GatewayRebindSpecVersionV2 || prepared.ActivePhase != tc.phase || prepared.FenceReleased {
+				t.Fatalf("active startup classification: %+v error=%v", prepared, err)
+			}
 			recovered, err := fresh.RecoverGatewayRebindStartup(ctx, f.repository)
 			if err != nil || !recovered.Recovered || recovered.InitialActivePhase != tc.phase ||
 				recovered.FinalActivePhase != appaccess.GatewayRebindCommitted || recovered.Disposition != appaccess.GatewayRebindDispositionCommit ||
@@ -111,6 +116,13 @@ func TestGatewayRebindConcreteCompositionRecoversForwardAfterDurableFailures(t *
 				!r.finalPresent || !r.final.Running || r.predecessor.FinalContainer.Running || r.stagePresent ||
 				!reflect.DeepEqual(r.effects[effects:], [][]string{{"container", "start", r.finalID}}) {
 				t.Fatalf("same-backend forward recovery: result=%#v effects=%v err=%v", recovered, r.effects[effects:], err)
+			}
+			confirmed, err := fresh.InspectGatewayRebindCurrent(ctx, f.repository)
+			if err != nil || confirmed.ActiveOperationID != "" || confirmed.ActiveSpecVersion != 0 || !confirmed.FenceReleased ||
+				confirmed.CurrentRecoveryMode != GatewayCurrentRecoveryStable || recovered.SelectedCurrentAuthority == nil ||
+				confirmed.SelectedCurrentAuthority != *recovered.SelectedCurrentAuthority ||
+				confirmed.CurrentStateDigest != recovered.CurrentStateDigest {
+				t.Fatalf("active recovery startup checkpoint: %+v error=%v", confirmed, err)
 			}
 			after, err := f.repository.GatewayRebindRecoverySnapshot(ctx)
 			if err != nil || after.Active != nil || f.repository.CheckGatewayRebindFence(ctx) != nil ||

@@ -95,6 +95,12 @@ func runServer(args []string) int {
 		return 1
 	}
 	defer db.Close()
+	preparedGateway, err := prepareGatewayRebindStartup(context.Background(), cfg, db, dockerExecutable, ownerDirectories)
+	if err != nil {
+		logger.Error("gateway rebind startup preparation failed", "error", err)
+		emergencyStop()
+		return 1
+	}
 	var workerAdmission func(context.Context) (func() error, error)
 	if cfg.ComposeRuntime || cfg.GeneratedRuntime {
 		workerAdmission, err = deploymentEffectsAdmission(db, ownerDirectories.WorkingDirectory)
@@ -128,7 +134,7 @@ func runServer(args []string) int {
 		}()
 	}
 	rebindCheck := rebindFenceCheck(db)
-	gate, err := inspectGatewayStartup(context.Background(), cfg, db, dockerExecutable, ownerDirectories)
+	gate, err := inspectGatewayStartupAfterPreparation(context.Background(), cfg, db, dockerExecutable, ownerDirectories, preparedGateway)
 	if err != nil {
 		logger.Error("gateway startup inspection failed", "error", err)
 		emergencyStop()
