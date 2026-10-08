@@ -56,9 +56,13 @@ func TestGatewayRebindAttemptViewUsesTypedCheckpointAndActualPriorReceipt(t *tes
 	checkpoint, intent := gatewayRebindAttemptTypedFixture(t, fixture)
 	state := cloneGatewayCurrentRouteState(fixture.baseline)
 	receipt := fixture.receipt
+	terminal, err := newGatewayRebindAttemptTerminalViewLegacy(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
 	selection := gatewayCurrentSelection{
 		Kind: gatewayCurrentSelectionRebind, Lineage: fixture.baseline.Lineage,
-		State: &state, Receipt: &receipt, Store: fixture.store,
+		State: &state, Receipt: &receipt, Terminal: &terminal, Store: fixture.store,
 	}
 	view, err := newGatewayRebindAttemptViewV2(intent, checkpoint, selection)
 	if err != nil {
@@ -101,9 +105,17 @@ func TestGatewayRebindAttemptViewUsesTypedCheckpointAndActualPriorReceipt(t *tes
 	wrongReceipt := selection
 	changedReceipt := receipt
 	changedReceipt.Digest = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	changedTerminal := terminal
+	changedTerminal.LegacyReceipt = &changedReceipt
 	wrongReceipt.Receipt = &changedReceipt
+	wrongReceipt.Terminal = &changedTerminal
 	if _, err := newGatewayRebindAttemptViewV2(intent, checkpoint, wrongReceipt); err == nil {
 		t.Fatal("typed adapter accepted a substituted prior terminal receipt")
+	}
+	missingTerminal := selection
+	missingTerminal.Terminal = nil
+	if _, err := newGatewayRebindAttemptViewV2(intent, checkpoint, missingTerminal); err == nil {
+		t.Fatal("typed adapter accepted a legacy receipt without its canonical terminal selection")
 	}
 }
 
