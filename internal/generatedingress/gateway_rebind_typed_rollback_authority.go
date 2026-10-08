@@ -107,8 +107,13 @@ func (d gatewayRebindTypedHandoverRuntime) authorizedRollbackPredecessor(ctx con
 		predecessor.Address != gatewayRebindPredecessorAddressPresent || guard(ctx) != nil {
 		return invalid()
 	}
+	// Ownership of a stopped predecessor is sufficient for handover observation,
+	// but starting it requires every predecessor/successor listener to be absent.
+	if !predecessor.Running && !d.withdrawn(ctx, attempt, gatewayRebindTypedEffectProgress{}, predecessor, false, false) {
+		return invalid()
+	}
 	second, err := repository.HostingGatewayStartupSnapshot(ctx)
-	if err != nil || ctx.Err() != nil || !reflect.DeepEqual(first, second) {
+	if err != nil || ctx.Err() != nil || !reflect.DeepEqual(first, second) || guard(ctx) != nil {
 		return invalid()
 	}
 	return predecessor, nil

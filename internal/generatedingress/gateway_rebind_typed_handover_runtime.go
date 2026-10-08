@@ -158,6 +158,19 @@ func (d gatewayRebindTypedHandoverRuntime) predecessor(ctx context.Context,
 	if err != nil {
 		return invalid()
 	}
+	if selection.Kind == gatewayCurrentSelectionRebind {
+		// History selects immutable predecessor content. Bind its local store
+		// identity too so the effect guard's fresh SQL-selected current can be
+		// compared without relaxing the complete selection equality check.
+		selection.Store, err = newGatewayCurrentRouteStateStore(d.manager.options.DataRoot, selection.Lineage)
+		if err != nil || selection.Terminal == nil {
+			return invalid()
+		}
+		if selection.Terminal.LegacyReceipt != nil {
+			receipt := *selection.Terminal.LegacyReceipt
+			selection.Receipt = &receipt
+		}
+	}
 	value := gatewayRebindTypedPredecessorObservation{Selection: selection,
 		Address: gatewayRebindPredecessorAddressAbsent}
 	switch selection.Kind {
@@ -207,11 +220,8 @@ func (d gatewayRebindTypedHandoverRuntime) predecessor(ctx context.Context,
 		if err != nil {
 			return invalid()
 		}
-		runtime := managerGatewayCurrentPhysicalRuntime{manager: d.manager, hostProbe: d.hostProbe,
-			containerProbe: d.containerProbe}
-		physical, err := runtime.observe(ctx, target)
-		if err != nil || (physical.Outcome != gatewayCurrentPhysicalStableServing &&
-			physical.Outcome != gatewayCurrentPhysicalRecoveryStopped) {
+		physical, err := d.observeCurrentPredecessor(ctx, target)
+		if err != nil {
 			return invalid()
 		}
 		value.Profile = gatewayProfileBinding{RevisionID: selection.State.Profile.RevisionID,
@@ -219,12 +229,12 @@ func (d gatewayRebindTypedHandoverRuntime) predecessor(ctx context.Context,
 			SelectedIPv4: selection.State.Profile.SelectedIPv4, InterfaceID: selection.State.Profile.InterfaceID,
 			PortStart: selection.State.Profile.PortStart, PortEnd: selection.State.Profile.PortEnd}
 		value.ContainerID = selection.Terminal.Resources.FinalContainer.ID
-		value.Running = physical.Outcome == gatewayCurrentPhysicalStableServing
+		value.Running = physical.Running
 		value.Observation = physical.Digest
 		value.Routes, _ = canonicalDigest(selection.State.Apps)
 		value.LocalHostPort = gatewayRebindRetainedHandoverLocalPort(history.Progress,
 			selection.Lineage.ProtectedGeneration, selection.Lineage.OperationID)
-		value.PhysicalCurrent = &physical
+		value.PhysicalCurrent = physical.Serving
 	default:
 		return invalid()
 	}

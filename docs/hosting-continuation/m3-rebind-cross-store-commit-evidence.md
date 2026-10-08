@@ -3572,3 +3572,153 @@ Docker/process acceptance. Preserve per-generation resource objects and
 immutable IDs when extending the simulator; do not replace current-source
 authority with a synthetic native predecessor. No publication, GitHub merge,
 deployment, controller restart or database provisioning is part of this unit.
+
+## Concrete second-generation rebind and rollback (2026-10-07)
+
+This local unit starts from `36bf923`. The approved restart dependency
+`14c2913` remains an ancestor through integration commit `b681cf9`.
+The reviewed source/test tree is
+`b486dce278b8605dee034d0faa67e608ac4555eb`.
+The scoped behavioral gates below passed. This section does not establish
+completed M3 or live Docker acceptance.
+
+### Scope and invariants
+
+The composed backend now retains each generation's actual resource objects,
+config bytes, immutable IDs and command effects. The second attempt selects
+the first committed current generation through real SQL and protected history.
+The network observation uses the production selector and canonicalizer against
+all retained Docker networks, so a later generation receives a distinct,
+non-overlapping ingress subnet. Host candidates remain stable throughout.
+
+The two outcomes require either a second committed transfer or rollback to the
+first current gateway. Assertions preserve the first receipt, protected bundle,
+files, SQL history, raw grant/allocation/access/profile authority and transfer.
+They require exactly one stop of the first current gateway and, only on rollback,
+exactly one restart of that same ID. No native predecessor start/stop or first
+generation resource removal is allowed. A fresh Manager with fresh process
+latches must attest the resulting current state without effects or SQL/file
+changes.
+
+Two concrete production issues are corrected:
+
+- A stopped current predecessor needs an exact inventory/config ownership proof
+  while its successor may own the shared loopback listener. A separate,
+  purpose-bound digest represents that proof; it does not claim generic
+  `RecoveryStopped` or global listener absence. Ordinary current attestation
+  retains its original strict absence requirement. Rollback restart separately
+  requires all predecessor/successor listeners absent, then rereads Hosting
+  authority and checks the protected effect guard again.
+- The runtime's history-derived predecessor selection omitted the local store
+  identity and optional legacy receipt used by strict current-selection equality.
+  It now binds the store from the manager data root and validated retained lineage,
+  and copies the already validated legacy receipt when present. The checkpoint's
+  state remains unchanged. The SQL effect boundary still loads and compares fresh
+  current state; the complete selection comparator is unchanged.
+
+### Development findings and verification plan
+
+Early runs exposed fixture errors: Docker copy dispatch split an immutable
+`sha256:` ID at the wrong colon; a second observation reused a stale network
+plan; and a prefix-12 listener helper depended on a handover plan that did not
+yet exist. These were corrected without fabricating progress or deleting the
+first generation's network. The corrected network run reached the second
+handover boundary, where strict selection equality exposed the missing store
+identity. Its failed result is not a stopped-listener reproduction or acceptance.
+
+Development logs are retained under
+`C:/Users/huang/Documents/Projects/Rig/temp/` with prefix
+`m3-second-rebind-20261007-` and suffix `.jsonl`:
+
+| Log | Actual outcome | SHA-256 |
+| --- | --- | --- |
+| `initial` | Failed copy dispatch, 50.414s | `8B3FDE0D5B57D7D72AF96FF3A717F64B069769200BBC4BC85EFC1598F6461D46` |
+| `diagnostic` | Confirmed copy dispatch refusal, 50.923s | `0318DBC23065A5261139B0F0A6B0808666124CB852FE26FECC8108E0E61CC1B7` |
+| `owned-dispatch` | Failed second admission from stale plan, 110.785s | `81DD6001FE42C242411E4F07B3F7733AD8B80BCD4C67896D9AADE381D8F305EA` |
+| `predecessor` | Two top-level tests passed; rollback positive control failed its fixture probe, 125.806s | `3695E60E93B7AC35B312F6ECC888638310783D2520749A331116EEAFCF8F1E17` |
+| `network-plan` | Failed second handover before record 13, 246.760s | `EE97245DF9559C49F068FA3B9F02DCDEBE18D24D2BCA57CCB90153CD58829C98` |
+| `rollback-absence` | Positive/occupied controls passed before the final guard correction, 41.198s | `01150C035F5D37D7C44684C43B020493F15BD08CB21A034B105238D81CB4A6CC` |
+| `composition-reviewed` | Explicitly stopped superseded run after the preceding handover failure, 63.996s | `AC6B3DBDFD6BC0A83B525AC14C745770B26E1901532278BE851DF920A8780723` |
+
+Independent source/security review required a final post-probe effect-guard
+check; the regression changes authority during the actual listener callback
+and requires that callback to be reached. Other focused cases reject changed
+container ID, restart config, effective bindings, between-read ownership and
+running without a serving proof. The occupied-listener case also verifies that
+ordinary current recovery still refuses the same shared listener.
+
+```text
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=20m -json ./internal/generatedingress -run '^TestGatewayRebind(StoppedCurrentPredecessor|CurrentPredecessor|RollbackPredecessor|TypedRollback)'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=20m -json ./internal/generatedingress -run '^TestGatewayRebindConcreteCompositionSecondGeneration$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=15m -json ./internal/generatedingress -run '^TestGatewayRebindConcreteComposition(CommitsAndReplaysSameDockerState|RecoversRetainedRollback)$'
+go test -mod=readonly -buildvcs=false -p=1 -count=1 -timeout=8m -json ./internal/generatedingress -run '^TestGatewayRebindTypedRollback(RequiresFinalPhysicalReadbacks|ReportsRetainedSuccessor)$'
+go vet -mod=readonly ./internal/generatedingress ./cmd/hostd ./internal/appaccess
+go build -mod=readonly -buildvcs=false ./...
+```
+
+The source/security review and final-source vet/build passed. The final-source
+native regression passed two top-level tests and two subtests without failures
+or skips in 428.103s. Its `native-regression` log has SHA-256
+`C0BEBB720826BC0168298BE842E4FA07951B0B42729585B2273F7264F608E749`.
+
+The original `authority-reviewed` process ended without a package result. Its
+retained log proves five completed top-level tests and thirteen subtests passed;
+it does not prove the unfinished readback/retained-successor cases. Log SHA-256:
+`D0929B14EE29E426FE7DD850D1B3AD33AE3A30693FC2137EFDBEBB94A38B4BB8`.
+That run compiled source tree `b4a69cb0e560a27b72590e61ede6b76763899598`,
+before the additional store/legacy-receipt binding in the current-predecessor
+branch. It includes the final rollback guard and its drift regression. The
+subsequent `store-binding` process also ended without a package result and left
+an empty buffered log, so it supplies no behavioral acceptance. Both tool handles
+were missing and an OS process census confirmed neither test process remained
+before rerunning. Replacement `multigeneration-final` and `authority-final`
+runs persist each output line immediately and record their exit codes separately.
+
+`authority-final` passed both remaining top-level tests and both readback-drift
+subtests on the final source, with zero failures or skips, exit 0, in 240.176s.
+Its log SHA-256 is
+`48F541C7DE4A0DFBCF41E011768979C21EA730FC2FEAF8C750EF4889C57924C4`.
+The process was reaped. This completes the selected authority cases across the
+retained completed cases and this rerun; the original interrupted package is
+not reported as a passing whole-suite run.
+
+The final `multigeneration-final` run passed the second-generation commit
+(438.35s) and rollback (568.72s), with their top-level test completing in
+1007.07s and the package in 1009.228s. There were zero failures or skips and
+exit code 0. Exact expected test discovery and the final package event were
+checked; the process was reaped. Log SHA-256:
+`E85E70B6F9F976746CFB7A9426EEC7E47F6356A59628E2643E111633FBFC8825`.
+
+The staged source tree remained unchanged throughout the final-source runs.
+Read-only gofmt, staged/unstaged whitespace checks, vet and the all-Go build
+passed. Independent final integration and security review accepted the source
+and evidence, conditional on the now-completed second-generation package gate.
+
+### Limits and next work
+
+This uses simulated Docker commands/config/probes with real SQLite and local
+protected files. Its aggregate inventory seam covers the unchanged application
+and image in these journeys; it is not a general Docker CLI emulator. No live
+Docker networking, abrupt process-death, Linux race, frontend, or full repository
+test-suite result is established here. Production effect factories stay closed.
+The composed chain starts from a native upgrade and performs two typed rebinds;
+continuation from a legacy-format prior rebind is not a composed journey here.
+
+Next is phase-aware hostd startup outside ordinary effects admission, followed
+by real Docker/process/hosted acceptance. Code rollback preserves SQL and
+immutable history; it must not delete protected bundles or runtime credentials.
+No publication, GitHub merge, deployment, controller restart or database
+provisioning is part of this unit.
+
+The reviewed next-unit design reuses current inspection and existing recovery
+APIs. Add an advisory mode for validated current protected state, then prepare
+the gateway after database open and before acquiring ordinary admission. Active
+typed rebind recovery takes priority. A stable rebound current is restored and
+then attested through terminal recovery; a completed LAN batch is restored while
+its marker stays available for dedicated retirement. Pending route, pending LAN,
+incomplete batch and native states retain their existing dedicated paths. After
+preparation releases its own leases, ordinary admission reacquires its unchanged
+fence and inspects fresh state using the same Manager. Unexpected results or
+refusal prevent workers/HTTP startup. Tests must prove call order, same-Manager
+reuse, drift/refusal behavior, completed-batch preservation and composed recovery.
+This is an implementation plan, not evidence that hostd has this behavior yet.

@@ -69,7 +69,8 @@ func (d *gatewayRebindCompositionDriver) initialize(intent gatewayRebindProtecte
 	d.t.Helper()
 	r := d.runner
 	r.intent = intent
-	network, err := gatewayRebindTypedStageNetworkBindingFor(intent, strings.Repeat("c", 64))
+	r.finalID = gatewayRebindCompositionResourceID(d.t, intent.Identity.FinalContainer)
+	network, err := gatewayRebindTypedStageNetworkBindingFor(intent, gatewayRebindCompositionResourceID(d.t, intent.Identity.IngressNetwork))
 	if err != nil {
 		d.t.Fatal(err)
 	}
@@ -98,6 +99,15 @@ func (d *gatewayRebindCompositionDriver) initialize(intent gatewayRebindProtecte
 	r.stage.ownedContainers, r.stage.ownedVolumes, r.stage.ownedNetworks = nil, nil, nil
 	r.effect = shape
 	d.install(d.manager)
+}
+
+func gatewayRebindCompositionResourceID(t *testing.T, name string) string {
+	t.Helper()
+	id, err := canonicalDigest(struct{ Name string }{name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 func (d *gatewayRebindCompositionDriver) install(m *Manager) {
@@ -388,10 +398,14 @@ func (r *gatewayRebindCompositionRunner) configArchive(source string) []byte {
 }
 
 func (r *gatewayRebindCompositionRunner) hostProbe(ctx context.Context, address string, port uint16, host, path string) gatewayV2HostProbeResult {
+	return gatewayRebindCompositionHostProbe(ctx, r.servers(), address, port, host, path)
+}
+
+func gatewayRebindCompositionHostProbe(ctx context.Context, servers []gatewayRebindCompositionServer, address string, port uint16, host, path string) gatewayV2HostProbeResult {
 	if ctx.Err() != nil {
 		return gatewayV2HostProbeResult{}
 	}
-	for _, serving := range r.servers() {
+	for _, serving := range servers {
 		if !serving.container.Running {
 			continue
 		}
@@ -408,10 +422,14 @@ func (r *gatewayRebindCompositionRunner) hostProbe(ctx context.Context, address 
 }
 
 func (r *gatewayRebindCompositionRunner) containerProbe(ctx context.Context, id, address string, port uint16, host, challenge string) bool {
+	return gatewayRebindCompositionContainerProbe(ctx, r.servers(), id, address, port, host, challenge)
+}
+
+func gatewayRebindCompositionContainerProbe(ctx context.Context, servers []gatewayRebindCompositionServer, id, address string, port uint16, host, challenge string) bool {
 	if ctx.Err() != nil {
 		return false
 	}
-	for _, serving := range r.servers() {
+	for _, serving := range servers {
 		if normalizeID(id) == normalizeID(serving.container.ID) && serving.container.Running && address == serving.address {
 			proof := gatewayRebindCompositionConfigProbe(serving.body, net.JoinHostPort(address, strconv.Itoa(int(port))), host, gatewayV2ChallengePathPrefix+challenge)
 			return proof.Connected && proof.Responded && proof.Status == http.StatusNotFound && proof.Body == gatewayV2ChallengeBodyPrefix+challenge
