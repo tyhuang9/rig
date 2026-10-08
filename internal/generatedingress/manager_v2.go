@@ -319,9 +319,24 @@ func (m *Manager) observeCommittedV2Locked(ctx context.Context, state gatewayV2R
 }
 
 func (m *Manager) applyCommittedV2Routes(ctx context.Context, state gatewayV2RouteState, finalContainerID, filename string) error {
+	return m.applyCommittedV2RoutesGuarded(ctx, state, finalContainerID, filename, nil)
+}
+
+// applyCommittedV2RoutesGuarded revalidates an invocation-local authority
+// immediately before every Docker mutation. The final check also closes the
+// window between the active-config rename and the caller's publication proof.
+func (m *Manager) applyCommittedV2RoutesGuarded(ctx context.Context, state gatewayV2RouteState,
+	finalContainerID, filename string, guard func(context.Context) error,
+) error {
 	if !validGatewayV2RouteState(state) || state.Pending != nil || state.LANRecovery != nil ||
 		!validSHA256(finalContainerID) || !validGatewayV2ConfigFilename(filename) {
 		return &Error{Code: DiagnosticRouteInvalid}
+	}
+	check := func() error {
+		if guard == nil {
+			return nil
+		}
+		return guard(ctx)
 	}
 	probeToken, err := gatewayV2HostChallenge(state)
 	if err != nil {
@@ -334,23 +349,38 @@ func (m *Manager) applyCommittedV2Routes(ctx context.Context, state gatewayV2Rou
 	if err != nil {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
+	if err := check(); err != nil {
+		return err
+	}
 	if err := m.copyGatewayV2Config(ctx, finalContainerID, config, filename); err != nil {
 		return err
 	}
 	containerPath := "/config/" + filename
+	if err := check(); err != nil {
+		return err
+	}
 	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", finalContainerID, "caddy", "validate", "--config", containerPath); err != nil {
 		return &Error{Code: DiagnosticRouteValidateFailed}
+	}
+	if err := check(); err != nil {
+		return err
 	}
 	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", finalContainerID, "caddy", "reload", "--config", containerPath); err != nil {
 		return &Error{Code: DiagnosticRouteReloadFailed}
 	}
+	if err := check(); err != nil {
+		return err
+	}
 	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", "--user", "0:0", finalContainerID, "cp", containerPath, "/config/active.next.json"); err != nil {
 		return &Error{Code: DiagnosticRouteReloadFailed}
+	}
+	if err := check(); err != nil {
+		return err
 	}
 	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "exec", "--user", "0:0", finalContainerID, "mv", "/config/active.next.json", "/config/"+state.Identity.ActiveConfigFilename); err != nil {
 		return &Error{Code: DiagnosticRouteReloadFailed}
 	}
-	return nil
+	return check()
 }
 
 func (m *Manager) copyGatewayV2Config(ctx context.Context, containerID string, contents []byte, filename string) error {

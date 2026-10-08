@@ -694,10 +694,10 @@ func (m *Manager) withGatewayCurrentLANCommitRecoveryLocked(ctx context.Context,
 	}
 	if state.Pending.Kind == gatewayV2PendingLANGrant {
 		if _, err := m.restoreGatewayCurrentPhysicalLocked(ctx, transition); err != nil {
-			return true, gatewayCurrentRouteOperationError(ctx)
+			return true, m.stopGatewayCurrentLANRecoveryLocked(ctx, transition)
 		}
 	} else if _, err := m.applyGatewayCurrentPhysicalLocked(ctx, transition); err != nil {
-		return true, gatewayCurrentRouteOperationError(ctx)
+		return true, m.stopGatewayCurrentLANRecoveryLocked(ctx, transition)
 	}
 	observation, err := gatewayCurrentGrantObservation(state, request,
 		GatewayV2LANGrantWithdrawnPendingReconciliation, true)
@@ -707,19 +707,10 @@ func (m *Manager) withGatewayCurrentLANCommitRecoveryLocked(ctx context.Context,
 	if err := validateCommitted(ctx, observation); err != nil {
 		return true, err
 	}
-	if _, err := m.confirmGatewayCurrentStateLocked(ctx, state); err != nil {
-		return true, err
-	}
 	var effective gatewayCurrentRouteState
 	if state.Pending.Kind == gatewayV2PendingLANGrant {
-		if _, err := m.applyGatewayCurrentPhysicalLocked(ctx, transition); err != nil {
-			return true, gatewayCurrentRouteOperationError(ctx)
-		}
 		effective = transition.Effective
 	} else {
-		if _, err := m.restoreGatewayCurrentPhysicalLocked(ctx, transition); err != nil {
-			return true, gatewayCurrentRouteOperationError(ctx)
-		}
 		effective, err = gatewayCurrentNextState(state, func(next *gatewayCurrentRouteState) {
 			next.Pending = nil
 			next.Apps[request.AppID] = cloneGatewayCurrentOperationApp(*state.Pending.Previous)
@@ -728,11 +719,31 @@ func (m *Manager) withGatewayCurrentLANCommitRecoveryLocked(ctx context.Context,
 			return true, err
 		}
 	}
+	// The observation remains pinned to the withdrawn recovery identity. Repeated
+	// callbacks reread serving authority; they do not assert a new 404 observation.
+	authorize := func(effectCtx context.Context) error {
+		if _, err := m.confirmGatewayCurrentStateLocked(effectCtx, state); err != nil {
+			return err
+		}
+		return validateCommitted(effectCtx, observation)
+	}
+	if _, err := m.publishGatewayCurrentLANRecoveryLocked(ctx, transition, authorize); err != nil {
+		return true, m.withdrawGatewayCurrentLANRecoveryLocked(ctx, transition, effective, request)
+	}
+	if err := authorize(ctx); err != nil {
+		return true, m.withdrawGatewayCurrentLANRecoveryLocked(ctx, transition, effective, request)
+	}
 	if err := m.persistGatewayCurrentExactLocked(ctx, state, effective); err != nil {
-		return true, err
+		return true, m.withdrawGatewayCurrentLANRecoveryLocked(ctx, transition, effective, request)
 	}
 	if _, err := m.attestGatewayCurrentStateLocked(ctx, effective); err != nil {
-		return true, err
+		return true, m.withdrawGatewayCurrentLANRecoveryLocked(ctx, transition, effective, request)
+	}
+	if err := validateCommitted(ctx, observation); err != nil {
+		return true, m.withdrawGatewayCurrentLANRecoveryLocked(ctx, transition, effective, request)
+	}
+	if _, err := m.confirmGatewayCurrentStateLocked(ctx, effective); err != nil {
+		return true, m.withdrawGatewayCurrentLANRecoveryLocked(ctx, transition, effective, request)
 	}
 	return true, nil
 }

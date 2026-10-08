@@ -52,6 +52,12 @@ func newManagedGatewayCurrentPhysicalDriver(m *Manager) gatewayCurrentPhysicalDr
 func (d managedGatewayCurrentPhysicalDriver) applyGatewayCurrentPhysical(ctx context.Context,
 	transition gatewayCurrentPhysicalTransition,
 ) (gatewayCurrentPhysicalAttestation, error) {
+	return d.applyGatewayCurrentPhysicalAuthorized(ctx, transition, nil)
+}
+
+func (d managedGatewayCurrentPhysicalDriver) applyGatewayCurrentPhysicalAuthorized(ctx context.Context,
+	transition gatewayCurrentPhysicalTransition, authorize func(context.Context) error,
+) (gatewayCurrentPhysicalAttestation, error) {
 	if !validGatewayCurrentPhysicalTransition(transition) {
 		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 	}
@@ -65,14 +71,25 @@ func (d managedGatewayCurrentPhysicalDriver) applyGatewayCurrentPhysical(ctx con
 		return gatewayCurrentPhysicalAttestation{}, err
 	}
 	guard := func(effectCtx context.Context) error {
-		_, guardErr := d.selectExact(effectCtx, transition.Pending)
-		return guardErr
+		if _, guardErr := d.selectExact(effectCtx, transition.Pending); guardErr != nil {
+			return guardErr
+		}
+		if authorize != nil {
+			return authorize(effectCtx)
+		}
+		return nil
 	}
-	return d.reconcile(ctx, target, guard, transition.Pending, gatewayCurrentPhysicalRecoveryEffective)
+	return d.reconcile(ctx, target, guard, gatewayCurrentPhysicalRecoveryEffective)
 }
 
 func (d managedGatewayCurrentPhysicalDriver) restoreGatewayCurrentPhysical(ctx context.Context,
 	transition gatewayCurrentPhysicalTransition,
+) (gatewayCurrentPhysicalAttestation, error) {
+	return d.restoreGatewayCurrentPhysicalAuthorized(ctx, transition, nil)
+}
+
+func (d managedGatewayCurrentPhysicalDriver) restoreGatewayCurrentPhysicalAuthorized(ctx context.Context,
+	transition gatewayCurrentPhysicalTransition, authorize func(context.Context) error,
 ) (gatewayCurrentPhysicalAttestation, error) {
 	if !validGatewayCurrentPhysicalTransition(transition) {
 		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
@@ -87,10 +104,15 @@ func (d managedGatewayCurrentPhysicalDriver) restoreGatewayCurrentPhysical(ctx c
 		return gatewayCurrentPhysicalAttestation{}, err
 	}
 	guard := func(effectCtx context.Context) error {
-		_, guardErr := d.selectExact(effectCtx, transition.Pending)
-		return guardErr
+		if _, guardErr := d.selectExact(effectCtx, transition.Pending); guardErr != nil {
+			return guardErr
+		}
+		if authorize != nil {
+			return authorize(effectCtx)
+		}
+		return nil
 	}
-	return d.reconcile(ctx, target, guard, transition.Pending, gatewayCurrentPhysicalRecoveryBefore)
+	return d.reconcile(ctx, target, guard, gatewayCurrentPhysicalRecoveryBefore)
 }
 
 func (d managedGatewayCurrentPhysicalDriver) attestGatewayCurrentPhysical(ctx context.Context,
@@ -207,7 +229,7 @@ func (d managedGatewayCurrentPhysicalDriver) stopGatewayCurrentOwned(ctx context
 }
 
 func (d managedGatewayCurrentPhysicalDriver) reconcile(ctx context.Context, target gatewayCurrentPhysicalTarget,
-	guard func(context.Context) error, selected gatewayCurrentRouteState, expected gatewayCurrentPhysicalOutcome,
+	guard func(context.Context) error, expected gatewayCurrentPhysicalOutcome,
 ) (gatewayCurrentPhysicalAttestation, error) {
 	if d.runtime == nil || guard == nil ||
 		(expected != gatewayCurrentPhysicalRecoveryBefore && expected != gatewayCurrentPhysicalRecoveryEffective) {
@@ -215,7 +237,7 @@ func (d managedGatewayCurrentPhysicalDriver) reconcile(ctx context.Context, targ
 	}
 	proof, err := d.runtime.observe(ctx, target)
 	if err == nil && gatewayCurrentPhysicalAttestationAtTarget(proof, target) && proof.Outcome == expected {
-		if _, confirmErr := d.selectExact(ctx, selected); confirmErr != nil {
+		if confirmErr := guard(ctx); confirmErr != nil {
 			return gatewayCurrentPhysicalAttestation{}, confirmErr
 		}
 		return proof, nil
@@ -229,7 +251,7 @@ func (d managedGatewayCurrentPhysicalDriver) reconcile(ctx context.Context, targ
 		if proofErr != nil || !gatewayCurrentPhysicalAttestationAtTarget(proof, target) || proof.Outcome != expected {
 			return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 		}
-		if _, confirmErr := d.selectExact(proofCtx, selected); confirmErr != nil {
+		if confirmErr := guard(proofCtx); confirmErr != nil {
 			return gatewayCurrentPhysicalAttestation{}, confirmErr
 		}
 		return proof, nil
@@ -240,7 +262,7 @@ func (d managedGatewayCurrentPhysicalDriver) reconcile(ctx context.Context, targ
 	if err != nil || !gatewayCurrentPhysicalAttestationAtTarget(proof, target) || proof.Outcome != expected {
 		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
 	}
-	if _, err := d.selectExact(proofCtx, selected); err != nil {
+	if err := guard(proofCtx); err != nil {
 		return gatewayCurrentPhysicalAttestation{}, err
 	}
 	return proof, nil

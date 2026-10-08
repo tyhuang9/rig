@@ -2,6 +2,7 @@ package generatedingress
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"reflect"
 	"sort"
@@ -116,6 +117,10 @@ type gatewayV2LANGrantDriver interface {
 	proveRolledBack(context.Context, gatewayV2RouteState, gatewayMigrationJournal, gatewayV2LANGrantRequest) bool
 	observePending(context.Context, gatewayV2RouteState, gatewayV2RouteState, gatewayMigrationJournal) gatewayV2PendingLiveTopology
 	stopOwnedGateway(context.Context, gatewayMigrationJournal) error
+}
+
+type gatewayV2LANCommitRecoveryDriver interface {
+	applyCommitRecovery(context.Context, gatewayV2RouteState, string, func(context.Context) error) error
 }
 
 // GrantGatewayV2LAN publishes one exact approved LAN binding. The authorizer
@@ -576,8 +581,10 @@ func (m *Manager) withGatewayV2LANObservation(ctx context.Context, request Gatew
 // WithGatewayV2LANCommitRecovery restores a quarantined binding only after a
 // lock-held callback freshly validates that its exact DB claim is terminally
 // committed and current. The callback receives the protected 404 observation;
-// it is read-only and must not call Manager methods. The binding is then
-// reapplied, proved, and its matching uncertainty marker cleared.
+// it is read-only and must not call Manager methods. Recovery may call it
+// repeatedly with the unchanged initial identity and ObservedAt; later calls
+// reauthorize that identity and do not attest a new physical 404. The binding
+// is then reapplied, proved, and its matching uncertainty marker cleared.
 func (m *Manager) WithGatewayV2LANCommitRecovery(ctx context.Context, request GatewayV2LANGrantRequest,
 	validateCommitted func(context.Context, GatewayV2LANGrantObservation) error,
 ) (resultErr error) {
@@ -590,7 +597,16 @@ func (m *Manager) WithGatewayV2LANCommitRecovery(ctx context.Context, request Ga
 	if err != nil {
 		return err
 	}
-	defer releaseGatewayLock(release, &resultErr)
+	defer func() {
+		if releaseErr := release(); releaseErr != nil {
+			unresolvedReleaseErr := &Error{Code: DiagnosticRouteUnresolved}
+			if resultErr != nil {
+				resultErr = errors.Join(resultErr, unresolvedReleaseErr)
+			} else {
+				resultErr = unresolvedReleaseErr
+			}
+		}
+	}()
 	if ctx.Err() != nil {
 		return &Error{Code: DiagnosticCancelled}
 	}
@@ -623,25 +639,91 @@ func (m *Manager) WithGatewayV2LANCommitRecovery(ctx context.Context, request Ga
 	if err != nil {
 		return err
 	}
-	if err := validateCommitted(recoveryCtx, observation); err != nil {
+	recoveryDriver, ok := driver.(gatewayV2LANCommitRecoveryDriver)
+	if !ok {
+		return gatewayV2LANGrantError(recoveryCtx)
+	}
+	// Each call reauthorizes the identity captured by the initial protected
+	// 404 observation. Later calls do not claim a new physical 404 proof.
+	guard := func(callbackCtx context.Context) error {
+		if callbackCtx == nil || callbackCtx.Err() != nil {
+			return gatewayV2LANGrantError(callbackCtx)
+		}
+		retained, retainedJournal, loadErr := store.loadBoundUpgrade(journal.OperationID)
+		if loadErr != nil || !reflect.DeepEqual(retained, state) || !reflect.DeepEqual(retainedJournal, journal) {
+			return gatewayV2LANGrantError(callbackCtx)
+		}
+		if err := validateCommitted(callbackCtx, observation); err != nil {
+			return err
+		}
+		retained, retainedJournal, loadErr = store.loadBoundUpgrade(journal.OperationID)
+		if loadErr != nil || !reflect.DeepEqual(retained, state) || !reflect.DeepEqual(retainedJournal, journal) {
+			return gatewayV2LANGrantError(callbackCtx)
+		}
+		return nil
+	}
+	fail := func(cause error) error {
+		if !failClosedGatewayV2LANAfterActivationLocked(ctx, m, store, journal, request, driver) {
+			return &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
+		}
+		return cause
+	}
+	if err := guard(recoveryCtx); err != nil {
 		return err
 	}
-	if recoveryCtx.Err() != nil || driver.selectedInterfacePreflight(state.Profile) != nil {
+	if driver.selectedInterfacePreflight(state.Profile) != nil {
 		return gatewayV2LANGrantError(recoveryCtx)
 	}
-	if driver.apply(recoveryCtx, published, "lan-grant-commit-recovery.json") != nil ||
-		!driver.proveGranted(recoveryCtx, published, journal, request) ||
-		!driver.proveAllGranted(recoveryCtx, published, journal) ||
+	if err := recoveryDriver.applyCommitRecovery(
+		recoveryCtx, published, "lan-grant-commit-recovery.json", guard,
+	); err != nil {
+		return fail(err)
+	}
+	if err := guard(recoveryCtx); err != nil {
+		return fail(err)
+	}
+	if !driver.proveGranted(recoveryCtx, published, journal, request) {
+		return fail(gatewayV2LANGrantError(recoveryCtx))
+	}
+	if err := guard(recoveryCtx); err != nil {
+		return fail(err)
+	}
+	if !driver.proveAllGranted(recoveryCtx, published, journal) ||
 		driver.selectedInterfacePreflight(state.Profile) != nil {
-		return gatewayV2LANGrantError(recoveryCtx)
+		return fail(gatewayV2LANGrantError(recoveryCtx))
+	}
+	if err := guard(recoveryCtx); err != nil {
+		return fail(err)
 	}
 	if err := store.saveCommittedV2State(published, journal); err != nil {
-		return gatewayV2LANGrantError(recoveryCtx)
+		return fail(gatewayV2LANGrantError(recoveryCtx))
 	}
-	if !driver.proveGranted(recoveryCtx, published, journal, request) ||
-		!driver.proveAllGranted(recoveryCtx, published, journal) ||
+	if err := validateCommitted(recoveryCtx, observation); err != nil {
+		return fail(err)
+	}
+	cleared, clearedJournal, loadErr := store.loadBoundUpgrade(journal.OperationID)
+	if loadErr != nil || !reflect.DeepEqual(cleared, published) || !reflect.DeepEqual(clearedJournal, journal) {
+		return fail(gatewayV2LANGrantError(recoveryCtx))
+	}
+	if !driver.proveGranted(recoveryCtx, published, journal, request) {
+		return fail(gatewayV2LANGrantError(recoveryCtx))
+	}
+	if err := validateCommitted(recoveryCtx, observation); err != nil {
+		return fail(err)
+	}
+	if !driver.proveAllGranted(recoveryCtx, published, journal) ||
 		driver.selectedInterfacePreflight(state.Profile) != nil {
-		return gatewayV2LANGrantError(recoveryCtx)
+		return fail(gatewayV2LANGrantError(recoveryCtx))
+	}
+	if recoveryCtx.Err() != nil {
+		return fail(gatewayV2LANGrantError(recoveryCtx))
+	}
+	if err := validateCommitted(recoveryCtx, observation); err != nil {
+		return fail(err)
+	}
+	confirmed, confirmedJournal, loadErr := store.loadBoundUpgrade(journal.OperationID)
+	if loadErr != nil || !reflect.DeepEqual(confirmed, published) || !reflect.DeepEqual(confirmedJournal, journal) {
+		return fail(gatewayV2LANGrantError(recoveryCtx))
 	}
 	return nil
 }
@@ -1089,6 +1171,23 @@ func (d managerGatewayV2LANGrantDriver) apply(ctx context.Context, state gateway
 		return gatewayV2LANGrantError(ctx)
 	}
 	return d.manager.applyCommittedV2Routes(ctx, state, journal.Resources.FinalContainerID, filename)
+}
+
+func (d managerGatewayV2LANGrantDriver) applyCommitRecovery(ctx context.Context, state gatewayV2RouteState,
+	filename string, guard func(context.Context) error,
+) error {
+	if d.manager == nil || guard == nil {
+		return gatewayV2LANGrantError(ctx)
+	}
+	_, durableState, journal, committed, err := d.manager.committedV2Locked()
+	if err != nil || !committed || durableState.OperationID != state.OperationID ||
+		journal.OperationID != state.OperationID || journal.Target.IdentityDigest != state.Identity.Digest ||
+		!validSHA256(journal.Resources.FinalContainerID) {
+		return gatewayV2LANGrantError(ctx)
+	}
+	return d.manager.applyCommittedV2RoutesGuarded(
+		ctx, state, journal.Resources.FinalContainerID, filename, guard,
+	)
 }
 
 func (d managerGatewayV2LANGrantDriver) proveGranted(ctx context.Context, state gatewayV2RouteState,

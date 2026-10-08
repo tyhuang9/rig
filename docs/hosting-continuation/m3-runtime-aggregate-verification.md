@@ -1,8 +1,10 @@
 # M3 aggregate verification and CI preparation
 
-Status: partial verification on 2026-10-07. The aggregate runtime is not ready
-for publication or activation: source review identified a LAN commit-recovery
-authority gap that is being repaired separately. M3 remains incomplete.
+Status: partial verification on 2026-10-07. The LAN commit-recovery authority
+finding from this checkpoint is repaired and has scoped passing evidence in
+[the follow-up record](./m3-lan-commit-recovery-authority-evidence.md). The aggregate
+is a draft candidate for separately authorized hosted verification; production
+activation and M3 completion remain pending.
 
 Frozen source reviewed/tested here: `2950279a99331b634340f231cc5b1d45469b3818`.
 Published base: PR #136 at `9694b4ecf0086174a4002098a2aa203c96907d50`.
@@ -88,8 +90,10 @@ Independent reviews of guarded SQL/appaccess and hostd/controller integration
 found no substantiated issue in their scoped source traces. The generated-ingress
 review found a current-gateway recovery path that revalidates serving authority
 only once before republishing. The native counterpart has an analogous pre-existing
-gap. Publication remains held for executable regression, repair and review of
-that boundary. Static reviews are not whole-repository execution evidence.
+gap. Publication was held for executable regression, repair and review of that
+boundary. The follow-up record documents the reproduced failures, repair, scoped
+source/security GO, and passing final outcomes, including a corrected test
+expectation. Static reviews are not whole-repository execution evidence.
 
 CodeRabbit is missing in WSL (`coderabbit: command not found`). Automatic approval
 review rejected downloading/executing its remote installer without explicit
