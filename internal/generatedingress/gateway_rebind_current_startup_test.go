@@ -146,7 +146,7 @@ func TestGatewayRebindCurrentStartupBindsSQLAndPhysicalAuthority(t *testing.T) {
 func TestGatewayRebindCurrentStartupDistinguishesRouteAndLANRecovery(t *testing.T) {
 	for _, name := range []string{"route", "disable", "batch"} {
 		t.Run(name, func(t *testing.T) {
-			f, _, claims, physical := gatewayRebindCurrentStartupFixture(t)
+			f, snapshot, claims, physical := gatewayRebindCurrentStartupFixture(t)
 			state := cloneGatewayCurrentRouteState(f.baseline)
 			var appID string
 			var previous gatewayCurrentAppRoute
@@ -187,6 +187,17 @@ func TestGatewayRebindCurrentStartupDistinguishesRouteAndLANRecovery(t *testing.
 			state.Digest, _ = gatewayCurrentRouteStateDigest(state)
 			if err := f.store.saveNext(f.baseline, state); err != nil {
 				t.Fatal(err)
+			}
+			repository := &gatewayRebindProposalRepositoryFake{snapshot: snapshot}
+			current, err := f.manager.InspectGatewayRebindCurrent(context.Background(), repository)
+			mode := GatewayCurrentRecoveryRoute
+			if name == "disable" {
+				mode = GatewayCurrentRecoveryLAN
+			} else if name == "batch" {
+				mode = GatewayCurrentRecoveryLANBatch
+			}
+			if err != nil || current.CurrentRecoveryMode != mode || current.CurrentStateDigest != state.Digest {
+				t.Fatalf("advisory current recovery=%+v error=%v", current, err)
 			}
 			projection, err := gatewayCurrentPhysicalOutcomeProjectionForSelection(state)
 			if err != nil {

@@ -43,6 +43,19 @@ type GatewayRebindRetainedOperationInspection struct {
 	Resources              GatewayRebindOwnedResourceInspection
 }
 
+// GatewayCurrentRecoveryMode is advisory dispatch information from the
+// validated selected state. It does not authorize an effect or clear a marker.
+type GatewayCurrentRecoveryMode string
+
+const (
+	GatewayCurrentRecoveryNative       GatewayCurrentRecoveryMode = "native"
+	GatewayCurrentRecoveryStable       GatewayCurrentRecoveryMode = "stable"
+	GatewayCurrentRecoveryRoute        GatewayCurrentRecoveryMode = "pending_route"
+	GatewayCurrentRecoveryLAN          GatewayCurrentRecoveryMode = "pending_lan"
+	GatewayCurrentRecoveryLANBatch     GatewayCurrentRecoveryMode = "lan_batch"
+	GatewayCurrentRecoveryLANBatchDone GatewayCurrentRecoveryMode = "completed_lan_batch"
+)
+
 // GatewayRebindCurrentInspection keeps active recovery direction separate
 // from the SQL-selected current lineage. A committed current rebind can be
 // valid while a later prepared operation remains active.
@@ -51,7 +64,9 @@ type GatewayRebindCurrentInspection struct {
 	CurrentStateVersion      uint64
 	CurrentStateRevision     uint64
 	CurrentStateDigest       string
+	CurrentRecoveryMode      GatewayCurrentRecoveryMode
 	ActiveOperationID        string
+	ActiveSpecVersion        int
 	ActivePhase              appaccess.GatewayRebindState
 	FenceReleased            bool
 	Retained                 []GatewayRebindRetainedOperationInspection
@@ -97,6 +112,7 @@ func (m *Manager) inspectGatewayRebindCurrentLocked(ctx context.Context,
 			return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
 		}
 		result.CurrentStateVersion = 2
+		result.CurrentRecoveryMode = GatewayCurrentRecoveryNative
 		result.CurrentStateDigest, err = canonicalDigest(selection.Upgrade.State)
 	case gatewayCurrentSelectionRebind:
 		if selection.State == nil {
@@ -105,6 +121,7 @@ func (m *Manager) inspectGatewayRebindCurrentLocked(ctx context.Context,
 		result.CurrentStateVersion = selection.State.Version
 		result.CurrentStateRevision = selection.State.Revision
 		result.CurrentStateDigest = selection.State.Digest
+		result.CurrentRecoveryMode, err = gatewayCurrentRecoveryMode(*selection.State)
 	default:
 		err = errors.New("generated ingress current selection kind is invalid")
 	}
@@ -117,6 +134,7 @@ func (m *Manager) inspectGatewayRebindCurrentLocked(ctx context.Context,
 			return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
 		}
 		result.ActivePhase = snapshot.Phase
+		result.ActiveSpecVersion = snapshot.Active.Claim.SpecVersion
 	} else if snapshot.Phase != "" || snapshot.DatabaseCommittedEvent != nil ||
 		snapshot.DatabaseCommitObserved || snapshot.RollbackAllowed {
 		return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
@@ -155,6 +173,31 @@ func (m *Manager) inspectGatewayRebindCurrentLocked(ctx context.Context,
 		return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
 	}
 	return result, nil
+}
+
+// The selector validates the complete state before this classifier runs.
+func gatewayCurrentRecoveryMode(state gatewayCurrentRouteState) (GatewayCurrentRecoveryMode, error) {
+	if state.LANRecovery != nil {
+		batch := state.LANRecovery
+		if state.Pending != nil || len(batch.Items) == 0 || batch.Head < 0 || batch.Head > len(batch.Items) {
+			return "", errors.New("invalid current gateway recovery batch")
+		}
+		if batch.Head == len(batch.Items) {
+			return GatewayCurrentRecoveryLANBatchDone, nil
+		}
+		return GatewayCurrentRecoveryLANBatch, nil
+	}
+	if state.Pending == nil {
+		return GatewayCurrentRecoveryStable, nil
+	}
+	switch state.Pending.Kind {
+	case "", gatewayV2PendingRouteSwitch:
+		return GatewayCurrentRecoveryRoute, nil
+	case gatewayV2PendingLANGrant, gatewayV2PendingLANWithdrawal, gatewayV2PendingLANDisable:
+		return GatewayCurrentRecoveryLAN, nil
+	default:
+		return "", errors.New("invalid current gateway pending operation")
+	}
 }
 
 func gatewayRebindRetainedOperationInspectionV2(receipt gatewayRebindTerminalReceiptV2) (

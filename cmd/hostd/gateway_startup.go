@@ -59,6 +59,13 @@ func inspectGatewayStartup(ctx context.Context, cfg config.Config, db *sql.DB,
 func inspectGatewayStartupWithFence(ctx context.Context, cfg config.Config, db *sql.DB,
 	dockerExecutable string, directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
 ) (gatewayStartup, error) {
+	return inspectGatewayStartupUsingIngress(ctx, cfg, db, dockerExecutable, directories, fenceCheck, nil)
+}
+
+func inspectGatewayStartupUsingIngress(ctx context.Context, cfg config.Config, db *sql.DB,
+	dockerExecutable string, directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
+	ingress *generatedingress.Manager,
+) (gatewayStartup, error) {
 	if fenceCheck == nil {
 		return gatewayStartup{}, errors.New("gateway rebind fence check is required")
 	}
@@ -80,9 +87,11 @@ func inspectGatewayStartupWithFence(ctx context.Context, cfg config.Config, db *
 		}
 		return gatewayStartup{snapshot: snapshot}, nil
 	}
-	ingress, err := newGatewayStartupIngress(cfg, dockerExecutable, directories, fenceCheck, repository)
-	if err != nil {
-		return gatewayStartup{}, err
+	if ingress == nil {
+		ingress, err = newGatewayStartupIngress(cfg, dockerExecutable, directories, fenceCheck, repository)
+		if err != nil {
+			return gatewayStartup{}, err
+		}
 	}
 	inspection, err := ingress.InspectGatewayV2Startup(ctx, gatewayStartupClaims(snapshot.Upgrades))
 	if err != nil {

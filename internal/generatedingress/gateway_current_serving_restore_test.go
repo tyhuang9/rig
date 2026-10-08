@@ -292,6 +292,10 @@ func TestGatewayCurrentServingRuntimeCensusRejectsIncompleteOrCrossedComponents(
 
 func TestGatewayCurrentServingRestoreKeepsCompletedBatchAndTerminalSQL(t *testing.T) {
 	f := gatewayCurrentLANRecoveryCompletedSQLFixture(t)
+	prepared, err := f.manager.InspectGatewayRebindCurrent(context.Background(), f.repository)
+	if err != nil || prepared.CurrentRecoveryMode != GatewayCurrentRecoveryLANBatchDone {
+		t.Fatalf("completed batch startup classification: %+v error=%v", prepared, err)
+	}
 	snapshot, err := f.repository.HostingGatewayStartupSnapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -312,6 +316,10 @@ func TestGatewayCurrentServingRestoreKeepsCompletedBatchAndTerminalSQL(t *testin
 	if err != nil || readErr != nil || !reflect.DeepEqual(installed, *selection.State) || !reflect.DeepEqual(snapshot, after) ||
 		len(driver.ownedStops) != 0 {
 		t.Fatal("restart retired the completed queue or changed terminal SQL authority")
+	}
+	confirmed, err := f.manager.InspectGatewayRebindCurrent(context.Background(), f.repository)
+	if err != nil || !reflect.DeepEqual(prepared, confirmed) {
+		t.Fatalf("completed batch startup checkpoint changed during restore: %v", err)
 	}
 	// Structural validity alone does not allow an acknowledged batch to
 	// restart if its terminal census subsequently loses the clear proof.

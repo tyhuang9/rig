@@ -538,6 +538,10 @@ func TestGatewayRebindConcreteCompositionCommitsAndReplaysSameDockerState(t *tes
 		r.stopFinal() // Simulate a host restart without replacing any resources.
 		fresh := freshGatewayRebindRecoveryManager(f.manager)
 		driver.install(fresh)
+		prepared, err := fresh.InspectGatewayRebindCurrent(ctx, f.repository)
+		if err != nil || prepared.CurrentRecoveryMode != GatewayCurrentRecoveryStable || !prepared.FenceReleased {
+			t.Fatalf("stopped terminal startup classification: %+v error=%v", prepared, err)
+		}
 		handled, err := fresh.RestoreGatewayCurrentServingStartup(ctx, f.repository)
 		if err != nil || !handled || !r.final.Running || r.predecessor.FinalContainer.Running || len(r.effects) != effects+1 ||
 			!reflect.DeepEqual(r.effects[effects], []string{"container", "start", r.finalID}) {
@@ -547,6 +551,10 @@ func TestGatewayRebindConcreteCompositionCommitsAndReplaysSameDockerState(t *tes
 		recovered, err := fresh.RecoverGatewayRebindStartup(ctx, f.repository)
 		if err != nil || !recovered.FenceReleased || !validSHA256(recovered.CurrentAttestationDigest) || len(r.effects) != effects {
 			t.Fatalf("restored terminal attestation: %v", err)
+		}
+		confirmed, err := fresh.InspectGatewayRebindCurrent(ctx, f.repository)
+		if err != nil || !reflect.DeepEqual(prepared, confirmed) {
+			t.Fatalf("stopped terminal startup checkpoint changed: %v", err)
 		}
 		f.manager = fresh
 	})
