@@ -48,8 +48,12 @@ func TestGatewayRebindProposalAndAdmissionUseRealRepository(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(inspection, repeated) {
 		t.Fatal("real repository changed the read-only proposal")
 	}
+	runtimeHeadsDigest, err := appaccess.GatewayRebindRuntimeHeadsV2Digest(inspection.Spec.OperationID, inspection.RuntimeHeads)
+	if err != nil || len(inspection.RuntimeHeads) == 0 || inspection.Spec.RuntimeHeadsCount != int64(len(inspection.RuntimeHeads)) || inspection.Spec.RuntimeHeadsDigest != runtimeHeadsDigest {
+		t.Fatal("proposal must carry the exact inspected runtime-head census")
+	}
 	proposal := appaccess.GatewayRebindPreclaimProposalV2{
-		Spec: inspection.Spec, Roster: inspection.Roster,
+		Spec: inspection.Spec, Roster: inspection.Roster, RuntimeHeads: inspection.RuntimeHeads,
 		RebindApproval: appaccess.Approval{Action: appaccess.ActionRebindGateway,
 			SpecDigest: inspection.SpecDigest, ActorID: gatewayRebindTestAdministrator},
 		ConfigureApproval: appaccess.Approval{Action: appaccess.ActionConfigureGateway,
