@@ -26,6 +26,8 @@ jobs:
         test:
           - TestLiveGatewayRebindCrossStoreProposalRetainsCurrentAuthority
           - TestLiveGatewayRebindCrossStorePreparedClaimProcessRecovery
+          - TestLiveGatewayRebindRuntimeCommitAndReplay
+          - TestLiveGatewayRebindRuntimeRollbackAndReplay
     steps:
       - name: Check out source
         timeout-minutes: 2
@@ -47,12 +49,13 @@ jobs:
           ip -Version
           sudo -n true
 
-      - name: Verify real SQL and protected gateway authority
+      - name: Verify real gateway runtime and stored authority
         timeout-minutes: 36
         shell: bash
         env:
           RIG_RUN_LIVE_GATEWAY_V2: "1"
           RIG_RUN_LIVE_GATEWAY_REBIND_CROSS_STORE: "1"
+          RIG_RUN_LIVE_GATEWAY_REBIND_RUNTIME: "1"
           TEST_NAME: ${{ matrix.test }}
         run: |
           set -euo pipefail
