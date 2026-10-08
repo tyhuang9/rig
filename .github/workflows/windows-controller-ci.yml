@@ -16,8 +16,8 @@ env:
   GOTOOLCHAIN: local
 
 jobs:
-  windows-controller:
-    name: Windows controller verification
+  windows-controller-core:
+    name: Windows controller core checks
     runs-on: windows-2025
     timeout-minutes: 40
     defaults:
@@ -53,8 +53,16 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm --dir web install --frozen-lockfile
 
-      - name: Run full Go tests
-        run: go test -count=1 -timeout=20m ./...
+      - name: Run repository tests outside the Windows ingress partitions
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $allPackages = @(& go list ./...)
+          if ($LASTEXITCODE -ne 0) { throw 'Go package discovery failed.' }
+          $ingress = @($allPackages | Where-Object { $_ -eq 'github.com/hostd/hostd/internal/generatedingress' })
+          $packages = @($allPackages | Where-Object { $_ -ne 'github.com/hostd/hostd/internal/generatedingress' })
+          if ($ingress.Count -ne 1 -or $packages.Count -eq 0) { throw 'Incomplete Go package inventory.' }
+          & go test -count=1 -timeout=20m @packages
+          if ($LASTEXITCODE -ne 0) { throw 'Repository Go tests failed.' }
 
       - name: Run Go vet
         run: go vet ./...
@@ -76,3 +84,75 @@ jobs:
 
       - name: Check embedded dashboard assets
         run: pwsh -NoProfile -File scripts/check-embedded.ps1
+
+  windows-ingress:
+    name: Windows ingress tests (${{ matrix.suite }})
+    runs-on: windows-2025
+    timeout-minutes: 42
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - gateway-v2
+          - rebind-history
+          - rebind-config
+          - rebind-resources
+          - rebind-typed-withdrawal
+          - rebind-typed-completed
+          - rebind-typed-runtime
+          - rebind-composition-native
+          - rebind-composition-second-generation
+          - rebind-composition-legacy-source
+          - current-lan
+          - current-serving
+          - ingress-remainder
+    steps:
+      - name: Preserve repository line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - name: Check out source
+        timeout-minutes: 2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        timeout-minutes: 3
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Verify Windows shared-runner prerequisites
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash --version
+          jq --version
+          test "$(go env GOOS)" = windows
+
+      - name: Run complete Windows ingress partition
+        timeout-minutes: 34
+        shell: bash
+        env:
+          TEST_SUITE: ${{ matrix.suite }}
+        run: bash scripts/check-generated-runtime-race.sh "$TEST_SUITE" plain
+
+  windows-controller:
+    name: Windows controller verification
+    if: ${{ always() }}
+    needs: [windows-controller-core, windows-ingress]
+    runs-on: windows-2025
+    timeout-minutes: 2
+    steps:
+      - name: Require core checks and every Windows ingress partition
+        shell: pwsh
+        env:
+          CORE_RESULT: ${{ needs.windows-controller-core.result }}
+          INGRESS_RESULT: ${{ needs.windows-ingress.result }}
+        run: |
+          if ($env:CORE_RESULT -ne 'success' -or $env:INGRESS_RESULT -ne 'success') {
+            throw 'Windows controller verification did not pass every required group.'
+          }

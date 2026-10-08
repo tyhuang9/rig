@@ -2,7 +2,19 @@
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-suite="${1:?provide the required race suite}"
+suite="${1:?provide the required test suite}"
+mode="${2:-race}"
+if [[ "$#" -gt 2 ]]; then
+  printf 'Expected a suite and optional race/plain mode.\n' >&2
+  exit 1
+fi
+# Linux gates retain race detection by default. Windows uses these exact
+# complementary selections in plain mode, retaining all other test flags.
+case "$mode" in
+  race) race_flags=(-race) ;;
+  plain) race_flags=() ;;
+  *) printf 'Unknown test mode: %s\n' "$mode" >&2; exit 1 ;;
+esac
 filter=()
 # These complementary filters retain every ingress test and its full subtest
 # tree. Both workflows use this command so their partitions cannot drift.
@@ -90,7 +102,7 @@ case "$suite" in
 esac
 output="$(mktemp)"
 trap 'rm -f "$output"' EXIT
-go test -json -race -count=1 -timeout=32m "${filter[@]}" "${packages[@]}" | tee "$output"
+go test -json "${race_flags[@]}" -count=1 -timeout=32m "${filter[@]}" "${packages[@]}" | tee "$output"
 # An empty selection must not satisfy a required race check. pipefail above
 # preserves every test, race, compilation and output-capture failure.
 jq -se 'any(.[]; .Action == "pass" and ((.Test // "") | test("^Test[^/]+$")))' "$output" > /dev/null
