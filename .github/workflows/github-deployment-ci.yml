@@ -159,7 +159,7 @@ jobs:
               packages+=("$package")
             fi
           done
-          # Ingress runs in the five complementary jobs below. Every other
+          # Ingress runs in the complementary jobs below. Every other
           # discovered package retains its complete race-tested test tree.
           [[ "$ingress_count" -eq 1 && "${#packages[@]}" -gt 0 ]]
           go test -race -count=1 -timeout=40m "${packages[@]}"
@@ -171,7 +171,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [gateway-v2, rebind-history, rebind-config, rebind-resources, ingress-remainder]
+        suite:
+          - gateway-v2
+          - rebind-history
+          - rebind-config
+          - rebind-resources
+          - rebind-typed-withdrawal
+          - rebind-typed-completed
+          - rebind-typed-runtime
+          - rebind-composition-native
+          - rebind-composition-second-generation
+          - rebind-composition-legacy-source
+          - current-lan
+          - current-serving
+          - ingress-remainder
     steps:
       - name: Check out source
         timeout-minutes: 2

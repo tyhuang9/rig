@@ -224,7 +224,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [runtime-packages, gateway-v2, rebind-history, rebind-config, rebind-resources, ingress-remainder]
+        suite:
+          - runtime-packages
+          - gateway-v2
+          - rebind-history
+          - rebind-config
+          - rebind-resources
+          - rebind-typed-withdrawal
+          - rebind-typed-completed
+          - rebind-typed-runtime
+          - rebind-composition-native
+          - rebind-composition-second-generation
+          - rebind-composition-legacy-source
+          - current-lan
+          - current-serving
+          - ingress-remainder
     steps:
       - name: Check out source
         timeout-minutes: 2
