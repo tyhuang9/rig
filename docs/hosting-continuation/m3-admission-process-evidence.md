@@ -238,3 +238,87 @@ Rollback removes these test/evidence additions while retaining all actual SQL
 and protected history. Publication and any local integration into the runtime
 branch still require separate authorization; the runtime draft request covers
 only `9470a79` and excludes this unit.
+
+## Protected-preparation process crash extension
+
+Status: local Windows and actual WSL Linux verification passed on 2026-10-08.
+Base: `2cb38b525ae720faf9acb1d54756545fa9e6572f`. Only the process-test source
+and this additive evidence changed. The source SHA-256 before and after both
+runs was `AD95992DB69CEEF0009BC4F1ADA5783AEF5B6227670ED18F8BDE786C9CF92172`.
+
+`TestGatewayRebindAdmissionProcessRecoversProtectedPreparation` adds two bounded
+subtests on the real prepared-admission path:
+
+- `checkpoint` pauses inside the existing successor-network observer. Production
+  ordering reaches that observer only after the prepared SQL claim and exact
+  predecessor checkpoint are durable, and before the typed intent write. The
+  parent verifies the one-checkpoint protected prefix, then requires an owned
+  OS kill and complete process reaping.
+- `progress1` lets `prepareGatewayRebindLocked` install the checkpoint, typed
+  successor intent, and progress sequence 1 through the actual protected stores.
+  The child signals only after the method returns while it still owns the
+  deployment-effects and gateway locks. The parent verifies that exact prefix,
+  then performs the same strict kill.
+
+Each subtest starts two independent recovery children. Those children reopen
+SQLite and the protected root, reacquire both locks, and call the real prepared
+admission recovery path. The first recovery must preserve every file present at
+the crash boundary while completing any missing prefix. The second must preserve
+all SQL and protected bytes exactly. Both retain the prepared SQL fence, claim,
+generation, and predecessor, and child command counters must remain zero. The
+manifests contain only approved input, paths, and pinned simulated predecessor
+observations; they do not serialize or manufacture durable successor history.
+
+Executed verification used Go 1.26.0 and the existing local cache, with
+`GOFLAGS=-mod=readonly -buildvcs=false -p=1` and `GOTOOLCHAIN=local`.
+Inherited live-test opt-ins were removed. One test slot was released after eight
+runtime groups finished; the new tests then ran sequentially, keeping at most
+two concurrent test processes across both worktrees.
+
+```text
+go test -json -count=1 -timeout=5m -run '^(TestGatewayRebindAdmissionProcessRejectsBoundaryWork|TestGatewayRebindAdmissionProcessSerializesContenders|TestGatewayRebindAdmissionProcessRecoversCommittedClaim|TestGatewayRebindAdmissionProcessRecoversProtectedPreparation)$' ./internal/generatedingress
+go vet -mod=readonly -buildvcs=false -p=1 ./internal/generatedingress
+gofmt -l internal/generatedingress/gateway_rebind_admission_process_test.go
+git diff --check
+```
+
+All four non-helper admission-process parents passed on Windows (**8.668s**) and
+Linux (**3.541s**), with both new `checkpoint` and `progress1` subcases passing
+and no skips or failures. Compiled discovery matched the exact four terminal
+parent results. Child OS kills, reaping and protected-prefix assertions were
+executed, not inferred from source review.
+
+Linux used `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c`, then actually
+executed the test binary with `wsl.exe --exec` through `go tool test2json`, the
+same exact selection, `-test.count=1` and `-test.timeout=5m`. The full compile and
+execution argument arrays are retained in the artifacts below. Cross-compilation
+alone is not counted as Linux acceptance; this was plain execution, not race
+instrumentation.
+
+Scoped vet, empty read-only gofmt output and whitespace checks passed, exit 0.
+No full repository build was repeated for these test-only additions. Production
+and hostd source remain unchanged and their earlier build evidence remains
+separate. The shared recovery helper now releases both locks on snapshot-read
+failure; the four-parent reruns cover its existing and new successful paths.
+
+Artifacts under `C:/Users/huang/Documents/Projects/Rig/temp/` include `.command.json`,
+`.inventory.json`, `.jsonl`, `.exit`, `.summary.json` and `.verification.json`:
+
+| Run prefix | JSON SHA-256 |
+| --- | --- |
+| `m3-protected-preparation-windows-20261008` | `C9D28C0606F2B4FED1746CB3F53427F5A38956C84895A8D2D01739975674B62E` |
+| `m3-protected-preparation-linux-20261008` | `FAE849BB952B56298C000CC51FEC55F082AADAA419711E4E3313725C2CDC6449` |
+
+The Linux prefix also has `.compile.json`; static results are in
+`m3-protected-preparation-static-20261008.json`. Independent QA reviewed the
+exact source hash and returned bounded GO for the actual pause boundaries,
+retained locks, strict kill/reap, separate recovery/replay, immutable prefix and
+zero-command assertions. Root also reviewed the complete two-file diff.
+
+This extension does not claim an intent-only crash boundary because production
+has no post-intent/pre-progress test hook. It also does not cover progress stages
+2 through 12 and their effects; typed handover stages 13 through 16; completion
+17, receipt, successor-ready SQL, current-baseline installation, database commit,
+terminal SQL, compensation, recovery effects, or release. Those remain separate
+crash-matrix work. It does not expand the earlier unit into live Docker, a full
+hostd restart, power-loss durability, race coverage, or every protected write.

@@ -366,6 +366,135 @@ func TestGatewayRebindAdmissionProcessRecoversCommittedClaim(t *testing.T) {
 	}
 }
 
+func TestGatewayRebindAdmissionProcessRecoversProtectedPreparation(t *testing.T) {
+	tests := []struct {
+		name         string
+		mode         string
+		marker       string
+		wantIntents  int
+		wantProgress int
+	}{
+		{name: "checkpoint", mode: "crash-after-checkpoint", marker: "CHECKPOINT_INSTALLED"},
+		{name: "progress1", mode: "crash-after-progress1", marker: "PROGRESS_1_INSTALLED", wantIntents: 1, wantProgress: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newGatewayRebindPredecessorFixtureWithClaim(t, false)
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+			f.manager.options.RebindFenceCheck = f.repository.CheckGatewayRebindFence
+			inspection := gatewayRebindAdmissionProcessInspection(t, f)
+			completeCrossStoreRepositoryFixture(t, f, inspection.Roster[0])
+			beforeSQL, err := f.repository.GatewayRebindRecoverySnapshot(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeFiles, err := readGatewayHistorySnapshotMode(f.manager.store, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeCommands := len(f.runner.commands)
+			manifest := gatewayRebindAdmissionProcessManifest{
+				DataRoot: f.manager.options.DataRoot, WorkingDirectory: f.manager.options.WorkingDirectory,
+				DockerExecutable: f.manager.options.DockerExecutable, DockerConfigDirectory: f.manager.options.DockerConfigDirectory,
+				HostPort: f.manager.options.HostPort, Input: gatewayRebindAdmissionProcessInput(inspection),
+				PredecessorSubnet: f.state.Network.Subnet, PinnedTopology: gatewayTopologyExactFinalV2,
+			}
+			manifestPath := gatewayRebindAdmissionWriteManifest(t, f.manager.options.DataRoot,
+				"protected-preparation-"+test.name+".json", manifest)
+			crashed := gatewayRebindAdmissionStartProcess(t, test.mode, "", manifestPath)
+			gatewayRebindAdmissionReadMarker(t, ctx, crashed, test.marker)
+
+			prepared, err := f.repository.GatewayRebindRecoverySnapshot(ctx)
+			if err != nil || prepared.Active == nil || prepared.Active.Claim.V2 == nil ||
+				prepared.Active.Claim.V2.Spec.OperationID != inspection.Spec.OperationID ||
+				prepared.Active.Claim.V2.Spec.SuccessorProtectedGeneration != inspection.ProtectedGeneration ||
+				!reflect.DeepEqual(prepared.Active.Claim.V2.Spec, inspection.Spec) ||
+				prepared.Phase != appaccess.GatewayRebindPrepared || !prepared.RollbackAllowed || prepared.DatabaseCommitObserved ||
+				!reflect.DeepEqual(prepared.CurrentSource, beforeSQL.CurrentSource) ||
+				!errors.Is(f.repository.CheckGatewayRebindFence(ctx), appaccess.ErrGatewayRebindActive) {
+				t.Fatalf("%s marker did not retain the exact prepared SQL claim: %v", test.name, err)
+			}
+			gatewayRebindAdmissionAssertPreparationHistory(t, f.manager, inspection,
+				*prepared.Active.Claim.V2, test.wantIntents, test.wantProgress)
+			pausedFiles, err := readGatewayHistorySnapshotMode(f.manager.store, true)
+			wantAdded := 1 + test.wantIntents + test.wantProgress
+			if err != nil || len(pausedFiles.files) != len(beforeFiles.files)+wantAdded ||
+				!gatewayRebindAdmissionHistoryRetained(beforeFiles, pausedFiles) || len(f.runner.commands) != beforeCommands {
+				t.Fatalf("%s marker did not expose the exact protected prefix: files=%d want=%d error=%v",
+					test.name, len(pausedFiles.files), len(beforeFiles.files)+wantAdded, err)
+			}
+
+			gatewayRebindAdmissionKillAndReap(t, crashed)
+			gatewayRebindAdmissionRunRecovery(t, ctx, manifestPath)
+			gatewayRebindAdmissionAssertPreparationHistory(t, f.manager, inspection,
+				*prepared.Active.Claim.V2, 1, 1)
+			recoveredFiles, err := readGatewayHistorySnapshotMode(f.manager.store, true)
+			if err != nil || !gatewayRebindAdmissionHistoryRetained(pausedFiles, recoveredFiles) ||
+				(test.wantProgress == 1 && !sameGatewayHistorySnapshot(pausedFiles, recoveredFiles)) {
+				t.Fatalf("%s recovery replaced the installed protected prefix: %v", test.name, err)
+			}
+			recoveredSQL, err := f.repository.GatewayRebindRecoverySnapshot(ctx)
+			if err != nil || !reflect.DeepEqual(prepared, recoveredSQL) ||
+				!errors.Is(f.repository.CheckGatewayRebindFence(ctx), appaccess.ErrGatewayRebindActive) {
+				t.Fatalf("%s recovery changed SQL authority or released the fence: %v", test.name, err)
+			}
+
+			gatewayRebindAdmissionRunRecovery(t, ctx, manifestPath)
+			replayedFiles, err := readGatewayHistorySnapshotMode(f.manager.store, true)
+			replayedSQL, sqlErr := f.repository.GatewayRebindRecoverySnapshot(ctx)
+			if err != nil || sqlErr != nil || !sameGatewayHistorySnapshot(recoveredFiles, replayedFiles) ||
+				!reflect.DeepEqual(prepared, replayedSQL) ||
+				!errors.Is(f.repository.CheckGatewayRebindFence(ctx), appaccess.ErrGatewayRebindActive) ||
+				len(f.runner.commands) != beforeCommands {
+				t.Fatalf("%s replay changed SQL/protected bytes, released the fence, or caused an external effect", test.name)
+			}
+		})
+	}
+}
+
+func gatewayRebindAdmissionAssertPreparationHistory(t *testing.T, manager *Manager,
+	inspection GatewayRebindProposalInspection, claim appaccess.GatewayRebindClaimV2, wantIntents, wantProgress int,
+) {
+	t.Helper()
+	history, err := manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.Checkpoints) != 1 || len(history.Intents) != 0 ||
+		len(history.IntentsV2) != wantIntents || len(history.Progress) != wantProgress || len(history.Terminals) != 0 {
+		t.Fatalf("protected preparation prefix counts: checkpoints=%d intents=%d progress=%d terminals=%d error=%v",
+			len(history.Checkpoints), len(history.IntentsV2), len(history.Progress), len(history.Terminals), err)
+	}
+	checkpoint := history.Checkpoints[0].Checkpoint
+	if checkpoint.Generation != inspection.ProtectedGeneration || checkpoint.OperationID != inspection.Spec.OperationID ||
+		checkpoint.Digest != inspection.PredecessorCheckpointDigest || checkpoint.sourceRef() != inspection.Spec.Predecessor {
+		t.Fatal("protected preparation checkpoint lost the admitted generation or predecessor")
+	}
+	if wantIntents == 1 {
+		intent := history.IntentsV2[0].Intent
+		if intent.Generation != inspection.ProtectedGeneration || intent.OperationID != inspection.Spec.OperationID ||
+			!reflect.DeepEqual(intent.Claim, claim) || intent.Predecessor != inspection.Spec.Predecessor {
+			t.Fatal("protected preparation intent lost the admitted claim, generation, or predecessor")
+		}
+	}
+	if wantProgress == 1 {
+		progress := history.Progress[0].Record
+		if progress.Generation != inspection.ProtectedGeneration || progress.OperationID != inspection.Spec.OperationID ||
+			progress.Sequence != 1 || progress.Phase != gatewayRebindProgressSuccessorIntent ||
+			progress.ProtectedIntentDigest != history.IntentsV2[0].Intent.Digest {
+			t.Fatal("protected preparation progress does not bind the exact successor intent")
+		}
+	}
+}
+
+func gatewayRebindAdmissionHistoryRetained(before, after gatewayHistorySnapshot) bool {
+	retained := gatewayHistorySnapshot{files: make(map[string]gatewayHistoryFileFingerprint)}
+	for name := range before.files {
+		if fingerprint, ok := after.files[name]; ok {
+			retained.files[name] = fingerprint
+		}
+	}
+	return sameGatewayHistorySnapshot(before, retained)
+}
+
 func TestGatewayRebindAdmissionProcessHelper(t *testing.T) {
 	mode := os.Getenv(gatewayRebindAdmissionProcessModeEnvironment)
 	if mode == "" {
@@ -379,6 +508,9 @@ func TestGatewayRebindAdmissionProcessHelper(t *testing.T) {
 		err = gatewayRebindAdmissionProcessMutation(os.Getenv(gatewayRebindAdmissionProcessManifestEnvironment), mode)
 	case "crash-after-claim":
 		err = gatewayRebindAdmissionProcessCrashAfterClaim(os.Getenv(gatewayRebindAdmissionProcessManifestEnvironment))
+	case "crash-after-checkpoint", "crash-after-progress1":
+		err = gatewayRebindAdmissionProcessCrashProtectedPreparation(
+			os.Getenv(gatewayRebindAdmissionProcessManifestEnvironment), mode)
 	case "recover":
 		err = gatewayRebindAdmissionProcessRecover(os.Getenv(gatewayRebindAdmissionProcessManifestEnvironment))
 	default:
@@ -565,6 +697,120 @@ func gatewayRebindAdmissionProcessCrashAfterClaim(path string) error {
 	return fmt.Errorf("crash boundary returned: %w", errors.Join(err, releaseErr))
 }
 
+func gatewayRebindAdmissionProcessCrashProtectedPreparation(path, mode string) error {
+	manifest, err := gatewayRebindAdmissionReadManifest(path)
+	if err != nil || manifest.Input.Inspection.Spec.OperationID == "" ||
+		(mode != "crash-after-checkpoint" && mode != "crash-after-progress1") {
+		return errors.New("protected preparation crash manifest is invalid")
+	}
+	db, err := database.Open(manifest.DataRoot)
+	if err != nil {
+		return err
+	}
+	repository := appaccess.New(db)
+	runner := &gatewayRebindAdmissionNoEffectRunner{}
+	manager, err := New(runner, gatewayRebindAdmissionOptions(manifest, repository))
+	if err != nil {
+		return errors.Join(err, db.Close())
+	}
+	manager.gatewayTopologyObserver = func(context.Context, routeState, gatewayV2RouteState,
+		gatewayMigrationJournal,
+	) gatewayObservedTopology {
+		return manifest.PinnedTopology
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	releaseEffects, err := gatewayRebindAcquireDeploymentEffects(ctx, manifest.WorkingDirectory)
+	if err != nil {
+		return errors.Join(err, db.Close())
+	}
+	releaseGateway, err := manager.lockGatewayRaw(ctx)
+	if err != nil {
+		return errors.Join(err, releaseEffects(), db.Close())
+	}
+
+	if mode == "crash-after-checkpoint" {
+		manager.gatewayRebindV2NetworkObserver = func(hookContext context.Context,
+			claim appaccess.GatewayRebindClaimV2,
+		) (gatewayRebindSuccessorNetworkObservation, error) {
+			if boundaryErr := gatewayRebindAdmissionValidateChildPreparation(hookContext, manager, repository,
+				runner, manifest.Input.Inspection, claim, 0, 0); boundaryErr != nil {
+				return gatewayRebindSuccessorNetworkObservation{}, boundaryErr
+			}
+			if markerErr := gatewayRebindAdmissionPrintMarker("CHECKPOINT_INSTALLED"); markerErr != nil {
+				return gatewayRebindSuccessorNetworkObservation{}, markerErr
+			}
+			return gatewayRebindSuccessorNetworkObservation{}, gatewayRebindAdmissionWaitForParentKill()
+		}
+	} else {
+		installCrossStoreFixtureNetworkObserver(manager, manifest.PredecessorSubnet)
+	}
+	attempt, prepareErr := manager.prepareGatewayRebindLocked(ctx, repository, manifest.Input)
+	if mode == "crash-after-progress1" && prepareErr == nil {
+		if attemptErr := gatewayRebindAdmissionValidateChildPreparation(ctx, manager, repository, runner,
+			manifest.Input.Inspection, attempt.Claim, 1, 1); attemptErr != nil {
+			prepareErr = attemptErr
+		} else if attempt.Checkpoint.Digest != manifest.Input.Inspection.PredecessorCheckpointDigest ||
+			attempt.Intent.Predecessor != attempt.Claim.Spec.Predecessor || attempt.Progress.Sequence != 1 ||
+			attempt.Progress.Phase != gatewayRebindProgressSuccessorIntent {
+			prepareErr = errors.New("actual prepared prefix one does not match its admitted claim")
+		} else if markerErr := gatewayRebindAdmissionPrintMarker("PROGRESS_1_INSTALLED"); markerErr != nil {
+			prepareErr = markerErr
+		} else {
+			prepareErr = gatewayRebindAdmissionWaitForParentKill()
+		}
+	}
+	releaseErr := errors.Join(releaseGateway(), releaseEffects(), db.Close())
+	return fmt.Errorf("protected preparation crash boundary returned: %w", errors.Join(prepareErr, releaseErr))
+}
+
+func gatewayRebindAdmissionValidateChildPreparation(ctx context.Context, manager *Manager,
+	repository *appaccess.Repository, runner *gatewayRebindAdmissionNoEffectRunner,
+	inspection GatewayRebindProposalInspection, claim appaccess.GatewayRebindClaimV2, wantIntents, wantProgress int,
+) error {
+	snapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || runner.calls.Load() != 0 || snapshot.Active == nil || snapshot.Active.Claim.V2 == nil ||
+		!reflect.DeepEqual(*snapshot.Active.Claim.V2, claim) || snapshot.Phase != appaccess.GatewayRebindPrepared ||
+		!snapshot.RollbackAllowed || snapshot.DatabaseCommitObserved ||
+		!errors.Is(repository.CheckGatewayRebindFence(ctx), appaccess.ErrGatewayRebindActive) {
+		return errors.New("protected preparation SQL claim or fence is not durable")
+	}
+	history, err := manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.Checkpoints) != 1 || len(history.Intents) != 0 ||
+		len(history.IntentsV2) != wantIntents || len(history.Progress) != wantProgress || len(history.Terminals) != 0 {
+		return errors.New("protected preparation history prefix is not exact")
+	}
+	checkpoint := history.Checkpoints[0].Checkpoint
+	if checkpoint.Generation != inspection.ProtectedGeneration || checkpoint.OperationID != inspection.Spec.OperationID ||
+		checkpoint.Digest != inspection.PredecessorCheckpointDigest || checkpoint.sourceRef() != inspection.Spec.Predecessor {
+		return errors.New("protected preparation checkpoint does not match the admitted predecessor")
+	}
+	if wantIntents == 1 {
+		intent := history.IntentsV2[0].Intent
+		if intent.Generation != inspection.ProtectedGeneration || intent.OperationID != inspection.Spec.OperationID ||
+			!reflect.DeepEqual(intent.Claim, claim) || intent.Predecessor != inspection.Spec.Predecessor {
+			return errors.New("protected preparation intent does not match the admitted claim")
+		}
+	}
+	if wantProgress == 1 {
+		progress := history.Progress[0].Record
+		if progress.Generation != inspection.ProtectedGeneration || progress.OperationID != inspection.Spec.OperationID ||
+			progress.Sequence != 1 || progress.Phase != gatewayRebindProgressSuccessorIntent ||
+			progress.ProtectedIntentDigest != history.IntentsV2[0].Intent.Digest {
+			return errors.New("protected preparation progress does not bind the exact intent")
+		}
+	}
+	return nil
+}
+
+func gatewayRebindAdmissionWaitForParentKill() error {
+	control := make([]byte, 1)
+	if _, err := os.Stdin.Read(control); err != nil {
+		return errors.New("crash parent ended the control channel without killing the child")
+	}
+	return errors.New("crash parent continued a kill-only child")
+}
+
 func gatewayRebindAdmissionProcessRecover(path string) error {
 	manifest, err := gatewayRebindAdmissionReadManifest(path)
 	if err != nil {
@@ -599,7 +845,7 @@ func gatewayRebindAdmissionProcessRecover(path string) error {
 	}
 	snapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil {
-		return err
+		return errors.Join(err, releaseGateway(), releaseEffects())
 	}
 	attempt, err := manager.recoverGatewayRebindPreparedAdmissionLocked(ctx, repository, snapshot)
 	if err != nil || runner.calls.Load() != 0 || attempt.Progress.Sequence != 1 || attempt.Progress.Phase != gatewayRebindProgressSuccessorIntent ||
