@@ -37,6 +37,7 @@ import (
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/hostnetwork"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
@@ -182,8 +183,8 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 			t.Error("runtime worker did not stop")
 		}
 	}()
-	appA := lanTwoAppDeploy(t, &request, jobStore, githubSource, setup, "LAN A", "lan-a-v1", &appIDs)
-	appB := lanTwoAppDeploy(t, &request, jobStore, githubSource, setup, "LAN B", "lan-b-v1", &appIDs)
+	appA := lanTwoAppDeploy(t, &request, jobStore, deploymentStore, composition.state, githubSource, setup, "LAN A", "lan-a-v1", &appIDs)
+	appB := lanTwoAppDeploy(t, &request, jobStore, deploymentStore, composition.state, githubSource, setup, "LAN B", "lan-b-v1", &appIDs)
 	if appA.id == appB.id || appA.deploymentID == appB.deploymentID {
 		t.Fatal("two distinct application deployments are required")
 	}
@@ -256,7 +257,7 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	if configA.RevisionID == appA.config.RevisionID || configA.RevisionNumber != appA.config.RevisionNumber+1 {
 		t.Fatal("redeploy A did not save a distinct configuration revision")
 	}
-	lanTwoAppDeployJob(t, &request, jobStore, appA.id, appA.plan, configA)
+	lanTwoAppDeployJob(t, &request, jobStore, deploymentStore, composition.state, appA.id, appA.plan, configA)
 	lanTwoAppProbeMatrix(t, ctx, selected.IPv4, portA, portB, ports[2], "lan-a-v2", "lan-b-v1")
 	lanTwoAppProbe(t, ctx, selected.IPv4, portB, selected.IPv4, "/api/notes", http.StatusOK, "b-persistent-note")
 	if got := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-q", "--filter", "label=io.rig.application="+appB.id); got != beforeB {
@@ -550,8 +551,9 @@ func lanTwoAppConfig(marker string) []apicontract.ScopedConfigurationValueInput 
 	}
 }
 
-func lanTwoAppDeploy(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service, source apicontract.GitHubSource,
-	setup apicontract.DeploymentSetupInput, name, marker string, appIDs *[]string,
+func lanTwoAppDeploy(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service, deploymentStore *deployments.Repository,
+	state *generatedruntimestate.Repository, source apicontract.GitHubSource, setup apicontract.DeploymentSetupInput,
+	name, marker string, appIDs *[]string,
 ) lanTwoAppDeployment {
 	t.Helper()
 	var inspection apicontract.InspectResponse
@@ -582,12 +584,13 @@ func lanTwoAppDeploy(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service, so
 		PublicBuildDisclosureAcknowledged: true, Entries: lanTwoAppConfig(marker),
 		Remove: []apicontract.ScopedConfigurationKey{},
 	}, http.StatusOK, &saved)
-	deploymentID := lanTwoAppDeployJob(t, api, jobStore, application.ID, plan, saved)
+	deploymentID := lanTwoAppDeployJob(t, api, jobStore, deploymentStore, state, application.ID, plan, saved)
 	return lanTwoAppDeployment{id: application.ID, deploymentID: deploymentID, plan: plan, config: saved}
 }
 
-func lanTwoAppDeployJob(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service, appID string,
-	plan apicontract.DeploymentPlanRevision, configuration apicontract.ApplicationConfiguration,
+func lanTwoAppDeployJob(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service, deploymentStore *deployments.Repository,
+	state *generatedruntimestate.Repository, appID string, plan apicontract.DeploymentPlanRevision,
+	configuration apicontract.ApplicationConfiguration,
 ) string {
 	t.Helper()
 	path := "/api/v1/apps/" + appID + "/deployments"
@@ -612,7 +615,8 @@ func lanTwoAppDeployJob(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service,
 		}
 		if job.Status == string(jobs.Failed) || job.Status == string(jobs.NeedsAttention) ||
 			job.Status == string(jobs.WaitingUser) || time.Now().After(deadline) || api.ctx.Err() != nil {
-			t.Fatalf("generated deployment did not succeed: status=%s phase=%s code=%s", job.Status, job.Phase, job.ErrorCode)
+			lanTwoAppLogDeploymentFailure(t, api.ctx, appID, mutation.Job.ID, deploymentStore.List, state.Get)
+			t.Fatal("generated deployment did not succeed; safe diagnostic logged")
 		}
 	}
 	var history apicontract.DeploymentList

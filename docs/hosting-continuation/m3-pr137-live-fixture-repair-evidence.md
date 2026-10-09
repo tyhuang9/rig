@@ -271,3 +271,253 @@ crash markers, exact recovery/replay and terminal outcomes, physical application
 responses and clean owned-resource teardown. Local deterministic or WSL tests do
 not replace those hosted results. Further publication requires separate
 authorization.
+
+## Hosted follow-up at published `1b3eb24` — 2026-10-09
+
+The user authorized publishing the reviewed follow-up. Draft PR 137 was updated
+to `1b3eb244c2f29d30b7c8b77faff5bcca995f66d3` after all original workflows
+finished and their terminal records were saved. No original run was canceled,
+no merge occurred, and the target remained PR 136's branch.
+
+### Confirmed passes
+
+The new generated-runtime Docker lifecycle job `113849127437` passed, including
+all four repaired direct-Manager parents and the final cleanup step:
+
+| Parent | Actual PASS elapsed |
+| --- | --- |
+| `TestLiveNextCacheRuntimeRoute` | 43.91 seconds |
+| `TestLiveGeneratedGatewayReadiness` | 35.23 seconds |
+| `TestLiveGeneratedBlueGreenLifecycle` | 46.54 seconds |
+| `TestLiveHostingNotesDatabaseRoundtrip` | 52.67 seconds |
+
+Their exact Go JSON PASS events are retained in
+`temp/pr137-job-113849127437-attempt1.log`, SHA-256
+`12D4F76F2B67D31599332E957CF25C70F76630DEC6E0750A048BA186F690B998`.
+This is actual hosted Linux Docker evidence, including the application-owned
+disposable external TLS services; it is not a deployment of the user's private
+application or a managed database feature.
+
+`TestLiveGatewayRebindCrossStorePreparedClaimProcessRecovery` now passed in
+46.85 seconds in job `113849127883`. Its saved log SHA-256 is
+`7F83DCEDB76DD9B480813D78A04ECCCBCF003E6F003B8753CC891167C80B2F93`.
+This establishes the repaired JSON transport and original application-body
+assertion in the actual independent-process Docker journey.
+
+Documentation run `37939259651` succeeded: build job `113849127583` passed and
+deployment was skipped for the draft. Its terminal metadata is preserved in
+`temp/pr137-run37939259651-attempt1-final.json`. No documentation publication is
+claimed from that skipped job.
+
+### Retained failures and their narrower boundaries
+
+Gateway Docker workflow `37939259591` completed with **11 passing jobs and
+4 failed jobs**. Terminal metadata is
+`temp/pr137-run37939259591-attempt1-final.json`, SHA-256
+`4BF5A99BFB88AC5C900852868414BBC1B95D1E6B2A532AF9D78A18FA4A526C11`.
+The prepared-process pass does not replace these failures:
+
+| Parent / job | Observed boundary | Saved log SHA-256 |
+| --- | --- | --- |
+| Typed commit/replay / `113849128245` | Reaches typed commit, then `route_reconciliation_required`; strict cleanup cannot obtain gateway admission and retains resources. 68.32 seconds. | `BFD9781AB5DBD6AEB1A1897E1C99493291B040ACB043CD662AEFB3EF41B385B6` |
+| Typed rollback/replay / `113849128442` | Does not reach the intended pre-sequence-17 refusal hook; reconciliation fails and terminal-only cleanup retains resources. 105.79 seconds. | `4B189AB2C371893D7232EAD60BAD118DF01D7BF32DB88D833B7A114B4D9D27BF` |
+| Private handover commit/restart / `113849128413` | First coordinator observation at `final_config_copied` fails, with zero effects; child does not reach the intended crash marker. 124.11 seconds. | `C9DDEF37BC72D81E529B7F37725C6D766D26EA900D87015AB49BC422C0F771FA` |
+| Private handover rollback/restart / `113849127684` | Same first-observation refusal, zero effects, before crash marker. 130.01 seconds. | `AA3D1758EE1FB59B8B012F55E82E6B424FABA9AFCE50BE4FB8DAE6E5435DB62E` |
+
+Log paths have the same `temp/pr137-job-<job>-attempt1.log` pattern. These are
+new failed attempts at later boundaries, not successful runtime commit/rollback
+acceptance. The new handover diagnostic localizes an observation failure but
+does not identify its physical predicate or justify weakening any proof.
+The cleanup admission refusal may come from the process fail-stop latch; it is
+not evidence that an operating-system lock remained held.
+
+Relay job `113849128418` also failed in 20.09 seconds, now at the durable source
+assertion after the deliberately lost ACK and controller reopen. Its context
+budget investigation is recorded separately in
+[the relay budget evidence](./m3-pr137-relay-budget-evidence.md).
+The newly published Linux race and Windows workflows were still running when
+this follow-up was recorded. Original race timeout results remain failed;
+their optimization and new outcomes require separate evidence. M3 remains open.
+
+### Additional terminal results at the same published source
+
+Observed on 2026-10-09 at approximately 14:24 UTC. The exact source remains
+`1b3eb244c2f29d30b7c8b77faff5bcca995f66d3`, attempt one. No workflow was
+canceled or restarted. The following final metadata files are retained under
+`C:/Users/huang/Documents/Projects/Rig/temp/` as
+`pr137-run<run>-attempt1-final.json`:
+
+| Workflow / run | Terminal result | Metadata SHA-256 |
+| --- | --- | --- |
+| Relay Compose / `37939259624` | SUCCESS, one job | `10C668CAB0F3190091C0BB25BB561002EE40BAF10FEDCF731FC390C4F4504288` |
+| Playwright browser / `37939259719` | SUCCESS, one job | `E5040B4603E10CA71FBEE617545E848523F66B2D538D4C7C05A565F31F8A12F0` |
+| Migration approval and uncertainty / `37939259632` | SUCCESS, one job | `49394298CEF5806A28304239FA72AFD701D14691A1FEB73CAB8C771A7921F6BC` |
+| Hosted controller journey / `37939259579` | SUCCESS, both process restart and authenticated TLS notes jobs | `013CC0D8F0FF13112AAF0838F94C5827CEA803CF83CBD0B42D997501A6076EEB` |
+| Two-app LAN / `37939259630` | FAILURE, one job | `048FA803F5D11A214B6C7A8FCB2E47380B4619DA6CB28743CA8F256447CE14EA` |
+
+The LAN parent `TestLiveControllerTwoAppLANJourney` failed after 1015.78
+seconds at fixture line 259, while redeploying application A. Its 14-minute
+deployment wait expired with durable job status `running`, phase
+`apply_runtime` and no error code. Both preceding LAN grants have complete
+successful closed traces. The broad job phase is reported before authorization
+and image building, so it does not identify a specific Docker command, lock,
+or runtime phase. Complete Docker cleanup passed. Its log is
+`pr137-job-113849127873-attempt1.log`, SHA-256
+`AEFB83CE9D4A8BC9B3BB1004C58DAED118C152BA3B288912C17D9ECBF7BC3810`.
+This remains a failed acceptance attempt; no deadline increase or runtime
+guard relaxation is justified by this evidence alone.
+
+The Windows core job `113849127799` also failed, although its containing
+workflow was still active. The sole reported package failure was
+`TestLegacyLocalSourceDraftMigratesAndCompletesManagedComposeDeployment`:
+52.65 seconds total, with its 20-second wait for simulated Compose startup
+expiring at fixture line 490. The durable job was `running` in `render_compose`,
+with zero simulated `up` calls, no error code and no error detail. The log is
+`pr137-job-113849127799-attempt1.log`, SHA-256
+`3A415B6E47734A9098294CFA5B6A230E34C94C6E4BCE47A736EA3DFF9F27511C`.
+The following core steps were skipped after repository tests failed; the earlier
+successful Windows workflow at `488046b` does not replace this failed attempt.
+
+One focused local reproduction used the unchanged legacy test and production
+Compose executor, Go 1.27.0 windows/amd64, `GOTOOLCHAIN=local`,
+`GOFLAGS=-mod=readonly -buildvcs=false -p=1`, and `CGO_ENABLED=0`:
+
+```text
+go test -json -count=1 -timeout=3m -run '^TestLegacyLocalSourceDraftMigratesAndCompletesManagedComposeDeployment$' ./internal/jobs
+```
+
+The restricted execution failed earlier at protected configuration setup,
+fixture line 441, with `configuration_unavailable`. That result remains in
+`temp/pr137-windows-legacy-check-20261009/`; it did not reach the hosted failure
+boundary. Normal Windows user execution then passed the exact parent once in
+2.07 seconds (package 2.502 seconds, command wall 5.937 seconds), with no skips
+or failures. Its result and source hashes are in
+`temp/pr137-windows-legacy-check-20261009-normal-user/result.json`; output
+SHA-256 is `915FD16E3A38B71F9F72EC7CC9F44849AEF4D7687DA9C95B5F2DE6E18C2CD9EA`.
+The test, job service and Compose executor hashes were unchanged before and
+after both commands. The local sandbox boundary and hosted wait failure are
+distinct. A focused local pass does not establish the cause or repair of the
+hosted failure, and no retry-until-pass sequence was performed.
+
+The Windows workflow subsequently completed at the same published source:
+**18 successful ingress jobs, one failed core job and one correctly failed
+dependent aggregate**. Its immutable final metadata is
+`temp/pr137-run37939259666-attempt1-final.json`, SHA-256
+`B5045CEB498E8CED5290F8CC7FE697928121CAF01098C8C26EF8BC883B39FBE5`.
+The aggregate job `113871683341` log is retained with SHA-256
+`B981CF94BFFBA635E7D20F8B65BCF0920C6D835FFF4FD5566E0FF6BA38C43B65`.
+The complete Windows result is FAILURE; the 18 ingress successes do not
+establish the core checks that were skipped after its test failure.
+
+The generated-runtime lifecycle workflow `37939259638` also finished at the
+same source with **14 passing jobs, six failed race groups and a failed
+dependent aggregate**. The complete result is FAILURE. Final metadata is
+`temp/pr137-run37939259638-attempt1-final.json`, SHA-256
+`39332A319F3788D0D19CFF3B2B12AA94B1FB8C6E79DE5DF357408DB91EDDB78A`;
+aggregate job `113875249632` log SHA-256 is
+`A74EBDFA8125293F1D869BA4AC1B2FA86EED1BE6DC451A2F84086BE395EC715F`.
+The last failed config group, job `113849127993`, timed out at `32m0s`;
+its log SHA-256 is
+`B573989F00D54575BDA434BD7F27EB863B61C896D4CE23B91D235121CC4D5242`.
+No data-race marker was found in that log; timeout remains failed acceptance.
+The earlier fixed-time race table in
+[the capacity evidence](./m3-pr137-race-fixture-capacity-evidence.md)
+remains a historical snapshot, not a complete final workflow tally.
+
+### Local failure diagnostics and production compilation
+
+The local follow-up adds failure-only diagnostics to these two fixtures. It
+does not claim to repair either unknown hosted stall:
+
+- The LAN fixture selects the exact failed job from at most ten deployment
+  records, verifies application/deployment identity, then reads that runtime
+  deployment. One shared two-second observational context covers both reads.
+  It is detached from the failed journey's cancellation so a terminal snapshot
+  can still be attempted, and is canceled when the diagnostic returns. Output
+  is limited to fixed read-result labels, allowlisted deployment/runtime/migration
+  states and canonical component-state counts. IDs, component names, raw errors,
+  configuration and Docker arguments are excluded. Missing, ambiguous and
+  crossed identities produce fixed refusal labels. There are no Docker effects
+  or changes to the deployment wait, authorization or cleanup.
+- The Windows Compose fixture snapshots its existing fake runner requests under
+  its mutex. It emits only total/config/up/unknown counts and a fixed last-command
+  class. Classification recognizes the controller's existing command shapes;
+  arbitrary option values cannot impersonate a subcommand. The existing
+  20-second startup wait and success assertions are retained.
+
+The LAN diagnostic helpers and deterministic tests are untagged private test
+code, so ordinary controller CI exercises them. Only their live-journey call
+site requires the `live_docker` build tag. Independent security review found
+no source blocker in the bounded reads, identity selection or sanitized output.
+Independent final source review also passed for the aggregate follow-up.
+Executable verification is recorded below. These reviews establish local
+readiness for a publication request, not hosted acceptance or merge approval.
+
+The repository's production build passed on the local candidate with the
+private gateway diagnostic changes applied:
+
+```text
+go build -trimpath ./cmd/hostd ./cmd/hostctl ./cmd/rig-relay ./cmd/rig-relay-probe
+```
+
+This used Go 1.27.0 windows/amd64, `GOTOOLCHAIN=local`,
+`GOFLAGS=-mod=readonly -buildvcs=false -p=1` and `CGO_ENABLED=0`.
+The command exited zero in 6.015 seconds with empty output. All tracked
+production Go files and `go.mod`/`go.sum` had identical hashes before and after
+the build; concurrent test-only edits were excluded from that production
+manifest. The record is
+`temp/pr137-followup-production-build-20261009/result.json`, SHA-256
+`5934E7B8157DDE904BC647977872C6AA1976AC8DD7DE023C3F0AAE2DF1642C42`.
+This is local compilation of the recorded working tree, not hosted acceptance
+of the unpublished follow-up or a deployed binary.
+
+### Failure diagnostic verification
+
+All three source files stayed unchanged through native checks, Linux compilation
+and actual WSL execution:
+
+| File | SHA-256 |
+| --- | --- |
+| `cmd/hostd/hosting_lan_two_app_live_test.go` | `0D5A8DFEB05023AA113E3BFEF1D29A7C4D6C8E85DA1842EC24BBDB88D32E19DC` |
+| `cmd/hostd/hosting_lan_two_app_diagnostic_test.go` | `F13759B1FCBFC54E24165D9534586E548EF9053339A34D79C70C3295C986A372` |
+| `internal/jobs/compose_worker_integration_test.go` | `D2CFDF36C43D5E5687C5ED1A532B3A172B1C6E658039036D7322B3C1C81BFF27` |
+
+The exact native selections were:
+
+```text
+go test ./cmd/hostd -run '^(TestLanTwoAppDeploymentFailureObservationIsAllowlisted|TestLanTwoAppFailureDiagnosticContextIgnoresParentCancellationAndDeadline|TestLanTwoAppDeploymentFailureObservationRejectsUnreadableOrAmbiguousState)$' -count=1 -json -timeout=2m
+go test ./internal/jobs -run '^(TestBlockingComposeRunnerFailureDiagnosticSnapshotIsAllowlisted|TestBlockingComposeRunnerCommandClassRequiresExactComposeShape|TestLegacyLocalSourceDraftMigratesAndCompletesManagedComposeDeployment)$' -count=1 -json -timeout=2m
+go vet ./cmd/hostd ./internal/jobs
+```
+
+The hostd selection was also executed with `-tags=live_docker`. That command
+compiled the live call site and executed the same deterministic diagnostic
+parents; it did not select or run the Docker journey. Linux binaries were
+crosscompiled with the local Go 1.27.0 toolchain and actually executed in WSL
+using the same anchored selections. Tests retained count one and two-minute
+package limits. No credentials or live services were needed.
+
+| Execution | Result | Output SHA-256 |
+| --- | --- | --- |
+| Native hostd | 3 parents and 8 subcases PASS | `2B59E2394E60FBA6734941566EF93023CAB67104D36938E5A6A1B2A3888B31CD` |
+| Native jobs | 3 parents and 5 subcases PASS, including unchanged legacy Compose control | `14FB5F33764C3C81365C8D38A743A9E75FA7CF3BA864EF134C08BB36AB8B4D33` |
+| Native hostd with Docker tag | Same 3 parents and 8 subcases PASS | `BF35C8CEC9E66F224312B924574C4AB96C01E6178B70BE7EA5EA2F9F4FAE211A` |
+| Actual WSL hostd | 3 parents and 8 subcases PASS | `37E6D9D4CC3AEC3B7B6EFBCEA7B63C2ED01C62B15582E6F52771DB880605E54C` |
+| Actual WSL jobs from package directory | 3 parents and 5 subcases PASS | `97A06E2F1A59138EBE149302BD9E405A0277B0269B74994FD7CF4DE274415484` |
+
+Scoped vet exited zero; `gofmt -d` and `git diff --check` were clean. Commands,
+exit records, exact inventories and source hashes are retained under
+`temp/m3-pr137-failure-diagnostics-20261009/`. Its final artifact manifest
+SHA-256 is `2151774FCB0DD2D4266BA9A3051AB3D2CDCF057EDFED082C402E179DD41601A2`.
+
+Environment/setup failures remain recorded separately: native Go is unavailable
+inside WSL; an initial binary-copy launcher resolved an invalid root target;
+and the first executed jobs binary ran from the evidence directory, so its
+existing migration fixture could not locate relative migration files. Only the
+affected launcher/package-directory execution was corrected using the same
+compiled binaries. Native tests and compilation were not repeated to mask these
+failures. The final jobs package-directory run passed its existing control in
+0.49 seconds. These checks establish diagnostic behavior and test discovery;
+they do not establish a repair of the hosted LAN or Windows stall, Docker
+acceptance, or Linux race acceptance. Reverting the three test-file changes
+restores the prior failure output without changing runtime data or deployment.
