@@ -347,8 +347,8 @@ func TestLiveGatewayRebindFinalHandoverChild(t *testing.T) {
 		err = manager.handoverGatewayRebindFinalWithDriver(ctx, appaccess.New(db), driver, time.Now().UTC(), nil)
 	}
 	if err != nil {
-		t.Logf("private handover refusal: effects=%d coordinator_observations=%d last_phase=%q last_observation_failed=%t",
-			driver.effects, driver.observations, driver.lastPhase, driver.lastObservationFailed)
+		t.Logf("private handover refusal: effects=%d coordinator_observations=%d last_phase=%q last_observation_failed=%t handover_diagnostic_stage=%q",
+			driver.effects, driver.observations, driver.lastPhase, driver.lastObservationFailed, driver.lastDiagnosticStage)
 		failLiveIngress(t, "run private handover in independent process", err)
 	}
 	if mode == "replay" && driver.effects != 0 {
@@ -364,6 +364,7 @@ type liveFinalHandoverDriver struct {
 	observations          int
 	lastPhase             gatewayRebindProgressPhase
 	lastObservationFailed bool
+	lastDiagnosticStage   string
 }
 
 // Record only bounded diagnostic metadata. All observation decisions and
@@ -375,6 +376,10 @@ func (d *liveFinalHandoverDriver) observeHandover(ctx context.Context,
 	d.lastPhase = value.Phase
 	observation, err := d.managerGatewayRebindFinalHandoverDriver.observeHandover(ctx, value)
 	d.lastObservationFailed = err != nil
+	d.lastDiagnosticStage = ""
+	if stage, ok := gatewayRebindHandoverDiagnosticStageFrom(err); ok {
+		d.lastDiagnosticStage = stage.String()
+	}
 	return observation, err
 }
 

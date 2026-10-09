@@ -83,9 +83,11 @@ func TestGatewayRebindRuntimeLivePreconditions(t *testing.T) {
 
 type liveGatewayRebindRuntimeFixture struct {
 	liveGatewayRebindSourceFixture
-	manager    *Manager
-	inspection GatewayRebindProposalInspection
-	input      gatewayRebindCommitInput
+	manager          *Manager
+	diagnosticRunner *liveGatewayRebindRuntimeDiagnosticRunner
+	diagnosticDriver *liveGatewayRebindRuntimeRollbackDriver
+	inspection       GatewayRebindProposalInspection
+	input            gatewayRebindCommitInput
 }
 
 func newLiveGatewayRebindRuntimeFixture(t *testing.T) liveGatewayRebindRuntimeFixture {
@@ -95,12 +97,14 @@ func newLiveGatewayRebindRuntimeFixture(t *testing.T) liveGatewayRebindRuntimeFi
 	options := source.fixture.ingress.options
 	options.RebindFenceCheck = source.repository.CheckGatewayRebindFence
 	options.RebindCurrentStateRepository = source.repository
-	manager, err := New(source.fixture.runner, options)
+	diagnosticRunner := &liveGatewayRebindRuntimeDiagnosticRunner{runner: source.fixture.runner}
+	manager, err := New(diagnosticRunner, options)
 	if err != nil {
 		t.Fatal("open typed runtime manager")
 	}
 	rebind, current := newGatewayRebindRuntimeDrivers(manager)
-	manager.gatewayRebindCrossStoreDriver = rebind
+	diagnosticDriver := &liveGatewayRebindRuntimeRollbackDriver{managerGatewayRebindCrossStoreDriver: rebind}
+	manager.gatewayRebindCrossStoreDriver = diagnosticDriver
 	manager.gatewayCurrentPhysicalDriver = current
 	source.fixture.ingress = manager
 	inspection, err := manager.InspectGatewayRebindProposal(source.fixture.ctx, source.repository, GatewayRebindProposalInput{
@@ -113,7 +117,8 @@ func newLiveGatewayRebindRuntimeFixture(t *testing.T) liveGatewayRebindRuntimeFi
 	if err != nil || len(inspection.Roster) != 1 {
 		t.Fatal("inspect the exact typed rebind proposal")
 	}
-	value := liveGatewayRebindRuntimeFixture{liveGatewayRebindSourceFixture: source, manager: manager, inspection: inspection,
+	value := liveGatewayRebindRuntimeFixture{liveGatewayRebindSourceFixture: source, manager: manager,
+		diagnosticRunner: diagnosticRunner, diagnosticDriver: diagnosticDriver, inspection: inspection,
 		input: gatewayRebindCommitInput{Inspection: inspection,
 			RebindApproval:    appaccess.Approval{Action: appaccess.ActionRebindGateway, SpecDigest: inspection.SpecDigest, ActorID: gatewayRebindTestAdministrator},
 			ConfigureApproval: appaccess.Approval{Action: appaccess.ActionConfigureGateway, SpecDigest: inspection.SuccessorProfileSpecDigest, ActorID: gatewayRebindTestAdministrator}}}
@@ -125,7 +130,39 @@ func newLiveGatewayRebindRuntimeFixture(t *testing.T) liveGatewayRebindRuntimeFi
 
 type liveGatewayRebindRuntimeRollbackDriver struct {
 	managerGatewayRebindCrossStoreDriver
-	refused bool
+	refuseSequence17 bool
+	refused          bool
+	lastSequence     uint64
+	lastPhase        gatewayRebindProgressPhase
+}
+
+type liveGatewayRebindRuntimeDiagnosticRunner struct {
+	runner           runtimeprocess.CommandRunner
+	lastCommandClass string
+}
+
+func (r *liveGatewayRebindRuntimeDiagnosticRunner) Run(ctx context.Context,
+	request runtimeprocess.CommandRequest,
+) (runtimeprocess.CommandResult, error) {
+	r.lastCommandClass = liveGatewayRebindRuntimeCommandClass(request.Args)
+	return r.runner.Run(ctx, request)
+}
+
+func liveGatewayRebindRuntimeCommandClass(args []string) string {
+	if len(args) < 2 {
+		return "unknown"
+	}
+	switch args[0] + "_" + args[1] {
+	case "image_inspect", "network_inspect", "network_create", "network_rm", "network_connect", "network_disconnect",
+		"volume_inspect", "volume_create", "volume_rm", "container_inspect", "container_create", "container_start", "container_stop", "container_rm":
+		return args[0] + "_" + args[1]
+	case "container_cp":
+		return "config_copy"
+	case "container_exec":
+		return "container_exec"
+	default:
+		return "unknown"
+	}
 }
 
 type liveGatewayRebindRuntimeReplayRunner struct {
@@ -244,12 +281,22 @@ func (d *liveGatewayRebindRuntimeRollbackDriver) reconcileSuccessorLocked(ctx co
 ) (gatewayRebindTypedPhysicalResult, error) {
 	return d.managerGatewayRebindCrossStoreDriver.reconcileSuccessorLocked(ctx, request,
 		func(appendCtx context.Context, record gatewayRebindProgressRecord) error {
-			if record.Sequence == 17 && record.Phase == gatewayRebindProgressHandoverCommitted && !d.refused {
+			if d.refuseSequence17 && record.Sequence == 17 && record.Phase == gatewayRebindProgressHandoverCommitted && !d.refused {
 				d.refused = true
 				return errors.New("test refusal before durable sequence seventeen")
 			}
-			return appendProgress(appendCtx, record)
+			return d.appendValidatedProgress(appendCtx, record, appendProgress)
 		})
+}
+
+func (d *liveGatewayRebindRuntimeRollbackDriver) appendValidatedProgress(ctx context.Context,
+	record gatewayRebindProgressRecord, appendProgress gatewayRebindTypedProgressAppender,
+) error {
+	if err := appendProgress(ctx, record); err != nil {
+		return err
+	}
+	d.lastSequence, d.lastPhase = record.Sequence, record.Phase
+	return nil
 }
 
 func TestLiveGatewayRebindRuntimeCommitAndReplay(t *testing.T) {
@@ -299,16 +346,21 @@ func liveGatewayRebindRuntimeJourney(t *testing.T, rollback bool) {
 
 	var result GatewayRebindCommitResult
 	if rollback {
-		base := f.manager.gatewayRebindCrossStoreDriver.(managerGatewayRebindCrossStoreDriver)
-		driver := &liveGatewayRebindRuntimeRollbackDriver{managerGatewayRebindCrossStoreDriver: base}
-		f.manager.gatewayRebindCrossStoreDriver = driver
+		driver := f.diagnosticDriver
+		driver.refuseSequence17 = true
 		result, err = f.manager.commitGatewayRebind(ctx, repository, f.input)
 		if err != nil || !driver.refused {
+			if err != nil {
+				t.Logf("typed runtime refusal: last_validated_sequence=%d last_validated_phase=%q command_class=%q",
+					f.diagnosticDriver.lastSequence, f.diagnosticDriver.lastPhase, f.diagnosticRunner.lastCommandClass)
+			}
 			t.Fatalf("force exact pre-sequence17 rollback: refused=%t err=%v", driver.refused, err)
 		}
 	} else {
 		result, err = f.manager.commitGatewayRebind(ctx, repository, f.input)
 		if err != nil {
+			t.Logf("typed runtime refusal: last_validated_sequence=%d last_validated_phase=%q command_class=%q",
+				f.diagnosticDriver.lastSequence, f.diagnosticDriver.lastPhase, f.diagnosticRunner.lastCommandClass)
 			failLiveIngress(t, "commit typed runtime rebind", err)
 		}
 	}
