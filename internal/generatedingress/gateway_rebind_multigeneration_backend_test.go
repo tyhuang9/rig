@@ -179,7 +179,7 @@ func (r *gatewayRebindMultiRunner) servers() []gatewayRebindCompositionServer {
 			servers = append(servers, gatewayRebindCompositionServer{entry.stage.container, entry.stage.containerRuntime, entry.intent.Network.ContainerIPv4, entry.stage.stageBody})
 		}
 		if entry.finalPresent {
-			servers = append(servers, gatewayRebindCompositionServer{entry.final, entry.finalRuntime, entry.intent.Network.ContainerIPv4, entry.stage.activeBody})
+			servers = append(servers, gatewayRebindCompositionServer{entry.final, entry.finalRuntime, entry.intent.Network.ContainerIPv4, entry.currentLiveBody()})
 		}
 	}
 	return servers
@@ -343,20 +343,9 @@ func (r *gatewayRebindMultiRunner) Run(ctx context.Context, request runtimeproce
 			return gatewayCurrentPhysicalNetworkResult(id, network)
 		}
 	}
-	name := a[len(a)-1]
-	if a[0] == "container" {
-		switch a[1] {
-		case "create":
-			name = gatewayRebindCompositionArg(a, "--name")
-		case "exec":
-			name = a[2]
-		case "cp":
-			name = a[3]
-			if name == "-" {
-				name = a[2]
-			}
-			name = strings.SplitN(name, ":/", 2)[0]
-		}
+	name, err := gatewayRebindMultiCommandTarget(a)
+	if err != nil {
+		return runtimeprocess.CommandResult{}, err
 	}
 	if r.legacy != nil && a[0] == "container" && a[1] == "inspect" && r.legacyEndpoint(name) {
 		return r.runLegacy(ctx, request)
@@ -402,6 +391,56 @@ func (r *gatewayRebindMultiRunner) Run(ctx context.Context, request runtimeproce
 		return native.Run(ctx, request) // Application endpoint, never a retained gateway ID.
 	}
 	return runtimeprocess.CommandResult{}, fmt.Errorf("unowned multi-generation command: %v", a)
+}
+
+// gatewayRebindMultiCommandTarget accepts only the target position Docker uses
+// for each command family. In particular, root exec commands place the
+// immutable container ID after the exact --user value; never infer it by
+// scanning arbitrary arguments.
+func gatewayRebindMultiCommandTarget(args []string) (string, error) {
+	if len(args) < 2 {
+		return "", errors.New("incomplete multi-generation command")
+	}
+	if args[0] != "container" {
+		return args[len(args)-1], nil
+	}
+	switch args[1] {
+	case "create":
+		name := gatewayRebindCompositionArg(args, "--name")
+		if name == "" {
+			return "", errors.New("missing multi-generation container name")
+		}
+		return name, nil
+	case "exec":
+		if len(args) < 3 {
+			return "", errors.New("incomplete multi-generation exec")
+		}
+		if args[2] != "--user" {
+			if args[2] == "" {
+				return "", errors.New("missing multi-generation exec target")
+			}
+			return args[2], nil
+		}
+		if len(args) < 5 || args[3] != "0:0" || args[4] == "" {
+			return "", errors.New("malformed multi-generation root exec")
+		}
+		return args[4], nil
+	case "cp":
+		if len(args) != 4 {
+			return "", errors.New("malformed multi-generation container copy")
+		}
+		location := args[3]
+		if location == "-" {
+			location = args[2]
+		}
+		name, _, found := strings.Cut(location, ":/")
+		if !found || name == "" {
+			return "", errors.New("missing multi-generation copy target")
+		}
+		return name, nil
+	default:
+		return args[len(args)-1], nil
+	}
 }
 
 func (r *gatewayRebindMultiRunner) applicationNetwork(query string) (caddyNetworkInspection, string, bool) {
