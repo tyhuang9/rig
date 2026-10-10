@@ -71,8 +71,9 @@ func TestManagedGatewayCurrentLANRecoveryDriverRefusesSelectionDriftBeforeEffect
 		managerGatewayCurrentPhysicalDriver: managerGatewayCurrentPhysicalDriver{manager: fixture.manager},
 		runtime:                             runtime,
 	}
+	contract := installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 	if _, err := driver.withdrawGatewayCurrentLANRecoveryBatch(context.Background(), action); err == nil ||
-		runtime.reconciles != 1 || runtime.observes != 0 {
+		runtime.reconciles != 1 || runtime.observes != 0 || contract.calls == 0 {
 		t.Fatalf("selection drift reached batch effects: reconciles=%d observes=%d error=%v",
 			runtime.reconciles, runtime.observes, err)
 	}
@@ -114,9 +115,19 @@ func TestManagedGatewayCurrentLANRecoveryDriverRefusesSelectionDriftBeforeEffect
 		managerGatewayCurrentPhysicalDriver: managerGatewayCurrentPhysicalDriver{manager: fixture.manager},
 		runtime:                             observer,
 	}
+	contract = installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, attestDriver)
 	if _, err := attestDriver.attestGatewayCurrentLANRecoveryBatch(context.Background(), action); err == nil ||
-		observer.observes != 2 {
+		observer.observes != 2 || contract.calls == 0 {
 		t.Fatalf("post-proof selection drift was accepted: observes=%d error=%v", observer.observes, err)
+	}
+}
+
+func TestManagedGatewayCurrentLANRecoveryDriverPinsExactPredecessorRetirementObservation(t *testing.T) {
+	fixture, runner, contract, selection, snapshot := gatewayCurrentPredecessorRetirementContractFixture(t)
+	before := gatewayCurrentPhysicalExecutorDigest(t, runner)
+	if err := fixture.manager.observeGatewayCurrentPredecessorsRetiredLocked(context.Background(), selection, snapshot); err != nil ||
+		contract.calls != 1 || gatewayCurrentPhysicalExecutorDigest(t, runner) != before {
+		t.Fatalf("exact predecessor observation: calls=%d effects=%v err=%v", contract.calls, runner.effects, err)
 	}
 }
 
@@ -162,9 +173,10 @@ func TestManagedGatewayCurrentLANRecoveryRuntimeClassifiesOnlyCanonicalPartialTo
 		managerGatewayCurrentPhysicalDriver: managerGatewayCurrentPhysicalDriver{manager: fixture.manager},
 		runtime:                             runtime,
 	}
+	contract := installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 	result, err := driver.attestGatewayCurrentLANRecoveryBatch(context.Background(), action)
 	if err != nil || result.BatchAbsent || result.Attestation.Outcome != gatewayCurrentPhysicalRecoveryMixed ||
-		!reflect.DeepEqual(result.Attestation.State, partial) {
+		!reflect.DeepEqual(result.Attestation.State, partial) || contract.calls == 0 {
 		t.Fatalf("actual partial batch topology=%#v error=%v", result, err)
 	}
 }
@@ -183,6 +195,7 @@ func TestManagedGatewayCurrentLANRecoveryRuntimeWithdrawsWholeBatchAfterLostRelo
 		managerGatewayCurrentPhysicalDriver: managerGatewayCurrentPhysicalDriver{manager: fixture.manager},
 		runtime:                             runtime,
 	}
+	contract := installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 
 	before, err := driver.attestGatewayCurrentLANRecoveryBatch(context.Background(), action)
 	if err != nil || before.BatchAbsent || !reflect.DeepEqual(before.Attestation.State, action.Before) {
@@ -206,7 +219,7 @@ func TestManagedGatewayCurrentLANRecoveryRuntimeWithdrawsWholeBatchAfterLostRelo
 		!reflect.DeepEqual(withdrawn.Attestation.LANRecovery, action.Selected.LANRecovery) ||
 		!sameCaddyConfig(runner.live, mustGatewayCurrentPhysicalConfig(t, action.Withdrawn)) ||
 		!sameCaddyConfig(runner.files[target.Identity.Rebind.ActiveConfigFilename],
-			mustGatewayCurrentPhysicalConfig(t, action.Withdrawn)) {
+			mustGatewayCurrentPhysicalConfig(t, action.Withdrawn)) || contract.calls == 0 {
 		t.Fatalf("retried whole-batch withdrawal=%#v effects=%v error=%v", withdrawn, runner.effects, err)
 	}
 	retained, err = fixture.store.load()
@@ -237,6 +250,7 @@ func TestManagedGatewayCurrentLANRecoveryRuntimeAttestsStoppedWholeBatchWithoutS
 		managerGatewayCurrentPhysicalDriver: managerGatewayCurrentPhysicalDriver{manager: fixture.manager},
 		runtime:                             runtime,
 	}
+	contract := installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 	before, err := driver.attestGatewayCurrentLANRecoveryBatch(context.Background(), action)
 	if err == nil || !reflect.DeepEqual(before, gatewayCurrentLANRecoveryPhysicalResult{}) {
 		t.Fatalf("stopped restart config with retained LAN was attested: proof=%#v error=%v", before, err)
@@ -244,7 +258,7 @@ func TestManagedGatewayCurrentLANRecoveryRuntimeAttestsStoppedWholeBatchWithoutS
 	result, err := driver.withdrawGatewayCurrentLANRecoveryBatch(context.Background(), action)
 	if err != nil || !result.BatchAbsent || result.Attestation.Outcome != gatewayCurrentPhysicalRecoveryStopped ||
 		!result.Attestation.Runtime.ListenerAbsent || !reflect.DeepEqual(result.Attestation.State, action.Withdrawn) ||
-		runner.container.Running {
+		runner.container.Running || contract.calls == 0 {
 		t.Fatalf("stopped whole-batch proof=%#v error=%v", result, err)
 	}
 	for _, effect := range runner.effects {
