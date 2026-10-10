@@ -139,6 +139,7 @@ func (m *Manager) restoreGatewayCurrentServingLocked(ctx context.Context,
 	if state.Pending != nil || (state.LANRecovery != nil && state.LANRecovery.Head != len(state.LANRecovery.Items)) {
 		return true, gatewayCurrentRouteOperationError(ctx)
 	}
+	retirementUncertain := false
 	fail := func() (bool, error) {
 		m.gatewayRebindFailStopLatch().Store(true)
 		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), v2ObservationTimeout)
@@ -151,8 +152,39 @@ func (m *Manager) restoreGatewayCurrentServingLocked(ctx context.Context,
 		if err != nil || m.stopGatewayCurrentOwnedTargetLocked(stopCtx, target) != nil {
 			return true, &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
 		}
+		if retirementUncertain {
+			return true, &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
+		}
 		return true, gatewayCurrentRouteOperationError(ctx)
 	}
+	retirementUncertain = true
+	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil {
+		return fail()
+	}
+	files, err := readGatewayHistorySnapshotMode(m.store, true)
+	if err != nil {
+		return fail()
+	}
+	withdrawalGuard := func(effectCtx context.Context) error {
+		fresh, err := repository.HostingGatewayStartupSnapshot(effectCtx)
+		selected, currentSQL, selectedCurrent, selectionErr := m.gatewayCurrentSelectedStateForRecoveryLocked(effectCtx)
+		after, historyErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		afterFiles, filesErr := readGatewayHistorySnapshotMode(m.store, true)
+		if err != nil || selectionErr != nil || historyErr != nil || filesErr != nil ||
+			!selectedCurrent || !sameGatewayCurrentSelection(selection, selected) ||
+			!reflect.DeepEqual(selectedSQL, currentSQL) || !reflect.DeepEqual(currentSQL, fresh.Rebind) ||
+			!sameGatewayRebindCurrentHistory(history, after) || !sameGatewayHistorySnapshot(files, afterFiles) ||
+			repository.CheckGatewayRebindFence(effectCtx) != nil || effectCtx.Err() != nil {
+			return gatewayCurrentRouteOperationError(effectCtx)
+		}
+		return nil
+	}
+	if withdrawalGuard(ctx) != nil || m.retireGatewayCurrentPredecessorsLocked(ctx, selection, withdrawalGuard) != nil ||
+		withdrawalGuard(ctx) != nil {
+		return fail()
+	}
+	retirementUncertain = false
 	snapshot, err := repository.HostingGatewayStartupSnapshot(ctx)
 	if err != nil || !snapshot.ActiveRebindApprovalsAuthorizeServing() || !reflect.DeepEqual(snapshot.Rebind, selectedSQL) {
 		return fail()
@@ -162,14 +194,6 @@ func (m *Manager) restoreGatewayCurrentServingLocked(ctx context.Context,
 		return fail()
 	}
 	action, err := gatewayCurrentServingRestoreActionForSelection(selection, authorizationDigest)
-	if err != nil {
-		return fail()
-	}
-	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
-	if err != nil {
-		return fail()
-	}
-	files, err := readGatewayHistorySnapshotMode(m.store, true)
 	if err != nil {
 		return fail()
 	}

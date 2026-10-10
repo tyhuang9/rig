@@ -41,13 +41,36 @@ func TestGatewayCurrentServingRestoreComposesSQLWithConcreteExecutor(t *testing.
 			runner.lostStartAck = true
 			driver := managedGatewayCurrentServingExecutorDriver(
 				gatewayCurrentStateFixture{manager: f.manager}, runner, localPort)
-			f.manager.gatewayCurrentPhysicalDriver = driver
+			contract := installGatewayRebindStrictPredecessorRetirementContract(t, f.manager, driver)
 			files, err := readGatewayHistorySnapshotMode(f.manager.store, true)
 			if err != nil {
 				t.Fatal(err)
 			}
+			var expectedRetired gatewayCurrentRouteState
+			var postRetirementAction gatewayCurrentPredecessorRetirementAction
+			if completedBatch {
+				history, err := f.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				expectedRetired, err = gatewayCurrentLANRecoveryRetiredState(*selection.State)
+				if err != nil {
+					t.Fatal(err)
+				}
+				postSelection := selection
+				postSelection.State = &expectedRetired
+				postRetirementAction, err = gatewayCurrentPredecessorRetirementActionFor(postSelection, history)
+				if err != nil || contract.expected.CurrentLineage != postRetirementAction.CurrentLineage ||
+					contract.expected.CurrentFinalID != postRetirementAction.CurrentFinalID ||
+					!reflect.DeepEqual(contract.expected.CurrentFacts, postRetirementAction.CurrentFacts) ||
+					!reflect.DeepEqual(contract.expected.Native, postRetirementAction.Native) ||
+					!reflect.DeepEqual(contract.expected.Predecessors, postRetirementAction.Predecessors) {
+					t.Fatalf("completed batch changed predecessor ownership or ancestry: %v", err)
+				}
+				contract.observedActions = []gatewayCurrentPredecessorRetirementAction{contract.expected, postRetirementAction}
+			}
 			handled, err := f.manager.RestoreGatewayCurrentServingStartup(ctx, f.repository)
-			if err != nil || !handled || !runner.container.Running || !containsGatewayCurrentPhysicalEffect(runner.effects,
+			if err != nil || !handled || !runner.container.Running || contract.retireCalls != 1 || !containsGatewayCurrentPhysicalEffect(runner.effects,
 				[]string{"container", "start", target.Resources.FinalContainer.ID}) {
 				t.Fatalf("SQL-authorized concrete restore failed: handled=%t effects=%v err=%v", handled, runner.effects, err)
 			}
@@ -62,13 +85,14 @@ func TestGatewayCurrentServingRestoreComposesSQLWithConcreteExecutor(t *testing.
 					t.Fatalf("proved running completed batch did not retire: %v", err)
 				}
 				retired, err := selection.Store.load()
-				if err != nil || retired.LANRecovery != nil || retired.Revision != installed.Revision+1 ||
-					!reflect.DeepEqual(retired.Apps, installed.Apps) {
+				if err != nil || !reflect.DeepEqual(retired, expectedRetired) || retired.LANRecovery != nil ||
+					retired.Revision != installed.Revision+1 || !reflect.DeepEqual(retired.Apps, installed.Apps) {
 					t.Fatal("retirement changed serving routes or retained the completed marker")
 				}
+				contract.expected = postRetirementAction
 				effects := len(runner.effects)
 				if handled, err := f.manager.RestoreGatewayCurrentServingStartup(ctx, f.repository); err != nil || !handled ||
-					len(runner.effects) != effects || !runner.container.Running {
+					len(runner.effects) != effects || !runner.container.Running || contract.retireCalls != 2 {
 					t.Fatalf("stable post-retirement restoration was not idempotent: effects=%v err=%v", runner.effects, err)
 				}
 			}

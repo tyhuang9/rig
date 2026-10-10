@@ -303,6 +303,9 @@ func (d managedGatewayCurrentPhysicalDriver) selectExact(ctx context.Context,
 		!reflect.DeepEqual(*selection.State, want) || m.gatewayRebindAdmissionBlocked() || ctx.Err() != nil {
 		return gatewayCurrentSelection{}, gatewayCurrentPhysicalDriverError(ctx)
 	}
+	if err := m.observeGatewayCurrentPredecessorsRetiredLocked(ctx, selection, snapshot); err != nil {
+		return gatewayCurrentSelection{}, err
+	}
 	return selection, nil
 }
 

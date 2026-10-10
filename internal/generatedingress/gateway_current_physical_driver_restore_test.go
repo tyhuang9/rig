@@ -64,10 +64,11 @@ func TestManagedGatewayCurrentServingRestoreRequiresFullAndExactAuthorityAtProof
 		managerGatewayCurrentPhysicalDriver: managerGatewayCurrentPhysicalDriver{manager: fixture.manager},
 		runtime:                             runtime,
 	}
+	contract := installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 	proof, err := driver.restoreGatewayCurrentServing(context.Background(), action,
 		func(context.Context) error { authorizationChecks++; return nil })
 	if err != nil || proof.Outcome != gatewayCurrentPhysicalStableServing || runtime.restores != 1 ||
-		runtime.observes != 1 || authorizationChecks < 4 || !reflect.DeepEqual(proof.State, action.Target) {
+		runtime.observes != 1 || authorizationChecks < 4 || !reflect.DeepEqual(proof.State, action.Target) || contract.calls == 0 {
 		t.Fatalf("lost-ack stable restore: proof=%#v restores=%d observes=%d guards=%d error=%v",
 			proof, runtime.restores, runtime.observes, authorizationChecks, err)
 	}
@@ -147,16 +148,48 @@ func TestManagedGatewayCurrentServingRestoreRequiresFullAndExactAuthorityAtProof
 	}
 }
 
+func TestManagedGatewayCurrentServingRestoreDriverRefusesPinnedPredecessorRetirementObservation(t *testing.T) {
+	_, runner, contract, selection, _ := gatewayCurrentPredecessorRetirementContractFixture(t)
+	action, err := gatewayCurrentServingRestoreActionForSelection(selection, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract.refuse = true
+	before := gatewayCurrentPhysicalExecutorDigest(t, runner)
+	if _, err := contract.restoreGatewayCurrentServing(context.Background(), action,
+		func(context.Context) error { return nil }); err == nil ||
+		contract.calls != 1 || gatewayCurrentPhysicalExecutorDigest(t, runner) != before {
+		t.Fatalf("configured retirement observation refusal reached current runtime: calls=%d effects=%v err=%v", contract.calls, runner.effects, err)
+	}
+	contract.refuse = false
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := contract.restoreGatewayCurrentServing(cancelled, action,
+		func(context.Context) error { return nil }); err == nil || contract.calls != 1 ||
+		gatewayCurrentPhysicalExecutorDigest(t, runner) != before {
+		t.Fatalf("cancelled restore reached retirement or current runtime: calls=%d effects=%v err=%v", contract.calls, runner.effects, err)
+	}
+	if err := contract.observeGatewayCurrentPredecessorsRetired(cancelled, contract.expected); err == nil || contract.calls != 2 ||
+		gatewayCurrentPhysicalExecutorDigest(t, runner) != before {
+		t.Fatalf("cancelled retirement callback was accepted: calls=%d err=%v", contract.calls, err)
+	}
+	if err := contract.observeGatewayCurrentPredecessorsRetired(nil, contract.expected); err == nil || contract.calls != 3 ||
+		gatewayCurrentPhysicalExecutorDigest(t, runner) != before {
+		t.Fatalf("nil-context retirement callback was accepted: calls=%d err=%v", contract.calls, err)
+	}
+}
+
 func TestManagedGatewayCurrentServingRestoreRuntimeAcceptsExactRunningOrStoppedOnly(t *testing.T) {
 	t.Run("exact running is idempotent", func(t *testing.T) {
 		fixture, _, action, target := managedGatewayCurrentServingStableFixture(t)
 		localPort := fixture.history.Predecessor.Journal.Source.LocalHostPort
 		runner := newGatewayCurrentPhysicalExecutor(t, target, action.Target, action.Target, localPort)
 		driver := managedGatewayCurrentServingExecutorDriver(fixture, runner, localPort)
+		contract := installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 		proof, err := driver.restoreGatewayCurrentServing(context.Background(), action,
 			func(context.Context) error { return nil })
 		if err != nil || proof.Outcome != gatewayCurrentPhysicalStableServing || len(runner.effects) != 0 ||
-			!reflect.DeepEqual(proof.State, action.Target) {
+			!reflect.DeepEqual(proof.State, action.Target) || contract.calls == 0 {
 			t.Fatalf("idempotent running restore: proof=%#v effects=%v error=%v", proof, runner.effects, err)
 		}
 	})
@@ -179,6 +212,7 @@ func TestManagedGatewayCurrentServingRestoreRuntimeAcceptsExactRunningOrStoppedO
 		runner := newGatewayCurrentPhysicalExecutor(t, target, transition.Effective,
 			transition.Effective, localPort)
 		driver := managedGatewayCurrentServingExecutorDriver(fixture, runner, localPort)
+		installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 		if _, err := driver.restoreGatewayCurrentServing(context.Background(), action,
 			func(context.Context) error { return nil }); err == nil || len(runner.effects) != 0 {
 			t.Fatalf("inexact running topology reached effects: effects=%v error=%v", runner.effects, err)
@@ -192,11 +226,12 @@ func TestManagedGatewayCurrentServingRestoreRuntimeAcceptsExactRunningOrStoppedO
 		runner.stopAt(mustGatewayCurrentPhysicalConfig(t, action.Target))
 		runner.lostStartAck = true
 		driver := managedGatewayCurrentServingExecutorDriver(fixture, runner, localPort)
+		contract := installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 		proof, err := driver.restoreGatewayCurrentServing(context.Background(), action,
 			func(context.Context) error { return nil })
 		start := []string{"container", "start", target.Resources.FinalContainer.ID}
 		if err != nil || proof.Outcome != gatewayCurrentPhysicalStableServing || !runner.container.Running ||
-			!containsGatewayCurrentPhysicalEffect(runner.effects, start) {
+			!containsGatewayCurrentPhysicalEffect(runner.effects, start) || contract.calls == 0 {
 			t.Fatalf("stopped lost-ack restore: proof=%#v effects=%v error=%v", proof, runner.effects, err)
 		}
 	})
@@ -210,6 +245,7 @@ func TestManagedGatewayCurrentServingRestoreRuntimeCompletedBatchStartsOnlyUnder
 		runner.stopAt(mustGatewayCurrentPhysicalConfig(t, action.Target))
 		runner.lostStartAck = true
 		driver := managedGatewayCurrentServingExecutorDriver(fixture, runner, localPort)
+		contract := installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 		guardsByEffects := make(map[int]int)
 		proof, err := driver.restoreGatewayCurrentServing(context.Background(), action,
 			func(context.Context) error { guardsByEffects[len(runner.effects)]++; return nil })
@@ -219,7 +255,7 @@ func TestManagedGatewayCurrentServingRestoreRuntimeCompletedBatchStartsOnlyUnder
 			!sameCaddyConfig(runner.files[target.Identity.Rebind.ActiveConfigFilename],
 				mustGatewayCurrentPhysicalConfig(t, action.Target)) ||
 			!containsGatewayCurrentPhysicalEffect(runner.effects, start) ||
-			guardsByEffects[0] < 4 || guardsByEffects[len(runner.effects)] < 2 {
+			guardsByEffects[0] < 4 || guardsByEffects[len(runner.effects)] < 2 || contract.calls == 0 {
 			t.Fatalf("completed-batch restore: proof=%#v effects=%v guards=%v error=%v",
 				proof, runner.effects, guardsByEffects, err)
 		}
@@ -231,6 +267,7 @@ func TestManagedGatewayCurrentServingRestoreRuntimeCompletedBatchStartsOnlyUnder
 		runner := newGatewayCurrentPhysicalExecutor(t, target, action.Target, action.Target, localPort)
 		runner.stopAt(mustGatewayCurrentPhysicalConfig(t, action.Target))
 		driver := managedGatewayCurrentServingExecutorDriver(fixture, runner, localPort)
+		installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 		checks := 0
 		authorize := func(context.Context) error {
 			checks++
@@ -252,6 +289,7 @@ func TestManagedGatewayCurrentServingRestoreRuntimeCompletedBatchStartsOnlyUnder
 		runner := newGatewayCurrentPhysicalExecutor(t, target, action.Target, action.Target, localPort)
 		runner.stopAt(mustGatewayCurrentPhysicalConfig(t, action.Target))
 		driver := managedGatewayCurrentServingExecutorDriver(fixture, runner, localPort)
+		installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 		authorize := func(context.Context) error {
 			if runner.container.Running {
 				return errors.New("authorization changed after start")
@@ -273,8 +311,9 @@ func TestManagedGatewayCurrentServingRestoreRuntimeRechecksAuthorityAfterFinalSt
 		runner := newGatewayCurrentPhysicalExecutor(t, target, action.Target, action.Target, localPort)
 		runner.stopAt(mustGatewayCurrentPhysicalConfig(t, action.Target))
 		driver := managedGatewayCurrentServingExecutorDriver(fixture, runner, localPort)
+		contract := installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 		if _, err := driver.restoreGatewayCurrentServing(context.Background(), action,
-			func(context.Context) error { return nil }); err != nil || !runner.container.Running {
+			func(context.Context) error { return nil }); err != nil || !runner.container.Running || contract.calls == 0 {
 			t.Fatalf("positive stopped restore: effects=%v error=%v", runner.effects, err)
 		}
 	})
@@ -288,6 +327,7 @@ func TestManagedGatewayCurrentServingRestoreRuntimeRechecksAuthorityAfterFinalSt
 		runner := &gatewayCurrentServingLateInventoryExecutor{gatewayCurrentPhysicalExecutor: base,
 			authorized: &authorized, armed: &arm}
 		driver := managedGatewayCurrentServingExecutorDriver(fixture, base, localPort)
+		installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 		fixture.manager.runner = runner
 		checks := 0
 		authorize := func(context.Context) error {

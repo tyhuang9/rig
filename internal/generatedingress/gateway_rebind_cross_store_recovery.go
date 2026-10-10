@@ -616,10 +616,38 @@ func (m *Manager) recoverGatewayRebindCommittedCurrentLocked(ctx context.Context
 	}
 	defer func() {
 		if resultErr != nil && selection.Kind == gatewayCurrentSelectionRebind {
-			resultErr = errors.Join(m.withdrawGatewayRebindTerminalCurrentLocked(ctx, selection), resultErr)
+			resultErr = gatewayCurrentPredecessorRetirementFailure(resultErr,
+				m.withdrawGatewayRebindTerminalCurrentLocked(ctx, selection))
 			recovered = GatewayRebindStartupRecoveryResult{}
 		}
 	}()
+	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil {
+		return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
+	}
+	files, err := readGatewayHistorySnapshotMode(m.store, true)
+	if err != nil {
+		return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
+	}
+	guard := func(effectCtx context.Context) error {
+		fresh, snapshotErr := repository.GatewayRebindRecoverySnapshot(effectCtx)
+		freshHistory, historyErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		freshFiles, filesErr := readGatewayHistorySnapshotMode(m.store, true)
+		freshSelection, selectionErr := m.selectGatewayCurrentLocked(effectCtx, fresh)
+		if snapshotErr != nil || !reflect.DeepEqual(snapshot, fresh) || historyErr != nil ||
+			!sameGatewayRebindCurrentHistory(history, freshHistory) || filesErr != nil ||
+			!sameGatewayHistorySnapshot(files, freshFiles) || selectionErr != nil ||
+			!sameGatewayCurrentSelection(selection, freshSelection) || repository.CheckGatewayRebindFence(effectCtx) != nil ||
+			effectCtx.Err() != nil {
+			return gatewayRebindProposalError(effectCtx)
+		}
+		return nil
+	}
+	if selection.Kind == gatewayCurrentSelectionRebind {
+		if err := m.retireGatewayCurrentPredecessorsLocked(ctx, selection, guard); err != nil {
+			return GatewayRebindStartupRecoveryResult{}, &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
+		}
+	}
 	var attestation string
 	if selection.Kind == gatewayCurrentSelectionRebind {
 		attestation, err = driver.attestCommittedCurrentLocked(ctx, selection)

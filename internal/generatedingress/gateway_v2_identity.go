@@ -961,20 +961,8 @@ func gatewayV2ExpectedHostname(state gatewayV2RouteState, role string) string {
 }
 
 func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigrationJournal, value caddyInspection, runtime gatewayContainerRuntime, found bool, role, imageID string, running, allowStoppedRestarts bool) bool {
-	name, configFilename, restart := state.Identity.StageContainer, state.Identity.StageConfigFilename, gatewayV2StageRestartPolicy
-	if role == gatewayV2FinalContainerRole {
-		name, configFilename, restart = state.Identity.FinalContainer, state.Identity.ActiveConfigFilename, gatewayV2FinalRestartPolicy
-	}
-	if !found || value.Running != running || value.Restarting || !validGatewayContainerRuntime(runtime, !running && allowStoppedRestarts) || !validContainerID(value.ID) || normalizeID(value.Image) != normalizeID(imageID) ||
-		strings.TrimPrefix(value.Name, "/") != name || value.Hostname != gatewayV2ExpectedHostname(state, role) || value.User != "1000:1000" || value.NetworkMode != state.Identity.IngressNetwork ||
-		!exactGatewayV2Environment(value.Env) || !value.ReadOnly || value.Privileged || !onlyCaddyCapability(value.CapAdd) || !exactFoldSet(value.CapDrop, "ALL") ||
-		!onlyNoNewPrivileges(value.SecurityOpt) || len(value.Binds) != 0 || len(value.Tmpfs) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 ||
-		value.NanoCPUs != 1_000_000_000 || value.PIDsLimit != 128 || value.LogType != "local" || len(value.LogConfig) != 2 ||
-		value.LogConfig["max-size"] != "10m" || value.LogConfig["max-file"] != "3" || value.Restart != restart ||
-		len(value.Entrypoint) != 1 || value.Entrypoint[0] != caddyExecutable || len(value.Cmd) != 3 || value.Cmd[0] != "run" || value.Cmd[1] != "--config" ||
-		value.Cmd[2] != "/config/"+configFilename || len(value.Ulimits) != 1 || value.Ulimits[0] != (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}) ||
-		!validGatewayV2ContainerLabels(value.Labels, gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true)) ||
-		!validGatewayV2Mounts(value.Mounts, state.Identity) || !validGatewayV2PortBindings(value.PortBindings, state, journal, role) ||
+	if !validGatewayV2ContainerStatic(state, journal, value, found, role, imageID) || value.Running != running ||
+		value.Restarting || !validGatewayContainerRuntime(runtime, !running && allowStoppedRestarts) ||
 		(running && !gatewayV2EffectivePortBindingsMatchConfigured(runtime.EffectivePortBindings, value.PortBindings)) ||
 		(!running && gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings)) {
 		return false
@@ -1004,6 +992,28 @@ func validGatewayV2ContainerState(state gatewayV2RouteState, journal gatewayMigr
 		if name == state.Identity.IngressNetwork && attachment.IPAddress != state.Network.ContainerIPv4 {
 			return false
 		}
+	}
+	return true
+}
+
+func validGatewayV2ContainerStatic(state gatewayV2RouteState, journal gatewayMigrationJournal,
+	value caddyInspection, found bool, role, imageID string,
+) bool {
+	name, configFilename, restart := state.Identity.StageContainer, state.Identity.StageConfigFilename, gatewayV2StageRestartPolicy
+	if role == gatewayV2FinalContainerRole {
+		name, configFilename, restart = state.Identity.FinalContainer, state.Identity.ActiveConfigFilename, gatewayV2FinalRestartPolicy
+	}
+	if !found || !validContainerID(value.ID) || normalizeID(value.Image) != normalizeID(imageID) ||
+		strings.TrimPrefix(value.Name, "/") != name || value.Hostname != gatewayV2ExpectedHostname(state, role) || value.User != "1000:1000" || value.NetworkMode != state.Identity.IngressNetwork ||
+		!exactGatewayV2Environment(value.Env) || !value.ReadOnly || value.Privileged || !onlyCaddyCapability(value.CapAdd) || !exactFoldSet(value.CapDrop, "ALL") ||
+		!onlyNoNewPrivileges(value.SecurityOpt) || len(value.Binds) != 0 || len(value.Tmpfs) != 0 || value.Memory != 268435456 || value.MemorySwap != 268435456 ||
+		value.NanoCPUs != 1_000_000_000 || value.PIDsLimit != 128 || value.LogType != "local" || len(value.LogConfig) != 2 ||
+		value.LogConfig["max-size"] != "10m" || value.LogConfig["max-file"] != "3" || value.Restart != restart ||
+		len(value.Entrypoint) != 1 || value.Entrypoint[0] != caddyExecutable || len(value.Cmd) != 3 || value.Cmd[0] != "run" || value.Cmd[1] != "--config" ||
+		value.Cmd[2] != "/config/"+configFilename || len(value.Ulimits) != 1 || value.Ulimits[0] != (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}) ||
+		!validGatewayV2ContainerLabels(value.Labels, gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, role, true)) ||
+		!validGatewayV2Mounts(value.Mounts, state.Identity) || !validGatewayV2PortBindings(value.PortBindings, state, journal, role) {
+		return false
 	}
 	return true
 }

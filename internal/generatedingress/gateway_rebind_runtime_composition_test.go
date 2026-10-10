@@ -954,7 +954,7 @@ func TestGatewayRebindConcreteCompositionCommitsAndReplaysSameDockerState(t *tes
 		driver.install(fresh)
 		_, err := fresh.RecoverGatewayRebindStartup(ctx, f.repository)
 		var diagnostic *Error
-		if err == nil || !errors.As(err, &diagnostic) || diagnostic.candidateMayBeLive || !fresh.gatewayRebindAdmissionBlocked() ||
+		if err == nil || !errors.As(err, &diagnostic) || !diagnostic.candidateMayBeLive || !fresh.gatewayRebindAdmissionBlocked() ||
 			r.final.Running || r.predecessor.FinalContainer.Running || !r.finalPresent || len(r.effects) != effects+1 ||
 			!reflect.DeepEqual(r.effects[effects], []string{"container", "stop", "--time", "10", r.finalID}) {
 			t.Fatalf("terminal corruption failed exact withdrawal: err=%v effects=%v", err, r.effects[effects:])

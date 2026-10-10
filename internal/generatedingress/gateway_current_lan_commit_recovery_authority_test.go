@@ -51,6 +51,17 @@ func TestGatewayCurrentLANCommitRecoveryWithdrawsAfterAuthorityLoss(t *testing.T
 	}
 }
 
+func TestGatewayCurrentLANCommitRecoveryRejectsMismatchedPredecessorRetirementObservation(t *testing.T) {
+	_, runner, contract, _, _ := gatewayCurrentPredecessorRetirementContractFixture(t)
+	mismatched := contract.expected
+	mismatched.CurrentFinalID = "mismatched-current-final"
+	before := gatewayCurrentPhysicalExecutorDigest(t, runner)
+	if err := contract.observeGatewayCurrentPredecessorsRetired(context.Background(), mismatched); err == nil ||
+		contract.calls != 1 || gatewayCurrentPhysicalExecutorDigest(t, runner) != before {
+		t.Fatalf("mismatched retirement action reached current runtime: calls=%d effects=%v err=%v", contract.calls, runner.effects, err)
+	}
+}
+
 // Model a guarded adapter explicitly; unguarded adapters remain unavailable for
 // serving recovery. The production adapter's inner effect boundary is tested below.
 func (d *gatewayCurrentStateMachineDriver) applyGatewayCurrentPhysicalAuthorized(ctx context.Context,
@@ -218,13 +229,14 @@ func TestManagedGatewayCurrentLANCommitRecoveryPhysicalAuthority(t *testing.T) {
 					return nil
 				}
 				driver := managedGatewayCurrentPhysicalDriver{managerGatewayCurrentPhysicalDriver: managerGatewayCurrentPhysicalDriver{manager: fixture.manager}, runtime: runtime}
+				contract := installGatewayCurrentPredecessorRetirementContract(t, fixture.manager, driver)
 				var err error
 				if operation == "apply" {
 					_, err = driver.applyGatewayCurrentPhysicalAuthorized(context.Background(), transition, authorize)
 				} else {
 					_, err = driver.restoreGatewayCurrentPhysicalAuthorized(context.Background(), transition, authorize)
 				}
-				if err == nil || checks == 0 {
+				if err == nil || checks == 0 || contract.calls == 0 {
 					t.Fatalf("managed driver accepted revoked authority at %s: checks=%d err=%v", boundary, checks, err)
 				}
 				if (boundary == "before_effect" || boundary == "already_exact") && effects != 0 {
