@@ -192,8 +192,11 @@ jobs:
         suite:
           - gateway-v2
           - rebind-history
+          - rebind-current
           - rebind-config
           - rebind-resources
+          - rebind-handover
+          - rebind-handover-rollback
           - rebind-typed-withdrawal
           - rebind-typed-completed
           - rebind-typed-runtime
@@ -201,6 +204,8 @@ jobs:
           - rebind-composition-second-generation
           - rebind-composition-legacy-source
           - current-lan
+          - current-lan-recovery
+          - current-runtime
           - current-serving
           - ingress-remainder
     steps:

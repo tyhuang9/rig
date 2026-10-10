@@ -3,7 +3,6 @@ package generatedingress
 import (
 	"context"
 	"errors"
-	"reflect"
 	"strings"
 )
 
@@ -25,15 +24,9 @@ func newManagerGatewayRebindFinalHandoverDriver(m *Manager, reads gatewayRebindS
 func (d managerGatewayRebindFinalHandoverDriver) observeHandover(ctx context.Context,
 	value gatewayRebindFinalHandoverContext,
 ) (gatewayRebindFinalHandoverObservation, error) {
-	first, err := d.readHandover(ctx, value)
-	if err != nil {
-		return gatewayRebindFinalHandoverObservation{}, err
-	}
-	second, err := d.readHandover(ctx, value)
-	if err != nil || !reflect.DeepEqual(first, second) || ctx.Err() != nil {
-		return gatewayRebindFinalHandoverObservation{}, gatewayRebindEffectBoundaryError(ctx)
-	}
-	return second, nil
+	return observeGatewayRebindHandoverStable(ctx, func() (gatewayRebindFinalHandoverObservation, error) {
+		return d.readHandover(ctx, value)
+	})
 }
 
 func (d managerGatewayRebindFinalHandoverDriver) createFinal(ctx context.Context,

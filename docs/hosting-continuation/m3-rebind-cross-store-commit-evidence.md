@@ -2926,8 +2926,14 @@ change; broader M3 and production acceptance remain open.
 
 ### Limits and remaining work
 
-A fresh local `docker info --format '{{.OSType}} {{.ServerVersion}}'` failed
-because `npipe:////./pipe/dockerDesktopLinuxEngine` was unavailable. No live
+A fresh local probe failed because
+`npipe:////./pipe/dockerDesktopLinuxEngine` was unavailable:
+
+```sh
+docker info --format '{{.OSType}} {{.ServerVersion}}'
+```
+
+No live
 Docker, Linux race, frontend build, or full repository test-suite pass is claimed.
 Serving checks occur at coordinator/runtime boundaries; this does not claim
 transaction-atomic role revocation against concurrent SQL updates.

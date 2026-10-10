@@ -19,34 +19,149 @@ type gatewayRebindHandoverPhysical struct {
 	Applications map[string]caddyNetworkInspection
 }
 
+type gatewayRebindHandoverDiagnosticStage uint8
+
+const (
+	gatewayRebindHandoverDiagnosticUnknown gatewayRebindHandoverDiagnosticStage = iota
+	gatewayRebindHandoverDiagnosticInput
+	gatewayRebindHandoverDiagnosticStageInventory
+	gatewayRebindHandoverDiagnosticFinalInventory
+	gatewayRebindHandoverDiagnosticPredecessor
+	gatewayRebindHandoverDiagnosticStageRuntime
+	gatewayRebindHandoverDiagnosticFinalRuntime
+	gatewayRebindHandoverDiagnosticResources
+	gatewayRebindHandoverDiagnosticHost
+	gatewayRebindHandoverDiagnosticApplicationCensus
+	gatewayRebindHandoverDiagnosticPredecessorDigest
+	gatewayRebindHandoverDiagnosticConfigPair
+	gatewayRebindHandoverDiagnosticStagePublication
+	gatewayRebindHandoverDiagnosticWithdrawal
+	gatewayRebindHandoverDiagnosticFinalObservation
+	gatewayRebindHandoverDiagnosticStableRead
+)
+
+func (s gatewayRebindHandoverDiagnosticStage) String() string {
+	switch s {
+	case gatewayRebindHandoverDiagnosticInput:
+		return "input"
+	case gatewayRebindHandoverDiagnosticStageInventory:
+		return "stage_inventory"
+	case gatewayRebindHandoverDiagnosticFinalInventory:
+		return "final_inventory"
+	case gatewayRebindHandoverDiagnosticPredecessor:
+		return "predecessor"
+	case gatewayRebindHandoverDiagnosticStageRuntime:
+		return "stage_runtime"
+	case gatewayRebindHandoverDiagnosticFinalRuntime:
+		return "final_runtime"
+	case gatewayRebindHandoverDiagnosticResources:
+		return "resources"
+	case gatewayRebindHandoverDiagnosticHost:
+		return "host"
+	case gatewayRebindHandoverDiagnosticApplicationCensus:
+		return "application_census"
+	case gatewayRebindHandoverDiagnosticPredecessorDigest:
+		return "predecessor_digest"
+	case gatewayRebindHandoverDiagnosticConfigPair:
+		return "config_pair"
+	case gatewayRebindHandoverDiagnosticStagePublication:
+		return "stage_publication"
+	case gatewayRebindHandoverDiagnosticWithdrawal:
+		return "withdrawal"
+	case gatewayRebindHandoverDiagnosticFinalObservation:
+		return "final_observation"
+	case gatewayRebindHandoverDiagnosticStableRead:
+		return "stable_read"
+	default:
+		return ""
+	}
+}
+
+type gatewayRebindHandoverDiagnosticError struct {
+	stage gatewayRebindHandoverDiagnosticStage
+	cause error
+}
+
+func newGatewayRebindHandoverDiagnosticError(ctx context.Context, stage gatewayRebindHandoverDiagnosticStage) error {
+	return &gatewayRebindHandoverDiagnosticError{stage: stage, cause: gatewayRebindEffectBoundaryError(ctx)}
+}
+
+func (e *gatewayRebindHandoverDiagnosticError) Error() string { return e.cause.Error() }
+func (e *gatewayRebindHandoverDiagnosticError) Unwrap() error { return e.cause }
+func (e *gatewayRebindHandoverDiagnosticError) handoverDiagnosticStage() string {
+	if e == nil {
+		return ""
+	}
+	return e.stage.String()
+}
+
+func gatewayRebindHandoverDiagnosticStageFrom(err error) (gatewayRebindHandoverDiagnosticStage, bool) {
+	var diagnostic *gatewayRebindHandoverDiagnosticError
+	if !errors.As(err, &diagnostic) || diagnostic == nil || diagnostic.stage.String() == "" {
+		return gatewayRebindHandoverDiagnosticUnknown, false
+	}
+	return diagnostic.stage, true
+}
+
+func gatewayRebindHandoverSecondReadError(ctx context.Context, err error) error {
+	if stage, ok := gatewayRebindHandoverDiagnosticStageFrom(err); ok {
+		return newGatewayRebindHandoverDiagnosticError(ctx, stage)
+	}
+	return gatewayRebindEffectBoundaryError(ctx)
+}
+
+func gatewayRebindHandoverStableReadError(ctx context.Context, first, second gatewayRebindFinalHandoverObservation) error {
+	if reflect.DeepEqual(first, second) && ctx != nil && ctx.Err() == nil {
+		return nil
+	}
+	return newGatewayRebindHandoverDiagnosticError(ctx, gatewayRebindHandoverDiagnosticStableRead)
+}
+
+func observeGatewayRebindHandoverStable(ctx context.Context,
+	read func() (gatewayRebindFinalHandoverObservation, error),
+) (gatewayRebindFinalHandoverObservation, error) {
+	first, err := read()
+	if err != nil {
+		return gatewayRebindFinalHandoverObservation{}, err
+	}
+	second, err := read()
+	if err != nil {
+		return gatewayRebindFinalHandoverObservation{}, gatewayRebindHandoverSecondReadError(ctx, err)
+	}
+	if err := gatewayRebindHandoverStableReadError(ctx, first, second); err != nil {
+		return gatewayRebindFinalHandoverObservation{}, err
+	}
+	return second, nil
+}
+
 func (d managerGatewayRebindFinalHandoverDriver) readHandover(ctx context.Context,
 	value gatewayRebindFinalHandoverContext,
 ) (gatewayRebindFinalHandoverObservation, error) {
-	invalid := func() (gatewayRebindFinalHandoverObservation, error) {
-		return gatewayRebindFinalHandoverObservation{}, gatewayRebindEffectBoundaryError(ctx)
+	invalid := func(stage gatewayRebindHandoverDiagnosticStage) (gatewayRebindFinalHandoverObservation, error) {
+		return gatewayRebindFinalHandoverObservation{}, newGatewayRebindHandoverDiagnosticError(ctx, stage)
 	}
 	if d.manager == nil || ctx == nil || ctx.Err() != nil || d.inspectDocker == nil ||
 		d.reads.network.candidates == nil || d.reads.network.host == nil || d.reads.network.docker == nil || d.reads.dockerIDs == nil ||
 		!validGatewayRebindFinalHandoverBase(value) || (value.Plan != nil && !validGatewayRebindFinalHandoverPlan(value, *value.Plan)) ||
 		(value.Final != nil && !validGatewayRebindFinalContainerBinding(value, *value.Final)) {
-		return invalid()
+		return invalid(gatewayRebindHandoverDiagnosticInput)
 	}
 	physical := gatewayRebindHandoverPhysical{}
 	var err error
 	physical.Stage, err = d.inspect(ctx, value.Intent)
 	if err != nil {
-		return invalid()
+		return invalid(gatewayRebindHandoverDiagnosticStageInventory)
 	}
 	var finalFound bool
 	physical.Final, physical.FinalRuntime, finalFound, err = d.manager.inspectNamedGatewayContainer(ctx, value.Intent.Intent.Identity.FinalContainer)
 	if err != nil || finalFound != physical.Stage.FinalContainerFound || (finalFound && physical.Stage.StageContainerFound) {
-		return invalid()
+		return invalid(gatewayRebindHandoverDiagnosticFinalInventory)
 	}
 	physical.Predecessor, err = d.inspectDocker(ctx, value.Source, value.Predecessor.State, value.Predecessor.Journal)
 	defer clearGatewayV2DockerObservation(&physical.Predecessor)
 	if err != nil || !validGatewayRebindPredecessorDocker(value.Source, value.Predecessor.State, value.Predecessor.Journal, physical.Predecessor) ||
 		normalizeID(physical.Predecessor.Image.ID) != value.SequenceTwelve.Stage.ObservedDockerImageID {
-		return invalid()
+		return invalid(gatewayRebindHandoverDiagnosticPredecessor)
 	}
 	proof := gatewayRebindFinalHandoverObservation{
 		Stage: gatewayRebindHandoverContainerAbsent, Final: gatewayRebindHandoverContainerAbsent,
@@ -60,41 +175,41 @@ func (d managerGatewayRebindFinalHandoverDriver) readHandover(ctx context.Contex
 			proof.Stage = gatewayRebindHandoverContainerStopped
 		case gatewayRebindStageRuntimeServing:
 			if physical.Stage.StageRuntime.ConfiguredNetworks[value.Intent.Intent.Identity.IngressNetwork].EndpointID != value.SequenceTwelve.Stage.StageServing.EndpointID {
-				return invalid()
+				return invalid(gatewayRebindHandoverDiagnosticStageRuntime)
 			}
 			proof.Stage = gatewayRebindHandoverContainerRunning
 		default:
-			return invalid()
+			return invalid(gatewayRebindHandoverDiagnosticStageRuntime)
 		}
 	}
 	if finalFound {
 		id := value.CreatedFinalID
 		if value.Final != nil {
 			if id != "" {
-				return invalid()
+				return invalid(gatewayRebindHandoverDiagnosticFinalRuntime)
 			}
 			id = value.Final.ID
 		}
 		if !validGatewayRebindFinalHandoverContainer(value, physical.Final, physical.FinalRuntime, id) {
-			return invalid()
+			return invalid(gatewayRebindHandoverDiagnosticFinalRuntime)
 		}
 		proof.Final, proof.FinalID = gatewayRebindHandoverContainerStopped, id
 		if physical.Final.Running {
 			proof.Final = gatewayRebindHandoverContainerRunning
 		}
 	} else if value.CreatedFinalID != "" {
-		return invalid()
+		return invalid(gatewayRebindHandoverDiagnosticFinalRuntime)
 	}
 	if !validGatewayRebindHandoverResources(value, physical, proof) || !d.handoverVolumeUsersExact(ctx, value, proof) {
-		return invalid()
+		return invalid(gatewayRebindHandoverDiagnosticResources)
 	}
 	proof.HostDigest, proof.PredecessorAddress, err = d.handoverHostProof(ctx, value, proof.IngressNetworkPresent)
 	if err != nil {
-		return invalid()
+		return invalid(gatewayRebindHandoverDiagnosticHost)
 	}
 	proof.ApplicationNetworks, physical.Applications, proof.ApplicationEndpointsDigest, err = d.handoverApplicationProof(ctx, value, physical, proof)
 	if err != nil || (value.Plan != nil && !reflect.DeepEqual(proof.ApplicationNetworks, value.Plan.ApplicationNetworks)) {
-		return invalid()
+		return invalid(gatewayRebindHandoverDiagnosticApplicationCensus)
 	}
 	// Membership is validated against the complete immutable joint roster above.
 	// Exclude only the proved successor from the predecessor's dynamic census.
@@ -103,7 +218,7 @@ func (d managerGatewayRebindFinalHandoverDriver) readHandover(ctx context.Contex
 	predecessor.V1ApplicationNetworks = gatewayRebindWithoutFinalMember(predecessor.V1ApplicationNetworks, proof.FinalID)
 	proof.PredecessorObservationDigest, err = gatewayRebindPredecessorDockerDigest(predecessor, value.Predecessor.State.Identity)
 	if err != nil {
-		return invalid()
+		return invalid(gatewayRebindHandoverDiagnosticPredecessorDigest)
 	}
 	if !proof.PredecessorRunning {
 		proof.PredecessorStopDigest = proof.PredecessorObservationDigest
@@ -117,7 +232,7 @@ func (d managerGatewayRebindFinalHandoverDriver) readHandover(ctx context.Contex
 	}
 	if containerID != "" {
 		if !d.handoverConfigPair(ctx, value, containerID, proof.Final == gatewayRebindHandoverContainerRunning) {
-			return invalid()
+			return invalid(gatewayRebindHandoverDiagnosticConfigPair)
 		}
 		proof.ConfigDigest = value.SequenceTwelve.Stage.FinalConfigIntent.ContentDigest
 	}
@@ -128,11 +243,11 @@ func (d managerGatewayRebindFinalHandoverDriver) readHandover(ctx context.Contex
 		clear(body)
 		clear(live)
 		if !valid || !proveGatewayRebindStagePublication(ctx, *value.SequenceTwelve.Stage.StageStartIntent, containerID, d.hostProbe, d.containerProbe) {
-			return invalid()
+			return invalid(gatewayRebindHandoverDiagnosticStagePublication)
 		}
 	}
 	if !d.proveHandoverWithdrawnBindings(ctx, value, proof) {
-		return invalid()
+		return invalid(gatewayRebindHandoverDiagnosticWithdrawal)
 	}
 	if proof.Final == gatewayRebindHandoverContainerRunning && d.proveHandoverFinalRoutes(ctx, value, proof.FinalID) {
 		proof.RoutesDigest = value.Plan.RoutePlanDigest
@@ -144,7 +259,7 @@ func (d managerGatewayRebindFinalHandoverDriver) readHandover(ctx context.Contex
 		proveGatewayV2FinalLoopbackRoutes(ctx, value.Predecessor.State, value.Predecessor.Journal, d.hostProbe) {
 		proof.PredecessorRoutesDigest, err = canonicalDigest(value.Predecessor.State.Apps)
 		if err != nil {
-			return invalid()
+			return invalid(gatewayRebindHandoverDiagnosticPredecessorDigest)
 		}
 	}
 	// Normalize only a separately validated unordered mount set. Retain every
@@ -154,11 +269,11 @@ func (d managerGatewayRebindFinalHandoverDriver) readHandover(ctx context.Contex
 	physical.Predecessor.FinalContainer.Mounts = nil
 	proof.InventoryDigest, err = canonicalDigest(physical)
 	if err != nil {
-		return invalid()
+		return invalid(gatewayRebindHandoverDiagnosticFinalObservation)
 	}
 	proof.Digest, err = gatewayRebindFinalHandoverObservationDigest(proof)
 	if err != nil || !validGatewayRebindFinalHandoverObservationValue(proof) || ctx.Err() != nil {
-		return invalid()
+		return invalid(gatewayRebindHandoverDiagnosticFinalObservation)
 	}
 	return proof, nil
 }

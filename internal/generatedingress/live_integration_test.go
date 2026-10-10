@@ -27,6 +27,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -49,6 +51,20 @@ type liveCapacitySource struct{}
 
 func (liveCapacitySource) Snapshot(context.Context) (generatedruntime.CapacitySnapshot, error) {
 	return generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 8 << 30}, nil
+}
+
+func liveGatewayAccessRepository(t *testing.T, dataRoot string) *appaccess.Repository {
+	t.Helper()
+	db, err := database.Open(dataRoot)
+	if err != nil {
+		t.Fatal("open live gateway controller database")
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error("close live gateway controller database")
+		}
+	})
+	return appaccess.New(db)
 }
 
 func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
@@ -108,11 +124,13 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal("create generated runtime")
 	}
+	accessRepository := liveGatewayAccessRepository(t, state)
 	ingress, err := New(runner, Options{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		DataRoot: state, HostPort: hostPort, CommandTimeout: 45 * time.Second, PullTimeout: 5 * time.Minute,
-		OutputLimit:      liveDockerOutputLimit,
-		RebindFenceCheck: func(context.Context) error { return nil },
+		OutputLimit:                  liveDockerOutputLimit,
+		RebindFenceCheck:             accessRepository.CheckGatewayRebindFence,
+		RebindCurrentStateRepository: accessRepository,
 	})
 	if err != nil {
 		t.Fatal("create generated ingress")
