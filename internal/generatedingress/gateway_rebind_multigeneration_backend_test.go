@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -101,6 +102,12 @@ func installGatewayRebindMultiNetworkObserver(t *testing.T, m *Manager, backend 
 	t.Helper()
 	observe := m.gatewayRebindV2NetworkObserver
 	m.gatewayRebindV2NetworkObserver = func(ctx context.Context, claim appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error) {
+		if ctx == nil {
+			return gatewayRebindSuccessorNetworkObservation{}, errors.New("invalid multi-generation host census")
+		}
+		if err := ctx.Err(); err != nil {
+			return gatewayRebindSuccessorNetworkObservation{}, err
+		}
 		value, err := observe(ctx, claim)
 		if err != nil {
 			return value, err
@@ -131,6 +138,12 @@ func installGatewayRebindMultiNetworkObserver(t *testing.T, m *Manager, backend 
 		}
 		sort.Slice(value.Candidates, func(i, j int) bool { return gatewayRebindCandidateLess(value.Candidates[i], value.Candidates[j]) })
 		sort.Strings(value.HostInterfaces)
+		// Retirement has no admitted claim to bind to a new network plan. Its
+		// caller only needs the fixture's already-arranged host candidate census.
+		// Keep every nonempty claim on the normal claim-bound planner below.
+		if reflect.DeepEqual(claim, appaccess.GatewayRebindClaimV2{}) {
+			return value, nil
+		}
 		var candidates []hostNetworkCandidate
 		for _, candidate := range value.Candidates {
 			candidates = append(candidates, hostNetworkCandidate{InterfaceID: candidate.InterfaceID,
@@ -295,6 +308,7 @@ func (r *gatewayRebindMultiRunner) resources() []gatewayRebindMultiResource {
 	resources := []gatewayRebindMultiResource{
 		{kind: "container", name: caddyContainerName, id: normalizeID(n.predecessor.V1Container.ID), labels: n.predecessor.V1Container.Labels, entry: n, native: true, present: n.predecessor.V1ContainerFound},
 		{kind: "container", name: n.predecessorState.Identity.FinalContainer, id: normalizeID(n.predecessor.FinalContainer.ID), labels: n.predecessor.FinalContainer.Labels, entry: n, native: true, present: n.predecessor.FinalContainerFound},
+		{kind: "container", name: n.predecessorState.Identity.StageContainer, id: normalizeID(n.predecessor.StageContainer.ID), labels: n.predecessor.StageContainer.Labels, entry: n, native: true, present: n.predecessor.StageContainerFound},
 		{kind: "volume", name: caddyVolumeName, id: caddyVolumeName, labels: n.predecessor.V1Volume.Labels, entry: n, native: true, present: n.predecessor.V1VolumeFound},
 		{kind: "volume", name: n.predecessorState.Identity.ConfigVolume, id: n.predecessorState.Identity.ConfigVolume, labels: n.predecessor.ConfigVolume.Labels, entry: n, native: true, present: n.predecessor.ConfigVolumeFound},
 		{kind: "volume", name: n.predecessorState.Identity.DataVolume, id: n.predecessorState.Identity.DataVolume, labels: n.predecessor.DataVolume.Labels, entry: n, native: true, present: n.predecessor.DataVolumeFound},
@@ -376,6 +390,13 @@ func (r *gatewayRebindMultiRunner) Run(ctx context.Context, request runtimeproce
 		if resource.native && r.legacy != nil {
 			if a[1] != "inspect" {
 				return runtimeprocess.CommandResult{}, fmt.Errorf("native multi-generation resource is inspect-only: %v", a)
+			}
+			if resource.name == resource.entry.predecessorState.Identity.StageContainer {
+				if !resource.entry.predecessor.StageContainerFound {
+					return gatewayCurrentPhysicalNotFound("container")
+				}
+				return jsonResult(gatewayContainerInspection{caddyInspection: resource.entry.predecessor.StageContainer,
+					gatewayContainerRuntime: resource.entry.predecessor.StageRuntime}), nil
 			}
 			return resource.entry.gatewayRebindTypedHandoverRuntimeRunner.Run(ctx, request)
 		}

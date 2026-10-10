@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -165,6 +166,24 @@ func newGatewayRebindLegacyCompositionFixture(t *testing.T) (gatewayRebindPredec
 	installCrossStoreFixtureNetworkObserver(f.manager, f.state.Network.Subnet)
 	observe := f.manager.gatewayRebindV2NetworkObserver
 	f.manager.gatewayRebindV2NetworkObserver = func(ctx context.Context, claim appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error) {
+		if ctx == nil {
+			return gatewayRebindSuccessorNetworkObservation{}, errors.New("invalid legacy retained host census")
+		}
+		if err := ctx.Err(); err != nil {
+			return gatewayRebindSuccessorNetworkObservation{}, err
+		}
+		// Retirement has no new claim. Preserve only the current address that
+		// this fixture explicitly arranges, rather than deriving host presence
+		// from retained Docker or protected artifacts.
+		if reflect.DeepEqual(claim, appaccess.GatewayRebindClaimV2{}) {
+			profile := selected.State.Profile
+			prefix := netip.PrefixFrom(netip.MustParseAddr(profile.SelectedIPv4), 24).Masked().String()
+			return gatewayRebindSuccessorNetworkObservation{
+				Candidates: []gatewayRebindSuccessorNetworkCandidate{{
+					InterfaceID: profile.InterfaceID, IPv4: profile.SelectedIPv4, Prefix: prefix}},
+				HostInterfaces: []string{prefix},
+			}, nil
+		}
 		value, err := observe(ctx, claim)
 		if err != nil {
 			return value, err
@@ -213,7 +232,8 @@ func newGatewayRebindLegacyCompositionFixture(t *testing.T) (gatewayRebindPredec
 
 func TestGatewayRebindLegacyCompositionCurrentCensus(t *testing.T) {
 	f, selected, _, driver := newGatewayRebindLegacyCompositionFixture(t)
-	proof, err := f.manager.gatewayCurrentPhysicalDriver.attestGatewayCurrentPhysical(context.Background(), selected)
+	ctx := context.Background()
+	proof, err := f.manager.gatewayCurrentPhysicalDriver.attestGatewayCurrentPhysical(ctx, selected)
 	if err != nil || !gatewayCurrentPhysicalAttestationAtTarget(proof, driver.backend.legacy.target) || len(driver.backend.effects) != 0 {
 		managed := f.manager.gatewayCurrentPhysicalDriver.(managedGatewayCurrentPhysicalDriver)
 		_, selectionErr := managed.selectExact(context.Background(), *selected.State)
@@ -237,6 +257,58 @@ func TestGatewayRebindLegacyCompositionCurrentCensus(t *testing.T) {
 	}
 	if len(driver.backend.effects) != 0 {
 		t.Fatal("read-only census changed physical state")
+	}
+}
+
+func TestGatewayRebindLegacyCompositionRetirementCensus(t *testing.T) {
+	f, selected, _, driver := newGatewayRebindLegacyCompositionFixture(t)
+	ctx := context.Background()
+	nativeStage := driver.runner.predecessorState.Identity.StageContainer
+	stageResult, stageErr := driver.backend.Run(ctx, runtimeprocess.CommandRequest{Args: []string{"container", "inspect", nativeStage}})
+	if stageErr == nil || string(stageResult.Stderr) != "no such container" {
+		t.Fatalf("known absent native stage was not an exact Docker not-found: result=%#v error=%v", stageResult, stageErr)
+	}
+	unknownStage := nativeStage + "-foreign"
+	unknownResult, unknownErr := driver.backend.Run(ctx, runtimeprocess.CommandRequest{Args: []string{"container", "inspect", unknownStage}})
+	if unknownErr == nil || len(unknownResult.Stdout) != 0 || len(unknownResult.Stderr) != 0 || !strings.Contains(unknownErr.Error(), "unowned multi-generation command") {
+		t.Fatalf("unknown native stage was accepted as known absence: result=%#v error=%v", unknownResult, unknownErr)
+	}
+	managed := f.manager.gatewayCurrentPhysicalDriver.(managedGatewayCurrentPhysicalDriver)
+	if _, err := managed.selectExact(ctx, *selected.State); err != nil {
+		t.Fatalf("baseline current selection: %v", err)
+	}
+	stageFound := driver.runner.predecessor.StageContainerFound
+	driver.runner.predecessor.StageContainerFound = true
+	presentStage, presentErr := driver.backend.Run(ctx, runtimeprocess.CommandRequest{Args: []string{"container", "inspect", nativeStage}})
+	if presentErr != nil || len(presentStage.Stdout) == 0 || len(presentStage.Stderr) != 0 {
+		t.Fatalf("known present native stage was not read from the retained observation: result=%#v error=%v", presentStage, presentErr)
+	}
+	if _, err := managed.selectExact(ctx, *selected.State); err == nil {
+		t.Fatal("reappeared native stage was accepted by current selection")
+	}
+	driver.runner.predecessor.StageContainerFound = stageFound
+	empty, err := f.manager.gatewayRebindV2NetworkObserver(ctx, appaccess.GatewayRebindClaimV2{})
+	profile := selected.State.Profile
+	prefix := netip.PrefixFrom(netip.MustParseAddr(profile.SelectedIPv4), 24).Masked().String()
+	wantCandidates := []gatewayRebindSuccessorNetworkCandidate{
+		{InterfaceID: profile.InterfaceID, IPv4: profile.SelectedIPv4, Prefix: prefix},
+		{InterfaceID: "rebind-next-successor", IPv4: "192.168.98.8", Prefix: "192.168.98.0/24"},
+	}
+	sort.Slice(wantCandidates, func(i, j int) bool { return gatewayRebindCandidateLess(wantCandidates[i], wantCandidates[j]) })
+	if err != nil || !reflect.DeepEqual(empty.Candidates, wantCandidates) || empty.OperationID != "" || empty.ClaimRequestDigest != "" || empty.ProfileSpecDigest != "" {
+		t.Fatalf("retirement candidate census=%#v error=%v", empty, err)
+	}
+	malformed := appaccess.GatewayRebindClaimV2{State: appaccess.GatewayRebindPrepared, StateSequence: 1}
+	if _, err := f.manager.gatewayRebindV2NetworkObserver(ctx, malformed); err == nil {
+		t.Fatal("malformed nonempty claim bypassed the claim-bound network planner")
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := f.manager.gatewayRebindV2NetworkObserver(canceled, appaccess.GatewayRebindClaimV2{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled retirement census error=%v", err)
+	}
+	if len(driver.backend.effects) != 0 {
+		t.Fatal("retirement census controls changed physical state")
 	}
 }
 
@@ -379,6 +451,9 @@ func TestGatewayRebindConcreteCompositionLegacySource(t *testing.T) {
 			effects := len(driver.backend.effects)
 			fresh := freshGatewayRebindRecoveryManager(f.manager)
 			fresh.gatewayRebindFailStop, fresh.gatewayRebindCommitBarrier = &atomic.Bool{}, &atomic.Bool{}
+			// Recovery managers deliberately omit fixture-only observers. Preserve
+			// this retained host census before installing the shared multi backend.
+			fresh.gatewayRebindV2NetworkObserver = f.manager.gatewayRebindV2NetworkObserver
 			replay := &gatewayRebindMultiDriver{gatewayRebindCompositionDriver: &gatewayRebindCompositionDriver{
 				t: t, runner: driver.runner}, backend: driver.backend}
 			replay.installMulti(fresh)
