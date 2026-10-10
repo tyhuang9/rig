@@ -375,6 +375,7 @@ func TestGatewayRebindAdmissionProcessRecoversProtectedPreparation(t *testing.T)
 		wantProgress int
 	}{
 		{name: "checkpoint", mode: "crash-after-checkpoint", marker: "CHECKPOINT_INSTALLED"},
+		{name: "intent", mode: "crash-after-intent", marker: "INTENT_INSTALLED", wantIntents: 1},
 		{name: "progress1", mode: "crash-after-progress1", marker: "PROGRESS_1_INSTALLED", wantIntents: 1, wantProgress: 1},
 	}
 	for _, test := range tests {
@@ -410,6 +411,8 @@ func TestGatewayRebindAdmissionProcessRecoversProtectedPreparation(t *testing.T)
 				prepared.Active.Claim.V2.Spec.OperationID != inspection.Spec.OperationID ||
 				prepared.Active.Claim.V2.Spec.SuccessorProtectedGeneration != inspection.ProtectedGeneration ||
 				!reflect.DeepEqual(prepared.Active.Claim.V2.Spec, inspection.Spec) ||
+				!sameGatewayRebindRosterV2(prepared.Active.RosterV2, inspection.Roster) ||
+				!sameGatewayRebindRuntimeHeads(prepared.Active.RuntimeHeads, inspection.RuntimeHeads) ||
 				prepared.Phase != appaccess.GatewayRebindPrepared || !prepared.RollbackAllowed || prepared.DatabaseCommitObserved ||
 				!reflect.DeepEqual(prepared.CurrentSource, beforeSQL.CurrentSource) ||
 				!errors.Is(f.repository.CheckGatewayRebindFence(ctx), appaccess.ErrGatewayRebindActive) {
@@ -430,7 +433,9 @@ func TestGatewayRebindAdmissionProcessRecoversProtectedPreparation(t *testing.T)
 			gatewayRebindAdmissionAssertPreparationHistory(t, f.manager, inspection,
 				*prepared.Active.Claim.V2, 1, 1)
 			recoveredFiles, err := readGatewayHistorySnapshotMode(f.manager.store, true)
-			if err != nil || !gatewayRebindAdmissionHistoryRetained(pausedFiles, recoveredFiles) ||
+			wantRecoveryAdded := 2 - test.wantIntents - test.wantProgress
+			if err != nil || len(recoveredFiles.files) != len(pausedFiles.files)+wantRecoveryAdded ||
+				!gatewayRebindAdmissionHistoryRetained(pausedFiles, recoveredFiles) ||
 				(test.wantProgress == 1 && !sameGatewayHistorySnapshot(pausedFiles, recoveredFiles)) {
 				t.Fatalf("%s recovery replaced the installed protected prefix: %v", test.name, err)
 			}
@@ -471,7 +476,9 @@ func gatewayRebindAdmissionAssertPreparationHistory(t *testing.T, manager *Manag
 	if wantIntents == 1 {
 		intent := history.IntentsV2[0].Intent
 		if intent.Generation != inspection.ProtectedGeneration || intent.OperationID != inspection.Spec.OperationID ||
-			!reflect.DeepEqual(intent.Claim, claim) || intent.Predecessor != inspection.Spec.Predecessor {
+			!reflect.DeepEqual(intent.Claim, claim) || intent.Predecessor != inspection.Spec.Predecessor ||
+			!sameGatewayRebindRosterV2(intent.Roster, inspection.Roster) ||
+			!sameGatewayRebindRuntimeHeads(intent.RuntimeHeads, inspection.RuntimeHeads) {
 			t.Fatal("protected preparation intent lost the admitted claim, generation, or predecessor")
 		}
 	}
@@ -508,7 +515,7 @@ func TestGatewayRebindAdmissionProcessHelper(t *testing.T) {
 		err = gatewayRebindAdmissionProcessMutation(os.Getenv(gatewayRebindAdmissionProcessManifestEnvironment), mode)
 	case "crash-after-claim":
 		err = gatewayRebindAdmissionProcessCrashAfterClaim(os.Getenv(gatewayRebindAdmissionProcessManifestEnvironment))
-	case "crash-after-checkpoint", "crash-after-progress1":
+	case "crash-after-checkpoint", "crash-after-intent", "crash-after-progress1":
 		err = gatewayRebindAdmissionProcessCrashProtectedPreparation(
 			os.Getenv(gatewayRebindAdmissionProcessManifestEnvironment), mode)
 	case "recover":
@@ -700,7 +707,7 @@ func gatewayRebindAdmissionProcessCrashAfterClaim(path string) error {
 func gatewayRebindAdmissionProcessCrashProtectedPreparation(path, mode string) error {
 	manifest, err := gatewayRebindAdmissionReadManifest(path)
 	if err != nil || manifest.Input.Inspection.Spec.OperationID == "" ||
-		(mode != "crash-after-checkpoint" && mode != "crash-after-progress1") {
+		(mode != "crash-after-checkpoint" && mode != "crash-after-intent" && mode != "crash-after-progress1") {
 		return errors.New("protected preparation crash manifest is invalid")
 	}
 	db, err := database.Open(manifest.DataRoot)
@@ -744,6 +751,22 @@ func gatewayRebindAdmissionProcessCrashProtectedPreparation(path, mode string) e
 		}
 	} else {
 		installCrossStoreFixtureNetworkObserver(manager, manifest.PredecessorSubnet)
+		if mode == "crash-after-intent" {
+			manager.gatewayRebindAfterPreparedIntent = func(hookContext context.Context) error {
+				snapshot, snapshotErr := repository.GatewayRebindRecoverySnapshot(hookContext)
+				if snapshotErr != nil || snapshot.Active == nil || snapshot.Active.Claim.V2 == nil {
+					return errors.New("prepared intent SQL claim is not durable")
+				}
+				if boundaryErr := gatewayRebindAdmissionValidateChildPreparation(hookContext, manager, repository,
+					runner, manifest.Input.Inspection, *snapshot.Active.Claim.V2, 1, 0); boundaryErr != nil {
+					return boundaryErr
+				}
+				if markerErr := gatewayRebindAdmissionPrintMarker("INTENT_INSTALLED"); markerErr != nil {
+					return markerErr
+				}
+				return gatewayRebindAdmissionWaitForParentKill()
+			}
+		}
 	}
 	attempt, prepareErr := manager.prepareGatewayRebindLocked(ctx, repository, manifest.Input)
 	if mode == "crash-after-progress1" && prepareErr == nil {
@@ -772,6 +795,8 @@ func gatewayRebindAdmissionValidateChildPreparation(ctx context.Context, manager
 	if err != nil || runner.calls.Load() != 0 || snapshot.Active == nil || snapshot.Active.Claim.V2 == nil ||
 		!reflect.DeepEqual(*snapshot.Active.Claim.V2, claim) || snapshot.Phase != appaccess.GatewayRebindPrepared ||
 		!snapshot.RollbackAllowed || snapshot.DatabaseCommitObserved ||
+		!sameGatewayRebindRosterV2(snapshot.Active.RosterV2, inspection.Roster) ||
+		!sameGatewayRebindRuntimeHeads(snapshot.Active.RuntimeHeads, inspection.RuntimeHeads) ||
 		!errors.Is(repository.CheckGatewayRebindFence(ctx), appaccess.ErrGatewayRebindActive) {
 		return errors.New("protected preparation SQL claim or fence is not durable")
 	}
@@ -788,7 +813,9 @@ func gatewayRebindAdmissionValidateChildPreparation(ctx context.Context, manager
 	if wantIntents == 1 {
 		intent := history.IntentsV2[0].Intent
 		if intent.Generation != inspection.ProtectedGeneration || intent.OperationID != inspection.Spec.OperationID ||
-			!reflect.DeepEqual(intent.Claim, claim) || intent.Predecessor != inspection.Spec.Predecessor {
+			!reflect.DeepEqual(intent.Claim, claim) || intent.Predecessor != inspection.Spec.Predecessor ||
+			!sameGatewayRebindRosterV2(intent.Roster, inspection.Roster) ||
+			!sameGatewayRebindRuntimeHeads(intent.RuntimeHeads, inspection.RuntimeHeads) {
 			return errors.New("protected preparation intent does not match the admitted claim")
 		}
 	}
