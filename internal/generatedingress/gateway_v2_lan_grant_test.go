@@ -1068,17 +1068,18 @@ func TestGatewayV2LANCommitRecoveryRequiresDBProofBeforeRepublishing(t *testing.
 		t.Fatal(err)
 	}
 	driver.events = nil
-	validated := false
+	validationCalls := 0
 	if err := manager.WithGatewayV2LANCommitRecovery(context.Background(), request,
 		func(_ context.Context, observation GatewayV2LANGrantObservation) error {
+			validationCalls++
 			if observation.Disposition != GatewayV2LANGrantWithdrawnPendingReconciliation ||
-				!observation.ActivationUncertain || driver.live.Apps[request.AppID].LAN != nil {
+				!observation.ActivationUncertain ||
+				(validationCalls == 1 && driver.live.Apps[request.AppID].LAN != nil) {
 				t.Fatalf("observation=%#v live=%#v", observation, driver.live)
 			}
-			validated = true
 			return nil
-		}); err != nil || !validated {
-		t.Fatalf("recovery err=%v validated=%t events=%v", err, validated, driver.events)
+		}); err != nil || validationCalls < 10 {
+		t.Fatalf("recovery err=%v validationCalls=%d events=%v", err, validationCalls, driver.events)
 	}
 	installed, _, err := store.loadBoundUpgrade(journal.OperationID)
 	if err != nil || installed.Pending != nil || installed.Apps[request.AppID].LAN == nil ||
@@ -1159,6 +1160,8 @@ func TestGatewayV2ProductionEmergencyStopUsesBoundIdentityWithForeignImageLabels
 }
 
 func TestGatewayV2EmergencyStopConstructionBypassesUnavailableDatabaseFenceOnlyForExactOwnedStop(t *testing.T) {
+	priorFailStop := gatewayRebindProcessFailStop.Load()
+	t.Cleanup(func() { gatewayRebindProcessFailStop.Store(priorFailStop) })
 	manager, _, state, journal, _, _ := gatewayV2LANGrantFixture(t)
 	labels := gatewayV2ResourceLabels(state, journal, gatewayV2ManagedContainerLabel, gatewayV2FinalContainerRole, true)
 	runner := &gatewayV2EmergencyStopRunner{inspection: gatewayContainerInspection{
@@ -1191,6 +1194,8 @@ type fakeGatewayV2LANGrantDriver struct {
 	failGrantProof          bool
 	failGrantProofAt        int
 	grantProofCalls         int
+	allGrantProofCalls      int
+	proveAllGrantedHook     func(int)
 	failRollbackProof       bool
 	pendingTopology         gatewayV2PendingLiveTopology
 	applyHook               func()
@@ -1251,6 +1256,24 @@ func (d *fakeGatewayV2LANGrantDriver) apply(_ context.Context, state gatewayV2Ro
 	return nil
 }
 
+func (d *fakeGatewayV2LANGrantDriver) applyCommitRecovery(ctx context.Context, state gatewayV2RouteState,
+	filename string, guard func(context.Context) error,
+) error {
+	d.checkLocked()
+	d.events = append(d.events, "apply:"+filename)
+	// Mirror the production copy, validate, reload, active-copy, rename, and
+	// post-rename authority boundaries. Reload is the first serving effect.
+	for step := 0; step < 6; step++ {
+		if err := guard(ctx); err != nil {
+			return err
+		}
+		if step == 2 {
+			d.live = cloneGatewayV2RouteState(state)
+		}
+	}
+	return nil
+}
+
 func (d *fakeGatewayV2LANGrantDriver) proveGranted(_ context.Context, state gatewayV2RouteState,
 	_ gatewayMigrationJournal, request gatewayV2LANGrantRequest,
 ) bool {
@@ -1266,6 +1289,10 @@ func (d *fakeGatewayV2LANGrantDriver) proveAllGranted(_ context.Context, state g
 ) bool {
 	d.checkLocked()
 	d.events = append(d.events, "prove_all_granted")
+	d.allGrantProofCalls++
+	if d.proveAllGrantedHook != nil {
+		d.proveAllGrantedHook(d.allGrantProofCalls)
+	}
 	return !d.failGrantProof && reflect.DeepEqual(d.live, state)
 }
 

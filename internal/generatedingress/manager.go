@@ -13,8 +13,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
@@ -66,6 +68,19 @@ type Options struct {
 	// gateway locks are both held, before any protected gateway observation or
 	// mutation. Production callers must provide a fresh database-backed check.
 	RebindFenceCheck func(context.Context) error
+	// RebindCurrentStateRepository supplies a fresh SQL-selected current
+	// lineage for ordinary route, grant, disable, redeploy, and restart paths.
+	// It is optional for legacy-only callers; any path that observes a scoped
+	// rebind current-state bundle fails closed when this provider is absent.
+	RebindCurrentStateRepository GatewayRebindCurrentStateRepository
+}
+
+// GatewayRebindCurrentStateRepository is intentionally read-only. Ordinary
+// generated-ingress operations use it only to select and revalidate the
+// current protected generation; rebind claims and transitions remain private
+// coordinator operations with their own explicit repository contract.
+type GatewayRebindCurrentStateRepository interface {
+	GatewayRebindRecoverySnapshot(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error)
 }
 
 type Manager struct {
@@ -75,6 +90,22 @@ type Manager struct {
 	dockerEnv                []string
 	workingDirectoryIdentity os.FileInfo
 	mu                       contextMutex
+	// gatewayRebindFailStop points at the process-wide latch in production.
+	// Tests may replace it with a private latch to avoid cross-test state.
+	gatewayRebindFailStop *atomic.Bool
+	// gatewayRebindCommitBarrier is process scoped in production. The final
+	// coordinator arms it before clearing the SQL fence and releases it only
+	// after every local lock and lease release succeeds.
+	gatewayRebindCommitBarrier *atomic.Bool
+	// gatewayRebindV2NetworkObserver is replaceable only by package tests.
+	// Production performs two complete host and Docker inventory reads.
+	gatewayRebindV2NetworkObserver func(context.Context, appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error)
+	// gatewayRebindAfterClaim is a package-test crash boundary after the SQL
+	// prepared commit and before any protected checkpoint write.
+	gatewayRebindAfterClaim func(context.Context, appaccess.GatewayRebindClaimV2) error
+	// gatewayRebindClock is read only after a SQL transition returns. Tests
+	// replace it to pin protected record times.
+	gatewayRebindClock func() time.Time
 	// gatewayTopologyObserver is replaceable only by package tests. Production
 	// always uses the full read-only Docker attestation.
 	gatewayTopologyObserver func(context.Context, routeState, gatewayV2RouteState, gatewayMigrationJournal) gatewayObservedTopology
@@ -96,6 +127,13 @@ type Manager struct {
 	// Production uses the committed-v2 reload and publication proof adapter in
 	// gateway_v2_lan_grant.go.
 	gatewayV2LANGrantDriver gatewayV2LANGrantDriver
+	// gatewayCurrentPhysicalDriver is replaceable only by package tests. The
+	// production adapter proves and mutates the SQL-selected rebind generation
+	// without projecting it through a migration-026 journal.
+	gatewayCurrentPhysicalDriver gatewayCurrentPhysicalDriver
+	// gatewayRebindCrossStoreDriver is replaceable only by package tests. The
+	// production adapter performs the normalized typed-source physical flow.
+	gatewayRebindCrossStoreDriver gatewayRebindCrossStoreDriver
 }
 
 // contextMutex lets a route observation abandon lock contention when its
@@ -175,7 +213,10 @@ func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager,
 	if err != nil {
 		return nil, err
 	}
-	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv, workingDirectoryIdentity: workingDirectoryIdentity, mu: newContextMutex()}, nil
+	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv,
+		workingDirectoryIdentity: workingDirectoryIdentity, mu: newContextMutex(),
+		gatewayRebindFailStop:      &gatewayRebindProcessFailStop,
+		gatewayRebindCommitBarrier: &gatewayRebindProcessCommitBarrier}, nil
 }
 
 // Switch atomically reloads the aggregate Caddy route set, durably records the
@@ -191,6 +232,9 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 		return err
 	}
 	defer releaseGatewaySwitchLock(release, &resultErr)
+	if handled, err := m.switchGatewayCurrentStateMachineLocked(ctx, request); err != nil || handled {
+		return err
+	}
 	if store, state, journal, committed, err := m.committedV2Locked(); err != nil {
 		return markCandidateMayBeLive(err)
 	} else if committed {
@@ -284,6 +328,24 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 // Recover rolls back an uncertain pending switch to the last committed route,
 // then reapplies the committed aggregate config and restart file.
 func (m *Manager) Recover(ctx context.Context) error {
+	if m == nil || ctx == nil {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
+	release, err := m.lockGateway(ctx)
+	if err != nil {
+		return err
+	}
+	handled, recoveryErr := m.recoverGatewayCurrentStateMachineLocked(ctx)
+	releaseErr := release()
+	if recoveryErr != nil {
+		return recoveryErr
+	}
+	if releaseErr != nil {
+		return gatewayCurrentRouteOperationError(ctx)
+	}
+	if handled {
+		return nil
+	}
 	return m.Provision(ctx)
 }
 

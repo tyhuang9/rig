@@ -1,0 +1,235 @@
+package generatedingress
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"sort"
+
+	"github.com/hostd/hostd/internal/appaccess"
+)
+
+type gatewayRebindTypedAttemptBoundary struct {
+	Snapshot  appaccess.GatewayRebindRecoverySnapshot
+	Selection gatewayCurrentSelection
+	History   gatewayRebindProtectedIntentHistory
+	Progress  []gatewayRebindProgressRecord
+}
+
+type gatewayRebindTypedRuntimeHeadsRepository interface {
+	GatewayRebindRuntimeHeads(context.Context) ([]appaccess.GatewayRebindRuntimeHead, error)
+}
+
+// Forward effects require current serving permission as well as retained
+// ownership. Keep this separate from the ownership boundary so revocation
+// cannot prevent stopping or removing an exactly owned resource.
+func (m *Manager) readGatewayRebindTypedForwardBoundaryLocked(ctx context.Context,
+	request gatewayRebindPhysicalReconcileRequest,
+) (gatewayRebindTypedAttemptBoundary, error) {
+	invalid := func() (gatewayRebindTypedAttemptBoundary, error) {
+		return gatewayRebindTypedAttemptBoundary{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	if m == nil || ctx == nil || ctx.Err() != nil || !validGatewayRebindPhysicalReconcileRequest(request) {
+		return invalid()
+	}
+	repository, ok := m.options.RebindCurrentStateRepository.(GatewayCurrentServingStartupRepository)
+	if !ok {
+		return invalid()
+	}
+	first, err := repository.HostingGatewayStartupSnapshot(ctx)
+	if err != nil || !first.ActiveRebindApprovalsAuthorizeServing() ||
+		!gatewayRebindTypedSnapshotMatchesRequest(first.Rebind, request) ||
+		!gatewayRebindTypedRosterApprovalsCurrent(request.Attempt, first.Grants) {
+		return invalid()
+	}
+	boundary, err := m.readGatewayRebindTypedAttemptBoundaryLocked(ctx, request)
+	if err != nil || !reflect.DeepEqual(first.Rebind, boundary.Snapshot) ||
+		!sameGatewayRebindRuntimeHeads(first.RuntimeHeads, request.Attempt.Intent.RuntimeHeads) {
+		return invalid()
+	}
+	second, err := repository.HostingGatewayStartupSnapshot(ctx)
+	if err != nil || ctx.Err() != nil || !reflect.DeepEqual(first, second) {
+		return invalid()
+	}
+	return boundary, nil
+}
+
+func gatewayRebindTypedRosterApprovalsCurrent(attempt gatewayRebindPreparedAttempt,
+	snapshot appaccess.AppAccessGrantStartupSnapshot,
+) bool {
+	grants := make(map[string]appaccess.AppAccessGrantStartupClaim, len(snapshot.Claims))
+	for _, grant := range snapshot.Claims {
+		if _, duplicate := grants[grant.Claim.AttemptID]; duplicate {
+			return false
+		}
+		grants[grant.Claim.AttemptID] = grant
+	}
+	for _, entry := range attempt.Intent.Roster {
+		grant, exists := grants[entry.GrantAttemptID]
+		if !exists || !grant.ApproverIsAdministrator {
+			return false
+		}
+		var raw *gatewayV2LANBinding
+		if attempt.Checkpoint.UpgradeState != nil {
+			raw = attempt.Checkpoint.UpgradeState.Apps[entry.AppID].LAN
+		} else if attempt.Checkpoint.CurrentState != nil {
+			if lan := attempt.Checkpoint.CurrentState.Apps[entry.AppID].LAN; lan != nil {
+				raw = &lan.Raw
+			}
+		}
+		if raw == nil || GatewayLANGrantRequest(grant.Claim) != gatewayV2LANGrantRequestForBinding(entry.AppID, *raw) {
+			return false
+		}
+	}
+	return true
+}
+
+// readGatewayRebindTypedAttemptBoundaryLocked is the active-attempt authority
+// check used immediately before and after every typed physical effect. It is
+// deliberately separate from the ordinary current driver: an admitted
+// successor keeps the predecessor SQL-selected while ordinary mutation must
+// remain fenced. This reader proves that exact active claim, typed protected
+// prefix, SQL recovery direction, and predecessor selection together.
+func (m *Manager) readGatewayRebindTypedAttemptBoundaryLocked(ctx context.Context,
+	request gatewayRebindPhysicalReconcileRequest,
+) (gatewayRebindTypedAttemptBoundary, error) {
+	invalid := func() (gatewayRebindTypedAttemptBoundary, error) {
+		return gatewayRebindTypedAttemptBoundary{}, errors.New("generated ingress typed rebind effect authority changed")
+	}
+	if m == nil || ctx == nil || ctx.Err() != nil || !validGatewayRebindPhysicalReconcileRequest(request) ||
+		m.options.RebindCurrentStateRepository == nil {
+		return invalid()
+	}
+	repository := m.options.RebindCurrentStateRepository
+	headsRepository, ok := repository.(gatewayRebindTypedRuntimeHeadsRepository)
+	if !ok {
+		return invalid()
+	}
+	first, err := repository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || !gatewayRebindTypedSnapshotMatchesRequest(first, request) {
+		return invalid()
+	}
+	firstHeads, err := headsRepository.GatewayRebindRuntimeHeads(ctx)
+	if err != nil || !sameGatewayRebindRuntimeHeads(firstHeads, request.Attempt.Intent.RuntimeHeads) {
+		return invalid()
+	}
+	selection, err := m.selectGatewayCurrentLocked(ctx, first)
+	if err != nil {
+		return invalid()
+	}
+	expectedLineage, lineageErr := gatewayRebindTypedSelectedLineage(request)
+	if lineageErr != nil || selection.Lineage != expectedLineage {
+		return invalid()
+	}
+	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil {
+		return invalid()
+	}
+	progress, err := gatewayRebindTypedAttemptHistory(request, history)
+	if err != nil {
+		return invalid()
+	}
+	second, err := repository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || !reflect.DeepEqual(first, second) || ctx.Err() != nil {
+		return invalid()
+	}
+	secondHeads, err := headsRepository.GatewayRebindRuntimeHeads(ctx)
+	if err != nil || !sameGatewayRebindRuntimeHeads(firstHeads, secondHeads) {
+		return invalid()
+	}
+	confirmedSelection, err := m.selectGatewayCurrentLocked(ctx, second)
+	if err != nil || !sameGatewayCurrentSelection(selection, confirmedSelection) {
+		return invalid()
+	}
+	confirmedHistory, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || !sameGatewayRebindCurrentHistory(history, confirmedHistory) {
+		return invalid()
+	}
+	return gatewayRebindTypedAttemptBoundary{Snapshot: first, Selection: selection,
+		History: history, Progress: progress}, nil
+}
+
+func gatewayRebindTypedSelectedLineage(request gatewayRebindPhysicalReconcileRequest) (appaccess.GatewayCurrentLineageRef, error) {
+	if !request.DatabaseCommitObserved {
+		return request.Attempt.Claim.Spec.Predecessor.Lineage, nil
+	}
+	if request.Terminal == nil {
+		return appaccess.GatewayCurrentLineageRef{}, errors.New("typed database commit lacks terminal receipt")
+	}
+	return gatewayRebindCurrentLineageV2(*request.Terminal)
+}
+
+func gatewayRebindTypedSnapshotMatchesRequest(snapshot appaccess.GatewayRebindRecoverySnapshot,
+	request gatewayRebindPhysicalReconcileRequest,
+) bool {
+	if snapshot.Active == nil || snapshot.Active.Claim.V2 == nil ||
+		!sameGatewayRebindClaimV2Admission(*snapshot.Active.Claim.V2, request.Attempt.Claim) ||
+		snapshot.Phase != request.SQLPhase || snapshot.RollbackAllowed != request.RollbackAllowed ||
+		snapshot.DatabaseCommitObserved != request.DatabaseCommitObserved {
+		return false
+	}
+	if request.DatabaseCommitObserved {
+		if snapshot.DatabaseCommittedEvent == nil ||
+			snapshot.DatabaseCommittedEvent.OperationID != request.Attempt.Claim.Spec.OperationID ||
+			snapshot.DatabaseCommittedEvent.State != appaccess.GatewayRebindDatabaseCommitted {
+			return false
+		}
+	} else if snapshot.DatabaseCommittedEvent != nil {
+		return false
+	}
+	expectedLineage, err := gatewayRebindTypedSelectedLineage(request)
+	return err == nil && snapshot.CurrentSource != nil &&
+		*snapshot.CurrentSource == gatewayCurrentAuthority(expectedLineage)
+}
+
+func gatewayRebindTypedAttemptHistory(request gatewayRebindPhysicalReconcileRequest,
+	history gatewayRebindProtectedIntentHistory,
+) ([]gatewayRebindProgressRecord, error) {
+	claim := request.Attempt.Claim
+	generation, operationID := claim.Spec.SuccessorProtectedGeneration, claim.Spec.OperationID
+	checkpointCount, intentCount := 0, 0
+	for _, selected := range history.Checkpoints {
+		if selected.Generation == generation && selected.Checkpoint.OperationID == operationID {
+			checkpointCount++
+			if !reflect.DeepEqual(selected.Checkpoint, request.Attempt.Checkpoint) {
+				return nil, errors.New("typed predecessor checkpoint changed")
+			}
+		}
+	}
+	for _, selected := range history.IntentsV2 {
+		if selected.Generation == generation && selected.Intent.OperationID == operationID {
+			intentCount++
+			if !reflect.DeepEqual(selected.Intent, request.Attempt.Intent) {
+				return nil, errors.New("typed protected intent changed")
+			}
+		}
+	}
+	if checkpointCount != 1 || intentCount != 1 {
+		return nil, errors.New("typed attempt history is incomplete")
+	}
+	progress := make([]gatewayRebindProgressRecord, 0, 17)
+	for _, selected := range history.Progress {
+		if selected.Generation == generation && selected.Record.OperationID == operationID {
+			progress = append(progress, selected.Record)
+		}
+	}
+	sort.Slice(progress, func(i, j int) bool { return progress[i].Sequence < progress[j].Sequence })
+	if len(progress) == 0 || !reflect.DeepEqual(progress[0], request.Attempt.Progress) ||
+		!gatewayRebindTypedProgressMatchesCheckpoint(request.Attempt.Intent, request.Attempt.Checkpoint, progress) {
+		return nil, errors.New("typed progress prefix is invalid")
+	}
+	var terminals []gatewayRebindTerminalReceiptV2
+	for _, selected := range history.TerminalsV2 {
+		if selected.Generation == generation && selected.Receipt.OperationID == operationID {
+			terminals = append(terminals, selected.Receipt)
+		}
+	}
+	if request.Terminal == nil {
+		if len(terminals) != 0 {
+			return nil, errors.New("typed terminal appeared before physical decision")
+		}
+	} else if len(terminals) != 1 || !reflect.DeepEqual(terminals[0], *request.Terminal) {
+		return nil, errors.New("typed terminal does not match recovery direction")
+	}
+	return progress, nil
+}

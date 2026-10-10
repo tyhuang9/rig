@@ -1,8 +1,37 @@
 package generatedingress
 
-import "context"
+import (
+	"context"
+	"sync/atomic"
+)
 
 var managerAcquireGatewayOSLock = acquireGatewayOSLock
+
+// gatewayRebindProcessFailStop is deliberately process scoped. Once final SQL
+// release has committed but a required local lock or lease cannot be proved
+// released, constructing another Manager in the same process is not recovery.
+// Only a fresh process may reacquire the OS resources and reattest current
+// state.
+var gatewayRebindProcessFailStop atomic.Bool
+var gatewayRebindProcessCommitBarrier atomic.Bool
+
+func (m *Manager) gatewayRebindFailStopLatch() *atomic.Bool {
+	if m != nil && m.gatewayRebindFailStop != nil {
+		return m.gatewayRebindFailStop
+	}
+	return &gatewayRebindProcessFailStop
+}
+
+func (m *Manager) gatewayRebindCommitBarrierLatch() *atomic.Bool {
+	if m != nil && m.gatewayRebindCommitBarrier != nil {
+		return m.gatewayRebindCommitBarrier
+	}
+	return &gatewayRebindProcessCommitBarrier
+}
+
+func (m *Manager) gatewayRebindAdmissionBlocked() bool {
+	return m.gatewayRebindFailStopLatch().Load() || m.gatewayRebindCommitBarrierLatch().Load()
+}
 
 // lockGateway serializes the entire observation or mutation across Manager
 // instances sharing one data root. The local mutex is acquired first so a
@@ -30,13 +59,34 @@ func (m *Manager) lockGateway(ctx context.Context) (func() error, error) {
 	return release, nil
 }
 
-// lockGatewayRaw is reserved for the journal-bound emergency-stop path,
-// read-only rebind attestors, and the private prepared-claim rebind network
-// stage that holds the deployment-effects lease and freshly proves the SQL
-// fence under this lock. All ordinary observation and mutation must call
+// lockGatewayRaw is reserved for read-only rebind attestors and the private
+// prepared-claim rebind network stage that holds the deployment-effects lease
+// and freshly proves the SQL fence under this lock. All ordinary observation and mutation must call
 // lockGateway so SQLite can fence an in-progress LAN gateway rebind before any
 // Docker inspection or effect.
 func (m *Manager) lockGatewayRaw(ctx context.Context) (func() error, error) {
+	return m.lockGatewayRawMode(ctx, false)
+}
+
+// lockGatewayRawForInspection permits the one read-only phase/current
+// inspection to report a latched fail-stop. It must never be used by an effect
+// or by ordinary route authorization.
+func (m *Manager) lockGatewayRawForInspection(ctx context.Context) (func() error, error) {
+	return m.lockGatewayRawMode(ctx, true)
+}
+
+// lockGatewayRawForOwnedStop is the only effect boundary that may cross an
+// existing process fail-stop. It authorizes no selection or publication; the
+// caller may only withdraw exact protected-owned resources after separately
+// acquiring the deployment-effects lease.
+func (m *Manager) lockGatewayRawForOwnedStop(ctx context.Context) (func() error, error) {
+	return m.lockGatewayRawMode(ctx, true)
+}
+
+func (m *Manager) lockGatewayRawMode(ctx context.Context, allowFailStop bool) (func() error, error) {
+	if !allowFailStop && m.gatewayRebindAdmissionBlocked() {
+		return nil, &Error{Code: DiagnosticRouteUnresolved}
+	}
 	if err := m.mu.LockContext(ctx); err != nil {
 		return nil, &Error{Code: DiagnosticCancelled}
 	}
@@ -52,6 +102,11 @@ func (m *Manager) lockGatewayRaw(ctx context.Context) (func() error, error) {
 		_ = releaseOS()
 		m.mu.Unlock()
 		return nil, &Error{Code: DiagnosticCancelled}
+	}
+	if !allowFailStop && m.gatewayRebindAdmissionBlocked() {
+		_ = releaseOS()
+		m.mu.Unlock()
+		return nil, &Error{Code: DiagnosticRouteUnresolved}
 	}
 	return func() error {
 		defer m.mu.Unlock()

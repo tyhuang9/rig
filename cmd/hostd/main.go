@@ -77,10 +77,12 @@ func runServer(args []string) int {
 		logger.Error("Docker executable resolution failed", "error", err)
 		return 1
 	}
+	var startupAdmission *deploymentEffectsStartupLease
 	emergencyStop := func() {
-		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if stopErr := stopOwnedGatewayOnStartupFailure(stopCtx, cfg, dockerExecutable, ownerDirectories); stopErr != nil {
+		stopErr := runGatewayStartupEmergencyStop(startupAdmission, func(stopCtx context.Context) error {
+			return stopOwnedGatewayOnStartupFailure(stopCtx, cfg, dockerExecutable, ownerDirectories)
+		})
+		if stopErr != nil {
 			logger.Error("owned gateway emergency stop could not be verified", "error", stopErr)
 		} else {
 			logger.Warn("owned gateway stopped after startup reconciliation failure")
@@ -93,8 +95,13 @@ func runServer(args []string) int {
 		return 1
 	}
 	defer db.Close()
+	preparedGateway, err := prepareGatewayRebindStartup(context.Background(), cfg, db, dockerExecutable, ownerDirectories)
+	if err != nil {
+		logger.Error("gateway rebind startup preparation failed", "error", err)
+		emergencyStop()
+		return 1
+	}
 	var workerAdmission func(context.Context) (func() error, error)
-	var startupAdmission *deploymentEffectsStartupLease
 	if cfg.ComposeRuntime || cfg.GeneratedRuntime {
 		workerAdmission, err = deploymentEffectsAdmission(db, ownerDirectories.WorkingDirectory)
 		if err != nil {
@@ -127,7 +134,7 @@ func runServer(args []string) int {
 		}()
 	}
 	rebindCheck := rebindFenceCheck(db)
-	gate, err := inspectGatewayStartup(context.Background(), cfg, db, dockerExecutable, ownerDirectories)
+	gate, err := inspectGatewayStartupAfterPreparation(context.Background(), cfg, db, dockerExecutable, ownerDirectories, preparedGateway)
 	if err != nil {
 		logger.Error("gateway startup inspection failed", "error", err)
 		emergencyStop()

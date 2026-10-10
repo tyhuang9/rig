@@ -15,7 +15,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
@@ -256,9 +255,25 @@ func newGatewayRebindPredecessorFixture(t *testing.T) gatewayRebindPredecessorFi
 }
 
 func newGatewayRebindPredecessorFixtureWithClaim(t *testing.T, insertClaim bool) gatewayRebindPredecessorFixture {
+	return newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t, insertClaim, '4', "")
+}
+
+func newGatewayRebindPredecessorFixtureWithLANApprover(t *testing.T, insertClaim bool,
+	lanApproverID string,
+) gatewayRebindPredecessorFixture {
+	return newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t, insertClaim, '4', lanApproverID)
+}
+
+func newGatewayRebindPredecessorFixtureWithEndpoint(t *testing.T, insertClaim bool, endpointID rune) gatewayRebindPredecessorFixture {
+	return newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t, insertClaim, endpointID, "")
+}
+
+func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, insertClaim bool,
+	endpointID rune, lanApproverID string,
+) gatewayRebindPredecessorFixture {
 	t.Helper()
 	manager, runner := newManagerFixture(t, false)
-	db, err := database.Open(manager.options.DataRoot)
+	db, err := openGatewayRebindFixtureDatabase(manager.options.DataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,6 +281,18 @@ func newGatewayRebindPredecessorFixtureWithClaim(t *testing.T, insertClaim bool)
 	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,role,created_at,updated_at)
 		VALUES(?,'rebind-admin','hash','administrator',datetime('now'),datetime('now'))`, gatewayRebindTestAdministrator); err != nil {
 		t.Fatal(err)
+	}
+	accessApproverID := gatewayRebindTestAdministrator
+	if lanApproverID != "" {
+		if !validCanonicalUUID(lanApproverID) || lanApproverID == gatewayRebindTestAdministrator {
+			t.Fatal("invalid distinct LAN approver fixture identity")
+		}
+		if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,role,created_at,updated_at)
+			VALUES(?,?,?,'administrator',datetime('now'),datetime('now'))`, lanApproverID,
+			"rebind-lan-"+lanApproverID, "hash"); err != nil {
+			t.Fatal(err)
+		}
+		accessApproverID = lanApproverID
 	}
 	repository := appaccess.New(db)
 	ctx := context.Background()
@@ -304,7 +331,7 @@ func newGatewayRebindPredecessorFixtureWithClaim(t *testing.T, insertClaim bool)
 	revision, _, err := repository.ApproveAppAccess(ctx, appaccess.ApproveAppAccessInput{
 		AppID: appID, OperationID: allocation.OwnerOperationID, AllocationID: allocation.ID,
 		Approval: appaccess.Approval{
-			Action: appaccess.ActionEnableAppAccess, SpecDigest: accessDigest, ActorID: gatewayRebindTestAdministrator,
+			Action: appaccess.ActionEnableAppAccess, SpecDigest: accessDigest, ActorID: accessApproverID,
 		},
 	})
 	if err != nil {
@@ -370,7 +397,7 @@ func newGatewayRebindPredecessorFixtureWithClaim(t *testing.T, insertClaim bool)
 		appID: {
 			Slot: generatedruntime.Slot(active.Slot),
 			Endpoints: []generatedruntime.RouteEndpoint{
-				endpoint("api", "server", "rebind-app-network", "rebind-app-blue", 3000, '4'),
+				endpoint("api", "server", "rebind-app-network", "rebind-app-blue", 3000, endpointID),
 			},
 		},
 	}}

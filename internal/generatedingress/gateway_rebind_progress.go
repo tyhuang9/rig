@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/hostd/hostd/internal/appaccess"
 )
 
 const (
@@ -19,20 +21,27 @@ const (
 	gatewayRebindProgressSequenceDigits      = 2
 	maxGatewayRebindProgressBytes            = 32 << 10
 	maxGatewayRebindFinalConfigProgressBytes = 256 << 10
-	gatewayRebindProgressMaximumSequence     = 12
+	gatewayRebindProgressMaximumSequence     = 18
 )
 
 type gatewayRebindProgressPhase string
 
 const (
-	gatewayRebindProgressSuccessorIntent   gatewayRebindProgressPhase = "successor_intent"
-	gatewayRebindProgressStageIntent       gatewayRebindProgressPhase = "stage_intent"
-	gatewayRebindProgressStageConfigIntent gatewayRebindProgressPhase = "stage_config_intent"
-	gatewayRebindProgressStageConfigCopied gatewayRebindProgressPhase = "stage_config_copied"
-	gatewayRebindProgressStageStartIntent  gatewayRebindProgressPhase = "stage_start_intent"
-	gatewayRebindProgressStageServing      gatewayRebindProgressPhase = "stage_serving"
-	gatewayRebindProgressFinalConfigIntent gatewayRebindProgressPhase = "final_config_intent"
-	gatewayRebindProgressFinalConfigCopied gatewayRebindProgressPhase = "final_config_copied"
+	gatewayRebindProgressSuccessorIntent     gatewayRebindProgressPhase = "successor_intent"
+	gatewayRebindProgressStageIntent         gatewayRebindProgressPhase = "stage_intent"
+	gatewayRebindProgressStageConfigIntent   gatewayRebindProgressPhase = "stage_config_intent"
+	gatewayRebindProgressStageConfigCopied   gatewayRebindProgressPhase = "stage_config_copied"
+	gatewayRebindProgressStageStartIntent    gatewayRebindProgressPhase = "stage_start_intent"
+	gatewayRebindProgressStageServing        gatewayRebindProgressPhase = "stage_serving"
+	gatewayRebindProgressFinalConfigIntent   gatewayRebindProgressPhase = "final_config_intent"
+	gatewayRebindProgressFinalConfigCopied   gatewayRebindProgressPhase = "final_config_copied"
+	gatewayRebindProgressFinalHandoverIntent gatewayRebindProgressPhase = "final_handover_intent"
+	gatewayRebindProgressFinalContainerBound gatewayRebindProgressPhase = "final_container_bound"
+	gatewayRebindProgressCutoverIntent       gatewayRebindProgressPhase = "cutover_intent"
+	gatewayRebindProgressSuccessorServing    gatewayRebindProgressPhase = "successor_serving"
+	gatewayRebindProgressHandoverCommitted   gatewayRebindProgressPhase = "handover_committed"
+	gatewayRebindProgressRollbackIntent      gatewayRebindProgressPhase = "rollback_intent"
+	gatewayRebindProgressHandoverRolledBack  gatewayRebindProgressPhase = "handover_rolled_back"
 )
 
 // gatewayRebindProgressRecord is immutable history for the initial rebind.
@@ -53,7 +62,74 @@ type gatewayRebindProgressRecord struct {
 	PreviousDigest        string                     `json:"previousDigest,omitempty"`
 	Stage                 *gatewayRebindStageIntent  `json:"stage,omitempty"`
 	Digest                string                     `json:"digest"`
+	// Handover is appended after Digest so records one through twelve retain
+	// their exact canonical JSON bytes and digests. It is populated only by the
+	// private final-handover state machine.
+	Handover *gatewayRebindFinalHandoverProgress `json:"handover,omitempty"`
+	// TypedEffect is the v2-source physical result. It is a distinct union arm
+	// appended after every v1 field so all legacy canonical bytes remain exact.
+	TypedEffect *gatewayRebindTypedEffectProgress `json:"typedEffect,omitempty"`
+	// TypedRollback is written only after a typed forward prefix. Its intent
+	// record precedes every compensation effect and its completion record binds
+	// the exact restored predecessor and absent successor inventory.
+	TypedRollback *gatewayRebindTypedRollbackProgress `json:"typedRollback,omitempty"`
 }
+
+type gatewayRebindTypedEffectProgress struct {
+	Version             int                                         `json:"version"`
+	Purpose             string                                      `json:"purpose"`
+	ImageID             string                                      `json:"imageId"`
+	StagePlanDigest     string                                      `json:"stagePlanDigest"`
+	Network             *gatewayRebindStageNetworkBinding           `json:"network,omitempty"`
+	ConfigVolume        *gatewayRebindStageConfigVolumeBinding      `json:"configVolume,omitempty"`
+	DataVolume          *gatewayRebindStageDataVolumeBinding        `json:"dataVolume,omitempty"`
+	StageContainer      *gatewayRebindStageContainerBinding         `json:"stageContainer,omitempty"`
+	StageConfigIntent   *gatewayRebindStageConfigIntentBinding      `json:"stageConfigIntent,omitempty"`
+	StageConfigCopy     *gatewayRebindStageConfigCopyBinding        `json:"stageConfigCopy,omitempty"`
+	StageStartIntent    *gatewayRebindStageStartIntentBinding       `json:"stageStartIntent,omitempty"`
+	StageServing        *gatewayRebindStageServingBinding           `json:"stageServing,omitempty"`
+	FinalConfigIntent   *gatewayRebindTypedFinalConfigIntentBinding `json:"finalConfigIntent,omitempty"`
+	FinalConfigCopy     *gatewayRebindFinalConfigCopyBinding        `json:"finalConfigCopy,omitempty"`
+	HandoverIntent      *gatewayRebindTypedHandoverIntent           `json:"handoverIntent,omitempty"`
+	ApplicationNetworks []gatewayRebindHandoverApplicationNetwork   `json:"applicationNetworks,omitempty"`
+	FinalContainer      *gatewayRebindFinalContainerBinding         `json:"finalContainer,omitempty"`
+	CutoverIntent       *gatewayRebindTypedCutoverIntent            `json:"cutoverIntent,omitempty"`
+	SuccessorServing    *gatewayRebindFinalHandoverServingProof     `json:"successorServing,omitempty"`
+	Resources           *gatewayRebindFinalHandoverResourceBindings `json:"resources,omitempty"`
+	PhysicalProof       *gatewayRebindFinalHandoverTerminalProof    `json:"physicalProof,omitempty"`
+	Digest              string                                      `json:"digest"`
+}
+
+type gatewayRebindTypedRollbackOwnedResources struct {
+	ImageID             string                                    `json:"imageId"`
+	IngressNetwork      *gatewayRebindStageNetworkBinding         `json:"ingressNetwork,omitempty"`
+	ConfigVolume        *gatewayRebindStageConfigVolumeBinding    `json:"configVolume,omitempty"`
+	DataVolume          *gatewayRebindStageDataVolumeBinding      `json:"dataVolume,omitempty"`
+	StageContainer      *gatewayRebindStageContainerBinding       `json:"stageContainer,omitempty"`
+	FinalContainer      *gatewayRebindFinalContainerBinding       `json:"finalContainer,omitempty"`
+	ApplicationNetworks []gatewayRebindHandoverApplicationNetwork `json:"applicationNetworks,omitempty"`
+}
+
+type gatewayRebindTypedRollbackProgress struct {
+	Version                 int                                      `json:"version"`
+	Purpose                 string                                   `json:"purpose"`
+	FromSequence            uint64                                   `json:"fromSequence"`
+	FromPhase               gatewayRebindProgressPhase               `json:"fromPhase"`
+	FromDigest              string                                   `json:"fromDigest"`
+	PlanDigest              string                                   `json:"planDigest"`
+	Owned                   gatewayRebindTypedRollbackOwnedResources `json:"owned"`
+	PredecessorRoutesDigest string                                   `json:"predecessorRoutesDigest"`
+	AdoptionProofDigest     string                                   `json:"adoptionProofDigest,omitempty"`
+	PhysicalProof           *gatewayRebindFinalHandoverTerminalProof `json:"physicalProof,omitempty"`
+	Digest                  string                                   `json:"digest"`
+}
+
+const (
+	gatewayRebindTypedEffectVersion   = 1
+	gatewayRebindTypedEffectPurpose   = "hostd/generated-ingress/rebind/typed-effect/v1"
+	gatewayRebindTypedRollbackVersion = 1
+	gatewayRebindTypedRollbackPurpose = "hostd/generated-ingress/rebind/typed-rollback/v1"
+)
 
 // gatewayRebindStageIntent keeps the approved Caddy content digest distinct
 // from the observed Docker image object ID. The latter is merely a pinned
@@ -241,6 +317,406 @@ func newGatewayRebindSuccessorIntentProgress(intent gatewayRebindProtectedIntent
 		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress rebind successor progress input")
 	}
 	return value, nil
+}
+
+func newGatewayRebindSuccessorIntentProgressV2(intent gatewayRebindProtectedIntentV2,
+	occurredAt time.Time,
+) (gatewayRebindProgressRecord, error) {
+	if !validGatewayRebindProtectedIntentV2(intent) || !validGatewayRebindProgressTime(occurredAt) {
+		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress typed rebind successor progress input")
+	}
+	value := gatewayRebindProgressRecord{
+		Version: gatewayRebindProgressVersion, Generation: intent.Generation, OperationID: intent.OperationID,
+		Sequence: 1, Phase: gatewayRebindProgressSuccessorIntent,
+		OccurredAt: occurredAt.UTC().Format(time.RFC3339Nano), ProtectedIntentDigest: intent.Digest,
+	}
+	_, value.Purpose = gatewayRebindProgressName(value.Generation, value.OperationID, value.Sequence)
+	digest, err := gatewayRebindProgressDigest(value)
+	if err != nil {
+		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress typed rebind successor progress input")
+	}
+	value.Digest = digest
+	if !gatewayRebindProgressMatchesIntentV2(value, intent, nil) {
+		return gatewayRebindProgressRecord{}, errors.New("invalid generated ingress typed rebind successor progress input")
+	}
+	return value, nil
+}
+
+func newGatewayRebindTypedEffectProgressV2(intent gatewayRebindProtectedIntentV2,
+	checkpoint gatewayRebindPredecessorCheckpoint, previous []gatewayRebindProgressRecord,
+	effect gatewayRebindTypedEffectProgress, occurredAt time.Time,
+) (gatewayRebindProgressRecord, error) {
+	invalid := errors.New("invalid generated ingress typed effect progress input")
+	if !validGatewayRebindProtectedIntentV2(intent) || !validGatewayRebindPredecessorCheckpoint(checkpoint) ||
+		checkpoint.sourceRef() != intent.Predecessor || len(previous) == 0 || len(previous) >= 17 ||
+		!validGatewayRebindProgressTime(occurredAt) {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	last := previous[len(previous)-1]
+	lastAt, err := parseGatewayRebindProgressTime(last.OccurredAt)
+	if err != nil || !occurredAt.After(lastAt) {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	effect.Version, effect.Purpose, effect.Digest = gatewayRebindTypedEffectVersion, gatewayRebindTypedEffectPurpose, ""
+	effect.Digest, err = gatewayRebindTypedEffectDigest(effect)
+	if err != nil {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	sequence := uint64(len(previous) + 1)
+	phase, ok := gatewayRebindTypedEffectPhase(sequence)
+	if !ok {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	value := gatewayRebindProgressRecord{
+		Version: gatewayRebindProgressVersion, Generation: intent.Generation, OperationID: intent.OperationID,
+		Sequence: sequence, Phase: phase, OccurredAt: occurredAt.UTC().Format(time.RFC3339Nano),
+		ProtectedIntentDigest: intent.Digest, PreviousDigest: last.Digest, TypedEffect: &effect,
+	}
+	_, value.Purpose = gatewayRebindProgressName(value.Generation, value.OperationID, value.Sequence)
+	value.Digest, err = gatewayRebindProgressDigest(value)
+	selections := make([]gatewayRebindProgressSelection, len(previous))
+	for index := range previous {
+		selections[index] = gatewayRebindProgressSelection{Generation: previous[index].Generation,
+			Sequence: previous[index].Sequence, Record: previous[index], Existing: true}
+	}
+	if err != nil || !gatewayRebindProgressMatchesIntentV2(value, intent, selections) ||
+		!gatewayRebindTypedProgressMatchesCheckpoint(intent, checkpoint, append(previous, value)) {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	return value, nil
+}
+
+func gatewayRebindTypedEffectDigest(value gatewayRebindTypedEffectProgress) (string, error) {
+	value.Digest = ""
+	return canonicalDigest(value)
+}
+
+func gatewayRebindTypedRollbackDigest(value gatewayRebindTypedRollbackProgress) (string, error) {
+	value.Digest = ""
+	return canonicalDigest(value)
+}
+
+func gatewayRebindTypedRollbackPlanDigest(intent gatewayRebindProtectedIntentV2,
+	value gatewayRebindTypedRollbackProgress,
+) (string, error) {
+	return canonicalDigest(struct {
+		Purpose                 string                                   `json:"purpose"`
+		ProtectedIntentDigest   string                                   `json:"protectedIntentDigest"`
+		Predecessor             appaccess.GatewayRebindSourceRef         `json:"predecessor"`
+		FromSequence            uint64                                   `json:"fromSequence"`
+		FromPhase               gatewayRebindProgressPhase               `json:"fromPhase"`
+		FromDigest              string                                   `json:"fromDigest"`
+		Owned                   gatewayRebindTypedRollbackOwnedResources `json:"owned"`
+		PredecessorRoutesDigest string                                   `json:"predecessorRoutesDigest"`
+		AdoptionProofDigest     string                                   `json:"adoptionProofDigest,omitempty"`
+	}{"hostd/generated-ingress/rebind/typed-rollback-plan/v1", intent.Digest, intent.Predecessor,
+		value.FromSequence, value.FromPhase, value.FromDigest, value.Owned,
+		value.PredecessorRoutesDigest, value.AdoptionProofDigest})
+}
+
+func gatewayRebindTypedRollbackOwnedFromEffect(value gatewayRebindTypedEffectProgress) gatewayRebindTypedRollbackOwnedResources {
+	result := gatewayRebindTypedRollbackOwnedResources{ImageID: value.ImageID}
+	if value.Network != nil {
+		copy := *value.Network
+		result.IngressNetwork = &copy
+	}
+	if value.ConfigVolume != nil {
+		copy := *value.ConfigVolume
+		result.ConfigVolume = &copy
+	}
+	if value.DataVolume != nil {
+		copy := *value.DataVolume
+		result.DataVolume = &copy
+	}
+	if value.StageContainer != nil {
+		copy := *value.StageContainer
+		result.StageContainer = &copy
+	}
+	if value.FinalContainer != nil {
+		copy := *value.FinalContainer
+		result.FinalContainer = &copy
+	}
+	result.ApplicationNetworks = append([]gatewayRebindHandoverApplicationNetwork(nil), value.ApplicationNetworks...)
+	return result
+}
+
+func validGatewayRebindTypedRollbackOwned(value gatewayRebindTypedRollbackOwnedResources,
+	identity gatewayRebindSuccessorIdentity,
+) bool {
+	return validGatewayRebindTypedRollbackOwnedShape(value) && validGatewayRebindSuccessorIdentityValue(identity) &&
+		(value.ConfigVolume == nil || value.ConfigVolume.Name == identity.ConfigVolume) &&
+		(value.DataVolume == nil || value.DataVolume.Name == identity.DataVolume)
+}
+
+func validGatewayRebindTypedRollbackOwnedShape(value gatewayRebindTypedRollbackOwnedResources) bool {
+	if value.ImageID == "" {
+		return value.IngressNetwork == nil && value.ConfigVolume == nil && value.DataVolume == nil &&
+			value.StageContainer == nil && value.FinalContainer == nil && len(value.ApplicationNetworks) == 0
+	}
+	if !validSHA256(value.ImageID) ||
+		value.ConfigVolume != nil && value.IngressNetwork == nil ||
+		value.DataVolume != nil && value.ConfigVolume == nil ||
+		value.StageContainer != nil && value.DataVolume == nil ||
+		value.FinalContainer != nil && value.StageContainer == nil {
+		return false
+	}
+	if value.IngressNetwork != nil && (!validContainerID(value.IngressNetwork.ID) ||
+		normalizeID(value.IngressNetwork.ID) != value.IngressNetwork.ID || !validSHA256(value.IngressNetwork.OwnershipDigest)) {
+		return false
+	}
+	if value.ConfigVolume != nil && !validGatewayRebindStageConfigVolumeBindingValue(*value.ConfigVolume) {
+		return false
+	}
+	if value.DataVolume != nil && !validGatewayRebindStageDataVolumeBindingValue(*value.DataVolume) {
+		return false
+	}
+	if value.StageContainer != nil && !validGatewayRebindStageContainerBindingValue(*value.StageContainer) {
+		return false
+	}
+	if value.FinalContainer != nil && (!validGatewayRebindFinalContainerBindingValue(*value.FinalContainer) ||
+		value.StageContainer == nil || value.FinalContainer.ID == value.StageContainer.ID) {
+		return false
+	}
+	return validGatewayRebindFinalHandoverApplicationNetworkValues(value.ApplicationNetworks)
+}
+
+func validGatewayRebindTypedRollbackProgress(value gatewayRebindTypedRollbackProgress) bool {
+	expectedPhase, phaseOK := gatewayRebindTypedForwardPhase(value.FromSequence)
+	if value.Version != gatewayRebindTypedRollbackVersion || value.Purpose != gatewayRebindTypedRollbackPurpose ||
+		value.FromSequence < 1 || value.FromSequence > 16 || !phaseOK || value.FromPhase != expectedPhase ||
+		!validSHA256(value.FromDigest) || !validSHA256(value.PlanDigest) ||
+		!validGatewayRebindTypedRollbackOwnedShape(value.Owned) || !validSHA256(value.PredecessorRoutesDigest) ||
+		(value.AdoptionProofDigest != "" && !validSHA256(value.AdoptionProofDigest)) || !validSHA256(value.Digest) {
+		return false
+	}
+	if value.PhysicalProof != nil && !validGatewayRebindFinalHandoverOutcomeValue(*value.PhysicalProof) {
+		return false
+	}
+	digest, err := gatewayRebindTypedRollbackDigest(value)
+	return err == nil && digest == value.Digest
+}
+
+func gatewayRebindTypedRollbackOwnedContains(bound, planned gatewayRebindTypedRollbackOwnedResources,
+	fromSequence uint64,
+) bool {
+	if bound.ImageID != planned.ImageID || bound.IngressNetwork != nil && !reflect.DeepEqual(bound.IngressNetwork, planned.IngressNetwork) ||
+		bound.ConfigVolume != nil && !reflect.DeepEqual(bound.ConfigVolume, planned.ConfigVolume) ||
+		bound.DataVolume != nil && !reflect.DeepEqual(bound.DataVolume, planned.DataVolume) ||
+		bound.StageContainer != nil && !reflect.DeepEqual(bound.StageContainer, planned.StageContainer) ||
+		bound.FinalContainer != nil && !reflect.DeepEqual(bound.FinalContainer, planned.FinalContainer) ||
+		!reflect.DeepEqual(bound.ApplicationNetworks, planned.ApplicationNetworks) {
+		return false
+	}
+	if reflect.DeepEqual(bound, planned) {
+		return true
+	}
+	// Only the one effect authorized by the immediately retained creation
+	// intent may be adopted after a lost acknowledgment. Future resources and
+	// foreign extras remain fenced even when their individual hashes are valid.
+	projection := planned
+	switch fromSequence {
+	case 2:
+		if bound.IngressNetwork != nil || planned.IngressNetwork == nil {
+			return false
+		}
+		projection.IngressNetwork = nil
+	case 3:
+		if bound.ConfigVolume != nil || planned.ConfigVolume == nil {
+			return false
+		}
+		projection.ConfigVolume = nil
+	case 4:
+		if bound.DataVolume != nil || planned.DataVolume == nil {
+			return false
+		}
+		projection.DataVolume = nil
+	case 5:
+		if bound.StageContainer != nil || planned.StageContainer == nil {
+			return false
+		}
+		projection.StageContainer = nil
+	case 13:
+		if bound.FinalContainer != nil || planned.FinalContainer == nil {
+			return false
+		}
+		projection.FinalContainer = nil
+	default:
+		return false
+	}
+	return reflect.DeepEqual(bound, projection)
+}
+
+func validGatewayRebindTypedRollbackPhysicalProof(value gatewayRebindFinalHandoverTerminalProof,
+	rollback gatewayRebindTypedRollbackProgress, priorProgressDigest string,
+) bool {
+	observation := value.Observation
+	return validGatewayRebindFinalHandoverOutcomeValue(value) && value.Kind == gatewayRebindFinalHandoverOutcomeAbort &&
+		value.PriorProgressDigest == priorProgressDigest && observation.Stage == gatewayRebindHandoverContainerAbsent &&
+		observation.Final == gatewayRebindHandoverContainerAbsent && observation.FinalID == "" &&
+		observation.PredecessorRunning && observation.PredecessorAddress == gatewayRebindPredecessorAddressPresent &&
+		!observation.ConfigVolumePresent && !observation.DataVolumePresent && !observation.IngressNetworkPresent &&
+		len(observation.ApplicationNetworks) == 0 && observation.ConfigDigest == "" && observation.RoutesDigest == "" &&
+		observation.PredecessorRoutesDigest == rollback.PredecessorRoutesDigest && observation.PredecessorStopDigest == ""
+}
+
+func newGatewayRebindTypedRollbackIntentV2(intent gatewayRebindProtectedIntentV2,
+	previous []gatewayRebindProgressRecord, owned gatewayRebindTypedRollbackOwnedResources,
+	predecessorRoutesDigest, adoptionProofDigest string, occurredAt time.Time,
+) (gatewayRebindProgressRecord, error) {
+	invalid := errors.New("invalid generated ingress typed rollback intent")
+	if !validGatewayRebindProtectedIntentV2(intent) || len(previous) < 1 || len(previous) >= 17 ||
+		!validGatewayRebindProgressTime(occurredAt) {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	last := previous[len(previous)-1]
+	if last.TypedRollback != nil || last.Sequence < 1 || last.Sequence > 16 ||
+		(last.Sequence == 1) != (last.TypedEffect == nil) ||
+		!validGatewayRebindTypedRollbackOwned(owned, intent.Identity) || !validSHA256(predecessorRoutesDigest) {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	bound := gatewayRebindTypedRollbackOwnedResources{}
+	if last.TypedEffect != nil {
+		bound = gatewayRebindTypedRollbackOwnedFromEffect(*last.TypedEffect)
+	}
+	if !gatewayRebindTypedRollbackOwnedContains(bound, owned, last.Sequence) ||
+		(!reflect.DeepEqual(bound, owned) && !validSHA256(adoptionProofDigest)) ||
+		(reflect.DeepEqual(bound, owned) && adoptionProofDigest != "") {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	lastAt, err := parseGatewayRebindProgressTime(last.OccurredAt)
+	if err != nil || !occurredAt.After(lastAt) {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	rollback := gatewayRebindTypedRollbackProgress{
+		Version: gatewayRebindTypedRollbackVersion, Purpose: gatewayRebindTypedRollbackPurpose,
+		FromSequence: last.Sequence, FromPhase: last.Phase, FromDigest: last.Digest,
+		Owned: owned, PredecessorRoutesDigest: predecessorRoutesDigest, AdoptionProofDigest: adoptionProofDigest,
+	}
+	rollback.PlanDigest, err = gatewayRebindTypedRollbackPlanDigest(intent, rollback)
+	if err != nil {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	rollback.Digest, err = gatewayRebindTypedRollbackDigest(rollback)
+	if err != nil {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	value := gatewayRebindProgressRecord{
+		Version: gatewayRebindProgressVersion, Generation: intent.Generation, OperationID: intent.OperationID,
+		Sequence: last.Sequence + 1, Phase: gatewayRebindProgressRollbackIntent,
+		OccurredAt: occurredAt.UTC().Format(time.RFC3339Nano), ProtectedIntentDigest: intent.Digest,
+		PreviousDigest: last.Digest, TypedRollback: &rollback,
+	}
+	_, value.Purpose = gatewayRebindProgressName(value.Generation, value.OperationID, value.Sequence)
+	value.Digest, err = gatewayRebindProgressDigest(value)
+	selections := make([]gatewayRebindProgressSelection, len(previous))
+	for index := range previous {
+		selections[index] = gatewayRebindProgressSelection{Generation: previous[index].Generation,
+			Sequence: previous[index].Sequence, Record: previous[index], Existing: true}
+	}
+	if err != nil || !gatewayRebindProgressMatchesIntentV2(value, intent, selections) {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	return value, nil
+}
+
+func newGatewayRebindTypedRollbackCompleteV2(intent gatewayRebindProtectedIntentV2,
+	previous []gatewayRebindProgressRecord, proof gatewayRebindFinalHandoverTerminalProof, occurredAt time.Time,
+) (gatewayRebindProgressRecord, error) {
+	invalid := errors.New("invalid generated ingress typed rollback completion")
+	if !validGatewayRebindProtectedIntentV2(intent) || len(previous) < 2 || len(previous) >= 18 ||
+		!validGatewayRebindProgressTime(occurredAt) {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	last := previous[len(previous)-1]
+	if last.Phase != gatewayRebindProgressRollbackIntent || last.TypedRollback == nil || last.TypedRollback.PhysicalProof != nil {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	lastAt, err := parseGatewayRebindProgressTime(last.OccurredAt)
+	rollback := *last.TypedRollback
+	if err != nil || !occurredAt.After(lastAt) || !validGatewayRebindTypedRollbackPhysicalProof(proof, rollback, last.Digest) {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	proofCopy := proof
+	rollback.PhysicalProof = &proofCopy
+	rollback.Digest, err = gatewayRebindTypedRollbackDigest(rollback)
+	if err != nil {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	value := gatewayRebindProgressRecord{
+		Version: gatewayRebindProgressVersion, Generation: intent.Generation, OperationID: intent.OperationID,
+		Sequence: last.Sequence + 1, Phase: gatewayRebindProgressHandoverRolledBack,
+		OccurredAt: occurredAt.UTC().Format(time.RFC3339Nano), ProtectedIntentDigest: intent.Digest,
+		PreviousDigest: last.Digest, TypedRollback: &rollback,
+	}
+	_, value.Purpose = gatewayRebindProgressName(value.Generation, value.OperationID, value.Sequence)
+	value.Digest, err = gatewayRebindProgressDigest(value)
+	selections := make([]gatewayRebindProgressSelection, len(previous))
+	for index := range previous {
+		selections[index] = gatewayRebindProgressSelection{Generation: previous[index].Generation,
+			Sequence: previous[index].Sequence, Record: previous[index], Existing: true}
+	}
+	if err != nil || !gatewayRebindProgressMatchesIntentV2(value, intent, selections) {
+		return gatewayRebindProgressRecord{}, invalid
+	}
+	return value, nil
+}
+
+func gatewayRebindTypedStagePlanDigest(intent gatewayRebindProtectedIntentV2) (string, error) {
+	return canonicalDigest(struct {
+		Purpose     string                              `json:"purpose"`
+		Intent      string                              `json:"protectedIntentDigest"`
+		Checkpoint  string                              `json:"predecessorCheckpointDigest"`
+		Source      string                              `json:"sourceStateDigest"`
+		Identity    gatewayRebindSuccessorIdentity      `json:"identity"`
+		Network     gatewayRebindSuccessorIntentNetwork `json:"network"`
+		NetworkHash string                              `json:"networkDigest"`
+	}{"hostd/generated-ingress/rebind/typed-stage-plan/v1", intent.Digest,
+		intent.Predecessor.PredecessorCheckpointDigest, intent.Predecessor.SourceStateDigest,
+		intent.Identity, intent.Network, intent.NetworkDigest})
+}
+
+func gatewayRebindTypedEffectPhase(sequence uint64) (gatewayRebindProgressPhase, bool) {
+	phases := [...]gatewayRebindProgressPhase{
+		gatewayRebindProgressStageIntent, gatewayRebindProgressStageIntent,
+		gatewayRebindProgressStageIntent, gatewayRebindProgressStageIntent, gatewayRebindProgressStageIntent,
+		gatewayRebindProgressStageConfigIntent, gatewayRebindProgressStageConfigCopied,
+		gatewayRebindProgressStageStartIntent, gatewayRebindProgressStageServing,
+		gatewayRebindProgressFinalConfigIntent, gatewayRebindProgressFinalConfigCopied,
+		gatewayRebindProgressFinalHandoverIntent, gatewayRebindProgressFinalContainerBound,
+		gatewayRebindProgressCutoverIntent, gatewayRebindProgressSuccessorServing,
+		gatewayRebindProgressHandoverCommitted,
+	}
+	if sequence < 2 || sequence > 17 {
+		return "", false
+	}
+	return phases[sequence-2], true
+}
+
+func gatewayRebindTypedForwardPhase(sequence uint64) (gatewayRebindProgressPhase, bool) {
+	if sequence == 1 {
+		return gatewayRebindProgressSuccessorIntent, true
+	}
+	return gatewayRebindTypedEffectPhase(sequence)
+}
+
+func gatewayRebindTypedPhysicalOutcomeMatches(identity gatewayRebindSuccessorIdentity, previousDigest string,
+	resources gatewayRebindFinalHandoverResourceBindings, proof gatewayRebindFinalHandoverTerminalProof,
+) bool {
+	if !validGatewayRebindSuccessorIdentityValue(identity) || !validSHA256(previousDigest) ||
+		!validGatewayRebindFinalHandoverResourceBindingsValue(resources) ||
+		!validGatewayRebindFinalHandoverOutcomeValue(proof) || proof.Kind != gatewayRebindFinalHandoverOutcomeCommit ||
+		proof.PriorProgressDigest != previousDigest || resources.ConfigVolume.Name != identity.ConfigVolume ||
+		resources.DataVolume.Name != identity.DataVolume || resources.FinalContainer == nil ||
+		proof.Observation.Stage != gatewayRebindHandoverContainerAbsent ||
+		proof.Observation.Final != gatewayRebindHandoverContainerRunning ||
+		proof.Observation.FinalID != resources.FinalContainer.ID || proof.Observation.PredecessorRunning ||
+		!proof.Observation.ConfigVolumePresent || !proof.Observation.DataVolumePresent ||
+		!proof.Observation.IngressNetworkPresent || !validSHA256(proof.Observation.ConfigDigest) ||
+		!validSHA256(proof.Observation.RoutesDigest) || !validSHA256(proof.Observation.PredecessorStopDigest) ||
+		!reflect.DeepEqual(proof.Observation.ApplicationNetworks, resources.ApplicationNetworks) {
+		return false
+	}
+	return true
 }
 
 func newGatewayRebindStageIntentProgress(intent gatewayRebindProtectedIntent,
@@ -636,7 +1112,8 @@ func gatewayRebindProgressDigest(value gatewayRebindProgressRecord) (string, err
 func validGatewayRebindProgressRecord(value gatewayRebindProgressRecord) bool {
 	if value.Version != gatewayRebindProgressVersion || value.Generation == 0 || value.Generation == math.MaxUint64 ||
 		!validCanonicalUUID(value.OperationID) || value.Sequence == 0 || value.Sequence > gatewayRebindProgressMaximumSequence ||
-		!validSHA256(value.ProtectedIntentDigest) || !validSHA256(value.Digest) {
+		!validSHA256(value.ProtectedIntentDigest) || !validSHA256(value.Digest) ||
+		(value.Sequence <= 12 && value.Handover != nil) {
 		return false
 	}
 	_, expectedPurpose := gatewayRebindProgressName(value.Generation, value.OperationID, value.Sequence)
@@ -645,6 +1122,26 @@ func validGatewayRebindProgressRecord(value gatewayRebindProgressRecord) bool {
 	}
 	if _, err := parseGatewayRebindProgressTime(value.OccurredAt); err != nil {
 		return false
+	}
+	if value.TypedEffect != nil {
+		expectedPhase, ok := gatewayRebindTypedEffectPhase(value.Sequence)
+		if !ok || value.Phase != expectedPhase || !validSHA256(value.PreviousDigest) ||
+			value.Stage != nil || value.Handover != nil || value.TypedRollback != nil ||
+			!validGatewayRebindTypedEffectProgress(*value.TypedEffect, value.Sequence) {
+			return false
+		}
+		digest, err := gatewayRebindProgressDigest(value)
+		return err == nil && digest == value.Digest
+	}
+	if value.TypedRollback != nil {
+		if (value.Phase != gatewayRebindProgressRollbackIntent && value.Phase != gatewayRebindProgressHandoverRolledBack) ||
+			!validSHA256(value.PreviousDigest) || value.Stage != nil || value.Handover != nil ||
+			!validGatewayRebindTypedRollbackProgress(*value.TypedRollback) ||
+			(value.Phase == gatewayRebindProgressRollbackIntent) != (value.TypedRollback.PhysicalProof == nil) {
+			return false
+		}
+		digest, err := gatewayRebindProgressDigest(value)
+		return err == nil && digest == value.Digest
 	}
 	switch value.Phase {
 	case gatewayRebindProgressSuccessorIntent:
@@ -686,10 +1183,85 @@ func validGatewayRebindProgressRecord(value gatewayRebindProgressRecord) bool {
 			!validGatewayRebindStageIntent(*value.Stage) {
 			return false
 		}
+	case gatewayRebindProgressFinalHandoverIntent, gatewayRebindProgressFinalContainerBound,
+		gatewayRebindProgressCutoverIntent, gatewayRebindProgressSuccessorServing,
+		gatewayRebindProgressHandoverCommitted, gatewayRebindProgressRollbackIntent,
+		gatewayRebindProgressHandoverRolledBack:
+		if value.Sequence < 13 || value.Sequence > gatewayRebindProgressMaximumSequence ||
+			!validSHA256(value.PreviousDigest) || value.Stage == nil ||
+			!validGatewayRebindStageIntent(*value.Stage) || value.Handover == nil ||
+			!validGatewayRebindFinalHandoverProgressValue(*value.Handover) {
+			return false
+		}
 	default:
 		return false
 	}
 	digest, err := gatewayRebindProgressDigest(value)
+	return err == nil && digest == value.Digest
+}
+
+func validGatewayRebindTypedEffectProgress(value gatewayRebindTypedEffectProgress, sequence uint64) bool {
+	if value.Version != gatewayRebindTypedEffectVersion || value.Purpose != gatewayRebindTypedEffectPurpose ||
+		!validSHA256(value.ImageID) || !validSHA256(value.StagePlanDigest) || !validSHA256(value.Digest) {
+		return false
+	}
+	if (sequence >= 3) != (value.Network != nil) || sequence >= 3 && (!validContainerID(value.Network.ID) ||
+		normalizeID(value.Network.ID) != value.Network.ID || !validSHA256(value.Network.OwnershipDigest)) {
+		return false
+	}
+	if (sequence >= 4) != (value.ConfigVolume != nil) || sequence >= 4 && !validGatewayRebindStageConfigVolumeBindingValue(*value.ConfigVolume) {
+		return false
+	}
+	if (sequence >= 5) != (value.DataVolume != nil) || sequence >= 5 && !validGatewayRebindStageDataVolumeBindingValue(*value.DataVolume) {
+		return false
+	}
+	if (sequence >= 6) != (value.StageContainer != nil) || sequence >= 6 && !validGatewayRebindStageContainerBindingValue(*value.StageContainer) {
+		return false
+	}
+	if (sequence >= 7) != (value.StageConfigIntent != nil) ||
+		sequence >= 7 && !validGatewayRebindStageConfigIntentBindingValue(*value.StageConfigIntent) ||
+		(sequence >= 8) != (value.StageConfigCopy != nil) ||
+		sequence >= 8 && !validGatewayRebindStageConfigCopyBindingValue(*value.StageConfigCopy) ||
+		(sequence >= 9) != (value.StageStartIntent != nil) ||
+		sequence >= 9 && !validGatewayRebindStageStartIntentBindingValue(*value.StageStartIntent) ||
+		(sequence >= 10) != (value.StageServing != nil) ||
+		sequence >= 10 && !validGatewayRebindStageServingBindingValue(*value.StageServing) ||
+		(sequence >= 11) != (value.FinalConfigIntent != nil) ||
+		sequence >= 11 && !validGatewayRebindTypedFinalConfigIntentBindingValue(*value.FinalConfigIntent) ||
+		(sequence >= 12) != (value.FinalConfigCopy != nil) ||
+		sequence >= 12 && !validGatewayRebindFinalConfigCopyBindingValue(*value.FinalConfigCopy) ||
+		(sequence >= 13) != (value.HandoverIntent != nil) ||
+		sequence >= 13 && !validGatewayRebindTypedHandoverIntentValue(*value.HandoverIntent) ||
+		(sequence >= 15) != (value.CutoverIntent != nil) ||
+		sequence >= 15 && !validGatewayRebindTypedCutoverIntentValue(*value.CutoverIntent) ||
+		(sequence >= 16) != (value.SuccessorServing != nil) ||
+		sequence >= 16 && !validGatewayRebindFinalHandoverServingValue(*value.SuccessorServing) {
+		return false
+	}
+	if sequence < 13 && len(value.ApplicationNetworks) != 0 ||
+		sequence >= 13 && !validGatewayRebindFinalHandoverApplicationNetworkValues(value.ApplicationNetworks) {
+		return false
+	}
+	if (sequence >= 14) != (value.FinalContainer != nil) || sequence >= 14 && (!validGatewayRebindFinalContainerBindingValue(*value.FinalContainer) ||
+		value.StageContainer == nil || value.FinalContainer.ID == value.StageContainer.ID) {
+		return false
+	}
+	if sequence == 17 {
+		if value.Resources == nil || value.PhysicalProof == nil ||
+			!validGatewayRebindFinalHandoverResourceBindingsValue(*value.Resources) ||
+			!validGatewayRebindFinalHandoverOutcomeValue(*value.PhysicalProof) ||
+			value.PhysicalProof.Kind != gatewayRebindFinalHandoverOutcomeCommit || value.Network == nil ||
+			value.ConfigVolume == nil || value.DataVolume == nil || value.StageContainer == nil || value.FinalContainer == nil ||
+			value.Resources.ImageID != value.ImageID || *value.Resources.FinalContainer != *value.FinalContainer ||
+			value.Resources.IngressNetwork != *value.Network || value.Resources.ConfigVolume != *value.ConfigVolume ||
+			value.Resources.DataVolume != *value.DataVolume || value.Resources.StageContainer != *value.StageContainer ||
+			!reflect.DeepEqual(value.Resources.ApplicationNetworks, value.ApplicationNetworks) {
+			return false
+		}
+	} else if value.Resources != nil || value.PhysicalProof != nil {
+		return false
+	}
+	digest, err := gatewayRebindTypedEffectDigest(value)
 	return err == nil && digest == value.Digest
 }
 
@@ -846,6 +1418,29 @@ func (s *gatewayRebindProgressStore) installExact(ctx context.Context, value gat
 func gatewayRebindProgressInstallPermitted(history gatewayRebindProtectedIntentHistory,
 	value gatewayRebindProgressRecord,
 ) bool {
+	for _, selected := range history.IntentsV2 {
+		if selected.Generation != value.Generation || selected.Intent.OperationID != value.OperationID ||
+			selected.Intent.Digest != value.ProtectedIntentDigest {
+			continue
+		}
+		previous := make([]gatewayRebindProgressSelection, 0, value.Sequence-1)
+		for _, existing := range history.Progress {
+			if existing.Generation != value.Generation {
+				continue
+			}
+			if existing.Sequence == value.Sequence {
+				return gatewayRebindProgressMatchesIntentV2(value, selected.Intent, previous) &&
+					reflect.DeepEqual(existing.Record, value) &&
+					gatewayRebindProgressMatchesCheckpointHistory(history, selected.Intent, previous, value)
+			}
+			if existing.Sequence < value.Sequence {
+				previous = append(previous, existing)
+			}
+		}
+		return value.Sequence == uint64(len(previous)+1) &&
+			gatewayRebindProgressMatchesIntentV2(value, selected.Intent, previous) &&
+			gatewayRebindProgressMatchesCheckpointHistory(history, selected.Intent, previous, value)
+	}
 	if len(history.Intents) != 1 || history.Intents[0].Generation != value.Generation ||
 		history.Intents[0].Intent.OperationID != value.OperationID ||
 		history.Intents[0].Intent.Digest != value.ProtectedIntentDigest {
@@ -858,7 +1453,8 @@ func gatewayRebindProgressInstallPermitted(history gatewayRebindProtectedIntentH
 		}
 		if existing.Sequence == value.Sequence {
 			if !gatewayRebindProgressMatchesIntent(value, history.Intents[0].Intent, previous) ||
-				!gatewayRebindProgressMatchesPredecessor(history, value) {
+				!gatewayRebindProgressMatchesPredecessor(history, value) ||
+				!gatewayRebindProgressMatchesHandoverContext(history, value) {
 				return false
 			}
 			return reflect.DeepEqual(existing.Record, value)
@@ -869,13 +1465,228 @@ func gatewayRebindProgressInstallPermitted(history gatewayRebindProtectedIntentH
 	}
 	return value.Sequence == uint64(len(history.Progress)+1) &&
 		gatewayRebindProgressMatchesIntent(value, history.Intents[0].Intent, previous) &&
-		gatewayRebindProgressMatchesPredecessor(history, value)
+		gatewayRebindProgressMatchesPredecessor(history, value) &&
+		gatewayRebindProgressMatchesHandoverContext(history, value)
+}
+
+func gatewayRebindProgressMatchesCheckpointHistory(history gatewayRebindProtectedIntentHistory,
+	intent gatewayRebindProtectedIntentV2, previous []gatewayRebindProgressSelection,
+	value gatewayRebindProgressRecord,
+) bool {
+	for _, selected := range history.Checkpoints {
+		if selected.Generation != intent.Generation || selected.Checkpoint.OperationID != intent.OperationID {
+			continue
+		}
+		records := make([]gatewayRebindProgressRecord, 0, len(previous)+1)
+		for _, prior := range previous {
+			records = append(records, prior.Record)
+		}
+		records = append(records, value)
+		return gatewayRebindTypedProgressMatchesCheckpoint(intent, selected.Checkpoint, records)
+	}
+	return false
+}
+
+func scanGatewayRebindProgressForIntentV2(dataRoot string, intent gatewayRebindProtectedIntentV2,
+	checkpoint gatewayRebindPredecessorCheckpoint, artifacts gatewayRebindHistoryGeneration,
+) ([]gatewayRebindProgressSelection, error) {
+	sequences := make([]uint64, 0, len(artifacts.progress))
+	for sequence := range artifacts.progress {
+		sequences = append(sequences, sequence)
+	}
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	result := make([]gatewayRebindProgressSelection, 0, len(sequences))
+	for index, sequence := range sequences {
+		if sequence != uint64(index+1) || sequence > gatewayRebindProgressMaximumSequence {
+			return nil, errors.New("generated ingress typed rebind progress history has a sequence gap")
+		}
+		artifact := artifacts.progress[sequence]
+		store, err := newGatewayRebindProgressStore(dataRoot, intent.Generation, intent.OperationID, sequence)
+		if err != nil || store.path != artifact.path {
+			return nil, errors.New("generated ingress typed rebind progress history path is invalid")
+		}
+		value, err := store.load()
+		if err != nil || !gatewayRebindProgressMatchesIntentV2(value, intent, result) {
+			return nil, errors.New("generated ingress typed rebind progress history is invalid")
+		}
+		result = append(result, gatewayRebindProgressSelection{Store: store, Generation: intent.Generation,
+			Sequence: sequence, Record: value, Existing: true})
+	}
+	records := make([]gatewayRebindProgressRecord, len(result))
+	for index := range result {
+		records[index] = result[index].Record
+	}
+	if !gatewayRebindTypedProgressMatchesCheckpoint(intent, checkpoint, records) {
+		return nil, errors.New("generated ingress typed rebind progress disagrees with predecessor checkpoint")
+	}
+	return result, nil
+}
+
+func gatewayRebindProgressMatchesIntentV2(value gatewayRebindProgressRecord,
+	intent gatewayRebindProtectedIntentV2, previous []gatewayRebindProgressSelection,
+) bool {
+	if !validGatewayRebindProtectedIntentV2(intent) || !validGatewayRebindProgressRecord(value) ||
+		value.Generation != intent.Generation || value.OperationID != intent.OperationID ||
+		value.ProtectedIntentDigest != intent.Digest {
+		return false
+	}
+	if value.Sequence == 1 {
+		return value.Phase == gatewayRebindProgressSuccessorIntent && len(previous) == 0 &&
+			value.PreviousDigest == "" && value.Stage == nil && value.Handover == nil &&
+			value.TypedEffect == nil && value.TypedRollback == nil
+	}
+	if value.Sequence < 2 || value.Sequence > 18 || len(previous) != int(value.Sequence-1) {
+		return false
+	}
+	prior := previous[len(previous)-1].Record
+	priorAt, priorErr := parseGatewayRebindProgressTime(prior.OccurredAt)
+	currentAt, currentErr := parseGatewayRebindProgressTime(value.OccurredAt)
+	if priorErr != nil || currentErr != nil || !currentAt.After(priorAt) ||
+		value.PreviousDigest != prior.Digest || prior.Sequence+1 != value.Sequence {
+		return false
+	}
+	if value.TypedRollback != nil {
+		return value.TypedEffect == nil && gatewayRebindTypedRollbackMatchesIntent(value, intent, previous)
+	}
+	if value.TypedEffect == nil || value.TypedRollback != nil || value.Sequence > 17 ||
+		!gatewayRebindTypedEffectMatchesIntent(*value.TypedEffect, intent, prior) {
+		return false
+	}
+	if value.Sequence == 2 {
+		return prior.Sequence == 1 && prior.TypedEffect == nil
+	}
+	return prior.TypedEffect != nil && gatewayRebindTypedEffectExtends(*prior.TypedEffect, *value.TypedEffect, value.Sequence)
+}
+
+func gatewayRebindTypedRollbackMatchesIntent(value gatewayRebindProgressRecord,
+	intent gatewayRebindProtectedIntentV2, previous []gatewayRebindProgressSelection,
+) bool {
+	rollback := value.TypedRollback
+	if rollback == nil || !validGatewayRebindTypedRollbackProgress(*rollback) ||
+		rollback.FromSequence >= uint64(len(previous)+1) || rollback.FromSequence < 1 {
+		return false
+	}
+	forward := previous[rollback.FromSequence-1].Record
+	if forward.Sequence != rollback.FromSequence || forward.TypedRollback != nil ||
+		(forward.Sequence == 1) != (forward.TypedEffect == nil) ||
+		forward.Phase != rollback.FromPhase || forward.Digest != rollback.FromDigest ||
+		!validGatewayRebindTypedRollbackOwned(rollback.Owned, intent.Identity) {
+		return false
+	}
+	bound := gatewayRebindTypedRollbackOwnedResources{}
+	if forward.TypedEffect != nil {
+		bound = gatewayRebindTypedRollbackOwnedFromEffect(*forward.TypedEffect)
+	}
+	if !gatewayRebindTypedRollbackOwnedContains(bound, rollback.Owned, rollback.FromSequence) ||
+		(!reflect.DeepEqual(bound, rollback.Owned) && !validSHA256(rollback.AdoptionProofDigest)) ||
+		(reflect.DeepEqual(bound, rollback.Owned) && rollback.AdoptionProofDigest != "") {
+		return false
+	}
+	planDigest, err := gatewayRebindTypedRollbackPlanDigest(intent, *rollback)
+	if err != nil || planDigest != rollback.PlanDigest {
+		return false
+	}
+	switch value.Phase {
+	case gatewayRebindProgressRollbackIntent:
+		prior := previous[len(previous)-1].Record
+		return rollback.PhysicalProof == nil && prior.Sequence == rollback.FromSequence && prior.Digest == rollback.FromDigest &&
+			value.Sequence == rollback.FromSequence+1
+	case gatewayRebindProgressHandoverRolledBack:
+		prior := previous[len(previous)-1].Record
+		if prior.Phase != gatewayRebindProgressRollbackIntent || prior.TypedRollback == nil ||
+			prior.Sequence != rollback.FromSequence+1 || value.Sequence != rollback.FromSequence+2 ||
+			rollback.PhysicalProof == nil || !validGatewayRebindTypedRollbackPhysicalProof(*rollback.PhysicalProof, *rollback, prior.Digest) {
+			return false
+		}
+		prefix := *rollback
+		prefix.PhysicalProof = nil
+		prefix.Digest = prior.TypedRollback.Digest
+		return reflect.DeepEqual(prefix, *prior.TypedRollback)
+	default:
+		return false
+	}
+}
+
+func gatewayRebindTypedEffectMatchesIntent(value gatewayRebindTypedEffectProgress,
+	intent gatewayRebindProtectedIntentV2, prior gatewayRebindProgressRecord,
+) bool {
+	planDigest, planErr := gatewayRebindTypedStagePlanDigest(intent)
+	if planErr != nil || value.StagePlanDigest != planDigest ||
+		!validGatewayRebindTypedEffectProgress(value, prior.Sequence+1) ||
+		value.ConfigVolume != nil && value.ConfigVolume.Name != intent.Identity.ConfigVolume ||
+		value.DataVolume != nil && value.DataVolume.Name != intent.Identity.DataVolume ||
+		!gatewayRebindTypedEffectSemanticMatch(value, intent, prior) {
+		return false
+	}
+	if prior.Sequence+1 == 17 {
+		return value.Resources != nil && value.PhysicalProof != nil &&
+			gatewayRebindTypedPhysicalOutcomeMatches(intent.Identity, prior.Digest, *value.Resources, *value.PhysicalProof)
+	}
+	return true
+}
+
+func gatewayRebindTypedEffectExtends(previous, current gatewayRebindTypedEffectProgress, sequence uint64) bool {
+	prefix := current
+	switch sequence {
+	case 3:
+		prefix.Network = nil
+	case 4:
+		prefix.ConfigVolume = nil
+	case 5:
+		prefix.DataVolume = nil
+	case 6:
+		prefix.StageContainer = nil
+	case 7:
+		prefix.StageConfigIntent = nil
+	case 8:
+		prefix.StageConfigCopy = nil
+	case 9:
+		prefix.StageStartIntent = nil
+	case 10:
+		prefix.StageServing = nil
+	case 11:
+		prefix.FinalConfigIntent = nil
+	case 12:
+		prefix.FinalConfigCopy = nil
+	case 13:
+		prefix.HandoverIntent, prefix.ApplicationNetworks = nil, nil
+	case 14:
+		prefix.FinalContainer = nil
+	case 15:
+		prefix.CutoverIntent = nil
+	case 16:
+		prefix.SuccessorServing = nil
+	case 17:
+		prefix.Resources, prefix.PhysicalProof = nil, nil
+	default:
+		return false
+	}
+	prefix.Digest = previous.Digest
+	return reflect.DeepEqual(prefix, previous)
+}
+
+func gatewayRebindProgressMatchesHandoverContext(history gatewayRebindProtectedIntentHistory,
+	value gatewayRebindProgressRecord,
+) bool {
+	if value.Sequence <= 12 {
+		return true
+	}
+	if len(history.Intents) != 1 || len(history.Progress) < 12 ||
+		history.Progress[11].Record.Sequence != 12 || value.Handover == nil || value.Handover.Plan == nil {
+		return false
+	}
+	contextValue := gatewayRebindFinalHandoverContext{
+		Intent: history.Intents[0].Intent, SequenceTwelve: history.Progress[11].Record,
+		Predecessor: history.Predecessor, Source: history.Source, Phase: value.Phase,
+		Plan: value.Handover.Plan, Final: value.Handover.Final,
+	}
+	return validGatewayRebindFinalHandoverProgressContext(contextValue, value)
 }
 
 func gatewayRebindProgressMatchesPredecessor(history gatewayRebindProtectedIntentHistory,
 	value gatewayRebindProgressRecord,
 ) bool {
-	if value.Sequence != 11 && value.Sequence != 12 {
+	if value.Sequence < 11 {
 		return true
 	}
 	return value.Stage != nil && value.Stage.FinalConfigIntent != nil &&
@@ -917,7 +1728,7 @@ func scanGatewayRebindProgressForIntent(dataRoot string, intent gatewayRebindPro
 		}
 		value, err := store.load()
 		if err != nil || !gatewayRebindProgressMatchesIntent(value, intent, result) ||
-			((value.Sequence == 11 || value.Sequence == 12) && (value.Stage == nil || value.Stage.FinalConfigIntent == nil ||
+			(value.Sequence >= 11 && (value.Stage == nil || value.Stage.FinalConfigIntent == nil ||
 				!gatewayRebindFinalConfigRoutePlanMatchesPredecessor(intent, predecessor,
 					value.Stage.FinalConfigIntent.RoutePlan))) {
 			return nil, errors.New("generated ingress rebind progress history is invalid")
@@ -1144,12 +1955,13 @@ func gatewayRebindProgressMatchesIntent(value gatewayRebindProgressRecord, inten
 		currentAt, currentErr := parseGatewayRebindProgressTime(value.OccurredAt)
 		return err == nil && currentErr == nil && currentAt.After(previousAt)
 	default:
-		return false
+		return value.Sequence >= 13 &&
+			gatewayRebindFinalHandoverProgressMatchesIntent(value, intent, previous)
 	}
 }
 
 func gatewayRebindProgressMaxBytes(sequence uint64) int {
-	if sequence == 11 || sequence == 12 {
+	if sequence >= 11 && sequence <= gatewayRebindProgressMaximumSequence {
 		return maxGatewayRebindFinalConfigProgressBytes
 	}
 	return maxGatewayRebindProgressBytes

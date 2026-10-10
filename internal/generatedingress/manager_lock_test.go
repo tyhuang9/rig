@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,6 +91,67 @@ func TestGatewayLockReleasesWhenFenceCancelsContext(t *testing.T) {
 	}
 	if !manager.mu.TryLock() {
 		t.Fatal("cancelled fence retained Manager lock")
+	}
+	manager.mu.Unlock()
+}
+
+func TestGatewayRebindProcessFailStopBlocksReconstructedManagers(t *testing.T) {
+	first, runner := newManagerFixture(t, false)
+	second, err := New(runner, first.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.gatewayRebindFailStopLatch() != second.gatewayRebindFailStopLatch() {
+		t.Fatal("production managers did not share the process fail-stop latch")
+	}
+	first.gatewayRebindFailStopLatch().Store(true)
+	t.Cleanup(func() { gatewayRebindProcessFailStop.Store(false) })
+	for name, manager := range map[string]*Manager{"existing": first, "reconstructed": second} {
+		if release, lockErr := manager.lockGateway(context.Background()); release != nil ||
+			!IsCode(lockErr, DiagnosticRouteUnresolved) {
+			t.Fatalf("%s manager bypassed process fail-stop: release=%t error=%v", name, release != nil, lockErr)
+		}
+	}
+}
+
+func TestGatewayRebindCommitBarrierBlocksReconstructedManagers(t *testing.T) {
+	first, runner := newManagerFixture(t, false)
+	second, err := New(runner, first.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.gatewayRebindCommitBarrierLatch() != second.gatewayRebindCommitBarrierLatch() {
+		t.Fatal("production managers did not share the process commit barrier")
+	}
+	first.gatewayRebindCommitBarrierLatch().Store(true)
+	t.Cleanup(func() { gatewayRebindProcessCommitBarrier.Store(false) })
+	for name, manager := range map[string]*Manager{"existing": first, "reconstructed": second} {
+		if release, lockErr := manager.lockGateway(context.Background()); release != nil ||
+			!IsCode(lockErr, DiagnosticRouteUnresolved) {
+			t.Fatalf("%s manager bypassed process commit barrier: release=%t error=%v",
+				name, release != nil, lockErr)
+		}
+	}
+}
+
+func TestGatewayRebindCommitBarrierRecheckedAfterOSLockAcquisition(t *testing.T) {
+	manager, _ := newManagerFixture(t, false)
+	barrier := &atomic.Bool{}
+	manager.gatewayRebindCommitBarrier = barrier
+	original := managerAcquireGatewayOSLock
+	released := false
+	managerAcquireGatewayOSLock = func(context.Context, *stateStore) (func() error, error) {
+		barrier.Store(true)
+		return func() error { released = true; return nil }, nil
+	}
+	t.Cleanup(func() { managerAcquireGatewayOSLock = original })
+	if release, err := manager.lockGatewayRaw(context.Background()); release != nil ||
+		!IsCode(err, DiagnosticRouteUnresolved) || !released {
+		t.Fatalf("barrier crossing OS acquisition was accepted: release=%t error=%v osReleased=%t",
+			release != nil, err, released)
+	}
+	if !manager.mu.TryLock() {
+		t.Fatal("barrier refusal retained Manager lock")
 	}
 	manager.mu.Unlock()
 }

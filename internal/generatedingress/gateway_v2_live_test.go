@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/hostnetwork"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
@@ -52,6 +54,8 @@ type liveGatewayV2Fixture struct {
 	root         string
 	dockerConfig string
 	stateRoot    string
+	db           *sql.DB
+	repository   *appaccess.Repository
 	ingress      *Manager
 	candidates   []generatedruntime.Candidate
 	spec         liveGatewayV2FixtureSpec
@@ -228,18 +232,24 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	if err != nil {
 		t.Fatal("create live gateway-v2 runtime")
 	}
+	db, err := database.Open(stateRoot)
+	if err != nil {
+		t.Fatal("open real live gateway-v2 control database")
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	repository := appaccess.New(db)
 	ingress, err := New(runner, Options{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		DataRoot: stateRoot, HostPort: freeLoopbackPort(t), CommandTimeout: 45 * time.Second,
 		PullTimeout: 5 * time.Minute, OutputLimit: liveDockerOutputLimit,
-		RebindFenceCheck: func(context.Context) error { return nil },
+		RebindFenceCheck: repository.CheckGatewayRebindFence, RebindCurrentStateRepository: repository,
 	})
 	if err != nil {
 		t.Fatal("create live gateway-v2 ingress")
 	}
 	fixture := &liveGatewayV2Fixture{
 		ctx: ctx, runner: runner, docker: docker, root: root, dockerConfig: dockerConfig,
-		stateRoot: stateRoot, ingress: ingress, spec: spec, interfaceIP: selected.IPv4, port: port,
+		stateRoot: stateRoot, db: db, repository: repository, ingress: ingress, spec: spec, interfaceIP: selected.IPv4, port: port,
 	}
 	// LIFO cleanup removes v2 first, then candidates/v1/application resources.
 	t.Cleanup(func() {

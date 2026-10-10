@@ -11,15 +11,25 @@ import (
 // with protected gateway state. Historical rolled-back attempts are included
 // so a protected binding can be matched by AttemptID and rejected precisely.
 type AppAccessGrantStartupClaim struct {
-	Claim                   AppAccessGrantClaim
-	Revision                AppAccessRevision
-	Allocation              Allocation
-	Profile                 GatewayProfileRevision
-	AppArchived             bool
-	AccessHeadCurrent       bool
-	ProfileHeadCurrent      bool
-	ApproverIsAdministrator bool
-	DisableIntent           *AppAccessDisableIntent
+	Claim                          AppAccessGrantClaim
+	Revision                       AppAccessRevision
+	Allocation                     Allocation
+	Profile                        GatewayProfileRevision
+	EffectiveProfile               GatewayProfileRevision
+	CurrentGatewaySource           GatewayCurrentAuthorityRef
+	TransferChain                  []GatewayRebindAllocationTransfer
+	TransferChainTipDigest         string
+	TerminalReceiptDigest          string
+	RetainedEffectiveProfile       GatewayProfileRevision
+	RetainedGatewaySource          GatewayCurrentAuthorityRef
+	RetainedTransferChain          []GatewayRebindAllocationTransfer
+	RetainedTransferChainTipDigest string
+	RetainedTerminalReceiptDigest  string
+	AppArchived                    bool
+	AccessHeadCurrent              bool
+	ProfileHeadCurrent             bool
+	ApproverIsAdministrator        bool
+	DisableIntent                  *AppAccessDisableIntent
 }
 
 type AppAccessGrantStartupSnapshot struct {
@@ -27,12 +37,16 @@ type AppAccessGrantStartupSnapshot struct {
 }
 
 // HostingGatewayStartupSnapshot is the single durable startup census used by
-// hostd before it starts normal workers. Gateway upgrade and per-app grant
-// facts are observed under the same SQLite read transaction.
+// hostd before it starts normal workers. Gateway upgrade, grant, disable and
+// current rebind facts are observed under the same SQLite read transaction.
 type HostingGatewayStartupSnapshot struct {
-	Upgrades GatewayUpgradeStartupSnapshot
-	Grants   AppAccessGrantStartupSnapshot
-	Disables AppAccessDisableStartupSnapshot
+	Upgrades                      GatewayUpgradeStartupSnapshot
+	Grants                        AppAccessGrantStartupSnapshot
+	Disables                      AppAccessDisableStartupSnapshot
+	Rebind                        GatewayRebindRecoverySnapshot
+	RuntimeHeads                  []GatewayRebindRuntimeHead
+	RuntimeComponents             []GatewayStartupRuntimeComponent
+	ActiveRebindApprovalAuthority *GatewayRebindActiveApprovalAuthority
 }
 
 // AppAccessGrantStartupSnapshot reads every retained attempt, immutable event
@@ -59,12 +73,13 @@ func (r *Repository) AppAccessGrantStartupSnapshot(ctx context.Context) (AppAcce
 	return snapshot, nil
 }
 
-// HostingGatewayStartupSnapshot reads gateway upgrade claims and all LAN grant
-// attempts from one SQLite snapshot. Consumers must still compare these facts
-// with protected generated-ingress state before starting workers or exposing
+// HostingGatewayStartupSnapshot reads gateway upgrade claims, all LAN attempts,
+// current rebind authority and complete active runtime heads/components from
+// one SQLite snapshot. Consumers
+// must still compare these facts with protected state before starting workers or exposing
 // URLs; this method performs no external observation or recovery.
 func (r *Repository) HostingGatewayStartupSnapshot(ctx context.Context) (HostingGatewayStartupSnapshot, error) {
-	if r == nil || r.db == nil {
+	if r == nil || r.db == nil || ctx == nil {
 		return HostingGatewayStartupSnapshot{}, ErrInvalidInput
 	}
 	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
@@ -84,10 +99,27 @@ func (r *Repository) HostingGatewayStartupSnapshot(ctx context.Context) (Hosting
 	if err != nil {
 		return HostingGatewayStartupSnapshot{}, err
 	}
+	rebind, err := readGatewayRebindRecoverySnapshot(ctx, tx)
+	if err != nil {
+		return HostingGatewayStartupSnapshot{}, err
+	}
+	heads, err := readGatewayRebindRuntimeHeads(ctx, tx)
+	if err != nil {
+		return HostingGatewayStartupSnapshot{}, err
+	}
+	components, err := readGatewayStartupRuntimeComponents(ctx, tx, heads)
+	if err != nil {
+		return HostingGatewayStartupSnapshot{}, err
+	}
+	approvals, err := readGatewayRebindActiveApprovalAuthority(ctx, tx, rebind)
+	if err != nil {
+		return HostingGatewayStartupSnapshot{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return HostingGatewayStartupSnapshot{}, err
 	}
-	return HostingGatewayStartupSnapshot{Upgrades: gateway, Grants: grants, Disables: disables}, nil
+	return HostingGatewayStartupSnapshot{Upgrades: gateway, Grants: grants, Disables: disables, Rebind: rebind,
+		RuntimeHeads: heads, RuntimeComponents: components, ActiveRebindApprovalAuthority: approvals}, nil
 }
 
 func (r *Repository) readAppAccessGrantStartupSnapshot(ctx context.Context, tx *sql.Tx) (AppAccessGrantStartupSnapshot, error) {
@@ -144,6 +176,7 @@ func (r *Repository) readGatewayUpgradeStartupSnapshot(ctx context.Context, tx *
 		Claims:         make([]GatewayUpgradeStartupClaim, 0, len(operationIDs)),
 	}
 	activeClaims := 0
+	var rebindRecovery *GatewayRebindRecoverySnapshot
 	for _, operationID := range operationIDs {
 		claim, err := readGatewayProfileUpgradeClaim(ctx, tx, operationID)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -183,12 +216,39 @@ func (r *Repository) readGatewayUpgradeStartupSnapshot(ctx context.Context, tx *
 		if err != nil {
 			return GatewayUpgradeStartupSnapshot{}, err
 		}
-		if claim.State != GatewayProfileUpgradeRolledBack {
+		if claim.State == GatewayProfileUpgradePrepared || claim.State == GatewayProfileUpgradeServing ||
+			claim.State == GatewayProfileUpgradeUnresolved {
 			activeClaims++
 			if activeClaims > 1 || current == nil || actorRole != "administrator" ||
 				current.ID != profile.ID || current.RevisionNumber != profile.RevisionNumber ||
 				current.SpecDigest != profile.SpecDigest {
 				return GatewayUpgradeStartupSnapshot{}, ErrInvalidStoredState
+			}
+		} else if claim.State == GatewayProfileUpgradeCommitted {
+			currentMatches := current != nil && current.ID == profile.ID &&
+				current.RevisionNumber == profile.RevisionNumber && current.SpecDigest == profile.SpecDigest
+			if currentMatches {
+				activeClaims++
+				selectedProfile, selectedSource, readErr := readGatewayCurrentAuthority(ctx, tx)
+				if readErr != nil || activeClaims > 1 || actorRole != "administrator" || selectedProfile != profile ||
+					selectedSource.Kind != GatewayRebindSourceGatewayUpgrade ||
+					selectedSource.OperationID != claim.OperationID ||
+					selectedSource.ProfileRevisionID != profile.ID ||
+					selectedSource.ProfileRevisionNumber != profile.RevisionNumber ||
+					selectedSource.ProfileSpecDigest != profile.SpecDigest {
+					return GatewayUpgradeStartupSnapshot{}, invalidRebindStoredState(readErr)
+				}
+			} else {
+				if rebindRecovery == nil {
+					value, readErr := readGatewayRebindRecoverySnapshot(ctx, tx)
+					if readErr != nil {
+						return GatewayUpgradeStartupSnapshot{}, readErr
+					}
+					rebindRecovery = &value
+				}
+				if !gatewayRebindRecoveryDescendsFromUpgrade(*rebindRecovery, claim, profile) {
+					return GatewayUpgradeStartupSnapshot{}, ErrInvalidStoredState
+				}
 			}
 		}
 		result.Claims = append(result.Claims, GatewayUpgradeStartupClaim{
@@ -196,6 +256,50 @@ func (r *Repository) readGatewayUpgradeStartupSnapshot(ctx context.Context, tx *
 		})
 	}
 	return result, nil
+}
+
+func gatewayRebindRecoveryDescendsFromUpgrade(snapshot GatewayRebindRecoverySnapshot,
+	claim GatewayProfileUpgradeClaim, profile GatewayProfileRevision,
+) bool {
+	if snapshot.CurrentProfile == nil || snapshot.CurrentSource == nil ||
+		snapshot.CurrentSource.Kind != GatewayRebindSourceGatewayRebind ||
+		snapshot.CurrentSource.ProfileRevisionID != snapshot.CurrentProfile.ID ||
+		snapshot.CurrentSource.ProfileRevisionNumber != snapshot.CurrentProfile.RevisionNumber ||
+		snapshot.CurrentSource.ProfileSpecDigest != snapshot.CurrentProfile.SpecDigest {
+		return false
+	}
+	authority := *snapshot.CurrentSource
+	seen := make(map[string]struct{}, len(snapshot.History))
+	for authority.Kind == GatewayRebindSourceGatewayRebind {
+		if _, duplicate := seen[authority.OperationID]; duplicate {
+			return false
+		}
+		seen[authority.OperationID] = struct{}{}
+		history := findGatewayRebindHistory(snapshot.History, authority.OperationID)
+		if history == nil || retainedGatewayRebindDisposition(history.Commands) != GatewayRebindDispositionCommit ||
+			!gatewayRebindHistoryHasDatabaseCommit(*history) {
+			return false
+		}
+		successorID, successorNumber, successorDigest := historyClaimSuccessorProfile(history.Claim)
+		if authority.ProfileRevisionID != successorID || authority.ProfileRevisionNumber != successorNumber ||
+			authority.ProfileSpecDigest != successorDigest ||
+			authority.TerminalReceiptDigest != retainedGatewayRebindReceipt(history.Commands) {
+			return false
+		}
+		authority = historyClaimPredecessorAuthority(history.Claim)
+	}
+	return authority.Kind == GatewayRebindSourceGatewayUpgrade && authority.OperationID == claim.OperationID &&
+		authority.ProfileRevisionID == profile.ID && authority.ProfileRevisionNumber == profile.RevisionNumber &&
+		authority.ProfileSpecDigest == profile.SpecDigest && authority.TerminalReceiptDigest == ""
+}
+
+func gatewayRebindHistoryHasDatabaseCommit(history GatewayRebindHistoryEntry) bool {
+	for _, event := range history.Events {
+		if event.State == GatewayRebindDatabaseCommitted {
+			return true
+		}
+	}
+	return false
 }
 
 func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID string) (AppAccessGrantStartupClaim, error) {
@@ -256,8 +360,42 @@ func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID s
 	}
 
 	value := AppAccessGrantStartupClaim{
-		Claim: claim, Revision: revision, Allocation: revision.Allocation, Profile: profile,
+		Claim: claim, Revision: revision, Allocation: revision.Allocation,
+		Profile: profile, EffectiveProfile: profile,
 		DisableIntent: disableIntent,
+	}
+	if claim.State == AppAccessGrantCommitted {
+		resolution, resolveErr := resolveGatewayBindingForStoredGrant(ctx, tx, GatewayBindingRef{
+			AppID: claim.Spec.AppID, AllocationID: claim.Spec.AllocationID,
+			AccessRevisionID: claim.Spec.AccessRevisionID, GrantAttemptID: claim.AttemptID,
+		}, profile, claim)
+		if resolveErr != nil || resolution.RawProfile.ID != profile.ID ||
+			resolution.RawProfile.RevisionNumber != profile.RevisionNumber ||
+			resolution.RawProfile.SpecDigest != profile.SpecDigest {
+			return AppAccessGrantStartupClaim{}, invalidRebindStoredState(resolveErr)
+		}
+		if claim.RetiredAt != nil && resolution.CurrentGatewaySource.Kind != "" {
+			value.EffectiveProfile = GatewayProfileRevision{}
+			value.RetainedEffectiveProfile = resolution.EffectiveProfile
+			value.RetainedGatewaySource = resolution.CurrentGatewaySource
+			value.RetainedTransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
+			value.RetainedTransferChainTipDigest = resolution.TransferChainTipDigest
+			value.RetainedTerminalReceiptDigest = resolution.TerminalReceiptDigest
+		} else if claim.RetiredAt == nil {
+			value.EffectiveProfile = resolution.EffectiveProfile
+			value.CurrentGatewaySource = resolution.CurrentGatewaySource
+			value.TransferChain = append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...)
+			value.TransferChainTipDigest = resolution.TransferChainTipDigest
+			value.TerminalReceiptDigest = resolution.TerminalReceiptDigest
+		}
+	} else if claim.State == AppAccessGrantApplying || claim.State == AppAccessGrantDBActive ||
+		claim.State == AppAccessGrantUncertain {
+		source, resolveErr := readOptionalGatewayCurrentAuthority(ctx, tx, profile)
+		if resolveErr != nil {
+			return AppAccessGrantStartupClaim{}, invalidRebindStoredState(resolveErr)
+		}
+		value.CurrentGatewaySource = source
+		value.TerminalReceiptDigest = source.TerminalReceiptDigest
 	}
 	var archived sql.NullString
 	if err := tx.QueryRowContext(ctx, `SELECT archived_at FROM applications WHERE id=?`, claim.Spec.AppID).Scan(&archived); errors.Is(err, sql.ErrNoRows) {
@@ -277,7 +415,7 @@ func readAppAccessGrantStartupClaim(ctx context.Context, tx *sql.Tx, attemptID s
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM lan_gateway_profile_heads
 		WHERE singleton=1 AND revision_id=? AND revision_number=?
-	)`, claim.Spec.GatewayProfileRevisionID, claim.Spec.GatewayProfileRevisionNumber).Scan(&current); err != nil {
+	)`, value.EffectiveProfile.ID, value.EffectiveProfile.RevisionNumber).Scan(&current); err != nil {
 		return AppAccessGrantStartupClaim{}, err
 	}
 	value.ProfileHeadCurrent = current == 1

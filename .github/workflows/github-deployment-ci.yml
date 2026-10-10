@@ -47,8 +47,26 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm --dir web install --frozen-lockfile
 
-      - name: Run Go tests
-        run: go test -count=1 -timeout=15m ./...
+      - name: Run repository tests outside the required ingress race partitions
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_list="$(mktemp)"
+          trap 'rm -f "$package_list"' EXIT
+          go list ./... > "$package_list"
+          mapfile -t all_packages < "$package_list"
+          packages=()
+          ingress_count=0
+          for package in "${all_packages[@]}"; do
+            if [[ "$package" == github.com/hostd/hostd/internal/generatedingress ]]; then
+              ingress_count=$((ingress_count + 1))
+            else
+              packages+=("$package")
+            fi
+          done
+          # Complete ingress coverage remains required by ingress-race.
+          [[ "$ingress_count" -eq 1 && "${#packages[@]}" -gt 0 ]]
+          go test -count=1 -timeout=15m "${packages[@]}"
 
       - name: Run Go vet
         run: go vet ./...
@@ -159,7 +177,7 @@ jobs:
               packages+=("$package")
             fi
           done
-          # Ingress runs in the five complementary jobs below. Every other
+          # Ingress runs in the complementary jobs below. Every other
           # discovered package retains its complete race-tested test tree.
           [[ "$ingress_count" -eq 1 && "${#packages[@]}" -gt 0 ]]
           go test -race -count=1 -timeout=40m "${packages[@]}"
@@ -171,7 +189,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [gateway-v2, rebind-history, rebind-config, rebind-resources, ingress-remainder]
+        suite:
+          - gateway-v2
+          - rebind-history
+          - rebind-current
+          - rebind-config
+          - rebind-resources
+          - rebind-handover
+          - rebind-handover-rollback
+          - rebind-typed-withdrawal
+          - rebind-typed-completed
+          - rebind-typed-runtime
+          - rebind-composition-native
+          - rebind-composition-second-generation
+          - rebind-composition-legacy-source
+          - current-lan
+          - current-lan-recovery
+          - current-runtime
+          - current-serving
+          - ingress-remainder
     steps:
       - name: Check out source
         timeout-minutes: 2

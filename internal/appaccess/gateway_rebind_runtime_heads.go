@@ -4,9 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // GatewayRebindRuntimeHead is the complete active generated-runtime identity
@@ -33,7 +32,20 @@ func (r *Repository) GatewayRebindRuntimeHeads(ctx context.Context) ([]GatewayRe
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT h.app_id,h.deployment_id,h.release_id,h.slot,h.generation,h.updated_at,
+	result, err := readGatewayRebindRuntimeHeads(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func readGatewayRebindRuntimeHeads(ctx context.Context,
+	query gatewayRebindQuiescenceQuerier,
+) ([]GatewayRebindRuntimeHead, error) {
+	rows, err := query.QueryContext(ctx, `SELECT h.app_id,h.deployment_id,h.release_id,h.slot,h.generation,h.updated_at,
 		a.id,a.archived_at,d.deployment_id,r.id
 		FROM generated_runtime_active_heads h
 		LEFT JOIN applications a ON a.id=h.app_id
@@ -54,7 +66,7 @@ func (r *Repository) GatewayRebindRuntimeHeads(ctx context.Context) ([]GatewayRe
 			_ = rows.Close()
 			return nil, err
 		}
-		if uuid.Validate(value.AppID) != nil || !applicationID.Valid || applicationID.String != value.AppID ||
+		if !validUUID(value.AppID) || !applicationID.Valid || applicationID.String != value.AppID ||
 			value.Generation < 0 {
 			_ = rows.Close()
 			return nil, ErrInvalidStoredState
@@ -75,8 +87,9 @@ func (r *Repository) GatewayRebindRuntimeHeads(ctx context.Context) ([]GatewayRe
 		}
 		value.DeploymentID, value.ReleaseID, value.Slot = deploymentID.String, releaseID.String, slot.String
 		value.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt.String)
-		if err != nil || uuid.Validate(value.DeploymentID) != nil || uuid.Validate(value.ReleaseID) != nil ||
-			(value.Slot != "blue" && value.Slot != "green") || value.UpdatedAt.IsZero() {
+		if err != nil || !validUUID(value.DeploymentID) || !validUUID(value.ReleaseID) ||
+			(value.Slot != "blue" && value.Slot != "green") || value.UpdatedAt.IsZero() ||
+			!strings.HasSuffix(updatedAt.String, "Z") {
 			_ = rows.Close()
 			return nil, ErrInvalidStoredState
 		}
@@ -92,13 +105,61 @@ func (r *Repository) GatewayRebindRuntimeHeads(ctx context.Context) ([]GatewayRe
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
 	for index := 1; index < len(result); index++ {
 		if result[index-1].AppID >= result[index].AppID {
 			return nil, errors.New("generated runtime active heads are not unique")
 		}
 	}
 	return result, nil
+}
+
+func sameGatewayRebindRuntimeHeads(left, right []GatewayRebindRuntimeHead) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].AppID != right[index].AppID ||
+			left[index].DeploymentID != right[index].DeploymentID ||
+			left[index].ReleaseID != right[index].ReleaseID ||
+			left[index].Slot != right[index].Slot ||
+			left[index].Generation != right[index].Generation ||
+			!left[index].UpdatedAt.Equal(right[index].UpdatedAt) {
+			return false
+		}
+	}
+	return true
+}
+
+func readGatewayRebindRetainedRuntimeHeads(ctx context.Context,
+	query gatewayRebindQuiescenceQuerier, operationID string,
+) ([]GatewayRebindRuntimeHead, error) {
+	rows, err := query.QueryContext(ctx, `SELECT ordinal,app_id,deployment_id,release_id,slot,
+		generation,updated_at,entry_digest FROM lan_gateway_rebind_runtime_heads
+		WHERE operation_id=? ORDER BY ordinal`, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	values := make([]GatewayRebindRuntimeHead, 0)
+	for rows.Next() {
+		var ordinal int64
+		var stamp, entryDigest string
+		var value GatewayRebindRuntimeHead
+		if err := rows.Scan(&ordinal, &value.AppID, &value.DeploymentID, &value.ReleaseID,
+			&value.Slot, &value.Generation, &stamp, &entryDigest); err != nil {
+			return nil, err
+		}
+		value.UpdatedAt, err = time.Parse(time.RFC3339Nano, stamp)
+		digest, digestErr := gatewayRebindRuntimeHeadV2Digest(operationID, ordinal, value)
+		if err != nil || formatTime(value.UpdatedAt) != stamp || ordinal != int64(len(values)+1) ||
+			digestErr != nil || digest != entryDigest ||
+			(len(values) > 0 && values[len(values)-1].AppID >= value.AppID) {
+			return nil, ErrInvalidStoredState
+		}
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return values, nil
 }

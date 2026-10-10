@@ -59,6 +59,13 @@ func inspectGatewayStartup(ctx context.Context, cfg config.Config, db *sql.DB,
 func inspectGatewayStartupWithFence(ctx context.Context, cfg config.Config, db *sql.DB,
 	dockerExecutable string, directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
 ) (gatewayStartup, error) {
+	return inspectGatewayStartupUsingIngress(ctx, cfg, db, dockerExecutable, directories, fenceCheck, nil)
+}
+
+func inspectGatewayStartupUsingIngress(ctx context.Context, cfg config.Config, db *sql.DB,
+	dockerExecutable string, directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
+	ingress *generatedingress.Manager,
+) (gatewayStartup, error) {
 	if fenceCheck == nil {
 		return gatewayStartup{}, errors.New("gateway rebind fence check is required")
 	}
@@ -80,13 +87,21 @@ func inspectGatewayStartupWithFence(ctx context.Context, cfg config.Config, db *
 		}
 		return gatewayStartup{snapshot: snapshot}, nil
 	}
-	ingress, err := newGatewayStartupIngress(cfg, dockerExecutable, directories, fenceCheck)
-	if err != nil {
-		return gatewayStartup{}, err
+	if ingress == nil {
+		ingress, err = newGatewayStartupIngress(cfg, dockerExecutable, directories, fenceCheck, repository)
+		if err != nil {
+			return gatewayStartup{}, err
+		}
 	}
 	inspection, err := ingress.InspectGatewayV2Startup(ctx, gatewayStartupClaims(snapshot.Upgrades))
 	if err != nil {
 		return gatewayStartup{}, fmt.Errorf("inspect gateway upgrade startup: %w", err)
+	}
+	if inspection.CurrentGatewaySource.Kind != "" {
+		confirmed, readErr := repository.HostingGatewayStartupSnapshot(ctx)
+		if readErr != nil || !reflect.DeepEqual(snapshot, confirmed) || !committedGatewayStartupInspection(confirmed, inspection) {
+			return gatewayStartup{}, errors.New("current gateway authority changed during startup inspection")
+		}
 	}
 	result := gatewayStartup{ingress: ingress, snapshot: snapshot, inspection: inspection}
 	if inspection.Disposition == generatedingress.GatewayV2StartupNormalV1 {
@@ -96,7 +111,7 @@ func inspectGatewayStartupWithFence(ctx context.Context, cfg config.Config, db *
 		return result, nil
 	}
 	if inspection.Disposition == generatedingress.GatewayV2StartupRecoveryOnly &&
-		!committedGatewayStartupOperation(snapshot.Upgrades, inspection.OperationID) {
+		!committedGatewayStartupInspection(snapshot, inspection) {
 		if len(snapshot.Grants.Claims) != 0 || len(snapshot.Disables.Claims) != 0 {
 			return gatewayStartup{}, errors.New("LAN grant history exists while gateway upgrade requires recovery")
 		}
@@ -137,30 +152,17 @@ func inspectGatewayStartupWithFence(ctx context.Context, cfg config.Config, db *
 
 func newGatewayStartupIngress(cfg config.Config, dockerExecutable string,
 	directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
+	repository generatedingress.GatewayRebindCurrentStateRepository,
 ) (*generatedingress.Manager, error) {
 	ingress, err := generatedingress.New(runtimeprocess.ExecRunner{}, generatedingress.Options{
 		DockerExecutable: dockerExecutable, DockerEndpoint: cfg.DockerEndpoint,
 		DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
-		DataRoot: cfg.DataRoot, RebindFenceCheck: fenceCheck,
+		DataRoot: cfg.DataRoot, RebindFenceCheck: fenceCheck, RebindCurrentStateRepository: repository,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create gateway startup inspector: %w", err)
 	}
 	return ingress, nil
-}
-
-// stopOwnedGatewayOnStartupFailure is the emergency fallback when SQLite or
-// protected ingress state cannot be reconciled. It never chooses a container
-// by name alone: generated ingress must prove its purpose-bound journal and
-// the exact running container ownership before stopping it.
-func stopOwnedGatewayOnStartupFailure(ctx context.Context, cfg config.Config, dockerExecutable string,
-	directories docker.ControllerDirectories,
-) error {
-	return generatedingress.StopOwnedGatewayV2OnStartupFailure(ctx, runtimeprocess.ExecRunner{}, generatedingress.Options{
-		DockerExecutable: dockerExecutable, DockerEndpoint: cfg.DockerEndpoint,
-		DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
-		DataRoot: cfg.DataRoot,
-	})
 }
 
 // quarantineLANRecoveryStartup withdraws any observed unfinished LAN grant or
@@ -317,7 +319,7 @@ func selectLANAccessStartupRecovery(snapshot appaccess.HostingGatewayStartupSnap
 		inspection.Disposition != generatedingress.GatewayV2StartupRecoveryOnly {
 		return "", "", "", false, errors.New("LAN access startup requires a v2 gateway")
 	}
-	if !committedGatewayStartupOperation(snapshot.Upgrades, inspection.OperationID) {
+	if !committedGatewayStartupInspection(snapshot, inspection) {
 		return "", "", "", false, errors.New("LAN access startup requires a committed v2 gateway")
 	}
 	switch access.Disposition {
@@ -364,7 +366,7 @@ func selectLANRecoveryBatchHead(snapshot appaccess.HostingGatewayStartupSnapshot
 		inspection.Disposition != generatedingress.GatewayV2StartupRecoveryOnly {
 		return "", "", "", false, errors.New("LAN recovery batch requires a v2 gateway")
 	}
-	if !committedGatewayStartupOperation(snapshot.Upgrades, inspection.OperationID) {
+	if !committedGatewayStartupInspection(snapshot, inspection) {
 		return "", "", "", false, errors.New("LAN recovery batch requires a committed v2 gateway")
 	}
 	if head.Count <= 0 || head.Head < 0 || head.Head > head.Count {
@@ -386,13 +388,13 @@ func gatewayInspectionMatchesQuarantinedLANBatch(initial, quarantined generatedi
 	return (initial.Disposition == generatedingress.GatewayV2StartupNormalV2 ||
 		initial.Disposition == generatedingress.GatewayV2StartupRecoveryOnly) &&
 		initial.OperationID != "" && quarantined.Disposition == generatedingress.GatewayV2StartupRecoveryOnly &&
-		quarantined.OperationID == initial.OperationID
+		quarantined.OperationID == initial.OperationID && quarantined.CurrentGatewaySource == initial.CurrentGatewaySource
 }
 
 func gatewayInspectionMatchesRetiredLANBatch(quarantined, retired generatedingress.GatewayV2StartupInspection) bool {
 	return quarantined.Disposition == generatedingress.GatewayV2StartupRecoveryOnly &&
 		quarantined.OperationID != "" && retired.Disposition == generatedingress.GatewayV2StartupNormalV2 &&
-		retired.OperationID == quarantined.OperationID
+		retired.OperationID == quarantined.OperationID && retired.CurrentGatewaySource == quarantined.CurrentGatewaySource
 }
 
 func validateLANAccessStartupRecoveryIdentity(snapshot appaccess.HostingGatewayStartupSnapshot,
@@ -429,7 +431,7 @@ func selectLANStartupRecovery(snapshot appaccess.HostingGatewayStartupSnapshot,
 			return "", "", "", errors.New("gateway and LAN grant startup inspections disagree")
 		}
 	case generatedingress.GatewayV2LANStartupRecoveryOnly:
-		if !committedGatewayStartupOperation(snapshot.Upgrades, inspection.OperationID) {
+		if !committedGatewayStartupInspection(snapshot, inspection) {
 			return "", "", "", errors.New("LAN grant recovery requires a committed v2 gateway")
 		}
 		selectedAppID, ok := grantStartupAppID(snapshot.Grants, grantInspection.AttemptID)
@@ -480,65 +482,21 @@ func disableStartupAppID(snapshot appaccess.AppAccessDisableStartupSnapshot, ope
 }
 
 func lanDisableStartupClaims(snapshot appaccess.AppAccessDisableStartupSnapshot) []generatedingress.GatewayV2LANDisableStartupClaim {
-	claims := make([]generatedingress.GatewayV2LANDisableStartupClaim, 0, len(snapshot.Claims))
-	for _, entry := range snapshot.Claims {
-		request := generatedingress.GatewayV2LANDisableRequest{
-			OperationID: entry.Claim.OperationID, RequestDigest: entry.Claim.RequestDigest,
-			SpecDigest: entry.Claim.SpecDigest, AppID: entry.Claim.Spec.AppID,
-			AllocationID: entry.Claim.Spec.AllocationID, OwnerOperationID: entry.Claim.Spec.OwnerOperationID,
-			Port: entry.Claim.Spec.Port, AccessRevisionID: entry.Claim.Spec.AccessRevisionID,
-			AccessRevisionNumber: entry.Claim.Spec.AccessRevisionNumber,
-			AccessSpecDigest:     entry.Revision.SpecDigest, ApprovedBy: entry.Claim.ApprovedBy,
-			GatewayProfileRevisionID:     entry.Claim.Spec.GatewayProfileRevisionID,
-			GatewayProfileRevisionNumber: entry.Claim.Spec.GatewayProfileRevisionNumber,
-			GatewayProfileSpecDigest:     entry.Profile.SpecDigest,
-		}
-		if entry.SourceGrant != nil {
-			grant := gatewayLANGrantRequest(*entry.SourceGrant)
-			request.SourceGrant = &grant
-		}
-		claims = append(claims, generatedingress.GatewayV2LANDisableStartupClaim{
-			Request: request, State: entry.Claim.State, StateSequence: entry.Claim.StateSequence,
-			ClearAcknowledged: entry.ProtectedClearAck != nil || entry.SuccessorAck != nil,
-			RequiresRecovery: entry.Claim.State != appaccess.AppAccessDisableCommitted &&
-				(entry.AppArchived || !entry.AccessHeadCurrent || !entry.ProfileHeadCurrent ||
-					!entry.ApproverIsAdministrator),
-		})
-	}
-	return claims
+	return generatedingress.GatewayLANDisableStartupClaims(snapshot)
 }
 
 func lanGrantStartupClaims(snapshot appaccess.AppAccessGrantStartupSnapshot) []generatedingress.GatewayV2LANStartupClaim {
-	claims := make([]generatedingress.GatewayV2LANStartupClaim, 0, len(snapshot.Claims))
-	for _, entry := range snapshot.Claims {
-		claim := generatedingress.GatewayV2LANStartupClaim{
-			Request:       gatewayLANGrantRequest(entry.Claim),
-			State:         entry.Claim.State,
-			StateSequence: entry.Claim.StateSequence,
-			RequiresRecovery: entry.AppArchived || !entry.AccessHeadCurrent ||
-				!entry.ProfileHeadCurrent || !entry.ApproverIsAdministrator,
-		}
-		if entry.DisableIntent != nil {
-			claim.DisableIntentOperationID = entry.DisableIntent.OperationID
-		}
-		claims = append(claims, claim)
-	}
-	return claims
+	return generatedingress.GatewayLANGrantStartupClaims(snapshot)
+}
+
+func gatewayLANStartupBinding(profile appaccess.GatewayProfileRevision, source appaccess.GatewayCurrentAuthorityRef,
+	chain []appaccess.GatewayRebindAllocationTransfer, tip, receipt string,
+) *generatedingress.GatewayV2LANStartupBindingProjection {
+	return generatedingress.GatewayLANStartupBinding(profile, source, chain, tip, receipt)
 }
 
 func gatewayLANGrantRequest(claim appaccess.AppAccessGrantClaim) generatedingress.GatewayV2LANGrantRequest {
-	return generatedingress.GatewayV2LANGrantRequest{
-		AttemptID: claim.AttemptID, ClaimRequestDigest: claim.RequestDigest,
-		AppID: claim.Spec.AppID, AllocationID: claim.Spec.AllocationID,
-		OwnerOperationID: claim.Spec.OwnerOperationID, Port: claim.Spec.Port,
-		AccessRevisionID:             claim.Spec.AccessRevisionID,
-		AccessRevisionNumber:         claim.Spec.AccessRevisionNumber,
-		AccessSpecDigest:             claim.Spec.AccessSpecDigest,
-		ApprovedBy:                   claim.Spec.ApprovedBy,
-		GatewayProfileRevisionID:     claim.Spec.GatewayProfileRevisionID,
-		GatewayProfileRevisionNumber: claim.Spec.GatewayProfileRevisionNumber,
-		GatewayProfileSpecDigest:     claim.Spec.GatewayProfileSpecDigest,
-	}
+	return generatedingress.GatewayLANGrantRequest(claim)
 }
 
 func hasProtectedGatewayUpgradeHistory(dataRoot string) (bool, error) {

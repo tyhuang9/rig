@@ -17,6 +17,8 @@ const (
 // database snapshot. No mutable HTTP state participates in startup selection.
 type GatewayV2LANDisableStartupClaim struct {
 	Request           GatewayV2LANDisableRequest
+	CurrentBinding    *GatewayV2LANStartupBindingProjection
+	RetainedBinding   *GatewayV2LANStartupBindingProjection
 	State             appaccess.AppAccessDisableState
 	StateSequence     int64
 	RequiresRecovery  bool
@@ -69,6 +71,7 @@ func validateGatewayV2LANAccessStartupClaims(grants []GatewayV2LANStartupClaim,
 	}
 	for _, claim := range disables {
 		if !validGatewayV2LANDisableRequest(claim.Request) || !validGatewayV2LANDisableStartupSequence(claim.State, claim.StateSequence) ||
+			!validGatewayV2LANStartupDisableBindings(claim) ||
 			(claim.ClearAcknowledged && claim.State != appaccess.AppAccessDisableCommitted) {
 			return gatewayV2LANAccessStartupClaims{}, gatewayV2StartupInspectionError(nil)
 		}
@@ -82,7 +85,9 @@ func validateGatewayV2LANAccessStartupClaims(grants []GatewayV2LANStartupClaim,
 			grant, exists := grantSet.byAttempt[claim.Request.SourceGrant.AttemptID]
 			if !exists || grant.Request != *claim.Request.SourceGrant ||
 				grant.State != appaccess.AppAccessGrantCommitted ||
-				grant.DisableIntentOperationID != claim.Request.OperationID {
+				grant.DisableIntentOperationID != claim.Request.OperationID ||
+				!reflect.DeepEqual(grant.CurrentBinding, claim.CurrentBinding) ||
+				!reflect.DeepEqual(grant.RetainedBinding, claim.RetainedBinding) {
 				return gatewayV2LANAccessStartupClaims{}, gatewayV2StartupInspectionError(nil)
 			}
 		}
@@ -123,9 +128,16 @@ func (m *Manager) InspectGatewayV2LANAccessStartup(ctx context.Context,
 	defer releaseGatewayLock(release, &resultErr)
 	proofCtx, cancelProof := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelProof()
+	if current, handled, currentErr := m.inspectGatewayCurrentLANStartupLocked(proofCtx, claims); currentErr != nil || handled {
+		return current, currentErr
+	}
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil || !validGatewayV2RouteState(state) {
 		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(proofCtx)
+	}
+	authority, err := m.readGatewayV2LANStartupAuthorityLocked(proofCtx, store, state, journal, claims.grants, claims.disables)
+	if err != nil {
+		return GatewayV2LANAccessStartupInspection{}, err
 	}
 	inspection, err = inspectGatewayV2LANAccessStartupLocked(proofCtx, state, journal, claims, m.gatewayV2LANDisableDriver())
 	if err != nil {
@@ -134,6 +146,9 @@ func (m *Manager) InspectGatewayV2LANAccessStartup(ctx context.Context,
 	confirmed, confirmedJournal, err := store.loadBoundUpgrade(journal.OperationID)
 	if err != nil || !reflect.DeepEqual(confirmed, state) || !reflect.DeepEqual(confirmedJournal, journal) {
 		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(proofCtx)
+	}
+	if err := m.confirmGatewayV2LANStartupAuthorityLocked(proofCtx, authority, store, state, journal, claims.grants, claims.disables); err != nil {
+		return GatewayV2LANAccessStartupInspection{}, err
 	}
 	return inspection, nil
 }
@@ -288,11 +303,17 @@ func inspectGatewayV2LANAccessStartupLocked(ctx context.Context, state gatewayV2
 	if driver.selectedInterfacePreflight(state.Profile) != nil || ctx.Err() != nil {
 		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
 	}
+	return gatewayV2LANStartupInspectionForCandidates(recoveryCandidates, claims)
+}
+
+func gatewayV2LANStartupInspectionForCandidates(recoveryCandidates map[string]gatewayV2LANAccessStartupRecoveryCandidate,
+	claims gatewayV2LANAccessStartupClaims,
+) (GatewayV2LANAccessStartupInspection, error) {
 	if len(recoveryCandidates) == 0 {
 		return GatewayV2LANAccessStartupInspection{Disposition: GatewayV2LANStartupNormal}, nil
 	}
 	if !gatewayV2LANRecoveryCandidatesCompatible(recoveryCandidates, claims) {
-		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		return GatewayV2LANAccessStartupInspection{}, gatewayV2StartupInspectionError(nil)
 	}
 	ordered := make([]gatewayV2LANAccessStartupRecoveryCandidate, 0, len(recoveryCandidates))
 	for _, candidate := range recoveryCandidates {
@@ -428,7 +449,7 @@ func gatewayV2LANRecoveryCandidatesAreLegacyPair(
 
 func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 	grants []GatewayV2LANStartupClaim, disables []GatewayV2LANDisableStartupClaim,
-) error {
+) (resultErr error) {
 	inspection, err := m.InspectGatewayV2LANAccessStartup(ctx, grants, disables)
 	if err != nil || inspection.Disposition == GatewayV2LANStartupNormal {
 		return err
@@ -468,18 +489,31 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	defer release()
+	defer releaseGatewayLock(release, &resultErr)
 	workCtx, cancelWork := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelWork()
+	if handled, err := m.quarantineGatewayCurrentLANStartupLocked(workCtx, claims); err != nil || handled {
+		return err
+	}
 	store, state, journal, committed, err := m.committedV2Locked()
 	if err != nil || !committed || store == nil {
 		return gatewayV2StartupInspectionError(workCtx)
+	}
+	authority, err := m.readGatewayV2LANStartupAuthorityLocked(workCtx, store, state, journal, claims.grants, claims.disables)
+	if err != nil {
+		return err
 	}
 	confirmed, err := inspectGatewayV2LANAccessStartupLocked(workCtx, state, journal, claims, m.gatewayV2LANDisableDriver())
 	if err != nil || !reflect.DeepEqual(confirmed, inspection) {
 		return gatewayV2StartupInspectionError(workCtx)
 	}
-	driver := m.gatewayV2LANDisableDriver()
+	if err := m.confirmGatewayV2LANStartupAuthorityLocked(workCtx, authority, store, state, journal, claims.grants, claims.disables); err != nil {
+		return err
+	}
+	var driver gatewayV2LANGrantDriver = &gatewayV2LANStartupMutationDriver{
+		gatewayV2LANGrantDriver: m.gatewayV2LANDisableDriver(), manager: m,
+		authority: authority, store: store, journal: journal, grants: claims.grants, disables: claims.disables,
+	}
 	request := claim.Request
 	if state.Pending == nil {
 		app, exists := state.Apps[request.AppID]
@@ -487,7 +521,7 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 			if !proveGatewayV2LANDisabled(workCtx, driver, state, journal, request) {
 				return emergencyGatewayV2LANDisableStop(ctx, m, journal, driver)
 			}
-			return nil
+			return m.confirmGatewayV2LANStartupAuthorityLocked(workCtx, authority, store, state, journal, claims.grants, claims.disables)
 		}
 		pending, _, pendingErr := gatewayV2LANDisablePendingState(state, request)
 		if pendingErr != nil || store.saveCommittedV2State(pending, journal) != nil {
@@ -515,5 +549,5 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 	if err != nil || !reflect.DeepEqual(retained, state) || !reflect.DeepEqual(retainedJournal, journal) {
 		return emergencyGatewayV2LANDisableStop(ctx, m, journal, driver)
 	}
-	return nil
+	return m.confirmGatewayV2LANStartupMutationResultLocked(workCtx, authority, store, state, journal, claims.grants, claims.disables)
 }

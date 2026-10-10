@@ -16,10 +16,15 @@ type AppAccessGrantAuthorizationInput struct {
 }
 
 type AppAccessGrantAuthorization struct {
-	Claim      AppAccessGrantClaim
-	Revision   AppAccessRevision
-	Allocation Allocation
-	Profile    GatewayProfileRevision
+	Claim                  AppAccessGrantClaim
+	Revision               AppAccessRevision
+	Allocation             Allocation
+	Profile                GatewayProfileRevision
+	EffectiveProfile       GatewayProfileRevision
+	CurrentGatewaySource   GatewayCurrentAuthorityRef
+	TransferChain          []GatewayRebindAllocationTransfer
+	TransferChainTipDigest string
+	TerminalReceiptDigest  string
 }
 
 // AuthorizeAppAccessGrant validates the claim history, exact current heads,
@@ -54,18 +59,42 @@ func (r *Repository) AuthorizeAppAccessGrant(ctx context.Context,
 	if _, ok := permitted[claim.State]; !ok {
 		return AppAccessGrantAuthorization{}, ErrConflict
 	}
-	revision, profile, err := validateCurrentAppAccessGrantSpec(ctx, tx, claim.Spec, true)
+	revision, profile, err := validateCurrentAppAccessGrantSpec(ctx, tx, claim.Spec, true,
+		claim.State != AppAccessGrantCommitted)
 	if err != nil {
 		return AppAccessGrantAuthorization{}, err
 	}
 	if !appAccessGrantAllocationStateMatches(claim.State, revision.Allocation.State) {
 		return AppAccessGrantAuthorization{}, ErrInvalidStoredState
 	}
+	resolution := GatewayBindingResolution{RawProfile: profile, EffectiveProfile: profile}
+	if claim.State == AppAccessGrantCommitted {
+		resolution, err = resolveGatewayBindingForConsumer(ctx, tx, GatewayBindingRef{
+			AppID: claim.Spec.AppID, AllocationID: claim.Spec.AllocationID,
+			AccessRevisionID: claim.Spec.AccessRevisionID, GrantAttemptID: claim.AttemptID,
+		}, profile)
+		if err != nil || resolution.RawProfile.ID != profile.ID ||
+			resolution.RawProfile.RevisionNumber != profile.RevisionNumber ||
+			resolution.RawProfile.SpecDigest != profile.SpecDigest {
+			return AppAccessGrantAuthorization{}, invalidRebindStoredState(err)
+		}
+	} else {
+		resolution.CurrentGatewaySource, err = readOptionalGatewayCurrentAuthority(ctx, tx, profile)
+		if err != nil {
+			return AppAccessGrantAuthorization{}, invalidRebindStoredState(err)
+		}
+		resolution.TerminalReceiptDigest = resolution.CurrentGatewaySource.TerminalReceiptDigest
+	}
 	if err := tx.Commit(); err != nil {
 		return AppAccessGrantAuthorization{}, err
 	}
 	return AppAccessGrantAuthorization{
-		Claim: claim, Revision: revision, Allocation: revision.Allocation, Profile: profile,
+		Claim: claim, Revision: revision, Allocation: revision.Allocation,
+		Profile: profile, EffectiveProfile: resolution.EffectiveProfile,
+		CurrentGatewaySource:   resolution.CurrentGatewaySource,
+		TransferChain:          append([]GatewayRebindAllocationTransfer(nil), resolution.TransferChain...),
+		TransferChainTipDigest: resolution.TransferChainTipDigest,
+		TerminalReceiptDigest:  resolution.TerminalReceiptDigest,
 	}, nil
 }
 
