@@ -1,6 +1,7 @@
 package generatedingress
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"reflect"
@@ -24,11 +25,35 @@ func (r gatewayCurrentServingRestoreRepository) HostingGatewayStartupSnapshot(ct
 
 type gatewayCurrentServingRestoreFake struct {
 	*gatewayCurrentLANBatchRetirementDriver
-	t              *testing.T
-	calls, effects int
-	before         func()
-	after          func(*gatewayCurrentPhysicalAttestation)
-	action         gatewayCurrentServingRestoreAction
+	t                                             *testing.T
+	calls, effects, retirementCalls, observeCalls int
+	before                                        func()
+	after                                         func(*gatewayCurrentPhysicalAttestation)
+	action                                        gatewayCurrentServingRestoreAction
+	retirementAction                              gatewayCurrentPredecessorRetirementAction
+	retireErr                                     error
+	observeErr                                    error
+}
+
+func (d *gatewayCurrentServingRestoreFake) retireGatewayCurrentPredecessors(ctx context.Context,
+	action gatewayCurrentPredecessorRetirementAction, guard func(context.Context) error,
+) error {
+	d.retirementCalls++
+	d.retirementAction = action
+	if !validGatewayFinalOwnershipFacts(action.CurrentFacts) || !validGatewayV2RouteState(action.Native.State) || guard == nil {
+		d.t.Fatal("retirement driver received invalid action or guard")
+	}
+	if d.retireErr != nil {
+		return d.retireErr
+	}
+	return guard(ctx)
+}
+
+func (d *gatewayCurrentServingRestoreFake) observeGatewayCurrentPredecessorsRetired(context.Context,
+	gatewayCurrentPredecessorRetirementAction,
+) error {
+	d.observeCalls++
+	return d.observeErr
 }
 
 func (d *gatewayCurrentServingRestoreFake) restoreGatewayCurrentServing(ctx context.Context,
@@ -121,6 +146,142 @@ func TestGatewayCurrentServingRestoreUsesRealCompleteSQLAuthority(t *testing.T) 
 	after, filesErr := readGatewayHistorySnapshotMode(f.manager.store, true)
 	if err != nil || !reflect.DeepEqual(installed, *selection.State) || filesErr != nil || !sameGatewayHistorySnapshot(before, after) {
 		t.Fatal("physical restart wrote protected state or immutable history")
+	}
+}
+
+func TestGatewayCurrentServingRestoreRetiresPredecessorsBeforeServing(t *testing.T) {
+	t.Run("complete ancestry precedes serving", func(t *testing.T) {
+		f, selection, driver := gatewayCurrentServingRestoreSQLFixture(t)
+		driver.before = func() {
+			if driver.retirementCalls != 1 || !validGatewayFinalOwnershipFacts(driver.retirementAction.CurrentFacts) ||
+				driver.retirementAction.CurrentFinalID != selection.Terminal.Resources.FinalContainer.ID {
+				t.Fatal("serving effect began before exact predecessor retirement")
+			}
+		}
+		handled, err := f.manager.RestoreGatewayCurrentServingStartup(context.Background(), f.repository)
+		if err != nil || !handled || driver.retirementCalls != 1 || driver.observeCalls != 0 || driver.calls != 1 ||
+			driver.effects != 1 || len(driver.ownedStops) != 0 {
+			t.Fatalf("complete retirement/serving order: handled=%t retirement=%d observe=%d calls=%d effects=%d stops=%d err=%v",
+				handled, driver.retirementCalls, driver.observeCalls, driver.calls, driver.effects, len(driver.ownedStops), err)
+		}
+	})
+	t.Run("role revocation permits withdrawal but denies serving", func(t *testing.T) {
+		f, _, driver := gatewayCurrentServingRestoreSQLFixture(t)
+		driver.retireErr = nil
+		driver.before = nil
+		if _, err := f.db.Exec(`UPDATE users SET role='viewer' WHERE id=?`, gatewayRebindTestAdministrator); err != nil {
+			t.Fatal(err)
+		}
+		handled, err := f.manager.RestoreGatewayCurrentServingStartup(context.Background(), f.repository)
+		if !handled || err == nil || driver.retirementCalls != 1 || driver.calls != 0 || driver.effects != 0 ||
+			len(driver.ownedStops) != 1 || !f.manager.gatewayRebindAdmissionBlocked() {
+			t.Fatalf("revoked serving authority bypassed retirement quarantine: handled=%t retirement=%d calls=%d effects=%d stops=%d err=%v",
+				handled, driver.retirementCalls, driver.calls, driver.effects, len(driver.ownedStops), err)
+		}
+	})
+	t.Run("history read failure quarantines only selected current", func(t *testing.T) {
+		f, selection, driver := gatewayCurrentServingRestoreSQLFixture(t)
+		history, err := f.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		if err != nil || selection.Terminal == nil || selection.Terminal.Format != gatewayRebindAttemptTerminalTypedV2 {
+			t.Fatalf("typed selected terminal: terminal=%#v err=%v", selection.Terminal, err)
+		}
+		var retained *gatewayRebindProtectedIntentV2Selection
+		for index := range history.IntentsV2 {
+			candidate := &history.IntentsV2[index]
+			if candidate.Intent.Digest != selection.Terminal.ProtectedIntentDigest ||
+				candidate.Intent.Generation != selection.Terminal.Generation ||
+				candidate.Intent.OperationID != selection.Terminal.OperationID {
+				continue
+			}
+			if retained != nil {
+				t.Fatal("ambiguous typed retained intent for selected current")
+			}
+			retained = candidate
+		}
+		if retained == nil || retained.Store == nil {
+			t.Fatalf("missing selected typed retained intent: typed=%d", len(history.IntentsV2))
+		}
+		originalRead := upgradeProtectedRead
+		originalBytes, err := originalRead(retained.Store.path, retained.Store.purpose)
+		if err != nil {
+			t.Fatal(err)
+		}
+		originalRepository := f.manager.options.RebindCurrentStateRepository
+		snapshotReads, historyReads, readsBeforeArm, faults := 0, 0, 0, 0
+		armed := false
+		f.manager.options.RebindCurrentStateRepository = gatewayCurrentSnapshotFunc(func(ctx context.Context) (
+			appaccess.GatewayRebindRecoverySnapshot, error,
+		) {
+			value, snapshotErr := originalRepository.GatewayRebindRecoverySnapshot(ctx)
+			snapshotReads++
+			if snapshotErr == nil && snapshotReads == 3 {
+				armed = true
+			}
+			return value, snapshotErr
+		})
+		upgradeProtectedRead = func(path, purpose string) ([]byte, error) {
+			body, readErr := originalRead(path, purpose)
+			if path == retained.Store.path && purpose == retained.Store.purpose {
+				historyReads++
+				if !armed {
+					readsBeforeArm++
+				}
+				if armed && faults == 0 {
+					faults++
+					return nil, errors.New("injected post-selection retained-history read failure")
+				}
+			}
+			return body, readErr
+		}
+		t.Cleanup(func() {
+			upgradeProtectedRead = originalRead
+			f.manager.options.RebindCurrentStateRepository = originalRepository
+		})
+		handled, err := f.manager.RestoreGatewayCurrentServingStartup(context.Background(), f.repository)
+		var diagnostic *Error
+		if !handled || !errors.As(err, &diagnostic) || !diagnostic.CandidateMayBeLive() || driver.retirementCalls != 0 ||
+			driver.calls != 0 || len(driver.ownedStops) != 1 ||
+			!reflect.DeepEqual(driver.ownedStops[0].State, *selection.State) || snapshotReads != 3 || !armed ||
+			readsBeforeArm == 0 || historyReads < 2 || faults != 1 {
+			t.Fatalf("history failure quarantine: handled=%t retirement=%d calls=%d stops=%#v snapshots=%d armed=%t history-reads=%d before-arm=%d faults=%d err=%+v",
+				handled, driver.retirementCalls, driver.calls, driver.ownedStops, snapshotReads, armed, historyReads, readsBeforeArm, faults, diagnostic)
+		}
+		afterBytes, readErr := originalRead(retained.Store.path, retained.Store.purpose)
+		if readErr != nil || !bytes.Equal(originalBytes, afterBytes) {
+			t.Fatalf("post-selection retained history changed: read=%v equal=%t", readErr, bytes.Equal(originalBytes, afterBytes))
+		}
+	})
+}
+
+func TestRetireGatewayCurrentPredecessorsStartupUsesSelectedRebindAuthority(t *testing.T) {
+	f, selection, driver := gatewayCurrentServingRestoreSQLFixture(t)
+	ctx := context.Background()
+	beforeSQL, err := f.repository.HostingGatewayStartupSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeHistory, err := f.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handled, err := f.manager.RetireGatewayCurrentPredecessorsStartup(ctx, f.repository)
+	if err != nil || !handled || driver.retirementCalls != 1 || driver.observeCalls != 0 || driver.calls != 0 ||
+		driver.effects != 0 || len(driver.ownedStops) != 0 ||
+		driver.retirementAction.CurrentFinalID != selection.Terminal.Resources.FinalContainer.ID {
+		t.Fatalf("startup retirement: handled=%t retirement=%d observe=%d serving=%d effects=%d stops=%d err=%v",
+			handled, driver.retirementCalls, driver.observeCalls, driver.calls, driver.effects, len(driver.ownedStops), err)
+	}
+	afterSQL, sqlErr := f.repository.HostingGatewayStartupSnapshot(ctx)
+	afterHistory, historyErr := f.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if sqlErr != nil || historyErr != nil || !reflect.DeepEqual(beforeSQL, afterSQL) ||
+		!sameGatewayRebindCurrentHistory(beforeHistory, afterHistory) {
+		t.Fatalf("startup retirement changed authority: SQL=%v history=%v", sqlErr, historyErr)
+	}
+	handled, err = f.manager.RetireGatewayCurrentPredecessorsStartup(ctx, f.repository)
+	if err != nil || !handled || driver.retirementCalls != 2 || driver.calls != 0 || driver.effects != 0 ||
+		len(driver.ownedStops) != 0 {
+		t.Fatalf("idempotent startup retirement: handled=%t retirement=%d serving=%d effects=%d stops=%d err=%v",
+			handled, driver.retirementCalls, driver.calls, driver.effects, len(driver.ownedStops), err)
 	}
 }
 

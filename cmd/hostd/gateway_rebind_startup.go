@@ -24,6 +24,7 @@ type gatewayRebindStartupPreparation struct {
 // its lease. These closures bind every operation to the same manager/repository.
 type gatewayRebindStartupRecovery struct {
 	inspect func(context.Context) (generatedingress.GatewayRebindCurrentInspection, error)
+	retire  func(context.Context) (bool, error)
 	restore func(context.Context) (bool, error)
 	recover func(context.Context) (generatedingress.GatewayRebindStartupRecoveryResult, error)
 }
@@ -52,6 +53,9 @@ func prepareGatewayRebindStartup(ctx context.Context, cfg config.Config, db *sql
 	current, err := prepareGatewayRebindRecovery(ctx, presence, gatewayRebindStartupRecovery{
 		inspect: func(ctx context.Context) (generatedingress.GatewayRebindCurrentInspection, error) {
 			return ingress.InspectGatewayRebindCurrent(ctx, repository)
+		},
+		retire: func(ctx context.Context) (bool, error) {
+			return ingress.RetireGatewayCurrentPredecessorsStartup(ctx, repository)
 		},
 		restore: func(ctx context.Context) (bool, error) {
 			return ingress.RestoreGatewayCurrentServingStartup(ctx, repository)
@@ -106,7 +110,7 @@ func prepareGatewayRebindRecovery(ctx context.Context, presence generatedingress
 		return generatedingress.GatewayRebindCurrentInspection{}, errors.New("gateway rebind startup preparation could not be verified")
 	}
 	if ctx == nil || ctx.Err() != nil || !presence.Present || presence.SelectedCurrentAuthority == nil ||
-		recovery.inspect == nil || recovery.restore == nil || recovery.recover == nil {
+		recovery.inspect == nil || recovery.retire == nil || recovery.restore == nil || recovery.recover == nil {
 		return refuse()
 	}
 	before, err := recovery.inspect(ctx)
@@ -118,7 +122,8 @@ func prepareGatewayRebindRecovery(ctx context.Context, presence generatedingress
 		return refuse()
 	}
 	active := before.ActiveOperationID != ""
-	terminalRecovery := false
+	current := before
+	var result generatedingress.GatewayRebindStartupRecoveryResult
 	if active {
 		if before.ActiveSpecVersion != appaccess.GatewayRebindSpecVersionV2 || before.FenceReleased {
 			return refuse()
@@ -128,31 +133,68 @@ func prepareGatewayRebindRecovery(ctx context.Context, presence generatedingress
 		default:
 			return refuse()
 		}
-	} else {
-		if before.ActiveSpecVersion != 0 || before.ActivePhase != "" || !before.FenceReleased {
-			return refuse()
+		result, err = recovery.recover(ctx)
+		if err != nil {
+			return generatedingress.GatewayRebindCurrentInspection{}, fmt.Errorf("recover gateway rebind before admission: %w", err)
 		}
-		switch before.CurrentRecoveryMode {
-		case generatedingress.GatewayCurrentRecoveryStable, generatedingress.GatewayCurrentRecoveryLANBatchDone:
-			handled, err := recovery.restore(ctx)
-			if err != nil {
-				return generatedingress.GatewayRebindCurrentInspection{}, fmt.Errorf("restore current gateway before admission: %w", err)
-			}
-			if !handled || ctx.Err() != nil {
-				return refuse()
-			}
-			// A completed batch remains owned by the dedicated LAN retirement
-			// path; ordinary terminal recovery requires a marker-free state.
-			terminalRecovery = before.CurrentRecoveryMode == generatedingress.GatewayCurrentRecoveryStable
-		case generatedingress.GatewayCurrentRecoveryNative, generatedingress.GatewayCurrentRecoveryRoute,
-			generatedingress.GatewayCurrentRecoveryLAN, generatedingress.GatewayCurrentRecoveryLANBatch:
-			return before, nil
-		default:
+		current, err = recovery.inspect(ctx)
+		if err != nil || ctx.Err() != nil || !gatewayRebindStartupTerminalInspection(current) ||
+			!gatewayRebindStartupRecoveryMatches(before, result, current) {
 			return refuse()
 		}
 	}
-	var result generatedingress.GatewayRebindStartupRecoveryResult
-	if active || terminalRecovery {
+	if ctx.Err() != nil || !gatewayRebindStartupTerminalInspection(current) {
+		return refuse()
+	}
+	switch current.CurrentRecoveryMode {
+	case generatedingress.GatewayCurrentRecoveryNative:
+		if current.SelectedCurrentAuthority.Kind != appaccess.GatewayRebindSourceGatewayUpgrade {
+			return refuse()
+		}
+		// A native predecessor has no committed rebind ancestor to retire.
+		// Active ABORT recovery has already validated its exact terminal result.
+		return current, nil
+	case generatedingress.GatewayCurrentRecoveryStable, generatedingress.GatewayCurrentRecoveryRoute,
+		generatedingress.GatewayCurrentRecoveryLAN, generatedingress.GatewayCurrentRecoveryLANBatch,
+		generatedingress.GatewayCurrentRecoveryLANBatchDone:
+		if current.SelectedCurrentAuthority.Kind != appaccess.GatewayRebindSourceGatewayRebind {
+			return refuse()
+		}
+	default:
+		return refuse()
+	}
+
+	// Retirement owns its leases and must finish before any stable or dedicated
+	// recovery path can proceed. Pin a fresh full inspection after lease release;
+	// the physical effect guards independently reject later predecessor revival.
+	handled, err := recovery.retire(ctx)
+	if err != nil {
+		return generatedingress.GatewayRebindCurrentInspection{}, fmt.Errorf("retire gateway predecessors before admission: %w", err)
+	}
+	if !handled || ctx.Err() != nil {
+		return refuse()
+	}
+	retired, err := recovery.inspect(ctx)
+	if err != nil || ctx.Err() != nil || !reflect.DeepEqual(current, retired) {
+		return refuse()
+	}
+	switch current.CurrentRecoveryMode {
+	case generatedingress.GatewayCurrentRecoveryRoute, generatedingress.GatewayCurrentRecoveryLAN,
+		generatedingress.GatewayCurrentRecoveryLANBatch:
+		return retired, nil
+	case generatedingress.GatewayCurrentRecoveryStable, generatedingress.GatewayCurrentRecoveryLANBatchDone:
+		handled, err = recovery.restore(ctx)
+		if err != nil {
+			return generatedingress.GatewayRebindCurrentInspection{}, fmt.Errorf("restore current gateway before admission: %w", err)
+		}
+		if !handled || ctx.Err() != nil {
+			return refuse()
+		}
+	}
+	// Completed batches remain owned by dedicated LAN retirement. An active
+	// attempt already supplied its verified terminal result before retirement.
+	terminalRecovery := !active && current.CurrentRecoveryMode == generatedingress.GatewayCurrentRecoveryStable
+	if terminalRecovery {
 		result, err = recovery.recover(ctx)
 		if err != nil {
 			return generatedingress.GatewayRebindCurrentInspection{}, fmt.Errorf("recover gateway rebind before admission: %w", err)
@@ -162,14 +204,17 @@ func prepareGatewayRebindRecovery(ctx context.Context, presence generatedingress
 	if err != nil {
 		return generatedingress.GatewayRebindCurrentInspection{}, fmt.Errorf("inspect current gateway after recovery: %w", err)
 	}
-	if ctx.Err() != nil || !after.FenceReleased || after.ActiveOperationID != "" || after.ActivePhase != "" ||
-		after.ActiveSpecVersion != 0 || (!active && !reflect.DeepEqual(before, after)) {
+	if ctx.Err() != nil || !gatewayRebindStartupTerminalInspection(after) || !reflect.DeepEqual(current, after) {
 		return refuse()
 	}
 	if (active || terminalRecovery) && !gatewayRebindStartupRecoveryMatches(before, result, after) {
 		return refuse()
 	}
 	return after, nil
+}
+
+func gatewayRebindStartupTerminalInspection(current generatedingress.GatewayRebindCurrentInspection) bool {
+	return current.FenceReleased && current.ActiveOperationID == "" && current.ActivePhase == "" && current.ActiveSpecVersion == 0
 }
 
 func gatewayRebindStartupRecoveryMatches(before generatedingress.GatewayRebindCurrentInspection,

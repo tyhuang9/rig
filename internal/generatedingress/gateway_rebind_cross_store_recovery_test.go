@@ -289,6 +289,7 @@ func TestRecoverGatewayRebindStartupCompletesDatabaseCommittedAttemptAndReattest
 	}
 
 	fresh := freshGatewayRebindRecoveryManager(fixture.manager)
+	retirement, retirementRunner := installGatewayRebindStrictPredecessorRetirementForSelectedCurrent(t, fresh)
 	recoveryDriver := &gatewayRebindBoundedPhysicalDriver{t: t, template: driver.template}
 	result, err := fresh.recoverGatewayRebindStartupWithDriver(context.Background(), fixture.repository, recoveryDriver)
 	if err != nil || !result.RebindHistoryPresent || !result.Recovered ||
@@ -298,7 +299,8 @@ func TestRecoverGatewayRebindStartupCompletesDatabaseCommittedAttemptAndReattest
 		result.SelectedCurrentAuthority == nil || result.SelectedCurrentAuthority.OperationID != input.Inspection.Spec.OperationID ||
 		result.CurrentStateVersion != gatewayCurrentRouteStateVersion || result.CurrentStateRevision == 0 ||
 		!validSHA256(result.CurrentStateDigest) || !validSHA256(result.CurrentAttestationDigest) ||
-		recoveryDriver.commitCalls != 1 || recoveryDriver.attestCalls != 2 {
+		recoveryDriver.commitCalls != 1 || recoveryDriver.attestCalls != 2 || retirement.retireCalls != 1 ||
+		len(retirementRunner.effects) != 0 {
 		history, historyErr := fresh.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 		attempt, attemptErr := gatewayRebindPreparedAttemptFromHistory(snapshot, history)
 		terminal, terminalErr := gatewayRebindActiveTerminalV2(history, *snapshot.Active.Claim.V2)
@@ -318,12 +320,14 @@ func TestRecoverGatewayRebindStartupCompletesDatabaseCommittedAttemptAndReattest
 		t.Fatalf("committed startup recovery retained fence: %#v error=%v", confirmed, err)
 	}
 	restart := freshGatewayRebindRecoveryManager(fresh)
+	restartRetirement, restartRunner := installGatewayRebindStrictPredecessorRetirementForSelectedCurrent(t, restart)
 	restartDriver := &gatewayRebindBoundedPhysicalDriver{t: t, template: driver.template}
 	restarted, err := restart.recoverGatewayRebindStartupWithDriver(context.Background(), fixture.repository,
 		restartDriver)
 	if err != nil || !restarted.RebindHistoryPresent || restarted.Recovered || !restarted.FenceReleased ||
 		restarted.SelectedCurrentAuthority == nil || restarted.CurrentStateRevision == 0 ||
 		!validSHA256(restarted.CurrentAttestationDigest) || restartDriver.commitCalls != 0 ||
+		restartRetirement.retireCalls != 1 || len(restartRunner.effects) != 0 ||
 		restartDriver.attestCalls != 1 {
 		t.Fatalf("committed normal restart=%#v calls=%d/%d error=%v",
 			restarted, restartDriver.commitCalls, restartDriver.attestCalls, err)

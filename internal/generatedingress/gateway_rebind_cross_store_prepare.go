@@ -164,6 +164,11 @@ func (m *Manager) installGatewayRebindPreparedProtectedLocked(ctx context.Contex
 	if err != nil || ensureGatewayRebindIntentV2(intentStore, intent) != nil {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}
+	if m.gatewayRebindAfterPreparedIntent != nil {
+		if err := m.gatewayRebindAfterPreparedIntent(ctx); err != nil {
+			return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+		}
+	}
 	progressStore, err := newGatewayRebindProgressStore(m.options.DataRoot, intent.Generation, intent.OperationID, 1)
 	if err != nil {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)

@@ -9,8 +9,10 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -27,7 +30,12 @@ import (
 // SQL commit and fresh Manager construction.
 type gatewayRebindCompositionRunner struct {
 	*gatewayRebindTypedHandoverRuntimeRunner
-	before runtimeprocess.CommandRunner
+	before           runtimeprocess.CommandRunner
+	currentCandidate []byte
+	currentLive      []byte
+	currentNext      []byte
+	currentRestart   []byte
+	currentAutosave  []byte
 }
 
 type gatewayRebindCompositionDriver struct {
@@ -172,6 +180,11 @@ func newGatewayRebindCompositionFixture(t *testing.T) (gatewayRebindPredecessorF
 			clear(runner.stage.activeBody)
 			clear(runner.stage.autosave)
 		}
+		clear(runner.currentCandidate)
+		clear(runner.currentLive)
+		clear(runner.currentNext)
+		clear(runner.currentRestart)
+		clear(runner.currentAutosave)
 		clearGatewayV2DockerObservation(&runner.predecessor)
 	})
 	return f, input, driver
@@ -289,10 +302,46 @@ func (r *gatewayRebindCompositionRunner) Run(ctx context.Context, request runtim
 	}
 	if len(args) == 4 && args[0] == "container" && args[1] == "cp" {
 		if args[3] == "-" {
+			if r.currentConfigInitialized() {
+				if archive, found := r.currentConfigArchive(args[2]); found {
+					r.requests = append(r.requests, append([]string(nil), args...))
+					return runtimeprocess.CommandResult{Stdout: archive}, nil
+				}
+				if strings.HasPrefix(args[2], r.finalID+":/config/") {
+					return runtimeprocess.CommandResult{}, errors.New("unexpected composed current config archive")
+				}
+			}
 			if strings.HasPrefix(args[2], r.stage.container.ID+":/config/") || strings.HasPrefix(args[2], r.finalID+":/config/") {
 				r.requests = append(r.requests, append([]string(nil), args...))
 				return runtimeprocess.CommandResult{Stdout: r.configArchive(args[2])}, nil
 			}
+		} else if r.finalPresent && strings.HasPrefix(args[3], r.finalID+":/config/") {
+			if args[3] != r.finalID+":/config/"+gatewayCurrentPhysicalConfigFilename {
+				return runtimeprocess.CommandResult{}, errors.New("unexpected composed current config destination")
+			}
+			info, err := os.Stat(args[2])
+			if err != nil {
+				return runtimeprocess.CommandResult{}, err
+			}
+			if !info.Mode().IsRegular() {
+				return runtimeprocess.CommandResult{}, errors.New("composed current config source is not a regular file")
+			}
+			// copyGatewayV2Config creates a root-owned 0644 source. Windows does not
+			// preserve POSIX permission bits for ordinary test files, so retain the
+			// portable regular-file check there and enforce the requested mode where
+			// the filesystem represents it.
+			if runtime.GOOS != "windows" && info.Mode().Perm() != 0o644 {
+				return runtimeprocess.CommandResult{}, errors.New("unexpected composed current config source mode")
+			}
+			body, err := os.ReadFile(args[2])
+			if err != nil {
+				return runtimeprocess.CommandResult{}, err
+			}
+			clear(r.currentCandidate)
+			r.currentCandidate = append([]byte(nil), body...)
+			clear(body)
+			record()
+			return runtimeprocess.CommandResult{}, nil
 		} else if r.stagePresent {
 			body, err := os.ReadFile(args[2])
 			if err != nil {
@@ -310,6 +359,32 @@ func (r *gatewayRebindCompositionRunner) Run(ctx context.Context, request runtim
 			record()
 			return runtimeprocess.CommandResult{}, nil
 		}
+	}
+	if r.currentConfigInitialized() {
+		if result, handled, err := r.runCurrentConfigCommand(args); handled {
+			return result, err
+		}
+	}
+	if len(args) == 3 && args[0] == "container" && args[1] == "start" && args[2] == r.finalID && r.finalPresent &&
+		len(r.currentRestart) != 0 {
+		restart := r.currentRestartBody()
+		if len(restart) == 0 {
+			return runtimeprocess.CommandResult{}, errors.New("missing composed current restart config")
+		}
+		autosave, err := gatewayRebindCanonicalAutosaveConfig(restart)
+		if err != nil {
+			return runtimeprocess.CommandResult{}, err
+		}
+		clear(r.currentLive)
+		r.currentLive = append([]byte(nil), restart...)
+		clear(r.currentAutosave)
+		r.currentAutosave = autosave
+		r.startFinal()
+		clear(r.stage.autosave)
+		r.stage.autosave = append([]byte(nil), r.currentAutosave...)
+		record()
+		r.afterPhysicalEffect(args)
+		return runtimeprocess.CommandResult{}, nil
 	}
 	if len(args) == 3 && args[0] == "container" && args[1] == "start" && args[2] == r.stage.container.ID && r.stagePresent {
 		autosave, err := gatewayRebindCanonicalAutosaveConfig(r.stage.stageBody)
@@ -374,27 +449,338 @@ func (r *gatewayRebindCompositionRunner) readBeforeStageBinding(args []string) (
 
 func (r *gatewayRebindCompositionRunner) configArchive(source string) []byte {
 	if !strings.HasSuffix(source, "/config/.") {
-		return gatewayRebindSingleConfigArchive(r.t, r.intent.Identity.ActiveConfigFilename, r.stage.activeBody)
+		return gatewayRebindCompositionSingleFileArchive(r.t, r.intent.Identity.ActiveConfigFilename, r.stage.activeBody)
 	}
-	headers := []tar.Header{{Name: ".", Typeflag: tar.TypeDir}}
-	var body []byte
-	for _, file := range []struct {
-		name string
-		body []byte
-	}{
-		{r.intent.Identity.StageConfigFilename, r.stage.stageBody},
-		{r.intent.Identity.ActiveConfigFilename, r.stage.activeBody},
-		{"caddy/autosave.json", r.stage.autosave},
-	} {
-		if len(file.body) != 0 {
-			if file.name == "caddy/autosave.json" {
-				headers = append(headers, tar.Header{Name: "caddy/", Typeflag: tar.TypeDir, Mode: 01777})
+	return gatewayRebindCompositionArchive(r.t, []gatewayRebindCompositionArchiveFile{
+		{name: r.intent.Identity.StageConfigFilename, body: r.stage.stageBody, mode: 0o644},
+		{name: r.intent.Identity.ActiveConfigFilename, body: r.stage.activeBody, mode: 0o644},
+		{name: "caddy/autosave.json", body: r.stage.autosave, mode: 0o600, uid: 1000, gid: 1000},
+	})
+}
+
+func (r *gatewayRebindCompositionRunner) runCurrentConfigCommand(args []string) (runtimeprocess.CommandResult, bool, error) {
+	if len(args) < 3 || args[0] != "container" || args[1] != "exec" {
+		return runtimeprocess.CommandResult{}, false, nil
+	}
+	target := ""
+	if args[2] == "--user" {
+		if len(args) < 5 || args[3] != "0:0" || args[4] != r.finalID {
+			return runtimeprocess.CommandResult{}, true, errors.New("unexpected composed current root command")
+		}
+		target = args[4]
+	} else {
+		target = args[2]
+	}
+	if target != r.finalID {
+		if args[2] != "--user" && len(args) >= 5 && args[3] == "caddy" &&
+			(args[4] == "validate" || args[4] == "reload") {
+			return runtimeprocess.CommandResult{}, true, errors.New("foreign composed current caddy command")
+		}
+		if gatewayRebindCompositionCurrentEndpointHeadURL(args) != "" {
+			return runtimeprocess.CommandResult{}, true, errors.New("foreign composed current endpoint probe")
+		}
+		return runtimeprocess.CommandResult{}, false, nil
+	}
+	if !r.finalPresent || !r.final.Running {
+		return runtimeprocess.CommandResult{}, true, errors.New("composed current container is not running")
+	}
+	if args[2] != "--user" {
+		if gatewayRebindCompositionCurrentAdminRead(args, r.finalID) {
+			return runtimeprocess.CommandResult{Stdout: append([]byte(nil), r.currentLiveBody()...)}, true, nil
+		}
+		if challenge, ok := r.currentChallengeRead(args); ok {
+			return runtimeprocess.CommandResult{Stdout: []byte(gatewayV2ChallengeBodyPrefix + challenge + "\n404")}, true, nil
+		}
+		if endpointURL := gatewayRebindCompositionCurrentEndpointHeadURL(args); endpointURL != "" {
+			if !r.currentEndpointHead(endpointURL) {
+				return runtimeprocess.CommandResult{}, true, errors.New("unexpected composed current endpoint probe")
 			}
-			headers = append(headers, tar.Header{Name: file.name, Typeflag: tar.TypeReg, Size: int64(len(file.body)), Mode: 0600, Uid: 1000, Gid: 1000})
-			body = append(body, file.body...)
+			return runtimeprocess.CommandResult{Stdout: []byte("200")}, true, nil
 		}
 	}
-	return gatewayRebindStageConfigCopyHeadersTar(r.t, headers, body)
+	configPath := "/config/" + gatewayCurrentPhysicalConfigFilename
+	activePath := "/config/" + r.intent.Identity.ActiveConfigFilename
+	record := func() {
+		r.requests = append(r.requests, append([]string(nil), args...))
+		r.effects = append(r.effects, append([]string(nil), args...))
+	}
+	switch {
+	case reflect.DeepEqual(args, []string{"container", "exec", r.finalID, "caddy", "validate", "--config", configPath}):
+		if len(r.currentCandidate) == 0 {
+			return runtimeprocess.CommandResult{}, true, errors.New("missing composed current candidate config")
+		}
+		canonical, err := gatewayRebindCanonicalAutosaveConfig(r.currentCandidate)
+		if err != nil {
+			return runtimeprocess.CommandResult{}, true, err
+		}
+		clear(canonical)
+		record()
+		return runtimeprocess.CommandResult{}, true, nil
+	case reflect.DeepEqual(args, []string{"container", "exec", r.finalID, "caddy", "reload", "--config", configPath}):
+		if len(r.currentCandidate) == 0 {
+			return runtimeprocess.CommandResult{}, true, errors.New("missing composed current candidate config")
+		}
+		autosave, err := gatewayRebindCanonicalAutosaveConfig(r.currentCandidate)
+		if err != nil {
+			return runtimeprocess.CommandResult{}, true, err
+		}
+		clear(r.currentLive)
+		r.currentLive = append([]byte(nil), r.currentCandidate...)
+		clear(r.currentAutosave)
+		r.currentAutosave = autosave
+		record()
+		return runtimeprocess.CommandResult{}, true, nil
+	case reflect.DeepEqual(args, []string{"container", "exec", "--user", "0:0", r.finalID, "cp", configPath, "/config/active.next.json"}):
+		if len(r.currentCandidate) == 0 {
+			return runtimeprocess.CommandResult{}, true, errors.New("missing composed current candidate config")
+		}
+		clear(r.currentNext)
+		r.currentNext = append([]byte(nil), r.currentCandidate...)
+		record()
+		return runtimeprocess.CommandResult{}, true, nil
+	case reflect.DeepEqual(args, []string{"container", "exec", "--user", "0:0", r.finalID, "mv", "/config/active.next.json", activePath}):
+		if len(r.currentNext) == 0 {
+			return runtimeprocess.CommandResult{}, true, errors.New("missing composed current next config")
+		}
+		clear(r.currentRestart)
+		r.currentRestart = append([]byte(nil), r.currentNext...)
+		clear(r.currentNext)
+		r.currentNext = nil
+		record()
+		return runtimeprocess.CommandResult{}, true, nil
+	default:
+		return runtimeprocess.CommandResult{}, true, errors.New("unexpected composed current config command")
+	}
+}
+
+// gatewayRebindCompositionCurrentEndpointHeadURL accepts only the exact
+// endpoint transport command issued by Manager.probeGatewayEndpoint. The
+// target is intentionally left variable here so foreign targets can be denied
+// before the underlying handover runner's permissive simulated exec path.
+func gatewayRebindCompositionCurrentEndpointHeadURL(args []string) string {
+	prefix := []string{"container", "exec"}
+	suffix := []string{"curl", "--disable", "--silent", "--head", "--output", "/dev/null", "--write-out", "%{http_code}",
+		"--http1.1", "--proto", "=http", "--noproxy", "*", "--connect-timeout", "1", "--max-time", "2"}
+	if len(args) != len(prefix)+1+len(suffix)+1 || !reflect.DeepEqual(args[:len(prefix)], prefix) ||
+		args[2] == "" || !reflect.DeepEqual(args[len(prefix)+1:len(prefix)+1+len(suffix)], suffix) {
+		return ""
+	}
+	return args[len(args)-1]
+}
+
+// currentEndpointHead models one observable transport check without becoming a
+// general curl interpreter. Its target must remain an exact, uniquely retained
+// running endpoint reachable through an attached application network and an
+// upstream that the current live Caddy configuration actually addresses.
+func (r *gatewayRebindCompositionRunner) currentEndpointHead(endpointURL string) bool {
+	var matched generatedruntime.RouteEndpoint
+	urlMatches, aliasMatches := 0, 0
+	for _, route := range gatewayV2RouteRecords(r.predecessorState) {
+		for _, endpoint := range route.Endpoints {
+			address := net.JoinHostPort(endpoint.NetworkAlias+"."+endpoint.NetworkName,
+				strconv.FormatUint(uint64(endpoint.InternalPort), 10))
+			if endpointURL != "http://"+address+"/" {
+				continue
+			}
+			matched, urlMatches = endpoint, urlMatches+1
+		}
+	}
+	if urlMatches != 1 || normalizeID(matched.ContainerID) == normalizeID(r.finalID) {
+		return false
+	}
+	for _, route := range gatewayV2RouteRecords(r.predecessorState) {
+		for _, endpoint := range route.Endpoints {
+			if endpoint.NetworkAlias == matched.NetworkAlias && endpoint.NetworkName == matched.NetworkName {
+				aliasMatches++
+			}
+		}
+	}
+	if aliasMatches != 1 {
+		return false
+	}
+	if attachment := r.final.Networks[matched.NetworkName]; attachment == nil || attachment.IPAddress == "" {
+		return false
+	}
+	network, found := r.applicationNetwork(matched.NetworkName)
+	if !found {
+		return false
+	}
+	member, found := network.Containers[matched.ContainerID]
+	if !found {
+		for id, value := range network.Containers {
+			if normalizeID(id) == normalizeID(matched.ContainerID) {
+				member, found = value, true
+				break
+			}
+		}
+	}
+	if !found || member.Name != matched.Component {
+		return false
+	}
+	endpoint, found := r.endpoint(matched.ContainerID)
+	if !found || !endpoint.Running || endpoint.Health != "healthy" {
+		return false
+	}
+	endpointAttachment := endpoint.Networks[matched.NetworkName]
+	if endpointAttachment == nil || endpointAttachment.IPAddress == "" || !containsString(endpointAttachment.Aliases, matched.NetworkAlias) {
+		return false
+	}
+	var config caddyConfig
+	if json.Unmarshal(r.currentLiveBody(), &config) != nil {
+		return false
+	}
+	dial := net.JoinHostPort(matched.NetworkAlias+"."+matched.NetworkName, strconv.FormatUint(uint64(matched.InternalPort), 10))
+	for _, server := range config.Apps.HTTP.Servers {
+		for _, route := range server.Routes {
+			for _, handler := range route.Handle {
+				if handler.Handler != "reverse_proxy" {
+					continue
+				}
+				for _, upstream := range handler.Upstreams {
+					if upstream.Dial == dial {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func gatewayRebindCompositionCurrentAdminRead(args []string, finalID string) bool {
+	return reflect.DeepEqual(args, []string{"container", "exec", finalID, "curl", "--disable", "--silent", "--show-error",
+		"--fail", "--proto", "=http", "--noproxy", "*", "--max-time", "10", "http://127.0.0.1:2019/config/"})
+}
+
+func (r *gatewayRebindCompositionRunner) currentChallengeRead(args []string) (string, bool) {
+	prefix := []string{"container", "exec", r.finalID, "curl", "--disable", "--silent", "--show-error", "--output", "-",
+		"--write-out", "\n%{http_code}", "--http1.1", "--proto", "=http", "--noproxy", "*", "--connect-timeout", "1",
+		"--max-time", "2", "--header"}
+	if len(args) != len(prefix)+2 || !reflect.DeepEqual(args[:len(prefix)], prefix) {
+		return "", false
+	}
+	host, found := strings.CutPrefix(args[len(prefix)], "Host: ")
+	hostAddress, hostErr := netip.ParseAddr(host)
+	if !found || hostErr != nil || !hostAddress.Is4() || !hostAddress.IsPrivate() || hostAddress.String() != host {
+		return "", false
+	}
+	parsed, err := url.Parse(args[len(args)-1])
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false
+	}
+	address, err := netip.ParseAddr(parsed.Hostname())
+	port, portErr := strconv.ParseUint(parsed.Port(), 10, 16)
+	if err != nil || !address.Is4() || portErr != nil || port == 0 || parsed.Path == gatewayV2ChallengePathPrefix {
+		return "", false
+	}
+	challenge, found := strings.CutPrefix(parsed.Path, gatewayV2ChallengePathPrefix)
+	if !found || !validSHA256(challenge) {
+		return "", false
+	}
+	proof := gatewayRebindCompositionConfigProbe(r.currentLiveBody(), net.JoinHostPort(address.String(), strconv.FormatUint(port, 10)), host, parsed.Path)
+	if !proof.Connected || !proof.Responded || proof.Status != http.StatusNotFound ||
+		proof.Body != gatewayV2ChallengeBodyPrefix+challenge {
+		return "", false
+	}
+	return challenge, true
+}
+
+func (r *gatewayRebindCompositionRunner) currentLiveBody() []byte {
+	if len(r.currentLive) != 0 {
+		return r.currentLive
+	}
+	return r.stage.activeBody
+}
+
+func (r *gatewayRebindCompositionRunner) currentConfigInitialized() bool {
+	return len(r.currentCandidate) != 0 || len(r.currentLive) != 0 || len(r.currentNext) != 0 ||
+		len(r.currentRestart) != 0 || len(r.currentAutosave) != 0
+}
+
+func (r *gatewayRebindCompositionRunner) currentRestartBody() []byte {
+	if len(r.currentRestart) != 0 {
+		return r.currentRestart
+	}
+	return r.stage.activeBody
+}
+
+func (r *gatewayRebindCompositionRunner) currentAutosaveBody() []byte {
+	if len(r.currentAutosave) != 0 {
+		return r.currentAutosave
+	}
+	return r.stage.autosave
+}
+
+func (r *gatewayRebindCompositionRunner) currentConfigArchive(source string) ([]byte, bool) {
+	prefix := r.finalID + ":/config/"
+	if !strings.HasPrefix(source, prefix) {
+		return nil, false
+	}
+	name := strings.TrimPrefix(source, prefix)
+	switch name {
+	case r.intent.Identity.ActiveConfigFilename:
+		return gatewayRebindCompositionSingleFileArchive(r.t, name, r.currentRestartBody()), true
+	case gatewayCurrentPhysicalConfigFilename:
+		if len(r.currentCandidate) == 0 {
+			return nil, false
+		}
+		return gatewayRebindCompositionSingleFileArchive(r.t, name, r.currentCandidate), true
+	case ".":
+		files := []gatewayRebindCompositionArchiveFile{
+			{name: r.intent.Identity.StageConfigFilename, body: r.stage.stageBody, mode: 0o644},
+			{name: r.intent.Identity.ActiveConfigFilename, body: r.currentRestartBody(), mode: 0o644},
+		}
+		if len(r.currentCandidate) != 0 {
+			files = append([]gatewayRebindCompositionArchiveFile{{
+				name: gatewayCurrentPhysicalConfigFilename, body: r.currentCandidate, mode: 0o644,
+			}}, files...)
+		}
+		if len(r.currentNext) != 0 {
+			files = append(files, gatewayRebindCompositionArchiveFile{name: "active.next.json", body: r.currentNext, mode: 0o644})
+		}
+		if autosave := r.currentAutosaveBody(); len(autosave) != 0 {
+			files = append(files, gatewayRebindCompositionArchiveFile{
+				name: "caddy/autosave.json", body: autosave, mode: 0o600, uid: 1000, gid: 1000,
+			})
+		}
+		return gatewayRebindCompositionArchive(r.t, files), true
+	default:
+		return nil, false
+	}
+}
+
+type gatewayRebindCompositionArchiveFile struct {
+	name     string
+	body     []byte
+	mode     int64
+	uid, gid int
+}
+
+// gatewayRebindCompositionSingleFileArchive models Docker's direct
+// container-cp-out form: the first and only entry is the requested regular
+// file. Directory copies intentionally use gatewayRebindCompositionArchive.
+func gatewayRebindCompositionSingleFileArchive(t *testing.T, name string, body []byte) []byte {
+	t.Helper()
+	return gatewayRebindStageConfigCopyHeadersTar(t, []tar.Header{{
+		Name: name, Typeflag: tar.TypeReg, Size: int64(len(body)), Mode: 0o644,
+	}}, body)
+}
+
+func gatewayRebindCompositionArchive(t *testing.T, files []gatewayRebindCompositionArchiveFile) []byte {
+	t.Helper()
+	headers := []tar.Header{{Name: ".", Typeflag: tar.TypeDir, Mode: 0o755}}
+	body := []byte(nil)
+	for _, file := range files {
+		if len(file.body) == 0 {
+			continue
+		}
+		if file.name == "caddy/autosave.json" {
+			headers = append(headers, tar.Header{Name: "caddy/", Typeflag: tar.TypeDir, Mode: 0o1777})
+		}
+		headers = append(headers, tar.Header{Name: file.name, Typeflag: tar.TypeReg, Size: int64(len(file.body)), Mode: file.mode, Uid: file.uid, Gid: file.gid})
+		body = append(body, file.body...)
+	}
+	return gatewayRebindStageConfigCopyHeadersTar(t, headers, body)
 }
 
 func (r *gatewayRebindCompositionRunner) hostProbe(ctx context.Context, address string, port uint16, host, path string) gatewayV2HostProbeResult {
@@ -451,7 +837,7 @@ func (r *gatewayRebindCompositionRunner) servers() []gatewayRebindCompositionSer
 		servers = append(servers, gatewayRebindCompositionServer{r.stage.container, r.stage.containerRuntime, r.intent.Network.ContainerIPv4, r.stage.stageBody})
 	}
 	if r.finalPresent {
-		servers = append(servers, gatewayRebindCompositionServer{r.final, r.finalRuntime, r.intent.Network.ContainerIPv4, r.stage.activeBody})
+		servers = append(servers, gatewayRebindCompositionServer{r.final, r.finalRuntime, r.intent.Network.ContainerIPv4, r.currentLiveBody()})
 	}
 	return servers
 }
@@ -568,7 +954,7 @@ func TestGatewayRebindConcreteCompositionCommitsAndReplaysSameDockerState(t *tes
 		driver.install(fresh)
 		_, err := fresh.RecoverGatewayRebindStartup(ctx, f.repository)
 		var diagnostic *Error
-		if err == nil || !errors.As(err, &diagnostic) || diagnostic.candidateMayBeLive || !fresh.gatewayRebindAdmissionBlocked() ||
+		if err == nil || !errors.As(err, &diagnostic) || !diagnostic.candidateMayBeLive || !fresh.gatewayRebindAdmissionBlocked() ||
 			r.final.Running || r.predecessor.FinalContainer.Running || !r.finalPresent || len(r.effects) != effects+1 ||
 			!reflect.DeepEqual(r.effects[effects], []string{"container", "stop", "--time", "10", r.finalID}) {
 			t.Fatalf("terminal corruption failed exact withdrawal: err=%v effects=%v", err, r.effects[effects:])

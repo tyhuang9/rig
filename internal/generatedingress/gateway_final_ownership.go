@@ -88,6 +88,24 @@ func gatewayFinalOwnershipIngressMatches(facts gatewayFinalOwnershipFacts,
 func gatewayFinalOwnershipContainerMatches(facts gatewayFinalOwnershipFacts,
 	container caddyInspection, runtime gatewayContainerRuntime,
 ) bool {
+	if !gatewayFinalOwnershipContainerStaticMatches(facts, container) || runtime.Paused || runtime.Dead ||
+		container.Restarting {
+		return false
+	}
+	if container.Running {
+		return gatewayV2EffectivePortBindingsMatchConfigured(runtime.EffectivePortBindings, container.PortBindings)
+	}
+	return !gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings)
+}
+
+// gatewayFinalOwnershipContainerStaticMatches proves only immutable creation
+// and ownership facts. Callers that withdraw an exact retired owner must make
+// their own conservative liveness decision after this check; in particular a
+// restarting container is still an effect target rather than an ownership
+// mismatch.
+func gatewayFinalOwnershipContainerStaticMatches(facts gatewayFinalOwnershipFacts,
+	container caddyInspection,
+) bool {
 	if !validGatewayFinalOwnershipFacts(facts) {
 		return false
 	}
@@ -109,7 +127,7 @@ func gatewayFinalOwnershipContainerMatches(facts gatewayFinalOwnershipFacts,
 		container.Memory != 268435456 || container.MemorySwap != 268435456 || container.NanoCPUs != 1_000_000_000 ||
 		container.PIDsLimit != 128 || container.LogType != "local" || len(container.LogConfig) != 2 ||
 		container.LogConfig["max-size"] != "10m" || container.LogConfig["max-file"] != "3" ||
-		container.Restart != gatewayV2FinalRestartPolicy || container.Restarting || runtime.Paused || runtime.Dead ||
+		container.Restart != gatewayV2FinalRestartPolicy ||
 		len(container.Entrypoint) != 1 || container.Entrypoint[0] != caddyExecutable || len(container.Cmd) != 3 ||
 		container.Cmd[0] != "run" || container.Cmd[1] != "--config" || container.Cmd[2] != "/config/"+identity.ActiveConfigFilename ||
 		len(container.Ulimits) != 1 || container.Ulimits[0] != (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}) ||
@@ -117,10 +135,7 @@ func gatewayFinalOwnershipContainerMatches(facts gatewayFinalOwnershipFacts,
 		!gatewayCurrentPhysicalPortBindings(container.PortBindings, facts.profile(), facts.LocalHostPort) {
 		return false
 	}
-	if container.Running {
-		return gatewayV2EffectivePortBindingsMatchConfigured(runtime.EffectivePortBindings, container.PortBindings)
-	}
-	return !gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings)
+	return true
 }
 
 func gatewayFinalOwnershipConfigurationDigest(facts gatewayFinalOwnershipFacts) (string, error) {

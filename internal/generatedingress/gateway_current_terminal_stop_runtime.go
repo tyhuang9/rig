@@ -57,8 +57,18 @@ func (d managerGatewayCurrentPhysicalRuntime) stopTerminalOwned(ctx context.Cont
 func (d managerGatewayCurrentPhysicalRuntime) terminalOwnedInventory(ctx context.Context,
 	facts gatewayFinalOwnershipFacts,
 ) (caddyInspection, bool, error) {
-	invalid := func() (caddyInspection, bool, error) {
+	container, runtime, present, err := d.terminalOwnedOwnershipInventory(ctx, facts)
+	if err != nil || (present && !gatewayFinalOwnershipContainerMatches(facts, container, runtime)) {
 		return caddyInspection{}, false, gatewayCurrentPhysicalDriverError(ctx)
+	}
+	return container, present, nil
+}
+
+func (d managerGatewayCurrentPhysicalRuntime) terminalOwnedOwnershipInventory(ctx context.Context,
+	facts gatewayFinalOwnershipFacts,
+) (caddyInspection, gatewayContainerRuntime, bool, error) {
+	invalid := func() (caddyInspection, gatewayContainerRuntime, bool, error) {
+		return caddyInspection{}, gatewayContainerRuntime{}, false, gatewayCurrentPhysicalDriverError(ctx)
 	}
 	if d.manager == nil || ctx == nil || ctx.Err() != nil || !validGatewayFinalOwnershipFacts(facts) {
 		return invalid()
@@ -111,7 +121,7 @@ func (d managerGatewayCurrentPhysicalRuntime) terminalOwnedInventory(ctx context
 	expectedUsers := []string{}
 	if namedFound {
 		if !reflect.DeepEqual(named, byID) || !reflect.DeepEqual(namedRuntime, idRuntime) ||
-			!gatewayFinalOwnershipContainerMatches(facts, named, namedRuntime) || !validOwnedNameSet(containers, identity.FinalContainer) {
+			!gatewayFinalOwnershipContainerStaticMatches(facts, named) || !validOwnedNameSet(containers, identity.FinalContainer) {
 			return invalid()
 		}
 		expectedUsers = []string{resources.FinalContainer.ID}
@@ -131,7 +141,7 @@ func (d managerGatewayCurrentPhysicalRuntime) terminalOwnedInventory(ctx context
 	if ctx.Err() != nil {
 		return invalid()
 	}
-	return named, namedFound, nil
+	return named, namedRuntime, namedFound, nil
 }
 
 func (d managerGatewayCurrentPhysicalRuntime) terminalOwnedListenersAbsent(ctx context.Context,

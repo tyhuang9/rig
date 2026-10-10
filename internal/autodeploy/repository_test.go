@@ -13,8 +13,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/controllerrelay"
-	controldb "github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/relay/protocol"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 const (
@@ -39,7 +39,7 @@ type repositoryFixture struct {
 
 func newRepositoryFixture(t *testing.T) *repositoryFixture {
 	t.Helper()
-	db, err := controldb.Open(t.TempDir())
+	db, err := databasefixture.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
