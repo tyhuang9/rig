@@ -54,17 +54,43 @@ type gatewayRebindTypedHandoverDriver interface {
 func (d gatewayRebindTypedStageRuntime) stable(ctx context.Context,
 	intent gatewayRebindProtectedIntentV2, guard gatewayRebindTypedEffectGuard,
 ) (gatewayRebindTypedStageObservation, error) {
-	if guard == nil || guard(ctx) != nil {
-		return gatewayRebindTypedStageObservation{}, gatewayRebindEffectBoundaryError(ctx)
+	if guard == nil {
+		return gatewayRebindTypedStageObservation{}, newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationStable, gatewayRebindTypedStageDiagnosticCheckpointPreEffectGuard)
+	}
+	if guard(ctx) != nil {
+		return gatewayRebindTypedStageObservation{}, newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationStable, gatewayRebindTypedStageDiagnosticCheckpointPreEffectGuard)
 	}
 	first, err := d.read(ctx, intent)
-	if err != nil || !d.networkTopologyMatches(ctx, intent, first) {
-		return gatewayRebindTypedStageObservation{}, gatewayRebindEffectBoundaryError(ctx)
+	if err != nil {
+		return gatewayRebindTypedStageObservation{}, newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationStable, gatewayRebindTypedStageDiagnosticCheckpointFirstRead)
+	}
+	if !d.networkTopologyMatches(ctx, intent, first) {
+		return gatewayRebindTypedStageObservation{}, newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationStable, gatewayRebindTypedStageDiagnosticCheckpointFirstTopology)
 	}
 	second, err := d.read(ctx, intent)
-	if err != nil || !d.networkTopologyMatches(ctx, intent, second) || !reflect.DeepEqual(first, second) ||
-		ctx.Err() != nil || guard(ctx) != nil {
-		return gatewayRebindTypedStageObservation{}, gatewayRebindEffectBoundaryError(ctx)
+	if err != nil {
+		return gatewayRebindTypedStageObservation{}, newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationStable, gatewayRebindTypedStageDiagnosticCheckpointSecondRead)
+	}
+	if !d.networkTopologyMatches(ctx, intent, second) {
+		return gatewayRebindTypedStageObservation{}, newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationStable, gatewayRebindTypedStageDiagnosticCheckpointSecondTopology)
+	}
+	if !reflect.DeepEqual(first, second) {
+		return gatewayRebindTypedStageObservation{}, newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationStable, gatewayRebindTypedStageDiagnosticCheckpointStableEquality)
+	}
+	if ctx.Err() != nil {
+		return gatewayRebindTypedStageObservation{}, newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationStable, gatewayRebindTypedStageDiagnosticCheckpointPostEffectGuard)
+	}
+	if guard(ctx) != nil {
+		return gatewayRebindTypedStageObservation{}, newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationStable, gatewayRebindTypedStageDiagnosticCheckpointPostEffectGuard)
 	}
 	return second, nil
 }
@@ -337,40 +363,71 @@ func (d gatewayRebindTypedStageRuntime) serveStage(ctx context.Context,
 	guard gatewayRebindTypedEffectGuard,
 ) (string, error) {
 	if effect.StageStartIntent == nil || effect.StageServing != nil {
-		return "", gatewayRebindEffectBoundaryError(ctx)
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointPrecondition)
 	}
 	value, err := d.stable(ctx, intent, guard)
-	if err != nil || !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, value) {
-		return "", gatewayRebindEffectBoundaryError(ctx)
+	if err != nil {
+		return "", gatewayRebindTypedStageDiagnosticErrorFrom(ctx, err)
+	}
+	if !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, value) {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointResourceShape)
 	}
 	body, err := gatewayRebindTypedStageConfigBytes(intent)
 	if err != nil {
-		return "", gatewayRebindEffectBoundaryError(ctx)
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointConfigRender)
 	}
 	defer clear(body)
 	inventory, err := d.stageConfigInventory(ctx, effect, body, true)
-	if err != nil || inventory != gatewayRebindStageConfigInventoryExact {
-		return "", gatewayRebindEffectBoundaryError(ctx)
+	if err != nil {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointStageArchive)
+	}
+	if inventory != gatewayRebindStageConfigInventoryExact {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointStageArchive)
 	}
 	// Reading the config archive crosses a physical boundary. Reattest the
 	// complete resource identity and ownership census after that read and before
 	// a stopped container may publish any listener.
 	value, err = d.stable(ctx, intent, guard)
-	if err != nil || !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, value) {
-		return "", gatewayRebindEffectBoundaryError(ctx)
+	if err != nil {
+		return "", gatewayRebindTypedStageDiagnosticErrorFrom(ctx, err)
+	}
+	if !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, value) {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointResourceShape)
 	}
 	if gatewayRebindTypedStoppedStageContainerMatches(intent, effect, value) {
-		if guard(ctx) != nil || d.manager.runDiscard(ctx, d.manager.options.CommandTimeout,
-			"container", "start", effect.StageContainer.ID) != nil || guard(ctx) != nil {
-			return "", gatewayRebindEffectBoundaryError(ctx)
+		if guard(ctx) != nil {
+			return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+				gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointPreEffectGuard)
+		}
+		if d.manager.runDiscard(ctx, d.manager.options.CommandTimeout, "container", "start", effect.StageContainer.ID) != nil {
+			return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+				gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointStartEffect)
+		}
+		if guard(ctx) != nil {
+			return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+				gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointPostEffectGuard)
 		}
 	} else if !gatewayRebindTypedRunningStageMatches(intent, effect, value) {
-		return "", gatewayRebindEffectBoundaryError(ctx)
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointRunningShape)
 	}
 	confirmed, err := d.stable(ctx, intent, guard)
-	if err != nil || !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, confirmed) ||
-		!gatewayRebindTypedRunningStageMatches(intent, effect, confirmed) {
-		return "", gatewayRebindEffectBoundaryError(ctx)
+	if err != nil {
+		return "", gatewayRebindTypedStageDiagnosticErrorFrom(ctx, err)
+	}
+	if !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, confirmed) {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointResourceShape)
+	}
+	if !gatewayRebindTypedRunningStageMatches(intent, effect, confirmed) {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointRunningShape)
 	}
 	live, liveErr := d.manager.inspectLiveCaddyConfig(ctx, effect.StageContainer.ID)
 	validConfig := liveErr == nil && sameCaddyConfig(body, live)
@@ -382,23 +439,43 @@ func (d gatewayRebindTypedStageRuntime) serveStage(ctx context.Context,
 	if containerProbe == nil {
 		containerProbe = d.manager.probeGatewayV2ContainerChallenge
 	}
-	if !validConfig || !proveGatewayRebindStagePublication(ctx, *effect.StageStartIntent,
-		effect.StageContainer.ID, hostProbe, containerProbe) ||
-		guard(ctx) != nil {
-		return "", gatewayRebindEffectBoundaryError(ctx)
+	if !validConfig {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointLiveConfig)
+	}
+	if !proveGatewayRebindStagePublication(ctx, *effect.StageStartIntent, effect.StageContainer.ID, hostProbe, containerProbe) {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointPublication)
+	}
+	if guard(ctx) != nil {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointPostEffectGuard)
 	}
 	final, finalErr := d.stable(ctx, intent, guard)
-	if finalErr != nil || !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, final) ||
-		!gatewayRebindTypedRunningStageMatches(intent, effect, final) {
-		return "", gatewayRebindEffectBoundaryError(ctx)
+	if finalErr != nil {
+		return "", gatewayRebindTypedStageDiagnosticErrorFrom(ctx, finalErr)
+	}
+	if !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, final) {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointResourceShape)
+	}
+	if !gatewayRebindTypedRunningStageMatches(intent, effect, final) {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointRunningShape)
 	}
 	inventory, err = d.stageConfigInventory(ctx, effect, body, true)
-	if err != nil || inventory != gatewayRebindStageConfigInventoryExact || guard(ctx) != nil {
-		return "", gatewayRebindEffectBoundaryError(ctx)
+	if err != nil || inventory != gatewayRebindStageConfigInventoryExact {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointStageArchive)
+	}
+	if guard(ctx) != nil {
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointPostEffectGuard)
 	}
 	endpoint := final.StageRuntime.ConfiguredNetworks[intent.Identity.IngressNetwork].EndpointID
 	if !validContainerID(endpoint) || normalizeID(endpoint) != endpoint {
-		return "", gatewayRebindEffectBoundaryError(ctx)
+		return "", newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationServeStage, gatewayRebindTypedStageDiagnosticCheckpointEndpointShape)
 	}
 	return endpoint, nil
 }
@@ -428,44 +505,77 @@ func (d gatewayRebindTypedStageRuntime) copyFinalConfig(ctx context.Context,
 	if effect.FinalConfigIntent == nil || effect.FinalConfigCopy != nil || effect.StageServing == nil ||
 		!gatewayRebindTypedFinalConfigContentMatches(intent, *effect.FinalConfigIntent) ||
 		checkpoint.sourceRef() != intent.Predecessor {
-		return gatewayRebindEffectBoundaryError(ctx)
+		return newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointPrecondition)
 	}
 	value, err := d.stable(ctx, intent, guard)
-	if err != nil || !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, value) ||
-		!gatewayRebindTypedRunningStageMatches(intent, effect, value) {
-		return gatewayRebindEffectBoundaryError(ctx)
+	if err != nil {
+		return gatewayRebindTypedStageDiagnosticErrorFrom(ctx, err)
+	}
+	if !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, value) {
+		return newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointResourceShape)
+	}
+	if !gatewayRebindTypedRunningStageMatches(intent, effect, value) {
+		return newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointRunningShape)
 	}
 	stageBody, err := gatewayRebindTypedStageConfigBytes(intent)
 	if err != nil {
-		return gatewayRebindEffectBoundaryError(ctx)
+		return newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointConfigRender)
 	}
 	defer clear(stageBody)
 	activeBody, err := gatewayRebindTypedFinalConfigBytes(intent, checkpoint,
 		effect.FinalConfigIntent.RoutePlan)
 	if err != nil {
-		return gatewayRebindEffectBoundaryError(ctx)
+		return newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointConfigRender)
 	}
 	defer clear(activeBody)
 	inventory, err := d.finalConfigInventory(ctx, effect, stageBody, activeBody)
 	if err != nil {
-		return gatewayRebindEffectBoundaryError(ctx)
+		return newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointFinalArchive)
 	}
 	if inventory == gatewayRebindFinalConfigInventoryStageOnly {
-		if guard(ctx) != nil || d.manager.copyGatewayV2Config(ctx, effect.StageContainer.ID,
-			append([]byte(nil), activeBody...), intent.Identity.ActiveConfigFilename) != nil || guard(ctx) != nil {
-			return gatewayRebindEffectBoundaryError(ctx)
+		if guard(ctx) != nil {
+			return newGatewayRebindTypedStageDiagnosticError(ctx,
+				gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointPreEffectGuard)
+		}
+		if d.manager.copyGatewayV2Config(ctx, effect.StageContainer.ID,
+			append([]byte(nil), activeBody...), intent.Identity.ActiveConfigFilename) != nil {
+			return newGatewayRebindTypedStageDiagnosticError(ctx,
+				gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointCopyEffect)
+		}
+		if guard(ctx) != nil {
+			return newGatewayRebindTypedStageDiagnosticError(ctx,
+				gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointPostEffectGuard)
 		}
 	} else if inventory != gatewayRebindFinalConfigInventoryExactPair {
-		return gatewayRebindEffectBoundaryError(ctx)
+		return newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointFinalArchive)
 	}
 	confirmed, err := d.stable(ctx, intent, guard)
-	if err != nil || !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, confirmed) ||
-		!gatewayRebindTypedRunningStageMatches(intent, effect, confirmed) {
-		return gatewayRebindEffectBoundaryError(ctx)
+	if err != nil {
+		return gatewayRebindTypedStageDiagnosticErrorFrom(ctx, err)
+	}
+	if !gatewayRebindTypedStageResourcePrefixMatches(intent, effect, confirmed) {
+		return newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointResourceShape)
+	}
+	if !gatewayRebindTypedRunningStageMatches(intent, effect, confirmed) {
+		return newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointRunningShape)
 	}
 	inventory, err = d.finalConfigInventory(ctx, effect, stageBody, activeBody)
-	if err != nil || inventory != gatewayRebindFinalConfigInventoryExactPair || guard(ctx) != nil {
-		return gatewayRebindEffectBoundaryError(ctx)
+	if err != nil || inventory != gatewayRebindFinalConfigInventoryExactPair {
+		return newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointFinalArchive)
+	}
+	if guard(ctx) != nil {
+		return newGatewayRebindTypedStageDiagnosticError(ctx,
+			gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig, gatewayRebindTypedStageDiagnosticCheckpointPostEffectGuard)
 	}
 	return nil
 }
