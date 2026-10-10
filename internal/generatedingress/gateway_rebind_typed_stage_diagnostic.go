@@ -10,6 +10,7 @@ type gatewayRebindTypedStageDiagnosticOperation uint8
 const (
 	gatewayRebindTypedStageDiagnosticOperationUnknown gatewayRebindTypedStageDiagnosticOperation = iota
 	gatewayRebindTypedStageDiagnosticOperationStable
+	gatewayRebindTypedStageDiagnosticOperationCopyStageConfig
 	gatewayRebindTypedStageDiagnosticOperationServeStage
 	gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig
 )
@@ -18,6 +19,8 @@ func (operation gatewayRebindTypedStageDiagnosticOperation) String() string {
 	switch operation {
 	case gatewayRebindTypedStageDiagnosticOperationStable:
 		return "stable"
+	case gatewayRebindTypedStageDiagnosticOperationCopyStageConfig:
+		return "copy_stage_config"
 	case gatewayRebindTypedStageDiagnosticOperationServeStage:
 		return "serve_stage"
 	case gatewayRebindTypedStageDiagnosticOperationCopyFinalConfig:
@@ -48,6 +51,7 @@ const (
 	gatewayRebindTypedStageDiagnosticCheckpointLiveConfig
 	gatewayRebindTypedStageDiagnosticCheckpointPublication
 	gatewayRebindTypedStageDiagnosticCheckpointFinalArchive
+	gatewayRebindTypedStageDiagnosticCheckpointPostCopyStageArchive
 	gatewayRebindTypedStageDiagnosticCheckpointEndpointShape
 )
 
@@ -87,6 +91,8 @@ func (checkpoint gatewayRebindTypedStageDiagnosticCheckpoint) String() string {
 		return "publication"
 	case gatewayRebindTypedStageDiagnosticCheckpointFinalArchive:
 		return "final_archive"
+	case gatewayRebindTypedStageDiagnosticCheckpointPostCopyStageArchive:
+		return "post_copy_stage_archive"
 	case gatewayRebindTypedStageDiagnosticCheckpointEndpointShape:
 		return "endpoint_shape"
 	default:
