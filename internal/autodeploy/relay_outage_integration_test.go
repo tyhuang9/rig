@@ -40,9 +40,11 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	if dsn == "" {
 		t.Skip("RIG_RELAY_TEST_DATABASE_URL is unset; relay outage convergence integration not run")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	pool, reopenPG := relayOutagePostgres(t, ctx, dsn)
+	// Preparing a fresh migrated controller is fixture setup, not part of the
+	// bounded outage/restart journey. Both phases retain a finite budget.
+	setupCtx, cancelSetup := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancelSetup()
+	pool, reopenPG := relayOutagePostgres(t, setupCtx, dsn)
 	relay, err := store.New(pool, store.Options{})
 	if err != nil {
 		t.Fatal("create relay store")
@@ -54,11 +56,11 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x53}, ed25519.SeedSize))
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 	now := time.Now().UTC()
-	relayOutageEnrollRelay(t, ctx, relay, now, controllerID, keyID, publicKey)
-	relayOutageSeedController(t, ctx, db, now, controllerID, keyID, bindingID, publicKey)
+	relayOutageEnrollRelay(t, setupCtx, relay, now, controllerID, keyID, publicKey)
+	relayOutageSeedController(t, setupCtx, db, now, controllerID, keyID, bindingID, publicKey)
 	controllerRepository := controllerrelay.NewRepository(db)
 	autoRepository := NewRepository(db)
-	status, err := autoRepository.Configure(ctx, ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, ExpectedRevision: 0, Enabled: true}, now)
+	status, err := autoRepository.Configure(setupCtx, ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, ExpectedRevision: 0, Enabled: true}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,8 +69,16 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	firstRun, stopFirst, firstSupervisor := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, nil)
 	firstFixture := relayOutageFirstRunFixture{stopSupervisor: stopFirst, server: server, handler: handler, done: firstRun}
 	t.Cleanup(func() { firstFixture.Stop(t) })
-	relayOutageWaitInitialSubscriptionSync(t, ctx, db, pool, controllerID, status.SubscriptionID, firstSupervisor)
+	relayOutageWaitInitialSubscriptionSync(t, setupCtx, db, pool, controllerID, status.SubscriptionID, firstSupervisor)
 	firstFixture.Stop(t)
+	if setupCtx.Err() != nil {
+		t.Fatal("initial relay fixture exceeded setup deadline")
+	}
+	cancelSetup()
+	// This single deadline covers every outage update, both controller
+	// restarts, lost-ACK recovery and final convergence; no restart resets it.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
 
 	for generation, sha := range []string{testSHA, secondSHA, coordinatorThirdSHA} {
 		result, pushErr := relay.PushSourceEvent(ctx, store.SourceEvent{
@@ -109,7 +119,7 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	autoRepository = NewRepository(db)
 	relay.Close()
 	pool.Close()
-	pool = reopenPG()
+	pool = reopenPG(ctx)
 	relay, err = store.New(pool, store.Options{})
 	if err != nil {
 		t.Fatal("reconstruct relay store")
@@ -203,7 +213,7 @@ func relayOutageAssertDurableSource(t *testing.T, ctx context.Context, db *sql.D
 	}
 }
 
-func relayOutagePostgres(t *testing.T, ctx context.Context, dsn string) (*pgxpool.Pool, func() *pgxpool.Pool) {
+func relayOutagePostgres(t *testing.T, ctx context.Context, dsn string) (*pgxpool.Pool, func(context.Context) *pgxpool.Pool) {
 	t.Helper()
 	admin, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -233,12 +243,12 @@ func relayOutagePostgres(t *testing.T, ctx context.Context, dsn string) (*pgxpoo
 	if err = store.Migrate(ctx, pool); err != nil {
 		t.Fatal("migrate isolated PostgreSQL test schema")
 	}
-	reopen := func() *pgxpool.Pool {
-		reopened, openErr := pgxpool.NewWithConfig(ctx, cfg)
+	reopen := func(reopenCtx context.Context) *pgxpool.Pool {
+		reopened, openErr := pgxpool.NewWithConfig(reopenCtx, cfg)
 		if openErr != nil {
 			t.Fatal("reopen isolated PostgreSQL test pool")
 		}
-		if migrateErr := store.Migrate(ctx, reopened); migrateErr != nil {
+		if migrateErr := store.Migrate(reopenCtx, reopened); migrateErr != nil {
 			reopened.Close()
 			t.Fatal("re-migrate isolated PostgreSQL test schema")
 		}

@@ -15,7 +15,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
@@ -274,7 +273,7 @@ func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, 
 ) gatewayRebindPredecessorFixture {
 	t.Helper()
 	manager, runner := newManagerFixture(t, false)
-	db, err := database.Open(manager.options.DataRoot)
+	db, err := openGatewayRebindFixtureDatabase(manager.options.DataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}

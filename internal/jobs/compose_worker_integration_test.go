@@ -368,6 +368,187 @@ func (r *blockingComposeRunner) upCallCount() int {
 	return count
 }
 
+type blockingComposeRunnerFailureDiagnostic struct {
+	Total, Config, Up, Unknown int
+	Last                       string
+}
+
+func (r *blockingComposeRunner) failureDiagnosticSnapshot() blockingComposeRunnerFailureDiagnostic {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	value := blockingComposeRunnerFailureDiagnostic{Last: "none"}
+	for _, request := range r.requests {
+		value.Total++
+		switch blockingComposeRunnerCommandClass(request.Args) {
+		case "config":
+			value.Config++
+			value.Last = "config"
+		case "up":
+			value.Up++
+			value.Last = "up"
+		default:
+			value.Unknown++
+			value.Last = "unknown"
+		}
+	}
+	return value
+}
+
+func blockingComposeRunnerCommandClass(arguments []string) string {
+	switch {
+	case blockingComposeConfigCommand(arguments):
+		return "config"
+	case blockingComposeUpCommand(arguments):
+		return "up"
+	default:
+		return "unknown"
+	}
+}
+
+func blockingComposeConfigCommand(arguments []string) bool {
+	return len(arguments) == 13 &&
+		arguments[0] == "compose" &&
+		arguments[1] == "--project-name" &&
+		arguments[3] == "--project-directory" &&
+		arguments[5] == "--env-file" &&
+		arguments[7] == "-f" &&
+		arguments[9] == "config" &&
+		arguments[10] == "--format" &&
+		arguments[11] == "json" &&
+		arguments[12] == "--no-env-resolution"
+}
+
+func blockingComposeUpCommand(arguments []string) bool {
+	return len(arguments) == 14 &&
+		arguments[0] == "compose" &&
+		arguments[1] == "--project-name" &&
+		arguments[3] == "--project-directory" &&
+		arguments[5] == "--env-file" &&
+		arguments[7] == "-f" &&
+		arguments[9] == "up" &&
+		arguments[10] == "-d" &&
+		arguments[11] == "--wait" &&
+		arguments[12] == "--wait-timeout" &&
+		blockingComposeWaitTimeout(arguments[13])
+}
+
+func blockingComposeWaitTimeout(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func blockingComposeJobStatusLabel(value string) string {
+	switch jobs.Status(value) {
+	case jobs.Queued, jobs.Assigned, jobs.Running, jobs.Waiting, jobs.WaitingUser, jobs.Succeeded, jobs.Failed, jobs.Cancelled, jobs.Interrupted, jobs.NeedsAttention:
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func blockingComposeJobPhaseLabel(value string) string {
+	switch value {
+	case "queued", "assigned", "validate", "prepare_workspace", "materialize_release", "render_compose", "evaluate_policy", "apply_runtime", "wait_for_health", "finalize", "running", "waiting_external", "waiting_user", "cancelling", "succeeded", "failed", "cancelled", "interrupted", "needs_attention", "approval_required", "migration_approval_required", "insufficient_replacement_capacity", "route_reconciliation_required":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func TestBlockingComposeRunnerFailureDiagnosticSnapshotIsAllowlisted(t *testing.T) {
+	runner := &blockingComposeRunner{
+		requests: []runtimeprocess.CommandRequest{
+			{Args: []string{"compose", "--project-name", "config-secret", "--project-directory", "C:/private/project", "--env-file", "C:/private/config-secret.env", "-f", "C:/private/config-secret.yaml", "config", "--format", "json", "--no-env-resolution"}, Env: []string{"TOKEN=config-secret"}},
+			{Args: []string{"compose", "--project-name", "config", "--project-directory", "C:/private/project", "--env-file", "C:/private/runtime-secret.env", "-f", "C:/private/compose.yaml", "up", "-d", "--wait", "--wait-timeout", "30"}, Env: []string{"TOKEN=runtime-secret"}},
+			{Args: []string{"compose", "mystery", "argument-secret"}, Env: []string{"TOKEN=unknown-secret"}},
+		},
+		upResult: runtimeprocess.CommandResult{Stdout: []byte("runtime-output-secret"), Stderr: []byte("runtime-error-secret")},
+		upError:  errors.New("runner-error-secret"),
+	}
+	diagnostic := runner.failureDiagnosticSnapshot()
+	if diagnostic.Total != 3 || diagnostic.Config != 1 || diagnostic.Up != 1 || diagnostic.Unknown != 1 || diagnostic.Last != "unknown" {
+		t.Fatalf("diagnostic=%#v", diagnostic)
+	}
+	body, err := json.Marshal(diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"secret", "private", "mystery", "argument"} {
+		if strings.Contains(string(body), forbidden) {
+			t.Fatalf("diagnostic leaked %q: %s", forbidden, body)
+		}
+	}
+}
+
+func TestBlockingComposeRunnerCommandClassRequiresExactComposeShape(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "exact config",
+			args: []string{"compose", "--project-name", "project", "--project-directory", "workspace", "--env-file", "environment", "-f", "compose.yaml", "config", "--format", "json", "--no-env-resolution"},
+			want: "config",
+		},
+		{
+			name: "exact up with config project value",
+			args: []string{"compose", "--project-name", "config", "--project-directory", "workspace", "--env-file", "environment", "-f", "compose.yaml", "up", "-d", "--wait", "--wait-timeout", "30"},
+			want: "up",
+		},
+		{
+			name: "config value in unrelated position",
+			args: []string{"compose", "--project-name", "project", "--project-directory", "config", "--env-file", "environment", "-f", "compose.yaml", "up", "-d", "--wait", "--wait-timeout", "30"},
+			want: "up",
+		},
+		{
+			name: "config with extra argument",
+			args: []string{"compose", "--project-name", "project", "--project-directory", "workspace", "--env-file", "environment", "-f", "compose.yaml", "config", "--format", "json", "--no-env-resolution", "extra"},
+			want: "unknown",
+		},
+		{
+			name: "up with malformed timeout",
+			args: []string{"compose", "--project-name", "project", "--project-directory", "workspace", "--env-file", "environment", "-f", "compose.yaml", "up", "-d", "--wait", "--wait-timeout", "thirty"},
+			want: "unknown",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := blockingComposeRunnerCommandClass(test.args); got != test.want {
+				t.Fatalf("command class=%q want=%q", got, test.want)
+			}
+		})
+	}
+	for _, test := range []struct {
+		value string
+		want  string
+	}{
+		{value: string(jobs.Running), want: string(jobs.Running)},
+		{value: "status-secret", want: "unknown"},
+	} {
+		if got := blockingComposeJobStatusLabel(test.value); got != test.want {
+			t.Fatalf("status label=%q want=%q", got, test.want)
+		}
+	}
+	for _, test := range []struct {
+		value string
+		want  string
+	}{
+		{value: "render_compose", want: "render_compose"},
+		{value: "phase-secret", want: "unknown"},
+	} {
+		if got := blockingComposeJobPhaseLabel(test.value); got != test.want {
+			t.Fatalf("phase label=%q want=%q", got, test.want)
+		}
+	}
+}
+
 func (r *blockingComposeRunner) requestsSnapshot() []runtimeprocess.CommandRequest {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -483,11 +664,12 @@ func TestLegacyLocalSourceDraftMigratesAndCompletesManagedComposeDeployment(t *t
 	select {
 	case <-runner.upStarted:
 	case <-time.After(20 * time.Second):
+		diagnostic := runner.failureDiagnosticSnapshot()
 		durable, getErr := jobService.Get(job.ID)
 		if getErr != nil {
-			t.Fatalf("legacy local deployment did not reach compose up: durable job lookup failed: getErr=%v upCalls=%d", getErr, runner.upCallCount())
+			t.Fatalf("legacy local deployment did not reach compose up: durable_read=failed runner_total=%d runner_config=%d runner_up=%d runner_unknown=%d runner_last=%s", diagnostic.Total, diagnostic.Config, diagnostic.Up, diagnostic.Unknown, diagnostic.Last)
 		}
-		t.Fatalf("legacy local deployment did not reach compose up: status=%q phase=%q errorCode=%q errorDetailSet=%t attempt=%d upCalls=%d", durable.Status, durable.Phase, durable.ErrorCode, durable.ErrorDetail != "", durable.Attempt, runner.upCallCount())
+		t.Fatalf("legacy local deployment did not reach compose up: durable_read=ok job_status=%s job_phase=%s runner_total=%d runner_config=%d runner_up=%d runner_unknown=%d runner_last=%s", blockingComposeJobStatusLabel(durable.Status), blockingComposeJobPhaseLabel(durable.Phase), diagnostic.Total, diagnostic.Config, diagnostic.Up, diagnostic.Unknown, diagnostic.Last)
 	}
 	release()
 	completed := waitForJob(t, jobService, job.ID, jobs.Succeeded)
