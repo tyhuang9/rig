@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,6 +206,101 @@ func TestPrepareGatewayRebindLockedClaimsBeforeProtectedIntent(t *testing.T) {
 		history.Progress[len(history.Progress)-1].Record.Digest != attempt.Progress.Digest {
 		t.Fatalf("prepared history mismatch: intents=%d progress=%d error=%v",
 			len(history.IntentsV2), len(history.Progress), err)
+	}
+}
+
+func TestPrepareGatewayRebindLockedIntentBoundaryRetainsFence(t *testing.T) {
+	f := newGatewayRebindPredecessorFixtureWithClaim(t, false)
+	ctx := context.Background()
+	f.manager.options.RebindFenceCheck = f.repository.CheckGatewayRebindFence
+	inspection := gatewayRebindAdmissionProcessInspection(t, f)
+	completeCrossStoreRepositoryFixture(t, f, inspection.Roster[0])
+	beforeSQL, err := f.repository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeHistory, err := f.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeFiles, err := readGatewayHistorySnapshotMode(f.manager.store, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeCommands := len(f.runner.commands)
+	installCrossStoreFixtureNetworkObserver(f.manager, f.state.Network.Subnet)
+	sentinel := errors.New("prepared intent boundary sentinel")
+	hookCalls := 0
+	f.manager.gatewayRebindAfterPreparedIntent = func(context.Context) error {
+		hookCalls++
+		return sentinel
+	}
+	_, prepareErr := withCrossStoreFixtureEffectLocks(t, f.manager, func() (gatewayRebindPreparedAttempt, error) {
+		return f.manager.prepareGatewayRebindLocked(ctx, f.repository, gatewayRebindAdmissionProcessInput(inspection))
+	})
+	if !IsCode(prepareErr, DiagnosticRouteUnresolved) || errors.Is(prepareErr, sentinel) ||
+		strings.Contains(prepareErr.Error(), sentinel.Error()) || hookCalls != 1 {
+		t.Fatalf("intent boundary error was not sanitized: error=%v hookCalls=%d", prepareErr, hookCalls)
+	}
+	preparedSQL, err := f.repository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || preparedSQL.Active == nil || preparedSQL.Active.Claim.V2 == nil ||
+		preparedSQL.Phase != appaccess.GatewayRebindPrepared || !preparedSQL.RollbackAllowed || preparedSQL.DatabaseCommitObserved ||
+		!reflect.DeepEqual(preparedSQL.Active.Claim.V2.Spec, inspection.Spec) ||
+		!sameGatewayRebindRosterV2(preparedSQL.Active.RosterV2, inspection.Roster) ||
+		!sameGatewayRebindRuntimeHeads(preparedSQL.Active.RuntimeHeads, inspection.RuntimeHeads) ||
+		!reflect.DeepEqual(preparedSQL.CurrentSource, beforeSQL.CurrentSource) ||
+		!errors.Is(f.repository.CheckGatewayRebindFence(ctx), appaccess.ErrGatewayRebindActive) {
+		t.Fatalf("intent boundary did not retain the actual prepared SQL fence: %v", err)
+	}
+	history, err := f.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.Checkpoints) != len(beforeHistory.Checkpoints)+1 ||
+		len(history.IntentsV2) != len(beforeHistory.IntentsV2)+1 || len(history.Progress) != len(beforeHistory.Progress) ||
+		len(history.Terminals) != len(beforeHistory.Terminals) ||
+		!sameGatewayRebindRosterV2(history.IntentsV2[len(history.IntentsV2)-1].Intent.Roster, inspection.Roster) ||
+		!sameGatewayRebindRuntimeHeads(history.IntentsV2[len(history.IntentsV2)-1].Intent.RuntimeHeads, inspection.RuntimeHeads) {
+		t.Fatalf("intent-only protected prefix mismatch: checkpoints=%d intents=%d progress=%d terminals=%d error=%v",
+			len(history.Checkpoints), len(history.IntentsV2), len(history.Progress), len(history.Terminals), err)
+	}
+	intentOnly, err := readGatewayHistorySnapshotMode(f.manager.store, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gatewayRebindAdmissionHistoryRetained(beforeFiles, intentOnly) || len(f.runner.commands) != beforeCommands {
+		t.Fatal("intent boundary replaced predecessor files or issued an external effect")
+	}
+	fresh, err := New(f.runner, f.manager.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installCrossStoreFixtureNetworkObserver(fresh, f.state.Network.Subnet)
+	recovered, recoverErr := withCrossStoreFixtureEffectLocks(t, fresh, func() (gatewayRebindPreparedAttempt, error) {
+		return fresh.recoverGatewayRebindPreparedAdmissionLocked(ctx, f.repository, preparedSQL)
+	})
+	if recoverErr != nil || recovered.Progress.Sequence != 1 || recovered.Progress.Phase != gatewayRebindProgressSuccessorIntent {
+		t.Fatalf("default recovery did not install progress one: attempt=%#v error=%v", recovered, recoverErr)
+	}
+	recoveredFiles, err := readGatewayHistorySnapshotMode(fresh.store, true)
+	recoveredSQL, sqlErr := f.repository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || sqlErr != nil || !gatewayRebindAdmissionHistoryRetained(intentOnly, recoveredFiles) ||
+		!reflect.DeepEqual(preparedSQL, recoveredSQL) || !errors.Is(f.repository.CheckGatewayRebindFence(ctx), appaccess.ErrGatewayRebindActive) ||
+		len(f.runner.commands) != beforeCommands {
+		t.Fatalf("default recovery changed the retained intent-only prefix: %v", err)
+	}
+	replayCalls := 0
+	fresh.gatewayRebindAfterPreparedIntent = func(context.Context) error {
+		replayCalls++
+		return errors.New("complete replay unexpectedly invoked intent hook")
+	}
+	replayed, replayErr := withCrossStoreFixtureEffectLocks(t, fresh, func() (gatewayRebindPreparedAttempt, error) {
+		return fresh.recoverGatewayRebindPreparedAdmissionLocked(ctx, f.repository, preparedSQL)
+	})
+	replayedFiles, fileErr := readGatewayHistorySnapshotMode(fresh.store, true)
+	finalSQL, finalSQLErr := f.repository.GatewayRebindRecoverySnapshot(ctx)
+	if replayErr != nil || replayCalls != 0 || replayed.Progress.Digest != recovered.Progress.Digest || fileErr != nil ||
+		!sameGatewayHistorySnapshot(recoveredFiles, replayedFiles) ||
+		finalSQLErr != nil || !reflect.DeepEqual(preparedSQL, finalSQL) ||
+		!errors.Is(f.repository.CheckGatewayRebindFence(ctx), appaccess.ErrGatewayRebindActive) || len(f.runner.commands) != beforeCommands {
+		t.Fatalf("complete replay changed progress, invoked hook, or released fence: replay=%#v error=%v", replayed, replayErr)
 	}
 }
 
