@@ -159,6 +159,33 @@ type liveCrossStoreAdmissionChild struct {
 	Input      gatewayRebindCommitInput
 }
 
+func liveCrossStoreAdmissionChildInput(value liveCrossStoreAdmissionChild) (gatewayRebindCommitInput, error) {
+	input := value.Input
+	inspection := input.Inspection
+	specDigest, err := appaccess.GatewayRebindSpecV2Digest(inspection.Spec)
+	if err != nil || specDigest != inspection.SpecDigest || inspection.Spec.RosterCount != int64(len(inspection.Roster)) {
+		return gatewayRebindCommitInput{}, errors.New("invalid private admission child inspection")
+	}
+	roster := append([]appaccess.GatewayRebindRosterEntryV2(nil), inspection.Roster...)
+	for index := range roster {
+		if roster[index].Ordinal != int64(index+1) || roster[index].OperationID != inspection.Spec.OperationID {
+			return gatewayRebindCommitInput{}, errors.New("invalid private admission child inspection")
+		}
+		digest, digestErr := appaccess.GatewayRebindRosterEntryV2Digest(roster[index])
+		if digestErr != nil {
+			return gatewayRebindCommitInput{}, errors.New("invalid private admission child inspection")
+		}
+		roster[index].EntryDigest = digest
+	}
+	rosterDigest, err := appaccess.GatewayRebindRosterV2Digest(roster)
+	if err != nil || rosterDigest != inspection.Spec.RosterDigest {
+		return gatewayRebindCommitInput{}, errors.New("invalid private admission child inspection")
+	}
+	inspection.Roster = roster
+	input.Inspection = inspection
+	return input, nil
+}
+
 // This is a real abrupt test-process exit, with no deferred lock cleanup,
 // followed by two independent recovery processes. It covers prepared admission
 // only, not hostd bootstrap dispatch or terminal cross-store commit recovery.
@@ -292,8 +319,7 @@ func TestLiveGatewayRebindCrossStorePreparedClaimProcessRecovery(t *testing.T) {
 	}
 	assertLiveOneShot(t, fixture.ctx, options.HostPort, fixture.spec.appID, "/", fixture.spec.applicationReply, "prepared recovery changed LAN app loopback route")
 	assertLiveOneShot(t, fixture.ctx, options.HostPort, f.loopbackID, "/", f.loopbackReply, "prepared recovery changed loopback-only app")
-	response := probeGatewayV2HostStatus(fixture.ctx, f.predecessorIPv4, fixture.port, f.predecessorIPv4, "/")
-	if !response.Connected || !response.Responded || response.Status != 200 || response.Body != fixture.spec.applicationReply {
+	if !liveGatewayRebindRuntimeLANBody(fixture.ctx, f.predecessorIPv4, fixture.port, fixture.spec.applicationReply) {
 		t.Fatal("prepared recovery changed the original LAN publication")
 	}
 	wrongHost := probeGatewayV2HostStatus(fixture.ctx, f.predecessorIPv4, fixture.port, f.loopbackID+".rig.localhost", "/")
@@ -352,6 +378,10 @@ func TestLiveGatewayRebindCrossStoreAdmissionChild(t *testing.T) {
 	if err != nil || json.Unmarshal(body, &value) != nil {
 		t.Fatal("read private admission fixture configuration")
 	}
+	input, inputErr := liveCrossStoreAdmissionChildInput(value)
+	if inputErr != nil {
+		t.Fatal("validate private admission fixture configuration")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	db, err := database.Open(value.Controller.DataRoot)
@@ -377,7 +407,7 @@ func TestLiveGatewayRebindCrossStoreAdmissionChild(t *testing.T) {
 			return errors.New("unreachable exit boundary")
 		}
 		_, err = withCrossStoreFixtureEffectLocks(t, manager, func() (gatewayRebindPreparedAttempt, error) {
-			return manager.prepareGatewayRebindLocked(ctx, repository, value.Input)
+			return manager.prepareGatewayRebindLocked(ctx, repository, input)
 		})
 		t.Fatalf("prepared admission returned instead of reaching exit boundary: %v", err)
 	case "recover":

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
@@ -72,7 +73,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 		t.Fatal("hosting fixture API dependencies are missing; run its frozen pnpm install before the live gate")
 	}
 	root := t.TempDir()
-	for _, name := range []string{"runtime-docker", "build-docker", "working", "ingress-state"} {
+	for _, name := range []string{"runtime-docker", "build-docker", "working"} {
 		if err := os.Mkdir(filepath.Join(root, name), 0o700); err != nil {
 			t.Fatal("create hosted test directory")
 		}
@@ -243,11 +244,13 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	imageID, definitionDigest := hostingLiveBuildAPI(t, ctx, docker, buildDockerConfig, workspace, root, imageTag, plan, appID, releaseID, artifactID, dbURL, token, sentinel)
 	hostingLiveImageHasNoSecrets(t, ctx, docker, runtimeDockerConfig, imageID, dbURL, token, sentinel)
 	port := uint16(hostingLiveFreePort(t, "127.0.0.1"))
+	accessRepository := appaccess.New(db)
 	ingress, err := generatedingress.New(runtimeprocess.ExecRunner{}, generatedingress.Options{
 		DockerExecutable: docker, DockerConfigDirectory: runtimeDockerConfig,
-		WorkingDirectory: filepath.Join(root, "working"), DataRoot: filepath.Join(root, "ingress-state"),
+		WorkingDirectory: filepath.Join(root, "working"), DataRoot: dataRoot,
 		HostPort: port, CommandTimeout: 45 * time.Second, PullTimeout: 5 * time.Minute,
-		RebindFenceCheck: func(context.Context) error { return nil },
+		RebindFenceCheck:             accessRepository.CheckGatewayRebindFence,
+		RebindCurrentStateRepository: accessRepository,
 	})
 	if err != nil {
 		t.Fatal("prepare generated ingress")

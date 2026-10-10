@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
@@ -51,8 +53,8 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 		t.Fatal("Docker daemon unavailable")
 	}
 	root := t.TempDir()
-	dockerConfig, working, ingressState, dataRoot := filepath.Join(root, "docker-config"), filepath.Join(root, "working"), filepath.Join(root, "ingress"), filepath.Join(root, "data")
-	for _, directory := range []string{dockerConfig, working, ingressState, dataRoot} {
+	dockerConfig, working, dataRoot := filepath.Join(root, "docker-config"), filepath.Join(root, "working"), filepath.Join(root, "data")
+	for _, directory := range []string{dockerConfig, working, dataRoot} {
 		if err := os.Mkdir(directory, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -89,10 +91,21 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	port := uint16(controllerJourneyPort(t, "127.0.0.1"))
+	db, err := database.Open(dataRoot)
+	if err != nil {
+		t.Fatal("open Next cache controller database")
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Error("close Next cache controller database")
+		}
+	})
+	accessRepository := appaccess.New(db)
 	ingress, err := generatedingress.New(runner, generatedingress.Options{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
-		DataRoot: ingressState, HostPort: port, CommandTimeout: 45 * time.Second, PullTimeout: 5 * time.Minute,
-		RebindFenceCheck: func(context.Context) error { return nil },
+		DataRoot: dataRoot, HostPort: port, CommandTimeout: 45 * time.Second, PullTimeout: 5 * time.Minute,
+		RebindFenceCheck:             accessRepository.CheckGatewayRebindFence,
+		RebindCurrentStateRepository: accessRepository,
 	})
 	if err != nil {
 		t.Fatal(err)

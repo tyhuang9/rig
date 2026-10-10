@@ -86,11 +86,13 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	if err != nil {
 		t.Fatal("create generated runtime")
 	}
+	accessRepository := liveGatewayAccessRepository(t, state)
 	ingress, err := New(runner, Options{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		DataRoot: state, HostPort: freeLoopbackPort(t), CommandTimeout: 45 * time.Second,
 		PullTimeout: 5 * time.Minute, OutputLimit: liveDockerOutputLimit,
-		RebindFenceCheck: func(context.Context) error { return nil },
+		RebindFenceCheck:             accessRepository.CheckGatewayRebindFence,
+		RebindCurrentStateRepository: accessRepository,
 	})
 	if err != nil {
 		t.Fatal("create generated ingress")
