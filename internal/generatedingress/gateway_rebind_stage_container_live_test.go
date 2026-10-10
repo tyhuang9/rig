@@ -258,10 +258,17 @@ func TestLiveGatewayRebindSuccessorStoppedStageContainer(t *testing.T) {
 	}
 	replayedDriver := managerGatewayRebindStageContainerDriver{manager: restarted}
 	replayed, err := replayedDriver.inspect(fixture.ctx, intent)
-	if err != nil || !reflect.DeepEqual(physical, replayed) ||
-		!validGatewayRebindStageContainerObservation(intent, *bound.Stage, replayed, containerBinding) ||
-		!validOwnedNameSet(replayed.OwnedContainers, intent.Intent.Identity.StageContainer) {
-		t.Fatal("fresh-manager replay changed exact stopped-container identity or created a second container")
+	if err != nil {
+		t.Fatal("fresh-manager stopped-container replay inspection failed")
+	}
+	if !reflect.DeepEqual(physical, replayed) {
+		t.Fatal("fresh-manager stopped-container replay physical snapshot changed")
+	}
+	if !validGatewayRebindStageContainerObservation(intent, *bound.Stage, replayed, containerBinding) {
+		t.Fatal("fresh-manager stopped-container replay exact binding proof failed")
+	}
+	if !validOwnedNameSet(replayed.OwnedContainers, intent.Intent.Identity.StageContainer) {
+		t.Fatal("fresh-manager stopped-container replay owned-container census changed")
 	}
 	replayedDelta, err := readGatewayRebindStageContainerPhysicalObservation(
 		fixture.ctx, restartReads, replayedDriver, intent, *bound.Stage, containerBinding)

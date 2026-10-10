@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -86,6 +87,7 @@ type liveGatewayRebindRuntimeFixture struct {
 	manager          *Manager
 	diagnosticRunner *liveGatewayRebindRuntimeDiagnosticRunner
 	diagnosticDriver *liveGatewayRebindRuntimeRollbackDriver
+	diagnosticStage  *liveGatewayRebindRuntimeTypedStageDiagnosticDriver
 	inspection       GatewayRebindProposalInspection
 	input            gatewayRebindCommitInput
 }
@@ -103,6 +105,11 @@ func newLiveGatewayRebindRuntimeFixture(t *testing.T) liveGatewayRebindRuntimeFi
 		t.Fatal("open typed runtime manager")
 	}
 	rebind, current := newGatewayRebindRuntimeDrivers(manager)
+	diagnosticStage := &liveGatewayRebindRuntimeTypedStageDiagnosticDriver{
+		gatewayRebindTypedStageDriver: rebind.stage,
+		first:                         liveGatewayRebindRuntimeTypedStageDiagnosticSnapshot{FirstMethod: liveGatewayRebindRuntimeTypedStageMethodUnknown},
+	}
+	rebind.stage = diagnosticStage
 	diagnosticDriver := &liveGatewayRebindRuntimeRollbackDriver{managerGatewayRebindCrossStoreDriver: rebind}
 	manager.gatewayRebindCrossStoreDriver = diagnosticDriver
 	manager.gatewayCurrentPhysicalDriver = current
@@ -118,7 +125,7 @@ func newLiveGatewayRebindRuntimeFixture(t *testing.T) liveGatewayRebindRuntimeFi
 		t.Fatal("inspect the exact typed rebind proposal")
 	}
 	value := liveGatewayRebindRuntimeFixture{liveGatewayRebindSourceFixture: source, manager: manager,
-		diagnosticRunner: diagnosticRunner, diagnosticDriver: diagnosticDriver, inspection: inspection,
+		diagnosticRunner: diagnosticRunner, diagnosticDriver: diagnosticDriver, diagnosticStage: diagnosticStage, inspection: inspection,
 		input: gatewayRebindCommitInput{Inspection: inspection,
 			RebindApproval:    appaccess.Approval{Action: appaccess.ActionRebindGateway, SpecDigest: inspection.SpecDigest, ActorID: gatewayRebindTestAdministrator},
 			ConfigureApproval: appaccess.Approval{Action: appaccess.ActionConfigureGateway, SpecDigest: inspection.SuccessorProfileSpecDigest, ActorID: gatewayRebindTestAdministrator}}}
@@ -130,22 +137,96 @@ func newLiveGatewayRebindRuntimeFixture(t *testing.T) liveGatewayRebindRuntimeFi
 
 type liveGatewayRebindRuntimeRollbackDriver struct {
 	managerGatewayRebindCrossStoreDriver
+	mu               sync.Mutex
 	refuseSequence17 bool
 	refused          bool
 	lastSequence     uint64
 	lastPhase        gatewayRebindProgressPhase
 }
 
+func (d *liveGatewayRebindRuntimeRollbackDriver) requireSequence17Refusal() {
+	d.mu.Lock()
+	d.refuseSequence17 = true
+	d.mu.Unlock()
+}
+
+func (d *liveGatewayRebindRuntimeRollbackDriver) diagnosticSnapshot() (bool, uint64, gatewayRebindProgressPhase) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.refused, d.lastSequence, d.lastPhase
+}
+
 type liveGatewayRebindRuntimeDiagnosticRunner struct {
+	mu               sync.Mutex
 	runner           runtimeprocess.CommandRunner
 	lastCommandClass string
+	lastResult       liveGatewayRebindRuntimeCommandResult
+}
+
+type liveGatewayRebindRuntimeCommandResult struct {
+	Outcome         string
+	Context         string
+	StdoutTruncated bool
+	StderrTruncated bool
 }
 
 func (r *liveGatewayRebindRuntimeDiagnosticRunner) Run(ctx context.Context,
 	request runtimeprocess.CommandRequest,
 ) (runtimeprocess.CommandResult, error) {
-	r.lastCommandClass = liveGatewayRebindRuntimeCommandClass(request.Args)
-	return r.runner.Run(ctx, request)
+	class := liveGatewayRebindRuntimeCommandClass(request.Args)
+	result, err := r.runner.Run(ctx, request)
+	r.mu.Lock()
+	r.lastCommandClass = class
+	r.lastResult = liveGatewayRebindRuntimeCommandResult{
+		Outcome: liveGatewayRebindRuntimeCommandOutcome(ctx, err), Context: liveGatewayRebindRuntimeCommandContext(ctx),
+		StdoutTruncated: result.StdoutTruncated, StderrTruncated: result.StderrTruncated,
+	}
+	r.mu.Unlock()
+	return result, err
+}
+
+func (r *liveGatewayRebindRuntimeDiagnosticRunner) diagnosticSnapshot() (string, liveGatewayRebindRuntimeCommandResult) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	class, result := r.lastCommandClass, r.lastResult
+	if class == "" {
+		class = "unknown"
+	}
+	if result.Outcome == "" {
+		result.Outcome = "unknown"
+	}
+	if result.Context == "" {
+		result.Context = "unknown"
+	}
+	return class, result
+}
+
+func liveGatewayRebindRuntimeCommandOutcome(ctx context.Context, err error) string {
+	if err == nil {
+		return "success"
+	}
+	switch liveGatewayRebindRuntimeCommandContext(ctx) {
+	case "cancelled":
+		return "cancelled"
+	case "deadline":
+		return "deadline"
+	default:
+		return "failure"
+	}
+}
+
+func liveGatewayRebindRuntimeCommandContext(ctx context.Context) string {
+	if ctx == nil {
+		return "nil"
+	}
+	switch ctx.Err() {
+	case context.Canceled:
+		return "cancelled"
+	case context.DeadlineExceeded:
+		return "deadline"
+	default:
+		return "active"
+	}
 }
 
 func liveGatewayRebindRuntimeCommandClass(args []string) string {
@@ -153,8 +234,8 @@ func liveGatewayRebindRuntimeCommandClass(args []string) string {
 		return "unknown"
 	}
 	switch args[0] + "_" + args[1] {
-	case "image_inspect", "network_inspect", "network_create", "network_rm", "network_connect", "network_disconnect",
-		"volume_inspect", "volume_create", "volume_rm", "container_inspect", "container_create", "container_start", "container_stop", "container_rm":
+	case "image_inspect", "image_ls", "network_inspect", "network_ls", "network_create", "network_rm", "network_connect", "network_disconnect",
+		"volume_inspect", "volume_ls", "volume_create", "volume_rm", "container_inspect", "container_ls", "container_create", "container_start", "container_stop", "container_rm":
 		return args[0] + "_" + args[1]
 	case "container_cp":
 		return "config_copy"
@@ -163,6 +244,151 @@ func liveGatewayRebindRuntimeCommandClass(args []string) string {
 	default:
 		return "unknown"
 	}
+}
+
+type liveGatewayRebindRuntimeTypedStageMethod string
+
+const (
+	liveGatewayRebindRuntimeTypedStageMethodUnknown         liveGatewayRebindRuntimeTypedStageMethod = "unknown"
+	liveGatewayRebindRuntimeTypedStageMethodServeStage      liveGatewayRebindRuntimeTypedStageMethod = "serve_stage"
+	liveGatewayRebindRuntimeTypedStageMethodCopyFinalConfig liveGatewayRebindRuntimeTypedStageMethod = "copy_final_config"
+)
+
+type liveGatewayRebindRuntimeTypedStageDiagnosticSnapshot struct {
+	FirstMethod            liveGatewayRebindRuntimeTypedStageMethod
+	Operation              string
+	Checkpoint             string
+	ServeStageSucceeded    bool
+	CopyFinalConfigSuccess bool
+	OuterRefusal           string
+}
+
+type liveGatewayRebindRuntimeTypedStageDiagnosticDriver struct {
+	gatewayRebindTypedStageDriver
+	mu    sync.Mutex
+	first liveGatewayRebindRuntimeTypedStageDiagnosticSnapshot
+}
+
+func (d *liveGatewayRebindRuntimeTypedStageDiagnosticDriver) serveStage(ctx context.Context,
+	intent gatewayRebindProtectedIntentV2, effect gatewayRebindTypedEffectProgress,
+	guard gatewayRebindTypedEffectGuard,
+) (string, error) {
+	endpoint, err := d.gatewayRebindTypedStageDriver.serveStage(ctx, intent, effect, guard)
+	d.record(liveGatewayRebindRuntimeTypedStageMethodServeStage, err)
+	return endpoint, err
+}
+
+func (d *liveGatewayRebindRuntimeTypedStageDiagnosticDriver) copyFinalConfig(ctx context.Context,
+	intent gatewayRebindProtectedIntentV2, checkpoint gatewayRebindPredecessorCheckpoint,
+	effect gatewayRebindTypedEffectProgress, guard gatewayRebindTypedEffectGuard,
+) error {
+	err := d.gatewayRebindTypedStageDriver.copyFinalConfig(ctx, intent, checkpoint, effect, guard)
+	d.record(liveGatewayRebindRuntimeTypedStageMethodCopyFinalConfig, err)
+	return err
+}
+
+func (d *liveGatewayRebindRuntimeTypedStageDiagnosticDriver) record(
+	method liveGatewayRebindRuntimeTypedStageMethod, err error,
+) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err == nil {
+		switch method {
+		case liveGatewayRebindRuntimeTypedStageMethodServeStage:
+			d.first.ServeStageSucceeded = true
+		case liveGatewayRebindRuntimeTypedStageMethodCopyFinalConfig:
+			d.first.CopyFinalConfigSuccess = true
+		}
+		return
+	}
+	if d.first.FirstMethod != "" && d.first.FirstMethod != liveGatewayRebindRuntimeTypedStageMethodUnknown {
+		return
+	}
+	d.first.FirstMethod = method
+	d.first.Operation = gatewayRebindTypedStageDiagnosticOperationUnknown.String()
+	d.first.Checkpoint = gatewayRebindTypedStageDiagnosticCheckpointUnknown.String()
+	var diagnostic *gatewayRebindTypedStageDiagnosticError
+	if errors.As(err, &diagnostic) && diagnostic != nil {
+		d.first.Operation, d.first.Checkpoint = diagnostic.typedStageDiagnostic()
+	}
+}
+
+func (d *liveGatewayRebindRuntimeTypedStageDiagnosticDriver) diagnosticSnapshot(
+	outerErr error,
+) liveGatewayRebindRuntimeTypedStageDiagnosticSnapshot {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	value := d.first
+	if value.FirstMethod == "" {
+		value.FirstMethod = liveGatewayRebindRuntimeTypedStageMethodUnknown
+	}
+	if value.Operation == "" {
+		value.Operation = gatewayRebindTypedStageDiagnosticOperationUnknown.String()
+	}
+	if value.Checkpoint == "" {
+		value.Checkpoint = gatewayRebindTypedStageDiagnosticCheckpointUnknown.String()
+	}
+	if value.OuterRefusal == "" {
+		value.OuterRefusal = "none"
+	}
+	if outerErr != nil && value.FirstMethod == liveGatewayRebindRuntimeTypedStageMethodUnknown &&
+		(value.ServeStageSucceeded || value.CopyFinalConfigSuccess) {
+		value.OuterRefusal = "after_successful_stage_method"
+	}
+	return value
+}
+
+type liveGatewayRebindRuntimeFailureDiagnostic struct {
+	LastSequence        uint64
+	LastPhase           gatewayRebindProgressPhase
+	FirstMethod         liveGatewayRebindRuntimeTypedStageMethod
+	Operation           string
+	Checkpoint          string
+	ServeStageSucceeded bool
+	CopyFinalConfigOK   bool
+	OuterRefusal        string
+	LatestCommand       string
+	CommandOutcome      string
+	CommandContext      string
+	StdoutTruncated     bool
+	StderrTruncated     bool
+}
+
+func (f liveGatewayRebindRuntimeFixture) failureDiagnostic(err error) liveGatewayRebindRuntimeFailureDiagnostic {
+	value := liveGatewayRebindRuntimeFailureDiagnostic{
+		FirstMethod:    liveGatewayRebindRuntimeTypedStageMethodUnknown,
+		Operation:      gatewayRebindTypedStageDiagnosticOperationUnknown.String(),
+		Checkpoint:     gatewayRebindTypedStageDiagnosticCheckpointUnknown.String(),
+		OuterRefusal:   "none",
+		LatestCommand:  "unknown",
+		CommandOutcome: "unknown",
+		CommandContext: "unknown",
+	}
+	if f.diagnosticDriver != nil {
+		_, value.LastSequence, value.LastPhase = f.diagnosticDriver.diagnosticSnapshot()
+	}
+	if f.diagnosticStage != nil {
+		stage := f.diagnosticStage.diagnosticSnapshot(err)
+		value.FirstMethod, value.Operation, value.Checkpoint = stage.FirstMethod, stage.Operation, stage.Checkpoint
+		value.ServeStageSucceeded, value.CopyFinalConfigOK, value.OuterRefusal = stage.ServeStageSucceeded,
+			stage.CopyFinalConfigSuccess, stage.OuterRefusal
+	}
+	if f.diagnosticRunner != nil {
+		class, result := f.diagnosticRunner.diagnosticSnapshot()
+		value.LatestCommand = class
+		value.CommandOutcome, value.CommandContext = result.Outcome, result.Context
+		value.StdoutTruncated, value.StderrTruncated = result.StdoutTruncated, result.StderrTruncated
+	}
+	return value
+}
+
+func liveGatewayRebindRuntimeLogFailure(t *testing.T, fixture liveGatewayRebindRuntimeFixture, err error) {
+	t.Helper()
+	value := fixture.failureDiagnostic(err)
+	t.Logf("typed runtime refusal: last_validated_sequence=%d last_validated_phase=%q first_stage_method=%q stage_operation=%q stage_checkpoint=%q serve_stage_succeeded=%t copy_final_config_succeeded=%t outer_refusal=%q latest_command=%q command_outcome=%q command_context=%q stdout_truncated=%t stderr_truncated=%t",
+		value.LastSequence, value.LastPhase, value.FirstMethod, value.Operation, value.Checkpoint,
+		value.ServeStageSucceeded, value.CopyFinalConfigOK, value.OuterRefusal, value.LatestCommand,
+		value.CommandOutcome, value.CommandContext, value.StdoutTruncated, value.StderrTruncated)
 }
 
 type liveGatewayRebindRuntimeReplayRunner struct {
@@ -281,8 +507,13 @@ func (d *liveGatewayRebindRuntimeRollbackDriver) reconcileSuccessorLocked(ctx co
 ) (gatewayRebindTypedPhysicalResult, error) {
 	return d.managerGatewayRebindCrossStoreDriver.reconcileSuccessorLocked(ctx, request,
 		func(appendCtx context.Context, record gatewayRebindProgressRecord) error {
-			if d.refuseSequence17 && record.Sequence == 17 && record.Phase == gatewayRebindProgressHandoverCommitted && !d.refused {
+			d.mu.Lock()
+			refuse := d.refuseSequence17 && record.Sequence == 17 && record.Phase == gatewayRebindProgressHandoverCommitted && !d.refused
+			if refuse {
 				d.refused = true
+			}
+			d.mu.Unlock()
+			if refuse {
 				return errors.New("test refusal before durable sequence seventeen")
 			}
 			return d.appendValidatedProgress(appendCtx, record, appendProgress)
@@ -295,7 +526,9 @@ func (d *liveGatewayRebindRuntimeRollbackDriver) appendValidatedProgress(ctx con
 	if err := appendProgress(ctx, record); err != nil {
 		return err
 	}
+	d.mu.Lock()
 	d.lastSequence, d.lastPhase = record.Sequence, record.Phase
+	d.mu.Unlock()
 	return nil
 }
 
@@ -347,20 +580,19 @@ func liveGatewayRebindRuntimeJourney(t *testing.T, rollback bool) {
 	var result GatewayRebindCommitResult
 	if rollback {
 		driver := f.diagnosticDriver
-		driver.refuseSequence17 = true
+		driver.requireSequence17Refusal()
 		result, err = f.manager.commitGatewayRebind(ctx, repository, f.input)
-		if err != nil || !driver.refused {
+		refused, _, _ := driver.diagnosticSnapshot()
+		if err != nil || !refused {
 			if err != nil {
-				t.Logf("typed runtime refusal: last_validated_sequence=%d last_validated_phase=%q command_class=%q",
-					f.diagnosticDriver.lastSequence, f.diagnosticDriver.lastPhase, f.diagnosticRunner.lastCommandClass)
+				liveGatewayRebindRuntimeLogFailure(t, f, err)
 			}
-			t.Fatalf("force exact pre-sequence17 rollback: refused=%t err=%v", driver.refused, err)
+			t.Fatalf("force exact pre-sequence17 rollback: refused=%t err=%v", refused, err)
 		}
 	} else {
 		result, err = f.manager.commitGatewayRebind(ctx, repository, f.input)
 		if err != nil {
-			t.Logf("typed runtime refusal: last_validated_sequence=%d last_validated_phase=%q command_class=%q",
-				f.diagnosticDriver.lastSequence, f.diagnosticDriver.lastPhase, f.diagnosticRunner.lastCommandClass)
+			liveGatewayRebindRuntimeLogFailure(t, f, err)
 			failLiveIngress(t, "commit typed runtime rebind", err)
 		}
 	}
