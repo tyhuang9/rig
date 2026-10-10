@@ -16,13 +16,14 @@ import (
 )
 
 type gatewayStartupRecoveryFixture struct {
-	presence                        generatedingress.GatewayRebindStartupPresence
-	before                          generatedingress.GatewayRebindCurrentInspection
-	after                           generatedingress.GatewayRebindCurrentInspection
-	result                          generatedingress.GatewayRebindStartupRecoveryResult
-	calls                           []string
-	readErr, restoreErr, recoverErr error
-	unhandled                       bool
+	presence                                   generatedingress.GatewayRebindStartupPresence
+	before                                     generatedingress.GatewayRebindCurrentInspection
+	after                                      generatedingress.GatewayRebindCurrentInspection
+	result                                     generatedingress.GatewayRebindStartupRecoveryResult
+	calls                                      []string
+	readErr, retireErr, restoreErr, recoverErr error
+	unretired                                  bool
+	unhandled                                  bool
 }
 
 func newGatewayStartupRecoveryFixture(active bool) *gatewayStartupRecoveryFixture {
@@ -62,6 +63,10 @@ func (f *gatewayStartupRecoveryFixture) callbacks() gatewayRebindStartupRecovery
 			}
 			return f.after, f.readErr
 		},
+		retire: func(context.Context) (bool, error) {
+			f.calls = append(f.calls, "retire")
+			return !f.unretired, f.retireErr
+		},
 		restore: func(context.Context) (bool, error) {
 			f.calls = append(f.calls, "restore")
 			return !f.unhandled, f.restoreErr
@@ -97,12 +102,15 @@ func TestGatewayRebindStartupDispatchPreservesDedicatedRecovery(t *testing.T) {
 			if mode == generatedingress.GatewayCurrentRecoveryNative {
 				f.nativePredecessor()
 			}
-			want := []string{"inspect"}
+			want := []string{"inspect", "retire", "inspect"}
+			if mode == generatedingress.GatewayCurrentRecoveryNative {
+				want = []string{"inspect"}
+			}
 			if mode == generatedingress.GatewayCurrentRecoveryStable {
-				want = []string{"inspect", "restore", "recover", "inspect"}
+				want = []string{"inspect", "retire", "inspect", "restore", "recover", "inspect"}
 			}
 			if mode == generatedingress.GatewayCurrentRecoveryLANBatchDone {
-				want = []string{"inspect", "restore", "inspect"}
+				want = []string{"inspect", "retire", "inspect", "restore", "inspect"}
 			}
 			got, err := prepareGatewayRebindRecovery(context.Background(), f.presence, f.callbacks())
 			if err != nil || !reflect.DeepEqual(got, f.before) || !reflect.DeepEqual(f.calls, want) {
@@ -113,17 +121,22 @@ func TestGatewayRebindStartupDispatchPreservesDedicatedRecovery(t *testing.T) {
 }
 
 func TestGatewayRebindStartupActiveResultAndLeaseOrdering(t *testing.T) {
-	for _, name := range []string{"abort rebound", "abort native", "commit prepared", "commit successor ready", "commit database committed"} {
+	for _, name := range []string{"abort rebound", "abort native", "commit native predecessor", "commit prepared", "commit successor ready", "commit database committed"} {
 		t.Run(name, func(t *testing.T) {
 			f := newGatewayStartupRecoveryFixture(true)
-			if name == "abort native" {
+			if name == "abort native" || name == "commit native predecessor" {
 				f.nativePredecessor()
 			}
 			if strings.HasPrefix(name, "commit") {
 				f.result.FinalActivePhase, f.result.Disposition = appaccess.GatewayRebindCommitted, appaccess.GatewayRebindDispositionCommit
 				source := f.after.SelectedCurrentAuthority
+				source.Kind = appaccess.GatewayRebindSourceGatewayRebind
 				source.OperationID, source.TerminalReceiptDigest = f.before.ActiveOperationID, f.result.TerminalReceiptDigest
 				f.after.SelectedCurrentAuthority, f.result.SelectedCurrentAuthority = source, &source
+				f.after.CurrentRecoveryMode = generatedingress.GatewayCurrentRecoveryStable
+				f.after.CurrentStateVersion, f.after.CurrentStateRevision = 1, 1
+				f.result.CurrentStateVersion, f.result.CurrentStateRevision = 1, 1
+				f.result.CurrentStateDigest, f.result.CurrentAttestationDigest = f.after.CurrentStateDigest, strings.Repeat("4", 64)
 				f.after.Retained[0].Disposition = f.result.Disposition
 				if name == "commit successor ready" {
 					f.before.ActivePhase = appaccess.GatewayRebindSuccessorReady
@@ -140,6 +153,17 @@ func TestGatewayRebindStartupActiveResultAndLeaseOrdering(t *testing.T) {
 				t.Fatal(err)
 			}
 			callbacks := f.callbacks()
+			withLease := func(callback func(context.Context) (bool, error)) func(context.Context) (bool, error) {
+				return func(ctx context.Context) (bool, error) {
+					release, err := deploymenteffects.Acquire(ctx, directories.WorkingDirectory)
+					if err != nil {
+						t.Fatal(err)
+					}
+					value, err := callback(ctx)
+					return value, errors.Join(err, release())
+				}
+			}
+			callbacks.retire, callbacks.restore = withLease(callbacks.retire), withLease(callbacks.restore)
 			recover := callbacks.recover
 			callbacks.recover = func(ctx context.Context) (generatedingress.GatewayRebindStartupRecoveryResult, error) {
 				release, err := deploymenteffects.Acquire(ctx, directories.WorkingDirectory)
@@ -150,7 +174,11 @@ func TestGatewayRebindStartupActiveResultAndLeaseOrdering(t *testing.T) {
 				return value, errors.Join(err, release())
 			}
 			got, err := prepareGatewayRebindRecovery(ctx, f.presence, callbacks)
-			if err != nil || !reflect.DeepEqual(got, f.after) || !reflect.DeepEqual(f.calls, []string{"inspect", "recover", "inspect"}) {
+			want := []string{"inspect", "recover", "inspect", "retire", "inspect", "restore", "inspect"}
+			if name == "abort native" {
+				want = []string{"inspect", "recover", "inspect"}
+			}
+			if err != nil || !reflect.DeepEqual(got, f.after) || !reflect.DeepEqual(f.calls, want) {
 				t.Fatalf("active dispatch=%v result=%+v error=%v", f.calls, got, err)
 			}
 			// Ordinary admission can acquire the same lease only after recovery
@@ -184,6 +212,8 @@ func TestGatewayRebindStartupRefusesUnverifiedRecovery(t *testing.T) {
 		{"stray active format", false, func(f *gatewayStartupRecoveryFixture) { f.before.ActiveSpecVersion = 2 }},
 		{"unknown current mode", false, func(f *gatewayStartupRecoveryFixture) { f.before.CurrentRecoveryMode = "unknown" }},
 		{"read error", true, func(f *gatewayStartupRecoveryFixture) { f.readErr = errors.New("read failed") }},
+		{"retirement unhandled", false, func(f *gatewayStartupRecoveryFixture) { f.unretired = true }},
+		{"retirement release failure", false, func(f *gatewayStartupRecoveryFixture) { f.retireErr = errors.New("release failed") }},
 		{"restore unhandled", false, func(f *gatewayStartupRecoveryFixture) { f.unhandled = true }},
 		{"restore release failure", false, func(f *gatewayStartupRecoveryFixture) { f.restoreErr = errors.New("release failed") }},
 		{"recovery release failure", true, func(f *gatewayStartupRecoveryFixture) { f.recoverErr = errors.New("release failed") }},
@@ -235,6 +265,109 @@ func TestGatewayRebindStartupRefusesUnverifiedRecovery(t *testing.T) {
 	cancel()
 	if _, err := prepareGatewayRebindRecovery(ctx, f.presence, f.callbacks()); err == nil || len(f.calls) != 0 {
 		t.Fatalf("canceled preparation performed work: %v %v", f.calls, err)
+	}
+}
+
+func TestGatewayRebindStartupRetirementPinsEveryReboundMode(t *testing.T) {
+	for _, mode := range []generatedingress.GatewayCurrentRecoveryMode{
+		generatedingress.GatewayCurrentRecoveryStable, generatedingress.GatewayCurrentRecoveryRoute,
+		generatedingress.GatewayCurrentRecoveryLAN, generatedingress.GatewayCurrentRecoveryLANBatch,
+		generatedingress.GatewayCurrentRecoveryLANBatchDone,
+	} {
+		for _, mutation := range []string{"unhandled", "release failure", "current drift", "history drift", "authority drift", "read failure", "canceled"} {
+			t.Run(string(mode)+"/"+mutation, func(t *testing.T) {
+				f := newGatewayStartupRecoveryFixture(false)
+				f.before.CurrentRecoveryMode, f.after.CurrentRecoveryMode = mode, mode
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				callbacks := f.callbacks()
+				retire := callbacks.retire
+				callbacks.retire = func(ctx context.Context) (bool, error) {
+					switch mutation {
+					case "unhandled":
+						f.unretired = true
+					case "release failure":
+						f.retireErr = errors.New("retirement lease release failed")
+					case "current drift":
+						f.after.CurrentStateRevision++
+					case "history drift":
+						f.after.Retained = []generatedingress.GatewayRebindRetainedOperationInspection{{OperationID: uuid.NewString()}}
+					case "authority drift":
+						f.after.SelectedCurrentAuthority.OperationID = uuid.NewString()
+					case "read failure":
+						f.readErr = errors.New("post-retirement inspection failed")
+					case "canceled":
+						cancel()
+					}
+					return retire(ctx)
+				}
+				got, err := prepareGatewayRebindRecovery(ctx, f.presence, callbacks)
+				want := []string{"inspect", "retire", "inspect"}
+				if mutation == "unhandled" || mutation == "release failure" || mutation == "canceled" {
+					want = []string{"inspect", "retire"}
+				}
+				if err == nil || !reflect.DeepEqual(got, generatedingress.GatewayRebindCurrentInspection{}) || !reflect.DeepEqual(f.calls, want) {
+					t.Fatalf("unsafe retirement dispatch=%v result=%+v error=%v", f.calls, got, err)
+				}
+			})
+		}
+	}
+}
+
+func TestGatewayRebindStartupVerifiesActiveResultBeforeRetirement(t *testing.T) {
+	for _, mutation := range []string{"invalid result", "unhandled retirement", "post-retirement drift"} {
+		t.Run(mutation, func(t *testing.T) {
+			f := newGatewayStartupRecoveryFixture(true)
+			callbacks := f.callbacks()
+			want := []string{"inspect", "recover", "inspect"}
+			switch mutation {
+			case "invalid result":
+				f.result.Recovered = false
+			case "unhandled retirement":
+				f.unretired = true
+				want = append(want, "retire")
+			case "post-retirement drift":
+				inspect := callbacks.inspect
+				reads := 0
+				callbacks.inspect = func(ctx context.Context) (generatedingress.GatewayRebindCurrentInspection, error) {
+					current, err := inspect(ctx)
+					reads++
+					if reads == 3 {
+						current.CurrentStateRevision++
+					}
+					return current, err
+				}
+				want = append(want, "retire", "inspect")
+			}
+			got, err := prepareGatewayRebindRecovery(context.Background(), f.presence, callbacks)
+			if err == nil || !reflect.DeepEqual(got, generatedingress.GatewayRebindCurrentInspection{}) || !reflect.DeepEqual(f.calls, want) {
+				t.Fatalf("unverified active retirement dispatch=%v result=%+v error=%v", f.calls, got, err)
+			}
+		})
+	}
+}
+
+func TestGatewayRebindStartupRetirementRequiresExactCurrentKind(t *testing.T) {
+	for _, mutation := range []string{"native mode with rebound authority", "pending mode with native authority", "missing callback"} {
+		t.Run(mutation, func(t *testing.T) {
+			f := newGatewayStartupRecoveryFixture(false)
+			callbacks := f.callbacks()
+			want := []string{"inspect"}
+			switch mutation {
+			case "native mode with rebound authority":
+				f.before.CurrentRecoveryMode = generatedingress.GatewayCurrentRecoveryNative
+			case "pending mode with native authority":
+				f.nativePredecessor()
+				f.before.CurrentRecoveryMode = generatedingress.GatewayCurrentRecoveryRoute
+			case "missing callback":
+				callbacks.retire = nil
+				want = nil
+			}
+			got, err := prepareGatewayRebindRecovery(context.Background(), f.presence, callbacks)
+			if err == nil || !reflect.DeepEqual(got, generatedingress.GatewayRebindCurrentInspection{}) || !reflect.DeepEqual(f.calls, want) {
+				t.Fatalf("inconsistent authority dispatch=%v result=%+v error=%v", f.calls, got, err)
+			}
+		})
 	}
 }
 
