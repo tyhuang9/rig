@@ -141,6 +141,39 @@ type liveGatewayRebindRuntimeRollbackDriver struct {
 	refused          bool
 	lastSequence     uint64
 	lastPhase        gatewayRebindProgressPhase
+	firstFailure     bool
+	firstMethod      liveGatewayRebindRuntimeCoordinatorMethod
+	reconcileOK      bool
+	forwardOK        bool
+	attestationOK    bool
+}
+
+type liveGatewayRebindRuntimeCoordinatorMethod string
+
+const (
+	liveGatewayRebindRuntimeCoordinatorMethodUnknown          liveGatewayRebindRuntimeCoordinatorMethod = "unknown"
+	liveGatewayRebindRuntimeCoordinatorMethodReconcileSuccess liveGatewayRebindRuntimeCoordinatorMethod = "reconcile_successor"
+	liveGatewayRebindRuntimeCoordinatorMethodConfirmForward   liveGatewayRebindRuntimeCoordinatorMethod = "confirm_forward"
+	liveGatewayRebindRuntimeCoordinatorMethodAttestCurrent    liveGatewayRebindRuntimeCoordinatorMethod = "current_attestation"
+)
+
+func (method liveGatewayRebindRuntimeCoordinatorMethod) clamped() liveGatewayRebindRuntimeCoordinatorMethod {
+	switch method {
+	case liveGatewayRebindRuntimeCoordinatorMethodReconcileSuccess,
+		liveGatewayRebindRuntimeCoordinatorMethodConfirmForward,
+		liveGatewayRebindRuntimeCoordinatorMethodAttestCurrent:
+		return method
+	default:
+		return liveGatewayRebindRuntimeCoordinatorMethodUnknown
+	}
+}
+
+type liveGatewayRebindRuntimeCoordinatorDiagnosticSnapshot struct {
+	FirstFailure  bool
+	FirstMethod   liveGatewayRebindRuntimeCoordinatorMethod
+	ReconcileOK   bool
+	ForwardOK     bool
+	AttestationOK bool
 }
 
 func (d *liveGatewayRebindRuntimeRollbackDriver) requireSequence17Refusal() {
@@ -153,6 +186,35 @@ func (d *liveGatewayRebindRuntimeRollbackDriver) diagnosticSnapshot() (bool, uin
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.refused, d.lastSequence, d.lastPhase
+}
+
+func (d *liveGatewayRebindRuntimeRollbackDriver) coordinatorDiagnosticSnapshot() liveGatewayRebindRuntimeCoordinatorDiagnosticSnapshot {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return liveGatewayRebindRuntimeCoordinatorDiagnosticSnapshot{FirstFailure: d.firstFailure,
+		FirstMethod: d.firstMethod.clamped(), ReconcileOK: d.reconcileOK, ForwardOK: d.forwardOK, AttestationOK: d.attestationOK}
+}
+
+func (d *liveGatewayRebindRuntimeRollbackDriver) recordCoordinatorOutcome(
+	method liveGatewayRebindRuntimeCoordinatorMethod, err error,
+) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	method = method.clamped()
+	if err != nil {
+		if !d.firstFailure {
+			d.firstFailure, d.firstMethod = true, method
+		}
+		return
+	}
+	switch method {
+	case liveGatewayRebindRuntimeCoordinatorMethodReconcileSuccess:
+		d.reconcileOK = true
+	case liveGatewayRebindRuntimeCoordinatorMethodConfirmForward:
+		d.forwardOK = true
+	case liveGatewayRebindRuntimeCoordinatorMethodAttestCurrent:
+		d.attestationOK = true
+	}
 }
 
 type liveGatewayRebindRuntimeDiagnosticRunner struct {
@@ -432,37 +494,47 @@ func (d *liveGatewayRebindRuntimeTypedStageDiagnosticDriver) diagnosticSnapshot(
 }
 
 type liveGatewayRebindRuntimeFailureDiagnostic struct {
-	LastSequence         uint64
-	LastPhase            gatewayRebindProgressPhase
-	FirstFailed          bool
-	FirstMethod          liveGatewayRebindRuntimeTypedStageMethod
-	Operation            string
-	Checkpoint           string
-	LastSuccessfulMethod liveGatewayRebindRuntimeTypedStageMethod
-	CopyStageConfigOK    bool
-	ServeStageSucceeded  bool
-	CopyFinalConfigOK    bool
-	OuterRefusal         string
-	LatestCommand        string
-	CommandOutcome       string
-	CommandContext       string
-	StdoutTruncated      bool
-	StderrTruncated      bool
+	LastSequence            uint64
+	LastPhase               gatewayRebindProgressPhase
+	FirstFailed             bool
+	FirstMethod             liveGatewayRebindRuntimeTypedStageMethod
+	Operation               string
+	Checkpoint              string
+	LastSuccessfulMethod    liveGatewayRebindRuntimeTypedStageMethod
+	CopyStageConfigOK       bool
+	ServeStageSucceeded     bool
+	CopyFinalConfigOK       bool
+	OuterRefusal            string
+	LatestCommand           string
+	CommandOutcome          string
+	CommandContext          string
+	StdoutTruncated         bool
+	StderrTruncated         bool
+	FirstCoordinatorFailure bool
+	FirstCoordinatorMethod  liveGatewayRebindRuntimeCoordinatorMethod
+	ReconcileSucceeded      bool
+	ForwardConfirmed        bool
+	CurrentAttested         bool
 }
 
 func (f liveGatewayRebindRuntimeFixture) failureDiagnostic(err error) liveGatewayRebindRuntimeFailureDiagnostic {
 	value := liveGatewayRebindRuntimeFailureDiagnostic{
-		FirstMethod:          liveGatewayRebindRuntimeTypedStageMethodUnknown,
-		Operation:            gatewayRebindTypedStageDiagnosticOperationUnknown.String(),
-		Checkpoint:           gatewayRebindTypedStageDiagnosticCheckpointUnknown.String(),
-		LastSuccessfulMethod: liveGatewayRebindRuntimeTypedStageMethodUnknown,
-		OuterRefusal:         "none",
-		LatestCommand:        "unknown",
-		CommandOutcome:       "unknown",
-		CommandContext:       "unknown",
+		FirstMethod:            liveGatewayRebindRuntimeTypedStageMethodUnknown,
+		Operation:              gatewayRebindTypedStageDiagnosticOperationUnknown.String(),
+		Checkpoint:             gatewayRebindTypedStageDiagnosticCheckpointUnknown.String(),
+		LastSuccessfulMethod:   liveGatewayRebindRuntimeTypedStageMethodUnknown,
+		OuterRefusal:           "none",
+		LatestCommand:          "unknown",
+		CommandOutcome:         "unknown",
+		CommandContext:         "unknown",
+		FirstCoordinatorMethod: liveGatewayRebindRuntimeCoordinatorMethodUnknown,
 	}
 	if f.diagnosticDriver != nil {
 		_, value.LastSequence, value.LastPhase = f.diagnosticDriver.diagnosticSnapshot()
+		coordinator := f.diagnosticDriver.coordinatorDiagnosticSnapshot()
+		value.FirstCoordinatorFailure, value.FirstCoordinatorMethod = coordinator.FirstFailure, coordinator.FirstMethod
+		value.ReconcileSucceeded, value.ForwardConfirmed, value.CurrentAttested = coordinator.ReconcileOK,
+			coordinator.ForwardOK, coordinator.AttestationOK
 	}
 	if f.diagnosticStage != nil {
 		stage := f.diagnosticStage.diagnosticSnapshot(err)
@@ -483,11 +555,21 @@ func (f liveGatewayRebindRuntimeFixture) failureDiagnostic(err error) liveGatewa
 
 func liveGatewayRebindRuntimeLogFailure(t *testing.T, fixture liveGatewayRebindRuntimeFixture, err error) {
 	t.Helper()
-	value := fixture.failureDiagnostic(err)
-	t.Logf("typed runtime refusal: last_validated_sequence=%d last_validated_phase=%q first_stage_failure=%t first_stage_method=%q stage_operation=%q stage_checkpoint=%q last_successful_stage_method=%q copy_stage_config_succeeded=%t serve_stage_succeeded=%t copy_final_config_succeeded=%t outer_refusal=%q latest_command=%q command_outcome=%q command_context=%q stdout_truncated=%t stderr_truncated=%t",
+	state := fixture.failureStateDiagnostic(fixture.failureDiagnosticContext(), err)
+	value := state.Failure
+	t.Logf("typed runtime refusal: last_validated_sequence=%d last_validated_phase=%q first_stage_failure=%t first_stage_method=%q stage_operation=%q stage_checkpoint=%q last_successful_stage_method=%q copy_stage_config_succeeded=%t serve_stage_succeeded=%t copy_final_config_succeeded=%t outer_refusal=%q latest_command=%q command_outcome=%q command_context=%q stdout_truncated=%t stderr_truncated=%t first_coordinator_failure=%t first_coordinator_method=%q reconcile_succeeded=%t forward_confirmed=%t current_attested=%t sql_phase=%q terminal_receipt=%q current_artifact=%q selected_authority=%q",
 		value.LastSequence, value.LastPhase, value.FirstFailed, value.FirstMethod, value.Operation, value.Checkpoint,
 		value.LastSuccessfulMethod, value.CopyStageConfigOK, value.ServeStageSucceeded, value.CopyFinalConfigOK, value.OuterRefusal, value.LatestCommand,
-		value.CommandOutcome, value.CommandContext, value.StdoutTruncated, value.StderrTruncated)
+		value.CommandOutcome, value.CommandContext, value.StdoutTruncated, value.StderrTruncated,
+		value.FirstCoordinatorFailure, value.FirstCoordinatorMethod, value.ReconcileSucceeded, value.ForwardConfirmed, value.CurrentAttested,
+		state.SQLPhase, state.TerminalReceipt, state.CurrentArtifact, state.Authority)
+}
+
+func (f liveGatewayRebindRuntimeFixture) failureDiagnosticContext() context.Context {
+	if f.fixture == nil {
+		return nil
+	}
+	return f.fixture.ctx
 }
 
 type liveGatewayRebindRuntimeReplayRunner struct {
@@ -604,7 +686,7 @@ func TestGatewayRebindRuntimeReplayCommandAudit(t *testing.T) {
 func (d *liveGatewayRebindRuntimeRollbackDriver) reconcileSuccessorLocked(ctx context.Context,
 	request gatewayRebindPhysicalReconcileRequest, appendProgress gatewayRebindTypedProgressAppender,
 ) (gatewayRebindTypedPhysicalResult, error) {
-	return d.managerGatewayRebindCrossStoreDriver.reconcileSuccessorLocked(ctx, request,
+	result, err := d.managerGatewayRebindCrossStoreDriver.reconcileSuccessorLocked(ctx, request,
 		func(appendCtx context.Context, record gatewayRebindProgressRecord) error {
 			d.mu.Lock()
 			refuse := d.refuseSequence17 && record.Sequence == 17 && record.Phase == gatewayRebindProgressHandoverCommitted && !d.refused
@@ -617,6 +699,24 @@ func (d *liveGatewayRebindRuntimeRollbackDriver) reconcileSuccessorLocked(ctx co
 			}
 			return d.appendValidatedProgress(appendCtx, record, appendProgress)
 		})
+	d.recordCoordinatorOutcome(liveGatewayRebindRuntimeCoordinatorMethodReconcileSuccess, err)
+	return result, err
+}
+
+func (d *liveGatewayRebindRuntimeRollbackDriver) confirmForwardServingLocked(ctx context.Context,
+	request gatewayRebindPhysicalReconcileRequest,
+) error {
+	err := d.managerGatewayRebindCrossStoreDriver.confirmForwardServingLocked(ctx, request)
+	d.recordCoordinatorOutcome(liveGatewayRebindRuntimeCoordinatorMethodConfirmForward, err)
+	return err
+}
+
+func (d *liveGatewayRebindRuntimeRollbackDriver) attestCommittedCurrentLocked(ctx context.Context,
+	selection gatewayCurrentSelection,
+) (string, error) {
+	attestation, err := d.managerGatewayRebindCrossStoreDriver.attestCommittedCurrentLocked(ctx, selection)
+	d.recordCoordinatorOutcome(liveGatewayRebindRuntimeCoordinatorMethodAttestCurrent, err)
+	return attestation, err
 }
 
 func (d *liveGatewayRebindRuntimeRollbackDriver) appendValidatedProgress(ctx context.Context,
