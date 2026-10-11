@@ -38,6 +38,27 @@ type gatewayRebindTypedStageObservation struct {
 	OwnedNetworks        []string
 }
 
+func canonicalGatewayRebindTypedMounts(values []mountInspection) []mountInspection {
+	result := append([]mountInspection(nil), values...)
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	})
+	return result
+}
+
+func canonicalGatewayRebindTypedStageObservation(intent gatewayRebindProtectedIntentV2,
+	value gatewayRebindTypedStageObservation,
+) (gatewayRebindTypedStageObservation, bool) {
+	if !value.StageContainerFound {
+		return value, true
+	}
+	if !validGatewayRebindStageContainerMounts(value.StageContainer.Mounts, intent.Identity) {
+		return gatewayRebindTypedStageObservation{}, false
+	}
+	value.StageContainer.Mounts = canonicalGatewayRebindTypedMounts(value.StageContainer.Mounts)
+	return value, true
+}
+
 func (d gatewayRebindTypedStageRuntime) read(ctx context.Context,
 	intent gatewayRebindProtectedIntentV2,
 ) (gatewayRebindTypedStageObservation, error) {

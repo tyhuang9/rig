@@ -80,7 +80,9 @@ func (d gatewayRebindTypedStageRuntime) stable(ctx context.Context,
 		return gatewayRebindTypedStageObservation{}, newGatewayRebindTypedStageDiagnosticError(ctx,
 			gatewayRebindTypedStageDiagnosticOperationStable, gatewayRebindTypedStageDiagnosticCheckpointSecondTopology)
 	}
-	if !reflect.DeepEqual(first, second) {
+	canonicalFirst, firstOK := canonicalGatewayRebindTypedStageObservation(intent, first)
+	canonicalSecond, secondOK := canonicalGatewayRebindTypedStageObservation(intent, second)
+	if !firstOK || !secondOK || !reflect.DeepEqual(canonicalFirst, canonicalSecond) {
 		return gatewayRebindTypedStageObservation{}, newGatewayRebindTypedStageDiagnosticError(ctx,
 			gatewayRebindTypedStageDiagnosticOperationStable, gatewayRebindTypedStageDiagnosticCheckpointStableEquality)
 	}

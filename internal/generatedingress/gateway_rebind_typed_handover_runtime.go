@@ -67,6 +67,44 @@ type gatewayRebindTypedHandoverPhysical struct {
 	ApplicationNetworks map[string]caddyNetworkInspection
 }
 
+func canonicalGatewayRebindTypedHandoverPhysical(intent gatewayRebindProtectedIntentV2,
+	value gatewayRebindTypedHandoverPhysical,
+) (gatewayRebindTypedHandoverPhysical, bool) {
+	stage, ok := canonicalGatewayRebindTypedStageObservation(intent, value.Stage)
+	if !ok {
+		return gatewayRebindTypedHandoverPhysical{}, false
+	}
+	value.Stage = stage
+	if value.FinalFound {
+		if !validGatewayRebindStageContainerMounts(value.Final.Mounts, intent.Identity) {
+			return gatewayRebindTypedHandoverPhysical{}, false
+		}
+		value.Final.Mounts = canonicalGatewayRebindTypedMounts(value.Final.Mounts)
+	}
+	if value.Predecessor.PhysicalUpgrade != nil {
+		selection := value.Predecessor.Selection
+		if selection.Kind != gatewayCurrentSelectionUpgrade || selection.Upgrade == nil ||
+			selection.UpgradeSource == nil || !value.Predecessor.PhysicalUpgrade.FinalContainerFound ||
+			!validGatewayV2Mounts(value.Predecessor.PhysicalUpgrade.FinalContainer.Mounts,
+				selection.Upgrade.State.Identity) {
+			return gatewayRebindTypedHandoverPhysical{}, false
+		}
+		physicalUpgrade := *value.Predecessor.PhysicalUpgrade
+		physicalUpgrade.FinalContainer.Mounts =
+			canonicalGatewayRebindTypedMounts(physicalUpgrade.FinalContainer.Mounts)
+		value.Predecessor.PhysicalUpgrade = &physicalUpgrade
+	}
+	return value, true
+}
+
+func sameGatewayRebindTypedHandoverPhysical(intent gatewayRebindProtectedIntentV2,
+	first, second gatewayRebindTypedHandoverPhysical,
+) bool {
+	canonicalFirst, firstOK := canonicalGatewayRebindTypedHandoverPhysical(intent, first)
+	canonicalSecond, secondOK := canonicalGatewayRebindTypedHandoverPhysical(intent, second)
+	return firstOK && secondOK && reflect.DeepEqual(canonicalFirst, canonicalSecond)
+}
+
 func newGatewayRebindTypedHandoverRuntime(manager *Manager) gatewayRebindTypedHandoverRuntime {
 	inventory := managerGatewayV2DockerInventory{manager: manager}
 	reads := gatewayRebindSuccessorPreflightReads{network: gatewayV2ProductionNetworkPlanReads(manager),
@@ -805,7 +843,8 @@ func (d gatewayRebindTypedHandoverRuntime) stableResources(ctx context.Context,
 		return gatewayRebindTypedHandoverPhysical{}, err
 	}
 	second, err := d.readResources(ctx, attempt, effect, stageExpected, finalExpected)
-	if err != nil || !reflect.DeepEqual(first, second) || ctx.Err() != nil || guard(ctx) != nil {
+	if err != nil || !sameGatewayRebindTypedHandoverPhysical(attempt.Intent, first, second) ||
+		ctx.Err() != nil || guard(ctx) != nil {
 		return gatewayRebindTypedHandoverPhysical{}, gatewayRebindEffectBoundaryError(ctx)
 	}
 	return second, nil
@@ -925,7 +964,8 @@ func (d gatewayRebindTypedHandoverRuntime) stable(ctx context.Context,
 		return gatewayRebindFinalHandoverObservation{}, gatewayRebindTypedHandoverPhysical{}, err
 	}
 	secondProof, secondPhysical, err := d.read(ctx, attempt, effect)
-	if err != nil || !reflect.DeepEqual(firstProof, secondProof) || !reflect.DeepEqual(firstPhysical, secondPhysical) ||
+	if err != nil || !reflect.DeepEqual(firstProof, secondProof) ||
+		!sameGatewayRebindTypedHandoverPhysical(attempt.Intent, firstPhysical, secondPhysical) ||
 		ctx.Err() != nil {
 		return gatewayRebindFinalHandoverObservation{}, gatewayRebindTypedHandoverPhysical{},
 			gatewayRebindEffectBoundaryError(ctx)
@@ -935,7 +975,8 @@ func (d gatewayRebindTypedHandoverRuntime) stable(ctx context.Context,
 	// containers, volumes, networks and predecessor before any caller acts.
 	finalExpected := effect.FinalContainer != nil
 	finalPhysical, err := d.readResources(ctx, attempt, effect, !finalExpected, finalExpected)
-	if err != nil || !reflect.DeepEqual(secondPhysical, finalPhysical) || guard(ctx) != nil {
+	if err != nil || !sameGatewayRebindTypedHandoverPhysical(attempt.Intent, secondPhysical, finalPhysical) ||
+		guard(ctx) != nil {
 		return gatewayRebindFinalHandoverObservation{}, gatewayRebindTypedHandoverPhysical{},
 			gatewayRebindEffectBoundaryError(ctx)
 	}
@@ -1281,8 +1322,10 @@ func (d gatewayRebindTypedHandoverRuntime) stableRollbackPrefix(ctx context.Cont
 	if err != nil || !d.stage.networkTopologyMatches(ctx, attempt.Intent, first) || !matches(first) {
 		return gatewayRebindTypedStageObservation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
+	canonicalFirst, firstOK := canonicalGatewayRebindTypedStageObservation(attempt.Intent, first)
 	second, err := d.stage.read(ctx, attempt.Intent)
-	if err != nil || !reflect.DeepEqual(first, second) ||
+	canonicalSecond, secondOK := canonicalGatewayRebindTypedStageObservation(attempt.Intent, second)
+	if err != nil || !firstOK || !secondOK || !reflect.DeepEqual(canonicalFirst, canonicalSecond) ||
 		!d.stage.networkTopologyMatches(ctx, attempt.Intent, second) ||
 		!matches(second) ||
 		ctx.Err() != nil || guard(ctx) != nil {
