@@ -406,7 +406,7 @@ request.once('error',error=>{if(receivedStatus){received(false);}else{finish({ou
 timer=setTimeout(()=>{if(receivedStatus){received(false);}request.destroy(Object.assign(new Error('timeout'),{code:'ETIMEDOUT'}));},1500);
 request.end();`
 
-const liveApplicationHTTPSProbeCommand = `const https=require('node:https');const [host,port,_expected,ca]=process.argv.slice(-4);let done=false,timer;const finish=value=>{if(done)return;done=true;clearTimeout(timer);process.stdout.write(JSON.stringify(value)+'\n',()=>process.exit(0));};const request=https.request({host,port:Number(port),servername:'live-external.rig.test',ca:Buffer.from(ca,'base64'),rejectUnauthorized:true,path:'/',method:'GET',agent:false,headers:{connection:'close'}},response=>{response.resume();response.once('end',()=>finish({outcome:'response',status:response.statusCode}));});timer=setTimeout(()=>request.destroy(Object.assign(new Error('timeout'),{code:'ETIMEDOUT'})),1500);request.once('error',error=>finish({outcome:'error',code:typeof error.code==='string'?error.code:'unknown'}));request.end();`
+const liveApplicationHTTPSProbeCommand = `const diagnostic=process.argv.slice(0,-4).includes('rig-live-node-tls-diagnostic');const diagnosticWrite=diagnostic?value=>process.stderr.write('rig-live-node-tls-diagnostic 1 '+value+'\n'):()=>{};if(diagnostic){const version=Number(process.versions.node.split('.')[0]);if(Number.isSafeInteger(version)&&version>0)diagnosticWrite('startup '+version);}const https=require('node:https');const [host,port,_expected,ca]=process.argv.slice(-4);let done=false,timer;const finish=value=>{if(done)return;done=true;clearTimeout(timer);process.stdout.write(JSON.stringify(value)+'\n',()=>{diagnosticWrite('stdout-callback');process.exit(0);});};const request=https.request({host,port:Number(port),servername:'live-external.rig.test',ca:Buffer.from(ca,'base64'),rejectUnauthorized:true,path:'/',method:'GET',agent:false,headers:{connection:'close'}},response=>{diagnosticWrite('response');response.resume();response.once('end',()=>{diagnosticWrite('response-end');finish({outcome:'response',status:response.statusCode});});});diagnosticWrite('request-created');timer=setTimeout(()=>{diagnosticWrite('timer');request.destroy(Object.assign(new Error('timeout'),{code:'ETIMEDOUT'}));},1500);request.once('error',error=>{diagnosticWrite('request-error');finish({outcome:'error',code:typeof error.code==='string'?error.code:'unknown'});});diagnosticWrite('request-sent');request.end();`
 
 type liveApplicationInspection struct {
 	ID           string                         `json:"id"`
@@ -921,13 +921,19 @@ func TestLiveExternalTLSNodeTrust(t *testing.T) {
 	defer fixture.Close(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, node, "-e", liveApplicationHTTPSProbeCommand, "127.0.0.1", fmt.Sprintf("%d", fixture.port), "", fixture.ca).Output()
+	stderr := newLiveNodeTLSDiagnosticStderrBuffer(liveNodeTLSDiagnosticLimit)
+	command := exec.CommandContext(ctx, node, "-e", liveApplicationHTTPSProbeCommand, liveNodeTLSDiagnosticFlag, "127.0.0.1", fmt.Sprintf("%d", fixture.port), "", fixture.ca)
+	command.Stderr = stderr
+	output, err := command.Output()
+	process := liveNodeTLSDiagnosticProcessOutcome(err)
+	parentContext := liveNodeTLSDiagnosticParentContext(ctx)
+	nodeDiagnostic := liveNodeTLSDiagnosticEvidence(stderr.Bytes(), stderr.Truncated())
 	if err != nil || ctx.Err() != nil {
-		t.Fatal("host-side Node TLS probe did not complete")
+		t.Fatalf("host-side Node TLS probe did not complete (process=%s,parent_context=%s,node_context=%s,node_major=%s)", process, parentContext, nodeDiagnostic.context, nodeDiagnostic.nodeMajor)
 	}
 	result, valid := decodeLiveApplicationProbeResult(output)
 	if !valid || liveApplicationProbeClassification(result) != liveApplicationProbeReachable || result.Status != http.StatusNoContent {
-		t.Fatal("host-side Node TLS probe did not trust the fixture CA and peer name")
+		t.Fatalf("host-side Node TLS probe did not trust the fixture CA and peer name (process=%s,parent_context=%s,node_context=%s,node_major=%s)", process, parentContext, nodeDiagnostic.context, nodeDiagnostic.nodeMajor)
 	}
 }
 
