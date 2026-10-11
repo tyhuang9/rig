@@ -33,11 +33,12 @@ const (
 	DiagnosticCancelled              DiagnosticCode = "cancelled"
 )
 
-// Error carries only an audit-safe diagnostic code and route safety outcome.
-// Docker and Caddy output is deliberately discarded inside the package.
+// Error carries only an audit-safe diagnostic code, route safety outcome, and
+// private finite checkpoint. Docker and Caddy output is deliberately discarded.
 type Error struct {
-	Code               DiagnosticCode
-	candidateMayBeLive bool
+	Code                         DiagnosticCode
+	candidateMayBeLive           bool
+	currentAttestationCheckpoint gatewayCurrentAttestationCheckpoint
 }
 
 func (e *Error) Error() string { return "generated ingress: " + string(e.Code) }

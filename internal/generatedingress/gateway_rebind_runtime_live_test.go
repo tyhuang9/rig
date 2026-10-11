@@ -136,16 +136,18 @@ func newLiveGatewayRebindRuntimeFixture(t *testing.T) liveGatewayRebindRuntimeFi
 
 type liveGatewayRebindRuntimeRollbackDriver struct {
 	managerGatewayRebindCrossStoreDriver
-	mu               sync.Mutex
-	refuseSequence17 bool
-	refused          bool
-	lastSequence     uint64
-	lastPhase        gatewayRebindProgressPhase
-	firstFailure     bool
-	firstMethod      liveGatewayRebindRuntimeCoordinatorMethod
-	reconcileOK      bool
-	forwardOK        bool
-	attestationOK    bool
+	mu                         sync.Mutex
+	refuseSequence17           bool
+	refused                    bool
+	lastSequence               uint64
+	lastPhase                  gatewayRebindProgressPhase
+	firstFailure               bool
+	firstMethod                liveGatewayRebindRuntimeCoordinatorMethod
+	reconcileOK                bool
+	forwardOK                  bool
+	attestationOK              bool
+	firstAttestationFailure    bool
+	firstAttestationCheckpoint gatewayCurrentAttestationCheckpoint
 }
 
 type liveGatewayRebindRuntimeCoordinatorMethod string
@@ -169,11 +171,13 @@ func (method liveGatewayRebindRuntimeCoordinatorMethod) clamped() liveGatewayReb
 }
 
 type liveGatewayRebindRuntimeCoordinatorDiagnosticSnapshot struct {
-	FirstFailure  bool
-	FirstMethod   liveGatewayRebindRuntimeCoordinatorMethod
-	ReconcileOK   bool
-	ForwardOK     bool
-	AttestationOK bool
+	FirstFailure               bool
+	FirstMethod                liveGatewayRebindRuntimeCoordinatorMethod
+	ReconcileOK                bool
+	ForwardOK                  bool
+	AttestationOK              bool
+	FirstAttestationFailure    bool
+	FirstAttestationCheckpoint gatewayCurrentAttestationCheckpoint
 }
 
 func (d *liveGatewayRebindRuntimeRollbackDriver) requireSequence17Refusal() {
@@ -191,8 +195,34 @@ func (d *liveGatewayRebindRuntimeRollbackDriver) diagnosticSnapshot() (bool, uin
 func (d *liveGatewayRebindRuntimeRollbackDriver) coordinatorDiagnosticSnapshot() liveGatewayRebindRuntimeCoordinatorDiagnosticSnapshot {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	checkpoint := d.firstAttestationCheckpoint
+	if !checkpoint.valid() {
+		checkpoint = gatewayCurrentAttestationCheckpointUnknown
+	}
 	return liveGatewayRebindRuntimeCoordinatorDiagnosticSnapshot{FirstFailure: d.firstFailure,
-		FirstMethod: d.firstMethod.clamped(), ReconcileOK: d.reconcileOK, ForwardOK: d.forwardOK, AttestationOK: d.attestationOK}
+		FirstMethod: d.firstMethod.clamped(), ReconcileOK: d.reconcileOK, ForwardOK: d.forwardOK, AttestationOK: d.attestationOK,
+		FirstAttestationFailure: d.firstAttestationFailure, FirstAttestationCheckpoint: checkpoint}
+}
+
+func TestLiveGatewayRebindRuntimeCoordinatorRetainsFirstCurrentAttestationCheckpoint(t *testing.T) {
+	var driver liveGatewayRebindRuntimeRollbackDriver
+	driver.recordCoordinatorOutcome(liveGatewayRebindRuntimeCoordinatorMethodAttestCurrent,
+		newGatewayCurrentAttestationError(context.Background(), gatewayCurrentAttestationCheckpointUnknown))
+	driver.recordCoordinatorOutcome(liveGatewayRebindRuntimeCoordinatorMethodAttestCurrent,
+		newGatewayCurrentAttestationError(context.Background(), gatewayCurrentAttestationCheckpointManagerDriver))
+	driver.recordCoordinatorOutcome(liveGatewayRebindRuntimeCoordinatorMethodConfirmForward,
+		errors.New("later coordinator failure"))
+	snapshot := driver.coordinatorDiagnosticSnapshot()
+	if !snapshot.FirstFailure ||
+		snapshot.FirstMethod != liveGatewayRebindRuntimeCoordinatorMethodAttestCurrent ||
+		!snapshot.FirstAttestationFailure ||
+		snapshot.FirstAttestationCheckpoint != gatewayCurrentAttestationCheckpointUnknown ||
+		snapshot.AttestationOK ||
+		snapshot.ForwardOK {
+		t.Fatalf("current attestation first failure changed: first=%t method=%q captured=%t checkpoint=%q attest=%t forward=%t",
+			snapshot.FirstFailure, snapshot.FirstMethod, snapshot.FirstAttestationFailure,
+			snapshot.FirstAttestationCheckpoint.String(), snapshot.AttestationOK, snapshot.ForwardOK)
+	}
 }
 
 func (d *liveGatewayRebindRuntimeRollbackDriver) recordCoordinatorOutcome(
@@ -202,6 +232,10 @@ func (d *liveGatewayRebindRuntimeRollbackDriver) recordCoordinatorOutcome(
 	defer d.mu.Unlock()
 	method = method.clamped()
 	if err != nil {
+		if method == liveGatewayRebindRuntimeCoordinatorMethodAttestCurrent && !d.firstAttestationFailure {
+			d.firstAttestationFailure = true
+			d.firstAttestationCheckpoint = gatewayCurrentAttestationCheckpointFromError(err)
+		}
 		if !d.firstFailure {
 			d.firstFailure, d.firstMethod = true, method
 		}
@@ -494,40 +528,43 @@ func (d *liveGatewayRebindRuntimeTypedStageDiagnosticDriver) diagnosticSnapshot(
 }
 
 type liveGatewayRebindRuntimeFailureDiagnostic struct {
-	LastSequence            uint64
-	LastPhase               gatewayRebindProgressPhase
-	FirstFailed             bool
-	FirstMethod             liveGatewayRebindRuntimeTypedStageMethod
-	Operation               string
-	Checkpoint              string
-	LastSuccessfulMethod    liveGatewayRebindRuntimeTypedStageMethod
-	CopyStageConfigOK       bool
-	ServeStageSucceeded     bool
-	CopyFinalConfigOK       bool
-	OuterRefusal            string
-	LatestCommand           string
-	CommandOutcome          string
-	CommandContext          string
-	StdoutTruncated         bool
-	StderrTruncated         bool
-	FirstCoordinatorFailure bool
-	FirstCoordinatorMethod  liveGatewayRebindRuntimeCoordinatorMethod
-	ReconcileSucceeded      bool
-	ForwardConfirmed        bool
-	CurrentAttested         bool
+	LastSequence               uint64
+	LastPhase                  gatewayRebindProgressPhase
+	FirstFailed                bool
+	FirstMethod                liveGatewayRebindRuntimeTypedStageMethod
+	Operation                  string
+	Checkpoint                 string
+	LastSuccessfulMethod       liveGatewayRebindRuntimeTypedStageMethod
+	CopyStageConfigOK          bool
+	ServeStageSucceeded        bool
+	CopyFinalConfigOK          bool
+	OuterRefusal               string
+	LatestCommand              string
+	CommandOutcome             string
+	CommandContext             string
+	StdoutTruncated            bool
+	StderrTruncated            bool
+	FirstCoordinatorFailure    bool
+	FirstCoordinatorMethod     liveGatewayRebindRuntimeCoordinatorMethod
+	ReconcileSucceeded         bool
+	ForwardConfirmed           bool
+	CurrentAttested            bool
+	FirstAttestationFailure    bool
+	FirstAttestationCheckpoint string
 }
 
 func (f liveGatewayRebindRuntimeFixture) failureDiagnostic(err error) liveGatewayRebindRuntimeFailureDiagnostic {
 	value := liveGatewayRebindRuntimeFailureDiagnostic{
-		FirstMethod:            liveGatewayRebindRuntimeTypedStageMethodUnknown,
-		Operation:              gatewayRebindTypedStageDiagnosticOperationUnknown.String(),
-		Checkpoint:             gatewayRebindTypedStageDiagnosticCheckpointUnknown.String(),
-		LastSuccessfulMethod:   liveGatewayRebindRuntimeTypedStageMethodUnknown,
-		OuterRefusal:           "none",
-		LatestCommand:          "unknown",
-		CommandOutcome:         "unknown",
-		CommandContext:         "unknown",
-		FirstCoordinatorMethod: liveGatewayRebindRuntimeCoordinatorMethodUnknown,
+		FirstMethod:                liveGatewayRebindRuntimeTypedStageMethodUnknown,
+		Operation:                  gatewayRebindTypedStageDiagnosticOperationUnknown.String(),
+		Checkpoint:                 gatewayRebindTypedStageDiagnosticCheckpointUnknown.String(),
+		LastSuccessfulMethod:       liveGatewayRebindRuntimeTypedStageMethodUnknown,
+		OuterRefusal:               "none",
+		LatestCommand:              "unknown",
+		CommandOutcome:             "unknown",
+		CommandContext:             "unknown",
+		FirstCoordinatorMethod:     liveGatewayRebindRuntimeCoordinatorMethodUnknown,
+		FirstAttestationCheckpoint: gatewayCurrentAttestationCheckpointUnknown.String(),
 	}
 	if f.diagnosticDriver != nil {
 		_, value.LastSequence, value.LastPhase = f.diagnosticDriver.diagnosticSnapshot()
@@ -535,6 +572,8 @@ func (f liveGatewayRebindRuntimeFixture) failureDiagnostic(err error) liveGatewa
 		value.FirstCoordinatorFailure, value.FirstCoordinatorMethod = coordinator.FirstFailure, coordinator.FirstMethod
 		value.ReconcileSucceeded, value.ForwardConfirmed, value.CurrentAttested = coordinator.ReconcileOK,
 			coordinator.ForwardOK, coordinator.AttestationOK
+		value.FirstAttestationFailure = coordinator.FirstAttestationFailure
+		value.FirstAttestationCheckpoint = coordinator.FirstAttestationCheckpoint.String()
 	}
 	if f.diagnosticStage != nil {
 		stage := f.diagnosticStage.diagnosticSnapshot(err)
@@ -557,12 +596,12 @@ func liveGatewayRebindRuntimeLogFailure(t *testing.T, fixture liveGatewayRebindR
 	t.Helper()
 	state := fixture.failureStateDiagnostic(fixture.failureDiagnosticContext(), err)
 	value := state.Failure
-	t.Logf("typed runtime refusal: last_validated_sequence=%d last_validated_phase=%q first_stage_failure=%t first_stage_method=%q stage_operation=%q stage_checkpoint=%q last_successful_stage_method=%q copy_stage_config_succeeded=%t serve_stage_succeeded=%t copy_final_config_succeeded=%t outer_refusal=%q latest_command=%q command_outcome=%q command_context=%q stdout_truncated=%t stderr_truncated=%t first_coordinator_failure=%t first_coordinator_method=%q reconcile_succeeded=%t forward_confirmed=%t current_attested=%t sql_phase=%q terminal_receipt=%q current_artifact=%q selected_authority=%q",
+	t.Logf("typed runtime refusal: last_validated_sequence=%d last_validated_phase=%q first_stage_failure=%t first_stage_method=%q stage_operation=%q stage_checkpoint=%q last_successful_stage_method=%q copy_stage_config_succeeded=%t serve_stage_succeeded=%t copy_final_config_succeeded=%t outer_refusal=%q latest_command=%q command_outcome=%q command_context=%q stdout_truncated=%t stderr_truncated=%t first_coordinator_failure=%t first_coordinator_method=%q reconcile_succeeded=%t forward_confirmed=%t current_attested=%t first_attestation_failure=%t current_attestation_checkpoint=%q sql_phase=%q terminal_receipt=%q current_artifact=%q selected_authority=%q",
 		value.LastSequence, value.LastPhase, value.FirstFailed, value.FirstMethod, value.Operation, value.Checkpoint,
 		value.LastSuccessfulMethod, value.CopyStageConfigOK, value.ServeStageSucceeded, value.CopyFinalConfigOK, value.OuterRefusal, value.LatestCommand,
 		value.CommandOutcome, value.CommandContext, value.StdoutTruncated, value.StderrTruncated,
 		value.FirstCoordinatorFailure, value.FirstCoordinatorMethod, value.ReconcileSucceeded, value.ForwardConfirmed, value.CurrentAttested,
-		state.SQLPhase, state.TerminalReceipt, state.CurrentArtifact, state.Authority)
+		value.FirstAttestationFailure, value.FirstAttestationCheckpoint, state.SQLPhase, state.TerminalReceipt, state.CurrentArtifact, state.Authority)
 }
 
 func (f liveGatewayRebindRuntimeFixture) failureDiagnosticContext() context.Context {

@@ -147,7 +147,8 @@ func (d managerGatewayCurrentPhysicalRuntime) observe(ctx context.Context,
 ) (gatewayCurrentPhysicalAttestation, error) {
 	if d.manager == nil || d.hostProbe == nil || d.containerProbe == nil || ctx == nil || ctx.Err() != nil ||
 		!validGatewayCurrentPhysicalTarget(target) {
-		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+		return gatewayCurrentPhysicalAttestation{}, newGatewayCurrentAttestationError(ctx,
+			gatewayCurrentAttestationCheckpointRuntimePrecondition)
 	}
 	first, err := d.read(ctx, target)
 	if err != nil {
@@ -160,7 +161,8 @@ func (d managerGatewayCurrentPhysicalRuntime) observe(ctx context.Context,
 	}
 	defer clearGatewayCurrentPhysicalInventory(&second)
 	if !reflect.DeepEqual(first, second) || ctx.Err() != nil {
-		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+		return gatewayCurrentPhysicalAttestation{}, newGatewayCurrentAttestationError(ctx,
+			gatewayCurrentAttestationCheckpointRuntimeStability)
 	}
 	return d.attestation(ctx, target, second)
 }
@@ -521,38 +523,40 @@ func (d managerGatewayCurrentPhysicalRuntime) stop(ctx context.Context,
 func (d managerGatewayCurrentPhysicalRuntime) read(ctx context.Context,
 	target gatewayCurrentPhysicalTarget,
 ) (gatewayCurrentPhysicalInventory, error) {
-	invalid := func(value *gatewayCurrentPhysicalInventory) (gatewayCurrentPhysicalInventory, error) {
+	invalid := func(value *gatewayCurrentPhysicalInventory, err error,
+		checkpoint gatewayCurrentAttestationCheckpoint,
+	) (gatewayCurrentPhysicalInventory, error) {
 		if value != nil {
 			clearGatewayCurrentPhysicalInventory(value)
 		}
-		return gatewayCurrentPhysicalInventory{}, gatewayCurrentPhysicalDriverError(ctx)
+		return gatewayCurrentPhysicalInventory{}, gatewayCurrentAttestationErrorFrom(ctx, err, checkpoint)
 	}
 	value, err := d.immutableInventoryValue(ctx, target)
 	if err != nil {
-		return invalid(&value)
+		return invalid(&value, err, gatewayCurrentAttestationCheckpointRuntimeInventoryPrecondition)
 	}
 	if !d.validIngressMembership(target, value.Ingress, value.Final) {
-		return invalid(&value)
+		return invalid(&value, nil, gatewayCurrentAttestationCheckpointRuntimeIngressMembership)
 	}
 	value.ApplicationNetworks, err = d.applicationNetworkBindings(ctx, target.State, value.Final, true)
 	if err != nil || !d.validFinalNetworks(target, value.Final, value.FinalRuntime, value.IngressID,
 		value.ApplicationNetworks) {
-		return invalid(&value)
+		return invalid(&value, err, gatewayCurrentAttestationCheckpointRuntimeApplicationNetworks)
 	}
 	routes := gatewayCurrentPhysicalRoutes(target.State)
 	value.EndpointDigest, err = d.manager.inspectGatewayRouteEndpointProof(ctx, routes)
 	if err != nil {
-		return invalid(&value)
+		return invalid(&value, err, gatewayCurrentAttestationCheckpointRuntimeEndpointProof)
 	}
 	value.RestartConfig, err = d.manager.inspectStoppedCaddyRestartConfig(ctx, value.Final.ID,
 		target.Identity.Rebind.ActiveConfigFilename)
 	if err != nil {
-		return invalid(&value)
+		return invalid(&value, err, gatewayCurrentAttestationCheckpointRuntimeRestartConfig)
 	}
 	if value.Final.Running {
 		value.LiveConfig, err = d.manager.inspectLiveCaddyConfig(ctx, value.Final.ID)
 		if err != nil {
-			return invalid(&value)
+			return invalid(&value, err, gatewayCurrentAttestationCheckpointRuntimeLiveConfig)
 		}
 	}
 	return value, nil
@@ -574,12 +578,15 @@ func (d managerGatewayCurrentPhysicalRuntime) immutableInventory(ctx context.Con
 func (d managerGatewayCurrentPhysicalRuntime) immutableInventoryValue(ctx context.Context,
 	target gatewayCurrentPhysicalTarget,
 ) (gatewayCurrentPhysicalInventory, error) {
-	invalid := func(value *gatewayCurrentPhysicalInventory) (gatewayCurrentPhysicalInventory, error) {
+	invalid := func(value *gatewayCurrentPhysicalInventory, err error,
+		checkpoint gatewayCurrentAttestationCheckpoint,
+	) (gatewayCurrentPhysicalInventory, error) {
 		clearGatewayCurrentPhysicalInventory(value)
-		return gatewayCurrentPhysicalInventory{}, gatewayCurrentPhysicalDriverError(ctx)
+		return gatewayCurrentPhysicalInventory{}, gatewayCurrentAttestationErrorFrom(ctx, err, checkpoint)
 	}
 	if d.manager == nil || ctx == nil || ctx.Err() != nil || !validGatewayCurrentPhysicalTarget(target) {
-		return gatewayCurrentPhysicalInventory{}, gatewayCurrentPhysicalDriverError(ctx)
+		return gatewayCurrentPhysicalInventory{}, newGatewayCurrentAttestationError(ctx,
+			gatewayCurrentAttestationCheckpointRuntimeInventoryPrecondition)
 	}
 	value := gatewayCurrentPhysicalInventory{}
 	var found bool
@@ -587,40 +594,40 @@ func (d managerGatewayCurrentPhysicalRuntime) immutableInventoryValue(ctx contex
 	value.Image, found, err = d.inspectImage(ctx, target.Resources.ImageID)
 	if err != nil || !found || normalizeID(value.Image.ID) != target.Resources.ImageID ||
 		!validGatewayPinnedImage(value.Image, true) {
-		return invalid(&value)
+		return invalid(&value, err, gatewayCurrentAttestationCheckpointRuntimeImage)
 	}
 	value.ConfigVolume, value.ConfigVolumeID, found, err = d.manager.inspectNamedVolumeWithIdentity(ctx,
 		target.Identity.Rebind.ConfigVolume)
 	if err != nil || !found || !d.validVolume(target, value.ConfigVolume, value.ConfigVolumeID,
 		target.Resources.ConfigVolume, gatewayV2ConfigVolumeRole) {
-		return invalid(&value)
+		return invalid(&value, err, gatewayCurrentAttestationCheckpointRuntimeConfigVolume)
 	}
 	value.DataVolume, value.DataVolumeID, found, err = d.manager.inspectNamedVolumeWithIdentity(ctx,
 		target.Identity.Rebind.DataVolume)
 	if err != nil || !found || !d.validVolume(target, value.DataVolume, value.DataVolumeID,
 		target.Resources.DataVolume, gatewayV2DataVolumeRole) {
-		return invalid(&value)
+		return invalid(&value, err, gatewayCurrentAttestationCheckpointRuntimeDataVolume)
 	}
 	value.Ingress, value.IngressID, found, err = d.manager.inspectNamedGatewayNetwork(ctx,
 		target.Identity.Rebind.IngressNetwork)
 	if err != nil || !found || !d.validIngress(target, value.Ingress, value.IngressID) {
-		return invalid(&value)
+		return invalid(&value, err, gatewayCurrentAttestationCheckpointRuntimeIngressNetwork)
 	}
 	if _, _, stageFound, stageErr := d.manager.inspectNamedGatewayContainer(ctx,
 		target.Identity.Rebind.StageContainer); stageErr != nil || stageFound {
-		return invalid(&value)
+		return invalid(&value, stageErr, gatewayCurrentAttestationCheckpointRuntimeStageAbsence)
 	}
 	containers, volumes, networks, err := d.ownedNames(ctx, target)
 	if err != nil || !validOwnedNameSet(containers, target.Identity.Rebind.FinalContainer) ||
 		!validOwnedNameSet(volumes, target.Identity.Rebind.ConfigVolume, target.Identity.Rebind.DataVolume) ||
 		!validOwnedNameSet(networks, target.Identity.Rebind.IngressNetwork) ||
 		!d.volumeUsersExact(ctx, target) {
-		return invalid(&value)
+		return invalid(&value, err, gatewayCurrentAttestationCheckpointRuntimeOwnedCensus)
 	}
 	value.Final, value.FinalRuntime, found, err = d.manager.inspectNamedGatewayContainer(ctx,
 		target.Identity.Rebind.FinalContainer)
 	if err != nil || !found || !d.validFinalBase(target, value.Final, value.FinalRuntime) {
-		return invalid(&value)
+		return invalid(&value, err, gatewayCurrentAttestationCheckpointRuntimeFinalContainer)
 	}
 	// Docker may enumerate the two exact owned mounts in either order. Their
 	// complete values were validated above; clone and sort only that slice so
@@ -634,7 +641,8 @@ func (d managerGatewayCurrentPhysicalRuntime) attestation(ctx context.Context,
 ) (gatewayCurrentPhysicalAttestation, error) {
 	expected, err := gatewayCurrentPhysicalConfigBytes(target.State)
 	if err != nil {
-		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentAttestationErrorFrom(ctx, err,
+			gatewayCurrentAttestationCheckpointRuntimeConfigRender)
 	}
 	defer clear(expected)
 	outcome := gatewayCurrentPhysicalStableServing
@@ -642,12 +650,14 @@ func (d managerGatewayCurrentPhysicalRuntime) attestation(ctx context.Context,
 	if !inventory.Final.Running {
 		if !sameCaddyConfig(expected, inventory.RestartConfig) ||
 			!d.listenerAbsent(ctx, target.State) {
-			return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+			return gatewayCurrentPhysicalAttestation{}, newGatewayCurrentAttestationError(ctx,
+				gatewayCurrentAttestationCheckpointRuntimeStoppedListener)
 		}
 		outcome, listenerAbsent = gatewayCurrentPhysicalRecoveryStopped, true
 	} else {
 		if !sameCaddyConfig(expected, inventory.LiveConfig) {
-			return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+			return gatewayCurrentPhysicalAttestation{}, newGatewayCurrentAttestationError(ctx,
+				gatewayCurrentAttestationCheckpointRuntimeActiveConfig)
 		}
 		switch {
 		case sameCaddyConfig(expected, inventory.RestartConfig):
@@ -657,10 +667,12 @@ func (d managerGatewayCurrentPhysicalRuntime) attestation(ctx context.Context,
 		case gatewayCurrentPhysicalAlternateConfigMatches(target, inventory.RestartConfig):
 			outcome = gatewayCurrentPhysicalRecoveryMixed
 		default:
-			return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+			return gatewayCurrentPhysicalAttestation{}, newGatewayCurrentAttestationError(ctx,
+				gatewayCurrentAttestationCheckpointRuntimeRestartMatch)
 		}
 		if !d.proveServing(ctx, target.State, inventory.Final.ID) {
-			return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+			return gatewayCurrentPhysicalAttestation{}, newGatewayCurrentAttestationError(ctx,
+				gatewayCurrentAttestationCheckpointRuntimeServingProbes)
 		}
 	}
 	return d.attestationProof(ctx, target, inventory, expected, outcome, listenerAbsent)
@@ -675,7 +687,8 @@ func (d managerGatewayCurrentPhysicalRuntime) attestationProof(ctx context.Conte
 			outcome != gatewayCurrentPhysicalRecoveryEffective && outcome != gatewayCurrentPhysicalRecoveryMixed &&
 			outcome != gatewayCurrentPhysicalRecoveryStopped) ||
 		listenerAbsent != (outcome == gatewayCurrentPhysicalRecoveryStopped) {
-		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+		return gatewayCurrentPhysicalAttestation{}, newGatewayCurrentAttestationError(ctx,
+			gatewayCurrentAttestationCheckpointRuntimeProofInput)
 	}
 	activeDigest := sha256.Sum256(expected)
 	routeDigest, err := canonicalDigest(struct {
@@ -684,14 +697,16 @@ func (d managerGatewayCurrentPhysicalRuntime) attestationProof(ctx context.Conte
 		Apps    map[string]gatewayCurrentAppRoute  `json:"apps"`
 	}{"hostd/generated-ingress/routes/current-physical/v1", target.Lineage, target.State.Apps})
 	if err != nil {
-		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentAttestationErrorFrom(ctx, err,
+			gatewayCurrentAttestationCheckpointRuntimeProofDigest)
 	}
 	applicationDigest, err := canonicalDigest(struct {
 		Networks  []gatewayRebindHandoverApplicationNetwork `json:"networks"`
 		Endpoints string                                    `json:"endpoints"`
 	}{inventory.ApplicationNetworks, inventory.EndpointDigest})
 	if err != nil {
-		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentAttestationErrorFrom(ctx, err,
+			gatewayCurrentAttestationCheckpointRuntimeProofDigest)
 	}
 	listenerDigest, err := canonicalDigest(struct {
 		StateDigest  string `json:"stateDigest"`
@@ -699,7 +714,8 @@ func (d managerGatewayCurrentPhysicalRuntime) attestationProof(ctx context.Conte
 		Absent       bool   `json:"absent"`
 	}{target.State.Digest, hex.EncodeToString(activeDigest[:]), listenerAbsent})
 	if err != nil {
-		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentAttestationErrorFrom(ctx, err,
+			gatewayCurrentAttestationCheckpointRuntimeProofDigest)
 	}
 	runtime := gatewayCurrentRuntimeProof{
 		Profile: GatewayV2ProfileBinding{RevisionID: target.State.Profile.RevisionID,
@@ -713,7 +729,8 @@ func (d managerGatewayCurrentPhysicalRuntime) attestationProof(ctx context.Conte
 	}
 	runtime.Digest, err = gatewayCurrentRuntimeProofDigest(runtime)
 	if err != nil {
-		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentAttestationErrorFrom(ctx, err,
+			gatewayCurrentAttestationCheckpointRuntimeProofDigest)
 	}
 	value := gatewayCurrentPhysicalAttestation{Outcome: outcome, State: cloneGatewayCurrentRouteState(target.State),
 		Lineage: target.Lineage, Terminal: target.Terminal, Identity: target.Identity,
@@ -721,7 +738,8 @@ func (d managerGatewayCurrentPhysicalRuntime) attestationProof(ctx context.Conte
 		LANRecovery: cloneGatewayCurrentLANRecoveryBatch(target.LANRecovery)}
 	value.Digest, err = gatewayCurrentPhysicalAttestationDigest(value)
 	if err != nil || !validGatewayCurrentPhysicalAttestation(value) {
-		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentAttestationErrorFrom(ctx, err,
+			gatewayCurrentAttestationCheckpointRuntimeProofDigest)
 	}
 	return value, nil
 }

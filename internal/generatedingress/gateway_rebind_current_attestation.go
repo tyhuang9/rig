@@ -11,69 +11,78 @@ import (
 // attest the exact commit baseline; terminal startup may attest newer current
 // revisions. A held commit barrier permits only this terminal observation.
 func (m *Manager) attestGatewayRebindCurrentLocked(ctx context.Context, selection gatewayCurrentSelection) (string, error) {
-	invalid := func() (string, error) { return "", gatewayRebindEffectBoundaryError(ctx) }
+	invalid := func(checkpoint gatewayCurrentAttestationCheckpoint) (string, error) {
+		return "", newGatewayCurrentAttestationError(ctx, checkpoint)
+	}
+	invalidFrom := func(err error, checkpoint gatewayCurrentAttestationCheckpoint) (string, error) {
+		return "", gatewayCurrentAttestationErrorFrom(ctx, err, checkpoint)
+	}
 	if m == nil || ctx == nil || ctx.Err() != nil || selection.Kind != gatewayCurrentSelectionRebind ||
 		selection.State == nil || selection.Store == nil || m.gatewayRebindFailStopLatch().Load() {
-		return invalid()
+		return invalid(gatewayCurrentAttestationCheckpointManagerPrecondition)
 	}
 	repository, ok := m.options.RebindCurrentStateRepository.(GatewayCurrentServingStartupRepository)
 	if !ok {
-		return invalid()
+		return invalid(gatewayCurrentAttestationCheckpointManagerAuthority)
 	}
 	snapshot, err := repository.HostingGatewayStartupSnapshot(ctx)
 	if err != nil {
-		return invalid()
+		return invalidFrom(err, gatewayCurrentAttestationCheckpointManagerAuthority)
 	}
 	active := snapshot.Rebind.Active != nil
 	barrier := m.gatewayRebindCommitBarrierLatch().Load()
 	if active && barrier {
-		return invalid()
+		return invalid(gatewayCurrentAttestationCheckpointManagerAuthority)
 	}
 	target, err := gatewayCurrentPhysicalTargetFor(selection, *selection.State, nil, nil)
 	if err != nil || target.Pending != nil || target.LANRecovery != nil {
-		return invalid()
+		return invalidFrom(err, gatewayCurrentAttestationCheckpointManagerPrecondition)
 	}
 	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	files, filesErr := readGatewayHistorySnapshotMode(m.store, true)
 	if err != nil || filesErr != nil {
-		return invalid()
+		if err != nil {
+			return invalidFrom(err, gatewayCurrentAttestationCheckpointManagerHistoryStability)
+		}
+		return invalidFrom(filesErr, gatewayCurrentAttestationCheckpointManagerHistoryStability)
 	}
 	var request gatewayRebindPhysicalReconcileRequest
 	if active {
 		attempt, attemptErr := gatewayRebindPreparedAttemptFromHistory(snapshot.Rebind, history)
 		if attemptErr != nil {
-			return invalid()
+			return invalidFrom(attemptErr, gatewayCurrentAttestationCheckpointManagerForwardBoundary)
 		}
 		receipt, receiptErr := gatewayRebindActiveTerminalV2(history, attempt.Claim)
 		if receiptErr != nil || receipt == nil {
-			return invalid()
+			return invalidFrom(receiptErr, gatewayCurrentAttestationCheckpointManagerForwardBoundary)
 		}
 		request = gatewayRebindForwardConfirmationRequest(attempt, *receipt, snapshot.Rebind)
 		if !validGatewayRebindCommittedServingRestoreRequest(request) {
-			return invalid()
+			return invalid(gatewayCurrentAttestationCheckpointManagerForwardBoundary)
 		}
 	}
 	readAuthority := func(readCtx context.Context) (appaccess.HostingGatewayStartupSnapshot, error) {
-		fail := func() (appaccess.HostingGatewayStartupSnapshot, error) {
-			return appaccess.HostingGatewayStartupSnapshot{}, gatewayRebindEffectBoundaryError(readCtx)
+		fail := func(err error) (appaccess.HostingGatewayStartupSnapshot, error) {
+			return appaccess.HostingGatewayStartupSnapshot{}, gatewayCurrentAttestationErrorFrom(readCtx, err,
+				gatewayCurrentAttestationCheckpointManagerAuthority)
 		}
 		if readCtx == nil || readCtx.Err() != nil || m.gatewayRebindFailStopLatch().Load() ||
 			m.gatewayRebindCommitBarrierLatch().Load() != barrier {
-			return fail()
+			return fail(nil)
 		}
 		fresh, err := repository.HostingGatewayStartupSnapshot(readCtx)
 		if err != nil || !reflect.DeepEqual(snapshot, fresh) || !fresh.ActiveRebindApprovalsAuthorizeServing() {
-			return fail()
+			return fail(err)
 		}
 		selected, err := m.selectGatewayCurrentLocked(readCtx, fresh.Rebind)
 		if err != nil || !sameGatewayCurrentSelection(selection, selected) {
-			return fail()
+			return fail(err)
 		}
 		if !active && (!gatewayCurrentRouteMutationSnapshotReady(fresh.Rebind) || repository.CheckGatewayRebindFence(readCtx) != nil) {
-			return fail()
+			return fail(nil)
 		}
 		if readCtx.Err() != nil || m.gatewayRebindFailStopLatch().Load() || m.gatewayRebindCommitBarrierLatch().Load() != barrier {
-			return fail()
+			return fail(nil)
 		}
 		return fresh, nil
 	}
@@ -85,38 +94,58 @@ func (m *Manager) attestGatewayRebindCurrentLocked(ctx context.Context, selectio
 		if active {
 			boundary, boundaryErr := m.readGatewayRebindTypedForwardBoundaryLocked(proofCtx, request)
 			if boundaryErr != nil || !sameGatewayCurrentSelection(selection, boundary.Selection) ||
-				!sameGatewayRebindCurrentHistory(history, boundary.History) ||
-				!m.gatewayRebindCommittedServingCensusMatchesLocked(proofCtx, request, target.State, fresh) {
-				return gatewayRebindEffectBoundaryError(proofCtx)
+				!sameGatewayRebindCurrentHistory(history, boundary.History) {
+				return gatewayCurrentAttestationErrorFrom(proofCtx, boundaryErr,
+					gatewayCurrentAttestationCheckpointManagerForwardBoundary)
+			}
+			if !m.gatewayRebindCommittedServingCensusMatchesLocked(proofCtx, request, target.State, fresh) {
+				return newGatewayCurrentAttestationError(proofCtx,
+					gatewayCurrentAttestationCheckpointManagerServingCensus)
 			}
 		} else {
 			if !gatewayCurrentServingRuntimeCensusMatches(target.State, fresh) {
-				return gatewayRebindEffectBoundaryError(proofCtx)
+				return newGatewayCurrentAttestationError(proofCtx,
+					gatewayCurrentAttestationCheckpointManagerServingCensus)
 			}
 			claims, claimsErr := validateGatewayV2LANAccessStartupClaims(GatewayLANGrantStartupClaims(fresh.Grants),
 				GatewayLANDisableStartupClaims(fresh.Disables))
 			inspection, inspectErr := gatewayCurrentLANStartupCensus(target.State, claims)
 			if claimsErr != nil || inspectErr != nil || inspection.Disposition != GatewayV2LANStartupNormal ||
 				m.validateGatewayCurrentLANRetainedHistoryLocked(proofCtx, claims, fresh.Rebind) != nil {
-				return gatewayRebindEffectBoundaryError(proofCtx)
+				return newGatewayCurrentAttestationError(proofCtx,
+					gatewayCurrentAttestationCheckpointManagerServingCensus)
 			}
 		}
 		after, historyErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 		afterFiles, filesErr := readGatewayHistorySnapshotMode(m.store, true)
 		if historyErr != nil || filesErr != nil || !sameGatewayRebindCurrentHistory(history, after) ||
 			!sameGatewayHistorySnapshot(files, afterFiles) {
-			return gatewayRebindEffectBoundaryError(proofCtx)
+			if historyErr != nil {
+				return gatewayCurrentAttestationErrorFrom(proofCtx, historyErr,
+					gatewayCurrentAttestationCheckpointManagerHistoryStability)
+			}
+			return gatewayCurrentAttestationErrorFrom(proofCtx, filesErr,
+				gatewayCurrentAttestationCheckpointManagerHistoryStability)
 		}
 		_, err = readAuthority(proofCtx)
 		return err
 	}
 	driver := m.gatewayRebindCurrentObserver()
-	if driver == nil || guard(ctx) != nil {
-		return invalid()
+	if driver == nil {
+		return invalid(gatewayCurrentAttestationCheckpointManagerDriver)
+	}
+	if err := guard(ctx); err != nil {
+		return invalidFrom(err, gatewayCurrentAttestationCheckpointManagerPreDriverGuard)
 	}
 	proof, err := driver.attestGatewayRebindCurrent(ctx, target, guard)
-	if err != nil || !gatewayCurrentServingRestoreProofMatches(proof, target, gatewayCurrentPhysicalStableServing) || guard(ctx) != nil {
-		return invalid()
+	if err != nil {
+		return invalidFrom(err, gatewayCurrentAttestationCheckpointManagerDriver)
+	}
+	if !gatewayCurrentServingRestoreProofMatches(proof, target, gatewayCurrentPhysicalStableServing) {
+		return invalid(gatewayCurrentAttestationCheckpointManagerProof)
+	}
+	if err := guard(ctx); err != nil {
+		return invalidFrom(err, gatewayCurrentAttestationCheckpointManagerPostDriverGuard)
 	}
 	return canonicalDigest(struct {
 		Purpose     string                             `json:"purpose"`

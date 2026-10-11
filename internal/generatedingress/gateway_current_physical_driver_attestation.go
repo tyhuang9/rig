@@ -29,21 +29,43 @@ func (m *Manager) gatewayRebindCurrentObserver() gatewayRebindCurrentAttestation
 func (d managedGatewayCurrentPhysicalDriver) attestGatewayRebindCurrent(ctx context.Context,
 	target gatewayCurrentPhysicalTarget, guard func(context.Context) error,
 ) (gatewayCurrentPhysicalAttestation, error) {
-	invalid := func() (gatewayCurrentPhysicalAttestation, error) {
-		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentPhysicalDriverError(ctx)
+	invalid := func(checkpoint gatewayCurrentAttestationCheckpoint) (gatewayCurrentPhysicalAttestation, error) {
+		return gatewayCurrentPhysicalAttestation{}, newGatewayCurrentAttestationError(ctx, checkpoint)
+	}
+	invalidFrom := func(err error,
+		checkpoint gatewayCurrentAttestationCheckpoint,
+	) (gatewayCurrentPhysicalAttestation, error) {
+		return gatewayCurrentPhysicalAttestation{}, gatewayCurrentAttestationErrorFrom(ctx, err, checkpoint)
 	}
 	if d.manager() == nil || d.runtime == nil || ctx == nil || ctx.Err() != nil || guard == nil ||
-		!validGatewayCurrentPhysicalTarget(target) || target.Pending != nil || target.LANRecovery != nil || guard(ctx) != nil {
-		return invalid()
+		!validGatewayCurrentPhysicalTarget(target) || target.Pending != nil || target.LANRecovery != nil {
+		return invalid(gatewayCurrentAttestationCheckpointDriverPrecondition)
+	}
+	if err := guard(ctx); err != nil {
+		return invalidFrom(err, gatewayCurrentAttestationCheckpointDriverInitialGuard)
 	}
 	first, err := d.runtime.observe(ctx, target)
-	if err != nil || !gatewayCurrentServingRestoreProofMatches(first, target, gatewayCurrentPhysicalStableServing) || guard(ctx) != nil {
-		return invalid()
+	if err != nil {
+		return invalidFrom(err, gatewayCurrentAttestationCheckpointDriverFirstObservation)
+	}
+	if !gatewayCurrentServingRestoreProofMatches(first, target, gatewayCurrentPhysicalStableServing) {
+		return invalid(gatewayCurrentAttestationCheckpointDriverFirstProof)
+	}
+	if err := guard(ctx); err != nil {
+		return invalidFrom(err, gatewayCurrentAttestationCheckpointDriverFirstGuard)
 	}
 	second, err := d.runtime.observe(ctx, target)
-	if err != nil || !gatewayCurrentServingRestoreProofMatches(second, target, gatewayCurrentPhysicalStableServing) ||
-		!reflect.DeepEqual(first, second) || guard(ctx) != nil {
-		return invalid()
+	if err != nil {
+		return invalidFrom(err, gatewayCurrentAttestationCheckpointDriverSecondObservation)
+	}
+	if !gatewayCurrentServingRestoreProofMatches(second, target, gatewayCurrentPhysicalStableServing) {
+		return invalid(gatewayCurrentAttestationCheckpointDriverSecondProof)
+	}
+	if !reflect.DeepEqual(first, second) {
+		return invalid(gatewayCurrentAttestationCheckpointDriverStability)
+	}
+	if err := guard(ctx); err != nil {
+		return invalidFrom(err, gatewayCurrentAttestationCheckpointDriverSecondGuard)
 	}
 	return second, nil
 }

@@ -577,6 +577,13 @@ func gatewayRebindTestDigest(t *testing.T, value any) string {
 }
 
 func seedGatewayRebindPredecessorRuntime(t *testing.T, db *sql.DB, appID string) generatedruntimestate.ActiveHead {
+	return seedGatewayRebindPredecessorRuntimeWithContainerID(t, db, appID, strings.Repeat("3", 64))
+}
+
+// seedGatewayRebindPredecessorRuntimeWithContainerID builds the same active
+// predecessor runtime as the default helper while allowing a composition
+// fixture to model a second app with its own concrete endpoint identity.
+func seedGatewayRebindPredecessorRuntimeWithContainerID(t *testing.T, db *sql.DB, appID, containerID string) generatedruntimestate.ActiveHead {
 	t.Helper()
 	planID, releaseID, deploymentID, jobID := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
 	stamp := time.Now().UTC().Format(time.RFC3339Nano)
@@ -631,7 +638,7 @@ func seedGatewayRebindPredecessorRuntime(t *testing.T, db *sql.DB, appID string)
 	if _, err := runtime.SetContainerStarting(context.Background(), appID, deploymentID, "api", "rig-rebind-api"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.SetContainerRunning(context.Background(), appID, deploymentID, "api", strings.Repeat("3", 64)); err != nil {
+	if _, err := runtime.SetContainerRunning(context.Background(), appID, deploymentID, "api", containerID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := runtime.AdvanceComponent(context.Background(), appID, deploymentID, "api",
