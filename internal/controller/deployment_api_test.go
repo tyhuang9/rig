@@ -24,11 +24,11 @@ import (
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/controller"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 // deploymentAPIFixture deliberately uses a real migrated SQLite database. The
@@ -57,7 +57,7 @@ func newDeploymentAPIFixture(t *testing.T, composeRuntime, fakeRuntime bool) dep
 func newDeploymentAPIFixtureWithRuntimes(t *testing.T, composeRuntime, generatedRuntime, fakeRuntime bool) deploymentAPIFixture {
 	t.Helper()
 	stateRoot := filepath.Join(t.TempDir(), "state")
-	db, err := database.Open(stateRoot)
+	db, err := databasefixture.Open(stateRoot)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 const (
@@ -632,7 +633,7 @@ func TestIdempotencyReplaySurvivesDatabaseRestart(t *testing.T) {
 
 func appAccessDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := database.Open(t.TempDir())
+	db, err := databasefixture.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

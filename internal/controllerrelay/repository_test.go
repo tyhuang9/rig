@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 const (
@@ -224,7 +224,7 @@ func TestRepositoryRejectsSensitiveValuesBeforeSQLite(t *testing.T) {
 func newRepositoryHarness(t *testing.T) (*Repository, string, time.Time) {
 	t.Helper()
 	root := t.TempDir()
-	db, err := database.Open(root)
+	db, err := databasefixture.Open(root)
 	if err != nil {
 		t.Fatal(err)
 	}
