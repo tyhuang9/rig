@@ -622,6 +622,10 @@ func (d managerGatewayCurrentPhysicalRuntime) immutableInventoryValue(ctx contex
 	if err != nil || !found || !d.validFinalBase(target, value.Final, value.FinalRuntime) {
 		return invalid(&value)
 	}
+	// Docker may enumerate the two exact owned mounts in either order. Their
+	// complete values were validated above; clone and sort only that slice so
+	// the surrounding immutable-inventory comparison remains full-field exact.
+	value.Final.Mounts = canonicalGatewayRebindTypedMounts(value.Final.Mounts)
 	return value, nil
 }
 

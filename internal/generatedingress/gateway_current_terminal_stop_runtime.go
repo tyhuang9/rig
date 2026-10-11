@@ -120,8 +120,17 @@ func (d managerGatewayCurrentPhysicalRuntime) terminalOwnedOwnershipInventory(ct
 	}
 	expectedUsers := []string{}
 	if namedFound {
-		if !reflect.DeepEqual(named, byID) || !reflect.DeepEqual(namedRuntime, idRuntime) ||
-			!gatewayFinalOwnershipContainerStaticMatches(facts, named) || !validOwnedNameSet(containers, identity.FinalContainer) {
+		if !gatewayFinalOwnershipContainerStaticMatches(facts, named) ||
+			!gatewayFinalOwnershipContainerStaticMatches(facts, byID) ||
+			!reflect.DeepEqual(namedRuntime, idRuntime) || !validOwnedNameSet(containers, identity.FinalContainer) {
+			return invalid()
+		}
+		// The name and immutable ID reads independently prove the exact owned
+		// mounts above. Compare every other field after clone-sorting only those
+		// mount slices; later liveness validation remains unchanged.
+		named.Mounts = canonicalGatewayRebindTypedMounts(named.Mounts)
+		byID.Mounts = canonicalGatewayRebindTypedMounts(byID.Mounts)
+		if !reflect.DeepEqual(named, byID) {
 			return invalid()
 		}
 		expectedUsers = []string{resources.FinalContainer.ID}
