@@ -34,6 +34,20 @@ type gatewayRebindAdmissionCandidate struct {
 	Proposal   appaccess.GatewayRebindPreclaimProposalV2
 }
 
+// gatewayRebindAcceptedClaim is invocation-local provenance from the exact
+// ClaimGatewayRebindV2 call below. Its private created bit is trusted only
+// after the returned claim has been checked against the locked candidate.
+type gatewayRebindAcceptedClaim struct {
+	claim   appaccess.GatewayRebindClaimV2
+	created bool
+}
+
+type gatewayRebindStrictClaim struct {
+	candidate gatewayRebindAdmissionCandidate
+	preclaim  gatewayRebindAdmissionPhysicalProof
+	accepted  gatewayRebindAcceptedClaim
+}
+
 // prepareGatewayRebindLocked is the claim-to-protected admission core. Its
 // caller holds the deployment-effects lease, Manager mutex, and gateway OS
 // lock. ClaimGatewayRebindV2 commits the short SQL prepared transaction before
@@ -66,39 +80,85 @@ func (m *Manager) prepareGatewayRebindStrictLocked(ctx context.Context,
 	repository gatewayRebindAdmissionRepository, input gatewayRebindCommitInput,
 	proofReader gatewayRebindAdmissionProofReader, liveSession func(context.Context) error,
 ) (gatewayRebindPreparedAttempt, error) {
+	strict, err := m.claimGatewayRebindStrictLocked(ctx, repository, input, proofReader, liveSession)
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, err
+	}
+	return m.continueGatewayRebindStrictLocked(ctx, repository, input, strict, proofReader, liveSession)
+}
+
+func (m *Manager) claimGatewayRebindStrictLocked(ctx context.Context,
+	repository gatewayRebindAdmissionRepository, input gatewayRebindCommitInput,
+	proofReader gatewayRebindAdmissionProofReader, liveSession func(context.Context) error,
+) (gatewayRebindStrictClaim, error) {
+	zero := gatewayRebindStrictClaim{}
 	if m == nil || ctx == nil || repository == nil || proofReader == nil || liveSession == nil {
-		return gatewayRebindPreparedAttempt{}, &Error{Code: DiagnosticValidationFailed}
+		return zero, &Error{Code: DiagnosticValidationFailed}
 	}
 	if err := checkGatewayRebindAdmissionSession(ctx, liveSession); err != nil {
-		return gatewayRebindPreparedAttempt{}, err
+		return zero, err
 	}
 	candidate, err := m.gatewayRebindAdmissionCandidateLocked(ctx, repository, input)
 	if err != nil {
-		return gatewayRebindPreparedAttempt{}, err
+		return zero, err
 	}
 	target := gatewayRebindAdmissionTarget(input.Inspection, candidate.Checkpoint)
 	preclaim, err := proofReader(ctx, target, candidate.Selection)
 	if err != nil || !gatewayRebindAdmissionProofMatchesTarget(ctx, preclaim, target, candidate.Selection) {
-		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+		return zero, gatewayRebindProposalError(ctx)
 	}
 	if err := checkGatewayRebindAdmissionSession(ctx, liveSession); err != nil {
-		return gatewayRebindPreparedAttempt{}, err
+		return zero, err
 	}
-	claim, err := m.claimGatewayRebindAdmissionLocked(ctx, repository, candidate)
+	strict := gatewayRebindStrictClaim{candidate: candidate, preclaim: preclaim}
+	strict.accepted, err = m.claimGatewayRebindStrictAcceptedLocked(ctx, repository, candidate)
 	if err != nil {
-		return gatewayRebindPreparedAttempt{}, err
+		return strict, err
 	}
-	network, err := m.attestGatewayRebindClaimAdmissionLocked(ctx, repository, candidate,
-		claim, proofReader, preclaim)
+	return strict, nil
+}
+
+func (m *Manager) continueGatewayRebindStrictLocked(ctx context.Context,
+	repository gatewayRebindAdmissionRepository, input gatewayRebindCommitInput,
+	strict gatewayRebindStrictClaim, proofReader gatewayRebindAdmissionProofReader,
+	liveSession func(context.Context) error,
+) (gatewayRebindPreparedAttempt, error) {
+	prepared, _, err := m.continueGatewayRebindStrictAdmissionLocked(ctx, repository, input,
+		strict, proofReader, liveSession)
+	return prepared, err
+}
+
+// continueGatewayRebindStrictAdmissionLocked reports whether the request's
+// live session passed immediately before the protected install. The facade
+// uses that provenance to distinguish an install failure eligible for the
+// narrowly proved no-effect abort from a session or cancellation failure,
+// which never authorizes cleanup.
+func (m *Manager) continueGatewayRebindStrictAdmissionLocked(ctx context.Context,
+	repository gatewayRebindAdmissionRepository, input gatewayRebindCommitInput,
+	strict gatewayRebindStrictClaim, proofReader gatewayRebindAdmissionProofReader,
+	liveSession func(context.Context) error,
+) (gatewayRebindPreparedAttempt, bool, error) {
+	if m == nil || ctx == nil || repository == nil || proofReader == nil || liveSession == nil ||
+		!strict.accepted.created || !validGatewayRebindAcceptedClaim(strict.accepted, strict.candidate) ||
+		!reflect.DeepEqual(strict.candidate.Proposal.Spec, input.Inspection.Spec) ||
+		strict.candidate.Proposal.RebindApproval != input.RebindApproval ||
+		strict.candidate.Proposal.ConfigureApproval != input.ConfigureApproval ||
+		!sameGatewayRebindRosterV2(strict.candidate.Proposal.Roster, input.Inspection.Roster) ||
+		!sameGatewayRebindRuntimeHeads(strict.candidate.Proposal.RuntimeHeads, input.Inspection.RuntimeHeads) {
+		return gatewayRebindPreparedAttempt{}, false, gatewayRebindProposalError(ctx)
+	}
+	network, err := m.attestGatewayRebindClaimAdmissionLocked(ctx, repository, strict.candidate,
+		strict.accepted.claim, proofReader, strict.preclaim)
 	if err != nil {
-		return gatewayRebindPreparedAttempt{}, err
+		return gatewayRebindPreparedAttempt{}, false, err
 	}
 	if err := checkGatewayRebindAdmissionSession(ctx, liveSession); err != nil {
-		return gatewayRebindPreparedAttempt{}, err
+		return gatewayRebindPreparedAttempt{}, false, err
 	}
-	return m.installGatewayRebindPreparedProtectedWithNetworkLocked(ctx, claim,
-		input.Inspection.Roster, input.Inspection.RuntimeHeads, candidate.Checkpoint,
+	prepared, err := m.installGatewayRebindPreparedProtectedWithNetworkLocked(ctx, strict.accepted.claim,
+		input.Inspection.Roster, input.Inspection.RuntimeHeads, strict.candidate.Checkpoint,
 		network, m.gatewayRebindProgressTime())
+	return prepared, true, err
 }
 
 func checkGatewayRebindAdmissionSession(ctx context.Context, liveSession func(context.Context) error) error {
@@ -160,6 +220,39 @@ func (m *Manager) claimGatewayRebindAdmissionLocked(ctx context.Context,
 		}
 	}
 	return claim, nil
+}
+
+func (m *Manager) claimGatewayRebindStrictAcceptedLocked(ctx context.Context,
+	repository gatewayRebindAdmissionRepository, candidate gatewayRebindAdmissionCandidate,
+) (gatewayRebindAcceptedClaim, error) {
+	claim, created, err := repository.ClaimGatewayRebindV2(ctx, candidate.Proposal)
+	if err != nil {
+		return gatewayRebindAcceptedClaim{}, gatewayRebindProposalError(ctx)
+	}
+	accepted := gatewayRebindAcceptedClaim{claim: claim, created: created}
+	if !validGatewayRebindAcceptedClaim(accepted, candidate) {
+		return gatewayRebindAcceptedClaim{}, gatewayRebindProposalError(ctx)
+	}
+	if m.gatewayRebindAfterClaim != nil {
+		if err := m.gatewayRebindAfterClaim(ctx, claim); err != nil {
+			return accepted, gatewayRebindProposalError(ctx)
+		}
+	}
+	return accepted, nil
+}
+
+func validGatewayRebindAcceptedClaim(accepted gatewayRebindAcceptedClaim,
+	candidate gatewayRebindAdmissionCandidate,
+) bool {
+	claim := accepted.claim
+	if appaccess.ValidateGatewayRebindClaimV2ForProposal(claim, candidate.Proposal) != nil {
+		return false
+	}
+	if !accepted.created {
+		return true
+	}
+	return claim.State == appaccess.GatewayRebindPrepared && claim.StateSequence == 1 &&
+		!claim.CreatedAt.IsZero() && claim.UpdatedAt.Equal(claim.CreatedAt)
 }
 
 func (m *Manager) recoverGatewayRebindPreparedAdmissionLocked(ctx context.Context,

@@ -525,3 +525,157 @@ scoped vet, four-CLI build, documentation checks, and aggregate review receipts
 are retained separately in the same unit's evidence directory. These checks
 do not qualify the still-unwired controller facade, real Docker execution,
 full-controller crash matrix, second-device LAN behavior, or M3 completion.
+
+## Dormant commit facade and historical retry checkpoint
+
+This checkpoint adds `Manager.CommitGatewayRebind` and dormant controller
+preview/commit handlers. No route, capability factory, or public writer is
+registered. The handlers are directly tested with a runtime mock; this is not
+an end-to-end supported-controller or physical Docker acceptance claim.
+
+The server builds a versioned review from the complete canonical proposal,
+roster, runtime heads, predecessor, selected source, and checkpoint bindings.
+Configure and rebind approval digests retain separate purposes. The pure public
+review validator checks the complete review and all digests; it grants neither
+physical proof nor effects authority. The controller compares the submitted
+candidate to this server review, derives the actor from the authenticated
+principal, and passes the request's live session guard. Curated response DTOs
+exclude protected paths, Docker/configuration output, and session data.
+
+The commit facade holds one deployment-effects lease, Manager mutex, and
+gateway OS lock across request classification, strict admission, continuation,
+and terminal proof. It constructs concrete production drivers and attaches an
+invocation-local forward-session guard. Fresh admission uses the preclaim and
+post-insert physical proof described above. A pure accepted-claim validator
+recomputes both canonical request digests before an accepted token can grant
+continuation or cleanup authority. `created == false` returns to read-only
+replay classification; it cannot enter this invocation's continuation or abort.
+
+No-effect abort is restricted to this invocation's newly created, canonical
+prepared claim with exact checkpoint, unchanged approvals, no intent/progress/
+terminal evidence, and fresh session and no-effect proof. A0 without a
+checkpoint, revoked or canceled sessions, changed claims, and uncertain
+protected prefixes remain fenced. The existing coordinator continuation and
+release ordering are shared without weakening rollback or exact-owned
+withdrawal authority. A lock-release failure returns a zero response.
+
+Historical completion and current authority are separate. An exact terminal
+retry does not replay effects. A newer active claim leaves the historical
+operation terminal but its physical proofs unavailable; the historical
+operation's released fence must not be confused with the newer global fence.
+A later same-lineage revision or another current authority is not the old
+operation's original terminal baseline. Active replies expose the actual SQL
+phase and database-committed state and do not claim terminal physical proof.
+Controller 201 responses require a newly created terminal operation, both
+verified proofs, and released operation fence; unknown or inconsistent runtime
+projections are rejected.
+
+### Read-only current and terminal proof
+
+The current-proof helper requires a stable no-active SQL snapshot, complete
+hosting/runtime/LAN census, exact selected authority, protected history and
+file identities, live session, fence, and stable latch state. It uses the
+existing validated predecessor observer for native, rebound, and valid stopped
+current state. Three complete hosting snapshots and final protected-file and
+session/fence checks prevent a stale partial proof. Its digest binds actual
+lineage, hosting snapshot and physical observation; it is not permission to
+serve or proof that historical approvers remain administrators.
+
+A committed terminal proof validates the retained P17 result and receipt,
+then proves the exact successor is serving and the complete predecessor chain
+is retired. The concrete read-only retirement observer runs before and after
+the serving attestation. It accepts the existing stopped-or-absent retirement
+contract and does not require retired resources to equal their historical P17
+snapshot. The digest binds retained terminal evidence, the complete retirement
+action, fresh serving proof, and current proof. Abort proof uses the existing
+read-only rollback observations and binds exact stage absence. None of these
+reads stops, repairs, retires, reconciles, writes history, or changes latches.
+
+The admission predecessor, current-proof and terminal-response implementations
+have mandatory private dependency cores for deterministic component tests.
+Every production wrapper unconditionally constructs concrete dependencies;
+there is no public, Manager, or global override and no optional fallback.
+Positive component tests use the actual managed runtime and readers with
+controlled probe transport. A separate exported commit control rejects a
+missing concrete current inventory before host probes, with unchanged SQL,
+protected history and effects. That control proves refusal behavior; source
+review establishes unconditional production factory selection. Running
+exported commit acceptance still requires actual Docker and host probes.
+
+### Checkpoint verification and retained failures
+
+The review builder passed four WSL parents and 27 descendant cases. The dormant
+controller handlers passed eight native Windows parents and 66 descendant
+cases, including full review/candidate binding, session revocation, active
+versus terminal projections, native current authority, and refusal of an
+unproved 201 response. The accepted-claim application layer passed its focused
+canonical-digest controls. Exact commands and immutable source/log receipts
+are retained under `temp/m3-controller-rebind-contract-20261012/` outside the
+checkout.
+
+Earlier failed attempts are preserved. Moving physical checks before the
+checkpoint exposed two obsolete coordinator failure-injection locations;
+commit `1ff1256` moves only those injections to the actual post-checkpoint hook,
+retaining all rollback and history assertions. The first facade aggregate
+revealed a new direct-abort test using the process-global commit barrier.
+The fixture now owns private latches and asserts the expected armed barrier;
+production latch behavior is unchanged. Its replacement passed all seven
+coordinator parents and 16 of 17 selected parents. Source inspection identified
+real host probes as an independent fixture testability limitation; the generic
+runtime failures did not establish that a host probe caused those failures.
+The private-core adjustment above keeps the production probe path unchanged.
+The following 22-parent gate passed 21 parents. Source tracing then identified
+a fixture restart-config mismatch: it returned a multi-entry directory archive
+for a request to copy one active file. A correction uses the existing
+single-entry archive helper with the actual retained active filename and
+bytes, changing no production validator. The targeted replacement still
+refused the positive case. A subsequent test-only diagnostic observed the
+`runtime_owned_census` checkpoint before archive inspection: the inherited
+runner answered an exact volume-user query with predecessor container names
+instead of the required final container ID. Selection, hosting SQL census and
+target validation succeeded. This evidence identifies the observed earlier
+fixture mismatch; it does not establish a production ownership defect.
+After the exact volume-query response was corrected, diagnostics observed
+successful inventory read and serving attestation but a refusal in the local
+admission matcher. The runtime proof holds the canonical image ID; the validated
+Docker inventory retains its `sha256:` prefix. The trace established unequal
+raw strings and equal canonical identities. The matcher correction binds both
+representations to the exact target image and retains pinned-image validation,
+including platform and approved repository digest. This local admission defect
+is distinct from the published Docker current-attestation failure under
+separate investigation. No production identity check is dropped.
+The final fixture census also answers exact retained-native-predecessor volume
+queries from actual present container mounts, and its controlled transport
+models listener absence only when the fixture's existing state proves it.
+All other commands and live/unknown endpoints delegate unchanged. The clean,
+uninstrumented terminal parent and its three cases then passed under WSL:
+fresh verified proof, stopped-successor refusal, and revived-predecessor
+refusal. Compilation, discovery and execution exited zero in 8.547 s,
+2.078 s and 22.547 s, with all 906 Go/SQL/module inputs and the binary unchanged
+(`commit-facade-predecessor-volume-fixture-wsl.result.json`). The image identity
+positive and all eight malformed/mismatch controls passed in the separately
+retained targeted run; that run's failed terminal cases remain recorded.
+Current-proof fixture compile and lock-admission failures are retained with
+their narrow corrections; no failed whole run is relabelled as passing.
+
+Security and scoped root source reviews accepted the final production and
+fixture changes. All 25 new ingress parents map exactly once through the
+unchanged required CI selector. Final canonical formatting and diff checks
+passed for all 19 pending Go files. Scoped vet for appaccess, controller and
+generatedingress and the four CLI builds passed in 51.875 s and 44.578 s, with
+906 unchanged inputs (`commit-facade-image-static-native.result.json`). The
+finite diagnostic markers were removed and production hashes restored before
+clean execution; no diagnostic instrumentation is part of this checkpoint.
+
+The final combined affected-contract execution is recorded separately in
+`commit-facade-final-wsl.result.json`; its outcome is not inferred from the
+partial or targeted receipts. Documentation verification runs `check:workflow`,
+`build`, and `check:accessibility` on this frozen page, with its result retained
+by the integration owner rather than rewriting the page to certify itself.
+Full supported
+controller route/factory composition, interactive reconciliation and actual-
+phase recovery, full-controller crash coverage, actual Docker terminal replay,
+and physical second-device LAN qualification remain incomplete. These are
+required follow-on implementation and acceptance work, not inferred passes
+from this dormant checkpoint. Rollback of this unactivated code does not remove
+retained SQL/audit/protected history.

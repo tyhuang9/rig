@@ -154,10 +154,23 @@ func (m *Manager) readGatewayRebindAdmissionPredecessorLocked(ctx context.Contex
 func (m *Manager) readGatewayRebindAdmissionPredecessorWithInspectLocked(ctx context.Context,
 	selection gatewayCurrentSelection, inspectDocker gatewayRebindDockerInspector,
 ) (gatewayRebindAdmissionPredecessorProof, error) {
+	handover := newGatewayRebindTypedHandoverRuntime(m)
+	physical := managerGatewayCurrentPhysicalRuntime{manager: m,
+		hostProbe: handover.hostProbe, containerProbe: handover.containerProbe}
+	return m.readGatewayRebindAdmissionPredecessorWithRuntimeLocked(ctx, selection, inspectDocker,
+		handover, physical)
+}
+
+func (m *Manager) readGatewayRebindAdmissionPredecessorWithRuntimeLocked(ctx context.Context,
+	selection gatewayCurrentSelection, inspectDocker gatewayRebindDockerInspector,
+	handover gatewayRebindTypedHandoverRuntime, physical managerGatewayCurrentPhysicalRuntime,
+) (gatewayRebindAdmissionPredecessorProof, error) {
 	invalid := func() (gatewayRebindAdmissionPredecessorProof, error) {
 		return gatewayRebindAdmissionPredecessorProof{}, gatewayRebindProposalError(ctx)
 	}
-	if m == nil || ctx == nil || inspectDocker == nil || ctx.Err() != nil {
+	if m == nil || ctx == nil || inspectDocker == nil || ctx.Err() != nil ||
+		handover.manager != m || physical.manager != m || handover.hostProbe == nil ||
+		handover.containerProbe == nil || physical.hostProbe == nil || physical.containerProbe == nil {
 		return invalid()
 	}
 	switch selection.Kind {
@@ -196,7 +209,6 @@ func (m *Manager) readGatewayRebindAdmissionPredecessorWithInspectLocked(ctx con
 		if err != nil {
 			return invalid()
 		}
-		handover := newGatewayRebindTypedHandoverRuntime(m)
 		first, err := handover.observeCurrentPredecessor(ctx, target)
 		if err != nil {
 			return invalid()
@@ -205,9 +217,7 @@ func (m *Manager) readGatewayRebindAdmissionPredecessorWithInspectLocked(ctx con
 		if err != nil || !reflect.DeepEqual(first, second) || !validSHA256(second.Digest) || ctx.Err() != nil {
 			return invalid()
 		}
-		physicalRuntime := managerGatewayCurrentPhysicalRuntime{manager: m,
-			hostProbe: handover.hostProbe, containerProbe: handover.containerProbe}
-		inventory, err := physicalRuntime.read(ctx, target)
+		inventory, err := physical.read(ctx, target)
 		if err != nil || !gatewayRebindAdmissionCurrentPhysicalMatches(target, second, inventory) {
 			clearGatewayCurrentPhysicalInventory(&inventory)
 			return invalid()
@@ -427,13 +437,15 @@ func gatewayRebindAdmissionCurrentPhysicalMatches(target gatewayCurrentPhysicalT
 	}
 	if physical.Running {
 		return physical.Serving != nil && inventory.Final.Running && !inventory.Final.Restarting &&
+			physical.Serving.Runtime.ImageID == target.Resources.ImageID &&
+			normalizeID(inventory.Image.ID) == target.Resources.ImageID &&
+			validGatewayPinnedImage(inventory.Image, true) &&
 			validGatewayCurrentPhysicalAttestation(*physical.Serving) &&
 			physical.Serving.Outcome == gatewayCurrentPhysicalStableServing &&
 			reflect.DeepEqual(physical.Serving.State, target.State) &&
 			physical.Serving.Lineage == target.Lineage && physical.Serving.Digest == physical.Digest &&
 			physical.Serving.Resources.FinalContainer.ID == inventory.Final.ID &&
-			physical.Serving.Runtime.ContainerID == inventory.Final.ID &&
-			physical.Serving.Runtime.ImageID == inventory.Image.ID
+			physical.Serving.Runtime.ContainerID == inventory.Final.ID
 	}
 	if physical.Serving != nil || inventory.Final.Running || inventory.Final.Restarting ||
 		gatewayV2HasEffectivePortBinding(inventory.FinalRuntime.EffectivePortBindings) {

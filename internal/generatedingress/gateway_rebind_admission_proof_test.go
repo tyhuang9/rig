@@ -252,6 +252,99 @@ func gatewayRebindStrictReboundFixture(t *testing.T) (gatewayCurrentStateFixture
 	return fixture, repository, input, reader, runner
 }
 
+func TestGatewayRebindAdmissionCurrentPhysicalMatchesCanonicalPinnedImage(t *testing.T) {
+	fixture := newGatewayCurrentStateFixture(t)
+	target := gatewayCurrentPhysicalRuntimeTestTarget(t, fixture)
+	localPort := fixture.history.Predecessor.Journal.Source.LocalHostPort
+	runner := newGatewayCurrentPhysicalExecutor(t, target, target.State, target.State, localPort)
+	fixture.manager.runner = runner
+	fixture.manager.options.HostPort = localPort
+	runtime := managerGatewayCurrentPhysicalRuntime{manager: fixture.manager,
+		hostProbe:      gatewayCurrentPhysicalExecutorHostProbe(localPort),
+		containerProbe: func(context.Context, string, string, uint16, string, string) bool { return true }}
+	inventory, err := runtime.read(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearGatewayCurrentPhysicalInventory(&inventory)
+	serving, err := runtime.attestation(context.Background(), target, inventory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical := gatewayRebindCurrentPredecessorPhysical{Running: true,
+		Digest: serving.Digest, Serving: &serving}
+	if !validSHA256(physical.Digest) || !validGatewayCurrentPhysicalAttestation(serving) ||
+		serving.Runtime.ImageID != target.Resources.ImageID ||
+		normalizeID(inventory.Image.ID) != target.Resources.ImageID ||
+		!strings.HasPrefix(inventory.Image.ID, "sha256:") ||
+		!validGatewayPinnedImage(inventory.Image, true) ||
+		!gatewayRebindAdmissionCurrentPhysicalMatches(target, physical, inventory) {
+		t.Fatalf("actual managed current proof did not match canonical pinned image: runtime=%q target=%q inspected=%q proof=%#v",
+			serving.Runtime.ImageID, target.Resources.ImageID, inventory.Image.ID, physical)
+	}
+
+	for _, test := range []struct {
+		name       string
+		wantPinned bool
+		mutate     func(*gatewayRebindCurrentPredecessorPhysical, *gatewayCurrentPhysicalInventory)
+	}{
+		{name: "changed runtime image", wantPinned: true,
+			mutate: func(value *gatewayRebindCurrentPredecessorPhysical, _ *gatewayCurrentPhysicalInventory) {
+				value.Serving.Runtime.ImageID = strings.Repeat("f", 64)
+			}},
+		{name: "changed inspected image", wantPinned: true,
+			mutate: func(_ *gatewayRebindCurrentPredecessorPhysical, value *gatewayCurrentPhysicalInventory) {
+				value.Image.ID = "sha256:" + strings.Repeat("f", 64)
+			}},
+		{name: "uppercase inspected image", mutate: func(_ *gatewayRebindCurrentPredecessorPhysical,
+			value *gatewayCurrentPhysicalInventory,
+		) {
+			value.Image.ID = "sha256:" + strings.Repeat("A", 64)
+		}},
+		{name: "short inspected image", mutate: func(_ *gatewayRebindCurrentPredecessorPhysical,
+			value *gatewayCurrentPhysicalInventory,
+		) {
+			value.Image.ID = "sha256:abc"
+		}},
+		{name: "double-prefixed inspected image", mutate: func(_ *gatewayRebindCurrentPredecessorPhysical,
+			value *gatewayCurrentPhysicalInventory,
+		) {
+			value.Image.ID = "sha256:sha256:" + target.Resources.ImageID
+		}},
+		{name: "wrong image OS", mutate: func(_ *gatewayRebindCurrentPredecessorPhysical,
+			value *gatewayCurrentPhysicalInventory,
+		) {
+			value.Image.OS = "windows"
+		}},
+		{name: "missing approved repository digest", mutate: func(_ *gatewayRebindCurrentPredecessorPhysical,
+			value *gatewayCurrentPhysicalInventory,
+		) {
+			value.Image.RepoDigests = nil
+		}},
+		{name: "wrong approved repository digest", mutate: func(_ *gatewayRebindCurrentPredecessorPhysical,
+			value *gatewayCurrentPhysicalInventory,
+		) {
+			value.Image.RepoDigests = []string{"caddy@sha256:" + strings.Repeat("f", 64)}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			changedPhysical, changedInventory := physical, inventory
+			changedServing := *physical.Serving
+			changedPhysical.Serving = &changedServing
+			changedInventory.Image.RepoDigests = append([]string(nil), inventory.Image.RepoDigests...)
+			test.mutate(&changedPhysical, &changedInventory)
+			if validGatewayPinnedImage(changedInventory.Image, true) != test.wantPinned {
+				t.Fatalf("pinned image control mismatch: image=%#v wantPinned=%t",
+					changedInventory.Image, test.wantPinned)
+			}
+			if gatewayRebindAdmissionCurrentPhysicalMatches(target, changedPhysical, changedInventory) {
+				t.Fatalf("changed current image proof matched: runtime=%q target=%q inspected=%q",
+					changedPhysical.Serving.Runtime.ImageID, target.Resources.ImageID, changedInventory.Image.ID)
+			}
+		})
+	}
+}
+
 func TestPrepareGatewayRebindStrictLockedRequiresLiveSessionAndProof(t *testing.T) {
 	f, input, reader := gatewayRebindStrictNativeFixture(t)
 	if _, err := f.manager.prepareGatewayRebindStrictLocked(context.Background(), f.repository,

@@ -28,6 +28,7 @@ import (
 	"github.com/hostd/hostd/internal/controllerrelay"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/hostnetwork"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
@@ -63,6 +64,8 @@ type Server struct {
 	GatewayProfiles       GatewayProfileService
 	GatewayUpgrades       GatewayUpgradeService
 	GatewayUpgradeRuntime GatewayUpgradeRuntime
+	GatewayRebinds        generatedingress.GatewayRebindCommitRepository
+	GatewayRebindRuntime  GatewayRebindRuntime
 	AppAccess             LANAppAccessService
 	AppGrants             LANAppGrantService
 	LANGrantRuntime       LANAppGrantRuntime
