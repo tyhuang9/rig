@@ -408,8 +408,8 @@ func TestGatewayRebindCoordinatorLatchesFailStopOnCurrentStateDriftAfterTerminal
 
 func TestGatewayRebindCoordinatorRollsBackPreparedClaimWithNoSuccessorEffects(t *testing.T) {
 	f, input, driver := newGatewayRebindCoordinatorFixture(t)
-	f.manager.gatewayRebindV2NetworkObserver = func(context.Context, appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error) {
-		return gatewayRebindSuccessorNetworkObservation{}, errors.New("injected successor network unavailable")
+	f.manager.gatewayRebindAfterPreparedCheckpoint = func(context.Context) error {
+		return errors.New("injected post-checkpoint failure")
 	}
 	result, err := f.manager.commitGatewayRebindWithDriver(context.Background(), f.repository, input, driver)
 	if err != nil {
@@ -484,8 +484,8 @@ func TestGatewayRebindCoordinatorRollsBackOwnedPostIntentEffects(t *testing.T) {
 
 func TestGatewayRebindCoordinatorRejectsChangedPredecessorAfterNoEffectRollback(t *testing.T) {
 	f, input, driver := newGatewayRebindCoordinatorFixture(t)
-	f.manager.gatewayRebindV2NetworkObserver = func(context.Context, appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error) {
-		return gatewayRebindSuccessorNetworkObservation{}, errors.New("injected successor network unavailable")
+	f.manager.gatewayRebindAfterPreparedCheckpoint = func(context.Context) error {
+		return errors.New("injected post-checkpoint failure")
 	}
 	repository := &gatewayRebindRollbackReadbackRepository{Repository: f.repository}
 	result, err := f.manager.commitGatewayRebindWithDriver(context.Background(), repository, input, driver)
