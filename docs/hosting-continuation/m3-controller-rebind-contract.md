@@ -418,9 +418,110 @@ source manifests, review records and formatting evidence are retained under
 `temp/m3-controller-rebind-contract-20261012/` outside the checkout. Documentation
 checks for this frozen page are recorded separately by the integration owner.
 
-This is preparation within one cohesive controller implementation, not a new
-acceptance milestone. Handlers, same-session administrator/CSRF checks, the
-lock-held audit/executor facade, native and rebound preclaim/post-insert physical
-proof adapters, and complete actual-phase recovery predicates still remain.
-There is no new production activation, actual Docker result, full-controller
-process-loss proof or physical second-device LAN acceptance from this checkpoint.
+This remains preparation within one cohesive controller implementation. The
+following checkpoints add session binding and strict admission proofs; handlers,
+the lock-held audit/executor facade, and complete actual-phase recovery
+predicates remain unfinished. No route or production writer is activated.
+
+## Live session binding
+
+Local checkpoint `269bfc1` adds `gateway_rebind_session.go` and its tests. The
+private binder derives the actor from the authenticated principal and captures
+one original session cookie, the submitted CSRF value, the authentication
+service, and the original request context. Initial validation and every guard
+invocation require the same live actor, administrator role, and CSRF value.
+Both the invocation context and original request context are checked before
+and after authentication. A detached forward context cannot revive a canceled
+interactive request. Failures are sanitized; no token, CSRF value, or request
+authority is persisted or shared between requests.
+
+The binder does not grant effects authority or register handlers. Startup and
+exact-owned withdrawal retain their separate authority. Native Windows Go
+1.26.7 verification passed five exact parents and 34 descendant cases, without
+failures or skips. Discovery, execution, and scoped controller vet exited zero;
+all 895 Go/SQL/module inputs remained unchanged. Source/security and final
+review accepted the two-file checkpoint. The original commit metadata receipt
+and its additive corrected tree assessment are both retained.
+
+## Strict admission and prepared-prefix proof checkpoint
+
+`gateway_rebind_admission_proof.go` and the shared preparation core now provide
+the private strict admission path. The caller must hold the deployment-effects
+lease, Manager mutex, and gateway OS lock. The strict entry requires both a
+physical proof reader and live-session guard; neither has a permissive default.
+It rechecks the session, freshly compares the submitted proposal and selected
+authority, validates the preclaim physical proof, and checks the session again
+immediately before the existing transactional claim. After the SQL claim, it
+requires the exact prepared claim, canonical initial event, roster, runtime
+heads, and selected current authority. It compares a fresh physical proof to
+the preclaim proof and repeats the SQL/current census before the final session
+check and first protected write. A refusal after claim retains A0 and its
+fence, without installing protected evidence or authorizing Docker effects.
+
+The proof binds the immutable native or rebound predecessor identity and full
+validated observation, the derived current target where applicable, the exact
+checkpoint, and the successor profile and network inventory. Native Docker
+observations and successor network observations are independently sampled
+twice. Rebound proof uses the existing current-predecessor observation and
+physical-inventory readers. The production wrapper unconditionally supplies
+the existing real Docker inspector and network readers. A mandatory private
+read seam permits deterministic fixtures while retaining the same target,
+checkpoint, ownership, digest, stability, and network-selection predicates.
+
+Prepared recovery now applies the real proof wrapper to A0 and incomplete
+checkpoint/intent prefixes before repair writes. It requires stable SQL and
+physical evidence and does not cast an unresolved phase to prepared. An exact
+complete checkpoint/intent/progress-1 replay returns without new physical
+reads or writes. The claim-bound intent is validated before the first
+protected write, and existing protected contents are compared exactly.
+The legacy private preparation entry remains for component composition;
+there is no supported controller route into it. Future controller composition
+must call the strict entry with the concrete proof reader and live guard.
+
+Moving network validation before the checkpoint exposed a retained process
+test that had used the network observer as a post-write hook. A private
+package-test hook now runs immediately after the actual exact checkpoint
+write/readback and before intent-store creation. It is uninitialized in
+production and sanitizes callback failures like the existing after-intent
+hook. The test retains actual child kill/reap and exact SQL, fence, protected
+prefix, and recovery assertions; it does not synthesize the checkpoint itself.
+
+### Executable evidence and limits
+
+The final focused Go 1.26.7 gate cross-compiled the ingress test binary,
+discovered the exact selection, and executed it under WSL. All 12 parents and
+24 descendant cases passed once each, with no failures or skips (30 leaves,
+including parents without descendants). Compilation, discovery, and execution
+exited zero in 8.406 s, 3.609 s, and 14.922 s respectively. All 896
+Go/SQL/module inputs and the compiled binary hash remained unchanged.
+The immutable receipt is `admission-corrected3-wsl.result.json` under
+`temp/m3-controller-rebind-contract-20261012/` outside the checkout.
+
+The selection covers four new strict-admission/recovery parents, six affected
+existing preparation/process parents, and two retained census/preflight
+parents. Controls include missing proof/session, revocation and cancellation,
+native and rebound success, malformed immutable/derived physical facts,
+second-observation drift, initial-event and runtime-head changes, stable A0
+repair, and exact completed replay. Real child-process tests retain claim,
+checkpoint, intent, and progress-1 kill/reap boundaries. These children invoke
+the private Manager path with fixture physical evidence; they are not the full
+supported controller, actual Docker, or physical-LAN acceptance gates.
+
+All earlier failed attempts remain retained. The first behavior run exposed
+incomplete fixture setup; the next attempt failed compilation on a nonexistent
+test-only timestamp field. The following behavior run reached all cases and
+exposed private-directory mode, inconsistent fixture network inventories, and
+the obsolete checkpoint hook location. Corrections used the existing private
+directory preparation helper, the actual immutable profile approval timestamp,
+consistent fixture observations, and the real post-write hook. No production
+ownership predicate, immutable intent comparison, or expected positive outcome
+was relaxed to obtain the pass.
+
+Source/security review accepted the fixed production adapters, mandatory
+private seams, and process-local selection-handle rebinding. The four new
+parents each map exactly once to `ingress-remainder` in the existing required
+Linux and Windows workflows; no CI source changed. Final formatter, diff,
+scoped vet, four-CLI build, documentation checks, and aggregate review receipts
+are retained separately in the same unit's evidence directory. These checks
+do not qualify the still-unwired controller facade, real Docker execution,
+full-controller crash matrix, second-device LAN behavior, or M3 completion.

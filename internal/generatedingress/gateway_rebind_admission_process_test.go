@@ -59,15 +59,16 @@ func (r *gatewayRebindAdmissionProcessRepository) ClaimGatewayRebindV2(ctx conte
 }
 
 type gatewayRebindAdmissionProcessManifest struct {
-	DataRoot              string                              `json:"dataRoot"`
-	WorkingDirectory      string                              `json:"workingDirectory"`
-	DockerExecutable      string                              `json:"dockerExecutable"`
-	DockerConfigDirectory string                              `json:"dockerConfigDirectory"`
-	HostPort              uint16                              `json:"hostPort"`
-	Input                 gatewayRebindCommitInput            `json:"input"`
-	PredecessorSubnet     string                              `json:"predecessorSubnet"`
-	Mutation              generatedruntime.RouteSwitchRequest `json:"mutation"`
-	PinnedTopology        gatewayObservedTopology             `json:"pinnedTopology"`
+	DataRoot              string                               `json:"dataRoot"`
+	WorkingDirectory      string                               `json:"workingDirectory"`
+	DockerExecutable      string                               `json:"dockerExecutable"`
+	DockerConfigDirectory string                               `json:"dockerConfigDirectory"`
+	HostPort              uint16                               `json:"hostPort"`
+	Input                 gatewayRebindCommitInput             `json:"input"`
+	PredecessorSubnet     string                               `json:"predecessorSubnet"`
+	Mutation              generatedruntime.RouteSwitchRequest  `json:"mutation"`
+	PinnedTopology        gatewayObservedTopology              `json:"pinnedTopology"`
+	AdmissionProof        *gatewayRebindAdmissionPhysicalProof `json:"admissionProof,omitempty"`
 }
 
 type gatewayRebindAdmissionProcessCommand struct {
@@ -299,12 +300,16 @@ func TestGatewayRebindAdmissionProcessRecoversCommittedClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	admissionProof := gatewayRebindAdmissionFixtureProof(t, f.manager, beforeSQL, inspection,
+		gatewayRebindNativeFixtureInspector(t, f),
+		gatewayRebindCrossStoreAdmissionTestReads(inspection.Spec, f.state.Network.Subnet))
 	beforeCommands := len(f.runner.commands)
 	manifest := gatewayRebindAdmissionProcessManifest{
 		DataRoot: f.manager.options.DataRoot, WorkingDirectory: f.manager.options.WorkingDirectory,
 		DockerExecutable: f.manager.options.DockerExecutable, DockerConfigDirectory: f.manager.options.DockerConfigDirectory,
 		HostPort: f.manager.options.HostPort, Input: gatewayRebindAdmissionProcessInput(inspection),
 		PredecessorSubnet: f.state.Network.Subnet, PinnedTopology: gatewayTopologyExactFinalV2,
+		AdmissionProof: &admissionProof,
 	}
 	manifestPath := gatewayRebindAdmissionWriteManifest(t, f.manager.options.DataRoot, "recovery.json", manifest)
 	crashed := gatewayRebindAdmissionStartProcess(t, "crash-after-claim", "", manifestPath)
@@ -394,12 +399,16 @@ func TestGatewayRebindAdmissionProcessRecoversProtectedPreparation(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
+			admissionProof := gatewayRebindAdmissionFixtureProof(t, f.manager, beforeSQL, inspection,
+				gatewayRebindNativeFixtureInspector(t, f),
+				gatewayRebindCrossStoreAdmissionTestReads(inspection.Spec, f.state.Network.Subnet))
 			beforeCommands := len(f.runner.commands)
 			manifest := gatewayRebindAdmissionProcessManifest{
 				DataRoot: f.manager.options.DataRoot, WorkingDirectory: f.manager.options.WorkingDirectory,
 				DockerExecutable: f.manager.options.DockerExecutable, DockerConfigDirectory: f.manager.options.DockerConfigDirectory,
 				HostPort: f.manager.options.HostPort, Input: gatewayRebindAdmissionProcessInput(inspection),
 				PredecessorSubnet: f.state.Network.Subnet, PinnedTopology: gatewayTopologyExactFinalV2,
+				AdmissionProof: &admissionProof,
 			}
 			manifestPath := gatewayRebindAdmissionWriteManifest(t, f.manager.options.DataRoot,
 				"protected-preparation-"+test.name+".json", manifest)
@@ -736,21 +745,23 @@ func gatewayRebindAdmissionProcessCrashProtectedPreparation(path, mode string) e
 		return errors.Join(err, releaseEffects(), db.Close())
 	}
 
+	installCrossStoreFixtureNetworkObserver(manager, manifest.PredecessorSubnet)
 	if mode == "crash-after-checkpoint" {
-		manager.gatewayRebindV2NetworkObserver = func(hookContext context.Context,
-			claim appaccess.GatewayRebindClaimV2,
-		) (gatewayRebindSuccessorNetworkObservation, error) {
+		manager.gatewayRebindAfterPreparedCheckpoint = func(hookContext context.Context) error {
+			snapshot, snapshotErr := repository.GatewayRebindRecoverySnapshot(hookContext)
+			if snapshotErr != nil || snapshot.Active == nil || snapshot.Active.Claim.V2 == nil {
+				return errors.New("prepared checkpoint SQL claim is not durable")
+			}
 			if boundaryErr := gatewayRebindAdmissionValidateChildPreparation(hookContext, manager, repository,
-				runner, manifest.Input.Inspection, claim, 0, 0); boundaryErr != nil {
-				return gatewayRebindSuccessorNetworkObservation{}, boundaryErr
+				runner, manifest.Input.Inspection, *snapshot.Active.Claim.V2, 0, 0); boundaryErr != nil {
+				return boundaryErr
 			}
 			if markerErr := gatewayRebindAdmissionPrintMarker("CHECKPOINT_INSTALLED"); markerErr != nil {
-				return gatewayRebindSuccessorNetworkObservation{}, markerErr
+				return markerErr
 			}
-			return gatewayRebindSuccessorNetworkObservation{}, gatewayRebindAdmissionWaitForParentKill()
+			return gatewayRebindAdmissionWaitForParentKill()
 		}
 	} else {
-		installCrossStoreFixtureNetworkObserver(manager, manifest.PredecessorSubnet)
 		if mode == "crash-after-intent" {
 			manager.gatewayRebindAfterPreparedIntent = func(hookContext context.Context) error {
 				snapshot, snapshotErr := repository.GatewayRebindRecoverySnapshot(hookContext)
@@ -874,7 +885,13 @@ func gatewayRebindAdmissionProcessRecover(path string) error {
 	if err != nil {
 		return errors.Join(err, releaseGateway(), releaseEffects())
 	}
-	attempt, err := manager.recoverGatewayRebindPreparedAdmissionLocked(ctx, repository, snapshot)
+	if manifest.AdmissionProof == nil {
+		return errors.Join(errors.New("prepared recovery physical proof is unavailable"),
+			releaseGateway(), releaseEffects())
+	}
+	proofReader := gatewayRebindImmutableFixtureProofReader(*manifest.AdmissionProof)
+	attempt, err := manager.recoverGatewayRebindPreparedAdmissionWithProofLocked(ctx, repository,
+		snapshot, proofReader)
 	if err != nil || runner.calls.Load() != 0 || attempt.Progress.Sequence != 1 || attempt.Progress.Phase != gatewayRebindProgressSuccessorIntent ||
 		attempt.Intent.Predecessor != attempt.Claim.Spec.Predecessor || attempt.Checkpoint.Digest != attempt.Claim.Spec.Predecessor.PredecessorCheckpointDigest {
 		return errors.Join(fmt.Errorf("recover exact prepared admission: %w", err), releaseGateway(), releaseEffects())
