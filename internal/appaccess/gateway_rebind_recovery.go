@@ -33,7 +33,12 @@ func (r *Repository) GatewayRebindRecoverySnapshot(ctx context.Context,
 	return value, nil
 }
 
-func readGatewayRebindRecoverySnapshot(ctx context.Context, tx *sql.Tx,
+type gatewayRebindRecoveryQuerier interface {
+	rowQuerier
+	gatewayRebindQuiescenceQuerier
+}
+
+func readGatewayRebindRecoverySnapshot(ctx context.Context, tx gatewayRebindRecoveryQuerier,
 ) (GatewayRebindRecoverySnapshot, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT operation_id,spec_format_version
 		FROM lan_gateway_rebind_claims ORDER BY created_at,operation_id`)
@@ -148,7 +153,7 @@ func readGatewayRebindRecoverySnapshot(ctx context.Context, tx *sql.Tx,
 	return result, nil
 }
 
-func readGatewayRebindNoHistoryCurrent(ctx context.Context, tx *sql.Tx,
+func readGatewayRebindNoHistoryCurrent(ctx context.Context, tx gatewayRebindRecoveryQuerier,
 ) (*GatewayProfileRevision, *GatewayCurrentAuthorityRef, error) {
 	var profileID sql.NullString
 	var profileNumber int64
@@ -186,7 +191,7 @@ func readGatewayRebindNoHistoryCurrent(ctx context.Context, tx *sql.Tx,
 	return &current, &source, nil
 }
 
-func readGatewayRebindHistory(ctx context.Context, tx *sql.Tx, operationID string,
+func readGatewayRebindHistory(ctx context.Context, tx gatewayRebindRecoveryQuerier, operationID string,
 	version int,
 ) (GatewayRebindHistoryEntry, error) {
 	value := GatewayRebindHistoryEntry{Claim: GatewayRebindClaimRecord{SpecVersion: version}}
