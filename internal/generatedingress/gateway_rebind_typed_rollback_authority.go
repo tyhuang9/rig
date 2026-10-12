@@ -15,7 +15,8 @@ func gatewayRebindTypedPrecommitServingSnapshotMatches(attempt gatewayRebindPrep
 	rebind := snapshot.Rebind
 	if rebind.Active == nil || rebind.Active.Claim.V2 == nil ||
 		rebind.DatabaseCommitObserved || rebind.DatabaseCommittedEvent != nil ||
-		(rebind.Phase != appaccess.GatewayRebindPrepared && rebind.Phase != appaccess.GatewayRebindSuccessorReady) ||
+		(rebind.Phase != appaccess.GatewayRebindPrepared && rebind.Phase != appaccess.GatewayRebindSuccessorReady &&
+			rebind.Phase != appaccess.GatewayRebindUnresolved) ||
 		!sameGatewayRebindClaimV2Admission(*rebind.Active.Claim.V2, attempt.Claim) ||
 		rebind.CurrentSource == nil || *rebind.CurrentSource != gatewayCurrentAuthority(attempt.Checkpoint.Lineage) ||
 		!snapshot.ActiveRebindApprovalsAuthorizeServing() ||
@@ -90,7 +91,11 @@ func (d gatewayRebindTypedHandoverRuntime) authorizedRollbackPredecessor(ctx con
 	if d.manager == nil || ctx == nil || ctx.Err() != nil || guard == nil || guard(ctx) != nil {
 		return invalid()
 	}
-	repository, ok := d.manager.options.RebindCurrentStateRepository.(GatewayCurrentServingStartupRepository)
+	repository, ok := d.typedBoundaryRepository()
+	if !ok {
+		return invalid()
+	}
+	snapshotRepository, ok := repository.(GatewayRebindCurrentStateRepository)
 	if !ok {
 		return invalid()
 	}
@@ -98,7 +103,7 @@ func (d gatewayRebindTypedHandoverRuntime) authorizedRollbackPredecessor(ctx con
 	if err != nil || !first.Rebind.RollbackAllowed || !gatewayRebindTypedPrecommitServingSnapshotMatches(attempt, first) {
 		return invalid()
 	}
-	ownedSQL, err := d.manager.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(ctx)
+	ownedSQL, err := snapshotRepository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || !reflect.DeepEqual(first.Rebind, ownedSQL) {
 		return invalid()
 	}
@@ -117,6 +122,19 @@ func (d gatewayRebindTypedHandoverRuntime) authorizedRollbackPredecessor(ctx con
 		return invalid()
 	}
 	return predecessor, nil
+}
+
+func (d gatewayRebindTypedHandoverRuntime) typedBoundaryRepository() (
+	gatewayRebindTypedBoundaryRepository, bool,
+) {
+	if d.repository != nil {
+		return d.repository, true
+	}
+	if d.manager == nil {
+		return nil, false
+	}
+	repository, ok := d.manager.options.RebindCurrentStateRepository.(gatewayRebindTypedBoundaryRepository)
+	return repository, ok
 }
 
 type gatewayRebindRollbackPredecessorReader func(context.Context) (

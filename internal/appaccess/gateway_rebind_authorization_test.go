@@ -82,6 +82,57 @@ func TestGatewayRebindReconcileAuthorizationA0BindsPreviewAndAudit(t *testing.T)
 	assertGatewayRebindReconcileAuditCount(t, fixture, 2)
 }
 
+func TestGatewayRebindCheckpointTerminalRecoveryPolicy(t *testing.T) {
+	fixture, claim := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+	snapshot := gatewayRebindAuthorizationSnapshot(t, fixture)
+	receipt := strings.Repeat("7", 64)
+	trusted := gatewayRebindA0TrustedSnapshot(claim)
+	trusted.Protected.Presence = GatewayRebindProtectedEvidenceCheckpointTerminal
+	trusted.Protected.FixedDisposition = GatewayRebindDispositionAbort
+	trusted.Protected.TerminalReceiptDigest = receipt
+	review, err := BuildGatewayRebindReconcileReview(snapshot, trusted, testAdministrator)
+	if err != nil || review.Snapshot.Policy != GatewayRebindRecoveryRollbackOnly ||
+		review.Snapshot.Trusted.Protected != trusted.Protected ||
+		ValidateGatewayRebindReconcileReview(review, testAdministrator) != nil {
+		t.Fatalf("checkpoint-terminal review=%#v error=%v", review, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*GatewayRebindTrustedRecoverySnapshot)
+	}{
+		{"intent digest", func(v *GatewayRebindTrustedRecoverySnapshot) { v.Protected.IntentDigest = strings.Repeat("1", 64) }},
+		{"record sequence", func(v *GatewayRebindTrustedRecoverySnapshot) { v.Protected.RecordSequence = 1 }},
+		{"record digest", func(v *GatewayRebindTrustedRecoverySnapshot) { v.Protected.RecordDigest = strings.Repeat("2", 64) }},
+		{"commit disposition", func(v *GatewayRebindTrustedRecoverySnapshot) {
+			v.Protected.FixedDisposition = GatewayRebindDispositionCommit
+		}},
+		{"missing receipt", func(v *GatewayRebindTrustedRecoverySnapshot) { v.Protected.TerminalReceiptDigest = "" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := trusted
+			test.mutate(&invalid)
+			if _, err := BuildGatewayRebindReconcileReview(snapshot, invalid,
+				testAdministrator); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("malformed checkpoint terminal error=%v", err)
+			}
+		})
+	}
+
+	t.Run("later SQL phase", func(t *testing.T) {
+		if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(),
+			gatewayRebindProofForClaimV2(t, claim, GatewayRebindPrepared, 1,
+				GatewayRebindSuccessorReady, receipt, nil)); err != nil {
+			t.Fatal(err)
+		}
+		later := gatewayRebindAuthorizationSnapshot(t, fixture)
+		if _, err := BuildGatewayRebindReconcileReview(later, trusted,
+			testAdministrator); !errors.Is(err, ErrConflict) {
+			t.Fatalf("later SQL phase checkpoint terminal error=%v", err)
+		}
+	})
+}
+
 func TestGatewayRebindReconcileAuthorizationRejectsWithoutAudit(t *testing.T) {
 	tests := []struct {
 		name string

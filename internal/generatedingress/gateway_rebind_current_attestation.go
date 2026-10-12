@@ -17,19 +17,31 @@ func (m *Manager) attestGatewayRebindCurrentLocked(ctx context.Context, selectio
 func (m *Manager) attestGatewayRebindCurrentWithSessionLocked(ctx context.Context, selection gatewayCurrentSelection,
 	forwardSessionGuard gatewayRebindForwardSessionGuard,
 ) (string, error) {
+	if m == nil {
+		return "", newGatewayCurrentAttestationError(ctx, gatewayCurrentAttestationCheckpointManagerPrecondition)
+	}
+	repository, ok := m.options.RebindCurrentStateRepository.(gatewayRebindTypedBoundaryRepository)
+	if !ok {
+		return "", newGatewayCurrentAttestationError(ctx, gatewayCurrentAttestationCheckpointManagerAuthority)
+	}
+	return m.attestGatewayRebindCurrentWithRepositoryAndSessionLocked(ctx, selection, repository,
+		forwardSessionGuard)
+}
+
+func (m *Manager) attestGatewayRebindCurrentWithRepositoryAndSessionLocked(ctx context.Context,
+	selection gatewayCurrentSelection, repository gatewayRebindTypedBoundaryRepository,
+	forwardSessionGuard gatewayRebindForwardSessionGuard,
+) (string, error) {
 	invalid := func(checkpoint gatewayCurrentAttestationCheckpoint) (string, error) {
 		return "", newGatewayCurrentAttestationError(ctx, checkpoint)
 	}
 	invalidFrom := func(err error, checkpoint gatewayCurrentAttestationCheckpoint) (string, error) {
 		return "", gatewayCurrentAttestationErrorFrom(ctx, err, checkpoint)
 	}
-	if m == nil || ctx == nil || ctx.Err() != nil || selection.Kind != gatewayCurrentSelectionRebind ||
+	if m == nil || ctx == nil || ctx.Err() != nil || repository == nil ||
+		selection.Kind != gatewayCurrentSelectionRebind ||
 		selection.State == nil || selection.Store == nil || m.gatewayRebindFailStopLatch().Load() {
 		return invalid(gatewayCurrentAttestationCheckpointManagerPrecondition)
-	}
-	repository, ok := m.options.RebindCurrentStateRepository.(GatewayCurrentServingStartupRepository)
-	if !ok {
-		return invalid(gatewayCurrentAttestationCheckpointManagerAuthority)
 	}
 	snapshot, err := repository.HostingGatewayStartupSnapshot(ctx)
 	if err != nil {
@@ -110,7 +122,7 @@ func (m *Manager) attestGatewayRebindCurrentWithSessionLocked(ctx context.Contex
 		}
 		if active {
 			boundary, boundaryErr := (managerGatewayRebindCrossStoreDriver{
-				manager: m, forwardSessionGuard: forwardSessionGuard,
+				manager: m, repository: repository, forwardSessionGuard: forwardSessionGuard,
 			}).readGatewayRebindTypedForwardBoundaryLocked(proofCtx, request)
 			if boundaryErr != nil || !sameGatewayCurrentSelection(selection, boundary.Selection) ||
 				!sameGatewayRebindCurrentHistory(history, boundary.History) {

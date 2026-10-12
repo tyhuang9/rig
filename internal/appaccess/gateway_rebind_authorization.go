@@ -25,14 +25,17 @@ const (
 type GatewayRebindProtectedEvidencePresence string
 
 const (
-	GatewayRebindProtectedEvidenceAbsent  GatewayRebindProtectedEvidencePresence = "validated_absent"
-	GatewayRebindProtectedEvidencePresent GatewayRebindProtectedEvidencePresence = "validated_present"
+	GatewayRebindProtectedEvidenceAbsent             GatewayRebindProtectedEvidencePresence = "validated_absent"
+	GatewayRebindProtectedEvidencePresent            GatewayRebindProtectedEvidencePresence = "validated_present"
+	GatewayRebindProtectedEvidenceCheckpointTerminal GatewayRebindProtectedEvidencePresence = "validated_checkpoint_terminal"
 )
 
 // GatewayRebindProtectedRecoveryEvidence is a projection supplied only after
 // generated ingress has validated the complete protected scan. Validated
-// absence means that the scan contained no intent or progress for this exact
-// operation; it is not proof that no Docker or filesystem effect exists.
+// absence means that the scan contained no intent, progress, or terminal for
+// this exact operation; it is not proof that no Docker or filesystem effect
+// exists. A checkpoint terminal binds an exact no-intent abort receipt without
+// pretending that an intent or progress record existed.
 type GatewayRebindProtectedRecoveryEvidence struct {
 	Presence              GatewayRebindProtectedEvidencePresence `json:"presence"`
 	OperationID           string                                 `json:"operationId"`
@@ -131,6 +134,105 @@ func BuildGatewayRebindReconcileReview(snapshot GatewayRebindRecoverySnapshot,
 		Snapshot: canonical, RecoveryDigest: recoveryDigest,
 		RecoveryApprovalDigest: approvalDigest,
 	}, nil
+}
+
+// GatewayRebindRecoveryPolicyForSnapshot derives the canonical policy without
+// creating actor consent. It applies the same SQL/trusted-evidence validation
+// as BuildGatewayRebindReconcileReview.
+func GatewayRebindRecoveryPolicyForSnapshot(snapshot GatewayRebindRecoverySnapshot,
+	trusted GatewayRebindTrustedRecoverySnapshot,
+) (GatewayRebindRecoveryPolicy, error) {
+	canonical, err := buildGatewayRebindReconcileSnapshot(snapshot, trusted)
+	if err != nil {
+		return "", err
+	}
+	return canonical.Policy, nil
+}
+
+// ValidateGatewayRebindReconcileReview checks the canonical review and its
+// actor-bound digests without granting SQL, protected-state, Docker, or effect
+// authority. Callers still have to rebuild and authorize the review from fresh
+// evidence at the mutation boundary.
+func ValidateGatewayRebindReconcileReview(review GatewayRebindReconcileReview, actorID string) error {
+	snapshot := review.Snapshot
+	if !validUUID(actorID) || snapshot.Version != GatewayRebindReconcileVersionV1 ||
+		snapshot.Purpose != GatewayRebindReconcilePurpose ||
+		!validUUID(snapshot.Claim.Spec.OperationID) || !validDigest(review.RecoveryDigest) ||
+		!validDigest(review.RecoveryApprovalDigest) || snapshot.CurrentProfile == nil ||
+		snapshot.CurrentSource == nil || !validGatewayRebindProtectedEvidence(snapshot.Trusted.Protected) ||
+		!validGatewayCurrentLineageRef(snapshot.Trusted.SelectedCurrent.Lineage) ||
+		!validDigest(snapshot.Trusted.SelectedCurrent.StateDigest) ||
+		gatewayRebindCurrentAuthorityProjection(snapshot.Trusted.SelectedCurrent.Lineage) != *snapshot.CurrentSource {
+		return ErrInvalidStoredState
+	}
+	profileDigest, err := GatewayProfileSpecDigest(snapshot.CurrentProfile.Spec)
+	if err != nil || !validUUID(snapshot.CurrentProfile.ID) || snapshot.CurrentProfile.RevisionNumber <= 0 ||
+		!validUUID(snapshot.CurrentProfile.OperationID) || profileDigest != snapshot.CurrentProfile.SpecDigest ||
+		snapshot.CurrentProfile.ID != snapshot.CurrentSource.ProfileRevisionID ||
+		snapshot.CurrentProfile.RevisionNumber != snapshot.CurrentSource.ProfileRevisionNumber ||
+		snapshot.CurrentProfile.SpecDigest != snapshot.CurrentSource.ProfileSpecDigest {
+		return ErrInvalidStoredState
+	}
+	claim := snapshot.Claim
+	specDigest, err := GatewayRebindSpecV2Digest(claim.Spec)
+	successorProfileDigest, successorProfileErr := GatewayProfileSpecDigest(claim.Spec.SuccessorProfile)
+	requestDigest, requestErr := gatewayRebindClaimV2RequestDigest(claim.Spec,
+		claim.RebindApproval, claim.ConfigureApproval)
+	if err != nil || successorProfileErr != nil || requestErr != nil || requestDigest != claim.RequestDigest ||
+		claim.RebindApproval.Action != ActionRebindGateway || claim.RebindApproval.SpecDigest != specDigest ||
+		claim.ConfigureApproval.Action != ActionConfigureGateway ||
+		claim.ConfigureApproval.SpecDigest != successorProfileDigest ||
+		!validUUID(claim.RebindApproval.ActorID) || !validUUID(claim.ConfigureApproval.ActorID) ||
+		!validGatewayRebindState(claim.State) || claim.StateSequence < 1 ||
+		claim.UpdatedAt.Before(claim.CreatedAt) {
+		return ErrInvalidStoredState
+	}
+	if snapshot.DatabaseCommittedEvent != nil &&
+		(snapshot.DatabaseCommittedEvent.OperationID != claim.Spec.OperationID ||
+			snapshot.DatabaseCommittedEvent.State != GatewayRebindDatabaseCommitted ||
+			snapshot.DatabaseCommittedEvent.Sequence <= 0 ||
+			snapshot.DatabaseCommittedEvent.Sequence > claim.StateSequence) {
+		return ErrInvalidStoredState
+	}
+	if snapshot.RetainedCommand != nil &&
+		(snapshot.RetainedCommand.OperationID != claim.Spec.OperationID ||
+			snapshot.RetainedCommand.Sequence <= 0 || !validDigest(snapshot.RetainedCommand.CommandDigest) ||
+			snapshot.RetainedCommand.TerminalDisposition == GatewayRebindDispositionNone ||
+			!validDigest(snapshot.RetainedCommand.TerminalReceiptDigest)) {
+		return ErrInvalidStoredState
+	}
+	active := GatewayRebindHistoryEntry{Claim: GatewayRebindClaimRecord{
+		SpecVersion: GatewayRebindSpecVersionV2, V2: &claim,
+	}}
+	rollbackAllowed := snapshot.DatabaseCommittedEvent == nil &&
+		(snapshot.RetainedCommand == nil ||
+			snapshot.RetainedCommand.TerminalDisposition != GatewayRebindDispositionCommit)
+	recovery := GatewayRebindRecoverySnapshot{
+		Active: &active, CurrentSource: snapshot.CurrentSource,
+		DatabaseCommittedEvent: cloneGatewayRebindEvent(snapshot.DatabaseCommittedEvent),
+		Phase:                  claim.State, DatabaseCommitObserved: snapshot.DatabaseCommittedEvent != nil,
+		RollbackAllowed: rollbackAllowed,
+	}
+	canonicalPolicy, policyErr := gatewayRebindRecoveryPolicy(recovery,
+		snapshot.RetainedCommand, snapshot.Trusted)
+	switch snapshot.Policy {
+	case GatewayRebindRecoveryEvidenceDecides, GatewayRebindRecoveryForwardOnly,
+		GatewayRebindRecoveryRollbackOnly:
+	default:
+		return ErrInvalidStoredState
+	}
+	if policyErr != nil || canonicalPolicy != snapshot.Policy {
+		return ErrInvalidStoredState
+	}
+	computed, err := digestJSON(snapshot)
+	if err != nil || computed != review.RecoveryDigest {
+		return ErrInvalidStoredState
+	}
+	approval, err := gatewayRebindRecoveryApprovalDigest(snapshot, computed, actorID)
+	if err != nil || approval != review.RecoveryApprovalDigest {
+		return ErrInvalidStoredState
+	}
+	return nil
 }
 
 // AuthorizeAndAuditGatewayRebindReconcile revalidates the exact SQL snapshot,
@@ -323,6 +425,11 @@ func gatewayRebindRecoveryPolicy(snapshot GatewayRebindRecoverySnapshot,
 		(snapshot.Phase != GatewayRebindPrepared || snapshot.DatabaseCommitObserved || retained != nil) {
 		return "", ErrConflict
 	}
+	if protected.Presence == GatewayRebindProtectedEvidenceCheckpointTerminal &&
+		(snapshot.Phase != GatewayRebindPrepared || snapshot.DatabaseCommitObserved ||
+			!snapshot.RollbackAllowed) {
+		return "", ErrConflict
+	}
 
 	retainedDisposition, retainedReceipt := GatewayRebindDispositionNone, ""
 	if retained != nil {
@@ -380,6 +487,10 @@ func validGatewayRebindProtectedEvidence(value GatewayRebindProtectedRecoveryEvi
 		default:
 			return false
 		}
+	case GatewayRebindProtectedEvidenceCheckpointTerminal:
+		return value.IntentDigest == "" && value.RecordSequence == 0 && value.RecordDigest == "" &&
+			value.FixedDisposition == GatewayRebindDispositionAbort &&
+			validDigest(value.TerminalReceiptDigest)
 	default:
 		return false
 	}

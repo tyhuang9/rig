@@ -32,7 +32,7 @@ func (d managerGatewayRebindCrossStoreDriver) restoreCompletedServingLocked(ctx 
 		(request.Terminal != nil && !gatewayRebindPhysicalMatchesTerminal(result, *request.Terminal)) {
 		return invalid()
 	}
-	repository, ok := d.manager.options.RebindCurrentStateRepository.(GatewayCurrentServingStartupRepository)
+	repository, ok := d.typedBoundaryRepository()
 	if !ok {
 		return invalid()
 	}

@@ -679,3 +679,136 @@ and physical second-device LAN qualification remain incomplete. These are
 required follow-on implementation and acceptance work, not inferred passes
 from this dormant checkpoint. Rollback of this unactivated code does not remove
 retained SQL/audit/protected history.
+
+## Dormant operation recovery checkpoint
+
+This checkpoint adds private controller handlers for operation status, recovery
+review and reconciliation, backed by separate generated-ingress read and
+recovery capabilities. The recovery repository cannot create a claim. The
+handlers remain absent from production route registration and hostd factory
+assembly; their presence does not open the production wiring gate above.
+
+GET status rechecks the original administrator session before disclosure.
+Recovery preview and reconcile additionally require the original request's
+CSRF proof. Status distinguishes actual SQL phase from the latest validated
+protected progress phase, historical completion from selected current
+authority, and verified absence from unavailable evidence. Only a successful
+complete-history absence check maps to 404. Raw repository not-found errors
+remain unavailable. Pristine installation absence additionally requires exact
+empty SQL, a complete read-only protected-file census, canonical empty route
+state and a clear fence, all stable across repeated reads. Partial, unknown or
+corrupt artifacts remain unavailable; the effect-authority history scanner
+keeps its predecessor requirement. Responses omit audit capabilities, raw SQL
+events, protected paths and bytes, Docker state, and session material.
+
+Executable recovery review holds the deployment effects lease before the
+gateway locks. Its canonical consent binds the actual claim, roster, runtime
+heads, protected scan, selected current evidence, actor and derived policy.
+Reconcile recomputes that review under the same lock order, uses the existing
+transactional authorization audit, and repeats the complete review and live
+session checks before dispatch. An audit row records attempted consent; it
+cannot authorize an effect or a later request by itself. Physical boundaries
+use the repository supplied to that invocation.
+
+Stored `unresolved` is retained as the actual phase. A fixed pre-DB commit
+prefix follows the existing successor-ready transition; a fixed pre-DB abort
+follows rollback. A retained DB-commit event permits only forward completion.
+Unfixed or contradictory unresolved evidence has no executable action. A
+validated checkpoint-only no-effect abort has an explicit canonical evidence
+case: no invented intent or progress, exact generation and scan/receipt
+digests, and abort disposition only. Its exact checkpoint, receipt and
+no-effect ownership are revalidated before completing terminal SQL.
+
+Newly requested physical rollback checks the live request and original
+approvers before its directional start. Existing mandatory compensation,
+retained terminal completion and exact-owned safety withdrawal retain their
+independent safeguards after request expiry. Recovery does not clear process
+latches, reverse committed transfers, rewrite immutable history or replace a
+claim or its original approvals. A successful reconcile response requires an
+inactive terminal operation, matching protected and SQL receipts, the
+policy-consistent disposition, released operation fence, and fresh qualified
+terminal and current proofs.
+
+### HTTP acceptance assembly and verification status
+
+Local controller tests explicitly assemble the dormant handlers with real
+authentication, SQLite, the repository and Manager for exact absence and
+refusal paths. Mock-runtime handler tests separately cover curated response
+and authorization boundaries. Neither is a positive physical recovery gate.
+
+`TestLiveGatewayRebindControllerRecoveryCommitAndReplay` reuses the existing
+disposable GI Docker fixture. Its parent compiles and discovers one exact
+controller child before creating resources, retains the real prepared P1
+prefix, and owns cleanup. The child consumes only the parent's private
+ephemeral fixture manifest and uses real authentication, HTTP, repository,
+Manager and Docker execution. It exercises recovery preview, refused altered
+consent, forward reconciliation, terminal reads and stale-request refusal.
+The parent checks terminal SQL/protected state, retained prefixes, grants,
+runtime heads and both routes, then the existing independent cleanup census.
+This is a controlled test protocol, not an external prepared-state interface.
+The child emits only finite markers immediately before its HTTP calls. On
+failure, the parent reports the last recognized attempted stage and suppresses
+raw child output; that marker does not identify the refusing predicate or
+prove that an HTTP call completed.
+
+The live parent is selected explicitly by the Docker workflow, including its
+separate opt-in and exact RUN/PASS/no-skip checks. Actual Docker execution is
+unrun locally. It remains an acceptance requirement on the exact candidate;
+the parent/child source does not establish full-controller kill/reap coverage
+at A0 or later boundaries, production assembly, or second-device LAN access.
+
+### Local verification and limits
+
+The final focused Go 1.26.7 Linux execution passed all 13 selected parents and
+86 descendants, with every expected RUN/PASS present once and no failures or
+skips. Compilation, discovery and execution completed in 8.594 s, 3.968 s and
+157.625 s. All 925 Go/SQL/module inputs and the compiled binary stayed unchanged
+(`recovery-flow-final-wsl.result.json`). This is actual WSL execution of the
+cross-compiled Linux binary, without race instrumentation; it is not a Docker
+run. The unchanged CI selector places eight parents in `rebind-history`, the
+literal unresolved physical replay parent in `rebind-typed-completed`, and the
+four pure validator parents in `ingress-remainder`.
+
+The audited component gate includes prepared commit, fixed abort, and literal
+unresolved commit before and after the immutable DB-commit event. Each positive
+requires exactly one audit, the actual shared coordinator, the expected terminal
+SQL state and disposition, released fence, and validated current and terminal
+proofs. Managed physical readers use controlled command/probe transport; no
+successful proof or response is fabricated. Adjacent controls cover invocation
+repository drift, post-audit drift/session loss, missing dependencies, actual
+effects-lease contention, original approval revocation, canonical claim/roster/
+runtime-head binding, pristine absence, and truthful unresolved direction.
+
+A meaningful two-case RED first showed that cached commit and abort replay
+refused literal pre-DB `unresolved`. The only input changed for its GREEN was
+the precommit authority predicate's phase allowlist; every existing DB-event,
+claim, approval, current-source and serving-census predicate remains. Both cases
+then passed with unchanged unresolved SQL and no new effects
+(`recovery-unresolved-physical-red-wsl.result.json` and
+`recovery-unresolved-physical-green-wsl.result.json`). Refusal-side owned safety
+withdrawal in the RED is retained as failed-run evidence.
+
+Separate retained gates passed six appaccess parents/51 descendants natively
+and 20 controller parents/99 descendants in WSL, including the real initialized
+empty-state HTTP path. Their receipts are
+`recovery-authority-first-native.result.json` and
+`recovery-handlers-final-wsl.result.json`. Final canonical formatting passed for
+35 Go files; diff check, scoped vet for appaccess/controller/generatedingress,
+and all four CLI builds passed with the same 925 unchanged inputs
+(`recovery-flow-static-native.result.json`; vet 69.750 s, builds 66.157 s).
+
+Earlier compile, fixture, environment and behavioral failures remain in their
+original receipts. These include the native fixture ACL failure, the initial
+empty-state projection refusal, the active disposition omission, and the
+path-specific single-file versus directory archive mismatch in the controlled
+runtime fixture. Temporary finite diagnostic markers were removed before clean
+verification. Missing marker output did not prove non-entry, and a zero failed
+response did not prove the retained SQL phase. The decisive runtime trace and
+subsequent passing managed-component run supersede those early inferences.
+
+Documentation workflow, build and accessibility results are retained separately
+against this frozen page. The earlier checkpoint results above remain evidence
+only for their recorded source. Actual Docker HTTP recovery and cleanup, hosted
+race acceptance, production hostd assembly, the full supported-controller crash
+matrix and physical second-device LAN qualification remain required and unrun
+for this local checkpoint. None is inferred from local component success.

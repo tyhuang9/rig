@@ -20,6 +20,11 @@ type gatewayRebindTypedRuntimeHeadsRepository interface {
 	GatewayRebindRuntimeHeads(context.Context) ([]appaccess.GatewayRebindRuntimeHead, error)
 }
 
+type gatewayRebindTypedBoundaryRepository interface {
+	GatewayCurrentServingStartupRepository
+	gatewayRebindTypedRuntimeHeadsRepository
+}
+
 type gatewayRebindForwardSessionGuard func(context.Context) error
 
 // readGatewayRebindTypedForwardBoundaryLocked composes request-scoped session
@@ -39,7 +44,11 @@ func (d managerGatewayRebindCrossStoreDriver) readGatewayRebindTypedForwardBound
 			return invalid()
 		}
 	}
-	boundary, err := d.manager.readGatewayRebindTypedForwardBoundaryLocked(ctx, request)
+	repository, ok := d.typedBoundaryRepository()
+	if !ok {
+		return invalid()
+	}
+	boundary, err := d.manager.readGatewayRebindTypedForwardBoundaryWithRepositoryLocked(ctx, repository, request)
 	if err != nil {
 		return invalid()
 	}
@@ -63,8 +72,21 @@ func (m *Manager) readGatewayRebindTypedForwardBoundaryLocked(ctx context.Contex
 	if m == nil || ctx == nil || ctx.Err() != nil || !validGatewayRebindPhysicalReconcileRequest(request) {
 		return invalid()
 	}
-	repository, ok := m.options.RebindCurrentStateRepository.(GatewayCurrentServingStartupRepository)
+	repository, ok := m.options.RebindCurrentStateRepository.(gatewayRebindTypedBoundaryRepository)
 	if !ok {
+		return invalid()
+	}
+	return m.readGatewayRebindTypedForwardBoundaryWithRepositoryLocked(ctx, repository, request)
+}
+
+func (m *Manager) readGatewayRebindTypedForwardBoundaryWithRepositoryLocked(ctx context.Context,
+	repository gatewayRebindTypedBoundaryRepository, request gatewayRebindPhysicalReconcileRequest,
+) (gatewayRebindTypedAttemptBoundary, error) {
+	invalid := func() (gatewayRebindTypedAttemptBoundary, error) {
+		return gatewayRebindTypedAttemptBoundary{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	if m == nil || ctx == nil || ctx.Err() != nil || repository == nil ||
+		!validGatewayRebindPhysicalReconcileRequest(request) {
 		return invalid()
 	}
 	first, err := repository.HostingGatewayStartupSnapshot(ctx)
@@ -73,7 +95,7 @@ func (m *Manager) readGatewayRebindTypedForwardBoundaryLocked(ctx context.Contex
 		!gatewayRebindTypedRosterApprovalsCurrent(request.Attempt, first.Grants) {
 		return invalid()
 	}
-	boundary, err := m.readGatewayRebindTypedAttemptBoundaryLocked(ctx, request)
+	boundary, err := m.readGatewayRebindTypedAttemptBoundaryWithRepositoryLocked(ctx, repository, request)
 	if err != nil || !reflect.DeepEqual(first.Rebind, boundary.Snapshot) ||
 		!sameGatewayRebindRuntimeHeads(first.RuntimeHeads, request.Attempt.Intent.RuntimeHeads) {
 		return invalid()
@@ -131,16 +153,32 @@ func (m *Manager) readGatewayRebindTypedAttemptBoundaryLocked(ctx context.Contex
 		m.options.RebindCurrentStateRepository == nil {
 		return invalid()
 	}
-	repository := m.options.RebindCurrentStateRepository
-	headsRepository, ok := repository.(gatewayRebindTypedRuntimeHeadsRepository)
+	repository, ok := m.options.RebindCurrentStateRepository.(gatewayRebindTypedBoundaryRepository)
 	if !ok {
 		return invalid()
 	}
-	first, err := repository.GatewayRebindRecoverySnapshot(ctx)
+	return m.readGatewayRebindTypedAttemptBoundaryWithRepositoryLocked(ctx, repository, request)
+}
+
+func (m *Manager) readGatewayRebindTypedAttemptBoundaryWithRepositoryLocked(ctx context.Context,
+	repository gatewayRebindTypedBoundaryRepository, request gatewayRebindPhysicalReconcileRequest,
+) (gatewayRebindTypedAttemptBoundary, error) {
+	invalid := func() (gatewayRebindTypedAttemptBoundary, error) {
+		return gatewayRebindTypedAttemptBoundary{}, errors.New("generated ingress typed rebind effect authority changed")
+	}
+	if m == nil || ctx == nil || ctx.Err() != nil || repository == nil ||
+		!validGatewayRebindPhysicalReconcileRequest(request) {
+		return invalid()
+	}
+	snapshotRepository, ok := repository.(GatewayRebindCurrentStateRepository)
+	if !ok {
+		return invalid()
+	}
+	first, err := snapshotRepository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || !gatewayRebindTypedSnapshotMatchesRequest(first, request) {
 		return invalid()
 	}
-	firstHeads, err := headsRepository.GatewayRebindRuntimeHeads(ctx)
+	firstHeads, err := repository.GatewayRebindRuntimeHeads(ctx)
 	if err != nil || !sameGatewayRebindRuntimeHeads(firstHeads, request.Attempt.Intent.RuntimeHeads) {
 		return invalid()
 	}
@@ -160,11 +198,11 @@ func (m *Manager) readGatewayRebindTypedAttemptBoundaryLocked(ctx context.Contex
 	if err != nil {
 		return invalid()
 	}
-	second, err := repository.GatewayRebindRecoverySnapshot(ctx)
+	second, err := snapshotRepository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || !reflect.DeepEqual(first, second) || ctx.Err() != nil {
 		return invalid()
 	}
-	secondHeads, err := headsRepository.GatewayRebindRuntimeHeads(ctx)
+	secondHeads, err := repository.GatewayRebindRuntimeHeads(ctx)
 	if err != nil || !sameGatewayRebindRuntimeHeads(firstHeads, secondHeads) {
 		return invalid()
 	}
@@ -178,6 +216,29 @@ func (m *Manager) readGatewayRebindTypedAttemptBoundaryLocked(ctx context.Contex
 	}
 	return gatewayRebindTypedAttemptBoundary{Snapshot: first, Selection: selection,
 		History: history, Progress: progress}, nil
+}
+
+func (d managerGatewayRebindCrossStoreDriver) typedBoundaryRepository() (
+	gatewayRebindTypedBoundaryRepository, bool,
+) {
+	if d.repository != nil {
+		return d.repository, true
+	}
+	if d.manager == nil {
+		return nil, false
+	}
+	repository, ok := d.manager.options.RebindCurrentStateRepository.(gatewayRebindTypedBoundaryRepository)
+	return repository, ok
+}
+
+func (d managerGatewayRebindCrossStoreDriver) readGatewayRebindTypedAttemptBoundaryLocked(ctx context.Context,
+	request gatewayRebindPhysicalReconcileRequest,
+) (gatewayRebindTypedAttemptBoundary, error) {
+	repository, ok := d.typedBoundaryRepository()
+	if !ok {
+		return gatewayRebindTypedAttemptBoundary{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	return d.manager.readGatewayRebindTypedAttemptBoundaryWithRepositoryLocked(ctx, repository, request)
 }
 
 func gatewayRebindTypedSelectedLineage(request gatewayRebindPhysicalReconcileRequest) (appaccess.GatewayCurrentLineageRef, error) {

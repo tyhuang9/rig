@@ -2,6 +2,7 @@ package generatedingress
 
 import (
 	"context"
+	"errors"
 	"reflect"
 
 	"github.com/hostd/hostd/internal/appaccess"
@@ -14,6 +15,10 @@ type gatewayRebindCommitCurrentProof struct {
 
 type gatewayRebindCommitPredecessorReader func(context.Context, gatewayCurrentSelection) (
 	gatewayRebindAdmissionPredecessorProof, error)
+
+type gatewayRebindCommitCurrentProofRepository interface {
+	GatewayCurrentServingStartupRepository
+}
 
 // Caller holds the effects lease and both gateway locks. This proves the
 // selected physical state against the complete current SQL census. It neither
@@ -28,6 +33,30 @@ func (m *Manager) readGatewayRebindCommitCurrentProofLocked(ctx context.Context,
 	}
 	return m.readGatewayRebindCommitCurrentProofWithInspectLocked(ctx, repository, snapshot,
 		liveSession, m.inspectGatewayRebindDocker)
+}
+
+func (m *Manager) readGatewayRebindRecoveryCurrentProofLocked(ctx context.Context,
+	repository GatewayRebindRecoveryReadRepository, snapshot appaccess.GatewayRebindRecoverySnapshot,
+	liveSession func(context.Context) error,
+) (gatewayRebindCommitCurrentProof, error) {
+	if m == nil || repository == nil {
+		return gatewayRebindCommitCurrentProof{}, gatewayRebindProposalError(ctx)
+	}
+	activeOperationID := ""
+	if snapshot.Active != nil {
+		if snapshot.Active.Claim.SpecVersion != appaccess.GatewayRebindSpecVersionV2 ||
+			snapshot.Active.Claim.Legacy != nil || snapshot.Active.Claim.V2 == nil {
+			return gatewayRebindCommitCurrentProof{}, gatewayRebindProposalError(ctx)
+		}
+		activeOperationID = snapshot.Active.Claim.V2.Spec.OperationID
+	}
+	return m.readGatewayRebindCurrentProofWithPredecessorLocked(ctx, repository, snapshot,
+		liveSession, func(readCtx context.Context, selection gatewayCurrentSelection) (
+			gatewayRebindAdmissionPredecessorProof, error,
+		) {
+			return m.readGatewayRebindAdmissionPredecessorWithInspectLocked(readCtx, selection,
+				m.inspectGatewayRebindDocker)
+		}, activeOperationID)
 }
 
 func (m *Manager) readGatewayRebindCommitCurrentProofWithInspectLocked(ctx context.Context,
@@ -46,28 +75,35 @@ func (m *Manager) readGatewayRebindCommitCurrentProofWithInspectLocked(ctx conte
 }
 
 func (m *Manager) readGatewayRebindCommitCurrentProofWithPredecessorLocked(ctx context.Context,
-	repository GatewayRebindCommitRepository, snapshot appaccess.GatewayRebindRecoverySnapshot,
+	repository gatewayRebindCommitCurrentProofRepository, snapshot appaccess.GatewayRebindRecoverySnapshot,
 	liveSession func(context.Context) error, predecessor gatewayRebindCommitPredecessorReader,
+) (gatewayRebindCommitCurrentProof, error) {
+	return m.readGatewayRebindCurrentProofWithPredecessorLocked(ctx, repository, snapshot,
+		liveSession, predecessor, "")
+}
+
+func (m *Manager) readGatewayRebindCurrentProofWithPredecessorLocked(ctx context.Context,
+	repository gatewayRebindCommitCurrentProofRepository, snapshot appaccess.GatewayRebindRecoverySnapshot,
+	liveSession func(context.Context) error, predecessor gatewayRebindCommitPredecessorReader,
+	recoveryOperationID string,
 ) (gatewayRebindCommitCurrentProof, error) {
 	invalid := func() (gatewayRebindCommitCurrentProof, error) {
 		return gatewayRebindCommitCurrentProof{}, gatewayRebindProposalError(ctx)
 	}
 	if m == nil || ctx == nil || ctx.Err() != nil || repository == nil || liveSession == nil ||
-		predecessor == nil || !gatewayCurrentRouteMutationSnapshotReady(snapshot) ||
+		predecessor == nil || !gatewayRebindCurrentProofSnapshotReady(snapshot, recoveryOperationID) ||
 		snapshot.CurrentSource == nil || m.gatewayRebindFailStopLatch().Load() {
 		return invalid()
 	}
-	startup, ok := repository.(GatewayCurrentServingStartupRepository)
-	if !ok {
-		return invalid()
-	}
+	startup := repository
 	barrier := m.gatewayRebindCommitBarrierLatch().Load()
 	guard := func() error {
 		if err := checkGatewayRebindAdmissionSession(ctx, liveSession); err != nil {
 			return err
 		}
 		if m.gatewayRebindFailStopLatch().Load() || m.gatewayRebindCommitBarrierLatch().Load() != barrier ||
-			repository.CheckGatewayRebindFence(ctx) != nil || ctx.Err() != nil {
+			!gatewayRebindCurrentProofFenceMatches(repository.CheckGatewayRebindFence(ctx), recoveryOperationID) ||
+			ctx.Err() != nil {
 			return gatewayRebindProposalError(ctx)
 		}
 		return nil
@@ -86,7 +122,7 @@ func (m *Manager) readGatewayRebindCommitCurrentProofWithPredecessorLocked(ctx c
 	}
 	selection, err := m.selectGatewayCurrentLocked(ctx, snapshot)
 	if err != nil || gatewayCurrentAuthority(selection.Lineage) != *snapshot.CurrentSource ||
-		!m.gatewayRebindCommitCurrentCensusMatchesLocked(ctx, selection, first) {
+		!m.gatewayRebindCurrentProofCensusMatchesLocked(ctx, selection, first, recoveryOperationID) {
 		return invalid()
 	}
 	if err := guard(); err != nil {
@@ -101,7 +137,7 @@ func (m *Manager) readGatewayRebindCommitCurrentProofWithPredecessorLocked(ctx c
 	// concurrent SQL writer cannot replace protected state after its last check.
 	second, err := startup.HostingGatewayStartupSnapshot(ctx)
 	if err != nil || !reflect.DeepEqual(first, second) ||
-		!m.gatewayRebindCommitCurrentCensusMatchesLocked(ctx, selection, second) {
+		!m.gatewayRebindCurrentProofCensusMatchesLocked(ctx, selection, second, recoveryOperationID) {
 		return invalid()
 	}
 	if err := guard(); err != nil {
@@ -115,13 +151,18 @@ func (m *Manager) readGatewayRebindCommitCurrentProofWithPredecessorLocked(ctx c
 		ctx.Err() != nil || m.gatewayRebindFailStopLatch().Load() || m.gatewayRebindCommitBarrierLatch().Load() != barrier {
 		return invalid()
 	}
+	purpose := "hostd/generated-ingress/rebind/commit-current-proof/v1"
+	if recoveryOperationID != "" {
+		purpose = "hostd/generated-ingress/rebind/recovery-current-proof/v1"
+	}
 	digest, err := canonicalDigest(struct {
-		Version  int                                     `json:"version"`
-		Purpose  string                                  `json:"purpose"`
-		Lineage  appaccess.GatewayCurrentLineageRef      `json:"lineage"`
-		Census   appaccess.HostingGatewayStartupSnapshot `json:"census"`
-		Physical gatewayRebindAdmissionPredecessorProof  `json:"physical"`
-	}{1, "hostd/generated-ingress/rebind/commit-current-proof/v1", selection.Lineage, first, physical})
+		Version             int                                     `json:"version"`
+		Purpose             string                                  `json:"purpose"`
+		RecoveryOperationID string                                  `json:"recoveryOperationId,omitempty"`
+		Lineage             appaccess.GatewayCurrentLineageRef      `json:"lineage"`
+		Census              appaccess.HostingGatewayStartupSnapshot `json:"census"`
+		Physical            gatewayRebindAdmissionPredecessorProof  `json:"physical"`
+	}{1, purpose, recoveryOperationID, selection.Lineage, first, physical})
 	if err != nil || !validSHA256(digest) || ctx.Err() != nil {
 		return invalid()
 	}
@@ -130,7 +171,7 @@ func (m *Manager) readGatewayRebindCommitCurrentProofWithPredecessorLocked(ctx c
 	// read without performing any recovery or changing either admission latch.
 	last, err := startup.HostingGatewayStartupSnapshot(ctx)
 	if err != nil || !reflect.DeepEqual(first, last) ||
-		!m.gatewayRebindCommitCurrentCensusMatchesLocked(ctx, selection, last) {
+		!m.gatewayRebindCurrentProofCensusMatchesLocked(ctx, selection, last, recoveryOperationID) {
 		return invalid()
 	}
 	if err := guard(); err != nil {
@@ -160,7 +201,50 @@ func clearGatewayRebindCommitCurrentPhysical(proof *gatewayRebindAdmissionPredec
 func (m *Manager) gatewayRebindCommitCurrentCensusMatchesLocked(ctx context.Context,
 	selection gatewayCurrentSelection, snapshot appaccess.HostingGatewayStartupSnapshot,
 ) bool {
-	if !gatewayCurrentRouteMutationSnapshotReady(snapshot.Rebind) {
+	return m.gatewayRebindCurrentProofCensusMatchesLocked(ctx, selection, snapshot, "")
+}
+
+func gatewayRebindCurrentProofSnapshotReady(snapshot appaccess.GatewayRebindRecoverySnapshot,
+	activeOperationID string,
+) bool {
+	if activeOperationID == "" {
+		return gatewayCurrentRouteMutationSnapshotReady(snapshot)
+	}
+	if !validCanonicalUUID(activeOperationID) || snapshot.Active == nil ||
+		snapshot.Active.Claim.SpecVersion != appaccess.GatewayRebindSpecVersionV2 ||
+		snapshot.Active.Claim.Legacy != nil || snapshot.Active.Claim.V2 == nil {
+		return false
+	}
+	claim := snapshot.Active.Claim.V2
+	if claim.Spec.OperationID != activeOperationID || !gatewayRebindCommitActiveState(claim.State) ||
+		snapshot.Phase != claim.State ||
+		snapshot.DatabaseCommitObserved != (snapshot.DatabaseCommittedEvent != nil) {
+		return false
+	}
+	switch claim.State {
+	case appaccess.GatewayRebindPrepared, appaccess.GatewayRebindSuccessorReady:
+		return !snapshot.DatabaseCommitObserved
+	case appaccess.GatewayRebindDatabaseCommitted:
+		return snapshot.DatabaseCommitObserved
+	case appaccess.GatewayRebindUnresolved:
+		return true
+	default:
+		return false
+	}
+}
+
+func gatewayRebindCurrentProofFenceMatches(err error, activeOperationID string) bool {
+	if activeOperationID == "" {
+		return err == nil
+	}
+	return errors.Is(err, appaccess.ErrGatewayRebindActive)
+}
+
+func (m *Manager) gatewayRebindCurrentProofCensusMatchesLocked(ctx context.Context,
+	selection gatewayCurrentSelection, snapshot appaccess.HostingGatewayStartupSnapshot,
+	activeOperationID string,
+) bool {
+	if !gatewayRebindCurrentProofSnapshotReady(snapshot.Rebind, activeOperationID) {
 		return false
 	}
 	routes, err := gatewayRebindProposalRoutes(selection)

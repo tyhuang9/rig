@@ -79,13 +79,17 @@ func validGatewayRebindPhysicalReconcileRequest(value gatewayRebindPhysicalRecon
 			!value.DatabaseCommitObserved && value.Terminal == nil
 	case gatewayRebindPhysicalReconcileForwardOnly:
 		return value.Terminal != nil && value.Terminal.Disposition == appaccess.GatewayRebindDispositionCommit &&
-			(value.SQLPhase == appaccess.GatewayRebindPrepared ||
+			((!value.DatabaseCommitObserved && (value.SQLPhase == appaccess.GatewayRebindPrepared ||
 				value.SQLPhase == appaccess.GatewayRebindSuccessorReady ||
-				(value.SQLPhase == appaccess.GatewayRebindDatabaseCommitted && value.DatabaseCommitObserved))
+				value.SQLPhase == appaccess.GatewayRebindUnresolved)) ||
+				(value.DatabaseCommitObserved && (value.SQLPhase == appaccess.GatewayRebindDatabaseCommitted ||
+					value.SQLPhase == appaccess.GatewayRebindUnresolved)))
 	case gatewayRebindPhysicalReconcileRollbackOnly:
 		return value.Terminal != nil && value.Terminal.Disposition == appaccess.GatewayRebindDispositionAbort &&
 			value.RollbackAllowed && !value.DatabaseCommitObserved &&
-			(value.SQLPhase == appaccess.GatewayRebindPrepared || value.SQLPhase == appaccess.GatewayRebindSuccessorReady)
+			(value.SQLPhase == appaccess.GatewayRebindPrepared ||
+				value.SQLPhase == appaccess.GatewayRebindSuccessorReady ||
+				value.SQLPhase == appaccess.GatewayRebindUnresolved)
 	default:
 		return false
 	}
