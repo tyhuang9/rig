@@ -13,9 +13,10 @@ import (
 // returning an error here keeps the private commit path fail closed until that
 // adapter has proved the complete physical sequence.
 type managerGatewayRebindCrossStoreDriver struct {
-	manager  *Manager
-	stage    gatewayRebindTypedStageDriver
-	handover gatewayRebindTypedHandoverDriver
+	manager             *Manager
+	stage               gatewayRebindTypedStageDriver
+	handover            gatewayRebindTypedHandoverDriver
+	forwardSessionGuard gatewayRebindForwardSessionGuard
 }
 
 func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorLocked(ctx context.Context,
@@ -164,13 +165,13 @@ func (d managerGatewayRebindCrossStoreDriver) reconcileSuccessorForwardLocked(ct
 	if stage == nil {
 		return gatewayRebindTypedPhysicalResult{}, errors.New("generated ingress typed physical rebind is unavailable")
 	}
-	boundary, err := d.manager.readGatewayRebindTypedForwardBoundaryLocked(ctx, request)
+	boundary, err := d.readGatewayRebindTypedForwardBoundaryLocked(ctx, request)
 	if err != nil {
 		return gatewayRebindTypedPhysicalResult{}, gatewayRebindEffectBoundaryError(ctx)
 	}
 	progress := append([]gatewayRebindProgressRecord(nil), boundary.Progress...)
 	guard := func(guardCtx context.Context) error {
-		fresh, guardErr := d.manager.readGatewayRebindTypedForwardBoundaryLocked(guardCtx, request)
+		fresh, guardErr := d.readGatewayRebindTypedForwardBoundaryLocked(guardCtx, request)
 		if guardErr != nil || !reflect.DeepEqual(progress, fresh.Progress) {
 			return gatewayRebindEffectBoundaryError(guardCtx)
 		}
@@ -384,5 +385,5 @@ func gatewayRebindTypedPhysicalResultFromProgress(last gatewayRebindProgressReco
 func (d managerGatewayRebindCrossStoreDriver) attestCommittedCurrentLocked(ctx context.Context,
 	selection gatewayCurrentSelection,
 ) (string, error) {
-	return d.manager.attestGatewayRebindCurrentLocked(ctx, selection)
+	return d.manager.attestGatewayRebindCurrentWithSessionLocked(ctx, selection, d.forwardSessionGuard)
 }

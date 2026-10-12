@@ -20,6 +20,37 @@ type gatewayRebindTypedRuntimeHeadsRepository interface {
 	GatewayRebindRuntimeHeads(context.Context) ([]appaccess.GatewayRebindRuntimeHead, error)
 }
 
+type gatewayRebindForwardSessionGuard func(context.Context) error
+
+// readGatewayRebindTypedForwardBoundaryLocked composes request-scoped session
+// authority around the existing SQL/protected forward boundary. A nil guard is
+// the startup/private path and preserves the underlying boundary unchanged.
+func (d managerGatewayRebindCrossStoreDriver) readGatewayRebindTypedForwardBoundaryLocked(ctx context.Context,
+	request gatewayRebindPhysicalReconcileRequest,
+) (gatewayRebindTypedAttemptBoundary, error) {
+	invalid := func() (gatewayRebindTypedAttemptBoundary, error) {
+		return gatewayRebindTypedAttemptBoundary{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	if d.manager == nil || ctx == nil || ctx.Err() != nil {
+		return invalid()
+	}
+	if d.forwardSessionGuard != nil {
+		if d.forwardSessionGuard(ctx) != nil || ctx.Err() != nil {
+			return invalid()
+		}
+	}
+	boundary, err := d.manager.readGatewayRebindTypedForwardBoundaryLocked(ctx, request)
+	if err != nil {
+		return invalid()
+	}
+	if d.forwardSessionGuard != nil {
+		if d.forwardSessionGuard(ctx) != nil || ctx.Err() != nil {
+			return invalid()
+		}
+	}
+	return boundary, nil
+}
+
 // Forward effects require current serving permission as well as retained
 // ownership. Keep this separate from the ownership boundary so revocation
 // cannot prevent stopping or removing an exactly owned resource.

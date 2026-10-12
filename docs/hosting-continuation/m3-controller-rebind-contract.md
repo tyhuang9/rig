@@ -1,11 +1,13 @@
 # M3 controller rebind admission and recovery contract
 
-Status: proposed implementation contract, documentation only. Source baseline:
+Status: contract with dormant implementation checkpoints; the supported
+controller flow and its acceptance gates remain incomplete. Source baseline:
 `cb83fa480c16eec33c8b38e9846ae421139bbce0`. This document resolves the
 controller request and recovery choice identified in the [cutover
 contract](./m3-rebind-cutover-contract.md#unresolved-implementation-choices).
-It neither registers a route nor enables a writer, factory, migration, listener,
-or deployment. Existing cutover, ownership, authorization, and acceptance
+The branch includes the additive audit migration described below, but registers
+no rebind route and enables no writer, factory, listener, or deployment.
+Existing cutover, ownership, authorization, and acceptance
 requirements continue to apply. Review acceptance is not runtime acceptance.
 
 ## Decisions
@@ -361,3 +363,64 @@ controller request assembly, Docker behavior, a full-controller crash boundary,
 physical LAN qualification, production wiring or M3 completion. Those gates
 remain required above; passing an advisory SQL authorization test cannot replace
 them.
+
+## Request parsing and invocation-local forward guards
+
+The next local checkpoint adds private proposal, commit and reconcile request
+parsers in `internal/controller/gateway_rebind_request.go`. They accept only the
+contract's exact fields, one JSON object and canonical values. Duplicate and
+unknown keys, nested ambiguity, extra documents, query strings, actor or proof
+injection, and client-selected recovery direction are refused. The actual body
+stream is limited to 16 KiB independent of Content-Length; an oversized request
+returns a typed size error for eventual handler mapping. Reconcile operation
+identity comes only from the matched path. The parsers register no routes and
+their returned values confer no authority.
+
+An optional session guard now belongs to each private physical-driver
+invocation, never to the Manager or shared state. Forward reconciliation,
+confirmation, completed restoration and committed-current attestation check it
+around existing SQL/protected authority reads. A callback that cancels its
+context while returning nil is also refused. The original nil-guard path is
+retained for startup/private callers. Rollback and exact-owned withdrawal keep
+their existing independent safety authority, including withdrawal after an
+interactive session has been revoked.
+
+The pre-edit ingress baseline at local checkpoint `20e58b2` passed three exact
+parents through actual WSL execution. The focused changed-source gate then
+passed four parents and ten descendant subcases (twelve leaves including the
+two parents without subtests). It covers separate concurrent invocations,
+revocation before and after authority reads, cancellation, nil/allowed current
+attestation, revocation during observation, exact-owned withdrawal with SQL and
+protected history unchanged, and retained completed-successor restoration.
+Cross-compilation, binary discovery and Linux execution exited zero. The
+compiled binary and all 892 Go/SQL/module input hashes remained unchanged.
+
+Native Windows parser verification passed five exact parents, 141 descendant
+test nodes and 136 leaf cases with no failures or skips. This includes four new
+parser parents and retained profile/body-validation coverage. The tests prove
+typed-value preservation, bounded reads and closure, strict decoding, canonical
+identities/digests, and zero-valued sanitized failures. Scoped controller and
+ingress vet checks and the four native production CLI builds exited zero.
+
+The first static wrapper retained a failed formatter assessment: five existing
+Go files had CRLF line endings. A read-only comparison proved that canonical
+gofmt output differed only by CRLF-to-LF normalization. Only those line endings
+were changed; a separate final formatter check was empty and diff checking
+passed. The original failed assessment and successful vet/build receipts remain
+preserved. Behavior was not rerun for this semantics-preserving line-ending
+correction.
+
+Security/source review accepted the guarded core after the explicit
+post-callback cancellation check and accepted the private parsers. All three
+new ingress parents map exactly once to the existing `rebind-history` partition
+in each required workflow; no CI file changed. Exact commands, raw output,
+source manifests, review records and formatting evidence are retained under
+`temp/m3-controller-rebind-contract-20261012/` outside the checkout. Documentation
+checks for this frozen page are recorded separately by the integration owner.
+
+This is preparation within one cohesive controller implementation, not a new
+acceptance milestone. Handlers, same-session administrator/CSRF checks, the
+lock-held audit/executor facade, native and rebound preclaim/post-insert physical
+proof adapters, and complete actual-phase recovery predicates still remain.
+There is no new production activation, actual Docker result, full-controller
+process-loss proof or physical second-device LAN acceptance from this checkpoint.

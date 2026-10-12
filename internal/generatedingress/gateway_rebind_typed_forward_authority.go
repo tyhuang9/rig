@@ -30,7 +30,7 @@ func (d managerGatewayRebindCrossStoreDriver) confirmForwardServingLocked(ctx co
 	if !ok || d.manager == nil {
 		return fail()
 	}
-	boundary, err := d.manager.readGatewayRebindTypedForwardBoundaryLocked(ctx, request)
+	boundary, err := d.readGatewayRebindTypedForwardBoundaryLocked(ctx, request)
 	if err != nil {
 		return fail()
 	}
@@ -41,7 +41,7 @@ func (d managerGatewayRebindCrossStoreDriver) confirmForwardServingLocked(ctx co
 		return fail()
 	}
 	guard := func(effectCtx context.Context) error {
-		fresh, err := d.manager.readGatewayRebindTypedForwardBoundaryLocked(effectCtx, request)
+		fresh, err := d.readGatewayRebindTypedForwardBoundaryLocked(effectCtx, request)
 		if err != nil || !reflect.DeepEqual(boundary.Progress, fresh.Progress) {
 			return gatewayRebindEffectBoundaryError(effectCtx)
 		}
