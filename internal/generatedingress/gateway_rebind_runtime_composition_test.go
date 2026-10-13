@@ -914,9 +914,11 @@ func TestGatewayRebindConcreteCompositionCommitsAndReplaysSameDockerState(t *tes
 	for replay := 0; replay < 2; replay++ {
 		fresh := freshGatewayRebindRecoveryManager(f.manager)
 		driver.install(fresh)
-		result, err := fresh.RecoverGatewayRebindStartup(ctx, f.repository)
-		if err != nil || !result.FenceReleased || !validSHA256(result.CurrentAttestationDigest) || len(r.effects) != effects || fresh.gatewayRebindAdmissionBlocked() {
-			t.Fatalf("fresh replay %d effects=%d/%d err=%v", replay, len(r.effects), effects, err)
+		result, recoveryDiagnostic, err := liveGatewayRebindRuntimeRecoverWithDiagnostic(ctx, fresh, f.repository)
+		if err != nil || !result.FenceReleased || !validSHA256(result.CurrentAttestationDigest) || len(r.effects) != effects ||
+			fresh.gatewayRebindAdmissionBlocked() || !recoveryDiagnostic.committedCurrentSucceeded() {
+			t.Fatalf("fresh replay %d effects=%d/%d error=%t diagnostic=%s", replay, len(r.effects), effects,
+				err != nil, recoveryDiagnostic)
 		}
 		f.manager = fresh
 	}
@@ -934,9 +936,10 @@ func TestGatewayRebindConcreteCompositionCommitsAndReplaysSameDockerState(t *tes
 			t.Fatalf("terminal restore handled=%t err=%v effects=%v", handled, err, r.effects[effects:])
 		}
 		effects = len(r.effects)
-		recovered, err := fresh.RecoverGatewayRebindStartup(ctx, f.repository)
-		if err != nil || !recovered.FenceReleased || !validSHA256(recovered.CurrentAttestationDigest) || len(r.effects) != effects {
-			t.Fatalf("restored terminal attestation: %v", err)
+		recovered, recoveryDiagnostic, err := liveGatewayRebindRuntimeRecoverWithDiagnostic(ctx, fresh, f.repository)
+		if err != nil || !recovered.FenceReleased || !validSHA256(recovered.CurrentAttestationDigest) ||
+			len(r.effects) != effects || !recoveryDiagnostic.committedCurrentSucceeded() {
+			t.Fatalf("restored terminal attestation: error=%t diagnostic=%s", err != nil, recoveryDiagnostic)
 		}
 		confirmed, err := fresh.InspectGatewayRebindCurrent(ctx, f.repository)
 		if err != nil || !reflect.DeepEqual(prepared, confirmed) {
@@ -952,12 +955,14 @@ func TestGatewayRebindConcreteCompositionCommitsAndReplaysSameDockerState(t *tes
 		r.stage.activeBody = []byte(`{"tampered":true}`)
 		fresh := freshGatewayRebindRecoveryManager(f.manager)
 		driver.install(fresh)
-		_, err := fresh.RecoverGatewayRebindStartup(ctx, f.repository)
+		_, recoveryDiagnostic, err := liveGatewayRebindRuntimeRecoverWithDiagnostic(ctx, fresh, f.repository)
 		var diagnostic *Error
 		if err == nil || !errors.As(err, &diagnostic) || !diagnostic.candidateMayBeLive || !fresh.gatewayRebindAdmissionBlocked() ||
 			r.final.Running || r.predecessor.FinalContainer.Running || !r.finalPresent || len(r.effects) != effects+1 ||
-			!reflect.DeepEqual(r.effects[effects], []string{"container", "stop", "--time", "10", r.finalID}) {
-			t.Fatalf("terminal corruption failed exact withdrawal: err=%v effects=%v", err, r.effects[effects:])
+			!reflect.DeepEqual(r.effects[effects], []string{"container", "stop", "--time", "10", r.finalID}) ||
+			!recoveryDiagnostic.Wrapped || recoveryDiagnostic.RecoveryEntries != 1 {
+			t.Fatalf("terminal corruption failed exact withdrawal: error=%t effect_count=%d diagnostic=%s",
+				err != nil, len(r.effects)-effects, recoveryDiagnostic)
 		}
 		f.manager = fresh
 	})
