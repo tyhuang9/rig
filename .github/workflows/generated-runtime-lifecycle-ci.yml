@@ -242,6 +242,8 @@ jobs:
           - current-lan
           - current-lan-recovery
           - current-runtime
+          - current-serving-emergency
+          - current-serving-predecessor
           - current-serving
           - ingress-remainder
     steps:

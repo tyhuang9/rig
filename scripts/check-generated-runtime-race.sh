@@ -38,6 +38,8 @@ current_pattern='^Test(ManagedGatewayCurrent|GatewayCurrent|InspectGatewayCurren
 current_lan_pattern='^Test(ManagedGatewayCurrentLAN|GatewayCurrentLAN)'
 current_lan_recovery_pattern='^Test(ManagedGatewayCurrentLANRecovery|GatewayCurrentLANRecovery)'
 current_runtime_pattern='^Test(ManagedGatewayCurrent|GatewayCurrent)(Physical|Serving)'
+current_serving_emergency_pattern='^TestGatewayCurrent(Typed|Native|Startup|Terminal)Emergency'
+current_serving_predecessor_pattern='^TestGatewayCurrentPredecessor'
 case "$suite" in
   runtime-packages)
     packages=(
@@ -115,9 +117,17 @@ case "$suite" in
     packages=(./internal/generatedingress)
     filter=(-run "$current_runtime_pattern")
     ;;
+  current-serving-emergency)
+    packages=(./internal/generatedingress)
+    filter=(-run "$current_serving_emergency_pattern")
+    ;;
+  current-serving-predecessor)
+    packages=(./internal/generatedingress)
+    filter=(-run "$current_serving_predecessor_pattern")
+    ;;
   current-serving)
     packages=(./internal/generatedingress)
-    filter=(-run "$current_pattern" -skip "$current_lan_pattern|$current_runtime_pattern")
+    filter=(-run "$current_pattern" -skip "$current_lan_pattern|$current_runtime_pattern|$current_serving_emergency_pattern|$current_serving_predecessor_pattern")
     ;;
   ingress-remainder)
     packages=(./internal/generatedingress)
