@@ -131,7 +131,7 @@ func gatewayFinalOwnershipContainerStaticMatches(facts gatewayFinalOwnershipFact
 		len(container.Entrypoint) != 1 || container.Entrypoint[0] != caddyExecutable || len(container.Cmd) != 3 ||
 		container.Cmd[0] != "run" || container.Cmd[1] != "--config" || container.Cmd[2] != "/config/"+identity.ActiveConfigFilename ||
 		len(container.Ulimits) != 1 || container.Ulimits[0] != (ulimitInspection{Name: "nofile", Hard: 1024, Soft: 1024}) ||
-		!reflect.DeepEqual(container.Labels, labels) || !validGatewayRebindStageContainerMounts(container.Mounts, identity) ||
+		!validGatewayV2ContainerLabels(container.Labels, labels) || !validGatewayRebindStageContainerMounts(container.Mounts, identity) ||
 		!gatewayCurrentPhysicalPortBindings(container.PortBindings, facts.profile(), facts.LocalHostPort) {
 		return false
 	}

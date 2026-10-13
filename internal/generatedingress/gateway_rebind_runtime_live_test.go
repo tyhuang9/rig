@@ -919,11 +919,18 @@ func liveGatewayRebindRuntimeJourney(t *testing.T, rollback bool) {
 	if err != nil {
 		t.Fatal("read SQL before fresh recovery")
 	}
-	recovery, err := fresh.RecoverGatewayRebindStartup(ctx, repository)
+	recovery, recoveryDiagnostic, err := liveGatewayRebindRuntimeRecoverWithDiagnostic(ctx, fresh, repository)
+	authorityMatches := recovery.SelectedCurrentAuthority != nil && *recovery.SelectedCurrentAuthority == *afterSQL.CurrentSource
+	diagnosticMatches := recoveryDiagnostic.Wrapped && recoveryDiagnostic.RecoveryEntries == 1
+	if !rollback {
+		diagnosticMatches = recoveryDiagnostic.committedCurrentSucceeded()
+	}
 	if err != nil || recovery.Recovered || !recovery.FenceReleased || recovery.SelectedCurrentAuthority == nil ||
 		*recovery.SelectedCurrentAuthority != *afterSQL.CurrentSource || (rollback && recovery.CurrentAttestationDigest != "") ||
-		(!rollback && !validSHA256(recovery.CurrentAttestationDigest)) {
-		t.Fatalf("fresh typed runtime recovery=%+v err=%v", recovery, err)
+		(!rollback && !validSHA256(recovery.CurrentAttestationDigest)) || !diagnosticMatches {
+		t.Fatalf("fresh typed runtime recovery refused: error=%t recovered=%t fence_released=%t authority_selected=%t authority_matches=%t rollback_attestation_empty=%t commit_attestation_valid=%t diagnostic=%s",
+			err != nil, recovery.Recovered, recovery.FenceReleased, recovery.SelectedCurrentAuthority != nil, authorityMatches,
+			recovery.CurrentAttestationDigest == "", validSHA256(recovery.CurrentAttestationDigest), recoveryDiagnostic)
 	}
 	afterReplay, historyErr := fresh.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	afterReplaySQL, sqlErr := repository.GatewayRebindRecoverySnapshot(ctx)

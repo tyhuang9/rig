@@ -32,6 +32,10 @@ jobs:
           go-version: 1.26.7
           cache: false
 
+      - name: Check repository race selector contract
+        shell: bash
+        run: bash scripts/check-repository-race_test.sh
+
       - name: Set up pnpm
         uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
         with:
@@ -160,27 +164,45 @@ jobs:
           fi
           jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
 
-      - name: Run repository tests with race detection
+      - name: Run repository remainder tests with race detection
         shell: bash
         run: |
           set -euo pipefail
-          package_list="$(mktemp)"
-          trap 'rm -f "$package_list"' EXIT
-          go list ./... > "$package_list"
-          mapfile -t all_packages < "$package_list"
-          packages=()
-          ingress_count=0
-          for package in "${all_packages[@]}"; do
-            if [[ "$package" == github.com/hostd/hostd/internal/generatedingress ]]; then
-              ingress_count=$((ingress_count + 1))
-            else
-              packages+=("$package")
-            fi
-          done
-          # Ingress runs in the complementary jobs below. Every other
-          # discovered package retains its complete race-tested test tree.
-          [[ "$ingress_count" -eq 1 && "${#packages[@]}" -gt 0 ]]
-          go test -race -count=1 -timeout=40m "${packages[@]}"
+          bash scripts/check-repository-race.sh repository-remainder
+
+  repository-race:
+    name: Repository heavy race tests (${{ matrix.suite }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - hostd
+          - appaccess
+          - appconfig
+          - database
+          - generatedrecovery
+          - jobs
+          - controller-lifecycle
+          - controller-remainder
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Run complete repository race partition
+        shell: bash
+        env:
+          RACE_SUITE: ${{ matrix.suite }}
+        run: bash scripts/check-repository-race.sh "$RACE_SUITE"
 
   ingress-race:
     name: Repository ingress race tests (${{ matrix.suite }})
@@ -232,15 +254,16 @@ jobs:
   postgres-race-gate:
     name: PostgreSQL and Linux race verification
     if: ${{ always() }}
-    needs: [postgres-race, ingress-race]
+    needs: [postgres-race, repository-race, ingress-race]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - name: Require PostgreSQL and every repository race partition
         env:
           REPOSITORY_RESULT: ${{ needs.postgres-race.result }}
+          HEAVY_RESULT: ${{ needs.repository-race.result }}
           INGRESS_RESULT: ${{ needs.ingress-race.result }}
-        run: test "$REPOSITORY_RESULT" = success && test "$INGRESS_RESULT" = success
+        run: test "$REPOSITORY_RESULT" = success && test "$HEAVY_RESULT" = success && test "$INGRESS_RESULT" = success
 
   relay-packaging:
     name: Relay packaging verification

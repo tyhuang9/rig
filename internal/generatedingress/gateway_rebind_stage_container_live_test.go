@@ -10,6 +10,19 @@ import (
 	"github.com/hostd/hostd/internal/database"
 )
 
+func equalGatewayRebindStageContainerSnapshot(intent gatewayRebindProtectedIntent,
+	stage gatewayRebindStageIntent, binding *gatewayRebindStageContainerBinding,
+	physical, replayed gatewayRebindStageContainerObservation,
+) bool {
+	if !validGatewayRebindStageContainerObservation(intent, stage, physical, binding) ||
+		!validGatewayRebindStageContainerObservation(intent, stage, replayed, binding) {
+		return false
+	}
+	physical.StageContainer.Mounts = canonicalGatewayRebindTypedMounts(physical.StageContainer.Mounts)
+	replayed.StageContainer.Mounts = canonicalGatewayRebindTypedMounts(replayed.StageContainer.Mounts)
+	return reflect.DeepEqual(physical, replayed)
+}
+
 // TestLiveGatewayRebindSuccessorStoppedStageContainer proves that the fourth
 // private successor effect creates one exact, stopped container on a
 // disposable default-local Linux Docker daemon. It must remain inert until a
@@ -261,7 +274,7 @@ func TestLiveGatewayRebindSuccessorStoppedStageContainer(t *testing.T) {
 	if err != nil {
 		t.Fatal("fresh-manager stopped-container replay inspection failed")
 	}
-	if !reflect.DeepEqual(physical, replayed) {
+	if !equalGatewayRebindStageContainerSnapshot(intent, *bound.Stage, containerBinding, physical, replayed) {
 		t.Fatal("fresh-manager stopped-container replay physical snapshot changed")
 	}
 	if !validGatewayRebindStageContainerObservation(intent, *bound.Stage, replayed, containerBinding) {
