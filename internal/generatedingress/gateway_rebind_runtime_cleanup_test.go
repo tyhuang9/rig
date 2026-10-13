@@ -80,7 +80,7 @@ func validGatewayRebindRuntimeCleanupSnapshot(value gatewayRebindRuntimeCleanupS
 	if !validGatewayRebindRuntimeCleanupAuthority(plan.Authority) || value.Authority != plan.Authority || value.StagePresent {
 		return false
 	}
-	if value.Final.Present && (value.Final.ID != plan.FinalID || value.Final.ImageID != plan.ImageID || !reflect.DeepEqual(value.Final.Labels, plan.FinalLabels)) {
+	if value.Final.Present && (value.Final.ID != plan.FinalID || value.Final.ImageID != plan.ImageID || !validGatewayV2ContainerLabels(value.Final.Labels, plan.FinalLabels)) {
 		return false
 	}
 	if (!value.Final.Present || !value.Final.Running) && !value.Final.ListenerAbsent {
@@ -211,6 +211,39 @@ func TestGatewayRebindRuntimeCleanupRejectsUnownedResources(t *testing.T) {
 			mutate.apply(fake)
 			if err := cleanupGatewayRebindRuntimeTerminal(context.Background(), fake, plan); err == nil || len(fake.effects) != 0 {
 				t.Fatalf("unowned resource reached effect boundary: effects=%v err=%v", fake.effects, err)
+			}
+		})
+	}
+}
+
+func TestGatewayRebindRuntimeCleanupImageMetadataDoesNotGrantAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]string)
+		allow  bool
+	}{
+		{name: "foreign image metadata", allow: true},
+		{name: "missing Rig label", mutate: func(labels map[string]string) { delete(labels, "io.rig.operation-id") }},
+		{name: "changed Rig label", mutate: func(labels map[string]string) { labels["io.rig.operation-id"] = "other" }},
+		{name: "unexpected Rig label", mutate: func(labels map[string]string) { labels["io.rig.unexpected"] = "other" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plan, fake := newGatewayRebindRuntimeCleanupFixture()
+			plan.FinalLabels = map[string]string{"io.rig.managed": "typed", "io.rig.operation-id": "operation"}
+			fake.snapshot.Final.Labels = map[string]string{
+				"io.rig.managed": "typed", "io.rig.operation-id": "operation", "org.opencontainers.image.title": "Caddy",
+			}
+			if test.mutate != nil {
+				test.mutate(fake.snapshot.Final.Labels)
+			}
+			err := cleanupGatewayRebindRuntimeTerminal(context.Background(), fake, plan)
+			if test.allow {
+				if err != nil || len(fake.effects) != 5 || fake.snapshot.Final.Present || fake.snapshot.Config.Present ||
+					fake.snapshot.Data.Present || fake.snapshot.Ingress.Present {
+					t.Fatalf("foreign metadata blocked exact terminal cleanup: effects=%v err=%v", fake.effects, err)
+				}
+			} else if err == nil || len(fake.effects) != 0 {
+				t.Fatalf("image metadata masked invalid Rig authority: effects=%v err=%v", fake.effects, err)
 			}
 		})
 	}

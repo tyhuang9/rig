@@ -106,9 +106,10 @@ func newLiveGatewayRebindRuntimeCleanupBoundary(ctx context.Context, fixture liv
 	if err != nil {
 		return b, errors.New("bind exact current physical target")
 	}
-	proof, err := b.manager.attestGatewayCurrentPhysicalLocked(ctx, selected)
-	if err != nil || proof.Outcome != gatewayCurrentPhysicalStableServing || !gatewayCurrentPhysicalAttestationAtTarget(proof, b.target) {
-		return b, errors.New("attest committed serving target")
+	proof, diagnostic, err := liveGatewayRebindRuntimeCleanupAttestCurrent(ctx, b.manager, selected)
+	stable, atTarget := proof.Outcome == gatewayCurrentPhysicalStableServing, gatewayCurrentPhysicalAttestationAtTarget(proof, b.target)
+	if err != nil || !stable || !atTarget {
+		return b, diagnostic.refusal(stable, atTarget)
 	}
 	driver := newManagedGatewayCurrentPhysicalDriver(b.manager).(managedGatewayCurrentPhysicalDriver)
 	b.runtime = driver.runtime.(managerGatewayCurrentPhysicalRuntime)
