@@ -322,12 +322,24 @@ func (d managerGatewayCurrentPhysicalRuntime) nativePredecessorOwnershipInventor
 	}
 	named, namedRuntime, namedFound, namedErr := d.manager.inspectNamedGatewayContainer(ctx, state.Identity.FinalContainer)
 	byID, idRuntime, idFound, idErr := d.manager.inspectNamedGatewayContainer(ctx, journal.Resources.FinalContainerID)
-	if namedErr != nil || idErr != nil || namedFound != idFound ||
-		(namedFound && (!reflect.DeepEqual(named, byID) || !reflect.DeepEqual(namedRuntime, idRuntime) ||
-			normalizeID(named.ID) != journal.Resources.FinalContainerID ||
-			!validGatewayV2ContainerStatic(state, journal, named, true, gatewayV2FinalContainerRole, image.ID))) ||
-		(!namedFound && len(containers) != 0) {
+	if namedErr != nil || idErr != nil || namedFound != idFound || (!namedFound && len(containers) != 0) {
 		return invalid()
+	}
+	if namedFound {
+		if !validGatewayV2ContainerStatic(state, journal, named, true, gatewayV2FinalContainerRole, image.ID) ||
+			!validGatewayV2ContainerStatic(state, journal, byID, true, gatewayV2FinalContainerRole, image.ID) ||
+			!reflect.DeepEqual(namedRuntime, idRuntime) || normalizeID(named.ID) != journal.Resources.FinalContainerID {
+			return invalid()
+		}
+		// The name and immutable ID reads independently prove the exact owned
+		// mounts. Compare every other field after clone-sorting only those
+		// validated mount slices; the later inventory and liveness checks remain
+		// unchanged.
+		named.Mounts = canonicalGatewayRebindTypedMounts(named.Mounts)
+		byID.Mounts = canonicalGatewayRebindTypedMounts(byID.Mounts)
+		if !reflect.DeepEqual(named, byID) {
+			return invalid()
+		}
 	}
 	if !namedFound && len(network.Containers) != 0 {
 		return invalid()
