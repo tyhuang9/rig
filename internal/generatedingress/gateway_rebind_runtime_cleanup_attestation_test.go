@@ -74,7 +74,13 @@ func TestGatewayRebindRuntimeCleanupGenericAttestationAcceptsComposedCommittedSe
 			if attestErr != nil || proof.Outcome != gatewayCurrentPhysicalStableServing ||
 				!gatewayCurrentPhysicalAttestationAtTarget(proof, target) || !diagnostic.wrapped || diagnostic.managerRefused ||
 				diagnostic.driverEntries != 1 || diagnostic.retirementEntries == 0 || diagnostic.runtimeEntries == 0 ||
+				diagnostic.predecessorInventoryEntries == 0 || diagnostic.retiredProfileListenerEntries == 0 ||
+				diagnostic.retiredLocalListenerEntries == 0 ||
 				diagnostic.driverFailures != 0 || diagnostic.retirementFailures != 0 || diagnostic.runtimeFailures != 0 ||
+				diagnostic.predecessorInventoryFailures != 0 || diagnostic.predecessorInventoryFirstFailure != 0 ||
+				diagnostic.retiredProfileListenerFailures != 0 || diagnostic.retiredProfileListenerFirstFailure != 0 ||
+				diagnostic.retiredLocalListenerFailures != 0 || diagnostic.retiredLocalListenerFirstFailure != 0 ||
+				diagnostic.retirementFirstFailureStage != liveGatewayRebindRuntimeCleanupRetirementFailureNone ||
 				!restoredOK || restored.manager() != installed.manager() || !runtimeRestored || restoredRuntime.manager != fixture.manager {
 				t.Fatalf("generic cleanup attestation refused composed current: outcome=%q at_target=%t diagnostic=%+v restored=%t effects=%d error=%v",
 					proof.Outcome, gatewayCurrentPhysicalAttestationAtTarget(proof, target), diagnostic, restoredOK, effectDelta, attestErr)

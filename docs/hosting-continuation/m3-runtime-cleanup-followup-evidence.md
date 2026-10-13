@@ -123,3 +123,87 @@ run must identify that boundary and pass forward/replay plus independent cleanup
 M3 is incomplete. Supported full-controller restart recovery and physical
 second-device LAN qualification remain later gates. No managed database or Neon
 provisioning, production activation, deployment or GitHub merge is included.
+
+## Later hosted evidence: retirement predicate refusal
+
+The [PR #150 forward job](https://github.com/tyhuang9/rig/actions/runs/38459223388/job/115509753049)
+ran source `1ad62a9f9be7e981c3b9516b682fdea4102dcb03` against baseline
+`b591f042c9569742ee66f45863cb3ac938fb5b75`. Its exact test merge is
+`fbacec2d12f4f264adf4db7cdb45ccf400779949`, with tree
+`a64ddc08f16bf25b1e4ab790853499bb5962ef56`. This run passed exact terminal
+commit and fresh-manager replay, then failed initial cleanup attestation:
+
+```text
+wrapped=true manager_refused=true driver_entries=1 driver_failures=1
+retirement_entries=2 retirement_failures=1 runtime_entries=1 runtime_failures=0
+stable=false at_target=false
+```
+
+The parent failed after 150.22 seconds; independent cleanup failed and resources
+were retained. Raw log SHA-256:
+`d85ab579f58d738efe20f2a52f618d4de1d1f20338ab619b3fd391035a6499c0`.
+Metadata, merge proof, log and exact RUN/FAIL inventory are retained in
+`temp/m3-pr150-readiness-ci-20261013/job-115509753049.*`.
+
+The first retirement observation passed. The raw runtime observation returned
+successfully. The second physical retirement delegate then refused. The final
+`stable`/`at_target` flags follow that refusal; they do not show that the raw
+runtime observation returned unstable. The four remaining physical boundaries
+are the opening inventory, profile listeners, local listener, and closing
+inventory. Surrounding SQL/history rereads are outside the counted delegate.
+
+The listener methods may internally call the concrete `exactCurrentServing`
+runtime observer; those nested calls bypass the top-level diagnostic runtime
+counter. A successful counted runtime observation therefore does not rule out a
+later nested probe refusal. Runtime observation creates no transient container or
+network endpoint. No production defect or behavior repair is established yet.
+
+### Predicate diagnostic baseline
+
+Before extending the existing private cleanup wrapper, clean local source
+`c8b2a094948169de0ec3c7f121c34ceae91911af` passed two exact parents and nine
+descendants: composed baseline/foreign-image-metadata attestation, plus the seven
+existing delegation contracts. There were no skips or missing tests. All 890
+Go/SQL/module inputs remained frozen through compilation, discovery and actual
+WSL execution using the Go 1.26.7 environment and commands recorded above.
+Compilation took 3.437 seconds, discovery 3.750 seconds, and execution 21.156
+seconds. Binary SHA-256:
+`a44c586888cc1be33366bfc379b6e87f53aa7499935b2f1f3dc3b7e0976e0475`.
+Test log SHA-256:
+`ba1f112c1a19f6becb08363fc1c71e33e818c947cd8431a717370438ad09cca7`.
+Exact receipts: `temp/m3-retirement-predicate-proof-20261013/retirement-baseline-wsl.*`.
+
+The test-only extension records which original predicate returns false, preserving
+every original argument, one delegation and the exact result. Each predicate has
+entry/failure counts and a first-failure call ordinal. The first failed predicate
+uses a private closed enumeration; diagnostics retain no raw context, action,
+profile, port, guard, upstream error or authority value. The existing concrete
+runtime embedding and optional interfaces remain intact. No retry, changed
+ownership predicate or runtime authority is added.
+
+### Predicate diagnostic final verification
+
+The final formatted source passed both parents and all 15 descendants, without
+skips or missing tests. Exact RUN/PASS inventories matched discovery. The existing
+composed baseline and foreign-image-metadata cases require calls to all three
+physical predicates, no reported failures, unchanged physical effects, SQL and
+protected history. Six additional contract cases cover both returned booleans
+for each predicate, exact argument and guard forwarding, one delegate call, and
+finite counters. The seven prior delegation cases remain included.
+
+All 890 Go/SQL/module inputs remained unchanged. Compilation took 8.672 seconds,
+discovery 4.187 seconds, and WSL test execution 21.796 seconds. Binary SHA-256:
+`0fefd52691604b6f00c84c30cdb8421449d4266997eedffab87c0a36ad86f19d`.
+Test log SHA-256:
+`1a7ee2c726d0f3468016460520ed94d40d6c100442cdcb66bc3cc5f7480c79f5`.
+The exact parent/descendant inventory, commands and per-input hashes are in
+`temp/m3-retirement-predicate-proof-20261013/retirement-final-wsl.*`.
+
+Canonical LF formatting of both changed Go test files, `git diff --check HEAD`,
+and `go vet ./internal/generatedingress` passed with unchanged inputs; vet took
+45.172 seconds. Pinned offline documentation installation passed in 0.875 seconds.
+Documentation workflow, build and accessibility checks are required before
+publication. Only two test files and this evidence page change; no new production
+CLI build or local Linux race acceptance is claimed. Actual hosted predicate
+evidence and successful complete Docker cleanup remain unverified for this
+extension. M3 remains incomplete.
