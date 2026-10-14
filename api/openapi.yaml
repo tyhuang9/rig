@@ -105,6 +105,15 @@ paths:
       responses:
         '200': {description: Controller status and capabilities, content: {application/json: {schema: {$ref: '#/components/schemas/SystemStatus'}}}}
         default: {$ref: '#/components/responses/Problem'}
+  /api/v1/system/recovery:
+    get:
+      operationId: getControllerRecovery
+      description: Returns the single freshly validated recovery operation the administrator may open. The locator contains no recovery authority or operational evidence.
+      x-rig-problem-codes: [lan_gateway_forbidden, invalid_lan_gateway_request, lan_gateway_unavailable]
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {description: Controller mode and optional validated recovery locator, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/ControllerRecovery'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /api/v1/system/doctor:
     get:
       operationId: doctor
@@ -901,6 +910,21 @@ components:
         ownerOperationId: {type: string, format: uuid}
         port: {type: integer, minimum: 8100, maximum: 8119}
         approvalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    ControllerRecovery:
+      type: object
+      additionalProperties: false
+      required: [version, mode]
+      properties:
+        version: {type: integer, const: 1}
+        mode: {type: string, enum: [normal, recovery_only]}
+        recovery: {$ref: '#/components/schemas/ControllerRecoveryLocator', x-go-pointer: true}
+    ControllerRecoveryLocator:
+      type: object
+      additionalProperties: false
+      required: [kind, operationId]
+      properties:
+        kind: {type: string, enum: [gateway_rebind, lan_grant, lan_disable, gateway_upgrade]}
+        operationId: {type: string, format: uuid}
     LANPortAllocation:
       type: object
       additionalProperties: false
