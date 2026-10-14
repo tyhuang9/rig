@@ -2,7 +2,12 @@
 
 Status: local backend, operator-flow and documentation checks passed. Hosted
 acceptance remains pending. M3 acceptance is incomplete.
-Base: supported-controller draft PR #154, `8e450e06c97bf3ed6effb9b0db97608af8e384af`.
+Initial base: supported-controller draft PR #154, `8e450e06c97bf3ed6effb9b0db97608af8e384af`.
+The published parent correction `897e7da4db2aa2747b5c289a402bbe7cd3248bc1`
+was integrated locally at `0d84e66`, preserving both histories. Its three ingress
+regressions were rerun after integration on Windows and Linux: all three passed
+on each platform, with no skips. Receipts: `parent-sync-native.result.json` and
+`parent-sync-wsl.result.json`. No application runtime source changed in this merge.
 
 ## Scope
 
@@ -95,7 +100,8 @@ checks found no horizontal page overflow at widths 375, 768 and 1440. Root and a
 independent UX reviewer inspected all six recovery/review screenshots across
 those widths; the review dialog scrolls internally to its two approval controls.
 No full WCAG conformance claim is made. Security and code review found no
-remaining blocking issue in this bounded change.
+remaining blocking issue in this bounded change. Final integration review gave
+a GO for draft publication with hosted acceptance still outstanding.
 
 Development failures were retained as evidence, including stale test fixtures,
 unsupported test matcher types, an over-strict single-read browser assertion,
@@ -112,6 +118,12 @@ are recorded in `docs-final.result.json`; the documentation build log SHA-256 is
 This evidence-only summary was added after that successful documentation build.
 
 ## Remaining acceptance
+
+Recovery discovery recognizes `gateway_upgrade`, but this change does not add an
+interactive gateway-upgrade recovery screen. That inherited case remains blocked
+with sign-out available; it requires the supported controller recovery protocol.
+Interactive recovery in this UI covers gateway rebind and the existing LAN
+access recovery paths. Discovery support alone is not full UI support.
 
 PR #153's repaired private-controller Docker recovery journey passed; see its
 [acceptance evidence](m3-controller-docker-acceptance.md). PR #154's full supported
