@@ -27,7 +27,24 @@ const (
 	liveLANGatewayRebindRecoveryPermission          = "RIG_RUN_LIVE_LAN_GATEWAY_REBIND_RECOVERY"
 	liveLANGatewayRebindRecoveryPurpose             = "hostd/controller/lan-gateway-rebind-recovery-live/v1"
 	liveLANGatewayRebindRecoveryStagePrefix         = "LAN_GATEWAY_REBIND_RECOVERY_STAGE:"
+	liveLANGatewayRebindRecoveryOutcomePrefix       = "LAN_GATEWAY_REBIND_RECOVERY_OUTCOME:"
 	liveLANGatewayRebindRecoveryMarker              = "LAN_GATEWAY_REBIND_RECOVERY_HTTP_OK"
+)
+
+type liveLANGatewayRebindRecoveryOutcome string
+
+const (
+	liveLANGatewayRebindRecoveryOutcomeUnknown          liveLANGatewayRebindRecoveryOutcome = "unknown"
+	liveLANGatewayRebindRecoveryOutcomeCommitted        liveLANGatewayRebindRecoveryOutcome = "success-commit"
+	liveLANGatewayRebindRecoveryOutcomeRolledBack       liveLANGatewayRebindRecoveryOutcome = "success-abort"
+	liveLANGatewayRebindRecoveryOutcomeSuccessOther     liveLANGatewayRebindRecoveryOutcome = "success-other"
+	liveLANGatewayRebindRecoveryOutcomeUnavailable      liveLANGatewayRebindRecoveryOutcome = "problem-unavailable"
+	liveLANGatewayRebindRecoveryOutcomeConflict         liveLANGatewayRebindRecoveryOutcome = "problem-conflict"
+	liveLANGatewayRebindRecoveryOutcomeApprovalMismatch liveLANGatewayRebindRecoveryOutcome = "problem-approval-mismatch"
+	liveLANGatewayRebindRecoveryOutcomeInvalidRequest   liveLANGatewayRebindRecoveryOutcome = "problem-invalid-request"
+	liveLANGatewayRebindRecoveryOutcomeForbidden        liveLANGatewayRebindRecoveryOutcome = "problem-forbidden"
+	liveLANGatewayRebindRecoveryOutcomeNotFound         liveLANGatewayRebindRecoveryOutcome = "problem-not-found"
+	liveLANGatewayRebindRecoveryOutcomeProblemOther     liveLANGatewayRebindRecoveryOutcome = "problem-other"
 )
 
 type liveLANGatewayRebindRecoveryManifest struct {
@@ -175,6 +192,8 @@ func TestLiveLANGatewayRebindRecoveryChild(t *testing.T) {
 	approvedBody := liveLANGatewayRebindReconcileBody(t, review.RecoveryDigest, review.RecoveryApprovalDigest)
 	fmt.Println(liveLANGatewayRebindRecoveryStagePrefix + "approved-reconcile")
 	statusCode, body = request(http.MethodPost, basePath+"/reconcile", approvedBody)
+	fmt.Println(liveLANGatewayRebindRecoveryOutcomePrefix +
+		string(liveLANGatewayRebindRecoveryApprovedOutcome(statusCode, body)))
 	reconciled := decodeLiveLANGatewayRebindRecoveryJSON[lanGatewayRebindReconcileResponse](t, statusCode, body)
 	if statusCode != http.StatusOK || reconciled.Version != generatedingress.GatewayRebindReconcileVersion ||
 		reconciled.Status.OperationID != manifest.OperationID || reconciled.Status.Active ||
@@ -233,6 +252,98 @@ func TestLiveLANGatewayRebindRecoveryChild(t *testing.T) {
 		t.Fatal("refused terminal replay changed the committed receipt")
 	}
 	fmt.Println(liveLANGatewayRebindRecoveryMarker)
+}
+
+// liveLANGatewayRebindRecoveryApprovedOutcome emits only a finite test
+// diagnostic. It never returns a response body, operation identity, digest,
+// session value or upstream error.
+func liveLANGatewayRebindRecoveryApprovedOutcome(statusCode int, body []byte) liveLANGatewayRebindRecoveryOutcome {
+	if statusCode == http.StatusOK {
+		var response lanGatewayRebindReconcileResponse
+		if json.Unmarshal(body, &response) != nil || response.Status.Operation == nil {
+			return liveLANGatewayRebindRecoveryOutcomeSuccessOther
+		}
+		switch {
+		case response.Status.Operation.StoredState == string(appaccess.GatewayRebindCommitted) &&
+			response.Status.Operation.TerminalDisposition == string(appaccess.GatewayRebindDispositionCommit):
+			return liveLANGatewayRebindRecoveryOutcomeCommitted
+		case response.Status.Operation.StoredState == string(appaccess.GatewayRebindRolledBack) &&
+			response.Status.Operation.TerminalDisposition == string(appaccess.GatewayRebindDispositionAbort):
+			return liveLANGatewayRebindRecoveryOutcomeRolledBack
+		default:
+			return liveLANGatewayRebindRecoveryOutcomeSuccessOther
+		}
+	}
+	var problem struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal(body, &problem) != nil {
+		return liveLANGatewayRebindRecoveryOutcomeProblemOther
+	}
+	switch {
+	case statusCode == http.StatusServiceUnavailable && problem.Code == "lan_gateway_unavailable":
+		return liveLANGatewayRebindRecoveryOutcomeUnavailable
+	case statusCode == http.StatusConflict && problem.Code == "lan_gateway_conflict":
+		return liveLANGatewayRebindRecoveryOutcomeConflict
+	case statusCode == http.StatusForbidden && problem.Code == "lan_gateway_approval_mismatch":
+		return liveLANGatewayRebindRecoveryOutcomeApprovalMismatch
+	case statusCode == http.StatusBadRequest && problem.Code == "invalid_lan_gateway_request":
+		return liveLANGatewayRebindRecoveryOutcomeInvalidRequest
+	case statusCode == http.StatusForbidden && problem.Code == "lan_gateway_forbidden":
+		return liveLANGatewayRebindRecoveryOutcomeForbidden
+	case statusCode == http.StatusNotFound && problem.Code == "lan_gateway_rebind_not_found":
+		return liveLANGatewayRebindRecoveryOutcomeNotFound
+	default:
+		return liveLANGatewayRebindRecoveryOutcomeProblemOther
+	}
+}
+
+func TestLiveLANGatewayRebindRecoveryApprovedOutcomeIsFinite(t *testing.T) {
+	response := func(state appaccess.GatewayRebindState,
+		disposition appaccess.GatewayRebindTerminalDisposition,
+	) []byte {
+		body, err := json.Marshal(lanGatewayRebindReconcileResponse{Status: lanGatewayRebindStatus{
+			Operation: &lanGatewayRebindOperation{StoredState: string(state),
+				TerminalDisposition: string(disposition)},
+		}})
+		if err != nil {
+			t.Fatal("encode finite recovery outcome fixture")
+		}
+		return body
+	}
+	for _, test := range []struct {
+		name       string
+		statusCode int
+		body       []byte
+		want       liveLANGatewayRebindRecoveryOutcome
+	}{
+		{name: "commit", statusCode: http.StatusOK,
+			body: response(appaccess.GatewayRebindCommitted, appaccess.GatewayRebindDispositionCommit),
+			want: liveLANGatewayRebindRecoveryOutcomeCommitted},
+		{name: "rollback", statusCode: http.StatusOK,
+			body: response(appaccess.GatewayRebindRolledBack, appaccess.GatewayRebindDispositionAbort),
+			want: liveLANGatewayRebindRecoveryOutcomeRolledBack},
+		{name: "mismatched success", statusCode: http.StatusOK,
+			body: response(appaccess.GatewayRebindCommitted, appaccess.GatewayRebindDispositionAbort),
+			want: liveLANGatewayRebindRecoveryOutcomeSuccessOther},
+		{name: "unavailable", statusCode: http.StatusServiceUnavailable,
+			body: []byte(`{"code":"lan_gateway_unavailable","detail":"private"}`),
+			want: liveLANGatewayRebindRecoveryOutcomeUnavailable},
+		{name: "wrong status", statusCode: http.StatusBadRequest,
+			body: []byte(`{"code":"lan_gateway_unavailable"}`),
+			want: liveLANGatewayRebindRecoveryOutcomeProblemOther},
+		{name: "unknown code", statusCode: http.StatusServiceUnavailable,
+			body: []byte(`{"code":"private-value"}`),
+			want: liveLANGatewayRebindRecoveryOutcomeProblemOther},
+		{name: "malformed", statusCode: http.StatusServiceUnavailable,
+			body: []byte(`private-value`), want: liveLANGatewayRebindRecoveryOutcomeProblemOther},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := liveLANGatewayRebindRecoveryApprovedOutcome(test.statusCode, test.body); got != test.want {
+				t.Fatalf("outcome=%q want=%q", got, test.want)
+			}
+		})
+	}
 }
 
 func readLiveLANGatewayRebindRecoveryManifest(path string) (liveLANGatewayRebindRecoveryManifest, error) {

@@ -21,6 +21,7 @@ import (
 const liveControllerRecoveryEnvironment = "RIG_RUN_LIVE_LAN_GATEWAY_REBIND_RECOVERY"
 const liveControllerRecoveryManifestEnvironment = "RIG_TEST_LAN_GATEWAY_REBIND_RECOVERY_MANIFEST"
 const liveControllerRecoveryChildTest = "TestLiveLANGatewayRebindRecoveryChild"
+const liveControllerRecoveryOutcomePrefix = "LAN_GATEWAY_REBIND_RECOVERY_OUTCOME:"
 
 // Keep this private manifest in sync with the controller child. It contains
 // only this disposable fixture's session, never credentials from a running Rig.
@@ -122,7 +123,7 @@ func TestLiveGatewayRebindControllerRecoveryCommitAndReplay(t *testing.T) {
 	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
 		t.Fatal("write private controller recovery manifest")
 	}
-	runLiveControllerRecoveryChild(t, ctx, binary, manifestPath)
+	runLiveControllerRecoveryChild(t, ctx, binary, manifestPath, f)
 
 	afterSQL, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || afterSQL.Active != nil || len(afterSQL.History) != 1 ||
@@ -187,7 +188,9 @@ func buildLiveControllerRecoveryChild(t *testing.T) string {
 	return binary
 }
 
-func runLiveControllerRecoveryChild(t *testing.T, ctx context.Context, binary, manifest string) {
+func runLiveControllerRecoveryChild(t *testing.T, ctx context.Context, binary, manifest string,
+	fixture liveGatewayRebindRuntimeFixture,
+) {
 	t.Helper()
 	before, err := os.ReadFile(binary)
 	if err != nil {
@@ -203,8 +206,11 @@ func runLiveControllerRecoveryChild(t *testing.T, ctx context.Context, binary, m
 		!bytes.Contains(output, []byte("--- PASS: "+liveControllerRecoveryChildTest+" ")) ||
 		bytes.Count(output, []byte("LAN_GATEWAY_REBIND_RECOVERY_HTTP_OK")) != 1 {
 		// This child handles session credentials. Never echo its raw output.
-		t.Fatalf("controller recovery child did not complete the exact HTTP journey: error=%v last_attempt=%s",
-			runErr, liveControllerRecoveryLastAttempt(output))
+		state := fixture.failureStateDiagnostic(ctx, errors.New("controller recovery child failed"))
+		t.Fatalf("controller recovery child did not complete the exact HTTP journey: error=%v last_attempt=%s approved_outcome=%s child_failure=%s sql_phase=%s terminal_receipt=%s current_artifact=%s authority=%s",
+			runErr, liveControllerRecoveryLastAttempt(output), liveControllerRecoveryApprovedOutcome(output),
+			liveControllerRecoveryChildFailure(output), state.SQLPhase, state.TerminalReceipt,
+			state.CurrentArtifact, state.Authority)
 	}
 }
 
@@ -225,6 +231,80 @@ func liveControllerRecoveryLastAttempt(output []byte) string {
 		}
 	}
 	return last
+}
+
+func liveControllerRecoveryApprovedOutcome(output []byte) string {
+	result := "unknown"
+	found := false
+	for _, line := range bytes.Split(output, []byte{'\n'}) {
+		value, ok := strings.CutPrefix(strings.TrimSpace(string(line)), liveControllerRecoveryOutcomePrefix)
+		if !ok {
+			continue
+		}
+		switch value {
+		case "success-commit", "success-abort", "success-other", "problem-unavailable", "problem-conflict",
+			"problem-approval-mismatch", "problem-invalid-request", "problem-forbidden", "problem-not-found",
+			"problem-other":
+			if found {
+				return "ambiguous"
+			}
+			result, found = value, true
+		default:
+			return "unknown"
+		}
+	}
+	return result
+}
+
+func liveControllerRecoveryChildFailure(output []byte) string {
+	for _, failure := range []struct {
+		message string
+		value   string
+	}{
+		{message: "execute controller recovery HTTP request", value: "request"},
+		{message: "read bounded no-store controller recovery response", value: "response-boundary"},
+		{message: "decode controller recovery response", value: "response-decode"},
+		{message: "approved HTTP reconciliation did not return exact committed authority", value: "approved-authority"},
+		{message: "approved reconciliation did not write exactly one purpose-bound audit", value: "approved-audit"},
+	} {
+		if bytes.Contains(output, []byte(failure.message)) {
+			return failure.value
+		}
+	}
+	return "unknown"
+}
+
+func TestLiveControllerRecoveryDiagnosticsAreFinite(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		output      string
+		wantOutcome string
+		wantFailure string
+	}{
+		{name: "commit authority refusal",
+			output: liveControllerRecoveryOutcomePrefix + "success-commit\n" +
+				"approved HTTP reconciliation did not return exact committed authority private-value\n",
+			wantOutcome: "success-commit", wantFailure: "approved-authority"},
+		{name: "curated unavailable",
+			output: liveControllerRecoveryOutcomePrefix + "problem-unavailable\n" +
+				"decode controller recovery response private-value\n",
+			wantOutcome: "problem-unavailable", wantFailure: "response-decode"},
+		{name: "unknown values are clamped",
+			output:      liveControllerRecoveryOutcomePrefix + "private-value\nprivate-value\n",
+			wantOutcome: "unknown", wantFailure: "unknown"},
+		{name: "duplicates are ambiguous",
+			output: liveControllerRecoveryOutcomePrefix + "success-commit\n" +
+				liveControllerRecoveryOutcomePrefix + "success-abort\n",
+			wantOutcome: "ambiguous", wantFailure: "unknown"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if outcome, failure := liveControllerRecoveryApprovedOutcome([]byte(test.output)),
+				liveControllerRecoveryChildFailure([]byte(test.output)); outcome != test.wantOutcome || failure != test.wantFailure {
+				t.Fatalf("outcome=%q failure=%q want_outcome=%q want_failure=%q",
+					outcome, failure, test.wantOutcome, test.wantFailure)
+			}
+		})
+	}
 }
 
 func liveControllerRecoveryChildEnvironment(manifest string) []string {
