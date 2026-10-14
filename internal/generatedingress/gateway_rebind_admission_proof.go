@@ -436,16 +436,29 @@ func gatewayRebindAdmissionCurrentPhysicalMatches(target gatewayCurrentPhysicalT
 		return false
 	}
 	if physical.Running {
-		return physical.Serving != nil && inventory.Final.Running && !inventory.Final.Restarting &&
-			physical.Serving.Runtime.ImageID == target.Resources.ImageID &&
-			normalizeID(inventory.Image.ID) == target.Resources.ImageID &&
-			validGatewayPinnedImage(inventory.Image, true) &&
-			validGatewayCurrentPhysicalAttestation(*physical.Serving) &&
-			physical.Serving.Outcome == gatewayCurrentPhysicalStableServing &&
-			reflect.DeepEqual(physical.Serving.State, target.State) &&
-			physical.Serving.Lineage == target.Lineage && physical.Serving.Digest == physical.Digest &&
-			physical.Serving.Resources.FinalContainer.ID == inventory.Final.ID &&
-			physical.Serving.Runtime.ContainerID == inventory.Final.ID
+		if physical.Serving == nil || !inventory.Final.Running || inventory.Final.Restarting ||
+			physical.Serving.Runtime.ImageID != target.Resources.ImageID ||
+			normalizeID(inventory.Image.ID) != target.Resources.ImageID ||
+			!validGatewayPinnedImage(inventory.Image, true) ||
+			!validGatewayCurrentPhysicalAttestation(*physical.Serving) ||
+			physical.Serving.Outcome != gatewayCurrentPhysicalStableServing ||
+			!reflect.DeepEqual(physical.Serving.State, target.State) ||
+			physical.Serving.Lineage != target.Lineage || physical.Serving.Digest != physical.Digest ||
+			physical.Serving.Resources.FinalContainer.ID != inventory.Final.ID ||
+			physical.Serving.Runtime.ContainerID != inventory.Final.ID {
+			return false
+		}
+		expected, err := gatewayCurrentPhysicalConfigBytes(target.State)
+		if err != nil {
+			return false
+		}
+		defer clear(expected)
+		if !sameCaddyConfig(expected, inventory.LiveConfig) || !sameCaddyConfig(expected, inventory.RestartConfig) {
+			return false
+		}
+		serving, err := gatewayCurrentPhysicalAttestationProof(context.Background(), target, inventory,
+			expected, gatewayCurrentPhysicalStableServing, false)
+		return err == nil && reflect.DeepEqual(serving, *physical.Serving)
 	}
 	if physical.Serving != nil || inventory.Final.Running || inventory.Final.Restarting ||
 		gatewayV2HasEffectivePortBinding(inventory.FinalRuntime.EffectivePortBindings) {

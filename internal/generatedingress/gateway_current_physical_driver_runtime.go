@@ -682,6 +682,13 @@ func (d managerGatewayCurrentPhysicalRuntime) attestationProof(ctx context.Conte
 	target gatewayCurrentPhysicalTarget, inventory gatewayCurrentPhysicalInventory, expected []byte,
 	outcome gatewayCurrentPhysicalOutcome, listenerAbsent bool,
 ) (gatewayCurrentPhysicalAttestation, error) {
+	return gatewayCurrentPhysicalAttestationProof(ctx, target, inventory, expected, outcome, listenerAbsent)
+}
+
+func gatewayCurrentPhysicalAttestationProof(ctx context.Context,
+	target gatewayCurrentPhysicalTarget, inventory gatewayCurrentPhysicalInventory, expected []byte,
+	outcome gatewayCurrentPhysicalOutcome, listenerAbsent bool,
+) (gatewayCurrentPhysicalAttestation, error) {
 	if !validGatewayCurrentPhysicalTarget(target) || len(expected) == 0 ||
 		(outcome != gatewayCurrentPhysicalStableServing && outcome != gatewayCurrentPhysicalRecoveryBefore &&
 			outcome != gatewayCurrentPhysicalRecoveryEffective && outcome != gatewayCurrentPhysicalRecoveryMixed &&
