@@ -11,6 +11,29 @@ or restarted. These results do not authorize a GitHub merge or deployment.
 
 ## Scope and invariants
 
+### Hosted selected-current fixture correction
+
+Hosted run `38646243936`, job `116134761652`, failed the old
+`TestInspectGatewayRebindCurrentSeparatesSelectedAuthorityFromActivePhase` at
+`8e450e0`. A local Linux reproduction failed identically. The synthetic active
+claim omitted required approvals, profile, roster, history and protected generation;
+the current validator correctly rejected it. Its legacy-active success expectation
+was also obsolete. The fixture now checks rejection with an empty inspection and
+retains the stable selected-current and process-fence assertions. Production code
+and validators are unchanged.
+
+The renamed `TestInspectGatewayRebindCurrentRetainsSelectedAuthorityAndProcessFence`
+passed alongside `TestGatewayRebindProposalAndAdmissionUseRealRepository` and
+`TestPrepareGatewayRebindLockedIntentBoundaryRetainsFence` on Windows and Linux:
+three discovered parents per platform, no failures or skips. The latter two retain
+positive coverage of a valid later operation and protected intent while the prior
+committed gateway remains selected. Evidence receipts are
+`selected-current-repair-native.result.json` and
+`selected-current-repair-wsl.result.json` in the evidence directory below.
+Hosted race verification of this correction is pending.
+
+### Runtime invariants
+
 The candidate assembles the existing guarded rebind coordinators into normal
 hostd startup and five canonical authenticated API operations. Startup has an
 explicit refusing zero value, normal admission, and exact-operation recovery-only
