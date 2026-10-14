@@ -12,6 +12,7 @@ import {
   type LANAppGrantRead,
   type LANRecoveryHead,
 } from "./api";
+import { LANGatewayRebindRecoveryScreen } from "./lan-gateway-rebind";
 
 type SignOut = () => void | Promise<void>;
 type RecoveryReview =
@@ -123,6 +124,35 @@ function exactRecoveryHead(value: unknown) {
   return value;
 }
 
+type LegacyRecoveryLocator = { kind: "lan_grant" | "lan_disable"; operationId: string };
+type ControllerRecoveryLocator = { kind: "gateway_rebind" | "lan_grant" | "lan_disable" | "gateway_upgrade"; operationId: string };
+type ControllerRecoveryRead = { mode: "normal" } | { mode: "normal" | "recovery_only"; locator: ControllerRecoveryLocator };
+
+function validRecoveryLocator(value: unknown): value is ControllerRecoveryLocator {
+  const locator = record(value);
+  return Boolean(locator && (locator.kind === "gateway_rebind" || locator.kind === "lan_grant" || locator.kind === "lan_disable" || locator.kind === "gateway_upgrade") &&
+    typeof locator.operationId === "string" && uuidPattern.test(locator.operationId));
+}
+
+function exactControllerRecoveryRead(value: unknown): ControllerRecoveryRead {
+  const response = record(value);
+  if (!response || response.version !== 1 || (response.mode !== "normal" && response.mode !== "recovery_only")) {
+    throw new Error("invalid_recovery_locator");
+  }
+  if (!("recovery" in response)) {
+    if (response.mode !== "normal") throw new Error("invalid_recovery_locator");
+    return { mode: "normal" as const };
+  }
+  if (!validRecoveryLocator(response.recovery)) throw new Error("invalid_recovery_locator");
+  return { mode: response.mode, locator: response.recovery };
+}
+
+function exactControllerRecoveryLocator(value: unknown): ControllerRecoveryLocator {
+  const response = exactControllerRecoveryRead(value);
+  if (!("locator" in response)) throw new Error("invalid_recovery_locator");
+  return response.locator;
+}
+
 function sameRecoveryHead(left: LANRecoveryHead, right: LANRecoveryHead) {
   return recoveryHeadFields.every((field) => left[field] === right[field]);
 }
@@ -187,6 +217,9 @@ async function readExactObservation(head: LANRecoveryHead): Promise<RecoveryRevi
 }
 
 function recoveryReadError(error: unknown) {
+  if (error instanceof Error && error.message === "recovery_locator_mismatch") {
+    return "Rig could not prove that this recovery operation still matches the startup recovery record. Restart Rig before continuing.";
+  }
   if (error instanceof Error && error.message === "unsupported_recovery_kind") {
     return "This recovery kind is not supported by this console. Restart Rig with a supported recovery build before continuing.";
   }
@@ -229,9 +262,10 @@ function RecoveryFacts({ review }: { review: RecoveryReview }) {
   </dl>;
 }
 
-export function LANRecoveryScreen({ onSignOut, onCheckSystemStatus }: {
+export function LANRecoveryScreen({ onSignOut, onCheckSystemStatus, expectedRecovery }: {
   onSignOut: SignOut;
   onCheckSystemStatus: () => Promise<void>;
+  expectedRecovery?: LegacyRecoveryLocator;
 }) {
   const heading = useRef<HTMLHeadingElement>(null);
   const errorSummary = useRef<HTMLDivElement>(null);
@@ -264,6 +298,9 @@ export function LANRecoveryScreen({ onSignOut, onCheckSystemStatus }: {
     setConfirmed(false);
     try {
       const head = exactRecoveryHead(await api.lanRecoveryHead());
+      if (expectedRecovery && (head.kind !== expectedRecovery.kind || head.operationId !== expectedRecovery.operationId)) {
+        throw new Error("recovery_locator_mismatch");
+      }
       const next = await readExactObservation(head);
       if (!reviewMatchesHead(next)) throw new Error("inconsistent_recovery_observation");
       if (!mounted.current) return false;
@@ -292,6 +329,9 @@ export function LANRecoveryScreen({ onSignOut, onCheckSystemStatus }: {
     setStatusMessage("");
     try {
       const firstHead = exactRecoveryHead(await api.lanRecoveryHead());
+      if (expectedRecovery && (firstHead.kind !== expectedRecovery.kind || firstHead.operationId !== expectedRecovery.operationId)) {
+        throw new Error("recovery_locator_mismatch");
+      }
       if (!sameRecoveryHead(review.head, firstHead) || recoveryKind(firstHead) !== review.kind) {
         throw new Error("changed_recovery_head");
       }
@@ -328,7 +368,7 @@ export function LANRecoveryScreen({ onSignOut, onCheckSystemStatus }: {
       window.setTimeout(() => completionSummary.current?.focus(), 0);
     } catch (error) {
       setConfirmed(false);
-      if (error instanceof Error && (error.message === "changed_recovery_head" || error.message === "inconsistent_recovery_observation" || error.message === "unsupported_recovery_kind")) {
+      if (error instanceof Error && (error.message === "changed_recovery_head" || error.message === "inconsistent_recovery_observation" || error.message === "unsupported_recovery_kind" || error.message === "recovery_locator_mismatch")) {
         setBlockingError("The recovery head or its exact observation changed during review. No request was sent. Restart Rig before continuing.");
       } else {
         const failure = postError(error);
@@ -388,13 +428,80 @@ export function LANRecoveryScreen({ onSignOut, onCheckSystemStatus }: {
   </main>;
 }
 
+function administrator(role: string) {
+  return role.trim().toLowerCase() === "administrator";
+}
+
+type RecoveryEntry =
+  | { state: "loading" }
+  | { state: "viewer" }
+  | { state: "clear" }
+  | { state: "blocked" }
+  | { state: "locator"; locator: ReturnType<typeof exactControllerRecoveryLocator> };
+
+function ControllerRecoveryEntry({ role, onSignOut, onCheckSystemStatus }: {
+  role: string;
+  onSignOut: SignOut;
+  onCheckSystemStatus: () => Promise<void>;
+}) {
+  const heading = useRef<HTMLHeadingElement>(null);
+  const [retry, setRetry] = useState(0);
+  const [entry, setEntry] = useState<RecoveryEntry>({ state: "loading" });
+
+  useEffect(() => {
+    if (!administrator(role)) {
+      setEntry({ state: "viewer" });
+      return;
+    }
+    let mounted = true;
+    setEntry({ state: "loading" });
+    void api.getControllerRecovery().then((response) => {
+      if (!mounted) return;
+      try {
+        const next = exactControllerRecoveryRead(response);
+        setEntry("locator" in next ? { state: "locator", locator: next.locator } : { state: "clear" });
+      } catch {
+        setEntry({ state: "blocked" });
+      }
+    }).catch(() => {
+      if (mounted) setEntry({ state: "blocked" });
+    });
+    return () => { mounted = false; };
+  }, [retry, role]);
+
+  useEffect(() => {
+    if (entry.state === "viewer" || entry.state === "blocked" || entry.state === "clear") heading.current?.focus();
+  }, [entry.state]);
+
+  if (entry.state === "locator") {
+    if (entry.locator.kind === "gateway_rebind") {
+      return <LANGatewayRebindRecoveryScreen key={entry.locator.operationId} operationId={entry.locator.operationId} onSignOut={onSignOut} onCheckSystemStatus={onCheckSystemStatus}/>;
+    }
+    if (entry.locator.kind === "lan_grant" || entry.locator.kind === "lan_disable") {
+      const expectedRecovery: LegacyRecoveryLocator = { kind: entry.locator.kind, operationId: entry.locator.operationId };
+      return <LANRecoveryScreen expectedRecovery={expectedRecovery} onSignOut={onSignOut} onCheckSystemStatus={onCheckSystemStatus}/>;
+    }
+  }
+
+  return <main className="recovery-shell"><section className="recovery-card" aria-labelledby="recovery-entry-title">
+    <header className="recovery-header"><div className="auth-brand"><b aria-hidden="true">h&gt;</b><span>hostd</span></div><button className="button" type="button" onClick={() => void onSignOut()}>Sign out</button></header>
+    <div className="recovery-heading"><p className="recovery-kicker">Local recovery console</p><h1 id="recovery-entry-title" ref={heading} tabIndex={-1}>LAN recovery required</h1></div>
+    {entry.state === "loading" && <div className="recovery-loading" role="status" aria-live="polite" aria-busy="true">Checking the recorded recovery operation…</div>}
+    {entry.state === "viewer" && <div className="callout warning" role="alert"><strong>Administrator access is required</strong><span>This account cannot inspect or reconcile the recorded LAN operation. The normal console remains isolated; sign out and use an administrator account.</span></div>}
+    {entry.state === "clear" && <div className="callout info" role="status"><strong>No active LAN recovery is recorded</strong><span>Rig remains isolated until you explicitly check system status after restart.</span></div>}
+    {(entry.state === "blocked" || entry.state === "locator") && <div className="callout danger" role="alert"><strong>Recovery cannot be confirmed</strong><span>Rig could not prove one exact recovery operation. The normal console remains isolated until an administrator can check recovery again.</span></div>}
+    {entry.state === "blocked" && <div className="recovery-actions"><button className="button primary" type="button" onClick={() => setRetry((current) => current + 1)}>Check recovery again</button><button className="button" type="button" onClick={() => void onSignOut()}>Sign out</button></div>}
+    {entry.state === "clear" && <div className="recovery-actions"><button className="button primary" type="button" onClick={() => void onCheckSystemStatus()}>Check system status after restart</button><button className="button" type="button" onClick={() => void onSignOut()}>Sign out</button></div>}
+  </section></main>;
+}
+
 export const NORMAL_STATUS_RECHECK_MS = 30_000;
 export const NORMAL_STATUS_PROBE_TIMEOUT_MS = 5_000;
 
 type OperatorMode = "checking" | "normal" | "recovery" | "indeterminate";
 type ProbeOptions = { hideNormal: boolean; allowRecoveryExit: boolean; restoreFocus: boolean };
 
-export function AuthenticatedOperatorGate({ onSignOut, children }: { onSignOut: SignOut; children: ReactNode }) {
+export function AuthenticatedOperatorGate({ onSignOut, children, role = "administrator" }: { onSignOut: SignOut; children: ReactNode; role?: string }) {
   const queryClient = useQueryClient();
   const heading = useRef<HTMLHeadingElement>(null);
   const probeSequence = useRef(0);
@@ -511,7 +618,7 @@ export function AuthenticatedOperatorGate({ onSignOut, children }: { onSignOut: 
   }, [mode]);
 
   if (mode === "normal") return children;
-  if (mode === "recovery") return <LANRecoveryScreen onSignOut={onSignOut} onCheckSystemStatus={() => probe({ hideNormal: true, allowRecoveryExit: true, restoreFocus: true })}/>;
+  if (mode === "recovery") return <ControllerRecoveryEntry role={role} onSignOut={onSignOut} onCheckSystemStatus={() => probe({ hideNormal: true, allowRecoveryExit: true, restoreFocus: true })}/>;
   if (mode === "checking") return <main className="recovery-shell"><section className="recovery-card"><header className="recovery-header"><div className="auth-brand"><b aria-hidden="true">h&gt;</b><span>hostd</span></div><button className="button" type="button" onClick={() => void onSignOut()}>Sign out</button></header><div className="recovery-loading" role="status" aria-live="polite" aria-busy="true">Checking Rig system status…</div></section></main>;
   return <main className="recovery-shell">
     <section className="recovery-card recovery-indeterminate" aria-labelledby="status-title">

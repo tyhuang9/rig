@@ -2,12 +2,14 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
+  enterGatewayReconciliationRecovery,
   type LANGatewayCandidate,
   type LANGatewayProfileRead,
   type LANGatewayProfileSpec,
   type LANGatewayUpgradeProposal,
 } from "./api";
 import { Dialog } from "./dialog";
+import { LANGatewayRebindPanel } from "./lan-gateway-rebind";
 
 function administrator(role: string) {
   return role.trim().toLowerCase() === "administrator";
@@ -37,6 +39,18 @@ function candidateLabel(candidate: LANGatewayCandidate) {
 
 function readableState(value: string) {
   return value.replaceAll("_", " ");
+}
+
+function activeGatewayRebindLocator(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const response = value as Record<string, unknown>;
+  const recovery = response.recovery;
+  if (!recovery || typeof recovery !== "object" || Array.isArray(recovery)) return null;
+  const locator = recovery as Record<string, unknown>;
+  return response.version === 1 && response.mode === "normal" && locator.kind === "gateway_rebind" &&
+    typeof locator.operationId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(locator.operationId)
+    ? locator.operationId
+    : null;
 }
 
 type GatewayUpgradeClaim = {
@@ -99,6 +113,13 @@ export function LANGatewayPanel({ role }: { role: string }) {
   const upgrade = useQuery({
     queryKey: ["lan-gateway-upgrade"],
     queryFn: api.lanGatewayUpgrade,
+    enabled: canManage,
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
+  const controllerRecovery = useQuery({
+    queryKey: ["controller-recovery"],
+    queryFn: api.getControllerRecovery,
     enabled: canManage,
     retry: false,
     refetchOnWindowFocus: false,
@@ -194,9 +215,12 @@ export function LANGatewayPanel({ role }: { role: string }) {
   const proposal = upgrade.data?.proposal;
   const desiredClaim = upgrade.data?.desiredClaim;
   const upgradeGuidance = gatewayUpgradeGuidance(desiredClaim, upgrade.data?.observed ?? { availability: "unknown" });
+  const rebindBlockedByUpgrade = Boolean(desiredClaim && !(desiredClaim.state === "committed" && upgrade.data?.observed.availability === "serving"));
+  const activeRebindOperationId = activeGatewayRebindLocator(controllerRecovery.data);
+  const activeRebindRecovery = Boolean(activeRebindOperationId);
   const readsChecking = profile.isFetching || upgrade.isFetching;
   const proposalMatchesCurrentProfile = proposalMatchesProfile(proposal, configuredProfile);
-  const canReviewUpgrade = Boolean(profile.isSuccess && upgrade.isSuccess && !readsChecking && !desiredClaim &&
+  const canReviewUpgrade = Boolean(profile.isSuccess && upgrade.isSuccess && !readsChecking && !desiredClaim && !activeRebindRecovery &&
     proposalMatchesCurrentProfile && proposal && /^[a-f0-9]{64}$/.test(proposal.actionDigest));
   const canConfirmUpgrade = Boolean(canReviewUpgrade && sameUpgradeProposal(upgradeReview ?? undefined, proposal));
   const openUpgradeReview = () => {
@@ -242,14 +266,15 @@ export function LANGatewayPanel({ role }: { role: string }) {
     <div className="lan-heading"><div><h2 id="lan-gateway-title">LAN gateway</h2><p>Choose the controller interface and HTTP port pool for explicit LAN sharing.</p></div><button className="button small" type="button" disabled={profile.isFetching || upgrade.isFetching || profileBusy || upgradeBusy} onClick={() => void refresh()}>Check gateway state</button></div>
     <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{profileBusy ? "Reviewing LAN gateway profile." : upgradeBusy ? "Applying LAN gateway upgrade." : message}</span>
     {message && <p className="lan-message">{message}</p>}
+    {activeRebindOperationId && <div className="callout warning" role="status"><strong>Gateway recovery is available</strong><span>Rig recorded gateway operation {activeRebindOperationId}. Open its recovery screen before changing gateway settings.</span><button className="button small" type="button" onClick={enterGatewayReconciliationRecovery}>Open gateway recovery</button></div>}
     {profile.isLoading ? <p role="status">Loading LAN gateway profile…</p> : profile.isError ? <div className="callout danger" role="status"><strong>LAN gateway profile could not be loaded.</strong><span>{profile.error.message}</span><button className="button small" type="button" onClick={() => void profile.refetch()}>Retry profile check</button></div> : <>
       {configuredProfile ? <dl className="lan-details"><div><dt>Desired profile revision</dt><dd>{configuredProfile.revisionNumber}</dd></div><div><dt>Interface</dt><dd>{configuredProfile.spec.interfaceId}</dd></div><div><dt>Selected IPv4</dt><dd>{configuredProfile.spec.selectedIpv4}</dd></div><div><dt>Port pool</dt><dd>{poolText(configuredProfile.spec)}</dd></div></dl> : <div className="callout info"><strong>LAN sharing is not configured.</strong><span>Approving a profile records desired state only. It does not bind a port or publish an address.</span></div>}
-      {candidates.length === 0 ? <div className="callout warning"><strong>No private IPv4 interface is available.</strong><span>Connect a private RFC 1918 network to this controller, then check the gateway state again.</span></div> : <form className="lan-profile-form" onSubmit={(event) => { event.preventDefault(); setReviewError(""); if (selectedSpec) requestProfileReview.mutate(selectedSpec); }} noValidate aria-busy={profileBusy}>
-        <div className="field"><label htmlFor="lan-interface">Interface and IPv4 address</label><select id="lan-interface" value={candidate} disabled={profileBusy} onChange={(event) => setCandidate(event.target.value)}>{candidates.map((item) => <option key={candidateID(item)} value={candidateID(item)}>{candidateLabel(item)}</option>)}</select><small>Only current private IPv4 interface and address pairs are selectable.</small></div>
-        <div className="lan-port-pool"><div className="field"><label htmlFor="lan-port-start">First port</label><input id="lan-port-start" type="number" inputMode="numeric" min={8100} max={8119} value={portStart} disabled={profileBusy} aria-invalid={!validPortPool || undefined} aria-describedby={!validPortPool ? portValidationId : undefined} onChange={(event) => setPortStart(Number(event.target.value))}/></div><div className="field"><label htmlFor="lan-port-end">Last port</label><input id="lan-port-end" type="number" inputMode="numeric" min={8100} max={8119} value={portEnd} disabled={profileBusy} aria-invalid={!validPortPool || undefined} aria-describedby={!validPortPool ? portValidationId : undefined} onChange={(event) => setPortEnd(Number(event.target.value))}/></div></div>
+      {candidates.length === 0 ? <div className="callout warning"><strong>No private IPv4 interface is available.</strong><span>Connect a private RFC 1918 network to this controller, then check the gateway state again.</span></div> : <form className="lan-profile-form" onSubmit={(event) => { event.preventDefault(); setReviewError(""); if (selectedSpec && !activeRebindRecovery) requestProfileReview.mutate(selectedSpec); }} noValidate aria-busy={profileBusy}>
+        <div className="field"><label htmlFor="lan-interface">Interface and IPv4 address</label><select id="lan-interface" value={candidate} disabled={profileBusy || activeRebindRecovery} onChange={(event) => setCandidate(event.target.value)}>{candidates.map((item) => <option key={candidateID(item)} value={candidateID(item)}>{candidateLabel(item)}</option>)}</select><small>Only current private IPv4 interface and address pairs are selectable.</small></div>
+        <div className="lan-port-pool"><div className="field"><label htmlFor="lan-port-start">First port</label><input id="lan-port-start" type="number" inputMode="numeric" min={8100} max={8119} value={portStart} disabled={profileBusy || activeRebindRecovery} aria-invalid={!validPortPool || undefined} aria-describedby={!validPortPool ? portValidationId : undefined} onChange={(event) => setPortStart(Number(event.target.value))}/></div><div className="field"><label htmlFor="lan-port-end">Last port</label><input id="lan-port-end" type="number" inputMode="numeric" min={8100} max={8119} value={portEnd} disabled={profileBusy || activeRebindRecovery} aria-invalid={!validPortPool || undefined} aria-describedby={!validPortPool ? portValidationId : undefined} onChange={(event) => setPortEnd(Number(event.target.value))}/></div></div>
         {!validPortPool && <p id={portValidationId} className="form-error" role="alert">Choose a port pool from 8100 through 8119, with the last port no lower than the first.</p>}
         {reviewError && <div className="callout danger" role="alert"><strong>Profile review unavailable</strong><span>{reviewError}</span><button className="button small" type="button" onClick={() => void refresh()}>Refresh profile summary</button></div>}
-        <button className="button" type="submit" disabled={!selectedSpec || profileBusy}>{requestProfileReview.isPending ? "Preparing review…" : "Review LAN gateway profile"}</button>
+        <button className="button" type="submit" disabled={!selectedSpec || profileBusy || activeRebindRecovery}>{requestProfileReview.isPending ? "Preparing review…" : "Review LAN gateway profile"}</button>
       </form>}
     </>}
     <section className="lan-upgrade" aria-labelledby="lan-upgrade-title">
@@ -259,6 +284,7 @@ export function LANGatewayPanel({ role }: { role: string }) {
         {upgradeGuidance ? <div ref={gatewayUpgradeGuidanceTarget} className="callout warning" role="status" tabIndex={-1}><strong>{upgradeGuidance.title}</strong><span>{upgradeGuidance.body}</span></div> : !configuredProfile ? <p className="lan-muted">Approve a LAN gateway profile before reviewing the gateway upgrade.</p> : !canReviewUpgrade ? <div className="callout warning" role="status"><strong>Gateway confirmation is unavailable.</strong><span>{readsChecking ? "Rig is checking the current gateway profile and observation. Wait for that check to finish before reviewing an upgrade." : proposal && !proposalMatchesCurrentProfile ? "The available gateway proposal does not match the current desired profile. Refresh the gateway state before reviewing an upgrade." : "Refresh the gateway state to obtain an exact action digest. Rig will not start an upgrade without it."}</span></div> : <button className="button" type="button" disabled={upgradeBusy} onClick={openUpgradeReview}>Review gateway upgrade</button>}
       </>}
     </section>
+    <LANGatewayRebindPanel profile={profile.data} disabled={profile.isLoading || profile.isError || profileBusy || upgradeBusy || readsChecking || rebindBlockedByUpgrade || activeRebindRecovery}/>
     {profileReview && <Dialog title="Review LAN gateway profile" description="Confirm the exact controller interface, address, pool, and approval digest. This saves desired state only." pending={configureProfile.isPending} focusTitle close={() => setProfileReview(null)}>
       <dl className="lan-review-details"><div><dt>Profile revision</dt><dd>New revision {profileReview.response.expectedRevisionNumber + 1}</dd></div><div><dt>Interface</dt><dd>{profileReview.spec.interfaceId}</dd></div><div><dt>Private IPv4</dt><dd>{profileReview.spec.selectedIpv4}</dd></div><div><dt>Port pool</dt><dd>{poolText(profileReview.spec)}</dd></div><div><dt>Approval digest</dt><dd className="mono">{profileReview.response.proposal?.approvalDigest}</dd></div></dl>
       {configureProfile.isError ? <div ref={profileApprovalErrorTarget} className="callout danger" role="alert" tabIndex={-1}><strong>Profile approval was not completed.</strong><span>{configureProfile.error.message}</span><button className="button small" type="button" onClick={() => { setProfileReview(null); void refresh(); }}>Refresh profile summary</button></div> : <div className="deployment-dialog-actions"><button className="button" type="button" disabled={configureProfile.isPending} onClick={() => setProfileReview(null)}>Cancel</button><button className="button primary" type="button" disabled={configureProfile.isPending} onClick={() => configureProfile.mutate(profileReview)}>{configureProfile.isPending ? "Approving…" : "Approve desired profile"}</button></div>}
