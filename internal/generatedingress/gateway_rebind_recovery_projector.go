@@ -535,7 +535,7 @@ func gatewayRebindProtectedRecoveryProjection(history gatewayRebindProtectedInte
 	if intent == nil && len(progress) == 0 && terminal == nil {
 		return appaccess.GatewayRebindProtectedRecoveryEvidence{
 			Presence: appaccess.GatewayRebindProtectedEvidenceAbsent, OperationID: operationID,
-			Generation: generation, ScanDigest: digest,
+			Generation: generation, ScanDigest: digest, FixedDisposition: appaccess.GatewayRebindDispositionNone,
 		}, "", true, nil
 	}
 	if intent == nil && len(progress) == 0 && terminal != nil {

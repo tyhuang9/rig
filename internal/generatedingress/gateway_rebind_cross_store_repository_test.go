@@ -111,6 +111,23 @@ func TestGatewayRebindProposalAndAdmissionUseRealRepository(t *testing.T) {
 		current.FenceReleased || len(current.Retained) != 0 {
 		t.Fatalf("current inspection confused prepared attempt with selected authority: %v", err)
 	}
+	status, err := f.manager.InspectGatewayRebindOperation(ctx, f.repository, claim.Spec.OperationID)
+	if err != nil || status.Protected == nil ||
+		status.Protected.Presence != appaccess.GatewayRebindProtectedEvidenceAbsent ||
+		status.Protected.FixedDisposition != appaccess.GatewayRebindDispositionNone ||
+		status.RecoveryPolicy != appaccess.GatewayRebindRecoveryEvidenceDecides ||
+		len(status.AllowedActions) != 0 || !status.Active ||
+		status.OperationFence != GatewayRebindOperationFenceHeld ||
+		ValidateGatewayRebindOperationInspection(status, claim.Spec.OperationID) != nil {
+		t.Fatalf("SQL-only prepared status lost its explicit no-disposition evidence or policy: %v", err)
+	}
+	malformed := status
+	protected := *status.Protected
+	protected.FixedDisposition = ""
+	malformed.Protected = &protected
+	if ValidateGatewayRebindOperationInspection(malformed, claim.Spec.OperationID) == nil {
+		t.Fatal("empty disposition must remain invalid for absent protected evidence")
+	}
 	afterArtifacts, err := readGatewayHistorySnapshot(f.manager.store)
 	if err != nil || !sameGatewayHistorySnapshot(beforeArtifacts, afterArtifacts) {
 		t.Fatal("proposal/admission boundary changed protected files")
