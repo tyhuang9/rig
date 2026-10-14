@@ -16,6 +16,98 @@ env:
   GOTOOLCHAIN: local
 
 jobs:
+  supported-hostd-rebind-crash-matrix:
+    name: Supported hostd rebind crash and recovery matrix
+    needs: rebind-cross-store-live
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out source
+        timeout-minutes: 2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        timeout-minutes: 3
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Record local Docker and disposable host-network prerequisites
+        timeout-minutes: 1
+        run: |
+          docker version --format 'Docker CLI={{.Client.Version}} Engine={{.Server.Version}} API={{.Server.APIVersion}}'
+          ip -Version
+          sudo -n true
+
+      - name: Verify manifest and runner controls before creating resources
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          package_name='github.com/hostd/hostd/cmd/hostd'
+          test_pattern='^(TestGatewayRebindLiveRequiredManifestIsClosed|TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly|TestLiveHostdRebindDockerMutationClassifiesCopyDirection)$'
+          go test -tags live_docker -json -v -count=1 -timeout=2m ./cmd/hostd -run "$test_pattern" | tee "$output"
+          jq -e -s --arg package_name "$package_name" --argjson test_names '["TestGatewayRebindLiveRequiredManifestIsClosed","TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly","TestLiveHostdRebindDockerMutationClassifiesCopyDirection"]' '
+            [.[] | select(.Package == $package_name)] as $events |
+            all($test_names[]; . as $name |
+              ([$events[] | select(.Test == $name and .Action == "run")] | length) == 1 and
+              ([$events[] | select(.Test == $name and .Action == "pass")] | length) == 1 and
+              ([$events[] | select(.Test == $name and (.Action == "fail" or .Action == "skip"))] | length) == 0)
+          ' "$output" > /dev/null
+
+      - name: Run actual hostd authenticated crash matrix
+        timeout-minutes: 350
+        shell: bash
+        env:
+          RIG_RUN_LIVE_GATEWAY_V2: "1"
+          RIG_RUN_LIVE_GATEWAY_REBIND_CROSS_STORE: "1"
+          RIG_RUN_LIVE_GATEWAY_REBIND_RUNTIME: "1"
+          RIG_RUN_LIVE_HOSTD_GATEWAY_REBIND: "1"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          package_name='github.com/hostd/hostd/cmd/hostd'
+          test_name='TestLiveControllerGatewayRebindCrashMatrix'
+          go test -tags live_docker -json -v -count=1 -timeout=345m ./cmd/hostd -run "^${test_name}$" | tee "$output"
+          jq -e -s --arg package_name "$package_name" --arg test_name "$test_name" '
+            [.[] | select(.Package == $package_name)] as $events |
+            ([$events[] | select(.Test == $test_name and .Action == "run")] | length) == 1 and
+            ([$events[] | select(.Test == $test_name and .Action == "pass")] | length) == 1 and
+            ([$events[] | select(.Test == $test_name and (.Action == "fail" or .Action == "skip"))] | length) == 0 and
+            ([$events[] | select(((.Test // "") | startswith($test_name + "/boundary/")) and .Action == "run")] | length) == 33 and
+            ([$events[] | select(((.Test // "") | startswith($test_name + "/boundary/")) and .Action == "pass")] | length) == 33 and
+            ([$events[] | select(((.Test // "") | startswith($test_name + "/scenario/")) and .Action == "run")] | length) == 29 and
+            ([$events[] | select(((.Test // "") | startswith($test_name + "/scenario/")) and .Action == "pass")] | length) == 29 and
+            ([$events[] | select((((.Test // "") | startswith($test_name + "/boundary/")) or ((.Test // "") | startswith($test_name + "/scenario/"))) and (.Action == "fail" or .Action == "skip"))] | length) == 0
+          ' "$output" > /dev/null
+
+      - name: Require independent full-hostd fixture cleanup
+        if: always()
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          containers="$(docker ps --all --filter label=io.rig.managed --format '{{.ID}} {{.Names}} {{.Status}}')"
+          networks="$(docker network ls --filter label=io.rig.managed --format '{{.ID}} {{.Name}}')"
+          volumes="$(docker volume ls --filter label=io.rig.managed --format '{{.Name}}')"
+          images="$(docker image ls --filter label=io.rig.managed=generated-image --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
+          builders="$(docker ps --all --filter label=rig.controller=generated-builder --format '{{.ID}} {{.Names}} {{.Status}}')"
+          builder_networks="$(docker network ls --filter label=rig.controller=generated-builder --format '{{.ID}} {{.Name}}')"
+          adapters="$(ip -json -details link show | jq -r '.[] | select((.ifname | startswith("righ")) or ((.ifalias // "") | startswith("rig-supported-hostd-rebind:"))) | .ifname')"
+          children="$(pgrep -af '[T]estLiveControllerGatewayRebindCrashMatrix' || true)"
+          if [[ -n "$containers" || -n "$networks" || -n "$volumes" || -n "$images" || -n "$builders" || -n "$builder_networks" || -n "$adapters" || -n "$children" ]]; then
+            printf 'Supported hostd rebind resources or children were not cleaned up.\n' >&2
+            printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+              "$containers" "$networks" "$volumes" "$images" "$builders" "$builder_networks" "$adapters" "$children" >&2
+            exit 1
+          fi
+
   rebind-cross-store-live:
     name: Rebind cross-store boundary (${{ matrix.test }})
     runs-on: ubuntu-24.04
