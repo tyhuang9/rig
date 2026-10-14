@@ -919,21 +919,61 @@ func TestLiveExternalTLSNodeTrust(t *testing.T) {
 	}
 	fixture := newLiveExternalTLSFixtureAt(t, "127.0.0.1:0")
 	defer fixture.Close(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	stderr := newLiveNodeTLSDiagnosticStderrBuffer(liveNodeTLSDiagnosticLimit)
-	command := exec.CommandContext(ctx, node, "-e", liveApplicationHTTPSProbeCommand, liveNodeTLSDiagnosticFlag, "127.0.0.1", fmt.Sprintf("%d", fixture.port), "", fixture.ca)
+	command := exec.Command(node, "-e", liveApplicationHTTPSProbeCommand, liveNodeTLSDiagnosticFlag, "127.0.0.1", fmt.Sprintf("%d", fixture.port), "", fixture.ca)
 	command.Stderr = stderr
-	output, err := command.Output()
+	output, err, parentContext := runLiveNodeTLSProbe(command, stderr)
 	process := liveNodeTLSDiagnosticProcessOutcome(err)
-	parentContext := liveNodeTLSDiagnosticParentContext(ctx)
 	nodeDiagnostic := liveNodeTLSDiagnosticEvidence(stderr.Bytes(), stderr.Truncated())
-	if err != nil || ctx.Err() != nil {
+	if err != nil || parentContext != "active" {
 		t.Fatalf("host-side Node TLS probe did not complete (process=%s,parent_context=%s,node_context=%s,node_major=%s)", process, parentContext, nodeDiagnostic.context, nodeDiagnostic.nodeMajor)
 	}
 	result, valid := decodeLiveApplicationProbeResult(output)
 	if !valid || liveApplicationProbeClassification(result) != liveApplicationProbeReachable || result.Status != http.StatusNoContent {
 		t.Fatalf("host-side Node TLS probe did not trust the fixture CA and peer name (process=%s,parent_context=%s,node_context=%s,node_major=%s)", process, parentContext, nodeDiagnostic.context, nodeDiagnostic.nodeMajor)
+	}
+}
+
+func runLiveNodeTLSProbe(command *exec.Cmd, stderr *liveNodeTLSDiagnosticStderrBuffer) ([]byte, error, string) {
+	return runLiveNodeTLSProbeWithAllowances(command, stderr,
+		liveNodeTLSStartupAllowance, liveNodeTLSCompletionAllowance)
+}
+
+func runLiveNodeTLSProbeWithAllowances(command *exec.Cmd, stderr *liveNodeTLSDiagnosticStderrBuffer,
+	startupAllowance, completionAllowance time.Duration,
+) ([]byte, error, string) {
+	var stdout bytes.Buffer
+	command.Stdout = &stdout
+	command.WaitDelay = liveNodeTLSKillReapAllowance
+	if err := command.Start(); err != nil {
+		return nil, err, "active"
+	}
+	waited := make(chan error, 1)
+	go func() {
+		waited <- command.Wait()
+	}()
+	startup := time.NewTimer(startupAllowance)
+	select {
+	case err := <-waited:
+		startup.Stop()
+		return stdout.Bytes(), err, "active"
+	case <-stderr.StartupObserved():
+		startup.Stop()
+	case <-startup.C:
+		_ = command.Process.Kill()
+		err := <-waited
+		return stdout.Bytes(), err, "node-startup-deadline"
+	}
+
+	completion := time.NewTimer(completionAllowance)
+	defer completion.Stop()
+	select {
+	case err := <-waited:
+		return stdout.Bytes(), err, "active"
+	case <-completion.C:
+		_ = command.Process.Kill()
+		err := <-waited
+		return stdout.Bytes(), err, "probe-completion-deadline"
 	}
 }
 
