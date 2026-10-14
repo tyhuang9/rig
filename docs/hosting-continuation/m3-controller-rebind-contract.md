@@ -306,14 +306,14 @@ Agree on typed adapter signatures first, then use disjoint ownership:
   full-controller child-process harness, using the same handler/composition as
   the supported daemon; no direct private-Manager call presented as that gate.
 
-Local nonactivating implementation and controller contract tests can proceed
-while Docker checks are queued. Normal hostd construction, route registration
-and factory availability remain closed until the corresponding acceptance and
-review gates permit production wiring. Test composition must be explicit and
-unavailable through a release binary flag, environment variable or public API.
-Do not claim a built but unregistered handler is accepted supported-controller
-behavior. Production wiring and release are separately gated, not implied by
-merging documentation or passing a mocked test.
+Candidate Manager construction installs one coherent physical adapter pair on
+the same Manager, runner, stores and locks. Supported hostd route and startup
+assembly is tracked in the candidate's acceptance record; wiring alone does not
+establish supported-controller acceptance or authorize release. Test composition
+must remain explicit and unavailable through a release binary flag, environment
+variable or public API. An unregistered handler is not accepted supported behavior.
+Hosted Docker, race, platform and physical qualification gates remain required;
+source integration or a passing mocked test does not replace them.
 
 The concrete runtime used by the full-controller Docker harness must first pass
 its actual typed forward/rollback/replay and independent cleanup gates on the
