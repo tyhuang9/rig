@@ -96,7 +96,7 @@ func TestInspectGatewayRebindProposalBuildsTypedTransferAwareSource(t *testing.T
 	}
 }
 
-func TestInspectGatewayRebindCurrentSeparatesSelectedAuthorityFromActivePhase(t *testing.T) {
+func TestInspectGatewayRebindCurrentRetainsSelectedAuthorityAndProcessFence(t *testing.T) {
 	fixture := newGatewayCurrentStateFixture(t)
 	fixture.manager.mu = newContextMutex()
 	fixture.manager.options.RebindFenceCheck = func(context.Context) error { return nil }
@@ -128,6 +128,8 @@ func TestInspectGatewayRebindCurrentSeparatesSelectedAuthorityFromActivePhase(t 
 	}
 	fixture.manager.gatewayRebindFailStop.Store(false)
 
+	// TestGatewayRebindProposalAndAdmissionUseRealRepository covers a valid
+	// prepared operation without manufacturing incomplete claim authority here.
 	activeOperationID := uuid.NewString()
 	repository.snapshot.Active = &appaccess.GatewayRebindHistoryEntry{Claim: appaccess.GatewayRebindClaimRecord{
 		SpecVersion: appaccess.GatewayRebindSpecVersionV2,
@@ -138,23 +140,22 @@ func TestInspectGatewayRebindCurrentSeparatesSelectedAuthorityFromActivePhase(t 
 	repository.snapshot.Phase = appaccess.GatewayRebindPrepared
 	repository.snapshot.RollbackAllowed = true
 	repository.fenceErr = appaccess.ErrGatewayRebindActive
-	inspection, err = fixture.manager.InspectGatewayRebindCurrent(context.Background(), &repository)
-	if err != nil || inspection.SelectedCurrentAuthority.OperationID != fixture.receipt.OperationID ||
-		inspection.ActiveOperationID != activeOperationID || inspection.ActivePhase != appaccess.GatewayRebindPrepared ||
-		inspection.ActiveSpecVersion != appaccess.GatewayRebindSpecVersionV2 || inspection.FenceReleased {
-		t.Fatalf("prepared B obscured committed A: inspection=%#v error=%v", inspection, err)
+	if inspection, err = fixture.manager.InspectGatewayRebindCurrent(context.Background(), &repository); err == nil ||
+		!reflect.DeepEqual(inspection, GatewayRebindCurrentInspection{}) {
+		t.Fatalf("partial typed active claim was not rejected: inspection=%#v error=%v", inspection, err)
 	}
-	// Inspection continues to describe legacy active claims; the startup
-	// dispatcher refuses unsupported recovery formats without hiding history.
+
 	repository.snapshot.Active.Claim = appaccess.GatewayRebindClaimRecord{SpecVersion: 1,
 		Legacy: &appaccess.GatewayRebindClaim{Spec: appaccess.GatewayRebindSpec{OperationID: activeOperationID}}}
-	inspection, err = fixture.manager.InspectGatewayRebindCurrent(context.Background(), &repository)
-	if err != nil || inspection.ActiveSpecVersion != 1 || inspection.ActiveOperationID != activeOperationID || inspection.FenceReleased {
-		t.Fatalf("legacy inspection lost active format: inspection=%#v error=%v", inspection, err)
+	if inspection, err = fixture.manager.InspectGatewayRebindCurrent(context.Background(), &repository); err == nil ||
+		!reflect.DeepEqual(inspection, GatewayRebindCurrentInspection{}) {
+		t.Fatalf("legacy active claim was not rejected: inspection=%#v error=%v", inspection, err)
 	}
+
 	repository.snapshot.Active.Claim.V2 = &appaccess.GatewayRebindClaimV2{}
-	if _, err := fixture.manager.InspectGatewayRebindCurrent(context.Background(), &repository); err == nil {
-		t.Fatal("crossed active claim formats produced a startup inspection")
+	if inspection, err = fixture.manager.InspectGatewayRebindCurrent(context.Background(), &repository); err == nil ||
+		!reflect.DeepEqual(inspection, GatewayRebindCurrentInspection{}) {
+		t.Fatalf("crossed active claim formats were not rejected: inspection=%#v error=%v", inspection, err)
 	}
 }
 
